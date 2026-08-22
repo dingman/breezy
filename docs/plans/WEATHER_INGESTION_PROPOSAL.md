@@ -104,13 +104,31 @@ Each `body_header_regex` in the registry is machine-checked against a real multi
 
 **Corrected against a live 20-product corpus (2026-08-22).** Earlier versions of this plan — and the `nws-cli-settlement` skill — asserted that a final CLI reads `CLIMATE REPORT FOR <yesterday>` while a preliminary reads `CLIMATE SUMMARY`. **That is false.** Both issuances read `...THE <SITE> CLIMATE SUMMARY FOR <DATE>...`. The discriminator is a separate line: the **preliminary carries `VALID TODAY AS OF 0400 PM LOCAL TIME.`** and the final does not.
 
+**Refined again during Phase 1, against the captured real pair.** `REPORT` vs `SUMMARY` does not discriminate *at all*, because **both strings appear in both products** in different positions: the top masthead reads `CLIMATE REPORT` in each, and the headline sentence reads `CLIMATE SUMMARY` in each. Code keying on the masthead would therefore misparse *both* issuances identically rather than merely misclassifying one — a worse failure, because it looks like a parser bug rather than a settlement bug.
+
 Classification therefore keys on **(the presence/absence of that `VALID TODAY AS OF …` line, plus the headline `summary_date`)** — never on `issuanceTime`, and never on `REPORT` vs `SUMMARY` wording. This is the single highest-consequence parsing rule in the system: misreading a preliminary as final settles on a value NWS has not finalized. Test #1 (`test_preliminary_cli_is_not_settlement_grade`) pins it against real fixtures of both issuances for the same day.
 
 Classification predicates are pure functions with no clock access, so they behave identically live and in replay.
 
-### 2.5 Parsing
+### 2.5 Parsing — deliberate deviation, decided in Phase 1
 
-pyIEM, behind a structural allowlist (line count/length, WMO header shape, AWIPS PIL == `CLI{loc}`, body-header regex) applied **before** the parser sees the text. pyIEM must be constructed offline — `pyiem.parser()` opens a live PostgreSQL connection on the default path.
+**Earlier versions mandated pyIEM. Phase 1 reverses that: `normalize/cli_parse.py` is our own parser, and pyIEM is an optional `backfill` extra only.** This is a conscious deviation, recorded here so it is not mistaken for an oversight.
+
+The reasoning, weighed against a review that flagged the deviation as HIGH:
+
+- pyIEM pulls a 48-package dependency tree with two undeclared imports, and `pyiem.parser()` **opens a live PostgreSQL connection** on its default construction path — in a module that must stay pure and import-safe.
+- It is regex-heavy fixed-width parsing, so it carries the ReDoS exposure that motivated the `ProcessPoolExecutor` containment in §6. A security review measured our own patterns as free of catastrophic-backtracking shapes.
+- Our parser fails **closed**: every ambiguity raises `CliParseError` before any partially-populated result can be constructed, at 100% branch coverage.
+
+**The reviewer's underlying point stood, and was the real risk: the regexes had been validated against one NWS office (KOKX).** That was answered with evidence rather than argument.
+
+**Result (executed):** real CLI products were captured for all five cities across five different WFOs — KOKX, KMTR, KMFL, KLOT, KLOX — and **all four new offices parsed cleanly on the first run with no code change**. Every office renders the `...THE <SITE> CLIMATE SUMMARY FOR <DATE>...` headline and the `TEMPERATURE (F)` → `YESTERDAY` → `MAXIMUM`/`MINIMUM`/`AVERAGE` → blank → `PRECIPITATION (IN)` structure identically. The only cross-office variance observed is the observed-time column format (`2:19 PM` at KMTR/KLOX/KMFL vs `301 PM` at KOKX), which the parser never reads. A cross-city rejection matrix additionally proves each site's `body_header_regex` — read from `sites.toml`, not copied — rejects every sibling's real header.
+
+**If a future office renders the temperature block in a way the parser cannot handle, that finding — not the abstract argument — reopens the pyIEM decision.**
+
+Two parsing rules that are load-bearing regardless of parser:
+- The structural allowlist (line count/length, WMO header shape, AWIPS PIL == `CLI{loc}`, body-header regex) is applied **before** the parser sees the text.
+- Temperature extraction is anchored to the **`YESTERDAY` subsection**. The `TEMPERATURE (F)` block also contains `NORMAL` and `RECORD` subsections with their own `MAXIMUM`/`MINIMUM` lines; a first-match-in-block search would silently return a record high as the observed high — a mis-parse rather than a rejection, and a wrong settlement.
 
 ### 2.6 Normalization
 
@@ -177,7 +195,21 @@ Consequences for the data model:
 
 - **Missing values** use genuinely nullable Arrow columns plus a `*_flag` string column for the sentinel kind. No `missing_mask` bitfield; no "annotate `float`, pass `None`" lie that the type-checker would enforce against us.
 - **Schema evolution** is guarded by our own strict decoder. Drift is otherwise **silent and non-deterministic** — pyarrow infers the schema from the first fragment only and whichever fragment sorts first wins: new-schema-last silently overwrites new data with defaults, new-schema-first injects `None` past a dataclass default. The strict decoder converts silent corruption into a loud failure.
-- **`catalog.custom_data(...)` returns `CustomData` wrapper objects, not raw instances** — callers unwrap `.data`.
+- **`catalog.custom_data(...)` returns `CustomData` wrapper objects, not raw instances** — callers unwrap `.data`. Its parameter is `cls`, **not** `data_cls` (`catalog/base.py:202`), and `as_nautilus=True` double-wraps because `query` already wraps custom classes.
+- **Arrow `nullable=False` is not enforced on write** (executed): `pa.RecordBatch.from_pylist([{"v": 1}], schema=<d not null, v>)` yields `{"d": None, "v": 1}` with no error, and extra keys are dropped silently. Our encoder validates the dict itself rather than trusting the schema to reject it.
+- **The bundled `dicts_to_record_batch` swallows every exception** (prints and returns `None`), turning a decode failure into an opaque assertion. Not used.
+
+**Known limitation — strict decoding is one-sided, but narrower than first measured.** The strict decoder compares the *unified dataset* schema, which pyarrow infers from the first/oldest fragment, against the registered schema. Both real version-drift directions are caught. A **later** divergent fragment while the first still matches was initially found to coerce silently to NULL.
+
+Adding `tavg_flag` (§4.1 record content) unexpectedly closed most of that hole, because the paired value/flag invariant is itself a detector. Re-measured on the pinned install for a later-fragment divergence:
+
+| Dropped column | Outcome |
+|---|---|
+| `tavg_f` | **Caught** — `ValueError: tavg_f is missing, so tavg_flag must name the sentinel kind` |
+| `source_channel`, `is_final` (non-null) | **Caught** — field guards raise `TypeError` |
+| `tavg_flag` while its value is present | **Undetected**, coerced to `None` |
+
+The residual hole is therefore only a nullable `*_flag` column dropped alongside a present value — and that state is unreachable through our own strict encoder. All three cases are pinned in `test_drift_detection_is_one_sided_when_the_first_fragment_matches`. A per-record `schema_version` assertion or a periodic catalog-wide schema audit would close it entirely; that remains Phase 2 work, now at lower priority.
 
 **Verified on 1.231.0 by execution:** a hand-written `Data` subclass with `date32` and nullable `int64` round-trips construct → `to_dict` → `to_arrow` → `write_data` → `query` → `from_arrow` with values and nulls intact, with zero private-API surface.
 
@@ -188,7 +220,7 @@ Consequences for the data model:
 ### 4.2 Timestamps
 
 - **`ts_init` = `retrieved_at_ns`** — when *Breezy* received and validated it, stamped once and propagated, never re-stamped from `clock.now()`. Replay order then equals real arrival order. Not issuance time: if we are down and fetch late, issuance time lets the backtest know things before we did.
-- **`ts_event` = semantic instant.** Finals: end of climate day (LST). **Preliminaries: issuance time** — the `ts_event ≤ ts_init` invariant is scoped to finals and contract-tested there, because a preliminary polled at 16:15 has a climate day ending hours later.
+- **`ts_event` = semantic instant.** Finals: end of climate day (LST). **Preliminaries: issuance time.** The `ts_event ≤ ts_init` invariant is scoped to finals and contract-tested there. **Corrected justification (Phase 1):** earlier text claimed the invariant is *violated* by preliminaries — it is not, since under the issuance-time rule above it holds for them too. The real reason to scope it is that the **type must not enforce it globally**, because a preliminary carrying a climate-day-end `ts_event` would violate it, and the record class must be able to represent that rather than reject it at construction.
 - Forecasts: `ts_event` = model **run** time; the target day is a separate field.
 - **Banned:** `use_ts_event_for_ts_init=True` on any read path.
 
@@ -300,7 +332,7 @@ This bypasses nothing: Nautilus does not own outbound HTTP for third-party data 
 
 **Stack:** `pytest`, `pytest-asyncio` (strict), `pytest-cov`, `hypothesis` (narrow), `pytest-randomly`, `import-linter`, `mypy`, `ruff`, **`respx`** (viable now that weather transport is `httpx`). **Rejected:** `freezegun`/`time-machine` — Nautilus ships `TestClock`, and monkeypatching global time would hide the missing injectable-clock seam.
 
-**mypy scope, stated honestly:** `--strict` on `normalize/`, `registry/`, `settlement/`, `features/` — the Nautilus-free island. Not achievable on `domain/` (only 4 `.pyi` stubs ship; Cython modules are unstubbed).
+**mypy scope (widened in Phase 1).** `--strict` now covers `normalize/`, `registry/`, `settlement/`, `features/`, **`domain/` and `ingest/`** — 17 source files, clean. Earlier versions claimed `domain/` was unreachable because only 4 `.pyi` stubs ship and the Cython modules are unstubbed. In practice that produces exactly **two** errors, both `Class cannot subclass "Data" (has type "Any")`. The fix is a narrow per-module waiver of `disallow_subclassing_any` for `breezy.domain.*` plus `ignore_missing_imports` for `pyarrow.*`/`nautilus_trader.*` — every other strict check still applies there. Do not widen those waivers.
 
 **Fixtures:** verbatim body + `meta.json` (url, allowlisted headers, status, `captured_at`, `sha256_body`) + hand-verified `expected.json`; `test_fixture_integrity` recomputes every digest. Corpus: CLI preliminary, final, **CCA correction**, multi-station, M/T/MS/MB sentinels, time-format variants, 403/503/400/429, METAR with null `maxTemperatureLast24Hours`, ACIS normal + future-date `M`, Open-Meteo forecast/previous-runs/error. No test touches the network (autouse socket-blocking fixture).
 

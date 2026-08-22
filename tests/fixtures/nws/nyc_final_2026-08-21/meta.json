@@ -1,0 +1,12 @@
+{
+  "url": "https://api.weather.gov/products/40bb657c-e166-44d4-a038-dd18701cf2c8",
+  "status": 200,
+  "retrieved_at": "2026-08-22T19:14:00Z",
+  "sha256_body": "19f486b5b0d299cd146d181b811b05705893e41c8096196dc5c0ee80d317fdc5",
+  "product_id": "40bb657c-e166-44d4-a038-dd18701cf2c8",
+  "issuing_office": "KOKX",
+  "issuance_time": "2026-08-22T06:26:00+00:00",
+  "wmo_collective_id": "CDUS41",
+  "note": "FINAL CLI for NYC (Central Park), covering climate day 2026-08-21. No VALID TODAY AS OF line present. Pairs with nyc_preliminary_2026-08-21 for the two-issuance discriminator test.",
+  "synthetic": false
+}

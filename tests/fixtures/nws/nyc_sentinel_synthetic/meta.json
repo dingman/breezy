@@ -1,0 +1,9 @@
+{
+  "url": null,
+  "status": null,
+  "retrieved_at": "2026-08-22T19:14:00Z",
+  "sha256_body": "4327db50cc3c6f0e141c66cb56a4302a9c001ba7fbd4c8cf05b210bdc40f407f",
+  "synthetic": true,
+  "based_on": "tests/fixtures/nws/nyc_final_2026-08-21/product.txt",
+  "note": "SYNTHETIC. Hand-constructed from the real FINAL fixture by replacing TMAX with 'MM' (missing), TMIN with 'T' (trace), and TAVG with 'MS' (missing at time) to exercise sentinel preservation. The fourth documented sentinel, 'MB' (missing at midnight), is covered by a direct parametrized unit test of the token-level parser rather than a fourth full-product fixture, since only three temperature fields exist per product."
+}

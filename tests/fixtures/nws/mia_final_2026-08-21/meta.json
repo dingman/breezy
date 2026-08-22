@@ -1,0 +1,12 @@
+{
+  "url": "https://api.weather.gov/products/c2e87d93-ee8b-4d95-a28e-d8ec9f89eb06",
+  "status": 200,
+  "retrieved_at": "2026-08-22T19:33:00Z",
+  "sha256_body": "cc015832e7d14e0a36900641771202ef3320b92fbe4ad9c5d090fbeeae82e97c",
+  "product_id": "c2e87d93-ee8b-4d95-a28e-d8ec9f89eb06",
+  "issuing_office": "KMFL",
+  "issuance_time": "2026-08-22T08:25:00+00:00",
+  "wmo_collective_id": "CDUS42",
+  "note": "FINAL CLI for Miami, covering climate day 2026-08-21. Captured to prove format-drift resilience: a different WFO (KMFL) than NYC's KOKX. No VALID TODAY AS OF line present.",
+  "synthetic": false
+}

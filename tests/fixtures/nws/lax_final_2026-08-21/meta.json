@@ -1,0 +1,12 @@
+{
+  "url": "https://api.weather.gov/products/2646e991-e88a-43ca-b793-d1e7ac653205",
+  "status": 200,
+  "retrieved_at": "2026-08-22T19:33:00Z",
+  "sha256_body": "a681ae46fc0d58b4d167a4618178d76bb6b57fa06ccfa7e262f36a515fb3e318",
+  "product_id": "2646e991-e88a-43ca-b793-d1e7ac653205",
+  "issuing_office": "KLOX",
+  "issuance_time": "2026-08-22T08:50:00+00:00",
+  "wmo_collective_id": "CDUS46",
+  "note": "FINAL CLI for Los Angeles Intl, covering climate day 2026-08-21. Captured to prove format-drift resilience: a different WFO (KLOX) than NYC's KOKX. No VALID TODAY AS OF line present.",
+  "synthetic": false
+}

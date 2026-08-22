@@ -1,0 +1,12 @@
+{
+  "url": "https://api.weather.gov/products/ed80e538-da15-4597-bd3e-4c9e851d53ce",
+  "status": 200,
+  "retrieved_at": "2026-08-22T19:33:00Z",
+  "sha256_body": "c2a20d1ad85cd72721d960ce1948bbfb939e925e1a298ad3cc03fe5252c4e261",
+  "product_id": "ed80e538-da15-4597-bd3e-4c9e851d53ce",
+  "issuing_office": "KMTR",
+  "issuance_time": "2026-08-22T08:26:00+00:00",
+  "wmo_collective_id": "CDUS46",
+  "note": "FINAL CLI for San Francisco Airport, covering climate day 2026-08-21. Captured to prove format-drift resilience: a different WFO (KMTR) than NYC's KOKX. No VALID TODAY AS OF line present.",
+  "synthetic": false
+}

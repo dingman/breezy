@@ -1,0 +1,2 @@
+# Malformed fixture: no top-level [sites] table at all.
+registry_version = "test-1"

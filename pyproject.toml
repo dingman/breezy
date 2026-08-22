@@ -9,7 +9,64 @@ authors = [
 requires-python = ">=3.13"
 dependencies = [
     "nautilus-trader~=1.231",
+    "httpx>=0.28",
 ]
+
+[dependency-groups]
+dev = [
+    "pytest>=8.3",
+    "pytest-asyncio>=0.24",
+    "pytest-cov>=6.0",
+    "pytest-randomly>=3.16",
+    "hypothesis>=6.112",
+    "respx>=0.21",
+    "mypy>=1.13",
+    "ruff>=0.8",
+    "import-linter>=2.1",
+]
+
+[project.optional-dependencies]
+backfill = ["pyiem>=1.19"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "strict"
+addopts = "-q --strict-markers --strict-config"
+markers = [
+    "contract: pins verified NautilusTrader 1.231.0 behaviour; run first on any version bump",
+    "replay: live/backtest parity tests",
+]
+
+[tool.ruff]
+line-length = 100
+target-version = "py313"
+# Vendored upstream NautilusTrader docs — reference material, not our code.
+extend-exclude = ["docs/reference/nautilus"]
+
+[tool.mypy]
+python_version = "3.13"
+strict = true
+files = [
+    "src/breezy/normalize",
+    "src/breezy/registry",
+    "src/breezy/settlement",
+    "src/breezy/domain",
+    "src/breezy/ingest",
+]
+
+# pyarrow ships no stubs, and nautilus_trader's Data base is a compiled Cython
+# module (only 4 .pyi files ship). Untyped at the boundary, strict within.
+[[tool.mypy.overrides]]
+module = ["pyarrow.*", "nautilus_trader.*"]
+ignore_missing_imports = true
+follow_untyped_imports = false
+
+# nautilus_trader.core.data.Data is a compiled Cython class, so mypy sees it as
+# Any and refuses the subclass. Waive ONLY that rule, only for our record types
+# — every other strict check still applies to this package.
+[[tool.mypy.overrides]]
+module = ["breezy.domain.*"]
+disallow_subclassing_any = false
 
 [project.scripts]
 breezy = "breezy:main"

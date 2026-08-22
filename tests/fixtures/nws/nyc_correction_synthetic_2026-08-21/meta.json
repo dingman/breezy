@@ -1,0 +1,9 @@
+{
+  "url": null,
+  "status": null,
+  "retrieved_at": "2026-08-22T19:14:00Z",
+  "sha256_body": "a48830682eef8bd248e9728f853ec95b0a81d5762e55216e38f34d780ee011ed",
+  "synthetic": true,
+  "based_on": "tests/fixtures/nws/nyc_final_2026-08-21/product.txt",
+  "note": "SYNTHETIC. No live CCA/CCB correction was observed in the capture window (2026-08-22), consistent with the nws-cli-settlement skill's note that corrections are rare (0/200 in its sample). Hand-constructed from the real FINAL fixture by: (1) appending the 'CCA' WMO BBB token to the abbreviated heading line, (2) marking the product title CORRECTED, (3) revising TMAX 79 -> 80 to model a real correction changing a settled value. Used only to test correction-evidence detection, never as a settlement value."
+}

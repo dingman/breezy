@@ -1,0 +1,12 @@
+{
+  "url": "https://api.weather.gov/products/c52effd7-d893-47ba-85ff-037f7ceee51f",
+  "status": 200,
+  "retrieved_at": "2026-08-22T19:14:00Z",
+  "sha256_body": "574219ff27b336d403c62e2f1720a9ed2f0b129397a8964383fe80a0fb2b01a6",
+  "product_id": "c52effd7-d893-47ba-85ff-037f7ceee51f",
+  "issuing_office": "KOKX",
+  "issuance_time": "2026-08-21T20:44:00+00:00",
+  "wmo_collective_id": "CDUS41",
+  "note": "PRELIMINARY CLI for NYC (Central Park), issued 4:44 PM local for climate day 2026-08-21 (same climate day as nyc_final_2026-08-21's FINAL, issued the following morning). Carries the VALID TODAY AS OF 0400 PM LOCAL TIME. line -- the settlement-grade discriminator. Both issuances use identical 'CLIMATE SUMMARY' headline wording, confirming REPORT-vs-SUMMARY wording is NOT the discriminator.",
+  "synthetic": false
+}

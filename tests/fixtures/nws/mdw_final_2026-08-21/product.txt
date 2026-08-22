@@ -1,0 +1,91 @@
+
+000
+CDUS43 KLOT 220633
+CLIMDW
+
+CLIMATE REPORT 
+NATIONAL WEATHER SERVICE CHICAGO IL
+133 AM CDT SAT AUG 22 2026
+
+...................................
+
+...THE CHICAGO-MIDWAY CLIMATE SUMMARY FOR AUGUST 21 2026...
+
+CLIMATE NORMAL PERIOD: 1991 TO 2020
+CLIMATE RECORD PERIOD: 1928 TO 2026
+
+
+WEATHER ITEM   OBSERVED TIME   RECORD YEAR NORMAL DEPARTURE LAST      
+                VALUE   (LST)  VALUE       VALUE  FROM      YEAR     
+                                                  NORMAL           
+...................................................................
+TEMPERATURE (F)                                                          
+ YESTERDAY                                                           
+  MAXIMUM         80   2:31 PM  99    1955  82     -2       78        
+  MINIMUM         62   5:17 AM  46    1950  66     -4       66        
+  AVERAGE         71                        74     -3       72     
+
+PRECIPITATION (IN)                                                    
+  YESTERDAY        T             1.58 1975   0.13  -0.13     0.00     
+  MONTH TO DATE    4.37                      2.72   1.65     2.81     
+  SINCE JUN 1     17.89                     10.28   7.61    14.84     
+  SINCE JAN 1     31.78                     22.76   9.02    24.41     
+
+DEGREE DAYS                                                           
+ HEATING                                                              
+  YESTERDAY        0                         0      0        0        
+  MONTH TO DATE    0                         0      0        0        
+  SINCE JUN 1      3                        25    -22        9        
+  SINCE JUL 1      0                         1     -1        0        
+
+ COOLING                                                              
+  YESTERDAY        6                         9     -3        7        
+  MONTH TO DATE  211                       214     -3      283        
+  SINCE JUN 1    798                       789      9     1051        
+  SINCE JAN 1    882                       871     11     1102        
+...................................................................
+
+
+WIND (MPH)                                                            
+  HIGHEST WIND SPEED    17   HIGHEST WIND DIRECTION    SW (210)       
+  HIGHEST GUST SPEED    23   HIGHEST GUST DIRECTION     S (190)       
+  AVERAGE WIND SPEED     6.4                                        
+
+
+SKY COVER                                                             
+  AVERAGE SKY COVER 0.6                                                 
+
+
+WEATHER CONDITIONS                                                    
+THE FOLLOWING WEATHER WAS RECORDED YESTERDAY.                         
+  THUNDERSTORM                                                        
+
+
+RELATIVE HUMIDITY (PERCENT)
+ HIGHEST    87           3:00 AM                                      
+ LOWEST     56           2:00 PM                                      
+ AVERAGE    72                                                        
+
+..........................................................
+
+
+THE CHICAGO-MIDWAY CLIMATE NORMALS FOR TODAY
+                         NORMAL    RECORD    YEAR                     
+ MAXIMUM TEMPERATURE (F)   82       103      1936                      
+ MINIMUM TEMPERATURE (F)   66        51      1928                      
+
+
+SUNRISE AND SUNSET                                                    
+AUGUST 22 2026........SUNRISE   6:07 AM CDT   SUNSET   7:40 PM CDT     
+AUGUST 23 2026........SUNRISE   6:08 AM CDT   SUNSET   7:39 PM CDT     
+
+
+-  INDICATES NEGATIVE NUMBERS.
+R  INDICATES RECORD WAS SET OR TIED.
+MM INDICATES DATA IS MISSING.
+T  INDICATES TRACE AMOUNT.
+
+
+
+
+$$

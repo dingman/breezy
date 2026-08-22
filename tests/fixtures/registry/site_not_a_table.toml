@@ -1,0 +1,5 @@
+# Malformed fixture: a "site" entry under the venue is a scalar, not a table.
+registry_version = "test-1"
+
+[sites.polymarket_us]
+TST = "not-a-table"

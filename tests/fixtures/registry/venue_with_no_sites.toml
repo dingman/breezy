@@ -1,0 +1,4 @@
+# Malformed fixture: the venue table exists but declares no sites under it.
+registry_version = "test-1"
+
+[sites.polymarket_us]

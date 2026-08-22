@@ -1,0 +1,12 @@
+{
+  "url": "https://api.weather.gov/products/4c320984-bf26-4f5d-a9fc-0a0bdc163bb4",
+  "status": 200,
+  "retrieved_at": "2026-08-22T19:33:00Z",
+  "sha256_body": "af2b81b6eb8ae5ccf7c3a8998308a61a930fd2f15fccd69169e877cb7fdeed93",
+  "product_id": "4c320984-bf26-4f5d-a9fc-0a0bdc163bb4",
+  "issuing_office": "KLOT",
+  "issuance_time": "2026-08-22T06:33:00+00:00",
+  "wmo_collective_id": "CDUS43",
+  "note": "FINAL CLI for Chicago Midway, covering climate day 2026-08-21. Captured to prove format-drift resilience: a different WFO (KLOT) than NYC's KOKX, and KLOT is the office that also issues O'Hare's CLI under the same issuingOffice -- the header-collision case. No VALID TODAY AS OF line present.",
+  "synthetic": false
+}

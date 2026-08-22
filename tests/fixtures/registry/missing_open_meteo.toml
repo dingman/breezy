@@ -1,0 +1,17 @@
+# Malformed fixture: the site table has no [*.open_meteo] sub-table at all.
+registry_version = "test-1"
+
+[sites.polymarket_us.TST]
+icao = "KABC"
+cli_location = "ZZZ"
+issuing_office = "KXYZ"
+iana_tz = "America/New_York"
+std_utc_offset_hours = -5.0
+body_header_regex = '^\.\.\.THE\s+TEST\s+CLIMATE\s+SUMMARY\s+FOR\b'
+never_substitute = ["KDEF"]
+never_substitute_cli_locations = ["DEF"]
+settlement_time_local = "08:00"
+settlement_timezone = "America/New_York"
+settlement_delay_time_local = "11:00"
+settlement_delay_timezone = "America/New_York"
+no_data_fallback_days = 7
