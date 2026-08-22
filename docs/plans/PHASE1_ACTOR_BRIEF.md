@@ -22,7 +22,7 @@ Build `src/breezy/ingest/nws_actor.py` and the supporting modules named below. O
 
 **F1 — `catalog.custom_data(...)` silently drops `metadata`.** It is used only on the `as_nautilus=True` branch and never forwarded to `query` (`catalog/base.py:202-218`). A warm-start response therefore publishes on the **metadata-less** topic `historical.data.NwsClimateDay*`, which a metadata-bearing subscription cannot match.
 
-**F2 — `Actor.run_in_executor` discards the callable's return value in both modes.** It returns a `TaskId` — a plain UUID with no `add_done_callback` and no result channel. With no executor registered it runs inline and throws the value away just the same. It is fire-and-forget only, and **cannot** host a parse that must return a record.
+**F2 — `Actor.run_in_executor` returns a `TaskId` only, with no result channel reachable through the `Actor` public API.** In no-executor mode, the callable's return value is discarded entirely. In executor mode, the `Future` IS retained via `ActorExecutor.get_future(task_id)`, but only if the caller holds a reference to the executor (which the `Actor` holds privately and does not expose). It is fire-and-forget from the actor's interface, and **cannot** host a parse that must return a record to the actor's own logic.
 
 **F3 — `DataEngine._query_catalog` breaks on the first registered catalog that returns rows.** With one catalog root per station, registering all N means stations 2..N silently warm-start from **station 1's records**. This is not a missing feature; it is confidently wrong data.
 

@@ -2,12 +2,12 @@
 
 Phase 1 parses CLI product text INLINE on the asyncio event loop -- there
 is no executor/process containment for this path (`Actor.run_in_executor`
-discards its callable's return value in both modes, so it cannot host a
-parse that must return a value). The consequence: a parse that is merely
-SLOW -- not necessarily catastrophically exponential -- stalls the
-ENTIRE Nautilus event loop, not just ingestion. Every venue heartbeat and
-every execution path in the process, halted by one malformed weather
-product.
+does not expose the result through the actor's public API and cannot host a
+parse that must return a value to the actor's own logic). The consequence:
+a parse that is merely SLOW -- not necessarily catastrophically exponential --
+stalls the ENTIRE Nautilus event loop, not just ingestion. Every venue
+heartbeat and every execution path in the process, halted by one malformed
+weather product.
 
 This test does not assert the parser accepts or rejects any given input
 correctly (that is covered by test_normalize_cli_parse*.py). It asserts

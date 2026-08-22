@@ -1,13 +1,25 @@
-"""Contract tests pinning WHY per-station separation must be a catalog root.
+"""Contract tests pinning why per-station separation must be a catalog root.
 
 Each assertion below was observed by execution against nautilus-trader 1.231.0.
-Together they close every alternative to one-root-per-station, so a future reader
-cannot "simplify" `breezy.persistence.catalog` into a single shared catalog with a
-filter. A failure here means the platform moved -- re-verify before changing
-Breezy.
+Together they verify that alternative approaches (single root with identifier-based
+filtering, metadata-based routing) cannot achieve the required station isolation
+without forfeiting append-only-by-construction.
+
+NautilusTrader DOES support identifier-based filtering if our record types
+carried an `instrument_id` (parquet.py:332-333, 2476-2477, 2249-2257); see
+`docs/plans/WEATHER_INGESTION_PROPOSAL.md` §10. However, adopting it would
+silently destroy the no-delete guarantee the settlement module depends on: today's
+identifier-less flat structure causes `delete_data_range(identifier=None)` to no-op
+because the substring match for `/data/custom_nws_climate_day/` fails in the actual
+path (parquet.py:1428); adding an `instrument_id` would place files under
+`/data/custom_nws_climate_day/<id>/`, matching the substring and allowing delete_data_range
+to execute. This test pins that the native facility exists but is declined to preserve
+settlement guarantees. A failure here means the platform moved -- re-verify before
+changing Breezy.
 
 Scope note: `tests/contract/test_catalog_nws_records.py` pins the record types'
-round-trip and the silent write-skip. This module pins the *partitioning* facts.
+round-trip and the silent write-skip. This module pins the *partitioning* and
+append-only design.
 """
 
 from __future__ import annotations

@@ -310,11 +310,12 @@ def test_drift_detection_is_one_sided_when_the_first_fragment_matches(tmp_path: 
 
     `_query_pyarrow` unifies fragments under the schema inferred from the FIRST
     one, and `get_file_list_from_data_cls` globs (so oldest-first, since filenames
-    are zero-padded nanosecond ranges). Both real version-drift directions are
-    therefore caught -- the oldest fragment disagrees with the registered schema,
-    which is exactly what the decoder compares. What the schema check cannot see
-    is a LATER fragment diverging while the first still matches: its missing
-    column is coerced to NULL before the decoder runs.
+    are ISO-8601-derived with fixed-width timestamp components that sort
+    lexicographically in chronological order). Both real version-drift directions
+    are therefore caught -- the oldest fragment disagrees with the registered
+    schema, which is exactly what the decoder compares. What the schema check
+    cannot see is a LATER fragment diverging while the first still matches: its
+    missing column is coerced to NULL before the decoder runs.
 
     The record's own constructor invariants close most of that gap as defence in
     depth, and this test pins exactly how much: a coerced NULL is caught wherever

@@ -2,24 +2,45 @@
 
 Why one catalog root per station
 --------------------------------
-There is no in-catalog filter that separates two stations' records on
-NautilusTrader 1.231.0, because neither :class:`~breezy.domain.nws_climate_day.NwsClimateDay`
-nor :class:`~breezy.domain.nws_raw_product.NwsRawProduct` carries an
-``instrument_id``:
+NautilusTrader 1.231.0 could separate two stations' records in a single
+catalog root if :class:`~breezy.domain.nws_climate_day.NwsClimateDay` and
+:class:`~breezy.domain.nws_raw_product.NwsRawProduct` carried an ``instrument_id``.
+The native mechanism works: ``identifier_function`` (``parquet.py:332-333``)
+DOES check for and use ``instrument_id``; ``_make_path`` (``parquet.py:2476-2477``)
+DOES append it to create ``/data/<type>/<id>/`` paths; and ``query(identifiers=[...])``
+and ``BacktestDataConfig(instrument_ids=[...])`` WOULD filter correctly
+(see `docs/plans/WEATHER_INGESTION_PROPOSAL.md` §10 for the evaluation).
 
-* ``_write_chunk`` partitions on ``Instrument`` -> ``bar_type`` -> ``instrument_id``
-  and otherwise writes **flat** to ``data/custom_<snake_name>/`` (``parquet.py:320-336``),
-  so every station's rows land in one directory;
-* ``write_data(..., identifier=...)`` is only consulted for the empty-data
-  file-name-extension case, and is otherwise derived from the objects themselves --
-  a custom type without ``instrument_id`` yields ``None``;
-* ``query(..., identifiers=[...])`` therefore matches nothing and returns ``[]``;
-* ``DataType`` metadata does not filter the catalog at all -- it only tags the
+However, adopting ``instrument_id`` would **forfeit append-only-by-construction**,
+a settlement-critical guarantee this module is designed to enforce:
+
+* Today, without identifier subdirectories, files sit at ``data/custom_nws_climate_day/``,
+  and ``delete_data_range(...)`` with ``identifier=None`` no-ops because the substring
+  match ``"/data/custom_nws_climate_day/"`` is not found in the actual directory path
+  (``parquet.py:1428`` substring-matches with a trailing separator, and
+  ``/path/data/custom_nws_climate_day`` contains no such separator after the type name).
+* Adding an ``instrument_id`` would place files at ``data/custom_nws_climate_day/<id>/``,
+  and that path DOES contain the substring. The second condition ``parts[-2] == data_cls_name``
+  (``parquet.py:1431``) would then pass, and ``delete_data_range`` would recursively delete,
+  **silently destroying the no-delete guarantee this module depends on.**
+
+Therefore, multi-station separation is achieved via **one catalog root per station**,
+which decouples settlement isolation from the fragility of ``delete_data_range``
+substring matching:
+
+* One root per ``(venue, city)`` pair ensures each station's rows are
+  partitioned to a dedicated filesystem directory;
+* ``station_catalog_path`` validates both components against a strict allowlist
+  and verifies containment under the base, closing symlink and path-traversal
+  attacks on both the root directory and the writer lock file;
+* ``DataType`` metadata does not filter the catalog -- it only tags the
   returned wrapper, so two ``BacktestDataConfig`` s differing only by metadata
-  replay every row twice.
+  replay every row twice, and metadata is therefore never consulted in the
+  station-selection logic;
+* No filtering within a catalog is required because each catalog serves only one station.
 
-The partition key that remains is the **directory**. This module owns that
-decision so the ingest and replay paths cannot disagree about it.
+The partition key is the **directory**. This module owns that decision so the
+ingest and replay paths cannot disagree about it.
 
 Path safety
 -----------

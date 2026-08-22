@@ -33,10 +33,11 @@ Known limit of the read-side guard
 The decoder sees the *dataset* schema, which pyarrow has already unified from the
 first fragment. Both real version-drift directions are caught, because the first
 fragment is the oldest (``get_file_list_from_data_cls`` globs, and filenames are
-zero-padded nanosecond ranges) and it is the oldest fragment that disagrees with
-the newly registered schema. What this check cannot see is a *later*
-fragment diverging while the first still matches -- its missing column is coerced
-to NULL before the decoder runs.
+ISO-8601-derived with fixed-width timestamp components that sort lexicographically
+in chronological order: ``2023-10-26T07-30-50-123456789Z_...parquet``) and it is
+the oldest fragment that disagrees with the newly registered schema. What this
+check cannot see is a *later* fragment diverging while the first still matches --
+its missing column is coerced to NULL before the decoder runs.
 
 The record constructors close most of that gap as defence in depth: a coerced NULL
 raises wherever it contradicts a non-nullable field guard or a paired value/sentinel
