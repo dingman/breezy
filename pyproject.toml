@@ -52,6 +52,7 @@ files = [
     "src/breezy/settlement",
     "src/breezy/domain",
     "src/breezy/ingest",
+    "src/breezy/persistence",
 ]
 
 # pyarrow ships no stubs, and nautilus_trader's Data base is a compiled Cython
@@ -66,6 +67,13 @@ follow_untyped_imports = false
 # — every other strict check still applies to this package.
 [[tool.mypy.overrides]]
 module = ["breezy.domain.*"]
+disallow_subclassing_any = false
+
+# Actor subclasses a compiled Cython class that erases to Any. Scoped to this one
+# module deliberately: a package-wide waiver would silently cover future ingest code
+# that has no such excuse.
+[[tool.mypy.overrides]]
+module = ["breezy.ingest.nws_actor"]
 disallow_subclassing_any = false
 
 [project.scripts]

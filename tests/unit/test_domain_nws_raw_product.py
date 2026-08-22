@@ -167,3 +167,145 @@ def test_class_name_is_not_a_prefix_of_the_other_record_class() -> None:
     a, b = NwsRawProduct.__name__, NwsClimateDay.__name__
     assert not a.startswith(b)
     assert not b.startswith(a)
+
+
+# -- `ts_event <= ts_init`, on every construction path ---------------------------------------
+
+_ONE_MINUTE_NS = 60_000_000_000
+_PRELIM_ISSUANCE_NS = int(
+    dt.datetime(2026, 8, 22, 20, 44, tzinfo=dt.UTC).timestamp() * 1_000_000_000,
+)
+
+
+def _payload(*, issuance_ns: int, retrieved_ns: int) -> dict[str, Any]:
+    """A `to_dict` payload with both instants set, kept internally consistent.
+
+    `from_dict` checks `ts_event == issuance_time_ns` and `ts_init ==
+    retrieved_at_ns` before it constructs, so each pair moves together — a test
+    for the ordering rule that tripped one of those guards instead would pass for
+    the wrong reason.
+    """
+    payload = make_raw_product().to_dict()
+    payload["issuance_time_ns"] = issuance_ns
+    payload["ts_event"] = issuance_ns
+    payload["retrieved_at_ns"] = retrieved_ns
+    payload["ts_init"] = retrieved_ns
+    return payload
+
+
+def test_constructor_rejects_issuance_after_retrieval() -> None:
+    with pytest.raises(ValueError, match="cannot be received before"):
+        make_raw_product(
+            issuance_time_ns=_RETRIEVED_NS + _ONE_MINUTE_NS,
+            retrieved_at_ns=_RETRIEVED_NS,
+        )
+
+
+def test_from_dict_rejects_a_stored_record_whose_issuance_postdates_retrieval() -> None:
+    """`from_dict` is the path replay reads through, so it is the path that needs the guard.
+
+    A row written by an older schema version, or by any path that is not
+    `ingest.records.build_raw_product`, otherwise flows into a backtest and
+    produces a plausible, wrong answer with no error anywhere.
+    """
+    with pytest.raises(ValueError, match="cannot be received before"):
+        NwsRawProduct.from_dict(
+            _payload(issuance_ns=_RETRIEVED_NS + _ONE_MINUTE_NS, retrieved_ns=_RETRIEVED_NS),
+        )
+
+
+def test_arrow_decode_rejects_a_violating_row_read_back_from_the_catalog() -> None:
+    """The registered decoder calls `from_dict` per row, so catalog replay inherits the guard."""
+    from nautilus_trader.serialization.arrow.serializer import ArrowSerializer
+
+    table = pa.Table.from_pylist(
+        [_payload(issuance_ns=_RETRIEVED_NS + _ONE_MINUTE_NS, retrieved_ns=_RETRIEVED_NS)],
+        schema=NwsRawProduct.schema(),
+    )
+
+    with pytest.raises(ValueError, match="cannot be received before"):
+        ArrowSerializer.deserialize(NwsRawProduct, table)
+
+
+def test_simultaneous_issuance_and_retrieval_is_accepted() -> None:
+    """The rule is `<=`, matching `build_raw_product`'s own `retrieved < issuance` rejection.
+
+    NWS publishes `issuanceTime` at minute granularity, so an equal pair is
+    ordinary. Tightening this to `<` would reject real archive rows at read time.
+    """
+    record = NwsRawProduct.from_dict(
+        _payload(issuance_ns=_ISSUANCE_NS, retrieved_ns=_ISSUANCE_NS),
+    )
+
+    assert record.ts_event == record.ts_init
+
+
+def test_the_invariant_holds_for_preliminary_issuances_too() -> None:
+    """Unconditional, not finals-only: this record's `ts_event` is always the issuance instant.
+
+    The finals-only scoping belongs to `NwsClimateDay`, whose `ts_event` is a
+    *derived* semantic instant (the end of the climate day for a final). The
+    archive record's `ts_event` is the product's own issuance time for both
+    issuance classes, and bytes cannot be received before they were issued in
+    either case.
+    """
+    preliminary = make_raw_product(
+        issuance_time_ns=_PRELIM_ISSUANCE_NS,
+        retrieved_at_ns=_PRELIM_ISSUANCE_NS + _ONE_MINUTE_NS,
+        climate_day=None,
+    )
+    assert preliminary.ts_event <= preliminary.ts_init
+
+    with pytest.raises(ValueError, match="cannot be received before"):
+        make_raw_product(
+            issuance_time_ns=_PRELIM_ISSUANCE_NS,
+            retrieved_at_ns=_PRELIM_ISSUANCE_NS - _ONE_MINUTE_NS,
+            climate_day=None,
+        )
+
+
+def test_the_archive_record_cannot_express_finality() -> None:
+    """Why the invariant here cannot be scoped to finals even in principle.
+
+    Finality is derived from the raw text later (`normalize.classify_issuance`)
+    and lives on `NwsClimateDay`. This record has no such field, and its
+    `climate_day` is nullable because capture precedes parsing.
+    """
+    assert "is_final" not in NwsRawProduct.schema().names
+    assert not hasattr(make_raw_product(), "is_final")
+
+
+def test_from_dict_rejects_a_ts_event_decoupled_from_the_issuance_field() -> None:
+    """`ts_event` is derived, never stored independently.
+
+    The ordering rule above is only meaningful because these two columns cannot
+    drift apart on the read path: a row whose `ts_event` disagreed with
+    `issuance_time_ns` could satisfy the ordering while describing a different
+    instant than the provenance it carries.
+    """
+    payload = make_raw_product().to_dict()
+    payload["ts_event"] = _ISSUANCE_NS - _ONE_MINUTE_NS
+
+    with pytest.raises(ValueError, match="must equal `issuance_time_ns`"):
+        NwsRawProduct.from_dict(payload)
+
+
+def test_from_dict_rejects_a_ts_init_decoupled_from_the_retrieval_field() -> None:
+    payload = make_raw_product().to_dict()
+    payload["ts_init"] = _RETRIEVED_NS + _ONE_MINUTE_NS
+
+    with pytest.raises(ValueError, match="must equal `retrieved_at_ns`"):
+        NwsRawProduct.from_dict(payload)
+
+
+def test_repr_names_both_digests_and_both_instants_without_the_raw_text() -> None:
+    """The archive text can be tens of kilobytes; `repr` reports its length, not its body."""
+    rendered = repr(make_raw_product())
+
+    assert rendered.startswith("NwsRawProduct(")
+    assert _RAW_SHA in rendered
+    assert _RESPONSE_SHA in rendered
+    assert f"ts_event={_ISSUANCE_NS}" in rendered
+    assert f"ts_init={_RETRIEVED_NS}" in rendered
+    assert f"raw_len={len(_RAW_TEXT)}" in rendered
+    assert _RAW_TEXT not in rendered

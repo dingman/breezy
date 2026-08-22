@@ -22,6 +22,11 @@ _CLIMATE_DAY_END_NS = int(
 )
 _ISSUANCE_NS = int(dt.datetime(2026, 8, 23, 6, 27, tzinfo=dt.UTC).timestamp() * 1_000_000_000)
 _RETRIEVED_NS = int(dt.datetime(2026, 8, 23, 6, 31, tzinfo=dt.UTC).timestamp() * 1_000_000_000)
+# The ~4:44 PM local preliminary for the same climate day, and the poll that got it.
+_PRELIM_ISSUED_NS = int(dt.datetime(2026, 8, 22, 20, 44, tzinfo=dt.UTC).timestamp() * 1_000_000_000)
+_PRELIM_RETRIEVED_NS = int(
+    dt.datetime(2026, 8, 22, 20, 49, tzinfo=dt.UTC).timestamp() * 1_000_000_000,
+)
 _SHA = hashlib.sha256(b"CDUS41 KOKX 230627").hexdigest()
 
 
@@ -68,17 +73,50 @@ def test_ts_init_is_retrieved_at_ns_and_is_not_a_constructor_parameter() -> None
 
 
 def test_ts_event_is_the_caller_supplied_semantic_instant() -> None:
+    """The default fixture is final-shaped, so its `ts_event` is the climate-day end."""
     record = make_climate_day()
+    assert record.is_final is True
     assert record.ts_event == _CLIMATE_DAY_END_NS
+    assert record.ts_event <= record.ts_init
+
+
+def test_preliminary_ts_event_is_the_issuance_instant_and_precedes_retrieval() -> None:
+    """A preliminary's `ts_event` is when it was issued -- never the climate-day end.
+
+    So `ts_event <= ts_init` holds for every preliminary the pipeline can build:
+    `NwsRawProduct` rejects `issuance_time_ns > retrieved_at_ns`, and
+    `build_climate_day` copies that same issuance instant into `ts_event`.
+    Asserting the ordering for preliminaries would therefore be vacuous, which is
+    why `build_climate_day` scopes the assertion to finals. Derivation itself is
+    pinned in `tests/unit/test_ingest_records.py`.
+    """
+    preliminary = make_climate_day(
+        is_final=False,
+        issuance_time_ns=_PRELIM_ISSUED_NS,
+        retrieved_at_ns=_PRELIM_RETRIEVED_NS,
+        ts_event=_PRELIM_ISSUED_NS,
+    )
+
+    assert preliminary.ts_event == preliminary.issuance_time_ns
+    assert preliminary.ts_event <= preliminary.ts_init
 
 
 def test_no_global_ts_event_le_ts_init_invariant_is_enforced() -> None:
-    """A preliminary's climate day ends after the poll; the type must not reject that."""
-    preliminary = make_climate_day(
-        is_final=False,
-        ts_event=_RETRIEVED_NS + 3_600 * 1_000_000_000,
-    )
-    assert preliminary.ts_event > preliminary.ts_init
+    """No ordering check here, for *either* issuance class.
+
+    Not headroom for preliminaries -- a preliminary's `ts_event` is its issuance
+    instant and cannot post-date retrieval. The finals-only assertion is an
+    ingestion-time classification guard in `build_climate_day`; this type stores
+    what it is handed, including on the `from_dict` decode path that must rebuild
+    rows already written. Enforcing the ordering here -- globally or for one class
+    -- fails this test.
+    """
+    for is_final in (True, False):
+        record = make_climate_day(
+            is_final=is_final,
+            ts_event=_RETRIEVED_NS + 3_600 * 1_000_000_000,
+        )
+        assert record.ts_event > record.ts_init
 
 
 # --------------------------------------------------------------------------------------

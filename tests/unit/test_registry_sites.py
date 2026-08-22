@@ -13,7 +13,9 @@ import pytest
 
 from breezy.registry.sites import (
     DEFAULT_REGISTRY_PATH,
+    ClimateDayWindow,
     EnrichmentCoordinates,
+    SettlementDeadline,
     SettlementSite,
     SiteNotFoundError,
     SiteRegistry,
@@ -29,6 +31,16 @@ EXPECTED_HEADERS = {
     "MIA": "...THE MIAMI CLIMATE SUMMARY FOR AUGUST 21 2026...",
     "MDW": "...THE CHICAGO-MIDWAY CLIMATE SUMMARY FOR AUGUST 21 2026...",
     "LAX": "...THE LOS ANGELES INTL AIRPORT CA CLIMATE SUMMARY FOR AUGUST 21 2026...",
+}
+
+# The station's own (DST-following) IANA zone, per sites.toml -- used ONLY as
+# a test-side expectation to prove the venue settlement clock is NOT
+# site-local. The loader deliberately does not expose this value (see
+# `test_iana_tz_is_not_exposed_by_any_accessor`).
+_SITE_LOCAL_TZ_FOR_TEST = {
+    "MDW": "America/Chicago",
+    "LAX": "America/Los_Angeles",
+    "SFO": "America/Los_Angeles",
 }
 
 
@@ -67,28 +79,109 @@ def test_settlement_accessor_requires_venue_and_city(registry: SiteRegistry) -> 
         registry.settlement_site("NYC")  # type: ignore[call-arg]
 
 
+def test_climate_day_window_and_settlement_deadline_require_venue_and_city(
+    registry: SiteRegistry,
+) -> None:
+    window = registry.climate_day_window("polymarket_us", "NYC")
+    assert isinstance(window, ClimateDayWindow)
+    with pytest.raises(SiteNotFoundError):
+        registry.climate_day_window("kalshi", "NYC")
+    with pytest.raises(SiteNotFoundError):
+        registry.climate_day_window("polymarket_us", "NOPE")
+    with pytest.raises(TypeError):
+        registry.climate_day_window("NYC")  # type: ignore[call-arg]
+
+    deadline = registry.settlement_deadline("polymarket_us", "NYC")
+    assert isinstance(deadline, SettlementDeadline)
+    with pytest.raises(SiteNotFoundError):
+        registry.settlement_deadline("kalshi", "NYC")
+    with pytest.raises(SiteNotFoundError):
+        registry.settlement_deadline("polymarket_us", "NOPE")
+    with pytest.raises(TypeError):
+        registry.settlement_deadline("NYC")  # type: ignore[call-arg]
+
+
 @pytest.mark.parametrize("city", ["MDW", "LAX", "SFO"])
 def test_settlement_clock_is_venue_not_site_local(registry: SiteRegistry, city: str) -> None:
-    site = registry.settlement_site("polymarket_us", city)
-    assert site.settlement_timezone == "America/New_York"
-    assert site.settlement_time_local == "08:00"
-    # For these three sites the venue clock and the station's own IANA zone
+    deadline = registry.settlement_deadline("polymarket_us", city)
+    assert deadline.settlement_timezone == "America/New_York"
+    assert deadline.settlement_time_local == "08:00"
+    # For these three sites the venue clock and the station's own zone
     # differ -- 08:00 ET is emphatically not 08:00 at the station.
-    assert site.iana_tz != site.settlement_timezone
+    assert deadline.settlement_timezone != _SITE_LOCAL_TZ_FOR_TEST[city]
 
 
 def test_settlement_clock_matches_venue_for_all_sites(registry: SiteRegistry) -> None:
     for venue, city in registry.pairs():
-        site = registry.settlement_site(venue, city)
-        assert site.settlement_timezone == "America/New_York"
-        assert site.settlement_delay_timezone == "America/New_York"
+        deadline = registry.settlement_deadline(venue, city)
+        assert deadline.settlement_timezone == "America/New_York"
+        assert deadline.settlement_delay_timezone == "America/New_York"
 
 
 def test_conditional_delay_time_is_exposed(registry: SiteRegistry) -> None:
+    deadline = registry.settlement_deadline("polymarket_us", "NYC")
+    assert deadline.settlement_delay_time_local == "11:00"
+    assert deadline.settlement_delay_timezone == "America/New_York"
+    assert deadline.settlement_delay_time_local != deadline.settlement_time_local
+
+
+def test_climate_day_offset_is_fixed_standard_time_for_all_sites(registry: SiteRegistry) -> None:
+    expected = {
+        "NYC": -5.0,
+        "SFO": -8.0,
+        "MIA": -5.0,
+        "MDW": -6.0,
+        "LAX": -8.0,
+    }
+    for city, offset in expected.items():
+        window = registry.climate_day_window("polymarket_us", city)
+        assert window.std_utc_offset_hours == pytest.approx(offset)
+
+
+def test_climate_day_offset_and_venue_clock_are_structurally_separate(
+    registry: SiteRegistry,
+) -> None:
+    """The two clocks must be unreachable through each other's accessor.
+
+    `ClimateDayWindow` (fixed standard-time offset, never DST-aware) and
+    `SettlementDeadline` (DST-following venue wall-clock deadline) are
+    different types returned by different accessors -- a caller cannot reach
+    for the wrong one by autocomplete. Mirrors
+    `test_open_meteo_coordinates_not_reachable_through_settlement_accessor`.
+    """
+    window = registry.climate_day_window("polymarket_us", "NYC")
+    assert not hasattr(window, "settlement_timezone")
+    assert not hasattr(window, "settlement_time_local")
+    assert not hasattr(window, "settlement_delay_time_local")
+    assert not hasattr(window, "settlement_delay_timezone")
+    assert not hasattr(window, "no_data_fallback_days")
+
+    deadline = registry.settlement_deadline("polymarket_us", "NYC")
+    assert not hasattr(deadline, "std_utc_offset_hours")
+
     site = registry.settlement_site("polymarket_us", "NYC")
-    assert site.settlement_delay_time_local == "11:00"
-    assert site.settlement_delay_timezone == "America/New_York"
-    assert site.settlement_delay_time_local != site.settlement_time_local
+    assert not hasattr(site, "std_utc_offset_hours")
+    assert not hasattr(site, "settlement_timezone")
+    assert not hasattr(site, "settlement_time_local")
+
+
+def test_iana_tz_is_not_exposed_by_any_accessor(registry: SiteRegistry) -> None:
+    """iana_tz is real, verified data in sites.toml but has no consumer.
+
+    Its only plausible future use is confusing the DST-following venue
+    settlement clock with the non-DST-aware climate-day offset, so the
+    loader validates its presence (see test_registry_validation.py) but
+    never surfaces it through any returned type.
+    """
+    site = registry.settlement_site("polymarket_us", "NYC")
+    window = registry.climate_day_window("polymarket_us", "NYC")
+    deadline = registry.settlement_deadline("polymarket_us", "NYC")
+    coords = registry.enrichment_coordinates("polymarket_us", "NYC")
+
+    assert not hasattr(site, "iana_tz")
+    assert not hasattr(window, "iana_tz")
+    assert not hasattr(deadline, "iana_tz")
+    assert not hasattr(coords, "iana_tz")
 
 
 def test_open_meteo_coordinates_not_reachable_through_settlement_accessor(

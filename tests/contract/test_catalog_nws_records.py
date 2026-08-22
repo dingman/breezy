@@ -25,6 +25,7 @@ from nautilus_trader.serialization.arrow.serializer import ArrowSerializer
 from breezy.domain.nws_climate_day import CLIMATE_DAY_SCHEMA_VERSION, NwsClimateDay
 from breezy.domain.selection import select_climate_day
 from breezy.domain.strict_arrow import SchemaDriftError
+from breezy.persistence.catalog import read_current_climate_day
 
 pytestmark = pytest.mark.contract
 
@@ -208,13 +209,27 @@ def test_correction_supersedes_via_later_ts_init(tmp_path: Path) -> None:
     assert as_of_before.tmax_f == 84
 
 
-def test_ts_event_le_ts_init_holds_for_finals_only(tmp_path: Path) -> None:
-    """The invariant is scoped to finals and must NOT be enforced globally.
+def test_catalog_does_not_enforce_ts_event_le_ts_init(tmp_path: Path) -> None:
+    """The catalog round-trips a row whose `ts_event` post-dates its `ts_init`.
 
-    A final's `ts_event` is the end of the climate day (LST), always before the
-    ~02:27 local retrieval that follows it. A preliminary is polled mid-afternoon
-    while its own climate day still has hours to run, so any record whose
-    `ts_event` is the climate-day end violates the ordering by construction.
+    This pins **catalog permissiveness**, not pipeline semantics. `NwsClimateDay`
+    carries no `ts_event <= ts_init` field invariant, so such a row must come
+    back out unchanged -- never clamped, reordered or silently rejected -- and
+    therefore stays detectable downstream.
+
+    The preliminary below is deliberately **non-pipeline-shaped**:
+    `build_climate_day` can never emit it. A pipeline preliminary's `ts_event`
+    *is* its `issuance_time_ns`, and `NwsRawProduct` rejects
+    `issuance_time_ns > retrieved_at_ns` unconditionally at construction, so
+    `ts_event <= ts_init` holds for every built preliminary as a theorem.
+    Hand-setting this fixture's `ts_event` to the climate-day end is the only
+    way to manufacture the ordering the catalog is being tested against.
+
+    It is therefore NOT evidence that preliminaries are a class the builder's
+    finals-only check exempts. That check is a misclassification detector: a
+    final's `ts_event` is derived from `(summary_date, registry standard
+    offset)` independently of the fetch, which makes finals the only class
+    where the comparison can carry information. See `breezy.ingest.records`.
     """
     catalog = make_catalog(tmp_path)
     preliminary = make_climate_day(
@@ -239,8 +254,8 @@ def test_ts_event_le_ts_init_holds_for_finals_only(tmp_path: Path) -> None:
         assert record.ts_event <= record.ts_init
 
     assert any(r.ts_event > r.ts_init for r in preliminaries), (
-        "the catalog accepted and returned a preliminary whose semantic instant "
-        "post-dates its arrival; a global ts_event <= ts_init assertion is invalid"
+        "the catalog must persist and return a row whose semantic instant "
+        "post-dates its arrival, unchanged; it does not enforce ts_event <= ts_init"
     )
 
 
@@ -376,3 +391,97 @@ def test_published_average_persists_as_a_whole_degree_int(tmp_path: Path) -> Non
     assert restored.tavg_f == 74
     assert isinstance(restored.tavg_f, int)
     assert restored.tavg_f != (restored.tmax_f + restored.tmin_f) / 2
+
+
+def test_backfilled_preliminary_never_supersedes_a_final_through_the_catalog(
+    tmp_path: Path,
+) -> None:
+    """The finality rule must hold on the real read path, not just in memory.
+
+    Phase 2's IEM/AFOS backfill re-fetches ~7 days of products and stamps
+    ``ts_init = retrieved_at_ns = now``, so a re-fetched PRELIMINARY lands on disk
+    with a strictly later ``ts_init`` than the FINAL already stored for the same
+    ``(station, climate_day)``. Selecting on arrival alone would hand settlement a
+    value NWS never finalized. Written as two disjoint ``ts_init`` ranges so both
+    records genuinely persist (a same-range write is silently skipped).
+    """
+    catalog = make_catalog(tmp_path)
+    backfilled_ns = _FINAL_RETRIEVED_NS + 7 * 86_400_000_000_000
+
+    final = make_climate_day(tmax_f=84, is_final=True)
+    backfilled_preliminary = make_climate_day(
+        tmax_f=82,
+        is_final=False,
+        revision_seq=2,
+        issuance_time_ns=_PRELIM_ISSUED_NS,
+        retrieved_at_ns=backfilled_ns,
+        ts_event=_PRELIM_ISSUED_NS,
+    )
+
+    catalog.write_data([final])
+    catalog.write_data([backfilled_preliminary])
+
+    stored = unwrap(catalog.query(data_cls=NwsClimateDay))
+    assert len(stored) == 2
+    assert max(r.ts_init for r in stored) == backfilled_ns, (
+        "the preliminary is the latest arrival on disk; that is the trap"
+    )
+
+    for selected in (
+        select_climate_day(stored, "NYC", _DAY),
+        read_current_climate_day(catalog, station="NYC", climate_day=_DAY),
+    ):
+        assert selected is not None
+        assert selected.is_final is True
+        assert selected.tmax_f == 84
+
+    # Point-in-time correctness survives: that afternoon, the preliminary had not
+    # even been superseded yet, and as of the final's arrival the final is current.
+    as_of_final = read_current_climate_day(
+        catalog,
+        station="NYC",
+        climate_day=_DAY,
+        as_of_ts_init=_FINAL_RETRIEVED_NS,
+    )
+    assert as_of_final is not None
+    assert as_of_final.is_final is True
+    assert as_of_final.tmax_f == 84
+
+
+def test_as_of_before_the_final_returns_the_preliminary_through_the_catalog(
+    tmp_path: Path,
+) -> None:
+    """The ``as_of_ts_init`` bound is applied BEFORE finality precedence.
+
+    At 17:00 local on the climate day the preliminary is genuinely everything
+    Breezy knew, so a backtest replayed to that instant must see it. "A final
+    always wins" is a claim about the candidate set after the bound, never about
+    the whole record set.
+    """
+    catalog = make_catalog(tmp_path)
+    preliminary = make_climate_day(
+        tmax_f=82,
+        is_final=False,
+        issuance_time_ns=_PRELIM_ISSUED_NS,
+        retrieved_at_ns=_PRELIM_RETRIEVED_NS,
+        ts_event=_PRELIM_ISSUED_NS,
+    )
+    final = make_climate_day(tmax_f=84, is_final=True, revision_seq=2)
+
+    catalog.write_data([preliminary])
+    catalog.write_data([final])
+
+    as_of_that_afternoon = read_current_climate_day(
+        catalog,
+        station="NYC",
+        climate_day=_DAY,
+        as_of_ts_init=_PRELIM_RETRIEVED_NS + 600_000_000_000,
+    )
+    assert as_of_that_afternoon is not None
+    assert as_of_that_afternoon.is_final is False
+    assert as_of_that_afternoon.tmax_f == 82
+
+    current = read_current_climate_day(catalog, station="NYC", climate_day=_DAY)
+    assert current is not None
+    assert current.is_final is True
+    assert current.tmax_f == 84

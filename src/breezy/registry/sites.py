@@ -5,14 +5,27 @@ Breezy. This module is a read-only, eagerly-validated view over that file. It
 imports no `nautilus_trader` and derives nothing: every settlement-critical
 identifier is read from the file verbatim.
 
-Two structural guarantees this module exists to enforce:
+Structural guarantees this module exists to enforce:
 
 - `(venue, city)` keying everywhere -- there is no city-only accessor, so a
   second venue (Kalshi) needs no restructuring later.
 - Enrichment isolation -- `SettlementSite` carries no `open_meteo` fields at
   all. Forecast coordinates are reachable only via `enrichment_coordinates`,
-  a differently-named accessor returning a differently-typed object. That is
-  a property of the API shape, not a convention callers must remember.
+  a differently-named accessor returning a differently-typed object.
+- Two-clock isolation -- there are two genuinely different clocks in this
+  system and they must never be confused:
+    1. `ClimateDayWindow.std_utc_offset_hours` -- the FIXED standard-time
+       offset that defines the climate day's midnight-to-midnight window,
+       year-round, never DST-aware.
+    2. `SettlementDeadline` -- the VENUE's settlement deadline, a
+       DST-following civil wall-clock time (`settlement_timezone`,
+       `America/New_York` for every site regardless of station location),
+       plus its conditional review delay.
+  These are returned by two distinct accessors as two distinct types so a
+  caller cannot reach for the wrong one by autocomplete. `iana_tz` -- the
+  one field whose only plausible use is confusing the two -- is validated
+  as present (it is real, verified provenance) but is not surfaced by any
+  accessor; see the note on `_build_climate_day_window`.
 """
 
 from __future__ import annotations
@@ -27,15 +40,23 @@ from typing import Any, Final
 
 DEFAULT_REGISTRY_PATH: Final[Path] = Path(__file__).resolve().parent / "sites.toml"
 
-_REQUIRED_SITE_FIELDS: Final[tuple[str, ...]] = (
+_REQUIRED_IDENTIFIER_FIELDS: Final[tuple[str, ...]] = (
     "icao",
     "cli_location",
     "issuing_office",
-    "iana_tz",
-    "std_utc_offset_hours",
     "body_header_regex",
     "never_substitute",
     "never_substitute_cli_locations",
+)
+
+# `iana_tz` is required and validated (real, verified data) but is NEVER
+# stored on any returned type -- see the module docstring and
+# `_build_climate_day_window`.
+_REQUIRED_UNSURFACED_FIELDS: Final[tuple[str, ...]] = ("iana_tz",)
+
+_REQUIRED_CLIMATE_DAY_FIELDS: Final[tuple[str, ...]] = ("std_utc_offset_hours",)
+
+_REQUIRED_SETTLEMENT_DEADLINE_FIELDS: Final[tuple[str, ...]] = (
     "settlement_time_local",
     "settlement_timezone",
     "settlement_delay_time_local",
@@ -70,16 +91,16 @@ class SiteNotFoundError(RegistryError, KeyError):
 
 @dataclass(frozen=True, slots=True)
 class SettlementSite:
-    """A single settlement-critical `(venue, city)` binding.
+    """Settlement-critical identity for a `(venue, city)` binding.
 
     Every field is a stored value read verbatim from `sites.toml` -- nothing
     here is computed from another field. In particular `cli_location` is
     never derived from `icao`.
 
-    Deliberately excludes any enrichment (`open_meteo`) fields. See
-    `EnrichmentCoordinates` and `SiteRegistry.enrichment_coordinates` for
-    forecast-only coordinate data, which lives on a separate type reachable
-    only through a separately-named accessor.
+    Deliberately excludes enrichment (`open_meteo`) fields -- see
+    `EnrichmentCoordinates` -- and both clock concerns -- see
+    `ClimateDayWindow` and `SettlementDeadline` -- each reachable only
+    through its own separately-named accessor.
     """
 
     venue: str
@@ -87,18 +108,49 @@ class SettlementSite:
     icao: str
     cli_location: str
     issuing_office: str
-    iana_tz: str
-    std_utc_offset_hours: float
     body_header_regex: Pattern[str]
     never_substitute: tuple[str, ...]
     never_substitute_cli_locations: tuple[str, ...]
-    # VENUE clock, paired with settlement_timezone -- NOT this site's local
-    # clock. For MDW, LAX and SFO the settlement instant is deliberately not
-    # 08:00 at the station.
+
+
+@dataclass(frozen=True, slots=True)
+class ClimateDayWindow:
+    """The climate day's fixed standard-time UTC offset for `(venue, city)`.
+
+    `std_utc_offset_hours` is NEVER DST-aware: the climate day runs
+    local-standard midnight to midnight all year regardless of whether the
+    date falls under daylight saving. Structurally distinct from
+    `SettlementDeadline` -- this type carries no timezone-ish string field
+    at all, so there is nothing here a caller could mistake for the
+    DST-following venue clock.
+    """
+
+    venue: str
+    city: str
+    std_utc_offset_hours: float
+
+
+@dataclass(frozen=True, slots=True)
+class SettlementDeadline:
+    """The VENUE's settlement deadline clock for `(venue, city)`.
+
+    `settlement_time_local` / `settlement_timezone` are the venue's clock
+    (08:00 America/New_York for every site today), NOT the station's own
+    local clock -- for MDW, LAX and SFO the settlement instant is
+    deliberately not 08:00 at the station. `settlement_timezone` DOES
+    observe DST, unlike `ClimateDayWindow.std_utc_offset_hours`, and that is
+    correct: it is a civil wall-clock deadline, not the climate-day window.
+
+    `settlement_delay_time_local` / `settlement_delay_timezone` is the
+    conditional review delay (applies when the CLI reading disagrees with
+    the 24-hour METAR observation) -- also the venue's clock, not
+    site-local.
+    """
+
+    venue: str
+    city: str
     settlement_time_local: str
     settlement_timezone: str
-    # Conditional delay clock (applies when the CLI reading disagrees with
-    # the 24-hour METAR observation). Also the venue's clock, not site-local.
     settlement_delay_time_local: str
     settlement_delay_timezone: str
     no_data_fallback_days: int
@@ -137,7 +189,7 @@ def _compile_header_regex(pattern: str, site_key: str) -> Pattern[str]:
 
 def _build_settlement_site(venue: str, city: str, table: dict[str, Any]) -> SettlementSite:
     site_key = f"{venue}.{city}"
-    for field in _REQUIRED_SITE_FIELDS:
+    for field in _REQUIRED_IDENTIFIER_FIELDS:
         _require_field(table, field, site_key)
 
     never_substitute = tuple(str(x) for x in table["never_substitute"])
@@ -150,13 +202,48 @@ def _build_settlement_site(venue: str, city: str, table: dict[str, Any]) -> Sett
         icao=str(table["icao"]),
         cli_location=str(table["cli_location"]),
         issuing_office=str(table["issuing_office"]),
-        iana_tz=str(table["iana_tz"]),
-        std_utc_offset_hours=float(table["std_utc_offset_hours"]),
         body_header_regex=_compile_header_regex(str(table["body_header_regex"]), site_key),
         never_substitute=never_substitute,
         never_substitute_cli_locations=tuple(
             str(x) for x in table["never_substitute_cli_locations"]
         ),
+    )
+
+
+def _build_climate_day_window(venue: str, city: str, table: dict[str, Any]) -> ClimateDayWindow:
+    site_key = f"{venue}.{city}"
+    for field in _REQUIRED_CLIMATE_DAY_FIELDS:
+        _require_field(table, field, site_key)
+
+    # `iana_tz` is validated as present -- it is real, verified provenance
+    # and must not silently disappear from the registry's contract -- but
+    # deliberately discarded here rather than stored on `ClimateDayWindow`.
+    # Its only plausible future use is being reached for as if it were the
+    # DST-aware venue settlement clock (it is not: see `SettlementDeadline`)
+    # or as a shortcut past the fixed `std_utc_offset_hours` (it would be
+    # wrong for that too, since it follows DST and the climate day does
+    # not). Add a dedicated accessor only when a concrete consumer needs
+    # display/parsing context, not before.
+    for field in _REQUIRED_UNSURFACED_FIELDS:
+        _require_field(table, field, site_key)
+
+    return ClimateDayWindow(
+        venue=venue,
+        city=city,
+        std_utc_offset_hours=float(table["std_utc_offset_hours"]),
+    )
+
+
+def _build_settlement_deadline(
+    venue: str, city: str, table: dict[str, Any]
+) -> SettlementDeadline:
+    site_key = f"{venue}.{city}"
+    for field in _REQUIRED_SETTLEMENT_DEADLINE_FIELDS:
+        _require_field(table, field, site_key)
+
+    return SettlementDeadline(
+        venue=venue,
+        city=city,
         settlement_time_local=str(table["settlement_time_local"]),
         settlement_timezone=str(table["settlement_timezone"]),
         settlement_delay_time_local=str(table["settlement_delay_time_local"]),
@@ -204,10 +291,14 @@ class SiteRegistry:
         self,
         registry_version: str,
         settlement_sites: dict[tuple[str, str], SettlementSite],
+        climate_day_windows: dict[tuple[str, str], ClimateDayWindow],
+        settlement_deadlines: dict[tuple[str, str], SettlementDeadline],
         enrichment_sites: dict[tuple[str, str], EnrichmentCoordinates],
     ) -> None:
         self._registry_version = registry_version
         self._settlement_sites = settlement_sites
+        self._climate_day_windows = climate_day_windows
+        self._settlement_deadlines = settlement_deadlines
         self._enrichment_sites = enrichment_sites
 
     @property
@@ -220,7 +311,7 @@ class SiteRegistry:
         return tuple(self._settlement_sites.keys())
 
     def settlement_site(self, venue: str, city: str) -> SettlementSite:
-        """Return the settlement-critical binding for `(venue, city)`.
+        """Return the settlement identity for `(venue, city)`.
 
         Raises `SiteNotFoundError` for an unregistered venue or city --
         never returns `None` and never silently substitutes a neighbour.
@@ -230,6 +321,32 @@ class SiteRegistry:
         except KeyError as exc:
             raise SiteNotFoundError(
                 f"no settlement site registered for venue={venue!r} city={city!r}"
+            ) from exc
+
+    def climate_day_window(self, venue: str, city: str) -> ClimateDayWindow:
+        """Return the climate day's fixed standard-time offset for `(venue, city)`.
+
+        Structurally separate from `settlement_deadline`: never DST-aware,
+        never a wall-clock deadline.
+        """
+        try:
+            return self._climate_day_windows[(venue, city)]
+        except KeyError as exc:
+            raise SiteNotFoundError(
+                f"no climate-day window registered for venue={venue!r} city={city!r}"
+            ) from exc
+
+    def settlement_deadline(self, venue: str, city: str) -> SettlementDeadline:
+        """Return the venue's settlement deadline clock for `(venue, city)`.
+
+        Structurally separate from `climate_day_window`: this is the venue's
+        DST-following civil deadline, never the climate-day offset.
+        """
+        try:
+            return self._settlement_deadlines[(venue, city)]
+        except KeyError as exc:
+            raise SiteNotFoundError(
+                f"no settlement deadline registered for venue={venue!r} city={city!r}"
             ) from exc
 
     def enrichment_coordinates(self, venue: str, city: str) -> EnrichmentCoordinates:
@@ -267,6 +384,8 @@ def load_registry(path: Path = DEFAULT_REGISTRY_PATH) -> SiteRegistry:
         raise RegistryError("registry: missing or empty top-level table 'sites'")
 
     settlement_sites: dict[tuple[str, str], SettlementSite] = {}
+    climate_day_windows: dict[tuple[str, str], ClimateDayWindow] = {}
+    settlement_deadlines: dict[tuple[str, str], SettlementDeadline] = {}
     enrichment_sites: dict[tuple[str, str], EnrichmentCoordinates] = {}
 
     for venue, cities_raw in sites_raw.items():
@@ -276,6 +395,12 @@ def load_registry(path: Path = DEFAULT_REGISTRY_PATH) -> SiteRegistry:
             if not isinstance(table_raw, dict):
                 raise RegistryError(f"registry: site '{venue}.{city}' is not a table")
             settlement_sites[(venue, city)] = _build_settlement_site(venue, city, table_raw)
+            climate_day_windows[(venue, city)] = _build_climate_day_window(
+                venue, city, table_raw
+            )
+            settlement_deadlines[(venue, city)] = _build_settlement_deadline(
+                venue, city, table_raw
+            )
             enrichment_sites[(venue, city)] = _build_enrichment_coordinates(
                 venue, city, table_raw
             )
@@ -283,6 +408,8 @@ def load_registry(path: Path = DEFAULT_REGISTRY_PATH) -> SiteRegistry:
     return SiteRegistry(
         registry_version=registry_version,
         settlement_sites=settlement_sites,
+        climate_day_windows=climate_day_windows,
+        settlement_deadlines=settlement_deadlines,
         enrichment_sites=enrichment_sites,
     )
 

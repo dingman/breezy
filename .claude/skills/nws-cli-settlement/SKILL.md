@@ -195,7 +195,13 @@ Similarly, `pyiem.nws.products.cf6` parses the F6 form (monthly/daily climate ta
 
 **Libraries to AVOID** (stale/unmaintained): nwswx, nwsapy, noaa-sdk.
 
-**Gotcha**: Even with pyIEM, validate parser output against physical sanity bounds (max ≤ 130°F, min ≥ -100°F, max ≥ min) before trusting it as settlement input. Defense against malformed upstream text AND parser bugs.
+**Gotcha**: Even with pyIEM, validate parser output against physical sanity bounds before trusting it as settlement input. Defense against malformed upstream text AND parser bugs.
+
+Bounds are **max ≤ 140°F, min ≥ -100°F, tmin ≤ tavg ≤ tmax** (equality accepted — CLI publishes whole degrees, so a fog-locked SFO day legitimately rounds all three to the same value), plus a **diurnal range ≤ 130°F**.
+
+**140, not 130.** An earlier revision of this file said 130°F, which is *below* the WMO-recognised record of 134°F (Death Valley, 1913) — that is a bound on "unusual", not on "impossible", and it would reject a record-breaking day. Get the asymmetry right: a bound that is too wide lets one absurd value through into a gate that has several other guards, while a bound that is too tight takes the bot offline **precisely when a record-breaking day makes the market most interesting**. Err wide. Our five sites top out near 110°F, so 140 leaves ~30°F of headroom over anything they can produce.
+
+**The diurnal-range bound is not redundant with the per-field envelope**, and this is the load-bearing argument for keeping it: the envelope alone permits a 240°F span (140 paired with -100) because it never inspects the two values *together*. A column shift that pairs a real MAXIMUM with another row's MINIMUM yields two individually-plausible numbers and one impossible pair. Calibrate it from the world record 100°F swing (Browning MT, 1916), never from our sites' observed ~40-45°F ranges — otherwise it becomes the constraint that halts a record day.
 
 ---
 
@@ -295,7 +301,7 @@ Before marking a CLI record as ready for settlement:
 - [ ] Re-poll `/products/types/CLI/locations/{loc}` for candidate supersessions if already settled
 - [ ] Dedupe on `(productCode, location, summary_date, hash)`, never on UUID
 - [ ] Use monotonic `revision_seq` if a correction lands after settlement
-- [ ] Validate parsed max/min against sanity bounds (max ≤ 130°F, min ≥ -100°F, max ≥ min)
+- [ ] Validate parsed max/min/avg against sanity bounds (max ≤ 140°F, min ≥ -100°F, tmin ≤ tavg ≤ tmax, diurnal range ≤ 130°F) — see the bounds note above for why 140 and not 130
 - [ ] Store all 16 provenance fields including raw_text + sha256
 - [ ] Cross-check via ACIS if anomalous
 - [ ] Consult `src/breezy/registry/sites.toml` (not this skill's table) for station configuration

@@ -56,8 +56,10 @@ def station_header_lines(sites: dict[str, dict]) -> dict[str, str]:
     """
     headers = {}
     for city, fixture_dir in CITY_FIXTURE_DIRS.items():
-        body_header_regex = sites[city]["body_header_regex"]
-        parsed = parse_cli_product(_load_text(fixture_dir), body_header_regex=body_header_regex)
+        body_header_regex = re.compile(sites[city]["body_header_regex"], re.MULTILINE)
+        parsed = parse_cli_product(
+            _load_text(fixture_dir), cli_location=city, body_header_regex=body_header_regex
+        )
         headers[city] = parsed.station_header_line
     return headers
 

@@ -21,6 +21,13 @@ def test_loader_rejects_missing_required_field() -> None:
         load_registry(FIXTURES_DIR / "missing_required_field.toml")
 
 
+def test_loader_rejects_missing_iana_tz() -> None:
+    # iana_tz is still required at load time even though no accessor
+    # surfaces it -- validation and exposure are independent concerns.
+    with pytest.raises(RegistryError, match="iana_tz"):
+        load_registry(FIXTURES_DIR / "missing_iana_tz.toml")
+
+
 def test_loader_rejects_uncompilable_regex() -> None:
     with pytest.raises(RegistryError, match="body_header_regex"):
         load_registry(FIXTURES_DIR / "uncompilable_regex.toml")

@@ -9,6 +9,7 @@ partially-populated result.
 
 from __future__ import annotations
 
+import re
 from datetime import date
 from pathlib import Path
 
@@ -18,7 +19,15 @@ from breezy.normalize.cli_parse import CliParseError, parse_cli_product, parse_t
 from breezy.normalize.units import TemperatureReadingF
 
 FIXTURES_DIR = Path(__file__).resolve().parent.parent / "fixtures" / "nws"
-NYC_HEADER_REGEX = r"^\.\.\.THE\s+CENTRAL\s+PARK\s+NY\s+CLIMATE\s+SUMMARY\s+FOR\b"
+NYC_HEADER_REGEX = re.compile(
+    r"^\.\.\.THE\s+CENTRAL\s+PARK\s+NY\s+CLIMATE\s+SUMMARY\s+FOR\b", re.MULTILINE
+)
+
+# A minimal WMO/AWIPS prefix that satisfies the structural allowlist
+# (line count/length, "000" indicator, WMO heading shape, PIL == CLINYC)
+# so hand-built test bodies below reach the specific downstream check
+# each test targets, rather than being rejected earlier by the gate.
+_VALID_NYC_PREFIX = "\n000\nCDUS41 KOKX 220626\nCLINYC\n"
 
 
 def _load(name: str) -> str:
@@ -33,16 +42,22 @@ def test_summary_date_from_headline_not_issuance_time() -> None:
     would get the final wrong (2026-08-22 instead of 2026-08-21).
     """
     preliminary = parse_cli_product(
-        _load("nyc_preliminary_2026-08-21"), body_header_regex=NYC_HEADER_REGEX
+        _load("nyc_preliminary_2026-08-21"),
+        cli_location="NYC",
+        body_header_regex=NYC_HEADER_REGEX,
     )
-    final = parse_cli_product(_load("nyc_final_2026-08-21"), body_header_regex=NYC_HEADER_REGEX)
+    final = parse_cli_product(
+        _load("nyc_final_2026-08-21"), cli_location="NYC", body_header_regex=NYC_HEADER_REGEX
+    )
 
     assert preliminary.summary_date == date(2026, 8, 21)
     assert final.summary_date == date(2026, 8, 21)
 
 
 def test_parse_real_final_fixture_matches_expected() -> None:
-    result = parse_cli_product(_load("nyc_final_2026-08-21"), body_header_regex=NYC_HEADER_REGEX)
+    result = parse_cli_product(
+        _load("nyc_final_2026-08-21"), cli_location="NYC", body_header_regex=NYC_HEADER_REGEX
+    )
 
     assert result.station_header_line == "...THE CENTRAL PARK NY CLIMATE SUMMARY FOR AUGUST 21 2026..."
     assert result.tmax == TemperatureReadingF(value_f=79, sentinel="NONE")
@@ -52,7 +67,9 @@ def test_parse_real_final_fixture_matches_expected() -> None:
 
 def test_parse_real_preliminary_fixture_matches_expected() -> None:
     result = parse_cli_product(
-        _load("nyc_preliminary_2026-08-21"), body_header_regex=NYC_HEADER_REGEX
+        _load("nyc_preliminary_2026-08-21"),
+        cli_location="NYC",
+        body_header_regex=NYC_HEADER_REGEX,
     )
 
     assert result.tmax == TemperatureReadingF(value_f=79, sentinel="NONE")
@@ -72,7 +89,8 @@ def test_temperature_extraction_anchors_to_yesterday_not_normal_or_record() -> N
     the block.
     """
     text = (
-        "...THE CENTRAL PARK NY CLIMATE SUMMARY FOR AUGUST 21 2026...\n"
+        _VALID_NYC_PREFIX
+        + "...THE CENTRAL PARK NY CLIMATE SUMMARY FOR AUGUST 21 2026...\n"
         "TEMPERATURE (F)\n"
         " NORMAL\n"
         "  MAXIMUM         83\n"
@@ -88,7 +106,7 @@ def test_temperature_extraction_anchors_to_yesterday_not_normal_or_record() -> N
         "PRECIPITATION (IN)\n"
     )
 
-    result = parse_cli_product(text, body_header_regex=NYC_HEADER_REGEX)
+    result = parse_cli_product(text, cli_location="NYC", body_header_regex=NYC_HEADER_REGEX)
 
     assert result.tmax == TemperatureReadingF(value_f=79, sentinel="NONE")
     assert result.tmin == TemperatureReadingF(value_f=63, sentinel="NONE")
@@ -100,7 +118,8 @@ def test_temperature_extraction_anchors_to_today_for_preliminary() -> None:
     the anchor must recognize both labels as the observed-value subsection.
     """
     text = (
-        "...THE CENTRAL PARK NY CLIMATE SUMMARY FOR AUGUST 21 2026...\n"
+        _VALID_NYC_PREFIX
+        + "...THE CENTRAL PARK NY CLIMATE SUMMARY FOR AUGUST 21 2026...\n"
         "VALID TODAY AS OF 0400 PM LOCAL TIME.\n"
         "TEMPERATURE (F)\n"
         " NORMAL\n"
@@ -114,7 +133,7 @@ def test_temperature_extraction_anchors_to_today_for_preliminary() -> None:
         "PRECIPITATION (IN)\n"
     )
 
-    result = parse_cli_product(text, body_header_regex=NYC_HEADER_REGEX)
+    result = parse_cli_product(text, cli_location="NYC", body_header_regex=NYC_HEADER_REGEX)
 
     assert result.tmax == TemperatureReadingF(value_f=79, sentinel="NONE")
     assert result.tmin == TemperatureReadingF(value_f=63, sentinel="NONE")
@@ -126,7 +145,8 @@ def test_ambiguous_product_rejected_when_no_observed_subsection_found() -> None:
     NORMAL or RECORD value as if it were observed.
     """
     text = (
-        "...THE CENTRAL PARK NY CLIMATE SUMMARY FOR AUGUST 21 2026...\n"
+        _VALID_NYC_PREFIX
+        + "...THE CENTRAL PARK NY CLIMATE SUMMARY FOR AUGUST 21 2026...\n"
         "TEMPERATURE (F)\n"
         " NORMAL\n"
         "  MAXIMUM         83\n"
@@ -135,12 +155,12 @@ def test_ambiguous_product_rejected_when_no_observed_subsection_found() -> None:
         "PRECIPITATION (IN)\n"
     )
     with pytest.raises(CliParseError):
-        parse_cli_product(text, body_header_regex=NYC_HEADER_REGEX)
+        parse_cli_product(text, cli_location="NYC", body_header_regex=NYC_HEADER_REGEX)
 
 
 def test_sentinel_flags_are_preserved_not_imputed() -> None:
     result = parse_cli_product(
-        _load("nyc_sentinel_synthetic"), body_header_regex=NYC_HEADER_REGEX
+        _load("nyc_sentinel_synthetic"), cli_location="NYC", body_header_regex=NYC_HEADER_REGEX
     )
 
     assert result.tmax.value_f is None
@@ -186,29 +206,31 @@ def test_ambiguous_product_rejected_when_a_single_temperature_line_is_missing() 
     guess.
     """
     missing_minimum = (
-        "...THE CENTRAL PARK NY CLIMATE SUMMARY FOR AUGUST 21 2026...\n"
+        _VALID_NYC_PREFIX
+        + "...THE CENTRAL PARK NY CLIMATE SUMMARY FOR AUGUST 21 2026...\n"
         "TEMPERATURE (F)\n YESTERDAY\n  MAXIMUM 79\n\nPRECIPITATION\n"
     )
     with pytest.raises(CliParseError):
-        parse_cli_product(missing_minimum, body_header_regex=NYC_HEADER_REGEX)
+        parse_cli_product(missing_minimum, cli_location="NYC", body_header_regex=NYC_HEADER_REGEX)
 
 
 def test_ambiguous_product_is_rejected_not_partially_parsed() -> None:
     """A product with no recognizable CLIMATE SUMMARY headline must raise,
     never return a reading with some fields populated and others guessed.
     """
-    garbage = "THIS IS NOT A CLI PRODUCT AT ALL\nNO HEADLINE HERE\n"
+    garbage = _VALID_NYC_PREFIX + "THIS IS NOT A CLI PRODUCT AT ALL\nNO HEADLINE HERE\n"
     with pytest.raises(CliParseError):
-        parse_cli_product(garbage, body_header_regex=NYC_HEADER_REGEX)
+        parse_cli_product(garbage, cli_location="NYC", body_header_regex=NYC_HEADER_REGEX)
 
 
 def test_ambiguous_product_rejected_when_headline_date_is_unparseable() -> None:
     garbled = (
-        "...THE CENTRAL PARK NY CLIMATE SUMMARY FOR NOTAMONTH 21 2026...\n"
+        _VALID_NYC_PREFIX
+        + "...THE CENTRAL PARK NY CLIMATE SUMMARY FOR NOTAMONTH 21 2026...\n"
         "TEMPERATURE (F)\n MAXIMUM 79\n MINIMUM 63\n AVERAGE 71\nPRECIPITATION\n"
     )
     with pytest.raises(CliParseError):
-        parse_cli_product(garbled, body_header_regex=NYC_HEADER_REGEX)
+        parse_cli_product(garbled, cli_location="NYC", body_header_regex=NYC_HEADER_REGEX)
 
 
 def test_ambiguous_product_rejected_when_headline_day_is_out_of_range() -> None:
@@ -216,17 +238,21 @@ def test_ambiguous_product_rejected_when_headline_day_is_out_of_range() -> None:
     still be rejected -- not silently clamped or guessed.
     """
     impossible_day = (
-        "...THE CENTRAL PARK NY CLIMATE SUMMARY FOR FEBRUARY 30 2026...\n"
+        _VALID_NYC_PREFIX
+        + "...THE CENTRAL PARK NY CLIMATE SUMMARY FOR FEBRUARY 30 2026...\n"
         "TEMPERATURE (F)\n MAXIMUM 79\n MINIMUM 63\n AVERAGE 71\nPRECIPITATION\n"
     )
     with pytest.raises(CliParseError):
-        parse_cli_product(impossible_day, body_header_regex=NYC_HEADER_REGEX)
+        parse_cli_product(impossible_day, cli_location="NYC", body_header_regex=NYC_HEADER_REGEX)
 
 
 def test_ambiguous_product_rejected_when_temperature_block_missing() -> None:
-    no_temp_block = "...THE CENTRAL PARK NY CLIMATE SUMMARY FOR AUGUST 21 2026...\nno temperature data here\n"
+    no_temp_block = (
+        _VALID_NYC_PREFIX
+        + "...THE CENTRAL PARK NY CLIMATE SUMMARY FOR AUGUST 21 2026...\nno temperature data here\n"
+    )
     with pytest.raises(CliParseError):
-        parse_cli_product(no_temp_block, body_header_regex=NYC_HEADER_REGEX)
+        parse_cli_product(no_temp_block, cli_location="NYC", body_header_regex=NYC_HEADER_REGEX)
 
 
 def test_ambiguous_product_rejected_when_station_header_does_not_match_registry_regex() -> None:
@@ -235,13 +261,14 @@ def test_ambiguous_product_rejected_when_station_header_does_not_match_registry_
     NYC's Central Park reading.
     """
     wrong_station = (
-        "...THE KENNEDY NY CLIMATE SUMMARY FOR AUGUST 21 2026...\n"
+        _VALID_NYC_PREFIX
+        + "...THE KENNEDY NY CLIMATE SUMMARY FOR AUGUST 21 2026...\n"
         "TEMPERATURE (F)\n MAXIMUM 79\n MINIMUM 63\n AVERAGE 71\nPRECIPITATION\n"
     )
     with pytest.raises(CliParseError):
-        parse_cli_product(wrong_station, body_header_regex=NYC_HEADER_REGEX)
+        parse_cli_product(wrong_station, cli_location="NYC", body_header_regex=NYC_HEADER_REGEX)
 
 
 def test_ambiguous_product_rejected_for_empty_text() -> None:
     with pytest.raises(CliParseError):
-        parse_cli_product("", body_header_regex=NYC_HEADER_REGEX)
+        parse_cli_product("", cli_location="NYC", body_header_regex=NYC_HEADER_REGEX)

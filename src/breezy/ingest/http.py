@@ -12,7 +12,10 @@ Every control below is individually load-bearing:
 
 - HTTPS-only + host allowlist, checked before any socket opens.
 - Redirects are never followed: a 3xx on a settlement endpoint is an
-  integrity alarm, not a fetch step.
+  integrity alarm, not a fetch step. The one deliberate exception is 304
+  Not Modified, the expected success response to a conditional GET
+  (``If-None-Match``) against the discovery-list endpoint; 305 and 306
+  remain alarms (see ``RedirectError`` and ``FetchResult``).
 - TLS verification is always on (no code path disables it), minimum TLS 1.2.
 - Response bodies are capped (128 KiB default) and the cap is enforced
   *during* streaming, before the full body is materialised.
@@ -20,13 +23,24 @@ Every control below is individually load-bearing:
   mutating the settlement datum (and its digest) via ``errors="replace"``.
 - The SHA-256 digest is computed over the exact raw bytes received, before
   anything (decoding, normalization) can transform them.
+- The instant of receipt is stamped **here**, adjacent to that digest, from
+  an injected clock. This layer is the only one that knows when the bytes
+  arrived; every later layer can only guess, and a late guess silently
+  degrades replay fidelity (see :class:`FetchResult`).
+- Conditional-GET validators are accepted as typed *values*, never as a
+  caller-supplied header mapping, so the hardened headers above cannot be
+  displaced per call. An ``ETag`` is remote data being echoed back into an
+  outbound request, so it is validated for length and charset before it is
+  ever placed in a header (see :func:`_validated_cache_validator`).
 """
 
 from __future__ import annotations
 
 import hashlib
 import os
+import re
 import ssl
+from collections.abc import Callable
 from dataclasses import dataclass
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
@@ -34,8 +48,17 @@ import httpx
 
 DEFAULT_MAX_BODY_BYTES = 128 * 1024  # 128 KiB; real CLI products are <64 KiB.
 DEFAULT_CHUNK_SIZE = 8 * 1024
-DEFAULT_CONTACT = "breezy-data@gopoint.com"
+DEFAULT_CONTACT = "breezy-data@gmail.com"
 USER_AGENT_ENV_VAR = "BREEZY_USER_AGENT"
+
+# Generous for a real validator (NWS ETags run ~40 chars, an HTTP-date 29)
+# and far below anything that could be used to smuggle a payload.
+MAX_VALIDATOR_LENGTH = 256
+
+# RFC 9110 field-value characters, minus the obsolete forms: printable US-ASCII
+# only. This excludes CR, LF and NUL (header injection), HTAB and DEL (obs-fold
+# and control smuggling), and every non-ASCII byte.
+_VALIDATOR_CHARSET = re.compile(r"\A[\x20-\x7e]+\Z")
 
 # Environment variables that can silently redirect or weaken outbound TLS
 # traffic. Trusting these unexamined defeats the host allowlist and TLS
@@ -70,10 +93,22 @@ class DisallowedHostError(TransportError):
 
 
 class RedirectError(TransportError):
-    """Raised when the server responds with a 3xx status.
+    """Raised when the server responds with a 3xx status other than 304.
 
     Redirects are never followed. On a settlement endpoint this is treated
     as an integrity alarm, not a normal fetch outcome.
+
+    304 Not Modified is deliberately excluded: it is the expected success
+    response to a conditional GET on the discovery-list endpoint and is
+    returned to the caller as a normal ``FetchResult`` instead (see
+    :meth:`HttpTransport.fetch`).
+
+    305 (Use Proxy) and 306 (reserved, unused since HTTP/1.1) remain
+    alarms. 305 instructs the client to route through a proxy, which on a
+    settlement path is arguably *more* alarming than an ordinary redirect,
+    not less; 306 has no legitimate use, so a live server emitting it is
+    itself anomalous. Neither is a response the conditional GET is ever
+    expected to produce.
     """
 
     def __init__(self, message: str, *, status_code: int, location: str | None) -> None:
@@ -124,6 +159,19 @@ class ContentEncodingError(TransportError):
     Identity encoding is requested explicitly; anything else is treated as
     an integrity signal from a compromised or malicious allowlisted host,
     never something to transparently decompress.
+    """
+
+
+class InvalidCacheValidatorError(TransportError):
+    """Raised when a conditional-GET validator is not well formed.
+
+    Raised before any socket is opened. A validator is remote data (an
+    ``ETag``/``Last-Modified`` the origin sent us) being echoed back into an
+    outbound request, so it is the one caller-supplied value in this module
+    that reaches the wire. Anything carrying CR/LF, a control character, a
+    non-ASCII byte, surrounding whitespace, or an absurd length is refused
+    rather than sanitised: a header-injection vector through a stored ETag is
+    precisely what the rest of this module's hardening exists to prevent.
     """
 
 
@@ -179,6 +227,53 @@ def _default_user_agent() -> str:
     return f"breezy-weather-ingest/0.1 (+mailto:{DEFAULT_CONTACT})"
 
 
+def _validated_cache_validator(value: str, header: str) -> str:
+    """Return `value` if it is safe to place in `header`, else raise.
+
+    Static typing already pins the parameter to `str` at every call site, so
+    this guards the runtime threat rather than the type: a validator that
+    round-tripped through a remote server and our own storage before being
+    echoed back out. The error message names the *header*, never the value —
+    an untrusted string must not be laundered into a log line.
+    """
+    if len(value) > MAX_VALIDATOR_LENGTH:
+        raise InvalidCacheValidatorError(
+            f"{header} validator exceeds the maximum length of "
+            f"{MAX_VALIDATOR_LENGTH} characters."
+        )
+    if value != value.strip():
+        raise InvalidCacheValidatorError(
+            f"{header} validator must not carry leading or trailing whitespace."
+        )
+    if _VALIDATOR_CHARSET.match(value) is None:
+        raise InvalidCacheValidatorError(
+            f"{header} validator is empty or contains characters that are not "
+            "printable US-ASCII; it is refused rather than sanitised."
+        )
+    return value
+
+
+def _conditional_headers(
+    *,
+    if_none_match: str | None,
+    if_modified_since: str | None,
+) -> dict[str, str]:
+    """Build the conditional-GET request headers from validated values.
+
+    The header *names* are supplied here and only here. A caller passes
+    values, never keys, so no per-call input can displace the hardened
+    ``User-Agent``/``Accept-Encoding`` set on the client.
+    """
+    headers: dict[str, str] = {}
+    if if_none_match is not None:
+        headers["If-None-Match"] = _validated_cache_validator(if_none_match, "If-None-Match")
+    if if_modified_since is not None:
+        headers["If-Modified-Since"] = _validated_cache_validator(
+            if_modified_since, "If-Modified-Since"
+        )
+    return headers
+
+
 # --------------------------------------------------------------------------
 # Result type
 # --------------------------------------------------------------------------
@@ -186,18 +281,71 @@ def _default_user_agent() -> str:
 
 @dataclass(frozen=True)
 class FetchResult:
-    """Result of a successful fetch.
+    """Result of a successful fetch, including 304 Not Modified.
+
+    **A `FetchResult` describes an exchange.** One rule governs its fields, in
+    two clauses that share that subject:
+
+    1. The exchange *always happened at an instant*, so ``retrieved_at_ns`` is
+       unconditional — present on every status, 304 included.
+    2. The exchange *carried a document* exactly when the status says a body
+       was sent, so ``text`` and ``sha256`` are present iff
+       ``status_code != 304``.
 
     ``sha256`` is computed over the exact raw bytes received, before UTF-8
     decoding, so provenance is captured ahead of any transformation.
+    ``retrieved_at_ns`` is stamped adjacent to it, from the transport's
+    injected clock, so the two describe the same event.
+
+    A 304 has no body (RFC 9110 SS15.4.5): ``text`` and ``sha256`` are
+    ``None`` in that case, never the digest of an empty body. That keeps a
+    "nothing changed" response from being mistaken for a zero-length
+    fetched document, and forces a ``status_code`` check (enforced by
+    mypy under strict mode, since both fields are ``str | None``) before
+    either field can flow into a provenance record.
+
+    A 304 *does* carry ``retrieved_at_ns``. The body carve-out is about the
+    document, not the exchange: a 304 is the healthy steady-state answer to a
+    conditional GET, it is a successful poll for the freshness watchdog (which
+    measures liveness in nanoseconds), and a stampless 304 would force the
+    caller to re-stamp from its own clock — reintroducing the second source of
+    truth this field exists to remove.
+
+    ``retrieved_at_ns`` has no default. Omission is a ``TypeError`` from the
+    generated ``__init__``; a zero or negative value is rejected below,
+    because "silently omitted" and "stamped as 0" are the same defect wearing
+    different clothes.
     """
 
-    text: str
-    sha256: str
+    text: str | None
+    sha256: str | None
     status_code: int
     headers: httpx.Headers
     url: str
+    retrieved_at_ns: int
     retry_after: str | None = None
+
+    def __post_init__(self) -> None:
+        # Clause 1 — the exchange always happened at an instant.
+        # `bool` is an `int` subclass and is rejected explicitly: a stray
+        # `True` would sail through the range check as 1 nanosecond.
+        if isinstance(self.retrieved_at_ns, bool) or not isinstance(self.retrieved_at_ns, int):
+            raise TypeError(
+                "`retrieved_at_ns` must be an `int` of UNIX nanoseconds, was "
+                f"{type(self.retrieved_at_ns).__name__}"
+            )
+        if self.retrieved_at_ns <= 0:
+            raise ValueError(
+                f"`retrieved_at_ns` must be a positive UNIX-nanosecond instant, was "
+                f"{self.retrieved_at_ns}"
+            )
+
+        # Clause 2 — it carried a document iff the status says a body was sent.
+        has_body = self.text is not None or self.sha256 is not None
+        if self.status_code == 304 and has_body:
+            raise ValueError("304 Not Modified FetchResult must not carry text/sha256")
+        if self.status_code != 304 and not has_body:
+            raise ValueError(f"status {self.status_code} FetchResult must carry text and sha256")
 
 
 # --------------------------------------------------------------------------
@@ -236,6 +384,7 @@ class HttpTransport:
         self,
         *,
         allowed_hosts: frozenset[str],
+        clock: Callable[[], int],
         max_body_bytes: int = DEFAULT_MAX_BODY_BYTES,
         chunk_size: int = DEFAULT_CHUNK_SIZE,
         connect_timeout: float = 5.0,
@@ -246,6 +395,15 @@ class HttpTransport:
         check_proxy_env: bool = True,
         approved_proxy_env_vars: frozenset[str] | None = None,
     ) -> None:
+        # `clock` is required and injected, exactly as `SettlementGate` takes
+        # it: a `Callable[[], int]` of UNIX nanoseconds. The ingest Actor
+        # passes `Actor.clock.timestamp_ns` (Nautilus' own native clock) so the
+        # receipt stamps that become `ts_init` and the gate's freshness
+        # watchdog read ONE clock. A module-level default would be a second
+        # clock that can silently diverge from it, and would make the exact
+        # stamped value unassertable under test -- which is how a late stamp
+        # gets in unnoticed.
+        self._clock = clock
         self._check_proxy_env = check_proxy_env
         self._approved_proxy_env_vars = approved_proxy_env_vars
         if check_proxy_env:
@@ -294,8 +452,33 @@ class HttpTransport:
             headers={"User-Agent": self._user_agent, "Accept-Encoding": "identity"},
         )
 
-    async def fetch(self, url: str) -> FetchResult:
-        """Fetch ``url`` and return its raw-bytes digest plus decoded text.
+    async def fetch(
+        self,
+        url: str,
+        *,
+        if_none_match: str | None = None,
+        if_modified_since: str | None = None,
+    ) -> FetchResult:
+        """Fetch ``url`` and return its raw-bytes digest, decoded text and receipt instant.
+
+        Parameters
+        ----------
+        url : str
+            The absolute HTTPS URL to fetch. Validated against the scheme,
+            userinfo, port and host-allowlist rules before any socket opens.
+        if_none_match : str or None
+            An ``ETag`` from a previous response for this URL, sent as
+            ``If-None-Match``. Supply it to make the origin answer 304 when
+            nothing changed.
+        if_modified_since : str or None
+            A ``Last-Modified`` value from a previous response for this URL,
+            sent as ``If-Modified-Since``.
+
+        Both validators are accepted as *values*, never as a header mapping:
+        the transport builds the header names itself, so a caller cannot
+        displace ``User-Agent``, ``Accept-Encoding`` or any other hardened
+        header on a per-call basis. Each is checked by
+        :func:`_validated_cache_validator` before it reaches the wire.
 
         Raises one of the :class:`TransportError` subclasses on any failure
         mode; never returns a partially-materialised or lossily-decoded
@@ -309,13 +492,31 @@ class HttpTransport:
         if self._check_proxy_env:
             assert_clean_proxy_env(self._approved_proxy_env_vars)
 
+        # Host allowlisting stays the outermost gate; validator checks follow,
+        # and both complete before a socket is opened.
         self._validate_url(url)
+        conditional_headers = _conditional_headers(
+            if_none_match=if_none_match,
+            if_modified_since=if_modified_since,
+        )
 
         try:
-            async with self._build_client() as client, client.stream("GET", url) as response:
+            async with (
+                self._build_client() as client,
+                client.stream("GET", url, headers=conditional_headers) as response,
+            ):
                 self._raise_for_status(response)
+                if response.status_code == 304:
+                    return self._not_modified_result(response, url)
                 self._reject_unexpected_content_encoding(response)
                 body = await self._read_capped_body(response)
+                # Stamp and digest, adjacent and in that order, on the bytes
+                # that just finished arriving: one clock read, describing the
+                # same event as the digest beside it. Nothing (a decode, an
+                # await, a parse, a record construction) is allowed to come
+                # between the arrival and the instant recorded for it.
+                retrieved_at_ns = self._clock()
+                digest = hashlib.sha256(body).hexdigest()
         except httpx.TimeoutException as exc:
             raise TransportTimeoutError(f"Timed out fetching {redact_url(url)}: {exc}") from exc
         except httpx.TransportError as exc:
@@ -332,19 +533,19 @@ class HttpTransport:
                 f"Response body from {redact_url(url)} is not valid UTF-8: {exc}"
             ) from exc
 
-        digest = hashlib.sha256(body).hexdigest()
         return FetchResult(
             text=text,
             sha256=digest,
             status_code=response.status_code,
             headers=response.headers,
             url=url,
+            retrieved_at_ns=retrieved_at_ns,
             retry_after=response.headers.get("retry-after"),
         )
 
     def _raise_for_status(self, response: httpx.Response) -> None:
         status = response.status_code
-        if 300 <= status < 400:
+        if 300 <= status < 400 and status != 304:
             raise RedirectError(
                 f"Server returned redirect {status} for {redact_url(str(response.url))}; "
                 "redirects are disabled and treated as an integrity alarm.",
@@ -366,6 +567,29 @@ class HttpTransport:
                 f"{status} server error from {redact_url(str(response.url))}.",
                 status_code=status,
             )
+
+    def _not_modified_result(self, response: httpx.Response, url: str) -> FetchResult:
+        """Build the ``FetchResult`` for a 304 Not Modified response.
+
+        304 carries no body per RFC 9110 SS15.4.5, so there is nothing to
+        decode or digest. ``ETag``/``Last-Modified`` still arrive on
+        ``response.headers`` for the caller to persist for the next
+        conditional GET.
+
+        The receipt instant IS stamped here — one clock read, at the point the
+        response was received. A 304 has no document but it is still an
+        exchange that happened at a time, and it is a successful poll for the
+        freshness watchdog.
+        """
+        return FetchResult(
+            text=None,
+            sha256=None,
+            status_code=response.status_code,
+            headers=response.headers,
+            url=url,
+            retrieved_at_ns=self._clock(),
+            retry_after=response.headers.get("retry-after"),
+        )
 
     def _reject_unexpected_content_encoding(self, response: httpx.Response) -> None:
         """Reject any non-identity Content-Encoding before the body is read.

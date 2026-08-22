@@ -19,7 +19,31 @@ digests:
 
 Timestamps: ``ts_event`` is the issuance instant, ``ts_init`` the retrieval
 instant. Neither is a constructor parameter -- both derive from the provenance
-fields, so ``ts_event <= ts_init`` holds by construction for this type.
+fields -- and ``ts_event <= ts_init`` is *enforced* in ``__init__``, so it holds
+on every construction path: direct construction, :meth:`from_dict`, and the
+registered Arrow decoder, which rebuilds each row through ``from_dict``. Bytes
+cannot be received before they were issued, so a record that claims otherwise is
+incoherent whichever path produced it, and the read path is the one that matters:
+replay reconstructs from the catalog, and a violating row would otherwise flow
+into a backtest and return a plausible, wrong answer with nothing raised.
+
+The rule here is **unconditional**, deliberately unlike
+:class:`~breezy.domain.nws_climate_day.NwsClimateDay`, where the ordering is
+asserted for finals only. That scoping exists because that record's ``ts_event``
+is a *derived semantic* instant -- the end of the climate day for a final -- which
+need not precede arrival. This record's ``ts_event`` is the product's own
+issuance time for both the ~04:44-local preliminary and the ~02:27-local final,
+so the causal ordering holds for both. A finals-only carve-out is not even
+expressible here: finality is derived from the raw text downstream, this record
+carries no ``is_final`` field, and ``climate_day`` is nullable because capture
+precedes parsing.
+
+The guard is the same predicate as the one
+:func:`breezy.ingest.records.build_raw_product` applies before constructing, so
+the reader can never reject a record the sanctioned writer can produce. Should
+clock skew between the NWS-supplied ``issuanceTime`` and Breezy's own retrieval
+stamp ever have to be tolerated, both must change together -- which is the
+coupling worth having visible.
 
 No ``parser_version`` field: this record is captured *before* parsing, and
 claiming a parser produced it would be false provenance. The parsed values and
@@ -88,7 +112,10 @@ class NwsRawProduct(Data):
         ``/products/{id}`` endpoint does not expose this field, so it is parsed
         from the raw text and is frequently absent.
     issuance_time_ns, retrieved_at_ns : int
-        UNIX nanoseconds. These become ``ts_event`` and ``ts_init``.
+        UNIX nanoseconds. These become ``ts_event`` and ``ts_init``, and
+        ``issuance_time_ns <= retrieved_at_ns`` is enforced here for both
+        issuance classes (see the module docstring). Equality is accepted: NWS
+        publishes ``issuanceTime`` at minute granularity.
     climate_day : datetime.date or None
         Summary date extracted from the headline once known. Nullable, because
         capture precedes parsing.
@@ -162,6 +189,14 @@ class NwsRawProduct(Data):
 
         self._ts_event = self.issuance_time_ns
         self._ts_init = self.retrieved_at_ns
+
+        if self._ts_event > self._ts_init:
+            raise ValueError(
+                f"`issuance_time_ns` ({self._ts_event}) is after `retrieved_at_ns` "
+                f"({self._ts_init}) for {self.station} product {self.product_uuid}: "
+                f"bytes cannot be received before they were issued, so `ts_event` "
+                f"must never exceed `ts_init`",
+            )
 
     @property
     def ts_event(self) -> int:

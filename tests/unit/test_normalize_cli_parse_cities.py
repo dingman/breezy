@@ -19,6 +19,7 @@ the hand-rolled parser could not handle.
 
 from __future__ import annotations
 
+import re
 import tomllib
 from pathlib import Path
 
@@ -55,9 +56,11 @@ def test_parse_real_fixture_for_each_remaining_city(
     city: str, fixture_dir: str, tmax: int, tmin: int, tavg: int
 ) -> None:
     sites = _load_sites()
-    body_header_regex = sites[city]["body_header_regex"]
+    body_header_regex = re.compile(sites[city]["body_header_regex"], re.MULTILINE)
 
-    result = parse_cli_product(_load_text(fixture_dir), body_header_regex=body_header_regex)
+    result = parse_cli_product(
+        _load_text(fixture_dir), cli_location=city, body_header_regex=body_header_regex
+    )
 
     assert result.tmax == TemperatureReadingF(value_f=tmax, sentinel="NONE")
     assert result.tmin == TemperatureReadingF(value_f=tmin, sentinel="NONE")

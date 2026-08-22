@@ -21,26 +21,62 @@ Timestamps
 ----------
 ``ts_init`` is ``retrieved_at_ns`` -- the instant *Breezy* received the product --
 and is not a constructor parameter, so it cannot be re-stamped from a clock.
-Replay order then equals real arrival order.
+Replay order then equals real arrival order, because ``ts_init`` is the key
+Nautilus sorts the merged stream on and advances the backtest clock from;
+``ts_event`` is never read in the replay path.
 
 ``ts_event`` is the semantic instant and is supplied by the caller, because
-deriving it needs the station registry:
+deriving it needs the station registry. It means a **different thing per issuance
+class**, and :func:`breezy.ingest.records.build_climate_day` is its only deriver:
 
-* finals -- end of the climate day in local **standard** time (never UTC, never
-  the DST-adjusted clock);
-* preliminaries -- the issuance time.
+* **finals** -- the end of the climate day: 24:00 on the summary date in the
+  site's local **standard** time (never UTC, never the DST-adjusted clock).
+  Computed from the summary date and the registry's fixed offset, so it is
+  independent of when the product was fetched.
+* **preliminaries** -- the issuance instant, ``issuance_time_ns``, copied from
+  the archived product.
 
-No global ``ts_event <= ts_init`` invariant is enforced here. A preliminary polled
-mid-afternoon belongs to a climate day that ends hours later, so the ordering is
-asserted for finals only (see ``tests/contract/test_catalog_nws_records.py``).
+``ts_event <= ts_init`` is asserted **for finals only**, in ``build_climate_day``.
+The scoping is not headroom granted to preliminaries -- it is the reverse. A
+preliminary's ``ts_event`` *is* its issuance instant, and
+:class:`~breezy.domain.nws_raw_product.NwsRawProduct` already rejects
+``issuance_time_ns > retrieved_at_ns`` at construction, so for a preliminary the
+ordering holds by construction and asserting it could never fail. A final is the
+only record whose ``ts_event`` is derived independently of the fetch, so it is the
+only one where the comparison carries information: ``ts_event > ts_init`` means
+the climate day had not ended when the bytes arrived, which means the product is
+**not** a final and was misclassified. Finals are the class that needs the check;
+preliminaries are exempt because the check is vacuous for them, not because they
+are allowed to violate it.
+
+This class enforces no ordering check of its own, for either issuance class. The
+check is an ingestion-time classification guard, not a field invariant: it belongs
+where the issuance class is decided and the failure can be named, and this
+constructor is also the catalog decode path (``from_dict``), so a rejection here
+would make an already-written row unreadable rather than surfacing at ingestion.
+
+Pinned by ``test_final_ts_event_is_the_climate_day_end_in_local_standard_time``,
+``test_preliminary_ts_event_is_the_issuance_instant`` and
+``test_a_final_may_not_predate_the_climate_day_it_reports`` in
+``tests/unit/test_ingest_records.py``, and by the ordering tests in
+``tests/unit/test_domain_nws_climate_day.py``.
 
 Revisions
 ---------
 A correction is a **new record with a strictly later** ``ts_init``, never a
 rewrite: ``ParquetDataCatalog._write_chunk`` silently skips a write whose computed
 filename already exists, and ``delete_data_range`` no-ops for identifier-less
-custom types. Readers select max-``ts_init`` per ``(station, climate_day)`` --
-see :mod:`breezy.domain.selection`.
+custom types.
+
+Readers therefore select max ``(is_final, ts_init, revision_seq)`` per
+``(station, climate_day)``. ``is_final`` leads so that a backfilled preliminary
+can never shadow a final -- a final outranks a preliminary at any ``ts_init``.
+``ts_init`` then orders *within* a finality class: among finals the later arrival
+wins, which is the correction path, and among preliminaries likewise.
+``revision_seq`` breaks a remaining tie. Selection guarantees a final is never
+shadowed, **not that one exists**, so settlement callers must still check
+``is_final``. That rule and the ``as_of_ts_init`` bound live in
+:mod:`breezy.domain.selection`.
 """
 
 from __future__ import annotations
@@ -108,9 +144,10 @@ class NwsClimateDay(Data):
     revision_seq : int
         Monotonic per ``(station, climate_day)``, starting at 1.
     is_superseded : bool
-        Known-superseded at write time. Selection uses max-``ts_init``; this flag
-        is a record of what was known then, since prior records are never
-        rewritten.
+        Known-superseded at write time. Selection does not consult it -- it ranks
+        on ``(is_final, ts_init, revision_seq)`` -- so this flag is only a record
+        of what was known when the record was written, since prior records are
+        never rewritten.
     issuing_office : str
         WFO that issued the product (e.g. ``"KOKX"``). Not sufficient on its own
         to bind a product to a station -- one office issues for several cities.
@@ -126,7 +163,9 @@ class NwsClimateDay(Data):
     schema_version : int
         Revision of this record layout.
     ts_event : int
-        Semantic instant in UNIX nanoseconds (see the module docstring).
+        Semantic instant in UNIX nanoseconds: the climate-day end in local
+        standard time for a final, the issuance instant for a preliminary. No
+        ordering against ``ts_init`` is checked here (see the module docstring).
 
     """
 
