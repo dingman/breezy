@@ -41,15 +41,15 @@ Seams (b) and (d) are unblocked today and are built while credentials are pendin
 
 - **Pin `nautilus-trader~=1.231`** and pin EXACT versions of `pyiem`, `pynws`, `metar`, and `polymarket_us`.
 - **Write contract tests asserting each documented Nautilus gotcha**, so a version bump fails RED instead of drifting silently. At minimum, one test each for:
-  - `BacktestEngine.add_data()` sorts by `ts_init`, NOT `ts_event` (contradicts the base-class docstring).
-  - `add_data` raises `ValueError` when `instrument_id` is absent from the cache and `client_id` is `None` — so weather data MUST be added with an explicit `client_id`, e.g. `ClientId("WEATHER")`.
+  - `BacktestEngine.add_data()` sorts by `ts_init`, NOT `ts_event`. This is documented behaviour, not a docstring contradiction — and `ts_event` is never read in the replay path at all (`backtest/engine.pyx:903`, `:2610`). A wrong `ts_event` corrupts settlement joins and semantics; it does not reorder a backtest.
+  - `add_data` raises **`TypeError`** — not `ValueError` — when `instrument_id` is absent from the cache and `client_id` is `None` (`engine.pyx:889` → `correctness.pyx:145`). `ValueError` comes only from the separate `BacktestNode` path (`node.py:729`). Weather data MUST still be added with an explicit `client_id`, e.g. `ClientId("WEATHER")` — but do not write a test asserting `ValueError` on the engine path; it will be a false assertion.
   - `@customdataclass` only injects `__init__` **if not already defined** — a hand-written `__init__` silently changes the `ts_event`/`ts_init` constructor contract.
   - `LiveMarketDataClient.subscribe_bars` asserts `bar_type.is_externally_aggregated()`.
 - **Validate parser output against physical sanity bounds** before any value is trusted for settlement (temperature ranges, min ≤ max, plausible deltas). A malformed remote product must fail loudly, never settle quietly.
 - **Compute and store `sha256(raw_text)` at ingestion; verify it before any later settlement use.** Archive raw text IMMUTABLY — the API offers no archive guarantee.
 - **Design and TEST the provenance revision/supersession write path.** ParquetDataCatalog gives you serialization, NOT supersession semantics: monotonic `revision_seq` per `(station, summary_date)`, dedupe on `(productCode, location, summary_date, hash)` never on UUID, and explicit supersession of already-settled data. This is code you must author and prove with tests.
 - Use Nautilus `test_kit/` stubs, mocks, and providers rather than hand-rolling fixtures.
-- **Grep/ripgrep silently skips `.venv` (gitignored).** Use Glob + Read to investigate installed Nautilus source. A "not found" from Grep inside `.venv` is meaningless — re-check with Glob before concluding anything is absent.
+- **The `Grep` tool and ripgrep skip `.venv` (gitignored); Bash `grep -rn` does NOT.** Bash `grep` searches `.venv` fine and is the right tool for sweeping installed Nautilus source. A "not found" from the *Grep tool* inside `.venv` is meaningless — re-check with Bash `grep` or Glob before concluding anything is absent.
 
 ## Hard gate — signing code
 
@@ -71,7 +71,7 @@ Your output is not done until these exist and are tested:
 ## Workflow
 
 1. Load the three skills. Restate the seam you were dispatched for; refuse a multi-seam brief.
-2. Investigate installed Nautilus source (Glob + Read, not Grep in `.venv`). State what is already native.
+2. Investigate installed Nautilus source (Bash `grep`, Glob + Read — not the Grep tool, which skips `.venv`). State what is already native.
 3. Write the null-hypothesis finding: what Nautilus provides, what genuinely must be authored, with file-level evidence.
 4. Hand RED tests to `tdd-guide` first; implement minimally to GREEN.
 5. Add the contract tests and (for signing) the hard-gate suite.

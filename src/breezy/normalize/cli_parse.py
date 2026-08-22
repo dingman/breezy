@@ -39,6 +39,16 @@ most specific first, and never on a message string:
 distinction -- exact-type / ordered-`except` dispatch is what separates
 them.
 
+MULTI-STATION PRODUCTS. A CLI body may carry several stations' sections
+(a known NWS hazard). The headline scan takes the FIRST section only, and
+`body_header_regex` then proves that section is ours -- so a body leading
+with a sibling station is REFUSED rather than searched further down. That
+is a deliberate fail-closed limitation while multi-station bodies remain
+unobserved for our five cities: scanning on would mean trusting
+section-boundary detection that no real product has ever exercised.
+Temperature extraction is scoped to that same first section on both
+sides, so our headline can never be paired with a sibling's values.
+
 STRUCTURAL PRE-PARSE GATE. Phase 1 parses inline on the asyncio event
 loop (no executor/process containment exists for this path), so a slow
 parse on a malformed product stalls the entire Nautilus event loop, not
@@ -55,7 +65,7 @@ from dataclasses import dataclass
 from datetime import date
 
 from breezy.normalize.sanity import check_physical_sanity
-from breezy.normalize.units import TemperatureReadingF
+from breezy.normalize.units import SentinelFlag, TemperatureReadingF
 
 _MONTH_NAME_TO_NUMBER: dict[str, int] = {
     "JANUARY": 1,
@@ -96,13 +106,21 @@ _MAXIMUM_RE = re.compile(r"MAXIMUM\s+(?P<token>-?\S+)")
 _MINIMUM_RE = re.compile(r"MINIMUM\s+(?P<token>-?\S+)")
 _AVERAGE_RE = re.compile(r"AVERAGE\s+(?P<token>-?\S+)")
 
-_SENTINEL_TOKENS: dict[str, str] = {
+_SENTINEL_TOKENS: dict[str, SentinelFlag] = {
     "M": "M",
     "MM": "M",
     "T": "T",
     "MS": "MS",
     "MB": "MB",
 }
+"""Raw CLI token -> `SentinelFlag`. The VALUE type is load-bearing: typing it
+as the `Literal` rather than `str` is what lets a type checker prove that only
+the five declared sentinel spellings can ever reach
+`TemperatureReadingF.sentinel`. Typed as `dict[str, str]` it could not, and the
+one call site had to carry a `# type: ignore[arg-type]` that switched the check
+off -- an invariant worth enforcing, disabled to work around a type that was
+merely too wide. `"NONE"` is deliberately absent: it means "a real number is
+present", which is not something a sentinel token can ever say."""
 
 MAX_LINE_COUNT = 500
 """Real CLI products run ~90-100 lines; this gives ~5x headroom while still
@@ -118,11 +136,59 @@ _WMO_HEADING_RE = re.compile(
     r"^[A-Z]{4}\d{2}\s+[A-Z]{4}\s+\d{6}(?:\s+(?P<bbb>[A-Z]{3}))?$"
 )
 """WMO abbreviated heading shape: T1T2A1A2ii + WFO + ddhhmm, with an
-optional trailing BBB correction token (CCA/CCB/...).
+optional trailing BBB indicator.
 
 The BBB token is captured, not merely tolerated: api.weather.gov exposes
-no BBB field, so this line is the ONLY place the correction signal
-exists, and it drives revision/supersession decisions downstream."""
+no BBB field, so this line is the ONLY place the signal exists, and it
+drives revision/supersession decisions downstream.
+
+The capture stays a permissive `[A-Z]{3}` ON PURPOSE. This is the
+STRUCTURAL gate, and its job is to accept anything WMO-shaped and reject
+anything else; deciding what a given indicator MEANS is a separate,
+stricter step (`_bbb_indicates_correction`). Narrowing the capture to
+`CC[AB]` would make a routine `RRA` retransmission fail the heading shape
+outright, i.e. a `CliStructuralError` -- a loud integrity alarm and a
+sticky hard block raised on an entirely healthy product. Permissive on
+shape, strict on interpretation."""
+
+_CORRECTION_BBB_RE = re.compile(r"^CC[A-Z]$")
+"""A BBB indicator that means CORRECTION, and only that.
+
+The BBB space is NOT a correction flag -- it is four different things:
+
+    ``CCx``  correction to a previously transmitted product   <- correction
+    ``AAx``  amendment                                        <- NOT
+    ``RRx``  delayed / retransmitted report                   <- NOT
+    ``Pxx``  message segment number                           <- NOT
+
+`CC[A-Z]`, not `CC[AB]`: corrections run CCA, CCB, CCC, ... and a third
+correction to one climate day is exactly the case most likely to land
+AFTER settlement. Matching only the first two would be a false negative on
+the highest-consequence instance of the signal.
+
+This range is kept IDENTICAL to `classify._CORRECTION_RE`, which answers
+the same question from the free text. The two signals differ in COVERAGE
+by design (the free-text scan is a deliberate superset that also catches
+CORRECTED/CORRECTION wording in a body with no BBB token at all), but they
+must never differ in ALPHABET: two signals for one concept disagreeing
+about which letters count is a contradiction waiting to be found by
+whoever wires either one into `revision_seq`.
+`tests/unit/test_normalize_correction_signal_agreement.py` fails if the
+two are changed independently -- change both or neither."""
+
+
+def _bbb_indicates_correction(bbb: str | None) -> bool:
+    """Is this BBB indicator a correction (``CCx``), as opposed to an
+    amendment, a retransmission, a segment number, or nothing at all?
+
+    Private on purpose. The verdict is published as the
+    `is_correction_bbb` property of `CliStructuralHeader` and
+    `ParsedCliProduct`, so a caller reads a decided boolean instead of
+    re-deriving one from a token whose spelling it would have to know.
+    """
+    if bbb is None:
+        return False
+    return _CORRECTION_BBB_RE.match(bbb) is not None
 
 
 class CliParseError(ValueError):
@@ -191,7 +257,7 @@ class CliContentError(CliParseError):
     """
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
 class CliStructuralHeader:
     """The header facts the structural allowlist validated.
 
@@ -208,13 +274,44 @@ class CliStructuralHeader:
     used in the api.weather.gov path segment."""
 
     wmo_bbb: str | None
-    """WMO BBB correction token from line 2, e.g. ``"CCA"``; `None` when
-    the heading carries none. `None` rather than `""` deliberately: an
-    empty string and a missing value are indistinguishable under a
-    truthiness test but not under an Arrow round-trip."""
+    """WMO BBB indicator from line 2, verbatim, e.g. ``"CCA"`` or
+    ``"RRA"``; `None` when the heading carries none. `None` rather than
+    `""` deliberately: an empty string and a missing value are
+    indistinguishable under a truthiness test but not under an Arrow
+    round-trip.
+
+    THIS IS NOT A CORRECTION FLAG. ``if wmo_bbb is not None`` is the
+    obvious-looking correction test and it is WRONG: the BBB space also
+    carries amendments (``AAx``), delayed/retransmitted reports (``RRx``)
+    and message segments (``Pxx``), none of which is a correction.
+    Misreading an ``RRA`` retransmission of an unchanged final as a
+    correction forces a spurious revision or a false post-settlement
+    supersession alert. Read `is_correction_bbb` for that question.
+
+    The general token is kept rather than narrowed to ``CC[AB]`` because
+    it has real provenance value in its own right: "this product arrived
+    as a delayed retransmission" is exactly the fact that explains a late
+    or duplicated final when someone reconstructs the timeline later.
+    """
+
+    @property
+    def is_correction_bbb(self) -> bool:
+        """Does the BBB indicator say CORRECTION (``CCx``)?
+
+        DERIVED, read-only, and computed here rather than by the caller so
+        that the correction verdict and the token it came from can never
+        drift apart, and so no caller has to know the BBB alphabet to get
+        the question right.
+
+        A `False` here does NOT mean "no correction evidence anywhere" --
+        `classify.has_correction_evidence` scans the free text for
+        CORRECTED/CORRECTION wording, which is a separate, advisory
+        signal. This one is the positional, structural verdict.
+        """
+        return _bbb_indicates_correction(self.wmo_bbb)
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
 class ParsedCliProduct:
     """The settlement-relevant fields extracted from one CLI product."""
 
@@ -227,9 +324,17 @@ class ParsedCliProduct:
     """See `CliStructuralHeader.awips_pil`. Required provenance."""
 
     wmo_bbb: str | None
-    """See `CliStructuralHeader.wmo_bbb`. Required provenance -- no
-    default, because a field that silently defaults to "not a correction"
-    is a supersession bug waiting to happen."""
+    """See `CliStructuralHeader.wmo_bbb` -- including why this is NOT a
+    correction flag. Required provenance -- no default, because a field
+    that silently defaults to "not a correction" is a supersession bug
+    waiting to happen."""
+
+    @property
+    def is_correction_bbb(self) -> bool:
+        """See `CliStructuralHeader.is_correction_bbb`. Always agrees with
+        the header this product was parsed from -- same token, same
+        derivation, one scan."""
+        return _bbb_indicates_correction(self.wmo_bbb)
 
 
 def parse_temperature_token(token: str) -> TemperatureReadingF:
@@ -243,7 +348,7 @@ def parse_temperature_token(token: str) -> TemperatureReadingF:
     if not token:
         raise CliContentError("empty temperature token")
     if token in _SENTINEL_TOKENS:
-        return TemperatureReadingF(value_f=None, sentinel=_SENTINEL_TOKENS[token])  # type: ignore[arg-type]
+        return TemperatureReadingF(value_f=None, sentinel=_SENTINEL_TOKENS[token])
     try:
         value = int(token)
     except ValueError as exc:
@@ -419,9 +524,33 @@ def parse_cli_product(
             f"unparseable summary date in headline: {station_header_line!r}"
         ) from exc
 
-    temperature_block_match = _TEMPERATURE_BLOCK_RE.search(product_text)
+    # Scope the temperature search to OUR OWN SECTION: from the end of the
+    # headline just matched, up to the next headline (or end of text).
+    #
+    # `nws-cli-settlement` lists multi-station CLIs -- several stations'
+    # sections in one product -- as a known NWS hazard. Searching the whole
+    # body for the first TEMPERATURE (F) block silently walked past a
+    # section that had none and adopted the NEXT STATION'S values, returning
+    # a fully-populated, confident, wrong settlement under our headline.
+    # `body_header_regex` only proves the FIRST headline is ours; it says
+    # nothing about which section a later block belongs to.
+    #
+    # Bounding on both sides makes headline and temperatures provably come
+    # from the same section, and turns the mis-pairing into a `CliContentError`.
+    next_headline_match = _HEADLINE_RE.search(product_text, headline_match.end())
+    section_end = (
+        next_headline_match.start() if next_headline_match is not None else len(product_text)
+    )
+    section = product_text[headline_match.end() : section_end]
+
+    temperature_block_match = _TEMPERATURE_BLOCK_RE.search(section)
     if temperature_block_match is None:
-        raise CliContentError("no TEMPERATURE (F) block found")
+        raise CliContentError(
+            "no TEMPERATURE (F) block found in this product's own section (between "
+            f"{station_header_line!r} and the next station headline or end of text); "
+            "refusing to adopt a temperature block belonging to another station's "
+            "section of a multi-station product"
+        )
     block = temperature_block_match.group("block")
 
     observed_match = _OBSERVED_SUBSECTION_RE.search(block)

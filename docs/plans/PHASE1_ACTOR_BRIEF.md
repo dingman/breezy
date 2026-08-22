@@ -41,7 +41,7 @@ Earlier versions of this brief named the fuzz ceiling as the load-bearing contro
 - `os.open` + `fcntl.flock` on the station root;
 - two pyarrow read-backs plus `catalog.write_data` inside `write_records`;
 - at warm start, `read_climate_days(...)` over the **entire** station catalog, unbounded;
-- `read_current_climate_day`, which the catalog module's own docstring says reads "the station's whole catalog into memory per lookup, with no bound".
+- `read_climate_day_as_of_settlement`, which the catalog module's own docstring says reads "the station's whole catalog into memory per lookup, with no bound".
 
 That work is unbounded, **grows monotonically with retention**, and freezes the identical event loop — every venue heartbeat and every execution path in the process. The parse has a ceiling test; the thing that will actually stall the loop does not.
 
@@ -96,15 +96,46 @@ Name a module that owns: the single `SettlementGate`, the single `StateStore`, t
 
 ## 4. Async and typing rulings
 
-### 4.1 `on_timer` is sync; the poll is async — but VERIFY THE THREAD FIRST
+### 4.1 The timer callback runs on a Rust thread — MEASURED, ruling corrected
 
-`run_in_executor` cannot be used (F2) and the timer callback is unconditionally sync. The intended bridge is `asyncio.create_task(self._poll(...))` from the timer callback, with `add_done_callback` attached to that real `asyncio.Task`. That callback is the supervision path: an unhandled exception in `_poll` must transition the gate to BLOCKED with a CRIT log, because a poll task that dies silently is a gate left OPEN over stale data.
+Earlier revisions said to bridge with `asyncio.create_task`. **That is wrong and would have failed at the first timer fire.** Measured against a real `NautilusKernel` in LIVE mode, under both uvloop and the selector loop, with two independent probes agreeing:
 
-**This is the one ruling in this brief with no execution behind it, and two independent reviewers flagged it.** `LiveClock` timers are driven from **Rust**, and the callback re-enters Python through a pyo3 conversion wrapper. If it lands on a tokio thread rather than the asyncio loop thread, `asyncio.create_task` raises `RuntimeError: no running event loop` and the entire supervision story never exists. `TestClock` fires inline on the caller's thread, so a backtest proves nothing about this.
+| Probe | Loop thread | Timer callback thread |
+|---|---|---|
+| `threading.current_thread()` | `MainThread` | **`_DummyThread`** (`Dummy-N`) — CPython's placeholder for a thread it did not create |
+| `asyncio.get_running_loop()` | OK | **`RuntimeError: no running event loop`** |
+| `asyncio.create_task(coro)` | OK | **`RuntimeError: no running event loop`** |
+| `asyncio.run_coroutine_threadsafe(coro, loop)` | n/a | **OK** — returns a `concurrent.futures.Future` |
 
-**Measure it before building on it.** Assert `threading.get_ident()` inside a live timer callback against the loop thread. If they differ, the primitive is `asyncio.run_coroutine_threadsafe(coro, loop)` and the loop reference must be plumbed explicitly — base `Actor` exposes none, so say where it comes from. Do not proceed on the assumption; this determines whether polling works at all.
+**The primitive is `asyncio.run_coroutine_threadsafe(coro, loop)`**, not `loop.call_soon_threadsafe(loop.create_task, coro)` — only the former returns a handle, and the handle *is* the supervision seam that drives the gate to BLOCKED.
 
-This path is **live-only**. Guard it so a backtest never schedules a real fetch.
+**The loop reference comes from `asyncio.get_running_loop()` inside `Actor.on_start`.** Measured: in a live kernel `on_start` is awaited **on the loop thread** and returns the kernel's own loop. Base `Actor` exposes no loop attribute at all (`[n for n in dir(actor) if "loop" in n.lower()] == []`), and the only other route is buried in `ActorExecutor._loop` — a private attribute, so not an option. In a backtest `get_running_loop()` raises, which is the correct signal that the bridge is not needed.
+
+```python
+def on_start(self) -> None:
+    self._loop = asyncio.get_running_loop()      # live only; raises in backtest
+    self.clock.set_timer(name=..., interval=..., callback=self._on_timer)
+
+def _on_timer(self, event) -> None:              # Rust/tokio thread
+    loop = self._loop
+    if loop is None or loop.is_closed():
+        return                                   # shutdown race — see below
+    fut = asyncio.run_coroutine_threadsafe(self._poll(...), loop)
+    fut.add_done_callback(self._on_poll_done)    # fut.exception() -> gate BLOCKED
+```
+
+**Four measured hazards that must be encoded in the code, not just known:**
+
+1. **Rust swallows exceptions raised in the callback.** A callback that raised every time still fired repeatedly; the only trace was a `nautilus_common::timer` ERROR log. **Nothing propagates into Python.** Supervision therefore cannot rely on an exception escaping the callback — it must be explicit, via `fut.exception()` in the done-callback.
+2. **Treat the callback as concurrent-capable.** Two distinct OS thread idents were observed across fires of the same actor's timers, and simultaneity was *not* disproven. Keep `_on_timer` to "submit and return"; do **all** Actor-state mutation on the loop thread.
+3. **`_on_poll_done` must not assume it is on the loop thread.** `concurrent.futures.Future.add_done_callback` runs on the completing thread — measured `MainThread` — *unless* the future is already done at attach time, in which case it runs on the tokio thread.
+4. **`run_coroutine_threadsafe` raises if the loop is closed** (shutdown race). Guard it, and decide deliberately whether that guard returns quietly or trips the gate.
+
+**Do not use `Actor.run_in_executor` here.** Beyond F2 (it discards return values and hands back a `TaskId` with no `add_done_callback`), when an executor *is* registered it calls `self._loop.run_in_executor(...)` and `Future.add_done_callback(...)` **from the calling thread** — while `ActorExecutor`'s own docstring states that only `queue_for_executor` is safe to call from other threads. It appeared to work in the probe; it is calling non-thread-safe asyncio APIs from a foreign thread regardless.
+
+Pinned by `tests/contract/test_live_timer_thread_affinity.py` (9 tests), including a `TestClock`-fires-inline test so nobody "re-verifies" this in a backtest and gets the comfortable wrong answer.
+
+**Still unverified, carry as assumptions:** no node with a live data client attached (no network by policy); simultaneity of concurrent callbacks observed but not proven; behaviour under load not measured; thread provenance inferred from `_DummyThread` plus the log target, not from reading the compiled Rust.
 
 ### 4.2 mypy strict### 4.2 mypy strict
 
@@ -130,12 +161,27 @@ retry_after: str | None = None
 
 `retrieved_at_ns` is named identically to the domain field it becomes (`NwsRawProduct.retrieved_at_ns` → `ts_init`), so the boundary is a straight assignment with no translation step to hide a bug in. Zero, negative and `bool` are rejected — "silently omitted" and "stamped 0" are the same defect, and `bool` is an `int` subclass that would otherwise sail through as 1 ns.
 
-**Constructor and fetch:**
+**Constructor and the two fetch methods — the Actor never constructs a URL:**
 ```python
-HttpTransport(*, allowed_hosts: frozenset[str], clock: Callable[[], int], ...)
-async def fetch(self, url: str, *, if_none_match: str | None = None,
-                if_modified_since: str | None = None) -> FetchResult
+HttpTransport(*, allowed_hosts: frozenset[str], clock: Callable[[], int],
+              base_url: str = DEFAULT_BASE_URL, ...)          # "https://api.weather.gov"
+
+async def fetch_discovery_list(self, cli_location: str, *,
+                               if_none_match: str | None = None,
+                               if_modified_since: str | None = None) -> FetchResult
+async def fetch_product(self, product_id: str) -> FetchResult
 ```
+There is **no public method that accepts a URL.** Pass `"NYC"` and a UUID; the transport builds the paths. Four mistakes are now inexpressible rather than discouraged: a conditional GET on a product (mypy `call-arg` + `TypeError`), aiming a discovery call at a product URL, a product id carrying `..`/`/`/`?`/CRLF/NUL/`%2e%2e%2f`, and passing the AWIPS PIL `CLINYC` where the CLI location `NYC` belongs. The two identifier shapes — `[A-Z]{3}` and a canonical UUID — are mutually exclusive, so neither method can be aimed at the other's endpoint.
+
+**Three identifier spaces, all three live in this codebase, never interchangeable:** the CLI location (`NYC`, the path segment), the AWIPS PIL (`CLINYC`, line 3 of the product text), and the issuing WFO (`OKX`). A stale fixture was using the WFO in the discovery path until this change.
+
+An unsolicited **304 on a product fetch raises** (`RedirectError`, `status_code=304` → `PollOutcome.REDIRECT`, block, CRIT). Closing the signature stops us *asking*; it does not stop a buggy origin or an intermediate cache volunteering one, and that would take the identical silent-staleness route.
+
+A malformed identifier raises **`ValueError`, deliberately not a `TransportError`** — nothing was transported, the request could not be *formed*. Do not catch it as a network condition. It propagates to task-death supervision (BLOCKED + CRIT), which is the correct severity: a malformed uuid arriving in NWS's own JSON is either an upstream defect or tampering.
+
+**Product ids are matched, never normalised.** Parsing through `uuid.UUID` and re-serialising would accept `urn:uuid:` and braced forms and silently rewrite the settlement lookup key, desyncing the fetched id from the `product_uuid` recorded in `product_index`. Match-without-transform keeps them byte-identical.
+
+**Honest limit:** both identifiers are `str`, so aiming a discovery call at a product is caught at **runtime** (pre-socket `ValueError`), not by mypy. `NewType` wrappers would be defeated by a one-token cast; the runtime shape check is the real guard.
 The clock is **required**, matching `SettlementGate.__init__` — a defaulted module-level clock would be a second clock that can silently diverge from the one the freshness watchdog reads.
 
 Conditional-GET validators are typed **values**, never a header dict, so nothing per-call can displace `User-Agent`/`Accept-Encoding`. They are charset- and length-checked before any socket opens; a malformed one raises `InvalidCacheValidatorError` (routed as an integrity alarm, §5).
@@ -222,6 +268,12 @@ The **catalog write path raises six** exception types, not three: `ConcurrentWri
 
 `TRANSPORT_CONTRACT_VIOLATION` is the **F4 drift detector**: a status `http.py` promises to raise on, arriving instead as a plain `FetchResult`, fails closed rather than being routed as an ordinary status.
 
+**`persistence.catalog`** — the unbounded `read_current_climate_day` is **deleted**, not deprecated. Two accessors replace it, and picking the wrong one is a type error rather than a silent wrong answer:
+- `read_climate_day_as_of_settlement(catalog, *, station, climate_day, as_of_ts_init: int)` — settlement, reconciliation, retry. `as_of_ts_init` is keyword-only with **no default**; `None` is rejected at runtime.
+- `read_climate_day_including_corrections(catalog, *, station, climate_day)` — audit/truth only. Takes no bound parameter at all.
+
+Use the settlement accessor on any path that decides money. The truth accessor answers "what do we believe now", which is a different question from "what should the venue have settled on", and a corrected final always wins the unbounded query.
+
 **`persistence.catalog.write_records(...) -> WriteOutcome`** — check `is_complete`. A non-empty `skipped`, including the partial case, is an integrity violation.
 
 ---
@@ -242,6 +294,11 @@ The previous version of this section described **one** fetch yielding product te
 5. `CacheConfig.flush_on_start = False`
 
 **All five Actors must share one `SettlementGate` instance** (§3.6). The gate now reads its global entry through to the store on every access rather than caching it, so a sibling instance can no longer serve a stale `ua_trap_blocked`; the shared-instance rule still stands, because two mechanisms guarding this invariant is correct.
+
+**Two runtime guarantees the Actor must supply — the modules below it cannot.**
+
+- **Wrap the parse in `asyncio.wait_for`.** The 250 ms fuzz ceiling is a **CI-time property test**, not a production circuit-breaker. `GateReason.OVERSIZE_OR_PARSE_TIMEOUT` exists as a routing target, but **nothing measures real elapsed time** — so if a future regex edit, or an input shape outside the fuzz corpus's strategy space, reintroduces a stall, the event loop freezes with no guard. Wrap the call, route `TimeoutError` to `record_oversize_or_parse_timeout`, and stop the runtime guarantee depending on regex authors never regressing.
+- **Schedule `record_final_overdue` on a wall clock, independent of poll outcome.** This is the only orthogonal defence against a perpetual-304 staleness attack: a 304 counts as a successful poll and resets `last_successful_poll_ns`, satisfying the liveness watchdog indefinitely while writing no record. The gate keeps liveness and data-completeness genuinely decoupled at the state-machine level — `record_successful_poll` does **not** clear `final_overdue`. That decoupling must survive at the call site too. Add a contract test asserting the deadline fires on a schedule, **not** "after N failed fetches".
 
 **Step 1 — may we perform network I/O?**
 
@@ -293,6 +350,16 @@ Steps 9→12 are the crash window §3.3 recovers.
 **Correction to a premise stated in earlier revisions:** `ts_event` is **not** the replay-ordering key in 1.231.0. `ts_init` is the sort key everywhere (`backtest/engine.pyx:903`, `:2610`) and `ts_event` is never read in the replay path. A wrong `ts_event` corrupts settlement semantics and joins — which is serious — but it does not reorder a backtest. Include it in the comparison for that reason, not for an ordering reason.
 
 **On the fuzz and catalog ceilings:** wall-clock assertions are genuinely noisy on shared CI. State the methodology — fixed iteration count, percentile, or a machine-normalized budget — or the instruction to treat a breach as production-blocking will be ignored after the third false alarm.
+
+---
+
+## 7b. A deliberate availability cost the operator should know about
+
+Corrupt persisted state is fail-closed by design: a corrupted `product_index` entry makes that uuid return `MISMATCH` forever (first-write-wins never rewrites it, preserving forensic evidence), and corrupt **global** gate state blocks every site. This is the correct posture and should not change — it is what stops corruption being laundered into a clean slate.
+
+The consequence, stated plainly rather than discovered during an incident: any bit-flip or write fault in the shared cache database — disk error, an unrelated Nautilus subsystem sharing `Cache._general`, ordinary operational fault — becomes a **permanent trading halt** for that station, or for all stations, with no auto-recovery and only manual acknowledgement to clear it.
+
+That is a very different failure mode from "settles against bad data", and it is the one we chose. Worth an explicit operator sign-off, because the bot silently *not* trading is a real cost even though it is the safe direction.
 
 ---
 

@@ -10,12 +10,23 @@ section 6 for the full rationale and the evaluation of why
 
 Every control below is individually load-bearing:
 
-- HTTPS-only + host allowlist, checked before any socket opens.
+- HTTPS-only + host allowlist, checked before any socket opens, on the URL
+  the transport itself constructed.
+- Callers pass **typed identifiers, never URLs**: the two public fetch
+  methods take a bare CLI location code and a product id respectively, and
+  build their own paths. The origin is configurable; the paths are not.
+  Both identifiers are untrusted (one comes from the registry, one is
+  parsed out of remote JSON), so each is shape-checked before it can become
+  a path segment -- traversal, injection and absolute-URL forms are refused
+  rather than sanitised. Construction is defence in depth, not a substitute
+  for the allowlist, which still guards the finished URL.
 - Redirects are never followed: a 3xx on a settlement endpoint is an
   integrity alarm, not a fetch step. The one deliberate exception is 304
   Not Modified, the expected success response to a conditional GET
   (``If-None-Match``) against the discovery-list endpoint; 305 and 306
-  remain alarms (see ``RedirectError`` and ``FetchResult``).
+  remain alarms (see ``RedirectError`` and ``FetchResult``). That carve-out
+  is scoped to the endpoint that can legitimately produce it -- see the
+  conditional-GET control below.
 - TLS verification is always on (no code path disables it), minimum TLS 1.2.
 - Response bodies are capped (128 KiB default) and the cap is enforced
   *during* streaming, before the full body is materialised.
@@ -32,6 +43,21 @@ Every control below is individually load-bearing:
   displaced per call. An ``ETag`` is remote data being echoed back into an
   outbound request, so it is validated for length and charset before it is
   ever placed in a header (see :func:`_validated_cache_validator`).
+- Conditional GET is restricted to the endpoint where it is safe, **in the
+  type system rather than in this prose**. There are two public fetch
+  methods over one private implementation:
+  :meth:`HttpTransport.fetch_discovery_list` takes validators;
+  :meth:`HttpTransport.fetch_product` takes none at all. A discovery list is
+  a mutable index of what exists, so revalidating it is correct. A
+  ``/products/{id}`` body is immutable by id, so there is nothing to
+  revalidate: a conditional GET there buys nothing and costs correctness,
+  because a 304 routes as a *successful poll* that satisfies the freshness
+  watchdog while writing no record and recording no digest. "Conditionally
+  GET a product body" is therefore not a call that can be written, rather
+  than one that is discouraged. Because the two methods take *identifiers*
+  of mutually exclusive shape rather than URLs, the converse mistake --
+  aiming the conditional-GET method at a product body -- is equally
+  inexpressible.
 """
 
 from __future__ import annotations
@@ -42,9 +68,11 @@ import re
 import ssl
 from collections.abc import Callable
 from dataclasses import dataclass
-from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
+from urllib.parse import parse_qsl, quote, urlencode, urlsplit, urlunsplit
 
 import httpx
+
+DEFAULT_BASE_URL = "https://api.weather.gov"
 
 DEFAULT_MAX_BODY_BYTES = 128 * 1024  # 128 KiB; real CLI products are <64 KiB.
 DEFAULT_CHUNK_SIZE = 8 * 1024
@@ -54,6 +82,34 @@ USER_AGENT_ENV_VAR = "BREEZY_USER_AGENT"
 # Generous for a real validator (NWS ETags run ~40 chars, an HTTP-date 29)
 # and far below anything that could be used to smuggle a payload.
 MAX_VALIDATOR_LENGTH = 256
+
+# The BARE CLI location code -- the `{loc}` segment of
+# /products/types/CLI/locations/{loc}, e.g. `NYC`, `SFO`, `MIA`, `MDW`, `LAX`.
+#
+# This is NOT the AWIPS PIL. The PIL (`CLINYC`) appears on line 3 of the
+# product TEXT and is a different identifier in a different position;
+# conflating the two has already been a live defect in this project, so
+# `CLINYC` is refused here rather than fetched as a location that does not
+# exist.
+#
+# The shape is all this module enforces. `src/breezy/registry/sites.toml` is
+# the single source of truth for WHICH codes are legitimate -- station
+# identifiers are never hardcoded in settlement logic. Loosening this pattern
+# is a deliberate decision that needs a registry cross-check, not a
+# convenience edit.
+_CLI_LOCATION_PATTERN = re.compile(r"\A[A-Z]{3}\Z")
+
+# A product id as api.weather.gov assigns it: a canonical UUID. Every id
+# observed in this project's fixtures and every id described by the
+# `nws-cli-settlement` skill has this shape.
+#
+# Matched WITHOUT normalising, so the id placed in the path is byte-identical
+# to the id `ingest/product_index.py` records as `product_uuid` -- parsing and
+# re-serialising through `uuid.UUID` would accept `urn:uuid:` and braced forms
+# and then silently rewrite a settlement lookup key.
+_PRODUCT_ID_PATTERN = re.compile(
+    r"\A[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}\Z"
+)
 
 # RFC 9110 field-value characters, minus the obsolete forms: printable US-ASCII
 # only. This excludes CR, LF and NUL (header injection), HTAB and DEL (obs-fold
@@ -98,10 +154,16 @@ class RedirectError(TransportError):
     Redirects are never followed. On a settlement endpoint this is treated
     as an integrity alarm, not a normal fetch outcome.
 
-    304 Not Modified is deliberately excluded: it is the expected success
-    response to a conditional GET on the discovery-list endpoint and is
+    304 Not Modified is excluded **on the discovery-list endpoint only**,
+    where it is the expected success response to a conditional GET and is
     returned to the caller as a normal ``FetchResult`` instead (see
-    :meth:`HttpTransport.fetch`).
+    :meth:`HttpTransport.fetch_discovery_list`).
+
+    On :meth:`HttpTransport.fetch_product` a 304 IS raised through this
+    class, with ``status_code == 304``. That path never sends a validator,
+    so a 304 there is unsolicited and cannot be a truthful "your copy is
+    current" -- it is a stale-copy integrity alarm on the body that
+    determines settlement.
 
     305 (Use Proxy) and 306 (reserved, unused since HTTP/1.1) remain
     alarms. 305 instructs the client to route through a proxy, which on a
@@ -253,6 +315,41 @@ def _validated_cache_validator(value: str, header: str) -> str:
     return value
 
 
+def _validated_path_identifier(value: str, *, name: str, shape: str, pattern: re.Pattern[str]) -> str:
+    """Return `value` percent-encoded for use as ONE path segment, else raise.
+
+    Both identifiers this module accepts are untrusted. `cli_location` comes
+    from a registry value; `product_id` is **network-derived**, parsed out of
+    the discovery-list JSON an origin served us. A leading `/`, a `..`, a
+    query `?`, a fragment `#` or an encoded `%2e%2e%2f` in either one is a
+    path-manipulation primitive, and refusing those is the entire reason this
+    module exists.
+
+    The shape check is exact-match anchored, so nothing outside the permitted
+    charset survives -- traversal, injection and absolute-URL forms are all
+    rejected by construction rather than stripped. `quote(safe="")` on the way
+    out is a no-op for every value that passes, and is applied anyway so the
+    encoding guarantee does not silently depend on the pattern staying tight.
+
+    Raises `ValueError`, deliberately NOT a `TransportError`: nothing was
+    transported. The request could not even be FORMED, so there is no poll
+    outcome to route it to, and letting it be caught by an
+    `except TransportError` handler would let a path-manipulation attempt be
+    logged as a network condition.
+
+    The message names the *parameter*, never the value -- the same rule the
+    cache validators follow, for the same reason: an untrusted string must not
+    be laundered into a log line.
+    """
+    if pattern.match(value) is None:
+        raise ValueError(
+            f"`{name}` must be {shape}; the supplied value does not match and is "
+            "refused rather than sanitised. The value is withheld from this "
+            "message because it is untrusted input."
+        )
+    return quote(value, safe="")
+
+
 def _conditional_headers(
     *,
     if_none_match: str | None,
@@ -279,7 +376,7 @@ def _conditional_headers(
 # --------------------------------------------------------------------------
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
 class FetchResult:
     """Result of a successful fetch, including 304 Not Modified.
 
@@ -353,7 +450,7 @@ class FetchResult:
 # --------------------------------------------------------------------------
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
 class _Timeouts:
     connect: float = 5.0
     read: float = 10.0
@@ -385,6 +482,7 @@ class HttpTransport:
         *,
         allowed_hosts: frozenset[str],
         clock: Callable[[], int],
+        base_url: str = DEFAULT_BASE_URL,
         max_body_bytes: int = DEFAULT_MAX_BODY_BYTES,
         chunk_size: int = DEFAULT_CHUNK_SIZE,
         connect_timeout: float = 5.0,
@@ -410,6 +508,11 @@ class HttpTransport:
             assert_clean_proxy_env(approved_proxy_env_vars)
 
         self._allowed_hosts = frozenset(host.lower() for host in allowed_hosts)
+        # The ORIGIN is configurable so tests can retarget it; the PATHS are
+        # not -- they are built from validated identifiers by the two
+        # `_*_url` helpers below. A caller supplies what to fetch, never
+        # where on the origin to fetch it from.
+        self._base_url = base_url.rstrip("/")
         self._max_body_bytes = max_body_bytes
         self._chunk_size = chunk_size
         self._timeouts = _Timeouts(
@@ -417,6 +520,37 @@ class HttpTransport:
         )
         self._user_agent = user_agent or _default_user_agent()
         self._ssl_context = _build_ssl_context()
+
+    def _discovery_list_url(self, cli_location: str) -> str:
+        """Build the discovery-list URL for a BARE CLI location code.
+
+        `cli_location` is the `{loc}` path segment (`NYC`), never the AWIPS
+        PIL (`CLINYC`) and never the issuing WFO (`OKX`) -- three different
+        identifier spaces for the same site.
+        """
+        segment = _validated_path_identifier(
+            cli_location,
+            name="cli_location",
+            shape=(
+                "the bare three-letter CLI location code (e.g. `NYC`), not the "
+                "AWIPS PIL (`CLINYC`), not the issuing office, and not a URL"
+            ),
+            pattern=_CLI_LOCATION_PATTERN,
+        )
+        return f"{self._base_url}/products/types/CLI/locations/{segment}"
+
+    def _product_url(self, product_id: str) -> str:
+        """Build the product-body URL for a product id (a canonical UUID)."""
+        segment = _validated_path_identifier(
+            product_id,
+            name="product_id",
+            shape=(
+                "a canonical UUID as assigned by api.weather.gov (8-4-4-4-12 "
+                "hex digits), not a URL and not a path fragment"
+            ),
+            pattern=_PRODUCT_ID_PATTERN,
+        )
+        return f"{self._base_url}/products/{segment}"
 
     def _validate_url(self, url: str) -> None:
         parts = urlsplit(url)
@@ -452,20 +586,33 @@ class HttpTransport:
             headers={"User-Agent": self._user_agent, "Accept-Encoding": "identity"},
         )
 
-    async def fetch(
+    async def fetch_discovery_list(
         self,
-        url: str,
+        cli_location: str,
         *,
         if_none_match: str | None = None,
         if_modified_since: str | None = None,
     ) -> FetchResult:
-        """Fetch ``url`` and return its raw-bytes digest, decoded text and receipt instant.
+        """Fetch a station's **discovery list**, optionally as a conditional GET.
+
+        This is the endpoint where conditional GET is correct: the list of
+        products for a location is a *mutable index of what exists*, it is
+        polled far more often than it changes, and a 304 there is a true
+        statement that nothing new has been published. Revalidating it is
+        the whole point.
 
         Parameters
         ----------
-        url : str
-            The absolute HTTPS URL to fetch. Validated against the scheme,
-            userinfo, port and host-allowlist rules before any socket opens.
+        cli_location : str
+            The **bare** CLI location code -- the ``{loc}`` path segment of
+            ``/products/types/CLI/locations/{loc}``, e.g. ``NYC``. The
+            transport builds the path; the caller never supplies a URL.
+
+            This is **not** the AWIPS PIL: the PIL for that site is
+            ``CLINYC`` and lives on line 3 of the product text. It is also
+            not the issuing office (``OKX``). Three identifier spaces, one
+            site -- see ``src/breezy/registry/sites.toml``, which is the
+            single source of truth for which codes are legitimate.
         if_none_match : str or None
             An ``ETag`` from a previous response for this URL, sent as
             ``If-None-Match``. Supply it to make the origin answer 304 when
@@ -480,9 +627,99 @@ class HttpTransport:
         header on a per-call basis. Each is checked by
         :func:`_validated_cache_validator` before it reaches the wire.
 
-        Raises one of the :class:`TransportError` subclasses on any failure
-        mode; never returns a partially-materialised or lossily-decoded
-        body.
+        A 304 comes back as a normal :class:`FetchResult` with
+        ``status_code == 304`` and no document. On this endpoint that is the
+        healthy steady state.
+
+        Raises `ValueError` if `cli_location` is not a well-formed bare
+        location code (before any socket opens), or one of the
+        :class:`TransportError` subclasses on any transport failure mode;
+        never returns a partially-materialised or lossily-decoded body.
+        """
+        return await self._fetch(
+            self._discovery_list_url(cli_location),
+            if_none_match=if_none_match,
+            if_modified_since=if_modified_since,
+            allow_not_modified=True,
+        )
+
+    async def fetch_product(self, product_id: str) -> FetchResult:
+        """Fetch a **product body** by id. Unconditionally, always, by construction.
+
+        This method takes no cache-validator parameters, and that absence is
+        the point: it makes "conditionally GET a product body" something a
+        caller cannot express, rather than something a docstring discourages.
+
+        It also takes an **id, not a URL**, which is what makes the converse
+        mistake -- pointing :meth:`fetch_discovery_list` at a product body to
+        get its validators back -- equally inexpressible. A CLI location is
+        three uppercase letters and a product id is a canonical UUID, so no
+        string satisfies both and neither method can be aimed at the other's
+        endpoint.
+
+        A ``/products/{id}`` body is **immutable by id**. There is nothing
+        there to revalidate, so a conditional GET buys nothing and costs
+        correctness. A 304 routes as a *successful poll*
+        (``routing.route_fetch_result`` -> ``PollOutcome.NOT_MODIFIED``,
+        "freshness satisfied, no record written"), so a stale or buggy 304 on
+        a product fetch -- a known class of server-side ETag defect, or simply
+        a reissue racing the validator capture -- would leave the site reading
+        OPEN and fresh while a corrected final sat unfetched.
+        ``FINAL_CLI_OVERDUE`` would not catch it either: that watchdog fires
+        off a *deadline*, not off "is my copy current". The failure would be
+        invisible to every gate signal until the next discovery poll.
+
+        Because this path never sends a validator, a 304 *received* here is
+        unsolicited (RFC 9110 SS15.4.5: 304 answers a conditional request) and
+        is raised as a :class:`RedirectError` integrity alarm rather than
+        returned. Closing the signature stops us asking for one; that check
+        stops a buggy or hostile origin volunteering one.
+
+        Parameters
+        ----------
+        product_id : str
+            The product id assigned by api.weather.gov -- a canonical UUID,
+            the same value ``ingest/product_index.py`` records as
+            ``product_uuid``. The transport builds ``/products/{id}`` itself.
+
+            This value is **network-derived** (parsed out of the discovery
+            JSON), so it is treated as untrusted: its shape is checked before
+            it is placed in a path, and it is never normalised, so the id
+            fetched is byte-identical to the id recorded as provenance.
+
+        Raises `ValueError` if `product_id` is not a well-formed product id
+        (before any socket opens), or one of the :class:`TransportError`
+        subclasses on any transport failure mode; never returns a
+        partially-materialised or lossily-decoded body.
+        """
+        return await self._fetch(
+            self._product_url(product_id),
+            if_none_match=None,
+            if_modified_since=None,
+            allow_not_modified=False,
+        )
+
+    async def _fetch(
+        self,
+        url: str,
+        *,
+        if_none_match: str | None,
+        if_modified_since: str | None,
+        allow_not_modified: bool,
+    ) -> FetchResult:
+        """Shared hardened implementation behind both public fetch methods.
+
+        Private so that the endpoint distinction cannot be bypassed by
+        reaching past the two public methods, and so the hardening cannot
+        fork between them: every control (allowlist, TLS floor, redirect
+        alarm, size cap, strict decode, digest-before-decode, receipt stamp)
+        is applied here, once, for both.
+
+        ``allow_not_modified`` is a property of the *endpoint*, fixed by
+        which public method was called -- deliberately not derived from
+        whether this particular call happened to carry a validator. Deriving
+        it per call would put a correctness-critical branch back onto
+        per-call state, which is exactly the fragility the split removes.
         """
         # Re-checked on every fetch, not only at construction: a long-lived
         # transport is built once per trading session, so an env var set
@@ -505,7 +742,7 @@ class HttpTransport:
                 self._build_client() as client,
                 client.stream("GET", url, headers=conditional_headers) as response,
             ):
-                self._raise_for_status(response)
+                self._raise_for_status(response, allow_not_modified=allow_not_modified)
                 if response.status_code == 304:
                     return self._not_modified_result(response, url)
                 self._reject_unexpected_content_encoding(response)
@@ -543,8 +780,24 @@ class HttpTransport:
             retry_after=response.headers.get("retry-after"),
         )
 
-    def _raise_for_status(self, response: httpx.Response) -> None:
+    def _raise_for_status(self, response: httpx.Response, *, allow_not_modified: bool) -> None:
         status = response.status_code
+        if status == 304 and not allow_not_modified:
+            # Unsolicited: this endpoint never sends a validator, and RFC 9110
+            # SS15.4.5 says 304 answers a conditional request. Returned as a
+            # `FetchResult` it would route to `PollOutcome.NOT_MODIFIED` and
+            # satisfy the freshness watchdog while writing no record, which on
+            # a settlement body is the exact silent-staleness failure the
+            # endpoint split exists to prevent. Raised as the EXISTING
+            # `RedirectError` -- no new subclass, since `routing.py` enumerates
+            # them and a contract test fails if one lacks a route.
+            raise RedirectError(
+                f"Server returned 304 Not Modified for {redact_url(str(response.url))}, "
+                "which sent no conditional-GET validator. An unsolicited 304 on an "
+                "immutable-by-id body is an integrity alarm, not a fresh poll.",
+                status_code=status,
+                location=response.headers.get("location"),
+            )
         if 300 <= status < 400 and status != 304:
             raise RedirectError(
                 f"Server returned redirect {status} for {redact_url(str(response.url))}; "

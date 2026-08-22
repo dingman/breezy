@@ -82,3 +82,33 @@ def test_correction_evidence_detects_each_marker(marker: str) -> None:
 
 def test_correction_evidence_false_for_empty_text() -> None:
     assert has_correction_evidence("") is False
+
+
+@pytest.mark.parametrize(
+    "phrase",
+    [
+        "CORRECTIONS TO THE CLIMATE SUMMARY FOLLOW",
+        "...CORRECTIONS...",
+        "THE FOLLOWING CORRECTIONS APPLY",
+    ],
+)
+def test_correction_evidence_detects_the_plural_spelling(phrase: str) -> None:
+    """`\\bCORRECTED\\b|\\bCORRECTION\\b` did not match CORRECTIONS: `\\b`
+    after the singular requires a non-word character, and the trailing `S`
+    is a word character, so the plural slipped through entirely.
+
+    The whole-text superset behaviour here is deliberate and stays. While
+    this flag is ADVISORY, a false positive costs an operator a few seconds
+    dismissing an alert; a false negative silently degrades the audit trail
+    that has to explain a settlement discrepancy after the fact. Catch
+    more, not less.
+    """
+    assert has_correction_evidence(phrase) is True
+
+
+def test_correction_evidence_still_ignores_unrelated_words() -> None:
+    """Widening to `CORRECTIONS?` must not widen to arbitrary prefixes:
+    CORRECTIONAL and CORRECTIVE are not correction evidence.
+    """
+    assert has_correction_evidence("CORRECTIONAL FACILITY") is False
+    assert has_correction_evidence("CORRECTIVE ACTION") is False

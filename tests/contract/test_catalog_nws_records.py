@@ -25,7 +25,10 @@ from nautilus_trader.serialization.arrow.serializer import ArrowSerializer
 from breezy.domain.nws_climate_day import CLIMATE_DAY_SCHEMA_VERSION, NwsClimateDay
 from breezy.domain.selection import select_climate_day
 from breezy.domain.strict_arrow import SchemaDriftError
-from breezy.persistence.catalog import read_current_climate_day
+from breezy.persistence.catalog import (
+    read_climate_day_as_of_settlement,
+    read_climate_day_including_corrections,
+)
 
 pytestmark = pytest.mark.contract
 
@@ -429,7 +432,7 @@ def test_backfilled_preliminary_never_supersedes_a_final_through_the_catalog(
 
     for selected in (
         select_climate_day(stored, "NYC", _DAY),
-        read_current_climate_day(catalog, station="NYC", climate_day=_DAY),
+        read_climate_day_including_corrections(catalog, station="NYC", climate_day=_DAY),
     ):
         assert selected is not None
         assert selected.is_final is True
@@ -437,7 +440,7 @@ def test_backfilled_preliminary_never_supersedes_a_final_through_the_catalog(
 
     # Point-in-time correctness survives: that afternoon, the preliminary had not
     # even been superseded yet, and as of the final's arrival the final is current.
-    as_of_final = read_current_climate_day(
+    as_of_final = read_climate_day_as_of_settlement(
         catalog,
         station="NYC",
         climate_day=_DAY,
@@ -471,7 +474,7 @@ def test_as_of_before_the_final_returns_the_preliminary_through_the_catalog(
     catalog.write_data([preliminary])
     catalog.write_data([final])
 
-    as_of_that_afternoon = read_current_climate_day(
+    as_of_that_afternoon = read_climate_day_as_of_settlement(
         catalog,
         station="NYC",
         climate_day=_DAY,
@@ -481,7 +484,7 @@ def test_as_of_before_the_final_returns_the_preliminary_through_the_catalog(
     assert as_of_that_afternoon.is_final is False
     assert as_of_that_afternoon.tmax_f == 82
 
-    current = read_current_climate_day(catalog, station="NYC", climate_day=_DAY)
+    current = read_climate_day_including_corrections(catalog, station="NYC", climate_day=_DAY)
     assert current is not None
     assert current.is_final is True
     assert current.tmax_f == 84

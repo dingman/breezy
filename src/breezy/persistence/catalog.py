@@ -37,6 +37,22 @@ stations' records into one directory. Only components derived here
 itself or anything above it, because pointing a data root at a symlinked volume
 is ordinary deployment practice and rejecting it would be a false positive.
 
+That check alone is not sufficient, because it is not atomic with the
+directory creation that follows it. :meth:`pathlib.Path.mkdir` with
+``exist_ok=True`` catches ``FileExistsError`` and falls back to ``is_dir()``,
+which **follows symlinks**: a link planted in the window between the check and
+the ``mkdir`` is accepted as "already exists and is a directory", and every
+subsequent write goes to a directory of someone else's choosing with no
+exception and no log. The writer lock closes its own version of this window in
+the kernel with ``O_NOFOLLOW``; the directory has no such flag, so
+:func:`_require_real_directory` re-verifies with ``os.lstat`` (which does not
+follow) **after** the ``mkdir`` -- and again inside the writer lock's critical
+section on every :func:`write_records` call, which narrows the exposure from
+"once per process lifetime" to "immediately before each write, under the lock".
+The consequence of missing it is worse than the lock case: a subverted lock lets
+two writers race, which read-back verification catches, while an aliased root
+durably merges two stations' settlement records and no read-back can tell.
+
 Corrections
 -----------
 A correction is a **new record with a strictly later** ``ts_init``, never a
@@ -65,7 +81,7 @@ immediately with :class:`ConcurrentWriterError` instead of relying on the skip
 detector to notice downstream.
 
 The lock is deliberately **write-only**. Readers -- :func:`read_climate_days`,
-:func:`read_raw_products`, :func:`read_current_climate_day`, and Nautilus's own
+:func:`read_raw_products`, both climate-day accessors, and Nautilus's own
 ``BacktestNode`` replay, which opens the root itself and never calls this module --
 take no lock at all, so any number of processes may read one station root
 concurrently. Locking reads would serialise multi-process replay for no
@@ -114,6 +130,31 @@ correct on them, so only genuinely network-shared types are refused (see
 Selection is not reimplemented here -- :mod:`breezy.domain.selection` owns the
 supersession rule, keyed on ``(is_final, ts_init, revision_seq)``, and the
 ``as_of_ts_init`` bound.
+
+Two questions, two accessors
+----------------------------
+"What should the venue have settled on at 08:00 ET?" and "what do we believe
+now?" are different questions with different answers, and the difference is
+money: ``is_final`` leads the ordering and ``is_superseded`` is deliberately
+never consulted, so an **unbounded** query always prefers a corrected final --
+same ``is_final``, strictly later ``ts_init``. Venue P&L is immutable, so a
+settlement, reconciliation or retry path that reads the corrected value is
+reading a number the venue never paid out on.
+
+A single function with an optional bound makes the safe call depend on every
+future caller remembering an argument. So there are two, and the wrong one does
+not type-check:
+
+* :func:`read_climate_day_as_of_settlement` -- settlement-facing.
+  ``as_of_ts_init`` is a **required keyword with no default**.
+* :func:`read_climate_day_including_corrections` -- audit/truth-facing.
+  Unbounded, and named for what it may return.
+
+This mirrors the structural remedy already used for the two-clocks problem
+(:class:`~breezy.registry.sites.ClimateDayWindow` vs
+:class:`~breezy.registry.sites.SettlementDeadline`) and the enrichment barrier:
+distinct names and distinct shapes, so the wrong one is not reachable by
+autocomplete. There is deliberately no unbounded-by-default accessor.
 """
 
 from __future__ import annotations
@@ -123,6 +164,7 @@ import errno
 import fcntl
 import os
 import re
+import stat
 from collections import Counter
 from collections.abc import Iterator, Sequence
 from contextlib import contextmanager
@@ -155,8 +197,9 @@ __all__ = [
     "assert_writer_lock_filesystem_supported",
     "open_station_catalog",
     "probe_filesystem",
+    "read_climate_day_as_of_settlement",
+    "read_climate_day_including_corrections",
     "read_climate_days",
-    "read_current_climate_day",
     "read_raw_products",
     "station_catalog_path",
     "write_records",
@@ -330,9 +373,27 @@ def open_station_catalog(base: Path, venue: str, city: str) -> ParquetDataCatalo
     The root is created eagerly so that a station with no data yet is still a
     directory on disk -- a missing root and an empty root are otherwise
     indistinguishable to an operator inspecting the data island.
+
+    Raises
+    ------
+    CatalogPathError
+        If the path is unsafe, or if what is on disk after the ``mkdir`` is not
+        a real directory. The path check and the ``mkdir`` are separate
+        syscalls, and ``mkdir(exist_ok=True)`` reports success for a **symlink**
+        to a directory, so the result is re-verified here rather than trusted.
+        This is not the last word: :func:`write_records` re-checks under the
+        writer lock, because a root opened once is written through for the whole
+        life of the process.
+
     """
     root = station_catalog_path(base, venue, city)
     root.mkdir(parents=True, exist_ok=True)
+
+    # Post-`mkdir`, with calls that do NOT follow symlinks: the component walk
+    # covers `<base>/<venue>` (which `root` alone cannot speak for), and the
+    # `lstat` covers `root` itself.
+    _require_no_symlinked_components(Path(base), (venue, city))
+    _require_real_directory(root)
 
     return ParquetDataCatalog(path=root)
 
@@ -368,9 +429,12 @@ def write_records(catalog: ParquetDataCatalog, records: Sequence[Data]) -> Write
         :class:`ConcurrentWriterError` is a subclass, so catch this type to
         handle every "could not take the lock" outcome at once.
     CatalogPathError
-        If the writer-lock path is a symlink. Refusing to follow it is what keeps
-        the lock bound to this station root rather than to an inode of someone
-        else's choosing.
+        If the writer-lock path is a symlink, or if the station root itself is
+        no longer a real directory. Refusing to follow either is what keeps both
+        the lock and the records bound to this station root rather than to an
+        inode of someone else's choosing. The root is re-checked on **every**
+        call, under the lock: it was validated when the catalog was opened, but
+        a root is opened once and written through for the life of the process.
     CatalogWriteError
         If read-back shows a partial write, which the platform's per-class
         chunking should make impossible.
@@ -464,21 +528,90 @@ def read_raw_products(
     return _read(catalog, NwsRawProduct, start=start, end=end)
 
 
-def read_current_climate_day(
+def read_climate_day_as_of_settlement(
     catalog: ParquetDataCatalog,
     *,
     station: str,
     climate_day: dt.date,
-    as_of_ts_init: int | None = None,
+    as_of_ts_init: int,
 ) -> NwsClimateDay | None:
-    """Return the current record for `(station, climate_day)` as known at a time.
+    """Return the record as known at `as_of_ts_init` -- the SETTLEMENT answer.
 
-    Composes :func:`read_climate_days` with
-    :func:`breezy.domain.selection.select_climate_day`, which owns the rule --
-    max ``(is_final, ts_init, revision_seq)`` per ``(station, climate_day)``,
-    ``is_final`` leading so that a backfilled preliminary can never shadow a
-    final -- and the ``as_of_ts_init`` bound. Only the key's shape is named here;
-    the rule itself is not restated.
+    Use this wherever the question is "what should the venue have settled on",
+    including reconciliation and any retry of a settlement decision. Venue P&L
+    is immutable, so these paths must read the value that was current at the
+    settlement instant, never a correction that landed afterwards.
+
+    ``as_of_ts_init`` is a **required keyword with no default**, and ``None`` is
+    rejected at runtime. That is the whole point of this function existing
+    separately from :func:`read_climate_day_including_corrections`: an optional
+    bound makes correctness depend on every future caller remembering to pass
+    one, and the failure is silent -- an unbounded query returns a *later*
+    corrected final in preference to the record the venue actually paid out on,
+    because ``is_final`` leads the ordering and ``is_superseded`` is never
+    consulted.
+
+    Parameters
+    ----------
+    catalog : ParquetDataCatalog
+        One station's catalog, from :func:`open_station_catalog`.
+    station : str
+        The registry **CLI location** code -- see
+        :func:`read_climate_day_including_corrections`.
+    climate_day : datetime.date
+    as_of_ts_init : int
+        Inclusive upper bound on ``ts_init`` in UNIX nanoseconds: the answer the
+        resolver would have given at that instant. Source it from the venue's
+        settlement deadline (:class:`~breezy.registry.sites.SettlementDeadline`),
+        not from "now".
+
+    Returns
+    -------
+    NwsClimateDay or None
+        ``None`` when nothing for that key had arrived by ``as_of_ts_init``.
+        A returned record is *current as of the bound*, not necessarily
+        settlement-grade: callers must still check ``is_final``.
+
+    Raises
+    ------
+    TypeError
+        If ``as_of_ts_init`` is omitted (also a `mypy` error) or is not an
+        ``int``. ``None`` in particular would silently un-bound the query.
+
+    """
+    if not isinstance(as_of_ts_init, int):
+        raise TypeError(
+            f"`as_of_ts_init` must be an `int` UNIX-nanosecond bound, was "
+            f"{type(as_of_ts_init).__name__}. Un-bounding this query returns "
+            f"corrections that landed after settlement, which is a different "
+            f"question: call `read_climate_day_including_corrections` if that "
+            f"is genuinely what you want.",
+        )
+
+    return _select_current_climate_day(
+        catalog,
+        station=station,
+        climate_day=climate_day,
+        as_of_ts_init=as_of_ts_init,
+    )
+
+
+def read_climate_day_including_corrections(
+    catalog: ParquetDataCatalog,
+    *,
+    station: str,
+    climate_day: dt.date,
+) -> NwsClimateDay | None:
+    """Return the latest record for `(station, climate_day)` -- the AUDIT answer.
+
+    Unbounded on purpose, and named for what that means: if a correction has
+    landed, this returns the *corrected* value, which is what Breezy believes
+    now and NOT what the venue settled on. Use it for audit, monitoring, truth
+    reconstruction and supersession review.
+
+    **Never** call this from a settlement, reconciliation or retry path --
+    :func:`read_climate_day_as_of_settlement` is the accessor for those, and it
+    forces the bound to be stated.
 
     Parameters
     ----------
@@ -492,21 +625,46 @@ def read_current_climate_day(
         ``registry.settlement_site(venue, city).cli_location``; passing ``city``
         directly is a settlement bug waiting for the first site where they differ.
     climate_day : datetime.date
-    as_of_ts_init : int, optional
-        Inclusive upper bound on ``ts_init``: the answer the resolver would have
-        given at that instant.
 
     Returns
     -------
     NwsClimateDay or None
         The *current* record, which is not necessarily settlement-grade: before
-        the final arrives this is the preliminary. Settlement callers must check
-        ``is_final`` themselves -- selection guarantees a final is never shadowed,
-        not that one exists.
+        the final arrives this is the preliminary. Callers must check
+        ``is_final`` themselves -- selection guarantees a final is never
+        shadowed, not that one exists.
+
+    """
+    return _select_current_climate_day(
+        catalog,
+        station=station,
+        climate_day=climate_day,
+        as_of_ts_init=None,
+    )
+
+
+def _select_current_climate_day(
+    catalog: ParquetDataCatalog,
+    *,
+    station: str,
+    climate_day: dt.date,
+    as_of_ts_init: int | None,
+) -> NwsClimateDay | None:
+    """Shared body of the two accessors -- never called directly.
+
+    Private so that the unbounded shape is not reachable as an entry point:
+    the public surface is exactly the two named questions.
+
+    Composes :func:`read_climate_days` with
+    :func:`breezy.domain.selection.select_climate_day`, which owns the rule --
+    max ``(is_final, ts_init, revision_seq)`` per ``(station, climate_day)``,
+    ``is_final`` leading so that a backfilled preliminary can never shadow a
+    final -- and the ``as_of_ts_init`` bound. Only the key's shape is named here;
+    the rule itself is not restated.
 
     Notes
     -----
-    ``as_of_ts_init`` is deliberately NOT pushed down into the catalog query as an
+    The bound is deliberately NOT pushed down into the catalog query as an
     ``end`` bound. The two filters are equivalent today (``_query_pyarrow`` filters
     ``ts_init <= end``), but the selection rule is settlement-critical and must have
     exactly one implementation; a pushdown would silently become a second one.
@@ -583,6 +741,40 @@ def _require_no_symlinked_components(base: Path, components: Sequence[str]) -> N
             )
 
 
+def _require_real_directory(root: Path) -> None:
+    """Refuse a station root that is not a real directory, WITHOUT following links.
+
+    The check that matters is `os.lstat`, which -- unlike every path predicate
+    used to derive the root -- does not follow a symlink. `Path.mkdir` with
+    ``exist_ok=True`` catches `FileExistsError` and falls back to `self.is_dir()`,
+    which DOES follow, so a link planted between a symlink check and the `mkdir`
+    is reported as "already exists and is a directory" and every write from then
+    on lands in the link's target.
+
+    Raising `CatalogPathError` rather than a new type is deliberate:
+    `breezy.ingest.routing` enumerates the catalog write-path taxonomy exactly,
+    and this IS a path-safety failure -- the same class of event as a symlinked
+    component or a symlinked lock file.
+    """
+    try:
+        status = os.lstat(root)
+    except OSError as exc:
+        raise CatalogPathError(
+            f"the station root {root} could not be verified as a real directory "
+            f"({exc}); refusing to write through a path whose identity on disk "
+            f"is unknown",
+        ) from exc
+
+    if not stat.S_ISDIR(status.st_mode):
+        raise CatalogPathError(
+            f"station root {root} is not a real directory: `lstat` (which does "
+            f"not follow links) reports {stat.filemode(status.st_mode)}. A "
+            f"symlink here silently merges two stations' settlement records "
+            f"into one directory, and `mkdir(exist_ok=True)` cannot detect it "
+            f"because its `is_dir()` fallback follows the link",
+        )
+
+
 @contextmanager
 def _writer_lock(catalog: ParquetDataCatalog) -> Iterator[None]:
     """Hold this station root's advisory writer lock, or fail immediately.
@@ -603,6 +795,13 @@ def _writer_lock(catalog: ParquetDataCatalog) -> Iterator[None]:
     path is `CatalogPathError`, and every other `OSError` (EROFS, ENOSPC, EACCES,
     EISDIR, ENOTDIR ...) is `WriterLockError`. All of them are raised before the
     lock is held and therefore before anything is read or written.
+
+    The station root is re-verified INSIDE the critical section, immediately
+    before the caller's read-modify-write span. Validating it when the catalog
+    was opened is not enough: a root is opened once and written through for the
+    life of the process, so that check leaves a window as wide as the process.
+    Under the lock the check is cheap, no other sanctioned writer can be midway
+    through a write, and a failure aborts before `write_data` is reached.
     """
     lock_path = Path(catalog.path) / WRITER_LOCK_FILENAME
 
@@ -636,6 +835,7 @@ def _writer_lock(catalog: ParquetDataCatalog) -> Iterator[None]:
             ) from exc
 
         try:
+            _require_real_directory(Path(catalog.path))
             yield
         finally:
             fcntl.flock(fd, fcntl.LOCK_UN)

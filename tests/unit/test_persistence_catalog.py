@@ -12,6 +12,7 @@ from __future__ import annotations
 import datetime as dt
 import fcntl
 import hashlib
+import inspect
 import os
 from pathlib import Path
 from typing import Any
@@ -38,8 +39,9 @@ from breezy.persistence.catalog import (
     assert_writer_lock_filesystem_supported,
     open_station_catalog,
     probe_filesystem,
+    read_climate_day_as_of_settlement,
+    read_climate_day_including_corrections,
     read_climate_days,
-    read_current_climate_day,
     read_raw_products,
     station_catalog_path,
     write_records,
@@ -428,7 +430,8 @@ def test_read_climate_days_honours_the_ts_init_window(tmp_path: Path) -> None:
 # -- as-of composition over `domain.selection` -----------------------------------------------
 
 
-def test_read_current_climate_day_returns_the_superseding_record(tmp_path: Path) -> None:
+def test_the_audit_accessor_returns_the_superseding_record(tmp_path: Path) -> None:
+    """Corrections included -- "what do we believe now", NOT a settlement answer."""
     catalog = open_station_catalog(tmp_path, "polymarket_us", "NYC")
     original = make_climate_day(tmax_f=84)
     corrected = make_climate_day(
@@ -440,15 +443,15 @@ def test_read_current_climate_day_returns_the_superseding_record(tmp_path: Path)
     write_records(catalog, [original])
     write_records(catalog, [corrected])
 
-    current = read_current_climate_day(catalog, station="NYC", climate_day=_DAY)
+    current = read_climate_day_including_corrections(catalog, station="NYC", climate_day=_DAY)
 
     assert current is not None
     assert current.tmax_f == 99
     assert current.revision_seq == 2
 
 
-def test_read_current_climate_day_respects_the_as_of_bound(tmp_path: Path) -> None:
-    """Post-hoc audit: what would the resolver have returned before the fix?"""
+def test_the_settlement_accessor_answers_as_of_its_bound(tmp_path: Path) -> None:
+    """What the venue would have settled on -- never the later correction."""
     catalog = open_station_catalog(tmp_path, "polymarket_us", "NYC")
     write_records(catalog, [make_climate_day(tmax_f=84)])
     write_records(
@@ -463,13 +466,13 @@ def test_read_current_climate_day_respects_the_as_of_bound(tmp_path: Path) -> No
         ],
     )
 
-    before = read_current_climate_day(
+    before = read_climate_day_as_of_settlement(
         catalog,
         station="NYC",
         climate_day=_DAY,
         as_of_ts_init=_RETRIEVED_NS,
     )
-    at_correction = read_current_climate_day(
+    at_correction = read_climate_day_as_of_settlement(
         catalog,
         station="NYC",
         climate_day=_DAY,
@@ -482,12 +485,135 @@ def test_read_current_climate_day_respects_the_as_of_bound(tmp_path: Path) -> No
     assert at_correction.tmax_f == 99
 
 
-def test_read_current_climate_day_returns_none_for_an_unknown_key(tmp_path: Path) -> None:
+def test_both_accessors_return_none_for_an_unknown_key(tmp_path: Path) -> None:
     catalog = open_station_catalog(tmp_path, "polymarket_us", "NYC")
     write_records(catalog, [make_climate_day()])
 
-    assert read_current_climate_day(catalog, station="NYC", climate_day=dt.date(2026, 1, 1)) is None
-    assert read_current_climate_day(catalog, station="MDW", climate_day=_DAY) is None
+    assert (
+        read_climate_day_including_corrections(
+            catalog,
+            station="NYC",
+            climate_day=dt.date(2026, 1, 1),
+        )
+        is None
+    )
+    assert read_climate_day_including_corrections(catalog, station="MDW", climate_day=_DAY) is None
+    assert (
+        read_climate_day_as_of_settlement(
+            catalog,
+            station="NYC",
+            climate_day=dt.date(2026, 1, 1),
+            as_of_ts_init=_RETRIEVED_NS,
+        )
+        is None
+    )
+    assert (
+        read_climate_day_as_of_settlement(
+            catalog,
+            station="MDW",
+            climate_day=_DAY,
+            as_of_ts_init=_RETRIEVED_NS,
+        )
+        is None
+    )
+
+
+# -- the settlement / audit accessor split ----------------------------------------------------
+
+
+def test_the_settlement_accessor_cannot_be_called_without_a_bound(tmp_path: Path) -> None:
+    """The wrong call must not compile -- and must not run either.
+
+    ``as_of_ts_init`` is keyword-only with NO default, so omitting it is a
+    `mypy` error at author time and a `TypeError` at run time. A settlement,
+    reconciliation, or retry path cannot silently read "what we believe now".
+    """
+    catalog = open_station_catalog(tmp_path, "polymarket_us", "NYC")
+    write_records(catalog, [make_climate_day()])
+
+    with pytest.raises(TypeError, match="as_of_ts_init"):
+        read_climate_day_as_of_settlement(  # type: ignore[call-arg]
+            catalog,
+            station="NYC",
+            climate_day=_DAY,
+        )
+
+
+def test_the_settlement_accessor_signature_forbids_an_implicit_bound() -> None:
+    """Structural, so a later "convenience" default fails RED rather than drift."""
+    parameter = inspect.signature(read_climate_day_as_of_settlement).parameters["as_of_ts_init"]
+
+    assert parameter.kind is inspect.Parameter.KEYWORD_ONLY
+    assert parameter.default is inspect.Parameter.empty
+
+
+def test_the_settlement_accessor_refuses_a_none_bound(tmp_path: Path) -> None:
+    """`None` is the one value that would satisfy the signature and un-bound it."""
+    catalog = open_station_catalog(tmp_path, "polymarket_us", "NYC")
+    write_records(catalog, [make_climate_day()])
+
+    with pytest.raises(TypeError, match="read_climate_day_including_corrections"):
+        read_climate_day_as_of_settlement(
+            catalog,
+            station="NYC",
+            climate_day=_DAY,
+            as_of_ts_init=None,  # type: ignore[arg-type]
+        )
+
+
+def test_the_audit_accessor_takes_no_bound_at_all() -> None:
+    """Two accessors, two shapes: neither can be mistaken for the other."""
+    parameters = inspect.signature(read_climate_day_including_corrections).parameters
+
+    assert "as_of_ts_init" not in parameters
+
+
+def test_no_unbounded_by_default_accessor_survives() -> None:
+    """The defect was an entry point that defaulted to unbounded.
+
+    Re-adding one -- under any name -- puts "what should the venue have settled
+    on" and "what do we believe now" back behind a single call whose safety
+    depends on every future caller remembering an optional argument.
+    """
+    assert not hasattr(catalog_module, "read_current_climate_day")
+    assert "read_current_climate_day" not in catalog_module.__all__
+    assert "read_climate_day_as_of_settlement" in catalog_module.__all__
+    assert "read_climate_day_including_corrections" in catalog_module.__all__
+
+
+def test_the_two_accessors_disagree_on_a_corrected_final(tmp_path: Path) -> None:
+    """The whole point of the split, stated as an assertion.
+
+    Venue P&L is immutable: a settlement or reconciliation path must read the
+    value the venue actually paid out on, while audit reads the corrected truth.
+    """
+    catalog = open_station_catalog(tmp_path, "polymarket_us", "NYC")
+    settled_at_ns = _RETRIEVED_NS
+    write_records(catalog, [make_climate_day(tmax_f=84)])
+    write_records(
+        catalog,
+        [
+            make_climate_day(
+                tmax_f=99,
+                revision_seq=2,
+                correction_flag=True,
+                retrieved_at_ns=settled_at_ns + _MINUTE_NS,
+            ),
+        ],
+    )
+
+    venue = read_climate_day_as_of_settlement(
+        catalog,
+        station="NYC",
+        climate_day=_DAY,
+        as_of_ts_init=settled_at_ns,
+    )
+    truth = read_climate_day_including_corrections(catalog, station="NYC", climate_day=_DAY)
+
+    assert venue is not None
+    assert truth is not None
+    assert venue.tmax_f == 84
+    assert truth.tmax_f == 99
 
 
 # -- single-writer enforcement ----------------------------------------------------------------
@@ -566,7 +692,19 @@ def test_readers_never_take_the_writer_lock(tmp_path: Path) -> None:
     try:
         assert len(read_climate_days(catalog)) == 1
         assert read_raw_products(catalog) == []
-        assert read_current_climate_day(catalog, station="NYC", climate_day=_DAY) is not None
+        assert (
+            read_climate_day_including_corrections(catalog, station="NYC", climate_day=_DAY)
+            is not None
+        )
+        assert (
+            read_climate_day_as_of_settlement(
+                catalog,
+                station="NYC",
+                climate_day=_DAY,
+                as_of_ts_init=_RETRIEVED_NS,
+            )
+            is not None
+        )
     finally:
         _release(fd)
 
@@ -645,6 +783,132 @@ def test_open_station_catalog_rejects_a_symlinked_component(tmp_path: Path) -> N
 
     with pytest.raises(CatalogPathError, match="symlink"):
         open_station_catalog(base, "polymarket_us", "NYC")
+
+
+# -- station-root aliasing (check-to-mkdir race) -----------------------------------------------
+
+
+def _plant_symlink_instead_of_mkdir(
+    monkeypatch: pytest.MonkeyPatch,
+    target: Path,
+    link_to: Path | None,
+) -> None:
+    """Make `Path.mkdir` lose the race for `target`, exactly as an attacker would.
+
+    `station_catalog_path` checks for a symlink and `open_station_catalog`
+    then calls `mkdir` -- two syscalls with a window between them.
+    `Path.mkdir(exist_ok=True)` swallows `FileExistsError` and falls back to
+    `self.is_dir()`, which FOLLOWS symlinks, so a link planted in that window
+    is accepted as "already exists and is a directory".
+
+    `link_to=None` plants nothing, simulating the root being removed in the
+    same window.
+    """
+    real_mkdir = Path.mkdir
+
+    def racing_mkdir(self: Path, *args: Any, **kwargs: Any) -> None:
+        if self == target and not self.is_symlink() and not self.exists():
+            if link_to is not None:
+                self.symlink_to(link_to)
+            return
+        real_mkdir(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "mkdir", racing_mkdir)
+
+
+def test_open_station_catalog_refuses_a_root_aliased_in_the_mkdir_race(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Winning the check-to-`mkdir` window must not durably alias two stations.
+
+    `mkdir(exist_ok=True)` reports success for a symlink to a directory, and the
+    returned catalog would then write NYC's settlement records into MDW's root
+    for the whole life of the process -- no exception, no log.
+    """
+    base = tmp_path / "nws"
+    victim = base / "polymarket_us" / "MDW"
+    victim.mkdir(parents=True)
+    _plant_symlink_instead_of_mkdir(monkeypatch, base / "polymarket_us" / "NYC", victim)
+
+    with pytest.raises(CatalogPathError, match="symlink"):
+        open_station_catalog(base, "polymarket_us", "NYC")
+
+
+def test_open_station_catalog_refuses_a_root_that_vanished_in_the_mkdir_race(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The post-`mkdir` verification fails closed when it cannot see the root."""
+    base = tmp_path / "nws"
+    _plant_symlink_instead_of_mkdir(monkeypatch, base / "polymarket_us" / "NYC", None)
+
+    with pytest.raises(CatalogPathError, match="could not be verified"):
+        open_station_catalog(base, "polymarket_us", "NYC")
+
+
+def test_write_records_refuses_a_station_root_aliased_after_the_catalog_was_opened(
+    tmp_path: Path,
+) -> None:
+    """Station roots are opened once; re-validation must happen per WRITE.
+
+    Checking only at open leaves a window the width of the process lifetime.
+    This aliases NYC's root onto MDW's *after* a clean open -- the write must be
+    refused and MDW's directory must stay free of NYC's records.
+    """
+    base = tmp_path / "nws"
+    nyc = open_station_catalog(base, "polymarket_us", "NYC")
+    mdw = open_station_catalog(base, "polymarket_us", "MDW")
+
+    nyc_root = Path(nyc.path)
+    nyc_root.rmdir()
+    nyc_root.symlink_to(Path(mdw.path))
+
+    with pytest.raises(CatalogPathError, match="symlink"):
+        write_records(nyc, [make_climate_day(station="NYC", tmax_f=84)])
+
+    assert nyc_root.is_symlink(), "the planted link is left in place as evidence"
+    assert read_climate_days(mdw) == []
+    assert list(Path(mdw.path).rglob("*.parquet")) == []
+
+
+def test_write_records_re_verifies_the_root_on_every_call(tmp_path: Path) -> None:
+    """A first successful write must not license the second one."""
+    base = tmp_path / "nws"
+    nyc = open_station_catalog(base, "polymarket_us", "NYC")
+    mdw = open_station_catalog(base, "polymarket_us", "MDW")
+
+    assert write_records(nyc, [make_climate_day(station="NYC")]).is_complete
+
+    nyc_root = Path(nyc.path)
+    aliased = tmp_path / "aliased"
+    nyc_root.rename(aliased)
+    nyc_root.symlink_to(Path(mdw.path))
+
+    with pytest.raises(CatalogPathError, match="symlink"):
+        write_records(
+            nyc,
+            [make_climate_day(station="NYC", retrieved_at_ns=_RETRIEVED_NS + _MINUTE_NS)],
+        )
+
+    assert read_climate_days(mdw) == []
+
+
+def test_the_aliasing_refusal_is_a_documented_catalog_error(tmp_path: Path) -> None:
+    """`CatalogPathError` is reused deliberately: `breezy.ingest.routing`
+    enumerates the catalog write-path taxonomy exactly, and a new type there
+    would be an unrouted error rather than a routed integrity alarm."""
+    base = tmp_path / "nws"
+    nyc = open_station_catalog(base, "polymarket_us", "NYC")
+    mdw = open_station_catalog(base, "polymarket_us", "MDW")
+    Path(nyc.path).rmdir()
+    Path(nyc.path).symlink_to(Path(mdw.path))
+
+    with pytest.raises(CatalogPathError) as excinfo:
+        write_records(nyc, [make_climate_day()])
+
+    assert isinstance(excinfo.value, ValueError)
+    assert str(nyc.path) in str(excinfo.value)
 
 
 def test_station_catalog_path_allows_a_symlinked_base(tmp_path: Path) -> None:

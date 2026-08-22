@@ -149,7 +149,11 @@ A single weather site has FOUR names in different systems; conflating them is a 
 - Formats via `Accept` header: `application/ld+json` for /products (required for settlement text)
 - No URL version segment; changes gated by `Feature-Flags` request header + Service Change Notices
 - Unknown query param → 400 (validate params before sending)
-- Full HTTP caching: honor `Cache-Control`, `Last-Modified`, `ETag` headers to avoid redundant fetches
+- HTTP caching: conditional GET (`If-None-Match` / `If-Modified-Since`) is correct on the **discovery list** (`/products/types/CLI/locations/{loc}`) and **must never be used on `/products/{id}`**.
+
+  **Why the carve-out, and it is not politeness.** A `/products/{id}` body is immutable by id — there is nothing to revalidate, so a conditional GET there buys nothing and costs correctness. A 304 routes as a *successful poll*, which satisfies the freshness watchdog while writing no record and recording no digest. So a stale-or-buggy 304 on a product fetch — a known class of server-side ETag defect, or simply a reissue racing the validator capture — leaves the site reading OPEN and fresh while a corrected final sits unfetched. `FINAL_CLI_OVERDUE` will not catch it either: that watchdog fires off a *deadline*, not off "is my copy current." The failure is invisible to every gate signal until the next discovery poll.
+
+  Enforce this in the type system, not in prose: the product fetch should be a distinct method that has no validator parameters at all, so it cannot be wired up by mistake. "Avoid redundant fetches" is the right instinct on the list endpoint and the wrong one on the settlement endpoint.
 
 ---
 

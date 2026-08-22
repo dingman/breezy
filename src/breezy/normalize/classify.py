@@ -30,9 +30,44 @@ _VALID_TODAY_RE = re.compile(
 )
 
 _CORRECTION_RE = re.compile(
-    r"\bCC[AB]\b|\bCORRECTED\b|\bCORRECTION\b",
+    r"\bCC[A-Z]\b|\bCORRECTED\b|\bCORRECTIONS?\b",
     re.IGNORECASE,
 )
+"""Deliberately a WHOLE-TEXT SUPERSET, not a precise classifier.
+
+`CC[A-Z]`, not `CC[AB]`: corrections run CCA, CCB, CCC, ... and a THIRD
+correction to one climate day is the instance most likely to land after
+settlement has already happened -- exactly the case where the audit trail
+has to be right. Missing it is the expensive direction.
+
+This range is kept IDENTICAL to `cli_parse._CORRECTION_BBB_RE`, which
+answers the same question from the positional BBB token. Two signals for
+one concept disagreeing about which letters count is a contradiction
+waiting to be found by whoever wires either one into `revision_seq`.
+`tests/unit/test_normalize_correction_signal_agreement.py` fails if the
+two alphabets are ever changed independently -- change both or neither.
+
+`CORRECTIONS?` (not `CORRECTION`): `\\b` after the singular requires a
+non-word character next, and the `S` of the plural is a word character, so
+`CORRECTIONS` matched nothing at all. `CORRECTIONAL`/`CORRECTIVE` are
+still excluded -- the trailing `\\b` only admits the exact plural.
+
+The word-boundary anchors are load-bearing on the widened `CC[A-Z]`: a
+bare `CCC` inside a longer token (`CCC072`, `XCCCX`) must not match, or an
+advisory flag becomes noise instead of signal.
+
+The scan runs over the whole product text on purpose, and it stays a
+SUPERSET of the positional signal: CORRECTED/CORRECTION wording in a body
+carrying no BBB token at all is still correction evidence here and is
+still not a positional correction. That divergence in COVERAGE is
+reviewed and deliberate; the divergence in ALPHABET was not. This flag is
+ADVISORY: a false positive costs an operator a few seconds dismissing an
+alert, while a false negative silently degrades the audit trail that has
+to explain a settlement discrepancy after the fact. Catch more, not less.
+
+Use `cli_parse.CliStructuralHeader.is_correction_bbb` -- the positional,
+structurally-validated verdict -- for supersession decisions, and this one
+for the audit trail."""
 
 
 class ClassificationError(ValueError):

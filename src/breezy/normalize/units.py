@@ -28,7 +28,7 @@ SentinelFlag = Literal["NONE", "M", "T", "MS", "MB"]
 """
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
 class TemperatureReadingF:
     """A single settlement temperature value, in whole-degree Fahrenheit.
 
