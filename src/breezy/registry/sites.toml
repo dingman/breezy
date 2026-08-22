@@ -1,0 +1,300 @@
+# =============================================================================
+# Breezy — NWS settlement-site registry
+# =============================================================================
+#
+# THIS FILE IS THE SINGLE SOURCE OF SETTLEMENT TRUTH.
+#
+# Every value here is an EXPLICIT STORED VALUE. Nothing in this file may be
+# derived, inferred, guessed, or reconstructed at runtime — not the CLI
+# location id from the ICAO, not the issuing office from the city, not the
+# UTC offset from the IANA zone, not the body-header text from the station
+# name. If a value is not written here, it does not exist.
+#
+# A geographically nearby station is NEVER an acceptable substitute. Market
+# settlement depends on one specific NWS Daily Climate Report (CLI) product
+# for one specific station. Substituting a neighbouring airport silently
+# settles positions against the wrong number.
+#
+# WHY `body_header_regex` EXISTS AND WHY IT IS MANDATORY
+# -----------------------------------------------------
+# A single Weather Forecast Office issues CLI products for MANY cities under
+# an IDENTICAL `issuingOffice` value. Verified live on 2026-08-22:
+#   KOKX issues CLINYC, CLIJFK, CLILGA, CLIEWR
+#   KLOT issues CLIMDW and CLIORD
+#   KLOX issues CLILAX, CLIBUR, CLILGB
+#   KMTR issues CLISFO, CLIOAK, CLISJC
+#   KMFL issues CLIMIA, CLIFLL, CLIAPF
+# Two entries in `never_substitute` are NOT same-office collisions and were
+# verified live to be issued by DIFFERENT offices — they are listed because
+# they are geographic neighbours a careless mapping could reach for, not
+# because they share an issuingOffice with the settlement site:
+#   MTH (Marathon, FL Keys)  -> KKEY   [neighbour of MIA, different office]
+#   SNA (John Wayne/Orange)  -> KSGX   [neighbour of LAX, different office]
+# Both offices confirmed on 2026-08-22 via /products/types/CLI/locations/{loc}.
+# Matching on `issuingOffice` alone is therefore WORTHLESS. The body-header
+# assertion is the only check that catches a KOKX product that is silently
+# JFK rather than Central Park. Every regex below was verified to match its
+# own city's real product text AND to reject every sibling product fetched
+# from the same office.
+#
+# The regexes are deliberately narrow. A loosened pattern such as
+# `THE CHICAGO.*CLIMATE SUMMARY` MATCHES BOTH Midway and O'Hare — verified.
+# Do not relax these patterns. Apply with MULTILINE; they anchor on the
+# leading `...` of the CLI headline and are whitespace-tolerant only between
+# tokens (real products contain irregular double spaces).
+#
+# CLIMATE-DAY TIMEZONE
+# --------------------
+# `std_utc_offset_hours` is the FIXED STANDARD-time offset and is never the
+# DST offset. The climate day runs local-standard midnight to midnight all
+# year, regardless of whether the date falls under daylight saving. Use
+# `iana_tz` for display/parsing context only; use `std_utc_offset_hours` to
+# establish the climate-day window.
+#
+# SETTLEMENT CLOCK
+# ----------------
+# `settlement_time_local` / `settlement_timezone` are the VENUE's settlement
+# clock (08:00 Eastern, the calendar day after the contract date). This is
+# the venue clock, NOT the site's local clock: Chicago and Los Angeles
+# markets also settle at 08:00 America/New_York, not 08:00 local.
+#
+# 08:00 ET IS NOT THE ONLY SETTLEMENT INSTANT. Per the venue's published
+# rules, if the CLI reading is inconsistent with the 24-hour METAR
+# observation for the same location, settlement may be DELAYED until
+# 11:00 AM ET for review. That conditional instant is stored explicitly as
+# `settlement_delay_time_local` / `settlement_delay_timezone` — it is never
+# computed, and the delay clock is likewise the venue's, not the site's.
+#
+# `no_data_fallback_days = 7` — if no data publishes within one week the
+# contract settles at last fair-market prices.
+#
+# VENUE KEYING
+# ------------
+# Bindings are keyed `(venue, city)` — `[sites.<venue>.<city>]` — even though
+# `polymarket_us` is the only venue today. Kalshi is added as a sibling venue
+# table with no restructuring of this file.
+#
+# OPEN-METEO SUB-TABLES
+# ---------------------
+# `[sites.<venue>.<city>.open_meteo]` is ENRICHMENT-ONLY coordinate data for
+# forecast lookups. It carries `settlement_eligible = false` and is
+# namespaced so that no settlement code path can reach it through the
+# settlement accessor. Coordinates are NEVER a settlement input.
+#
+# PROVENANCE OF THESE VALUES
+# --------------------------
+# Verified 2026-08-22 by live read-only requests to api.weather.gov:
+#   /products/types/CLI/locations           (location id existence)
+#   /products/types/CLI/locations/{loc}     (issuingOffice on recent products)
+#   /products/{id}                          (verbatim body-header text)
+#   /stations/{icao}                        (geometry, elevation, timeZone)
+#   /offices/{wfo}                          (office identity)
+# The observed product id for each city's quoted header is recorded inline.
+#
+# PRE-PRODUCTION RE-VERIFICATION GATE — REQUIRED, NOT OPTIONAL
+# ------------------------------------------------------------
+# Before production trading is enabled, a DIFFERENT agent must independently
+# re-fetch, read-only and live: (a) `issuing_office` for all five sites via
+# /products/types/CLI/locations/{loc}, and (b) at least one recent product
+# body per site via /products/{id}, re-asserting each `body_header_regex`
+# against the real text. The venue's own snapshot names stations only — it
+# carries no offices, product ids, or header text — so the values in this
+# file cannot be re-verified from venue documentation alone. This file is
+# the sole settlement truth; a single stale office or drifted header line
+# settles positions against the wrong station.
+# =============================================================================
+
+registry_version = "1.0.0"
+
+# -----------------------------------------------------------------------------
+# New York — Central Park (a COOP climate site, NOT an airport)
+# AWIPS PIL: CLINYC   WMO: CDUS41 KOKX
+# Header verbatim from product 40bb657c-e166-44d4-a038-dd18701cf2c8 (KOKX,
+# 2026-08-22T06:26:00Z):
+#   ...THE CENTRAL PARK NY CLIMATE SUMMARY FOR AUGUST 21 2026...
+# Sibling decoy verified rejected: ...THE KENNEDY NY CLIMATE SUMMARY FOR...
+# -----------------------------------------------------------------------------
+[sites.polymarket_us.NYC]
+icao = "KNYC"
+cli_location = "NYC"
+issuing_office = "KOKX"
+iana_tz = "America/New_York"
+std_utc_offset_hours = -5.0
+body_header_regex = '^\.\.\.THE\s+CENTRAL\s+PARK\s+NY\s+CLIMATE\s+SUMMARY\s+FOR\b'
+never_substitute = ["KJFK", "KLGA", "KEWR"]
+never_substitute_cli_locations = ["JFK", "LGA", "EWR"]
+# VENUE clock, NOT this site's local clock. `settlement_time_local` must
+# always be read together with `settlement_timezone`; for MDW, LAX and SFO
+# the settlement instant is NOT 08:00 at the station.
+settlement_time_local = "08:00"
+settlement_timezone = "America/New_York"
+# Conditional delay: if the CLI reading is inconsistent with the 24-hour
+# METAR observation for the same location, settlement may be delayed to
+# this instant for venue review. Also the VENUE clock, not site-local.
+settlement_delay_time_local = "11:00"
+settlement_delay_timezone = "America/New_York"
+no_data_fallback_days = 7
+
+[sites.polymarket_us.NYC.open_meteo]
+settlement_eligible = false
+lat = 40.78333
+lon = -73.96667
+elevation_m = 46.9392
+
+# -----------------------------------------------------------------------------
+# San Francisco — San Francisco International Airport
+# AWIPS PIL: CLISFO   WMO: CDUS46 KMTR
+# Header verbatim from product ed80e538-da15-4597-bd3e-4c9e851d53ce (KMTR,
+# 2026-08-22T08:26:00Z):
+#   ...THE SAN FRANCISCO AIRPORT CLIMATE SUMMARY FOR AUGUST 21 2026...
+# Sibling decoy verified rejected: ...THE OAKLAND AIRPORT CLIMATE SUMMARY FOR...
+# -----------------------------------------------------------------------------
+[sites.polymarket_us.SFO]
+icao = "KSFO"
+cli_location = "SFO"
+issuing_office = "KMTR"
+iana_tz = "America/Los_Angeles"
+std_utc_offset_hours = -8.0
+body_header_regex = '^\.\.\.THE\s+SAN\s+FRANCISCO\s+AIRPORT\s+CLIMATE\s+SUMMARY\s+FOR\b'
+never_substitute = ["KOAK", "KSJC"]
+never_substitute_cli_locations = ["OAK", "SJC"]
+# VENUE clock, NOT this site's local clock. `settlement_time_local` must
+# always be read together with `settlement_timezone`; for MDW, LAX and SFO
+# the settlement instant is NOT 08:00 at the station.
+settlement_time_local = "08:00"
+settlement_timezone = "America/New_York"
+# Conditional delay: if the CLI reading is inconsistent with the 24-hour
+# METAR observation for the same location, settlement may be delayed to
+# this instant for venue review. Also the VENUE clock, not site-local.
+settlement_delay_time_local = "11:00"
+settlement_delay_timezone = "America/New_York"
+no_data_fallback_days = 7
+
+[sites.polymarket_us.SFO.open_meteo]
+settlement_eligible = false
+lat = 37.61961
+lon = -122.36558
+elevation_m = 3.048
+
+# -----------------------------------------------------------------------------
+# Miami — Miami International Airport
+# AWIPS PIL: CLIMIA   WMO: CDUS42 KMFL
+# Header verbatim from product c2e87d93-ee8b-4d95-a28e-d8ec9f89eb06 (KMFL,
+# 2026-08-22T08:25:00Z):
+#   ...THE MIAMI CLIMATE SUMMARY FOR AUGUST 21 2026...
+# Sibling decoy verified rejected: ...THE FORT LAUDERDALE CLIMATE SUMMARY FOR...
+# NOTE: the issuing office is KMFL (Miami - South Florida). It is NOT KBRO;
+# /offices/BRO resolves to "Brownsville/Rio Grande Valley, TX".
+# -----------------------------------------------------------------------------
+[sites.polymarket_us.MIA]
+icao = "KMIA"
+cli_location = "MIA"
+issuing_office = "KMFL"
+iana_tz = "America/New_York"
+std_utc_offset_hours = -5.0
+body_header_regex = '^\.\.\.THE\s+MIAMI\s+CLIMATE\s+SUMMARY\s+FOR\b'
+# KFLL/KAPF are same-office (KMFL) siblings — the collision hazard.
+# KMTH (Marathon) is a geographic neighbour issued by a DIFFERENT office
+# (KKEY, verified live 2026-08-22); listed defensively, not a same-office
+# collision.
+never_substitute = ["KFLL", "KAPF", "KMTH"]
+never_substitute_cli_locations = ["FLL", "APF", "MTH"]
+# VENUE clock, NOT this site's local clock. `settlement_time_local` must
+# always be read together with `settlement_timezone`; for MDW, LAX and SFO
+# the settlement instant is NOT 08:00 at the station.
+settlement_time_local = "08:00"
+settlement_timezone = "America/New_York"
+# Conditional delay: if the CLI reading is inconsistent with the 24-hour
+# METAR observation for the same location, settlement may be delayed to
+# this instant for venue review. Also the VENUE clock, not site-local.
+settlement_delay_time_local = "11:00"
+settlement_delay_timezone = "America/New_York"
+no_data_fallback_days = 7
+
+[sites.polymarket_us.MIA.open_meteo]
+settlement_eligible = false
+lat = 25.79056
+lon = -80.31639
+elevation_m = 3.048
+
+# -----------------------------------------------------------------------------
+# Chicago — Chicago Midway Airport (NOT O'Hare)
+# AWIPS PIL: CLIMDW   WMO: CDUS43 KLOT
+# Header verbatim from product 4c320984-bf26-4f5d-a9fc-0a0bdc163bb4 (KLOT,
+# 2026-08-22T06:33:00Z):
+#   ...THE CHICAGO-MIDWAY CLIMATE SUMMARY FOR AUGUST 21 2026...
+# Sibling decoy verified rejected: ...THE CHICAGO-OHARE CLIMATE SUMMARY FOR...
+# KLOT issues BOTH under an identical issuingOffice. The `MIDWAY` token is
+# the discriminator; a `THE CHICAGO.*` pattern matches O'Hare too.
+# The hyphen carries `\s*` on both sides for the same reason the other
+# patterns use `\s+` between tokens (see the Burbank double-space case);
+# every verified sample renders it as a bare `CHICAGO-MIDWAY`.
+# -----------------------------------------------------------------------------
+[sites.polymarket_us.MDW]
+icao = "KMDW"
+cli_location = "MDW"
+issuing_office = "KLOT"
+iana_tz = "America/Chicago"
+std_utc_offset_hours = -6.0
+body_header_regex = '^\.\.\.THE\s+CHICAGO\s*-\s*MIDWAY\s+CLIMATE\s+SUMMARY\s+FOR\b'
+never_substitute = ["KORD"]
+never_substitute_cli_locations = ["ORD"]
+# VENUE clock, NOT this site's local clock. `settlement_time_local` must
+# always be read together with `settlement_timezone`; for MDW, LAX and SFO
+# the settlement instant is NOT 08:00 at the station.
+settlement_time_local = "08:00"
+settlement_timezone = "America/New_York"
+# Conditional delay: if the CLI reading is inconsistent with the 24-hour
+# METAR observation for the same location, settlement may be delayed to
+# this instant for venue review. Also the VENUE clock, not site-local.
+settlement_delay_time_local = "11:00"
+settlement_delay_timezone = "America/New_York"
+no_data_fallback_days = 7
+
+[sites.polymarket_us.MDW.open_meteo]
+settlement_eligible = false
+lat = 41.78417
+lon = -87.75528
+elevation_m = 188.0616
+
+# -----------------------------------------------------------------------------
+# Los Angeles — Los Angeles International Airport
+# AWIPS PIL: CLILAX   WMO: CDUS46 KLOX
+# Header verbatim from product 2646e991-e88a-43ca-b793-d1e7ac653205 (KLOX,
+# 2026-08-22T08:50:00Z):
+#   ...THE LOS ANGELES INTL AIRPORT CA CLIMATE SUMMARY FOR AUGUST 21 2026...
+# Sibling decoy verified rejected:
+#   ...THE HOLLYWOOD/BURBANK  AIRPORT CA CLIMATE SUMMARY FOR...  (sic, 2 spaces)
+# NOTE: the issuing office is KLOX (Los Angeles/Oxnard). It is NOT KSOX;
+# /offices/SOX returns HTTP 404 (not a valid office id).
+# -----------------------------------------------------------------------------
+[sites.polymarket_us.LAX]
+icao = "KLAX"
+cli_location = "LAX"
+issuing_office = "KLOX"
+iana_tz = "America/Los_Angeles"
+std_utc_offset_hours = -8.0
+body_header_regex = '^\.\.\.THE\s+LOS\s+ANGELES\s+INTL\s+AIRPORT\s+CA\s+CLIMATE\s+SUMMARY\s+FOR\b'
+# KBUR/KLGB are same-office (KLOX) siblings — the collision hazard.
+# KSNA (John Wayne) is a geographic neighbour issued by a DIFFERENT office
+# (KSGX, verified live 2026-08-22); listed defensively, not a same-office
+# collision.
+never_substitute = ["KBUR", "KLGB", "KSNA"]
+never_substitute_cli_locations = ["BUR", "LGB", "SNA"]
+# VENUE clock, NOT this site's local clock. `settlement_time_local` must
+# always be read together with `settlement_timezone`; for MDW, LAX and SFO
+# the settlement instant is NOT 08:00 at the station.
+settlement_time_local = "08:00"
+settlement_timezone = "America/New_York"
+# Conditional delay: if the CLI reading is inconsistent with the 24-hour
+# METAR observation for the same location, settlement may be delayed to
+# this instant for venue review. Also the VENUE clock, not site-local.
+settlement_delay_time_local = "11:00"
+settlement_delay_timezone = "America/New_York"
+no_data_fallback_days = 7
+
+[sites.polymarket_us.LAX.open_meteo]
+settlement_eligible = false
+lat = 33.93806
+lon = -118.38889
+elevation_m = 38.1

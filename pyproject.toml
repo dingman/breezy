@@ -1,0 +1,19 @@
+[project]
+name = "breezy"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+authors = [
+    { name = "Release Bot", email = "bot@adops.dev" }
+]
+requires-python = ">=3.13"
+dependencies = [
+    "nautilus-trader~=1.231",
+]
+
+[project.scripts]
+breezy = "breezy:main"
+
+[build-system]
+requires = ["uv_build>=0.12.5,<0.13.0"]
+build-backend = "uv_build"

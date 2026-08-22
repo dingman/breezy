@@ -1,0 +1,56 @@
+# NautilusTrader
+
+> Open-source algorithmic trading platform: a Rust-native core engine with a Python API for
+> backtesting and live deployment of multi-asset, multi-venue trading systems from a single
+> codebase.
+
+## Key facts
+
+- NautilusTrader is developed by Nautech Systems Pty Ltd.
+- The open-source engine supports research, backtesting, simulation, and live trading workflows.
+- The architecture uses an event-driven core, nanosecond timestamps, deterministic replay, and
+  shared engine semantics between backtest and live environments.
+- Python strategy code runs against performance-sensitive Rust components.
+- NautilusTrader is trading software only. Nautech Systems is not a broker, dealer, exchange, or
+  financial adviser.
+
+## Site
+
+- [Open source](https://nautilustrader.io/open-source/): open-source engine, releases, provenance, and getting started
+- [Quality](https://nautilustrader.io/quality/): testing, deterministic simulation, benchmarks, and release gates
+- [Security](https://nautilustrader.io/security/): security policy, responsible disclosure, and supply chain posture
+- [Stats](https://nautilustrader.io/resources/stats/): public order-flow statistics attributed to NautilusTrader
+- [Cloud platform](https://nautilustrader.io/cloud-platform/): managed cloud infrastructure and enterprise products
+- [Institutional](https://nautilustrader.io/institutional/): engagement tier for firms trading at scale
+- [Pro](https://nautilustrader.io/pro/): high-performance, user-controlled infrastructure for professional traders
+- [Prediction markets](https://nautilustrader.io/prediction/): backtesting, simulation, and live trading on prediction markets
+- [Blog](https://nautilustrader.io/blog/): release announcements and engineering posts ([RSS](https://nautilustrader.io/feed.xml))
+- [About](https://nautilustrader.io/about/): company background and mission
+- [Team](https://nautilustrader.io/team/): the people building NautilusTrader
+- [Partners](https://nautilustrader.io/partners/): technology, venue, and data partners
+- [Brand](https://nautilustrader.io/brand/): logos, colors, and brand usage guidelines
+- [Legal](https://nautilustrader.io/legal/): terms, policies, disclosures, and trading-risk disclaimer
+
+## Integrations
+
+Each page documents the adapter's supported products, order types, data feeds, execution features,
+and quickstarts for one venue or data provider.
+
+- [Architect](https://nautilustrader.io/architect/): Architect Exchange (AX) market data and perpetual futures on equities, FX, metals, and energy
+- [Binance](https://nautilustrader.io/binance/): spot, USDT-margined, and coin-margined futures
+- [BitMEX](https://nautilustrader.io/bitmex/): spot, perpetual swaps, futures, and spreads
+- [Bybit](https://nautilustrader.io/bybit/): spot, linear, inverse, and options
+- [Databento](https://nautilustrader.io/databento/): live and historical market data with L3 book depth and nanosecond timestamps
+- [Derive](https://nautilustrader.io/derive/): on-chain options, perpetuals, and spot
+- [Hyperliquid](https://nautilustrader.io/hyperliquid/): spot and perpetual futures
+- [Kraken](https://nautilustrader.io/kraken/): Kraken Spot and Futures
+- [Lighter](https://nautilustrader.io/lighter/): perpetual, RWA, and spot markets
+- [OKX](https://nautilustrader.io/okx/): spot, margin, perpetual swaps, futures, and options
+- [Polymarket](https://nautilustrader.io/polymarket/): CLOB market data and binary outcome markets
+
+## Documentation
+
+- [Docs index](https://nautilustrader.io/docs/llms.txt): per-page index of the latest documentation with links to raw markdown
+- [Full docs corpus](https://nautilustrader.io/docs/llms-full.txt): the complete latest documentation as a single text file
+
+Raw markdown for any documentation page is served under https://nautilustrader.io/docs/md/.
