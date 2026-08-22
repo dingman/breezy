@@ -325,9 +325,16 @@ class RouteDecision:
         The server's `Retry-After`, when it sent one. Carried, never
         interpreted: backoff timing is the Actor's.
     needs_cross_site_burst_signal
-        The recorder needs the Actor's `cross_site_burst_detected=` argument.
-        403 only -- the gate classifies UA-trap vs abuse itself, but only the
-        Actor can see concurrent per-site attempts.
+        The recorder accepts the Actor's `cross_site_burst_detected=` keyword
+        (403 only). The gate classifies UA-trap vs abuse itself, and now
+        derives ITS OWN cross-site burst signal from durably persisted
+        per-site state -- this flag names the SUPPLEMENTARY, transitional
+        signal from the Actor-owned in-memory `CrossSite403Window`, kept as
+        a belt-and-suspenders arm so it can only ever add an extra halt,
+        never remove one, relative to the gate's own persisted-state
+        derivation. `SettlementGate.record_forbidden_403`'s signature is
+        unchanged by that derivation -- `cross_site_burst_detected=` is
+        still exactly the keyword this flag tells the Actor to pass.
     needs_final_window_signal
         The recorder needs the Actor's `final_window_elapsed=` argument. The
         retry/backoff window belongs to the caller, as it does for the

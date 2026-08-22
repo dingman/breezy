@@ -10,20 +10,26 @@ from __future__ import annotations
 import json
 import logging
 from collections.abc import Callable
+from dataclasses import dataclass
 
 import pytest
 
 from breezy.ingest.gate import (
     _GLOBAL_KEY,
+    DEFAULT_BURST_POLICY,
     CachePersistenceConfig,
     CachePersistenceMisconfiguredError,
+    CrossSiteBurstPolicy,
     GateBlockedError,
     GateReason,
     GateState,
     InMemoryStateStore,
     SettlementGate,
     StateStore,
+    _site_entry_from_bytes,
+    _site_entry_to_bytes,
     _site_key,
+    _SiteEntry,
     assert_cache_persistence_configured,
     cache_persistence_config_from,
 )
@@ -31,6 +37,16 @@ from breezy.ingest.gate import (
 VENUE = "polymarket_us"
 CITY = "NYC"
 OTHER_CITY = "SFO"
+THIRD_CITY = "MIA"
+_SECOND = 1_000_000_000
+
+#: Default site set for `_gate()` -- covers every (venue, city) literal this
+#: file uses (CITY, OTHER_CITY, and the bare "MIA" a handful of older tests
+#: reference directly), so the vast majority of existing `_gate()` call sites
+#: need no change now that `sites` is a required SettlementGate argument.
+_DEFAULT_TEST_SITES: frozenset[tuple[str, str]] = frozenset(
+    {(VENUE, CITY), (VENUE, OTHER_CITY), (VENUE, THIRD_CITY)}
+)
 
 
 class _FakeClock:
@@ -46,10 +62,19 @@ class _FakeClock:
         self._now_ns += delta_ns
 
 
-def _gate(store: InMemoryStateStore | None = None, clock: _FakeClock | None = None) -> tuple[SettlementGate, InMemoryStateStore, _FakeClock]:
+def _gate(
+    store: InMemoryStateStore | None = None,
+    clock: _FakeClock | None = None,
+    sites: frozenset[tuple[str, str]] = _DEFAULT_TEST_SITES,
+    burst_policy: CrossSiteBurstPolicy = DEFAULT_BURST_POLICY,
+) -> tuple[SettlementGate, InMemoryStateStore, _FakeClock]:
     store = store if store is not None else InMemoryStateStore()
     clock = clock if clock is not None else _FakeClock()
-    return SettlementGate(store=store, clock=clock), store, clock
+    return (
+        SettlementGate(store=store, clock=clock, sites=sites, burst_policy=burst_policy),
+        store,
+        clock,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -272,6 +297,431 @@ def test_ua_trap_block_can_be_manually_cleared() -> None:
     gate.record_forbidden_403(VENUE, CITY, detail="mid-session onset", cross_site_burst_detected=True)
     gate.acknowledge_ua_trap_resolved(detail="UA fixed and redeployed")
     assert gate.status(VENUE, CITY).state is GateState.OPEN
+
+
+# ---------------------------------------------------------------------------
+# Cross-site 403 burst DERIVED FROM PERSISTED STATE -- the actual fix.
+#
+# The defect: neither of record_forbidden_403's two original arms survives a
+# trap whose 403s straddle a process restart. Arm 1
+# (any_site_ever_succeeded) is a permanent one-way latch, dead after first
+# bring-up. Arm 2 (the caller-reported cross_site_burst_detected, backed by
+# shared_state.CrossSite403Window) is in-memory and lost on restart. In
+# steady state, every site just abuse-degrades and the global halt never
+# fires. This section pins the NEW arm: SettlementGate derives its own burst
+# signal from the durable, per-site `abuse_403_last_ns` it already persists,
+# read straight through the store the same way `_load_global` is -- so it
+# survives exactly the restart the other two arms cannot.
+#
+# every test below has BOTH sites succeed first, so the cold-start arm is
+# latched off, and none of them passes `cross_site_burst_detected=` --
+# purely isolating the new derivation from the two pre-existing arms.
+# ---------------------------------------------------------------------------
+
+
+def test_persisted_burst_survives_restart_the_headline_scenario(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """The exact gap this fix closes: site A 403s, the PROCESS RESTARTS (a
+    brand-new SettlementGate instance over the same store -- neither prior
+    gate instance nor its in-memory CrossSite403Window survives that), then
+    site B 403s within the window. Only the persisted-state derivation can
+    possibly detect this; both prior arms are dead by construction here.
+    """
+    gate1, store, clock = _gate()
+    gate1.record_successful_poll(VENUE, CITY)
+    gate1.record_successful_poll(VENUE, OTHER_CITY)
+    gate1.record_forbidden_403(VENUE, CITY, detail="site A 403s, pre-restart")
+    assert gate1.status(VENUE, CITY).state is GateState.DEGRADED  # abuse only, not yet a trap
+
+    clock.advance(20 * _SECOND)  # comfortably inside the default 120s window
+    gate2, _, _ = _gate(store=store, clock=clock)  # simulated restart: a NEW instance
+
+    with caplog.at_level(logging.INFO, logger="breezy.ingest.gate"):
+        gate2.record_forbidden_403(VENUE, OTHER_CITY, detail="site B 403s, post-restart")
+
+    assert gate2.status(VENUE, CITY).state is GateState.BLOCKED
+    assert gate2.status(VENUE, OTHER_CITY).state is GateState.BLOCKED
+    assert gate2.status(VENUE, CITY).reason is GateReason.UA_TRAP_403
+    assert any(
+        "cross-site 403 burst (persisted-state derivation)" in r.getMessage()
+        for r in caplog.records
+    )
+
+
+def test_persisted_burst_detected_within_one_process_no_restart_required() -> None:
+    """Same-process burst still detected -- the new arm is a superset of the
+    restart case, not a replacement path that only fires post-restart.
+    """
+    gate, _, clock = _gate()
+    gate.record_successful_poll(VENUE, CITY)
+    gate.record_successful_poll(VENUE, OTHER_CITY)
+    gate.record_forbidden_403(VENUE, CITY, detail="site A 403s")
+    assert gate.status(VENUE, OTHER_CITY).state is GateState.OPEN
+
+    clock.advance(20 * _SECOND)
+    gate.record_forbidden_403(VENUE, OTHER_CITY, detail="site B 403s, same process")
+
+    assert gate.status(VENUE, CITY).state is GateState.BLOCKED
+    assert gate.status(VENUE, OTHER_CITY).state is GateState.BLOCKED
+
+
+def test_one_site_403ing_repeatedly_alone_never_trips_a_persisted_burst() -> None:
+    """Repeated 403s from ONE city are the per-site abuse block, never a
+    cross-site burst -- counting events instead of distinct sites would let
+    a single city's retry loop manufacture a global halt.
+    """
+    gate, _, clock = _gate()
+    gate.record_successful_poll(VENUE, CITY)
+    gate.record_successful_poll(VENUE, OTHER_CITY)
+
+    for _ in range(5):
+        gate.record_forbidden_403(VENUE, CITY, detail="repeated abuse 403")
+        clock.advance(10 * _SECOND)
+
+    assert gate.status(VENUE, CITY).state is GateState.DEGRADED
+    assert gate.status(VENUE, OTHER_CITY).state is GateState.OPEN
+
+
+def test_refresh_not_latch_continuous_403s_past_window_still_count_as_current() -> None:
+    """REFRESH semantics, not latch-once: `abuse_403_last_ns` is set to `now`
+    on EVERY 403, so a site 403ing every poll for far longer than
+    `window_ns` must still read as CURRENT evidence -- never age out just
+    because its FIRST 403 in the sequence is long expired. Latching only the
+    first 403 (the `cross_check_unavailable_since_ns` idiom) would let an
+    ACTIVELY trapped site silently drop out of its own burst window.
+    """
+    gate, _, clock = _gate()
+    gate.record_successful_poll(VENUE, CITY)
+    gate.record_successful_poll(VENUE, OTHER_CITY)
+
+    gate.record_forbidden_403(VENUE, CITY, detail="first 403")
+    clock.advance(DEFAULT_BURST_POLICY.window_ns * 3)  # CITY's FIRST 403 is now long expired
+    gate.record_forbidden_403(VENUE, CITY, detail="still 403ing, much later")  # refreshes it
+
+    clock.advance(10 * _SECOND)  # within the window of the REFRESH, not the original
+    gate.record_forbidden_403(VENUE, OTHER_CITY, detail="second site, within window of the refresh")
+
+    assert gate.status(VENUE, CITY).state is GateState.BLOCKED
+    assert gate.status(VENUE, OTHER_CITY).state is GateState.BLOCKED
+
+
+def test_persisted_burst_window_boundary_is_strictly_less_than() -> None:
+    """Pins the freshness check to the SAME strict `<` (never `<=`)
+    `shared_state._within_window` uses: evidence exactly `window_ns` old is
+    NOT fresh; evidence one nanosecond younger still is.
+    """
+    gate, _, clock = _gate()
+    gate.record_successful_poll(VENUE, CITY)
+    gate.record_successful_poll(VENUE, OTHER_CITY)
+    gate.record_forbidden_403(VENUE, CITY, detail="site A 403s")
+    clock.advance(DEFAULT_BURST_POLICY.window_ns)  # now - at_ns == window_ns, NOT < window_ns
+    gate.record_forbidden_403(VENUE, OTHER_CITY, detail="site B 403s at the exact boundary")
+    assert gate.status(VENUE, CITY).state is GateState.DEGRADED
+    assert gate.status(VENUE, OTHER_CITY).state is GateState.DEGRADED
+
+    gate2, _, clock2 = _gate()
+    gate2.record_successful_poll(VENUE, CITY)
+    gate2.record_successful_poll(VENUE, OTHER_CITY)
+    gate2.record_forbidden_403(VENUE, CITY, detail="site A 403s")
+    clock2.advance(DEFAULT_BURST_POLICY.window_ns - 1)  # one ns INSIDE the window
+    gate2.record_forbidden_403(VENUE, OTHER_CITY, detail="site B 403s one ns inside the window")
+    assert gate2.status(VENUE, CITY).state is GateState.BLOCKED
+    assert gate2.status(VENUE, OTHER_CITY).state is GateState.BLOCKED
+
+
+def test_successful_poll_clears_abuse_evidence_so_recovery_cannot_later_combine() -> None:
+    """record_successful_poll clears `abuse_403_last_ns` alongside
+    `abuse_403_degraded` -- a site that has since recovered must not keep
+    contributing stale 403 evidence toward a LATER, unrelated burst.
+    """
+    gate, _, clock = _gate()
+    gate.record_successful_poll(VENUE, CITY)
+    gate.record_successful_poll(VENUE, OTHER_CITY)
+    gate.record_forbidden_403(VENUE, CITY, detail="site A 403s")
+    assert gate.status(VENUE, CITY).state is GateState.DEGRADED
+
+    clock.advance(5 * _SECOND)
+    gate.record_successful_poll(VENUE, CITY)  # CITY recovers -- clears abuse_403_last_ns
+    assert gate.status(VENUE, CITY).state is GateState.OPEN
+
+    clock.advance(10 * _SECOND)  # still comfortably inside the burst window
+    gate.record_forbidden_403(VENUE, OTHER_CITY, detail="unrelated 403 on a different site")
+
+    assert gate.status(VENUE, OTHER_CITY).state is GateState.DEGRADED  # one site, not a burst
+    assert gate.status(VENUE, CITY).state is GateState.OPEN
+
+
+def test_corrupt_sibling_entry_counts_toward_the_burst(caplog: pytest.LogCaptureFixture) -> None:
+    """CRITICAL #1: a naive predicate that only counts siblings with valid,
+    fresh `abuse_403_last_ns` would let corrupting a single site's bytes
+    silently zero out its contribution to the burst count -- failing OPEN on
+    exactly the signal this module exists to fail closed on. A sibling whose
+    persisted state is undecodable must count TOWARD the burst instead, and
+    the corruption must be logged distinctly from an ordinary halt.
+    """
+    gate, store, _ = _gate()
+    gate.record_successful_poll(VENUE, CITY)
+    gate.record_successful_poll(VENUE, OTHER_CITY)
+    store.set(_site_key(VENUE, OTHER_CITY), b"{not valid json")  # corrupt sibling bytes
+
+    with caplog.at_level(logging.INFO, logger="breezy.ingest.gate"):
+        gate.record_forbidden_403(VENUE, CITY, detail="only site with valid persisted history")
+
+    assert gate.status(VENUE, CITY).state is GateState.BLOCKED
+    assert gate.status(VENUE, CITY).reason is GateReason.UA_TRAP_403
+    corrupt_sibling_logs = [
+        r for r in caplog.records if "corrupt persisted SIBLING site state" in r.getMessage()
+    ]
+    assert corrupt_sibling_logs
+    assert all(r.levelno == logging.CRITICAL for r in corrupt_sibling_logs)
+
+
+def test_sibling_read_is_never_served_from_this_instances_stale_cache() -> None:
+    """CRITICAL #2: this gate instance's own per-site cache (populated only
+    for reads THIS instance made directly) must never be consulted for a
+    SIBLING site's burst evidence -- otherwise a sibling's 403, recorded by
+    its OWN Actor's gate instance sharing the same store, would be invisible
+    to this instance's burst derivation until this instance is reconstructed.
+    Correctness here must not depend on the per-Actor-owns-one-site
+    invariant that ``shared_state.py`` enforces, not this module.
+    """
+    store = InMemoryStateStore()
+    clock = _FakeClock()
+    gate_a, _, _ = _gate(store=store, clock=clock)  # models Actor A's own instance
+    gate_b, _, _ = _gate(store=store, clock=clock)  # models Actor B's own instance
+
+    gate_a.record_successful_poll(VENUE, CITY)
+    gate_b.record_successful_poll(VENUE, OTHER_CITY)
+
+    # gate_a reads (and therefore CACHES) OTHER_CITY's clean, pre-403 view.
+    assert gate_a.status(VENUE, OTHER_CITY).state is GateState.OPEN
+
+    # OTHER_CITY 403s through its OWN Actor's gate instance, persisting fresh
+    # abuse_403_last_ns to the SHARED store -- gate_a's cache is now stale.
+    clock.advance(1 * _SECOND)
+    gate_b.record_forbidden_403(VENUE, OTHER_CITY, detail="site B 403s via its own Actor")
+    assert gate_b.status(VENUE, OTHER_CITY).state is GateState.DEGRADED
+
+    # CITY 403s through gate_a. A cached (stale) sibling read would see no
+    # evidence for OTHER_CITY and stay DEGRADED; a store-backed read sees it.
+    clock.advance(10 * _SECOND)
+    gate_a.record_forbidden_403(VENUE, CITY, detail="site A 403s via its own Actor")
+
+    assert gate_a.status(VENUE, CITY).state is GateState.BLOCKED
+    assert gate_b.status(VENUE, OTHER_CITY).state is GateState.BLOCKED
+
+
+def test_ack_then_one_unrelated_403_does_not_immediately_re_halt() -> None:
+    """HIGH: acknowledge_ua_trap_resolved() must not leave re-triggering
+    evidence behind. A genuine trap (two sites' persisted abuse evidence),
+    acknowledged by the operator, must not be immediately re-triggered by
+    ONE further unrelated 403 on a THIRD site combining with pre-ack
+    evidence the ack failed to clear -- a halt loop the operator has no way
+    to break.
+    """
+    gate, _, clock = _gate()
+    for site_venue, site_city in _DEFAULT_TEST_SITES:
+        gate.record_successful_poll(site_venue, site_city, detail="warmup")
+
+    gate.record_forbidden_403(VENUE, CITY, detail="site A 403s")
+    assert gate.status(VENUE, CITY).state is GateState.DEGRADED  # 1 site, not yet a trap
+
+    clock.advance(5 * _SECOND)
+    gate.record_forbidden_403(VENUE, OTHER_CITY, detail="site B 403s -- now a genuine burst")
+    assert gate.status(VENUE, THIRD_CITY).state is GateState.BLOCKED  # global trap fired
+
+    gate.acknowledge_ua_trap_resolved(detail="UA fixed and redeployed")
+    assert gate.status(VENUE, THIRD_CITY).state is GateState.OPEN
+
+    clock.advance(10 * _SECOND)  # comfortably inside the OLD (pre-ack) window
+    gate.record_forbidden_403(VENUE, THIRD_CITY, detail="one unrelated ordinary 403")
+
+    # Must NOT immediately re-halt: CITY's/OTHER_CITY's evidence was cleared
+    # on ack, so THIRD_CITY's lone 403 is one site, not a burst.
+    assert gate.status(VENUE, THIRD_CITY).state is GateState.DEGRADED
+    assert gate.status(VENUE, CITY).state is GateState.OPEN
+    assert gate.status(VENUE, OTHER_CITY).state is GateState.OPEN
+
+
+def test_backward_clock_jump_keeps_persisted_burst_evidence() -> None:
+    """A backward clock jump must not evict evidence: `now - at_ns` goes
+    negative, trivially `< window_ns`, biasing toward halting -- the cheap
+    error, matching `shared_state._within_window`'s documented direction.
+    """
+    gate, _, clock = _gate()
+    gate.record_successful_poll(VENUE, CITY)
+    gate.record_successful_poll(VENUE, OTHER_CITY)
+    clock.advance(100 * _SECOND)
+    gate.record_forbidden_403(VENUE, CITY, detail="site A 403s")
+
+    clock.advance(-50 * _SECOND)  # clock jumps backward
+    gate.record_forbidden_403(VENUE, OTHER_CITY, detail="site B 403s after a backward jump")
+
+    assert gate.status(VENUE, CITY).state is GateState.BLOCKED
+    assert gate.status(VENUE, OTHER_CITY).state is GateState.BLOCKED
+
+
+def test_forward_clock_jump_past_the_window_expires_evidence() -> None:
+    gate, _, clock = _gate()
+    gate.record_successful_poll(VENUE, CITY)
+    gate.record_successful_poll(VENUE, OTHER_CITY)
+    gate.record_forbidden_403(VENUE, CITY, detail="site A 403s")
+
+    clock.advance(DEFAULT_BURST_POLICY.window_ns * 2)  # well past the window
+    gate.record_forbidden_403(VENUE, OTHER_CITY, detail="site B 403s, well past the window")
+
+    assert gate.status(VENUE, CITY).state is GateState.DEGRADED
+    assert gate.status(VENUE, OTHER_CITY).state is GateState.DEGRADED
+
+
+def test_near_miss_burst_evidence_is_logged_when_one_short_of_threshold(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Observability: a silent under-detection would otherwise be invisible
+    to an operator triaging at 07:30.
+    """
+    gate, _, _ = _gate()
+    gate.record_successful_poll(VENUE, CITY)
+    gate.record_successful_poll(VENUE, OTHER_CITY)
+
+    with caplog.at_level(logging.WARNING, logger="breezy.ingest.gate"):
+        gate.record_forbidden_403(VENUE, CITY, detail="only one site so far")
+
+    assert any("NEAR-MISS" in r.getMessage() for r in caplog.records)
+
+
+def test_a_custom_burst_policy_is_honored_by_the_persisted_derivation() -> None:
+    """The constructor's `burst_policy` argument must actually govern the
+    derivation, not just be accepted and ignored in favour of the default.
+    """
+    policy = CrossSiteBurstPolicy(window_ns=30 * _SECOND, site_threshold=3)
+    gate, _, clock = _gate(burst_policy=policy)
+    for site_venue, site_city in _DEFAULT_TEST_SITES:
+        gate.record_successful_poll(site_venue, site_city, detail="warmup")
+
+    gate.record_forbidden_403(VENUE, CITY, detail="site A")
+    clock.advance(5 * _SECOND)
+    gate.record_forbidden_403(VENUE, OTHER_CITY, detail="site B")
+    assert gate.status(VENUE, THIRD_CITY).state is GateState.OPEN  # only 2 of 3 required
+
+    clock.advance(5 * _SECOND)
+    gate.record_forbidden_403(VENUE, THIRD_CITY, detail="site C")
+    assert gate.status(VENUE, THIRD_CITY).state is GateState.BLOCKED
+
+
+def test_cross_site_burst_policy_rejects_an_indefensible_threshold_or_window() -> None:
+    """Pins `site_threshold >= 2` (and `window_ns > 0`) at gate.py, the
+    policy's new home after the move from shared_state.py.
+    """
+    for window_ns, site_threshold in [(0, 2), (-1, 2), (1 * _SECOND, 1), (1 * _SECOND, 0)]:
+        with pytest.raises(ValueError):
+            CrossSiteBurstPolicy(window_ns=window_ns, site_threshold=site_threshold)
+
+
+def test_default_burst_policy_is_two_sites_in_two_minutes() -> None:
+    assert DEFAULT_BURST_POLICY.site_threshold == 2
+    assert DEFAULT_BURST_POLICY.window_ns == 120 * _SECOND
+
+
+def test_site_entry_round_trips_the_new_abuse_403_last_ns_field() -> None:
+    entry = _SiteEntry(abuse_403_degraded=True, abuse_403_last_ns=123_456_789)
+    restored = _site_entry_from_bytes(_site_entry_to_bytes(entry))
+    assert restored.abuse_403_last_ns == 123_456_789
+    assert restored == entry
+
+
+def test_old_schema_bytes_missing_abuse_403_last_ns_decode_to_the_default() -> None:
+    """Forward-compat: bytes persisted by code BEFORE this fix never wrote
+    `abuse_403_last_ns` at all. Decoding them must default the field to
+    `None`, not raise -- an existing site's persisted history must survive
+    the upgrade.
+    """
+    old_schema_payload = {
+        "last_successful_poll_ns": 42,
+        "transient_failure_count": 0,
+        "transient_blocked": False,
+        "abuse_403_degraded": False,
+        "parser_failure": False,
+        "sanity_violation": False,
+        "ambiguous_headline": False,
+        "oversize_or_timeout": False,
+        "cross_check_unavailable_since_ns": None,
+        "cross_check_blocked": False,
+        "acis_disagreement": False,
+        "task_dead": False,
+        "redirect_integrity_alarm": False,
+        "client_error_defect": False,
+        "clock_regression": False,
+        "final_overdue": False,
+        "final_overdue_climate_day": None,
+        "write_integrity_violation": False,
+        "transport_integrity_alarm": False,
+        "stale_degraded": False,
+        "stale_blocked": False,
+        "last_reason": "successful_poll",
+        "last_detail": "",
+        "last_transition_ns": 42,
+    }
+    raw = json.dumps(old_schema_payload).encode("utf-8")
+    restored = _site_entry_from_bytes(raw)
+    assert restored.abuse_403_last_ns is None
+    assert restored.last_successful_poll_ns == 42
+
+
+def test_rollback_new_bytes_under_the_old_schema_raise_type_error_and_fail_closed() -> None:
+    """Documents the rollback direction: if this fix is rolled back (an OLD
+    `_SiteEntry` without `abuse_403_last_ns`) while the store already holds
+    bytes written by the NEW code, decoding raises `TypeError` -- caught by
+    `_load_site`'s `except (ValueError, TypeError, KeyError)`, which fails
+    closed to BLOCKED. `asdict()` serializes every field unconditionally, so
+    EVERY actively-polled site's bytes carry the new key, not only ones that
+    were ever 403-flagged -- this affects a rollback's entire fleet, not a
+    corner case.
+    """
+
+    @dataclass(frozen=True, slots=True)
+    class _PreFixSiteEntry:  # the schema BEFORE abuse_403_last_ns existed
+        last_successful_poll_ns: int | None = None
+        transient_failure_count: int = 0
+        transient_blocked: bool = False
+        abuse_403_degraded: bool = False
+        parser_failure: bool = False
+        sanity_violation: bool = False
+        ambiguous_headline: bool = False
+        oversize_or_timeout: bool = False
+        cross_check_unavailable_since_ns: int | None = None
+        cross_check_blocked: bool = False
+        acis_disagreement: bool = False
+        task_dead: bool = False
+        redirect_integrity_alarm: bool = False
+        client_error_defect: bool = False
+        clock_regression: bool = False
+        final_overdue: bool = False
+        final_overdue_climate_day: str | None = None
+        write_integrity_violation: bool = False
+        transport_integrity_alarm: bool = False
+        stale_degraded: bool = False
+        stale_blocked: bool = False
+        last_reason: GateReason = GateReason.NEVER_POLLED
+        last_detail: str = ""
+        last_transition_ns: int = 0
+
+    gate, store, _ = _gate()
+    gate.record_successful_poll(VENUE, CITY)  # NEW code writes abuse_403_last_ns=None too
+
+    raw = store.get(_site_key(VENUE, CITY))
+    assert raw is not None
+    payload = json.loads(raw.decode("utf-8"))
+    payload["last_reason"] = GateReason(payload["last_reason"])
+
+    with pytest.raises(TypeError):
+        _PreFixSiteEntry(**payload)  # unexpected keyword 'abuse_403_last_ns'
+
+    # And the NEW code reading its OWN new bytes back does not raise --
+    # sanity check that the forward direction is unaffected.
+    reloaded, _, _ = _gate(store=store, clock=_FakeClock())
+    assert reloaded.status(VENUE, CITY).state is GateState.OPEN
 
 
 # ---------------------------------------------------------------------------
@@ -872,7 +1322,7 @@ def test_store_set_failure_does_not_advance_cache_past_durable_state() -> None:
     # test -- raises.
     store: StateStore = _FailOnSetStore(fail_from_call=3)
     clock = _FakeClock()
-    gate = SettlementGate(store=store, clock=clock)
+    gate = SettlementGate(store=store, clock=clock, sites=_DEFAULT_TEST_SITES)
 
     gate.record_successful_poll(VENUE, CITY)  # 1st + 2nd set() succeed -> OPEN, durable
     assert gate.status(VENUE, CITY).state is GateState.OPEN
@@ -888,7 +1338,7 @@ def test_store_set_failure_does_not_advance_cache_past_durable_state() -> None:
 def test_store_set_failure_on_global_block_does_not_advance_cache() -> None:
     store: StateStore = _FailOnSetStore(fail_from_call=1)
     clock = _FakeClock()
-    gate = SettlementGate(store=store, clock=clock)
+    gate = SettlementGate(store=store, clock=clock, sites=_DEFAULT_TEST_SITES)
 
     with pytest.raises(RuntimeError):
         gate.record_forbidden_403(VENUE, CITY, detail="UA rejected")  # cold start -> trap
@@ -1000,11 +1450,11 @@ def test_blocking_causes_never_writes_to_the_store() -> None:
             raise AssertionError("blocking_causes() must never call store.set()")
 
     seed_store = InMemoryStateStore()
-    seed_gate = SettlementGate(store=seed_store, clock=_FakeClock())
+    seed_gate = SettlementGate(store=seed_store, clock=_FakeClock(), sites=_DEFAULT_TEST_SITES)
     seed_gate.record_successful_poll(VENUE, CITY)
     seed_gate.record_parser_failure(VENUE, CITY, detail="x")
 
-    readonly_gate = SettlementGate(store=_NoSetStore(seed_store), clock=_FakeClock())
+    readonly_gate = SettlementGate(store=_NoSetStore(seed_store), clock=_FakeClock(), sites=_DEFAULT_TEST_SITES)
     causes = readonly_gate.blocking_causes(VENUE, CITY)  # must not raise
     assert GateReason.PARSER_FAILURE in causes
 
@@ -1215,7 +1665,7 @@ _CORRUPT_SITE_PAYLOADS = [
 def test_corrupt_persisted_site_bytes_fail_safe_to_blocked(raw: bytes) -> None:
     store = InMemoryStateStore()
     store.set(_site_key(VENUE, CITY), raw)
-    gate = SettlementGate(store=store, clock=_FakeClock())
+    gate = SettlementGate(store=store, clock=_FakeClock(), sites=_DEFAULT_TEST_SITES)
 
     status = gate.status(VENUE, CITY)  # must not raise
     assert status.state is GateState.BLOCKED
@@ -1225,7 +1675,7 @@ def test_corrupt_persisted_site_bytes_fail_safe_to_blocked(raw: bytes) -> None:
 def test_corrupt_persisted_site_bytes_logged_at_critical(caplog: pytest.LogCaptureFixture) -> None:
     store = InMemoryStateStore()
     store.set(_site_key(VENUE, CITY), b"not json at all")
-    gate = SettlementGate(store=store, clock=_FakeClock())
+    gate = SettlementGate(store=store, clock=_FakeClock(), sites=_DEFAULT_TEST_SITES)
 
     with caplog.at_level(logging.INFO, logger="breezy.ingest.gate"):
         gate.status(VENUE, CITY)
@@ -1243,7 +1693,7 @@ def test_corrupt_persisted_site_bytes_require_open_raises_gate_blocked_error_not
     """
     store = InMemoryStateStore()
     store.set(_site_key(VENUE, CITY), b"{not valid json")
-    gate = SettlementGate(store=store, clock=_FakeClock())
+    gate = SettlementGate(store=store, clock=_FakeClock(), sites=_DEFAULT_TEST_SITES)
 
     with pytest.raises(GateBlockedError):
         gate.require_open(VENUE, CITY)
@@ -1259,7 +1709,7 @@ def test_corrupt_persisted_global_bytes_fails_closed_blocking_all_sites(
     """
     store = InMemoryStateStore()
     store.set(_GLOBAL_KEY, b"{corrupt")
-    gate = SettlementGate(store=store, clock=_FakeClock())
+    gate = SettlementGate(store=store, clock=_FakeClock(), sites=_DEFAULT_TEST_SITES)
 
     with caplog.at_level(logging.INFO, logger="breezy.ingest.gate"):
         status_a = gate.status(VENUE, CITY)
@@ -1274,7 +1724,7 @@ def test_corrupt_persisted_global_bytes_fails_closed_blocking_all_sites(
 def test_corrupt_persisted_global_bytes_can_be_manually_cleared() -> None:
     store = InMemoryStateStore()
     store.set(_GLOBAL_KEY, b"{corrupt")
-    gate = SettlementGate(store=store, clock=_FakeClock())
+    gate = SettlementGate(store=store, clock=_FakeClock(), sites=_DEFAULT_TEST_SITES)
     gate.record_successful_poll(VENUE, CITY)
     assert gate.status(VENUE, CITY).state is GateState.BLOCKED  # globally blocked
 
@@ -1516,12 +1966,12 @@ class _SimulatedNautilusCache:
 def test_ua_trap_survives_simulated_restart_when_fully_configured() -> None:
     database: dict[str, bytes] = {}
     cache1 = _SimulatedNautilusCache(database=database)
-    gate1 = SettlementGate(store=cache1, clock=_FakeClock())
+    gate1 = SettlementGate(store=cache1, clock=_FakeClock(), sites=_DEFAULT_TEST_SITES)
     gate1.record_forbidden_403(VENUE, CITY, detail="cold start")  # global UA-trap
     assert gate1.status(VENUE, CITY).state is GateState.BLOCKED
 
     cache2 = cache1.restart(load_cache=True, flush_on_start=False)
-    gate2 = SettlementGate(store=cache2, clock=_FakeClock())
+    gate2 = SettlementGate(store=cache2, clock=_FakeClock(), sites=_DEFAULT_TEST_SITES)
     status = gate2.status(VENUE, CITY)
     assert status.state is GateState.BLOCKED
     assert status.reason is GateReason.UA_TRAP_403
@@ -1535,12 +1985,12 @@ def test_ua_trap_is_laundered_by_restart_when_flush_on_start_true() -> None:
     """
     database: dict[str, bytes] = {}
     cache1 = _SimulatedNautilusCache(database=database)
-    gate1 = SettlementGate(store=cache1, clock=_FakeClock())
+    gate1 = SettlementGate(store=cache1, clock=_FakeClock(), sites=_DEFAULT_TEST_SITES)
     gate1.record_forbidden_403(VENUE, CITY, detail="cold start")
     assert gate1.status(VENUE, CITY).state is GateState.BLOCKED
 
     cache2 = cache1.restart(load_cache=True, flush_on_start=True)
-    gate2 = SettlementGate(store=cache2, clock=_FakeClock())
+    gate2 = SettlementGate(store=cache2, clock=_FakeClock(), sites=_DEFAULT_TEST_SITES)
     status = gate2.status(VENUE, CITY)
     # The global latch is lost -- but the SITE itself still independently
     # defaults to BLOCKED (never polled), so this must not be mistaken for
@@ -1552,21 +2002,21 @@ def test_ua_trap_is_laundered_by_restart_when_flush_on_start_true() -> None:
 def test_ua_trap_is_laundered_by_restart_when_load_cache_false() -> None:
     database: dict[str, bytes] = {}
     cache1 = _SimulatedNautilusCache(database=database)
-    gate1 = SettlementGate(store=cache1, clock=_FakeClock())
+    gate1 = SettlementGate(store=cache1, clock=_FakeClock(), sites=_DEFAULT_TEST_SITES)
     gate1.record_forbidden_403(VENUE, CITY, detail="cold start")
 
     cache2 = cache1.restart(load_cache=False, flush_on_start=False)
-    gate2 = SettlementGate(store=cache2, clock=_FakeClock())
+    gate2 = SettlementGate(store=cache2, clock=_FakeClock(), sites=_DEFAULT_TEST_SITES)
     assert gate2.status(VENUE, CITY).reason is not GateReason.UA_TRAP_403
 
 
 def test_ua_trap_is_laundered_by_restart_when_database_unset() -> None:
     cache1 = _SimulatedNautilusCache(database=None)
-    gate1 = SettlementGate(store=cache1, clock=_FakeClock())
+    gate1 = SettlementGate(store=cache1, clock=_FakeClock(), sites=_DEFAULT_TEST_SITES)
     gate1.record_forbidden_403(VENUE, CITY, detail="cold start")
 
     cache2 = cache1.restart(load_cache=True, flush_on_start=False)
-    gate2 = SettlementGate(store=cache2, clock=_FakeClock())
+    gate2 = SettlementGate(store=cache2, clock=_FakeClock(), sites=_DEFAULT_TEST_SITES)
     assert gate2.status(VENUE, CITY).reason is not GateReason.UA_TRAP_403
 
 
@@ -1587,8 +2037,8 @@ def test_global_ua_trap_block_is_visible_across_sibling_gate_instances() -> None
     """
     store = InMemoryStateStore()
     clock = _FakeClock()
-    gate_a = SettlementGate(store=store, clock=clock)  # Actor A's own instance
-    gate_b = SettlementGate(store=store, clock=clock)  # Actor B's own instance
+    gate_a = SettlementGate(store=store, clock=clock, sites=_DEFAULT_TEST_SITES)  # Actor A's own instance
+    gate_b = SettlementGate(store=store, clock=clock, sites=_DEFAULT_TEST_SITES)  # Actor B's own instance
 
     gate_a.record_successful_poll(VENUE, "MIA")
     gate_b.record_successful_poll(VENUE, OTHER_CITY)
@@ -1618,7 +2068,7 @@ def test_site_level_persist_before_cache_ordering_is_unaffected() -> None:
     """
     store: StateStore = _FailOnSetStore(fail_from_call=3)
     clock = _FakeClock()
-    gate = SettlementGate(store=store, clock=clock)
+    gate = SettlementGate(store=store, clock=clock, sites=_DEFAULT_TEST_SITES)
 
     gate.record_successful_poll(VENUE, CITY)
     assert gate.status(VENUE, CITY).state is GateState.OPEN

@@ -50,6 +50,7 @@ logger = logging.getLogger(__name__)
 
 _GLOBAL_KEY = "gate:__global__"
 _TRANSIENT_DEGRADE_THRESHOLD = 3
+_NS_PER_SECOND = 1_000_000_000
 
 
 def _site_key(venue: str, city: str) -> str:
@@ -155,6 +156,93 @@ class GateBlockedError(Exception):
 
 
 # ---------------------------------------------------------------------------
+# Cross-site 403 burst policy
+#
+# Defined ONCE, here. `shared_state.py` imports and re-exports these two
+# names rather than redefining them -- two definitions of "what counts as a
+# burst" is exactly the drift that let the UA-trap gap this module fixes
+# exist in the first place (the gate's own derivation and the legacy
+# in-memory window must agree on window/threshold, or "the gate detected a
+# burst" and "the window detected a burst" quietly stop meaning the same
+# thing). Named `DEFAULT_BURST_POLICY`, matching the constant's pre-existing
+# name in `shared_state.py` -- an earlier design note called it
+# `DEFAULT_CROSS_SITE_BURST_POLICY`; that name never shipped, so this keeps
+# the one that is actually in use rather than forcing every existing import
+# to rename.
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True, slots=True)
+class CrossSiteBurstPolicy:
+    """What counts as a cross-site 403 burst.
+
+    Attributes
+    ----------
+    window_ns : int
+        How long one site's 403 stays as evidence, in nanoseconds.
+    site_threshold : int
+        How many DISTINCT sites must show a same-cause 403 inside that window.
+
+    Design, and why each number is what it is
+    -----------------------------------------
+    **Distinct sites, never events.** Repeated 403s from one city are exactly
+    the per-site abuse block the gate already handles by degrading that one
+    city. Counting events would let a single city's retry loop manufacture a
+    global halt -- the one direction where "bias toward halting" is actually
+    wrong, because it makes an all-site halt reachable from a single-site
+    fault. ``site_threshold`` below 2 is refused for that reason.
+
+    **Two sites, not three.** A UA trap is a property of the ``User-Agent``,
+    which is process-global: under a trap, every site 403s. With five sites on
+    a slow poll cadence, waiting for a third city costs another full poll
+    cycle, and every cycle spent 403-ing is more evidence to NWS that we are a
+    bad actor. Two cities failing the same way inside two minutes has no benign
+    explanation -- per-caller throttling arrives as a 429, not a 403, and NWS
+    403s are not per-location. The bias is deliberate and stated in the brief:
+    an unnecessary global halt costs trading time and clears with an operator
+    acknowledgement; a missed UA trap costs API access outright.
+
+    **120 seconds.** It must comfortably exceed the natural stagger between two
+    cities' polls and stay far below the time a trap takes to matter. With a
+    ~5-minute per-site cadence across five staggered sites, two cities' polls
+    land within roughly a minute of each other; 120 s leaves a full stagger of
+    headroom while keeping two genuinely unrelated 403s hours apart from
+    combining. The window does **not** need to span a whole poll cycle: a trap
+    403s *every* request, so the second city's very next poll supplies the
+    second data point.
+
+    This same policy now governs two independent burst signals: the legacy
+    in-memory :class:`~breezy.ingest.shared_state.CrossSite403Window` (kept
+    during the transition -- see :meth:`SettlementGate.record_forbidden_403`)
+    and the gate's own derivation from durably persisted per-site
+    ``abuse_403_last_ns`` state. One policy, two readers, so they can never
+    silently disagree on what a burst is.
+    """
+
+    window_ns: int
+    site_threshold: int
+
+    def __post_init__(self) -> None:
+        if self.window_ns <= 0:
+            raise ValueError(f"`window_ns` must be positive, was {self.window_ns}")
+        if self.site_threshold < 2:
+            raise ValueError(
+                "`site_threshold` must be at least 2: a threshold of 1 makes a "
+                "CROSS-site window fire on a single site, which is the per-site "
+                "abuse block the gate already handles -- and would let one "
+                f"city's retry loop halt all five. Was {self.site_threshold}"
+            )
+
+
+#: Two distinct sites, same cause, inside two minutes. See
+#: :class:`CrossSiteBurstPolicy` for the derivation of both numbers.
+DEFAULT_BURST_POLICY = CrossSiteBurstPolicy(
+    window_ns=120 * _NS_PER_SECOND,
+    site_threshold=2,
+)
+
+
+# ---------------------------------------------------------------------------
 # Injectable persistence seam
 # ---------------------------------------------------------------------------
 
@@ -198,6 +286,13 @@ class _SiteEntry:
     transient_failure_count: int = 0
     transient_blocked: bool = False
     abuse_403_degraded: bool = False
+    # REFRESH semantics, not latch-once: set to `now` on EVERY 403 for this
+    # site (see record_forbidden_403), never only the first. A site 403ing
+    # every poll for an hour must still read as CURRENT evidence to the
+    # cross-site burst derivation -- latching once-until-cleared (the
+    # cross_check_unavailable_since_ns idiom below) would let an actively
+    # trapped site age out of its own window and silently stop counting.
+    abuse_403_last_ns: int | None = None
     parser_failure: bool = False
     sanity_violation: bool = False
     ambiguous_headline: bool = False
@@ -406,16 +501,46 @@ class SettlementGate:
     restores exactly the prior state, and a site never touched by this
     process still resolves to the persisted answer (or the BLOCKED default
     if the store has never seen it either).
+
+    ``sites`` is the full ``(venue, city)`` set this gate serves, REQUIRED
+    (no default) rather than an optional per-call parameter on
+    :meth:`record_forbidden_403` -- an earlier design let the site set
+    default to empty on any call site that forgot to pass it, silently
+    disabling cross-site burst detection with no error and no log. That is
+    the exact footgun shape that caused the defect this module fixes, so it
+    is closed at construction instead. A ``frozenset`` because it is
+    membership-tested and iterated, never indexed, and closes out
+    duplicate/self-referencing entries for free -- consistent with
+    ``shared_state.DEFAULT_ALLOWED_HOSTS: frozenset[str]``.
     """
 
-    def __init__(self, *, store: StateStore, clock: Callable[[], int]) -> None:
+    def __init__(
+        self,
+        *,
+        store: StateStore,
+        clock: Callable[[], int],
+        sites: frozenset[tuple[str, str]],
+        burst_policy: CrossSiteBurstPolicy = DEFAULT_BURST_POLICY,
+    ) -> None:
         self._store = store
         self._clock = clock
-        # Per-site entries ARE cached: each Actor owns exactly one
-        # (venue, city) (module docstring / the ingestion proposal's
-        # per-station-Actor design), so no sibling instance can race a
-        # cached site entry stale. The GLOBAL entry has no such guarantee
-        # -- see _load_global -- so it is deliberately NOT cached here.
+        self._known_sites = sites
+        self._burst_policy = burst_policy
+        # Per-site entries ARE cached, keyed by (venue, city): each Actor
+        # calls _load_site/_save_site ONLY for the one site it owns (module
+        # docstring / the ingestion proposal's per-station-Actor design), so
+        # no sibling instance can race THAT cached entry stale under normal
+        # per-Actor traffic. That invariant does NOT extend to a read of a
+        # SIBLING site's entry initiated from within this module (the
+        # persisted cross-site-burst derivation, and
+        # acknowledge_ua_trap_resolved()'s evidence clear) -- those go
+        # through _load_sibling_site, which reads straight through the store
+        # on every call, exactly like _load_global and for the identical
+        # reason: correctness here must never depend on an invariant (one
+        # Actor per site) that is enforced in a DIFFERENT module
+        # (shared_state.py's register_site_actor), not in this one. The
+        # GLOBAL entry has no per-site-ownership guarantee at all -- see
+        # _load_global -- so it is deliberately NOT cached here either.
         self._sites: dict[tuple[str, str], _SiteEntry] = {}
 
     def _now(self) -> int:
@@ -498,6 +623,107 @@ class SettlementGate:
                 detail=f"corrupt persisted bytes: {exc}",
                 at_ns=self._now(),
             )
+
+    def _load_sibling_site(self, venue: str, city: str) -> tuple[_SiteEntry, bool]:
+        """Read a SIBLING site's entry straight through the store on EVERY
+        call -- deliberately never served from ``self._sites``, for exactly
+        ``_load_global``'s rationale: this instance's per-site cache is only
+        safe for the ONE site the owning Actor calls ``_load_site`` for, and
+        that safety invariant is enforced in ``shared_state.py``
+        (``register_site_actor``), not here. Reading a sibling through the
+        cache would make cross-site burst detection depend on an invariant
+        this module cannot itself verify.
+
+        Returns ``(entry, corrupt)``. ``corrupt`` is ``True`` when the
+        sibling's persisted bytes could not be decoded -- the caller
+        (:meth:`_derive_cross_site_burst`) must treat that as burst evidence
+        rather than silence, exactly the corrupt-sibling CRITICAL this
+        method exists to make possible: a naive predicate that only counts
+        sites with valid, still-fresh ``abuse_403_last_ns`` would let
+        corrupting a single site's bytes silently zero out its contribution
+        to the burst count -- failing OPEN on exactly the signal this module
+        exists to fail closed on.
+        """
+        raw = self._store.get(_site_key(venue, city))
+        if raw is None:
+            return _SiteEntry(), False
+        try:
+            return _site_entry_from_bytes(raw), False
+        except (ValueError, TypeError, KeyError) as exc:
+            logger.critical(
+                "gate: corrupt persisted SIBLING site state for venue=%s city=%s "
+                "while evaluating cross-site burst evidence -- counting it TOWARD "
+                "the burst (fail toward halt, never toward silently suppressing "
+                "one). error=%s",
+                venue,
+                city,
+                exc,
+            )
+            return (
+                replace(
+                    _SiteEntry(),
+                    last_reason=GateReason.CORRUPT_PERSISTED_STATE,
+                    last_detail=f"corrupt persisted bytes: {exc}",
+                    last_transition_ns=self._now(),
+                ),
+                True,
+            )
+
+    def _derive_cross_site_burst(
+        self, venue: str, city: str, *, now: int
+    ) -> tuple[bool, int, bool]:
+        """Cross-site 403 burst evidence derived from state this gate
+        already persists durably (``abuse_403_last_ns`` per site), rather
+        than a second, weaker in-memory copy of the same evidence -- the
+        core approach of this fix. Survives a process restart because it is
+        read from the same durable store every other gate decision is.
+
+        The ACTING site (``venue``, ``city``) counts as evidence AT ``now``
+        even though ``record_forbidden_403`` has not yet persisted its own
+        ``abuse_403_last_ns`` when this runs -- that write happens only
+        after the UA-trap-vs-abuse decision this derivation feeds. Without
+        including it here, the second half of a two-site burst would never
+        see itself as one of the two sites.
+
+        Every OTHER configured site (``self._known_sites``) is read through
+        :meth:`_load_sibling_site` (never the per-Actor cache) and counts as
+        fresh evidence when its persisted ``abuse_403_last_ns`` is within
+        ``policy.window_ns`` of ``now``, using the SAME strict ``<`` (never
+        ``<=``) as ``shared_state._within_window`` -- a boundary-equal
+        timestamp is NOT current evidence, and a backward clock jump
+        (``now - at_ns`` negative, trivially ``< window_ns``) is KEPT rather
+        than evicted, biasing toward halting on the cheap-error side. A
+        sibling whose persisted bytes are undecodable counts TOWARD the
+        burst unconditionally (see :meth:`_load_sibling_site`) since there
+        is no timestamp to check freshness against, and corruption itself is
+        exactly the kind of signal this module fails closed on.
+
+        Returns ``(detected, distinct_site_count, near_miss)``.
+        ``near_miss`` is ``True`` iff ``distinct_site_count`` is exactly one
+        short of ``policy.site_threshold`` -- observability for the silent
+        under-detection that would otherwise be invisible (see
+        :meth:`record_forbidden_403`).
+        """
+        policy = self._burst_policy
+        acting_site = (venue, city)
+        distinct: set[tuple[str, str]] = {acting_site}
+        for site in self._known_sites:
+            if site == acting_site:
+                continue
+            sibling_venue, sibling_city = site
+            entry, corrupt = self._load_sibling_site(sibling_venue, sibling_city)
+            if corrupt:
+                distinct.add(site)
+                continue
+            at_ns = entry.abuse_403_last_ns
+            if at_ns is None:
+                continue
+            if now - at_ns < policy.window_ns:
+                distinct.add(site)
+        count = len(distinct)
+        detected = count >= policy.site_threshold
+        near_miss = count == policy.site_threshold - 1
+        return detected, count, near_miss
 
     def _save_site(self, venue: str, city: str, entry: _SiteEntry) -> None:
         # Persist FIRST, cache second. If store.set() raises (or the process
@@ -593,10 +819,13 @@ class SettlementGate:
 
         Clears every transient-cause flag (failure counters, parser/sanity/
         ambiguous/oversize blocks, cross-check unavailability, task death,
-        staleness). Deliberately does **not** clear an active ACIS
-        disagreement -- that halt requires its own explicit resume signal
-        (:meth:`record_acis_agreement`), per the settled autonomous-resume
-        rule.
+        staleness) AND this site's ``abuse_403_last_ns``/``abuse_403_degraded``
+        evidence -- a recovered site must not keep contributing stale 403
+        evidence toward a future cross-site burst derivation
+        (:meth:`_derive_cross_site_burst`). Deliberately does **not** clear
+        an active ACIS disagreement -- that halt requires its own explicit
+        resume signal (:meth:`record_acis_agreement`), per the settled
+        autonomous-resume rule.
         """
         entry = self._load_site(venue, city)
         now = self._now()
@@ -606,6 +835,7 @@ class SettlementGate:
             transient_failure_count=0,
             transient_blocked=False,
             abuse_403_degraded=False,
+            abuse_403_last_ns=None,
             parser_failure=False,
             sanity_violation=False,
             ambiguous_headline=False,
@@ -656,26 +886,77 @@ class SettlementGate:
         independently walk its own 3-strike transient counter to reach,
         instead of an immediate all-site halt.
 
-        UA-trap iff EITHER:
+        UA-trap iff ANY of:
           - no site tracked by this gate has EVER had a persisted
             successful poll (cross-restart cold start; see
             ``_GlobalEntry.any_site_ever_succeeded``), or
-          - the caller reports ``cross_site_burst_detected`` -- a burst of
-            same-cause 403s across multiple cities is itself trap evidence
-            regardless of what any single site's own history says. The
-            burst window/counting is the caller's own timing to own (its
-            poll loop sees concurrent per-site attempts this gate cannot),
-            matching the retry/conflict-window precedent elsewhere in this
-            module.
+          - the caller reports ``cross_site_burst_detected`` -- the legacy,
+            in-memory, per-process
+            ``shared_state.CrossSite403Window``. Kept ONLY as a transition
+            safety net: it is process-lifetime state, so it is exactly the
+            arm that goes silent across a restart -- the defect this
+            derivation exists to close. OR-ed in rather than removed so the
+            transition can only ever *over*-halt (the cheap-error
+            direction), never under-halt.
+          - this gate's OWN derivation from durably persisted per-site
+            ``abuse_403_last_ns`` state (:meth:`_derive_cross_site_burst`)
+            finds ``policy.site_threshold`` or more distinct sites with
+            fresh (or corrupt-and-therefore-fail-closed) 403 evidence. This
+            is the arm that survives a restart: it reads the same durable
+            store every other gate decision reads, so a trap whose 403s
+            straddle a process restart still trips it, unlike the two arms
+            above.
 
         The safer misclassification direction is trap-over-abuse: an
         unnecessary global halt costs trading time, a missed trap costs
         the API.
         """
         global_entry = self._load_global()
-        is_ua_trap = (not global_entry.any_site_ever_succeeded) or cross_site_burst_detected
+        now = self._now()
+        persisted_burst, distinct_sites, near_miss = self._derive_cross_site_burst(
+            venue, city, now=now
+        )
+        is_ua_trap = (
+            (not global_entry.any_site_ever_succeeded)
+            or cross_site_burst_detected
+            or persisted_burst
+        )
+        if persisted_burst:
+            # Equivalent of shared_state.CrossSite403Window.observe()'s own
+            # CRITICAL log -- re-emitted here so observability does not
+            # regress now that this arm can detect a burst the in-memory
+            # window cannot (post-restart). Logged whenever the persisted
+            # derivation itself finds a burst, independent of which arm
+            # ultimately decided is_ua_trap.
+            logger.critical(
+                "cross-site 403 burst (persisted-state derivation): %d distinct "
+                "sites show fresh or corrupt abuse-403 evidence within "
+                "window_ns=%d (threshold=%d) -- treating as UA-trap evidence. "
+                "triggering venue=%s city=%s",
+                distinct_sites,
+                self._burst_policy.window_ns,
+                self._burst_policy.site_threshold,
+                venue,
+                city,
+            )
+        elif near_miss:
+            # A silent under-detection is otherwise invisible: one more
+            # distinct site's 403 would have tripped the persisted-state
+            # burst derivation. Logged even when another arm already
+            # classifies this as a trap, and even when it does not, so an
+            # operator triaging at 07:30 can see how close a real per-site
+            # abuse pattern is running to trap territory.
+            logger.warning(
+                "cross-site 403 burst NEAR-MISS (persisted-state derivation): "
+                "%d distinct sites show fresh abuse-403 evidence, one short of "
+                "threshold=%d within window_ns=%d. venue=%s city=%s",
+                distinct_sites,
+                self._burst_policy.site_threshold,
+                self._burst_policy.window_ns,
+                venue,
+                city,
+            )
         if is_ua_trap:
-            now = self._now()
             new_global = replace(
                 global_entry,
                 ua_trap_blocked=True,
@@ -689,7 +970,7 @@ class SettlementGate:
             )
             return self.status(venue, city)
         entry = self._load_site(venue, city)
-        new_entry = replace(entry, abuse_403_degraded=True)
+        new_entry = replace(entry, abuse_403_degraded=True, abuse_403_last_ns=now)
         self._transition_site(venue, city, new_entry, reason=GateReason.ABUSE_BLOCK_403, detail=detail)
         return self.status(venue, city)
 
@@ -698,6 +979,21 @@ class SettlementGate:
 
         Unlike ACIS disagreement, a UA-trap is a code/config defect (e.g. a
         stale or malformed User-Agent), so resolving it is never automatic.
+
+        Also clears per-site abuse-403 evidence (``abuse_403_last_ns`` /
+        ``abuse_403_degraded``) for EVERY site this gate knows about
+        (``self._known_sites``), not only the one an operator happened to be
+        looking at. Chosen over the alternative (gating burst evaluation on
+        an "ignore evidence older than the last ack" timestamp) because it
+        needs no new persisted field and its correctness is visible in
+        exactly the same ``abuse_403_last_ns`` :meth:`_derive_cross_site_burst`
+        already reads -- no second clock to keep synchronized with the
+        first. Without this, stale per-site evidence from BEFORE the ack
+        could combine with one unrelated ordinary 403 seconds later and
+        immediately re-trip the persisted-state derivation -- a halt loop
+        the operator has no way to break, since acknowledging previously
+        cleared only the global latch and never the evidence that
+        re-derives it.
         """
         now = self._now()
         new_global = replace(
@@ -708,6 +1004,13 @@ class SettlementGate:
             at_ns=now,
         )
         self._save_global(new_global)
+
+        for site_venue, site_city in self._known_sites:
+            entry = self._load_site(site_venue, site_city)
+            if entry.abuse_403_degraded or entry.abuse_403_last_ns is not None:
+                cleared = replace(entry, abuse_403_degraded=False, abuse_403_last_ns=None)
+                self._save_site(site_venue, site_city, cleared)
+
         logger.warning("UA-trap 403 condition manually cleared: %s", detail)
 
     def record_transient_failure(
