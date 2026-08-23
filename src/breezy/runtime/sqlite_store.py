@@ -1,14 +1,69 @@
 """Durable, file-backed :class:`~breezy.ingest.gate.StateStore` on SQLite.
 
-A prior evaluation rejected backing ``StateStore`` with Nautilus ``Cache``
-on concrete evidence: ``Cache.add`` queues its write to a background task
-and returns before the write is durable; ``Cache.get`` reads only an
-in-memory dict, never the database; and ``Cache.reset()`` clears that dict
-without clearing the database, which silently resurrects
-``ua_trap_blocked=False`` and can launder a permanent trading halt. SQLite
-avoids all three: writes commit synchronously before ``set()`` returns,
-reads always go through the same durable file, and there is no separate
-in-memory cache to fall out of sync with it.
+Why not the native Nautilus ``Cache``
+-------------------------------------
+Every claim below was verified by reading the installed
+``nautilus-trader==1.231.0`` in ``.venv/`` at the cited ``path:line``, and is
+pinned by ``tests/contract/test_nautilus_cache_durability_contract.py`` so it
+fails loudly on a version bump instead of drifting. Paths are relative to
+``nautilus_trader/``.
+
+A previous revision of this docstring asserted three defects in ``Cache``.
+**One of them was wrong and one was vacuous**; they are corrected here rather
+than left standing, because the right conclusion reached through wrong
+reasoning is not evidence. Corrections are recorded at the bottom.
+
+The single sufficient reason, and it is configuration-dependent:
+
+* **Under this deployment's configuration, ``Cache`` is memory-only.**
+  ``Cache.add`` writes ``self._general[key] = value`` and then forwards to a
+  database **only** ``if self._database is not None`` (``cache/cache.pyx:1704-1708``).
+  ``Cache.get`` is ``return self._general.get(key)`` -- it never reads a
+  database on any code path (``cache/cache.pyx:2853``). The database is read
+  once, in bulk, by the ``cache_general()`` warm-load, which sets
+  ``self._general = {}`` when there is no database (``cache/cache.pyx:289-299``).
+  Breezy configures ``CacheConfig(database=None, flush_on_start=False)``
+  (``breezy.runtime.node_config``), and ``NautilusKernel`` maps a falsy
+  ``config.cache.database`` to ``cache_db = None`` (``system/kernel.py:310-311``),
+  so ``Cache.has_backing`` is ``False`` (``cache/cache.pyx:115``) and nothing
+  written to it survives process exit.
+
+* **The alternative is Redis, and only Redis.** ``NautilusKernel`` accepts
+  ``config.cache.database.type == "redis"`` and raises ``ValueError`` for
+  every other value, case-sensitively (``system/kernel.py:312-329``);
+  ``DatabaseConfig.type`` defaults to ``"redis"`` and is documented
+  ``{'redis'}`` (``common/config.py:357,389``). The adapter unconditionally
+  constructs ``nautilus_pyo3.RedisCacheDatabase``
+  (``cache/database.pyx:162-166``). This deployment has no Redis and adding
+  one to make an NWS poll cursor durable is a heavier dependency than a
+  single local file.
+
+So the honest statement is **not** "``Cache`` is not durable" -- with Redis it
+is. It is: ``Cache`` is memory-only under the only configuration available to
+this deployment, and the supported alternative is a Redis server this
+deployment does not have.
+
+What SQLite gives instead: ``set()`` ``COMMIT``\\ s before it returns, ``get()``
+reads the same durable file, and there is no second in-memory copy to
+desynchronise.
+
+Corrections to the previous justification (1.231.0)
+---------------------------------------------------
+* **FALSE:** "``Cache.add`` queues its write to a background task and returns
+  before the write is durable." There is no background task in this path.
+  ``add`` mutates a dict synchronously and calls ``self._database.add``
+  in-line when a database exists (``cache/cache.pyx:1704-1708``); with
+  ``database=None`` it performs no write at all. The only deferral mechanism
+  in the tree is the opt-in ``CacheConfig.buffer_interval_ms``, which defaults
+  to ``None`` (``cache/config.py:67``) and applies to the Rust Redis backing,
+  which is unreachable here.
+* **TRUE but vacuous for us:** "``Cache.reset()`` clears the dict without
+  clearing the database." ``reset`` does clear ``_general``
+  (``cache/cache.pyx:1292``) while database flushing is the separate
+  ``flush_db()`` (``cache/cache.pyx:1332-1344``). But the consequence claimed
+  -- that this "resurrects ``ua_trap_blocked=False``" -- is backwards: after
+  ``reset`` a ``get`` returns ``None``, it does not return a stale ``False``.
+  And with ``database=None`` there is no database to desynchronise from.
 
 This module is deliberately Nautilus-free, matching
 ``breezy.ingest.gate``'s own isolation stance.
@@ -39,8 +94,9 @@ class SqliteStateStore:
     ``PRAGMA journal_mode=WAL`` and ``PRAGMA synchronous=FULL`` are set at
     construction, and every :meth:`set` call ``COMMIT``\\ s before
     returning. The durability boundary therefore coincides exactly with the
-    caller's success signal -- unlike ``Cache.add``, whose write completes
-    on a background task after the call already returned.
+    caller's success signal -- unlike ``Cache.add``, which under this
+    deployment's ``database=None`` config never leaves memory at all (see the
+    module docstring).
 
     Thread-safety
     --------------
@@ -98,7 +154,7 @@ class SqliteStateStore:
 
     def get(self, key: str) -> bytes | None:
         if not isinstance(key, str):
-            raise TypeError(f"key must be str, got {type(key).__name__}")
+            raise TypeError(f"key must be str, was {type(key).__name__}")
         self._check_thread()
         self._check_open()
         cursor = self._conn.execute(_SELECT_SQL, (key,))
@@ -111,9 +167,9 @@ class SqliteStateStore:
 
     def set(self, key: str, value: bytes) -> None:
         if not isinstance(key, str):
-            raise TypeError(f"key must be str, got {type(key).__name__}")
+            raise TypeError(f"key must be str, was {type(key).__name__}")
         if not isinstance(value, bytes):
-            raise TypeError(f"value must be bytes, got {type(value).__name__}")
+            raise TypeError(f"value must be bytes, was {type(value).__name__}")
         self._check_thread()
         self._check_open()
         self._conn.execute(_UPSERT_SQL, (key, value))
