@@ -37,7 +37,14 @@ before a line of this module was written
 * *A resume cursor.* ``grep -c 'resume_cursor' common/actor.pyx`` is **0**.
   ``on_save`` is not a substitute: ``save_state``/``load_state`` are
   ``NautilusKernelConfig`` fields and ``Trader.save()`` runs only from
-  ``kernel.stop()``, so on SIGKILL it never runs at all.
+  ``kernel.stop()``, so on SIGKILL it never runs at all. **Nor is ``Cache``**:
+  ``Cache.add`` forwards to a database only ``if self._database is not None``
+  (``cache/cache.pyx:1704-1708``) and ``cache_general`` resets ``self._general``
+  to ``{}`` without one (``:298``), while Breezy sets
+  ``CacheConfig(database=None)`` (``runtime/node_config.py:150`` ->
+  ``system/kernel.py:310-311``). So the cursor and the conditional-GET
+  validators live in ``SharedIngestState.store`` -- Breezy's own durable
+  ``SqliteStateStore``, alongside the gate and the product index.
 * *A data-completeness deadline distinct from a liveness watchdog.* Nothing in
   Nautilus models "today's climate day is complete".
 
@@ -134,7 +141,7 @@ from nautilus_trader.persistence.catalog import ParquetDataCatalog
 from breezy.domain.nws_climate_day import NwsClimateDay
 from breezy.domain.nws_raw_product import NwsRawProduct
 from breezy.ingest.config import NwsIngestActorConfig
-from breezy.ingest.gate import GateReason, SettlementGate
+from breezy.ingest.gate import GateReason, SettlementGate, StateStore
 from breezy.ingest.http import FetchResult, TransportError
 from breezy.ingest.nws_envelope import (
     DiscoveryEntry,
@@ -1090,17 +1097,47 @@ class NwsIngestActor(Actor):
             self._save_cursor(cursor)
 
     def reset_cursor(self) -> None:
-        """Rewind to "nothing published". Operational replay-repair tool."""
+        """Rewind to "nothing published". Operational replay-repair tool.
+
+        Written through to the durable store, not merely to ``self._cursor``:
+        rewinding in memory only would silently un-rewind on the next process,
+        so the operator would run the repair, restart, and get no replay.
+        """
         self._cursor = None
         self._cursor_loaded = True
-        self.cache.add(self._cursor_key, b"")
+        self._state_store.set(self._cursor_key, b"")
+
+    @property
+    def _state_store(self) -> StateStore:
+        """The ONE durable store -- **not** the Nautilus ``Cache``.
+
+        ``Cache`` cannot hold this. ``CacheConfig.database`` is ``None`` in
+        every Breezy node config (``runtime/node_config.py:150`` ->
+        ``system/kernel.py:310-311``), and ``Cache.add`` forwards to a database
+        only ``if self._database is not None`` (``cache/cache.pyx:1704-1708``)
+        while ``cache_general`` resets ``self._general`` to ``{}`` when there is
+        none (``:298``). So a cursor kept in ``Cache`` is a plain dict that dies
+        with the process, and after a restart ``warm_start`` republishes the
+        ENTIRE retained station catalog while the first poll goes out
+        unconditional.
+
+        Thread contract: ``StateStore`` is ``SqliteStateStore`` in every
+        deployment and is **thread-confined** (``runtime/sqlite_store.py:71-79``
+        raises off its constructing thread). Every caller of this property --
+        ``_load_cursor``/``_save_cursor``/``reset_cursor``/``_load_validators``/
+        ``_store_validators`` -- is reached only from the event-loop thread, the
+        same thread the gate and the product index already use it from. Nothing
+        handed to ``_run_off_loop`` may touch it; executor work stays restricted
+        to catalog I/O and the pure ``normalize`` parsers, neither of which does.
+        """
+        return self._shared.store
 
     @property
     def _cursor_key(self) -> str:
         return f"{CURSOR_KEY_PREFIX}{self._venue}:{self._city}"
 
     def _load_cursor(self) -> Cursor | None:
-        raw = self.cache.get(self._cursor_key)
+        raw = self._state_store.get(self._cursor_key)
         if not raw:
             return None
         try:
@@ -1119,18 +1156,28 @@ class NwsIngestActor(Actor):
             return None
 
     def _save_cursor(self, cursor: Cursor) -> None:
-        """Persist through ``Cache.add`` -- write-through per mutation.
+        """Persist to the durable store -- write-through per mutation.
 
-        ``on_save`` is the wrong home and this was measured: ``save_state`` /
-        ``load_state`` are ``NautilusKernelConfig`` fields, not ``ActorConfig``
-        fields, and ``Trader.save()`` is called **only** from ``kernel.stop()``
-        / ``stop_async()``. On SIGKILL, OOM or host loss it never runs, so a
-        cursor kept there is frozen at the last *graceful* shutdown -- possibly
-        never written at all.
+        Two homes were ruled out, both by measurement:
+
+        * ``on_save``. ``save_state``/``load_state`` are ``NautilusKernelConfig``
+          fields, not ``ActorConfig`` fields, and ``Trader.save()`` is called
+          **only** from ``kernel.stop()``/``stop_async()``. On SIGKILL, OOM or
+          host loss it never runs, so a cursor kept there is frozen at the last
+          *graceful* shutdown -- possibly never written at all.
+        * ``Cache.add``. It is write-through only when a cache database is
+          configured, and Breezy configures none; see :attr:`_state_store`.
+          Enabling one is not an option -- that would be reaching for a Nautilus
+          facility this deployment deliberately does not run, to carry Breezy's
+          own state, when Breezy already owns a durable store.
+
+        ``SqliteStateStore.set`` commits before it returns, so the durability
+        boundary coincides exactly with this call -- which is what lets the
+        crash window stay one record wide rather than one poll wide.
         """
         self._cursor = cursor
         self._cursor_loaded = True
-        self.cache.add(self._cursor_key, json.dumps(list(cursor)).encode("utf-8"))
+        self._state_store.set(self._cursor_key, json.dumps(list(cursor)).encode("utf-8"))
 
     # -- conditional-GET validators ---------------------------------------
 
@@ -1139,7 +1186,7 @@ class NwsIngestActor(Actor):
         return f"{VALIDATORS_KEY_PREFIX}{self._venue}:{self._city}"
 
     def _load_validators(self) -> tuple[str | None, str | None]:
-        raw = self.cache.get(self._validators_key)
+        raw = self._state_store.get(self._validators_key)
         if not raw:
             return (None, None)
         try:
@@ -1175,7 +1222,7 @@ class NwsIngestActor(Actor):
                 new_last_modified if new_last_modified is not None else last_modified
             ),
         }
-        self.cache.add(self._validators_key, json.dumps(payload).encode("utf-8"))
+        self._state_store.set(self._validators_key, json.dumps(payload).encode("utf-8"))
 
     # -- watchdogs ---------------------------------------------------------
 

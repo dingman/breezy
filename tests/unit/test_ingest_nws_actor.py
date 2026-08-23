@@ -122,7 +122,30 @@ class FakeClock:
         self.now += ns
 
 
-def durable_store_pair() -> tuple[InMemoryStateStore, Callable[[], InMemoryStateStore]]:
+class RecordingStateStore(InMemoryStateStore):
+    """`InMemoryStateStore` that records every write, in order.
+
+    The resume cursor and the conditional-GET validators live HERE, in
+    Breezy's own `StateStore`, not in the Nautilus `Cache`: `Cache.add`
+    forwards to a database only `if self._database is not None`
+    (`cache/cache.pyx:1704-1708`) and Breezy configures
+    `CacheConfig(database=None)` (`runtime/node_config.py:150`), so a cursor
+    kept there is a plain dict that dies with the process. Recording the
+    write ORDER is what lets a test assert the cursor was durable AT THE
+    MOMENT OF THE KILL rather than merely observing over-publication
+    afterwards -- the latter passes whether or not the write happened.
+    """
+
+    def __init__(self, data: dict[str, bytes], writes: list[tuple[str, bytes]]) -> None:
+        super().__init__(data)
+        self.writes = writes
+
+    def set(self, key: str, value: bytes) -> None:
+        super().set(key, value)
+        self.writes.append((key, value))
+
+
+def durable_store_pair() -> tuple[RecordingStateStore, Callable[[], RecordingStateStore]]:
     """A store plus an opener over the SAME backing dict.
 
     `SharedIngestState` now proves durability by round-trip through an
@@ -133,7 +156,11 @@ def durable_store_pair() -> tuple[InMemoryStateStore, Callable[[], InMemoryState
     `StateStore`).
     """
     backing: dict[str, bytes] = {}
-    return InMemoryStateStore(backing), lambda: InMemoryStateStore(backing)
+    writes: list[tuple[str, bytes]] = []
+    return (
+        RecordingStateStore(backing, writes),
+        lambda: RecordingStateStore(backing, writes),
+    )
 
 
 def _local_probe(path: Path) -> FilesystemProbe:
@@ -147,14 +174,14 @@ def _local_probe(path: Path) -> FilesystemProbe:
 
 
 class FakeCache(CacheFacade):  # type: ignore[misc]
-    """The `Cache.add`/`Cache.get` bytes seam, with call recording.
+    """A `CacheFacade` stand-in for `register_base`'s `cache` slot.
 
-    Real `Cache.add` is write-through per mutation, which is precisely why
-    SS3.3 puts the resume cursor here rather than in `on_save` (which never
-    runs on SIGKILL). Recording every `add` lets a test assert the cursor was
-    DURABLE AT THE MOMENT OF THE KILL rather than merely observing
-    over-publication afterwards -- the brief calls the latter "passing for the
-    wrong reason".
+    `register_base` hard type-checks its four arguments, so this must be a
+    real `CacheFacade` subclass rather than a duck type. Nothing in Breezy
+    stores state through it: the resume cursor and the conditional-GET
+    validators live in `RecordingStateStore` above. Writes are still recorded
+    so a test can assert this cache stays EMPTY -- a regression back onto
+    `Cache` would be silent otherwise, and silently non-durable.
     """
 
     def __init__(self) -> None:
@@ -180,14 +207,14 @@ def clock() -> FakeClock:
 
 
 @pytest.fixture
-def store_pair() -> tuple[InMemoryStateStore, Callable[[], InMemoryStateStore]]:
+def store_pair() -> tuple[RecordingStateStore, Callable[[], RecordingStateStore]]:
     return durable_store_pair()
 
 
 @pytest.fixture
 def store(
-    store_pair: tuple[InMemoryStateStore, Callable[[], InMemoryStateStore]],
-) -> InMemoryStateStore:
+    store_pair: tuple[RecordingStateStore, Callable[[], RecordingStateStore]],
+) -> RecordingStateStore:
     return store_pair[0]
 
 
@@ -195,7 +222,7 @@ def store(
 def shared(
     registry: SiteRegistry,
     clock: FakeClock,
-    store_pair: tuple[InMemoryStateStore, Callable[[], InMemoryStateStore]],
+    store_pair: tuple[RecordingStateStore, Callable[[], RecordingStateStore]],
     tmp_path: Path,
 ) -> Iterator[SharedIngestState]:
     store, store_opener = store_pair
@@ -220,9 +247,8 @@ def actor(shared: SharedIngestState, clock: FakeClock) -> Iterator[NwsIngestActo
     """A registered Actor with test doubles in the four `register_base` slots.
 
     `TestComponentStubs` supplies a real `Cache`/`MessageBus` elsewhere in this
-    suite; here the cache is a recording double because the resume-cursor
-    durability assertion needs the write ORDER, which the real cache does not
-    expose.
+    suite; here the cache is a recording double so a test can assert Breezy
+    writes NOTHING through it.
     """
     instance = build_actor(shared)
     try:
@@ -1136,30 +1162,38 @@ async def test_unroutable_body_shape_blocks_the_site(
 
 @pytest.mark.asyncio
 async def test_resume_cursor_is_durable_at_the_moment_of_each_publish(
-    actor: NwsIngestActor,
+    actor: NwsIngestActor, store: RecordingStateStore
 ) -> None:
     """SS3.3 + SS7: the exit test must assert DURABILITY AT THE MOMENT OF THE
     KILL, and fail if the cursor was never written. A test that kills and then
     observes over-publication passes whether or not the cursor was durable --
     which is passing for the wrong reason.
 
-    `on_save` is the wrong home: `save_state`/`load_state` are
-    `NautilusKernelConfig` fields and `Trader.save()` runs only from
-    `kernel.stop()`. On SIGKILL, OOM or host loss it never runs. `Cache.add`
-    is write-through per mutation, so the cursor lives there."""
+    Two homes are ruled out here, and this test is what pins the second:
+
+    * `on_save` -- `save_state`/`load_state` are `NautilusKernelConfig` fields
+      and `Trader.save()` runs only from `kernel.stop()`, so on SIGKILL, OOM or
+      host loss it never runs.
+    * the Nautilus `Cache` -- write-through only when `CacheConfig.database` is
+      set, and Breezy sets `database=None` (`runtime/node_config.py:150` ->
+      `system/kernel.py:310-311` -> `cache/cache.pyx:298`). The final assertion
+      below is the regression guard: Breezy must write NOTHING through it.
+    """
     with respx.mock(assert_all_called=False) as mock:
         mock_discovery(mock, NYC_FINAL)
         mock_product(mock, NYC_FINAL)
         actor.on_start()
         await actor.poll_once()
 
-    cache = actor.cache
-    cursor_writes = [k for k, _ in cache.writes if "cursor" in k]  # type: ignore[attr-defined]
+    cursor_writes = [k for k, _ in store.writes if "cursor" in k]
     published = actor.published  # type: ignore[attr-defined]
     assert len(cursor_writes) == len(published), (
         "every publish must be followed by a durable cursor write"
     )
     assert actor.resume_cursor is not None
+    assert actor.cache.writes == [], (  # type: ignore[attr-defined]
+        "nothing may be persisted through the memory-only Nautilus Cache"
+    )
 
 
 @pytest.mark.asyncio
@@ -1743,7 +1777,7 @@ async def test_corrupt_cursor_replays_rather_than_skipping(
         actor.on_start()
         await actor.poll_once()
 
-    actor.cache.add(actor._cursor_key, b"{not json")
+    actor._state_store.set(actor._cursor_key, b"{not json")
     actor._cursor_loaded = False
     assert actor.resume_cursor is None
 
@@ -1759,7 +1793,7 @@ async def test_corrupt_validators_fall_back_to_an_unconditional_get(
     """A corrupt stored validator degrades to an unconditional GET -- the
     conservative direction. Echoing an unreadable value back into an outbound
     request header is what `InvalidCacheValidatorError` exists to stop."""
-    actor.cache.add(actor._validators_key, b"[]")
+    actor._state_store.set(actor._validators_key, b"[]")
     with respx.mock(assert_all_called=False) as mock:
         route = mock_discovery(mock, NYC_FINAL)
         mock_product(mock, NYC_FINAL)
