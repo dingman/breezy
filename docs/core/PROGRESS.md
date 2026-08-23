@@ -1,0 +1,111 @@
+# Breezy — Progress and Backlog
+
+State of the work. Backlog items are tracked here, not in the design docs.
+
+---
+
+## Phase 1 — NWS ingestion substrate: BUILT AND LIVE-VALIDATED (2026-08-23)
+
+Design: `docs/plans/WEATHER_INGESTION_PROPOSAL.md` (v6, operator-approved 2026-08-22)
+and `docs/plans/PHASE1_ACTOR_BRIEF.md`.
+
+Persistence is native NautilusTrader `ParquetDataCatalog` for weather records
+(the data plane), with a SQLite `StateStore` for the settlement gate and the
+product-integrity index (the control plane). No PostgreSQL, TimescaleDB, Redis,
+DuckDB, vector store or custom persistence abstraction was introduced.
+
+### Live validation evidence
+
+One real process against `api.weather.gov`, one site (`polymarket_us:NYC`):
+
+- Actor registered and RUNNING: `NWS-INGEST-polymarket_us-NYC`;
+  `has_cache_backing=False`, `has_msgbus_backing=False`, zero catalogs
+  registered with the DataEngine.
+- 14 CLI products (2026-08-16 .. 2026-08-22) retrieved, parsed, normalized and
+  persisted as both `NwsRawProduct` and `NwsClimateDay`.
+- Read back **by a separate process**: `climate_days=14 raw_products=14`,
+  `ts_init` non-decreasing, **14/14 settlement digests re-verified**
+  (`read_raw_products` deliberately does not re-verify, so an unchecked
+  round-trip would prove nothing).
+- Preliminary/final pairs correctly distinguished on real data, including a
+  real revision: `2026-08-20 tmax=84 tmin=71 final=False` (20:45Z) then
+  `tmin=63 final=True` (05:00Z next day).
+- Restart dedupe: a second full process over the same catalog and state
+  (95s, 30s polls) held at 14/14 with 14 unique UUIDs and all digests valid.
+
+### Independent review outcome
+
+security-reviewer APPROVE (1 MEDIUM), prediction-market-reviewer APPROVE
+(1 MEDIUM, 1 LOW), python-reviewer BLOCK (1 HIGH). The HIGH and the security
+MEDIUM are fixed; the rest are tracked below.
+
+The two reviewers **contradicted each other** on gate fail-open behaviour.
+Resolved empirically, both were half right: per-site state fails CLOSED
+(`_derive_state` returns BLOCKED when `last_successful_poll_ns is None`),
+while the global `ua_trap_blocked` latch did not.
+
+---
+
+## Open follow-ups
+
+### [MEDIUM] `never_substitute` is declared but has no consumers
+`src/breezy/registry/sites.toml` defines `never_substitute` /
+`never_substitute_cli_locations` per site (e.g. NYC must never settle from
+KJFK/KLGA/KEWR), but nothing in the Phase 1 ingest path reads them.
+
+Not settlement-affecting today: the actual protection is the stronger,
+independent AWIPS-PIL-equals-`CLI{cli_location}` check plus the per-city
+`body_header_regex`, both of which are live code. The risk is forward-looking
+— whoever wires the Phase 2 METAR/ACIS cross-check could reasonably assume
+`never_substitute` is already enforced and omit the check.
+
+**Action:** before any METAR/ACIS path lands, either consume these lists or
+place a `TODO(Phase 2)` at the station-selection call site.
+
+### [LOW] `ABSOLUTE_MAX_F` widened 130 -> 140 F, unreconciled
+`src/breezy/normalize/sanity.py:65-68`. The docstring itself flags this as
+pending reconciliation with the `nws-cli-settlement` skill. The wider bound is
+the more defensible one (above the all-time world record, so a real heat event
+does not halt trading), but close the loop before Phase 2.
+
+### [MEDIUM] Unbounded whole-catalog reads per lookup
+`src/breezy/persistence/catalog.py:693` and every `read_climate_days` /
+`read_raw_products` call site in `nws_actor.py` omit `start`/`end`. Accepted
+and self-documented at ~2 records/climate-day/station (~730/year), but this is
+a full scan per poll per site and grows linearly with retention.
+
+**Action:** add a catalog row-count metric/alert rather than a code change now.
+
+### [LOW] `BREEZY_LOG_LEVEL` unvalidated at load time
+`src/breezy/runtime/settings.py:160` passes the value straight through, unlike
+every other setting in that module, which fails fast.
+
+### Import-linter contracts are still absent
+`import-linter` is declared as a dependency but **no contracts are configured**,
+so the layering it exists to enforce is unenforced.
+
+---
+
+## Pre-production gate (NOT YET RUN)
+
+`sites.toml:94-104` requires **independent live re-verification of every site's
+`issuing_office` and `body_header_regex` by a different agent** before trading
+real money. The design designates this — not the ingestion validation above —
+as the final settlement-truth check. One WFO issues several cities' CLI
+products, so office matching alone is worthless and a mis-bound site would
+settle from the wrong city's temperatures.
+
+---
+
+## Standing lesson from this phase
+
+The unit suite was **fully green at two separate points while the deployment
+was dead**: first the Actor could not be constructed at all
+(`ActorFactory.create` ends in `actor_cls(config)`, so `ImportableActorConfig`
+cannot carry `SharedIngestState`), then it was built but never registered.
+Both were caught by running the real process, never by tests. Both are now
+regression-tested by asserting on *behaviour* (`node.trader.added_actors`,
+`GateReason.TASK_DEATH` reaching the gate) rather than on structure.
+
+Treat green tests here as necessary and not sufficient; a live run is part of
+the definition of done for anything in the ingest path.

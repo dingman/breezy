@@ -1,6 +1,9 @@
 # Breezy — Weather Data Ingestion Implementation Proposal (v6)
 
-Status: **APPROVED by operator 2026-08-22. Phase 0 in progress. No production code written.**
+Status: **APPROVED by operator 2026-08-22. Phase 0 complete. Phase 1 ingestion substrate BUILT and
+live-validated 2026-08-23 against api.weather.gov** -- see `docs/core/PROGRESS.md` for the evidence
+and the open follow-ups. This document remains the authoritative design; where the implementation
+diverged, the divergence is recorded in PROGRESS.md, not silently absorbed here.
 Scope: ingesting **NWS** (primary/authoritative) and **Open-Meteo** (secondary/enrichment) into the NautilusTrader-based system.
 
 **What v6 is.** v5 appended its corrections as a §12 appendix rather than folding them into the body, leaving ~12 places where §§1–11 still asserted what §12 had already refuted — an implementer following the phase plan would have built the rejected design. v6 folds every correction into the text, records the operator's decisions as settled, and deletes superseded alternatives. **There is no appendix of corrections. If it is in this document, it is current.** Revision history is §11; it is a record, not a source of design.
@@ -459,4 +462,6 @@ One deliberate deviation, operator-approved: **outbound HTTP via `httpx` for wea
 
 ---
 
-**Approved 2026-08-22. Phase 0 in progress; no production code until Phase 0 output is reviewed.**
+**Approved 2026-08-22. Phase 0 complete; Phase 1 substrate built, reviewed and live-validated
+2026-08-23. Remaining pre-production gate: independent live re-verification of every site's
+`issuing_office` and `body_header_regex` (sites.toml:94-104) before trading real money.**
