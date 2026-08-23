@@ -31,10 +31,11 @@ backfill = ["pyiem>=1.19"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 asyncio_mode = "strict"
-addopts = "-q --strict-markers --strict-config"
+addopts = "-q --strict-markers --strict-config -m 'not live'"
 markers = [
     "contract: pins verified NautilusTrader 1.231.0 behaviour; run first on any version bump",
     "replay: live/backtest parity tests",
+    "live: performs REAL network I/O against api.weather.gov and needs BREEZY_LIVE=1; deselected by default",
 ]
 
 [tool.ruff]
@@ -53,6 +54,7 @@ files = [
     "src/breezy/domain",
     "src/breezy/ingest",
     "src/breezy/persistence",
+    "src/breezy/runtime",
 ]
 
 # pyarrow ships no stubs, and nautilus_trader's Data base is a compiled Cython
