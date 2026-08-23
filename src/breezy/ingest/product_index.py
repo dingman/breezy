@@ -80,6 +80,38 @@ logger = logging.getLogger(__name__)
 #: closed on the archived uuid -- never a delete.
 PRODUCT_INDEX_KEY_PREFIX = "productidx:"
 
+#: A durable manifest of every ``product_uuid`` this index has ever recorded
+#: a FIRST_SEEN entry for -- a JSON array, written under one fixed key
+#: disjoint from every real ``productidx:<uuid>`` entry (no uuid is ever
+#: literally ``__manifest__``).
+#:
+#: **The blind spot this closes.** Unlike ``gate.py``'s single global entry,
+#: absence of an individual ``productidx:<uuid>`` key is the ORDINARY case
+#: for the overwhelming majority of uuids (every one never yet observed) --
+#: a single yes/no sentinel cannot tell "genuinely new" apart from
+#: "previously recorded, now missing" the way it can for a singleton. This
+#: manifest is the per-key equivalent: on a miss for the primary key, this
+#: is consulted, and only a uuid genuinely absent from BOTH counts as
+#: first-seen. A uuid present in the manifest but missing its entry key
+#: means something removed the entry without removing the record of having
+#: seen it -- treated as :attr:`ProductIntegrityOutcome.MISMATCH`, never as
+#: first-seen, exactly the WEATHER_INGESTION_PROPOSAL-mandated bias toward
+#: an integrity halt over a silent pass.
+#:
+#: Written FIRST, before the primary entry, on every FIRST_SEEN (see
+#: :meth:`ProductIntegrityIndex.observe`): if the process dies or the store
+#: raises between the two writes, the manifest already lists the uuid,
+#: so a retry that lands with the entry still missing correctly reads as
+#: tampered rather than as a second legitimate first-seen -- the safer of
+#: the two possible orderings.
+#:
+#: Cannot detect the whole backing medium being deleted and recreated --
+#: this key lives in the same store as everything else, and no witness
+#: inside a medium can outlive that medium's own destruction. It closes the
+#: achievable case: a store that is still there and answering, but has lost
+#: one entry.
+_MANIFEST_KEY = f"{PRODUCT_INDEX_KEY_PREFIX}__manifest__"
+
 _HEX_DIGEST = re.compile(r"\A[0-9a-f]{64}\Z")
 
 #: A canonical, LOWERCASE product uuid as api.weather.gov assigns it.
@@ -306,6 +338,70 @@ class ProductIntegrityIndex:
 
     # -- internals ------------------------------------------------------
 
+    def _manifest_claims(self, product_uuid: str) -> bool:
+        """Whether the durable manifest says `product_uuid` was previously
+        recorded, consulted ONLY when the primary entry key is absent.
+
+        Fails closed on an unreadable manifest: if the manifest itself
+        cannot be decoded, this returns ``True`` for every uuid rather than
+        ``False`` for this one -- corruption of the very record that proves
+        a uuid is genuinely new must never be read as "therefore it must be
+        new". That is a deliberate, sticky posture (every FIRST_SEEN is
+        refused until the manifest is repaired), matching this module's
+        stance elsewhere: corruption is itself the integrity signal, not a
+        free pass.
+        """
+        raw = self._store.get(_MANIFEST_KEY)
+        if raw is None:
+            return False
+        try:
+            payload: Any = json.loads(raw.decode("utf-8"))
+            if not isinstance(payload, list) or not all(isinstance(item, str) for item in payload):
+                raise TypeError("manifest must be a JSON array of strings")
+        except (ValueError, TypeError, KeyError) as exc:
+            logger.critical(
+                "product index: UNREADABLE bootstrap manifest -- failing closed "
+                "for EVERY uuid with a missing entry (none can be proven "
+                "genuinely new until the manifest is repaired). error=%s",
+                exc,
+            )
+            return True
+        return product_uuid in payload
+
+    def _record_in_manifest(self, product_uuid: str) -> None:
+        """Durably add `product_uuid` to the first-seen manifest.
+
+        Only ever called from :meth:`observe` after :meth:`_load` has
+        already returned ``None`` for this uuid -- which itself only
+        happens when the manifest was either absent or successfully
+        decoded (see :meth:`_manifest_claims`: a corrupt manifest makes
+        `_load` return a :class:`_CorruptEntry` instead, and `observe`
+        never reaches this call in that case). So the read here can never
+        observe a manifest this process just proved was corrupt; no
+        decode-failure recovery is needed, and a `json.loads` failure here
+        would indicate a genuine, single-threaded ordering bug rather than
+        ordinary corruption, so it is allowed to propagate rather than
+        being silently swallowed.
+        """
+        raw = self._store.get(_MANIFEST_KEY)
+        manifest: list[str]
+        if raw is None:
+            manifest = []
+        else:
+            payload: Any = json.loads(raw.decode("utf-8"))
+            # `_manifest_claims` already validated these exact bytes as a
+            # JSON array of strings before `_load` could ever return
+            # `None` for this uuid -- the precondition for reaching this
+            # method at all (see its docstring). A `list[str]` cast, not a
+            # defensive re-check.
+            manifest = list(payload)
+        # `product_uuid` cannot already be in `manifest`: this is only
+        # called from `observe()`'s FIRST_SEEN branch, reached only when
+        # `_manifest_claims(product_uuid)` (consulted by `_load`) already
+        # returned `False` for it.
+        manifest.append(product_uuid)
+        self._store.set(_MANIFEST_KEY, json.dumps(manifest).encode("utf-8"))
+
     def _load(self, product_uuid: str) -> _IndexEntry | _CorruptEntry | None:
         """Return the cached/persisted entry for `product_uuid`, or ``None``
         if it has genuinely never been observed.
@@ -326,6 +422,31 @@ class ProductIntegrityIndex:
 
         raw = self._store.get(_index_key(product_uuid))
         if raw is None:
+            if self._manifest_claims(product_uuid):
+                # The manifest says this uuid was recorded before, but its
+                # entry key is gone -- NOT a clean slate. Silently reading
+                # this as "never seen" is exactly the laundering closed
+                # here: a mutated re-fetch of a KNOWN uuid would read as
+                # FIRST_SEEN instead of MISMATCH, silently accepting
+                # changed bytes under a stable id. Never cached as a
+                # _CorruptEntry-shaped return so the manifest is
+                # re-consulted every time -- a later repair of the entry
+                # key must be able to clear this without a process
+                # restart.
+                logger.critical(
+                    "product index: entry MISSING for product_uuid=%s despite "
+                    "the durable manifest recording it as previously "
+                    "observed -- failing closed to MISMATCH rather than "
+                    "first-seen.",
+                    product_uuid,
+                )
+                return _CorruptEntry(
+                    detail=(
+                        f"product_uuid={product_uuid} is listed in the durable "
+                        "manifest as previously observed, but its integrity "
+                        "entry is missing"
+                    )
+                )
             # Deliberately NOT cached. Absence is the one state a later
             # successful write must be able to replace; caching it would let a
             # failed persist look settled.
@@ -377,6 +498,16 @@ class ProductIntegrityIndex:
 
         if entry is None:
             new_entry = _IndexEntry(raw_sha256=observed, first_seen_at_ns=now)
+            # Manifest FIRST, entry SECOND -- deliberately, and the only
+            # safe order. If the process dies (or store.set() raises)
+            # between the two writes, the manifest already lists `uuid`; a
+            # later retry that finds the entry still missing then correctly
+            # reads as tampered (via _manifest_claims) rather than being
+            # silently allowed a second legitimate FIRST_SEEN. The reverse
+            # order would let exactly that crash window read as "never
+            # seen" forever -- the same laundering this manifest exists to
+            # close, just relocated to a narrower window.
+            self._record_in_manifest(uuid)
             # Persist FIRST, cache second. If store.set() raises (or the
             # process dies between the two statements), the in-memory view
             # must never advance ahead of the durable one -- a memory-only

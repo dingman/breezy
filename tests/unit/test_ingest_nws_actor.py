@@ -395,6 +395,36 @@ async def test_on_start_captures_the_running_loop(actor: NwsIngestActor) -> None
     assert actor.loop is asyncio.get_running_loop()
 
 
+@pytest.mark.asyncio
+async def test_on_start_warm_start_failure_reaches_the_gate(
+    actor: NwsIngestActor, shared: SharedIngestState
+) -> None:
+    """HIGH defect: `on_start` used to fire `warm_start()` via a bare
+    `create_task`, so a corrupt catalog / permission error / disk-full
+    exception during warm start vanished into "Task exception was never
+    retrieved" -- no `GateReason` recorded, the site left un-blocked.
+
+    This goes through the REAL `on_start` wiring (unlike every other
+    warm-start test, which calls `actor.warm_start()` directly and bypasses
+    the scheduling entirely) and lets the event loop actually run the
+    scheduled task to completion. It must be supervised exactly like the poll
+    path: the exception has to reach `GateReason.TASK_DEATH` and BLOCK the
+    site, not merely get logged.
+    """
+
+    async def _boom() -> None:
+        raise ValueError("warm start exploded")
+
+    actor.warm_start = _boom  # type: ignore[method-assign]
+    actor.on_start()
+    for _ in range(200):
+        await asyncio.sleep(0.01)
+        if GateReason.TASK_DEATH in shared.gate.blocking_causes(VENUE, CITY):
+            break
+    assert GateReason.TASK_DEATH in shared.gate.blocking_causes(VENUE, CITY)
+    assert shared.gate.status(VENUE, CITY).state is GateState.BLOCKED
+
+
 def test_on_start_without_a_running_loop_schedules_no_poll_timer(
     actor: NwsIngestActor,
 ) -> None:

@@ -669,3 +669,99 @@ def test_known_digest_rejects_a_case_variant_uuid() -> None:
     index.observe(UUID_A, DIGEST_ORIGINAL)
     with pytest.raises(ValueError):
         index.known_digest(UUID_A.upper())
+
+
+# ---------------------------------------------------------------------------
+# Bootstrap manifest -- a wiped entry key must never downgrade a mutated
+# re-fetch of a KNOWN uuid from MISMATCH to FIRST_SEEN.
+#
+# Full deletion-and-recreation of the whole backing file is not solvable
+# here either, for the identical reason documented in gate.py's own
+# bootstrap-sentinel tests: every key in this store, including the
+# manifest, is gone together in that case. What the manifest closes is the
+# achievable case -- the store still answers, but one entry key vanished
+# out from under it (a stray DELETE, a partial restore) while the manifest
+# survived. A real SqliteStateStore is required so a second connection to
+# the same file can remove exactly one row.
+# ---------------------------------------------------------------------------
+
+
+def test_a_wiped_entry_for_a_known_uuid_is_a_mismatch_not_first_seen(tmp_path) -> None:  # type: ignore[no-untyped-def]
+    """RED-first reproduction: observe a uuid (FIRST_SEEN, manifest records
+    it), delete ONLY its entry row out from under the store, then re-observe
+    the SAME uuid with MUTATED bytes. Before this fix that read as
+    FIRST_SEEN -- silently accepting changed bytes under a stable id. It
+    must read as MISMATCH.
+    """
+    import sqlite3
+
+    from breezy.runtime.sqlite_store import SqliteStateStore
+
+    path = tmp_path / "product_index.sqlite3"
+    with SqliteStateStore(path) as store:
+        index = ProductIntegrityIndex(store=store, clock=_FakeClock())
+        first = index.observe(UUID_A, DIGEST_ORIGINAL)
+        assert first.outcome is ProductIntegrityOutcome.FIRST_SEEN
+
+    # Out-of-band tamper on the SAME file: remove only this uuid's entry.
+    with sqlite3.connect(str(path)) as raw_conn:
+        deleted = raw_conn.execute(
+            "DELETE FROM state WHERE key = ?", (_index_key(UUID_A),)
+        ).rowcount
+        raw_conn.commit()
+    assert deleted == 1, "the entry row must have existed to demonstrate its deletion"
+
+    with SqliteStateStore(path) as reopened:
+        restarted = ProductIntegrityIndex(store=reopened, clock=_FakeClock())
+        result = restarted.observe(UUID_A, DIGEST_MUTATED)
+
+    assert result.outcome is ProductIntegrityOutcome.MISMATCH
+    assert result.outcome is not ProductIntegrityOutcome.FIRST_SEEN
+    assert result.is_integrity_alarm is True
+
+
+@pytest.mark.parametrize(
+    "label,raw",
+    [
+        ("not_json", b"not json at all"),
+        ("json_object_not_a_list", b'{"foo": "bar"}'),
+        ("list_with_non_string_item", b"[123]"),
+    ],
+)
+def test_corrupt_manifest_fails_closed_for_a_uuid_with_a_missing_entry(
+    label: str, raw: bytes, caplog: pytest.LogCaptureFixture
+) -> None:
+    """If the manifest itself cannot be decoded (or is not a JSON array of
+    strings), a uuid with no entry key must never be waved through as
+    first-seen -- corruption of the record that would otherwise prove
+    "genuinely new" is itself an integrity signal, not a free pass.
+    """
+    from breezy.ingest.product_index import _MANIFEST_KEY
+
+    store = _FakeStore()
+    store.data[_MANIFEST_KEY] = raw
+    index, _store, _clock = _index(store=store)
+
+    with caplog.at_level(logging.CRITICAL, logger="breezy.ingest.product_index"):
+        result = index.observe(UUID_A, DIGEST_ORIGINAL)
+
+    assert result.outcome is ProductIntegrityOutcome.MISMATCH
+    assert any(r.levelno == logging.CRITICAL for r in caplog.records)
+
+
+def test_a_genuinely_new_uuid_is_still_first_seen_over_a_real_sqlite_store(tmp_path) -> None:  # type: ignore[no-untyped-def]
+    """The other half of the same fix: a uuid this store has never recorded
+    (absent from both the entry key AND the manifest) must still be
+    reported FIRST_SEEN -- the manifest must not turn every legitimate new
+    product into a false integrity alarm.
+    """
+    from breezy.runtime.sqlite_store import SqliteStateStore
+
+    path = tmp_path / "fresh_product_index.sqlite3"
+    with SqliteStateStore(path) as store:
+        index = ProductIntegrityIndex(store=store, clock=_FakeClock())
+        index.observe(UUID_A, DIGEST_ORIGINAL)  # unrelated prior history
+
+        result = index.observe(UUID_B, DIGEST_ORIGINAL)
+
+    assert result.outcome is ProductIntegrityOutcome.FIRST_SEEN

@@ -438,7 +438,15 @@ class NwsIngestActor(Actor):
             )
             return
 
-        self._loop.create_task(self.warm_start())
+        # Supervised exactly like the timer-path coroutines below: a warm
+        # start that raises (corrupt catalog, permission error, disk full)
+        # must reach the settlement gate, not vanish as "Task exception was
+        # never retrieved". `_submit` already retains the strong reference
+        # `run_coroutine_threadsafe` needs (via `_chain_future`'s done-
+        # callback chain) and routes any exception through `_on_poll_done` ->
+        # `_record_task_death` -> the gate -- reused as-is rather than
+        # duplicated, so warm start and poll share one supervision path.
+        self._submit(self.warm_start())
         self._arm_timers()
 
     def on_stop(self) -> None:

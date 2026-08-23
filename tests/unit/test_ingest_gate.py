@@ -1314,16 +1314,19 @@ def test_store_set_failure_does_not_advance_cache_past_durable_state() -> None:
     store) would silently resume trading with no verified successful poll
     since the real failure.
     """
-    # record_successful_poll performs two writes the first time any site
-    # ever succeeds: the site entry itself, then the persisted, cross-restart
+    # record_successful_poll performs three writes the first time any site
+    # ever succeeds: the site entry itself, then -- because this is the
+    # first-ever global write against this store -- the bootstrap sentinel
+    # (_GLOBAL_BOOTSTRAP_KEY, stamped once so a later absent global row is
+    # never mistaken for first boot), then the persisted, cross-restart
     # "any site ever succeeded" global latch (see record_forbidden_403).
-    # Both must land before the 3rd set() -- the actual failing write under
-    # test -- raises.
-    store: StateStore = _FailOnSetStore(fail_from_call=3)
+    # All three must land before the 4th set() -- the actual failing write
+    # under test -- raises.
+    store: StateStore = _FailOnSetStore(fail_from_call=4)
     clock = _FakeClock()
     gate = SettlementGate(store=store, clock=clock, sites=_DEFAULT_TEST_SITES)
 
-    gate.record_successful_poll(VENUE, CITY)  # 1st + 2nd set() succeed -> OPEN, durable
+    gate.record_successful_poll(VENUE, CITY)  # 1st-3rd set() succeed -> OPEN, durable
     assert gate.status(VENUE, CITY).state is GateState.OPEN
 
     with pytest.raises(RuntimeError):
@@ -1814,6 +1817,91 @@ def test_the_real_sqlite_store_keeps_a_ua_trap_across_a_true_restart(tmp_path) -
     assert status.reason is GateReason.UA_TRAP_403
 
 
+# ---------------------------------------------------------------------------
+# Bootstrap sentinel -- a wiped global row must never launder a UA-trap
+# latch into a self-clearing NEVER_POLLED block.
+#
+# Full deletion-and-recreation of the whole `state.sqlite3*` file is
+# reproduced separately below AND is explicitly NOT solvable by any
+# store-internal witness (proven in the review notes and re-verified here):
+# once every row -- including this sentinel -- is gone, "genuine first
+# boot" and "everything was wiped" are the same observation through
+# `StateStore.get`/`set` alone. What IS solvable, and is exactly what
+# `_GLOBAL_BOOTSTRAP_KEY` closes, is the store surviving while a SPECIFIC
+# row (here, the global entry) does not -- a stray DELETE, a partial
+# restore, or a corrupted page recovered minus one row. A real
+# `SqliteStateStore` is required, per module design: only a second
+# connection to the same on-disk file can independently remove one row
+# while leaving the rest -- including the sentinel -- intact, which no
+# in-memory fake can model.
+# ---------------------------------------------------------------------------
+
+
+def test_a_wiped_global_row_fails_closed_instead_of_laundering_the_ua_trap(tmp_path) -> None:  # type: ignore[no-untyped-def]
+    """RED-first reproduction of the review's laundering: latch a UA-trap,
+    delete ONLY the persisted global row out from under the store (the
+    bootstrap sentinel and every other row survive), and confirm the next
+    read fails closed under a reason that requires a manual
+    `acknowledge_ua_trap_resolved()` -- never `NEVER_POLLED`, which any
+    single successful poll would silently clear.
+    """
+    import sqlite3
+
+    from breezy.runtime.sqlite_store import SqliteStateStore
+
+    path = tmp_path / "state.sqlite3"
+    with SqliteStateStore(path) as store:
+        gate = SettlementGate(store=store, clock=_FakeClock(), sites=_DEFAULT_TEST_SITES)
+        gate.record_forbidden_403(VENUE, CITY, detail="cross-site 403 burst")
+        latched = gate.status(VENUE, CITY)
+        assert latched.state is GateState.BLOCKED
+        assert latched.reason is GateReason.UA_TRAP_403
+
+    # Out-of-band tamper on the SAME file: remove only the global row.
+    with sqlite3.connect(str(path)) as raw_conn:
+        deleted = raw_conn.execute("DELETE FROM state WHERE key = ?", (_GLOBAL_KEY,)).rowcount
+        raw_conn.commit()
+    assert deleted == 1, "the global row must have existed to demonstrate its deletion"
+
+    with SqliteStateStore(path) as reopened:
+        gate2 = SettlementGate(store=reopened, clock=_FakeClock(), sites=_DEFAULT_TEST_SITES)
+        after_wipe = gate2.status(VENUE, CITY)
+
+    assert after_wipe.state is GateState.BLOCKED
+    assert after_wipe.reason is GateReason.STATE_STORE_TAMPERED
+    assert after_wipe.reason is not GateReason.NEVER_POLLED
+
+    # And the halt must NOT self-clear on the next ordinary successful poll
+    # -- that is precisely the laundering path this fix closes.
+    with SqliteStateStore(path) as still_open:
+        gate3 = SettlementGate(store=still_open, clock=_FakeClock(), sites=_DEFAULT_TEST_SITES)
+        gate3.record_successful_poll(VENUE, CITY)
+        assert gate3.status(VENUE, CITY).state is GateState.BLOCKED
+        assert gate3.status(VENUE, CITY).reason is GateReason.STATE_STORE_TAMPERED
+
+        gate3.acknowledge_ua_trap_resolved(detail="verified: row loss was transient store noise")
+        assert gate3.status(VENUE, CITY).state is GateState.OPEN
+
+
+def test_genuine_first_boot_over_a_real_sqlite_store_still_reaches_open(tmp_path) -> None:  # type: ignore[no-untyped-def]
+    """The other half of the same fix: a brand-new deployment (a store that
+    has NEVER been written to) must default permissively and still reach
+    OPEN after one successful poll -- the bootstrap sentinel must not turn
+    every fresh install into a manual-acknowledgement-required halt.
+    """
+    from breezy.runtime.sqlite_store import SqliteStateStore
+
+    path = tmp_path / "fresh_state.sqlite3"
+    with SqliteStateStore(path) as store:
+        gate = SettlementGate(store=store, clock=_FakeClock(), sites=_DEFAULT_TEST_SITES)
+
+        before_poll = gate.status(VENUE, CITY)
+        assert before_poll.state is GateState.BLOCKED
+        assert before_poll.reason is GateReason.NEVER_POLLED
+
+        gate.record_successful_poll(VENUE, CITY)
+        assert gate.status(VENUE, CITY).state is GateState.OPEN
+
 
 # ---------------------------------------------------------------------------
 # UA-trap survival across a simulated restart, through the REAL
@@ -1963,7 +2051,12 @@ def test_site_level_persist_before_cache_ordering_is_unaffected() -> None:
     during a site-level transition must still leave the in-memory site
     cache exactly at the last durably-persisted state.
     """
-    store: StateStore = _FailOnSetStore(fail_from_call=3)
+    # See test_store_set_failure_does_not_advance_cache_past_durable_state:
+    # record_successful_poll's first-ever global write now costs an extra
+    # bootstrap-sentinel set(), so the 3 successful writes it needs land
+    # before the 4th (record_task_death's) set() call, which is the one
+    # under test.
+    store: StateStore = _FailOnSetStore(fail_from_call=4)
     clock = _FakeClock()
     gate = SettlementGate(store=store, clock=clock, sites=_DEFAULT_TEST_SITES)
 

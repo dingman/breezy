@@ -59,6 +59,34 @@ _GLOBAL_KEY = "gate:__global__"
 _TRANSIENT_DEGRADE_THRESHOLD = 3
 _NS_PER_SECOND = 1_000_000_000
 
+#: Written once, the first time this store is ever mutated through
+#: `_save_global` -- a durable "this store has real history" witness,
+#: disjoint from `_GLOBAL_KEY` itself. Its entire purpose is to let
+#: `_load_global` tell apart two states that otherwise look IDENTICAL (both
+#: read `store.get(_GLOBAL_KEY) is None`):
+#:
+#:   1. genuine first boot -- this store has never held a global entry, so
+#:      the permissive default (`ua_trap_blocked=False`) is correct and a
+#:      fresh deployment must still reach OPEN after one successful poll;
+#:   2. the global entry EXISTED and is now gone -- a row deleted out from
+#:      under the store (a stray DELETE, a partial restore, a corrupted
+#:      page recovered minus one row) while the rest of the medium,
+#:      INCLUDING this sentinel, survived. Before this fix, case 2 read
+#:      exactly like case 1 and silently downgraded a latched UA-trap
+#:      global halt to a per-site NEVER_POLLED block -- one that any single
+#:      successful poll self-clears, defeating the manual
+#:      `acknowledge_ua_trap_resolved()` the halt was designed to require.
+#:
+#: This key cannot detect the whole backing file being deleted and
+#: recreated from scratch -- that erases every key in the `gate:`
+#: namespace, this sentinel included, and no key-value witness stored in
+#: the SAME medium can survive its own medium's total destruction. That is
+#: an infrastructure-level concern (file integrity monitoring, backups)
+#: outside what a `StateStore.get`/`set` seam can ever prove; what this
+#: sentinel closes is the achievable, realistic case -- a store that is
+#: still there and answering, but has lost specific rows.
+_GLOBAL_BOOTSTRAP_KEY = "gate:__bootstrap__"
+
 
 def _site_key(venue: str, city: str) -> str:
     return f"gate:{venue}:{city}"
@@ -109,6 +137,7 @@ class GateReason(str, Enum):
     FINAL_RECEIVED = "final_received"
     WRITE_INTEGRITY_VIOLATION = "write_integrity_violation"
     TRANSPORT_INTEGRITY_ALARM = "transport_integrity_alarm"
+    STATE_STORE_TAMPERED = "state_store_tampered"
 
 
 # Reasons the proposal's §6 table tags CRIT, logged at CRITICAL regardless of
@@ -128,6 +157,7 @@ _CRIT_REASONS = frozenset(
         GateReason.FINAL_CLI_OVERDUE,
         GateReason.WRITE_INTEGRITY_VIOLATION,
         GateReason.TRANSPORT_INTEGRITY_ALARM,
+        GateReason.STATE_STORE_TAMPERED,
     }
 )
 
@@ -624,6 +654,31 @@ class SettlementGate:
         """
         raw = self._store.get(_GLOBAL_KEY)
         if raw is None:
+            if self._store.get(_GLOBAL_BOOTSTRAP_KEY) is not None:
+                # This store has real history (the bootstrap sentinel
+                # proves a write happened here before), yet the global
+                # entry itself is gone. That is NOT first boot -- it is a
+                # row missing from a medium that otherwise still answers.
+                # Silently defaulting to permissive here is exactly the
+                # laundering this sentinel exists to close: a latched
+                # UA-trap block whose row vanished would otherwise read as
+                # "never happened" and let a single ordinary poll reopen
+                # every site with no operator acknowledgement. Fail closed,
+                # identically to corrupt bytes below, but with a reason
+                # that tells an operator the cause was absence, not decode
+                # failure.
+                logger.critical(
+                    "gate: global entry MISSING from a store that has prior "
+                    "bootstrap history -- failing closed, BLOCKING ALL SITES. "
+                    "This is not first boot: some other write already "
+                    "happened against this store."
+                )
+                return _GlobalEntry(
+                    ua_trap_blocked=True,
+                    reason=GateReason.STATE_STORE_TAMPERED,
+                    detail="global entry absent from a previously-bootstrapped store",
+                    at_ns=self._now(),
+                )
             return _GlobalEntry()
         try:
             return _global_entry_from_bytes(raw)
@@ -763,6 +818,16 @@ class SettlementGate:
         # persist-before-cache ordering is moot here (a simplification, not
         # a regression of that fix -- the SITE path in _save_site is
         # unchanged and still persists before mutating self._sites).
+        #
+        # The bootstrap sentinel is stamped BEFORE the real write, and only
+        # once ever (cheap to skip after that -- one extra store.get() per
+        # global write, one extra store.set() ever): it must be in place
+        # before the first global entry this process writes, so a row later
+        # deleted from under it is distinguishable from "never written" by
+        # every subsequent _load_global call, including ones from a
+        # completely different process instance over the same store.
+        if self._store.get(_GLOBAL_BOOTSTRAP_KEY) is None:
+            self._store.set(_GLOBAL_BOOTSTRAP_KEY, b"1")
         self._store.set(_GLOBAL_KEY, _global_entry_to_bytes(entry))
 
     def _transition_site(
