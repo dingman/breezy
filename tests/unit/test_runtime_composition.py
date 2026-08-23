@@ -308,7 +308,7 @@ class TestIngestRuntime:
             pass  # slot was released
 
     def test_a_construction_failure_does_not_leak_the_open_sqlite_handle(
-        self, settings: BreezyRuntimeSettings
+        self, settings: BreezyRuntimeSettings, probe: RecordingProbe
     ) -> None:
         # A network station root is refused by
         # `assert_writer_lock_filesystem_supported`, which runs INSIDE
@@ -321,6 +321,17 @@ class TestIngestRuntime:
         ):
             pytest.fail("body must never run")
 
+        assert RecordingStore.instances[-1].close_calls == 1
+
+        # Extend: prove the handle is genuinely RELEASED, not merely that
+        # `close()` was invoked once. A real SECOND `ingest_runtime` entry
+        # over the SAME `state_db_path`, through the SAME store factory,
+        # must succeed and yield a runtime that actually reads and writes
+        # through a fresh handle -- not just "does not raise".
+        with ingest_runtime(settings, probe=probe, store_factory=RecordingStore) as runtime:
+            assert isinstance(runtime.store, RecordingStore)
+            runtime.store.set("post-recovery-canary", b"ok")
+            assert runtime.store.get("post-recovery-canary") == b"ok"
         assert RecordingStore.instances[-1].close_calls == 1
 
     def test_a_construction_failure_does_not_leak_the_process_slot(
@@ -379,6 +390,109 @@ class TestIngestRuntime:
 
         with ingest_runtime(settings, clock=fixed_clock, probe=probe) as runtime:
             assert runtime.shared.clock is fixed_clock
+
+
+# ---------------------------------------------------------------------------
+# Teardown order, pinned as ONE recorded sequence
+#
+# `ingest_runtime` owns exactly two teardown steps -- `shared.dispose()` then
+# `store.close()` (`composition.py:130`, `:158`; `ExitStack` unwinds LIFO,
+# and `store.close` is registered BEFORE `shared.dispose`). Every existing
+# test above asserts each step happened in isolation (`close_calls == 1`,
+# slot released); none records the two as a single ordered sequence, so a
+# regression that silently reordered the two `stack.callback(...)` calls
+# would pass the whole suite. The node's OWN `dispose()` is a THIRD step,
+# owned by `cli._run_node`'s `finally`, which runs INSIDE this
+# contextmanager's `with` block (`cli.py:161-164`) -- see
+# `test_runtime_cli.TestTeardownOrder` for the full three-step
+# `node.dispose -> shared.dispose -> store.close` sequence pinned together.
+# ---------------------------------------------------------------------------
+
+
+class OrderRecordingStore(SqliteStateStore):
+    """A real `SqliteStateStore` that appends `"store.close"` to a shared,
+    injected `order` list at the moment `close()` actually runs.
+    """
+
+    def __init__(self, path: Path | str, *, order: list[str]) -> None:
+        super().__init__(path)
+        self._order = order
+
+    def close(self) -> None:
+        self._order.append("store.close")
+        super().close()
+
+
+class TestTeardownOrder:
+    def test_clean_exit_order_is_shared_dispose_then_store_close(
+        self,
+        settings: BreezyRuntimeSettings,
+        probe: RecordingProbe,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        order: list[str] = []
+        original_dispose = SharedIngestState.dispose
+
+        def recording_dispose(self_: SharedIngestState) -> None:
+            order.append("shared.dispose")
+            original_dispose(self_)
+
+        monkeypatch.setattr(SharedIngestState, "dispose", recording_dispose)
+
+        def factory(path: Path) -> OrderRecordingStore:
+            return OrderRecordingStore(path, order=order)
+
+        with ingest_runtime(settings, probe=probe, store_factory=factory) as runtime:
+            # Discard whatever the durability probe's SECOND, independent
+            # handle recorded during construction -- it is opened and closed
+            # entirely inside `SharedIngestState.__init__`
+            # (`assert_state_store_durable`), before this body ever runs.
+            # Only the TEARDOWN-phase calls are under test here.
+            order.clear()
+            assert isinstance(runtime.store, OrderRecordingStore)
+
+        assert order == ["shared.dispose", "store.close"]
+
+    def test_body_exception_still_tears_down_in_order_and_the_original_exception_propagates(
+        self,
+        settings: BreezyRuntimeSettings,
+        probe: RecordingProbe,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        order: list[str] = []
+        original_dispose = SharedIngestState.dispose
+
+        def recording_dispose(self_: SharedIngestState) -> None:
+            order.append("shared.dispose")
+            original_dispose(self_)
+
+        monkeypatch.setattr(SharedIngestState, "dispose", recording_dispose)
+
+        def factory(path: Path) -> OrderRecordingStore:
+            return OrderRecordingStore(path, order=order)
+
+        class Boom(Exception):
+            pass
+
+        raised = Boom("body failed mid-poll")
+
+        with (
+            pytest.raises(Boom) as excinfo,
+            ingest_runtime(settings, probe=probe, store_factory=factory),
+        ):
+            order.clear()
+            raise raised
+
+        # The ORIGINAL exception object propagates -- not a new one raised
+        # during teardown, and not merely "some Boom".
+        assert excinfo.value is raised
+        assert str(excinfo.value) == "body failed mid-poll"
+        assert order == ["shared.dispose", "store.close"]
+
+        # Both the slot and the handle were released even though the body
+        # raised: a fresh entry over the same paths succeeds.
+        with ingest_runtime(settings, probe=probe) as runtime:
+            assert isinstance(runtime.shared, SharedIngestState)
 
 
 # ---------------------------------------------------------------------------

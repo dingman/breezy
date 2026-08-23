@@ -20,6 +20,7 @@ from breezy.ingest.nws_actor import NwsIngestActor
 from breezy.ingest.shared_state import SharedIngestState
 from breezy.persistence.catalog import FilesystemLocality, FilesystemProbe
 from breezy.runtime import cli
+from breezy.runtime.sqlite_store import SqliteStateStore
 
 SITES: tuple[tuple[str, str], ...] = (("polymarket_us", "NYC"),)
 
@@ -39,10 +40,19 @@ class FakeNode:
 
     instances: ClassVar[list[FakeNode]] = []
 
-    def __init__(self, config: TradingNodeConfig, *, run_error: BaseException | None = None):
+    def __init__(
+        self,
+        config: TradingNodeConfig,
+        *,
+        run_error: BaseException | None = None,
+        order: list[str] | None = None,
+    ):
         self.config = config
         self.calls: list[str] = []
         self._run_error = run_error
+        # Optional shared sequence recorder -- see `TestTeardownOrder`. `None`
+        # by default so every other `FakeNode` caller is unaffected.
+        self._order = order
         self.trader = FakeTrader()
         FakeNode.instances.append(self)
 
@@ -56,6 +66,8 @@ class FakeNode:
 
     def dispose(self) -> None:
         self.calls.append("dispose")
+        if self._order is not None:
+            self._order.append("node.dispose")
 
 
 @pytest.fixture(autouse=True)
@@ -179,6 +191,107 @@ class TestRun:
         source = inspect.getsource(cli)
         assert "signal.signal" not in source
         assert "add_signal_handler" not in source
+
+
+class TestTeardownOrder:
+    """WI-7: the full THREE-step teardown order, as ONE recorded sequence.
+
+    `cli._run_node` disposes the node INSIDE the `with ingest_runtime(...)`
+    block (`cli.py:161-164`), so the true production order is
+    `node.dispose()` -> `shared.dispose()` -> `store.close()`: the node
+    first (`_run_node`'s own `finally`, `cli.py:129-134`), then the two
+    steps `ingest_runtime` owns on the way out (`composition.py:130,
+    :158`; `ExitStack` unwinds LIFO). `test_runtime_composition.py`'s
+    `TestTeardownOrder` pins the latter two steps in isolation; this class
+    pins all three together, exactly as production runs them.
+    """
+
+    def test_clean_exit_order_is_node_then_shared_then_store(
+        self, env: dict[str, str], monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        order: list[str] = []
+
+        original_shared_dispose = SharedIngestState.dispose
+
+        def recording_shared_dispose(self_: SharedIngestState) -> None:
+            order.append("shared.dispose")
+            original_shared_dispose(self_)
+
+        monkeypatch.setattr(SharedIngestState, "dispose", recording_shared_dispose)
+
+        original_store_close = SqliteStateStore.close
+
+        def recording_store_close(self_: SqliteStateStore) -> None:
+            order.append("store.close")
+            original_store_close(self_)
+
+        monkeypatch.setattr(SqliteStateStore, "close", recording_store_close)
+
+        def factory(config: TradingNodeConfig) -> FakeNode:
+            return FakeNode(config, order=order)
+
+        def discard_construction_noise(_shared: SharedIngestState) -> None:
+            # Discard anything recorded during construction -- e.g. the
+            # durability probe's own second store handle, opened and closed
+            # entirely inside `SharedIngestState.__init__`, before the node
+            # is even built. Only the TEARDOWN-phase calls are under test.
+            order.clear()
+
+        stderr = io.StringIO()
+        code = cli.run(
+            env=env,
+            node_factory=factory,
+            probe=local_probe,
+            stderr=stderr,
+            on_runtime=discard_construction_noise,
+        )
+
+        assert code == cli.EXIT_OK
+        assert order == ["node.dispose", "shared.dispose", "store.close"]
+
+    def test_run_raising_still_tears_down_all_three_in_order(
+        self, env: dict[str, str], monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        order: list[str] = []
+
+        original_shared_dispose = SharedIngestState.dispose
+
+        def recording_shared_dispose(self_: SharedIngestState) -> None:
+            order.append("shared.dispose")
+            original_shared_dispose(self_)
+
+        monkeypatch.setattr(SharedIngestState, "dispose", recording_shared_dispose)
+
+        original_store_close = SqliteStateStore.close
+
+        def recording_store_close(self_: SqliteStateStore) -> None:
+            order.append("store.close")
+            original_store_close(self_)
+
+        monkeypatch.setattr(SqliteStateStore, "close", recording_store_close)
+
+        def factory(config: TradingNodeConfig) -> FakeNode:
+            return FakeNode(config, order=order, run_error=RuntimeError("kaboom"))
+
+        def discard_construction_noise(_shared: SharedIngestState) -> None:
+            order.clear()
+
+        stderr = io.StringIO()
+        code = cli.run(
+            env=env,
+            node_factory=factory,
+            probe=local_probe,
+            stderr=stderr,
+            on_runtime=discard_construction_noise,
+        )
+
+        # `_run_node` catches the node's own failure and turns it into an
+        # exit code (`cli.py:126-128`) -- unlike `ingest_runtime`'s body, it
+        # never re-raises the original exception -- but disposal must still
+        # run to completion, in the documented order.
+        assert code == cli.EXIT_RUNTIME_ERROR
+        assert "kaboom" in stderr.getvalue()
+        assert order == ["node.dispose", "shared.dispose", "store.close"]
 
 
 class TestErrorReporting:
