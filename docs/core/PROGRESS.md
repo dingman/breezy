@@ -42,7 +42,20 @@ MEDIUM are fixed; the rest are tracked below.
 The two reviewers **contradicted each other** on gate fail-open behaviour.
 Resolved empirically, both were half right: per-site state fails CLOSED
 (`_derive_state` returns BLOCKED when `last_successful_poll_ns is None`),
-while the global `ua_trap_blocked` latch did not.
+while the global `ua_trap_blocked` latch did not. Both halves are now fixed:
+an in-store bootstrap sentinel covers row deletion, and an out-of-band
+witness at `<catalog_base>/.breezy-bootstrap-witness` covers deletion of the
+whole state-DB file. Verified end-to-end through `ingest_runtime`:
+
+    delete state DB only       -> BLOCKED / STATE_STORE_TAMPERED
+    delete state DB + witness  -> OPEN / SUCCESSFUL_POLL   (residual limit)
+    genuine first boot         -> OPEN / SUCCESSFUL_POLL
+
+**Residual limit, deliberately not overclaimed:** deleting BOTH the state DB
+and the witness marker is still undetectable. This raises the bar from
+"delete one file" to "delete two files in two different locations" and makes
+the realistic case -- a botched restore of just the DB -- loud. It is not a
+defence against an adversary with full filesystem write access.
 
 ---
 

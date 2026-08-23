@@ -40,6 +40,7 @@ from breezy.ingest.nws_actor import NwsIngestActor
 from breezy.ingest.shared_state import SharedIngestState
 from breezy.persistence.catalog import FilesystemProbe, probe_filesystem
 from breezy.registry.sites import SiteRegistry, default_registry, load_registry
+from breezy.runtime.bootstrap_witness import enforce_bootstrap_witness
 from breezy.runtime.node_config import actor_component_id, build_node_config
 from breezy.runtime.settings import BreezyRuntimeSettings
 from breezy.runtime.sqlite_store import SqliteStateStore
@@ -127,6 +128,14 @@ def ingest_runtime(
     with ExitStack() as stack:
         store = store_factory(settings.state_db_path)
         stack.callback(store.close)
+
+        # Out-of-band bootstrap witness: detects the whole state-DB file
+        # being deleted and recreated (a case no witness stored INSIDE that
+        # same file can survive -- see
+        # ``breezy.runtime.bootstrap_witness`` for the full rationale). Runs
+        # before anything else touches ``store`` so a tampered store is
+        # caught before the gate or the product index read it.
+        enforce_bootstrap_witness(store, catalog_base=settings.catalog_base)
 
         # The durability probe needs a SECOND, independent handle on the same
         # backing medium -- for `SqliteStateStore` a fresh connection to the

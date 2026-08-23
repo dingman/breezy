@@ -272,3 +272,195 @@ class TestGateEndToEnd:
         assert reopened_status.state is GateState.OPEN
         assert reopened_status.last_successful_poll_ns == 1_000
         reopened_store.close()
+
+
+# ---------------------------------------------------------------------------
+# Out-of-band bootstrap witness -- closes the remaining half of the
+# STATE_STORE_TAMPERED gap: WHOLE-FILE deletion of the state DB, not just a
+# single row within it.
+#
+# gate.py's own in-store `_GLOBAL_BOOTSTRAP_KEY` sentinel is explicitly
+# documented (see `tests/unit/test_ingest_gate.py`, the comment above
+# `test_a_wiped_global_row_fails_closed_instead_of_laundering_the_ua_trap`)
+# as unable to survive this: if the entire file is deleted and recreated,
+# the sentinel is gone along with everything else, and "genuinely new" and
+# "wiped" become the same observation through the store alone. Closing that
+# needs a witness that lives somewhere OTHER than the state-DB file --
+# `breezy.runtime.bootstrap_witness`.
+#
+# A real `SqliteStateStore` on a real temp path, with an ACTUAL `unlink()` of
+# every `state.sqlite3*` sibling (the main file plus WAL/SHM), is required:
+# an in-memory fake cannot model a file disappearing out from under a
+# connection.
+# ---------------------------------------------------------------------------
+
+
+def _delete_whole_state_db(path: Path) -> None:
+    """Simulate a botched restore / accidental `rm`: delete the main file
+    plus every WAL-mode sibling SQLite leaves behind.
+    """
+    for candidate in (path, Path(f"{path}-wal"), Path(f"{path}-shm")):
+        candidate.unlink(missing_ok=True)
+
+
+class TestBootstrapWitnessAgainstWholeFileDeletion:
+    def test_without_the_witness_whole_file_deletion_launders_the_ua_trap(
+        self, tmp_path: Path
+    ) -> None:
+        """RED-first reproduction (pinned permanently): absent the
+        out-of-band witness, deleting the whole state-DB file and reopening
+        it clears a latched UA-trap block after one ordinary successful
+        poll -- exactly the laundering `enforce_bootstrap_witness` exists to
+        close. This test intentionally never calls
+        `enforce_bootstrap_witness`, so it continues to document the
+        pre-fix vulnerability shape even after the fix ships.
+        """
+        path = tmp_path / "state.sqlite3"
+        sites = frozenset({(VENUE, CITY), (VENUE, OTHER_CITY)})
+
+        store = SqliteStateStore(path)
+        gate = SettlementGate(store=store, clock=lambda: 1_000, sites=sites)
+        gate.record_forbidden_403(VENUE, CITY, detail="cross-site 403 burst")
+        assert gate.status(VENUE, CITY).state is GateState.BLOCKED
+        store.close()
+
+        _delete_whole_state_db(path)
+
+        reopened_store = SqliteStateStore(path)
+        reopened_gate = SettlementGate(store=reopened_store, clock=lambda: 2_000, sites=sites)
+        status_before_poll = reopened_gate.status(VENUE, CITY)
+        assert status_before_poll.state is GateState.BLOCKED
+        assert status_before_poll.reason is GateReason.NEVER_POLLED
+
+        after_poll = reopened_gate.record_successful_poll(VENUE, CITY, detail="ordinary poll")
+        assert after_poll.state is GateState.OPEN
+        assert after_poll.reason is GateReason.SUCCESSFUL_POLL
+        reopened_store.close()
+
+    def test_the_witness_makes_whole_file_deletion_fail_closed_instead(
+        self, tmp_path: Path
+    ) -> None:
+        """The fix: run `enforce_bootstrap_witness` at every open. Deleting
+        the whole state-DB file is now detected via the out-of-band marker
+        surviving the destroyed file, and the gate BLOCKS every site under
+        STATE_STORE_TAMPERED even after a successful poll -- it never
+        reaches OPEN.
+        """
+        from breezy.runtime.bootstrap_witness import enforce_bootstrap_witness
+
+        path = tmp_path / "state.sqlite3"
+        catalog_base = tmp_path / "catalog"
+        sites = frozenset({(VENUE, CITY), (VENUE, OTHER_CITY)})
+
+        store = SqliteStateStore(path)
+        enforce_bootstrap_witness(store, catalog_base=catalog_base)
+        gate = SettlementGate(store=store, clock=lambda: 1_000, sites=sites)
+        gate.record_forbidden_403(VENUE, CITY, detail="cross-site 403 burst")
+        assert gate.status(VENUE, CITY).state is GateState.BLOCKED
+        store.close()
+
+        _delete_whole_state_db(path)
+        assert (catalog_base / ".breezy-bootstrap-witness").exists()
+
+        reopened_store = SqliteStateStore(path)
+        enforce_bootstrap_witness(reopened_store, catalog_base=catalog_base)
+        reopened_gate = SettlementGate(store=reopened_store, clock=lambda: 2_000, sites=sites)
+
+        status_before_poll = reopened_gate.status(VENUE, CITY)
+        assert status_before_poll.state is GateState.BLOCKED
+        assert status_before_poll.reason is GateReason.STATE_STORE_TAMPERED
+
+        after_poll = reopened_gate.record_successful_poll(VENUE, CITY, detail="ordinary poll")
+        assert after_poll.state is GateState.BLOCKED
+        assert after_poll.reason is GateReason.STATE_STORE_TAMPERED
+        assert after_poll.reason is not GateReason.SUCCESSFUL_POLL
+
+        # The existing, already-tested recovery path still works unchanged.
+        reopened_gate.acknowledge_ua_trap_resolved(detail="verified: restore was legitimate")
+        assert reopened_gate.status(VENUE, CITY).state is GateState.OPEN
+        reopened_store.close()
+
+    def test_genuine_first_boot_still_reaches_open(self, tmp_path: Path) -> None:
+        """The other half of the same fix: a brand-new deployment (no
+        store, no witness file) must still start permissively and reach
+        OPEN after one successful poll.
+        """
+        from breezy.runtime.bootstrap_witness import enforce_bootstrap_witness
+
+        path = tmp_path / "state.sqlite3"
+        catalog_base = tmp_path / "catalog"
+        sites = frozenset({(VENUE, CITY), (VENUE, OTHER_CITY)})
+
+        assert not path.exists()
+        assert not (catalog_base / ".breezy-bootstrap-witness").exists()
+
+        store = SqliteStateStore(path)
+        enforce_bootstrap_witness(store, catalog_base=catalog_base)
+        gate = SettlementGate(store=store, clock=lambda: 1_000, sites=sites)
+
+        assert gate.status(VENUE, CITY).state is GateState.BLOCKED
+        assert gate.status(VENUE, CITY).reason is GateReason.NEVER_POLLED
+
+        status = gate.record_successful_poll(VENUE, CITY, detail="first ever poll")
+        assert status.state is GateState.OPEN
+        assert status.reason is GateReason.SUCCESSFUL_POLL
+        store.close()
+
+    def test_reopening_an_intact_store_does_not_false_positive(self, tmp_path: Path) -> None:
+        """An ordinary restart over an INTACT store (nothing deleted) must
+        never be mistaken for tampering, regardless of how many times the
+        witness check runs.
+        """
+        from breezy.runtime.bootstrap_witness import enforce_bootstrap_witness
+
+        path = tmp_path / "state.sqlite3"
+        catalog_base = tmp_path / "catalog"
+        sites = frozenset({(VENUE, CITY), (VENUE, OTHER_CITY)})
+
+        store = SqliteStateStore(path)
+        enforce_bootstrap_witness(store, catalog_base=catalog_base)
+        gate = SettlementGate(store=store, clock=lambda: 1_000, sites=sites)
+        gate.record_successful_poll(VENUE, CITY, detail="first poll")
+        store.close()
+
+        for restart_ns in (2_000, 3_000, 4_000):
+            reopened_store = SqliteStateStore(path)
+            enforce_bootstrap_witness(reopened_store, catalog_base=catalog_base)
+            reopened_gate = SettlementGate(
+                store=reopened_store, clock=lambda restart_ns=restart_ns: restart_ns, sites=sites
+            )
+            status = reopened_gate.status(VENUE, CITY)
+            assert status.state is GateState.OPEN
+            assert status.reason is not GateReason.STATE_STORE_TAMPERED
+            reopened_store.close()
+
+    def test_missing_marker_file_alone_self_heals_without_blocking(self, tmp_path: Path) -> None:
+        """Deleting ONLY the witness marker file (the store itself intact)
+        is not, by itself, the whole-file-deletion attack this module
+        defends against -- it must self-heal, not falsely block.
+        """
+        from breezy.runtime.bootstrap_witness import enforce_bootstrap_witness
+
+        path = tmp_path / "state.sqlite3"
+        catalog_base = tmp_path / "catalog"
+        sites = frozenset({(VENUE, CITY)})
+
+        store = SqliteStateStore(path)
+        enforce_bootstrap_witness(store, catalog_base=catalog_base)
+        marker = catalog_base / ".breezy-bootstrap-witness"
+        assert marker.exists()
+        marker.unlink()
+
+        gate = SettlementGate(store=store, clock=lambda: 1_000, sites=sites)
+        status = gate.record_successful_poll(VENUE, CITY, detail="poll before re-check")
+        assert status.state is GateState.OPEN
+        store.close()
+
+        # Re-run the witness check (as a fresh process boot would): it must
+        # repair the marker rather than treat its absence as tampering.
+        reopened_store = SqliteStateStore(path)
+        enforce_bootstrap_witness(reopened_store, catalog_base=catalog_base)
+        assert marker.exists()
+        reopened_gate = SettlementGate(store=reopened_store, clock=lambda: 2_000, sites=sites)
+        assert reopened_gate.status(VENUE, CITY).state is GateState.OPEN
+        reopened_store.close()

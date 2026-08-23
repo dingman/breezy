@@ -379,3 +379,69 @@ class TestIngestRuntime:
 
         with ingest_runtime(settings, clock=fixed_clock, probe=probe) as runtime:
             assert runtime.shared.clock is fixed_clock
+
+
+# ---------------------------------------------------------------------------
+# Out-of-band bootstrap witness, exercised through the composition root
+# itself -- the empirical end-to-end probe: latch the UA trap through a real
+# `ingest_runtime`, delete the WHOLE state-DB file, reopen, and confirm the
+# gate stays BLOCKED (never re-opens on the next successful poll). See
+# `breezy.runtime.bootstrap_witness` for the mechanism.
+# ---------------------------------------------------------------------------
+
+
+class TestBootstrapWitnessThroughTheCompositionRoot:
+    def test_first_boot_stamps_the_out_of_band_witness_file(
+        self, settings: BreezyRuntimeSettings, probe: RecordingProbe
+    ) -> None:
+        from breezy.runtime.bootstrap_witness import witness_file_path
+
+        with ingest_runtime(settings, probe=probe):
+            pass
+
+        assert witness_file_path(settings.catalog_base).exists()
+
+    def test_whole_file_deletion_of_the_state_db_leaves_the_gate_blocked(
+        self, settings: BreezyRuntimeSettings, probe: RecordingProbe
+    ) -> None:
+        from breezy.ingest.gate import GateReason, GateState
+
+        venue, city = SITES[0]
+
+        with ingest_runtime(settings, probe=probe) as runtime:
+            runtime.shared.gate.record_forbidden_403(venue, city, detail="cross-site 403 burst")
+            assert runtime.shared.gate.status(venue, city).state is GateState.BLOCKED
+
+        # A botched restore / accidental `rm` of the whole DB, including its
+        # WAL-mode siblings. The out-of-band witness file (elsewhere under
+        # `catalog_base`) is untouched.
+        for suffix in ("", "-wal", "-shm"):
+            candidate = Path(f"{settings.state_db_path}{suffix}")
+            candidate.unlink(missing_ok=True)
+        assert not settings.state_db_path.exists()
+
+        with ingest_runtime(settings, probe=probe) as runtime:
+            before_poll = runtime.shared.gate.status(venue, city)
+            assert before_poll.state is GateState.BLOCKED
+            assert before_poll.reason is GateReason.STATE_STORE_TAMPERED
+
+            after_poll = runtime.shared.gate.record_successful_poll(
+                venue, city, detail="ordinary poll after the botched restore"
+            )
+            assert after_poll.state is GateState.BLOCKED
+            assert after_poll.reason is GateReason.STATE_STORE_TAMPERED
+            assert after_poll.reason is not GateReason.SUCCESSFUL_POLL
+
+    def test_genuine_first_deployment_still_reaches_open_after_a_poll(
+        self, settings: BreezyRuntimeSettings, probe: RecordingProbe
+    ) -> None:
+        from breezy.ingest.gate import GateState
+        from breezy.runtime.bootstrap_witness import witness_file_path
+
+        venue, city = SITES[0]
+        assert not settings.state_db_path.exists()
+        assert not witness_file_path(settings.catalog_base).exists()
+
+        with ingest_runtime(settings, probe=probe) as runtime:
+            status = runtime.shared.gate.record_successful_poll(venue, city, detail="first poll")
+            assert status.state is GateState.OPEN
