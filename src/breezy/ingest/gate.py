@@ -516,7 +516,10 @@ def _blocking_causes(global_entry: _GlobalEntry, entry: _SiteEntry) -> tuple[Gat
     # guard these would double-report ONE escalating watchdog as if it
     # were two independent causes. abuse_403_degraded has no BLOCKED-tier
     # counterpart, so it is never guarded.
-    if entry.transient_failure_count >= _TRANSIENT_DEGRADE_THRESHOLD and not entry.transient_blocked:
+    if (
+        entry.transient_failure_count >= _TRANSIENT_DEGRADE_THRESHOLD
+        and not entry.transient_blocked
+    ):
         causes.append(GateReason.TRANSIENT_FAILURE)
     if entry.abuse_403_degraded:
         causes.append(GateReason.ABUSE_BLOCK_403)
@@ -527,7 +530,9 @@ def _blocking_causes(global_entry: _GlobalEntry, entry: _SiteEntry) -> tuple[Gat
     return tuple(causes)
 
 
-def _log_transition(venue: str, city: str, state: GateState, reason: GateReason, detail: str) -> None:
+def _log_transition(
+    venue: str, city: str, state: GateState, reason: GateReason, detail: str
+) -> None:
     level = logging.CRITICAL if reason in _CRIT_REASONS else _LOG_LEVEL_BY_STATE[state]
     logger.log(
         level,
@@ -1060,7 +1065,9 @@ class SettlementGate:
             return self.status(venue, city)
         entry = self._load_site(venue, city)
         new_entry = replace(entry, abuse_403_degraded=True, abuse_403_last_ns=now)
-        self._transition_site(venue, city, new_entry, reason=GateReason.ABUSE_BLOCK_403, detail=detail)
+        self._transition_site(
+            venue, city, new_entry, reason=GateReason.ABUSE_BLOCK_403, detail=detail
+        )
         return self.status(venue, city)
 
     def acknowledge_ua_trap_resolved(self, *, detail: str = "") -> None:
@@ -1131,14 +1138,18 @@ class SettlementGate:
         """Malformed text / parser exception: REJECTED, BLOCK site, CRIT."""
         entry = self._load_site(venue, city)
         new_entry = replace(entry, parser_failure=True)
-        self._transition_site(venue, city, new_entry, reason=GateReason.PARSER_FAILURE, detail=detail)
+        self._transition_site(
+            venue, city, new_entry, reason=GateReason.PARSER_FAILURE, detail=detail
+        )
         return self.status(venue, city)
 
     def record_sanity_violation(self, venue: str, city: str, *, detail: str = "") -> GateStatus:
         """A physically-impossible value: REJECTED, BLOCK site, CRIT."""
         entry = self._load_site(venue, city)
         new_entry = replace(entry, sanity_violation=True)
-        self._transition_site(venue, city, new_entry, reason=GateReason.SANITY_VIOLATION, detail=detail)
+        self._transition_site(
+            venue, city, new_entry, reason=GateReason.SANITY_VIOLATION, detail=detail
+        )
         return self.status(venue, city)
 
     def record_ambiguous_headline(self, venue: str, city: str, *, detail: str = "") -> GateStatus:
@@ -1161,7 +1172,9 @@ class SettlementGate:
         )
         return self.status(venue, city)
 
-    def record_write_integrity_violation(self, venue: str, city: str, *, detail: str = "") -> GateStatus:
+    def record_write_integrity_violation(
+        self, venue: str, city: str, *, detail: str = ""
+    ) -> GateStatus:
         """A non-empty ``WriteOutcome.skipped`` from the catalog write path
         (full or partial): BLOCK site, CRIT.
 
@@ -1178,7 +1191,9 @@ class SettlementGate:
         )
         return self.status(venue, city)
 
-    def record_transport_integrity_alarm(self, venue: str, city: str, *, detail: str = "") -> GateStatus:
+    def record_transport_integrity_alarm(
+        self, venue: str, city: str, *, detail: str = ""
+    ) -> GateStatus:
         """A rejected response ``Content-Encoding`` (``ingest/http.py``'s
         ``ContentEncodingError``): BLOCK site, CRIT.
 
@@ -1223,7 +1238,9 @@ class SettlementGate:
         self._transition_site(venue, city, new_entry, reason=reason, detail=detail)
         return self.status(venue, city)
 
-    def record_cross_check_available(self, venue: str, city: str, *, detail: str = "") -> GateStatus:
+    def record_cross_check_available(
+        self, venue: str, city: str, *, detail: str = ""
+    ) -> GateStatus:
         """The advisory cross-check is reachable again: resume the site."""
         entry = self._load_site(venue, city)
         new_entry = replace(entry, cross_check_unavailable_since_ns=None, cross_check_blocked=False)
@@ -1261,7 +1278,9 @@ class SettlementGate:
         self._transition_site(venue, city, new_entry, reason=GateReason.TASK_DEATH, detail=detail)
         return self.status(venue, city)
 
-    def record_redirect_integrity_alarm(self, venue: str, city: str, *, detail: str = "") -> GateStatus:
+    def record_redirect_integrity_alarm(
+        self, venue: str, city: str, *, detail: str = ""
+    ) -> GateStatus:
         """A 3xx on a settlement endpoint: BLOCK site, CRIT.
 
         ``/products/{id}`` bodies are immutable by id -- there is no
@@ -1329,7 +1348,10 @@ class SettlementGate:
                 city,
                 new_entry,
                 reason=GateReason.CLOCK_REGRESSION,
-                detail=f"clock moved backward: now={now} last_successful_poll_ns={entry.last_successful_poll_ns}",
+                detail=(
+                    f"clock moved backward: now={now} "
+                    f"last_successful_poll_ns={entry.last_successful_poll_ns}"
+                ),
             )
             return self.status(venue, city)
 
@@ -1392,11 +1414,16 @@ class SettlementGate:
             city,
             new_entry,
             reason=GateReason.FINAL_CLI_OVERDUE,
-            detail=detail or f"final CLI overdue for climate_day={climate_day} deadline_ns={deadline_ns}",
+            detail=(
+                detail
+                or f"final CLI overdue for climate_day={climate_day} deadline_ns={deadline_ns}"
+            ),
         )
         return self.status(venue, city)
 
-    def record_final_received(self, venue: str, city: str, climate_day: str, *, detail: str = "") -> GateStatus:
+    def record_final_received(
+        self, venue: str, city: str, climate_day: str, *, detail: str = ""
+    ) -> GateStatus:
         """The final CLI for ``climate_day`` has been received: clear an
         overdue-final block for that specific climate day.
 

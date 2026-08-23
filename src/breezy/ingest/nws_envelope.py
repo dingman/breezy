@@ -213,7 +213,7 @@ def _require_str(payload: Mapping[str, Any], key: str, *, context: str) -> str:
     value = payload[key]
     if not isinstance(value, str):
         raise NwsEnvelopeFieldError(
-            f"{context}: field {key!r} must be a string, got {type(value).__name__}"
+            f"{context}: field {key!r} must be a string, was {type(value).__name__}"
         )
     if value == "":
         raise NwsEnvelopeFieldError(f"{context}: field {key!r} must not be empty")
@@ -246,7 +246,7 @@ def _optional_str(payload: Mapping[str, Any], key: str, *, context: str) -> str 
     if not isinstance(value, str):
         raise NwsEnvelopeFieldError(
             f"{context}: field {key!r} must be a string or null when present, "
-            f"got {type(value).__name__}"
+            f"was {type(value).__name__}"
         )
     return value
 
@@ -288,7 +288,7 @@ def parse_discovery_list(
     graph = payload["@graph"]
     if not isinstance(graph, list):
         raise NwsEnvelopeStructureError(
-            f"'@graph' must be a list, got {type(graph).__name__}"
+            f"'@graph' must be a list, was {type(graph).__name__}"
         )
     if len(graph) > max_items:
         raise NwsEnvelopeStructureError(
@@ -299,7 +299,7 @@ def parse_discovery_list(
     for index, item in enumerate(graph):
         if not isinstance(item, Mapping):
             raise NwsEnvelopeStructureError(
-                f"'@graph[{index}]' must be an object, got {type(item).__name__}"
+                f"'@graph[{index}]' must be an object, was {type(item).__name__}"
             )
         context = f"'@graph[{index}]'"
         product_uuid, product_code, issuing_office, wmo_collective_id, issuance_time_ns = (

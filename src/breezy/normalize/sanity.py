@@ -62,10 +62,14 @@ among them is roughly 110 F (LAX) / 109 F (Chicago Midway), so this bound
 sits ~30 F above anything these stations can physically produce, and
 still above a hypothetical new US national record.
 
-Note: `nws-cli-settlement` suggests 130 F. That figure is BELOW the
-attested US record of 134 F, i.e. it is a bound on "unusual" rather than
-on "impossible", so it is deliberately widened here. Flagged for
-reconciliation with the skill owner.
+Decision (settled): `nws-cli-settlement` suggests 130 F, but that figure
+sits BELOW the attested US/world record of 134 F -- it bounds "unusual",
+not "impossible". 140 F is kept as the deliberately wider figure: it
+stays above the all-time world record with margin, so a genuine
+once-in-a-century heat event at one of our five sites is recorded rather
+than halting trading on a false sanity violation. This reconciles the two
+layers' figures by design rather than by drift; no further reconciliation
+is pending.
 """
 
 ABSOLUTE_MIN_F = -100

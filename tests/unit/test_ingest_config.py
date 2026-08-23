@@ -100,7 +100,10 @@ def test_override_discovery_max_depth() -> None:
 
 
 def test_override_final_deadline_check_interval_seconds() -> None:
-    assert _config(final_deadline_check_interval_seconds=120).final_deadline_check_interval_seconds == 120
+    assert (
+        _config(final_deadline_check_interval_seconds=120).final_deadline_check_interval_seconds
+        == 120
+    )
 
 
 # ---------------------------------------------------------------------------

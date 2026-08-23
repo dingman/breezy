@@ -246,6 +246,40 @@ def test_non_positive_parse_timeout_raises_settings_error() -> None:
 
 
 # ---------------------------------------------------------------------------
+# Log level validation
+# ---------------------------------------------------------------------------
+
+
+def test_unrecognized_log_level_raises_settings_error() -> None:
+    with pytest.raises(SettingsError, match="BREEZY_LOG_LEVEL"):
+        load_settings(_env(BREEZY_LOG_LEVEL="VERBOSE"))
+
+
+@pytest.mark.parametrize(
+    "raw",
+    ["OFF", "TRACE", "DEBUG", "INFO", "WARNING", "ERROR"],
+)
+def test_each_nautilus_supported_log_level_is_accepted(raw: str) -> None:
+    settings = load_settings(_env(BREEZY_LOG_LEVEL=raw))
+    assert settings.log_level == raw
+
+
+def test_lowercase_log_level_is_normalized_to_uppercase() -> None:
+    settings = load_settings(_env(BREEZY_LOG_LEVEL="debug"))
+    assert settings.log_level == "DEBUG"
+
+
+def test_unsupported_python_logging_alias_raises_settings_error() -> None:
+    """`WARN`/`CRITICAL` are valid `logging` module aliases but are NOT in
+    NautilusTrader's `LogLevel` (`OFF`/`TRACE`/`DEBUG`/`INFO`/`WARNING`/
+    `ERROR`, verified against the installed `nautilus_pyo3.LogLevel`), so
+    they must fail fast here rather than reach Nautilus and fail there.
+    """
+    with pytest.raises(SettingsError, match="BREEZY_LOG_LEVEL"):
+        load_settings(_env(BREEZY_LOG_LEVEL="WARN"))
+
+
+# ---------------------------------------------------------------------------
 # Frozen / slots / immutability
 # ---------------------------------------------------------------------------
 
@@ -297,7 +331,9 @@ def test_settings_never_reads_breezy_user_agent_env_var() -> None:
     assert "BREEZY_USER_AGENT" not in env.accessed_keys
 
 
-def test_load_settings_env_parameter_is_injected_not_os_environ(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_load_settings_env_parameter_is_injected_not_os_environ(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     """Setting `BREEZY_TRADER_ID` in real `os.environ` must not leak in when
     an explicit `env` mapping is supplied -- the whole surface is testable
     without monkeypatching the real process environment.

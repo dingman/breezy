@@ -95,7 +95,9 @@ DEFAULT_RENOTIFY_AFTER_NS: Final[int] = 24 * 60 * 60 * 1_000_000_000
 #: `AlertPayload.to_dict()` key is a subset of this constant, so a future
 #: contributor cannot silently widen the payload by passing a whole
 #: snapshot (or settings) dict into `AlertSink.emit`.
-ALLOWED_ALERT_PAYLOAD_KEYS: Final[frozenset[str]] = frozenset({"severity", "event", "site", "detail"})
+ALLOWED_ALERT_PAYLOAD_KEYS: Final[frozenset[str]] = frozenset(
+    {"severity", "event", "site", "detail"}
+)
 
 #: `AlertPayload.detail` is truncated to this many characters. The threat
 #: this bounds is payload over-collection into a typo'd or compromised
@@ -307,7 +309,12 @@ class AlertPayload:
             object.__setattr__(self, "detail", self.detail[:MAX_ALERT_DETAIL_CHARS])
 
     def to_dict(self) -> dict[str, str]:
-        return {"severity": self.severity, "event": self.event, "site": self.site, "detail": self.detail}
+        return {
+            "severity": self.severity,
+            "event": self.event,
+            "site": self.site,
+            "detail": self.detail,
+        }
 
 
 class AlertSink(Protocol):
@@ -376,7 +383,7 @@ def _validate_webhook_url(url: str) -> None:
     parts = urlsplit(url)
     if parts.scheme != "https":
         raise ValueError(
-            f"{ALERT_WEBHOOK_URL_ENV_VAR} must use https (got scheme={parts.scheme!r})"
+            f"{ALERT_WEBHOOK_URL_ENV_VAR} must use https (found scheme={parts.scheme!r})"
         )
     if parts.username is not None or parts.password is not None:
         raise ValueError(f"{ALERT_WEBHOOK_URL_ENV_VAR} must not carry userinfo credentials")
@@ -402,7 +409,9 @@ class WebhookAlertSink:
     catch in tests.
     """
 
-    def __init__(self, url: str, *, timeout_s: float = 5.0, client: httpx.Client | None = None) -> None:
+    def __init__(
+        self, url: str, *, timeout_s: float = 5.0, client: httpx.Client | None = None
+    ) -> None:
         _validate_webhook_url(url)
         self._url = url
         self._client = client if client is not None else _build_webhook_client(timeout_s)
@@ -523,7 +532,9 @@ class AlertState:
         self._active: dict[AlertConditionKey, bool] = {}
         self._last_emitted_ns: dict[AlertConditionKey, int] = {}
 
-    def evaluate(self, conditions: Sequence[AlertCondition], *, now_ns: int) -> tuple[AlertPayload, ...]:
+    def evaluate(
+        self, conditions: Sequence[AlertCondition], *, now_ns: int
+    ) -> tuple[AlertPayload, ...]:
         """Return the `AlertPayload`s that should fire THIS cycle, updating
         internal transition/re-notify state for every condition passed in.
 
@@ -553,7 +564,9 @@ class AlertState:
                 self._last_emitted_ns[condition.key] = now_ns
         return tuple(emitted)
 
-    def dispatch(self, sink: AlertSink, conditions: Sequence[AlertCondition], *, now_ns: int) -> int:
+    def dispatch(
+        self, sink: AlertSink, conditions: Sequence[AlertCondition], *, now_ns: int
+    ) -> int:
         """`evaluate(...)`, then `emit_alert(sink, payload)` for each
         result. Returns the count of payloads this cycle decided to emit
         -- i.e. `HealthSnapshot.alerts_emitted_this_cycle` -- regardless of

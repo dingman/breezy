@@ -44,6 +44,12 @@ _DEFAULT_TRADER_ID = "BREEZY-001"
 _DEFAULT_POLL_INTERVAL_SECONDS = 300
 _DEFAULT_PARSE_TIMEOUT_MS = 250
 _DEFAULT_LOG_LEVEL = "INFO"
+
+#: NautilusTrader's genuine accepted set, verified against the installed
+#: package (`nautilus_trader.core.nautilus_pyo3.LogLevel`), not the stdlib
+#: `logging` module's level names -- `WARN`/`CRITICAL` are `logging`
+#: aliases NOT present on Nautilus's `LogLevel` and must be rejected here.
+_SUPPORTED_LOG_LEVELS = frozenset({"OFF", "TRACE", "DEBUG", "INFO", "WARNING", "ERROR"})
 _STATE_DB_RELATIVE_PATH = Path("state") / "breezy-state.sqlite3"
 
 
@@ -121,10 +127,21 @@ def _parse_positive_int(env: Mapping[str, str], var: str, default: int) -> int:
     try:
         value = int(raw)
     except ValueError as exc:
-        raise SettingsError(f"{var} must be an integer, got {raw!r}") from exc
+        raise SettingsError(f"{var} must be an integer, was {raw!r}") from exc
     if value <= 0:
-        raise SettingsError(f"{var} must be a positive integer, got {raw!r}")
+        raise SettingsError(f"{var} must be a positive integer, was {raw!r}")
     return value
+
+
+def _parse_log_level(env: Mapping[str, str]) -> str:
+    raw = env.get(_LOG_LEVEL_VAR, _DEFAULT_LOG_LEVEL)
+    normalized = raw.upper()
+    if normalized not in _SUPPORTED_LOG_LEVELS:
+        raise SettingsError(
+            f"{_LOG_LEVEL_VAR} must be one of "
+            f"{sorted(_SUPPORTED_LOG_LEVELS)} (NautilusTrader's LogLevel), was {raw!r}"
+        )
+    return normalized
 
 
 def _parse_check_proxy_env(env: Mapping[str, str]) -> bool:
@@ -157,7 +174,7 @@ def load_settings(env: Mapping[str, str] | None = None) -> BreezyRuntimeSettings
     parse_timeout_ms = _parse_positive_int(
         active_env, _PARSE_TIMEOUT_VAR, _DEFAULT_PARSE_TIMEOUT_MS
     )
-    log_level = active_env.get(_LOG_LEVEL_VAR, _DEFAULT_LOG_LEVEL)
+    log_level = _parse_log_level(active_env)
     check_proxy_env = _parse_check_proxy_env(active_env)
 
     registry_path_raw = active_env.get(_REGISTRY_PATH_VAR)

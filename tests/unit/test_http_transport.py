@@ -300,7 +300,13 @@ async def test_user_agent_honours_env_override(monkeypatch: pytest.MonkeyPatch) 
 
 
 def test_proxy_env_vars_trigger_startup_assertion(monkeypatch: pytest.MonkeyPatch) -> None:
-    for var in ("HTTP_PROXY", "HTTPS_PROXY", "SSL_CERT_FILE", "REQUESTS_CA_BUNDLE", "SSLKEYLOGFILE"):
+    for var in (
+        "HTTP_PROXY",
+        "HTTPS_PROXY",
+        "SSL_CERT_FILE",
+        "REQUESTS_CA_BUNDLE",
+        "SSLKEYLOGFILE",
+    ):
         monkeypatch.delenv(var, raising=False)
 
     # Clean environment: no assertion.
@@ -361,7 +367,9 @@ async def test_content_encoding_header_is_rejected() -> None:
     # never depend on whether the payload happens to decode cleanly.
     valid_gzip_body = gzip.compress(b"this would decode fine, and that is the point")
     respx.get(URL).mock(
-        return_value=httpx.Response(200, headers={"Content-Encoding": "gzip"}, content=valid_gzip_body)
+        return_value=httpx.Response(
+            200, headers={"Content-Encoding": "gzip"}, content=valid_gzip_body
+        )
     )
     transport = make_transport()
     with pytest.raises(ContentEncodingError):
@@ -402,7 +410,13 @@ async def test_proxy_env_set_after_construction_is_caught_on_fetch(
     var set afterwards (compromised dependency, subprocess, bad deploy) must
     still be caught on the next fetch, not silently honoured until restart.
     """
-    for var in ("HTTP_PROXY", "HTTPS_PROXY", "SSL_CERT_FILE", "REQUESTS_CA_BUNDLE", "SSLKEYLOGFILE"):
+    for var in (
+        "HTTP_PROXY",
+        "HTTPS_PROXY",
+        "SSL_CERT_FILE",
+        "REQUESTS_CA_BUNDLE",
+        "SSLKEYLOGFILE",
+    ):
         monkeypatch.delenv(var, raising=False)
 
     transport = make_transport(check_proxy_env=True)
@@ -678,7 +692,9 @@ async def test_if_modified_since_is_sent_when_supplied() -> None:
     respx.get(URL).mock(return_value=httpx.Response(200, content=b"ok"))
     transport = make_transport()
 
-    await transport.fetch_discovery_list(CLI_LOCATION, if_modified_since="Sat, 22 Aug 2026 06:26:00 GMT")
+    await transport.fetch_discovery_list(
+        CLI_LOCATION, if_modified_since="Sat, 22 Aug 2026 06:26:00 GMT"
+    )
 
     sent = respx.calls.last.request
     assert sent.headers["If-Modified-Since"] == "Sat, 22 Aug 2026 06:26:00 GMT"
@@ -734,7 +750,9 @@ async def test_the_304_path_is_reachable_end_to_end() -> None:
     assert first.retrieved_at_ns == FIXED_NS
 
     respx.get(URL).mock(return_value=httpx.Response(304, headers={"ETag": etag}))
-    second = await transport.fetch_discovery_list(CLI_LOCATION, if_none_match=first.headers.get("etag"))
+    second = await transport.fetch_discovery_list(
+        CLI_LOCATION, if_none_match=first.headers.get("etag")
+    )
 
     assert respx.calls.last.request.headers["If-None-Match"] == etag
     assert second.status_code == 304
@@ -826,7 +844,9 @@ async def test_the_validator_rejection_names_the_header_not_the_value() -> None:
     transport = make_transport()
 
     with pytest.raises(InvalidCacheValidatorError) as excinfo:
-        await transport.fetch_discovery_list(CLI_LOCATION, if_none_match='"secret-etag"\r\nX-Injected: 1')
+        await transport.fetch_discovery_list(
+            CLI_LOCATION, if_none_match='"secret-etag"\r\nX-Injected: 1'
+        )
 
     assert "If-None-Match" in str(excinfo.value)
     assert "secret-etag" not in str(excinfo.value)
@@ -996,7 +1016,9 @@ async def test_the_discovery_list_reaches_a_genuine_304_with_a_validator() -> No
     assert first.headers.get("etag") == etag
 
     respx.get(URL).mock(return_value=httpx.Response(304, headers={"ETag": etag}))
-    second = await transport.fetch_discovery_list(CLI_LOCATION, if_none_match=first.headers.get("etag"))
+    second = await transport.fetch_discovery_list(
+        CLI_LOCATION, if_none_match=first.headers.get("etag")
+    )
 
     assert respx.calls.last.request.headers["If-None-Match"] == etag
     assert second.status_code == 304
@@ -1043,7 +1065,9 @@ async def test_the_product_fetch_keeps_every_transport_guard() -> None:
         await transport.fetch_product(PRODUCT_ID)
 
     respx.get(PRODUCT_URL).mock(
-        return_value=httpx.Response(200, headers={"Content-Encoding": "gzip"}, content=gzip.compress(b"ok"))
+        return_value=httpx.Response(
+            200, headers={"Content-Encoding": "gzip"}, content=gzip.compress(b"ok")
+        )
     )
     with pytest.raises(ContentEncodingError):
         await transport.fetch_product(PRODUCT_ID)
@@ -1063,7 +1087,13 @@ async def test_the_product_fetch_rechecks_the_proxy_env_on_every_call(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """The non-TOCTOU proxy guard applies to both entry points."""
-    for var in ("HTTP_PROXY", "HTTPS_PROXY", "SSL_CERT_FILE", "REQUESTS_CA_BUNDLE", "SSLKEYLOGFILE"):
+    for var in (
+        "HTTP_PROXY",
+        "HTTPS_PROXY",
+        "SSL_CERT_FILE",
+        "REQUESTS_CA_BUNDLE",
+        "SSLKEYLOGFILE",
+    ):
         monkeypatch.delenv(var, raising=False)
 
     transport = make_transport(check_proxy_env=True)

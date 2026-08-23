@@ -915,7 +915,9 @@ def _fingerprint_counts(
     start = min(record.ts_init for record in group)
     end = max(record.ts_init for record in group)
 
-    return Counter(_fingerprint(record) for record in _read(catalog, data_cls, start=start, end=end))
+    return Counter(
+        _fingerprint(record) for record in _read(catalog, data_cls, start=start, end=end)
+    )
 
 
 def _read[RecordT: Data](

@@ -267,7 +267,9 @@ def test_write_snapshot_atomic_creates_parent_directory(tmp_path: Path) -> None:
 
 
 def test_alert_payload_keys_are_within_the_allowlist() -> None:
-    payload = AlertPayload(severity="WARN", event="site_blocked", site="polymarket_us/NYC", detail="x")
+    payload = AlertPayload(
+        severity="WARN", event="site_blocked", site="polymarket_us/NYC", detail="x"
+    )
 
     assert set(payload.to_dict()) <= ALLOWED_ALERT_PAYLOAD_KEYS
     assert set(payload.to_dict()) == ALLOWED_ALERT_PAYLOAD_KEYS
@@ -386,7 +388,9 @@ def test_webhook_alert_sink_rejects_url_with_no_hostname() -> None:
 def test_webhook_alert_sink_posts_allowlisted_payload() -> None:
     route = respx.post(_WEBHOOK_URL).mock(return_value=httpx.Response(200))
     sink = WebhookAlertSink(_WEBHOOK_URL)
-    payload = AlertPayload(severity="WARN", event="site_blocked", site="polymarket_us/NYC", detail="d")
+    payload = AlertPayload(
+        severity="WARN", event="site_blocked", site="polymarket_us/NYC", detail="d"
+    )
 
     sink.emit(payload)
 
@@ -523,7 +527,8 @@ def test_clearing_then_re_firing_produces_a_second_alert() -> None:
 
 
 def test_renotify_muted_condition_fires_on_transition_but_never_again() -> None:
-    state = AlertState(renotify_after_ns=1)  # near-zero window: would re-fire immediately if not muted
+    # near-zero window: would re-fire immediately if not muted
+    state = AlertState(renotify_after_ns=1)
 
     first = state.evaluate([_condition(active=True, renotify_muted=True)], now_ns=_START_NS)
     still_active_later = state.evaluate(

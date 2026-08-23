@@ -386,7 +386,9 @@ CORRUPT_PAYLOADS: list[tuple[str, bytes]] = [
 ]
 
 
-@pytest.mark.parametrize("label,raw", CORRUPT_PAYLOADS, ids=[label for label, _ in CORRUPT_PAYLOADS])
+@pytest.mark.parametrize(
+    "label,raw", CORRUPT_PAYLOADS, ids=[label for label, _ in CORRUPT_PAYLOADS]
+)
 def test_corrupt_persisted_entry_never_reads_as_first_seen(label: str, raw: bytes) -> None:
     store = _FakeStore()
     store.data[_index_key(UUID_A)] = raw

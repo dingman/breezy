@@ -29,13 +29,13 @@ as a classmethod and `encode_record_batch_py(items)` on instances
 outright that "Custom data is always Rust-defined"). Our class implements neither,
 so it is refused at three separate points before any byte is written:
 
-===============================================  ===========  ==============================================
+===============================================  ===========  ======================================
 call                                             raises       message (substring pinned below)
-===============================================  ===========  ==============================================
+===============================================  ===========  ======================================
 `register_custom_data_class(NwsClimateDay)`      `TypeError`  "must have decode_record_batch_py"
 `write_custom_data([record])`                    `TypeError`  "requires CustomData wrappers"
 `write_custom_data([pyo3.CustomData(..)])`       `OSError`    "is not registered for Arrow encoding"
-===============================================  ===========  ==============================================
+===============================================  ===========  ======================================
 
 The Cython `nautilus_trader.model.data.CustomData` wrapper is rejected by the same
 `TypeError` as a bare record -- only the pyo3 `CustomData` is accepted as a

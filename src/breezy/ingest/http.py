@@ -277,7 +277,9 @@ def redact_url(url: str) -> str:
         netloc = f"{netloc}:{parts.port}"
     if not parts.query:
         return urlunsplit((parts.scheme, netloc, parts.path, "", parts.fragment))
-    redacted_pairs = [(key, "REDACTED") for key, _ in parse_qsl(parts.query, keep_blank_values=True)]
+    redacted_pairs = [
+        (key, "REDACTED") for key, _ in parse_qsl(parts.query, keep_blank_values=True)
+    ]
     redacted_query = urlencode(redacted_pairs)
     return urlunsplit((parts.scheme, netloc, parts.path, redacted_query, parts.fragment))
 
@@ -315,7 +317,9 @@ def _validated_cache_validator(value: str, header: str) -> str:
     return value
 
 
-def _validated_path_identifier(value: str, *, name: str, shape: str, pattern: re.Pattern[str]) -> str:
+def _validated_path_identifier(
+    value: str, *, name: str, shape: str, pattern: re.Pattern[str]
+) -> str:
     """Return `value` percent-encoded for use as ONE path segment, else raise.
 
     Both identifiers this module accepts are untrusted. `cli_location` comes

@@ -1,6 +1,9 @@
 """Breezy -- a weather-prediction trading bot built natively on NautilusTrader."""
 
 
+__all__ = ["main"]
+
+
 def main() -> int:
     """The `breezy` console-script entrypoint (see `pyproject.toml`).
 

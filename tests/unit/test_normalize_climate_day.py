@@ -65,9 +65,13 @@ def test_climate_day_uses_local_standard_time_year_round(std_utc_offset_hours: f
             just_before = datetime.combine(probe_date, datetime.min.time(), tzinfo=UTC) + (
                 boundary_utc - timedelta(seconds=1)
             )
-            just_after = datetime.combine(probe_date, datetime.min.time(), tzinfo=UTC) + boundary_utc
+            just_after = (
+                datetime.combine(probe_date, datetime.min.time(), tzinfo=UTC) + boundary_utc
+            )
 
-            assert climate_day_for_instant(just_before, std_utc_offset_hours) == probe_date - timedelta(days=1)
+            assert climate_day_for_instant(
+                just_before, std_utc_offset_hours
+            ) == probe_date - timedelta(days=1)
             assert climate_day_for_instant(just_after, std_utc_offset_hours) == probe_date
 
 

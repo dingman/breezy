@@ -44,6 +44,11 @@ target-version = "py313"
 # Vendored upstream NautilusTrader docs — reference material, not our code.
 extend-exclude = ["docs/reference/nautilus"]
 
+[tool.ruff.lint]
+# Isort ordering is enforced by default; E501 must be opted in explicitly
+# because Ruff excludes it even under a broad select (formatter-adjacent rule).
+extend-select = ["E501"]
+
 [tool.mypy]
 python_version = "3.13"
 strict = true

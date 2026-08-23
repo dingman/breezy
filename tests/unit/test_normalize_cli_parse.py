@@ -59,7 +59,10 @@ def test_parse_real_final_fixture_matches_expected() -> None:
         _load("nyc_final_2026-08-21"), cli_location="NYC", body_header_regex=NYC_HEADER_REGEX
     )
 
-    assert result.station_header_line == "...THE CENTRAL PARK NY CLIMATE SUMMARY FOR AUGUST 21 2026..."
+    assert (
+        result.station_header_line
+        == "...THE CENTRAL PARK NY CLIMATE SUMMARY FOR AUGUST 21 2026..."
+    )
     assert result.tmax == TemperatureReadingF(value_f=79, sentinel="NONE")
     assert result.tmin == TemperatureReadingF(value_f=63, sentinel="NONE")
     assert result.tavg == TemperatureReadingF(value_f=71, sentinel="NONE")

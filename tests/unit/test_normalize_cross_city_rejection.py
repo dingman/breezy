@@ -23,7 +23,9 @@ import pytest
 from breezy.normalize.cli_parse import parse_cli_product
 
 FIXTURES_DIR = Path(__file__).resolve().parent.parent / "fixtures" / "nws"
-SITES_TOML = Path(__file__).resolve().parent.parent.parent / "src" / "breezy" / "registry" / "sites.toml"
+SITES_TOML = (
+    Path(__file__).resolve().parent.parent.parent / "src" / "breezy" / "registry" / "sites.toml"
+)
 
 CITY_FIXTURE_DIRS = {
     "NYC": "nyc_final_2026-08-21",

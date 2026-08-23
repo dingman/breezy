@@ -293,7 +293,9 @@ def test_restart_with_persisted_store_restores_ua_trap_global_block() -> None:
 def test_ua_trap_block_can_be_manually_cleared() -> None:
     gate, _, _ = _gate()
     gate.record_successful_poll(VENUE, CITY)
-    gate.record_forbidden_403(VENUE, CITY, detail="mid-session onset", cross_site_burst_detected=True)
+    gate.record_forbidden_403(
+        VENUE, CITY, detail="mid-session onset", cross_site_burst_detected=True
+    )
     gate.acknowledge_ua_trap_resolved(detail="UA fixed and redeployed")
     assert gate.status(VENUE, CITY).state is GateState.OPEN
 
@@ -1148,13 +1150,22 @@ def test_freshness_watchdog_full_escalation_sequence() -> None:
     gate.record_successful_poll(VENUE, CITY)
 
     clock.advance(500)
-    assert gate.check_freshness(VENUE, CITY, degraded_after_ns=1_000, blocked_after_ns=2_000).state is GateState.OPEN
+    assert (
+        gate.check_freshness(VENUE, CITY, degraded_after_ns=1_000, blocked_after_ns=2_000).state
+        is GateState.OPEN
+    )
 
     clock.advance(600)  # total 1_100
-    assert gate.check_freshness(VENUE, CITY, degraded_after_ns=1_000, blocked_after_ns=2_000).state is GateState.DEGRADED
+    assert (
+        gate.check_freshness(VENUE, CITY, degraded_after_ns=1_000, blocked_after_ns=2_000).state
+        is GateState.DEGRADED
+    )
 
     clock.advance(1_000)  # total 2_100
-    assert gate.check_freshness(VENUE, CITY, degraded_after_ns=1_000, blocked_after_ns=2_000).state is GateState.BLOCKED
+    assert (
+        gate.check_freshness(VENUE, CITY, degraded_after_ns=1_000, blocked_after_ns=2_000).state
+        is GateState.BLOCKED
+    )
 
 
 def test_freshness_watchdog_recovers_when_fresh_poll_lands() -> None:
@@ -1176,7 +1187,9 @@ def test_freshness_watchdog_is_a_noop_when_never_polled() -> None:
     assert status.reason is GateReason.NEVER_POLLED
 
 
-def test_freshness_watchdog_clears_stale_flags_once_fresh_again_without_explicit_poll_call() -> None:
+def test_freshness_watchdog_clears_stale_flags_once_fresh_again_without_explicit_poll_call() -> (
+    None
+):
     """Re-checking freshness after a poll already cleared staleness must not
     re-flag it, and must not emit a spurious transition when nothing changed.
     """
@@ -1415,7 +1428,9 @@ def test_blocking_causes_orders_most_severe_first() -> None:
     causes = gate.blocking_causes(VENUE, CITY)
     assert GateReason.ACIS_DISAGREEMENT in causes
     assert GateReason.CROSS_CHECK_UNAVAILABLE in causes
-    assert causes.index(GateReason.ACIS_DISAGREEMENT) < causes.index(GateReason.CROSS_CHECK_UNAVAILABLE)
+    assert causes.index(GateReason.ACIS_DISAGREEMENT) < causes.index(
+        GateReason.CROSS_CHECK_UNAVAILABLE
+    )
 
 
 def test_blocking_causes_includes_global_ua_trap_reason() -> None:
@@ -1456,7 +1471,9 @@ def test_blocking_causes_never_writes_to_the_store() -> None:
     seed_gate.record_successful_poll(VENUE, CITY)
     seed_gate.record_parser_failure(VENUE, CITY, detail="x")
 
-    readonly_gate = SettlementGate(store=_NoSetStore(seed_store), clock=_FakeClock(), sites=_DEFAULT_TEST_SITES)
+    readonly_gate = SettlementGate(
+        store=_NoSetStore(seed_store), clock=_FakeClock(), sites=_DEFAULT_TEST_SITES
+    )
     causes = readonly_gate.blocking_causes(VENUE, CITY)  # must not raise
     assert GateReason.PARSER_FAILURE in causes
 
@@ -1685,9 +1702,7 @@ def test_corrupt_persisted_site_bytes_logged_at_critical(caplog: pytest.LogCaptu
     assert any(record.levelno == logging.CRITICAL for record in caplog.records)
 
 
-def test_corrupt_persisted_site_bytes_require_open_raises_gate_blocked_error_not_a_decode_error() -> (
-    None
-):
+def test_corrupt_persisted_site_bytes_raises_gate_blocked_error_not_a_decode_error() -> None:
     """Every other blocked path funnels through GateBlockedError -- the type
     the Actor catches around require_open(). Corrupt bytes must stay inside
     that same contract rather than crashing the caller with a raw
@@ -2022,8 +2037,10 @@ def test_global_ua_trap_block_is_visible_across_sibling_gate_instances() -> None
     """
     store = InMemoryStateStore()
     clock = _FakeClock()
-    gate_a = SettlementGate(store=store, clock=clock, sites=_DEFAULT_TEST_SITES)  # Actor A's own instance
-    gate_b = SettlementGate(store=store, clock=clock, sites=_DEFAULT_TEST_SITES)  # Actor B's own instance
+    # Actor A's own instance
+    gate_a = SettlementGate(store=store, clock=clock, sites=_DEFAULT_TEST_SITES)
+    # Actor B's own instance
+    gate_b = SettlementGate(store=store, clock=clock, sites=_DEFAULT_TEST_SITES)
 
     gate_a.record_successful_poll(VENUE, "MIA")
     gate_b.record_successful_poll(VENUE, OTHER_CITY)

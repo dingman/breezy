@@ -75,11 +75,11 @@ independent AWIPS-PIL-equals-`CLI{cli_location}` check plus the per-city
 **Action:** before any METAR/ACIS path lands, either consume these lists or
 place a `TODO(Phase 2)` at the station-selection call site.
 
-### [LOW] `ABSOLUTE_MAX_F` widened 130 -> 140 F, unreconciled
-`src/breezy/normalize/sanity.py:65-68`. The docstring itself flags this as
-pending reconciliation with the `nws-cli-settlement` skill. The wider bound is
-the more defensible one (above the all-time world record, so a real heat event
-does not halt trading), but close the loop before Phase 2.
+### [RESOLVED] `ABSOLUTE_MAX_F` widened 130 -> 140 F, reconciled
+`src/breezy/normalize/sanity.py:65-68`. Kept at 140 F -- above the all-time
+world record, so a genuine heat event does not halt trading -- and the
+docstring now states the decision and rationale as settled rather than
+pending. No numeric or behavioral change.
 
 ### [MEDIUM] Unbounded whole-catalog reads per lookup
 `src/breezy/persistence/catalog.py:693` and every `read_climate_days` /
@@ -89,9 +89,12 @@ a full scan per poll per site and grows linearly with retention.
 
 **Action:** add a catalog row-count metric/alert rather than a code change now.
 
-### [LOW] `BREEZY_LOG_LEVEL` unvalidated at load time
-`src/breezy/runtime/settings.py:160` passes the value straight through, unlike
-every other setting in that module, which fails fast.
+### [RESOLVED] `BREEZY_LOG_LEVEL` unvalidated at load time
+`src/breezy/runtime/settings.py` now fails fast via `SettingsError`, matching
+every other setting in that module. Validated against NautilusTrader's actual
+`LogLevel` set (verified against the installed `nautilus_pyo3.LogLevel`:
+`OFF`/`TRACE`/`DEBUG`/`INFO`/`WARNING`/`ERROR`), not the stdlib `logging`
+module's aliases (`WARN`/`CRITICAL` are rejected).
 
 ### Import-linter contracts are still absent
 `import-linter` is declared as a dependency but **no contracts are configured**,

@@ -488,7 +488,7 @@ def parse_cli_product(
             "registry's `SettlementSite.body_header_regex` itself, not its "
             "`.pattern` source string). Re-compiling the source discards the "
             "flags it was compiled with -- the registry uses re.MULTILINE -- "
-            f"and that discard is silent; got {type(body_header_regex).__name__}"
+            f"and that discard is silent; was {type(body_header_regex).__name__}"
         )
 
     header = check_structural_allowlist(product_text, cli_location=cli_location)
