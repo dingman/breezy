@@ -55,6 +55,8 @@ from breezy.persistence.catalog import (
 )
 from breezy.registry.sites import RegistryError
 from breezy.runtime.composition import BreezyIngestRuntime, build_ingest_node, ingest_runtime
+from breezy.runtime.logging_bridge import install as install_logging_bridge
+from breezy.runtime.logging_bridge import uninstall as uninstall_logging_bridge
 from breezy.runtime.node_config import NodeConfigError
 from breezy.runtime.settings import SettingsError, load_settings
 
@@ -148,26 +150,36 @@ def run(
     -- including every failure path -- is exercisable without an event loop,
     a real filesystem probe, or the real process environment. ``on_runtime``
     is a composition-time observation hook; it takes part in no control flow.
+
+    The stdlib-to-Nautilus logging bridge (``breezy.runtime.logging_bridge``)
+    is installed first, before ``load_settings``, so every log record from
+    here on -- composition-time and runtime alike -- is forwarded to the
+    Nautilus log stream an operator actually reads. It is uninstalled on
+    every exit path via ``finally``, leaving no process-wide logging state
+    behind.
     """
     out = sys.stderr if stderr is None else stderr
-
+    install_logging_bridge()
     try:
-        settings = load_settings(env)
-    except SettingsError as exc:
-        _report(out, "configuration error", exc, expected=True)
-        return EXIT_CONFIG_ERROR
+        try:
+            settings = load_settings(env)
+        except SettingsError as exc:
+            _report(out, "configuration error", exc, expected=True)
+            return EXIT_CONFIG_ERROR
 
-    try:
-        with ingest_runtime(settings, probe=probe) as runtime:
-            if on_runtime is not None:
-                on_runtime(runtime.shared)
-            return _run_node(runtime, node_factory, out)
-    except _CONFIG_ERRORS as exc:
-        _report(out, "configuration error", exc, expected=True)
-        return EXIT_CONFIG_ERROR
-    except Exception as exc:  # noqa: BLE001 - the process exit contract lives here
-        _report(out, "failed to start", exc, expected=False)
-        return EXIT_RUNTIME_ERROR
+        try:
+            with ingest_runtime(settings, probe=probe) as runtime:
+                if on_runtime is not None:
+                    on_runtime(runtime.shared)
+                return _run_node(runtime, node_factory, out)
+        except _CONFIG_ERRORS as exc:
+            _report(out, "configuration error", exc, expected=True)
+            return EXIT_CONFIG_ERROR
+        except Exception as exc:  # noqa: BLE001 - the process exit contract lives here
+            _report(out, "failed to start", exc, expected=False)
+            return EXIT_RUNTIME_ERROR
+    finally:
+        uninstall_logging_bridge()
 
 
 def main() -> int:
