@@ -130,7 +130,7 @@ from dataclasses import dataclass, replace
 from datetime import timedelta
 from functools import lru_cache
 from pathlib import Path
-from typing import Any, Final
+from typing import TYPE_CHECKING, Any, Final
 from zoneinfo import ZoneInfo
 
 from nautilus_trader.common.actor import Actor
@@ -140,8 +140,9 @@ from nautilus_trader.persistence.catalog import ParquetDataCatalog
 
 from breezy.domain.nws_climate_day import NwsClimateDay
 from breezy.domain.nws_raw_product import NwsRawProduct
+from breezy.ingest import gaps
 from breezy.ingest.config import NwsIngestActorConfig
-from breezy.ingest.gate import GateReason, SettlementGate, StateStore
+from breezy.ingest.gate import GateReason, GateState, GateStatus, SettlementGate, StateStore
 from breezy.ingest.http import FetchResult, TransportError
 from breezy.ingest.nws_envelope import (
     DiscoveryEntry,
@@ -179,7 +180,6 @@ from breezy.normalize.cli_parse import (
     check_structural_allowlist,
     parse_cli_product,
 )
-from breezy.normalize.climate_day import standard_time_zone
 from breezy.normalize.sanity import CliSanityError
 from breezy.persistence.catalog import (
     WriteOutcome,
@@ -188,6 +188,15 @@ from breezy.persistence.catalog import (
     read_raw_products,
     write_records,
 )
+
+if TYPE_CHECKING:  # pragma: no cover - typing only; see `_health` for the cycle.
+    from breezy.runtime.health import (
+        AlertCondition,
+        AlertSink,
+        AlertState,
+        GapSummary,
+        HealthSnapshot,
+    )
 
 __all__ = [
     "CURSOR_KEY_PREFIX",
@@ -199,6 +208,29 @@ __all__ = [
 ]
 
 logger = logging.getLogger(__name__)
+
+
+def _health() -> Any:
+    """Import :mod:`breezy.runtime.health` at CALL time, not import time.
+
+    ``breezy/runtime/__init__.py`` imports ``breezy.runtime.composition``,
+    which imports ``NwsIngestActor`` from this module -- so a module-scope
+    ``from breezy.runtime.health import ...`` here is a genuine circular
+    import, and not a latent one: it was executed and it fails outright with
+    *"cannot import name 'NwsIngestActor' from partially initialized module"*
+    whenever this module is imported before ``breezy.runtime``.
+
+    Deferring to call time is the same fix :meth:`NwsIngestActor._have_final_for`
+    already applies to ``read_climate_day_as_of_settlement``, and it costs one
+    ``sys.modules`` hit per poll. The dependency direction stays correct on
+    paper too: ``health`` imports neither ``breezy.ingest`` nor anything else
+    from ``breezy`` -- it takes plain ``str``/``int``/``bool`` and its own
+    ``GapSummary`` -- so this is a wiring edge, never a layering inversion.
+    """
+    from breezy.runtime import health
+
+    return health
+
 
 #: Provenance of the code that produced a `ParsedCliProduct`. Stored on every
 #: settlement record so a later parser change is attributable.
@@ -214,6 +246,13 @@ VALIDATORS_KEY_PREFIX: Final[str] = "breezy:nws:validators:"
 #: watchdogs without a second knob to keep in sync.
 STALENESS_DEGRADE_INTERVALS: Final[int] = 4
 STALENESS_BLOCK_INTERVALS: Final[int] = 12
+
+#: A site continuously BLOCKED for this many poll intervals raises the
+#: `SiteBlocked` alert. Same reasoning as the two multipliers above -- derived
+#: from the ONE cadence the site actually has, so there is no second knob to
+#: keep in sync, and a five-minute site and an hourly site get proportionate
+#: patience without either being configured separately.
+SITE_BLOCKED_ALERT_INTERVALS: Final[int] = 4
 
 #: The Actor owns the retry window; the gate only records its outcome
 #: (`record_transient_failure(final_window_elapsed=...)`, mirroring the
@@ -379,6 +418,28 @@ class NwsIngestActor(Actor):
         )
         self.parse_cli_product: Callable[..., ParsedCliProduct] = parse_cli_product
         self.classify_issuance: Callable[[str], str] = classify_issuance
+
+        # -- WI-10/WI-12 observability seams (see `reconcile_and_report`).
+        #
+        # Attributes rather than constructor parameters, matching the three
+        # seams above: the Actor is built by `runtime.composition` from a
+        # msgspec-serialisable `ActorConfig`, which cannot carry a `Path` or a
+        # live `AlertSink`, so the wiring layer sets these after construction.
+        #: Where to write the per-cycle `HealthSnapshot`. `None` (the default)
+        #: writes no file at all -- an unconfigured deployment must not start
+        #: dropping artifacts in the working directory.
+        self.health_snapshot_path: Path | None = None
+        #: The process-wide `AlertSink`. `None` resolves `LoggingAlertSink`
+        #: (or `WebhookAlertSink`, iff `BREEZY_ALERT_WEBHOOK_URL` is set) on
+        #: first use and caches it -- so no `httpx.Client` and no TLS context
+        #: is ever built for a deployment that configured no webhook.
+        self.alert_sink: AlertSink | None = None
+        #: The most recently emitted snapshot, for introspection and tests.
+        self.last_health_snapshot: HealthSnapshot | None = None
+
+        self._alert_state: AlertState | None = None
+        self._blocked_since_ns: int | None = None
+        self._process_started_at_ns = shared.clock()
 
     # -- read-only accessors -------------------------------------------
 
@@ -641,8 +702,18 @@ class NwsIngestActor(Actor):
         Persisting a partial batch and recording success would be worse still:
         ``record_successful_poll`` clears every per-site block, so one good
         product would launder away the block a sibling product just earned.
+
+        **Why gap reconciliation and health emission sit at the very top.**
+        :meth:`reconcile_and_report` is called beside :meth:`check_staleness`
+        and **before** the ``network_allowed()`` early return, because that is
+        the only line reached on every timer fire. The 304 branch, the
+        no-new-products branch and the network-disallowed branch all return
+        early -- and those are exactly the polls a gap ledger exists to
+        observe. Attaching after the terminal publish would miss all of them,
+        i.e. would miss the entire steady state.
         """
         self.check_staleness()
+        await self.reconcile_and_report()
         if not self.network_allowed():
             return
 
@@ -1243,6 +1314,344 @@ class NwsIngestActor(Actor):
             blocked_after_ns=self.staleness_blocked_after_ns,
         )
 
+    # -- WI-10 / WI-12: gap reconciliation, health snapshot, alerts ---------
+
+    async def reconcile_and_report(self) -> None:
+        """Reconcile the durable gap ledger, then emit the health snapshot and
+        this cycle's alerts. Once per poll cycle, at the top of
+        :meth:`poll_once` -- see that method's docstring for why the top.
+
+        **Failure isolation is the point of this method existing at all.**
+        ``gaps.reconcile`` deliberately does not swallow: it raises
+        ``TamperedGapLedgerError`` on a corrupted ledger, because containment
+        is the attachment point's job rather than a pure function's. So both
+        halves are wrapped here, and independently: losing reconciliation for
+        one cycle is recoverable, losing the poll is not -- and the snapshot is
+        *more* valuable, not less, on the cycle where reconciliation just
+        failed, so a ledger failure must not suppress it.
+
+        ``Exception`` and not ``BaseException``: ``asyncio.CancelledError`` is
+        a shutdown signal and must keep propagating. Neither branch touches the
+        settlement gate, which is deliberate -- a defect in our own
+        observability is not evidence about the venue's data, and recording one
+        as a site block would take a healthy site offline for a bookkeeping
+        bug.
+
+        **Thread confinement (SS4.1).** ``reconcile`` WRITES to the
+        thread-confined ``SqliteStateStore``, so it runs inline on the event
+        loop, exactly like the gate and the product index. Only the catalog
+        read -- unbounded, ``flock``-taking pyarrow I/O -- goes through
+        ``_run_off_loop``. Reversing that raises ``RuntimeError`` out of the
+        store, and only in a real deployment.
+        """
+        now_ns = self._now()
+        entries: tuple[gaps.GapEntry, ...] = ()
+        revisions: tuple[gaps.RevisionEvent, ...] = ()
+
+        try:
+            catalog = self._open_catalog()
+            records = await self._run_off_loop(lambda: read_climate_days(catalog))
+            result = gaps.reconcile(
+                store=self._shared.store,
+                now_ns=now_ns,
+                venue=self._venue,
+                city=self._city,
+                station=self._site.cli_location,
+                std_utc_offset_hours=self._window.std_utc_offset_hours,
+                settlement_delay_time_local=self._deadline.settlement_delay_time_local,
+                settlement_delay_timezone=self._deadline.settlement_delay_timezone,
+                records=records,
+            )
+            revisions = result.revisions
+            entries = gaps.site_entries(self._shared.store, self._venue, self._city)
+        except Exception:
+            logger.exception(
+                "gap reconciliation failed for %s/%s -- swallowed so the poll continues",
+                self._venue,
+                self._city,
+            )
+
+        try:
+            self._emit_health(now_ns, entries=entries, revisions=revisions)
+        except Exception:
+            logger.exception(
+                "health emission failed for %s/%s -- swallowed so the poll continues",
+                self._venue,
+                self._city,
+            )
+
+    def _emit_health(
+        self,
+        now_ns: int,
+        *,
+        entries: Sequence[gaps.GapEntry],
+        revisions: Sequence[gaps.RevisionEvent],
+    ) -> None:
+        """Build this cycle's alert conditions and `HealthSnapshot`, dispatch,
+        and write the snapshot atomically if a path is configured.
+
+        The ``GapEntry -> GapSummary`` mapping lives HERE, at the call site,
+        and that is deliberate: ``health.py`` does not import
+        ``breezy.ingest`` and ``gaps.py`` does not import ``health`` -- neither
+        module may learn the other's vocabulary, so the adapter belongs to the
+        wiring that already knows both.
+        """
+        health = _health()
+
+        status = self.gate.status(self._venue, self._city)
+        causes = self.gate.blocking_causes(self._venue, self._city)
+        ua_latched = GateReason.UA_TRAP_403 in causes
+        site_label = f"{self._venue}/{self._city}"
+        today = gaps.local_standard_date(now_ns, self._window.std_utc_offset_hours)
+
+        # `open_gaps` deliberately includes ACKNOWLEDGED_LOST: an acknowledged
+        # day is muted for re-notify, never hidden. Removing it from the
+        # snapshot would make an operator's acknowledgement look like a repair.
+        summaries = tuple(
+            health.GapSummary(
+                climate_day=entry.climate_day.isoformat(),
+                state=entry.state.value,
+                severity=gaps.severity_for(entry.climate_day, today).value,
+                days_until_retention_loss=gaps.days_remaining_until_retention_loss(
+                    entry.climate_day, today
+                ),
+            )
+            for entry in entries
+            if entry.state is not gaps.GapState.RESOLVED
+        )
+        acknowledged_lost = sum(
+            1 for entry in entries if entry.state is gaps.GapState.ACKNOWLEDGED_LOST
+        )
+
+        conditions = self._alert_conditions(
+            now_ns,
+            health=health,
+            site_label=site_label,
+            status=status,
+            causes=causes,
+            ua_latched=ua_latched,
+            entries=entries,
+            summaries=summaries,
+            revisions=revisions,
+        )
+        emitted = self._alert_tracker(health).dispatch(
+            self._resolved_alert_sink(health), conditions, now_ns=now_ns
+        )
+
+        snapshot = health.HealthSnapshot(
+            schema_version=health.SCHEMA_VERSION,
+            process_started_at_ns=self._process_started_at_ns,
+            snapshot_at_ns=now_ns,
+            trader_id=str(getattr(self, "trader_id", "") or ""),
+            sites=(
+                health.SiteHealth(
+                    venue=self._venue,
+                    city=self._city,
+                    gate_state=status.state.value,
+                    gate_reason=status.reason.value,
+                    blocking_causes=tuple(cause.value for cause in causes),
+                    last_successful_poll_ns=status.last_successful_poll_ns,
+                    cursor=self._cursor_text(),
+                    open_gaps=summaries,
+                    acknowledged_lost_count=acknowledged_lost,
+                ),
+            ),
+            ua_trap_latched=ua_latched,
+            alerts_emitted_this_cycle=emitted,
+        )
+        self.last_health_snapshot = snapshot
+        if self.health_snapshot_path is not None:
+            health.write_snapshot_atomic(self.health_snapshot_path, snapshot)
+
+    def _alert_conditions(
+        self,
+        now_ns: int,
+        *,
+        health: Any,
+        site_label: str,
+        status: GateStatus,
+        causes: Sequence[GateReason],
+        ua_latched: bool,
+        entries: Sequence[gaps.GapEntry],
+        summaries: Sequence[GapSummary],
+        revisions: Sequence[gaps.RevisionEvent],
+    ) -> list[AlertCondition]:
+        """Every condition this site tracks, evaluated fresh for this cycle.
+
+        ``AlertState.evaluate`` leaves a key it is not handed untouched, so
+        every standing condition is passed on every cycle -- including the ones
+        that are ``active=False``, which is what lets a cleared condition fire
+        again next time it sets.
+
+        ``detail`` strings are short and structural by construction: no
+        absolute path, no upstream body or header, no settings field. The
+        snapshot has no slot for those either, so neither artifact can leak
+        ``user_agent_contact``.
+        """
+        blocked_after_ns = (
+            int(self._config.poll_interval_seconds) * SITE_BLOCKED_ALERT_INTERVALS * _NS_PER_SECOND
+        )
+        # Duration is measured from when THIS process first OBSERVED the block,
+        # never from `GateStatus.at_ns`. Two independent reasons, both found by
+        # test rather than by inspection:
+        #
+        # 1. `at_ns` is the last TRANSITION instant, and a blocked site keeps
+        #    transitioning -- `check_staleness` alone re-records every cycle.
+        #    Elapsed-since-`at_ns` therefore resets continuously and a
+        #    permanently blocked site would never reach the threshold at all.
+        # 2. A never-polled site reports `BLOCKED` with `at_ns == 0`, so the
+        #    same arithmetic reads the entire Unix epoch as downtime and pages
+        #    CRITICAL on every fresh deployment.
+        #
+        # In-memory and never persisted, matching `AlertState`'s own cold-start
+        # stance: at boot the site is unobserved, so the clock starts now and a
+        # genuinely dead-on-arrival deployment alerts after the threshold --
+        # which is the ONLY signal for that case, since `PollStale` cannot fire
+        # while `last_successful_poll_ns` is still `None`. Sampled once per
+        # cycle, because once per cycle is the only observation cadence there
+        # is.
+        if status.state is GateState.BLOCKED:
+            if self._blocked_since_ns is None:
+                self._blocked_since_ns = now_ns
+        else:
+            self._blocked_since_ns = None
+        blocked_long = (
+            self._blocked_since_ns is not None
+            and now_ns - self._blocked_since_ns >= blocked_after_ns
+        )
+        last_poll_ns = status.last_successful_poll_ns
+        poll_stale = (
+            last_poll_ns is not None and now_ns - last_poll_ns >= self.staleness_degraded_after_ns
+        )
+
+        conditions: list[AlertCondition] = [
+            health.AlertCondition(
+                key=health.AlertConditionKey(kind=health.UA_TRAP_LATCHED, site="global"),
+                active=ua_latched,
+                severity="CRITICAL",
+                event=health.UA_TRAP_LATCHED,
+                detail="global UA-trap latch is set; every site has stopped polling",
+            ),
+            health.AlertCondition(
+                key=health.AlertConditionKey(kind=health.SITE_BLOCKED, site=site_label),
+                active=blocked_long,
+                severity="CRITICAL",
+                event=health.SITE_BLOCKED,
+                detail=(
+                    f"blocked for at least {SITE_BLOCKED_ALERT_INTERVALS} poll intervals; "
+                    f"causes={','.join(cause.value for cause in causes)}"
+                ),
+            ),
+            health.AlertCondition(
+                key=health.AlertConditionKey(kind=health.FINAL_OVERDUE, site=site_label),
+                active=GateReason.FINAL_CLI_OVERDUE in causes,
+                severity="CRITICAL",
+                event=health.FINAL_OVERDUE,
+                detail="the final CLI is overdue past the venue settlement deadline",
+            ),
+            health.AlertCondition(
+                key=health.AlertConditionKey(kind=health.POLL_STALE, site=site_label),
+                active=poll_stale,
+                severity="WARN",
+                event=health.POLL_STALE,
+                detail=(
+                    f"no successful poll for at least {STALENESS_DEGRADE_INTERVALS} poll intervals"
+                ),
+            ),
+        ]
+
+        # One condition per gap inside the retention warning band, keyed by
+        # climate day so several simultaneous gaps each alert once rather than
+        # collapsing into a single flapping condition. ACKNOWLEDGED_LOST is
+        # muted for re-notify but still fires on transition and still appears
+        # in the snapshot -- acknowledgement silences repetition, not the fact.
+        acknowledged_days = {
+            entry.climate_day.isoformat()
+            for entry in entries
+            if entry.state is gaps.GapState.ACKNOWLEDGED_LOST
+        }
+        for summary in summaries:
+            conditions.append(
+                health.AlertCondition(
+                    key=health.AlertConditionKey(
+                        kind=health.GAP_RETENTION_WARNING,
+                        site=site_label,
+                        extra=summary.climate_day,
+                    ),
+                    active=summary.severity != gaps.GapSeverity.INFO.value,
+                    severity=summary.severity.upper(),
+                    event=health.GAP_RETENTION_WARNING,
+                    detail=(
+                        f"climate day {summary.climate_day} is {summary.state} with "
+                        f"{summary.days_until_retention_loss} day(s) until assumed "
+                        f"retention loss"
+                    ),
+                    renotify_muted=summary.climate_day in acknowledged_days,
+                )
+            )
+
+        # A revision is an EVENT, not a standing condition: `extra` carries the
+        # new sequence number so each distinct revision is a distinct key and
+        # therefore always a false->true transition. Passed only on the cycle
+        # it is observed; a key not passed is left untouched, never cleared.
+        for revision in revisions:
+            conditions.append(
+                health.AlertCondition(
+                    key=health.AlertConditionKey(
+                        kind=health.POST_SETTLEMENT_REVISION,
+                        site=site_label,
+                        extra=f"{revision.climate_day.isoformat()}:{revision.new_revision_seq}",
+                    ),
+                    active=True,
+                    severity="CRITICAL",
+                    event=health.POST_SETTLEMENT_REVISION,
+                    detail=(
+                        f"climate day {revision.climate_day.isoformat()} revised "
+                        f"{revision.previous_revision_seq}->{revision.new_revision_seq} "
+                        f"correction={revision.correction_flag} "
+                        f"superseded={revision.is_superseded}"
+                    ),
+                )
+            )
+        return conditions
+
+    def _alert_tracker(self, health: Any) -> AlertState:
+        """The one `AlertState` for this site, created on first use.
+
+        Never seeded from persisted state: a UA-trap latch or an open gap that
+        is already true at boot must read as a false->true transition on cycle
+        1 and fire. Computing transitions against persisted prior state would
+        make exactly those persistent, silent conditions never alert.
+        """
+        if self._alert_state is None:
+            self._alert_state = health.AlertState()
+        state: AlertState = self._alert_state
+        return state
+
+    def _resolved_alert_sink(self, health: Any) -> AlertSink:
+        """The configured sink, or a lazily-resolved default.
+
+        Resolution is deferred to first use rather than done in ``__init__``
+        so that a deployment with no ``BREEZY_ALERT_WEBHOOK_URL`` never
+        constructs an ``httpx.Client`` or an ``ssl.SSLContext`` at all.
+        """
+        if self.alert_sink is None:
+            self.alert_sink = health.resolve_alert_sink()
+        sink: AlertSink = self.alert_sink
+        return sink
+
+    def _cursor_text(self) -> str | None:
+        """The resume cursor rendered for the snapshot.
+
+        A compact `"<ts_init>:<record class>:<raw sha256>"`, not the tuple: the
+        snapshot is a machine-readable operator artifact, and the digest is
+        already public provenance stored beside every record.
+        """
+        cursor = self.resume_cursor
+        if cursor is None:
+            return None
+        return f"{cursor[0]}:{cursor[1]}:{cursor[2]}"
+
     async def check_final_deadline(self) -> None:
         """The data-completeness clock, on a wall schedule (SS6, SS5b).
 
@@ -1257,7 +1666,12 @@ class NwsIngestActor(Actor):
         block.
         """
         now = self._now()
-        climate_day = self._most_recent_completed_climate_day(now)
+        # The ONE copy of this arithmetic lives in `gaps` (extracted from this
+        # module's own former private method). Two copies of the fixed-standard
+        # -offset-vs-DST derivation is precisely the divergence that silently
+        # fabricates or hides gaps, so the private copy is gone rather than
+        # merely kept in agreement.
+        climate_day = gaps.most_recent_completed_climate_day(now, self._window.std_utc_offset_hours)
         deadline_ns = self._settlement_deadline_ns(climate_day)
         if now < deadline_ns:
             return
@@ -1273,20 +1687,6 @@ class NwsIngestActor(Actor):
                 f"by the venue deadline"
             ),
         )
-
-    def _most_recent_completed_climate_day(self, now_ns: int) -> dt.date:
-        """The last climate day that has definitely ended.
-
-        The climate day runs local **standard** midnight to midnight
-        year-round. Deriving it from UTC, or from the DST-following local
-        clock, is a settlement-correctness bug of the same class as mistaking a
-        preliminary for a final.
-        """
-        local = dt.datetime.fromtimestamp(
-            now_ns // _NS_PER_SECOND,
-            tz=standard_time_zone(self._window.std_utc_offset_hours),
-        )
-        return local.date() - dt.timedelta(days=1)
 
     def _settlement_deadline_ns(self, climate_day: dt.date) -> int:
         """The venue's settlement instant for ``climate_day``.

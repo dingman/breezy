@@ -111,9 +111,21 @@ class TestActorsAreNotRegisteredByConfig:
         # dragging in the Actor module and its heavyweight imports.
         import sys
 
-        sys.modules.pop("breezy.ingest.nws_actor", None)
-        build_node_config(make_settings())
-        assert "breezy.ingest.nws_actor" not in sys.modules
+        # The eviction MUST be restored. Leaving it popped lets a later import
+        # build a SECOND module object with its own `__dict__` while
+        # `composition.py:39` still holds the first -- so string-form
+        # `monkeypatch.setattr("breezy.ingest.nws_actor....")` patches a module
+        # nobody is executing. That produced a real 1-in-3 order-dependent
+        # failure in the PostSettlementRevision alert test, which passed in
+        # isolation and failed only when this test ran first. The assertion
+        # below is unchanged; only the cleanup is added.
+        saved = sys.modules.pop("breezy.ingest.nws_actor", None)
+        try:
+            build_node_config(make_settings())
+            assert "breezy.ingest.nws_actor" not in sys.modules
+        finally:
+            if saved is not None:
+                sys.modules["breezy.ingest.nws_actor"] = saved
 
     def test_actor_component_id_embeds_venue_and_city(self) -> None:
         # Still owned here: `build_ingest_actors` calls this function to keep

@@ -1950,3 +1950,68 @@ async def test_a_persisted_cursor_round_trips_across_a_restart(
     actor.published.clear()  # type: ignore[attr-defined]
     await actor.warm_start()
     assert actor.published == []  # type: ignore[attr-defined]
+
+
+# ---------------------------------------------------------------------------
+# The climate-day derivation exists exactly ONCE
+# ---------------------------------------------------------------------------
+
+
+def test_the_actor_no_longer_carries_a_private_climate_day_derivation() -> None:
+    """`gaps.most_recent_completed_climate_day` was extracted byte-for-byte
+    from this Actor's own `_most_recent_completed_climate_day`, so the
+    fixed-standard-offset-vs-DST arithmetic existed TWICE.
+
+    Two copies of exactly this calculation is the divergence that silently
+    fabricates or hides gaps -- the ledger and the settlement deadline would
+    disagree about which day is complete. The private copy is therefore gone,
+    not merely kept in agreement.
+    """
+    assert not hasattr(NwsIngestActor, "_most_recent_completed_climate_day")
+
+
+@pytest.mark.parametrize(
+    "instant",
+    [
+        # Exactly local-standard midnight, and one second either side of it --
+        # the boundary a float-division rewrite would move by a whole day.
+        dt.datetime(2026, 8, 22, 5, 0, 0, tzinfo=dt.UTC),
+        dt.datetime(2026, 8, 22, 4, 59, 59, tzinfo=dt.UTC),
+        dt.datetime(2026, 8, 22, 5, 0, 1, tzinfo=dt.UTC),
+        # Inside EDT: the DST-following clock says 20:00 on the 21st while
+        # local STANDARD time says 19:00 on the 21st. Both agree here, which
+        # is the point -- the standard offset is applied, never the DST one.
+        dt.datetime(2026, 8, 22, 0, 0, 0, tzinfo=dt.UTC),
+        # The spring-forward and fall-back instants themselves.
+        dt.datetime(2026, 3, 8, 7, 0, 0, tzinfo=dt.UTC),
+        dt.datetime(2026, 11, 1, 6, 0, 0, tzinfo=dt.UTC),
+        # A UTC date that is NOT the local date.
+        dt.datetime(2026, 8, 22, 3, 30, 0, tzinfo=dt.UTC),
+    ],
+)
+def test_the_extracted_climate_day_matches_the_removed_arithmetic_exactly(
+    shared: SharedIngestState, instant: dt.datetime
+) -> None:
+    """Behaviour-identical, proven against the arithmetic as it was WRITTEN in
+    `nws_actor.py` before the extraction (restated verbatim here, which is the
+    only way this assertion can falsify a drift in the extraction).
+
+    Floor division on whole seconds, not float division: `fromtimestamp` on a
+    float would round-trip through binary floating point and can land on the
+    wrong side of a midnight boundary.
+    """
+    from breezy.ingest import gaps
+    from breezy.normalize.climate_day import standard_time_zone
+
+    actor = build_actor(shared)
+    window = shared.registry.climate_day_window(VENUE, CITY)
+    now_ns = int(instant.timestamp()) * SECOND
+
+    # The removed implementation, verbatim.
+    local = dt.datetime.fromtimestamp(
+        now_ns // SECOND, tz=standard_time_zone(window.std_utc_offset_hours)
+    )
+    expected = local.date() - dt.timedelta(days=1)
+
+    assert gaps.most_recent_completed_climate_day(now_ns, window.std_utc_offset_hours) == expected
+    actor.shutdown_executor()

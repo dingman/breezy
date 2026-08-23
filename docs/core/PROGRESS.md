@@ -96,6 +96,40 @@ every other setting in that module. Validated against NautilusTrader's actual
 `OFF`/`TRACE`/`DEBUG`/`INFO`/`WARNING`/`ERROR`), not the stdlib `logging`
 module's aliases (`WARN`/`CRITICAL` are rejected).
 
+### [RESOLVED] `pyiem` backfill dependency was an open range
+`pyproject.toml`'s `backfill` extra declared `pyiem>=1.19`; the
+`nws-cli-settlement` skill mandates `pyiem == 1.27.0` exactly. Verified the
+installed `.venv` was already resolving `1.27.0` (so no test evidence in this
+repo was ever produced against a different release), then pinned the
+declaration to `==1.27.0` and resynced `uv.lock` via `uv lock`/`uv sync
+--extra backfill` (not hand-edited). Added
+`tests/unit/test_backfill_dependency_pin.py` to fail loudly if a future
+resync drifts the resolved version.
+
+**Scope note surfaced while verifying:** `pyiem` is not currently imported
+anywhere in `src/` or `tests/`. The live settlement parse path
+(`breezy.normalize.cli_parse`) is a deliberate hand-rolled, pure-text parser
+(see its module docstring) that never calls pyIEM, and
+`NwsIngestActor.PARSER_VERSION` is the hardcoded string
+`"breezy.normalize.cli_parse@0.1.0"`, not a pyiem version — contrary to the
+skill's "Use pyIEM -- Do NOT Hand-Roll Parsing" section and its
+`parser_version (pyiem version used)` provenance field. This pin therefore
+protects a not-yet-built pyIEM-backed backfill path; today's settlement-parse
+protection is the golden-parse fixtures in `test_normalize_cli_parse.py`
+(`test_parse_real_final_fixture_matches_expected` et al.), which pin
+`cli_parse.py`'s exact tmax/tmin/tavg output directly. Flagging the
+skill/implementation gap here rather than resolving it — reconciling it is an
+architecture decision (adopt pyIEM per the skill, or update the skill to
+match the hand-rolled design) outside this change's scope.
+
+Also checked `metar` and `pynws`, the skill's two other pyIEM-family pins
+(`metar == 2.0.1`, `pynws == 2.1.0`): `pynws` is not declared as a dependency
+at all (nothing to pin); `metar` is not a direct dependency either — it
+arrives only transitively via `pyiem` and happens to lock at `2.0.1`,
+matching the skill's mandate today but with no direct top-level pin holding
+it there. Not adding either, per this task's scope (do not add currently
+undeclared dependencies).
+
 ### Import-linter contracts are still absent
 `import-linter` is declared as a dependency but **no contracts are configured**,
 so the layering it exists to enforce is unenforced.
