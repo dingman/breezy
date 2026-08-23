@@ -45,7 +45,7 @@ from typing import Protocol, TextIO
 from nautilus_trader.config import TradingNodeConfig
 from nautilus_trader.live.node import TradingNode
 
-from breezy.ingest.gate import CachePersistenceMisconfiguredError
+from breezy.ingest.gate import StateStoreNotDurableError
 from breezy.ingest.http import ProxyEnvironmentError
 from breezy.ingest.shared_state import SharedIngestState, SharedIngestStateError
 from breezy.persistence.catalog import (
@@ -74,7 +74,7 @@ _CONFIG_ERRORS: tuple[type[BaseException], ...] = (
     RegistryError,
     SharedIngestStateError,
     WriterLockFilesystemError,
-    CachePersistenceMisconfiguredError,
+    StateStoreNotDurableError,
     ProxyEnvironmentError,
     OSError,
 )

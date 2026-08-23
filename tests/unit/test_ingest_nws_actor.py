@@ -39,8 +39,7 @@ import hashlib
 import inspect
 import json
 import threading
-from collections.abc import Iterator, Sequence
-from dataclasses import dataclass
+from collections.abc import Callable, Iterator, Sequence
 from pathlib import Path
 from typing import Any
 
@@ -123,21 +122,18 @@ class FakeClock:
         self.now += ns
 
 
-@dataclass(frozen=True)
-class FakeKernelConfig:
-    save_state: bool = True
-    load_state: bool = True
+def durable_store_pair() -> tuple[InMemoryStateStore, Callable[[], InMemoryStateStore]]:
+    """A store plus an opener over the SAME backing dict.
 
-
-@dataclass(frozen=True)
-class FakeCacheConfig:
-    database: object | None = "postgres://cache"
-    flush_on_start: bool = False
-
-
-@dataclass(frozen=True)
-class FakeExecEngineConfig:
-    load_cache: bool = True
+    `SharedIngestState` now proves durability by round-trip through an
+    independent handle on the store's backing medium, replacing the three
+    fake Nautilus config objects this module used to build (that guard
+    required `CacheConfig.database is not None`, which no Redis-free node
+    config can satisfy, and it described the Cache -- which is not what backs
+    `StateStore`).
+    """
+    backing: dict[str, bytes] = {}
+    return InMemoryStateStore(backing), lambda: InMemoryStateStore(backing)
 
 
 def _local_probe(path: Path) -> FilesystemProbe:
@@ -184,26 +180,32 @@ def clock() -> FakeClock:
 
 
 @pytest.fixture
-def store() -> InMemoryStateStore:
-    return InMemoryStateStore()
+def store_pair() -> tuple[InMemoryStateStore, Callable[[], InMemoryStateStore]]:
+    return durable_store_pair()
+
+
+@pytest.fixture
+def store(
+    store_pair: tuple[InMemoryStateStore, Callable[[], InMemoryStateStore]],
+) -> InMemoryStateStore:
+    return store_pair[0]
 
 
 @pytest.fixture
 def shared(
     registry: SiteRegistry,
     clock: FakeClock,
-    store: InMemoryStateStore,
+    store_pair: tuple[InMemoryStateStore, Callable[[], InMemoryStateStore]],
     tmp_path: Path,
 ) -> Iterator[SharedIngestState]:
+    store, store_opener = store_pair
     state = SharedIngestState(
         registry=registry,
         sites=ALL_SITES,
         catalog_base=tmp_path / "nws",
         store=store,
         clock=clock,
-        kernel_config=FakeKernelConfig(),
-        cache_config=FakeCacheConfig(),
-        exec_engine_config=FakeExecEngineConfig(),
+        store_opener=store_opener,
         probe=_local_probe,
         check_proxy_env=False,
     )

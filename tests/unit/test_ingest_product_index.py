@@ -601,3 +601,71 @@ def test_detail_is_populated_for_every_outcome() -> None:
         index.observe(UUID_A, DIGEST_MUTATED).detail,
     ]
     assert all(isinstance(d, str) and d for d in details)
+
+
+# ---------------------------------------------------------------------------
+# DEFECT 3 -- UUID casing must not split the index
+# ---------------------------------------------------------------------------
+#
+# `_require_hex_digest` is strict (64-char LOWERCASE hex, never normalised),
+# but `_require_product_uuid` only checked "non-empty str". A product uuid
+# differing from a stored one ONLY in case therefore keyed a SECOND
+# first-write-wins entry, so the mutated bytes read as first-seen and the
+# integrity alarm never fires. The uuid is a settlement identifier, so the fix
+# is to reject a non-canonical form loudly -- never to silently lower-case it
+# (`nws_envelope` takes the same stance: matched, never round-tripped).
+
+
+def test_upper_case_uuid_is_rejected_rather_than_creating_a_second_entry() -> None:
+    index, _store, _clock = _index()
+    index.observe(UUID_A, DIGEST_ORIGINAL)
+
+    with pytest.raises(ValueError):
+        index.observe(UUID_A.upper(), DIGEST_MUTATED)
+
+
+def test_a_case_variant_uuid_never_hides_a_digest_mismatch() -> None:
+    """The money bug: same product, upper-cased id, MUTATED bytes. Before the
+    fix this returned FIRST_SEEN under a second key; it must never do that.
+    """
+    index, _store, _clock = _index()
+    index.observe(UUID_A, DIGEST_ORIGINAL)
+
+    with pytest.raises(ValueError):
+        index.observe(UUID_A.swapcase(), DIGEST_MUTATED)
+
+    assert index.known_digest(UUID_A) == DIGEST_ORIGINAL
+
+
+@pytest.mark.parametrize(
+    "bad",
+    [
+        UUID_A.upper(),
+        UUID_A.replace("-", ""),
+        f"urn:uuid:{UUID_A}",
+        f"{{{UUID_A}}}",
+        f" {UUID_A}",
+        f"{UUID_A} ",
+        UUID_A[:-1],
+        f"{UUID_A}0",
+        "not-a-uuid",
+    ],
+)
+def test_non_canonical_product_uuid_is_rejected(bad: str) -> None:
+    index, _store, _clock = _index()
+    with pytest.raises(ValueError):
+        index.observe(bad, DIGEST_ORIGINAL)
+
+
+def test_rejected_uuid_writes_nothing() -> None:
+    index, store, _clock = _index()
+    with pytest.raises(ValueError):
+        index.observe(UUID_A.upper(), DIGEST_ORIGINAL)
+    assert store.set_calls == []
+
+
+def test_known_digest_rejects_a_case_variant_uuid() -> None:
+    index, _store, _clock = _index()
+    index.observe(UUID_A, DIGEST_ORIGINAL)
+    with pytest.raises(ValueError):
+        index.known_digest(UUID_A.upper())

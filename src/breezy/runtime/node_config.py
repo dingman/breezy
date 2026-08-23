@@ -3,10 +3,18 @@
 Null hypothesis, checked against the installed ``nautilus-trader==1.231.0``
 before anything here was written:
 
-* **Actor registration is native.** ``NautilusKernelConfig.actors`` is a list
-  of ``ImportableActorConfig`` and the kernel instantiates each one via
-  ``ActorFactory.create`` (``system/kernel.py:528-531``). Nothing needs to be
-  built to run an Actor per site.
+* **Actor registration is native, but NOT via config for our Actor.**
+  ``NautilusKernelConfig.actors`` is a list of ``ImportableActorConfig`` and
+  the kernel instantiates each one via ``ActorFactory.create``
+  (``system/kernel.py:528-531``), which ends in ``actor_cls(config)``
+  (``common/config.py:614``) -- one positional argument, round-tripped through
+  JSON. ``NwsIngestActor`` requires a live ``SharedIngestState``, so that route
+  cannot build it. The other native route can and is used:
+  ``Trader.add_actor(actor)`` (``trading/trader.py:312``) takes an
+  already-constructed Actor, reached through ``TradingNode.trader``
+  (``live/node.py:139``). See
+  :func:`breezy.runtime.composition.build_ingest_node`. Nothing is built to run
+  an Actor per site.
 * **Signal handling is native.** ``NautilusKernel._setup_loop``
   (``system/kernel.py:558-572``) registers SIGTERM/SIGINT/SIGABRT for every
   non-BACKTEST environment. See ``breezy.runtime.cli``.
@@ -15,7 +23,9 @@ before anything here was written:
 What this module therefore adds is only the mapping from
 :class:`~breezy.runtime.settings.BreezyRuntimeSettings` onto those native
 config objects, plus two refusals Nautilus does not make safely itself
-(see ``validated_trader_id`` and the zero-catalog rule below).
+(see ``validated_trader_id`` and the zero-catalog rule below). Actor
+construction is NOT here: it needs a live object and therefore belongs to the
+composition root.
 
 Deployment values are never hardcoded here: every one comes from settings.
 """
@@ -28,7 +38,6 @@ from typing import Any, cast
 from nautilus_trader.common import Environment
 from nautilus_trader.config import (
     CacheConfig,
-    ImportableActorConfig,
     LoggingConfig,
     TradingNodeConfig,
 )
@@ -36,13 +45,18 @@ from nautilus_trader.model.identifiers import TraderId
 
 from breezy.runtime.settings import BreezyRuntimeSettings
 
-#: The ingest Actor, referenced by ``"pkg.mod:Class"`` colon path.
+#: The ingest Actor's ``"pkg.mod:Class"`` colon path.
 #:
-#: A path STRING rather than an import, deliberately. ``ActorFactory.create``
-#: resolves it at node-build time (``common/config.py:611-614``), so this
-#: module -- and its tests -- stay buildable while the Actor module is
-#: authored separately. A DOTTED path is not equivalent: ``resolve_path``
-#: requires the colon form and a dotted one fails mid-run.
+#: Retained as a NAME only -- deliberately NOT used to register the Actor.
+#: ``ActorFactory.create`` ends in ``actor_cls(config)``
+#: (``common/config.py:614``): one positional argument, round-tripped through
+#: JSON. ``NwsIngestActor.__init__`` requires ``shared: SharedIngestState``,
+#: a live object, so the config-driven route cannot construct it at all.
+#: :func:`breezy.runtime.composition.build_ingest_node` constructs each Actor
+#: explicitly and registers it through the native ``Trader.add_actor``
+#: (``trading/trader.py:312``, reached via ``TradingNode.trader`` at
+#: ``live/node.py:139``). These constants remain so a test can assert the
+#: importable route is NOT in use.
 NWS_INGEST_ACTOR_PATH = "breezy.ingest.nws_actor:NwsIngestActor"
 
 #: The Actor's ``ActorConfig`` subclass, same colon-path convention.
@@ -97,36 +111,10 @@ def actor_component_id(venue: str, city: str) -> str:
     return f"{_COMPONENT_ID_PREFIX}-{venue}-{city}"
 
 
-def build_actor_configs(
-    settings: BreezyRuntimeSettings,
-) -> tuple[ImportableActorConfig, ...]:
-    """Return one :class:`ImportableActorConfig` per configured site.
-
-    The payload carries only msgspec-serialisable scalars. It deliberately
-    carries no ``Path``, callable, or object reference: ``ActorFactory.create``
-    round-trips ``config`` through JSON, so anything else either fails to
-    encode or silently diverges from the live object a later run rebuilds.
-    """
-    return tuple(
-        ImportableActorConfig(
-            actor_path=NWS_INGEST_ACTOR_PATH,
-            config_path=NWS_INGEST_ACTOR_CONFIG_PATH,
-            config={
-                "component_id": actor_component_id(venue, city),
-                "venue": venue,
-                "city": city,
-                "poll_interval_seconds": settings.poll_interval_seconds,
-                "parse_timeout_ms": settings.parse_timeout_ms,
-            },
-        )
-        for venue, city in settings.sites
-    )
-
-
 def build_node_config(settings: BreezyRuntimeSettings) -> TradingNodeConfig:
     """Return the `TradingNodeConfig` for the ingestion process.
 
-    Two deliberate zeroes:
+    Three deliberate zeroes:
 
     **Zero catalogs.** ``catalogs=[]``. ``NautilusKernel`` registers one
     ``DataEngine`` catalog per entry (``system/kernel.py:514-526``), and
@@ -134,6 +122,16 @@ def build_node_config(settings: BreezyRuntimeSettings) -> TradingNodeConfig:
     on the first registered catalog that returns rows. Breezy reads and writes
     its per-station ``ParquetDataCatalog`` roots directly, outside the
     DataEngine, so the correct registered count is zero -- not "one, carefully".
+
+    **Zero declared actors.** ``actors=[]``. Not an omission: the ingest
+    Actors are constructed by
+    :func:`breezy.runtime.composition.build_ingest_actors` with their
+    ``SharedIngestState`` injected, then registered through the native
+    ``Trader.add_actor`` (``trading/trader.py:312``). The
+    ``ImportableActorConfig`` route is structurally unusable for them --
+    ``ActorFactory.create`` ends in ``actor_cls(config)``
+    (``common/config.py:614``), one positional argument, and there is no seam
+    in it for a live shared object.
 
     **Zero cache/message-bus database.** ``kernel.py:311-329`` accepts only
     ``'redis'`` for either backing store and raises for anything else. There is
@@ -152,7 +150,7 @@ def build_node_config(settings: BreezyRuntimeSettings) -> TradingNodeConfig:
         cache=CacheConfig(database=None, flush_on_start=False),
         message_bus=None,
         catalogs=[],
-        actors=list(build_actor_configs(settings)),
+        actors=[],
         data_clients={},
         exec_clients={},
     )

@@ -4,9 +4,12 @@ These tests assert on the CONSTRUCTED config objects only. No `TradingNode`
 is built and no event loop is started, so nothing here touches the network,
 the filesystem, or the sibling-authored ingest Actor module.
 
-The Actor is referenced by PATH STRING throughout (`ImportableActorConfig`),
-which is why these tests pass without `breezy.ingest.nws_actor` existing:
-`ActorFactory.create` resolves that string only when a real node is built.
+The ingest Actors are deliberately NOT declared in this config: they need a
+live `SharedIngestState`, which `ActorFactory.create` (`actor_cls(config)`,
+`common/config.py:614`) has no seam for. They are constructed and registered by
+`breezy.runtime.composition` through the native `Trader.add_actor`. These tests
+therefore assert the config declares ZERO actors, and never import
+`breezy.ingest.nws_actor`.
 """
 
 from __future__ import annotations
@@ -25,7 +28,6 @@ from breezy.runtime.node_config import (
     NWS_INGEST_ACTOR_PATH,
     NodeConfigError,
     actor_component_id,
-    build_actor_configs,
     build_node_config,
     validated_trader_id,
 )
@@ -61,77 +63,88 @@ def make_settings(**overrides: object) -> BreezyRuntimeSettings:
 # ---------------------------------------------------------------------------
 
 
-class TestBuildActorConfigs:
-    def test_one_importable_actor_config_per_configured_site(self) -> None:
-        configs = build_actor_configs(make_settings())
+class TestActorsAreNotRegisteredByConfig:
+    """REPLACES `TestBuildActorConfigs`.
 
-        assert len(configs) == len(ALL_SITES)
-        assert all(isinstance(c, ImportableActorConfig) for c in configs)
-        assert [(c.config["venue"], c.config["city"]) for c in configs] == list(ALL_SITES)
+    `build_actor_configs` produced one `ImportableActorConfig` per site. That
+    route cannot work for this Actor: `ActorFactory.create` ends in
+    `actor_cls(config)` (`common/config.py:614`) -- one positional argument,
+    round-tripped through JSON -- while `NwsIngestActor.__init__` requires a
+    live `SharedIngestState`. The Actors are now constructed and registered by
+    `breezy.runtime.composition.build_ingest_node` through the native
+    `Trader.add_actor` (`trading/trader.py:312`); see
+    `tests/unit/test_runtime_actor_wiring.py`, which took over the
+    per-site-count, component-id and cadence assertions.
+    """
 
-    def test_a_partial_site_set_yields_only_those_actors(self) -> None:
-        configs = build_actor_configs(make_settings(sites=(("polymarket_us", "MIA"),)))
+    def test_the_node_config_declares_no_actors(self) -> None:
+        config = build_node_config(make_settings())
 
-        assert len(configs) == 1
-        assert configs[0].config["city"] == "MIA"
+        assert config.actors == []
 
-    def test_actor_and_config_are_referenced_by_colon_path_string(self) -> None:
-        # A dotted path silently fails mid-run under `resolve_path`; the colon
+    def test_the_importable_route_is_not_used_for_any_site(self) -> None:
+        for sites in (ALL_SITES, (("polymarket_us", "MIA"),)):
+            config = build_node_config(make_settings(sites=sites))
+            assert not any(
+                isinstance(a, ImportableActorConfig) and a.actor_path == NWS_INGEST_ACTOR_PATH
+                for a in config.actors
+            )
+
+    def test_build_actor_configs_is_gone(self) -> None:
+        """It must not come back: an `ImportableActorConfig` for this Actor
+        would fail at node-build time, in production, with a TypeError about a
+        missing `shared` argument.
+        """
+        from breezy.runtime import node_config
+
+        assert not hasattr(node_config, "build_actor_configs")
+
+    def test_the_colon_paths_are_retained_as_names_only(self) -> None:
+        # Kept so tests (and humans) can assert the importable route is NOT in
+        # use. A dotted path would fail mid-run under `resolve_path`; the colon
         # form is the only one NautilusTrader 1.231.0 resolves reliably.
         assert NWS_INGEST_ACTOR_PATH == "breezy.ingest.nws_actor:NwsIngestActor"
         assert NWS_INGEST_ACTOR_CONFIG_PATH == "breezy.ingest.config:NwsIngestActorConfig"
 
-        for config in build_actor_configs(make_settings()):
-            assert config.actor_path == NWS_INGEST_ACTOR_PATH
-            assert config.config_path == NWS_INGEST_ACTOR_CONFIG_PATH
-
-    def test_building_configs_does_not_import_the_actor_module(self) -> None:
-        # The whole point of the path-string indirection: this seam must build
-        # while the Actor module is still being authored elsewhere.
+    def test_building_the_node_config_does_not_import_the_actor_module(self) -> None:
+        # Still true, and still worth keeping: this seam must build without
+        # dragging in the Actor module and its heavyweight imports.
         import sys
 
         sys.modules.pop("breezy.ingest.nws_actor", None)
-        build_actor_configs(make_settings())
+        build_node_config(make_settings())
         assert "breezy.ingest.nws_actor" not in sys.modules
 
-    def test_component_ids_are_unique_per_site(self) -> None:
-        # ActorConfig.component_id defaults to None, which makes every Actor
-        # take its class name as its id -- five identical ids, and
-        # `Trader.add_actor` rejects the second one.
-        ids = [c.config["component_id"] for c in build_actor_configs(make_settings())]
-
-        assert len(set(ids)) == len(ALL_SITES)
-        assert ids == [actor_component_id(v, c) for v, c in ALL_SITES]
-
     def test_actor_component_id_embeds_venue_and_city(self) -> None:
+        # Still owned here: `build_ingest_actors` calls this function to keep
+        # five same-class Actors from colliding inside `Trader.add_actor`.
         assert actor_component_id("polymarket_us", "NYC") == "NWS-INGEST-polymarket_us-NYC"
 
-    def test_payload_round_trips_through_the_real_actor_config_class(self) -> None:
-        # `ActorFactory.create` msgspec-encodes `config` then `parse`s it into
-        # the config class. Anything unserialisable or misnamed fails there,
-        # at node build time, in production. Prove it round-trips here.
-        for config in build_actor_configs(make_settings()):
-            parsed = NwsIngestActorConfig.parse(msgspec.json.encode(config.config))
-            assert isinstance(parsed, NwsIngestActorConfig)
-            assert (parsed.venue, parsed.city) == (config.config["venue"], config.config["city"])
+    def test_component_ids_are_unique_per_site(self) -> None:
+        ids = [actor_component_id(v, c) for v, c in ALL_SITES]
 
-    def test_cadence_fields_come_from_settings_not_actor_defaults(self) -> None:
-        settings = make_settings(poll_interval_seconds=45, parse_timeout_ms=900)
+        assert len(set(ids)) == len(ALL_SITES)
 
-        for config in build_actor_configs(settings):
-            parsed = NwsIngestActorConfig.parse(msgspec.json.encode(config.config))
-            assert parsed.poll_interval_seconds == 45
-            assert parsed.parse_timeout_ms == 900
+    def test_the_actor_config_class_still_accepts_the_payload_shape(self) -> None:
+        # `build_ingest_actors` constructs `NwsIngestActorConfig` directly now,
+        # so the msgspec round-trip is no longer on the production path -- but
+        # the field names it passes must still be the real ones.
+        parsed = NwsIngestActorConfig.parse(
+            msgspec.json.encode(
+                {
+                    "component_id": actor_component_id("polymarket_us", "NYC"),
+                    "venue": "polymarket_us",
+                    "city": "NYC",
+                    "poll_interval_seconds": 45,
+                    "parse_timeout_ms": 900,
+                }
+            )
+        )
 
-    def test_no_deployment_path_leaks_into_the_actor_payload(self) -> None:
-        # A Path on an ImportableActorConfig either fails to serialise or
-        # silently diverges from the live object a later run reconstructs.
-        settings = make_settings()
-        for config in build_actor_configs(settings):
-            for value in config.config.values():
-                assert not isinstance(value, Path)
-            assert str(settings.catalog_base) not in msgspec.json.encode(config.config).decode()
-            assert str(settings.state_db_path) not in msgspec.json.encode(config.config).decode()
+        assert isinstance(parsed, NwsIngestActorConfig)
+        assert (parsed.venue, parsed.city) == ("polymarket_us", "NYC")
+        assert parsed.poll_interval_seconds == 45
+        assert parsed.parse_timeout_ms == 900
 
 
 # ---------------------------------------------------------------------------
@@ -214,11 +227,12 @@ class TestBuildNodeConfig:
         assert config.logging is not None
         assert config.logging.log_level == "DEBUG"
 
-    def test_carries_one_actor_config_per_site(self) -> None:
+    def test_carries_no_actor_configs(self) -> None:
+        # See `TestActorsAreNotRegisteredByConfig` for why this is zero and not
+        # one-per-site.
         config = build_node_config(make_settings())
 
-        assert len(config.actors) == len(ALL_SITES)
-        assert config.actors == list(build_actor_configs(make_settings()))
+        assert config.actors == []
 
     def test_no_deployment_value_is_hardcoded(self) -> None:
         a = build_node_config(make_settings(trader_id="BREEZY-001", log_level="INFO"))

@@ -952,7 +952,8 @@ def _read[RecordT: Data](
 # root" with NO exception and NO log -- exactly the silent degradation this
 # module exists to prevent. The precondition is not enforceable by `flock`
 # itself, so it is asserted at startup instead, mirroring
-# `breezy.ingest.gate.assert_cache_persistence_configured`.
+# `breezy.ingest.gate.assert_state_store_durable`. Both are SS6 step-0
+# preconditions run once by `SharedIngestState.__init__`.
 
 
 class FilesystemLocality(str, Enum):
@@ -1122,8 +1123,9 @@ def assert_writer_lock_filesystem_supported(probe: FilesystemProbe) -> None:
         )
 
     Takes the probe rather than the path, for the same reason
-    :func:`breezy.ingest.gate.assert_cache_persistence_configured` takes a config
-    object: every verdict is then reachable in a test without a real mount.
+    :func:`breezy.ingest.gate.assert_state_store_durable` takes an opener
+    rather than a filesystem path: every verdict is then reachable in a test
+    without a real mount.
 
     Raises
     ------

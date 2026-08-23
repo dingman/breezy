@@ -26,11 +26,17 @@ the product said when we first saw it.
 clean slate, which is precisely the laundering this exists to prevent: crash,
 restart, re-observe the mutated bytes, and the mutation reads as first-seen.
 State therefore goes through an injected :class:`StateStore`, exactly as
-``ingest/gate.py`` does, and the Actor backs that with ``Cache.add`` /
-``Cache.get`` (which require all three of ``ActorConfig.save_state``,
-``ActorConfig.load_state`` and ``CacheConfig.database`` -- see
-``gate.assert_cache_persistence_configured``). Keys are namespaced under
-``productidx:`` so one store can serve both this index and the gate.
+``ingest/gate.py`` does, and in production that store is
+``breezy.runtime.sqlite_store.SqliteStateStore``. The Nautilus ``Cache`` was
+evaluated for the role and rejected on measured evidence (``Cache.add``
+returns before the write is durable, ``Cache.get`` never reads the database,
+``Cache.reset()`` can launder a permanent halt), so durability is no longer a
+matter of getting five ``Cache``/kernel settings right. It is established at
+startup, empirically, by ``gate.assert_state_store_durable``, which
+round-trips a probe value through the real store and an independent handle on
+its backing medium rather than trusting any declared flag. Keys here are
+namespaced under ``productidx:`` so one store can serve both this index and
+the gate.
 
 **No gate dependency, by design.** A digest mismatch is a CRIT integrity signal,
 but this module does not call the gate -- it returns a typed outcome and the
@@ -75,6 +81,20 @@ logger = logging.getLogger(__name__)
 PRODUCT_INDEX_KEY_PREFIX = "productidx:"
 
 _HEX_DIGEST = re.compile(r"\A[0-9a-f]{64}\Z")
+
+#: A canonical, LOWERCASE product uuid as api.weather.gov assigns it.
+#:
+#: Exactly as strict as :data:`_HEX_DIGEST`, and for the same reason. When
+#: this only required "a non-empty str", a uuid differing from a stored one
+#: ONLY in case keyed a SECOND first-write-wins entry -- so the same product's
+#: mutated bytes read as FIRST_SEEN and the integrity alarm never fired. Case
+#: split the index; strictness closes it.
+#:
+#: Matched, never normalised. The uuid is a settlement identifier: it must be
+#: byte-identical to the id fetched and the id recorded as provenance, so a
+#: non-canonical form is rejected loudly rather than silently lower-cased
+#: (``breezy.ingest.nws_envelope`` takes the same stance for the same reason).
+_PRODUCT_UUID = re.compile(r"\A[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\Z")
 
 
 def _index_key(product_uuid: str) -> str:
@@ -202,10 +222,23 @@ class _CorruptEntry:
 
 
 def _require_product_uuid(value: object) -> str:
+    """Return `value` if it is a canonical lowercase product uuid.
+
+    As strict as :func:`_require_hex_digest`, deliberately: see
+    :data:`_PRODUCT_UUID` for the index-splitting defect that laxness caused.
+    Never normalises -- an upper-case or `urn:uuid:`-wrapped id means some
+    component produced a non-canonical settlement identifier, and that
+    component is what needs fixing.
+    """
     if not isinstance(value, str):
         raise TypeError(f"`product_uuid` must be a `str`, was {type(value).__name__}")
-    if not value.strip():
-        raise ValueError("`product_uuid` must be a non-empty `str`")
+    if _PRODUCT_UUID.match(value) is None:
+        raise ValueError(
+            "`product_uuid` must be a canonical lowercase UUID "
+            f"(8-4-4-4-12 hex, no braces or 'urn:uuid:' prefix), was {value!r}. "
+            "It is matched byte-identically and never normalised, because it is "
+            "a settlement identifier."
+        )
     return value
 
 

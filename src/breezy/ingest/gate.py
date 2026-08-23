@@ -4,10 +4,17 @@ Governing rule (docs/plans/WEATHER_INGESTION_PROPOSAL.md §6):
 **enrichment degrades, settlement halts.**
 
 This module is deliberately Nautilus-free (no ``import nautilus_trader``
-here) so it stays unit-testable in complete isolation. The eventual ingest
-Actor is expected to construct a :class:`SettlementGate`, back its
-:class:`StateStore` with ``Cache.add``/``Cache.get``, and drive its injected
-clock from ``Actor.clock.timestamp_ns``.
+here) so it stays unit-testable in complete isolation. The ingest Actor
+constructs a :class:`SettlementGate`, backs its :class:`StateStore` with
+``breezy.runtime.sqlite_store.SqliteStateStore``, and drives its injected
+clock from the one process-wide nanosecond clock.
+
+The Nautilus ``Cache`` was evaluated for that persistence role and rejected on
+measured evidence -- ``Cache.add`` returns before the write is durable,
+``Cache.get`` never reads the database, and ``Cache.reset()`` can launder a
+permanent trading halt. :func:`assert_state_store_durable` at the bottom of
+this module now proves, at startup and empirically, that whatever store this
+process was handed really does persist.
 
 Three states per ``(venue, city)`` site: ``OPEN``, ``DEGRADED``, ``BLOCKED``.
 A site **defaults to BLOCKED** until a successful verified poll -- an
@@ -250,9 +257,12 @@ DEFAULT_BURST_POLICY = CrossSiteBurstPolicy(
 class StateStore(Protocol):
     """The minimal persistence seam this module needs.
 
-    The eventual ingest Actor backs this with ``Cache.add(str, bytes)`` /
-    ``Cache.get(str)``. Deliberately narrower than a full key-value store so
-    a fake for tests is a five-line class.
+    Backed in production by
+    :class:`breezy.runtime.sqlite_store.SqliteStateStore`. Deliberately
+    narrower than a full key-value store so a fake for tests is a five-line
+    class. Being a ``StateStore`` is not by itself a durability claim --
+    :func:`assert_state_store_durable` is what establishes that, by round-trip
+    rather than by declaration.
     """
 
     def get(self, key: str) -> bytes | None: ...
@@ -261,18 +271,32 @@ class StateStore(Protocol):
 
 
 class InMemoryStateStore:
-    """A trivial in-process :class:`StateStore`, for tests and standalone use
-    before an Actor wires in ``Cache.add``/``Cache.get``.
+    """A trivial in-process :class:`StateStore`, for tests and standalone use.
+
+    **Not durable**, and it must not pretend to be: with the default private
+    backing dict it fails :func:`assert_state_store_durable`, because a handle
+    opened alongside it starts empty. Passing an explicit ``data`` mapping
+    makes several instances share one backing store, which is the in-process
+    analogue of reopening the SQLite file and is what lets a test exercise the
+    durability probe without touching a disk. Sharing a dict is still not
+    persistence across a restart -- only
+    :class:`breezy.runtime.sqlite_store.SqliteStateStore` is that.
     """
 
-    def __init__(self) -> None:
-        self._data: dict[str, bytes] = {}
+    def __init__(self, data: dict[str, bytes] | None = None) -> None:
+        self._data: dict[str, bytes] = {} if data is None else data
 
     def get(self, key: str) -> bytes | None:
         return self._data.get(key)
 
     def set(self, key: str, value: bytes) -> None:
         self._data[key] = value
+
+    def close(self) -> None:
+        """No-op: there is no resource to release. Present so this class
+        satisfies :class:`ClosableStateStore` and can therefore stand in for
+        the real store wherever an opener is required.
+        """
 
 
 # ---------------------------------------------------------------------------
@@ -1334,134 +1358,206 @@ class SettlementGate:
 
 
 # ---------------------------------------------------------------------------
-# Cache-database startup assertion
+# Durable-state startup assertion
 # ---------------------------------------------------------------------------
 #
-# Measured against the installed nautilus_trader==1.231.0 tree (never
-# assumed -- an earlier draft of this assertion was written against an
-# assumed surface and was wrong):
+# What this replaces, and why it had to go
+# ----------------------------------------
+# The predecessor of this section asserted five Nautilus ``Cache``-persistence
+# settings (``save_state``, ``load_state``, ``CacheConfig.database``,
+# ``ExecEngineConfig.load_cache``, ``CacheConfig.flush_on_start``). Two things
+# were wrong with it:
 #
-# - save_state / load_state live on ``NautilusKernelConfig``
-#   (nautilus_trader/system/config.py:122-123, both default False), which
-#   is the top-level node/engine config (e.g. ``TradingNodeConfig``) --
-#   NOT on ``ActorConfig`` (common/config.py:541-561, which has exactly
-#   ``component_id``/``log_events``/``log_commands``) or ``StrategyConfig``
-#   (trading/config.py:33-100, same story). An assertion reading
-#   ``actor_config.save_state`` either always raises against a real
-#   ``ActorConfig``, or was fed something that was never one.
-# - Even with save_state/load_state/``CacheConfig.database`` all correct,
-#   that is not sufficient for the gate's persisted state to actually
-#   survive a restart. ``Cache._general`` -- which backs this module's
-#   ``StateStore`` via ``Cache.add``/``Cache.get`` -- is repopulated from
-#   the database on a NEW process only via ``Cache.cache_general()``
-#   (cache/cache.pyx:279-304, which sets ``self._general = {}`` when no
-#   database is configured), reached only from
-#   ``ExecutionEngine.load_cache()`` (execution/engine.pyx:774-793), which
-#   the kernel invokes only when
-#   ``config.exec_engine.load_cache and not flush_on_start``
-#   (system/kernel.py:465-467, where
-#   ``flush_on_start = config.cache is not None and config.cache.flush_on_start``).
-#   Miss ``exec_engine.load_cache=True`` or ``cache.flush_on_start=False``
-#   and a UA-trap global halt -- the exact thing this module exists to
-#   make survive a crash-loop -- is silently lost on restart even though
-#   every other setting looks correct.
+# 1. **It was unsatisfiable.** It required ``CacheConfig.database is not
+#    None``. The installed nautilus-trader 1.231.0 kernel accepts only
+#    ``'redis'`` or ``None`` there (``system/kernel.py:311-329``) and raises
+#    for anything else. This deployment has no Redis, so NO valid node config
+#    could ever pass -- the guard could only be satisfied by feeding it a
+#    fabricated config-shaped object, which is a fiction in the startup path
+#    of a settlement-critical system.
+# 2. **It described the wrong mechanism.** It was written when this module's
+#    :class:`StateStore` was Cache-backed. It no longer is:
+#    ``breezy.runtime.sqlite_store.SqliteStateStore`` owns the durable state,
+#    chosen on measured evidence (``Cache.add`` returns before the write is
+#    durable, ``Cache.get`` never reads the database, and ``Cache.reset()``
+#    can launder a permanent trading halt).
 #
-# Deployment therefore requires ALL FIVE: save_state, load_state,
-# cache.database set, exec_engine.load_cache=True, cache.flush_on_start=False.
+# What is asserted instead
+# ------------------------
+# The property that actually matters: **the store handed to this module really
+# persists.** And it is established EMPIRICALLY -- by writing and reading a
+# probe value through the real store and through an INDEPENDENT handle on the
+# same backing medium -- never by trusting a declared flag. The whole failure
+# mode being defended against is state that *appears* to persist and does not;
+# a boolean saying "I am durable" is exactly what such a store would report.
+#
+# Like its predecessor, this is importable and callable with no live trading
+# node: it needs only a store and a way to open a second handle on it.
 
 
-@dataclass(frozen=True, slots=True)
-class CachePersistenceConfig:
-    """The five settings that must ALL be correct for the gate's persisted
-    state to both be written (save_state/load_state/database) and actually
-    survive a NautilusTrader process restart (load_cache/flush_on_start).
+#: The single key the durability probe writes. Namespaced away from both
+#: ``gate:`` (this module) and ``productidx:``
+#: (:mod:`breezy.ingest.product_index`) so a probe can never overwrite real
+#: state, and FIXED rather than per-run so repeated startups cannot grow the
+#: store without bound. The value left behind is the last probe's nonce, which
+#: is harmless and doubles as evidence that the check ran.
+DURABILITY_PROBE_KEY = "durability:probe"
+
+
+class ClosableStateStore(StateStore, Protocol):
+    """A :class:`StateStore` that owns a closable resource.
+
+    Exactly one method wider than ``StateStore``, so a caller that must
+    guarantee teardown (the composition root, and the durability probe below,
+    which opens handles of its own) can do so without widening the seam the
+    gate and the product index see.
     """
 
-    save_state: bool
-    load_state: bool
-    database: object | None
-    load_cache: bool
-    flush_on_start: bool
+    def close(self) -> None: ...
 
 
-class CachePersistenceMisconfiguredError(Exception):
-    """Raised when any of the five required settings is wrong -- i.e. gate
-    persistence would be silently inert, or silently lost on restart.
+#: Opens a NEW, independent handle on the SAME backing medium as the store
+#: being checked. For :class:`~breezy.runtime.sqlite_store.SqliteStateStore`
+#: that is a fresh connection to the same file. This is the seam that makes
+#: the durability check empirical rather than declarative: a handle that never
+#: saw the write in memory can only observe it if the write actually landed.
+StateStoreOpener = Callable[[], ClosableStateStore]
+
+
+class StateStoreNotDurableError(Exception):
+    """Raised when the configured :class:`StateStore` cannot be shown to
+    persist -- i.e. every halt, latch and integrity record this process writes
+    would be silently lost, which is precisely the laundering the gate and the
+    product index exist to prevent.
     """
 
 
-def assert_cache_persistence_configured(config: CachePersistenceConfig) -> None:
-    """Raise loudly unless all five required settings are correct.
+def _probe_nonce() -> bytes:
+    from uuid import uuid4
 
-    Importable and callable without constructing a live Nautilus node --
-    callers build a :class:`CachePersistenceConfig` from real
-    ``NautilusKernelConfig``/``CacheConfig``/``ExecEngineConfig`` fields
-    (see :func:`cache_persistence_config_from`) or pass one directly in
-    tests.
+    return uuid4().hex.encode("ascii")
+
+
+def _open_view(opener: StateStoreOpener, stage: str) -> ClosableStateStore:
+    try:
+        return opener()
+    except Exception as exc:
+        raise StateStoreNotDurableError(
+            f"could not open an independent handle on the state store ({stage}): {exc!r}. "
+            "Durability cannot be established, so startup fails closed."
+        ) from exc
+
+
+def assert_state_store_durable(store: StateStore, *, opener: StateStoreOpener) -> None:
+    """Prove, by round-trip, that ``store`` actually persists -- or raise.
+
+    Four properties are checked in order, each of which a plausible-looking but
+    non-durable store fails, and each of which maps to a measured way the
+    Nautilus ``Cache`` would have failed had it been used here:
+
+    1. **Write-through.** ``set`` then ``get`` on the same handle returns the
+       value written. (A ``set`` that queues the write and returns fails here
+       only if the value is not yet readable; the next check catches the rest.)
+    2. **The write reached the shared medium.** A handle opened by ``opener``
+       -- which has never seen the value in memory -- observes it. This is the
+       ``Cache.add`` failure shape: the call returns success while the write is
+       still in flight on a background task.
+    3. **Reads re-read the medium.** A value written by that independent handle
+       is visible through the ORIGINAL ``store``. This is the ``Cache.get``
+       failure shape: reads served from a private in-memory dict that the
+       database never refreshes.
+    4. **State outlives a handle.** After the independent handle is closed, a
+       second one still observes the value -- so persistence is a property of
+       the medium, not of a live connection.
+
+    Parameters
+    ----------
+    store : StateStore
+        The live store the gate and the product index will use.
+    opener : StateStoreOpener
+        Opens an independent handle on the same backing medium. Every handle
+        this function opens, it closes.
+
+    Raises
+    ------
+    StateStoreNotDurableError
+        If any property fails, or if the store or the opener raises. The check
+        fails CLOSED: an error while establishing durability is treated as
+        absent durability, never as a pass.
     """
-    missing: list[str] = []
-    if not config.save_state:
-        missing.append("NautilusKernelConfig.save_state=True (e.g. TradingNodeConfig.save_state)")
-    if not config.load_state:
-        missing.append("NautilusKernelConfig.load_state=True")
-    if config.database is None:
-        missing.append("CacheConfig.database (must not be None)")
-    if not config.load_cache:
-        missing.append("ExecEngineConfig.load_cache=True")
-    if config.flush_on_start:
-        missing.append("CacheConfig.flush_on_start=False")
-    if missing:
-        raise CachePersistenceMisconfiguredError(
-            "Gate persistence requires ALL FIVE of the following, or the "
-            "persisted state will not actually survive a restart (even "
-            "though on_save/on_load may appear to fire correctly): "
-            + "; ".join(missing)
+    first = _probe_nonce()
+    second = _probe_nonce()
+
+    try:
+        store.set(DURABILITY_PROBE_KEY, first)
+        observed = store.get(DURABILITY_PROBE_KEY)
+    except Exception as exc:
+        raise StateStoreNotDurableError(
+            f"the state store raised while writing its durability probe: {exc!r}"
+        ) from exc
+    if observed != first:
+        raise StateStoreNotDurableError(
+            "the state store did not return the value it had just accepted "
+            f"(wrote {first!r}, read back {observed!r}); writes are not "
+            "write-through, so no halt or integrity record it accepts can be trusted"
         )
 
+    view = _open_view(opener, "verifying the write reached the backing medium")
+    try:
+        try:
+            cross_handle = view.get(DURABILITY_PROBE_KEY)
+        except Exception as exc:
+            raise StateStoreNotDurableError(
+                f"an independent handle raised while reading the durability probe: {exc!r}"
+            ) from exc
+        if cross_handle != first:
+            raise StateStoreNotDurableError(
+                "a value the state store reported as written is NOT visible to an "
+                f"independent handle on the same backing medium (read {cross_handle!r}, "
+                f"expected {first!r}); the write never became durable, it only "
+                "looked like it did"
+            )
+        try:
+            view.set(DURABILITY_PROBE_KEY, second)
+        except Exception as exc:
+            raise StateStoreNotDurableError(
+                f"an independent handle raised while writing the durability probe: {exc!r}"
+            ) from exc
+    finally:
+        view.close()
 
-def cache_persistence_config_from(
-    kernel_config: object, cache_config: object, exec_engine_config: object
-) -> CachePersistenceConfig:
-    """Build a :class:`CachePersistenceConfig` from three config-shaped
-    objects.
+    try:
+        after_close = store.get(DURABILITY_PROBE_KEY)
+    except Exception as exc:
+        raise StateStoreNotDurableError(
+            f"the state store raised while re-reading its durability probe: {exc!r}"
+        ) from exc
+    if after_close != second:
+        raise StateStoreNotDurableError(
+            "the state store does not re-read its backing medium: a value committed "
+            f"by an independent handle is invisible to it (read {after_close!r}, "
+            f"expected {second!r}); it would serve stale state after any external write"
+        )
 
-    - ``kernel_config``: duck-typed against ``save_state``/``load_state``.
-      Pass the ``NautilusKernelConfig`` (e.g. ``TradingNodeConfig`` or a
-      backtest engine config) -- NOT an ``ActorConfig``/``StrategyConfig``,
-      which carry neither field on the installed 1.231.0 tree.
-    - ``cache_config``: duck-typed against ``database``/``flush_on_start``.
-      Pass the ``CacheConfig``.
-    - ``exec_engine_config``: duck-typed against ``load_cache``. Pass the
-      ``ExecEngineConfig`` (or ``LiveExecEngineConfig``, which extends it).
+    survivor = _open_view(opener, "verifying state outlives a handle")
+    try:
+        try:
+            final = survivor.get(DURABILITY_PROBE_KEY)
+        except Exception as exc:
+            raise StateStoreNotDurableError(
+                f"an independent handle raised while confirming the durability probe: {exc!r}"
+            ) from exc
+        if final != second:
+            raise StateStoreNotDurableError(
+                "state did not survive the lifetime of a handle on the backing medium "
+                f"(read {final!r}, expected {second!r}); persistence is tied to a live "
+                "connection, so a restart would start from a clean slate"
+            )
+    finally:
+        survivor.close()
 
-    Works with real Nautilus instances or fakes in tests without this
-    module importing ``nautilus_trader``.
-    """
-    if not hasattr(kernel_config, "save_state") or not hasattr(kernel_config, "load_state"):
-        raise CachePersistenceMisconfiguredError(
-            "kernel_config is missing save_state and/or load_state attributes -- "
-            "pass the NautilusKernelConfig (e.g. TradingNodeConfig), not an "
-            "ActorConfig/StrategyConfig, which carry neither field"
-        )
-    if not hasattr(cache_config, "database"):
-        raise CachePersistenceMisconfiguredError("cache_config is missing a 'database' attribute")
-    if not hasattr(cache_config, "flush_on_start"):
-        raise CachePersistenceMisconfiguredError(
-            "cache_config is missing a 'flush_on_start' attribute"
-        )
-    if not hasattr(exec_engine_config, "load_cache"):
-        raise CachePersistenceMisconfiguredError(
-            "exec_engine_config is missing a 'load_cache' attribute"
-        )
-    save_state = bool(kernel_config.save_state)
-    load_state = bool(kernel_config.load_state)
-    database = cache_config.database
-    flush_on_start = bool(cache_config.flush_on_start)
-    load_cache = bool(exec_engine_config.load_cache)
-    return CachePersistenceConfig(
-        save_state=save_state,
-        load_state=load_state,
-        database=database,
-        load_cache=load_cache,
-        flush_on_start=flush_on_start,
+    logger.info(
+        "state store certified durable: probe key=%s round-tripped through two "
+        "independent handles",
+        DURABILITY_PROBE_KEY,
     )

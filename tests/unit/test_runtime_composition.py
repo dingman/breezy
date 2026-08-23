@@ -14,7 +14,6 @@ from typing import ClassVar
 
 import pytest
 
-from breezy.ingest.gate import CachePersistenceMisconfiguredError
 from breezy.ingest.shared_state import (
     DuplicateSharedIngestStateError,
     SharedIngestState,
@@ -29,8 +28,6 @@ from breezy.persistence.catalog import (
 from breezy.registry.sites import SiteRegistry
 from breezy.runtime.composition import (
     BreezyIngestRuntime,
-    DurableStateAttestation,
-    durable_state_attestation,
     ingest_runtime,
     load_site_registry,
 )
@@ -154,56 +151,84 @@ def vars_of(settings: BreezyRuntimeSettings) -> dict[str, object]:
 
 
 # ---------------------------------------------------------------------------
-# Durable-state attestation (see composition.py for the full rationale)
+# Durable state
+#
+# REPLACES `TestDurableStateAttestation`. That class covered a duck-typed
+# `DurableStateAttestation` object the composition root fed to
+# `SharedIngestState` so a Cache-persistence assertion would pass -- an object
+# that reported a SQLite path as if it were `CacheConfig.database`. It existed
+# only because the assertion was unsatisfiable (`CacheConfig.database is not
+# None`, while the kernel accepts only 'redis' there and this deployment has no
+# Redis) and described the wrong mechanism.
+#
+# Both the assertion and the workaround are gone. The composition root now
+# hands `SharedIngestState` an opener over the REAL store, and durability is
+# established by round-trip.
 # ---------------------------------------------------------------------------
 
 
-class TestDurableStateAttestation:
-    def test_names_the_sqlite_file_that_actually_holds_durable_state(
+class TestDurableState:
+    def test_the_attestation_workaround_is_gone(self) -> None:
+        """A fiction in the startup path of a settlement-critical system must
+        not reappear.
+        """
+        from breezy.runtime import composition
+
+        assert not hasattr(composition, "DurableStateAttestation")
+        assert not hasattr(composition, "durable_state_attestation")
+
+    def test_the_composed_runtime_uses_a_genuinely_durable_store(
         self, settings: BreezyRuntimeSettings
     ) -> None:
-        attestation = durable_state_attestation(settings)
+        """Not a declared flag: the value is written through the live store and
+        read back by a NEW store object over the same file, after the runtime
+        (and therefore the original connection) has been torn down.
+        """
+        with ingest_runtime(settings, probe=RecordingProbe()) as runtime:
+            runtime.store.set("gate:probe-canary", b"latched")
+            assert isinstance(runtime.store, SqliteStateStore)
 
-        assert isinstance(attestation, DurableStateAttestation)
-        assert attestation.database == str(settings.state_db_path)
+        with SqliteStateStore(settings.state_db_path) as reopened:
+            assert reopened.get("gate:probe-canary") == b"latched"
 
-    def test_satisfies_the_shared_state_startup_precondition(
+    def test_a_non_durable_store_factory_fails_startup_closed(
         self, settings: BreezyRuntimeSettings
     ) -> None:
-        from breezy.ingest.gate import (
-            assert_cache_persistence_configured,
-            cache_persistence_config_from,
-        )
+        """The whole point of the replacement guard: a store that accepts every
+        write and persists nothing must stop the process, not start it.
+        """
+        from breezy.ingest.gate import InMemoryStateStore, StateStoreNotDurableError
 
-        attestation = durable_state_attestation(settings)
-        assert_cache_persistence_configured(
-            cache_persistence_config_from(attestation, attestation, attestation)
-        )
+        def volatile_factory(_path: Path) -> InMemoryStateStore:
+            return InMemoryStateStore()
 
-    def test_the_real_nautilus_node_config_cannot_satisfy_it(
+        with (
+            pytest.raises(StateStoreNotDurableError),
+            ingest_runtime(settings, probe=RecordingProbe(), store_factory=volatile_factory),
+        ):
+            pass
+
+    def test_a_failed_durability_check_leaks_neither_slot_nor_handle(
         self, settings: BreezyRuntimeSettings
     ) -> None:
-        # UPSTREAM DEFECT, asserted so it fails RED when fixed:
-        # `SharedIngestState` asserts Nautilus-Cache persistence, but Breezy's
-        # `StateStore` is `SqliteStateStore` (see that module's docstring: the
-        # Cache-backed store was rejected on measured evidence). The assertion
-        # demands `CacheConfig.database is not None`, and `kernel.py:311-329`
-        # accepts only 'redis' there -- so no real, Redis-free node config can
-        # ever pass. See `durable_state_attestation` for how this seam responds.
-        from breezy.ingest.gate import (
-            assert_cache_persistence_configured,
-            cache_persistence_config_from,
-        )
-        from breezy.runtime.node_config import build_node_config
+        """A misconfigured deployment must stay fixable in place: the
+        process-wide `SharedIngestState` slot must be released, so the next
+        attempt reports the real cause rather than a duplicate-construction
+        error.
+        """
+        from breezy.ingest.gate import InMemoryStateStore, StateStoreNotDurableError
 
-        node_config = build_node_config(settings)
+        def volatile_factory(_path: Path) -> InMemoryStateStore:
+            return InMemoryStateStore()
 
-        with pytest.raises(CachePersistenceMisconfiguredError):
-            assert_cache_persistence_configured(
-                cache_persistence_config_from(
-                    node_config, node_config.cache, node_config.exec_engine
-                )
-            )
+        with (
+            pytest.raises(StateStoreNotDurableError),
+            ingest_runtime(settings, probe=RecordingProbe(), store_factory=volatile_factory),
+        ):
+            pass
+
+        with ingest_runtime(settings, probe=RecordingProbe()) as runtime:
+            assert runtime.shared.sites == SITES
 
 
 # ---------------------------------------------------------------------------
@@ -221,7 +246,10 @@ class TestIngestRuntime:
             assert isinstance(runtime.registry, SiteRegistry)
             assert isinstance(runtime.store, SqliteStateStore)
             assert isinstance(runtime.shared, SharedIngestState)
-            assert len(runtime.node_config.actors) == len(SITES)
+            # Zero, not one-per-site: the ingest Actors need a live
+            # `SharedIngestState` and are built by `build_ingest_actors` and
+            # registered through the native `Trader.add_actor` instead.
+            assert runtime.node_config.actors == []
 
     def test_shared_state_is_backed_by_the_sqlite_store_and_configured_sites(
         self, settings: BreezyRuntimeSettings, probe: RecordingProbe

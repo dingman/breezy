@@ -17,8 +17,7 @@ import pytest
 from breezy.ingest.gate import (
     _GLOBAL_KEY,
     DEFAULT_BURST_POLICY,
-    CachePersistenceConfig,
-    CachePersistenceMisconfiguredError,
+    DURABILITY_PROBE_KEY,
     CrossSiteBurstPolicy,
     GateBlockedError,
     GateReason,
@@ -26,12 +25,12 @@ from breezy.ingest.gate import (
     InMemoryStateStore,
     SettlementGate,
     StateStore,
+    StateStoreNotDurableError,
     _site_entry_from_bytes,
     _site_entry_to_bytes,
     _site_key,
     _SiteEntry,
-    assert_cache_persistence_configured,
-    cache_persistence_config_from,
+    assert_state_store_durable,
 )
 
 VENUE = "polymarket_us"
@@ -1733,189 +1732,87 @@ def test_corrupt_persisted_global_bytes_can_be_manually_cleared() -> None:
 
 
 # ---------------------------------------------------------------------------
-# Cache-database startup assertion
+# Durable-state startup assertion
 #
-# Measured against the installed nautilus_trader==1.231.0 tree (not
-# assumed) -- see the module docstring / assert_cache_persistence_configured
-# for the exact file:line citations. Two corrections from an earlier draft:
+# REPLACES the five-condition Cache-persistence assertion this section used to
+# hold (`CachePersistenceConfig` / `assert_cache_persistence_configured` /
+# `cache_persistence_config_from`). Those tests asserted a guard that (a) could
+# never pass -- it demanded `CacheConfig.database is not None` while the kernel
+# accepts only 'redis' there and this deployment has no Redis -- and (b)
+# described the Nautilus `Cache`, which is no longer what backs `StateStore`.
 #
-# 1. save_state/load_state live on NautilusKernelConfig
-#    (nautilus_trader/system/config.py), NOT on ActorConfig or
-#    StrategyConfig -- both carry neither field. An assertion built against
-#    "actor_config.save_state" either always raises against a real
-#    ActorConfig, or was never exercised against one.
-# 2. Even with save_state/load_state/database all correct, Cache._general
-#    (which backs this module's StateStore via Cache.add/Cache.get) is
-#    repopulated from the database on restart ONLY through
-#    ExecutionEngine.load_cache() -> Cache.cache_general(), which the
-#    kernel invokes ONLY when exec_engine.load_cache is True AND
-#    cache.flush_on_start is False. Miss either and a UA-trap global halt
-#    -- the exact thing this module exists to make survive a crash-loop --
-#    is silently lost on restart.
+# The `_SimulatedNautilusCache` restart tests further down are KEPT: they are
+# the standing evidence for WHY the Cache was rejected, and they still exercise
+# the gate against a store double with realistic (not idealised) semantics.
+#
+# The behavioural replacement lives in `tests/unit/test_ingest_state_durability.py`.
+# What is asserted here is the one thing that belongs with the gate: the guard
+# is reachable from this module and a store the gate would silently lose state
+# through is refused.
 # ---------------------------------------------------------------------------
 
 
-def test_cache_persistence_assertion_passes_when_fully_configured() -> None:
-    config = CachePersistenceConfig(
-        save_state=True, load_state=True, database=object(), load_cache=True, flush_on_start=False
-    )
-    assert_cache_persistence_configured(config)  # must not raise
+def test_the_gate_module_exposes_the_durability_guard() -> None:
+    assert callable(assert_state_store_durable)
+    assert issubclass(StateStoreNotDurableError, Exception)
 
 
-def test_cache_persistence_assertion_fails_when_database_unset() -> None:
-    config = CachePersistenceConfig(
-        save_state=True, load_state=True, database=None, load_cache=True, flush_on_start=False
-    )
-    with pytest.raises(CachePersistenceMisconfiguredError, match="database"):
-        assert_cache_persistence_configured(config)
-
-
-def test_cache_persistence_assertion_fails_when_save_state_false() -> None:
-    config = CachePersistenceConfig(
-        save_state=False, load_state=True, database=object(), load_cache=True, flush_on_start=False
-    )
-    with pytest.raises(CachePersistenceMisconfiguredError, match="save_state"):
-        assert_cache_persistence_configured(config)
-
-
-def test_cache_persistence_assertion_fails_when_load_state_false() -> None:
-    config = CachePersistenceConfig(
-        save_state=True, load_state=False, database=object(), load_cache=True, flush_on_start=False
-    )
-    with pytest.raises(CachePersistenceMisconfiguredError, match="load_state"):
-        assert_cache_persistence_configured(config)
-
-
-def test_cache_persistence_assertion_fails_when_load_cache_false() -> None:
-    """ExecEngineConfig.load_cache=False: ExecutionEngine.load_cache() is
-    never invoked at all, so Cache.cache_general() never runs.
+def test_a_store_the_gate_would_lose_its_latch_through_is_refused() -> None:
+    """End-to-end in intent: a store whose state does not outlive the process
+    is exactly the one that launders a UA-trap halt across a crash-loop.
     """
-    config = CachePersistenceConfig(
-        save_state=True, load_state=True, database=object(), load_cache=False, flush_on_start=False
-    )
-    with pytest.raises(CachePersistenceMisconfiguredError, match="load_cache"):
-        assert_cache_persistence_configured(config)
+    store = InMemoryStateStore()
+    gate = SettlementGate(store=store, clock=_FakeClock(), sites=_DEFAULT_TEST_SITES)
+    gate.record_forbidden_403(VENUE, CITY, detail="cold start")
+    assert gate.status(VENUE, CITY).state is GateState.BLOCKED
+
+    with pytest.raises(StateStoreNotDurableError):
+        assert_state_store_durable(store, opener=InMemoryStateStore)
 
 
-def test_cache_persistence_assertion_fails_when_flush_on_start_true() -> None:
-    """CacheConfig.flush_on_start=True: kernel.py's own gating
-    (`not flush_on_start`) skips ExecutionEngine.load_cache() even though
-    load_cache=True and a database is configured.
+def test_the_durability_probe_does_not_disturb_gate_state() -> None:
+    """The probe writes to the SAME store the gate uses, so its key must not
+    collide with any `gate:` key -- a probe that clobbered the global entry
+    would clear a halt at every startup.
     """
-    config = CachePersistenceConfig(
-        save_state=True, load_state=True, database=object(), load_cache=True, flush_on_start=True
-    )
-    with pytest.raises(CachePersistenceMisconfiguredError, match="flush_on_start"):
-        assert_cache_persistence_configured(config)
+    backing: dict[str, bytes] = {}
+    store = InMemoryStateStore(backing)
+    gate = SettlementGate(store=store, clock=_FakeClock(), sites=_DEFAULT_TEST_SITES)
+    gate.record_forbidden_403(VENUE, CITY, detail="cold start")
+    before = dict(backing)
+
+    assert_state_store_durable(store, opener=lambda: InMemoryStateStore(backing))
+
+    assert store.get(_GLOBAL_KEY) == before[_GLOBAL_KEY]
+    assert {k: v for k, v in backing.items() if k.startswith("gate:")} == before
+    assert gate.status(VENUE, CITY).reason is GateReason.UA_TRAP_403
+    assert set(backing) - set(before) == {DURABILITY_PROBE_KEY}
 
 
-def test_cache_persistence_assertion_fails_when_all_five_unset() -> None:
-    config = CachePersistenceConfig(
-        save_state=False, load_state=False, database=None, load_cache=False, flush_on_start=True
-    )
-    with pytest.raises(CachePersistenceMisconfiguredError):
-        assert_cache_persistence_configured(config)
-
-
-class _FakeKernelConfig:
-    """Models NautilusKernelConfig (e.g. TradingNodeConfig), which is
-    where save_state/load_state actually live -- measured at
-    nautilus_trader/system/config.py:122-123. Deliberately NOT named
-    "ActorConfig": that was the bug.
+def test_the_real_sqlite_store_keeps_a_ua_trap_across_a_true_restart(tmp_path) -> None:  # type: ignore[no-untyped-def]
+    """The positive case the old five-setting assertion could never actually
+    reach: a UA-trap latch written through the REAL durable store, read back by
+    a completely new store object over the same file, after the first was
+    closed.
     """
+    from breezy.runtime.sqlite_store import SqliteStateStore
 
-    def __init__(self, save_state: bool, load_state: bool) -> None:
-        self.save_state = save_state
-        self.load_state = load_state
+    path = tmp_path / "state.sqlite3"
+    with SqliteStateStore(path) as first:
+        assert_state_store_durable(first, opener=lambda: SqliteStateStore(path))
+        gate = SettlementGate(store=first, clock=_FakeClock(), sites=_DEFAULT_TEST_SITES)
+        gate.record_forbidden_403(VENUE, CITY, detail="cold start")
+        assert gate.status(VENUE, CITY).state is GateState.BLOCKED
 
-
-class _FakeCacheConfig:
-    def __init__(self, database: object | None, flush_on_start: bool = False) -> None:
-        self.database = database
-        self.flush_on_start = flush_on_start
-
-
-class _FakeExecEngineConfig:
-    def __init__(self, load_cache: bool) -> None:
-        self.load_cache = load_cache
-
-
-def test_cache_persistence_config_from_real_shaped_objects() -> None:
-    kernel_config = _FakeKernelConfig(save_state=True, load_state=True)
-    cache_config = _FakeCacheConfig(database=object(), flush_on_start=False)
-    exec_engine_config = _FakeExecEngineConfig(load_cache=True)
-    config = cache_persistence_config_from(kernel_config, cache_config, exec_engine_config)
-    assert_cache_persistence_configured(config)  # must not raise
-
-
-def test_cache_persistence_config_from_detects_unset_database() -> None:
-    kernel_config = _FakeKernelConfig(save_state=True, load_state=True)
-    cache_config = _FakeCacheConfig(database=None)
-    exec_engine_config = _FakeExecEngineConfig(load_cache=True)
-    config = cache_persistence_config_from(kernel_config, cache_config, exec_engine_config)
-    with pytest.raises(CachePersistenceMisconfiguredError, match="database"):
-        assert_cache_persistence_configured(config)
-
-
-def test_cache_persistence_config_from_detects_flush_on_start() -> None:
-    kernel_config = _FakeKernelConfig(save_state=True, load_state=True)
-    cache_config = _FakeCacheConfig(database=object(), flush_on_start=True)
-    exec_engine_config = _FakeExecEngineConfig(load_cache=True)
-    config = cache_persistence_config_from(kernel_config, cache_config, exec_engine_config)
-    with pytest.raises(CachePersistenceMisconfiguredError, match="flush_on_start"):
-        assert_cache_persistence_configured(config)
-
-
-def test_cache_persistence_config_from_detects_load_cache_false() -> None:
-    kernel_config = _FakeKernelConfig(save_state=True, load_state=True)
-    cache_config = _FakeCacheConfig(database=object())
-    exec_engine_config = _FakeExecEngineConfig(load_cache=False)
-    config = cache_persistence_config_from(kernel_config, cache_config, exec_engine_config)
-    with pytest.raises(CachePersistenceMisconfiguredError, match="load_cache"):
-        assert_cache_persistence_configured(config)
-
-
-def test_cache_persistence_config_from_missing_kernel_attrs_raises() -> None:
-    class _Empty:
-        pass
-
-    with pytest.raises(CachePersistenceMisconfiguredError):
-        cache_persistence_config_from(
-            _Empty(), _FakeCacheConfig(database=object()), _FakeExecEngineConfig(load_cache=True)
+    with SqliteStateStore(path) as second:
+        restarted = SettlementGate(
+            store=second, clock=_FakeClock(), sites=_DEFAULT_TEST_SITES
         )
+        status = restarted.status(VENUE, CITY)
 
+    assert status.state is GateState.BLOCKED
+    assert status.reason is GateReason.UA_TRAP_403
 
-def test_cache_persistence_config_from_missing_cache_database_attr_raises() -> None:
-    class _Empty:
-        pass
-
-    with pytest.raises(CachePersistenceMisconfiguredError):
-        cache_persistence_config_from(
-            _FakeKernelConfig(True, True), _Empty(), _FakeExecEngineConfig(load_cache=True)
-        )
-
-
-def test_cache_persistence_config_from_missing_flush_on_start_attr_raises() -> None:
-    class _CacheConfigMissingFlushOnStart:
-        def __init__(self) -> None:
-            self.database = object()
-
-    with pytest.raises(CachePersistenceMisconfiguredError):
-        cache_persistence_config_from(
-            _FakeKernelConfig(True, True),
-            _CacheConfigMissingFlushOnStart(),
-            _FakeExecEngineConfig(load_cache=True),
-        )
-
-
-def test_cache_persistence_config_from_missing_exec_engine_attrs_raises() -> None:
-    class _Empty:
-        pass
-
-    with pytest.raises(CachePersistenceMisconfiguredError):
-        cache_persistence_config_from(
-            _FakeKernelConfig(True, True), _FakeCacheConfig(database=object()), _Empty()
-        )
 
 
 # ---------------------------------------------------------------------------
@@ -1978,8 +1875,8 @@ def test_ua_trap_survives_simulated_restart_when_fully_configured() -> None:
 
 
 def test_ua_trap_is_laundered_by_restart_when_flush_on_start_true() -> None:
-    """Documents the exact failure the 5-condition assertion exists to
-    catch at deploy time: with flush_on_start=True, kernel.py's own gating
+    """Documents the measured Cache failure that ruled the Cache OUT as the
+    durable store: with flush_on_start=True, kernel.py's own gating
     skips cache_general() even though load_cache=True and a database is
     configured, so the global block is silently gone after restart.
     """

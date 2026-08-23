@@ -30,10 +30,13 @@ written, against the installed ``nautilus_trader==1.231.0``:
   ``[n for n in dir(Actor()) if 'shared'/'service'/'registry'/'container' in n]``
   is empty.
 * ``Cache``'s general store is **bytes-keyed-by-str** (``cache/cache.pyx:1686``,
-  ``:2834``; ``Cache.add(key, object())`` raises ``TypeError`` -- executed). It
-  is a *persistence* seam, which is exactly how the gate and the index already
-  use it, and it structurally cannot hold a live ``SettlementGate``. So Nautilus
-  gives us the durable half for free and none of the object-identity half.
+  ``:2834``; ``Cache.add(key, object())`` raises ``TypeError`` -- executed), so
+  it structurally cannot hold a live ``SettlementGate``. It was also evaluated
+  for the *persistence* half and rejected on measured evidence (``Cache.add``
+  returns before the write is durable, ``Cache.get`` never reads the database,
+  ``Cache.reset()`` can launder a permanent halt -- see
+  ``breezy.runtime.sqlite_store``). So Nautilus gives us neither half here, and
+  both the store and this container are Breezy-owned.
 * ``MessageBus`` routes messages, not object references.
 * ``Trader.add_actor`` gives every Actor its **own** ``Clock`` instance
   (``trading/trader.py:342``, ``clock = self._clock.__class__()``). Five Actors
@@ -46,16 +49,23 @@ written, against the installed ``nautilus_trader==1.231.0``:
   ``ImportableActorConfig`` serialisation. It is not a shared-instance
   guarantee.
 
-**Conclusion:** Nautilus provides the durable key-value seam (used) and no
-per-process service container (built here, from Breezy-owned parts only). This
+**Conclusion:** Nautilus provides neither a durable key-value seam fit for a
+settlement halt nor a per-process service container; both are built here, from
+Breezy-owned parts only, and the durability of the store is PROVEN at startup
+rather than assumed (``gate.assert_state_store_durable``). This
 module imports ``nautilus_trader`` nowhere and modifies it nowhere.
 
-**Wiring.** The composition root constructs one :class:`SharedIngestState` and
-passes it (or its components) into each Actor's ``__init__``. A second
-independent construction raises. There is deliberately **no** module-level
-``current()`` accessor: a global getter would make the shared object reachable
-without injection, and "reachable from anywhere" is how a second, unnoticed
-graph of components gets built in the first place.
+**Wiring.** The composition root constructs one :class:`SharedIngestState`,
+constructs each Actor itself with ``shared=`` injected, and registers them
+through the NATIVE ``Trader.add_actor`` (``trading/trader.py:312``, reached via
+``TradingNode.trader`` at ``live/node.py:139``). The ``ImportableActorConfig``
+route cannot be used for these Actors: ``ActorFactory.create`` ends in
+``actor_cls(config)`` (``common/config.py:614``) -- one positional argument,
+with no seam for a live object. A second independent construction raises. There
+is deliberately **no** module-level ``current()`` accessor: a global getter
+would make the shared object reachable without injection, and "reachable from
+anywhere" is how a second, unnoticed graph of components gets built in the
+first place.
 """
 
 from __future__ import annotations
@@ -70,8 +80,8 @@ from breezy.ingest.gate import (
     CrossSiteBurstPolicy,
     SettlementGate,
     StateStore,
-    assert_cache_persistence_configured,
-    cache_persistence_config_from,
+    StateStoreOpener,
+    assert_state_store_durable,
 )
 from breezy.ingest.http import DEFAULT_BASE_URL, HttpTransport
 from breezy.ingest.product_index import ProductIntegrityIndex
@@ -276,11 +286,11 @@ class SharedIngestState:
     :class:`DuplicateSharedIngestStateError`.
 
     Construction is startup: it runs both deployment preconditions of the
-    brief's SS6 step 0 -- ``assert_cache_persistence_configured`` (five
-    conditions across three config objects) and
-    ``assert_writer_lock_filesystem_supported`` per station root. Both are
-    unenforceable later and silent when violated. Neither is an import-time
-    side effect: nothing at this module's scope calls them.
+    brief's SS6 step 0 -- ``assert_state_store_durable`` (an empirical
+    round-trip through ``store`` and an independent handle on its backing
+    medium) and ``assert_writer_lock_filesystem_supported`` per station root.
+    Both are unenforceable later and silent when violated. Neither is an
+    import-time side effect: nothing at this module's scope calls them.
 
     Parameters
     ----------
@@ -302,9 +312,13 @@ class SharedIngestState:
         and the burst window. Nautilus gives every Actor its own ``Clock``
         object (``trading/trader.py:342``), so a cross-Actor signal cannot be
         timed off any single Actor's clock.
-    kernel_config, cache_config, exec_engine_config : object
-        Duck-typed ``NautilusKernelConfig`` / ``CacheConfig`` /
-        ``ExecEngineConfig``, forwarded to ``cache_persistence_config_from``.
+    store_opener : StateStoreOpener
+        Opens a NEW, independent handle on the same backing medium as
+        ``store``. Used once, at construction, by
+        ``gate.assert_state_store_durable`` to PROVE by round-trip that
+        ``store`` really persists -- the one precondition that cannot be
+        established from a declared flag, because a store that merely appears
+        to persist is the exact failure being defended against.
     burst_policy : CrossSiteBurstPolicy
         See :data:`DEFAULT_BURST_POLICY`.
     allowed_hosts, base_url, user_agent, check_proxy_env
@@ -323,9 +337,7 @@ class SharedIngestState:
         catalog_base: Path,
         store: StateStore,
         clock: Callable[[], int],
-        kernel_config: object,
-        cache_config: object,
-        exec_engine_config: object,
+        store_opener: StateStoreOpener,
         burst_policy: CrossSiteBurstPolicy = DEFAULT_BURST_POLICY,
         allowed_hosts: frozenset[str] = DEFAULT_ALLOWED_HOSTS,
         base_url: str = DEFAULT_BASE_URL,
@@ -348,9 +360,7 @@ class SharedIngestState:
             self._burst_policy = burst_policy
 
             self._assert_deployment_preconditions(
-                kernel_config=kernel_config,
-                cache_config=cache_config,
-                exec_engine_config=exec_engine_config,
+                store_opener=store_opener,
                 probe=probe,
             )
 
@@ -395,9 +405,7 @@ class SharedIngestState:
     def _assert_deployment_preconditions(
         self,
         *,
-        kernel_config: object,
-        cache_config: object,
-        exec_engine_config: object,
+        store_opener: StateStoreOpener,
         probe: Callable[[Path], FilesystemProbe],
     ) -> None:
         """Run both SS6 step-0 preconditions, once, at construction.
@@ -406,10 +414,17 @@ class SharedIngestState:
         gate state that is never persisted looks identical to gate state that
         happens not to have changed, and an ``flock`` on a network filesystem
         returns success while excluding nobody.
+
+        The first precondition is a round-trip PROBE, not a settings check.
+        Its predecessor asserted five Nautilus ``Cache``-persistence settings;
+        that guard demanded ``CacheConfig.database is not None`` while the
+        kernel accepts only ``'redis'`` there, so no Redis-free node config
+        could satisfy it, and it described a mechanism this codebase had
+        already abandoned in favour of
+        ``breezy.runtime.sqlite_store.SqliteStateStore``. What replaces it
+        checks the store actually in use, empirically.
         """
-        assert_cache_persistence_configured(
-            cache_persistence_config_from(kernel_config, cache_config, exec_engine_config),
-        )
+        assert_state_store_durable(self._store, opener=store_opener)
         self._station_roots: dict[tuple[str, str], Path] = {}
         for venue, city in self._sites:
             root = station_catalog_path(self._catalog_base, venue, city)

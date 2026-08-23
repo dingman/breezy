@@ -18,17 +18,17 @@ from __future__ import annotations
 import ast
 import inspect
 from collections.abc import Callable, Iterator, Sequence
-from dataclasses import dataclass
 from pathlib import Path
 
 import pytest
 
 from breezy.ingest.gate import (
-    CachePersistenceMisconfiguredError,
+    DURABILITY_PROBE_KEY,
     GateState,
     InMemoryStateStore,
     SettlementGate,
     StateStore,
+    StateStoreNotDurableError,
 )
 from breezy.ingest.product_index import ProductIntegrityIndex
 from breezy.ingest.shared_state import (
@@ -82,21 +82,18 @@ class FakeClock:
         self.now += ns
 
 
-@dataclass(frozen=True)
-class FakeKernelConfig:
-    save_state: bool = True
-    load_state: bool = True
+def durable_store_pair() -> tuple[InMemoryStateStore, Callable[[], InMemoryStateStore]]:
+    """A store plus an opener over the SAME backing dict.
 
-
-@dataclass(frozen=True)
-class FakeCacheConfig:
-    database: object | None = "postgres://cache"
-    flush_on_start: bool = False
-
-
-@dataclass(frozen=True)
-class FakeExecEngineConfig:
-    load_cache: bool = True
+    The in-process stand-in for "reopen the SQLite file": an independent handle
+    that can only observe a write if the write reached the shared medium, which
+    is exactly what `assert_state_store_durable` probes for. Replaces the three
+    fake Nautilus config objects this module used to carry -- see
+    `tests/unit/test_ingest_state_durability.py` for why that guard was
+    unsatisfiable and described the wrong mechanism.
+    """
+    backing: dict[str, bytes] = {}
+    return InMemoryStateStore(backing), lambda: InMemoryStateStore(backing)
 
 
 class RecordingProbe:
@@ -130,8 +127,22 @@ def clock() -> FakeClock:
 
 
 @pytest.fixture
-def store() -> InMemoryStateStore:
-    return InMemoryStateStore()
+def store_pair() -> tuple[InMemoryStateStore, Callable[[], InMemoryStateStore]]:
+    return durable_store_pair()
+
+
+@pytest.fixture
+def store(
+    store_pair: tuple[InMemoryStateStore, Callable[[], InMemoryStateStore]],
+) -> InMemoryStateStore:
+    return store_pair[0]
+
+
+@pytest.fixture
+def store_opener(
+    store_pair: tuple[InMemoryStateStore, Callable[[], InMemoryStateStore]],
+) -> Callable[[], InMemoryStateStore]:
+    return store_pair[1]
 
 
 @pytest.fixture
@@ -144,6 +155,7 @@ def make_state(
     registry: SiteRegistry,
     clock: FakeClock,
     store: InMemoryStateStore,
+    store_opener: Callable[[], InMemoryStateStore],
     probe: RecordingProbe,
     tmp_path: Path,
 ) -> Iterator[Callable[..., SharedIngestState]]:
@@ -159,9 +171,7 @@ def make_state(
             "catalog_base": tmp_path / "nws",
             "store": store,
             "clock": clock,
-            "kernel_config": FakeKernelConfig(),
-            "cache_config": FakeCacheConfig(),
-            "exec_engine_config": FakeExecEngineConfig(),
+            "store_opener": store_opener,
             "probe": probe,
         }
         kwargs.update(overrides)
@@ -235,8 +245,8 @@ def test_a_failed_startup_precondition_does_not_wedge_the_process(
     leaving the process slot claimed by a half-built container would turn one
     config error into an unrecoverable one.
     """
-    with pytest.raises(CachePersistenceMisconfiguredError):
-        make_state(cache_config=FakeCacheConfig(flush_on_start=True))
+    with pytest.raises(StateStoreNotDurableError):
+        make_state(store=InMemoryStateStore(), store_opener=InMemoryStateStore)
 
     state = make_state()
 
@@ -248,22 +258,60 @@ def test_a_failed_startup_precondition_does_not_wedge_the_process(
 # ---------------------------------------------------------------------------
 
 
+class _NonDurableStore(InMemoryStateStore):
+    """Accepts every write and persists nothing -- the shape of a store that
+    silently launders a permanent halt.
+    """
+
+    def set(self, key: str, value: bytes) -> None:
+        return None
+
+
+class _RaisingStore(InMemoryStateStore):
+    def set(self, key: str, value: bytes) -> None:
+        raise OSError("read-only filesystem")
+
+
+def _broken_opener() -> InMemoryStateStore:
+    raise OSError("cannot open a second handle")
+
+
 @pytest.mark.parametrize(
-    "overrides",
+    ("store_override", "opener_override"),
     [
-        {"kernel_config": FakeKernelConfig(save_state=False)},
-        {"kernel_config": FakeKernelConfig(load_state=False)},
-        {"cache_config": FakeCacheConfig(database=None)},
-        {"cache_config": FakeCacheConfig(flush_on_start=True)},
-        {"exec_engine_config": FakeExecEngineConfig(load_cache=False)},
+        # Nothing was ever written.
+        (_NonDurableStore(), _NonDurableStore),
+        # Written, but only ever visible to the writing handle (`Cache.add`).
+        (InMemoryStateStore(), InMemoryStateStore),
+        # The store itself cannot write at all.
+        (_RaisingStore(), _RaisingStore),
+        # Durability cannot be established -- which must NOT be read as a pass.
+        (InMemoryStateStore(), _broken_opener),
     ],
+    ids=["writes-dropped", "write-not-shared", "store-raises", "opener-raises"],
 )
-def test_each_of_the_five_cache_persistence_conditions_fails_closed(
+def test_a_state_store_that_cannot_be_shown_durable_fails_closed(
     make_state: Callable[..., SharedIngestState],
-    overrides: dict[str, object],
+    store_override: InMemoryStateStore,
+    opener_override: Callable[[], InMemoryStateStore],
 ) -> None:
-    with pytest.raises(CachePersistenceMisconfiguredError):
-        make_state(**overrides)
+    with pytest.raises(StateStoreNotDurableError):
+        make_state(store=store_override, store_opener=opener_override)
+
+
+def test_a_genuinely_durable_store_is_accepted(
+    make_state: Callable[..., SharedIngestState],
+    tmp_path: Path,
+) -> None:
+    """The positive case the removed Cache guard could never reach: the REAL
+    durable store, certified by round-trip rather than by declaration.
+    """
+    from breezy.runtime.sqlite_store import SqliteStateStore
+
+    path = tmp_path / "durable" / "state.sqlite3"
+    with SqliteStateStore(path) as real_store:
+        state = make_state(store=real_store, store_opener=lambda: SqliteStateStore(path))
+        assert state.store is real_store
 
 
 def test_writer_lock_filesystem_is_probed_once_per_station_root(
@@ -300,8 +348,7 @@ def test_neither_precondition_is_an_import_time_side_effect() -> None:
     from breezy.ingest import shared_state
 
     guarded = {
-        "assert_cache_persistence_configured",
-        "cache_persistence_config_from",
+        "assert_state_store_durable",
         "assert_writer_lock_filesystem_supported",
         "probe_filesystem",
         "station_catalog_path",
@@ -427,10 +474,15 @@ def test_gate_and_index_share_one_store_without_key_collision(
     gate_keys = {k for k in keys if k.startswith("gate:")}
     index_keys = {k for k in keys if k.startswith("productidx:")}
 
+    # The startup durability probe writes to this same store, so it is a
+    # THIRD namespace that must not collide with either of the other two.
+    probe_keys = {DURABILITY_PROBE_KEY}
+
     assert gate_keys
     assert index_keys
     assert not (gate_keys & index_keys)
-    assert gate_keys | index_keys == keys
+    assert not (probe_keys & (gate_keys | index_keys))
+    assert gate_keys | index_keys | probe_keys == keys
 
 
 def test_a_second_gate_over_the_same_store_sees_the_shared_state(
