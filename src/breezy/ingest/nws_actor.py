@@ -119,7 +119,7 @@ import json
 import logging
 from collections.abc import Callable, Sequence
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import timedelta
 from functools import lru_cache
 from pathlib import Path
@@ -945,20 +945,45 @@ class NwsIngestActor(Actor):
         # and 1. No default of `1` -- a silent one would mask a missing
         # increment on a correction, and the settlement resolver re-checks the
         # LATEST revision for a climate day, not the first ingested.
+        # WI-11: a fast backlog drain can land two SEPARATE polls on the same
+        # clock tick (the injected nanosecond clock genuinely reads the same
+        # instant twice, or a warm-start replay is fast enough that it
+        # measurably does). `ts_init` is `retrieved_at_ns` (fetch time), so
+        # two single-product batches that share a tick produce a `ts_init`
+        # range for this batch that EXACTLY matches a range already on disk.
+        # `write_records` discards an exact-range rewrite SILENTLY
+        # (`persistence/catalog.py` module docstring, "Corrections"), which
+        # routes to `record_write_integrity_violation` -- CRIT, hard-block --
+        # and the second poll's products are durably lost. Every candidate
+        # reaching this point already passed `_undeduped` (SS3.4 Job 1), so
+        # its content is never a legitimate duplicate of what's on disk; a
+        # collision here is ALWAYS a fresh product colliding on the clock
+        # alone, never a rewrite that should be rejected. Nudging this
+        # batch's stamp strictly past the catalog's current maximum
+        # `ts_init` is therefore always correct, not merely a workaround: it
+        # never reorders anything relative to what is already durable, and
+        # only degrades timestamp precision (by nanoseconds) for the
+        # specific candidates whose real fetch instant already collided.
         seq_by_day: dict[dt.date, int] = {}
+        existing_max_ts_init: int | None = None
         for record in existing:
             if record.station != self._site.cli_location:
                 continue
             seq_by_day[record.climate_day] = seq_by_day.get(record.climate_day, 0) + 1
+            if existing_max_ts_init is None or record.ts_init > existing_max_ts_init:
+                existing_max_ts_init = record.ts_init
 
         records: list[Data] = []
         for candidate in prepared:
             day = candidate.parsed.summary_date
             seq_by_day[day] = seq_by_day.get(day, 0) + 1
+            fetch = candidate.fetch
+            if existing_max_ts_init is not None and fetch.retrieved_at_ns <= existing_max_ts_init:
+                fetch = replace(fetch, retrieved_at_ns=existing_max_ts_init + 1)
             raw_product = build_raw_product(
                 site=self._site,
                 registry_version=self._registry_version,
-                fetch=candidate.fetch,
+                fetch=fetch,
                 product_text=candidate.envelope.product_text,
                 product_uuid=candidate.envelope.product_uuid,
                 product_code=candidate.envelope.product_code,
