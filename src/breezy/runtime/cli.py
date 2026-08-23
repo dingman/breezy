@@ -54,7 +54,7 @@ from breezy.persistence.catalog import (
     probe_filesystem,
 )
 from breezy.registry.sites import RegistryError
-from breezy.runtime.composition import ingest_runtime
+from breezy.runtime.composition import BreezyIngestRuntime, build_ingest_node, ingest_runtime
 from breezy.runtime.node_config import NodeConfigError
 from breezy.runtime.settings import SettingsError, load_settings
 
@@ -109,11 +109,17 @@ def _report(stderr: TextIO, prefix: str, exc: BaseException, *, expected: bool) 
     logger.log(level, "%s: %s", prefix, exc, exc_info=True)
 
 
-def _run_node(config: TradingNodeConfig, node_factory: NodeFactory, stderr: TextIO) -> int:
-    """Build, run and always dispose the node. Never raises."""
+def _run_node(runtime: BreezyIngestRuntime, node_factory: NodeFactory, stderr: TextIO) -> int:
+    """Build, run and always dispose the node. Never raises.
+
+    The node is constructed through ``composition.build_ingest_node`` rather
+    than ``node_factory(config)`` directly, so every configured
+    ``NwsIngestActor`` (``shared=`` injected) is registered on it via the
+    native ``Trader.add_actor`` before ``build()`` runs.
+    """
     node: Node | None = None
     try:
-        node = node_factory(config)
+        node = build_ingest_node(runtime, node_factory=node_factory)
         node.build()
         node.run()
         return EXIT_OK
@@ -155,7 +161,7 @@ def run(
         with ingest_runtime(settings, probe=probe) as runtime:
             if on_runtime is not None:
                 on_runtime(runtime.shared)
-            return _run_node(runtime.node_config, node_factory, out)
+            return _run_node(runtime, node_factory, out)
     except _CONFIG_ERRORS as exc:
         _report(out, "configuration error", exc, expected=True)
         return EXIT_CONFIG_ERROR

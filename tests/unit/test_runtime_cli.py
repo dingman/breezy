@@ -16,11 +16,22 @@ import pytest
 from nautilus_trader.config import TradingNodeConfig
 
 import breezy
+from breezy.ingest.nws_actor import NwsIngestActor
 from breezy.ingest.shared_state import SharedIngestState
 from breezy.persistence.catalog import FilesystemLocality, FilesystemProbe
 from breezy.runtime import cli
 
 SITES: tuple[tuple[str, str], ...] = (("polymarket_us", "NYC"),)
+
+
+class FakeTrader:
+    """Records `Trader.add_actor` calls without a real Trader."""
+
+    def __init__(self) -> None:
+        self.added_actors: list[object] = []
+
+    def add_actor(self, actor: object) -> None:
+        self.added_actors.append(actor)
 
 
 class FakeNode:
@@ -32,6 +43,7 @@ class FakeNode:
         self.config = config
         self.calls: list[str] = []
         self._run_error = run_error
+        self.trader = FakeTrader()
         FakeNode.instances.append(self)
 
     def build(self) -> None:
@@ -97,13 +109,30 @@ class TestRun:
         # `actor_cls(config)` (`common/config.py:614`), so the
         # `ImportableActorConfig` route cannot construct it. Actors are built
         # and registered by `composition.build_ingest_node` through the native
-        # `Trader.add_actor`.
-        #
-        # KNOWN GAP: this module still calls `node_factory(config)` directly,
-        # so the node it runs has NO ingest actors registered. Wiring
-        # `build_ingest_node` in here is a one-line change to `_run_node`,
-        # deliberately not made in this change (this module was out of scope).
+        # `Trader.add_actor` -- see
+        # `test_ingest_actors_are_registered_on_the_node_via_trader_add_actor`.
         assert config.actors == []
+
+    def test_ingest_actors_are_registered_on_the_node_via_trader_add_actor(
+        self, env: dict[str, str]
+    ) -> None:
+        """Regression: the node `cli.run` runs must carry the ingest Actors.
+
+        A node with zero registered Actors builds and runs cleanly forever
+        while ingesting nothing -- silently. Asserting `config.actors == []`
+        (as `test_the_node_receives_the_composed_config` does) is correct but
+        insufficient: it would still pass with zero Actors registered. This
+        test asserts the Actors are actually present on `node.trader`, wired
+        through the native `Trader.add_actor`.
+        """
+        stderr = io.StringIO()
+
+        code = cli.run(env=env, node_factory=FakeNode, probe=local_probe, stderr=stderr)
+
+        assert code == cli.EXIT_OK
+        node = FakeNode.instances[-1]
+        assert len(node.trader.added_actors) == len(SITES)
+        assert all(isinstance(actor, NwsIngestActor) for actor in node.trader.added_actors)
 
     def test_shared_ingest_state_is_disposed_after_the_run(
         self, env: dict[str, str]
