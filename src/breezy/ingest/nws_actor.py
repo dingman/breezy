@@ -152,7 +152,10 @@ from breezy.ingest.nws_envelope import (
     parse_discovery_list,
     parse_product_envelope,
 )
-from breezy.ingest.product_index import ProductIntegrityIndex
+from breezy.ingest.product_index import (
+    CorruptProductIndexEntryError,
+    ProductIntegrityIndex,
+)
 from breezy.ingest.records import build_climate_day, build_raw_product
 from breezy.ingest.routing import (
     GateAction,
@@ -815,9 +818,10 @@ class NwsIngestActor(Actor):
             # neither the staleness watchdog nor FINAL_CLI_OVERDUE fired.
             return
 
-        # -- step 8: the integrity tripwire, for the whole batch.
+        # -- step 8: the integrity tripwire, for the whole batch. READ-ONLY
+        # here; the durable mark is step 11b, after the write is confirmed.
         for candidate in prepared:
-            if not self._observe_integrity(candidate):
+            if not self._check_integrity(candidate):
                 return
 
         # -- steps 9-11.
@@ -838,6 +842,36 @@ class NwsIngestActor(Actor):
 
         if records is None:
             return
+
+        # -- step 11b: NOW the uuids are durably "seen".
+        #
+        # This must never run before the write above is CONFIRMED. The mark is
+        # what `_undeduped` (SS3.4 Job 1) consults to decide a product has
+        # already been ingested, and it is durable -- so a mark written ahead
+        # of a persist that then fails (or a process death in that window) is
+        # permanent, silent data loss: the uuid reads as already-seen forever,
+        # the product is never re-fetched, and it is absent from the catalog.
+        # That is exactly how a corrected FINAL disappears with no alert and a
+        # position settles on the superseded temperature.
+        #
+        # Reversing the order fails in the recoverable direction instead. A
+        # crash between the confirmed write and this mark costs only the mark:
+        # the next poll re-fetches and re-persists a product already on disk.
+        # `_persist_batch` nudges a colliding `retrieved_at_ns` strictly past
+        # the catalog's current maximum `ts_init` (WI-11), so that re-write
+        # appends a later revision of identical content rather than tripping
+        # the exact-range rewrite `write_records` reports as `skipped`; and
+        # supersession resolves by `(is_final, ts_init, revision_seq)`, so the
+        # settled readings are unchanged. A duplicate revision is a cost. A
+        # lost correction is not survivable.
+        #
+        # Before publish, not after: `_observe_integrity` is the only remaining
+        # write here, and a death between it and the publish is already covered
+        # -- the records are durable and the cursor has not moved, so warm start
+        # republishes them.
+        for candidate in prepared:
+            if not self._observe_integrity(candidate):
+                return
 
         # -- step 12: publish, then advance the cursor.
         self._publish_records(records)
@@ -1007,8 +1041,79 @@ class NwsIngestActor(Actor):
             )
         return parse_product_envelope(payload)
 
+    def _integrity_alarm(self, uuid: str, detail: str) -> None:
+        # `routing` has no producer for a product-index MISMATCH; the closest
+        # exact recorder is the transport integrity alarm, which is the correct
+        # severity (CRIT, hard-block) and the correct claim: the datum's digest
+        # cannot be trusted.
+        self.gate.record_transport_integrity_alarm(
+            self._venue,
+            self._city,
+            detail=f"product-index MISMATCH for {uuid}: {detail}",
+        )
+
+    @staticmethod
+    def _require_digest(prepared: _PreparedProduct) -> str:
+        digest = prepared.fetch.sha256
+        if digest is None:  # pragma: no cover - guaranteed by FetchResult
+            raise ValueError("a non-304 FetchResult must carry a digest")
+        return digest
+
+    def _check_integrity(self, prepared: _PreparedProduct) -> bool:
+        """SS3.4 Job 2 at step 8 -- the tripwire's VERDICT, with no write.
+
+        The check and the durable record are deliberately split across the
+        catalog write: the verdict has to precede the write (mutated bytes must
+        never be persisted or published), while the record has to follow it
+        (see the step 11b comment in :meth:`poll_once` -- a durable mark ahead
+        of a confirmed persist is permanent silent data loss). This half is
+        therefore strictly read-only, and :meth:`_observe_integrity` performs
+        the identical comparison again afterwards on the durable path.
+
+        Same verdict as :meth:`_observe_integrity`, reached through the
+        read-only accessor: an entry whose digest differs is the CRIT event,
+        and unreadable persisted evidence -- which
+        :meth:`~breezy.ingest.product_index.ProductIntegrityIndex.known_digest`
+        reports by RAISING rather than by returning ``None``, so corruption can
+        never read as a clean slate -- is the same event. A ``store.get`` that
+        raises still propagates (fail-closed into task supervision) exactly as
+        before.
+        """
+        digest = self._require_digest(prepared)
+        uuid = prepared.envelope.product_uuid
+        try:
+            known = self.product_index.known_digest(uuid)
+        except CorruptProductIndexEntryError as exc:
+            self._integrity_alarm(
+                uuid,
+                f"cannot verify product_uuid={uuid}: {exc.detail}. "
+                "Failing closed -- an unreadable entry is not a clean slate.",
+            )
+            return False
+        if known is None or known == digest:
+            return True
+        self._integrity_alarm(
+            uuid,
+            f"INTEGRITY: product_uuid={uuid} was first seen with "
+            f"raw_sha256={known} and is now reported as raw_sha256={digest}. "
+            "An already-issued NWS product changed bytes under a stable uuid "
+            "-- upstream mutation, not a revision.",
+        )
+        return False
+
     def _observe_integrity(self, prepared: _PreparedProduct) -> bool:
-        """SS3.4 Job 2 -- the tripwire, and it should never fire.
+        """SS3.4 Job 2 at step 11b -- the tripwire's DURABLE RECORD, and it
+        should never fire.
+
+        Runs only after the catalog write is CONFIRMED (see the step 11b
+        comment in :meth:`poll_once`), because
+        :meth:`~breezy.ingest.product_index.ProductIntegrityIndex.observe`
+        writes the uuid durably and that mark is what suppresses every future
+        re-fetch. :meth:`_check_integrity` has already returned the same
+        verdict read-only before the write, so an alarm here means the index
+        gained a conflicting entry mid-poll; it is kept rather than assumed
+        away, and it is still fail-closed -- the records are durable and the
+        cursor has not moved, so warm start republishes them.
 
         NWS assigns a fresh uuid to every re-issue and ``/products/{id}``
         bodies are immutable by id, so after discovery-time dedupe this can
@@ -1023,22 +1128,12 @@ class NwsIngestActor(Actor):
         the poll aborts into task supervision, the site blocks) and it avoids
         latching a sticky CRIT on a transient cache blip.
         """
-        digest = prepared.fetch.sha256
-        if digest is None:  # pragma: no cover - guaranteed by FetchResult
-            raise ValueError("a non-304 FetchResult must carry a digest")
+        digest = self._require_digest(prepared)
         uuid = prepared.envelope.product_uuid
         observation = self.product_index.observe(uuid, digest)
         if not observation.is_integrity_alarm:
             return True
-        # `routing` has no producer for a product-index MISMATCH; the closest
-        # exact recorder is the transport integrity alarm, which is the correct
-        # severity (CRIT, hard-block) and the correct claim: the datum's digest
-        # cannot be trusted.
-        self.gate.record_transport_integrity_alarm(
-            self._venue,
-            self._city,
-            detail=f"product-index MISMATCH for {uuid}: {observation.detail}",
-        )
+        self._integrity_alarm(uuid, observation.detail)
         return False
 
     async def _persist_batch(

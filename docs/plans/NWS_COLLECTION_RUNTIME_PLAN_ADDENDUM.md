@@ -129,3 +129,24 @@ BLOCKER pins exist as tests.
   `ingest/http.py:577-587` (`verify=<TLS1.2+ ctx>`, `follow_redirects=False`,
   `trust_env=False`, bounded timeouts). `HttpTransport` is a single concrete
   NWS-specific class with no reusable base.
+
+## 6. Late correction: the catalog is NOT idempotent
+
+Measured while closing the observe-before-persist race. Recorded because the
+opposite was assumed in a dispatch brief and is easy to assume again.
+
+| Component | Idempotent on re-write? |
+|---|---|
+| `ProductIntegrityIndex.observe` (`ingest/product_index.py`) | **Yes.** First-write-wins; a second `(uuid, digest)` returns `MATCH` read-only and rewrites nothing. |
+| `catalog.write_records` (`persistence/catalog.py:422`) | **No.** Append-only by design: groups by type, calls `write_data`, verifies by read-back. There is no `product_uuid` key in it, and `NwsClimateDay` has no such field (only `NwsRawProduct` does, `domain/nws_raw_product.py:162`). A re-persist APPENDS A DUPLICATE. |
+
+Consequence for anyone reordering the ingest path: re-persisting is safe only
+because `_persist_batch` nudges `retrieved_at_ns` strictly past the catalog's
+current max `ts_init` (the WI-11 guard). That turns a re-persist into a later
+revision of identical content instead of an exact `ts_init`-range rewrite —
+and an exact-range rewrite is precisely what `write_records` reports as
+`skipped`, routing to `record_write_integrity_violation` (CRIT hard-block).
+Supersession then resolves on `(is_final, ts_init, revision_seq)` to the same
+readings, so settlement is unaffected; the cost is one redundant revision row.
+
+Do not "simplify" that nudge away on the belief that the catalog dedupes.
