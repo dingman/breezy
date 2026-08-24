@@ -393,26 +393,60 @@ def test_actor_config_stagger_offset_defaults_to_zero() -> None:
 
 
 class SlowTracker:
-    """An `AlertState` stand-in whose `dispatch` blocks for a real interval.
+    """An `AlertState` stand-in that DECIDES one payload without blocking.
 
-    Stands in for the whole `AlertState.dispatch -> emit_alert ->
-    WebhookAlertSink.emit -> httpx.Client.post` chain, whose default timeout
-    is 5 seconds. No socket is opened; the block is a `time.sleep`, which is
-    exactly as loop-hostile as a synchronous `post`.
+    Mirrors the real class's shape: `evaluate` is the read-modify-write half
+    (loop-thread confined, must stay fast) and `dispatch` is `evaluate` plus
+    the blocking fan-out. Defining `evaluate` here is what lets the wiring
+    confine the state mutation to the loop thread -- the previous stub had
+    only `dispatch`, so the split raised `AttributeError`.
     """
 
     def __init__(self, block_s: float) -> None:
         self.block_s = block_s
         self.calls = 0
 
-    def dispatch(self, sink: Any, conditions: Any, *, now_ns: int) -> int:
+    def evaluate(self, conditions: Any, *, now_ns: int) -> tuple[health.AlertPayload, ...]:
         self.calls += 1
+        return (
+            health.AlertPayload(
+                severity="CRITICAL", event="test", site="polymarket_us/NYC", detail="d"
+            ),
+        )
+
+    def dispatch(self, sink: Any, conditions: Any, *, now_ns: int) -> int:
+        payloads = self.evaluate(conditions, now_ns=now_ns)
+        for payload in payloads:
+            health.emit_alert(sink, payload)
+        return len(payloads)
+
+
+class SlowSink:
+    """The blocking half, where the latency actually lives in production:
+    `emit_alert -> WebhookAlertSink.emit -> httpx.Client.post`, whose default
+    timeout is 5 seconds. No socket is opened; the block is a `time.sleep`,
+    which is exactly as loop-hostile as a synchronous `post`.
+    """
+
+    def __init__(self, block_s: float) -> None:
+        self.block_s = block_s
+        self.emitted = 0
+
+    def emit(self, payload: health.AlertPayload) -> None:
+        self.emitted += 1
         time.sleep(self.block_s)
-        return 0
 
 
 class RaisingTracker:
+    def evaluate(self, conditions: Any, *, now_ns: int) -> tuple[health.AlertPayload, ...]:
+        raise ssl.SSLError("certificate verify failed")
+
     def dispatch(self, sink: Any, conditions: Any, *, now_ns: int) -> int:
+        raise ssl.SSLError("certificate verify failed")
+
+
+class RaisingSink:
+    def emit(self, payload: health.AlertPayload) -> None:
         raise ssl.SSLError("certificate verify failed")
 
 
@@ -431,8 +465,10 @@ async def test_a_slow_alert_sink_does_not_stall_the_event_loop(
     try:
         actor = actors[0]
         _register(actor)
-        tracker = SlowTracker(block_s=0.5)
+        tracker = SlowTracker(block_s=0.0)
+        slow_sink = SlowSink(block_s=0.5)
         actor._alert_state = tracker  # type: ignore[assignment]
+        actor.alert_sink = slow_sink
 
         ticks = 0
         running = True
@@ -451,9 +487,10 @@ async def test_a_slow_alert_sink_does_not_stall_the_event_loop(
             await beat
 
         assert tracker.calls == 1
+        assert slow_sink.emitted == 1, "the slow sink was never actually reached"
         assert ticks >= 10, (
             f"the event loop advanced only {ticks} ticks while the sink blocked "
-            "for 0.5s -- the dispatch is still running on the loop thread"
+            "for 0.5s -- the sink fan-out is still running on the loop thread"
         )
     finally:
         _shutdown(actors)
@@ -469,6 +506,26 @@ async def test_an_alert_sink_failure_still_never_reaches_the_poll_path(
         actor = actors[0]
         _register(actor)
         actor._alert_state = RaisingTracker()  # type: ignore[assignment]
+
+        await actor.reconcile_and_report()  # must not raise
+    finally:
+        _shutdown(actors)
+
+
+@pytest.mark.asyncio
+async def test_a_raising_alert_sink_still_never_reaches_the_poll_path(
+    runtime: BreezyIngestRuntime,
+) -> None:
+    """The containment contract's real shape after the evaluate/emit split:
+    the failure is in the SINK, and `emit_alert` must still swallow it inside
+    the executor rather than letting it surface as poll-cycle death.
+    """
+    actors = build_ingest_actors(runtime)
+    try:
+        actor = actors[0]
+        _register(actor)
+        actor._alert_state = SlowTracker(block_s=0.0)  # type: ignore[assignment]
+        actor.alert_sink = RaisingSink()
 
         await actor.reconcile_and_report()  # must not raise
     finally:
@@ -501,7 +558,12 @@ def test_the_snapshot_dir_env_var_reaches_every_actor(tmp_path: Path) -> None:
         actors = build_ingest_actors(rt)
         try:
             assert {str(a.health_snapshot_path) for a in actors} == {
-                str(snapshot_dir / f"health-{v}-{c}.json") for v, c in FIVE_SITES
+                # `.` separates venue from city, and is excluded from the
+                # label alphabet, so the mapping is injective -- see
+                # `site_snapshot_path`'s docstring and
+                # `test_site_snapshot_path_is_injective_*`.
+                str(snapshot_dir / f"health-{v}.{c}.json")
+                for v, c in FIVE_SITES
             }
             assert all(a.alert_sink is sink for a in actors)
             assert sorted(a.config.stagger_offset_seconds for a in actors) == [
@@ -555,3 +617,87 @@ def test_stagger_spacing_stays_inside_the_cross_site_burst_window() -> None:
         f"burst window is only {DEFAULT_BURST_POLICY.window_ns / 1e9}s -- a "
         "process-wide UA trap would no longer register as cross-site"
     )
+
+
+# ---------------------------------------------------------------------------
+# `site_snapshot_path` must be INJECTIVE (review finding 1)
+# ---------------------------------------------------------------------------
+
+
+def test_site_snapshot_path_is_injective_across_the_venue_city_boundary(
+    tmp_path: Path,
+) -> None:
+    """Two DIFFERENT sites must never resolve to one file.
+
+    `POLYMARKET-US` is an ordinary venue value. If the separator between
+    `venue` and `city` can also occur INSIDE a label, `("POLY-US", "NYC")`
+    and `("POLY", "US-NYC")` collide, two Actors clobber one file every
+    poll cycle, and a WEDGED site's file keeps receiving a fresh mtime and
+    healthy contents from its sibling -- so the runbook's per-file staleness
+    check reports healthy for a site that stopped collecting. That defeats
+    the entire reason per-site files were chosen over an aggregator.
+    """
+    left = site_snapshot_path(tmp_path, "POLY-US", "NYC")
+    right = site_snapshot_path(tmp_path, "POLY", "US-NYC")
+
+    assert left != right, f"distinct sites collided onto {left}"
+
+
+def test_site_snapshot_path_is_injective_over_a_grid_of_labels(tmp_path: Path) -> None:
+    """Exhaustive over a small grid whose members are exactly the shapes
+    that can alias under a naive `f"health-{venue}-{city}.json"`.
+    """
+    labels = ("A", "B", "A-B", "B-A", "A_B", "A-B-C", "AB")
+    seen: dict[Path, tuple[str, str]] = {}
+    for venue in labels:
+        for city in labels:
+            path = site_snapshot_path(tmp_path, venue, city)
+            assert path not in seen, f"{(venue, city)} collided with {seen[path]} onto {path}"
+            seen[path] = (venue, city)
+    assert len(seen) == len(labels) ** 2
+
+
+def test_site_snapshot_path_still_rejects_every_traversal_shape(tmp_path: Path) -> None:
+    """The containment guard must not be weakened by the injectivity fix."""
+    for bad in (
+        "../../etc/cron.d",
+        "/etc/passwd",
+        "",
+        ".",
+        "..",
+        "a/b",
+        "a\x00b",
+        "a\n",
+        "a\r\n../x",
+        "ａ",  # fullwidth
+        "а",  # cyrillic homoglyph
+        "a.b",
+        "a b",
+    ):
+        with pytest.raises(ValueError, match="unsafe"):
+            site_snapshot_path(tmp_path, "polymarket_us", bad)
+        with pytest.raises(ValueError, match="unsafe"):
+            site_snapshot_path(tmp_path, bad, "NYC")
+
+
+# ---------------------------------------------------------------------------
+# Label length bound (review finding 5)
+# ---------------------------------------------------------------------------
+
+
+def test_site_snapshot_path_rejects_an_overlong_label(tmp_path: Path) -> None:
+    """An unbounded label yields a filename past NAME_MAX, so every write
+    raises ENAMETOOLONG inside the executor and `reconcile_and_report`'s
+    blanket `except Exception` swallows it -- the deployment starts clean
+    and monitors a file that never exists. This is startup-known input, so
+    it must fail loudly at composition instead.
+    """
+    with pytest.raises(ValueError, match="unsafe"):
+        site_snapshot_path(tmp_path, "polymarket_us", "C" * 65)
+    with pytest.raises(ValueError, match="unsafe"):
+        site_snapshot_path(tmp_path, "V" * 65, "NYC")
+
+    # The bound itself is accepted, and the resulting name stays inside the
+    # 255-byte NAME_MAX every mainstream filesystem enforces.
+    at_bound = site_snapshot_path(tmp_path, "V" * 64, "C" * 64)
+    assert len(at_bound.name.encode("utf-8")) <= 255

@@ -65,6 +65,8 @@ __all__ = [
     "DEFAULT_RENOTIFY_AFTER_NS",
     "MAX_ALERT_DETAIL_CHARS",
     "SCHEMA_VERSION",
+    "SNAPSHOT_DIR_MODE",
+    "SNAPSHOT_FILE_MODE",
     "AlertCondition",
     "AlertConditionKey",
     "AlertPayload",
@@ -85,7 +87,7 @@ logger = logging.getLogger(__name__)
 #: Bumped whenever `HealthSnapshot.to_dict()`'s shape changes, so an
 #: operator or a future reader of the file on disk can tell an old snapshot
 #: apart from a new one without inferring it from field presence.
-SCHEMA_VERSION: Final[int] = 1
+SCHEMA_VERSION: Final[int] = 2
 
 #: Re-notify cadence while a condition remains continuously active: 24h in
 #: nanoseconds, matching the design's "slow re-notify" default.
@@ -110,6 +112,15 @@ MAX_ALERT_DETAIL_CHARS: Final[int] = 200
 #: variable is set. Unset (the default) is not a placeholder empty string
 #: baked into source -- it is the literal absence of any endpoint.
 ALERT_WEBHOOK_URL_ENV_VAR: Final[str] = "BREEZY_ALERT_WEBHOOK_URL"
+
+#: Mode of the health snapshot FILE: owner read/write only. Gap and gate
+#: contents disclose exactly when and how collection is degraded.
+SNAPSHOT_FILE_MODE: Final[int] = 0o600
+
+#: Mode of the DIRECTORY holding those files: owner only. Write access to
+#: the directory is enough to forge a snapshot by unlink-and-replace even
+#: without read access to the 0600 files themselves.
+SNAPSHOT_DIR_MODE: Final[int] = 0o700
 
 #: Vocabulary of alert condition kinds this module's callers are expected
 #: to evaluate and pass in as `AlertCondition.key.kind`. Kept as plain
@@ -174,6 +185,23 @@ class SiteHealth:
     `gate_state`/`gate_reason`/`blocking_causes` are `str`, not `gate.py`'s
     own `GateState`/`GateReason` enums, so this module carries zero
     dependency on `breezy.ingest.gate`.
+
+    **`ledger_unavailable` qualifies `open_gaps`, and is the only field
+    here that may not be read independently of another.** `None` means the
+    gap ledger was read successfully this cycle, so `open_gaps` is
+    authoritative; any string means reconciliation FAILED and `open_gaps`
+    is merely what was known before the failure -- almost always the empty
+    list, which is byte-identical to a genuinely healthy site. A file-based
+    monitor must therefore treat a non-`None` value as "gap state unknown",
+    never as "no gaps". It is a plain `str | None` (a bool would force the
+    operator back to the log to learn *which* failure, and the string is
+    already bounded and scrubbed by the caller) and deliberately NOT a
+    `gaps.py` type: this module imports nothing from `breezy.ingest`, which
+    is the same boundary `GapSummary` exists to hold. The string is
+    free-text, so it is the one field here that is not redaction-safe by
+    construction -- the caller is responsible for scrubbing paths, contact
+    addresses and upstream product text out of it BEFORE constructing this
+    object (see `nws_actor._scrub_failure_detail`).
     """
 
     venue: str
@@ -185,6 +213,7 @@ class SiteHealth:
     cursor: str | None
     open_gaps: tuple[GapSummary, ...]
     acknowledged_lost_count: int
+    ledger_unavailable: str | None
 
     def to_dict(self) -> dict[str, object]:
         return {
@@ -197,6 +226,7 @@ class SiteHealth:
             "cursor": self.cursor,
             "open_gaps": [gap.to_dict() for gap in self.open_gaps],
             "acknowledged_lost_count": self.acknowledged_lost_count,
+            "ledger_unavailable": self.ledger_unavailable,
         }
 
 
@@ -241,15 +271,40 @@ def write_snapshot_atomic(path: Path, snapshot: HealthSnapshot) -> None:
     """Atomically write `snapshot` as JSON to `path`.
 
     `tempfile.mkstemp(dir=<path's own parent directory>)` so `os.replace`
-    is a same-filesystem, atomic rename; `0o600` is applied to BOTH the
-    temp file (immediately, via `fchmod`, before any bytes are written --
-    and again via `chmod` right before the rename, matching the design
-    checklist exactly) and the final path. The default `tempfile`/`os.open`
-    mode is umask-dependent and typically group- or world-readable by
-    default umasks; gap and gate contents reveal exactly when and how
-    collection is degraded, which is reconnaissance value for timing an
-    attack against the UA-trap or freshness watchdog, so this does not
-    rely on the process umask being configured correctly.
+    is a same-filesystem, atomic rename; `0o600` is applied ONCE, to the
+    temp file's open DESCRIPTOR via `fchmod`, before any bytes are written.
+    The default `tempfile`/`os.open` mode is umask-dependent and typically
+    group- or world-readable by default umasks; gap and gate contents
+    reveal exactly when and how collection is degraded, which is
+    reconnaissance value for timing an attack against the UA-trap or
+    freshness watchdog, so this does not rely on the process umask being
+    configured correctly.
+
+    **No by-name `chmod` on either the temp path or the final path.**
+    `os.chmod(path, ...)` FOLLOWS symlinks and resolves by name, so an
+    attacker with write access to the directory who wins the window after
+    `os.replace` could plant a symlink at `path` aimed at any file this
+    process owns and have it restricted to 0600 -- a local denial of
+    service. `os.replace` itself does NOT follow a destination symlink, so
+    the rename was never the hazard; the trailing chmods were, and they
+    were redundant besides: a mode set with `fchmod` belongs to the inode
+    and survives the rename unchanged. See
+    `test_write_snapshot_atomic_never_chmods_the_snapshot_by_name`, which
+    pins both properties (no by-name chmod, final mode still 0600).
+
+    **Directory mode 0700, enforced on every write.** `mkdir` without an
+    explicit mode uses `0o777 & ~umask` -- commonly 0o775, i.e. group
+    writable -- and `exist_ok=True` silently accepts whatever mode an
+    existing directory already carries. A group-writable snapshot
+    directory lets a local user unlink or rename over `health-*.json` and
+    FORGE a plausible, freshly-timestamped snapshot claiming an OPEN gate
+    with no open gaps: they cannot read the 0600 contents, but they can
+    mask a dead collector across a settlement window, which defeats the
+    documented monitor contract just as effectively. The mode is therefore
+    both requested at creation and re-asserted afterwards so a
+    pre-existing permissive directory is corrected rather than inherited.
+    (`parents=True` intermediates are left alone -- those are the
+    operator's own directories, not the artifact's container.)
 
     On ANY failure (including a failure inside `os.replace` itself) the
     temp file is unlinked in a `finally`-equivalent handler and the
@@ -258,20 +313,21 @@ def write_snapshot_atomic(path: Path, snapshot: HealthSnapshot) -> None:
     for a future `mkstemp` collision or for local disclosure.
     """
     directory = path.parent
-    directory.mkdir(parents=True, exist_ok=True)
+    directory.mkdir(parents=True, exist_ok=True, mode=SNAPSHOT_DIR_MODE)
+    # `mkdir(mode=...)` is still masked by the umask, and is a no-op when
+    # the directory already exists; this makes the mode exact in both cases.
+    os.chmod(directory, SNAPSHOT_DIR_MODE)
     payload = json.dumps(snapshot.to_dict(), sort_keys=True).encode("utf-8")
 
     fd, tmp_name = tempfile.mkstemp(dir=directory, prefix=".health-snapshot-", suffix=".tmp")
     tmp_path = Path(tmp_name)
     try:
-        os.fchmod(fd, 0o600)
+        os.fchmod(fd, SNAPSHOT_FILE_MODE)
         with os.fdopen(fd, "wb") as handle:
             handle.write(payload)
             handle.flush()
             os.fsync(handle.fileno())
-        os.chmod(tmp_path, 0o600)
         os.replace(tmp_path, path)
-        os.chmod(path, 0o600)
     except BaseException:
         tmp_path.unlink(missing_ok=True)
         raise
@@ -420,6 +476,21 @@ class WebhookAlertSink:
         response = self._client.post(self._url, json=payload.to_dict())
         response.raise_for_status()
 
+    def close(self) -> None:
+        """Release the `httpx.Client` (and with it the pooled connections
+        and the TLS context) this sink owns.
+
+        `composition._close_alert_sink` duck-types `getattr(sink, "close")`
+        precisely so a sink that owns a transport can be torn down with the
+        rest of the runtime while `LoggingAlertSink`, which owns nothing,
+        needs no such method. This is the ONLY sink that owns a transport,
+        so without this method that teardown callback was a permanent
+        no-op. `httpx.Client.close()` is itself idempotent, so repeated
+        teardown (a failed construction unwinding through the same
+        `ExitStack`) is safe.
+        """
+        self._client.close()
+
 
 def resolve_alert_sink(env: Mapping[str, str] | None = None) -> AlertSink:
     """Return the `AlertSink` this process should use.
@@ -525,6 +596,14 @@ class AlertState:
     loop is expected to own an instance, matching every other
     single-writer assumption in this codebase (`SqliteStateStore`,
     `SettlementGate`).
+
+    That ownership binds the CALLER, and binds it per-thread, not merely
+    per-instance: `evaluate` is a read-modify-write over `_active` and
+    `_last_emitted_ns`, so it must run on the owning loop's own thread.
+    `dispatch` is `evaluate` plus a blocking sink fan-out, so a caller that
+    needs the fan-out off its loop must split the two and move only
+    `emit_alert` -- never hand the whole `dispatch` to an executor, which
+    silently relocates the mutation (see `nws_actor._emit_health`).
     """
 
     def __init__(self, *, renotify_after_ns: int = DEFAULT_RENOTIFY_AFTER_NS) -> None:

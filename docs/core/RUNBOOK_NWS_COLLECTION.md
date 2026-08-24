@@ -29,7 +29,7 @@
 | `BREEZY_ALLOW_PROXY_ENV` | (check proxy env) | (any value) | Set to `"1"` to allow HTTP_PROXY/HTTPS_PROXY env vars. Unset or `"0"` → block proxy env (secure default). |
 | `BREEZY_REGISTRY_PATH` | (none) | Path to `registry/sites.toml` | Optional override; if unset, embedded registry used. |
 | `BREEZY_USER_AGENT` | `breezy-weather-ingest/0.1 (+mailto:breezy-data@gmail.com)` | HTTP User-Agent string | Read by `ingest/http.py`, not `settings.py`. NWS uses this to contact operator on abuse. Contact email MUST be valid and monitored. |
-| `BREEZY_HEALTH_SNAPSHOT_DIR` | (none — feature off) | **Absolute** directory path | Directory the per-site health snapshots are written into, one file per site: `health-<venue>-<city>.json`, mode 0600. Unset = no file is written at all. Blank, relative, or containing a NUL byte → SettingsError exit 2. |
+| `BREEZY_HEALTH_SNAPSHOT_DIR` | (none — feature off) | **Absolute** directory path | Directory the per-site health snapshots are written into, one file per site: `health-<venue>.<city>.json`, mode 0600. Unset = no file is written at all. Blank, relative, or containing a NUL byte → SettingsError exit 2. |
 | `BREEZY_ALERT_WEBHOOK_URL` | (none) | `https://…` URL, no userinfo | Read by `runtime/health.py`, not `settings.py`. Unset → the process uses `LoggingAlertSink` and builds **no** HTTP client and **no** TLS context. Exactly ONE sink is built per process and shared by all five actors. |
 
 
@@ -39,8 +39,8 @@
 the process:
 
 ```
-/var/lib/breezy/health/health-polymarket_us-NYC.json
-/var/lib/breezy/health/health-polymarket_us-SFO.json
+/var/lib/breezy/health/health-polymarket_us.NYC.json
+/var/lib/breezy/health/health-polymarket_us.SFO.json
 …
 ```
 
@@ -55,7 +55,25 @@ observes a partial document.
 | Question | Check | Meaning |
 |---|---|---|
 | Is the PROCESS alive? | `max(mtime)` over `BREEZY_HEALTH_SNAPSHOT_DIR/health-*.json` older than `2 × BREEZY_POLL_INTERVAL_SECONDS` | Dead or wedged process. Nothing else makes every file go stale at once. |
-| Is a SITE alive? | any individual `health-<venue>-<city>.json` older than `2 × BREEZY_POLL_INTERVAL_SECONDS` while others are fresh | That one site's poll cycle is wedged; the rest of the process is fine. |
+| Is a SITE alive? | any individual `health-<venue>.<city>.json` older than `2 × BREEZY_POLL_INTERVAL_SECONDS` while others are fresh | That one site's poll cycle is wedged; the rest of the process is fine. |
+| Is the GAP LEDGER readable? | `ledger_unavailable` is non-`null` in any site's snapshot | **`open_gaps` in that snapshot is NOT authoritative.** Reconciliation is failing, so the list is unknown, NOT empty. Revision detection is dead for that site until this clears. |
+
+**`ledger_unavailable` is the one field that must never be read as "absent means
+fine".** The key is ALWAYS emitted: `null` means the ledger was read
+successfully; a non-`null` string names the failure class. A site whose ledger
+is unreadable will otherwise present as perfectly healthy -- `open_gaps: []`,
+fresh mtime, gate OPEN -- while a superseded NWS final goes undetected. A
+CRITICAL `LEDGER_UNAVAILABLE` alert is also emitted on the alert sink, but the
+webhook sink is UNSET by default, so on a default deployment this file is the
+only place the condition is visible.
+
+The detail string is deliberately scrubbed at capture (class name, then a
+<=120-char de-identified tail): paths, URLs and the `mailto:` contact are
+dropped whole, so it names the failure without carrying PII or filesystem
+layout into this artifact or off-host.
+
+`schema_version` is **2** as of the `ledger_unavailable` addition. A consumer
+pinned to schema 1 will not see this field.
 
 Example:
 

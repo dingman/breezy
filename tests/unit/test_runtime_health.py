@@ -15,6 +15,7 @@ offset from an arbitrary local `_START_NS`, never a wall-clock read.
 
 from __future__ import annotations
 
+import ast
 import json
 import os
 import ssl
@@ -25,6 +26,7 @@ import httpx
 import pytest
 import respx
 
+from breezy.runtime import health as health_module
 from breezy.runtime.health import (
     ALERT_WEBHOOK_URL_ENV_VAR,
     ALLOWED_ALERT_PAYLOAD_KEYS,
@@ -85,6 +87,7 @@ def _site(
     cursor: str | None = "cursor-abc",
     open_gaps: tuple[GapSummary, ...] = (),
     acknowledged_lost_count: int = 0,
+    ledger_unavailable: str | None = None,
 ) -> SiteHealth:
     return SiteHealth(
         venue=venue,
@@ -96,6 +99,7 @@ def _site(
         cursor=cursor,
         open_gaps=open_gaps,
         acknowledged_lost_count=acknowledged_lost_count,
+        ledger_unavailable=ledger_unavailable,
     )
 
 
@@ -144,6 +148,9 @@ def test_snapshot_to_dict_carries_every_declared_field() -> None:
     assert site_payload["last_successful_poll_ns"] == _START_NS
     assert site_payload["cursor"] == "cursor-abc"
     assert site_payload["acknowledged_lost_count"] == 0
+    # Always present, even when healthy: a monitor must not have to infer
+    # "the ledger is fine" from key absence (see `SiteHealth`'s docstring).
+    assert site_payload["ledger_unavailable"] is None
 
     (gap_payload,) = site_payload["open_gaps"]
     assert gap_payload == {
@@ -191,6 +198,10 @@ def test_snapshot_json_excludes_user_agent_contact() -> None:
                 gate_reason="cross_check_unavailable",
                 blocking_causes=("acis_disagreement", "cross_check_unavailable"),
                 open_gaps=(_gap(),),
+                # The one FREE-TEXT field in the snapshot, and therefore the
+                # only one whose redaction is not structural -- populated here
+                # so the document-level proof covers it too.
+                ledger_unavailable="TamperedGapLedgerError: row 41 hmac mismatch",
             ),
         ),
         ua_trap_latched=True,
@@ -582,3 +593,186 @@ def test_dispatch_zero_when_nothing_active() -> None:
 
     assert count == 0
     assert sink.received == []
+
+
+# --------------------------------------------------------------------------
+# Snapshot directory mode + by-name chmod hazards (review findings 2 and 3)
+# --------------------------------------------------------------------------
+
+
+def test_write_snapshot_atomic_creates_directory_mode_0700(tmp_path: Path) -> None:
+    """The directory containing 0600 snapshots must not be umask-dependent.
+
+    A group- or world-writable snapshot directory lets a local user unlink
+    or rename over `health-*.json` and FORGE a freshly-timestamped snapshot
+    claiming a healthy gate -- masking a dead collector across a settlement
+    window. The file mode deliberately does not trust the process umask;
+    the directory must not either.
+    """
+    target = tmp_path / "created" / "health.json"
+
+    write_snapshot_atomic(target, _snapshot())
+
+    mode = stat.S_IMODE(target.parent.stat().st_mode)
+    assert mode == 0o700, f"snapshot directory mode {mode:#o} is not 0o700"
+
+
+def test_write_snapshot_atomic_tightens_a_preexisting_permissive_directory(
+    tmp_path: Path,
+) -> None:
+    """`mkdir(exist_ok=True)` is a no-op on an existing directory, so a
+    directory an operator (or an earlier, umask-dependent run) left at 0775
+    must be corrected on the write path, not merely on creation.
+    """
+    directory = tmp_path / "preexisting"
+    directory.mkdir(mode=0o777)
+    os.chmod(directory, 0o775)
+    assert stat.S_IMODE(directory.stat().st_mode) == 0o775
+
+    write_snapshot_atomic(directory / "health.json", _snapshot())
+
+    mode = stat.S_IMODE(directory.stat().st_mode)
+    assert mode == 0o700, f"pre-existing snapshot directory left at {mode:#o}"
+
+
+def test_write_snapshot_atomic_never_chmods_the_snapshot_by_name(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """`os.chmod(path, ...)` follows symlinks and resolves by name.
+
+    An attacker who wins the window between `os.replace` and the chmod can
+    plant a symlink at `path` pointing at any file the process owns and have
+    it restricted to 0600 (a local DoS). `os.fchmod` on the still-open
+    descriptor already fixes the mode, and that mode survives the rename, so
+    neither by-name chmod may exist. Only the containing DIRECTORY -- which
+    has no descriptor to hand -- may be chmod'd by name.
+    """
+    target = tmp_path / "health.json"
+    real_chmod = os.chmod
+    chmodded: list[str] = []
+
+    def _recording_chmod(path: object, mode: int, **kwargs: object) -> None:
+        if isinstance(path, (str, Path)):
+            chmodded.append(str(path))
+        real_chmod(path, mode, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(os, "chmod", _recording_chmod)
+
+    write_snapshot_atomic(target, _snapshot())
+
+    assert str(target) not in chmodded, "final snapshot path was chmod'd by name"
+    assert not [p for p in chmodded if p.endswith(".tmp")], (
+        f"temp snapshot path was chmod'd by name: {chmodded}"
+    )
+    # And the mode is still exactly 0600, from `fchmod` alone.
+    assert stat.S_IMODE(target.stat().st_mode) == 0o600
+
+
+# --------------------------------------------------------------------------
+# WebhookAlertSink transport ownership (review finding 4)
+# --------------------------------------------------------------------------
+
+
+def test_webhook_alert_sink_close_releases_its_client() -> None:
+    """`composition._close_alert_sink` duck-types `close()`; without one on
+    the only sink that owns a transport, the httpx.Client and its TLS
+    context are never released and the teardown callback is a no-op.
+    """
+    client = httpx.Client()
+    sink = WebhookAlertSink(_WEBHOOK_URL, client=client)
+
+    sink.close()
+
+    assert client.is_closed
+
+
+def test_webhook_alert_sink_close_is_idempotent() -> None:
+    client = httpx.Client()
+    sink = WebhookAlertSink(_WEBHOOK_URL, client=client)
+
+    sink.close()
+    sink.close()
+
+    assert client.is_closed
+
+
+# --------------------------------------------------------------------------
+# `ledger_unavailable`: the FILE-based monitor must be able to see a dead
+# gap ledger (WI-12 residual 1)
+# --------------------------------------------------------------------------
+
+
+def test_site_health_renders_a_ledger_unavailable_marker() -> None:
+    """A failed `gaps.reconcile` leaves `open_gaps` EMPTY, which is exactly
+    what a genuinely healthy site looks like. The CRITICAL alert alone is not
+    enough: the webhook env var is unset by default, so alerts may only reach
+    logs, while the runbook points operators at `health-<venue>.<city>.json`.
+    The file must therefore carry the marker itself.
+    """
+    site = _site(ledger_unavailable="TamperedGapLedgerError: row hmac mismatch")
+
+    payload = site.to_dict()
+
+    assert payload["ledger_unavailable"] == "TamperedGapLedgerError: row hmac mismatch"
+    # And `open_gaps` must not be readable as authoritative while it is set.
+    assert payload["open_gaps"] == []
+
+
+def test_a_healthy_ledger_renders_the_marker_as_an_explicit_null() -> None:
+    """NEGATIVE CONTROL. A healthy ledger must be UNAMBIGUOUS: the key is
+    always present and explicitly `null`, so a monitor distinguishes "the
+    ledger is fine" from "this snapshot predates the field" without
+    inferring it from key absence.
+    """
+    payload = _site(open_gaps=(_gap(),)).to_dict()
+
+    assert "ledger_unavailable" in payload
+    assert payload["ledger_unavailable"] is None
+
+
+def test_written_snapshot_file_carries_the_ledger_marker(tmp_path: Path) -> None:
+    """Asserted on the ACTUAL rendered artifact, not an internal."""
+    target = tmp_path / "health-polymarket_us.NYC.json"
+    snapshot = _snapshot(sites=(_site(ledger_unavailable="RuntimeError: ledger is gone"),))
+
+    write_snapshot_atomic(target, snapshot)
+
+    decoded = json.loads(target.read_text())
+    assert decoded["sites"][0]["ledger_unavailable"] == "RuntimeError: ledger is gone"
+
+
+def test_written_snapshot_file_marks_a_healthy_ledger_null(tmp_path: Path) -> None:
+    """NEGATIVE CONTROL, on the artifact."""
+    target = tmp_path / "health-polymarket_us.NYC.json"
+
+    write_snapshot_atomic(target, _snapshot(sites=(_site(),)))
+
+    decoded = json.loads(target.read_text())
+    assert decoded["sites"][0]["ledger_unavailable"] is None
+
+
+def test_the_schema_version_was_bumped_for_the_ledger_marker() -> None:
+    """`SCHEMA_VERSION` is documented as bumped whenever `to_dict()`'s shape
+    changes; adding `ledger_unavailable` changed it, and a monitor reading an
+    older file must be able to tell it cannot trust the field's absence.
+    """
+    assert SCHEMA_VERSION == 2
+
+
+def test_health_module_still_imports_nothing_from_breezy_ingest() -> None:
+    """The scope boundary the module docstring declares. `ledger_unavailable`
+    is a plain `str | None` precisely so this stays true -- importing
+    `gaps.py` here would invert the layering the `GapSummary` seam exists to
+    prevent.
+    """
+    tree = ast.parse(Path(health_module.__file__).read_text())
+    imported: list[str] = []
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            imported.extend(alias.name for alias in node.names)
+        elif isinstance(node, ast.ImportFrom) and node.module:
+            imported.append(node.module)
+
+    assert not [name for name in imported if name.startswith("breezy.ingest")], (
+        f"health.py grew an import from breezy.ingest: {imported}"
+    )

@@ -30,7 +30,7 @@ from collections.abc import Callable, Iterator
 from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Protocol
+from typing import Any, Final, Protocol
 
 from nautilus_trader.config import TradingNodeConfig
 from nautilus_trader.live.node import TradingNode
@@ -95,33 +95,72 @@ AlertSinkFactory = Callable[[], AlertSink]
 # already does mkstemp + fchmod(0o600) + fsync + os.replace into the file's
 # own parent directory, and creates that directory on first write.
 
-_SAFE_SITE_LABEL = re.compile(r"\A[A-Za-z0-9_-]+\Z")
+#: Upper bound on one label. The composed name is
+#: ``"health-" + venue + "." + city + ".json"`` -- at most
+#: ``7 + 64 + 1 + 64 + 5 = 141`` bytes, comfortably inside the 255-byte
+#: ``NAME_MAX`` every mainstream filesystem enforces. Without a bound a
+#: 300-character label passes the slug check, the write raises
+#: ``ENAMETOOLONG`` inside the executor, and the Actor's blanket
+#: ``except Exception`` swallows it every cycle: the deployment starts
+#: clean while monitoring a file that never comes into existence. The
+#: labels are startup-known input, so this fails loudly at composition.
+MAX_SITE_LABEL_CHARS: Final[int] = 64
+
+_SAFE_SITE_LABEL = re.compile(r"\A[A-Za-z0-9_-]{1," + str(MAX_SITE_LABEL_CHARS) + r"}\Z")
+
+#: The venue/city separator inside a snapshot filename. Deliberately a
+#: character the label class above EXCLUDES -- see
+#: :func:`site_snapshot_path` for the injectivity argument that rests on it.
+_SITE_FIELD_SEPARATOR: Final[str] = "."
 
 
 def site_snapshot_path(directory: Path, venue: str, city: str) -> Path:
     """Return the health-snapshot file for one site beneath `directory`.
 
-    Deterministic and injective over `(venue, city)`, which is the whole
+    Deterministic and **injective** over `(venue, city)`, which is the whole
     point: the file for a site must be the same path on every restart so a
     monitor can watch a fixed name, and two sites must never resolve to one
     path.
 
-    `venue` and `city` are validated against a strict slug pattern rather
-    than merely joined. They originate from `BREEZY_SITES`, which validates
-    only that both halves are non-blank, so a value like `../../etc/cron.d`
-    would otherwise escape the configured directory and let an operator's
-    typo (or an attacker with control of the unit file's environment) write
-    a 0o600 JSON document anywhere the process can reach. Cross-checking
-    against the site registry happens elsewhere; this is the containment at
-    the point of path construction.
+    Injectivity proof. Both labels are drawn from ``[A-Za-z0-9_-]`` and are
+    non-empty, so neither can contain ``.``; the composed name is
+    ``"health-" + venue + "." + city + ".json"``. Strip the constant
+    ``"health-"`` prefix and the constant ``".json"`` suffix (the suffix is
+    unambiguous because `city` is non-empty and cannot itself contain
+    ``.``); what remains is ``venue + "." + city``, which contains EXACTLY
+    one ``.``, so the split point -- and therefore the pre-image -- is
+    unique. Two distinct `(venue, city)` pairs cannot map to one name.
+
+    ``-`` is NOT usable as that separator even though it reads better: it is
+    also a permitted label character, so ``("POLY-US", "NYC")`` and
+    ``("POLY", "US-NYC")`` both composed to ``health-POLY-US-NYC.json``.
+    Two Actors then clobbered one file every poll cycle, and a WEDGED site's
+    file kept getting a fresh mtime and healthy contents from its sibling --
+    the runbook's per-file staleness check would report healthy for a site
+    that had stopped collecting, straight through a settlement deadline.
+    That defeats the entire reason per-site files were chosen over an
+    aggregator. Excluding ``-`` from the label class instead would have been
+    equally injective but would reject ``POLYMARKET-US``, an ordinary venue
+    value, so the separator moved rather than the alphabet.
+
+    `venue` and `city` are validated against a strict, length-bounded slug
+    pattern rather than merely joined. They originate from `BREEZY_SITES`,
+    which validates only that both halves are non-blank, so a value like
+    `../../etc/cron.d` would otherwise escape the configured directory and
+    let an operator's typo (or an attacker with control of the unit file's
+    environment) write a 0o600 JSON document anywhere the process can reach.
+    ``\\A``/``\\Z`` (not ``^``/``$``) so a trailing newline cannot smuggle a
+    second line past the guard. Cross-checking against the site registry
+    happens elsewhere; this is the containment at the point of path
+    construction.
     """
     for label, value in (("venue", venue), ("city", city)):
         if not _SAFE_SITE_LABEL.match(value):
             raise ValueError(
-                f"unsafe {label} {value!r} for a snapshot filename: "
-                "only ASCII letters, digits, '_' and '-' are allowed"
+                f"unsafe {label} {value!r} for a snapshot filename: only ASCII letters, "
+                f"digits, '_' and '-' are allowed, 1 to {MAX_SITE_LABEL_CHARS} characters"
             )
-    return directory / f"health-{venue}-{city}.json"
+    return directory / f"health-{venue}{_SITE_FIELD_SEPARATOR}{city}.json"
 
 
 # ---------------------------------------------------------------------------

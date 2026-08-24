@@ -124,6 +124,7 @@ import concurrent.futures
 import datetime as dt
 import json
 import logging
+import re
 from collections.abc import Callable, Sequence
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, replace
@@ -195,6 +196,7 @@ from breezy.persistence.catalog import (
 if TYPE_CHECKING:  # pragma: no cover - typing only; see `_health` for the cycle.
     from breezy.runtime.health import (
         AlertCondition,
+        AlertPayload,
         AlertSink,
         AlertState,
         GapSummary,
@@ -203,6 +205,8 @@ if TYPE_CHECKING:  # pragma: no cover - typing only; see `_health` for the cycle
 
 __all__ = [
     "CURSOR_KEY_PREFIX",
+    "DEFAULT_OBSERVABILITY_IO_TIMEOUT_S",
+    "LEDGER_UNAVAILABLE",
     "PARSER_VERSION",
     "VALIDATORS_KEY_PREFIX",
     "NwsIngestActor",
@@ -211,6 +215,93 @@ __all__ = [
 ]
 
 logger = logging.getLogger(__name__)
+
+#: `AlertCondition.key.kind`/`event` for "this site's gap ledger could not be
+#: read or reconciled this cycle".
+#:
+#: Declared HERE and not in `runtime/health.py` alongside that module's other
+#: kind constants, and the asymmetry is deliberate: `health.py` documents
+#: itself as importing nothing from `breezy.ingest` and knowing nothing of the
+#: ledger's vocabulary, while the condition is raised only from this module's
+#: `reconcile_and_report` failure handler. `AlertConditionKey.kind` is a plain
+#: `str` by that module's own design ("kept as plain strings (not an `Enum`) so
+#: the ... wiring code can construct `AlertConditionKey`s without importing an
+#: enum"), so the wiring owning the condition also owns its name.
+LEDGER_UNAVAILABLE: Final[str] = "ledger_unavailable"
+
+#: Character ceiling for the scrubbed ledger-failure detail. Deliberately
+#: tighter than `health.MAX_ALERT_DETAIL_CHARS` (200): that constant bounds
+#: over-collection into a webhook, this one bounds how much attacker- or
+#: environment-influenced exception text can be echoed into a DISK artifact
+#: whose whole redaction guarantee is otherwise "no field slot exists to hold
+#: it".
+LEDGER_DETAIL_MAX_CHARS: Final[int] = 120
+
+#: Any whitespace-delimited token containing a path separator, an `@`, or a
+#: `:`-scheme-shaped URL is dropped whole rather than trimmed. These are the
+#: three shapes that carry the values `runtime/health.py` names as forbidden:
+#: absolute state-db/catalog paths (pyarrow and sqlite interpolate them into
+#: their messages), and the User-Agent contact address
+#: (`breezy-weather-ingest/0.1 (+mailto:<address>)`, which an HTTP-layer
+#: failure can echo). Token-granular so the surrounding, developer-authored
+#: sentence still reads.
+_UNSAFE_DETAIL_TOKEN: Final[re.Pattern[str]] = re.compile(r"\S*[/\\@]\S*")
+
+#: Everything outside this set becomes a space. Bounds the residue after
+#: token redaction to plain prose and punctuation -- no newlines (so a
+#: multi-line upstream body cannot be pasted in), no control characters (so a
+#: log or JSON consumer cannot be steered), no quotes-as-structure games.
+_UNSAFE_DETAIL_CHARS: Final[re.Pattern[str]] = re.compile(r"[^A-Za-z0-9 _.,:;()<>'\[\]=+-]")
+
+
+def _scrub_failure_detail(exc: BaseException) -> str:
+    """Render `exc` as a bounded, redacted one-line summary.
+
+    **Why this exists.** `SiteHealth.ledger_unavailable` and the
+    `LEDGER_UNAVAILABLE` alert payload both carry this string, so it lands in
+    a 0600 disk artifact AND is POSTed to an operator-configured webhook --
+    i.e. off-host. `health.py`'s redaction guarantee is structural ("there is
+    no attribute slot to hold `user_agent_contact` or an absolute path"), and
+    a free-text field punches a hole straight through it: the source is an
+    exception message, which is environment-influenced (sqlite and pyarrow
+    interpolate absolute paths) and, one layer up, upstream-influenced (NWS
+    product text).
+
+    Containment, in order: the exception CLASS NAME is kept verbatim (it is
+    developer-authored and structural, and is what actually names the
+    failure); the message is reduced to its FIRST LINE, then path/contact/URL
+    tokens are dropped whole, then the residue is restricted to a plain-prose
+    character set and length-bounded.
+
+    Honest limit: this bounds and de-identifies echoed text, it does not
+    prove an arbitrary message carries no information at all. The guaranteed
+    part of the contract is the class name; the message tail is best-effort
+    diagnosis under a 120-character ceiling.
+    """
+    kind = type(exc).__name__
+    message = str(exc).split("\n", 1)[0]
+    message = _UNSAFE_DETAIL_TOKEN.sub("<redacted>", message)
+    message = _UNSAFE_DETAIL_CHARS.sub(" ", message)
+    message = " ".join(message.split())
+    if len(message) > LEDGER_DETAIL_MAX_CHARS:
+        message = message[:LEDGER_DETAIL_MAX_CHARS].rstrip() + "..."
+    return f"{kind}: {message}" if message else kind
+
+
+#: Wall-clock ceiling, in seconds, for the observability path's OFF-LOOP
+#: blocking calls: the alert fan-out (`emit_alert` ->
+#: `WebhookAlertSink.emit` -> a synchronous `httpx` POST, itself 5s-capped) and
+#: the snapshot write (`write_snapshot_atomic`: `mkdir` + `chmod` + `fsync` +
+#: rename, all uninterruptible on a stalled mount).
+#:
+#: Not `parse_timeout_ms` (250 ms), which bounds a CPU-bound regex and would
+#: fire on any healthy `fsync`; and not unbounded, which is the actual defect
+#: this exists to close -- an unbounded `run_in_executor` over a wedged mount
+#: parks a worker forever, so `poll_once` never completes, its future never
+#: resolves, `_on_poll_done` -> `_record_task_death` never fires and the
+#: settlement gate keeps reading OPEN over stale data. Comfortably below the
+#: 300s default poll interval, so a breach is a real stall and not a slow disk.
+DEFAULT_OBSERVABILITY_IO_TIMEOUT_S: Final[float] = 30.0
 
 
 def _health() -> Any:
@@ -440,7 +531,18 @@ class NwsIngestActor(Actor):
         #: The most recently emitted snapshot, for introspection and tests.
         self.last_health_snapshot: HealthSnapshot | None = None
 
+        #: Ceiling for the two off-loop observability calls; see
+        #: `DEFAULT_OBSERVABILITY_IO_TIMEOUT_S`. An attribute, like the seams
+        #: above, so a test can shorten it without patching module globals.
+        self.observability_io_timeout_s: float = DEFAULT_OBSERVABILITY_IO_TIMEOUT_S
+
         self._alert_state: AlertState | None = None
+        #: Mutual exclusion for `poll_once`; see that method's docstring.
+        self._poll_in_flight = False
+        #: Set by `reconcile_and_report` when `gaps.reconcile` raised, cleared
+        #: when it succeeds. Read by `_alert_conditions` to raise
+        #: `LEDGER_UNAVAILABLE`, so a swallowed ledger failure is loud.
+        self._ledger_failure_detail: str | None = None
         self._blocked_since_ns: int | None = None
         self._process_started_at_ns = shared.clock()
 
@@ -533,11 +635,10 @@ class NwsIngestActor(Actor):
     def _arm_timers(self) -> None:
         if self._timers_armed:
             return
-        start_time = self._stagger_start_time()
         self.clock.set_timer(
             name=self._poll_timer_name,
             interval=timedelta(seconds=int(self._config.poll_interval_seconds)),
-            start_time=start_time,
+            start_time=self._stagger_start_time(),
             callback=self.on_poll_timer,
         )
         # SS6: the data-completeness deadline is scheduled on a WALL CLOCK,
@@ -550,7 +651,19 @@ class NwsIngestActor(Actor):
             interval=timedelta(
                 seconds=int(self._config.final_deadline_check_interval_seconds)
             ),
-            start_time=start_time,
+            # `start_time=None` -- UNSTAGGERED, deliberately, and the asymmetry
+            # with the poll timer above is the point. The stagger exists to
+            # spread concurrent HTTP requests to `api.weather.gov` across five
+            # sites so a synchronised burst cannot latch the UA trap.
+            # `check_final_deadline` performs NO network I/O -- it reads this
+            # site's own catalog and calls `record_final_overdue` -- so it
+            # gains nothing from the spreading and would only inherit the
+            # delay. At site index 4 (240s of a 300s interval) sharing the
+            # offset pushed cold-start deadline checking from 300s to 540s and
+            # overdue->page latency from ~600s to ~1080s: roughly eight minutes
+            # burned ahead of an 08:00 ET settlement deadline, in exchange for
+            # nothing.
+            start_time=None,
             callback=self.on_deadline_timer,
         )
         self._timers_armed = True
@@ -712,8 +825,62 @@ class NwsIngestActor(Actor):
 
     # -- SS6: the poll sequence ------------------------------------------
 
+    @property
+    def poll_in_flight(self) -> bool:
+        """Is a poll cycle currently running? See :meth:`poll_once`."""
+        return self._poll_in_flight
+
     async def poll_once(self) -> None:
-        """One full poll: SS6 steps 1-12.
+        """One full poll: SS6 steps 1-12, under mutual exclusion.
+
+        **Cycles may not overlap, and that is a correctness rule rather than a
+        tidiness one.** :meth:`on_poll_timer` fires on a wall schedule and
+        submits unconditionally, so a cycle that outruns its interval (a slow
+        upstream, a backed-up disk) overlaps its successor. Two overlapping
+        cycles then reach ``AlertState`` -- which documents itself as
+        "deliberately not thread-safe ... exactly one poll loop is expected to
+        own an instance" (``runtime/health.py``) -- and its ``evaluate`` is a
+        read-modify-write over ``self._active``. One cycle's write landing on
+        the other's stale read LOSES the false->true edge: `UA_TRAP_LATCHED`
+        and `SITE_BLOCKED`, the persistent-silent conditions the alerting
+        exists to catch, then stay silent until the 24h re-notify.
+
+        BELT AND BRACES with the thread confinement in :meth:`_emit_health`
+        (``evaluate`` on the loop thread, only the sink fan-out off it), and
+        deliberately not removed as redundant: confinement stops two workers
+        racing, this guard stops two *cycles* interleaving at all -- which also
+        bounds executor pressure and keeps the ordering between a cycle's
+        conditions and its snapshot.
+
+        The guard is a plain flag, not an ``asyncio.Lock``, because the
+        overlapping fire must be DROPPED rather than queued: queueing turns a
+        slow cycle into an ever-growing backlog of polls against
+        ``api.weather.gov`` -- the burst shape that latches the UA trap -- and
+        every queued cycle would be reporting a moment that has already passed.
+        The next timer fire polls normally; nothing is lost but a duplicate.
+
+        Check-and-set is atomic by construction: it runs to completion on the
+        event-loop thread before the first ``await``, and the flag is cleared
+        in a ``finally`` so a raising cycle cannot wedge polling permanently.
+        (The exception still propagates: it is the poll task's death, which
+        ``_on_poll_done`` -> ``_record_task_death`` must see.)
+        """
+        if self._poll_in_flight:
+            logger.warning(
+                "skipping overlapping poll cycle for %s/%s: the previous cycle "
+                "is still running",
+                self._venue,
+                self._city,
+            )
+            return
+        self._poll_in_flight = True
+        try:
+            await self._poll_cycle()
+        finally:
+            self._poll_in_flight = False
+
+    async def _poll_cycle(self) -> None:
+        """The cycle body. Called only by :meth:`poll_once`, under its guard.
 
         **Stage B is batched, and that is a deliberate reading of step 4.**
         The brief notes there that a single poll may yield several unfetched
@@ -1492,7 +1659,25 @@ class NwsIngestActor(Actor):
             )
             revisions = result.revisions
             entries = gaps.site_entries(self._shared.store, self._venue, self._city)
-        except Exception:
+            self._ledger_failure_detail = None
+        except Exception as exc:
+            # Swallowed, still -- but never SILENT. Left as a bare
+            # `logger.exception` this branch reported a perfectly healthy site
+            # forever: `entries` stays `()`, so the snapshot publishes
+            # `open_gaps: []` and no condition fires, while a
+            # `TamperedGapLedgerError` on one corrupt row raises every cycle
+            # and revision detection -- the only defence against a superseded
+            # final -- is dead. The operator dashboard would show green.
+            #
+            # So the failure becomes a CRITICAL `LEDGER_UNAVAILABLE` condition
+            # (raised in `_alert_conditions` off this attribute) and the
+            # snapshot is emitted anyway, on this cycle above all: a cycle
+            # whose reconciliation just failed is when the snapshot matters
+            # most. Scrubbed at CAPTURE, not at render, so the one stored
+            # string is safe for both consumers it reaches -- the 0600 disk
+            # artifact and the off-host webhook payload. See
+            # `_scrub_failure_detail`.
+            self._ledger_failure_detail = _scrub_failure_detail(exc)
             logger.exception(
                 "gap reconciliation failed for %s/%s -- swallowed so the poll continues",
                 self._venue,
@@ -1501,6 +1686,19 @@ class NwsIngestActor(Actor):
 
         try:
             await self._emit_health(now_ns, entries=entries, revisions=revisions)
+        except TimeoutError:
+            # NOT swallowed, and the one exception to this method's containment
+            # rule. Every other failure here is a defect in our own
+            # observability and must not take a healthy site offline -- but a
+            # `TimeoutError` from `_bounded_io` means a worker thread is parked
+            # on uninterruptible I/O and is never coming back. A Python thread
+            # cannot be killed, so with `max_workers=2` a second stall exhausts
+            # the pool and every later cycle hangs before it can report
+            # anything. Propagating routes it to `_on_poll_done` ->
+            # `_record_task_death` -> the settlement gate, which fails CLOSED
+            # over data we can no longer prove fresh. Silence here is the
+            # fail-OPEN.
+            raise
         except Exception:
             logger.exception(
                 "health emission failed for %s/%s -- swallowed so the poll continues",
@@ -1562,23 +1760,41 @@ class NwsIngestActor(Actor):
             summaries=summaries,
             revisions=revisions,
         )
-        # OFF THE LOOP, deliberately. `AlertState.dispatch` ends in
-        # `emit_alert` -> `WebhookAlertSink.emit` -> a SYNCHRONOUS
-        # `httpx.Client.post` with a 5s default timeout
-        # (`runtime/health.py`), so running it inline held the event-loop
-        # thread for up to five seconds per fired condition. The incident
-        # case is exactly the case it fires in: several sites transitioning
-        # to blocked at once serialises those POSTs and delays every other
-        # site's poll and final-overdue check near a settlement deadline.
-        # Same `_run_off_loop` seam, and for the same reason, as the catalog
-        # read in `reconcile_and_report`. Awaiting it keeps the ordering and
-        # the exception contract identical -- `emit_alert` still swallows
-        # sink failures, and this method's caller still swallows the rest.
+        # SPLIT ACROSS THE THREAD BOUNDARY, deliberately, and the split line
+        # is the whole point.
+        #
+        # `evaluate` -- ON THE LOOP THREAD. It is a read-modify-write over
+        # `AlertState`'s two dicts, and that class documents itself as
+        # "deliberately not thread-safe ... exactly one poll loop is expected
+        # to own an instance". Running it on an executor worker made that
+        # ownership claim false: it was safe only because no other code path
+        # dispatches alerts today -- thread-safety by exclusion, which the
+        # next caller added anywhere silently converts into a data race over
+        # the exact transitions that must never be lost (`UA_TRAP_LATCHED`,
+        # `SITE_BLOCKED` are latched-persistent, so a lost false->true edge is
+        # not re-tried until the 24h re-notify). It is pure bookkeeping over
+        # a handful of dict entries, so it costs the loop nothing.
+        #
+        # `emit_alert` -- OFF THE LOOP, under the same ceiling as before. This
+        # is the half with a real reason to leave: `WebhookAlertSink.emit` is
+        # a SYNCHRONOUS `httpx.Client.post` with a 5s default timeout, and the
+        # incident case is exactly the case it fires in -- several sites
+        # transitioning to blocked at once serialises those POSTs and delays
+        # every other site's poll and final-overdue check near a settlement
+        # deadline.
+        #
+        # The `dispatch` contract is preserved exactly: `emitted` is what this
+        # cycle DECIDED to emit, never what the sink managed to deliver, and
+        # `emit_alert` still swallows every sink failure inside the worker.
+        # The whole fan-out is one `_bounded_io` call, as `dispatch` was, so a
+        # black-holed webhook still trips the ceiling and routes to
+        # `_record_task_death` rather than parking a worker forever.
         tracker = self._alert_tracker(health)
         sink = self._resolved_alert_sink(health)
-        emitted = await self._run_off_loop(
-            lambda: tracker.dispatch(sink, conditions, now_ns=now_ns)
-        )
+        payloads = tracker.evaluate(conditions, now_ns=now_ns)
+        emitted = len(payloads)
+        if payloads:
+            await self._bounded_io(lambda: self._emit_all(health, sink, payloads))
 
         snapshot = health.HealthSnapshot(
             schema_version=health.SCHEMA_VERSION,
@@ -1596,6 +1812,15 @@ class NwsIngestActor(Actor):
                     cursor=self._cursor_text(),
                     open_gaps=summaries,
                     acknowledged_lost_count=acknowledged_lost,
+                    # The FILE-based half of the `LEDGER_UNAVAILABLE` signal.
+                    # The alert alone is not enough: `BREEZY_ALERT_WEBHOOK_URL`
+                    # is unset by default, so `resolve_alert_sink` yields a
+                    # LOGGING sink and the CRITICAL reaches nothing an operator
+                    # polls -- while the runbook points them at
+                    # `health-<venue>.<city>.json`. Without this field that
+                    # file shows `open_gaps: []`, byte-identical to a healthy
+                    # site, for a ledger that has been unreadable for days.
+                    ledger_unavailable=self._ledger_failure_detail,
                 ),
             ),
             ua_trap_latched=ua_latched,
@@ -1607,9 +1832,22 @@ class NwsIngestActor(Actor):
             # Off the loop for the same reason as the dispatch above:
             # `write_snapshot_atomic` does an `fsync` plus a rename, and a
             # stalled disk must not be able to hold the poll cycle's thread.
-            await self._run_off_loop(
+            # BOUNDED for the second reason: off-loop-and-unbounded is a
+            # fail-open, not a fix -- see `_bounded_io`.
+            await self._bounded_io(
                 lambda: health.write_snapshot_atomic(snapshot_path, snapshot)
             )
+
+    @staticmethod
+    def _emit_all(health: Any, sink: AlertSink, payloads: Sequence[AlertPayload]) -> None:
+        """The blocking half of the old `AlertState.dispatch`, run on a worker.
+
+        Kept as a named method rather than a comprehension inside the lambda so
+        the executor call site reads as "fan out these already-decided
+        payloads" -- the decision itself happened on the loop thread.
+        """
+        for payload in payloads:
+            health.emit_alert(sink, payload)
 
     def _alert_conditions(
         self,
@@ -1704,6 +1942,27 @@ class NwsIngestActor(Actor):
                 event=health.POLL_STALE,
                 detail=(
                     f"no successful poll for at least {STALENESS_DEGRADE_INTERVALS} poll intervals"
+                ),
+            ),
+            # CRITICAL, and passed on EVERY cycle -- inactive ones included,
+            # so `AlertState` sees the true->false edge and the next failure
+            # is a fresh false->true rather than a 24h-muted repeat.
+            #
+            # This is the only signal that `reconcile_and_report`'s swallowed
+            # branch fired. Without it the ledger can be unreadable
+            # indefinitely while the snapshot reports `open_gaps: []` -- zero
+            # gaps and zero alerts are exactly what a HEALTHY site looks like,
+            # so the failure is indistinguishable from success. CRITICAL and
+            # not WARN because a dead ledger means revision detection is off:
+            # a superseded final can be settled on with nothing to notice it.
+            health.AlertCondition(
+                key=health.AlertConditionKey(kind=LEDGER_UNAVAILABLE, site=site_label),
+                active=self._ledger_failure_detail is not None,
+                severity="CRITICAL",
+                event=LEDGER_UNAVAILABLE,
+                detail=(
+                    "gap ledger reconciliation failed; open_gaps in this snapshot is "
+                    f"NOT authoritative ({self._ledger_failure_detail})"
                 ),
             ),
         ]
@@ -2031,6 +2290,31 @@ class NwsIngestActor(Actor):
         """
         loop = asyncio.get_running_loop()
         return await loop.run_in_executor(self._executor, fn)
+
+    async def _bounded_io[T](self, fn: Callable[[], T]) -> T:
+        """Run blocking OBSERVABILITY I/O off the loop under a real ceiling.
+
+        Distinct from :meth:`_bounded` only in which clock it reads:
+        `_bounded` bounds a CPU-bound parse with `parse_timeout_ms` (250 ms),
+        which any healthy `fsync` or webhook POST would breach. This one uses
+        `observability_io_timeout_s` (30s default, well under the 300s poll
+        interval), so a breach means a genuine stall.
+
+        Why a ceiling at all, given the work is already off the loop: an
+        unbounded `run_in_executor` over a wedged mount or a black-holed
+        webhook parks a worker permanently, so the awaiting `poll_once` never
+        completes, its future never resolves, and `_on_poll_done` ->
+        `_record_task_death` -> the settlement gate never runs. The site then
+        reads OPEN over data nothing is refreshing -- silence presented as
+        health, which is the exact failure the health path exists to prevent.
+
+        Honest limit, identical to `_bounded`'s: a Python thread cannot be
+        killed, so `wait_for` frees the *cycle*, not the worker. The stall
+        still surfaces -- loudly, as task death -- instead of hanging.
+        """
+        return await asyncio.wait_for(
+            self._run_off_loop(fn), self.observability_io_timeout_s
+        )
 
     async def _bounded[T](self, fn: Callable[[], T]) -> T:
         """Run ``fn`` off the loop under a real wall-clock ceiling.
