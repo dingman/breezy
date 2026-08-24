@@ -26,6 +26,8 @@ DEFAULT_DISCOVERY_MAX_BYTES = 262_144
 DEFAULT_DISCOVERY_MAX_DEPTH = 8
 DEFAULT_FINAL_DEADLINE_CHECK_INTERVAL_SECONDS = 300
 DEFAULT_STAGGER_OFFSET_SECONDS = 0
+DEFAULT_PRODUCT_FETCH_DELAY_SECONDS = 0.5
+MAX_PRODUCT_FETCH_DELAY_SECONDS = 5.0
 
 
 class NwsIngestActorConfig(ActorConfig, frozen=True):
@@ -43,6 +45,10 @@ class NwsIngestActorConfig(ActorConfig, frozen=True):
     discovery_max_bytes: int = DEFAULT_DISCOVERY_MAX_BYTES
     discovery_max_depth: int = DEFAULT_DISCOVERY_MAX_DEPTH
     final_deadline_check_interval_seconds: int = DEFAULT_FINAL_DEADLINE_CHECK_INTERVAL_SECONDS
+    #: Polite intra-site pacing between `/products/{id}` body fetches. The first
+    #: product in a poll is never delayed; this applies only before the second
+    #: and later body requests so a fresh site does not send a cold-start burst.
+    product_fetch_delay_seconds: float = DEFAULT_PRODUCT_FETCH_DELAY_SECONDS
     #: Phase shift, in seconds, applied to this site's timers via the
     #: NATIVE `Clock.set_timer(start_time=...)` parameter
     #: (`nautilus_trader/common/component.pyx:419-478`). Assigned by
@@ -51,3 +57,19 @@ class NwsIngestActorConfig(ActorConfig, frozen=True):
     #: `0` (the default) means no shift, so a single-site or hand-built
     #: Actor behaves exactly as before.
     stagger_offset_seconds: int = DEFAULT_STAGGER_OFFSET_SECONDS
+
+    def __post_init__(self) -> None:
+        if self.product_fetch_delay_seconds < 0:
+            raise ValueError(
+                "`product_fetch_delay_seconds` must be non-negative, was "
+                f"{self.product_fetch_delay_seconds}"
+            )
+        if self.product_fetch_delay_seconds > MAX_PRODUCT_FETCH_DELAY_SECONDS:
+            # The observed cold-start ceiling is 14 products. Delaying before
+            # product 2..14 at 5 s adds at most 65 s: enough to blunt a burst,
+            # still far below the 300 s default poll cadence so `_poll_in_flight`
+            # does not silently turn pacing into dropped cycles.
+            raise ValueError(
+                "`product_fetch_delay_seconds` must be <= "
+                f"{MAX_PRODUCT_FETCH_DELAY_SECONDS}, was {self.product_fetch_delay_seconds}"
+            )

@@ -77,6 +77,11 @@ def _reset_nodes() -> Iterator[None]:
     FakeNode.instances = []
 
 
+@pytest.fixture(autouse=True)
+def _set_user_agent_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("BREEZY_USER_AGENT", "breezy-test/1.0 (+mailto:ops@example.com)")
+
+
 def local_probe(path: Path) -> FilesystemProbe:
     return FilesystemProbe(
         path=str(path),
@@ -95,6 +100,7 @@ def env(tmp_path: Path) -> dict[str, str]:
         "BREEZY_CATALOG_BASE": str(tmp_path / "nws"),
         "BREEZY_STATE_DB": str(tmp_path / "state" / "breezy-state.sqlite3"),
         "BREEZY_ALLOW_PROXY_ENV": "1",
+        "BREEZY_USER_AGENT": "breezy-test/1.0 (+mailto:ops@example.com)",
     }
 
 
@@ -305,6 +311,36 @@ class TestErrorReporting:
         assert "BREEZY_SITES" in message
         assert "Traceback" not in message
         assert FakeNode.instances == []
+
+    def test_missing_user_agent_exits_as_configuration_error(
+        self, env: dict[str, str], monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        stderr = io.StringIO()
+        monkeypatch.delenv("BREEZY_USER_AGENT", raising=False)
+
+        code = cli.run(
+            env={key: value for key, value in env.items() if key != "BREEZY_USER_AGENT"},
+            node_factory=FakeNode,
+            probe=local_probe,
+            stderr=stderr,
+        )
+
+        assert code == cli.EXIT_CONFIG_ERROR
+        assert "BREEZY_USER_AGENT" in stderr.getvalue()
+        assert "Traceback" not in stderr.getvalue()
+        assert FakeNode.instances == []
+
+    def test_injected_user_agent_env_is_used_without_process_environment(
+        self, env: dict[str, str], monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        stderr = io.StringIO()
+        monkeypatch.delenv("BREEZY_USER_AGENT", raising=False)
+
+        code = cli.run(env=env, node_factory=FakeNode, probe=local_probe, stderr=stderr)
+
+        assert code == cli.EXIT_OK
+        assert stderr.getvalue() == ""
+        assert FakeNode.instances[-1].calls == ["build", "run", "dispose"]
 
     def test_malformed_setting_exits_non_zero_with_a_clear_message(
         self, env: dict[str, str]

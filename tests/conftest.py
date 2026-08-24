@@ -41,6 +41,7 @@ _BLOCKED_MESSAGE = (
 )
 
 _LIVE_ENV_VAR = "BREEZY_LIVE"
+_TEST_USER_AGENT = "breezy-test/1.0 (+mailto:ops@example.com)"
 
 
 def pytest_configure(config: pytest.Config) -> None:
@@ -93,6 +94,11 @@ def _blocked_connect(self: socket.socket, *args: Any, **kwargs: Any) -> None:
 
 def _blocked_connect_ex(self: socket.socket, *args: Any, **kwargs: Any) -> int:
     raise RuntimeError(_BLOCKED_MESSAGE)
+
+
+@pytest.fixture(autouse=True)
+def _default_breezy_user_agent(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("BREEZY_USER_AGENT", _TEST_USER_AGENT)
 
 
 @pytest.fixture(autouse=True)

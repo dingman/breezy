@@ -46,7 +46,11 @@ from nautilus_trader.config import TradingNodeConfig
 from nautilus_trader.live.node import TradingNode
 
 from breezy.ingest.gate import StateStoreNotDurableError
-from breezy.ingest.http import ProxyEnvironmentError
+from breezy.ingest.http import (
+    USER_AGENT_ENV_VAR,
+    ProxyEnvironmentError,
+    UserAgentConfigurationError,
+)
 from breezy.ingest.shared_state import SharedIngestState, SharedIngestStateError
 from breezy.persistence.catalog import (
     FilesystemProbe,
@@ -78,6 +82,7 @@ _CONFIG_ERRORS: tuple[type[BaseException], ...] = (
     WriterLockFilesystemError,
     StateStoreNotDurableError,
     ProxyEnvironmentError,
+    UserAgentConfigurationError,
     OSError,
 )
 
@@ -167,8 +172,15 @@ def run(
             _report(out, "configuration error", exc, expected=True)
             return EXIT_CONFIG_ERROR
 
+        # `BREEZY_USER_AGENT` is owned by ingest/http.py, not settings.py, but
+        # an injected CLI environment must still be the whole environment for
+        # tests and dry-run tooling. Passing an empty string when the injected
+        # mapping omits it makes that omission fail here instead of falling
+        # through to the real process environment.
+        user_agent = None if env is None else env.get(USER_AGENT_ENV_VAR, "")
+
         try:
-            with ingest_runtime(settings, probe=probe) as runtime:
+            with ingest_runtime(settings, probe=probe, user_agent=user_agent) as runtime:
                 if on_runtime is not None:
                     on_runtime(runtime.shared)
                 return _run_node(runtime, node_factory, out)

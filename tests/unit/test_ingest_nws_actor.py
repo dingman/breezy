@@ -270,6 +270,7 @@ def build_actor(shared: SharedIngestState, **config_overrides: Any) -> NwsIngest
     kwargs: dict[str, Any] = {"venue": VENUE, "city": CITY, "poll_interval_seconds": 300}
     kwargs.update(config_overrides)
     instance = NwsIngestActor(config=NwsIngestActorConfig(**kwargs), shared=shared)
+    instance.sleep_between_product_fetches = _no_product_fetch_sleep  # type: ignore[attr-defined]
     instance.register_base(
         portfolio=TestComponentStubs.portfolio(),
         msgbus=TestComponentStubs.msgbus(),
@@ -282,6 +283,10 @@ def build_actor(shared: SharedIngestState, **config_overrides: Any) -> NwsIngest
     )
     instance.published = published  # type: ignore[attr-defined]
     return instance
+
+
+async def _no_product_fetch_sleep(_delay_seconds: float) -> None:
+    """Unit tests opt out of production pacing unless they assert it directly."""
 
 
 def discovery_payload(*entries: dict[str, Any]) -> dict[str, Any]:
@@ -710,6 +715,39 @@ async def test_conditional_validators_are_stored_and_replayed(
 
 
 @pytest.mark.asyncio
+async def test_discovery_validators_are_not_persisted_after_sanity_hard_block(
+    actor: NwsIngestActor, shared: SharedIngestState
+) -> None:
+    """A discovery validator is safe to replay only after the batch succeeds.
+
+    If a product body hard-blocks after the discovery list has been fetched, the
+    body was NOT persisted. Replaying that list's ETag on the next poll can turn
+    an unchanged 304 into `record_successful_poll`, clearing the CRIT sanity
+    block while the missing product is still absent from the catalog.
+    """
+    payload = product_payload(NYC_FINAL)
+    payload["productText"] = load_product_text(NYC_FINAL).replace(
+        "MAXIMUM         79", "MAXIMUM        250"
+    )
+
+    with respx.mock(assert_all_called=False) as mock:
+        mock_discovery(mock, NYC_FINAL, headers={"ETag": '"bad-batch"'})
+        mock.get(product_url(NYC_FINAL)).mock(return_value=httpx.Response(200, json=payload))
+        actor.on_start()
+        await actor.poll_once()
+
+    assert GateReason.SANITY_VIOLATION in shared.gate.blocking_causes(VENUE, CITY)
+
+    with respx.mock(assert_all_called=False) as mock:
+        route = mock_discovery(mock, NYC_FINAL)
+        mock.get(product_url(NYC_FINAL)).mock(return_value=httpx.Response(200, json=payload))
+        await actor.poll_once()
+
+    assert "if-none-match" not in route.calls[0].request.headers
+    assert GateReason.SANITY_VIOLATION in shared.gate.blocking_causes(VENUE, CITY)
+
+
+@pytest.mark.asyncio
 async def test_product_fetch_sends_no_conditional_validators(
     actor: NwsIngestActor,
 ) -> None:
@@ -816,6 +854,44 @@ async def test_batch_of_unfetched_ids_is_written_in_non_decreasing_ts_init_order
     assert [d.ts_init for d in days] == sorted(d.ts_init for d in days)
 
 
+@pytest.mark.asyncio
+async def test_product_fetches_are_paced_after_the_first_and_keep_issuance_order(
+    actor: NwsIngestActor,
+) -> None:
+    """Cold-start backlog fetches must not form a back-to-back burst.
+
+    The first body fetch is immediate, then each subsequent product is delayed
+    through an injected sleep seam. The loop still sorts by `issuance_time_ns`
+    before pacing, so `ts_init` order remains issuance order rather than the
+    discovery-list order.
+    """
+    events: list[str] = []
+
+    async def _record_sleep(delay_seconds: float) -> None:
+        events.append(f"sleep:{delay_seconds}")
+
+    def _product_response(dirname: str) -> httpx.Response:
+        events.append(f"fetch:{dirname}")
+        return httpx.Response(200, json=product_payload(dirname))
+
+    actor.sleep_between_product_fetches = _record_sleep  # type: ignore[attr-defined]
+
+    with respx.mock(assert_all_called=False) as mock:
+        # Deliberately newest-first in discovery; fetch order must still be
+        # oldest issuance first.
+        mock_discovery(mock, NYC_FINAL, NYC_PRELIM)
+        mock.get(product_url(NYC_PRELIM)).mock(
+            side_effect=lambda _request: _product_response(NYC_PRELIM)
+        )
+        mock.get(product_url(NYC_FINAL)).mock(
+            side_effect=lambda _request: _product_response(NYC_FINAL)
+        )
+        actor.on_start()
+        await actor.poll_once()
+
+    assert events == [f"fetch:{NYC_PRELIM}", "sleep:0.5", f"fetch:{NYC_FINAL}"]
+
+
 # ---------------------------------------------------------------------------
 # SS6 Stage B -- per product
 # ---------------------------------------------------------------------------
@@ -893,6 +969,38 @@ async def test_sibling_station_product_is_routine_and_never_blocks(
     assert GateReason.PARSER_FAILURE not in causes
     assert GateReason.OVERSIZE_OR_PARSE_TIMEOUT not in causes
     assert actor.published == []  # type: ignore[attr-defined]
+
+
+@pytest.mark.asyncio
+async def test_sibling_only_poll_stores_validators_without_recording_success(
+    actor: NwsIngestActor, shared: SharedIngestState, clock: FakeClock
+) -> None:
+    """A sibling-only discovery response is safe to revalidate but not fresh.
+
+    Every pending entry has already proven it is not this site's CLI product,
+    so replaying the discovery validator cannot hide an unpersisted NYC body.
+    It still must not call `record_successful_poll` on the 200 branch, because
+    sibling traffic alone would otherwise keep the site fresh forever.
+    """
+    with respx.mock(assert_all_called=False) as mock:
+        payload = discovery_payload(discovery_entry(MIA_FINAL))
+        mock.get(DISCOVERY_URL).mock(
+            return_value=httpx.Response(200, json=payload, headers={"ETag": '"siblings"'})
+        )
+        mock_product(mock, MIA_FINAL)
+        actor.on_start()
+        await actor.poll_once()
+
+    assert shared.gate.status(VENUE, CITY).last_successful_poll_ns is None
+
+    clock.advance(SECOND)
+    with respx.mock(assert_all_called=False) as mock:
+        route = mock.get(DISCOVERY_URL).mock(return_value=httpx.Response(304))
+        await actor.poll_once()
+
+    sent = route.calls[0].request
+    assert sent.headers["if-none-match"] == '"siblings"'
+    assert shared.gate.status(VENUE, CITY).last_successful_poll_ns == clock.now
 
 
 @pytest.mark.asyncio
@@ -1022,6 +1130,35 @@ async def test_catalog_write_error_routes_to_write_integrity_violation(
 
     assert GateReason.WRITE_INTEGRITY_VIOLATION in shared.gate.blocking_causes(
         VENUE, CITY
+    )
+
+
+@pytest.mark.asyncio
+async def test_catalog_write_cancellation_propagates_without_durable_block(
+    actor: NwsIngestActor, shared: SharedIngestState
+) -> None:
+    """A graceful shutdown cancellation is not catalog corruption.
+
+    `asyncio.CancelledError` inherits from `BaseException`, so catching
+    `BaseException` around the off-loop write swallows SIGTERM cancellation and
+    routes it as `UNROUTED_CATALOG_ERROR`, durably blocking the site on restart.
+    """
+
+    def _cancel(_catalog: Any, _records: Sequence[Any]) -> WriteOutcome:
+        raise asyncio.CancelledError("shutdown")
+
+    actor.write_records = _cancel  # type: ignore[method-assign]
+
+    with respx.mock(assert_all_called=False) as mock:
+        mock_discovery(mock, NYC_FINAL)
+        mock_product(mock, NYC_FINAL)
+        actor.on_start()
+        with pytest.raises(asyncio.CancelledError):
+            await actor.poll_once()
+
+    assert (
+        GateReason.WRITE_INTEGRITY_VIOLATION
+        not in shared.gate.blocking_causes(VENUE, CITY)
     )
 
 

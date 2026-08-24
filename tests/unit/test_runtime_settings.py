@@ -279,6 +279,29 @@ def test_unsupported_python_logging_alias_raises_settings_error() -> None:
         load_settings(_env(BREEZY_LOG_LEVEL="WARN"))
 
 
+def test_nws_runbook_matches_runtime_environment_contract() -> None:
+    runbook = Path("docs/core/RUNBOOK_NWS_COLLECTION.md").read_text()
+    required_table = runbook.split("**Required:**", maxsplit=1)[1].split(
+        "**Optional:**", maxsplit=1
+    )[0]
+    optional_table = runbook.split("**Optional:**", maxsplit=1)[1].split(
+        "### 1a.", maxsplit=1
+    )[0]
+
+    assert "| `BREEZY_USER_AGENT` |" in required_table
+    assert "| `BREEZY_USER_AGENT` |" not in optional_table
+    assert "startup fails exit 2" in required_table
+    assert "`OFF`, `TRACE`, `DEBUG`, `INFO`, `WARNING`, `ERROR`" in optional_table
+    log_level_row = next(
+        line for line in optional_table.splitlines() if line.startswith("| `BREEZY_LOG_LEVEL` |")
+    )
+    log_level_columns = [column.strip() for column in log_level_row.strip("|").split("|")]
+    assert log_level_columns[2] == "`OFF`, `TRACE`, `DEBUG`, `INFO`, `WARNING`, `ERROR`"
+    assert "CRITICAL" not in log_level_columns[2]
+    assert "Does NOT bridge stdlib `logging` to Nautilus" not in runbook
+    assert "stdlib `logging` records are bridged to Nautilus" in optional_table
+
+
 # ---------------------------------------------------------------------------
 # Frozen / slots / immutability
 # ---------------------------------------------------------------------------

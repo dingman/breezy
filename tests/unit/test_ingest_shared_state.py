@@ -30,6 +30,7 @@ from breezy.ingest.gate import (
     StateStore,
     StateStoreNotDurableError,
 )
+from breezy.ingest.http import UserAgentConfigurationError
 from breezy.ingest.product_index import ProductIntegrityIndex
 from breezy.ingest.shared_state import (
     DEFAULT_BURST_POLICY,
@@ -173,6 +174,7 @@ def make_state(
             "clock": clock,
             "store_opener": store_opener,
             "probe": probe,
+            "user_agent": "breezy-test/1.0 (+mailto:ops@example.com)",
         }
         kwargs.update(overrides)
         state = SharedIngestState(**kwargs)  # type: ignore[arg-type]
@@ -247,6 +249,17 @@ def test_a_failed_startup_precondition_does_not_wedge_the_process(
     """
     with pytest.raises(StateStoreNotDurableError):
         make_state(store=InMemoryStateStore(), store_opener=InMemoryStateStore)
+
+    state = make_state()
+
+    assert state.sites == ALL_SITES
+
+
+def test_a_blank_user_agent_does_not_wedge_the_process(
+    make_state: Callable[..., SharedIngestState],
+) -> None:
+    with pytest.raises(UserAgentConfigurationError):
+        make_state(user_agent=" ")
 
     state = make_state()
 

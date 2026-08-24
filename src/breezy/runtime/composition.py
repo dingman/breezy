@@ -273,6 +273,7 @@ def ingest_runtime(
     settings: BreezyRuntimeSettings,
     *,
     clock: Callable[[], int] | None = None,
+    user_agent: str | None = None,
     probe: ProbeFactory = probe_filesystem,
     store_factory: StoreFactory = SqliteStateStore,
     alert_sink_factory: AlertSinkFactory = resolve_alert_sink,
@@ -288,11 +289,16 @@ def ingest_runtime(
     ``SharedIngestState`` takes a ``probe``: every teardown path stays
     reachable in a test without a real mount or a real failure.
 
-    ``alert_sink_factory`` defaults to ``health.resolve_alert_sink``, which
-    returns a ``LoggingAlertSink`` unless ``BREEZY_ALERT_WEBHOOK_URL`` is set
-    -- so an unconfigured deployment builds no ``httpx.Client``, opens no
-    socket, and touches no ``ssl`` module state. It is called EXACTLY ONCE
-    here, and the resulting sink is shared by all five Actors.
+    ``user_agent`` is deliberately separate from
+    :class:`~breezy.runtime.settings.BreezyRuntimeSettings`: ``BREEZY_USER_AGENT``
+    is owned by ``ingest/http.py``, but the CLI still needs a way to route its
+    injected environment through the composition root without reading the real
+    process environment. ``alert_sink_factory`` defaults to
+    ``health.resolve_alert_sink``, which returns a ``LoggingAlertSink`` unless
+    ``BREEZY_ALERT_WEBHOOK_URL`` is set -- so an unconfigured deployment builds
+    no ``httpx.Client``, opens no socket, and touches no ``ssl`` module state.
+    It is called EXACTLY ONCE here, and the resulting sink is shared by all
+    five Actors.
     """
     if clock is None:
         import time
@@ -332,6 +338,7 @@ def ingest_runtime(
             clock=clock,
             store_opener=open_state_store_view,
             check_proxy_env=settings.check_proxy_env,
+            user_agent=user_agent,
             probe=probe,
         )
         stack.callback(shared.dispose)

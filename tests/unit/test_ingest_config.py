@@ -78,6 +78,10 @@ def test_default_final_deadline_check_interval_seconds() -> None:
     assert _config().final_deadline_check_interval_seconds == 300
 
 
+def test_default_product_fetch_delay_seconds() -> None:
+    assert _config().product_fetch_delay_seconds == 0.5
+
+
 # ---------------------------------------------------------------------------
 # Overrides
 # ---------------------------------------------------------------------------
@@ -104,6 +108,25 @@ def test_override_final_deadline_check_interval_seconds() -> None:
         _config(final_deadline_check_interval_seconds=120).final_deadline_check_interval_seconds
         == 120
     )
+
+
+def test_override_product_fetch_delay_seconds() -> None:
+    assert _config(product_fetch_delay_seconds=0.75).product_fetch_delay_seconds == 0.75
+
+
+# ---------------------------------------------------------------------------
+# Validation
+# ---------------------------------------------------------------------------
+
+
+def test_product_fetch_delay_seconds_rejects_negative_values() -> None:
+    with pytest.raises(ValueError, match="product_fetch_delay_seconds"):
+        _config(product_fetch_delay_seconds=-0.001)
+
+
+def test_product_fetch_delay_seconds_rejects_unbounded_delays() -> None:
+    with pytest.raises(ValueError, match="product_fetch_delay_seconds"):
+        _config(product_fetch_delay_seconds=60.0)
 
 
 # ---------------------------------------------------------------------------

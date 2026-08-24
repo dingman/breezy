@@ -50,12 +50,11 @@ _START_NS = 1_700_000_000_000_000_000
 _SECOND_NS = 1_000_000_000
 _WEBHOOK_URL = "https://alerts.example.test/webhook"
 
-# A sentinel standing in for "the operator's configured user_agent_contact
-# value", e.g. `breezy.ingest.http.DEFAULT_CONTACT` or a
-# `BREEZY_USER_AGENT` override. health.py never accepts or imports a
-# settings object at all, so this sentinel is never threaded into any
-# constructor below -- the tests prove it therefore cannot appear in the
-# serialized output.
+# A sentinel standing in for "the operator's configured User-Agent contact
+# value", for example the email embedded in a `BREEZY_USER_AGENT` override.
+# health.py never accepts or imports a settings object at all, so this
+# sentinel is never threaded into any constructor below -- the tests prove it
+# therefore cannot appear in the serialized output.
 _USER_AGENT_CONTACT_SENTINEL = "breezy-data@gmail.com"
 
 

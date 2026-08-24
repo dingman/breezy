@@ -39,10 +39,11 @@ Every control below is individually load-bearing:
   arrived; every later layer can only guess, and a late guess silently
   degrades replay fidelity (see :class:`FetchResult`).
 - Conditional-GET validators are accepted as typed *values*, never as a
-  caller-supplied header mapping, so the hardened headers above cannot be
-  displaced per call. An ``ETag`` is remote data being echoed back into an
-  outbound request, so it is validated for length and charset before it is
-  ever placed in a header (see :func:`_validated_cache_validator`).
+  caller-supplied header mapping, so the hardened ``User-Agent``, ``Accept``
+  and ``Accept-Encoding`` headers cannot be displaced per call. An ``ETag``
+  is remote data being echoed back into an outbound request, so it is
+  validated for length and charset before it is ever placed in a header (see
+  :func:`_validated_cache_validator`).
 - Conditional GET is restricted to the endpoint where it is safe, **in the
   type system rather than in this prose**. There are two public fetch
   methods over one private implementation:
@@ -76,8 +77,8 @@ DEFAULT_BASE_URL = "https://api.weather.gov"
 
 DEFAULT_MAX_BODY_BYTES = 128 * 1024  # 128 KiB; real CLI products are <64 KiB.
 DEFAULT_CHUNK_SIZE = 8 * 1024
-DEFAULT_CONTACT = "breezy-data@gmail.com"
 USER_AGENT_ENV_VAR = "BREEZY_USER_AGENT"
+DEFAULT_ACCEPT = "application/ld+json"
 
 # Generous for a real validator (NWS ETags run ~40 chars, an HTTP-date 29)
 # and far below anything that could be used to smuggle a payload.
@@ -215,6 +216,10 @@ class ProxyEnvironmentError(TransportError):
     """Raised when an unapproved proxy/TLS-affecting env var is set."""
 
 
+class UserAgentConfigurationError(ValueError):
+    """Raised when the required NWS User-Agent is unset or blank."""
+
+
 class ContentEncodingError(TransportError):
     """Raised when a response carries a non-identity Content-Encoding.
 
@@ -284,11 +289,52 @@ def redact_url(url: str) -> str:
     return urlunsplit((parts.scheme, netloc, parts.path, redacted_query, parts.fragment))
 
 
-def _default_user_agent() -> str:
-    override = os.environ.get(USER_AGENT_ENV_VAR)
-    if override:
-        return override
-    return f"breezy-weather-ingest/0.1 (+mailto:{DEFAULT_CONTACT})"
+def _resolved_user_agent(explicit: str | None) -> str:
+    user_agent = os.environ.get(USER_AGENT_ENV_VAR) if explicit is None else explicit
+    if user_agent is None:
+        raise UserAgentConfigurationError(
+            f"{USER_AGENT_ENV_VAR} is required and was not set; configure a "
+            "monitored contact User-Agent before live NWS fetching."
+        )
+    if not user_agent.strip():
+        raise UserAgentConfigurationError(
+            f"{USER_AGENT_ENV_VAR} must not be blank; configure a monitored "
+            "contact User-Agent before live NWS fetching."
+        )
+    # Reject rather than strip: the operator-configured header value is an
+    # identity presented to NWS, so startup should fail loudly if it is not
+    # already safe and canonical.
+    return _validated_header_value(
+        user_agent,
+        label=USER_AGENT_ENV_VAR,
+        error_factory=UserAgentConfigurationError,
+    )
+
+
+def _validated_header_value(
+    value: str,
+    *,
+    label: str,
+    error_factory: Callable[[str], Exception],
+) -> str:
+    """Return `value` if it is safe as an HTTP field value, else raise.
+
+    The caller supplies the human label and exception type so remote validators
+    keep their existing error taxonomy while the locally configured
+    ``User-Agent`` goes through the same wire-safety gate.
+    """
+    if len(value) > MAX_VALIDATOR_LENGTH:
+        raise error_factory(
+            f"{label} exceeds the maximum length of {MAX_VALIDATOR_LENGTH} characters."
+        )
+    if value != value.strip():
+        raise error_factory(f"{label} must not carry leading or trailing whitespace.")
+    if _VALIDATOR_CHARSET.match(value) is None:
+        raise error_factory(
+            f"{label} is empty or contains characters that are not printable US-ASCII; "
+            "it is refused rather than sanitised."
+        )
+    return value
 
 
 def _validated_cache_validator(value: str, header: str) -> str:
@@ -300,21 +346,11 @@ def _validated_cache_validator(value: str, header: str) -> str:
     echoed back out. The error message names the *header*, never the value —
     an untrusted string must not be laundered into a log line.
     """
-    if len(value) > MAX_VALIDATOR_LENGTH:
-        raise InvalidCacheValidatorError(
-            f"{header} validator exceeds the maximum length of "
-            f"{MAX_VALIDATOR_LENGTH} characters."
-        )
-    if value != value.strip():
-        raise InvalidCacheValidatorError(
-            f"{header} validator must not carry leading or trailing whitespace."
-        )
-    if _VALIDATOR_CHARSET.match(value) is None:
-        raise InvalidCacheValidatorError(
-            f"{header} validator is empty or contains characters that are not "
-            "printable US-ASCII; it is refused rather than sanitised."
-        )
-    return value
+    return _validated_header_value(
+        value,
+        label=f"{header} validator",
+        error_factory=InvalidCacheValidatorError,
+    )
 
 
 def _validated_path_identifier(
@@ -363,7 +399,7 @@ def _conditional_headers(
 
     The header *names* are supplied here and only here. A caller passes
     values, never keys, so no per-call input can displace the hardened
-    ``User-Agent``/``Accept-Encoding`` set on the client.
+    ``User-Agent``/``Accept``/``Accept-Encoding`` set on the client.
     """
     headers: dict[str, str] = {}
     if if_none_match is not None:
@@ -522,7 +558,7 @@ class HttpTransport:
         self._timeouts = _Timeouts(
             connect=connect_timeout, read=read_timeout, write=write_timeout, pool=pool_timeout
         )
-        self._user_agent = user_agent or _default_user_agent()
+        self._user_agent = _resolved_user_agent(user_agent)
         self._ssl_context = _build_ssl_context()
 
     def _discovery_list_url(self, cli_location: str) -> str:
@@ -587,7 +623,11 @@ class HttpTransport:
             # NETRC / etc. from the process environment.
             trust_env=False,
             timeout=self._timeouts.as_httpx_timeout(),
-            headers={"User-Agent": self._user_agent, "Accept-Encoding": "identity"},
+            headers={
+                "User-Agent": self._user_agent,
+                "Accept": DEFAULT_ACCEPT,
+                "Accept-Encoding": "identity",
+            },
         )
 
     async def fetch_discovery_list(
@@ -627,8 +667,8 @@ class HttpTransport:
 
         Both validators are accepted as *values*, never as a header mapping:
         the transport builds the header names itself, so a caller cannot
-        displace ``User-Agent``, ``Accept-Encoding`` or any other hardened
-        header on a per-call basis. Each is checked by
+        displace ``User-Agent``, ``Accept``, ``Accept-Encoding`` or any other
+        hardened header on a per-call basis. Each is checked by
         :func:`_validated_cache_validator` before it reaches the wire.
 
         A 304 comes back as a normal :class:`FetchResult` with

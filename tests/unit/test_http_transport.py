@@ -31,6 +31,7 @@ from breezy.ingest.http import (
     ServerError,
     TransportError,
     TransportTimeoutError,
+    UserAgentConfigurationError,
     assert_clean_proxy_env,
     redact_url,
 )
@@ -90,6 +91,7 @@ def make_transport(**overrides: object) -> HttpTransport:
         "allowed_hosts": frozenset({ALLOWED_HOST}),
         "check_proxy_env": False,
         "clock": _FakeClock(),
+        "user_agent": "breezy-test/1.0 (+mailto:ops@example.com)",
     }
     kwargs.update(overrides)
     return HttpTransport(**kwargs)  # type: ignore[arg-type]
@@ -279,13 +281,51 @@ async def test_generic_transport_failure_is_wrapped() -> None:
 
 @pytest.mark.asyncio
 @respx.mock
-async def test_user_agent_contains_contact(monkeypatch: pytest.MonkeyPatch) -> None:
+async def test_user_agent_is_required_when_no_explicit_value_is_passed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     monkeypatch.delenv("BREEZY_USER_AGENT", raising=False)
-    respx.get(URL).mock(return_value=httpx.Response(200, content=b"ok"))
-    transport = make_transport()
-    await transport.fetch_discovery_list(CLI_LOCATION)
-    sent_request = respx.calls.last.request
-    assert "breezy-data@gmail.com" in sent_request.headers["User-Agent"]
+    with pytest.raises(UserAgentConfigurationError) as excinfo:
+        make_transport(user_agent=None)
+
+    assert "BREEZY_USER_AGENT" in str(excinfo.value)
+    assert "breezy-data@gmail.com" not in str(excinfo.value)
+
+
+def test_user_agent_env_value_must_not_be_blank(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("BREEZY_USER_AGENT", " \t")
+
+    with pytest.raises(UserAgentConfigurationError) as excinfo:
+        make_transport(user_agent=None)
+
+    assert "BREEZY_USER_AGENT" in str(excinfo.value)
+
+
+@pytest.mark.parametrize(
+    "bad_user_agent",
+    [
+        "breezy-test/1.0\r\nX-Injected: 1",
+        "breezy-test/1.0\x00",
+        "breezy-test/1.0 (+mailto:ops@example.com) \u2014 nyc",
+        "x" * (MAX_VALIDATOR_LENGTH + 1),
+        " breezy-test/1.0 (+mailto:ops@example.com)",
+        "breezy-test/1.0 (+mailto:ops@example.com) ",
+    ],
+)
+def test_user_agent_must_be_a_bounded_printable_ascii_header_value(
+    bad_user_agent: str,
+) -> None:
+    with pytest.raises(UserAgentConfigurationError) as excinfo:
+        make_transport(user_agent=bad_user_agent)
+
+    assert "BREEZY_USER_AGENT" in str(excinfo.value)
+    assert bad_user_agent not in str(excinfo.value)
+
+
+def test_user_agent_accepts_a_normal_operator_contact_value() -> None:
+    transport = make_transport(user_agent="breezy-test/1.0 (+mailto:ops@example.com)")
+
+    assert transport._user_agent == "breezy-test/1.0 (+mailto:ops@example.com)"
 
 
 @pytest.mark.asyncio
@@ -293,7 +333,7 @@ async def test_user_agent_contains_contact(monkeypatch: pytest.MonkeyPatch) -> N
 async def test_user_agent_honours_env_override(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("BREEZY_USER_AGENT", "custom-agent/1.0 (+mailto:ops@example.com)")
     respx.get(URL).mock(return_value=httpx.Response(200, content=b"ok"))
-    transport = make_transport()
+    transport = make_transport(user_agent=None)
     await transport.fetch_discovery_list(CLI_LOCATION)
     sent_request = respx.calls.last.request
     assert sent_request.headers["User-Agent"] == "custom-agent/1.0 (+mailto:ops@example.com)"
@@ -776,6 +816,7 @@ async def test_conditional_headers_cannot_displace_the_hardened_headers() -> Non
 
     sent = respx.calls.last.request
     assert sent.headers["User-Agent"] == "breezy-test/1.0 (+mailto:ops@example.com)"
+    assert sent.headers["Accept"] == "application/ld+json"
     assert sent.headers["Accept-Encoding"] == "identity"
 
 

@@ -35,9 +35,9 @@ from breezy.ingest.gate import (
     assert_state_store_durable,
 )
 from breezy.ingest.http import (
+    DEFAULT_ACCEPT,
     DEFAULT_BASE_URL,
     DEFAULT_CHUNK_SIZE,
-    DEFAULT_CONTACT,
     DEFAULT_MAX_BODY_BYTES,
     MAX_VALIDATOR_LENGTH,
     USER_AGENT_ENV_VAR,
@@ -54,6 +54,7 @@ from breezy.ingest.http import (
     ServerError,
     TransportError,
     TransportTimeoutError,
+    UserAgentConfigurationError,
     redact_url,
 )
 from breezy.ingest.nws_envelope import (
@@ -112,11 +113,11 @@ from breezy.ingest.shared_state import (
 )
 
 __all__ = [
+    "DEFAULT_ACCEPT",
     "DEFAULT_ALLOWED_HOSTS",
     "DEFAULT_BASE_URL",
     "DEFAULT_BURST_POLICY",
     "DEFAULT_CHUNK_SIZE",
-    "DEFAULT_CONTACT",
     "DEFAULT_DISCOVERY_MAX_BYTES",
     "DEFAULT_DISCOVERY_MAX_DEPTH",
     "DEFAULT_FINAL_DEADLINE_CHECK_INTERVAL_SECONDS",
@@ -183,6 +184,7 @@ __all__ = [
     "TransportError",
     "TransportTimeoutError",
     "UnknownSiteError",
+    "UserAgentConfigurationError",
     "WriteOutcomeLike",
     "assert_state_store_durable",
     "build_climate_day",

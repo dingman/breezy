@@ -125,7 +125,7 @@ import datetime as dt
 import json
 import logging
 import re
-from collections.abc import Callable, Sequence
+from collections.abc import Awaitable, Callable, Sequence
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, replace
 from datetime import timedelta
@@ -512,6 +512,7 @@ class NwsIngestActor(Actor):
         )
         self.parse_cli_product: Callable[..., ParsedCliProduct] = parse_cli_product
         self.classify_issuance: Callable[[str], str] = classify_issuance
+        self.sleep_between_product_fetches: Callable[[float], Awaitable[None]] = asyncio.sleep
 
         # -- WI-10/WI-12 observability seams (see `reconcile_and_report`).
         #
@@ -944,7 +945,6 @@ class NwsIngestActor(Actor):
             self._execute(decision)
             return
 
-        self._store_validators(result)
         try:
             entries = self._parse_discovery(result)
         except (NwsEnvelopeError, ValueError) as exc:
@@ -955,6 +955,7 @@ class NwsIngestActor(Actor):
         if not pending:
             # SS6 step 4: nothing new. The poll genuinely succeeded, so
             # freshness is satisfied -- this is the routine steady state.
+            self._store_validators(result)
             self.gate.record_successful_poll(
                 self._venue,
                 self._city,
@@ -969,7 +970,8 @@ class NwsIngestActor(Actor):
         # arbitrary one.
         prepared: list[_PreparedProduct] = []
         try:
-            for entry in sorted(pending, key=lambda e: e.issuance_time_ns):
+            for index, entry in enumerate(sorted(pending, key=lambda e: e.issuance_time_ns)):
+                await self._pace_product_fetch(index)
                 candidate = await self._prepare_product(entry)
                 if candidate is not None:
                     prepared.append(candidate)
@@ -983,6 +985,7 @@ class NwsIngestActor(Actor):
             # operation -- and `record_successful_poll` would be worse, since
             # sibling products would keep this site "fresh" forever while
             # neither the staleness watchdog nor FINAL_CLI_OVERDUE fired.
+            self._store_validators(result)
             return
 
         # -- step 8: the integrity tripwire, for the whole batch. READ-ONLY
@@ -1003,7 +1006,7 @@ class NwsIngestActor(Actor):
                 self._venue, self._city, detail=f"{type(exc).__name__}: {exc}"
             )
             return
-        except BaseException as exc:  # noqa: BLE001 - routed by exact type
+        except Exception as exc:  # noqa: BLE001 - routed by exact catalog type
             self._execute(route_catalog_error(exc))
             return
 
@@ -1039,6 +1042,8 @@ class NwsIngestActor(Actor):
         for candidate in prepared:
             if not self._observe_integrity(candidate):
                 return
+
+        self._store_validators(result)
 
         # -- step 12: publish, then advance the cursor.
         self._publish_records(records)
@@ -1089,6 +1094,25 @@ class NwsIngestActor(Actor):
             for entry in entries
             if self.product_index.known_digest(entry.product_uuid) is None
         ]
+
+    async def _pace_product_fetch(self, index: int) -> None:
+        """Delay product-body requests after the first request in a poll.
+
+        The discovery list is one request per site and is already staggered
+        across sites by runtime composition. A cold-start backlog is different:
+        every pending `/products/{id}` body would otherwise be fetched
+        back-to-back inside this one Actor. The delay sits *after* issuance
+        sorting and *before* `_prepare_product`, so the first body fetch is still
+        immediate and `ts_init` order still follows issuance order. The sleep
+        seam is injectable because tests must prove pacing without spending
+        real wall-clock time.
+        """
+        if index == 0:
+            return
+        delay_seconds = float(self._config.product_fetch_delay_seconds)
+        if delay_seconds <= 0:
+            return
+        await self.sleep_between_product_fetches(delay_seconds)
 
     async def _prepare_product(self, entry: DiscoveryEntry) -> _PreparedProduct | None:
         """SS6 steps 5-7 for one product: fetch, structural allowlist, parse,
