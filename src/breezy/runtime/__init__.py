@@ -22,6 +22,8 @@ from breezy.runtime.composition import (
     build_ingest_node,
     ingest_runtime,
     load_site_registry,
+    site_snapshot_path,
+    site_stagger_offset_seconds,
 )
 from breezy.runtime.health import (
     ALERT_WEBHOOK_URL_ENV_VAR,
@@ -91,6 +93,8 @@ __all__ = [
     "load_settings",
     "load_site_registry",
     "resolve_alert_sink",
+    "site_snapshot_path",
+    "site_stagger_offset_seconds",
     "uninstall_logging_bridge",
     "validated_trader_id",
     "witness_file_path",

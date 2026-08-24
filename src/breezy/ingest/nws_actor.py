@@ -530,9 +530,11 @@ class NwsIngestActor(Actor):
     def _arm_timers(self) -> None:
         if self._timers_armed:
             return
+        start_time = self._stagger_start_time()
         self.clock.set_timer(
             name=self._poll_timer_name,
             interval=timedelta(seconds=int(self._config.poll_interval_seconds)),
+            start_time=start_time,
             callback=self.on_poll_timer,
         )
         # SS6: the data-completeness deadline is scheduled on a WALL CLOCK,
@@ -545,9 +547,40 @@ class NwsIngestActor(Actor):
             interval=timedelta(
                 seconds=int(self._config.final_deadline_check_interval_seconds)
             ),
+            start_time=start_time,
             callback=self.on_deadline_timer,
         )
         self._timers_armed = True
+
+    def _stagger_start_time(self) -> dt.datetime | None:
+        """This site's timer phase, or `None` for "start now".
+
+        **Native mechanism, not a Breezy one.** `Clock.set_timer` already
+        takes `start_time=` (`nautilus_trader/common/component.pyx:419-478`,
+        forwarded to `set_timer_ns(start_time_ns=...)`; the `TestClock`
+        implementation is at `:705-739` and the `LiveClock` one at
+        `:930-979`). With `fire_immediately=False` (the default) the first
+        event lands at `start_time + interval` and every event after that one
+        `interval` later -- so an offset is a PHASE SHIFT and never a change
+        to the steady-state cadence. Nothing here re-implements scheduling.
+
+        Why it matters: without it all five Actors arm identical timers at the
+        same instant and fire together, producing five concurrent bursts to
+        `api.weather.gov` under a single User-Agent -- the documented route
+        into the UA trap, which latches every site and clears only by manual
+        operator action.
+
+        The offset itself is assigned by the composition root
+        (`breezy.runtime.composition.site_stagger_offset_seconds`), the only
+        place that knows the full site set; this method just reads it.
+        """
+        offset = int(self._config.stagger_offset_seconds)
+        if offset <= 0:
+            return None
+        # `Clock` is compiled Cython, so `utc_now()` erases to `Any`; the
+        # annotation is asserted here rather than trusted.
+        now: dt.datetime = self.clock.utc_now()
+        return now + timedelta(seconds=offset)
 
     def _cancel_timers(self) -> None:
         if not self._timers_armed:
@@ -1372,7 +1405,7 @@ class NwsIngestActor(Actor):
             )
 
         try:
-            self._emit_health(now_ns, entries=entries, revisions=revisions)
+            await self._emit_health(now_ns, entries=entries, revisions=revisions)
         except Exception:
             logger.exception(
                 "health emission failed for %s/%s -- swallowed so the poll continues",
@@ -1380,7 +1413,7 @@ class NwsIngestActor(Actor):
                 self._city,
             )
 
-    def _emit_health(
+    async def _emit_health(
         self,
         now_ns: int,
         *,
@@ -1434,8 +1467,22 @@ class NwsIngestActor(Actor):
             summaries=summaries,
             revisions=revisions,
         )
-        emitted = self._alert_tracker(health).dispatch(
-            self._resolved_alert_sink(health), conditions, now_ns=now_ns
+        # OFF THE LOOP, deliberately. `AlertState.dispatch` ends in
+        # `emit_alert` -> `WebhookAlertSink.emit` -> a SYNCHRONOUS
+        # `httpx.Client.post` with a 5s default timeout
+        # (`runtime/health.py`), so running it inline held the event-loop
+        # thread for up to five seconds per fired condition. The incident
+        # case is exactly the case it fires in: several sites transitioning
+        # to blocked at once serialises those POSTs and delays every other
+        # site's poll and final-overdue check near a settlement deadline.
+        # Same `_run_off_loop` seam, and for the same reason, as the catalog
+        # read in `reconcile_and_report`. Awaiting it keeps the ordering and
+        # the exception contract identical -- `emit_alert` still swallows
+        # sink failures, and this method's caller still swallows the rest.
+        tracker = self._alert_tracker(health)
+        sink = self._resolved_alert_sink(health)
+        emitted = await self._run_off_loop(
+            lambda: tracker.dispatch(sink, conditions, now_ns=now_ns)
         )
 
         snapshot = health.HealthSnapshot(
@@ -1460,8 +1507,14 @@ class NwsIngestActor(Actor):
             alerts_emitted_this_cycle=emitted,
         )
         self.last_health_snapshot = snapshot
-        if self.health_snapshot_path is not None:
-            health.write_snapshot_atomic(self.health_snapshot_path, snapshot)
+        snapshot_path = self.health_snapshot_path
+        if snapshot_path is not None:
+            # Off the loop for the same reason as the dispatch above:
+            # `write_snapshot_atomic` does an `fsync` plus a rename, and a
+            # stalled disk must not be able to hold the poll cycle's thread.
+            await self._run_off_loop(
+                lambda: health.write_snapshot_atomic(snapshot_path, snapshot)
+            )
 
     def _alert_conditions(
         self,

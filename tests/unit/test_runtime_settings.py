@@ -341,3 +341,41 @@ def test_load_settings_env_parameter_is_injected_not_os_environ(
     monkeypatch.setenv("BREEZY_TRADER_ID", "FROM-REAL-OS-ENVIRON")
     settings = load_settings(_env())
     assert settings.trader_id == "BREEZY-001"
+
+
+# ---------------------------------------------------------------------------
+# BREEZY_HEALTH_SNAPSHOT_DIR (WI-12 wiring)
+# ---------------------------------------------------------------------------
+
+
+def test_health_snapshot_dir_defaults_to_none() -> None:
+    """Unset is VALID: the feature is simply off and no artifact is dropped
+    in whatever directory the process happened to start in.
+    """
+    settings = load_settings(_env())
+    assert settings.health_snapshot_dir is None
+
+
+def test_health_snapshot_dir_is_parsed_when_set() -> None:
+    settings = load_settings(_env(BREEZY_HEALTH_SNAPSHOT_DIR="/var/lib/breezy/health"))
+    assert settings.health_snapshot_dir == Path("/var/lib/breezy/health")
+
+
+def test_blank_health_snapshot_dir_is_rejected() -> None:
+    with pytest.raises(SettingsError, match="BREEZY_HEALTH_SNAPSHOT_DIR"):
+        load_settings(_env(BREEZY_HEALTH_SNAPSHOT_DIR="   "))
+
+
+def test_relative_health_snapshot_dir_is_rejected() -> None:
+    """A relative path resolves against the process CWD, which under systemd
+    is not a property any operator controls -- the snapshot would land
+    somewhere nobody monitors, and the runbook's "stale file means the
+    process is dead" check would read a file that never existed.
+    """
+    with pytest.raises(SettingsError, match="BREEZY_HEALTH_SNAPSHOT_DIR"):
+        load_settings(_env(BREEZY_HEALTH_SNAPSHOT_DIR="health"))
+
+
+def test_health_snapshot_dir_with_a_nul_byte_is_rejected() -> None:
+    with pytest.raises(SettingsError, match="BREEZY_HEALTH_SNAPSHOT_DIR"):
+        load_settings(_env(BREEZY_HEALTH_SNAPSHOT_DIR="/var/lib/bre\x00ezy"))

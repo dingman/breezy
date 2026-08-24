@@ -39,6 +39,7 @@ _PARSE_TIMEOUT_VAR = "BREEZY_PARSE_TIMEOUT_MS"
 _LOG_LEVEL_VAR = "BREEZY_LOG_LEVEL"
 _ALLOW_PROXY_ENV_VAR = "BREEZY_ALLOW_PROXY_ENV"
 _REGISTRY_PATH_VAR = "BREEZY_REGISTRY_PATH"
+_HEALTH_SNAPSHOT_DIR_VAR = "BREEZY_HEALTH_SNAPSHOT_DIR"
 
 _DEFAULT_TRADER_ID = "BREEZY-001"
 _DEFAULT_POLL_INTERVAL_SECONDS = 300
@@ -80,6 +81,13 @@ class BreezyRuntimeSettings:
     log_level: str
     check_proxy_env: bool
     registry_path: Path | None
+    #: Directory the per-site health snapshots are written into, or
+    #: `None` (the default) for "feature off, write nothing". A
+    #: DIRECTORY rather than a file path because each Actor knows only
+    #: its own site: five Actors sharing one file would clobber each
+    #: other. `breezy.runtime.composition.site_snapshot_path` derives
+    #: the one file per `(venue, city)` beneath it.
+    health_snapshot_dir: Path | None = None
 
 
 def _require(env: Mapping[str, str], var: str) -> str:
@@ -148,6 +156,47 @@ def _parse_check_proxy_env(env: Mapping[str, str]) -> bool:
     return env.get(_ALLOW_PROXY_ENV_VAR) != "1"
 
 
+def _parse_health_snapshot_dir(env: Mapping[str, str]) -> Path | None:
+    """Parse `BREEZY_HEALTH_SNAPSHOT_DIR`; `None` when unset.
+
+    Unset is deliberately VALID -- an unconfigured deployment writes no
+    snapshot at all rather than dropping artifacts in whatever directory
+    the process happened to start in.
+
+    Set-but-malformed fails fast, naming the variable, exactly like every
+    other setting here. Three rejections, each with a production failure
+    behind it:
+
+    * blank/whitespace -- an operator who meant to unset it instead wrote an
+      empty value, and `Path("")` is `Path(".")`, silently the CWD;
+    * relative -- resolves against the process CWD, which under systemd is
+      not a property the operator controls, so the snapshot lands somewhere
+      nobody monitors and the runbook's "stale file means the process is
+      dead" check reads a path that never existed;
+    * embedded NUL -- accepted by `Path()` and rejected only later by the
+      first syscall, i.e. inside the poll cycle rather than at startup.
+
+    No filesystem I/O: this module stays pure, and the directory is created
+    (with its parents) by `write_snapshot_atomic` at first write.
+    """
+    raw = env.get(_HEALTH_SNAPSHOT_DIR_VAR)
+    if raw is None:
+        return None
+    if not raw.strip():
+        raise SettingsError(
+            f"{_HEALTH_SNAPSHOT_DIR_VAR} must not be blank; unset it entirely to "
+            "disable health snapshots"
+        )
+    if "\x00" in raw:
+        raise SettingsError(f"{_HEALTH_SNAPSHOT_DIR_VAR} must not contain a NUL byte")
+    path = Path(raw)
+    if not path.is_absolute():
+        raise SettingsError(
+            f"{_HEALTH_SNAPSHOT_DIR_VAR} must be an absolute path, was {raw!r}"
+        )
+    return path
+
+
 def load_settings(env: Mapping[str, str] | None = None) -> BreezyRuntimeSettings:
     """Load and validate `BreezyRuntimeSettings` from `env`.
 
@@ -179,6 +228,7 @@ def load_settings(env: Mapping[str, str] | None = None) -> BreezyRuntimeSettings
 
     registry_path_raw = active_env.get(_REGISTRY_PATH_VAR)
     registry_path = Path(registry_path_raw) if registry_path_raw else None
+    health_snapshot_dir = _parse_health_snapshot_dir(active_env)
 
     return BreezyRuntimeSettings(
         trader_id=trader_id,
@@ -190,4 +240,5 @@ def load_settings(env: Mapping[str, str] | None = None) -> BreezyRuntimeSettings
         log_level=log_level,
         check_proxy_env=check_proxy_env,
         registry_path=registry_path,
+        health_snapshot_dir=health_snapshot_dir,
     )

@@ -25,6 +25,7 @@ DEFAULT_PARSE_TIMEOUT_MS = 250
 DEFAULT_DISCOVERY_MAX_BYTES = 262_144
 DEFAULT_DISCOVERY_MAX_DEPTH = 8
 DEFAULT_FINAL_DEADLINE_CHECK_INTERVAL_SECONDS = 300
+DEFAULT_STAGGER_OFFSET_SECONDS = 0
 
 
 class NwsIngestActorConfig(ActorConfig, frozen=True):
@@ -42,3 +43,11 @@ class NwsIngestActorConfig(ActorConfig, frozen=True):
     discovery_max_bytes: int = DEFAULT_DISCOVERY_MAX_BYTES
     discovery_max_depth: int = DEFAULT_DISCOVERY_MAX_DEPTH
     final_deadline_check_interval_seconds: int = DEFAULT_FINAL_DEADLINE_CHECK_INTERVAL_SECONDS
+    #: Phase shift, in seconds, applied to this site's timers via the
+    #: NATIVE `Clock.set_timer(start_time=...)` parameter
+    #: (`nautilus_trader/common/component.pyx:419-478`). Assigned by
+    #: `breezy.runtime.composition.site_stagger_offset_seconds`, which is
+    #: the only place that knows how many sites this process serves.
+    #: `0` (the default) means no shift, so a single-site or hand-built
+    #: Actor behaves exactly as before.
+    stagger_offset_seconds: int = DEFAULT_STAGGER_OFFSET_SECONDS

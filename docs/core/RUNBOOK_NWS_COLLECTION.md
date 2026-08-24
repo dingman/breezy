@@ -29,6 +29,60 @@
 | `BREEZY_ALLOW_PROXY_ENV` | (check proxy env) | (any value) | Set to `"1"` to allow HTTP_PROXY/HTTPS_PROXY env vars. Unset or `"0"` → block proxy env (secure default). |
 | `BREEZY_REGISTRY_PATH` | (none) | Path to `registry/sites.toml` | Optional override; if unset, embedded registry used. |
 | `BREEZY_USER_AGENT` | `breezy-weather-ingest/0.1 (+mailto:breezy-data@gmail.com)` | HTTP User-Agent string | Read by `ingest/http.py`, not `settings.py`. NWS uses this to contact operator on abuse. Contact email MUST be valid and monitored. |
+| `BREEZY_HEALTH_SNAPSHOT_DIR` | (none — feature off) | **Absolute** directory path | Directory the per-site health snapshots are written into, one file per site: `health-<venue>-<city>.json`, mode 0600. Unset = no file is written at all. Blank, relative, or containing a NUL byte → SettingsError exit 2. |
+| `BREEZY_ALERT_WEBHOOK_URL` | (none) | `https://…` URL, no userinfo | Read by `runtime/health.py`, not `settings.py`. Unset → the process uses `LoggingAlertSink` and builds **no** HTTP client and **no** TLS context. Exactly ONE sink is built per process and shared by all five actors. |
+
+
+### 1a. Health snapshots — "stale file means the process is dead"
+
+`BREEZY_HEALTH_SNAPSHOT_DIR` holds **one file per site**, not one file for
+the process:
+
+```
+/var/lib/breezy/health/health-polymarket_us-NYC.json
+/var/lib/breezy/health/health-polymarket_us-SFO.json
+…
+```
+
+Per-site because an actor knows only its own site — five actors sharing one
+path would overwrite each other every poll cycle and the file would report
+whichever site wrote last. Each file is rewritten once per poll cycle via
+`write_snapshot_atomic` (mkstemp → fsync → `os.replace`), so a reader never
+observes a partial document.
+
+**Liveness checks (both, they answer different questions):**
+
+| Question | Check | Meaning |
+|---|---|---|
+| Is the PROCESS alive? | `max(mtime)` over `BREEZY_HEALTH_SNAPSHOT_DIR/health-*.json` older than `2 × BREEZY_POLL_INTERVAL_SECONDS` | Dead or wedged process. Nothing else makes every file go stale at once. |
+| Is a SITE alive? | any individual `health-<venue>-<city>.json` older than `2 × BREEZY_POLL_INTERVAL_SECONDS` while others are fresh | That one site's poll cycle is wedged; the rest of the process is fine. |
+
+Example:
+
+```bash
+DIR=/var/lib/breezy/health
+NOW=$(date +%s)
+# process-level: newest file
+NEWEST=$(stat -c %Y "$DIR"/health-*.json | sort -n | tail -1)
+echo "process silent for $(( NOW - NEWEST ))s"
+```
+
+### 1b. Poll stagger
+
+The five sites do **not** poll simultaneously. The composition root assigns
+each site a deterministic phase offset — `index × poll_interval ÷ site_count`,
+so 0/60/120/180/240s on the 300s default — and feeds it to Nautilus's own
+`Clock.set_timer(start_time=…)`. The steady-state cadence is unchanged: every
+site still polls once per `BREEZY_POLL_INTERVAL_SECONDS`.
+
+Offsets are derived from the site's **position in `BREEZY_SITES`**, so they
+are stable across restarts and an incident is reproducible. Reordering or
+adding entries to `BREEZY_SITES` reassigns offsets; that is expected and
+harmless, but note it when correlating logs across a config change.
+
+This exists to keep five concurrent requests per interval — under a single
+`BREEZY_USER_AGENT` — from tripping the NWS UA trap (§ below), which latches
+**all** sites and clears only by manual operator action.
 
 ---
 
