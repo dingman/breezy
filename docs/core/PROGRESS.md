@@ -59,6 +59,97 @@ defence against an adversary with full filesystem write access.
 
 ---
 
+## Phase 1 NWS ingestion hardening: LANDED AND RE-VERIFIED (2026-08-24)
+
+Six NWS ingestion defects were fixed with RED -> GREEN tests. Final gates:
+`uv run pytest -q` exit 0 (1683 tests), `uv run ruff check .` clean,
+`uv run mypy` clean.
+
+### [CRITICAL] Conditional-GET validators could launder a blocked site open
+
+`nws_actor.py` stored the discovery ETag before the discovery body was parsed.
+If parser failure, sanity violation, integrity violation or write-integrity
+violation blocked the site after that point, the next poll could send
+`If-None-Match`, receive 304, and let `gate.record_successful_poll`
+(`gate.py:911-951`) clear exactly those block reasons without ever persisting
+the settlement product.
+
+Validators now store only on genuinely clean paths: the 304 branch, no-new
+products, sibling-only products, and after the durable-mark loop following
+persist. An independent settlement review audited all 12 `_poll_cycle` exits
+and found no remaining path that stores a validator for a list containing an
+unpersisted product of ours.
+
+### [HIGH] `asyncio.CancelledError` was swallowed on shutdown
+
+`except BaseException` caught SIGTERM cancellation, routed it as an unrouted
+catalog error and durably wrote a write-integrity violation to SQLite. A
+restart after a mid-write shutdown could come back BLOCKED. Narrowed to
+`except Exception` so cancellation propagates.
+
+### [HIGH] Product body fetches had no intra-site pacing
+
+A fresh site fetched every pending product body back-to-back; the existing
+stagger spreads sites, not requests within one site. That made the global NWS
+UA trap too easy to latch across all cities. Added
+`product_fetch_delay_seconds`, default `0.5`, bounded `[0, 5.0]`, applied
+before the 2nd and later fetches through an injectable sleep seam so tests do
+not sleep for real.
+
+### [HIGH] `BREEZY_USER_AGENT` defaulted to an unprovisioned placeholder
+
+The shipped default sent `breezy-data@gmail.com`, while
+`docs/plans/WEATHER_INGESTION_PROPOSAL.md` already records that this blocks
+live NWS fetching until created. `BREEZY_USER_AGENT` is now required and
+validated at startup: printable US-ASCII, bounded length, no leading or
+trailing whitespace. Misconfiguration raises `UserAgentConfigurationError`
+and exits 2.
+
+This also closed a silent-death path: a pasted non-ASCII character previously
+raised raw `UnicodeEncodeError`, not `TransportError`, so `poll_once` produced
+no `PollOutcome`, gate state or health signal.
+
+### [MEDIUM] Discovery fetches did not state the content contract
+
+NWS requests now send an undisplaceable `Accept: application/ld+json` header
+instead of relying on server defaults.
+
+### [HIGH] Sibling-only polls froze freshness
+
+The first validator fix missed the `if not prepared: return` branch, reached
+when every pending discovery entry is for a sibling station. Sibling products
+are never marked in the product-integrity index, so `_undeduped` re-yields
+them every cycle. With no validator stored, 304s never arrived,
+`last_successful_poll_ns` froze, and the site would latch `stale_blocked`
+after 12 poll intervals despite correct local data.
+
+Validators now store on that branch without recording a false successful poll.
+This was a regression introduced by the validator fix and caught in review
+before shipping.
+
+### Runbook correction
+
+The copy-paste systemd unit documented `BREEZY_SITES="polymarket:nyc"`, which
+the registry rejects (`configuration error: configured site polymarket/nyc is
+not in the registry`, exit 2). Corrected alongside the `BREEZY_LOG_LEVEL`
+value list: `CRITICAL` was documented but rejected; `OFF` and `TRACE` were
+valid but undocumented. Also removed a stale claim that the stdlib ->
+Nautilus logging bridge was still outstanding.
+
+### Live validation evidence
+
+Real end-to-end ingestion was re-proven against live `api.weather.gov` on four
+sites: NYC, SFO, MIA and LAX. Persisted values were cross-checked against raw
+upstream product text while bypassing Breezy's parser. Evidence:
+`docs/evidence/ingestion/LIVE_RUN_2026-08-24.md`.
+
+Observed real-data confirmations: record-qualifier suffixes (`96R`, `100R`)
+parse to bare integers; the `VALID TODAY AS OF` FINAL/PRELIMINARY
+discriminator is correct in both directions; Miami 2026-08-19 captured a real
+5 F settlement-relevant revision, preliminary `tmin=81` to final `tmin=76`.
+
+---
+
 ## Open follow-ups
 
 ### [MEDIUM] `never_substitute` is declared but has no consumers
@@ -178,9 +269,64 @@ fail-closed design. Also unverified: whether an office could emit `100 R`
 (whitespace-separated) — `_MAXIMUM_RE`'s `\S+` capture would take only `100`
 and silently drop the marker, the opposite failure mode. Not observed live.
 
-### Import-linter contracts are still absent
-`import-linter` is declared as a dependency but **no contracts are configured**,
-so the layering it exists to enforce is unenforced.
+### [MEDIUM] Live tests hardcode a personal contact address
+
+`tests/live/test_nws_live_ingest.py:86` hardcodes a personal address in
+`LIVE_USER_AGENT`. That contradicts the control in
+`docs/plans/WEATHER_INGESTION_PROPOSAL.md`: the NWS contact must be a role
+mailbox, not a personal address, because it lands in every fixture and log
+line. Pre-existing at HEAD, not introduced by today's fixes.
+
+**Action:** read the UA from `BREEZY_USER_AGENT` and skip the live tests when
+unset. Do not substitute a role mailbox that does not exist yet.
+
+### [MEDIUM] `BREEZY_USER_AGENT` is required for some offline construction paths
+
+`SharedIngestState.__init__` builds `HttpTransport` unconditionally, so a
+future offline replay, backtest or tooling path that constructs it will fail
+before reaching any no-network actor path. This was a deliberate trade for
+fail-fast live behaviour.
+
+**Action:** revisit only if an offline replay or backtest path lands.
+
+### [MEDIUM] Sibling-station products are never marked in the integrity index
+
+Sibling products stay pending and are re-fetched whenever the discovery list
+changes. Restored 304s bound the damage, but a list change can still waste one
+body fetch per sibling product.
+
+### [LOW] `_store_validators` can pair a fresh ETag with stale `Last-Modified`
+
+The headers can come from different responses. RFC 7232 requires servers to
+prefer `If-None-Match` when both validators are sent, so this is safe in
+practice, but it remains a latent staleness vector if an intermediary
+misbehaves.
+
+### [LOW] `respx` intercepts below httpx header validation
+
+No mocked request test can catch a malformed User-Agent. Mitigated by startup
+validation that is asserted directly rather than through a mocked request.
+
+### [LOW] `lint-imports` has no configuration
+
+`import-linter` is declared as a dev dependency but has zero contracts defined,
+so `lint-imports` reports "Could not read any configuration". Either define
+the layer contracts or drop the dependency.
+
+### [LOW] `ruff format --check` reports 31 unformatted files
+
+Pre-existing cosmetic drift. Formatting is not currently part of any gate.
+
+### [UNPROVEN] MDW is the only venue site not in the four-site live proof
+
+NYC, SFO, MIA and LAX now have the 2026-08-24 live proof recorded in
+`docs/evidence/ingestion/LIVE_RUN_2026-08-24.md`. MDW does not.
+
+### [UNPROVEN] No CORRECTION product appeared in the live window
+
+No CCA/CCB product appeared in any live window, so the supersession write path
+remains fixture-covered only. `revision_seq` was live-proven in its
+preliminary -> final form.
 
 ---
 

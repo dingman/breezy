@@ -14,8 +14,27 @@
 
 | Variable | Purpose | Format/Example | Failure if wrong |
 |---|---|---|---|
-| `BREEZY_SITES` | Active site set; no default | `"polymarket:nyc,kalshi:sfo"` (comma-separated venue:city pairs) | Missing: SettingsError, startup fails exit 2. Blank/malformed: startup fails exit 2. |
+| `BREEZY_SITES` | Active site set; no default | `"polymarket_us:NYC,polymarket_us:SFO"` (comma-separated `venue:city` pairs) | Missing: SettingsError, startup fails exit 2. Blank/malformed: startup fails exit 2. Not in the registry: exit 2 with `configured site <venue>/<city> is not in the registry`. |
 | `BREEZY_CATALOG_BASE` | Root of NWS data directory (state DB, catalogs, witness marker live here) | `/var/lib/breezy/catalog` | Missing: SettingsError exit 2. Not writable: OSError exit 2. Symlinked: writer lock fails (see §9). |
+| `BREEZY_USER_AGENT` | HTTP User-Agent string with a monitored operator contact | `breezy-weather-ingest/0.1 (+mailto:ops@example.com)` | Missing or blank: UserAgentConfigurationError, startup fails exit 2. Read by `ingest/http.py`, not `settings.py`. NWS uses this to contact the operator on abuse. |
+
+**`BREEZY_SITES` values are matched CASE-SENSITIVELY and EXACTLY against the
+table keys in `src/breezy/registry/sites.toml`.** `SiteRegistry.settlement_site`
+(`registry/sites.py:313-324`) does a plain dict lookup on the `(venue, city)`
+tuple: it never lower-cases, never aliases a venue name, and never substitutes
+a neighbour. The registry's keys are `[sites.<venue>.<CITY>]`, so today the
+only legal values are:
+
+```
+polymarket_us:NYC   polymarket_us:SFO   polymarket_us:MIA
+polymarket_us:MDW   polymarket_us:LAX
+```
+
+Verified live on 2026-08-24: `BREEZY_SITES=polymarket:nyc` — a plausible-looking
+lowercase/short-venue spelling — exits **2** with
+`breezy: configuration error: configured site polymarket/nyc is not in the registry`.
+There is no Kalshi entry in the registry yet, so `kalshi:…` is not a valid
+value either.
 
 **Optional:**
 
@@ -25,10 +44,9 @@
 | `BREEZY_STATE_DB` | `{BREEZY_CATALOG_BASE}/state/breezy-state.sqlite3` | Path | SQLite file; must not be on a network filesystem. Created if missing. |
 | `BREEZY_POLL_INTERVAL_SECONDS` | `300` (5 min) | Positive integer | Polling frequency per site. Governs how fast missed products can be caught; lower = faster catch-up, higher = lower request rate. |
 | `BREEZY_PARSE_TIMEOUT_MS` | `250` | Positive integer | Timeout for CLI product text parsing. Exceeds → product marked OVERSIZE_OR_PARSE_TIMEOUT, site degraded. |
-| `BREEZY_LOG_LEVEL` | `INFO` | `DEBUG`, `INFO`, `WARNING`, `ERROR`, `CRITICAL` | Nautilus kernel log level. Does NOT bridge stdlib `logging` to Nautilus; WI-3 is outstanding. |
+| `BREEZY_LOG_LEVEL` | `INFO` | `OFF`, `TRACE`, `DEBUG`, `INFO`, `WARNING`, `ERROR` | Nautilus kernel log level. `CRITICAL` is rejected and startup fails exit 2. stdlib `logging` records are bridged to Nautilus by the console entrypoint. |
 | `BREEZY_ALLOW_PROXY_ENV` | (check proxy env) | (any value) | Set to `"1"` to allow HTTP_PROXY/HTTPS_PROXY env vars. Unset or `"0"` → block proxy env (secure default). |
 | `BREEZY_REGISTRY_PATH` | (none) | Path to `registry/sites.toml` | Optional override; if unset, embedded registry used. |
-| `BREEZY_USER_AGENT` | `breezy-weather-ingest/0.1 (+mailto:breezy-data@gmail.com)` | HTTP User-Agent string | Read by `ingest/http.py`, not `settings.py`. NWS uses this to contact operator on abuse. Contact email MUST be valid and monitored. |
 | `BREEZY_HEALTH_SNAPSHOT_DIR` | (none — feature off) | **Absolute** directory path | Directory the per-site health snapshots are written into, one file per site: `health-<venue>.<city>.json`, mode 0600. Unset = no file is written at all. Blank, relative, or containing a NUL byte → SettingsError exit 2. |
 | `BREEZY_ALERT_WEBHOOK_URL` | (none) | `https://…` URL, no userinfo | Read by `runtime/health.py`, not `settings.py`. Unset → the process uses `LoggingAlertSink` and builds **no** HTTP client and **no** TLS context. Exactly ONE sink is built per process and shared by all five actors. |
 
@@ -131,7 +149,7 @@ StateDirectory=breezy
 CacheDirectory=breezy
 
 Environment="BREEZY_CATALOG_BASE=/var/lib/breezy/catalog"
-Environment="BREEZY_SITES=polymarket:nyc"
+Environment="BREEZY_SITES=polymarket_us:NYC"
 Environment="BREEZY_USER_AGENT=breezy-ingest/1.0 (+mailto:ops@example.com)"
 
 # Use the full path to breezy entrypoint
@@ -368,8 +386,8 @@ sudo systemctl stop breezy-nws-ingest
 
 # Edit the unit
 sudo systemctl edit breezy-nws-ingest
-# Change:   Environment="BREEZY_SITES=polymarket:nyc,kalshi:sfo,…"
-# To:       Environment="BREEZY_SITES=polymarket:nyc"
+# Change:   Environment="BREEZY_SITES=polymarket_us:NYC,polymarket_us:SFO,…"
+# To:       Environment="BREEZY_SITES=polymarket_us:NYC"
 
 sudo systemctl daemon-reload
 sudo systemctl start breezy-nws-ingest
