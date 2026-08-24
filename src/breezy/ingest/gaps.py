@@ -212,6 +212,16 @@ class ObservedRecord(Protocol):
     revision_seq: int
     correction_flag: bool
     is_superseded: bool
+    #: Digest of the verbatim product text. The identity of the OBSERVATION,
+    #: as opposed to ``revision_seq``, which identifies only its position in
+    #: the catalog -- see :func:`_is_revision`.
+    raw_sha256: str
+    #: The settlement-relevant readings: the observed high, low and the
+    #: product's own published average. ``None`` when the paired sentinel flag
+    #: names a missing/trace value.
+    tmax_f: int | None
+    tmin_f: int | None
+    tavg_f: int | None
 
 
 class TamperedGapLedgerError(Exception):
@@ -250,6 +260,14 @@ class GapEntry:
     ``ReconcileResult.opened`` / ``.resolved``), purely so a later reissue has
     something to be compared against. ``state is OPEN`` -- not "an entry
     exists" -- is the outstanding-gap predicate for any caller.
+
+    ``observed_raw_sha256`` and the three ``observed_t*_f`` readings are the
+    CONTENT baseline: the evidence :func:`_is_revision` actually compares
+    against, and the reason ``observed_revision_seq`` is recorded but never
+    compared. ``observed_raw_sha256`` is ``""`` -- never a real digest -- when
+    the baseline is UNKNOWN: on an ``OPEN`` entry (nothing observed yet) and
+    on an entry decoded from the pre-content-baseline format (see
+    :func:`_entry_from_bytes`).
     """
 
     venue: str
@@ -261,6 +279,10 @@ class GapEntry:
     resolved_at_ns: int | None
     observed_revision_seq: int
     observed_is_final: bool
+    observed_raw_sha256: str
+    observed_tmax_f: int | None
+    observed_tmin_f: int | None
+    observed_tavg_f: int | None
     correction_flag: bool
     is_superseded: bool
     acknowledged_by: str | None
@@ -272,11 +294,16 @@ class GapEntry:
 class RevisionEvent:
     """A post-resolution change observed for an already-``RESOLVED`` day.
 
-    Fires when ``revision_seq`` increases, or when ``correction_flag`` or
-    ``is_superseded`` flips from ``False`` to ``True`` -- each independently,
-    per ``NwsClimateDay``'s documented semantics
-    (``src/breezy/domain/nws_climate_day.py``). Consumed by WI-12's
-    ``PostSettlementRevision`` alert; this module only detects and reports it.
+    Fires when a settlement-relevant READING changes, or when
+    ``correction_flag`` or ``is_superseded`` flips from ``False`` to ``True``
+    -- each independently, per ``NwsClimateDay``'s documented semantics
+    (``src/breezy/domain/nws_climate_day.py``). Explicitly does NOT fire on a
+    ``revision_seq`` increase alone: see :func:`_is_revision`.
+
+    ``previous_revision_seq`` / ``new_revision_seq`` are carried for
+    provenance in the operator-facing alert -- "which catalog rows" -- and are
+    NOT the trigger. Consumed by WI-12's ``PostSettlementRevision`` alert;
+    this module only detects and reports it.
     """
 
     venue: str
@@ -318,6 +345,10 @@ class _ObservedSummary:
     revision_seq: int
     correction_flag: bool
     is_superseded: bool
+    raw_sha256: str
+    tmax_f: int | None
+    tmin_f: int | None
+    tavg_f: int | None
 
 
 # ---------------------------------------------------------------------------
@@ -448,6 +479,10 @@ def _entry_to_bytes(entry: GapEntry) -> bytes:
         "resolved_at_ns": entry.resolved_at_ns,
         "observed_revision_seq": entry.observed_revision_seq,
         "observed_is_final": entry.observed_is_final,
+        "observed_raw_sha256": entry.observed_raw_sha256,
+        "observed_tmax_f": entry.observed_tmax_f,
+        "observed_tmin_f": entry.observed_tmin_f,
+        "observed_tavg_f": entry.observed_tavg_f,
         "correction_flag": entry.correction_flag,
         "is_superseded": entry.is_superseded,
         "acknowledged_by": entry.acknowledged_by,
@@ -499,6 +534,34 @@ def _require_bool(payload: dict[str, Any], field: str) -> bool:
     return value
 
 
+def _str_or_default(payload: dict[str, Any], field: str, default: str) -> str:
+    """`field` as a ``str``, or `default` when the key is ABSENT ENTIRELY.
+
+    Absent means "written by a codec that predates this field", which is a
+    real state on disk: ``SqliteStateStore`` cannot delete or rewrite in bulk
+    (get/set/close over bytes only), so entries in the old format survive an
+    upgrade forever and MUST decode rather than crash the poll. Present-but-
+    wrong-typed is a different fact entirely and still raises -- tolerating
+    the old format must never become tolerating garbage.
+    """
+    if field not in payload:
+        return default
+    return _require_str(payload, field)
+
+
+def _optional_int_or_default(payload: dict[str, Any], field: str) -> int | None:
+    """`field` as an ``int | None``, defaulting to ``None`` when ABSENT.
+
+    ``None`` is also a legitimate stored value (the reading was a sentinel),
+    so this default is deliberately NOT the legacy marker. That job belongs
+    to ``observed_raw_sha256 == ""`` alone -- one unambiguous marker, checked
+    in one place (:func:`_is_revision`).
+    """
+    if field not in payload:
+        return None
+    return _require_optional_int(payload, field)
+
+
 def _entry_from_bytes(raw: bytes) -> GapEntry:
     payload: Any = json.loads(raw.decode("utf-8"))
     if not isinstance(payload, dict):
@@ -520,6 +583,10 @@ def _entry_from_bytes(raw: bytes) -> GapEntry:
         resolved_at_ns=_require_optional_int(payload, "resolved_at_ns"),
         observed_revision_seq=_require_int(payload, "observed_revision_seq"),
         observed_is_final=_require_bool(payload, "observed_is_final"),
+        observed_raw_sha256=_str_or_default(payload, "observed_raw_sha256", ""),
+        observed_tmax_f=_optional_int_or_default(payload, "observed_tmax_f"),
+        observed_tmin_f=_optional_int_or_default(payload, "observed_tmin_f"),
+        observed_tavg_f=_optional_int_or_default(payload, "observed_tavg_f"),
         correction_flag=_require_bool(payload, "correction_flag"),
         is_superseded=_require_bool(payload, "is_superseded"),
         acknowledged_by=_require_optional_str(payload, "acknowledged_by"),
@@ -673,53 +740,133 @@ def _reduce_observed(
             revision_seq=record.revision_seq,
             correction_flag=record.correction_flag,
             is_superseded=record.is_superseded,
+            raw_sha256=record.raw_sha256,
+            tmax_f=record.tmax_f,
+            tmin_f=record.tmin_f,
+            tavg_f=record.tavg_f,
         )
         for day, (_, record) in best.items()
     }
 
 
+def _readings(entry: GapEntry) -> tuple[int | None, int | None, int | None]:
+    return (entry.observed_tmax_f, entry.observed_tmin_f, entry.observed_tavg_f)
+
+
+def _observed_readings(obs: _ObservedSummary) -> tuple[int | None, int | None, int | None]:
+    return (obs.tmax_f, obs.tmin_f, obs.tavg_f)
+
+
+def _supersedes_baseline(entry: GapEntry, obs: _ObservedSummary) -> bool:
+    """Whether `obs` may restate `entry` at all.
+
+    A PRELIMINARY can never revise, refresh or downgrade a baseline that is
+    already a FINAL: it is not settlement-grade (``NwsClimateDay``:
+    "Preliminaries are never settlement-grade"), and a correction to a final
+    is itself a final. Without this the ledger would roll backwards to
+    ``is_final=False`` whenever a truncated read returned only the
+    preliminary, re-arming the refresh path and rewriting the entry on every
+    poll thereafter.
+    """
+    return obs.is_final or not entry.observed_is_final
+
+
 def _is_revision(entry: GapEntry, obs: _ObservedSummary) -> bool:
+    """Whether `obs` is a genuine post-settlement REVISION of `entry`.
+
+    **What this deliberately does NOT look at: ``revision_seq``.** That field
+    is not published by NWS. ``NwsIngestActor._persist_batch`` assigns it as
+    an internal per-``(station, climate_day)`` CATALOG ORDINAL --
+    ``seq_by_day[day] = seq_by_day.get(day, 0) + 1``, counted over every
+    ``NwsClimateDay`` already on disk for that day -- so it increments for
+    reasons that carry no settlement meaning whatsoever:
+
+    * a preliminary maturing into its ordinary final (the final is persisted
+      second, so it ALWAYS lands at the next ordinal), and
+    * a re-persist of BYTE-IDENTICAL content after a crash between the
+      catalog write and the durable seen-mark, which a supervisor restart
+      loop repeats indefinitely -- each repeat carrying a distinct alert key,
+      so dedupe cannot suppress it.
+
+    Both raised CRITICAL ``POST_SETTLEMENT_REVISION``. Alert fatigue on the
+    highest-signal channel is not a cosmetic defect here: this alert is the
+    only defence against a genuinely superseded final, and an operator who
+    has learned to ignore it has no defence at all.
+
+    The evidence actually used, in order:
+
+    1. ``correction_flag`` / ``is_superseded`` flipping ``False`` -> ``True``.
+       Checked FIRST, ahead of the identical-content shortcut, because
+       ``is_superseded`` is a write-time annotation rather than something
+       derived from the product text -- it can legitimately flip on content
+       that is byte-identical, and that is a genuine signal.
+    2. An UNKNOWN baseline (``observed_raw_sha256 == ""``) stops here and
+       reports no revision. That is an entry written before the content
+       baseline existed; there is nothing to compare, and inventing a
+       difference would page the operator once per already-collected day at
+       upgrade time. The entry upgrades itself on this same reconcile (see
+       :func:`_differs_from_baseline`) and behaves normally from then on.
+    3. Identical ``raw_sha256`` -- the same product text -- is never a
+       revision, whatever ordinal it was filed under. This is what kills the
+       duplicate-re-persist storm.
+    4. Otherwise: different bytes, so compare the values that settle money.
+       A changed high, low or published average alerts; anything else that
+       differs (headers, wording, the ordinal itself) does not.
+
+    Sentinel FLAGS (``tmax_flag`` and friends) are deliberately not compared.
+    ``NwsClimateDay`` enforces value/flag exclusivity in both directions, so a
+    value appearing or disappearing already shows up as an ``int``/``None``
+    change here; a flag changing while the value stays ``None`` only renames
+    the KIND of absence and never changes the settleable number.
+    """
+    if obs.correction_flag and not entry.correction_flag:
+        return True
+    if obs.is_superseded and not entry.is_superseded:
+        return True
+    if not entry.observed_raw_sha256:
+        return False
+    if entry.observed_raw_sha256 == obs.raw_sha256:
+        return False
+    return _readings(entry) != _observed_readings(obs)
+
+
+def _differs_from_baseline(entry: GapEntry, obs: _ObservedSummary) -> bool:
+    """Whether `entry` still describes `obs` exactly.
+
+    Broader than :func:`_is_revision` on purpose: this decides whether a
+    durable WRITE is needed, not whether an operator is paged. A preliminary
+    maturing into a final, a re-persist at a new ordinal, and an old-format
+    entry meeting its first content baseline all change what was observed
+    without revising any settled value -- each refreshes the entry in place
+    and emits nothing. When this is ``False`` no write happens at all, which
+    is what keeps a steady-state poll completely inert.
+    """
     return (
-        obs.revision_seq > entry.observed_revision_seq
-        or (obs.correction_flag and not entry.correction_flag)
-        or (obs.is_superseded and not entry.is_superseded)
+        entry.observed_revision_seq != obs.revision_seq
+        or entry.observed_is_final != obs.is_final
+        or entry.observed_raw_sha256 != obs.raw_sha256
+        or _readings(entry) != _observed_readings(obs)
+        or entry.correction_flag != obs.correction_flag
+        or entry.is_superseded != obs.is_superseded
     )
 
 
-def _is_maturation(entry: GapEntry, obs: _ObservedSummary) -> bool:
-    """A PRELIMINARY that has since become the FINAL, at no higher revision.
-
-    Deliberately NOT folded into :func:`_is_revision`. A preliminary maturing
-    into a final at the same ``revision_seq`` is ordinary progression, not a
-    revision to a settled value: firing :class:`RevisionEvent` here would
-    alert on ordinary days and desensitise the operator to the corrected-final
-    alert that actually matters. Detection of the case that DOES matter is
-    unaffected either way -- a later corrected final carries an incremented
-    ``revision_seq`` (or a ``correction_flag`` / ``is_superseded`` flip) and
-    trips :func:`_is_revision` regardless of which baseline it is compared to.
-
-    What maturation DOES require is a durable refresh: left alone, the entry
-    would describe the observation as non-final forever, so the ledger would
-    misdescribe what was actually observed. One-way by construction
-    (``is_final`` False -> True only), so a stale preliminary re-delivered
-    after the final can never downgrade the baseline and re-arm this path.
-    """
-    return obs.is_final and not entry.observed_is_final
-
-
 def _with_observation(entry: GapEntry, obs: _ObservedSummary, now_ns: int) -> GapEntry:
-    """`entry` restated against `obs` -- the ONE place the four observation
-    fields are copied across, shared by every path that records an
-    observation (resolution, revision, maturation) so they cannot drift.
-    ``resolved_at_ns`` is untouched: refreshing an already-``RESOLVED`` day is
-    not a re-resolution, and the instant it was first accounted for must
-    survive.
+    """`entry` restated against `obs` -- the ONE place the observation fields
+    are copied across, shared by every path that records an observation
+    (resolution, revision, refresh) so they cannot drift. ``resolved_at_ns``
+    is untouched: refreshing an already-``RESOLVED`` day is not a
+    re-resolution, and the instant it was first accounted for must survive.
     """
     return replace(
         entry,
         last_reconciled_ns=now_ns,
         observed_revision_seq=obs.revision_seq,
         observed_is_final=obs.is_final,
+        observed_raw_sha256=obs.raw_sha256,
+        observed_tmax_f=obs.tmax_f,
+        observed_tmin_f=obs.tmin_f,
+        observed_tavg_f=obs.tavg_f,
         correction_flag=obs.correction_flag,
         is_superseded=obs.is_superseded,
     )
@@ -759,10 +906,12 @@ def reconcile(
 
     1. **Revisit** every entry already in the durable manifest for this
        `(venue, city)` -- ``OPEN`` entries either resolve (an observation
-       now exists) or get ``last_reconciled_ns`` bumped; ``RESOLVED``
-       entries are checked for a revision event, and failing that for a
-       silent PRELIMINARY-to-FINAL maturation, which refreshes the durable
-       baseline in place and emits nothing (see :func:`_is_maturation`);
+       now exists) or get ``last_reconciled_ns`` bumped; a ``RESOLVED``
+       entry whose observation has CHANGED is refreshed in place, and
+       additionally reports a :class:`RevisionEvent` when that change is
+       settlement-relevant -- an ordinary PRELIMINARY-to-FINAL maturation and
+       a byte-identical re-persist at a new catalog ordinal are refreshes,
+       NOT revisions (see :func:`_is_revision`);
        ``ACKNOWLEDGED_LOST`` entries never transition but still get ``last_reconciled_ns`` bumped
        so they stay visibly alive. This pass is NOT bounded by the
        high-water mark -- an ``OPEN`` day from months ago must keep being
@@ -818,26 +967,33 @@ def reconcile(
             else:
                 _write_entry(store, replace(entry, last_reconciled_ns=now_ns))
         elif entry.state is GapState.RESOLVED:
-            if obs is not None and _is_revision(entry, obs):
-                revisions.append(
-                    RevisionEvent(
-                        venue=venue,
-                        city=city,
-                        climate_day=entry.climate_day,
-                        previous_revision_seq=entry.observed_revision_seq,
-                        new_revision_seq=obs.revision_seq,
-                        correction_flag=obs.correction_flag,
-                        is_superseded=obs.is_superseded,
+            # One decision, in two independent halves: does the durable entry
+            # still describe what is observed (write or not), and is the
+            # difference settlement-relevant (page the operator or not). A
+            # preliminary that cannot supersede a final baseline answers NO to
+            # both without a second mechanism.
+            if (
+                obs is not None
+                and _supersedes_baseline(entry, obs)
+                and _differs_from_baseline(entry, obs)
+            ):
+                if _is_revision(entry, obs):
+                    revisions.append(
+                        RevisionEvent(
+                            venue=venue,
+                            city=city,
+                            climate_day=entry.climate_day,
+                            previous_revision_seq=entry.observed_revision_seq,
+                            new_revision_seq=obs.revision_seq,
+                            correction_flag=obs.correction_flag,
+                            is_superseded=obs.is_superseded,
+                        )
                     )
-                )
+                # Refresh either way: an unrefreshed entry would misdescribe
+                # what was actually observed, and would re-arm this same path
+                # on every poll forever.
                 _write_entry(store, _with_observation(entry, obs, now_ns))
-            elif obs is not None and _is_maturation(entry, obs):
-                # The preliminary this day resolved against has become the
-                # final. Refresh the durable baseline in place and emit
-                # NOTHING: not a revision, not a re-resolution, reported in
-                # neither `opened` nor `resolved`. See :func:`_is_maturation`.
-                _write_entry(store, _with_observation(entry, obs, now_ns))
-            # else: no change since the last reconcile -- no write.
+            # else: nothing new to record -- no event, and no write at all.
         else:  # GapState.ACKNOWLEDGED_LOST -- never transitions back.
             _write_entry(store, replace(entry, last_reconciled_ns=now_ns))
 
@@ -873,6 +1029,12 @@ def reconcile(
                     resolved_at_ns=None,
                     observed_revision_seq=0,
                     observed_is_final=False,
+                    # Nothing observed, so there is no content baseline: the
+                    # empty digest is the UNKNOWN marker, never a real one.
+                    observed_raw_sha256="",
+                    observed_tmax_f=None,
+                    observed_tmin_f=None,
+                    observed_tavg_f=None,
                     correction_flag=False,
                     is_superseded=False,
                     acknowledged_by=None,
@@ -904,6 +1066,10 @@ def reconcile(
                     resolved_at_ns=now_ns,
                     observed_revision_seq=first_obs.revision_seq,
                     observed_is_final=first_obs.is_final,
+                    observed_raw_sha256=first_obs.raw_sha256,
+                    observed_tmax_f=first_obs.tmax_f,
+                    observed_tmin_f=first_obs.tmin_f,
+                    observed_tavg_f=first_obs.tavg_f,
                     correction_flag=first_obs.correction_flag,
                     is_superseded=first_obs.is_superseded,
                     acknowledged_by=None,

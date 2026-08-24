@@ -106,6 +106,13 @@ class FakeObserved:
     revision_seq: int = 1
     correction_flag: bool = False
     is_superseded: bool = False
+    # The CONTENT of the observation. `gaps._is_revision` compares these, not
+    # `revision_seq` -- which is only an internal catalog ordinal and
+    # increments for ordinary maturation and for identical re-persists alike.
+    raw_sha256: str = "a" * 64
+    tmax_f: int | None = 41
+    tmin_f: int | None = 30
+    tavg_f: int | None = 36
 
 
 class RecordingSink:
@@ -343,6 +350,11 @@ async def test_a_revision_event_surfaces_as_a_post_settlement_revision_alert(
                     ts_init=clock.now,
                     revision_seq=2,
                     correction_flag=True,
+                    # A corrected product is DIFFERENT text reporting a
+                    # different high -- the settlement-relevant change the
+                    # alert exists for, not merely the next catalog ordinal.
+                    raw_sha256="b" * 64,
+                    tmax_f=44,
                 )
             ]
             await actor.poll_once()  # cycle 3: revision

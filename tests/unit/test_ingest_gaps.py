@@ -24,8 +24,9 @@ Test groups, matching the design's RED list:
 from __future__ import annotations
 
 import datetime as dt
+import hashlib
 import json
-from dataclasses import FrozenInstanceError, dataclass
+from dataclasses import FrozenInstanceError, dataclass, replace
 from typing import Any
 from zoneinfo import ZoneInfo
 
@@ -87,9 +88,45 @@ class _FakeStore:
         self.data[key] = value
 
 
+def _sha(label: str) -> str:
+    """A deterministic 64-hex digest standing in for `NwsClimateDay.raw_sha256`.
+
+    Derived from a label, never from a clock or the network, so the same
+    product text always yields the same digest across runs and orderings --
+    which is exactly the property the duplicate-re-persist tests assert on.
+    """
+    return hashlib.sha256(label.encode("utf-8")).hexdigest()
+
+
+#: The digest of the ORIGINAL product text in every fixture below. A second
+#: record carrying this same digest is the same bytes re-persisted, never a
+#: revision, no matter what catalog ordinal it was assigned.
+SHA_ORIGINAL = _sha("original-cli-product")
+
+#: Settlement-relevant readings of the original product.
+TMAX_ORIGINAL = 41
+TMIN_ORIGINAL = 30
+TAVG_ORIGINAL = 36
+
+#: A PRELIMINARY and the FINAL that supersedes it are different products, so
+#: they ALWAYS carry different digests -- even when they report the very same
+#: temperatures. That is precisely why the digest alone cannot decide whether
+#: an observation is a revision: the readings have to be compared too.
+SHA_PRELIMINARY = _sha("preliminary-cli-product")
+SHA_FINAL = _sha("final-cli-product")
+SHA_CORRECTED = _sha("corrected-cli-product")
+
+
 @dataclass(frozen=True, slots=True)
 class _Record:
-    """A minimal `gaps.ObservedRecord`-shaped stand-in for `NwsClimateDay`."""
+    """A minimal `gaps.ObservedRecord`-shaped stand-in for `NwsClimateDay`.
+
+    Carries the settlement-relevant readings (`tmax_f`/`tmin_f`/`tavg_f`) and
+    the content digest (`raw_sha256`) because revision detection is a question
+    about the OBSERVATION, not about `revision_seq` -- which is not an NWS
+    field at all but an internal per-`(station, climate_day)` catalog ordinal
+    assigned by `NwsIngestActor._persist_batch`.
+    """
 
     station: str
     climate_day: dt.date
@@ -98,6 +135,10 @@ class _Record:
     revision_seq: int
     correction_flag: bool = False
     is_superseded: bool = False
+    raw_sha256: str = SHA_ORIGINAL
+    tmax_f: int | None = TMAX_ORIGINAL
+    tmin_f: int | None = TMIN_ORIGINAL
+    tavg_f: int | None = TAVG_ORIGINAL
 
 
 def _reconcile(
@@ -119,6 +160,73 @@ def _reconcile(
         settlement_delay_timezone=SETTLEMENT_DELAY_TIMEZONE,
         records=records,
         retention_days=retention_days,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Record builders.
+#
+# `revision_seq` is an internal per-`(station, climate_day)` catalog ORDINAL,
+# assigned in `NwsIngestActor._persist_batch` as
+# `seq_by_day[day] = seq_by_day.get(day, 0) + 1` counted over every record
+# already on disk for that day -- NOT an NWS-published field. Every builder
+# below therefore takes the ordinal EXPLICITLY, and every multi-record fixture
+# assigns it the way `_persist_batch` actually would: 1 for the first record
+# ever persisted for a day, 2 for the second, and so on, whatever those
+# records contain.
+# ---------------------------------------------------------------------------
+
+
+def _original_final(day: dt.date, *, seq: int = 1, ts_init: int = 1) -> _Record:
+    """The first FINAL persisted for `day`: the settlement baseline."""
+    return _Record(
+        station=STATION, climate_day=day, ts_init=ts_init, is_final=True, revision_seq=seq
+    )
+
+
+def _prelim_record(
+    day: dt.date,
+    *,
+    seq: int = 1,
+    ts_init: int = 1,
+    tmax_f: int | None = TMAX_ORIGINAL,
+) -> _Record:
+    """The ~preliminary issuance for `day`, always the FIRST record persisted."""
+    return _Record(
+        station=STATION,
+        climate_day=day,
+        ts_init=ts_init,
+        is_final=False,
+        revision_seq=seq,
+        raw_sha256=SHA_PRELIMINARY,
+        tmax_f=tmax_f,
+    )
+
+
+def _final_record(
+    day: dt.date,
+    *,
+    seq: int = 2,
+    ts_init: int = 2,
+    tmax_f: int | None = TMAX_ORIGINAL,
+    raw_sha256: str = SHA_FINAL,
+    correction_flag: bool = False,
+    is_superseded: bool = False,
+) -> _Record:
+    """The FINAL issuance for `day`. Defaults to ordinal 2 because in
+    production a final is persisted AFTER the preliminary it supersedes, and
+    the preliminary is still on disk when the ordinal is assigned.
+    """
+    return _Record(
+        station=STATION,
+        climate_day=day,
+        ts_init=ts_init,
+        is_final=True,
+        revision_seq=seq,
+        correction_flag=correction_flag,
+        is_superseded=is_superseded,
+        raw_sha256=raw_sha256,
+        tmax_f=tmax_f,
     )
 
 
@@ -429,11 +537,15 @@ def _resolved_gap_store(*, revision_seq: int = 1) -> tuple[_FakeStore, dt.date, 
     return store, day, resolved_ns
 
 
-def test_a_revision_seq_increase_on_a_resolved_day_emits_a_revision_event() -> None:
+def test_a_reissued_final_with_a_changed_temperature_on_a_resolved_day_alerts() -> None:
+    # The accumulated shape production actually produces: the original final
+    # is STILL on disk when the reissue lands, so `read_climate_days` returns
+    # both, and the reissue's ordinal is 2 because of that.
     store, day, resolved_ns = _resolved_gap_store(revision_seq=1)
     later_ns = resolved_ns + NS_PER_SECOND
     records = (
-        _Record(station=STATION, climate_day=day, ts_init=2, is_final=True, revision_seq=2),
+        _original_final(day, seq=1),
+        _final_record(day, seq=2, raw_sha256=SHA_CORRECTED, tmax_f=TMAX_ORIGINAL + 2),
     )
 
     result = _reconcile(store, later_ns, records, retention_days=2)
@@ -447,20 +559,17 @@ def test_a_revision_seq_increase_on_a_resolved_day_emits_a_revision_event() -> N
     entry = get_entry(store, VENUE, CITY, day)
     assert entry is not None
     assert entry.observed_revision_seq == 2
+    assert entry.observed_tmax_f == TMAX_ORIGINAL + 2
 
 
 def test_correction_flag_flipping_true_emits_a_revision_event_independently() -> None:
+    # INDEPENDENTLY: the reissue reports the very same temperatures as the
+    # original, so only the correction flag can be carrying the signal.
     store, day, resolved_ns = _resolved_gap_store(revision_seq=1)
     later_ns = resolved_ns + NS_PER_SECOND
     records = (
-        _Record(
-            station=STATION,
-            climate_day=day,
-            ts_init=2,
-            is_final=True,
-            revision_seq=1,
-            correction_flag=True,
-        ),
+        _original_final(day, seq=1),
+        _final_record(day, seq=2, raw_sha256=SHA_CORRECTED, correction_flag=True),
     )
 
     result = _reconcile(store, later_ns, records, retention_days=2)
@@ -473,17 +582,14 @@ def test_correction_flag_flipping_true_emits_a_revision_event_independently() ->
 
 
 def test_is_superseded_flipping_true_emits_a_revision_event_independently() -> None:
+    # INDEPENDENTLY, and at a BYTE-IDENTICAL digest: `is_superseded` is a
+    # write-time annotation, not something derived from the product text, so
+    # it is the one signal that must survive the identical-content shortcut.
     store, day, resolved_ns = _resolved_gap_store(revision_seq=1)
     later_ns = resolved_ns + NS_PER_SECOND
     records = (
-        _Record(
-            station=STATION,
-            climate_day=day,
-            ts_init=2,
-            is_final=True,
-            revision_seq=1,
-            is_superseded=True,
-        ),
+        _original_final(day, seq=1),
+        _final_record(day, seq=2, raw_sha256=SHA_ORIGINAL, is_superseded=True),
     )
 
     result = _reconcile(store, later_ns, records, retention_days=2)
@@ -499,9 +605,7 @@ def test_no_change_on_a_resolved_day_emits_no_revision_event_and_no_write() -> N
     store, day, resolved_ns = _resolved_gap_store(revision_seq=1)
     before = store.data[_entry_key(VENUE, CITY, day)]
     later_ns = resolved_ns + NS_PER_SECOND
-    records = (
-        _Record(station=STATION, climate_day=day, ts_init=1, is_final=True, revision_seq=1),
-    )
+    records = (_original_final(day, seq=1),)
 
     result = _reconcile(store, later_ns, records, retention_days=2)
 
@@ -562,19 +666,28 @@ def test_a_cleanly_observed_day_is_recorded_so_later_revisions_stay_detectable()
     assert entry.observed_is_final is True
     assert entry.correction_flag is False
     assert entry.is_superseded is False
+    # The CONTENT baseline a later reissue is compared against -- without it,
+    # revision detection has nothing to compare but the catalog ordinal.
+    assert entry.observed_raw_sha256 == SHA_ORIGINAL
+    assert entry.observed_tmax_f == TMAX_ORIGINAL
+    assert entry.observed_tmin_f == TMIN_ORIGINAL
+    assert entry.observed_tavg_f == TAVG_ORIGINAL
     assert entry.acknowledged_by is None
     # Reachable through the durable manifest, not just by point lookup --
     # an entry the manifest does not list can never be enumerated again.
     assert [e.climate_day for e in site_entries(store, VENUE, CITY)] == [day]
 
 
-def test_a_revision_seq_increase_on_a_never_missing_day_emits_a_revision_event() -> None:
+def test_a_changed_temperature_on_a_never_missing_day_emits_a_revision_event() -> None:
     # The headline settlement-correctness case: collected cleanly and on
-    # time, then reissued with an incremented revision.
+    # time, then reissued reporting a DIFFERENT high. Fed in the accumulated
+    # shape `read_climate_days` really returns -- the original final is still
+    # on disk, which is why the reissue's catalog ordinal is 2.
     store, day, first_ns = _clean_day_store(revision_seq=1)
     later_ns = first_ns + 2 * NS_PER_SECOND
     records = (
-        _Record(station=STATION, climate_day=day, ts_init=2, is_final=True, revision_seq=2),
+        _original_final(day, seq=1),
+        _final_record(day, seq=2, raw_sha256=SHA_CORRECTED, tmax_f=TMAX_ORIGINAL + 3),
     )
 
     result = _reconcile(store, later_ns, records, retention_days=1)
@@ -594,19 +707,13 @@ def test_a_revision_seq_increase_on_a_never_missing_day_emits_a_revision_event()
 
 
 def test_correction_flag_flipping_true_on_a_never_missing_day_emits_a_revision_event() -> None:
-    # A station reporting error corrected hours later, with NO revision-seq
-    # bump: the correction flag alone must still alert.
+    # A station reporting error corrected hours later, reporting the SAME
+    # temperatures: the correction flag alone must still alert.
     store, day, first_ns = _clean_day_store(revision_seq=1)
     later_ns = first_ns + 2 * NS_PER_SECOND
     records = (
-        _Record(
-            station=STATION,
-            climate_day=day,
-            ts_init=2,
-            is_final=True,
-            revision_seq=1,
-            correction_flag=True,
-        ),
+        _original_final(day, seq=1),
+        _final_record(day, seq=2, raw_sha256=SHA_CORRECTED, correction_flag=True),
     )
 
     result = _reconcile(store, later_ns, records, retention_days=1)
@@ -614,7 +721,7 @@ def test_correction_flag_flipping_true_on_a_never_missing_day_emits_a_revision_e
     assert len(result.revisions) == 1
     assert result.revisions[0].correction_flag is True
     assert result.revisions[0].previous_revision_seq == 1
-    assert result.revisions[0].new_revision_seq == 1
+    assert result.revisions[0].new_revision_seq == 2
     entry = get_entry(store, VENUE, CITY, day)
     assert entry is not None
     assert entry.correction_flag is True
@@ -624,14 +731,8 @@ def test_is_superseded_flipping_true_on_a_never_missing_day_emits_a_revision_eve
     store, day, first_ns = _clean_day_store(revision_seq=1)
     later_ns = first_ns + 2 * NS_PER_SECOND
     records = (
-        _Record(
-            station=STATION,
-            climate_day=day,
-            ts_init=2,
-            is_final=True,
-            revision_seq=1,
-            is_superseded=True,
-        ),
+        _original_final(day, seq=1),
+        _final_record(day, seq=2, raw_sha256=SHA_ORIGINAL, is_superseded=True),
     )
 
     result = _reconcile(store, later_ns, records, retention_days=1)
@@ -686,12 +787,18 @@ def test_recording_a_clean_day_never_re_opens_or_re_resolves_it() -> None:
 # ---------------------------------------------------------------------------
 # 6c. Preliminary -> final maturation refreshes the baseline WITHOUT alerting
 #
-# A preliminary maturing into a final at the SAME `revision_seq` is ordinary
-# progression, not a revision to a settled value -- alerting on it would
-# desensitise the operator to the corrected-final alert that actually matters.
-# But leaving the entry frozen at the preliminary's values makes the durable
+# A preliminary maturing into a final that reports the SAME temperatures is
+# ordinary progression, not a revision to a settled value -- alerting on it
+# would desensitise the operator to the corrected-final alert that actually
+# matters. It is NOT detectable from `revision_seq`: the final is persisted
+# after the preliminary, so it is ALWAYS assigned the next catalog ordinal.
+# Leaving the entry frozen at the preliminary's values would make the durable
 # ledger misdescribe what was observed, so the entry is refreshed in place and
 # nothing is emitted.
+#
+# Every fixture here feeds the ACCUMULATED record set `read_climate_days`
+# really returns: the catalog is append-only, so the preliminary is still
+# present alongside the final on every later poll, forever.
 # ---------------------------------------------------------------------------
 
 
@@ -705,15 +812,7 @@ def _preliminary_day_store(*, revision_seq: int = 1) -> tuple[_FakeStore, dt.dat
     store = _FakeStore()
     day = dt.date(2026, 1, 10)
     first_ns = _ns_at("2026-01-11T12:00:00")
-    records = (
-        _Record(
-            station=STATION,
-            climate_day=day,
-            ts_init=1,
-            is_final=False,
-            revision_seq=revision_seq,
-        ),
-    )
+    records = (_prelim_record(day, seq=revision_seq),)
     result = _reconcile(store, first_ns, records, retention_days=1)
 
     assert result.opened == ()
@@ -727,14 +826,14 @@ def _preliminary_day_store(*, revision_seq: int = 1) -> tuple[_FakeStore, dt.dat
 
 
 def test_a_preliminary_maturing_into_a_final_refreshes_the_entry_without_alerting() -> None:
-    # HEADLINE: same `revision_seq`, `is_final` False -> True. The durable
-    # entry must stop misdescribing the observation, and NO RevisionEvent may
-    # fire -- this is normal progression, not a revision to a settled value.
+    # HEADLINE: `is_final` False -> True at the NEXT catalog ordinal (2, the
+    # only ordinal production can assign here) reporting the SAME high. The
+    # durable entry must stop misdescribing the observation, and NO
+    # RevisionEvent may fire -- this is normal progression, not a revision to
+    # a settled value.
     store, day, first_ns = _preliminary_day_store(revision_seq=1)
     later_ns = first_ns + 2 * NS_PER_SECOND
-    records = (
-        _Record(station=STATION, climate_day=day, ts_init=2, is_final=True, revision_seq=1),
-    )
+    records = (_prelim_record(day, seq=1), _final_record(day, seq=2))
 
     result = _reconcile(store, later_ns, records, retention_days=1)
 
@@ -744,7 +843,9 @@ def test_a_preliminary_maturing_into_a_final_refreshes_the_entry_without_alertin
     entry = get_entry(store, VENUE, CITY, day)
     assert entry is not None
     assert entry.observed_is_final is True
-    assert entry.observed_revision_seq == 1
+    assert entry.observed_revision_seq == 2
+    assert entry.observed_raw_sha256 == SHA_FINAL
+    assert entry.observed_tmax_f == TMAX_ORIGINAL
     assert entry.correction_flag is False
     assert entry.is_superseded is False
     assert entry.state is GapState.RESOLVED
@@ -759,9 +860,7 @@ def test_a_matured_final_re_observed_unchanged_performs_no_further_write() -> No
     # rewrite -- otherwise every poll forever writes the same bytes back.
     store, day, first_ns = _preliminary_day_store(revision_seq=1)
     matured_ns = first_ns + 2 * NS_PER_SECOND
-    records = (
-        _Record(station=STATION, climate_day=day, ts_init=2, is_final=True, revision_seq=1),
-    )
+    records = (_prelim_record(day, seq=1), _final_record(day, seq=2))
     _reconcile(store, matured_ns, records, retention_days=1)
     after_refresh = dict(store.data)
 
@@ -784,7 +883,7 @@ def test_a_correction_after_maturation_alerts_once_against_the_refreshed_baselin
     matured = _reconcile(
         store,
         matured_ns,
-        (_Record(station=STATION, climate_day=day, ts_init=2, is_final=True, revision_seq=1),),
+        (_prelim_record(day, seq=1), _final_record(day, seq=2)),
         retention_days=1,
     )
     assert matured.revisions == ()
@@ -797,12 +896,13 @@ def test_a_correction_after_maturation_alerts_once_against_the_refreshed_baselin
         store,
         corrected_ns,
         (
-            _Record(
-                station=STATION,
-                climate_day=day,
+            _prelim_record(day, seq=1),
+            _final_record(day, seq=2),
+            _final_record(
+                day,
+                seq=3,
                 ts_init=3,
-                is_final=True,
-                revision_seq=2,
+                raw_sha256=SHA_CORRECTED,
                 correction_flag=True,
             ),
         ),
@@ -812,12 +912,12 @@ def test_a_correction_after_maturation_alerts_once_against_the_refreshed_baselin
     assert len(corrected.revisions) == 1
     event = corrected.revisions[0]
     assert event.climate_day == day
-    assert event.previous_revision_seq == 1
-    assert event.new_revision_seq == 2
+    assert event.previous_revision_seq == 2
+    assert event.new_revision_seq == 3
     assert event.correction_flag is True
     entry = get_entry(store, VENUE, CITY, day)
     assert entry is not None
-    assert entry.observed_revision_seq == 2
+    assert entry.observed_revision_seq == 3
     assert entry.observed_is_final is True
     assert entry.correction_flag is True
 
@@ -831,7 +931,7 @@ def test_a_weaker_re_observation_never_downgrades_a_final_baseline() -> None:
     _reconcile(
         store,
         matured_ns,
-        (_Record(station=STATION, climate_day=day, ts_init=2, is_final=True, revision_seq=1),),
+        (_prelim_record(day, seq=1), _final_record(day, seq=2)),
         retention_days=1,
     )
     after_refresh = dict(store.data)
@@ -840,7 +940,7 @@ def test_a_weaker_re_observation_never_downgrades_a_final_baseline() -> None:
     result = _reconcile(
         store,
         stale_ns,
-        (_Record(station=STATION, climate_day=day, ts_init=9, is_final=False, revision_seq=1),),
+        (_prelim_record(day, seq=3, ts_init=9, tmax_f=TMAX_ORIGINAL + 9),),
         retention_days=1,
     )
 
@@ -864,7 +964,7 @@ def test_a_gap_resolved_by_a_preliminary_then_matured_refreshes_without_alerting
     resolved = _reconcile(
         store,
         resolved_ns,
-        (_Record(station=STATION, climate_day=day, ts_init=1, is_final=False, revision_seq=1),),
+        (_prelim_record(day, seq=1),),
         retention_days=1,
     )
     assert resolved.resolved == (day,)
@@ -872,7 +972,7 @@ def test_a_gap_resolved_by_a_preliminary_then_matured_refreshes_without_alerting
     result = _reconcile(
         store,
         matured_ns,
-        (_Record(station=STATION, climate_day=day, ts_init=2, is_final=True, revision_seq=1),),
+        (_prelim_record(day, seq=1), _final_record(day, seq=2)),
         retention_days=1,
     )
 
@@ -882,6 +982,279 @@ def test_a_gap_resolved_by_a_preliminary_then_matured_refreshes_without_alerting
     assert entry is not None
     assert entry.observed_is_final is True
     assert entry.resolved_at_ns == resolved_ns
+
+
+# ---------------------------------------------------------------------------
+# 6d. Revision detection is a question about the OBSERVATION, never about the
+#     catalog ordinal.
+#
+# `revision_seq` is NOT an NWS-published field. `NwsIngestActor._persist_batch`
+# assigns it as `seq_by_day[day] = seq_by_day.get(day, 0) + 1`, counted over
+# every `NwsClimateDay` already on disk for that `(station, climate_day)` --
+# so it increments for a preliminary maturing into a final, and increments
+# again for a crash-window re-persist of BYTE-IDENTICAL bytes. Treating an
+# increment as a revision fires CRITICAL POST_SETTLEMENT_REVISION on ordinary
+# days, which destroys the operator's ability to notice the one case that
+# actually costs money: a settled final superseded by a different value.
+# ---------------------------------------------------------------------------
+
+
+def test_a_byte_identical_re_persist_at_a_higher_catalog_ordinal_is_not_a_revision() -> None:
+    # HEADLINE. The crash window `NWS_COLLECTION_RUNTIME_PLAN_ADDENDUM.md`
+    # documents: the catalog persist is confirmed, the process dies before the
+    # durable seen-mark, so the same product is re-fetched and re-persisted.
+    # Same bytes, same digest, same readings -- next ordinal. Nothing was
+    # revised, so nothing may be reported.
+    store, day, first_ns = _clean_day_store(revision_seq=1)
+    later_ns = first_ns + 2 * NS_PER_SECOND
+    records = (
+        _original_final(day, seq=1, ts_init=1),
+        # `_persist_batch` also nudges `retrieved_at_ns` past the catalog's
+        # current max on a collision, which is why `ts_init` differs too.
+        _original_final(day, seq=2, ts_init=2),
+    )
+
+    result = _reconcile(store, later_ns, records, retention_days=1)
+
+    assert result.revisions == ()
+    entry = get_entry(store, VENUE, CITY, day)
+    assert entry is not None
+    assert entry.observed_raw_sha256 == SHA_ORIGINAL
+    assert entry.observed_tmax_f == TMAX_ORIGINAL
+    assert entry.state is GapState.RESOLVED
+
+
+def test_a_restart_loop_re_persisting_identical_bytes_never_produces_a_page_storm() -> None:
+    # A supervisor restart loop re-persists the same bytes over and over, each
+    # at the next ordinal. Under ordinal-based detection every cycle raised a
+    # CRITICAL alert with a DISTINCT key, so dedupe could never suppress it.
+    store, day, first_ns = _clean_day_store(revision_seq=1)
+    accumulated = [_original_final(day, seq=1, ts_init=1)]
+    now_ns = first_ns
+
+    for ordinal in range(2, 8):
+        accumulated.append(_original_final(day, seq=ordinal, ts_init=ordinal))
+        now_ns += 2 * NS_PER_SECOND
+        result = _reconcile(store, now_ns, tuple(accumulated), retention_days=1)
+        assert result.revisions == (), f"ordinal {ordinal} raised a phantom revision"
+
+
+@pytest.mark.parametrize(
+    ("final_tmax_f", "expected_revisions"),
+    [
+        pytest.param(TMAX_ORIGINAL, 0, id="temperature-unchanged-is-maturation"),
+        pytest.param(TMAX_ORIGINAL + 1, 1, id="temperature-changed-is-settlement-relevant"),
+    ],
+)
+def test_maturation_alerts_only_when_the_settlement_temperature_changes(
+    final_tmax_f: int,
+    expected_revisions: int,
+) -> None:
+    # HEADLINE, as a discriminating PAIR: the two runs are identical in every
+    # respect a catalog ordinal can see (preliminary at ordinal 1, final at
+    # ordinal 2, both digests different because they are different products)
+    # and differ ONLY in the value that settles money. Anything keyed on the
+    # ordinal cannot tell them apart; the alert must.
+    store, day, first_ns = _preliminary_day_store(revision_seq=1)
+    later_ns = first_ns + 2 * NS_PER_SECOND
+    records = (
+        _prelim_record(day, seq=1),
+        _final_record(day, seq=2, tmax_f=final_tmax_f),
+    )
+
+    result = _reconcile(store, later_ns, records, retention_days=1)
+
+    assert len(result.revisions) == expected_revisions
+    entry = get_entry(store, VENUE, CITY, day)
+    assert entry is not None
+    # Either way the durable baseline stops misdescribing the observation.
+    assert entry.observed_is_final is True
+    assert entry.observed_tmax_f == final_tmax_f
+    assert entry.observed_raw_sha256 == SHA_FINAL
+
+
+@pytest.mark.parametrize(
+    ("changed_field", "changed_value"),
+    [
+        pytest.param("tmax_f", TMAX_ORIGINAL + 4, id="high-changed"),
+        pytest.param("tmin_f", TMIN_ORIGINAL - 4, id="low-changed"),
+        pytest.param("tavg_f", TAVG_ORIGINAL + 1, id="published-average-changed"),
+        pytest.param("tmax_f", None, id="high-became-a-sentinel"),
+        pytest.param("tmin_f", None, id="low-became-a-sentinel"),
+        pytest.param("tavg_f", None, id="published-average-became-a-sentinel"),
+    ],
+)
+def test_every_settlement_relevant_reading_change_alerts(
+    changed_field: str,
+    changed_value: int | None,
+) -> None:
+    # The venue settles on the observed high, low and published average
+    # (`domain/nws_climate_day.py`, `tavg_f`), so a change to ANY of the three
+    # is settlement-relevant -- including one that becomes a sentinel, which
+    # turns a settleable number into no number at all.
+    store, day, first_ns = _clean_day_store(revision_seq=1)
+    later_ns = first_ns + 2 * NS_PER_SECOND
+    reissue = replace(
+        _original_final(day, seq=2, ts_init=2),
+        raw_sha256=SHA_CORRECTED,
+        **{changed_field: changed_value},
+    )
+    records = (_original_final(day, seq=1, ts_init=1), reissue)
+
+    result = _reconcile(store, later_ns, records, retention_days=1)
+
+    assert len(result.revisions) == 1
+    assert result.revisions[0].climate_day == day
+
+
+def test_a_steady_state_re_reconcile_neither_alerts_nor_writes() -> None:
+    # NEGATIVE CONTROL. Production re-reads the SAME append-only record set on
+    # every single poll, forever. Once the baseline matches it, further polls
+    # must be completely inert: no event, and not one byte written.
+    store, day, first_ns = _preliminary_day_store(revision_seq=1)
+    records = (_prelim_record(day, seq=1), _final_record(day, seq=2))
+    settled_ns = first_ns + 2 * NS_PER_SECOND
+    _reconcile(store, settled_ns, records, retention_days=1)
+    settled = dict(store.data)
+
+    for tick in range(1, 4):
+        result = _reconcile(store, settled_ns + tick * NS_PER_SECOND, records, retention_days=1)
+        assert result.revisions == ()
+        assert result.opened == ()
+        assert result.resolved == ()
+        assert store.data == settled, f"poll {tick} rewrote the ledger with no change"
+
+
+# ---------------------------------------------------------------------------
+# 6e. Backward-compatible decode of entries written before the content
+#     baseline existed.
+#
+# The store cannot delete or scan, so an operator upgrading in place has
+# entries on disk in the OLD format. They must decode, must NOT alert merely
+# for being old, and must upgrade themselves silently on the next reconcile.
+# ---------------------------------------------------------------------------
+
+
+def _legacy_entry_payload(**overrides: Any) -> dict[str, Any]:
+    """An entry EXACTLY as the pre-content-baseline codec wrote it.
+
+    Spelled out literally rather than derived from `_valid_entry_payload`, so
+    a future field addition cannot silently redefine what "the old format"
+    means and quietly stop testing the upgrade path.
+    """
+    base: dict[str, Any] = {
+        "venue": VENUE,
+        "city": CITY,
+        "climate_day": "2026-01-10",
+        "state": "resolved",
+        "first_detected_ns": 1,
+        "last_reconciled_ns": 1,
+        "resolved_at_ns": 1,
+        "observed_revision_seq": 1,
+        "observed_is_final": True,
+        "correction_flag": False,
+        "is_superseded": False,
+        "acknowledged_by": None,
+        "acknowledged_at_ns": None,
+        "acknowledged_reason": None,
+    }
+    base.update(overrides)
+    return base
+
+
+def _legacy_store(day: dt.date) -> _FakeStore:
+    store = _FakeStore()
+    store.data[_MANIFEST_KEY] = json.dumps([_manifest_id(VENUE, CITY, day)]).encode("utf-8")
+    store.data[_entry_key(VENUE, CITY, day)] = json.dumps(
+        _legacy_entry_payload(climate_day=day.isoformat())
+    ).encode("utf-8")
+    store.data[_hw_key(VENUE, CITY)] = json.dumps({"expected_through": day.isoformat()}).encode(
+        "utf-8"
+    )
+    return store
+
+
+def test_an_entry_written_in_the_old_format_still_decodes() -> None:
+    day = dt.date(2026, 1, 10)
+    store = _legacy_store(day)
+
+    entry = get_entry(store, VENUE, CITY, day)
+
+    assert entry is not None
+    assert entry.state is GapState.RESOLVED
+    assert entry.observed_revision_seq == 1
+    # The absent content baseline decodes as UNKNOWN -- the empty digest --
+    # not as a fabricated one that could be compared against and "differ".
+    assert entry.observed_raw_sha256 == ""
+    assert entry.observed_tmax_f is None
+    assert entry.observed_tmin_f is None
+    assert entry.observed_tavg_f is None
+
+
+def test_an_old_format_entry_upgrades_itself_silently_instead_of_alerting() -> None:
+    # An operator restarting on the new code must not be paged once per
+    # already-collected day. The baseline is UNKNOWN, not "different".
+    day = dt.date(2026, 1, 10)
+    store = _legacy_store(day)
+    now_ns = _ns_at("2026-01-11T12:00:00")
+
+    result = _reconcile(store, now_ns, (_original_final(day, seq=1),), retention_days=1)
+
+    assert result.revisions == ()
+    entry = get_entry(store, VENUE, CITY, day)
+    assert entry is not None
+    assert entry.observed_raw_sha256 == SHA_ORIGINAL
+    assert entry.observed_tmax_f == TMAX_ORIGINAL
+
+
+def test_an_old_format_entry_still_alerts_on_a_correction_before_it_is_upgraded() -> None:
+    # The unknown baseline suppresses the CONTENT comparison only. A
+    # correction flag is self-describing evidence and needs no baseline.
+    day = dt.date(2026, 1, 10)
+    store = _legacy_store(day)
+    now_ns = _ns_at("2026-01-11T12:00:00")
+    records = (
+        _original_final(day, seq=1),
+        _final_record(day, seq=2, raw_sha256=SHA_CORRECTED, correction_flag=True),
+    )
+
+    result = _reconcile(store, now_ns, records, retention_days=1)
+
+    assert len(result.revisions) == 1
+    assert result.revisions[0].correction_flag is True
+
+
+def test_an_upgraded_entry_then_behaves_like_any_other_content_baseline() -> None:
+    day = dt.date(2026, 1, 10)
+    store = _legacy_store(day)
+    now_ns = _ns_at("2026-01-11T12:00:00")
+    _reconcile(store, now_ns, (_original_final(day, seq=1),), retention_days=1)
+    upgraded = dict(store.data)
+
+    # An identical re-persist at the next ordinal is now provably not a
+    # revision, and is inert.
+    inert = _reconcile(
+        store,
+        now_ns + NS_PER_SECOND,
+        (_original_final(day, seq=1), _original_final(day, seq=2, ts_init=2)),
+        retention_days=1,
+    )
+    assert inert.revisions == ()
+
+    # ...and a genuinely different high still alerts.
+    changed = _reconcile(
+        store,
+        now_ns + 2 * NS_PER_SECOND,
+        (
+            _original_final(day, seq=1),
+            _final_record(
+                day, seq=3, ts_init=3, raw_sha256=SHA_CORRECTED, tmax_f=TMAX_ORIGINAL + 5
+            ),
+        ),
+        retention_days=1,
+    )
+    assert len(changed.revisions) == 1
+    assert store.data != upgraded
 
 
 # ---------------------------------------------------------------------------
@@ -1075,6 +1448,10 @@ def _valid_entry_payload(**overrides: Any) -> dict[str, Any]:
         "resolved_at_ns": None,
         "observed_revision_seq": 0,
         "observed_is_final": False,
+        "observed_raw_sha256": "",
+        "observed_tmax_f": None,
+        "observed_tmin_f": None,
+        "observed_tavg_f": None,
         "correction_flag": False,
         "is_superseded": False,
         "acknowledged_by": None,
@@ -1096,6 +1473,12 @@ def _valid_entry_payload(**overrides: Any) -> dict[str, Any]:
         pytest.param({"resolved_at_ns": True}, id="optional-int-field-is-bool"),
         pytest.param({"observed_is_final": "yes"}, id="bool-field-not-bool"),
         pytest.param({"acknowledged_by": 5}, id="optional-str-field-not-str"),
+        # A field that decodes with a DEFAULT when absent must still be
+        # validated when PRESENT -- tolerating the old format must never
+        # become tolerating garbage.
+        pytest.param({"observed_raw_sha256": 5}, id="defaulted-str-field-not-str"),
+        pytest.param({"observed_tmax_f": "41"}, id="defaulted-optional-int-not-int"),
+        pytest.param({"observed_tmin_f": True}, id="defaulted-optional-int-is-bool"),
     ],
 )
 def test_malformed_entry_fields_are_tampering(overrides: dict[str, Any]) -> None:
@@ -1168,6 +1551,10 @@ def test_gap_entry_is_frozen() -> None:
         resolved_at_ns=None,
         observed_revision_seq=0,
         observed_is_final=False,
+        observed_raw_sha256="",
+        observed_tmax_f=None,
+        observed_tmin_f=None,
+        observed_tavg_f=None,
         correction_flag=False,
         is_superseded=False,
         acknowledged_by=None,
