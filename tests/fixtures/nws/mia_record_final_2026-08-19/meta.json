@@ -1,0 +1,12 @@
+{
+  "url": "https://api.weather.gov/products/c670fb79-bd30-4f4f-b3fe-1ac489b2d0ea",
+  "status": 200,
+  "retrieved_at": "2026-08-24T03:15:00Z",
+  "sha256_body": "e1bd2552028a36f6e05ceb9e84d5138849d70c7f7cb012cf67e9452e545c13a7",
+  "product_id": "c670fb79-bd30-4f4f-b3fe-1ac489b2d0ea",
+  "issuing_office": "KMFL",
+  "issuance_time": "2026-08-20T08:26:00+00:00",
+  "wmo_collective_id": "CDUS42",
+  "note": "FINAL CLI for Miami, covering climate day 2026-08-19. A second, independent real capture of the same 'R' (record tied/broken) suffix, on a different day and a different value (96R rather than 100R), confirming the fix generalizes rather than special-casing the single value seen in the original live failure.",
+  "synthetic": false
+}

@@ -59,6 +59,24 @@ def test_classify_issuance_preliminary_when_valid_today_line_present() -> None:
     assert classify_issuance(text) == "PRELIMINARY"
 
 
+@pytest.mark.parametrize("valid_time", ["0500 PM", "0900 AM", "1200 PM"])
+def test_classify_issuance_preliminary_for_other_registry_sites_valid_times(
+    valid_time: str,
+) -> None:
+    """The discriminator is TIME-AGNOSTIC on real registry sites: NYC/MIA/MDW
+    preliminaries carry '0400 PM', SFO/LAX (and OAK/SJC/BUR/LGB/MTH) carry
+    '0500 PM'. A regex "simplified" to the '0400 PM' literal would misclassify
+    every SFO/LAX PRELIMINARY as FINAL and settle those sites on a
+    non-finalized value -- pin a couple of other valid times here so that
+    regression is caught.
+    """
+    text = (
+        "...THE SAN FRANCISCO CA CLIMATE SUMMARY FOR AUGUST 21 2026...\n"
+        f"VALID TODAY AS OF {valid_time} LOCAL TIME.\n"
+    )
+    assert classify_issuance(text) == "PRELIMINARY"
+
+
 def test_classify_issuance_rejects_empty_text() -> None:
     with pytest.raises(ClassificationError):
         classify_issuance("")

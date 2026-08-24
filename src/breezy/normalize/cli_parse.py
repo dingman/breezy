@@ -9,7 +9,9 @@ registry's `body_header_regex` -- this module accepts that regex as a
 parameter and does not import the registry itself, to keep this island
 free of any dependency beyond pure text), and tmax/tmin/tavg in whole
 degrees Fahrenheit with sentinel flags (M/T/MS/MB) preserved rather than
-imputed.
+imputed, and with NWS's "record was set or tied" qualifier (a trailing
+``R`` on the value, e.g. ``100R``) preserved via `TemperatureReadingF.
+is_record` rather than rejected -- see `parse_temperature_token`.
 
 An ambiguous or unparseable product raises a `CliParseError` subclass
 rather than returning a partially-populated result -- a silent partial
@@ -105,6 +107,20 @@ _OBSERVED_SUBSECTION_RE = re.compile(
 _MAXIMUM_RE = re.compile(r"MAXIMUM\s+(?P<token>-?\S+)")
 _MINIMUM_RE = re.compile(r"MINIMUM\s+(?P<token>-?\S+)")
 _AVERAGE_RE = re.compile(r"AVERAGE\s+(?P<token>-?\S+)")
+
+_RECORD_TOKEN_RE = re.compile(r"^(?P<number>-?\d+)R$")
+"""Shape of a temperature token carrying NWS's "record" qualifier.
+
+Real CLI products render a value that tied or broke the daily
+period-of-record with a trailing literal ``R`` (footer legend: ``R
+INDICATES RECORD WAS SET OR TIED.``), e.g. ``100R`` or ``96R``. The
+pattern is deliberately narrow -- signed digits, then exactly one
+trailing ``R``, anchored both ends -- so it accepts only that exact NWS
+shape and nothing else. `10RR`, `10R5`, `R100` and similar all fail to
+match and fall through to the plain-integer parse, which then raises
+`CliContentError` same as any other unrecognized token: this is a widened
+allowlist for one specific, attested real-world shape, not a general
+loosening of what counts as a valid token."""
 
 _SENTINEL_TOKENS: dict[str, SentinelFlag] = {
     "M": "M",
@@ -342,13 +358,23 @@ def parse_temperature_token(token: str) -> TemperatureReadingF:
 
     Recognized sentinel tokens (M, MM, T, MS, MB) map to their sentinel
     flag with `value_f=None`. A signed integer token maps to `value_f`
-    with `sentinel="NONE"`. Anything else raises `CliContentError` --
-    never imputed to 0, never silently dropped.
+    with `sentinel="NONE"`. A signed integer followed by a single
+    trailing ``R`` (NWS's "record was set or tied" qualifier, e.g.
+    ``100R``) maps to that same integer `value_f` with `is_record=True`
+    -- the record marker is preserved, never discarded and never treated
+    as an unrecognized token. Anything else raises `CliContentError` --
+    never imputed to 0, never silently dropped, and never loosened beyond
+    these two exact shapes (plain signed integer, or signed integer + R).
     """
     if not token:
         raise CliContentError("empty temperature token")
     if token in _SENTINEL_TOKENS:
         return TemperatureReadingF(value_f=None, sentinel=_SENTINEL_TOKENS[token])
+    record_match = _RECORD_TOKEN_RE.match(token)
+    if record_match is not None:
+        return TemperatureReadingF(
+            value_f=int(record_match.group("number")), sentinel="NONE", is_record=True
+        )
     try:
         value = int(token)
     except ValueError as exc:

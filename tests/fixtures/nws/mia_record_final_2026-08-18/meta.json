@@ -1,0 +1,12 @@
+{
+  "url": "https://api.weather.gov/products/dfb5768b-8561-40e7-99de-8317352a863b",
+  "status": 200,
+  "retrieved_at": "2026-08-24T03:15:00Z",
+  "sha256_body": "dbf4cc472479dad9a202a38d9ab5cdc2faf5edba0d709d7348c8c65dacd86613",
+  "product_id": "dfb5768b-8561-40e7-99de-8317352a863b",
+  "issuing_office": "KMFL",
+  "issuance_time": "2026-08-19T08:22:00+00:00",
+  "wmo_collective_id": "CDUS42",
+  "note": "FINAL CLI for Miami, covering climate day 2026-08-18. Captured live from api.weather.gov after a real 5-site collection run BLOCKED polymarket_us/MIA with CliContentError: unrecognized temperature token: '100R'. The 'R' suffix on the MAXIMUM value (100R) means the daily record was tied or broken -- see the product's own footer legend 'R  INDICATES RECORD WAS SET OR TIED.' -- and the observed value is still exactly 100 F, fully settlement-valid. This fixture pins the fix that accepts the trailing R qualifier without discarding it or loosening acceptance of genuinely malformed tokens.",
+  "synthetic": false
+}

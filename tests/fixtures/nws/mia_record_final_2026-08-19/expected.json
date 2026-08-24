@@ -1,0 +1,15 @@
+{
+  "summary_date": "2026-08-19",
+  "issuance": "FINAL",
+  "station_header_line": "...THE MIAMI CLIMATE SUMMARY FOR AUGUST 19 2026...",
+  "tmax_f": 96,
+  "tmax_sentinel": "NONE",
+  "tmax_is_record": true,
+  "tmin_f": 76,
+  "tmin_sentinel": "NONE",
+  "tmin_is_record": false,
+  "tavg_f": 86,
+  "tavg_sentinel": "NONE",
+  "tavg_is_record": false,
+  "has_correction_evidence": false
+}

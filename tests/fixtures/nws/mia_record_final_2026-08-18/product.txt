@@ -1,0 +1,99 @@
+
+000
+CDUS42 KMFL 190822
+CLIMIA
+
+CLIMATE REPORT 
+NATIONAL WEATHER SERVICE MIAMI,FL
+422 AM EDT WED AUG 19 2026
+
+...................................
+
+...THE MIAMI CLIMATE SUMMARY FOR AUGUST 18 2026...
+
+CLIMATE NORMAL PERIOD: 1991 TO 2020
+CLIMATE RECORD PERIOD: 1895 TO 2026
+
+
+WEATHER ITEM   OBSERVED TIME   RECORD YEAR NORMAL DEPARTURE LAST      
+                VALUE   (LST)  VALUE       VALUE  FROM      YEAR     
+                                                  NORMAL           
+...................................................................
+TEMPERATURE (F)                                                          
+ YESTERDAY                                                           
+  MAXIMUM        100R  2:47 PM  96    2022  91      9       94        
+  MINIMUM         82   6:57 AM  67    1938  78      4       79        
+  AVERAGE         91                        84      7       87     
+
+PRECIPITATION (IN)                                                    
+  YESTERDAY        0.00          3.72 1933   0.30  -0.30     0.00     
+  MONTH TO DATE    2.55                      5.34  -2.79     3.95     
+  SINCE MAY 1     15.89                     29.53 -13.64    29.26     
+  SINCE JAN 1     25.32                     39.33 -14.01    33.49     
+
+SNOWFALL (IN)                                                              
+  YESTERDAY        0.0                                                
+  MONTH TO DATE    0.0                                                
+  SINCE JUN 1      0.0                                                
+  SINCE JUL 1      0.0                                                
+  SNOW DEPTH       0                                                 
+
+DEGREE DAYS                                                           
+ HEATING                                                              
+  YESTERDAY        0                         0      0        0        
+  MONTH TO DATE    0                         0      0        0        
+  SINCE JUN 1      0                         0      0        0        
+  SINCE JUL 1      0                         0      0        0        
+
+ COOLING                                                              
+  YESTERDAY       26                        19      7       22        
+  MONTH TO DATE  386                       346     40      364        
+  SINCE JUN 1   1626                      1470    156     1529        
+  SINCE JAN 1   3157                      2886    271     3102        
+...................................................................
+
+
+WIND (MPH)                                                            
+  HIGHEST WIND SPEED    15   HIGHEST WIND DIRECTION    SE (130)       
+  HIGHEST GUST SPEED    23   HIGHEST GUST DIRECTION    SE (120)       
+  AVERAGE WIND SPEED     6.4                                        
+
+
+SKY COVER                                                             
+  POSSIBLE SUNSHINE  MM                                                 
+  AVERAGE SKY COVER 0.1                                                 
+
+
+WEATHER CONDITIONS                                                    
+THE FOLLOWING WEATHER WAS RECORDED YESTERDAY.                         
+  NO SIGNIFICANT WEATHER WAS OBSERVED.                                  
+
+
+RELATIVE HUMIDITY (PERCENT)
+ HIGHEST    85                                                        
+ LOWEST     35                                                        
+ AVERAGE    60                                                        
+
+..........................................................
+
+
+THE MIAMI CLIMATE NORMALS FOR TODAY
+                         NORMAL    RECORD    YEAR                     
+ MAXIMUM TEMPERATURE (F)   91        96      1909                      
+ MINIMUM TEMPERATURE (F)   78        70      1947                      
+
+
+SUNRISE AND SUNSET                                                    
+AUGUST 19 2026........SUNRISE   6:56 AM EDT   SUNSET   7:53 PM EDT     
+AUGUST 20 2026........SUNRISE   6:56 AM EDT   SUNSET   7:52 PM EDT     
+
+
+-  INDICATES NEGATIVE NUMBERS.
+R  INDICATES RECORD WAS SET OR TIED.
+MM INDICATES DATA IS MISSING.
+T  INDICATES TRACE AMOUNT.
+
+
+
+
+$$
