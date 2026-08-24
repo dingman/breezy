@@ -139,7 +139,14 @@ def test_complete_history_produces_no_gaps() -> None:
     # Assert
     assert result.opened == ()
     assert result.resolved == ()
-    assert site_entries(store, VENUE, CITY) == ()
+    # NO GAP -- which is a statement about STATE, not about the absence of a
+    # row. The day IS recorded (already RESOLVED, never OPEN) so a later
+    # corrected reissue of this very final has a baseline to be compared
+    # against; asserting `site_entries(...) == ()` here would re-assert the
+    # settlement-correctness defect that made `RevisionEvent` unreachable for
+    # every cleanly-collected day. See section 6b.
+    assert [e.state for e in site_entries(store, VENUE, CITY)] == [GapState.RESOLVED]
+    assert not [e for e in site_entries(store, VENUE, CITY) if e.state is GapState.OPEN]
 
 
 def test_one_missing_day_opens_exactly_one_entry_with_the_reconcile_instant() -> None:
@@ -212,7 +219,11 @@ def test_utc_et_disagreement_end_to_end_resolves_against_the_et_day() -> None:
     result = _reconcile(store := _FakeStore(), now_ns, records, retention_days=1)
 
     assert result.opened == ()
-    assert site_entries(store, VENUE, CITY) == ()
+    # Recorded against the ET climate day and already RESOLVED -- no OPEN gap.
+    # (See the note on `test_complete_history_produces_no_gaps` for why this
+    # is not `== ()`.)
+    entries = site_entries(store, VENUE, CITY)
+    assert [(e.climate_day, e.state) for e in entries] == [(et_day, GapState.RESOLVED)]
 
 
 def test_observed_records_from_a_different_station_are_ignored() -> None:
@@ -496,6 +507,381 @@ def test_no_change_on_a_resolved_day_emits_no_revision_event_and_no_write() -> N
 
     assert result.revisions == ()
     assert store.data[_entry_key(VENUE, CITY, day)] == before
+
+
+# ---------------------------------------------------------------------------
+# 6b. Revision tracking for days that were NEVER a gap
+#
+# The settlement-correctness case: NWS reissues a corrected climate-day final
+# hours after a day that was collected cleanly and on time. Revision detection
+# must cover EVERY observed final, not only days that were once missing --
+# otherwise `RevisionEvent` is structurally unreachable for the overwhelming
+# majority of days and a settled position on a wrong temperature is silent.
+# ---------------------------------------------------------------------------
+
+
+def _clean_day_store(*, revision_seq: int = 1) -> tuple[_FakeStore, dt.date, int]:
+    """A site whose climate day was observed cleanly and on time: never a gap.
+
+    Both instants used by callers fall on the SAME ET calendar day (see the
+    comment on `test_a_filled_gap_becomes_resolved_and_stops_alarming`) so no
+    new candidate day enters the window between reconciles.
+    """
+    store = _FakeStore()
+    day = dt.date(2026, 1, 10)
+    first_ns = _ns_at("2026-01-11T12:00:00")
+    records = (
+        _Record(
+            station=STATION,
+            climate_day=day,
+            ts_init=1,
+            is_final=True,
+            revision_seq=revision_seq,
+        ),
+    )
+    result = _reconcile(store, first_ns, records, retention_days=1)
+
+    # A day that was never missing is never reported as opened OR as resolved:
+    # recording it must not manufacture a phantom gap-then-fill transition.
+    assert result.opened == ()
+    assert result.resolved == ()
+    assert result.revisions == ()
+    return store, day, first_ns
+
+
+def test_a_cleanly_observed_day_is_recorded_so_later_revisions_stay_detectable() -> None:
+    store, day, first_ns = _clean_day_store(revision_seq=1)
+
+    entry = get_entry(store, VENUE, CITY, day)
+    assert entry is not None
+    assert entry.state is GapState.RESOLVED
+    assert entry.first_detected_ns == first_ns
+    assert entry.last_reconciled_ns == first_ns
+    assert entry.resolved_at_ns == first_ns
+    assert entry.observed_revision_seq == 1
+    assert entry.observed_is_final is True
+    assert entry.correction_flag is False
+    assert entry.is_superseded is False
+    assert entry.acknowledged_by is None
+    # Reachable through the durable manifest, not just by point lookup --
+    # an entry the manifest does not list can never be enumerated again.
+    assert [e.climate_day for e in site_entries(store, VENUE, CITY)] == [day]
+
+
+def test_a_revision_seq_increase_on_a_never_missing_day_emits_a_revision_event() -> None:
+    # The headline settlement-correctness case: collected cleanly and on
+    # time, then reissued with an incremented revision.
+    store, day, first_ns = _clean_day_store(revision_seq=1)
+    later_ns = first_ns + 2 * NS_PER_SECOND
+    records = (
+        _Record(station=STATION, climate_day=day, ts_init=2, is_final=True, revision_seq=2),
+    )
+
+    result = _reconcile(store, later_ns, records, retention_days=1)
+
+    assert len(result.revisions) == 1
+    event = result.revisions[0]
+    assert isinstance(event, RevisionEvent)
+    assert event.venue == VENUE
+    assert event.city == CITY
+    assert event.climate_day == day
+    assert event.previous_revision_seq == 1
+    assert event.new_revision_seq == 2
+    entry = get_entry(store, VENUE, CITY, day)
+    assert entry is not None
+    assert entry.observed_revision_seq == 2
+    assert entry.state is GapState.RESOLVED
+
+
+def test_correction_flag_flipping_true_on_a_never_missing_day_emits_a_revision_event() -> None:
+    # A station reporting error corrected hours later, with NO revision-seq
+    # bump: the correction flag alone must still alert.
+    store, day, first_ns = _clean_day_store(revision_seq=1)
+    later_ns = first_ns + 2 * NS_PER_SECOND
+    records = (
+        _Record(
+            station=STATION,
+            climate_day=day,
+            ts_init=2,
+            is_final=True,
+            revision_seq=1,
+            correction_flag=True,
+        ),
+    )
+
+    result = _reconcile(store, later_ns, records, retention_days=1)
+
+    assert len(result.revisions) == 1
+    assert result.revisions[0].correction_flag is True
+    assert result.revisions[0].previous_revision_seq == 1
+    assert result.revisions[0].new_revision_seq == 1
+    entry = get_entry(store, VENUE, CITY, day)
+    assert entry is not None
+    assert entry.correction_flag is True
+
+
+def test_is_superseded_flipping_true_on_a_never_missing_day_emits_a_revision_event() -> None:
+    store, day, first_ns = _clean_day_store(revision_seq=1)
+    later_ns = first_ns + 2 * NS_PER_SECOND
+    records = (
+        _Record(
+            station=STATION,
+            climate_day=day,
+            ts_init=2,
+            is_final=True,
+            revision_seq=1,
+            is_superseded=True,
+        ),
+    )
+
+    result = _reconcile(store, later_ns, records, retention_days=1)
+
+    assert len(result.revisions) == 1
+    assert result.revisions[0].is_superseded is True
+    entry = get_entry(store, VENUE, CITY, day)
+    assert entry is not None
+    assert entry.is_superseded is True
+
+
+def test_a_clean_day_re_observed_unchanged_emits_no_revision_event_and_no_write() -> None:
+    # NEGATIVE CONTROL: recording every observed day must not turn every
+    # reconcile into a revision alert.
+    store, day, first_ns = _clean_day_store(revision_seq=1)
+    before = dict(store.data)
+    later_ns = first_ns + 2 * NS_PER_SECOND
+    records = (
+        _Record(station=STATION, climate_day=day, ts_init=1, is_final=True, revision_seq=1),
+    )
+
+    result = _reconcile(store, later_ns, records, retention_days=1)
+
+    assert result.revisions == ()
+    assert result.opened == ()
+    assert result.resolved == ()
+    assert store.data == before
+
+
+def test_recording_a_clean_day_never_re_opens_or_re_resolves_it() -> None:
+    # A second reconcile at the SAME instant with the SAME records is
+    # byte-identical: the clean-day entry is written exactly once.
+    store, day, first_ns = _clean_day_store(revision_seq=3)
+    snapshot = dict(store.data)
+    records = (
+        _Record(station=STATION, climate_day=day, ts_init=1, is_final=True, revision_seq=3),
+    )
+
+    result = _reconcile(store, first_ns, records, retention_days=1)
+
+    assert result == ReconcileResult(
+        venue=VENUE,
+        city=CITY,
+        opened=(),
+        resolved=(),
+        revisions=(),
+        high_water_mark=day,
+    )
+    assert store.data == snapshot
+
+
+# ---------------------------------------------------------------------------
+# 6c. Preliminary -> final maturation refreshes the baseline WITHOUT alerting
+#
+# A preliminary maturing into a final at the SAME `revision_seq` is ordinary
+# progression, not a revision to a settled value -- alerting on it would
+# desensitise the operator to the corrected-final alert that actually matters.
+# But leaving the entry frozen at the preliminary's values makes the durable
+# ledger misdescribe what was observed, so the entry is refreshed in place and
+# nothing is emitted.
+# ---------------------------------------------------------------------------
+
+
+def _preliminary_day_store(*, revision_seq: int = 1) -> tuple[_FakeStore, dt.date, int]:
+    """A site whose climate day was first seen as a PRELIMINARY, on time.
+
+    All instants used by callers fall on the SAME ET calendar day (see the
+    comment on `test_a_filled_gap_becomes_resolved_and_stops_alarming`) so no
+    new candidate day enters the window between reconciles.
+    """
+    store = _FakeStore()
+    day = dt.date(2026, 1, 10)
+    first_ns = _ns_at("2026-01-11T12:00:00")
+    records = (
+        _Record(
+            station=STATION,
+            climate_day=day,
+            ts_init=1,
+            is_final=False,
+            revision_seq=revision_seq,
+        ),
+    )
+    result = _reconcile(store, first_ns, records, retention_days=1)
+
+    assert result.opened == ()
+    assert result.resolved == ()
+    assert result.revisions == ()
+    entry = get_entry(store, VENUE, CITY, day)
+    assert entry is not None
+    assert entry.state is GapState.RESOLVED
+    assert entry.observed_is_final is False
+    return store, day, first_ns
+
+
+def test_a_preliminary_maturing_into_a_final_refreshes_the_entry_without_alerting() -> None:
+    # HEADLINE: same `revision_seq`, `is_final` False -> True. The durable
+    # entry must stop misdescribing the observation, and NO RevisionEvent may
+    # fire -- this is normal progression, not a revision to a settled value.
+    store, day, first_ns = _preliminary_day_store(revision_seq=1)
+    later_ns = first_ns + 2 * NS_PER_SECOND
+    records = (
+        _Record(station=STATION, climate_day=day, ts_init=2, is_final=True, revision_seq=1),
+    )
+
+    result = _reconcile(store, later_ns, records, retention_days=1)
+
+    assert result.revisions == ()
+    assert result.opened == ()
+    assert result.resolved == ()
+    entry = get_entry(store, VENUE, CITY, day)
+    assert entry is not None
+    assert entry.observed_is_final is True
+    assert entry.observed_revision_seq == 1
+    assert entry.correction_flag is False
+    assert entry.is_superseded is False
+    assert entry.state is GapState.RESOLVED
+    assert entry.last_reconciled_ns == later_ns
+    # Refreshing an already-RESOLVED day is not a re-resolution: the instant
+    # the day was first accounted for must not be rewritten.
+    assert entry.resolved_at_ns == first_ns
+
+
+def test_a_matured_final_re_observed_unchanged_performs_no_further_write() -> None:
+    # NEGATIVE CONTROL: the refresh must be a one-shot, not a per-reconcile
+    # rewrite -- otherwise every poll forever writes the same bytes back.
+    store, day, first_ns = _preliminary_day_store(revision_seq=1)
+    matured_ns = first_ns + 2 * NS_PER_SECOND
+    records = (
+        _Record(station=STATION, climate_day=day, ts_init=2, is_final=True, revision_seq=1),
+    )
+    _reconcile(store, matured_ns, records, retention_days=1)
+    after_refresh = dict(store.data)
+
+    third_ns = matured_ns + 2 * NS_PER_SECOND
+    result = _reconcile(store, third_ns, records, retention_days=1)
+
+    assert result.revisions == ()
+    assert result.opened == ()
+    assert result.resolved == ()
+    assert store.data == after_refresh
+
+
+def test_a_correction_after_maturation_alerts_once_against_the_refreshed_baseline() -> None:
+    # REGRESSION GUARD: preliminary -> final (silent refresh) -> corrected
+    # final. Exactly ONE RevisionEvent across the whole sequence, and it is
+    # compared against the refreshed baseline (already `is_final`), not the
+    # stale preliminary one.
+    store, day, first_ns = _preliminary_day_store(revision_seq=1)
+    matured_ns = first_ns + 2 * NS_PER_SECOND
+    matured = _reconcile(
+        store,
+        matured_ns,
+        (_Record(station=STATION, climate_day=day, ts_init=2, is_final=True, revision_seq=1),),
+        retention_days=1,
+    )
+    assert matured.revisions == ()
+    baseline = get_entry(store, VENUE, CITY, day)
+    assert baseline is not None
+    assert baseline.observed_is_final is True  # the refreshed baseline
+
+    corrected_ns = matured_ns + 2 * NS_PER_SECOND
+    corrected = _reconcile(
+        store,
+        corrected_ns,
+        (
+            _Record(
+                station=STATION,
+                climate_day=day,
+                ts_init=3,
+                is_final=True,
+                revision_seq=2,
+                correction_flag=True,
+            ),
+        ),
+        retention_days=1,
+    )
+
+    assert len(corrected.revisions) == 1
+    event = corrected.revisions[0]
+    assert event.climate_day == day
+    assert event.previous_revision_seq == 1
+    assert event.new_revision_seq == 2
+    assert event.correction_flag is True
+    entry = get_entry(store, VENUE, CITY, day)
+    assert entry is not None
+    assert entry.observed_revision_seq == 2
+    assert entry.observed_is_final is True
+    assert entry.correction_flag is True
+
+
+def test_a_weaker_re_observation_never_downgrades_a_final_baseline() -> None:
+    # A stale preliminary re-delivered after the final must not roll the
+    # ledger's baseline backwards to `is_final=False`, which would re-arm the
+    # refresh path and rewrite the entry on every poll.
+    store, day, first_ns = _preliminary_day_store(revision_seq=1)
+    matured_ns = first_ns + 2 * NS_PER_SECOND
+    _reconcile(
+        store,
+        matured_ns,
+        (_Record(station=STATION, climate_day=day, ts_init=2, is_final=True, revision_seq=1),),
+        retention_days=1,
+    )
+    after_refresh = dict(store.data)
+
+    stale_ns = matured_ns + 2 * NS_PER_SECOND
+    result = _reconcile(
+        store,
+        stale_ns,
+        (_Record(station=STATION, climate_day=day, ts_init=9, is_final=False, revision_seq=1),),
+        retention_days=1,
+    )
+
+    assert result.revisions == ()
+    assert store.data == after_refresh
+    entry = get_entry(store, VENUE, CITY, day)
+    assert entry is not None
+    assert entry.observed_is_final is True
+
+
+def test_a_gap_resolved_by_a_preliminary_then_matured_refreshes_without_alerting() -> None:
+    # The same maturation, reached through the OPEN -> RESOLVED path rather
+    # than through the never-missing path: one mechanism must serve both.
+    store = _FakeStore()
+    day = dt.date(2026, 1, 10)
+    opened_ns = _ns_at("2026-01-11T12:00:00")
+    resolved_ns = _ns_at("2026-01-11T14:00:00")
+    matured_ns = _ns_at("2026-01-11T16:00:00")
+
+    assert _reconcile(store, opened_ns, retention_days=1).opened == (day,)
+    resolved = _reconcile(
+        store,
+        resolved_ns,
+        (_Record(station=STATION, climate_day=day, ts_init=1, is_final=False, revision_seq=1),),
+        retention_days=1,
+    )
+    assert resolved.resolved == (day,)
+
+    result = _reconcile(
+        store,
+        matured_ns,
+        (_Record(station=STATION, climate_day=day, ts_init=2, is_final=True, revision_seq=1),),
+        retention_days=1,
+    )
+
+    assert result.revisions == ()
+    assert result.resolved == ()
+    entry = get_entry(store, VENUE, CITY, day)
+    assert entry is not None
+    assert entry.observed_is_final is True
+    assert entry.resolved_at_ns == resolved_ns
 
 
 # ---------------------------------------------------------------------------

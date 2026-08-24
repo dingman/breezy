@@ -76,11 +76,24 @@ conservative estimate, not a guarantee. It must never be confused with
 about when Breezy falls back to a no-data settlement outcome, not an API
 retention guarantee, and this module never reads it.
 
-**Growth.** One entry per ``(site, climate_day)`` that ever fails to arrive
-by its review-extension deadline, forever (never evicted, matching
+**Growth.** One entry per ``(site, climate_day)`` that becomes EXPECTED --
+whether or not it arrived -- forever (never evicted, matching
 ``product_index.py``'s acceptance of unbounded growth for the same
-store-cannot-delete reason). At five sites this is at most 1,825 entries/year,
-~200 bytes each, ~0.4 MB/year -- accepted, not engineered around.
+store-cannot-delete reason). Recording the days that DID arrive is what makes
+:class:`RevisionEvent` reachable for them at all (see :func:`reconcile` pass
+2), and it costs the worst case this module already budgeted for: at five
+sites, 1,825 entries/year, ~200 bytes each, ~0.4 MB/year -- accepted, not
+engineered around. The count is bounded per site per day by the per-site
+high-water mark, which only ever advances: a day is evaluated for entry
+creation exactly once, on the first reconcile after its review extension
+elapses, so no day can be entered twice and the growth rate is exactly one
+entry per site per calendar day. The COLD-START backfill is separately
+bounded by ``retention_days``. What is NOT bounded is the per-poll read cost:
+:func:`reconcile` pass 1 reads every entry a site has ever written, so that
+scan now grows by ~365 entries/site/year instead of only by the (rare) missing
+days -- ~1,800 point ``get`` calls per site per poll after five years. That is
+a read-amplification figure to watch, not a correctness limit, and bounding it
+would need a store that can scan or delete.
 
 **Attachment point (NOT wired here).** Per the design, ``reconcile`` belongs
 at the very top of ``NwsIngestActor.poll_once``, beside
@@ -230,6 +243,13 @@ class GapEntry:
     (nothing has ever been observed for this day); once ``RESOLVED`` it is
     the latest revision seen as of the reconcile that resolved -- or later
     revised -- it.
+
+    An entry is NOT evidence that a day was ever missing. A day observed
+    cleanly and on time is written straight to ``RESOLVED`` on the reconcile
+    that first finds it (never ``OPEN``, and never reported in
+    ``ReconcileResult.opened`` / ``.resolved``), purely so a later reissue has
+    something to be compared against. ``state is OPEN`` -- not "an entry
+    exists" -- is the outstanding-gap predicate for any caller.
     """
 
     venue: str
@@ -274,7 +294,10 @@ class ReconcileResult:
 
     ``opened`` / ``resolved`` / ``revisions`` are reported in ascending
     ``climate_day`` order for opened/resolved and processing order for
-    revisions. Idempotent by construction: a second call with the same
+    revisions. ``resolved`` means "a day that WAS an open gap is now filled"
+    only -- a day observed cleanly on first sight is recorded (see
+    :func:`reconcile` pass 2) but reported in neither list. Idempotent by
+    construction: a second call with the same
     ``now_ns`` and the same ``records`` reports the empty transitions
     (nothing NEW opens, resolves or revises) even though unchanged ``OPEN``
     and ``ACKNOWLEDGED_LOST`` entries are still durably rewritten with an
@@ -663,6 +686,45 @@ def _is_revision(entry: GapEntry, obs: _ObservedSummary) -> bool:
     )
 
 
+def _is_maturation(entry: GapEntry, obs: _ObservedSummary) -> bool:
+    """A PRELIMINARY that has since become the FINAL, at no higher revision.
+
+    Deliberately NOT folded into :func:`_is_revision`. A preliminary maturing
+    into a final at the same ``revision_seq`` is ordinary progression, not a
+    revision to a settled value: firing :class:`RevisionEvent` here would
+    alert on ordinary days and desensitise the operator to the corrected-final
+    alert that actually matters. Detection of the case that DOES matter is
+    unaffected either way -- a later corrected final carries an incremented
+    ``revision_seq`` (or a ``correction_flag`` / ``is_superseded`` flip) and
+    trips :func:`_is_revision` regardless of which baseline it is compared to.
+
+    What maturation DOES require is a durable refresh: left alone, the entry
+    would describe the observation as non-final forever, so the ledger would
+    misdescribe what was actually observed. One-way by construction
+    (``is_final`` False -> True only), so a stale preliminary re-delivered
+    after the final can never downgrade the baseline and re-arm this path.
+    """
+    return obs.is_final and not entry.observed_is_final
+
+
+def _with_observation(entry: GapEntry, obs: _ObservedSummary, now_ns: int) -> GapEntry:
+    """`entry` restated against `obs` -- the ONE place the four observation
+    fields are copied across, shared by every path that records an
+    observation (resolution, revision, maturation) so they cannot drift.
+    ``resolved_at_ns`` is untouched: refreshing an already-``RESOLVED`` day is
+    not a re-resolution, and the instant it was first accounted for must
+    survive.
+    """
+    return replace(
+        entry,
+        last_reconciled_ns=now_ns,
+        observed_revision_seq=obs.revision_seq,
+        observed_is_final=obs.is_final,
+        correction_flag=obs.correction_flag,
+        is_superseded=obs.is_superseded,
+    )
+
+
 # ---------------------------------------------------------------------------
 # Reconciliation
 # ---------------------------------------------------------------------------
@@ -698,8 +760,10 @@ def reconcile(
     1. **Revisit** every entry already in the durable manifest for this
        `(venue, city)` -- ``OPEN`` entries either resolve (an observation
        now exists) or get ``last_reconciled_ns`` bumped; ``RESOLVED``
-       entries are checked for a revision event; ``ACKNOWLEDGED_LOST``
-       entries never transition but still get ``last_reconciled_ns`` bumped
+       entries are checked for a revision event, and failing that for a
+       silent PRELIMINARY-to-FINAL maturation, which refreshes the durable
+       baseline in place and emits nothing (see :func:`_is_maturation`);
+       ``ACKNOWLEDGED_LOST`` entries never transition but still get ``last_reconciled_ns`` bumped
        so they stay visibly alive. This pass is NOT bounded by the
        high-water mark -- an ``OPEN`` day from months ago must keep being
        re-checked for resolution every single reconcile, forever, or a late
@@ -712,9 +776,14 @@ def reconcile(
        first not-yet-expected day, since every later day is even less
        expected, and does NOT advance the high-water mark past it -- that
        day is re-evaluated on the next call once its extension has elapsed.
-       A day that IS observed the very first time it is checked never gets
-       an entry at all: only a day that is expected AND unobserved with no
-       prior entry opens one.
+       An expected day with no observation opens an ``OPEN`` entry; an
+       expected day that IS already observed the very first time it is
+       checked is written directly as ``RESOLVED``, capturing that
+       observation, and is reported in NEITHER ``opened`` nor ``resolved``
+       (it was never a gap). That resolved-on-first-sight entry exists for
+       one reason: every later reconcile then compares the day through pass
+       1's existing ``_is_revision`` check, so a corrected reissue of a
+       cleanly-collected final still raises a :class:`RevisionEvent`.
 
     Raises
     ------
@@ -740,14 +809,9 @@ def reconcile(
                 _write_entry(
                     store,
                     replace(
-                        entry,
+                        _with_observation(entry, obs, now_ns),
                         state=GapState.RESOLVED,
                         resolved_at_ns=now_ns,
-                        last_reconciled_ns=now_ns,
-                        observed_revision_seq=obs.revision_seq,
-                        observed_is_final=obs.is_final,
-                        correction_flag=obs.correction_flag,
-                        is_superseded=obs.is_superseded,
                     ),
                 )
                 resolved.append(entry.climate_day)
@@ -766,17 +830,13 @@ def reconcile(
                         is_superseded=obs.is_superseded,
                     )
                 )
-                _write_entry(
-                    store,
-                    replace(
-                        entry,
-                        last_reconciled_ns=now_ns,
-                        observed_revision_seq=obs.revision_seq,
-                        observed_is_final=obs.is_final,
-                        correction_flag=obs.correction_flag,
-                        is_superseded=obs.is_superseded,
-                    ),
-                )
+                _write_entry(store, _with_observation(entry, obs, now_ns))
+            elif obs is not None and _is_maturation(entry, obs):
+                # The preliminary this day resolved against has become the
+                # final. Refresh the durable baseline in place and emit
+                # NOTHING: not a revision, not a re-resolution, reported in
+                # neither `opened` nor `resolved`. See :func:`_is_maturation`.
+                _write_entry(store, _with_observation(entry, obs, now_ns))
             # else: no change since the last reconcile -- no write.
         else:  # GapState.ACKNOWLEDGED_LOST -- never transitions back.
             _write_entry(store, replace(entry, last_reconciled_ns=now_ns))
@@ -799,26 +859,58 @@ def reconcile(
         )
         if now_ns < extension_end_ns:
             break
-        if day not in observed:
-            new_entry = GapEntry(
-                venue=venue,
-                city=city,
-                climate_day=day,
-                state=GapState.OPEN,
-                first_detected_ns=now_ns,
-                last_reconciled_ns=now_ns,
-                resolved_at_ns=None,
-                observed_revision_seq=0,
-                observed_is_final=False,
-                correction_flag=False,
-                is_superseded=False,
-                acknowledged_by=None,
-                acknowledged_at_ns=None,
-                acknowledged_reason=None,
+        first_obs = observed.get(day)
+        if first_obs is None:
+            _write_entry(
+                store,
+                GapEntry(
+                    venue=venue,
+                    city=city,
+                    climate_day=day,
+                    state=GapState.OPEN,
+                    first_detected_ns=now_ns,
+                    last_reconciled_ns=now_ns,
+                    resolved_at_ns=None,
+                    observed_revision_seq=0,
+                    observed_is_final=False,
+                    correction_flag=False,
+                    is_superseded=False,
+                    acknowledged_by=None,
+                    acknowledged_at_ns=None,
+                    acknowledged_reason=None,
+                ),
             )
-            _write_entry(store, new_entry)
             opened.append(day)
-        # else: observed on first check -- never a gap, no entry created.
+        else:
+            # Observed on first check -- never a gap. It is deliberately NOT
+            # reported in `opened` or `resolved` (nothing was ever missing, so
+            # a gap-then-fill transition would be a phantom), but an entry IS
+            # written, already ``RESOLVED``, capturing what was observed. That
+            # entry is the ONLY baseline a later reissue can be compared
+            # against: without it, pass 1 has nothing to revisit for this day
+            # and :class:`RevisionEvent` is structurally unreachable for every
+            # day that arrived cleanly and on time -- i.e. almost all of them.
+            # From here the EXISTING pass-1 `_is_revision` comparison does all
+            # the work; no second mechanism is introduced.
+            _write_entry(
+                store,
+                GapEntry(
+                    venue=venue,
+                    city=city,
+                    climate_day=day,
+                    state=GapState.RESOLVED,
+                    first_detected_ns=now_ns,
+                    last_reconciled_ns=now_ns,
+                    resolved_at_ns=now_ns,
+                    observed_revision_seq=first_obs.revision_seq,
+                    observed_is_final=first_obs.is_final,
+                    correction_flag=first_obs.correction_flag,
+                    is_superseded=first_obs.is_superseded,
+                    acknowledged_by=None,
+                    acknowledged_at_ns=None,
+                    acknowledged_reason=None,
+                ),
+            )
         new_hw = day
         day += dt.timedelta(days=1)
 
