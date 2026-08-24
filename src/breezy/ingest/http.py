@@ -76,7 +76,7 @@ DEFAULT_BASE_URL = "https://api.weather.gov"
 
 DEFAULT_MAX_BODY_BYTES = 128 * 1024  # 128 KiB; real CLI products are <64 KiB.
 DEFAULT_CHUNK_SIZE = 8 * 1024
-DEFAULT_CONTACT = "breezy-data@gmail.com"
+DEFAULT_CONTACT = "breezy@jonathan.vc"
 USER_AGENT_ENV_VAR = "BREEZY_USER_AGENT"
 
 # Generous for a real validator (NWS ETags run ~40 chars, an HTTP-date 29)
@@ -139,6 +139,29 @@ _SENSITIVE_PROXY_ENV_VARS = (
 
 class TransportError(Exception):
     """Base class for all errors raised by :class:`HttpTransport`."""
+
+
+class MissingContactError(ValueError):
+    """Raised when no User-Agent contact is configured and none was supplied.
+
+    Deliberately **not** a :class:`TransportError` subclass, for the same
+    reason :func:`_validated_path_identifier` below raises a bare
+    ``ValueError`` rather than a ``TransportError``: this fires at
+    :class:`HttpTransport` **construction**, before any socket could open and
+    before any poll could exist. Nothing was transported, so there is no poll
+    outcome for `breezy.ingest.routing.route_transport_error` to route it to
+    -- putting it in the ``TransportError`` tree would force a permanent,
+    unreachable row onto every consumer of that taxonomy (the routing table,
+    its enumeration contract test) for an error that can never arrive there
+    in practice.
+
+    NWS blocklists misbehaving clients **permanently**. A silent fallback to
+    a hardcoded contact address here would let a misconfigured deployment
+    poll NWS under an address nobody monitors, invisibly, until the
+    blocklist landed -- which is unrecoverable. Raised eagerly at
+    construction, never deferred to first fetch, so the failure is loud and
+    immediate rather than a silent, plausible-looking default.
+    """
 
 
 class DisallowedHostError(TransportError):
@@ -283,10 +306,34 @@ def redact_url(url: str) -> str:
 
 
 def _default_user_agent() -> str:
+    """Return the User-Agent contact from ``USER_AGENT_ENV_VAR``, or raise.
+
+    There is deliberately **no silent fallback** to ``DEFAULT_CONTACT`` here.
+    An earlier version of this function returned a hardcoded
+    ``breezy@jonathan.vc`` User-Agent whenever the env var was unset -- a
+    plausible-looking default that let a misconfigured deployment poll NWS
+    under an address nobody was monitoring the mailbox for, invisibly, right
+    up until the permanent blocklist landed. That failure mode is exactly
+    what NWS's abuse policy exists to punish, so it must fail loudly at
+    construction instead.
+
+    ``DEFAULT_CONTACT`` remains exported as the documented *value* a well
+    formed contact takes (quoted in this function's error message, and used
+    directly by callers/tests that want to construct a transport explicitly)
+    -- it is simply never reached as an implicit runtime default again.
+    """
     override = os.environ.get(USER_AGENT_ENV_VAR)
     if override:
         return override
-    return f"breezy-weather-ingest/0.1 (+mailto:{DEFAULT_CONTACT})"
+    raise MissingContactError(
+        f"{USER_AGENT_ENV_VAR} is not set and no `user_agent` was supplied to "
+        "`HttpTransport`. Breezy refuses to guess a contact address: NWS "
+        "permanently blocklists misbehaving clients, so a User-Agent pointing "
+        "at an address nobody monitors is worse than refusing to start. Set "
+        f"{USER_AGENT_ENV_VAR} to a monitored role mailbox (e.g. "
+        f"'breezy-weather-ingest/0.1 (+mailto:{DEFAULT_CONTACT})'), or pass "
+        "`user_agent=` explicitly."
+    )
 
 
 def _validated_cache_validator(value: str, header: str) -> str:

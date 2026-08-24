@@ -7,18 +7,18 @@ pins, and §0 decision 5 for the ACIS auto-resume rule.
 
 from __future__ import annotations
 
+import base64
 import json
 import logging
 from collections.abc import Callable
 from dataclasses import dataclass
+from pathlib import Path
 
 import pytest
 
 from breezy.ingest.gate import (
     _GLOBAL_KEY,
     DEFAULT_BURST_POLICY,
-    CachePersistenceConfig,
-    CachePersistenceMisconfiguredError,
     CrossSiteBurstPolicy,
     GateBlockedError,
     GateReason,
@@ -26,13 +26,14 @@ from breezy.ingest.gate import (
     InMemoryStateStore,
     SettlementGate,
     StateStore,
+    _global_entry_to_bytes,
+    _GlobalEntry,
     _site_entry_from_bytes,
     _site_entry_to_bytes,
     _site_key,
     _SiteEntry,
-    assert_cache_persistence_configured,
-    cache_persistence_config_from,
 )
+from breezy.persistence.state_store import FileStateStore
 
 VENUE = "polymarket_us"
 CITY = "NYC"
@@ -1733,192 +1734,6 @@ def test_corrupt_persisted_global_bytes_can_be_manually_cleared() -> None:
 
 
 # ---------------------------------------------------------------------------
-# Cache-database startup assertion
-#
-# Measured against the installed nautilus_trader==1.231.0 tree (not
-# assumed) -- see the module docstring / assert_cache_persistence_configured
-# for the exact file:line citations. Two corrections from an earlier draft:
-#
-# 1. save_state/load_state live on NautilusKernelConfig
-#    (nautilus_trader/system/config.py), NOT on ActorConfig or
-#    StrategyConfig -- both carry neither field. An assertion built against
-#    "actor_config.save_state" either always raises against a real
-#    ActorConfig, or was never exercised against one.
-# 2. Even with save_state/load_state/database all correct, Cache._general
-#    (which backs this module's StateStore via Cache.add/Cache.get) is
-#    repopulated from the database on restart ONLY through
-#    ExecutionEngine.load_cache() -> Cache.cache_general(), which the
-#    kernel invokes ONLY when exec_engine.load_cache is True AND
-#    cache.flush_on_start is False. Miss either and a UA-trap global halt
-#    -- the exact thing this module exists to make survive a crash-loop --
-#    is silently lost on restart.
-# ---------------------------------------------------------------------------
-
-
-def test_cache_persistence_assertion_passes_when_fully_configured() -> None:
-    config = CachePersistenceConfig(
-        save_state=True, load_state=True, database=object(), load_cache=True, flush_on_start=False
-    )
-    assert_cache_persistence_configured(config)  # must not raise
-
-
-def test_cache_persistence_assertion_fails_when_database_unset() -> None:
-    config = CachePersistenceConfig(
-        save_state=True, load_state=True, database=None, load_cache=True, flush_on_start=False
-    )
-    with pytest.raises(CachePersistenceMisconfiguredError, match="database"):
-        assert_cache_persistence_configured(config)
-
-
-def test_cache_persistence_assertion_fails_when_save_state_false() -> None:
-    config = CachePersistenceConfig(
-        save_state=False, load_state=True, database=object(), load_cache=True, flush_on_start=False
-    )
-    with pytest.raises(CachePersistenceMisconfiguredError, match="save_state"):
-        assert_cache_persistence_configured(config)
-
-
-def test_cache_persistence_assertion_fails_when_load_state_false() -> None:
-    config = CachePersistenceConfig(
-        save_state=True, load_state=False, database=object(), load_cache=True, flush_on_start=False
-    )
-    with pytest.raises(CachePersistenceMisconfiguredError, match="load_state"):
-        assert_cache_persistence_configured(config)
-
-
-def test_cache_persistence_assertion_fails_when_load_cache_false() -> None:
-    """ExecEngineConfig.load_cache=False: ExecutionEngine.load_cache() is
-    never invoked at all, so Cache.cache_general() never runs.
-    """
-    config = CachePersistenceConfig(
-        save_state=True, load_state=True, database=object(), load_cache=False, flush_on_start=False
-    )
-    with pytest.raises(CachePersistenceMisconfiguredError, match="load_cache"):
-        assert_cache_persistence_configured(config)
-
-
-def test_cache_persistence_assertion_fails_when_flush_on_start_true() -> None:
-    """CacheConfig.flush_on_start=True: kernel.py's own gating
-    (`not flush_on_start`) skips ExecutionEngine.load_cache() even though
-    load_cache=True and a database is configured.
-    """
-    config = CachePersistenceConfig(
-        save_state=True, load_state=True, database=object(), load_cache=True, flush_on_start=True
-    )
-    with pytest.raises(CachePersistenceMisconfiguredError, match="flush_on_start"):
-        assert_cache_persistence_configured(config)
-
-
-def test_cache_persistence_assertion_fails_when_all_five_unset() -> None:
-    config = CachePersistenceConfig(
-        save_state=False, load_state=False, database=None, load_cache=False, flush_on_start=True
-    )
-    with pytest.raises(CachePersistenceMisconfiguredError):
-        assert_cache_persistence_configured(config)
-
-
-class _FakeKernelConfig:
-    """Models NautilusKernelConfig (e.g. TradingNodeConfig), which is
-    where save_state/load_state actually live -- measured at
-    nautilus_trader/system/config.py:122-123. Deliberately NOT named
-    "ActorConfig": that was the bug.
-    """
-
-    def __init__(self, save_state: bool, load_state: bool) -> None:
-        self.save_state = save_state
-        self.load_state = load_state
-
-
-class _FakeCacheConfig:
-    def __init__(self, database: object | None, flush_on_start: bool = False) -> None:
-        self.database = database
-        self.flush_on_start = flush_on_start
-
-
-class _FakeExecEngineConfig:
-    def __init__(self, load_cache: bool) -> None:
-        self.load_cache = load_cache
-
-
-def test_cache_persistence_config_from_real_shaped_objects() -> None:
-    kernel_config = _FakeKernelConfig(save_state=True, load_state=True)
-    cache_config = _FakeCacheConfig(database=object(), flush_on_start=False)
-    exec_engine_config = _FakeExecEngineConfig(load_cache=True)
-    config = cache_persistence_config_from(kernel_config, cache_config, exec_engine_config)
-    assert_cache_persistence_configured(config)  # must not raise
-
-
-def test_cache_persistence_config_from_detects_unset_database() -> None:
-    kernel_config = _FakeKernelConfig(save_state=True, load_state=True)
-    cache_config = _FakeCacheConfig(database=None)
-    exec_engine_config = _FakeExecEngineConfig(load_cache=True)
-    config = cache_persistence_config_from(kernel_config, cache_config, exec_engine_config)
-    with pytest.raises(CachePersistenceMisconfiguredError, match="database"):
-        assert_cache_persistence_configured(config)
-
-
-def test_cache_persistence_config_from_detects_flush_on_start() -> None:
-    kernel_config = _FakeKernelConfig(save_state=True, load_state=True)
-    cache_config = _FakeCacheConfig(database=object(), flush_on_start=True)
-    exec_engine_config = _FakeExecEngineConfig(load_cache=True)
-    config = cache_persistence_config_from(kernel_config, cache_config, exec_engine_config)
-    with pytest.raises(CachePersistenceMisconfiguredError, match="flush_on_start"):
-        assert_cache_persistence_configured(config)
-
-
-def test_cache_persistence_config_from_detects_load_cache_false() -> None:
-    kernel_config = _FakeKernelConfig(save_state=True, load_state=True)
-    cache_config = _FakeCacheConfig(database=object())
-    exec_engine_config = _FakeExecEngineConfig(load_cache=False)
-    config = cache_persistence_config_from(kernel_config, cache_config, exec_engine_config)
-    with pytest.raises(CachePersistenceMisconfiguredError, match="load_cache"):
-        assert_cache_persistence_configured(config)
-
-
-def test_cache_persistence_config_from_missing_kernel_attrs_raises() -> None:
-    class _Empty:
-        pass
-
-    with pytest.raises(CachePersistenceMisconfiguredError):
-        cache_persistence_config_from(
-            _Empty(), _FakeCacheConfig(database=object()), _FakeExecEngineConfig(load_cache=True)
-        )
-
-
-def test_cache_persistence_config_from_missing_cache_database_attr_raises() -> None:
-    class _Empty:
-        pass
-
-    with pytest.raises(CachePersistenceMisconfiguredError):
-        cache_persistence_config_from(
-            _FakeKernelConfig(True, True), _Empty(), _FakeExecEngineConfig(load_cache=True)
-        )
-
-
-def test_cache_persistence_config_from_missing_flush_on_start_attr_raises() -> None:
-    class _CacheConfigMissingFlushOnStart:
-        def __init__(self) -> None:
-            self.database = object()
-
-    with pytest.raises(CachePersistenceMisconfiguredError):
-        cache_persistence_config_from(
-            _FakeKernelConfig(True, True),
-            _CacheConfigMissingFlushOnStart(),
-            _FakeExecEngineConfig(load_cache=True),
-        )
-
-
-def test_cache_persistence_config_from_missing_exec_engine_attrs_raises() -> None:
-    class _Empty:
-        pass
-
-    with pytest.raises(CachePersistenceMisconfiguredError):
-        cache_persistence_config_from(
-            _FakeKernelConfig(True, True), _FakeCacheConfig(database=object()), _Empty()
-        )
-
-
-# ---------------------------------------------------------------------------
 # UA-trap survival across a simulated restart, through the REAL
 # Cache.add/Cache.get/cache_general() repopulation semantics -- not a
 # hand-rolled store that always returns what was set. Measured:
@@ -2091,3 +1906,116 @@ def test_in_memory_state_store_round_trips() -> None:
     assert store.get("missing") is None
     store.set("k", b"v")
     assert store.get("k") == b"v"
+
+
+# ---------------------------------------------------------------------------
+# Corrupt persisted bytes against a REAL FileStateStore
+#
+# Every corrupt-entry test above uses InMemoryStateStore, which has no CRC32
+# and structurally cannot raise StateStoreCorruptError -- those tests prove
+# the design (a decode failure fails closed), never the deployment (the
+# production store's own corruption signal fails closed too). These pin the
+# real defect: FileStateStore.get() raises StateStoreCorruptError (a
+# RuntimeError subclass) on a CRC32 mismatch, which the three handlers in
+# gate.py must catch, not merely a ValueError/TypeError/KeyError from
+# decoding already-fetched bytes.
+# ---------------------------------------------------------------------------
+
+
+def _flip_one_byte_of_value(path: Path, key: str) -> None:
+    """Corrupt exactly one key's stored payload (fails its CRC32 check) while
+    keeping the JSON container itself well-formed, so the effect is
+    attributable only to the store's CRC discipline, never to a broken JSON
+    parse. Deliberately duplicated from
+    ``test_persistence_state_store.py``'s identical helper rather than
+    imported -- test modules in this project do not cross-import (mirrors
+    ``state_store.py``'s own note on why ``_require_real_directory`` is
+    duplicated rather than imported from ``catalog.py``).
+    """
+    parsed = json.loads(path.read_text())
+    original_b64: str = parsed[key]["data"]
+    raw = bytearray(base64.b64decode(original_b64))
+    raw[0] ^= 0xFF
+    parsed[key]["data"] = base64.b64encode(bytes(raw)).decode("ascii")
+    path.write_text(json.dumps(parsed))
+
+
+def test_corrupt_crc_site_bytes_against_real_file_state_store_blocks_only_that_site(
+    tmp_path: Path,
+) -> None:
+    """The SITE blast radius (gate.py's ``_load_site``), pinned against the
+    real store: a CRC32-corrupt site entry must fail closed to BLOCKED for
+    that site alone, not propagate StateStoreCorruptError out of status().
+    """
+    path = tmp_path / "state.json"
+    store = FileStateStore(path)
+    store.set(_site_key(VENUE, CITY), _site_entry_to_bytes(_SiteEntry(last_successful_poll_ns=1)))
+    store.close()
+
+    _flip_one_byte_of_value(path, _site_key(VENUE, CITY))
+
+    reopened = FileStateStore(path)
+    try:
+        gate = SettlementGate(store=reopened, clock=_FakeClock(), sites=_DEFAULT_TEST_SITES)
+        status = gate.status(VENUE, CITY)  # must not raise StateStoreCorruptError
+        assert status.state is GateState.BLOCKED
+        assert status.reason is GateReason.CORRUPT_PERSISTED_STATE
+    finally:
+        reopened.close()
+
+
+def test_corrupt_crc_global_bytes_against_real_file_state_store_blocks_all_sites(
+    tmp_path: Path,
+) -> None:
+    """The GLOBAL blast radius (gate.py's ``_load_global``), pinned against
+    the real store: a CRC32-corrupt global entry must fail closed to
+    BLOCKING ALL SITES, not propagate StateStoreCorruptError out of status().
+    """
+    path = tmp_path / "state.json"
+    store = FileStateStore(path)
+    store.set(_GLOBAL_KEY, _global_entry_to_bytes(_GlobalEntry()))
+    store.close()
+
+    _flip_one_byte_of_value(path, _GLOBAL_KEY)
+
+    reopened = FileStateStore(path)
+    try:
+        gate = SettlementGate(store=reopened, clock=_FakeClock(), sites=_DEFAULT_TEST_SITES)
+        status_a = gate.status(VENUE, CITY)  # must not raise StateStoreCorruptError
+        status_b = gate.status(VENUE, OTHER_CITY)
+        assert status_a.state is GateState.BLOCKED
+        assert status_b.state is GateState.BLOCKED
+        assert status_a.reason is GateReason.CORRUPT_PERSISTED_STATE
+    finally:
+        reopened.close()
+
+
+def test_corrupt_crc_sibling_bytes_against_real_file_state_store_counts_toward_burst(
+    tmp_path: Path,
+) -> None:
+    """The third handler (``_load_sibling_site``, ``gate.py:~658``), pinned
+    against the real store: a CRC32-corrupt SIBLING site entry must count
+    toward the cross-site burst derivation rather than propagate
+    StateStoreCorruptError out of record_forbidden_403().
+    """
+    path = tmp_path / "state.json"
+    store = FileStateStore(path)
+    store.set(
+        _site_key(VENUE, OTHER_CITY),
+        _site_entry_to_bytes(_SiteEntry(last_successful_poll_ns=1)),
+    )
+    store.close()
+
+    _flip_one_byte_of_value(path, _site_key(VENUE, OTHER_CITY))
+
+    reopened = FileStateStore(path)
+    try:
+        gate = SettlementGate(store=reopened, clock=_FakeClock(), sites=_DEFAULT_TEST_SITES)
+        gate.record_successful_poll(VENUE, CITY)
+        status = gate.record_forbidden_403(  # must not raise StateStoreCorruptError
+            VENUE, CITY, detail="only site with valid persisted history"
+        )
+        assert status.state is GateState.BLOCKED
+        assert status.reason is GateReason.UA_TRAP_403
+    finally:
+        reopened.close()

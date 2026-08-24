@@ -18,13 +18,11 @@ from __future__ import annotations
 import ast
 import inspect
 from collections.abc import Callable, Iterator, Sequence
-from dataclasses import dataclass
 from pathlib import Path
 
 import pytest
 
 from breezy.ingest.gate import (
-    CachePersistenceMisconfiguredError,
     GateState,
     InMemoryStateStore,
     SettlementGate,
@@ -48,6 +46,10 @@ from breezy.persistence.catalog import (
     FilesystemProbe,
     WriterLockFilesystemError,
     station_catalog_path,
+)
+from breezy.persistence.state_store import (
+    FileStateStore,
+    StateStoreError,
 )
 from breezy.registry.sites import SiteRegistry, default_registry
 
@@ -82,23 +84,6 @@ class FakeClock:
         self.now += ns
 
 
-@dataclass(frozen=True)
-class FakeKernelConfig:
-    save_state: bool = True
-    load_state: bool = True
-
-
-@dataclass(frozen=True)
-class FakeCacheConfig:
-    database: object | None = "postgres://cache"
-    flush_on_start: bool = False
-
-
-@dataclass(frozen=True)
-class FakeExecEngineConfig:
-    load_cache: bool = True
-
-
 class RecordingProbe:
     """A `probe_filesystem` stand-in whose verdict is fixed and whose calls are
     recorded, so per-station-root probing is assertable without a real mount.
@@ -117,6 +102,21 @@ class RecordingProbe:
             locality=self.locality,
             detail="fake probe",
         )
+
+
+@pytest.fixture(autouse=True)
+def _default_breezy_user_agent(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Give every test in this module a contact env var, by default.
+
+    `HttpTransport` (built internally by `SharedIngestState`) now fails fast
+    at construction when no contact is configured -- see
+    `breezy.ingest.http.MissingContactError` and the RED/GREEN pair in
+    `tests/unit/test_http_transport.py` that pins that behaviour. None of the
+    tests in this module are testing UA behaviour, so rather than pass
+    `user_agent=` through every `make_state()` call site, this autouse
+    fixture supplies a default `BREEZY_USER_AGENT` for the whole module.
+    """
+    monkeypatch.setenv("BREEZY_USER_AGENT", "breezy-test/1.0 (+mailto:breezy@jonathan.vc)")
 
 
 @pytest.fixture
@@ -159,9 +159,12 @@ def make_state(
             "catalog_base": tmp_path / "nws",
             "store": store,
             "clock": clock,
-            "kernel_config": FakeKernelConfig(),
-            "cache_config": FakeCacheConfig(),
-            "exec_engine_config": FakeExecEngineConfig(),
+            # The `store` fixture is an `InMemoryStateStore` -- not durable --
+            # so every test that does not care about the durability
+            # precondition opts out of it explicitly here. Tests that DO care
+            # (below) override this back to `True` against a real
+            # `FileStateStore`.
+            "require_durable_store": False,
             "probe": probe,
         }
         kwargs.update(overrides)
@@ -235,8 +238,11 @@ def test_a_failed_startup_precondition_does_not_wedge_the_process(
     leaving the process slot claimed by a half-built container would turn one
     config error into an unrecoverable one.
     """
-    with pytest.raises(CachePersistenceMisconfiguredError):
-        make_state(cache_config=FakeCacheConfig(flush_on_start=True))
+    with pytest.raises(StateStoreError):
+        # The `store` fixture is an `InMemoryStateStore`; `require_durable_store`
+        # (opted out of by every other test's `make_state` defaults) proves it
+        # is not durable and refuses to start.
+        make_state(require_durable_store=True)
 
     state = make_state()
 
@@ -248,22 +254,43 @@ def test_a_failed_startup_precondition_does_not_wedge_the_process(
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.parametrize(
-    "overrides",
-    [
-        {"kernel_config": FakeKernelConfig(save_state=False)},
-        {"kernel_config": FakeKernelConfig(load_state=False)},
-        {"cache_config": FakeCacheConfig(database=None)},
-        {"cache_config": FakeCacheConfig(flush_on_start=True)},
-        {"exec_engine_config": FakeExecEngineConfig(load_cache=False)},
-    ],
-)
-def test_each_of_the_five_cache_persistence_conditions_fails_closed(
+def test_a_non_durable_store_is_rejected_at_construction(
     make_state: Callable[..., SharedIngestState],
-    overrides: dict[str, object],
 ) -> None:
-    with pytest.raises(CachePersistenceMisconfiguredError):
-        make_state(**overrides)
+    """The replacement for the declined Cache-backed precondition:
+    `SharedIngestState` must refuse to start unless `store` is a genuinely
+    durable `FileStateStore` with its startup lock held -- an in-memory (or
+    otherwise non-durable) stand-in would let the `ua_trap_blocked` halt
+    latch be silently lost on every restart, which is exactly the failure
+    mode `assert_state_store_durable` exists to catch.
+    """
+    with pytest.raises(StateStoreError):
+        make_state(require_durable_store=True)
+
+
+def test_a_genuinely_durable_store_satisfies_the_precondition(
+    make_state: Callable[..., SharedIngestState],
+    tmp_path: Path,
+) -> None:
+    store = FileStateStore(tmp_path / "durable-state" / "state.json")
+    try:
+        state = make_state(store=store, require_durable_store=True)
+        assert state.store is store
+    finally:
+        store.close()
+
+
+def test_require_durable_store_false_opts_out_for_a_non_durable_double(
+    make_state: Callable[..., SharedIngestState],
+    store: InMemoryStateStore,
+) -> None:
+    """The explicit opt-out every other test in this module relies on via
+    `make_state`'s defaults, pinned directly: `require_durable_store=False`
+    must let a non-durable double through construction.
+    """
+    state = make_state(require_durable_store=False)
+
+    assert state.store is store
 
 
 def test_writer_lock_filesystem_is_probed_once_per_station_root(
@@ -300,8 +327,7 @@ def test_neither_precondition_is_an_import_time_side_effect() -> None:
     from breezy.ingest import shared_state
 
     guarded = {
-        "assert_cache_persistence_configured",
-        "cache_persistence_config_from",
+        "assert_state_store_durable",
         "assert_writer_lock_filesystem_supported",
         "probe_filesystem",
         "station_catalog_path",

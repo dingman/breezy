@@ -53,6 +53,7 @@ files = [
     "src/breezy/domain",
     "src/breezy/ingest",
     "src/breezy/persistence",
+    "src/breezy/settings.py",
 ]
 
 # pyarrow ships no stubs, and nautilus_trader's Data base is a compiled Cython

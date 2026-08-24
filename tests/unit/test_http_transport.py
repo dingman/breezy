@@ -17,13 +17,16 @@ import pytest
 import respx
 
 from breezy.ingest.http import (
+    DEFAULT_CONTACT,
     MAX_VALIDATOR_LENGTH,
+    USER_AGENT_ENV_VAR,
     ContentEncodingError,
     DecodeError,
     DisallowedHostError,
     ForbiddenError,
     HttpTransport,
     InvalidCacheValidatorError,
+    MissingContactError,
     OversizeBodyError,
     ProxyEnvironmentError,
     RateLimitedError,
@@ -109,6 +112,24 @@ def make_fetch_result(**overrides: object) -> object:
     }
     kwargs.update(overrides)
     return FetchResult(**kwargs)  # type: ignore[arg-type]
+
+
+@pytest.fixture(autouse=True)
+def _default_breezy_user_agent(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Give every test in this module a contact env var, by default.
+
+    `HttpTransport` construction now fails fast when no contact is
+    configured (see `test_construction_raises_when_contact_env_unset_and_no_override`
+    below) -- that is the security fix this module exists to verify. The
+    ~60 call sites above that construct via `make_transport()` with no
+    explicit `user_agent=` are not testing UA behaviour at all, so rather
+    than touch every one of them, this autouse fixture supplies a default
+    `BREEZY_USER_AGENT` for the whole module. Tests that specifically care
+    about the env var (unset, or a specific override) call
+    `monkeypatch.delenv`/`monkeypatch.setenv` themselves afterwards, on the
+    same `monkeypatch` fixture instance, and that later call wins.
+    """
+    monkeypatch.setenv(USER_AGENT_ENV_VAR, "breezy-test/1.0 (+mailto:breezy@jonathan.vc)")
 
 
 @pytest.mark.asyncio
@@ -277,15 +298,53 @@ async def test_generic_transport_failure_is_wrapped() -> None:
         await transport.fetch_discovery_list(CLI_LOCATION)
 
 
-@pytest.mark.asyncio
-@respx.mock
-async def test_user_agent_contains_contact(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.delenv("BREEZY_USER_AGENT", raising=False)
-    respx.get(URL).mock(return_value=httpx.Response(200, content=b"ok"))
-    transport = make_transport()
-    await transport.fetch_discovery_list(CLI_LOCATION)
-    sent_request = respx.calls.last.request
-    assert "breezy-data@gmail.com" in sent_request.headers["User-Agent"]
+def test_construction_raises_when_contact_env_unset_and_no_override(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """RED for the live security defect: no silent fallback to DEFAULT_CONTACT.
+
+    THIS TEST'S MEANING CHANGED. It used to be `test_user_agent_contains_contact`,
+    which deleted `BREEZY_USER_AGENT`, constructed a transport anyway, and
+    asserted the silently-substituted `DEFAULT_CONTACT` showed up on the wire.
+    That assertion *encoded the defect*: a misconfigured deployment would poll
+    NWS under an address nobody monitors, invisibly, until the permanent
+    blocklist landed. There is no well-formed behaviour left for the old
+    assertion to describe, so it is replaced rather than deleted quietly --
+    the failure mode it used to bless is now exactly what must raise.
+    """
+    monkeypatch.delenv(USER_AGENT_ENV_VAR, raising=False)
+    with pytest.raises(MissingContactError):
+        make_transport()
+
+
+def test_default_user_agent_helper_raises_when_env_unset(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Same defect, exercised directly against the helper `HttpTransport` calls."""
+    from breezy.ingest.http import _default_user_agent
+
+    monkeypatch.delenv(USER_AGENT_ENV_VAR, raising=False)
+    with pytest.raises(MissingContactError):
+        _default_user_agent()
+
+
+def test_construction_succeeds_with_explicit_user_agent_even_when_env_unset(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An explicit constructor argument is a valid, non-silent way to supply UA."""
+    monkeypatch.delenv(USER_AGENT_ENV_VAR, raising=False)
+    transport = make_transport(user_agent="breezy-test/1.0 (+mailto:breezy@jonathan.vc)")
+    assert isinstance(transport, HttpTransport)
+
+
+def test_default_contact_constant_still_documents_the_role_mailbox() -> None:
+    """`DEFAULT_CONTACT` survives as a documented value/test fixture only.
+
+    It must never again be reachable as a silent runtime default -- see the
+    two tests above -- but it is still the canonical example value quoted in
+    the fail-fast error message and used across fixtures/log-line docs.
+    """
+    assert DEFAULT_CONTACT == "breezy@jonathan.vc"
 
 
 @pytest.mark.asyncio

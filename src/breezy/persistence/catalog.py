@@ -181,8 +181,6 @@ autocomplete. There is deliberately no unbounded-by-default accessor.
 from __future__ import annotations
 
 import datetime as dt
-import errno
-import fcntl
 import os
 import re
 import stat
@@ -202,6 +200,14 @@ from nautilus_trader.persistence.catalog.parquet import ParquetDataCatalog
 from breezy.domain.nws_climate_day import NwsClimateDay
 from breezy.domain.nws_raw_product import NwsRawProduct
 from breezy.domain.selection import select_climate_day
+from breezy.persistence.filelock import (
+    FileLockContentionError,
+    FileLockError,
+    FileLockSymlinkError,
+    acquire_flock,
+    open_lock_fd,
+    release_flock,
+)
 
 __all__ = [
     "NETWORK_FILESYSTEM_TYPES",
@@ -230,12 +236,6 @@ _COMPONENT_PATTERN: Final[re.Pattern[str]] = re.compile(r"\A[A-Za-z0-9][A-Za-z0-
 _COMPONENT_MAX_LEN: Final[int] = 64
 
 WRITER_LOCK_FILENAME: Final[str] = ".breezy-writer.lock"
-
-# `open(..., O_NOFOLLOW)` on a symlink is ELOOP on Linux and EMLINK on the BSDs.
-# Both are treated as a path-safety failure rather than an environment failure;
-# either way the write is refused, so the only cost of the (vanishingly unlikely)
-# EMLINK-from-`mkdir` overlap is a less precise message on an already-loud abort.
-_SYMLINKED_LOCK_ERRNOS: Final[frozenset[int]] = frozenset({errno.ELOOP, errno.EMLINK})
 
 _Fingerprint = tuple[tuple[str, Any], ...]
 
@@ -823,23 +823,24 @@ def _writer_lock(catalog: ParquetDataCatalog) -> Iterator[None]:
     life of the process, so that check leaves a window as wide as the process.
     Under the lock the check is cheap, no other sanctioned writer can be midway
     through a write, and a failure aborts before `write_data` is reached.
+
+    A thin adapter over `breezy.persistence.filelock`'s OS mechanics (open +
+    `O_NOFOLLOW`, non-blocking `flock`, release): this module owns only the
+    translation into ITS OWN exception hierarchy (`CatalogPathError`,
+    `ConcurrentWriterError`, `WriterLockError`) and the station-root
+    re-verification, never the lock/open primitives themselves.
     """
     lock_path = Path(catalog.path) / WRITER_LOCK_FILENAME
 
     try:
-        lock_path.parent.mkdir(parents=True, exist_ok=True)
-        fd = os.open(lock_path, os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o644)
-    except OSError as exc:
-        if exc.errno in _SYMLINKED_LOCK_ERRNOS:
-            # Raised by `O_NOFOLLOW` when the lock path itself is a link, and by
-            # `mkdir` when one lies above it. Both are the same hazard, so the
-            # message names the condition rather than a specific component.
-            raise CatalogPathError(
-                f"refusing to follow a symlink at or above the writer lock path "
-                f"{lock_path}; a lock taken on a link's target does not exclude "
-                f"another writer on station root {catalog.path}",
-            ) from exc
-
+        fd = open_lock_fd(lock_path)
+    except FileLockSymlinkError as exc:
+        raise CatalogPathError(
+            f"refusing to follow a symlink at or above the writer lock path "
+            f"{lock_path}; a lock taken on a link's target does not exclude "
+            f"another writer on station root {catalog.path}",
+        ) from exc
+    except FileLockError as exc:
         raise WriterLockError(
             f"could not acquire the writer lock for station root {catalog.path}: "
             f"{exc}; nothing was read or written",
@@ -847,8 +848,8 @@ def _writer_lock(catalog: ParquetDataCatalog) -> Iterator[None]:
 
     try:
         try:
-            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except OSError as exc:
+            acquire_flock(fd, blocking=False)
+        except FileLockContentionError as exc:
             raise ConcurrentWriterError(
                 f"another process holds the writer lock for station root "
                 f"{catalog.path}; exactly one writer per station root is required "
@@ -859,7 +860,7 @@ def _writer_lock(catalog: ParquetDataCatalog) -> Iterator[None]:
             _require_real_directory(Path(catalog.path))
             yield
         finally:
-            fcntl.flock(fd, fcntl.LOCK_UN)
+            release_flock(fd)
     finally:
         os.close(fd)
 
@@ -952,7 +953,7 @@ def _read[RecordT: Data](
 # root" with NO exception and NO log -- exactly the silent degradation this
 # module exists to prevent. The precondition is not enforceable by `flock`
 # itself, so it is asserted at startup instead, mirroring
-# `breezy.ingest.gate.assert_cache_persistence_configured`.
+# `breezy.persistence.state_store.assert_state_store_durable`.
 
 
 class FilesystemLocality(str, Enum):
@@ -1121,9 +1122,11 @@ def assert_writer_lock_filesystem_supported(probe: FilesystemProbe) -> None:
             probe_filesystem(station_catalog_path(base, venue, city)),
         )
 
-    Takes the probe rather than the path, for the same reason
-    :func:`breezy.ingest.gate.assert_cache_persistence_configured` takes a config
-    object: every verdict is then reachable in a test without a real mount.
+    Takes the probe rather than the path so every verdict is reachable in a
+    test without a real mount --
+    :func:`breezy.persistence.state_store.assert_state_store_durable` reuses
+    this same function for exactly that reason when it certifies a
+    :class:`~breezy.persistence.state_store.FileStateStore`.
 
     Raises
     ------

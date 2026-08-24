@@ -30,10 +30,16 @@ written, against the installed ``nautilus_trader==1.231.0``:
   ``[n for n in dir(Actor()) if 'shared'/'service'/'registry'/'container' in n]``
   is empty.
 * ``Cache``'s general store is **bytes-keyed-by-str** (``cache/cache.pyx:1686``,
-  ``:2834``; ``Cache.add(key, object())`` raises ``TypeError`` -- executed). It
-  is a *persistence* seam, which is exactly how the gate and the index already
-  use it, and it structurally cannot hold a live ``SettlementGate``. So Nautilus
-  gives us the durable half for free and none of the object-identity half.
+  ``:2834``; ``Cache.add(key, object())`` raises ``TypeError`` -- executed), so
+  it structurally cannot hold a live ``SettlementGate`` either way. It was
+  also evaluated, separately, as the *persistence* seam behind
+  :class:`~breezy.ingest.gate.StateStore` and **declined**:
+  ``Cache.add`` fire-and-forgets its database write and ``Cache.get`` never
+  reads the database at all (measured against a killed Redis -- see
+  ``breezy.persistence.state_store`` module docstring), so a safety latch
+  backed by it can be silently lost. The gate and the index are instead
+  backed by :class:`breezy.persistence.state_store.FileStateStore`. Nautilus
+  therefore gives us neither half for free here.
 * ``MessageBus`` routes messages, not object references.
 * ``Trader.add_actor`` gives every Actor its **own** ``Clock`` instance
   (``trading/trader.py:342``, ``clock = self._clock.__class__()``). Five Actors
@@ -46,9 +52,11 @@ written, against the installed ``nautilus_trader==1.231.0``:
   ``ImportableActorConfig`` serialisation. It is not a shared-instance
   guarantee.
 
-**Conclusion:** Nautilus provides the durable key-value seam (used) and no
-per-process service container (built here, from Breezy-owned parts only). This
-module imports ``nautilus_trader`` nowhere and modifies it nowhere.
+**Conclusion:** Nautilus provides no reliably durable key-value seam (``Cache``
+was measured and declined; ``breezy.persistence.state_store.FileStateStore``
+is the Breezy-owned replacement) and no per-process service container (built
+here, from Breezy-owned parts only). This module imports ``nautilus_trader``
+nowhere and modifies it nowhere.
 
 **Wiring.** The composition root constructs one :class:`SharedIngestState` and
 passes it (or its components) into each Actor's ``__init__``. A second
@@ -70,8 +78,6 @@ from breezy.ingest.gate import (
     CrossSiteBurstPolicy,
     SettlementGate,
     StateStore,
-    assert_cache_persistence_configured,
-    cache_persistence_config_from,
 )
 from breezy.ingest.http import DEFAULT_BASE_URL, HttpTransport
 from breezy.ingest.product_index import ProductIntegrityIndex
@@ -81,6 +87,7 @@ from breezy.persistence.catalog import (
     probe_filesystem,
     station_catalog_path,
 )
+from breezy.persistence.state_store import assert_state_store_durable
 from breezy.registry.sites import SiteNotFoundError, SiteRegistry
 
 logger = logging.getLogger(__name__)
@@ -276,9 +283,10 @@ class SharedIngestState:
     :class:`DuplicateSharedIngestStateError`.
 
     Construction is startup: it runs both deployment preconditions of the
-    brief's SS6 step 0 -- ``assert_cache_persistence_configured`` (five
-    conditions across three config objects) and
-    ``assert_writer_lock_filesystem_supported`` per station root. Both are
+    brief's SS6 step 0 -- ``assert_state_store_durable`` (proves ``store`` is
+    a genuinely durable :class:`~breezy.persistence.state_store.FileStateStore`,
+    not merely one that structurally satisfies the ``StateStore`` protocol)
+    and ``assert_writer_lock_filesystem_supported`` per station root. Both are
     unenforceable later and silent when violated. Neither is an import-time
     side effect: nothing at this module's scope calls them.
 
@@ -302,9 +310,13 @@ class SharedIngestState:
         and the burst window. Nautilus gives every Actor its own ``Clock``
         object (``trading/trader.py:342``), so a cross-Actor signal cannot be
         timed off any single Actor's clock.
-    kernel_config, cache_config, exec_engine_config : object
-        Duck-typed ``NautilusKernelConfig`` / ``CacheConfig`` /
-        ``ExecEngineConfig``, forwarded to ``cache_persistence_config_from``.
+    require_durable_store : bool
+        Default ``True``. Runs ``assert_state_store_durable(store)`` at
+        construction, failing closed unless ``store`` is a genuinely durable
+        :class:`~breezy.persistence.state_store.FileStateStore` with its
+        startup lock held. Set ``False`` only for tests exercising something
+        other than this precondition, backed by a non-durable double such as
+        :class:`~breezy.ingest.gate.InMemoryStateStore`.
     burst_policy : CrossSiteBurstPolicy
         See :data:`DEFAULT_BURST_POLICY`.
     allowed_hosts, base_url, user_agent, check_proxy_env
@@ -323,9 +335,7 @@ class SharedIngestState:
         catalog_base: Path,
         store: StateStore,
         clock: Callable[[], int],
-        kernel_config: object,
-        cache_config: object,
-        exec_engine_config: object,
+        require_durable_store: bool = True,
         burst_policy: CrossSiteBurstPolicy = DEFAULT_BURST_POLICY,
         allowed_hosts: frozenset[str] = DEFAULT_ALLOWED_HOSTS,
         base_url: str = DEFAULT_BASE_URL,
@@ -348,9 +358,7 @@ class SharedIngestState:
             self._burst_policy = burst_policy
 
             self._assert_deployment_preconditions(
-                kernel_config=kernel_config,
-                cache_config=cache_config,
-                exec_engine_config=exec_engine_config,
+                require_durable_store=require_durable_store,
                 probe=probe,
             )
 
@@ -395,9 +403,7 @@ class SharedIngestState:
     def _assert_deployment_preconditions(
         self,
         *,
-        kernel_config: object,
-        cache_config: object,
-        exec_engine_config: object,
+        require_durable_store: bool,
         probe: Callable[[Path], FilesystemProbe],
     ) -> None:
         """Run both SS6 step-0 preconditions, once, at construction.
@@ -407,9 +413,8 @@ class SharedIngestState:
         happens not to have changed, and an ``flock`` on a network filesystem
         returns success while excluding nobody.
         """
-        assert_cache_persistence_configured(
-            cache_persistence_config_from(kernel_config, cache_config, exec_engine_config),
-        )
+        if require_durable_store:
+            assert_state_store_durable(self._store)
         self._station_roots: dict[tuple[str, str], Path] = {}
         for venue, city in self._sites:
             root = station_catalog_path(self._catalog_base, venue, city)

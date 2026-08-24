@@ -6,8 +6,12 @@ Governing rule (docs/plans/WEATHER_INGESTION_PROPOSAL.md §6):
 This module is deliberately Nautilus-free (no ``import nautilus_trader``
 here) so it stays unit-testable in complete isolation. The eventual ingest
 Actor is expected to construct a :class:`SettlementGate`, back its
-:class:`StateStore` with ``Cache.add``/``Cache.get``, and drive its injected
-clock from ``Actor.clock.timestamp_ns``.
+:class:`StateStore` with
+:class:`breezy.persistence.state_store.FileStateStore` (native ``Cache`` was
+measured and declined -- ``Cache.add`` fire-and-forgets its database write
+and ``Cache.get`` never reads the database at all, so a safety latch backed
+by it can be silently lost; see ``breezy.persistence.state_store`` module
+docstring), and drive its injected clock from ``Actor.clock.timestamp_ns``.
 
 Three states per ``(venue, city)`` site: ``OPEN``, ``DEGRADED``, ``BLOCKED``.
 A site **defaults to BLOCKED** until a successful verified poll -- an
@@ -45,6 +49,8 @@ from collections.abc import Callable
 from dataclasses import asdict, dataclass, replace
 from enum import Enum
 from typing import Any, Protocol
+
+from breezy.persistence.state_store import StateStoreCorruptError
 
 logger = logging.getLogger(__name__)
 
@@ -250,9 +256,10 @@ DEFAULT_BURST_POLICY = CrossSiteBurstPolicy(
 class StateStore(Protocol):
     """The minimal persistence seam this module needs.
 
-    The eventual ingest Actor backs this with ``Cache.add(str, bytes)`` /
-    ``Cache.get(str)``. Deliberately narrower than a full key-value store so
-    a fake for tests is a five-line class.
+    The eventual ingest Actor backs this with
+    :class:`breezy.persistence.state_store.FileStateStore` (``get``/``set``).
+    Deliberately narrower than a full key-value store so a fake for tests is
+    a five-line class.
     """
 
     def get(self, key: str) -> bytes | None: ...
@@ -262,7 +269,8 @@ class StateStore(Protocol):
 
 class InMemoryStateStore:
     """A trivial in-process :class:`StateStore`, for tests and standalone use
-    before an Actor wires in ``Cache.add``/``Cache.get``.
+    before an Actor wires in a durable
+    :class:`breezy.persistence.state_store.FileStateStore`.
     """
 
     def __init__(self) -> None:
@@ -473,6 +481,23 @@ def _blocking_causes(global_entry: _GlobalEntry, entry: _SiteEntry) -> tuple[Gat
     return tuple(causes)
 
 
+def _corruption_kind(exc: Exception) -> str:
+    """Diagnostic label distinguishing WHY persisted bytes were rejected --
+    an operator's response to each differs. :class:`StateStoreCorruptError`
+    means the store's own per-value CRC32 rejected bytes that were damaged
+    on disk (or, for a whole-file JSON parse failure, the container itself);
+    either way the bytes are physically wrong and the fix is a storage/disk
+    investigation. A ``ValueError``/``TypeError``/``KeyError`` means the
+    bytes were readable and CRC-clean but decoded to a shape this code does
+    not recognise -- the persisted SCHEMA has drifted (e.g. a rollback to an
+    older binary reading bytes a newer one wrote), and the fix is a
+    code/deploy investigation, not a disk one.
+    """
+    if isinstance(exc, StateStoreCorruptError):
+        return "CRC32-verified corruption: stored bytes were damaged on disk"
+    return "schema decode failure: persisted bytes do not match the expected shape"
+
+
 def _log_transition(venue: str, city: str, state: GateState, reason: GateReason, detail: str) -> None:
     level = logging.CRITICAL if reason in _CRIT_REASONS else _LOG_LEVEL_BY_STATE[state]
     logger.log(
@@ -551,36 +576,40 @@ class SettlementGate:
         cached = self._sites.get(key)
         if cached is not None:
             return cached
-        raw = self._store.get(_site_key(venue, city))
-        if raw is None:
-            entry = _SiteEntry()
-        else:
-            try:
-                entry = _site_entry_from_bytes(raw)
-            except (ValueError, TypeError, KeyError) as exc:
-                # Corrupt or schema-drifted bytes must never propagate as a
-                # bare decode exception out of status()/require_open() --
-                # every other blocked path funnels through GateBlockedError,
-                # and a caller doing the right thing (catching that type
-                # around require_open) must not crash on this one path
-                # instead. Fail closed to the default BLOCKED entry (never
-                # polled), stamped with a reason that tells an operator this
-                # was corruption, not an ordinary halt. The bad bytes are
-                # left untouched in the store -- this is a purely in-memory
-                # recovery, not a silent rewrite of forensic evidence.
-                logger.critical(
-                    "gate: corrupt persisted site state for venue=%s city=%s "
-                    "-- failing closed to BLOCKED. error=%s",
-                    venue,
-                    city,
-                    exc,
-                )
-                entry = replace(
-                    _SiteEntry(),
-                    last_reason=GateReason.CORRUPT_PERSISTED_STATE,
-                    last_detail=f"corrupt persisted bytes: {exc}",
-                    last_transition_ns=self._now(),
-                )
+        try:
+            raw = self._store.get(_site_key(venue, city))
+            entry = _SiteEntry() if raw is None else _site_entry_from_bytes(raw)
+        except (StateStoreCorruptError, ValueError, TypeError, KeyError) as exc:
+            # Corrupt or schema-drifted bytes must never propagate as a bare
+            # exception out of status()/require_open() -- every other
+            # blocked path funnels through GateBlockedError, and a caller
+            # doing the right thing (catching that type around require_open)
+            # must not crash on this one path instead. Fail closed to the
+            # default BLOCKED entry (never polled), stamped with a reason
+            # that tells an operator this was corruption, not an ordinary
+            # halt. The bad bytes are left untouched in the store -- this is
+            # a purely in-memory recovery, not a silent rewrite of forensic
+            # evidence. `self._store.get(...)` is INSIDE this try
+            # deliberately: the production FileStateStore raises
+            # StateStoreCorruptError (a RuntimeError, not a
+            # ValueError/TypeError/KeyError) straight out of `get()` itself
+            # on a CRC32 mismatch, before this code ever gets bytes to
+            # decode -- leaving that call outside the try let exactly that
+            # exception propagate uncaught.
+            logger.critical(
+                "gate: corrupt persisted site state for venue=%s city=%s "
+                "(%s) -- failing closed to BLOCKED. error=%s",
+                venue,
+                city,
+                _corruption_kind(exc),
+                exc,
+            )
+            entry = replace(
+                _SiteEntry(),
+                last_reason=GateReason.CORRUPT_PERSISTED_STATE,
+                last_detail=f"{_corruption_kind(exc)}: {exc}",
+                last_transition_ns=self._now(),
+            )
         self._sites[key] = entry
         return entry
 
@@ -598,13 +627,15 @@ class SettlementGate:
         cache-backed database is a correctness requirement, not an
         optimization to weigh against cost.
         """
-        raw = self._store.get(_GLOBAL_KEY)
-        if raw is None:
-            return _GlobalEntry()
         try:
+            raw = self._store.get(_GLOBAL_KEY)
+            if raw is None:
+                return _GlobalEntry()
             return _global_entry_from_bytes(raw)
-        except (ValueError, TypeError, KeyError) as exc:
-            # Same fail-safe posture as _load_site, but the conservative
+        except (StateStoreCorruptError, ValueError, TypeError, KeyError) as exc:
+            # Same fail-safe posture as _load_site (including
+            # `self._store.get(...)` being INSIDE this try for the identical
+            # reason -- see that method's comment), but the conservative
             # default for the GLOBAL flag is the opposite of neutral:
             # corrupted global bytes could have been a live UA-trap
             # block, and silently defaulting to "not blocked" would
@@ -613,14 +644,15 @@ class SettlementGate:
             # Block everything and require the same manual
             # acknowledge_ua_trap_resolved() clear a real UA-trap needs.
             logger.critical(
-                "gate: corrupt persisted global state -- failing closed, "
-                "BLOCKING ALL SITES. error=%s",
+                "gate: corrupt persisted global state (%s) -- failing "
+                "closed, BLOCKING ALL SITES. error=%s",
+                _corruption_kind(exc),
                 exc,
             )
             return _GlobalEntry(
                 ua_trap_blocked=True,
                 reason=GateReason.CORRUPT_PERSISTED_STATE,
-                detail=f"corrupt persisted bytes: {exc}",
+                detail=f"{_corruption_kind(exc)}: {exc}",
                 at_ns=self._now(),
             )
 
@@ -644,26 +676,30 @@ class SettlementGate:
         to the burst count -- failing OPEN on exactly the signal this module
         exists to fail closed on.
         """
-        raw = self._store.get(_site_key(venue, city))
-        if raw is None:
-            return _SiteEntry(), False
         try:
+            raw = self._store.get(_site_key(venue, city))
+            if raw is None:
+                return _SiteEntry(), False
             return _site_entry_from_bytes(raw), False
-        except (ValueError, TypeError, KeyError) as exc:
+        except (StateStoreCorruptError, ValueError, TypeError, KeyError) as exc:
+            # `self._store.get(...)` is INSIDE this try deliberately -- see
+            # `_load_site`'s comment for why leaving it outside let the
+            # production store's StateStoreCorruptError propagate uncaught.
             logger.critical(
                 "gate: corrupt persisted SIBLING site state for venue=%s city=%s "
-                "while evaluating cross-site burst evidence -- counting it TOWARD "
-                "the burst (fail toward halt, never toward silently suppressing "
-                "one). error=%s",
+                "(%s) while evaluating cross-site burst evidence -- counting it "
+                "TOWARD the burst (fail toward halt, never toward silently "
+                "suppressing one). error=%s",
                 venue,
                 city,
+                _corruption_kind(exc),
                 exc,
             )
             return (
                 replace(
                     _SiteEntry(),
                     last_reason=GateReason.CORRUPT_PERSISTED_STATE,
-                    last_detail=f"corrupt persisted bytes: {exc}",
+                    last_detail=f"{_corruption_kind(exc)}: {exc}",
                     last_transition_ns=self._now(),
                 ),
                 True,
@@ -1331,137 +1367,3 @@ class SettlementGate:
             detail=detail or f"final received for climate_day={climate_day}",
         )
         return self.status(venue, city)
-
-
-# ---------------------------------------------------------------------------
-# Cache-database startup assertion
-# ---------------------------------------------------------------------------
-#
-# Measured against the installed nautilus_trader==1.231.0 tree (never
-# assumed -- an earlier draft of this assertion was written against an
-# assumed surface and was wrong):
-#
-# - save_state / load_state live on ``NautilusKernelConfig``
-#   (nautilus_trader/system/config.py:122-123, both default False), which
-#   is the top-level node/engine config (e.g. ``TradingNodeConfig``) --
-#   NOT on ``ActorConfig`` (common/config.py:541-561, which has exactly
-#   ``component_id``/``log_events``/``log_commands``) or ``StrategyConfig``
-#   (trading/config.py:33-100, same story). An assertion reading
-#   ``actor_config.save_state`` either always raises against a real
-#   ``ActorConfig``, or was fed something that was never one.
-# - Even with save_state/load_state/``CacheConfig.database`` all correct,
-#   that is not sufficient for the gate's persisted state to actually
-#   survive a restart. ``Cache._general`` -- which backs this module's
-#   ``StateStore`` via ``Cache.add``/``Cache.get`` -- is repopulated from
-#   the database on a NEW process only via ``Cache.cache_general()``
-#   (cache/cache.pyx:279-304, which sets ``self._general = {}`` when no
-#   database is configured), reached only from
-#   ``ExecutionEngine.load_cache()`` (execution/engine.pyx:774-793), which
-#   the kernel invokes only when
-#   ``config.exec_engine.load_cache and not flush_on_start``
-#   (system/kernel.py:465-467, where
-#   ``flush_on_start = config.cache is not None and config.cache.flush_on_start``).
-#   Miss ``exec_engine.load_cache=True`` or ``cache.flush_on_start=False``
-#   and a UA-trap global halt -- the exact thing this module exists to
-#   make survive a crash-loop -- is silently lost on restart even though
-#   every other setting looks correct.
-#
-# Deployment therefore requires ALL FIVE: save_state, load_state,
-# cache.database set, exec_engine.load_cache=True, cache.flush_on_start=False.
-
-
-@dataclass(frozen=True, slots=True)
-class CachePersistenceConfig:
-    """The five settings that must ALL be correct for the gate's persisted
-    state to both be written (save_state/load_state/database) and actually
-    survive a NautilusTrader process restart (load_cache/flush_on_start).
-    """
-
-    save_state: bool
-    load_state: bool
-    database: object | None
-    load_cache: bool
-    flush_on_start: bool
-
-
-class CachePersistenceMisconfiguredError(Exception):
-    """Raised when any of the five required settings is wrong -- i.e. gate
-    persistence would be silently inert, or silently lost on restart.
-    """
-
-
-def assert_cache_persistence_configured(config: CachePersistenceConfig) -> None:
-    """Raise loudly unless all five required settings are correct.
-
-    Importable and callable without constructing a live Nautilus node --
-    callers build a :class:`CachePersistenceConfig` from real
-    ``NautilusKernelConfig``/``CacheConfig``/``ExecEngineConfig`` fields
-    (see :func:`cache_persistence_config_from`) or pass one directly in
-    tests.
-    """
-    missing: list[str] = []
-    if not config.save_state:
-        missing.append("NautilusKernelConfig.save_state=True (e.g. TradingNodeConfig.save_state)")
-    if not config.load_state:
-        missing.append("NautilusKernelConfig.load_state=True")
-    if config.database is None:
-        missing.append("CacheConfig.database (must not be None)")
-    if not config.load_cache:
-        missing.append("ExecEngineConfig.load_cache=True")
-    if config.flush_on_start:
-        missing.append("CacheConfig.flush_on_start=False")
-    if missing:
-        raise CachePersistenceMisconfiguredError(
-            "Gate persistence requires ALL FIVE of the following, or the "
-            "persisted state will not actually survive a restart (even "
-            "though on_save/on_load may appear to fire correctly): "
-            + "; ".join(missing)
-        )
-
-
-def cache_persistence_config_from(
-    kernel_config: object, cache_config: object, exec_engine_config: object
-) -> CachePersistenceConfig:
-    """Build a :class:`CachePersistenceConfig` from three config-shaped
-    objects.
-
-    - ``kernel_config``: duck-typed against ``save_state``/``load_state``.
-      Pass the ``NautilusKernelConfig`` (e.g. ``TradingNodeConfig`` or a
-      backtest engine config) -- NOT an ``ActorConfig``/``StrategyConfig``,
-      which carry neither field on the installed 1.231.0 tree.
-    - ``cache_config``: duck-typed against ``database``/``flush_on_start``.
-      Pass the ``CacheConfig``.
-    - ``exec_engine_config``: duck-typed against ``load_cache``. Pass the
-      ``ExecEngineConfig`` (or ``LiveExecEngineConfig``, which extends it).
-
-    Works with real Nautilus instances or fakes in tests without this
-    module importing ``nautilus_trader``.
-    """
-    if not hasattr(kernel_config, "save_state") or not hasattr(kernel_config, "load_state"):
-        raise CachePersistenceMisconfiguredError(
-            "kernel_config is missing save_state and/or load_state attributes -- "
-            "pass the NautilusKernelConfig (e.g. TradingNodeConfig), not an "
-            "ActorConfig/StrategyConfig, which carry neither field"
-        )
-    if not hasattr(cache_config, "database"):
-        raise CachePersistenceMisconfiguredError("cache_config is missing a 'database' attribute")
-    if not hasattr(cache_config, "flush_on_start"):
-        raise CachePersistenceMisconfiguredError(
-            "cache_config is missing a 'flush_on_start' attribute"
-        )
-    if not hasattr(exec_engine_config, "load_cache"):
-        raise CachePersistenceMisconfiguredError(
-            "exec_engine_config is missing a 'load_cache' attribute"
-        )
-    save_state = bool(kernel_config.save_state)
-    load_state = bool(kernel_config.load_state)
-    database = cache_config.database
-    flush_on_start = bool(cache_config.flush_on_start)
-    load_cache = bool(exec_engine_config.load_cache)
-    return CachePersistenceConfig(
-        save_state=save_state,
-        load_state=load_state,
-        database=database,
-        load_cache=load_cache,
-        flush_on_start=flush_on_start,
-    )

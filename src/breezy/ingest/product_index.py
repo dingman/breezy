@@ -26,11 +26,12 @@ the product said when we first saw it.
 clean slate, which is precisely the laundering this exists to prevent: crash,
 restart, re-observe the mutated bytes, and the mutation reads as first-seen.
 State therefore goes through an injected :class:`StateStore`, exactly as
-``ingest/gate.py`` does, and the Actor backs that with ``Cache.add`` /
-``Cache.get`` (which require all three of ``ActorConfig.save_state``,
-``ActorConfig.load_state`` and ``CacheConfig.database`` -- see
-``gate.assert_cache_persistence_configured``). Keys are namespaced under
-``productidx:`` so one store can serve both this index and the gate.
+``ingest/gate.py`` does, and the Actor backs that with a durable
+:class:`breezy.persistence.state_store.FileStateStore` -- certified at
+startup by ``state_store.assert_state_store_durable`` -- rather than native
+``Cache``, whose ``add``/``get`` were measured and declined (see the
+``state_store`` module docstring). Keys are namespaced under ``productidx:``
+so one store can serve both this index and the gate.
 
 **No gate dependency, by design.** A digest mismatch is a CRIT integrity signal,
 but this module does not call the gate -- it returns a typed outcome and the

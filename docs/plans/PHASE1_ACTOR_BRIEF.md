@@ -365,4 +365,4 @@ That is a very different failure mode from "settles against bad data", and it is
 
 ## 8. Standing constraints
 
-NautilusTrader is immutable — no monkeypatching, no vendored source, no writes into site-packages. Path components derive only from the registry object and a typed date, never from parsed product text. The User-Agent is the role mailbox `breezy-data@gmail.com`, never a personal address. TLS is never disabled. No commits.
+NautilusTrader is immutable — no monkeypatching, no vendored source, no writes into site-packages. Path components derive only from the registry object and a typed date, never from parsed product text. The User-Agent is the role mailbox `breezy@jonathan.vc`, never a personal address. TLS is never disabled. No commits.
