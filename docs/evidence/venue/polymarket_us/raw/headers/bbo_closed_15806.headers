@@ -1,0 +1,19 @@
+HTTP/2 200 
+date: Tue, 25 Aug 2026 00:20:13 GMT
+content-type: application/json
+content-length: 346
+vary: Origin
+x-pm-server-latency: 1
+x-pm-trace-id: 3c5f984d21a090aa285897f8a5698146
+accept-ranges: bytes
+last-modified: Tue, 25 Aug 2026 00:20:13 GMT
+expires: Tue, 25 Aug 2026 00:20:43 GMT
+cache-control: public, max-age=30
+cf-cache-status: EXPIRED
+set-cookie: __cf_bm=9sSxD0yaG6ThpSCcLiffWV9apxc8qLHgl_zXPCE4jmo-1787617213.2370815-1.0.1.1-BskAb.QHaUxdSoeYlYQdP3cOuoLyCWr.WpTLZ6mkzxA0nlo00blc7kcIZY2ukThJEpkB6Hf3SycP9f5oD5fEncHgz4DHx0gl2Nvv0aXcB2zs.2X34HSJq2GJiZsGRxul; HttpOnly; SameSite=None; Secure; Path=/; Domain=polymarket.us; Expires=Tue, 25 Aug 2026 00:50:13 GMT
+set-cookie: _cfuvid=tREtkYJbx.7I4wSdvIVZx8.LB68m2dGW1KySl1L.cRc-1787617213.2370815-1.0.1.1-D_5hx5CgAM8vlBAOlTa.pT5AOcQz6gCFQjOwBq7rJWw; HttpOnly; SameSite=None; Secure; Path=/; Domain=polymarket.us
+speculation-rules: "/cdn-cgi/speculation"
+server: cloudflare
+cf-ray: a3066dfeba04758e-DFW
+alt-svc: h3=":443"; ma=86400
+

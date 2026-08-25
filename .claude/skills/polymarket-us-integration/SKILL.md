@@ -80,7 +80,12 @@ Example:
 
 **Critical details**:
 - Include trailing slash if the path carries one.
-- Query string is INCLUDED in the path.
+- **Query string is EXCLUDED** — the canonical string is `timestamp + HTTP method + path` over the BARE path.
+  Evidence: `docs/evidence/venue/polymarket_us/docs_snapshots/api-reference_authentication_2026-08-25.md:82`
+  ("combining the timestamp, HTTP method, and path") and its worked example at line 94
+  (`message = f"{timestamp}{method}{path}"`); Polymarket's own SDK signs path-only at
+  `docs/evidence/venue/polymarket_us/sdk_snapshot/polymarket_us_0.1.2/auth.py:27`, building query
+  parameters separately. No venue source states that the query string is signed.
 - Sign the exact bytes of this concatenation using your Ed25519 private key.
 - Timestamp must be within 30 SECONDS of server time or the request fails silently.
 

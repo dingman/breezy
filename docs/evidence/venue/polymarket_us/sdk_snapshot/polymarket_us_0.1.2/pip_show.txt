@@ -1,0 +1,10 @@
+Name: polymarket-us
+Version: 0.1.2
+Summary: Polymarket US Python SDK
+Home-page: https://docs.polymarket.us
+Author: Polymarket Team
+Author-email: 
+License-Expression: MIT
+Location: /tmp/breezy-polyus-venue-facts-venv/lib/python3.14/site-packages
+Requires: httpx, pynacl, websockets
+Required-by: 

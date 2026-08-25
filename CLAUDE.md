@@ -27,7 +27,25 @@ Prefer the smallest correct extension. Avoid duplication, parallel architecture,
 
 The **main Claude session is a coordinator only**.
 
-It must delegate **all implementation, investigation, code analysis, testing, debugging, research, and other non-coordination work** to sub-agents and the **Codex Claude Code plugin**.
+It must delegate **all implementation, investigation, code analysis, testing, debugging, research, and other non-coordination work**. The main session never performs that work itself.
+
+### Delegation Order
+
+Route every unit of non-coordinator work in this order:
+
+1. **Codex first.** The **Codex Claude Code plugin** is the default destination for all implementation, investigation, debugging, and analysis work. Prefer it over Claude sub-agents whenever it can do the job.
+2. **Claude sub-agents second**, as the fallback — see the trigger below.
+
+**Fallback trigger.** Fall back to the standard sub-agent procedure (global CLAUDE.md §2: specialist fan-out, matched agent + skill, parallel seams) only when Codex is genuinely unusable, evidenced by one of:
+
+* `codex:setup` reports `ready: false`, or Codex is not installed / not authenticated.
+* Codex usage, quota, or rate limit is exhausted.
+* A hard tool error or PreToolUse block on the Codex path.
+* The work is Claude-native coordination surface that Codex cannot address (writing briefs, merging agent findings, plan/spec authoring).
+
+Report the fallback and its trigger — never fall back silently, and never let "Codex was busy" become an excuse to do the work inline.
+
+**Verification is unconditional.** Codex output is evidence to be checked, exactly like sub-agent output: verify claims against the artifact, require real RED→GREEN test output, and re-run gates yourself. Delegation moves the work, never the accountability.
 
 The main session may:
 
