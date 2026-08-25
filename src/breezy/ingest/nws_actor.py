@@ -144,7 +144,7 @@ from breezy.domain.nws_raw_product import NwsRawProduct
 from breezy.ingest import gaps
 from breezy.ingest.config import NwsIngestActorConfig
 from breezy.ingest.gate import GateReason, GateState, GateStatus, SettlementGate, StateStore
-from breezy.ingest.http import FetchResult, TransportError
+from breezy.ingest.http import REDACTION_MARKER, FetchResult, TransportError
 from breezy.ingest.nws_envelope import (
     DiscoveryEntry,
     NwsEnvelopeError,
@@ -280,7 +280,7 @@ def _scrub_failure_detail(exc: BaseException) -> str:
     """
     kind = type(exc).__name__
     message = str(exc).split("\n", 1)[0]
-    message = _UNSAFE_DETAIL_TOKEN.sub("<redacted>", message)
+    message = _UNSAFE_DETAIL_TOKEN.sub(REDACTION_MARKER, message)
     message = _UNSAFE_DETAIL_CHARS.sub(" ", message)
     message = " ".join(message.split())
     if len(message) > LEDGER_DETAIL_MAX_CHARS:

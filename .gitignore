@@ -2,5 +2,12 @@
 __pycache__/
 *.py[cod]
 .env
+.env.*
+.polymarket-us-credentials.json
+*.pem
+*.key
+*.secret
+*.credentials
+secrets/
 .coverage
 .coverage.*

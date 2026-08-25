@@ -269,6 +269,16 @@ def assert_clean_proxy_env(approved: frozenset[str] | set[str] | None = None) ->
         )
 
 
+#: The ONE token substituted for any redacted value anywhere in Breezy.
+#: Defined in this (lowest) layer so the adapter redaction surface can
+#: re-export it instead of declaring a second literal that can drift.
+#:
+#: Deliberately bare and URL-safe: a marker carrying angle brackets is
+#: percent-encoded by ``urlencode`` into ``%3Credacted%3E`` inside a query
+#: string, so it could never be the same token in all three contexts.
+REDACTION_MARKER: str = "REDACTED"
+
+
 def redact_url(url: str) -> str:
     """Return ``url`` with query-parameter values and userinfo removed.
 
@@ -283,7 +293,7 @@ def redact_url(url: str) -> str:
     if not parts.query:
         return urlunsplit((parts.scheme, netloc, parts.path, "", parts.fragment))
     redacted_pairs = [
-        (key, "REDACTED") for key, _ in parse_qsl(parts.query, keep_blank_values=True)
+        (key, REDACTION_MARKER) for key, _ in parse_qsl(parts.query, keep_blank_values=True)
     ]
     redacted_query = urlencode(redacted_pairs)
     return urlunsplit((parts.scheme, netloc, parts.path, redacted_query, parts.fragment))

@@ -10,6 +10,13 @@ requires-python = ">=3.13"
 dependencies = [
     "nautilus-trader~=1.231",
     "httpx>=0.28",
+    # CORE, not an extra, and pinned exactly. `signing.py` imports `nacl` at
+    # module scope and holds order-submission barrier B2 (the signer refuses
+    # any method but GET). Behind the `polymarket-us` extra the barrier's test
+    # suite SKIPPED on a default checkout -- a guard that never runs is
+    # indistinguishable from a guard that passes. Exact pin because this is
+    # the cryptographic primitive under a safety barrier.
+    "pynacl==1.6.2",
 ]
 
 [dependency-groups]
@@ -27,15 +34,18 @@ dev = [
 
 [project.optional-dependencies]
 backfill = ["pyiem==1.27.0"]
+polymarket-us = ["polymarket-us==0.1.2"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 asyncio_mode = "strict"
-addopts = "-q --strict-markers --strict-config -m 'not live'"
+addopts = "-q --strict-markers --strict-config -m 'not live and not venue_live and not real_money'"
 markers = [
     "contract: pins verified NautilusTrader 1.231.0 behaviour; run first on any version bump",
     "replay: live/backtest parity tests",
     "live: performs REAL network I/O against api.weather.gov and needs BREEZY_LIVE=1; deselected by default",
+    "venue_live: performs REAL network I/O against a prediction venue and needs BREEZY_VENUE_LIVE=1; deselected by default",
+    "real_money: can place or affect real-money venue orders and needs BREEZY_REAL_MONEY=1 plus operator approval; deselected by default",
 ]
 
 [tool.ruff]
@@ -53,6 +63,7 @@ extend-select = ["E501"]
 python_version = "3.13"
 strict = true
 files = [
+    "src/breezy/adapters",
     "src/breezy/normalize",
     "src/breezy/registry",
     "src/breezy/settlement",
@@ -60,6 +71,46 @@ files = [
     "src/breezy/ingest",
     "src/breezy/persistence",
     "src/breezy/runtime",
+
+    # The venue slice. The operator EXECUTES the smoke script against
+    # PRODUCTION credentials, so it must be typechecked, and so must the test
+    # doubles that claim to model the real classes.
+    #
+    # Scoped to `scripts/venue` rather than all of `scripts`: `scripts/analysis`
+    # is owned by the settlement seam and currently carries 5 pre-existing
+    # strict errors (settlement_bucket_gate.py:189,466 x2;
+    # settlement_alignment_diagnosis.py:473,482). Widening the gate over another
+    # seam's live work is that seam's call, not this one's -- the errors are
+    # reported rather than silently absorbed or silently skipped.
+    #
+    # `tests/` is likewise not checked wholesale: it carries 159 pre-existing
+    # strict errors across 38 files. The polymarket_us tests are enumerated
+    # because THIS slice's doubles must not drift from the classes they model.
+    "scripts/venue",
+    "tests/unit/test_polymarket_us_auth_smoke.py",
+    "tests/unit/test_polymarket_us_config.py",
+    "tests/unit/test_polymarket_us_credential_gate.py",
+    "tests/unit/test_polymarket_us_credential_serialization.py",
+    "tests/unit/test_polymarket_us_data.py",
+    "tests/unit/test_polymarket_us_dependency_pin.py",
+    "tests/unit/test_polymarket_us_env.py",
+    "tests/unit/test_polymarket_us_errors.py",
+    "tests/unit/test_polymarket_us_exception_leak.py",
+    "tests/unit/test_polymarket_us_factories.py",
+    "tests/unit/test_polymarket_us_fee_guard.py",
+    "tests/unit/test_polymarket_us_http.py",
+    "tests/unit/test_polymarket_us_package_exports.py",
+    "tests/unit/test_polymarket_us_parsing.py",
+    "tests/unit/test_polymarket_us_phase0_safety.py",
+    "tests/unit/test_polymarket_us_provider.py",
+    "tests/unit/test_polymarket_us_readonly_guard.py",
+    "tests/unit/test_polymarket_us_redaction.py",
+    "tests/unit/test_polymarket_us_secret_exposure.py",
+    "tests/unit/test_polymarket_us_signing.py",
+    "tests/unit/test_polymarket_us_symbology.py",
+    "tests/unit/test_polymarket_us_taxonomy.py",
+    "tests/unit/test_polymarket_us_transport.py",
+    "tests/unit/test_polymarket_us_websocket.py",
 ]
 
 # pyarrow ships no stubs, and nautilus_trader's Data base is a compiled Cython
@@ -81,6 +132,15 @@ disallow_subclassing_any = false
 # that has no such excuse.
 [[tool.mypy.overrides]]
 module = ["breezy.ingest.nws_actor"]
+disallow_subclassing_any = false
+
+# Same compiled-Cython-erases-to-Any reason as above, for the two venue-slice
+# modules that subclass one. `Actor` (smoke script's QuoteWitness) and `Logger`
+# (the leak suite's recording logger) are both Cython classes. Named
+# individually, never package-wide: a broad waiver would silently cover future
+# code with no such excuse.
+[[tool.mypy.overrides]]
+module = ["polymarket_us_auth_smoke", "tests.unit.test_polymarket_us_exception_leak"]
 disallow_subclassing_any = false
 
 [project.scripts]
