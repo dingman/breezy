@@ -1,0 +1,11 @@
+{
+  "cache_dir": "/tmp/breezy-settlement-alignment-cache",
+  "captured_by": "breezy settlement bucket guard-band analysis script",
+  "catalog_base": "/tmp/claude-1000/-home-jon-breezy/34299567-3c3b-4763-afa6-a66114aa4e2b/scratchpad/settlement-catalog-snapshot-2026-08-25T021936Z",
+  "command": "/home/jon/breezy/.venv/bin/python3 scripts/analysis/settlement_bucket_guard_band.py --catalog-base /tmp/claude-1000/-home-jon-breezy/34299567-3c3b-4763-afa6-a66114aa4e2b/scratchpad/settlement-catalog-snapshot-2026-08-25T021936Z --cache-dir /tmp/breezy-settlement-alignment-cache --output docs/evidence/settlement_bucket_guard_band_2026-08-26.md",
+  "note": "Digest sidecar for post-hoc exploratory guard-band evidence report.",
+  "pre_registration": "docs/evidence/settlement_bucket_guard_band_prereg_2026-08-26.md",
+  "retrieved_at": "2026-08-26T01:53:41+00:00",
+  "sha256": "9857648af49405c3e3aeead45aea997a5ffef205f61906bcd2aa49db388d7f86",
+  "url": "local offline study"
+}

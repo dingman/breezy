@@ -6,6 +6,17 @@ State of the work. Backlog items are tracked here, not in the design docs.
 
 ## Phase 1 — NWS ingestion substrate: BUILT AND LIVE-VALIDATED (2026-08-23)
 
+> **[CORRECTION 2026-08-24] The catalog described in this section no longer
+> exists.** The 14 persisted climate days, the `14/14` digest re-verification
+> and the restart-dedupe run below were all real when written, but the catalog
+> they were written to is gone — most likely a `BREEZY_CATALOG_BASE` pointed at
+> a tmpfs path that did not survive a reboot. Nothing was collecting between
+> that loss and 2026-08-24T19:45:54Z. **Treat every record count in this
+> section as historical, not as data on disk.** Current on-disk state is in
+> "Collection re-established" below. The code claims in this section still
+> stand; only the data does not.
+
+
 Design: `docs/plans/WEATHER_INGESTION_PROPOSAL.md` (v6, operator-approved 2026-08-22)
 and `docs/plans/PHASE1_ACTOR_BRIEF.md`.
 
@@ -147,6 +158,88 @@ Observed real-data confirmations: record-qualifier suffixes (`96R`, `100R`)
 parse to bare integers; the `VALID TODAY AS OF` FINAL/PRELIMINARY
 discriminator is correct in both directions; Miami 2026-08-19 captured a real
 5 F settlement-relevant revision, preliminary `tmin=81` to final `tmin=76`.
+
+---
+
+## Collection re-established after total catalog loss (2026-08-24)
+
+**Status: LIVE.** All five venue sites collecting on durable storage.
+
+### What was lost
+
+The catalog backing every record count in the Phase 1 sections above was gone,
+and nothing had been collecting for an unknown interval ending
+2026-08-24T19:45:54Z. No parquet, no `breezy-state*`, no bootstrap witness
+existed anywhere under `/home/jon`, and `BREEZY_CATALOG_BASE` was unset. The
+evidence documents were accurate at the time of writing; the storage they
+described did not survive.
+
+### Deployment now in place
+
+| | |
+|---|---|
+| `BREEZY_CATALOG_BASE` | `/home/jon/.local/share/breezy/catalog` (0700) |
+| Filesystem | **ext4, 543G free — verified not tmpfs** |
+| State DB | derived: `<base>/state/breezy-state.sqlite3` |
+| Env file | `/home/jon/.config/breezy/breezy.env` (0600) |
+| Unit | `~/.config/systemd/user/breezy-nws-ingest.service`, enabled, lingering on |
+| `BREEZY_SITES` | all five: `polymarket_us:{NYC,SFO,MIA,MDW,LAX}` |
+| `BREEZY_USER_AGENT` | set to a real role mailbox in the env file |
+
+Chosen over the runbook's `/var/lib/breezy` + `_breezy` service user because
+that path needs root; the runbook production posture remains the documented
+target and is unchanged.
+
+### First-poll evidence (2026-08-24)
+
+Cold start 19:45:54Z. First poll per site, on the designed 0/60/120/180/240s
+anti-UA-trap stagger:
+
+| Site | Predicted | Actual | Records | Gate |
+|---|---|---|---|---|
+| NYC | 19:50:55 | 19:51:04 | 28 | OPEN |
+| SFO | 19:51:55 | 19:52:03 | 28 | OPEN |
+| MIA | 19:52:55 | 19:53:04 | 28 | OPEN |
+| MDW | 19:53:55 | 19:54:04 | 30 | OPEN |
+| LAX | 19:54:55 | 19:55:08 | 38 | OPEN |
+
+152 records, 10 parquet files, both `custom_nws_climate_day` and
+`custom_nws_raw_product` datasets per site.
+
+**Seven climate days recovered (2026-08-17 .. 2026-08-23) on all five sites**,
+each with both a PRELIMINARY and a FINAL product. 2026-08-17 was recovered with
+**zero days of margin** against assumed NWS retention — the restart won that
+race by less than a day.
+
+### What this validated, unprompted, on live data
+
+- **The fail-closed gate works as designed.** Every site defaulted to
+  `BLOCKED / final_cli_overdue` with no history, then transitioned to
+  `OPEN / final_received` only on a real FINAL product for 2026-08-23. This is
+  the SettlementGate's core claim, observed in production rather than in a test.
+- **The stagger works as designed.** Actual first-fire times matched the
+  `site_stagger_offset_seconds(index, 5, 300)` prediction to within 9s, giving
+  one request per 60s to `api.weather.gov` under a single User-Agent instead of
+  a five-way simultaneous burst.
+- **The durability probe is now armed** (`durability:probe` row in the state
+  DB) — the guard that would have caught the original loss.
+
+### [OPEN] Non-uniform record counts across sites — unverified inference
+
+Same seven days and the same product pair per day yielded 28/28/28/**30**/**38**.
+The extra records on MDW (+2) and LAX (+10) are *most likely* correction or
+revision products, which would make LAX the highest-revision site and give the
+preliminary->final revision-rate study its first live sample. **This is an
+inference from record counts and has not been verified** — extra METAR
+observations for those stations are equally consistent with the numbers.
+Confirm before relying on it.
+
+### [LOW] Misleading gate log line: `state=BLOCKED reason=successful_poll`
+
+At 19:51:04Z NYC logged a BLOCKED transition whose stated reason was a
+*successful* poll, superseded ~200ms later by the OPEN transition. The gate
+re-derives per call so this is cosmetic rather than functional, but the reason
+string is contradictory and should be corrected.
 
 ---
 
@@ -317,10 +410,13 @@ the layer contracts or drop the dependency.
 
 Pre-existing cosmetic drift. Formatting is not currently part of any gate.
 
-### [UNPROVEN] MDW is the only venue site not in the four-site live proof
+### [RESOLVED 2026-08-24] MDW now has a live proof
 
-NYC, SFO, MIA and LAX now have the 2026-08-24 live proof recorded in
-`docs/evidence/ingestion/LIVE_RUN_2026-08-24.md`. MDW does not.
+Closed by the 19:45:54Z collection restart: MDW polled at 19:54:04Z and
+persisted 30 records with its gate transitioning to OPEN on `final_received`
+for climate day 2026-08-23, alongside the other four sites. All five venue
+sites now have a live proof. Evidence:
+`docs/evidence/ingestion/COLLECTION_RESTART_2026-08-24.md`.
 
 ### [UNPROVEN] No CORRECTION product appeared in the live window
 
@@ -466,3 +562,383 @@ is **not demonstrated by that run's evidence** and remains unverified.
 
 **Action:** verify post-persist ledger/snapshot convergence over a multi-cycle
 run before relying on either artifact for alerting.
+
+---
+
+## Venue quote-tape recorder: BUILT, REVIEWED, NOT YET RUNNING (2026-08-26)
+
+Work item 1.1 of `docs/plans/TRADING_ENABLEMENT_PLAN.md`. **Uncommitted.**
+**Not started collecting** — gated on a live run (see "Gating item" below).
+
+### Why this and not a strategy or a backtest
+
+Backtesting was impossible and remains so for any period before the tape
+starts: a backtest needs the weather series AND the market price series
+aligned in time, and no Polymarket.us price history exists or can be
+obtained. Polymarket.us weather markets did not exist before 2026, so no
+vendor can backfill them. Weather history IS retroactively available (the
+alignment study drew ~1,800 city-days per site from the IEM archive), which
+makes the price tape the only irreversible item on the critical path: every
+uncaptured day is permanently lost. Strategy, sizing, execution client and
+settlement package can all be built later from a standing start.
+
+### What was built
+
+Native Nautilus persistence, verified NATIVE SUFFICIENT by execution rather
+than by reading: `StreamingConfig` / `StreamingFeatherWriter` wired at
+`runtime/node_config.py::build_quote_tape_node_config`, plus a
+`breezy-quote-tape` entrypoint. **No bespoke persistence layer was written.**
+
+Captured: `QuoteTick`, `OrderBookDepth10`, `TradeTick`, `MarkPriceUpdate`,
+`InstrumentClose`, `InstrumentStatus`, and four custom records —
+`QuoteTapeGap`, `VenueClockOffset`, `VenueSettlementSnapshot`,
+`DepthTruncation`.
+
+Gates at the close of pass 4 (final): `pytest` 2412 passed / exit 0; `mypy`
+clean over 88 source files; `ruff` 9 findings, all pre-existing in the vendored
+`docs/evidence/**/sdk_snapshot/`. All three independently re-run by the
+coordinator, not accepted from agent reports.
+
+### A regression this introduced and closed
+
+A first attempt made seven `POLYMARKET_US_*` variables unconditionally
+required in `load_settings()`, which broke the startup path of the LIVE NWS
+collector — it would have failed on restart. 90 test errors. Fixed by role
+separation (`PolymarketUSQuoteTapeSettings` / `load_quote_tape_settings`),
+not by defaults, which would have started the recorder half-configured and
+silently recording nothing. Pinned by
+`tests/unit/test_nws_ingest_settings_role_isolation.py`.
+
+### Three silent-data-loss traps found in Nautilus and in our own code
+
+1. `StreamingFeatherWriter` **discards a quote with no exception and no log**
+   when the instrument is absent from the `Cache` (`writer.py:228-238`).
+2. `OrderBookDepth10.__init__` pads a short side with `NULL_ORDER` at
+   precision 0; the Arrow encoder then rejects the record, and
+   `writer.write` swallows that into a log line (`writer.py:284-288`). A
+   thin book — i.e. a quiet weather market — would have vanished silently.
+   We now pad at the instrument's own precision.
+3. Ours: `resolved_gaps_by_seq` keyed on `gap_seq` alone, but `gap_seq` is
+   per-instrument, so two cities collided and one city's outage was silently
+   discarded while the other's boundaries were stamped onto it. A
+   contamination filter that is confidently wrong is worse than none.
+
+All three are contract-tested so an upstream change fails RED.
+
+### Two venue facts corrected against the committed captures
+
+- **The venue does not emit ten levels.** `book_open_510636.json` carries 12
+  bids and 14 offers. `OrderBookDepth10` truncates; `DepthTruncation`
+  records how many levels were dropped per frame, not what they were.
+  Slippage measured from this tape is valid only to level ten.
+- **`settlementPx` on an OPEN market is a daily mark, not a settlement.**
+  Open: `settlementPx == closePx == 0.4900`, method `..._EVENT_TIER_2`.
+  Expired: `settlementPx = 1.0000`, no `closePx`, method `..._EVENT_TIER_1`.
+  The venue distinguishes the regimes by its own enum. Recording the open-
+  market value as a settlement would have fabricated a settled price into an
+  archive that can never be re-recorded. `InstrumentClose` now requires a
+  terminal state AND `TIER_1`.
+
+### Review outcome
+
+Three independent axes over two rounds. Domain: original CRITICAL closed
+(levels beyond 10 are far-OTM dust, not liquidity near the best). Security:
+read-only cage INTACT and measurably hardened — `transport.py` B3 replaced a
+bound method whose `__self__` reached the pyo3 client with a `_GetOnlyCallable`
+closure, plus a runtime receiver-graph scanner. Code: approve, with the
+mutation check independently reproduced (parse-depth-and-discard fails
+exactly 3 tests).
+
+One documented claim was found FALSE and removed rather than left standing:
+`max_file_size` is never consulted under `rotation_mode=SCHEDULED_DATES`
+(`writer.py:305-318` is an `if/elif` chain), so the "512 MB backstop" was
+dead code asserting a bound the code did not provide. **One day's tape file
+is unbounded. Accepted and unmitigated — needs external disk alerting.**
+
+### Gating item — do NOT start continuous capture until this passes
+
+**No live run has happened.** Zero authenticated calls, zero live-network
+verification; every venue host in every test is `.invalid`. 2401 green tests
+do not establish that a real frame reaches parquet. This is exactly the
+standing lesson of this repo.
+
+`MARKET_SLUG_KEY = "marketSlug"` remains an **unresolved venue guess** and
+every routing decision rests on it. If it is wrong the recorder captures
+nothing and looks exactly like a quiet market.
+
+Live venue tests are behind the deliberate three-lock gate of
+`docs/plans/POLYMARKET_US_READONLY_AUTH_PLAN.md` D2 (`BREEZY_VENUE_LIVE=1`
+AND `BREEZY_ALLOW_CREDENTIALED_PYTEST=1` AND the `--venue-live` flag). That
+gate exists so no automation trips it incidentally; unlocking it is an
+operator decision.
+
+### Other open, disclosed limitations
+
+- Trade frame schema UNRESOLVED — `TRADE_CONTAINER_KEY` and the taker-side
+  mapping are inferred. Fail-closed: an unrecognised side maps to
+  `NO_AGGRESSOR`, never a guessed direction.
+- `EXPIRED_MARKET_STATES` partly speculative; only observed states confirmed.
+- `tape_gaps` is a LOWER BOUND. `QuoteTapeGap` now carries a
+  `recorder_instance_id` sourced from the native `NautilusKernelConfig.instance_id`
+  (the same value that names the streaming directory), and
+  `resolved_gaps_by_seq` keys on `(recorder_instance_id, instrument_id, gap_seq)`.
+  The FIELD makes correct partitioning possible; nothing FORCES a consumer to
+  use it, so a consumer iterating raw catalog rows still inherits the
+  under-exclusion hazard. Loader-side enforcement is outstanding.
+- **Void/cancel settlements are unhandled and deliberately unguessed.**
+  `parse_instrument_close` emits `CONTRACT_EXPIRED` unconditionally on a TIER_1
+  terminal frame, so a voided market arriving under TIER_1 would be recorded as
+  a genuine settlement. No evidence either way exists in the captures. This is a
+  `polymarket-us-discovery` live-probe question, not a coding one.
+- Strike-ladder coverage of configured slugs is unverified.
+- `VenueSettlementSnapshot.settlement_px` is a verbatim string; no rounding
+  decision has been made.
+
+### Settlement premise: still unvalidated, and the gate may be the wrong shape
+
+The pre-registered 2 F bucket-alignment gate FAILED all five cities. A
+post-hoc boundary guard-band sweep (`docs/evidence/settlement_bucket_guard_band_2026-08-26.md`)
+did NOT rescue it — agreement DEGRADES as the guard tightens (0.764 -> 0.688)
+while retention collapses to 12.97%.
+
+The residual is not boundary noise. It is a one-directional bias: misses go
+from 68.5% to 99.3% "METAR below CLI" as the guard tightens, and NYC is
+~99.6% one-directional at every band. KNYC (Central Park) reports ~29
+observations/day against ~306 at the airport ASOS sites — sparse sampling
+systematically misses the true daily maximum. **Systematic bias is
+correctable; boundary noise is not.**
+
+Open question, NOT yet tested: the bucket gate is SYMMETRIC, but the Tier-1
+rule is ASYMMETRIC — it only buys once the observed running max has already
+cleared the strike, and refuses the P~0 side. A negative bias is the
+conservative direction for that rule. Testing the asymmetric form needs its
+own pre-registration and an adversarial domain review; it must not be
+adopted as a rescue without one.
+
+---
+
+## GO LIVE backlog (opened 2026-08-26)
+
+Roadmap: `docs/plans/GO_LIVE_PLAN.md`. Per-item execution plans:
+`docs/plans/backlog/G-*.md`.
+
+**Scope boundary:** this backlog covers work up to — and deliberately NOT
+including — the forecast model. Populating `src/breezy/features/` and
+`src/breezy/settlement/` (both currently 0 bytes), the probability estimator,
+calibration, sizing and the execution client are Phase E/F and are not opened
+here. They are entered only on a Phase D GO.
+
+Status vocabulary: `TODO` / `IN PROGRESS` / `GREEN` / `BLOCKED (<unlock>)`.
+
+### Phase B — free falsification (no venue, no credentials, no wait)
+
+- **G-01 — Preliminary→final revision-rate study (DOM-11).** `GREEN (result: UNDERPOWERED)`
+  Pre-registered, run, reported. N=44 against a pre-registered floor of N>=90
+  per site. LAX 0/8, MDW 0/9, MIA 0/9, NYC **2/9 (0.222, Wilson [0.063, 0.547])**,
+  SFO 0/9. No PASS claim is valid. Evidence:
+  `docs/evidence/preliminary_final_revision_2026-08-26.md`. NYC's revision rate,
+  though underpowered, is a warning for the post-preliminary window DOM-11
+  proposed as possibly dominating Tier 1. The item is green because the study
+  was executed and honestly reported; the *finding* is that more data is needed.
+  Measure the preliminary-CLI → final-CLI revision rate per site from the
+  catalog already on disk. Prices the post-preliminary-CLI window, which the
+  domain review judges may dominate Tier 1. Pre-register before running.
+- **G-02 — ROI feasibility arithmetic (DOM-13).** `GREEN (verdict: NO-GO)`
+  Per 100 contracts per city-day cluster: pessimistic ~$3/day net, central
+  ~$9/day net, optimistic ~$15/day net. **NO-GO for committing to the downstream
+  adapter / settlement / execution build** on current worked-example economics;
+  free falsification and irreversible tape capture stay in scope. Evidence:
+  `docs/evidence/roi_feasibility_2026-08-26.md`. Theta sensitivity moves the
+  five-city p=0.97 result by only ~$1/day per 500 contracts, so G-15 fee
+  discovery will not rescue it. Breadth moves the central case from ~$6/day
+  (three cities) to ~$9/day (five).
+  Programme-level gross/net ROI estimate before committing to 63 blocking
+  requirements. Central estimate from the worked example is tens of dollars
+  per day gross. Written GO/NO-GO.
+- **G-03 — Asymmetric-gate pre-registration + adversarial review.** `IN PROGRESS`
+  `docs/evidence/asymmetric_gate_prereg_2026-08-26.md` at **revision 6**.
+  Adversarially reviewed **five times, BLOCK every time**. The loop is
+  converging and each round found a real defect — see the standing lesson on the
+  paper-close pattern. Round 1 falsified the document's own central premise
+  (MDW runs the dangerous direction). Round 5 found the power floor could be
+  mathematically **undefined**, not merely large. Computation (G-17) remains
+  **NOT AUTHORISED**, which is the correct state.
+  The failed 2 °F gate is SYMMETRIC; the Tier-1 rule is ASYMMETRIC. Write the
+  pre-registration and obtain an adversarial domain review **before** testing.
+  Must not be adopted as a post-hoc rescue.
+
+### Phase C — amendment set (`TRADING_ENABLEMENT_PLAN.md` is BLOCK)
+
+- **G-04 — STK-1: pyo3 socket escape in the test suite.** `GREEN (with stated residual)`
+  RED test reproduced the escape against a closed loopback port
+  (`HttpError ... Connection refused (os error 111)` while the Python socket
+  block read green), then closed it. `tests/unit/test_pyo3_network_block.py`.
+  **Residual, not overclaimed:** this is an in-process constructor block for
+  known Nautilus pyo3 HTTP/WebSocket clients, NOT a kernel-level egress block.
+  A complete OS/process-level block still needs an external network namespace
+  or CI firewall.
+  **Safety-critical, ahead of the document work.** The autouse socket blocker
+  patches Python's `socket` only; a `nautilus_pyo3` client reached the OS while
+  the gate read green. An ordinary `uv run pytest -q` could transmit a signed
+  order. Needs a RED test proving the escape, then a real block.
+- **G-05 — STK-10: pin `nautilus-trader==1.231.0`.** `GREEN`
+  Pinned in `pyproject.toml` and `uv.lock`; `uv lock --check` exit 0; contract
+  suite passes against the pin.
+  Currently `~=1.231` while the whole `contract/` suite pins measured 1.231.0
+  behaviour.
+- **G-06 — STK-6: register the `venue_live` pytest marker.** `GREEN`
+  Registered with marker text naming the exact three-lock gate. Wired to the
+  existing gate rather than a second mechanism; gate not weakened.
+  No `venue_live` marker exists and `--strict-markers` requires registering it
+  in the same change as its first use.
+- **G-07 — STK-9 / ARC-4: import-linter layering contract.** `GREEN`
+  `uv run lint-imports --no-cache` exit 0, **2 contracts kept, 0 broken**:
+  "Breezy top-level source packages follow the documented layer direction" and
+  "Breezy never imports the Nautilus Polymarket .com adapter".
+  Promote `lint-imports` from cosmetic (it has no configuration today) to
+  required. It is the enforcement mechanism for the missing dependency-direction
+  rule and for the "never import the .com adapter" ban.
+- **G-08 — Amend TRADING_ENABLEMENT_PLAN with the full finding set.** `GREEN`
+  All 38 findings resolved, 0 argued-rejected. Traceability table at
+  `docs/plans/TRADING_ENABLEMENT_PLAN_AMENDMENTS.md`. Eight new requirements
+  added (REQ-VENUE-18, REQ-OPS-13..17, REQ-ALPHA-09..10); Phase 3 split into
+  3a/3b per ARC-7; Phase 0 items labelled non-TDD per STK-11. Spot-verified by
+  the coordinator by grepping six cited requirement IDs in the amended plan —
+  all present. **The BLOCK header was NOT lifted**: it was re-labelled to the
+  accurate current reason (ROI NO-GO + asymmetric gate not authorised).
+  Committed as `d4bde7b`.
+  SEC-1..8, ARC-1..8, DOM-1..13, STK-1..12. Document work. Lifts the BLOCK
+  ruling. Depends on G-01, G-02, G-03 landing their determinations.
+
+### Phase A support — recorder hardening (no venue access needed)
+
+- **G-09 — Loader-side gap-partitioning enforcement.** `GREEN (with stated residual)`
+  `src/breezy/persistence/quote_tape_gaps.py` —
+  `load_partitioned_quote_tape_gaps`, `GapPartitionKey`,
+  `PartitionedQuoteTapeGaps`, `UnpartitionedQuoteTapeGapReadError`. RED test
+  writes colliding `gap_seq=1` rows through a real Nautilus
+  `ParquetDataCatalog`, proves the naive flat collapse drops a still-open
+  outage, and proves the sanctioned loader refuses flat reads.
+  **Residual:** fully preventing a direct raw `ParquetDataCatalog.query(...)`
+  would require wrapping Nautilus globally, which the immutability constraint
+  forbids. Enforcement is the sanctioned loader API, not a hard seal.
+  `QuoteTapeGap` carries `recorder_instance_id` and `resolved_gaps_by_seq` keys
+  on `(recorder_instance_id, instrument_id, gap_seq)`, but nothing FORCES a
+  consumer to partition correctly — a consumer iterating raw catalog rows still
+  inherits the under-exclusion hazard. `tape_gaps` remains a LOWER BOUND until
+  this lands.
+- **G-10 — Tape file disk alerting.** `GREEN`
+  `src/breezy/runtime/quote_tape_disk_monitor.py`, wired into
+  `quote_tape_cli.py`, thresholds required-no-default in `settings.py`.
+  **The Nautilus claim was independently verified before building the
+  mitigation:** in installed 1.231.0, `_check_file_rotation` consults
+  `max_file_size` only for `RotationMode.SIZE`; `INTERVAL`/`SCHEDULED_DATES`
+  take a separate `elif` branch on scheduled time alone. **Decision: alert, do
+  not halt** — a false halt creates unrecoverable tape loss, so the monitor
+  logs escalating WARNING/ERROR and lets capture continue until the filesystem
+  itself rejects writes.
+  `max_file_size` is never consulted under `rotation_mode=SCHEDULED_DATES`
+  (`writer.py:305-318` is an if/elif chain), so one day's tape file is
+  unbounded. Currently accepted and unmitigated. Needs external disk alerting
+  before continuous capture starts.
+- **G-11 — Commit the quote-tape recorder work.** `TODO`
+  Still outstanding. Blocked on G-03 converging so the working tree is
+  committed in a coherent state rather than mid-review-loop.
+  Work item 1.1 is built and reviewed but **uncommitted**. It is on the
+  critical path and must not live only in the working tree.
+
+### Phase A — live venue (OPERATOR-GATED)
+
+- **G-12 — Resolve `MARKET_SLUG_KEY` against the live venue.**
+  `BLOCKED (operator: three-lock credential gate + D1 KYC)`
+  `"marketSlug"` is an unresolved guess on which every routing decision rests.
+  Wrong ⇒ the recorder captures nothing and looks like a quiet market.
+- **G-13 — Gating live run of the recorder.**
+  `BLOCKED (operator: three-lock credential gate)`
+  Zero authenticated calls have ever been made. Prove one real frame reaches
+  parquet, read back by a separate process.
+- **G-14 — Start continuous capture under systemd.**
+  `BLOCKED (depends G-12, G-13, G-10)`
+- **G-15 — Fee schedule discovery.**
+  `BLOCKED (operator: live probe)`
+  `maker_fee`/`taker_fee` are `Decimal(0)`; `assert_fee_schedule_known` is
+  fail-closed. The formula `fee = theta * C * p * (1-p)` is documented but the
+  schedule is `[UNKNOWN]`.
+
+### Phase D — hard gate
+
+- **G-16 — Accumulate ≥14 days of joined tape.**
+  `BLOCKED (calendar: 14 days after G-14)`
+- **G-17 — Phase 1.5 premise falsification GO/NO-GO.**
+  `BLOCKED (depends G-16)`
+  Restructured per DOM-1: (a) settlement-alignment Wilson lower bound per city
+  and per degree-of-clearance stratum as the GO/NO-GO, plus (b) a capturability
+  study on depth-weighted fill price and printed trades. GO requires both.
+  **NO-GO stops the programme.**
+
+### Autonomous-execution note
+
+G-01..G-11 are executable without venue access, credentials or a calendar wait.
+G-12..G-17 are not, and are tracked as BLOCKED with their unlock condition
+rather than as failures. Any "all green" claim refers to the G-01..G-11 subset.
+
+---
+
+## Standing lesson — the paper-close pattern (2026-08-26)
+
+Recorded because it was caught **four times in one session**, in a document
+whose entire purpose was methodological rigour.
+
+**The pattern.** A finding is raised. The next revision adds prose announcing
+the fix — and the prose is accurate about what *should* happen — while the
+operative expression an implementer would actually run is left unchanged,
+contradicted by a sibling bullet, or replaced with something that does not
+compute what the prose says.
+
+**The four instances, all in `docs/evidence/asymmetric_gate_prereg_2026-08-26.md`:**
+
+1. Revision 2 justified a power anchor `p̂ = 0.985` on the ground that it is
+   "the entry region where the depth actually is" — i.e. from the market price.
+   That presupposes the market is calibrated, which is precisely what DOM-10
+   disputes. The circularity was not removed, only relocated.
+2. Revision 3 announced a replacement anchor in prose while the **binding
+   `N(c,k)` formula still hardcoded `0.985`**. The reviewer's words: "the math a
+   G-17 implementer would actually run is unchanged from the version that was
+   BLOCKed for circularity."
+3. Revision 3 also described its new concordance table as the exceedance
+   fraction when the table carried the complement. An implementer following the
+   prose would have computed the anchor **backwards**.
+4. Revision 4 introduced `p̂_anchor(c,k) = min(c, 1 - 2*(1-c) + 1)`. The second
+   term simplifies to `2c`, so the whole expression reduces to `min(c, 2c) = c`
+   — a per-city constant with **zero stratum dependence**, which is exactly the
+   defect the revision claimed to fix. The bullets below it defined `2c-1`
+   instead. Alongside it, a cross-reference reading "defined in the next bullet"
+   pointed at a bullet that was not a definition.
+
+**Why prose review does not catch this.** Every one of these reads correctly at
+the paragraph level. The defect only appears when you evaluate the expression
+or trace the computation end to end. Three of the four were found only because
+the reviewer was explicitly instructed to trace what an implementer would run,
+rather than to assess whether the document said the right things.
+
+**Binding rules going forward.**
+
+- A review of any document containing a formula MUST simplify the formula, not
+  read it. `min(c, 2c)` looks like a stratified anchor and is a constant.
+- When a revision claims to replace a value, **grep for the old value** and
+  confirm it does not survive in a binding position. Narrative mentions in
+  review records are fine; an occurrence inside the operative formula is the
+  defect.
+- Every formula gets a **worked table of per-input values**. `2c-1` with the
+  five city values written out cannot be transcribed wrongly; a bare expression
+  can.
+- There must be exactly **one** definition of any computed quantity. A formula
+  line plus an operational bullet list is two definitions, and they will drift.
+- A traceability table is verified by **reading the cited section**, never by
+  reading the table. Applied to G-08: six cited requirement IDs were grepped in
+  the amended plan and all six were present.
+
+**Cost of not catching it.** Instance 4 would have silently under-powered the
+`[0,1)` clearance stratum — the one stratum the document insists must reach a
+verdict — raising the odds of a false GO at exactly the boundary where the
+DOM-4 divergence modes bite. That is a wrong trade, not a wrong document.
