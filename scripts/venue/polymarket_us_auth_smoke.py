@@ -16,11 +16,11 @@ Read-only by construction
 The only egress primitives reachable from here are
 ``PolymarketUSHttpClient.get_authenticated`` / ``get_public`` (barrier B1),
 a signer that refuses to sign anything but ``GET`` (B2), and a transport that
-keeps its pyo3 client in a non-attribute binding (B3). The repo-wide AST
-barriers B4/B5 scan ``scripts/`` as well as ``src/``, and classify anything
-under ``scripts/venue/`` as venue-touching, so this file is inside their
-scope. TLS verification is left entirely to the transport and is never
-weakened anywhere in this script.
+keeps its pyo3 client out of attribute and bound-method ``__self__``
+reachability (B3). The repo-wide AST barriers B4/B5 scan ``scripts/`` as well
+as ``src/``, and classify anything under ``scripts/venue/`` as venue-touching,
+so this file is inside their scope. TLS verification is left entirely to the
+transport and is never weakened anywhere in this script.
 
 Safety preconditions, in the order they are enforced
 ----------------------------------------------------
@@ -89,6 +89,7 @@ from breezy.adapters.polymarket_us.env import (
 )
 from breezy.adapters.polymarket_us.errors import (
     PolymarketUSError,
+    SignatureClockSkewError,
 )
 from breezy.adapters.polymarket_us.factories import (
     POLYMARKET_US_CLIENT_NAME,
@@ -111,6 +112,7 @@ __all__ = [
     "EVIDENCE_DIRECTORY",
     "HTTP_METHOD",
     "SECRET_FRAGMENT_LENGTH",
+    "SIGNING_CLOCK_SKEW_GUARD_MS",
     "VENUE_LIVE_ENV_VAR",
     "CredentialGuard",
     "EvidenceCheckpoint",
@@ -121,6 +123,7 @@ __all__ = [
     "RequestRecord",
     "SmokeRefusal",
     "SmokeReport",
+    "assert_host_clock_safe_for_signing",
     "assert_smoke_enabled",
     "build_safe_excepthook",
     "build_safe_loop_exception_handler",
@@ -167,6 +170,20 @@ MAX_LOG_LINES: Final[int] = 60
 
 #: How far outside the +/-30s window step D deliberately reaches.
 STALE_TIMESTAMP_OFFSET_MS: Final[int] = 120_000
+
+#: The docs define a +/-30s signing window. Refusing at half that window leaves
+#: operational margin and surfaces clock drift before it looks like a generic
+#: venue-side 401.
+DOCUMENTED_SIGNING_WINDOW_MS: Final[int] = 30_000
+SIGNING_CLOCK_SKEW_GUARD_FRACTION: Final[float] = 0.5
+SIGNING_CLOCK_SKEW_GUARD_MS: Final[int] = int(
+    DOCUMENTED_SIGNING_WINDOW_MS * SIGNING_CLOCK_SKEW_GUARD_FRACTION
+)
+
+TEARDOWN_OK: Final[str] = "OK"
+TEARDOWN_NOT_RUN: Final[str] = "NOT_RUN"
+TEARDOWN_FAILED: Final[str] = "FAILED"
+KNOWN_BENIGN_NAUTILUS_LOOP_STOP: Final[str] = "KNOWN_BENIGN_NAUTILUS_LOOP_STOP"
 
 
 class SmokeRefusal(RuntimeError):
@@ -382,6 +399,8 @@ class SmokeReport:
     write_requests_issued: int
     verdict: bool
     verdict_reason: str
+    teardown_health: str = TEARDOWN_NOT_RUN
+    teardown_error: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -488,16 +507,17 @@ def render_evidence(report: SmokeReport, *, secrets: Iterable[str]) -> str:
         f"# Polymarket.us read-only authenticated smoke test -- {report.started_at}",
         "",
         (
-            f"**Verdict: {'PASS' if report.verdict else 'FAIL'}** -- "
+            f"**Connectivity verdict: {'PASS' if report.verdict else 'FAIL'}** -- "
             "authenticated connectivity "
             f"{'proven' if report.verdict else 'NOT proven'}."
         ),
+        f"**Teardown health: {report.teardown_health}**",
         "",
         report.verdict_reason,
-        "",
-        "## Run environment",
-        "",
     ]
+    if report.teardown_error is not None:
+        lines.extend(["", f"Teardown detail: {report.teardown_error}"])
+    lines += ["", "## Run environment", ""]
     lines.extend(
         _table(
             [
@@ -517,6 +537,8 @@ def render_evidence(report: SmokeReport, *, secrets: Iterable[str]) -> str:
                 ["market slugs", ", ".join(report.market_slugs)],
                 ["HTTP methods issued", HTTP_METHOD],
                 ["write requests issued", str(report.write_requests_issued)],
+                ["teardown health", report.teardown_health],
+                ["teardown error", report.teardown_error or "-"],
             ],
             ["field", "value"],
         )
@@ -735,14 +757,16 @@ class EvidenceCheckpoint:
             return None
         failure = describe_exception(exc, self.secrets)
         stamp = dt.datetime.now(tz=dt.UTC).strftime("%H:%M:%SZ")
+        teardown_health = (
+            KNOWN_BENIGN_NAUTILUS_LOOP_STOP
+            if is_known_benign_nautilus_loop_stop(exc, report)
+            else TEARDOWN_FAILED
+        )
         failed_report = replace(
             report,
             finished_at=dt.datetime.now(tz=dt.UTC).isoformat(timespec="seconds"),
-            verdict=False,
-            verdict_reason=(
-                "Evidence was checkpointed before teardown completed, but the "
-                f"run then failed during or after teardown -- {failure}"
-            ),
+            teardown_health=teardown_health,
+            teardown_error=failure,
             log_excerpt=(*report.log_excerpt, f"{stamp} teardown FAILED: {failure}")[
                 -MAX_LOG_LINES:
             ],
@@ -756,26 +780,62 @@ class EvidenceCheckpoint:
 
 
 @dataclass
+class TransportEvent:
+    """One attempted GET, recorded whether it returns or raises."""
+
+    url: str
+    headers: Mapping[str, str]
+    response: VenueResponse | None
+    elapsed_ms: float
+    failure_type: str | None = None
+
+
+@dataclass
 class RecordingTransport:
     """Wraps the GET-only transport and records what actually went on the wire.
 
     Exists so the evidence reports the headers that were REALLY sent rather
-    than a second, separately-computed set. It has exactly one method, so the
-    recorded ``write_requests`` counter is structurally pinned at zero.
+    than a second, separately-computed set. Failed attempts are recorded as
+    their own events before the exception is re-raised, so evidence cannot
+    carry forward the previous successful request's status or headers. It has
+    exactly one method, so the recorded ``write_requests`` counter is
+    structurally pinned at zero.
     """
 
     inner: PolymarketUSReadTransport
-    records: list[tuple[str, Mapping[str, str], VenueResponse, float]] = field(default_factory=list)
+    records: list[TransportEvent] = field(default_factory=list)
     write_requests: int = 0
 
     async def get(self, url: str, *, headers: Mapping[str, str], quota_key: str) -> VenueResponse:
         started = time.perf_counter()
-        response = await self.inner.get(url, headers=headers, quota_key=quota_key)
         elapsed_ms = (time.perf_counter() - started) * 1000.0
-        self.records.append((url, dict(headers), response, elapsed_ms))
-        return response
+        try:
+            response = await self.inner.get(url, headers=headers, quota_key=quota_key)
+        except Exception as exc:
+            elapsed_ms = (time.perf_counter() - started) * 1000.0
+            self.records.append(
+                TransportEvent(
+                    url=url,
+                    headers=dict(headers),
+                    response=None,
+                    elapsed_ms=elapsed_ms,
+                    failure_type=type(exc).__name__,
+                )
+            )
+            raise
+        else:
+            elapsed_ms = (time.perf_counter() - started) * 1000.0
+            self.records.append(
+                TransportEvent(
+                    url=url,
+                    headers=dict(headers),
+                    response=response,
+                    elapsed_ms=elapsed_ms,
+                )
+            )
+            return response
 
-    def last(self) -> tuple[str, Mapping[str, str], VenueResponse, float] | None:
+    def last(self) -> TransportEvent | None:
         return self.records[-1] if self.records else None
 
 
@@ -802,21 +862,32 @@ def _record_from(
             observed_headers={},
             note=note or "no request reached the transport",
         )
-    _url, headers, response, elapsed_ms = entry
+    if entry.response is None:
+        return RequestRecord(
+            step=step,
+            label=label,
+            path=path,
+            query_string=query_string,
+            status=status_override,
+            latency_ms=entry.elapsed_ms,
+            sent_headers=entry.headers,
+            observed_headers={},
+            note=note or f"transport failure: {entry.failure_type}",
+        )
     return RequestRecord(
         step=step,
         label=label,
         path=path,
         query_string=query_string,
-        status=status_override if status_override is not None else response.status,
-        latency_ms=elapsed_ms,
-        sent_headers=headers,
-        observed_headers=response.headers,
+        status=status_override if status_override is not None else entry.response.status,
+        latency_ms=entry.elapsed_ms,
+        sent_headers=entry.headers,
+        observed_headers=entry.response.headers,
         note=note,
     )
 
 
-def _clock_offset_ms(records: Sequence[RequestRecord]) -> int | None:
+def _clock_offset_ms(records: Sequence[RequestRecord], *, now_ms: int | None = None) -> int | None:
     """Host clock offset against the venue's ``Date`` response header."""
     for record in records:
         raw = {k.lower(): v for k, v in record.observed_headers.items()}.get("date")
@@ -833,8 +904,29 @@ def _clock_offset_ms(records: Sequence[RequestRecord]) -> int | None:
         if venue_time.tzinfo is None:
             venue_time = venue_time.replace(tzinfo=dt.UTC)
         venue_ms = int(venue_time.timestamp() * 1000)
-        return int(time.time() * 1000) - venue_ms
+        return (int(time.time() * 1000) if now_ms is None else now_ms) - venue_ms
     return None
+
+
+def assert_host_clock_safe_for_signing(
+    records: Sequence[RequestRecord], *, now_ms: int | None = None
+) -> None:
+    """Refuse before signing when the venue Date header shows unsafe skew."""
+    offset_ms = _clock_offset_ms(records, now_ms=now_ms)
+    if offset_ms is None:
+        raise SignatureClockSkewError(
+            "Refusing to sign authenticated Polymarket.us requests: no valid venue "
+            "Date header was measured, so host clock offset cannot be proven within "
+            f"+/-{SIGNING_CLOCK_SKEW_GUARD_MS} ms."
+        )
+    if abs(offset_ms) > SIGNING_CLOCK_SKEW_GUARD_MS:
+        raise SignatureClockSkewError(
+            "Refusing to sign authenticated Polymarket.us requests: host clock "
+            f"offset vs venue Date header is {offset_ms} ms, exceeding the safe "
+            f"+/-{SIGNING_CLOCK_SKEW_GUARD_MS} ms guard "
+            f"({SIGNING_CLOCK_SKEW_GUARD_FRACTION:.0%} of the documented "
+            f"+/-{DOCUMENTED_SIGNING_WINDOW_MS} ms signing window)."
+        )
 
 
 def _key_file_facts(env: Mapping[str, str]) -> tuple[int | None, str | None]:
@@ -1315,6 +1407,8 @@ async def run_smoke(
         findings.append(gateway_finding)
         counter.note(f"step A gateway status={gateway_record.status}")
         checkpoint_now("Smoke run in progress: gateway reachability has been checkpointed.")
+        assert_host_clock_safe_for_signing(records)
+        counter.note(f"host clock offset accepted: {_clock_offset_ms(records)} ms")
 
         auth_record, authenticated_ok = await _probe_authenticated(client, transport)
         records.append(auth_record)
@@ -1375,7 +1469,7 @@ async def run_smoke(
 
         final_report = build_report()
         counter.note(f"smoke run finished: {'PASS' if final_report.verdict else 'FAIL'}")
-        final_report = build_report()
+        final_report = replace(build_report(), teardown_health=TEARDOWN_OK)
         checkpoint_now(final_report.verdict_reason)
         return final_report
     finally:
@@ -1429,6 +1523,21 @@ def describe_exception(exc: BaseException, secrets: Sequence[str]) -> str:
     if find_secret_leak_offsets(scrubbed, secrets):
         scrubbed = "<message withheld: secret-derived material survived redaction>"
     return f"{type(exc).__name__}: {scrubbed}"
+
+
+def is_known_benign_nautilus_loop_stop(exc: BaseException, report: SmokeReport) -> bool:
+    """Whether ``exc`` is the named Nautilus asyncio-run teardown race.
+
+    This label is deliberately narrow: it only applies after connectivity has
+    already been proven by the checkpointed report, and only to the exact loop
+    stop RuntimeError observed from Nautilus 1.231.0 disposal under
+    ``asyncio.run``.
+    """
+    return (
+        report.verdict
+        and type(exc) is RuntimeError
+        and str(exc) == "Event loop stopped before Future completed."
+    )
 
 
 async def drain_node_task(
@@ -1570,6 +1679,10 @@ async def _run_node(
 
 #: Exit code for an unanticipated failure inside the live run.
 EXIT_UNEXPECTED: Final[int] = 3
+
+#: Connectivity was proven, but Nautilus 1.231.0 hit its known loop-stop
+#: teardown race after evidence checkpointing.
+EXIT_KNOWN_BENIGN_TEARDOWN: Final[int] = 4
 
 #: Exit code for an operator interrupt (matches the shell's 128+SIGINT).
 EXIT_INTERRUPTED: Final[int] = 130
@@ -1732,12 +1845,28 @@ def main(argv: Sequence[str] | None = None) -> int:
     except KeyboardInterrupt:
         print("INTERRUPTED by operator; no evidence written.", file=sys.stderr)
         return EXIT_INTERRUPTED
+    except SignatureClockSkewError as exc:
+        print(f"REFUSED: {describe_exception(exc, secrets)}", file=sys.stderr)
+        if checkpoint.latest_path is not None:
+            print(f"Checkpoint evidence: {checkpoint.latest_path}", file=sys.stderr)
+        return 2
     except BaseException as exc:  # noqa: BLE001 - deliberate last line of defence
+        known_teardown = (
+            checkpoint.latest_report is not None
+            and is_known_benign_nautilus_loop_stop(exc, checkpoint.latest_report)
+        )
         checkpoint_path = checkpoint.write_unexpected_failure(exc)
-        report_fatal(exc, secrets)
+        if known_teardown:
+            print(
+                f"TEARDOWN HEALTH: {KNOWN_BENIGN_NAUTILUS_LOOP_STOP}: "
+                f"{describe_exception(exc, secrets)}",
+                file=sys.stderr,
+            )
+        else:
+            report_fatal(exc, secrets)
         if checkpoint_path is not None:
             print(f"Checkpoint evidence: {checkpoint_path}", file=sys.stderr)
-        return EXIT_UNEXPECTED
+        return EXIT_KNOWN_BENIGN_TEARDOWN if known_teardown else EXIT_UNEXPECTED
 
     print()
     print("=" * 72)
@@ -1753,6 +1882,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     print(f"Frames received    : {report.frames_received}")
     print(f"QuoteTicks         : {report.quotes_delivered}")
     print(f"Write requests     : {report.write_requests_issued}")
+    print(f"Teardown health    : {report.teardown_health}")
     print(f"Evidence           : {path}")
     print("=" * 72)
     return 0 if report.verdict else 1

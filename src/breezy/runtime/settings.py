@@ -40,11 +40,27 @@ _LOG_LEVEL_VAR = "BREEZY_LOG_LEVEL"
 _ALLOW_PROXY_ENV_VAR = "BREEZY_ALLOW_PROXY_ENV"
 _REGISTRY_PATH_VAR = "BREEZY_REGISTRY_PATH"
 _HEALTH_SNAPSHOT_DIR_VAR = "BREEZY_HEALTH_SNAPSHOT_DIR"
+#: Read ONLY by :func:`load_quote_tape_settings`, never by
+#: :func:`load_settings`. See that function's docstring for why the venue
+#: role is loaded separately.
+QUOTE_TAPE_CATALOG_VAR = "BREEZY_POLYMARKET_US_QUOTE_TAPE_CATALOG"
+_QUOTE_TAPE_MIN_FREE_BYTES_WARNING_VAR = (
+    "BREEZY_POLYMARKET_US_QUOTE_TAPE_MIN_FREE_BYTES_WARNING"
+)
+_QUOTE_TAPE_MIN_FREE_BYTES_ERROR_VAR = "BREEZY_POLYMARKET_US_QUOTE_TAPE_MIN_FREE_BYTES_ERROR"
+_QUOTE_TAPE_MAX_FILE_BYTES_WARNING_VAR = (
+    "BREEZY_POLYMARKET_US_QUOTE_TAPE_MAX_FILE_BYTES_WARNING"
+)
+_QUOTE_TAPE_MAX_FILE_BYTES_ERROR_VAR = "BREEZY_POLYMARKET_US_QUOTE_TAPE_MAX_FILE_BYTES_ERROR"
+_QUOTE_TAPE_DISK_CHECK_INTERVAL_VAR = (
+    "BREEZY_POLYMARKET_US_QUOTE_TAPE_DISK_CHECK_INTERVAL_SECONDS"
+)
 
 _DEFAULT_TRADER_ID = "BREEZY-001"
 _DEFAULT_POLL_INTERVAL_SECONDS = 300
 _DEFAULT_PARSE_TIMEOUT_MS = 250
 _DEFAULT_LOG_LEVEL = "INFO"
+_DEFAULT_QUOTE_TAPE_DISK_CHECK_INTERVAL_SECONDS = 30
 
 #: NautilusTrader's genuine accepted set, verified against the installed
 #: package (`nautilus_trader.core.nautilus_pyo3.LogLevel`), not the stdlib
@@ -132,6 +148,17 @@ def _parse_positive_int(env: Mapping[str, str], var: str, default: int) -> int:
     raw = env.get(var)
     if raw is None:
         return default
+    try:
+        value = int(raw)
+    except ValueError as exc:
+        raise SettingsError(f"{var} must be an integer, was {raw!r}") from exc
+    if value <= 0:
+        raise SettingsError(f"{var} must be a positive integer, was {raw!r}")
+    return value
+
+
+def _parse_required_positive_int(env: Mapping[str, str], var: str) -> int:
+    raw = _require(env, var)
     try:
         value = int(raw)
     except ValueError as exc:
@@ -241,4 +268,119 @@ def load_settings(env: Mapping[str, str] | None = None) -> BreezyRuntimeSettings
         check_proxy_env=check_proxy_env,
         registry_path=registry_path,
         health_snapshot_dir=health_snapshot_dir,
+    )
+
+
+@dataclass(frozen=True, slots=True)
+class PolymarketUSQuoteTapeSettings:
+    """Validated settings for the **quote-tape recorder** role.
+
+    A SEPARATE type from :class:`BreezyRuntimeSettings` on purpose. The two
+    are different processes with different jobs and different failure
+    consequences:
+
+    * the NWS ingestion process collects weather observations and must start
+      on a host that carries no venue configuration at all;
+    * the quote-tape recorder connects to Polymarket.us and is useless
+      without every venue endpoint.
+
+    Folding the venue variables onto the shared type made them mandatory for
+    BOTH, which turned a running weather collector into one that could not
+    restart. Role separation is what prevents that class of outage, not
+    per-field defaults: defaults would instead let the recorder start
+    half-configured and silently record nothing.
+
+    Note what is NOT here: no venue endpoint, slug list, user agent or
+    signing variant. Those are owned by
+    :func:`breezy.adapters.polymarket_us.factories.config_from_env`, which
+    already implements the section 7 environment contract and produces the
+    ``PolymarketUSDataClientConfig`` the node needs. Reading them a second
+    time here would be a second, competing policy for the same variables --
+    exactly what this module's header forbids for ``BREEZY_USER_AGENT``.
+    """
+
+    trader_id: str
+    log_level: str
+    #: Root of the ``ParquetDataCatalog`` the recorded tape lands under.
+    #: Absolute, for the same reason ``health_snapshot_dir`` is: under systemd
+    #: the process CWD is not a property the operator controls, and a tape
+    #: written somewhere nobody reads is indistinguishable from no tape.
+    catalog_root: Path
+    min_free_bytes_warning: int
+    min_free_bytes_error: int
+    max_file_bytes_warning: int
+    max_file_bytes_error: int
+    disk_check_interval_seconds: int
+
+
+def load_quote_tape_settings(
+    env: Mapping[str, str] | None = None,
+) -> PolymarketUSQuoteTapeSettings:
+    """Load and validate the quote-tape recorder's own settings.
+
+    Strict on its own terms: :data:`QUOTE_TAPE_CATALOG_VAR` and the disk
+    thresholds are required with no defaults, and every rejection names the
+    variable. Calling this is the act of starting the recorder role, so failing
+    here fails the right process -- never the weather collector.
+    """
+    active_env: Mapping[str, str] = os.environ if env is None else env
+
+    raw = _require(active_env, QUOTE_TAPE_CATALOG_VAR)
+    if not raw.strip():
+        raise SettingsError(f"{QUOTE_TAPE_CATALOG_VAR} is required and must not be blank")
+    if "\x00" in raw:
+        raise SettingsError(f"{QUOTE_TAPE_CATALOG_VAR} must not contain a NUL byte")
+    catalog_root = Path(raw.strip())
+    if not catalog_root.is_absolute():
+        raise SettingsError(
+            f"{QUOTE_TAPE_CATALOG_VAR} must be an absolute path, was {raw!r}"
+        )
+    # Refused, not resolved. Normalising would mean the directory an operator
+    # reads in the unit file is not the directory the tape lands in, and the
+    # tape is the one artifact that cannot be re-created if it lands somewhere
+    # unwatched. Compared as a path SEGMENT, so a directory merely named
+    # ``tape..v2`` is still legal.
+    if any(part == ".." for part in catalog_root.parts):
+        raise SettingsError(
+            f"{QUOTE_TAPE_CATALOG_VAR} must not contain a '..' segment, was {raw!r}"
+        )
+
+    min_free_bytes_warning = _parse_required_positive_int(
+        active_env, _QUOTE_TAPE_MIN_FREE_BYTES_WARNING_VAR
+    )
+    min_free_bytes_error = _parse_required_positive_int(
+        active_env, _QUOTE_TAPE_MIN_FREE_BYTES_ERROR_VAR
+    )
+    max_file_bytes_warning = _parse_required_positive_int(
+        active_env, _QUOTE_TAPE_MAX_FILE_BYTES_WARNING_VAR
+    )
+    max_file_bytes_error = _parse_required_positive_int(
+        active_env, _QUOTE_TAPE_MAX_FILE_BYTES_ERROR_VAR
+    )
+    disk_check_interval_seconds = _parse_positive_int(
+        active_env,
+        _QUOTE_TAPE_DISK_CHECK_INTERVAL_VAR,
+        _DEFAULT_QUOTE_TAPE_DISK_CHECK_INTERVAL_SECONDS,
+    )
+
+    if min_free_bytes_error >= min_free_bytes_warning:
+        raise SettingsError(
+            f"{_QUOTE_TAPE_MIN_FREE_BYTES_ERROR_VAR} must be less than "
+            f"{_QUOTE_TAPE_MIN_FREE_BYTES_WARNING_VAR}"
+        )
+    if max_file_bytes_error <= max_file_bytes_warning:
+        raise SettingsError(
+            f"{_QUOTE_TAPE_MAX_FILE_BYTES_ERROR_VAR} must be greater than "
+            f"{_QUOTE_TAPE_MAX_FILE_BYTES_WARNING_VAR}"
+        )
+
+    return PolymarketUSQuoteTapeSettings(
+        trader_id=active_env.get(_TRADER_ID_VAR, _DEFAULT_TRADER_ID),
+        log_level=_parse_log_level(active_env),
+        catalog_root=catalog_root,
+        min_free_bytes_warning=min_free_bytes_warning,
+        min_free_bytes_error=min_free_bytes_error,
+        max_file_bytes_warning=max_file_bytes_warning,
+        max_file_bytes_error=max_file_bytes_error,
+        disk_check_interval_seconds=disk_check_interval_seconds,
     )

@@ -57,6 +57,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import uuid
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any, Final, Protocol, runtime_checkable
@@ -65,21 +66,44 @@ from nautilus_trader.cache.cache import Cache
 from nautilus_trader.common.component import LiveClock, MessageBus
 from nautilus_trader.common.enums import LogColor
 from nautilus_trader.common.providers import InstrumentProvider
+from nautilus_trader.core.data import Data
 from nautilus_trader.data.messages import SubscribeQuoteTicks, UnsubscribeQuoteTicks
 from nautilus_trader.live.data_client import LiveMarketDataClient
-from nautilus_trader.model.data import QuoteTick
-from nautilus_trader.model.identifiers import ClientId, Venue
-from nautilus_trader.model.instruments import Instrument
+from nautilus_trader.model.data import CustomData, DataType, QuoteTick
+from nautilus_trader.model.identifiers import ClientId, InstrumentId, Venue
+from nautilus_trader.model.instruments import BinaryOption, Instrument
 
 from breezy.adapters.polymarket_us.config import PolymarketUSDataClientConfig
 from breezy.adapters.polymarket_us.errors import PolymarketUSError
+from breezy.adapters.polymarket_us.parsing import (
+    EXPIRED_MARKET_STATES,
+    TERMINAL_SETTLEMENT_METHOD,
+    TRADE_CONTAINER_KEY,
+    depth_levels_dropped,
+    parse_instrument_close,
+    parse_instrument_status,
+    parse_mark_price,
+    parse_order_book_depth10,
+    parse_quote_tick,
+    parse_settlement_snapshot,
+    parse_trade_tick,
+    venue_market_state,
+    venue_settlement_method,
+)
 from breezy.adapters.polymarket_us.symbology import (
     POLYMARKET_US_VENUE,
     instrument_id_to_slug,
     slug_to_instrument_id,
 )
+from breezy.adapters.polymarket_us.tape_records import (
+    DepthTruncation,
+    QuoteTapeGap,
+    VenueClockOffset,
+)
 
 __all__ = [
+    "CLOCK_OFFSET_SAMPLE_EVERY",
+    "CLOCK_OFFSET_SOURCE",
     "MARKET_SLUG_KEY",
     "MISSING_ROUTING_KEY_WARN_EVERY",
     "POLYMARKET_US_VENUE",
@@ -92,7 +116,7 @@ __all__ = [
     "derive_client_id",
     "diagnose_frame_payload",
     "frame_class_counts",
-    "should_warn_for_missing_routing_key",
+    "should_warn_at_count",
 ]
 
 # ``POLYMARKET_US_VENUE`` is imported from ``symbology`` and re-exported here:
@@ -130,6 +154,17 @@ MISSING_ROUTING_KEY_WARN_EVERY: Final[int] = 100
 
 #: How often the safe-mode watchdog samples the socket's degraded flag.
 DEFAULT_FEED_WATCH_INTERVAL_SECS: Final[float] = 5.0
+
+#: Publish one :class:`VenueClockOffset` every N market-data frames carrying a
+#: venue timestamp. Frame-driven rather than time-driven so the sampler costs
+#: no timer and, more importantly, no extra network egress: the offset is
+#: derived from data already on the socket. A silent feed publishes no offset,
+#: which is correct -- there is nothing to compare.
+CLOCK_OFFSET_SAMPLE_EVERY: Final[int] = 200
+
+#: What the offset series compares. Recorded on every record so a reader never
+#: has to guess which two clocks produced the number.
+CLOCK_OFFSET_SOURCE: Final[str] = "ws-transact-time"
 
 
 @dataclass(frozen=True, slots=True)
@@ -188,8 +223,12 @@ class QuoteTickParser(Protocol):
     ) -> QuoteTick: ...
 
 
-def should_warn_for_missing_routing_key(count: int) -> bool:
-    """Rate-limit policy for the missing-routing-key WARN.
+def should_warn_at_count(count: int) -> bool:
+    """Rate-limit policy for a repeating WARN, shared by every such alarm here.
+
+    Named for what it does rather than for its first caller: it now also gates
+    the depth-truncation warning, where a name mentioning routing keys would
+    actively mislead a reader.
 
     A separate pure function because ``Component._log`` is
     ``cdef readonly`` (``common/component.pxd:226``) and therefore cannot be
@@ -198,7 +237,7 @@ def should_warn_for_missing_routing_key(count: int) -> bool:
 
     Warns on the FIRST occurrence (so a wrong key guess is visible within one
     frame, not after a hundred), then once every
-    :data:`MISSING_ROUTING_KEY_WARN_EVERY` frames.
+    :data:`MISSING_ROUTING_KEY_WARN_EVERY` occurrences.
     """
     if count <= 0:
         return False
@@ -348,7 +387,7 @@ class PolymarketUSDataClient(LiveMarketDataClient):
         config: PolymarketUSDataClientConfig,
         *,
         feed_factory: MarketsFeedFactory,
-        quote_parser: QuoteTickParser,
+        quote_parser: QuoteTickParser = parse_quote_tick,
         feed_watch_interval_secs: float = DEFAULT_FEED_WATCH_INTERVAL_SECS,
     ) -> None:
         super().__init__(
@@ -370,10 +409,30 @@ class PolymarketUSDataClient(LiveMarketDataClient):
         self._feed_watch_interval_secs: float = feed_watch_interval_secs
         self._feed_watchdog: asyncio.Task[None] | None = None
         self._safe_mode: bool = False
+        # The owning node's NATIVE `instance_id`, threaded via config because
+        # neither `MessageBus` nor `LiveDataClientFactory.create` exposes it
+        # (see `PolymarketUSDataClientConfig.recorder_instance_id`). Falls back
+        # to a per-process UUID4 so a client built OUTSIDE the recorder role
+        # still produces partitionable rows -- never to a blank, which
+        # `QuoteTapeGap` refuses outright.
+        self._recorder_instance_id: str = (
+            config.recorder_instance_id or f"unmanaged-{uuid.uuid4()}"
+        )
         self._dropped_frames: int = 0
         self._frames_missing_routing_key: int = 0
         self._quotes_published: int = 0
         self._frame_diagnostics: list[FrameDiagnostic] = []
+        # Tape-gap accounting. `None` for "never sampled yet", so the very
+        # first sample cannot be mistaken for a transition.
+        self._feed_was_connected: bool | None = None
+        self._gap_opened_ns: int | None = None
+        self._tape_gaps: int = 0
+        self._tape_gap_seconds_total: float = 0.0
+        self._trades_published: int = 0
+        self._depth_levels_truncated: int = 0
+        self._clock_offset_samples: int = 0
+        self._quote_parse_failures: int = 0
+        self._expired_without_terminal_settlement: int = 0
 
     # -- state ------------------------------------------------------------
 
@@ -405,9 +464,96 @@ class PolymarketUSDataClient(LiveMarketDataClient):
         return self._quotes_published
 
     @property
+    def quote_parse_failures(self) -> int:
+        """Market-data frames that arrived but yielded no quote.
+
+        Its own counter rather than part of :attr:`dropped_frames`, because
+        such a frame is usually NOT dropped: a settled market publishes an
+        empty book alongside its settlement price, and that settlement record
+        is kept. The two facts mean different things -- "the book stopped being
+        quotable" versus "the frame was unusable" -- and conflating them would
+        hide a tape that has silently stopped carrying prices while still
+        looking busy.
+
+        The two counters OVERLAP and must never be summed. A frame that yields
+        no quote AND nothing else -- a truncated payload carrying only its
+        routing key -- increments BOTH. The increment is deliberately NOT gated
+        on other records having been published: that would zero this counter in
+        exactly the total-garbage case where it is most diagnostic. Pinned by
+        ``tests/unit/test_quote_tape_consumer_contract.py::TestCounterSemantics``.
+        """
+        return self._quote_parse_failures
+
+    @property
+    def expired_without_terminal_settlement(self) -> int:
+        """Frames whose market is EXPIRED but whose method is not TIER_1.
+
+        The provenance record lands on disk either way
+        (``VenueSettlementSnapshot`` with ``is_terminal=False``), so this is a
+        convenience for spotting the condition from the running process rather
+        than the record of it. A market stuck here has expired without the
+        venue publishing a terminally-computed price, and no ``InstrumentClose``
+        will be written until it does.
+
+        Counts FRAMES, not markets: a market that republishes while stuck
+        increments this repeatedly. It is a smoke signal, not a population.
+        """
+        return self._expired_without_terminal_settlement
+
+    @property
+    def trades_published(self) -> int:
+        """Executed prints handed to the data engine."""
+        return self._trades_published
+
+    @property
+    def depth_levels_truncated(self) -> int:
+        """Book levels the ten-per-side native carrier could not keep.
+
+        Non-zero is EXPECTED, not an error: the committed capture carries 12
+        bid and 14 offer levels. It is surfaced because slippage measured from
+        this tape is valid only down to the tenth level, and an analyst has no
+        other way to learn where the recorded book ends.
+        """
+        return self._depth_levels_truncated
+
+    @property
     def frame_diagnostics(self) -> tuple[FrameDiagnostic, ...]:
         """Return redaction-safe diagnostics for every inbound dict frame."""
         return tuple(self._frame_diagnostics)
+
+    @property
+    def tape_gaps(self) -> int:
+        """Observed interruptions of the quote feed. **A LOWER BOUND.**
+
+        Quotes that occur while the socket is down are lost permanently --
+        Polymarket.us weather markets cannot be backfilled. The socket's
+        supervisor reconnects and replays subscriptions, so the recorded tape
+        RESUMES and nothing in the resulting parquet says it ever stopped.
+        This counter is the only thing that does.
+
+        Why it is explicitly a lower bound, and not corrected to be exact:
+
+        * a gap shorter than the watchdog's sample interval is not seen at all;
+        * a gap still open when the process exits is counted, but its duration
+          stops accruing at the last sample;
+        * the socket's own internal retry may complete between two samples.
+
+        Analysis that joins this tape to anything else must treat an absence
+        of quotes as unknown, not as an absence of trading. Publishing a number
+        that is honestly a floor is what makes that possible; publishing one
+        that pretends to be exact is how a hole becomes a conclusion.
+        """
+        return self._tape_gaps
+
+    @property
+    def tape_gap_seconds_total(self) -> float:
+        """Wall-clock seconds observed with the feed down. Lower bound, as above."""
+        return self._tape_gap_seconds_total
+
+    @property
+    def is_tape_gap_open(self) -> bool:
+        """True while the feed is down RIGHT NOW and quotes are being lost."""
+        return self._gap_opened_ns is not None
 
     # -- lifecycle --------------------------------------------------------
 
@@ -489,11 +635,19 @@ class PolymarketUSDataClient(LiveMarketDataClient):
     # -- inbound frames ---------------------------------------------------
 
     def _handle_ws_frame(self, raw: bytes) -> None:
-        """Handle one inbound socket frame. Runs on the event-loop thread.
+        """Turn one inbound frame into EVERY record it can support.
 
-        A malformed or unroutable frame is counted and dropped: one bad frame
-        must never take down a live feed, and it must never be settled on
-        either.
+        A market-data frame carries far more than a top-of-book quote: ten-plus
+        levels of depth per side, the venue's ``state``, and the venue's own
+        ``settlementPx``. Publishing only the quote discarded the rest, and
+        Polymarket.us weather markets have no history, so each discarded field
+        was a permanent per-frame loss.
+
+        The record types are INDEPENDENT. A frame whose book is empty -- which
+        is exactly what a settled market looks like -- still yields the
+        settlement value, which is the single most valuable record the venue
+        ever sends. Conversely a frame that yields nothing at all is dropped and
+        counted, so a schema change cannot become silence.
         """
         try:
             decoded = json.loads(raw)
@@ -529,18 +683,222 @@ class PolymarketUSDataClient(LiveMarketDataClient):
             self._drop_frame(f"no instrument loaded for {instrument_id}")
             return
 
-        try:
-            quote = self._quote_parser(
-                payload,
-                instrument=instrument,
-                ts_init=self._clock.timestamp_ns(),
-            )
-        except (PolymarketUSError, ValueError, KeyError, TypeError) as exc:
-            self._drop_frame(f"unparseable quote for {instrument_id}: {type(exc).__name__}")
-            return
+        ts_init = self._clock.timestamp_ns()
+        published = 0
+        if TRADE_CONTAINER_KEY in payload:
+            published += self._publish_trade(payload, instrument, ts_init)
+        else:
+            published += self._publish_market_data(payload, instrument, ts_init)
 
-        self._handle_data(quote)
-        self._quotes_published += 1
+        if published == 0:
+            self._drop_frame(f"frame for {instrument_id} yielded no usable record")
+
+    def _publish_market_data(
+        self, payload: Mapping[str, Any], instrument: Instrument, ts_init: int
+    ) -> int:
+        """Publish quote, depth, state and mark/close from one market-data frame.
+
+        Each is attempted separately and a failure in one never suppresses the
+        others: the failure modes are genuinely independent (an empty book is
+        normal at settlement, a missing ``settlementPx`` is normal early in a
+        market's life), and coupling them would make the most common benign
+        case delete the most valuable record.
+        """
+        published = 0
+        quote = self._try_parse(
+            payload, instrument, ts_init, self._quote_parser, "quote", required=True
+        )
+        if quote is None:
+            self._quote_parse_failures += 1
+        else:
+            self._handle_data(quote)
+            self._quotes_published += 1
+            published += 1
+
+        if isinstance(instrument, BinaryOption):
+            depth = self._try_parse(
+                payload, instrument, ts_init, parse_order_book_depth10, "depth", required=False
+            )
+            if depth is not None:
+                self._handle_data(depth)
+                published += 1
+                published += self._note_depth_truncation(payload, depth, ts_init)
+
+            for parser, label in (
+                (parse_instrument_status, "state"),
+                (parse_mark_price, "mark price"),
+                (parse_instrument_close, "settlement"),
+                (parse_settlement_snapshot, "settlement provenance"),
+            ):
+                record = self._try_parse(
+                    payload, instrument, ts_init, parser, label, required=False
+                )
+                if record is None:
+                    continue
+                # The settlement-provenance record is a custom type and must be
+                # wrapped; the other three are native and must not be.
+                if isinstance(record, Data) and type(record).__module__.endswith(
+                    "tape_records"
+                ):
+                    self._publish_custom(record)
+                else:
+                    self._handle_data(record)
+                published += 1
+
+            if (
+                venue_market_state(payload) in EXPIRED_MARKET_STATES
+                and venue_settlement_method(payload) != TERMINAL_SETTLEMENT_METHOD
+            ):
+                self._expired_without_terminal_settlement += 1
+
+        self._sample_clock_offset(quote, ts_init)
+        return published
+
+    def _publish_trade(
+        self, payload: Mapping[str, Any], instrument: Instrument, ts_init: int
+    ) -> int:
+        """Publish an executed print.
+
+        Executed prints are the only ground truth for what actually traded
+        rather than what was merely quoted, and they cannot be reconstructed
+        from a quote tape afterwards.
+        """
+        if not isinstance(instrument, BinaryOption):
+            return 0
+        trade = self._try_parse(
+            payload, instrument, ts_init, parse_trade_tick, "trade", required=False
+        )
+        if trade is None:
+            return 0
+        self._handle_data(trade)
+        self._trades_published += 1
+        return 1
+
+    def _try_parse(
+        self,
+        payload: Mapping[str, Any],
+        instrument: Instrument,
+        ts_init: int,
+        parser: Callable[..., Any],
+        label: str,
+        *,
+        required: bool,
+    ) -> Any:
+        """Run one parser, converting any venue-payload failure into ``None``.
+
+        ``required=True`` logs at ERROR (the quote is the record everything else
+        is measured against); the rest log at DEBUG, because their absence is
+        routinely legitimate and an ERROR per frame would drown the operator.
+        Nothing is ever substituted for a value the venue did not send.
+        """
+        try:
+            return parser(payload, instrument=instrument, ts_init=ts_init)
+        except (PolymarketUSError, ValueError, KeyError, TypeError) as exc:
+            message = (
+                f"Could not parse {label} for {instrument.id}: {type(exc).__name__}"
+            )
+            if required:
+                self._log.error(message)
+            else:
+                self._log.debug(message)
+            return None
+
+    def _note_depth_truncation(
+        self, payload: Mapping[str, Any], depth: Any, ts_init: int
+    ) -> int:
+        """Record -- to the TAPE -- how much of this snapshot did not fit.
+
+        A process-memory counter cannot answer the question an analyst actually
+        asks: *was THIS snapshot, the one beside my crossing event, truncated?*
+        Runtime logs may never reach the study; the archive does. So the marker
+        is a record of its own, stamped with the same ``ts_event`` as the depth
+        record it describes, giving an exact join rather than a
+        nearest-neighbour guess.
+
+        Deliberately NOT stuffed into ``OrderBookDepth10.flags``: that is a
+        Nautilus-defined bitfield with documented meanings, and overloading it
+        would make Breezy's tape misread by any standard Nautilus consumer.
+
+        Emitted only when something was dropped, so absence means "nothing was
+        dropped" -- which is the common case for a quiet market.
+
+        Returns the number of records published (0 or 1).
+        """
+        dropped = depth_levels_dropped(payload)
+        if dropped <= 0:
+            return 0
+
+        market_data = payload.get("marketData")
+        bids_seen = asks_seen = 0
+        if isinstance(market_data, Mapping):
+            for key, attr in (("bids", "bid"), ("offers", "ask")):
+                side = market_data.get(key)
+                count = (
+                    len(side)
+                    if isinstance(side, Sequence) and not isinstance(side, str | bytes | bytearray)
+                    else 0
+                )
+                if attr == "bid":
+                    bids_seen = count
+                else:
+                    asks_seen = count
+
+        self._depth_levels_truncated += dropped
+        self._publish_custom(
+            DepthTruncation(
+                instrument_id=depth.instrument_id,
+                bid_levels_seen=bids_seen,
+                ask_levels_seen=asks_seen,
+                levels_dropped=dropped,
+                ts_event=depth.ts_event,
+                ts_init=ts_init,
+            )
+        )
+        if should_warn_at_count(self._depth_levels_truncated):
+            self._log.warning(
+                f"{self._depth_levels_truncated} book level(s) discarded so far: the "
+                "venue is publishing more than the 10 levels per side that "
+                "OrderBookDepth10 carries. Slippage measured from this tape is "
+                "valid only up to the tenth level; the per-snapshot "
+                "DepthTruncation records say exactly which snapshots are affected."
+            )
+        return 1
+
+    def _sample_clock_offset(self, quote: QuoteTick | None, ts_init: int) -> None:
+        """Publish the host-vs-venue clock offset every N timestamped frames.
+
+        Derived from frames already on the socket -- ``ts_init`` (host receipt)
+        minus ``ts_event`` (the venue's ``transactTime``) -- so it costs no
+        extra request and does not widen this client's read-only surface. The
+        read-only auth smoke measured a ~131 second host offset; without a
+        recorded series, a crossing-time join against host-stamped weather data
+        cannot be reconciled after the fact.
+        """
+        if quote is None or quote.ts_event <= 0:
+            return
+        self._clock_offset_samples += 1
+        if self._clock_offset_samples % CLOCK_OFFSET_SAMPLE_EVERY != 0:
+            return
+        self._publish_custom(
+            VenueClockOffset(
+                source=CLOCK_OFFSET_SOURCE,
+                offset_ns=ts_init - quote.ts_event,
+                samples=self._clock_offset_samples,
+                ts_event=quote.ts_event,
+                ts_init=ts_init,
+            )
+        )
+
+    def _publish_custom(self, record: Data) -> None:
+        """Publish a custom record through the engine.
+
+        ``DataEngine._handle_data`` dispatches custom types only on
+        ``isinstance(data, CustomData)`` (``data/engine.pyx:2570``); a bare
+        payload falls through to the error branch and is never delivered. The
+        engine then republishes the UNWRAPPED object
+        (``engine.pyx:2848``), which is what the streaming writer records.
+        """
+        self._handle_data(CustomData(DataType(type(record)), record))
 
     def _drop_frame(self, reason: str) -> None:
         self._dropped_frames += 1
@@ -557,7 +915,7 @@ class PolymarketUSDataClient(LiveMarketDataClient):
         """
         self._frames_missing_routing_key += 1
         count = self._frames_missing_routing_key
-        if not should_warn_for_missing_routing_key(count):
+        if not should_warn_at_count(count):
             return
         self._log.warning(
             f"{count} inbound market-data frame(s) carried no {MARKET_SLUG_KEY!r} key; "
@@ -571,23 +929,132 @@ class PolymarketUSDataClient(LiveMarketDataClient):
     # -- operability ------------------------------------------------------
 
     async def _watch_feed(self) -> None:
-        """Fail closed once the socket's own supervisor has given up.
+        """Sample the feed's health on a fixed cadence until it is beyond saving.
 
-        The socket owns reconnection, heartbeat and idle timeout. When it
-        reports ``is_degraded`` it has stopped retrying, so no further quotes
-        are coming and the client must stop presenting itself as connected.
+        The loop is deliberately empty of policy: every decision lives in
+        :meth:`sample_feed_health`, which is synchronous and therefore
+        directly testable. A watchdog whose logic can only be exercised by
+        racing an event loop is a watchdog nobody verifies.
         """
         while True:
             await asyncio.sleep(self._feed_watch_interval_secs)
-            if not self._feed.is_degraded:
-                continue
-            self._safe_mode = True
-            self._set_connected(False)
-            self._log.error(
-                "Markets feed lost and not recoverable; entering safe mode "
-                "(client marked disconnected, no further quotes)",
-            )
+            if not self.sample_feed_health():
+                return
+
+    def sample_feed_health(self) -> bool:
+        """Record one observation of the feed. Returns False to stop watching.
+
+        Two jobs, both of which must happen on every sample:
+
+        **Tape-gap accounting.** The socket reconnects and replays
+        subscriptions by itself, so quotes resume and the parquet tape carries
+        no marker of the interruption. Counting the transitions here is the
+        only record that the archive has a hole in it. See :attr:`tape_gaps`
+        for why the count is explicitly a lower bound.
+
+        **Fail closed.** When the socket reports ``is_degraded`` its supervisor
+        has stopped retrying: no further quotes are coming. The client marks
+        itself disconnected rather than presenting a frozen book as live.
+        """
+        connected = self._feed.is_connected
+        previous = self._feed_was_connected
+        self._feed_was_connected = connected
+        now_ns = self._clock.timestamp_ns()
+
+        if previous is not False and not connected:
+            # Falling edge -- including the first sample if it finds the feed
+            # already down, because that is still an interval with no quotes.
+            self._open_tape_gap(now_ns)
+        elif previous is False and connected:
+            self._close_tape_gap(now_ns)
+
+        if not self._feed.is_degraded:
+            return True
+
+        self._safe_mode = True
+        self._set_connected(False)
+        self._log.error(
+            "Markets feed lost and not recoverable; entering safe mode "
+            "(client marked disconnected, no further quotes). "
+            f"{self._tape_gaps} tape gap(s) observed, "
+            f"{self._tape_gap_seconds_total:.1f}s of quotes lost so far -- "
+            "this final gap remains OPEN and its quotes are unrecoverable.",
+        )
+        return False
+
+    def _open_tape_gap(self, now_ns: int) -> None:
+        if self._gap_opened_ns is not None:
             return
+        self._gap_opened_ns = now_ns
+        self._tape_gaps += 1
+        self._log.error(
+            f"Quote tape gap #{self._tape_gaps} OPENED: the markets feed is down. "
+            "Quotes occurring from now until it returns are permanently lost -- "
+            "this venue's weather markets cannot be backfilled.",
+        )
+        self._publish_gap_records(started_ns=now_ns, ended_ns=0, resolved=False, ts_init=now_ns)
+
+    def _close_tape_gap(self, now_ns: int) -> None:
+        opened_ns = self._gap_opened_ns
+        self._gap_opened_ns = None
+        if opened_ns is None:
+            return
+        seconds = max(0.0, (now_ns - opened_ns) / 1_000_000_000)
+        self._tape_gap_seconds_total += seconds
+        self._log.info(
+            f"Quote tape gap #{self._tape_gaps} CLOSED after ~{seconds:.1f}s "
+            f"(observed total {self._tape_gap_seconds_total:.1f}s across "
+            f"{self._tape_gaps} gap(s)). The tape resumes here; it is NOT "
+            "continuous across this point.",
+        )
+        self._publish_gap_records(
+            started_ns=opened_ns, ended_ns=now_ns, resolved=True, ts_init=now_ns
+        )
+
+    def _publish_gap_records(
+        self, *, started_ns: int, ended_ns: int, resolved: bool, ts_init: int
+    ) -> None:
+        """Write the outage to the TAPE, not only to the log.
+
+        A log line is invisible to a study reading parquet. One record per
+        subscribed instrument, because a socket outage affects every market on
+        that socket and a per-instrument key is what lets a join exclude or
+        flag the contaminated interval.
+
+        Emitted on BOTH edges: the ``resolved=False`` record on open means an
+        outage in progress when the process dies is still on disk, which is the
+        gap most likely to be missed and the one that contaminates everything
+        after it.
+        """
+        for instrument_id in self._subscribed_instrument_ids():
+            self._publish_custom(
+                QuoteTapeGap(
+                    instrument_id=instrument_id,
+                    gap_seq=self._tape_gaps,
+                    started_ns=started_ns,
+                    ended_ns=ended_ns,
+                    resolved=resolved,
+                    recorder_instance_id=self._recorder_instance_id,
+                    ts_event=started_ns,
+                    ts_init=ts_init,
+                )
+            )
+
+    def _subscribed_instrument_ids(self) -> list[InstrumentId]:
+        """Instruments this client is recording, resolved from configured slugs.
+
+        Taken from the CONFIG rather than from the socket's live subscription
+        map: during an outage that map may be mid-replay, and a gap that
+        silently covered fewer instruments than it really affected would be
+        worse than no gap record at all.
+        """
+        resolved: list[InstrumentId] = []
+        for slug in self._venue_config.market_slugs:
+            try:
+                resolved.append(slug_to_instrument_id(slug))
+            except PolymarketUSError:  # pragma: no cover - config is validated upstream
+                continue
+        return resolved
 
 
 def build_data_client(
@@ -600,7 +1067,7 @@ def build_data_client(
     clock: LiveClock,
     instrument_provider: InstrumentProvider,
     feed_factory: MarketsFeedFactory,
-    quote_parser: QuoteTickParser,
+    quote_parser: QuoteTickParser = parse_quote_tick,
     feed_watch_interval_secs: float = DEFAULT_FEED_WATCH_INTERVAL_SECS,
 ) -> PolymarketUSDataClient:
     """Wire a data client from the arguments a ``LiveDataClientFactory`` has.

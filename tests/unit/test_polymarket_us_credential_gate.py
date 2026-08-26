@@ -8,7 +8,8 @@ Before this change, ``pytest_sessionstart`` aborted unconditionally when any
 proposed lifting that abort on ``BREEZY_VENUE_LIVE=1``, which was rejected on
 review: that one variable would both silence the credential kill-switch AND
 unlock ``venue_live`` execution, so a single stray line in a shell profile
-would fire real signed requests where that had been structurally impossible.
+would fire real signed read requests where the default pytest credential
+tripwire previously refused at startup.
 
 The gate therefore requires THREE independently-named factors, no one of
 which both silences the abort and unlocks execution:

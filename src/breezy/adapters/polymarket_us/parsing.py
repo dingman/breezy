@@ -60,9 +60,23 @@ from decimal import Decimal, InvalidOperation
 from typing import Any
 
 from nautilus_trader.model.currencies import USD
-from nautilus_trader.model.data import QuoteTick
-from nautilus_trader.model.enums import AssetClass
-from nautilus_trader.model.identifiers import Symbol, Venue
+from nautilus_trader.model.data import (
+    BookOrder,
+    InstrumentClose,
+    InstrumentStatus,
+    MarkPriceUpdate,
+    OrderBookDepth10,
+    QuoteTick,
+    TradeTick,
+)
+from nautilus_trader.model.enums import (
+    AggressorSide,
+    AssetClass,
+    InstrumentCloseType,
+    MarketStatusAction,
+    OrderSide,
+)
+from nautilus_trader.model.identifiers import Symbol, TradeId, Venue
 from nautilus_trader.model.instruments import BinaryOption, Instrument
 from nautilus_trader.model.objects import Price, Quantity
 
@@ -77,19 +91,96 @@ from breezy.adapters.polymarket_us.symbology import (
     parse_weather_slug,
     slug_to_instrument_id,
 )
+from breezy.adapters.polymarket_us.tape_records import VenueSettlementSnapshot
 
 __all__ = [
     "CLIMATE_CATEGORY",
+    "DEPTH10_LEVELS",
+    "EXPIRED_MARKET_STATES",
     "FEE_SCHEDULE_STATUS_KEY",
     "FEE_SCHEDULE_STATUS_KNOWN",
     "FEE_SCHEDULE_STATUS_UNKNOWN",
+    "OBSERVED_SETTLEMENT_METHODS",
     "QUOTE_CURRENCY_CODE",
+    "TERMINAL_SETTLEMENT_METHOD",
+    "TRADE_CONTAINER_KEY",
     "assert_fee_schedule_known",
+    "depth_levels_dropped",
     "parse_binary_option",
+    "parse_book_levels",
     "parse_book_top",
+    "parse_instrument_close",
+    "parse_instrument_status",
+    "parse_mark_price",
+    "parse_order_book_depth10",
     "parse_quote_tick",
     "parse_rfc3339_nanos",
+    "parse_settlement_snapshot",
+    "parse_trade_tick",
+    "venue_market_state",
+    "venue_settlement_method",
 ]
+
+#: Levels per side carried by ``OrderBookDepth10``. Fixed by Nautilus
+#: (``model/data.pyx:3491-3495``), not a Breezy choice.
+DEPTH10_LEVELS: int = 10
+
+#: The frame container holding an executed print.
+#:
+#: UNRESOLVED venue fact: no trade frame has been captured. The key is the one
+#: ``data._classify_frame`` already recognises, and every field inside is
+#: REQUIRED -- a frame that does not match raises and is dropped and counted by
+#: the caller, so a wrong guess degrades to "no trades recorded", never to a
+#: fabricated print. Confirmation is a live-probe question for
+#: ``polymarket-us-discovery``.
+TRADE_CONTAINER_KEY: str = "trade"
+
+#: Venue ``state`` values that mean the contract has reached a terminal
+#: settlement, so ``settlementPx`` is the final value rather than a daily mark.
+#: ``MARKET_STATE_EXPIRED`` is observed in the committed capture
+#: ``book_closed_15806.json``; the others are defensive and, if they never
+#: occur, cost nothing. A state NOT listed here never produces an
+#: ``InstrumentClose``.
+EXPIRED_MARKET_STATES: frozenset[str] = frozenset(
+    {"MARKET_STATE_EXPIRED", "MARKET_STATE_SETTLED", "MARKET_STATE_CLOSED"}
+)
+
+#: The ONLY ``settlementPriceCalculationMethod`` value that may create a
+#: TERMINAL settlement record.
+#:
+#: Observed in ``book_closed_15806.json`` on an expired market whose
+#: ``settlementPx`` is ``1.0000`` and whose ``closePx`` is absent. The live
+#: capture carries ``..._EVENT_TIER_2`` with ``settlementPx == closePx``, i.e.
+#: a daily mark.
+#:
+#: Gating on ``state`` alone would be one frame away from permanent corruption:
+#: if the venue flips ``state`` to EXPIRED before republishing a
+#: terminally-computed price, a mark-derived number becomes the settlement
+#: truth that REQ-SETTLE-04/08 and everything trained on it treat as ground
+#: truth -- in an archive that can never be re-recorded.
+TERMINAL_SETTLEMENT_METHOD: str = "SETTLEMENT_PRICE_CALCULATION_METHOD_EVENT_TIER_1"
+
+#: Every method value ever observed. The enum is otherwise UNRESOLVED, and a
+#: value outside this set is NEVER treated as terminal -- a third value might
+#: be a new terminal method or a new intraday one, and guessing which is
+#: guessing about settlement truth. Recorded verbatim either way, so the
+#: judgement can be re-derived later rather than lost.
+OBSERVED_SETTLEMENT_METHODS: frozenset[str] = frozenset(
+    {
+        TERMINAL_SETTLEMENT_METHOD,
+        "SETTLEMENT_PRICE_CALCULATION_METHOD_EVENT_TIER_2",
+    }
+)
+
+#: Venue taker-side spellings mapped onto Nautilus's aggressor side. UNRESOLVED:
+#: no trade frame has been captured, so an unrecognised token maps to
+#: ``NO_AGGRESSOR`` rather than to a guessed direction.
+_TAKER_SIDES: dict[str, AggressorSide] = {
+    "SIDE_BUY": AggressorSide.BUYER,
+    "SIDE_SELL": AggressorSide.SELLER,
+    "BUY": AggressorSide.BUYER,
+    "SELL": AggressorSide.SELLER,
+}
 
 #: The only settlement currency Polymarket.us (a fiat DCM) is documented to use.
 #: A payload naming anything else is refused rather than coerced.
@@ -314,7 +405,16 @@ def _parse_amount(
 # ---------------------------------------------------------------------------
 
 
-def _best_level(levels: object, *, side: str, want_lowest: bool) -> tuple[Decimal, Decimal]:
+def _parse_levels(levels: object, *, side: str) -> list[tuple[Decimal, Decimal]]:
+    """Validate and return EVERY level of one book side, in venue order.
+
+    Previously this function range-checked all levels and then returned a
+    single ``min()``/``max()``. Every level below the top was validated and
+    discarded, which made slippage-at-size unmeasurable from the recorded tape
+    -- see ``tests/unit/test_polymarket_us_depth_parsing.py`` for why that
+    biases the Phase 1.5 gate. The validation is unchanged; only the discarding
+    is gone.
+    """
     if not isinstance(levels, Sequence) or isinstance(levels, (str, bytes)):
         raise VenuePayloadError(
             f"Book side {side!r} must be a JSON array, got {type(levels).__name__}"
@@ -343,7 +443,34 @@ def _best_level(levels: object, *, side: str, want_lowest: bool) -> tuple[Decima
                 f"Book level {side}[{index}] size {size} is not a positive size"
             )
         parsed.append((price, size))
+    return parsed
+
+
+def _best_level(levels: object, *, side: str, want_lowest: bool) -> tuple[Decimal, Decimal]:
+    parsed = _parse_levels(levels, side=side)
     return min(parsed) if want_lowest else max(parsed)
+
+
+def parse_book_levels(
+    payload: Mapping[str, Any],
+) -> tuple[list[tuple[Decimal, Decimal]], list[tuple[Decimal, Decimal]]]:
+    """Return ``(bids, asks)`` as fully validated, best-first ``Decimal`` levels.
+
+    Sorted here rather than trusted from the venue: position carries meaning to
+    a slippage walk (level ``n`` is the ``n``-th best), and a venue that stops
+    sorting a side would otherwise produce a silently wrong slippage estimate
+    from a tape that looks perfectly well formed.
+    """
+    market_data = _require_mapping(payload, "marketData", context="order book payload")
+    bids = _parse_levels(_require(market_data, "bids", error=VenuePayloadError), side="bids")
+    asks = _parse_levels(_require(market_data, "offers", error=VenuePayloadError), side="offers")
+    bids.sort(key=lambda level: level[0], reverse=True)
+    asks.sort(key=lambda level: level[0])
+    if bids[0][0] > asks[0][0]:
+        raise VenuePayloadError(
+            f"Order book is crossed: best bid {bids[0][0]} exceeds best offer {asks[0][0]}"
+        )
+    return bids, asks
 
 
 def parse_book_top(payload: Mapping[str, Any]) -> tuple[Decimal, Decimal, Decimal, Decimal]:
@@ -400,6 +527,402 @@ def parse_quote_tick(
         ask_price=_build_price(ask_price, precision=instrument.price_precision, field="offers.px"),
         bid_size=_build_quantity(bid_size, precision=instrument.size_precision, field="bids.qty"),
         ask_size=_build_quantity(ask_size, precision=instrument.size_precision, field="offers.qty"),
+        ts_event=ts_event,
+        ts_init=ts_init,
+    )
+
+
+def _market_data(payload: Mapping[str, Any], *, instrument: BinaryOption) -> Mapping[str, Any]:
+    """Return the ``marketData`` envelope, refusing a frame for another slug."""
+    market_data = _require_mapping(payload, "marketData", context="market data payload")
+    expected_slug = instrument.id.symbol.value
+    observed_slug = _require(market_data, "marketSlug", error=VenuePayloadError)
+    if observed_slug != expected_slug:
+        raise VenuePayloadError(
+            f"Market data frame is for slug {observed_slug!r} but was parsed against "
+            f"instrument {expected_slug!r}"
+        )
+    return market_data
+
+
+def parse_order_book_depth10(
+    payload: Mapping[str, Any], *, instrument: BinaryOption, ts_init: int
+) -> OrderBookDepth10:
+    """Build a native ``OrderBookDepth10`` from a book or market-data frame.
+
+    **Why the native type and not a custom one.** ``OrderBookDepth10`` is
+    Arrow-registered (``serialization/arrow/serializer.py``), is a
+    per-instrument table in ``StreamingFeatherWriter``
+    (``persistence/writer.py:137-147``), partitions natively into
+    ``data/order_book_depths/<instrument_id>/``, and carries ``to_quote_tick()``
+    for free. Measured end to end before this function was written. A custom
+    depth type would have reimplemented all of that.
+
+    **Truncation is real and is the price of the native carrier.** The
+    committed capture ``book_open_510636.json`` has **12 bid levels and 14 offer
+    levels**, so ten-per-side is a genuine cut, not a theoretical one. The
+    caller counts truncations (``PolymarketUSDataClient.depth_levels_truncated``)
+    and warns, because an analyst who assumes the tape is the whole book will
+    understate available liquidity beyond level ten. Ten levels is nonetheless
+    what slippage-at-intended-size needs, and it is ten times what the previous
+    top-of-book-only tape carried.
+
+    **Padding is authored, and must be.** ``OrderBookDepth10.__init__`` pads a
+    short side with ``NULL_ORDER``, whose price and size precision are 0. The
+    Arrow encoder then rejects the record outright --
+    ``ValueError: Mixed metadata at row 0`` -- and the writer swallows that into
+    a log line, so a thin book would vanish from the tape silently. Executed and
+    reproduced. Padding at the instrument's own precision is what makes a thin
+    market recordable at all.
+    """
+    market_data = _market_data(payload, instrument=instrument)
+    ts_event = parse_rfc3339_nanos(
+        _require(market_data, "transactTime", error=VenuePayloadError), field="transactTime"
+    )
+    bids, asks = parse_book_levels(payload)
+
+    price_precision = instrument.price_precision
+    size_precision = instrument.size_precision
+
+    def side_orders(
+        levels: list[tuple[Decimal, Decimal]], side: OrderSide, field: str
+    ) -> tuple[list[BookOrder], list[int]]:
+        kept = levels[:DEPTH10_LEVELS]
+        orders = [
+            BookOrder(
+                side,
+                _build_price(price, precision=price_precision, field=f"{field}.px"),
+                _build_quantity(size, precision=size_precision, field=f"{field}.qty"),
+                0,
+            )
+            for price, size in kept
+        ]
+        counts = [1] * len(orders)
+        # Precision-matched filler, NOT Nautilus's NULL_ORDER. See the docstring.
+        filler = BookOrder(side, Price(0, price_precision), Quantity(0, size_precision), 0)
+        while len(orders) < DEPTH10_LEVELS:
+            orders.append(filler)
+            counts.append(0)
+        return orders, counts
+
+    bid_orders, bid_counts = side_orders(bids, OrderSide.BUY, "bids")
+    ask_orders, ask_counts = side_orders(asks, OrderSide.SELL, "offers")
+
+    return OrderBookDepth10(
+        instrument_id=instrument.id,
+        bids=bid_orders,
+        asks=ask_orders,
+        bid_counts=bid_counts,
+        ask_counts=ask_counts,
+        flags=0,
+        # No venue sequence number is present in any capture. Zero is what
+        # Nautilus documents for that case (``model/data.pyx:3460-3462``);
+        # inventing a counter here would look like venue ordering and is not.
+        sequence=0,
+        ts_event=ts_event,
+        ts_init=ts_init,
+    )
+
+
+def depth_levels_dropped(payload: Mapping[str, Any]) -> int:
+    """Levels the ten-per-side carrier could not keep. Zero when nothing is cut."""
+    market_data = payload.get("marketData")
+    if not isinstance(market_data, Mapping):
+        return 0
+    dropped = 0
+    for key in ("bids", "offers"):
+        side = market_data.get(key)
+        if isinstance(side, Sequence) and not isinstance(side, (str, bytes)):
+            dropped += max(0, len(side) - DEPTH10_LEVELS)
+    return dropped
+
+
+def parse_trade_tick(
+    payload: Mapping[str, Any], *, instrument: BinaryOption, ts_init: int
+) -> TradeTick:
+    """Build a ``TradeTick`` from an executed-print frame.
+
+    Executed prints are the only ground truth for what actually traded rather
+    than what was merely quoted (REQ-DATA-04), and they cannot be reconstructed
+    later from a quote tape.
+
+    **UNRESOLVED venue fact.** No trade frame has been captured; the field names
+    here are the singular forms already used by the book payload
+    (``px``/``qty``/``transactTime``/``marketSlug``) plus ``tradeId`` and
+    ``takerSide``. Every one is REQUIRED except ``takerSide``, so a frame that
+    does not match raises :class:`VenuePayloadError` and is dropped and counted
+    by the caller. A wrong guess therefore degrades to "no trades recorded",
+    which the drop counter makes visible -- never to a fabricated print.
+    """
+    trade = _require_mapping(payload, TRADE_CONTAINER_KEY, context="trade payload")
+    expected_slug = instrument.id.symbol.value
+    observed_slug = _require(trade, "marketSlug", error=VenuePayloadError)
+    if observed_slug != expected_slug:
+        raise VenuePayloadError(
+            f"Trade frame is for slug {observed_slug!r} but was parsed against "
+            f"instrument {expected_slug!r}"
+        )
+    price = _parse_amount(_require(trade, "px", error=VenuePayloadError), field="trade.px")
+    if price < _PRICE_MIN or price > _PRICE_MAX:
+        raise VenuePayloadError(
+            f"Trade price {price} is outside the binary-option range "
+            f"[{_PRICE_MIN}, {_PRICE_MAX}]"
+        )
+    size = _to_decimal(
+        _require(trade, "qty", error=VenuePayloadError), field="trade.qty", error=VenuePayloadError
+    )
+    if size <= 0:
+        raise VenuePayloadError(f"Trade size {size} is not a positive size")
+    ts_event = parse_rfc3339_nanos(
+        _require(trade, "transactTime", error=VenuePayloadError), field="transactTime"
+    )
+    raw_trade_id = _require(trade, "tradeId", error=VenuePayloadError)
+    if not isinstance(raw_trade_id, str) or not raw_trade_id.strip():
+        raise VenuePayloadError("Field 'tradeId' must be a non-empty string")
+
+    raw_side = trade.get("takerSide")
+    aggressor = _TAKER_SIDES.get(raw_side, AggressorSide.NO_AGGRESSOR) if isinstance(
+        raw_side, str
+    ) else AggressorSide.NO_AGGRESSOR
+
+    return TradeTick(
+        instrument_id=instrument.id,
+        price=_build_price(price, precision=instrument.price_precision, field="trade.px"),
+        size=_build_quantity(size, precision=instrument.size_precision, field="trade.qty"),
+        aggressor_side=aggressor,
+        trade_id=TradeId(raw_trade_id.strip()),
+        ts_event=ts_event,
+        ts_init=ts_init,
+    )
+
+
+def venue_market_state(payload: Mapping[str, Any]) -> str | None:
+    """Return the raw venue ``state`` string, or ``None`` when absent.
+
+    Observed values in the committed captures: ``MARKET_STATE_OPEN``
+    (``book_open_510636.json``) and ``MARKET_STATE_EXPIRED``
+    (``book_closed_15806.json``). The full enum is UNRESOLVED, which is exactly
+    why the value is returned as a string and never coerced.
+    """
+    market_data = payload.get("marketData")
+    if not isinstance(market_data, Mapping):
+        return None
+    state = market_data.get("state")
+    return state if isinstance(state, str) and state.strip() else None
+
+
+def parse_instrument_status(
+    payload: Mapping[str, Any], *, instrument: BinaryOption, ts_init: int
+) -> InstrumentStatus | None:
+    """Carry the venue's market state, VERBATIM, on the native status record.
+
+    ``action`` is deliberately ``MarketStatusAction.NONE``. Nautilus's enum has
+    no member meaning ``MARKET_STATE_EXPIRED``, and choosing the nearest one
+    would bake a guess about an UNRESOLVED venue enum into an archive that can
+    never be re-recorded. ``reason`` is a free-text field, so the venue's own
+    string survives byte for byte and can be re-interpreted later once the enum
+    is known. Nothing is lost and nothing is invented.
+    """
+    state = venue_market_state(payload)
+    if state is None:
+        return None
+    market_data = _market_data(payload, instrument=instrument)
+    ts_event = parse_rfc3339_nanos(
+        _require(market_data, "transactTime", error=VenuePayloadError), field="transactTime"
+    )
+    return InstrumentStatus(
+        instrument_id=instrument.id,
+        action=MarketStatusAction.NONE,
+        ts_event=ts_event,
+        ts_init=ts_init,
+        reason=state,
+    )
+
+
+def _stats(payload: Mapping[str, Any]) -> Mapping[str, Any] | None:
+    market_data = payload.get("marketData")
+    if not isinstance(market_data, Mapping):
+        return None
+    stats = market_data.get("stats")
+    return stats if isinstance(stats, Mapping) else None
+
+
+def venue_settlement_method(payload: Mapping[str, Any]) -> str | None:
+    """Return the raw ``settlementPriceCalculationMethod``, or ``None`` if absent.
+
+    Returned as a STRING and never coerced onto an enum: only two values have
+    ever been observed and the rest of the space is UNRESOLVED. See
+    :data:`TERMINAL_SETTLEMENT_METHOD`.
+    """
+    stats = _stats(payload)
+    if stats is None:
+        return None
+    method = stats.get("settlementPriceCalculationMethod")
+    return method if isinstance(method, str) and method.strip() else None
+
+
+def _venue_settlement_px_text(payload: Mapping[str, Any]) -> str | None:
+    """The venue's own spelling of ``settlementPx.value``, unmodified.
+
+    Kept as text so the settlement-truth record never silently acquires our
+    formatting: the capture spells it ``"1.0000"`` (four places) while the
+    instrument's price precision is three.
+    """
+    stats = _stats(payload)
+    if stats is None:
+        return None
+    raw = stats.get("settlementPx")
+    if not isinstance(raw, Mapping):
+        return None
+    value = raw.get("value")
+    return value if isinstance(value, str) and value.strip() else None
+
+
+def _is_terminal_settlement(payload: Mapping[str, Any]) -> bool:
+    """Both the state AND the venue's own method must say so. Never either."""
+    state = venue_market_state(payload)
+    if state is None or state not in EXPIRED_MARKET_STATES:
+        return False
+    return venue_settlement_method(payload) == TERMINAL_SETTLEMENT_METHOD
+
+
+def _settlement_amount(payload: Mapping[str, Any]) -> tuple[Decimal, int] | None:
+    stats = _stats(payload)
+    if stats is None:
+        return None
+    raw = stats.get("settlementPx")
+    if raw is None:
+        return None
+    price = _parse_amount(raw, field="stats.settlementPx")
+    if price < _PRICE_MIN or price > _PRICE_MAX:
+        raise VenuePayloadError(
+            f"Settlement price {price} is outside the binary-option range "
+            f"[{_PRICE_MIN}, {_PRICE_MAX}]"
+        )
+    raw_time = stats.get("settlementSetTime")
+    if not isinstance(raw_time, str):
+        return None
+    return price, parse_rfc3339_nanos(raw_time, field="settlementSetTime")
+
+
+def parse_settlement_snapshot(
+    payload: Mapping[str, Any], *, instrument: BinaryOption, ts_init: int
+) -> VenueSettlementSnapshot | None:
+    """Record the venue's settlement fields VERBATIM, on every bearing frame.
+
+    Emitted whether or not the frame is allowed to create a terminal
+    settlement, which is the point: an EXPIRED market whose price is not yet
+    terminally computed produces no ``InstrumentClose``, and without this
+    record that refusal would also be a silence. "Record it and wait" needs
+    something recorded.
+
+    ``is_terminal`` is the derived judgement stored ALONGSIDE its raw inputs
+    (``state``, ``method``), never instead of them, so a later correction to
+    the rule can be applied retrospectively to an archive that cannot be
+    re-recorded.
+
+    Both venue clocks are kept: ``ts_event`` is ``settlementSetTime`` (when the
+    venue COMPUTED the price) and ``venue_transact_time_ns`` is the frame's own
+    ``transactTime`` (when the venue DISCLOSED it). They differ by hours in the
+    committed capture, and a settlement dispute turns on the lag between them.
+    """
+    method = venue_settlement_method(payload)
+    settlement_px = _venue_settlement_px_text(payload)
+    if method is None or settlement_px is None:
+        return None
+    state = venue_market_state(payload)
+    if state is None:
+        return None
+    settlement = _settlement_amount(payload)
+    if settlement is None:
+        return None
+    _, ts_event = settlement
+    # Read via `_stats`'s unvalidated sibling rather than `_market_data`: this
+    # function deliberately does NOT re-assert the slug/instrument match, which
+    # is the caller's job and is already done upstream in the routing path.
+    # Introducing that check here would change when provenance is recorded, and
+    # the whole point of this record is that it is recorded whenever possible.
+    market_data = payload.get("marketData")
+    if not isinstance(market_data, Mapping):
+        return None
+    raw_transact = market_data.get("transactTime")
+    if not isinstance(raw_transact, str):
+        return None
+    transact_time = parse_rfc3339_nanos(raw_transact, field="transactTime")
+    return VenueSettlementSnapshot(
+        instrument_id=instrument.id,
+        state=state,
+        method=method,
+        settlement_px=settlement_px,
+        is_terminal=_is_terminal_settlement(payload),
+        venue_transact_time_ns=transact_time,
+        ts_event=ts_event,
+        ts_init=ts_init,
+    )
+
+
+def parse_mark_price(
+    payload: Mapping[str, Any], *, instrument: BinaryOption, ts_init: int
+) -> MarkPriceUpdate | None:
+    """Capture the venue's own ``settlementPx`` as a native ``MarkPriceUpdate``.
+
+    **Not an ``InstrumentClose``.** The committed OPEN-market capture carries
+    ``state=MARKET_STATE_OPEN`` alongside ``settlementPx=0.4900``, so on a live
+    market this field is a daily mark, not a terminal value. Recording it as a
+    close price would fabricate a settlement that has not happened.
+    :func:`parse_instrument_close` handles the terminal case separately.
+
+    ``ts_event`` is the venue's ``settlementSetTime``, not the frame's
+    ``transactTime``: in the capture they differ by hours, and the mark's own
+    timestamp is the one that matters for any later join.
+    """
+    settlement = _settlement_amount(payload)
+    if settlement is None:
+        return None
+    price, ts_event = settlement
+    return MarkPriceUpdate(
+        instrument_id=instrument.id,
+        value=_build_price(
+            price, precision=instrument.price_precision, field="stats.settlementPx"
+        ),
+        ts_event=ts_event,
+        ts_init=ts_init,
+    )
+
+
+def parse_instrument_close(
+    payload: Mapping[str, Any], *, instrument: BinaryOption, ts_init: int
+) -> InstrumentClose | None:
+    """Emit the venue's TERMINAL settlement value, and only when it is terminal.
+
+    **TWO conditions, both required.** The state must be in
+    :data:`EXPIRED_MARKET_STATES` AND the venue's own
+    ``settlementPriceCalculationMethod`` must be
+    :data:`TERMINAL_SETTLEMENT_METHOD`. Gating on the state alone is one frame
+    away from permanent corruption: if the venue flips ``state`` before it
+    republishes a terminally-computed price, a mark-derived number would be
+    recorded as settlement truth in an archive with no correction path.
+
+    A refusal here is not a loss -- :func:`parse_settlement_snapshot` records
+    the frame verbatim either way, so "expired but not yet terminal" is visible
+    on disk rather than silent.
+
+    This is the venue's own authoritative settlement number, which plan item
+    1.2's ledger needs and which venue REST may not retain once the market ages
+    out -- capture it while it is on the wire or lose it.
+    """
+    if not _is_terminal_settlement(payload):
+        return None
+    settlement = _settlement_amount(payload)
+    if settlement is None:
+        return None
+    price, ts_event = settlement
+    return InstrumentClose(
+        instrument_id=instrument.id,
+        close_price=_build_price(
+            price, precision=instrument.price_precision, field="stats.settlementPx"
+        ),
+        close_type=InstrumentCloseType.CONTRACT_EXPIRED,
         ts_event=ts_event,
         ts_init=ts_init,
     )

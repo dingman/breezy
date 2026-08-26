@@ -123,6 +123,23 @@ def test_transport_does_not_expose_the_http_client_as_an_attribute(
     assert exposed == [], f"barrier B3: HttpClient reachable via attribute(s) {exposed}"
 
 
+@pytest.mark.allow_socket
+def test_transport_does_not_expose_real_pyo3_client_through_bound_method_self() -> None:
+    """B3 must not leave ``transport._get.__self__`` pointing at HttpClient."""
+    transport = _transport()
+
+    exposed = []
+    for name in dir(transport):
+        if name.startswith("__"):
+            continue
+        value = getattr(transport, name, None)
+        receiver = getattr(value, "__self__", None)
+        if receiver is not None and callable(getattr(receiver, "post", None)):
+            exposed.append(f"{name}.__self__ -> {type(receiver).__name__}.post")
+
+    assert exposed == [], "barrier B3 receiver escape(s): " + ", ".join(exposed)
+
+
 def test_transport_defines_slots_so_no_client_can_be_attached_later(
     recording_client: type[_RecordingHttpClient],
 ) -> None:

@@ -21,8 +21,11 @@ design, and which this module closes:
   ``scripts/`` **and** ``tests/``.
 * **Escape B (inside the package).** ``nautilus_pyo3.HttpClient`` is
   POST-capable, so ``client._transport._client.post(...)`` reaches a write
-  verb without the string literal ``"POST"`` appearing anywhere. Closed by
-  the attribute rule in :func:`find_write_egress_violations`.
+  verb without the string literal ``"POST"`` appearing anywhere. A second
+  escape through ``transport._get.__self__.post`` exists if the transport
+  stores a bound pyo3 method. Closed by the runtime receiver-graph check in
+  :func:`find_write_capable_receiver_exposures` plus the attribute rule in
+  :func:`find_write_egress_violations`.
 
 DETECTION ALGORITHM (stated in full so it is falsifiable, and exercised by
 the ``*_detects_*`` proof-by-construction tests below -- no barrier here is
@@ -81,6 +84,9 @@ import re
 from collections.abc import Iterator
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
+
+import pytest
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 
@@ -235,6 +241,56 @@ def scan_write_egress(roots: tuple[str, ...] = EGRESS_SCAN_ROOTS) -> list[Violat
 
 
 # --------------------------------------------------------------------------
+# B3 runtime receiver graph -- no pyo3 client exposed through attributes
+# --------------------------------------------------------------------------
+
+
+class _WriteCapableHttpClient:
+    def __init__(self, *_args: Any, **_kwargs: Any) -> None:
+        return
+
+    async def get(self, *_args: Any, **_kwargs: Any) -> object:
+        return object()
+
+    def post(self, *_args: Any, **_kwargs: Any) -> object:
+        return object()
+
+
+def find_write_capable_receiver_exposures(obj: object) -> list[Violation]:
+    """Find ordinary attribute paths exposing an object with a write verb.
+
+    This intentionally checks two Python-level mistakes a source scan cannot
+    prove away: storing the client directly, and storing a bound method whose
+    ``__self__`` is the client.
+    """
+    found: list[Violation] = []
+    for name in dir(obj):
+        if name.startswith("__"):
+            continue
+        value = getattr(obj, name)
+        if callable(getattr(value, "post", None)):
+            found.append(
+                Violation(
+                    "<object>",
+                    0,
+                    "B3",
+                    f"{name} exposes write-capable receiver directly",
+                )
+            )
+        receiver = getattr(value, "__self__", None)
+        if receiver is not None and callable(getattr(receiver, "post", None)):
+            found.append(
+                Violation(
+                    "<object>",
+                    0,
+                    "B3",
+                    f"{name}.__self__ exposes write-capable receiver",
+                )
+            )
+    return found
+
+
+# --------------------------------------------------------------------------
 # B5 -- SDK signing-module import ban, prefix matched
 # --------------------------------------------------------------------------
 
@@ -373,6 +429,47 @@ def test_b4_scan_covers_both_src_and_scripts() -> None:
     scanned = {path for path, _ in iter_python_sources(EGRESS_SCAN_ROOTS)}
     assert any(p.startswith("src/") for p in scanned)
     assert any(p.startswith("scripts/") for p in scanned)
+
+
+# ==========================================================================
+# Barrier B3 -- no write-capable pyo3 client exposed through transport object
+# ==========================================================================
+
+
+def test_b3_constructed_transport_exposes_no_write_capable_receiver(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from nautilus_trader.core import nautilus_pyo3
+
+    from breezy.adapters.polymarket_us.transport import NautilusHttpTransport
+
+    monkeypatch.setattr(nautilus_pyo3, "HttpClient", _WriteCapableHttpClient)
+
+    transport = NautilusHttpTransport(
+        timeout_secs=5,
+        default_quota=object(),
+        keyed_quotas=[],
+        default_headers={"User-Agent": "breezy-b3-test/1.0 (+mailto:ops@example.com)"},
+    )
+
+    violations = find_write_capable_receiver_exposures(transport)
+    assert violations == [], "B3 receiver exposure(s):\n" + "\n".join(
+        str(v) for v in violations
+    )
+
+
+def test_b3_detector_catches_the_bound_method_self_escape() -> None:
+    class LeakyTransport:
+        __slots__ = ("_get",)
+
+        def __init__(self) -> None:
+            client = _WriteCapableHttpClient()
+            self._get = client.get
+
+    violations = find_write_capable_receiver_exposures(LeakyTransport())
+
+    assert [v.rule for v in violations] == ["B3"]
+    assert "_get.__self__ exposes write-capable receiver" in violations[0].detail
 
 
 # ==========================================================================

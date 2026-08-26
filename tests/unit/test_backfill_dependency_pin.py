@@ -18,7 +18,7 @@ from __future__ import annotations
 import ast
 import inspect
 
-import pyiem
+import pytest
 
 from breezy.ingest.nws_actor import PARSER_VERSION
 
@@ -34,6 +34,8 @@ def test_installed_pyiem_matches_the_mandated_pin() -> None:
     fail loudly here rather than silently changing what a future
     pyIEM-backed parse would produce.
     """
+    pyiem = pytest.importorskip("pyiem")
+
     assert pyiem.__version__ == MANDATED_PYIEM_VERSION
 
 

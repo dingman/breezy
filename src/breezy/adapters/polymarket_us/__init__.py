@@ -28,11 +28,14 @@ with the same name as the key in ``TradingNodeConfig.data_clients``, because
 What is deliberately NOT here
 -----------------------------
 No execution client, no order path, no fee model, no strategy. This slice is
-GET-only and structurally so: the signer refuses any method but ``GET``
-(barrier B2), the HTTP client exposes only two read methods (B1), the
-transport keeps its pyo3 client out of the attribute graph (B3), and
-repo-wide AST barriers (B4/B5) scan ``src/`` and ``scripts/`` for write
-verbs and for imports of the venue SDK's signing module.
+GET-only across ordinary adapter/script paths: the signer refuses any method
+but ``GET`` (barrier B2), the HTTP client exposes only two read methods (B1),
+the transport keeps its pyo3 client out of attribute and bound-method
+``__self__`` reachability (B3), and repo-wide AST barriers (B4/B5) scan
+``src/`` and ``scripts/`` for write verbs and for imports of the venue SDK's
+signing module. B3 is pinned by
+``test_transport_does_not_expose_real_pyo3_client_through_bound_method_self``
+and ``test_b3_constructed_transport_exposes_no_write_capable_receiver``.
 
 No secret is exported, and none can be. Credentials live only in
 ``RedactedSecureString`` at runtime and are resolved exclusively in the

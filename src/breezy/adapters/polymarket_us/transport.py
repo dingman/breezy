@@ -12,9 +12,10 @@ Nautilus does not and should not know about:
    client can be driven by a recording double in tests without monkeypatching
    a third-party object's private attributes (plan D4, evidence 1);
 2. the venue rate-limit budget (section 8.2) expressed as ``Quota`` objects;
-3. **order-submission barrier B3**: the pyo3 client is captured as a bound
-   ``get`` coroutine and is NOT stored as an attribute, so there is no
-   ``transport._client`` to walk to a write verb. ``__slots__`` closes the
+3. **order-submission barrier B3**: the pyo3 client is captured inside a
+   module-private GET-only callable whose instance has no client attribute and
+   no bound method whose ``__self__`` is the client. There is no
+   ``transport._client`` to walk to a write verb, and ``__slots__`` closes the
    companion hole -- a write-capable client cannot be attached later either.
 
 The pyo3 client is looked up as ``nautilus_pyo3.HttpClient`` at construction
@@ -101,6 +102,28 @@ DEFAULT_BOOK_REQUESTS_PER_MINUTE: int = 12
 DEFAULT_PORTFOLIO_REQUESTS_PER_MINUTE: int = 12
 
 
+def _build_get_only_callable(client: Any) -> Callable[..., Awaitable[Any]]:
+    """Return a callable GET proxy without storing ``client`` on an object.
+
+    The returned object exposes only ``__call__``. Its ``__self__`` is the proxy
+    object, not the pyo3 client, and the proxy has no attributes. The client is
+    still reachable through deliberate Python function-closure introspection;
+    B3's purpose is to remove the ordinary attribute and bound-method receiver
+    paths that a caller or refactor would naturally take.
+    """
+
+    class _GetOnlyCallable:
+        __slots__ = ()
+
+        async def __call__(self, *args: Any, **kwargs: Any) -> Any:
+            return await client.get(*args, **kwargs)
+
+        def __repr__(self) -> str:
+            return "NautilusHttpTransportGetOnlyCallable()"
+
+    return _GetOnlyCallable()
+
+
 @dataclass(frozen=True, slots=True)
 class VenueResponse:
     """One venue HTTP response, reduced to what the read path may observe.
@@ -184,16 +207,17 @@ def build_keyed_quotas(
 class NautilusHttpTransport:
     """GET-only wrapper over ``nautilus_pyo3.HttpClient`` (barrier B3).
 
-    The constructor builds the client as a LOCAL and keeps only its bound
-    ``get`` coroutine. Storing the client itself would put
-    ``transport._client.post(...)`` one attribute hop away from any caller --
-    an escape that contains no ``POST``-shaped literal for a source scan to
-    find. ``__slots__`` prevents a client being attached afterwards.
+    The constructor builds the client as a LOCAL and keeps only a GET-only
+    callable object closed over that local. Storing the client itself would put
+    ``transport._client.post(...)`` one attribute hop away from any caller.
+    Storing ``client.get`` is also insufficient because bound methods expose
+    their receiver as ``__self__``. ``__slots__`` prevents a client being
+    attached afterwards.
 
-    The Python object graph does still reach the client through
-    ``self._get.__self__``; that is not an accident anyone commits, and the
-    repo-wide AST barrier flags write-verb attribute access inside this package
-    explicitly. What is removed is the *ordinary* path.
+    The Python object graph can still reach the client through deliberate
+    closure-cell introspection on the callable's class method. That is a
+    language residual, not an ordinary attribute path or a bound-method
+    receiver path.
     """
 
     __slots__ = ("_get", "_permitted_quota_keys")
@@ -223,7 +247,7 @@ class NautilusHttpTransport:
             timeout_secs=timeout_secs,
         )
         # Barrier B3. `client` is a local and is never stored.
-        self._get: Callable[..., Awaitable[Any]] = client.get
+        self._get: Callable[..., Awaitable[Any]] = _build_get_only_callable(client)
         self._permitted_quota_keys: frozenset[str] = permitted_quota_keys
 
     async def get(self, url: str, *, headers: Mapping[str, str], quota_key: str) -> VenueResponse:

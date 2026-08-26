@@ -8,7 +8,7 @@ authors = [
 ]
 requires-python = ">=3.13"
 dependencies = [
-    "nautilus-trader~=1.231",
+    "nautilus-trader==1.231.0",
     "httpx>=0.28",
     # CORE, not an extra, and pinned exactly. `signing.py` imports `nacl` at
     # module scope and holds order-submission barrier B2 (the signer refuses
@@ -44,15 +44,77 @@ markers = [
     "contract: pins verified NautilusTrader 1.231.0 behaviour; run first on any version bump",
     "replay: live/backtest parity tests",
     "live: performs REAL network I/O against api.weather.gov and needs BREEZY_LIVE=1; deselected by default",
-    "venue_live: performs REAL network I/O against a prediction venue and needs BREEZY_VENUE_LIVE=1; deselected by default",
+    "venue_live: test performs real authenticated calls against the live Polymarket.us venue; gated behind BREEZY_VENUE_LIVE=1 AND BREEZY_ALLOW_CREDENTIALED_PYTEST=1 AND --venue-live",
     "real_money: can place or affect real-money venue orders and needs BREEZY_REAL_MONEY=1 plus operator approval; deselected by default",
+]
+
+[tool.importlinter]
+root_packages = ["breezy"]
+include_external_packages = true
+
+[[tool.importlinter.contracts]]
+name = "Breezy top-level source packages follow the documented layer direction"
+type = "layers"
+containers = ["breezy"]
+layers = [
+    "runtime",
+    "adapters",
+    "ingest",
+    "persistence | registry | normalize",
+    "features | settlement",
+    "domain",
+]
+exhaustive = true
+ignore_imports = [
+    # Current inspected debt from the Polymarket.us read-path slice.
+    "breezy.adapters.polymarket_us.config -> breezy.runtime.settings",
+    "breezy.adapters.polymarket_us.factories -> breezy.runtime.settings",
+    # Current inspected debt from the NWS ingest runtime cycle.
+    "breezy.ingest.nws_actor -> breezy.runtime.health",
+    # Current inspected debt from quote-tape persistence using venue tape records.
+    "breezy.persistence.quote_tape_gaps -> breezy.adapters.polymarket_us.tape_records",
+]
+
+[[tool.importlinter.contracts]]
+name = "Breezy never imports the Nautilus Polymarket .com adapter"
+type = "forbidden"
+source_modules = ["breezy"]
+forbidden_modules = ["nautilus_trader"]
+allow_indirect_imports = true
+ignore_imports = [
+    "breezy.adapters.polymarket_us.config -> nautilus_trader",
+    "breezy.adapters.polymarket_us.credentials -> nautilus_trader",
+    "breezy.adapters.polymarket_us.data -> nautilus_trader",
+    "breezy.adapters.polymarket_us.factories -> nautilus_trader",
+    "breezy.adapters.polymarket_us.parsing -> nautilus_trader",
+    "breezy.adapters.polymarket_us.provider -> nautilus_trader",
+    "breezy.adapters.polymarket_us.secure -> nautilus_trader",
+    "breezy.adapters.polymarket_us.signing -> nautilus_trader",
+    "breezy.adapters.polymarket_us.symbology -> nautilus_trader",
+    "breezy.adapters.polymarket_us.tape_records -> nautilus_trader",
+    "breezy.adapters.polymarket_us.transport -> nautilus_trader",
+    "breezy.adapters.polymarket_us.websocket -> nautilus_trader",
+    "breezy.domain.nws_climate_day -> nautilus_trader",
+    "breezy.domain.nws_raw_product -> nautilus_trader",
+    "breezy.ingest.config -> nautilus_trader",
+    "breezy.ingest.nws_actor -> nautilus_trader",
+    "breezy.persistence.catalog -> nautilus_trader",
+    "breezy.persistence.quote_tape_gaps -> nautilus_trader",
+    "breezy.runtime.cli -> nautilus_trader",
+    "breezy.runtime.composition -> nautilus_trader",
+    "breezy.runtime.logging_bridge -> nautilus_trader",
+    "breezy.runtime.node_config -> nautilus_trader",
+    "breezy.runtime.quote_tape_cli -> nautilus_trader",
 ]
 
 [tool.ruff]
 line-length = 100
 target-version = "py313"
 # Vendored upstream NautilusTrader docs — reference material, not our code.
-extend-exclude = ["docs/reference/nautilus"]
+extend-exclude = [
+    "docs/reference/nautilus",
+    "docs/evidence/venue/polymarket_us/sdk_snapshot",
+]
 
 [tool.ruff.lint]
 # Isort ordering is enforced by default; E501 must be opted in explicitly
@@ -93,6 +155,7 @@ files = [
     "tests/unit/test_polymarket_us_credential_serialization.py",
     "tests/unit/test_polymarket_us_data.py",
     "tests/unit/test_polymarket_us_dependency_pin.py",
+    "tests/unit/test_polymarket_us_depth_parsing.py",
     "tests/unit/test_polymarket_us_env.py",
     "tests/unit/test_polymarket_us_errors.py",
     "tests/unit/test_polymarket_us_exception_leak.py",
@@ -103,20 +166,27 @@ files = [
     "tests/unit/test_polymarket_us_parsing.py",
     "tests/unit/test_polymarket_us_phase0_safety.py",
     "tests/unit/test_polymarket_us_provider.py",
+    "tests/unit/test_polymarket_us_quote_tape_gap.py",
     "tests/unit/test_polymarket_us_readonly_guard.py",
     "tests/unit/test_polymarket_us_redaction.py",
     "tests/unit/test_polymarket_us_secret_exposure.py",
+    "tests/unit/test_polymarket_us_settlement_provenance.py",
     "tests/unit/test_polymarket_us_signing.py",
     "tests/unit/test_polymarket_us_symbology.py",
+    "tests/unit/test_polymarket_us_tape_records.py",
+    "tests/unit/test_polymarket_us_tape_routing.py",
     "tests/unit/test_polymarket_us_taxonomy.py",
     "tests/unit/test_polymarket_us_transport.py",
     "tests/unit/test_polymarket_us_websocket.py",
 ]
 
 # pyarrow ships no stubs, and nautilus_trader's Data base is a compiled Cython
-# module (only 4 .pyi files ship). Untyped at the boundary, strict within.
+# module (only 4 .pyi files ship). pandas is in the same position: it is a
+# transitive nautilus_trader dependency and `StreamingConfig.rotation_interval`
+# is typed as `pd.Timedelta`, so the streaming rotation config cannot be
+# expressed without touching it. Untyped at the boundary, strict within.
 [[tool.mypy.overrides]]
-module = ["pyarrow.*", "nautilus_trader.*"]
+module = ["pyarrow.*", "pandas.*", "nautilus_trader.*"]
 ignore_missing_imports = true
 follow_untyped_imports = false
 
@@ -124,7 +194,7 @@ follow_untyped_imports = false
 # Any and refuses the subclass. Waive ONLY that rule, only for our record types
 # — every other strict check still applies to this package.
 [[tool.mypy.overrides]]
-module = ["breezy.domain.*"]
+module = ["breezy.domain.*", "breezy.adapters.polymarket_us.tape_records"]
 disallow_subclassing_any = false
 
 # Actor subclasses a compiled Cython class that erases to Any. Scoped to this one
@@ -145,6 +215,10 @@ disallow_subclassing_any = false
 
 [project.scripts]
 breezy = "breezy:main"
+# A SEPARATE process from `breezy`, not a subcommand of it: the NWS collector
+# must start on a host with no venue configuration, and the quote-tape recorder
+# must refuse to start without it. See `breezy.runtime.quote_tape_cli`.
+breezy-quote-tape = "breezy.runtime.quote_tape_cli:main"
 
 [build-system]
 requires = ["uv_build>=0.12.5,<0.13.0"]

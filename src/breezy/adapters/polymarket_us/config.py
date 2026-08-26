@@ -81,6 +81,18 @@ class PolymarketUSDataClientConfig(LiveDataClientConfig, frozen=True):
         A specific, contactable User-Agent. Never a generic placeholder.
     signing_variant : SigningVariant
         Which canonical-string builder to sign with.
+    recorder_instance_id : str | None
+        The NATIVE Nautilus node ``instance_id`` of the process that owns this
+        client, stamped onto every ``QuoteTapeGap`` row so gap rows from two
+        recorder runs can be told apart after their catalogs are merged.
+
+        Threaded through the config because it is not otherwise reachable:
+        ``MessageBus`` accepts ``instance_id`` but exposes no attribute for it
+        (no ``cdef readonly`` entry in ``common/component.pxd:273-299``), and
+        ``LiveDataClientFactory.create`` (``live/factories.py:33-39``) receives
+        only loop/name/config/msgbus/cache/clock. This is NOT a second identity
+        scheme -- ``breezy.runtime.node_config.build_quote_tape_node_config``
+        sets this field and ``TradingNodeConfig.instance_id`` from one value.
     """
 
     secrets: PolymarketUSSecretsRefConfig = PolymarketUSSecretsRefConfig()
@@ -90,6 +102,7 @@ class PolymarketUSDataClientConfig(LiveDataClientConfig, frozen=True):
     market_slugs: tuple[str, ...] = ()
     user_agent: str | None = None
     signing_variant: SigningVariant = SigningVariant.PATH_ONLY
+    recorder_instance_id: str | None = None
     http_timeout_secs: int = 10
     global_requests_per_second: int = 15
     instrument_requests_per_minute: int = 6

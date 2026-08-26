@@ -41,8 +41,9 @@ would block the single trading loop and stall every other client on it,
 including the settlement feed. ``developer_guide/adapters.md:263-266`` states
 the rule; ``adapters/databento/factories.py:59`` is the in-tree precedent.
 
-This module is READ-ONLY by construction: it builds a GET-only HTTP client
-(barriers B1-B3) and registers no execution client factory.
+This module is read-only at the Nautilus registration boundary: it builds a
+GET-only HTTP client (barriers B1-B3, including the B3 receiver-graph tests)
+and registers no execution client factory.
 """
 
 from __future__ import annotations

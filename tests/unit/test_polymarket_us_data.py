@@ -54,7 +54,7 @@ from breezy.adapters.polymarket_us.data import (
     PolymarketUSDataClient,
     build_data_client,
     frame_class_counts,
-    should_warn_for_missing_routing_key,
+    should_warn_at_count,
 )
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -547,13 +547,13 @@ def test_the_missing_routing_key_warning_fires_first_then_rate_limits() -> None:
     pure function and is tested as one.
     """
     n = MISSING_ROUTING_KEY_WARN_EVERY
-    assert should_warn_for_missing_routing_key(1) is True
-    assert should_warn_for_missing_routing_key(2) is False
-    assert should_warn_for_missing_routing_key(n - 1) is False
-    assert should_warn_for_missing_routing_key(n) is True
-    assert should_warn_for_missing_routing_key(n + 1) is False
-    assert should_warn_for_missing_routing_key(2 * n) is True
-    assert should_warn_for_missing_routing_key(0) is False
+    assert should_warn_at_count(1) is True
+    assert should_warn_at_count(2) is False
+    assert should_warn_at_count(n - 1) is False
+    assert should_warn_at_count(n) is True
+    assert should_warn_at_count(n + 1) is False
+    assert should_warn_at_count(2 * n) is True
+    assert should_warn_at_count(0) is False
 
 
 def test_the_missing_routing_key_notice_is_logged_at_warning_not_debug() -> None:

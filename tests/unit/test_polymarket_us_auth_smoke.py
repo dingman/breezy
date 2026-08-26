@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import datetime as dt
 import importlib.util
 import os
 import resource
@@ -44,6 +45,7 @@ from breezy.adapters.polymarket_us.credentials import (
     PolymarketUSCredentials,
     PolymarketUSSecretsRefConfig,
 )
+from breezy.adapters.polymarket_us.errors import VenueTransportError
 from breezy.adapters.polymarket_us.factories import (
     API_BASE_ENV_VAR,
     GATEWAY_BASE_ENV_VAR,
@@ -540,6 +542,49 @@ def test_evidence_records_frame_classes_counts_and_safe_values() -> None:
     assert SLUG in text
 
 
+@pytest.mark.asyncio
+async def test_recording_transport_records_transport_failure_as_its_own_event() -> None:
+    """A failed request must not inherit the previous successful request record."""
+
+    class FlakyReadTransport:
+        calls = 0
+
+        async def get(
+            self, url: str, *, headers: Mapping[str, str], quota_key: str
+        ) -> Any:
+            del quota_key
+            self.calls += 1
+            if self.calls == 1:
+                return smoke.VenueResponse(
+                    status=200,
+                    headers={"date": "Tue, 25 Aug 2026 12:00:00 GMT"},
+                    body=b"ok",
+                )
+            raise VenueTransportError(f"GET failed for {url}")
+
+    transport = smoke.RecordingTransport(inner=FlakyReadTransport())
+
+    await transport.get("https://api.polymarket.us/ok", headers={"X-Probe": "first"}, quota_key="q")
+    with pytest.raises(VenueTransportError):
+        await transport.get(
+            "https://api.polymarket.us/fail",
+            headers={"X-Probe": "second"},
+            quota_key="q",
+        )
+
+    record = smoke._record_from(
+        transport,
+        step="B",
+        label="authenticated portfolio read",
+        path="/v1/portfolio/positions",
+    )
+
+    assert record.status is None
+    assert record.sent_headers == {"X-Probe": "second"}
+    assert record.observed_headers == {}
+    assert "VenueTransportError" in record.note
+
+
 # ---------------------------------------------------------------------------
 # The writer refuses rather than committing a leak
 # ---------------------------------------------------------------------------
@@ -747,7 +792,7 @@ def test_main_writes_latest_checkpoint_when_asyncio_run_fails_after_probes(
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    """A Nautilus teardown loop-stop must not erase evidence already gathered."""
+    """A known Nautilus teardown loop-stop must not erase a proven PASS."""
     secret = make_secret()
     key_id = str(UUID4())
     monkeypatch.setattr(smoke, "prepare", lambda *a, **k: _prepared_with(secret, key_id))
@@ -764,13 +809,14 @@ def test_main_writes_latest_checkpoint_when_asyncio_run_fails_after_probes(
     captured = capsys.readouterr()
     combined = captured.out + captured.err
     files = list(tmp_path.glob("READONLY_AUTH_SMOKE_*.md"))
-    assert exit_code == smoke.EXIT_UNEXPECTED
+    assert exit_code == 4
     assert len(files) == 1
     text = files[0].read_text(encoding="utf-8")
-    assert "Verdict: FAIL" in text
-    assert "teardown" in text.lower()
+    assert "Connectivity verdict: PASS" in text
+    assert "Teardown health: KNOWN_BENIGN_NAUTILUS_LOOP_STOP" in text
     assert "RuntimeError" in text
     assert "Event loop stopped before Future completed" in text
+    assert "KNOWN_BENIGN_NAUTILUS_LOOP_STOP" in combined
     assert "Traceback (most recent call last)" not in combined
     assert smoke.find_secret_leak_offsets(text + combined, [secret, key_id]) == ()
 
@@ -1029,6 +1075,76 @@ def test_the_verdict_distinguishes_a_dead_node_from_a_quiet_market() -> None:
     assert "_CanaryBoom" in dead
     assert dead != quiet != unauthenticated
     assert len({dead, quiet, unauthenticated}) == 3
+
+
+def test_clock_skew_guard_accepts_a_safe_fraction_of_the_documented_window() -> None:
+    records = (
+        smoke.RequestRecord(
+            step="A",
+            label="public market read",
+            path="/v1/market/slug/example",
+            query_string="",
+            status=200,
+            latency_ms=1.0,
+            sent_headers={},
+            observed_headers={"date": "Tue, 25 Aug 2026 12:00:00 GMT"},
+            note="accepted",
+        ),
+    )
+
+    smoke.assert_host_clock_safe_for_signing(
+        records,
+        now_ms=int(dt.datetime(2026, 8, 25, 12, 0, 14, 999000, tzinfo=dt.UTC).timestamp() * 1000),
+    )
+
+
+def test_clock_skew_guard_refuses_before_signing_when_offset_is_too_large() -> None:
+    records = (
+        smoke.RequestRecord(
+            step="A",
+            label="public market read",
+            path="/v1/market/slug/example",
+            query_string="",
+            status=200,
+            latency_ms=1.0,
+            sent_headers={},
+            observed_headers={"date": "Tue, 25 Aug 2026 12:00:00 GMT"},
+            note="accepted",
+        ),
+    )
+
+    with pytest.raises(smoke.SignatureClockSkewError) as excinfo:
+        smoke.assert_host_clock_safe_for_signing(
+            records,
+            now_ms=int(
+                dt.datetime(2026, 8, 25, 12, 0, 15, 1_000, tzinfo=dt.UTC).timestamp() * 1000
+            ),
+        )
+
+    message = str(excinfo.value)
+    assert "15001" in message
+    assert "15000" in message
+    assert "30000" in message
+    assert "Date header" in message
+
+
+def test_clock_skew_guard_refuses_when_no_venue_date_header_was_measured() -> None:
+    records = (
+        smoke.RequestRecord(
+            step="A",
+            label="public market read",
+            path="/v1/market/slug/example",
+            query_string="",
+            status=200,
+            latency_ms=1.0,
+            sent_headers={},
+            observed_headers={},
+            note="accepted",
+        ),
+    )
+
+    with pytest.raises(smoke.SignatureClockSkewError, match="Date header"):
+        smoke.assert_host_clock_safe_for_signing(records, now_ms=0)
 
 
 # ---------------------------------------------------------------------------

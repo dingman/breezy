@@ -29,8 +29,9 @@ from __future__ import annotations
 
 import os
 import socket
+import sys
 from collections.abc import Iterator, Mapping
-from typing import Any
+from typing import Any, cast
 
 import pytest
 
@@ -80,6 +81,8 @@ PYO3_EGRESS_GAP = (
 OS_EGRESS_BLOCK_COMMAND = (
     "unshare -r -n env BREEZY_TEST_OS_EGRESS_BLOCK=1 .venv/bin/python -m pytest"
 )
+_PYO3_NETWORK_CLIENT_NAMES = ("HttpClient", "WebSocketClient")
+_ORIGINAL_PYO3_NETWORK_CLIENTS: dict[str, Any] | None = None
 
 
 class _BlockedPyo3NetworkClient:
@@ -90,6 +93,58 @@ class _BlockedPyo3NetworkClient:
             "Network access is disabled in this test suite: "
             "nautilus_pyo3.HttpClient/WebSocketClient are blocked by default."
         )
+
+
+def _pyo3_module() -> Any | None:
+    try:
+        from nautilus_trader.core import nautilus_pyo3
+    except ImportError:
+        return None
+    return nautilus_pyo3
+
+
+def _set_imported_breezy_pyo3_aliases(*, web_socket_client: Any) -> None:
+    websocket_module = sys.modules.get("breezy.adapters.polymarket_us.websocket")
+    if websocket_module is not None:
+        cast(Any, websocket_module).WebSocketClient = web_socket_client
+
+
+def _install_pyo3_network_client_block() -> None:
+    """Deny pyo3 network-client construction before test modules can alias it.
+
+    Residual limit: this is an in-process constructor block, not a kernel
+    firewall. It blocks the known Nautilus pyo3 HTTP/WebSocket construction
+    paths while preserving per-test loopback opt-outs; arbitrary future native
+    extensions could still call OS networking unless pytest is launched inside
+    an external network namespace or CI firewall.
+    """
+    module = _pyo3_module()
+    if module is None:
+        return
+
+    global _ORIGINAL_PYO3_NETWORK_CLIENTS
+    if _ORIGINAL_PYO3_NETWORK_CLIENTS is None:
+        _ORIGINAL_PYO3_NETWORK_CLIENTS = {
+            name: getattr(module, name)
+            for name in _PYO3_NETWORK_CLIENT_NAMES
+            if hasattr(module, name)
+        }
+
+    for name in _ORIGINAL_PYO3_NETWORK_CLIENTS:
+        setattr(module, name, _BlockedPyo3NetworkClient)
+    _set_imported_breezy_pyo3_aliases(web_socket_client=_BlockedPyo3NetworkClient)
+
+
+def _restore_pyo3_network_clients_for_opted_out_test() -> None:
+    module = _pyo3_module()
+    if module is None or _ORIGINAL_PYO3_NETWORK_CLIENTS is None:
+        return
+
+    for name, original in _ORIGINAL_PYO3_NETWORK_CLIENTS.items():
+        setattr(module, name, original)
+    web_socket_client = _ORIGINAL_PYO3_NETWORK_CLIENTS.get("WebSocketClient")
+    if web_socket_client is not None:
+        _set_imported_breezy_pyo3_aliases(web_socket_client=web_socket_client)
 
 
 def missing_venue_live_unlocks(*, env: Mapping[str, str], venue_live_flag: bool) -> tuple[str, ...]:
@@ -152,14 +207,16 @@ def pytest_configure(config: pytest.Config) -> None:
     )
     config.addinivalue_line(
         "markers",
-        "venue_live: performs REAL network I/O against a prediction venue and needs "
-        f"{_VENUE_LIVE_ENV_VAR}=1; deselected by default",
+        "venue_live: test performs real authenticated calls against the live "
+        "Polymarket.us venue; gated behind BREEZY_VENUE_LIVE=1 AND "
+        "BREEZY_ALLOW_CREDENTIALED_PYTEST=1 AND --venue-live",
     )
     config.addinivalue_line(
         "markers",
         "real_money: can place or affect real-money venue orders and needs "
         f"{_REAL_MONEY_ENV_VAR}=1 plus operator approval; deselected by default",
     )
+    _install_pyo3_network_client_block()
 
 
 def pytest_sessionstart(session: pytest.Session) -> None:
@@ -301,16 +358,14 @@ def _block_network_sockets(
     if _is_real_network_test(request):
         # `live` tests are real-network-by-design (`tests/live/`); gating
         # whether they RUN AT ALL is `pytest_collection_modifyitems`'s job.
-        yield
+        _restore_pyo3_network_clients_for_opted_out_test()
+        try:
+            yield
+        finally:
+            _install_pyo3_network_client_block()
         return
 
+    _install_pyo3_network_client_block()
     monkeypatch.setattr(socket.socket, "connect", _blocked_connect)
     monkeypatch.setattr(socket.socket, "connect_ex", _blocked_connect_ex)
-    try:
-        from nautilus_trader.core import nautilus_pyo3
-    except ImportError:
-        yield
-        return
-    monkeypatch.setattr(nautilus_pyo3, "HttpClient", _BlockedPyo3NetworkClient)
-    monkeypatch.setattr(nautilus_pyo3, "WebSocketClient", _BlockedPyo3NetworkClient)
     yield
