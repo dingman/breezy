@@ -81,7 +81,9 @@ all three assumed egress originates inside
   (`core/nautilus_pyo3.pyi:5450-5459` defines `async def post(...)`, and
   `:5429` a generic `request(...)`). If the transport wrapper holds the client
   as an attribute, `client._transport._client.post(...)` reaches it — and
-  contains no `"POST"` string literal for an AST scan to find.
+  contains no `"POST"` string literal for an AST scan to find. Storing a bound
+  `client.get` method is also insufficient: `bound_method.__self__` exposes the
+  same POST-capable client.
 
 **Revised barriers, now genuinely layered:**
 
@@ -89,8 +91,8 @@ all three assumed egress originates inside
 |---|---|---|
 | B1 | `PolymarketUSHttpClient` exposes exactly `get_authenticated` and `get_public`. Its one private dispatch helper asserts `method in _PERMITTED_METHODS` (`frozenset({"GET"})`) → `MethodNotPermittedError`. | Naive misuse |
 | B2 | `Ed25519RequestSigner.sign_headers` raises `MethodNotPermittedError` for any method other than `GET`. An order request cannot be signed by Breezy code. | Signing a write |
-| B3 | **`NautilusHttpTransport` holds the `HttpClient` in a closure, not an attribute.** Its `__init__` builds the client as a local, binds `_get = client.get`, and stores only that bound coroutine. There is no attribute path from the transport object to `.post`. | Escape B |
-| B4 | **Repo-wide AST guard** over `src/` **and** `scripts/`: fails if any module outside the deny-list constants contains the literals `"POST"`, `"DELETE"`, `"PUT"`, `"PATCH"`, or `/v1/orders`; and fails on any `ast.Attribute` access named `post`/`patch`/`delete`/`request` on a name resolving to an `HttpClient` binding. | Escape B, plus drift |
+| B3 | **`NautilusHttpTransport` holds the `HttpClient` in a GET-only callable closure, not as an attribute or bound pyo3 method.** `tests/unit/test_polymarket_us_transport.py::test_transport_does_not_expose_real_pyo3_client_through_bound_method_self` constructs the real pyo3 client and asserts no `transport` attribute has a `__self__` exposing callable `.post`; `tests/unit/test_polymarket_us_readonly_guard.py::test_b3_constructed_transport_exposes_no_write_capable_receiver` pins the same receiver graph with a write-capable double. Residual: deliberate closure-cell introspection can still recover the client; ordinary attribute and `__self__` paths cannot. | Escape B |
+| B4 | **Repo-wide AST guard** over `src/` **and** `scripts/`: fails if any venue-touching module contains the literals `"POST"`, `"DELETE"`, `"PUT"`, `"PATCH"`, or `/v1/orders`; and fails on any `ast.Attribute` access named `post`/`put`/`patch`/`delete`/`request` on any receiver. | Escape B, plus drift |
 | B5 | **Import ban on the SDK's signing module repo-wide.** `from polymarket_us.auth import …` and `import polymarket_us.auth` are permitted in **no** file except the one differential-oracle test named in Step 4. Implemented by prefix-matching `node.module.split(".")[0] == "polymarket_us"` rather than exact equality — which also repairs the shipped ban's blind spot. | Escape A |
 | B6 | `safety.assert_live_order_submission_permitted` (shipped) remains the future single chokepoint. This slice adds **no caller**; Step 13 asserts that. | Regression |
 
@@ -154,7 +156,8 @@ wrong**: it made one variable do double duty — silencing the credential
 kill-switch *and* unlocking `venue_live` execution
 (`tests/conftest.py:146-153`). A stray `BREEZY_VENUE_LIVE=1` in a shell profile,
 combined with any CI or IDE invocation that overrides `-m`, would fire real
-signed requests where that was previously structurally impossible.
+signed read requests where the default pytest credential tripwire previously
+refused at startup.
 
 **Decision: require two independently-named confirmations, neither of which
 alone is sufficient.**
@@ -1367,7 +1370,7 @@ fails the run rather than committing a leak.
 | S8 (SEC-4) | Evidence redacts `X-PM-Access-Key`, `X-PM-Signature` **and** `X-PM-Timestamp`; pre-commit scan over the evidence file | §10 |
 | S9 | Credential tripwire retained; exemption requires **three** independent factors, no one of which both silences the abort and unlocks execution; plus the autouse scrub | D2 |
 | S10 | Network kill-switch and pyo3 constructor block untouched; the OS-namespace run remains the documented closure of the residual gap | `tests/conftest.py:61-71`; `BUILD_PLAN:105-109` |
-| S11 | GET-only, structurally: six layered barriers B1–B6, two of them repo-wide | §2.1 |
+| S11 | GET-only across ordinary adapter/script paths: six layered barriers B1–B6, two of them repo-wide, with B3 specifically pinned against attribute and `__self__` receiver exposure | §2.1 |
 | S12 | Per-endpoint `keyed_quotas` with a required `quota_key` at every call site | §8.2 |
 | S13 | Local clock-skew assertion before every signature | `signing.py` |
 | S14 | Adapter owns its User-Agent; never reads `BREEZY_USER_AGENT` | `factories.py` |
