@@ -1,12 +1,47 @@
 # Pre-registration — Asymmetric settlement-alignment gate
 
-**Written:** 2026-08-26. **Revision 10** (amended same day).
+**Written:** 2026-08-26. **Revision 14** (amended same day). **APPROVED.**
 **Status:** PRE-REGISTRATION. Written BEFORE any asymmetric statistic has been
 computed. No asymmetric hit rate exists in this repo at the time of writing.
 **Authorises:** nothing yet. Computation is gated on adversarial domain review
 (see §8) and belongs to backlog item G-17, not to this document.
 
-> **Revision 10 amends revision 9 in response to a NINTH BLOCK verdict.** Round 9
+> **Revision 14 applies the two ADVISORY amendments from round 13, which
+> returned APPROVE-WITH-AMENDMENTS** — the first non-BLOCK verdict in fourteen
+> revisions and thirteen adversarial reviews. G-17 is now authorised **on
+> methodological grounds**, and remains unconditionally blocked on G-16 (>=14
+> days of captured tape), which is an operational blocker and not a
+> methodological objection. Amendments marked **[R14]**; record in §10l.
+>
+> **Revision 13 amended revision 12 in response to a TWELFTH BLOCK verdict.**
+> Round 12 confirmed round 11's finding closed and found "everything else in the
+> document is now sound", but caught that revision 12's new
+> `PROVISIONAL-UNDERPOWERED` state **copied STRUCTURALLY UNREACHABLE's exemption
+> from the expiry clock without copying its escalation** — so a cell landing
+> there could never resolve to GO or NO-GO, reopening the DOM-1
+> non-falsifiability hole for exactly the cells the document predicts will land
+> there. Corrected here; amendments marked **[R13]**; record in §10k.
+>
+> **Revision 12 amended revision 11 in response to an ELEVENTH BLOCK verdict.**
+> Round 11 confirmed round 10's finding closed, then found revision 11's own
+> closing sentence self-contradictory: "mark the cell Branch B ... do not fall
+> back to the pooled anchor" — but Branch B is *defined* as `2c-1`/`c` on the
+> whole-city **pooled** concordance, so the instruction and its mechanism said
+> opposite things, "reproducing round 9's population-mismatch defect silently,
+> dressed in different terminology." Corrected here; amendments marked
+> **[R12]**; record in §10j.
+>
+> **Revision 11 amended revision 10 in response to a TENTH BLOCK verdict.** Round 10
+> found revision 10's representativeness diagnostic **pointed at the wrong
+> partition**: the passage correctly derives that the tradeable subpopulation is
+> the *early*-in-day one (the market closes before the 14:00-16:00 daily-max
+> window), then instructs the implementer to substitute the *late*-window
+> anchor. The two sentences contradict each other, and the error fires exactly
+> when the diagnostic matters — producing "false confidence that a control has
+> run, not merely a missing control." Corrected here; amendments marked
+> **[R11]**; record in §10i.
+>
+> **Revision 10 amended revision 9 in response to a NINTH BLOCK verdict.** Round 9
 > confirmed the anchor/gate-statistic separation was implemented cleanly with no
 > residual contradiction, then found the separation created a **population
 > mismatch**: `H(c,k)` now conditions on tradeability while `p̂_anchor(c,k)` does
@@ -485,15 +520,115 @@ explicit power calculation, fixed now:
      produces:
 
      1. For each city, partition simulated crossings by time of day into
-        early-window and late-window strata, split at the earliest plausible
-        market close under DOM-9's range.
+        **early-window** (at or before the split point — the tradeable side) and
+        **late-window** (after it) strata.
+
+        **Split point [R11].** DOM-9 states a *daily-max timing* range
+        (14:00-16:00 local), not a market-close range; revision 10 said "the
+        earliest plausible market close under DOM-9's range" without saying
+        which. Pre-declared: until DOM-9's actual close time is known, use
+        **14:00 local** — the start of the daily-max window — as the split
+        proxy, and **sweep** the split across 12:00-16:00 local in one-hour
+        steps, reporting the diagnostic at every step. A conclusion that holds
+        only at one split point is reported as split-sensitive, not as a
+        conclusion. **The 14:00 result — not any sweep point — governs the
+        binding `N(c,k)` [R12];** the sweep is mandatory transparency, never a
+        menu from which a favourable split may be chosen. When DOM-9 resolves,
+        re-run at the true close, which then governs.
      2. Compute the conditional METAR-vs-CLI agreement rate, with Wilson bounds,
         for each partition, per clearance stratum.
      3. **If the two partitions' Wilson intervals are non-overlapping in any
-        `(c,k)`, the pooled anchor is population-mismatched for that cell.** Use
-        the late-window — i.e. the tradeable-subset-matching — partition's
-        anchor instead, or if that partition is itself thin, mark the cell
-        Branch B and report it.
+        `(c,k)`, the pooled anchor is population-mismatched for that cell.**
+        Substitute the **EARLY-window** partition's anchor — that is the
+        tradeable-matching one. **[R11 — direction corrected.]** Revision 10
+        said "late-window", which inverted its own stated mechanism: DOM-9's
+        concern is that the market **closes before** the 14:00-16:00 daily-max
+        window, so the crossings that are unambiguously tradeable are the ones
+        occurring **before** close — the early ones. Substituting the late-window
+        anchor would have drawn from the population that is *least*
+        representative of what the strategy can trade, precisely when the
+        diagnostic fires, and left the direction of the resulting error on
+        `N(c,k)` unknown rather than corrected.
+        **If the early-window partition is itself thin [R12].** Revision 11 said
+        "mark the cell Branch B and report it; do not fall back to the pooled
+        anchor" — but Branch B is defined as `2c-1`/`c` where `c` is the
+        **whole-city, unconditional** concordance from the §7 table. Routing a
+        thin early partition to Branch B therefore *is* falling back to the
+        pooled anchor: it mixes early and late crossings in exactly the
+        proportion this diagnostic exists to distrust, and does so precisely
+        when the diagnostic has already *proven* the two partitions differ. The
+        instruction and its mechanism contradicted each other. Replaced with an
+        explicit two-step rule:
+
+        - **First, re-estimate the concordance on the early partition alone.**
+          Define `c_early(city)` = the 95% Wilson lower bound of
+          `1 - P(METAR_running_max > CLI_tmax)` computed over **early-window
+          crossings only**. Where Branch B fires from this path, it consumes
+          `c_early(city)`, never the pooled `c`. All other Branch B behaviour is
+          unchanged.
+        - **Second, if the early-window crossing count for that city is below
+          the Branch A bar of 200 cases [R13 — comparand restated]**, emit **no
+          numeric anchor at all** for that cell. Classify it
+          `PROVISIONAL-UNDERPOWERED`: it carries no `N(c,k)`, contributes to no
+          verdict, and is reported by name. A cell whose tradeable population
+          cannot be estimated must produce an absent number, not a substituted
+          one.
+
+          **Forcing function [R13] — this state resolves, it does not sit.**
+          Revision 12 made `PROVISIONAL-UNDERPOWERED` "exempt from
+          expiry-to-NO-GO exactly as STRUCTURALLY UNREACHABLE is", but copied
+          only the exemption, not the escalation that makes the exemption safe.
+          STRUCTURALLY UNREACHABLE is exempt from the *clock* precisely because
+          it substitutes an **immediate** evidence-based verdict for the timed
+          one. `PROVISIONAL-UNDERPOWERED` had no such substitute, and its
+          underlying population is the **fixed IEM archive** — which does not
+          grow with tape capture — so a cell there today would still be there at
+          day 42, permanently, blocking its city from ever leaving
+          NOT YET ANSWERABLE. That is the DOM-1 hole reopened, and it would have
+          fired on LAX/SFO's `[0,1)` strata, which this document predicts as the
+          likely path.
+
+          Pre-declared resolution:
+
+          1. On first classification, report it immediately and name the cells.
+          2. Attempt one re-derivation: widen the early-window definition by
+             sweeping the split later within the 12:00-16:00 range **for anchor
+             estimation only** — never for the binding `N(c,k)`, which remains
+             governed by the 14:00 split — and record whether any split yields a
+             sufficient early population. This is the only remedy available,
+             because the archive is fixed.
+
+             **Selection rule [R14].** Where more than one split clears the
+             200-case bar, use the **first** split reaching it, moving
+             monotonically later from 14:00. Stop there: do not continue
+             sweeping past the first qualifying split, and **never select a
+             later split on the ground that it yields a larger anchor.** A
+             higher anchor lowers the required `N(c,k)`, so free choice among
+             qualifying splits would be a selection surface — bounded (at most
+             three candidates, one-time, archive-only, never touching the
+             binding `N(c,k)` or the live `H(c,k)`), but pinned here regardless.
+          3. **If no split yields a sufficient early population, the cell
+             converts to a stated, evidence-labelled NO-GO** for that city.
+             **[R14 — resolved at first classification, not at day 42.]** The
+             42-day cadence exists for quantities that grow with tape capture.
+             `c_early` draws only on the **fixed** IEM archive, so step 2's
+             outcome is fully knowable at first classification and nothing
+             changes between evaluations. Waiting out a clock that has nothing
+             left to tell us is unmotivated delay, so the conversion happens
+             **immediately on the failed re-derivation**. The NO-GO text: *"the tradeable population cannot be
+             estimated from available archive data, therefore the falsification
+             test cannot be run."* That NO-GO **counts** toward §7 rule 3's
+             two-city programme-rejection tally.
+          4. It may not be extended further without a new pre-registration and
+             its own adversarial review.
+
+          A verdict that cannot be reached is not a neutral outcome. Where the
+          data cannot support the test, the answer is NO-GO, stated on that
+          ground — not silence.
+
+        This is the expected path for LAX/SFO's boundary strata — an early-in-day
+        clearance before a 14:00-16:00 daily max is the less common event — so
+        it must not silently resolve to a pooled figure.
      4. Until this diagnostic has been run, **`N(c,k)` for LAX and SFO is
         PROVISIONAL** and must be labelled as such in the feasibility table. NYC,
         MIA and MDW are unaffected where DOM-9 does not apply.
@@ -780,8 +915,13 @@ review, not a passed one.**
 - **Revision 7** — re-reviewed, verdict **BLOCK**. Findings in §10f.
 - **Revision 8** — re-reviewed, verdict **BLOCK**. Findings in §10g.
 - **Revision 9** — re-reviewed, verdict **BLOCK**. Findings in §10h.
-- **Revision 10** — this document. Requires re-review. The §8 questions stand
-  and must be answered against revision 10, not against its predecessors.
+- **Revision 10** — re-reviewed, verdict **BLOCK**. Findings in §10i.
+- **Revision 11** — re-reviewed, verdict **BLOCK**. Findings in §10j.
+- **Revision 12** — re-reviewed, verdict **BLOCK**. Findings in §10k.
+- **Revision 13** — re-reviewed, verdict **APPROVE-WITH-AMENDMENTS**. Findings
+  in §10l.
+- **Revision 14** — this document. Applies both advisory amendments. **G-17 is
+  authorised on methodological grounds.**
 
 Computation (G-17) remains **NOT AUTHORISED**. It additionally cannot begin
 before G-16 (>=14 days of captured tape), which has not started.
@@ -1162,6 +1302,181 @@ but should be pinned before implementation. → Addressed in §4 with a concrete
 §5's DOM-1 falsifiability test, §6's fee-sensitivity handling, and the
 OUT-OF-SCOPE-DOM-9 vs rule-3 exclusion logic. §10f and §10g confirmed faithful
 and unsoftened.
+
+## 10i. Adversarial re-review record — revision 10 **[R11]**
+
+Verdict: **BLOCK** (tenth consecutive). G-17 not authorised on methodological
+grounds, separately from its unconditional block on G-16.
+
+**[CRITICAL, introduced by R10] The representativeness-diagnostic substitution
+rule pointed at the wrong partition** — "the exact failure shape this document
+has been BLOCKed for nine times, now inside the fix for round 9's finding."
+
+The passage states the mechanism correctly — "the anchor overstates the true
+rate for the tradeable population" when "the tradeable subpopulation is
+systematically **earlier-in-day**" — which "follows directly from DOM-9: the
+market closes before the 14:00-16:00 daily-max window, so only crossings
+occurring **before** close are tradeable — the tradeable subpopulation is the
+**early** one by construction." The operative rule then said to "use the
+**late-window** — i.e. the tradeable-subset-matching — partition's anchor",
+which "inverts the document's own stated logic."
+
+Failure scenario recorded verbatim: "exactly when the diagnostic fires ... an
+implementer following this text substitutes the anchor from the population that
+is *not* representative of the tradeable subset, believing the mismatch is
+fixed. The direction of the resulting error on `N(c,k)` is now unknown rather
+than corrected, which is worse than the PROVISIONAL flag the document intends:
+it produces false confidence that a control has run, not merely a missing
+control."
+
+→ Corrected in §7: the substitution now selects the EARLY-window partition, with
+the reasoning stated inline so the direction cannot drift again, and a thin
+early partition falls to Branch B rather than back to the pooled anchor.
+
+**[MEDIUM, advisory] The split point was underspecified** — DOM-9 gives a
+daily-max timing range, not a market-close range. → Addressed in §7: 14:00 local
+pre-declared as the proxy, with a mandatory 12:00-16:00 sweep and
+split-sensitivity reporting.
+
+**Confirmed sound:** the 10%/90% criterion "correctly falls through to the
+existing §7 floor/coverage machinery with no new interaction defect"; the DOM-1
+test still passes at the whole-gate level, "unaffected by this finding, which is
+local to the LAX/SFO anchor-substitution mechanism"; §10g and §10h are
+"unsoftened, accurate records".
+
+**On the process itself**, recorded because it is the reason this loop continues:
+"the repeated-BLOCK process is working as designed — it is catching a real
+defect each round, including this one — but it has not yet produced a document
+free of the 'prose states the property, mechanism does the opposite' defect it
+exists to hunt. That is not a process failure; it is evidence the process should
+keep running rather than stop at a round number."
+
+## 10j. Adversarial re-review record — revision 11 **[R12]**
+
+Verdict: **BLOCK** (eleventh consecutive). G-17 not authorised on methodological
+grounds.
+
+**Round 10's finding confirmed genuinely closed:** "The early/late direction now
+matches the mechanism paragraph above it and point 1's own early=tradeable
+definition; internally consistent."
+
+**[CRITICAL, introduced by R11] "Do not fall back to the pooled anchor" was
+contradicted by the mechanism it named.** Branch B "is defined as: use
+`2c-1`/`c`, where `c = concordance(c)` is the **whole-city, unconditional**
+figure ... No partition-specific `c` is defined anywhere in the document ... So
+when a thin early-window partition fires 'Branch B,' the number an implementer
+actually plugs in is the pooled, whole-archive `c` — mixing early and late
+crossings in exactly the proportion the representativeness diagnostic exists to
+distrust."
+
+Failure scenario recorded: "This is the expected path for LAX/SFO's boundary
+strata — a genuine early-in-day clearance of the strike before a 14:00-16:00
+window daily max is the less common event, so the early-window `[0,1)`/`[1,2)`
+cells are plausibly thin exactly where the diagnostic already found the two
+partitions' intervals non-overlapping (i.e., where the mismatch is proven, not
+merely suspected). At that moment the document instructs falling to a
+computation that is substantively 'the pooled anchor' while its own sentence
+says the opposite — reproducing round 9's population-mismatch defect silently,
+dressed in different terminology."
+
+→ Addressed in §7 by taking both of the reviewer's options rather than one:
+`c_early(city)` is defined as a partition-specific Wilson lower bound that
+Branch B consumes when it fires from this path, and if `c_early` is itself below
+the Branch A bar the cell emits **no numeric anchor at all**, classified
+`PROVISIONAL-UNDERPOWERED` and exempt from expiry exactly as STRUCTURALLY
+UNREACHABLE is.
+
+**Confirmed sound by round 11:** the 12:00-16:00 sweep introduces no
+multiple-comparisons surface — "14:00 is pre-declared as the operative split;
+the sweep is mandatory full-reporting diagnostic transparency, not a 'pick the
+favorable split' mechanism — no p-hacking surface introduced." Its minor
+advisory, that the document should say explicitly that the 14:00 result governs
+the binding `N(c,k)`, is now stated. DOM-1 still satisfied at the whole-gate
+level. §10h and §10i confirmed "accurate, unsoftened", cross-checked against
+DOM-9's verbatim wording. On whole-document structure: "none beyond Finding 1 —
+no new whole-document defect found."
+
+## 10k. Adversarial re-review record — revision 12 **[R13]**
+
+Verdict: **BLOCK** (twelfth consecutive). G-17 not authorised on methodological
+grounds.
+
+**Round 11's finding confirmed genuinely closed:** `c_early(city)` "is
+well-defined ... and is computable from data the representativeness diagnostic
+already produces: nothing beyond the early/late partition of simulated crossings
+is needed. Branch B, when it fires from a thin early partition, now consumes
+`c_early`, never pooled `c` — the population-mismatch contradiction round 11
+found is gone, and the reasoning is stated inline so it can't drift again."
+
+**[CRITICAL, introduced by R12] `PROVISIONAL-UNDERPOWERED` had no resolution
+path — the DOM-1 hole reopened, narrower but real.** STRUCTURALLY UNREACHABLE's
+exemption from the 42-day clock "is paired with a mandatory escalation ... It
+never sits in limbo — it substitutes an immediate, evidence-based verdict for
+the timed one. `PROVISIONAL-UNDERPOWERED` copies the exemption but not the
+escalation." And critically: "Since `c_early`'s underlying population is the
+fixed IEM archive (not growing with G-16 tape), a cell that is
+`PROVISIONAL-UNDERPOWERED` today will be `PROVISIONAL-UNDERPOWERED` at day 14,
+28, and 42 — permanently."
+
+Consequence: because `[0,1)` must reach a verdict before a city can leave
+NOT YET ANSWERABLE, "LAX and/or SFO can be stuck in `NOT YET ANSWERABLE`
+indefinitely, contributing to neither a GO nor a NO-GO, and never counted in
+rule 3's failure tally either. This directly fails the DOM-1 test for those
+cities: the gate cannot return GO *or* NO-GO on them." The reviewer's path count:
+"Five states, three that resolve cleanly ..., one that resolves via forced
+escalation ..., and one — `PROVISIONAL-UNDERPOWERED` — that does not resolve at
+all."
+
+→ Addressed in §7: the state now carries a mandatory forcing function —
+immediate report, one bounded re-derivation attempt by sweeping the split for
+anchor estimation only, then conversion at the third evaluation to a stated
+evidence-labelled NO-GO that **counts** toward rule 3.
+
+**Advisory, addressed:** "below the Branch A sample bar" now restates the
+comparand explicitly (early-window crossing count against the 200-case bar).
+
+**Confirmed by round 12:** §10i and §10j "faithful, unsoftened records"; the
+end-to-end trace "shows no other instance of the 'prose promises a property the
+mechanism doesn't deliver' pattern this round — the one instance found is the
+escalation gap above"; and "everything else in the document is now sound."
+
+## 10l. Adversarial re-review record — revision 13 **[R14]**
+
+Verdict: **APPROVE-WITH-AMENDMENTS**. First non-BLOCK verdict in the sequence.
+**G-17 computation authorised on methodological grounds**, subject to two
+advisory amendments, both applied in revision 14. Separately and
+unconditionally still blocked on G-16 (tape capture), which the reviewer
+explicitly notes "is not a methodological objection".
+
+**Round 12's finding confirmed genuinely closed**, with the path count re-run
+independently: "Every branch now terminates in a verdict or a properly-excluded
+OUT-OF-SCOPE-DOM-9 classification ... I find no remaining path by which a cell
+avoids ever producing a verdict."
+
+**[MEDIUM, advisory — applied in R14] The bounded re-derivation had a tie-break
+gap.** The document "specifies the **failure** path exhaustively ... but is
+silent on the **success** path: if multiple splits between 15:00-16:00 clear the
+sufficiency bar with materially different `c_early` values, nothing pins which
+one governs." Since a higher anchor lowers the required floor, that was "a
+selection-effect surface, though bounded ... it cannot manufacture a false GO on
+live data — it only affects how much live evidence is required."
+→ Applied: first qualifying split moving monotonically later from 14:00 governs.
+
+**[LOW, advisory — applied in R14] The 42-day deadline was unexplained slack.**
+"`c_early`'s re-derivation draws only on the fixed IEM archive ... That means the
+outcome of step 2 is knowable at the moment of first classification — yet step 3
+defers the NO-GO conversion to 'the third evaluation' (day 42) ... Nothing
+changes between evaluations for this state."
+→ Applied: conversion happens immediately on the failed re-derivation.
+
+**Independently re-verified by the reviewer:** all five cities' concordance and
+signed-error figures "match exactly" against
+`settlement_alignment_diagnosis_2026-08-25.md` §1; `wilson_lower_bound` at line
+206 and `build_threshold_cases` margins `(0,1,2,3)` at line 313 in
+`settlement_alignment_study.py`, "confirming the still-unbuilt-extension
+characterization remains accurate". No new instance of the "prose promises a
+property the mechanism doesn't deliver" pattern. DOM-1 satisfied per city
+including LAX/SFO. §10j and §10k faithful and unsoftened.
 
 ## 11. GREEN criterion for backlog item G-03
 

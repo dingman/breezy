@@ -755,14 +755,39 @@ Status vocabulary: `TODO` / `IN PROGRESS` / `GREEN` / `BLOCKED (<unlock>)`.
   Programme-level gross/net ROI estimate before committing to 63 blocking
   requirements. Central estimate from the worked example is tens of dollars
   per day gross. Written GO/NO-GO.
-- **G-03 — Asymmetric-gate pre-registration + adversarial review.** `IN PROGRESS`
-  `docs/evidence/asymmetric_gate_prereg_2026-08-26.md` at **revision 6**.
-  Adversarially reviewed **five times, BLOCK every time**. The loop is
-  converging and each round found a real defect — see the standing lesson on the
-  paper-close pattern. Round 1 falsified the document's own central premise
-  (MDW runs the dangerous direction). Round 5 found the power floor could be
-  mathematically **undefined**, not merely large. Computation (G-17) remains
-  **NOT AUTHORISED**, which is the correct state.
+- **G-03 — Asymmetric-gate pre-registration + adversarial review.** `GREEN`
+  `docs/evidence/asymmetric_gate_prereg_2026-08-26.md` at **revision 14**,
+  **APPROVED-WITH-AMENDMENTS** on round 13; both advisories applied. Twelve
+  consecutive BLOCK verdicts preceded it, each on a real defect. **G-17 is now
+  authorised on methodological grounds** and remains unconditionally blocked on
+  G-16 (tape capture), which is operational, not methodological.
+
+  What the loop actually found, in order:
+  1. The document's own central premise was **falsified**: MDW runs the
+     dangerous direction (56.37% METAR>CLI, mean +0.0527), so "METAR reads below
+     CLI" may not be asserted programme-wide anywhere.
+  2. `H(c,k)` was structurally blind to adverse selection (DOM-10).
+  3. The `p̂ = 0.985` power anchor was taken from market price — presupposing
+     the calibration DOM-10 disputes.
+  4. That anchor survived in the **binding formula** after the prose claimed to
+     replace it.
+  5. The replacement `min(c, 2c)` was dead algebra reducing to `c`.
+  6. The Wilson lower bound converges to `p̂` from below, so the floor could be
+     **mathematically undefined**, not merely large — which would have produced
+     programme-wide NO-GO by arithmetic rather than evidence.
+  7. "Computable today" was false: the cited script strata by the *final* daily
+     max, not the running max at receipt, and cannot emit two of the five bins.
+  8. A claimed conservatism margin was a **no-op** — a constant lag cannot
+     change observation ordering.
+  9. A declared DOM-9 prerequisite gated nothing the construction implemented.
+  10. The anchor measured a different **population** than the statistic it sized.
+  11. The representativeness fix named the **wrong partition**.
+  12. "Do not fall back to the pooled anchor" routed to a branch defined on the
+      pooled anchor.
+  13. A new exempt state had no resolution path, reopening DOM-1.
+
+  Findings 4, 5, 11 and 12 are the paper-close pattern — see the standing lesson
+  below. Several were introduced *by* a fix for the previous round.
   The failed 2 °F gate is SYMMETRIC; the Tier-1 rule is ASYMMETRIC. Write the
   pre-registration and obtain an adversarial domain review **before** testing.
   Must not be adopted as a post-hoc rescue.
@@ -841,9 +866,11 @@ Status vocabulary: `TODO` / `IN PROGRESS` / `GREEN` / `BLOCKED (<unlock>)`.
   (`writer.py:305-318` is an if/elif chain), so one day's tape file is
   unbounded. Currently accepted and unmitigated. Needs external disk alerting
   before continuous capture starts.
-- **G-11 — Commit the quote-tape recorder work.** `TODO`
-  Still outstanding. Blocked on G-03 converging so the working tree is
-  committed in a coherent state rather than mid-review-loop.
+- **G-11 — Commit the quote-tape recorder work.** `GREEN`
+  Committed as `b02e7ed` (code) and `58599ec` (docs), staged by explicit path,
+  no `git add -A`. Secret scan clean before commit. Gates re-run independently
+  by the coordinator at the commit: pytest exit 0 (0 failures), ruff exit 0,
+  mypy exit 0 over 90 source files, lint-imports exit 0 (2 contracts kept).
   Work item 1.1 is built and reviewed but **uncommitted**. It is on the
   critical path and must not live only in the working tree.
 
