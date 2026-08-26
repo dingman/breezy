@@ -874,6 +874,22 @@ Status vocabulary: `TODO` / `IN PROGRESS` / `GREEN` / `BLOCKED (<unlock>)`.
   Work item 1.1 is built and reviewed but **uncommitted**. It is on the
   critical path and must not live only in the working tree.
 
+### Phase A support — autonomous discovery (added 2026-08-26)
+
+- **G-18 — Autonomous market discovery.** `TODO` — **ON THE CRITICAL PATH.**
+  Plan: `docs/plans/backlog/G-18-autonomous-market-discovery.md`.
+  Opened on operator direction: the bot must discover markets itself and will
+  never be handed a slug list. `POLYMARKET_US_MARKET_SLUGS` is static and
+  required while weather slugs are **per-day**, so continuous capture would
+  record nothing from day two and look exactly like a quiet market.
+  **G-14 must not start until this lands.**
+  Verified feasible offline: the venue exposes `GET /v1/markets` with
+  `categories` / `active` / `closed` / pagination filters, and list payloads are
+  already captured in `docs/evidence/venue/polymarket_us/raw/`. Nautilus
+  supplies the reload primitive (`initialize(reload=True)`) and the bundled
+  Polymarket adapter supplies the scheduling pattern verbatim — no new
+  abstraction is needed.
+
 ### Phase A — live venue (OPERATOR-GATED)
 
 - **G-12 — Resolve `MARKET_SLUG_KEY` against the live venue.**
@@ -885,7 +901,9 @@ Status vocabulary: `TODO` / `IN PROGRESS` / `GREEN` / `BLOCKED (<unlock>)`.
   Zero authenticated calls have ever been made. Prove one real frame reaches
   parquet, read back by a separate process.
 - **G-14 — Start continuous capture under systemd.**
-  `BLOCKED (depends G-12, G-13, G-10)`
+  `BLOCKED (depends G-12, G-13, G-10, G-18)`
+  **G-18 added as a hard dependency:** starting continuous capture on a static
+  slug list would silently record nothing after day one.
 - **G-15 — Fee schedule discovery.**
   `BLOCKED (operator: live probe)`
   `maker_fee`/`taker_fee` are `Decimal(0)`; `assert_fee_schedule_known` is
