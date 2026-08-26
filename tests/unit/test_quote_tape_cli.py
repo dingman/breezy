@@ -50,7 +50,7 @@ BASE_ENV: dict[str, str] = {
     "POLYMARKET_US_API_BASE": "https://api.example.invalid",
     "POLYMARKET_US_GATEWAY_BASE": "https://gateway.example.invalid",
     "POLYMARKET_US_WS_URL": "wss://ws.example.invalid",
-    "POLYMARKET_US_MARKET_SLUGS": SLUG,
+    "POLYMARKET_US_DISCOVERY_RELOAD_INTERVAL_MINS": "5",
     "POLYMARKET_US_USER_AGENT": "breezy-test/1.0 (+mailto:ops@example.invalid)",
 }
 
@@ -171,7 +171,7 @@ def test_the_node_is_configured_to_stream_to_the_configured_catalog_root(
         "POLYMARKET_US_API_BASE",
         "POLYMARKET_US_GATEWAY_BASE",
         "POLYMARKET_US_WS_URL",
-        "POLYMARKET_US_MARKET_SLUGS",
+        "POLYMARKET_US_DISCOVERY_RELOAD_INTERVAL_MINS",
         "POLYMARKET_US_USER_AGENT",
     ],
 )

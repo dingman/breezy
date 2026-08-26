@@ -36,7 +36,7 @@ the status code, the quota key and the allow-listed rate-limit headers are.
 from __future__ import annotations
 
 import json
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from typing import Any, Protocol
 from urllib.parse import quote, urlencode
 
@@ -117,7 +117,7 @@ class PolymarketUSHttpClient:
         self,
         path: str,
         *,
-        query: Mapping[str, str] | None = None,
+        query: Mapping[str, object] | None = None,
         quota_key: str,
     ) -> Mapping[str, Any]:
         """Signed GET against the authenticated API.
@@ -138,7 +138,7 @@ class PolymarketUSHttpClient:
         self,
         path: str,
         *,
-        query: Mapping[str, str] | None = None,
+        query: Mapping[str, object] | None = None,
         quota_key: str,
     ) -> Mapping[str, Any]:
         """Unauthenticated GET against the public gateway."""
@@ -153,7 +153,7 @@ class PolymarketUSHttpClient:
 
     # -- internals ----------------------------------------------------------
 
-    def _build_query_string(self, query: Mapping[str, str] | None) -> str:
+    def _build_query_string(self, query: Mapping[str, object] | None) -> str:
         """Render ``query`` deterministically: sorted by key, percent-encoded.
 
         Determinism is not cosmetic. The same string is signed and sent, so any
@@ -163,7 +163,18 @@ class PolymarketUSHttpClient:
         """
         if not query:
             return ""
-        return urlencode(sorted(query.items()), quote_via=quote)
+        normalised: list[tuple[str, object]] = []
+        for key, value in sorted(query.items()):
+            if isinstance(value, bool):
+                normalised.append((key, str(value).lower()))
+            elif isinstance(value, Sequence) and not isinstance(value, (str, bytes, bytearray)):
+                for item in value:
+                    normalised.append(
+                        (key, str(item).lower() if isinstance(item, bool) else item)
+                    )
+            else:
+                normalised.append((key, value))
+        return urlencode(normalised, quote_via=quote, doseq=True)
 
     async def _dispatch(
         self,

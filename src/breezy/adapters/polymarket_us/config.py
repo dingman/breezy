@@ -30,6 +30,7 @@ Breezy policy rather than venue truth.
 
 from __future__ import annotations
 
+import msgspec
 from nautilus_trader.live.config import LiveDataClientConfig
 
 from breezy.adapters.polymarket_us.credentials import (
@@ -39,13 +40,20 @@ from breezy.adapters.polymarket_us.credentials import (
 from breezy.adapters.polymarket_us.signing import SigningVariant
 from breezy.runtime.settings import SettingsError
 
-__all__ = ["PolymarketUSDataClientConfig"]
+__all__ = [
+    "DEFAULT_DISCOVERY_CITY_CODES",
+    "PolymarketUSDataClientConfig",
+    "PolymarketUSMarketDiscoveryConfig",
+]
+
+DEFAULT_DISCOVERY_CITY_CODES: tuple[str, ...] = ("nyc", "sfo", "mia", "mdw", "lax")
 
 #: Fields with no safe default: unset means "operator has not configured it".
 REQUIRED_FIELDS: tuple[str, ...] = (
     "api_base_url",
     "gateway_base_url",
     "ws_url",
+    "instrument_reload_interval_mins",
     "user_agent",
 )
 
@@ -54,10 +62,42 @@ POSITIVE_FIELDS: tuple[str, ...] = (
     "http_timeout_secs",
     "global_requests_per_second",
     "instrument_requests_per_minute",
+    "discovery_requests_per_minute",
     "book_requests_per_minute",
     "ws_heartbeat_secs",
     "ws_idle_timeout_secs",
 )
+
+
+class PolymarketUSMarketDiscoveryConfig(msgspec.Struct, frozen=True):
+    """Venue list-query configuration for autonomous weather-market discovery."""
+
+    limit: int = 100
+    order_by: tuple[str, ...] = ("endDate",)
+    order_direction: str = "asc"
+    categories: tuple[str, ...] = ("climate",)
+    active: bool | None = True
+    closed: bool | None = False
+    archived: bool | None = False
+    include_closed: bool = False
+    city_codes: tuple[str, ...] = DEFAULT_DISCOVERY_CITY_CODES
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.limit, int) or isinstance(self.limit, bool) or self.limit <= 0:
+            raise SettingsError(f"market_discovery.limit must be positive, was {self.limit!r}")
+        if self.order_direction not in {"asc", "desc"}:
+            raise SettingsError(
+                "market_discovery.order_direction must be 'asc' or 'desc', "
+                f"was {self.order_direction!r}"
+            )
+        for field in ("order_by", "categories", "city_codes"):
+            values = getattr(self, field)
+            if not isinstance(values, tuple) or not values:
+                raise SettingsError(f"market_discovery.{field} must be a non-empty tuple")
+            if any(not isinstance(value, str) or not value.strip() for value in values):
+                raise SettingsError(f"market_discovery.{field} must not contain a blank entry")
+        if any(code != code.lower() for code in self.city_codes):
+            raise SettingsError("market_discovery.city_codes must use lowercase slug codes")
 
 
 class PolymarketUSDataClientConfig(LiveDataClientConfig, frozen=True):
@@ -75,8 +115,11 @@ class PolymarketUSDataClientConfig(LiveDataClientConfig, frozen=True):
         Markets WebSocket origin WITHOUT the path; the path is owned by
         :data:`breezy.adapters.polymarket_us.websocket.WS_PATH` so the
         connected path and the signed path cannot drift apart.
-    market_slugs : tuple[str, ...]
-        The market slugs this client subscribes on connect. Must be non-empty.
+    market_discovery : PolymarketUSMarketDiscoveryConfig
+        The venue list-query and city registry used to discover markets.
+    instrument_reload_interval_mins : int
+        Required reload cadence. Nautilus supplies the reload primitive but not
+        a scheduler, and per-day weather markets need one.
     user_agent : str
         A specific, contactable User-Agent. Never a generic placeholder.
     signing_variant : SigningVariant
@@ -99,21 +142,26 @@ class PolymarketUSDataClientConfig(LiveDataClientConfig, frozen=True):
     api_base_url: str | None = None
     gateway_base_url: str | None = None
     ws_url: str | None = None
+    market_discovery: PolymarketUSMarketDiscoveryConfig = PolymarketUSMarketDiscoveryConfig()
     market_slugs: tuple[str, ...] = ()
+    instrument_reload_interval_mins: int | None = None
     user_agent: str | None = None
     signing_variant: SigningVariant = SigningVariant.PATH_ONLY
     recorder_instance_id: str | None = None
     http_timeout_secs: int = 10
     global_requests_per_second: int = 15
     instrument_requests_per_minute: int = 6
+    discovery_requests_per_minute: int = 6
     book_requests_per_minute: int = 12
     ws_heartbeat_secs: int = 20
     ws_idle_timeout_secs: int = 60
 
     def __post_init__(self) -> None:
-        unset = [name for name in REQUIRED_FIELDS if not _is_present(getattr(self, name))]
-        if not self.market_slugs:
-            unset.append("market_slugs")
+        unset = [
+            name
+            for name in REQUIRED_FIELDS
+            if not _is_required_field_present(name, getattr(self, name))
+        ]
         if unset:
             raise SettingsError(
                 "PolymarketUSDataClientConfig requires every venue parameter to be "
@@ -138,6 +186,12 @@ class PolymarketUSDataClientConfig(LiveDataClientConfig, frozen=True):
 def _is_present(value: object) -> bool:
     """True when a required string field carries a usable value."""
     return isinstance(value, str) and bool(value.strip())
+
+
+def _is_required_field_present(name: str, value: object) -> bool:
+    if name == "instrument_reload_interval_mins":
+        return isinstance(value, int) and not isinstance(value, bool) and value > 0
+    return _is_present(value)
 
 
 assert_config_type_excludes_secrets(PolymarketUSDataClientConfig)

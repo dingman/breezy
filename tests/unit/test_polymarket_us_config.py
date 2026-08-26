@@ -24,7 +24,11 @@ import msgspec
 import pytest
 from nautilus_trader.common.config import tokenize_config
 
-from breezy.adapters.polymarket_us.config import PolymarketUSDataClientConfig
+from breezy.adapters.polymarket_us.config import (
+    DEFAULT_DISCOVERY_CITY_CODES,
+    PolymarketUSDataClientConfig,
+    PolymarketUSMarketDiscoveryConfig,
+)
 from breezy.adapters.polymarket_us.credentials import (
     PolymarketUSSecretsRefConfig,
     assert_config_type_excludes_secrets,
@@ -36,7 +40,7 @@ VALID_KWARGS: dict[str, object] = {
     "api_base_url": "https://api.example.invalid",
     "gateway_base_url": "https://gateway.example.invalid",
     "ws_url": "wss://api.example.invalid",
-    "market_slugs": ("tc-temp-nychigh-2026-08-25-lt79f",),
+    "instrument_reload_interval_mins": 5,
     "user_agent": "breezy-test/1.0 (+mailto:ops@example.invalid)",
 }
 
@@ -53,18 +57,33 @@ def test_config_raises_settings_error_naming_each_unset_field() -> None:
         PolymarketUSDataClientConfig()
 
     message = str(excinfo.value)
-    for field in ("api_base_url", "gateway_base_url", "ws_url", "market_slugs", "user_agent"):
+    for field in (
+        "api_base_url",
+        "gateway_base_url",
+        "ws_url",
+        "instrument_reload_interval_mins",
+        "user_agent",
+    ):
         assert field in message
 
 
-def test_config_raises_settings_error_for_an_empty_market_slug_tuple() -> None:
-    with pytest.raises(SettingsError, match="market_slugs"):
-        make_config(market_slugs=())
+def test_config_raises_settings_error_for_missing_reload_interval() -> None:
+    with pytest.raises(SettingsError, match="instrument_reload_interval_mins"):
+        make_config(instrument_reload_interval_mins=None)
 
 
-def test_config_raises_settings_error_for_a_blank_market_slug() -> None:
-    with pytest.raises(SettingsError, match="market_slugs"):
-        make_config(market_slugs=("ok-slug", "   "))
+def test_config_raises_settings_error_for_blank_discovery_category() -> None:
+    with pytest.raises(SettingsError, match="categories"):
+        make_config(
+            market_discovery=PolymarketUSMarketDiscoveryConfig(categories=("climate", " "))
+        )
+
+
+def test_default_discovery_city_codes_cover_the_weather_sites() -> None:
+    config = make_config()
+
+    assert config.market_discovery.city_codes == DEFAULT_DISCOVERY_CITY_CODES
+    assert config.market_discovery.city_codes == ("nyc", "sfo", "mia", "mdw", "lax")
 
 
 def test_signing_variant_defaults_to_path_only() -> None:
@@ -89,6 +108,8 @@ def test_signing_variant_accepts_its_own_string_value() -> None:
         "global_requests_per_second",
         "instrument_requests_per_minute",
         "book_requests_per_minute",
+        "discovery_requests_per_minute",
+        "instrument_reload_interval_mins",
         "ws_heartbeat_secs",
         "ws_idle_timeout_secs",
     ],

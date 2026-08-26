@@ -116,6 +116,18 @@ class Provider(InstrumentProvider):
         for instrument in self._preloaded:
             self.add(instrument)
 
+    @property
+    def market_slugs(self) -> tuple[str, ...]:
+        return tuple(str(instrument.id.symbol.value) for instrument in self._preloaded)
+
+    @property
+    def active_market_slugs(self) -> tuple[str, ...]:
+        return self.market_slugs
+
+    @property
+    def resolved_market_reasons(self) -> Mapping[str, str]:
+        return {}
+
 
 class Harness:
     def __init__(self, client: PolymarketUSDataClient, feed: Feed) -> None:
@@ -159,6 +171,7 @@ def _harness(loop: asyncio.AbstractEventLoop) -> Harness:
             gateway_base_url="https://gateway.example.invalid",
             ws_url="wss://api.example.invalid",
             market_slugs=(SLUG,),
+            instrument_reload_interval_mins=5,
             user_agent="breezy-test/1.0 (+mailto:ops@example.invalid)",
             instrument_provider=InstrumentProviderConfig(load_all=True),
         ),

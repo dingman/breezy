@@ -102,11 +102,24 @@ class FakeInstrumentProvider(InstrumentProvider):
         super().__init__(config=InstrumentProviderConfig(load_all=True))
         self._preloaded = list(instruments)
         self.load_all_calls = 0
+        self._resolved_market_reasons: dict[str, str] = {}
 
     async def load_all_async(self, filters: dict[str, Any] | None = None) -> None:
         self.load_all_calls += 1
         for instrument in self._preloaded:
             self.add(instrument)
+
+    @property
+    def market_slugs(self) -> tuple[str, ...]:
+        return tuple(str(instrument.id.symbol.value) for instrument in self._preloaded)
+
+    @property
+    def active_market_slugs(self) -> tuple[str, ...]:
+        return tuple(str(instrument.id.symbol.value) for instrument in self._preloaded)
+
+    @property
+    def resolved_market_reasons(self) -> Mapping[str, str]:
+        return dict(self._resolved_market_reasons)
 
 
 class FakeMarketsFeed:
@@ -211,7 +224,7 @@ def make_config(**overrides: object) -> PolymarketUSDataClientConfig:
         "api_base_url": "https://api.example.invalid",
         "gateway_base_url": "https://gateway.example.invalid",
         "ws_url": "wss://api.example.invalid",
-        "market_slugs": (SLUG,),
+        "instrument_reload_interval_mins": 5,
         "user_agent": "breezy-test/1.0 (+mailto:ops@example.invalid)",
         "instrument_provider": InstrumentProviderConfig(load_all=True),
     }
@@ -357,6 +370,29 @@ async def test_disconnect_closes_the_feed_and_leaves_no_orphaned_task() -> None:
     assert leaked == set()
 
 
+@pytest.mark.asyncio
+async def test_discovery_reload_subscribes_new_and_unsubscribes_resolved_markets() -> None:
+    first = make_instrument(SLUG)
+    second = make_instrument(OTHER_SLUG)
+    harness = build_harness(instruments=[first])
+    await harness.client._connect()
+    provider = harness.client._instrument_provider
+    assert isinstance(provider, FakeInstrumentProvider)
+
+    provider._preloaded = [second]
+    provider._resolved_market_reasons = {SLUG: "closed=true status='MARKET_STATUS_RESOLVED'"}
+    await provider.initialize(reload=True)
+    harness.client._send_all_instruments_to_data_engine()
+    await harness.client._reconcile_discovered_subscriptions(cycle="test")
+
+    assert SLUG not in harness.feed.subscriptions
+    assert OTHER_SLUG in harness.feed.subscriptions
+    assert any(event.startswith("unsubscribe:") for event in harness.feed.events)
+    assert f"subscribe:{OTHER_SLUG}" in harness.feed.events
+
+    await harness.client._disconnect()
+
+
 # ---------------------------------------------------------------------------
 # Subscription
 # ---------------------------------------------------------------------------
@@ -364,7 +400,7 @@ async def test_disconnect_closes_the_feed_and_leaves_no_orphaned_task() -> None:
 
 @pytest.mark.asyncio
 async def test_subscribe_quote_ticks_subscribes_the_slug_once() -> None:
-    harness = build_harness(config=make_config(market_slugs=(OTHER_SLUG,)))
+    harness = build_harness()
     await harness.client._connect()
     instrument_id = InstrumentId(Symbol(SLUG), POLYMARKET_US_VENUE)
 

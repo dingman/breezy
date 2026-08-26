@@ -82,7 +82,7 @@ TAPE_ENV: dict[str, str] = {
     "POLYMARKET_US_API_BASE": "https://api.example.invalid",
     "POLYMARKET_US_GATEWAY_BASE": "https://gateway.example.invalid",
     "POLYMARKET_US_WS_URL": "wss://ws.example.invalid",
-    "POLYMARKET_US_MARKET_SLUGS": f"{SLUG},{OTHER_SLUG}",
+    "POLYMARKET_US_DISCOVERY_RELOAD_INTERVAL_MINS": "5",
     "POLYMARKET_US_USER_AGENT": "breezy-test/1.0 (+mailto:ops@example.invalid)",
 }
 
@@ -145,7 +145,7 @@ def make_data_client_config() -> PolymarketUSDataClientConfig:
         api_base_url="https://api.example.invalid",
         gateway_base_url="https://gateway.example.invalid",
         ws_url="wss://ws.example.invalid",
-        market_slugs=(SLUG, OTHER_SLUG),
+        instrument_reload_interval_mins=5,
         user_agent="breezy-test/1.0 (+mailto:ops@example.invalid)",
     )
 
@@ -287,7 +287,12 @@ class TestQuoteTapeNodeConfig:
         )
 
         assert set(config.data_clients) == {POLYMARKET_US_CLIENT_NAME}
-        assert config.data_clients[POLYMARKET_US_CLIENT_NAME].market_slugs == (SLUG, OTHER_SLUG)
+        assert (
+            config.data_clients[
+                POLYMARKET_US_CLIENT_NAME
+            ].instrument_reload_interval_mins
+            == 5
+        )
         assert config.exec_clients == {}
 
     def test_declares_no_actors_and_registers_no_data_engine_catalogs(

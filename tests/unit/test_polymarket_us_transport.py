@@ -38,6 +38,7 @@ from breezy.adapters.polymarket_us.transport import (
     PERMITTED_QUOTA_KEYS,
     QUOTA_KEY_BOOK,
     QUOTA_KEY_DEFAULT,
+    QUOTA_KEY_DISCOVERY,
     QUOTA_KEY_INSTRUMENTS,
     QUOTA_KEY_PORTFOLIO,
     NautilusHttpTransport,
@@ -178,7 +179,12 @@ def test_observed_response_headers_cover_retry_after_and_rate_limit_headers() ->
 def test_keyed_quota_table_covers_exactly_the_permitted_quota_keys() -> None:
     keyed = dict(build_keyed_quotas())
     assert set(keyed) | {QUOTA_KEY_DEFAULT} == set(PERMITTED_QUOTA_KEYS)
-    assert {QUOTA_KEY_INSTRUMENTS, QUOTA_KEY_BOOK, QUOTA_KEY_PORTFOLIO} <= set(keyed)
+    assert {
+        QUOTA_KEY_DISCOVERY,
+        QUOTA_KEY_INSTRUMENTS,
+        QUOTA_KEY_BOOK,
+        QUOTA_KEY_PORTFOLIO,
+    } <= set(keyed)
 
 
 def test_default_quota_stays_below_the_retail_twenty_per_second_cap() -> None:

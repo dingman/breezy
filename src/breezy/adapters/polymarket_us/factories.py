@@ -69,7 +69,7 @@ from breezy.adapters.polymarket_us.http import PolymarketUSHttpClient
 from breezy.adapters.polymarket_us.parsing import parse_quote_tick
 from breezy.adapters.polymarket_us.provider import PolymarketUSInstrumentProvider
 from breezy.adapters.polymarket_us.signing import Ed25519RequestSigner, SigningVariant
-from breezy.adapters.polymarket_us.symbology import POLYMARKET_US_VENUE, slug_to_instrument_id
+from breezy.adapters.polymarket_us.symbology import POLYMARKET_US_VENUE
 from breezy.adapters.polymarket_us.transport import (
     NautilusHttpTransport,
     build_default_quota,
@@ -80,6 +80,7 @@ from breezy.runtime.settings import SettingsError
 
 __all__ = [
     "API_BASE_ENV_VAR",
+    "DISCOVERY_RELOAD_INTERVAL_ENV_VAR",
     "GATEWAY_BASE_ENV_VAR",
     "MARKET_SLUGS_ENV_VAR",
     "POLYMARKET_US_CLIENT_NAME",
@@ -103,6 +104,7 @@ API_BASE_ENV_VAR: str = "POLYMARKET_US_API_BASE"
 GATEWAY_BASE_ENV_VAR: str = "POLYMARKET_US_GATEWAY_BASE"
 WS_URL_ENV_VAR: str = "POLYMARKET_US_WS_URL"
 MARKET_SLUGS_ENV_VAR: str = "POLYMARKET_US_MARKET_SLUGS"
+DISCOVERY_RELOAD_INTERVAL_ENV_VAR: str = "POLYMARKET_US_DISCOVERY_RELOAD_INTERVAL_MINS"
 USER_AGENT_ENV_VAR: str = "POLYMARKET_US_USER_AGENT"
 
 #: Optional. Absent means the evidence-backed default, ``PATH_ONLY``
@@ -144,7 +146,7 @@ def config_from_env(
         API_BASE_ENV_VAR,
         GATEWAY_BASE_ENV_VAR,
         WS_URL_ENV_VAR,
-        MARKET_SLUGS_ENV_VAR,
+        DISCOVERY_RELOAD_INTERVAL_ENV_VAR,
         USER_AGENT_ENV_VAR,
     ):
         raw = source.get(name, "")
@@ -158,12 +160,28 @@ def config_from_env(
             "required with no default. Unset or empty: " + ", ".join(missing)
         )
 
-    slugs = tuple(part.strip() for part in values[MARKET_SLUGS_ENV_VAR].split(","))
-    if any(not slug for slug in slugs):
+    raw_interval = values[DISCOVERY_RELOAD_INTERVAL_ENV_VAR]
+    try:
+        reload_interval = int(raw_interval)
+    except ValueError as exc:
         raise SettingsError(
-            f"{MARKET_SLUGS_ENV_VAR} contains a blank entry; it must be a "
-            "comma-separated list of non-empty market slugs"
+            f"{DISCOVERY_RELOAD_INTERVAL_ENV_VAR} must be a positive integer, "
+            f"was {raw_interval!r}"
+        ) from exc
+    if reload_interval <= 0:
+        raise SettingsError(
+            f"{DISCOVERY_RELOAD_INTERVAL_ENV_VAR} must be a positive integer, "
+            f"was {raw_interval!r}"
         )
+    legacy_slugs: tuple[str, ...] = ()
+    raw_legacy_slugs = source.get(MARKET_SLUGS_ENV_VAR, "").strip()
+    if raw_legacy_slugs:
+        legacy_slugs = tuple(part.strip() for part in raw_legacy_slugs.split(","))
+        if any(not slug for slug in legacy_slugs):
+            raise SettingsError(
+                f"{MARKET_SLUGS_ENV_VAR} contains a blank entry; it must be a "
+                "comma-separated list of non-empty market slugs"
+            )
 
     raw_variant = source.get(SIGNING_VARIANT_ENV_VAR, "").strip()
     if raw_variant:
@@ -181,7 +199,8 @@ def config_from_env(
         api_base_url=values[API_BASE_ENV_VAR],
         gateway_base_url=values[GATEWAY_BASE_ENV_VAR],
         ws_url=values[WS_URL_ENV_VAR],
-        market_slugs=slugs,
+        market_slugs=legacy_slugs,
+        instrument_reload_interval_mins=reload_interval,
         user_agent=values[USER_AGENT_ENV_VAR],
         signing_variant=variant,
     )
@@ -206,12 +225,12 @@ def _required(value: str | None, *, field: str) -> str:
 def _instrument_provider_config_for(
     config: PolymarketUSDataClientConfig,
 ) -> InstrumentProviderConfig:
-    """Ensure Nautilus initializes the configured Polymarket.us slug universe."""
+    """Ensure Nautilus initializes via autonomous market discovery."""
     provider_config = config.instrument_provider
     if provider_config.load_all or provider_config.load_ids:
         return provider_config
     return InstrumentProviderConfig(
-        load_ids=frozenset(slug_to_instrument_id(slug) for slug in config.market_slugs),
+        load_all=True,
         filters=provider_config.filters,
         filter_callable=provider_config.filter_callable,
         log_warnings=provider_config.log_warnings,
@@ -274,6 +293,7 @@ class PolymarketUSLiveDataClientFactory(LiveDataClientFactory):
             timeout_secs=config.http_timeout_secs,
             default_quota=build_default_quota(config.global_requests_per_second),
             keyed_quotas=build_keyed_quotas(
+                discovery_requests_per_minute=config.discovery_requests_per_minute,
                 instrument_requests_per_minute=config.instrument_requests_per_minute,
                 book_requests_per_minute=config.book_requests_per_minute,
             ),
@@ -290,8 +310,9 @@ class PolymarketUSLiveDataClientFactory(LiveDataClientFactory):
             client=http_client,
             config=_instrument_provider_config_for(config),
             venue=POLYMARKET_US_VENUE,
-            market_slugs=config.market_slugs,
+            discovery=config.market_discovery,
             clock=clock,
+            logger=Logger(f"{name}-discovery"),
         )
 
         ws_signer = signer if WS_MARKETS_REQUIRES_AUTH else None

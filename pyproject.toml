@@ -154,6 +154,7 @@ files = [
     "tests/unit/test_polymarket_us_credential_gate.py",
     "tests/unit/test_polymarket_us_credential_serialization.py",
     "tests/unit/test_polymarket_us_data.py",
+    "tests/unit/test_polymarket_us_discovery.py",
     "tests/unit/test_polymarket_us_dependency_pin.py",
     "tests/unit/test_polymarket_us_depth_parsing.py",
     "tests/unit/test_polymarket_us_env.py",

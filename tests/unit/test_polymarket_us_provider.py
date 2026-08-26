@@ -27,6 +27,7 @@ from nautilus_trader.core.correctness import PyCondition
 from nautilus_trader.model.identifiers import InstrumentId, Symbol, Venue
 from nautilus_trader.model.instruments import BinaryOption
 
+from breezy.adapters.polymarket_us.config import PolymarketUSMarketDiscoveryConfig
 from breezy.adapters.polymarket_us.errors import (
     InstrumentDefinitionError,
     PolymarketUSError,
@@ -35,10 +36,14 @@ from breezy.adapters.polymarket_us.errors import (
 from breezy.adapters.polymarket_us.http import PolymarketUSHttpClient
 from breezy.adapters.polymarket_us.provider import (
     MARKET_BY_SLUG_PATH,
+    MARKET_LIST_PATH,
     PolymarketUSInstrumentProvider,
 )
 from breezy.adapters.polymarket_us.symbology import POLYMARKET_US_VENUE
-from breezy.adapters.polymarket_us.transport import QUOTA_KEY_INSTRUMENTS, VenueResponse
+from breezy.adapters.polymarket_us.transport import (
+    QUOTA_KEY_DISCOVERY,
+    VenueResponse,
+)
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 RAW = REPO_ROOT / "docs" / "evidence" / "venue" / "polymarket_us" / "raw"
@@ -56,13 +61,24 @@ def raw_bytes(name: str) -> bytes:
 class RecordingTransport:
     """Stub satisfying ``PolymarketUSReadTransport``: GET, quota key, nothing else."""
 
-    def __init__(self, bodies: dict[str, bytes]) -> None:
+    def __init__(self, bodies: dict[str, bytes], market_slugs: tuple[str, ...]) -> None:
         self._bodies: dict[str, bytes] = bodies
+        self._market_slugs = market_slugs
         self.calls: list[tuple[str, str]] = []
 
     async def get(self, url: str, *, headers: dict[str, str], quota_key: str) -> VenueResponse:
         self.calls.append((url, quota_key))
         assert headers == {}, "a public gateway read must send no auth headers"
+        if url.startswith("https://gateway.polymarket.us" + MARKET_LIST_PATH):
+            markets = []
+            for slug in self._market_slugs:
+                if slug in self._bodies:
+                    markets.append(json.loads(self._bodies[slug])["market"])
+            return VenueResponse(
+                status=200,
+                headers={},
+                body=json.dumps({"markets": markets}).encode("utf-8"),
+            )
         for slug, body in self._bodies.items():
             if url.endswith(f"/{slug}"):
                 return VenueResponse(status=200, headers={}, body=body)
@@ -97,7 +113,7 @@ def build_provider(
             OPEN_SLUG: raw_bytes("market_open_510636_by_slug.json"),
             CLOSED_SLUG: raw_bytes("market_closed_15806_by_slug.json"),
         }
-    transport = RecordingTransport(bodies)
+    transport = RecordingTransport(bodies, market_slugs)
     client = PolymarketUSHttpClient(
         transport=transport,  # type: ignore[arg-type]
         signer=UnusableSigner(),  # type: ignore[arg-type]
@@ -111,7 +127,7 @@ def build_provider(
         client=client,
         config=config if config is not None else InstrumentProviderConfig(),
         venue=POLYMARKET_US_VENUE,
-        market_slugs=market_slugs,
+        discovery=PolymarketUSMarketDiscoveryConfig(limit=100, include_closed=True),
         clock=clock,
     )
     return provider, transport, clock
@@ -139,7 +155,10 @@ async def test_load_all_async_produces_binary_options_from_a_captured_payload() 
     provider, _, _ = build_provider(market_slugs=(OPEN_SLUG, CLOSED_SLUG))
     await provider.load_all_async()
 
-    assert provider.count == 2
+    assert provider.count == 1
+    assert provider.market_slugs == (OPEN_SLUG, CLOSED_SLUG)
+    assert provider.active_market_slugs == (OPEN_SLUG,)
+    assert CLOSED_SLUG in provider.resolved_market_reasons
     instrument = provider.find(InstrumentId(Symbol(OPEN_SLUG), POLYMARKET_US_VENUE))
     assert isinstance(instrument, BinaryOption)
     assert instrument.outcome == "Yes"
@@ -170,27 +189,33 @@ async def test_provider_uses_only_the_gateway_market_by_slug_path_and_quota_key(
 
     assert len(transport.calls) == 1
     url, quota_key = transport.calls[0]
-    assert url == ("https://gateway.polymarket.us" + MARKET_BY_SLUG_PATH.format(slug=OPEN_SLUG))
-    assert quota_key == QUOTA_KEY_INSTRUMENTS
+    assert url.startswith("https://gateway.polymarket.us" + MARKET_LIST_PATH)
+    assert "limit=100" in url
+    assert "offset=0" in url
+    assert quota_key == QUOTA_KEY_DISCOVERY
 
 
 @pytest.mark.asyncio
 async def test_repeated_load_of_the_same_slug_issues_one_request() -> None:
-    """Instrument metadata is static for a session (plan section 8.2)."""
+    """Discovery repeats per cycle; by-slug metadata reads stay cached."""
     provider, transport, _ = build_provider()
     await provider.load_all_async()
     await provider.load_all_async()
     await provider.load_async(InstrumentId(Symbol(OPEN_SLUG), POLYMARKET_US_VENUE))
-    assert len(transport.calls) == 1
+    assert len(transport.calls) == 2
+    assert all(
+        url.startswith("https://gateway.polymarket.us" + MARKET_LIST_PATH)
+        for url, _ in transport.calls
+    )
 
 
 @pytest.mark.asyncio
 async def test_load_ids_async_fetches_only_the_requested_ids() -> None:
     provider, transport, _ = build_provider(market_slugs=(OPEN_SLUG, CLOSED_SLUG))
-    await provider.load_ids_async([InstrumentId(Symbol(CLOSED_SLUG), POLYMARKET_US_VENUE)])
+    await provider.load_all_async()
+    await provider.load_ids_async([InstrumentId(Symbol(OPEN_SLUG), POLYMARKET_US_VENUE)])
 
     assert len(transport.calls) == 1
-    assert transport.calls[0][0].endswith(CLOSED_SLUG)
     assert provider.count == 1
 
 
@@ -221,12 +246,12 @@ async def test_a_malformed_payload_is_rejected_loudly_and_adds_no_instrument() -
 
 @pytest.mark.asyncio
 async def test_one_bad_slug_fails_the_whole_load_rather_than_being_skipped() -> None:
-    broken = json.loads(raw_bytes("market_closed_15806_by_slug.json"))
+    broken = json.loads(raw_bytes("market_open_510636_by_slug.json"))
     del broken["market"]["minimumTradeQty"]
     provider, _, _ = build_provider(
         bodies={
-            OPEN_SLUG: raw_bytes("market_open_510636_by_slug.json"),
-            CLOSED_SLUG: json.dumps(broken).encode("utf-8"),
+            OPEN_SLUG: json.dumps(broken).encode("utf-8"),
+            CLOSED_SLUG: raw_bytes("market_closed_15806_by_slug.json"),
         },
         market_slugs=(OPEN_SLUG, CLOSED_SLUG),
     )
@@ -239,7 +264,7 @@ async def test_a_payload_whose_slug_disagrees_with_the_request_is_rejected() -> 
     swapped = json.loads(raw_bytes("market_open_510636_by_slug.json"))
     swapped["market"]["slug"] = CLOSED_SLUG
     provider, _, _ = build_provider(bodies={OPEN_SLUG: json.dumps(swapped).encode("utf-8")})
-    with pytest.raises(InstrumentDefinitionError):
+    with pytest.raises(PolymarketUSError):
         await provider.load_all_async()
 
 
@@ -259,20 +284,26 @@ async def test_an_instrument_id_from_a_foreign_venue_is_rejected() -> None:
         await provider.load_ids_async([foreign])
 
 
-def test_a_configured_slug_that_is_malformed_is_rejected_at_construction() -> None:
+@pytest.mark.asyncio
+async def test_a_discovered_slug_that_is_malformed_is_rejected() -> None:
+    broken = json.loads(raw_bytes("market_open_510636_by_slug.json"))
+    broken["market"]["slug"] = "tc.temp.dotted"
+    provider, _, _ = build_provider(bodies={OPEN_SLUG: json.dumps(broken).encode("utf-8")})
     with pytest.raises(VenuePayloadError):
-        build_provider(market_slugs=("tc.temp.dotted",))
+        await provider.load_all_async()
 
 
-def test_an_empty_slug_tuple_is_rejected_at_construction() -> None:
-    with pytest.raises(VenuePayloadError):
-        build_provider(market_slugs=())
+@pytest.mark.asyncio
+async def test_an_empty_discovery_cycle_is_rejected() -> None:
+    provider, _, _ = build_provider(market_slugs=())
+    with pytest.raises(VenuePayloadError, match="discovery returned zero"):
+        await provider.load_all_async()
 
 
 @pytest.mark.asyncio
 async def test_a_venue_error_status_propagates_instead_of_yielding_zero_instruments() -> None:
     provider, _, _ = build_provider(bodies={})
-    with pytest.raises(PolymarketUSError):
+    with pytest.raises(VenuePayloadError, match="discovery returned zero"):
         await provider.load_all_async()
     assert provider.count == 0
 

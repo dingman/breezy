@@ -59,8 +59,8 @@ from breezy.adapters.polymarket_us.credentials import (
 from breezy.adapters.polymarket_us.data import PolymarketUSDataClient
 from breezy.adapters.polymarket_us.factories import (
     API_BASE_ENV_VAR,
+    DISCOVERY_RELOAD_INTERVAL_ENV_VAR,
     GATEWAY_BASE_ENV_VAR,
-    MARKET_SLUGS_ENV_VAR,
     USER_AGENT_ENV_VAR,
     WS_URL_ENV_VAR,
     PolymarketUSLiveDataClientFactory,
@@ -128,7 +128,7 @@ def make_env(**overrides: str) -> dict[str, str]:
         API_BASE_ENV_VAR: "https://api.polymarket.us",
         GATEWAY_BASE_ENV_VAR: "https://gateway.polymarket.us",
         WS_URL_ENV_VAR: "wss://api.polymarket.us",
-        MARKET_SLUGS_ENV_VAR: f"{SLUG},{OTHER_SLUG}",
+        DISCOVERY_RELOAD_INTERVAL_ENV_VAR: "5",
         USER_AGENT_ENV_VAR: USER_AGENT,
     }
     env.update(overrides)
@@ -141,7 +141,7 @@ def make_config(**overrides: Any) -> PolymarketUSDataClientConfig:
         "api_base_url": "https://api.polymarket.us",
         "gateway_base_url": "https://gateway.polymarket.us",
         "ws_url": "wss://api.polymarket.us",
-        "market_slugs": (SLUG, OTHER_SLUG),
+        "instrument_reload_interval_mins": 5,
         "user_agent": USER_AGENT,
     }
     kwargs.update(overrides)
@@ -261,31 +261,26 @@ def test_credentials_are_resolved_from_the_config_supplied_env_var_names(
     assert wired["seen_refs"] == [secrets]
 
 
-def test_create_wires_the_instrument_provider_with_the_configured_slugs(
+def test_create_wires_the_instrument_provider_with_discovery_config(
     wired: dict[str, Any],
 ) -> None:
     client = build_client(make_config())
     provider = client._instrument_provider
 
     assert isinstance(provider, PolymarketUSInstrumentProvider)
-    assert provider.market_slugs == (SLUG, OTHER_SLUG)
+    assert provider._discovery.city_codes == ("nyc", "sfo", "mia", "mdw", "lax")
     assert provider.venue == POLYMARKET_US_VENUE
 
 
-def test_create_wires_configured_slugs_as_native_provider_load_ids(
+def test_create_wires_native_provider_load_all_for_discovery(
     wired: dict[str, Any],
 ) -> None:
-    """The node calls InstrumentProvider.initialize(), so native load_ids must be set."""
+    """The node calls InstrumentProvider.initialize(), so native load_all must be set."""
     client = build_client(make_config(instrument_provider=InstrumentProviderConfig()))
     provider = client._instrument_provider
 
-    assert provider._load_all_on_start is False
-    load_ids = provider._load_ids_on_start
-    assert load_ids is not None
-    assert {instrument_id.value for instrument_id in load_ids} == {
-        f"{SLUG}.POLYMARKET_US",
-        f"{OTHER_SLUG}.POLYMARKET_US",
-    }
+    assert provider._load_all_on_start is True
+    assert provider._load_ids_on_start is None
 
 
 def test_create_preserves_an_explicit_native_provider_loading_config(
@@ -319,7 +314,12 @@ def test_create_budgets_the_transport_from_the_config_quotas(
     transport = StubTransport.instances[0]
 
     assert transport.timeout_secs == 7
-    assert [key for key, _ in transport.keyed_quotas] == ["instruments", "book", "portfolio"]
+    assert [key for key, _ in transport.keyed_quotas] == [
+        "discovery",
+        "instruments",
+        "book",
+        "portfolio",
+    ]
 
 
 def test_create_builds_a_markets_socket_bound_to_the_configured_url(
@@ -389,7 +389,7 @@ def test_config_from_env_builds_the_documented_configuration() -> None:
     assert config.api_base_url == "https://api.polymarket.us"
     assert config.gateway_base_url == "https://gateway.polymarket.us"
     assert config.ws_url == "wss://api.polymarket.us"
-    assert config.market_slugs == (SLUG, OTHER_SLUG)
+    assert config.instrument_reload_interval_mins == 5
     assert config.user_agent == USER_AGENT
     assert config.signing_variant == SigningVariant.PATH_ONLY
 
@@ -403,21 +403,21 @@ def test_config_from_env_names_every_unset_variable_in_one_error() -> None:
         API_BASE_ENV_VAR,
         GATEWAY_BASE_ENV_VAR,
         WS_URL_ENV_VAR,
-        MARKET_SLUGS_ENV_VAR,
+        DISCOVERY_RELOAD_INTERVAL_ENV_VAR,
         USER_AGENT_ENV_VAR,
     ):
         assert name in message
 
 
-def test_config_from_env_rejects_a_blank_slug_entry() -> None:
+def test_config_from_env_rejects_a_non_integer_reload_interval() -> None:
     with pytest.raises(SettingsError):
-        config_from_env(make_env(**{MARKET_SLUGS_ENV_VAR: f"{SLUG}, ,{OTHER_SLUG}"}))
+        config_from_env(make_env(**{DISCOVERY_RELOAD_INTERVAL_ENV_VAR: "soon"}))
 
 
-def test_config_from_env_trims_whitespace_around_slugs() -> None:
-    config = config_from_env(make_env(**{MARKET_SLUGS_ENV_VAR: f" {SLUG} , {OTHER_SLUG} "}))
+def test_config_from_env_rejects_a_non_positive_reload_interval() -> None:
+    with pytest.raises(SettingsError):
+        config_from_env(make_env(**{DISCOVERY_RELOAD_INTERVAL_ENV_VAR: "0"}))
 
-    assert config.market_slugs == (SLUG, OTHER_SLUG)
 
 
 def test_config_from_env_carries_no_secret_value() -> None:

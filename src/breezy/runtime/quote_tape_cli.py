@@ -42,22 +42,12 @@ honest record of how many separate capture sessions there were, and therefore
 of where the tape is discontinuous. See
 ``PolymarketUSDataClient.tape_gaps`` for gaps WITHIN a session.
 
-Strike-ladder coverage is the OPERATOR's responsibility, and unverified
-----------------------------------------------------------------------
-``POLYMARKET_US_MARKET_SLUGS`` is an explicit list. Nothing here cross-checks it
-against the venue's market listing, because the market-data client holds no HTTP
-client by construction (that is what keeps its read-only surface a single
-socket) and adding one to validate a config would widen it.
-
-The consequence is real and is stated rather than hidden: if the configured
-ladder is missing strikes for a city, the tape silently covers only part of that
-city's market on that day, and plan item 1.5.4's per-city persistence check --
-"is the gap present across cities and across days?" -- would be computed over a
-truncated ladder without knowing it. The configured slug count is logged at
-startup so the number is at least visible in the run's own log, and the count
-per city per day is a check the analysis step must perform against a market
-listing it fetches itself. **Not solved here. Do not read the tape as
-ladder-complete.**
+Market discovery
+----------------
+The recorder discovers Polymarket.us weather markets through ``GET /v1/markets``
+inside the read-only data adapter. The operator supplies endpoints and a reload
+cadence, not per-day market slugs. Discovery remains fail-closed: a zero-market
+cycle or an uncorroborated weather slug is a runtime fault, not a quiet tape.
 
 The exit contract matches ``breezy.runtime.cli``:
 
@@ -231,12 +221,10 @@ def run(
             # terms first -- 0700, and refused outright if it is a symlink.
             prepare_quote_tape_root(settings.catalog_root)
             config = build_quote_tape_node_config(settings, data_client_config)
-            # Stated in the run's own log because nothing verifies it: see the
-            # module docstring on strike-ladder coverage.
             logger.info(
-                "quote-tape recording %d configured market slug(s); ladder "
-                "completeness is NOT verified against any venue listing",
-                len(data_client_config.market_slugs),
+                "quote-tape recording with Polymarket.us discovery reload interval "
+                "%d minute(s)",
+                data_client_config.instrument_reload_interval_mins,
             )
         except _CONFIG_ERRORS as exc:
             _report(out, "configuration error", exc, expected=True)

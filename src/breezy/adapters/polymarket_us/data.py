@@ -112,11 +112,13 @@ __all__ = [
     "MarketsFeedFactory",
     "PolymarketUSDataClient",
     "QuoteTickParser",
+    "SubscriptionChangePlan",
     "build_data_client",
     "derive_client_id",
     "diagnose_frame_payload",
     "frame_class_counts",
     "should_warn_at_count",
+    "subscription_changes_after_discovery",
 ]
 
 # ``POLYMARKET_US_VENUE`` is imported from ``symbology`` and re-exported here:
@@ -177,6 +179,42 @@ class FrameDiagnostic:
     value_types: Mapping[str, str]
     safe_values: Mapping[str, str]
     slug_bearing_keys: tuple[str, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class SubscriptionChangePlan:
+    """Cache-gated subscription changes after one discovery cycle."""
+
+    subscribe: tuple[str, ...]
+    unsubscribe: tuple[tuple[str, str], ...]
+    blocked_missing_cache: tuple[str, ...]
+
+
+def subscription_changes_after_discovery(
+    *,
+    desired_slugs: Sequence[str],
+    live_slugs: Sequence[str],
+    cached_slugs: frozenset[str],
+    resolved_reasons: Mapping[str, str],
+) -> SubscriptionChangePlan:
+    """Plan WS subscription changes while enforcing cache-before-subscribe."""
+    desired = tuple(dict.fromkeys(desired_slugs))
+    live = tuple(dict.fromkeys(live_slugs))
+    live_set = set(live)
+    desired_set = set(desired)
+
+    blocked = tuple(slug for slug in desired if slug not in live_set and slug not in cached_slugs)
+    subscribe = tuple(slug for slug in desired if slug not in live_set and slug in cached_slugs)
+    unsubscribe = tuple(
+        (slug, resolved_reasons.get(slug, "discovery-missing"))
+        for slug in live
+        if slug not in desired_set or slug in resolved_reasons
+    )
+    return SubscriptionChangePlan(
+        subscribe=subscribe,
+        unsubscribe=unsubscribe,
+        blocked_missing_cache=blocked,
+    )
 
 
 @runtime_checkable
@@ -408,6 +446,7 @@ class PolymarketUSDataClient(LiveMarketDataClient):
         self._feed: MarketsFeed = feed_factory(self._handle_ws_frame)
         self._feed_watch_interval_secs: float = feed_watch_interval_secs
         self._feed_watchdog: asyncio.Task[None] | None = None
+        self._update_instruments_task: asyncio.Task[None] | None = None
         self._safe_mode: bool = False
         # The owning node's NATIVE `instance_id`, threaded via config because
         # neither `MessageBus` nor `LiveDataClientFactory.create` exposes it
@@ -562,13 +601,18 @@ class PolymarketUSDataClient(LiveMarketDataClient):
         self._log.info("Initializing instruments...")
         await self._instrument_provider.initialize()
         self._send_all_instruments_to_data_engine()
+        self._alert_on_missing_cache_after_push(self._provider_active_slugs())
 
         await self._feed.connect()
+        await self._reconcile_discovered_subscriptions(cycle="initial")
 
-        # One subscribe call per slug, so one requestId maps to exactly one
-        # slug and an unsubscribe cannot silently drop a sibling market.
-        for slug in self._venue_config.market_slugs:
-            await self._feed.subscribe_market_data([slug])
+        interval_mins = self._venue_config.instrument_reload_interval_mins
+        if interval_mins is None:  # pragma: no cover - config validation narrows at runtime
+            raise ValueError("instrument_reload_interval_mins is required")
+        self._update_instruments_task = self.create_task(
+            self._update_instruments(interval_mins),
+            log_msg="update_instruments",
+        )
 
         self._feed_watchdog = self._loop.create_task(
             self._watch_feed(),
@@ -576,8 +620,20 @@ class PolymarketUSDataClient(LiveMarketDataClient):
         )
 
     async def _disconnect(self) -> None:
+        await self._cancel_update_instruments()
         await self._cancel_feed_watchdog()
         await self._feed.close()
+
+    async def _cancel_update_instruments(self) -> None:
+        task = self._update_instruments_task
+        self._update_instruments_task = None
+        if task is None or task.done():
+            return
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
 
     async def _cancel_feed_watchdog(self) -> None:
         task = self._feed_watchdog
@@ -605,6 +661,100 @@ class PolymarketUSDataClient(LiveMarketDataClient):
         for currency in self._instrument_provider.currencies().values():
             self._cache.add_currency(currency)
 
+    async def _update_instruments(self, interval_mins: int) -> None:
+        try:
+            while True:
+                self._log.debug(
+                    f"Scheduled task 'update_instruments' to run in {interval_mins} minutes"
+                )
+                await asyncio.sleep(interval_mins * 60)
+                before = len(self._provider_active_slugs())
+                await self._instrument_provider.initialize(reload=True)
+                self._send_all_instruments_to_data_engine()
+                after_slugs = self._provider_active_slugs()
+                self._alert_on_discovery_counts(before=before, after=len(after_slugs))
+                self._alert_on_missing_cache_after_push(after_slugs)
+                await self._reconcile_discovered_subscriptions(cycle="reload")
+        except asyncio.CancelledError:
+            self._log.debug("Canceled task 'update_instruments'")
+
+    async def _reconcile_discovered_subscriptions(self, *, cycle: str) -> None:
+        desired = self._provider_active_slugs()
+        live = tuple(self._feed.subscriptions)
+        cached = frozenset(
+            slug
+            for slug in desired
+            if self._cache.instrument(slug_to_instrument_id(slug, self.venue)) is not None
+        )
+        resolved = self._provider_resolved_reasons()
+        plan = subscription_changes_after_discovery(
+            desired_slugs=desired,
+            live_slugs=live,
+            cached_slugs=cached,
+            resolved_reasons=resolved,
+        )
+        for slug in plan.blocked_missing_cache:
+            self._log.error(
+                "Polymarket.us discovery found slug "
+                f"{slug!r} but cache.instrument is None after engine push; "
+                "refusing to subscribe before the streaming writer can resolve it"
+            )
+        for slug, reason in plan.unsubscribe:
+            request_id = self._feed.subscriptions.get(slug)
+            if request_id is None:
+                continue
+            self._log.warning(
+                f"Polymarket.us discovery cycle {cycle}: unsubscribing {slug} ({reason})"
+            )
+            await self._feed.unsubscribe(request_id)
+        for slug in plan.subscribe:
+            self._log.info(f"Polymarket.us discovery cycle {cycle}: subscribing {slug} (new)")
+            await self._feed.subscribe_market_data([slug])
+        self._log.info(
+            "Polymarket.us discovery cycle "
+            f"{cycle}: subscribed={plan.subscribe!r} unsubscribed={plan.unsubscribe!r} "
+            f"blocked_missing_cache={plan.blocked_missing_cache!r}"
+        )
+
+    def _provider_active_slugs(self) -> tuple[str, ...]:
+        value = getattr(self._instrument_provider, "active_market_slugs", ())
+        return tuple(value) if isinstance(value, Sequence) else ()
+
+    def _provider_market_slugs(self) -> tuple[str, ...]:
+        value = getattr(self._instrument_provider, "market_slugs", ())
+        return tuple(value) if isinstance(value, Sequence) else ()
+
+    def _provider_resolved_reasons(self) -> Mapping[str, str]:
+        value = getattr(self._instrument_provider, "resolved_market_reasons", {})
+        return dict(value) if isinstance(value, Mapping) else {}
+
+    def _alert_on_discovery_counts(self, *, before: int, after: int) -> None:
+        resolved = self._provider_resolved_reasons()
+        self._log.info(
+            f"Polymarket.us discovery count before={before} after={after} "
+            f"resolved={len(resolved)}"
+        )
+        if after == 0:
+            self._log.error(
+                "Polymarket.us discovery produced zero active markets this cycle; "
+                "this is not treated as a quiet tape"
+            )
+        if after < before and not resolved:
+            self._log.error(
+                "Polymarket.us discovery active market count dropped "
+                f"from {before} to {after} without a resolved-market explanation"
+            )
+
+    def _alert_on_missing_cache_after_push(self, slugs: Sequence[str]) -> None:
+        for slug in slugs:
+            instrument_id = slug_to_instrument_id(slug, self.venue)
+            if self._cache.instrument(instrument_id) is None:
+                self._log.error(
+                    "Polymarket.us discovery found slug "
+                    f"{slug!r} but cache.instrument({instrument_id}) is None after "
+                    "publishing instruments to the data engine"
+                )
+
     # -- subscriptions ----------------------------------------------------
 
     async def _subscribe_quote_ticks(self, command: SubscribeQuoteTicks) -> None:
@@ -616,6 +766,12 @@ class PolymarketUSDataClient(LiveMarketDataClient):
             return
         if slug in self._feed.subscriptions:
             self._log.debug(f"Already subscribed to {slug}")
+            return
+        if self._cache.instrument(instrument_id) is None:
+            self._log.error(
+                f"Refusing quote subscription for {instrument_id}: cache.instrument is "
+                "None, so streaming persistence would silently drop the first quote"
+            )
             return
         await self._feed.subscribe_market_data([slug])
 
@@ -660,7 +816,7 @@ class PolymarketUSDataClient(LiveMarketDataClient):
 
         payload: Mapping[str, Any] = decoded
         self._frame_diagnostics.append(
-            diagnose_frame_payload(payload, self._venue_config.market_slugs)
+            diagnose_frame_payload(payload, self._provider_market_slugs())
         )
         slug = _market_slug_from_payload(payload)
         if slug is None:
@@ -1041,15 +1197,9 @@ class PolymarketUSDataClient(LiveMarketDataClient):
             )
 
     def _subscribed_instrument_ids(self) -> list[InstrumentId]:
-        """Instruments this client is recording, resolved from configured slugs.
-
-        Taken from the CONFIG rather than from the socket's live subscription
-        map: during an outage that map may be mid-replay, and a gap that
-        silently covered fewer instruments than it really affected would be
-        worse than no gap record at all.
-        """
+        """Instruments this client is recording, resolved from latest discovery."""
         resolved: list[InstrumentId] = []
-        for slug in self._venue_config.market_slugs:
+        for slug in self._provider_active_slugs():
             try:
                 resolved.append(slug_to_instrument_id(slug))
             except PolymarketUSError:  # pragma: no cover - config is validated upstream

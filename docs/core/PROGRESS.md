@@ -876,7 +876,24 @@ Status vocabulary: `TODO` / `IN PROGRESS` / `GREEN` / `BLOCKED (<unlock>)`.
 
 ### Phase A support — autonomous discovery (added 2026-08-26)
 
-- **G-18 — Autonomous market discovery.** `TODO` — **ON THE CRITICAL PATH.**
+- **G-18 — Autonomous market discovery.** `GREEN` — was on the critical path.
+  Built and verified **entirely offline against committed captured payloads**;
+  zero live venue calls. Six tests: the captured climate payload yields the
+  expected weather slug set; the provider discovers open markets from the list
+  endpoint; pagination is followed to a short page; a zero-discovery cycle
+  raises and alerts loudly; a bounds/`description` disagreement fails closed;
+  and subscription never precedes the Cache containing the instrument.
+  `POLYMARKET_US_MARKET_SLUGS` is no longer required recorder config —
+  `POLYMARKET_US_DISCOVERY_RELOAD_INTERVAL_MINS` is required-no-default in its
+  place. `MARKET_SLUG_KEY` deliberately unchanged: it is the WebSocket key and
+  G-12 stays open pending a live frame.
+  Gates re-run independently by the coordinator: pytest 0 (0 failures), ruff 0,
+  mypy 0 over 91 source files, lint-imports 0 (2 contracts kept). The read-only
+  barrier suite still passes — discovery is GET-only.
+  **Residual:** `POLYMARKET_US_MARKET_SLUGS` survives as optional legacy
+  metadata for the auth-smoke probe path only.
+
+  **[SUPERSEDED — original TODO text below]**
   Plan: `docs/plans/backlog/G-18-autonomous-market-discovery.md`.
   Opened on operator direction: the bot must discover markets itself and will
   never be handed a slug list. `POLYMARKET_US_MARKET_SLUGS` is static and

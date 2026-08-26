@@ -48,6 +48,7 @@ from breezy.adapters.polymarket_us.credentials import (
 from breezy.adapters.polymarket_us.errors import VenueTransportError
 from breezy.adapters.polymarket_us.factories import (
     API_BASE_ENV_VAR,
+    DISCOVERY_RELOAD_INTERVAL_ENV_VAR,
     GATEWAY_BASE_ENV_VAR,
     MARKET_SLUGS_ENV_VAR,
     USER_AGENT_ENV_VAR,
@@ -101,6 +102,7 @@ def make_env(**overrides: str) -> dict[str, str]:
         GATEWAY_BASE_ENV_VAR: "https://gateway.polymarket.us",
         WS_URL_ENV_VAR: "wss://api.polymarket.us",
         MARKET_SLUGS_ENV_VAR: SLUG,
+        DISCOVERY_RELOAD_INTERVAL_ENV_VAR: "5",
         USER_AGENT_ENV_VAR: USER_AGENT,
     }
     env.update(overrides)

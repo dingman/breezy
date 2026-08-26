@@ -40,6 +40,7 @@ from breezy.adapters.polymarket_us.redaction import redact_url
 
 __all__ = [
     "DEFAULT_BOOK_REQUESTS_PER_MINUTE",
+    "DEFAULT_DISCOVERY_REQUESTS_PER_MINUTE",
     "DEFAULT_GLOBAL_REQUESTS_PER_SECOND",
     "DEFAULT_INSTRUMENT_REQUESTS_PER_MINUTE",
     "DEFAULT_PORTFOLIO_REQUESTS_PER_MINUTE",
@@ -47,6 +48,7 @@ __all__ = [
     "PERMITTED_QUOTA_KEYS",
     "QUOTA_KEY_BOOK",
     "QUOTA_KEY_DEFAULT",
+    "QUOTA_KEY_DISCOVERY",
     "QUOTA_KEY_INSTRUMENTS",
     "QUOTA_KEY_PORTFOLIO",
     "RETAIL_GLOBAL_REQUESTS_PER_SECOND",
@@ -71,6 +73,7 @@ OBSERVED_RESPONSE_HEADERS: tuple[str, ...] = (
 )
 
 QUOTA_KEY_INSTRUMENTS: str = "instruments"
+QUOTA_KEY_DISCOVERY: str = "discovery"
 QUOTA_KEY_BOOK: str = "book"
 QUOTA_KEY_PORTFOLIO: str = "portfolio"
 QUOTA_KEY_DEFAULT: str = "default"
@@ -79,7 +82,13 @@ QUOTA_KEY_DEFAULT: str = "default"
 #: programming error, not a silently-unthrottled request: adding an endpoint
 #: without giving it a budget fails loudly at the first call.
 PERMITTED_QUOTA_KEYS: frozenset[str] = frozenset(
-    {QUOTA_KEY_INSTRUMENTS, QUOTA_KEY_BOOK, QUOTA_KEY_PORTFOLIO, QUOTA_KEY_DEFAULT}
+    {
+        QUOTA_KEY_INSTRUMENTS,
+        QUOTA_KEY_DISCOVERY,
+        QUOTA_KEY_BOOK,
+        QUOTA_KEY_PORTFOLIO,
+        QUOTA_KEY_DEFAULT,
+    }
 )
 
 #: The documented RETAIL ceiling, recorded so the headroom below is auditable:
@@ -97,6 +106,7 @@ RETAIL_GLOBAL_REQUESTS_PER_SECOND: int = 20
 
 #: Breezy's global budget: 25% headroom under the retail cap.
 DEFAULT_GLOBAL_REQUESTS_PER_SECOND: int = 15
+DEFAULT_DISCOVERY_REQUESTS_PER_MINUTE: int = 6
 DEFAULT_INSTRUMENT_REQUESTS_PER_MINUTE: int = 6
 DEFAULT_BOOK_REQUESTS_PER_MINUTE: int = 12
 DEFAULT_PORTFOLIO_REQUESTS_PER_MINUTE: int = 12
@@ -175,6 +185,7 @@ def build_default_quota(
 
 def build_keyed_quotas(
     *,
+    discovery_requests_per_minute: int = DEFAULT_DISCOVERY_REQUESTS_PER_MINUTE,
     instrument_requests_per_minute: int = DEFAULT_INSTRUMENT_REQUESTS_PER_MINUTE,
     book_requests_per_minute: int = DEFAULT_BOOK_REQUESTS_PER_MINUTE,
     portfolio_requests_per_minute: int = DEFAULT_PORTFOLIO_REQUESTS_PER_MINUTE,
@@ -188,6 +199,7 @@ def build_keyed_quotas(
     so this budget costs nothing in the steady state.
     """
     for name, value in (
+        ("discovery_requests_per_minute", discovery_requests_per_minute),
         ("instrument_requests_per_minute", instrument_requests_per_minute),
         ("book_requests_per_minute", book_requests_per_minute),
         ("portfolio_requests_per_minute", portfolio_requests_per_minute),
@@ -195,6 +207,10 @@ def build_keyed_quotas(
         if value <= 0:
             raise ValueError(f"{name} must be positive; got {value}")
     return [
+        (
+            QUOTA_KEY_DISCOVERY,
+            nautilus_pyo3.Quota.rate_per_minute(discovery_requests_per_minute),
+        ),
         (
             QUOTA_KEY_INSTRUMENTS,
             nautilus_pyo3.Quota.rate_per_minute(instrument_requests_per_minute),
