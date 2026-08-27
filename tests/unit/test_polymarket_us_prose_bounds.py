@@ -182,6 +182,37 @@ def test_prose_forms_parse_to_their_stated_strike_and_comparator(
 
 
 # ---------------------------------------------------------------------------
+# Ladder contiguity: shared helpers, module-level so they are independently
+# testable rather than trapped as a closure inside one test function.
+# ---------------------------------------------------------------------------
+
+
+def _bucket_lower_sort_key(bucket: tuple[int, int | None, int | None]) -> tuple[bool, int]:
+    """Sort key ordering buckets ascending by lower bound, ``None`` first.
+
+    Guards explicitly with ``is not None`` rather than truthiness: a lower
+    bound of exactly 0 is a real, frequently observed NYC/MDW value, not an
+    absent bound, and must not be treated as falsy.
+    """
+    lower = bucket[1]
+    return (lower is not None, lower if lower is not None else -999)
+
+
+def _ordered_by_lower_bound(
+    buckets: list[tuple[int, int | None, int | None]],
+) -> list[tuple[int, int | None, int | None]]:
+    return sorted(buckets, key=_bucket_lower_sort_key)
+
+
+def contiguous(buckets: list[tuple[int, int | None, int | None]]) -> bool:
+    ordered = _ordered_by_lower_bound(buckets)
+    for (_, _, upper), (_, lower, _) in pairwise(ordered):
+        if upper is None or lower is None or lower != upper + 1:
+            return False
+    return True
+
+
+# ---------------------------------------------------------------------------
 # THE FINDING: the slug's `lt` token is CONTEXT DEPENDENT
 # ---------------------------------------------------------------------------
 
@@ -228,13 +259,6 @@ def test_the_prose_ladder_tiles_the_temperature_line_and_the_literal_slug_never_
         ladders.setdefault(key, []).append((market.sort_order, lower, upper))
 
     assert len(ladders) >= MIN_LADDERS
-
-    def contiguous(buckets: list[tuple[int, int | None, int | None]]) -> bool:
-        ordered = sorted(buckets, key=lambda b: (b[1] is not None, b[1] if b[1] else -999))
-        for (_, _, upper), (_, lower, _) in pairwise(ordered):
-            if upper is None or lower is None or lower != upper + 1:
-                return False
-        return True
 
     gapped = [key for key, buckets in ladders.items() if not contiguous(buckets)]
     assert gapped == [], f"prose ladders are not contiguous for {gapped[:3]}"
@@ -291,6 +315,29 @@ def test_lt79_and_lte78_describe_the_same_half_line_but_lte_is_never_emitted() -
     from_prose = parse_prose_bounds(target.description)
     assert from_prose is not None
     assert from_prose.closed_interval == (None, 78)
+
+
+def test_a_zero_lower_bound_sorts_as_the_true_minimum_not_as_a_falsy_sentinel() -> None:
+    """0F is a real, observed NYC/MDW lower bound -- not a falsy "absent" marker.
+
+    A ladder tiling -5..-3, -2..-1, 0..1 is perfectly contiguous. A sort key
+    of the shape ``lower if lower else SENTINEL`` treats the bucket whose
+    lower bound is exactly 0 as if it had no lower bound at all, sorting it
+    as though -999 were its lower bound -- i.e. before -5 and -2, not after
+    them. That flips the correct ascending order ``[-5, -2, 0]`` into the
+    wrong order ``[0, -5, -2]`` and makes a genuinely contiguous ladder read
+    as gapped.
+    """
+    buckets: list[tuple[int, int | None, int | None]] = [
+        (2, -2, -1),
+        (0, -5, -3),
+        (5, 0, 1),
+    ]
+
+    ordered = _ordered_by_lower_bound(buckets)
+
+    assert [lower for _, lower, _ in ordered] == [-5, -2, 0]
+    assert contiguous(buckets) is True
 
 
 # ---------------------------------------------------------------------------
