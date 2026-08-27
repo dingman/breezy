@@ -43,7 +43,8 @@ every backlog item marked operator-blocked.
 |---|---|---|---|
 | B1 | `POLYMARKET_US_API_BASE` / `_GATEWAY_BASE` / `_WS_URL` | `config.py` `REQUIRED_FIELDS`; `factories.py:105-107,143-157` | Venue constants; already in the captured docs snapshot and `headers/` captures |
 | B2 | `POLYMARKET_US_DISCOVERY_RELOAD_INTERVAL_MINS` | `factories.py:109,158-172` | `startDate` / `endDate` / `gameStartTime` give the exact turnover instants |
-| B3 | `DEFAULT_DISCOVERY_CITY_CODES` (hardcoded) | `config.py:49,83,99` | `series_limit100.json` weather series ids 35-44 |
+| ~~B3~~ **DONE** | `DEFAULT_DISCOVERY_CITY_CODES` (hardcoded) | deleted from `config.py` | Now `discovery_city_codes_from_registry()`, derived from `registry/sites.toml` and failing closed on empty/colliding venues. Proof it is derived, not recited: a synthetic BOS/DAL registry yields `("bos","dal")` (`test_polymarket_us_config.py`). |
+| B3b | `city_codes` silently narrows discovery | `provider.py:123,333` | **Open.** `city_codes` is a CLIENT-SIDE filter over the already-fetched climate payload, so a weather market for a city outside the registry is dropped with no refusal. `series.derive_site_pairs` refuses exactly this case (refusal #1) but never sees it, because the filter runs upstream. Fix: make `_weather_market_payloads` raise on an observed weather city absent from the registry, mirroring that refusal. Same defect class as B3 — a venue fact overridden by a local list — merely moved downstream. |
 | B4 | `BREEZY_SITES` (required-no-default) | `settings.py:34,236` | Same series list, intersected with `registry/sites.toml` |
 | B5 | Fee schedule `UNKNOWN` (G-15) | `parsing.py:195,224-252` | `feeCoefficient` present in **45/45** captured market observations |
 | B6 | Strike/bounds via inferred slug grammar | `symbology.py:89-101` | `description` / `title` carry the authoritative comparator; `marketSides` carries Yes/No |

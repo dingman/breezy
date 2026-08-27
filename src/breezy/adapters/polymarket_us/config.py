@@ -47,10 +47,10 @@ from breezy.adapters.polymarket_us.credentials import (
     assert_config_type_excludes_secrets,
 )
 from breezy.adapters.polymarket_us.signing import SigningVariant
+from breezy.registry.sites import SiteRegistry, default_registry
 from breezy.runtime.settings import SettingsError
 
 __all__ = [
-    "DEFAULT_DISCOVERY_CITY_CODES",
     "POLYMARKET_US_ALLOW_FOREIGN_ORIGIN_ENV_VAR",
     "POLYMARKET_US_API_BASE_URL",
     "POLYMARKET_US_GATEWAY_BASE_URL",
@@ -58,9 +58,8 @@ __all__ = [
     "POLYMARKET_US_WS_BASE_URL",
     "PolymarketUSDataClientConfig",
     "PolymarketUSMarketDiscoveryConfig",
+    "discovery_city_codes_from_registry",
 ]
-
-DEFAULT_DISCOVERY_CITY_CODES: tuple[str, ...] = ("nyc", "sfo", "mia", "mdw", "lax")
 
 #: The registrable domain every venue origin must sit under. VENUE FACT: all
 #: three pinned origins (``api``, ``gateway``, ``wss``) are hosts under it.
@@ -148,6 +147,37 @@ POSITIVE_FIELDS: tuple[str, ...] = (
 )
 
 
+def discovery_city_codes_from_registry(
+    registry: SiteRegistry | None = None,
+    *,
+    venue: str = "polymarket_us",
+) -> tuple[str, ...]:
+    """Derive discovery city slugs from settlement truth, not a recited tuple.
+
+    Config construction has no live venue series payload; the active registry is
+    the narrower load-time source because it is the set Breezy can settle. The
+    venue-side equality/refusal remains in ``series.derive_site_pairs`` where a
+    venue payload actually exists.
+    """
+    active_registry = default_registry() if registry is None else registry
+    codes = tuple(
+        city.lower()
+        for registered_venue, city in active_registry.pairs()
+        if registered_venue == venue
+    )
+    if not codes:
+        raise SettingsError(
+            f"market_discovery.city_codes cannot be derived: registry holds no "
+            f"sites for venue {venue!r}"
+        )
+    if len(set(codes)) != len(codes):
+        raise SettingsError(
+            "market_discovery.city_codes cannot be derived: registry city keys "
+            f"for venue {venue!r} collide after lowercase normalization"
+        )
+    return codes
+
+
 class PolymarketUSMarketDiscoveryConfig(msgspec.Struct, frozen=True):
     """Venue list-query configuration for autonomous weather-market discovery."""
 
@@ -159,7 +189,7 @@ class PolymarketUSMarketDiscoveryConfig(msgspec.Struct, frozen=True):
     closed: bool | None = False
     archived: bool | None = False
     include_closed: bool = False
-    city_codes: tuple[str, ...] = DEFAULT_DISCOVERY_CITY_CODES
+    city_codes: tuple[str, ...] = msgspec.field(default_factory=discovery_city_codes_from_registry)
 
     def __post_init__(self) -> None:
         if not isinstance(self.limit, int) or isinstance(self.limit, bool) or self.limit <= 0:
@@ -227,7 +257,9 @@ class PolymarketUSDataClientConfig(LiveDataClientConfig, frozen=True):
     api_base_url: str = POLYMARKET_US_API_BASE_URL
     gateway_base_url: str = POLYMARKET_US_GATEWAY_BASE_URL
     ws_url: str = POLYMARKET_US_WS_BASE_URL
-    market_discovery: PolymarketUSMarketDiscoveryConfig = PolymarketUSMarketDiscoveryConfig()
+    market_discovery: PolymarketUSMarketDiscoveryConfig = msgspec.field(
+        default_factory=PolymarketUSMarketDiscoveryConfig
+    )
     market_slugs: tuple[str, ...] = ()
     instrument_reload_interval_mins: int | None = None
     user_agent: str | None = None

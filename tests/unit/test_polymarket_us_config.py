@@ -20,20 +20,23 @@ Two properties are load-bearing and both are pinned here:
 
 from __future__ import annotations
 
+from pathlib import Path
+
 import msgspec
 import pytest
 from nautilus_trader.common.config import tokenize_config
 
 from breezy.adapters.polymarket_us.config import (
-    DEFAULT_DISCOVERY_CITY_CODES,
     PolymarketUSDataClientConfig,
     PolymarketUSMarketDiscoveryConfig,
+    discovery_city_codes_from_registry,
 )
 from breezy.adapters.polymarket_us.credentials import (
     PolymarketUSSecretsRefConfig,
     assert_config_type_excludes_secrets,
 )
 from breezy.adapters.polymarket_us.signing import SigningVariant
+from breezy.registry.sites import default_registry, load_registry
 from breezy.runtime.settings import SettingsError
 
 VALID_KWARGS: dict[str, object] = {
@@ -91,8 +94,90 @@ def test_config_raises_settings_error_for_blank_discovery_category() -> None:
 def test_default_discovery_city_codes_cover_the_weather_sites() -> None:
     config = make_config()
 
-    assert config.market_discovery.city_codes == DEFAULT_DISCOVERY_CITY_CODES
-    assert config.market_discovery.city_codes == ("nyc", "sfo", "mia", "mdw", "lax")
+    assert config.market_discovery.city_codes == discovery_city_codes_from_registry()
+    assert config.market_discovery.city_codes == tuple(
+        city.lower()
+        for venue, city in default_registry().pairs()
+        if venue == "polymarket_us"
+    )
+
+
+def test_discovery_city_codes_are_derived_from_the_registry_not_recited(
+    tmp_path: Path,
+) -> None:
+    registry_path = tmp_path / "sites.toml"
+    registry_path.write_text(
+        """
+registry_version = "test"
+
+[sites.polymarket_us.BOS]
+icao = "KBOS"
+cli_location = "BOS"
+issuing_office = "KBOX"
+body_header_regex = "^BOS$"
+never_substitute = ["BOS"]
+never_substitute_cli_locations = ["BOS"]
+iana_tz = "America/New_York"
+std_utc_offset_hours = -5
+settlement_time_local = "08:00"
+settlement_timezone = "America/New_York"
+settlement_delay_time_local = "11:00"
+settlement_delay_timezone = "America/New_York"
+no_data_fallback_days = 7
+
+[sites.polymarket_us.BOS.open_meteo]
+settlement_eligible = false
+lat = 42.36
+lon = -71.01
+elevation_m = 6.0
+
+[sites.polymarket_us.DAL]
+icao = "KDAL"
+cli_location = "DAL"
+issuing_office = "KFWD"
+body_header_regex = "^DAL$"
+never_substitute = ["DAL"]
+never_substitute_cli_locations = ["DAL"]
+iana_tz = "America/Chicago"
+std_utc_offset_hours = -6
+settlement_time_local = "08:00"
+settlement_timezone = "America/New_York"
+settlement_delay_time_local = "11:00"
+settlement_delay_timezone = "America/New_York"
+no_data_fallback_days = 7
+
+[sites.polymarket_us.DAL.open_meteo]
+settlement_eligible = false
+lat = 32.85
+lon = -96.85
+elevation_m = 148.0
+
+[sites.kalshi.SEA]
+icao = "KSEA"
+cli_location = "SEA"
+issuing_office = "KSEW"
+body_header_regex = "^SEA$"
+never_substitute = ["SEA"]
+never_substitute_cli_locations = ["SEA"]
+iana_tz = "America/Los_Angeles"
+std_utc_offset_hours = -8
+settlement_time_local = "08:00"
+settlement_timezone = "America/New_York"
+settlement_delay_time_local = "11:00"
+settlement_delay_timezone = "America/New_York"
+no_data_fallback_days = 7
+
+[sites.kalshi.SEA.open_meteo]
+settlement_eligible = false
+lat = 47.45
+lon = -122.31
+elevation_m = 131.0
+""".lstrip(),
+        encoding="utf-8",
+    )
+    registry = load_registry(registry_path)
+
+    assert discovery_city_codes_from_registry(registry) == ("bos", "dal")
 
 
 def test_signing_variant_defaults_to_path_only() -> None:
