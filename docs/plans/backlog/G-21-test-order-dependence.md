@@ -1,4 +1,4 @@
-# G-21 — Pre-existing test-suite order dependence
+# G-21 — Pre-existing test-suite flake — RESOLVED 2026-08-27
 
 Recorded 2026-08-27. **Not caused by any change in this session** — proven below.
 
@@ -45,3 +45,33 @@ One agent hypothesised `__warningregistry__` order dependence for the fee-model
 occurrence and then disproved its own theory: `catch_warnings` bumps the filter
 version and invalidates the registry. Recorded so the next investigator does not
 re-derive a dead end.
+
+
+## RESOLVED — and the umask lead was NOT the cause
+
+Root cause, reproduced deterministically at
+`pytest -p randomly --randomly-seed=54`: the positive evidence/no-leak tests
+generated **randomised fake credentials**, and `write_evidence()` scans output
+for any 4-character fragment of a secret. On seed 54 the fake secret fragment
+`atew` occurs inside `polymarket.us` at offsets 621 and 644, so the leak guard
+**correctly failed closed** and the permission assertions never ran.
+
+So the guard was right and the test was wrong. The failure was a true positive
+against a secret that only existed because the test invented one at random.
+That is why it moved between test names and looked like order dependence: the
+seed drives both the ordering and the fake credential.
+
+Fix: deterministic leak-safe fake credentials for those tests.
+
+The `os.umask` stub was ALSO wrong and was fixed in the same pass — it reported
+0 without setting anything — but it was not the reproduced mechanism. Recorded
+because the hypothesis was stated confidently in this file and was wrong;
+the next reader should not treat a plausible mechanism as a diagnosis.
+
+Not reproduced as distinct causes: the fee-model and discovery occurrences.
+They are consistent with the same seed-driven credential collision, but that
+was not demonstrated. If either recurs, look for a new mechanism rather than
+assuming this one.
+
+Verification: seed 54 green, a 7-seed sweep green, 30/30 consecutive full-suite
+runs green.

@@ -32,7 +32,8 @@ import importlib.util
 import os
 import resource
 import sys
-from collections.abc import Mapping
+from collections.abc import Iterator, Mapping
+from contextlib import contextmanager
 from pathlib import Path
 from types import ModuleType
 from typing import Any
@@ -63,6 +64,8 @@ SCRIPT_REL = "scripts/venue/polymarket_us_auth_smoke.py"
 
 SLUG = "tc-temp-nychigh-2026-08-25-lt79f"
 USER_AGENT = "breezy-smoke/1.0 (+mailto:ops@example.com)"
+LEAK_SAFE_SECRET = base64.b64encode(bytes(range(32))).decode("ascii")
+LEAK_SAFE_KEY_ID = "f13c9a7b-2d6e-4a80-b935-c8e20d41ab67"
 
 
 def _load_smoke_module() -> ModuleType:
@@ -86,6 +89,20 @@ smoke = _load_smoke_module()
 def make_secret() -> str:
     """A freshly generated base64 Ed25519 secret. Never a real credential."""
     return base64.b64encode(bytes(SigningKey.generate())).decode("ascii")
+
+
+def make_leak_safe_secret_pair() -> tuple[str, str]:
+    """Deterministic fake credentials whose fragments do not occur in evidence text."""
+    return LEAK_SAFE_SECRET, LEAK_SAFE_KEY_ID
+
+
+@contextmanager
+def permissive_umask() -> Iterator[None]:
+    previous = os.umask(0)
+    try:
+        yield
+    finally:
+        os.umask(previous)
 
 
 def make_credentials(secret: str, key_id: str) -> PolymarketUSCredentials:
@@ -433,7 +450,7 @@ def test_find_secret_leak_offsets_ignores_empty_secrets() -> None:
 
 
 def test_evidence_redacts_the_signature_header() -> None:
-    secret, key_id = make_secret(), str(UUID4())
+    secret, key_id = make_leak_safe_secret_pair()
     signature = base64.b64encode(b"a-signature-value-here").decode("ascii")
     text = smoke.render_evidence(
         make_report(key_id=key_id, signature=signature), secrets=[secret, key_id, signature]
@@ -445,7 +462,7 @@ def test_evidence_redacts_the_signature_header() -> None:
 
 def test_evidence_redacts_the_access_key_header() -> None:
     """SEC-4: the access key is redacted too, not only the signature."""
-    secret, key_id = make_secret(), str(UUID4())
+    secret, key_id = make_leak_safe_secret_pair()
     signature = base64.b64encode(b"a-signature-value-here").decode("ascii")
     text = smoke.render_evidence(
         make_report(key_id=key_id, signature=signature), secrets=[secret, key_id, signature]
@@ -466,7 +483,7 @@ def test_evidence_redacts_sensitive_headers_even_with_no_secret_list() -> None:
     layer under test -- which is also the realistic failure mode, since a
     caller that forgets to collect a secret into the list gets exactly this.
     """
-    key_id = str(UUID4())
+    key_id = LEAK_SAFE_KEY_ID
     signature = base64.b64encode(b"a-signature-value-here").decode("ascii")
     text = smoke.render_evidence(make_report(key_id=key_id, signature=signature), secrets=[])
 
@@ -477,7 +494,7 @@ def test_evidence_redacts_sensitive_headers_even_with_no_secret_list() -> None:
 
 
 def test_evidence_marks_every_sensitive_header_as_redacted() -> None:
-    secret, key_id = make_secret(), str(UUID4())
+    secret, key_id = make_leak_safe_secret_pair()
     signature = base64.b64encode(b"a-signature-value-here").decode("ascii")
     text = smoke.render_evidence(
         make_report(key_id=key_id, signature=signature), secrets=[secret, key_id, signature]
@@ -490,7 +507,7 @@ def test_evidence_marks_every_sensitive_header_as_redacted() -> None:
 
 def test_evidence_contains_no_secret_and_no_four_character_fragment() -> None:
     """The single highest-blast-radius assertion in this suite."""
-    secret, key_id = make_secret(), str(UUID4())
+    secret, key_id = make_leak_safe_secret_pair()
     signature = base64.b64encode(b"a-signature-value-here").decode("ascii")
     secrets = [secret, key_id, signature]
     text = smoke.render_evidence(make_report(key_id=key_id, signature=signature), secrets=secrets)
@@ -500,7 +517,7 @@ def test_evidence_contains_no_secret_and_no_four_character_fragment() -> None:
 
 
 def test_evidence_reports_the_operator_facing_facts() -> None:
-    secret, key_id = make_secret(), str(UUID4())
+    secret, key_id = make_leak_safe_secret_pair()
     signature = base64.b64encode(b"sig").decode("ascii")
     text = smoke.render_evidence(
         make_report(key_id=key_id, signature=signature), secrets=[secret, key_id, signature]
@@ -513,7 +530,7 @@ def test_evidence_reports_the_operator_facing_facts() -> None:
 
 
 def test_evidence_states_every_open_live_question() -> None:
-    secret, key_id = make_secret(), str(UUID4())
+    secret, key_id = make_leak_safe_secret_pair()
     text = smoke.render_evidence(
         make_report(key_id=key_id, signature="sig"), secrets=[secret, key_id]
     )
@@ -524,7 +541,7 @@ def test_evidence_states_every_open_live_question() -> None:
 
 def test_evidence_records_the_websocket_frame_schema_keys() -> None:
     """The ``marketSlug`` field name is a GUESS; the raw keys settle it."""
-    secret, key_id = make_secret(), str(UUID4())
+    secret, key_id = make_leak_safe_secret_pair()
     text = smoke.render_evidence(
         make_report(key_id=key_id, signature="sig"), secrets=[secret, key_id]
     )
@@ -534,7 +551,7 @@ def test_evidence_records_the_websocket_frame_schema_keys() -> None:
 
 
 def test_evidence_records_frame_classes_counts_and_safe_values() -> None:
-    secret, key_id = make_secret(), str(UUID4())
+    secret, key_id = make_leak_safe_secret_pair()
     text = smoke.render_evidence(
         make_report(key_id=key_id, signature="sig"), secrets=[secret, key_id]
     )
@@ -593,7 +610,7 @@ async def test_recording_transport_records_transport_failure_as_its_own_event() 
 
 
 def test_write_evidence_writes_the_artefact_and_a_digest_sidecar(tmp_path: Path) -> None:
-    secret, key_id = make_secret(), str(UUID4())
+    secret, key_id = make_leak_safe_secret_pair()
     report = make_report(key_id=key_id, signature="sig")
 
     path = smoke.write_evidence(report, secrets=[secret, key_id], directory=tmp_path)
@@ -609,7 +626,7 @@ def test_write_evidence_refuses_and_writes_nothing_when_a_fragment_survives(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Proof the writer's own gate is not vacuous."""
-    secret, key_id = make_secret(), str(UUID4())
+    secret, key_id = make_leak_safe_secret_pair()
     report = make_report(key_id=key_id, signature="sig")
     fragment = secret[3:7]
 
@@ -629,7 +646,7 @@ def test_evidence_leak_error_never_echoes_the_fragment_it_found(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    secret, key_id = make_secret(), str(UUID4())
+    secret, key_id = make_leak_safe_secret_pair()
     report = make_report(key_id=key_id, signature="sig")
     fragment = secret[3:7]
     monkeypatch.setattr(
@@ -736,8 +753,7 @@ def test_unexpected_failure_in_run_smoke_is_contained_and_scrubbed(
     capsys: pytest.CaptureFixture[str],
 ) -> None:
     """An arbitrary exception from the live run must not reach the excepthook."""
-    secret = make_secret()
-    key_id = str(UUID4())
+    secret, key_id = make_leak_safe_secret_pair()
     monkeypatch.setattr(smoke, "prepare", lambda *a, **k: _prepared_with(secret, key_id))
 
     async def _boom(*_args: Any, **_kwargs: Any) -> Any:
@@ -765,8 +781,7 @@ def test_unexpected_failure_in_evidence_write_is_contained(
     capsys: pytest.CaptureFixture[str],
 ) -> None:
     """`write_evidence` sits outside the old guard too, and holds the secrets."""
-    secret = make_secret()
-    key_id = str(UUID4())
+    secret, key_id = make_leak_safe_secret_pair()
     monkeypatch.setattr(smoke, "prepare", lambda *a, **k: _prepared_with(secret, key_id))
 
     async def _ok(*_args: Any, **_kwargs: Any) -> Any:
@@ -795,8 +810,7 @@ def test_main_writes_latest_checkpoint_when_asyncio_run_fails_after_probes(
     capsys: pytest.CaptureFixture[str],
 ) -> None:
     """A known Nautilus teardown loop-stop must not erase a proven PASS."""
-    secret = make_secret()
-    key_id = str(UUID4())
+    secret, key_id = make_leak_safe_secret_pair()
     monkeypatch.setattr(smoke, "prepare", lambda *a, **k: _prepared_with(secret, key_id))
 
     async def _checkpoint_then_boom(*_args: Any, **kwargs: Any) -> Any:
@@ -827,7 +841,7 @@ def test_asyncio_loop_exception_handler_records_scrubbed_context_without_traceba
     capsys: pytest.CaptureFixture[str],
 ) -> None:
     """The asyncio callback exception path bypasses sys.excepthook."""
-    secret = make_secret()
+    secret = LEAK_SAFE_SECRET
     counter = smoke._QuoteCounter([SLUG])
     loop = asyncio.new_event_loop()
     try:
@@ -855,8 +869,7 @@ def test_keyboard_interrupt_is_not_swallowed_as_a_crash(
     capsys: pytest.CaptureFixture[str],
 ) -> None:
     """Operator Ctrl-C must stay distinguishable from a defect, and stay quiet."""
-    secret = make_secret()
-    key_id = str(UUID4())
+    secret, key_id = make_leak_safe_secret_pair()
     monkeypatch.setattr(smoke, "prepare", lambda *a, **k: _prepared_with(secret, key_id))
 
     async def _interrupt(*_args: Any, **_kwargs: Any) -> Any:
@@ -942,15 +955,11 @@ def _write_evidence_to(tmp_path: Path, key_id: str, secret: str) -> Path:
     return written
 
 
-def test_evidence_file_and_sidecar_are_owner_read_write_only(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    monkeypatch.setattr(os, "umask", lambda _mask: 0)
-    secret = make_secret()
-    key_id = str(UUID4())
+def test_evidence_file_and_sidecar_are_owner_read_write_only(tmp_path: Path) -> None:
+    secret, key_id = make_leak_safe_secret_pair()
 
-    path = _write_evidence_to(tmp_path, key_id, secret)
+    with permissive_umask():
+        path = _write_evidence_to(tmp_path, key_id, secret)
     sidecar = path.with_suffix(path.suffix + ".sha256")
 
     assert path.stat().st_mode & 0o777 == 0o600, "evidence artefact must be 0600"
@@ -959,8 +968,7 @@ def test_evidence_file_and_sidecar_are_owner_read_write_only(
 
 def test_evidence_directory_is_created_owner_only(tmp_path: Path) -> None:
     """A permissive parent directory undoes a restrictive file."""
-    secret = make_secret()
-    key_id = str(UUID4())
+    secret, key_id = make_leak_safe_secret_pair()
 
     path = _write_evidence_to(tmp_path, key_id, secret)
 
@@ -972,8 +980,7 @@ def test_a_permissive_preexisting_directory_is_tightened(tmp_path: Path) -> None
     directory = tmp_path / "nested" / "evidence"
     directory.mkdir(parents=True)
     directory.chmod(0o777)
-    secret = make_secret()
-    key_id = str(UUID4())
+    secret, key_id = make_leak_safe_secret_pair()
 
     _write_evidence_to(tmp_path, key_id, secret)
 
@@ -993,8 +1000,7 @@ def test_a_permissive_preexisting_directory_is_tightened(tmp_path: Path) -> None
 
 
 def test_describe_exception_gives_the_type_and_a_scrubbed_message() -> None:
-    secret = make_secret()
-    key_id = str(UUID4())
+    secret, key_id = make_leak_safe_secret_pair()
 
     described = smoke.describe_exception(
         RuntimeError(f"handshake rejected for {key_id} signed with {secret}"),
@@ -1008,7 +1014,7 @@ def test_describe_exception_gives_the_type_and_a_scrubbed_message() -> None:
 
 def test_describe_exception_withholds_a_message_it_cannot_scrub() -> None:
     """Fail closed, but never lose the type -- that is the load-bearing part."""
-    secret = make_secret()
+    secret = LEAK_SAFE_SECRET
 
     described = smoke.describe_exception(_CanaryBoom(secret[:8]), [secret])
 
@@ -1018,7 +1024,7 @@ def test_describe_exception_withholds_a_message_it_cannot_scrub() -> None:
 
 @pytest.mark.asyncio
 async def test_a_failed_node_task_is_captured_and_reported() -> None:
-    secret = make_secret()
+    secret = LEAK_SAFE_SECRET
     counter = smoke._QuoteCounter(["slug-a"])
 
     async def _explode() -> None:
