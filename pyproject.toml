@@ -197,8 +197,15 @@ files = [
     # Settlement seam: the asymmetric gate's minimum-coverage rule. Registered
     # so the closed-set membership logic and its anti-negation guard are
     # typechecked, not merely executed.
+    "scripts/analysis/settlement_programme_report.py",
+    "tests/unit/test_settlement_conservatism_prose_guard.py",
     "tests/unit/test_settlement_coverage_rule.py",
     "tests/unit/test_settlement_programme_rollup.py",
+    "tests/unit/test_settlement_purity_guard.py",
+    "tests/unit/test_settlement_report_prose_claims.py",
+    "tests/unit/test_settlement_reporting.py",
+    "tests/unit/test_settlement_reporting_guard.py",
+    "tests/unit/test_settlement_programme_report_script.py",
 ]
 
 # pyarrow ships no stubs, and nautilus_trader's Data base is a compiled Cython

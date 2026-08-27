@@ -8,39 +8,23 @@ Binding spec: `docs/evidence/asymmetric_gate_prereg_2026-08-26.md`.
 
 ## Open
 
-### [HIGH] Rule 4 — headline reporting is unimplemented
-Prereg §7 rule 4 (line 855-857): "**MDW's result appears in the headline determination
-whatever it is. A four-city pass may never be reported without MDW's number stated
-alongside it.**"
-
-`programme.py` contains zero references to MDW or to a headline concept. `grep -c MDW`
-returns 0 for the module. `ProgrammeDetermination` does carry every city determination,
-so a reporter *can* reach MDW's number — nothing yet *forces* it to.
-
-This was omitted from the implementation brief, not by the implementer.
-
-Note the sentence immediately preceding these rules, line 845: "Discipline that changes
-no action is theatre." An unenforced reporting rule is exactly that. The obligation is a
-reporting-layer constraint rather than a computation one, so it lands with the reporter —
-but it must land *with* it, not after.
-
-Suggested shape: the reporter cannot emit a programme headline without MDW's cell
-figures; a guard test asserts a headline built from a four-city pass that omits MDW
-raises rather than rendering.
-
 ### [MEDIUM] No consumer exists
 `grep -rn determine_programme src` finds only the module itself. The gate computes a
 determination that nothing reads. Until a consumer exists, every guarantee here is
 latent.
 
-### [MEDIUM] Rule 2 has no mechanism
-Rule 2 (line 850-853) forbids any downstream document, requirement, or strategy from
-asserting "METAR reads below CLI" as a general property of the estimator, and requires
-any component relying on it to re-derive per city. There is no barrier test enforcing
-this. It is a candidate for an AST/prose scan in the barrier-suite style.
-
 ## Closed
 
+- Rule 4 reporting path — `src/breezy/settlement/reporting.py` now refuses sanctioned
+  reports that omit MDW, refuses `PRIMARY_GO` without MDW's boundary figure reported,
+  renders MDW in the headline, and renders primary detail from the identity-checked
+  headline lines.
+- Rule 2 second clause for the reporting path — D4a/D4b AST guards reject obvious
+  programme-wide claim identifiers and one-sided direction identifiers while allowing
+  per-city/city-keyed measurement and `SignedErrorDirection`'s two-polarity enum.
+- Rule 2 first clause — closed as a prose lint, not a semantic proof. P1 scans
+  `docs/plans`, `docs/core`, `docs/evidence`, `src`, and `scripts`, strips Markdown
+  code spans/fences, and currently reports zero live hits.
 - Rule 3 — two-or-more primary NO-GO rejects programme-wide. Threshold is 2 per [R4],
   which corrected revision 3's "three or more". Expiry-converted NO-GOs count.
 - Rule 5 — halt-and-unwind. Programme rejection sets every city, including live GO

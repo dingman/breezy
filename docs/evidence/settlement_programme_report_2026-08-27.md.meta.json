@@ -1,0 +1,8 @@
+{
+  "command": "settlement_programme_report",
+  "inputs": {
+    "cells": "b574b1cb5ffdb993af29d20072ea565bd85b9cfce775bc276a9b9ea6c6cd56ff",
+    "evidence": "386610806c770c12d25541b8e049f8fdf2cf84ea221fba53313c1e827d619c58"
+  },
+  "output_sha256": "fd46cc49e6904129a1ca46c32c50e5d99b857c568266f9ca32fa19540d624d09"
+}

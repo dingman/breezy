@@ -1054,3 +1054,27 @@ rather than to assess whether the document said the right things.
 `[0,1)` clearance stratum — the one stratum the document insists must reach a
 verdict — raising the odds of a false GO at exactly the boundary where the
 DOM-4 divergence modes bite. That is a wrong trade, not a wrong document.
+
+---
+
+## G-20 settlement reporting layer implemented (2026-08-27)
+
+`src/breezy/settlement/reporting.py` now provides the pure reporting layer over
+`ProgrammeDetermination`: exact city and stratum joins, MDW headline identity,
+MDW boundary-figure requirement for `PRIMARY_GO`, partitioned unevaluated ledger,
+unconditional [R7] provenance caveat, and fixed-section Markdown rendering.
+
+The impure writer is isolated in
+`scripts/analysis/settlement_programme_report.py`, which reads strict JSON inputs
+and writes the report plus `.sha256` and `.meta.json` sidecars. First generated
+artifact:
+`docs/evidence/settlement_programme_report_2026-08-27.md`.
+
+New guard suites cover settlement purity (D1-D4), report construction/rendering
+(R1/R2), and the P1 prose lint. Each live barrier was mutation-tested with a
+planted violation, then restored green with the injected file deleted.
+
+Residuals remain: no trading-path consumer forces a report to be produced, D2
+constrains only the settlement package, P1 is literal prose linting rather than
+semantic enforcement, and the report carries `H(c,k)` only, not DOM-10's
+`H2(c,k,q)` statistic.
