@@ -16,6 +16,7 @@ from breezy.adapters.polymarket_us.credentials import (
     CredentialConfigError,
     assert_config_type_excludes_secrets,
 )
+from breezy.adapters.polymarket_us.safety import LiveTradingPermit
 from breezy.adapters.polymarket_us.secure import RedactedSecureString
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -107,6 +108,37 @@ def test_polymarket_us_config_serializes_only_secret_references() -> None:
     assert KEY_ID_VALUE not in digest
 
 
+#: A permit is no longer constructible here, and that is the point. It is
+#: obtained from the single issuer, which reads the operator gate and nothing
+#: else. The forgery-refusal proofs live in
+#: ``tests/unit/test_polymarket_us_permit_issuance.py``; this module keeps the
+#: Phase-0 refusals it always asserted.
+NOW_NS = 1_787_788_800_000_000_000
+FINGERPRINT = b"phase0-fingerprint"
+
+
+def _operator_enabled_permit(monkeypatch: pytest.MonkeyPatch, ceiling: str) -> LiveTradingPermit:
+    from nautilus_trader.common.component import TestClock
+
+    from breezy.adapters.polymarket_us.safety import (
+        MAX_ORDER_NOTIONAL_USD_ENV_VAR,
+        OPERATOR_ID_ENV_VAR,
+        SESSION_NOTIONAL_USD_ENV_VAR,
+        SESSION_ORDER_COUNT_ENV_VAR,
+        TRADING_ENABLED_ENV_VAR,
+        issue_live_trading_permit,
+    )
+
+    monkeypatch.setenv(TRADING_ENABLED_ENV_VAR, "1")
+    monkeypatch.setenv(MAX_ORDER_NOTIONAL_USD_ENV_VAR, ceiling)
+    monkeypatch.setenv(OPERATOR_ID_ENV_VAR, "operator@example.com")
+    monkeypatch.setenv(SESSION_NOTIONAL_USD_ENV_VAR, "1000.00")
+    monkeypatch.setenv(SESSION_ORDER_COUNT_ENV_VAR, "100")
+    clock = TestClock()
+    clock.set_time(NOW_NS)
+    return issue_live_trading_permit(clock=clock)
+
+
 def test_credentials_present_do_not_authorize_live_order_submission() -> None:
     from breezy.adapters.polymarket_us.credentials import PolymarketUSCredentials
     from breezy.adapters.polymarket_us.safety import (
@@ -125,14 +157,18 @@ def test_credentials_present_do_not_authorize_live_order_submission() -> None:
             permit=None,
             manual_order_indicator=True,
             order_notional_usd=Decimal("1.00"),
+            request_fingerprint=FINGERPRINT,
+            now_ns=NOW_NS,
         )
 
 
-def test_live_order_submission_chokepoint_requires_credentials_permit_and_manual_flag() -> None:
+def test_live_order_submission_chokepoint_requires_credentials_permit_and_manual_flag(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     from breezy.adapters.polymarket_us.credentials import PolymarketUSCredentials
     from breezy.adapters.polymarket_us.safety import (
+        LiveOrderSubmissionAuthorization,
         LiveTradingPermissionError,
-        LiveTradingPermit,
         assert_live_order_submission_permitted,
     )
 
@@ -140,11 +176,7 @@ def test_live_order_submission_chokepoint_requires_credentials_permit_and_manual
         key_id=RedactedSecureString(KEY_ID_VALUE, name="pm_key_id"),
         secret_key=RedactedSecureString(SECRET_VALUE, name="pm_secret_key"),
     )
-    permit = LiveTradingPermit(
-        operator_id="operator@example.com",
-        max_order_notional_usd=Decimal("5.00"),
-        issued_at_ns=1,
-    )
+    permit = _operator_enabled_permit(monkeypatch, "5.00")
 
     with pytest.raises(LiveTradingPermissionError, match="credentials"):
         assert_live_order_submission_permitted(
@@ -152,6 +184,8 @@ def test_live_order_submission_chokepoint_requires_credentials_permit_and_manual
             permit=permit,
             manual_order_indicator=True,
             order_notional_usd=Decimal("1.00"),
+            request_fingerprint=FINGERPRINT,
+            now_ns=NOW_NS,
         )
     with pytest.raises(LiveTradingPermissionError, match="manualOrderIndicator"):
         assert_live_order_submission_permitted(
@@ -159,6 +193,8 @@ def test_live_order_submission_chokepoint_requires_credentials_permit_and_manual
             permit=permit,
             manual_order_indicator=None,
             order_notional_usd=Decimal("1.00"),
+            request_fingerprint=FINGERPRINT,
+            now_ns=NOW_NS,
         )
     with pytest.raises(LiveTradingPermissionError, match="exceeds permit"):
         assert_live_order_submission_permitted(
@@ -166,14 +202,44 @@ def test_live_order_submission_chokepoint_requires_credentials_permit_and_manual
             permit=permit,
             manual_order_indicator=True,
             order_notional_usd=Decimal("5.01"),
+            request_fingerprint=FINGERPRINT,
+            now_ns=NOW_NS,
         )
 
-    assert_live_order_submission_permitted(
+    authorization = assert_live_order_submission_permitted(
         credentials=credentials,
         permit=permit,
         manual_order_indicator=False,
         order_notional_usd=Decimal("5.00"),
+        request_fingerprint=FINGERPRINT,
+        now_ns=NOW_NS,
     )
+
+    assert isinstance(authorization, LiveOrderSubmissionAuthorization)
+
+
+def test_an_unissued_permit_does_not_authorize_live_order_submission() -> None:
+    """The Phase-0 fuse that was missing: possession is not authorisation.
+
+    ``LiveTradingPermit`` used to be a public frozen dataclass anyone could
+    construct with a $1e9 ceiling, so the chokepoint's permit check was
+    decorative. Proven here at the Phase-0 fuse level as well as in the
+    dedicated issuance suite, because this is the module a reader checks to
+    learn what the cage actually guarantees.
+    """
+    from breezy.adapters.polymarket_us.safety import LiveTradingPermissionError
+
+    with pytest.raises(LiveTradingPermissionError, match="issue_live_trading_permit"):
+        LiveTradingPermit(
+            operator_id="anyone",
+            max_order_notional_usd=Decimal("1e9"),
+            issued_at_ns=1,
+            expires_at_ns=2,
+            permit_id=b"0123456789abcdef",
+            budget_notional_usd=Decimal("1e9"),
+            budget_order_count=1000,
+            authenticity=b"forged",
+        )
 
 
 def test_pytest_fails_fast_when_polymarket_credentials_are_present() -> None:

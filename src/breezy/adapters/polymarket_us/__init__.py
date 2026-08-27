@@ -100,8 +100,12 @@ from breezy.adapters.polymarket_us.redaction import (
     redact_url,
 )
 from breezy.adapters.polymarket_us.safety import (
+    LiveOrderSubmissionAuthorization,
+    LiveTradingPermissionError,
     LiveTradingPermit,
     assert_live_order_submission_permitted,
+    issue_live_trading_permit,
+    live_trading_budget_remaining,
 )
 from breezy.adapters.polymarket_us.secure import RedactedSecureString
 from breezy.adapters.polymarket_us.signing import (
@@ -146,6 +150,8 @@ __all__ = [
     "Ed25519RequestSigner",
     "FeeScheduleUnknownError",
     "GatewayForbiddenError",
+    "LiveOrderSubmissionAuthorization",
+    "LiveTradingPermissionError",
     "LiveTradingPermit",
     "MakerRebateUnmodelledError",
     "MarketsFeed",
@@ -182,6 +188,8 @@ __all__ = [
     "build_keyed_quotas",
     "config_from_env",
     "instrument_id_to_slug",
+    "issue_live_trading_permit",
+    "live_trading_budget_remaining",
     "load_polymarket_us_credentials",
     "parse_binary_option",
     "parse_book_top",

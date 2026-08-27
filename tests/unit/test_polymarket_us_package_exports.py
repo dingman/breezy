@@ -24,11 +24,21 @@ import pytest
 import breezy.adapters.polymarket_us as pkg
 
 #: The Phase-0 surface. Removing any of these is a breaking change.
+#:
+#: The permit seam is pinned in full deliberately. It is the enablement
+#: ceiling on real money, and a caller cannot use it safely without all four
+#: names: the issuer (the ONLY way to obtain authority), the permit, the
+#: capability the chokepoint returns, and the error every refusal raises. An
+#: export list carrying the type but not its issuer would leave the type
+#: looking constructible, which is the exact defect this seam closed.
 PHASE_0_EXPORTS = (
+    "LiveOrderSubmissionAuthorization",
+    "LiveTradingPermissionError",
     "LiveTradingPermit",
     "PolymarketUSCredentials",
     "PolymarketUSSecretsRefConfig",
     "assert_live_order_submission_permitted",
+    "issue_live_trading_permit",
 )
 
 #: The read-only slice's integration surface.
