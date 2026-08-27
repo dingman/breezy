@@ -57,6 +57,11 @@ name = "Breezy top-level source packages follow the documented layer direction"
 type = "layers"
 containers = ["breezy"]
 layers = [
+    # `strategy` is the TOP layer: a strategy reaches down into `runtime` for
+    # the backtest feed's shared `ClientId` and into `ingest` for the shared
+    # weather `DataType` factories. Nothing may reach back up into it -- the
+    # harness in `runtime` takes strategies as constructed objects.
+    "strategy",
     "runtime",
     "adapters",
     "ingest",
@@ -105,6 +110,10 @@ ignore_imports = [
     # Wraps weather records in the native `CustomData` envelope and names
     # the native `ClientId` -- both are Nautilus extension points.
     "breezy.runtime.backtest_feed -> nautilus_trader",
+    # Composes the native `BacktestEngine` and subclasses nothing.
+    "breezy.runtime.backtest_harness -> nautilus_trader",
+    # Subclasses the native `Strategy`/`StrategyConfig` extension points.
+    "breezy.strategy.harness_probe -> nautilus_trader",
     "breezy.runtime.cli -> nautilus_trader",
     "breezy.runtime.composition -> nautilus_trader",
     "breezy.runtime.logging_bridge -> nautilus_trader",
@@ -138,6 +147,7 @@ files = [
     "src/breezy/ingest",
     "src/breezy/persistence",
     "src/breezy/runtime",
+    "src/breezy/strategy",
 
     # The venue slice. The operator EXECUTES the smoke script against
     # PRODUCTION credentials, so it must be typechecked, and so must the test
@@ -233,6 +243,12 @@ disallow_subclassing_any = false
 # that has no such excuse.
 [[tool.mypy.overrides]]
 module = ["breezy.ingest.nws_actor"]
+disallow_subclassing_any = false
+
+# `Strategy` and `StrategyConfig` are compiled Cython classes that erase to Any.
+# Named per module, never package-wide, for the same reason as above.
+[[tool.mypy.overrides]]
+module = ["breezy.strategy.harness_probe"]
 disallow_subclassing_any = false
 
 # Same compiled-Cython-erases-to-Any reason as above, for the two venue-slice

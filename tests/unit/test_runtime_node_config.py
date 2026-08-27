@@ -222,7 +222,9 @@ class TestBuildNodeConfig:
     def test_uses_no_redis_backed_message_bus_database(self) -> None:
         assert build_node_config(make_settings()).message_bus is None
 
-    def test_declares_no_data_clients_exec_clients_or_strategies(self) -> None:
+    def test_declares_no_data_clients_exec_clients_strategies_or_exec_algorithms(
+        self,
+    ) -> None:
         # Ingestion is Actor-driven (polling HTTP), not DataClient-driven, and
         # this process trades nothing.
         #
@@ -232,11 +234,20 @@ class TestBuildNodeConfig:
         # `submit_order` in the first place (`trading/strategy.pyx`), and the
         # kernel instantiates every entry in `strategies` unconditionally
         # (`system/kernel.py`). Pinning one without the other pins half a pair.
+        #
+        # `exec_algorithms` is the THIRD field of that pair, added 2026-08-27.
+        # `ExecAlgorithm` subclasses `Actor` but carries the order-submission
+        # surface a Strategy has -- `submit_order`, `modify_order`,
+        # `cancel_order` (`execution/algorithm.pyx`) -- and the kernel builds
+        # every entry via `ExecAlgorithmFactory.create` on the same
+        # unconditional path as `strategies`. A cage that names two of the
+        # three leaves the third as an unreviewed route to an execution path.
         config = build_node_config(make_settings())
 
         assert config.data_clients == {}
         assert config.exec_clients == {}
         assert config.strategies == []
+        assert config.exec_algorithms == []
 
     def test_trader_id_comes_from_settings(self) -> None:
         config = build_node_config(make_settings(trader_id="BREEZY-042"))
@@ -310,19 +321,25 @@ class TestTheReadOnlyCageIsDeclaredNotDefaulted:
 
     `exec_clients={}` has always been explicit here; `strategies` was left to
     the Nautilus default. That asymmetry is the defect: a default is invisible
-    in review and silently follows upstream if it ever changes, while the two
-    fields are one pair -- a `Strategy` is the caller of `submit_order`, and
-    an `ExecClient` is what carries the call to a venue. Either one alone is
-    enough to make the other harmless; neither being declared is how a
+    in review and silently follows upstream if it ever changes, while the
+    fields are one set -- a `Strategy` is the caller of `submit_order`, and
+    an `ExecClient` is what carries the call to a venue. Any one alone is
+    enough to make the others harmless; none being declared is how a
     read-only process stops being read-only without anyone editing a line that
     mentions execution.
+
+    `exec_algorithms` is the third member of that set and was unpinned until
+    2026-08-27. It is NOT redundant with `strategies`: an `ExecAlgorithm`
+    reaches `submit_order` in its own right (`execution/algorithm.pyx`), so a
+    config carrying `strategies=[]` and a populated `exec_algorithms` is a
+    read-only process that can trade.
     """
 
     def test_the_repo_builds_exactly_the_node_configs_this_rule_covers(self) -> None:
         # Guards the rule against silently going vacuous if a build site moves.
         assert len(_node_config_calls()) == 2
 
-    @pytest.mark.parametrize("field", ["exec_clients", "strategies"])
+    @pytest.mark.parametrize("field", ["exec_clients", "strategies", "exec_algorithms"])
     def test_every_node_config_declares_the_field_empty(self, field: str) -> None:
         for call in _node_config_calls():
             assert field in _empty_literal_keywords(call), (

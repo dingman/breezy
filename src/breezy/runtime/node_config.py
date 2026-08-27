@@ -210,6 +210,12 @@ def build_node_config(settings: BreezyRuntimeSettings) -> TradingNodeConfig:
         # on the built config. Pinned by
         # `TestTheReadOnlyCageIsDeclaredNotDefaulted`.
         strategies=[],
+        # The THIRD field that reaches an execution path. `ExecAlgorithm`
+        # subclasses `Actor`, so it is easy to read as data-side, but it
+        # carries `submit_order`/`modify_order`/`cancel_order` in its own
+        # right (`execution/algorithm.pyx`) and the kernel instantiates every
+        # entry unconditionally. `strategies=[]` does not cover it.
+        exec_algorithms=[],
     )
     return cast(TradingNodeConfig, config)
 
@@ -452,9 +458,10 @@ def build_quote_tape_node_config(
         actors=[],
         data_clients={POLYMARKET_US_CLIENT_NAME: data_client_config},
         exec_clients={},
-        # Same pair as in `build_node_config`, for the same reason: the
+        # Same set as in `build_node_config`, for the same reason: the
         # recorder is a tape, not a trader.
         strategies=[],
+        exec_algorithms=[],
         streaming=StreamingConfig(
             catalog_path=str(settings.catalog_root),
             include_types=QUOTE_TAPE_INCLUDE_TYPES,

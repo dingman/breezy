@@ -71,6 +71,8 @@ defaults to `None`, so this is the behaviour you get by doing nothing.
 | `price_protection_points` | `None` — **unit undefined** | Docstring does not define "points" against `price_increment`. Do not guess a boundary that might reject every marketable order. |
 | `routing` | `False` (default) | Single venue. |
 | `settlement_prices` | `{instrument_id: 0.0 or 1.0}` for **every** instrument in the run | See §0 and §5. |
+| `oto_trigger_mode` | omitted (default `OtoTriggerMode.PARTIAL`) | Inert while `support_contingent_orders=False`. **Not covered by the source-level argument pin** because it is not passed. |
+| `use_message_queue` | omitted (default `True`) | An engine-internal mechanism, not a venue fact. **Not covered by the source-level argument pin.** |
 
 ## 2. `account_type` — CASH, with a strategy-side guard
 
@@ -197,6 +199,20 @@ instrument from Breezy's own recorded truth:
 - Gate the trigger on `is_terminal`, never on the mere presence of
   `settlementPx` — that field appears on live markets too, meaning something
   different.
+
+### 1a. Settlement is the ONLY trigger, not merely the timing
+
+`BinaryOption.instrument_class == BINARY_OPTION`, which is **absent** from
+`ENGINE_EXPIRING_INSTRUMENT_CLASSES` (`model/instruments/base.pyx:67` — the set
+is exactly `FUTURE`, `FUTURES_SPREAD`, `OPTION`, `OPTION_SPREAD`). So
+`_instrument_has_expiration` is `False` for every Breezy instrument and the
+time-based expiration branch **can never fire**.
+
+The injected `InstrumentClose` is therefore the *sole* settlement trigger. An
+omitted or mis-ordered close does not merely mis-time settlement — the position
+**never settles at all**, and is left marked to the last quote as unrealised.
+This makes the §5 ordering invariant stronger than "get the timestamp right":
+it is the difference between a settled book and a permanently open one.
 
 ## 6. Requires live venue observation
 

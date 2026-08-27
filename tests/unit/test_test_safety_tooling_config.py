@@ -60,6 +60,12 @@ def test_import_linter_enforces_layers_and_polymarket_com_adapter_ban() -> None:
     assert layers["containers"] == ["breezy"]
     assert layers["exhaustive"] is True
     assert layers["layers"] == [
+        # `strategy` is the top layer as of 2026-08-27: strategies reach DOWN
+        # into `runtime` (the backtest feed's shared `ClientId`) and `ingest`
+        # (the shared weather `DataType` factories), and nothing reaches back
+        # up. The backtest harness in `runtime` takes strategies as
+        # already-constructed objects, so it never imports one.
+        "strategy",
         "runtime",
         "adapters",
         "ingest",
