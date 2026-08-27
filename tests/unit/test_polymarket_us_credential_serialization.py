@@ -62,6 +62,7 @@ import copy
 import dataclasses
 import os
 import pickle
+import sys
 from collections.abc import Iterator
 from pathlib import Path
 
@@ -77,6 +78,11 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 
 #: Roots scanned for the ``asdict``-on-a-credential ban.
 ASDICT_SCAN_ROOTS = ("src", "scripts")
+
+#: Current shipped coverage is 83 files (75 under ``src/breezy`` and 8 under
+#: ``scripts``). Keep this as an at-least guard so new files do not require a
+#: test edit, while any collapsed or misrouted scan fails loudly.
+MIN_ASDICT_SCAN_SOURCE_COUNT = 83
 
 _VISIBLE_CHARS = 4
 
@@ -348,9 +354,19 @@ def find_asdict_on_credentials(path: str, source: str) -> list[str]:
 
 
 def test_no_breezy_module_calls_asdict_on_a_credential() -> None:
+    scanned_sources = list(_iter_python_sources(ASDICT_SCAN_ROOTS))
+    if os.environ.get("BREEZY_ASDICT_GUARD_TRACE") == "1":
+        print(f"ASDICT_GUARD_SCANNED_COUNT={len(scanned_sources)}")
+        print("ASDICT_GUARD_SCANNED_NAMES=" + ",".join(path for path, _source in scanned_sources))
+    assert len(scanned_sources) >= MIN_ASDICT_SCAN_SOURCE_COUNT, (
+        "asdict credential guard scanned "
+        f"{len(scanned_sources)} Python source files under roots {ASDICT_SCAN_ROOTS!r}; "
+        f"expected at least {MIN_ASDICT_SCAN_SOURCE_COUNT}. Scanned: "
+        + ", ".join(path for path, _source in scanned_sources)
+    )
     violations = [
         v
-        for path, source in _iter_python_sources(ASDICT_SCAN_ROOTS)
+        for path, source in scanned_sources
         for v in find_asdict_on_credentials(path, source)
     ]
     assert violations == [], (
@@ -359,6 +375,15 @@ def test_no_breezy_module_calls_asdict_on_a_credential() -> None:
         "the secret. Render credentials with "
         "breezy.adapters.polymarket_us.redaction.redact_secure instead:\n" + "\n".join(violations)
     )
+
+
+def test_the_asdict_ban_fails_loudly_when_scan_coverage_collapses(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(sys.modules[__name__], "ASDICT_SCAN_ROOTS", ("missing-root",))
+
+    with pytest.raises(AssertionError, match="asdict credential guard scanned"):
+        test_no_breezy_module_calls_asdict_on_a_credential()
 
 
 def test_the_asdict_ban_is_not_vacuous() -> None:
