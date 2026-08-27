@@ -14,6 +14,7 @@ therefore assert the config declares ZERO actors, and never import
 
 from __future__ import annotations
 
+import ast
 from pathlib import Path
 
 import msgspec
@@ -32,6 +33,11 @@ from breezy.runtime.node_config import (
     validated_trader_id,
 )
 from breezy.runtime.settings import BreezyRuntimeSettings
+
+#: Read as SOURCE by `TestTheReadOnlyCageIsDeclaredNotDefaulted`.
+NODE_CONFIG_SOURCE = (
+    Path(__file__).resolve().parents[2] / "src" / "breezy" / "runtime" / "node_config.py"
+)
 
 ALL_SITES: tuple[tuple[str, str], ...] = (
     ("polymarket_us", "NYC"),
@@ -216,13 +222,21 @@ class TestBuildNodeConfig:
     def test_uses_no_redis_backed_message_bus_database(self) -> None:
         assert build_node_config(make_settings()).message_bus is None
 
-    def test_declares_no_data_or_exec_clients(self) -> None:
+    def test_declares_no_data_clients_exec_clients_or_strategies(self) -> None:
         # Ingestion is Actor-driven (polling HTTP), not DataClient-driven, and
         # this process trades nothing.
+        #
+        # `strategies` is the OTHER half of the read-only cage and was
+        # unguarded until 2026-08-27. `exec_clients={}` alone removes the
+        # venue-facing transport; a registered `Strategy` is what would call
+        # `submit_order` in the first place (`trading/strategy.pyx`), and the
+        # kernel instantiates every entry in `strategies` unconditionally
+        # (`system/kernel.py`). Pinning one without the other pins half a pair.
         config = build_node_config(make_settings())
 
         assert config.data_clients == {}
         assert config.exec_clients == {}
+        assert config.strategies == []
 
     def test_trader_id_comes_from_settings(self) -> None:
         config = build_node_config(make_settings(trader_id="BREEZY-042"))
@@ -254,3 +268,64 @@ class TestBuildNodeConfig:
         assert a.logging is not None
         assert b.logging is not None
         assert a.logging.log_level != b.logging.log_level
+
+
+# ---------------------------------------------------------------------------
+# The read-only cage is DECLARED, not defaulted
+# ---------------------------------------------------------------------------
+
+
+def _node_config_calls() -> list[ast.Call]:
+    """Every `TradingNodeConfig(...)` construction in `runtime.node_config`.
+
+    Read from source rather than from a built object: `strategies == []` is
+    also what an unconfigured `TradingNodeConfig()` returns, so a runtime
+    assertion cannot distinguish "declared empty" from "never considered".
+    Only the source can.
+    """
+    tree = ast.parse(NODE_CONFIG_SOURCE.read_text(encoding="utf-8"))
+    return [
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id == "TradingNodeConfig"
+    ]
+
+
+def _empty_literal_keywords(call: ast.Call) -> set[str]:
+    """Keyword names in `call` bound to an empty list or dict literal."""
+    return {
+        kw.arg
+        for kw in call.keywords
+        if kw.arg is not None
+        and isinstance(kw.value, ast.List | ast.Dict)
+        and not getattr(kw.value, "elts", [])
+        and not getattr(kw.value, "keys", [])
+    }
+
+
+class TestTheReadOnlyCageIsDeclaredNotDefaulted:
+    """Both halves of the execution cage are stated at every build site.
+
+    `exec_clients={}` has always been explicit here; `strategies` was left to
+    the Nautilus default. That asymmetry is the defect: a default is invisible
+    in review and silently follows upstream if it ever changes, while the two
+    fields are one pair -- a `Strategy` is the caller of `submit_order`, and
+    an `ExecClient` is what carries the call to a venue. Either one alone is
+    enough to make the other harmless; neither being declared is how a
+    read-only process stops being read-only without anyone editing a line that
+    mentions execution.
+    """
+
+    def test_the_repo_builds_exactly_the_node_configs_this_rule_covers(self) -> None:
+        # Guards the rule against silently going vacuous if a build site moves.
+        assert len(_node_config_calls()) == 2
+
+    @pytest.mark.parametrize("field", ["exec_clients", "strategies"])
+    def test_every_node_config_declares_the_field_empty(self, field: str) -> None:
+        for call in _node_config_calls():
+            assert field in _empty_literal_keywords(call), (
+                f"{NODE_CONFIG_SOURCE.name}:{call.lineno}: TradingNodeConfig(...) does not "
+                f"declare `{field}` as an empty literal"
+            )

@@ -202,6 +202,14 @@ def build_node_config(settings: BreezyRuntimeSettings) -> TradingNodeConfig:
         actors=[],
         data_clients={},
         exec_clients={},
+        # The other half of the read-only cage. `exec_clients={}` removes the
+        # venue-facing transport; `strategies=[]` removes the only component
+        # that calls `submit_order` at all. Both are stated rather than
+        # defaulted so the intent is visible in review and testable in source
+        # -- an unset field and a deliberately empty one are indistinguishable
+        # on the built config. Pinned by
+        # `TestTheReadOnlyCageIsDeclaredNotDefaulted`.
+        strategies=[],
     )
     return cast(TradingNodeConfig, config)
 
@@ -444,6 +452,9 @@ def build_quote_tape_node_config(
         actors=[],
         data_clients={POLYMARKET_US_CLIENT_NAME: data_client_config},
         exec_clients={},
+        # Same pair as in `build_node_config`, for the same reason: the
+        # recorder is a tape, not a trader.
+        strategies=[],
         streaming=StreamingConfig(
             catalog_path=str(settings.catalog_root),
             include_types=QUOTE_TAPE_INCLUDE_TYPES,

@@ -102,6 +102,9 @@ ignore_imports = [
     "breezy.ingest.nws_actor -> nautilus_trader",
     "breezy.persistence.catalog -> nautilus_trader",
     "breezy.persistence.quote_tape_gaps -> nautilus_trader",
+    # Wraps weather records in the native `CustomData` envelope and names
+    # the native `ClientId` -- both are Nautilus extension points.
+    "breezy.runtime.backtest_feed -> nautilus_trader",
     "breezy.runtime.cli -> nautilus_trader",
     "breezy.runtime.composition -> nautilus_trader",
     "breezy.runtime.logging_bridge -> nautilus_trader",

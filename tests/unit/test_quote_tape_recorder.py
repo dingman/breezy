@@ -283,7 +283,7 @@ class TestQuoteTapeSettings:
 
 
 class TestQuoteTapeNodeConfig:
-    def test_registers_the_read_only_data_client_and_zero_exec_clients(
+    def test_registers_the_read_only_data_client_and_zero_exec_clients_or_strategies(
         self, tmp_path: Path
     ) -> None:
         config = build_quote_tape_node_config(
@@ -298,6 +298,9 @@ class TestQuoteTapeNodeConfig:
             == 5
         )
         assert config.exec_clients == {}
+        # The recorder is a tape, not a trader: `strategies` is the half of
+        # the execution cage that `exec_clients` alone does not close.
+        assert config.strategies == []
 
     def test_declares_no_actors_and_registers_no_data_engine_catalogs(
         self, tmp_path: Path
