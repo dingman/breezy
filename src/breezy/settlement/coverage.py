@@ -75,6 +75,10 @@ class CellClassification(enum.Enum):
     ``THETA_CONTINGENT``
         ``BE(c,k) < p̂_anchor(c,k)`` only at the optimistic theta end. Prereg
         [R6]: "proceed, but the verdict is CONDITIONAL on G-15 fee discovery".
+    ``OUT_OF_SCOPE_DOM_9``
+        [R10]: fewer than 10% of historical city-days reach their daily maximum
+        before the venue's actual close, so the city is out of scope entirely
+        rather than evidence of a failed instrument.
     ``UNDERPOWERED``
         Below the ``N(c,k)`` floor. Prereg: "contribute to no verdict, and are
         never pooled upward to manufacture power." Subject to the 42-day clock.
@@ -99,6 +103,7 @@ class CellClassification(enum.Enum):
 
     GO = "GO"
     NO_GO = "NO_GO"
+    OUT_OF_SCOPE_DOM_9 = "OUT_OF_SCOPE_DOM_9"
     THETA_CONTINGENT = "THETA_CONTINGENT"
     UNDERPOWERED = "UNDERPOWERED"
     PROVISIONAL_UNDERPOWERED = "PROVISIONAL_UNDERPOWERED"
@@ -119,6 +124,7 @@ class CityDeterminationStatus(enum.Enum):
     GO = "GO"
     GO_PENDING_ESCALATION = "GO_PENDING_ESCALATION"
     NO_GO = "NO_GO"
+    OUT_OF_SCOPE_DOM_9 = "OUT_OF_SCOPE_DOM_9"
     THETA_CONTINGENT = "THETA_CONTINGENT"
     NOT_YET_ANSWERABLE = "NOT_YET_ANSWERABLE"
 
@@ -159,6 +165,12 @@ _ESCALATING: Final[frozenset[CellClassification]] = frozenset(
     {
         CellClassification.STRUCTURALLY_UNREACHABLE,
         CellClassification.PROVISIONAL_UNDERPOWERED,
+    }
+)
+
+_OUT_OF_SCOPE: Final[frozenset[CellClassification]] = frozenset(
+    {
+        CellClassification.OUT_OF_SCOPE_DOM_9,
     }
 )
 
@@ -241,6 +253,10 @@ def determine_city(
     issuing any city determination.
     """
     boundary = _validated_boundary(city, cells)
+    out_of_scope_cells = _strata_with(cells, _OUT_OF_SCOPE)
+    if out_of_scope_cells:
+        return _out_of_scope_dom_9(city, boundary, out_of_scope_cells)
+
     if not satisfies_coverage(boundary):
         return _not_yet_boundary(city, cells, boundary)
 
@@ -355,6 +371,24 @@ def _theta_contingent(
         reason=(
             f"THETA_CONTINGENT at {', '.join(contingent_cells)}: conditional on "
             f"G-15 fee discovery, which this function cannot observe [R6]"
+        ),
+    )
+
+
+def _out_of_scope_dom_9(
+    city: str,
+    boundary: CellClassification,
+    out_of_scope_cells: tuple[str, ...],
+) -> CityDetermination:
+    return _build_determination(
+        city,
+        CityDeterminationStatus.OUT_OF_SCOPE_DOM_9,
+        boundary,
+        out_of_scope_cells,
+        ExpiryDisposition.NOT_APPLICABLE,
+        reason=(
+            f"OUT_OF_SCOPE_DOM_9 at {', '.join(out_of_scope_cells)}: [R10] "
+            f"excludes the city from the programme failure count"
         ),
     )
 

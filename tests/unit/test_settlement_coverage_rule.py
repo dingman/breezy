@@ -63,6 +63,7 @@ def test_the_classification_set_is_exactly_the_pre_registered_seven() -> None:
     assert {member.name for member in CellClassification} == {
         "GO",
         "NO_GO",
+        "OUT_OF_SCOPE_DOM_9",
         "THETA_CONTINGENT",
         "UNDERPOWERED",
         "PROVISIONAL_UNDERPOWERED",
@@ -115,9 +116,10 @@ def test_the_three_resolving_classifications_satisfy_coverage(
         C.PROVISIONAL_UNDERPOWERED,
         C.STRUCTURALLY_UNREACHABLE,
         C.NOT_YET_ANSWERABLE,
+        C.OUT_OF_SCOPE_DOM_9,
     ],
 )
-def test_the_four_non_resolving_classifications_do_not_satisfy_coverage(
+def test_the_five_non_resolving_classifications_do_not_satisfy_coverage(
     verdict: CellClassification,
 ) -> None:
     assert satisfies_coverage(verdict) is False
@@ -132,6 +134,7 @@ def test_every_classification_outside_the_closed_set_fails_coverage() -> None:
         C.PROVISIONAL_UNDERPOWERED,
         C.STRUCTURALLY_UNREACHABLE,
         C.NOT_YET_ANSWERABLE,
+        C.OUT_OF_SCOPE_DOM_9,
     }
 
 
