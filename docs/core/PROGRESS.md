@@ -1078,3 +1078,19 @@ Residuals remain: no trading-path consumer forces a report to be produced, D2
 constrains only the settlement package, P1 is literal prose linting rather than
 semantic enforcement, and the report carries `H(c,k)` only, not DOM-10's
 `H2(c,k,q)` statistic.
+
+---
+
+## Strategy author quickstart guide written (2026-08-27)
+
+`docs/specs/STRATEGY_QUICKSTART.md` — a practical guide for engineers writing a
+Nautilus Strategy for backtesting. Covers: reference strategies to copy,
+subscription patterns (depth vs. quote), weather data wrapping, StrategyConfig
+typing under mypy strict mode, the four gates (pytest, ruff, mypy, lint-imports),
+and the zero-configuration principle (no pyproject.toml changes required).
+
+Every claim in the guide was verified against source code. Friction points from
+a live author session are addressed: weather wrapping, OrderBookDepth10 vs.
+QuoteTick, StrategyConfig import path, Decimal literal preference, client-scoped
+weather subscription, and the type-checking split (src/ is checked, tests/ is
+not). Includes a minimal end-to-end example that runs against the real harness.
