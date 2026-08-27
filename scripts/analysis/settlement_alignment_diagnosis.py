@@ -18,6 +18,11 @@ from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 
+from settlement_alignment_cache import (
+    DEFAULT_SETTLEMENT_ALIGNMENT_CACHE_DIR,
+    require_settlement_alignment_cache_dir,
+    resolve_settlement_alignment_cache_dir,
+)
 from settlement_alignment_study import (
     END_DATE,
     PRIMARY_BREAK_EVEN,
@@ -36,7 +41,7 @@ from settlement_alignment_study import (
     wilson_lower_bound,
 )
 
-DEFAULT_CACHE_DIR = Path("/tmp/breezy-settlement-alignment-cache")
+DEFAULT_CACHE_DIR = DEFAULT_SETTLEMENT_ALIGNMENT_CACHE_DIR
 DEFAULT_OUTPUT = Path("docs/evidence/settlement_alignment_diagnosis_2026-08-25.md")
 
 
@@ -459,19 +464,24 @@ def markdown_report(
 def parse_args(argv: Sequence[str]) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--catalog-base", type=Path, default=os.environ.get("BREEZY_CATALOG_BASE"))
-    parser.add_argument("--cache-dir", type=Path, default=DEFAULT_CACHE_DIR)
+    parser.add_argument(
+        "--cache-dir",
+        type=resolve_settlement_alignment_cache_dir,
+        default=DEFAULT_CACHE_DIR,
+    )
     parser.add_argument("--output", type=Path, default=DEFAULT_OUTPUT)
     return parser.parse_args(argv)
 
 
 def main(argv: Sequence[str] | None = None) -> int:
     args = parse_args(sys.argv[1:] if argv is None else argv)
-    assert_cache_complete(args.cache_dir)
+    cache_dir = require_settlement_alignment_cache_dir(args.cache_dir)
+    assert_cache_complete(cache_dir)
     sites = load_sites()
     client = NoNetworkClient()
     validation, _overlap_labels = validate_archive_against_catalog(
         client=client,
-        cache_dir=args.cache_dir,
+        cache_dir=cache_dir,
         delay_s=0.0,
         catalog_base=args.catalog_base,
         sites=sites,
@@ -480,7 +490,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         raise SystemExit(f"archive-validation bridge did not pass: {validation.status}")
     cases, drops, parse_errors = fetch_historical_cases(
         client=client,
-        cache_dir=args.cache_dir,
+        cache_dir=cache_dir,
         delay_s=0.0,
         sites=sites,
         start=START_DATE,
@@ -491,7 +501,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     report = markdown_report(
         command=command,
         catalog_base=args.catalog_base,
-        cache_dir=args.cache_dir,
+        cache_dir=cache_dir,
         validation_status=validation.status,
         validation_checked=validation.checked_count,
         validation_mismatches=validation.mismatch_count,

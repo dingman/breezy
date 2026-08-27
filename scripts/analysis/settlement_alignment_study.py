@@ -30,6 +30,11 @@ from zipfile import ZipFile
 
 import httpx
 from nautilus_trader.persistence.catalog.parquet import ParquetDataCatalog
+from settlement_alignment_cache import (
+    DEFAULT_SETTLEMENT_ALIGNMENT_CACHE_DIR,
+    require_settlement_alignment_cache_dir,
+    resolve_settlement_alignment_cache_dir,
+)
 
 from breezy.domain.nws_climate_day import NwsClimateDay
 from breezy.domain.selection import latest_by_climate_day
@@ -42,7 +47,7 @@ from breezy.registry.sites import SettlementSite, default_registry
 PREREGISTRATION_PATH: Final[Path] = Path(
     "scripts/analysis/pre_registration_2026-08-24T192643Z.md"
 )
-DEFAULT_CACHE_DIR: Final[Path] = Path("scripts/analysis/cache/settlement_alignment")
+DEFAULT_CACHE_DIR: Final[Path] = DEFAULT_SETTLEMENT_ALIGNMENT_CACHE_DIR
 DEFAULT_EVIDENCE_PATH: Final[Path] = Path(
     "docs/evidence/settlement_alignment_2026-08-24.md"
 )
@@ -1066,8 +1071,12 @@ def markdown_report(
             (
                 "Fetch plan and observed cost: five venue-mapped stations, one IEM ASOS "
                 "METAR CSV per station, and one IEM AFOS CLI ZIP per station-year for "
-                "2021-01-01 through 2025-12-31. The completed run cached 40 files under "
-                "`/tmp/breezy-settlement-alignment-cache`, totaling about 298 MiB."
+                "2021-01-01 through 2025-12-31. The completed run cached 40 files, totaling "
+                "about 298 MiB. That cache was written to "
+                "`/tmp/breezy-settlement-alignment-cache` and has since been relocated, "
+                "SHA-256 verified, to "
+                "`~/.local/share/breezy/archive/settlement-alignment-cache`, which is "
+                "the path these scripts now default to."
             ),
             "",
             (
@@ -1128,7 +1137,11 @@ def write_evidence(path: Path, content: str) -> None:
 def parse_args(argv: Sequence[str]) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--catalog-base", type=Path, default=os.environ.get("BREEZY_CATALOG_BASE"))
-    parser.add_argument("--cache-dir", type=Path, default=DEFAULT_CACHE_DIR)
+    parser.add_argument(
+        "--cache-dir",
+        type=resolve_settlement_alignment_cache_dir,
+        default=DEFAULT_CACHE_DIR,
+    )
     parser.add_argument("--output", type=Path, default=DEFAULT_EVIDENCE_PATH)
     parser.add_argument("--delay-seconds", type=float, default=0.25)
     parser.add_argument("--start-date", type=dt.date.fromisoformat, default=START_DATE)
@@ -1141,6 +1154,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     if args.start_date != START_DATE or args.end_date != END_DATE:
         raise SystemExit("start/end date overrides would violate the pre-registration")
 
+    cache_dir = require_settlement_alignment_cache_dir(args.cache_dir)
     try:
         pyiem_version = importlib.metadata.version("pyiem")
     except importlib.metadata.PackageNotFoundError:
@@ -1151,7 +1165,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     with httpx.Client(headers={"User-Agent": USER_AGENT}) as client:
         validation, _overlap_labels = validate_archive_against_catalog(
             client=client,
-            cache_dir=args.cache_dir,
+            cache_dir=cache_dir,
             delay_s=args.delay_seconds,
             catalog_base=args.catalog_base,
             sites=sites,
@@ -1164,7 +1178,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 parse_errors=(f"pyiem version available to backfill extra: {pyiem_version}",),
                 blocked=True,
                 catalog_base=args.catalog_base,
-                cache_dir=args.cache_dir,
+                cache_dir=cache_dir,
                 command=command,
             )
             write_evidence(args.output, report)
@@ -1172,7 +1186,7 @@ def main(argv: Sequence[str] | None = None) -> int:
 
         cases, drops, parse_errors = fetch_historical_cases(
             client=client,
-            cache_dir=args.cache_dir,
+            cache_dir=cache_dir,
             delay_s=args.delay_seconds,
             sites=sites,
             start=START_DATE,
@@ -1188,7 +1202,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             ),
             blocked=False,
             catalog_base=args.catalog_base,
-            cache_dir=args.cache_dir,
+            cache_dir=cache_dir,
             command=command,
         )
         write_evidence(args.output, report)

@@ -19,6 +19,11 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Final
 
+from settlement_alignment_cache import (
+    DEFAULT_SETTLEMENT_ALIGNMENT_CACHE_DIR,
+    require_settlement_alignment_cache_dir,
+    resolve_settlement_alignment_cache_dir,
+)
 from settlement_bucket_gate import (
     BUCKET_WIDTH_F,
     END_DATE,
@@ -42,7 +47,7 @@ from settlement_bucket_gate import (
     verdict,
 )
 
-DEFAULT_CACHE_DIR: Final[Path] = Path("/tmp/breezy-settlement-alignment-cache")
+DEFAULT_CACHE_DIR: Final[Path] = DEFAULT_SETTLEMENT_ALIGNMENT_CACHE_DIR
 DEFAULT_OUTPUT: Final[Path] = Path(
     "docs/evidence/settlement_bucket_guard_band_2026-08-26.md"
 )
@@ -634,7 +639,11 @@ def write_sidecars(
 def parse_args(argv: Sequence[str]) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--catalog-base", type=Path, default=os.environ.get("BREEZY_CATALOG_BASE"))
-    parser.add_argument("--cache-dir", type=Path, default=DEFAULT_CACHE_DIR)
+    parser.add_argument(
+        "--cache-dir",
+        type=resolve_settlement_alignment_cache_dir,
+        default=DEFAULT_CACHE_DIR,
+    )
     parser.add_argument("--output", type=Path, default=DEFAULT_OUTPUT)
     parser.add_argument("--start-date", type=dt.date.fromisoformat, default=START_DATE)
     parser.add_argument("--end-date", type=dt.date.fromisoformat, default=END_DATE)
@@ -651,9 +660,10 @@ def main(argv: Sequence[str] | None = None) -> int:
     if args.start_date != START_DATE or args.end_date != END_DATE:
         raise SystemExit("start/end date overrides would violate the follow-up registration")
 
+    cache_dir = require_settlement_alignment_cache_dir(args.cache_dir)
     sites = load_sites()
     validation_status, checked, mismatches, validation_details = load_validation_labels(
-        cache_dir=args.cache_dir,
+        cache_dir=cache_dir,
         sites=sites,
         catalog_base=args.catalog_base,
     )
@@ -665,7 +675,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     retained_cases: tuple[GuardedBucketCase, ...] = ()
     if validation_status == "passed":
         comparisons, drops, parse_errors = load_daily_comparisons(
-            cache_dir=args.cache_dir,
+            cache_dir=cache_dir,
             sites=sites,
             start=START_DATE,
             end=END_DATE,
@@ -684,7 +694,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     report = markdown_report(
         command=command,
         catalog_base=args.catalog_base,
-        cache_dir=args.cache_dir,
+        cache_dir=cache_dir,
         validation_status=validation_status,
         validation_checked=checked,
         validation_mismatches=mismatches,
@@ -701,7 +711,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         output=args.output,
         command=command,
         catalog_base=args.catalog_base,
-        cache_dir=args.cache_dir,
+        cache_dir=cache_dir,
     )
     return 0 if validation_status == "passed" else 2
 
