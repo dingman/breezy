@@ -142,6 +142,8 @@ def make_tape_settings(root: Path, **overrides: object) -> PolymarketUSQuoteTape
 
 def make_data_client_config() -> PolymarketUSDataClientConfig:
     return PolymarketUSDataClientConfig(
+        # Deliberate test-double origin off the venue domain.
+        allow_foreign_origin=True,
         api_base_url="https://api.example.invalid",
         gateway_base_url="https://gateway.example.invalid",
         ws_url="wss://ws.example.invalid",
@@ -212,21 +214,23 @@ class TestQuoteTapeSettings:
         assert settings.max_file_bytes_error == 500 * 1024**3
         assert settings.disk_check_interval_seconds == 30
 
-    @pytest.mark.parametrize(
-        "name",
-        [
-            "BREEZY_POLYMARKET_US_QUOTE_TAPE_MIN_FREE_BYTES_WARNING",
-            "BREEZY_POLYMARKET_US_QUOTE_TAPE_MIN_FREE_BYTES_ERROR",
-            "BREEZY_POLYMARKET_US_QUOTE_TAPE_MAX_FILE_BYTES_WARNING",
-            "BREEZY_POLYMARKET_US_QUOTE_TAPE_MAX_FILE_BYTES_ERROR",
-        ],
-    )
-    def test_disk_thresholds_are_required_with_no_defaults(self, name: str) -> None:
-        env = dict(TAPE_ENV)
-        del env[name]
+    def test_disk_thresholds_are_derived_when_none_are_configured(self) -> None:
+        """G-19 B10: only the disk SPEND is an operator ceiling.
 
-        with pytest.raises(SettingsError, match=name):
-            load_quote_tape_settings(env)
+        How much headroom a volume needs is a property of the volume, and
+        `shutil.disk_usage` can see it. The recorder must start with none of
+        the four set, and the derived monitor must still be able to fire.
+        """
+        env = {
+            key: value
+            for key, value in TAPE_ENV.items()
+            if "BYTES" not in key
+        }
+
+        settings = load_quote_tape_settings(env)
+
+        assert 0 < settings.min_free_bytes_error < settings.min_free_bytes_warning
+        assert 0 < settings.max_file_bytes_warning < settings.max_file_bytes_error
 
     @pytest.mark.parametrize(
         ("name", "value"),

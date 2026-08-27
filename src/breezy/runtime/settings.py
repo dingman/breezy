@@ -14,21 +14,38 @@ exclusively by `breezy.ingest.http` (`HttpTransport`'s own env-var reader);
 a second reader in this module would be a second, competing policy for the
 same variable.
 
-`BREEZY_SITES` has deliberately **no "all sites" default**. A production
-deployment must state which `(venue, city)` pairs it serves; a partial
-deployment (e.g. during a staged rollout) must be an explicit, visible
-choice in the environment, never an inferred one. Cross-checking the parsed
-pairs against the site registry is NOT this module's job -- that happens at
-the composition root via `SharedIngestState`, which is the single place
-that already owns a `SiteRegistry` instance.
+`BREEZY_SITES` is an **override, not a requirement** (G-19 item B4). Which
+cities exist is a VENUE FACT, and the bot must discover venue facts itself
+-- an operator who has to recite the city list into an environment file is
+supplying something the venue already publishes. Unset therefore means
+"every `(venue, city)` Breezy holds settlement truth for", read from the
+site registry in force (`BREEZY_REGISTRY_PATH`, else the packaged
+`sites.toml`). Setting it narrows a run deliberately, which is a real
+operational need during a staged rollout; setting it BLANK is still a
+malformed value and is still refused.
+
+That default is the registry, not the venue payload, on purpose. The
+registry is the narrower of the two and is the one that carries settlement
+truth, so deriving from it can never enable a city Breezy cannot settle.
+The venue side of the intersection is derived by
+`breezy.adapters.polymarket_us.series.derive_site_pairs`, which refuses --
+loudly -- if the venue trades a city with no registry entry;
+`tests/unit/test_polymarket_us_series.py` pins the two sets equal against
+the captured venue payloads, so the over-approximation here is a CHECKED
+equality rather than an assumption. Cross-checking an explicitly configured
+`BREEZY_SITES` against the registry remains the composition root's job via
+`SharedIngestState`.
 """
 
 from __future__ import annotations
 
 import os
-from collections.abc import Mapping
+import shutil
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
+
+from breezy.registry.sites import RegistryError, default_registry, load_registry
 
 _TRADER_ID_VAR = "BREEZY_TRADER_ID"
 _SITES_VAR = "BREEZY_SITES"
@@ -57,6 +74,24 @@ _QUOTE_TAPE_DISK_CHECK_INTERVAL_VAR = (
 )
 
 _DEFAULT_TRADER_ID = "BREEZY-001"
+
+#: G-19 item B11 asked for this to be derived from the NWS CLI issuance
+#: cadence. It is NOT derivable, and the reasoning is recorded here so the
+#: question is not re-opened.
+#:
+#: The cadence the repo actually holds is "two issuances per day per site"
+#: (`src/breezy/ingest/product_index.py:72`, and the preliminary ~16:44 /
+#: final ~02:27 local instants in the `nws-cli-settlement` skill). A poll interval is not a
+#: function of that cadence: it is a DETECTION-LATENCY choice -- how long a
+#: published product may sit unfetched -- bounded below by api.weather.gov
+#: politeness and above by the settlement deadline. Two issuances per day
+#: constrains it only to "well under ten hours", which is four orders of
+#: magnitude wider than the value in use. Any formula yielding 300 would be
+#: reverse-engineered from the answer, which is worse than an honest constant.
+#:
+#: 300 s = five sites polled once per five minutes = 1 request per site per
+#: 300 s, and a missed product is caught within five minutes of issuance.
+#: `BREEZY_POLL_INTERVAL_SECONDS` overrides it.
 _DEFAULT_POLL_INTERVAL_SECONDS = 300
 _DEFAULT_PARSE_TIMEOUT_MS = 250
 _DEFAULT_LOG_LEVEL = "INFO"
@@ -144,21 +179,52 @@ def _parse_sites(raw: str) -> tuple[tuple[str, str], ...]:
     return tuple(pairs)
 
 
+def _registry_site_pairs(registry_path: Path | None) -> tuple[tuple[str, str], ...]:
+    """Every `(venue, city)` in the registry in force, in file order.
+
+    This is the ONLY filesystem read `load_settings` performs, and it happens
+    only when `BREEZY_SITES` is unset -- the override path neither pays for it
+    nor fails on it. `RegistryError` and the `OSError` family are re-raised as
+    `SettingsError` naming `BREEZY_REGISTRY_PATH`, because from the operator's
+    point of view this IS a configuration failure and must exit as one rather
+    than as an unhandled traceback.
+    """
+    try:
+        registry = default_registry() if registry_path is None else load_registry(registry_path)
+    except (RegistryError, OSError, ValueError) as exc:
+        raise SettingsError(
+            f"{_SITES_VAR} is unset, so the active site set is derived from the "
+            f"site registry, but the registry could not be loaded "
+            f"({_REGISTRY_PATH_VAR}={registry_path}): {exc}"
+        ) from exc
+    return registry.pairs()
+
+
+def _resolve_sites(
+    env: Mapping[str, str], registry_path: Path | None
+) -> tuple[tuple[str, str], ...]:
+    """Return the configured site set, or derive it when `BREEZY_SITES` is unset.
+
+    Unset is NOT an error (G-19 B4): the city universe is a venue fact and the
+    bot derives it. A blank or malformed value still is an error -- that is an
+    operator mistake, not an absence of opinion.
+    """
+    raw = env.get(_SITES_VAR)
+    if raw is None:
+        derived = _registry_site_pairs(registry_path)
+        if not derived:
+            raise SettingsError(
+                f"{_SITES_VAR} is unset and the site registry holds no sites, so "
+                "there is nothing to run; refusing to start with an empty site set"
+            )
+        return derived
+    return _parse_sites(raw)
+
+
 def _parse_positive_int(env: Mapping[str, str], var: str, default: int) -> int:
     raw = env.get(var)
     if raw is None:
         return default
-    try:
-        value = int(raw)
-    except ValueError as exc:
-        raise SettingsError(f"{var} must be an integer, was {raw!r}") from exc
-    if value <= 0:
-        raise SettingsError(f"{var} must be a positive integer, was {raw!r}")
-    return value
-
-
-def _parse_required_positive_int(env: Mapping[str, str], var: str) -> int:
-    raw = _require(env, var)
     try:
         value = int(raw)
     except ValueError as exc:
@@ -181,6 +247,18 @@ def _parse_log_level(env: Mapping[str, str]) -> str:
 
 def _parse_check_proxy_env(env: Mapping[str, str]) -> bool:
     return env.get(_ALLOW_PROXY_ENV_VAR) != "1"
+
+
+def proxy_env_check_enabled(env: Mapping[str, str] | None = None) -> bool:
+    """Return whether proxy/TLS environment hygiene is enforced.
+
+    Public because the Polymarket.us adapter factory needs the SAME answer as
+    `runtime/composition.py` without depending on a fully-built `Settings`:
+    `LiveDataClientFactory.create` receives only loop/name/config/msgbus/
+    cache/clock (`live/factories.py:33-39`). One operator switch,
+    `BREEZY_ALLOW_PROXY_ENV`, governs both transports rather than two.
+    """
+    return _parse_check_proxy_env(os.environ if env is None else env)
 
 
 def _parse_health_snapshot_dir(env: Mapping[str, str]) -> Path | None:
@@ -232,13 +310,17 @@ def load_settings(env: Mapping[str, str] | None = None) -> BreezyRuntimeSettings
     rather than the real process environment.
 
     Raises `SettingsError` naming the offending variable for any missing
-    required value or malformed value. Does NOT cross-check `sites` against
-    the site registry -- see the module docstring.
+    required value or malformed value. Does NOT cross-check an explicitly
+    configured `sites` against the site registry -- see the module docstring.
+    When `BREEZY_SITES` is unset the site set is DERIVED from that registry
+    and is therefore registry-valid by construction.
     """
     active_env: Mapping[str, str] = os.environ if env is None else env
 
     trader_id = active_env.get(_TRADER_ID_VAR, _DEFAULT_TRADER_ID)
-    sites = _parse_sites(_require(active_env, _SITES_VAR))
+    registry_path_raw = active_env.get(_REGISTRY_PATH_VAR)
+    registry_path = Path(registry_path_raw) if registry_path_raw else None
+    sites = _resolve_sites(active_env, registry_path)
     catalog_base = Path(_require(active_env, _CATALOG_BASE_VAR))
 
     state_db_raw = active_env.get(_STATE_DB_VAR)
@@ -253,8 +335,6 @@ def load_settings(env: Mapping[str, str] | None = None) -> BreezyRuntimeSettings
     log_level = _parse_log_level(active_env)
     check_proxy_env = _parse_check_proxy_env(active_env)
 
-    registry_path_raw = active_env.get(_REGISTRY_PATH_VAR)
-    registry_path = Path(registry_path_raw) if registry_path_raw else None
     health_snapshot_dir = _parse_health_snapshot_dir(active_env)
 
     return BreezyRuntimeSettings(
@@ -269,6 +349,127 @@ def load_settings(env: Mapping[str, str] | None = None) -> BreezyRuntimeSettings
         registry_path=registry_path,
         health_snapshot_dir=health_snapshot_dir,
     )
+
+
+# ---------------------------------------------------------------------------
+# G-19 B10 -- tape disk thresholds, derived from the volume the tape lands on
+# ---------------------------------------------------------------------------
+
+_MIB = 1024**2
+_GIB = 1024**3
+
+#: Fraction of the volume that must stay free before the ERROR floor trips.
+#: The WARNING floor is exactly twice this, so the two can never invert.
+_FREE_ERROR_FRACTION = 0.05
+#: Absolute floor for the ERROR threshold on volumes small enough that 5% is
+#: a handful of bytes. Capped by `_FREE_MAX_TOTAL_FRACTION` so it can never
+#: exceed the volume it is measured against.
+_FREE_ERROR_FLOOR_BYTES = 512 * _MIB
+#: Absolute ceiling. Without it, 5% of a 128 TiB array is 6.5 TiB -- an alarm
+#: no operator can ever satisfy, which is the same as no alarm at all.
+_FREE_ERROR_CEILING_BYTES = 25 * _GIB
+#: Hard cap as a fraction of the volume. Guarantees the WARNING floor (2x the
+#: error floor) stays at or under a quarter of the disk, so a small volume
+#: scales the thresholds DOWN instead of alarming from the moment it is empty.
+_FREE_MAX_TOTAL_FRACTION = 0.125
+
+#: One daily tape file (`QUOTE_TAPE_ROTATION_INTERVAL` is one day) is expected
+#: to be megabytes for a handful of weather markets. These thresholds are a
+#: FRAME-STORM detector, not a capacity plan: a day consuming a sixtieth of
+#: the whole volume is anomalous by orders of magnitude.
+_FILE_WARNING_DIVISOR = 60
+_FILE_WARNING_FLOOR_BYTES = 16 * _MIB
+_FILE_WARNING_CEILING_BYTES = 8 * _GIB
+_FILE_MAX_TOTAL_DIVISOR = 24
+
+
+@dataclass(frozen=True, slots=True)
+class DiskThresholds:
+    """The four quote-tape disk thresholds, derived or overridden.
+
+    Invariants held by :func:`derive_disk_thresholds` and re-checked against
+    any operator override in :func:`load_quote_tape_settings`:
+    ``min_free_bytes_error < min_free_bytes_warning`` and
+    ``max_file_bytes_warning < max_file_bytes_error``.
+    """
+
+    min_free_bytes_warning: int
+    min_free_bytes_error: int
+    max_file_bytes_warning: int
+    max_file_bytes_error: int
+
+
+def derive_disk_thresholds(total_bytes: int) -> DiskThresholds:
+    """Derive the four thresholds from the size of the volume the tape lands on.
+
+    G-19 item B10: only "how much disk am I willing to spend" is an operator
+    ceiling; the shape of the alarm is a property of the disk and of the tape's
+    daily rotation, both of which the process can see for itself.
+
+    Two failure modes are designed against explicitly, because the monitor
+    (`breezy.runtime.quote_tape_disk_monitor`) is ALERT-ONLY -- it never stops
+    the recorder, so a badly-calibrated threshold degrades silently:
+
+    * a threshold at or above the whole volume alarms from the first check and
+      is trained away. Every derived value is bounded well below `total_bytes`.
+    * a threshold so low it never precedes ENOSPC. The free-space WARNING is
+      set so at least one more warning-sized daily file fits before the ERROR
+      floor, which is the smallest headroom an operator could act on.
+    """
+    if total_bytes <= 0:
+        raise SettingsError(
+            "cannot derive quote-tape disk thresholds: the reported disk total "
+            f"is {total_bytes} bytes"
+        )
+
+    free_error = min(
+        max(int(total_bytes * _FREE_ERROR_FRACTION), _FREE_ERROR_FLOOR_BYTES),
+        _FREE_ERROR_CEILING_BYTES,
+        int(total_bytes * _FREE_MAX_TOTAL_FRACTION),
+    )
+    file_warning = min(
+        max(total_bytes // _FILE_WARNING_DIVISOR, _FILE_WARNING_FLOOR_BYTES),
+        _FILE_WARNING_CEILING_BYTES,
+        total_bytes // _FILE_MAX_TOTAL_DIVISOR,
+    )
+    if free_error < 1 or file_warning < 1:
+        raise SettingsError(
+            "cannot derive quote-tape disk thresholds: the volume is too small "
+            f"to alarm meaningfully ({total_bytes} bytes total)"
+        )
+
+    return DiskThresholds(
+        min_free_bytes_warning=free_error * 2,
+        min_free_bytes_error=free_error,
+        max_file_bytes_warning=file_warning,
+        max_file_bytes_error=file_warning * 2,
+    )
+
+
+def probe_total_bytes(path: Path) -> int:
+    """Total bytes of the volume `path` lives on, walking up if it is absent.
+
+    The tape root does not exist on a host's first start -- Nautilus creates it
+    on the first write -- so probing it directly would raise `FileNotFoundError`
+    and stop the recorder from ever starting. Walking to the nearest existing
+    ancestor reports the same volume in every realistic case, and `/` always
+    exists, so the walk terminates.
+    """
+    candidate = path
+    while True:
+        if candidate.exists():
+            return shutil.disk_usage(candidate).total
+        parent = candidate.parent
+        if parent == candidate:
+            raise SettingsError(
+                f"cannot size the volume for {path}: no existing ancestor directory"
+            )
+        candidate = parent
+
+
+#: Injected so the derivation is testable at simulated disk sizes without a
+#: real volume of that size.
+TotalBytesProbe = Callable[[Path], int]
 
 
 @dataclass(frozen=True, slots=True)
@@ -315,13 +516,24 @@ class PolymarketUSQuoteTapeSettings:
 
 def load_quote_tape_settings(
     env: Mapping[str, str] | None = None,
+    *,
+    total_bytes_probe: TotalBytesProbe = probe_total_bytes,
 ) -> PolymarketUSQuoteTapeSettings:
     """Load and validate the quote-tape recorder's own settings.
 
-    Strict on its own terms: :data:`QUOTE_TAPE_CATALOG_VAR` and the disk
-    thresholds are required with no defaults, and every rejection names the
-    variable. Calling this is the act of starting the recorder role, so failing
-    here fails the right process -- never the weather collector.
+    Strict where strictness is legitimate: :data:`QUOTE_TAPE_CATALOG_VAR` is a
+    deploy path, an operator ceiling, and is required with no default. Every
+    rejection names the variable. Calling this is the act of starting the
+    recorder role, so failing here fails the right process -- never the weather
+    collector.
+
+    The four disk thresholds are NOT required (G-19 item B10). They are derived
+    from the size of the volume the tape lands on -- see
+    :func:`derive_disk_thresholds` -- and each remains an operator override for
+    a deployment that wants to spend less disk than the derivation allows. A
+    partial override is deliberately supported and deliberately still checked:
+    an override that inverts the ordering against its derived sibling raises,
+    rather than quietly producing a monitor that can never fire.
     """
     active_env: Mapping[str, str] = os.environ if env is None else env
 
@@ -345,17 +557,36 @@ def load_quote_tape_settings(
             f"{QUOTE_TAPE_CATALOG_VAR} must not contain a '..' segment, was {raw!r}"
         )
 
-    min_free_bytes_warning = _parse_required_positive_int(
-        active_env, _QUOTE_TAPE_MIN_FREE_BYTES_WARNING_VAR
+    try:
+        total_bytes = total_bytes_probe(catalog_root)
+    except SettingsError:
+        raise
+    except OSError as exc:
+        raise SettingsError(
+            f"cannot size the volume behind {QUOTE_TAPE_CATALOG_VAR}="
+            f"{catalog_root}, so the disk thresholds cannot be derived: {exc}"
+        ) from exc
+    derived = derive_disk_thresholds(total_bytes)
+
+    min_free_bytes_warning = _parse_positive_int(
+        active_env,
+        _QUOTE_TAPE_MIN_FREE_BYTES_WARNING_VAR,
+        derived.min_free_bytes_warning,
     )
-    min_free_bytes_error = _parse_required_positive_int(
-        active_env, _QUOTE_TAPE_MIN_FREE_BYTES_ERROR_VAR
+    min_free_bytes_error = _parse_positive_int(
+        active_env,
+        _QUOTE_TAPE_MIN_FREE_BYTES_ERROR_VAR,
+        derived.min_free_bytes_error,
     )
-    max_file_bytes_warning = _parse_required_positive_int(
-        active_env, _QUOTE_TAPE_MAX_FILE_BYTES_WARNING_VAR
+    max_file_bytes_warning = _parse_positive_int(
+        active_env,
+        _QUOTE_TAPE_MAX_FILE_BYTES_WARNING_VAR,
+        derived.max_file_bytes_warning,
     )
-    max_file_bytes_error = _parse_required_positive_int(
-        active_env, _QUOTE_TAPE_MAX_FILE_BYTES_ERROR_VAR
+    max_file_bytes_error = _parse_positive_int(
+        active_env,
+        _QUOTE_TAPE_MAX_FILE_BYTES_ERROR_VAR,
+        derived.max_file_bytes_error,
     )
     disk_check_interval_seconds = _parse_positive_int(
         active_env,

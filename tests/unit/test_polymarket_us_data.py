@@ -48,6 +48,7 @@ from nautilus_trader.test_kit.stubs.component import TestComponentStubs
 
 from breezy.adapters.polymarket_us.config import PolymarketUSDataClientConfig
 from breezy.adapters.polymarket_us.data import (
+    DISCOVERY_RELOAD_FLOOR_SECS,
     MARKET_SLUG_KEY,
     MISSING_ROUTING_KEY_WARN_EVERY,
     POLYMARKET_US_VENUE,
@@ -69,7 +70,12 @@ CLIENT_NAME = "POLYMARKET_US"
 # ---------------------------------------------------------------------------
 
 
-def make_instrument(slug: str) -> BinaryOption:
+def make_instrument(
+    slug: str,
+    *,
+    activation_ns: int = 0,
+    expiration_ns: int = 1_800_000_000_000_000_000,
+) -> BinaryOption:
     symbol = Symbol(slug)
     price_increment = Price.from_str("0.001")
     size_increment = Quantity.from_str("1")
@@ -84,8 +90,8 @@ def make_instrument(slug: str) -> BinaryOption:
         price_increment=price_increment,
         size_precision=size_increment.precision,
         size_increment=size_increment,
-        activation_ns=0,
-        expiration_ns=1_800_000_000_000_000_000,
+        activation_ns=activation_ns,
+        expiration_ns=expiration_ns,
         max_quantity=None,
         min_quantity=Quantity.from_int(1),
         maker_fee=Decimal(0),
@@ -221,6 +227,8 @@ def raising_quote_parser(
 
 def make_config(**overrides: object) -> PolymarketUSDataClientConfig:
     kwargs: dict[str, object] = {
+        # Deliberate test-double origin off the venue domain.
+        "allow_foreign_origin": True,
         "api_base_url": "https://api.example.invalid",
         "gateway_base_url": "https://gateway.example.invalid",
         "ws_url": "wss://api.example.invalid",
@@ -753,3 +761,56 @@ def test_no_optional_base_method_is_overridden_only_to_raise() -> None:
         if len(body) == 1 and isinstance(body[0], ast.Raise):
             offenders.append(node.name)
     assert offenders == []
+
+
+# ---------------------------------------------------------------------------
+# G-19 B2: the reload cadence is derived, not recited by an operator
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_client_uses_the_explicit_reload_override_when_one_is_configured() -> None:
+    """The env var survives as an OPTIONAL override (staging, test double)."""
+    harness = build_harness(config=make_config(instrument_reload_interval_mins=5))
+
+    assert harness.client._next_reload_delay_secs() == 5 * 60
+
+
+@pytest.mark.asyncio
+async def test_client_derives_the_reload_delay_from_the_discovered_market_set() -> None:
+    """With no override, the cadence comes from the venue's own boundaries."""
+    now_ns = LiveClock().timestamp_ns()
+    boundary_ns = now_ns + 3 * 3600 * 1_000_000_000
+    harness = build_harness(
+        config=make_config(instrument_reload_interval_mins=None),
+        instruments=[make_instrument(SLUG, activation_ns=now_ns, expiration_ns=boundary_ns)],
+    )
+    await harness.client._instrument_provider.initialize()
+
+    delay = harness.client._next_reload_delay_secs()
+
+    assert DISCOVERY_RELOAD_FLOOR_SECS < delay <= 3 * 3600
+
+    await harness.client._instrument_provider.initialize()
+
+
+@pytest.mark.asyncio
+async def test_connect_schedules_the_reload_task_without_any_configured_interval() -> None:
+    """The lifecycle still spawns the native reload task with no operator input."""
+    now_ns = LiveClock().timestamp_ns()
+    harness = build_harness(
+        config=make_config(instrument_reload_interval_mins=None),
+        instruments=[
+            make_instrument(
+                SLUG,
+                activation_ns=now_ns,
+                expiration_ns=now_ns + 3 * 3600 * 1_000_000_000,
+            )
+        ],
+    )
+    await harness.client._connect()
+    try:
+        task = harness.client._update_instruments_task
+        assert task is not None and not task.done()
+    finally:
+        await harness.client._disconnect()

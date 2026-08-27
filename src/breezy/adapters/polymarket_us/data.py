@@ -104,6 +104,8 @@ from breezy.adapters.polymarket_us.tape_records import (
 __all__ = [
     "CLOCK_OFFSET_SAMPLE_EVERY",
     "CLOCK_OFFSET_SOURCE",
+    "DISCOVERY_RELOAD_CEILING_SECS",
+    "DISCOVERY_RELOAD_FLOOR_SECS",
     "MARKET_SLUG_KEY",
     "MISSING_ROUTING_KEY_WARN_EVERY",
     "POLYMARKET_US_VENUE",
@@ -112,11 +114,14 @@ __all__ = [
     "MarketsFeedFactory",
     "PolymarketUSDataClient",
     "QuoteTickParser",
+    "ReloadDelay",
     "SubscriptionChangePlan",
     "build_data_client",
     "derive_client_id",
+    "derive_reload_delay_secs",
     "diagnose_frame_payload",
     "frame_class_counts",
+    "instrument_boundaries_ns",
     "should_warn_at_count",
     "subscription_changes_after_discovery",
 ]
@@ -167,6 +172,118 @@ CLOCK_OFFSET_SAMPLE_EVERY: Final[int] = 200
 #: What the offset series compares. Recorded on every record so a reader never
 #: has to guess which two clocks produced the number.
 CLOCK_OFFSET_SOURCE: Final[str] = "ws-transact-time"
+
+#: Shortest gap the derived discovery reload is ever allowed to schedule.
+#:
+#: Reasoning, not taste. (1) Rate limit: the discovery quota is 6 requests per
+#: minute (``PolymarketUSDataClientConfig.discovery_requests_per_minute``) and
+#: one reload cycle is at least one paginated ``GET /v1/markets``; reloading
+#: faster than once a minute spends the whole budget on discovery and starves
+#: the instrument and book reads that share the transport. (2) Hot-loop
+#: safety: a stale or malformed payload whose boundaries have all already
+#: passed derives a delay of zero, and without a floor that is a tight
+#: request loop against the venue. Every clamp to this value is logged.
+DISCOVERY_RELOAD_FLOOR_SECS: Final[float] = 60.0
+
+#: Longest gap the derived discovery reload is ever allowed to schedule.
+#:
+#: Reasoning from the captured payloads. Weather markets turn over daily at
+#: 05:00Z (``raw/markets_categories_climate.json``: every market carries
+#: ``endDate`` at ``T05:00:00Z``), and the venue LISTS the next day's ladder
+#: well before that -- ``raw/market_open_510636_by_slug.json`` has
+#: ``startDate = 2026-08-24T09:45:21Z`` against ``endDate =
+#: 2026-08-26T05:00:00Z``, a ~19 hour lead. A market listed just after a
+#: reload would therefore go unseen for most of a day if the derived delay
+#: were allowed to run to the next boundary unbounded. Six hours bounds that
+#: discovery lag to a small fraction of the listing lead while still costing
+#: only four discovery cycles a day. It also makes an absurd boundary -- a
+#: corrupt ``endDate`` in the year 2200 -- unable to park the reload loop
+#: forever. Every clamp to this value is logged.
+DISCOVERY_RELOAD_CEILING_SECS: Final[float] = 6 * 60 * 60.0
+
+
+@dataclass(frozen=True, slots=True)
+class ReloadDelay:
+    """The outcome of one cadence derivation.
+
+    Attributes
+    ----------
+    seconds : float
+        How long to wait before the next discovery reload.
+    clamped : str | None
+        ``None`` when the venue's own boundary was used verbatim; otherwise
+        ``"floor"`` or ``"ceiling"``, naming which guard engaged. Carried
+        rather than silently applied so the caller can log it loudly.
+    boundary_ns : int | None
+        The upcoming boundary the delay targets, or ``None`` when every known
+        boundary is already in the past (a stale payload).
+    """
+
+    seconds: float
+    clamped: str | None
+    boundary_ns: int | None
+
+
+def instrument_boundaries_ns(instruments: Sequence[Instrument]) -> tuple[int, ...]:
+    """Collect venue turnover instants from NATIVE Nautilus instrument fields.
+
+    Null hypothesis, and it holds: nothing new stores these. The venue's
+    ``startDate`` and ``endDate`` are already mapped onto the native
+    ``Instrument.activation_ns`` / ``.expiration_ns`` by
+    ``parsing.parse_binary_option``, so the discovered market set already
+    carries every boundary this derivation needs and no parallel boundary
+    store is built.
+
+    ``gameStartTime`` is deliberately NOT a boundary: it marks the start of the
+    climate day for a market that is already listed and already discovered, so
+    it never changes the discovered SET. Only activation and expiration do.
+    """
+    boundaries: list[int] = []
+    for instrument in instruments:
+        for attribute in ("activation_ns", "expiration_ns"):
+            value = getattr(instrument, attribute, None)
+            if isinstance(value, int) and not isinstance(value, bool) and value > 0:
+                boundaries.append(value)
+    return tuple(boundaries)
+
+
+def derive_reload_delay_secs(
+    *,
+    now_ns: int,
+    boundaries_ns: Sequence[int],
+) -> ReloadDelay:
+    """Derive the next discovery reload delay from the discovered market set.
+
+    The venue states its own turnover instants, so the bot reads them rather
+    than being told a cadence (G-19 B2). The next reload targets the SOONEST
+    upcoming boundary among the markets currently known.
+
+    An empty boundary set is a RETRY AT THE FLOOR, not a fatal invariant, and
+    it is the one sanctioned fallback-on-failure in this adapter. It is
+    reachable at a cold start inside a fully-settled window: ``load_all_async``
+    refuses only a *zero-discovered* cycle, so if every discovered market
+    carries a ``resolved_reason`` it ``continue``s before ``self.add(...)`` and
+    SUCCEEDS while ``get_all()`` stays empty. Raising here killed the reload
+    task on its first iteration -- permanently, because that loop is the only
+    thing that would ever discover the next day's ladder, so the bot went
+    quietly and irrecoverably blind. Every other guard in this adapter fails
+    shut on purpose; this one must not, because the floor is bounded (a request
+    every :data:`DISCOVERY_RELOAD_FLOOR_SECS`, well inside the venue budget)
+    while blindness is unbounded.
+
+    The floor is returned with ``clamped="floor"`` so the caller logs it
+    loudly. It is never applied silently.
+    """
+    if not boundaries_ns:
+        return ReloadDelay(DISCOVERY_RELOAD_FLOOR_SECS, "floor", None)
+    upcoming = [boundary for boundary in boundaries_ns if boundary > now_ns]
+    boundary_ns = min(upcoming) if upcoming else None
+    raw_secs = 0.0 if boundary_ns is None else (boundary_ns - now_ns) / 1e9
+    if raw_secs < DISCOVERY_RELOAD_FLOOR_SECS:
+        return ReloadDelay(DISCOVERY_RELOAD_FLOOR_SECS, "floor", boundary_ns)
+    if raw_secs > DISCOVERY_RELOAD_CEILING_SECS:
+        return ReloadDelay(DISCOVERY_RELOAD_CEILING_SECS, "ceiling", boundary_ns)
+    return ReloadDelay(raw_secs, None, boundary_ns)
 
 
 @dataclass(frozen=True, slots=True)
@@ -606,11 +723,8 @@ class PolymarketUSDataClient(LiveMarketDataClient):
         await self._feed.connect()
         await self._reconcile_discovered_subscriptions(cycle="initial")
 
-        interval_mins = self._venue_config.instrument_reload_interval_mins
-        if interval_mins is None:  # pragma: no cover - config validation narrows at runtime
-            raise ValueError("instrument_reload_interval_mins is required")
         self._update_instruments_task = self.create_task(
-            self._update_instruments(interval_mins),
+            self._update_instruments(),
             log_msg="update_instruments",
         )
 
@@ -661,22 +775,93 @@ class PolymarketUSDataClient(LiveMarketDataClient):
         for currency in self._instrument_provider.currencies().values():
             self._cache.add_currency(currency)
 
-    async def _update_instruments(self, interval_mins: int) -> None:
+    def _next_reload_delay_secs(self) -> float:
+        """Seconds until the next discovery reload.
+
+        An explicit ``instrument_reload_interval_mins`` is an OPTIONAL
+        operator override (staging host, test double) and wins when present.
+        With it unset -- the default -- the cadence is DERIVED from the venue's
+        own turnover instants on the currently-discovered market set, so no
+        human has to recite a number the payload already states (G-19 B2).
+        """
+        override = self._venue_config.instrument_reload_interval_mins
+        if override is not None:
+            return float(override) * 60.0
+
+        outcome = derive_reload_delay_secs(
+            now_ns=self._clock.timestamp_ns(),
+            boundaries_ns=instrument_boundaries_ns(
+                list(self._instrument_provider.get_all().values())
+            ),
+        )
+        if outcome.clamped is not None:
+            self._log.warning(
+                "Polymarket.us discovery reload cadence clamped to the "
+                f"{outcome.clamped} of {outcome.seconds:.0f}s; soonest upcoming "
+                f"venue boundary was {outcome.boundary_ns!r} against clock "
+                f"{self._clock.timestamp_ns()}. A stale or malformed market "
+                "payload is the usual cause.",
+                LogColor.YELLOW,
+            )
+        return outcome.seconds
+
+    async def _update_instruments(self) -> None:
+        """Reload discovered instruments forever; exit ONLY on cancellation.
+
+        Nautilus calls ``connect()`` once and provides no reconnection and no
+        rediscovery, so this loop is the sole path by which the bot ever learns
+        about the next day's market ladder. An exception escaping it is
+        therefore not a failed cycle -- it is permanent, silent blindness.
+        The derivation below already falls back to the floor rather than
+        raising; this handler is the structural guarantee that a FUTURE
+        derivation which raises for a new reason cannot blind the bot either.
+        """
         try:
             while True:
+                try:
+                    delay_secs = self._next_reload_delay_secs()
+                except PolymarketUSError as exc:
+                    delay_secs = DISCOVERY_RELOAD_FLOOR_SECS
+                    self._log.error(
+                        "Polymarket.us reload cadence could not be derived "
+                        f"({type(exc).__name__}: {exc}); retrying at the "
+                        f"{delay_secs:.0f}s floor. The reload loop is never "
+                        "allowed to exit: it is the only path to the next "
+                        "day's market ladder.",
+                        LogColor.RED,
+                    )
                 self._log.debug(
-                    f"Scheduled task 'update_instruments' to run in {interval_mins} minutes"
+                    "Scheduled task 'update_instruments' to run in "
+                    f"{delay_secs:.0f} seconds"
                 )
-                await asyncio.sleep(interval_mins * 60)
-                before = len(self._provider_active_slugs())
-                await self._instrument_provider.initialize(reload=True)
-                self._send_all_instruments_to_data_engine()
-                after_slugs = self._provider_active_slugs()
-                self._alert_on_discovery_counts(before=before, after=len(after_slugs))
-                self._alert_on_missing_cache_after_push(after_slugs)
-                await self._reconcile_discovered_subscriptions(cycle="reload")
+                await asyncio.sleep(delay_secs)
+                try:
+                    await self._run_one_reload_cycle()
+                except Exception as exc:  # noqa: BLE001 - deliberate: see below
+                    # `asyncio.CancelledError` derives from `BaseException`, so
+                    # cancellation still propagates to the handler below and
+                    # shutdown is unaffected. A FAILED CYCLE, by contrast, is
+                    # only ever a failed cycle: a venue outage, a malformed
+                    # discovery payload, or a rejected status must not end the
+                    # one loop that would recover from it on the next pass.
+                    self._log.error(
+                        "Polymarket.us discovery reload cycle failed "
+                        f"({type(exc).__name__}: {exc}); the reload loop "
+                        "continues and will retry on the next scheduled pass.",
+                        LogColor.RED,
+                    )
         except asyncio.CancelledError:
             self._log.debug("Canceled task 'update_instruments'")
+
+    async def _run_one_reload_cycle(self) -> None:
+        """One discovery reload pass. Extracted so the loop can survive it."""
+        before = len(self._provider_active_slugs())
+        await self._instrument_provider.initialize(reload=True)
+        self._send_all_instruments_to_data_engine()
+        after_slugs = self._provider_active_slugs()
+        self._alert_on_discovery_counts(before=before, after=len(after_slugs))
+        self._alert_on_missing_cache_after_push(after_slugs)
+        await self._reconcile_discovered_subscriptions(cycle="reload")
 
     async def _reconcile_discovered_subscriptions(self, *, cycle: str) -> None:
         desired = self._provider_active_slugs()

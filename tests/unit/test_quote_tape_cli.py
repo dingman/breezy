@@ -47,6 +47,10 @@ BASE_ENV: dict[str, str] = {
     "BREEZY_POLYMARKET_US_QUOTE_TAPE_MIN_FREE_BYTES_ERROR": str(10 * 1024**3),
     "BREEZY_POLYMARKET_US_QUOTE_TAPE_MAX_FILE_BYTES_WARNING": str(400 * 1024**3),
     "BREEZY_POLYMARKET_US_QUOTE_TAPE_MAX_FILE_BYTES_ERROR": str(500 * 1024**3),
+    # Security finding M2: these test-double origins sit off the venue domain,
+    # so the recorder's environment must declare that deliberately -- exactly
+    # as a real staging run would have to.
+    "POLYMARKET_US_ALLOW_FOREIGN_ORIGIN": "1",
     "POLYMARKET_US_API_BASE": "https://api.example.invalid",
     "POLYMARKET_US_GATEWAY_BASE": "https://gateway.example.invalid",
     "POLYMARKET_US_WS_URL": "wss://ws.example.invalid",
@@ -164,14 +168,6 @@ def test_the_node_is_configured_to_stream_to_the_configured_catalog_root(
     "name",
     [
         "BREEZY_POLYMARKET_US_QUOTE_TAPE_CATALOG",
-        "BREEZY_POLYMARKET_US_QUOTE_TAPE_MIN_FREE_BYTES_WARNING",
-        "BREEZY_POLYMARKET_US_QUOTE_TAPE_MIN_FREE_BYTES_ERROR",
-        "BREEZY_POLYMARKET_US_QUOTE_TAPE_MAX_FILE_BYTES_WARNING",
-        "BREEZY_POLYMARKET_US_QUOTE_TAPE_MAX_FILE_BYTES_ERROR",
-        "POLYMARKET_US_API_BASE",
-        "POLYMARKET_US_GATEWAY_BASE",
-        "POLYMARKET_US_WS_URL",
-        "POLYMARKET_US_DISCOVERY_RELOAD_INTERVAL_MINS",
         "POLYMARKET_US_USER_AGENT",
     ],
 )
@@ -183,6 +179,19 @@ def test_every_missing_variable_exits_two_and_names_itself(
     The weather collector is unaffected by any of these; the recorder refuses
     to start half-configured rather than recording an incomplete tape nobody
     notices is incomplete.
+
+    G-19 B1/B2 removed the four Polymarket.us venue-FACT variables from this
+    list. They are no longer required inputs -- the endpoint triple is pinned
+    from captured venue evidence and the reload cadence is derived from the
+    discovered market set -- so their absence must NOT stop the recorder. The
+    complement is asserted by
+    ``test_recorder_starts_with_no_venue_fact_variable_set``.
+
+    G-19 B10 removed the four disk thresholds for the same reason: how much
+    headroom a volume needs is derivable from the volume, so their absence
+    must not stop the recorder either. Both survivors are genuine operator
+    ceilings -- a deploy path and a contact string -- and neither can be
+    self-derived.
     """
     env = dict(complete_env)
     del env[name]
@@ -193,6 +202,33 @@ def test_every_missing_variable_exits_two_and_names_itself(
     assert code == EXIT_CONFIG_ERROR
     assert name in err.getvalue()
     assert RecordingNode.instances == [], "no node is built from a bad environment"
+
+
+@pytest.mark.parametrize(
+    "name",
+    [
+        "POLYMARKET_US_API_BASE",
+        "POLYMARKET_US_GATEWAY_BASE",
+        "POLYMARKET_US_WS_URL",
+        "POLYMARKET_US_DISCOVERY_RELOAD_INTERVAL_MINS",
+    ],
+)
+def test_recorder_starts_with_no_venue_fact_variable_set(
+    name: str, complete_env: dict[str, str]
+) -> None:
+    """G-19: no venue FACT may block the recorder from starting.
+
+    Removing any one of the four (B) variables must NOT produce a
+    configuration error -- the bot already knows or derives that value.
+    """
+    env = dict(complete_env)
+    del env[name]
+    err = io.StringIO()
+
+    code = run(env=env, node_factory=RecordingNode, stderr=err)
+
+    assert code != EXIT_CONFIG_ERROR, err.getvalue()
+    assert name not in err.getvalue()
 
 
 def test_ctrl_c_is_a_clean_shutdown_not_a_runtime_failure(

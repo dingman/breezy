@@ -14,11 +14,10 @@
 
 | Variable | Purpose | Format/Example | Failure if wrong |
 |---|---|---|---|
-| `BREEZY_SITES` | Active site set; no default | `"polymarket_us:NYC,polymarket_us:SFO"` (comma-separated `venue:city` pairs) | Missing: SettingsError, startup fails exit 2. Blank/malformed: startup fails exit 2. Not in the registry: exit 2 with `configured site <venue>/<city> is not in the registry`. |
 | `BREEZY_CATALOG_BASE` | Root of NWS data directory (state DB, catalogs, witness marker live here) | `/var/lib/breezy/catalog` | Missing: SettingsError exit 2. Not writable: OSError exit 2. Symlinked: writer lock fails (see §9). |
 | `BREEZY_USER_AGENT` | HTTP User-Agent string with a monitored operator contact | `breezy-weather-ingest/0.1 (+mailto:ops@example.com)` | Missing or blank: UserAgentConfigurationError, startup fails exit 2. Read by `ingest/http.py`, not `settings.py`. NWS uses this to contact the operator on abuse. |
 
-**`BREEZY_SITES` values are matched CASE-SENSITIVELY and EXACTLY against the
+**When `BREEZY_SITES` IS set**, its values are matched CASE-SENSITIVELY and EXACTLY against the
 table keys in `src/breezy/registry/sites.toml`.** `SiteRegistry.settlement_site`
 (`registry/sites.py:313-324`) does a plain dict lookup on the `(venue, city)`
 tuple: it never lower-cases, never aliases a venue name, and never substitutes
@@ -41,8 +40,9 @@ value either.
 | Variable | Default | Type/Range | Notes |
 |---|---|---|---|
 | `BREEZY_TRADER_ID` | `BREEZY-001` | Two non-empty hyphen-separated segments, e.g. `WEATHER-PROD` | Malformed → NodeConfigError exit 2. Unvalidated value panics Nautilus in Rust (SIGABRT 134, uncatchable); pre-validation at `runtime/node_config.py:82-100` prevents this. |
+| `BREEZY_SITES` | **all sites in the registry in force** (today the five `polymarket_us` cities) | comma-separated `venue:city` pairs, e.g. `"polymarket_us:NYC,polymarket_us:SFO"` | Which cities exist is a VENUE FACT, so unset means "derive" (G-19 B4), not "fail". Set it only to NARROW a run deliberately. Blank/malformed: startup fails exit 2. Not in the registry: exit 2 with `configured site <venue>/<city> is not in the registry`. |
 | `BREEZY_STATE_DB` | `{BREEZY_CATALOG_BASE}/state/breezy-state.sqlite3` | Path | SQLite file; must not be on a network filesystem. Created if missing. |
-| `BREEZY_POLL_INTERVAL_SECONDS` | `300` (5 min) | Positive integer | Polling frequency per site. Governs how fast missed products can be caught; lower = faster catch-up, higher = lower request rate. |
+| `BREEZY_POLL_INTERVAL_SECONDS` | `300` (5 min) | Positive integer | Polling frequency per site. Governs how fast missed products can be caught; lower = faster catch-up, higher = lower request rate. NOT derived from the CLI issuance cadence — see the reasoning at `runtime/settings.py:_DEFAULT_POLL_INTERVAL_SECONDS`. |
 | `BREEZY_PARSE_TIMEOUT_MS` | `250` | Positive integer | Timeout for CLI product text parsing. Exceeds → product marked OVERSIZE_OR_PARSE_TIMEOUT, site degraded. |
 | `BREEZY_LOG_LEVEL` | `INFO` | `OFF`, `TRACE`, `DEBUG`, `INFO`, `WARNING`, `ERROR` | Nautilus kernel log level. `CRITICAL` is rejected and startup fails exit 2. stdlib `logging` records are bridged to Nautilus by the console entrypoint. |
 | `BREEZY_ALLOW_PROXY_ENV` | (check proxy env) | (any value) | Set to `"1"` to allow HTTP_PROXY/HTTPS_PROXY env vars. Unset or `"0"` → block proxy env (secure default). |

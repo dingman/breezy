@@ -27,7 +27,7 @@ with the same name as the key in ``TradingNodeConfig.data_clients``, because
 
 What is deliberately NOT here
 -----------------------------
-No execution client, no order path, no fee model, no strategy. This slice is
+No execution client, no order path, no strategy. This slice is
 GET-only across ordinary adapter/script paths: the signer refuses any method
 but ``GET`` (barrier B2), the HTTP client exposes only two read methods (B1),
 the transport keeps its pyo3 client out of attribute and bound-method
@@ -36,6 +36,16 @@ the transport keeps its pyo3 client out of attribute and bound-method
 signing module. B3 is pinned by
 ``test_transport_does_not_expose_real_pyo3_client_through_bound_method_self``
 and ``test_b3_constructed_transport_exposes_no_write_capable_receiver``.
+
+``PolymarketUSFeeModel`` IS exported, and deliberately so. It is a backtest
+extension point, not an order path: it prices a fill, it cannot place one.
+Exporting it is half the fix for a real defect -- the model had zero callers
+while ``BacktestEngine.add_venue`` defaults to ``MakerTakerFeeModel``
+(``backtest/engine.pyx:643-644``), so the accurate model sat on the shelf and
+the generic one was what would actually run. The other half is barrier F2 in
+``tests/unit/test_polymarket_us_fee_guard.py``, which fails the suite for any
+module under ``src/`` or ``scripts/`` that builds a venue without passing
+``fee_model=PolymarketUSFeeModel()``.
 
 No secret is exported, and none can be. Credentials live only in
 ``RedactedSecureString`` at runtime and are resolved exclusively in the
@@ -56,7 +66,9 @@ from breezy.adapters.polymarket_us.data import (
 from breezy.adapters.polymarket_us.env import load_polymarket_us_credentials
 from breezy.adapters.polymarket_us.errors import (
     CredentialSourceError,
+    FeeScheduleUnknownError,
     GatewayForbiddenError,
+    MakerRebateUnmodelledError,
     MethodNotPermittedError,
     PolymarketUSError,
     SignatureClockSkewError,
@@ -71,6 +83,7 @@ from breezy.adapters.polymarket_us.factories import (
     PolymarketUSLiveDataClientFactory,
     config_from_env,
 )
+from breezy.adapters.polymarket_us.fees import PolymarketUSFeeModel
 from breezy.adapters.polymarket_us.http import PolymarketUSHttpClient
 from breezy.adapters.polymarket_us.parsing import (
     parse_binary_option,
@@ -131,8 +144,10 @@ __all__ = [
     "CanonicalRequest",
     "CredentialSourceError",
     "Ed25519RequestSigner",
+    "FeeScheduleUnknownError",
     "GatewayForbiddenError",
     "LiveTradingPermit",
+    "MakerRebateUnmodelledError",
     "MarketsFeed",
     "MethodNotPermittedError",
     "NautilusHttpTransport",
@@ -140,6 +155,7 @@ __all__ = [
     "PolymarketUSDataClient",
     "PolymarketUSDataClientConfig",
     "PolymarketUSError",
+    "PolymarketUSFeeModel",
     "PolymarketUSHttpClient",
     "PolymarketUSInstrumentProvider",
     "PolymarketUSLiveDataClientFactory",

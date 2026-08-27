@@ -25,29 +25,85 @@ rounding of a venue price is a wrong number that survives into settlement.
 instrument definitions). There is no code path that substitutes a constant for
 a value the venue did not send.
 
-**Fees fail closed -- in substance, not only in this docstring.**
-``BUILD_PLAN`` Phase 1 downgraded the Polymarket.us fee schedule to
-``[UNKNOWN]``. The market payload's ``feeCoefficient`` is the ``theta`` of
+**Fees fail closed through a native fee-model extension.**
+The market payload's ``feeCoefficient`` is the ``theta`` of
 ``fee = theta * C * p * (1 - p)`` -- a coefficient on a concave function of
 price, not a flat rate on notional, which is what Nautilus's
-``maker_fee``/``taker_fee`` mean. It is recorded verbatim in ``info`` next to
-:data:`FEE_SCHEDULE_STATUS_UNKNOWN` and is never written to either fee field.
+``maker_fee``/``taker_fee`` mean. A valid per-market coefficient is recorded
+verbatim in ``info`` under :data:`FEE_COEFFICIENT_KEY` and marks the fee
+schedule :data:`FEE_SCHEDULE_STATUS_KNOWN`; absence keeps the schedule
+:data:`FEE_SCHEDULE_STATUS_UNKNOWN`, and an unusable value aborts the load.
 
-That marker alone is NOT enough, and saying otherwise was a real defect.
-``BinaryOption`` defaults the two fee fields via ``maker_fee or Decimal(0)``
-(``model/instruments/binary_option.pyx:148-149``), so every instrument loaded
-here carries a genuine, typed ``Decimal(0)`` in exactly the fields generic
-Nautilus machinery reads -- ``MakerTakerFeeModel.get_commission`` multiplies
-notional by ``instrument.taker_fee`` and by nothing else
+**DECISION (a): the flat fee fields carry ``theta``, and are made UNREACHABLE
+rather than argued safe.**
+The exact fee is carried by
+:class:`~breezy.adapters.polymarket_us.fees.PolymarketUSFeeModel`. The
+question this docstring answers is what the two FLAT fields should hold, given
+that generic Nautilus machinery reads them and nothing in Nautilus can stop a
+future caller from doing so.
+
+Writing ``theta`` there is not a guess about the VALUE. It is the meaning
+Nautilus itself assigns to an instrument fee rate on a probability-priced
+binary: ``nautilus_pyo3.ProbabilityPriceFeeModel`` computes
+``qty * rate * p * (1 - p)`` "using the instrument's maker or taker fee rate".
+So the field follows the framework's own convention for this instrument class.
+
+**What the flat read actually costs, stated accurately.** A generic
+``MakerTakerFeeModel`` computes ``notional * taker_fee``, i.e.
+``theta * C * p``. The venue charges ``theta * C * p * (1 - p)``. The absolute
+difference is ``theta * C * p^2``, which is ``>= 0`` everywhere on ``[0, 1]``.
+
+That non-negativity is true and it defends the WRONG property. The venue fee
+is **symmetric about ``p = 0.50``**; the flat read is **monotone in ``p``**.
+The RELATIVE overstatement is ``1 / (1 - p)``, which is **unbounded as
+``p -> 1``**. At ``theta = 0.06``, ``C = 100``:
+
+===================  ===============  ==============  =====
+trade                true venue fee   flat-field fee  ratio
+===================  ===============  ==============  =====
+YES @ ``p = 0.90``   $0.54            $5.40           10x
+NO  @ ``p = 0.10``   $0.54            $0.60           1.11x
+===================  ===============  ==============  =====
+
+The venue charges those two IDENTICALLY. The flat read charges one 9x more
+than the other, so it does not haircut an edge gate -- it TILTS it toward the
+cheap side of every book. For a weather bot, confident forecasts land exactly
+in the ``p -> 1`` region where the distortion is worst. Calling this
+"conservative" was a real defect in an earlier revision of this docstring.
+
+**Zero is not the alternative.** ``BinaryOption`` defaults these fields to
+``Decimal(0)`` (``model/instruments/binary_option.pyx:148-149``): a real,
+typed, usable zero that reads as a FREE venue. Now that a parsed coefficient
+marks the schedule ``KNOWN``, :func:`assert_fee_schedule_known` OPENS, so a
+zero here would be charged as nothing at all -- understating, which is
+strictly worse than overstating. **Neither flat value is safe on its own.**
+
+``theta`` is therefore kept only so that a circumvention errs in the
+overstating direction. The actual defence is barrier F2 in
+``tests/unit/test_polymarket_us_fee_guard.py``, which fails the suite for any
+module under ``src/`` or ``scripts/`` that constructs a backtest venue without
+passing ``fee_model=PolymarketUSFeeModel()`` -- because
+``BacktestEngine.add_venue`` otherwise defaults to ``MakerTakerFeeModel``
+(``backtest/engine.pyx:643-644``). Barrier F1 independently forbids reading
+either field as truth.
+
+**The ``info`` marker alone is NOT enough, and saying otherwise was a real
+defect.** Whenever the venue omits ``feeCoefficient`` the schedule stays
+``UNKNOWN`` and ``BinaryOption`` defaults both fee fields via
+``maker_fee or Decimal(0)`` (``model/instruments/binary_option.pyx:148-149``),
+putting a genuine, typed ``Decimal(0)`` in exactly the fields generic Nautilus
+machinery reads -- ``MakerTakerFeeModel.get_commission`` multiplies notional
+by ``instrument.taker_fee`` and by nothing else
 (``backtest/models/fee.pyx:96-99``). A zero there is indistinguishable from a
 free venue, while the real taker fee is $1.50 per 100 contracts at p=0.50.
 
 Instruments must stay loadable (the read-only slice needs them to receive
-quotes), so the enforcement is a guard rather than a refusal:
-:func:`assert_fee_schedule_known` raises unless ``info`` says the schedule is
-``KNOWN``, and ``tests/unit/test_polymarket_us_fee_guard.py`` (barrier F1)
-fails the suite if any venue-touching module reads a fee field without calling
-it.
+quotes), so the enforcement is a guard plus
+:class:`breezy.adapters.polymarket_us.fees.PolymarketUSFeeModel`, rather than a
+flat fee. :func:`assert_fee_schedule_known` raises unless ``info`` says the
+schedule is ``KNOWN``, and ``tests/unit/test_polymarket_us_fee_guard.py``
+(barrier F1) fails the suite if any venue-touching module reads a fee field
+without calling it.
 """
 
 from __future__ import annotations
@@ -97,6 +153,7 @@ __all__ = [
     "CLIMATE_CATEGORY",
     "DEPTH10_LEVELS",
     "EXPIRED_MARKET_STATES",
+    "FEE_COEFFICIENT_KEY",
     "FEE_SCHEDULE_STATUS_KEY",
     "FEE_SCHEDULE_STATUS_KNOWN",
     "FEE_SCHEDULE_STATUS_UNKNOWN",
@@ -186,7 +243,14 @@ _TAKER_SIDES: dict[str, AggressorSide] = {
 #: A payload naming anything else is refused rather than coerced.
 QUOTE_CURRENCY_CODE: str = "USD"
 
-#: ``info`` key carrying the fee-schedule resolution state.
+#: ``info`` key holding the market's own verbatim ``theta``, as a string.
+#: Read by :class:`~breezy.adapters.polymarket_us.fees.PolymarketUSFeeModel`,
+#: which re-validates it rather than trusting the status marker alone.
+FEE_COEFFICIENT_KEY: str = "fee_coefficient"
+
+#: ``info`` key carrying the fee-schedule resolution state. Barrier F1 hangs
+#: on this constant: :func:`assert_fee_schedule_known` reads it and every
+#: fee-consuming path must call that guard first.
 FEE_SCHEDULE_STATUS_KEY: str = "fee_schedule_status"
 
 #: Recorded in ``BinaryOption.info`` so no downstream consumer can mistake the
@@ -194,10 +258,9 @@ FEE_SCHEDULE_STATUS_KEY: str = "fee_schedule_status"
 #: :func:`assert_fee_schedule_known`, not by convention.
 FEE_SCHEDULE_STATUS_UNKNOWN: str = "UNKNOWN"
 
-#: The ONLY value that unlocks a fee-consuming path. Nothing writes it today:
-#: resolving the schedule means (a) a live-verified per-market fee model for
-#: ``theta * C * p * (1 - p)`` and (b) a decision about how that maps onto
-#: Nautilus's flat-rate fee fields, neither of which is in this slice.
+#: The ONLY value that unlocks a fee-consuming path. It is written only after a
+#: finite per-market ``feeCoefficient`` in ``[0, 1]`` is parsed from the venue
+#: payload.
 FEE_SCHEDULE_STATUS_KNOWN: str = "KNOWN"
 
 #: The venue's own label for a weather market. Used to decide when an
@@ -250,8 +313,8 @@ def assert_fee_schedule_known(instrument: Instrument) -> None:
         f"fee schedule is {status or FEE_SCHEDULE_STATUS_UNKNOWN!s}. Its "
         "'maker_fee' and 'taker_fee' fields hold a placeholder Decimal(0) supplied "
         "by BinaryOption's own default, NOT a verified zero-fee schedule; the venue "
-        "charges theta * C * p * (1 - p) (taker theta 0.06, $1.50 per 100 contracts "
-        "at p=0.50). Resolve the schedule and mark it "
+        "charges theta * C * p * (1 - p), with theta read from the market payload. "
+        "Resolve the schedule and mark it "
         f"{FEE_SCHEDULE_STATUS_KNOWN!r} before charging or netting fees."
     )
 
@@ -398,6 +461,38 @@ def _parse_amount(
             f"{QUOTE_CURRENCY_CODE!r}; refusing to treat it as a USD amount"
         )
     return _to_decimal(_require(value, "value", error=error), field=f"{field}.value", error=error)
+
+
+def _parse_fee_coefficient(market: Mapping[str, Any]) -> tuple[Decimal | None, str]:
+    """Read the market's own ``theta``, or report the schedule UNKNOWN.
+
+    Three outcomes, deliberately distinct:
+
+    * **Absent or JSON ``null``** -> ``(None, UNKNOWN)``. The venue said
+      nothing, so we know nothing, and every fee-consuming path fails closed
+      via :func:`assert_fee_schedule_known`.
+    * **Present and usable** (finite, ``0 <= theta <= 1``) ->
+      ``(theta, KNOWN)``. The status is DERIVED from an actual parse; it is
+      never assumed and never written on any other path.
+    * **Present and unusable** -> raises
+      :class:`~breezy.adapters.polymarket_us.errors.InstrumentDefinitionError`.
+      A coefficient we cannot read is a venue schema change, and aborting the
+      instrument surfaces it immediately instead of degrading to UNKNOWN and
+      letting a fee-free instrument look merely unresolved.
+
+    Note that a parsed ``0`` is KNOWN, not UNKNOWN: "the venue told us this
+    market is free" and "the venue told us nothing" are different facts, and
+    conflating them is exactly the defect barrier F1 exists to prevent.
+    """
+    raw = market.get("feeCoefficient")
+    if raw is None:
+        return None, FEE_SCHEDULE_STATUS_UNKNOWN
+    theta = _to_decimal(raw, field="feeCoefficient", error=InstrumentDefinitionError)
+    if theta < Decimal(0) or theta > Decimal(1):
+        raise InstrumentDefinitionError(
+            f"Field 'feeCoefficient' value {theta} is outside the supported range [0, 1]"
+        )
+    return theta, FEE_SCHEDULE_STATUS_KNOWN
 
 
 # ---------------------------------------------------------------------------
@@ -1051,7 +1146,7 @@ def parse_binary_option(
             f"({expiration_ns} <= {activation_ns})"
         )
 
-    fee_coefficient = market.get("feeCoefficient")
+    fee_coefficient, fee_schedule_status = _parse_fee_coefficient(market)
     info: dict[str, Any] = {
         "market_id": str(_require(market, "id", error=InstrumentDefinitionError)),
         "slug": slug,
@@ -1061,9 +1156,9 @@ def parse_binary_option(
         "question": market.get("question"),
         "market_side_ids": tuple(str(side.get("id")) for side in sides),
         "size_increment_source": "minimumTradeQty",
-        # Fees fail closed: recorded, never promoted to a rate. See module docstring.
-        "fee_coefficient": None if fee_coefficient is None else str(fee_coefficient),
-        FEE_SCHEDULE_STATUS_KEY: FEE_SCHEDULE_STATUS_UNKNOWN,
+        # Recorded verbatim, per market. PolymarketUSFeeModel reads it from here.
+        FEE_COEFFICIENT_KEY: None if fee_coefficient is None else str(fee_coefficient),
+        FEE_SCHEDULE_STATUS_KEY: fee_schedule_status,
     }
     info.update(_weather_info(market, slug))
 
@@ -1081,6 +1176,10 @@ def parse_binary_option(
         ts_event=ts_event,
         ts_init=ts_init,
         min_quantity=Quantity.from_str(format(size_increment, f".{size_precision}f")),
+        # DECISION (a) -- see the module docstring for the algebra. `theta`
+        # itself, not a flat notional rate and not a placeholder zero.
+        maker_fee=fee_coefficient,
+        taker_fee=fee_coefficient,
         outcome=outcome,
         description=_description(market),
         info=info,

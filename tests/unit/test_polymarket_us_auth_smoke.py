@@ -1315,7 +1315,11 @@ def test_prepare_leaves_the_guard_disarmed_when_config_fails(
     monkeypatch.setattr(smoke.resource, "getrlimit", lambda which: (0, 0))
 
     env = make_env()
-    del env[API_BASE_ENV_VAR]
+    # The endpoint triple became an OPTIONAL override in G-19 B1, so removing
+    # it no longer fails config. `POLYMARKET_US_USER_AGENT` -- a contact
+    # string, and the one remaining required input -- is what this ordering
+    # test now removes to provoke the config failure.
+    del env[USER_AGENT_ENV_VAR]
 
     with pytest.raises(SettingsError):
         smoke.prepare(env, guard=guard)

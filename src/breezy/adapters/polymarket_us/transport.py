@@ -37,6 +37,7 @@ from nautilus_trader.core import nautilus_pyo3
 
 from breezy.adapters.polymarket_us.errors import VenueTransportError
 from breezy.adapters.polymarket_us.redaction import redact_url
+from breezy.ingest.http import assert_clean_proxy_env
 
 __all__ = [
     "DEFAULT_BOOK_REQUESTS_PER_MINUTE",
@@ -51,6 +52,8 @@ __all__ = [
     "QUOTA_KEY_DISCOVERY",
     "QUOTA_KEY_INSTRUMENTS",
     "QUOTA_KEY_PORTFOLIO",
+    "REDIRECT_STATUS_LOWER",
+    "REDIRECT_STATUS_UPPER",
     "RETAIL_GLOBAL_REQUESTS_PER_SECOND",
     "NautilusHttpTransport",
     "PolymarketUSReadTransport",
@@ -70,7 +73,18 @@ OBSERVED_RESPONSE_HEADERS: tuple[str, ...] = (
     "x-ratelimit-remaining",
     "x-ratelimit-reset",
     "date",
+    # Named so a redirect is at least VISIBLE. Without it the allow-list hides
+    # `Location`, and a 3xx is invisible in logs as well as in the code path.
+    "location",
 )
+
+#: Statuses refused outright by :meth:`NautilusHttpTransport.get`.
+#:
+#: See the class docstring for what this does and does not achieve: it stops a
+#: redirect the Rust client hands BACK to us, and it cannot stop one the Rust
+#: client already followed.
+REDIRECT_STATUS_LOWER: int = 300
+REDIRECT_STATUS_UPPER: int = 400
 
 QUOTA_KEY_INSTRUMENTS: str = "instruments"
 QUOTA_KEY_DISCOVERY: str = "discovery"
@@ -234,6 +248,36 @@ class NautilusHttpTransport:
     closure-cell introspection on the callable's class method. That is a
     language residual, not an ordinary attribute path or a bound-method
     receiver path.
+
+    Redirects -- what this class can and cannot do
+    ---------------------------------------------
+    ``HttpClient`` exposes no redirect policy (its constructor is exactly
+    ``default_headers, header_keys, keyed_quotas, default_quota, timeout_secs,
+    proxy_url`` -- ``core/nautilus_pyo3.pyi:5417-5425``), so ``reqwest``'s
+    default ``Policy::limited(10)`` applies. ``reqwest`` strips only its own
+    hardcoded sensitive header set on a cross-host hop, which does NOT include
+    the venue's custom ``X-PM-*`` credential headers.
+
+    Measured against two loopback listeners on different host strings: a 301,
+    302, 303 or 307 carrying a ``Location`` is followed transparently, the
+    second host receives ``x-pm-access-key`` / ``x-pm-timestamp`` /
+    ``x-pm-signature`` intact, a control ``authorization`` header IS stripped,
+    and this method observes the FINAL response -- status 200. ``HttpResponse``
+    exposes only ``status``, ``headers`` and ``body``, with no final-URL
+    attribute, so a followed hop is neither preventable nor detectable here.
+
+    :meth:`get` therefore refuses every ``3xx`` it is handed, which covers the
+    redirects ``reqwest`` declines to follow itself (measured: a 302 with no
+    ``Location``, a 305, a 304) plus anything a future version stops following.
+    It is defence in depth and drift detection, **not** a fix for the followed
+    hop. The controls that actually bound that residual are the venue-domain
+    origin allowlist in ``config.assert_well_formed_origin`` (only the venue
+    itself, or an actor who has already broken TLS to the venue and can read
+    the header directly, can emit the 302) and the read-only GET-only cage
+    (what leaks is a non-secret key id plus a path-scoped signature valid for
+    the venue's 30-second window, never an order capability).
+    ``tests/unit/test_polymarket_us_transport_security.py`` pins the measured
+    behaviour so a ``nautilus-trader`` bump that changes it fails RED.
     """
 
     __slots__ = ("_get", "_permitted_quota_keys")
@@ -246,7 +290,22 @@ class NautilusHttpTransport:
         keyed_quotas: list[tuple[str, Any]],
         default_headers: dict[str, str],
         permitted_quota_keys: frozenset[str] = PERMITTED_QUOTA_KEYS,
+        check_proxy_env: bool = True,
+        approved_proxy_env_vars: frozenset[str] | None = None,
     ) -> None:
+        # `reqwest` honours HTTP_PROXY/HTTPS_PROXY/ALL_PROXY from the
+        # environment whenever no explicit proxy is configured, and no proxy is
+        # configured here. Measured: an `HTTP_PROXY` listener received a
+        # request carrying `x-pm-access-key` and `x-pm-signature`.
+        # `breezy.ingest.http` has guarded its own client this way since it was
+        # written (`ingest/http.py:557,783`); the path carrying SIGNING
+        # CREDENTIALS was the one left outside that control. Checked before the
+        # client is constructed so a dirty environment is a startup failure,
+        # never a dispatched request. `check_proxy_env` is threaded from
+        # `BREEZY_ALLOW_PROXY_ENV` so this adapter and the ingest client obey
+        # one operator switch rather than two.
+        if check_proxy_env:
+            assert_clean_proxy_env(approved_proxy_env_vars)
         if timeout_secs <= 0:
             raise ValueError(f"timeout_secs must be positive; got {timeout_secs}")
         if not default_headers.get("User-Agent"):
@@ -287,6 +346,18 @@ class NautilusHttpTransport:
                 f"GET {redact_url(url)} failed at the transport layer "
                 f"(quota_key={quota_key}): {type(exc).__name__}"
             ) from None
+        status = int(response.status)
+        if REDIRECT_STATUS_LOWER <= status < REDIRECT_STATUS_UPPER:
+            # Refused, never decoded and never trusted. Only the status and the
+            # redacted URL reach the message: the request headers -- which are
+            # the credential -- are never echoed into an exception or a log.
+            raise VenueTransportError(
+                f"GET {redact_url(url)} returned a redirect status {status} "
+                f"(quota_key={quota_key}). Breezy refuses to follow a redirect on "
+                "the venue read path: the credential headers are custom "
+                "'X-PM-*' names, which reqwest does not strip on a cross-host "
+                "hop. Escalate rather than reroute."
+            )
         return VenueResponse(
             status=int(response.status),
             headers=dict(response.headers),

@@ -302,15 +302,38 @@ class TestTeardownOrder:
 
 class TestErrorReporting:
     def test_missing_required_setting_exits_non_zero_with_a_clear_message(self) -> None:
+        """G-19 B4 moved ``BREEZY_SITES`` off this list.
+
+        The city universe is a venue FACT and is now derived from the site
+        registry when unset. ``BREEZY_CATALOG_BASE`` is a deploy path -- an
+        operator enablement ceiling -- and stays required, so it is the
+        variable an empty environment must now name.
+        """
         stderr = io.StringIO()
 
         code = cli.run(env={}, node_factory=FakeNode, probe=local_probe, stderr=stderr)
 
         assert code == cli.EXIT_CONFIG_ERROR
         message = stderr.getvalue()
-        assert "BREEZY_SITES" in message
+        assert "BREEZY_CATALOG_BASE" in message
         assert "Traceback" not in message
         assert FakeNode.instances == []
+
+    def test_an_unset_site_list_starts_on_the_derived_registry_default(
+        self, env: dict[str, str]
+    ) -> None:
+        """The G-19 deliverable at the process boundary: no recited venue fact."""
+        stderr = io.StringIO()
+
+        code = cli.run(
+            env={key: value for key, value in env.items() if key != "BREEZY_SITES"},
+            node_factory=FakeNode,
+            probe=local_probe,
+            stderr=stderr,
+        )
+
+        assert code == cli.EXIT_OK
+        assert stderr.getvalue() == ""
 
     def test_missing_user_agent_exits_as_configuration_error(
         self, env: dict[str, str], monkeypatch: pytest.MonkeyPatch

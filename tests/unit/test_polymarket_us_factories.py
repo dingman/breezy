@@ -101,11 +101,16 @@ class StubTransport:
         default_quota: Any,
         keyed_quotas: list[tuple[str, Any]],
         default_headers: dict[str, str],
+        permitted_quota_keys: frozenset[str] | None = None,
+        check_proxy_env: bool = True,
+        approved_proxy_env_vars: frozenset[str] | None = None,
     ) -> None:
         self.timeout_secs = timeout_secs
         self.default_quota = default_quota
         self.keyed_quotas = keyed_quotas
         self.default_headers = dict(default_headers)
+        self.check_proxy_env = check_proxy_env
+        self.approved_proxy_env_vars = approved_proxy_env_vars
         StubTransport.instances.append(self)
 
     async def get(
@@ -394,19 +399,24 @@ def test_config_from_env_builds_the_documented_configuration() -> None:
     assert config.signing_variant == SigningVariant.PATH_ONLY
 
 
-def test_config_from_env_names_every_unset_variable_in_one_error() -> None:
+def test_config_from_env_names_the_only_required_variable() -> None:
+    """G-19: only the contact string is an operator input.
+
+    The four venue-fact variables are optional overrides, so an empty
+    environment must not accuse the operator of failing to supply them.
+    """
     with pytest.raises(SettingsError) as excinfo:
         config_from_env({})
 
     message = str(excinfo.value)
+    assert USER_AGENT_ENV_VAR in message
     for name in (
         API_BASE_ENV_VAR,
         GATEWAY_BASE_ENV_VAR,
         WS_URL_ENV_VAR,
         DISCOVERY_RELOAD_INTERVAL_ENV_VAR,
-        USER_AGENT_ENV_VAR,
     ):
-        assert name in message
+        assert name not in message
 
 
 def test_config_from_env_rejects_a_non_integer_reload_interval() -> None:

@@ -1,12 +1,12 @@
 """Barrier F1: the venue fee schedule fails closed in SUBSTANCE, not in prose.
 
 Why this file exists (the defect it pins). ``parsing.parse_binary_option``
-constructs ``BinaryOption`` without passing ``maker_fee``/``taker_fee``.
-Nautilus defaults them with ``maker_fee or Decimal(0)``
-(``model/instruments/binary_option.pyx:148-149``), so every instrument this
-adapter loads carries a *real, valid, typed* ``Decimal(0)`` in the two fields
-that generic Nautilus machinery actually reads --
-``MakerTakerFeeModel.get_commission`` multiplies notional by
+originally constructed ``BinaryOption`` without passing
+``maker_fee``/``taker_fee``. Nautilus defaults them with
+``maker_fee or Decimal(0)`` (``model/instruments/binary_option.pyx:148-149``),
+so every instrument this adapter loaded carried a *real, valid, typed*
+``Decimal(0)`` in the two fields that generic Nautilus machinery actually
+reads -- ``MakerTakerFeeModel.get_commission`` multiplies notional by
 ``instrument.maker_fee``/``instrument.taker_fee`` and nothing else
 (``backtest/models/fee.pyx:96-99``). The ``fee_schedule_status="UNKNOWN"``
 marker lived only in the loosely-typed ``info`` dict, which nothing was forced
@@ -17,6 +17,15 @@ The venue fee is not negligible: ``fee = theta * C * p * (1 - p)`` with a
 taker ``theta`` of 0.06, i.e. $1.50 per 100 contracts at p=0.50
 (``polymarket-us-integration`` skill, "Fee Formula"). A silent zero inflates
 apparent edge on every quote and bleeds real money once execution lands.
+
+UPDATE 2026-08-26 (G-15). ``theta`` is published per market in every captured
+payload, so the schedule is now DERIVED and marked ``KNOWN``, the fee itself
+is carried by ``fees.PolymarketUSFeeModel``, and the two flat fields carry
+``theta`` rather than zero. This barrier is NOT thereby retired, for two
+reasons that are each pinned by a test below: the zero still appears verbatim
+whenever the venue omits ``feeCoefficient``, and ``theta`` read as a flat
+notional rate is still the wrong number -- merely wrong in the safe
+(overstating) direction.
 
 The fix has two halves, and this file proves both:
 
@@ -95,7 +104,6 @@ from typing import Any
 
 import pytest
 from nautilus_trader.model.instruments import BinaryOption
-from nautilus_trader.model.objects import Price, Quantity
 
 from breezy.adapters.polymarket_us.errors import (
     FeeScheduleUnknownError,
@@ -259,50 +267,82 @@ def open_instrument(open_market: dict[str, Any]) -> BinaryOption:
     return parse_binary_option(open_market, venue=POLYMARKET_US_VENUE, ts_init=TS_INIT)
 
 
+@pytest.fixture
+def unknown_instrument(open_market: dict[str, Any]) -> BinaryOption:
+    """A market whose ``feeCoefficient`` the venue did not send.
+
+    The guard tests below need a genuinely UNKNOWN instrument. Since
+    2026-08-26 the captured open market parses to KNOWN, so the UNKNOWN case
+    is constructed by removing the field rather than by relying on the
+    adapter never resolving a schedule.
+    """
+    del open_market["market"]["feeCoefficient"]
+    return parse_binary_option(open_market, venue=POLYMARKET_US_VENUE, ts_init=TS_INIT)
+
+
 # ---------------------------------------------------------------------------
 # The hazard itself, pinned rather than certified as acceptable
 # ---------------------------------------------------------------------------
 
 
-def test_the_typed_fee_fields_hold_a_real_zero_that_a_generic_fee_model_would_trust(
+def test_the_flat_fee_fields_carry_theta_and_are_defended_only_by_barrier_f2(
     open_instrument: BinaryOption,
 ) -> None:
-    """Reproduce the CRITICAL finding: the zero is real, typed, and usable.
+    """The zero is gone; what replaced it is NOT thereby "conservative".
 
-    This test does NOT certify ``Decimal(0)`` as acceptable -- it pins the
-    hazard, so the guard below has something to guard. It replays the exact
-    arithmetic of ``MakerTakerFeeModel.get_commission``
-    (``backtest/models/fee.pyx:96-99``) and shows the commission it would
-    charge is $0.00 where the venue's own schedule charges $1.50.
+    Until 2026-08-26 these fields held ``Decimal(0)`` -- a real, typed,
+    usable zero that ``MakerTakerFeeModel.get_commission`` would have charged
+    as a FREE venue (``backtest/models/fee.pyx:96-99``). They now carry the
+    market's own ``theta``.
+
+    That is better, and it is still wrong. Read as a flat notional rate
+    ``theta`` overstates by ``theta * C * p^2``, and the RELATIVE error is
+    ``1/(1-p)`` -- unbounded as ``p -> 1``, and it destroys the venue fee's
+    symmetry about ``p = 0.50``. That is a directional tilt toward the cheap
+    side of every book, not a conservative haircut. The full comparison of
+    the two REAL models lives in ``test_polymarket_us_fee_model.py``; kept
+    out of this file so the property has exactly one home.
+
+    Setting the fields back to zero would be strictly WORSE, because the
+    status is now KNOWN: the guard would open and a default
+    ``MakerTakerFeeModel`` would charge nothing at all. Neither value is safe
+    while a default fee model can reach a venue, which is what barrier F2
+    below forbids.
     """
-    fill_qty = Quantity.from_int(100)
-    fill_px = Price.from_str("0.500")
-    notional = open_instrument.notional_value(
-        quantity=fill_qty,
-        price=fill_px,
-        use_quote_for_inverse=False,
-    )
+    assert_fee_schedule_known(open_instrument)
 
-    # The two lines a generic Nautilus fee model executes, verbatim.
-    maker_commission = notional.as_decimal() * open_instrument.maker_fee
-    taker_commission = notional.as_decimal() * open_instrument.taker_fee
-    assert maker_commission == Decimal(0)
-    assert taker_commission == Decimal(0)
-
-    # What the venue would actually charge: theta * C * p * (1 - p).
-    theta = Decimal(str(open_instrument.info["fee_coefficient"]))
-    price = fill_px.as_decimal()
-    venue_taker_fee = theta * fill_qty.as_decimal() * price * (Decimal(1) - price)
+    theta = Decimal(open_instrument.info["fee_coefficient"])
     assert theta == Decimal("0.06")
-    assert venue_taker_fee == Decimal("1.500")
-    assert taker_commission != venue_taker_fee
+    assert open_instrument.maker_fee == theta
+    assert open_instrument.taker_fee == theta
+    assert open_instrument.taker_fee != Decimal(0), "a zero here would read as a FREE venue"
 
 
-def test_the_info_marker_alone_binds_nobody_which_is_why_the_guard_exists(
-    open_instrument: BinaryOption,
+def test_an_instrument_whose_coefficient_the_venue_never_sent_still_holds_the_zero(
+    open_market: dict[str, Any],
 ) -> None:
-    """The marker is present and correct -- and is not, by itself, enforcement."""
-    assert open_instrument.info[FEE_SCHEDULE_STATUS_KEY] == FEE_SCHEDULE_STATUS_UNKNOWN
+    """The original hazard is unchanged wherever the venue stays silent.
+
+    This is why barrier F1 below is still load-bearing rather than historical.
+    """
+    del open_market["market"]["feeCoefficient"]
+    instrument = parse_binary_option(open_market, venue=POLYMARKET_US_VENUE, ts_init=TS_INIT)
+
+    assert instrument.info[FEE_SCHEDULE_STATUS_KEY] == FEE_SCHEDULE_STATUS_UNKNOWN
+    assert instrument.maker_fee == Decimal(0)
+    assert instrument.taker_fee == Decimal(0)
+
+
+def test_the_info_marker_is_derived_from_the_payload_and_binds_nobody_by_itself(
+    open_instrument: BinaryOption,
+    open_market: dict[str, Any],
+) -> None:
+    """KNOWN is written only when a coefficient was actually parsed."""
+    assert open_instrument.info[FEE_SCHEDULE_STATUS_KEY] == FEE_SCHEDULE_STATUS_KNOWN
+
+    del open_market["market"]["feeCoefficient"]
+    silent = parse_binary_option(open_market, venue=POLYMARKET_US_VENUE, ts_init=TS_INIT)
+    assert silent.info[FEE_SCHEDULE_STATUS_KEY] == FEE_SCHEDULE_STATUS_UNKNOWN
     assert FEE_SCHEDULE_STATUS_UNKNOWN != FEE_SCHEDULE_STATUS_KNOWN
 
 
@@ -312,25 +352,25 @@ def test_the_info_marker_alone_binds_nobody_which_is_why_the_guard_exists(
 
 
 def test_the_guard_refuses_an_instrument_whose_fee_schedule_is_unknown(
-    open_instrument: BinaryOption,
+    unknown_instrument: BinaryOption,
 ) -> None:
     with pytest.raises(FeeScheduleUnknownError, match="fee schedule"):
-        assert_fee_schedule_known(open_instrument)
+        assert_fee_schedule_known(unknown_instrument)
 
 
 def test_the_guard_failure_is_catchable_as_the_adapter_base_error(
-    open_instrument: BinaryOption,
+    unknown_instrument: BinaryOption,
 ) -> None:
     with pytest.raises(PolymarketUSError):
-        assert_fee_schedule_known(open_instrument)
+        assert_fee_schedule_known(unknown_instrument)
 
 
 def test_the_guard_names_the_two_fields_that_hold_the_misleading_zero(
-    open_instrument: BinaryOption,
+    unknown_instrument: BinaryOption,
 ) -> None:
     """An operator reading the traceback must learn WHY the zero is not a fee."""
     with pytest.raises(FeeScheduleUnknownError) as excinfo:
-        assert_fee_schedule_known(open_instrument)
+        assert_fee_schedule_known(unknown_instrument)
     message = str(excinfo.value)
     assert "maker_fee" in message
     assert "taker_fee" in message
@@ -599,3 +639,333 @@ def test_the_documented_residual_gap_is_real_and_reported_honestly() -> None:
 def test_the_repository_still_has_no_unguarded_fee_reads() -> None:
     """The tightened rule must not regress the shipped tree."""
     assert scan_unguarded_fee_reads() == []
+
+
+# ---------------------------------------------------------------------------
+# Barrier F2: no backtest venue may take the DEFAULT fee model
+# ---------------------------------------------------------------------------
+#
+# The defect this exists to stop, stated plainly. `PolymarketUSFeeModel`
+# computes the venue's real `theta * C * p * (1 - p)`. It had ZERO production
+# callers: no module under `src/` or `scripts/` constructed a `BacktestEngine`
+# venue at all, and the class was not even exported from the package root.
+#
+# Meanwhile `BacktestEngine.add_venue` DEFAULTS its `fee_model` argument to
+# `MakerTakerFeeModel()` (`backtest/engine.pyx:643-644`, verified):
+#
+#     if fee_model is None:
+#         fee_model = MakerTakerFeeModel()
+#
+# and the `BacktestNode` path lands in the same place: `BacktestVenueConfig`
+# defaults `fee_model=None`, `get_fee_model` returns `None` for it
+# (`backtest/node.py:872-875`), and `node.py:401` passes that straight to
+# `add_venue`. So on BOTH paths, the accurate model sits on the shelf while
+# the generic one is what actually runs, reading `instrument.taker_fee` and
+# nothing else (`backtest/models/fee.pyx:96-99`).
+#
+# That generic read is not a conservative haircut. It computes `theta*C*p`
+# against the venue's `theta*C*p*(1-p)`: absolute error `theta*C*p^2`,
+# RELATIVE error `1/(1-p)` -- unbounded as `p -> 1` -- and it destroys the
+# venue fee's symmetry about `p = 0.50`, so a YES at p=0.90 and a NO at p=0.10
+# (identically priced by the venue, $0.54 each) are charged $5.40 and $0.60.
+# For a weather bot, confident forecasts land exactly in the worst region.
+#
+# Setting the flat fields back to `Decimal(0)` is NOT the fix: the schedule is
+# now KNOWN, so the F1 guard opens, and a generic model would then charge
+# NOTHING -- a real, valid zero that reads as a free venue. Understating is
+# strictly worse than overstating. Neither flat value is safe while a default
+# fee model can reach a venue.
+#
+# Hence: keep the flat fields at `theta` (so a circumvention errs in the
+# overstating direction) and make them UNREACHABLE. There is no such call site
+# in the repository today. This barrier lands NOW, before one appears, so it
+# goes RED the moment somebody adds a default-fee-model venue.
+#
+# RULE F2, stated so it is falsifiable:
+#
+#   Step 1 -- scan EVERY module under `src/` and `scripts/`. Unlike F1 there
+#   is no venue-touching filter: a backtest-wiring module need not import the
+#   adapter or name the venue host to construct an engine that trades
+#   Polymarket.us instruments, so classifier exemption would be a hole.
+#
+#   Step 2 -- collect every `ast.Call` whose callee name is `add_venue` (the
+#   engine path) or `BacktestVenueConfig` (the node path, which reaches
+#   `add_venue` through `node.py:401`).
+#
+#   Step 3 -- a call is EXEMPT only if it carries a `fee_model=` keyword whose
+#   value expression mentions `PolymarketUSFeeModel`, as a `Name`, as an
+#   `Attribute`, or inside a string constant (which is how
+#   `ImportableFeeModelConfig(fee_model_path=...)` names a class). Anything
+#   else -- omitted, `None`, a different model, or a `**kwargs` splat that
+#   hides the argument -- is a violation.
+#
+# RESIDUAL GAPS, stated rather than papered over:
+#
+#   H1 -- indirection. `fee_model=pick()` where `pick()` returns the default
+#   passes if the returned expression is not visible at the call site. Same
+#   class of gap as F1's G3, and the same deliberate per-call-site scope.
+#
+#   H2 -- a fee model wired through a config file or environment lookup rather
+#   than source. Nothing in the repository does this; if it ever does, this
+#   barrier must be extended rather than exempted.
+
+#: Venue-construction callees that reach `BacktestEngine.add_venue`.
+_VENUE_CONSTRUCTORS = frozenset({"add_venue", "BacktestVenueConfig"})
+
+#: The only fee model a Polymarket.us backtest venue may be given.
+_REQUIRED_FEE_MODEL = "PolymarketUSFeeModel"
+
+
+@dataclass(frozen=True, slots=True)
+class VenueFeeViolation:
+    path: str
+    lineno: int
+    detail: str
+
+    def __str__(self) -> str:
+        return f"{self.path}:{self.lineno}: [F2] {self.detail}"
+
+
+def _mentions_required_fee_model(node: ast.AST) -> bool:
+    """True when ``PolymarketUSFeeModel`` appears anywhere in ``node``.
+
+    Covers the three ways it can legitimately be named: bare (``Name``),
+    qualified (``Attribute``, e.g. ``fees.PolymarketUSFeeModel``), and as a
+    string inside an ``ImportableFeeModelConfig(fee_model_path=...)``.
+    """
+    for child in ast.walk(node):
+        if isinstance(child, ast.Name) and child.id == _REQUIRED_FEE_MODEL:
+            return True
+        if isinstance(child, ast.Attribute) and child.attr == _REQUIRED_FEE_MODEL:
+            return True
+        if (
+            isinstance(child, ast.Constant)
+            and isinstance(child.value, str)
+            and _REQUIRED_FEE_MODEL in child.value
+        ):
+            return True
+    return False
+
+
+def find_default_fee_model_venues(path: str, source: str) -> list[VenueFeeViolation]:
+    """Apply rule F2 to one module. No venue-touching exemption -- see Step 1."""
+    tree = ast.parse(source, filename=path)
+
+    violations: list[VenueFeeViolation] = []
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        func = node.func
+        name = func.attr if isinstance(func, ast.Attribute) else getattr(func, "id", "")
+        if name not in _VENUE_CONSTRUCTORS:
+            continue
+
+        keyword = next((kw for kw in node.keywords if kw.arg == "fee_model"), None)
+        if keyword is None:
+            violations.append(
+                VenueFeeViolation(
+                    path,
+                    node.lineno,
+                    f"{name}(...) omits `fee_model=`; BacktestEngine.add_venue then "
+                    f"defaults to MakerTakerFeeModel (backtest/engine.pyx:643-644), "
+                    f"which reads instrument.taker_fee as a flat notional rate. Pass "
+                    f"fee_model={_REQUIRED_FEE_MODEL}().",
+                )
+            )
+        elif not _mentions_required_fee_model(keyword.value):
+            violations.append(
+                VenueFeeViolation(
+                    path,
+                    node.lineno,
+                    f"{name}(...) passes a `fee_model=` that does not name "
+                    f"{_REQUIRED_FEE_MODEL}; the Polymarket.us fee is "
+                    f"theta * C * p * (1 - p) and no flat rate can express it.",
+                )
+            )
+    return violations
+
+
+def scan_default_fee_model_venues(
+    roots: tuple[str, ...] = FEE_SCAN_ROOTS,
+) -> list[VenueFeeViolation]:
+    return [
+        v
+        for path, src in iter_python_sources(roots)
+        for v in find_default_fee_model_venues(path, src)
+    ]
+
+
+def test_no_module_constructs_a_backtest_venue_without_the_venue_fee_model() -> None:
+    """THE barrier. Goes RED the moment a default-fee-model venue appears."""
+    violations = scan_default_fee_model_venues()
+    assert violations == [], (
+        "F2 violations (a BacktestEngine venue would silently use "
+        "MakerTakerFeeModel, which reads the flat maker_fee/taker_fee fields as "
+        "notional rates -- unbounded relative error as p -> 1):\n"
+        + "\n".join(str(v) for v in violations)
+    )
+
+
+def test_f2_detects_an_add_venue_call_with_no_fee_model() -> None:
+    """Non-vacuity: exactly the call site that does not exist yet."""
+    source = (
+        "from nautilus_trader.backtest.engine import BacktestEngine\n"
+        "\n"
+        "def build():\n"
+        "    engine = BacktestEngine()\n"
+        "    engine.add_venue(venue=V, oms_type=O, account_type=A, starting_balances=B)\n"
+        "    return engine\n"
+    )
+    violations = find_default_fee_model_venues("src/breezy/runtime/backtest.py", source)
+
+    assert len(violations) == 1
+    assert violations[0].lineno == 5
+    assert "omits `fee_model=`" in violations[0].detail
+
+
+def test_f2_detects_an_add_venue_call_passing_an_explicit_none() -> None:
+    """`fee_model=None` is the DEFAULT spelled out, not an opt-out."""
+    source = "def build(engine):\n    engine.add_venue(venue=V, fee_model=None)\n"
+
+    assert find_default_fee_model_venues("src/breezy/runtime/backtest.py", source) != []
+
+
+def test_f2_detects_an_add_venue_call_passing_a_different_fee_model() -> None:
+    source = (
+        "from nautilus_trader.backtest.models import MakerTakerFeeModel\n"
+        "\n"
+        "def build(engine):\n"
+        "    engine.add_venue(venue=V, fee_model=MakerTakerFeeModel())\n"
+    )
+    violations = find_default_fee_model_venues("src/breezy/runtime/backtest.py", source)
+
+    assert len(violations) == 1
+    assert "does not name PolymarketUSFeeModel" in violations[0].detail
+
+
+def test_f2_detects_a_kwargs_splat_that_hides_the_fee_model_argument() -> None:
+    """`add_venue(**settings)` names no fee model, so it fails closed."""
+    source = "def build(engine, settings):\n    engine.add_venue(**settings)\n"
+
+    assert find_default_fee_model_venues("src/breezy/runtime/backtest.py", source) != []
+
+
+def test_f2_detects_the_backtest_node_config_path_as_well_as_the_engine_path() -> None:
+    """`BacktestVenueConfig(fee_model=None)` reaches the same default.
+
+    `get_fee_model` returns `None` for it (`backtest/node.py:872-875`) and
+    `node.py:401` passes that straight into `add_venue`.
+    """
+    source = (
+        "from nautilus_trader.backtest.config import BacktestVenueConfig\n"
+        "\n"
+        "CONFIG = BacktestVenueConfig(\n"
+        '    name="POLYMARKET_US", oms_type="NETTING", account_type="CASH",\n'
+        '    starting_balances=["1000 USD"],\n'
+        ")\n"
+    )
+    violations = find_default_fee_model_venues("src/breezy/runtime/backtest.py", source)
+
+    assert len(violations) == 1
+    assert "BacktestVenueConfig" in violations[0].detail
+
+
+def test_f2_accepts_an_add_venue_call_that_passes_the_venue_fee_model() -> None:
+    """Non-vacuity in the other direction: the barrier is satisfiable."""
+    source = (
+        "from breezy.adapters.polymarket_us import PolymarketUSFeeModel\n"
+        "\n"
+        "def build(engine):\n"
+        "    engine.add_venue(venue=V, fee_model=PolymarketUSFeeModel())\n"
+    )
+
+    assert find_default_fee_model_venues("src/breezy/runtime/backtest.py", source) == []
+
+
+def test_f2_accepts_a_qualified_reference_to_the_venue_fee_model() -> None:
+    source = (
+        "from breezy.adapters.polymarket_us import fees\n"
+        "\n"
+        "def build(engine):\n"
+        "    engine.add_venue(venue=V, fee_model=fees.PolymarketUSFeeModel())\n"
+    )
+
+    assert find_default_fee_model_venues("src/breezy/runtime/backtest.py", source) == []
+
+
+def test_f2_accepts_the_importable_config_spelling_used_by_backtest_node() -> None:
+    """`ImportableFeeModelConfig` names the class as a STRING path."""
+    source = (
+        "from nautilus_trader.backtest.config import BacktestVenueConfig\n"
+        "from nautilus_trader.backtest.config import ImportableFeeModelConfig\n"
+        "\n"
+        "CONFIG = BacktestVenueConfig(\n"
+        '    name="POLYMARKET_US",\n'
+        "    fee_model=ImportableFeeModelConfig(\n"
+        '        fee_model_path="breezy.adapters.polymarket_us.fees:PolymarketUSFeeModel",\n'
+        '        config_path="x:Y", config={},\n'
+        "    ),\n"
+        ")\n"
+    )
+
+    assert find_default_fee_model_venues("src/breezy/runtime/backtest.py", source) == []
+
+
+def test_f2_scans_every_module_not_only_the_venue_touching_ones() -> None:
+    """A backtest-wiring module need not look venue-touching to F1's classifier.
+
+    Pinned because exempting it would be the obvious hole: the module below
+    imports no adapter symbol and names no venue host, so F1's C1-C4
+    classifier would let it through, yet its venue trades Polymarket.us
+    instruments loaded from the catalog.
+    """
+    source = (
+        "from nautilus_trader.backtest.engine import BacktestEngine\n"
+        "\n"
+        "def build():\n"
+        "    engine = BacktestEngine()\n"
+        "    engine.add_venue(venue=V)\n"
+        "    return engine\n"
+    )
+    path = "src/breezy/runtime/health.py"
+
+    tree = ast.parse(source)
+    assert not is_venue_touching(path, tree), "precondition: F1 would exempt this module"
+    assert find_default_fee_model_venues(path, source) != []
+
+
+def test_f2_scan_covers_both_src_and_scripts() -> None:
+    scanned = {path for path, _ in iter_python_sources(FEE_SCAN_ROOTS)}
+    assert any(p.startswith("src/") for p in scanned)
+    assert any(p.startswith("scripts/") for p in scanned)
+
+
+def test_f2_ignores_an_unrelated_call_that_merely_takes_a_venue_keyword() -> None:
+    """The rule keys on the CALLEE, not on the presence of a `venue=` argument."""
+    source = "def f(client):\n    return client.add_instrument(venue=V)\n"
+
+    assert find_default_fee_model_venues("src/breezy/runtime/backtest.py", source) == []
+
+
+def test_the_engine_default_this_barrier_exists_to_stop_is_still_the_default() -> None:
+    """Contract test on the immutable foundation.
+
+    Read from the shipped ``engine.pyx`` because ``BacktestEngine.add_venue``
+    is a compiled ``cython_function_or_method`` and ``inspect.getsource``
+    raises ``TypeError`` on it.
+
+    If a future Nautilus stops defaulting ``fee_model`` to
+    ``MakerTakerFeeModel``, barrier F2's premise changes and the rationale
+    above must be re-verified rather than carried forward.
+    """
+    import nautilus_trader
+
+    engine_pyx = Path(nautilus_trader.__file__).parent / "backtest" / "engine.pyx"
+    assert engine_pyx.is_file(), f"Nautilus source not shipped at {engine_pyx}"
+
+    source = engine_pyx.read_text(encoding="utf-8")
+
+    assert "fee_model = MakerTakerFeeModel()" in source, (
+        "BacktestEngine.add_venue no longer defaults to MakerTakerFeeModel; "
+        "re-verify barrier F2's premise against the new Nautilus version"
+    )

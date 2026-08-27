@@ -37,6 +37,8 @@ from breezy.adapters.polymarket_us.signing import SigningVariant
 from breezy.runtime.settings import SettingsError
 
 VALID_KWARGS: dict[str, object] = {
+    # Deliberate test-double origin off the venue domain.
+    "allow_foreign_origin": True,
     "api_base_url": "https://api.example.invalid",
     "gateway_base_url": "https://gateway.example.invalid",
     "ws_url": "wss://api.example.invalid",
@@ -52,24 +54,31 @@ def make_config(**overrides: object) -> PolymarketUSDataClientConfig:
 
 
 def test_config_raises_settings_error_naming_each_unset_field() -> None:
-    """Every unset venue parameter is named, not just the first one found."""
+    """Every unset REQUIRED field is named, not just the first one found.
+
+    After G-19 B1/B2 exactly one field is required: ``user_agent``, a contact
+    string. The endpoint triple and the reload cadence are venue facts the bot
+    pins or derives, so their absence is not an operator error and they must
+    NOT be named here (see ``test_polymarket_us_autonomy_g19.py``).
+    """
     with pytest.raises(SettingsError) as excinfo:
         PolymarketUSDataClientConfig()
 
     message = str(excinfo.value)
-    for field in (
-        "api_base_url",
-        "gateway_base_url",
-        "ws_url",
-        "instrument_reload_interval_mins",
-        "user_agent",
-    ):
-        assert field in message
+    assert "user_agent" in message
+    for field in ("api_base_url", "gateway_base_url", "ws_url"):
+        assert field not in message
 
 
-def test_config_raises_settings_error_for_missing_reload_interval() -> None:
+def test_config_accepts_no_reload_interval_and_treats_it_as_derive() -> None:
+    """``None`` is the explicit "derive from the venue payload" sentinel."""
+    assert make_config(instrument_reload_interval_mins=None).instrument_reload_interval_mins is None
+
+
+def test_config_rejects_a_non_positive_reload_interval_override() -> None:
+    """The override is optional, never unvalidated."""
     with pytest.raises(SettingsError, match="instrument_reload_interval_mins"):
-        make_config(instrument_reload_interval_mins=None)
+        make_config(instrument_reload_interval_mins=0)
 
 
 def test_config_raises_settings_error_for_blank_discovery_category() -> None:

@@ -922,10 +922,60 @@ Status vocabulary: `TODO` / `IN PROGRESS` / `GREEN` / `BLOCKED (<unlock>)`.
   **G-18 added as a hard dependency:** starting continuous capture on a static
   slug list would silently record nothing after day one.
 - **G-15 — Fee schedule discovery.**
-  `BLOCKED (operator: live probe)`
-  `maker_fee`/`taker_fee` are `Decimal(0)`; `assert_fee_schedule_known` is
-  fail-closed. The formula `fee = theta * C * p * (1-p)` is documented but the
-  schedule is `[UNKNOWN]`.
+  `GREEN (autonomous; NOT an operator input)`
+  The previous `BLOCKED (operator: live probe)` label was **wrong**. The venue
+  publishes the fee coefficient in every market payload we had already
+  captured, so this was never an operator question and never needed a live
+  probe. Per the governing principle, venue facts are discovered by the bot,
+  never supplied by the operator.
+
+  **Evidence, re-derived 2026-08-26** by recursive sweep of
+  `docs/evidence/venue/polymarket_us/raw/*.json`:
+  - **729 market observations / 680 distinct slugs** across **11 files** that
+    contain market objects: `events_seriesId_35.json` (600),
+    `search_weather.json` (60), `markets_categories_climate.json` (20),
+    `markets_tagIds_weather.json` (20), `events_seriesId_35_active.json` (12),
+    `search_weather_seriesIds_35.json` (12), `market_closed_15806_by_id.json`,
+    `market_closed_15806_by_slug.json`, `market_open_510636_by_id.json`,
+    `market_open_510636_by_slug.json`, `markets_slug_open.json` (1 each).
+  - `feeCoefficient == 0.06` in **729/729**, with **zero** exceptions, spanning
+    both `MARKET_STATUS_OPEN` (60 slugs) and `MARKET_STATUS_RESOLVED` (620
+    slugs), so it is not an artefact of one lifecycle stage. No slug ever
+    disagrees with itself across duplicate observations.
+  - `orderPriceMinTickSize == 0.01` in **729/729**.
+  - `minimumTradeQty` **VARIES** — 378 slugs at `0.01`, 302 at `1`. Read per
+    market; never assumed. (`_increment` aborts the load if it is absent.)
+
+  Note: an earlier note circulated "7 files / 45 observations / 42 vs 3". That
+  came from a top-level-only scan and **undercounts by ~16x**; it misses every
+  market nested under `events[].markets[]`. The numbers above supersede it.
+
+  **Implemented.** `theta` is parsed per market, validated (finite, `[0,1]`),
+  and written to `info` only when actually parsed — `FEE_SCHEDULE_STATUS_KNOWN`
+  is DERIVED, never assumed. Absence leaves `UNKNOWN` and fail-closed; an
+  unusable value aborts the instrument via `InstrumentDefinitionError`. The fee
+  itself is computed by `PolymarketUSFeeModel`, a subclass of the native
+  `backtest.models.FeeModel` extension point. `maker_fee`/`taker_fee` now carry
+  `theta` rather than a zero, which can only ever OVERSTATE (the gap is
+  `theta*C*p^2 >= 0`). Barrier F1 remains green and remains load-bearing.
+
+  **STILL GENUINELY UNVERIFIED — do not read this item as more certain than it
+  is:**
+  1. **The maker coefficient.** The payload has ONE coefficient and no
+     maker/taker split. Makers are charged at the taker coefficient as a
+     deliberate conservative inference. The docs snapshot describes a maker
+     REBATE (-0.0125) which we deliberately do NOT apply, because applying an
+     unobserved rebate would understate cost. Resolve on the first observed
+     maker fill.
+  2. **The venue's exact rounding.** No captured payload states it. Banker's
+     rounding to $0.01 is implemented on the strength of the
+     `polymarket-us-integration` docs snapshot alone. Confirm against the first
+     real fill's charged commission.
+  3. **That `feeCoefficient` IS the taker coefficient.** Inferred from its
+     value (0.06) matching the documented taker theta exactly. Never stated by
+     the payload itself.
+  4. **Volume-tiered taker discounts** (0.054 / 0.045 / 0.03) are documented
+     but not applied; applying them would understate cost.
 
 ### Phase D — hard gate
 
@@ -940,9 +990,9 @@ Status vocabulary: `TODO` / `IN PROGRESS` / `GREEN` / `BLOCKED (<unlock>)`.
 
 ### Autonomous-execution note
 
-G-01..G-11 are executable without venue access, credentials or a calendar wait.
-G-12..G-17 are not, and are tracked as BLOCKED with their unlock condition
-rather than as failures. Any "all green" claim refers to the G-01..G-11 subset.
+G-01..G-11 and G-15 are executable without venue access, credentials or a calendar wait.
+G-12..G-14, G-16 and G-17 are not, and are tracked as BLOCKED with their unlock condition
+rather than as failures. Any "all green" claim refers to the G-01..G-11 + G-15 subset.
 
 ---
 

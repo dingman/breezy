@@ -167,6 +167,9 @@ def _harness(loop: asyncio.AbstractEventLoop) -> Harness:
         loop=loop,
         name=CLIENT_NAME,
         config=PolymarketUSDataClientConfig(
+            # A deliberate test-double origin off the venue domain, declared
+            # as such. The allowlist is the point of the field.
+            allow_foreign_origin=True,
             api_base_url="https://api.example.invalid",
             gateway_base_url="https://gateway.example.invalid",
             ws_url="wss://api.example.invalid",

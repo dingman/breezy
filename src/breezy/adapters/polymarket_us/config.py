@@ -16,19 +16,28 @@ with a secret-bearing annotation fails at collection time, not in production.
 Resolution happens in the factory, as
 ``developer_guide/adapters.md:263-266`` mandates.
 
-**Every venue parameter is a required input.** ``TRADING_ENABLEMENT_FINDINGS``
-(``:254-256``) forbids venue defaults, and a frozen kw-only ``msgspec`` struct
-expresses "required" with a ``None`` sentinel plus a ``__post_init__`` that
-refuses it. That check is not optional decoration: ``msgspec.Struct`` performs
-NO type validation on direct construction, so without it a misspelled
-``signing_variant`` string would be accepted here and only fail much later, at
-signing time, as an authentication error against the live venue.
+**No venue FACT is an operator input.** G-19 (``docs/plans/backlog/
+G-19-autonomy-sweep.md``) states the governing principle: the bot discovers
+anything the venue can tell it, and operator input is reserved strictly for
+enablement ceilings -- credentials, spend caps, contact strings, deploy paths.
+So the endpoint triple is PINNED here from captured venue evidence, the
+discovery cadence is DERIVED from the discovered market payloads, and the
+matching environment variables survive only as optional overrides. The single
+remaining required field is ``user_agent``: a contact string, which is an
+enablement ceiling and must never be guessed.
+
+An override is still validated. ``msgspec.Struct`` performs NO type validation
+on direct construction, so ``__post_init__`` is the only place a misspelled
+``signing_variant`` or an ``http://`` endpoint downgrade is caught before it
+becomes an authentication failure or a cleartext request against the venue.
 
 The quota, timeout and heartbeat numbers DO keep defaults, because they are
 Breezy policy rather than venue truth.
 """
 
 from __future__ import annotations
+
+from urllib.parse import urlsplit
 
 import msgspec
 from nautilus_trader.live.config import LiveDataClientConfig
@@ -42,20 +51,90 @@ from breezy.runtime.settings import SettingsError
 
 __all__ = [
     "DEFAULT_DISCOVERY_CITY_CODES",
+    "POLYMARKET_US_ALLOW_FOREIGN_ORIGIN_ENV_VAR",
+    "POLYMARKET_US_API_BASE_URL",
+    "POLYMARKET_US_GATEWAY_BASE_URL",
+    "POLYMARKET_US_ORIGIN_DOMAIN",
+    "POLYMARKET_US_WS_BASE_URL",
     "PolymarketUSDataClientConfig",
     "PolymarketUSMarketDiscoveryConfig",
 ]
 
 DEFAULT_DISCOVERY_CITY_CODES: tuple[str, ...] = ("nyc", "sfo", "mia", "mdw", "lax")
 
-#: Fields with no safe default: unset means "operator has not configured it".
-REQUIRED_FIELDS: tuple[str, ...] = (
-    "api_base_url",
-    "gateway_base_url",
-    "ws_url",
-    "instrument_reload_interval_mins",
-    "user_agent",
+#: The registrable domain every venue origin must sit under. VENUE FACT: all
+#: three pinned origins (``api``, ``gateway``, ``wss``) are hosts under it.
+POLYMARKET_US_ORIGIN_DOMAIN: str = "polymarket.us"
+
+#: The ONE deliberately-named escape from :data:`POLYMARKET_US_ORIGIN_DOMAIN`.
+#:
+#: The operator is the trust root, so this is not about distrusting them. It
+#: exists because the two ways to relocate credentialed traffic are NOT
+#: equivalently reviewed: changing a pinned constant goes through code review
+#: and git history, while setting ``POLYMARKET_US_API_BASE`` lands via a CI
+#: variable, a container spec, or a dependency mutating ``os.environ`` -- none
+#: reviewed, none traceable in the repo. Requiring a second, separately-named
+#: variable makes a staging or test-double run deliberate and makes a typo a
+#: startup failure rather than a credentialed request to a stranger.
+#:
+#: Precedent, and the decisive argument: ``breezy/ingest/http.py:558`` already
+#: host-allowlists the NWS path and re-validates every URL before a socket
+#: opens. The path carrying SIGNING CREDENTIALS was the one without it.
+POLYMARKET_US_ALLOW_FOREIGN_ORIGIN_ENV_VAR: str = "POLYMARKET_US_ALLOW_FOREIGN_ORIGIN"
+
+#: Exact value required to engage the escape. Deliberately not "any truthy
+#: string": ``true``/``yes``/``0`` must not silently unlock it.
+_ALLOW_FOREIGN_ORIGIN_VALUE: str = "1"
+
+#: Authenticated REST origin. VENUE FACT, not operator preference (G-19 B1).
+#:
+#: Evidence: ``docs/evidence/venue/polymarket_us/docs_snapshots/
+#: api-reference_introduction_2026-08-25.md:14``, the fenced block under the
+#: heading "## Authenticated API". Corroborated at ``:104`` of
+#: ``api-reference_authentication_2026-08-25.md`` (the worked signing example
+#: targets ``https://api.polymarket.us/v1/portfolio/positions``) and at
+#: ``VENUE_FACTS_2026-08-25.md:837``.
+POLYMARKET_US_API_BASE_URL: str = "https://api.polymarket.us"
+
+#: Public (unauthenticated) REST origin. VENUE FACT (G-19 B1).
+#:
+#: Evidence: ``docs/evidence/venue/polymarket_us/docs_snapshots/
+#: api-reference_introduction_2026-08-25.md:35``, the fenced block under the
+#: heading "## Public API". Corroborated by every captured public read in
+#: ``VENUE_FACTS_2026-08-25.md`` (e.g. ``:145``, ``:676``, ``:843``), each of
+#: which records a live ``GET https://gateway.polymarket.us/v1/...``.
+POLYMARKET_US_GATEWAY_BASE_URL: str = "https://gateway.polymarket.us"
+
+#: Markets WebSocket ORIGIN, path deliberately excluded. VENUE FACT (G-19 B1).
+#:
+#: Evidence: ``docs/evidence/venue/polymarket_us/docs_snapshots/
+#: api-reference_introduction_2026-08-25.md:30`` publishes
+#: ``wss://api.polymarket.us/v1/ws/markets``; the same URL appears at
+#: ``api-reference_websocket_markets_2026-08-25.md:22``. Only the ORIGIN is
+#: pinned here because the path is owned by
+#: :data:`breezy.adapters.polymarket_us.websocket.WS_PATH`, so the connected
+#: path and the SIGNED path cannot drift apart.
+POLYMARKET_US_WS_BASE_URL: str = "wss://api.polymarket.us"
+
+#: Origin fields and the single scheme each one is allowed to carry.
+#:
+#: Applied to the pinned constant AND to any environment override, so a
+#: staging host or a test double is held to the same shape as production and
+#: an accidental ``http://`` downgrade cannot reach the transport.
+ORIGIN_FIELD_SCHEMES: tuple[tuple[str, str], ...] = (
+    ("api_base_url", "https"),
+    ("gateway_base_url", "https"),
+    ("ws_url", "wss"),
 )
+
+#: Fields with no safe default: unset means "operator has not configured it".
+#:
+#: Only ONE entry survives G-19. ``user_agent`` is a contact string: a
+#: legitimate operator ceiling that the bot cannot and must not self-derive.
+#: The endpoint triple and the reload cadence were removed because both are
+#: venue facts the venue itself publishes (see the constants above and
+#: :func:`breezy.adapters.polymarket_us.data.derive_reload_delay_secs`).
+REQUIRED_FIELDS: tuple[str, ...] = ("user_agent",)
 
 #: Fields that are Breezy policy, but must still be strictly positive.
 POSITIVE_FIELDS: tuple[str, ...] = (
@@ -108,18 +187,24 @@ class PolymarketUSDataClientConfig(LiveDataClientConfig, frozen=True):
     secrets : PolymarketUSSecretsRefConfig
         Environment variable NAMES for the credentials. Never values.
     api_base_url : str
-        Authenticated REST origin, e.g. ``https://api.polymarket.us``.
+        Authenticated REST origin. Defaults to the pinned venue constant
+        :data:`POLYMARKET_US_API_BASE_URL`; set only to override (staging).
     gateway_base_url : str
-        Public REST origin, e.g. ``https://gateway.polymarket.us``.
+        Public REST origin. Defaults to :data:`POLYMARKET_US_GATEWAY_BASE_URL`.
     ws_url : str
         Markets WebSocket origin WITHOUT the path; the path is owned by
         :data:`breezy.adapters.polymarket_us.websocket.WS_PATH` so the
-        connected path and the signed path cannot drift apart.
+        connected path and the signed path cannot drift apart. Defaults to
+        :data:`POLYMARKET_US_WS_BASE_URL`.
     market_discovery : PolymarketUSMarketDiscoveryConfig
         The venue list-query and city registry used to discover markets.
-    instrument_reload_interval_mins : int
-        Required reload cadence. Nautilus supplies the reload primitive but not
-        a scheduler, and per-day weather markets need one.
+    instrument_reload_interval_mins : int | None
+        OPTIONAL fixed reload cadence, in minutes. ``None`` -- the default --
+        means "derive it from the discovered market set", which is the
+        autonomous path: every market payload carries ``startDate`` /
+        ``endDate`` / ``gameStartTime``, so the venue states its own turnover
+        instants and no operator has to recite one. See
+        :func:`breezy.adapters.polymarket_us.data.derive_reload_delay_secs`.
     user_agent : str
         A specific, contactable User-Agent. Never a generic placeholder.
     signing_variant : SigningVariant
@@ -139,9 +224,9 @@ class PolymarketUSDataClientConfig(LiveDataClientConfig, frozen=True):
     """
 
     secrets: PolymarketUSSecretsRefConfig = PolymarketUSSecretsRefConfig()
-    api_base_url: str | None = None
-    gateway_base_url: str | None = None
-    ws_url: str | None = None
+    api_base_url: str = POLYMARKET_US_API_BASE_URL
+    gateway_base_url: str = POLYMARKET_US_GATEWAY_BASE_URL
+    ws_url: str = POLYMARKET_US_WS_BASE_URL
     market_discovery: PolymarketUSMarketDiscoveryConfig = PolymarketUSMarketDiscoveryConfig()
     market_slugs: tuple[str, ...] = ()
     instrument_reload_interval_mins: int | None = None
@@ -156,6 +241,23 @@ class PolymarketUSDataClientConfig(LiveDataClientConfig, frozen=True):
     ws_heartbeat_secs: int = 20
     ws_idle_timeout_secs: int = 60
 
+    #: Escape from the venue-domain origin allowlist. NOT a secret, and
+    #: deliberately a FIELD rather than an environment read performed here.
+    #:
+    #: Two reasons it belongs on the struct. First, this module must not
+    #: consult the environment at all -- the factory owns every environment
+    #: lookup (``developer_guide/adapters.md:263-266``), and
+    #: ``test_config_module_never_imports_os`` enforces it. Second, a field is
+    #: AUDITABLE: it appears in ``config.json()`` and is hashed into the run
+    #: identifier by ``tokenize_config``, so a run that relocated its
+    #: credentialed traffic off the venue domain says so in its own record.
+    #: A hidden environment read would have left no trace.
+    #:
+    #: The factory sets it from
+    #: :data:`POLYMARKET_US_ALLOW_FOREIGN_ORIGIN_ENV_VAR`; test doubles and
+    #: staging wiring set it explicitly in code, which is reviewed.
+    allow_foreign_origin: bool = False
+
     def __post_init__(self) -> None:
         unset = [
             name
@@ -167,6 +269,20 @@ class PolymarketUSDataClientConfig(LiveDataClientConfig, frozen=True):
                 "PolymarketUSDataClientConfig requires every venue parameter to be "
                 f"set; unset or empty: {', '.join(unset)}"
             )
+        for field, scheme in ORIGIN_FIELD_SCHEMES:
+            assert_well_formed_origin(
+                field,
+                getattr(self, field),
+                scheme=scheme,
+                allow_foreign=self.allow_foreign_origin,
+            )
+        if self.instrument_reload_interval_mins is not None:
+            value = self.instrument_reload_interval_mins
+            if not isinstance(value, int) or isinstance(value, bool) or value <= 0:
+                raise SettingsError(
+                    "instrument_reload_interval_mins is an OPTIONAL override; when "
+                    f"set it must be a positive integer, was {value!r}"
+                )
         for slug in self.market_slugs:
             if not isinstance(slug, str) or not slug.strip():
                 raise SettingsError("market_slugs must not contain a blank entry")
@@ -183,14 +299,124 @@ class PolymarketUSDataClientConfig(LiveDataClientConfig, frozen=True):
             ) from exc
 
 
+def _assert_host_on_the_venue_domain(
+    field: str, origin: str, host: str, *, allow_foreign: bool
+) -> None:
+    """Refuse a host that is not the venue domain or a subdomain of it.
+
+    Three normalizations happen before the comparison, each closing a case
+    that a naive check accepts:
+
+    * a **trailing dot** (``api.polymarket.us.``) is the FQDN-root form of the
+      same host and is stripped, so it neither bypasses the check nor is
+      rejected as a stranger;
+    * a **non-ASCII host** (the Cyrillic homograph of ``api``) is refused
+      outright rather than IDNA-normalized. It is always a typo or an attack,
+      never intent, and refusing is louder than silently rewriting an operator's
+      string into a different one. A genuine internationalized label must be
+      supplied in its ``xn--`` form.
+    * the suffix match is **dot-bounded**, so ``api.polymarket.us.evil.com``
+      and ``notpolymarket.us`` are refused where a substring test accepts them.
+    """
+    normalized = host.rstrip(".")
+    if not normalized:
+        raise SettingsError(
+            f"PolymarketUSDataClientConfig.{field} must carry a host, was {origin!r}"
+        )
+    if not normalized.isascii():
+        raise SettingsError(
+            f"PolymarketUSDataClientConfig.{field} host {normalized!r} contains "
+            "non-ASCII characters. A homograph of a venue host is a typo or an "
+            "attack, never intent; supply the 'xn--' punycode form if an "
+            "internationalized label is genuinely meant."
+        )
+    if normalized == POLYMARKET_US_ORIGIN_DOMAIN or normalized.endswith(
+        f".{POLYMARKET_US_ORIGIN_DOMAIN}"
+    ):
+        return
+    if allow_foreign:
+        return
+    raise SettingsError(
+        f"PolymarketUSDataClientConfig.{field} host {normalized!r} is not "
+        f"{POLYMARKET_US_ORIGIN_DOMAIN!r} or a subdomain of it. Breezy refuses to "
+        "send signing credentials to a host outside the venue domain. If a "
+        "staging host or a test double is genuinely intended, set "
+        f"{POLYMARKET_US_ALLOW_FOREIGN_ORIGIN_ENV_VAR}="
+        f"{_ALLOW_FOREIGN_ORIGIN_VALUE} deliberately."
+    )
+
+
+def assert_well_formed_origin(
+    field: str, value: object, *, scheme: str, allow_foreign: bool = False
+) -> str:
+    """Refuse anything that is not a bare ``<scheme>://<host>`` origin.
+
+    Applied identically to the pinned venue constant and to an environment
+    override, so an override can relocate the host WITHIN the venue domain but
+    can never relax the transport: no scheme downgrade, no embedded
+    credentials, no path, query or fragment (the path is owned by the caller --
+    ``WS_PATH`` for the socket, the endpoint constants for REST -- and a path
+    here would be silently concatenated into a URL nobody wrote), and no
+    foreign host without the separately-named escape.
+
+    The value is validated EXACTLY as written. A frozen ``msgspec.Struct``
+    cannot normalize in ``__post_init__``, so accepting-and-returning a
+    stripped value while the struct keeps the raw one would mean the validator
+    inspects one string and the transport composes another -- measured:
+    ``' https://api.polymarket.us '`` composed to
+    ``' https://api.polymarket.us /v1/markets'``. Refusing a non-normalized
+    value is the only outcome that keeps the two strings identical.
+    """
+    if not isinstance(value, str) or not value.strip():
+        raise SettingsError(
+            f"PolymarketUSDataClientConfig.{field} must be a non-empty "
+            f"{scheme} origin, was {value!r}"
+        )
+    if value != value.strip():
+        raise SettingsError(
+            f"PolymarketUSDataClientConfig.{field} must carry no surrounding "
+            f"whitespace, was {value!r}. The frozen config keeps the raw string, "
+            "so a value this function had to strip is not the value the "
+            "transport would compose a URL from."
+        )
+    origin = value
+    parts = urlsplit(origin)
+    if parts.scheme != scheme:
+        raise SettingsError(
+            f"PolymarketUSDataClientConfig.{field} must use the {scheme!r} "
+            f"scheme, was {origin!r}"
+        )
+    if not parts.netloc or not parts.hostname:
+        raise SettingsError(
+            f"PolymarketUSDataClientConfig.{field} must carry a host, was {origin!r}"
+        )
+    if "@" in parts.netloc:
+        raise SettingsError(
+            f"PolymarketUSDataClientConfig.{field} must not embed credentials"
+        )
+    # Keyed on the RAW delimiters, not on the parsed components. `urlsplit`
+    # reports an EMPTY query for 'https://api.polymarket.us?' and an EMPTY
+    # fragment for '...#', so a component test passes both. The composed URL
+    # then lands on '/' while the signature covers '/v1/markets' -- the signed
+    # path and the requested path silently desync.
+    if parts.path.strip("/") or "?" in origin or "#" in origin:
+        raise SettingsError(
+            f"PolymarketUSDataClientConfig.{field} must be a bare origin with no "
+            f"path, query or fragment, was {origin!r}"
+        )
+    _assert_host_on_the_venue_domain(
+        field, origin, parts.hostname, allow_foreign=allow_foreign
+    )
+    return origin
+
+
 def _is_present(value: object) -> bool:
     """True when a required string field carries a usable value."""
     return isinstance(value, str) and bool(value.strip())
 
 
 def _is_required_field_present(name: str, value: object) -> bool:
-    if name == "instrument_reload_interval_mins":
-        return isinstance(value, int) and not isinstance(value, bool) and value > 0
+    del name  # every remaining required field is a non-empty string
     return _is_present(value)
 
 

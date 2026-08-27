@@ -81,6 +81,21 @@ _RESOLVED_STATUS_VALUES: frozenset[str] = frozenset(
 )
 
 
+#: Hard cap on discovery pages per cycle.
+#:
+#: ``_discover_markets`` otherwise terminates only on a SHORT page, which makes
+#: a hostile or broken RESPONSE the sole controller of loop termination: a host
+#: that always returns a full page loops forever, growing ``discovered``
+#: without bound, and ``initialize(reload=True)`` never returns. The venue
+#: quota makes that a slow hang and a memory leak rather than a request flood,
+#: which is exactly why it would be diagnosed late.
+#:
+#: 50 pages is roughly two orders of magnitude above the real weather universe
+#: (five cities x a handful of daily strike ladders), so it can only be reached
+#: by a payload that is already wrong.
+MAX_DISCOVERY_PAGES: int = 50
+
+
 @dataclass(frozen=True, slots=True)
 class DiscoveredMarket:
     """One weather market observed during the latest discovery cycle."""
@@ -300,7 +315,15 @@ class PolymarketUSInstrumentProvider(InstrumentProvider):
         discovered: list[DiscoveredMarket] = []
         offset = 0
         limit = self._discovery.limit
-        while True:
+        for page in range(MAX_DISCOVERY_PAGES + 1):
+            if page == MAX_DISCOVERY_PAGES:
+                raise VenuePayloadError(
+                    "Polymarket.us market discovery exceeded the "
+                    f"{MAX_DISCOVERY_PAGES}-page cap without returning a short "
+                    f"page (offset {offset}, limit {limit}). A response that "
+                    "never terminates pagination is malformed or hostile; "
+                    "refusing to keep paging."
+                )
             payload = await self._client.get_public(
                 MARKET_LIST_PATH,
                 query=self._query(offset=offset),

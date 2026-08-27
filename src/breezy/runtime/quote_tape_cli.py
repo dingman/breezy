@@ -221,10 +221,12 @@ def run(
             # terms first -- 0700, and refused outright if it is a symlink.
             prepare_quote_tape_root(settings.catalog_root)
             config = build_quote_tape_node_config(settings, data_client_config)
+            reload_override = data_client_config.instrument_reload_interval_mins
             logger.info(
-                "quote-tape recording with Polymarket.us discovery reload interval "
-                "%d minute(s)",
-                data_client_config.instrument_reload_interval_mins,
+                "quote-tape recording with Polymarket.us discovery reload cadence: %s",
+                "derived from the discovered market set (venue endDate boundaries)"
+                if reload_override is None
+                else f"operator override, {reload_override} minute(s)",
             )
         except _CONFIG_ERRORS as exc:
             _report(out, "configuration error", exc, expected=True)

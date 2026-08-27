@@ -58,7 +58,15 @@ from nautilus_trader.config import InstrumentProviderConfig
 from nautilus_trader.live.config import LiveDataClientConfig
 from nautilus_trader.live.factories import LiveDataClientFactory
 
-from breezy.adapters.polymarket_us.config import PolymarketUSDataClientConfig
+from breezy.adapters.polymarket_us.config import (
+    ORIGIN_FIELD_SCHEMES,
+    POLYMARKET_US_ALLOW_FOREIGN_ORIGIN_ENV_VAR,
+    POLYMARKET_US_API_BASE_URL,
+    POLYMARKET_US_GATEWAY_BASE_URL,
+    POLYMARKET_US_WS_BASE_URL,
+    PolymarketUSDataClientConfig,
+    assert_well_formed_origin,
+)
 from breezy.adapters.polymarket_us.data import (
     MarketsFeed,
     PolymarketUSDataClient,
@@ -76,13 +84,14 @@ from breezy.adapters.polymarket_us.transport import (
     build_keyed_quotas,
 )
 from breezy.adapters.polymarket_us.websocket import PolymarketUSMarketsWebSocket
-from breezy.runtime.settings import SettingsError
+from breezy.runtime.settings import SettingsError, proxy_env_check_enabled
 
 __all__ = [
     "API_BASE_ENV_VAR",
     "DISCOVERY_RELOAD_INTERVAL_ENV_VAR",
     "GATEWAY_BASE_ENV_VAR",
     "MARKET_SLUGS_ENV_VAR",
+    "POLYMARKET_US_ALLOW_FOREIGN_ORIGIN_ENV_VAR",
     "POLYMARKET_US_CLIENT_NAME",
     "SIGNING_VARIANT_ENV_VAR",
     "USER_AGENT_ENV_VAR",
@@ -100,12 +109,33 @@ POLYMARKET_US_CLIENT_NAME: str = "POLYMARKET_US"
 # Plan section 7. Venue-qualified rather than ``BREEZY_VENUE_*`` because Kalshi
 # is a committed second venue with a different key format, and one process will
 # eventually hold both key sets (plan D1).
+#
+# G-19 B1/B2: the first four are OPTIONAL OVERRIDES. Each names a value the
+# venue publishes about itself, so the bot pins or derives it and starts with
+# none of them set; the variable exists only to point a run at a staging host
+# or a test double.
 API_BASE_ENV_VAR: str = "POLYMARKET_US_API_BASE"
 GATEWAY_BASE_ENV_VAR: str = "POLYMARKET_US_GATEWAY_BASE"
 WS_URL_ENV_VAR: str = "POLYMARKET_US_WS_URL"
-MARKET_SLUGS_ENV_VAR: str = "POLYMARKET_US_MARKET_SLUGS"
 DISCOVERY_RELOAD_INTERVAL_ENV_VAR: str = "POLYMARKET_US_DISCOVERY_RELOAD_INTERVAL_MINS"
+MARKET_SLUGS_ENV_VAR: str = "POLYMARKET_US_MARKET_SLUGS"
+
+#: REQUIRED. A contact string is an enablement ceiling, not a venue fact: the
+#: bot cannot derive who to contact about its traffic, and must never invent a
+#: placeholder.
 USER_AGENT_ENV_VAR: str = "POLYMARKET_US_USER_AGENT"
+
+#: Maps each optional origin override to the config field it feeds. Built from
+#: :data:`ORIGIN_FIELD_SCHEMES` so the environment reader and the config
+#: validator can never disagree about which scheme a field accepts.
+_ORIGIN_ENV_VARS: tuple[tuple[str, str, str], ...] = tuple(
+    (env_var, field, scheme)
+    for env_var, (field, scheme) in zip(
+        (API_BASE_ENV_VAR, GATEWAY_BASE_ENV_VAR, WS_URL_ENV_VAR),
+        ORIGIN_FIELD_SCHEMES,
+        strict=True,
+    )
+)
 
 #: Optional. Absent means the evidence-backed default, ``PATH_ONLY``
 #: (plan section 5.1: docs snapshot ``:82,94,105`` and the SDK's
@@ -121,16 +151,62 @@ SIGNING_VARIANT_ENV_VAR: str = "POLYMARKET_US_SIGNING_VARIANT"
 #: has no stale-timestamp problem (plan section 5.3).
 WS_MARKETS_REQUIRES_AUTH: bool = True
 
+#: Exact value required to engage the origin-allowlist escape.
+_ALLOW_FOREIGN_ORIGIN_ENV_VALUE: str = "1"
+
+
+def _allow_foreign_origin(source: Mapping[str, str]) -> bool:
+    """Read the separately-named escape from the venue-domain allowlist.
+
+    Environment resolution belongs HERE, never in ``config.py``: the config is
+    a serialisation target that must consult no environment
+    (``developer_guide/adapters.md:263-266``, and
+    ``test_config_module_never_imports_os``). The answer is then carried as an
+    explicit, auditable config FIELD rather than re-read downstream.
+
+    Exact-match on ``"1"``. ``true``/``yes``/``on`` must NOT unlock it: a
+    half-remembered spelling should fail closed, loudly, at startup.
+    """
+    return (
+        source.get(POLYMARKET_US_ALLOW_FOREIGN_ORIGIN_ENV_VAR, "").strip()
+        == _ALLOW_FOREIGN_ORIGIN_ENV_VALUE
+    )
+
+
+def _origin_override(
+    source: Mapping[str, str],
+    env_var: str,
+    field: str,
+    scheme: str,
+    pinned: str,
+    *,
+    allow_foreign: bool = False,
+) -> str:
+    """Return the validated override, or the pinned venue constant."""
+    raw = source.get(env_var, "").strip()
+    if not raw:
+        return pinned
+    try:
+        return assert_well_formed_origin(
+            field, raw, scheme=scheme, allow_foreign=allow_foreign
+        )
+    except SettingsError as exc:
+        raise SettingsError(f"{env_var} is not a usable override: {exc}") from exc
+
 
 def config_from_env(
     env: Mapping[str, str] | None = None,
 ) -> PolymarketUSDataClientConfig:
     """Build a data-client config from the section 7 environment contract.
 
-    Every variable is REQUIRED with no default
-    (``TRADING_ENABLEMENT_FINDINGS.md:254-256``), and every unset one is named
-    in a single :class:`SettingsError` so an operator fixes the whole
-    environment in one pass instead of one variable per run.
+    Exactly one variable is REQUIRED: :data:`USER_AGENT_ENV_VAR`, a contact
+    string the bot cannot self-derive. Every other venue variable is an
+    OPTIONAL OVERRIDE of a value the bot already knows or derives (G-19 B1/B2),
+    so a correctly-provisioned host carries one variable, not five, and a
+    missing venue fact is never reported as an operator failure.
+
+    An override that IS present is validated exactly as strictly as the pinned
+    value: an override may relocate a host, never relax the transport.
 
     This is deliberately a module function rather than something ``create``
     does: a config that already carries endpoints must not be silently
@@ -140,39 +216,41 @@ def config_from_env(
 
     source = os.environ if env is None else env
 
-    missing: list[str] = []
-    values: dict[str, str] = {}
-    for name in (
-        API_BASE_ENV_VAR,
-        GATEWAY_BASE_ENV_VAR,
-        WS_URL_ENV_VAR,
-        DISCOVERY_RELOAD_INTERVAL_ENV_VAR,
-        USER_AGENT_ENV_VAR,
-    ):
-        raw = source.get(name, "")
-        if not raw.strip():
-            missing.append(name)
-        else:
-            values[name] = raw.strip()
-    if missing:
+    raw_user_agent = source.get(USER_AGENT_ENV_VAR, "").strip()
+    if not raw_user_agent:
         raise SettingsError(
-            "Polymarket.us venue configuration is incomplete; every variable is "
-            "required with no default. Unset or empty: " + ", ".join(missing)
+            f"{USER_AGENT_ENV_VAR} is required and has no default: it is a "
+            "contact string for venue operators, which Breezy must never "
+            "invent. Every other Polymarket.us venue variable is optional."
         )
 
-    raw_interval = values[DISCOVERY_RELOAD_INTERVAL_ENV_VAR]
-    try:
-        reload_interval = int(raw_interval)
-    except ValueError as exc:
-        raise SettingsError(
-            f"{DISCOVERY_RELOAD_INTERVAL_ENV_VAR} must be a positive integer, "
-            f"was {raw_interval!r}"
-        ) from exc
-    if reload_interval <= 0:
-        raise SettingsError(
-            f"{DISCOVERY_RELOAD_INTERVAL_ENV_VAR} must be a positive integer, "
-            f"was {raw_interval!r}"
-        )
+    api_env, gateway_env, ws_env = _ORIGIN_ENV_VARS
+    allow_foreign = _allow_foreign_origin(source)
+    api_base_url = _origin_override(
+        source, *api_env, POLYMARKET_US_API_BASE_URL, allow_foreign=allow_foreign
+    )
+    gateway_base_url = _origin_override(
+        source, *gateway_env, POLYMARKET_US_GATEWAY_BASE_URL, allow_foreign=allow_foreign
+    )
+    ws_url = _origin_override(
+        source, *ws_env, POLYMARKET_US_WS_BASE_URL, allow_foreign=allow_foreign
+    )
+
+    raw_interval = source.get(DISCOVERY_RELOAD_INTERVAL_ENV_VAR, "").strip()
+    reload_interval: int | None = None
+    if raw_interval:
+        try:
+            reload_interval = int(raw_interval)
+        except ValueError as exc:
+            raise SettingsError(
+                f"{DISCOVERY_RELOAD_INTERVAL_ENV_VAR} is an optional override; "
+                f"when set it must be a positive integer, was {raw_interval!r}"
+            ) from exc
+        if reload_interval <= 0:
+            raise SettingsError(
+                f"{DISCOVERY_RELOAD_INTERVAL_ENV_VAR} is an optional override; "
+                f"when set it must be a positive integer, was {raw_interval!r}"
+            )
     legacy_slugs: tuple[str, ...] = ()
     raw_legacy_slugs = source.get(MARKET_SLUGS_ENV_VAR, "").strip()
     if raw_legacy_slugs:
@@ -196,13 +274,14 @@ def config_from_env(
         variant = SigningVariant.PATH_ONLY
 
     return PolymarketUSDataClientConfig(
-        api_base_url=values[API_BASE_ENV_VAR],
-        gateway_base_url=values[GATEWAY_BASE_ENV_VAR],
-        ws_url=values[WS_URL_ENV_VAR],
+        api_base_url=api_base_url,
+        gateway_base_url=gateway_base_url,
+        ws_url=ws_url,
         market_slugs=legacy_slugs,
         instrument_reload_interval_mins=reload_interval,
-        user_agent=values[USER_AGENT_ENV_VAR],
+        user_agent=raw_user_agent,
         signing_variant=variant,
+        allow_foreign_origin=allow_foreign,
     )
 
 
@@ -274,9 +353,9 @@ class PolymarketUSLiveDataClientFactory(LiveDataClientFactory):
                 f"PolymarketUSDataClientConfig; got {type(config).__name__}"
             )
 
-        api_base_url = _required(config.api_base_url, field="api_base_url")
-        gateway_base_url = _required(config.gateway_base_url, field="gateway_base_url")
-        ws_url = _required(config.ws_url, field="ws_url")
+        api_base_url = config.api_base_url
+        gateway_base_url = config.gateway_base_url
+        ws_url = config.ws_url
         user_agent = _required(config.user_agent, field="user_agent")
 
         # BLOCKING filesystem I/O, deliberately performed here: `build()` runs
@@ -298,6 +377,11 @@ class PolymarketUSLiveDataClientFactory(LiveDataClientFactory):
                 book_requests_per_minute=config.book_requests_per_minute,
             ),
             default_headers={"User-Agent": user_agent},
+            # One operator switch for both transports. `reqwest` would
+            # otherwise honour HTTP_PROXY/HTTPS_PROXY on the path that carries
+            # signing credentials, which `breezy.ingest.http` has refused on
+            # its own path since it was written.
+            check_proxy_env=proxy_env_check_enabled(),
         )
         http_client = PolymarketUSHttpClient(
             transport=transport,

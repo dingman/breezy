@@ -86,6 +86,8 @@ ignore_imports = [
     "breezy.adapters.polymarket_us.credentials -> nautilus_trader",
     "breezy.adapters.polymarket_us.data -> nautilus_trader",
     "breezy.adapters.polymarket_us.factories -> nautilus_trader",
+    # Subclasses the native `backtest.models.FeeModel` extension point.
+    "breezy.adapters.polymarket_us.fees -> nautilus_trader",
     "breezy.adapters.polymarket_us.parsing -> nautilus_trader",
     "breezy.adapters.polymarket_us.provider -> nautilus_trader",
     "breezy.adapters.polymarket_us.secure -> nautilus_trader",
@@ -150,6 +152,7 @@ files = [
     # because THIS slice's doubles must not drift from the classes they model.
     "scripts/venue",
     "tests/unit/test_polymarket_us_auth_smoke.py",
+    "tests/unit/test_polymarket_us_autonomy_g19.py",
     "tests/unit/test_polymarket_us_config.py",
     "tests/unit/test_polymarket_us_credential_gate.py",
     "tests/unit/test_polymarket_us_credential_serialization.py",
@@ -162,6 +165,7 @@ files = [
     "tests/unit/test_polymarket_us_exception_leak.py",
     "tests/unit/test_polymarket_us_factories.py",
     "tests/unit/test_polymarket_us_fee_guard.py",
+    "tests/unit/test_polymarket_us_fee_model.py",
     "tests/unit/test_polymarket_us_http.py",
     "tests/unit/test_polymarket_us_package_exports.py",
     "tests/unit/test_polymarket_us_parsing.py",
@@ -169,8 +173,10 @@ files = [
     "tests/unit/test_polymarket_us_provider.py",
     "tests/unit/test_polymarket_us_quote_tape_gap.py",
     "tests/unit/test_polymarket_us_readonly_guard.py",
+    "tests/unit/test_polymarket_us_reload_resilience.py",
     "tests/unit/test_polymarket_us_redaction.py",
     "tests/unit/test_polymarket_us_secret_exposure.py",
+    "tests/unit/test_polymarket_us_series.py",
     "tests/unit/test_polymarket_us_settlement_provenance.py",
     "tests/unit/test_polymarket_us_signing.py",
     "tests/unit/test_polymarket_us_symbology.py",
@@ -178,6 +184,7 @@ files = [
     "tests/unit/test_polymarket_us_tape_routing.py",
     "tests/unit/test_polymarket_us_taxonomy.py",
     "tests/unit/test_polymarket_us_transport.py",
+    "tests/unit/test_polymarket_us_transport_security.py",
     "tests/unit/test_polymarket_us_websocket.py",
 ]
 

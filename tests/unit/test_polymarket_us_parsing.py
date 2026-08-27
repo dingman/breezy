@@ -29,13 +29,16 @@ import pytest
 from nautilus_trader.model.instruments import BinaryOption
 from nautilus_trader.model.objects import Price, Quantity
 
+from breezy.adapters.polymarket_us import parsing
 from breezy.adapters.polymarket_us.errors import (
     FeeScheduleUnknownError,
     InstrumentDefinitionError,
     VenuePayloadError,
 )
 from breezy.adapters.polymarket_us.parsing import (
+    FEE_COEFFICIENT_KEY,
     FEE_SCHEDULE_STATUS_KEY,
+    FEE_SCHEDULE_STATUS_KNOWN,
     FEE_SCHEDULE_STATUS_UNKNOWN,
     assert_fee_schedule_known,
     parse_binary_option,
@@ -44,6 +47,10 @@ from breezy.adapters.polymarket_us.parsing import (
     parse_rfc3339_nanos,
 )
 from breezy.adapters.polymarket_us.symbology import POLYMARKET_US_VENUE
+from tests.unit.conftest import (
+    MIN_CAPTURED_MARKETS,
+    iter_captured_market_payloads,
+)
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 RAW = REPO_ROOT / "docs" / "evidence" / "venue" / "polymarket_us" / "raw"
@@ -207,34 +214,186 @@ def test_info_carries_the_venue_identifiers_and_the_cluster_id(
     assert info["market_side_ids"] == ("1020784", "1020785")
 
 
-def test_fee_coefficient_is_never_mapped_to_a_maker_or_taker_fee_rate(
+def test_fee_coefficient_is_validated_and_marks_the_schedule_known(
     open_instrument: BinaryOption,
 ) -> None:
-    """``feeCoefficient`` is recorded verbatim and never promoted to a rate.
+    """``feeCoefficient`` is the venue's ``theta``, and it is DERIVED, not assumed.
 
-    ``BUILD_PLAN`` Phase 1 downgraded the .us fee schedule to ``[UNKNOWN]``;
-    ``feeCoefficient`` is the ``theta`` of ``fee = theta * C * p * (1 - p)``,
-    not a flat rate on notional, and Nautilus's ``maker_fee``/``taker_fee``
-    are flat rates. Copying 0.06 across would invent a number.
-
-    REPLACES an earlier version of this test that asserted
-    ``open_instrument.maker_fee == Decimal(0)`` and
-    ``open_instrument.taker_fee == Decimal(0)`` as the *fail-closed* property.
-    Those assertions encoded the defect: the zero is a real, typed value that
-    ``MakerTakerFeeModel`` will happily multiply by
-    (``backtest/models/fee.pyx:96-99``), so certifying it certified a
-    zero-fee illusion. The hazard and its guard are now pinned in
-    ``tests/unit/test_polymarket_us_fee_guard.py``; what remains here is the
-    only claim this test was ever entitled to make -- that ``theta`` is not
-    copied into a fee field.
+    ``theta`` is the coefficient of ``fee = theta * C * p * (1 - p)``. The
+    schedule is marked KNOWN only because a finite per-market coefficient in
+    ``[0, 1]`` was actually parsed out of this payload.
     """
     info = open_instrument.info
-    assert info[FEE_SCHEDULE_STATUS_KEY] == FEE_SCHEDULE_STATUS_UNKNOWN
-    assert info["fee_coefficient"] == "0.06"
-    assert Decimal(info["fee_coefficient"]) == Decimal("0.06")
+    assert info[FEE_SCHEDULE_STATUS_KEY] == FEE_SCHEDULE_STATUS_KNOWN
+    assert info[FEE_COEFFICIENT_KEY] == "0.06"
+    assert Decimal(info[FEE_COEFFICIENT_KEY]) == Decimal("0.06")
+    assert_fee_schedule_known(open_instrument)
 
+
+def test_the_flat_fee_fields_carry_theta_not_a_zero_and_not_a_notional_rate(
+    open_instrument: BinaryOption,
+) -> None:
+    """DECISION (a): ``maker_fee``/``taker_fee`` hold ``theta`` itself.
+
+    This is the same meaning Nautilus's own prediction-market fee model
+    assigns to those fields -- ``nautilus_pyo3.ProbabilityPriceFeeModel``
+    computes ``qty * rate * p * (1 - p)`` "using the instrument's maker or
+    taker fee rate" -- so the value follows the framework's convention rather
+    than inventing one. See ``fees.py`` for the never-understates algebra.
+
+    The previous ``Decimal(0)`` was a real, typed, usable zero that any
+    generic fee model would have charged as a FREE venue.
+    """
+    assert_fee_schedule_known(open_instrument)
+    assert open_instrument.maker_fee == Decimal("0.06")
+    assert open_instrument.taker_fee == Decimal("0.06")
+
+
+def test_the_flat_fields_are_theta_itself_and_not_a_notional_rate(
+    open_instrument: BinaryOption,
+) -> None:
+    """What the fields HOLD. What reading them generically COSTS lives elsewhere.
+
+    The test this replaces asserted
+    ``theta*C*p - theta*C*p*(1-p) == theta*C*p*p`` with both sides computed
+    from the same ``theta`` inside the test body. That is an algebraic
+    identity -- it holds for theta = 0, 0.06 and 1 alike -- so it constrained
+    nothing about the parser and survived deleting ``maker_fee=``/``taker_fee=``
+    from :func:`parse_binary_option` outright.
+
+    The property that actually matters compares the two REAL fee models on the
+    REAL instrument, and lives in ``test_polymarket_us_fee_model.py`` so it has
+    exactly one home. What belongs HERE is only the parser's own contract:
+    the fields carry the market's verbatim coefficient.
+    """
+    assert_fee_schedule_known(open_instrument)
+
+    theta = Decimal(open_instrument.info[FEE_COEFFICIENT_KEY])
+
+    assert open_instrument.maker_fee == theta
+    assert open_instrument.taker_fee == theta
+    assert theta != Decimal(0), "a zero here would read as a FREE venue"
+
+
+def test_missing_fee_coefficient_leaves_the_fee_schedule_unknown(
+    open_market: dict[str, Any],
+) -> None:
+    """Absence is UNKNOWN and fail-closed -- never a defaulted coefficient."""
+    del open_market["market"]["feeCoefficient"]
+    instrument = parse_binary_option(open_market, venue=POLYMARKET_US_VENUE, ts_init=TS_INIT)
+
+    assert instrument.info[FEE_SCHEDULE_STATUS_KEY] == FEE_SCHEDULE_STATUS_UNKNOWN
+    assert instrument.info[FEE_COEFFICIENT_KEY] is None
+    # And the flat fields fall back to BinaryOption's own placeholder zero,
+    # which is exactly why barrier F1 forces the guard to be called.
+    assert instrument.maker_fee == Decimal(0)
+    assert instrument.taker_fee == Decimal(0)
     with pytest.raises(FeeScheduleUnknownError):
-        assert_fee_schedule_known(open_instrument)
+        assert_fee_schedule_known(instrument)
+
+
+def test_a_null_fee_coefficient_is_treated_as_absent_not_as_zero(
+    open_market: dict[str, Any],
+) -> None:
+    """A JSON ``null`` must not become a free venue."""
+    open_market["market"]["feeCoefficient"] = None
+    instrument = parse_binary_option(open_market, venue=POLYMARKET_US_VENUE, ts_init=TS_INIT)
+
+    assert instrument.info[FEE_SCHEDULE_STATUS_KEY] == FEE_SCHEDULE_STATUS_UNKNOWN
+    with pytest.raises(FeeScheduleUnknownError):
+        assert_fee_schedule_known(instrument)
+
+
+@pytest.mark.parametrize(
+    "bad",
+    [
+        "not-a-number",
+        -Decimal("0.01"),
+        Decimal("1.01"),
+        True,
+        [0.06],
+        {"value": 0.06},
+        "NaN",
+        "Infinity",
+    ],
+)
+def test_invalid_fee_coefficient_is_refused_rather_than_marked_known(
+    open_market: dict[str, Any], bad: object
+) -> None:
+    """An unusable coefficient aborts the instrument, it never defaults.
+
+    Refused through the existing ``VenuePayloadError`` path so a venue schema
+    change surfaces as a failed load rather than a silently wrong fee.
+    """
+    open_market["market"]["feeCoefficient"] = bad
+    with pytest.raises(InstrumentDefinitionError, match="feeCoefficient"):
+        parse_binary_option(open_market, venue=POLYMARKET_US_VENUE, ts_init=TS_INIT)
+
+
+def test_a_zero_fee_coefficient_is_a_legitimate_known_free_market(
+    open_market: dict[str, Any],
+) -> None:
+    """Zero is IN range. A venue that says 0 is believed; silence is not.
+
+    This is the distinction the whole barrier exists to draw: a parsed zero
+    and an absent field are different facts.
+    """
+    open_market["market"]["feeCoefficient"] = 0
+    instrument = parse_binary_option(open_market, venue=POLYMARKET_US_VENUE, ts_init=TS_INIT)
+
+    assert instrument.info[FEE_SCHEDULE_STATUS_KEY] == FEE_SCHEDULE_STATUS_KNOWN
+    assert_fee_schedule_known(instrument)
+    assert instrument.taker_fee == Decimal(0)
+
+
+def test_every_captured_market_observation_parses_with_the_venue_tick_size() -> None:
+    """Parser-side corpus property, asserted over the whole capture.
+
+    The fee-schedule half of this property (status KNOWN, coefficient in
+    range) is asserted once, in ``test_polymarket_us_fee_model.py``. What
+    stays here is what this module owns: price precision, and the fact that
+    both market lifecycle stages are represented so no property below is an
+    artefact of a single stage.
+    """
+    payloads = iter_captured_market_payloads()
+    assert len(payloads) >= MIN_CAPTURED_MARKETS, (
+        f"corpus shrank to {len(payloads)}; evidence lost?"
+    )
+
+    instruments = [
+        parse_binary_option(payload, venue=POLYMARKET_US_VENUE, ts_init=TS_INIT)
+        for payload in payloads
+    ]
+
+    assert {i.price_increment for i in instruments} == {Price.from_str("0.01")}
+
+    statuses = {payload["market"].get("status") for payload in payloads}
+    assert "MARKET_STATUS_OPEN" in statuses
+    assert "MARKET_STATUS_RESOLVED" in statuses
+
+
+def test_minimum_trade_qty_is_read_per_market_because_it_varies() -> None:
+    """``minimumTradeQty`` is NOT constant across the capture.
+
+    Unlike ``feeCoefficient`` and ``orderPriceMinTickSize``, this field takes
+    two distinct values, so a global constant would be wrong for one of them.
+    """
+    payloads = iter_captured_market_payloads()
+    assert {p["market"]["minimumTradeQty"] for p in payloads} == {1, 0.01}
+
+    increments = {
+        parse_binary_option(p, venue=POLYMARKET_US_VENUE, ts_init=TS_INIT).size_increment
+        for p in payloads
+    }
+    assert increments == {Quantity.from_str("1"), Quantity.from_str("0.01")}
+
+
+def test_minimum_trade_qty_absence_aborts_rather_than_defaulting(
+    open_market: dict[str, Any],
+) -> None:
+    del open_market["market"]["minimumTradeQty"]
+    with pytest.raises(InstrumentDefinitionError, match="minimumTradeQty"):
+        parse_binary_option(open_market, venue=POLYMARKET_US_VENUE, ts_init=TS_INIT)
 
 
 def test_market_metadata_missing_tick_size_raises_rather_than_defaulting(
@@ -455,3 +614,66 @@ def test_the_documented_websocket_market_data_frame_parses(
     assert tick.bid_price == Price.from_str("0.55")
     assert tick.ask_size == Quantity.from_str("0.80")
     assert tick.ts_event == parse_rfc3339_nanos("2026-08-25T10:30:00Z", field="transactTime")
+
+
+# ---------------------------------------------------------------------------
+# Constant documentation must stay paired with its constant (F5)
+# ---------------------------------------------------------------------------
+
+
+def _sphinx_doc_comment_for(source: str, constant: str) -> str:
+    """Return the ``#:`` comment block immediately preceding ``constant``.
+
+    ``#:`` is Sphinx's "this documents the next assignment" marker, so the
+    pairing is positional: a symbol inserted between a ``#:`` block and the
+    assignment it described silently steals the documentation.
+    """
+    lines = source.splitlines()
+    index = next(
+        i
+        for i, line in enumerate(lines)
+        if line.startswith((f"{constant}:", f"{constant} ="))
+    )
+    block: list[str] = []
+    cursor = index - 1
+    while cursor >= 0 and lines[cursor].startswith("#:"):
+        block.append(lines[cursor])
+        cursor -= 1
+    return "\n".join(reversed(block))
+
+
+@pytest.mark.parametrize(
+    "constant",
+    [
+        "FEE_COEFFICIENT_KEY",
+        "FEE_SCHEDULE_STATUS_KEY",
+        "FEE_SCHEDULE_STATUS_KNOWN",
+        "FEE_SCHEDULE_STATUS_UNKNOWN",
+    ],
+)
+def test_every_fee_constant_carries_its_own_doc_comment(constant: str) -> None:
+    """A ``#:`` block inserted above the wrong symbol documents the wrong thing.
+
+    ``FEE_COEFFICIENT_KEY`` was added BETWEEN the ``#:`` comment describing
+    ``FEE_SCHEDULE_STATUS_KEY`` and that constant's own assignment. The result:
+    ``FEE_SCHEDULE_STATUS_KEY`` -- the constant the entire F1 barrier hangs on
+    -- silently lost its documentation, and ``FEE_COEFFICIENT_KEY`` acquired
+    two contradictory description lines.
+    """
+    source = Path(parsing.__file__).read_text(encoding="utf-8")
+
+    block = _sphinx_doc_comment_for(source, constant)
+
+    assert block, f"{constant} has no `#:` doc comment"
+
+
+def test_the_status_key_doc_comment_describes_the_status_and_not_the_coefficient() -> None:
+    """Non-vacuity: presence is not enough, the text must be about the right symbol."""
+    source = Path(parsing.__file__).read_text(encoding="utf-8")
+
+    status = _sphinx_doc_comment_for(source, "FEE_SCHEDULE_STATUS_KEY").lower()
+    coefficient = _sphinx_doc_comment_for(source, "FEE_COEFFICIENT_KEY").lower()
+
+    assert "resolution state" in status or "fee-schedule" in status
+    assert "theta" in coefficient
+    assert "theta" not in status, "the status key's comment must not describe theta"

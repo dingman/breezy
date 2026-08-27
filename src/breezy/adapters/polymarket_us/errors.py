@@ -21,6 +21,7 @@ __all__ = [
     "FeeScheduleUnknownError",
     "GatewayForbiddenError",
     "InstrumentDefinitionError",
+    "MakerRebateUnmodelledError",
     "MethodNotPermittedError",
     "PolymarketUSError",
     "SignatureClockSkewError",
@@ -166,18 +167,51 @@ class BoundsSemanticsError(VenuePayloadError):
 class FeeScheduleUnknownError(PolymarketUSError):
     """A fee-consuming path was reached while the venue fee schedule is UNKNOWN.
 
-    ``BinaryOption`` defaults ``maker_fee``/``taker_fee`` to ``Decimal(0)``
-    (``model/instruments/binary_option.pyx:148-149``), and generic Nautilus
-    machinery -- ``MakerTakerFeeModel.get_commission``
-    (``backtest/models/fee.pyx:96-99``) among it -- reads those typed fields
-    directly. A zero there is a REAL, VALID number, not a marker, so an
-    unresolved fee schedule silently becomes a zero-fee assumption that
-    inflates apparent edge.
+    Generic Nautilus machinery -- ``MakerTakerFeeModel.get_commission``
+    (``backtest/models/fee.pyx:96-99``) among it -- reads the typed
+    ``maker_fee``/``taker_fee`` fields directly and nothing else. Whatever
+    those fields hold IS the fee, as far as that machinery is concerned.
 
-    Raised by
+    On the UNKNOWN branch they hold ``Decimal(0)``, because ``BinaryOption``
+    defaults them via ``maker_fee or Decimal(0)``
+    (``model/instruments/binary_option.pyx:148-149``) and the adapter has no
+    coefficient to pass. A zero there is a REAL, VALID number, not a marker,
+    so an unresolved schedule silently reads as a FREE VENUE and inflates
+    apparent edge.
+
+    On the KNOWN branch they hold the market's own ``theta`` instead, which
+    is a different failure and not a milder one: read as a flat notional rate
+    it overstates by ``theta * C * p^2``, with an UNBOUNDED relative error as
+    ``p -> 1`` and the venue fee's symmetry about ``p = 0.50`` destroyed. The
+    only real defence there is barrier F2 in
+    ``tests/unit/test_polymarket_us_fee_guard.py``, which keeps a default fee
+    model off every backtest venue.
+
+    So neither branch makes the flat fields safe to read, and this guard is
+    what makes the UNKNOWN branch fail loudly rather than freely. Raised by
     :func:`~breezy.adapters.polymarket_us.parsing.assert_fee_schedule_known`,
     which every fee-consuming path must call. Not a ``VenuePayloadError``: the
     payload is fine, it is Breezy's knowledge of the schedule that is missing.
+    """
+
+
+class MakerRebateUnmodelledError(PolymarketUSError):
+    """A maker-only (post-only) order reached the fee model, which cannot price it.
+
+    The venue's documented maker coefficient is **negative** (-0.0125): a
+    REBATE, i.e. income. ``PolymarketUSFeeModel`` charges makers at the taker
+    coefficient (+theta) because no captured payload carries a maker/taker
+    split, and applying an unobserved rebate would understate cost.
+
+    That inference is safe for a TAKER gate and only for a taker gate. At
+    C=100, p=0.50 the venue would pay $0.3125 while the model charges $1.50 --
+    wrong by $1.8125 and wrong in SIGN. Any maker/posting strategy backtested
+    against it is negative by construction and therefore unevaluable, so a
+    post-only order -- an explicit maker-only intent -- is refused rather than
+    silently priced with an inverted sign.
+
+    Resolve by observing a real maker fill and recording the venue's actual
+    maker treatment, not by relaxing this refusal.
     """
 
 
