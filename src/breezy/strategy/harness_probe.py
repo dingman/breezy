@@ -19,6 +19,20 @@ receives ZERO records -- no error, no log, no failing assertion anywhere else.
 That is also semantically right: one climate day settles many markets, so
 weather is not per-instrument data.
 
+**And therefore: the strategy MUST filter on ``station`` itself.** Verified on
+a live engine -- a client-scoped subscription delivers EVERY city's
+``NwsClimateDay`` to EVERY strategy in the run, with nothing on the record
+marking it foreign, and nothing anywhere in the platform correlating a
+station with an instrument's city. A strategy that acts on the first record it
+receives will size a New York position off Chicago's temperature and log
+nothing. This is correct platform behaviour, not a defect, and it cannot be
+fixed in the harness without breaking the one-day-settles-many-markets model.
+So the probe demonstrates the filter, in :meth:`BreezyHarnessProbe.on_data`,
+deliberately: this module is the thing a new strategy gets copied from, and it
+should teach the right shape. The probe COUNTS every record that arrives (that
+is how the weather path is proved alive) and TRADES only on records whose
+``station`` matches its own.
+
 **The single order is a MARKET BUY.** MARKET so the fill is unambiguously
 TAKER: ``PolymarketUSFeeModel`` prices a maker fill at the taker coefficient,
 which is wrong in SIGN (the venue documents a *rebate*), making any
@@ -72,6 +86,12 @@ class BreezyHarnessProbeConfig(StrategyConfig, frozen=True):
     instrument_id : InstrumentId
         The market to subscribe to and trade. Supplied rather than discovered,
         so the probe stays venue-agnostic.
+    station : str | None
+        The NWS station whose records may DRIVE the trade. Records from other
+        stations are still counted -- they really do arrive (see the module
+        docstring) -- but they never place an order. ``None`` means "trade on
+        any station", which is correct only for a single-city run and is not
+        what a real strategy should copy.
     trade_quantity : Decimal
         Size of the single MARKET BUY, in contracts. Coerced to the
         instrument's own ``size_precision`` via ``Instrument.make_qty`` --
@@ -82,6 +102,7 @@ class BreezyHarnessProbeConfig(StrategyConfig, frozen=True):
 
     instrument_id: InstrumentId
     trade_quantity: Decimal
+    station: str | None = None
 
 
 class BreezyHarnessProbe(Strategy):
@@ -97,6 +118,13 @@ class BreezyHarnessProbe(Strategy):
         self.quotes: int = 0
         self.depths: int = 0
         self.weather: int = 0
+        #: Stations of every weather record that ARRIVED, in order -- including
+        #: the foreign ones. Kept because "the foreign records are delivered"
+        #: is a fact a test has to be able to assert; a strategy that silently
+        #: dropped them could not tell a foreign record from no record at all.
+        self.weather_stations: tuple[str, ...] = ()
+        #: The station of the record that actually drove the order, once one has.
+        self.traded_station: str | None = None
         self.closes: int = 0
         self.events: int = 0
         self.fills: int = 0
@@ -157,7 +185,17 @@ class BreezyHarnessProbe(Strategy):
             return
 
         self.weather += 1
+        self.weather_stations = (*self.weather_stations, data.station)
         self._record(data.ts_event, "weather", f"{data.station}:{data.climate_day.isoformat()}")
+
+        # THE FILTER. Counting happened above, unconditionally, because the
+        # foreign records genuinely arrive and pretending otherwise would hide
+        # the hazard. Trading happens only for this probe's own station: the
+        # weather subscription is client-scoped, so a two-city run hands both
+        # cities' records to both strategies, and nothing marks which is which.
+        if self.config.station is not None and data.station != self.config.station:
+            self._record(data.ts_event, "foreign", data.station)
+            return
 
         if self.orders_submitted or self._quantity is None:
             return
@@ -167,6 +205,7 @@ class BreezyHarnessProbe(Strategy):
             quantity=self._quantity,
         )
         self.orders_submitted += 1
+        self.traded_station = data.station
         self._own_order_ids.add(order.client_order_id)
         self._record(data.ts_event, "submit", f"BUY:{order.quantity}")
         self.submit_order(order)

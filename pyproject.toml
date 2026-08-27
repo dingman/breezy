@@ -112,8 +112,25 @@ ignore_imports = [
     "breezy.runtime.backtest_feed -> nautilus_trader",
     # Composes the native `BacktestEngine` and subclasses nothing.
     "breezy.runtime.backtest_harness -> nautilus_trader",
-    # Subclasses the native `Strategy`/`StrategyConfig` extension points.
-    "breezy.strategy.harness_probe -> nautilus_trader",
+    # Subscribes to the native `MessageBus` order-event topic and subclasses
+    # nothing; reads `OrderInitialized`/`OrderSide` to screen order intent.
+    "breezy.runtime.backtest_order_guard -> nautilus_trader",
+    # WILDCARD, deliberately, over the whole `breezy.strategy` subtree: every
+    # strategy subclasses the native `Strategy`/`StrategyConfig` extension
+    # points, so a per-module entry made "write a strategy" a pyproject edit
+    # that nothing in `pytest` catches. `**` (whole subtree) rather than `*`
+    # (direct children only) so a strategy in a subpackage is covered too.
+    #
+    # This does NOT weaken the architecture. The LAYERS contract above still
+    # constrains what `strategy` may import from `breezy` -- it is the TOP
+    # layer, so nothing may reach back into it, and it may only reach DOWN.
+    # All this waives is the blanket "no `nautilus_trader` anywhere" rule,
+    # whose purpose is to keep the Polymarket .com adapter out of Breezy;
+    # `nautilus_trader.trading.strategy` is the native extension point a
+    # strategy exists to subclass. Pinned by
+    # `tests/unit/test_strategy_module_gate.py`, which synthesises a brand-new
+    # strategy module and runs the real `lint-imports` over it.
+    "breezy.strategy.** -> nautilus_trader",
     "breezy.runtime.cli -> nautilus_trader",
     "breezy.runtime.composition -> nautilus_trader",
     "breezy.runtime.logging_bridge -> nautilus_trader",
@@ -245,10 +262,16 @@ disallow_subclassing_any = false
 module = ["breezy.ingest.nws_actor"]
 disallow_subclassing_any = false
 
-# `Strategy` and `StrategyConfig` are compiled Cython classes that erase to Any.
-# Named per module, never package-wide, for the same reason as above.
+# `Strategy` and `StrategyConfig` are compiled Cython classes that erase to Any,
+# so EVERY strategy trips `disallow_subclassing_any`. Package-wide by wildcard,
+# unlike the entries above: subclassing the native `Strategy` is the defining
+# act of this package rather than an exception within it, and a per-module list
+# made "write a strategy" a pyproject edit that `pytest` cannot catch -- the
+# suite stayed green at 3153 passed while `mypy` and `lint-imports` both failed.
+# Only this ONE rule is waived; every other strict check still applies here.
+# Pinned by `tests/unit/test_strategy_module_gate.py`.
 [[tool.mypy.overrides]]
-module = ["breezy.strategy.harness_probe"]
+module = ["breezy.strategy.*"]
 disallow_subclassing_any = false
 
 # Same compiled-Cython-erases-to-Any reason as above, for the two venue-slice

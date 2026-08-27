@@ -77,12 +77,41 @@ def _probe(tape: SyntheticBinaryTape) -> BreezyHarnessProbe:
     )
 
 
-def _config(tape: SyntheticBinaryTape, *, settle_at: float | None = None) -> BreezyBacktestConfig:
+def _two_cities(tape: SyntheticBinaryTape) -> list[object]:
+    """Chicago's climate day, then New York's -- foreign record FIRST."""
+    return as_backtest_data(
+        [
+            make_climate_day(
+                station="MDW",
+                tmax_f=95,
+                is_final=True,
+                retrieved_at_ns=tape.weather_ts_ns - 1,
+            ),
+            make_climate_day(
+                station="NYC",
+                tmax_f=72,
+                is_final=True,
+                retrieved_at_ns=tape.weather_ts_ns,
+            ),
+        ],
+    )
+
+
+def _config(
+    tape: SyntheticBinaryTape,
+    *,
+    settle_at: float | None = None,
+    weather: object = None,
+) -> BreezyBacktestConfig:
     price = tape.settlement_price if settle_at is None else settle_at
     return BreezyBacktestConfig(
         instruments=(tape.instrument,),
         market_data=tape.all_data(),
-        weather_data=as_backtest_data([make_climate_day(retrieved_at_ns=tape.weather_ts_ns)]),
+        weather_data=(
+            as_backtest_data([make_climate_day(retrieved_at_ns=tape.weather_ts_ns)])
+            if weather is None
+            else weather  # type: ignore[arg-type]
+        ),
         settlement_prices={tape.instrument.id: price},
         starting_balances=(Money(STARTING_BALANCE_USD, tape.instrument.quote_currency),),
     )
@@ -315,6 +344,69 @@ def test_a_contract_that_settles_at_zero_loses_the_whole_stake(
         assert position.avg_px_close == 0.0
         assert position.realized_pnl is not None
         assert position.realized_pnl.as_decimal() < Decimal(-CLIP) * losing.best_ask.as_decimal()
+    finally:
+        engine.dispose()
+
+
+# ---------------------------------------------------------------------------
+# The cost of client-scoped weather: EVERY city reaches EVERY strategy
+# ---------------------------------------------------------------------------
+
+
+def test_a_foreign_citys_weather_is_delivered_to_the_probe(
+    tape: SyntheticBinaryTape,
+) -> None:
+    """Verified platform behaviour, pinned so it cannot be mistaken for a bug.
+
+    Weather is scoped by `client_id` (it must be -- an instrument-scoped
+    subscription matches no topic and receives zero records), so a run covering
+    two cities hands BOTH cities' `NwsClimateDay` records to EVERY strategy.
+    Nothing on the record marks it foreign and nothing correlates a station
+    with an instrument's city.
+    """
+    probe = BreezyHarnessProbe(
+        BreezyHarnessProbeConfig(
+            instrument_id=tape.instrument.id,
+            trade_quantity=Decimal(CLIP),
+            station="NYC",
+        ),
+    )
+    engine = run_backtest(
+        _config(tape, weather=_two_cities(tape)),
+        strategies=(probe,),
+    )
+    try:
+        assert probe.weather == 2
+        assert probe.weather_stations == ("MDW", "NYC")
+    finally:
+        engine.dispose()
+
+
+def test_the_probe_trades_only_on_its_OWN_stations_record(
+    tape: SyntheticBinaryTape,
+) -> None:
+    """The filter the probe exists to demonstrate.
+
+    Chicago's record arrives FIRST and carries a wildly different high. A
+    strategy that acted on the first record it received -- the obvious shape,
+    and the one an author writes when nothing tells them otherwise -- would
+    size this New York position off Chicago's weather and log nothing.
+    """
+    probe = BreezyHarnessProbe(
+        BreezyHarnessProbeConfig(
+            instrument_id=tape.instrument.id,
+            trade_quantity=Decimal(CLIP),
+            station="NYC",
+        ),
+    )
+    engine = run_backtest(
+        _config(tape, weather=_two_cities(tape)),
+        strategies=(probe,),
+    )
+    try:
+        assert probe.orders_submitted == 1
+        assert probe.traded_station == "NYC"
+        assert "foreign|MDW" in "".join(probe.decisions)
     finally:
         engine.dispose()
 

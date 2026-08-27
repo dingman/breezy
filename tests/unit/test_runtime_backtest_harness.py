@@ -65,7 +65,11 @@ def test_an_instrument_closed_without_a_settlement_price_is_refused() -> None:
     tape = synthetic_binary_tape(size_precision=0)
 
     with pytest.raises(SettlementInvariantError) as excinfo:
-        assert_settlement_invariants(market_data=tape.all_data(), settlement_prices={})
+        assert_settlement_invariants(
+            instruments=(tape.instrument,),
+            market_data=tape.all_data(),
+            settlement_prices={},
+        )
 
     assert excinfo.value.invariant is SettlementInvariant.COVERAGE
     assert str(tape.instrument.id) in str(excinfo.value)
@@ -77,6 +81,7 @@ def test_a_settlement_price_for_a_DIFFERENT_instrument_does_not_satisfy_coverage
 
     with pytest.raises(SettlementInvariantError) as excinfo:
         assert_settlement_invariants(
+            instruments=(tape.instrument,),
             market_data=tape.all_data(),
             settlement_prices={ABSENT: 1.0},
         )
@@ -98,16 +103,38 @@ def test_an_end_of_session_close_needs_no_settlement_price() -> None:
         tape.instrument_close.ts_init,
     )
 
+    # The instrument is NAMED in the waiver rather than omitted from
+    # `instruments`: the CLOSE rule (which an END_OF_SESSION close does not
+    # satisfy) is proved separately in
+    # `tests/unit/test_runtime_backtest_settlement_gate.py`, and what THIS test
+    # is about is that no settlement PRICE is demanded for such a close.
     assert_settlement_invariants(
+        instruments=(tape.instrument,),
         market_data=[*tape.market_data, benign],
         settlement_prices={},
+        instruments_without_close=(tape.instrument.id,),
     )
 
 
-def test_a_run_with_no_close_at_all_needs_no_settlement_prices() -> None:
+def test_a_run_with_no_close_at_all_is_REFUSED_rather_than_vacuously_accepted() -> None:
+    """This test used to assert the opposite, and the opposite was the defect.
+
+    Derived from `market_data`, all three original invariants were satisfied by
+    a tape carrying no close at all: nothing expired, so nothing needed a
+    price, an endpoint or an ordering. The position stayed open, `realized_pnl`
+    was commission-only, and the run was green. The CLOSE rule is derived from
+    `instruments` precisely so that "nothing was configured" fails.
+    """
     tape = synthetic_binary_tape(size_precision=0)
 
-    assert_settlement_invariants(market_data=list(tape.market_data), settlement_prices={})
+    with pytest.raises(SettlementInvariantError) as excinfo:
+        assert_settlement_invariants(
+            instruments=(tape.instrument,),
+            market_data=list(tape.market_data),
+            settlement_prices={},
+        )
+
+    assert excinfo.value.invariant is SettlementInvariant.CLOSE
 
 
 # ---------------------------------------------------------------------------
@@ -125,6 +152,7 @@ def test_a_settlement_price_that_is_not_an_endpoint_is_refused(price: float) -> 
 
     with pytest.raises(SettlementInvariantError) as excinfo:
         assert_settlement_invariants(
+            instruments=(tape.instrument,),
             market_data=tape.all_data(),
             settlement_prices={tape.instrument.id: price},
         )
@@ -137,6 +165,7 @@ def test_both_endpoints_are_accepted(price: float) -> None:
     tape = synthetic_binary_tape(size_precision=0)
 
     assert_settlement_invariants(
+        instruments=(tape.instrument,),
         market_data=tape.all_data(),
         settlement_prices={tape.instrument.id: price},
     )
@@ -151,6 +180,7 @@ def test_an_extra_settlement_price_for_an_uncosed_instrument_is_still_endpoint_c
 
     with pytest.raises(SettlementInvariantError) as excinfo:
         assert_settlement_invariants(
+            instruments=(tape.instrument,),
             market_data=tape.all_data(),
             settlement_prices={tape.instrument.id: 1.0, ABSENT: 0.97},
         )
@@ -179,6 +209,7 @@ def test_a_close_that_precedes_the_last_market_data_is_refused() -> None:
 
     with pytest.raises(SettlementInvariantError) as excinfo:
         assert_settlement_invariants(
+            instruments=(tape.instrument,),
             market_data=[*tape.market_data, early],
             settlement_prices={tape.instrument.id: 1.0},
         )
@@ -199,6 +230,7 @@ def test_a_close_exactly_equal_to_the_last_market_data_ts_is_refused() -> None:
 
     with pytest.raises(SettlementInvariantError) as excinfo:
         assert_settlement_invariants(
+            instruments=(tape.instrument,),
             market_data=[*tape.market_data, tied],
             settlement_prices={tape.instrument.id: 1.0},
         )
@@ -221,15 +253,17 @@ def test_the_ordering_rule_is_per_instrument_not_global() -> None:
     )
 
     assert_settlement_invariants(
+        instruments=(early.instrument, late.instrument),
         market_data=[*early.all_data(), *late.market_data, shifted_close],
         settlement_prices={early.instrument.id: 1.0, late.instrument.id: 0.0},
     )
 
 
-def test_the_valid_synthetic_tape_satisfies_all_three_invariants() -> None:
+def test_the_valid_synthetic_tape_satisfies_every_invariant() -> None:
     tape = synthetic_binary_tape(size_precision=0, settlement_price=1.0)
 
     assert_settlement_invariants(
+        instruments=(tape.instrument,),
         market_data=tape.all_data(),
         settlement_prices={tape.instrument.id: tape.settlement_price},
     )

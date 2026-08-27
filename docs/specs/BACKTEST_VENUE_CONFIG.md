@@ -74,7 +74,7 @@ defaults to `None`, so this is the behaviour you get by doing nothing.
 | `oto_trigger_mode` | omitted (default `OtoTriggerMode.PARTIAL`) | Inert while `support_contingent_orders=False`. **Not covered by the source-level argument pin** because it is not passed. |
 | `use_message_queue` | omitted (default `True`) | An engine-internal mechanism, not a venue fact. **Not covered by the source-level argument pin.** |
 
-## 2. `account_type` — CASH, with a strategy-side guard
+## 2. `account_type` — CASH, with a harness-side guard
 
 `CashAccount.balance_impact` (`accounting/accounts/cash.pyx:489-493`) returns
 `-notional` for BUY and **`+notional` for SELL**. The `RiskEngine` check
@@ -95,8 +95,28 @@ Nautilus reserves against open **orders**, not open **positions**. Sizing logic
 then compounds off capital that does not exist, while terminal PnL arithmetic
 stays correct — so the backtest looks fine.
 
-**Therefore: `AccountType.CASH` plus a strategy-side invariant that no SELL
-exceeds the cached net long quantity for that instrument.**
+**Therefore: `AccountType.CASH` plus an invariant that no SELL exceeds the
+cached net long quantity for that instrument.**
+
+That invariant lives in **the harness**, not in each strategy. It was
+originally specified strategy-side, and that placement was wrong: it asks every
+strategy author to re-derive the rule from this paragraph, which they may never
+read. One did not, and it cost a verified live failure — a `LIMIT SELL` for 500
+contracts against a **zero** position and \$1,000 of cash was accepted and
+filled 50, with no rejection and no warning anywhere.
+
+It is enforced by `breezy.runtime.backtest_order_guard.BacktestOrderGuard`,
+which subscribes to the native `events.order.*` message-bus topic and screens
+each `OrderInitialized` at **submit** time — the earliest observation point the
+framework offers (`trading/strategy.pyx:855-859` publishes it before the
+duplicate-id check, before `cache.add_order`, and before the `RiskEngine`). A
+SELL is refused when `already-working sells + this order > net long`, unless it
+is `reduce_only`. The engine's own settlement leg never passes through the
+screen: `check_instrument_expiration` adds its order to the cache directly and
+publishes no `OrderInitialized` (`backtest/engine.pyx:5952-5966`).
+
+A strategy is still free to keep its own guard, and `resting_ladder` does; what
+changed is that forgetting one is no longer silent.
 
 `BETTING` is the tempting wrong answer and is definitively wrong.
 `BettingAccount.balance_impact` (`accounting/accounts/betting.pyx:84-86`)
@@ -240,7 +260,8 @@ Ranked by (probability of getting it wrong) x (invisibility).
    The error you make *after* fixing (2).
 4. **CASH without a naked-short guard.** Free balance rises when a short fills;
    sizing compounds off phantom capital. Terminal PnL still correct, so the only
-   symptom is positions that could never have been funded.
+   symptom is positions that could never have been funded. Closed by
+   `breezy.runtime.backtest_order_guard` — see §2.
 5. **`base_currency=None`.** `BinaryOption.get_base_currency()` returns `None`,
    so both sell-check branches (`risk/engine.pyx:996`, `:1007`) evaluate False
    and **every sell check disappears.** Strictly worse than (4).
