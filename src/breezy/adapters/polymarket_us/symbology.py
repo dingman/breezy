@@ -23,30 +23,55 @@ guessed record -- for anything outside the two grammars actually observed in
 tolerable; :mod:`breezy.adapters.polymarket_us.parsing` decides it is not for a
 market the venue itself labels ``climate``.
 
-Bound tokens are stored **verbatim**. The captured market
-``tc-temp-nychigh-2026-08-25-lt79f`` carries the venue title "78 or below" and a
-description saying "less than or equal to 78F", so ``lt79`` and ``lte78``
-describe the same contract. Recording ``("lt", 79)`` states what the slug says;
-translating it to ``("lte", 78)`` would be an unevidenced venue-semantics claim.
+Bound tokens are stored **verbatim**. Recording ``("lt", 79)`` states what the
+slug says; rewriting it to ``("lte", 78)`` would be an unevidenced
+venue-semantics claim, so :class:`WeatherSlug` never does that.
 
-**And ``lt79 == lte78`` is NOT a general identity.** It holds only if the
-settlement reading is a whole degree -- and this repo has already had to
-special-case fractional and record-qualifier NWS temperatures. Worse, the
-committed captures show the two spellings actively DISAGREEING on range
-markets: ``tc-temp-laxhigh-2026-08-24-gte80lt81f`` is titled "80 to 81" and
-described as "between 80F and 81F", while a strict whole-degree reading of
-``lt81`` yields the single value 80. The bucket ladder for that day
-(``lt80``, ``gte80lt81``, ``gte82lt83``, ``gte84lt85``, ``gte86lt87``,
-``gte88``) tiles the temperature line without gaps ONLY under the venue's
-inclusive prose reading; under the literal slug reading, 81, 83, 85 and 87
-belong to no bucket at all.
+**THE SLUG IS NOT THE SOURCE OF TRUTH FOR THE COMPARATOR (G-19 B6).**
+The venue's own ``description``/``title`` are, and this module reads them
+first. The reason is empirical, not stylistic: across the 680 distinct weather
+markets in ``docs/evidence/venue/polymarket_us/raw/`` the ``lt`` token is
+**context dependent**, so no single comparator algebra can decode it.
 
-So a consumer must never treat ``<`` and ``<=`` as interchangeable on the
-strength of the slug alone. :func:`assert_bounds_cross_checked` is the loud,
-explicit cross-check: it refuses unless the caller states that the settlement
-reading is whole-degree AND the venue's own ``description``/``title``
-corroborate the interval the slug spells. It decides nothing about settlement;
-it only refuses to let an unverified comparator through.
+============================  ==========================  ==================
+slug bound segment (count)    the venue's own words        closed interval
+============================  ==========================  ==================
+``lt<N>f``          (113)     "less than or equal to N-1"  ``(None, N - 1)``
+``gte<N>f``         (112)     "greater than or equal to N" ``(N, None)``
+``gte<A>lt<B>f``    (455)     "between A and B"            ``(A, B)``
+============================  ==========================  ==================
+
+Read the ``lt`` column twice. Standalone, ``lt80`` is titled "79 or below" --
+the ordinary strict reading, upper bound ``N - 1``. Inside a range,
+``gte80lt81`` is titled "80 to 81" -- the SAME token now contributing an
+INCLUSIVE upper bound of ``N``. One offset cannot be both.
+
+The tie-break is the bucket ladder. For each of the 114 captured
+(city, measure, climate-date) groups the venue publishes a ladder of buckets;
+under the prose reading those ladders tile the whole-degree line with no gap
+and no overlap in **114 of 114** cases, and under the naive strict slug reading
+in **0 of 114** -- e.g. LAX 2026-08-24 reads ``<=79``, ``80-81``, ``82-83``,
+``84-85``, ``86-87``, ``>=88``, a perfect partition, whereas the literal slug
+reading orphans 81, 83, 85 and 87, leaving those settlement values covered by
+no contract at all. A venue cannot run that ladder, so the prose is right and
+the inferred grammar is wrong.
+
+So the slug is demoted to a CORROBORATING cross-check, and the check is the
+table above -- a recorded observation over 680/680 captured markets, not a
+comparator algebra. A bound segment outside those three families is refused
+rather than extrapolated. ``lte`` and bare ``gt`` are accepted by the token
+regex but have **never been emitted by the venue**; they decode to ``None``.
+
+**Absent or unreadable prose is a refusal, not a fallback.** Falling back to
+the slug would be falling back to a reading that is provably wrong for 455 of
+680 captured markets. :func:`assert_bounds_cross_checked` therefore raises, and
+its refusal deliberately carries no candidate interval for a caller to salvage.
+
+``lt79 == lte78`` also holds only if the settlement reading is a whole degree
+-- this repo has already had to special-case fractional and record-qualifier
+NWS temperatures -- so the caller must assert that explicitly, at the call
+site, in the traceback. :func:`assert_bounds_cross_checked` decides nothing
+about settlement; it only refuses to let an uncorroborated comparator through.
 """
 
 from __future__ import annotations
@@ -62,11 +87,18 @@ from breezy.adapters.polymarket_us.errors import BoundsSemanticsError, VenuePayl
 __all__ = [
     "INSTRUMENT_SEPARATOR",
     "POLYMARKET_US_VENUE",
+    "PROSE_BETWEEN",
+    "PROSE_GE",
+    "PROSE_LE",
+    "ClosedInterval",
+    "ProseBounds",
     "WeatherSlug",
     "assert_bounds_cross_checked",
     "assert_valid_slug",
     "instrument_id_to_slug",
+    "parse_prose_bounds",
     "parse_weather_slug",
+    "slug_closed_interval",
     "slug_to_instrument_id",
 ]
 
@@ -200,69 +232,133 @@ def _parse_bounds(raw_bounds: str) -> tuple[tuple[str, int], ...] | None:
     return tokens
 
 
-#: Venue prose spellings of a closed upper bound, e.g. "less than or equal to
-#: 78F" / "78 or below" / "78° or below".
-_PROSE_UPPER_RE: re.Pattern[str] = re.compile(
-    r"less than or equal to\s*(\d{1,3})|(\d{1,3})\D{0,3}or below", re.IGNORECASE
-)
+ClosedInterval = tuple[int | None, int | None]
 
-#: Venue prose spellings of a closed lower bound.
-_PROSE_LOWER_RE: re.Pattern[str] = re.compile(
-    r"greater than or equal to\s*(\d{1,3})|(\d{1,3})\D{0,3}or above", re.IGNORECASE
-)
+#: The three comparators the venue actually writes. Enumerated over the full
+#: recursive corpus BEFORE this parser was designed: 455 ``between``, 113
+#: ``less than or equal to``, 112 ``greater than or equal to`` across 680
+#: distinct markets, with no fourth form. Kept as a closed vocabulary so an
+#: unobserved fourth spelling fails loudly instead of being silently dropped.
+PROSE_LE: str = "<="
+PROSE_GE: str = ">="
+PROSE_BETWEEN: str = "between"
 
-#: Venue prose spellings of a closed interval, e.g. "between 80F and 81F" /
-#: "80 to 81" / "68° to 69°".
-_PROSE_INTERVAL_RE: re.Pattern[str] = re.compile(
-    r"between\s*(\d{1,3})\D{0,8}?and\s*(\d{1,3})|(\d{1,3})\D{0,3}to\s*(\d{1,3})",
+#: "between 80F and 81F", "between 64°F and 65°F" (description forms) and
+#: "80 to 81", "64° to 65°" (title / titleShort forms).
+_PROSE_BETWEEN_RE: re.Pattern[str] = re.compile(
+    r"between\s*(\d{1,3})\s*(?:°|&deg;)?\s*F?\s*and\s*(\d{1,3})"
+    r"|(?<!\d)(\d{1,3})\s*(?:°|&deg;)?\s*to\s*(\d{1,3})(?!\d)",
     re.IGNORECASE,
 )
 
-#: The closed-interval reading of each slug comparator, valid ONLY for a
-#: whole-degree settlement reading. ``lt N`` excludes ``N``, so under whole
-#: degrees its greatest member is ``N - 1``.
-_COMPARATOR_OFFSETS: dict[str, tuple[str, int]] = {
-    "lt": ("upper", -1),
-    "lte": ("upper", 0),
-    "gt": ("lower", 1),
-    "gte": ("lower", 0),
-}
+#: "less than or equal to 78F", "78 or below", "78° or below".
+_PROSE_LE_RE: re.Pattern[str] = re.compile(
+    r"less than or equal to\s*(\d{1,3})|(?<!\d)(\d{1,3})\s*(?:°|&deg;)?\s*or below",
+    re.IGNORECASE,
+)
 
-ClosedInterval = tuple[int | None, int | None]
+#: "greater than or equal to 88F", "88 or above", "88° or above".
+_PROSE_GE_RE: re.Pattern[str] = re.compile(
+    r"greater than or equal to\s*(\d{1,3})|(?<!\d)(\d{1,3})\s*(?:°|&deg;)?\s*or above",
+    re.IGNORECASE,
+)
+
+#: Every slug bound-segment family OBSERVED in the captures, mapped to the
+#: closed whole-degree interval the venue's own prose states for it. Counts and
+#: the ladder-tiling evidence are in the module docstring.
+#:
+#: This is a RECORDED OBSERVATION, not a comparator algebra, and that
+#: distinction is the whole point of B6: ``lt`` carries offset ``-1`` in the
+#: one-token family and offset ``0`` in the two-token family, so there is no
+#: per-token rule to write down. A family absent from this table is refused.
+_OBSERVED_SLUG_FAMILIES: frozenset[tuple[str, ...]] = frozenset(
+    {("lt",), ("gte",), ("gte", "lt")}
+)
 
 
-def _slug_closed_interval(bounds: tuple[tuple[str, int], ...]) -> ClosedInterval:
-    """Read ``bounds`` as an inclusive integer interval (whole degrees only)."""
-    lower: int | None = None
-    upper: int | None = None
-    for comparator, value in bounds:
-        side, offset = _COMPARATOR_OFFSETS[comparator]
-        if side == "upper":
-            upper = value + offset
-        else:
-            lower = value + offset
-    return lower, upper
+@dataclass(frozen=True, slots=True)
+class ProseBounds:
+    """Strike and comparator as stated by the venue, in the venue's own words.
+
+    This is the PRIMARY reading. ``strikes`` holds the numbers the venue
+    actually wrote, in the order it wrote them, so a consumer can render the
+    contract back without re-deriving it. ``closed_interval`` is the same
+    statement as an inclusive whole-degree interval.
+    """
+
+    comparator: str
+    strikes: tuple[int, ...]
+    closed_interval: ClosedInterval
 
 
-def _prose_closed_interval(text: str | None) -> ClosedInterval | None:
-    """Read the venue's own words as an inclusive integer interval, or ``None``."""
+def parse_prose_bounds(text: str | None) -> ProseBounds | None:
+    """Read the venue's own words into a comparator and strike, or ``None``.
+
+    ``None`` means "this adapter cannot read it", never "there is no bound".
+    Callers must treat ``None`` as a refusal; there is deliberately no
+    slug-derived fallback, because the slug's ``lt`` is provably context
+    dependent (module docstring).
+
+    A text matching more than one comparator family is also ``None``: two
+    readable-but-different statements in one field is a venue change we must
+    look at, not something to resolve by match order.
+    """
     if not isinstance(text, str) or not text.strip():
         return None
-    match = _PROSE_INTERVAL_RE.search(text)
-    if match is not None:
-        low, high = (match.group(1), match.group(2))
+
+    candidates: list[ProseBounds] = []
+
+    between = _PROSE_BETWEEN_RE.search(text)
+    if between is not None:
+        low, high = between.group(1), between.group(2)
         if low is None or high is None:
-            low, high = (match.group(3), match.group(4))
+            low, high = between.group(3), between.group(4)
         if low is not None and high is not None:
-            return int(low), int(high)
+            candidates.append(
+                ProseBounds(
+                    comparator=PROSE_BETWEEN,
+                    strikes=(int(low), int(high)),
+                    closed_interval=(int(low), int(high)),
+                )
+            )
+
+    upper = _PROSE_LE_RE.search(text)
+    if upper is not None:
+        value = int(upper.group(1) or upper.group(2))
+        candidates.append(
+            ProseBounds(comparator=PROSE_LE, strikes=(value,), closed_interval=(None, value))
+        )
+
+    lower = _PROSE_GE_RE.search(text)
+    if lower is not None:
+        value = int(lower.group(1) or lower.group(2))
+        candidates.append(
+            ProseBounds(comparator=PROSE_GE, strikes=(value,), closed_interval=(value, None))
+        )
+
+    if len(candidates) != 1:
         return None
-    match = _PROSE_UPPER_RE.search(text)
-    if match is not None:
-        return None, int(match.group(1) or match.group(2))
-    match = _PROSE_LOWER_RE.search(text)
-    if match is not None:
-        return int(match.group(1) or match.group(2)), None
-    return None
+    return candidates[0]
+
+
+def slug_closed_interval(bounds: tuple[tuple[str, int], ...]) -> ClosedInterval | None:
+    """Corroborating reading of the slug, or ``None`` for an unobserved family.
+
+    Demoted from primary to cross-check by G-19 B6. Only the three families in
+    ``_OBSERVED_SLUG_FAMILIES`` decode; everything else -- an ``lte`` token the
+    venue has never emitted, a bare ``gt``, a reversed or wider range -- returns
+    ``None`` so the gate refuses instead of extrapolating a comparator rule that
+    the corpus shows does not exist.
+    """
+    family = tuple(comparator for comparator, _ in bounds)
+    if family not in _OBSERVED_SLUG_FAMILIES:
+        return None
+    values = [value for _, value in bounds]
+    if family == ("lt",):
+        return None, values[0] - 1
+    if family == ("gte",):
+        return values[0], None
+    return values[0], values[1]
 
 
 def assert_bounds_cross_checked(
@@ -272,74 +368,102 @@ def assert_bounds_cross_checked(
     title: str | None,
     reading_is_whole_degrees: bool,
 ) -> ClosedInterval:
-    """Refuse to let a slug comparator be used until the venue prose confirms it.
+    """Derive the bounds from the venue's PROSE, corroborated by the slug.
 
     This is a REFUSAL GATE, not settlement logic: it reads no observation,
-    decides no outcome, and computes no payoff. It exists because
-    ``bounds``/``raw_bounds`` are stored verbatim (correctly), and a verbatim
-    ``lt`` is not a verified ``<``.
+    decides no outcome, and computes no payoff.
 
-    Two independent things must hold, and both are checked:
+    G-19 B6 inverted the precedence here. The venue's ``description``/``title``
+    are now the source of the strike and the comparator; the slug's verbatim
+    tokens only have to AGREE. Previously the slug was primary and the prose
+    merely cross-checked it, which refused 455 of the 680 captured markets --
+    not because the venue was ambiguous but because the inferred grammar read
+    ``lt`` with a fixed offset it does not have.
 
-    1. ``reading_is_whole_degrees`` must be ``True``. The whole identity
+    Three independent things must hold, and all three are checked:
+
+    1. ``reading_is_whole_degrees`` must be ``True``. The identity
        ``lt N == lte N-1`` collapses the moment the settlement reading carries
        a fraction, and this repo has already met fractional and
-       record-qualifier NWS temperatures. The caller has to assert the
-       assumption explicitly, at the call site, in the traceback.
-    2. The inclusive interval implied by the slug must equal the inclusive
-       interval the venue states in ``description`` or ``title``. Where both
-       are readable they must also agree with each other.
+       record-qualifier NWS temperatures. The caller asserts the assumption
+       explicitly, at the call site, in the traceback.
+    2. The venue must state an interval this adapter can read, in
+       ``description`` or ``title``. Where both are readable they must agree.
+    3. The slug's bound segment must belong to an observed family and must
+       decode to the same interval the venue states.
 
     Returns
     -------
     ClosedInterval
         The corroborated ``(lower, upper)`` inclusive bounds, either end
-        ``None`` for an open side. Returned rather than discarded so a
-        consumer has a *verified* value to use and no reason to re-derive one
-        from the raw comparator.
+        ``None`` for an open side. Returned rather than discarded so a consumer
+        has a *verified* value and no reason to re-derive one from the raw
+        comparator.
 
     Raises
     ------
     BoundsSemanticsError
-        If the whole-degree assumption is not asserted, if neither field
-        yields a readable interval, if the two fields disagree, or if the
-        venue's interval differs from the slug's. On the captured corpus the
-        last case fires for every ``gte<A>lt<B>`` range market -- that is a
-        real venue divergence, not a false positive; see the module docstring.
+        If the whole-degree assumption is not asserted, if neither prose field
+        is readable, if the two fields disagree, if the slug's family is one
+        the venue has never emitted, or if slug and prose disagree. The refusal
+        deliberately carries no candidate interval when the prose is missing:
+        there is nothing for a caller to salvage, because the slug alone is not
+        an authority on the comparator.
     """
     if not reading_is_whole_degrees:
         raise BoundsSemanticsError(
             f"Refusing to interpret bounds {weather.raw_bounds!r} of {weather.slug!r}: "
-            "the slug's comparators can only be read as an integer interval when the "
-            "settlement reading is a whole degree. A fractional or record-qualifier "
+            "the venue's stated threshold can only be read as an integer interval when "
+            "the settlement reading is a whole degree. A fractional or record-qualifier "
             "reading makes 'lt N' and 'lte N-1' different contracts."
         )
 
-    from_description = _prose_closed_interval(description)
-    from_title = _prose_closed_interval(title)
-    if from_description is None and from_title is None:
-        raise BoundsSemanticsError(
-            f"Refusing to interpret bounds {weather.raw_bounds!r} of {weather.slug!r}: "
-            "neither the venue description nor the title states an interval this "
-            "adapter can read, so the slug's comparators cannot be corroborated."
-        )
-    if from_description is not None and from_title is not None and from_description != from_title:
+    from_description = parse_prose_bounds(description)
+    from_title = parse_prose_bounds(title)
+    if (
+        from_description is not None
+        and from_title is not None
+        and from_description.closed_interval != from_title.closed_interval
+    ):
         raise BoundsSemanticsError(
             f"Venue description and title disagree for {weather.slug!r}: description "
-            f"reads {from_description}, title reads {from_title}."
+            f"reads {from_description.closed_interval}, title reads "
+            f"{from_title.closed_interval}."
         )
 
-    from_prose = from_description if from_description is not None else from_title
-    from_slug = _slug_closed_interval(weather.bounds)
-    if from_slug != from_prose:
+    from_prose: ProseBounds
+    if from_description is not None:
+        from_prose = from_description
+    elif from_title is not None:
+        from_prose = from_title
+    else:
+        raise BoundsSemanticsError(
+            f"Refusing to interpret bounds {weather.raw_bounds!r} of {weather.slug!r}: "
+            "neither the venue description nor the title states a threshold this "
+            "adapter can read, so the bounds cannot be corroborated. The slug is NOT "
+            "consulted as a fallback -- its 'lt' token means '<= N-1' standalone and "
+            "'<= N' inside a range, so it cannot decide a comparator on its own."
+        )
+
+    from_slug = slug_closed_interval(weather.bounds)
+    if from_slug is None:
+        raise BoundsSemanticsError(
+            f"Bounds {weather.raw_bounds!r} of {weather.slug!r} use a comparator family "
+            f"{tuple(c for c, _ in weather.bounds)!r} that has never been observed in a "
+            "captured Polymarket.us market. Refusing to extrapolate a comparator rule "
+            "onto an unobserved slug shape; capture the market and re-derive the "
+            "grammar before trading it."
+        )
+    if from_slug != from_prose.closed_interval:
         raise BoundsSemanticsError(
             f"Bounds {weather.raw_bounds!r} of {weather.slug!r} are not corroborated by "
-            f"the venue's own words: the slug reads {from_slug} under a whole-degree "
-            f"interpretation, the venue states {from_prose}. Do NOT treat '<' and '<=' "
-            "as interchangeable here -- resolve the venue's intended interval before "
-            "using this market for settlement."
+            f"the venue's own words: the slug decodes to {from_slug}, the venue states "
+            f"{from_prose.closed_interval} ({from_prose.comparator} "
+            f"{from_prose.strikes}). The venue's words govern -- do NOT treat '<' and "
+            "'<=' as interchangeable here; re-derive the slug grammar before using "
+            "this market for settlement."
         )
-    return from_slug
+    return from_prose.closed_interval
 
 
 def parse_weather_slug(slug: str) -> WeatherSlug | None:

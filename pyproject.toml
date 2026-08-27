@@ -170,6 +170,7 @@ files = [
     "tests/unit/test_polymarket_us_package_exports.py",
     "tests/unit/test_polymarket_us_parsing.py",
     "tests/unit/test_polymarket_us_phase0_safety.py",
+    "tests/unit/test_polymarket_us_prose_bounds.py",
     "tests/unit/test_polymarket_us_provider.py",
     "tests/unit/test_polymarket_us_quote_tape_gap.py",
     "tests/unit/test_polymarket_us_readonly_guard.py",

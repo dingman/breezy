@@ -47,12 +47,28 @@ path, strategy/backtest seam). Findings, with citations, not claims:
 
 | ID | Barrier | Location |
 |----|---------|----------|
-| B1 | HTTP dispatch `PERMITTED_METHODS` GET-only | `http.py:64`, raised `:178-181` |
-| B2 | Signer refuses non-GET | `signing.py:84`, `:260-263` |
-| B3 | Transport wraps pyo3 client in a GET-only closure | `transport.py:105-124` |
-| B4 | Quota-key allowlist has no order bucket | `transport.py:81-83` |
-| B6 | `assert_live_order_submission_permitted` + `LiveTradingPermit` | `safety.py:16,32-53` — **zero production callers today** |
-| B7 | Static barrier suite fails CI on any POST/order literal | `tests/unit/test_polymarket_us_readonly_guard.py:1-80` |
+| B1 | HTTP dispatch `PERMITTED_METHODS` GET-only | `http.py:64`, raised `:189-190` |
+| B2 | Signer refuses non-GET, before the secret is loaded | `signing.py:84`, `:260-265` |
+| B3 | Transport wraps the pyo3 client in a GET-only closure; `__slots__` blocks re-attachment | `transport.py:129-148`, `:283`; runtime scan `test_polymarket_us_readonly_guard.py:244,435` |
+| B4 | Repo-wide AST write-egress ban (V1 verb literals, V2 `/v*/orders`, V3 `.post/.put/.patch/.delete/.request`, V4 `getattr`) | `test_polymarket_us_readonly_guard.py:372` |
+| B5 | SDK signing-module import ban, prefix matched | `test_polymarket_us_readonly_guard.py:294,476` |
+| B6 | No execution client (subclass OR import); `assert_live_order_submission_permitted` has zero callers | `test_polymarket_us_readonly_guard.py:529`; `safety.py:16,32` |
+| F1 | No unguarded `maker_fee`/`taker_fee` read, call-site granular | `test_polymarket_us_fee_guard.py:432` |
+| F2 | No backtest venue may take the DEFAULT fee model | `test_polymarket_us_fee_guard.py:645` |
+
+**Not a numbered barrier, but load-bearing:** the quota-key allowlist
+`PERMITTED_QUOTA_KEYS` has no order/trade bucket (`transport.py:98-106`),
+enforced twice — `http.py:194` and `transport.py:180`.
+
+> **Numbering corrected 2026-08-27.** This table previously invented a `B7`
+> that exists nowhere in the code, and disagreed with the code about what
+> `B4` and `B5` ARE: it listed `B4` as the quota allowlist and had no `B5`,
+> while the suite defines `B4` as the write-egress scan and `B5` as the SDK
+> import ban. Four line citations were stale. The code
+> (`test_polymarket_us_readonly_guard.py:1` — "barriers B1-B6") is
+> authoritative; this table now follows it. The hazard was concrete: an
+> execution-client design reviewed as "modifies B4" could have been approved
+> against a barrier entirely different from the one it actually changes.
 
 These are features, not debt. Removing them is a Phase 4 activity with its own
 review, never an incidental side effect of adding an execution client.

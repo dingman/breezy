@@ -236,40 +236,51 @@ def test_a_single_sided_market_is_corroborated_by_the_venue_prose() -> None:
     assert verified == (None, 78)
 
 
-def test_a_range_market_is_refused_because_the_venue_prose_disagrees() -> None:
-    """The finding, made concrete on a captured market.
+def test_a_range_market_resolves_to_the_venue_prose_not_the_literal_slug() -> None:
+    """The finding, made concrete on a captured market (G-19 B6).
 
     ``gte80lt81f`` read literally under whole degrees is the single value 80;
     the venue titles it "80 to 81" and describes it as "between 80F and 81F".
     Both cannot be true. The ladder for that day (``lt80``, ``gte80lt81``,
     ``gte82lt83``, ``gte84lt85``, ``gte86lt87``, ``gte88``) only tiles the
     temperature line without gaps under the venue's inclusive reading -- so the
-    slug's ``lt`` is the spelling that must not be trusted.
+    slug's ``lt`` is the spelling that must not be trusted, and the venue's
+    words are what the gate now returns.
+
+    This previously asserted a REFUSAL. That was the right instinct pointed at
+    the wrong culprit: the venue is not ambiguous here, our inferred grammar
+    was wrong. The tripwire is preserved below -- the literal slug reading is
+    still asserted to disagree, so if the venue ever makes ``lt`` mean a fixed
+    offset this test fails and the change gets looked at.
     """
     weather = parse_weather_slug("tc-temp-laxhigh-2026-08-24-gte80lt81f")
     assert weather is not None
     assert weather.bounds == (("gte", 80), ("lt", 81))
 
-    with pytest.raises(BoundsSemanticsError, match="not corroborated"):
-        assert_bounds_cross_checked(
-            weather,
-            description=(
-                "Will the highest temperature recorded at Los Angeles International "
-                "Airport (KLAX) in Los Angeles for 2026-08-24 as reported by the "
-                "National Weather Service's Climatological Report (Daily) be between "
-                "80F and 81F?"
-            ),
-            title="80 to 81",
-            reading_is_whole_degrees=True,
-        )
+    verified = assert_bounds_cross_checked(
+        weather,
+        description=(
+            "Will the highest temperature recorded at Los Angeles International "
+            "Airport (KLAX) in Los Angeles for 2026-08-24 as reported by the "
+            "National Weather Service's Climatological Report (Daily) be between "
+            "80F and 81F?"
+        ),
+        title="80 to 81",
+        reading_is_whole_degrees=True,
+    )
+
+    assert verified == (80, 81)
+    # The tripwire: a naive strict reading of the same tokens is still wrong.
+    assert (80, 81) != (weather.bounds[0][1], weather.bounds[1][1] - 1)
 
 
-def test_every_captured_range_market_diverges_from_its_own_venue_prose() -> None:
+def test_every_captured_range_market_diverges_from_the_LITERAL_slug_reading() -> None:
     """Pin the scale of the divergence so it cannot be dismissed as a one-off.
 
-    If a future capture makes range slugs agree with their prose, this test
-    fails and the divergence must be re-examined deliberately -- which is the
-    point.
+    Every captured two-token range market disagrees with a naive strict reading
+    of its own slug, and agrees with the venue's prose. If a future capture
+    makes the literal slug reading correct, this test fails and the grammar
+    must be re-derived deliberately -- which is the point.
     """
     ranges = 0
     for slug, title, description in _iter_captured_weather_markets():
@@ -277,13 +288,20 @@ def test_every_captured_range_market_diverges_from_its_own_venue_prose() -> None
         if weather is None or len(weather.bounds) != 2:
             continue
         ranges += 1
-        with pytest.raises(BoundsSemanticsError):
-            assert_bounds_cross_checked(
-                weather,
-                description=description,
-                title=title,
-                reading_is_whole_degrees=True,
-            )
+
+        # The venue's words govern, and the gate returns them.
+        verified = assert_bounds_cross_checked(
+            weather,
+            description=description,
+            title=title,
+            reading_is_whole_degrees=True,
+        )
+        (_, lower), (_, upper) = weather.bounds
+        assert verified == (lower, upper)
+
+        # ... and the naive strict reading would have been wrong, every time.
+        assert verified != (lower, upper - 1)
+
     assert ranges > 100
 
 
