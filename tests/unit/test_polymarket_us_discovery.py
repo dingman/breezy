@@ -149,6 +149,37 @@ def test_captured_climate_list_payload_exposes_the_expected_weather_slug_set() -
     }
 
 
+def test_discovery_refuses_weather_city_without_registry_truth() -> None:
+    market = dict(wrapped_market("market_open_510636_by_slug.json"))
+    market["slug"] = "tc-temp-boshigh-2026-08-25-lt79f"
+    market["question"] = "Highest temperature in Boston on August 25?"
+    market["description"] = (
+        "Will the highest temperature recorded at Logan Airport (KBOS) in Boston "
+        "for 2026-08-25 as reported by the National Weather Service's "
+        "Climatological Report (Daily) be less than or equal to 78F? "
+        "Outcome verified from NWS Climatological Report."
+    )
+
+    with pytest.raises(
+        VenuePayloadError,
+        match=(
+            "Boston.*tc-temp-boshigh-2026-08-25-lt79f.*no polymarket_us "
+            "entry in the settlement registry"
+        ),
+    ):
+        discovery_candidate_slugs(page_with(market), city_codes=("nyc",))
+
+
+def test_non_weather_climate_payload_without_city_is_skipped() -> None:
+    market = {
+        "slug": "climate-policy-index-2026",
+        "question": "Will the climate policy index close above 50 in 2026?",
+        "description": "A non-temperature climate market with no settlement-city claim.",
+    }
+
+    assert discovery_candidate_slugs(page_with(market), city_codes=("nyc",)) == ()
+
+
 @pytest.mark.asyncio
 async def test_provider_discovers_open_markets_from_the_list_endpoint() -> None:
     provider, transport, _ = provider_for_pages(

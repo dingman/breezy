@@ -32,6 +32,7 @@ under the ``instruments`` quota key.
 
 from __future__ import annotations
 
+import re
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any
@@ -78,6 +79,10 @@ _RESOLVED_STATUS_VALUES: frozenset[str] = frozenset(
         "MARKET_STATUS_EXPIRED",
         "MARKET_STATUS_TERMINATED",
     }
+)
+
+_WEATHER_QUESTION_RE: re.Pattern[str] = re.compile(
+    r"^(?:Highest|Lowest) temperature in (?P<city>.+?) on "
 )
 
 
@@ -131,15 +136,39 @@ def _weather_market_payloads(
         assert_valid_slug(slug)
         assert isinstance(slug, str)
         parsed = parse_weather_slug(slug)
+        city_name = _weather_city_name_from_payload(market)
         if parsed is None:
+            if city_name is None:
+                continue
             raise VenuePayloadError(
-                f"{MARKET_LIST_PATH} returned climate candidate {slug!r} but its slug "
-                "does not match the observed weather grammar"
+                f"{MARKET_LIST_PATH} returned weather market {slug!r} naming "
+                f"{city_name!r}, but its slug does not match the observed weather grammar"
+            )
+        if city_name is None:
+            raise VenuePayloadError(
+                f"{MARKET_LIST_PATH} returned weather market {slug!r} but the venue "
+                "payload does not explicitly name its city in the question field; "
+                "refusing to fall back to slug parsing"
             )
         if parsed.city not in city_set:
-            continue
+            raise VenuePayloadError(
+                f"{MARKET_LIST_PATH} returned weather market naming {city_name!r} "
+                f"({slug!r}, slug city {parsed.city!r}), which has no polymarket_us "
+                "entry in the settlement registry; refusing to trade or to skip a "
+                "city Breezy holds no settlement truth for"
+            )
         accepted.append(market)
     return tuple(accepted)
+
+
+def _weather_city_name_from_payload(market: Mapping[str, Any]) -> str | None:
+    question = market.get("question")
+    if not isinstance(question, str):
+        return None
+    match = _WEATHER_QUESTION_RE.match(question)
+    if match is None:
+        return None
+    return match.group("city")
 
 
 def _markets_from_payload(payload: Mapping[str, Any]) -> Sequence[Any]:
