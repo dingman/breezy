@@ -151,6 +151,11 @@ files = [
     # strict errors across 38 files. The polymarket_us tests are enumerated
     # because THIS slice's doubles must not drift from the classes they model.
     "scripts/venue",
+    # STK-1 native-egress firewall barriers (N1-N5) and the pyo3 block
+    # regression suite. Typechecked because they reason about the real
+    # nautilus_pyo3 client classes and the conftest sentinel.
+    "tests/unit/test_execution_egress_firewall_guard.py",
+    "tests/unit/test_pyo3_network_block.py",
     "tests/unit/test_polymarket_us_auth_smoke.py",
     "tests/unit/test_polymarket_us_autonomy_g19.py",
     "tests/unit/test_polymarket_us_config.py",
@@ -187,6 +192,11 @@ files = [
     "tests/unit/test_polymarket_us_transport.py",
     "tests/unit/test_polymarket_us_transport_security.py",
     "tests/unit/test_polymarket_us_websocket.py",
+
+    # Settlement seam: the asymmetric gate's minimum-coverage rule. Registered
+    # so the closed-set membership logic and its anti-negation guard are
+    # typechecked, not merely executed.
+    "tests/unit/test_settlement_coverage_rule.py",
 ]
 
 # pyarrow ships no stubs, and nautilus_trader's Data base is a compiled Cython

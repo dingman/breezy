@@ -1,0 +1,37 @@
+name: tests
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+
+      - name: Sync dependencies
+        run: uv sync --all-extras --dev
+
+      # STK-1. `nautilus_pyo3.HttpClient` is a Rust reqwest client and does not
+      # go through Python's socket module, so the in-process kill-switch in
+      # tests/conftest.py cannot constrain it. The suite therefore runs inside a
+      # network namespace with no route off-box. Barrier N3 verifies the block
+      # is real rather than merely asserted.
+      - name: Install network sandbox
+        run: sudo apt-get update && sudo apt-get install -y bubblewrap
+
+      - name: Test (OS network egress blocked)
+        run: BREEZY_PYTHON="$(uv python find)" scripts/ci/run_tests_no_egress.sh
+
+      - name: Ruff
+        run: uv run ruff check .
+
+      - name: Mypy
+        run: uv run mypy
+
+      - name: Import contracts
+        run: uv run lint-imports

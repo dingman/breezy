@@ -30,6 +30,7 @@ from __future__ import annotations
 import os
 import socket
 import sys
+import types
 from collections.abc import Iterator, Mapping
 from typing import Any, cast
 
@@ -81,8 +82,23 @@ PYO3_EGRESS_GAP = (
 OS_EGRESS_BLOCK_COMMAND = (
     "unshare -r -n env BREEZY_TEST_OS_EGRESS_BLOCK=1 .venv/bin/python -m pytest"
 )
-_PYO3_NETWORK_CLIENT_NAMES = ("HttpClient", "WebSocketClient")
+#: Every native client class that can open a socket from Rust.
+#:
+#: ``SocketClient`` (raw TCP) was absent from this tuple until 2026-08-27 and
+#: was therefore unguarded at EVERY import path -- see barrier N1 in
+#: ``tests/unit/test_execution_egress_firewall_guard.py``.
+_PYO3_NETWORK_CLIENT_NAMES = ("HttpClient", "WebSocketClient", "SocketClient")
+
+#: Real classes by NAME, for tests that need the genuine article (the egress
+#: canary in barrier N3). Preserved shape: callers index by class name.
 _ORIGINAL_PYO3_NETWORK_CLIENTS: dict[str, Any] | None = None
+
+#: Every ``(module_object, attr_name, original_value)`` slot that exposes a
+#: native client. The top-level ``nautilus_pyo3`` module and its ``network``
+#: submodule are DISTINCT module objects with independent attribute slots;
+#: rebinding only the former left ``nautilus_pyo3.network.HttpClient`` live,
+#: reachable by a one-line supported import from any test.
+_ORIGINAL_PYO3_NETWORK_SLOTS: list[tuple[Any, str, Any]] | None = None
 
 
 class _BlockedPyo3NetworkClient:
@@ -101,6 +117,21 @@ def _pyo3_module() -> Any | None:
     except ImportError:
         return None
     return nautilus_pyo3
+
+
+def _pyo3_module_objects(module: Any) -> list[Any]:
+    """Return the pyo3 root module plus every submodule object it exposes.
+
+    Each is a separate namespace with its own attribute slot, so blocking the
+    root alone is not a block. Enumerated dynamically rather than hard-coding
+    ``network``, so a future Nautilus release that re-exports a client from a
+    new submodule is covered without an edit here.
+    """
+    owners = [module]
+    owners.extend(
+        value for _, value in sorted(vars(module).items()) if isinstance(value, types.ModuleType)
+    )
+    return owners
 
 
 def _set_imported_breezy_pyo3_aliases(*, web_socket_client: Any) -> None:
@@ -122,27 +153,32 @@ def _install_pyo3_network_client_block() -> None:
     if module is None:
         return
 
-    global _ORIGINAL_PYO3_NETWORK_CLIENTS
+    global _ORIGINAL_PYO3_NETWORK_CLIENTS, _ORIGINAL_PYO3_NETWORK_SLOTS
+    if _ORIGINAL_PYO3_NETWORK_SLOTS is None:
+        _ORIGINAL_PYO3_NETWORK_SLOTS = [
+            (owner, name, getattr(owner, name))
+            for owner in _pyo3_module_objects(module)
+            for name in _PYO3_NETWORK_CLIENT_NAMES
+            if hasattr(owner, name)
+        ]
     if _ORIGINAL_PYO3_NETWORK_CLIENTS is None:
         _ORIGINAL_PYO3_NETWORK_CLIENTS = {
-            name: getattr(module, name)
-            for name in _PYO3_NETWORK_CLIENT_NAMES
-            if hasattr(module, name)
+            name: original for _, name, original in _ORIGINAL_PYO3_NETWORK_SLOTS
         }
 
-    for name in _ORIGINAL_PYO3_NETWORK_CLIENTS:
-        setattr(module, name, _BlockedPyo3NetworkClient)
+    for owner, name, _ in _ORIGINAL_PYO3_NETWORK_SLOTS:
+        setattr(owner, name, _BlockedPyo3NetworkClient)
     _set_imported_breezy_pyo3_aliases(web_socket_client=_BlockedPyo3NetworkClient)
 
 
 def _restore_pyo3_network_clients_for_opted_out_test() -> None:
     module = _pyo3_module()
-    if module is None or _ORIGINAL_PYO3_NETWORK_CLIENTS is None:
+    if module is None or _ORIGINAL_PYO3_NETWORK_SLOTS is None:
         return
 
-    for name, original in _ORIGINAL_PYO3_NETWORK_CLIENTS.items():
-        setattr(module, name, original)
-    web_socket_client = _ORIGINAL_PYO3_NETWORK_CLIENTS.get("WebSocketClient")
+    for owner, name, original in _ORIGINAL_PYO3_NETWORK_SLOTS:
+        setattr(owner, name, original)
+    web_socket_client = (_ORIGINAL_PYO3_NETWORK_CLIENTS or {}).get("WebSocketClient")
     if web_socket_client is not None:
         _set_imported_breezy_pyo3_aliases(web_socket_client=web_socket_client)
 
