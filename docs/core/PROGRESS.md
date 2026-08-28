@@ -1203,14 +1203,22 @@ hand-typed bucket table, the expected winner is checked against the instrument's
 corroborated closed interval facts. Evidence:
 `pytest -q tests/contract/test_multi_instrument_weather_strategy.py` passed.
 
-### Harness gaps self-named by the implementer
+### [CLOSED] Harness gaps self-named by the implementer
 
-- **[MEDIUM] H-1** Refusal ORDERING is untested — each test triggers exactly one
-  refusal condition, so precedence between them is unpinned.
-- **[LOW] H-2** Prose pins are substring matches; a docstring could drift while
-  still containing the pinned substring.
-- **[MEDIUM] H-3** `Bar` is excluded from `VENUE_MARKET_DATA_TYPES` with no test
-  asserting that exclusion is correct.
+Closed 2026-08-28 at `e1b416a`. All three were untested-but-CORRECT rather than
+defects, which is why no production code changed — but that could not be known
+without writing the tests.
+
+- **H-1** Refusal precedence is now pinned as total orders across the settlement
+  invariants, the build-time guards, the order guard, and `SilentRunCondition`,
+  each labelled DESCRIPTIVE or design-choice so a later reordering reads as a
+  decision rather than a regression. Nine mutations confirmed it.
+- **H-2** Prose pins tightened from incidental fragments to the claim sentences
+  they came from. Four left alone with reasoning: full-text equality that breaks
+  on any rewording is worse than a substring.
+- **H-3** The `Bar` exclusion is CORRECT and now records why: Nautilus' `Bar` has
+  no `instrument_id` (only `bar_type`) while `_group_market_data` keys on it, so
+  admitting `Bar` would break that function outright rather than misgroup it.
 
 ### Quality and infrastructure
 
@@ -1226,9 +1234,20 @@ corroborated closed interval facts. Evidence:
   tests/unit/test_polymarket_us_credential_serialization.py` passed (24
   tests); a live mutation test (an `asdict(payload)` call appended to and
   reverted from `gate.py`) reproduced the guard failing before the revert.
-- **[LOW] Q-2** `tests/` is not typechecked — 159 strict errors across 38 files.
-- **[LOW] Q-3** `scripts/analysis` carries 5 pre-existing strict errors
-  (`settlement_bucket_gate.py:189,466`; `settlement_alignment_diagnosis.py:473,482`).
+- **[CLOSED] Q-2** (`38da561`) `tests/` is now typechecked wholesale; the gate
+  went 129 -> 234 files. The recorded figure was 159 errors across 38 files; the
+  real one was 152 across 39, of which 69 were stale `# type: ignore` comments
+  that would each have swallowed a future real error on their line. Surfaced
+  three things worth more than the cleanup: a production Protocol defect in
+  `ingest/gaps.py` (plain attributes demand a SETTABLE variable, so a frozen
+  double could never satisfy a Protocol it conforms to), real double drift in
+  `test_domain_strict_arrow.py`, and six assertions that could never fail.
+- **[CLOSED] Q-3** (`f2c2703`) `scripts/analysis` typechecks and is in the gate.
+  The recorded figure was 5 errors; the real one was 9. The two suspicious cases
+  got verdicts from the code rather than silencing casts -- `NoNetworkClient` is
+  provably unreachable on the supported path and is a fail-fast sentinel, and
+  `GuardedBucketCase` genuinely is substitutable for `PhaseCase` -- and neither
+  was a latent bug.
 - **[CLOSED] Q-4** A once-observed failure in the asdict guard was never
   reproduced. Most probable cause: several agents mutating one working tree while
   pytest ran, and the guard AST-parses every file under `src/` and `scripts/`.
