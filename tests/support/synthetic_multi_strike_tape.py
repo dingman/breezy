@@ -37,8 +37,9 @@ TWO THINGS THIS TAPE DOES THAT THE SINGLE-INSTRUMENT ONE CANNOT
   city/day do NOT share an ``activation_ns`` (observed: two distinct values
   one second apart across the six ``nychigh-2026-04-23`` strikes). Anchoring
   each instrument to its own activation would produce streams offset from one
-  another for no modelled reason, so the tape anchors every instrument to
-  ``max(activation_ns) + 1s`` and interleaves from there.
+  another for no modelled reason, so the tape anchors every instrument from a
+  shared instant after both activation and the final climate-day boundary,
+  then interleaves from there.
 * **Per-instrument settlement.** ``settlement_prices`` is a mapping, and the
   point of this fixture is that some entries are ``1.0`` and some are ``0.0``
   in the SAME run.
@@ -212,8 +213,12 @@ def synthetic_strike_tape(
     instruments = captured_instruments(slugs)
     # ONE origin for every leg. The captured strikes on a single city/day do
     # not share an activation instant, and a per-leg anchor would offset the
-    # streams for no modelled reason.
-    base_ns = max(i.activation_ns for i in instruments) + _STEP_NS
+    # streams for no modelled reason. The synthetic weather record is a FINAL,
+    # so replay must also sit after the market's final climate-day boundary.
+    base_ns = (
+        max(max(i.activation_ns for i in instruments), max(i.expiration_ns for i in instruments))
+        + _STEP_NS
+    )
 
     market_data: list[Data] = []
     legs: list[SyntheticStrikeLeg] = []

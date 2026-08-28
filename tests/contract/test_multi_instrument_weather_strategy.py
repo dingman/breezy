@@ -33,8 +33,10 @@ The seams under test, each of which fails QUIETLY
 
 from __future__ import annotations
 
+import datetime as dt
 from dataclasses import replace
 from decimal import Decimal
+from pathlib import Path
 from typing import TYPE_CHECKING
 
 import pytest
@@ -47,6 +49,7 @@ from nautilus_trader.model.enums import (
 from nautilus_trader.model.events import OrderFilled
 from nautilus_trader.model.objects import Money, Price
 
+from breezy.domain.weather_bucket_facts import read_weather_bucket_facts
 from breezy.runtime.backtest_feed import as_backtest_data
 from breezy.runtime.backtest_harness import (
     BreezyBacktestConfig,
@@ -54,16 +57,16 @@ from breezy.runtime.backtest_harness import (
     SettlementInvariantError,
     run_backtest,
 )
-from breezy.strategy.strike_ladder import (
-    OPEN_BOUND_F,
-    BreezyStrikeLadder,
-    BreezyStrikeLadderConfig,
-)
+from breezy.strategy.strike_ladder import BreezyStrikeLadder, BreezyStrikeLadderConfig
 from tests.support.synthetic_multi_strike_tape import SyntheticStrikeTape, synthetic_strike_tape
 from tests.unit.test_persistence_catalog import make_climate_day
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
+    from collections.abc import Sequence
+
     from nautilus_trader.backtest.engine import BacktestEngine
+
+    from breezy.domain.nws_climate_day import NwsClimateDay
 
 pytestmark = pytest.mark.contract
 
@@ -81,11 +84,62 @@ FULL_CLIP = 10
 HEDGE_CLIP = 4
 STARTING_BALANCE_USD = 1_000
 
-_BUCKETS = {
-    WINNER: (72, 73),
-    NEAR_MISS: (70, 71),
-    FAR_SIDE: (74, OPEN_BOUND_F),
+
+_STANDARD_UTC_OFFSET_HOURS = {
+    "NYC": 5,
+    "MIA": 5,
+    "MDW": 6,
+    "LAX": 8,
+    "SFO": 8,
 }
+
+
+def _final_ts_event_ns(*, station: str, climate_day: dt.date) -> int:
+    day_end_utc = dt.datetime.combine(
+        climate_day + dt.timedelta(days=1),
+        dt.time(hour=_STANDARD_UTC_OFFSET_HOURS[station], tzinfo=dt.UTC),
+    )
+    return int(day_end_utc.timestamp() * 1_000_000_000)
+
+
+def _climate_day_for_tape(tape: SyntheticStrikeTape) -> dt.date:
+    climate_days = {
+        read_weather_bucket_facts(leg.instrument.info).climate_day for leg in tape.legs
+    }
+    if len(climate_days) != 1:
+        raise AssertionError(f"synthetic tape spans multiple climate days: {climate_days}")
+    return next(iter(climate_days))
+
+
+def _final_ts_event_for_tape(tape: SyntheticStrikeTape) -> int:
+    expirations = {leg.instrument.expiration_ns for leg in tape.legs}
+    if len(expirations) != 1:
+        raise AssertionError(f"synthetic tape spans multiple expirations: {expirations}")
+    return next(iter(expirations))
+
+
+def _make_weather_record(
+    tape: SyntheticStrikeTape,
+    *,
+    station: str = "NYC",
+    climate_day: dt.date | None = None,
+    tmax_f: int = OBSERVED_TMAX_F,
+    ts_event: int | None = None,
+    retrieved_at_ns: int | None = None,
+) -> NwsClimateDay:
+    day = climate_day if climate_day is not None else _climate_day_for_tape(tape)
+    final_ts_event = ts_event if ts_event is not None else _final_ts_event_ns(
+        station=station,
+        climate_day=day,
+    )
+    return make_climate_day(
+        station=station,
+        climate_day=day,
+        tmax_f=tmax_f,
+        is_final=True,
+        ts_event=final_ts_event,
+        retrieved_at_ns=retrieved_at_ns if retrieved_at_ns is not None else tape.weather_ts_ns,
+    )
 
 
 def build_tape() -> SyntheticStrikeTape:
@@ -102,10 +156,7 @@ def _ladder(tape: SyntheticStrikeTape, *, tolerance_f: int = 2) -> BreezyStrikeL
     # not a dataclass, so `dataclasses.replace` raises on it.
     return BreezyStrikeLadder(
         BreezyStrikeLadderConfig(
-            station="NYC",
-            buckets=tuple(
-                (leg.instrument_id, *_BUCKETS[str(leg.instrument.symbol)]) for leg in tape.legs
-            ),
+            instrument_ids=tuple(leg.instrument_id for leg in tape.legs),
             trade_quantity=Decimal(FULL_CLIP),
             hedge_quantity=Decimal(HEDGE_CLIP),
             tolerance_f=tolerance_f,
@@ -113,23 +164,50 @@ def _ladder(tape: SyntheticStrikeTape, *, tolerance_f: int = 2) -> BreezyStrikeL
     )
 
 
-def _config(tape: SyntheticStrikeTape) -> BreezyBacktestConfig:
+def _config(
+    tape: SyntheticStrikeTape,
+    *,
+    weather_records: Sequence[NwsClimateDay] | None = None,
+) -> BreezyBacktestConfig:
     return BreezyBacktestConfig(
         instruments=tape.instruments(),
         market_data=tape.all_data(),
         weather_data=as_backtest_data(
-            [
-                make_climate_day(
-                    station="NYC",
-                    tmax_f=OBSERVED_TMAX_F,
-                    is_final=True,
-                    retrieved_at_ns=tape.weather_ts_ns,
-                ),
-            ],
+            list(weather_records) if weather_records is not None else [_make_weather_record(tape)]
         ),
         settlement_prices=tape.settlement_prices(),
         starting_balances=(Money(STARTING_BALANCE_USD, tape.legs[0].instrument.quote_currency),),
     )
+
+
+def test_fixture_weather_record_matches_the_market_climate_day(tape: SyntheticStrikeTape) -> None:
+    """The synthetic final must be a possible final for the traded market day."""
+    config = _config(tape)
+    weather = config.weather_data[0].data
+    climate_days = {
+        read_weather_bucket_facts(leg.instrument.info).climate_day for leg in tape.legs
+    }
+
+    assert climate_days == {weather.climate_day}
+    assert weather.ts_event == min(leg.instrument.expiration_ns for leg in tape.legs)
+    assert weather.retrieved_at_ns >= weather.ts_event
+
+
+def test_contract_does_not_hand_type_bucket_bounds() -> None:
+    source = Path(__file__).read_text(encoding="utf-8")
+
+    assert "_" + "BUCKETS" not in source
+    assert "OPEN" + "_BOUND_F" not in source
+    assert "(" + "72, 73)" not in source
+
+
+def test_strategy_does_not_hand_type_bucket_bounds() -> None:
+    source = Path("src/breezy/strategy/strike_ladder.py").read_text(encoding="utf-8")
+
+    assert "_" + "BUCKETS" not in source
+    assert "OPEN" + "_BOUND_F" not in source
+    assert "(" + "72, 73)" not in source
+    assert "buckets" + ":" not in source
 
 
 def _run(tape: SyntheticStrikeTape) -> tuple[BacktestEngine, BreezyStrikeLadder]:
@@ -490,21 +568,67 @@ def test_the_upper_edge_of_a_bucket_is_INSIDE_it(tape: SyntheticStrikeTape) -> N
     engine = run_backtest(
         replace(
             _config(tape),
-            weather_data=as_backtest_data(
-                [
-                    make_climate_day(
-                        station="NYC",
-                        tmax_f=73,
-                        is_final=True,
+            weather_data=as_backtest_data([_make_weather_record(tape, tmax_f=73)]),
+        ),
+        strategies=(ladder,),
+        allow_idle_strategies=True,
+    )
+    try:
+        assert list(ladder.submitted) == [tape.leg(WINNER).instrument_id]
+    finally:
+        engine.dispose()
+
+
+def test_right_station_wrong_climate_day_does_not_drive_the_ladder(
+    tape: SyntheticStrikeTape,
+) -> None:
+    wrong_day = _climate_day_for_tape(tape) - dt.timedelta(days=1)
+    ladder = _ladder(tape)
+    engine = run_backtest(
+        replace(
+            _config(
+                tape,
+                weather_records=[
+                    _make_weather_record(
+                        tape,
+                        climate_day=wrong_day,
                         retrieved_at_ns=tape.weather_ts_ns,
-                    ),
+                    )
                 ],
             ),
         ),
         strategies=(ladder,),
+        allow_idle_strategies=True,
     )
     try:
-        assert list(ladder.submitted) == [tape.leg(WINNER).instrument_id]
+        assert ladder.weather == 1
+        assert ladder.traded_tmax_f is None
+        assert ladder.submitted == {}
+    finally:
+        engine.dispose()
+
+
+def test_wrong_station_right_climate_day_does_not_drive_the_ladder(
+    tape: SyntheticStrikeTape,
+) -> None:
+    ladder = _ladder(tape)
+    engine = run_backtest(
+        replace(
+            _config(
+                tape,
+                weather_records=[
+                    _make_weather_record(tape, station="MIA", retrieved_at_ns=tape.weather_ts_ns)
+                ],
+            ),
+        ),
+        strategies=(ladder,),
+        allow_idle_strategies=True,
+    )
+    try:
+        assert ladder.weather == 1
+        assert ladder.weather_stations == ("MIA",)
+        assert ladder.traded_tmax_f is None
+        assert ladder.submitted == {}
     finally:
         engine.dispose()
 
@@ -527,18 +651,13 @@ def test_a_client_scoped_subscription_delivers_OTHER_cities_weather_too(
             _config(tape),
             weather_data=as_backtest_data(
                 [
-                    make_climate_day(
-                        station="MDW",
+                    _make_weather_record(
+                        tape,
+                        station="MIA",
                         tmax_f=95,
-                        is_final=True,
                         retrieved_at_ns=tape.weather_ts_ns - 1,
                     ),
-                    make_climate_day(
-                        station="NYC",
-                        tmax_f=OBSERVED_TMAX_F,
-                        is_final=True,
-                        retrieved_at_ns=tape.weather_ts_ns,
-                    ),
+                    _make_weather_record(tape),
                 ],
             ),
         ),
@@ -547,7 +666,7 @@ def test_a_client_scoped_subscription_delivers_OTHER_cities_weather_too(
     try:
         # Both records were delivered -- the subscription is not city-scoped.
         assert ladder.weather == 2
-        assert ladder.weather_stations == ("MDW", "NYC")
+        assert ladder.weather_stations == ("MIA", "NYC")
         # But only NYC's drove the ladder.
         assert ladder.traded_tmax_f == OBSERVED_TMAX_F
         assert len(ladder.submitted) == 3

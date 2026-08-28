@@ -1164,7 +1164,7 @@ back, and runs a real backtest that trades. The quickstart now documents only
 that proven path, including the native flat-stream caveats for
 stream-converted `BinaryOption` and `InstrumentClose`.
 
-### [HIGH] C-1 — `_BUCKETS` is hand-typed; nothing forces it to match the venue
+### [CLOSED] C-1 — `_BUCKETS` is hand-typed; nothing forces it to match the venue
 
 `tests/contract/test_multi_instrument_weather_strategy.py:84`. Plan committed at
 `6805204`, peer-reviewed to revision 2, six increments. Only increment 5 closes
@@ -1172,17 +1172,36 @@ the hole. No money is at risk today — the live node is `strategies=[]` and
 `BreezyStrikeLadder` is constructed only by its own test — so this must land
 before live authorization, not before more backtesting.
 
-### [HIGH] C-2 — The contract fixture correlates a weather record to nothing
+Closed 2026-08-28: `BreezyStrikeLadderConfig` now takes `instrument_ids`, the
+strategy reads bucket bounds from `read_weather_bucket_facts(instrument.info)`,
+and the contract has a source guard that rejects `_BUCKETS`, `OPEN_BOUND_F`, and
+the `(72, 73)` hand-typed tuple. Evidence:
+`pytest -q tests/contract/test_multi_instrument_weather_strategy.py` passed.
+
+### [CLOSED] C-2 — The contract fixture correlates a weather record to nothing
 
 The fixture drives `climate_day 2026-08-22` into markets dated `2026-04-23`, a
 121-day gap, with zero `climate_day=` overrides, and the suite is green. Plan
 increment 4.
 
-### [MEDIUM] C-3 — The bucket test cannot discriminate closed from half-open
+Closed 2026-08-28: the contract fixture now builds a coherent final
+`climate_day` / `ts_event` / `retrieved_at_ns` triple from the instruments'
+stored facts and final boundary. The synthetic tape replay anchor moved after
+the market's final climate-day boundary so books and closes still exercise real
+fills and settlements. Evidence:
+`pytest -q tests/contract/test_multi_instrument_weather_strategy.py` passed.
+
+### [CLOSED] C-3 — The bucket test cannot discriminate closed from half-open
 
 `OBSERVED_TMAX_F = 72` against `WINNER = (72, 73)`. 72 is the LOWER endpoint, so
 the closed reading and the naive half-open reading agree there and the test
 passes under both. The discriminating observation is 73. Add it.
+
+Closed 2026-08-28: the contract now observes `73` with `tolerance_f=0` and
+asserts only `gte72lt73f` submits. Because the test config no longer carries a
+hand-typed bucket table, the expected winner is checked against the instrument's
+corroborated closed interval facts. Evidence:
+`pytest -q tests/contract/test_multi_instrument_weather_strategy.py` passed.
 
 ### Harness gaps self-named by the implementer
 

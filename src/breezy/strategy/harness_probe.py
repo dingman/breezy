@@ -21,16 +21,13 @@ weather is not per-instrument data.
 
 **And therefore: the strategy MUST filter on ``station`` itself.** Verified on
 a live engine -- a client-scoped subscription delivers EVERY city's
-``NwsClimateDay`` to EVERY strategy in the run, with nothing on the record
-marking it foreign, and nothing anywhere in the platform correlating a
-station with an instrument's city. A strategy that acts on the first record it
-receives will size a New York position off Chicago's temperature and log
-nothing. This is correct platform behaviour, not a defect, and it cannot be
-fixed in the harness without breaking the one-day-settles-many-markets model.
-So the probe demonstrates the filter, in :meth:`BreezyHarnessProbe.on_data`,
-deliberately: this module is the thing a new strategy gets copied from, and it
-should teach the right shape. The probe COUNTS every record that arrives (that
-is how the weather path is proved alive) and TRADES only on records whose
+``NwsClimateDay`` to EVERY strategy in the run. Bucket strategies should read
+corroborated station/day facts from the cached instrument with
+``breezy.domain.weather_bucket_facts.read_weather_bucket_facts`` and call
+``facts.applies_to(data.station, data.climate_day)`` before trading. This
+single-instrument probe keeps an explicit ``station`` config only because it
+does not reason about bucket facts. The probe COUNTS every record that arrives
+(that is how the weather path is proved alive) and TRADES only on records whose
 ``station`` matches its own.
 
 **The single order is a MARKET BUY.** MARKET so the fill is unambiguously

@@ -36,7 +36,11 @@ engine's expiration latch cancels it (``engine.pyx:5936-5947``).
 
 Nothing here imports ``breezy.adapters.polymarket_us``: that would make this
 module venue-touching under the read-only guard's classifier C4, and the
-instrument is resolved from the native cache anyway.
+instrument is resolved from the native cache anyway. Strategies that need
+weather-bucket station/day/bounds should read the cached instrument's
+corroborated facts with
+``breezy.domain.weather_bucket_facts.read_weather_bucket_facts`` rather than
+importing a venue adapter or hand-typing bucket bounds.
 """
 
 from __future__ import annotations

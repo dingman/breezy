@@ -62,24 +62,30 @@ def on_quote_tick(self, tick: QuoteTick) -> None:
     self.log.info(f"Quote arrived: {tick.ask_price}")
 ```
 
-### 3.3 Weather Records (Station-filtered, client-scoped)
+### 3.3 Weather Records (Fact-filtered, client-scoped)
 
 ```python
+from breezy.domain.weather_bucket_facts import read_weather_bucket_facts
+
+def on_start(self) -> None:
+    instrument = self.cache.instrument(self.config.instrument_id)
+    self._facts = read_weather_bucket_facts(instrument.info)
+
 def on_data(self, data: Data) -> None:
     if type(data) is not NwsClimateDay:  # Type-exact, not isinstance
         return
     
-    # CRITICAL: YOU MUST FILTER BY STATION
+    # CRITICAL: YOU MUST FILTER BY THE INSTRUMENT'S STORED FACTS
     # Weather is delivered to EVERY strategy in the run from EVERY city.
     # The subscription is CLIENT-scoped, not instrument-scoped.
-    # Your instrument's city is never automatically correlated.
-    if data.station != self.config.station:
+    # The instrument's station/day is not correlated by Nautilus.
+    if not self._facts.applies_to(data.station, data.climate_day):
         return  # Skip foreign records
     
     # Now act on this record
 ```
 
-**Why is weather client-scoped?** One climate day settles many markets. The platform delivers all cities' records to all strategies with nothing marking which is foreign. A ladder that acts on the first record it sees will size a New York position off Chicago's temperature and log nothing. This is correct platform behaviour. You must filter.
+**Why is weather client-scoped?** One climate day settles many markets. The platform delivers all cities' records to all strategies with nothing marking which is foreign. A ladder that acts on the first record it sees will size a New York position off Chicago's temperature and log nothing. This is correct platform behaviour. Bucket strategies must read `read_weather_bucket_facts(instrument.info)` from the cached instrument and filter with `facts.applies_to(data.station, data.climate_day)`.
 
 ### 3.4 Instrument Close (Settlement trigger)
 
@@ -182,6 +188,7 @@ from nautilus_trader.trading.config import StrategyConfig
 from nautilus_trader.trading.strategy import Strategy
 
 from breezy.domain.nws_climate_day import NwsClimateDay
+from breezy.domain.weather_bucket_facts import WeatherBucketFacts, read_weather_bucket_facts
 from breezy.ingest.nws_actor import nws_climate_day_data_type
 from breezy.runtime.backtest_feed import NWS_BACKTEST_CLIENT_ID, as_backtest_data
 from breezy.runtime.backtest_harness import BreezyBacktestConfig, run_backtest
@@ -189,7 +196,6 @@ from breezy.runtime.backtest_harness import BreezyBacktestConfig, run_backtest
 
 class TempEagerConfig(StrategyConfig, frozen=True):
     instrument_id: InstrumentId
-    station: str
     buy_if_tmax_f: int = 80
 
 
@@ -199,12 +205,14 @@ class TempEager(Strategy):
         self.orders_submitted: int = 0
         self._last_ask: Price | None = None
         self._quantity: Quantity | None = None
+        self._facts: WeatherBucketFacts | None = None
 
     def on_start(self) -> None:
         instrument = self.cache.instrument(self.config.instrument_id)
         if instrument is None:
             self.stop()
             return
+        self._facts = read_weather_bucket_facts(instrument.info)
         self._quantity = instrument.make_qty(Decimal(10))
         self.subscribe_quote_ticks(instrument.id)
         self.subscribe_order_book_depth(instrument.id)
@@ -220,7 +228,7 @@ class TempEager(Strategy):
     def on_data(self, data) -> None:
         if type(data) is not NwsClimateDay:
             return
-        if data.station != self.config.station:
+        if self._facts is None or not self._facts.applies_to(data.station, data.climate_day):
             return
         # CRITICAL: Guard against None — missing highs are normal in real data
         if data.tmax_f is None:
@@ -247,7 +255,6 @@ from tests.unit.test_persistence_catalog import make_climate_day
 tape = synthetic_binary_tape()
 strategy = TempEager(TempEagerConfig(
     instrument_id=tape.instrument.id,
-    station="NYC",
 ))
 
 config = BreezyBacktestConfig(
@@ -403,7 +410,7 @@ A strategy that only subscribes to quotes and acts in `on_quote_tick` may never 
 
 A two-city run delivers both cities' weather to both strategies. A strategy that acts on the first record without checking `station` will trade off the wrong city.
 
-**Fix:** Every `on_data` handler must check `if data.station != self.config.station: return`.
+**Fix:** For bucket strategies, read `facts = read_weather_bucket_facts(instrument.info)` during `on_start`, then check `if not facts.applies_to(data.station, data.climate_day): return`.
 
 ### Trap: Missing high temperature crashes the strategy
 
@@ -453,6 +460,7 @@ The example in §7 lists all required imports at the top. If you copy only the c
 - **Test shape:** `tests/integration/test_forecast_edge_backtest.py`
 - **Backtest harness:** `src/breezy/runtime/backtest_harness.py` (BreezyBacktestConfig, run_backtest)
 - **Weather wrapping:** `src/breezy/runtime/backtest_feed.py` (as_backtest_data, NWS_BACKTEST_CLIENT_ID)
+- **Weather bucket facts:** `src/breezy/domain/weather_bucket_facts.py` (read_weather_bucket_facts)
 - **Nautilus docs:** Built-in `on_quote_tick`, `on_order_book_depth`, `on_data`, `subscribe_data`, `order_factory.market`
 - **Venue config:** `docs/specs/BACKTEST_VENUE_CONFIG.md` (settlement, fees, account types)
 

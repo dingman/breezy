@@ -13,7 +13,7 @@ The captured Polymarket.us universe is a ladder of mutually exclusive
 temperature buckets on one city and one day: ``...-gte70lt71f``,
 ``...-gte72lt73f``, ``...-gte74f``, ``...-lt66f``. Exactly one settles at 1.
 
-Given an observed high ``tmax_f`` for the configured station:
+Given an observed high ``tmax_f`` for an instrument's stored station/day facts:
 
 * the bucket **containing** ``tmax_f`` is bought at the full clip -- that is
   the position the weather implies. Buckets are CLOSED intervals: the venue
@@ -70,6 +70,10 @@ from nautilus_trader.trading.config import StrategyConfig
 from nautilus_trader.trading.strategy import Strategy
 
 from breezy.domain.nws_climate_day import NwsClimateDay
+from breezy.domain.weather_bucket_facts import (
+    WeatherFactsUnavailableError,
+    read_weather_bucket_facts,
+)
 from breezy.ingest.nws_actor import nws_climate_day_data_type
 from breezy.runtime.backtest_feed import NWS_BACKTEST_CLIENT_ID
 
@@ -82,12 +86,9 @@ if TYPE_CHECKING:  # pragma: no cover - typing only
     from nautilus_trader.model.identifiers import ClientOrderId, InstrumentId
     from nautilus_trader.model.objects import Quantity
 
-__all__ = ["BreezyStrikeLadder", "BreezyStrikeLadderConfig"]
+    from breezy.domain.weather_bucket_facts import WeatherBucketFacts
 
-#: Sentinel for an open-ended bucket bound (``...-gte74f`` has no upper edge,
-#: ``...-lt66f`` no lower one). A large finite integer rather than
-#: ``float('inf')`` so the config stays msgspec-encodable as plain ints.
-OPEN_BOUND_F: int = 10_000
+__all__ = ["BreezyStrikeLadder", "BreezyStrikeLadderConfig"]
 
 
 class BreezyStrikeLadderConfig(StrategyConfig, frozen=True):
@@ -95,25 +96,10 @@ class BreezyStrikeLadderConfig(StrategyConfig, frozen=True):
 
     Parameters
     ----------
-    station : str
-        The NWS station id whose ``NwsClimateDay`` records drive the decision
-        (e.g. ``"NYC"``). Records for any other station are ignored: the
-        weather subscription is client-scoped, so a run covering two cities
-        delivers BOTH cities' records to BOTH ladders.
-    buckets : tuple[tuple[InstrumentId, int, int], ...]
-        One entry per strike: ``(instrument_id, lower_f, upper_f)``. The
-        interval is **CLOSED at BOTH ends** -- ``lower_f <= tmax_f <=
-        upper_f`` -- because that is what the venue's own prose says, and the
-        venue's prose is the source of truth for the comparator, not the slug.
-        ``breezy.adapters.polymarket_us.symbology`` records the evidence: a
-        slug segment ``gte72lt73f`` is titled "72 to 73", so 73 is INSIDE the
-        bucket, and across the 114 captured city/day ladders only the closed
-        reading tiles the degree line without a gap (114 of 114, versus 0 of
-        114 for the naive half-open reading of ``lt``). A half-open bucket
-        here orphans every odd degree: the ladder simply fails to buy the
-        winning strike, buys its hedges instead, and loses money with no
-        error anywhere. Use :data:`OPEN_BOUND_F` / ``-OPEN_BOUND_F`` for an
-        open edge.
+    instrument_ids : tuple[InstrumentId, ...]
+        One entry per strike. Station, climate day and closed interval bounds
+        are read from each instrument's corroborated weather-bucket facts via
+        ``breezy.domain.weather_bucket_facts.read_weather_bucket_facts``.
     trade_quantity : Decimal
         Clip for the bucket that CONTAINS the observation, in contracts.
     hedge_quantity : Decimal
@@ -127,8 +113,7 @@ class BreezyStrikeLadderConfig(StrategyConfig, frozen=True):
 
     """
 
-    station: str
-    buckets: tuple[tuple[InstrumentId, int, int], ...]
+    instrument_ids: tuple[InstrumentId, ...]
     trade_quantity: Decimal
     hedge_quantity: Decimal
     tolerance_f: int = 1
@@ -158,6 +143,7 @@ class BreezyStrikeLadder(Strategy):
         self.traded_tmax_f: int | None = None
         self._own_order_ids: set[ClientOrderId] = set()
         self._quantities: dict[InstrumentId, tuple[Quantity, Quantity]] = {}
+        self._facts: dict[InstrumentId, WeatherBucketFacts] = {}
         self._fired: bool = False
 
     # -- lifecycle ---------------------------------------------------------
@@ -169,7 +155,7 @@ class BreezyStrikeLadder(Strategy):
         a ladder silently trading three of its four buckets is precisely the
         quiet wrong answer this module is meant not to produce.
         """
-        for instrument_id, _lower, _upper in self.config.buckets:
+        for instrument_id in self.config.instrument_ids:
             instrument = self.cache.instrument(instrument_id)
             if instrument is None:
                 self.log.error(
@@ -178,6 +164,16 @@ class BreezyStrikeLadder(Strategy):
                 )
                 self.stop()
                 return
+            try:
+                facts = read_weather_bucket_facts(instrument.info)
+            except WeatherFactsUnavailableError as exc:
+                self.log.error(
+                    f"instrument {instrument_id} has no usable weather-bucket facts: {exc}; "
+                    "stopping the whole ladder.",
+                )
+                self.stop()
+                return
+            self._facts[instrument_id] = facts
             self._quantities[instrument_id] = (
                 instrument.make_qty(self.config.trade_quantity),
                 instrument.make_qty(self.config.hedge_quantity),
@@ -192,7 +188,7 @@ class BreezyStrikeLadder(Strategy):
 
         # ONCE, by `client_id`. Never per instrument -- see module docstring.
         self.subscribe_data(nws_climate_day_data_type(), client_id=NWS_BACKTEST_CLIENT_ID)
-        self._record(0, "started", f"{len(self.config.buckets)} buckets")
+        self._record(0, "started", f"{len(self.config.instrument_ids)} buckets")
 
     # -- data --------------------------------------------------------------
 
@@ -215,17 +211,33 @@ class BreezyStrikeLadder(Strategy):
             f":final={data.is_final}",
         )
 
-        if self._fired or data.station != self.config.station:
+        if self._fired:
             return
         if self.config.require_final and not data.is_final:
             return
         if data.tmax_f is None:
             self._record(data.ts_event, "skip", "no tmax_f")
             return
+        applicable_facts = {
+            instrument_id: facts
+            for instrument_id, facts in self._facts.items()
+            if facts.applies_to(data.station, data.climate_day)
+        }
+        if not applicable_facts:
+            self._record(
+                data.ts_event,
+                "skip",
+                f"no bucket facts apply to {data.station}:{data.climate_day.isoformat()}",
+            )
+            return
 
         self._fired = True
         self.traded_tmax_f = data.tmax_f
-        self._trade_ladder(observed_f=data.tmax_f, ts_event=data.ts_event)
+        self._trade_ladder(
+            observed_f=data.tmax_f,
+            ts_event=data.ts_event,
+            facts_by_id=applicable_facts,
+        )
 
     def on_quote_tick(self, tick: QuoteTick) -> None:
         self.quotes[tick.instrument_id] = self.quotes.get(tick.instrument_id, 0) + 1
@@ -263,17 +275,29 @@ class BreezyStrikeLadder(Strategy):
 
     # -- internals ---------------------------------------------------------
 
-    def _trade_ladder(self, *, observed_f: int, ts_event: int) -> None:
+    def _trade_ladder(
+        self,
+        *,
+        observed_f: int,
+        ts_event: int,
+        facts_by_id: dict[InstrumentId, WeatherBucketFacts],
+    ) -> None:
         """One MARKET BUY per qualifying bucket, largest clip first."""
-        for instrument_id, lower, upper in self.config.buckets:
+        for instrument_id, facts in facts_by_id.items():
             full, hedge = self._quantities[instrument_id]
-            # CLOSED interval on BOTH sides -- see `BreezyStrikeLadderConfig`.
-            if lower <= observed_f <= upper:
+            if facts.contains(observed_f):
                 quantity, reason = full, "contains"
-            elif self._within_tolerance(observed_f, lower, upper):
+            elif (
+                self.config.tolerance_f > 0
+                and facts.distance_f(observed_f) <= self.config.tolerance_f
+            ):
                 quantity, reason = hedge, "hedge"
             else:
-                self._record(ts_event, "no-trade", f"{instrument_id}:[{lower},{upper})")
+                self._record(
+                    ts_event,
+                    "no-trade",
+                    f"{instrument_id}:distance={facts.distance_f(observed_f)}",
+                )
                 continue
             if quantity == 0:
                 self._record(ts_event, "no-trade", f"{instrument_id}:zero-clip")
@@ -289,21 +313,6 @@ class BreezyStrikeLadder(Strategy):
             self.submitted[instrument_id] = quantity
             self._record(ts_event, "submit", f"{instrument_id}:{reason}:BUY:{quantity}")
             self.submit_order(order)
-
-    def _within_tolerance(self, observed_f: int, lower: int, upper: int) -> bool:
-        """Is this bucket reachable if the observation is revised?
-
-        Distance from the observation to the CLOSED bucket interval, not to
-        either edge: a bucket the observation already sits in is handled
-        above, and one that merely touches must be measured from its near
-        edge.
-        """
-        tolerance = self.config.tolerance_f
-        if tolerance <= 0:
-            return False
-        if observed_f < lower:
-            return bool(lower - observed_f <= tolerance)
-        return bool(observed_f - upper <= tolerance)
 
     def _record(self, ts_event: int, kind: str, detail: str) -> None:
         self.decisions.append(f"{ts_event}|{kind}|{detail}")
