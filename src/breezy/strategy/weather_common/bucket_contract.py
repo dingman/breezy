@@ -1,0 +1,58 @@
+"""The traded contract's identity, sourced from Breezy's own venue facts.
+
+Replaces the bundle's ``contract_metadata.py`` section wholesale.
+``TemperatureContract``/``ContractKind``/``WeatherContractRegistry`` there
+were the bundle re-parsing bucket bounds from a venue slug, hand-rolled, with
+no relationship to Breezy's own parsed facts and no test against a captured
+market. :class:`MispricingContract` instead WRAPS
+:class:`breezy.domain.weather_bucket_facts.WeatherBucketFacts`, which is read
+from ``Instrument.info`` by
+``breezy.domain.weather_bucket_facts.read_weather_bucket_facts`` -- the
+already-corroborated source (114/114 captured buckets, per that module's
+docstring) -- so the bounds a decision trades against are the same bounds the
+venue actually settles on, closed at both finite ends.
+
+Also dropped: the bundle's ``settlement_local_time`` / ``timezone`` fields
+(defaults of ``time(23, 59)`` / ``"America/Chicago"`` baked into every
+contract regardless of station -- wrong for every station outside Chicago,
+and not sourced from anything). Breezy has no wall-clock settlement-time
+source at the strategy layer (settlement here is driven entirely by the
+native ``InstrumentClose`` -- see ``breezy.runtime.backtest_harness``), so
+"hours to settlement" is not recomputed from a fabricated clock. It comes
+from the injected :class:`~breezy.strategy.forecast_mispricing.forecast_source.ForecastSource`
+instead -- see that module's docstring for the contract this implies.
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+
+from breezy.domain.weather_bucket_facts import WeatherBucketFacts
+
+__all__ = ["MispricingContract"]
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
+class MispricingContract:
+    """One tradable instrument's weather-settlement identity and pricing facts."""
+
+    instrument_id: str
+    facts: WeatherBucketFacts
+    #: The instrument's own minimum price increment (``float(instrument.price_increment)``),
+    #: never a literal default -- the captured universe carries more than one tick size.
+    tick_size: float
+    #: 1.0 for markets already priced in [0, 1]; overridable per-strategy via
+    #: config for a cent-priced venue.
+    price_scale: float = 1.0
+    #: Payout dollars per contract at YES. Binary options here always pay 1.0.
+    contract_size: float = 1.0
+
+    @property
+    def location_id(self) -> str:
+        """The settlement station, doubling as the risk-grouping "location"."""
+        return self.facts.settlement_station
+
+    @property
+    def event_key(self) -> str:
+        """Groups every bucket settling off the same station/climate-day."""
+        return f"{self.facts.settlement_station}:{self.facts.climate_day.isoformat()}"
