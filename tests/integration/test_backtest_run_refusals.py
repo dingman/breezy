@@ -181,7 +181,14 @@ def test_the_open_position_error_names_the_instrument(tape: SyntheticBinaryTape)
 def test_the_open_position_error_explains_the_avg_px_close_trap(
     tape: SyntheticBinaryTape,
 ) -> None:
-    """An author cannot detect this from the obvious field, so the guard says so."""
+    """An author cannot detect this from the obvious field, so the guard says so.
+
+    H-2: tightened from the bare field name "avg_px_close" (which also
+    appears earlier in the same message purely as part of the `detail`
+    listing, e.g. "(avg_px_close=0.0)") to the actual TRAP being explained --
+    that the field reads the same 0.0 an unsettled position and a genuine
+    settle-at-zero both produce.
+    """
     with pytest.raises(SilentRunError) as excinfo:
         run_backtest(
             _config(
@@ -192,7 +199,7 @@ def test_the_open_position_error_explains_the_avg_px_close_trap(
             strategies=(_probe(tape),),
         )
 
-    assert "avg_px_close" in str(excinfo.value)
+    assert "`avg_px_close` is 0.0 on a position that never closed" in str(excinfo.value)
 
 
 def test_the_open_position_refusal_is_individually_overridable(
@@ -389,10 +396,18 @@ def test_a_post_only_order_is_refused_when_it_is_SUBMITTED(
     """
     strategy = _PostOnlyProbe(_PostOnlyProbeConfig(instrument_id=tape.instrument.id))
 
-    with pytest.raises(ValueError, match="post_only") as excinfo:
+    # H-2: `match="post_only"` would also match a message that only ever
+    # mentioned the PARAMETER NAME in passing; the value is the actual claim
+    # (that THIS order carried it), matching the guard's own message and the
+    # unit-level pin in `test_runtime_backtest_order_guard.py`.
+    with pytest.raises(ValueError, match="post_only=True") as excinfo:
         run_backtest(_config(tape), strategies=(strategy,))
 
-    assert "REBATE" in str(excinfo.value) or "rebate" in str(excinfo.value)
+    # H-2: tightened from a case-insensitive check for the word "rebate"
+    # (which could survive a rewrite that dropped the actual coefficient) to
+    # the specific numeric fact the message exists to convey -- the sign and
+    # magnitude of the maker rebate the fee model cannot price.
+    assert "-0.0125" in str(excinfo.value)
 
 
 # ---------------------------------------------------------------------------
@@ -447,7 +462,10 @@ def test_a_sell_with_no_position_is_refused_by_the_harness(
         _NakedShortProbeConfig(instrument_id=tape.instrument.id, quantity=Decimal(500)),
     )
 
-    with pytest.raises(ValueError, match="naked") as excinfo:
+    # H-2: `match="naked"` would also match if the word appeared only in an
+    # unrelated aside; `"naked short of"` is the phrase that introduces the
+    # actual computed overage and cannot appear without the claim it makes.
+    with pytest.raises(ValueError, match="naked short of") as excinfo:
         run_backtest(_config(tape), strategies=(strategy,))
 
     assert str(tape.instrument.id) in str(excinfo.value)
@@ -469,5 +487,5 @@ def test_the_naked_short_guard_lives_in_the_harness_not_in_the_strategy(
         _NakedShortProbeConfig(instrument_id=tape.instrument.id, quantity=Decimal(1)),
     )
 
-    with pytest.raises(ValueError, match="naked"):
+    with pytest.raises(ValueError, match="naked short of"):
         run_backtest(_config(tape), strategies=(strategy,))

@@ -29,10 +29,13 @@ from __future__ import annotations
 
 import pytest
 from nautilus_trader.model.currencies import USD
-from nautilus_trader.model.objects import Money
+from nautilus_trader.model.data import Bar, BarSpecification, BarType
+from nautilus_trader.model.enums import BarAggregation, PriceType
+from nautilus_trader.model.objects import Money, Price, Quantity
 
 from breezy.runtime.backtest_feed import as_backtest_data
 from breezy.runtime.backtest_harness import (
+    VENUE_MARKET_DATA_TYPES,
     BreezyBacktestConfig,
     NotVenueMarketDataError,
     assert_market_data_is_venue_data,
@@ -60,15 +63,24 @@ def test_a_bare_weather_record_in_market_data_is_refused() -> None:
     with pytest.raises(NotVenueMarketDataError) as excinfo:
         assert_market_data_is_venue_data([*tape.all_data(), make_climate_day()])
 
-    assert "NwsClimateDay" in str(excinfo.value)
+    # H-2: tightened from the bare class name "NwsClimateDay" (which could
+    # appear in the message for an unrelated reason, e.g. listing it among
+    # accepted types) to the actual CLAIM the message makes about it.
+    assert "NwsClimateDay is not venue market data" in str(excinfo.value)
 
 
 def test_the_refusal_names_the_field_the_record_belongs_in() -> None:
-    """An error that does not say where to put it teaches nothing."""
+    """An error that does not say where to put it teaches nothing.
+
+    H-2: tightened from the bare field name "weather_data" (which the message
+    ALSO uses when explaining what `market_data` accepts INSTEAD, so a
+    substring match on the name alone does not pin the "put it there"
+    instruction specifically) to the actual routing instruction.
+    """
     with pytest.raises(NotVenueMarketDataError) as excinfo:
         assert_market_data_is_venue_data([make_climate_day()])
 
-    assert "weather_data" in str(excinfo.value)
+    assert "it belongs in `weather_data`" in str(excinfo.value)
 
 
 def test_a_WRAPPED_weather_record_in_market_data_is_also_refused() -> None:
@@ -82,7 +94,7 @@ def test_a_WRAPPED_weather_record_in_market_data_is_also_refused() -> None:
     with pytest.raises(NotVenueMarketDataError) as excinfo:
         assert_market_data_is_venue_data(list(wrapped))
 
-    assert "weather_data" in str(excinfo.value)
+    assert "it belongs in `weather_data`" in str(excinfo.value)
 
 
 def test_the_screen_runs_from_the_builder() -> None:
@@ -122,3 +134,81 @@ def test_the_screen_is_type_exact_so_a_subclass_does_not_slip_through() -> None:
 
     with pytest.raises(NotVenueMarketDataError):
         assert_market_data_is_venue_data([impostor])
+
+
+# ---------------------------------------------------------------------------
+# H-3: `Bar` is excluded from `VENUE_MARKET_DATA_TYPES`, and that exclusion
+# is CORRECT -- pinned with the evidence, not merely asserted.
+# ---------------------------------------------------------------------------
+
+
+def _make_bar(instrument_id: object) -> Bar:
+    """A real `Bar`, minimally populated, for the one instrument under test."""
+    bar_type = BarType(instrument_id, BarSpecification(1, BarAggregation.MINUTE, PriceType.LAST))
+    return Bar(
+        bar_type,
+        Price(1, 2),
+        Price(1, 2),
+        Price(1, 2),
+        Price(1, 2),
+        Quantity(1, 0),
+        0,
+        0,
+    )
+
+
+def test_bar_is_absent_from_the_venue_market_data_allowlist() -> None:
+    """The allowlist itself, not merely the runtime refusal.
+
+    `add_data` accepts `Bar`, so its absence here is a deliberate CHOICE, not
+    a gap that happens to also refuse it -- pinning the set membership
+    directly is what would catch someone re-adding it to the allowlist
+    without addressing why it was never there.
+    """
+    assert Bar not in VENUE_MARKET_DATA_TYPES
+
+
+def test_a_bar_in_market_data_is_refused() -> None:
+    tape = synthetic_binary_tape(size_precision=0, settlement_price=1.0)
+    bar = _make_bar(tape.instrument.id)
+
+    with pytest.raises(NotVenueMarketDataError) as excinfo:
+        assert_market_data_is_venue_data([*tape.all_data(), bar])
+
+    assert "Bar" in str(excinfo.value)
+
+
+def test_bar_carries_its_instrument_under_bar_type_not_instrument_id() -> None:
+    """THE reason `Bar` cannot share the grouping the other venue types use.
+
+    `_group_market_data` (the function `build_backtest_engine` calls on
+    `config.market_data`) keys its groups on `record.instrument_id`. Every
+    admitted type in `VENUE_MARKET_DATA_TYPES` -- `OrderBookDelta(s)`,
+    `OrderBookDepth10`, `QuoteTick`, `TradeTick`, `InstrumentClose`,
+    `InstrumentStatus` -- carries that attribute directly. `Bar` does not: its
+    instrument lives at `bar.bar_type.instrument_id`. Admitting `Bar` into the
+    allowlist without special-casing the grouping function would not silently
+    misgroup it -- it would raise `AttributeError` the first time a `Bar`
+    reached `_group_market_data`, proven here directly against the real
+    native class rather than asserted from the comment.
+    """
+    tape = synthetic_binary_tape(size_precision=0, settlement_price=1.0)
+    bar = _make_bar(tape.instrument.id)
+
+    assert bar.bar_type.instrument_id == tape.instrument.id
+    with pytest.raises(AttributeError):
+        bar.instrument_id  # noqa: B018 - the point IS the attribute access
+
+
+def test_the_harness_refuses_a_bar_from_the_builder_too() -> None:
+    tape = synthetic_binary_tape(size_precision=0, settlement_price=1.0)
+    bar = _make_bar(tape.instrument.id)
+    config = BreezyBacktestConfig(
+        instruments=(tape.instrument,),
+        market_data=[*tape.all_data(), bar],
+        settlement_prices={tape.instrument.id: tape.settlement_price},
+        starting_balances=(Money(1_000, USD),),
+    )
+
+    with pytest.raises(NotVenueMarketDataError):
+        build_backtest_engine(config)

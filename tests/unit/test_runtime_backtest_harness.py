@@ -306,7 +306,12 @@ def test_an_unwrapped_weather_record_is_refused_rather_than_dropped() -> None:
     with pytest.raises(UnwrappedWeatherRecordError) as excinfo:
         build_backtest_engine(make_config(weather_data=(make_climate_day(),)))
 
-    assert "as_backtest_data" in str(excinfo.value)
+    # H-2: tightened from the bare function name "as_backtest_data" (which
+    # could appear in the message for an unrelated reason) to the actual
+    # instruction the message gives.
+    assert "Wrap with `breezy.runtime.backtest_feed.as_backtest_data` first" in str(
+        excinfo.value,
+    )
 
 
 def test_wrapped_weather_records_are_accepted() -> None:
