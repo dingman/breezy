@@ -26,11 +26,17 @@ every credential-bearing ``SecureString`` itself (``env.py``), so the subclass
 covers all real construction sites and the leak is closed *structurally*,
 wherever the object is rendered, rather than only at the container's repr.
 
-The AST barrier ``find_asdict_on_credentials`` in
+The AST barrier in
 ``tests/unit/test_polymarket_us_credential_serialization.py`` is retained as
-defence in depth: it stops the ``asdict``-on-a-credential idiom being written at
-all, which still matters because ``asdict`` yields raw, picklable credential
-objects regardless of how they render.
+defence in depth: it stops the ``asdict``-on-a-credential idiom being written
+at all, which still matters because ``asdict`` yields raw, picklable
+credential objects regardless of how they render. As of Q-1
+(``docs/core/PROGRESS.md``) the enforced guard is
+``find_unallowlisted_asdict_calls``, a CLOSED allowlist of permitted call
+sites keyed by exact file/line/argument -- not a name-based blocklist -- so a
+new call site cannot evade it by choosing an unremarkable variable name. The
+older ``find_asdict_on_credentials`` heuristic is retained in that test module
+only as a pinned, superseded example of the gap this closed.
 
 Scope, stated plainly
 ---------------------

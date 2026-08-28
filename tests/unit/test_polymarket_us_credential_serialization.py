@@ -353,6 +353,111 @@ def find_asdict_on_credentials(path: str, source: str) -> list[str]:
     return found
 
 
+# --------------------------------------------------------------------------
+# Q-1 fix -- invert the default from an open blocklist to a closed allowlist.
+#
+# The scanner above (`find_asdict_on_credentials`) is retained verbatim, but
+# only as a LEGACY heuristic exercised by
+# `test_the_old_name_heuristic_misses_an_unremarkable_variable_name`, which
+# pins its known gap: it is name-based and an `asdict(x)` call escapes it the
+# instant `x` is not spelled like `credentials`/`creds`/`credential`/
+# `secrets`. That is unbounded and always losable (docs/core/PROGRESS.md
+# Q-1).
+#
+# `find_unallowlisted_asdict_calls` below is the guard actually enforced by
+# `test_no_breezy_module_calls_asdict_on_a_credential`. It inverts the
+# default: every `asdict(...)` call site under `src/` and `scripts/` is a
+# FAILURE unless it is named, by exact file + line + argument, in the closed
+# `_ALLOWED_ASDICT_CALL_SITES` set below. A closed set defined by positive
+# membership cannot be escaped by inventing a new variable name -- there is
+# no name an evader could choose that is already a member of an empty-by-
+# default set. This mirrors how other guards in this repo work (e.g. the
+# venue market-data type allowlist): enumerate what is PERMITTED, not what is
+# forbidden.
+# --------------------------------------------------------------------------
+
+
+@dataclasses.dataclass(frozen=True, slots=True)
+class _AllowedAsdictCallSite:
+    """One positive-membership entry in the closed ``asdict`` allowlist.
+
+    Keyed by exact file + line + argument name, not just file: a file that
+    legitimately calls ``asdict`` once does not thereby license a second,
+    different, unreviewed call added later in the same file.
+    """
+
+    path: str
+    lineno: int
+    arg_name: str
+    justification: str
+
+
+#: Closed set. Add an entry ONLY when the argument at that exact call site is
+#: provably not credential-bearing, and say why. Anything else under `src/`
+#: or `scripts/` that calls `asdict` is a hard failure -- see
+#: `test_no_breezy_module_calls_asdict_on_a_credential`.
+_ALLOWED_ASDICT_CALL_SITES: tuple[_AllowedAsdictCallSite, ...] = (
+    _AllowedAsdictCallSite(
+        path="src/breezy/ingest/gate.py",
+        lineno=388,
+        arg_name="entry",
+        justification=(
+            "`entry` is a `_SiteEntry` -- a frozen dataclass of gate-state "
+            "booleans, timestamps and a `GateReason` enum used to persist "
+            "the settlement gate's state machine. It carries no "
+            "credential-bearing field; nothing here is loaded from, or "
+            "authenticates to, a venue."
+        ),
+    ),
+    _AllowedAsdictCallSite(
+        path="src/breezy/ingest/gate.py",
+        lineno=400,
+        arg_name="entry",
+        justification=(
+            "`entry` is a `_GlobalEntry` -- the cross-site UA-trap latch, "
+            "same shape as `_SiteEntry` above (booleans, a timestamp, a "
+            "`GateReason` enum). No credential-bearing field exists on the "
+            "type."
+        ),
+    ),
+)
+
+_ALLOWED_ASDICT_CALL_KEYS = frozenset(
+    (site.path, site.lineno, site.arg_name) for site in _ALLOWED_ASDICT_CALL_SITES
+)
+
+
+def find_unallowlisted_asdict_calls(path: str, source: str) -> list[str]:
+    """Flag every ``asdict(...)`` call site not in the closed allowlist.
+
+    Unlike ``find_asdict_on_credentials`` above, this does not look at what
+    the argument is NAMED at all -- it looks at whether the exact
+    ``(path, lineno, arg_name)`` triple is a member of
+    ``_ALLOWED_ASDICT_CALL_SITES``. A new call site under an unremarkable
+    name (``payload``, ``data``, ...) is caught precisely because it was
+    never granted membership, not because its name was recognised as
+    suspicious.
+    """
+    tree = ast.parse(source, filename=path)
+    found: list[str] = []
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        func = node.func
+        name = func.attr if isinstance(func, ast.Attribute) else getattr(func, "id", "")
+        if name != "asdict" or not node.args:
+            continue
+        arg = node.args[0]
+        target = arg.attr if isinstance(arg, ast.Attribute) else getattr(arg, "id", "<expr>")
+        if (path, node.lineno, target) in _ALLOWED_ASDICT_CALL_KEYS:
+            continue
+        found.append(
+            f"{path}:{node.lineno}: asdict({target}) is not in the closed "
+            "_ALLOWED_ASDICT_CALL_SITES allowlist"
+        )
+    return found
+
+
 def test_no_breezy_module_calls_asdict_on_a_credential() -> None:
     scanned_sources = list(_iter_python_sources(ASDICT_SCAN_ROOTS))
     if os.environ.get("BREEZY_ASDICT_GUARD_TRACE") == "1":
@@ -367,13 +472,17 @@ def test_no_breezy_module_calls_asdict_on_a_credential() -> None:
     violations = [
         v
         for path, source in scanned_sources
-        for v in find_asdict_on_credentials(path, source)
+        for v in find_unallowlisted_asdict_calls(path, source)
     ]
     assert violations == [], (
-        "dataclasses.asdict deep-copies SecureString fields and bypasses the "
-        "hand-written __repr__, republishing the first/last 4 characters of "
-        "the secret. Render credentials with "
-        "breezy.adapters.polymarket_us.redaction.redact_secure instead:\n" + "\n".join(violations)
+        "an asdict(...) call site exists under src/ or scripts/ that is not in "
+        "the closed _ALLOWED_ASDICT_CALL_SITES allowlist above. asdict deep-"
+        "copies field values and bypasses hand-written __repr__/__reduce__ "
+        "hooks entirely, so an unreviewed call site can leak or re-pickle "
+        "credential material regardless of what its argument is named. Either "
+        "remove the call, or -- only if the argument is provably non-"
+        "credential-bearing -- add it to _ALLOWED_ASDICT_CALL_SITES with a "
+        "justification:\n" + "\n".join(violations)
     )
 
 
@@ -399,3 +508,98 @@ def test_the_asdict_ban_is_not_vacuous() -> None:
 def test_the_asdict_ban_does_not_flag_legitimate_uses() -> None:
     source = "import dataclasses\n\n\ndef f(record):\n    return dataclasses.asdict(record)\n"
     assert find_asdict_on_credentials("src/breezy/ingest/gate.py", source) == []
+
+
+# --------------------------------------------------------------------------
+# Q-1 -- semantic-reach hardening (docs/core/PROGRESS.md): the name-based
+# heuristic above is an open blocklist and is always losable by inventing an
+# unremarkable variable name. These tests are written FIRST, against
+# `find_unallowlisted_asdict_calls` and `_ALLOWED_ASDICT_CALL_SITES`, which do
+# not exist yet -- this block is expected to fail (RED) until both are added.
+# --------------------------------------------------------------------------
+
+#: A call site that would defeat the OLD name-based heuristic: `data` is not
+#: in `_CREDENTIAL_ARG_HINTS`. Passed as literal (path, source) text -- not a
+#: real file on disk -- mirroring how `test_the_asdict_ban_is_not_vacuous`
+#: and `test_the_asdict_ban_does_not_flag_legitimate_uses` already exercise
+#: these scanner functions above: both take `(path, source)` and never touch
+#: the filesystem, so a synthetic path string plus literal source is exactly
+#: as valid as writing a throwaway module and is fully hermetic.
+_UNLISTED_ASDICT_FIXTURE_SOURCE = (
+    "import dataclasses\n\n\n"
+    "def leak_credentials(data):\n"
+    "    # `data` stands in for a credential-bearing dataclass at an\n"
+    "    # unremarkable call site -- the exact evasion Q-1 names.\n"
+    "    return dataclasses.asdict(data)\n"
+)
+
+
+def test_the_old_name_heuristic_misses_an_unremarkable_variable_name() -> None:
+    """BEFORE: the retained legacy heuristic passes this call site silently.
+
+    ``data`` is not in ``_CREDENTIAL_ARG_HINTS`` -- an open blocklist of
+    credential-sounding names is always losable this way. This is Q-1.
+    """
+    violations = find_asdict_on_credentials(
+        "src/breezy/_fixture_unlisted_asdict.py", _UNLISTED_ASDICT_FIXTURE_SOURCE
+    )
+    assert violations == []  # the gap Q-1 names -- proven still open here
+
+
+def test_the_new_allowlist_guard_catches_the_same_call_site() -> None:
+    """AFTER: the closed-membership allowlist flags the identical call site.
+
+    No name-based escape hatch exists here: the call site is simply absent
+    from ``_ALLOWED_ASDICT_CALL_SITES``, so it fails regardless of what the
+    argument is named.
+    """
+    violations = find_unallowlisted_asdict_calls(
+        "src/breezy/_fixture_unlisted_asdict.py", _UNLISTED_ASDICT_FIXTURE_SOURCE
+    )
+    assert violations != []
+    assert "asdict(data)" in violations[0]
+
+
+def test_every_allowlisted_call_site_carries_a_justification() -> None:
+    """Positive-membership entries must be justified, not just declared."""
+    assert _ALLOWED_ASDICT_CALL_SITES, "allowlist should not be silently empty"
+    for site in _ALLOWED_ASDICT_CALL_SITES:
+        assert site.justification.strip(), f"{site.path}:{site.lineno} has no justification"
+
+
+def test_every_allowlisted_call_site_still_exists_in_the_real_source() -> None:
+    """Guards against allowlist rot: a stale entry is an unused permission."""
+    sources = dict(_iter_python_sources(ASDICT_SCAN_ROOTS))
+    for site in _ALLOWED_ASDICT_CALL_SITES:
+        source = sources.get(site.path)
+        assert source is not None, f"{site.path} no longer exists under scan roots"
+        tree = ast.parse(source, filename=site.path)
+        calls_at_line = [
+            node
+            for node in ast.walk(tree)
+            if isinstance(node, ast.Call)
+            and (
+                (isinstance(node.func, ast.Attribute) and node.func.attr == "asdict")
+                or (isinstance(node.func, ast.Name) and node.func.id == "asdict")
+            )
+            and node.lineno == site.lineno
+        ]
+        assert calls_at_line, f"{site.path}:{site.lineno} no longer calls asdict"
+
+
+def test_no_unallowlisted_asdict_call_exists_under_the_scan_roots() -> None:
+    """The NEW guard, run for real: every asdict call site under src/ and
+    scripts/ must be exactly the closed allowlist -- nothing more."""
+    scanned_sources = list(_iter_python_sources(ASDICT_SCAN_ROOTS))
+    violations = [
+        v
+        for path, source in scanned_sources
+        for v in find_unallowlisted_asdict_calls(path, source)
+    ]
+    assert violations == [], (
+        "an asdict(...) call site exists under src/ or scripts/ that is not in "
+        "the closed _ALLOWED_ASDICT_CALL_SITES allowlist. Either the call must "
+        "be removed, or -- only if the argument is provably non-credential-"
+        "bearing -- added to the allowlist with a justification comment:\n"
+        + "\n".join(violations)
+    )

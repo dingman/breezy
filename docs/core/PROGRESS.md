@@ -1214,9 +1214,18 @@ corroborated closed interval facts. Evidence:
 
 ### Quality and infrastructure
 
-- **[MEDIUM] Q-1** The asdict credential guard is a name-based AST heuristic;
+- **[CLOSED] Q-1** The asdict credential guard was a name-based AST heuristic;
   `asdict(x)` where `x` holds credential material under an unexpected name still
-  passes (`fc34152` fixed coverage, not semantic reach).
+  passed (`fc34152` fixed coverage, not semantic reach).
+  Closed: `find_unallowlisted_asdict_calls` inverts the default -- every
+  `asdict(...)` call site under `src/`/`scripts/` fails unless it is a member
+  of the closed, positively-justified `_ALLOWED_ASDICT_CALL_SITES` set (2
+  real call sites, both `src/breezy/ingest/gate.py`, non-credential gate
+  state). The old heuristic is retained, unchanged, only as a pinned example
+  of the gap it left. Evidence: `pytest -q
+  tests/unit/test_polymarket_us_credential_serialization.py` passed (24
+  tests); a live mutation test (an `asdict(payload)` call appended to and
+  reverted from `gate.py`) reproduced the guard failing before the revert.
 - **[LOW] Q-2** `tests/` is not typechecked — 159 strict errors across 38 files.
 - **[LOW] Q-3** `scripts/analysis` carries 5 pre-existing strict errors
   (`settlement_bucket_gate.py:189,466`; `settlement_alignment_diagnosis.py:473,482`).
