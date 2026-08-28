@@ -9,6 +9,7 @@ whichever fragment sorts first and silently coerces the rest.
 from __future__ import annotations
 
 import datetime as dt
+from typing import Any
 
 import pyarrow as pa
 import pytest
@@ -21,11 +22,14 @@ class _Rec:
         self.d = d
         self.v = v
 
-    def to_dict(self) -> dict[str, object]:
+    def to_dict(self) -> dict[str, Any]:
         return {"d": self.d, "v": self.v}
 
     @classmethod
-    def from_dict(cls, values: dict) -> _Rec:
+    def from_dict(cls, values: dict[str, Any]) -> _Rec:
+        # Matches `ArrowRecord.from_dict`'s own `dict[str, Any]` signature
+        # (src/breezy/domain/strict_arrow.py) so this double cannot drift
+        # from the Protocol it models.
         return cls(values["d"], values["v"])
 
 

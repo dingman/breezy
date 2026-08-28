@@ -270,7 +270,7 @@ def build_actor(shared: SharedIngestState, **config_overrides: Any) -> NwsIngest
     kwargs: dict[str, Any] = {"venue": VENUE, "city": CITY, "poll_interval_seconds": 300}
     kwargs.update(config_overrides)
     instance = NwsIngestActor(config=NwsIngestActorConfig(**kwargs), shared=shared)
-    instance.sleep_between_product_fetches = _no_product_fetch_sleep  # type: ignore[attr-defined]
+    instance.sleep_between_product_fetches = _no_product_fetch_sleep
     instance.register_base(
         portfolio=TestComponentStubs.portfolio(),
         msgbus=TestComponentStubs.msgbus(),
@@ -278,10 +278,10 @@ def build_actor(shared: SharedIngestState, **config_overrides: Any) -> NwsIngest
         clock=TestClock(),
     )
     published: list[tuple[Any, Any]] = []
-    instance.publish_data = lambda data_type, data: published.append(  # type: ignore[method-assign]
+    instance.publish_data = lambda data_type, data: published.append(
         (data_type, data)
     )
-    instance.published = published  # type: ignore[attr-defined]
+    instance.published = published
     return instance
 
 
@@ -683,7 +683,7 @@ async def test_304_is_a_terminal_no_op_success(
         await actor.poll_once()
 
     assert shared.gate.status(VENUE, CITY).state is GateState.OPEN
-    assert actor.published == []  # type: ignore[attr-defined]
+    assert actor.published == []
     assert actor.resume_cursor is None
 
 
@@ -874,7 +874,7 @@ async def test_product_fetches_are_paced_after_the_first_and_keep_issuance_order
         events.append(f"fetch:{dirname}")
         return httpx.Response(200, json=product_payload(dirname))
 
-    actor.sleep_between_product_fetches = _record_sleep  # type: ignore[attr-defined]
+    actor.sleep_between_product_fetches = _record_sleep
 
     with respx.mock(assert_all_called=False) as mock:
         # Deliberately newest-first in discovery; fetch order must still be
@@ -938,7 +938,7 @@ async def test_publish_uses_the_raw_record_and_the_shared_data_type_factory(
         actor.on_start()
         await actor.poll_once()
 
-    published = actor.published  # type: ignore[attr-defined]
+    published = actor.published
     types = {dt_.type for dt_, _ in published}
     assert types == {NwsClimateDay, NwsRawProduct}
     for data_type, payload in published:
@@ -968,7 +968,7 @@ async def test_sibling_station_product_is_routine_and_never_blocks(
     causes = shared.gate.blocking_causes(VENUE, CITY)
     assert GateReason.PARSER_FAILURE not in causes
     assert GateReason.OVERSIZE_OR_PARSE_TIMEOUT not in causes
-    assert actor.published == []  # type: ignore[attr-defined]
+    assert actor.published == []
 
 
 @pytest.mark.asyncio
@@ -1046,7 +1046,7 @@ async def test_ambiguous_headline_records_its_own_reason(
             return_value=httpx.Response(200, json=payload)
         )
         actor.on_start()
-        actor.classify_issuance = _raise  # type: ignore[method-assign]
+        actor.classify_issuance = _raise
         await actor.poll_once()
 
     assert GateReason.AMBIGUOUS_HEADLINE in shared.gate.blocking_causes(VENUE, CITY)
@@ -1094,7 +1094,7 @@ async def test_incomplete_write_blocks_and_never_records_a_successful_poll(
     def _skip_everything(_catalog: Any, records: Sequence[Any]) -> WriteOutcome:
         return WriteOutcome(written=(), skipped=tuple(records), path="/fake")
 
-    actor.write_records = _skip_everything  # type: ignore[method-assign]
+    actor.write_records = _skip_everything
 
     with respx.mock(assert_all_called=False) as mock:
         mock_discovery(mock, NYC_FINAL)
@@ -1106,7 +1106,7 @@ async def test_incomplete_write_blocks_and_never_records_a_successful_poll(
     assert GateReason.WRITE_INTEGRITY_VIOLATION in shared.gate.blocking_causes(
         VENUE, CITY
     )
-    assert actor.published == []  # type: ignore[attr-defined]
+    assert actor.published == []
 
 
 @pytest.mark.asyncio
@@ -1120,7 +1120,7 @@ async def test_catalog_write_error_routes_to_write_integrity_violation(
     def _raise(_catalog: Any, _records: Sequence[Any]) -> WriteOutcome:
         raise ConcurrentWriterError("another writer holds the lock")
 
-    actor.write_records = _raise  # type: ignore[method-assign]
+    actor.write_records = _raise
 
     with respx.mock(assert_all_called=False) as mock:
         mock_discovery(mock, NYC_FINAL)
@@ -1147,7 +1147,7 @@ async def test_catalog_write_cancellation_propagates_without_durable_block(
     def _cancel(_catalog: Any, _records: Sequence[Any]) -> WriteOutcome:
         raise asyncio.CancelledError("shutdown")
 
-    actor.write_records = _cancel  # type: ignore[method-assign]
+    actor.write_records = _cancel
 
     with respx.mock(assert_all_called=False) as mock:
         mock_discovery(mock, NYC_FINAL)
@@ -1176,7 +1176,7 @@ async def test_parse_timeout_records_its_own_reason(
         _time.sleep(0.5)
         raise AssertionError("unreachable")
 
-    actor.parse_cli_product = _slow  # type: ignore[method-assign]
+    actor.parse_cli_product = _slow
 
     with respx.mock(assert_all_called=False) as mock:
         mock_discovery(mock, NYC_FINAL)
@@ -1323,12 +1323,12 @@ async def test_resume_cursor_is_durable_at_the_moment_of_each_publish(
         await actor.poll_once()
 
     cursor_writes = [k for k, _ in store.writes if "cursor" in k]
-    published = actor.published  # type: ignore[attr-defined]
+    published = actor.published
     assert len(cursor_writes) == len(published), (
         "every publish must be followed by a durable cursor write"
     )
     assert actor.resume_cursor is not None
-    assert actor.cache.writes == [], (  # type: ignore[attr-defined]
+    assert actor.cache.writes == [], (
         "nothing may be persisted through the memory-only Nautilus Cache"
     )
 
@@ -1349,7 +1349,7 @@ async def test_cursor_comparison_is_strict_on_the_full_tuple(
         actor.on_start()
         await actor.poll_once()
 
-    published = actor.published  # type: ignore[attr-defined]
+    published = actor.published
     ts_inits = {payload.ts_init for _, payload in published}
     assert len(published) == 2
     assert len(ts_inits) == 1, "the two records share one retrieved_at_ns by design"
@@ -1370,17 +1370,17 @@ async def test_warm_start_republishes_only_records_past_the_cursor(
         actor.on_start()
         await actor.poll_once()
 
-    live_published = list(actor.published)  # type: ignore[attr-defined]
-    actor.published.clear()  # type: ignore[attr-defined]
+    live_published = list(actor.published)
+    actor.published.clear()
 
     # Cursor already at the head: nothing to replay.
     await actor.warm_start()
-    assert actor.published == []  # type: ignore[attr-defined]
+    assert actor.published == []
 
     # Rewind the cursor: everything replays, in the same order.
     actor.reset_cursor()
     await actor.warm_start()
-    replayed = actor.published  # type: ignore[attr-defined]
+    replayed = actor.published
     assert [type(p).__name__ for _, p in replayed] == [
         type(p).__name__ for _, p in live_published
     ]
@@ -1393,7 +1393,7 @@ async def test_warm_start_is_a_no_op_on_an_empty_catalog(
     """A cold station root has no records; warm start must not fabricate one."""
     actor.on_start()
     await actor.warm_start()
-    assert actor.published == []  # type: ignore[attr-defined]
+    assert actor.published == []
     assert actor.resume_cursor is None
 
 
@@ -1608,7 +1608,7 @@ async def test_catalog_io_runs_off_the_event_loop(actor: NwsIngestActor) -> None
         idents.append(threading.get_ident())
         return original(catalog, records)
 
-    actor.write_records = _spy  # type: ignore[method-assign]
+    actor.write_records = _spy
 
     with respx.mock(assert_all_called=False) as mock:
         mock_discovery(mock, NYC_FINAL)
@@ -1631,7 +1631,7 @@ def test_data_type_factory_refuses_an_unregistered_record_type() -> None:
     factory would be the mirror of that bug, so it is a hard error rather than
     a best-effort `DataType(type(record))`."""
     with pytest.raises(TypeError, match="no shared DataType factory"):
-        nws_actor_module._data_type_for(object())  # type: ignore[arg-type]
+        nws_actor_module._data_type_for(object())
 
 
 @pytest.mark.asyncio
@@ -1823,7 +1823,7 @@ async def test_content_error_from_the_parser_is_a_crit_parse_failure(
     def _raise(*_args: Any, **_kwargs: Any) -> Any:
         raise CliContentError("induced content error")
 
-    actor.parse_cli_product = _raise  # type: ignore[method-assign]
+    actor.parse_cli_product = _raise
 
     with respx.mock(assert_all_called=False) as mock:
         mock_discovery(mock, NYC_FINAL)
@@ -1895,10 +1895,10 @@ async def test_publishing_the_same_records_twice_is_idempotent(
         actor.on_start()
         await actor.poll_once()
 
-    published_once = len(actor.published)  # type: ignore[attr-defined]
+    published_once = len(actor.published)
     catalog = open_station_catalog(tmp_path / "nws", VENUE, CITY)
     actor._publish_records([*read_climate_days(catalog), *read_raw_products(catalog)])
-    assert len(actor.published) == published_once  # type: ignore[attr-defined]
+    assert len(actor.published) == published_once
 
 
 @pytest.mark.asyncio
@@ -1918,9 +1918,9 @@ async def test_corrupt_cursor_replays_rather_than_skipping(
     actor._cursor_loaded = False
     assert actor.resume_cursor is None
 
-    actor.published.clear()  # type: ignore[attr-defined]
+    actor.published.clear()
     await actor.warm_start()
-    assert len(actor.published) == 2  # type: ignore[attr-defined]
+    assert len(actor.published) == 2
 
 
 @pytest.mark.asyncio
@@ -2023,7 +2023,7 @@ async def test_parser_may_also_report_a_sibling_station(
     def _raise(*_args: Any, **_kwargs: Any) -> Any:
         raise CliNotOurProductError("sibling station at the parse step")
 
-    actor.parse_cli_product = _raise  # type: ignore[method-assign]
+    actor.parse_cli_product = _raise
 
     with respx.mock(assert_all_called=False) as mock:
         mock_discovery(mock, NYC_FINAL)
@@ -2034,7 +2034,7 @@ async def test_parser_may_also_report_a_sibling_station(
     causes = shared.gate.blocking_causes(VENUE, CITY)
     assert GateReason.PARSER_FAILURE not in causes
     assert GateReason.OVERSIZE_OR_PARSE_TIMEOUT not in causes
-    assert actor.published == []  # type: ignore[attr-defined]
+    assert actor.published == []
 
 
 @pytest.mark.asyncio
@@ -2084,9 +2084,9 @@ async def test_a_persisted_cursor_round_trips_across_a_restart(
     actor._cursor_loaded = False  # simulate a fresh process reading it back
     assert actor.resume_cursor == in_memory
 
-    actor.published.clear()  # type: ignore[attr-defined]
+    actor.published.clear()
     await actor.warm_start()
-    assert actor.published == []  # type: ignore[attr-defined]
+    assert actor.published == []
 
 
 # ---------------------------------------------------------------------------

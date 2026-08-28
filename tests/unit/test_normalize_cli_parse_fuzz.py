@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import re
 import time
+from typing import Literal
 
 from hypothesis import HealthCheck, given, settings
 from hypothesis import strategies as st
@@ -88,9 +89,10 @@ def _adversarial_text() -> st.SearchStrategy[str]:
         ]
     )
 
+    excluded_categories: tuple[Literal["Cs"]] = ("Cs",)
     high_cardinality_unicode = st.text(
         alphabet=st.characters(
-            min_codepoint=0x20, max_codepoint=0x1FFFF, exclude_categories=("Cs",)
+            min_codepoint=0x20, max_codepoint=0x1FFFF, exclude_categories=excluded_categories
         ),
         min_size=0,
         max_size=20_000,

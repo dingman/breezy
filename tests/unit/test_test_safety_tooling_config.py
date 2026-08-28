@@ -96,10 +96,13 @@ def test_polymarket_com_adapter_imports_are_banned_repo_wide() -> None:
         tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
         for node in ast.walk(tree):
             imported_modules: list[str] = []
+            lineno = 0
             if isinstance(node, ast.Import):
                 imported_modules = [alias.name for alias in node.names]
+                lineno = node.lineno
             elif isinstance(node, ast.ImportFrom) and node.module is not None:
                 imported_modules = [node.module]
+                lineno = node.lineno
 
             for imported_module in imported_modules:
                 if any(
@@ -107,6 +110,6 @@ def test_polymarket_com_adapter_imports_are_banned_repo_wide() -> None:
                     for banned in _BANNED_POLYMARKET_COM_ADAPTERS
                 ):
                     relative = path.relative_to(_REPO_ROOT)
-                    offenders.append(f"{relative}:{node.lineno}: {imported_module}")
+                    offenders.append(f"{relative}:{lineno}: {imported_module}")
 
     assert offenders == []

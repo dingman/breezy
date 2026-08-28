@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import dataclasses
 from datetime import date
+from typing import TypedDict
 
 import pytest
 
@@ -17,7 +18,17 @@ from breezy.normalize.reading import ClimateDayReading
 from breezy.normalize.units import TemperatureReadingF
 
 
-def _reading_kwargs() -> dict:
+class _ReadingKwargs(TypedDict):
+    station: str
+    climate_day: date
+    tmax: TemperatureReadingF
+    tmin: TemperatureReadingF
+    tavg: TemperatureReadingF
+    is_final: bool
+    has_correction_evidence: bool
+
+
+def _reading_kwargs() -> _ReadingKwargs:
     return {
         "station": "NYC",
         "climate_day": date(2026, 8, 21),

@@ -248,7 +248,7 @@ async def test_a_raising_reconcile_is_logged_and_does_not_fail_the_poll(
             mock_product(mock, NYC_FINAL)
             await actor.poll_once()
 
-        assert actor.published, "the poll must still complete and publish"  # type: ignore[attr-defined]
+        assert actor.published, "the poll must still complete and publish"
         status = runtime.shared.gate.status(VENUE, CITY)
         assert status.state is not GateState.BLOCKED
         assert GateReason.STATE_STORE_TAMPERED not in runtime.shared.gate.blocking_causes(
@@ -279,7 +279,7 @@ async def test_a_raising_alert_sink_does_not_break_collection(
             await actor.poll_once()
 
         assert sink.calls > 0, "positive control: the sink must actually have been called"
-        assert actor.published, "collection must be unaffected by a dead sink"  # type: ignore[attr-defined]
+        assert actor.published, "collection must be unaffected by a dead sink"
         assert gaps.site_entries(runtime.store, VENUE, CITY) != ()
 
 

@@ -373,7 +373,7 @@ class TestBootstrapWitnessAgainstWholeFileDeletion:
         after_poll = reopened_gate.record_successful_poll(VENUE, CITY, detail="ordinary poll")
         assert after_poll.state is GateState.BLOCKED
         assert after_poll.reason is GateReason.STATE_STORE_TAMPERED
-        assert after_poll.reason is not GateReason.SUCCESSFUL_POLL
+        assert after_poll.reason is not GateReason.SUCCESSFUL_POLL  # type: ignore[comparison-overlap]  # tautological given the preceding `is` assert; kept as explicit documentation that the two enum members are mutually exclusive
 
         # The existing, already-tested recovery path still works unchanged.
         reopened_gate.acknowledge_ua_trap_resolved(detail="verified: restore was legitimate")
@@ -424,10 +424,14 @@ class TestBootstrapWitnessAgainstWholeFileDeletion:
         store.close()
 
         for restart_ns in (2_000, 3_000, 4_000):
+
+            def _clock(restart_ns: int = restart_ns) -> int:
+                return restart_ns
+
             reopened_store = SqliteStateStore(path)
             enforce_bootstrap_witness(reopened_store, catalog_base=catalog_base)
             reopened_gate = SettlementGate(
-                store=reopened_store, clock=lambda restart_ns=restart_ns: restart_ns, sites=sites
+                store=reopened_store, clock=_clock, sites=sites
             )
             status = reopened_gate.status(VENUE, CITY)
             assert status.state is GateState.OPEN

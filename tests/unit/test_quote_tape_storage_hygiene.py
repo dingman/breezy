@@ -125,6 +125,7 @@ class TestFileRotation:
         )
         streaming = config.streaming
 
+        assert streaming is not None
         assert streaming.rotation_mode == RotationMode.SCHEDULED_DATES
         assert streaming.rotation_timezone == "UTC"
 
@@ -136,4 +137,5 @@ class TestFileRotation:
             make_tape_settings(tmp_path), make_data_client_config()
         )
 
+        assert config.streaming is not None
         assert config.streaming.max_file_size > 0

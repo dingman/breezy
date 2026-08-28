@@ -335,7 +335,7 @@ def test_settings_is_frozen() -> None:
 def test_settings_has_no_dict_slots_only() -> None:
     settings = load_settings(_env())
     with pytest.raises(AttributeError):
-        _ = settings.__dict__  # type: ignore[attr-defined]
+        _ = settings.__dict__
 
 
 # ---------------------------------------------------------------------------
@@ -352,7 +352,7 @@ def test_settings_never_reads_breezy_user_agent_env_var() -> None:
 
     class TrackingEnv(dict[str, str]):
         def __init__(self, *args: object, **kwargs: object) -> None:
-            super().__init__(*args, **kwargs)  # type: ignore[arg-type]
+            super().__init__(*args, **kwargs)
             self.accessed_keys: set[str] = set()
 
         def __getitem__(self, key: str) -> str:

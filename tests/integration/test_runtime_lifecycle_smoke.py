@@ -115,6 +115,7 @@ def run_one_lifecycle(settings: BreezyRuntimeSettings) -> RecordingNode:
     with ingest_runtime(settings, clock=make_clock(), probe=local_probe) as runtime:
         assert isinstance(runtime, BreezyIngestRuntime)
         node = build_ingest_node(runtime, node_factory=RecordingNode)
+        assert isinstance(node, RecordingNode)
         node.build()
         node.run()
         node.dispose()

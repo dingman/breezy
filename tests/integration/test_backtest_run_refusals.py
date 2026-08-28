@@ -91,7 +91,7 @@ def _weather_before_the_book(tape: SyntheticBinaryTape) -> tuple[object, ...]:
     The realistic case, not a contrived one: NWS issues the climate day in the
     morning, the venue tape starts later.
     """
-    first_depth: OrderBookDepth10 = tape.market_data[0]  # type: ignore[assignment]
+    first_depth: OrderBookDepth10 = tape.market_data[0]
     return tuple(
         as_backtest_data([make_climate_day(retrieved_at_ns=first_depth.ts_init - 1)]),
     )
@@ -356,7 +356,7 @@ class _PostOnlyProbeConfig(StrategyConfig, frozen=True):
     instrument_id: object
 
 
-class _PostOnlyProbe(Strategy):
+class _PostOnlyProbe(Strategy):  # type: ignore[misc]  # Strategy is a compiled Cython class erasing to Any
     """Submits one post-only LIMIT far from the touch, so it can never fill."""
 
     def __init__(self, config: _PostOnlyProbeConfig) -> None:
@@ -420,7 +420,7 @@ class _NakedShortProbeConfig(StrategyConfig, frozen=True):
     quantity: Decimal
 
 
-class _NakedShortProbe(Strategy):
+class _NakedShortProbe(Strategy):  # type: ignore[misc]  # Strategy is a compiled Cython class erasing to Any
     """Sells with no position at all -- which the RiskEngine cannot catch.
 
     `CashAccount.balance_impact` returns +notional for a SELL, so

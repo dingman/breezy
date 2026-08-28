@@ -203,25 +203,58 @@ class ObservedRecord(Protocol):
     that class (which would pull in ``nautilus_trader`` and trigger its
     module-scope ``register_arrow`` side effect, exactly the isolation
     ``product_index.py`` already argues for and this module matches).
+
+    Every member is a read-only ``@property``, not a plain attribute: this
+    module only ever READS a record's fields (never assigns one), and a
+    frozen-dataclass test double modeling this Protocol -- exactly the kind
+    the module's own tests use -- has read-only attributes too. A plain
+    attribute declaration here would demand a *settable* variable for
+    structural matching, which a frozen dataclass can never satisfy even
+    though it is, behaviorally, a perfectly conforming ``ObservedRecord``.
     """
 
-    station: str
-    climate_day: dt.date
-    ts_init: int
-    is_final: bool
-    revision_seq: int
-    correction_flag: bool
-    is_superseded: bool
-    #: Digest of the verbatim product text. The identity of the OBSERVATION,
-    #: as opposed to ``revision_seq``, which identifies only its position in
-    #: the catalog -- see :func:`_is_revision`.
-    raw_sha256: str
-    #: The settlement-relevant readings: the observed high, low and the
-    #: product's own published average. ``None`` when the paired sentinel flag
-    #: names a missing/trace value.
-    tmax_f: int | None
-    tmin_f: int | None
-    tavg_f: int | None
+    @property
+    def station(self) -> str: ...
+
+    @property
+    def climate_day(self) -> dt.date: ...
+
+    @property
+    def ts_init(self) -> int: ...
+
+    @property
+    def is_final(self) -> bool: ...
+
+    @property
+    def revision_seq(self) -> int: ...
+
+    @property
+    def correction_flag(self) -> bool: ...
+
+    @property
+    def is_superseded(self) -> bool: ...
+
+    @property
+    def raw_sha256(self) -> str:
+        """Digest of the verbatim product text. The identity of the
+        OBSERVATION, as opposed to ``revision_seq``, which identifies only
+        its position in the catalog -- see :func:`_is_revision`.
+        """
+        ...
+
+    @property
+    def tmax_f(self) -> int | None:
+        """The settlement-relevant readings: the observed high, low and the
+        product's own published average. ``None`` when the paired sentinel
+        flag names a missing/trace value.
+        """
+        ...
+
+    @property
+    def tmin_f(self) -> int | None: ...
+
+    @property
+    def tavg_f(self) -> int | None: ...
 
 
 class TamperedGapLedgerError(Exception):

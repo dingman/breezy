@@ -23,7 +23,9 @@ from pathlib import Path
 import pytest
 
 from breezy.ingest.gate import (
+    DEFAULT_BURST_POLICY,
     DURABILITY_PROBE_KEY,
+    CrossSiteBurstPolicy,
     GateState,
     InMemoryStateStore,
     SettlementGate,
@@ -33,10 +35,8 @@ from breezy.ingest.gate import (
 from breezy.ingest.http import UserAgentConfigurationError
 from breezy.ingest.product_index import ProductIntegrityIndex
 from breezy.ingest.shared_state import (
-    DEFAULT_BURST_POLICY,
     FORBIDDEN_403_CAUSE,
     CrossSite403Window,
-    CrossSiteBurstPolicy,
     DuplicateSharedIngestStateError,
     DuplicateSiteRegistrationError,
     ForeignComponentError,

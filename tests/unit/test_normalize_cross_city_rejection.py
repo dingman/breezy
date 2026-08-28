@@ -17,6 +17,7 @@ from __future__ import annotations
 import re
 import tomllib
 from pathlib import Path
+from typing import Any, cast
 
 import pytest
 
@@ -40,19 +41,21 @@ def _load_text(dirname: str) -> str:
     return (FIXTURES_DIR / dirname / "product.txt").read_text()
 
 
-def _load_sites() -> dict[str, dict]:
+def _load_sites() -> dict[str, dict[str, Any]]:
     with SITES_TOML.open("rb") as handle:
         data = tomllib.load(handle)
-    return data["sites"]["polymarket_us"]
+    # tomllib.load returns dict[str, Any]; the nested chain below is
+    # genuinely Any until we assert the shape at this parsing boundary.
+    return cast("dict[str, dict[str, Any]]", data["sites"]["polymarket_us"])
 
 
 @pytest.fixture(scope="module")
-def sites() -> dict[str, dict]:
+def sites() -> dict[str, dict[str, Any]]:
     return _load_sites()
 
 
 @pytest.fixture(scope="module")
-def station_header_lines(sites: dict[str, dict]) -> dict[str, str]:
+def station_header_lines(sites: dict[str, dict[str, Any]]) -> dict[str, str]:
     """Each city's real station header line, extracted via its OWN registry
     regex (i.e. each fixture is confirmed self-consistent first).
     """
@@ -68,7 +71,7 @@ def station_header_lines(sites: dict[str, dict]) -> dict[str, str]:
 
 @pytest.mark.parametrize("city", ["NYC", "SFO", "MIA", "MDW", "LAX"])
 def test_body_header_regex_rejects_every_other_city(
-    city: str, sites: dict[str, dict], station_header_lines: dict[str, str]
+    city: str, sites: dict[str, dict[str, Any]], station_header_lines: dict[str, str]
 ) -> None:
     own_regex = sites[city]["body_header_regex"]
 

@@ -96,7 +96,7 @@ def test_a_store_that_declares_durability_but_drops_writes_is_rejected() -> None
 
     store = LyingStore()
     with pytest.raises(StateStoreNotDurableError):
-        assert_state_store_durable(store, opener=LyingStore)  # type: ignore[arg-type]
+        assert_state_store_durable(store, opener=LyingStore)
 
 
 def test_a_write_only_visible_to_the_writing_handle_is_rejected() -> None:
@@ -105,7 +105,7 @@ def test_a_write_only_visible_to_the_writing_handle_is_rejected() -> None:
     """
     store, _shared_opener = shared_memory_store()
     with pytest.raises(StateStoreNotDurableError):
-        assert_state_store_durable(store, opener=InMemoryStateStore)  # type: ignore[arg-type]
+        assert_state_store_durable(store, opener=InMemoryStateStore)
 
 
 def test_a_store_that_never_re_reads_the_medium_is_rejected() -> None:
@@ -140,7 +140,7 @@ def test_a_store_that_never_re_reads_the_medium_is_rejected() -> None:
 
     store = WriteThroughReadCachedStore()
     with pytest.raises(StateStoreNotDurableError):
-        assert_state_store_durable(store, opener=SharedView)  # type: ignore[arg-type]
+        assert_state_store_durable(store, opener=SharedView)
 
 
 def test_a_store_that_loses_state_when_a_handle_closes_is_rejected() -> None:
@@ -161,8 +161,8 @@ def test_a_store_that_loses_state_when_a_handle_closes_is_rejected() -> None:
 
     with pytest.raises(StateStoreNotDurableError):
         assert_state_store_durable(
-            VolatileOnCloseStore(),  # type: ignore[arg-type]
-            opener=VolatileOnCloseStore,  # type: ignore[arg-type]
+            VolatileOnCloseStore(),
+            opener=VolatileOnCloseStore,
         )
 
 
@@ -290,7 +290,7 @@ def test_an_io_failure_at_any_probe_stage_fails_closed(stage: str, fragment: str
     store = store_cls()
 
     with pytest.raises(StateStoreNotDurableError) as excinfo:
-        assert_state_store_durable(store, opener=store_cls)  # type: ignore[arg-type]
+        assert_state_store_durable(store, opener=store_cls)
 
     assert fragment in str(excinfo.value)
 

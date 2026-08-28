@@ -317,7 +317,7 @@ def test_write_records_fails_loudly_for_an_unregistered_record_type(tmp_path: Pa
     a rejected batch leaves no trace on disk.
     """
 
-    class Unregistered(Data):
+    class Unregistered(Data):  # type: ignore[misc]  # Data is a compiled Cython class erasing to Any
         @property
         def ts_event(self) -> int:
             return 0

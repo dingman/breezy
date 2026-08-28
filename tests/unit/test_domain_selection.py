@@ -111,7 +111,9 @@ def test_as_of_bound_reproduces_the_pre_correction_answer() -> None:
     )
     records = [first, correction]
 
-    assert select_climate_day(records, "NYC", dt.date(2026, 8, 22)).tmax_f == 85
+    current = select_climate_day(records, "NYC", dt.date(2026, 8, 22))
+    assert current is not None
+    assert current.tmax_f == 85
     as_of = select_climate_day(
         records,
         "NYC",
@@ -157,7 +159,7 @@ def test_custom_data_wrappers_are_rejected_with_a_pointed_message() -> None:
 
     wrapped = CustomData(DataType(NwsClimateDay), make_climate_day())
     with pytest.raises(TypeError, match="CustomData"):
-        latest_by_climate_day([wrapped])  # type: ignore[list-item]
+        latest_by_climate_day([wrapped])
 
 
 # -- finality precedence --------------------------------------------------------------------

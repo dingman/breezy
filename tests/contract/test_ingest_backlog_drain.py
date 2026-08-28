@@ -54,16 +54,21 @@ import pytest
 import respx
 
 from breezy.ingest.gate import GateReason, GateState
-from breezy.persistence.catalog import (
-    open_station_catalog,
-    read_climate_days,
-    read_raw_products,
-)
 
 # Re-used, not re-invented (task constraint): the `actor`/`shared`/`clock`/
 # `store`/`store_pair`/`registry` fixtures are picked up automatically from
 # `tests/contract/conftest.py`, which re-exports them from the unit suite.
 # Only the plain helpers/constants/types are imported directly here.
+# `NwsIngestActor`/`SharedIngestState` come from their OWN modules, not the
+# unit suite: the unit suite itself only re-imports them, and mypy's strict
+# `implicit_reexport` rule (correctly) refuses a second-hand re-export.
+from breezy.ingest.nws_actor import NwsIngestActor
+from breezy.ingest.shared_state import SharedIngestState
+from breezy.persistence.catalog import (
+    open_station_catalog,
+    read_climate_days,
+    read_raw_products,
+)
 from tests.unit.test_ingest_nws_actor import (
     BASE_URL,
     CITY,
@@ -71,8 +76,6 @@ from tests.unit.test_ingest_nws_actor import (
     SECOND,
     VENUE,
     FakeClock,
-    NwsIngestActor,
-    SharedIngestState,
     discovery_payload,
 )
 

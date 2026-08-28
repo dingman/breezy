@@ -1884,7 +1884,7 @@ def test_a_wiped_global_row_fails_closed_instead_of_laundering_the_ua_trap(tmp_p
 
     assert after_wipe.state is GateState.BLOCKED
     assert after_wipe.reason is GateReason.STATE_STORE_TAMPERED
-    assert after_wipe.reason is not GateReason.NEVER_POLLED
+    assert after_wipe.reason is not GateReason.NEVER_POLLED  # type: ignore[comparison-overlap]  # tautological given the preceding `is` assert; kept as explicit documentation that the two enum members are mutually exclusive
 
     # And the halt must NOT self-clear on the next ordinary successful poll
     # -- that is precisely the laundering path this fix closes.

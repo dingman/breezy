@@ -609,7 +609,7 @@ def test_a_concurrent_writer_is_routed_distinctly_from_its_parent_lock_error() -
 
     assert child.outcome is PollOutcome.CONCURRENT_WRITER
     assert parent.outcome is PollOutcome.WRITER_LOCK_FAILURE
-    assert child.outcome is not parent.outcome
+    assert child.outcome is not parent.outcome  # type: ignore[comparison-overlap]  # tautological given the preceding `is` assert; kept as explicit documentation that the two enum members are mutually exclusive
 
 
 def test_an_unrouted_catalog_error_fails_closed() -> None:
@@ -805,7 +805,7 @@ def test_oversize_body_uses_the_gates_dedicated_recorder_not_the_generic_alarm()
     decision = route_transport_error(OversizeBodyError("exceeded the 128 KiB cap"))
 
     assert decision.action is GateAction.RECORD_OVERSIZE_OR_PARSE_TIMEOUT
-    assert decision.action is not GateAction.RECORD_TRANSPORT_INTEGRITY_ALARM
+    assert decision.action is not GateAction.RECORD_TRANSPORT_INTEGRITY_ALARM  # type: ignore[comparison-overlap]  # tautological given the preceding `is` assert; kept as explicit documentation that the two enum members are mutually exclusive
     # Still not a transport hiccup.
     assert decision.is_integrity_alarm is True
     assert decision.is_transient is False

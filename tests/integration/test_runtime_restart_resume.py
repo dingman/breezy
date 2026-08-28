@@ -144,10 +144,10 @@ def _register(actor: NwsIngestActor) -> NwsIngestActor:
         clock=TestClock(),
     )
     published: list[tuple[Any, Any]] = []
-    actor.publish_data = lambda data_type, data: published.append(  # type: ignore[method-assign]
+    actor.publish_data = lambda data_type, data: published.append(
         (data_type, data)
     )
-    actor.published = published  # type: ignore[attr-defined]
+    actor.published = published
     return actor
 
 
@@ -266,7 +266,7 @@ async def test_resume_cursor_survives_a_full_teardown_and_rebuild(
             mock_product(mock, NYC_FINAL)
             await actor.poll_once()
 
-        assert actor.published, "the poll must publish, or there is no cursor to test"  # type: ignore[attr-defined]
+        assert actor.published, "the poll must publish, or there is no cursor to test"
         in_process = actor.resume_cursor
         assert in_process is not None
 
@@ -284,7 +284,7 @@ async def test_resume_cursor_survives_a_full_teardown_and_rebuild(
 
         # A3 -- nothing to replay.
         await start_and_settle(actor2)
-        assert actor2.published == []  # type: ignore[attr-defined]
+        assert actor2.published == []
 
 
 # ---------------------------------------------------------------------------
@@ -328,7 +328,7 @@ async def test_cursor_is_durable_at_the_moment_of_a_kill_between_persist_and_pub
             mock_product(mock, NYC_FINAL)
             await actor.poll_once()
 
-        published_before_kill = list(actor.published)  # type: ignore[attr-defined]
+        published_before_kill = list(actor.published)
         assert published_before_kill
         cursor_at_kill = runtime.store.get(CURSOR_KEY)
         assert cursor_at_kill is not None, (
@@ -342,7 +342,7 @@ async def test_cursor_is_durable_at_the_moment_of_a_kill_between_persist_and_pub
             real_write(catalog, records)
             raise _Killed("process killed after the durable write, before publish")
 
-        actor.write_records = write_then_die  # type: ignore[assignment]
+        actor.write_records = write_then_die
         clock.advance(300 * SECOND)
         with respx.mock(assert_all_called=False) as mock:
             mock_discovery(mock, NYC_PRELIM)
@@ -353,7 +353,7 @@ async def test_cursor_is_durable_at_the_moment_of_a_kill_between_persist_and_pub
         uuids, _ = catalog_state(settings)
         assert prelim_uuid in uuids
         # ...and nothing from it reached a subscriber.
-        assert list(actor.published) == published_before_kill  # type: ignore[attr-defined]
+        assert list(actor.published) == published_before_kill
         # ...and the cursor is exactly where poll 1 left it: durable, unmoved.
         assert runtime.store.get(CURSOR_KEY) == cursor_at_kill
 
@@ -361,7 +361,7 @@ async def test_cursor_is_durable_at_the_moment_of_a_kill_between_persist_and_pub
         assert runtime2.store.get(CURSOR_KEY) == cursor_at_kill
         await start_and_settle(actor2)
 
-        replayed = [payload for _, payload in actor2.published]  # type: ignore[attr-defined]
+        replayed = [payload for _, payload in actor2.published]
         # Exactly the two records the killed poll persisted, and nothing that
         # poll 1 already published. `NwsClimateDay` carries no `product_uuid`
         # -- the two types are joined by `raw_sha256` (`nws_raw_product.py:51`)
@@ -406,10 +406,10 @@ async def test_repolling_the_same_products_after_a_restart_is_a_clean_no_op(
         # The restart itself republished nothing: without a durable cursor the
         # warm start would replay the whole retained catalog here. Asserted
         # BEFORE the clear, so the clear cannot hide it.
-        assert actor2.published == [], (  # type: ignore[attr-defined]
+        assert actor2.published == [], (
             "warm start after a restart must not replay already-published records"
         )
-        actor2.published.clear()  # type: ignore[attr-defined]
+        actor2.published.clear()
         clock.advance(300 * SECOND)
         with respx.mock(assert_all_called=False) as mock:
             mock_discovery(mock, NYC_FINAL)
@@ -422,7 +422,7 @@ async def test_repolling_the_same_products_after_a_restart_is_a_clean_no_op(
             GateReason.WRITE_INTEGRITY_VIOLATION
             not in runtime2.shared.gate.blocking_causes(VENUE, CITY)
         )
-        assert actor2.published == []  # type: ignore[attr-defined]
+        assert actor2.published == []
 
 
 # ---------------------------------------------------------------------------
@@ -534,7 +534,7 @@ async def test_reset_cursor_survives_a_restart_as_absent(
         assert actor2.resume_cursor is None
         await start_and_settle(actor2)
         # The rewind really took effect: everything on disk replays.
-        assert len(actor2.published) == 2  # type: ignore[attr-defined]
+        assert len(actor2.published) == 2
 
 
 # ---------------------------------------------------------------------------

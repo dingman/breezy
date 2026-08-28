@@ -73,7 +73,7 @@ def _guard(
     net: Decimal = Decimal(0),
     open_orders: Sequence[_FakeOrder] = (),
 ) -> BacktestOrderGuard:
-    return BacktestOrderGuard(_FakePortfolio(net), _FakeCache(open_orders))  # type: ignore[arg-type]
+    return BacktestOrderGuard(_FakePortfolio(net), _FakeCache(open_orders))
 
 
 def _initialized(
@@ -205,7 +205,7 @@ def test_a_non_initialized_order_event_is_ignored() -> None:
         instrument_id = INSTRUMENT
         client_order_id = ClientOrderId("O-2")
 
-    _guard().on_order_event(_NotAnInitialization())  # type: ignore[arg-type]
+    _guard().on_order_event(_NotAnInitialization())
 
 
 def test_the_topic_is_the_one_strategies_publish_on() -> None:

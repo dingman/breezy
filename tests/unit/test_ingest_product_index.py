@@ -718,7 +718,7 @@ def test_a_wiped_entry_for_a_known_uuid_is_a_mismatch_not_first_seen(tmp_path) -
         result = restarted.observe(UUID_A, DIGEST_MUTATED)
 
     assert result.outcome is ProductIntegrityOutcome.MISMATCH
-    assert result.outcome is not ProductIntegrityOutcome.FIRST_SEEN
+    assert result.outcome is not ProductIntegrityOutcome.FIRST_SEEN  # type: ignore[comparison-overlap]  # tautological given the preceding `is` assert; kept as explicit documentation that the two enum members are mutually exclusive
     assert result.is_integrity_alarm is True
 
 

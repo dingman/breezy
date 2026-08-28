@@ -167,7 +167,7 @@ def test_pyo3_catalog_cannot_register_our_record_class() -> None:
     assert not hasattr(NwsClimateDay, "encode_record_batch_py")
 
     with pytest.raises(TypeError) as excinfo:
-        nautilus_pyo3.register_custom_data_class(NwsClimateDay)
+        nautilus_pyo3.register_custom_data_class(NwsClimateDay)  # type: ignore[attr-defined]  # stub gap, see module docstring
 
     assert "decode_record_batch_py" in str(excinfo.value)
 
@@ -213,8 +213,8 @@ def test_pyo3_catalog_refuses_our_record_at_every_wrapping(tmp_path: Path) -> No
 # ---------------------------------------------------------------------------
 
 
-@customdataclass_pyo3()
-class Pyo3LayoutProbe(Data):
+@customdataclass_pyo3()  # type: ignore[no-untyped-call]  # stub gap, see module docstring
+class Pyo3LayoutProbe(Data):  # type: ignore[misc]  # Data is a compiled Cython class erasing to Any
     """Throwaway probe type -- NOT a Breezy record type, and never persisted.
 
     `customdataclass_pyo3` registers the class with *both* the Python
@@ -228,7 +228,7 @@ class Pyo3LayoutProbe(Data):
     tmax_f: int = 0
 
 
-nautilus_pyo3.register_custom_data_class(Pyo3LayoutProbe)
+nautilus_pyo3.register_custom_data_class(Pyo3LayoutProbe)  # type: ignore[attr-defined]  # stub gap, see module docstring
 
 
 def _probe_records() -> list[Pyo3LayoutProbe]:
@@ -281,7 +281,7 @@ def test_python_catalog_reads_zero_records_from_a_pyo3_written_catalog(
     assert class_to_filename(Pyo3LayoutProbe) == "custom_pyo3_layout_probe"
 
     # Each catalog reads its own root.
-    assert len(pyo3_catalog.query_custom_data(Pyo3LayoutProbe.__name__)) == 3
+    assert len(pyo3_catalog.query_custom_data(Pyo3LayoutProbe.__name__)) == 3  # type: ignore[attr-defined]  # stub gap, see module docstring
     assert len(python_catalog.query(data_cls=Pyo3LayoutProbe)) == 3
 
     # The Python catalog reads the pyo3 root as empty -- silently.

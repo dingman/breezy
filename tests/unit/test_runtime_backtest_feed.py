@@ -92,7 +92,7 @@ def raw_products(count: int) -> list[NwsRawProduct]:
     ]
 
 
-class Collector(Actor):
+class Collector(Actor):  # type: ignore[misc]  # Actor is a compiled Cython class erasing to Any
     """The minimal subscriber. Deliberately an `Actor`, not a `Strategy`.
 
     A `Strategy` is what would call `submit_order`; introducing one is a
@@ -224,7 +224,7 @@ def test_a_record_class_with_no_shared_data_type_is_refused_loudly() -> None:
     same defect wearing a wrapper.
     """
 
-    class NotWeather(Data):
+    class NotWeather(Data):  # type: ignore[misc]  # Data is a compiled Cython class erasing to Any
         @property
         def ts_event(self) -> int:
             return 0

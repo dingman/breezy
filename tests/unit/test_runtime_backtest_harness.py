@@ -327,7 +327,7 @@ def test_wrapped_weather_records_are_accepted() -> None:
 def test_the_wrapping_check_is_type_exact_on_custom_data() -> None:
     """A subclass of `CustomData` is not what `DataEngine` dispatches on."""
 
-    class _CustomDataSubclass(CustomData):
+    class _CustomDataSubclass(CustomData):  # type: ignore[misc]  # CustomData is a compiled Cython class erasing to Any
         pass
 
     wrapped = as_backtest_data([make_climate_day()])[0]

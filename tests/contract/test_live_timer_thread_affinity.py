@@ -252,7 +252,11 @@ def test_actor_run_in_executor_gives_no_supervision_seam() -> None:
     actor = Actor(ActorConfig(component_id="CONTRACT-PROBE"))
     returned: list[str] = []
 
-    task_id = actor.run_in_executor(lambda: returned.append("ran") or "discarded")
+    def _run_and_discard() -> str:
+        returned.append("ran")
+        return "discarded"
+
+    task_id = actor.run_in_executor(_run_and_discard)
 
     assert isinstance(task_id, TaskId)
     assert dataclasses.is_dataclass(task_id)
@@ -278,7 +282,7 @@ def test_base_actor_exposes_no_public_event_loop_reference() -> None:
 # ---------------------------------------------------------------------------
 
 
-class _ProbeActor(Actor):
+class _ProbeActor(Actor):  # type: ignore[misc]  # Actor is a compiled Cython class erasing to Any
     """Smallest Actor that measures its own timer callback's thread context."""
 
     def __init__(self, config: ActorConfig) -> None:

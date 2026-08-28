@@ -141,7 +141,7 @@ async def test_a_crash_at_the_persist_step_leaves_the_product_refetchable(
 
     with process_cycle(settings, clock) as (_runtime, actor):
         await start_and_settle(actor)
-        actor.write_records = _die_before_writing  # type: ignore[assignment]
+        actor.write_records = _die_before_writing
         with respx.mock(assert_all_called=False) as mock:
             mock_discovery(mock, NYC_FINAL)
             crashed_route = mock_product(mock, NYC_FINAL)
@@ -158,7 +158,7 @@ async def test_a_crash_at_the_persist_step_leaves_the_product_refetchable(
         uuids, record_count = catalog_state(settings)
         assert final_uuid not in uuids
         assert record_count == 0, "the crash must leave the catalog untouched"
-        assert actor.published == []  # type: ignore[attr-defined]
+        assert actor.published == []
 
     with process_cycle(settings, clock) as (_runtime2, actor2):
         await start_and_settle(actor2)
@@ -208,7 +208,7 @@ async def test_a_clean_poll_still_dedupes_across_a_restart(
             mock_product(mock, NYC_FINAL)
             await actor.poll_once()
 
-        assert actor.published, "the poll must succeed, or the no-op claim is empty"  # type: ignore[attr-defined]
+        assert actor.published, "the poll must succeed, or the no-op claim is empty"
         assert runtime.store.get(_index_key(final_uuid)) is not None, (
             "a CONFIRMED persist must durably mark the uuid as seen"
         )
@@ -217,7 +217,7 @@ async def test_a_clean_poll_still_dedupes_across_a_restart(
 
     with process_cycle(settings, clock) as (runtime2, actor2):
         await start_and_settle(actor2)
-        assert actor2.published == []  # type: ignore[attr-defined]
+        assert actor2.published == []
         clock.advance(POLL_INTERVAL_NS)
         with respx.mock(assert_all_called=False) as mock:
             mock_discovery(mock, NYC_FINAL)
@@ -230,7 +230,7 @@ async def test_a_clean_poll_still_dedupes_across_a_restart(
             GateReason.WRITE_INTEGRITY_VIOLATION
             not in runtime2.shared.gate.blocking_causes(VENUE, CITY)
         )
-        assert actor2.published == []  # type: ignore[attr-defined]
+        assert actor2.published == []
 
 
 @pytest.mark.asyncio
@@ -263,7 +263,7 @@ async def test_a_mismatched_digest_still_blocks_before_anything_is_persisted(
         assert catalog_state(settings) == (set(), 0), (
             "a digest mismatch must be caught before the catalog write, never after it"
         )
-        assert actor.published == []  # type: ignore[attr-defined]
+        assert actor.published == []
 
 
 @pytest.mark.asyncio
@@ -300,4 +300,4 @@ async def test_unreadable_persisted_evidence_still_blocks_before_the_write(
             VENUE, CITY
         )
         assert catalog_state(settings) == (set(), 0)
-        assert actor.published == []  # type: ignore[attr-defined]
+        assert actor.published == []

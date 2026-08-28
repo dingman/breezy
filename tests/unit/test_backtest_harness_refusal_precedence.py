@@ -300,7 +300,7 @@ def test_post_only_beats_naked_short() -> None:
     concerns (unmodelled maker economics vs. an unfunded short) that happen to
     share one dispatch method, written in this order.
     """
-    guard = BacktestOrderGuard(_FakePortfolio(Decimal(0)), _FakeCache())  # type: ignore[arg-type]
+    guard = BacktestOrderGuard(_FakePortfolio(Decimal(0)), _FakeCache())
     event = OrderInitialized(
         trader_id=TraderId("BREEZY-BACKTEST-001"),
         strategy_id=StrategyId("S-1"),

@@ -115,7 +115,7 @@ def _final_ts_event_for_tape(tape: SyntheticStrikeTape) -> int:
     expirations = {leg.instrument.expiration_ns for leg in tape.legs}
     if len(expirations) != 1:
         raise AssertionError(f"synthetic tape spans multiple expirations: {expirations}")
-    return next(iter(expirations))
+    return int(next(iter(expirations)))
 
 
 def _make_weather_record(

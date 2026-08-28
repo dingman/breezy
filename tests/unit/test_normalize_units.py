@@ -33,7 +33,7 @@ def test_temperature_reading_rejects_value_without_none_sentinel_mismatch() -> N
 
 def test_temperature_reading_rejects_value_present_with_sentinel_present() -> None:
     with pytest.raises(ValueError):
-        TemperatureReadingF(value_f=79, sentinel="M")  # type: ignore[arg-type]
+        TemperatureReadingF(value_f=79, sentinel="M")
 
 
 def test_fahrenheit_to_celsius_is_enrichment_only_conversion() -> None:

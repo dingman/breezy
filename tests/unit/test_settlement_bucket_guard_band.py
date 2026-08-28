@@ -14,6 +14,7 @@ import importlib.util
 import sys
 from pathlib import Path
 from types import ModuleType
+from typing import Any
 
 _REPO_ROOT = Path(__file__).resolve().parents[2]
 _SCRIPTS_ANALYSIS_DIR = _REPO_ROOT / "scripts" / "analysis"
@@ -35,7 +36,7 @@ def _load_guard_band_module() -> ModuleType:
     return module
 
 
-def _comparison(module: ModuleType, **overrides: object):
+def _comparison(module: ModuleType, **overrides: object) -> Any:
     kwargs: dict[str, object] = {
         "city": "NYC",
         "climate_day": dt.date(2025, 8, 1),

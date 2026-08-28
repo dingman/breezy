@@ -186,21 +186,33 @@ def test_the_polymarket_test_doubles_are_typechecked_against_the_real_classes() 
 
     `test_polymarket_us_factories` was asserting `requires_auth` / `_signer`
     through the `MarketsFeed` Protocol, which declares neither.
+
+    A module counts as covered either by its own exact path being listed, or
+    by a listed entry being a directory that contains it (e.g. `"tests"`
+    covering the whole suite, per Q-2) -- `mypy`'s own `files` setting
+    accepts both file and directory entries, so this check must too.
     """
     tool = _pyproject()["tool"]
     assert isinstance(tool, dict)
     mypy_config = tool["mypy"]
     assert isinstance(mypy_config, dict)
     files = {str(entry) for entry in mypy_config["files"]}
+    file_dirs = {entry for entry in files if (REPO_ROOT / entry).is_dir()}
 
     on_disk = {
         str(path.relative_to(REPO_ROOT))
         for path in (REPO_ROOT / "tests" / "unit").glob("test_polymarket_us_*.py")
     }
 
+    def _is_covered(module: str) -> bool:
+        return module in files or any(
+            module == directory or module.startswith(f"{directory}/") for directory in file_dirs
+        )
+
     assert on_disk, "no polymarket_us test modules found"
-    assert on_disk <= files, (
-        f"these polymarket_us test modules are not typechecked: {sorted(on_disk - files)}"
+    uncovered = {module for module in on_disk if not _is_covered(module)}
+    assert not uncovered, (
+        f"these polymarket_us test modules are not typechecked: {sorted(uncovered)}"
     )
 
 

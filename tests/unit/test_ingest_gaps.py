@@ -1097,7 +1097,11 @@ def test_every_settlement_relevant_reading_change_alerts(
     reissue = replace(
         _original_final(day, seq=2, ts_init=2),
         raw_sha256=SHA_CORRECTED,
-        **{changed_field: changed_value},
+        # `changed_field` is a parametrize-supplied field NAME (one of the
+        # three settlement-relevant readings) -- genuinely dynamic by this
+        # test's design, so `replace`'s per-field overload cannot be
+        # satisfied statically.
+        **{changed_field: changed_value},  # type: ignore[arg-type]
     )
     records = (_original_final(day, seq=1, ts_init=1), reissue)
 

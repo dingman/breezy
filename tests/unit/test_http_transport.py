@@ -11,6 +11,7 @@ import dataclasses
 import gzip
 import hashlib
 import inspect
+from collections.abc import AsyncIterator
 
 import httpx
 import pytest
@@ -21,6 +22,7 @@ from breezy.ingest.http import (
     ContentEncodingError,
     DecodeError,
     DisallowedHostError,
+    FetchResult,
     ForbiddenError,
     HttpTransport,
     InvalidCacheValidatorError,
@@ -97,10 +99,8 @@ def make_transport(**overrides: object) -> HttpTransport:
     return HttpTransport(**kwargs)  # type: ignore[arg-type]
 
 
-def make_fetch_result(**overrides: object) -> object:
+def make_fetch_result(**overrides: object) -> FetchResult:
     """Construct a `FetchResult` directly, for the defensive-invariant tests."""
-    from breezy.ingest.http import FetchResult
-
     kwargs: dict[str, object] = {
         "text": "CLIMATE REPORT",
         "sha256": hashlib.sha256(b"CLIMATE REPORT").hexdigest(),
@@ -166,7 +166,7 @@ class _CountingByteStream:
         self._total_chunks = total_chunks
         self.yielded = 0
 
-    async def __call__(self, chunk_size: int):
+    async def __call__(self, chunk_size: int) -> AsyncIterator[bytes]:
         for _ in range(self._total_chunks):
             self.yielded += 1
             yield self._chunk
@@ -705,8 +705,8 @@ def test_a_304_fetch_result_carries_the_instant_and_no_document() -> None:
     """The invariant's two clauses, stated together on the status they differ on."""
     result = make_fetch_result(text=None, sha256=None, status_code=304)
 
-    assert result.status_code == 304  # type: ignore[attr-defined]
-    assert result.retrieved_at_ns == FIXED_NS  # type: ignore[attr-defined]
+    assert result.status_code == 304
+    assert result.retrieved_at_ns == FIXED_NS
 
 
 # --------------------------------------------------------------------------

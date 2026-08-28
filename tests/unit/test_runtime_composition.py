@@ -8,6 +8,7 @@ does, so the process-wide `SharedIngestState` slot is always released.
 
 from __future__ import annotations
 
+import dataclasses
 from collections.abc import Iterator
 from pathlib import Path
 from typing import ClassVar
@@ -120,7 +121,7 @@ class TestLoadSiteRegistry:
         copied.write_bytes(DEFAULT_REGISTRY_PATH.read_bytes())
 
         registry = load_site_registry(
-            BreezyRuntimeSettings(**{**vars_of(settings), "registry_path": copied})
+            dataclasses.replace(settings, registry_path=copied)
         )
 
         assert ("polymarket_us", "NYC") in registry.pairs()
@@ -132,22 +133,9 @@ class TestLoadSiteRegistry:
 
         with pytest.raises(FileNotFoundError):
             load_site_registry(
-                BreezyRuntimeSettings(**{**vars_of(settings), "registry_path": missing})
+                dataclasses.replace(settings, registry_path=missing)
             )
 
-
-def vars_of(settings: BreezyRuntimeSettings) -> dict[str, object]:
-    return {
-        "trader_id": settings.trader_id,
-        "sites": settings.sites,
-        "catalog_base": settings.catalog_base,
-        "state_db_path": settings.state_db_path,
-        "poll_interval_seconds": settings.poll_interval_seconds,
-        "parse_timeout_ms": settings.parse_timeout_ms,
-        "log_level": settings.log_level,
-        "check_proxy_env": settings.check_proxy_env,
-        "registry_path": settings.registry_path,
-    }
 
 
 # ---------------------------------------------------------------------------
@@ -352,9 +340,7 @@ class TestIngestRuntime:
     def test_a_site_absent_from_the_registry_is_refused(
         self, settings: BreezyRuntimeSettings, probe: RecordingProbe
     ) -> None:
-        bad = BreezyRuntimeSettings(
-            **{**vars_of(settings), "sites": (("polymarket_us", "PHL"),)}
-        )
+        bad = dataclasses.replace(settings, sites=(("polymarket_us", "PHL"),))
 
         with (
             pytest.raises(SharedIngestStateError) as excinfo,
@@ -544,7 +530,7 @@ class TestBootstrapWitnessThroughTheCompositionRoot:
             )
             assert after_poll.state is GateState.BLOCKED
             assert after_poll.reason is GateReason.STATE_STORE_TAMPERED
-            assert after_poll.reason is not GateReason.SUCCESSFUL_POLL
+            assert after_poll.reason is not GateReason.SUCCESSFUL_POLL  # type: ignore[comparison-overlap]  # tautological given the preceding `is` assert; kept as explicit documentation that the two enum members are mutually exclusive
 
     def test_genuine_first_deployment_still_reaches_open_after_a_poll(
         self, settings: BreezyRuntimeSettings, probe: RecordingProbe

@@ -408,8 +408,13 @@ def test_add_actor_after_start_neither_raises_nor_registers(
                 count_before = len(trader.actors())
                 assert count_before == 1
 
-                # No exception. None returned. Nothing registered.
-                assert trader.add_actor(late) is None
+                # No exception. None returned. Nothing registered. Pins
+                # `Trader.add_actor`'s compiled-Cython return contract
+                # (immutable Nautilus Trader) even though its stub already
+                # declares `-> None`, which makes this trivially true to
+                # mypy but is still the executable documentation this test
+                # exists to provide.
+                assert trader.add_actor(late) is None  # type: ignore[func-returns-value]
 
                 assert len(trader.actors()) == count_before
                 assert str(late.id) not in {str(a.id) for a in trader.actors()}

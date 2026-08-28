@@ -138,7 +138,11 @@ def test_snapshot_to_dict_carries_every_declared_field() -> None:
     assert payload["ua_trap_latched"] is True
     assert payload["alerts_emitted_this_cycle"] == 2
 
-    (site_payload,) = payload["sites"]  # type: ignore[index]
+    sites_raw = payload["sites"]
+    assert isinstance(sites_raw, list)
+    (site_raw,) = sites_raw
+    assert isinstance(site_raw, dict)
+    site_payload: dict[str, object] = site_raw
     assert site_payload["venue"] == "polymarket_us"
     assert site_payload["city"] == "NYC"
     assert site_payload["gate_state"] == "OPEN"
@@ -151,7 +155,9 @@ def test_snapshot_to_dict_carries_every_declared_field() -> None:
     # "the ledger is fine" from key absence (see `SiteHealth`'s docstring).
     assert site_payload["ledger_unavailable"] is None
 
-    (gap_payload,) = site_payload["open_gaps"]
+    open_gaps_raw = site_payload["open_gaps"]
+    assert isinstance(open_gaps_raw, list)
+    (gap_payload,) = open_gaps_raw
     assert gap_payload == {
         "climate_day": "2026-08-01",
         "state": "OPEN",

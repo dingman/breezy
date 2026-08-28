@@ -394,6 +394,8 @@ def test_published_average_persists_as_a_whole_degree_int(tmp_path: Path) -> Non
 
     assert restored.tavg_f == 74
     assert isinstance(restored.tavg_f, int)
+    assert restored.tmax_f is not None
+    assert restored.tmin_f is not None
     assert restored.tavg_f != (restored.tmax_f + restored.tmin_f) / 2
 
 

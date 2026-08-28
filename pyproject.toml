@@ -175,65 +175,13 @@ files = [
     # seam; those errors are now fixed and the gate is widened to cover it.
     "scripts/analysis",
     #
-    # `tests/` is likewise not checked wholesale: it carries 159 pre-existing
-    # strict errors across 38 files. The polymarket_us tests are enumerated
-    # because THIS slice's doubles must not drift from the classes they model.
-    # STK-1 native-egress firewall barriers (N1-N5) and the pyo3 block
-    # regression suite. Typechecked because they reason about the real
-    # nautilus_pyo3 client classes and the conftest sentinel.
-    "tests/unit/test_execution_egress_firewall_guard.py",
-    "tests/unit/test_pyo3_network_block.py",
-    "tests/unit/test_polymarket_us_auth_smoke.py",
-    "tests/unit/test_polymarket_us_autonomy_g19.py",
-    "tests/unit/test_polymarket_us_config.py",
-    "tests/unit/test_polymarket_us_credential_gate.py",
-    "tests/unit/test_polymarket_us_credential_serialization.py",
-    "tests/unit/test_polymarket_us_data.py",
-    "tests/unit/test_polymarket_us_discovery.py",
-    "tests/unit/test_polymarket_us_dependency_pin.py",
-    "tests/unit/test_polymarket_us_depth_parsing.py",
-    "tests/unit/test_polymarket_us_env.py",
-    "tests/unit/test_polymarket_us_errors.py",
-    "tests/unit/test_polymarket_us_exception_leak.py",
-    "tests/unit/test_polymarket_us_factories.py",
-    "tests/unit/test_polymarket_us_fee_guard.py",
-    "tests/unit/test_polymarket_us_fee_model.py",
-    "tests/unit/test_polymarket_us_http.py",
-    "tests/unit/test_polymarket_us_package_exports.py",
-    "tests/unit/test_polymarket_us_parsing.py",
-    "tests/unit/test_polymarket_us_permit_issuance.py",
-    "tests/unit/test_polymarket_us_phase0_safety.py",
-    "tests/unit/test_polymarket_us_prose_bounds.py",
-    "tests/unit/test_polymarket_us_provider.py",
-    "tests/unit/test_polymarket_us_quote_tape_gap.py",
-    "tests/unit/test_polymarket_us_readonly_guard.py",
-    "tests/unit/test_polymarket_us_reload_resilience.py",
-    "tests/unit/test_polymarket_us_redaction.py",
-    "tests/unit/test_polymarket_us_secret_exposure.py",
-    "tests/unit/test_polymarket_us_series.py",
-    "tests/unit/test_polymarket_us_settlement_provenance.py",
-    "tests/unit/test_polymarket_us_signing.py",
-    "tests/unit/test_polymarket_us_symbology.py",
-    "tests/unit/test_polymarket_us_tape_records.py",
-    "tests/unit/test_polymarket_us_tape_routing.py",
-    "tests/unit/test_polymarket_us_taxonomy.py",
-    "tests/unit/test_polymarket_us_transport.py",
-    "tests/unit/test_polymarket_us_transport_security.py",
-    "tests/unit/test_polymarket_us_websocket.py",
-
-    # Settlement seam: the asymmetric gate's minimum-coverage rule. Registered
-    # so the closed-set membership logic and its anti-negation guard are
-    # typechecked, not merely executed. (settlement_programme_report.py
-    # itself is covered by the "scripts/analysis" entry above; listing it
-    # again here would register it as a duplicate module.)
-    "tests/unit/test_settlement_conservatism_prose_guard.py",
-    "tests/unit/test_settlement_coverage_rule.py",
-    "tests/unit/test_settlement_programme_rollup.py",
-    "tests/unit/test_settlement_purity_guard.py",
-    "tests/unit/test_settlement_report_prose_claims.py",
-    "tests/unit/test_settlement_reporting.py",
-    "tests/unit/test_settlement_reporting_guard.py",
-    "tests/unit/test_settlement_programme_report_script.py",
+    # `tests/` (Q-2). Previously excluded wholesale -- it carried 159
+    # pre-existing strict errors across 38 files, so only the polymarket_us
+    # slice (whose doubles must not drift from the classes they model) was
+    # enumerated by hand. Those errors are now fixed (69 stale
+    # `# type: ignore` comments removed, ~83 real typing defects fixed) and
+    # the gate is widened to cover the whole directory.
+    "tests",
 ]
 
 # pyarrow ships no stubs, and nautilus_trader's Data base is a compiled Cython

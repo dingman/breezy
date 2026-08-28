@@ -22,6 +22,7 @@ from __future__ import annotations
 import re
 import tomllib
 from pathlib import Path
+from typing import Any, cast
 
 import pytest
 
@@ -38,10 +39,12 @@ def _load_text(dirname: str) -> str:
     return (FIXTURES_DIR / dirname / "product.txt").read_text()
 
 
-def _load_sites() -> dict[str, dict]:
+def _load_sites() -> dict[str, dict[str, Any]]:
     with SITES_TOML.open("rb") as handle:
         data = tomllib.load(handle)
-    return data["sites"]["polymarket_us"]
+    # tomllib.load returns dict[str, Any]; the nested chain below is
+    # genuinely Any until we assert the shape at this parsing boundary.
+    return cast("dict[str, dict[str, Any]]", data["sites"]["polymarket_us"])
 
 
 CITY_CASES = [
