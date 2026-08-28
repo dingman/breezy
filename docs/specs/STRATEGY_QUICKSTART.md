@@ -2,7 +2,7 @@
 
 **Target reader:** An engineer with no prior Breezy experience who wants to write a Nautilus `Strategy` and backtest it.
 
-**Status:** Active reference. Last updated 2026-08-27.
+**Status:** Active reference. Last updated 2026-08-28.
 
 This guide takes you from zero to a working backtest in ~30 minutes. Follow it linearly; every step has been validated against the live codebase.
 
@@ -276,11 +276,72 @@ assert strategy.orders_submitted == 1, "Example strategy should have submitted o
 
 ---
 
-## 8. The four validation gates
+## 8. Backtest Against Captured Catalog Data
+
+Captured venue data is read with Nautilus' native `ParquetDataCatalog`. Breezy does not provide a market-data reader layer for `QuoteTick`, `OrderBookDepth10`, `InstrumentClose`, or `BinaryOption`, because Nautilus already does the read-back.
+
+If the run is still in the quote-tape stream directory, convert the live feather files into the catalog's parquet layout first:
+
+```python
+from nautilus_trader.model.data import InstrumentClose, OrderBookDepth10, QuoteTick
+from nautilus_trader.model.instruments import BinaryOption
+from nautilus_trader.persistence.catalog.parquet import ParquetDataCatalog
+
+catalog = ParquetDataCatalog("path/to/catalog-root")
+instance_id = "instance-1"  # a directory name under path/to/catalog-root/live/
+
+catalog.convert_stream_to_data(instance_id, BinaryOption, subdirectory="live")
+catalog.convert_stream_to_data(instance_id, OrderBookDepth10, subdirectory="live")
+catalog.convert_stream_to_data(instance_id, QuoteTick, subdirectory="live")
+catalog.convert_stream_to_data(instance_id, InstrumentClose, subdirectory="live")
+```
+
+Then read the native objects back and feed them directly to the harness:
+
+```python
+from nautilus_trader.model.objects import Money
+
+instrument_id = "tc-temp-nychigh-2026-04-23-gte66lt67f.POLYMARKET_US"
+
+instrument = next(
+    instrument
+    for instrument in catalog.instruments()
+    if instrument.id.value == instrument_id
+)
+depths = catalog.order_book_depth10(instrument_ids=[instrument_id])
+quotes = catalog.quote_ticks(instrument_ids=[instrument_id])
+closes = [
+    close
+    for close in catalog.instrument_closes()
+    if close.instrument_id.value == instrument_id
+]
+
+config = BreezyBacktestConfig(
+    instruments=(instrument,),
+    market_data=[*depths, *quotes, *closes],
+    weather_data=as_backtest_data(weather_records),
+    settlement_prices={instrument.id: 1.0},
+    starting_balances=(Money(1000, instrument.quote_currency),),
+)
+
+engine = run_backtest(config, strategies=(strategy,))
+```
+
+Two details are load-bearing:
+
+- `QuoteTick` and `OrderBookDepth10` can be read with the typed catalog methods and filtered by `instrument_ids=[...]`.
+- For stream-converted `InstrumentClose` records, use `catalog.instrument_closes()` and select the records whose `instrument_id` matches. In Nautilus 1.231.0 the streaming writer stores `instrument_close` as a flat stream file, not under a per-instrument subdirectory.
+- For stream-converted `BinaryOption` definitions, use `catalog.instruments()` or `catalog.query(data_cls=BinaryOption)` and select the instrument by `id`. In Nautilus 1.231.0 the streamed instrument file converts into a flat `data/binary_option/...parquet` path, so `catalog.instruments(instrument_ids=[...])` has no per-instrument path segment to match.
+
+This path is covered by `tests/integration/test_catalog_market_data_backtest.py`: one test writes fabricated data directly to a tmp `ParquetDataCatalog`, and one writes the same fabricated data through `StreamingFeatherWriter`, converts it with `convert_stream_to_data`, reads it back, and runs a real `BreezyHarnessProbe` backtest that sees quotes and submits an order.
+
+---
+
+## 9. The four validation gates
 
 Every gate is mandatory before committing. Run them in this order:
 
-### 8.1 Pytest (unit and integration tests)
+### 9.1 Pytest (unit and integration tests)
 
 ```bash
 python -m pytest -q
@@ -290,7 +351,7 @@ Runs all tests except those marked `live`, `venue_live`, or `real_money`. Your s
 
 **Type coverage note:** `tests/` is NOT wholesale typechecked (159 pre-existing strict errors across 38 files). Your integration test will not be typechecked. However, your strategy code in `src/breezy/strategy/` IS typechecked under strict mode — any type error in the strategy itself will fail `mypy`.
 
-### 8.2 Ruff linter
+### 9.2 Ruff linter
 
 ```bash
 python -m ruff check .
@@ -298,7 +359,7 @@ python -m ruff check .
 
 Checks linting rules. If violations appear and you want to auto-fix them, use `python -m ruff format .` — **note: this command rewrites files in place**. Check first, format second.
 
-### 8.3 MyPy type checker (strict mode on src/breezy/strategy)
+### 9.3 MyPy type checker (strict mode on src/breezy/strategy)
 
 ```bash
 python -m mypy
@@ -306,7 +367,7 @@ python -m mypy
 
 Type-checks your strategy code under strict mode. If you read a config field, use `cast()` (see §5). If you use a type annotation, ensure it matches at runtime.
 
-### 8.4 Import linter (architecture contract)
+### 9.4 Import linter (architecture contract)
 
 ```bash
 lint-imports
@@ -316,7 +377,7 @@ Enforces the layer contract defined in `pyproject.toml`. Your strategy is in the
 
 ---
 
-## 9. Adding a strategy: what changes, what doesn't
+## 10. Adding a strategy: what changes, what doesn't
 
 **You MUST change:**
 - Create `src/breezy/strategy/my_strategy.py` with your strategy class
@@ -330,7 +391,7 @@ Enforces the layer contract defined in `pyproject.toml`. Your strategy is in the
 
 ---
 
-## 10. Common traps
+## 11. Common traps
 
 ### Trap: Quote-only strategies never trade
 
@@ -376,7 +437,7 @@ The example in §7 lists all required imports at the top. If you copy only the c
 
 ---
 
-## 11. Next steps
+## 12. Next steps
 
 1. **Copy a reference strategy** (forecast_edge for a real model, harness_probe for minimal).
 2. **Write your trading logic** in `on_data` and `on_order_book_depth`.
@@ -386,7 +447,7 @@ The example in §7 lists all required imports at the top. If you copy only the c
 
 ---
 
-## 12. References
+## 13. References
 
 - **Strategy examples:** `src/breezy/strategy/harness_probe.py`, `src/breezy/strategy/forecast_edge.py`
 - **Test shape:** `tests/integration/test_forecast_edge_backtest.py`

@@ -84,9 +84,9 @@ __all__ = [
 #: capture. Asserted by the tape's own tests.
 SYNTHETIC_TAPE_MARKER: Final[str] = "SYNTHETIC-NOT-A-VENUE-CAPTURE"
 
-#: Fabricated bid ladder, best first: ``(price, size)``. Three levels rather
-#: than ten, so the tape also exercises the null-order padding
-#: ``OrderBookDepth10.__init__`` applies (``model/data.pyx:3499-3504``).
+#: Fabricated bid ladder, best first: ``(price, size)``. Three real levels,
+#: padded to ten at construction time with precision-matched zero-size orders.
+#: Nautilus' own null padding uses precision zero and cannot be serialized.
 SYNTHETIC_BID_LEVELS: Final[tuple[tuple[str, int], ...]] = (
     ("0.40", 50),
     ("0.39", 40),
@@ -177,7 +177,17 @@ def _book_side(
         )
         for price, size in levels
     ]
-    return orders, [1] * len(orders)
+    counts = [1] * len(orders)
+    filler = BookOrder(
+        side,
+        Price(0, instrument.price_precision),
+        Quantity(0, instrument.size_precision),
+        0,
+    )
+    while len(orders) < 10:
+        orders.append(filler)
+        counts.append(0)
+    return orders, counts
 
 
 def synthetic_binary_tape(
@@ -214,15 +224,14 @@ def synthetic_binary_tape(
     # only its ORDERING relative to the close is load-bearing.
     base_ns = instrument.activation_ns + _STEP_NS
 
-    bid_counts = [1] * len(SYNTHETIC_BID_LEVELS)
-    ask_counts = [1] * len(SYNTHETIC_ASK_LEVELS)
-
     top_bid, top_bid_size = SYNTHETIC_BID_LEVELS[0]
     top_ask, top_ask_size = SYNTHETIC_ASK_LEVELS[0]
 
     market_data: list[Data] = []
     for update in range(depth_updates):
         depth_ts = base_ns + (2 * update) * _STEP_NS
+        bids, bid_counts = _book_side(SYNTHETIC_BID_LEVELS, OrderSide.BUY, instrument)
+        asks, ask_counts = _book_side(SYNTHETIC_ASK_LEVELS, OrderSide.SELL, instrument)
         market_data.append(
             OrderBookDepth10(
                 instrument_id=instrument.id,
@@ -230,10 +239,10 @@ def synthetic_binary_tape(
                 # EXTENDS the lists it is given with null padding
                 # (`model/data.pyx:3499`), so a shared list would grow past
                 # ten on the second record and raise.
-                bids=_book_side(SYNTHETIC_BID_LEVELS, OrderSide.BUY, instrument)[0],
-                asks=_book_side(SYNTHETIC_ASK_LEVELS, OrderSide.SELL, instrument)[0],
-                bid_counts=list(bid_counts),
-                ask_counts=list(ask_counts),
+                bids=bids,
+                asks=asks,
+                bid_counts=bid_counts,
+                ask_counts=ask_counts,
                 flags=0,
                 sequence=update,
                 ts_event=depth_ts,

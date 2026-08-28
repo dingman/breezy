@@ -43,10 +43,11 @@ def test_every_book_order_matches_the_instruments_own_precisions(size_precision:
     assert depths
     for depth in depths:
         for order in [*depth.bids, *depth.asks]:
-            if order.side == OrderSide.NO_ORDER_SIDE:
-                continue  # engine skips null padding
+            assert order.side is not OrderSide.NO_ORDER_SIDE
             assert order.price.precision == tape.instrument.price_precision
             assert order.size.precision == tape.instrument.size_precision
+        assert len(depth.bids) == 10
+        assert len(depth.asks) == 10
 
 
 @pytest.mark.parametrize("size_precision", SIZE_PRECISIONS)

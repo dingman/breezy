@@ -1130,7 +1130,7 @@ operator-domain, not something the bot may invent. Market DISCOVERY itself needs
 no KYC (`get_public` dispatches `authenticated=False`), so this is a
 configuration gap, not a credential gap.
 
-### [BLOCKER] B-2 — No reader loads market data from the catalog into a backtest
+### [CLOSED] B-2 — Native catalog market data reads into a backtest
 
 `src/breezy/persistence/catalog.py` exposes `read_climate_days`,
 `read_raw_products`, `read_climate_day_as_of_settlement` and
@@ -1140,12 +1140,29 @@ supported, tested path from a captured tape to
 could not feed the result to the harness. NOT gated on the operator; executable
 now against a fabricated-then-written catalog.
 
-### [HIGH] B-3 — The feather-to-parquet conversion is docstring-only
+Closed 2026-08-28 without adding a Breezy reader/helper:
+`tests/integration/test_catalog_market_data_backtest.py` writes fabricated
+`BinaryOption`, `OrderBookDepth10`, `QuoteTick` and `InstrumentClose` records
+to a tmp native `ParquetDataCatalog`, reads them back with Nautilus native
+catalog APIs, passes them directly into `BreezyBacktestConfig.market_data`, and
+runs `BreezyHarnessProbe` through `run_backtest`. The strategy sees depth,
+quotes and close data, receives weather, submits one order, fills, and closes a
+position.
+
+### [CLOSED] B-3 — Feather-to-parquet conversion is tested end to end
 
 `convert_stream_to_data(instance_id, QuoteTick, subdirectory="live")` appears in
 the `quote_tape_cli` module docstring as the documented way to make a run
 readable. Nothing automates it and no test proves a written run converts and
 reads back. A capture that cannot be read back is not a capture.
+
+Closed 2026-08-28: the same integration test writes the fabricated tape through
+Nautilus' native `StreamingFeatherWriter` under `live/<instance_id>/`, converts
+`BinaryOption`, `OrderBookDepth10`, `QuoteTick` and `InstrumentClose` with
+`convert_stream_to_data(..., subdirectory="live")`, reads the converted parquet
+back, and runs a real backtest that trades. The quickstart now documents only
+that proven path, including the native flat-stream caveats for
+stream-converted `BinaryOption` and `InstrumentClose`.
 
 ### [HIGH] C-1 — `_BUCKETS` is hand-typed; nothing forces it to match the venue
 
