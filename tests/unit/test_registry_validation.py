@@ -73,6 +73,63 @@ def test_loader_rejects_site_that_is_not_a_table() -> None:
         load_registry(FIXTURES_DIR / "site_not_a_table.toml")
 
 
+def test_loader_rejects_duplicate_venue_city_token(tmp_path: Path) -> None:
+    registry_path = tmp_path / "sites.toml"
+    registry_path.write_text(
+        """
+registry_version = "test"
+
+[sites.polymarket_us.NYC]
+icao = "KNYC"
+cli_location = "NYC"
+issuing_office = "KOKX"
+body_header_regex = "^NYC$"
+never_substitute = ["NYC"]
+never_substitute_cli_locations = ["NYC"]
+iana_tz = "America/New_York"
+std_utc_offset_hours = -5
+settlement_time_local = "08:00"
+settlement_timezone = "America/New_York"
+settlement_delay_time_local = "11:00"
+settlement_delay_timezone = "America/New_York"
+no_data_fallback_days = 7
+venue_city_token = "nyc"
+
+[sites.polymarket_us.NYC.open_meteo]
+settlement_eligible = false
+lat = 40.78
+lon = -73.96
+elevation_m = 46.0
+
+[sites.polymarket_us.ALT]
+icao = "KABC"
+cli_location = "ABC"
+issuing_office = "KOKX"
+body_header_regex = "^ABC$"
+never_substitute = ["ABC"]
+never_substitute_cli_locations = ["ABC"]
+iana_tz = "America/New_York"
+std_utc_offset_hours = -5
+settlement_time_local = "08:00"
+settlement_timezone = "America/New_York"
+settlement_delay_time_local = "11:00"
+settlement_delay_timezone = "America/New_York"
+no_data_fallback_days = 7
+venue_city_token = "nyc"
+
+[sites.polymarket_us.ALT.open_meteo]
+settlement_eligible = false
+lat = 40.0
+lon = -74.0
+elevation_m = 10.0
+""".lstrip(),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(RegistryError, match="venue_city_token"):
+        load_registry(registry_path)
+
+
 def test_nonderivable_valid_fixture_loads_cleanly() -> None:
     registry = load_registry(FIXTURES_DIR / "nonderivable_valid.toml")
     assert registry.registry_version == "test-1"

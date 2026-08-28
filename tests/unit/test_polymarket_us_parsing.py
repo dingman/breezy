@@ -31,6 +31,7 @@ from nautilus_trader.model.objects import Price, Quantity
 
 from breezy.adapters.polymarket_us import parsing
 from breezy.adapters.polymarket_us.errors import (
+    BoundsSemanticsError,
     FeeScheduleUnknownError,
     InstrumentDefinitionError,
     VenuePayloadError,
@@ -46,7 +47,18 @@ from breezy.adapters.polymarket_us.parsing import (
     parse_quote_tick,
     parse_rfc3339_nanos,
 )
-from breezy.adapters.polymarket_us.symbology import POLYMARKET_US_VENUE
+from breezy.adapters.polymarket_us.symbology import POLYMARKET_US_VENUE, REGISTRY_VENUE_KEY
+from breezy.domain.weather_bucket_facts import (
+    SETTLEMENT_STATION_KEY,
+    STRIKE_LOWER_F_KEY,
+    STRIKE_UPPER_F_KEY,
+    WEATHER_FACTS_STATUS_KEY,
+    WEATHER_FACTS_STATUS_KNOWN,
+    WEATHER_FACTS_STATUS_UNKNOWN,
+    is_weather_market,
+    read_weather_bucket_facts,
+)
+from breezy.registry.sites import default_registry
 from tests.unit.conftest import (
     MIN_CAPTURED_MARKETS,
     iter_captured_market_payloads,
@@ -214,6 +226,68 @@ def test_info_carries_the_venue_identifiers_and_the_cluster_id(
     assert info["market_side_ids"] == ("1020784", "1020785")
 
 
+def test_weather_market_info_carries_verified_facts_and_not_parsed_trap(
+    open_instrument: BinaryOption,
+) -> None:
+    info = open_instrument.info
+    facts = read_weather_bucket_facts(info)
+
+    assert info[WEATHER_FACTS_STATUS_KEY] == WEATHER_FACTS_STATUS_KNOWN
+    assert info[SETTLEMENT_STATION_KEY] == "NYC"
+    assert info[STRIKE_LOWER_F_KEY] is None
+    assert info[STRIKE_UPPER_F_KEY] == 78
+    assert "strike_bounds_parsed" not in info
+    assert info["strike_bounds"] == "lt79f"
+    assert facts.settlement_station == "NYC"
+    assert facts.lower_f is None
+    assert facts.upper_f == 78
+
+
+def test_non_weather_market_info_marks_weather_facts_unknown_without_fact_keys(
+    open_market: dict[str, Any],
+) -> None:
+    market = open_market["market"]
+    market["slug"] = "not-a-weather-market"
+    market["category"] = "sports"
+    for side in market["marketSides"]:
+        side["identifier"] = "not-a-weather-market"
+
+    instrument = parse_binary_option(open_market, venue=POLYMARKET_US_VENUE, ts_init=TS_INIT)
+
+    assert instrument.info[WEATHER_FACTS_STATUS_KEY] == WEATHER_FACTS_STATUS_UNKNOWN
+    assert is_weather_market(instrument.info) is False
+    for key in (
+        SETTLEMENT_STATION_KEY,
+        STRIKE_LOWER_F_KEY,
+        STRIKE_UPPER_F_KEY,
+        "strike_bounds_parsed",
+    ):
+        assert key not in instrument.info
+
+
+def test_registry_venue_key_names_a_packaged_registry_venue() -> None:
+    assert REGISTRY_VENUE_KEY in {venue for venue, _city in default_registry().pairs()}
+
+
+def test_parser_refuses_bounds_when_venue_prose_disagrees_with_slug(
+    open_market: dict[str, Any],
+) -> None:
+    open_market["market"]["title"] = "80 or above"
+
+    with pytest.raises(BoundsSemanticsError):
+        parse_binary_option(open_market, venue=POLYMARKET_US_VENUE, ts_init=TS_INIT)
+
+
+def test_parser_refuses_unmapped_weather_city_token(open_market: dict[str, Any]) -> None:
+    market = open_market["market"]
+    market["slug"] = "tc-temp-denhigh-2026-08-25-lt79f"
+    for side in market["marketSides"]:
+        side["identifier"] = "tc-temp-denhigh-2026-08-25-lt79f"
+
+    with pytest.raises(InstrumentDefinitionError, match="venue_city_token"):
+        parse_binary_option(open_market, venue=POLYMARKET_US_VENUE, ts_init=TS_INIT)
+
+
 def test_fee_coefficient_is_validated_and_marks_the_schedule_known(
     open_instrument: BinaryOption,
 ) -> None:
@@ -370,6 +444,35 @@ def test_every_captured_market_observation_parses_with_the_venue_tick_size() -> 
     statuses = {payload["market"].get("status") for payload in payloads}
     assert "MARKET_STATUS_OPEN" in statuses
     assert "MARKET_STATUS_RESOLVED" in statuses
+
+
+def test_every_captured_weather_market_writes_readable_facts() -> None:
+    payloads = iter_captured_market_payloads()
+    assert len(payloads) >= MIN_CAPTURED_MARKETS, (
+        f"corpus shrank to {len(payloads)}; evidence lost?"
+    )
+
+    measures: set[str] = set()
+    for payload in payloads:
+        instrument = parse_binary_option(payload, venue=POLYMARKET_US_VENUE, ts_init=TS_INIT)
+        assert instrument.info[WEATHER_FACTS_STATUS_KEY] == WEATHER_FACTS_STATUS_KNOWN
+        assert "strike_bounds_parsed" not in instrument.info
+        facts = read_weather_bucket_facts(instrument.info)
+        measures.add(facts.measure.value)
+
+    assert measures == {"high"}
+
+
+def test_weather_facts_survive_binary_option_json_round_trip(
+    open_instrument: BinaryOption,
+) -> None:
+    round_tripped = BinaryOption.from_dict(
+        json.loads(json.dumps(BinaryOption.to_dict(open_instrument)))
+    )
+
+    assert read_weather_bucket_facts(round_tripped.info) == read_weather_bucket_facts(
+        open_instrument.info
+    )
 
 
 def test_minimum_trade_qty_is_read_per_market_because_it_varies() -> None:

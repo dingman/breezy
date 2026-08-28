@@ -49,6 +49,8 @@ _REQUIRED_IDENTIFIER_FIELDS: Final[tuple[str, ...]] = (
     "never_substitute_cli_locations",
 )
 
+_REQUIRED_SYMBOLOGY_FIELDS: Final[tuple[str, ...]] = ("venue_city_token",)
+
 # `iana_tz` is required and validated (real, verified data) but is NEVER
 # stored on any returned type -- see the module docstring and
 # `_build_climate_day_window`.
@@ -111,6 +113,20 @@ class SettlementSite:
     body_header_regex: Pattern[str]
     never_substitute: tuple[str, ...]
     never_substitute_cli_locations: tuple[str, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class VenueSymbology:
+    """Venue-facing slug vocabulary for a `(venue, city)` binding.
+
+    A venue city token is not settlement-critical identity, so it is not stored
+    on `SettlementSite`. It is still an explicit registry value, never derived
+    from the city key.
+    """
+
+    venue: str
+    city: str
+    venue_city_token: str
 
 
 @dataclass(frozen=True, slots=True)
@@ -210,6 +226,22 @@ def _build_settlement_site(venue: str, city: str, table: dict[str, Any]) -> Sett
     )
 
 
+def _build_venue_symbology(venue: str, city: str, table: dict[str, Any]) -> VenueSymbology:
+    site_key = f"{venue}.{city}"
+    for field in _REQUIRED_SYMBOLOGY_FIELDS:
+        _require_field(table, field, site_key)
+
+    venue_city_token = str(table["venue_city_token"])
+    if not venue_city_token.strip():
+        raise RegistryError(f"site '{site_key}': venue_city_token must be non-empty")
+
+    return VenueSymbology(
+        venue=venue,
+        city=city,
+        venue_city_token=venue_city_token,
+    )
+
+
 def _build_climate_day_window(venue: str, city: str, table: dict[str, Any]) -> ClimateDayWindow:
     site_key = f"{venue}.{city}"
     for field in _REQUIRED_CLIMATE_DAY_FIELDS:
@@ -291,12 +323,16 @@ class SiteRegistry:
         self,
         registry_version: str,
         settlement_sites: dict[tuple[str, str], SettlementSite],
+        venue_symbologies: dict[tuple[str, str], VenueSymbology],
+        sites_by_venue_city_token: dict[tuple[str, str], SettlementSite],
         climate_day_windows: dict[tuple[str, str], ClimateDayWindow],
         settlement_deadlines: dict[tuple[str, str], SettlementDeadline],
         enrichment_sites: dict[tuple[str, str], EnrichmentCoordinates],
     ) -> None:
         self._registry_version = registry_version
         self._settlement_sites = settlement_sites
+        self._venue_symbologies = venue_symbologies
+        self._sites_by_venue_city_token = sites_by_venue_city_token
         self._climate_day_windows = climate_day_windows
         self._settlement_deadlines = settlement_deadlines
         self._enrichment_sites = enrichment_sites
@@ -321,6 +357,25 @@ class SiteRegistry:
         except KeyError as exc:
             raise SiteNotFoundError(
                 f"no settlement site registered for venue={venue!r} city={city!r}"
+            ) from exc
+
+    def venue_symbology(self, venue: str, city: str) -> VenueSymbology:
+        """Return venue-facing slug vocabulary for `(venue, city)`."""
+        try:
+            return self._venue_symbologies[(venue, city)]
+        except KeyError as exc:
+            raise SiteNotFoundError(
+                f"no venue symbology registered for venue={venue!r} city={city!r}"
+            ) from exc
+
+    def site_for_venue_city_token(self, venue: str, token: str) -> SettlementSite:
+        """Return the settlement site whose stored venue city token is `token`."""
+        try:
+            return self._sites_by_venue_city_token[(venue, token)]
+        except KeyError as exc:
+            raise SiteNotFoundError(
+                f"no settlement site registered for venue={venue!r} "
+                f"venue_city_token={token!r}"
             ) from exc
 
     def climate_day_window(self, venue: str, city: str) -> ClimateDayWindow:
@@ -384,6 +439,8 @@ def load_registry(path: Path = DEFAULT_REGISTRY_PATH) -> SiteRegistry:
         raise RegistryError("registry: missing or empty top-level table 'sites'")
 
     settlement_sites: dict[tuple[str, str], SettlementSite] = {}
+    venue_symbologies: dict[tuple[str, str], VenueSymbology] = {}
+    sites_by_venue_city_token: dict[tuple[str, str], SettlementSite] = {}
     climate_day_windows: dict[tuple[str, str], ClimateDayWindow] = {}
     settlement_deadlines: dict[tuple[str, str], SettlementDeadline] = {}
     enrichment_sites: dict[tuple[str, str], EnrichmentCoordinates] = {}
@@ -394,7 +451,17 @@ def load_registry(path: Path = DEFAULT_REGISTRY_PATH) -> SiteRegistry:
         for city, table_raw in cities_raw.items():
             if not isinstance(table_raw, dict):
                 raise RegistryError(f"registry: site '{venue}.{city}' is not a table")
-            settlement_sites[(venue, city)] = _build_settlement_site(venue, city, table_raw)
+            site = _build_settlement_site(venue, city, table_raw)
+            symbology = _build_venue_symbology(venue, city, table_raw)
+            token_key = (venue, symbology.venue_city_token)
+            if token_key in sites_by_venue_city_token:
+                raise RegistryError(
+                    f"registry: duplicate venue_city_token {symbology.venue_city_token!r} "
+                    f"for venue {venue!r}"
+                )
+            settlement_sites[(venue, city)] = site
+            venue_symbologies[(venue, city)] = symbology
+            sites_by_venue_city_token[token_key] = site
             climate_day_windows[(venue, city)] = _build_climate_day_window(
                 venue, city, table_raw
             )
@@ -408,6 +475,8 @@ def load_registry(path: Path = DEFAULT_REGISTRY_PATH) -> SiteRegistry:
     return SiteRegistry(
         registry_version=registry_version,
         settlement_sites=settlement_sites,
+        venue_symbologies=venue_symbologies,
+        sites_by_venue_city_token=sites_by_venue_city_token,
         climate_day_windows=climate_day_windows,
         settlement_deadlines=settlement_deadlines,
         enrichment_sites=enrichment_sites,

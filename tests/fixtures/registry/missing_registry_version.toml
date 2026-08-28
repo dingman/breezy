@@ -2,6 +2,7 @@
 [sites.polymarket_us.TST]
 icao = "KABC"
 cli_location = "ZZZ"
+venue_city_token = "tst"
 issuing_office = "KXYZ"
 iana_tz = "America/New_York"
 std_utc_offset_hours = -5.0

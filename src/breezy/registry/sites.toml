@@ -117,6 +117,7 @@ registry_version = "1.0.0"
 [sites.polymarket_us.NYC]
 icao = "KNYC"
 cli_location = "NYC"
+venue_city_token = "nyc"
 issuing_office = "KOKX"
 iana_tz = "America/New_York"
 std_utc_offset_hours = -5.0
@@ -152,6 +153,7 @@ elevation_m = 46.9392
 [sites.polymarket_us.SFO]
 icao = "KSFO"
 cli_location = "SFO"
+venue_city_token = "sfo"
 issuing_office = "KMTR"
 iana_tz = "America/Los_Angeles"
 std_utc_offset_hours = -8.0
@@ -189,6 +191,7 @@ elevation_m = 3.048
 [sites.polymarket_us.MIA]
 icao = "KMIA"
 cli_location = "MIA"
+venue_city_token = "mia"
 issuing_office = "KMFL"
 iana_tz = "America/New_York"
 std_utc_offset_hours = -5.0
@@ -233,6 +236,7 @@ elevation_m = 3.048
 [sites.polymarket_us.MDW]
 icao = "KMDW"
 cli_location = "MDW"
+venue_city_token = "mdw"
 issuing_office = "KLOT"
 iana_tz = "America/Chicago"
 std_utc_offset_hours = -6.0
@@ -271,6 +275,7 @@ elevation_m = 188.0616
 [sites.polymarket_us.LAX]
 icao = "KLAX"
 cli_location = "LAX"
+venue_city_token = "lax"
 issuing_office = "KLOX"
 iana_tz = "America/Los_Angeles"
 std_utc_offset_hours = -8.0

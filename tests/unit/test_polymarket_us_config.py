@@ -96,7 +96,7 @@ def test_default_discovery_city_codes_cover_the_weather_sites() -> None:
 
     assert config.market_discovery.city_codes == discovery_city_codes_from_registry()
     assert config.market_discovery.city_codes == tuple(
-        city.lower()
+        default_registry().venue_symbology(venue, city).venue_city_token
         for venue, city in default_registry().pairs()
         if venue == "polymarket_us"
     )
@@ -124,6 +124,7 @@ settlement_timezone = "America/New_York"
 settlement_delay_time_local = "11:00"
 settlement_delay_timezone = "America/New_York"
 no_data_fallback_days = 7
+venue_city_token = "bos-token"
 
 [sites.polymarket_us.BOS.open_meteo]
 settlement_eligible = false
@@ -145,6 +146,7 @@ settlement_timezone = "America/New_York"
 settlement_delay_time_local = "11:00"
 settlement_delay_timezone = "America/New_York"
 no_data_fallback_days = 7
+venue_city_token = "dal-token"
 
 [sites.polymarket_us.DAL.open_meteo]
 settlement_eligible = false
@@ -166,6 +168,7 @@ settlement_timezone = "America/New_York"
 settlement_delay_time_local = "11:00"
 settlement_delay_timezone = "America/New_York"
 no_data_fallback_days = 7
+venue_city_token = "sea-token"
 
 [sites.kalshi.SEA.open_meteo]
 settlement_eligible = false
@@ -177,7 +180,7 @@ elevation_m = 131.0
     )
     registry = load_registry(registry_path)
 
-    assert discovery_city_codes_from_registry(registry) == ("bos", "dal")
+    assert discovery_city_codes_from_registry(registry) == ("bos-token", "dal-token")
 
 
 def test_signing_variant_defaults_to_path_only() -> None:

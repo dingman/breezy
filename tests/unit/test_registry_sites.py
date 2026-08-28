@@ -19,6 +19,7 @@ from breezy.registry.sites import (
     SettlementSite,
     SiteNotFoundError,
     SiteRegistry,
+    VenueSymbology,
     default_registry,
     load_registry,
 )
@@ -63,6 +64,31 @@ def test_cli_location_is_read_not_derived_from_icao(registry: SiteRegistry) -> N
     assert hypothetical.icao == "KABC"
     assert hypothetical.cli_location == "ZZZ"
     assert hypothetical.cli_location != hypothetical.icao[1:]
+
+
+def test_venue_city_token_is_read_not_derived_from_city_key(registry: SiteRegistry) -> None:
+    symbology = registry.venue_symbology("polymarket_us", "NYC")
+    assert isinstance(symbology, VenueSymbology)
+    assert symbology.venue == "polymarket_us"
+    assert symbology.city == "NYC"
+    assert symbology.venue_city_token == "nyc"
+
+    non_derivable = load_registry(FIXTURES_DIR / "nonderivable_valid.toml")
+    hypothetical = non_derivable.venue_symbology("polymarket_us", "TST")
+    assert hypothetical.venue_city_token == "not-tst"
+    assert hypothetical.venue_city_token != hypothetical.city.lower()
+
+
+def test_site_can_be_resolved_by_venue_city_token(registry: SiteRegistry) -> None:
+    assert registry.site_for_venue_city_token("polymarket_us", "nyc") == (
+        registry.settlement_site("polymarket_us", "NYC")
+    )
+
+    with pytest.raises(SiteNotFoundError, match="venue_city_token"):
+        registry.site_for_venue_city_token("polymarket_us", "nope")
+
+    with pytest.raises(SiteNotFoundError, match="venue_city_token"):
+        registry.site_for_venue_city_token("kalshi", "nyc")
 
 
 def test_settlement_accessor_requires_venue_and_city(registry: SiteRegistry) -> None:

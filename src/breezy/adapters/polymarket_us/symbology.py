@@ -90,6 +90,7 @@ __all__ = [
     "PROSE_BETWEEN",
     "PROSE_GE",
     "PROSE_LE",
+    "REGISTRY_VENUE_KEY",
     "ClosedInterval",
     "ProseBounds",
     "WeatherSlug",
@@ -107,6 +108,10 @@ INSTRUMENT_SEPARATOR: str = "~"
 
 #: The single venue identity for this adapter.
 POLYMARKET_US_VENUE: Venue = Venue("POLYMARKET_US")
+
+#: This adapter's key in ``registry/sites.toml``. Stored, never derived from
+#: ``POLYMARKET_US_VENUE``; the two namespaces are related by convention only.
+REGISTRY_VENUE_KEY: str = "polymarket_us"
 
 #: Permitted slug characters. Deliberately narrow: it excludes ``.`` (breaks
 #: ``InstrumentId`` round-tripping), ``~`` (reserved), whitespace, ``/`` and

@@ -48,6 +48,7 @@ from breezy.adapters.polymarket_us.http import PolymarketUSHttpClient, SupportsV
 from breezy.adapters.polymarket_us.parsing import parse_binary_option
 from breezy.adapters.polymarket_us.symbology import (
     POLYMARKET_US_VENUE,
+    REGISTRY_VENUE_KEY,
     assert_bounds_cross_checked,
     assert_valid_slug,
     instrument_id_to_slug,
@@ -58,6 +59,7 @@ from breezy.adapters.polymarket_us.transport import (
     QUOTA_KEY_DISCOVERY,
     QUOTA_KEY_INSTRUMENTS,
 )
+from breezy.registry.sites import SiteRegistry, default_registry
 
 __all__ = [
     "MARKET_BY_SLUG_PATH",
@@ -218,6 +220,7 @@ class PolymarketUSInstrumentProvider(InstrumentProvider):
         venue: Venue = POLYMARKET_US_VENUE,
         discovery: PolymarketUSMarketDiscoveryConfig,
         clock: Clock,
+        sites: SiteRegistry | None = None,
         logger: SupportsVenueLog | None = None,
     ) -> None:
         super().__init__(config=config)
@@ -225,6 +228,7 @@ class PolymarketUSInstrumentProvider(InstrumentProvider):
         self._venue: Venue = venue
         self._discovery: PolymarketUSMarketDiscoveryConfig = discovery
         self._clock: Clock = clock
+        self._sites: SiteRegistry = default_registry() if sites is None else sites
         self._discovery_log: SupportsVenueLog = logger if logger is not None else self._log
         self._market_slugs: tuple[str, ...] = ()
         self._active_market_slugs: tuple[str, ...] = ()
@@ -275,7 +279,11 @@ class PolymarketUSInstrumentProvider(InstrumentProvider):
             self._assert_bounds(market.payload, market.slug)
             payload = {"market": market.payload}
             instrument = parse_binary_option(
-                payload, venue=self._venue, ts_init=self._clock.timestamp_ns()
+                payload,
+                venue=self._venue,
+                ts_init=self._clock.timestamp_ns(),
+                sites=self._sites,
+                venue_key=REGISTRY_VENUE_KEY,
             )
             if instrument.id.symbol.value != market.slug:
                 raise VenuePayloadError(
@@ -331,7 +339,11 @@ class PolymarketUSInstrumentProvider(InstrumentProvider):
                 quota_key=QUOTA_KEY_INSTRUMENTS,
             )
             instrument = parse_binary_option(
-                payload, venue=self._venue, ts_init=self._clock.timestamp_ns()
+                payload,
+                venue=self._venue,
+                ts_init=self._clock.timestamp_ns(),
+                sites=self._sites,
+                venue_key=REGISTRY_VENUE_KEY,
             )
             if instrument.id.symbol.value != slug:
                 raise VenuePayloadError(
@@ -396,6 +408,8 @@ class PolymarketUSInstrumentProvider(InstrumentProvider):
         parsed = parse_weather_slug(slug)
         if parsed is None:
             raise VenuePayloadError(f"Discovered weather market {slug!r} no longer parses")
+        # Kept as a discovery-time guard; parse_binary_option keeps the returned
+        # interval as the strategy-facing fact.
         assert_bounds_cross_checked(
             parsed,
             description=(

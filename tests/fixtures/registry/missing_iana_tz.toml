@@ -6,6 +6,7 @@ registry_version = "test-1"
 [sites.polymarket_us.TST]
 icao = "KABC"
 cli_location = "ZZZ"
+venue_city_token = "tst"
 issuing_office = "KXYZ"
 std_utc_offset_hours = -5.0
 body_header_regex = '^\.\.\.THE\s+TEST\s+CLIMATE\s+SUMMARY\s+FOR\b'

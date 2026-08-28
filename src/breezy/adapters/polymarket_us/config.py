@@ -161,7 +161,7 @@ def discovery_city_codes_from_registry(
     """
     active_registry = default_registry() if registry is None else registry
     codes = tuple(
-        city.lower()
+        active_registry.venue_symbology(registered_venue, city).venue_city_token
         for registered_venue, city in active_registry.pairs()
         if registered_venue == venue
     )
@@ -172,8 +172,8 @@ def discovery_city_codes_from_registry(
         )
     if len(set(codes)) != len(codes):
         raise SettingsError(
-            "market_discovery.city_codes cannot be derived: registry city keys "
-            f"for venue {venue!r} collide after lowercase normalization"
+            "market_discovery.city_codes cannot be derived: registry venue_city_token "
+            f"values for venue {venue!r} collide"
         )
     return codes
 

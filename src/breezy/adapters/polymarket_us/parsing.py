@@ -143,11 +143,22 @@ from breezy.adapters.polymarket_us.errors import (
 )
 from breezy.adapters.polymarket_us.symbology import (
     POLYMARKET_US_VENUE,
+    REGISTRY_VENUE_KEY,
+    assert_bounds_cross_checked,
     assert_valid_slug,
     parse_weather_slug,
     slug_to_instrument_id,
 )
 from breezy.adapters.polymarket_us.tape_records import VenueSettlementSnapshot
+from breezy.domain.weather_bucket_facts import (
+    SETTLEMENT_STATION_KEY,
+    STRIKE_LOWER_F_KEY,
+    STRIKE_UPPER_F_KEY,
+    WEATHER_FACTS_STATUS_KEY,
+    WEATHER_FACTS_STATUS_KNOWN,
+    WEATHER_FACTS_STATUS_UNKNOWN,
+)
+from breezy.registry.sites import SiteNotFoundError, SiteRegistry, default_registry
 
 __all__ = [
     "CLIMATE_CATEGORY",
@@ -1080,7 +1091,13 @@ def _market_sides(market: Mapping[str, Any], slug: str) -> tuple[list[Mapping[st
     return sides, outcome
 
 
-def _weather_info(market: Mapping[str, Any], slug: str) -> dict[str, Any]:
+def _weather_info(
+    market: Mapping[str, Any],
+    slug: str,
+    *,
+    sites: SiteRegistry,
+    venue_key: str,
+) -> dict[str, Any]:
     parsed = parse_weather_slug(slug)
     category = market.get("category")
     if parsed is None:
@@ -1090,26 +1107,43 @@ def _weather_info(market: Mapping[str, Any], slug: str) -> dict[str, Any]:
                 "not match any observed weather grammar; refusing to load a climate "
                 "instrument without a city_day_cluster_id"
             )
-        return {
-            "city": None,
-            "measure": None,
-            "climate_date": None,
-            "strike_bounds": None,
-            "strike_bounds_parsed": None,
-            "city_day_cluster_id": None,
-        }
+        return {WEATHER_FACTS_STATUS_KEY: WEATHER_FACTS_STATUS_UNKNOWN}
+
+    interval = assert_bounds_cross_checked(
+        parsed,
+        description=_description(market),
+        title=market.get("title") if isinstance(market.get("title"), str) else None,
+        # Settlement data flows through NwsClimateDay.tmax_f/tmin_f, typed int | None.
+        reading_is_whole_degrees=True,
+    )
+    try:
+        site = sites.site_for_venue_city_token(venue_key, parsed.city)
+    except SiteNotFoundError as exc:
+        raise InstrumentDefinitionError(
+            f"Market {slug!r} carries venue_city_token {parsed.city!r}, but no "
+            f"settlement site is registered for venue {venue_key!r}"
+        ) from exc
+
     return {
         "city": parsed.city,
         "measure": parsed.measure,
         "climate_date": parsed.climate_date,
         "strike_bounds": parsed.raw_bounds,
-        "strike_bounds_parsed": parsed.bounds,
         "city_day_cluster_id": parsed.city_day_cluster_id,
+        WEATHER_FACTS_STATUS_KEY: WEATHER_FACTS_STATUS_KNOWN,
+        SETTLEMENT_STATION_KEY: site.cli_location,
+        STRIKE_LOWER_F_KEY: interval[0],
+        STRIKE_UPPER_F_KEY: interval[1],
     }
 
 
 def parse_binary_option(
-    payload: Mapping[str, Any], *, venue: Venue = POLYMARKET_US_VENUE, ts_init: int
+    payload: Mapping[str, Any],
+    *,
+    venue: Venue = POLYMARKET_US_VENUE,
+    ts_init: int,
+    sites: SiteRegistry | None = None,
+    venue_key: str = REGISTRY_VENUE_KEY,
 ) -> BinaryOption:
     """Build a native ``BinaryOption`` from a ``GET /v1/market/slug/{slug}`` response.
 
@@ -1160,7 +1194,8 @@ def parse_binary_option(
         FEE_COEFFICIENT_KEY: None if fee_coefficient is None else str(fee_coefficient),
         FEE_SCHEDULE_STATUS_KEY: fee_schedule_status,
     }
-    info.update(_weather_info(market, slug))
+    active_sites = default_registry() if sites is None else sites
+    info.update(_weather_info(market, slug, sites=active_sites, venue_key=venue_key))
 
     return BinaryOption(
         instrument_id=slug_to_instrument_id(slug, venue),
