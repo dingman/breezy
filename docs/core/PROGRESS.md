@@ -1094,3 +1094,102 @@ a live author session are addressed: weather wrapping, OrderBookDepth10 vs.
 QuoteTick, StrategyConfig import path, Decimal literal preference, client-scoped
 weather subscription, and the type-checking split (src/ is checked, tests/ is
 not). Includes a minimal end-to-end example that runs against the real harness.
+
+---
+
+## BACKLOG — backtest readiness (opened 2026-08-28)
+
+The harness accepts an arbitrary strategy: an author who had never seen this
+repo wrote one and backtested it with zero configuration changes (`8070bc3`).
+That is verified and holds.
+
+**But the harness is ready and the DATA is not.** Measured 2026-08-28 against
+`~/.local/share/breezy/catalog/polymarket_us`: the catalog contains exactly two
+data-type directories, `custom_nws_climate_day` (115 rows) and
+`custom_nws_raw_product` (115 rows), across LAX/MDW/MIA/NYC/SFO. There are
+**zero** rows of `QuoteTick`, `TradeTick`, `OrderBookDepth10`, `InstrumentClose`
+or `BinaryOption`. Every backtest that exists runs against a synthetic tape
+whose settlement the test itself chooses. So a strategy can be RUN but not
+EVALUATED, and a backtest against fabricated prices cannot rank a strategy.
+
+Ordered by whether it blocks a real backtest.
+
+### [BLOCKER] B-1 — No venue market data has ever been captured
+
+The recorder exists and is read-only: `breezy-quote-tape`
+(`src/breezy/runtime/quote_tape_cli.py`, console entry in `pyproject.toml:291`)
+connects a read-only market-data client and lets Nautilus' native
+`StreamingFeatherWriter` persist `QuoteTick` and `BinaryOption` under
+`<catalog_root>/live/<instance_id>/`. It has no strategy, no Actor, no execution
+client.
+
+It has never been run here. **Gated on the operator**: no venue configuration is
+present on this host — `BREEZY_POLYMARKET_US_QUOTE_TAPE_CATALOG` and the
+Polymarket.us endpoint variables are unset, and endpoints/enablement are
+operator-domain, not something the bot may invent. Market DISCOVERY itself needs
+no KYC (`get_public` dispatches `authenticated=False`), so this is a
+configuration gap, not a credential gap.
+
+### [BLOCKER] B-2 — No reader loads market data from the catalog into a backtest
+
+`src/breezy/persistence/catalog.py` exposes `read_climate_days`,
+`read_raw_products`, `read_climate_day_as_of_settlement` and
+`read_climate_day_including_corrections` — **weather only**. There is no
+supported, tested path from a captured tape to
+`BreezyBacktestConfig.market_data`. Even if B-1 lands tomorrow, an author still
+could not feed the result to the harness. NOT gated on the operator; executable
+now against a fabricated-then-written catalog.
+
+### [HIGH] B-3 — The feather-to-parquet conversion is docstring-only
+
+`convert_stream_to_data(instance_id, QuoteTick, subdirectory="live")` appears in
+the `quote_tape_cli` module docstring as the documented way to make a run
+readable. Nothing automates it and no test proves a written run converts and
+reads back. A capture that cannot be read back is not a capture.
+
+### [HIGH] C-1 — `_BUCKETS` is hand-typed; nothing forces it to match the venue
+
+`tests/contract/test_multi_instrument_weather_strategy.py:84`. Plan committed at
+`6805204`, peer-reviewed to revision 2, six increments. Only increment 5 closes
+the hole. No money is at risk today — the live node is `strategies=[]` and
+`BreezyStrikeLadder` is constructed only by its own test — so this must land
+before live authorization, not before more backtesting.
+
+### [HIGH] C-2 — The contract fixture correlates a weather record to nothing
+
+The fixture drives `climate_day 2026-08-22` into markets dated `2026-04-23`, a
+121-day gap, with zero `climate_day=` overrides, and the suite is green. Plan
+increment 4.
+
+### [MEDIUM] C-3 — The bucket test cannot discriminate closed from half-open
+
+`OBSERVED_TMAX_F = 72` against `WINNER = (72, 73)`. 72 is the LOWER endpoint, so
+the closed reading and the naive half-open reading agree there and the test
+passes under both. The discriminating observation is 73. Add it.
+
+### Harness gaps self-named by the implementer
+
+- **[MEDIUM] H-1** Refusal ORDERING is untested — each test triggers exactly one
+  refusal condition, so precedence between them is unpinned.
+- **[LOW] H-2** Prose pins are substring matches; a docstring could drift while
+  still containing the pinned substring.
+- **[MEDIUM] H-3** `Bar` is excluded from `VENUE_MARKET_DATA_TYPES` with no test
+  asserting that exclusion is correct.
+
+### Quality and infrastructure
+
+- **[MEDIUM] Q-1** The asdict credential guard is a name-based AST heuristic;
+  `asdict(x)` where `x` holds credential material under an unexpected name still
+  passes (`fc34152` fixed coverage, not semantic reach).
+- **[LOW] Q-2** `tests/` is not typechecked — 159 strict errors across 38 files.
+- **[LOW] Q-3** `scripts/analysis` carries 5 pre-existing strict errors
+  (`settlement_bucket_gate.py:189,466`; `settlement_alignment_diagnosis.py:473,482`).
+- **[CLOSED] Q-4** A once-observed failure in the asdict guard was never
+  reproduced. Most probable cause: several agents mutating one working tree while
+  pytest ran, and the guard AST-parses every file under `src/` and `scripts/`.
+  An orchestration defect, not a product defect. Not to be re-chased.
+
+### Beyond this gate
+
+- DTC pre-registration P1 anchor re-derivation, and `[D6]` cache-only egress
+  closure (`docs/evidence/decision_time_clearance_prereg_2026-08-27.md`).
