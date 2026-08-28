@@ -24,7 +24,7 @@ from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from io import BytesIO
 from pathlib import Path
-from typing import Final
+from typing import Final, Protocol
 from urllib.parse import urlencode
 from zipfile import ZipFile
 
@@ -345,7 +345,20 @@ def cache_path_for_url(cache_dir: Path, url: str, suffix: str = ".txt") -> Path:
     return cache_dir / f"{digest}{suffix}"
 
 
-def fetch_text_cached(client: httpx.Client, cache_dir: Path, url: str, delay_s: float) -> str:
+class HistoricalDataClient(Protocol):
+    """The subset of ``httpx.Client`` these fetch helpers actually call.
+
+    Narrower than ``httpx.Client`` so a cache-only stub (e.g. a client that
+    always raises instead of performing network I/O) can honestly satisfy the
+    interface without claiming to implement the full HTTP client surface.
+    """
+
+    def get(self, url: str, *, timeout: float) -> httpx.Response: ...
+
+
+def fetch_text_cached(
+    client: HistoricalDataClient, cache_dir: Path, url: str, delay_s: float
+) -> str:
     cache_dir.mkdir(parents=True, exist_ok=True)
     path = cache_path_for_url(cache_dir, url)
     if path.exists():
@@ -359,7 +372,7 @@ def fetch_text_cached(client: httpx.Client, cache_dir: Path, url: str, delay_s: 
 
 
 def fetch_bytes_cached(
-    client: httpx.Client,
+    client: HistoricalDataClient,
     cache_dir: Path,
     url: str,
     delay_s: float,
@@ -590,7 +603,7 @@ def year_chunks(start: dt.date, end: dt.date) -> Iterable[tuple[dt.date, dt.date
 
 def fetch_cli_labels_chunked(
     *,
-    client: httpx.Client,
+    client: HistoricalDataClient,
     cache_dir: Path,
     delay_s: float,
     city: str,
@@ -727,7 +740,7 @@ def read_catalog_finals(
 
 def validate_archive_against_catalog(
     *,
-    client: httpx.Client,
+    client: HistoricalDataClient,
     cache_dir: Path,
     delay_s: float,
     catalog_base: Path | None,
@@ -814,7 +827,7 @@ def validate_archive_against_catalog(
 
 def fetch_historical_cases(
     *,
-    client: httpx.Client,
+    client: HistoricalDataClient,
     cache_dir: Path,
     delay_s: float,
     sites: Sequence[SiteSpec],

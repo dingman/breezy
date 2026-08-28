@@ -19,7 +19,7 @@ from collections import Counter, defaultdict
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Final
+from typing import Final, Protocol
 
 from settlement_alignment_cache import (
     DEFAULT_SETTLEMENT_ALIGNMENT_CACHE_DIR,
@@ -43,6 +43,16 @@ from settlement_alignment_study import (
     wilson_lower_bound,
     year_chunks,
 )
+
+# settlement_bucket_guard_band.py imports END_DATE, START_DATE and
+# load_sites through this module rather than duplicating the path to
+# settlement_alignment_study. Listed here so strict mode's
+# no-implicit-reexport rule treats the passthrough as intentional.
+__all__ = [
+    "END_DATE",
+    "START_DATE",
+    "load_sites",
+]
 
 DEFAULT_CACHE_DIR: Final[Path] = DEFAULT_SETTLEMENT_ALIGNMENT_CACHE_DIR
 DEFAULT_OUTPUT: Final[Path] = Path("docs/evidence/settlement_bucket_gate_2026-08-25.md")
@@ -180,9 +190,12 @@ def parse_venue_market(obj: Mapping[str, object], source_file: Path) -> VenueMar
         strike_low = int(match.group("gte"))
         strike_high = int(match.group("inner_lt"))
 
-    title = obj.get("title")
-    if not isinstance(title, str):
-        title = obj.get("groupItemTitle") if isinstance(obj.get("groupItemTitle"), str) else ""
+    title_value = obj.get("title")
+    if isinstance(title_value, str):
+        title = title_value
+    else:
+        group_item_title = obj.get("groupItemTitle")
+        title = group_item_title if isinstance(group_item_title, str) else ""
     description = obj.get("description")
     return VenueMarket(
         slug=slug_value,
@@ -439,7 +452,25 @@ def phase_cases(comparisons: Iterable[DailyComparison]) -> tuple[PhaseCase, ...]
     return tuple(cases)
 
 
-def summarize(cases: Iterable[PhaseCase]) -> AgreementStats:
+class AgreementCase(Protocol):
+    """The bucket-agreement surface ``summarize`` actually reads.
+
+    ``PhaseCase`` and ``GuardedBucketCase`` (settlement_bucket_guard_band.py)
+    both compute ``agreed``/``miss_direction`` identically from a CLI vs.
+    METAR bucket comparison; a guarded case genuinely is an agreement case,
+    just with extra guard-band fields ``summarize`` never touches. A
+    Protocol names that real substitutability instead of hiding it behind a
+    nominal ``PhaseCase`` type the guarded variant doesn't inherit from.
+    """
+
+    @property
+    def agreed(self) -> bool: ...
+
+    @property
+    def miss_direction(self) -> str: ...
+
+
+def summarize(cases: Iterable[AgreementCase]) -> AgreementStats:
     materialized = tuple(cases)
     agreements = sum(1 for case in materialized if case.agreed)
     count = len(materialized)
@@ -465,7 +496,7 @@ def format_rate(value: float) -> str:
     return f"{value:.6f}"
 
 
-def counter_text(counter: Counter[int] | Counter[str]) -> str:
+def counter_text[T: (int, str)](counter: Counter[T]) -> str:
     if not counter:
         return "none"
     return ", ".join(f"{key}: {counter[key]}" for key in sorted(counter))

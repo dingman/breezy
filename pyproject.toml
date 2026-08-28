@@ -169,18 +169,15 @@ files = [
     # The venue slice. The operator EXECUTES the smoke script against
     # PRODUCTION credentials, so it must be typechecked, and so must the test
     # doubles that claim to model the real classes.
-    #
-    # Scoped to `scripts/venue` rather than all of `scripts`: `scripts/analysis`
-    # is owned by the settlement seam and currently carries 5 pre-existing
-    # strict errors (settlement_bucket_gate.py:189,466 x2;
-    # settlement_alignment_diagnosis.py:473,482). Widening the gate over another
-    # seam's live work is that seam's call, not this one's -- the errors are
-    # reported rather than silently absorbed or silently skipped.
+    "scripts/venue",
+    # The settlement seam's analysis scripts (Q-3). Previously excluded
+    # because the directory carried pre-existing strict errors owned by that
+    # seam; those errors are now fixed and the gate is widened to cover it.
+    "scripts/analysis",
     #
     # `tests/` is likewise not checked wholesale: it carries 159 pre-existing
     # strict errors across 38 files. The polymarket_us tests are enumerated
     # because THIS slice's doubles must not drift from the classes they model.
-    "scripts/venue",
     # STK-1 native-egress firewall barriers (N1-N5) and the pyo3 block
     # regression suite. Typechecked because they reason about the real
     # nautilus_pyo3 client classes and the conftest sentinel.
@@ -226,8 +223,9 @@ files = [
 
     # Settlement seam: the asymmetric gate's minimum-coverage rule. Registered
     # so the closed-set membership logic and its anti-negation guard are
-    # typechecked, not merely executed.
-    "scripts/analysis/settlement_programme_report.py",
+    # typechecked, not merely executed. (settlement_programme_report.py
+    # itself is covered by the "scripts/analysis" entry above; listing it
+    # again here would register it as a duplicate module.)
     "tests/unit/test_settlement_conservatism_prose_guard.py",
     "tests/unit/test_settlement_coverage_rule.py",
     "tests/unit/test_settlement_programme_rollup.py",

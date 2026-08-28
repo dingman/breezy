@@ -17,6 +17,7 @@ from collections import Counter, defaultdict
 from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
 from pathlib import Path
+from typing import NoReturn
 
 from settlement_alignment_cache import (
     DEFAULT_SETTLEMENT_ALIGNMENT_CACHE_DIR,
@@ -46,7 +47,17 @@ DEFAULT_OUTPUT = Path("docs/evidence/settlement_alignment_diagnosis_2026-08-25.m
 
 
 class NoNetworkClient:
-    def get(self, url: str, *_args: object, **_kwargs: object) -> object:
+    """A ``HistoricalDataClient`` stub that always refuses a cache miss.
+
+    ``get`` never returns -- it always raises -- so ``NoReturn`` is the
+    honest return type. Per the return-type variance rule, a method that
+    never returns is a valid substitute wherever any return type is
+    expected, including the real ``httpx.Response`` the live client
+    returns; this script never depends on that value because the
+    preregistered cache is asserted complete before this client is used.
+    """
+
+    def get(self, url: str, *, timeout: float) -> NoReturn:
         raise RuntimeError(f"cache miss would require network access: {url}")
 
 
