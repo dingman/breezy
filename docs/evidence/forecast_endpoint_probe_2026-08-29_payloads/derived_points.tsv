@@ -1,0 +1,6 @@
+site	icoa	cli_location	lat	lon	gridId	gridX	gridY	forecast	forecastHourly	rawGridpoint	observationStations	forecastOffice	pointTimeZone	relativeCity	relativeState
+NYC	KNYC	NYC	40.78333	-73.96667											
+SFO	KSFO	SFO	37.61961	-122.36558											
+MIA	KMIA	MIA	25.79056	-80.31639											
+MDW	KMDW	MDW	41.78417	-87.75528											
+LAX	KLAX	LAX	33.93806	-118.38889											

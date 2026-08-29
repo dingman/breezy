@@ -1,0 +1,18 @@
+HTTP/1.1 301 Moved Permanently
+Server: nginx/1.28.3
+Content-Type: application/problem+json
+Location: /points/25.7906,-80.3164
+X-Request-ID: 01a047a9-5603-7652-a3e4-f6be235106d7
+X-Correlation-ID: 20cd31f1
+X-Server-ID: vm-bldr-api-ops-app13.ncep.noaa.gov
+Access-Control-Allow-Origin: *
+Access-Control-Expose-Headers: X-Correlation-Id, X-Request-Id, X-Server-Id
+Content-Length: 463
+Cache-Control: private, max-age=20032
+Expires: Sat, 29 Aug 2026 09:17:55 GMT
+Date: Sat, 29 Aug 2026 03:44:03 GMT
+Connection: keep-alive
+X-Edge-Request-ID: 9c0938c
+Vary: Accept,Feature-Flags,Accept-Language
+Strict-Transport-Security: max-age=31536000 ; includeSubDomains ; preload
+

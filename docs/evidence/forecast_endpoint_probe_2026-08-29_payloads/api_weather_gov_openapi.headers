@@ -1,0 +1,19 @@
+HTTP/1.1 200 OK
+Server: nginx/1.28.3
+Content-Type: application/vnd.oai.openapi+json;version=3.1
+ETag: "fcfa4494a93adba20ef11ebac36c0d9a35ba3163"
+Access-Control-Allow-Origin: *
+X-Request-ID: 01a04b9f-67f2-73d4-aec2-8843a3bec8d4
+X-Correlation-ID: 1a06142c
+X-Server-ID: vm-bldr-api-ops-app9.ncep.noaa.gov
+Vary: Accept-Encoding
+Cache-Control: public, max-age=604800
+Expires: Sat, 05 Sep 2026 03:45:33 GMT
+Date: Sat, 29 Aug 2026 03:45:33 GMT
+Transfer-Encoding:  chunked
+Connection: keep-alive
+Connection: Transfer-Encoding
+X-Edge-Request-ID: 5decb6d
+Vary: Accept,Feature-Flags,Accept-Language
+Strict-Transport-Security: max-age=31536000 ; includeSubDomains ; preload
+

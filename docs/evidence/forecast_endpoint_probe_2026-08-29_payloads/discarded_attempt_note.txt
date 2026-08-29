@@ -1,0 +1,17 @@
+During the first attempted probe command, curl was incorrectly invoked with
+`--location-trusted false`. Curl treats `--location-trusted` as enabling redirect
+following and also treated `false` as an extra URL.
+
+Observed effect:
+- five exact `/points/{lat},{lon}` invocations were started for NYC, SFO, MIA,
+  MDW, and LAX before the command was stopped;
+- the terminal output showed 200 response bodies at the canonical rounded point
+  URLs, which means each exact `/points` invocation likely followed a 301 to the
+  canonical `/points` URL;
+- body captures from that discarded run were not usable and were removed;
+- no 403 or 429 was observed in the terminal output or saved response headers.
+
+Conservative request accounting therefore counts that discarded run as 10
+api.weather.gov HTTP requests: five exact `/points` requests plus five followed
+canonical `/points` requests. The clean manifest in `request_manifest.tsv` then
+adds 13 more api.weather.gov requests, for a conservative total of 23.

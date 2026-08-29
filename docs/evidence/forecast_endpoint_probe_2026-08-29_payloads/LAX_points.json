@@ -1,0 +1,8 @@
+{
+    "correlationId": "273efe6a",
+    "title": "Adjusting Precision Of Point Coordinate",
+    "type": "https://api.weather.gov/problems/AdjustPointPrecision",
+    "status": 301,
+    "detail": "The precision of latitude/longitude points is limited for efficiency. The location attribute contains your request mapped to the nearest supported point. If your client supports it, you will be redirected.",
+    "instance": "https://api.weather.gov/requests/273efe6a"
+}

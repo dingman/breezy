@@ -1,0 +1,19 @@
+HTTP/1.1 200 OK
+Server: nginx/1.28.3
+Content-Type: application/ld+json
+Last-Modified: Fri, 28 Aug 2026 22:00:00 GMT
+Access-Control-Allow-Origin: *
+Access-Control-Expose-Headers: X-Correlation-Id, X-Request-Id, X-Server-Id
+X-Request-ID: 01a04b9f-2a34-7975-8b0f-7fdfacb08b91
+X-Correlation-ID: 2742a41d
+X-Server-ID: vm-bldr-api-ops-app7.ncep.noaa.gov
+Vary: Accept-Encoding
+Cache-Control: public, max-age=3420, s-maxage=3600
+Expires: Sat, 29 Aug 2026 04:45:17 GMT
+Date: Sat, 29 Aug 2026 03:48:17 GMT
+Content-Length: 12422
+Connection: keep-alive
+X-Edge-Request-ID: 5e04602
+Vary: Accept,Feature-Flags,Accept-Language
+Strict-Transport-Security: max-age=31536000 ; includeSubDomains ; preload
+
