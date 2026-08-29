@@ -34,6 +34,7 @@ from breezy.domain.weather_bucket_facts import Measure
 
 __all__ = [
     "ForecastErrorModel",
+    "ForecastRevision",
     "HorizonSigmaParams",
     "UnsupportedMeasureError",
     "WeatherProbabilityEngine",
@@ -138,6 +139,26 @@ def _log_gamma(z: float) -> float:
         y += 1.0
         ser += c / y
     return -tmp + log(2.5066282746310005 * ser / x)
+
+
+@dataclass(frozen=True, slots=True)
+class ForecastRevision:
+    """What one forecast update did to a single bucket's model probability.
+
+    Replaces the ``dict[str, float]`` the operator's bundle returned from
+    ``WeatherProbabilityEngine.revision``. Same five values under the same
+    names; a typed record so a mistyped key is a type error at authoring time
+    rather than a ``KeyError`` in the middle of a run.
+    """
+
+    #: Degrees F the forecast high moved (current - previous). Signed.
+    forecast_revision_f: float
+    #: Model probability the move implies (current - previous). Signed.
+    prob_revision: float
+    prev_prob: float
+    new_prob: float
+    #: Hours the settlement horizon shrank between the two publications.
+    horizon_change_h: float
 
 
 @dataclass(frozen=True, slots=True)
@@ -330,6 +351,35 @@ class WeatherProbabilityEngine:
             horizon_hours,
             facts.settlement_station,
             facts.climate_day,
+        )
+
+    def revision(
+        self,
+        facts: WeatherBucketFacts,
+        previous_high_f: float,
+        previous_horizon_hours: float,
+        current_high_f: float,
+        current_horizon_hours: float,
+    ) -> ForecastRevision:
+        """Model impact of one forecast update on one bucket's probability.
+
+        Carried over from the operator's bundle unchanged in arithmetic. Two
+        adaptations, neither touching the math: it takes
+        :class:`~breezy.domain.weather_bucket_facts.WeatherBucketFacts` rather
+        than the bundle's hand-rolled ``TemperatureContract`` (so the bounds
+        are the venue's own), and it returns a typed
+        :class:`ForecastRevision` rather than a ``dict[str, float]`` -- the
+        bundle indexed that dict with bare string keys, which no type checker
+        could verify and a typo would turn into a ``KeyError`` mid-backtest.
+        """
+        p0 = self.bucket_probability(facts, previous_high_f, previous_horizon_hours)
+        p1 = self.bucket_probability(facts, current_high_f, current_horizon_hours)
+        return ForecastRevision(
+            forecast_revision_f=current_high_f - previous_high_f,
+            prob_revision=p1 - p0,
+            prev_prob=p0,
+            new_prob=p1,
+            horizon_change_h=current_horizon_hours - previous_horizon_hours,
         )
 
     def expected_probability_se(

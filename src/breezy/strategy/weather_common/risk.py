@@ -180,6 +180,16 @@ class RiskManager:
         ):
             return RiskDecision(False, "shorts_disabled")
 
+        # PRESERVED DEFECT -- AWAITING AN OPERATOR RULING. DO NOT "FIX" SILENTLY.
+        # The third argument is the quote's age in minutes, and it is hardcoded
+        # to 0.0 here, so `quote_tradable`'s `stale_quote_minutes` check is
+        # PERMANENTLY VACUOUS on this path: an arbitrarily stale quote passes.
+        # (The caller does know the real age -- the strategy computes it for the
+        # separate pre-trade `quote_tradable` call -- so this is a dropped
+        # argument, not missing information.) Carried over verbatim from the
+        # operator's bundle. Changing it would start blocking orders that
+        # currently pass, which is an economic change to live behaviour and is
+        # the operator's call, not this integration's.
         ok, why = self.quote_tradable(quote, contract.price_scale, 0.0)
         if not ok:
             return RiskDecision(False, why)

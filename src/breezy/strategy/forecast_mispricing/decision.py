@@ -127,6 +127,14 @@ def evaluate_instrument(
 
     intent = SideIntent.FLAT
     edge = 0.0
+    # PRESERVED DEFECT -- AWAITING AN OPERATOR RULING. DO NOT "FIX" SILENTLY.
+    # `or` tests FALSINESS, not None. A midpoint of exactly 0.0 -- a real,
+    # reachable price on a 0-1 binary market whose YES side is worthless -- is
+    # falsy, so this silently falls through to `ask_p` and reports the ask as
+    # the market probability. `mid_p if mid_p is not None else ask_p` is the
+    # intended reading. Carried over verbatim from the operator's bundle;
+    # `mkt` is reassigned on both entry branches below and only survives on
+    # the no-entry path, so the blast radius is reporting, not sizing.
     mkt = mid_p or ask_p
     if long_edge >= cfg.min_entry_edge and long_edge >= short_edge:
         intent = SideIntent.LONG_YES
