@@ -9,18 +9,32 @@ partially-populated result.
 
 from __future__ import annotations
 
+import hashlib
 import re
 from datetime import date
 from pathlib import Path
 
 import pytest
 
-from breezy.normalize.cli_parse import CliParseError, parse_cli_product, parse_temperature_token
+from breezy.normalize import cli_parse
+from breezy.normalize.classify import classify_issuance
+from breezy.normalize.cli_parse import (
+    CliNotOurProductError,
+    CliParseError,
+    CliStructuralError,
+    check_structural_allowlist,
+    parse_cli_product,
+    parse_temperature_token,
+)
 from breezy.normalize.units import TemperatureReadingF
 
 FIXTURES_DIR = Path(__file__).resolve().parent.parent / "fixtures" / "nws"
+CLI_EQUIVALENCE_DIR = Path(__file__).resolve().parent.parent / "fixtures" / "cli_equivalence"
 NYC_HEADER_REGEX = re.compile(
     r"^\.\.\.THE\s+CENTRAL\s+PARK\s+NY\s+CLIMATE\s+SUMMARY\s+FOR\b", re.MULTILINE
+)
+MIA_HEADER_REGEX = re.compile(
+    r"^\.\.\.THE\s+MIAMI\s+CLIMATE\s+SUMMARY\s+FOR\b", re.MULTILINE
 )
 
 # A minimal WMO/AWIPS prefix that satisfies the structural allowlist
@@ -32,6 +46,31 @@ _VALID_NYC_PREFIX = "\n000\nCDUS41 KOKX 220626\nCLINYC\n"
 
 def _load(name: str) -> str:
     return (FIXTURES_DIR / name / "product.txt").read_text()
+
+
+def _load_cli_equivalence_bytes(name: str) -> bytes:
+    return (CLI_EQUIVALENCE_DIR / name).read_bytes()
+
+
+def _with_transmission_sequence(text: str, sequence: str) -> str:
+    lines = text.split("\n")
+    lines[1] = sequence
+    return "\n".join(lines)
+
+
+def _valid_nyc_body_with_sequence(sequence: str) -> str:
+    return _with_transmission_sequence(
+        _VALID_NYC_PREFIX
+        + "...THE CENTRAL PARK NY CLIMATE SUMMARY FOR AUGUST 21 2026...\n"
+        "TEMPERATURE (F)\n"
+        " YESTERDAY\n"
+        "  MAXIMUM         79\n"
+        "  MINIMUM         63\n"
+        "  AVERAGE         71\n"
+        "\n"
+        "PRECIPITATION (IN)\n",
+        sequence,
+    )
 
 
 def test_summary_date_from_headline_not_issuance_time() -> None:
@@ -78,6 +117,83 @@ def test_parse_real_preliminary_fixture_matches_expected() -> None:
     assert result.tmax == TemperatureReadingF(value_f=79, sentinel="NONE")
     assert result.tmin == TemperatureReadingF(value_f=63, sentinel="NONE")
     assert result.tavg == TemperatureReadingF(value_f=71, sentinel="NONE")
+
+
+def test_live_and_archive_cli_equivalence_fixture_parse_identically() -> None:
+    live_bytes = _load_cli_equivalence_bytes("MIA_20260824_live.txt")
+    archive_bytes = _load_cli_equivalence_bytes("MIA_20260824_archive.txt")
+    assert (
+        hashlib.sha256(live_bytes).hexdigest()
+        == "5107e7fb9cd56d2ee49b3cad302dee76f72a0e9f42c7f1b4ebec988ea5dac87f"
+    )
+    assert (
+        hashlib.sha256(archive_bytes).hexdigest()
+        == "fd57ce50dea7295624651e7034f9a4de84843b0974439f43cc391fa9ce9627a7"
+    )
+    # These digests are byte-level provenance, so the inequality is correct:
+    # the live API normalized the sequence to 000 while the archive preserved 100.
+    assert hashlib.sha256(live_bytes).digest() != hashlib.sha256(archive_bytes).digest()
+
+    live_text = live_bytes.decode()
+    archive_text = archive_bytes.decode()
+
+    live = parse_cli_product(
+        live_text,
+        cli_location="MIA",
+        body_header_regex=MIA_HEADER_REGEX,
+    )
+    archive = parse_cli_product(
+        archive_text,
+        cli_location="MIA",
+        body_header_regex=MIA_HEADER_REGEX,
+    )
+
+    assert live == archive
+    assert classify_issuance(live_text) == classify_issuance(archive_text)
+    assert live.is_correction_bbb == archive.is_correction_bbb
+
+
+@pytest.mark.parametrize("sequence", ["000", "100", "507", "487"])
+def test_structural_allowlist_accepts_digits_only_transmission_sequences(sequence: str) -> None:
+    header = check_structural_allowlist(
+        _valid_nyc_body_with_sequence(sequence),
+        cli_location="NYC",
+    )
+
+    assert header.wmo_transmission_sequence == sequence
+
+
+@pytest.mark.parametrize("sequence", ["", "   ", "5O7", "O00", "123456789"])
+def test_structural_allowlist_refuses_invalid_transmission_sequences(sequence: str) -> None:
+    with pytest.raises(CliStructuralError, match="transmission indicator"):
+        check_structural_allowlist(
+            _valid_nyc_body_with_sequence(sequence),
+            cli_location="NYC",
+        )
+
+
+def test_transmission_sequence_pattern_refuses_embedded_newline() -> None:
+    # A `$` anchor would match before this trailing newline. Keep this pinned
+    # even though the current line split plus strip path masks the case.
+    assert cli_parse._WMO_TRANSMISSION_SEQUENCE_RE.match("507\n") is None
+
+
+def test_structural_header_carries_live_and_archive_transmission_sequences() -> None:
+    live = _load_cli_equivalence_bytes("MIA_20260824_live.txt").decode()
+    archive = _load_cli_equivalence_bytes("MIA_20260824_archive.txt").decode()
+
+    live_header = check_structural_allowlist(live, cli_location="MIA")
+    archive_header = check_structural_allowlist(archive, cli_location="MIA")
+
+    assert live_header.wmo_transmission_sequence == "000"
+    assert archive_header.wmo_transmission_sequence == "100"
+
+
+def test_sibling_station_still_refused_by_pil_after_sequence_widening() -> None:
+    sibling = _valid_nyc_body_with_sequence("507").replace("CLINYC", "CLIJFK", 1)
+
+    with pytest.raises(CliNotOurProductError):
+        parse_cli_product(sibling, cli_location="NYC", body_header_regex=NYC_HEADER_REGEX)
 
 
 def test_temperature_extraction_anchors_to_yesterday_not_normal_or_record() -> None:

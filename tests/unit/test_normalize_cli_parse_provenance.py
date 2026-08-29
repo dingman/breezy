@@ -110,7 +110,11 @@ def test_structural_allowlist_returns_the_header_it_validated() -> None:
     )
 
     assert isinstance(header, CliStructuralHeader)
-    assert header == CliStructuralHeader(awips_pil="CLINYC", wmo_bbb="CCA")
+    assert header == CliStructuralHeader(
+        awips_pil="CLINYC",
+        wmo_transmission_sequence="000",
+        wmo_bbb="CCA",
+    )
 
 
 def test_parsed_product_and_standalone_allowlist_agree() -> None:
@@ -241,7 +245,11 @@ def test_correction_verdict_is_derived_and_cannot_be_set_independently() -> None
     cannot hand-assemble a header whose token and verdict disagree, and the
     two can never drift apart.
     """
-    header = CliStructuralHeader(awips_pil="CLINYC", wmo_bbb="RRA")
+    header = CliStructuralHeader(
+        awips_pil="CLINYC",
+        wmo_transmission_sequence="000",
+        wmo_bbb="RRA",
+    )
 
     assert header.is_correction_bbb is False
     with pytest.raises((AttributeError, TypeError)):
@@ -266,7 +274,11 @@ def test_parsed_product_and_allowlist_agree_on_the_correction_verdict() -> None:
 @pytest.mark.parametrize(
     "instance",
     [
-        CliStructuralHeader(awips_pil="CLINYC", wmo_bbb=None),
+        CliStructuralHeader(
+            awips_pil="CLINYC",
+            wmo_transmission_sequence="000",
+            wmo_bbb=None,
+        ),
         TemperatureReadingF(value_f=79, sentinel="NONE"),
         ParsedCliProduct(
             summary_date=date(2026, 8, 21),

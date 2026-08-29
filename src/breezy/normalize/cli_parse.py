@@ -167,6 +167,9 @@ outright, i.e. a `CliStructuralError` -- a loud integrity alarm and a
 sticky hard block raised on an entirely healthy product. Permissive on
 shape, strict on interpretation."""
 
+_WMO_TRANSMISSION_SEQUENCE_RE = re.compile(r"\A\d{1,6}\Z")
+"""WMO transmission-sequence line shape accepted by the structural gate."""
+
 _CORRECTION_BBB_RE = re.compile(r"^CC[A-Z]$")
 """A BBB indicator that means CORRECTION, and only that.
 
@@ -289,6 +292,12 @@ class CliStructuralHeader:
     ``CLI{cli_location}``. Distinct identifier space from the CLI location
     used in the api.weather.gov path segment."""
 
+    wmo_transmission_sequence: str
+    """WMO transmission sequence from line 1, stripped to the observed
+    digit token. Live api.weather.gov bodies have so far normalized this to
+    ``"000"``, while verbatim archives can preserve the original numeric
+    sequence. This is provenance, not an addressing or security property."""
+
     wmo_bbb: str | None
     """WMO BBB indicator from line 2, verbatim, e.g. ``"CCA"`` or
     ``"RRA"``; `None` when the heading carries none. `None` rather than
@@ -404,9 +413,9 @@ def check_structural_allowlist(product_text: str, *, cli_location: str) -> CliSt
     do with it.
 
     Checks, in order: total line count, per-line length, the WMO
-    transmission-indicator line ("000"), the WMO abbreviated-heading shape
-    (capturing the optional BBB correction token), and AWIPS PIL equality
-    to ``CLI{cli_location}``.
+    transmission-sequence line (1-6 digits), the WMO abbreviated-heading
+    shape (capturing the optional BBB correction token), and AWIPS PIL
+    equality to ``CLI{cli_location}``.
 
     Raises `CliStructuralError` for a malformed or hostile SHAPE, and
     `CliNotOurProductError` for a well-formed product that simply belongs
@@ -431,17 +440,21 @@ def check_structural_allowlist(product_text: str, *, cli_location: str) -> CliSt
                 f"{MAX_LINE_LENGTH}-character structural allowlist"
             )
 
-    # Expected shape (matches every real product observed across five
-    # offices): [0] blank transmission leader, [1] "000" indicator,
-    # [2] WMO abbreviated heading, [3] AWIPS PIL.
+    # Expected shape: [0] blank transmission leader, [1] WMO transmission
+    # sequence, [2] WMO abbreviated heading, [3] AWIPS PIL.
     if len(lines) < 4:
         raise CliStructuralError(
             "product is too short to contain a WMO header and AWIPS PIL"
         )
 
-    if lines[1].strip() != "000":
+    transmission_sequence = lines[1].strip()
+    # Use \Z, not $, because `$` also matches before a trailing newline. The
+    # current split+strip path masks that case, but the anchor is the contract
+    # if this check is ever refactored to validate an unstripped line.
+    if _WMO_TRANSMISSION_SEQUENCE_RE.match(transmission_sequence) is None:
         raise CliStructuralError(
-            f"unexpected transmission indicator line: {lines[1]!r}; expected '000'"
+            f"unexpected transmission indicator line: {lines[1]!r}; "
+            "expected 1-6 ASCII digits"
         )
 
     wmo_match = _WMO_HEADING_RE.match(lines[2].strip())
@@ -470,7 +483,11 @@ def check_structural_allowlist(product_text: str, *, cli_location: str) -> CliSt
             "station or product type and is not ours to parse"
         )
 
-    return CliStructuralHeader(awips_pil=actual_pil, wmo_bbb=wmo_match.group("bbb"))
+    return CliStructuralHeader(
+        awips_pil=actual_pil,
+        wmo_transmission_sequence=transmission_sequence,
+        wmo_bbb=wmo_match.group("bbb"),
+    )
 
 
 def parse_cli_product(

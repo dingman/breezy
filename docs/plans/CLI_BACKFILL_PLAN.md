@@ -702,3 +702,38 @@ The receipt-lag probe's first result pooled two populations and reported p95 = 6
 - **2008–2020 coverage, yield, and format stability.** Entirely unmeasured; R-11 stands.
 - **2003–2007 admission** (OQ-3). Unchanged: refused by default.
 - **Sequencing.** I-1 through I-5 remain HELD pending an operator decision against the clock-bound live streams (§12). Nothing in I-0 committed the schema, created a catalog root, or touched the network.
+
+---
+
+## 14. I-1 executed — 2026-08-29
+
+The `000` accommodation (§4.1 option O-4) is implemented, with the equivalence golden pair that is the premise of the whole backfill.
+
+### The observed sequence value was `100`, not `507`
+
+§4.1 and §7 cite `507`/`487` as example archived sequences. The real value on the acquired pair is **`100`** (line 1 is `100 `, with a trailing space). This vindicates widening to a *class* — anchored 1–6 ASCII digits — rather than enumerating observed values. Had the plan allowlisted `507`/`487` specifically, I-1 would have failed on the first real product.
+
+### Change
+
+`check_structural_allowlist` now matches `\A\d{1,6}\Z` against the stripped line-1 token instead of requiring literal `"000"`, and `CliStructuralHeader` gained `wmo_transmission_sequence` carrying the observed value as provenance. `\Z` rather than `$` is used deliberately and carries a comment saying why, since `$` also matches before a trailing newline.
+
+**The addressing guards are byte-identical**, verified by diff: `_WMO_HEADING_RE` and the `actual_pil != expected_pil` equality check are untouched. `000` was never a security property — it is an artefact of the live API normalising the sequence. The PIL check is what proves a product is ours, and a sibling station's product with a widened sequence is still refused (pinned by test).
+
+### Evidence
+
+RED: 8 failing parser tests, including the archive fixture rejected with `unexpected transmission indicator line: '100 '; expected '000'`.
+GREEN: **3417 passed, 1 skipped, exit 0**; `ruff`, `mypy` (266 files), `lint-imports` (2 contracts kept, 0 broken) all clean. Gates re-run independently of the implementing agent.
+
+Fixtures: `tests/fixtures/cli_equivalence/` — MIA, climate day 2026-08-24, issuance 2026-08-25T08:27:00Z. Live half read from the local catalog; archive half took **1** IEM request. `api.weather.gov` was never contacted, so the production collector's latching UA trap was never at risk.
+
+### The assertion that matters most
+
+The equivalence test asserts field-for-field parse equality **and** `sha256(live) != sha256(archive)`, with both digests pinned. That inequality is what kills the O-1 mutant: any implementation that normalises archived text to `000` before hashing — the shape `settlement_alignment_study.py:449` uses — makes the digests equal and fails. A test that only checked parse equality would have passed for a design that destroys the verbatim-bytes contract.
+
+### One existing test was changed, and it was a strengthening
+
+`test_normalize_cli_parse_errors.py` used `001` as an invalid-sequence example in two places. Under the widened rule `001` is *valid*, which would have made both assertions **vacuous** — asserting a refusal that no longer occurs. They now use `NOT000`, still under `pytest.raises(CliStructuralError)`. No test was weakened, skipped, or deleted.
+
+### Next
+
+I-2 (record types, SCHEMA FREEZE) remains gated on the operator sequencing decision in §12. I-1 changed only the parser and is independently useful: the settlement path now tolerates a real transmission sequence without any behaviour change for live `000` products.

@@ -175,7 +175,7 @@ def test_oversize_line_length_is_structural() -> None:
 
 def test_missing_transmission_indicator_is_structural() -> None:
     with pytest.raises(CliStructuralError):
-        _parse(_VALID_BODY.replace("000", "001", 1))
+        _parse(_VALID_BODY.replace("000", "NOT000", 1))
 
 
 def test_malformed_wmo_heading_is_structural() -> None:
@@ -322,7 +322,7 @@ def test_sanity_check_runs_after_the_structural_gate() -> None:
     violation -- the cheap gate always wins.
     """
     malformed_and_impossible = _VALID_BODY.replace("MAXIMUM 79", "MAXIMUM 250", 1).replace(
-        "000", "001", 1
+        "000", "NOT000", 1
     )
 
     with pytest.raises(CliStructuralError):
