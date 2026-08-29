@@ -12,9 +12,15 @@ which is only knowable AFTER the day it describes has settled. Fitting a model
 on records that overlap the evaluation window leaks the answer into the
 predictor. :func:`fit_error_model` must therefore be called on a train window
 that ENDS BEFORE the backtest start date, and the resulting model must be
-treated as frozen for the duration of the run. Nothing in this module enforces
-that -- it cannot, because it never sees the run -- so it is the caller's
-obligation. Do not call it from inside a strategy's event handlers.
+treated as frozen for the duration of the run.
+
+Pass ``train_end_exclusive`` -- normally the backtest start date -- and that
+obligation stops being merely documented: any record whose ``target_date`` is
+AT OR AFTER the cutoff raises :class:`ValueError` instead of silently
+contaminating the fit. The parameter is optional so that no existing caller's
+behaviour changes, but callers feeding a backtest should always supply it.
+Whether the fitted model is then held frozen for the run is still outside what
+this module can see. Do not call it from inside a strategy's event handlers.
 
 One dead statement from the bundle is not reproduced: it constructed a
 ``WeatherProbabilityEngine(model)`` into a local named ``helper`` and then
@@ -55,6 +61,8 @@ def fit_error_model(
     records: Iterable[ForecastErrorRecord],
     base: ForecastErrorModel | None = None,
     min_samples: int = 40,
+    *,
+    train_end_exclusive: date | None = None,
 ) -> ForecastErrorModel:
     """Fit per-key bias and sigma overrides from realized forecast errors.
 
@@ -66,10 +74,33 @@ def fit_error_model(
     override at all.
 
     Mutates and returns ``base`` when given one.
+
+    Parameters
+    ----------
+    train_end_exclusive : date, optional
+        Lookahead guard. When given, every record must have a ``target_date``
+        STRICTLY BEFORE this date; one at or after it raises
+        :class:`ValueError`. Pass the backtest start date -- the first day of
+        the evaluation window is itself leakage, since its realized high is not
+        knowable to a strategy standing at that day's open. See the module
+        docstring.
+
+    Raises
+    ------
+    ValueError
+        If ``train_end_exclusive`` is given and any record is at or after it.
     """
     model = base or ForecastErrorModel(min_samples_for_local=min_samples)
     buckets: dict[str, list[float]] = {}
     for rec in records:
+        if train_end_exclusive is not None and rec.target_date >= train_end_exclusive:
+            msg = (
+                "lookahead bias: forecast-error record for "
+                f"{rec.location_id} target_date={rec.target_date.isoformat()} is at or "
+                f"after train_end_exclusive={train_end_exclusive.isoformat()}; its "
+                "realized high is not knowable from inside the evaluation window"
+            )
+            raise ValueError(msg)
         err = rec.realized_high_f - rec.forecast_high_f
         for key in model.lookup_keys(rec.location_id, rec.target_date, rec.horizon_hours):
             buckets.setdefault(key, []).append(err)

@@ -184,12 +184,28 @@ class RiskManager:
         # The third argument is the quote's age in minutes, and it is hardcoded
         # to 0.0 here, so `quote_tradable`'s `stale_quote_minutes` check is
         # PERMANENTLY VACUOUS on this path: an arbitrarily stale quote passes.
-        # (The caller does know the real age -- the strategy computes it for the
-        # separate pre-trade `quote_tradable` call -- so this is a dropped
-        # argument, not missing information.) Carried over verbatim from the
-        # operator's bundle. Changing it would start blocking orders that
-        # currently pass, which is an economic change to live behaviour and is
-        # the operator's call, not this integration's.
+        # WHAT THAT COSTS DIFFERS PER STRATEGY -- it is a dropped argument for
+        # one caller and a total absence of quote-staleness protection for the
+        # other two:
+        #   * `forecast_mispricing` -- COVERED. It computes the real quote age
+        #     (`age_min = (now - quote.ts_event) / 60`) and calls
+        #     `quote_tradable` itself as an independent upstream gate before
+        #     ever reaching here (`forecast_mispricing/decision.py:68-70`), so
+        #     for this caller the 0.0 below is genuinely a dropped argument,
+        #     not missing information.
+        #   * `calibration_mean_reversion` -- NOT COVERED. It never calls
+        #     `quote_tradable` anywhere, so the vacuous check below is its ONLY
+        #     quote-staleness gate, i.e. it has none. (Do not be misled by
+        #     `calibration_mean_reversion/decision.py:102`: that `age_min` is
+        #     FORECAST age measured from `published_at`, gating
+        #     `stable_forecast_minutes` -- a different quantity entirely.)
+        #   * `forecast_revision` -- NOT COVERED, same as calibration: zero
+        #     `quote_tradable` references in the package.
+        # Carried over verbatim from the operator's bundle (the same hardcoded
+        # 0.0, alongside an unused `quote_age_minutes` helper). Wiring the real
+        # age in would start blocking orders that currently pass, which is an
+        # economic change to live behaviour and is the operator's call, not this
+        # integration's.
         ok, why = self.quote_tradable(quote, contract.price_scale, 0.0)
         if not ok:
             return RiskDecision(False, why)

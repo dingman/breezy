@@ -21,6 +21,8 @@ from __future__ import annotations
 
 import datetime as dt
 
+import pytest
+
 from breezy.domain.weather_bucket_facts import Measure, WeatherBucketFacts
 from breezy.strategy.forecast_revision.config import ForecastRevisionConfig
 from breezy.strategy.forecast_revision.decision import RevisionState, evaluate_instrument
@@ -292,3 +294,179 @@ def test_no_catch_up_exit_without_a_position() -> None:
         )
         is None
     )
+
+
+# ----------------------------------------------------------------------
+# Bucket-ladder siblings: the per-instrument baseline is NOT the shared history
+# ----------------------------------------------------------------------
+SIBLING_INSTRUMENT_ID = "NYC-75TO80.POLYMARKET_US"
+
+
+def _sibling_contract() -> MispricingContract:
+    """A second ladder bucket settling off the SAME station and climate day.
+
+    Breezy's venue sells bucket ladders, so `(settlement_station, climate_day)`
+    -- the key `RevisionState` files forecast history under -- is shared by
+    several tradable instruments. Their market prices are not.
+    """
+    return MispricingContract(
+        instrument_id=SIBLING_INSTRUMENT_ID,
+        facts=WeatherBucketFacts(
+            settlement_station=STATION,
+            climate_day=CLIMATE_DAY,
+            measure=Measure.HIGH,
+            lower_f=75,
+            upper_f=80,
+        ),
+        tick_size=0.01,
+    )
+
+
+def _observe_ladder(state: RevisionState) -> None:
+    """Tick both ladder siblings at both publications, primary contract first.
+
+    This is the live sequencing: each instrument learns of the revision from
+    its OWN quote tick, and whichever ticks first advances the shared history.
+    """
+    primary, sibling = _contract(), _sibling_contract()
+    for published, primary_mid, sibling_mid in (
+        (T0, 0.30, 0.50),
+        (T1, 0.30, 0.52),
+    ):
+        high_f = 78.0 if published is T0 else 84.0
+        horizon = 26.0 if published is T0 else 24.0
+        snap = _snapshot(high_f=high_f, published_at=published, horizon=horizon)
+        state.observe(contract=primary, forecast=snap, market_mid_p=primary_mid)
+        state.observe(contract=sibling, forecast=snap, market_mid_p=sibling_mid)
+
+
+def test_every_ladder_sibling_records_its_own_market_baseline() -> None:
+    """The shared-history advance must not gate the per-instrument baseline.
+
+    The sibling's `observe` call always loses the race to advance the shared
+    `(station, climate_day)` bucket, so if baseline recording is gated behind
+    that advance the sibling never gets one at all.
+    """
+    state = RevisionState(history_len=12)
+    _observe_ladder(state)
+
+    move = state.market_move_since(
+        instrument_id=SIBLING_INSTRUMENT_ID,
+        published_at=T1,
+        quote=MarketQuote(
+            instrument_id=SIBLING_INSTRUMENT_ID,
+            bid=0.59,
+            ask=0.61,
+            bid_size=100.0,
+            ask_size=100.0,
+            ts_event=NOW,
+        ),
+        price_scale=1.0,
+    )
+    assert move is not None, "sibling has no market baseline at the publication"
+    assert move == pytest.approx(0.60 - 0.52)
+
+
+def test_a_ladder_sibling_nets_out_its_own_market_move() -> None:
+    """`unabsorbed` for the sibling must subtract ITS move, not default to 0.0.
+
+    With no baseline, `market_move_since` returns None, `market_dp` defaults to
+    0.0 and `unabsorbed` collapses to the FULL model revision -- as though the
+    book had absorbed nothing -- which systematically inflates `edge`.
+    """
+    state = RevisionState(history_len=12)
+    _observe_ladder(state)
+
+    sibling_quote = MarketQuote(
+        instrument_id=SIBLING_INSTRUMENT_ID,
+        bid=0.59,
+        ask=0.61,
+        bid_size=100.0,
+        ask_size=100.0,
+        ts_event=NOW,
+    )
+    decision = evaluate_instrument(
+        contract=_sibling_contract(),
+        quote=sibling_quote,
+        now=NOW,
+        current_qty=0.0,
+        state=state,
+        engine=WeatherProbabilityEngine(),
+        cfg=ForecastRevisionConfig(instrument_ids=()),
+    )
+    assert decision is not None
+    market_dp = _metric(decision, "dP_market")
+    d_p = _metric(decision, "dP_model")
+    assert market_dp == pytest.approx(0.60 - 0.52)
+    assert market_dp != 0.0
+    assert _metric(decision, "unabsorbed") == pytest.approx(d_p - market_dp)
+    # The defect's signature: with no baseline, `market_dp` defaults to 0.0 and
+    # `unabsorbed` is EXACTLY the full model revision. It must not be.
+    assert _metric(decision, "unabsorbed") != pytest.approx(d_p)
+    # This ladder bucket (75-80F) prices DOWN on a +6F revision, so its `d_p` is
+    # negative while its market moved up: an opposite-sign move, which widens
+    # `|unabsorbed|` rather than shrinking it. Absorption is signed, not absolute.
+    assert d_p < 0
+    assert _metric(decision, "absorbed_frac") < 0
+
+
+# ----------------------------------------------------------------------
+# Pinned characteristic of the pull seam: revisions between polls MERGE
+# ----------------------------------------------------------------------
+def test_a_publication_missed_between_polls_is_merged_not_scored() -> None:
+    """`ForecastSource.snapshot` returns the CURRENT forecast, not a queue.
+
+    A genuine NWS revision that lands and is superseded between two polls is
+    permanently invisible: history holds only the later one, so `evaluate_instrument`
+    scores ONE merged delta across what were two separate revision events. This
+    test PINS that as a known characteristic of the pull seam -- it is not
+    equivalence with the bundle's push path, and the correction belongs to the
+    `ForecastSource` implementation (plan increment I-6), not here.
+    """
+    t_missed = T0 + dt.timedelta(minutes=45)
+    state = RevisionState(history_len=12)
+    contract = _contract()
+
+    state.observe(
+        contract=contract,
+        forecast=_snapshot(high_f=78.0, published_at=T0, horizon=26.0),
+        market_mid_p=0.30,
+    )
+    # The 81.0F publication at `t_missed` is never polled -- it is superseded
+    # by the 84.0F publication before the next `snapshot()` call.
+    state.observe(
+        contract=contract,
+        forecast=_snapshot(high_f=84.0, published_at=T1, horizon=24.0),
+        market_mid_p=0.30,
+    )
+
+    hist = state.history(contract)
+    assert [s.expected_high_f for s in hist] == [78.0, 84.0]
+    assert all(s.published_at != t_missed for s in hist)
+
+    decision = _evaluate(state=state, quote=_quote(bid=0.29, ask=0.31))
+    assert decision is not None
+    # ONE merged +6.0F delta, not a +3.0F then a +3.0F scored separately.
+    assert _metric(decision, "dT") == 6.0
+
+
+# ----------------------------------------------------------------------
+# Defensive None gate on the implied prices
+# ----------------------------------------------------------------------
+def test_a_one_sided_quote_yields_no_decision() -> None:
+    """Align with `calibration_mean_reversion.decision`'s explicit None check.
+
+    The falsy-`or` defect on `mkt` is preserved deliberately (operator ruling
+    pending); what is corrected here is the MISSING `is None` gate before it,
+    so a quote with no bid cannot reach the `mkt` expression at all.
+    """
+    state = _state_with_upward_revision()
+    one_sided = MarketQuote(
+        instrument_id=INSTRUMENT_ID,
+        bid=None,
+        ask=0.31,
+        bid_size=None,
+        ask_size=100.0,
+        ts_event=NOW,
+    )
+    assert _evaluate(state=state, quote=one_sided) is None

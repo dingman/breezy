@@ -24,13 +24,49 @@ the forecast seam is a PULL
 called fresh on every quote or depth update). So the history is accumulated by
 :meth:`RevisionState.observe`, which the strategy calls with each PULLED
 snapshot. ``observe`` appends only when ``published_at`` is strictly newer than
-the newest publication already held, which reproduces both of the bundle's
-guards: repeated pulls of the SAME publication do not grow the history (the
-push path saw each publication once), and an out-of-order publication is
-ignored (the bundle logged and dropped it).
+the newest publication already held.
+
+WHAT THE PULL SEAM REPRODUCES, AND WHAT IT DOES NOT
+----------------------------------------------------
+It IS equivalent for the two idempotence guards. Repeated pulls of the SAME
+publication do not grow the history -- the push path saw each publication once,
+and the bundle additionally no-oped on an unchanged publication at
+``evaluate_instrument``'s ``current.published_at <= previous.published_at``
+check (NOT at its ``on_nws_forecast`` ingestion filter, which used a strict
+``<`` and so let an equal timestamp through to the history). And an
+out-of-order publication is ignored, as the bundle logged and dropped it.
+
+It is NOT equivalent for publication COVERAGE, and this changes trading
+behaviour. ``ForecastSource.snapshot`` returns only the forecast current as of
+``now`` -- not a queue of everything published since the last poll. If two
+genuine NWS revisions land between two poll ticks, only the later survives:
+the intermediate publication is permanently invisible, and ``evaluate_instrument``
+scores ONE MERGED delta across what were two separately-scored events. Three
+consequences, all real:
+
+* a merged ``d_t``/``d_p`` can clear ``min_temp_revision_f`` /
+  ``min_unabsorbed_prob`` when neither constituent revision would alone --
+  a false positive;
+* two opposite-sign revisions can net to roughly zero and both be skipped --
+  a false negative;
+* ``window_end`` anchors to ``current.published_at``, the LATER revision, so a
+  poll landing after ``reaction_window_minutes`` has already elapsed drops
+  straight to :func:`_maybe_exit_caught_up` and never attempts an entry it
+  could have traded.
+
+Correctness therefore REQUIRES a polling cadence strictly finer than BOTH the
+real forecast-issuance interval and ``reaction_window_minutes``. The durable
+fix is a ``ForecastSource`` that can return every publication since the last
+poll; that is plan increment I-6 (see
+``docs/plans/FORECAST_INGESTION_PLAN.md``), not a change to the Protocol here,
+and the strategy is degraded until it lands. The behaviour is pinned by
+``test_a_publication_missed_between_polls_is_merged_not_scored``.
 
 The market-probability baseline is captured at the same moment, from the
-caller's latest quote, exactly as ``on_forecast_updated`` did.
+caller's latest quote, exactly as ``on_forecast_updated`` did -- and, as there,
+independently of whether the SHARED per-(station, day) history advanced. See
+:meth:`RevisionState.observe` for why that independence is load-bearing on a
+bucket ladder.
 
 Two smaller adaptations, neither touching the math: bucket probabilities come
 from ``engine.revision(contract.facts, ...)`` rather than
@@ -95,7 +131,27 @@ class RevisionState:
 
         Replaces the bundle's ``on_forecast_updated`` push hook -- see the
         module docstring. Re-observing a publication already held, or one older
-        than the newest held, is a no-op.
+        than the newest held, does not grow the SHARED history.
+
+        THE SHARED HISTORY AND THE PER-INSTRUMENT BASELINE ARE INDEPENDENT.
+        ``_history`` is keyed by ``(settlement_station, climate_day)``, which
+        every bucket in a ladder SHARES; ``_market_p_at_forecast`` is keyed by
+        ``instrument_id``, which they do not. Each ladder sibling learns of a
+        revision from its OWN quote tick, so only the first sibling to tick
+        advances the shared history -- gating the baseline on that advance would
+        leave every other sibling with no baseline at all, hence a ``None`` from
+        :meth:`market_move_since`, hence ``market_dp`` defaulting to 0.0 and
+        ``unabsorbed`` collapsing to the full model revision as though the book
+        had absorbed nothing. The bundle had no such coupling: its
+        ``on_forecast_updated`` advanced the per-(location, date) history once
+        and then looped ``self.registry.all()`` recording EVERY matching
+        contract's own midpoint regardless. The baseline is therefore appended
+        below independent of the return value -- but only ONCE per publication
+        per instrument, which is both the semantics the name promises (the
+        market probability AT THE MOMENT the forecast arrived) and what the
+        push path recorded, since it saw each publication exactly once. Later
+        re-polls of a publication already baselined are ignored, so decoupling
+        does not turn the series into a per-poll tick log.
         """
         key = self._key(contract)
         bucket = self._history.get(key)
@@ -103,13 +159,14 @@ class RevisionState:
             bucket = deque(maxlen=self.history_len)
             self._history[key] = bucket
         published = ensure_aware(forecast.published_at)
-        if bucket and published <= ensure_aware(bucket[-1].published_at):
-            return False
-        bucket.append(forecast)
+        advanced = not (bucket and published <= ensure_aware(bucket[-1].published_at))
+        if advanced:
+            bucket.append(forecast)
         if market_mid_p is not None:
             series = self._market_p_at_forecast.setdefault(contract.instrument_id, [])
-            series.append((published, market_mid_p))
-        return True
+            if not any(ensure_aware(ts) == published for ts, _ in series):
+                series.append((published, market_mid_p))
+        return advanced
 
     def clear(self) -> None:
         self._history.clear()
@@ -250,6 +307,15 @@ def evaluate_instrument(
         quote.implied_ask(scale),
         quote.implied_mid(scale),
     )
+    if bid_p is None or ask_p is None or mid_p is None:
+        # Defensive only, and NOT the preserved defect below. A one-sided or
+        # empty book cannot produce a market probability at all, so there is
+        # nothing to report and nothing to trade against. `calibration_mean_reversion`
+        # carries this same explicit check; the bundle omitted it here, and the
+        # omission is unreachable today (quotes are built from non-None floats
+        # and depth is guarded upstream) -- this aligns the defensive style
+        # without changing any reachable outcome.
+        return None
     # PRESERVED DEFECT -- AWAITING AN OPERATOR RULING. DO NOT "FIX" SILENTLY.
     # `or` tests FALSINESS, not None. A touch price of exactly 0.0 -- a real,
     # reachable price on a 0-1 binary market -- is falsy, so this silently
