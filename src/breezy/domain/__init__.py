@@ -13,6 +13,14 @@ Two notes for callers:
   matches ``XSomething`` by msgbus glob, so handlers `isinstance`-check as well.
 """
 
+from breezy.domain.archived_climate_day import (
+    ARCHIVED_CLIMATE_DAY_SCHEMA_VERSION,
+    ArchivedClimateDay,
+)
+from breezy.domain.archived_raw_product import (
+    ARCHIVED_RAW_PRODUCT_SCHEMA_VERSION,
+    ArchivedRawProduct,
+)
 from breezy.domain.nws_climate_day import (
     CLIMATE_DAY_SCHEMA_VERSION,
     MISSING_VALUE_FLAGS,
@@ -28,9 +36,13 @@ from breezy.domain.selection import (
 from breezy.domain.strict_arrow import SchemaDriftError
 
 __all__ = [
+    "ARCHIVED_CLIMATE_DAY_SCHEMA_VERSION",
+    "ARCHIVED_RAW_PRODUCT_SCHEMA_VERSION",
     "CLIMATE_DAY_SCHEMA_VERSION",
     "MISSING_VALUE_FLAGS",
     "RAW_PRODUCT_SCHEMA_VERSION",
+    "ArchivedClimateDay",
+    "ArchivedRawProduct",
     "ClimateDayKey",
     "NwsClimateDay",
     "NwsRawProduct",

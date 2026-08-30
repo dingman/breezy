@@ -101,6 +101,8 @@ ignore_imports = [
     "breezy.adapters.polymarket_us.tape_records -> nautilus_trader",
     "breezy.adapters.polymarket_us.transport -> nautilus_trader",
     "breezy.adapters.polymarket_us.websocket -> nautilus_trader",
+    "breezy.domain.archived_climate_day -> nautilus_trader",
+    "breezy.domain.archived_raw_product -> nautilus_trader",
     "breezy.domain.nws_climate_day -> nautilus_trader",
     "breezy.domain.nws_raw_product -> nautilus_trader",
     "breezy.ingest.config -> nautilus_trader",
