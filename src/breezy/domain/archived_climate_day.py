@@ -50,16 +50,26 @@ from breezy.domain.nws_climate_day import MISSING_VALUE_FLAGS
 from breezy.domain.strict_arrow import make_strict_decoder, make_strict_encoder
 from breezy.domain.validation import (
     require_bool,
+    require_float,
     require_hex_digest,
     require_int,
-    require_optional_float,
     require_optional_int,
     require_optional_text,
     require_pure_date,
     require_text,
 )
+from breezy.domain.wmo import is_correction_bbb_token
 
 ARCHIVED_CLIMATE_DAY_SCHEMA_VERSION: Final[int] = 1
+
+_ADMISSION_ERAS: Final[frozenset[str]] = frozenset({"modern", "transitional"})
+"""The only two legal `admission_era` values (see `docs/plans/CLI_BACKFILL_PLAN.md`).
+
+`admission_era` is a sample-selection covariate that later bias analysis
+depends on. Unlike a free-text field, this vocabulary is closed and must stay
+closed: once a row is written under a typo'd or mis-cased era (``"Modern"``,
+``"legacy"``), the frozen Arrow schema can never rename the value away, so
+the bad label is uncorrectable and silently pollutes the stratum forever."""
 
 
 class ArchivedClimateDay(Data):
@@ -82,7 +92,11 @@ class ArchivedClimateDay(Data):
         Whole-text correction evidence.
     is_correction_bbb : bool
         Positional BBB-token correction verdict, stored separately from the
-        broader free-text evidence.
+        broader free-text evidence. An independent constructor argument, not
+        a property derived from ``wmo_bbb_token`` -- but cross-checked
+        against it at construction time (`breezy.domain.wmo.is_correction_bbb_token`)
+        so a hand-built or corrupted row can never round-trip a disagreement
+        on this frozen schema.
     revision_seq : int
         Monotonic per ``(station, climate_day, is_final)``, starting at 1.
     issuing_office : str
@@ -172,14 +186,8 @@ class ArchivedClimateDay(Data):
         self.parser_version = require_text(parser_version, "parser_version")
         self.registry_version = require_text(registry_version, "registry_version")
         self.raw_sha256 = require_hex_digest(raw_sha256, "raw_sha256")
-        station_year_yield_value = require_optional_float(
-            station_year_yield,
-            "station_year_yield",
-        )
-        if station_year_yield_value is None:
-            raise TypeError("`station_year_yield` must be a real number, was NoneType")
-        self.station_year_yield = station_year_yield_value
-        self.admission_era = require_text(admission_era, "admission_era")
+        self.station_year_yield = require_float(station_year_yield, "station_year_yield")
+        self.admission_era = _require_admission_era(admission_era, "admission_era")
         self.schema_version = require_int(schema_version, "schema_version")
 
         if self.revision_seq < 1:
@@ -199,6 +207,19 @@ class ArchivedClimateDay(Data):
                 f"`issuance_time_ns` ({self.issuance_time_ns}) is after "
                 f"`archive_retrieved_at_ns` ({self.archive_retrieved_at_ns}) for "
                 f"{self.station} {self.climate_day.isoformat()}",
+            )
+
+        expected_is_correction_bbb = is_correction_bbb_token(self.wmo_bbb_token)
+        if self.is_correction_bbb is not expected_is_correction_bbb:
+            raise ValueError(
+                f"`is_correction_bbb` ({self.is_correction_bbb}) disagrees with "
+                f"`wmo_bbb_token` ({self.wmo_bbb_token!r}), which implies "
+                f"{expected_is_correction_bbb}, for {self.station} "
+                f"{self.climate_day.isoformat()}; this is an independent constructor "
+                "argument on this frozen record, not a derived property, precisely "
+                "so a hand-built or corrupted row can be cross-checked instead of "
+                "silently round-tripping an inconsistency the Arrow schema can never "
+                "later correct",
             )
 
         self._ts_event = self.issuance_time_ns
@@ -369,6 +390,23 @@ def _require_flag(
         )
 
     return flag
+
+
+def _require_admission_era(value: Any, name: str) -> str:
+    """Enforce the closed sample-selection-era vocabulary.
+
+    Matches `_require_flag`'s allowlist style above: a small, closed set of
+    legal values enforced at construction, not left to downstream analysis
+    to discover a stray value was never valid.
+    """
+    era = require_text(value, name)
+
+    if era not in _ADMISSION_ERAS:
+        raise ValueError(
+            f"`{name}` must be one of {sorted(_ADMISSION_ERAS)}, was {era!r}",
+        )
+
+    return era
 
 
 # Registered exactly once, at module scope.

@@ -71,6 +71,22 @@ def require_optional_float(value: Any, name: str) -> float | None:
     return float(value)
 
 
+def require_float(value: Any, name: str) -> float:
+    """Return `value` coerced to `float`; never `None`.
+
+    Delegates to `require_optional_float` for the type-coercion rule, then
+    rejects `None` explicitly so a required numeric field cannot silently
+    become optional. Kept as the `require_*` counterpart to
+    `require_optional_float`, matching every other required field's pattern
+    (e.g. `require_int` alongside `require_optional_int`).
+    """
+    coerced = require_optional_float(value, name)
+    if coerced is None:
+        raise TypeError(f"`{name}` must be a real number, was NoneType")
+
+    return coerced
+
+
 def require_bool(value: Any, name: str) -> bool:
     if not isinstance(value, bool):
         raise TypeError(f"`{name}` must be a `bool`, was {type(value).__name__}")

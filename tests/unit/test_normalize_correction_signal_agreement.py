@@ -112,7 +112,9 @@ def test_the_two_signals_agree_on_every_bbb_indicator(bbb: str) -> None:
     """THE INVARIANT. Whatever the alphabet is, both paths use the same one.
 
     If this fails, one of `classify._CORRECTION_RE` or
-    `cli_parse._CORRECTION_BBB_RE` was changed without the other.
+    `breezy.domain.wmo._CORRECTION_BBB_RE` (consumed positionally via
+    `cli_parse.CliStructuralHeader.is_correction_bbb`) was changed without
+    the other.
     """
     positional, free_text = _both_verdicts(bbb)
 

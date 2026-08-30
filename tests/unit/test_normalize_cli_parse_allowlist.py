@@ -82,6 +82,14 @@ def test_allowlist_rejects_missing_transmission_indicator() -> None:
         parse_cli_product(bad, cli_location="NYC", body_header_regex=NYC_HEADER_REGEX)
 
 
+@pytest.mark.parametrize("non_ascii_digits", ["١٢٣", "１２３"])
+def test_allowlist_rejects_non_ascii_transmission_digits(non_ascii_digits: str) -> None:
+    bad = _VALID_BODY.replace("\n000\n", f"\n{non_ascii_digits}\n")
+
+    with pytest.raises(CliParseError, match="ASCII digits"):
+        parse_cli_product(bad, cli_location="NYC", body_header_regex=NYC_HEADER_REGEX)
+
+
 def test_allowlist_rejects_malformed_wmo_heading() -> None:
     bad = _VALID_BODY.replace("CDUS41 KOKX 220626", "NOT A WMO HEADING AT ALL")
     with pytest.raises(CliParseError, match="WMO"):

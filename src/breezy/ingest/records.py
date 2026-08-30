@@ -109,7 +109,7 @@ from breezy.normalize.climate_day import standard_time_zone
 from breezy.normalize.units import TemperatureReadingF
 from breezy.registry.sites import ClimateDayWindow, SettlementSite
 
-__all__ = ["build_climate_day", "build_raw_product"]
+__all__ = ["build_climate_day", "build_raw_product", "value_and_flag"]
 
 _EPOCH: Final[dt.datetime] = dt.datetime(1970, 1, 1, tzinfo=dt.UTC)
 _NS_PER_SECOND: Final[int] = 1_000_000_000
@@ -320,9 +320,9 @@ def build_climate_day(
             f"had not ended when the product was retrieved, so this is not a final",
         )
 
-    tmax_f, tmax_flag = _value_and_flag(parsed.tmax)
-    tmin_f, tmin_flag = _value_and_flag(parsed.tmin)
-    tavg_f, tavg_flag = _value_and_flag(parsed.tavg)
+    tmax_f, tmax_flag = value_and_flag(parsed.tmax)
+    tmin_f, tmin_flag = value_and_flag(parsed.tmin)
+    tavg_f, tavg_flag = value_and_flag(parsed.tavg)
 
     return NwsClimateDay(
         station=site.cli_location,
@@ -348,7 +348,7 @@ def build_climate_day(
     )
 
 
-def _value_and_flag(reading: TemperatureReadingF) -> tuple[int | None, str | None]:
+def value_and_flag(reading: TemperatureReadingF) -> tuple[int | None, str | None]:
     """Split a parsed reading into the record's paired value and sentinel flag.
 
     A sentinel is carried through as the flag with a null value; it is never

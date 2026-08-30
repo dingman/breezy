@@ -40,8 +40,9 @@ correction to one climate day is the instance most likely to land after
 settlement has already happened -- exactly the case where the audit trail
 has to be right. Missing it is the expensive direction.
 
-This range is kept IDENTICAL to `cli_parse._CORRECTION_BBB_RE`, which
-answers the same question from the positional BBB token. Two signals for
+This range is kept IDENTICAL to `breezy.domain.wmo._CORRECTION_BBB_RE`
+(consumed positionally via `cli_parse.CliStructuralHeader.is_correction_bbb`),
+which answers the same question from the positional BBB token. Two signals for
 one concept disagreeing about which letters count is a contradiction
 waiting to be found by whoever wires either one into `revision_seq`.
 `tests/unit/test_normalize_correction_signal_agreement.py` fails if the

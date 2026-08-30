@@ -9,7 +9,7 @@ from __future__ import annotations
 
 from breezy.domain.archived_climate_day import ArchivedClimateDay
 from breezy.domain.archived_raw_product import ArchivedRawProduct
-from breezy.ingest.records import _value_and_flag
+from breezy.ingest.records import value_and_flag
 from breezy.normalize.classify import classify_issuance, has_correction_evidence
 from breezy.normalize.cli_parse import ParsedCliProduct, check_structural_allowlist
 from breezy.registry.sites import SettlementSite
@@ -62,9 +62,9 @@ def build_archived_climate_day(
         )
 
     is_final = classify_issuance(raw_product.raw_text) == "FINAL"
-    tmax_f, tmax_flag = _value_and_flag(parsed.tmax)
-    tmin_f, tmin_flag = _value_and_flag(parsed.tmin)
-    tavg_f, tavg_flag = _value_and_flag(parsed.tavg)
+    tmax_f, tmax_flag = value_and_flag(parsed.tmax)
+    tmin_f, tmin_flag = value_and_flag(parsed.tmin)
+    tavg_f, tavg_flag = value_and_flag(parsed.tavg)
 
     return ArchivedClimateDay(
         station=site.cli_location,

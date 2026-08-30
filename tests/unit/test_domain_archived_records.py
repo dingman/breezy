@@ -179,6 +179,20 @@ def test_archived_climate_day_arrow_decode_rejects_missing_fragment_column() -> 
         ArrowSerializer.deserialize(ArchivedClimateDay, drifted)
 
 
+def test_archived_climate_day_rejects_none_station_year_yield() -> None:
+    """Record mutant: routing `station_year_yield` through the optional-float
+    helper without re-adding the required-ness check (Finding 3 regression)."""
+    with pytest.raises(TypeError, match="station_year_yield"):
+        make_archived_climate_day(station_year_yield=None)
+
+
+def test_archived_climate_day_rejects_non_numeric_station_year_yield() -> None:
+    """Record mutant: dropping the type-coercion guard inherited from
+    `require_optional_float` when Finding 3's `require_float` was introduced."""
+    with pytest.raises(TypeError, match="station_year_yield"):
+        make_archived_climate_day(station_year_yield="0.98")
+
+
 def test_station_year_yield_and_admission_era_are_non_null_round_trip_fields() -> None:
     """Record mutant: omitting Revision 2's unaddable bias-analysis covariates."""
     restored = ArchivedClimateDay.from_dict(make_archived_climate_day().to_dict())
@@ -188,6 +202,67 @@ def test_station_year_yield_and_admission_era_are_non_null_round_trip_fields() -
     assert restored.admission_era == "modern"
     assert "station_year_yield" in ArchivedClimateDay.schema().names
     assert "admission_era" in ArchivedClimateDay.schema().names
+
+
+@pytest.mark.parametrize("admission_era", ["modern", "transitional"])
+def test_admission_era_accepts_only_the_backfill_plan_vocabulary(admission_era: str) -> None:
+    record = make_archived_climate_day(admission_era=admission_era)
+
+    assert record.admission_era == admission_era
+
+
+@pytest.mark.parametrize("admission_era", ["Modern", "legacy"])
+def test_archived_climate_day_rejects_unknown_admission_era(admission_era: str) -> None:
+    with pytest.raises(ValueError, match="admission_era"):
+        make_archived_climate_day(admission_era=admission_era)
+
+
+def test_archived_climate_day_from_dict_rejects_unknown_admission_era() -> None:
+    values = make_archived_climate_day().to_dict()
+    values["admission_era"] = "legacy"
+
+    with pytest.raises(ValueError, match="admission_era"):
+        ArchivedClimateDay.from_dict(values)
+
+
+@pytest.mark.parametrize(
+    ("wmo_bbb_token", "is_correction_bbb"),
+    [(None, False), ("CCA", True), ("CCC", True), ("RRA", False), ("AAA", False)],
+)
+def test_is_correction_bbb_must_agree_with_wmo_bbb_token(
+    wmo_bbb_token: str | None,
+    is_correction_bbb: bool,
+) -> None:
+    record = make_archived_climate_day(
+        wmo_bbb_token=wmo_bbb_token,
+        is_correction_bbb=is_correction_bbb,
+    )
+
+    assert record.wmo_bbb_token == wmo_bbb_token
+    assert record.is_correction_bbb is is_correction_bbb
+
+
+@pytest.mark.parametrize(
+    ("wmo_bbb_token", "is_correction_bbb"),
+    [("CCA", False), ("CCC", False), ("RRA", True), (None, True)],
+)
+def test_archived_climate_day_rejects_correction_bbb_disagreement(
+    wmo_bbb_token: str | None,
+    is_correction_bbb: bool,
+) -> None:
+    with pytest.raises(ValueError, match="is_correction_bbb"):
+        make_archived_climate_day(
+            wmo_bbb_token=wmo_bbb_token,
+            is_correction_bbb=is_correction_bbb,
+        )
+
+
+def test_archived_climate_day_from_dict_rejects_correction_bbb_disagreement() -> None:
+    values = make_archived_climate_day(wmo_bbb_token="CCA", is_correction_bbb=True).to_dict()
+    values["is_correction_bbb"] = False
+
+    with pytest.raises(ValueError, match="is_correction_bbb"):
+        ArchivedClimateDay.from_dict(values)
 
 
 def test_archived_record_topics_do_not_prefix_collide_with_live_record_topics() -> None:

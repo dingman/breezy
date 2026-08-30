@@ -174,13 +174,30 @@ def test_read_archived_climate_days_unwraps_and_filters_bounds(tmp_path: Path) -
     assert [record.to_dict() for record in records] == [second.to_dict()]
 
 
+def test_read_archived_climate_days_raises_when_station_root_is_missing(tmp_path: Path) -> None:
+    root = archive_catalog_path(tmp_path / "archive", "polymarket_us", "NYC")
+    catalog = ParquetDataCatalog(path=root)
+
+    with pytest.raises(FileNotFoundError, match="archived catalog root"):
+        read_archived_climate_days(catalog, station="NYC")
+
+
+def test_read_archived_climate_days_returns_empty_for_existing_empty_root(tmp_path: Path) -> None:
+    root = archive_catalog_path(tmp_path / "archive", "polymarket_us", "NYC")
+    root.mkdir(parents=True)
+    catalog = ParquetDataCatalog(path=root)
+
+    assert read_archived_climate_days(catalog, station="NYC") == []
+
+
 def test_read_archived_climate_days_requires_the_requested_station(tmp_path: Path) -> None:
     root = archive_catalog_path(tmp_path / "archive", "polymarket_us", "NYC")
     root.mkdir(parents=True)
     catalog = ParquetDataCatalog(path=root)
     write_records(catalog, [make_archived_day()])
 
-    assert read_archived_climate_days(catalog, station="MDW") == []
+    with pytest.raises(ValueError, match="station"):
+        read_archived_climate_days(catalog, station="MDW")
 
 
 def test_no_settlement_shaped_archive_as_of_accessor_exists() -> None:

@@ -66,6 +66,7 @@ import re
 from dataclasses import dataclass
 from datetime import date
 
+from breezy.domain.wmo import is_correction_bbb_token
 from breezy.normalize.sanity import check_physical_sanity
 from breezy.normalize.units import SentinelFlag, TemperatureReadingF
 
@@ -161,53 +162,25 @@ drives revision/supersession decisions downstream.
 The capture stays a permissive `[A-Z]{3}` ON PURPOSE. This is the
 STRUCTURAL gate, and its job is to accept anything WMO-shaped and reject
 anything else; deciding what a given indicator MEANS is a separate,
-stricter step (`_bbb_indicates_correction`). Narrowing the capture to
+stricter step (`domain.wmo.is_correction_bbb_token`). Narrowing the capture to
 `CC[AB]` would make a routine `RRA` retransmission fail the heading shape
 outright, i.e. a `CliStructuralError` -- a loud integrity alarm and a
 sticky hard block raised on an entirely healthy product. Permissive on
 shape, strict on interpretation."""
 
-_WMO_TRANSMISSION_SEQUENCE_RE = re.compile(r"\A\d{1,6}\Z")
-"""WMO transmission-sequence line shape accepted by the structural gate."""
+_WMO_TRANSMISSION_SEQUENCE_RE = re.compile(r"\A[0-9]{1,6}\Z")
+"""WMO transmission-sequence line shape accepted by the structural gate.
 
-_CORRECTION_BBB_RE = re.compile(r"^CC[A-Z]$")
-"""A BBB indicator that means CORRECTION, and only that.
+`[0-9]`, not `\\d`: without `re.ASCII`, `\\d` matches every Unicode decimal
+digit (Arabic-Indic, fullwidth, Devanagari, ...), which would silently pass
+this gate while the docstring and error message both promise ASCII digits
+only."""
 
-The BBB space is NOT a correction flag -- it is four different things:
-
-    ``CCx``  correction to a previously transmitted product   <- correction
-    ``AAx``  amendment                                        <- NOT
-    ``RRx``  delayed / retransmitted report                   <- NOT
-    ``Pxx``  message segment number                           <- NOT
-
-`CC[A-Z]`, not `CC[AB]`: corrections run CCA, CCB, CCC, ... and a third
-correction to one climate day is exactly the case most likely to land
-AFTER settlement. Matching only the first two would be a false negative on
-the highest-consequence instance of the signal.
-
-This range is kept IDENTICAL to `classify._CORRECTION_RE`, which answers
-the same question from the free text. The two signals differ in COVERAGE
-by design (the free-text scan is a deliberate superset that also catches
-CORRECTED/CORRECTION wording in a body with no BBB token at all), but they
-must never differ in ALPHABET: two signals for one concept disagreeing
-about which letters count is a contradiction waiting to be found by
-whoever wires either one into `revision_seq`.
-`tests/unit/test_normalize_correction_signal_agreement.py` fails if the
-two are changed independently -- change both or neither."""
-
-
-def _bbb_indicates_correction(bbb: str | None) -> bool:
-    """Is this BBB indicator a correction (``CCx``), as opposed to an
-    amendment, a retransmission, a segment number, or nothing at all?
-
-    Private on purpose. The verdict is published as the
-    `is_correction_bbb` property of `CliStructuralHeader` and
-    `ParsedCliProduct`, so a caller reads a decided boolean instead of
-    re-deriving one from a token whose spelling it would have to know.
-    """
-    if bbb is None:
-        return False
-    return _CORRECTION_BBB_RE.match(bbb) is not None
+# `is_correction_bbb_token` (the "does this BBB token mean CORRECTION?"
+# predicate) lives in `breezy.domain.wmo` -- `domain` is the bottom layer,
+# so this is a legal downward import, and `domain.archived_climate_day`
+# imports the SAME function for its own cross-check. See that module for
+# the full alphabet rationale and the agreement-test cross-reference.
 
 
 class CliParseError(ValueError):
@@ -333,7 +306,7 @@ class CliStructuralHeader:
         CORRECTED/CORRECTION wording, which is a separate, advisory
         signal. This one is the positional, structural verdict.
         """
-        return _bbb_indicates_correction(self.wmo_bbb)
+        return is_correction_bbb_token(self.wmo_bbb)
 
 
 @dataclass(frozen=True, slots=True)
@@ -359,7 +332,7 @@ class ParsedCliProduct:
         """See `CliStructuralHeader.is_correction_bbb`. Always agrees with
         the header this product was parsed from -- same token, same
         derivation, one scan."""
-        return _bbb_indicates_correction(self.wmo_bbb)
+        return is_correction_bbb_token(self.wmo_bbb)
 
 
 def parse_temperature_token(token: str) -> TemperatureReadingF:

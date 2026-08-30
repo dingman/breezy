@@ -57,12 +57,33 @@ def read_archived_climate_days(
     start: int | None = None,
     end: int | None = None,
 ) -> list[ArchivedClimateDay]:
-    """Return unwrapped archived climate-day rows for `station` within optional bounds."""
-    return [
-        record
-        for record in _read_archive_records(catalog, ArchivedClimateDay, start=start, end=end)
-        if record.station == station
-    ]
+    """Return unwrapped archived climate-day rows for `station` within optional bounds.
+
+    Raises `FileNotFoundError` if the catalog's root does not exist -- a
+    missing root means a mistyped base or an archive that was never created,
+    and must never present the same as "confirmed empty, safe to proceed" the
+    way an existing-but-empty root legitimately does. Raises `ValueError` if a
+    record read from this per-station catalog root names a different
+    station: a per-station root that yields another station's rows is a
+    misconfigured root, not "no data for this station".
+    """
+    if not Path(catalog.path).exists():
+        raise FileNotFoundError(
+            f"archived catalog root {catalog.path} does not exist; refusing to treat a "
+            "missing root the same as a confirmed-empty one"
+        )
+
+    records = _read_archive_records(catalog, ArchivedClimateDay, start=start, end=end)
+
+    for record in records:
+        if record.station != station:
+            raise ValueError(
+                f"archived catalog root {catalog.path} returned station {record.station!r} "
+                f"when queried for station {station!r}; this is a misconfigured root, not "
+                "an absence of data"
+            )
+
+    return records
 
 
 def _read_archive_records[RecordT: ArchivedClimateDay](

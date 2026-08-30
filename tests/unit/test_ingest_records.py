@@ -28,7 +28,7 @@ import pytest
 from breezy.domain.nws_climate_day import CLIMATE_DAY_SCHEMA_VERSION, NwsClimateDay
 from breezy.domain.nws_raw_product import RAW_PRODUCT_SCHEMA_VERSION, NwsRawProduct, sha256_text
 from breezy.ingest.http import FetchResult
-from breezy.ingest.records import build_climate_day, build_raw_product
+from breezy.ingest.records import build_climate_day, build_raw_product, value_and_flag
 from breezy.normalize.cli_parse import ParsedCliProduct, parse_cli_product
 from breezy.normalize.units import TemperatureReadingF
 from breezy.registry.sites import ClimateDayWindow, SettlementSite, default_registry
@@ -87,6 +87,11 @@ def window_for(city: str) -> ClimateDayWindow:
 
 def registry_version() -> str:
     return default_registry().registry_version
+
+
+def test_value_and_flag_is_public_for_archive_builder_parity() -> None:
+    assert value_and_flag(TemperatureReadingF(value_f=72, sentinel="NONE")) == (72, None)
+    assert value_and_flag(TemperatureReadingF(value_f=None, sentinel="T")) == (None, "T")
 
 
 def make_fetch(
