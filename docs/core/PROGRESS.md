@@ -1257,3 +1257,145 @@ without writing the tests.
 
 - DTC pre-registration P1 anchor re-derivation, and `[D6]` cache-only egress
   closure (`docs/evidence/decision_time_clearance_prereg_2026-08-27.md`).
+
+---
+
+## Operator control contract (set 2026-08-30) — BINDING
+
+The operator has reserved exactly **two** controls and delegated every other
+engineering decision to the build side:
+
+1. **Maximum daily budget.**
+2. **Maximum per POSITION** — explicitly *not* per weather market.
+
+Values are not yet supplied and MUST be obtained before any live enablement.
+
+Everything else — event caps, location caps, portfolio-wide caps, retention
+policy, supervision, sequencing — is an engineering decision, not an operator
+question. Two consequences that are not optional:
+
+- **The daily-budget control has no home.** `RiskLimits`
+  (`strategy/weather_common/risk.py:47-62`) has **no time dimension** at all.
+  Nothing enforces a daily notional or loss ceiling. It must be built before
+  the operator's stated control can be honoured.
+- **The per-position knob silently detunes the rest.** `max_position_contracts`,
+  `max_event_notional` (1000) and `max_location_notional` (2000) are absolute
+  dollars; only `max_equity_fraction` scales with equity. Raising the position
+  cap for a larger bankroll makes the two hardcoded caps the real binding
+  constraint without anyone deciding that. There is also no portfolio-wide cap
+  (`max_total_notional` does not exist), so no single number answers "how much
+  can be at risk on weather today".
+
+---
+
+## Backtest of all three weather strategies: RUN (2026-08-30)
+
+36 runs through the real `run_backtest` harness — 2 forecast conditions x 3
+strategies x 6 settlement scenarios — against the only real venue tape that
+exists (6 minutes, 2026-08-30 16:05-16:11Z, 5 instruments, 675 depths + 675
+quotes), settled on **real preliminary** NWS observations (NYC tmax=78F,
+MIA tmax=91F, both `is_final=False`).
+
+Runner: `scripts/analysis/run_weather_strategy_backtests.py` (+
+`weather_strategy_backtest_lib.py`, `tests/unit/test_weather_strategy_backtest_lib.py`).
+JSON reports under `~/.local/share/breezy/derived/strategy-backtests/`.
+
+Result under real preliminary settlement:
+
+| Strategy | Orders | Fills | Realized | Outcome |
+|---|---|---|---|---|
+| `forecast_mispricing` | 4 | 4 | **-$5.41** | traded and lost |
+| `calibration_mean_reversion` | 0 | 0 | 0.00 | signalled, blocked on liquidity |
+| `forecast_revision` | 0 | 0 | n/a | REFUSED, naked short |
+
+Gates re-run independently by the coordinator: `pytest` exit 0 (3554 collected),
+`ruff` clean, `mypy` clean (284 files), `lint-imports` 3 kept / 0 broken. No
+harness, strategy, config default or guard was modified.
+
+**These numbers are NOT measured edge.** The forecast input was synthetic
+(Breezy has no forecast ingestion). The 4 fills are really **2 independent
+outcomes** — one NYC observation, one MIA — so nothing here can rank a strategy.
+
+---
+
+## Decision record 2026-08-30 — data capture and risk correctness
+
+Peer consultation: friendly architect (`trading-bot-architect`), adversarial
+domain review (`prediction-market-reviewer`), premise refutation (`Explore`),
+and operational safety (`security-reviewer`). **Codex was requested three times
+and was quota-exhausted every time** ("try again at Aug 31st 2026 2:23 AM") —
+recorded as an unmet consultation, not a silent skip.
+
+### What the peers overturned
+
+- **A prior claim in this repo is wrong.** `CLI_BACKFILL_PLAN.md:46` asserts
+  "Historical **forecasts** are unavailable", citing the DTC pre-registration.
+  The prereg's evidence is entirely about *repo state* ("in this repository").
+  `WEATHER_INGESTION_PROPOSAL.md:150-159` names Open-Meteo `/v1/previous-runs`
+  **"the backtest source"**, archive from Jan 2024, with point-in-time
+  discipline already designed at `:171-173`. It was **deferred, never rejected
+  on availability**. Availability remains unverified (`:155`, `:416`).
+- **Price history genuinely is forward-only** (unchanged, and now better
+  evidenced): the venue's own docs answer "Is there a public trade tape? No"
+  (`docs_snapshots/trader-guide_market-data_2026-08-25.md:48-52`), and expired
+  markets return null prices keeping only `settlementPx`.
+- **The quote-tape recorder is NOT safe to run unattended.** Three CRITICALs:
+  (C1) reconnect gives up after ~10 attempts, sets `_degraded`, and the process
+  then runs forever doing nothing — it never exits, so no supervisor can help
+  (`websocket.py:666-703`, `data.py:1285-1324`, `quote_tape_cli.py:141-177`);
+  (C2) an unclean shutdown silently voids an **entire** daily feather file —
+  `read_all()` is all-or-nothing and `convert_stream_to_data` swallows the
+  `ArrowInvalid` and continues (`parquet.py:2604-2646,2788-2800`); (C3) the
+  `websocket.py`/`factories.py` pool rewrite is **uncommitted** and today's
+  newest smoke evidence shows 0 frames, 0 QuoteTicks, teardown FAILED.
+- **Cross-strategy risk hole (two peers converged independently).** Each
+  strategy builds its own `RiskManager` over only its own `instrument_ids`
+  (`risk.py:94-97`), so running all three concurrently permits up to **3x** the
+  intended per-event exposure, invisibly.
+- **SHORT_YES has no legal expression on this venue.** It becomes
+  `OrderSide.SELL` from flat (`forecast_revision/strategy.py:304,341`;
+  `calibration_mean_reversion/strategy.py:308`), and `MispricingContract` has no
+  NO-side instrument. `calibration_mean_reversion` was SHORT_YES-only in the
+  tested window, i.e. it currently cannot execute any of its signals.
+
+### Corrections to earlier coordinator claims
+
+- "Per-position caps let six buckets stack on one city-day" — **false**.
+  `exclusive_conflict` (`risk.py:141-154`, `allow_overlapping_exclusive_yes=False`)
+  already refuses a second long-YES on one `event_key`.
+- "The ladder may leave a gap between 83 and 84" — **false**. `contains` is
+  closed-closed, so a stride-2 ladder tiles the integers exactly.
+- "P1 is just a restart; the engineering is done" — **false**, see C1/C2/C3.
+
+### Ordering (by irreversibility, then by cost of being wrong)
+
+- **P0 DONE** — back up the non-reproducible assets. The 299 MB IEM cache
+  cannot be honestly re-fetched (IEM returns a later revision), and it backs
+  three published evidence docs. Verified 40/40 against
+  `settlement-alignment-cache.sha256` and copied to `/mnt/storage/breezy-backup/`
+  (second physical disk), re-verified 40/40 at the destination. The live
+  catalog (219 files, incl. the irreplaceable 6-minute tape) was copied and
+  verified 219/219 with a fresh manifest.
+- **P1** — harden THEN supervise the quote tape: health watchdog that exits
+  non-zero on degradation, conversion-time integrity check, convert-and-prune
+  retention, an attended end-to-end smoke run, and only then a
+  `breezy-quote-tape.service`. Prices are the one irreplaceable stream.
+- **P2** — two cheap read-only probes before building anything: Open-Meteo
+  `/v1/previous-runs` availability/depth, and whether IEM AFOS serves a forecast
+  PIL. A positive result replaces a ~13-month forward clock with a ~2.5-year
+  archive that pairs against settlement truth already held back to 2020.
+- **P3** — forecast ingestion, scoped by whichever P2 branch wins.
+- **P4** — risk correctness: one shared composition-root exposure view, a
+  portfolio-wide cap, equity-scaled limits, and the daily-budget gate.
+  Prerequisite for running more than one strategy at once.
+- **P5** — SHORT_YES: read-only probe on whether the second market side has its
+  own book, then either real NO-side support or `allow_short=False`.
+- **P6** — wire boundary-conditional preliminary-revision cost into sizing;
+  `min_model_edge=0.04` is plausibly smaller than the settlement-revision cost
+  it is meant to cover.
+
+Storage note: a separate 3.6 TB disk exists at `/mnt/storage` (3.4 TB free). It
+is **not** needed for tape capacity — measured raw feather is ~1.15 GB/day and
+the converted parquet form is ~19x smaller (4,925,597 -> 178,151 bytes for the
+same window), so convert-and-prune keeps this on the primary disk for years.
+The second disk is used for backups of non-reproducible data instead.
