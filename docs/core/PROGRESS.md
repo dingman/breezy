@@ -6,17 +6,16 @@ evidence summaries do not live here. They live in git history,
 
 ## Maintenance contract (BINDING, enforced)
 
-- **Hard budget: 250 lines / 12 KB.** A `PostToolUse` hook
-  (`.claude/hooks/progress-size-gate.sh`) fails any write that exceeds it.
-- **An item leaves this file when it closes.** Do not rewrite it as a
-  `[CLOSED]` narrative — delete it and let the commit be the record.
-- **Never restate evidence here.** Link `docs/evidence/<file>.md` instead.
-- **Never restate a durable rule here.** It belongs in `docs/core/LESSONS.md`.
-- **Severity tags mark OPEN items only.** A `[HIGH]` heading over fixed work is
-  the exact ambiguity that made the 76 KB predecessor unsafe.
+- **Hard budget: 250 lines / 12 KB**, enforced by
+  `.claude/hooks/progress-size-gate.sh` (`PostToolUse`). Consolidate when it
+  blocks; never raise the budget.
+- **An item leaves this file when it closes** — delete it, don't rewrite it as
+  a `[CLOSED]` narrative. The commit is the record.
+- **Never restate evidence** (link `docs/evidence/`) **or a durable rule**
+  (that is `docs/core/LESSONS.md`).
+- **Severity tags mark OPEN items only.**
 
-Rationale: L-5 in `docs/core/LESSONS.md`. Pre-shrink copy:
-`docs/core/archive/PROGRESS-pre-2026-08-31-backlog-replacement.md`.
+Rationale: L-5. Pre-shrink copy in `docs/core/archive/`.
 
 ---
 
@@ -55,13 +54,20 @@ Two consequences that are not optional:
   `/v1/previous-runs` was deferred, never rejected. Still unverified.
 - **Price history genuinely is forward-only.** No public trade tape; expired
   markets return null prices keeping only `settlementPx`.
+- **There is no NO-side instrument, and there cannot be one** (BL-6, closed
+  2026-08-31). NO is a side of the SAME book, not a second market;
+  `parsing.py:_market_sides` refuses any side whose `identifier != slug`.
+  `docs/evidence/no_side_instrument_probe_2026-08-31.md`.
+  **P5 is rescoped** from "add NO-side instrument support" to "support
+  `outcomeSide` / price inversion on the same instrument" — smaller, different
+  work. Live acceptance of `outcomeSide=NO` stays the operator-gated probe.
 
 ---
 
 ## BACKLOG — selected for execution (opened 2026-08-31)
 
-Source: the three-strategy backtest run of 2026-08-31 (36/36 runs COMPLETED;
-report `~/.local/share/breezy/derived/strategy-backtests/weather_strategy_backtests_20260831T135804+0000.json`).
+Source: the three-strategy backtest run of 2026-08-31, 36/36 COMPLETED. Reports:
+`~/.local/share/breezy/derived/strategy-backtests/` (newest = `...20260831T135804+0000.json`).
 
 **Binding constraints on every item below.** No item may:
 set `allow_short=True`; weaken `BacktestOrderGuard` or any settlement
@@ -157,17 +163,17 @@ configs default `False` (`*/config.py:99,115,112`).
 **Acceptance:** docstring matches verified defaults and records that the
 naked-short abort path is unreachable at defaults.
 
-### [BLOCKER] BL-6 — Does a NO-side instrument exist in the captured tape?
+### [MEDIUM] BL-7 — The naked-short guard's stated remedy points at nothing
 
-Two of three strategies cannot execute because SHORT_YES has no legal
-expression on this venue. Before any NO-side support is designed, answer
-empirically and **offline**: do the 60 captured instruments contain the
-complementary NO-side market for any of the 5 tradable YES buckets?
+`backtest_order_guard.py:155-156` refuses a naked short with "short YES is
+spelled buy NO, which is a different InstrumentId with its own book". BL-6
+proved no such instrument exists or can exist. The refusal is CORRECT and must
+stay; only the rationale is wrong, and it misdirects anyone acting on it.
 
-**Scope limit:** read-only against the existing capture. No live venue access,
-no credentials, no network — the live probe is operator-gated and out of scope.
-
-**Acceptance:** a written yes/no with instrument ids and evidence.
+**Acceptance:** message names the real expression (`outcomeSide` / price
+inversion on the same instrument) and cites
+`docs/evidence/no_side_instrument_probe_2026-08-31.md`. Refusal behaviour
+unchanged — a test must pin that the guard still refuses the same orders.
 
 ---
 
@@ -175,28 +181,28 @@ no credentials, no network — the live probe is operator-gated and out of scope
 
 | ID | Sev | Item |
 |---|---|---|
-| CF-1 | OPEN | Non-uniform record counts across sites (28/28/28/30/38) — extra MDW/LAX records are an unverified inference |
-| CF-2 | MED | `never_substitute` declared in `registry/sites.toml` but no consumer reads it |
-| CF-3 | MED | Unbounded whole-catalog reads per lookup (`persistence/catalog.py:693`); full scan per poll per site |
-| CF-4 | MED | `is_record` parsed but not persisted; `tmax_flag` is `None` even on record days. Not a settlement defect |
+| CF-1 | OPEN | Non-uniform record counts (28/28/28/30/38); extra MDW/LAX records an unverified inference |
+| CF-2 | MED | `never_substitute` in `registry/sites.toml` has no consumer |
+| CF-3 | MED | Unbounded whole-catalog reads per lookup (`persistence/catalog.py:693`) |
+| CF-4 | MED | `is_record` parsed, never persisted; `tmax_flag` `None` on record days. Not a settlement defect |
 | CF-5 | MED | Fail-closed parsing: one bad token blocks a whole site for that poll |
-| CF-6 | MED | `tests/live/test_nws_live_ingest.py:86` hardcodes a personal contact address; must be a role address |
-| CF-7 | MED | `BREEZY_USER_AGENT` required on offline construction paths (`SharedIngestState.__init__` builds `HttpTransport` unconditionally) |
-| CF-8 | MED | Sibling-station products never marked in the integrity index; wasted body fetches on list change |
+| CF-6 | MED | `tests/live/test_nws_live_ingest.py:86` hardcodes a personal contact; must be a role address |
+| CF-7 | MED | `BREEZY_USER_AGENT` required on offline paths (`SharedIngestState.__init__`) |
+| CF-8 | MED | Sibling-station products unmarked in the integrity index; wasted fetches |
 | CF-9 | LOW | `_store_validators` can pair a fresh ETag with a stale `Last-Modified` |
-| CF-10 | LOW | `respx` intercepts below httpx header validation — no mocked test can catch a malformed UA |
-| CF-11 | LOW | `ruff format --check` reports 31 unformatted files; formatting is in no gate |
-| CF-12 | LOW | Gate log line `state=BLOCKED reason=successful_poll` is cosmetically misleading |
-| CF-13 | UNPROVEN | No CCA/CCB CORRECTION product ever appeared live; supersession write path is fixture-covered only |
+| CF-10 | LOW | `respx` intercepts below httpx header validation; no mocked test catches a bad UA |
+| CF-11 | LOW | `ruff format --check`: 31 unformatted files; formatting is in no gate |
+| CF-12 | LOW | Gate log `state=BLOCKED reason=successful_poll` is cosmetically misleading |
+| CF-13 | UNPROVEN | No CCA/CCB CORRECTION seen live; supersession path fixture-covered only |
 
 ### Programme sequence (carried forward from 2026-08-30)
 
 - **P1** — harden then supervise the quote tape (watchdog exiting non-zero on
   degradation, conversion-time integrity check, convert-and-prune retention,
   attended smoke run, then a systemd unit). Prices are the one irreplaceable
-  stream. Three CRITICALs remain open: reconnect gives up and then runs forever
-  doing nothing; an unclean shutdown silently voids an entire daily feather
-  file; the `websocket.py`/`factories.py` pool rewrite is uncommitted.
+  stream. Three CRITICALs open: reconnect gives up then runs forever doing
+  nothing; unclean shutdown silently voids a whole daily feather file; the
+  `websocket.py`/`factories.py` pool rewrite is uncommitted.
 - **P2** — two read-only probes: Open-Meteo `/v1/previous-runs`
   availability/depth, and whether IEM AFOS serves a forecast PIL.
 - **P3** — forecast ingestion, scoped by whichever P2 branch wins. Breezy
@@ -222,9 +228,7 @@ no credentials, no network — the live probe is operator-gated and out of scope
 
 ## Pointers
 
-- Durable rules: `docs/core/LESSONS.md` (L-1..L-5 — all binding)
-- Evidence: `docs/evidence/` (32 files)
-- Plans: `docs/plans/`
-- Runbook: `docs/core/RUNBOOK_NWS_COLLECTION.md`
-- Strategy authoring: `docs/specs/STRATEGY_QUICKSTART.md`
-- Full pre-shrink history: `docs/core/archive/PROGRESS-pre-2026-08-31-backlog-replacement.md`
+Durable rules `docs/core/LESSONS.md` (L-1..L-5, all binding) · evidence
+`docs/evidence/` · plans `docs/plans/` · runbook
+`docs/core/RUNBOOK_NWS_COLLECTION.md` · strategy authoring
+`docs/specs/STRATEGY_QUICKSTART.md` · pre-shrink history `docs/core/archive/`
