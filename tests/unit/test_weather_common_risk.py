@@ -15,6 +15,7 @@ from breezy.domain.weather_bucket_facts import Measure, WeatherBucketFacts
 from breezy.strategy.calibration_mean_reversion.config import CalibrationMeanReversionConfig
 from breezy.strategy.forecast_mispricing.config import ForecastMispricingConfig
 from breezy.strategy.forecast_revision.config import ForecastRevisionConfig
+from breezy.strategy.weather_common import risk as risk_module
 from breezy.strategy.weather_common.bucket_contract import MispricingContract
 from breezy.strategy.weather_common.models import MarketQuote
 from breezy.strategy.weather_common.refusals import SHORTS_DISABLED, RefusalCounter
@@ -448,3 +449,95 @@ def test_exclusive_conflict_ignores_a_reducing_or_short_delta() -> None:
 
     assert risk.exclusive_conflict(bucket_b, -5.0, portfolio) is False
     assert risk.exclusive_conflict(bucket_b, 5.0, portfolio) is True
+
+
+# ---------------------------------------------------------------------------
+# Shared cross-strategy max-payout exposure
+# ---------------------------------------------------------------------------
+
+
+def test_three_strategy_managers_share_the_same_event_notional_cap() -> None:
+    """Regression for BL-3: three isolated managers admit 3x the event cap."""
+    contracts = [
+        _contract("A", lower_f=80, upper_f=81),
+        _contract("B", lower_f=82, upper_f=83),
+        _contract("C", lower_f=84, upper_f=85),
+    ]
+    limits = RiskLimits(
+        max_event_notional=2.0,
+        max_location_notional=100.0,
+        max_position_contracts=100.0,
+        max_equity_fraction=1.0,
+        allow_overlapping_exclusive_yes=True,
+    )
+    shared_exposure_cls = getattr(risk_module, "SharedExposureView", None)
+    shared_exposure = shared_exposure_cls() if shared_exposure_cls is not None else None
+
+    managers = []
+    for contract in contracts:
+        kwargs = {}
+        if shared_exposure is not None:
+            kwargs["exposure_view"] = shared_exposure
+        managers.append(RiskManager(limits, {contract.instrument_id: contract}, **kwargs))
+
+    portfolio = PortfolioSnapshot(equity=10_000.0)
+    decisions = []
+    for contract, manager in zip(contracts, managers, strict=True):
+        decision = manager.evaluate_order(
+            contract=contract,
+            signed_qty_delta=1.0,
+            hours_to_settlement=24.0,
+            forecast_age_hours=0.0,
+            edge=0.50,
+            portfolio=portfolio,
+            quote=_quote(),
+            quote_age_minutes=0.0,
+        )
+        decisions.append(decision)
+        if decision.allowed:
+            portfolio.pending_qty[contract.instrument_id] = decision.clipped_quantity
+
+    assert [decision.reason for decision in decisions] == [
+        "ok",
+        "ok",
+        "max_event_notional",
+    ]
+
+
+def test_single_strategy_event_notional_boundary_is_unchanged() -> None:
+    contract = _contract("A", lower_f=80, upper_f=None)
+    risk = RiskManager(
+        RiskLimits(
+            max_event_notional=2.0,
+            max_location_notional=100.0,
+            max_position_contracts=100.0,
+            max_equity_fraction=1.0,
+        ),
+        {"A": contract},
+    )
+
+    boundary = risk.evaluate_order(
+        contract=contract,
+        signed_qty_delta=1.0,
+        hours_to_settlement=24.0,
+        forecast_age_hours=0.0,
+        edge=0.50,
+        portfolio=PortfolioSnapshot(pending_qty={"A": 1.0}, equity=10_000.0),
+        quote=_quote(),
+        quote_age_minutes=0.0,
+    )
+    over = risk.evaluate_order(
+        contract=contract,
+        signed_qty_delta=1.0,
+        hours_to_settlement=24.0,
+        forecast_age_hours=0.0,
+        edge=0.50,
+        portfolio=PortfolioSnapshot(pending_qty={"A": 2.0}, equity=10_000.0),
+        quote=_quote(),
+        quote_age_minutes=0.0,
+    )
+
+    assert boundary.allowed is True
+    assert boundary.clipped_quantity == 1.0
+    assert over.allowed is False
+    assert over.reason == "max_event_notional"

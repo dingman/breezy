@@ -106,31 +106,6 @@ confirmed or dropped by the implementer (L-4: `[V]` belongs on the inference).
 run whose signals were all refused is not reported as an unqualified
 `COMPLETED`.
 
-### [HIGH] BL-3 — Cross-strategy exposure is uncapped
-
-Each strategy constructs its own `RiskManager` over only its own `contracts`
-(`RiskManager.__init__`, `risk.py:151-165`; call sites
-`calibration_mean_reversion/strategy.py:185`, `forecast_mispricing/strategy.py:170`,
-`forecast_revision/strategy.py:176`, all `RiskManager(self._risk_limits(),
-self._contracts, refusals=self.refusals)`). Running all three concurrently
-therefore permits up to **3x** the intended per-event exposure, invisibly.
-Today's run is safe only because each strategy ran in its own isolated
-`run_backtest`.
-
-**L-1 gate:** first prove whether Nautilus' own `Portfolio` / `RiskEngine`
-already provides a shared exposure view. Build only if genuinely absent.
-
-**L-2 trap — BINDING.** `max_event_notional` is measured in max-payout dollars
-via `contract.contract_size` (`risk.py:301-311`), NOT market value. Substituting
-`Portfolio.net_exposure` would loosen every cap by roughly the price reciprocal
-— a guard weakening disguised as a native win. Any native substitution must
-state both units and prove they match, or be rejected.
-
-**Acceptance:** one shared exposure view built at the composition root; a RED
-test in which three strategies sharing one `event_key` are refused at the SAME
-`max_event_notional` that a single strategy is refused at (today they are
-refused at 3x it). Cap semantics unchanged — no limit value edited.
-
 ### [MEDIUM] BL-4 — The `naive`/`realistic` backtest conditions are a no-op
 
 All 18 pairs are byte-identical. `forecast_mispricing`'s "realistic" override

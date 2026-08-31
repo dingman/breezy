@@ -34,6 +34,7 @@ from breezy.runtime.backtest_harness import (
     SettlementInvariant,
     SettlementInvariantError,
     UnwrappedWeatherRecordError,
+    _install_shared_exposure_view,
     assert_settlement_invariants,
     build_backtest_engine,
 )
@@ -41,6 +42,18 @@ from tests.support.synthetic_binary_tape import synthetic_binary_tape
 from tests.unit.test_persistence_catalog import make_climate_day
 
 ABSENT = InstrumentId(Symbol("synthetic-absent-market"), Venue("POLYMARKET_US"))
+
+
+class _ExposureAwareStrategy:
+    def __init__(self) -> None:
+        self.exposure_view: object | None = None
+
+    @staticmethod
+    def new_shared_exposure_view() -> object:
+        return object()
+
+    def use_shared_exposure_view(self, exposure_view: object) -> None:
+        self.exposure_view = exposure_view
 
 
 def make_config(**overrides: object) -> BreezyBacktestConfig:
@@ -54,6 +67,17 @@ def make_config(**overrides: object) -> BreezyBacktestConfig:
     }
     kwargs.update(overrides)
     return BreezyBacktestConfig(**kwargs)  # type: ignore[arg-type]
+
+
+def test_backtest_composition_root_installs_one_shared_exposure_view() -> None:
+    first = _ExposureAwareStrategy()
+    second = _ExposureAwareStrategy()
+    third = object()
+
+    _install_shared_exposure_view((first, second, third))
+
+    assert first.exposure_view is not None
+    assert first.exposure_view is second.exposure_view
 
 
 # ---------------------------------------------------------------------------
