@@ -24,6 +24,10 @@ from types import ModuleType
 import pytest
 
 from breezy.domain.weather_bucket_facts import Measure, WeatherBucketFacts
+from breezy.strategy.weather_common.bucket_contract import MispricingContract
+from breezy.strategy.weather_common.models import MarketQuote
+from breezy.strategy.weather_common.refusals import RefusalCounter
+from breezy.strategy.weather_common.risk import PortfolioSnapshot, RiskLimits, RiskManager
 
 
 def _load_lib_module() -> ModuleType:
@@ -360,3 +364,117 @@ def test_derive_completion_status_zero_orders_and_all_zero_refusal_values_is_com
     )
 
     assert status == lib.STATUS_COMPLETED
+
+
+# ---------------------------------------------------------------------------
+# BL-8 end-to-end -- a wholly-gagged run reports COMPLETED_ALL_REFUSED
+# ---------------------------------------------------------------------------
+#
+# `derive_completion_status` has always been generic: it sums whatever
+# `refusal_counts` it is handed and never special-cases `shorts_disabled`.
+# The BL-8 bug lived one layer down, in `RiskManager.evaluate_order`, which
+# only ever recorded that one reason. These tests run a real `RiskManager`
+# end to end into `derive_completion_status` to prove the FULL run-status
+# path -- not just the counter -- now reports the gag for reasons besides
+# `shorts_disabled`.
+
+_STATION = "NYC"
+_CLIMATE_DAY = dt.date(2026, 8, 28)
+_NOW = dt.datetime(2026, 8, 28, 12, 0, tzinfo=dt.UTC)
+
+
+def _bucket_contract(instrument_id: str) -> MispricingContract:
+    return MispricingContract(
+        instrument_id=instrument_id,
+        facts=WeatherBucketFacts(
+            settlement_station=_STATION,
+            climate_day=_CLIMATE_DAY,
+            measure=Measure.HIGH,
+            lower_f=80,
+            upper_f=None,
+        ),
+        tick_size=0.01,
+    )
+
+
+def _fresh_quote() -> MarketQuote:
+    return MarketQuote(
+        instrument_id="ANY",
+        bid=0.40,
+        ask=0.42,
+        bid_size=100.0,
+        ask_size=100.0,
+        ts_event=_NOW,
+    )
+
+
+def test_a_run_wholly_refused_for_stale_quote_reports_completed_all_refused() -> None:
+    """Every formed signal in this "run" is refused for `stale_quote`, and
+    zero orders are ever submitted -- the exact `COMPLETED_ALL_REFUSED`
+    scenario BL-8 exists to make visible. Before the fix, `stale_quote`
+    was never recorded, `refusal_counts` stayed empty, and this reported an
+    unqualified `COMPLETED`, indistinguishable from a strategy that simply
+    saw no opportunity.
+    """
+    contract = _bucket_contract("A")
+    counter = RefusalCounter()
+    risk = RiskManager(RiskLimits(), {"A": contract}, refusals=counter)
+    orders_submitted = 0
+
+    for _tick in range(3):  # every tick forms a signal and gets refused
+        decision = risk.evaluate_order(
+            contract=contract,
+            signed_qty_delta=10.0,
+            hours_to_settlement=24.0,
+            forecast_age_hours=0.0,
+            edge=0.50,
+            portfolio=PortfolioSnapshot(),
+            quote=_fresh_quote(),
+            quote_age_minutes=999.0,  # far past the stale-quote limit, every tick
+        )
+        assert decision.allowed is False
+        assert decision.reason == "stale_quote"
+
+    status = lib.derive_completion_status(
+        orders_submitted=orders_submitted,
+        refusal_counts=dict(counter.counts),
+    )
+
+    assert counter.counts == {"stale_quote": 3}
+    assert status == lib.STATUS_COMPLETED_ALL_REFUSED
+
+
+def test_a_run_wholly_refused_for_a_notional_cap_reports_completed_all_refused() -> None:
+    """Same scenario, gagged by a notional cap instead of quote staleness --
+    another reason BL-8 names explicitly as previously uncounted.
+    """
+    contract = _bucket_contract("A")
+    counter = RefusalCounter()
+    risk = RiskManager(
+        RiskLimits(max_event_notional=1.0, max_location_notional=100.0),
+        {"A": contract},
+        refusals=counter,
+    )
+    orders_submitted = 0
+
+    for _tick in range(2):
+        decision = risk.evaluate_order(
+            contract=contract,
+            signed_qty_delta=10.0,
+            hours_to_settlement=24.0,
+            forecast_age_hours=0.0,
+            edge=0.50,
+            portfolio=PortfolioSnapshot(equity=10_000.0),
+            quote=_fresh_quote(),
+            quote_age_minutes=0.0,
+        )
+        assert decision.allowed is False
+        assert decision.reason == "max_event_notional"
+
+    status = lib.derive_completion_status(
+        orders_submitted=orders_submitted,
+        refusal_counts=dict(counter.counts),
+    )
+
+    assert counter.counts == {"max_event_notional": 2}
+    assert status == lib.STATUS_COMPLETED_ALL_REFUSED

@@ -28,7 +28,7 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Final
 
 from breezy.strategy.weather_common.refusals import SHORTS_DISABLED, RefusalCounter
 
@@ -37,6 +37,7 @@ if TYPE_CHECKING:  # pragma: no cover - typing only
     from breezy.strategy.weather_common.models import MarketQuote
 
 __all__ = [
+    "COUNTED_REFUSAL_REASONS",
     "PortfolioSnapshot",
     "RiskDecision",
     "RiskLimits",
@@ -44,6 +45,36 @@ __all__ = [
     "SharedExposureView",
     "edge_after_costs",
 ]
+
+#: Every distinct key `RiskManager.evaluate_order` can record on the
+#: `RefusalCounter` it is passed. Fixed and finite by construction -- see
+#: `RiskManager._counted_reason`, which canonicalizes `quote_tradable`'s one
+#: dynamic-valued reason (`f"spread_{spread:.3f}"`) to `"wide_spread"`
+#: before it ever reaches `.record`, so this set can never grow with market
+#: noise the way an unmapped float-suffixed key would (see the
+#: `weather_common.refusals` module docstring for why that matters: a
+#: refusal reason nobody can bound is a memory leak, not a counter).
+COUNTED_REFUSAL_REASONS: Final[frozenset[str]] = frozenset(
+    {
+        "settlement_halt",
+        "too_close_to_settlement",
+        "stale_forecast",
+        "edge_below_minimum",
+        SHORTS_DISABLED,
+        "missing_bid_ask",
+        "crossed_or_locked_ignored",
+        "wide_spread",
+        "insufficient_liquidity",
+        "future_quote",
+        "stale_quote",
+        "exclusive_bucket_conflict",
+        "max_position",
+        "max_event_notional",
+        "max_location_notional",
+        "max_simultaneous_positions",
+        "equity_fraction",
+    },
+)
 
 
 @dataclass(slots=True)
@@ -236,6 +267,16 @@ class RiskManager:
         liq = min(quote.bid_size or 0.0, quote.ask_size or 0.0)
         if liq < self.limits.min_liquidity_contracts:
             return False, "insufficient_liquidity"
+        # `now_ts_age_minutes` is MINUTES, matching `stale_quote_minutes` --
+        # unit proof at the call site in `evaluate_order`. NEGATIVE here means
+        # `quote.ts_event` is AHEAD of `now`: clock skew or a bad feed
+        # timestamp, not freshness. Checked as its own bounded reason and
+        # BEFORE the staleness check below, which only ever fires on the
+        # positive side of zero -- without this, the more wrong (more
+        # negative) the timestamp, the "fresher" the quote looks, and the
+        # staleness gate fails open forever on that input (BL-9).
+        if now_ts_age_minutes < 0:
+            return False, "future_quote"
         if now_ts_age_minutes > self.limits.stale_quote_minutes:
             return False, "stale_quote"
         return True, "ok"
@@ -264,6 +305,46 @@ class RiskManager:
                 return True
         return False
 
+    @staticmethod
+    def _counted_reason(reason: str) -> str:
+        """Bounded `RefusalCounter` key for a raw `evaluate_order` reason.
+
+        `quote_tradable` returns `f"spread_{spread:.3f}"` as the
+        outward-facing reason (kept verbatim on the returned `RiskDecision`
+        -- an operator reading a block log wants the measured spread), but
+        that string carries the spread VALUE and must never become a
+        counter key: an unbounded, float-suffixed key space is a memory leak
+        grown by market noise, not a `RefusalCounter` (see the
+        `weather_common.refusals` module docstring). Every other reason this
+        class produces is already one of the fixed strings in
+        `COUNTED_REFUSAL_REASONS` and passes through unchanged.
+        """
+        if reason.startswith("spread_"):
+            return "wide_spread"
+        return reason
+
+    def _refuse(self, reason: str) -> RiskDecision:
+        """Record `reason` on the counter, then return the refusal.
+
+        Every call site inside `evaluate_order` refuses an order the
+        strategy already FORMED and tried to submit: `evaluate_order` is
+        invoked once per signal, only after `<strategy>.decision.
+        evaluate_instrument` has already returned a non-`None`, non-`FLAT`
+        `SignalDecision` (see e.g.
+        `calibration_mean_reversion.strategy._evaluate_and_act`, which
+        returns early on `None`/`FLAT` and calls `_maybe_submit` ->
+        `evaluate_order` only otherwise). That is the line this module
+        draws: a decision-layer gate that fires BEFORE any signal exists can
+        be ordinary market conditions (no opportunity), not a gag -- but
+        every refusal returned from THIS method blocks an order the
+        strategy actually tried to place, so every one of them counts. See
+        `breezy.strategy.weather_common.refusals` for why that distinction
+        matters and `COUNTED_REFUSAL_REASONS` for the fixed set this can
+        record.
+        """
+        self.refusals.record(self._counted_reason(reason))
+        return RiskDecision(False, reason)
+
     def evaluate_order(
         self,
         *,
@@ -278,13 +359,13 @@ class RiskManager:
     ) -> RiskDecision:
         limits = self.limits
         if hours_to_settlement < limits.halt_hours_before_settlement:
-            return RiskDecision(False, "settlement_halt")
+            return self._refuse("settlement_halt")
         if hours_to_settlement < limits.min_hours_to_settlement:
-            return RiskDecision(False, "too_close_to_settlement")
+            return self._refuse("too_close_to_settlement")
         if forecast_age_hours > limits.stale_forecast_hours:
-            return RiskDecision(False, "stale_forecast")
+            return self._refuse("stale_forecast")
         if abs(edge) < limits.min_model_edge:
-            return RiskDecision(False, "edge_below_minimum")
+            return self._refuse("edge_below_minimum")
         # CLOSE-ONLY, and the only naked-short control there is (see
         # `RiskLimits.allow_short`). Netted against SETTLED position --
         # `settled_qty`, never `net_qty`: `net_qty` includes signed pending
@@ -295,45 +376,40 @@ class RiskManager:
             and not limits.allow_short
             and portfolio.settled_qty(contract.instrument_id) + signed_qty_delta < -1e-9
         ):
-            # Counted, because this refusal can silence a whole strategy: one
-            # producing no trades because it is structurally disabled looks
-            # exactly like one producing no trades because the market is
-            # efficient. See `weather_common.refusals`.
-            self.refusals.record(SHORTS_DISABLED)
-            return RiskDecision(False, SHORTS_DISABLED)
+            return self._refuse(SHORTS_DISABLED)
 
         # Unit proof: callers pass minutes, matching `stale_quote_minutes`.
         ok, why = self.quote_tradable(quote, contract.price_scale, quote_age_minutes)
         if not ok:
-            return RiskDecision(False, why)
+            return self._refuse(why)
 
         if self.exclusive_conflict(contract, signed_qty_delta, portfolio):
-            return RiskDecision(False, "exclusive_bucket_conflict")
+            return self._refuse("exclusive_bucket_conflict")
 
         projected = portfolio.net_qty(contract.instrument_id) + signed_qty_delta
         if abs(projected) > limits.max_position_contracts + 1e-9:
             room = limits.max_position_contracts - abs(portfolio.net_qty(contract.instrument_id))
             if room <= 0:
-                return RiskDecision(False, "max_position")
+                return self._refuse("max_position")
             signed_qty_delta = room if signed_qty_delta > 0 else -room
 
         event_after = self.event_notional(portfolio, contract.event_key) + abs(
             signed_qty_delta,
         ) * contract.contract_size
         if event_after > limits.max_event_notional:
-            return RiskDecision(False, "max_event_notional")
+            return self._refuse("max_event_notional")
 
         loc_after = self.location_notional(portfolio, contract.location_id) + abs(
             signed_qty_delta,
         ) * contract.contract_size
         if loc_after > limits.max_location_notional:
-            return RiskDecision(False, "max_location_notional")
+            return self._refuse("max_location_notional")
 
         if (
             portfolio.open_position_count() >= limits.max_simultaneous_positions
             and abs(portfolio.net_qty(contract.instrument_id)) < 1e-9
         ):
-            return RiskDecision(False, "max_simultaneous_positions")
+            return self._refuse("max_simultaneous_positions")
 
         order_notional = abs(signed_qty_delta) * contract.contract_size
         if portfolio.equity > 0 and order_notional > limits.max_equity_fraction * portfolio.equity:
@@ -341,7 +417,7 @@ class RiskManager:
                 contract.contract_size, 1e-9,
             )
             if clipped < 1.0:
-                return RiskDecision(False, "equity_fraction")
+                return self._refuse("equity_fraction")
             signed_qty_delta = clipped if signed_qty_delta > 0 else -clipped
 
         return RiskDecision(True, "ok", clipped_quantity=signed_qty_delta)
