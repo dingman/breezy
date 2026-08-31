@@ -120,6 +120,7 @@ from tests.conftest import (
 )
 from tests.unit.test_polymarket_us_readonly_guard import (
     Violation,
+    _imported_module_strings,
     is_venue_touching,
     iter_python_sources,
 )
@@ -211,6 +212,31 @@ _EGRESS_FUNCTION_NAMES = frozenset(
         "_batch_cancel_orders",
     }
 )
+
+
+
+#: X1 -- roots scanned for the exec-test marker ban.
+TEST_SCAN_ROOTS = ("tests",)
+
+#: X1 -- the execution package, as an import string and as a path prefix.
+EXEC_PACKAGE_MODULE = "breezy.adapters.polymarket_us.exec"
+EXEC_PACKAGE_PATH_PREFIX = "src/breezy/adapters/polymarket_us/exec/"
+
+#: X1 -- the four markers for which ``tests/conftest.py`` (:455-459) restores
+#: the ORIGINAL native pyo3 network clients, undoing barrier N1 for that test.
+SOCKET_RESTORING_MARKERS = frozenset({"allow_socket", "live", "venue_live", "real_money"})
+
+#: X2 -- native constructs banned BY NAME (plan section 6.1).
+#:
+#: ``SandboxExecutionClient`` hardcodes a ``MakerTakerFeeModel`` and a
+#: ``LatencyModel(0)``; ``BettingAccount`` and ``AccountType.BETTING`` model
+#: back/lay stake, which is not a drop-in for a 0-1 binary.
+BANNED_NATIVE_NAMES = frozenset({"SandboxExecutionClient", "BettingAccount"})
+BANNED_ACCOUNT_TYPE_MEMBER = "BETTING"
+BANNED_NATIVE_MODULE_SUBSTRING = "accounting.accounts.betting"
+
+#: X3 -- direction vocabulary prohibited anywhere under ``exec/``.
+BANNED_EXEC_DIRECTION_TOKENS = frozenset({"_SHORT", "OUTCOME_SIDE_NO"})
 
 
 # ==========================================================================
@@ -964,3 +990,487 @@ def test_n5_the_same_probe_is_not_blocked_without_the_sandbox() -> None:
             probe_socket.connect((CANARY_HOST, CANARY_PORT))
     finally:
         probe_socket.close()
+
+
+
+# ==========================================================================
+# X1-X3 -- the detectors (single implementations; the proofs above run these)
+# ==========================================================================
+
+
+def _marker_names(tree: ast.AST) -> set[str]:
+    """Every pytest marker NAME the module applies, however it is spelled.
+
+    Covers ``@pytest.mark.x``, ``@pytest.mark.x(...)``, the bare
+    ``from pytest import mark`` / ``@mark.x`` form, and the module-level
+    ``pytestmark = ...`` assignment -- all of which reduce to an
+    ``ast.Attribute`` whose receiver is spelled ``mark``.
+    """
+    names: set[str] = set()
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Attribute):
+            continue
+        receiver = node.value
+        receiver_name = (
+            receiver.attr
+            if isinstance(receiver, ast.Attribute)
+            else getattr(receiver, "id", "")
+        )
+        if receiver_name == "mark":
+            names.add(node.attr)
+    return names
+
+
+def _imports_exec_package(tree: ast.AST) -> bool:
+    """True when the module imports the execution package or a submodule.
+
+    An AST check, not a text match: a planted SOURCE STRING naming the
+    package -- of which this very module holds several -- must not count as
+    an import of it.
+    """
+    for module in _imported_module_strings(tree):
+        if module == EXEC_PACKAGE_MODULE or module.startswith(EXEC_PACKAGE_MODULE + "."):
+            return True
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.ImportFrom) or node.level != 0 or not node.module:
+            continue
+        if node.module != EXEC_PACKAGE_MODULE.rsplit(".", 1)[0]:
+            continue
+        if any(alias.name == "exec" for alias in node.names):
+            return True  # ``from breezy.adapters.polymarket_us import exec``
+    return False
+
+
+def find_exec_test_marker_violations(path: str, source: str) -> list[Violation]:
+    """X1: a test module importing ``exec/`` may carry no socket-restoring marker."""
+    tree = ast.parse(source, filename=path)
+    if not _imports_exec_package(tree):
+        return []
+    offending = sorted(_marker_names(tree) & SOCKET_RESTORING_MARKERS)
+    return [
+        Violation(
+            path,
+            0,
+            "X1",
+            f"imports {EXEC_PACKAGE_MODULE} under @pytest.mark.{marker}, "
+            f"which restores the real pyo3 network clients",
+        )
+        for marker in offending
+    ]
+
+
+def scan_exec_test_markers(roots: tuple[str, ...] = TEST_SCAN_ROOTS) -> list[Violation]:
+    return [
+        v
+        for path, src in iter_python_sources(roots)
+        for v in find_exec_test_marker_violations(path, src)
+    ]
+
+
+def find_banned_native_constructs(path: str, source: str) -> list[Violation]:
+    """X2: the constructs the plan bans by name, detected through the AST.
+
+    AST rather than raw text, deliberately and load-bearingly:
+    ``runtime/backtest_harness.py:684`` carries a COMMENT saying the account
+    type is deliberately NOT ``BETTING``. That comment is correct in context
+    and must never be "fixed" to satisfy a barrier -- the same hazard the plan
+    names for ``risk.py``'s "short YES is spelled buy NO".
+    """
+    tree = ast.parse(source, filename=path)
+    found: list[Violation] = []
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            for alias in node.names:
+                if BANNED_NATIVE_MODULE_SUBSTRING in alias.name:
+                    found.append(
+                        Violation(path, node.lineno, "X2", f"imports {alias.name}")
+                    )
+        elif isinstance(node, ast.ImportFrom):
+            if node.module and BANNED_NATIVE_MODULE_SUBSTRING in node.module:
+                found.append(Violation(path, node.lineno, "X2", f"imports {node.module}"))
+            for alias in node.names:
+                if alias.name in BANNED_NATIVE_NAMES or alias.name == BANNED_ACCOUNT_TYPE_MEMBER:
+                    found.append(
+                        Violation(path, node.lineno, "X2", f"imports the name {alias.name}")
+                    )
+        elif isinstance(node, ast.Attribute):
+            if node.attr in BANNED_NATIVE_NAMES or node.attr == BANNED_ACCOUNT_TYPE_MEMBER:
+                found.append(Violation(path, node.lineno, "X2", f"references .{node.attr}"))
+        elif isinstance(node, ast.Name):
+            if node.id in BANNED_NATIVE_NAMES:
+                found.append(Violation(path, node.lineno, "X2", f"references {node.id}"))
+        elif (
+            isinstance(node, ast.Subscript)
+            and isinstance(node.slice, ast.Constant)
+            and node.slice.value == BANNED_ACCOUNT_TYPE_MEMBER
+        ):
+            found.append(
+                Violation(path, node.lineno, "X2", f"reaches [{BANNED_ACCOUNT_TYPE_MEMBER!r}]")
+            )
+    # An ``import ... import Name`` reports the module AND the imported name;
+    # collapse to one finding per line so a count assertion stays meaningful.
+    seen: set[tuple[int, str]] = set()
+    unique: list[Violation] = []
+    for violation in found:
+        key = (violation.lineno, violation.rule)
+        if key in seen:
+            continue
+        seen.add(key)
+        unique.append(violation)
+    return unique
+
+
+def scan_banned_native_constructs(
+    roots: tuple[str, ...] = EGRESS_SCAN_ROOTS,
+) -> list[Violation]:
+    return [
+        v
+        for path, src in iter_python_sources(roots)
+        for v in find_banned_native_constructs(path, src)
+    ]
+
+
+def _is_one(node: ast.expr) -> bool:
+    """True for ``1``, ``1.0``, and one-argument constructors of either."""
+    if isinstance(node, ast.Constant) and isinstance(node.value, int | float):
+        return bool(node.value == 1)
+    if (
+        isinstance(node, ast.Call)
+        and len(node.args) == 1
+        and isinstance(node.args[0], ast.Constant)
+    ):
+        value = node.args[0].value
+        if isinstance(value, str):
+            return value.strip() in {"1", "1.0"}
+        if isinstance(value, int | float):
+            return bool(value == 1)
+    return False
+
+
+def find_exec_direction_violations(path: str, source: str) -> list[Violation]:
+    """X3: direction vocabulary and complement arithmetic, under ``exec/`` only.
+
+    Two passes, because neither alone suffices: raw text sees identifiers and
+    comments the AST cannot, and the AST sees implicitly concatenated string
+    literals the raw text cannot. One finding per token per file.
+    """
+    if not path.startswith(EXEC_PACKAGE_PATH_PREFIX):
+        return []
+    tree = ast.parse(source, filename=path)
+    constants = [
+        node.value
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Constant) and isinstance(node.value, str)
+    ]
+    found: list[Violation] = []
+    for token in sorted(BANNED_EXEC_DIRECTION_TOKENS):
+        if token in source or any(token in value for value in constants):
+            found.append(
+                Violation(path, 0, "X3", f"carries the banned direction token {token!r}")
+            )
+    for node in ast.walk(tree):
+        if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Sub) and _is_one(node.left):
+            found.append(
+                Violation(
+                    path,
+                    node.lineno,
+                    "X3",
+                    "complement arithmetic `1 - x`: the YES/NO flip this plan does not build",
+                )
+            )
+    return found
+
+
+def scan_exec_direction_vocabulary(
+    roots: tuple[str, ...] = EGRESS_SCAN_ROOTS,
+) -> list[Violation]:
+    return [
+        v
+        for path, src in iter_python_sources(roots)
+        for v in find_exec_direction_violations(path, src)
+    ]
+
+# ==========================================================================
+# X1 -- no exec test may carry a marker that restores the real pyo3 clients
+# ==========================================================================
+#
+# ``tests/conftest.py:455-459`` restores the ORIGINAL native network clients
+# for any test carrying ``allow_socket``, ``live``, ``venue_live`` or
+# ``real_money``. A test that imports the execution package and carries one of
+# those markers therefore runs execution-adjacent code with barrier N1 lifted.
+#
+# The ban is sound only because no exec test ever needs a socket: composition
+# is observed by calling ``node.build()``, which constructs clients and opens
+# nothing, with both factories' transports monkeypatched. If that ever stops
+# being true, the answer is a different technique, not a marker.
+
+#: Planted test module: imports the execution package AND lifts N1.
+_PLANTED_EXEC_TEST_WITH_MARKER = (
+    "import pytest\n"
+    "\n"
+    "from breezy.adapters.polymarket_us.exec import endpoints\n"
+    "\n"
+    "\n"
+    "@pytest.mark.allow_socket\n"
+    "def test_reaches_the_venue():\n"
+    "    assert endpoints is not None\n"
+)
+
+#: Same import, no marker. The exemption that keeps X1 from being a blanket
+#: ban on testing the exec package at all.
+_PLANTED_EXEC_TEST_WITHOUT_MARKER = (
+    "from breezy.adapters.polymarket_us.exec import endpoints\n"
+    "\n"
+    "\n"
+    "def test_reaches_nothing():\n"
+    "    assert endpoints is not None\n"
+)
+
+#: A marked test that does NOT touch the exec package -- the shipped suite has
+#: these (the ``live`` weather tests), and X1 must not touch them.
+_PLANTED_MARKED_TEST_OUTSIDE_THE_EXEC_PACKAGE = (
+    "import pytest\n"
+    "\n"
+    "\n"
+    "@pytest.mark.live\n"
+    "def test_weather():\n"
+    "    assert True\n"
+)
+
+
+def test_x1_no_shipped_test_imports_the_exec_package_under_a_socket_marker() -> None:
+    """The live barrier. Vacuous today by construction -- see the proofs below."""
+    violations = scan_exec_test_markers()
+    assert violations == [], "X1 violations:\n" + "\n".join(str(v) for v in violations)
+
+
+@pytest.mark.parametrize("marker", sorted(SOCKET_RESTORING_MARKERS))
+def test_x1_detects_every_marker_that_restores_the_real_pyo3_clients(marker: str) -> None:
+    """One case per marker: all four restore the clients, all four are banned."""
+    source = _PLANTED_EXEC_TEST_WITH_MARKER.replace("allow_socket", marker)
+    violations = find_exec_test_marker_violations("tests/unit/test_planted.py", source)
+    assert [v.rule for v in violations] == ["X1"]
+    assert marker in violations[0].detail
+
+
+def test_x1_detects_the_module_level_pytestmark_form() -> None:
+    """``pytestmark = pytest.mark.allow_socket`` marks every test in the file."""
+    source = (
+        "import pytest\n"
+        "\n"
+        "from breezy.adapters.polymarket_us import exec as exec_pkg\n"
+        "\n"
+        "pytestmark = [pytest.mark.venue_live]\n"
+        "\n"
+        "\n"
+        "def test_x():\n"
+        "    assert exec_pkg is not None\n"
+    )
+    assert [v.rule for v in find_exec_test_marker_violations("tests/unit/t.py", source)] == ["X1"]
+
+
+def test_x1_detects_the_bare_mark_import_form() -> None:
+    """``from pytest import mark`` then ``@mark.allow_socket``."""
+    source = (
+        "from pytest import mark\n"
+        "\n"
+        "from breezy.adapters.polymarket_us.exec import client\n"
+        "\n"
+        "\n"
+        "@mark.allow_socket\n"
+        "def test_x():\n"
+        "    assert client is not None\n"
+    )
+    assert [v.rule for v in find_exec_test_marker_violations("tests/unit/t.py", source)] == ["X1"]
+
+
+def test_x1_does_not_fire_on_an_exec_test_that_carries_no_marker() -> None:
+    violations = find_exec_test_marker_violations(
+        "tests/unit/test_planted.py", _PLANTED_EXEC_TEST_WITHOUT_MARKER
+    )
+    assert violations == []
+
+
+def test_x1_does_not_fire_on_a_marked_test_outside_the_exec_package() -> None:
+    """The shipped ``live`` and ``venue_live`` suites must stay untouched."""
+    violations = find_exec_test_marker_violations(
+        "tests/live/test_weather.py", _PLANTED_MARKED_TEST_OUTSIDE_THE_EXEC_PACKAGE
+    )
+    assert violations == []
+
+
+def test_x1_the_marker_set_is_exactly_the_set_conftest_restores_clients_for() -> None:
+    """Pins X1's set to its REASON. Read off conftest's source, not recalled.
+
+    If conftest starts restoring the clients for a fifth marker, X1's set is
+    stale and this fails -- rather than X1 silently covering three of four.
+    """
+    source = (REPO_ROOT / "tests" / "conftest.py").read_text(encoding="utf-8")
+    tree = ast.parse(source, filename="tests/conftest.py")
+    restoring: set[str] = set()
+    for node in ast.walk(tree):
+        if (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and node.func.attr == "get_closest_marker"
+            and node.args
+            and isinstance(node.args[0], ast.Constant)
+            and isinstance(node.args[0].value, str)
+        ):
+            restoring.add(node.args[0].value)
+    assert SOCKET_RESTORING_MARKERS <= restoring
+
+
+# ==========================================================================
+# X2 -- constructs banned BY NAME (plan section 6.1, "Banned by name")
+# ==========================================================================
+
+
+def test_x2_no_module_in_src_or_scripts_uses_a_banned_native_construct() -> None:
+    violations = scan_banned_native_constructs()
+    assert violations == [], "X2 violations:\n" + "\n".join(str(v) for v in violations)
+
+
+def test_x2_detects_the_sandbox_execution_client_by_import() -> None:
+    source = "from nautilus_trader.adapters.sandbox.execution import SandboxExecutionClient\n"
+    assert [v.rule for v in find_banned_native_constructs("src/breezy/x.py", source)] == ["X2"]
+
+
+def test_x2_detects_the_sandbox_execution_client_used_as_a_base() -> None:
+    source = (
+        "from nautilus_trader.adapters.sandbox import execution\n"
+        "\n"
+        "\n"
+        "class C(execution.SandboxExecutionClient):\n"
+        "    pass\n"
+    )
+    assert [v.rule for v in find_banned_native_constructs("src/breezy/x.py", source)] == ["X2"]
+
+
+def test_x2_detects_the_betting_account_type_member() -> None:
+    source = "from nautilus_trader.model.enums import AccountType\n\nT = AccountType.BETTING\n"
+    assert [v.rule for v in find_banned_native_constructs("src/breezy/x.py", source)] == ["X2"]
+
+
+def test_x2_detects_the_betting_member_reached_by_subscript() -> None:
+    """``AccountType['BETTING']`` is the same member by another spelling."""
+    source = "from nautilus_trader.model.enums import AccountType\n\nT = AccountType['BETTING']\n"
+    assert [v.rule for v in find_banned_native_constructs("src/breezy/x.py", source)] == ["X2"]
+
+
+def test_x2_detects_the_betting_account_module() -> None:
+    source = "from nautilus_trader.accounting.accounts.betting import BettingAccount\n"
+    rules = [v.rule for v in find_banned_native_constructs("src/breezy/x.py", source)]
+    assert rules and set(rules) == {"X2"}
+
+
+def test_x2_does_not_fire_on_the_shipped_comment_that_explains_the_refusal() -> None:
+    """``backtest_harness.py:684`` says why BETTING is NOT used. That comment
+    is correct in context and must never be "fixed".
+
+    X2 is an AST rule precisely so a comment cannot trip it -- the same
+    hazard the plan names for ``risk.py``'s "short YES is spelled buy NO".
+    """
+    path = REPO_ROOT / "src" / "breezy" / "runtime" / "backtest_harness.py"
+    source = path.read_text(encoding="utf-8")
+    assert "BETTING" in source
+    assert find_banned_native_constructs("src/breezy/runtime/backtest_harness.py", source) == []
+
+
+def test_x2_does_not_fire_on_an_unrelated_attribute_named_after_a_different_member() -> None:
+    source = "from nautilus_trader.model.enums import AccountType\n\nT = AccountType.CASH\n"
+    assert find_banned_native_constructs("src/breezy/x.py", source) == []
+
+
+# ==========================================================================
+# X3 -- direction vocabulary banned under exec/ (prohibition, not purity)
+# ==========================================================================
+#
+# ``_SHORT`` and ``OUTCOME_SIDE_NO`` are the tokens by which a direction model
+# this plan does not build would enter, and ``1 - price`` is the complement
+# arithmetic that silently converts one side into the other. All three are
+# PROHIBITED under ``exec/`` rather than proven absent, so indirection cannot
+# defeat them: the token scan reads raw text, not the AST.
+#
+# The ban is scoped to ``exec/`` by path and to nothing else, deliberately.
+# ``risk.py:75-78``'s comment "short YES is spelled buy NO" is CORRECT in its
+# own context and must not be "fixed"; a repo-wide token ban would have
+# demanded exactly that.
+#
+# At NS-2 ``exec/`` holds one docstring-only ``__init__.py``, so the live scan
+# below passes over nothing. That is why each ban ships with a planted-source
+# proof: a scan that cannot fire on the day it lands is decoration until
+# proven otherwise.
+
+
+def test_x3_no_module_under_exec_carries_direction_vocabulary() -> None:
+    """The live barrier. Vacuous at NS-2 -- the proofs below are the content."""
+    violations = scan_exec_direction_vocabulary()
+    assert violations == [], "X3 violations:\n" + "\n".join(str(v) for v in violations)
+
+
+def test_x3_the_live_scan_actually_reaches_the_exec_package() -> None:
+    """Non-vacuity of the SCAN's reach, distinct from the rule's reach.
+
+    Without this the live test above would pass identically if the scan
+    walked an empty root -- which is exactly how a vacuous barrier reads.
+    """
+    scanned = {
+        path
+        for path, _ in iter_python_sources(EGRESS_SCAN_ROOTS)
+        if path.startswith(EXEC_PACKAGE_PATH_PREFIX)
+    }
+    assert scanned == {"src/breezy/adapters/polymarket_us/exec/__init__.py"}
+
+
+@pytest.mark.parametrize("token", sorted(BANNED_EXEC_DIRECTION_TOKENS))
+def test_x3_detects_each_banned_token_in_planted_exec_source(token: str) -> None:
+    source = f'"""Docstring."""\n\nINTENT = "ORDER_INTENT_SELL{token}"\n'
+    violations = find_exec_direction_violations(f"{EXEC_PACKAGE_PATH_PREFIX}reports.py", source)
+    assert [v.rule for v in violations] == ["X3"]
+    assert token in violations[0].detail
+
+
+def test_x3_detects_a_banned_token_split_across_an_implicit_concatenation() -> None:
+    """Two scans, because neither alone is enough.
+
+    The raw-text pass sees nothing here -- the token does not appear in the
+    source at all. Python's parser folds adjacent string literals into ONE
+    ``ast.Constant``, so the AST pass does see it. Conversely the AST pass
+    cannot see an identifier or a comment, which the raw-text pass can.
+
+    Residual, stated rather than claimed away: an EXPLICIT ``"OUTCOME_SIDE_"
+    + "NO"`` is folded by neither, and is not detected. The ban is a
+    prohibition on the vocabulary, not a proof of semantic absence.
+    """
+    source = 'SIDE = "OUTCOME_SIDE_" "NO"\n'
+    assert "OUTCOME_SIDE_NO" not in source
+    violations = find_exec_direction_violations(f"{EXEC_PACKAGE_PATH_PREFIX}reports.py", source)
+    assert [v.rule for v in violations] == ["X3"]
+
+
+def test_x3_detects_the_complement_arithmetic() -> None:
+    source = "def no_price(price):\n    return 1 - price\n"
+    violations = find_exec_direction_violations(f"{EXEC_PACKAGE_PATH_PREFIX}reports.py", source)
+    assert [v.rule for v in violations] == ["X3"]
+    assert "complement" in violations[0].detail
+
+
+def test_x3_detects_the_complement_through_a_decimal_constructor() -> None:
+    source = (
+        "from decimal import Decimal\n\n\ndef no_price(price):\n    return Decimal('1') - price\n"
+    )
+    path = f"{EXEC_PACKAGE_PATH_PREFIX}reports.py"
+    rules = [v.rule for v in find_exec_direction_violations(path, source)]
+    assert rules == ["X3"]
+
+
+def test_x3_does_not_fire_on_ordinary_subtraction() -> None:
+    source = "def remaining(quantity, filled):\n    return quantity - filled\n"
+    assert find_exec_direction_violations(f"{EXEC_PACKAGE_PATH_PREFIX}reports.py", source) == []
+
+
+def test_x3_does_not_fire_outside_the_exec_package() -> None:
+    """``risk.py``'s correct-in-context comment is why this scope exists."""
+    source = "OUTCOME_SIDE_NO = 'no'\n\n\ndef no_price(price):\n    return 1 - price\n"
+    assert find_exec_direction_violations("src/breezy/strategy/risk.py", source) == []

@@ -46,7 +46,21 @@ Step 1 -- classify each ``*.py`` file under ``src/`` and ``scripts/`` as
        ``(?i)\\bpolymarketexchange\\.com\\b``;
   (C4) it imports a module whose first dotted segment is ``polymarket_us``
        (absolute imports only), or imports ``breezy.adapters.polymarket_us``
-       (or a submodule of it).
+       (or a submodule of it);
+  (C5) any ``ast.Constant`` string in it matches ``(?i)polymarket`` -- the
+       venue's NAME rather than its host. C3 matches only the two origins;
+       a module that names the venue any other way matched nothing. The
+       concrete escape C5 closes is a module OUTSIDE the adapter package
+       that takes its base URL from the environment::
+
+           BASE = os.environ["POLYMARKET_US_API_BASE_URL"]
+
+       -- one of the four override variables the shipped config already
+       declares (``config.py:55-58``). It names no host (C3 miss), imports
+       no venue module (C4 miss), and lives outside both path prefixes (C1
+       and C2 miss), so before C5 every write-verb rule silently did not
+       apply to it. Measured before landing: C5 newly classifies 15 shipped
+       modules and adds ZERO V1-V4, F1 or E0-E3 findings.
 
 A file that is not venue-touching is exempt from the write-verb rules. That
 exemption is deliberate and load-bearing: ``src/breezy/runtime/health.py``
@@ -72,23 +86,46 @@ Step 2 -- inside a venue-touching file, report a violation for ANY of:
        ``getattr`` whose second positional argument is a constant string
        in the V3 name set. Without this, V3 is trivially bypassed.
 
-RESIDUAL GAP, stated rather than papered over: a module that neither names
-a venue host nor imports the venue SDK, and that builds its URL from an
-environment variable at runtime, is not statically detectable by any rule
-here. That path is covered by other layers, not this one -- B1/B2 (the
+RESIDUAL GAP, stated rather than papered over, and NARROWER since C5: a
+module that names the venue NOWHERE -- not its host, not its name, not its
+SDK, not its adapter package -- and that builds its URL from an environment
+variable whose name also does not name the venue, is not statically
+detectable by any rule here. C5 closed the case where the environment
+variable itself names the venue, which is every variable the shipped config
+declares; what is left is a module that is anonymous about its destination
+end to end. That path is covered by other layers, not this one -- B1/B2 (the
 signer refuses to sign a non-GET, so such a request cannot be authenticated
-by Breezy code), B6 (the shipped chokepoint), and the pytest socket
-kill-switch plus the ``nautilus_pyo3`` constructor block in
-``tests/conftest.py``.
+by Breezy code), B6 (the shipped chokepoint), B7 (nothing may mint a permit),
+and the pytest socket kill-switch plus the ``nautilus_pyo3`` constructor
+block in ``tests/conftest.py``.
+
+BARRED CALLEES (B6, B7) -- two functions in ``safety.py`` that no module in
+``src/`` or ``scripts/`` may CALL, at zero, with no allowlist:
+
+  (B6) ``assert_live_order_submission_permitted`` -- the chokepoint. A caller
+       means an order path exists;
+  (B7) ``issue_live_trading_permit`` -- the ISSUER. It derives every field
+       from the operator's environment and takes no ceiling parameter, so a
+       caller anywhere in the tree mints authority for itself out of nothing
+       but ``os.environ``. It shipped with no caller barrier at all and was
+       re-exported from the package ``__init__``; both are closed here (the
+       export by removal, the reachability by this rule).
+
+There is deliberately NO allowlist for either. A one-entry allowlist that is
+empty is a zero-entry allowlist, and shipping the structure unused is how it
+later gets an entry without a paired assertion. The plan that first needs a
+caller introduces the allowlist together with its ``== 1`` pin.
 """
 
 from __future__ import annotations
 
 import ast
+import inspect
 import re
-from collections.abc import Iterator
+from collections.abc import Iterator, Mapping
 from dataclasses import dataclass
 from pathlib import Path
+from types import MappingProxyType
 from typing import Any
 
 import pytest
@@ -116,6 +153,12 @@ _VENUE_HOST_RE = re.compile(
     r"\b(?:api|gateway)\.polymarket\.us\b|\bpolymarketexchange\.com\b",
     re.IGNORECASE,
 )
+#: C5 -- the venue's NAME anywhere in a string constant. Deliberately broader
+#: than ``_VENUE_HOST_RE``: it has to match an environment-variable NAME
+#: (``POLYMARKET_US_API_BASE_URL``) and a venue-id string, not just an origin.
+#: Broad classification is the safe direction -- it only ever puts MORE modules
+#: under the write-verb rules.
+_VENUE_NAME_RE = re.compile(r"polymarket", re.IGNORECASE)
 _ADAPTER_PACKAGE = "breezy.adapters.polymarket_us"
 
 #: C2 -- script directories whose contents are venue-touching BY PATH.
@@ -191,12 +234,12 @@ def is_venue_touching(path: str, tree: ast.AST) -> bool:
     if any(path.startswith(prefix) for prefix in VENUE_TOUCHING_SCRIPT_PREFIXES):
         return True  # C2
     for node in ast.walk(tree):
-        if (
-            isinstance(node, ast.Constant)
-            and isinstance(node.value, str)
-            and _VENUE_HOST_RE.search(node.value)
-        ):
+        if not isinstance(node, ast.Constant) or not isinstance(node.value, str):
+            continue
+        if _VENUE_HOST_RE.search(node.value):
             return True  # C3
+        if _VENUE_NAME_RE.search(node.value):
+            return True  # C5
     for module in _imported_module_strings(tree):
         segments = module.split(".")
         if segments[0] == SDK_ROOT_PACKAGE:
@@ -347,6 +390,54 @@ def scan_sdk_imports(roots: tuple[str, ...] = REPO_WIDE_SCAN_ROOTS) -> list[Viol
 
 
 # --------------------------------------------------------------------------
+# B6 / B7 -- functions no module in src/ or scripts/ may CALL
+# --------------------------------------------------------------------------
+
+#: Callee name -> barrier id. A DENY table, not an allowlist: there is no
+#: exemption mechanism here and adding one is itself the change a reviewer
+#: must see. Equality-pinned by
+#: ``tests/unit/test_cage_rule_constants_are_pinned.py``, so an entry cannot
+#: be dropped by a one-token diff.
+BARRED_CALLEES: Mapping[str, str] = MappingProxyType(
+    {
+        "assert_live_order_submission_permitted": "B6",
+        "issue_live_trading_permit": "B7",
+    }
+)
+
+
+def find_barred_callers(path: str, source: str) -> list[Violation]:
+    """Report every call in ``source`` to a barred ``safety.py`` function.
+
+    The single implementation of B6 and B7: the live scans below and their
+    proof-by-construction tests run this same function, so the proofs prove
+    the enforced rule rather than a copy of it.
+
+    A definition site is not a call site -- ``safety.py`` defines both names
+    as ``FunctionDef`` nodes and is therefore never reported by its own rule.
+    The signature takes ``(path, source)`` and nothing else, deliberately:
+    an exemption parameter is the shape an allowlist arrives in, and
+    ``test_b7_the_caller_barrier_has_no_exemption_mechanism`` pins its
+    absence.
+    """
+    tree = ast.parse(source, filename=path)
+    found: list[Violation] = []
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        func = node.func
+        name = func.attr if isinstance(func, ast.Attribute) else getattr(func, "id", "")
+        rule = BARRED_CALLEES.get(name)
+        if rule is not None:
+            found.append(Violation(path, node.lineno, rule, f"calls {name}()"))
+    return found
+
+
+def scan_barred_callers(roots: tuple[str, ...] = EGRESS_SCAN_ROOTS) -> list[Violation]:
+    return [v for path, src in iter_python_sources(roots) for v in find_barred_callers(path, src)]
+
+
+# --------------------------------------------------------------------------
 # S16 -- ``.get_value()`` inside an ``assert``
 # --------------------------------------------------------------------------
 
@@ -427,6 +518,80 @@ def test_b4_classifies_a_scripts_module_importing_the_sdk_as_venue_touching() ->
     source = "from polymarket_us.auth import create_auth_headers\n\nM = 'DELETE'\n"
     violations = find_write_egress_violations("scripts/analysis/whatever.py", source)
     assert [v.rule for v in violations] == ["V1"]
+
+
+#: RED 5 / counter 2. A module OUTSIDE the adapter package that reaches the
+#: venue with its base URL read from the environment. It names no host (C3
+#: miss), imports no venue module and no SDK (C4 miss), and is under neither
+#: path prefix (C1/C2 miss). The only thing that betrays it is the NAME of
+#: the environment variable -- which is one of the four the shipped config
+#: already declares (``config.py:55-58``).
+_PLANTED_ENVIRONMENT_DRIVEN_EGRESS = (
+    "import os\n"
+    "\n"
+    "import httpx\n"
+    "\n"
+    "BASE = os.environ['POLYMARKET_US_API_BASE_URL']\n"
+    "\n"
+    "\n"
+    "def fetch(path):\n"
+    "    return httpx.get(BASE + path)\n"
+)
+
+
+def test_c5_classifies_an_environment_driven_egress_module_outside_the_package() -> None:
+    """Counter 2: a module that escapes the classifier escapes every rule.
+
+    This is the negative case with content. Asserting ``is_venue_touching``
+    is True for the paths section 5 of the plan already lists is vacuous --
+    every one of them passes on the C1 string prefix alone, before any file
+    exists.
+    """
+    path = "src/breezy/egress_outside_the_package.py"
+    tree = ast.parse(_PLANTED_ENVIRONMENT_DRIVEN_EGRESS, filename=path)
+    assert is_venue_touching(path, tree) is True
+
+
+def test_c5_the_planted_module_matches_none_of_c1_to_c4() -> None:
+    """Pins WHY the module was undetected, so C5 cannot be dropped as spare.
+
+    Each of the four shipped rules is re-evaluated here against the planted
+    source; if a later edit made one of them cover this case, this test fails
+    and the redundancy is surfaced rather than assumed.
+    """
+    path = "src/breezy/egress_outside_the_package.py"
+    tree = ast.parse(_PLANTED_ENVIRONMENT_DRIVEN_EGRESS, filename=path)
+
+    assert not path.startswith("src/breezy/adapters/polymarket_us/")  # C1
+    assert not any(path.startswith(prefix) for prefix in VENUE_TOUCHING_SCRIPT_PREFIXES)  # C2
+    hosts = [
+        n
+        for n in ast.walk(tree)
+        if isinstance(n, ast.Constant)
+        and isinstance(n.value, str)
+        and _VENUE_HOST_RE.search(n.value)
+    ]
+    assert hosts == []  # C3
+    for module in _imported_module_strings(tree):
+        assert module.split(".")[0] != SDK_ROOT_PACKAGE  # C4
+        assert not module.startswith(_ADAPTER_PACKAGE)  # C4
+
+
+def test_c5_makes_the_write_verb_rules_apply_to_the_planted_module() -> None:
+    """Classification is only worth what it switches on. This is that."""
+    path = "src/breezy/egress_outside_the_package.py"
+    source = _PLANTED_ENVIRONMENT_DRIVEN_EGRESS + (
+        "\n\ndef send(body):\n    return httpx.post(BASE, json=body)\n"
+    )
+    rules = {v.rule for v in find_write_egress_violations(path, source)}
+    assert "V3" in rules
+
+
+def test_c5_does_not_classify_a_module_that_names_no_venue_at_all() -> None:
+    """Non-vacuity in the other direction: C5 is a token match, not a blanket."""
+    source = "import os\n\nBASE = os.environ['SOME_OTHER_BASE_URL']\n"
+    tree = ast.parse(source)
+    assert is_venue_touching("src/breezy/runtime/whatever.py", tree) is False
 
 
 def test_b4_does_not_fire_on_a_non_venue_module_that_posts_to_an_operator_webhook() -> None:
@@ -567,6 +732,30 @@ def test_adapter_package_defines_no_live_execution_client() -> None:
     assert offenders == [], "execution-client violations:\n" + "\n".join(str(o) for o in offenders)
 
 
+#: The planted caller B6's non-vacuity proof uses. An order path, in source.
+_PLANTED_CHOKEPOINT_CALLER = (
+    "from breezy.adapters.polymarket_us.safety import (\n"
+    "    assert_live_order_submission_permitted,\n"
+    ")\n"
+    "\n"
+    "\n"
+    "def submit(c, p):\n"
+    "    assert_live_order_submission_permitted(credentials=c, permit=p)\n"
+)
+
+#: The planted caller B7's non-vacuity proof uses: a module outside the issuer
+#: minting a permit for itself out of the operator's environment. Every field
+#: of the permit is derived inside the issuer from ``os.environ``, so this call
+#: -- with no argument but a clock -- is the whole self-issuance defect.
+_PLANTED_PERMIT_MINTER = (
+    "from breezy.adapters.polymarket_us.safety import issue_live_trading_permit\n"
+    "\n"
+    "\n"
+    "def mint_from_the_operator_environment(clock):\n"
+    "    return issue_live_trading_permit(clock=clock)\n"
+)
+
+
 def test_safety_chokepoint_has_no_caller_in_this_slice() -> None:
     """B6: the shipped chokepoint stays uncalled by src/ and scripts/.
 
@@ -574,37 +763,70 @@ def test_safety_chokepoint_has_no_caller_in_this_slice() -> None:
     its tests are naturally excluded because only ``src`` and ``scripts``
     are scanned, and the definition is a ``FunctionDef``, not a ``Call``.
     """
-    callers: list[Violation] = []
-    for path, source in iter_python_sources(("src", "scripts")):
-        tree = ast.parse(source, filename=path)
-        for node in ast.walk(tree):
-            if isinstance(node, ast.Call):
-                func = node.func
-                name = func.attr if isinstance(func, ast.Attribute) else getattr(func, "id", "")
-                if name == "assert_live_order_submission_permitted":
-                    callers.append(Violation(path, node.lineno, "B6", "chokepoint called"))
+    callers = [v for v in scan_barred_callers() if v.rule == "B6"]
     assert callers == [], "B6 violations:\n" + "\n".join(str(c) for c in callers)
 
 
 def test_b6_detects_a_call_to_the_chokepoint() -> None:
-    """Proof the B6 scan is not vacuous, using the same predicate shape."""
+    """Proof the B6 scan is not vacuous -- run through the ENFORCED scanner."""
+    violations = find_barred_callers("src/breezy/rogue.py", _PLANTED_CHOKEPOINT_CALLER)
+    assert [v.rule for v in violations] == ["B6"]
+
+
+def test_permit_issuer_has_no_caller_in_this_slice() -> None:
+    """B7 (defect D-2): nothing in src/ or scripts/ may mint a permit.
+
+    ``issue_live_trading_permit`` reads the operator gate, both ceilings and
+    the operator identity from ``os.environ`` and takes no parameter but a
+    clock, so any caller anywhere in the tree grants itself authority. The
+    pin is ``== 0``, repo-wide across both scanned roots, with no allowlist.
+    """
+    callers = [v for v in scan_barred_callers() if v.rule == "B7"]
+    assert callers == [], "B7 violations:\n" + "\n".join(str(c) for c in callers)
+
+
+def test_b7_detects_a_module_minting_a_permit_from_the_operator_environment() -> None:
+    """Proof by construction that B7 is not vacuous."""
+    violations = find_barred_callers("src/breezy/rogue.py", _PLANTED_PERMIT_MINTER)
+    assert [v.rule for v in violations] == ["B7"]
+
+
+def test_b7_detects_the_call_through_an_attribute_receiver_too() -> None:
+    """``safety.issue_live_trading_permit(...)`` is the same mint."""
     source = (
-        "from breezy.adapters.polymarket_us.safety import (\n"
-        "    assert_live_order_submission_permitted,\n"
-        ")\n"
+        "from breezy.adapters.polymarket_us import safety\n"
         "\n"
         "\n"
-        "def submit():\n"
-        "    assert_live_order_submission_permitted(credentials=c, permit=p)\n"
+        "def mint(clock):\n"
+        "    return safety.issue_live_trading_permit(clock=clock)\n"
     )
-    tree = ast.parse(source)
-    hits = [
-        n
-        for n in ast.walk(tree)
-        if isinstance(n, ast.Call)
-        and getattr(n.func, "id", "") == "assert_live_order_submission_permitted"
-    ]
-    assert len(hits) == 1
+    assert [v.rule for v in find_barred_callers("scripts/analysis/rogue.py", source)] == ["B7"]
+
+
+def test_b7_does_not_fire_on_the_issuer_s_own_definition_site() -> None:
+    """The shipped ``safety.py`` defines both names and calls neither.
+
+    Read off the real file, not a planted string: if the definition site ever
+    started calling the issuer, this barrier has to see it.
+    """
+    path = REPO_ROOT / "src" / "breezy" / "adapters" / "polymarket_us" / "safety.py"
+    source = path.read_text(encoding="utf-8")
+    assert find_barred_callers("src/breezy/adapters/polymarket_us/safety.py", source) == []
+
+
+def test_b7_the_caller_barrier_has_no_exemption_mechanism() -> None:
+    """No allowlist, and no parameter through which one could arrive.
+
+    The plan's own words: a one-entry allowlist that is empty is a zero-entry
+    allowlist, and shipping the structure unused is how it later gets an entry
+    without a paired assertion. This pins the ABSENCE of the structure.
+    """
+    assert list(inspect.signature(find_barred_callers).parameters) == ["path", "source"]
+    assert list(inspect.signature(scan_barred_callers).parameters) == ["roots"]
+    assert set(BARRED_CALLEES) == {
+        "assert_live_order_submission_permitted",
+        "issue_live_trading_permit",
+    }
 
 
 # ==========================================================================
