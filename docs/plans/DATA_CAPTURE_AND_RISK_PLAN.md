@@ -176,7 +176,29 @@ Revision 1: *"P2 must complete before I-1 merges."* But `FORECAST_INGESTION_PLAN
 - **§5's mergeability claim was false** — P4, P5f and P6b all edit `risk.py` and the same three `config.py`. **Fixed** in §5.
 - **No observability increment**: exit 3, `TradingStateChanged`, denials and budget refusals reached no sink. **Fixed:** §4.P7, new.
 - **No rollback, and no pre-capital validation.** §2 establishes a working 36-run backtest harness that no increment re-runs after P4/P5/P6 change the risk surface. **Fixed:** §4.P7 and §6 item 5.
-- **`min_liquidity_contracts=25` vs measured median bid 0.3.** `quote_tradable` (`risk.py:109-111`) uses `min(bid_size, ask_size)`, so it rejects essentially every weather quote before any cap is consulted — and only `forecast_mispricing` calls it. **Tuning caps above a gate that rejects the book is measuring the wrong thing.** Depth belongs on the **executable** side for the intended direction. Recorded as **OQ-10**, and §4.P4 must measure it before tuning anything.
+- **`min_liquidity_contracts=25` vs the bid side -- RESTATED 2026-08-31, the earlier framing overstated it.** `quote_tradable` (`risk.py:177`) uses `min(bid_size, ask_size)`, so it gates on depth a long-only entry will never consume — and only `forecast_mispricing` calls it. **Tuning caps above a gate that rejects the book is measuring the wrong thing.** Depth belongs on the **executable** side for the intended direction. Recorded as **OQ-10**, and §4.P4 must measure it before tuning anything.
+
+  **PROVISIONAL measurement (2026-08-31), against the 675-quote tape --
+  NOT yet reproduced by a committed script, so it does not close OQ-10.**
+  `min(bid,ask) >= 25` passes 20.7% of quotes (9.6% with the spread gate);
+  `ask_size >= 25` alone passes 77.3% (66.2% with spread). Switching the entry
+  test to the executable side widens the tradable universe ~6.9x. The bid is
+  bimodal, not uniformly thin: `miahigh-gte89lt90f` has bid median 143 and
+  `nychigh-gte84lt85f` 1431, while three instruments sit at exactly 0.30 -- the
+  "median 0.3" figure was an artifact of averaging two populations, and this
+  plan repeated it. Ask-size percentiles: p10 6.3, p25 25.0, p50 43.1, p75
+  155.7 contracts.
+
+  **The `min(both)` test is wrong for entry but is accidentally doing a second
+  job: proxying EXIT liquidity.** Among entry-feasible quotes the bid supports
+  >=25 contracts only 26.8% of the time, median exit depth 0.30, median spread
+  16% of ask. So `min(...)` -> `ask_size` is correct ONLY if hold-to-settlement
+  is simultaneously declared the exit. Binary options settle at 0 or 1, so
+  settlement IS the exit -- we always get out, we just cannot stop out.
+  Loosening the gate without the budget guard in place converts an accidental
+  brake into unmanaged inventory. **P4 must land the guard first, then the gate,
+  and must re-derive these numbers from a committed script rather than citing
+  this paragraph.**
 - **`transaction_cost_prob = 0.015`** is a flat probability-unit stand-in for a fee that is genuinely `θ·p(1−p)`: correct at p=0.5, ~3× over-charged at p=0.9 — biasing against exactly the confident-tail trades the model is best at. Folded into §4.P6, which already edits that comparison.
 - **L: `websocket.py:991-1001`** interpolates full `{error}` text on the shard-close path, violating the module's own type-name-only rule honoured at `:499` and `:626`. One-line fix, folded into P1.
 
@@ -648,7 +670,7 @@ and prove they match.**
 
 **The per-position control.** The dollar cap is native configuration (`max_notional_per_order`), mapped from the operator's single figure at composition. Breezy adds only the **cumulative** per-instrument ceiling in premium terms. `max_position_contracts` stays a venue/liquidity bound. The operator's explicit "**not** per weather market" is honoured by leaving `max_event_premium` (station+climate-day) as *our* parameter, distinct from theirs.
 
-**Before tuning anything, measure OQ-10.** `quote_tradable` requires `min_liquidity_contracts = 25` against `min(bid_size, ask_size)` (`risk.py:109-111`), and the measured median top-of-book bid is ~0.3 contracts — so the gate rejects essentially every weather quote *before any cap is consulted*, and only `forecast_mispricing` calls it. Tuning caps above a gate that rejects the book is measuring the wrong thing. Depth belongs on the **executable side** for the intended direction, not `min(both)`.
+**Before tuning anything, measure OQ-10.** `quote_tradable` requires `min_liquidity_contracts = 25` against `min(bid_size, ask_size)` (`risk.py:177`), and the bid side is BIMODAL, not uniformly thin, and only `forecast_mispricing` calls it. Tuning caps above a gate that rejects the book is measuring the wrong thing. Depth belongs on the **executable side** for the intended direction, not `min(both)`.
 
 **Tests.** Flagship: three `RiskManager`s over one event sum to **one** event premium; a third order exceeding it is refused — must fail against today's code. An UNDECIDABLE instrument is counted in scope, not dropped. A pending unfilled order contributes to the cap. N concurrent submits totalling > budget: the last refused **before** any fill. A partially-filled IOC converts the filled portion and releases only the remainder. Reconcile is idempotent under a duplicate terminal event, and correct under a **dropped** one. Counter survives restart; a new UTC day resets; the same day does not. **No configured value + signer present ⇒ node stays HALTED and alerts at startup.** No configured value + no signer ⇒ backtest runs normally. `bypass is False` on every shipped config. **Contract test (R13-class):** `set_trading_state(HALTED)` on a live test node causes a subsequent `SubmitOrder` to be **denied**, asserted on the `OrderDenied` event — not merely that the state field changed. Contract test: a `max_notional_per_order` breach produces `NOTIONAL_EXCEEDS_MAX_PER_ORDER`. A `BudgetGuard` whose `on_event` raises leaves the node **HALTED**, not ACTIVE. `describe_binding_order` names the binding cap at the configured equity. `exclusive_conflict` behaviour byte-identical before and after.
 

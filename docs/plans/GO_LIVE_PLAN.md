@@ -1,7 +1,24 @@
 # Breezy — GO LIVE Plan
 
-**Status:** authoritative roadmap from current state to first real trade.
-**Created:** 2026-08-26.
+> # [SUPERSEDED 2026-08-31 -- DO NOT SEQUENCE FROM THIS FILE]
+>
+> This plan's audit is dated 2026-08-26 and is now wholesale stale. Its "Not
+> built at all" list names strategies, a backtest harness, sizing and risk gates
+> that **all now exist**, and it claims the fee schedule is unimplemented when
+> all 60 captured instruments carry `fee_schedule_status=KNOWN`,
+> `fee_coefficient=0.06`, and `assert_fee_schedule_known` (`parsing.py:297`)
+> opens today.
+>
+> **Retained for one reason only:** it is the sole written home of the
+> order-egress workstream (its Phase F) and of operator gates D1-D5. The active
+> plan, `DATA_CAPTURE_AND_RISK_PLAN.md`, contains **no execution-client work at
+> all** -- a gap found on 2026-08-31 and being closed now. Until that lands,
+> cite this file for the EXISTENCE of the egress workstream and for nothing
+> else. Every code-state claim here must be re-verified against the tree.
+
+**Status:** SUPERSEDED. Roadmap retained for the egress workstream and operator
+gates only; its code-state audit is stale.
+**Created:** 2026-08-26. **Superseded:** 2026-08-31.
 **Supersedes nothing.** This is the index over `TRADING_ENABLEMENT_PLAN.md`,
 `POLYMARKET_US_BUILD_PLAN.md` and `POLYMARKET_US_READONLY_AUTH_PLAN.md`; those
 remain the detailed sources. Where this file and they disagree, they win on
