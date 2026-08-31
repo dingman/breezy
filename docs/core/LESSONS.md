@@ -161,3 +161,88 @@ plan is a list of good ideas, not a route.
   relied on for Phase F while its own audit had been stale for five days. Stale
   documents do not announce themselves; a superseded marker is now mandatory the
   moment a plan's factual claims are found wrong.
+
+---
+
+## L-4 — A fix is a diff against one finding; a document is a set of claims (2026-08-31)
+
+### What happened
+
+`ORDER_EGRESS_PLAN.md` went through three adversarial review rounds. Round 1: 16
+blocking findings. Round 2: 5 criticals, with 15 of 16 round-1 findings genuinely
+closed — converging. Round 3: roughly 7 criticals and 10 highs, and **most were
+created by revision 3's own fixes**. Round 2 had already shown 3 of its 5 criticals
+were introduced by round-1's repairs. Two consecutive rounds is a pattern.
+
+Four of round 3's findings share one mechanism. A revision changed a fact in the
+place the finding pointed at, and did not change the other places asserting the same
+fact:
+
+- §4.2 deleted `cost_cap = payout_cap × price` and gave E-5 an AST scan banning it;
+  E-5's body still computed it. An implementer following the increment trips the
+  increment's own scanner.
+- The settlement source was reverted in E-3 and E-6; `:473` and `:2028` still
+  described the pre-revert arrangement, and `:473` is the reuse table an implementer
+  reads to decide what to reuse.
+- G0's coverage line omitted the increment that actually registers the exec client.
+
+The remaining round-3 findings share a second mechanism: a fix that satisfies its
+named finding while perturbing a neighbouring design area. Moving position-attribution
+to a later increment closed the phantom short and created a backward dependency.
+Adding a fifth authority type closed a bypass and made `POST /v1/orders` reachable
+under a second, budget-invisible type.
+
+### Why
+
+Revising against a block list optimises hard against the named findings. Nothing in
+that loop re-runs the document's global consistency checks, so the edit is locally
+correct and globally wrong. The larger and more cross-referenced the document, the
+worse the ratio: this one designed the settlement identity, the authority-type
+algebra and the container/ordering simultaneously, so every fix perturbed two other
+areas.
+
+### The rule
+
+**After any revision, sweep for propagation before claiming a finding closed.** For
+every FACT the revision changed, enumerate every site in the document asserting that
+fact and verify each one changed. This is mechanical and cheap; it would have caught
+three of round 3's findings for the cost of three greps.
+
+**And when review rounds stop converging, the document is the defect.** Two
+consecutive rounds where repairs generate more criticals than they close is not a
+signal to revise harder — it is a signal that the scope is too entangled to converge.
+Cut it at a principled seam and plan the halves separately, after the earlier half
+exists as code and answers the later half's questions.
+
+### How to apply
+
+- A revision report names, per finding, the sites it swept — not just the site it
+  edited. "Fixed at `:1296`" is incomplete; "fixed at `:1296`, swept `:550`, `:558`,
+  `:2028`" is the claim.
+- Re-review every revision. Never assume a fix is a monotonic improvement; in this
+  document it was not, twice.
+- Track findings-per-round. Rising counts mean stop revising and re-scope. The seam
+  should be one the domain already provides — here, NO-SEND / SEND, because settlement
+  is not needed until a position can exist and multi-type authority is not needed
+  until a write endpoint exists.
+- Prefer several small plans over one large one for anything spanning more than one
+  design area. The 2246-line document was not thorough; it was three plans sharing a
+  namespace.
+
+### Correction to L-3
+
+L-3's "third recurrence" was recorded as *the trading process itself does not exist*,
+on the strength of `grep "TradingNode(" src/` returning zero hits. **That inference was
+false.** The repo passes the class rather than calling it — `node_factory: NodeFactory
+= TradingNode` (`quote_tape_cli.py:195`, `cli.py:147`), then `node_factory(config);
+node.build(); node.run()` (`:151-156`). A real `TradingNode` is built and run today by
+the quote-tape process. The true gap is narrower and still real: no trading-ROLE node
+config (`build_quote_tape_node_config` pins `exec_clients={}`, `strategies=[]`) and no
+`breezy-trade` entry point. L-3's substance survives — no increment built the
+trading-role container — but its headline overstated the gap, and the overstatement
+was carried into a plan as a `[V]`-tagged fact.
+
+**The generalisable half:** `[V]` belongs on the INFERENCE, not on the command that
+produced it. A grep result is evidence; what it implies is a separate claim needing
+separate proof. Zero hits for `Foo(` does not mean `Foo` is unused — it means `Foo` is
+not called *in that syntactic form*. See [[verify-agent-claims-against-artifact]].
