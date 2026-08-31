@@ -111,6 +111,13 @@ from typing import Any
 
 import pytest
 
+from tests.conftest import (
+    CANARY_HOST,
+    CANARY_PORT,
+    EGRESS_BLOCK_LAUNCHER,
+    OS_EGRESS_BLOCK_ENV_VAR,
+    execution_egress_abort_reason,
+)
 from tests.unit.test_polymarket_us_readonly_guard import (
     Violation,
     is_venue_touching,
@@ -127,16 +134,11 @@ EGRESS_SCAN_ROOTS = ("src", "scripts")
 #: was entirely unguarded.
 NATIVE_NETWORK_CLIENT_NAMES = ("HttpClient", "WebSocketClient", "SocketClient")
 
-#: The env var by which a launcher attests that it applied an OS egress block.
-OS_EGRESS_BLOCK_ENV_VAR = "BREEZY_TEST_OS_EGRESS_BLOCK"
-
-#: RFC 5737 TEST-NET-2. Guaranteed never allocated to a real host, so probing
-#: it cannot deliver traffic to any third party even with the firewall absent.
-CANARY_HOST = "198.51.100.7"
-CANARY_PORT = 80
-
-#: Repo-relative path of the launcher that applies the OS-level block (N5).
-EGRESS_BLOCK_LAUNCHER = "scripts/ci/run_tests_no_egress.sh"
+#: ``OS_EGRESS_BLOCK_ENV_VAR``, ``CANARY_HOST``, ``CANARY_PORT`` and
+#: ``EGRESS_BLOCK_LAUNCHER`` are imported from ``tests.conftest`` above. They
+#: live there because ``pytest_sessionstart`` is the enforcement point for N2,
+#: and a constant owned by the code that enforces the rule cannot drift from
+#: the code that proves it.
 
 #: ``errno`` values that mean the kernel refused to emit the packet at all.
 #: These are the only outcomes that count as BLOCKED.
@@ -157,6 +159,17 @@ _REACHED_TEXTS = (
     "no route to host",
 )
 
+#: Path prefixes under which EVERY module is an execution-egress surface (E0).
+#:
+#: A PREFIX, not a list of exact paths, and deliberately so: E0 *classifies a
+#: hazard*, so it has to fail CLOSED as the directory grows. The plan's own
+#: module layout puts ``endpoints.py``, ``reports.py``, ``client.py``,
+#: ``config.py`` and ``factories.py`` here -- none of which E1 knows, none of
+#: which E3 sees, and only one of which E2 would classify. ``endpoints.py``,
+#: the single module that will hold every venue order-path literal, matched
+#: NO rule before E0 existed.
+_EGRESS_PATH_PREFIXES = ("src/breezy/adapters/polymarket_us/exec/",)
+
 #: Module basenames that constitute an execution-egress surface (E1).
 _EGRESS_MODULE_BASENAMES = frozenset(
     {
@@ -175,8 +188,28 @@ _EGRESS_CLASS_BASES = frozenset(
     {"LiveExecutionClient", "LiveExecClientFactory", "LiveExecutionClientFactory"}
 )
 #: Function names that constitute an execution-egress surface (E3).
+#:
+#: BOTH forms of every verb. The bare names alone classified nothing a real
+#: client does: every order-bearing coroutine a ``LiveExecutionClient``
+#: implements is underscored -- ``_submit_order``, ``_submit_order_list``,
+#: ``_modify_order``, ``_cancel_order``, ``_cancel_all_orders`` and
+#: ``_batch_cancel_orders`` (``nautilus_trader/live/execution_client.py``
+#: :608-633).
 _EGRESS_FUNCTION_NAMES = frozenset(
-    {"submit_order", "place_order", "cancel_order", "modify_order", "submit_order_list"}
+    {
+        "submit_order",
+        "place_order",
+        "cancel_order",
+        "modify_order",
+        "submit_order_list",
+        "_submit_order",
+        "_place_order",
+        "_cancel_order",
+        "_modify_order",
+        "_submit_order_list",
+        "_cancel_all_orders",
+        "_batch_cancel_orders",
+    }
 )
 
 
@@ -449,42 +482,13 @@ def find_execution_egress_modules(
 ) -> list[Violation]:
     """Report every module that constitutes an execution-egress surface.
 
-    Three rules, all syntactic:
-
-      E1 -- the module's basename is a known execution-egress name AND the
-            module is venue-touching (C1-C4 from the read-only guard), so a
-            generic ``orders.py`` in a non-venue package does not fire;
-      E2 -- it defines a class whose name ends with an execution-client
-            suffix, or that subclasses a Nautilus live-execution base;
-      E3 -- it is venue-touching and defines a function whose name is an
-            order-lifecycle verb.
+    Delegates to :func:`_scan_source`, which is the single implementation of
+    rules E0-E3 -- so the ``*_detects_*`` proofs below exercise the very code
+    this live scan runs, not a second copy of it.
     """
     found: list[Violation] = []
     for path, source in iter_python_sources(roots):
-        tree = ast.parse(source, filename=path)
-        venue = is_venue_touching(path, tree)
-
-        if venue and Path(path).name in _EGRESS_MODULE_BASENAMES:
-            found.append(Violation(path, 0, "E1", "venue-touching execution-egress module name"))
-
-        for node in ast.walk(tree):
-            if isinstance(node, ast.ClassDef):
-                if node.name.endswith(_EGRESS_CLASS_SUFFIXES):
-                    found.append(
-                        Violation(path, node.lineno, "E2", f"class {node.name} is an exec client")
-                    )
-                    continue
-                for base in node.bases:
-                    name = base.attr if isinstance(base, ast.Attribute) else getattr(base, "id", "")
-                    if name in _EGRESS_CLASS_BASES:
-                        found.append(
-                            Violation(path, node.lineno, "E2", f"class {node.name}({name})")
-                        )
-            elif venue and isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef):
-                if node.name in _EGRESS_FUNCTION_NAMES:
-                    found.append(
-                        Violation(path, node.lineno, "E3", f"defines {node.name}() on venue path")
-                    )
+        found.extend(_scan_source(path, source))
     return found
 
 
@@ -496,22 +500,20 @@ def assert_firewall_precedes_execution_egress(
 ) -> None:
     """N2's rule, factored so the detector tests can drive it directly.
 
-    No execution-egress module -> nothing to gate. Otherwise the OS firewall
-    must be BOTH attested and substantiated by a real blocked connect.
+    The rule itself lives in ``tests.conftest`` because that is where it is
+    ENFORCED (``pytest_sessionstart`` aborts on it before collection). This
+    wrapper turns the same verdict into an assertion, so the detector tests
+    below are a non-vacuity proof OF the enforced rule rather than of a copy.
     """
-    if not egress_modules:
-        return
-    listing = "\n".join(str(v) for v in egress_modules)
-    assert attested, (
-        "N2: execution-egress module(s) exist but the OS egress firewall is not "
-        f"attested ({OS_EGRESS_BLOCK_ENV_VAR}=1). The firewall is a hard "
-        "prerequisite and must land FIRST. Run the suite via "
-        f"{EGRESS_BLOCK_LAUNCHER}.\n{listing}"
+    reason = execution_egress_abort_reason(
+        egress_modules=egress_modules,
+        attested=attested,
+        outcome=outcome,
     )
-    assert outcome is not None and outcome.blocked, (
-        "N2: execution-egress module(s) exist and the firewall is attested, but a "
-        f"real native connect to {CANARY_HOST} was not blocked -- {outcome}\n{listing}"
-    )
+    if reason is not None:
+        # `raise`, not `assert`: the message must be the verdict VERBATIM so a
+        # test can compare the two, and an `assert` would vanish under `-O`.
+        raise AssertionError(reason)
 
 
 def test_n2_no_execution_egress_module_may_exist_without_a_proven_firewall() -> None:
@@ -589,9 +591,85 @@ def test_n2_does_not_fire_on_a_non_venue_module_named_orders() -> None:
     assert _scan_source("src/breezy/persistence/orders.py", source) == []
 
 
-def test_n2_the_shipped_tree_currently_has_no_execution_egress_module() -> None:
-    """Pins the precondition: today the barrier is gating an empty set."""
-    assert find_execution_egress_modules() == []
+# --------------------------------------------------------------------------
+# E0 -- the exec package is an egress surface BY PATH (NS-0 (a))
+# --------------------------------------------------------------------------
+
+
+def test_n2_e0_classifies_any_module_under_the_exec_package_by_path() -> None:
+    """A module E1/E2/E3 cannot see must still be classified.
+
+    ``transport.py`` is not a known egress basename, defines no class and no
+    order verb -- yet it is one of the filenames the NO-SEND plan's own module
+    layout contemplates under ``exec/``. Without E0 it is invisible to N2.
+    """
+    source = '"""Docstring only."""\n\nCONNECT_TIMEOUT_SECONDS = 5\n'
+    violations = _scan_source(
+        "src/breezy/adapters/polymarket_us/exec/transport.py",
+        source,
+    )
+    assert [v.rule for v in violations] == ["E0"]
+
+
+def test_n2_e0_is_a_prefix_so_it_fails_closed_as_the_package_grows() -> None:
+    """A nested module gets no exemption from an exact-path list."""
+    source = '"""Docstring only."""\n'
+    violations = _scan_source(
+        "src/breezy/adapters/polymarket_us/exec/nested/deeper.py",
+        source,
+    )
+    assert [v.rule for v in violations] == ["E0"]
+
+
+def test_n2_e0_does_not_fire_outside_the_exec_package() -> None:
+    """Non-vacuity: the same source one directory up is not classified."""
+    source = '"""Docstring only."""\n\nCONNECT_TIMEOUT_SECONDS = 5\n'
+    assert _scan_source("src/breezy/adapters/polymarket_us/transport.py", source) == []
+
+
+def test_n2_e3_detects_the_underscore_order_coroutine_a_real_client_defines() -> None:
+    """Every coroutine a ``LiveExecutionClient`` implements is underscored.
+
+    ``nautilus_trader/live/execution_client.py:608-633`` defines
+    ``_submit_order``, ``_submit_order_list``, ``_modify_order``,
+    ``_cancel_order``, ``_cancel_all_orders`` and ``_batch_cancel_orders``.
+    E3 held only the bare forms, so a real client's order path matched none.
+    """
+    source = (
+        "from breezy.adapters.polymarket_us import transport\n"
+        "\n"
+        "\n"
+        "async def _submit_order(command):\n"
+        "    return None\n"
+    )
+    rules = {v.rule for v in _scan_source("src/breezy/runtime/broker.py", source)}
+    assert "E3" in rules
+
+
+def test_n2_e3_covers_every_underscore_order_coroutine_a_live_client_implements() -> None:
+    """Pins the whole set, not just the one the RED above happens to plant."""
+    required = {
+        "_submit_order",
+        "_submit_order_list",
+        "_modify_order",
+        "_cancel_order",
+        "_cancel_all_orders",
+        "_batch_cancel_orders",
+    }
+    assert required <= _EGRESS_FUNCTION_NAMES
+
+
+def test_n2_the_shipped_tree_has_exactly_the_expected_execution_egress_modules() -> None:
+    """Exact-set pin. NOT an "is empty" pin -- an EQUALITY.
+
+    ``exec/__init__.py`` ships with NS-0 precisely so E0 is armed before the
+    package holds anything. Because this is an equality, ANY later increment
+    that adds a module under ``exec/`` fails here until it updates the
+    expected set in the same commit. That is the point: a new execution-egress
+    module cannot land silently.
+    """
+    found = [(v.path, v.rule) for v in find_execution_egress_modules()]
+    assert found == [("src/breezy/adapters/polymarket_us/exec/__init__.py", "E0")]
 
 
 def test_n2_scan_covers_both_src_and_scripts() -> None:
@@ -601,16 +679,35 @@ def test_n2_scan_covers_both_src_and_scripts() -> None:
 
 
 def _scan_source(path: str, source: str) -> list[Violation]:
-    """Apply the E1-E3 rules to one in-memory module (detector helper)."""
+    """Apply rules E0-E3 to ONE module. The single implementation.
+
+    Four rules, all syntactic:
+
+      E0 -- the module's path is under an execution-egress package prefix.
+            Unconditional: no class, no known basename and no order verb is
+            needed, because the point of the prefix is to classify files
+            whose contents the other three rules cannot see;
+      E1 -- the module's basename is a known execution-egress name AND the
+            module is venue-touching (C1-C4 from the read-only guard), so a
+            generic ``orders.py`` in a non-venue package does not fire;
+      E2 -- it defines a class whose name ends with an execution-client
+            suffix, or that subclasses a Nautilus live-execution base;
+      E3 -- it is venue-touching and defines a function whose name is an
+            order-lifecycle verb, in either its bare or its underscored form.
+    """
     tree = ast.parse(source, filename=path)
     venue = is_venue_touching(path, tree)
     found: list[Violation] = []
+    if path.startswith(_EGRESS_PATH_PREFIXES):
+        found.append(Violation(path, 0, "E0", "module lives in an execution-egress package"))
     if venue and Path(path).name in _EGRESS_MODULE_BASENAMES:
         found.append(Violation(path, 0, "E1", "venue-touching execution-egress module name"))
     for node in ast.walk(tree):
         if isinstance(node, ast.ClassDef):
             if node.name.endswith(_EGRESS_CLASS_SUFFIXES):
-                found.append(Violation(path, node.lineno, "E2", f"class {node.name}"))
+                found.append(
+                    Violation(path, node.lineno, "E2", f"class {node.name} is an exec client")
+                )
                 continue
             for base in node.bases:
                 name = base.attr if isinstance(base, ast.Attribute) else getattr(base, "id", "")
@@ -618,8 +715,189 @@ def _scan_source(path: str, source: str) -> list[Violation]:
                     found.append(Violation(path, node.lineno, "E2", f"class {node.name}({name})"))
         elif venue and isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef):
             if node.name in _EGRESS_FUNCTION_NAMES:
-                found.append(Violation(path, node.lineno, "E3", f"defines {node.name}()"))
+                found.append(
+                    Violation(path, node.lineno, "E3", f"defines {node.name}() on venue path")
+                )
     return found
+
+
+# ==========================================================================
+# N2-ABORT -- the rule is consulted from conftest and STOPS the session
+# ==========================================================================
+#
+# Reporting is not stopping. Before NS-0 the N2 rule lived only inside this
+# module, so a violation reddened ONE test while pytest ran the entire rest of
+# the suite in the same process -- with the hazard present and the firewall
+# absent. The rule is now consulted from ``pytest_sessionstart``, which runs
+# BEFORE collection, and the session exits there.
+#
+# The proof is deliberately NOT "one test failed": these tests launch a CHILD
+# pytest with ``--collect-only`` and assert on whether collection output was
+# produced at all. ``--collect-only`` emits one line per collected test, so
+# the absence of every test id in the child's output is a direct observation
+# that collection never happened.
+
+
+def _child_pytest_env(*, attest: bool) -> dict[str, str]:
+    """Environment for a child pytest run: no credentials, chosen attestation.
+
+    Credentials are stripped so the child cannot abort for the OTHER reason
+    ``pytest_sessionstart`` has (the credential gate), which would make these
+    assertions ambiguous.
+    """
+    from tests.conftest import POLYMARKET_CREDENTIAL_ENV_VARS
+
+    env = {k: v for k, v in os.environ.items() if k not in POLYMARKET_CREDENTIAL_ENV_VARS}
+    env.pop(OS_EGRESS_BLOCK_ENV_VAR, None)
+    if attest:
+        env[OS_EGRESS_BLOCK_ENV_VAR] = "1"
+    return env
+
+
+#: A test id that a completed collection of THIS module must print, and that
+#: an aborted session cannot print. Named rather than pattern-matched so the
+#: assertion cannot be satisfied by an unrelated line.
+_COLLECTION_WITNESS_ID = "test_n4_success_is_not_treated_as_blocked"
+
+#: Both child-session tests assert this FIRST. Without it, deleting
+#: ``exec/__init__.py`` would turn them into two tests that pass by observing
+#: an ordinary session -- vacuously green while the barrier gates nothing.
+_CHILD_GATE_PRECONDITION = (
+    "precondition failed: the shipped tree holds no execution-egress module, so "
+    "the child session has nothing to gate and its fate proves nothing"
+)
+
+
+def _run_child_collect_only(*, attest: bool) -> subprocess.CompletedProcess[str]:
+    """Collect (never run) this module in a child pytest. Fixed argv, no shell."""
+    return subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "pytest",
+            "--collect-only",
+            # ``-v`` because ``addopts`` carries ``-q``, under which
+            # ``--collect-only`` collapses to a single count line. At default
+            # verbosity it prints one line per collected test, which is what
+            # makes "collection never happened" directly observable.
+            "-v",
+            "-p",
+            "no:randomly",
+            "-p",
+            "no:cacheprovider",
+            "tests/unit/test_execution_egress_firewall_guard.py",
+        ],
+        cwd=REPO_ROOT,
+        env=_child_pytest_env(attest=attest),
+        capture_output=True,
+        text=True,
+        timeout=300,
+        check=False,
+    )
+
+
+def test_n2_an_unattested_session_aborts_before_collection() -> None:
+    """RED 3. Egress modules exist, no attestation -> the session never collects.
+
+    No canary packet is emitted on this path: an absent attestation is decided
+    without probing anything.
+    """
+    from tests.conftest import EXECUTION_EGRESS_ABORT_MARKER
+
+    assert find_execution_egress_modules(), _CHILD_GATE_PRECONDITION
+
+    result = _run_child_collect_only(attest=False)
+    combined = result.stdout + result.stderr
+    assert EXECUTION_EGRESS_ABORT_MARKER in combined, combined[-4000:]
+    assert "firewall is not attested" in combined, combined[-4000:]
+    assert _COLLECTION_WITNESS_ID not in combined, (
+        "the child reached collection; the rule reported instead of stopping"
+    )
+    assert result.returncode == 2, combined[-4000:]
+
+
+def test_n2_an_attested_session_lives_or_dies_by_the_real_canary() -> None:
+    """RED 3b. An attestation is worth exactly what the kernel says it is.
+
+    Both branches are asserted, and which one applies is decided by a real
+    measurement taken here in the parent rather than by an assumption about
+    the host:
+
+    * canary REACHED (an ordinary, unsandboxed run) -- the attestation is a
+      lie and the child must abort before collection. This is the half
+      revision 1 of the plan left untested;
+    * canary BLOCKED (running under ``scripts/ci/run_tests_no_egress.sh``) --
+      the attestation is substantiated and the child must proceed to
+      collection. That is not a skip: it asserts the substantiated branch does
+      NOT abort, so the barrier cannot be satisfied by aborting unconditionally.
+    """
+    from tests.conftest import EXECUTION_EGRESS_ABORT_MARKER
+
+    assert find_execution_egress_modules(), _CHILD_GATE_PRECONDITION
+
+    outcome = probe_real_egress_canary()
+    result = _run_child_collect_only(attest=True)
+    combined = result.stdout + result.stderr
+
+    if outcome.blocked:
+        assert EXECUTION_EGRESS_ABORT_MARKER not in combined, combined[-4000:]
+        assert _COLLECTION_WITNESS_ID in combined, combined[-4000:]
+        assert result.returncode == 0, combined[-4000:]
+        return
+
+    assert EXECUTION_EGRESS_ABORT_MARKER in combined, combined[-4000:]
+    assert "was not blocked" in combined, combined[-4000:]
+    assert _COLLECTION_WITNESS_ID not in combined, (
+        "the child reached collection on a LYING attestation"
+    )
+    assert result.returncode == 2, combined[-4000:]
+
+
+def test_n2_the_abort_decision_refuses_an_attested_but_unsubstantiated_firewall() -> None:
+    """The same clause as RED 3b, decided in-process and without a packet.
+
+    RED 3b can only exercise the lying-attestation branch on a host whose
+    egress is genuinely open. This asserts the same rule directly against the
+    function ``pytest_sessionstart`` consults, so the clause is covered on
+    every host including a sandboxed CI runner.
+    """
+    from tests.conftest import execution_egress_abort_reason
+
+    planted = [Violation("src/breezy/adapters/polymarket_us/exec/__init__.py", 0, "E0", "planted")]
+    reason = execution_egress_abort_reason(
+        egress_modules=planted,
+        attested=True,
+        outcome=classify_canary_failure(OSError(111, "Connection refused")),
+    )
+    assert reason is not None
+    assert "was not blocked" in reason
+
+
+def test_n2_the_abort_decision_is_silent_when_there_is_nothing_to_gate() -> None:
+    """Non-vacuity in the other direction: no egress modules, no abort."""
+    from tests.conftest import execution_egress_abort_reason
+
+    assert execution_egress_abort_reason(egress_modules=[], attested=False, outcome=None) is None
+
+
+def test_n2_the_test_module_assertion_and_the_conftest_rule_are_the_same_rule() -> None:
+    """The in-suite assertion is the non-vacuity proof OF the conftest rule.
+
+    If these were two implementations, the barrier's proof-by-construction
+    tests would prove the copy nobody enforces.
+    """
+    from tests.conftest import execution_egress_abort_reason
+
+    planted = [Violation("src/breezy/adapters/polymarket_us/exec/__init__.py", 0, "E0", "planted")]
+    reason = execution_egress_abort_reason(
+        egress_modules=planted,
+        attested=False,
+        outcome=None,
+    )
+    assert reason is not None
+    with pytest.raises(AssertionError) as excinfo:
+        assert_firewall_precedes_execution_egress(planted, attested=False, outcome=None)
+    assert reason in str(excinfo.value)
 
 
 # ==========================================================================

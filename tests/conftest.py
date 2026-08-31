@@ -31,8 +31,8 @@ import os
 import socket
 import sys
 import types
-from collections.abc import Iterator, Mapping
-from typing import Any, cast
+from collections.abc import Iterator, Mapping, Sequence
+from typing import Any, Protocol, cast
 
 import pytest
 
@@ -82,6 +82,26 @@ PYO3_EGRESS_GAP = (
 OS_EGRESS_BLOCK_COMMAND = (
     "unshare -r -n env BREEZY_TEST_OS_EGRESS_BLOCK=1 .venv/bin/python -m pytest"
 )
+
+#: The env var by which a launcher ATTESTS that it applied an OS egress block.
+#: Defined here rather than in the barrier module because
+#: :func:`pytest_sessionstart` below is now the enforcement point, and a
+#: constant owned by the thing that enforces it cannot drift from it.
+OS_EGRESS_BLOCK_ENV_VAR = "BREEZY_TEST_OS_EGRESS_BLOCK"
+
+#: Repo-relative path of the launcher that applies the OS-level block (N5).
+EGRESS_BLOCK_LAUNCHER = "scripts/ci/run_tests_no_egress.sh"
+
+#: RFC 5737 TEST-NET-2. Guaranteed never allocated to a real host, so probing
+#: it cannot deliver traffic to any third party even with the firewall absent.
+CANARY_HOST = "198.51.100.7"
+CANARY_PORT = 80
+
+#: Prefix on every N2 session-abort message. Tests match on this rather than
+#: on incidental prose, and a child pytest's output is searched for it to
+#: decide whether the session aborted.
+EXECUTION_EGRESS_ABORT_MARKER = "[breezy] N2 execution-egress firewall barrier"
+
 #: Every native client class that can open a socket from Rust.
 #:
 #: ``SocketClient`` (raw TCP) was absent from this tuple until 2026-08-27 and
@@ -255,7 +275,105 @@ def pytest_configure(config: pytest.Config) -> None:
     _install_pyo3_network_client_block()
 
 
+class _CanaryOutcomeLike(Protocol):
+    """The one field N2 reads off a canary probe result."""
+
+    @property
+    def blocked(self) -> bool: ...
+
+
+def execution_egress_abort_reason(
+    *,
+    egress_modules: Sequence[object],
+    attested: bool,
+    outcome: _CanaryOutcomeLike | None,
+) -> str | None:
+    """Barrier N2's rule: return why the session must stop, or ``None``.
+
+    This is the SINGLE implementation of the rule. ``pytest_sessionstart``
+    consults it to abort before collection, and
+    ``tests/unit/test_execution_egress_firewall_guard.py``'s
+    ``assert_firewall_precedes_execution_egress`` asserts on it, so that
+    module's proof-by-construction tests prove the enforced rule rather than
+    a copy of it.
+
+    No execution-egress module -> nothing to gate. Otherwise the OS firewall
+    must be BOTH attested and substantiated by a real blocked connect.
+    """
+    if not egress_modules:
+        return None
+    listing = "\n".join(str(module) for module in egress_modules)
+    if not attested:
+        return (
+            f"{EXECUTION_EGRESS_ABORT_MARKER}: execution-egress module(s) exist but "
+            f"the OS egress firewall is not attested ({OS_EGRESS_BLOCK_ENV_VAR}=1). "
+            "The firewall is a hard prerequisite and must land FIRST. Run the suite "
+            f"via {EGRESS_BLOCK_LAUNCHER}.\n{listing}"
+        )
+    if outcome is None or not outcome.blocked:
+        return (
+            f"{EXECUTION_EGRESS_ABORT_MARKER}: execution-egress module(s) exist and "
+            f"the firewall is attested, but a real native connect to {CANARY_HOST} "
+            f"was not blocked -- {outcome}\n{listing}"
+        )
+    return None
+
+
+def _execution_egress_abort_reason_for_this_session() -> str | None:
+    """Apply N2 to the shipped tree and this process's real egress reachability.
+
+    The scan and the canary probe live in the barrier module, and are imported
+    LAZILY here: that module imports names from this one, so a module-scope
+    import would be circular. By the time a hook runs, this module is fully
+    executed and the import is safe.
+
+    The probe is issued ONLY when execution-egress modules exist AND an
+    attestation is present -- so a tree without an ``exec/`` package emits no
+    packet, and an unattested session is refused without emitting one either.
+    """
+    from tests.unit.test_execution_egress_firewall_guard import (
+        find_execution_egress_modules,
+        os_egress_block_attested,
+        probe_real_egress_canary,
+    )
+
+    egress_modules = find_execution_egress_modules()
+    if not egress_modules:
+        return None
+    attested = os_egress_block_attested()
+    outcome = probe_real_egress_canary() if attested else None
+    return execution_egress_abort_reason(
+        egress_modules=egress_modules,
+        attested=attested,
+        outcome=outcome,
+    )
+
+
 def pytest_sessionstart(session: pytest.Session) -> None:
+    """Abort the session -- BEFORE collection -- on either hard precondition.
+
+    Order matters and is deliberate: the credential gate runs first because it
+    emits no network traffic, so a credentialed session is refused without the
+    N2 canary probe ever leaving this host.
+    """
+    _abort_on_credentialed_session(session)
+    _abort_unless_the_egress_firewall_precedes_execution_egress()
+
+
+def _abort_unless_the_egress_firewall_precedes_execution_egress() -> None:
+    """Barrier N2, enforced as a STOP rather than as a late red test.
+
+    Before this existed the rule lived only inside its own test module, so a
+    violation reddened one test while pytest ran the whole suite in the same
+    process with the hazard present and the firewall absent. Reporting is not
+    stopping.
+    """
+    reason = _execution_egress_abort_reason_for_this_session()
+    if reason is not None:
+        pytest.exit(reason, returncode=2)
+
+
+def _abort_on_credentialed_session(session: pytest.Session) -> None:
     present = sorted(name for name in POLYMARKET_CREDENTIAL_ENV_VARS if os.environ.get(name))
     if not present:
         return
