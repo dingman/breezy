@@ -31,6 +31,7 @@ from breezy.strategy.weather_common.models import (
     SignalDecision,
 )
 from breezy.strategy.weather_common.probability import WeatherProbabilityEngine
+from breezy.strategy.weather_common.refusals import SHORTS_DISABLED, RefusalCounter
 
 STATION = "NYC"
 CLIMATE_DAY = dt.date(2026, 8, 28)
@@ -97,6 +98,7 @@ def _evaluate(
     forecast: ForecastSnapshot | None = None,
     current_qty: float = 0.0,
     cfg: CalibrationMeanReversionConfig | None = None,
+    refusals: RefusalCounter | None = None,
 ) -> SignalDecision | None:
     return evaluate_instrument(
         contract=_contract(),
@@ -106,7 +108,16 @@ def _evaluate(
         current_qty=current_qty,
         engine=WeatherProbabilityEngine(),
         cfg=cfg if cfg is not None else CalibrationMeanReversionConfig(instrument_ids=()),
+        refusals=refusals,
     )
+
+
+#: Shorting is OFF by default and unreachable without writing it at a call
+#: site (see `RiskLimits.allow_short`). The short-branch math below is still
+#: live -- it is what an operator would enable -- so those tests state the
+#: override explicitly, and each is paired with the default-path assertion
+#: that the same input trades nothing.
+SHORTS_ENABLED = CalibrationMeanReversionConfig(instrument_ids=(), allow_short=True)
 
 
 # ----------------------------------------------------------------------
@@ -181,10 +192,16 @@ def test_a_forecast_younger_than_the_stability_window_is_not_traded() -> None:
 # Entry
 # ----------------------------------------------------------------------
 def test_market_far_above_the_calibrated_probability_shorts_yes() -> None:
-    """Forecast 70F against a >=80F bucket: model p is tiny, market is rich."""
+    """Forecast 70F against a >=80F bucket: model p is tiny, market is rich.
+
+    Pins the short-branch MATH, which the close-only default does not remove.
+    `allow_short=True` is stated explicitly because it is no longer a default
+    -- see `SHORTS_ENABLED` and the paired default-path test below.
+    """
     decision = _evaluate(
         quote=_quote(bid=0.90, ask=0.92),
         forecast=_forecast(expected_high_f=70.0),
+        cfg=SHORTS_ENABLED,
     )
     assert decision is not None
     assert decision.intent is SideIntent.SHORT_YES
@@ -220,6 +237,17 @@ def test_a_fairly_priced_market_produces_no_decision() -> None:
     )
 
 
+def test_shorts_are_suppressed_by_the_default_config() -> None:
+    """The same rich market as the short-entry test, on the DEFAULT config."""
+    assert (
+        _evaluate(
+            quote=_quote(bid=0.90, ask=0.92),
+            forecast=_forecast(expected_high_f=70.0),
+        )
+        is None
+    )
+
+
 def test_shorts_are_suppressed_when_disallowed() -> None:
     cfg = CalibrationMeanReversionConfig(instrument_ids=(), allow_short=False)
     assert (
@@ -230,6 +258,41 @@ def test_shorts_are_suppressed_when_disallowed() -> None:
         )
         is None
     )
+
+
+def test_a_suppressed_short_is_counted_rather_than_silently_dropped() -> None:
+    """This strategy was SHORT_YES-only in the tested window.
+
+    So this branch can suppress EVERY signal it produces, and a `None` return
+    is indistinguishable from "the market is fairly priced". The counter is
+    what makes those two facts distinguishable.
+    """
+    refusals = RefusalCounter()
+
+    assert (
+        _evaluate(
+            quote=_quote(bid=0.90, ask=0.92),
+            forecast=_forecast(expected_high_f=70.0),
+            refusals=refusals,
+        )
+        is None
+    )
+    assert refusals.count(SHORTS_DISABLED) == 1
+
+
+def test_a_fairly_priced_market_counts_no_refusal() -> None:
+    """The other half of the same fact: no signal is NOT a refusal."""
+    refusals = RefusalCounter()
+
+    assert (
+        _evaluate(
+            quote=_quote(bid=0.49, ask=0.51),
+            forecast=_forecast(expected_high_f=FAIR_HIGH_F),
+            refusals=refusals,
+        )
+        is None
+    )
+    assert refusals.total() == 0
 
 
 def test_entry_is_refused_when_the_executable_gap_is_below_the_minimum_edge() -> None:
@@ -245,7 +308,11 @@ def test_entry_is_refused_when_the_executable_gap_is_below_the_minimum_edge() ->
 
 
 def test_quantity_is_clipped_to_the_configured_maximum() -> None:
-    cfg = CalibrationMeanReversionConfig(instrument_ids=(), max_quantity=30.0)
+    # A rich market against a low forecast is a SHORT_YES, so this sizing test
+    # needs shorting explicitly enabled now that it is off by default.
+    cfg = CalibrationMeanReversionConfig(
+        instrument_ids=(), max_quantity=30.0, allow_short=True,
+    )
     decision = _evaluate(
         quote=_quote(bid=0.95, ask=0.97),
         forecast=_forecast(expected_high_f=60.0),

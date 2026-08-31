@@ -105,7 +105,11 @@ class ForecastRevisionConfig(StrategyConfig, frozen=True):
     stale_forecast_hours: float = 8.0
     stale_quote_minutes: float = 15.0
     transaction_cost_prob: float = 0.015
-    allow_short: bool = True
+    #: FALSE. See ``breezy.strategy.weather_common.risk.RiskLimits.allow_short``:
+    #: this is the only naked-short control in the system (Nautilus denies no
+    #: naked short of its own), and ``True`` is reachable only by writing it at
+    #: a call site -- an explicit operator act, never a default.
+    allow_short: bool = False
     starting_equity: float = 10_000.0
 
     # Probability model (breezy.strategy.weather_common.probability.ForecastErrorModel).

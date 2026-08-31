@@ -27,6 +27,7 @@ from breezy.strategy.weather_common.models import (
     SignalDecision,
 )
 from breezy.strategy.weather_common.probability import WeatherProbabilityEngine
+from breezy.strategy.weather_common.refusals import SHORTS_DISABLED, RefusalCounter
 from breezy.strategy.weather_common.risk import RiskLimits, RiskManager
 
 STATION = "NYC"
@@ -101,6 +102,7 @@ def _evaluate(
     forecast: ForecastSnapshot,
     current_qty: float = 0.0,
     cfg: ForecastMispricingConfig | None = None,
+    refusals: RefusalCounter | None = None,
 ) -> SignalDecision | None:
     return evaluate_instrument(
         contract=contract,
@@ -111,6 +113,7 @@ def _evaluate(
         engine=_engine(),
         risk=_risk(contract),
         cfg=cfg or _cfg(),
+        refusals=refusals,
     )
 
 
@@ -177,11 +180,20 @@ def test_enters_long_yes_when_model_probability_is_far_above_the_cheap_ask() -> 
 
 
 def test_enters_short_yes_when_model_probability_is_far_below_the_rich_bid() -> None:
+    """Pins the short-branch MATH, which the close-only default does not remove.
+
+    `allow_short=True` is stated explicitly because it is no longer a default:
+    shorting is off unless an operator writes it at a call site (see
+    `RiskLimits.allow_short`). The default-path behaviour for this same input
+    is pinned by the test below it.
+    """
     contract = _contract(lower_f=80, upper_f=None)
     quote = _quote(bid=0.70, ask=0.72)
     forecast = _forecast(expected_high_f=50.0)  # comfortably below threshold
 
-    decision = _evaluate(contract=contract, quote=quote, forecast=forecast)
+    decision = _evaluate(
+        contract=contract, quote=quote, forecast=forecast, cfg=_cfg(allow_short=True),
+    )
 
     assert decision is not None
     assert decision.intent is SideIntent.SHORT_YES
@@ -199,6 +211,22 @@ def test_short_side_is_refused_when_shorting_is_disabled() -> None:
     )
 
     assert decision is None
+
+
+def test_the_short_side_is_refused_by_the_default_config_and_counted() -> None:
+    """No override: the DEFAULT refuses it, and says so on the counter."""
+    contract = _contract(lower_f=80, upper_f=None)
+    refusals = RefusalCounter()
+
+    decision = _evaluate(
+        contract=contract,
+        quote=_quote(bid=0.70, ask=0.72),
+        forecast=_forecast(expected_high_f=50.0),
+        refusals=refusals,
+    )
+
+    assert decision is None
+    assert refusals.count(SHORTS_DISABLED) == 1
 
 
 # ---------------------------------------------------------------------------

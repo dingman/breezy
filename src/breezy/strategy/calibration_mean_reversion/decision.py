@@ -40,6 +40,7 @@ from datetime import datetime
 from typing import TYPE_CHECKING
 
 from breezy.strategy.weather_common.models import SideIntent, SignalDecision
+from breezy.strategy.weather_common.refusals import SHORTS_DISABLED, RefusalCounter
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
     from breezy.strategy.calibration_mean_reversion.config import (
@@ -81,6 +82,7 @@ def evaluate_instrument(
     current_qty: float,
     engine: WeatherProbabilityEngine,
     cfg: CalibrationMeanReversionConfig,
+    refusals: RefusalCounter | None = None,
 ) -> SignalDecision | None:
     """Return the desired position change, or ``None`` for "do nothing"."""
     hours_left = forecast.horizon_hours
@@ -162,6 +164,10 @@ def evaluate_instrument(
         executable_gap = cal_p - ask_p - cfg.transaction_cost_prob
         mkt = ask_p
     if intent is SideIntent.SHORT_YES and not cfg.allow_short:
+        # Counted, not merely suppressed: this strategy was SHORT_YES-only in
+        # the tested window, so this branch can silence it entirely.
+        if refusals is not None:
+            refusals.record(SHORTS_DISABLED)
         return None
     if executable_gap < cfg.min_model_edge:
         return None

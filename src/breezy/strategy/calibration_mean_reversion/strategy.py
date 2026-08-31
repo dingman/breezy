@@ -93,6 +93,7 @@ from breezy.strategy.weather_common.probability import (
     HorizonSigmaParams,
     WeatherProbabilityEngine,
 )
+from breezy.strategy.weather_common.refusals import RefusalAlerter, RefusalCounter
 from breezy.strategy.weather_common.risk import PortfolioSnapshot, RiskLimits, RiskManager
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
@@ -141,6 +142,13 @@ class CalibrationMeanReversionStrategy(Strategy):
         self._quotes: dict[str, MarketQuote] = {}
         self._last_eval: dict[str, datetime] = {}
         self._risk: RiskManager | None = None
+        # PUBLIC: shared by the DECISION layer and the RISK layer, which refuse
+        # a short at two different points, and readable by an operator (or a
+        # test) asking "did this strategy do nothing, or was it stopped from
+        # doing something?". The alerter is built in `on_start`, where the
+        # strategy id -- its alert `site` -- is settled.
+        self.refusals = RefusalCounter()
+        self._refusal_alerter: RefusalAlerter | None = None
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -174,7 +182,8 @@ class CalibrationMeanReversionStrategy(Strategy):
             self.subscribe_order_book_depth(instrument_id)
             self.log.info(f"CalibrationMeanReversionStrategy subscribed {instrument_id}")
 
-        self._risk = RiskManager(self._risk_limits(), self._contracts)
+        self._risk = RiskManager(self._risk_limits(), self._contracts, refusals=self.refusals)
+        self._refusal_alerter = RefusalAlerter(self.refusals, site=str(self.id))
         self.subscribe_data(nws_climate_day_data_type(), client_id=NWS_BACKTEST_CLIENT_ID)
 
     def on_reset(self) -> None:
@@ -282,8 +291,12 @@ class CalibrationMeanReversionStrategy(Strategy):
             current_qty=current_qty,
             engine=self._engine,
             cfg=self._config,
+            refusals=self.refusals,
         )
         if decision is None:
+            # The decision layer refuses a SHORT_YES intent BEFORE risk ever
+            # sees it, so this is where that refusal becomes visible.
+            self._report_refusals()
             return
         if decision.intent is SideIntent.FLAT:
             if abs(current_qty) > 1e-9:
@@ -327,6 +340,7 @@ class CalibrationMeanReversionStrategy(Strategy):
                 f"RISK block {contract.instrument_id}: {risk_decision.reason} "
                 f"edge={decision.edge:.3f}",
             )
+            self._report_refusals()
             return
         self._submit_delta(contract, quote, risk_decision.clipped_quantity, decision)
 
@@ -368,6 +382,22 @@ class CalibrationMeanReversionStrategy(Strategy):
             f"ORDER {contract.instrument_id} delta={signed_delta:+.1f} "
             f"intent={decision.intent.value} edge={decision.edge:.3f} reason={decision.reason}",
         )
+
+    def _report_refusals(self) -> None:
+        """Push this evaluation's refusal counts through the alert path.
+
+        Called after every refusal, and cheap by design: `AlertState` dedupes
+        to one payload per false->true transition plus the standard 24h
+        re-notify, so a strategy that is structurally disabled alerts ONCE and
+        then stays quiet, rather than emitting per refused order (a firehose an
+        operator learns to ignore, which is the same outcome as no alert).
+
+        Runs on the strategy's own event-handler thread, which is the thread
+        that owns the `AlertState` -- see `RefusalAlerter`.
+        """
+        if self._refusal_alerter is None:
+            return
+        self._refusal_alerter.report(now_ns=self.clock.timestamp_ns())
 
     def _flatten(self, instrument_id: str, reason: str) -> None:
         nt_id = self._nt_ids[instrument_id]

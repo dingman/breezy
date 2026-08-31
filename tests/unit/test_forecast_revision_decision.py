@@ -34,6 +34,7 @@ from breezy.strategy.weather_common.models import (
     SignalDecision,
 )
 from breezy.strategy.weather_common.probability import WeatherProbabilityEngine
+from breezy.strategy.weather_common.refusals import SHORTS_DISABLED, RefusalCounter
 
 STATION = "NYC"
 CLIMATE_DAY = dt.date(2026, 8, 28)
@@ -115,6 +116,7 @@ def _evaluate(
     now: dt.datetime = NOW,
     current_qty: float = 0.0,
     cfg: ForecastRevisionConfig | None = None,
+    refusals: RefusalCounter | None = None,
 ) -> SignalDecision | None:
     return evaluate_instrument(
         contract=_contract(),
@@ -124,6 +126,7 @@ def _evaluate(
         state=state,
         engine=WeatherProbabilityEngine(),
         cfg=cfg if cfg is not None else ForecastRevisionConfig(instrument_ids=()),
+        refusals=refusals,
     )
 
 
@@ -218,6 +221,13 @@ def test_shorts_are_suppressed_when_disallowed() -> None:
     )
     cfg = ForecastRevisionConfig(instrument_ids=(), allow_short=False)
     assert _evaluate(state=state, quote=_quote(bid=0.79, ask=0.81), cfg=cfg) is None
+
+    # ... and the DEFAULT config, with no override at all, does the same --
+    # counting the refusal so "no trades" stays distinguishable from "no
+    # opportunities".
+    refusals = RefusalCounter()
+    assert _evaluate(state=state, quote=_quote(bid=0.79, ask=0.81), refusals=refusals) is None
+    assert refusals.count(SHORTS_DISABLED) == 1
 
 
 def test_entry_is_refused_when_edge_after_costs_is_below_the_minimum() -> None:
@@ -392,7 +402,11 @@ def test_a_ladder_sibling_nets_out_its_own_market_move() -> None:
         current_qty=0.0,
         state=state,
         engine=WeatherProbabilityEngine(),
-        cfg=ForecastRevisionConfig(instrument_ids=()),
+        # The sibling's unabsorbed move is DOWNWARD here, i.e. a SHORT_YES,
+        # so this arithmetic test needs shorting explicitly enabled now that
+        # it is off by default. What is under test is `unabsorbed`, not the
+        # permission.
+        cfg=ForecastRevisionConfig(instrument_ids=(), allow_short=True),
     )
     assert decision is not None
     market_dp = _metric(decision, "dP_market")

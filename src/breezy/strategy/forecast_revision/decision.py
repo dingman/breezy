@@ -88,6 +88,7 @@ from breezy.strategy.weather_common.models import (
     SignalDecision,
     ensure_aware,
 )
+from breezy.strategy.weather_common.refusals import SHORTS_DISABLED, RefusalCounter
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
     from breezy.strategy.forecast_revision.config import ForecastRevisionConfig
@@ -214,6 +215,7 @@ def evaluate_instrument(
     state: RevisionState,
     engine: WeatherProbabilityEngine,
     cfg: ForecastRevisionConfig,
+    refusals: RefusalCounter | None = None,
 ) -> SignalDecision | None:
     """Return the desired position change, or ``None`` for "do nothing"."""
     hist = state.history(contract)
@@ -300,6 +302,9 @@ def evaluate_instrument(
 
     intent = SideIntent.LONG_YES if unabsorbed > 0 else SideIntent.SHORT_YES
     if intent is SideIntent.SHORT_YES and not cfg.allow_short:
+        # Counted, not merely suppressed -- see `weather_common.refusals`.
+        if refusals is not None:
+            refusals.record(SHORTS_DISABLED)
         return None
 
     bid_p, ask_p, mid_p = (

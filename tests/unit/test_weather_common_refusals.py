@@ -1,0 +1,139 @@
+"""Unit tests for `breezy.strategy.weather_common.refusals`.
+
+The counter exists because of a specific failure mode, not for telemetry's
+sake: `calibration_mean_reversion` was SHORT_YES-only in the tested window, so
+with shorts disabled it can execute NO signal at all. A strategy producing zero
+trades because it is structurally disabled and one producing zero trades
+because the market is efficient are the SAME observation and completely
+different facts. These tests pin the second one being distinguishable from the
+first at the alert sink.
+"""
+
+from __future__ import annotations
+
+from breezy.runtime.health import AlertPayload, AlertState
+from breezy.strategy.weather_common.refusals import (
+    SHORTS_DISABLED,
+    SHORTS_DISABLED_EVENT,
+    RefusalAlerter,
+    RefusalCounter,
+)
+
+SITE = "strategy/CalibrationMeanReversion-000"
+
+#: One day in nanoseconds -- `AlertState`'s default re-notify cadence.
+DAY_NS = 24 * 60 * 60 * 1_000_000_000
+
+
+class _RecordingSink:
+    """An `AlertSink` that keeps what it was handed."""
+
+    def __init__(self) -> None:
+        self.payloads: list[AlertPayload] = []
+
+    def emit(self, payload: AlertPayload) -> None:
+        self.payloads.append(payload)
+
+
+# ---------------------------------------------------------------------------
+# RefusalCounter
+# ---------------------------------------------------------------------------
+
+
+def test_a_fresh_counter_counts_zero() -> None:
+    counter = RefusalCounter()
+    assert counter.count(SHORTS_DISABLED) == 0
+    assert counter.total() == 0
+
+
+def test_records_accumulate_per_reason() -> None:
+    counter = RefusalCounter()
+    counter.record(SHORTS_DISABLED)
+    counter.record(SHORTS_DISABLED)
+    counter.record("some_other_reason")
+
+    assert counter.count(SHORTS_DISABLED) == 2
+    assert counter.count("some_other_reason") == 1
+    assert counter.total() == 3
+
+
+# ---------------------------------------------------------------------------
+# RefusalAlerter -- counter -> existing alert path
+# ---------------------------------------------------------------------------
+
+
+def test_a_shorts_disabled_refusal_reaches_the_alert_sink() -> None:
+    counter = RefusalCounter()
+    sink = _RecordingSink()
+    alerter = RefusalAlerter(counter, site=SITE, sink=sink)
+
+    counter.record(SHORTS_DISABLED)
+    emitted = alerter.report(now_ns=1_000)
+
+    assert emitted == 1
+    assert len(sink.payloads) == 1
+    payload = sink.payloads[0]
+    assert payload.event == SHORTS_DISABLED_EVENT
+    assert payload.site == SITE
+    assert payload.severity == "WARN"
+    assert "1" in payload.detail
+
+
+def test_no_refusal_emits_nothing() -> None:
+    """Silence here must mean "nothing was refused", never "nobody looked"."""
+    counter = RefusalCounter()
+    sink = _RecordingSink()
+    alerter = RefusalAlerter(counter, site=SITE, sink=sink)
+
+    assert alerter.report(now_ns=1_000) == 0
+    assert sink.payloads == []
+
+
+def test_a_standing_refusal_does_not_re_notify_on_every_cycle() -> None:
+    """`AlertState`'s dedupe is the whole reason this goes through it.
+
+    A strategy evaluates on every quote tick; an alert per refused order would
+    be a firehose an operator learns to ignore, which is the same outcome as no
+    alert at all.
+    """
+    counter = RefusalCounter()
+    sink = _RecordingSink()
+    alerter = RefusalAlerter(counter, site=SITE, sink=sink)
+
+    counter.record(SHORTS_DISABLED)
+    alerter.report(now_ns=1_000)
+    for _ in range(50):
+        counter.record(SHORTS_DISABLED)
+        alerter.report(now_ns=2_000)
+
+    assert len(sink.payloads) == 1
+
+
+def test_a_standing_refusal_re_notifies_after_the_renotify_window() -> None:
+    counter = RefusalCounter()
+    sink = _RecordingSink()
+    alerter = RefusalAlerter(
+        counter, site=SITE, sink=sink, state=AlertState(renotify_after_ns=DAY_NS),
+    )
+
+    counter.record(SHORTS_DISABLED)
+    alerter.report(now_ns=1_000)
+    counter.record(SHORTS_DISABLED)
+    alerter.report(now_ns=1_000 + DAY_NS)
+
+    assert len(sink.payloads) == 2
+    assert "2" in sink.payloads[1].detail
+
+
+def test_the_detail_names_the_structural_disablement_not_just_a_number() -> None:
+    """"12 refusals" is a metric; the operator needs the interpretation."""
+    counter = RefusalCounter()
+    sink = _RecordingSink()
+    alerter = RefusalAlerter(counter, site=SITE, sink=sink)
+
+    counter.record(SHORTS_DISABLED)
+    alerter.report(now_ns=1_000)
+
+    detail = sink.payloads[0].detail
+    assert SHORTS_DISABLED in detail
+    assert "no trades" in detail

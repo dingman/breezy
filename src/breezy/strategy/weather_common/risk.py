@@ -30,6 +30,8 @@ from collections.abc import Mapping
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
+from breezy.strategy.weather_common.refusals import SHORTS_DISABLED, RefusalCounter
+
 if TYPE_CHECKING:  # pragma: no cover - typing only
     from breezy.strategy.weather_common.bucket_contract import MispricingContract
     from breezy.strategy.weather_common.models import MarketQuote
@@ -58,7 +60,27 @@ class RiskLimits:
     stale_forecast_hours: float = 8.0
     stale_quote_minutes: float = 15.0
     transaction_cost_prob: float = 0.015  # fees + expected slippage in prob units
-    allow_short: bool = True
+    #: FALSE, and it must stay false in every default construction path.
+    #:
+    #: This is not a conservative preference, it is the ONLY naked-short
+    #: control in the system. `nautilus_trader==1.231.0` denies no naked short
+    #: of its own: `risk/engine.pyx:974-985` exempts a position-REDUCING sell
+    #: outright, and a position-OPENING sell is denied only by
+    #: `CUM_NOTIONAL_EXCEEDS_FREE_BALANCE`, itself gated on
+    #: `not allow_borrowing` -- and on a CASH account
+    #: `CashAccount.balance_impact` returns +notional for a SELL, so the
+    #: `(free + impact) < 0` gate cannot fire either. Nothing is behind this
+    #: flag.
+    #:
+    #: The venue makes the same point economically: on a Polymarket CLOB you
+    #: cannot sell tokens you do not hold -- "short YES" is spelled "buy NO",
+    #: a different instrument with its own book (see
+    #: `breezy.runtime.backtest_order_guard`).
+    #:
+    #: `True` is reachable only by writing it at a call site, which is an
+    #: explicit operator act on the record. A test asserts the default on a
+    #: bare `RiskLimits()` and on all three strategy configs.
+    allow_short: bool = False
     allow_overlapping_exclusive_yes: bool = False
 
 
@@ -78,7 +100,42 @@ class PortfolioSnapshot:
     equity: float = 10_000.0
 
     def net_qty(self, instrument_id: str) -> float:
+        """Settled position PLUS signed working orders.
+
+        The right quantity for every EXPOSURE question (notional caps,
+        exclusivity, position caps): a working buy is exposure we have already
+        committed to and must not double up on.
+
+        The WRONG quantity for the close-only guard -- see
+        :meth:`settled_qty`.
+        """
         return self.position_qty.get(instrument_id, 0.0) + self.pending_qty.get(instrument_id, 0.0)
+
+    def settled_qty(self, instrument_id: str) -> float:
+        """Position actually HELD -- no working orders of any sign.
+
+        The only quantity a sell can be netted against. `pending_qty` is
+        signed and includes pending BUYS, so a working buy inflates
+        :meth:`net_qty` and made a sell that opens a short look like a
+        reduction (10 held + 50 working buy = 60, against which a 40-lot sell
+        "reduces"; it opens a 30-lot naked short the moment it fills, and the
+        buy may never fill at all).
+
+        Symmetrically it excludes pending SELLS. That is a KNOWN second-order
+        gap, recorded rather than papered over: two sells that are each within
+        the settled long are jointly naked, and this method cannot see the
+        first one. It is not fixable from `pending_qty`, which is a single
+        SIGNED net per instrument -- a +50 net can be a 60-lot buy against a
+        10-lot sell, so the sell component is not recoverable here. What
+        covers it today: every strategy skips evaluation entirely while any
+        order is working (`cache.orders_open`), and in backtests
+        :class:`breezy.runtime.backtest_order_guard.BacktestOrderGuard` sums
+        working sell quantity straight from the cache at submit time. The
+        first of those is incidental and the second is backtest-only, so a
+        change that widens the portfolio snapshot must re-examine this -- see
+        the plan's P4.
+        """
+        return self.position_qty.get(instrument_id, 0.0)
 
     def open_position_count(self) -> int:
         return sum(1 for q in self.position_qty.values() if abs(q) > 1e-9)
@@ -92,9 +149,20 @@ class RiskDecision:
 
 
 class RiskManager:
-    def __init__(self, limits: RiskLimits, contracts: Mapping[str, MispricingContract]) -> None:
+    def __init__(
+        self,
+        limits: RiskLimits,
+        contracts: Mapping[str, MispricingContract],
+        *,
+        refusals: RefusalCounter | None = None,
+    ) -> None:
         self.limits = limits
         self.contracts = contracts
+        #: Shared with the strategy's DECISION layer, which refuses a
+        #: `SHORT_YES` intent before it can reach here at all -- see
+        #: `breezy.strategy.weather_common.refusals`. Optional so the pure
+        #: screening tests need not construct one; a strategy always passes it.
+        self.refusals = RefusalCounter() if refusals is None else refusals
 
     def quote_tradable(
         self, quote: MarketQuote, price_scale: float, now_ts_age_minutes: float,
@@ -173,12 +241,22 @@ class RiskManager:
             return RiskDecision(False, "stale_forecast")
         if abs(edge) < limits.min_model_edge:
             return RiskDecision(False, "edge_below_minimum")
+        # CLOSE-ONLY, and the only naked-short control there is (see
+        # `RiskLimits.allow_short`). Netted against SETTLED position --
+        # `settled_qty`, never `net_qty`: `net_qty` includes signed pending
+        # quantity, so a working BUY inflated it and let a sell that opens a
+        # short pass as a "reduction". A pending buy is not inventory.
         if (
             signed_qty_delta < 0
             and not limits.allow_short
-            and portfolio.net_qty(contract.instrument_id) + signed_qty_delta < -1e-9
+            and portfolio.settled_qty(contract.instrument_id) + signed_qty_delta < -1e-9
         ):
-            return RiskDecision(False, "shorts_disabled")
+            # Counted, because this refusal can silence a whole strategy: one
+            # producing no trades because it is structurally disabled looks
+            # exactly like one producing no trades because the market is
+            # efficient. See `weather_common.refusals`.
+            self.refusals.record(SHORTS_DISABLED)
+            return RiskDecision(False, SHORTS_DISABLED)
 
         # PRESERVED DEFECT -- AWAITING AN OPERATOR RULING. DO NOT "FIX" SILENTLY.
         # The third argument is the quote's age in minutes, and it is hardcoded

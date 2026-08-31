@@ -30,6 +30,7 @@ from datetime import datetime
 from typing import TYPE_CHECKING
 
 from breezy.strategy.weather_common.models import SideIntent, SignalDecision
+from breezy.strategy.weather_common.refusals import SHORTS_DISABLED, RefusalCounter
 from breezy.strategy.weather_common.risk import edge_after_costs
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
@@ -52,6 +53,7 @@ def evaluate_instrument(
     engine: WeatherProbabilityEngine,
     risk: RiskManager,
     cfg: ForecastMispricingConfig,
+    refusals: RefusalCounter | None = None,
 ) -> SignalDecision | None:
     """Return the desired position change, or ``None`` for "do nothing"."""
     if forecast.is_stale(now, cfg.stale_forecast_hours):
@@ -140,7 +142,15 @@ def evaluate_instrument(
         intent = SideIntent.LONG_YES
         edge = long_edge
         mkt = ask_p
-    elif short_edge >= cfg.min_entry_edge and cfg.allow_short:
+    elif short_edge >= cfg.min_entry_edge:
+        # Same outcome as the old `and cfg.allow_short` conjunct -- a
+        # suppressed short fell through to the `else` and returned None either
+        # way -- but now the refusal is COUNTED rather than indistinguishable
+        # from "no edge". See `weather_common.refusals`.
+        if not cfg.allow_short:
+            if refusals is not None:
+                refusals.record(SHORTS_DISABLED)
+            return None
         intent = SideIntent.SHORT_YES
         edge = short_edge
         mkt = bid_p

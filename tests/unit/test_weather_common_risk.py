@@ -12,8 +12,12 @@ from __future__ import annotations
 import datetime as dt
 
 from breezy.domain.weather_bucket_facts import Measure, WeatherBucketFacts
+from breezy.strategy.calibration_mean_reversion.config import CalibrationMeanReversionConfig
+from breezy.strategy.forecast_mispricing.config import ForecastMispricingConfig
+from breezy.strategy.forecast_revision.config import ForecastRevisionConfig
 from breezy.strategy.weather_common.bucket_contract import MispricingContract
 from breezy.strategy.weather_common.models import MarketQuote
+from breezy.strategy.weather_common.refusals import SHORTS_DISABLED, RefusalCounter
 from breezy.strategy.weather_common.risk import (
     PortfolioSnapshot,
     RiskLimits,
@@ -209,3 +213,224 @@ def test_shorting_a_flat_instrument_is_blocked_when_shorts_are_disabled() -> Non
 
     assert decision.allowed is False
     assert decision.reason == "shorts_disabled"
+
+
+# ---------------------------------------------------------------------------
+# Close-only: the ONLY naked-short control there is
+# ---------------------------------------------------------------------------
+#
+# `nautilus_trader==1.231.0` denies no naked short of its own:
+# `risk/engine.pyx:974-985` exempts a position-REDUCING sell outright, and a
+# position-OPENING sell is denied only by `CUM_NOTIONAL_EXCEEDS_FREE_BALANCE`,
+# itself gated on `not allow_borrowing` -- and on a CASH account
+# `CashAccount.balance_impact` returns +notional for a SELL, so that gate
+# cannot fire either. These tests therefore pin a control with nothing behind
+# it, not a defence-in-depth layer.
+
+
+def test_shorting_from_flat_is_refused_under_the_bare_default_limits() -> None:
+    """The DEFAULT limits must refuse it -- no argument, no override, no config."""
+    contract = _contract("A", lower_f=80, upper_f=None)
+    risk = RiskManager(RiskLimits(), {"A": contract})
+
+    decision = risk.evaluate_order(
+        contract=contract,
+        signed_qty_delta=-10.0,
+        hours_to_settlement=24.0,
+        forecast_age_hours=0.0,
+        edge=0.50,
+        portfolio=PortfolioSnapshot(),
+        quote=_quote(),
+    )
+
+    assert decision.allowed is False
+    assert decision.reason == "shorts_disabled"
+
+
+def test_a_pending_buy_cannot_unlock_a_sell_that_opens_a_short() -> None:
+    """Close-only is evaluated against SETTLED position, never against `net_qty`.
+
+    `net_qty` is `position_qty + pending_qty` and `pending_qty` is SIGNED, so a
+    pending BUY inflates it. Reading the guard off `net_qty` let a sell that
+    takes the settled position below zero pass: 10 held + 50 pending buy = 60,
+    against which a 40-lot sell "reduces". It does not -- it opens a 30-lot
+    naked short the instant it fills, and the pending buy may never fill at
+    all. A pending buy is not inventory.
+    """
+    contract = _contract("A", lower_f=80, upper_f=None)
+    risk = RiskManager(RiskLimits(allow_short=False), {"A": contract})
+    portfolio = PortfolioSnapshot(
+        position_qty={"A": 10.0},
+        pending_qty={"A": 50.0},  # a WORKING BUY, not inventory
+    )
+
+    decision = risk.evaluate_order(
+        contract=contract,
+        signed_qty_delta=-40.0,
+        hours_to_settlement=24.0,
+        forecast_age_hours=0.0,
+        edge=0.50,
+        portfolio=portfolio,
+        quote=_quote(),
+    )
+
+    assert decision.allowed is False
+    assert decision.reason == "shorts_disabled"
+
+
+def test_a_sell_that_exactly_closes_a_long_is_allowed_at_the_boundary() -> None:
+    """Close-only must not become refuse-all: that strands every open position."""
+    contract = _contract("A", lower_f=80, upper_f=None)
+    risk = RiskManager(RiskLimits(), {"A": contract})
+    portfolio = PortfolioSnapshot(position_qty={"A": 10.0})
+
+    decision = risk.evaluate_order(
+        contract=contract,
+        signed_qty_delta=-10.0,  # exactly flat afterwards
+        hours_to_settlement=24.0,
+        forecast_age_hours=0.0,
+        edge=0.50,
+        portfolio=portfolio,
+        quote=_quote(),
+    )
+
+    assert decision.allowed is True
+    assert decision.clipped_quantity == -10.0
+
+
+def test_a_partial_close_is_allowed() -> None:
+    contract = _contract("A", lower_f=80, upper_f=None)
+    risk = RiskManager(RiskLimits(), {"A": contract})
+    portfolio = PortfolioSnapshot(position_qty={"A": 10.0})
+
+    decision = risk.evaluate_order(
+        contract=contract,
+        signed_qty_delta=-4.0,
+        hours_to_settlement=24.0,
+        forecast_age_hours=0.0,
+        edge=0.50,
+        portfolio=portfolio,
+        quote=_quote(),
+    )
+
+    assert decision.allowed is True
+    assert decision.clipped_quantity == -4.0
+
+
+def test_a_sell_one_contract_past_flat_is_refused_at_the_boundary() -> None:
+    contract = _contract("A", lower_f=80, upper_f=None)
+    risk = RiskManager(RiskLimits(), {"A": contract})
+    portfolio = PortfolioSnapshot(position_qty={"A": 10.0})
+
+    decision = risk.evaluate_order(
+        contract=contract,
+        signed_qty_delta=-11.0,  # one contract past flat
+        hours_to_settlement=24.0,
+        forecast_age_hours=0.0,
+        edge=0.50,
+        portfolio=portfolio,
+        quote=_quote(),
+    )
+
+    assert decision.allowed is False
+    assert decision.reason == "shorts_disabled"
+
+
+def test_a_shorts_disabled_refusal_is_recorded_on_the_counter() -> None:
+    """A refusal nobody can count is a strategy that silently does nothing."""
+    contract = _contract("A", lower_f=80, upper_f=None)
+    counter = RefusalCounter()
+    risk = RiskManager(RiskLimits(), {"A": contract}, refusals=counter)
+
+    risk.evaluate_order(
+        contract=contract,
+        signed_qty_delta=-10.0,
+        hours_to_settlement=24.0,
+        forecast_age_hours=0.0,
+        edge=0.50,
+        portfolio=PortfolioSnapshot(),
+        quote=_quote(),
+    )
+
+    assert counter.count(SHORTS_DISABLED) == 1
+
+
+def test_an_allowed_order_records_no_refusal() -> None:
+    contract = _contract("A", lower_f=80, upper_f=None)
+    counter = RefusalCounter()
+    risk = RiskManager(RiskLimits(), {"A": contract}, refusals=counter)
+
+    decision = risk.evaluate_order(
+        contract=contract,
+        signed_qty_delta=10.0,
+        hours_to_settlement=24.0,
+        forecast_age_hours=0.0,
+        edge=0.50,
+        portfolio=PortfolioSnapshot(),
+        quote=_quote(),
+    )
+
+    assert decision.allowed is True
+    assert counter.count(SHORTS_DISABLED) == 0
+
+
+# ---------------------------------------------------------------------------
+# `allow_short=True` is unreachable from any DEFAULT construction path
+# ---------------------------------------------------------------------------
+
+
+def test_bare_risk_limits_forbid_shorting() -> None:
+    assert RiskLimits().allow_short is False
+
+
+def test_no_strategy_config_default_permits_shorting() -> None:
+    """All three strategy configs, at their defaults, off the same rule.
+
+    Asserted on the config OBJECTS rather than on source text: a default that
+    flips back to `True` fails here regardless of how it is spelled.
+    """
+    assert CalibrationMeanReversionConfig(instrument_ids=()).allow_short is False
+    assert ForecastMispricingConfig(instrument_ids=()).allow_short is False
+    assert ForecastRevisionConfig(instrument_ids=()).allow_short is False
+
+
+# ---------------------------------------------------------------------------
+# `exclusive_conflict` is UNTOUCHED by the close-only fix -- characterization
+# ---------------------------------------------------------------------------
+
+
+def test_exclusive_conflict_still_counts_a_pending_long_on_a_sibling_bucket() -> None:
+    """Deliberately still `net_qty`, pending included, and this is correct.
+
+    The close-only fix narrows the SHORT guard to settled position only. It
+    must not narrow this one: a working BUY on a sibling bucket is exactly the
+    second long-YES on one climate day that this rule exists to prevent, and
+    waiting for it to fill before noticing would be too late.
+    """
+    bucket_a = _contract("A", lower_f=80, upper_f=None)
+    bucket_b = _contract("B", lower_f=85, upper_f=None)
+    risk = RiskManager(RiskLimits(), {"A": bucket_a, "B": bucket_b})
+    portfolio = PortfolioSnapshot(pending_qty={"A": 10.0})  # working BUY, unfilled
+
+    decision = risk.evaluate_order(
+        contract=bucket_b,
+        signed_qty_delta=5.0,
+        hours_to_settlement=24.0,
+        forecast_age_hours=0.0,
+        edge=0.50,
+        portfolio=portfolio,
+        quote=_quote(),
+    )
+
+    assert decision.allowed is False
+    assert decision.reason == "exclusive_bucket_conflict"
+
+
+def test_exclusive_conflict_ignores_a_reducing_or_short_delta() -> None:
+    bucket_a = _contract("A", lower_f=80, upper_f=None)
+    bucket_b = _contract("B", lower_f=85, upper_f=None)
+    risk = RiskManager(RiskLimits(), {"A": bucket_a, "B": bucket_b})
+    portfolio = PortfolioSnapshot(position_qty={"A": 10.0, "B": 8.0})
+
+    assert risk.exclusive_conflict(bucket_b, -5.0, portfolio) is False
+    assert risk.exclusive_conflict(bucket_b, 5.0, portfolio) is True
