@@ -49,33 +49,60 @@ carried as `[V]` were false or miscounted and are corrected in section 9.1.
 
 > Running `breezy-trade` on a venue-configured host builds and starts one
 > Nautilus `TradingNode` that
-> **(a)** registers exactly one Polymarket.us **data** client and exactly one
-> Polymarket.us **execution** client;
+> **(a)** has, after `node.build()`, exactly one Polymarket.us data client and
+> exactly one Polymarket.us execution client **observably registered on the
+> node's own engines** — `node.kernel.exec_engine.registered_clients ==
+> [ClientId("POLYMARKET_US")]` and the registered client is an instance of
+> `PolymarketUSExecutionClient`;
 > **(b)** puts a non-`None`, `AccountType.CASH`, `USD`-denominated `Account`
 > for venue `POLYMARKET_US` into the Nautilus `Cache`, built from a live
 > `GET /v1/account/balances`, **before the trader starts**;
-> **(c)** completes native startup reconciliation from
-> `GET /v1/portfolio/positions`, `GET /v1/orders/open` and
-> `GET /v1/portfolio/activities` **or refuses to start the trader**, with no
-> path on which a venue position is absent from the cache and reconciliation
-> still reports success;
-> **(d)** answers **every one** of the eight order-lifecycle coroutines with a
-> named, counted, alerted `OrderDenied` and never an `OrderSubmitted`;
+> **(c)** hands the engine, from `GET /v1/portfolio/positions` and
+> `GET /v1/orders/open`, a report set in which **every** `PositionStatusReport`
+> and `OrderStatusReport` names an instrument already in the cache — and
+> otherwise **refuses the whole reconciliation and raises a CRITICAL alert**, so
+> that the native instrument-not-loaded fail-open, which has **five** identical
+> sites (`live/execution_engine.py:2396-2400`, `:2435-2439`, `:2473-2477`,
+> `:3057-3062`, `:3087-3092`), cannot silently pass a venue position through;
+> with `generate_missing_orders=True`
+> so that a reported position that survives that check is actually *entered
+> into* the cache rather than warned about;
+> **(d)** answers each of the **six** order-bearing lifecycle coroutines with
+> the denial event its command's order state can actually accept — `OrderDenied`
+> for the two submit paths, `OrderCancelRejected` / `OrderModifyRejected` for
+> the four cancel/modify paths — every one named, counted and alerted, and
+> never an `OrderSubmitted`;
 > **(e)** while `scan_write_egress(("src", "scripts"))` reports zero violations
 > outside the single V2-allowlisted path `exec/endpoints.py`, and zero V1 / V3 /
 > V4 violations anywhere, and `http.PERMITTED_METHODS` and
 > `signing.PERMITTED_METHODS` are still exactly `frozenset({"GET"})` and are
 > never rebound.
 
-**Falsifiers.** (a) `breezy-trade` is not an entry point, or the node it builds
-carries an empty `data_clients` or `exec_clients`. (b) `cache.account_for_venue`
-returns `None`, or an account in a currency other than `USD`, or the trader
-starts before either is true. (c) A venue position exists that is absent from
-the cache while reconciliation reports success. (d) Any lifecycle coroutine
-produces anything other than `OrderDenied`, or a denial that is not named,
-counted and alerted. (e) Any write-capable construct anywhere outside the one
-allowlisted file. **And, for all five: the suite passing green while the clause
-is unimplemented.**
+**Falsifiers.** (a) `breezy-trade` is not an entry point, or
+`registered_clients` is empty or holds a client of another type after
+`build()` — the case `live/node_builder.py:231-233` `[V]` produces silently
+when a factory name does not match its `exec_clients` key. (b)
+`cache.account_for_venue` returns `None`, or an account in a currency other
+than `USD`, or the trader starts before either is true. (c) A venue position
+report naming an uncached instrument reaches the engine, or a report set that
+passed the check leaves the cache flat. (d) Any of the six coroutines produces
+`OrderSubmitted`, or emits an event its command's order state rejects (which
+`execution/engine.pyx:1586-1594` `[V]` logs and discards, leaving the caller
+with no denial at all). (e) Any write-capable construct anywhere outside the
+one allowlisted file. **And, for all five: the suite passing green while the
+clause is unimplemented.**
+
+**One thing clause (c) does NOT claim, because Nautilus does not provide it.**
+"Refuses to start the trader" is **not** "refuses to start". When
+reconciliation fails, `NautilusKernel.start_async` returns at `:1028-1029` and
+`self._trader.start()` (`:1039`) is never reached `[V]` — but
+`TradingNode.run_async` then logs `RUNNING` (`live/node.py:352`) and awaits the
+engine queue tasks (`:357+`) `[V]`, so **the process daemonises with no
+trader**. There is no native abort. Breezy's compensations are stated in NS-5:
+a CRITICAL alert at the moment of refusal, and a latched refusal flag that
+`trade_cli` maps to a non-zero exit when `run()` finally returns. The residual —
+a live process with no trader between refusal and operator intervention — is
+named, not asserted away (OQ-9).
 
 **What this predicate deliberately does NOT claim.** No order is ever
 transmitted. No position is ever opened by Breezy. No PnL is ever realized. No
@@ -108,18 +135,24 @@ section 3 states the result.
 | 1 | The E0 path rule and the collection abort | `tests/conftest.py::pytest_sessionstart` and its existing `pytest.exit` (`:258`, `:268`); `find_execution_egress_modules` (`test_execution_egress_firewall_guard.py:447`); `scripts/ci/run_tests_no_egress.sh` | **all three already exist** — NS-0 wires them together |
 | 2 | `exec/__init__.py` | the E0 rule armed, or the first file in the directory lands unclassified | **NS-0, same commit** |
 | 3 | Every test run from NS-0 onward | an attested-and-substantiated OS egress block, because `exec/` is now non-empty | **NS-0**; CI already runs the suite this way (`.github/workflows/tests.yml:27`) |
-| 4 | Observed response shapes for balances / positions / open orders / activities | an authenticated read against the live venue, and a redaction-safe shape recorder | **NS-1** — extends `scripts/venue/polymarket_us_auth_smoke.py`, which already performs `GET /v1/portfolio/positions` (`:163`) and already has a shape-without-values recorder (`:955`) |
+| 4 | Observed response shapes for **balances, positions and activities** (three non-order paths) | an authenticated read against the live venue, and a recorder that emits **no values at all** — the existing `diagnose_frame_payload` publishes every scalar (`data.py:428-429` `[V]`) and is NOT reused | **NS-1** — extends `scripts/venue/polymarket_us_auth_smoke.py`, which already performs `GET /v1/portfolio/positions` (`:163`) |
+| 4b | The observed shape of `GET /v1/orders/open` | the same recorder **plus** the path constant, which cannot live in `scripts/venue/` without creating a second V2-allowlisted file (see NS-1 Barriers) | **NS-4's own operator step**, importing `ORDER_PATH_OPEN` from `exec/endpoints.py` — never a second allowlist entry |
 | 5 | The cage-constant equality pins | the nine rule constants, which all exist today | **NS-2** |
 | 6 | `build_trading_node_config` | native `TradingNodeConfig`; a `PolymarketUSDataClientConfig`, produced by the shipped `config_from_env` (`factories.py:197`); a settings loader for the trading role | **NS-3** (settings loader in the same increment) |
 | 7 | `breezy-trade` | a `[project.scripts]` table (`pyproject.toml:255`) and a `main()` | **NS-3** |
 | 8 | The node that actually runs | native `TradingNode`; `PolymarketUSLiveDataClientFactory` (`factories.py:320`); an exec factory | **NS-3** (data half), **NS-5** (exec half) |
+| 8b | An **observation** that composition succeeded | `node.build()` having run, plus `node.kernel` (a public instance attribute assigned at `live/node.py:71` `[V]`) and `exec_engine.registered_clients` (`execution/engine.pyx:212-221` `[V]`). `build()` (`live/node.py:272-281` `[V]`) constructs clients only — no connect, no socket, once both factories' transports are monkeypatched | **NS-3** (data), **NS-5** (exec) — both assert on the real node |
 | 9 | `exec/endpoints.py` | the B4/V2 narrowing, without which the file cannot land at all (`_ORDER_PATH_RE` matches `/v1/orders`, `/v1/orders/open`, `/v1/order/{id}`) | **NS-4, same commit** |
-| 10 | `exec/reports.py` fixtures | observed payload shapes — the SDK snapshot types are all `total=False`, so every field is optional and nothing can be assumed present | **NS-1** |
+| 10 | `exec/reports.py` fixtures | observed payload shapes — the SDK snapshot types are all `total=False`, so every field is optional and nothing can be assumed present. Fixtures are **hand-transcribed** from the evidence artifact into the test module; `docs/evidence/` is never read by code | **NS-1** (three paths), **NS-4's operator step** (open orders) |
+| 10b | `exec/reports.py` passing CI | a `pyproject.toml` `ignore_imports` entry — it imports the Nautilus report types, and `uv run lint-imports` runs in CI (`.github/workflows/tests.yml:37` `[V]`) | **NS-4, same commit** |
+| 10c | `generate_missing_orders=True` actually entering a reported position into the cache | the instrument in the cache — the reconciliation path logs at DEBUG and returns `True` when it is absent, at **five** sites (`live/execution_engine.py:2396-2400`, `:2435-2439`, `:2473-2477`, `:3057-3062`, `:3087-3092` `[V]`) | **NS-3** loads instruments through the data client's `PolymarketUSInstrumentProvider`; **NS-5** refuses any report set naming an uncached instrument |
 | 11 | A CALLER for the report mappers | a `LiveExecutionClient` whose report coroutines `LiveExecutionEngine` invokes | **NS-5** |
 | 12 | `exec/client.py` | the node config carrying its client config; the B6b narrowing; one new `ignore_imports` entry per new nautilus-importing module | **NS-3** (node) + **NS-5** (same commit) |
 | 13 | An alert sink **in the trading process** | `resolve_alert_sink` (`health.py:495`) plus a construction site inside this process — today it is constructed only in `ingest_runtime` (`composition.py:352`), so every "loud" failure this plan specifies would be log-only | **NS-5**, in `exec/factories.py` |
 | 14 | A true account in the cache | `_set_account_id` (`execution/client.pyx:148`) and `generate_account_state` (`:329`), both native; plus an observed balances shape | **NS-1** + **NS-5** |
-| 15 | A started trader | reconciliation returning `True` — the kernel returns without starting the trader otherwise (`system/kernel.py:1027-1029`, `:1040`) | **NS-5** |
+| 15 | A started trader | reconciliation returning `True` — otherwise `start_async` returns at `:1029` and `self._trader.start()` (`:1039`) is never reached `[V]` | **NS-5** |
+| 17 | `trade_cli` reading the refusal latch | a reachable latch. `LiveExecutionEngine.registered_clients` returns `ClientId`s only and there is no public `get_client` (`execution/engine.pyx:212-221` `[V]`), so the client OBJECT has no native accessor — the latch is a module-level object in `exec/client.py`, imported directly | **NS-5**, both halves. NS-3 ships a `False`-returning predicate with its own test, so NS-3 needs nothing later |
+| 16 | An operator learning that the trader did NOT start | an alert sink (row 13) **and** a non-zero exit — the process otherwise daemonises with no trader (`live/node.py:349-357` `[V]`) | **NS-3** (the exit path and its predicate), **NS-5** (the alert, the latch, and the predicate's real body) |
 
 **Rows that read "nothing" before this plan: two.** Row 4 (the mappers had no
 observed payload to map from — the predecessor deferred this to two open
@@ -128,6 +161,22 @@ container in the trading process at all). Both are closed by placing an
 increment **before** the artifact that needs it: NS-1 before NS-4, and the sink's
 construction site inside the same increment as its only consumer.
 
+**Six rows added in revision 2, each closing a container the first revision
+asserted rather than checked.** Row 4b: revision 1 put an order-path literal in
+`scripts/venue/`, which would have created a *second* V2-allowlisted file and
+falsified goal clause (e) — the container for that literal is `exec/endpoints.py`,
+which NS-4 builds, so the capture that needs it moves after NS-4. Row 8b:
+revision 1 had no observation of composition at all, only a three-assertion
+inference chain, because ledger claim F-17 wrongly said no accessor existed.
+Row 10b: `exec/reports.py` had no `lint-imports` container and NS-4 had no Files
+section. Row 10c: `generate_missing_orders` cannot enter a position into the
+cache if the instrument is not loaded, and nothing in revision 1 established
+that it was. Row 16: revision 1 said "refuses to start the trader" and treated
+that as sufficient; the process actually daemonises, so *learning about it* is
+itself an artifact needing a container. Row 17: the latch that row 16 depends on
+has no native accessor, which is the second-order container question row 16
+would otherwise have left unasked.
+
 ---
 
 ## 3. Dependency check — performed after ordering
@@ -135,10 +184,10 @@ construction site inside the same increment as its only consumer.
 | Increment | Depends on | All earlier? |
 |---|---|---|
 | **NS-0** arm the firewall | nothing in this plan | — |
-| **NS-1** read-only shape capture | nothing in this plan (script + operator credentials already exist) | — |
-| **NS-2** cage + permit strengthening | nothing in this plan | — |
-| **NS-3** the trading process | nothing in this plan | — |
-| **NS-4** `exec/endpoints.py` + `exec/reports.py` | NS-0 (E0 rule armed before the second and third `exec/` files land), NS-1 (shapes) | **yes** |
+| **NS-1** read-only shape capture, three non-order paths | nothing in this plan. **Checked against NS-1's own Barriers paragraph**, which is where revision 1's undeclared dependency hid: with `/v1/orders/open` removed, no path in NS-1 matches `_ORDER_PATH_RE` (`/v\d+/orders?\b` `[V]`), so NS-1 needs no allowance from NS-4 | — |
+| **NS-2** cage strengthening + the issuer barrier | nothing in this plan | — |
+| **NS-3** the trading process | nothing in this plan. **Checked against its own Files and Barriers:** the exit-code contract names a refusal predicate whose real body arrives in NS-5, but NS-3 ships that predicate returning `False` with its own test, so no artifact NS-3 needs is built later | — |
+| **NS-4** `exec/endpoints.py` + `exec/reports.py` (+ its operator step for the open-orders shape) | NS-0 (E0 rule armed before the second and third `exec/` files land), NS-1 (three shapes) | **yes** |
 | **NS-5** `exec/client.py` + config + factory | NS-0, NS-2 (pins are the baseline the B6b narrowing is measured against), NS-3 (the node), NS-4 (the mappers and the endpoint table) | **yes** |
 
 **Result: no increment depends on a later one.** NS-1 and NS-2 are independent of
@@ -146,6 +195,15 @@ everything and of each other; NS-1 is placed second only because it is
 operator-run and its latency should overlap the code work. The chain that
 carries the goal state is NS-0 → NS-3 → NS-4 → NS-5, with NS-1 feeding NS-4 and
 NS-2 feeding NS-5.
+
+**How this table is now checked, because revision 1's version was wrong.** It
+said NS-1 depended on "nothing in this plan" while NS-1's own Barriers paragraph
+required an allowance NS-4 introduces — the predecessor's exact failure, a table
+written and not read. The check performed for revision 2 is mechanical: for each
+increment, re-read **its own Files and Barriers paragraphs** and list every
+artifact named there that this plan creates. That is what surfaced the
+`/v1/orders/open` literal, and it is why the open-orders capture is now a step
+*inside* NS-4 rather than a forward dependency of NS-1.
 
 ---
 
@@ -161,36 +219,51 @@ still missing after it. This is the check, not a summary of it.
   running the whole suite and printing red afterwards. Missing: everything.
 - **After NS-1**: still nothing of the predicate holds, and no line of `src/`
   changed. What is added is the only input clauses (b) and (c) cannot be built
-  without: the observed field names and types of the four authenticated
-  responses. Without it, NS-4's mappers would be written against `total=False`
-  TypedDicts in which every field is optional, so every real record would refuse
-  and the process would reconcile nothing. Missing: everything else.
-- **After NS-2**: still nothing of the predicate holds. What is added is that the
-  cage cannot be *loosened* by a one-token diff, that `consume()` cannot be
-  satisfied by a lying `Decimal` subclass, that a permit cannot be minted from
-  any module in the tree, and that renewing a permit no longer resets the
-  operator's session budget. Everything NS-3..NS-5 does is measured against these
-  pins. Missing: the process, the reports, the client.
+  without: the observed field names, types and nesting of **three** of the four
+  authenticated responses — balances, positions, activities. Without it, NS-4's
+  mappers would be written against `total=False` TypedDicts in which every field
+  is optional, so every real record would refuse and the process would reconcile
+  nothing. The fourth (`/v1/orders/open`) is deliberately **not** here: its path
+  literal has no lawful home until `exec/endpoints.py` exists. Missing:
+  everything else.
+- **After NS-2**: still nothing of the predicate holds, **and `safety.py` is not
+  opened at all**. What is added is that the cage cannot be *loosened* — or
+  silently *narrowed* — by a one-token diff, that a permit cannot be minted from
+  any module in the tree (`== 0` callers, no allowlist), and that a module
+  reaching the venue from outside the package is classified. The two `safety.py`
+  internals revision 1 admitted here are deferred with the authority model
+  (section 8), because both are reachable only through a capability this plan
+  pins at zero. Everything NS-3..NS-5 does is measured against these pins.
+  Missing: the process, the reports, the client.
 - **After NS-3**: clause **(a) half** holds — a `TradingNode` for the trading
   role exists, starts from `breezy-trade`, and carries exactly one Polymarket.us
   data client. `exec_clients` is still an explicit `{}`. Missing: (a) exec half,
   (b), (c), (d). This is the first increment whose output is a thing that *runs*.
 - **After NS-4**: no clause completes, and no capability was added. What is added
   is the data every later clause consumes: the frozen `(method, path-template)`
-  table for the read surface, and pure venue-JSON to Nautilus-report mappers
-  with no caller yet. Clause **(e)** is now non-trivially true for the first
-  time: the V2 allowlist exists and contains exactly one file. Missing: (a) exec
-  half, (b), (c), (d).
-- **After NS-5**: the whole predicate holds. Clause (a) completes (the exec
-  client is registered and constructed), (b) holds (`_set_account_id` then
-  balances then `generate_account_state` then a cache assertion Breezy owns),
-  (c) holds (reconciliation is driven from real GETs and a discrepancy fails
-  reconciliation rather than warning), (d) holds (all eight coroutines deny),
-  (e) still holds (nothing NS-5 adds is write-capable). **Nothing is missing from
-  the predicate.**
+  table for the read surface, pure venue-JSON to Nautilus-report mappers with no
+  caller yet, and — via NS-4's own operator step, which imports the path constant
+  rather than restating it — the fourth observed shape. Clause **(e)** is now
+  non-trivially true for the first time: the V2 allowlist exists and contains
+  exactly one file. Missing: (a) exec half, (b), (c), (d).
+- **After NS-5**: the whole predicate holds. Clause (a) completes and is
+  **observed** — `node.build()` runs in the test and
+  `kernel.exec_engine.registered_clients` is read directly, which is the only
+  check that catches `node_builder.py:231-233`'s silent zero-client build.
+  (b) holds (`_set_account_id`, then balances, then `generate_account_state`,
+  then a cache assertion Breezy owns). (c) holds in the form the predicate now
+  states: every position report Breezy hands over names a cached instrument or
+  the whole set is refused with a CRITICAL alert, and `generate_missing_orders=True`
+  makes a surviving report actually enter the cache. (d) holds for the six
+  order-bearing coroutines, each with the event its command's order state can
+  accept. (e) still holds — nothing NS-5 adds is write-capable. **Nothing is
+  missing from the predicate**, and two things the predicate deliberately no
+  longer claims (a post-reconciliation cache comparison; "the process refuses to
+  start") are named in OQ-9 and clause (c)'s note rather than quietly assumed.
 
 **Coverage.** (a) from NS-3 + NS-5. (b) from NS-1 + NS-4 + NS-5. (c) from NS-1 +
-NS-4 + NS-5. (d) from NS-5. (e) from NS-0 + NS-2 + NS-4 + NS-5.
+NS-3 (instrument loading) + NS-4 + NS-5. (d) from NS-5. (e) from NS-0 + NS-2 +
+NS-4 + NS-5.
 
 **Send column.** NS-0 none; NS-1 GET (operator-run script, already permitted);
 NS-2 none; NS-3 GET + WS (the same surface the recorder already uses); NS-4 GET;
@@ -204,7 +277,7 @@ attribute.**
 ```
 src/breezy/adapters/polymarket_us/
     http.py  transport.py  signing.py     <- UNCHANGED, BYTE-FOR-BYTE. GET-only.
-    safety.py                             <- NS-2: type-exactness, session-budget carry-forward
+    safety.py                             <- UNCHANGED. Its two internal defects are deferred (8)
     factories.py                          <- UNCHANGED (its own no-exec-factory barrier stays TRUE)
     exec/
         __init__.py       (NS-0)  docstring only; its existence arms the E0 rule
@@ -249,26 +322,60 @@ Rationale, and it is why the two shapes differ in the first place: the ingest
 `@contextmanager` exists to own **non-node process resources** with teardown — a
 SQLite store, shared ingest state, an alert sink (`composition.py:313-353`
 `[V]`). The quote-tape process owns none of those and therefore has no
-contextmanager. The trading process owns none of those either: its only such
-resource is the alert sink, and the sink is constructed by, and torn down by,
-the execution client (NS-5), because Nautilus gives an exec client exactly one
-composition seam — the factory — and no accessor by which a caller could reach
-the constructed client to inject one afterwards (`LiveExecutionEngine` exposes
-`registered_clients` and `_clients` only; `TradingNode` exposes `cache`,
-`portfolio`, `trader` and no kernel/engine accessor `[V]`).
+contextmanager. The trading process owns one: the alert sink. It is taken as a
+**constructor parameter defaulting to `None`**, resolved by
+`resolve_alert_sink()` when unset — the pattern already established at
+`strategy/weather_common/refusals.py:123` `[V]` — so production resolves one
+sink per client and a test injects a recorder without monkeypatching anything.
+
+**One function is split out of the CLI, and only one:**
+`build_trading_node(config, node_factory=TradingNode) -> Node`, mirroring
+`composition.build_ingest_node` (`composition.py:462-486` `[V]`), which exists
+for exactly this reason — it returns a node the caller may *inspect* before
+deciding to run it. `trade_cli._run_node` calls it, then `node.run()`, and
+always disposes. Without that split, every composed-node RED below would have to
+call `run()`.
+
+The trading process owns a **second** non-node resource: the refusal latch, a
+module-level object in `exec/client.py` that `trade_cli` reads after `run()`
+returns. It is not a contextmanager resource — nothing needs closing — and the
+reason it is module-level rather than reached through the node is stated in NS-5
+rule 7: `registered_clients` exposes `ClientId`s only and there is no public
+`get_client`, so the alternative was an engine private.
+
+**Composition is OBSERVED, not inferred — revision 1 had this backwards.**
+Revision 1 asserted (ledger claim F-17) that `TradingNode` exposed no kernel or
+engine accessor, and built a three-assertion inference chain around that
+absence. **The claim was false.** `self.kernel = NautilusKernel(...)` is
+assigned in `TradingNode.__init__` (`live/node.py:71` `[V]`) — a public
+*instance* attribute, invisible to the class-level `dir()` the claim rested on.
+So `node.kernel.exec_engine.registered_clients` (`system/kernel.py:906-915`;
+`execution/engine.pyx:212-221` `[V]`) resolves, and composition can be read off
+the node itself. The inference chain was not merely unnecessary, it was
+**incapable of detecting the failure that matters**: `build_exec_clients` takes
+`name = parts.partition("-")[0]` (`live/node_builder.py:220` `[V]`) and, when no
+factory is registered under that name, logs an error and `continue`s
+(`:231-233` `[V]`) — the node finishes `build()` with **zero** exec clients
+while every link in the chain passes.
 
 **Consequence for every RED in this plan, stated once here so no increment has
-to restate it:** the composed-node evidence is *structural* and is taken from a
-node that is **constructed and never built or run** — exactly the technique
-`tests/contract/test_node_composition_contract.py` already uses and asserts
-(`:135-143`, and `test_building_the_runtime_and_node_opens_no_socket` at `:432`
-`[V]`). `node.build()` constructs the venue clients, which construct a
-`nautilus_pyo3.HttpClient` — blocked in tests by barrier N1 — so **no test in
-this plan calls `node.build()` or `node.run()`.** Behavioural evidence is taken
-one level down, against the real `LiveExecutionEngine` and `Cache` from
-`nautilus_trader.test_kit.stubs`, which is already the established pattern in
-this repo (13 test modules use `TestComponentStubs` `[V]`). NS-5's RED list
-states the chain that joins the two levels without a gap.
+to restate it:** composed-node REDs construct a real `TradingNode`, call
+`node.build()`, and read `kernel.exec_engine.registered_clients` /
+`kernel.data_engine.registered_clients`. `build()` (`live/node.py:272-281`
+`[V]`) calls only `build_data_clients` and `build_exec_clients` — it connects
+nothing and opens no socket **provided both factories' transports and credential
+loaders are monkeypatched**, which is the technique
+`tests/unit/test_polymarket_us_factories.py:181-182` `[V]` already uses to
+defeat the pyo3 block. **`node.run()` is still never called** — that is where
+the event loop, the connections and the sockets are
+(`live/node.py:338-363` `[V]`). Behavioural evidence below the node is taken
+against the real `LiveExecutionEngine` and `Cache` from
+`nautilus_trader.test_kit.stubs`, already the established pattern here (13 test
+modules use `TestComponentStubs` `[V]`). The no-socket assertion itself is
+carried over verbatim from
+`tests/contract/test_node_composition_contract.py:432` `[V]`, and now covers a
+node that has been **built**, not merely constructed — a strictly stronger
+statement than the one revision 1 borrowed.
 
 ---
 
@@ -278,10 +385,12 @@ states the chain that joins the two levels without a gap.
 
 | Capability | Native anchor `[V]` | Breezy's job |
 |---|---|---|
-| The process container | `TradingNode` (`live/node.py`), kernel lifecycle (`system/kernel.py`), `add_data_client_factory` (`live/node.py:230`), `add_exec_client_factory` (`:251`) | **configure and instantiate one** — a config builder, a CLI, an entry point. No runtime. |
-| Execution-client machinery | `LiveExecutionClient`: 8 coroutines to implement (`live/execution_client.py:598-636`), `generate_mass_status` (`:440-514`), `_await_account_registered` (`:534-567`) | subclass; implement the seams |
-| Lifecycle event construction and msgbus routing | `execution/client.pyx`: `generate_account_state` (`:329`), `generate_order_denied` (`:370`) | call them |
-| Startup reconciliation and its fail-closed gate | `live/execution_engine.py:1680-1730`; `system/kernel.py:1027-1029` — reconciliation false means the kernel returns and **`self._trader.start()` (`:1040`) is never reached** | supply reports; assert the match ourselves |
+| The process container | `TradingNode` (`live/node.py`), kernel lifecycle (`system/kernel.py`), `add_data_client_factory` (`live/node.py:230`), `add_exec_client_factory` (`:251`), and `node.kernel` (`:71`) for reading back what was composed | **configure and instantiate one** — a config builder, a CLI, an entry point. No runtime. |
+| Execution-client machinery | `LiveExecutionClient`: 8 coroutines to implement — 2 lifecycle, **6 order-bearing** (`live/execution_client.py:598-636`) — `generate_mass_status` (`:440-514`), `_await_account_registered` (`:534-567`) | subclass; implement the seams |
+| Lifecycle event construction and msgbus routing | `execution/client.pyx`: `generate_account_state` (`:329`), `generate_order_denied` (`:370-406`), `generate_order_modify_rejected` (`:531-537`), `generate_order_cancel_rejected` (`:575-581`) | call them — **and pick the one the target order's state can accept** (F-23), which is the whole content of NS-5 rule 5 |
+| Commission on a reconciliation-inferred fill | `ExecutionClient.calculate_commission` (`execution/client.pyx:165-194`), an override hook returning `None` by default; the helper substitutes `Money(0, quote_currency)` (`live/reconciliation.py:503-507`) | **deliberately NOT overridden** — no read here establishes the fee model, and nothing in NO-SEND consumes PnL. Recorded as a carry-forward constraint (8.1 row 8), not left silent |
+| Startup reconciliation and its **partial** fail-closed gate | `live/execution_engine.py:1680-1732`; `system/kernel.py:1028-1029` — reconciliation false means `start_async` returns and **`self._trader.start()` (`:1039`) is never reached**. It is NOT a process abort: `run_async` logs `RUNNING` and awaits the queue tasks anyway (`live/node.py:349-357` `[V]`) | supply reports; **check our own inputs before handing them over**, and alert + latch when we refuse |
+| Entering a reported venue position into the cache | `generate_missing_orders=True` — the native default (`live/config.py:183` `[V]`): the engine computes the difference, synthesises a reconciliation order report and applies it (`live/execution_engine.py:2511-2563` `[V]`) | **enable it.** Revision 1 pinned it `False`, inherited from a plan whose settlement exit needed that; with settlement deferred, `False` means every venue position is warned about and skipped (`:2501-2509` `[V]`) |
 | Account registration in the cache | `_set_account_id` (`execution/client.pyx:148-152`), `_await_account_registered` | set the id FIRST, then assert the cache |
 | Order cache, position tracking, the order state machine | `execution/client.pyx`, `model/orders/base.pyx` | obey |
 | Alert sink, webhook and logging | `runtime/health.py`: `resolve_alert_sink` (`:495`), `emit_alert` (`:514`), `WebhookAlertSink` (`:450`) with `close()` (`:479`) | **construct one in this process** — that is the whole gap |
@@ -299,7 +408,7 @@ states the chain that joins the two levels without a gap.
 | `Ed25519RequestSigner` | `signing.py:185+`; `PERMITTED_METHODS = {"GET"}` at `:84` | signing every report GET | **BYTE-IDENTICAL** |
 | `NautilusHttpTransport` | `transport.py`; the GET-only closure at `:129-148` | all report traffic | **BYTE-IDENTICAL** |
 | `PolymarketUSHttpClient` | `http.py:94-270`; `get_authenticated` at `:116`; `PERMITTED_METHODS = {"GET"}` at `:64` | balances / positions / open orders / activities | **BYTE-IDENTICAL** |
-| `QUOTA_KEY_PORTFOLIO` | `transport.py:93`, in `PERMITTED_QUOTA_KEYS` (`:98`), budgeted at 12/min | every exec-side read | **already exists, already permitted, currently unused in `src/`** — no new quota key, no widening |
+| `QUOTA_KEY_PORTFOLIO` | `transport.py:93`, in `PERMITTED_QUOTA_KEYS` (`:98`), budgeted at 12/min | every exec-side read | **already exists and is already permitted** — no new quota key, no widening. Revision 1 called it "unused"; it has three live callers, all in `scripts/venue/polymarket_us_auth_smoke.py:1018,1062,1122` `[V]`, the very file NS-1 extends. It is unused **in `src/`**, which is the claim that matters, and NS-1's reads share its budget |
 | `PolymarketUSInstrumentProvider` | `provider.py` | the instrument cache both clients share | unchanged |
 | `PolymarketUSCredentials` + loader | `credentials.py`; used at `factories.py:364` | the exec client's own credential load | unchanged |
 | Data-client factory shape | `factories.py:320-437` | the template `exec/factories.py` mirrors | unchanged |
@@ -323,10 +432,29 @@ is used as-is.
 4. **`_query_account`.** It is *called* (`live/execution_client.py:332`) and
    never *defined* anywhere in the class `[V]` — an omission surfaces as an
    `AttributeError` inside a created task.
-5. **A Breezy-owned reconciliation match assertion.** See fact F-2.
+5. **A Breezy-owned precondition check on the reports it hands over.** Not a
+   post-reconciliation comparison — there is no seam for one (OQ-9). Nautilus
+   reports reconciliation success while the cache does not reflect the venue on
+   **at least eight** paths: instrument-not-loaded at **five** sites
+   (`:2396-2400`, `:2435-2439`, `:2473-2477`, `:3057-3062`, `:3087-3092`), a
+   quantity discrepancy under `generate_missing_orders=False` (`:2501-2509`), a
+   closed order whose reported `filled_qty` differs (`:3204-3214`), and a
+   `FillReport` whose `venue_order_id` has no `OrderStatusReport` (`:1881-1907`,
+   applied only inside the order loop). Facts F-2, F-18, F-19 and F-21. Two are
+   closed by configuration (F-2 by `generate_missing_orders=True`), five by the
+   one input precondition, and one is accepted and recorded (OQ-10).
 6. **An alert sink construction site in this process.**
 7. **Observed response shapes.** The venue SDK's TypedDicts are `total=False`
    throughout, so the schema constrains nothing.
+8. **A value-free response-shape recorder.** The existing one publishes every
+   scalar (F/B-23) and cannot be pointed at an account balance.
+9. **A process-level refusal signal.** Nautilus stops the *trader* on a failed
+   reconciliation and leaves the *process* running (F-5 plus `live/node.py:349-357`),
+   and the execution client object has no public accessor from the engine
+   (`registered_clients` returns `ClientId`s; no `get_client` exists `[V]`). So a
+   module-level latch in `exec/client.py` plus a `trade_cli` predicate is
+   authored — the smallest thing that turns a native silence into an exit code,
+   and the only alternative was reaching into `exec_engine._clients`.
 
 ---
 
@@ -389,6 +517,16 @@ non-vacuity proof.
    sessionstart** — asserted by running a child process and checking it never
    reaches collection, not by asserting one test failed. *Red today:* conftest
    never consults the rule, so the child runs the whole suite.
+3b. A planted exec file with `BREEZY_TEST_OS_EGRESS_BLOCK=1` attested but **no
+   real block** also aborts. *Red today:* nothing checks. **This is the half
+   revision 1 left untested**: it wrote "attested AND substantiated" into NS-0's
+   goal while RED 3 covered only the unattested case, so a lying attestation
+   passed. The sessionstart hook therefore calls `probe_real_egress_canary()`
+   (`:387-413` `[V]`, which probes through the *original* pyo3 client and so is
+   unaffected by conftest's socket patch) whenever egress modules exist and the
+   attestation is present, and exits when the outcome is not `blocked`. Cost:
+   one outbound connect attempt to RFC 5737 TEST-NET-2 per session in which
+   `exec/` is non-empty — the same probe `test_n3` already makes, moved earlier.
 4. `find_execution_egress_modules()` on the shipped tree returns **exactly**
    `[exec/__init__.py under E0]` — the "currently empty" pin (`:592-594` `[V]`)
    inverts to an exact-set pin. *Red today:* the set is empty and the rule that
@@ -424,119 +562,156 @@ process that refuses every record reconciles nothing — clause (c) of the goal
 state would be unreachable. **This is the container-check row that read
 "nothing".**
 
-**Null hypothesis: the mechanism already exists.** The smoke script already
-performs `GET /v1/portfolio/positions` (`:163` `[V]`, and the 2026-08-30 runs
-record it returning 200 `[V]`), already redacts on two independent layers and
-refuses to emit a file if secret-derived material survives (`:497-720` `[V]`),
-and already contains a "describe one frame's shape without publishing nonscalar
-payloads" facility for WebSocket frames (`:955` `[V]`). **Absent: applying that
-facility to HTTP response bodies, and reading the other three endpoints.**
+**Scope: three paths, not four.** `GET /v1/account/balances`,
+`GET /v1/portfolio/positions`, `GET /v1/portfolio/activities`. **`GET /v1/orders/open`
+is deliberately excluded** — see Barriers. Its shape is captured by NS-4's own
+operator step, after `exec/endpoints.py` exists to hold the literal.
 
-**Goal.** Extend the operator-run smoke to record, for
-`GET /v1/account/balances`, `GET /v1/portfolio/positions`,
-`GET /v1/orders/open` and `GET /v1/portfolio/activities`: the **field names,
-their JSON types, their nesting, and their cardinality — never their values.**
-Numeric fields are recorded as type plus **digit count and decimal-place
-count**, never magnitude, because the fixed-point scale question (does the venue
-send `0.53`, `53`, or `530000`?) is exactly what the mappers must not guess and
-is not answerable from a type alone. One new evidence artifact under
-`docs/evidence/venue/polymarket_us/`, with its `.sha256`, in the existing dated
-format.
+**The recorder is NEW. `diagnose_frame_payload` is NOT reused, and revision 1's
+reuse of it was the most dangerous defect in the document.** The existing
+facility does the **opposite** of what its docstring's paraphrase suggests:
+`_walk_structure` executes `safe_values[prefix] = str(value)` for every
+`str | int | float | bool | None` (`data.py:428-429` `[V]`), and the smoke
+renders those under a literal `"Safe scalar values:"` table
+(`polymarket_us_auth_smoke.py:627-635` `[V]`). Its docstring says "without
+publishing **non**scalar payloads" (`:955` `[V]`) — it suppresses *containers*
+and publishes *scalars*. Revision 1 paraphrased that as "shape without values",
+which is the inverse. Pointed at `/v1/account/balances` it would have written
+the operator's balance into a committed, hashed, public artifact. The stated
+fail-closed net does not catch it either: `find_secret_leak_offsets` (`:307`
+`[V]`) scans only the credential strings passed as `secrets`, and a balance is
+not a credential. And because dict keys become published path segments
+(`f"{prefix}.{key}"`, `data.py:435` `[V]`), a positions map keyed by market
+publishes the portfolio *as field names*.
+
+**Currently-committed evidence is clean.** `_frame_schema` is wired only to the
+WebSocket frame handler and the recorded scalars are public order-book levels.
+The hazard was the proposed new use, not the existing one, and nothing already
+on disk needs remediation.
+
+**Goal.** A new `describe_response_shape(body: Mapping) -> ResponseShape` in the
+smoke script, whose result type **has no `safe_values` field at all** — the
+absence is the guarantee, not a filter that could be widened later. It records:
+the set of key **paths**, the JSON **type** at each path, and, for mappings
+whose keys are data (a positions map keyed by market slug), the literal marker
+`<dynamic-key>` in place of every key below the first dynamic level. It records
+**no** value, **no** digit or decimal count, and **no** array length: all three
+are value-derived, and the fixed-point scale question they were meant to answer
+is answerable from the SDK snapshot's `Amount` type or from a **public** market
+read, neither of which touches the operator's numbers. One new evidence artifact
+under `docs/evidence/venue/polymarket_us/`, with its `.sha256`, in the existing
+dated format.
 
 **REDs — and what makes each go red.**
-1. The shape recorder applied to a dict containing a value that matches a
-   secret's redaction pattern emits **no value**, and the existing
-   post-redaction verification (`:710-720` `[V]`) passes. *Red today:* the
-   recorder is frame-shaped and does not accept a JSON body.
-2. A synthetic `GetAccountBalancesResponse`-shaped dict round-trips to a shape
-   record naming every key and no value. *Red today:* no such function.
-3. The four endpoint paths appear in the smoke's read plan with method `GET`,
-   and the script's own write-request counter stays `0`. *Red today:* three of
-   the four are not read.
+1. `describe_response_shape` applied to `{"balances": [{"currency": "USD",
+   "available": "1234.56"}]}` produces a record in which the string `1234.56`
+   **does not appear anywhere**, asserted against the rendered artifact text,
+   not against the intermediate object. *Red today:* the only recorder present
+   emits it under "Safe scalar values:".
+2. Applied to a mapping keyed by market slug, no slug appears in the output;
+   the path is `positions.<dynamic-key>.netPosition`. *Red today:* `data.py:435`
+   interpolates the key.
+3. `ResponseShape` has no attribute named `safe_values`, `values`, or
+   `samples` — asserted by `dataclasses.fields`. *Red today:* the type reused
+   would be `FrameSchema`, which has `safe_values`.
+4. The three endpoint paths appear in the smoke's read plan with method `GET`,
+   the script's write-request counter stays `0`, and **none** of the three
+   matches `_ORDER_PATH_RE`. *Red today:* two of the three are not read.
+5. `find_write_egress_violations` over the modified smoke script reports **zero**
+   violations. *Red today:* passes today and must keep passing; it is stated
+   because revision 1's version of this increment would have broken it.
 
 **Files.** `scripts/venue/polymarket_us_auth_smoke.py`; its test module; the
-emitted evidence artifact plus `.sha256`.
+emitted evidence artifact plus `.sha256`. **No `src/` file changes.**
 
-**Barriers.** `scripts/venue/` is venue-touching by path (rule C2,
-`readonly_guard.py:128-131` `[V]`), so V1-V4 apply in full and **no
-write-method literal and no `.post` may appear**. `/v1/orders/open` is an
-order-path literal and therefore trips **V2** — this increment takes the **same
-exact-path V2 allowance NS-4 takes**, or, preferably, imports the constant from
-`exec/endpoints.py` once NS-4 exists. *Ordering note:* if the operator run
-happens before NS-4, the allowance is granted here for this one file and removed
-when NS-4 centralises the constant. State which happened in the commit message;
-do not leave two allowlisted files standing.
+**Barriers — and the forward dependency revision 1 hid here.**
+`scripts/venue/` is venue-touching by rule C2 (`readonly_guard.py:128-131`
+`[V]`), so V1-V4 apply in full: no write-method literal, no `.post`. Revision 1
+also read `/v1/orders/open` here, which is an order-path literal and trips
+**V2** (`_ORDER_PATH_RE = /v\d+/orders?\b` `[V]`). That would have required an
+exact-path V2 allowance for `polymarket_us_auth_smoke.py` — a **second**
+allowlisted file, falsifying goal clause (e), and it would have put an order
+path in the one file that handles live credentials. **Resolved by removing the
+path, not by widening the allowlist:** the open-orders shape is captured in
+NS-4's operator step, importing `ORDER_PATH_OPEN` from `exec/endpoints.py`, so
+the literal only ever exists in the one file allowed to hold it. The three paths
+NS-1 does read match no rule.
 
-**Completion.** A committed, hashed evidence artifact naming every field of the
-four authenticated responses, with no value of any kind. **Everything NS-4 maps,
-it maps from this artifact.**
+**Completion.** A committed, hashed evidence artifact naming every field path
+and type of the three authenticated responses, containing no value, no key that
+is itself data, and no count derived from a value. **Everything NS-4 maps for
+balances, positions and activities, it maps from this artifact** — transcribed
+by hand into the test module, never read from `docs/evidence/` by code.
 
-**If the operator run cannot happen.** NS-4's mappers are written to refuse per
-record by name, NS-5 ships, and clause (c) of the goal state is **not claimed**:
-the process would start, emit an account only if the balances shape is among the
-observed ones, and otherwise fail reconciliation and refuse to start the trader.
+**If the operator run cannot happen.** NS-4's mappers refuse per record by name,
+NS-5 ships, and clause (c) of the goal state is **not claimed**: the process
+would start, emit an account only if the balances shape is among the observed
+ones, and otherwise refuse the reconciliation, alert, and latch a non-zero exit.
 That is a correct fail-closed state and an incomplete goal state. Say so; do not
 claim the predicate.
 
 ---
 
-### NS-2 — Cage strengthening and the permit defects that stand alone
+### NS-2 — Cage strengthening, and the one permit defect this plan can reach
 
-**Goal.** Make every rule constant unloosenable, and fix the three shipped
-`safety.py` defects that need no new vocabulary. Strengthening *before*
-narrowing means NS-4's and NS-5's narrowings are measured against a pinned
-baseline.
+**Goal.** Make every cage rule constant unloosenable, and close the one
+`safety.py` defect whose consequence is reachable while nothing mints a permit.
 
-**What is here, and why each qualifies.** A defect qualifies for this increment
-if it is (i) a correction to already-shipped code, (ii) testable with a RED
-today, and (iii) does not require inventing the authority vocabulary the SEND
-half is built on. The three permit defects that fail (iii) — endpoint scope, the
-fingerprint contract, the four authority types — are in section 8.
+**What is here, and what moved out.** Revision 1 admitted a defect to this
+increment if it was (i) a correction to shipped code, (ii) testable with a RED
+today, and (iii) free of the SEND half's authority vocabulary. Two of the three
+defects it admitted fail its own criterion — and the review was right to say so.
 
-| # | Defect | Cite `[V]` | Fix |
+| # | Defect | Cite `[V]` | Disposition |
 |---|---|---|---|
-| **D-1** | `consume()` compares notionals with `!=` and does not type-check, so a `Decimal` subclass overriding `__ne__` satisfies the re-check at any magnitude | `safety.py:463` | mirror `:676`'s existing `type(x) is not Decimal` guard |
-| **D-2** | `issue_live_trading_permit` has **no caller barrier at all** and is re-exported in the package `__all__` | `safety.py:527`; `adapters/polymarket_us/__init__.py:107,191` | caller count pinned `== 0` with a one-entry path allowlist **declared and empty**, plus a proof that a planted caller fails; removed from `__all__` |
-| **D-3** | Renewal resets the operator's budget: issuance re-reads the ceilings from the environment (`:548`) and installs a **fresh** `_Budget` under a fresh `permit_id` (`:575`); `_PERMIT_BUDGETS` (`:332`) is keyed per permit and aggregates nothing; `PERMIT_TTL_NS` is 15 minutes (`:157`), so renewal is forced — roughly 32 renewals on an 8-hour day | `safety.py` | a process-level session ledger keyed by `operator_id`, created on first issuance and **never reset**; renewal binds to the existing ledger and carries the REMAINING budget forward |
+| **D-2** | `issue_live_trading_permit` has **no caller barrier at all** and is re-exported in the package `__all__`, so any module in the tree may mint a permit from the operator's environment | `safety.py:527`; `adapters/polymarket_us/__init__.py:107,191` | **KEPT.** A caller barrier is a *cage* rule, not authority design: it constrains who may reach an existing function, needs no new state, and its consequence — self-issuance — is reachable today by any module. Pinned `== 0` callers in `src/` + `scripts/`, with **no allowlist structure at all**, plus a proof that a planted caller fails. Removed from `__all__`. |
+| **D-1** | `consume()` compares notionals with `!=` and does not type-check, so a `Decimal` subclass overriding `__ne__` satisfies the re-check at any magnitude | `safety.py:463` | **MOVED to the SEND half** (section 8). `consume` is reachable only from a capability, which is minted only by the chokepoint, which this plan pins at **zero callers**. Fixing it here changes code no path in this plan executes. |
+| **D-3** | Renewal resets the operator's budget: issuance re-reads the ceilings from the environment (`:548`) and installs a fresh `_Budget` under a fresh `permit_id` (`:575`); `_PERMIT_BUDGETS` (`:332`) aggregates nothing; `PERMIT_TTL_NS` is 15 minutes (`:157`), so renewal is forced | `safety.py` | **MOVED to the SEND half** (section 8). The fix *designs new authority state* — a process ledger keyed by `operator_id` — inside a plan whose whole seam is that the authority model is deferred. That is criterion (iii) violated by the increment that wrote the criterion. Its own residual hazard is recorded in the carry-forward table: the ledger key would be read from operator-controlled environment, so a successor must pin it at first issuance and refuse a different value, or changing one variable mints a fresh budget. |
 
-**Note on D-2's count.** It is `== 0` in this plan and stays `== 0` through NS-5:
-nothing in the NO-SEND half mints a permit, because no GET requires one. The
-predecessor had to flip `== 0` to `== 1`; here there is no flip, which is
-strictly simpler and strictly stronger. Never `<= 1` — that is satisfied by zero
-and passes while dead.
+**D-2's barrier is `== 0` with nothing to allow.** Revision 1 wrote "`== 0`
+callers with a one-entry path allowlist **declared and empty**", which is
+self-contradictory — a one-entry allowlist that is empty is a zero-entry
+allowlist, and shipping an unused allowlist structure is the shape that later
+gets filled in without a paired assertion. There is no allowlist. The rule is:
+zero callers, anywhere in `src/` and `scripts/`, full stop. The SEND plan that
+first needs a caller introduces the allowlist together with its `== 1` pin.
 
-**The eight silent-failure counters, all landing here.**
+**The eight silent-failure counters.**
 
 | # | Failure mode | Counter |
 |---|---|---|
 | 1 | A directory-prefix *exemption* becomes a blanket allowance | every exemption is an exact path; each allowlist entry must resolve to an existing file; the frozenset is equality-pinned |
-| 2 | Egress escapes the classifier — a module outside the package taking its base URL from the environment | `assert is_venue_touching(p) is True` for **every** path in section 5's layout, **including paths that do not yet exist** |
+| 2 | Egress escapes the classifier | **the planted-module RED (#5 below), and only that.** Revision 1 stated this as "`assert is_venue_touching(p) is True` for every path in section 5's layout". That assertion is **vacuous** for the six `exec/` paths — they pass on the C1 string prefix alone (`readonly_guard.py:189` `[V]`), before any file exists — and **false** for `runtime/settings.py`, which imports no venue module and classifies `False` (`:187-206` `[V]`), so it could not have landed as written. What has content is the negative case: a module that reaches the venue by a route C1-C4 miss. |
 | 3 | The global rule is loosened instead of the file allowlisted | equality pins on all nine rule constants: `_WRITE_METHODS`, `_WRITE_ATTRS`, `_ORDER_PATH_RE`, `EGRESS_SCAN_ROOTS`, `SDK_IMPORT_ORACLE`, `_EGRESS_MODULE_BASENAMES`, `_EGRESS_CLASS_SUFFIXES`, `_EGRESS_CLASS_BASES`, `_EGRESS_FUNCTION_NAMES` |
 | 4 | N2 blind to planned filenames | **NS-0** |
 | 5 | A barrier written `<= 1` passes while dead | every count assertion is an equality, with a proof that both neighbours fail |
-| 6 | An exec test marked `allow_socket` / `live` / `venue_live` / `real_money` restores the real pyo3 clients (`conftest.py:394-402` `[V]`) | static ban on those four markers in any test importing `...polymarket_us.exec` — **sound only because section 5.1's decision means no exec test ever needs a socket** |
+| 6 | An exec test marked `allow_socket` / `live` / `venue_live` / `real_money` restores the real pyo3 clients (`conftest.py:394-402` `[V]`) | static ban on those four markers in any test importing `...polymarket_us.exec` — **sound only because section 5.1's decision means no exec test ever needs a socket**, including the ones that now call `node.build()` |
 | 7 | Data-path widening by rebinding `signing.PERMITTED_METHODS` on an imported module object | repo-wide AST ban on assignment to `PERMITTED_METHODS` / `PERMITTED_QUOTA_KEYS` / `_WRITE_*` |
 | 8 | A rule constant is *narrowed* rather than widened, silently disarming a scan | the same equality pins as #3, which fail in both directions |
 
-**REDs — one per defect, each failing on today's tree.**
-1. A `Decimal` subclass whose `__ne__` returns `False` passes `consume(...)` at
-   an arbitrary magnitude. *Red today:* `:463` is a bare `!=`.
-2. Spending a permit's session budget and then issuing a second permit restores
-   the full budget. *Red today:* `:575` installs a fresh `_Budget`.
-3. A module outside the issuer mints a permit from the operator's environment.
+**REDs — and what makes each go red.**
+1. A module outside the issuer mints a permit from the operator's environment.
    *Red today:* no caller barrier exists.
-4. Widening `_WRITE_METHODS` by one token leaves the suite green. *Red today:*
+2. `issue_live_trading_permit` is importable from
+   `breezy.adapters.polymarket_us`. *Red today:* it is in `__all__`
+   (`__init__.py:191` `[V]`).
+3. Widening `_WRITE_METHODS` by one token leaves the suite green. *Red today:*
    the constant is unpinned.
-5. A planted `src/breezy/egress_outside_the_package.py` reading its base URL from
-   `os.environ` is classified **not** venue-touching. *Red today:* C1-C4 do not
-   cover it.
+4. **Narrowing** `_EGRESS_CLASS_BASES` by removing `LiveExecutionClient` leaves
+   the suite green. *Red today:* unpinned in that direction too, and this is the
+   direction that silently disarms NS-0.
+5. A planted `src/breezy/egress_outside_the_package.py` that reaches the venue
+   with its base URL read from `os.environ` is classified **not**
+   venue-touching. *Red today:* C1-C4 do not cover it. This is counter 2's whole
+   content.
 6. A test importing `...polymarket_us.exec` marked `@pytest.mark.allow_socket`
    is undetected. *Red today:* no such scan.
 7. Rebinding `signing.PERMITTED_METHODS` from another module is unbanned.
    *Red today:* no such scan.
 
-**Files.** `safety.py`; `adapters/polymarket_us/__init__.py`; the three guard
-suites; new `tests/unit/test_cage_rule_constants_are_pinned.py`.
+**Files.** `adapters/polymarket_us/__init__.py`; the three guard suites; new
+`tests/unit/test_cage_rule_constants_are_pinned.py`. **`safety.py` is not
+touched by this plan at all** — D-1 and D-3 were the only reasons to open it.
 
 **Barriers.** Every change is strictly stronger. **No allowlist is created in
 this increment.** `SandboxExecutionClient`, `AccountType.BETTING` and
@@ -596,10 +771,26 @@ abstraction over three processes.**
 - `runtime/trade_cli.py` mirroring `quote_tape_cli.py` (section 5.1): `main()`
   calls `run(env=None, node_factory=TradingNode, stderr=None)`, which loads
   settings, builds the data client config, builds the node config, and then
-  calls `_run_node(config, node_factory, stderr)`, which constructs the node,
-  registers the data client factory under the same name that keys
-  `data_clients`, builds, runs, and **always** disposes. `KeyboardInterrupt` is
-  exit 0, as the tape has it (`quote_tape_cli.py:158-168` `[V]`).
+  calls `_run_node(config, node_factory, stderr)`. `_run_node` delegates
+  construction, factory registration and `build()` to
+  **`build_trading_node(config, node_factory) -> Node`** — a named seam mirroring
+  `composition.build_ingest_node` (`composition.py:462-486` `[V]`), which exists
+  for exactly this reason: it returns a node the caller can *inspect* before the
+  caller decides to run it. `_run_node` then calls `node.run()` and **always**
+  disposes. `KeyboardInterrupt` is exit 0, as the tape has it
+  (`quote_tape_cli.py:158-168` `[V]`). Splitting `build_trading_node` out is what
+  makes RED 3 possible without a test ever calling `run()`.
+- **The exit-code contract.** After `node.run()` returns, `_run_node` asks a
+  local predicate whether the run was refused and returns `EXIT_RUNTIME_ERROR`
+  when it was. This is the only way an operator's supervisor learns that the
+  trader never started: the kernel's reconciliation gate stops the *trader*, not
+  the *process* (`live/node.py:349-357` `[V]`). **At NS-3 that predicate is a
+  function in `trade_cli` itself that returns `False` and has its own test** —
+  NS-3 depends on nothing later, and the exit path is exercised at NS-3 by
+  monkeypatching the predicate rather than by anticipating NS-5's shape. NS-5
+  replaces the body with a read of its module-level latch, in NS-5's own commit
+  and Files. The contract is stated here rather than in NS-5 because `trade_cli`
+  is the only place a process exit code can be produced.
 - `breezy-trade = "breezy.runtime.trade_cli:main"` in `[project.scripts]`, a
   **separate** process from `breezy` and `breezy-quote-tape` for the reason
   `pyproject.toml:257-259` `[V]` already states about those two: the weather
@@ -633,17 +824,25 @@ test in this plan would need a socket — see section 5.1 and NS-2 counter 6.
    quantifies over every site and asserts emptiness of three fields
    (`:343-349` `[V]`), so it cannot express "this site may carry exactly one
    data client" and cannot detect a fourth site at all.
-3. A real `TradingNode(build_trading_node_config(...), loop=loop)` is
-   **constructed** with `node.trader` present and `node.is_built` false, and the
-   construction opens **no socket** — the same assertion shape as
-   `test_node_composition_contract.py:432` `[V]`. *Red today:* the builder does
-   not exist.
-4. `trade_cli._run_node` driven with a recording double registers
-   `PolymarketUSLiveDataClientFactory` under **exactly** `POLYMARKET_US_CLIENT_NAME`
-   — the same key that appears in `data_clients` — before `build()`. *Red today:*
-   `trade_cli` does not exist. (This is the assertion whose absence makes a
-   recorder silently record an empty tape; `quote_tape_cli.py:141-148` `[V]`
-   documents the same hazard on the other process.)
+3. `build_trading_node(config, node_factory=TradingNode)` returns a node for
+   which `node.is_built() is True` and
+   `node.kernel.data_engine.registered_clients == [ClientId("POLYMARKET_US")]`,
+   with the data factory's `NautilusHttpTransport` and credential loader
+   monkeypatched, and the construction opens **no socket** — the assertion
+   carried over from `test_node_composition_contract.py:432` `[V]`, now applied
+   to a node that has been **built**. *Red today:* neither the builder nor the
+   seam exists. **`is_built` is a method, not a property** (`live/node.py:185`
+   `[V]`); revision 1 asserted on the bound object, which is always truthy and
+   therefore always passed.
+4. The same test, with the factory registered under a **misspelled** name,
+   yields `registered_clients == []` and the test **fails**. *Red today:* no
+   builder. This is the case `node_builder.py` produces silently — it applies
+   `name = parts.partition("-")[0]` (`:220` `[V]`) and logs an error then
+   `continue`s on a name with no registered factory (`:231-233` `[V]`) — and it
+   is the reason the assertion reads `registered_clients`, not "the factory was
+   called". `quote_tape_cli.py:141-148` `[V]` documents the same hazard on the
+   other process, where its symptom is a recorder silently recording an empty
+   tape.
 5. `trade_cli.run` with the venue environment absent **exits non-zero without
    constructing a node**. *Red today:* no CLI.
 6. Neither `ingest_runtime` (`composition.py:272`) nor `quote_tape_cli` can
@@ -654,6 +853,12 @@ test in this plan would need a socket — see section 5.1 and NS-2 counter 6.
 7. `uv run lint-imports` passes. *Red today:* a new module importing
    `nautilus_trader` breaks the forbidden-import contract until its
    `ignore_imports` entry lands in the same commit.
+8. `_run_node` returns `EXIT_RUNTIME_ERROR` when the refusal predicate returns
+   `True` and `0` when it returns `False`, driven by monkeypatching the
+   predicate. *Red today:* no CLI. The predicate's NS-3 body returns `False`
+   unconditionally, so this test exercises the **exit path**, not the latch —
+   stated so nobody reads a green here as evidence that a refusal is detected.
+   NS-5's RED 12c is the test that closes that half.
 
 **The node-config barrier: narrowed, and strictly stronger.** Today's rule is
 "at every `TradingNodeConfig(...)` site, `exec_clients`, `strategies` and
@@ -742,14 +947,36 @@ unrecognised.
 NS-5's client, having called `super().generate_mass_status(...)`, returns `None`
 when any per-record refusal occurred. The engine counts `None` as a failure for
 that client (`live/execution_engine.py:1721-1727` `[V]`), reconciliation fails,
-and the kernel **does not start the trader** (`system/kernel.py:1027-1029`,
-`:1040` `[V]`). Diagnostically nothing is lost — every refusal was already
-logged and alerted — and the outcome is native fail-closed with no authored
-machinery.
-*(This rule is scope-dependent and is flagged as such: in the SEND half,
-discarding a reconciliation while holding a live position abandons it, which is
-exactly why the predecessor's per-record rule exists. It is stated here as a
-consequence of "no position can exist", not inherited as universal.)*
+and `self._trader.start()` (`system/kernel.py:1039` `[V]`) is never reached.
+Diagnostically nothing is lost — every refusal was already logged and alerted —
+and the outcome is native fail-closed with no authored machinery.
+**This rule is correct for NO-SEND and WRONG for SEND**, and that is not a
+parenthetical: discarding a reconciliation while holding a live position
+abandons it, with no cancel and no exit. It has a row in the carry-forward table
+(section 8.1) and the implementer writes that sentence as a comment above the
+`return None`, so the successor plan meets it in the code and not only in a
+document.
+
+**`open_only` is silently ignored, and that is a venue limitation, not a
+choice.** `generate_mass_status` issues `GenerateOrderStatusReports(open_only=False)`
+(`live/execution_client.py:475-481` `[V]`) — the engine is asking for *all*
+order status, not just open. The venue's only authenticated order listing is
+`/v1/orders/open` (`resources/orders.py:35` `[V]`); `/v1/order/{order_id}`
+(`:42`) requires an id we do not have for an order we have never seen. So the
+mapper honours `open_only=False` as far as the venue permits and **states the
+gap in its docstring and in one test**, rather than silently returning open
+orders in response to a request for all of them.
+
+**A `FillReport` without a matching `OrderStatusReport` is dropped natively.**
+Fills are keyed by `venue_order_id` and applied only inside the loop over
+`mass_status.order_reports` (`live/execution_engine.py:1881-1907` `[V]`). With
+`/v1/orders/open` as the only order source, every fill of an order that has
+since closed is discarded by the engine before Breezy sees any effect. The
+mapper still maps them — they are cheap, and they are correct input the moment
+an order source covering closed orders exists — but **no clause of the goal
+state depends on a fill reaching the cache**, and positions come from the
+position reports instead. Stated here so nobody later reads "fills are mapped"
+as "fills are applied" (OQ-10).
 
 **Every decode is refused unless it was observed.** The fixed-point question —
 does the venue send a price as `0.53`, `53`, or `530000`? — is answered by NS-1's
@@ -769,13 +996,46 @@ than a refusal; the mapper refuses by name, per record.
    violations outside that one exact path. *Red today:* the file does not exist,
    and once it does the scan fails until the exact-path allowance lands in the
    same commit.
-5. `assert is_venue_touching("src/breezy/adapters/polymarket_us/exec/reports.py", tree) is True`.
-   *Note:* this passes by rule C1 the moment the path string exists, so it is
-   written **before** the file lands and its value is as a regression pin on C1,
-   not as a discovery. Flagged rather than dressed up as a RED.
+5. `uv run lint-imports` passes. *Red today:* `exec/reports.py` importing the
+   Nautilus report types breaks the forbidden-import contract until its
+   `ignore_imports` entry lands in the same commit — the container revision 1
+   never named.
+6. `exec/endpoints.py` contains **no** `import` statement, asserted on its AST.
+   *Red today:* the file does not exist; the assertion exists so that the "it
+   imports nothing, so it needs no `ignore_imports` entry" claim above cannot
+   quietly stop being true.
+7. The order-status mapper's docstring and one test record that the venue cannot
+   satisfy `open_only=False`. *Red today:* no mapper.
+8. *(Not a RED, flagged as such.)*
+   `assert is_venue_touching("src/breezy/adapters/polymarket_us/exec/reports.py", tree) is True`
+   passes by rule C1 the moment the path string exists, before any file lands.
+   It is a regression pin on C1, not a discovery, and it is listed here so it is
+   not miscounted as evidence.
+
+**Files.** `src/breezy/adapters/polymarket_us/exec/endpoints.py`;
+`src/breezy/adapters/polymarket_us/exec/reports.py`; `pyproject.toml` (one
+`ignore_imports` entry, see Barriers); `tests/unit/test_polymarket_us_readonly_guard.py`
+and `tests/unit/test_execution_egress_firewall_guard.py` (the V2 allowance and
+the N2 exact-set pin); new `tests/unit/test_polymarket_us_exec_reports.py`;
+`scripts/venue/polymarket_us_auth_smoke.py` and its evidence artifact (the
+operator step below). **Revision 1 had no Files section here at all**, which is
+how the `lint-imports` container went missing.
+
+**The operator step, inside this increment.** Once `exec/endpoints.py` exists,
+the NS-1 recorder is pointed at `GET /v1/orders/open` by **importing**
+`ORDER_PATH_OPEN` from `exec/endpoints.py` rather than restating the literal, so
+no second file is ever V2-allowlisted. A second dated evidence artifact is
+emitted. NS-4 is not complete until it exists, or until the order-status mapper
+is shipped refusing by record with that stated (see NS-1's fallback).
 
 **Barriers.** **B4/V2 narrowed** — the first and only allowance this increment
-creates. It is an **exact path** (`exec/endpoints.py`), never a prefix, paired in
+creates. **`lint-imports`:** `exec/reports.py` imports the Nautilus report types,
+so `pyproject.toml` gains
+`breezy.adapters.polymarket_us.exec.reports -> nautilus_trader`, of exactly the
+same shape as the twelve existing adapter entries (`:88-142` `[V]`), in the same
+commit; CI runs `uv run lint-imports` (`.github/workflows/tests.yml:37` `[V]`).
+`exec/endpoints.py` imports nothing and needs no entry — asserted, so that an
+import added to it later fails rather than silently acquiring one. It is an **exact path** (`exec/endpoints.py`), never a prefix, paired in
 the same commit with: the `(method, template)` frozenset equality pin, the
 all-methods-are-GET assertion, `_ORDER_PATH_RE` pinned, and
 `assert is_venue_touching(<that path>) is True`. **V1, V3 and V4 apply in full —
@@ -790,12 +1050,13 @@ V2-allowlisted path. Clause (e) of the goal state is now non-trivially true.
 
 ### NS-5 — `exec/client.py`: the client that reconciles truthfully and refuses everything
 
-**Null hypothesis: NATIVE — sufficient for the machinery, insufficient for five
+**Null hypothesis: NATIVE — sufficient for the machinery, insufficient for six
 seams.** `LiveExecutionClient` supplies everything but eight
-`NotImplementedError` coroutines (`live/execution_client.py:598-636` `[V]`) and
-the four report coroutines (`:343-438` `[V]`). **GENUINELY ABSENT:** the
-`AccountState` emission, `_set_account_id`, `_query_account`, the reconciliation
-match assertion, and an alert sink in this process.
+`NotImplementedError` coroutines (`live/execution_client.py:598-636` `[V]`) — two
+lifecycle (`_connect`, `_disconnect`) and **six order-bearing** — and the four
+report coroutines (`:343-438` `[V]`). **GENUINELY ABSENT:** the `AccountState`
+emission, `_set_account_id`, `_query_account`, the report precondition, the
+refusal latch, and an alert sink in this process.
 
 **Goal.** One `PolymarketUSExecutionClient(LiveExecutionClient)`, one
 `PolymarketUSExecClientConfig`, one `PolymarketUSLiveExecClientFactory`,
@@ -815,16 +1076,63 @@ assert currency identity, `generate_account_state(...)`,
 `self._cache.account(self.account_id) is not None`** — never trusting the
 await's return.
 
-**2. Breezy owns the reconciliation match assertion.** With
-`generate_missing_orders=False`, a position-quantity discrepancy logs a warning
-and **`return True`** (`live/execution_engine.py:2501-2509` `[V]`). Native
-"reconciled" therefore does not imply "matched", and a goal-state assertion
-resting on the native result would pass **precisely in the state it was written
-to detect**. Breezy compares its own `PositionStatusReport` set against the
-cache and **fails reconciliation on any discrepancy**, in a named function
-`exec/client.py::_assert_reconciled`. The failure route is NS-4's: return `None`
-from `generate_mass_status`, so the kernel does not start the trader. No halt
-machinery is authored.
+**2. Reconciliation truth is enforced on the INPUT, because the output cannot be
+observed.**
+
+*Revision 1's `_assert_reconciled` is WITHDRAWN, and why matters.* It compared
+reports against the cache inside `generate_mass_status`. The engine awaits
+`generate_mass_status` at `live/execution_engine.py:1710-1712` `[V]` and only
+then applies the reports, at `:1732` `[V]`. With NS-3's `database=None,
+flush_on_start=False` the cache holds **zero** positions at that moment, always
+— so the rule returned `None` whenever the venue held a position (the trader
+never starts, permanently) and was vacuously true when it held none. There is no
+configuration in which it detected the hazard it was written for. Its RED is
+withdrawn with it.
+
+*There is no post-reconciliation seam.* `start_async` awaits
+`_await_execution_reconciliation()` and, on success, proceeds to
+`self._trader.start()` with nothing between (`system/kernel.py:1025-1039` `[V]`);
+`ExecutionClient` has no post-reconcile hook `[V]` — searched
+`live/execution_client.py` and `execution/client.pyx` for a callback invoked
+after `_reconcile_execution_mass_status`, and found none. **This probe sees
+methods and call sites in those two files; it does not see a hook that a future
+Nautilus release might add elsewhere.** OQ-9 records the residual.
+
+So two rules act on what we hand over, before the engine touches it.
+
+*(a) `generate_missing_orders=True` — the NATIVE DEFAULT, restored.* Revision 1
+set it `False`, inherited from the abandoned settlement plan. With `False`, a
+position-quantity discrepancy logs a warning and `return True`
+(`live/execution_engine.py:2501-2509` `[V]`) — and because the cache starts
+empty, **every** venue position is a discrepancy, so goal clause (c) would be
+unachievable for every position the venue reports. With `True`, the engine takes
+the diff path at `:2511-2563` `[V]` and enters the position. This is the
+`native mechanism, wrong degree` shape of LESSONS L-2 in its purest form: the
+mechanism was right, the setting inverted it.
+
+*(b) A precondition on every report we emit.* The instrument-not-loaded
+fail-open is not one site but **five**, all identical — DEBUG log, `return True`
+— at `live/execution_engine.py:2396-2400`, `:2435-2439`, `:2473-2477`,
+`:3057-3062` and `:3087-3092` `[V]`. One control closes all five: **every
+`PositionStatusReport` and `OrderStatusReport` this client emits names an
+`instrument_id` for which `self._cache.instrument(...)` is not `None`, and any
+report failing that check is a refusal — counted, alerted with the
+`instrument_id`, and `generate_mass_status` returns `None`.** Refusing to
+reconcile is the correct answer to "the venue says you hold something you cannot
+represent".
+
+*The ordering this depends on is guaranteed, and here is the chain.*
+`start_async` runs `_connect_clients()`, then `_await_engines_connected()`, and
+only then reconciliation (`system/kernel.py:1020-1027` `[V]`); Breezy's data
+client awaits `self._instrument_provider.initialize()` and pushes the
+instruments to the data engine **inside** `_connect`, before returning
+(`data.py:716-721` `[V]`). So the provider's universe is in the cache before the
+first report is mapped.
+
+*The consequence, stated rather than discovered later:* the provider loads
+weather markets only, so a venue position in any other market refuses
+reconciliation and the process does not trade. That is the designed answer under
+goal clause (c), and OQ-11 records the operator question it raises.
 
 **3. The currency identity, asserted at emission.** The emitted
 `AccountBalance.currency` must be identically `USD`, which is the
@@ -834,20 +1142,87 @@ and useless: `balance_free(USD)` returns `None` for a currency the account does
 not hold. `_connect` fails closed on it. `AccountBalance.free` carries the
 venue's **available/withdrawable** figure and never a total including
 order-locked collateral; `locked` carries the difference. Both rules are pinned
-by contract test against NS-1's observed shape.
+by contract test against the **field names and types** NS-1 recorded — NS-1
+records no values, so no test may assert one.
 
 **4. `_query_account` is defined explicitly.** It is called
 (`live/execution_client.py:332` `[V]`) and **not defined anywhere in the class**
-`[V]`; omitting it raises `AttributeError` inside a created task.
+— probed by grepping `live/execution_client.py` and `execution/client.pyx` for
+`def _query_account`, which finds only the call `[V]`. **That probe sees those
+two files; it would not see a definition injected by a mixin or a subclass, and
+none exists in our tree.** Omitting it raises `AttributeError` inside a created
+task.
 
-**5. All eight lifecycle coroutines refuse.** `_submit_order`,
-`_submit_order_list`, `_modify_order`, `_cancel_order`, `_cancel_all_orders`,
-`_batch_cancel_orders` each call `generate_order_denied`
-(`execution/client.pyx:370` `[V]`) with a named reason, increment a named
-counter, and emit an alert. `OrderDenied` is terminal and pre-venue: no
-`OrderSubmitted` is ever generated. `_connect` and `_disconnect` are the only
-two that do real work. Refusal reasons are module constants, one per coroutine,
-so a denial is greppable and countable rather than a formatted string.
+**5. Per-coroutine refusal semantics — six coroutines, three event types.**
+A blanket "all eight emit `OrderDenied`" is wrong twice: `_connect`/`_disconnect`
+take no command, and `OrderDenied` is reachable only from `INITIALIZED` /
+`RELEASED` (`model/orders/base.pyx:95,107` `[V]`), so on an `ACCEPTED` order it
+raises `InvalidStateTrigger`, which `_apply_event_to_order` catches, warns about,
+and `return True` (`execution/engine.pyx:1586-1594` `[V]`) — the refusal
+vanishes.
+
+| coroutine | command | IDs the command carries | event emitted |
+|---|---|---|---|
+| `_submit_order` | `SubmitOrder` | `command.order` (`messages.pxd:124-125` `[V]`) | `generate_order_denied(strategy_id, instrument_id, client_order_id, reason, ts_event)` — five params (`execution/client.pyx:370-406` `[V]`) |
+| `_submit_order_list` | `SubmitOrderList` | `command.order_list.orders` (`:139-140` `[V]`) | one `generate_order_denied` **per order** |
+| `_modify_order` | `ModifyOrder` | `client_order_id`, `venue_order_id` (`:156-159` `[V]`) | `generate_order_modify_rejected(strategy_id, instrument_id, client_order_id, venue_order_id, reason, ts_event)` (`execution/client.pyx:531-537` `[V]`) |
+| `_cancel_order` | `CancelOrder` | `client_order_id`, `venue_order_id` (`:175-178` `[V]`) | `generate_order_cancel_rejected` — same six params (`execution/client.pyx:575-581` `[V]`) |
+| `_cancel_all_orders` | `CancelAllOrders` | **`order_side` only** (`:188-189` `[V]`) | one cancel-rejected per order resolved from `self._cache.orders_open(instrument_id=command.instrument_id, side=command.order_side)` (`cache/cache.pyx:4710-4716` `[V]`); when that set is empty, **no event** — counter and alert only |
+| `_batch_cancel_orders` | `BatchCancelOrders` | `command.cancels`, a list of `CancelOrder` (`:199-200` `[V]`) | one cancel-rejected per element |
+
+Two honest consequences, written into the module docstring rather than
+discovered by the first SEND-half reader:
+- `OrderModifyRejected` / `OrderCancelRejected` change an order's state only from
+  `PENDING_UPDATE` / `PENDING_CANCEL` (`model/orders/base.pyx:1055-1060` `[V]`);
+  this client never emits `OrderPendingUpdate` / `OrderPendingCancel`, so the
+  rejection is published on the message bus and recorded on the order, and the
+  order's status is untouched. No exception is raised — unlike the `OrderDenied`
+  path, the FSM is simply not triggered.
+- With NS-3's `strategies=[]`, **no order can exist for these five paths to act
+  on.** They are barriers, exercised by tests and by nothing else. Their value is
+  that the first caller in the SEND half meets a named, counted, alerted refusal
+  instead of a `NotImplementedError` — and `_submit_order`, the only one a
+  strategy reaches first, is the one whose `OrderDenied` is fully effective.
+
+Every refusal increments a counter named by a module constant (one per
+coroutine, so a denial is greppable and countable rather than a formatted
+string) and emits an alert at `WARN`.
+
+**6. `calculate_commission` is NOT overridden, and that is a decision with a
+consequence.** The base returns `None` (`execution/client.pyx:165-194` `[V]`).
+It is reachable in NO-SEND: an `OrderStatusReport` whose `filled_qty` exceeds the
+cached order's makes the engine generate an inferred fill (`:3220`,
+`_generate_inferred_fill` at `:3485-3505` `[V]`), which passes this client to
+`create_inferred_order_filled_event`, and a `None` commission **falls back to
+`Money(0, quote_currency)`** (`live/reconciliation.py:503-507` `[V]`). So a
+reconciled fill records zero fee. No read this plan performs establishes the
+venue's fee model, and nothing in NO-SEND consumes realised PnL — no strategy, no
+sizing, no exit. Zero is therefore recorded knowingly, and the constraint has a
+carry-forward row (section 8.1): **a SEND half that computes PnL must override
+this before it trusts a reconciled fill.**
+
+**7. Reconciliation failure must be LOUD, because the process survives it.**
+When reconciliation fails, `start_async` returns early (`system/kernel.py:1028-1029`
+`[V]`) and `run_async` goes on to log `RUNNING` (`live/node.py:352` `[V]`) and
+await the queue tasks (`:357+` `[V]`): the process daemonises with no trader and
+would otherwise exit 0. So, **before** returning `None` from
+`generate_mass_status`, the client emits a `CRITICAL` alert and sets a refusal
+latch. The alert cannot wait for shutdown — `_disconnect`, which closes the
+webhook sink, never runs on that path.
+
+*Where the latch lives, and the alternative rejected.* The engine's registry
+maps `ClientId -> ExecutionClient` in `self._clients`, but the public surface is
+`registered_clients`, which returns **`ClientId`s only**
+(`execution/engine.pyx:212-221` `[V]`), and there is no public
+`get_client` — probed by grepping `execution/engine.pyx` for `def get_client`,
+which finds none `[V]`. Reaching the client object therefore means touching
+`exec_engine._clients`, a private attribute, which the immutable-foundation rule
+forbids. So the latch is a **module-level object in `exec/client.py`** with an
+explicit `set(reason)` / `is_set` / `reset()`, imported directly by `trade_cli`
+— one process, one client, one latch. The cost is module-level mutable state:
+the exec test module carries an autouse fixture calling `reset()`, and RED 12c
+asserts a freshly imported module is unlatched. That cost is accepted over
+reaching into an engine private.
 
 **Account shape, chosen once rather than defaulted.**
 `account_type=AccountType.CASH`; `base_currency=None` (multi-currency, matching a
@@ -855,19 +1230,23 @@ per-currency balance list) with rule 3's identity check as the control;
 `oms_type=OmsType.NETTING`, pinned by test. Config pins, each stated rather than
 defaulted because a defaulted value and a chosen one are indistinguishable in
 review: `reconciliation=True` (`live/config.py:177` `[V]`),
-`generate_missing_orders=False` (native default `True`, `:183` `[V]`),
+`generate_missing_orders=True` (rule 2(a); native default, `:183` `[V]`),
 `filter_unclaimed_external_orders=False` (native default already `False`, `:180`
 `[V]`; set `True` it makes the engine silently discard an unclaimed external
-report, `live/execution_engine.py:3575` `[V]`), `open_check_interval_secs=None`
-and `position_check_interval_secs=None` (`:188` `[V]` — nothing this process
-does benefits from a repeated check, and enabling one before a settlement exit
-exists is how a wrong-price report would fire repeatedly).
+report, `live/execution_engine.py:3575` `[V]`), `filter_position_reports=False`
+(native default, `:181` `[V]` — set `True` it drops **every** position report and
+goal clause (c) becomes unachievable in silence), `open_check_interval_secs=None`
+(`:188` `[V]`) and `position_check_interval_secs=None` (`:195` `[V]` — nothing
+this process does benefits from a repeated check, and enabling one before a
+settlement exit exists is how a wrong-price report would fire repeatedly).
 
-**The alert sink gets its container here.** `resolve_alert_sink` (`health.py:495`
-`[V]`) is called **exactly once**, in `PolymarketUSLiveExecClientFactory.create`
-— the one composition seam Nautilus offers for an execution client
-(`live/factories.py::LiveExecClientFactory.create` `[V]`) — and handed to the
-client's constructor. The client closes it in `_disconnect`, duck-typing
+**The alert sink gets its container here, using the pattern already in the
+tree.** The client takes `sink: AlertSink | None = None` and does
+`self._sink = resolve_alert_sink() if sink is None else sink` — verbatim the
+injection pattern at `strategy/weather_common/refusals.py:113-124` `[V]`, so
+tests inject a recording sink with no monkeypatching and production resolves the
+default. `resolve_alert_sink` (`health.py:495` `[V]`) is therefore called at most
+once per client. The client closes the sink in `_disconnect`, duck-typing
 `close()` best-effort exactly as `composition._close_alert_sink` does
 (`composition.py:255-268` `[V]`), because `LoggingAlertSink` owns nothing and
 `WebhookAlertSink` owns an `httpx.Client` (`health.py:479-492` `[V]`). Every
@@ -882,31 +1261,38 @@ type rather than narrowing the signature, loads credentials with blocking I/O at
 `build()` time (never in a coroutine and never on a reconnect path), and builds
 its own `Ed25519RequestSigner`, `NautilusHttpTransport` and
 `PolymarketUSHttpClient` from the same shipped classes. Every read it issues
-carries `quota_key=QUOTA_KEY_PORTFOLIO`, which already exists, is already
-permitted, and is currently unused in `src/` `[V]` — no quota key is added and
-none is widened.
+carries `quota_key=QUOTA_KEY_PORTFOLIO`, which already exists and is already
+permitted — no quota key is added and none is widened.
 
 **REDs — and what makes each go red.**
 
-*Composed-node level (a real `TradingNode`, constructed only, never built):*
-1. `build_trading_node_config`'s `exec_clients` is **exactly**
-   `{POLYMARKET_US_CLIENT_NAME: <the exec config parameter>}` under the per-site
-   value table, and the other two sites are byte-unchanged. *Red today:* the
-   site pins `{}`.
-2. `trade_cli._run_node` driven with a recording double registers
-   `PolymarketUSLiveExecClientFactory` under exactly `POLYMARKET_US_CLIENT_NAME`
-   via `add_exec_client_factory` before `build()`. *Red today:* it registers
-   only the data factory.
+*Composed-node level — a real `TradingNode`, BUILT and observed directly
+(section 5.1), never run:*
+1. `build_trading_node(config)` yields a node with
+   `node.kernel.exec_engine.registered_clients == [ClientId(POLYMARKET_US_CLIENT_NAME)]`
+   and the registered client is an instance of `PolymarketUSExecutionClient`.
+   *Red today:* the NS-3 site pins `exec_clients={}`, so the list is empty.
+   **This is the assertion revision 1 could not make**: the three-assertion
+   inference chain it used passes even when `build_exec_clients` logs
+   "No LiveExecClientFactory registered" and `continue`s
+   (`live/node_builder.py:231-233` `[V]`), leaving zero exec clients.
+2. The same test with the factory registered under a **misspelled** name yields
+   `registered_clients == []` and **fails**. *Red today:* trivially, but it is
+   what makes RED 1 non-vacuous, and it pins the `name.partition("-")[0]`
+   truncation at `live/node_builder.py:220` `[V]`.
 
 *Factory level (stub msgbus/cache/clock; transport and credential loader
 monkeypatched at the module — the technique
-`tests/unit/test_polymarket_us_factories.py:181-182` `[V]` already uses):*
+`tests/unit/test_polymarket_us_factories.py:181-182` `[V]` already uses, and the
+same monkeypatch is what keeps `node.build()` socket-free above):*
 3. `PolymarketUSLiveExecClientFactory.create(...)` returns a
    `PolymarketUSExecutionClient` whose `ClientId` derives from the registered
    name, whose venue is `POLYMARKET_US_VENUE`, whose `account_type` is `CASH`
    and whose `oms_type` is `NETTING`. *Red today:* no factory.
-4. `create` resolves the alert sink **exactly once** and the client holds it.
-   *Red today:* no sink is constructed anywhere in this process.
+4. A client constructed with `sink=None` resolves the default sink; one
+   constructed with a recording sink uses it and calls `resolve_alert_sink`
+   **never**. *Red today:* no client, and an implementation that resolves
+   unconditionally fails the second half for the right reason.
 5. `create` rejects a config of the wrong type. *Red today:* no factory.
 
 *Engine level (`LiveExecutionEngine` and `Cache` from `test_kit` stubs, on an
@@ -918,17 +1304,35 @@ event loop, with a stub HTTP client returning NS-1-shaped payloads):*
    *Red today:* no client; and an implementation relying on
    `_await_account_registered` alone fails this for the right reason.
 8. A balances payload in a non-`USD` currency makes `_connect` raise.
-9. Each of the eight coroutines emits `OrderDenied` with its named reason,
-   increments its counter, emits an alert, and **never** `OrderSubmitted`.
+9. **Per coroutine, one test each, asserting the event TYPE from the table
+   above:** `_submit_order` and each order of `_submit_order_list` produce
+   `OrderDenied`; `_modify_order` produces `OrderModifyRejected`; `_cancel_order`
+   and each element of `_batch_cancel_orders` produce `OrderCancelRejected`;
+   `_cancel_all_orders` produces one cancel-rejected per open order in the cache
+   matching instrument and side, and **zero events with a non-zero counter** when
+   the cache holds none. Every case: the named reason constant, the counter
+   incremented, an alert emitted, and **no `OrderSubmitted` ever**. *Red today:*
+   no client — and an implementation that emits `OrderDenied` for the cancel and
+   modify paths fails RED 9 on the type assertion, which is the whole point of
+   splitting it.
 10. `_query_account` is awaited without `AttributeError`.
-11. A venue position absent from the cache makes `generate_mass_status` return
-    `None`. *Red today:* no client; and an implementation that trusts the native
-    result fails this, because the native path returns `True`
-    (`live/execution_engine.py:2503-2509`).
+11. A `PositionStatusReport` naming an instrument **absent from the cache** makes
+    `generate_mass_status` return `None`, with the counter incremented and the
+    `instrument_id` in the alert. *Red today:* no client; and an implementation
+    that hands the report over and trusts the engine fails this, because all five
+    native sites `return True` (rule 2(b)).
 12. An unmappable record makes `generate_mass_status` return `None` **and** the
     per-record counter is non-zero **and** the other two report lists were
     non-empty when it happened — NS-4's two rules asserted together, so an
     implementation satisfying one by violating the other fails.
+12b. A reconciliation failure sets the refusal latch and emits a `CRITICAL`
+    alert **before** `generate_mass_status` returns, asserted on the recording
+    sink. *Red today:* no latch exists; and an implementation that alerts from
+    `_disconnect` fails, because `_disconnect` is never reached on that path.
+12c. A freshly imported `exec/client.py` is **unlatched**, and `trade_cli`
+    returns exit code 0 for an unlatched run and non-zero for a latched one.
+    *Red today:* no latch and no mapping; this is the test that makes the
+    module-level latch's isolation cost visible rather than incidental.
 
 *Static:*
 13. Exactly **one** `LiveExecutionClient` subclass exists in `src/` + `scripts/`,
@@ -940,21 +1344,8 @@ event loop, with a stub HTTP client returning NS-1-shaped payloads):*
 14. `scan_write_egress()` still reports zero violations outside
     `exec/endpoints.py`. *Red today:* passes today and must keep passing —
     written so that a `.post` introduced anywhere in NS-5 fails it.
-15. `uv run lint-imports` passes. *Red today:* four new modules import
+15. `uv run lint-imports` passes. *Red today:* three new modules import
     `nautilus_trader` and one imports `breezy.runtime.health`.
-
-**A note on the gap between the two evidence levels.** No test builds or runs
-the node (section 5.1), so nothing directly observes the real node handing our
-config to our factory. That link is closed by a chain of three assertions rather
-than by one integration test: RED 1 pins that `exec_clients` carries exactly our
-config type under exactly the registered name; RED 2 pins that the same name is
-handed to `add_exec_client_factory` with exactly our factory class; RED 3 pins
-that our factory, given a config of that type, returns our client. Nautilus
-resolves `data_clients` / `exec_clients` keys against registered factory names
-(`live/node.py:230`, `:251` `[V]`, and the hazard is documented at
-`quote_tape_cli.py:141-148` `[V]`), so the three together determine the
-composition. **State this limitation in the test module; do not let a reader
-believe a composed node was exercised.**
 
 **Barriers.**
 - **B6b narrowed** (`tests/unit/test_polymarket_us_readonly_guard.py:550` `[V]`):
@@ -975,21 +1366,29 @@ believe a composed node was exercised.**
 - **Cage layer 4** — only the NS-3 site's `exec_clients` changes, under the
   per-site value table; `strategies` and `exec_algorithms` stay `[]` there.
 - **`pyproject.toml`** gains one `ignore_imports` entry per new
-  nautilus-importing module (`exec.client`, `exec.config`, `exec.factories`, and
-  `exec.reports` if it imports the report types), each of the same shape as the
-  existing per-module entries, **plus** one entry
-  `breezy.adapters.polymarket_us.exec.client -> breezy.runtime.health` — an
+  nautilus-importing module — `exec.client`, `exec.config`, `exec.factories`
+  (`exec.reports`'s entry landed in NS-4) — each of the same shape as the twelve
+  existing per-module entries (`:88-142` `[V]`), **plus** one entry
+  `breezy.adapters.polymarket_us.exec.client -> breezy.runtime.health`: an
   upward `adapters -> runtime` import of exactly the same class as the recorded
-  debt `breezy.ingest.nws_actor -> breezy.runtime.health` (`pyproject.toml:79`
+  debt `breezy.ingest.nws_actor -> breezy.runtime.health` (`pyproject.toml:78`
   `[V]`). Recorded as inspected debt, with the alternative in OQ-3.
 - **No write verb, no write attribute, no endpoint literal outside
   `exec/endpoints.py`, no signing change.**
 
+**Files.** `src/breezy/adapters/polymarket_us/exec/client.py`, `exec/config.py`,
+`exec/factories.py`; `src/breezy/runtime/node_config.py` and
+`src/breezy/runtime/trade_cli.py` (the `exec_clients` site, the factory
+registration, and the latch-to-exit-code mapping); `pyproject.toml`;
+`tests/unit/test_polymarket_us_readonly_guard.py` (B6b narrowing); new
+`tests/unit/test_polymarket_us_exec_client.py` and
+`tests/contract/test_trading_node_composition_contract.py`.
+
 **Completion.** The full goal-state predicate holds. `breezy-trade` starts,
 connects, emits a true `USD` `CASH` account, reconciles the venue's positions and
-open orders or refuses to start the trader, and denies every order — with
-`scan_write_egress()` clean outside one file and both `PERMITTED_METHODS`
-frozensets still `{"GET"}`.
+open orders — or refuses, alerts `CRITICAL` and exits non-zero — and refuses
+every order on all six order-bearing coroutines, with `scan_write_egress()` clean
+outside one file and both `PERMITTED_METHODS` frozensets still `{"GET"}`.
 
 ---
 
@@ -1000,7 +1399,7 @@ NO-SEND work independently requires.
 
 | Deferred | Was | Why it is not here |
 |---|---|---|
-| The denial layer over the risk engine's fail-opens | E-5 | It denies orders *before Nautilus is consulted* on a path to a venue. There is no such path: all eight lifecycle coroutines already refuse unconditionally at NS-5, which is strictly stronger than a conditional pre-check. The fail-opens matter the moment one coroutine stops refusing — which is the first SEND increment. |
+| The denial layer over the risk engine's fail-opens | E-5 | It denies orders *before Nautilus is consulted* on a path to a venue. There is no such path: all **six order-bearing** coroutines already refuse unconditionally at NS-5, which is strictly stronger than a conditional pre-check. The fail-opens matter the moment one coroutine stops refusing — which is the first SEND increment. |
 | Settlement as exit | E-6 | Settlement realizes PnL on a position. **This plan can never open a position**, so there is nothing to settle. (It also could not use `generate_order_filled` on a filled order: `_ORDER_STATE_TABLE` has **seven** transitions *into* `FILLED` — `model/orders/base.pyx:116,124,126,136,143,150,156` `[V]` — and **zero** transitions *from* it. The predecessor said eight; the count was wrong and the load-bearing half was right.) |
 | Order-source / strategy enablement | E-7 | A registered strategy exists to produce orders. Every order is refused, so registering one adds a denial trace and a second thing that can be misconfigured. `strategies=[]` stays an explicit empty literal at all three node-config sites, pinned. |
 | `ExecAlgorithm`s | — | Permanently `[]` at all three sites. An `ExecAlgorithm` reaches `submit_order` in its own right (`node_config.py:213-217` `[V]`), so enabling one opens an order source outside any strategy. |
@@ -1014,6 +1413,30 @@ NO-SEND work independently requires.
 | `exec/direction.py` — the `OrderSide -> (intent, outcomeSide, action, price)` map | E-7 | It exists to construct a request body. No body is constructed. The `1.00 - X` inversion hazard is *inert* while no request is built; the AST **prohibitions** on `_SHORT`, `OUTCOME_SIDE_NO` and any `1 - price` form under `exec/` are retained at NS-2 anyway because they cost nothing. |
 | The `payout_cap x price` conversion | 4.2 vs E-5 | Deleted in the predecessor's 4.2 and still specified in its E-5 — a self-contradiction in which an implementer following the increment trips the increment's own scan. **Neither the conversion nor the scan is inherited here**: no cap is computed anywhere in this plan. |
 | The AST purity scan over the settlement identity function | E-6 | The identity it guarded is deferred. The *principle* is retained: this plan contains **no name-blacklist AST scan used as a proof of purity**, because one level of indirection defeats it — an impure helper called by a pure-looking function passes. Where this plan needs a property proven it proves it behaviourally (NS-4), and its AST scans are used only for *prohibitions* (a token must not appear), which indirection cannot defeat. |
+| `safety.py` D-1: `consume()` compares notionals with a bare `!=` and no type check, so a `Decimal` subclass overriding `__ne__` satisfies the re-check at any magnitude (`safety.py:463` `[V]`) | NS-2 rev 1 | `consume` is reachable only from a capability, minted only by the chokepoint, which this plan pins at **zero callers**. Fixing it here changes code no path in this plan executes. The mirror it should use already exists at `safety.py:676` `[V]`. |
+| `safety.py` D-3: renewal resets the operator's budget — issuance re-reads the ceilings (`:548`) and installs a fresh `_Budget` under a fresh `permit_id` (`:575`), `_PERMIT_BUDGETS` (`:332`) aggregates nothing, and `PERMIT_TTL_NS` is 15 minutes (`:157`), so renewal is forced `[V]` | NS-2 rev 1 | The fix **designs new authority state** — a process ledger keyed by `operator_id` — inside a plan whose seam is that the authority model is deferred. **Residual for the successor:** that key would be read from operator-controlled environment, so it must be pinned at first issuance and a different value refused; otherwise changing one variable mints a fresh budget, which is the same defect one level up. |
+
+
+### 8.1 Carry-forward — constraints this half establishes that the SEND half must honour
+
+These are not deferred *work*; they are **findings already paid for** that a
+successor would otherwise re-derive or, worse, contradict. Rows 1-6 are
+**inherited from `ORDER_EGRESS_PLAN.md` and NOT re-verified here** except where
+marked — they are recorded so the seam does not lose them, and the successor's
+first duty is to verify each at its cite. Rows 7-9 are established by this
+document and are `[V]`.
+
+| # | Constraint | Origin | Status |
+|---|---|---|---|
+| 1 | `TradeId` is capped at **36 characters**; a venue trade identifier longer than that must be hashed or truncated deterministically, never passed through | `ORDER_EGRESS_PLAN.md` | Inherited, **unverified here** |
+| 2 | The settlement price lives at `marketData.stats.settlementPx` in a `/book` response — **not** at `stats.settlementPx` — and the identically-named field in a `bbo_*` response sits at `marketData.settlementPx`, a different path, and must be excluded | same | **Verified here `[V]`**: a recursive key walk of `docs/evidence/venue/polymarket_us/raw/book_closed_15806.json` yields exactly `marketData.stats.settlementPx`; `bbo_closed_15806.json` yields exactly `marketData.settlementPx`; `market_closed_15806_by_slug.json` yields **no** settlement key at all |
+| 3 | A venue **correction** after settlement either silently drops or produces a phantom short, depending on the exit path chosen | same | Inherited, **unverified here** |
+| 4 | The settlement fill's **side, quantity, `venue_position_id` and emission precondition were never specified** in the predecessor — an unspecified fill is the defect, not a missing detail | same | Inherited, **unverified here** |
+| 5 | The settlement gate has a **fourth conjunct available for free**: `settlementSetTime` at or after expiration | same | **Field presence verified here `[V]`** — `marketData.stats.settlementSetTime` sits beside `settlementPx` in `book_closed_15806.json`, alongside `settlementPriceCalculationMethod`. The *semantics* of the conjunct are inherited and **unverified** |
+| 6 | The `known issuer == 1` pin collides with the operator probe script, which is a second issuer | same | Inherited, **unverified here** |
+| 7 | **`generate_mass_status` returning `None` on any refusal is correct for NO-SEND and WRONG for SEND.** Discarding a reconciliation while a position is open abandons it, with no cancel and no exit. NS-4 requires this sentence as a code comment above the `return None`, so the successor meets it in the source | this plan, NS-4 | `[V]` — `live/execution_engine.py:1721-1727` |
+| 8 | **`calculate_commission` must be overridden before any PnL is trusted.** Not overridden here, so an inferred reconciliation fill records `Money(0, quote_currency)` (`live/reconciliation.py:503-507`) | this plan, NS-5 rule 6 | `[V]` |
+| 9 | **The instrument-not-loaded fail-open has five sites, not one** (`live/execution_engine.py:2396-2400`, `:2435-2439`, `:2473-2477`, `:3057-3062`, `:3087-3092`), all DEBUG + `return True`. The input precondition NS-5 rule 2(b) installs is the single control that covers all five, and any widening of the instrument universe must keep it | this plan, NS-5 rule 2 | `[V]` |
 
 ---
 
@@ -1044,23 +1467,30 @@ is inherited.
 
 | # | Fact | Cite |
 |---|---|---|
-| **F-1** | `LiveExecutionClient` declares exactly **eight** coroutines to implement: `_connect`, `_disconnect`, `_submit_order`, `_submit_order_list`, `_modify_order`, `_cancel_order`, `_cancel_all_orders`, `_batch_cancel_orders` | `live/execution_client.py:598-636` |
-| **F-2** | With `generate_missing_orders=False`, a position-quantity discrepancy logs a warning and **`return True`** — native "reconciled" does not imply "matched" | `live/execution_engine.py:2501-2509` |
+| **F-1** | `LiveExecutionClient` declares exactly **eight** coroutines to implement — `_connect` and `_disconnect`, which take no command, plus **six order-bearing** ones: `_submit_order`, `_submit_order_list`, `_modify_order`, `_cancel_order`, `_cancel_all_orders`, `_batch_cancel_orders` | `live/execution_client.py:598-636` |
+| **F-2** | With `generate_missing_orders=False`, a position-quantity discrepancy logs a warning and **`return True`** — native "reconciled" does not imply "matched". Since the cache starts empty, **every** venue position is such a discrepancy. With the native `True`, the engine takes the diff path at `:2511-2563` and enters the position | `live/execution_engine.py:2501-2509`, `:2511-2563` |
 | **F-3** | `generate_mass_status` gathers the three plural report coroutines in a bare `asyncio.gather` inside one `try` with no `return_exceptions`, and returns `None` on any exception | `live/execution_client.py:498-514` |
 | **F-4** | A `None` mass status is counted as a reconciliation failure for that client | `live/execution_engine.py:1721-1727` |
-| **F-5** | If reconciliation fails, the kernel **returns** and `self._trader.start()` is never reached | `system/kernel.py:1027-1029`, `:1040`; `_await_execution_reconciliation` at `:1335-1349` |
+| **F-5** | If reconciliation fails, the kernel **returns** and `self._trader.start()` is never reached. Order in `start_async`: `_connect_clients()` `:1022`, `_await_engines_connected()` `:1024`, `_await_execution_reconciliation()` `:1028`, `_trader.start()` `:1039` | `system/kernel.py:1022-1039`; `_await_execution_reconciliation` at `:1335-1349` |
 | **F-6** | `_await_account_registered` warns "Cannot await account registration: account_id not set" and **returns** when `account_id` is unset | `live/execution_client.py:544-546` |
 | **F-7** | `self.account_id = None` at construction; `_set_account_id` is the only setter and asserts `self.id.to_str() == account_id.get_issuer()` | `execution/client.pyx:135`, `:148-152` |
 | **F-8** | `generate_account_state(balances, margins, reported, ts_event, info)` builds and publishes the `AccountState`; nothing calls it for you | `execution/client.pyx:329-367` |
-| **F-9** | `generate_order_denied(strategy_id, instrument_id, client_order_id, reason)` exists | `execution/client.pyx:370` |
-| **F-10** | `_query_account` is **called** and **never defined** in `LiveExecutionClient` | called at `live/execution_client.py:332`; no `async def _query_account` anywhere in the module source |
-| **F-11** | Native defaults: `reconciliation=True` (`:177`), `filter_unclaimed_external_orders=False` (`:180`), `generate_missing_orders=True` (`:183`), `inflight_check_interval_ms=2000` (`:184`), `inflight_check_threshold_ms=5000` (`:185`), `inflight_check_retries=5` (`:186`), `open_check_interval_secs=None` (`:188`) | `live/config.py` |
+| **F-9** | `generate_order_denied(strategy_id, instrument_id, client_order_id, reason, ts_event)` — **five** parameters, not four. `generate_order_modify_rejected` and `generate_order_cancel_rejected` each take **six** (`..., venue_order_id, reason, ts_event`) | `execution/client.pyx:370-406`, `:531-537`, `:575-581` |
+| **F-10** | `_query_account` is **called** and **never defined** in `LiveExecutionClient` | called at `live/execution_client.py:332`. **Absence probe:** grep for `_query_account` across `live/execution_client.py` and `execution/client.pyx`, which finds only the call. That probe sees definitions in those two files; it would not see one injected by a mixin or a `.pxd`-declared method, and none exists |
+| **F-11** | Native defaults: `reconciliation=True` (`:177`), `filter_unclaimed_external_orders=False` (`:180`), `generate_missing_orders=True` (`:183`), `inflight_check_interval_ms=2000` (`:184`), `inflight_check_threshold_ms=5000` (`:185`), `inflight_check_retries=5` (`:186`), `filter_position_reports=False` (`:181`), `open_check_interval_secs=None` (`:188`), `position_check_interval_secs=None` (`:195`) | `live/config.py` |
 | **F-12** | `filter_unclaimed_external_orders=True` makes the engine **discard** an unclaimed external report | `live/execution_engine.py:3575` |
 | **F-13** | The kernel raises `ValueError` only for an **unrecognized** `cache.database.type`; `"redis"` is the only supported value; **no connectivity probe anywhere** | `system/kernel.py:309-329` |
 | **F-14** | `_ORDER_STATE_TABLE`: seven transitions into `FILLED`, zero from it | `model/orders/base.pyx:116,124,126,136,143,150,156` |
 | **F-15** | `TradingNode.add_data_client_factory(name, factory)` at `:230`, `add_exec_client_factory(name, factory)` at `:251`; both take the factory **class** | `live/node.py` |
 | **F-16** | `LiveExecClientFactory.create(loop, name, config, msgbus, cache, clock) -> LiveExecutionClient` is the exec-client extension point, and is the **only** composition seam for one | `live/factories.py` |
-| **F-17** | `LiveExecutionEngine` exposes `registered_clients` and `_clients`; `TradingNode` exposes `cache`, `portfolio`, `trader` and no kernel or engine accessor — a constructed exec client is **not** reachable from outside | `dir()` over both classes on the installed 1.231.0 |
+| **F-17** | ~~`TradingNode` exposes no kernel or engine accessor; a constructed exec client is not reachable from outside~~ **WITHDRAWN — the claim was FALSE.** `TradingNode.kernel` is a public **instance** attribute assigned in `__init__` (`live/node.py:71`), and `node.kernel.exec_engine` (`system/kernel.py:906-915`) `.registered_clients` (`execution/engine.pyx:212-221`) resolves. **The probe was `dir()` over the class, which cannot see instance attributes** — an absence claim inheriting its probe's blind spot. Section 5.1 and REDs 1-2 now observe the built node directly | `live/node.py:71`, `system/kernel.py:906-915`, `execution/engine.pyx:212-221` |
+| **F-18** | The instrument-not-loaded fail-open has **five** sites in the reconciliation path, all DEBUG-log + `return True` | `live/execution_engine.py:2396-2400`, `:2435-2439`, `:2473-2477`, `:3057-3062`, `:3087-3092` |
+| **F-19** | Fill reports are applied **only inside the loop over `mass_status.order_reports`**, keyed by `venue_order_id`, so a `FillReport` with no matching `OrderStatusReport` is silently dropped | `live/execution_engine.py:1881-1907` |
+| **F-20** | An `OrderStatusReport` whose `filled_qty` exceeds the cached order's makes the engine generate an **inferred fill**, passing the execution client so `calculate_commission` is consulted; the base returns `None` and the helper substitutes `Money(0, quote_currency)` | `live/execution_engine.py:3220`, `:3485-3505`; `live/reconciliation.py:503-507`; `execution/client.pyx:165-194` |
+| **F-21** | A **sixth** related fail-open: an already-closed order reporting a different `filled_qty` logs and `return True  # Consider it reconciled to avoid infinite loops` | `live/execution_engine.py:3204-3214` |
+| **F-22** | `start_async` runs `_connect_clients()`, then `_await_engines_connected()`, and only then `_await_execution_reconciliation()` — so a data client that loads instruments inside its own `_connect` has them in the cache before the first report is reconciled | `system/kernel.py:1020-1039` |
+| **F-23** | `OrderDenied` is reachable only from `INITIALIZED`/`RELEASED`; on any other state `_apply_event_to_order` catches `InvalidStateTrigger`, warns and `return True`. `OrderModifyRejected`/`OrderCancelRejected` trigger the FSM only from `PENDING_UPDATE`/`PENDING_CANCEL` and otherwise leave the order untouched **without raising** | `model/orders/base.pyx:95,107`, `:1055-1060`; `execution/engine.pyx:1586-1594` |
+| **F-24** | `CancelAllOrders` carries `order_side` and no `client_order_id` (`messages.pxd:188-189`); `BatchCancelOrders` carries `cancels`, a list of `CancelOrder` (`:199-200`); `Cache.orders_open` filters by `venue`, `instrument_id`, `strategy_id`, `side`, `account_id` | `execution/messages.pxd`; `cache/cache.pyx:4710-4716` |
 
 ### 9.3 Breezy — all `[V]`
 
@@ -1080,9 +1510,9 @@ is inherited.
 | **B-12** | `pytest_configure` at `:227`, `pytest_sessionstart` at `:258` with an existing `pytest.exit(..., returncode=2)` at `:268` — both run before collection | `tests/conftest.py` |
 | **B-13** | CI runs the whole suite under the OS egress block (`.github/workflows/tests.yml:27`), then ruff, mypy and `lint-imports` (`:30-37`). The launcher keeps loopback usable inside the namespace (`scripts/ci/run_tests_no_egress.sh:32-43`) | as cited |
 | **B-14** | `http.PERMITTED_METHODS = frozenset({"GET"})` (`http.py:64`); `signing.PERMITTED_METHODS = frozenset({"GET"})` (`signing.py:84`); `get_authenticated(path, *, query, quota_key)` requires `quota_key` (`http.py:116-135`), refused unless in `PERMITTED_QUOTA_KEYS` (`transport.py:180`) | as cited |
-| **B-15** | `QUOTA_KEY_PORTFOLIO` (`transport.py:93`) is in `PERMITTED_QUOTA_KEYS` (`:98-106`), budgeted at 12/min, and has **no caller in `src/`** today | `transport.py`; grep of `quota_key=` under `src/breezy/adapters/polymarket_us/` |
+| **B-15** | `QUOTA_KEY_PORTFOLIO` (`transport.py:93`) is in `PERMITTED_QUOTA_KEYS` (`:98-106`), budgeted at 12/min, and has **no caller in `src/`** today — it does have **three live callers in `scripts/venue/polymarket_us_auth_smoke.py` (`:1018`, `:1062`, `:1122`)**, which is the file NS-1 extends. **Probe:** grep of `QUOTA_KEY_PORTFOLIO` across `src/` and `scripts/`; it sees literal references, not one built by string concatenation | `transport.py:93`, `:98-106`; grep across `src/` and `scripts/` |
 | **B-16** | `PolymarketUSLiveDataClientFactory` (`factories.py:320`) with `create` at `:334`; `config_from_env` at `:197`; credentials loaded at `:364`. `test_module_defines_no_execution_client_factory` (`tests/unit/test_polymarket_us_factories.py:461`) is scoped to that module only, and `create` is already tested socket-free by monkeypatching `NautilusHttpTransport` and the credential loader (`:181-182`) | as cited |
-| **B-17** | `resolve_alert_sink` (`health.py:495`), `emit_alert` catching `BaseException` (`:514-535`), `WebhookAlertSink.close` (`:479-492`). The sink is constructed **only** in `ingest_runtime` (`composition.py:352`) and torn down by `_close_alert_sink` (`:255-268`) — there is **no alert sink in any venue-facing process** | as cited |
+| **B-17** | `resolve_alert_sink` (`health.py:495`), `emit_alert` catching `BaseException` (`:514-535`), `WebhookAlertSink.close` (`:479-492`). The sink is constructed at **four** sites, not one: `ingest_runtime` (`composition.py:352`, torn down by `_close_alert_sink` `:255-268`), `ingest/nws_actor.py:2070` (lazy), `strategy/weather_common/refusals.py:123`, and as a default argument at `composition.py:279`. The load-bearing half stands — **no alert sink exists in any venue-facing process** — and `refusals.py:113-124` is the established `sink=None -> resolve_alert_sink()` injection pattern NS-5 adopts | as cited |
 | **B-18** | `BinaryOption.currency = USD` for every Breezy instrument | `src/breezy/adapters/polymarket_us/parsing.py:1204` |
 | **B-19** | `safety.py`: `PERMIT_TTL_NS` = 15 min (`:157`), `_PERMIT_BUDGETS` keyed per permit (`:332`), `consume` compares notionals with a bare `!=` (`:463`), `issue_live_trading_permit` (`:527`) re-reads ceilings (`:548`) and installs a fresh `_Budget` (`:575`), `assert_live_order_submission_permitted` (`:626`) takes no method and no path, and there is already a `type(x) is not Decimal` guard at `:676` to mirror. `issue_live_trading_permit` is in the package `__all__` (`adapters/polymarket_us/__init__.py:107,191`) | as cited |
 | **B-20** | Every read surface is GET and every write surface is POST in the SDK snapshot: `account.py:16`, `portfolio.py:18,26`, `orders.py:35,42` versus `orders.py:27,47,55,63,71,79` | `docs/evidence/venue/polymarket_us/sdk_snapshot/polymarket_us_0.1.2/resources/` |
@@ -1090,8 +1520,23 @@ is inherited.
 | **B-22** | `docs/evidence/venue/polymarket_us/raw/` contains 27 captures, **none** of them an authenticated account, position, order or activity payload | listing of that directory |
 | **B-23** | The operator smoke already issues `GET /v1/portfolio/positions` (`:163`) and recorded 200 responses on 2026-08-30; it records **no body**; it has a frame-shape-without-values recorder at `:955` and a post-redaction verification at `:710-720`; the artifact reports "HTTP methods issued: GET" and "write requests issued: 0" | `scripts/venue/polymarket_us_auth_smoke.py`; `docs/evidence/venue/polymarket_us/READONLY_AUTH_SMOKE_2026-08-30T155317+0000.md` |
 | **B-24** | `tests/contract/test_node_composition_contract.py` constructs a genuine `TradingNode` and never builds or runs it (`:135-143`), and asserts the construction opens no socket (`:432`) | as cited |
-| **B-25** | The import-linter layer order puts `runtime` **above** `adapters`, so `adapters -> runtime` is upward; `breezy.ingest.nws_actor -> breezy.runtime.health` is already recorded as inspected debt of that class (`:79`); the forbidden-`nautilus_trader` contract needs one `ignore_imports` entry per importing module | `pyproject.toml:55-142` |
+| **B-25** | The import-linter layer order puts `runtime` **above** `adapters`, so `adapters -> runtime` is upward; `breezy.ingest.nws_actor -> breezy.runtime.health` is already recorded as inspected debt of that class (`:78`); the forbidden-`nautilus_trader` contract needs one `ignore_imports` entry per importing module | `pyproject.toml:55-142` |
 | **B-26** | 13 test modules already build Nautilus components from `nautilus_trader.test_kit.stubs`, so the engine-level RED technique is established rather than new | grep of `test_kit` under `tests/` |
+
+
+### 9.4 Withdrawn — claims revision 1 of THIS document made and cannot defend
+
+Recorded rather than deleted, because a withdrawn claim that vanishes is
+indistinguishable from one that was never made.
+
+| # | Revision 1 claimed | Actually | Where it was swept |
+|---|---|---|---|
+| **W-1** | F-17: `TradingNode` exposes no kernel or engine accessor (probe: class-level `dir()`) | **False** — `self.kernel` is an instance attribute (`live/node.py:71` `[V]`). The probe could not see it | §5.1 rewritten to direct observation; NS-3 REDs 3-4 and NS-5 REDs 1-2; §9.2 F-17 marked withdrawn; §4's NS-5 bullet; container-check rows 8b and 17; §6.1's process-container row |
+| **W-2** | `_assert_reconciled` compares reports against the cache inside `generate_mass_status` | **Mistimed.** The engine applies reports only *after* that call (`live/execution_engine.py:1710-1712`, `:1732` `[V]`), and with `database=None` the cache is empty at that moment, always | NS-5 rule 2 replaced by an input precondition; RED 11 rewritten; OQ-2's wording; OQ-9 added |
+| **W-3** | `generate_missing_orders=False` | **Inverted the mechanism.** With `False` every venue position is a discrepancy that warns and `return True` (`:2501-2509` `[V]`), making goal clause (c) unachievable | NS-5 rule 2(a) and the config pin list; §6.1 gained the `generate_missing_orders=True` row |
+| **W-4** | "All eight lifecycle coroutines refuse" with `generate_order_denied` | **Two are not order-bearing, and `OrderDenied` is invalid on four of the six** (F-23) | Goal clause (d) and its falsifier; §4 walk; NS-5 rule 5 table; RED 9 |
+| **W-5** | NS-1 reuses `diagnose_frame_payload` to record "shape without values" | **Inverted.** `_walk_structure` publishes every scalar verbatim (`data.py:428-429` `[V]`); the docstring suppresses *non*scalars | NS-1 rewritten around a new value-free recorder; container-check row 4; §6.3 item 8; §2's summary of added rows |
+| **W-6** | "If Redis is unreachable the process refuses to start" | Uncited and false (C-3) | Withdrawn in revision 1 already; Redis is out of scope entirely |
 
 ---
 
@@ -1100,13 +1545,16 @@ is inherited.
 | ID | Question | What would close it | If it does not close |
 |---|---|---|---|
 | **OQ-1** | The exact field names, nesting and fixed-point scale of `GetAccountBalancesResponse`, `GetUserPositionsResponse`, `GetOpenOrdersResponse` and `GetActivitiesResponse` | **NS-1**, from a live authenticated read | NS-4's mappers refuse by record and clause (c) of the goal state is not claimed (see NS-1, "if the operator run cannot happen") |
-| **OQ-2** | Which venue field carries a position's **average entry price**. `UserPosition` has `cost` and `netPosition` but no explicit avg-px field (B-21) | NS-1's shape artifact | `PositionStatusReport.avg_px_open` is left `None` and `_assert_reconciled` compares quantity only, **stating that limitation in the code**, rather than deriving a price from `cost / netPosition` unverified |
+| **OQ-2** | Which venue field carries a position's **average entry price**. `UserPosition` has `cost` and `netPosition` but no explicit avg-px field (B-21) | NS-1's shape artifact — **field names only; NS-1 records no values, so no arithmetic can be checked against it** | `PositionStatusReport.avg_px_open` is left `None`, with that limitation stated in the mapper's docstring, rather than deriving a price from `cost / netPosition` unverified. Nothing in NO-SEND consumes it |
 | **OQ-3** | Should the alert primitives move below `adapters` instead of `exec/client.py` importing `breezy.runtime.health` upward? | A survey of `health.py`'s own dependencies; it is a `runtime` module with no obvious downward blocker | NS-5 adds one `ignore_imports` entry of the same class as the recorded `nws_actor` debt, and this stays open |
-| **OQ-4** | Is `/v1/portfolio/activities` actually the fill source, and does it distinguish a fill from a deposit or transfer? | NS-1's shape artifact plus `ActivityType` (B-21) | The fill mapper maps `ACTIVITY_TYPE_TRADE` only and refuses every other type by name — a refusal, never a guess |
+| **OQ-4** | Is `/v1/portfolio/activities` actually the fill source, and does it distinguish a fill from a deposit or transfer? | NS-1's shape artifact plus `ActivityType` (B-21) | The fill mapper maps `ACTIVITY_TYPE_TRADE` only and refuses every other type by name — a refusal, never a guess. **Note that mapped is not applied:** with `/v1/orders/open` as the only order source, the engine drops any fill without a matching order report (F-19), so no goal clause depends on this answer |
 | **OQ-5** | Does the venue's 30-second signing window hold for these four endpoints? The 2026-08-30 smoke observed a **deliberately stale (-120 s) timestamp ACCEPTED** on `/v1/portfolio/positions` `[V]` | A repeat observation in NS-1 | Nothing in this plan depends on it; recorded so a future tightening is noticed rather than assumed |
 | **OQ-6** | Is `base_currency=USD` strictly safer than `None`, given the currency-identity check? | A local test once a balances shape is known | `None` plus the identity check ships |
 | **OQ-7** | Do the deferred permit defects (endpoint scope, fingerprint contract, authority types) need to land before *any* capability is minted, or only before the first exposure-opening one? | A review of the first SEND increment's plan | Treated as **hard prerequisites of the first increment that mints a capability**, which is the conservative reading |
 | **OQ-8** | Does `GET /v1/orders/open` ever return an order Breezy did not place — for example one the operator placed manually on the same API key? | Observation in NS-1 | NS-4's order-status mapper maps them, NS-5 reports them, and reconciliation attributes them natively; nothing in this plan claims Breezy is the only actor on the key |
+| **OQ-9** | Is there any seam at which Breezy can observe the **outcome** of reconciliation, rather than only its input? | A hook invoked after `_reconcile_execution_mass_status` — searched `live/execution_client.py` and `execution/client.pyx` and found none `[V]`; a Nautilus release note would close it | NS-5 rule 2 enforces truth on the **input** only, and the residual is stated in the module docstring: after handoff, the engine's own fail-opens (F-18, F-21) are not observable from this process. Goal clause (c) is verified at engine level in tests (RED 11), and in production by the precondition plus the absence of a refusal |
+| **OQ-10** | Does the process need an order source covering **closed** orders, so that fills apply (F-19) and inferred fills stop being silently dropped? | The venue exposing a closed-order or order-history listing; `/v1/order/{order_id}` needs an id we never hold | Fills are mapped and not applied. No goal clause depends on a fill reaching the cache; positions come from the position reports. Carried to the SEND half, where a fill that does not apply is a real exposure error |
+| **OQ-11 — CLOSED 2026-08-31, decided, not escalated** | May the operator's account hold a position in a market **outside** the instrument provider's weather universe? | **Not an operator question.** The operator's reserved controls are maximum daily budget and maximum per position; this is a correctness decision and therefore ours. It also cannot be closed by an NS-1 capture: a position count is value-derived and the recorder rule forbids cardinality | **DECIDED: refuse, loudly** — NS-5 rule 2(b) refuses reconciliation, the process does not trade, and the `instrument_id` is named in a `CRITICAL` alert. Rationale: in NO-SEND, refusing costs *nothing* — the process cannot trade anyway, so "refuses to start trading" forfeits no capability, while proceeding would tolerate exposure we cannot see and would set clause (c) aside on its first real test. **The trade-off inverts for the SEND half**, where refusing has a real cost (an unrelated position halts live trading), so that half must re-decide rather than inherit this. Recorded as carry-forward row 10 |
 
 ---
 
@@ -1133,18 +1581,26 @@ is inherited.
 
 Attack in this order.
 
-1. **Section 9.1 first.** Five of the predecessor's `[V]` claims were wrong. If
-   any claim in 9.2 or 9.3 is wrong, the increment resting on it is wrong.
+1. **Sections 9.1 and 9.4 first.** Five of the predecessor's `[V]` claims were
+   wrong, and six of revision 1's own. If any claim in 9.2 or 9.3 is wrong, the
+   increment resting on it is wrong. **Attack the absence claims hardest** —
+   F-10, F-17's replacement and OQ-9's "no post-reconciliation seam" each state
+   the probe used; ask what that probe cannot see.
 2. **Section 2 against section 3.** Does every artifact have a container, and is
    that container earlier?
 3. **Section 1's predicate against section 4's walk.** Does the walk actually
    arrive, and does each increment add what it claims?
 4. **The REDs.** For each, ask: *what makes this go red, and could a wrong
-   implementation make it go green?* Two are already flagged as weak (NS-3 RED 6
-   is vacuous until the builder lands; NS-4 RED 5 passes by rule C1 the moment
-   the path string exists). Find the others.
-5. **Section 8.** Is anything deferred that the goal state secretly needs? Is
-   any hook left for something deferred?
+   implementation make it go green?* Four are flagged as weak or non-discovering
+   in place: NS-3 RED 6 (vacuous until the builder lands); NS-4 RED 8 (passes by
+   rule C1 the moment the path string exists — labelled *not a RED*); NS-4 RED 6
+   (an AST assertion that a file imports nothing, which is a pin rather than a
+   discovery); NS-5 RED 2 (trivially red, but it is what makes RED 1
+   non-vacuous). Find the others.
+5. **Section 8, and 8.1 hardest.** Is anything deferred that the goal state
+   secretly needs? Is any hook left for something deferred? **Rows 1 and 3-6 of
+   8.1 are inherited and unverified** — if one is wrong, say so here rather than
+   letting the SEND half inherit it a second time.
 6. **The scan.** After every increment: `scan_write_egress(("src","scripts"))`
    returns zero violations outside `exec/endpoints.py`, and both
    `PERMITTED_METHODS` frozensets are still `frozenset({"GET"})`.
