@@ -42,15 +42,54 @@ plus 35 CLI AFOS retrievals.
 
 ## Still open
 
-Four scripts still default to the `/tmp` path:
-`settlement_alignment_diagnosis.py:39`, `settlement_bucket_gate.py:42`,
-`settlement_bucket_guard_band.py:45`, and `settlement_alignment_study.py:45` —
-the last pointing at `scripts/analysis/cache/settlement_alignment`, which does
-not exist at all.
+### CLOSED 2026-08-31 — the `/tmp` defaults. This section was stale.
 
-Until those defaults move, a future run silently re-fetches into `/tmp` and the
-problem returns. Tracked as the follow-up to this note.
+This note originally claimed four scripts still defaulted to the `/tmp` path
+(`settlement_alignment_diagnosis.py:39`, `settlement_bucket_gate.py:42`,
+`settlement_bucket_guard_band.py:45`, `settlement_alignment_study.py:45`) and
+that a future run would silently re-fetch into `/tmp`. **That is no longer
+true, and the claim is corrected here rather than left to mislead.**
 
-`settlement_bucket_guard_band_2026-08-26.md:4` also records a `--catalog-base`
+All four now route through a single shared module,
+`scripts/analysis/settlement_alignment_cache.py`, which at `:8-10` defaults to
+this directory:
+
+```python
+DEFAULT_SETTLEMENT_ALIGNMENT_CACHE_DIR: Final[Path] = (
+    Path.home() / ".local/share/breezy/archive/settlement-alignment-cache"
+)
+```
+
+and which **fails closed** at `:24-31` — `require_settlement_alignment_cache_dir`
+raises `SettlementAlignmentCacheError` naming the expected directory rather than
+re-fetching anything:
+
+| Script | imports (line) | `DEFAULT_CACHE_DIR` | fail-closed call |
+|---|---|---|---|
+| `settlement_alignment_diagnosis.py` | `:22-25` | `:45` | `:489` |
+| `settlement_bucket_gate.py` | `:24-27` | `:57` | `:819` |
+| `settlement_bucket_guard_band.py` | `:22-25` | `:50` | `:663` |
+| `settlement_alignment_study.py` | `:33-36` | `:50` | `:1170` |
+
+The only surviving `/tmp` reference is prose in a docstring
+(`settlement_alignment_study.py:1089`) describing the historical location.
+`DATA_CAPTURE_AND_RISK_PLAN.md` §0.2 finding H records the same correction.
+**The follow-up this note tracked is closed.**
+
+### Superseded — this archive now has a verified off-device backup
+
+`docs/evidence/archive/ARCHIVE_BACKUP_2026-08-31T002635Z.md` (increment P0)
+records a `.tar.zst` copy on `/dev/sdb1` (`st_dev` 2065, against the primary's
+64512), verified **40/40 from a restored extraction** against the manifest at
+`:28-31` above. The quote tape under `<catalog_root>/live/` is covered by the
+same run (37/37). The `/tmp` copy is still not deleted and is no longer the
+only redundancy.
+
+### Genuinely still open
+
+`settlement_bucket_guard_band_2026-08-26.md:4` records a `--catalog-base`
 inside a *session scratchpad* under `/tmp/claude-1000/...`, which is more
 ephemeral still. That snapshot is not recovered here and may already be gone.
+
+The P0 backup is a second **device**, not a second **host**: a host-loss event
+still takes every copy. Off-host storage needs an operator spend ceiling.

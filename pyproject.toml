@@ -194,6 +194,9 @@ files = [
     # because the directory carried pre-existing strict errors owned by that
     # seam; those errors are now fixed and the gate is widened to cover it.
     "scripts/analysis",
+    # `scripts/archive` (P0). The operator EXECUTES this against the only copy
+    # of two irreplaceable datasets, so it is typechecked like the venue smoke.
+    "scripts/archive",
     #
     # `tests/` (Q-2). Previously excluded wholesale -- it carried 159
     # pre-existing strict errors across 38 files, so only the polymarket_us
