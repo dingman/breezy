@@ -1,5 +1,27 @@
 # Order egress — implementation plan
 
+> **SPLIT AND PARTIALLY SUPERSEDED — 2026-08-31.** Three adversarial review rounds
+> (16 blocking → 5 criticals → ~7 criticals + ~10 highs) showed this document
+> DIVERGING: each revision's fixes created defects faster than they closed them.
+> See `ORDER_EGRESS_PLAN_REVIEW_R3_2026-08-31.md` and LESSONS L-4.
+>
+> **Do not implement from this file.**
+>
+> - **E-0..E-4** (NO-SEND: firewall, cage, trading process, endpoints + report
+>   mappers, refusing execution client) → **`EXEC_CLIENT_NOSEND_PLAN.md`**.
+> - **E-5..E-14** (denial layer, settlement exit, order-source enablement, and
+>   every SEND increment incl. the multi-type authority algebra) → deferred to
+>   successor plans, to be written after the container exists as code.
+>
+> **Known-false claims retained here for the record, NOT for use:** N-14 ("the
+> process itself does not exist") is FALSE — a `TradingNode` is built and run today
+> (`quote_tape_cli.py:195`, `:151-156`); the real gap is the absence of a
+> trading-ROLE config and a `breezy-trade` entry point. The settlement `TradeId`
+> format exceeds the 36-char cap and is unconstructable. The primary settlement
+> source names the wrong endpoint and the wrong field path. Findings, evidence and
+> the surviving material worth carrying forward are in the round-3 review.
+
+
 **Status:** **REVISION 3.** Not executed. Revision 1 was reviewed by four
 independent adversarial lenses (architecture/omission, security/cage,
 runtime/execution-path, prediction-market/domain), each blind to the others, and
