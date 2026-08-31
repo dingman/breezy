@@ -598,7 +598,24 @@ A `try/except` treating the raise as "not weather" silently drops instruments fr
 
 **Still ours, and thin:** the instrument → `event_key` mapping. It maps and sums native numbers. **If it grows its own state, the null hypothesis was abandoned** — a test asserts it holds no quantity-typed field and no mutator.
 
-**Also remove:** `_equity()` (`forecast_revision/strategy.py:392-403`) hand-loops `account.balance_total(...)`, duplicating native `PortfolioFacade.equity(venue)`.
+**`_equity()` -- WITHDRAWN as a removal. It is a LESSONS L-2 unit change, not duplication.**
+Revision 2 originally said `_equity()` (`forecast_revision/strategy.py`, and the same
+method in the other two strategies) hand-loops `account.balance_total(...)` and merely
+duplicates native `PortfolioFacade.equity(venue)`. **That instruction is withdrawn.**
+
+The two are NOT the same number. Native `equity()` is
+`balance.total + SUM(mark_value of open positions)` (`portfolio/portfolio.pyx:1180-1181`);
+Breezy's `_equity()` returns **`balance_total` only**. Swapping them changes what every
+equity-scaled cap is a fraction OF, inflating the caps by the mark-to-market value of
+open positions -- largest exactly when the book is most exposed.
+
+Either keep the local definition and document why it is deliberately not native
+`equity()`, or adopt native and re-derive every fraction against the new base behind a
+characterisation test, declared as a behaviour change. This is the SECOND "just use the
+native one" instruction in this plan that was really a unit change (the first:
+`net_exposure` vs `qty x contract_size`, section 2.3). **The pattern is now the
+expectation, not the surprise: before ANY native substitution in P4, state both units
+and prove they match.**
 
 #### P4.3 — Aggregate ceiling
 
