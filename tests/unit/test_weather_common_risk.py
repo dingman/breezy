@@ -389,6 +389,316 @@ def test_an_allowed_order_records_no_refusal() -> None:
 
 
 # ---------------------------------------------------------------------------
+# BL-8 -- every `evaluate_order` refusal is counted, not just `shorts_disabled`
+# ---------------------------------------------------------------------------
+#
+# `evaluate_order` is only ever invoked once a strategy's decision layer has
+# already formed a non-`FLAT`, non-`None` `SignalDecision` and is attempting
+# to submit it (see `RiskManager._refuse`'s docstring for the call-site
+# proof). Every refusal below therefore blocks an order the strategy
+# actually tried to place -- a gag, not "no opportunity" -- and must count.
+
+
+def test_stale_quote_refusal_is_recorded_on_the_counter() -> None:
+    """A gagged run must be distinguishable from an efficient market.
+
+    Regression for BL-8: `quote_tradable`'s `stale_quote` reason reaches
+    `evaluate_order` but was never recorded, so a run refused on every tick
+    for a stale quote reported a clean, unqualified `COMPLETED`.
+    """
+    contract = _contract("A", lower_f=80, upper_f=None)
+    counter = RefusalCounter()
+    risk = RiskManager(RiskLimits(), {"A": contract}, refusals=counter)
+
+    decision = risk.evaluate_order(
+        contract=contract,
+        signed_qty_delta=10.0,
+        hours_to_settlement=24.0,
+        forecast_age_hours=0.0,
+        edge=0.50,
+        portfolio=PortfolioSnapshot(),
+        quote=_quote(),
+        quote_age_minutes=999.0,  # far past the default 15-minute limit
+    )
+
+    assert decision.allowed is False
+    assert decision.reason == "stale_quote"
+    assert counter.count("stale_quote") == 1
+
+
+def test_max_event_notional_refusal_is_recorded_on_the_counter() -> None:
+    """Regression for BL-8: notional-cap refusals were silently uncounted."""
+    contract = _contract("A", lower_f=80, upper_f=None)
+    counter = RefusalCounter()
+    risk = RiskManager(
+        RiskLimits(max_event_notional=1.0, max_location_notional=100.0),
+        {"A": contract},
+        refusals=counter,
+    )
+
+    decision = risk.evaluate_order(
+        contract=contract,
+        signed_qty_delta=10.0,
+        hours_to_settlement=24.0,
+        forecast_age_hours=0.0,
+        edge=0.50,
+        portfolio=PortfolioSnapshot(equity=10_000.0),
+        quote=_quote(),
+        quote_age_minutes=0.0,
+    )
+
+    assert decision.allowed is False
+    assert decision.reason == "max_event_notional"
+    assert counter.count("max_event_notional") == 1
+
+
+def test_max_location_notional_refusal_is_recorded_on_the_counter() -> None:
+    contract = _contract("A", lower_f=80, upper_f=None)
+    counter = RefusalCounter()
+    risk = RiskManager(
+        RiskLimits(max_event_notional=100.0, max_location_notional=1.0),
+        {"A": contract},
+        refusals=counter,
+    )
+
+    decision = risk.evaluate_order(
+        contract=contract,
+        signed_qty_delta=10.0,
+        hours_to_settlement=24.0,
+        forecast_age_hours=0.0,
+        edge=0.50,
+        portfolio=PortfolioSnapshot(equity=10_000.0),
+        quote=_quote(),
+        quote_age_minutes=0.0,
+    )
+
+    assert decision.allowed is False
+    assert decision.reason == "max_location_notional"
+    assert counter.count("max_location_notional") == 1
+
+
+def test_max_position_refusal_is_recorded_on_the_counter() -> None:
+    contract = _contract("A", lower_f=80, upper_f=None)
+    counter = RefusalCounter()
+    risk = RiskManager(
+        RiskLimits(max_position_contracts=5.0),
+        {"A": contract},
+        refusals=counter,
+    )
+    portfolio = PortfolioSnapshot(position_qty={"A": 5.0})
+
+    decision = risk.evaluate_order(
+        contract=contract,
+        signed_qty_delta=1.0,  # already at the cap; no room left
+        hours_to_settlement=24.0,
+        forecast_age_hours=0.0,
+        edge=0.50,
+        portfolio=portfolio,
+        quote=_quote(),
+        quote_age_minutes=0.0,
+    )
+
+    assert decision.allowed is False
+    assert decision.reason == "max_position"
+    assert counter.count("max_position") == 1
+
+
+def test_exclusive_bucket_conflict_refusal_is_recorded_on_the_counter() -> None:
+    bucket_a = _contract("A", lower_f=80, upper_f=None)
+    bucket_b = _contract("B", lower_f=85, upper_f=None)
+    counter = RefusalCounter()
+    risk = RiskManager(RiskLimits(), {"A": bucket_a, "B": bucket_b}, refusals=counter)
+    portfolio = PortfolioSnapshot(position_qty={"A": 10.0})
+
+    decision = risk.evaluate_order(
+        contract=bucket_b,
+        signed_qty_delta=5.0,
+        hours_to_settlement=24.0,
+        forecast_age_hours=0.0,
+        edge=0.50,
+        portfolio=portfolio,
+        quote=_quote(),
+        quote_age_minutes=0.0,
+    )
+
+    assert decision.allowed is False
+    assert counter.count("exclusive_bucket_conflict") == 1
+
+
+def test_settlement_halt_refusal_is_recorded_on_the_counter() -> None:
+    """One of the "earlier gates" BL-8 calls out by name."""
+    contract = _contract("A", lower_f=80, upper_f=None)
+    counter = RefusalCounter()
+    risk = RiskManager(RiskLimits(), {"A": contract}, refusals=counter)
+
+    decision = risk.evaluate_order(
+        contract=contract,
+        signed_qty_delta=10.0,
+        hours_to_settlement=0.1,
+        forecast_age_hours=0.0,
+        edge=0.50,
+        portfolio=PortfolioSnapshot(),
+        quote=_quote(),
+        quote_age_minutes=0.0,
+    )
+
+    assert decision.allowed is False
+    assert counter.count("settlement_halt") == 1
+
+
+def test_edge_below_minimum_refusal_is_recorded_on_the_counter() -> None:
+    """The other "earlier gate" BL-8 calls out by name."""
+    contract = _contract("A", lower_f=80, upper_f=None)
+    counter = RefusalCounter()
+    risk = RiskManager(RiskLimits(), {"A": contract}, refusals=counter)
+
+    decision = risk.evaluate_order(
+        contract=contract,
+        signed_qty_delta=10.0,
+        hours_to_settlement=24.0,
+        forecast_age_hours=0.0,
+        edge=0.01,
+        portfolio=PortfolioSnapshot(),
+        quote=_quote(),
+        quote_age_minutes=0.0,
+    )
+
+    assert decision.allowed is False
+    assert counter.count("edge_below_minimum") == 1
+
+
+def test_wide_spread_refusals_collapse_to_one_bounded_counter_key() -> None:
+    """`quote_tradable` composes `f"spread_{spread:.3f}"` -- a raw record of
+    that string would grow one counter key per distinct spread value ever
+    observed, an unbounded key space keyed by market noise. Every wide-spread
+    refusal, regardless of the measured spread, must land on ONE key.
+    """
+    contract = _contract("A", lower_f=80, upper_f=None)
+    counter = RefusalCounter()
+    risk = RiskManager(RiskLimits(max_bid_ask_spread=0.01), {"A": contract}, refusals=counter)
+
+    first = risk.evaluate_order(
+        contract=contract,
+        signed_qty_delta=10.0,
+        hours_to_settlement=24.0,
+        forecast_age_hours=0.0,
+        edge=0.50,
+        portfolio=PortfolioSnapshot(),
+        quote=_quote(bid=0.40, ask=0.42),  # spread 0.02
+        quote_age_minutes=0.0,
+    )
+    second = risk.evaluate_order(
+        contract=contract,
+        signed_qty_delta=10.0,
+        hours_to_settlement=24.0,
+        forecast_age_hours=0.0,
+        edge=0.50,
+        portfolio=PortfolioSnapshot(),
+        quote=_quote(bid=0.30, ask=0.40),  # spread 0.10, a DIFFERENT value
+        quote_age_minutes=0.0,
+    )
+
+    assert first.allowed is False
+    assert first.reason == "spread_0.020"  # outward reason keeps the value
+    assert second.allowed is False
+    assert second.reason == "spread_0.100"
+    assert counter.count("wide_spread") == 2  # both land on the one bounded key
+    assert "spread_0.020" not in counter.counts
+    assert "spread_0.100" not in counter.counts
+
+
+# ---------------------------------------------------------------------------
+# BL-9 -- a future-dated quote (negative age) must not fail open as fresh
+# ---------------------------------------------------------------------------
+
+
+def test_a_future_dated_quote_is_refused_as_future_quote() -> None:
+    """`now_ts_age_minutes` negative means `quote.ts_event` is AHEAD of
+    `now` -- clock skew or a bad feed timestamp, not freshness. Before the
+    fix, `now_ts_age_minutes > stale_quote_minutes` was the only staleness
+    check, and a negative age never exceeds a positive threshold, so the
+    quote was silently accepted as fresh.
+    """
+    contract = _contract("A", lower_f=80, upper_f=None)
+    counter = RefusalCounter()
+    risk = RiskManager(RiskLimits(), {"A": contract}, refusals=counter)
+
+    decision = risk.evaluate_order(
+        contract=contract,
+        signed_qty_delta=10.0,
+        hours_to_settlement=24.0,
+        forecast_age_hours=0.0,
+        edge=0.50,
+        portfolio=PortfolioSnapshot(),
+        quote=_quote(),
+        quote_age_minutes=-1440.0,  # quote.ts_event is a full day in the future
+    )
+
+    assert decision.allowed is False
+    assert decision.reason == "future_quote"
+    assert counter.count("future_quote") == 1
+
+
+def test_zero_age_quote_is_still_accepted() -> None:
+    """Boundary proof: the fix must not over-tighten `now_ts_age_minutes == 0`."""
+    contract = _contract("A", lower_f=80, upper_f=None)
+    risk = RiskManager(RiskLimits(), {"A": contract})
+
+    decision = risk.evaluate_order(
+        contract=contract,
+        signed_qty_delta=10.0,
+        hours_to_settlement=24.0,
+        forecast_age_hours=0.0,
+        edge=0.50,
+        portfolio=PortfolioSnapshot(equity=10_000.0),
+        quote=_quote(),
+        quote_age_minutes=0.0,
+    )
+
+    assert decision.allowed is True
+
+
+def test_small_positive_age_within_the_stale_bound_is_still_accepted() -> None:
+    """Boundary proof: an ordinary fresh quote must not be caught by BL-9."""
+    contract = _contract("A", lower_f=80, upper_f=None)
+    risk = RiskManager(RiskLimits(), {"A": contract})  # stale_quote_minutes default 15.0
+
+    decision = risk.evaluate_order(
+        contract=contract,
+        signed_qty_delta=10.0,
+        hours_to_settlement=24.0,
+        forecast_age_hours=0.0,
+        edge=0.50,
+        portfolio=PortfolioSnapshot(equity=10_000.0),
+        quote=_quote(),
+        quote_age_minutes=5.0,
+    )
+
+    assert decision.allowed is True
+
+
+def test_age_exactly_at_the_stale_quote_boundary_is_still_accepted() -> None:
+    """The pre-existing `>` (not `>=`) boundary at `stale_quote_minutes` is
+    unchanged by BL-9 -- this pins that BL-9 touched only the negative side.
+    """
+    contract = _contract("A", lower_f=80, upper_f=None)
+    risk = RiskManager(RiskLimits(stale_quote_minutes=15.0), {"A": contract})
+
+    decision = risk.evaluate_order(
+        contract=contract,
+        signed_qty_delta=10.0,
+        hours_to_settlement=24.0,
+        forecast_age_hours=0.0,
+        edge=0.50,
+        portfolio=PortfolioSnapshot(equity=10_000.0),
+        quote=_quote(),
+        quote_age_minutes=15.0,
+    )
+
+    assert decision.allowed is True
+
+
+# ---------------------------------------------------------------------------
 # `allow_short=True` is unreachable from any DEFAULT construction path
 # ---------------------------------------------------------------------------
 
