@@ -139,6 +139,37 @@ not trade under `realistic`, that is reported plainly, with the specific gate
 that blocked it -- this script does not iterate on forecast values to
 manufacture trades.
 
+WHY BOTH CONDITIONS ARE KEPT, DELIBERATELY
+--------------------------------------------
+On `orders_submitted`/`fills`/`ending_balance_usd` alone, every
+`naive`/`realistic` row pair is identical for `forecast_mispricing` (its
+`realistic` override sets `allow_short=False`, already that strategy's config
+default) and for `calibration_mean_reversion`/`forecast_revision` (both
+submit zero orders in EITHER condition, because `SHORTS_DISABLED` -- every
+`SHORT_YES` signal refused under each strategy's own `allow_short=False`
+default, see `RefusalCounter`/`derive_completion_status` -- refuses the
+signal before `published_at` timing can matter). That made the two
+conditions LOOK like a no-op pair. They are not: `naive` and `realistic`
+differ materially in REFUSAL signal, which only became visible once
+`RunResult.refusal_counts`/`status` existed. From the real
+`primary_real_preliminary` scenario:
+
+    condition  strategy                    orders  status                 refusals
+    naive      calibration_mean_reversion  0       COMPLETED              {}
+    naive      forecast_revision           0       COMPLETED              {}
+    realistic  calibration_mean_reversion  0       COMPLETED_ALL_REFUSED  {'shorts_disabled': 2}
+    realistic  forecast_revision           0       COMPLETED_ALL_REFUSED  {'shorts_disabled': 860}
+
+Under `naive`, `calibration_mean_reversion` and `forecast_revision` never
+form a `SHORT_YES` signal at all -- the unrealistic 0-6-minute-old forecast
+never clears their entry gate, so there is nothing to refuse. Under
+`realistic`, the same two strategies DO signal -- 860 times for
+`forecast_revision` alone -- and every one is refused as `shorts_disabled`.
+"Never signalled" and "signalled 860 times, every signal gagged" are
+different diagnostic states: only `realistic` shows these two strategies are
+functional-but-gagged by `allow_short=False` rather than simply idle. Both
+conditions are retained for exactly this reason, not by inertia.
+
 USAGE
 -----
     uv run python scripts/analysis/run_weather_strategy_backtests.py
