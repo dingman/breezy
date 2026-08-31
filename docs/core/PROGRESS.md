@@ -38,26 +38,23 @@ Two consequences that are not optional:
 - **The per-position knob silently detunes the rest.** `max_event_notional`
   (1000) and `max_location_notional` (2000) are absolute dollars; only
   `max_equity_fraction` scales with equity. No portfolio-wide cap
-  (`max_total_notional`) exists, so no single number answers "how much can be
-  at risk on weather today".
+  (`max_total_notional`) exists.
 
 ---
 
 ## Standing verdicts that gate future work
 
-- **G-02 — ROI feasibility: NO-GO** for committing to the downstream adapter /
-  settlement / execution build on current worked-example economics (~$3–15/day
-  net per 100 contracts per city-day). Free falsification and irreversible tape
-  capture remain in scope. Evidence: `docs/evidence/roi_feasibility_2026-08-26.md`.
-- **G-01 — Preliminary→final revision study: UNDERPOWERED.** N=44 vs a
-  pre-registered floor of N≥90/site. NYC 2/9 (Wilson [0.063, 0.547]). No PASS
-  claim is valid. Evidence: `docs/evidence/preliminary_final_revision_2026-08-26.md`.
+- **G-02 — ROI feasibility: NO-GO** on committing to the downstream adapter /
+  settlement / execution build (~$3–15/day net per 100 contracts per city-day).
+  Free falsification and tape capture stay in scope.
+  `docs/evidence/roi_feasibility_2026-08-26.md`.
+- **G-01 — Prelim→final revision study: UNDERPOWERED.** N=44 vs floor N≥90/site.
+  No PASS claim is valid. `docs/evidence/preliminary_final_revision_2026-08-26.md`.
 - **Historical forecasts are NOT proven unavailable.** `CLI_BACKFILL_PLAN.md:46`
-  claims otherwise; its cited evidence is about *repo state*, not availability.
-  Open-Meteo `/v1/previous-runs` was **deferred, never rejected**. Availability
-  remains unverified.
-- **Price history genuinely is forward-only.** The venue publishes no trade
-  tape; expired markets return null prices keeping only `settlementPx`.
+  claims otherwise from *repo state*, not availability. Open-Meteo
+  `/v1/previous-runs` was deferred, never rejected. Still unverified.
+- **Price history genuinely is forward-only.** No public trade tape; expired
+  markets return null prices keeping only `settlementPx`.
 
 ---
 
@@ -87,18 +84,23 @@ The in-code comment defers this to the operator; the operator control contract
 above says otherwise — this is an engineering decision. The direction of effect
 is strictly more conservative (it can only block orders that currently pass).
 
-**Acceptance:** RED test proving a stale quote is refused for all three
-strategies; the "PRESERVED DEFECT" comment removed; the 36-run backtest re-run
-and any change in fills reported.
+**Acceptance:** RED test proving a quote older than `stale_quote_minutes` is
+refused for all three strategies (and one just inside the bound is not); the
+"PRESERVED DEFECT" comment (`risk.py:261-286`) removed; the 36-run backtest
+re-run with a written before/after fill count per strategy. L-2: state the UNIT
+of the threaded age (minutes) and prove it matches `stale_quote_minutes`.
+Note `risk.py:268` cites a stale `decision.py:68-70`; the real site is `:70-71`.
 
 ### [HIGH] BL-2 — A fully-gagged strategy reports as a clean completion
 
 All 36 runs emitted `SHORTS_DISABLED_REFUSALS`, yet every JSON row carries
 `status=COMPLETED, refusal_type=null, refusal_message=null`. Two of three
 strategies had their **entire signal set** refused and are indistinguishable in
-the report from a strategy that saw no opportunity. Commit `4a1280f`
-additionally converted `forecast_revision`'s loud `NakedShortRefusedError`
-abort into this silent path.
+the report from a strategy that saw no opportunity. `forecast_revision`'s loud
+`NakedShortRefusedError` abort has also become this silent path; commit
+`4a1280f` is the *suspected* cause but its subject is about the close-only
+guard and does not mention `allow_short` — **[INFERENCE, not verified]**, to be
+confirmed or dropped by the implementer (L-4: `[V]` belongs on the inference).
 
 **Acceptance:** per-run refusal counts and reasons propagate into report rows; a
 run whose signals were all refused is not reported as an unqualified
@@ -106,16 +108,28 @@ run whose signals were all refused is not reported as an unqualified
 
 ### [HIGH] BL-3 — Cross-strategy exposure is uncapped
 
-Each strategy builds its own `RiskManager` over only its own `instrument_ids`
-(`risk.py:94-97`), so running all three concurrently permits up to **3x** the
-intended per-event exposure, invisibly. Today's run is safe only because each
-strategy ran in its own isolated `run_backtest`.
+Each strategy constructs its own `RiskManager` over only its own `contracts`
+(`RiskManager.__init__`, `risk.py:151-165`; call sites
+`calibration_mean_reversion/strategy.py:185`, `forecast_mispricing/strategy.py:170`,
+`forecast_revision/strategy.py:176`, all `RiskManager(self._risk_limits(),
+self._contracts, refusals=self.refusals)`). Running all three concurrently
+therefore permits up to **3x** the intended per-event exposure, invisibly.
+Today's run is safe only because each strategy ran in its own isolated
+`run_backtest`.
 
 **L-1 gate:** first prove whether Nautilus' own `Portfolio` / `RiskEngine`
 already provides a shared exposure view. Build only if genuinely absent.
 
-**Acceptance:** one shared composition-root exposure view; a RED test showing
-three concurrent strategies refused at the intended per-event cap.
+**L-2 trap — BINDING.** `max_event_notional` is measured in max-payout dollars
+via `contract.contract_size` (`risk.py:301-311`), NOT market value. Substituting
+`Portfolio.net_exposure` would loosen every cap by roughly the price reciprocal
+— a guard weakening disguised as a native win. Any native substitution must
+state both units and prove they match, or be rejected.
+
+**Acceptance:** one shared exposure view built at the composition root; a RED
+test in which three strategies sharing one `event_key` are refused at the SAME
+`max_event_notional` that a single strategy is refused at (today they are
+refused at 3x it). Cap semantics unchanged — no limit value edited.
 
 ### [MEDIUM] BL-4 — The `naive`/`realistic` backtest conditions are a no-op
 
@@ -124,8 +138,15 @@ sets `allow_short=False`, already the default; the other two never reach a
 timing gate because `SHORTS_DISABLED` fires first. The runner spends 18 extra
 runs and claims two conditions while measuring one.
 
-**Acceptance:** either the conditions differ on something that can change
-behaviour at current defaults, or they collapse to one and the claim is deleted.
+**Decision (pre-committed, not a disjunction):** COLLAPSE. Making the two
+conditions differ behaviourally at current defaults would require flipping
+`allow_short=True` (`:746`) or bypassing `SHORTS_DISABLED` — both forbidden by
+the header. So the runner collapses to ONE condition and the two-condition
+claim is deleted from the docstring.
+
+**Acceptance:** one condition remains; run count drops 36 → 18; the surviving
+run's per-row results are byte-identical to today's `naive` rows (proving the
+collapse removed only duplication, not signal); no config default edited.
 
 ### [MEDIUM] BL-5 — Runner docstring states a default that does not exist
 
