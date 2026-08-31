@@ -148,6 +148,7 @@ from nautilus_trader.model.enums import (
     OrderStatus,
 )
 from nautilus_trader.model.identifiers import TraderId
+from nautilus_trader.trading.strategy import Strategy
 
 from breezy.adapters.polymarket_us.fees import PolymarketUSFeeModel
 from breezy.adapters.polymarket_us.symbology import POLYMARKET_US_VENUE
@@ -161,7 +162,6 @@ if TYPE_CHECKING:  # pragma: no cover - typing only
     from nautilus_trader.model.identifiers import InstrumentId
     from nautilus_trader.model.instruments import Instrument
     from nautilus_trader.model.objects import Money
-    from nautilus_trader.trading.strategy import Strategy
 
 __all__ = [
     "DEFAULT_BACKTEST_INSTANCE_ID",
@@ -172,6 +172,7 @@ __all__ = [
     "NotVenueMarketDataError",
     "SettlementInvariant",
     "SettlementInvariantError",
+    "SharedExposureContractError",
     "SilentRunCondition",
     "SilentRunError",
     "UnwrappedWeatherRecordError",
@@ -304,6 +305,39 @@ class SilentRunError(RuntimeError):
     def __init__(self, condition: SilentRunCondition, message: str) -> None:
         super().__init__(message)
         self.condition = condition
+
+
+class SharedExposureContractError(RuntimeError):
+    """A run's strategies do not agree on shared max-payout exposure tracking.
+
+    ``new_shared_exposure_view``/``use_shared_exposure_view`` are hand-defined
+    per strategy (see
+    ``breezy.strategy.weather_common.shared_exposure.SharedExposureMixin``),
+    and this module discovers them structurally via
+    ``getattr(strategy, name, None)`` because ``runtime`` may not import
+    ``breezy.strategy`` -- ``strategy`` is the TOP layer in the layers
+    contract in ``pyproject.toml``, and nothing may reach back up into it.
+
+    Structural discovery can only prove a defect from the OUTSIDE: it can
+    never tell "a strategy that deliberately opts out of shared exposure
+    tracking" apart from "a strategy that forgot to opt in", because both
+    simply lack the two methods. What it CAN prove, and what this error is
+    raised for, are the two shapes that are never a legitimate design:
+
+    * a strategy offering exactly ONE of the two methods -- no correct
+      implementation of the pair is ever partial; and
+    * a run whose real Nautilus ``Strategy`` participants are a genuine MIX
+      of full support (both methods) and none at all -- this is exactly the
+      silent-doubling shape the guard exists to refuse: two strategies each
+      believing they hold the only tail on one ``event_key``, because one of
+      them was quietly handed its own private exposure view instead of the
+      run's shared one.
+
+    A ``Strategy`` that consistently supports neither method, alone or
+    alongside other strategies that also support neither, is NOT rejected:
+    a run with no shared-exposure participant at all has no doubling risk to
+    guard against.
+    """
 
 
 @dataclass(frozen=True, kw_only=True, slots=True)
@@ -847,7 +881,65 @@ def _refuse_idle_strategies(engine: BacktestEngine, strategies: Sequence[Strateg
     )
 
 
+def _shared_exposure_support(strategy: Strategy) -> tuple[bool, bool]:
+    """Whether `strategy` exposes the factory / the installer, independently."""
+    has_new_view = getattr(strategy, "new_shared_exposure_view", None) is not None
+    has_install = getattr(strategy, "use_shared_exposure_view", None) is not None
+    return has_new_view, has_install
+
+
+def _refuse_partial_shared_exposure(strategies: Sequence[Strategy]) -> None:
+    """Raise `SharedExposureContractError` for the two shapes that are always a defect.
+
+    See that error's docstring for what structural discovery can and cannot
+    prove. This function proves only the two provable shapes: a strategy
+    offering exactly one of the two methods, and a run whose real `Strategy`
+    participants mix full support with none at all.
+    """
+    support = [(strategy, *_shared_exposure_support(strategy)) for strategy in strategies]
+    asymmetric = [
+        strategy for strategy, has_new_view, has_install in support if has_new_view != has_install
+    ]
+
+    real_strategy_support = [
+        (has_new_view, has_install)
+        for strategy, has_new_view, has_install in support
+        if isinstance(strategy, Strategy)
+    ]
+    some_fully_support = any(
+        has_new_view and has_install for has_new_view, has_install in real_strategy_support
+    )
+    some_support_neither = any(
+        not has_new_view and not has_install for has_new_view, has_install in real_strategy_support
+    )
+    mixed_participation = some_fully_support and some_support_neither
+
+    offenders = list(asymmetric)
+    if mixed_participation:
+        offenders.extend(
+            strategy
+            for strategy, has_new_view, has_install in support
+            if isinstance(strategy, Strategy) and not has_new_view and not has_install
+        )
+    if not offenders:
+        return
+
+    names = ", ".join(sorted({type(strategy).__name__ for strategy in offenders}))
+    raise SharedExposureContractError(
+        f"{len(offenders)} strateg(ies) in this run do not fully support shared max-payout "
+        f"exposure tracking while at least one sibling strategy in this run does: {names}. "
+        f"A strategy that means to share exposure with the rest of this run must define BOTH "
+        f"`new_shared_exposure_view` and `use_shared_exposure_view` -- inherit "
+        f"`breezy.strategy.weather_common.shared_exposure.SharedExposureMixin` rather than "
+        f"hand-writing them. Without both, this strategy would be silently handed its own "
+        f"PRIVATE exposure view, and two strategies holding a tail on the same event_key "
+        f"would each believe they hold the only position -- doubling real exposure past the "
+        f"configured max-payout budget with no exception and no refusal counted.",
+    )
+
+
 def _install_shared_exposure_view(strategies: Sequence[Strategy]) -> None:
+    _refuse_partial_shared_exposure(strategies)
     exposure_view = None
     for strategy in strategies:
         new_view = getattr(strategy, "new_shared_exposure_view", None)

@@ -87,6 +87,7 @@ from breezy.strategy.weather_common.forecast_source import (
     ForecastSource,
     MissingForecastSourceError,
 )
+from breezy.strategy.weather_common.freshness import SignalFreshness
 from breezy.strategy.weather_common.models import ForecastSnapshot, MarketQuote, SideIntent
 from breezy.strategy.weather_common.probability import (
     ForecastErrorModel,
@@ -100,6 +101,7 @@ from breezy.strategy.weather_common.risk import (
     RiskManager,
     SharedExposureView,
 )
+from breezy.strategy.weather_common.shared_exposure import SharedExposureMixin
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
     from nautilus_trader.core.data import Data
@@ -112,7 +114,7 @@ if TYPE_CHECKING:  # pragma: no cover - typing only
 __all__ = ["CalibrationMeanReversionStrategy"]
 
 
-class CalibrationMeanReversionStrategy(Strategy):
+class CalibrationMeanReversionStrategy(SharedExposureMixin, Strategy):
     """Fades the market when it diverges from a calibrated probability by z sigma."""
 
     def __init__(
@@ -197,15 +199,6 @@ class CalibrationMeanReversionStrategy(Strategy):
         )
         self._refusal_alerter = RefusalAlerter(self.refusals, site=str(self.id))
         self.subscribe_data(nws_climate_day_data_type(), client_id=NWS_BACKTEST_CLIENT_ID)
-
-    def use_shared_exposure_view(self, exposure_view: SharedExposureView) -> None:
-        if self._risk is not None:
-            raise RuntimeError("shared exposure must be installed before strategy start")
-        self._shared_exposure_view = exposure_view
-
-    @staticmethod
-    def new_shared_exposure_view() -> SharedExposureView:
-        return SharedExposureView()
 
     def on_reset(self) -> None:
         self._quotes.clear()
@@ -353,7 +346,7 @@ class CalibrationMeanReversionStrategy(Strategy):
             contract=contract,
             signed_qty_delta=delta,
             hours_to_settlement=forecast.horizon_hours,
-            forecast_age_hours=forecast_age_hours,
+            signal_age=SignalFreshness.forecast(forecast_age_hours),
             edge=decision.edge,
             portfolio=self._portfolio_snapshot(),
             quote=quote,

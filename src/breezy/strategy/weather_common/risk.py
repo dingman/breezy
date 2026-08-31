@@ -1,6 +1,7 @@
 """Portfolio risk gating, carried over from the bundle's ``risk.py`` section.
 
-The limits, the order-screening sequence (settlement halt -> stale forecast ->
+The limits, the order-screening sequence (settlement halt -> stale signal
+(forecast or observation, see `breezy.strategy.weather_common.freshness`) ->
 minimum edge -> short permission -> quote tradability -> exclusivity ->
 position/notional/count caps -> equity fraction) and every threshold are
 unchanged from the operator's bundle. Only the "which contracts exist and how
@@ -30,10 +31,12 @@ from collections.abc import Mapping
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Final
 
+from breezy.strategy.weather_common.freshness import SignalKind
 from breezy.strategy.weather_common.refusals import SHORTS_DISABLED, RefusalCounter
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
     from breezy.strategy.weather_common.bucket_contract import MispricingContract
+    from breezy.strategy.weather_common.freshness import SignalFreshness
     from breezy.strategy.weather_common.models import MarketQuote
 
 __all__ = [
@@ -59,6 +62,8 @@ COUNTED_REFUSAL_REASONS: Final[frozenset[str]] = frozenset(
         "settlement_halt",
         "too_close_to_settlement",
         "stale_forecast",
+        "stale_observation",
+        "observation_limit_unset",
         "edge_below_minimum",
         SHORTS_DISABLED,
         "missing_bid_ask",
@@ -76,6 +81,14 @@ COUNTED_REFUSAL_REASONS: Final[frozenset[str]] = frozenset(
     },
 )
 
+#: The counted refusal reason for each `SignalKind`'s staleness check --
+#: `RiskManager.evaluate_order`'s stale-signal step reports one of these two,
+#: never the bare `"stale"`, so a block log names WHICH bound was breached.
+_STALE_REASON: Final[dict[SignalKind, str]] = {
+    SignalKind.FORECAST: "stale_forecast",
+    SignalKind.OBSERVATION: "stale_observation",
+}
+
 
 @dataclass(slots=True)
 class RiskLimits:
@@ -90,6 +103,15 @@ class RiskLimits:
     min_hours_to_settlement: float = 2.0
     halt_hours_before_settlement: float = 1.0
     stale_forecast_hours: float = 8.0
+    #: LIVENESS backstop only -- decay/revision risk is owned by each
+    #: strategy's decision.py; do not tighten this to express confidence in a
+    #: print. `None` (the default, and the only value any shipped strategy
+    #: ships) means "unset", and unset REFUSES every observation-kind order
+    #: (see `RiskManager.evaluate_order`'s `observation_limit_unset` branch)
+    #: rather than falling back to `stale_forecast_hours` or admitting the
+    #: order -- see `freshness.py` for why forecast and observation share one
+    #: screening step but never one bound.
+    stale_observation_hours: float | None = None
     stale_quote_minutes: float = 15.0
     transaction_cost_prob: float = 0.015  # fees + expected slippage in prob units
     #: FALSE, and it must stay false in every default construction path.
@@ -114,6 +136,18 @@ class RiskLimits:
     #: bare `RiskLimits()` and on all three strategy configs.
     allow_short: bool = False
     allow_overlapping_exclusive_yes: bool = False
+
+    def max_signal_age_hours(self, kind: SignalKind) -> float | None:
+        """The staleness bound for one `SignalKind`.
+
+        `FORECAST` always resolves to `stale_forecast_hours`, which is a
+        plain `float` and therefore never `None`. `OBSERVATION` resolves to
+        `stale_observation_hours`, which defaults `None` -- fail-closed, not
+        a silent fallback to the forecast bound.
+        """
+        if kind is SignalKind.FORECAST:
+            return self.stale_forecast_hours
+        return self.stale_observation_hours
 
 
 @dataclass(slots=True)
@@ -351,7 +385,7 @@ class RiskManager:
         contract: MispricingContract,
         signed_qty_delta: float,
         hours_to_settlement: float,
-        forecast_age_hours: float,
+        signal_age: SignalFreshness,
         edge: float,
         portfolio: PortfolioSnapshot,
         quote: MarketQuote,
@@ -362,8 +396,18 @@ class RiskManager:
             return self._refuse("settlement_halt")
         if hours_to_settlement < limits.min_hours_to_settlement:
             return self._refuse("too_close_to_settlement")
-        if forecast_age_hours > limits.stale_forecast_hours:
-            return self._refuse("stale_forecast")
+        # For FORECAST this reduces algebraically to the pre-change check
+        # (`forecast_age_hours > limits.stale_forecast_hours`), at the same
+        # sequence position: `max_signal_age_hours(FORECAST)` always returns
+        # `stale_forecast_hours`, a plain `float`, so the `is None` branch
+        # below is unreachable for a forecast signal. See
+        # `test_forecast_age_exactly_at_the_stale_forecast_boundary_is_accepted`
+        # for the equivalence pin.
+        max_age_hours = limits.max_signal_age_hours(signal_age.kind)
+        if max_age_hours is None:
+            return self._refuse("observation_limit_unset")
+        if signal_age.age_hours > max_age_hours:
+            return self._refuse(_STALE_REASON[signal_age.kind])
         if abs(edge) < limits.min_model_edge:
             return self._refuse("edge_below_minimum")
         # CLOSE-ONLY, and the only naked-short control there is (see

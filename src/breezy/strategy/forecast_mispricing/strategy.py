@@ -75,6 +75,7 @@ from breezy.strategy.weather_common.forecast_source import (
     ForecastSource,
     MissingForecastSourceError,
 )
+from breezy.strategy.weather_common.freshness import SignalFreshness
 from breezy.strategy.weather_common.models import ForecastSnapshot, MarketQuote, SideIntent
 from breezy.strategy.weather_common.probability import (
     ForecastErrorModel,
@@ -88,6 +89,7 @@ from breezy.strategy.weather_common.risk import (
     RiskManager,
     SharedExposureView,
 )
+from breezy.strategy.weather_common.shared_exposure import SharedExposureMixin
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
     from nautilus_trader.core.data import Data
@@ -100,7 +102,7 @@ if TYPE_CHECKING:  # pragma: no cover - typing only
 __all__ = ["ForecastMispricingStrategy"]
 
 
-class ForecastMispricingStrategy(Strategy):
+class ForecastMispricingStrategy(SharedExposureMixin, Strategy):
     """Buys/sells YES when the model-vs-market edge, after costs, clears a threshold."""
 
     def __init__(
@@ -182,15 +184,6 @@ class ForecastMispricingStrategy(Strategy):
         )
         self._refusal_alerter = RefusalAlerter(self.refusals, site=str(self.id))
         self.subscribe_data(nws_climate_day_data_type(), client_id=NWS_BACKTEST_CLIENT_ID)
-
-    def use_shared_exposure_view(self, exposure_view: SharedExposureView) -> None:
-        if self._risk is not None:
-            raise RuntimeError("shared exposure must be installed before strategy start")
-        self._shared_exposure_view = exposure_view
-
-    @staticmethod
-    def new_shared_exposure_view() -> SharedExposureView:
-        return SharedExposureView()
 
     def _risk_limits(self) -> RiskLimits:
         cfg = self._config
@@ -327,7 +320,7 @@ class ForecastMispricingStrategy(Strategy):
             contract=contract,
             signed_qty_delta=delta,
             hours_to_settlement=forecast.horizon_hours,
-            forecast_age_hours=forecast_age_hours,
+            signal_age=SignalFreshness.forecast(forecast_age_hours),
             edge=decision.edge,
             portfolio=self._portfolio_snapshot(),
             quote=quote,

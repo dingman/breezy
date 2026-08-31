@@ -61,6 +61,16 @@ class MarketQuote:
     ask_size: float | None
     ts_event: datetime
     mid: float | None = None
+    #: OPTIONAL per-level ask-side depth ladder, best price first, e.g.
+    #: ``((ask, ask_size), (next_price, next_size), ...)`` in RAW venue price
+    #: units (same units as ``ask``/``implied_ask``). ``None`` for callers
+    #: that only ever look at top-of-book -- additive: every existing
+    #: keyword-argument ``MarketQuote(...)`` call site is unaffected by this
+    #: field's default. Only ``running_extreme_lock`` currently reads it (see
+    #: that strategy's ``decision.py``): every fill there is a TAKER against
+    #: the live ask, so sizing/pricing off level 0 alone can silently walk
+    #: through price on a thin book (see that module's docstring).
+    ask_ladder: tuple[tuple[float, float], ...] | None = None
 
     def __post_init__(self) -> None:
         if self.mid is None and self.bid is not None and self.ask is not None:

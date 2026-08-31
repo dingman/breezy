@@ -47,8 +47,14 @@ Two consequences that are not optional:
   settlement / execution build (~$3–15/day net per 100 contracts per city-day).
   Free falsification and tape capture stay in scope.
   `docs/evidence/roi_feasibility_2026-08-26.md`.
-- **G-01 — Prelim→final revision study: UNDERPOWERED.** N=44 vs floor N≥90/site.
-  No PASS claim is valid. `docs/evidence/preliminary_final_revision_2026-08-26.md`.
+- **G-01 — Prelim→final revision study: SUPERSEDED 2026-08-31 → POWERED, FAIL.**
+  The N=44 UNDERPOWERED run used the live catalog only (`Archive data used: no`).
+  Re-run against the held AFOS archive (N≈1820/site) under the SAME pre-registered
+  rule: LAX/MIA PASS; **MDW 13.96%, NYC 11.79%, SFO 4.50% FAIL** Wilson-upper≤0.05.
+  A stronger constraint, not a release. **Interior-bucket strategies are dead on
+  MDW/NYC/SFO** (they need exact equality). Open-tail paths are unaffected: 97% of
+  revisions are UPWARD, downward rate 0.21%.
+  `docs/evidence/observation_lock_falsification_2026-08-31.md`.
 - **Historical forecasts are NOT proven unavailable.** `CLI_BACKFILL_PLAN.md:46`
   claims otherwise from *repo state*, not availability. Open-Meteo
   `/v1/previous-runs` was deferred, never rejected. Still unverified.
@@ -74,6 +80,53 @@ Two consequences that are not optional:
   `forecast_revision` naive refuses nothing; realistic refuses 860
   `shorts_disabled`. "Never signalled" is not "signalled 860 times, all
   refused." Both conditions stay; the collapse was withdrawn.
+
+---
+
+## BACKLOG — observation-lock strategies (opened 2026-08-31)
+
+Evidence: `docs/evidence/observation_lock_falsification_2026-08-31.md`.
+Landed this batch: shared-risk `SignalFreshness` contract (observation-kind
+orders gate on `RiskLimits.stale_observation_hours`, unset ⇒ refuse);
+`SharedExposureMixin` + harness guard closing the silent private-exposure-view
+gap; `running_extreme_lock` v1 (open-tail only, margin-conditioned model_p).
+
+### [HIGH] BL-11 — `stale_observation_hours` has no shipped value
+
+Derived recommendation is **12.665h** (max-over-sites P99 issuance gap, MIA
+12.3167h, + live receipt P99 0.3488h). NOT the pooled P99 (12.52h): MIA's own P99
+exceeds the pooled figure, so a pooled bound spuriously refuses MIA's slowest ~1%
+of legitimate days. No shipped config declares it (a test pins that). Observed MAX
+gap is 18.80h, so any P99 bound fires on rare legitimate days — decide whether
+that is acceptable before live enablement.
+
+### [HIGH] BL-12 — observation strategies cannot be backtested
+
+`scripts/analysis/run_weather_strategy_backtests.py` is forecast-plumbing
+end-to-end (`ForecastSource` injection, `published_at`-offset sweep). An
+observation-only strategy has nothing of that shape to plug into, and faking a
+forecast is forbidden. `running_extreme_lock` is therefore unit-tested but has
+NO backtest run. Needs an observation-shaped harness path.
+
+### [MED] BL-13 — `cli_settlement_print_lock` not implemented
+
+Both pre-registered gates PASS on archive data (p_stable 99.989% N=9106;
+halt-window 98.66% N=9164). Blocked only on BL-12 for economic confirmation.
+`lagged_anomaly_tail` stays build-order 3, unstarted.
+
+### [MED] BL-14 — `RefusalAlerter` alerts on `SHORTS_DISABLED` only
+
+`refusals.py:134-151` hardcodes one condition, so a run refused entirely for
+`stale_observation` / `observation_limit_unset` counts but never alerts in live.
+Mitigated for now by the construction-time raise in `running_extreme_lock`;
+generalise `_conditions` over the counted key set.
+
+### [MED] BL-15 — `stale_forecast` fails open on a negative age (BL-9 class)
+
+`risk.py` checks only `>`. A negative age makes a signal look infinitely fresh.
+`quote_tradable` already has the `future_quote` guard for exactly this
+(`risk.py:278-279`). Deliberately deferred from the freshness change because it
+is a behavior change on the forecast path; needs its own `future_signal` reason.
 
 ---
 

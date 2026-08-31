@@ -18,6 +18,7 @@ Breezy's own:
 from __future__ import annotations
 
 import ast
+import datetime as dt
 from pathlib import Path
 
 import pytest
@@ -26,17 +27,28 @@ from nautilus_trader.model.data import CustomData, InstrumentClose
 from nautilus_trader.model.enums import InstrumentCloseType
 from nautilus_trader.model.identifiers import InstrumentId, Symbol, Venue
 from nautilus_trader.model.objects import Money, Price
+from nautilus_trader.trading.config import StrategyConfig
+from nautilus_trader.trading.strategy import Strategy
 
+from breezy.domain.weather_bucket_facts import Measure, WeatherBucketFacts
 from breezy.runtime.backtest_feed import as_backtest_data
 from breezy.runtime.backtest_harness import (
     HARNESS_SOURCE_PATH,
     BreezyBacktestConfig,
     SettlementInvariant,
     SettlementInvariantError,
+    SharedExposureContractError,
     UnwrappedWeatherRecordError,
     _install_shared_exposure_view,
     assert_settlement_invariants,
     build_backtest_engine,
+)
+from breezy.strategy.weather_common.bucket_contract import MispricingContract
+from breezy.strategy.weather_common.risk import (
+    PortfolioSnapshot,
+    RiskLimits,
+    RiskManager,
+    SharedExposureView,
 )
 from tests.support.synthetic_binary_tape import synthetic_binary_tape
 from tests.unit.test_persistence_catalog import make_climate_day
@@ -45,6 +57,14 @@ ABSENT = InstrumentId(Symbol("synthetic-absent-market"), Venue("POLYMARKET_US"))
 
 
 class _ExposureAwareStrategy:
+    """A plain double, not a real Nautilus `Strategy` -- exempt from the
+    contract guard the same way `object()` below is: neither is a real
+    `Strategy` instance, so neither can be the "real strategy that forgot
+    the pair" the guard exists to catch. See
+    `test_a_real_strategy_missing_the_shared_exposure_pair_is_rejected` for
+    the regression that uses genuine `Strategy` subclasses instead.
+    """
+
     def __init__(self) -> None:
         self.exposure_view: object | None = None
 
@@ -54,6 +74,78 @@ class _ExposureAwareStrategy:
 
     def use_shared_exposure_view(self, exposure_view: object) -> None:
         self.exposure_view = exposure_view
+
+
+class _BareStrategyConfig(StrategyConfig, frozen=True):
+    """No fields; the subclassing itself is the whole point."""
+
+
+class _BareStrategy(Strategy):  # type: ignore[misc]  # Strategy is a compiled Cython class erasing to Any
+    """A real Nautilus `Strategy` that never learned about shared exposure
+    tracking -- the exact shape of the regression under test: a weather
+    strategy that forgot to copy the `new_shared_exposure_view` /
+    `use_shared_exposure_view` pair.
+    """
+
+    def __init__(self, config: _BareStrategyConfig) -> None:
+        super().__init__(config)
+
+
+class _SharedExposureAwareRealStrategy(Strategy):  # type: ignore[misc]  # Strategy is Any
+    """A real Nautilus `Strategy` that DOES support shared exposure tracking."""
+
+    def __init__(self, config: _BareStrategyConfig) -> None:
+        super().__init__(config)
+        self.exposure_view: SharedExposureView | None = None
+
+    @staticmethod
+    def new_shared_exposure_view() -> SharedExposureView:
+        return SharedExposureView()
+
+    def use_shared_exposure_view(self, exposure_view: SharedExposureView) -> None:
+        self.exposure_view = exposure_view
+
+
+class _WiredWeatherStrategy:
+    """Mimics a real weather strategy's `on_start` wiring closely enough to
+    prove the MONEY-AT-RISK behaviour: that a `RiskManager` built from the
+    view `_install_shared_exposure_view` handed out actually aggregates
+    exposure across sibling strategy instances, not just that no error was
+    raised and no identity was checked.
+    """
+
+    def __init__(self, contract: MispricingContract) -> None:
+        self._contract = contract
+        self._shared_exposure_view: SharedExposureView | None = None
+        self.risk: RiskManager | None = None
+
+    @staticmethod
+    def new_shared_exposure_view() -> SharedExposureView:
+        return SharedExposureView()
+
+    def use_shared_exposure_view(self, exposure_view: SharedExposureView) -> None:
+        self._shared_exposure_view = exposure_view
+
+    def start(self, limits: RiskLimits) -> None:
+        self.risk = RiskManager(
+            limits,
+            {self._contract.instrument_id: self._contract},
+            exposure_view=self._shared_exposure_view,
+        )
+
+
+def _weather_contract(instrument_id: str) -> MispricingContract:
+    return MispricingContract(
+        instrument_id=instrument_id,
+        facts=WeatherBucketFacts(
+            settlement_station="NYC",
+            climate_day=dt.date(2026, 8, 28),
+            measure=Measure.HIGH,
+            lower_f=80,
+            upper_f=None,
+        ),
+        tick_size=0.01,
+    )
 
 
 def make_config(**overrides: object) -> BreezyBacktestConfig:
@@ -78,6 +170,93 @@ def test_backtest_composition_root_installs_one_shared_exposure_view() -> None:
 
     assert first.exposure_view is not None
     assert first.exposure_view is second.exposure_view
+
+
+def test_a_real_strategy_missing_the_shared_exposure_pair_is_rejected() -> None:
+    """Regression for the silent-doubling defect (BL-10 prerequisite).
+
+    `_install_shared_exposure_view` used to discover the pair with
+    `getattr(strategy, name, None)` and silently skip a strategy that had
+    neither method -- handing it its own PRIVATE `SharedExposureView`
+    instead of the run's shared one. A run mixing a real `Strategy` that
+    fully supports shared exposure with a real `Strategy` that supports
+    NONE of it is exactly the shape that produced silent double-counted
+    exposure, and must now be REJECTED rather than silently admitted.
+    """
+    aware = _SharedExposureAwareRealStrategy(_BareStrategyConfig())
+    bare = _BareStrategy(_BareStrategyConfig())
+
+    with pytest.raises(SharedExposureContractError):
+        _install_shared_exposure_view((aware, bare))
+
+    # Not silently handed a private view either -- the pre-fix behaviour.
+    assert aware.exposure_view is None
+
+
+def test_a_strategy_offering_only_one_half_of_the_pair_is_rejected() -> None:
+    """Partial implementation (only one of the two methods) is never a
+    legitimate design -- it is always a botched hand-copy of the pair, so it
+    must raise even without a fully-compliant sibling in the same run.
+    """
+
+    class _HalfPair:
+        @staticmethod
+        def new_shared_exposure_view() -> SharedExposureView:
+            return SharedExposureView()
+
+    with pytest.raises(SharedExposureContractError):
+        _install_shared_exposure_view((_HalfPair(),))
+
+
+def test_all_strategies_in_a_run_share_one_view_instance_by_identity() -> None:
+    """Bullet 2: not just "no error", but every strategy in the run holds the
+    SAME `SharedExposureView` object.
+    """
+    contract_a = _weather_contract("A")
+    contract_b = _weather_contract("B")
+    contract_c = _weather_contract("C")
+    strategy_a = _WiredWeatherStrategy(contract_a)
+    strategy_b = _WiredWeatherStrategy(contract_b)
+    strategy_c = _WiredWeatherStrategy(contract_c)
+
+    _install_shared_exposure_view((strategy_a, strategy_b, strategy_c))
+
+    assert strategy_a._shared_exposure_view is not None
+    assert strategy_a._shared_exposure_view is strategy_b._shared_exposure_view
+    assert strategy_a._shared_exposure_view is strategy_c._shared_exposure_view
+
+
+def test_exposure_genuinely_aggregates_across_two_strategy_instances() -> None:
+    """Bullet 3 -- the money-at-risk proof.
+
+    Strategy A opens a position; strategy A never tells strategy B about it
+    directly. After `_install_shared_exposure_view` wires both through the
+    SAME `SharedExposureView`, strategy B's OWN `RiskManager` must see A's
+    position when computing `event_notional`/`exclusive_conflict` on the
+    same `event_key` -- proving real cross-strategy aggregation, not just
+    that the wiring didn't raise.
+    """
+    contract_a = _weather_contract("A")
+    contract_b = _weather_contract("B")
+    strategy_a = _WiredWeatherStrategy(contract_a)
+    strategy_b = _WiredWeatherStrategy(contract_b)
+
+    _install_shared_exposure_view((strategy_a, strategy_b))
+
+    limits = RiskLimits(max_event_notional=100.0, max_location_notional=100.0)
+    strategy_a.start(limits)
+    strategy_b.start(limits)
+    assert strategy_a.risk is not None
+    assert strategy_b.risk is not None
+
+    # Only strategy A's instrument carries a position -- B never traded.
+    portfolio = PortfolioSnapshot(position_qty={contract_a.instrument_id: 3.0})
+
+    # B's OWN RiskManager sees A's exposure through the shared view.
+    assert strategy_b.risk.event_notional(portfolio, contract_a.event_key) == 3.0
+    # And B is refused a second long-YES on the same event because A already
+    # holds one -- the exact "must not stack two tails" invariant.
+    assert strategy_b.risk.exclusive_conflict(contract_b, 1.0, portfolio) is True
 
 
 # ---------------------------------------------------------------------------

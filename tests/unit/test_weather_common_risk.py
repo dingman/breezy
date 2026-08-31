@@ -11,12 +11,15 @@ from __future__ import annotations
 
 import datetime as dt
 
+import pytest
+
 from breezy.domain.weather_bucket_facts import Measure, WeatherBucketFacts
 from breezy.strategy.calibration_mean_reversion.config import CalibrationMeanReversionConfig
 from breezy.strategy.forecast_mispricing.config import ForecastMispricingConfig
 from breezy.strategy.forecast_revision.config import ForecastRevisionConfig
 from breezy.strategy.weather_common import risk as risk_module
 from breezy.strategy.weather_common.bucket_contract import MispricingContract
+from breezy.strategy.weather_common.freshness import SignalFreshness, SignalKind
 from breezy.strategy.weather_common.models import MarketQuote
 from breezy.strategy.weather_common.refusals import SHORTS_DISABLED, RefusalCounter
 from breezy.strategy.weather_common.risk import (
@@ -29,6 +32,13 @@ from breezy.strategy.weather_common.risk import (
 STATION = "NYC"
 CLIMATE_DAY = dt.date(2026, 8, 28)
 NOW = dt.datetime(2026, 8, 28, 12, 0, tzinfo=dt.UTC)
+
+#: The unit-of-work under test in almost every case below is the screening
+#: sequence AFTER the staleness step, not staleness itself -- so a single
+#: always-fresh `SignalFreshness` constant keeps those call sites a one-line
+#: mechanical edit (R2 in the plan) instead of constructing a fresh value 30+
+#: times over. Tests that exercise staleness itself build their own.
+FRESH = SignalFreshness.forecast(0.0)
 
 
 def _contract(
@@ -96,7 +106,7 @@ def test_settlement_halt_blocks_regardless_of_edge() -> None:
         contract=contract,
         signed_qty_delta=10.0,
         hours_to_settlement=0.1,  # below default halt_hours_before_settlement=1.0
-        forecast_age_hours=0.0,
+        signal_age=FRESH,
         edge=0.50,
         portfolio=PortfolioSnapshot(),
         quote=_quote(),
@@ -115,7 +125,7 @@ def test_edge_below_minimum_is_blocked() -> None:
         contract=contract,
         signed_qty_delta=10.0,
         hours_to_settlement=24.0,
-        forecast_age_hours=0.0,
+        signal_age=FRESH,
         edge=0.01,  # below default min_model_edge=0.04
         portfolio=PortfolioSnapshot(),
         quote=_quote(),
@@ -134,7 +144,7 @@ def test_a_well_formed_order_within_every_limit_is_allowed() -> None:
         contract=contract,
         signed_qty_delta=10.0,
         hours_to_settlement=24.0,
-        forecast_age_hours=0.0,
+        signal_age=FRESH,
         edge=0.50,
         portfolio=PortfolioSnapshot(equity=10_000.0),
         quote=_quote(),
@@ -162,7 +172,7 @@ def test_a_second_long_yes_on_the_same_climate_day_is_an_exclusive_conflict() ->
         contract=bucket_b,
         signed_qty_delta=5.0,  # a NEW long YES on B, while A is already long
         hours_to_settlement=24.0,
-        forecast_age_hours=0.0,
+        signal_age=FRESH,
         edge=0.50,
         portfolio=portfolio,
         quote=_quote(),
@@ -193,7 +203,7 @@ def test_buckets_on_different_climate_days_are_not_exclusive() -> None:
         contract=bucket_other_day,
         signed_qty_delta=5.0,
         hours_to_settlement=24.0,
-        forecast_age_hours=0.0,
+        signal_age=FRESH,
         edge=0.50,
         portfolio=portfolio,
         quote=_quote(),
@@ -211,7 +221,7 @@ def test_shorting_a_flat_instrument_is_blocked_when_shorts_are_disabled() -> Non
         contract=contract,
         signed_qty_delta=-10.0,
         hours_to_settlement=24.0,
-        forecast_age_hours=0.0,
+        signal_age=FRESH,
         edge=0.50,
         portfolio=PortfolioSnapshot(),
         quote=_quote(),
@@ -244,7 +254,7 @@ def test_shorting_from_flat_is_refused_under_the_bare_default_limits() -> None:
         contract=contract,
         signed_qty_delta=-10.0,
         hours_to_settlement=24.0,
-        forecast_age_hours=0.0,
+        signal_age=FRESH,
         edge=0.50,
         portfolio=PortfolioSnapshot(),
         quote=_quote(),
@@ -276,7 +286,7 @@ def test_a_pending_buy_cannot_unlock_a_sell_that_opens_a_short() -> None:
         contract=contract,
         signed_qty_delta=-40.0,
         hours_to_settlement=24.0,
-        forecast_age_hours=0.0,
+        signal_age=FRESH,
         edge=0.50,
         portfolio=portfolio,
         quote=_quote(),
@@ -297,7 +307,7 @@ def test_a_sell_that_exactly_closes_a_long_is_allowed_at_the_boundary() -> None:
         contract=contract,
         signed_qty_delta=-10.0,  # exactly flat afterwards
         hours_to_settlement=24.0,
-        forecast_age_hours=0.0,
+        signal_age=FRESH,
         edge=0.50,
         portfolio=portfolio,
         quote=_quote(),
@@ -317,7 +327,7 @@ def test_a_partial_close_is_allowed() -> None:
         contract=contract,
         signed_qty_delta=-4.0,
         hours_to_settlement=24.0,
-        forecast_age_hours=0.0,
+        signal_age=FRESH,
         edge=0.50,
         portfolio=portfolio,
         quote=_quote(),
@@ -337,7 +347,7 @@ def test_a_sell_one_contract_past_flat_is_refused_at_the_boundary() -> None:
         contract=contract,
         signed_qty_delta=-11.0,  # one contract past flat
         hours_to_settlement=24.0,
-        forecast_age_hours=0.0,
+        signal_age=FRESH,
         edge=0.50,
         portfolio=portfolio,
         quote=_quote(),
@@ -358,7 +368,7 @@ def test_a_shorts_disabled_refusal_is_recorded_on_the_counter() -> None:
         contract=contract,
         signed_qty_delta=-10.0,
         hours_to_settlement=24.0,
-        forecast_age_hours=0.0,
+        signal_age=FRESH,
         edge=0.50,
         portfolio=PortfolioSnapshot(),
         quote=_quote(),
@@ -377,7 +387,7 @@ def test_an_allowed_order_records_no_refusal() -> None:
         contract=contract,
         signed_qty_delta=10.0,
         hours_to_settlement=24.0,
-        forecast_age_hours=0.0,
+        signal_age=FRESH,
         edge=0.50,
         portfolio=PortfolioSnapshot(),
         quote=_quote(),
@@ -414,7 +424,7 @@ def test_stale_quote_refusal_is_recorded_on_the_counter() -> None:
         contract=contract,
         signed_qty_delta=10.0,
         hours_to_settlement=24.0,
-        forecast_age_hours=0.0,
+        signal_age=FRESH,
         edge=0.50,
         portfolio=PortfolioSnapshot(),
         quote=_quote(),
@@ -440,7 +450,7 @@ def test_max_event_notional_refusal_is_recorded_on_the_counter() -> None:
         contract=contract,
         signed_qty_delta=10.0,
         hours_to_settlement=24.0,
-        forecast_age_hours=0.0,
+        signal_age=FRESH,
         edge=0.50,
         portfolio=PortfolioSnapshot(equity=10_000.0),
         quote=_quote(),
@@ -465,7 +475,7 @@ def test_max_location_notional_refusal_is_recorded_on_the_counter() -> None:
         contract=contract,
         signed_qty_delta=10.0,
         hours_to_settlement=24.0,
-        forecast_age_hours=0.0,
+        signal_age=FRESH,
         edge=0.50,
         portfolio=PortfolioSnapshot(equity=10_000.0),
         quote=_quote(),
@@ -491,7 +501,7 @@ def test_max_position_refusal_is_recorded_on_the_counter() -> None:
         contract=contract,
         signed_qty_delta=1.0,  # already at the cap; no room left
         hours_to_settlement=24.0,
-        forecast_age_hours=0.0,
+        signal_age=FRESH,
         edge=0.50,
         portfolio=portfolio,
         quote=_quote(),
@@ -514,7 +524,7 @@ def test_exclusive_bucket_conflict_refusal_is_recorded_on_the_counter() -> None:
         contract=bucket_b,
         signed_qty_delta=5.0,
         hours_to_settlement=24.0,
-        forecast_age_hours=0.0,
+        signal_age=FRESH,
         edge=0.50,
         portfolio=portfolio,
         quote=_quote(),
@@ -535,7 +545,7 @@ def test_settlement_halt_refusal_is_recorded_on_the_counter() -> None:
         contract=contract,
         signed_qty_delta=10.0,
         hours_to_settlement=0.1,
-        forecast_age_hours=0.0,
+        signal_age=FRESH,
         edge=0.50,
         portfolio=PortfolioSnapshot(),
         quote=_quote(),
@@ -556,7 +566,7 @@ def test_edge_below_minimum_refusal_is_recorded_on_the_counter() -> None:
         contract=contract,
         signed_qty_delta=10.0,
         hours_to_settlement=24.0,
-        forecast_age_hours=0.0,
+        signal_age=FRESH,
         edge=0.01,
         portfolio=PortfolioSnapshot(),
         quote=_quote(),
@@ -581,7 +591,7 @@ def test_wide_spread_refusals_collapse_to_one_bounded_counter_key() -> None:
         contract=contract,
         signed_qty_delta=10.0,
         hours_to_settlement=24.0,
-        forecast_age_hours=0.0,
+        signal_age=FRESH,
         edge=0.50,
         portfolio=PortfolioSnapshot(),
         quote=_quote(bid=0.40, ask=0.42),  # spread 0.02
@@ -591,7 +601,7 @@ def test_wide_spread_refusals_collapse_to_one_bounded_counter_key() -> None:
         contract=contract,
         signed_qty_delta=10.0,
         hours_to_settlement=24.0,
-        forecast_age_hours=0.0,
+        signal_age=FRESH,
         edge=0.50,
         portfolio=PortfolioSnapshot(),
         quote=_quote(bid=0.30, ask=0.40),  # spread 0.10, a DIFFERENT value
@@ -627,7 +637,7 @@ def test_a_future_dated_quote_is_refused_as_future_quote() -> None:
         contract=contract,
         signed_qty_delta=10.0,
         hours_to_settlement=24.0,
-        forecast_age_hours=0.0,
+        signal_age=FRESH,
         edge=0.50,
         portfolio=PortfolioSnapshot(),
         quote=_quote(),
@@ -648,7 +658,7 @@ def test_zero_age_quote_is_still_accepted() -> None:
         contract=contract,
         signed_qty_delta=10.0,
         hours_to_settlement=24.0,
-        forecast_age_hours=0.0,
+        signal_age=FRESH,
         edge=0.50,
         portfolio=PortfolioSnapshot(equity=10_000.0),
         quote=_quote(),
@@ -667,7 +677,7 @@ def test_small_positive_age_within_the_stale_bound_is_still_accepted() -> None:
         contract=contract,
         signed_qty_delta=10.0,
         hours_to_settlement=24.0,
-        forecast_age_hours=0.0,
+        signal_age=FRESH,
         edge=0.50,
         portfolio=PortfolioSnapshot(equity=10_000.0),
         quote=_quote(),
@@ -688,7 +698,7 @@ def test_age_exactly_at_the_stale_quote_boundary_is_still_accepted() -> None:
         contract=contract,
         signed_qty_delta=10.0,
         hours_to_settlement=24.0,
-        forecast_age_hours=0.0,
+        signal_age=FRESH,
         edge=0.50,
         portfolio=PortfolioSnapshot(equity=10_000.0),
         quote=_quote(),
@@ -740,7 +750,7 @@ def test_exclusive_conflict_still_counts_a_pending_long_on_a_sibling_bucket() ->
         contract=bucket_b,
         signed_qty_delta=5.0,
         hours_to_settlement=24.0,
-        forecast_age_hours=0.0,
+        signal_age=FRESH,
         edge=0.50,
         portfolio=portfolio,
         quote=_quote(),
@@ -797,7 +807,7 @@ def test_three_strategy_managers_share_the_same_event_notional_cap() -> None:
             contract=contract,
             signed_qty_delta=1.0,
             hours_to_settlement=24.0,
-            forecast_age_hours=0.0,
+            signal_age=FRESH,
             edge=0.50,
             portfolio=portfolio,
             quote=_quote(),
@@ -830,7 +840,7 @@ def test_single_strategy_event_notional_boundary_is_unchanged() -> None:
         contract=contract,
         signed_qty_delta=1.0,
         hours_to_settlement=24.0,
-        forecast_age_hours=0.0,
+        signal_age=FRESH,
         edge=0.50,
         portfolio=PortfolioSnapshot(pending_qty={"A": 1.0}, equity=10_000.0),
         quote=_quote(),
@@ -840,7 +850,7 @@ def test_single_strategy_event_notional_boundary_is_unchanged() -> None:
         contract=contract,
         signed_qty_delta=1.0,
         hours_to_settlement=24.0,
-        forecast_age_hours=0.0,
+        signal_age=FRESH,
         edge=0.50,
         portfolio=PortfolioSnapshot(pending_qty={"A": 2.0}, equity=10_000.0),
         quote=_quote(),
@@ -851,3 +861,364 @@ def test_single_strategy_event_notional_boundary_is_unchanged() -> None:
     assert boundary.clipped_quantity == 1.0
     assert over.allowed is False
     assert over.reason == "max_event_notional"
+
+
+# ---------------------------------------------------------------------------
+# Observation-freshness plan, C3: pins that `age_hours == stale_forecast_hours`
+# is ACCEPTED under the `>` (not `>=`) boundary -- unchanged by the
+# `forecast_age_hours` -> `signal_age: SignalFreshness` rewrite. Confirmed
+# green against the OLD `forecast_age_hours=8.0` signature BEFORE the rewrite
+# landed (see the task's RED/GREEN verification report); this is that same
+# test ported to the new signature, proving the rewrite is algebraically a
+# no-op for the FORECAST kind.
+# ---------------------------------------------------------------------------
+
+
+def test_forecast_age_exactly_at_the_stale_forecast_boundary_is_accepted() -> None:
+    contract = _contract("A", lower_f=80, upper_f=None)
+    risk = RiskManager(RiskLimits(stale_forecast_hours=8.0), {"A": contract})
+
+    decision = risk.evaluate_order(
+        contract=contract,
+        signed_qty_delta=10.0,
+        hours_to_settlement=24.0,
+        signal_age=SignalFreshness.forecast(8.0),  # exactly at the boundary
+        edge=0.50,
+        portfolio=PortfolioSnapshot(equity=10_000.0),
+        quote=_quote(),
+        quote_age_minutes=0.0,
+    )
+
+    assert decision.allowed is True
+
+
+# ---------------------------------------------------------------------------
+# C2 -- `stale_observation_hours` fail-closed default, and no shipped config
+# declares one (the missing half of the `allow_short` discipline, applied to
+# the new field: see `test_bare_risk_limits_forbid_shorting` /
+# `test_no_strategy_config_default_permits_shorting` above).
+# ---------------------------------------------------------------------------
+
+
+def test_bare_risk_limits_defaults_stale_observation_hours_to_none() -> None:
+    assert RiskLimits().stale_observation_hours is None
+
+
+def test_no_strategy_config_declares_a_stale_observation_hours_default() -> None:
+    """No shipped strategy is observation-driven yet (see the plan's blast
+    radius): none of the three configs should carry this field at all, so a
+    future strategy that silently starts is impossible to miss here.
+    """
+    assert not hasattr(CalibrationMeanReversionConfig(instrument_ids=()), "stale_observation_hours")
+    assert not hasattr(ForecastMispricingConfig(instrument_ids=()), "stale_observation_hours")
+    assert not hasattr(ForecastRevisionConfig(instrument_ids=()), "stale_observation_hours")
+
+
+# ---------------------------------------------------------------------------
+# `RiskLimits.max_signal_age_hours` -- the FORECAST/OBSERVATION selector
+# ---------------------------------------------------------------------------
+
+
+def test_max_signal_age_hours_selects_stale_forecast_hours_for_forecast_kind() -> None:
+    limits = RiskLimits(stale_forecast_hours=6.0, stale_observation_hours=3.0)
+    assert limits.max_signal_age_hours(SignalKind.FORECAST) == 6.0
+
+
+def test_max_signal_age_hours_selects_stale_observation_hours_for_observation_kind() -> None:
+    limits = RiskLimits(stale_forecast_hours=6.0, stale_observation_hours=3.0)
+    assert limits.max_signal_age_hours(SignalKind.OBSERVATION) == 3.0
+
+
+def test_max_signal_age_hours_is_none_for_observation_kind_on_bare_limits() -> None:
+    assert RiskLimits().max_signal_age_hours(SignalKind.OBSERVATION) is None
+
+
+# ---------------------------------------------------------------------------
+# Observation-driven freshness screening (plan P3, corrections C1/C2/C3/C7)
+# ---------------------------------------------------------------------------
+
+
+def test_observation_signal_older_than_the_bound_is_refused_as_stale_observation() -> None:
+    contract = _contract("A", lower_f=80, upper_f=None)
+    counter = RefusalCounter()
+    risk = RiskManager(
+        RiskLimits(stale_observation_hours=2.0), {"A": contract}, refusals=counter,
+    )
+
+    decision = risk.evaluate_order(
+        contract=contract,
+        signed_qty_delta=10.0,
+        hours_to_settlement=24.0,
+        signal_age=SignalFreshness.observation(2.5),  # past the 2.0h bound
+        edge=0.50,
+        portfolio=PortfolioSnapshot(equity=10_000.0),
+        quote=_quote(),
+        quote_age_minutes=0.0,
+    )
+
+    assert decision.allowed is False
+    assert decision.reason == "stale_observation"
+    assert counter.count("stale_observation") == 1
+
+
+def test_observation_age_exactly_at_the_stale_observation_boundary_is_accepted() -> None:
+    """Same `>` (not `>=`) boundary idiom as `stale_quote_minutes`
+    (`test_age_exactly_at_the_stale_quote_boundary_is_still_accepted`) and as
+    `stale_forecast_hours`
+    (`test_forecast_age_exactly_at_the_stale_forecast_boundary_is_accepted`).
+    """
+    contract = _contract("A", lower_f=80, upper_f=None)
+    risk = RiskManager(RiskLimits(stale_observation_hours=2.0), {"A": contract})
+
+    decision = risk.evaluate_order(
+        contract=contract,
+        signed_qty_delta=10.0,
+        hours_to_settlement=24.0,
+        signal_age=SignalFreshness.observation(2.0),  # exactly at the boundary
+        edge=0.50,
+        portfolio=PortfolioSnapshot(equity=10_000.0),
+        quote=_quote(),
+        quote_age_minutes=0.0,
+    )
+
+    assert decision.allowed is True
+
+
+def test_observation_signal_with_no_configured_bound_is_refused_as_limit_unset() -> None:
+    """C1(b): the should-never-happen backstop. No shipped strategy is
+    observation-driven yet (C2), so `stale_observation_hours` is `None` on
+    every default construction path -- this must REFUSE, not silently admit
+    the order or fall back to `stale_forecast_hours`. C1(a)'s wiring-time
+    raise, added when the first observation strategy is wired, is the
+    structural mitigation that keeps this branch should-never-happen in
+    production; this test pins what happens if it is ever reached anyway.
+    """
+    contract = _contract("A", lower_f=80, upper_f=None)
+    counter = RefusalCounter()
+    risk = RiskManager(RiskLimits(), {"A": contract}, refusals=counter)
+
+    decision = risk.evaluate_order(
+        contract=contract,
+        signed_qty_delta=10.0,
+        hours_to_settlement=24.0,
+        signal_age=SignalFreshness.observation(0.0),  # even age=0 must refuse
+        edge=0.50,
+        portfolio=PortfolioSnapshot(equity=10_000.0),
+        quote=_quote(),
+        quote_age_minutes=0.0,
+    )
+
+    assert decision.allowed is False
+    assert decision.reason == "observation_limit_unset"
+    assert counter.count("observation_limit_unset") == 1
+
+
+def test_a_stale_and_low_edge_order_refuses_for_staleness_first_sequence_pin() -> None:
+    """Proves the sequence position is preserved: staleness is still checked
+    BEFORE `min_model_edge`, exactly as the old `forecast_age_hours` check
+    was at risk.py:365-366.
+    """
+    contract = _contract("A", lower_f=80, upper_f=None)
+    risk = RiskManager(RiskLimits(stale_forecast_hours=8.0), {"A": contract})
+
+    decision = risk.evaluate_order(
+        contract=contract,
+        signed_qty_delta=10.0,
+        hours_to_settlement=24.0,
+        signal_age=SignalFreshness.forecast(9.0),  # stale
+        edge=0.01,  # ALSO below min_model_edge=0.04
+        portfolio=PortfolioSnapshot(equity=10_000.0),
+        quote=_quote(),
+        quote_age_minutes=0.0,
+    )
+
+    assert decision.allowed is False
+    assert decision.reason == "stale_forecast"
+
+
+def test_omitting_signal_age_raises_type_error() -> None:
+    """`signal_age` is required and keyword-only -- there is no sentinel that
+    means "no evidence", by design (see the plan's "Default is REFUSAL").
+    """
+    contract = _contract("A", lower_f=80, upper_f=None)
+    risk = RiskManager(RiskLimits(), {"A": contract})
+
+    with pytest.raises(TypeError):
+        risk.evaluate_order(  # type: ignore[call-arg]
+            contract=contract,
+            signed_qty_delta=10.0,
+            hours_to_settlement=24.0,
+            edge=0.50,
+            portfolio=PortfolioSnapshot(equity=10_000.0),
+            quote=_quote(),
+            quote_age_minutes=0.0,
+        )
+
+
+# ---------------------------------------------------------------------------
+# C7/F4 -- `COUNTED_REFUSAL_REASONS` is fixed and finite BY CONSTRUCTION.
+# Previously unenforced (zero consumers repo-wide); this test drives every
+# refusal branch `evaluate_order` can reach and asserts the counter never
+# grows a key outside the frozenset.
+# ---------------------------------------------------------------------------
+
+
+def test_every_recorded_refusal_reason_is_within_the_counted_set() -> None:
+    counter = RefusalCounter()
+    contract_a = _contract("A", lower_f=80, upper_f=None)
+    contract_b = _contract("B", lower_f=85, upper_f=None)
+
+    # settlement_halt
+    risk = RiskManager(RiskLimits(), {"A": contract_a}, refusals=counter)
+    risk.evaluate_order(
+        contract=contract_a, signed_qty_delta=10.0, hours_to_settlement=0.1,
+        signal_age=FRESH, edge=0.50, portfolio=PortfolioSnapshot(),
+        quote=_quote(), quote_age_minutes=0.0,
+    )
+    # too_close_to_settlement
+    risk.evaluate_order(
+        contract=contract_a, signed_qty_delta=10.0, hours_to_settlement=1.5,
+        signal_age=FRESH, edge=0.50, portfolio=PortfolioSnapshot(),
+        quote=_quote(), quote_age_minutes=0.0,
+    )
+    # stale_forecast
+    risk.evaluate_order(
+        contract=contract_a, signed_qty_delta=10.0, hours_to_settlement=24.0,
+        signal_age=SignalFreshness.forecast(999.0), edge=0.50,
+        portfolio=PortfolioSnapshot(), quote=_quote(), quote_age_minutes=0.0,
+    )
+    # stale_observation
+    risk_obs = RiskManager(
+        RiskLimits(stale_observation_hours=1.0), {"A": contract_a}, refusals=counter,
+    )
+    risk_obs.evaluate_order(
+        contract=contract_a, signed_qty_delta=10.0, hours_to_settlement=24.0,
+        signal_age=SignalFreshness.observation(999.0), edge=0.50,
+        portfolio=PortfolioSnapshot(), quote=_quote(), quote_age_minutes=0.0,
+    )
+    # observation_limit_unset
+    risk.evaluate_order(
+        contract=contract_a, signed_qty_delta=10.0, hours_to_settlement=24.0,
+        signal_age=SignalFreshness.observation(0.0), edge=0.50,
+        portfolio=PortfolioSnapshot(), quote=_quote(), quote_age_minutes=0.0,
+    )
+    # edge_below_minimum
+    risk.evaluate_order(
+        contract=contract_a, signed_qty_delta=10.0, hours_to_settlement=24.0,
+        signal_age=FRESH, edge=0.01, portfolio=PortfolioSnapshot(),
+        quote=_quote(), quote_age_minutes=0.0,
+    )
+    # shorts_disabled
+    risk.evaluate_order(
+        contract=contract_a, signed_qty_delta=-10.0, hours_to_settlement=24.0,
+        signal_age=FRESH, edge=0.50, portfolio=PortfolioSnapshot(),
+        quote=_quote(), quote_age_minutes=0.0,
+    )
+    # missing_bid_ask
+    risk.evaluate_order(
+        contract=contract_a, signed_qty_delta=10.0, hours_to_settlement=24.0,
+        signal_age=FRESH, edge=0.50, portfolio=PortfolioSnapshot(),
+        quote=MarketQuote(
+            instrument_id="ANY", bid=None, ask=None, bid_size=None,
+            ask_size=None, ts_event=NOW,
+        ),
+        quote_age_minutes=0.0,
+    )
+    # crossed_or_locked_ignored
+    risk.evaluate_order(
+        contract=contract_a, signed_qty_delta=10.0, hours_to_settlement=24.0,
+        signal_age=FRESH, edge=0.50, portfolio=PortfolioSnapshot(),
+        quote=_quote(bid=0.50, ask=0.40), quote_age_minutes=0.0,
+    )
+    # wide_spread
+    risk.evaluate_order(
+        contract=contract_a, signed_qty_delta=10.0, hours_to_settlement=24.0,
+        signal_age=FRESH, edge=0.50, portfolio=PortfolioSnapshot(),
+        quote=_quote(bid=0.10, ask=0.90), quote_age_minutes=0.0,
+    )
+    # insufficient_liquidity
+    risk.evaluate_order(
+        contract=contract_a, signed_qty_delta=10.0, hours_to_settlement=24.0,
+        signal_age=FRESH, edge=0.50, portfolio=PortfolioSnapshot(),
+        quote=MarketQuote(
+            instrument_id="ANY", bid=0.40, ask=0.42, bid_size=1.0, ask_size=1.0,
+            ts_event=NOW,
+        ),
+        quote_age_minutes=0.0,
+    )
+    # future_quote
+    risk.evaluate_order(
+        contract=contract_a, signed_qty_delta=10.0, hours_to_settlement=24.0,
+        signal_age=FRESH, edge=0.50, portfolio=PortfolioSnapshot(),
+        quote=_quote(), quote_age_minutes=-10.0,
+    )
+    # stale_quote
+    risk.evaluate_order(
+        contract=contract_a, signed_qty_delta=10.0, hours_to_settlement=24.0,
+        signal_age=FRESH, edge=0.50, portfolio=PortfolioSnapshot(),
+        quote=_quote(), quote_age_minutes=999.0,
+    )
+    # exclusive_bucket_conflict
+    risk_excl = RiskManager(
+        RiskLimits(), {"A": contract_a, "B": contract_b}, refusals=counter,
+    )
+    risk_excl.evaluate_order(
+        contract=contract_b, signed_qty_delta=5.0, hours_to_settlement=24.0,
+        signal_age=FRESH, edge=0.50,
+        portfolio=PortfolioSnapshot(position_qty={"A": 10.0}),
+        quote=_quote(), quote_age_minutes=0.0,
+    )
+    # max_position
+    risk_pos = RiskManager(
+        RiskLimits(max_position_contracts=5.0), {"A": contract_a}, refusals=counter,
+    )
+    risk_pos.evaluate_order(
+        contract=contract_a, signed_qty_delta=1.0, hours_to_settlement=24.0,
+        signal_age=FRESH, edge=0.50,
+        portfolio=PortfolioSnapshot(position_qty={"A": 5.0}),
+        quote=_quote(), quote_age_minutes=0.0,
+    )
+    # max_event_notional
+    risk_event = RiskManager(
+        RiskLimits(max_event_notional=1.0, max_location_notional=100.0),
+        {"A": contract_a}, refusals=counter,
+    )
+    risk_event.evaluate_order(
+        contract=contract_a, signed_qty_delta=10.0, hours_to_settlement=24.0,
+        signal_age=FRESH, edge=0.50, portfolio=PortfolioSnapshot(equity=10_000.0),
+        quote=_quote(), quote_age_minutes=0.0,
+    )
+    # max_location_notional
+    risk_loc = RiskManager(
+        RiskLimits(max_event_notional=100.0, max_location_notional=1.0),
+        {"A": contract_a}, refusals=counter,
+    )
+    risk_loc.evaluate_order(
+        contract=contract_a, signed_qty_delta=10.0, hours_to_settlement=24.0,
+        signal_age=FRESH, edge=0.50, portfolio=PortfolioSnapshot(equity=10_000.0),
+        quote=_quote(), quote_age_minutes=0.0,
+    )
+    # max_simultaneous_positions
+    risk_sim = RiskManager(
+        RiskLimits(max_simultaneous_positions=1), {"A": contract_a, "B": contract_b},
+        refusals=counter,
+    )
+    risk_sim.evaluate_order(
+        contract=contract_b, signed_qty_delta=5.0, hours_to_settlement=24.0,
+        signal_age=FRESH, edge=0.50,
+        portfolio=PortfolioSnapshot(position_qty={"A": 10.0}),
+        quote=_quote(), quote_age_minutes=0.0,
+    )
+    # equity_fraction
+    risk_eq = RiskManager(
+        RiskLimits(max_equity_fraction=0.001, max_position_contracts=10_000.0),
+        {"A": contract_a}, refusals=counter,
+    )
+    risk_eq.evaluate_order(
+        contract=contract_a, signed_qty_delta=10_000.0, hours_to_settlement=24.0,
+        signal_age=FRESH, edge=0.50, portfolio=PortfolioSnapshot(equity=1.0),
+        quote=_quote(), quote_age_minutes=0.0,
+    )
+
+    assert set(counter.counts) <= risk_module.COUNTED_REFUSAL_REASONS
+    assert counter.total() > 0
