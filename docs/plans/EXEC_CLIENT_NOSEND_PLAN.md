@@ -1,6 +1,6 @@
 # The NO-SEND execution client — implementation plan
 
-**Status:** Revision 1, not executed. **Created:** 2026-08-31.
+**Status:** Revision 2, not executed. **Created:** 2026-08-31.
 
 **What this document is.** `docs/plans/ORDER_EGRESS_PLAN.md` (revision 3, 2246
 lines) designed the settlement identity, a four-type authority algebra and the
@@ -1437,6 +1437,8 @@ document and are `[V]`.
 | 7 | **`generate_mass_status` returning `None` on any refusal is correct for NO-SEND and WRONG for SEND.** Discarding a reconciliation while a position is open abandons it, with no cancel and no exit. NS-4 requires this sentence as a code comment above the `return None`, so the successor meets it in the source | this plan, NS-4 | `[V]` — `live/execution_engine.py:1721-1727` |
 | 8 | **`calculate_commission` must be overridden before any PnL is trusted.** Not overridden here, so an inferred reconciliation fill records `Money(0, quote_currency)` (`live/reconciliation.py:503-507`) | this plan, NS-5 rule 6 | `[V]` |
 | 9 | **The instrument-not-loaded fail-open has five sites, not one** (`live/execution_engine.py:2396-2400`, `:2435-2439`, `:2473-2477`, `:3057-3062`, `:3087-3092`), all DEBUG + `return True`. The input precondition NS-5 rule 2(b) installs is the single control that covers all five, and any widening of the instrument universe must keep it | this plan, NS-5 rule 2 | `[V]` |
+| 10 | **OQ-11 must be RE-DECIDED, not inherited.** In NO-SEND, a venue position outside the instrument universe refuses reconciliation and the process does not trade — correct, because refusing forfeits no capability when the process cannot trade anyway. **Once trading is live the trade-off inverts:** refusing means one unrelated position halts all trading, and the SEND half must weigh that cost explicitly rather than carry this decision forward | this plan, coordinator decision 2026-08-31 | Decided for NO-SEND; **open for SEND** |
+| 11 | **`POST /v1/orders` was reachable under TWO authority types, and the reduce-only one decremented order count but NOT budget** — leaving the operator's maximum-daily-budget ceiling with zero coverage on a path that posts live orders. This bears directly on one of the operator's two reserved controls, so the SEND half must pin every order-posting path to the budget, not merely to a count | `ORDER_EGRESS_PLAN_REVIEW_R3_2026-08-31.md` C-e | Inherited, **unverified here** |
 
 ---
 
