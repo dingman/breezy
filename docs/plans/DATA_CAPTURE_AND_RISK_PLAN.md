@@ -199,6 +199,42 @@ Revision 1: *"P2 must complete before I-1 merges."* But `FORECAST_INGESTION_PLAN
   brake into unmanaged inventory. **P4 must land the guard first, then the gate,
   and must re-derive these numbers from a committed script rather than citing
   this paragraph.**
+
+  **SELECTION BIAS -- ADDED 2026-08-31. Every percentage above is computed on a
+  sample that structurally excludes the cases it is trying to measure.**
+  `parse_book_top` (`parsing.py:582`) calls `_best_level` on BOTH sides
+  unconditionally, and the depth path indexes `bids[0][0]` (`:574`), so a frame
+  whose `bids` array is empty raises `VenuePayloadError` and yields **no
+  `quote_tick` and no `order_book_depths` row at all** -- not a row with a zero
+  bid. Live confirmation, one recorder session: the 5 slugs whose
+  `bestBidQuote` was `None` at discovery produced **247 parse errors and zero
+  rows**, while 5 two-sided slugs produced 675 of each. The 675-quote tape is
+  therefore CONDITIONED ON A TWO-SIDED BOOK, and half the sampled ladder never
+  entered it.
+
+  Three consequences, in increasing order of severity:
+
+  1. `min(bid,ask) >= 25` passing 20.7% is an **overestimate** of bid-side
+     availability across the real ladder: every excluded slug would have failed
+     it. The true figure is lower by an unmeasured amount.
+  2. `ask_size >= 25` passing 77.3% is biased in an **unknown direction**. The
+     excluded slugs' ask sizes were never recorded, and a market nobody bids
+     may be either thinly offered or heavily offered. The ~6.9x widening claim
+     is not safe to rely on until re-measured on an unconditioned sample.
+  3. **The severe one, which is not a statistics problem at all: the bot is
+     BLIND to those markets.** Zero quotes means no signal, no valuation, no
+     entry -- on precisely the cheap deep-out-of-the-money strikes a weather
+     model with a confident tail forecast would most want to buy. A gate we
+     chose is not rejecting them; the parser is dropping them before any gate
+     runs. That is silent universe truncation, and nothing in either plan
+     currently detects it.
+
+  **This does not close OQ-10 and it does not reopen the direction of the fix**
+  (`min(both)` -> executable side is still right). It adds a prerequisite: the
+  committed script that re-derives these numbers must first be able to SEE
+  one-sided books, so a one-sided frame must yield a row carrying an explicit
+  empty/zero bid rather than raising. Recorded as **OQ-13**; it blocks P4's
+  measurement, and P4 must not tune against the conditioned tape.
 - **`transaction_cost_prob = 0.015`** is a flat probability-unit stand-in for a fee that is genuinely `θ·p(1−p)`: correct at p=0.5, ~3× over-charged at p=0.9 — biasing against exactly the confident-tail trades the model is best at. Folded into §4.P6, which already edits that comparison.
 - **L: `websocket.py:991-1001`** interpolates full `{error}` text on the shard-close path, violating the module's own type-name-only rule honoured at `:499` and `:626`. One-line fix, folded into P1.
 
@@ -803,6 +839,7 @@ Genuinely independent: P0, P2, P5p, P7 items 1–3.
 | R-13 | Caps are tuned above a liquidity gate that rejects the whole book | MED | OQ-10 measured **before** P4 tunes anything |
 | R-14 | Probes fall outside the read-only guard's classifier | MED | Under `scripts/venue/`; `scripts/probes/` added to the classifier; classification asserted |
 | R-15 | Three concurrent agents in one tree produce unreproducible failures | MED | Commit by explicit path, never `git add -A` |
+| R-16 | Silent universe truncation: one-sided books never reach the tape, so deep-OTM strikes are invisible to signal and to measurement alike | **HIGH** | OQ-13 answered before P4 measures; the re-derivation script must run on an unconditioned sample |
 
 ---
 
@@ -827,6 +864,8 @@ Genuinely independent: P0, P2, P5p, P7 items 1–3.
 **OQ-9 (NEW, deferred to the forecast plan).** Should a schema-stable **raw forecast payload** record (the `NwsRawProduct` pattern — `raw_text` + digests, no derived fields) start the forward clock on day 0, reducing P2 to a decision about the *derived* record only? A good idea that belongs to `FORECAST_INGESTION_PLAN.md`, not here.
 
 **OQ-10 (NEW, blocking P4's tuning).** `min_liquidity_contracts = 25` against `min(bid_size, ask_size)` versus a measured median top-of-book bid of ~0.3 contracts. Does the gate reject essentially every weather quote before any cap is consulted? If so, depth belongs on the **executable** side for the intended direction, and cap tuning is measuring the wrong thing.
+
+**OQ-13 (NEW, blocking OQ-10's measurement).** The quote tape cannot see a one-sided book. `parse_book_top` (`parsing.py:582`) requires a best level on both sides and the depth path indexes `bids[0][0]` (`:574`), so an empty `bids` array raises `VenuePayloadError` and the frame produces **no row of any kind**. Measured live: 5 slugs with `bestBidQuote = None` yielded 247 errors and zero rows against 675 each for 5 two-sided slugs. Two questions, in order: (a) what SHOULD a one-sided frame emit — a `QuoteTick` with an explicit zero/absent bid, a depth row only, or a distinct record type — given that a `QuoteTick` with a zero bid is a lie about a book that has no bid at all? (b) How many weather instruments are currently invisible to the bot for this reason across a full ladder, not a 10-slug sample? Until (a) is answered, every bid-side statistic in this plan is conditioned on a two-sided book, and the deep-OTM strikes a confident tail forecast would target are exactly the ones missing.
 
 **OQ-12 (NEW, deliberately not acted on).** ZFP-only parses 120/120 where the registered AFD+ZFP mix parsed 123/240. Acting on that against the same data would be re-registering the bar around the result. A fresh pre-registration judged out-of-sample is the only legitimate route, and it is not scheduled.
 
