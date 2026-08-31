@@ -41,6 +41,7 @@ if TYPE_CHECKING:  # pragma: no cover - typing only
     from collections.abc import Sequence
 
 INSTRUMENT = InstrumentId(Symbol("synthetic-guard-market"), Venue("POLYMARKET_US"))
+NO_SIDE_EVIDENCE_DOC = "docs/evidence/no_side_instrument_probe_2026-08-31.md"
 
 
 class _FakePortfolio:
@@ -140,6 +141,79 @@ def test_a_sell_exactly_equal_to_the_net_long_is_accepted() -> None:
 def test_a_sell_one_unit_beyond_the_net_long_is_refused() -> None:
     with pytest.raises(NakedShortRefusedError):
         _guard(net=Decimal(10)).on_order_event(_initialized(quantity=11))
+
+
+@pytest.mark.parametrize(
+    ("net", "open_orders", "event_kwargs", "is_refused"),
+    [
+        pytest.param(Decimal(10), (), {"quantity": 10}, False, id="flatten-position"),
+        pytest.param(Decimal(10), (), {"quantity": 11}, True, id="one-beyond-net"),
+        pytest.param(Decimal(0), (), {"quantity": 1}, True, id="flat-sell"),
+        pytest.param(
+            Decimal(10),
+            (_FakeOrder(side=OrderSide.SELL, leaves=Decimal(10)),),
+            {"quantity": 10},
+            True,
+            id="working-sell-plus-new-sell",
+        ),
+        pytest.param(
+            Decimal(10),
+            (_FakeOrder(side=OrderSide.BUY, leaves=Decimal(10)),),
+            {"quantity": 10},
+            False,
+            id="working-buy-does-not-count",
+        ),
+        pytest.param(
+            Decimal(10),
+            (_FakeOrder(side=OrderSide.SELL, leaves=Decimal(10), reduce_only=True),),
+            {"quantity": 10},
+            False,
+            id="working-reduce-only-sell-does-not-count",
+        ),
+        pytest.param(
+            Decimal(0),
+            (),
+            {"quantity": 500, "reduce_only": True},
+            False,
+            id="reduce-only",
+        ),
+        pytest.param(
+            Decimal(0),
+            (),
+            {"side": OrderSide.BUY, "quantity": 500},
+            False,
+            id="buy",
+        ),
+    ],
+)
+def test_naked_short_refusal_set_and_exception_type_are_pinned(
+    net: Decimal,
+    open_orders: Sequence[_FakeOrder],
+    event_kwargs: dict[str, object],
+    is_refused: bool,
+) -> None:
+    guard = _guard(net=net, open_orders=open_orders)
+    event = _initialized(**event_kwargs)
+
+    if is_refused:
+        with pytest.raises(NakedShortRefusedError):
+            guard.on_order_event(event)
+    else:
+        guard.on_order_event(event)
+
+
+def test_naked_short_refusal_message_names_same_instrument_outcome_side() -> None:
+    with pytest.raises(NakedShortRefusedError) as excinfo:
+        _guard(net=Decimal(0)).on_order_event(_initialized(quantity=1))
+
+    message = str(excinfo.value)
+    assert NO_SIDE_EVIDENCE_DOC in message
+    assert "outcomeSide" in message
+    assert "price inversion" in message
+    assert "same instrument" in message
+    assert '"short YES" is spelled "buy NO"' not in message
+    assert "different InstrumentId" not in message
+    assert "own book" not in message
 
 
 def test_a_sell_with_no_position_at_all_is_refused() -> None:
