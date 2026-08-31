@@ -311,3 +311,52 @@ def test_latest_publication_at_or_before_is_order_independent_in_the_input_seque
     result = lib.latest_publication_at_or_before([pub1, pub0], now)
 
     assert result == pub1
+
+
+# ---------------------------------------------------------------------------
+# derive_completion_status
+# ---------------------------------------------------------------------------
+
+
+def test_derive_completion_status_no_orders_no_refusals_is_completed() -> None:
+    # An efficient market: the strategy saw no opportunity, not a gag.
+    status = lib.derive_completion_status(orders_submitted=0, refusal_counts={})
+
+    assert status == lib.STATUS_COMPLETED
+
+
+def test_derive_completion_status_orders_submitted_is_completed_even_with_refusals() -> None:
+    # Some signals traded, some were refused -- not the ENTIRE signal set.
+    status = lib.derive_completion_status(
+        orders_submitted=3, refusal_counts={"shorts_disabled": 2},
+    )
+
+    assert status == lib.STATUS_COMPLETED
+
+
+def test_derive_completion_status_zero_orders_with_refusals_is_completed_all_refused() -> None:
+    # Zero orders AND a nonzero refusal count: the whole signal set was gagged,
+    # not merely a strategy that found no edge.
+    status = lib.derive_completion_status(
+        orders_submitted=0, refusal_counts={"shorts_disabled": 12},
+    )
+
+    assert status == lib.STATUS_COMPLETED_ALL_REFUSED
+
+
+def test_derive_completion_status_sums_multiple_refusal_reasons() -> None:
+    status = lib.derive_completion_status(
+        orders_submitted=0,
+        refusal_counts={"shorts_disabled": 5, "some_other_reason": 1},
+    )
+
+    assert status == lib.STATUS_COMPLETED_ALL_REFUSED
+
+
+def test_derive_completion_status_zero_orders_and_all_zero_refusal_values_is_completed() -> None:
+    # A reason key present with count 0 is not evidence of a refusal.
+    status = lib.derive_completion_status(
+        orders_submitted=0, refusal_counts={"shorts_disabled": 0},
+    )
+
+    assert status == lib.STATUS_COMPLETED

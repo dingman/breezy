@@ -170,8 +170,11 @@ from nautilus_trader.trading.strategy import Strategy
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from weather_strategy_backtest_lib import (
+    STATUS_COMPLETED,
+    STATUS_COMPLETED_ALL_REFUSED,
     Scenario,
     build_settlement_scenarios,
+    derive_completion_status,
     hours_until,
     latest_publication_at_or_before,
     select_tradable_instrument_ids,
@@ -346,10 +349,15 @@ class RunResult:
     scenario: str
     provenance_by_station: dict[str, str]
     observed_by_station: dict[str, int]
-    status: str  # "COMPLETED" or "REFUSED"
+    status: str  # STATUS_COMPLETED, STATUS_COMPLETED_ALL_REFUSED, or "REFUSED"
     refusal_type: str | None
     refusal_message: str | None
     orders_submitted: int
+    # Per-reason counts from this run's strategy `RefusalCounter` (e.g.
+    # `{"shorts_disabled": 12}`) -- see `derive_completion_status`. Empty for
+    # the hard-abort "REFUSED" path, where `refusal_type`/`refusal_message`
+    # already carry the reason.
+    refusal_counts: dict[str, int] = field(default_factory=dict)
     fills: list[FillSummary] = field(default_factory=list)
     positions: list[PositionSummary] = field(default_factory=list)
     ending_balance_usd: float | None = None
@@ -365,6 +373,7 @@ class RunResult:
             "refusal_type": self.refusal_type,
             "refusal_message": self.refusal_message,
             "orders_submitted": self.orders_submitted,
+            "refusal_counts": dict(self.refusal_counts),
             "fills": [
                 {"side": f.side, "quantity": f.quantity, "avg_price": f.avg_price}
                 for f in self.fills
@@ -642,16 +651,29 @@ def _run_one(
             balance = account.balance_total(USD)
             if balance is not None:
                 ending_balance = float(balance.as_double())
+        # Every weather strategy owns a `RefusalCounter` (`strategy.refusals`,
+        # see `breezy.strategy.weather_common.refusals`) that both its
+        # decision layer and `RiskManager` record into during the run just
+        # completed. Read it here, before `engine.dispose()`, so a strategy
+        # whose entire signal set was refused (e.g. every SHORT_YES gagged by
+        # `allow_short=False`) is never indistinguishable from one that
+        # simply saw no opportunity.
+        refusal_counts = dict(strategy.refusals.counts)
+        status = derive_completion_status(
+            orders_submitted=len(orders),
+            refusal_counts=refusal_counts,
+        )
         return RunResult(
             condition=condition,
             strategy=strategy_kind,
             scenario=scenario.name,
             provenance_by_station=dict(scenario.provenance_by_station),
             observed_by_station=dict(scenario.observed_by_station),
-            status="COMPLETED",
+            status=status,
             refusal_type=None,
             refusal_message=None,
             orders_submitted=len(orders),
+            refusal_counts=refusal_counts,
             fills=fills,
             positions=positions,
             ending_balance_usd=ending_balance,
@@ -678,9 +700,15 @@ def _print_summary(results: list[RunResult]) -> None:
     print("-" * len(header))
     for r in results:
         realized = sum(p.realized_pnl or 0.0 for p in r.positions)
-        realized_str = f"{realized:+.2f}" if r.status == "COMPLETED" else "n/a"
+        realized_str = f"{realized:+.2f}" if r.status == STATUS_COMPLETED else "n/a"
         balance_str = f"{r.ending_balance_usd:.2f}" if r.ending_balance_usd is not None else "n/a"
-        detail = r.status if r.status == "COMPLETED" else f"{r.status}:{r.refusal_type}"
+        if r.status == STATUS_COMPLETED:
+            detail = r.status
+        elif r.status == STATUS_COMPLETED_ALL_REFUSED:
+            reasons = ",".join(f"{k}={v}" for k, v in sorted(r.refusal_counts.items()))
+            detail = f"{r.status}:{reasons}"
+        else:
+            detail = f"{r.status}:{r.refusal_type}"
         print(
             f"{r.condition:<10} {r.strategy:<28} {r.scenario:<24} {detail:<10} "
             f"{r.orders_submitted:>6} {len(r.fills):>5} {realized_str:>13} "
