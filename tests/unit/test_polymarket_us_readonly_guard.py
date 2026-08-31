@@ -35,7 +35,12 @@ Step 1 -- classify each ``*.py`` file under ``src/`` and ``scripts/`` as
 *venue-touching* or not. A file is venue-touching when ANY of:
 
   (C1) its path is under ``src/breezy/adapters/polymarket_us/``;
-  (C2) its path is under ``scripts/venue/``;
+  (C2) its path is under ``scripts/venue/`` or ``scripts/probes/``;
+       (``scripts/probes/`` is covered pre-emptively per
+       ``DATA_CAPTURE_AND_RISK_PLAN.md`` R15: a probe placed there taking
+       its base URL from config and importing only ``breezy.ingest.http``
+       would otherwise match NONE of C1-C4, so the write-verb and
+       order-path rules would silently not apply to it);
   (C3) any ``ast.Constant`` string in it matches
        ``(?i)\\b(?:api|gateway)\\.polymarket\\.us\\b`` or
        ``(?i)\\bpolymarketexchange\\.com\\b``;
@@ -113,6 +118,18 @@ _VENUE_HOST_RE = re.compile(
 )
 _ADAPTER_PACKAGE = "breezy.adapters.polymarket_us"
 
+#: C2 -- script directories whose contents are venue-touching BY PATH.
+#:
+#: ``scripts/venue/`` is where the venue smoke and the P2 probes live.
+#: ``scripts/probes/`` carries no file today and is listed anyway, per
+#: ``docs/plans/DATA_CAPTURE_AND_RISK_PLAN.md`` R15: the barrier has to be in
+#: place BEFORE the directory exists, or the first probe written there is
+#: exempt from every write-verb rule and nobody notices.
+VENUE_TOUCHING_SCRIPT_PREFIXES: tuple[str, ...] = (
+    "scripts/venue/",
+    "scripts/probes/",
+)
+
 
 @dataclass(frozen=True, slots=True)
 class Violation:
@@ -171,7 +188,7 @@ def is_venue_touching(path: str, tree: ast.AST) -> bool:
     """Return True when ``path`` may sit on a Polymarket.us egress path."""
     if path.startswith("src/breezy/adapters/polymarket_us/"):
         return True  # C1
-    if path.startswith("scripts/venue/"):
+    if any(path.startswith(prefix) for prefix in VENUE_TOUCHING_SCRIPT_PREFIXES):
         return True  # C2
     for node in ast.walk(tree):
         if (

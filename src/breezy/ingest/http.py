@@ -540,6 +540,7 @@ class HttpTransport:
         write_timeout: float = 5.0,
         pool_timeout: float = 5.0,
         user_agent: str | None = None,
+        accept: str = DEFAULT_ACCEPT,
         check_proxy_env: bool = True,
         approved_proxy_env_vars: frozenset[str] | None = None,
     ) -> None:
@@ -569,6 +570,18 @@ class HttpTransport:
             connect=connect_timeout, read=read_timeout, write=write_timeout, pool=pool_timeout
         )
         self._user_agent = _resolved_user_agent(user_agent)
+        # The `Accept` VALUE is a per-transport setting; the header NAME is
+        # still supplied here and only here, so no per-call input can displace
+        # it (see `_conditional_headers`). It defaults to the NWS value, so the
+        # settlement path is byte-identical to before this seam existed. It is
+        # configurable because a hardened transport aimed at a non-NWS origin
+        # (the P2 probes) must be able to ask for that origin's media type
+        # rather than fork this module's hardening to get one header changed.
+        self._accept = _validated_header_value(
+            accept,
+            label="accept",
+            error_factory=ValueError,
+        )
         self._ssl_context = _build_ssl_context()
 
     def _discovery_list_url(self, cli_location: str) -> str:
@@ -635,7 +648,7 @@ class HttpTransport:
             timeout=self._timeouts.as_httpx_timeout(),
             headers={
                 "User-Agent": self._user_agent,
-                "Accept": DEFAULT_ACCEPT,
+                "Accept": self._accept,
                 "Accept-Encoding": "identity",
             },
         )
