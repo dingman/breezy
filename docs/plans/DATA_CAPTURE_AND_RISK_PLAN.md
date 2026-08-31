@@ -486,9 +486,45 @@ got, by era and by location.
 **Still open:** the block's older edge (2019 is null), and the far side of the
 post-2024 hole. Neither changes the schema decision, so neither gates I-4.
 
-| Probe B outcome | Decision |
-|---|---|
-| Passes its pre-registered bar | A second historical source for cross-validation. Never a settlement source |
+### Probe B — EXECUTED 2026-08-31. **VERDICT: FAIL.** Registered outcome: stop.
+
+Evidence: `docs/evidence/iem_afos_forecast_pil_probe_2026-08-31T013909Z/`. 4 of 12
+budgeted requests; all HTTP 200 `text/plain`. The anticipated `fmt=text` refusal did
+**not** occur.
+
+| clause | measured | state |
+|---|---|---|
+| ≥50 products | 240 | PASS |
+| ≥2 sites | 2 (NYC/KOKX, MDW/KLOT) | PASS |
+| ≥90% numeric daily high | **0.5125** (123/240) | **FAIL** |
+| issuance time from WMO header | 238/240 | FAIL |
+| office attribution | 238/240 | FAIL |
+
+Probe B carried all four of Probe A's report defects **plus one of its own**: it counted
+`sites` by *step label*, so AFD+ZFP for a single city scored `sites=2` and would have
+silently satisfied the ≥2-sites clause with one site. All fixed; a non-2xx, or a 2xx
+whose non-empty body carries no WMO-headed product, now aborts. An *empty* 2xx does not
+— that is a fact about one PIL, and aborting on it would let one quiet PIL suppress the
+second site the bar needs.
+
+The two WMO-header misses are `CCA` **corrected** products (`FXUS63 KLOT 100021 CCA`);
+the BBB group after DDHHMM breaks the header regex's end anchor. Real, small, and not
+worth fixing unless Probe B is ever revived.
+
+> **DECISION (plan owner). Probe B is CLOSED as FAIL. Do not re-scope it now.**
+> The post-hoc observation that **ZFP alone parses 120/120** (highs, WMO time and office
+> attribution all clean) while AFD manages 3/120 is recorded as **OQ-12**, NOT acted on.
+> Narrowing the product set after seeing the data and re-running on the same data is
+> re-registering the bar around the result — precisely what the pre-registration
+> discipline exists to forbid. If a second historical source is ever wanted, the correct
+> move is a **newly pre-registered ZFP-only probe on fresh dates and sites**, judged
+> out-of-sample. Probe B is not on the critical path and the branch decision is already
+> settled, so that is not scheduled.
+>
+> **Latent hazard found in passing:** `zfp_mdw` returned 4,102,198 B against a 4,194,304 B
+> per-instance body cap — **97.8%**. `limit=60` was binding on all four steps. Any future
+> ZFP probe must lower `limit` or raise its own instance cap; today it is one busy
+> forecast day from truncation.
 
 Forward NWS collection (P3a) starts **regardless** of both outcomes.
 
@@ -752,6 +788,8 @@ Genuinely independent: P0, P2, P5p, P7 items 1–3.
 **OQ-9 (NEW, deferred to the forecast plan).** Should a schema-stable **raw forecast payload** record (the `NwsRawProduct` pattern — `raw_text` + digests, no derived fields) start the forward clock on day 0, reducing P2 to a decision about the *derived* record only? A good idea that belongs to `FORECAST_INGESTION_PLAN.md`, not here.
 
 **OQ-10 (NEW, blocking P4's tuning).** `min_liquidity_contracts = 25` against `min(bid_size, ask_size)` versus a measured median top-of-book bid of ~0.3 contracts. Does the gate reject essentially every weather quote before any cap is consulted? If so, depth belongs on the **executable** side for the intended direction, and cap tuning is measuring the wrong thing.
+
+**OQ-12 (NEW, deliberately not acted on).** ZFP-only parses 120/120 where the registered AFD+ZFP mix parsed 123/240. Acting on that against the same data would be re-registering the bar around the result. A fresh pre-registration judged out-of-sample is the only legitimate route, and it is not scheduled.
 
 **OQ-11 (NEW, out of scope).** Is a sibling-bucket long-only basket a legitimate expression of the mean-reversion signal? `P(¬A) = Σ P(B)` over siblings, purchasable on the deep ask side, and fees favour the basket — but `exclusive_conflict` currently forbids more than one long YES per `event_key`, and cost is `Σ ask_i` versus `1 − bid_A`. An evidence question, not a default.
 

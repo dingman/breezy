@@ -804,7 +804,7 @@ def _sample(
         sites=sites,
         highs_extracted=parsed,
         issuance_recoverable=issuance,
-        zone_attributable=zoned,
+        office_attributable=zoned,
     )
 
 
@@ -825,7 +825,7 @@ def test_probe_b_passes_only_when_every_pre_registered_clause_holds() -> None:
         ({"products": 60, "sites": 2, "parsed": 60, "issuance": 59, "zoned": 60}, "issuance_time"),
         (
             {"products": 60, "sites": 2, "parsed": 60, "issuance": 60, "zoned": 59},
-            "zone_attribution",
+            "office_attribution",
         ),
     ],
 )

@@ -69,17 +69,26 @@ async def test_probe_b_runs_within_budget_and_computes_a_verdict(tmp_path: Path)
     )
     writer = ProbeEvidenceWriter(tmp_path)
 
-    exchanges, payloads, aborted = await probe.execute(transport, writer, plan)
+    execution = await probe.execute(transport, writer, plan)
 
-    assert aborted is None, aborted
     assert budget.spent <= budget.limit
     rows = (tmp_path / MANIFEST_FILENAME).read_text(encoding="utf-8").splitlines()
-    assert len(rows) - 1 == len(exchanges)
+    assert len(rows) - 1 == len(execution.exchanges)
+    # An abort is a legitimate OUTCOME (a failed baseline stops the run rather
+    # than re-spending the budget), so its accounting is asserted, not its
+    # absence: aborting must always name the steps it skipped.
+    if execution.aborted is None:
+        assert execution.skipped == ()
+        assert len(execution.exchanges) == len(plan)
+    else:
+        assert len(execution.exchanges) + len(execution.skipped) <= len(plan)
 
     offices = {
-        step.label: registry.settlement_site(probe.VENUE, step.city).issuing_office for step in plan
+        city: registry.settlement_site(probe.VENUE, city).issuing_office
+        for city in probe.PROBE_CITIES
     }
-    verdict = probe.evaluate_verdict(probe.census_from_payloads(payloads, offices))
+    census = probe.census_from_outcomes(execution.outcomes, offices)
+    verdict = probe.evaluate_verdict(census)
     # The VALUE of the verdict is the finding, not an assertion. Only its
     # internal consistency is asserted here.
     assert verdict.passed is (verdict.failures == ())
