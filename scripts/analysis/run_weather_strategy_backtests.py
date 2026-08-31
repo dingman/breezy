@@ -77,25 +77,67 @@ market data, and even that scenario trades against an ASSUMED forecast (no
 forecast ingestion exists) -- so no number this script prints is a claim about
 live trading performance.
 
-ONE CONDITION: `naive`
------------------------
-An earlier version of this runner ran every strategy under two conditions,
-`naive` (a single constant forecast snapshot published at the tape's own
-first timestamp) and `realistic` (a set of input-timing fixes: `published_at`
-moved hours earlier, and `forecast_mispricing` constructed with
-`allow_short=False`/`use_limit_orders=False` -- both already that strategy's
-config default). All 18 `naive`/`realistic` row pairs it produced were
-byte-identical: `forecast_mispricing`'s override set a field to its existing
-default, and `calibration_mean_reversion`/`forecast_revision` never reached
-the moved-timing gate at all because `SHORTS_DISABLED` (every `SHORT_YES`
-signal refused under each strategy's own `allow_short=False` default -- see
-`RefusalCounter`, `derive_completion_status`) fired first regardless of
-`published_at`. Making the two conditions differ behaviourally would require
-either flipping `allow_short=True` or bypassing the `SHORTS_DISABLED` refusal,
-and this runner does neither. The `realistic` condition was therefore a no-op
-duplicating `naive`'s own rows, and has been removed: `CONDITIONS` carries
-exactly `naive`, at every strategy's config defaults, with no override ever
-constructed.
+TWO CONDITIONS: `naive` (baseline) AND `realistic`
+-----------------------------------------------------
+A first version of this runner used one forecast shape for every strategy: a
+single, constant snapshot published at the instant the tape begins. Every one
+of the three strategies traded zero or aborted every scenario under it, and
+independent review found all three blockers traced to that ONE unrealistic
+input, not to the strategies or the harness. Both conditions below are run and
+reported; the `naive` condition is kept, unmodified, as the baseline it always
+was.
+
+* **`naive`** (baseline, unchanged): `published_at` == the tape's own first
+  timestamp (a forecast 0-6 minutes old for the whole run), one constant
+  snapshot per station, every strategy at its config defaults.
+* **`realistic`**: three independent, individually-justified input fixes --
+  never a strategy, config default, harness, or guard change:
+
+  1. **`published_at` moved `REALISTIC_PUBLISHED_AT_OFFSET_HOURS` (6.0 hours) before
+     the tape window**, for `calibration_mean_reversion` and
+     `forecast_mispricing`. Real NWS forecasts are issued hours before the
+     trading window they cover; a 0-6-minute-old forecast is the unrealistic
+     artifact, not `stable_forecast_minutes=25.0`
+     (`CalibrationMeanReversionConfig`) that it was failing. The offset is
+     also comfortably inside `stale_forecast_hours=8.0` (`RiskLimits`), so it
+     unblocks the stability floor without tripping the staleness ceiling.
+     `expected_high_f` is UNCHANGED from the `naive` condition -- only the
+     timing moves, so any behaviour change is attributable to that alone.
+  2. **`forecast_mispricing` is constructed with `allow_short=False` and
+     `use_limit_orders=False`.** Both are config fields the strategy already
+     exposes with defaults; setting them is using a knob, not weakening the
+     `BacktestOrderGuard`, which stays untouched and still refuses any naked
+     short that gets through. Breezy holds no inventory at run start, so
+     `SHORT_YES` is unreachable on this CLOB for a first move -- the guard's
+     own message says as much ("short YES is spelled buy NO, which is a
+     different InstrumentId"). The `naive` condition's `NakedShortRefusedError`
+     is kept and reported as a genuine pre-live default-config defect, not
+     papered over.
+  3. **`forecast_revision` is given a PUBLISHED SEQUENCE, not a constant
+     snapshot** (`REVISION_SEQUENCE_...` constants below, printed at
+     runtime): a baseline publication `REALISTIC_PUBLISHED_AT_OFFSET_HOURS`
+     before the tape, then two more inside the tape window, each
+     `REVISION_STEP_F` degrees higher than the last (same sign, satisfying
+     `persistence_same_sign=True` with `persistence_updates=2`). The strategy
+     is structurally unable to detect a revision in a forecast that never
+     changes; this is the minimum realistic input that lets it observe one.
+     `allow_short` is left at its config default (`False` --
+     `ForecastRevisionConfig.allow_short`, and likewise `False` for the other
+     two strategies' configs) for this strategy -- unlike `forecast_mispricing`,
+     this was not one of the three diagnosed blockers, so no override is
+     constructed for it here. Because the default is `False`, not `True`, any
+     SHORT_YES signal this strategy forms is refused before it ever reaches a
+     naked-short abort: the abort path (`NakedShortRefusedError`) is
+     unreachable at these defaults, and a refusal is reported exactly as it
+     occurs (see `RefusalCounter`) rather than pre-emptively silenced.
+
+None of these three touches the settlement sweep, the settlement truth, or any
+forecast VALUE relative to `naive` (only #3 introduces new values, and only to
+create a detectable revision, never reverse-engineered from the settlement
+sweep or chosen to manufacture a profitable trade). If a strategy still does
+not trade under `realistic`, that is reported plainly, with the specific gate
+that blocked it -- this script does not iterate on forecast values to
+manufacture trades.
 
 USAGE
 -----
@@ -194,24 +236,42 @@ STRATEGY_KINDS: Final[tuple[str, ...]] = (
     "forecast_revision",
 )
 
-#: The single condition this runner produces (see the module docstring's
-#: "ONE CONDITION" section for why the previous two-condition design was
-#: collapsed to this one).
+#: The unmodified baseline (a forecast published at/near tape start) and the
+#: input-realism fix (see the module docstring's "TWO CONDITIONS" section).
 CONDITION_NAIVE: Final[str] = "naive"
-CONDITIONS: Final[tuple[str, ...]] = (CONDITION_NAIVE,)
+CONDITION_REALISTIC: Final[str] = "realistic"
+CONDITIONS: Final[tuple[str, ...]] = (CONDITION_NAIVE, CONDITION_REALISTIC)
+
+#: ASSUMED, fix #1. Real NWS forecasts are issued hours ahead of the trading
+#: window they cover; this is comfortably inside `RiskLimits.stale_forecast_hours`
+#: (8.0) and clears `CalibrationMeanReversionConfig.stable_forecast_minutes`
+#: (25.0) many times over. `expected_high_f` is UNCHANGED from `naive`.
+REALISTIC_PUBLISHED_AT_OFFSET_HOURS: Final[float] = 6.0
+
+#: ASSUMED, fix #3. `forecast_revision`'s published SEQUENCE: a baseline
+#: publication `REALISTIC_PUBLISHED_AT_OFFSET_HOURS` before the tape (shared
+#: with fix #1), then two more inside the tape window, `REVISION_STEP_F`
+#: degrees apart and same-sign (`persistence_same_sign=True`,
+#: `persistence_updates=2`). Chosen to be large enough to clear
+#: `min_temp_revision_f=1.5` on its own; never reverse-engineered from the
+#: settlement sweep.
+REVISION_PUB1_OFFSET_MINUTES: Final[float] = 1.0
+REVISION_PUB2_OFFSET_MINUTES: Final[float] = 3.0
+REVISION_STEP_F: Final[float] = 3.0
 
 
 @dataclass(frozen=True, slots=True)
 class _SequenceForecastSource:
     """ASSUMED forecast(s), injected explicitly -- see the module docstring.
 
-    This runner always constructs it with exactly ONE `(published_at,
-    expected_high_f)` entry per station (`naive`'s constant single-snapshot
-    forecast), but it is written to generalize over several: a station with
-    multiple entries would let a strategy observe a sequence of publications
-    as `now` advances past each one in turn. Never reads any settlement
-    observation, real or swept -- `expected_high_f` values are supplied by
-    the caller, always independently of `observed_by_station`.
+    Generalizes over both conditions: a station with ONE `(published_at,
+    expected_high_f)` entry behaves exactly like a constant single-snapshot
+    source (`naive`, and `realistic`'s `calibration_mean_reversion` /
+    `forecast_mispricing` sources); a station with several entries lets
+    `forecast_revision` observe a sequence of publications as `now` advances
+    past each one in turn. Never reads any settlement observation, real or
+    swept -- `expected_high_f` values are supplied by the caller, always
+    independently of `observed_by_station`.
 
     `horizon_hours` is always LIVE, computed from `now` against that station's
     real settlement deadline (`settlement_deadline_by_station`, sourced from
@@ -284,7 +344,7 @@ class PositionSummary:
 
 @dataclass(frozen=True, slots=True)
 class RunResult:
-    condition: str  # always CONDITION_NAIVE -- see module docstring's "ONE CONDITION"
+    condition: str  # CONDITION_NAIVE or CONDITION_REALISTIC
     strategy: str
     scenario: str
     provenance_by_station: dict[str, str]
@@ -478,8 +538,8 @@ def _build_strategy(
 ) -> Strategy:
     """Build one strategy of `kind`. Every field but `instrument_ids` is a
     config default UNLESS explicitly named in `config_overrides` -- see the
-    module docstring's "ONE CONDITION" section. `config_overrides` is always
-    `{}` in this runner: no field is ever overridden.
+    module docstring's "TWO CONDITIONS" section for which run passes which
+    overrides and why each one is justified on its own.
     """
     if kind == "calibration_mean_reversion":
         return CalibrationMeanReversionStrategy(
@@ -666,13 +726,12 @@ def _forecast_sources_and_overrides(
 ]:
     """Per (condition, strategy_kind): the `ForecastSource` and config overrides.
 
-    Keys are `f"{condition}:{strategy_kind}"`. `CONDITIONS` carries exactly
-    one condition (`naive` -- see the module docstring's "ONE CONDITION"
-    section), so every strategy gets the SAME `_SequenceForecastSource`: a
-    single, constant snapshot published at the tape's own first timestamp,
-    and no config override -- every field stays at its strategy's own
-    default.
+    Keys are `f"{condition}:{strategy_kind}"`. See the module docstring's "TWO
+    CONDITIONS" section for what each one is and why.
     """
+    realistic_published_at = tape_start_dt - dt.timedelta(
+        hours=REALISTIC_PUBLISHED_AT_OFFSET_HOURS,
+    )
     stations = tuple(settlement_deadline_by_station)
 
     naive_source = _SequenceForecastSource(
@@ -681,16 +740,74 @@ def _forecast_sources_and_overrides(
         },
         settlement_deadline_by_station=settlement_deadline_by_station,
     )
+    realistic_single_source = _SequenceForecastSource(
+        publications_by_station={
+            station: ((realistic_published_at, ASSUMED_FORECAST_HIGH_F[station]),)
+            for station in stations
+        },
+        settlement_deadline_by_station=settlement_deadline_by_station,
+    )
+    pub1_at = tape_start_dt + dt.timedelta(minutes=REVISION_PUB1_OFFSET_MINUTES)
+    pub2_at = tape_start_dt + dt.timedelta(minutes=REVISION_PUB2_OFFSET_MINUTES)
+    realistic_revision_source = _SequenceForecastSource(
+        publications_by_station={
+            station: (
+                (realistic_published_at, ASSUMED_FORECAST_HIGH_F[station]),
+                (pub1_at, ASSUMED_FORECAST_HIGH_F[station] + REVISION_STEP_F),
+                (pub2_at, ASSUMED_FORECAST_HIGH_F[station] + 2 * REVISION_STEP_F),
+            )
+            for station in stations
+        },
+        settlement_deadline_by_station=settlement_deadline_by_station,
+    )
 
     sources: dict[str, ForecastSource] = {
-        f"{CONDITION_NAIVE}:{kind}": naive_source for kind in STRATEGY_KINDS
+        f"{CONDITION_NAIVE}:calibration_mean_reversion": naive_source,
+        f"{CONDITION_NAIVE}:forecast_mispricing": naive_source,
+        f"{CONDITION_NAIVE}:forecast_revision": naive_source,
+        f"{CONDITION_REALISTIC}:calibration_mean_reversion": realistic_single_source,
+        f"{CONDITION_REALISTIC}:forecast_mispricing": realistic_single_source,
+        f"{CONDITION_REALISTIC}:forecast_revision": realistic_revision_source,
     }
     overrides: dict[str, dict[str, Any]] = {
-        f"{CONDITION_NAIVE}:{kind}": {} for kind in STRATEGY_KINDS
+        f"{CONDITION_NAIVE}:calibration_mean_reversion": {},
+        f"{CONDITION_NAIVE}:forecast_mispricing": {},
+        f"{CONDITION_NAIVE}:forecast_revision": {},
+        f"{CONDITION_REALISTIC}:calibration_mean_reversion": {},
+        f"{CONDITION_REALISTIC}:forecast_mispricing": {
+            "allow_short": False,
+            "use_limit_orders": False,
+        },
+        f"{CONDITION_REALISTIC}:forecast_revision": {},
     }
     print(
         f"ASSUMED forecast, {CONDITION_NAIVE} condition (fixed, published_at="
         f"{tape_start_dt.isoformat()}): {ASSUMED_FORECAST_HIGH_F}",
+    )
+    print(
+        f"ASSUMED forecast, {CONDITION_REALISTIC} condition, single-snapshot "
+        f"(calibration_mean_reversion, forecast_mispricing), published_at="
+        f"{realistic_published_at.isoformat()} "
+        f"({REALISTIC_PUBLISHED_AT_OFFSET_HOURS}h before tape start): "
+        f"{ASSUMED_FORECAST_HIGH_F}",
+    )
+    print(
+        f"ASSUMED forecast, {CONDITION_REALISTIC} condition, PUBLISHED SEQUENCE "
+        f"(forecast_revision): "
+        + "; ".join(
+            f"{station}: "
+            + " -> ".join(
+                f"{p[1]:.1f}F@{p[0].isoformat()}"
+                for p in realistic_revision_source.publications_by_station[station]
+            )
+            for station in stations
+        ),
+    )
+    print(
+        f"CONFIG OVERRIDE, {CONDITION_REALISTIC} condition, forecast_mispricing: "
+        f"{overrides[f'{CONDITION_REALISTIC}:forecast_mispricing']} "
+        f"(venue holds no inventory at run start, so SHORT_YES is unreachable "
+        f"on this CLOB for a first move; BacktestOrderGuard is unchanged)",
     )
     return sources, overrides
 
@@ -802,6 +919,8 @@ def main(argv: list[str] | None = None) -> int:
                 "weather_catalog_root": str(args.weather_catalog_root),
                 "real_observed_by_station": real_observed,
                 "assumed_forecast_high_f_by_station": ASSUMED_FORECAST_HIGH_F,
+                "realistic_published_at_offset_hours": REALISTIC_PUBLISHED_AT_OFFSET_HOURS,
+                "revision_sequence_step_f": REVISION_STEP_F,
                 "tradable_instrument_ids": [ti.instrument.id.value for ti in tape_instruments],
                 "scenarios": [
                     {
