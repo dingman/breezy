@@ -203,17 +203,28 @@ def test_naked_short_refusal_set_and_exception_type_are_pinned(
 
 
 def test_naked_short_refusal_message_names_same_instrument_outcome_side() -> None:
+    """Substance lives in the raised MESSAGE; the evidence citation lives in
+    the exception class's DOCSTRING -- a ``docs/evidence`` path is a runtime
+    value if it is embedded in the raised f-string, but prose in a docstring
+    is a permitted citation (``test_probe_containment.py``'s
+    ``find_evidence_path_reads`` detector distinguishes exactly this).
+    """
     with pytest.raises(NakedShortRefusedError) as excinfo:
         _guard(net=Decimal(0)).on_order_event(_initialized(quantity=1))
 
     message = str(excinfo.value)
-    assert NO_SIDE_EVIDENCE_DOC in message
+    assert NO_SIDE_EVIDENCE_DOC not in message
     assert "outcomeSide" in message
     assert "price inversion" in message
     assert "same instrument" in message
     assert '"short YES" is spelled "buy NO"' not in message
     assert "different InstrumentId" not in message
     assert "own book" not in message
+
+    docstring = NakedShortRefusedError.__doc__ or ""
+    assert NO_SIDE_EVIDENCE_DOC in docstring
+    assert "same" in docstring
+    assert "instrument" in docstring
 
 
 def test_a_sell_with_no_position_at_all_is_refused() -> None:

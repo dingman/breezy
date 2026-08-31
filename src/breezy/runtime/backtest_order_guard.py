@@ -96,6 +96,11 @@ class NakedShortRefusedError(ValueError):
     fill is accepted, the account's free balance RISES, and terminal PnL
     arithmetic stays correct. The only symptom is a position that could never
     have been funded.
+
+    On Polymarket.us, NO is an outcome side on the *same* instrument/book --
+    not a separate ``InstrumentId`` with its own book -- so the live order
+    expression is ``outcomeSide=NO`` with price inversion, as recorded in
+    ``docs/evidence/no_side_instrument_probe_2026-08-31.md``.
     """
 
 
@@ -154,8 +159,7 @@ class BacktestOrderGuard:
                 f"naked short of {pending + quantity - net}. On a Polymarket CLOB you "
                 f"cannot sell tokens you do not hold. On Polymarket.us, NO is an "
                 f"outcome side on the same instrument/book: the live order expression "
-                f"is `outcomeSide=NO` with price inversion, as recorded in "
-                f"`docs/evidence/no_side_instrument_probe_2026-08-31.md`. No "
+                f"is `outcomeSide=NO` with price inversion. No "
                 f"Nautilus check can catch this: `CashAccount.balance_impact` returns "
                 f"+notional for a SELL, so the RiskEngine's `(free + impact) < 0` gate "
                 f"can never fire, position-reducing sells are exempted outright, and "
