@@ -314,7 +314,7 @@ Two changes from revision 1:
 
 **Why (b) was added (R16).** P0's whole argument — cannot be honestly re-fetched, one copy on one device — applies verbatim to the quote tape, which §4.P1.4's prune *deletes*. Revision 1 rated that HIGH and mitigated it with a retention record and no second copy.
 
-**Why now.** The only T0 item, and already on a clock: `ARCHIVE_RELOCATION_2026-08-27.md:10-11` puts the `/tmp` sweep around **2026-09-04**, and that `/tmp` copy is currently the only redundancy.
+**Why now.** The only T0 item, and already on a clock: `ARCHIVE_RELOCATION_2026-08-27.md:10-11` puts the `/tmp` sweep around **2026-09-04**, and that `/tmp` copy was believed to be the only redundancy. **Corrected 2026-08-31:** `/mnt/storage/breezy-backup/` already held an unverified, never-restored rsync copy from 2026-08-30; P0 wrote to a disjoint directory and left it untouched.
 
 **Steps.** (1) Re-measure — file count, `du -sb`, `/tmp` copy presence. (2) **Verify the primary against the git-tracked manifest first** (`:28-31`), so backing up a corrupt primary is impossible. (3) Copy as `.tar.zst` + detached `.sha256` + the unchanged per-file manifest. (4) **Prove the restore**: extract to scratch and verify *that extraction*. (5) Do not delete the `/tmp` copy. (6) Correct the stale "Still open" (`:43-49`) — all four scripts now default via `settlement_alignment_cache.py:8-10`, fail-closed at `:24-31`. (7) **Commit the untracked P6 dependencies** (`scripts/analysis/settlement_truth_dataset.py`, `price_conditional_settlement_analysis.py` and their tests) — an uncommitted dependency of a T0-backed study is the same losable-artifact problem.
 
@@ -420,11 +420,75 @@ Two caveats carried into the decision: Open-Meteo carries a stated 1–3 °C sys
 
 That is valuable — it is the input to `ForecastErrorModel`/`HorizonSigmaParams`, to `sigma`, to `min_model_edge`, and to P6's guard band. It is **not** a backtest, and any document claiming otherwise is wrong. This sentence is carried verbatim into every artifact Branch H produces.
 
-| Probe A outcome | Decision |
+### EXECUTED 2026-08-31 — the branch decision, settled on evidence
+
+Probe A ran three times (the first two are preserved as negative findings). Evidence:
+`docs/evidence/open_meteo_previous_runs_probe_2026-08-31T005848Z/` and
+`docs/evidence/open_meteo_coverage_bisect_probe_2026-08-31T011135Z/`.
+
+**Two corrections to this plan's own text.** (i) The class is `HttpTransport`, not
+`HttpClient`. (ii) **`/v1/previous-runs` does not exist.** That path came from
+`WEATHER_INGESTION_PROPOSAL.md:152` and was never verified; it returns
+`{"error":true,"reason":"Not Found"}`. The real surface is
+**`https://previous-runs-api.open-meteo.com/v1/forecast`, hourly only**,
+`temperature_2m_previous_dayN`. Note the trap: `api.open-meteo.com/v1/forecast`
+returns **HTTP 200 with every previous-run value null** — a named variable is not a
+served variable, and only a "2xx AND it yielded the datum" rule separates them.
+
+| Q | Answer |
 |---|---|
-| Un-keyed, valid-time anchored, N ≥ 5, archive ≥ 2024-01 | **Branch H** — an offline harvester feeding a calibration study. **Adds to**, never replaces, forward NWS collection |
-| Any of those fails | **Branch F** — forward NWS only. Record the negative as a finding, not a failure |
-| Probe B passes its bar | A second historical source for cross-validation. Never a settlement source |
+| 1 un-keyed / host | YES, free tier, `previous-runs-api.open-meteo.com` |
+| 2 naming / max N | `temperature_2m_previous_dayN`; real **max N = 7** (`day8` → 200 with 0/168) |
+| 3 archive depth | **`archive_reaches_2024_01` REFUTED** — see below |
+| 4 valid-time or run-time | **VALID-TIME anchored**, corroborated: identical values across window shapes rules out *request-window* anchoring only, so the populated 2022 window is the second leg (no run made "1 day before now" can forecast 2022) |
+| 5 publication lag | partial; needs a second execution on a later day |
+| 6 restatement | **unanswerable in one run** by construction; baseline digests captured for a later diff |
+| 7 model identifiers | all five accepted |
+| 8 licence text | the API origin serves **none**; absence is the finding. Moot — operator closed the gate |
+| 9 response sizes | largest realistic payload 10,666 B vs a 512 KiB cap |
+
+**Coverage is a function of BOTH date and model** (`temperature_2m_previous_day1`, NYC, 7-day hourly windows, all HTTP 200):
+
+| date | best_match | ecmwf_ifs025 | gfs_seamless | icon_seamless |
+|---|---|---|---|---|
+| 2022-01-01 | **168/168** | 0/168 | **168/168** | 0/168 |
+| 2024-01-01 | 0/168 | 0/168 | 0/168 | 0/168 |
+
+**Positive control, which is what makes this conclusive:** at 2024-01-01 the *base*
+`temperature_2m` series is **168/168** while the previous-run layer is **0/168** for
+every model. The previous-run LAYER stops; the model does not. A malformed request is
+ruled out. Boundary bisected to **2023-12-09 … 2024-01-01** (23 days); interior samples
+at 2022-06-26, 2022-12-19, 2023-06-13 all 168/168, so the block is contiguous.
+
+**`best_match` is an opaque alias.** At 2022 it is byte-identical to `gfs_seamless`
+(same grid point 40.78858/-73.9661, same values) while ecmwf/icon resolve to a
+different grid point (40.75/-74.0) and are empty. It silently changes which model you
+got, by era and by location.
+
+> **DECISION — Branch H PARTIAL.** A per-model historical harvest is worth building,
+> but **only for ~2022-01 → 2023-12**, and it **must request explicit `models=`, never
+> `best_match`**. A backfill spanning 2024 silently returns nulls. The deep archive and
+> the live forward capture are **two disjoint datasets with a hole between them** — they
+> must never be concatenated into one series without an explicit gap marker.
+>
+> **SCHEMA — `model`, `init_time_ns` and `previous_run_index` ARE required, and this is
+> now evidence-based rather than speculative.** Coverage is per-model on both axes and
+> `best_match` resolves differently by era and location without saying so. A record
+> omitting `model` would mix GFS and ICON rows under one identity, and a forecast-error
+> calibration computed across that mixture is not a per-model skill estimate — it is an
+> average over an unrecorded, time-varying model selection. `init_time_ns` and
+> `previous_run_index` follow: `previous_dayN` is the only way runs are addressed, and N
+> is meaningless without knowing which run it counted back from. Under
+> `make_strict_decoder` + one `register_arrow` these are unaddable after the first row.
+>
+> **`instrument_id` remains STRUCK** (R12) — unchanged by this evidence.
+
+**Still open:** the block's older edge (2019 is null), and the far side of the
+post-2024 hole. Neither changes the schema decision, so neither gates I-4.
+
+| Probe B outcome | Decision |
+|---|---|
+| Passes its pre-registered bar | A second historical source for cross-validation. Never a settlement source |
 
 Forward NWS collection (P3a) starts **regardless** of both outcomes.
 
@@ -671,7 +735,7 @@ Genuinely independent: P0, P2, P5p, P7 items 1–3.
 
 **OQ-1 (blocking P7 item 4).** The real overnight inter-write gap for a 5-instrument weather tape. Guessing it is a data-loss bug wearing a safety costume; the watchdog stays alert-only until measured.
 
-**OQ-2 (blocking P3a's schema).** Does Open-Meteo `/v1/previous-runs` answer un-keyed, and is it valid-time anchored? The only question here whose answer changes a one-way door.
+**OQ-2 — CLOSED 2026-08-31.** Yes un-keyed, and **valid-time anchored** — but at `previous-runs-api.open-meteo.com/v1/forecast`, hourly only; `/v1/previous-runs` does not exist. Branch H PARTIAL (2022-01 → 2023-12, explicit `models=`). `model`/`init_time_ns`/`previous_run_index` are required. See §4.P2.
 
 **OQ-3 (non-blocking, P4).** UTC or per-instrument climate day for the budget boundary? UTC chosen and argued; persisted so a later change is auditable.
 

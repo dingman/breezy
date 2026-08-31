@@ -216,6 +216,17 @@ class ProbeExchange:
     text: str | None
     finding: str | None = None
 
+    @property
+    def succeeded(self) -> bool:
+        """True only for a 2xx.
+
+        The single authority on "did this request answer". A probe that treats
+        any other status as an answer reports coverage it does not have --
+        ``docs/evidence/open_meteo_previous_runs_probe_2026-08-31T003816Z``
+        recorded 22 HTTP 404s as ``ok`` and marked all nine questions answered.
+        """
+        return 200 <= self.status_code < 300
+
 
 class ProbeTransport(HttpTransport):
     """A budgeted, GET-only, settlement-host-free view of the hardened transport.
@@ -409,7 +420,26 @@ class ProbeTransport(HttpTransport):
         return dt.datetime.fromtimestamp(seconds, tz=dt.UTC).isoformat(timespec="seconds")
 
     def _exchange_from_result(self, *, label: str, url: str, result: FetchResult) -> ProbeExchange:
+        """Classify the response. A non-2xx is a FINDING, never an ``ok``.
+
+        The status the origin returned decides the outcome; nothing downstream
+        gets to decide it later. A 404/400/401 body is still captured -- an
+        error payload often names the accepted parameter range, which is
+        evidence -- but it is recorded as a finding so no report can count it
+        as an answered question.
+        """
         body = result.text or ""
+        succeeded = 200 <= result.status_code < 300
+        outcome = "ok" if succeeded else f"http_{result.status_code}"
+        finding = (
+            None
+            if succeeded
+            else (
+                f"Server answered HTTP {result.status_code} (non-2xx). The body is "
+                "captured as evidence, but it carried no requested datum: this is a "
+                "FINDING, and no question may be marked answered from it."
+            )
+        )
         return ProbeExchange(
             ordinal=self._budget.spent,
             requested_at_utc=self._utc_stamp(),
@@ -418,9 +448,10 @@ class ProbeTransport(HttpTransport):
             status_code=result.status_code,
             body_bytes=len(body.encode("utf-8")),
             content_type=result.headers.get("content-type", ""),
-            outcome="ok",
+            outcome=outcome,
             sha256=result.sha256,
             text=result.text,
+            finding=finding,
         )
 
     def _exchange_from_alarm(

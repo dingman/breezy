@@ -1,0 +1,12 @@
+{
+  "body": "{\"error\":true,\"reason\":\"Data corrupted at path ''. Cannot initialize ForecastVariableDaily from invalid String value temperature_2m_max,temperature_2m_max_previous_day1.\"}",
+  "bytes": 171,
+  "content_type": "application/json; charset=utf-8",
+  "finding": "Server answered HTTP 400 (non-2xx). The body is captured as evidence, but it carried no requested datum: this is a FINDING, and no question may be marked answered from it.",
+  "label": "discovery_regular_forecast_endpoint_daily",
+  "outcome": "http_400",
+  "requested_at_utc": "2026-08-31T00:58:49+00:00",
+  "sha256": "dbf944daf41039e647ce4cd62524c27d8fb888011e9281894ee5b843f696c0fe",
+  "status": 400,
+  "url": "https://api.open-meteo.com/v1/forecast?daily=temperature_2m_max%2Ctemperature_2m_max_previous_day1&forecast_days=3&latitude=40.78333&longitude=-73.96667&timezone=UTC"
+}

@@ -1,0 +1,12 @@
+{
+  "body": "{\"reason\":\"Not Found\",\"error\":true}",
+  "bytes": 35,
+  "content_type": "application/json; charset=utf-8",
+  "finding": null,
+  "label": "q8_licence_and_error_shape",
+  "outcome": "ok",
+  "requested_at_utc": "2026-08-31T00:38:48+00:00",
+  "sha256": "0b44cbb9397adb7150163d190dcba431be0c30482a44d99a192a88b7edfd9652",
+  "status": 404,
+  "url": "https://api.open-meteo.com/v1/previous-runs"
+}

@@ -27,7 +27,6 @@ from __future__ import annotations
 import importlib.util
 import os
 import sys
-import time
 from pathlib import Path
 from types import ModuleType
 
@@ -63,22 +62,51 @@ async def test_probe_a_runs_within_its_hard_budget(tmp_path: Path) -> None:
     if not user_agent:
         pytest.skip("BREEZY_USER_AGENT must name a monitored contact for a live probe")
 
-    plan = probe.build_request_plan()
     budget = RequestBudget(limit=probe.REQUEST_BUDGET)
-    transport = ProbeTransport(
-        base_url=probe.BASE_URL,
-        allowed_hosts=probe.ALLOWED_HOSTS,
-        budget=budget,
-        max_body_bytes=probe.MAX_BODY_BYTES,
-        user_agent=user_agent,
-        accept="application/json",
-        clock=time.time_ns,
-    )
     writer = ProbeEvidenceWriter(tmp_path)
 
-    exchanges, aborted = await probe.execute(transport, writer, plan)
+    def factory(shape: object) -> ProbeTransport:
+        # ``probe`` is loaded from a path at runtime, so every attribute of it
+        # is typed ``Any``. Narrow by ASSERTING the contract rather than
+        # casting it away: a probe that handed back a bare ``httpx`` client --
+        # no budget, no allowlist, redirects followed -- would fail here
+        # instead of silently spending the run outside containment.
+        transport = probe.build_transport(shape, budget=budget, user_agent=user_agent)
+        assert isinstance(transport, ProbeTransport), (
+            f"build_transport must return a contained ProbeTransport, got {type(transport)!r}"
+        )
+        return transport
 
-    assert aborted is None, aborted
+    discovery, plan, execution, discovery_plan = await probe.run_probe(factory, writer)
+
     assert budget.spent <= budget.limit
+    assert len(discovery.exchanges) <= probe.DISCOVERY_BUDGET
     rows = (tmp_path / MANIFEST_FILENAME).read_text(encoding="utf-8").splitlines()
-    assert len(rows) - 1 == len(exchanges), "every dispatched request needs a manifest row"
+    dispatched = len(discovery.exchanges) + len(execution.exchanges)
+    assert len(rows) - 1 == dispatched, "every dispatched request needs a manifest row"
+
+    # A discovery failure must ABORT the plan rather than spend it re-learning
+    # the same negative -- the 2026-08-31 defect this harness now guards.
+    if discovery.shape is None:
+        assert execution.exchanges == ()
+        assert len(execution.skipped) == len(plan)
+
+    questions = probe.evaluate_questions(
+        (*discovery_plan, *plan), (*discovery.outcomes, *execution.outcomes)
+    )
+    verdict = probe.evaluate_verdict(questions, shape=discovery.shape, keyed=discovery.keyed)
+    assert verdict.verdict in {
+        probe.VERDICT_VIABLE,
+        probe.VERDICT_NOT_VIABLE,
+        probe.VERDICT_INCONCLUSIVE,
+    }
+    # No question may be answered by a step that did not return 2xx with data.
+    answered = {outcome.question for outcome in questions if outcome.answered}
+    dispatched_ok = {
+        outcome.label
+        for outcome in (*discovery.outcomes, *execution.outcomes)
+        if outcome.succeeded and outcome.datum is not None
+    }
+    for outcome in questions:
+        if outcome.question in answered:
+            assert set(outcome.answered_by) <= dispatched_ok
