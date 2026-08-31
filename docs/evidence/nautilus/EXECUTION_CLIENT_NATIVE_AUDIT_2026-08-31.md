@@ -179,3 +179,62 @@ venue rejections after `OrderSubmitted`.
   path depends on it.**
 - `_reconcile_position_report_hedging` (`NT/live/execution_engine.py:2349`) — only the
   NETTING path was read.
+
+---
+
+# ADDENDUM 2026-08-31 — the native notional cap fails open THREE ways
+
+Found while authoring `docs/plans/ORDER_EGRESS_PLAN.md`; **all re-verified by the
+orchestrator directly against `NT/risk/engine.pyx`.** This supersedes the optimistic
+framing of H-2 above: the cap is correctly *denominated*, and by default it never
+*fires*.
+
+| # | Condition | Line | Behaviour |
+|---|---|---|---|
+| F-1 | no account cached for the venue | `:684-689` | `return True` — **passes** |
+| F-2 | `account.is_margin_account` | `:691` | `return True` — **passes** |
+| F-3 | instrument absent from `_max_notional_per_order` | `:675, 677` | `.get()` -> `None`, `if max_notional_setting:` is false — **no cap applied** |
+| F-4 | MARKET order with no cached quote or trade | `:786-789` | `continue` — **notional never checked for that order** |
+
+## F-3 is the one that bites Breezy specifically
+
+`self._max_notional_per_order: dict[InstrumentId, Decimal] = {}` (`:179`) is populated
+**only** at construction, by iterating the static `RiskEngineConfig.max_notional_per_order`
+mapping (`:194-196`). The per-order lookup is `.get(instrument.id)` (`:675`).
+
+**Breezy's instruments are discovered at runtime.** Weather buckets are daily and their
+IDs (`tc-temp-nychigh-2026-08-30-gte84lt85f.POLYMARKET_US`) cannot exist in a static
+config written in advance. So the dict is empty for every instrument Breezy actually
+trades, and the cap is **inert**.
+
+The native remedy exists and must be used: `cpdef void set_max_notional_per_order(
+InstrumentId, new_value)` at `:279`, called at runtime as instruments are discovered.
+That is a wiring obligation, not a new abstraction — but a plan that says "NATIVE:
+configure `max_notional_per_order`" and stops there ships **no cap at all**.
+
+## F-4: never emit MARKET
+
+A MARKET order's notional is checked only when a quote or trade is cached; otherwise the
+engine logs at **warning** and `continue`s past the check (`:786-789`). Breezy's read side
+documents that a settled market publishes an **empty book**
+(`adapters/polymarket_us/data.py:624-641`) — precisely when a stale MARKET order is most
+dangerous. The plan's rule to emit LIMIT only is therefore a safety control, not a style
+preference. For LIMIT, `last_px = order.price` unconditionally (`:854`), so the check
+always has a price to work with.
+
+## Why this is recorded as a pattern, not four bugs
+
+This is the **second-order form of LESSONS L-2**, now observed for the third time: the
+audit is right about the *mechanism* and wrong about its *degree*. `TradingState.REDUCING`
+does not deny an opening BUY from flat; the free-balance guard is conditional on
+`not allow_borrowing`; and now the notional cap has four independent silent-pass paths.
+
+**Every one of them fails OPEN and logs below the level we emit** — debug for F-1,
+nothing at all for F-3, warning for F-4. There is no observable difference between "the
+cap allowed this order" and "the cap was never consulted."
+
+**Binding consequence for P4 and the egress plan.** A "NATIVE — configure it" verdict is
+not complete until a contract test **executes the native path and asserts a DENIAL**.
+Asserting that a permitted order passes proves nothing here, because passing is also what
+total absence looks like. Breezy must additionally carry its own denial ahead of the
+native check, so that the native layer is defence in depth rather than the only line.
