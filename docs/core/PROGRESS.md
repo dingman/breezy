@@ -61,13 +61,26 @@ Two consequences that are not optional:
   **P5 is rescoped** from "add NO-side instrument support" to "support
   `outcomeSide` / price inversion on the same instrument" — smaller, different
   work. Live acceptance of `outcomeSide=NO` stays the operator-gated probe.
+- **The stale-quote gate is wired but unreachable for two of three strategies.**
+  `evaluate_order` refuses `shorts_disabled` BEFORE it calls `quote_tradable`
+  (`risk.py:296-306`). `calibration_mean_reversion` and `forecast_revision`
+  emit only shorts, so their orders die at the earlier gate. BL-1's fix is
+  therefore proven by unit test, NOT by the backtest: the post-change re-run
+  shows zero `stale_quote` refusals and an unchanged fill count (24 -> 24, all
+  `forecast_mispricing`). The gate goes live for the other two only once shorts
+  are expressible.
+- **The `naive`/`realistic` conditions are NOT redundant** (BL-4, reversed
+  2026-08-31). Making refusals visible falsified the byte-identical claim:
+  `forecast_revision` naive refuses nothing; realistic refuses 860
+  `shorts_disabled`. "Never signalled" is not "signalled 860 times, all
+  refused." Both conditions stay; the collapse was withdrawn.
 
 ---
 
 ## BACKLOG — selected for execution (opened 2026-08-31)
 
 Source: the three-strategy backtest run of 2026-08-31, 36/36 COMPLETED. Reports:
-`~/.local/share/breezy/derived/strategy-backtests/` (newest = `...20260831T135804+0000.json`).
+`~/.local/share/breezy/derived/strategy-backtests/` (newest = `...20260831T151235+0000.json`, post-BL-1/2/3/5).
 
 **Binding constraints on every item below.** No item may:
 set `allow_short=True`; weaken `BacktestOrderGuard` or any settlement
@@ -76,92 +89,6 @@ the NO-SEND execution-egress firewall; or invent a value for an
 operator-reserved control. Every increment carries an **L-1 null-hypothesis
 verdict** citing installed source under
 `.venv/lib/python3.13/site-packages/nautilus_trader/` before implementation.
-
-### [HIGH] BL-1 — The stale-quote gate is vacuous
-
-`strategy/weather_common/risk.py:287` passes a hardcoded `0.0` quote age into
-`quote_tradable`, so `stale_quote_minutes` can never fire.
-`forecast_mispricing` gates real quote age upstream
-(`forecast_mispricing/decision.py:70-71`), but `calibration_mean_reversion` and
-`forecast_revision` have **no other staleness protection** and can act on
-arbitrarily stale quotes. Wire the real age through.
-
-The in-code comment defers this to the operator; the operator control contract
-above says otherwise — this is an engineering decision. The direction of effect
-is strictly more conservative (it can only block orders that currently pass).
-
-**Acceptance:** RED test proving a quote older than `stale_quote_minutes` is
-refused for all three strategies (and one just inside the bound is not); the
-"PRESERVED DEFECT" comment (`risk.py:261-286`) removed; the 36-run backtest
-re-run with a written before/after fill count per strategy. L-2: state the UNIT
-of the threaded age (minutes) and prove it matches `stale_quote_minutes`.
-Note `risk.py:268` cites a stale `decision.py:68-70`; the real site is `:70-71`.
-
-### [HIGH] BL-2 — A fully-gagged strategy reports as a clean completion
-
-All 36 runs emitted `SHORTS_DISABLED_REFUSALS`, yet every JSON row carries
-`status=COMPLETED, refusal_type=null, refusal_message=null`. Two of three
-strategies had their **entire signal set** refused and are indistinguishable in
-the report from a strategy that saw no opportunity. `forecast_revision`'s loud
-`NakedShortRefusedError` abort has also become this silent path; commit
-`4a1280f` is the *suspected* cause but its subject is about the close-only
-guard and does not mention `allow_short` — **[INFERENCE, not verified]**, to be
-confirmed or dropped by the implementer (L-4: `[V]` belongs on the inference).
-
-**Acceptance:** per-run refusal counts and reasons propagate into report rows; a
-run whose signals were all refused is not reported as an unqualified
-`COMPLETED`.
-
-### [HIGH] BL-3 — Cross-strategy exposure is uncapped
-
-Each strategy constructs its own `RiskManager` over only its own `contracts`
-(`RiskManager.__init__`, `risk.py:151-165`; call sites
-`calibration_mean_reversion/strategy.py:185`, `forecast_mispricing/strategy.py:170`,
-`forecast_revision/strategy.py:176`, all `RiskManager(self._risk_limits(),
-self._contracts, refusals=self.refusals)`). Running all three concurrently
-therefore permits up to **3x** the intended per-event exposure, invisibly.
-Today's run is safe only because each strategy ran in its own isolated
-`run_backtest`.
-
-**L-1 gate:** first prove whether Nautilus' own `Portfolio` / `RiskEngine`
-already provides a shared exposure view. Build only if genuinely absent.
-
-**L-2 trap — BINDING.** `max_event_notional` is measured in max-payout dollars
-via `contract.contract_size` (`risk.py:301-311`), NOT market value. Substituting
-`Portfolio.net_exposure` would loosen every cap by roughly the price reciprocal
-— a guard weakening disguised as a native win. Any native substitution must
-state both units and prove they match, or be rejected.
-
-**Acceptance:** one shared exposure view built at the composition root; a RED
-test in which three strategies sharing one `event_key` are refused at the SAME
-`max_event_notional` that a single strategy is refused at (today they are
-refused at 3x it). Cap semantics unchanged — no limit value edited.
-
-### [MEDIUM] BL-4 — The `naive`/`realistic` backtest conditions are a no-op
-
-All 18 pairs are byte-identical. `forecast_mispricing`'s "realistic" override
-sets `allow_short=False`, already the default; the other two never reach a
-timing gate because `SHORTS_DISABLED` fires first. The runner spends 18 extra
-runs and claims two conditions while measuring one.
-
-**Decision (pre-committed, not a disjunction):** COLLAPSE. Making the two
-conditions differ behaviourally at current defaults would require flipping
-`allow_short=True` (`:746`) or bypassing `SHORTS_DISABLED` — both forbidden by
-the header. So the runner collapses to ONE condition and the two-condition
-claim is deleted from the docstring.
-
-**Acceptance:** one condition remains; run count drops 36 → 18; the surviving
-run's per-row results are byte-identical to today's `naive` rows (proving the
-collapse removed only duplication, not signal); no config default edited.
-
-### [MEDIUM] BL-5 — Runner docstring states a default that does not exist
-
-`scripts/analysis/run_weather_strategy_backtests.py:124` claims `allow_short`
-"is left at its config default (`True`)" for `forecast_revision`. All three
-configs default `False` (`*/config.py:99,115,112`).
-
-**Acceptance:** docstring matches verified defaults and records that the
-naked-short abort path is unreachable at defaults.
 
 ### [MEDIUM] BL-7 — The naked-short guard's stated remedy points at nothing
 

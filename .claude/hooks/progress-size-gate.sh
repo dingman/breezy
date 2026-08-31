@@ -9,9 +9,12 @@ MAX_BYTES=12288
 payload=$(cat)
 f=$(printf '%s' "$payload" | jq -r '.tool_input.file_path // .tool_response.filePath // empty' 2>/dev/null)
 
+# Write/Edit name the file directly. Bash does not -- and a shell edit
+# (sed, python, heredoc) must not be a way around the budget -- so when the
+# payload names no PROGRESS.md, fall back to checking the project's copy.
 case "$f" in
   */docs/core/PROGRESS.md) ;;
-  *) exit 0 ;;
+  *) f="${CLAUDE_PROJECT_DIR:-.}/docs/core/PROGRESS.md" ;;
 esac
 
 [ -f "$f" ] || exit 0
