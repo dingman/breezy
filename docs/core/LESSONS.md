@@ -98,3 +98,66 @@ deny an opening BUY from flat; the free-balance guard is conditional on
 `not allow_borrowing`). Degree is where a native verdict fails. Hence the binding
 test-doctrine rule: every "NATIVE — configure" verdict gets a contract test that
 EXECUTES the native path and asserts the outcome.
+
+---
+
+## L-3 — A plan whose end state is not the goal state is not a plan (2026-08-31)
+
+### What happened
+
+Asked why the build was taking so long when Nautilus "already has almost everything",
+three independent investigations converged on an answer nobody had noticed: the active
+plan, `DATA_CAPTURE_AND_RISK_PLAN.md` §5, is a five-to-six-week ordered sequence
+(`P0 → P1 → (P2 ∥ P5-probe) → P5-fix → P4 → P3a → P3b → P6 → P7`) that, **executed
+perfectly and to completion, still ends with a bot that cannot place an order.**
+
+`grep -rn "LiveExecutionClient\|ExecutionClient" src/` returns **zero hits**.
+`safety.py:8` describes itself as "The single **future** chokepoint" and
+`assert_live_order_submission_permitted` has no production caller — only a re-export
+and its own tests. The entire order-egress workstream lived only in Phase F of
+`GO_LIVE_PLAN.md`, a document dated 2026-08-26 whose code-state audit had gone
+wholesale stale and which was therefore no longer being read.
+
+The plan had survived four adversarial peer reviews and a full revision-2 rewrite.
+None of them caught it, because **every review asked "is what is written here correct?"
+and none asked "does what is written here add up to the goal?"**
+
+### Why this is binding
+
+This is the single largest schedule finding in the project so far, and it is not a
+coding error — it is a planning-topology error. Each increment was individually
+well-justified, well-evidenced, and correctly sequenced against its neighbours. The
+defect existed only in the *gaps between* increments, which is exactly the place no
+increment-level review looks.
+
+It also explains the measured effort profile: ~40% self-imposed process and ~28%
+rework, against ~22% genuine domain difficulty. Rigour was being spent generously on
+the increments we already knew how to specify, while the one workstream nobody had
+scoped stayed invisible — and being unscoped, it never competed for attention.
+
+The failure mode generalises: **work that has never been decomposed is work that never
+appears on the critical path**, so a plan will systematically under-schedule precisely
+what it understands least. Difficulty and visibility are inversely correlated here.
+
+### The rule
+
+Every plan states its GOAL STATE as a falsifiable predicate, then proves — explicitly,
+in the plan — that completing the listed increments reaches it. Absent that proof the
+plan is a list of good ideas, not a route.
+
+### How to apply
+
+- Each plan opens with: `GOAL STATE: <predicate>` and `WALK: <increment> → … → GOAL`,
+  where the walk is checked end-to-end, not increment by increment.
+- Add the reviewer's second question. Increment review asks "is this correct?";
+  **plan review must separately ask "what is NOT here, and would its absence stop the
+  goal?"** Reviews that only audit written text cannot find omissions — the prompt must
+  name the omission hunt as its own task.
+- **Suspect the workstream you cannot yet decompose.** If a plan is precise for eight
+  increments and silent on a ninth, the silence is the signal: that is the long pole,
+  not a detail to fill in later.
+- A plan that cites another plan for a whole workstream has a dependency, not a
+  delegation. Verify the cited document is still live — `GO_LIVE_PLAN.md` was being
+  relied on for Phase F while its own audit had been stale for five days. Stale
+  documents do not announce themselves; a superseded marker is now mandatory the
+  moment a plan's factual claims are found wrong.
