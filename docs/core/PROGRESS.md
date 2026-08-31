@@ -90,43 +90,18 @@ operator-reserved control. Every increment carries an **L-1 null-hypothesis
 verdict** citing installed source under
 `.venv/lib/python3.13/site-packages/nautilus_trader/` before implementation.
 
-### [MEDIUM] BL-7 — The naked-short guard's stated remedy points at nothing
+### [MEDIUM] BL-10 — One strategy refuses quotes before the counter can see it
 
-`backtest_order_guard.py:155-156` refuses a naked short with "short YES is
-spelled buy NO, which is a different InstrumentId with its own book". BL-6
-proved no such instrument exists or can exist. The refusal is CORRECT and must
-stay; only the rationale is wrong, and it misdirects anyone acting on it.
+`forecast_mispricing/decision.py:71` calls `risk.quote_tradable(...)` as a
+pre-check BEFORE forming a signal, discards the reason into `_why`, and returns
+`None`. That refusal never reaches `evaluate_order`, so BL-8's counting cannot
+see it: for this one strategy a stale or wide-spread quote is still silently
+unrecorded. Predates BL-8; found while fixing it.
 
-**Acceptance:** message names the real expression (`outcomeSide` / price
-inversion on the same instrument) and cites
-`docs/evidence/no_side_instrument_probe_2026-08-31.md`. Refusal behaviour
-unchanged — a test must pin that the guard still refuses the same orders.
-
-### [HIGH] BL-8 — Only one refusal reason is counted, so a gagged run still reads clean
-
-`RiskManager.evaluate_order` records to `self.refusals` only for
-`SHORTS_DISABLED` (`risk.py:302`). `stale_quote`, the notional caps,
-`max_position` and `exclusive_bucket_conflict` all return a refusal without
-recording, and the runner derives status solely from `refusals.counts`. A run
-whose every signal died on `stale_quote` therefore publishes as an unqualified
-`COMPLETED` — the exact defect BL-2 was opened to kill, fixed then for only one
-reason code. BL-1 made `stale_quote` newly reachable.
-
-**Acceptance:** refusals of orders the strategy actually FORMED are counted
-under a BOUNDED key set (`quote_tradable` returns `f"spread_{spread:.3f}"` —
-an unbounded key space if mapped naively); RED tests for an all-`stale_quote`
-run and a cap-refused run reporting `COMPLETED_ALL_REFUSED`.
-
-### [MEDIUM] BL-9 — A future-dated quote fails open as fresh
-
-`quote_tradable` (`risk.py:239`) tests only `age > stale_quote_minutes`. A
-`ts_event` one day ahead of `now` yields `-1440.0` minutes and is accepted as
-fresh. The hole points the wrong way: the more wrong the clock, the fresher the
-quote looks.
-
-**Acceptance:** negative age refused under its own bounded reason and counted
-per BL-8; a test proving zero and small positive ages inside the bound are
-still accepted, so the boundary is not over-tightened.
+**Acceptance:** decide whether a pre-signal quote refusal is a gag or ordinary
+market conditions (BL-8 drew that line at "the strategy formed an order" — say
+whether this sits on the same side), then either count it under the same
+bounded key set or document why it must not be counted.
 
 ---
 
