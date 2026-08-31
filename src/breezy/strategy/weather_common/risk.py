@@ -41,6 +41,7 @@ __all__ = [
     "RiskDecision",
     "RiskLimits",
     "RiskManager",
+    "SharedExposureView",
     "edge_after_costs",
 ]
 
@@ -148,6 +149,57 @@ class RiskDecision:
     clipped_quantity: float = 0.0
 
 
+class SharedExposureView:
+    """Shared max-payout exposure registry for strategies in one composition root."""
+
+    def __init__(self) -> None:
+        self._contracts: dict[str, MispricingContract] = {}
+        self._native_instrument_ids: dict[str, object] = {}
+
+    def register(
+        self,
+        contracts: Mapping[str, MispricingContract],
+        native_instrument_ids: Mapping[str, object] | None = None,
+    ) -> None:
+        self._contracts.update(contracts)
+        if native_instrument_ids is not None:
+            self._native_instrument_ids.update(native_instrument_ids)
+
+    def instrument_ids(
+        self,
+        local_instrument_ids: Mapping[str, object],
+    ) -> dict[str, object]:
+        instrument_ids = dict(local_instrument_ids)
+        instrument_ids.update(self._native_instrument_ids)
+        return instrument_ids
+
+    def event_notional(self, portfolio: PortfolioSnapshot, event_key: str) -> float:
+        total = 0.0
+        for contract in self._contracts.values():
+            if contract.event_key != event_key:
+                continue
+            total += abs(portfolio.net_qty(contract.instrument_id)) * contract.contract_size
+        return total
+
+    def location_notional(self, portfolio: PortfolioSnapshot, location_id: str) -> float:
+        total = 0.0
+        for contract in self._contracts.values():
+            if contract.location_id != location_id:
+                continue
+            total += abs(portfolio.net_qty(contract.instrument_id)) * contract.contract_size
+        return total
+
+    def mutually_exclusive_group(
+        self, contract: MispricingContract,
+    ) -> list[MispricingContract]:
+        return [
+            other
+            for other in self._contracts.values()
+            if other.instrument_id != contract.instrument_id
+            and other.event_key == contract.event_key
+        ]
+
+
 class RiskManager:
     def __init__(
         self,
@@ -155,14 +207,21 @@ class RiskManager:
         contracts: Mapping[str, MispricingContract],
         *,
         refusals: RefusalCounter | None = None,
+        exposure_view: SharedExposureView | None = None,
+        native_instrument_ids: Mapping[str, object] | None = None,
     ) -> None:
         self.limits = limits
         self.contracts = contracts
+        self._exposure_view = SharedExposureView() if exposure_view is None else exposure_view
+        self._exposure_view.register(contracts, native_instrument_ids)
         #: Shared with the strategy's DECISION layer, which refuses a
         #: `SHORT_YES` intent before it can reach here at all -- see
         #: `breezy.strategy.weather_common.refusals`. Optional so the pure
         #: screening tests need not construct one; a strategy always passes it.
         self.refusals = RefusalCounter() if refusals is None else refusals
+
+    def instrument_ids(self, local_instrument_ids: Mapping[str, object]) -> dict[str, object]:
+        return self._exposure_view.instrument_ids(local_instrument_ids)
 
     def quote_tradable(
         self, quote: MarketQuote, price_scale: float, now_ts_age_minutes: float,
@@ -182,29 +241,13 @@ class RiskManager:
         return True, "ok"
 
     def event_notional(self, portfolio: PortfolioSnapshot, event_key: str) -> float:
-        total = 0.0
-        for contract in self.contracts.values():
-            if contract.event_key != event_key:
-                continue
-            qty = abs(portfolio.net_qty(contract.instrument_id))
-            total += qty * contract.contract_size
-        return total
+        return self._exposure_view.event_notional(portfolio, event_key)
 
     def location_notional(self, portfolio: PortfolioSnapshot, location_id: str) -> float:
-        total = 0.0
-        for contract in self.contracts.values():
-            if contract.location_id != location_id:
-                continue
-            total += abs(portfolio.net_qty(contract.instrument_id)) * contract.contract_size
-        return total
+        return self._exposure_view.location_notional(portfolio, location_id)
 
     def mutually_exclusive_group(self, contract: MispricingContract) -> list[MispricingContract]:
-        return [
-            other
-            for other in self.contracts.values()
-            if other.instrument_id != contract.instrument_id
-            and other.event_key == contract.event_key
-        ]
+        return self._exposure_view.mutually_exclusive_group(contract)
 
     def exclusive_conflict(
         self,
@@ -231,6 +274,7 @@ class RiskManager:
         edge: float,
         portfolio: PortfolioSnapshot,
         quote: MarketQuote,
+        quote_age_minutes: float,
     ) -> RiskDecision:
         limits = self.limits
         if hours_to_settlement < limits.halt_hours_before_settlement:
@@ -258,33 +302,8 @@ class RiskManager:
             self.refusals.record(SHORTS_DISABLED)
             return RiskDecision(False, SHORTS_DISABLED)
 
-        # PRESERVED DEFECT -- AWAITING AN OPERATOR RULING. DO NOT "FIX" SILENTLY.
-        # The third argument is the quote's age in minutes, and it is hardcoded
-        # to 0.0 here, so `quote_tradable`'s `stale_quote_minutes` check is
-        # PERMANENTLY VACUOUS on this path: an arbitrarily stale quote passes.
-        # WHAT THAT COSTS DIFFERS PER STRATEGY -- it is a dropped argument for
-        # one caller and a total absence of quote-staleness protection for the
-        # other two:
-        #   * `forecast_mispricing` -- COVERED. It computes the real quote age
-        #     (`age_min = (now - quote.ts_event) / 60`) and calls
-        #     `quote_tradable` itself as an independent upstream gate before
-        #     ever reaching here (`forecast_mispricing/decision.py:68-70`), so
-        #     for this caller the 0.0 below is genuinely a dropped argument,
-        #     not missing information.
-        #   * `calibration_mean_reversion` -- NOT COVERED. It never calls
-        #     `quote_tradable` anywhere, so the vacuous check below is its ONLY
-        #     quote-staleness gate, i.e. it has none. (Do not be misled by
-        #     `calibration_mean_reversion/decision.py:102`: that `age_min` is
-        #     FORECAST age measured from `published_at`, gating
-        #     `stable_forecast_minutes` -- a different quantity entirely.)
-        #   * `forecast_revision` -- NOT COVERED, same as calibration: zero
-        #     `quote_tradable` references in the package.
-        # Carried over verbatim from the operator's bundle (the same hardcoded
-        # 0.0, alongside an unused `quote_age_minutes` helper). Wiring the real
-        # age in would start blocking orders that currently pass, which is an
-        # economic change to live behaviour and is the operator's call, not this
-        # integration's.
-        ok, why = self.quote_tradable(quote, contract.price_scale, 0.0)
+        # Unit proof: callers pass minutes, matching `stale_quote_minutes`.
+        ok, why = self.quote_tradable(quote, contract.price_scale, quote_age_minutes)
         if not ok:
             return RiskDecision(False, why)
 

@@ -94,7 +94,12 @@ from breezy.strategy.weather_common.probability import (
     WeatherProbabilityEngine,
 )
 from breezy.strategy.weather_common.refusals import RefusalAlerter, RefusalCounter
-from breezy.strategy.weather_common.risk import PortfolioSnapshot, RiskLimits, RiskManager
+from breezy.strategy.weather_common.risk import (
+    PortfolioSnapshot,
+    RiskLimits,
+    RiskManager,
+    SharedExposureView,
+)
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
     from nautilus_trader.core.data import Data
@@ -142,6 +147,7 @@ class CalibrationMeanReversionStrategy(Strategy):
         self._quotes: dict[str, MarketQuote] = {}
         self._last_eval: dict[str, datetime] = {}
         self._risk: RiskManager | None = None
+        self._shared_exposure_view: SharedExposureView | None = None
         # PUBLIC: shared by the DECISION layer and the RISK layer, which refuse
         # a short at two different points, and readable by an operator (or a
         # test) asking "did this strategy do nothing, or was it stopped from
@@ -182,9 +188,24 @@ class CalibrationMeanReversionStrategy(Strategy):
             self.subscribe_order_book_depth(instrument_id)
             self.log.info(f"CalibrationMeanReversionStrategy subscribed {instrument_id}")
 
-        self._risk = RiskManager(self._risk_limits(), self._contracts, refusals=self.refusals)
+        self._risk = RiskManager(
+            self._risk_limits(),
+            self._contracts,
+            refusals=self.refusals,
+            exposure_view=self._shared_exposure_view,
+            native_instrument_ids=self._nt_ids,
+        )
         self._refusal_alerter = RefusalAlerter(self.refusals, site=str(self.id))
         self.subscribe_data(nws_climate_day_data_type(), client_id=NWS_BACKTEST_CLIENT_ID)
+
+    def use_shared_exposure_view(self, exposure_view: SharedExposureView) -> None:
+        if self._risk is not None:
+            raise RuntimeError("shared exposure must be installed before strategy start")
+        self._shared_exposure_view = exposure_view
+
+    @staticmethod
+    def new_shared_exposure_view() -> SharedExposureView:
+        return SharedExposureView()
 
     def on_reset(self) -> None:
         self._quotes.clear()
@@ -325,6 +346,8 @@ class CalibrationMeanReversionStrategy(Strategy):
             return
 
         forecast_age_hours = (now - forecast.published_at).total_seconds() / 3600.0
+        # Unit proof: this delta is minutes, the unit `stale_quote_minutes` expects.
+        quote_age_minutes = (now - quote.ts_event).total_seconds() / 60.0
         assert self._risk is not None  # built in on_start, before any data can arrive
         risk_decision = self._risk.evaluate_order(
             contract=contract,
@@ -334,6 +357,7 @@ class CalibrationMeanReversionStrategy(Strategy):
             edge=decision.edge,
             portfolio=self._portfolio_snapshot(),
             quote=quote,
+            quote_age_minutes=quote_age_minutes,
         )
         if not risk_decision.allowed:
             self.log.info(
@@ -410,12 +434,13 @@ class CalibrationMeanReversionStrategy(Strategy):
         self.log.info(f"FLATTEN {instrument_id} qty={qty:.1f} reason={reason}")
 
     def _portfolio_snapshot(self) -> PortfolioSnapshot:
+        nt_ids = self._risk.instrument_ids(self._nt_ids) if self._risk is not None else self._nt_ids
         position_qty = {
-            iid: float(self.portfolio.net_position(nt_id)) for iid, nt_id in self._nt_ids.items()
+            iid: float(self.portfolio.net_position(nt_id)) for iid, nt_id in nt_ids.items()
         }
         pending_qty = {
             iid: _signed_open_order_qty(self.cache.orders_open(instrument_id=nt_id))
-            for iid, nt_id in self._nt_ids.items()
+            for iid, nt_id in nt_ids.items()
         }
         return PortfolioSnapshot(
             position_qty=position_qty,

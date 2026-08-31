@@ -847,6 +847,21 @@ def _refuse_idle_strategies(engine: BacktestEngine, strategies: Sequence[Strateg
     )
 
 
+def _install_shared_exposure_view(strategies: Sequence[Strategy]) -> None:
+    exposure_view = None
+    for strategy in strategies:
+        new_view = getattr(strategy, "new_shared_exposure_view", None)
+        if new_view is not None:
+            exposure_view = new_view()
+            break
+    if exposure_view is None:
+        return
+    for strategy in strategies:
+        install = getattr(strategy, "use_shared_exposure_view", None)
+        if install is not None:
+            install(exposure_view)
+
+
 def run_backtest(
     config: BreezyBacktestConfig,
     *,
@@ -896,6 +911,7 @@ def run_backtest(
     engine = build_backtest_engine(config)
     try:
         install_order_guard(engine)
+        _install_shared_exposure_view(strategies)
         for strategy in strategies:
             engine.add_strategy(strategy)
         engine.run()
