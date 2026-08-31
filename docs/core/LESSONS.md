@@ -246,3 +246,61 @@ was carried into a plan as a `[V]`-tagged fact.
 produced it. A grep result is evidence; what it implies is a separate claim needing
 separate proof. Zero hits for `Foo(` does not mean `Foo` is unused — it means `Foo` is
 not called *in that syntactic form*. See [[verify-agent-claims-against-artifact]].
+
+---
+
+## L-5 — A state document that outgrows re-verification becomes a source of false claims (2026-08-31)
+
+**Date:** 2026-08-31. **Trigger:** operator challenge ("PROGRESS.md at 1400 lines feels
+like a waste of context space, what value is it actually providing to us?").
+
+### What happened
+
+`docs/core/PROGRESS.md` had grown to 1401 lines / 76 KB — 31 status-marked headings of
+which 11 were already closed, plus resolution narratives, evidence summaries duplicating
+`docs/evidence/`, and post-mortems duplicating L-1..L-4. In the same session it produced
+**three false claims** that were acted on before being caught:
+
+- It recorded `calibration_mean_reversion` as "blocked on liquidity". The real gate is
+  `SHORTS_DISABLED`, which fires in the decision layer *before* any liquidity check.
+- It recorded `forecast_revision` as "REFUSED, naked short". Commit `4a1280f` had
+  flipped `allow_short` to `False`, silently converting that loud abort into a counted
+  refusal. A live re-run confirmed the record was stale.
+- It carried `[BLOCKER] B-1 — No venue market data has ever been captured` and
+  `[LOW] lint-imports has no configuration`, both of which reality had already closed.
+
+Severity tags (`[HIGH]`, `[MEDIUM]`) were also used as *labels on closed work*, so the
+file could not be skimmed for what was actually open.
+
+### Why this is binding
+
+Length is not a cosmetic property of a state document — it is what makes the document
+wrong. Nobody re-reads 76 KB on each update, so entries are appended and never
+reconciled; the file accumulates claims that were true once. A state document that
+cannot be re-verified in one pass will drift, and drifted state is worse than absent
+state because it is trusted.
+
+The cost compounds: `/execute-backlog` Phase 0 dispatches an agent whose entire job is
+to read this file, and the skill's own `PROGRESS_DONE>30` volume gate exists precisely
+to force consolidation before execution.
+
+### The rule
+
+`docs/core/PROGRESS.md` tracks **OPEN state only**, under a hard budget of
+**250 lines / 12 KB**, enforced by `.claude/hooks/progress-size-gate.sh`
+(`PostToolUse` on `Write|Edit`, exit 2).
+
+- An item **leaves the file when it closes.** Never rewrite it as a `[CLOSED]`
+  narrative — the commit is the record.
+- **Never restate evidence** in it; link `docs/evidence/<file>.md`.
+- **Never restate a durable rule** in it; that belongs here in LESSONS.md.
+- **Severity tags mark OPEN items only.**
+- Superseded history goes to `docs/core/archive/`, never deleted outright.
+
+### How to apply
+
+- Before adding to PROGRESS.md, ask what can be *removed* in the same edit.
+- Treat a status claim older than the last relevant commit as unverified until re-checked
+  against code or a live run — see [[verify-agent-claims-against-artifact]].
+- If the size gate blocks a write, consolidate; do not raise the budget.
+- The same failure mode applies to any long-lived state doc, not just this one.
