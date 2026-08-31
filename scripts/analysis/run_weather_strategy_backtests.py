@@ -121,11 +121,15 @@ was.
      `persistence_same_sign=True` with `persistence_updates=2`). The strategy
      is structurally unable to detect a revision in a forecast that never
      changes; this is the minimum realistic input that lets it observe one.
-     `allow_short` is left at its config default (`True`) for this strategy --
-     unlike `forecast_mispricing`, this was not one of the three diagnosed
-     blockers, and a SHORT_YES signal here (if the strategy produces one) is
-     reported exactly as it occurs, including a possible naked-short refusal,
-     rather than pre-emptively silenced.
+     `allow_short` is left at its config default (`False` --
+     `ForecastRevisionConfig.allow_short`, and likewise `False` for the other
+     two strategies' configs) for this strategy -- unlike `forecast_mispricing`,
+     this was not one of the three diagnosed blockers, so no override is
+     constructed for it here. Because the default is `False`, not `True`, any
+     SHORT_YES signal this strategy forms is refused before it ever reaches a
+     naked-short abort: the abort path (`NakedShortRefusedError`) is
+     unreachable at these defaults, and a refusal is reported exactly as it
+     occurs (see `RefusalCounter`) rather than pre-emptively silenced.
 
 None of these three touches the settlement sweep, the settlement truth, or any
 forecast VALUE relative to `naive` (only #3 introduces new values, and only to
