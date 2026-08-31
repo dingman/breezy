@@ -99,6 +99,7 @@ def test_settlement_halt_blocks_regardless_of_edge() -> None:
         edge=0.50,
         portfolio=PortfolioSnapshot(),
         quote=_quote(),
+        quote_age_minutes=0.0,
     )
 
     assert decision.allowed is False
@@ -117,6 +118,7 @@ def test_edge_below_minimum_is_blocked() -> None:
         edge=0.01,  # below default min_model_edge=0.04
         portfolio=PortfolioSnapshot(),
         quote=_quote(),
+        quote_age_minutes=0.0,
     )
 
     assert decision.allowed is False
@@ -135,6 +137,7 @@ def test_a_well_formed_order_within_every_limit_is_allowed() -> None:
         edge=0.50,
         portfolio=PortfolioSnapshot(equity=10_000.0),
         quote=_quote(),
+        quote_age_minutes=0.0,
     )
 
     assert decision.allowed is True
@@ -162,6 +165,7 @@ def test_a_second_long_yes_on_the_same_climate_day_is_an_exclusive_conflict() ->
         edge=0.50,
         portfolio=portfolio,
         quote=_quote(),
+        quote_age_minutes=0.0,
     )
 
     assert decision.allowed is False
@@ -192,6 +196,7 @@ def test_buckets_on_different_climate_days_are_not_exclusive() -> None:
         edge=0.50,
         portfolio=portfolio,
         quote=_quote(),
+        quote_age_minutes=0.0,
     )
 
     assert decision.allowed is True
@@ -209,6 +214,7 @@ def test_shorting_a_flat_instrument_is_blocked_when_shorts_are_disabled() -> Non
         edge=0.50,
         portfolio=PortfolioSnapshot(),
         quote=_quote(),
+        quote_age_minutes=0.0,
     )
 
     assert decision.allowed is False
@@ -241,6 +247,7 @@ def test_shorting_from_flat_is_refused_under_the_bare_default_limits() -> None:
         edge=0.50,
         portfolio=PortfolioSnapshot(),
         quote=_quote(),
+        quote_age_minutes=0.0,
     )
 
     assert decision.allowed is False
@@ -272,6 +279,7 @@ def test_a_pending_buy_cannot_unlock_a_sell_that_opens_a_short() -> None:
         edge=0.50,
         portfolio=portfolio,
         quote=_quote(),
+        quote_age_minutes=0.0,
     )
 
     assert decision.allowed is False
@@ -292,6 +300,7 @@ def test_a_sell_that_exactly_closes_a_long_is_allowed_at_the_boundary() -> None:
         edge=0.50,
         portfolio=portfolio,
         quote=_quote(),
+        quote_age_minutes=0.0,
     )
 
     assert decision.allowed is True
@@ -311,6 +320,7 @@ def test_a_partial_close_is_allowed() -> None:
         edge=0.50,
         portfolio=portfolio,
         quote=_quote(),
+        quote_age_minutes=0.0,
     )
 
     assert decision.allowed is True
@@ -330,6 +340,7 @@ def test_a_sell_one_contract_past_flat_is_refused_at_the_boundary() -> None:
         edge=0.50,
         portfolio=portfolio,
         quote=_quote(),
+        quote_age_minutes=0.0,
     )
 
     assert decision.allowed is False
@@ -350,6 +361,7 @@ def test_a_shorts_disabled_refusal_is_recorded_on_the_counter() -> None:
         edge=0.50,
         portfolio=PortfolioSnapshot(),
         quote=_quote(),
+        quote_age_minutes=0.0,
     )
 
     assert counter.count(SHORTS_DISABLED) == 1
@@ -368,6 +380,7 @@ def test_an_allowed_order_records_no_refusal() -> None:
         edge=0.50,
         portfolio=PortfolioSnapshot(),
         quote=_quote(),
+        quote_age_minutes=0.0,
     )
 
     assert decision.allowed is True
@@ -420,6 +433,7 @@ def test_exclusive_conflict_still_counts_a_pending_long_on_a_sibling_bucket() ->
         edge=0.50,
         portfolio=portfolio,
         quote=_quote(),
+        quote_age_minutes=0.0,
     )
 
     assert decision.allowed is False

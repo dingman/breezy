@@ -299,6 +299,8 @@ class ForecastMispricingStrategy(Strategy):
             return
 
         forecast_age_hours = (now - forecast.published_at).total_seconds() / 3600.0
+        # Unit proof: this delta is minutes, the unit `stale_quote_minutes` expects.
+        quote_age_minutes = (now - quote.ts_event).total_seconds() / 60.0
         assert self._risk is not None
         risk_decision = self._risk.evaluate_order(
             contract=contract,
@@ -308,6 +310,7 @@ class ForecastMispricingStrategy(Strategy):
             edge=decision.edge,
             portfolio=self._portfolio_snapshot(),
             quote=quote,
+            quote_age_minutes=quote_age_minutes,
         )
         if not risk_decision.allowed:
             self.log.info(
