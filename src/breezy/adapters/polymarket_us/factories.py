@@ -83,7 +83,7 @@ from breezy.adapters.polymarket_us.transport import (
     build_default_quota,
     build_keyed_quotas,
 )
-from breezy.adapters.polymarket_us.websocket import PolymarketUSMarketsWebSocket
+from breezy.adapters.polymarket_us.websocket import PolymarketUSMarketsWebSocketPool
 from breezy.runtime.settings import SettingsError, proxy_env_check_enabled
 
 __all__ = [
@@ -406,7 +406,15 @@ class PolymarketUSLiveDataClientFactory(LiveDataClientFactory):
             # The socket takes its frame handler at construction time and the
             # data client IS that handler, so the client builds its own feed
             # from this closure rather than receiving a pre-built socket.
-            return PolymarketUSMarketsWebSocket(
+            #
+            # A pool, not a bare `PolymarketUSMarketsWebSocket`: the venue caps
+            # subscriptions per connection (`websocket.MAX_SUBSCRIPTIONS_PER_
+            # CONNECTION`, empirically measured 2026-08-30) and silently drops
+            # every subscription past it. The pool shards across as many
+            # connections as the live slug count requires; for <=
+            # MAX_SUBSCRIPTIONS_PER_CONNECTION slugs it behaves identically to
+            # the single connection it replaces.
+            return PolymarketUSMarketsWebSocketPool(
                 ws_url=ws_url,
                 signer=ws_signer,
                 handler=handler,

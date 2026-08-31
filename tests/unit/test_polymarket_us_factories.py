@@ -75,7 +75,10 @@ from breezy.adapters.polymarket_us.signing import (
     build_canonical_path_without_query,
 )
 from breezy.adapters.polymarket_us.symbology import POLYMARKET_US_VENUE
-from breezy.adapters.polymarket_us.websocket import PolymarketUSMarketsWebSocket
+from breezy.adapters.polymarket_us.websocket import (
+    PolymarketUSMarketsWebSocket,
+    PolymarketUSMarketsWebSocketPool,
+)
 from breezy.runtime.settings import SettingsError
 
 CLIENT_NAME = "POLYMARKET_US"
@@ -333,8 +336,15 @@ def test_create_builds_a_markets_socket_bound_to_the_configured_url(
     client = build_client(make_config())
     feed = client._feed
 
-    assert isinstance(feed, PolymarketUSMarketsWebSocket)
-    assert feed._ws_url == "wss://api.polymarket.us"
+    # The venue caps subscriptions per connection (`websocket.py`
+    # `MAX_SUBSCRIPTIONS_PER_CONNECTION`), so the factory wires a sharding
+    # pool rather than a bare socket. Its first shard is a real
+    # `PolymarketUSMarketsWebSocket`, built eagerly (never connected), so
+    # every configuration assertion below still applies to it unchanged.
+    assert isinstance(feed, PolymarketUSMarketsWebSocketPool)
+    shard = feed._shards[0]
+    assert isinstance(shard, PolymarketUSMarketsWebSocket)
+    assert shard._ws_url == "wss://api.polymarket.us"
 
 
 def test_create_signs_the_markets_socket_until_e1_is_measured(
@@ -347,8 +357,10 @@ def test_create_signs_the_markets_socket_until_e1_is_measured(
     # Protocol (`data.py:132-156`), so asserting it through that static type
     # was asserting against a shape the Protocol never promised.
     feed = client._feed
-    assert isinstance(feed, PolymarketUSMarketsWebSocket)
-    assert feed.requires_auth is True
+    assert isinstance(feed, PolymarketUSMarketsWebSocketPool)
+    shard = feed._shards[0]
+    assert isinstance(shard, PolymarketUSMarketsWebSocket)
+    assert shard.requires_auth is True
 
 
 def test_create_wires_the_venue_quote_parser(wired: dict[str, Any]) -> None:
@@ -371,8 +383,10 @@ def test_create_selects_the_builder_named_by_signing_variant(
 ) -> None:
     client = build_client(make_config(signing_variant=variant))
     feed = client._feed
-    assert isinstance(feed, PolymarketUSMarketsWebSocket)
-    signer = feed._signer
+    assert isinstance(feed, PolymarketUSMarketsWebSocketPool)
+    shard = feed._shards[0]
+    assert isinstance(shard, PolymarketUSMarketsWebSocket)
+    signer = shard._signer
 
     assert signer is not None
     assert signer._canonicalize is expected
