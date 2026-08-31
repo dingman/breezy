@@ -121,11 +121,15 @@ was.
      `persistence_same_sign=True` with `persistence_updates=2`). The strategy
      is structurally unable to detect a revision in a forecast that never
      changes; this is the minimum realistic input that lets it observe one.
-     `allow_short` is left at its config default (`True`) for this strategy --
-     unlike `forecast_mispricing`, this was not one of the three diagnosed
-     blockers, and a SHORT_YES signal here (if the strategy produces one) is
-     reported exactly as it occurs, including a possible naked-short refusal,
-     rather than pre-emptively silenced.
+     `allow_short` is left at its config default (`False` --
+     `ForecastRevisionConfig.allow_short`, and likewise `False` for the other
+     two strategies' configs) for this strategy -- unlike `forecast_mispricing`,
+     this was not one of the three diagnosed blockers, so no override is
+     constructed for it here. Because the default is `False`, not `True`, any
+     SHORT_YES signal this strategy forms is refused before it ever reaches a
+     naked-short abort: the abort path (`NakedShortRefusedError`) is
+     unreachable at these defaults, and a refusal is reported exactly as it
+     occurs (see `RefusalCounter`) rather than pre-emptively silenced.
 
 None of these three touches the settlement sweep, the settlement truth, or any
 forecast VALUE relative to `naive` (only #3 introduces new values, and only to
@@ -134,6 +138,37 @@ sweep or chosen to manufacture a profitable trade). If a strategy still does
 not trade under `realistic`, that is reported plainly, with the specific gate
 that blocked it -- this script does not iterate on forecast values to
 manufacture trades.
+
+WHY BOTH CONDITIONS ARE KEPT, DELIBERATELY
+--------------------------------------------
+On `orders_submitted`/`fills`/`ending_balance_usd` alone, every
+`naive`/`realistic` row pair is identical for `forecast_mispricing` (its
+`realistic` override sets `allow_short=False`, already that strategy's config
+default) and for `calibration_mean_reversion`/`forecast_revision` (both
+submit zero orders in EITHER condition, because `SHORTS_DISABLED` -- every
+`SHORT_YES` signal refused under each strategy's own `allow_short=False`
+default, see `RefusalCounter`/`derive_completion_status` -- refuses the
+signal before `published_at` timing can matter). That made the two
+conditions LOOK like a no-op pair. They are not: `naive` and `realistic`
+differ materially in REFUSAL signal, which only became visible once
+`RunResult.refusal_counts`/`status` existed. From the real
+`primary_real_preliminary` scenario:
+
+    condition  strategy                    orders  status                 refusals
+    naive      calibration_mean_reversion  0       COMPLETED              {}
+    naive      forecast_revision           0       COMPLETED              {}
+    realistic  calibration_mean_reversion  0       COMPLETED_ALL_REFUSED  {'shorts_disabled': 2}
+    realistic  forecast_revision           0       COMPLETED_ALL_REFUSED  {'shorts_disabled': 860}
+
+Under `naive`, `calibration_mean_reversion` and `forecast_revision` never
+form a `SHORT_YES` signal at all -- the unrealistic 0-6-minute-old forecast
+never clears their entry gate, so there is nothing to refuse. Under
+`realistic`, the same two strategies DO signal -- 860 times for
+`forecast_revision` alone -- and every one is refused as `shorts_disabled`.
+"Never signalled" and "signalled 860 times, every signal gagged" are
+different diagnostic states: only `realistic` shows these two strategies are
+functional-but-gagged by `allow_short=False` rather than simply idle. Both
+conditions are retained for exactly this reason, not by inertia.
 
 USAGE
 -----
@@ -166,8 +201,11 @@ from nautilus_trader.trading.strategy import Strategy
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from weather_strategy_backtest_lib import (
+    STATUS_COMPLETED,
+    STATUS_COMPLETED_ALL_REFUSED,
     Scenario,
     build_settlement_scenarios,
+    derive_completion_status,
     hours_until,
     latest_publication_at_or_before,
     select_tradable_instrument_ids,
@@ -342,10 +380,15 @@ class RunResult:
     scenario: str
     provenance_by_station: dict[str, str]
     observed_by_station: dict[str, int]
-    status: str  # "COMPLETED" or "REFUSED"
+    status: str  # STATUS_COMPLETED, STATUS_COMPLETED_ALL_REFUSED, or "REFUSED"
     refusal_type: str | None
     refusal_message: str | None
     orders_submitted: int
+    # Per-reason counts from this run's strategy `RefusalCounter` (e.g.
+    # `{"shorts_disabled": 12}`) -- see `derive_completion_status`. Empty for
+    # the hard-abort "REFUSED" path, where `refusal_type`/`refusal_message`
+    # already carry the reason.
+    refusal_counts: dict[str, int] = field(default_factory=dict)
     fills: list[FillSummary] = field(default_factory=list)
     positions: list[PositionSummary] = field(default_factory=list)
     ending_balance_usd: float | None = None
@@ -361,6 +404,7 @@ class RunResult:
             "refusal_type": self.refusal_type,
             "refusal_message": self.refusal_message,
             "orders_submitted": self.orders_submitted,
+            "refusal_counts": dict(self.refusal_counts),
             "fills": [
                 {"side": f.side, "quantity": f.quantity, "avg_price": f.avg_price}
                 for f in self.fills
@@ -638,16 +682,29 @@ def _run_one(
             balance = account.balance_total(USD)
             if balance is not None:
                 ending_balance = float(balance.as_double())
+        # Every weather strategy owns a `RefusalCounter` (`strategy.refusals`,
+        # see `breezy.strategy.weather_common.refusals`) that both its
+        # decision layer and `RiskManager` record into during the run just
+        # completed. Read it here, before `engine.dispose()`, so a strategy
+        # whose entire signal set was refused (e.g. every SHORT_YES gagged by
+        # `allow_short=False`) is never indistinguishable from one that
+        # simply saw no opportunity.
+        refusal_counts = dict(strategy.refusals.counts)
+        status = derive_completion_status(
+            orders_submitted=len(orders),
+            refusal_counts=refusal_counts,
+        )
         return RunResult(
             condition=condition,
             strategy=strategy_kind,
             scenario=scenario.name,
             provenance_by_station=dict(scenario.provenance_by_station),
             observed_by_station=dict(scenario.observed_by_station),
-            status="COMPLETED",
+            status=status,
             refusal_type=None,
             refusal_message=None,
             orders_submitted=len(orders),
+            refusal_counts=refusal_counts,
             fills=fills,
             positions=positions,
             ending_balance_usd=ending_balance,
@@ -674,9 +731,15 @@ def _print_summary(results: list[RunResult]) -> None:
     print("-" * len(header))
     for r in results:
         realized = sum(p.realized_pnl or 0.0 for p in r.positions)
-        realized_str = f"{realized:+.2f}" if r.status == "COMPLETED" else "n/a"
+        realized_str = f"{realized:+.2f}" if r.status == STATUS_COMPLETED else "n/a"
         balance_str = f"{r.ending_balance_usd:.2f}" if r.ending_balance_usd is not None else "n/a"
-        detail = r.status if r.status == "COMPLETED" else f"{r.status}:{r.refusal_type}"
+        if r.status == STATUS_COMPLETED:
+            detail = r.status
+        elif r.status == STATUS_COMPLETED_ALL_REFUSED:
+            reasons = ",".join(f"{k}={v}" for k, v in sorted(r.refusal_counts.items()))
+            detail = f"{r.status}:{reasons}"
+        else:
+            detail = f"{r.status}:{r.refusal_type}"
         print(
             f"{r.condition:<10} {r.strategy:<28} {r.scenario:<24} {detail:<10} "
             f"{r.orders_submitted:>6} {len(r.fills):>5} {realized_str:>13} "

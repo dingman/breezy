@@ -39,8 +39,11 @@ from breezy.domain.weather_bucket_facts import WeatherBucketFacts
 __all__ = [
     "PROVENANCE_ASSUMED",
     "PROVENANCE_REAL",
+    "STATUS_COMPLETED",
+    "STATUS_COMPLETED_ALL_REFUSED",
     "Scenario",
     "build_settlement_scenarios",
+    "derive_completion_status",
     "hours_until",
     "latest_publication_at_or_before",
     "select_tradable_instrument_ids",
@@ -52,6 +55,17 @@ PROVENANCE_REAL = "REAL"
 #: A station's reading in a `Scenario` is a sensitivity value chosen by this
 #: script -- never derived from any settlement truth or from the forecast.
 PROVENANCE_ASSUMED = "ASSUMED"
+
+#: A run submitted zero orders and recorded zero risk/decision refusals: it
+#: saw no tradable opportunity. Indistinguishable, without more, from a run
+#: whose entire signal set was gagged -- see :func:`derive_completion_status`.
+STATUS_COMPLETED = "COMPLETED"
+#: A run submitted zero orders BUT its strategy recorded at least one
+#: refusal (e.g. `SHORTS_DISABLED`, see
+#: `breezy.strategy.weather_common.refusals`): its entire signal set was
+#: refused, not merely absent. Distinct from :data:`STATUS_COMPLETED` so a
+#: gagged strategy never reports as an unqualified clean completion.
+STATUS_COMPLETED_ALL_REFUSED = "COMPLETED_ALL_REFUSED"
 
 
 @dataclass(frozen=True, slots=True)
@@ -188,6 +202,33 @@ def build_settlement_scenarios(
                 ),
             )
     return scenarios
+
+
+def derive_completion_status(
+    *,
+    orders_submitted: int,
+    refusal_counts: Mapping[str, int],
+) -> str:
+    """:data:`STATUS_COMPLETED_ALL_REFUSED` iff the run traded nothing AND was refused.
+
+    A run that submits zero orders is ambiguous on its own: it may simply
+    have seen no opportunity (an efficient market), or every signal it formed
+    may have been refused by a risk/decision gate (e.g. `SHORTS_DISABLED`
+    under `allow_short=False`) -- see
+    `breezy.strategy.weather_common.refusals.RefusalCounter`. Those are
+    different facts and must not report identically.
+
+    ``refusal_counts`` is summed across every reason rather than checked for
+    a specific key, so any reason the counter records (not only
+    `SHORTS_DISABLED`) counts as evidence the run was gagged, not merely
+    unopportune. A run with `orders_submitted > 0` is always
+    :data:`STATUS_COMPLETED`, even if some of its signals were separately
+    refused -- only a wholly-gagged run (zero orders) gets the distinct
+    status.
+    """
+    if orders_submitted == 0 and sum(refusal_counts.values()) > 0:
+        return STATUS_COMPLETED_ALL_REFUSED
+    return STATUS_COMPLETED
 
 
 def hours_until(now: dt.datetime, deadline: dt.datetime) -> float:
