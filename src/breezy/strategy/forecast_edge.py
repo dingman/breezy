@@ -23,6 +23,7 @@ from nautilus_trader.trading.strategy import Strategy
 from breezy.domain.nws_climate_day import NwsClimateDay
 from breezy.ingest.nws_actor import nws_climate_day_data_type
 from breezy.runtime.backtest_feed import NWS_BACKTEST_CLIENT_ID
+from breezy.strategy.depth10 import best_order
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
     from nautilus_trader.core.data import Data
@@ -198,10 +199,12 @@ class ForecastHighEdgeBuyer(Strategy):
         return cast("Decimal", self.config.probability_when_no)
 
     def _best_ask(self, asks: list[BookOrder]) -> Price | None:
-        if not asks:
+        """Best ask, skipping the Depth10 size-0 pad (see ``best_order``)."""
+        level = best_order(asks)
+        if level is None:
             return None
-        best: Price = asks[0].price
-        return best
+        price: Price = level.price
+        return price
 
     def _record(self, ts_event: int, kind: str, detail: str) -> None:
         self.decisions.append(f"{ts_event}|{kind}|{detail}")

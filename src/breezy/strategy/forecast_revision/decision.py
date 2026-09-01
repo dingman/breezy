@@ -229,6 +229,16 @@ def evaluate_instrument(
     scale = (
         cfg.price_scale_override if cfg.price_scale_override is not None else contract.price_scale
     )
+    bid_p, ask_p, mid_p = (
+        quote.implied_bid(scale),
+        quote.implied_ask(scale),
+        quote.implied_mid(scale),
+    )
+    if bid_p is None or ask_p is None or mid_p is None:
+        # A one-sided book cannot produce a market probability. Must run
+        # BEFORE the SHORT_YES / shorts_disabled branch: a missing bid is
+        # not a gag, it is no executable price (BL-20).
+        return None
 
     rev = engine.revision(
         contract.facts,
@@ -307,20 +317,6 @@ def evaluate_instrument(
             refusals.record(SHORTS_DISABLED)
         return None
 
-    bid_p, ask_p, mid_p = (
-        quote.implied_bid(scale),
-        quote.implied_ask(scale),
-        quote.implied_mid(scale),
-    )
-    if bid_p is None or ask_p is None or mid_p is None:
-        # Defensive only, and NOT the preserved defect below. A one-sided or
-        # empty book cannot produce a market probability at all, so there is
-        # nothing to report and nothing to trade against. `calibration_mean_reversion`
-        # carries this same explicit check; the bundle omitted it here, and the
-        # omission is unreachable today (quotes are built from non-None floats
-        # and depth is guarded upstream) -- this aligns the defensive style
-        # without changing any reachable outcome.
-        return None
     # PRESERVED DEFECT -- AWAITING AN OPERATOR RULING. DO NOT "FIX" SILENTLY.
     # `or` tests FALSINESS, not None. A touch price of exactly 0.0 -- a real,
     # reachable price on a 0-1 binary market -- is falsy, so this silently

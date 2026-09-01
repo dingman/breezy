@@ -550,6 +550,27 @@ def test_deep_book_with_ample_liquidity_reproduces_the_previous_level_zero_behav
 # ---------------------------------------------------------------------------
 
 
+def test_asks_only_quote_still_trades_against_the_live_ask() -> None:
+    """A missing bid is absent, not 0.00. A long-only taker still hits the ask.
+
+    Fabricating bid=0 would make mid=ask/2 and a ~0.98 "free" edge; refusing
+    merely because the bid is missing would undo BL-18 at the consumer layer.
+    """
+    contract = _contract(lower_f=80, upper_f=None)
+    decision = evaluate_instrument(
+        contract=contract,
+        quote=_quote(ask=0.50, bid=None),
+        observation=_observation(tmax_f=80),
+        now=NOW,
+        model_p_table=MODEL_P_TABLE,
+        cfg=_cfg(),
+    )
+
+    assert decision is not None
+    assert decision.intent is SideIntent.LONG_YES
+    assert decision.market_probability == pytest.approx(0.50)
+
+
 def test_ask_price_of_zero_is_refused_as_degenerate() -> None:
     contract = _contract(lower_f=80, upper_f=None)
     decision = evaluate_instrument(

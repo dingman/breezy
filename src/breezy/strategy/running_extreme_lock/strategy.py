@@ -118,6 +118,7 @@ from breezy.domain.nws_climate_day import NwsClimateDay
 from breezy.domain.weather_bucket_facts import Measure, read_weather_bucket_facts
 from breezy.ingest.nws_actor import nws_climate_day_data_type
 from breezy.runtime.backtest_feed import NWS_BACKTEST_CLIENT_ID
+from breezy.strategy.depth10 import market_quote_from_depth
 from breezy.strategy.running_extreme_lock.config import RunningExtremeLockConfig
 from breezy.strategy.running_extreme_lock.decision import (
     RunningExtremeObservation,
@@ -137,7 +138,7 @@ from breezy.strategy.weather_common.shared_exposure import SharedExposureMixin
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
     from nautilus_trader.core.data import Data
-    from nautilus_trader.model.data import BookOrder, OrderBookDepth10
+    from nautilus_trader.model.data import OrderBookDepth10
     from nautilus_trader.model.identifiers import InstrumentId
     from nautilus_trader.model.orders.base import Order
 
@@ -294,19 +295,10 @@ class RunningExtremeLockStrategy(SharedExposureMixin, Strategy):
         iid = str(depth.instrument_id)
         if iid not in self._contracts:
             return
-        best_bid = depth.bids[0] if depth.bids else None
-        best_ask = depth.asks[0] if depth.asks else None
-        if best_bid is None or best_ask is None:
+        quote = market_quote_from_depth(depth, include_ask_ladder=True)
+        if quote is None:
             return
-        self._quotes[iid] = MarketQuote(
-            instrument_id=iid,
-            bid=float(best_bid.price),
-            ask=float(best_ask.price),
-            bid_size=float(best_bid.size),
-            ask_size=float(best_ask.size),
-            ts_event=_ns_to_datetime(depth.ts_event),
-            ask_ladder=_ask_ladder(depth.asks),
-        )
+        self._quotes[iid] = quote
         self._evaluate_and_act(iid)
 
     def on_data(self, data: Data) -> None:
@@ -469,18 +461,6 @@ class RunningExtremeLockStrategy(SharedExposureMixin, Strategy):
 
 def _ns_to_datetime(ts_event: int) -> dt.datetime:
     return dt.datetime.fromtimestamp(ts_event / 1_000_000_000, tz=dt.UTC)
-
-
-def _ask_ladder(asks: list[BookOrder]) -> tuple[tuple[float, float], ...]:
-    """Ask-side depth ladder for VWAP-aware sizing (decision.py), skipping
-    ``OrderBookDepth10``'s ``NULL_ORDER`` padding.
-
-    ``OrderBookDepth10`` pads a short side to ten levels with zero-size
-    orders -- the same padding ``RestingLadderStrategy._best`` guards
-    against. Walking all ten levels naively would price a VWAP against
-    synthetic zero-price liquidity that was never actually on offer.
-    """
-    return tuple((float(level.price), float(level.size)) for level in asks if level.size > 0)
 
 
 def _signed_open_order_qty(orders: list[Order]) -> float:

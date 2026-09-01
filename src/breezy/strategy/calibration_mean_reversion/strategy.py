@@ -82,6 +82,7 @@ from breezy.strategy.calibration_mean_reversion.decision import (
     evaluate_instrument,
     should_throttle,
 )
+from breezy.strategy.depth10 import market_quote_from_depth
 from breezy.strategy.weather_common.bucket_contract import MispricingContract
 from breezy.strategy.weather_common.forecast_source import (
     ForecastSource,
@@ -244,18 +245,10 @@ class CalibrationMeanReversionStrategy(SharedExposureMixin, Strategy):
         iid = str(depth.instrument_id)
         if iid not in self._contracts:
             return
-        best_bid = depth.bids[0] if depth.bids else None
-        best_ask = depth.asks[0] if depth.asks else None
-        if best_bid is None or best_ask is None:
+        quote = market_quote_from_depth(depth)
+        if quote is None:
             return
-        self._quotes[iid] = MarketQuote(
-            instrument_id=iid,
-            bid=float(best_bid.price),
-            ask=float(best_ask.price),
-            bid_size=float(best_bid.size),
-            ask_size=float(best_ask.size),
-            ts_event=_ns_to_datetime(depth.ts_event),
-        )
+        self._quotes[iid] = quote
         self._evaluate_and_act(iid)
 
     def on_data(self, data: Data) -> None:

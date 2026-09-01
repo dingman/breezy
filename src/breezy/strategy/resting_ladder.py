@@ -51,6 +51,8 @@ from nautilus_trader.model.enums import LiquiditySide, OrderSide, TimeInForce
 from nautilus_trader.trading.config import StrategyConfig
 from nautilus_trader.trading.strategy import Strategy
 
+from breezy.strategy.depth10 import best_order
+
 if TYPE_CHECKING:  # pragma: no cover - typing only
     from decimal import Decimal
 
@@ -380,11 +382,11 @@ class BreezyRestingLadder(Strategy):
         (``model/data.pyx:3499-3504``); a naive ``side[0]`` on an EMPTY side
         would therefore read a synthetic 0.00 level as a real quote.
         """
-        for level in side:
-            if level.size > 0:
-                price: Price = level.price
-                return price
-        return None
+        level = best_order(side)
+        if level is None:
+            return None
+        price: Price = level.price
+        return price
 
     def _record(self, ts_event: int, kind: str, detail: str) -> None:
         self.decisions.append(f"{ts_event}|{kind}|{detail}")

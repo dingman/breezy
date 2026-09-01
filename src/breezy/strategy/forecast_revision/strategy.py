@@ -71,6 +71,7 @@ from breezy.domain.nws_climate_day import NwsClimateDay
 from breezy.domain.weather_bucket_facts import Measure, read_weather_bucket_facts
 from breezy.ingest.nws_actor import nws_climate_day_data_type
 from breezy.runtime.backtest_feed import NWS_BACKTEST_CLIENT_ID
+from breezy.strategy.depth10 import market_quote_from_depth
 from breezy.strategy.forecast_revision.config import ForecastRevisionConfig
 from breezy.strategy.forecast_revision.decision import RevisionState, evaluate_instrument
 from breezy.strategy.weather_common.bucket_contract import MispricingContract
@@ -235,18 +236,10 @@ class ForecastRevisionStrategy(SharedExposureMixin, Strategy):
         iid = str(depth.instrument_id)
         if iid not in self._contracts:
             return
-        best_bid = depth.bids[0] if depth.bids else None
-        best_ask = depth.asks[0] if depth.asks else None
-        if best_bid is None or best_ask is None:
+        quote = market_quote_from_depth(depth)
+        if quote is None:
             return
-        self._quotes[iid] = MarketQuote(
-            instrument_id=iid,
-            bid=float(best_bid.price),
-            ask=float(best_ask.price),
-            bid_size=float(best_bid.size),
-            ask_size=float(best_ask.size),
-            ts_event=_ns_to_datetime(depth.ts_event),
-        )
+        self._quotes[iid] = quote
         self._evaluate_and_act(iid)
 
     def on_data(self, data: Data) -> None:

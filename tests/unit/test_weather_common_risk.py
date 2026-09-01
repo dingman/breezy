@@ -622,6 +622,154 @@ def test_wide_spread_refusals_collapse_to_one_bounded_counter_key() -> None:
 # ---------------------------------------------------------------------------
 
 
+def test_asks_only_quote_is_tradable_when_ask_liquidity_clears_the_floor() -> None:
+    """A long-only taker does not need a bid. Spread is undefined, not ask-0."""
+    contract = _contract("A", lower_f=80, upper_f=None)
+    risk = RiskManager(RiskLimits(), {"A": contract})
+    quote = MarketQuote(
+        instrument_id="ANY",
+        bid=None,
+        ask=0.50,
+        bid_size=None,
+        ask_size=100.0,
+        ts_event=NOW,
+    )
+
+    decision = risk.evaluate_order(
+        contract=contract,
+        signed_qty_delta=10.0,
+        hours_to_settlement=24.0,
+        signal_age=FRESH,
+        edge=0.50,
+        portfolio=PortfolioSnapshot(),
+        quote=quote,
+        quote_age_minutes=0.0,
+    )
+
+    assert decision.allowed is True
+
+
+def test_asks_only_quote_is_not_a_wide_spread_against_a_synthetic_zero_bid() -> None:
+    """Reading the size-0 pad as bid=0 makes spread=ask, which always fails
+    ``max_bid_ask_spread``. That is the fabricated-price sibling, not a real
+    wide book.
+    """
+    contract = _contract("A", lower_f=80, upper_f=None)
+    risk = RiskManager(RiskLimits(max_bid_ask_spread=0.06), {"A": contract})
+    ok, why = risk.quote_tradable(
+        MarketQuote(
+            instrument_id="ANY",
+            bid=None,
+            ask=0.50,
+            bid_size=None,
+            ask_size=100.0,
+            ts_event=NOW,
+        ),
+        1.0,
+        0.0,
+    )
+
+    assert ok is True
+    assert why == "ok"
+
+
+def test_a_buy_on_a_bids_only_book_is_refused_as_missing_the_executable_side() -> None:
+    """quote_tradable may skip spread on a one-sided book; a BUY still needs an ask."""
+    contract = _contract("A", lower_f=80, upper_f=None)
+    risk = RiskManager(RiskLimits(), {"A": contract})
+    quote = MarketQuote(
+        instrument_id="ANY",
+        bid=0.40,
+        ask=None,
+        bid_size=100.0,
+        ask_size=None,
+        ts_event=NOW,
+    )
+
+    decision = risk.evaluate_order(
+        contract=contract,
+        signed_qty_delta=10.0,
+        hours_to_settlement=24.0,
+        signal_age=FRESH,
+        edge=0.50,
+        portfolio=PortfolioSnapshot(),
+        quote=quote,
+        quote_age_minutes=0.0,
+    )
+
+    assert decision.allowed is False
+    assert decision.reason == "missing_bid_ask"
+
+
+def test_a_reducing_sell_on_an_asks_only_book_is_refused_as_missing_the_executable_side() -> None:
+    """A close-only sell executes at the bid. An absent bid is not a 0.00 price."""
+    contract = _contract("A", lower_f=80, upper_f=None)
+    risk = RiskManager(RiskLimits(), {"A": contract})
+    quote = MarketQuote(
+        instrument_id="ANY",
+        bid=None,
+        ask=0.50,
+        bid_size=None,
+        ask_size=100.0,
+        ts_event=NOW,
+    )
+
+    decision = risk.evaluate_order(
+        contract=contract,
+        signed_qty_delta=-10.0,
+        hours_to_settlement=24.0,
+        signal_age=FRESH,
+        edge=0.50,
+        portfolio=PortfolioSnapshot(position_qty={"A": 10.0}),
+        quote=quote,
+        quote_age_minutes=0.0,
+    )
+
+    assert decision.allowed is False
+    assert decision.reason == "missing_bid_ask"
+
+
+def test_bids_only_quote_uses_bid_liquidity_and_does_not_invent_an_ask() -> None:
+    contract = _contract("A", lower_f=80, upper_f=None)
+    risk = RiskManager(RiskLimits(), {"A": contract})
+    ok, why = risk.quote_tradable(
+        MarketQuote(
+            instrument_id="ANY",
+            bid=0.40,
+            ask=None,
+            bid_size=100.0,
+            ask_size=None,
+            ts_event=NOW,
+        ),
+        1.0,
+        0.0,
+    )
+
+    assert ok is True
+    assert why == "ok"
+
+
+def test_a_thin_real_two_sided_book_is_still_tradable() -> None:
+    """Size 30 is small, but it is a real level, not a pad. Do not over-correct."""
+    contract = _contract("A", lower_f=80, upper_f=None)
+    risk = RiskManager(RiskLimits(min_liquidity_contracts=25.0), {"A": contract})
+    ok, why = risk.quote_tradable(
+        MarketQuote(
+            instrument_id="ANY",
+            bid=0.40,
+            ask=0.42,
+            bid_size=30.0,
+            ask_size=30.0,
+            ts_event=NOW,
+        ),
+        1.0,
+        0.0,
+    )
+
+    assert ok is True
+    assert why == "ok"
+
+
 def test_a_future_dated_quote_is_refused_as_future_quote() -> None:
     """`now_ts_age_minutes` negative means `quote.ts_event` is AHEAD of
     `now` -- clock skew or a bad feed timestamp, not freshness. Before the

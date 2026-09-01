@@ -290,6 +290,15 @@ def test_quantity_is_clipped_to_max_quantity_on_an_extreme_edge() -> None:
     assert decision.quantity == pytest.approx(_cfg().max_quantity)
 
 
+def test_a_missing_bid_does_not_fabricate_edge_against_a_zero_price() -> None:
+    """Edge is vs executable bid/ask, not mid. A missing bid is not 0.00."""
+    contract = _contract()
+    quote = _quote(bid=None, ask=0.30)
+    forecast = _forecast(expected_high_f=110.0)
+
+    assert _evaluate(contract=contract, quote=quote, forecast=forecast) is None
+
+
 @pytest.mark.parametrize("measure_upper", [None, 90])
 def test_range_and_above_buckets_both_route_through_bucket_probability(
     measure_upper: int | None,

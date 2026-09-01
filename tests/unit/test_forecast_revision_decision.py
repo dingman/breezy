@@ -484,3 +484,36 @@ def test_a_one_sided_quote_yields_no_decision() -> None:
         ts_event=NOW,
     )
     assert _evaluate(state=state, quote=one_sided) is None
+
+
+def test_a_one_sided_quote_does_not_count_as_shorts_disabled() -> None:
+    """A downward revision on an asks-only book is no market, not a gag.
+
+    BL-20 stores bid=None on a one-sided depth snapshot. If the None-side
+    gate runs AFTER the SHORT_YES branch, every such tick is counted as
+    shorts_disabled even though no executable short price exists.
+    """
+    state = RevisionState(history_len=12)
+    contract = _contract()
+    state.observe(
+        contract=contract,
+        forecast=_snapshot(high_f=90.0, published_at=T0, horizon=26.0),
+        market_mid_p=0.80,
+    )
+    state.observe(
+        contract=contract,
+        forecast=_snapshot(high_f=72.0, published_at=T1, horizon=24.0),
+        market_mid_p=0.80,
+    )
+    refusals = RefusalCounter()
+    one_sided = MarketQuote(
+        instrument_id=INSTRUMENT_ID,
+        bid=None,
+        ask=0.81,
+        bid_size=None,
+        ask_size=100.0,
+        ts_event=NOW,
+    )
+
+    assert _evaluate(state=state, quote=one_sided, refusals=refusals) is None
+    assert refusals.count(SHORTS_DISABLED) == 0

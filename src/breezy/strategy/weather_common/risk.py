@@ -291,14 +291,24 @@ class RiskManager:
     def quote_tradable(
         self, quote: MarketQuote, price_scale: float, now_ts_age_minutes: float,
     ) -> tuple[bool, str]:
-        if quote.bid is None or quote.ask is None:
+        if quote.bid is None and quote.ask is None:
             return False, "missing_bid_ask"
-        if quote.ask <= quote.bid:
-            return False, "crossed_or_locked_ignored"
-        spread = (quote.ask - quote.bid) * price_scale
-        if spread > self.limits.max_bid_ask_spread:
-            return False, f"spread_{spread:.3f}"
-        liq = min(quote.bid_size or 0.0, quote.ask_size or 0.0)
+        if quote.bid is not None and quote.ask is not None:
+            if quote.ask <= quote.bid:
+                return False, "crossed_or_locked_ignored"
+            spread = (quote.ask - quote.bid) * price_scale
+            if spread > self.limits.max_bid_ask_spread:
+                return False, f"spread_{spread:.3f}"
+            liq = min(quote.bid_size or 0.0, quote.ask_size or 0.0)
+        else:
+            # One-sided book: spread is undefined, not ask-minus-zero. A
+            # long-only taker buys at the ask; an absent bid is not a 0.00
+            # price and is not a wide-spread refusal. Liquidity is the
+            # populated side.
+            if quote.ask is not None:
+                liq = quote.ask_size or 0.0
+            else:
+                liq = quote.bid_size or 0.0
         if liq < self.limits.min_liquidity_contracts:
             return False, "insufficient_liquidity"
         # `now_ts_age_minutes` is MINUTES, matching `stale_quote_minutes` --
@@ -421,6 +431,14 @@ class RiskManager:
             and portfolio.settled_qty(contract.instrument_id) + signed_qty_delta < -1e-9
         ):
             return self._refuse(SHORTS_DISABLED)
+
+        # One-sided books are allowed through quote_tradable (spread is
+        # undefined, not ask-minus-zero). The executable side still has to
+        # exist: a BUY takes the ask, a sell hits the bid.
+        if signed_qty_delta > 0 and quote.ask is None:
+            return self._refuse("missing_bid_ask")
+        if signed_qty_delta < 0 and quote.bid is None:
+            return self._refuse("missing_bid_ask")
 
         # Unit proof: callers pass minutes, matching `stale_quote_minutes`.
         ok, why = self.quote_tradable(quote, contract.price_scale, quote_age_minutes)
