@@ -89,9 +89,14 @@ Evidence: `docs/evidence/observation_lock_falsification_2026-08-31.md`.
 
 Gate 0 RESOLVED: no live intraday ingest (transport hardcodes CLI, two URL
 builders, `_fetch` private at `ingest/http.py:769`), but ~5 yr of 5-min ASOS is
-on disk and Open-Meteo previous-runs reaches 2019. `R(t)` cannot enter a Nautilus
+on disk. Open-Meteo previous-runs reaches **2022-01..2023-12 plus the present,
+with a hole between** — the "2019" claim was a 200-OK-with-no-datum misread, see
+LESSONS L-8 amendment. `R(t)` cannot enter a Nautilus
 backtest — no `Data` subclass, no catalog wiring, no client. Plan (unreviewed):
-`docs/plans/intraday_observation_ingest_2026-09-01.md`. Two traps it found:
+`docs/plans/intraday_observation_ingest_2026-09-01.md` — peer-reviewed
+2026-09-01: RESUME WITH AMENDMENTS (re-anchor off the dead lock predicate;
+demote I-4; `build_running_max_days` at `pmr_climatology_study.py:351` is an
+EXISTING untested fold to PORT, not author). Two traps it found:
 barrier W1 (`test_weather_data_type_barrier.py:94`) does not cover a new record
 class, and `test_probe_containment.py:297-310` asserts set EQUALITY so a third
 endpoint turns it RED — widen both, never relax.
@@ -112,20 +117,6 @@ Generalise `_conditions` over the counted key set.
 
 `risk.py:395-398` checks halt before `min_hours_to_settlement` (2.0h); a
 decreasing clock always crosses 2.0 first. Decide if the two knobs are one.
-
-### [HIGH] BL-25 — three cost/sizing defects the tape already proves wrong
-
-Measured over the captured ladder: a $24.53 order exceeds level-0 size in 57.4%
-of snapshots and exhausts all 10 levels in 6.5%; realised walk-the-book slippage
-is p90 0.137 / p99 0.661, and 36.0% of snapshots exceed the flat 0.01 floor from
-the recorded book ALONE. Fix all three: (1) `trade_cost_prob`
-(`weather_common/costs.py:165-195`) is depth-blind — make it a VWAP walk;
-(2) `risk.py:485` returns `clipped_quantity=signed_qty_delta`, never clipped to
-`quote.ask_size` — clip to ladder depth; (3) ROI is reported on a configured
-$10,000 balance (`run_weather_strategy_backtests.py:350`), so -$5.41 shows as
--0.054% when it is ~-20% on capital actually deployed — report both.
-
----
 
 ## BACKLOG — selected for execution (opened 2026-08-31)
 
@@ -205,15 +196,19 @@ whole capture is **$0.574**, which nets NEGATIVE after fees and is refused by
 n ~ 300 station-days (~60 clean calendar days at 5 stations) before a CI lower
 bound can clear break-even.
 
-**Ordered path to a real-money ROI verdict:** (1) BL-25 — fix the three
-cost/sizing defects the tape already disproves; (2) continuous trigger-covering
-capture, not 19-minute slices; (3) freeze backtest in the REFUTATION + plumbing
-role only; (4) paper/live-small is REQUIRED — offer survival and market impact
-are counterfactuals about the venue's reaction to OUR order and exist in no
-recording; (5) feed measured latency/fill-probability/survival back as backtest
-inputs; (6) accumulate ~300 station-days; (7) settle CAPACITY first — with the
-winner-side book at ~$0.58 and the bid side empty, a correct strategy may still
-be uninvestable at size. Steps 4-6 cannot be shortened by engineering.
+**Ordered path to a real-money ROI verdict (revised 2026-09-01):** (1) BL-25
+DONE; (2) K1 gates the calibration family BEFORE any forecast build —
+`docs/evidence/k1_cheap_open_2026-09-01.md`, currently n=0, viable at ask<=0.03
+in ~20d / ask<=0.05 in ~9d, and the 0.01 tick needs ~359d so no plan may wait on
+it; (3) capture supervised to 2026-10-01 (D+1 book exists only if the recorder
+runs before local midnight); (4) execute the EXEC SPINE R-1..R-9
+(`docs/plans/EXEC_SPINE_2026-09-01.md`) — R-4 publishes the first AccountState
+and is what de-inerts every Nautilus cap (`risk/engine.pyx:682-692` returns True
+with no account); (5) forecast ingest (`docs/plans/forecast_ingest_2026-09-01.md`)
+HELD until K1 reports; (6) accumulate ~300 station-days; (7) settle CAPACITY.
+Backtest stays frozen in the REFUTATION + plumbing role — it cannot produce the
+ROI evidence, because offer survival is a counterfactual about the venue's
+reaction to OUR order and exists in no recording.
 
 ---
 
