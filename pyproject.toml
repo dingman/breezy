@@ -49,7 +49,16 @@ markers = [
 ]
 
 [tool.importlinter]
-root_packages = ["breezy"]
+# `nautilus_trader` is rooted, not left external, ONLY so the forbidden
+# contract below can name the Polymarket `.com` adapter itself. `grimp`
+# squashes external packages to their top-level name, so as an external the
+# framework is a single graph node and `lint-imports` refuses
+# `nautilus_trader.adapters.polymarket` outright ("subpackages of external
+# packages are not valid") -- which is why that contract used to have to ban
+# the WHOLE framework. Rooting it costs ~600 extra parsed files (the rest of
+# Nautilus is compiled Cython) and no measurable time. No contract constrains
+# Nautilus' own internal imports: it is immutable and not ours to shape.
+root_packages = ["breezy", "nautilus_trader"]
 include_external_packages = true
 
 [[tool.importlinter.contracts]]
@@ -84,68 +93,21 @@ ignore_imports = [
 name = "Breezy never imports the Nautilus Polymarket .com adapter"
 type = "forbidden"
 source_modules = ["breezy"]
-forbidden_modules = ["nautilus_trader"]
+# The ban is on the Polymarket `.com` adapter -- the thing this contract is
+# named for -- and on nothing else. It used to read `["nautilus_trader"]`,
+# banning the WHOLE framework, with a hand-maintained per-module allow-list
+# of ~30 entries as the unblocker. That inverted the repo's first principle:
+# reusing ANY new native meant editing this file, a change invisible from the
+# author's seat and caught by no test, while the allow-list -- not the
+# contract -- was what actually kept the `.com` adapter out. Naming the
+# adapter makes the contract enforce its own name, so the allow-list is
+# empty and stays empty.
+forbidden_modules = ["nautilus_trader.adapters.polymarket"]
+# Unchanged by the narrowing: only DIRECT imports are checked. Any indirect
+# route into the `.com` adapter passes through some Breezy module's own
+# direct import, which this contract catches; chains through Nautilus'
+# internals are Nautilus' business, not a Breezy adoption of the adapter.
 allow_indirect_imports = true
-ignore_imports = [
-    "breezy.adapters.polymarket_us.config -> nautilus_trader",
-    "breezy.adapters.polymarket_us.credentials -> nautilus_trader",
-    "breezy.adapters.polymarket_us.data -> nautilus_trader",
-    "breezy.adapters.polymarket_us.factories -> nautilus_trader",
-    # Subclasses the native `backtest.models.FeeModel` extension point.
-    "breezy.adapters.polymarket_us.fees -> nautilus_trader",
-    "breezy.adapters.polymarket_us.parsing -> nautilus_trader",
-    "breezy.adapters.polymarket_us.provider -> nautilus_trader",
-    "breezy.adapters.polymarket_us.secure -> nautilus_trader",
-    "breezy.adapters.polymarket_us.signing -> nautilus_trader",
-    "breezy.adapters.polymarket_us.symbology -> nautilus_trader",
-    "breezy.adapters.polymarket_us.tape_records -> nautilus_trader",
-    "breezy.adapters.polymarket_us.transport -> nautilus_trader",
-    "breezy.adapters.polymarket_us.websocket -> nautilus_trader",
-    "breezy.domain.archived_climate_day -> nautilus_trader",
-    "breezy.domain.archived_raw_product -> nautilus_trader",
-    "breezy.domain.nws_climate_day -> nautilus_trader",
-    "breezy.domain.nws_raw_product -> nautilus_trader",
-    "breezy.ingest.config -> nautilus_trader",
-    "breezy.ingest.nws_actor -> nautilus_trader",
-    "breezy.persistence.catalog -> nautilus_trader",
-    "breezy.persistence.archive_catalog -> nautilus_trader",
-    "breezy.persistence.quote_tape_gaps -> nautilus_trader",
-    # Wraps weather records in the native `CustomData` envelope and names
-    # the native `ClientId` -- both are Nautilus extension points.
-    "breezy.runtime.backtest_feed -> nautilus_trader",
-    # Composes the native `BacktestEngine` and subclasses nothing.
-    "breezy.runtime.backtest_harness -> nautilus_trader",
-    # Subscribes to the native `MessageBus` order-event topic and subclasses
-    # nothing; reads `OrderInitialized`/`OrderSide` to screen order intent.
-    "breezy.runtime.backtest_order_guard -> nautilus_trader",
-    # WILDCARD, deliberately, over the whole `breezy.strategy` subtree: every
-    # strategy subclasses the native `Strategy`/`StrategyConfig` extension
-    # points, so a per-module entry made "write a strategy" a pyproject edit
-    # that nothing in `pytest` catches. `**` (whole subtree) rather than `*`
-    # (direct children only) so a strategy in a subpackage is covered too.
-    #
-    # This does NOT weaken the architecture. The LAYERS contract above still
-    # constrains what `strategy` may import from `breezy` -- it is the TOP
-    # layer, so nothing may reach back into it, and it may only reach DOWN.
-    # All this waives is the blanket "no `nautilus_trader` anywhere" rule,
-    # whose purpose is to keep the Polymarket .com adapter out of Breezy;
-    # `nautilus_trader.trading.strategy` is the native extension point a
-    # strategy exists to subclass. Pinned by
-    # `tests/unit/test_strategy_module_gate.py`, which synthesises a brand-new
-    # strategy module and runs the real `lint-imports` over it.
-    "breezy.strategy.** -> nautilus_trader",
-    "breezy.runtime.cli -> nautilus_trader",
-    "breezy.runtime.composition -> nautilus_trader",
-    "breezy.runtime.logging_bridge -> nautilus_trader",
-    "breezy.runtime.node_config -> nautilus_trader",
-    "breezy.runtime.quote_tape_cli -> nautilus_trader",
-    # Same class as `quote_tape_cli` above and no wider: a process entrypoint
-    # naming the native `TradingNode` / `TradingNodeConfig` it drives. A
-    # per-module entry, never a `breezy.runtime.**` wildcard -- the point of
-    # this contract is that adding a new Nautilus-touching module is a
-    # decision somebody makes in this file.
-    "breezy.runtime.trade_cli -> nautilus_trader",
-]
 
 [[tool.importlinter.contracts]]
 name = "Settlement and strategy code never reaches archived backfill records"

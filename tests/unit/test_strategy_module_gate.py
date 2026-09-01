@@ -3,20 +3,21 @@
 The gate this file holds
 ------------------------
 
-``pyproject.toml`` carries two allowlists that a strategy module must appear
-in, because ``nautilus_trader.trading.strategy.Strategy`` is a compiled Cython
-class:
+``pyproject.toml`` carries a mypy ``disallow_subclassing_any = false``
+override that a strategy module must appear in, because
+``nautilus_trader.trading.strategy.Strategy`` is a compiled Cython class and
+without the override ``Class cannot subclass "Strategy" (has type "Any")``
+fails ``mypy src``.
 
-* the mypy ``disallow_subclassing_any = false`` override, without which
-  ``Class cannot subclass "Strategy" (has type "Any")`` fails ``mypy src``;
-* the import-linter forbidden contract's ``ignore_imports``, without which
-  ``breezy.<module> -> nautilus_trader`` fails ``lint-imports``.
-
-Both were once written PER MODULE. That made "add a strategy" a three-file
-change whose two other files are invisible from the strategy author's seat,
-and whose omission is not caught by ``pytest`` at all -- the suite stays green
-while two other gates go red. Both entries are now wildcards over
-``breezy.strategy``.
+It was once written PER MODULE, alongside a second per-module entry in the
+import-linter forbidden contract's ``ignore_imports`` (which then banned the
+whole of ``nautilus_trader``). That made "add a strategy" a three-file change
+whose two other files are invisible from the strategy author's seat, and whose
+omission is not caught by ``pytest`` at all -- the suite stays green while two
+other gates go red. The mypy override is now a wildcard over
+``breezy.strategy``; the import-linter side no longer needs an entry at all,
+because that contract now forbids only the Polymarket ``.com`` adapter
+(``tests/unit/test_nautilus_native_import_gate.py``).
 
 Why the test SYNTHESISES a module rather than asserting on config text
 ----------------------------------------------------------------------
@@ -113,9 +114,9 @@ def test_a_brand_new_strategy_module_keeps_the_import_contract(
 ) -> None:
     """`lint-imports` must accept its `nautilus_trader` import.
 
-    The whole contract set is run, not just the forbidden one: a wildcard
-    broad enough to cover the strategy package must not also relax the LAYER
-    contract that keeps `strategy` at the top.
+    The whole contract set is run, not just the forbidden one: a strategy is
+    the TOP layer, so a new strategy module must satisfy the LAYER contract
+    as well as the `.com`-adapter ban.
     """
     del generated_strategy
     result = _run(str(REPO_ROOT / ".venv" / "bin" / "lint-imports"))
@@ -141,6 +142,7 @@ def test_no_strategy_module_is_named_individually_in_pyproject(
     named = [module for module in modules if f"breezy.strategy.{module}" in pyproject]
 
     assert named == [], (
-        f"{named} are named individually in pyproject.toml; the allowlists must "
-        f"cover `breezy.strategy` by WILDCARD so writing a strategy needs no config edit"
+        f"{named} are named individually in pyproject.toml; the mypy allowlist "
+        f"must cover `breezy.strategy` by WILDCARD so writing a strategy needs "
+        f"no config edit"
     )

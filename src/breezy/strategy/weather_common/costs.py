@@ -20,15 +20,24 @@ can express a ``p * (1 - p)`` term at all. **The gap is real**; this module is
 the smallest pure helper that closes it.
 
 ``nautilus_trader/adapters/polymarket/fee_model.py::PolymarketFeeModel``
-implements the right formula and is nonetheless **forbidden and unsafe**: it
-lives in the Polymarket **.com** adapter, which the import-linter contract
-"Breezy never imports the Nautilus Polymarket .com adapter" blocks; it reads
-the flat ``instrument.taker_fee`` field and returns ``Money(0)`` when it is
-``<= 0`` -- fail-OPEN to a free venue, the exact posture
-``breezy.adapters.polymarket_us.fees`` refuses; and it credits maker rebates
-(``infer_maker_rebate_rate``, ``fee_model.py:132-176``), which
-``MakerRebateUnmodelledError`` says Breezy must not model until a real maker
-fill has been observed.
+implements the right formula and is nonetheless **unsafe for Breezy**, on its
+BEHAVIOUR -- the reason that stands whether or not it is reachable:
+
+* it reads the flat ``instrument.taker_fee`` field and **fails OPEN**,
+  returning ``Money(0)`` whenever that field is ``None`` or ``<= 0``
+  (``fee_model.py:294-295``). A missing rate silently prices the venue as
+  free: the exact posture ``breezy.adapters.polymarket_us.fees`` refuses.
+* it credits maker REBATES, returning a NEGATIVE ``Money`` for a maker fill
+  (``fee_model.py:301-316``, via ``infer_maker_rebate_rate`` ``:132-177`` and
+  ``calculate_maker_rebate`` ``:180``), which ``MakerRebateUnmodelledError``
+  says Breezy must not model until a real maker fill has been observed.
+
+It is also unreachable, but that is a consequence and not the reason: it lives
+in the Polymarket **.com** adapter, which the import-linter contract "Breezy
+never imports the Nautilus Polymarket .com adapter" forbids every Breezy
+module from importing. Do not lean on that contract as the argument -- while
+it was written as a framework-wide ban behind a per-module allow-list, the
+allow-list waived it for the very packages that would have used this model.
 
 This helper does **not** replace
 :class:`breezy.adapters.polymarket_us.fees.PolymarketUSFeeModel`, which stays

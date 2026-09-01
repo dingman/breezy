@@ -49,7 +49,13 @@ def test_venue_live_marker_documents_the_existing_three_lock_gate() -> None:
 def test_import_linter_enforces_layers_and_polymarket_com_adapter_ban() -> None:
     config = _pyproject()["tool"]["importlinter"]
 
-    assert config["root_packages"] == ["breezy"]
+    # `nautilus_trader` is a ROOT package, not merely an external one, because
+    # `grimp` squashes external packages to their top-level name: as an
+    # external, `nautilus_trader.adapters.polymarket` is not in the graph and
+    # `lint-imports` rejects it outright ("subpackages of external packages
+    # are not valid"). Rooting it is what makes the ban below expressible
+    # against the `.com` adapter ITSELF rather than the whole framework.
+    assert config["root_packages"] == ["breezy", "nautilus_trader"]
     assert config["include_external_packages"] is True
 
     contracts = {contract["name"]: contract for contract in config["contracts"]}
@@ -82,12 +88,31 @@ def test_import_linter_enforces_layers_and_polymarket_com_adapter_ban() -> None:
 
     assert forbidden["type"] == "forbidden"
     assert forbidden["source_modules"] == ["breezy"]
-    assert forbidden["forbidden_modules"] == ["nautilus_trader"]
+    # The ban names the `.com` ADAPTER, which is what the contract is called
+    # and what it exists to stop. It once named `nautilus_trader` -- the whole
+    # framework -- which banned nothing anyone wanted banned and instead taxed
+    # every native Breezy adopts with a `pyproject.toml` edit.
+    assert forbidden["forbidden_modules"] == ["nautilus_trader.adapters.polymarket"]
+    # Unchanged by the narrowing: only DIRECT imports are contract-checked.
+    # An indirect chain that ends in the `.com` adapter always passes through
+    # some Breezy module's own direct import, which this contract catches.
     assert forbidden["allow_indirect_imports"] is True
+    # The allow-list may never waive any part of the real ban. Under the
+    # framework-wide form this was the ONLY thing holding the line, and it is
+    # still what an author would have to defeat to reintroduce the `.com`
+    # adapter by configuration. `.get` because the narrowing left the
+    # allow-list empty: nothing that was on it was ever about the `.com`
+    # adapter, and every entry is now redundant.
     assert all(
         "nautilus_trader.adapters.polymarket" not in ignored
-        for ignored in forbidden["ignore_imports"]
+        for ignored in forbidden.get("ignore_imports", [])
     )
+    # ...and empty is the state the narrowing achieved. Pinned so the
+    # per-module regime cannot restart quietly: the executable counterpart is
+    # `tests/unit/test_nautilus_native_import_gate.py`, which plants a module
+    # importing the `.com` adapter and asserts the real `lint-imports`
+    # rejects it.
+    assert forbidden.get("ignore_imports", []) == []
 
 
 def test_polymarket_com_adapter_imports_are_banned_repo_wide() -> None:

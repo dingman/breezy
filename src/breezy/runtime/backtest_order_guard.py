@@ -17,9 +17,15 @@ the same refusal to the instant the order is submitted.
 position passes every ``RiskEngine`` check on a CASH account, because
 ``CashAccount.balance_impact`` (``accounting/accounts/cash.pyx:489-493``)
 returns **+notional** for a SELL, so the check ``(free + balance_impact) < 0``
-(``risk/engine.pyx:949``) can never fire; and 1.231.0 exempts
-position-reducing sells outright (``:975-987``), so the only sells that reach
-that gate are the naked ones. The spec used to prescribe "a strategy-side
+(``risk/engine.pyx:949``) can never fire; and 1.231.0 routes only
+position-reducing sells AROUND that check, on a CONDITION a naked sell fails:
+``is_position_reducing_sell = order.is_reduce_only or pending_sell_qty <=
+available_long_qty`` (``risk/engine.pyx:979-982``), where ``available_long_qty``
+is the net open LONG minus already-submitted sells (``:701-739``). A naked sell
+is neither reduce-only nor within a long it does not have, so it is NOT
+exempted -- it falls THROUGH to the balance check above, which on a cash
+account cannot deny it. Either way the sell arrives unopposed; the exemption
+merely decides which unfireable gate it reaches. The spec used to prescribe "a strategy-side
 invariant", which asks every strategy author to re-derive the rule from prose
 they may never read -- and one author, writing a perfectly reasonable ladder,
 did not. Verified live: a LIMIT SELL for 500 contracts against a ZERO position

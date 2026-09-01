@@ -220,10 +220,16 @@ class CorruptProductIndexEntryError(Exception):
 class StateStore(Protocol):
     """The minimal persistence seam this module needs.
 
-    Structurally identical to ``gate.StateStore`` on purpose: the Actor backs
-    both with the same ``Cache.add`` / ``Cache.get`` pair and may pass one
-    object to both (the key namespaces do not collide). It is declared here
-    rather than imported so this module carries no gate dependency.
+    Structurally identical to ``gate.StateStore`` on purpose: the Actor hands
+    ONE store object to both this index and the gate (their key namespaces,
+    ``productidx:`` and ``gate:``, do not collide). It is declared here rather
+    than imported so this module carries no gate dependency.
+
+    That store is ``breezy.runtime.sqlite_store.SqliteStateStore``, **not** the
+    native Nautilus ``Cache``, which was examined and DECLINED with the
+    evidence recorded in that module's docstring: under this deployment's
+    ``CacheConfig(database=None)`` the ``Cache`` is memory-only, and its only
+    supported backing is a Redis server this deployment does not have.
     """
 
     def get(self, key: str) -> bytes | None: ...
