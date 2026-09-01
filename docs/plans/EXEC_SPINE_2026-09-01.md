@@ -596,6 +596,20 @@ transitively and unnamed. Worse, that import is not even venue-classified — C4
 subclassing from, `nautilus_trader.adapters.polymarket*`, and `importlib.import_module` with a
 dotted string literal containing `live.retry`.**
 
+**Refinement (2026-09-01), and it makes B8 sharper, not softer.** The shipped adapter does NOT
+auto-resubmit as shipped: `max_retries` defaults to `PositiveInt | None = None`
+(`adapters/polymarket/config.py:208`) and resolves as `config.max_retries or 0`
+(`execution.py:223`) — **retry is OFF by default on submit, deliberately**, which is why
+`_is_unknown_submit_result` / `_handle_unknown_batch_submit_result` (`:1571-1577`) exist at all:
+Nautilus treats an ambiguous submit as ambiguous, not as retryable. So the hazard is not the
+adapter's default — it is somebody **turning it on**. And Breezy's own reference material was
+telling them to: `docs/reference/nautilus/digests/adapters-live-networking.md:574-578` shipped a
+copy-paste `RetryManagerPool(..., max_retries=3, ...)` recipe. That recipe is a DATA-fetch
+example, but nothing on the page said so, and the digest's own fact 38 (`:369-370`) — "retry only
+classified transient failures on **idempotent** operations" — was 200 lines away from the block
+people actually copy. Now guarded in place. **B8 is the enforcement; the digest guard is the
+prevention.**
+
 **B9 (new) — nothing pinned who may CALL the write transport.** R-5 allowlists
 `exec/write_transport.py` out of V1-V4 and R-7 narrows B6 to one permit caller, but no barrier
 constrains the transport's caller set: any later module importing it reaches `POST /v1/orders`
