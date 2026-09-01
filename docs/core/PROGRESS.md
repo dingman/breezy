@@ -163,10 +163,9 @@ either count it under the same bounded key set or document why not.
   (79b9b44); the feather question is ANSWERED — see BL-23, which is the
   remaining P1 work. Still untested end-to-end: the native shutdown joint
   (`kernel.py:585` + `:613-638`) is confirmed by source, not by a live-node run.
-- **P2/P3** — forecast probes (Open-Meteo `/v1/previous-runs`; IEM AFOS forecast
-  PIL) then forecast ingestion. Breezy ingests **no forecast data at all**, so
-  every forecast-strategy ROI is inadmissible until P3 lands. DEPRIORITISED:
-  the observation family needs no forecast and is the route to the stop gate.
+- **P2/P3** — forecast probes then ingestion. Breezy ingests **no forecast data
+  at all**, so every forecast-strategy ROI is inadmissible. DEPRIORITISED; the
+  observation family needs no forecast. See item (5) below.
 - **P4** — daily-budget gate and portfolio-wide cap (see operator contract).
   BL-3 is the first increment.
 - **P6** — wire boundary-conditional preliminary-revision cost into sizing;
@@ -198,11 +197,15 @@ bound can clear break-even.
 
 **Ordered path to a real-money ROI verdict (revised 2026-09-01):** (1) BL-25
 DONE; (2) K1 gates the calibration family BEFORE any forecast build —
-`docs/evidence/k1_cheap_open_2026-09-01.md`, currently n=0, viable at ask<=0.03
-in ~20d / ask<=0.05 in ~9d, and the 0.01 tick needs ~359d so no plan may wait on
-it; (3) capture supervised to 2026-10-01 (D+1 book exists only if the recorder
+`docs/evidence/k1_cheap_open_2026-09-01.md`. Measured n=0, but **30 D+1 entries
+are captured** (09-01, the first full 5-station D+1 day) and enter the
+population automatically once their CLI goes FINAL — what is missing is elapsed
+time, not code. Viable at ask<=0.03 in ~20d / ask<=0.05 in ~9d; the 0.01 tick
+needs ~359d, so no plan may wait on it. Re-runs daily, unattended; (3) capture supervised to 2026-10-01 (D+1 book exists only if the recorder
 runs before local midnight); (4) execute the EXEC SPINE R-1..R-9
-(`docs/plans/EXEC_SPINE_2026-09-01.md`) — R-4 publishes the first AccountState
+(`docs/plans/EXEC_SPINE_2026-09-01.md`, REVISED d582462 after peer review; the
+new latch/clearing/B8 material is itself under review) — R-4 publishes the first
+AccountState
 and is what de-inerts every Nautilus cap (`risk/engine.pyx:682-692` returns True
 with no account); (5) forecast ingest (`docs/plans/forecast_ingest_2026-09-01.md`)
 HELD until K1 reports; (6) accumulate ~300 station-days; (7) settle CAPACITY.
@@ -214,7 +217,7 @@ reaction to OUR order and exists in no recording.
 
 ## Pointers
 
-Durable rules `docs/core/LESSONS.md` (L-1..L-5, all binding) · evidence
+Durable rules `docs/core/LESSONS.md` (L-1..L-10, all binding) · evidence
 `docs/evidence/` · plans `docs/plans/` · runbook
 `docs/core/RUNBOOK_NWS_COLLECTION.md` · strategy authoring
 `docs/specs/STRATEGY_QUICKSTART.md` · pre-shrink history `docs/core/archive/`
