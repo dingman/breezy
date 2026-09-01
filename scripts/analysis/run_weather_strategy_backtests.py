@@ -231,8 +231,24 @@ from breezy.strategy.calibration_mean_reversion import (
 )
 from breezy.strategy.forecast_mispricing import ForecastMispricingConfig, ForecastMispricingStrategy
 from breezy.strategy.forecast_revision import ForecastRevisionConfig, ForecastRevisionStrategy
+from breezy.strategy.running_extreme_lock import RunningExtremeLockConfig, RunningExtremeLockStrategy
 from breezy.strategy.weather_common.forecast_source import ForecastSource
 from breezy.strategy.weather_common.models import ForecastSnapshot
+
+#: `RiskLimits.stale_observation_hours` has no shipped default (see
+#: `breezy.strategy.weather_common.risk` and
+#: `breezy.strategy.running_extreme_lock.config`'s module docstring) --
+#: every construction site must supply an explicit value. 12.665h is the
+#: measured, cited bound: 12.3167h is the MAX-over-sites P99 issuance gap
+#: (MIA's OWN P99, not the pooled P99 of 12.52h -- MIA's per-site P99
+#: exceeds the pooled figure, so a pooled bound would spuriously refuse
+#: MIA's slowest ~1% of legitimate days), plus 0.3488h live-receipt P99.
+#: Accepted consequence: the observed MAX gap is 18.80h, so this bound
+#: refuses on rare legitimate days -- a deliberate conservative trade for a
+#: strategy whose premise is a fresh observation. A BUILD-side decision, not
+#: an operator-reserved control (see `docs/evidence/observation_lock_falsification_2026-08-31.md`
+#: section 4).
+STALE_OBSERVATION_HOURS_RUNNING_EXTREME_LOCK: Final[float] = 12.665
 
 DEFAULT_QUOTE_CATALOG_PATH: Final[Path] = Path(
     "/home/jon/.local/share/breezy/catalog/quote_tape/polymarket_us",
@@ -564,14 +580,30 @@ def _restamp_climate_day(record: NwsClimateDay, retrieved_at_ns: int) -> NwsClim
 def _build_strategy(
     kind: str,
     instrument_ids: tuple[InstrumentId, ...],
-    forecast_source: ForecastSource,
+    forecast_source: ForecastSource | None,
     **config_overrides: Any,
 ) -> Strategy:
     """Build one strategy of `kind`. Every field but `instrument_ids` is a
     config default UNLESS explicitly named in `config_overrides` -- see the
     module docstring's "TWO CONDITIONS" section for which run passes which
     overrides and why each one is justified on its own.
+
+    `forecast_source` is `None` for `running_extreme_lock` -- an
+    observation-kind strategy that structurally cannot accept a
+    `ForecastSource` (see `RunningExtremeLockStrategy.__init__`). It is
+    mandatory for the three forecast-driven kinds; a `None` there is a
+    caller bug, not a case to fabricate a forecast for.
     """
+    if kind == "running_extreme_lock":
+        return RunningExtremeLockStrategy(
+            RunningExtremeLockConfig(
+                instrument_ids=instrument_ids,
+                stale_observation_hours=STALE_OBSERVATION_HOURS_RUNNING_EXTREME_LOCK,
+                **config_overrides,
+            ),
+        )
+    if forecast_source is None:
+        raise ValueError(f"strategy kind {kind!r} requires a forecast_source, got None")
     if kind == "calibration_mean_reversion":
         return CalibrationMeanReversionStrategy(
             CalibrationMeanReversionConfig(instrument_ids=instrument_ids, **config_overrides),
@@ -598,7 +630,7 @@ def _run_one(
     tape_instruments: list[TapeInstrument],
     closes: list[InstrumentClose],
     weather_data: list[Any],
-    forecast_source: ForecastSource,
+    forecast_source: ForecastSource | None,
     config_overrides: dict[str, Any],
 ) -> RunResult:
     instruments = [ti.instrument for ti in tape_instruments]
