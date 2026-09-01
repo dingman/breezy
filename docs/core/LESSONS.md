@@ -559,3 +559,54 @@ increment looks too small to need it.**
 to `submit_order` on a venue with **no client-order-id** auto-resubmits and
 silently doubles the position. Fabricating a native hid a real one that is
 actively dangerous. See [[validate-nautilus-before-planning]].
+
+---
+
+## L-11 — Claiming a gap where a native exists is the same defect as claiming a native where none does (2026-09-01)
+
+**Rule.** Every "Nautilus does not provide this" verdict is a null-hypothesis
+claim and carries exactly the same burden of proof as "Nautilus provides this":
+a `file:line` that was actually opened, plus a search that could have found the
+opposite. A FALSE GAP is harder to catch than a false native, because the code
+you then write **works** — nothing fails, no test goes red, and the duplication
+is only visible to someone who goes looking.
+
+**What happened.** `EXEC_SPINE` Revision 1 justified a Breezy-owned durable store
+with *"`CacheConfig(database=None)` is memory-only, so a restart orphans the
+position"* — stated as a property of Nautilus. It is a property of **our
+configuration**. Nautilus persists both natively: `cache/cache.pyx:393-394`
+restores orders and `:1366-1368` rebuilds the venue-order-id index;
+`cache/database.pyx:709-755` replays stored `OrderFilled` events and reconstructs
+the `Position`, so `avg_px_open` is derived from fills and survives byte-exact.
+The store may still be the right call — Redis is the only backend
+(`system/kernel.py:312`, `:324-329` raises otherwise) and we decline that
+dependency — but **"we decline a native" and "no native exists" are different
+statements, and only one of them was true.**
+
+**Why it matters beyond tidiness.** L-10 recorded a fabricated native that caused
+a wrong scope CUT. This is the mirror: a fabricated gap causes a wrong scope
+ADD. Both survive review by sounding like the conclusion of an investigation that
+never happened. The operator caught this one by asking directly, which is not a
+control we can rely on.
+
+**How to apply.** State the verdict in one of exactly three forms, never a fourth:
+`NATIVE CONFIRMED (file:line)` · `NATIVE EXISTS, DECLINED BECAUSE <cost>
+(file:line)` · `GENUINE GAP — verified absent (file:line of the search, plus the
+positive control)`. "Declined" must name what is being given up. A plan that
+reads "no native exists" where the truth is "a native exists and costs a Redis
+dependency" has hidden a decision the reader is entitled to re-make.
+
+**The tooling trap that makes false gaps cheap here.** Grep's *directory
+recursion* under `.venv/` is silently blind — ripgrep honours `.gitignore:1`
+(`.venv/`), so a recursive search of installed Nautilus returns **0 matches with
+no error**. Measured: `rg -l 'Nautech Systems'` under `nautilus_trader/live/` → 0
+files; `--no-ignore` → 15. File-scoped Grep works. **A bare "0 matches" never
+closes a null hypothesis in this repo** — re-run with shell `grep -r` and a
+positive control in the same command, e.g. `expiration_ns` = 0 across `live/`,
+`execution/`, `portfolio/`, `risk/`, `trading/` is meaningful only beside
+`expiration_ns` = 63 in `model/instruments/`.
+
+**Evidence:** `docs/evidence/native_reuse_audit_2026-09-01.md` — five-seam audit
+of every Breezy surface against its nearest native, including the inverse finding
+that Breezy configures **no** native risk caps at all. See [[L-10]],
+[[validate-nautilus-before-planning]], [[native-substitution-is-a-unit-change]].
