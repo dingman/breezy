@@ -372,13 +372,21 @@ not a shared one. **Opened inside `_connect`** (thread affinity, §Goal state).
 defaults to **True** (`live/config.py:183`, verified), and `_reconcile_position_report_netting`
 (`live/execution_engine.py:2466`) flattens a cached position when the venue reports FLAT, via
 `_create_flat_position_report` (`:1022`) and `_create_position_reconciliation_report` (`:2839`).
-But `calculate_reconciliation_price` (`live/reconciliation.py:549`) has no target `avg_px_open`
-for a flat target, so `:2866-2880` falls back to the last cached quote's **bid**, and failing
-that to **`current_avg_px`** — which books the close at the OPEN price and yields
-**`realized_pnl == 0` for every settled trade**. A settled binary is worth 1.00 or 0.00; neither
-fallback is either. This is not hypothetical: it is default configuration, it fires without
-anyone choosing it, and the number it produces is plausible enough to be believed. **R-9's RED
-test 2 lands WITH R-4, not after it.**
+**The mechanism is simpler and WORSE than revision 2 recorded.**
+`calculate_reconciliation_price` (`live/reconciliation.py:549`) does **not** return `None` for a
+long-to-flat target — it returns `avg_px_open` itself. Measured directly:
+`calculate_reconciliation_price(Decimal(10), Decimal("0.30"), Decimal(0), None, instrument)` →
+`Price(0.300)`. So `execution_engine.py:2863 if reconciliation_price is None` is **never
+entered**, and the cached-bid (`:2871`, `:2877`) and `current_avg_px` (`:2880-2881`) fallbacks
+are **unreachable**. The close is booked at the open price by the pricing function itself,
+yielding **`realized_pnl == 0` for every settled trade**. A settled binary is worth 1.00 or
+0.00; the open price is neither.
+**The mitigation previously recorded here — "a single cached quote tick prevents it" — is
+FALSE and is deleted.** Pinned by running the rig with and without a cached quote: both book
+0.30. The hazard is **unconditional** for any Breezy-opened position, fires on default
+configuration, and produces a number plausible enough to be believed. **R-9's RED test 2 lands
+WITH R-4, not after it** — it is now green as a demonstration, with the guard half held at
+`xfail(strict=True)` so R-9 landing forces the marker off.
 
 **RED:** account state published with the right `AccountId` and a USD balance; mass status on an
 empty account returns empty-but-non-`None`; a foreign position with no derivable entry price is
@@ -727,12 +735,14 @@ subscription (`live/data_client.py:676, 1014`); the only component that acts on 
 *does* flatten a cached position when the venue reports FLAT, via `_create_flat_position_report`
 (`:1022`) and `_create_position_reconciliation_report` (`:2839`), with `generate_missing_orders`
 defaulting **True** (`live/config.py:183`). **It will therefore fire on its own once R-4 lands.**
-But `calculate_reconciliation_price` (`live/reconciliation.py:549`) has no target `avg_px_open`
-for a flat target, so `:2866-2880` falls back to **the last cached quote's bid**, and failing that
-to **`current_avg_px`** — which books the close at the open price and yields
-`realized_pnl == 0` for every settled trade. A settled binary is worth 1.00 or 0.00; neither
-fallback is either. This is the sharpest hazard in the whole plan: a plausible, silent, wrong
-number produced by *default configuration*. R-9 must pre-empt it, not inherit it.
+But `calculate_reconciliation_price` (`live/reconciliation.py:549`) returns **`avg_px_open`
+itself** for a long-to-flat target — measured: `(Decimal(10), Decimal("0.30"), Decimal(0), None,
+instrument)` → `Price(0.300)`. The `is None` branch at `execution_engine.py:2863` is never
+entered and the bid / `current_avg_px` fallbacks are **unreachable**. The close is booked at the
+open price, yielding `realized_pnl == 0` for every settled trade. A settled binary is worth 1.00
+or 0.00; the open price is neither. This is the sharpest hazard in the whole plan: a plausible,
+silent, wrong number produced by *default configuration*, **unconditionally** — no cached quote
+prevents it. R-9 must pre-empt it, not inherit it.
 
 **Native and therefore REUSED (not rebuilt):** the report-injection seam.
 `ExecutionClient._send_order_status_report` (`execution/client.pyx:925`) sends to endpoint
