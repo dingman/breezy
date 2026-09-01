@@ -164,10 +164,12 @@ restart → mass status + fill record reconcile → settlement closes → one re
   native is the specific failure that caused this revision; an unverifiable citation is a
   defect regardless of whether the conclusion is right.
 - **A negative about installed Nautilus is only evidence if the search could have found a
-  positive.** The Grep tool cannot see under `.venv/` (ripgrep honours `.gitignore:1`). Use
-  shell `grep -rn --include='*.py' --include='*.pyx' PATTERN "$NT"`, and in the same command
-  grep a term known to be present, so the descent is proven. A bare "0 matches" with no
-  positive control does not close a null hypothesis.
+  positive.** The Grep tool's **directory recursion** under `.venv/` is blind — ripgrep honours
+  `.gitignore:1` — and returns 0 matches with no error. **Grep on an explicit FILE path works
+  normally**, since the ignore rule applies to traversal, not to a named target. So: for a
+  recursive search use shell `grep -rn --include='*.py' --include='*.pyx' PATTERN "$NT"`, and in
+  the same command grep a term known to be present so the descent is proven. A bare "0 matches"
+  with no positive control does not close a null hypothesis.
 - **Every increment carries a portability tag** (VENUE-SPECIFIC / PORTABLE / MIXED). The tag is
   documentation of a seam, never a licence to add indirection.
 - **Long-only, taker.** `allow_short=False` (`strategy/weather_common/risk.py:139`) never changes.
@@ -365,6 +367,18 @@ ours), and with `database=None` nothing survives. `SqliteStateStore` holds two k
 `exec/polymarket_us/venue_id/<id>` → `ClientOrderId`, and `exec/polymarket_us/fill/<id>` → the
 fill record. The `exec/<venue>/` namespace **is** the seam: a second venue gets its own prefix,
 not a shared one. **Opened inside `_connect`** (thread affinity, §Goal state).
+
+**LANDMINE — R-4 ARMS A SILENT WRONG NUMBER THE DAY IT LANDS.** `generate_missing_orders`
+defaults to **True** (`live/config.py:183`, verified), and `_reconcile_position_report_netting`
+(`live/execution_engine.py:2466`) flattens a cached position when the venue reports FLAT, via
+`_create_flat_position_report` (`:1022`) and `_create_position_reconciliation_report` (`:2839`).
+But `calculate_reconciliation_price` (`live/reconciliation.py:549`) has no target `avg_px_open`
+for a flat target, so `:2866-2880` falls back to the last cached quote's **bid**, and failing
+that to **`current_avg_px`** — which books the close at the OPEN price and yields
+**`realized_pnl == 0` for every settled trade**. A settled binary is worth 1.00 or 0.00; neither
+fallback is either. This is not hypothetical: it is default configuration, it fires without
+anyone choosing it, and the number it produces is plausible enough to be believed. **R-9's RED
+test 2 lands WITH R-4, not after it.**
 
 **RED:** account state published with the right `AccountId` and a USD balance; mass status on an
 empty account returns empty-but-non-`None`; a foreign position with no derivable entry price is
@@ -682,46 +696,181 @@ test at n=2 with two executions at different prices.
 **Done when** the goal-state predicate holds in full, **including clause 5 (OQ-1 closed and
 pinned) and clause 6 (intent retired)**.
 
-### R-9 — Settlement as exit — **RE-PLAN REQUIRED. This increment does not exist.**
+### R-9 — Settlement as exit — **REWRITTEN 2026-09-01. Breezy-owned, not a mapping increment.**
 
-**Revision 1 called this "a mapping increment, not a research one". That was the plan's worst
-error, and it was invisible because R-9 was the ONLY increment carrying no null-hypothesis
-verdict** — the standing rule exists precisely to catch this, and skipping it here hid a hole
-in the goal state for a whole revision.
+#### Null-hypothesis verdict: **REFUTED — no live path, and the nearest native path is a trap**
 
-Verified by the coordinator: `check_instrument_expiration` exists at
-`backtest/engine.pyx:3680,5919,5934` and **NOWHERE else in installed Nautilus** — zero live
-occurrences. `realized_pnl` appears in `src/breezy/` only inside a docstring
-(`runtime/backtest_harness.py:855`). The live data client can subscribe to `InstrumentClose`
-(`live/data_client.py:676,1014`), but no live execution path closes a position when one
-arrives. **A live filled position is never closed by settlement and never produces a
-realized-PnL row.** Settlement-as-exit works in `BacktestEngine` and only there.
+Nautilus 1.231.0 closes an expiring instrument **only in backtest**. `check_instrument_expiration`
+exists at `backtest/engine.pxd:465` and `backtest/engine.pyx:3680, 5919, 5934` and nowhere else in
+the install. Its body (`engine.pyx:5934-5980`) is the whole mechanism: cancel open orders, then
+either `_process_option_expiry` or synthesise a reduce-only `MarketOrder` tagged
+`EXPIRATION_<venue>_CLOSE` filled at `self._settlement_prices[...]`. `settlement_price` appears
+outside `backtest/` in exactly one place — a *comment*, `model/instruments/base.pyx:66`.
+`expiration_ns` / `is_expired` appear **zero times** in `live/`, `execution/`, `portfolio/`,
+`risk/`, `trading/` (coordinator-verified with a positive control: `expiration_ns` = 63 in
+`model/instruments/`, and `instrument` = 261 in `live/execution_engine.py`, so the search
+descended). `BinaryOption` carries `expiration_ns` (`binary_option.pyx:159`) and `outcome`
+(`:80`) and no live consumer reads either. `InstrumentClose` reaches live only as a *data*
+subscription (`live/data_client.py:676, 1014`); the only component that acts on it is
+`BacktestExecutionClient`/`SandboxExecutionClient` (`adapters/sandbox/execution.py:216-217`).
 
-Consequences that must be stated plainly: the goal state's final clause ("a filled position
-produces one realized-PnL row through settlement") is produced by **no increment in this
-plan**, and the estimator that clause feeds is named nowhere. A plan can be increment-correct
-and still never arrive; this one does not arrive.
+**One native live path both prior reviews missed — and it must be pre-empted by name.**
+`LiveExecutionEngine._reconcile_position_report_netting` (`live/execution_engine.py:2466`)
+*does* flatten a cached position when the venue reports FLAT, via `_create_flat_position_report`
+(`:1022`) and `_create_position_reconciliation_report` (`:2839`), with `generate_missing_orders`
+defaulting **True** (`live/config.py:183`). **It will therefore fire on its own once R-4 lands.**
+But `calculate_reconciliation_price` (`live/reconciliation.py:549`) has no target `avg_px_open`
+for a flat target, so `:2866-2880` falls back to **the last cached quote's bid**, and failing that
+to **`current_avg_px`** — which books the close at the open price and yields
+`realized_pnl == 0` for every settled trade. A settled binary is worth 1.00 or 0.00; neither
+fallback is either. This is the sharpest hazard in the whole plan: a plausible, silent, wrong
+number produced by *default configuration*. R-9 must pre-empt it, not inherit it.
 
-**The estimator must be named, and the plan's own n is inconsistent with the repo's.**
-`required_n_to_discriminate` already exists at
-`scripts/analysis/k1_cheap_open_settlement.py:324` and returns **n = 96** via a Wilson interval
-(`POWER_P_ALT=0.03`, `POWER_P_NULL=0.01`, `:165-166`). This plan's "n ~ 300" is a Wald interval
-on returns — the classic badly-covered interval at ~9 expected wins — and the two were never
-reconciled. Wilson is valid only if every trade is at ONE price; at varying prices the
-Bernoulli reduction breaks and a bootstrap is required. Note also that `POWER_P_NULL = 0.01` is
-break-even **before fees**: with theta alone it is 1.06% (n = 107), and with a $0.01 per-order
-floor it is 2% (**n = 753**). The fee floor therefore moves the sample requirement by ~7x, which
-is a programme-level fact, not a detail.
+**Native and therefore REUSED (not rebuilt):** the report-injection seam.
+`ExecutionClient._send_order_status_report` (`execution/client.pyx:925`) sends to endpoint
+`ExecEngine.reconcile_execution_report`, registered by `LiveExecutionEngine` (`:249-253`), public
+at `:1816`, routing an `OrderStatusReport` into `_reconcile_order_report` (`:3038`) →
+`_generate_order` (`:3512`) → `_generate_inferred_fill` (`:3485`) →
+`create_inferred_order_filled_event` (`reconciliation.py:434`), whose `last_px` is taken verbatim
+from `report.avg_px` when the order has no prior fill (`:485-489`). That produces a real
+`OrderFilled` → `Position.apply` → `PositionClosed` carrying `realized_pnl` and `realized_return`
+(`model/events/position.pyx:644`), which `PortfolioAnalyzer.add_positions` already consumes
+(`analysis/analyzer.py:216-218`). **No Nautilus change; no new event type; no new machinery.**
 
-A design for this increment is in flight. Until it lands, **R-9 is not buildable and nothing
-downstream of it may be scheduled.** Settlement truth is still in hand and still venue-portable
-(both venues settle on NWS), so the *economics* carry over — but the mechanism does not exist. Existing settlement tests are protected; none may be weakened.
-Keep the settlement decision keyed on the NWS observation, **never** on a venue resolution
-field: that single choice is what makes the economics survive a swap.
+#### The mechanism
 
-**Done when** a filled position produces one realized-PnL row through settlement and the
-per-trade return feeds the CI estimator. At sigma/mu ~ 8 per trade, roughly **n ~ 300
-station-days** are needed before a lower bound can clear break-even; R-9 starts that clock.
+A new `SettlementExitActor` (`src/breezy/settlement/exit_actor.py`), an `Actor` — not a Strategy:
+it forms no signal. It subscribes `nws_climate_day_data_type()` and, per instrument,
+`subscribe_instrument_close`. It fires only on the **conjunction** of:
+(a) a `NwsClimateDay` for `(settlement_station, climate_day)` with `is_final` and not
+`is_superseded` (`ingest/gaps.py:226-235`), and (b) `clock.timestamp_ns() >= instrument.expiration_ns`.
+The venue's `InstrumentClose` — already parsed and terminal-gated by
+`adapters/polymarket_us/parsing.py:1030-1065`, wired at `data.py:1333` — is a **corroborating
+signal only**; it never supplies the price.
+
+Settlement price = `1.00` if `read_weather_bucket_facts(instrument.info).contains(tmax_f)` else
+`0.00` (`domain/weather_bucket_facts.py:64`). For each `cache.positions_open(instrument_id=…)`, the
+actor builds an `OrderStatusReport` — SELL, MARKET, `OrderStatus.FILLED`, `reduce_only=True`,
+`quantity = filled_qty = position.quantity`, `avg_px =` settlement price,
+`client_order_id = SETTLE-<instrument_id>-<climate_day>` (deterministic) — and hands it to the exec
+client's `_send_order_status_report`. **Thread:** the actor's data handlers and the exec-engine
+endpoint are both on the kernel event loop, so no cross-thread hop is needed and the R-4/R-7
+`SqliteStateStore` affinity rule (`runtime/sqlite_store.py:120,128-135`) holds unchanged.
+
+**Attribution trap.** `_generate_order` assigns `StrategyId("EXTERNAL")` unless
+`get_external_order_claim(instrument_id)` matches (`:3552-3568`). Under netting OMS an EXTERNAL
+fill forms `<instrument>-EXTERNAL` and never closes the Breezy position. So the settlement-owning
+strategy must set `external_order_claims` (`trading/config.py:91`). **Consequence that changes
+R-6:** on a claimed instrument `tags` is **`None`**, not `["RECONCILIATION"]`, so R-6's guard
+exemption must key on the deterministic settlement `ClientOrderId`, **not** on the RECONCILIATION
+tag, or every settlement leg is refused. Second consequence: claiming disables
+`filter_unclaimed_external_orders` for that instrument, so a genuinely foreign venue order would be
+adopted into a Breezy position; the admission guard is Breezy-owned, keyed on R-4's durable
+venue-id map.
+
+*Rejected alternative:* `Strategy.close_position()` — routes a real `SubmitOrder` into the N2
+egress surface for an order that must never be sent, and the settled book is empty anyway (median
+top-of-book bid 0.3 contracts). *Rejected alternative:* leaving the fill on EXTERNAL and computing
+the return outside Nautilus — leaves `realized_pnl` permanently `None` and `PositionClosed` never
+emitted, i.e. exactly the defect R-9 exists to fix.
+
+#### Ownership split and the disagreement rule
+
+- **NWS owns the OUTCOME.** The booked settlement price is keyed on the final/corrected CLI integer
+  `tmax_f`, never on a venue resolution field. This is what survives a Kalshi swap.
+- **The venue owns the CASH and the FEES.** `ACTIVITY_TYPE_POSITION_RESOLUTION` →
+  `PositionResolution{beforePosition, afterPosition, tradeId}` (`types/portfolio.py:67-73`) via
+  `GET /v1/portfolio/activities`. **Correction:** `realizedPnl`/`costBasis` are on `Trade`
+  (`:53-65`), *not* on `PositionResolution`; the resolution cash is `afterPosition.realized` /
+  `cashValue` on `UserPosition` (`:22-33`), which also carries `expired: bool`. All are
+  `Amount{value: str}` — parse with `Decimal`, per R-3's rule.
+- **Disagreement rule.** They *will* diverge when the venue resolves off a preliminary CLI that NWS
+  later corrects. Neither side overwrites the other. The NWS-keyed price is booked into Nautilus;
+  the venue cash is written to a `SettlementReconciliation` record alongside it. On divergence
+  beyond one cent the trade is **flagged and excluded from the edge-estimation sample** (marked,
+  never deleted) while remaining in the cash ledger at the venue's number — its return is a draw
+  from neither distribution, so including it biases and dropping it silently fabricates. The
+  divergence *rate* is itself reported: it is the single most decision-relevant venue-portability
+  statistic, and a rate above a Breezy-owned threshold halts new position taking via the existing
+  `PositionTakingDisposition.HALT_NEW_POSITIONS_HOLD_OPEN_TO_SETTLEMENT`
+  (`settlement/programme.py:55`).
+
+#### Per-trade return and the NAMED estimator
+
+`Position.realized_return` (`model/position.pyx:916,951` → `_calculate_return`, `:1005`) is a
+**gross price return**: commissions are applied to `realized_pnl` and to
+`PositionAdjusted{COMMISSION}` (`:600-612`) but *not* to `realized_return`. Do **not** feed it.
+
+**Definition:** `r_i = realized_pnl_i / (avg_px_open_i * qty_i * multiplier)` — net, from the
+`PositionClosed` event, with `realized_pnl` carrying the **measured** fee. Fees enter through
+`ExecutionClient.calculate_commission` (`execution/client.pyx:165-194`; base returns `None` →
+`Money(0)`), which R-9 overrides to return the venue's own
+`Execution.commissionNotionalCollected` (`types/orders.py:108`), reconciled against
+`Order.commissionNotionalTotalCollected` / `commissionsBasisPoints` (`:90-91`). The modelled
+`theta*qty*p*(1-p)` in `adapters/polymarket_us/fees.py` stays a *backtest* model and is BANNED from
+the live realized path: at theta=0.06, 1 contract @ 0.01 it banker's-rounds to **$0.00**. The
+settlement leg itself is booked at zero commission (it is not a trade) — asserted, not assumed,
+against the resolution activity.
+
+**Estimator: BCa bootstrap, one-sided 95% lower bound on the ROI ratio `sum(pnl_i) / sum(cost_i)`**,
+paired resampling over trades. Not Wald: `r_i` is a two-point mass (`-1` vs `(1-p_i)/p_i` net) with
+the mass at the loss point rare and large, so a t/Wald left tail is anticonservative exactly where
+the decision is made. Not Wilson either — Wilson is valid only under a Bernoulli reduction, which
+holds only within a fixed-price cohort; **`k1_cheap_open_settlement.required_n_to_discriminate:324`
+stays the right tool for the settle-*rate* question and is NOT the ROI estimator.** Report both:
+the bootstrap bound on ROI (primary, the gate) and the Wilson bound on the price-banded hit rate
+(diagnostic, powered, already implemented). **The plan's `n ~ 300` is DELETED:** it is a Wald
+artefact of `(1.96*sigma/mu)^2 ~ 246`; the honest required-n is a function of the realised price
+mix and must be produced by a seeded simulation shipped with R-9, mirroring
+`required_n_to_discriminate`'s role, not asserted at plan time.
+
+#### RED tests (each with what it defeats)
+
+1. `test_no_native_live_expiry_path_exists` — scan the *installed* Nautilus: `expiration_ns` and
+   `check_instrument_expiration` occur zero times under `live/`, `execution/`, `portfolio/`.
+   *Non-vacuity:* the same scan must find `expiration_ns` in `model/instruments/binary_option.pyx`
+   and must FAIL on an empty or mis-rooted search path. Defeats a silent upgrade that adds a native
+   path we then duplicate, AND a scan that passes because it searched nothing (the `.venv` Grep
+   defect, mechanised).
+2. `test_reconciliation_fallback_price_is_never_booked` — drive `_reconcile_position_report_netting`
+   with a FLAT venue report and a stale quote; assert Breezy books 1.00/0.00, never the bid and
+   never `avg_px_open`. *Non-vacuity:* the unguarded path must be shown to produce
+   `realized_pnl == 0`. **Lands WITH R-4, not after it.**
+3. `test_settlement_price_is_keyed_on_nws_not_the_venue` — venue `InstrumentClose` says 0.00, final
+   CLI `tmax_f` lands in the bucket; assert booked 1.00 plus a divergence record. *Non-vacuity:* an
+   agreeing case must still book, so the test cannot pass by refusing everything.
+4. `test_preliminary_or_superseded_cli_never_settles`.
+5. `test_one_position_closed_event_with_realized_pnl` — the goal-state predicate.
+6. `test_settlement_exit_is_idempotent` — replayed `InstrumentClose` + restart produce exactly one
+   close (deterministic `ClientOrderId` + durable `exec/<venue>/settled/<key>`).
+7. `test_settlement_leg_survives_the_long_only_guard_without_a_reconciliation_tag` — pins that
+   claimed orders carry `tags=None`. Defeats R-6's tag-keyed exemption.
+8. `test_claimed_instrument_rejects_a_foreign_venue_order`.
+9. `test_return_is_net_of_the_measured_venue_commission` — a venue commission of $0.0006 must move
+   the number; substituting the modelled fee (which rounds to $0.00) must fail the test.
+10. `test_roi_lower_bound_is_bca_bootstrap_pinned_on_a_seed` + `test_wald_interval_is_refused`.
+
+#### Done when
+
+A live filled position, on the final CLI print for its climate day, closes at an NWS-keyed
+1.00/0.00; exactly one `PositionClosed` carries a `realized_pnl` net of the **venue-reported**
+commission; a `SettlementReconciliation` row pairs it with `PositionResolution` cash and records
+agreement or divergence; `r_i` lands in a durable per-trade ledger; the BCa estimator returns a
+seeded, pinned lower bound on a fixture sample; all ten RED tests green under
+`scripts/ci/run_tests_no_egress.sh`; no existing settlement test weakened.
+
+#### What blocks R-9
+
+**Hard.** `src/breezy/adapters/polymarket_us/exec/` is **empty** — there is no live execution client
+at all, so no `_send_order_status_report` seam and no `calculate_commission` override exists to
+write. R-9 requires **R-3** (report mappers), **R-4** (reconciling client + durable store +
+venue-id map, which the foreign-order guard keys on), **R-6** (whose guard exemption R-9 *changes*),
+**R-7** (a fill path) and **R-8** (a real fill to settle). **Soft:** `activities` must be observed
+once to confirm `POSITION_RESOLUTION` is emitted for a held market and whether the resolution leg
+carries a commission — a new **OQ-9**, closable only by a real order, blocking *done*, not *build*.
+
+**Buildable TODAY, against installed Nautilus and fixtures: tests 1, 2 and 10.** Test 2 should land
+early — it is the only defence against R-4 shipping a silent zero the day it lands.
 
 ---
 
