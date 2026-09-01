@@ -34,18 +34,26 @@ from nautilus_trader.test_kit.stubs.component import TestComponentStubs
 
 from breezy.adapters.polymarket_us.config import PolymarketUSDataClientConfig
 from breezy.adapters.polymarket_us.data import PolymarketUSDataClient, build_data_client
+from breezy.adapters.polymarket_us.websocket import SilentSubscriptionWarning
 from tests.unit.test_polymarket_us_data import SLUG, make_instrument
 
 CLIENT_NAME = "POLYMARKET_US"
 
 
 class ControllableFeed:
-    """A markets feed whose connected/degraded state the test drives directly."""
+    """A markets feed whose connected/degraded state the test drives directly.
+
+    Models the REAL split the socket exposes: ``is_degraded`` is the union
+    ("not fully healthy"), ``is_fatally_degraded`` the narrow subset the
+    process may be stopped over. A double that collapsed the two would
+    validate exactly the confusion this suite now pins.
+    """
 
     def __init__(self, handler: Any) -> None:
         self.handler = handler
         self._connected = False
-        self._degraded = False
+        self._fatally_degraded = False
+        self._silent: list[SilentSubscriptionWarning] = []
         self._subscriptions: dict[str, str] = {}
 
     @property
@@ -54,7 +62,15 @@ class ControllableFeed:
 
     @property
     def is_degraded(self) -> bool:
-        return self._degraded
+        return self._fatally_degraded or bool(self._silent)
+
+    @property
+    def is_fatally_degraded(self) -> bool:
+        return self._fatally_degraded
+
+    @property
+    def silent_subscriptions(self) -> tuple[SilentSubscriptionWarning, ...]:
+        return tuple(self._silent)
 
     @property
     def subscriptions(self) -> Mapping[str, str]:
@@ -84,8 +100,30 @@ class ControllableFeed:
         self._connected = True
 
     def give_up(self) -> None:
+        """Alias for the original fatal producer: reconnection abandoned."""
+        self.exhaust_reconnects()
+
+    def exhaust_reconnects(self) -> None:
+        """FATAL producer 1: the supervisor spent its retry budget and gave up."""
         self._connected = False
-        self._degraded = True
+        self._fatally_degraded = True
+
+    def supervisor_died(self) -> None:
+        """FATAL producer 2: the supervisor raised, so nothing reconnects now.
+
+        The socket can still LOOK connected here -- that is precisely why this
+        producer was invisible before it set a flag of its own.
+        """
+        self._fatally_degraded = True
+
+    def go_silent(self, slug: str, after_secs: float = 60.0) -> None:
+        """NON-FATAL producer 3: one subscribed slug produced no inbound frame.
+
+        The socket is alive and every other slug keeps flowing. At 05:00Z
+        roughly 60 thin overnight weather markets are subscribed, so this is
+        an EXPECTED, recurring observation -- never a reason to end the run.
+        """
+        self._silent.append(SilentSubscriptionWarning(slug=slug, subscribed_after_secs=after_secs))
 
 
 class FakeProvider(InstrumentProvider):
@@ -232,13 +270,16 @@ def test_an_open_gap_is_visible_before_the_feed_returns(loop: asyncio.AbstractEv
     assert client.is_tape_gap_open is False
 
 
-def test_entering_safe_mode_stops_the_watchdog_and_marks_the_client_disconnected(
+def test_entering_safe_mode_marks_the_client_disconnected_at_once(
     loop: asyncio.AbstractEventLoop,
 ) -> None:
     """Fail closed: once the socket gives up, no quotes are coming.
 
-    `sample_feed_health` returns False to tell the watchdog loop to stop, so a
-    dead feed does not keep a task alive polling forever.
+    Safe mode and the disconnect are immediate, on the FIRST fatal sample.
+    The watchdog deliberately does NOT stop there -- `shutdown_system` only
+    publishes a command the kernel may drop, and this loop is the only thing
+    left that could ask again. It stops once the request budget is spent
+    (`test_the_watchdog_keeps_re_checking_until_its_request_budget_is_spent`).
     """
     client, feed = build_client(loop)
     feed.restore()
@@ -247,9 +288,11 @@ def test_entering_safe_mode_stops_the_watchdog_and_marks_the_client_disconnected
     feed.give_up()
     keep_going = client.sample_feed_health()
 
-    assert keep_going is False
     assert client.is_safe_mode is True
     assert client.is_connected is False
+    assert keep_going is True, (
+        "the only re-checker must not end while the shutdown is unconfirmed"
+    )
 
 
 def test_a_gap_that_ends_in_safe_mode_is_still_counted(loop: asyncio.AbstractEventLoop) -> None:

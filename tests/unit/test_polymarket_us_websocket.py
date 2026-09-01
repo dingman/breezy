@@ -97,6 +97,7 @@ def _make_ws(
     signer: Ed25519RequestSigner | None,
     handler: Callable[[bytes], None] | None = None,
     request_ids: Iterable[str] = ("req-1", "req-2", "req-3", "req-4"),
+    logger: Any = None,
     **overrides: Any,
 ) -> PolymarketUSMarketsWebSocket:
     ids = iter(request_ids)
@@ -115,7 +116,7 @@ def _make_ws(
         loop=asyncio.get_running_loop(),
         heartbeat_secs=10,
         idle_timeout_secs=60,
-        logger=Logger("test-polymarket-us-ws"),
+        logger=logger if logger is not None else Logger("test-polymarket-us-ws"),
         request_id_factory=lambda: next(ids),
         **settings,
     )
@@ -442,6 +443,10 @@ async def test_reconnect_attempts_are_bounded_and_end_in_a_degraded_client() -> 
         # 1 initial handshake + (1 reconnect attempt + 2 retries) = 4 accepts.
         assert server.connection_attempts == 4
         assert ws.is_connected is False
+        assert ws.is_fatally_degraded is True, (
+            "abandoned reconnection is the FATAL class: nothing here reconnects "
+            "this socket again, so the run must end"
+        )
 
 
 @pytest.mark.allow_socket
@@ -872,21 +877,26 @@ async def test_one_shard_degrading_does_not_orphan_another_shards_subscriptions(
 # --------------------------------------------------------------------------
 # DEFECT 1 [CRITICAL] -- a detected silent subscription must reach a signal
 # an automated consumer actually polls. `PolymarketUSDataClient.sample_feed_health`
-# (data.py :1285-1319) polls ONLY `self._feed.is_degraded` on a fixed cadence
-# and fails closed (safe mode, disconnect) the moment it is True. Before this
-# fix, `silent_subscriptions`/`subscription_errors` were populated but never
-# read anywhere outside this module and its tests -- `is_connected` stayed
-# True and `is_degraded` stayed False forever, so a silently-truncated feed
-# looked identical to a healthy one to every automated consumer.
+# polls the feed on a fixed cadence. Before that fix,
+# `silent_subscriptions`/`subscription_errors` were populated but never read
+# anywhere outside this module and its tests -- `is_connected` stayed True and
+# `is_degraded` stayed False forever, so a silently-truncated feed looked
+# identical to a healthy one to every automated consumer.
+#
+# It must be visible WITHOUT being fatal. A silent slug leaves the socket up
+# and every other slug on it still flowing, so it belongs to `is_degraded`
+# (the union: "not fully healthy") and NEVER to `is_fatally_degraded` (the
+# narrow subset the process may be stopped over). Conflating the two would end
+# an eight-hour unattended capture on its first quiet overnight market.
 # --------------------------------------------------------------------------
 
 
 @pytest.mark.allow_socket
 @pytest.mark.asyncio
-async def test_a_confirmed_silent_subscription_sets_is_degraded() -> None:
+async def test_a_confirmed_silent_subscription_is_degraded_but_never_fatal() -> None:
     """A slug that outlives the confirmation window with no inbound frame must
-    flip `is_degraded`, the one property `sample_feed_health` polls -- not
-    just populate `silent_subscriptions`, which nothing in production reads.
+    flip `is_degraded` -- and must NOT flip `is_fatally_degraded`, the only
+    signal the data client is allowed to end the process over.
     """
     slugs = _weather_slugs(MAX_SUBSCRIPTIONS_PER_CONNECTION + 1)
     async with LoopbackWebSocketServer() as server:
@@ -910,6 +920,11 @@ async def test_a_confirmed_silent_subscription_sets_is_degraded() -> None:
                 await server.push_text(json.dumps({"marketSlug": slug}))
 
             await _wait_until(lambda: ws.is_degraded is True, timeout=5.0)
+            assert ws.is_fatally_degraded is False, (
+                "the socket is alive and the other slugs are flowing -- a silent "
+                "subscription must never be the fatal class"
+            )
+            assert ws.is_connected is True
         finally:
             await ws.close()
 
@@ -918,10 +933,11 @@ async def test_a_confirmed_silent_subscription_sets_is_degraded() -> None:
 
 @pytest.mark.allow_socket
 @pytest.mark.asyncio
-async def test_pool_is_degraded_when_any_shard_has_a_silent_subscription() -> None:
-    """The pool aggregates `is_degraded` from its shards (`any(...)`); a
-    silent subscription on ONE shard must therefore degrade the whole pool,
-    exactly like a shard's reconnect abandonment already does.
+async def test_pool_is_degraded_but_not_fatally_by_a_silent_subscription() -> None:
+    """The pool aggregates BOTH signals from its shards (`any(...)`), so a
+    silent subscription on one shard must show up in the pool's `is_degraded`
+    and stay out of its `is_fatally_degraded` -- unlike reconnect abandonment,
+    which is fatal at the shard and therefore fatal at the pool.
     """
     slugs = _weather_slugs(MAX_SUBSCRIPTIONS_PER_CONNECTION + 1)
     async with LoopbackWebSocketServer() as server:
@@ -938,6 +954,9 @@ async def test_pool_is_degraded_when_any_shard_has_a_silent_subscription() -> No
                 await server.push_text(json.dumps({"marketSlug": slug}))
 
             await _wait_until(lambda: pool.is_degraded is True, timeout=5.0)
+            assert pool.is_fatally_degraded is False, (
+                "one quiet slug on one shard must not declare the whole feed dead"
+            )
         finally:
             await pool.close()
 
@@ -1120,6 +1139,11 @@ async def test_pool_close_closes_every_shard_even_when_one_raises() -> None:
 #: used nowhere else, and never a real credential.
 _CLOSE_ERROR_SENTINEL = "X-PM-Signature: c2VudGluZWwtZG8tbm90LWxvZy1tZUFBQUE9PQ=="
 
+#: The same idea for the supervisor's own crash handler: exception TEXT is
+#: venue-controlled and must never be logged, even while the traceback FRAMES
+#: around it must be.
+_SUPERVISOR_ERROR_SENTINEL = "X-PM-Signature: c3VwZXJ2aXNvci1zZW50aW5lbC1BQUFB"
+
 
 class _RecordingPoolLogger:
     """Captures what the pool logged.
@@ -1212,3 +1236,48 @@ async def test_a_supervisor_that_dies_unexpectedly_is_reported_as_degraded() -> 
     await ws._supervise()
 
     assert ws.is_degraded is True, "an unexpected supervisor death must fail closed"
+    assert ws.is_fatally_degraded is True, (
+        "nothing reconnects this socket after its supervisor dies -- the run must end"
+    )
+
+
+@pytest.mark.asyncio
+async def test_a_dead_supervisor_records_where_it_died_without_venue_text() -> None:
+    """An unattended run's whole purpose is post-hoc analysis.
+
+    ``type(exc).__name__`` alone leaves an `AttributeError` at 06:00Z with no
+    file, no line and no expression -- the forensic record is destroyed at the
+    moment it is most needed. The venue-controlled-text rule (module docstring,
+    "Note on transport exception text") forbids ``str(exc)``, but a traceback's
+    FRAMES are not venue-authored: they are file/line/function/source read from
+    the local tree. So the frames are logged and the message never is.
+    """
+    recorder = _RecordingPoolLogger()
+    signer, _ = _new_signer()
+    ws = _make_ws(ws_url="wss://api.example.invalid", signer=signer, logger=recorder)
+
+    class ExplodingClient:
+        def is_reconnecting(self) -> bool:
+            raise RuntimeError(_SUPERVISOR_ERROR_SENTINEL)
+
+        def is_closed(self) -> bool:  # pragma: no cover - never reached
+            return True
+
+    ws._client = ExplodingClient()  # type: ignore[assignment]
+
+    await ws._supervise()
+
+    logged = "\n".join(recorder.messages)
+    assert "RuntimeError" in logged, f"the exception type must be named: {logged!r}"
+    assert _SUPERVISOR_ERROR_SENTINEL not in logged, (
+        f"venue-controlled exception text reached a log record: {logged!r}"
+    )
+    assert "test_polymarket_us_websocket.py" in logged, (
+        f"the raising FILE must be recoverable from the log: {logged!r}"
+    )
+    assert "is_reconnecting" in logged, (
+        f"the raising FUNCTION must be recoverable from the log: {logged!r}"
+    )
+    assert "websocket.py" in logged, (
+        f"the supervisor frame must be recoverable from the log: {logged!r}"
+    )

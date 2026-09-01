@@ -47,6 +47,7 @@ from breezy.adapters.polymarket_us.tape_records import (
     VenueClockOffset,
     VenueSettlementSnapshot,
 )
+from breezy.adapters.polymarket_us.websocket import SilentSubscriptionWarning
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 RAW = REPO_ROOT / "docs" / "evidence" / "venue" / "polymarket_us" / "raw"
@@ -69,7 +70,8 @@ class Feed:
     def __init__(self, handler: Any) -> None:
         self.handler = handler
         self._connected = False
-        self._degraded = False
+        self._fatally_degraded = False
+        self._silent: list[SilentSubscriptionWarning] = []
         self._subs: dict[str, str] = {}
 
     @property
@@ -78,7 +80,17 @@ class Feed:
 
     @property
     def is_degraded(self) -> bool:
-        return self._degraded
+        return self._fatally_degraded or bool(self._silent)
+
+    @property
+    def is_fatally_degraded(self) -> bool:
+        """Only the UNRECOVERABLE class -- what the client may stop the run over."""
+        return self._fatally_degraded
+
+    @property
+    def silent_subscriptions(self) -> tuple[SilentSubscriptionWarning, ...]:
+        """Subscribed slugs with no inbound frame yet. Reported, never fatal."""
+        return tuple(self._silent)
 
     @property
     def subscriptions(self) -> Mapping[str, str]:

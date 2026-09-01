@@ -107,6 +107,7 @@ __all__ = [
     "CLOCK_OFFSET_SOURCE",
     "DISCOVERY_RELOAD_CEILING_SECS",
     "DISCOVERY_RELOAD_FLOOR_SECS",
+    "FATAL_SHUTDOWN_REQUEST_BUDGET",
     "MARKET_SLUG_KEY",
     "MISSING_ROUTING_KEY_WARN_EVERY",
     "POLYMARKET_US_VENUE",
@@ -116,6 +117,7 @@ __all__ = [
     "PolymarketUSDataClient",
     "QuoteTickParser",
     "ReloadDelay",
+    "SilentSubscription",
     "SubscriptionChangePlan",
     "build_data_client",
     "derive_client_id",
@@ -162,6 +164,29 @@ MISSING_ROUTING_KEY_WARN_EVERY: Final[int] = 100
 
 #: How often the safe-mode watchdog samples the socket's degraded flag.
 DEFAULT_FEED_WATCH_INTERVAL_SECS: Final[float] = 5.0
+
+#: Topic ``Component.shutdown_system`` publishes on
+#: (``common/component.pyx:2182``). Duplicated here for ONE purpose -- a
+#: diagnostic that says out loud when nothing is listening, i.e. when the
+#: shutdown this client just requested cannot possibly be acted on. Never used
+#: to publish: authoring a shutdown command by hand is exactly the
+#: reimplementation the native call exists to avoid.
+SHUTDOWN_COMMAND_TOPIC: Final[str] = "commands.system.shutdown"
+
+#: How many times ONE unrecoverable feed fault may (re-)issue the native
+#: ``ShutdownSystem`` command before the watchdog stops re-checking.
+#:
+#: More than one, because ``Component.shutdown_system`` only PUBLISHES:
+#: ``NautilusKernel._on_shutdown_system`` (``system/kernel.py:613-628``) drops
+#: the command on a ``trader_id`` mismatch (warning), when ``not _is_running``
+#: (warning) and when ``_is_stopping`` (silently) -- and tells the publisher
+#: none of that. A one-shot request that was dropped would get no second
+#: chance from anywhere, leaving the node running forever on a dead feed: the
+#: exact failure the fail-closed path exists to eliminate, one layer up.
+#:
+#: Small and BOUNDED, because a dead feed is sampled every few seconds for
+#: hours and must never become an unbounded command stream at the kernel.
+FATAL_SHUTDOWN_REQUEST_BUDGET: Final[int] = 3
 
 #: How long the missing-instrument alert waits for the data engine to drain
 #: its queue before it reports an instrument as absent from the cache (BL-22).
@@ -348,6 +373,23 @@ def subscription_changes_after_discovery(
     )
 
 
+class SilentSubscription(Protocol):
+    """One slug the feed accepted but has never produced a frame for.
+
+    Structurally satisfied by
+    :class:`~breezy.adapters.polymarket_us.websocket.SilentSubscriptionWarning`.
+    Declared structurally, like :class:`MarketsFeed` itself, so the data-client
+    layer can REPORT an unconfirmed subscription without importing the
+    transport module.
+    """
+
+    @property
+    def slug(self) -> str: ...
+
+    @property
+    def subscribed_after_secs(self) -> float: ...
+
+
 @runtime_checkable
 class MarketsFeed(Protocol):
     """The markets-socket surface this client depends on.
@@ -362,7 +404,30 @@ class MarketsFeed(Protocol):
     def is_connected(self) -> bool: ...
 
     @property
-    def is_degraded(self) -> bool: ...
+    def is_degraded(self) -> bool:
+        """True when the feed is not FULLY healthy: fatal and non-fatal faults.
+
+        Reporting only. Never a stop condition: it is also raised by a single
+        unconfirmed subscription on an otherwise live socket.
+        """
+        ...
+
+    @property
+    def is_fatally_degraded(self) -> bool:
+        """The feed is gone and nothing in the process recovers it.
+
+        The ONLY signal this client may end the run over; see
+        :meth:`PolymarketUSDataClient.sample_feed_health`.
+        """
+        ...
+
+    @property
+    def silent_subscriptions(self) -> Sequence[SilentSubscription]:
+        """Slugs the venue accepted but has never delivered a frame for.
+
+        Loud (reported at ERROR, once per slug) and deliberately not fatal.
+        """
+        ...
 
     @property
     def subscriptions(self) -> Mapping[str, str]: ...
@@ -579,10 +644,15 @@ class PolymarketUSDataClient(LiveMarketDataClient):
         self._feed_watchdog: asyncio.Task[None] | None = None
         self._update_instruments_task: asyncio.Task[None] | None = None
         self._safe_mode: bool = False
-        # Guards the ONE-SHOT native shutdown request in `sample_feed_health`.
-        # That method is public and callable on a cadence, so without this a
-        # dead feed would spray `ShutdownSystem` commands at the kernel.
-        self._fatal_shutdown_requested: bool = False
+        # Bounds the native shutdown request in `sample_feed_health`. That
+        # method is public and callable on a cadence, so without a ceiling a
+        # dead feed would spray `ShutdownSystem` commands at the kernel -- and
+        # with a ceiling of ONE, a command the kernel dropped would never be
+        # re-issued (see `FATAL_SHUTDOWN_REQUEST_BUDGET`).
+        self._fatal_shutdown_requests: int = 0
+        # Slugs already reported as silent. Reported once per SLUG, never once
+        # per sample: the watchdog samples every few seconds for eight hours.
+        self._silent_subscription_slugs: set[str] = set()
         # The owning node's NATIVE `instance_id`, threaded via config because
         # neither `MessageBus` nor `LiveDataClientFactory.create` exposes it
         # (see `PolymarketUSDataClientConfig.recorder_instance_id`). Falls back
@@ -615,6 +685,19 @@ class PolymarketUSDataClient(LiveMarketDataClient):
     def is_safe_mode(self) -> bool:
         """True once the markets feed was lost and will not come back."""
         return self._safe_mode
+
+    @property
+    def silent_subscription_alerts(self) -> int:
+        """Distinct slugs the feed accepted but never delivered a frame for.
+
+        Counted, and logged at ERROR once each, because the quotes for those
+        slugs are being lost and this venue's weather markets cannot be
+        backfilled. Deliberately NOT a stop condition: the socket is alive and
+        every other slug is still recording (see
+        :attr:`~breezy.adapters.polymarket_us.websocket.PolymarketUSMarketsWebSocket.is_degraded`).
+        Alert on it; investigate it; never end the capture over it.
+        """
+        return len(self._silent_subscription_slugs)
 
     @property
     def dropped_frames(self) -> int:
@@ -1391,9 +1474,21 @@ class PolymarketUSDataClient(LiveMarketDataClient):
         only record that the archive has a hole in it. See :attr:`tape_gaps`
         for why the count is explicitly a lower bound.
 
-        **Fail closed.** When the socket reports ``is_degraded`` its supervisor
-        has stopped retrying: no further quotes are coming. The client marks
-        itself disconnected rather than presenting a frozen book as live.
+        **Report the unconfirmed subscriptions.** A slug the venue accepted
+        and never delivered is real, unbackfillable loss for that slug, and it
+        is reported at ERROR, once each. It is NOT a stop condition -- the
+        socket is alive and the rest of the ladder is still recording.
+
+        **Fail closed on the FATAL class only.** When the socket reports
+        ``is_fatally_degraded`` its supervisor has stopped retrying, or died:
+        no further quotes of any kind are coming and nothing in the process
+        recovers. The client marks itself disconnected rather than presenting
+        a frozen book as live, and asks the node to stop.
+
+        Polling ``is_degraded`` here instead would conflate the two: that flag
+        is the UNION and is also raised by a single silent subscription, so at
+        05:00Z the first of ~60 thin overnight weather markets to go quiet for
+        60s would have ended the whole eight-hour capture in its first minute.
         """
         connected = self._feed.is_connected
         previous = self._feed_was_connected
@@ -1407,7 +1502,9 @@ class PolymarketUSDataClient(LiveMarketDataClient):
         elif previous is False and connected:
             self._close_tape_gap(now_ns)
 
-        if not self._feed.is_degraded:
+        self._report_new_silent_subscriptions()
+
+        if not self._feed.is_fatally_degraded:
             return True
 
         self._safe_mode = True
@@ -1418,15 +1515,33 @@ class PolymarketUSDataClient(LiveMarketDataClient):
             f"{self._tape_gap_seconds_total:.1f}s of quotes lost so far -- "
             "this final gap remains OPEN and its quotes are unrecoverable"
         )
-        self._log.error(
-            f"{reason}. Entering safe mode (client marked disconnected, no "
-            "further quotes) and shutting the node down.",
-        )
-        self._request_fatal_shutdown(reason)
-        return False
+        return self._request_fatal_shutdown(reason)
 
-    def _request_fatal_shutdown(self, reason: str) -> None:
-        """Stop the whole process, cleanly, and make the exit status say so.
+    def _report_new_silent_subscriptions(self) -> None:
+        """Log every newly unconfirmed slug once, at ERROR, and keep recording.
+
+        The escalation decision lives here rather than in the transport that
+        detects it: the socket knows one slug is quiet, only the client knows
+        that ending the run over it would discard everything the other slugs
+        are still delivering.
+        """
+        for warning in self._feed.silent_subscriptions:
+            if warning.slug in self._silent_subscription_slugs:
+                continue
+            self._silent_subscription_slugs.add(warning.slug)
+            self._log.error(
+                f"Polymarket.us subscription {warning.slug!r} produced NO inbound frame "
+                f"within {warning.subscribed_after_secs:.1f}s of being subscribed: treat "
+                "it as UNCONFIRMED, never as a quiet market. Its quotes are being lost "
+                "and this venue's weather markets cannot be backfilled. "
+                f"{len(self._silent_subscription_slugs)} of "
+                f"{len(self._feed.subscriptions)} subscription(s) are now unconfirmed. "
+                "NOT fatal: the socket is alive and the rest keep recording.",
+                LogColor.RED,
+            )
+
+    def _request_fatal_shutdown(self, reason: str) -> bool:
+        """Ask the node to stop, cleanly. True while it is worth asking again.
 
         Before this, losing the feed ended the socket's supervisor coroutine
         and nothing else: the node kept running, subscribed to nothing,
@@ -1454,12 +1569,58 @@ class PolymarketUSDataClient(LiveMarketDataClient):
         an operator SIGTERM are indistinguishable to the caller. The latch in
         :mod:`breezy.adapters.polymarket_us.feed_fault` carries that one bit
         out to the CLI, which turns it into a non-zero exit code.
+
+        **The request is NOT one-shot, because delivery is not confirmable.**
+        ``shutdown_system`` publishes and returns; ``_on_shutdown_system``
+        drops the command outright when the kernel is not running or is
+        already stopping, and the publisher is told nothing either way. So the
+        return value keeps the CALLER (``_watch_feed``, the only thing left
+        that could ask again) alive across that window, and the request is
+        re-issued up to :data:`FATAL_SHUTDOWN_REQUEST_BUDGET` times. When the
+        command IS honoured, the kernel stops this client, ``_disconnect``
+        cancels the watchdog, and the loop ends without ever spending the rest
+        of the budget -- that cancellation is the only confirmation available.
         """
-        if self._fatal_shutdown_requested:
-            return
-        self._fatal_shutdown_requested = True
         record_fatal_feed_fault(str(self.id), reason)
+
+        if self._fatal_shutdown_requests >= FATAL_SHUTDOWN_REQUEST_BUDGET:
+            return False
+
+        if self._fatal_shutdown_requests == 0:
+            self._log.error(
+                f"{reason}. Entering safe mode (client marked disconnected, no "
+                "further quotes) and shutting the node down.",
+            )
+        else:
+            self._log.error(
+                "The node is STILL RUNNING after a fatal feed shutdown was "
+                f"requested (attempt {self._fatal_shutdown_requests + 1} of "
+                f"{FATAL_SHUTDOWN_REQUEST_BUDGET}); re-issuing the native "
+                "ShutdownSystem command.",
+            )
+        if not self._msgbus.has_subscribers(SHUTDOWN_COMMAND_TOPIC):
+            self._log.error(
+                f"NOTHING is subscribed to {SHUTDOWN_COMMAND_TOPIC!r}: this "
+                "shutdown request cannot be acted on by any kernel. The fatal "
+                "fault is latched, so the exit status will still report it if "
+                "this process is stopped by other means.",
+            )
+
+        self._fatal_shutdown_requests += 1
         self.shutdown_system(reason)
+
+        if self._fatal_shutdown_requests >= FATAL_SHUTDOWN_REQUEST_BUDGET:
+            self._log.error(
+                f"That was the LAST of {FATAL_SHUTDOWN_REQUEST_BUDGET} shutdown "
+                "requests this watchdog will make for a dead feed; it now stops "
+                "sampling. If the node is still running after this, nothing "
+                "further will ask it to stop -- but the fault stays latched, so "
+                "the exit status reports it whenever this process does stop. A "
+                "hard exit is deliberately NOT attempted: it would truncate the "
+                "day's Arrow stream and silently discard the whole tape.",
+            )
+            return False
+        return True
 
     def _open_tape_gap(self, now_ns: int) -> None:
         if self._gap_opened_ns is not None:

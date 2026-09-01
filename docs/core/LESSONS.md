@@ -304,3 +304,40 @@ to force consolidation before execution.
   against code or a live run — see [[verify-agent-claims-against-artifact]].
 - If the size gate blocks a write, consolidate; do not raise the budget.
 - The same failure mode applies to any long-lived state doc, not just this one.
+
+## L-6 — Promoting a shared flag to a kill switch inherits every producer (2026-09-01)
+
+**What happened.** `79b9b44` made a dead market-data feed shut the node down and
+exit non-zero, reading the existing `is_degraded` flag as the fatal signal. That
+flag had THREE producers, not the two the change reasoned about: reconnect
+exhaustion (`websocket.py:699`), supervisor death (`:710`), and
+`_watch_for_silent_subscriptions` (`:795`) — one subscribed slug producing no
+inbound frame within 60s. The third is an ordinary overnight condition in a thin
+book. With ~60 weather markets subscribed, the first quiet one would have ended
+an 8-hour capture around minute one, exiting 1 with "feed lost and not
+recoverable" — a false statement, and a null capture that would have been read
+as a dead market.
+
+**Why it got in.** The flag was SAFE to share while its only consumer was inert:
+producer 3's comment (`websocket.py:791-793`) explicitly justified reusing
+`is_degraded` rather than "adding a second, unpolled signal", and it was right
+at the time — the consumer set `_safe_mode`, which is written and never read.
+The defect was not introduced by the producer or by the consumer. It was
+introduced by the CHANGE IN WHAT THE FLAG MEANT, which no single site records.
+The aggregator's own docstring (`:946-951`) still described the flag as "ANY
+shard has abandoned reconnection" — it never mentioned producer 3 — so the
+blast radius was invisible from the exact place the new consumer read it.
+
+**The rule.** Before wiring an existing boolean to an irreversible action
+(process exit, shutdown, halt, liquidate, alert-the-operator), ENUMERATE ITS
+WRITERS — every assignment, not just the one you are reasoning about — and
+classify each as fatal or not. A flag's docstring is not the enumeration; the
+assignments are. If any writer is a routine condition, the flag is a
+health*indicator*, not a kill switch, and needs the fatal class split out. Ask
+"was this flag safe only because nothing important consumed it?" A signal that
+has never had teeth has never been pressure-tested for precision.
+
+**Corollary for reviews.** "Fail closed" is only correct when the signal means
+what the action assumes. Fail-closed on an imprecise signal is not conservative
+— it converts routine noise into an outage, which is strictly worse than the
+silent failure it replaced.

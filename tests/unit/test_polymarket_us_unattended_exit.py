@@ -44,6 +44,7 @@ import pytest
 from nautilus_trader.common.messages import ShutdownSystem
 
 from breezy.adapters.polymarket_us import feed_fault
+from breezy.adapters.polymarket_us.data import FATAL_SHUTDOWN_REQUEST_BUDGET
 from breezy.runtime.quote_tape_cli import EXIT_OK, EXIT_RUNTIME_ERROR, run
 from tests.unit.test_polymarket_us_quote_tape_gap import build_client
 from tests.unit.test_quote_tape_cli import BASE_ENV, RecordingNode
@@ -119,14 +120,19 @@ def test_an_unrecoverable_feed_latches_a_fatal_fault_for_the_exit_status(
     assert "feed" in fault.reason.lower()
 
 
-def test_the_shutdown_is_requested_once_however_often_the_watchdog_samples(
+def test_the_shutdown_request_is_bounded_however_often_the_watchdog_samples(
     loop: asyncio.AbstractEventLoop,
 ) -> None:
     """A repeated sample must not spray shutdown commands at the kernel.
 
-    ``sample_feed_health`` returns False to stop the watchdog, but the method
-    is public and directly callable, and a future caller must not be able to
-    turn one lost feed into an unbounded command stream.
+    ``sample_feed_health`` is public and directly callable on a cadence, so
+    one lost feed must never become an unbounded command stream -- that is the
+    guard this test has always carried and still carries. What changed is the
+    ceiling: exactly-one was wrong, because ``shutdown_system`` only PUBLISHES
+    and ``NautilusKernel._on_shutdown_system`` drops the command outright when
+    the kernel is not running or already stopping, telling the publisher
+    nothing. A small BOUNDED budget re-asks across that window; the stream is
+    still bounded, which is the invariant that matters here.
     """
     client, feed = build_client(loop)
     published: list[Any] = []
@@ -135,10 +141,176 @@ def test_the_shutdown_is_requested_once_however_often_the_watchdog_samples(
     feed.restore()
     client.sample_feed_health()
     feed.give_up()
+    for _ in range(50):
+        client.sample_feed_health()
+
+    assert len(published) == FATAL_SHUTDOWN_REQUEST_BUDGET
+    assert FATAL_SHUTDOWN_REQUEST_BUDGET < 5, "the budget must stay small"
+
+
+def test_the_watchdog_keeps_re_checking_until_its_request_budget_is_spent(
+    loop: asyncio.AbstractEventLoop,
+) -> None:
+    """The re-checker must outlive an UNCONFIRMED shutdown request.
+
+    ``Component.shutdown_system`` (``common/component.pyx:2162-2182``) only
+    publishes; ``NautilusKernel._on_shutdown_system`` (``system/kernel.py``)
+    drops the command on a ``trader_id`` mismatch, when ``not _is_running``,
+    or silently when ``_is_stopping``. If the watchdog ended on the first
+    request, a dropped command would get no second chance from anywhere and
+    the node would run on forever with a dead feed and a latched fault --
+    exactly the failure the fail-closed path exists to eliminate.
+    """
+    client, feed = build_client(loop)
+    published: list[Any] = []
+    client._msgbus.subscribe(SHUTDOWN_TOPIC, published.append)
+
+    feed.restore()
+    client.sample_feed_health()
+    feed.give_up()
+
+    results = [client.sample_feed_health() for _ in range(FATAL_SHUTDOWN_REQUEST_BUDGET)]
+
+    assert results[:-1] == [True] * (FATAL_SHUTDOWN_REQUEST_BUDGET - 1), (
+        "the watchdog must keep sampling while the shutdown is unconfirmed"
+    )
+    assert results[-1] is False, "and stop once there is nothing left to re-ask"
+    assert len(published) == FATAL_SHUTDOWN_REQUEST_BUDGET
+
+
+# -- a SILENT SUBSCRIPTION IS NOT A DEAD FEED ------------------------------
+#
+# `is_degraded` on the markets feed has THREE producers, not two: reconnect
+# exhaustion and supervisor death (both fatal -- nothing in the process
+# reconnects that socket), and ONE subscribed slug outliving its 60s
+# confirmation window with no inbound frame (not fatal -- the socket is alive
+# and every other slug is still flowing). `_degraded` is sticky and the pool
+# aggregates with `any(...)`, so at 05:00Z, with ~60 thin overnight weather
+# markets subscribed, the FIRST quiet one would degrade its shard, degrade the
+# pool, and end an eight-hour unattended capture in its first minute with a
+# near-empty tape and a "feed lost and not recoverable" message that is false.
+
+
+def test_a_silent_subscription_alone_never_shuts_the_node_down(
+    loop: asyncio.AbstractEventLoop,
+) -> None:
+    """One quiet overnight market must not end the whole capture."""
+    client, feed = build_client(loop)
+    published: list[Any] = []
+    client._msgbus.subscribe(SHUTDOWN_TOPIC, published.append)
+
+    feed.restore()
+    client.sample_feed_health()
+    feed.go_silent("kxhighny-26aug31-b70")
+
+    keep_watching = client.sample_feed_health()
+
+    assert published == [], "a silent subscription must never request a shutdown"
+    assert feed_fault.fatal_feed_fault() is None, "and must never latch a fatal fault"
+    assert keep_watching is True, "recording continues; the feed is alive"
+    assert client.is_safe_mode is False
+
+
+def test_many_silent_subscriptions_still_never_shut_the_node_down(
+    loop: asyncio.AbstractEventLoop,
+) -> None:
+    """Not even a majority of the ladder going quiet is fatal.
+
+    Quiet is the NORMAL overnight state of these markets. Volume, not
+    fatality, is what a silent slug scales into: the run keeps recording
+    whatever is flowing and reports everything that is not.
+    """
+    client, feed = build_client(loop)
+    published: list[Any] = []
+    client._msgbus.subscribe(SHUTDOWN_TOPIC, published.append)
+
+    feed.restore()
+    client.sample_feed_health()
+    for index in range(60):
+        feed.go_silent(f"kxhighny-26aug31-b{index}")
+
+    assert client.sample_feed_health() is True
+    assert published == []
+    assert client.silent_subscription_alerts == 60
+
+
+def test_a_silent_subscription_is_still_reported_loudly_once_per_slug(
+    loop: asyncio.AbstractEventLoop,
+) -> None:
+    """Non-fatal must not mean invisible: it is a real, unbackfillable loss.
+
+    Reported once per SLUG, not once per sample: the watchdog samples every
+    few seconds for eight hours, and a per-sample report would bury the very
+    signal it exists to raise.
+    """
+    client, feed = build_client(loop)
+    feed.restore()
+    client.sample_feed_health()
+
+    feed.go_silent("kxhighny-26aug31-b70")
+    client.sample_feed_health()
+
+    assert client.silent_subscription_alerts == 1
+
     for _ in range(5):
         client.sample_feed_health()
 
+    assert client.silent_subscription_alerts == 1, "one report per slug, not per sample"
+
+    feed.go_silent("kxhighchi-26aug31-b62")
+    client.sample_feed_health()
+
+    assert client.silent_subscription_alerts == 2
+
+
+@pytest.mark.parametrize(
+    "fatal_producer",
+    ["exhaust_reconnects", "supervisor_died"],
+)
+def test_a_genuinely_fatal_feed_failure_still_shuts_the_node_down(
+    loop: asyncio.AbstractEventLoop,
+    fatal_producer: str,
+) -> None:
+    """The fix must not regress what the fail-closed path exists for.
+
+    Both fatal producers leave the socket permanently unsupervised: nothing in
+    the process reconnects it and Nautilus has no notion of a data client that
+    stopped producing. Both must still stop the run.
+    """
+    client, feed = build_client(loop)
+    published: list[Any] = []
+    client._msgbus.subscribe(SHUTDOWN_TOPIC, published.append)
+
+    feed.restore()
+    client.sample_feed_health()
+    getattr(feed, fatal_producer)()
+    client.sample_feed_health()
+
+    assert len(published) == 1, "a fatal fault must still request a native shutdown"
+    fault = feed_fault.fatal_feed_fault()
+    assert fault is not None
+    assert client.is_safe_mode is True
+
+
+def test_a_silent_subscription_never_masks_a_later_fatal_failure(
+    loop: asyncio.AbstractEventLoop,
+) -> None:
+    """Downgrading producer 3 must not desensitise the fatal check."""
+    client, feed = build_client(loop)
+    published: list[Any] = []
+    client._msgbus.subscribe(SHUTDOWN_TOPIC, published.append)
+
+    feed.restore()
+    client.sample_feed_health()
+    feed.go_silent("kxhighny-26aug31-b70")
+    client.sample_feed_health()
+    assert published == []
+
+    feed.exhaust_reconnects()
+    client.sample_feed_health()
+
     assert len(published) == 1
+    assert feed_fault.fatal_feed_fault() is not None
 
 
 def test_the_first_fault_is_the_one_reported(loop: asyncio.AbstractEventLoop) -> None:

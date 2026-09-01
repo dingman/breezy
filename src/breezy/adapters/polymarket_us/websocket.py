@@ -104,6 +104,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import traceback
 import uuid
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
@@ -301,9 +302,9 @@ class PolymarketUSMarketsWebSocket:
         "_confirmation_task",
         "_confirmation_window_secs",
         "_connection_label",
-        "_degraded",
         "_delay_initial_ms",
         "_delay_max_ms",
+        "_fatally_degraded",
         "_handler",
         "_heartbeat_secs",
         "_idle_timeout_secs",
@@ -379,7 +380,10 @@ class PolymarketUSMarketsWebSocket:
         self._tasks: set[asyncio.Task[Any] | asyncio.Future[Any]] = set()
         self._retry_manager: RetryManager[bool] | None = None
         self._closing: bool = False
-        self._degraded: bool = False
+        #: FATAL degradation only (:attr:`is_fatally_degraded`). A silent
+        #: subscription must never be recorded here -- it has its own,
+        #: non-fatal record in `_silent_subscriptions`.
+        self._fatally_degraded: bool = False
         self._subscription_errors: list[WebSocketErrorFrame] = []
         #: slug -> loop time it was (re)subscribed. Popped the moment ANY
         #: frame naming that slug arrives; a survivor at sweep time becomes a
@@ -400,28 +404,54 @@ class PolymarketUSMarketsWebSocket:
 
     @property
     def is_degraded(self) -> bool:
-        """True once this connection can no longer be trusted to deliver every
-        subscription it was asked to carry.
+        """True once this connection is no longer FULLY healthy -- fatal or not.
 
-        This is the ONE fail-closed signal a data client actually polls
-        (:meth:`~breezy.adapters.polymarket_us.data.PolymarketUSDataClient.sample_feed_health`
-        reads only this property, on a fixed cadence, and enters safe mode the
-        moment it is True). Two independent conditions set it, both
-        unrecoverable by waiting:
+        Deliberately the UNION of two classes of fault that must never be
+        confused, because they call for opposite responses:
 
-        1. Reconnection was abandoned (:meth:`_supervise`) -- the socket is
-           gone and no further quotes of ANY kind will arrive.
-        2. A subscribed slug was confirmed silently dropped by the venue
-           (:meth:`_watch_for_silent_subscriptions`) -- the socket is alive,
-           but at least one slug the caller believes is live is not, and
-           Polymarket.us weather markets cannot be backfilled. Reusing this
-           same signal, rather than adding a second one nothing polls, is
-           deliberate: see :attr:`silent_subscriptions` for the raw detail
-           and the module docstring's "Note on the per-connection
-           subscription cap" for why a quiet market and a dropped
-           subscription must never look identical.
+        1. **Fatal** (:attr:`is_fatally_degraded`): reconnection was abandoned,
+           or the supervisor died. The socket is gone, nothing in the process
+           reconnects it, and no further quotes of ANY kind will arrive.
+        2. **Not fatal**: at least one subscribed slug outlived its
+           confirmation window with no inbound frame
+           (:attr:`silent_subscriptions`, :meth:`_watch_for_silent_subscriptions`).
+           The socket is ALIVE and every other slug on it is still flowing;
+           exactly one subscription is unconfirmed. Real, unbackfillable data
+           loss for that slug -- and not a reason to stop recording the rest.
+
+        **A consumer that STOPS THE PROCESS must poll
+        :attr:`is_fatally_degraded`, never this one.** This property answered
+        "is the feed fatally dead?" for BOTH classes once, and
+        ``PolymarketUSDataClient.sample_feed_health`` escalated it to a node
+        shutdown: at 05:00Z, with ~60 thin overnight weather markets
+        subscribed, the first one to go quiet for 60s would have ended an
+        eight-hour unattended capture in its first minute, over a feed that
+        was alive, with a "feed lost and not recoverable" message that was
+        false. Read THIS one for "is the feed fully healthy?" (reporting,
+        dashboards, tests); read the fatal one for "must the run end?".
         """
-        return self._degraded
+        return self._fatally_degraded or bool(self._silent_subscriptions)
+
+    @property
+    def is_fatally_degraded(self) -> bool:
+        """True once this connection can no longer deliver ANY subscription.
+
+        The ONE fail-closed signal a data client may end the process over
+        (:meth:`~breezy.adapters.polymarket_us.data.PolymarketUSDataClient.sample_feed_health`
+        polls exactly this, on a fixed cadence, and escalates it to a clean
+        node shutdown with a non-zero exit status). Set by, and only by, the
+        two unrecoverable supervisor exits (:meth:`_supervise`), neither of
+        which waiting can fix:
+
+        1. Reconnection was abandoned after the retry budget.
+        2. The supervisor died on an unexpected exception -- nothing else in
+           the process reconnects this socket, and Nautilus has no notion of a
+           data client that stopped producing.
+
+        A silent subscription is deliberately NOT one of these; see
+        :attr:`is_degraded` for the distinction and why it is load-bearing.
+        """
+        return self._fatally_degraded
 
     @property
     def subscriptions(self) -> Mapping[str, str]:
@@ -459,7 +489,7 @@ class PolymarketUSMarketsWebSocket:
         if self.is_connected:
             return
         self._closing = False
-        self._degraded = False
+        self._fatally_degraded = False
         await self._open()
         if self.requires_auth and self._supervisor is None:
             self._supervisor = self._loop.create_task(
@@ -671,14 +701,16 @@ class PolymarketUSMarketsWebSocket:
         Nautilus has no notion of a data client that stopped producing
         (``LiveDataEngine.connect`` calls ``client.connect()`` once and never
         looks again). So both fatal exits -- retry exhaustion and an
-        unexpected exception -- must set ``is_degraded``, which is the signal
-        ``PolymarketUSDataClient.sample_feed_health`` already polls and now
-        escalates to a clean node shutdown with a non-zero exit status.
+        unexpected exception -- must set ``is_fatally_degraded``, the signal
+        ``PolymarketUSDataClient.sample_feed_health`` polls and escalates to a
+        clean node shutdown with a non-zero exit status. This coroutine is the
+        ONLY producer of that flag: an unconfirmed subscription is a different,
+        non-fatal fault (:attr:`is_degraded`).
 
         Before this, only exhaustion set it. An exception ended the task
-        silently: ``is_connected`` stayed True, ``is_degraded`` stayed False,
-        and an unattended recorder kept a healthy-looking, permanently
-        unsupervised socket for the rest of the capture window.
+        silently: ``is_connected`` stayed True, the flag stayed False, and an
+        unattended recorder kept a healthy-looking, permanently unsupervised
+        socket for the rest of the capture window.
 
         Cancellation is deliberately NOT degradation and is re-raised
         untouched -- ``close()`` sets ``_closing`` before it cancels, and a
@@ -696,7 +728,7 @@ class PolymarketUSMarketsWebSocket:
                     "Polymarket.us markets websocket closed; reconnecting with fresh signature"
                 )
                 if not await self._reconnect_with_backoff():
-                    self._degraded = True
+                    self._fatally_degraded = True
                     self._log.error(
                         "Polymarket.us markets websocket reconnection abandoned after "
                         f"{self._reconnect_max_attempts} retries; the market data feed is down"
@@ -705,13 +737,18 @@ class PolymarketUSMarketsWebSocket:
         except asyncio.CancelledError:
             raise
         except Exception as exc:  # noqa: BLE001 - deliberate: see below
-            # Type name only, never the message: transport exception text is
-            # venue-controlled and must not reach a log record.
-            self._degraded = True
+            # Type name and TRACEBACK FRAMES, never the message. The message is
+            # venue-controlled text and must not reach a log record (module
+            # docstring); the frames are not -- see `_traceback_frames`. An
+            # unattended run exists to be analysed afterwards, and a bare
+            # `AttributeError` at 06:00Z with no file, line or expression
+            # destroys exactly the record that analysis needs.
+            self._fatally_degraded = True
             self._log.error(
                 "Polymarket.us markets websocket supervisor died unexpectedly "
                 f"({type(exc).__name__}); no further reconnection will be "
-                "attempted and the market data feed is down"
+                "attempted and the market data feed is down. Raised at "
+                f"{_traceback_frames(exc)}"
             )
 
     async def _reconnect_with_backoff(self) -> bool:
@@ -754,20 +791,30 @@ class PolymarketUSMarketsWebSocket:
         place -- re-subscribing or escalating is a data-client/operator
         decision, not this transport's.
 
-        A confirmed silent slug also sets :attr:`is_degraded`. Before this,
-        ``silent_subscriptions``/``subscription_errors`` were populated but
-        read by nothing outside this module and its tests: ``is_connected``
-        stayed True and ``is_degraded`` stayed False forever, so a silently
-        truncated feed was indistinguishable from a healthy one to every
-        automated consumer. Reusing ``is_degraded`` -- the same fail-closed
-        signal reconnect-abandonment already sets -- costs no new wiring in
-        :class:`~breezy.adapters.polymarket_us.data.PolymarketUSDataClient`,
-        whose ``sample_feed_health`` already polls exactly this property on a
-        fixed cadence and enters safe mode the moment it is True (data.py
-        ``sample_feed_health``). A distinct signal would need its own
-        consumer wired into that client -- a parallel alerting path for a
-        codebase whose whole point is that a dropped slug must never look
-        healthy to whatever already watches for "not healthy".
+        A confirmed silent slug is VISIBLE but NOT FATAL. It appears in
+        :attr:`silent_subscriptions` and in :attr:`is_degraded` (the union,
+        "not fully healthy"); it deliberately does NOT appear in
+        :attr:`is_fatally_degraded`, the only signal a consumer may stop the
+        process over. That split is the whole point:
+
+        * Visible, because before it existed ``silent_subscriptions`` was read
+          by nothing outside this module and its tests -- ``is_connected``
+          stayed True and nothing flagged anything, so a silently truncated
+          feed was indistinguishable from a healthy one to every automated
+          consumer.
+        * Not fatal, because the socket is ALIVE. Every other slug on this
+          connection is still delivering, and the overnight weather ladder is
+          quiet by nature: ~60 thin markets are subscribed at 05:00Z and the
+          first one to pass 60 seconds without a frame would otherwise end an
+          eight-hour capture in its first minute with a near-empty tape.
+          Losing one slug's quotes is bad; throwing away the other 59 to
+          report it is worse, and the report is what the operator needs
+          either way.
+
+        Escalation policy therefore lives with the consumer
+        (:meth:`~breezy.adapters.polymarket_us.data.PolymarketUSDataClient.sample_feed_health`
+        reports each newly silent slug at ERROR and keeps recording), not in
+        this transport, which only detects and reports.
         """
         window = self._confirmation_window_secs
         if window is None:  # pragma: no cover -- only ever scheduled when set
@@ -789,18 +836,42 @@ class PolymarketUSMarketsWebSocket:
                 elapsed = now - self._pending_confirmation.pop(slug)
                 warning = SilentSubscriptionWarning(slug=slug, subscribed_after_secs=elapsed)
                 self._silent_subscriptions.append(warning)
-                # Fail closed on the SAME signal reconnect-abandonment already
-                # sets -- see the docstring above for why this reuses
-                # `is_degraded` instead of adding a second, unpolled signal.
-                self._degraded = True
+                # NOT `_fatally_degraded`. Appending to `_silent_subscriptions`
+                # is itself what raises `is_degraded` (the union), so this stays
+                # polled and loud without ever declaring a live socket dead --
+                # see this method's docstring for why that distinction decides
+                # whether an unattended capture survives its first quiet market.
                 self._log.error(
                     f"Polymarket.us markets websocket ({self._connection_label}): "
                     f"{slug!r} was subscribed {elapsed:.1f}s ago and has produced NO "
                     "inbound frame since. Absence of an error frame is NOT proof this "
                     "subscription is live (see the module docstring's silent-truncation "
                     "note) -- treat this slug as UNCONFIRMED, never as a quiet market. "
-                    "Marking this connection degraded so the data client fails closed."
+                    "This connection is marked degraded but NOT fatally: the socket is "
+                    "up and its other slugs keep flowing, so recording continues."
                 )
+
+
+def _traceback_frames(exc: BaseException) -> str:
+    """Render an exception's traceback WITHOUT its message.
+
+    ``traceback.format_exception`` cannot be used here: it ends with
+    ``str(exc)``, and for a transport error that string is venue-controlled
+    text this module must never log (module docstring, "Note on transport
+    exception text"). ``extract_tb`` yields only filename, line number,
+    function name and the SOURCE LINE, all read from the local tree by
+    ``linecache`` -- none of it authored by the venue.
+
+    Innermost frame first, because that is the one an operator reads first.
+    """
+    frames = traceback.extract_tb(exc.__traceback__)
+    if not frames:
+        return "<no traceback available>"
+    return " <- ".join(
+        f"{frame.filename}:{frame.lineno} in {frame.name}()"
+        + (f" [{frame.line}]" if frame.line else "")
+        for frame in reversed(frames)
+    )
 
 
 def _new_request_id() -> str:
@@ -943,13 +1014,35 @@ class PolymarketUSMarketsWebSocketPool:
 
     @property
     def is_degraded(self) -> bool:
-        """True once ANY shard has abandoned reconnection.
+        """True once ANY shard is less than fully healthy -- fatal or not.
 
-        Fail-closed like the single-connection signal it aggregates: one lost
-        shard means that shard's slugs stop flowing, which is enough to say
-        the feed as a whole is no longer fully healthy.
+        Aggregates :attr:`PolymarketUSMarketsWebSocket.is_degraded`, whose
+        docstring defines the two classes this unions over: an abandoned
+        reconnect or a dead supervisor (FATAL -- that shard's slugs stop
+        entirely and nothing recovers them), and an unconfirmed, silent
+        subscription (NOT fatal -- that shard's socket is up and its other
+        slugs keep flowing).
+
+        **Not the signal to stop the process**: use
+        :attr:`is_fatally_degraded`. This docstring previously claimed the
+        flag meant "ANY shard has abandoned reconnection" and never mentioned
+        the silent-subscription producer at all, which is how a live pool with
+        one quiet overnight market came to be reported as an unrecoverable
+        feed loss.
         """
         return any(shard.is_degraded for shard in self._shards)
+
+    @property
+    def is_fatally_degraded(self) -> bool:
+        """True once ANY shard has lost its socket for good.
+
+        Fail-closed on the FATAL class only: one shard whose reconnection was
+        abandoned, or whose supervisor died, means that shard's slugs stop
+        arriving for the rest of the run and nothing in the process brings
+        them back -- enough, on its own, to end the run. A silent subscription
+        on any shard deliberately never reaches here.
+        """
+        return any(shard.is_fatally_degraded for shard in self._shards)
 
     @property
     def subscriptions(self) -> Mapping[str, str]:

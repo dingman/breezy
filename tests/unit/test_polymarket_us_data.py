@@ -57,6 +57,7 @@ from breezy.adapters.polymarket_us.data import (
     frame_class_counts,
     should_warn_at_count,
 )
+from breezy.adapters.polymarket_us.websocket import SilentSubscriptionWarning
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 
@@ -141,7 +142,8 @@ class FakeMarketsFeed:
         self.events: list[str] = []
         self._subscriptions: dict[str, str] = {}
         self._connected = False
-        self._degraded = False
+        self._fatally_degraded = False
+        self._silent: list[SilentSubscriptionWarning] = []
         self._next_id = 0
 
     @property
@@ -150,7 +152,17 @@ class FakeMarketsFeed:
 
     @property
     def is_degraded(self) -> bool:
-        return self._degraded
+        return self._fatally_degraded or bool(self._silent)
+
+    @property
+    def is_fatally_degraded(self) -> bool:
+        """Only the UNRECOVERABLE class -- what the client may stop the run over."""
+        return self._fatally_degraded
+
+    @property
+    def silent_subscriptions(self) -> tuple[SilentSubscriptionWarning, ...]:
+        """Subscribed slugs with no inbound frame yet. Reported, never fatal."""
+        return tuple(self._silent)
 
     @property
     def subscriptions(self) -> Mapping[str, str]:
@@ -177,9 +189,20 @@ class FakeMarketsFeed:
             if held == request_id:
                 del self._subscriptions[slug]
 
-    def degrade(self) -> None:
-        self._degraded = True
+    def degrade_fatally(self) -> None:
+        """The FATAL class: reconnection abandoned, or the supervisor died.
+
+        Named for the class it belongs to, because the non-fatal class (a
+        silent, unconfirmed subscription) also raises `is_degraded` and must
+        NOT reach safe mode -- a double with one undifferentiated `degrade()`
+        is what let those two be conflated in the first place.
+        """
+        self._fatally_degraded = True
         self._connected = False
+
+    def go_silent(self, slug: str, after_secs: float = 60.0) -> None:
+        """The NON-FATAL class: one subscribed slug produced no inbound frame."""
+        self._silent.append(SilentSubscriptionWarning(slug=slug, subscribed_after_secs=after_secs))
 
     def deliver(self, payload: Mapping[str, Any]) -> None:
         self.handler(json.dumps(payload).encode())
@@ -685,14 +708,14 @@ async def test_a_parser_failure_drops_the_frame_and_keeps_the_feed_alive() -> No
 
 
 @pytest.mark.asyncio
-async def test_feed_degradation_enters_safe_mode_and_marks_the_client_disconnected() -> None:
+async def test_fatal_feed_degradation_enters_safe_mode_and_marks_the_client_disconnected() -> None:
     harness = build_harness()
     harness.client._feed_watch_interval_secs = 0.01
     await harness.client._connect()
     harness.client._set_connected(True)
     assert harness.client.is_safe_mode is False
 
-    harness.feed.degrade()
+    harness.feed.degrade_fatally()
     for _ in range(100):
         await asyncio.sleep(0.01)
         if harness.client.is_safe_mode:
@@ -700,6 +723,33 @@ async def test_feed_degradation_enters_safe_mode_and_marks_the_client_disconnect
 
     assert harness.client.is_safe_mode is True
     assert harness.client.is_connected is False
+    await harness.client._disconnect()
+
+
+@pytest.mark.asyncio
+async def test_a_silent_subscription_never_enters_safe_mode() -> None:
+    """The other half of the same watchdog, running against a LIVE socket.
+
+    Exercised through the real `_watch_feed` task rather than a direct
+    `sample_feed_health` call, because the task is what runs at 05:00Z: an
+    unconfirmed slug must be reported and the loop must keep going.
+    """
+    harness = build_harness()
+    harness.client._feed_watch_interval_secs = 0.01
+    await harness.client._connect()
+    harness.client._set_connected(True)
+
+    harness.feed.go_silent("kxhighny-26aug31-b70")
+    for _ in range(100):
+        await asyncio.sleep(0.01)
+        if harness.client.silent_subscription_alerts:
+            break
+
+    assert harness.client.silent_subscription_alerts == 1, "reported"
+    assert harness.client.is_safe_mode is False, "and never fatal"
+    assert harness.client.is_connected is True
+    watchdog = harness.client._feed_watchdog
+    assert watchdog is not None and not watchdog.done(), "the watchdog keeps sampling"
     await harness.client._disconnect()
 
 
