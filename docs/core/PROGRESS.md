@@ -51,6 +51,18 @@ Two consequences that are not optional (tracked by P4):
   are dead on MDW/NYC/SFO** (they need exact equality). Open tails unaffected:
   97% of revisions UPWARD, downward rate 0.21%.
   `docs/evidence/observation_lock_falsification_2026-08-31.md`.
+- **`cli_settlement_print_lock` is REFUTED on real data (2026-09-01).** Two
+  independent nulls on the same window: no legal window, and no ask. On all five
+  stations the bucket containing the printed value carried **0 asks across 3332
+  depth rows**. The settlement-truth edge is measured-certain and
+  unexecutable. `docs/evidence/print_lock_refuted_2026-09-01.md`; rule L-7.
+- **The book reprices on PHYSICAL determination, not on the print.** The NYC
+  winner had no ask at 03:30Z -- 3 h BEFORE its final printed, ~10 h after its
+  climate day ended. The ladder itself is liquid (2026-08-31: 18653/21985 rows
+  carry an ask, 84.8%; 2026-09-01: 100424/100431, 100.0%); only the winning rung
+  is unoffered. Any trigger anchored to a publication event arrives late by the
+  publication lag. L-7 amendment.
+
 - **Historical forecasts are NOT proven unavailable.** `CLI_BACKFILL_PLAN.md:46`
   claims otherwise from *repo state*, not availability. Open-Meteo
   `/v1/previous-runs` was deferred, never rejected. Still unverified.
@@ -77,19 +89,21 @@ Two consequences that are not optional (tracked by P4):
 
 Evidence: `docs/evidence/observation_lock_falsification_2026-08-31.md`.
 
-### [HIGH] BL-19 — shipped config refuses the observation family's whole region
+### [HIGH] BL-24 — H3's Gate 0: does Breezy hold ANY intraday observation?
 
-DECIDED for BOTH strategies, NOT YET APPLIED to config — that is what remains.
-`docs/evidence/bl19_edge_and_cost_decision_2026-09-01.md`: `min_model_edge`
-0.04 -> 0.005; flat `transaction_cost_prob` -> `fee(p)+slippage`; `theta`
-per-instrument, never defaulted (`fees.py:90` forbids a fallback);
-`slippage_prob` 0.01 UNMEASURED and load-bearing. Print-lock's `model_p`
-(0.996896) already shipped in 05aa5f9; the two cost knobs still inherit
-`RiskLimits` by reference. CORRECTION: `decision.py:296` subtracts the cost
-BEFORE the floor, so the shipped requirement is ask <= 0.9418 (0.94 on the
-grid), not the ~0.957 previously recorded here. The SPEC's pre-registered kill
-ceiling had the same defect and would have declared the lead dead at 0.94 —
-corrected to 0.98 in `docs/strategies/breezy_strategy_cli_settlement_print_lock.md` §5.
+H3 needs `R(t)`, the running observed max, updated intraday and available with
+no look-ahead. `running_extreme_lock` reads `observation.tmax_f`, which comes
+from CLI PRELIMINARY/FINAL products -- end-of-period summaries, not intraday.
+If no hourly/METAR/ASOS path exists, `R(t)` does not exist inside the bot and H3
+is unimplementable until it does. Two look-ahead traps to settle in the same
+pass: for FINALS `ts_event` is climate-day END, not the observed high's
+measurement time; and `BacktestEngine` orders by `ts_init`, so a running max
+built from measurement timestamps and stamped available afterwards LEAKS.
+
+**Acceptance:** a cited YES/NO on intraday ingest; per-class `ts_event`/`ts_init`
+provenance; and, if NO, the smallest native-first extension named against an
+existing actor/data-client pattern. Observations are backfillable from the NWS
+archive, so this gates H3's labelling, not today's capture.
 
 ### [MED] BL-21 — both tail-locks are outlier strategies; base rate unknown
 
@@ -100,22 +114,6 @@ in `[H-5,H]` the venue never lists. Pre-registered kill: trigger rate < 0.20
 over captured station-days. Any ask/break-even comparison MUST gate on the
 trigger first — an unfired tail shows pennies that read as free certainty.
 `first_in_window_capture_2026-09-01.md`, `h2_lower_tail_rejected_2026-09-01.md`.
-
-### [HIGH] BL-23 — a truncated tape is discarded SILENTLY, not corrupted
-
-Measured 2026-09-01 against a real SIGKILL. An unclean death does NOT void the
-file: `close()` only appends the end-of-stream marker, and a clean EOF at a
-message boundary reads fine. But if the file ends MID-MESSAGE,
-`ParquetDataCatalog._read_feather_file` catches `(pa.ArrowInvalid, OSError)` and
-returns `None` (`parquet.py:2795-2800`), which `convert_stream_to_data` turns
-into `continue` (`:2644-2646`). Conversion then "succeeds" over an EMPTY
-catalog: 228 KB on disk, 0 rows delivered, no exception, no log line. Loss is
-bounded by the file buffer (~8 KB, not the 10 s flush interval) — salvage
-recovered 491/500 records — and by one day (`SCHEDULED_DATES` closes rotated
-files). **Never read a 0-row `convert_stream_to_data` as a quiet market.**
-Wanted, in order: a read-back preflight that reports truncation loudly; a
-salvage reader on the proven prefix recovery. Pinned by
-`tests/contract/test_quote_tape_unclean_shutdown.py`.
 
 ### [MED] BL-14 — `RefusalAlerter` alerts on `SHORTS_DISABLED` only
 
@@ -138,16 +136,12 @@ decreasing clock always crosses 2.0 first. Decide if the two knobs are one.
 
 ## BACKLOG — selected for execution (opened 2026-08-31)
 
-Source: the three-strategy backtest run of 2026-08-31, 36/36 COMPLETED. Reports:
-`~/.local/share/breezy/derived/strategy-backtests/` (newest = `...20260831T151235+0000.json`, post-BL-1/2/3/5).
-
-**Binding constraints on every item below.** No item may:
-set `allow_short=True`; weaken `BacktestOrderGuard` or any settlement
-invariant; relax a safety guard to go green; touch live-trading enablement or
-the NO-SEND execution-egress firewall; or invent a value for an
-operator-reserved control. Every increment carries an **L-1 null-hypothesis
-verdict** citing installed source under
-`.venv/lib/python3.13/site-packages/nautilus_trader/` before implementation.
+**Binding constraints on EVERY item in this file.** No item may: set
+`allow_short=True`; weaken `BacktestOrderGuard` or any settlement invariant;
+relax a safety guard to go green; touch live-trading enablement or the NO-SEND
+egress firewall; or invent an operator-reserved value. Every increment carries
+an **L-1 null-hypothesis verdict** citing installed source under
+`.venv/lib/python3.13/site-packages/nautilus_trader/` first.
 
 ### [MEDIUM] BL-10 — One strategy refuses quotes before the counter can see it
 
@@ -211,10 +205,16 @@ plain work items, no longer blocked. Still blocked:
 | G-16 | ≥14 days of joined tape | calendar: 14 days after G-14 |
 | G-17 | Phase 1.5 premise GO/NO-GO | G-16. **NO-GO stops the programme.** |
 
-**Immediate path to the ROI stop gate** (`docs/specs/CAPTURE_SPEC_OBSERVATION_GATE0.md`):
-BL-13 print-lock build + BL-19 -> P1 recorder hardening -> morning capture
-(05:00-13:00Z, the final-print window) -> Gate 0B (>=14 station-days) ->
-observation backtest. The evening tape only measures tail reachability.
+**Immediate path to the ROI stop gate.** The observation family's
+settlement-truth branch is closed (print-lock refuted). The live hypothesis is
+**H3** (`docs/strategies/H3_intraday_running_max_lock.md`): buy the bucket
+holding the running observed max `R(t)` after the diurnal peak, while the book
+still offers it. Its Gate 0 is a DATA prerequisite, not a modelling one --
+Breezy's ingest is CLI-product-driven and may hold no intraday observation at
+all, in which case `R(t)` does not exist inside the bot. Sequence: settle Gate 0
+-> keep the recorder alive through 2026-09-02 13:00Z so the 09-01 peak window
+and its finals are both on tape -> label the 09-01 tape by `R(t)` -> H3 kill
+criteria 1-4.
 
 ---
 

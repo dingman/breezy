@@ -371,3 +371,43 @@ of mute -- `RefusalCounter` was EMPTY, since nothing reached the decision layer.
 A null with no persisted inputs would have been indistinguishable from a dead
 market. See [[verify-agent-claims-against-artifact]]: the 0-ask count was
 confirmed independently through the native catalog reader before being acted on.
+
+**Amendment (2026-09-01, same day).** "Public" does not mean "officially
+published." Re-reading the same tape by timestamp: the NYC winner carried no ask
+at 03:30Z -- **3 h before its final printed, and ~10 h after its climate day had
+ended.** The book had already fully repriced while the official record did not
+yet exist. So the moment that empties the offer side is the moment the outcome
+becomes PHYSICALLY DETERMINED and observable to anyone watching the same
+instrument, not the moment a bulletin is issued. Any future strategy that names
+a publication event as its trigger is anchored to the wrong clock and will
+arrive late by exactly the publication lag. This is the measurement that
+generated H3 (`docs/strategies/H3_intraday_running_max_lock.md`).
+
+## L-8 — A 0-row read is not a quiet market until the tape is verified (2026-09-01)
+
+**What happened.** A quote-tape capture was killed uncleanly. The file was not
+corrupted in the ordinary sense -- `close()` only appends the end-of-stream
+marker, so a clean EOF at a message boundary still reads fine. But when the file
+ended MID-MESSAGE, `ParquetDataCatalog._read_feather_file` caught
+`(pa.ArrowInvalid, OSError)` and returned `None` (`parquet.py:2795-2800`), which
+`convert_stream_to_data` turned into `continue` (`:2644-2646`). Conversion then
+reported SUCCESS over an empty catalog: 228 KB on disk, 0 rows delivered, no
+exception, no log line.
+
+**The rule.** In this system a null result has two indistinguishable causes --
+the market did nothing, or the tape silently failed to load. They are
+indistinguishable *by construction*, because the loader's failure path is a
+`continue`. **Never interpret a 0-row or low-row result as evidence about the
+market until the tape behind it has been independently verified** (row counts by
+file, timestamp coverage against the intended window, and a truncation
+preflight). Verification precedes interpretation; a strategy verdict built on an
+unverified tape is a verdict about the recorder.
+
+**How to apply.** Run `breezy-quote-tape-preflight` over the catalog before any
+run that will produce a strategy verdict, and quote its per-file status
+(`EMPTY_FILE` / `EMPTY_STREAM` / `INTACT` / `TRUNCATED` / `UNREADABLE`) in the
+evidence document alongside the result. Loss from an unclean death is bounded by
+the write buffer (~8 KB), not the flush interval -- salvage recovered 491/500
+records -- so a truncated tail is usually recoverable and should be salvaged
+rather than discarded. Pinned by
+`tests/contract/test_quote_tape_unclean_shutdown.py`.
