@@ -230,3 +230,13 @@ book locked on the FORECAST, not on the observation). Capture must START before
 the local peak and run continuously THROUGH it. The recorder is currently
 positioned to produce exactly that, under a restart supervisor with a
 2026-09-02 14:00Z deadline.
+
+### Prerequisite that is easy to miss
+
+The on-disk ASOS archive ends **2026-01-02**. It does NOT cover 2026-09-01, so
+`R(t)` for today's tape cannot be reconstructed from what is already local. IEM
+serves the current day (`settlement_alignment_study.py:405-433` is the sanctioned
+fetch path), and IEM archives permanently, so this is retrievable tomorrow
+alongside the finals rather than urgent today -- but the market-gap experiment
+is unlabelable without it. Fetch 2026-09-01 ASOS for all five stations before
+attempting to mark the winner against the physical lock.
