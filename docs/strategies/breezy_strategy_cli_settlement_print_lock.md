@@ -155,10 +155,35 @@ allow_short: bool = False          # MUST remain False
 min_stable_prob: float = 0.97
 min_edge_after_costs: float        # pass-through intent; RiskManager also enforces min_model_edge
 max_quote_age_minutes: float
-require_correction_flag_clear: bool = True
 use_tmax: bool = True              # primary
 use_tmin: bool = False             # only if instrument is a min bucket
 ```
+
+> **IMPLEMENTED CONTRACT DIFFERS (2026-09-01).** Three fields in the list above
+> do NOT exist in the shipped config, deliberately:
+>
+> - `require_correction_flag_clear` — DELETED, the refusal is hard-coded. A
+>   corrected record sits outside the `p_stable` denominator entirely (the
+>   measurement is first-final -> last pre-settlement, so a correction IS the
+>   failure event being counted). Its only alternative setting would trade an
+>   unmeasured product at a measured product's confidence.
+> - `transaction_cost_prob` — DELETED. No field denotes a TOTAL cost, because a
+>   single scalar cannot express `fee(p) + slippage` and the tempting partial
+>   application admits ask 0.99 at negative expectation while reporting a
+>   positive edge. Cost is `venue_fee_prob(theta, p) + slippage_prob`, with
+>   `theta` injected per instrument and refused when absent, and `slippage_prob`
+>   required with no default and validated at >= one tick.
+> - `edge_qty_scale` — DELETED. Sizing is a constant DOLLAR cost basis,
+>   `A / (ask + fee(ask))`; the old edge-proportional rule committed 3.8x more
+>   capital on the least-corroborated signal.
+>
+> Added, with no counterpart above: `MEASURED_STATIONS`, a hard refusal of any
+> station outside the five the constant was measured on. The vocabulary is the
+> registry `cli_location` (`"NYC"`), NOT the ICAO form (`KNYC`) used elsewhere
+> in these documents — building it from the docs would refuse every station.
+>
+> Rationale: `docs/plans/print_lock_adverse_selection_and_cost_2026-09-01.md`
+> and `docs/evidence/bl19_edge_and_cost_decision_2026-09-01.md` §8.
 
 Do not put `max_daily_trading_budget` or `max_notional_per_position` numbers in config. Size as a function of those caps **when the operator assigns them**, plus existing payout-dollar caps (`max_event_notional`, `max_location_notional`, `max_position_contracts`, `max_equity_fraction`, `max_simultaneous_positions`).
 
