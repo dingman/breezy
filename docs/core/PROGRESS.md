@@ -77,21 +77,6 @@ Two consequences that are not optional (tracked by P4):
 
 Evidence: `docs/evidence/observation_lock_falsification_2026-08-31.md`.
 
-### [CRITICAL] BL-20 — strategies read a synthetic 0.00 as a real price
-
-(BL-18, the one-sided-book parser refusal, is fixed — the commit is the record.)
-
-`OrderBookDepth10` pads an empty side with ten `Price(0)/Quantity(0)` levels, so
-the pad sits at index 0. `RestingLadder._best` skips `size == 0`;
-`ForecastHighEdgeBuyer._best_ask`, `running_extreme_lock`'s top-of-book copy,
-`forecast_mispricing`, `calibration_mean_reversion` and `forecast_revision` do
-NOT — a one-sided snapshot reads as bid=0 / mid=ask/2. Native `to_quote_tick()`
-shares the flaw; do not quote from it.
-
-**Do not backtest or trade off one-sided Depth10 until every consumer skips
-`size == 0` and passes `None` for a missing side.** Blocks Gate 0A's
-interpretation, not its capture.
-
 ### [HIGH] BL-19 — shipped config refuses `running_extreme_lock`'s whole region
 
 `min_model_edge=0.04` (`risk.py:100`, `config.py:113`, gated `risk.py:411`): at
@@ -102,23 +87,33 @@ certain contracts are nearly free). Break-even ask at margin 0 is 0.99663.
 Decide these deliberately or a null capture reads as a dead market. Tick is
 0.01, so 0.995 is not a real price.
 
-### [HIGH] BL-11 — `stale_observation_hours` has no shipped value
+### [HIGH] BL-21 — H1's trigger never fires on the LISTED tail
 
-Derived recommendation **12.665h** = max-over-sites P99 issuance gap (MIA
-12.3167h) + live receipt P99 0.3488h. NOT the pooled P99 (12.52h): MIA's own
-P99 exceeds it, so a pooled bound spuriously refuses MIA's slowest ~1% of
-legitimate days. Observed MAX gap 18.80h, so any P99 bound fires on rare
-legitimate days — accept that before live enablement.
+First in-window capture (2026-09-01, 18m49s, 60 instruments, 10088 depth
+records, all five stations): `running_extreme_lock`'s trigger fired **zero**
+times. The venue lists exactly ONE `gte<N>f` per city-day, set 4-8F ABOVE the
+day's actual (MDW 91 vs 97, MIA 91 vs 95, NYC 78 vs 86, SFO 67 vs 72), so
+`H >= X` was never satisfied.
 
-### [MED] BL-12 — CORRECTED: the seam exists; the gap is one dispatch branch
+The margin-conditional Wilson table was built by sweeping floors in `[H-5, H]`
+— floors the venue never lists. It describes a population the strategy cannot
+trade. **Trigger FREQUENCY, not edge size, is now the binding question.**
 
-Earlier text ("cannot be backtested") was overstated. `backtest_harness.py:792`
-already calls `engine.add_data(weather_data, client_id=NWS_BACKTEST_CLIENT_ID)`
-generically and `running_extreme_lock/strategy.py:269` is already subscribed.
-Whole gap: `_build_strategy` (`run_weather_strategy_backtests.py:564-590`) has
-branches for only the three forecast strategies and takes `forecast_source` as
-a MANDATORY positional the observation strategy cannot accept. Add a branch,
-make the param optional. An ECONOMIC result is blocked by BL-18, not by shape.
+All 1824 measured asks sit below the 0.99663 break-even (0.01-0.21) and that is
+MEANINGLESS: those are unreached tails priced correctly. Any analysis must gate
+on `H >= X` BEFORE comparing an ask to a break-even, or it will read a 0.02 ask
+on a tail needing 6F more heat as a 99.7% lock.
+`docs/evidence/first_in_window_capture_2026-09-01.md`.
+
+Open: how often does the daily max beat the venue's listed top rung? Historical
+listings are unavailable, so this needs forward capture or a defensible proxy.
+
+### [LOW] BL-22 — 60 spurious `cache.instrument is None` ERRORs per cycle
+
+Cosmetic, data is sound: the check runs with no `await` after publishing
+(`data.py:720-721`) so the engine has not processed yet; the authoritative gate
+at `:724` passes, and WS frames resolve via `_instrument_provider.find()` first
+(`:1020-1022`). Fix before an unattended run or it buries real errors.
 
 ### [MED] BL-13 — `cli_settlement_print_lock` not implemented
 
