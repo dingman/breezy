@@ -311,7 +311,12 @@ shipped decoder uses bare `json.loads`, destroying the JSON literal. Use
 `json.loads(body, parse_float=Decimal)` on the private-endpoint path. Market prices are
 unaffected — `Amount` (`types/common.py`) carries `value` as a decimal **string**.
 `AccountBalance.currency` must be identically `USD` to match `BinaryOption.currency`
-(`parsing.py:1204`); non-USD is a hard refusal, never a coercion.
+(`parsing.py:1235`, `currency=USD` — the `:1204` citation in revision 2 was wrong, that line
+parses `endDate`); non-USD is a hard refusal, never a coercion. **Reuse, do not rewrite:**
+`_parse_amount` (`parsing.py:463-475`) already refuses non-`USD` and returns `Decimal` for
+`{"value","currency"}` objects. It does NOT cover `UserBalance`, whose fields are bare JSON
+floats — that path is the genuine gap, and `parse_float=Decimal` appears nowhere in the
+codebase today (verified 2026-09-01).
 
 **RED:** `test_balance_decode_preserves_decimal_literal` (`0.1` must not become
 `0.1000000000000000055…`); `test_non_usd_balance_is_refused`; per-report round-trips.
