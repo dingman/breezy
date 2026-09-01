@@ -31,6 +31,7 @@ only by the runner script itself.
 from __future__ import annotations
 
 import datetime as dt
+import math
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
@@ -539,8 +540,12 @@ def first_blocking_gate(
     from breezy.strategy.cli_settlement_print_lock.strategy import (
         MEASURED_P_STABLE_WILSON_LOWER,
     )
-    from breezy.strategy.running_extreme_lock.decision import _vwap_ask_for_quantity
-    from breezy.strategy.weather_common.costs import trade_cost_prob, venue_fee_prob
+    from breezy.strategy.weather_common.costs import (
+        NoExecutableDepthError,
+        depth_aware_trade_cost_prob,
+        venue_fee_prob,
+    )
+    from breezy.strategy.weather_common.ladder import ask_levels, levels_within_price
 
     # The SHIPPED `hours_until`, deliberately not this module's same-named
     # helper: the two take their arguments in OPPOSITE order
@@ -565,24 +570,31 @@ def first_blocking_gate(
     ask_p = quote.implied_ask(scale)
     theta = contract.fee_coefficient
 
+    # MIRRORS `cli_settlement_print_lock.decision.evaluate_instrument`
+    # step for step -- level-0 fee for the anchor premium, the rungs the
+    # shipped marketable IOC limit can lift, then the VWAP-priced edge over
+    # the INTENDED size (s8.5, and BL-25 D1). Any divergence here decodes a
+    # null into the wrong answer, which is the failure `GateLadderDriftError`
+    # below exists to make impossible; the two are pinned by
+    # `test_the_recorded_vwap_is_the_price_the_shipped_decision_actually_used`.
     fee_prob: float | None = None
     edge: float | None = None
     edge_zero_slip: float | None = None
-    if ask_p is not None and 0.0 < ask_p < 1.0 and theta is not None:
-        fee_prob = venue_fee_prob(executable_price=ask_p, fee_coefficient=theta)
-        cost = trade_cost_prob(
-            executable_price=ask_p,
-            fee_coefficient=theta,
-            slippage_prob=cfg.slippage_prob,
-        )
-        edge = MEASURED_P_STABLE_WILSON_LOWER - ask_p - cost
-        edge_zero_slip = edge + cfg.slippage_prob
-
-    # The quantity the shipped sizing rule would ask for, so the VWAP walk is
-    # taken at the INTENDED size rather than an arbitrary one (s8.5).
     vwap_ask: float | None = None
     vwap_filled: float | None = None
-    if ask_p is not None and theta is not None and 0.0 < ask_p < 1.0 and fee_prob is not None:
+    if ask_p is not None and 0.0 < ask_p < 1.0 and theta is not None:
+        level0_fee_prob = venue_fee_prob(executable_price=ask_p, fee_coefficient=theta)
+        # The level-0 PRE-SCREEN the shipped decision runs first, recorded as
+        # the fallback so a book too thin to fill one contract is still
+        # attributed to the SIZE gate (`GATE_QUANTITY_BELOW_ONE`) rather than
+        # collapsing into `GATE_EDGE_BELOW_MINIMUM` for want of an edge.
+        fee_prob = level0_fee_prob
+        edge = (
+            MEASURED_P_STABLE_WILSON_LOWER
+            - ask_p
+            - (level0_fee_prob + cfg.slippage_prob)
+        )
+        edge_zero_slip = edge + cfg.slippage_prob
         anchor = cost_basis_anchor(
             base_quantity=cfg.base_quantity,
             worst_ask=worst_admissible_ask(
@@ -594,16 +606,31 @@ def first_blocking_gate(
             ),
             fee_coefficient=theta,
         )
-        intended = min(cfg.max_quantity, anchor / (ask_p + fee_prob), quote.ask_size or 0.0)
-        ladder = (
-            quote.ask_ladder
-            if quote.ask_ladder is not None
-            else ((quote.ask or 0.0, quote.ask_size or 0.0),)
+        reachable = levels_within_price(
+            ask_levels(quote),
+            (quote.ask or 0.0) + cfg.slippage_prob / scale,
         )
-        walked = _vwap_ask_for_quantity(ladder, max(intended, 0.0))
-        if walked is not None:
-            vwap_ask = walked[0] * scale
-            vwap_filled = walked[1]
+        reachable_depth = sum(size for price, size in reachable if size > 0.0 and price > 0.0)
+        candidate = math.floor(
+            min(cfg.max_quantity, anchor / (ask_p + level0_fee_prob), reachable_depth),
+        )
+        if candidate >= 1:
+            try:
+                cost_detail = depth_aware_trade_cost_prob(
+                    ask_levels=reachable,
+                    quantity=float(candidate),
+                    price_scale=scale,
+                    fee_coefficient=theta,
+                    slippage_floor_prob=cfg.slippage_prob,
+                )
+            except NoExecutableDepthError:
+                cost_detail = None
+            if cost_detail is not None and 0.0 < cost_detail.executable_price < 1.0:
+                vwap_ask = cost_detail.executable_price
+                vwap_filled = float(math.floor(cost_detail.fillable_quantity))
+                fee_prob = cost_detail.fee_prob
+                edge = MEASURED_P_STABLE_WILSON_LOWER - vwap_ask - cost_detail.total_prob
+                edge_zero_slip = edge + cost_detail.slippage_prob
 
     if hours_to_settlement <= cfg.halt_hours_before_settlement:
         gate = GATE_HALT_WINDOW

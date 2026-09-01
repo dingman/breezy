@@ -1370,3 +1370,268 @@ def test_every_recorded_refusal_reason_is_within_the_counted_set() -> None:
 
     assert set(counter.counts) <= risk_module.COUNTED_REFUSAL_REASONS
     assert counter.total() > 0
+
+
+# ---------------------------------------------------------------------------
+# BL-25 D2 -- clipping the order to the depth that actually exists
+#
+# `clipped_quantity` was clipped to `max_position_contracts`, the notional
+# caps and the equity cap, but NEVER to the book. Measured over the captured
+# ladder (`~/.local/share/breezy/catalog/quote_tape/polymarket_us`, `data/`
+# AND `live/`): a $24.53 order exceeds level-0 ask size in 57.4% of snapshots
+# and exhausts all ten recorded levels in 6.5%; the winning rung was offered
+# 0.58 contracts while worthless rungs carried a median 35,991. So the system
+# could "buy" 24.8 contracts where 0.58 exist.
+# ---------------------------------------------------------------------------
+
+
+def _depth_quote(
+    *,
+    ask: float = 0.42,
+    ask_size: float | None = 100.0,
+    ask_ladder: tuple[tuple[float, float], ...] | None = None,
+) -> MarketQuote:
+    """A one-sided ask book, so top-of-book size is the only liquidity term."""
+    return MarketQuote(
+        instrument_id="ANY",
+        bid=None,
+        ask=ask,
+        bid_size=None,
+        ask_size=ask_size,
+        ts_event=NOW,
+        ask_ladder=ask_ladder,
+    )
+
+
+def _permissive_limits(**overrides: object) -> RiskLimits:
+    """Every cap wide open, so a clip observed below is the DEPTH clip."""
+    defaults: dict[str, object] = {
+        "max_position_contracts": 10_000.0,
+        "max_event_notional": 1_000_000.0,
+        "max_location_notional": 1_000_000.0,
+        "max_equity_fraction": 1.0,
+        "min_liquidity_contracts": 0.0,
+    }
+    defaults.update(overrides)
+    return RiskLimits(**defaults)  # type: ignore[arg-type]
+
+
+def test_a_buy_is_clipped_to_the_visible_top_of_book_depth() -> None:
+    contract = _contract("A", lower_f=80, upper_f=None)
+    risk = RiskManager(_permissive_limits(), {"A": contract})
+
+    decision = risk.evaluate_order(
+        contract=contract,
+        signed_qty_delta=24.8,
+        hours_to_settlement=24.0,
+        signal_age=FRESH,
+        edge=0.50,
+        portfolio=PortfolioSnapshot(equity=10_000.0),
+        quote=_depth_quote(ask=0.99, ask_size=0.58),
+        quote_age_minutes=0.0,
+    )
+
+    assert decision.allowed is False
+    assert decision.reason == "insufficient_depth"
+
+
+def test_a_buy_is_clipped_to_depth_when_a_whole_contract_still_fits() -> None:
+    contract = _contract("A", lower_f=80, upper_f=None)
+    risk = RiskManager(_permissive_limits(), {"A": contract})
+
+    decision = risk.evaluate_order(
+        contract=contract,
+        signed_qty_delta=200.0,
+        hours_to_settlement=24.0,
+        signal_age=FRESH,
+        edge=0.50,
+        portfolio=PortfolioSnapshot(equity=10_000.0),
+        quote=_depth_quote(ask_size=12.0),
+        quote_age_minutes=0.0,
+    )
+
+    assert decision.allowed is True
+    assert decision.clipped_quantity == pytest.approx(12.0)
+
+
+def test_a_buy_is_clipped_to_the_whole_ladder_when_the_quote_carries_one() -> None:
+    """The ladder is the depth the depth-aware COST priced (BL-25 D1)."""
+    contract = _contract("A", lower_f=80, upper_f=None)
+    risk = RiskManager(_permissive_limits(), {"A": contract})
+
+    decision = risk.evaluate_order(
+        contract=contract,
+        signed_qty_delta=200.0,
+        hours_to_settlement=24.0,
+        signal_age=FRESH,
+        edge=0.50,
+        portfolio=PortfolioSnapshot(equity=10_000.0),
+        quote=_depth_quote(
+            ask=0.90,
+            ask_size=5.0,
+            ask_ladder=((0.90, 5.0), (0.95, 20.0), (0.99, 50.0)),
+        ),
+        quote_age_minutes=0.0,
+    )
+
+    assert decision.allowed is True
+    assert decision.clipped_quantity == pytest.approx(75.0)
+
+
+def test_a_ladder_exhausted_before_the_request_never_silently_over_fills() -> None:
+    contract = _contract("A", lower_f=80, upper_f=None)
+    risk = RiskManager(_permissive_limits(), {"A": contract})
+
+    requested = 10_000.0
+    decision = risk.evaluate_order(
+        contract=contract,
+        signed_qty_delta=requested,
+        hours_to_settlement=24.0,
+        signal_age=FRESH,
+        edge=0.50,
+        portfolio=PortfolioSnapshot(equity=1_000_000.0),
+        quote=_depth_quote(
+            ask=0.90,
+            ask_size=5.0,
+            ask_ladder=((0.90, 5.0), (0.95, 20.0), (0.99, 50.0)),
+        ),
+        quote_age_minutes=0.0,
+    )
+
+    assert decision.allowed is True
+    assert decision.clipped_quantity < requested
+    assert decision.clipped_quantity == pytest.approx(75.0)
+
+
+def test_a_request_inside_the_visible_depth_is_not_clipped_at_all() -> None:
+    contract = _contract("A", lower_f=80, upper_f=None)
+    risk = RiskManager(_permissive_limits(), {"A": contract})
+
+    decision = risk.evaluate_order(
+        contract=contract,
+        signed_qty_delta=10.0,
+        hours_to_settlement=24.0,
+        signal_age=FRESH,
+        edge=0.50,
+        portfolio=PortfolioSnapshot(equity=10_000.0),
+        quote=_depth_quote(ask_size=100.0),
+        quote_age_minutes=0.0,
+    )
+
+    assert decision.allowed is True
+    assert decision.clipped_quantity == pytest.approx(10.0)
+
+
+def test_the_position_cap_still_binds_when_it_is_tighter_than_depth() -> None:
+    contract = _contract("A", lower_f=80, upper_f=None)
+    risk = RiskManager(_permissive_limits(max_position_contracts=6.0), {"A": contract})
+
+    decision = risk.evaluate_order(
+        contract=contract,
+        signed_qty_delta=200.0,
+        hours_to_settlement=24.0,
+        signal_age=FRESH,
+        edge=0.50,
+        portfolio=PortfolioSnapshot(equity=10_000.0),
+        quote=_depth_quote(ask_size=100.0),
+        quote_age_minutes=0.0,
+    )
+
+    assert decision.allowed is True
+    assert decision.clipped_quantity == pytest.approx(6.0)
+
+
+def test_the_equity_cap_still_binds_when_it_is_tighter_than_depth() -> None:
+    contract = _contract("A", lower_f=80, upper_f=None)
+    risk = RiskManager(_permissive_limits(max_equity_fraction=0.05), {"A": contract})
+
+    decision = risk.evaluate_order(
+        contract=contract,
+        signed_qty_delta=200.0,
+        hours_to_settlement=24.0,
+        signal_age=FRESH,
+        edge=0.50,
+        portfolio=PortfolioSnapshot(equity=100.0),
+        quote=_depth_quote(ask_size=100.0),
+        quote_age_minutes=0.0,
+    )
+
+    assert decision.allowed is True
+    # 0.05 * 100 equity / 1.0 contract_size = 5 contracts, tighter than 100.
+    assert decision.clipped_quantity == pytest.approx(5.0)
+
+
+def test_the_notional_cap_still_binds_when_it_is_tighter_than_depth() -> None:
+    contract = _contract("A", lower_f=80, upper_f=None)
+    risk = RiskManager(_permissive_limits(max_event_notional=4.0), {"A": contract})
+
+    decision = risk.evaluate_order(
+        contract=contract,
+        signed_qty_delta=200.0,
+        hours_to_settlement=24.0,
+        signal_age=FRESH,
+        edge=0.50,
+        portfolio=PortfolioSnapshot(equity=10_000.0),
+        quote=_depth_quote(ask_size=100.0),
+        quote_age_minutes=0.0,
+    )
+
+    assert decision.allowed is False
+    assert decision.reason == "max_event_notional"
+
+
+def test_an_insufficient_depth_refusal_is_recorded_on_the_counter() -> None:
+    counter = RefusalCounter()
+    contract = _contract("A", lower_f=80, upper_f=None)
+    risk = RiskManager(_permissive_limits(), {"A": contract}, refusals=counter)
+
+    risk.evaluate_order(
+        contract=contract,
+        signed_qty_delta=24.8,
+        hours_to_settlement=24.0,
+        signal_age=FRESH,
+        edge=0.50,
+        portfolio=PortfolioSnapshot(equity=10_000.0),
+        quote=_depth_quote(ask=0.99, ask_size=0.58),
+        quote_age_minutes=0.0,
+    )
+
+    assert counter.count("insufficient_depth") == 1
+
+
+def test_insufficient_depth_is_a_bounded_counted_refusal_reason() -> None:
+    assert "insufficient_depth" in risk_module.COUNTED_REFUSAL_REASONS
+
+
+def test_a_position_reducing_sell_is_not_clipped_to_ask_depth() -> None:
+    """Deliberate asymmetry, recorded rather than assumed.
+
+    The depth clip prices a TAKER against the ASK. A sell takes the BID, and
+    `MarketQuote` carries no bid ladder; clipping an exit to a bid side whose
+    measured top-of-book median is 0.3 contracts would trap positions the
+    close-only guard exists to let out. Revisit only with a bid ladder in
+    hand.
+    """
+    contract = _contract("A", lower_f=80, upper_f=None)
+    risk = RiskManager(_permissive_limits(), {"A": contract})
+
+    decision = risk.evaluate_order(
+        contract=contract,
+        signed_qty_delta=-50.0,
+        hours_to_settlement=24.0,
+        signal_age=FRESH,
+        edge=0.50,
+        portfolio=PortfolioSnapshot(position_qty={"A": 50.0}, equity=10_000.0),
+        quote=MarketQuote(
+            instrument_id="ANY",
+            bid=0.40,
+            ask=0.42,
+            bid_size=0.3,
+            ask_size=0.3,
+            ts_event=NOW,
+        ),
+        quote_age_minutes=0.0,
+    )
+
+    assert decision.allowed is True
+    assert decision.clipped_quantity == pytest.approx(-50.0)

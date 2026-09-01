@@ -14,6 +14,7 @@ the SETTLEMENT-TIME authority, and they must not drift.
 
 from __future__ import annotations
 
+import inspect
 import math
 from decimal import Decimal
 
@@ -23,8 +24,11 @@ from nautilus_trader.model.objects import Price, Quantity
 
 from breezy.adapters.polymarket_us.fees import PolymarketUSFeeModel
 from breezy.strategy.weather_common.costs import (
+    DepthAwareTradeCost,
     FeeCoefficientSource,
+    NoExecutableDepthError,
     UnknownFeeScheduleError,
+    depth_aware_trade_cost_prob,
     trade_cost_prob,
     venue_fee_prob,
 )
@@ -243,3 +247,233 @@ def test_venue_fee_prob_times_contracts_agrees_with_the_settlement_fee_model(
     # `1e-9` is float slack for the half-cent boundary (0.135 -> 0.14), not a
     # loosening of the agreement.
     assert abs(estimate - float(authority.as_double())) <= 0.005 + 1e-9
+
+
+# ---------------------------------------------------------------------------
+# `depth_aware_trade_cost_prob` -- BL-25 D1
+#
+# The flat additive `slippage_prob` is the wrong SHAPE, not merely an
+# unmeasured value. Measured over the captured ladder
+# (`~/.local/share/breezy/catalog/quote_tape/polymarket_us`, `data/` AND
+# `live/`): a $24.53 order exceeds level-0 ask size in 57.4% of snapshots and
+# exhausts all ten recorded levels in 6.5%; realised walk-the-book slippage
+# (VWAP - level-0 ask) is 0.0026 at the median but 0.137 at p90 and 0.661 at
+# p99, and 36.0% of snapshots exceed the flat 0.01 floor from the recorded
+# book ALONE. Cost therefore depends on the SIZE being taken, and is priced
+# here at the VWAP of the ladder actually consumed.
+# ---------------------------------------------------------------------------
+
+#: Level 0 cheap and thin, the rungs behind it expensive -- the measured shape.
+THIN_TOP_LADDER: tuple[tuple[float, float], ...] = ((0.90, 5.0), (0.95, 20.0), (0.99, 50.0))
+
+
+def test_depth_aware_cost_prices_the_vwap_of_the_intended_size_not_level_zero() -> None:
+    inside_level_zero = depth_aware_trade_cost_prob(
+        ask_levels=THIN_TOP_LADDER,
+        quantity=5.0,
+        price_scale=1.0,
+        fee_coefficient=THETA,
+        slippage_floor_prob=0.01,
+    )
+    through_level_one = depth_aware_trade_cost_prob(
+        ask_levels=THIN_TOP_LADDER,
+        quantity=25.0,
+        price_scale=1.0,
+        fee_coefficient=THETA,
+        slippage_floor_prob=0.01,
+    )
+
+    assert inside_level_zero.executable_price == pytest.approx(0.90)
+    # (5 * 0.90 + 20 * 0.95) / 25 -- the price actually paid, not the tick.
+    assert through_level_one.executable_price == pytest.approx(0.94)
+    assert through_level_one.top_of_book_price == pytest.approx(0.90)
+    assert through_level_one.slippage_prob == pytest.approx(0.04)
+    assert through_level_one.total_prob > inside_level_zero.total_prob
+
+
+def test_depth_aware_cost_rises_with_intended_size_on_a_fixed_ladder() -> None:
+    """The property the flat constant cannot express at all.
+
+    The monotone quantity is the ALL-IN price -- ``executable_price +
+    total_prob``, which is exactly what the edge is netted against. It rises
+    strictly the moment a request walks past a level, and never falls.
+
+    ``total_prob`` ALONE is deliberately NOT asserted monotone, because it is
+    not: the venue fee ``theta * p * (1 - p)`` is concave and DECREASING above
+    p = 0.5, so walking from 0.90 to 0.9083 shrinks the fee by more than the
+    (still sub-floor) concession adds. Asserting a monotone `total_prob` would
+    be asserting something false about the venue's own fee formula. The edge
+    gate consumes price-plus-cost, and that is what is pinned here.
+    """
+
+    def _cost(quantity: float) -> DepthAwareTradeCost:
+        return depth_aware_trade_cost_prob(
+            ask_levels=THIN_TOP_LADDER,
+            quantity=quantity,
+            price_scale=1.0,
+            fee_coefficient=THETA,
+            slippage_floor_prob=0.01,
+        )
+
+    def _all_in(quantity: float) -> float:
+        cost = _cost(quantity)
+        return cost.executable_price + cost.total_prob
+
+    sizes = (1.0, 5.0, 6.0, 25.0, 26.0, 75.0)
+
+    assert [_all_in(q) for q in sizes] == sorted(_all_in(q) for q in sizes)
+    assert [_cost(q).slippage_prob for q in sizes] == sorted(
+        _cost(q).slippage_prob for q in sizes
+    )
+    # Level boundaries at 5 and 25 contracts: crossing one must cost more.
+    assert _all_in(6.0) > _all_in(5.0)
+    assert _all_in(26.0) > _all_in(25.0)
+    # 0.9154 inside level 0 against 1.0482 for the whole ladder: a size the
+    # old flat constant priced identically at both.
+    assert _all_in(75.0) > _all_in(1.0) + 0.13
+
+
+def test_depth_aware_cost_never_prices_below_the_configured_slippage_floor() -> None:
+    """The 0.01 floor is a SAFETY floor. Depth-awareness may only raise it.
+
+    `docs/plans/...` and `SLIPPAGE_PROB_CLI_SETTLEMENT_PRINT_LOCK`: a floor of
+    zero restores the exact unsafe configuration the structured cost term
+    exists to forbid, so the depth walk is a `max`, never a replacement.
+    """
+    deep_and_flat = depth_aware_trade_cost_prob(
+        ask_levels=((0.90, 10_000.0),),
+        quantity=25.0,
+        price_scale=1.0,
+        fee_coefficient=THETA,
+        slippage_floor_prob=0.01,
+    )
+
+    assert deep_and_flat.slippage_prob == pytest.approx(0.01)
+    assert deep_and_flat.total_prob == pytest.approx(
+        trade_cost_prob(executable_price=0.90, fee_coefficient=THETA, slippage_prob=0.01),
+    )
+
+
+def test_depth_aware_cost_agrees_with_the_flat_cost_on_a_single_level_book() -> None:
+    """No ladder, no walk: the new path must reduce to the shipped one."""
+    for price in (0.99, 0.90, 0.65, 0.50, 0.21, 0.02):
+        cost = depth_aware_trade_cost_prob(
+            ask_levels=((price, 500.0),),
+            quantity=25.0,
+            price_scale=1.0,
+            fee_coefficient=THETA,
+            slippage_floor_prob=0.01,
+        )
+        assert cost.total_prob == pytest.approx(
+            trade_cost_prob(
+                executable_price=price, fee_coefficient=THETA, slippage_prob=0.01,
+            ),
+            abs=1e-12,
+        )
+
+
+def test_depth_aware_cost_reports_what_the_ladder_could_actually_fill() -> None:
+    cost = depth_aware_trade_cost_prob(
+        ask_levels=THIN_TOP_LADDER,
+        quantity=500.0,
+        price_scale=1.0,
+        fee_coefficient=THETA,
+        slippage_floor_prob=0.01,
+    )
+
+    assert cost.requested_quantity == pytest.approx(500.0)
+    assert cost.fillable_quantity == pytest.approx(75.0)
+    assert cost.depth_exhausted is True
+
+
+def test_depth_aware_cost_scales_raw_venue_prices_into_probability_units() -> None:
+    """A cent-quoted market: the ladder is raw, the cost is a probability."""
+    cost = depth_aware_trade_cost_prob(
+        ask_levels=((90.0, 5.0), (95.0, 20.0)),
+        quantity=25.0,
+        price_scale=0.01,
+        fee_coefficient=THETA,
+        slippage_floor_prob=0.01,
+    )
+
+    assert cost.executable_price == pytest.approx(0.94)
+    assert cost.slippage_prob == pytest.approx(0.04)
+
+
+@pytest.mark.parametrize("theta", [-0.01, 1.01, float("nan"), float("inf")])
+def test_depth_aware_cost_refuses_an_unusable_fee_coefficient(theta: float) -> None:
+    """The refusal posture of `venue_fee_prob` must not regress under D1."""
+    with pytest.raises(ValueError):
+        depth_aware_trade_cost_prob(
+            ask_levels=THIN_TOP_LADDER,
+            quantity=25.0,
+            price_scale=1.0,
+            fee_coefficient=theta,
+            slippage_floor_prob=0.01,
+        )
+
+
+def test_depth_aware_cost_has_no_default_fee_coefficient_to_fall_back_on() -> None:
+    """`adapters.polymarket_us.fees` refuses rather than trading free.
+
+    A default here would reintroduce exactly the fallback it refuses, so the
+    parameter is REQUIRED -- the unknown-schedule refusal happens at
+    resolution time and cannot be bypassed by calling this function.
+    """
+    signature = inspect.signature(depth_aware_trade_cost_prob)
+
+    assert signature.parameters["fee_coefficient"].default is inspect.Parameter.empty
+    assert signature.parameters["slippage_floor_prob"].default is inspect.Parameter.empty
+
+
+def test_an_unresolved_fee_schedule_still_refuses_instead_of_pricing_a_trade() -> None:
+    class _NoSchedule:
+        def fee_coefficient_for(self, instrument_id: str) -> float:
+            raise UnknownFeeScheduleError(f"no schedule for {instrument_id}")
+
+    source: FeeCoefficientSource = _NoSchedule()
+
+    with pytest.raises(UnknownFeeScheduleError):
+        depth_aware_trade_cost_prob(
+            ask_levels=THIN_TOP_LADDER,
+            quantity=25.0,
+            price_scale=1.0,
+            fee_coefficient=source.fee_coefficient_for("KNYC-80-84.SIM"),
+            slippage_floor_prob=0.01,
+        )
+
+
+def test_depth_aware_cost_refuses_a_book_with_no_executable_depth() -> None:
+    """No depth is a NO-TRADE, never a level-0-priced trade of unknown size."""
+    with pytest.raises(NoExecutableDepthError):
+        depth_aware_trade_cost_prob(
+            ask_levels=(),
+            quantity=25.0,
+            price_scale=1.0,
+            fee_coefficient=THETA,
+            slippage_floor_prob=0.01,
+        )
+    with pytest.raises(NoExecutableDepthError):
+        depth_aware_trade_cost_prob(
+            ask_levels=((0.90, 0.0),),
+            quantity=25.0,
+            price_scale=1.0,
+            fee_coefficient=THETA,
+            slippage_floor_prob=0.01,
+        )
+
+
+def test_no_executable_depth_error_is_a_value_error() -> None:
+    assert issubclass(NoExecutableDepthError, ValueError)
+
+
+@pytest.mark.parametrize("floor", [-0.001, float("nan"), float("inf")])
+def test_depth_aware_cost_refuses_a_negative_or_non_finite_slippage_floor(floor: float) -> None:
+    with pytest.raises(ValueError):
+        depth_aware_trade_cost_prob(
+            ask_levels=THIN_TOP_LADDER,
+            quantity=25.0,
+            price_scale=1.0,
+            fee_coefficient=THETA,
+            slippage_floor_prob=floor,
+        )

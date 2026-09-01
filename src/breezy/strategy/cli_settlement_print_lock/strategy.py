@@ -669,7 +669,13 @@ class CliSettlementPrintLockStrategy(SharedExposureMixin, Strategy):
         iid = str(depth.instrument_id)
         if iid not in self._contracts:
             return
-        quote = market_quote_from_depth(depth)
+        # WITH the ask ladder (BL-25 D1). The decision layer prices and sizes
+        # over the rungs its own marketable IOC limit can lift, not the
+        # level-0 tick alone -- see `decision.evaluate_instrument`. Level-0
+        # `ask`/`ask_size` are unchanged by this flag, so every other reader
+        # of the quote (the risk manager's liquidity and spread screens, the
+        # marketable limit price) sees exactly what it saw before.
+        quote = market_quote_from_depth(depth, include_ask_ladder=True)
         if quote is None:
             return
         self._quotes[iid] = quote

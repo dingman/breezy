@@ -32,6 +32,7 @@ from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Final
 
 from breezy.strategy.weather_common.freshness import SignalKind
+from breezy.strategy.weather_common.ladder import available_ask_depth
 from breezy.strategy.weather_common.refusals import SHORTS_DISABLED, RefusalCounter
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
@@ -78,6 +79,7 @@ COUNTED_REFUSAL_REASONS: Final[frozenset[str]] = frozenset(
         "max_location_notional",
         "max_simultaneous_positions",
         "equity_fraction",
+        "insufficient_depth",
     },
 )
 
@@ -481,6 +483,29 @@ class RiskManager:
             if clipped < 1.0:
                 return self._refuse("equity_fraction")
             signed_qty_delta = clipped if signed_qty_delta > 0 else -clipped
+
+        # DEPTH, last and tightest (BL-25 D2). Every clip above is a POLICY
+        # cap -- how much we are willing to hold. This one is a FACT about the
+        # book: how much is actually offered. It runs last so a tighter policy
+        # cap always still binds, and it can only ever reduce the order.
+        #
+        # BUY SIDE ONLY, deliberately. A buy takes the ask, and `MarketQuote`
+        # carries an ask ladder (`ask_ladder`, else top-of-book) that
+        # `weather_common.ladder.available_ask_depth` reads. A sell takes the
+        # BID, for which there is no ladder field at all, and the measured
+        # top-of-book bid on this venue is ~0.3 contracts -- clipping an exit
+        # to that would trap positions the close-only guard exists to let out,
+        # which is a worse failure than the one being fixed. Revisit only with
+        # a recorded bid ladder in hand.
+        if signed_qty_delta > 0:
+            depth = available_ask_depth(quote)
+            if depth < 1.0:
+                # Mirrors the `equity_fraction` branch above: a sub-one-contract
+                # allowance is not a smaller order, it is no order. Refused
+                # rather than rounded up -- rounding up is exactly the
+                # "buy 24.8 where 0.58 exist" behaviour this closes.
+                return self._refuse("insufficient_depth")
+            signed_qty_delta = min(signed_qty_delta, depth)
 
         return RiskDecision(True, "ok", clipped_quantity=signed_qty_delta)
 

@@ -150,7 +150,13 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, Final
 
 from breezy.domain.weather_bucket_facts import Measure
-from breezy.strategy.weather_common.costs import trade_cost_prob, venue_fee_prob
+from breezy.strategy.weather_common.costs import (
+    NoExecutableDepthError,
+    depth_aware_trade_cost_prob,
+    trade_cost_prob,
+    venue_fee_prob,
+)
+from breezy.strategy.weather_common.ladder import ask_levels, levels_within_price
 from breezy.strategy.weather_common.models import SideIntent, SignalDecision, ensure_aware
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
@@ -416,27 +422,23 @@ def evaluate_instrument(
         # degenerate-ask guard above.
         return None
 
-    # Edge against the ASK actually paid, never the midpoint -- every fill is
-    # a taker (module docstring, and the brief's non-negotiable look-ahead /
-    # execution rules). Cost is the venue's own concave fee PLUS the execution
-    # term, computed separately and never read from one configurable scalar.
-    fee_prob = venue_fee_prob(executable_price=ask_p, fee_coefficient=fee_coefficient)
-    cost = trade_cost_prob(
+    # PRE-SCREEN at the BEST possible price -- level 0. Cheap, and it can only
+    # over-admit: the depth-aware repricing below is monotone worse, so
+    # anything this refuses the true price would refuse too.
+    level0_fee_prob = venue_fee_prob(executable_price=ask_p, fee_coefficient=fee_coefficient)
+    level0_cost = trade_cost_prob(
         executable_price=ask_p,
         fee_coefficient=fee_coefficient,
         slippage_prob=cfg.slippage_prob,
     )
-    edge = model_p - ask_p - cost
-    if edge < cfg.min_edge_after_costs:
+    if model_p - ask_p - level0_cost < cfg.min_edge_after_costs:
         return None
 
     # Sizing: CONSTANT DOLLAR COST BASIS. The largest WHOLE contract count
     # whose PREMIUM (`ask + fee(ask)` -- the entire downside of a long-only
     # binary) stays within the anchor `A`, bounded by `max_quantity` and by
-    # the visible ask depth so the price above is the price the whole order
-    # actually pays. Never affine in `edge`: see the module docstring. Nothing
-    # the edge gate admitted above can be refused here, because
-    # `A / (ask + fee(ask)) >= base_quantity` for every `ask <= a_max`.
+    # the depth the book actually offers. Never affine in `edge`: see the
+    # module docstring.
     #
     # Payout-dollar caps (`max_event_notional`, `max_location_notional`,
     # `max_position_contracts`, `max_equity_fraction`,
@@ -454,10 +456,79 @@ def evaluate_instrument(
         ),
         fee_coefficient=fee_coefficient,
     )
-    premium = ask_p + fee_prob
-    visible_depth = quote.ask_size or 0.0
-    quantity = math.floor(min(cfg.max_quantity, anchor / premium, visible_depth))
+    # THE RUNGS THIS STRATEGY CAN ACTUALLY LIFT. The execution seam submits a
+    # MARKETABLE IOC LIMIT at `ask + slippage_prob` (`strategy.py`'s
+    # `_marketable_limit_price`, and the "EXECUTION SEAM" section of that
+    # module's docstring): no fill can occur above that price. Rungs above it
+    # are not liquidity available to this strategy, so sizing or pricing
+    # against them would model a fill it structurally cannot get. The bound is
+    # computed WITHOUT the execution layer's round-UP-to-a-tick, so it is
+    # never looser than the limit actually emitted.
+    #
+    # At the shipped configuration (`slippage_prob` = 0.01 = one tick) this
+    # admits at most one rung past the top of book, and any such rung concedes
+    # at most one tick -- so the effective slippage equals the floor and the
+    # arithmetic below reduces to what it was before. That equality is the
+    # POINT: it is now structural rather than a coincidence between two
+    # modules. Raise `slippage_prob` and the strategy becomes willing to lift
+    # deeper rungs, and the edge is repriced at their true VWAP instead of
+    # still being computed off the level-0 tick (BL-25 D1).
+    reachable = levels_within_price(
+        ask_levels(quote),
+        (quote.ask or 0.0) + cfg.slippage_prob / scale,
+    )
+    reachable_depth = sum(size for price, size in reachable if size > 0.0 and price > 0.0)
+    candidate = math.floor(
+        min(cfg.max_quantity, anchor / (ask_p + level0_fee_prob), reachable_depth),
+    )
+    if candidate < 1:
+        return None
+
+    # --- DEPTH-AWARE REPRICING (BL-25 D1) ---------------------------------
+    # Size and price are mutually dependent: a bigger size walks deeper into
+    # the ask ladder, worsening the VWAP, which shrinks the edge. Resolved as
+    # SIZE-FIRST-THEN-REPRICE, exactly as `running_extreme_lock.decision`
+    # resolves it and for the same reason -- an iterative largest-size search
+    # would converge (edge is monotonically non-increasing in size) but is
+    # unwarranted for a v1 rule whose inputs are themselves coarse.
+    #
+    # `candidate` was sized at the level-0 premium, which is the SMALLEST
+    # possible premium and therefore the LARGEST size the anchor could ever
+    # buy. Repricing it at the true VWAP can only make the premium bigger, and
+    # the anchor is re-applied at that true premium downstream by
+    # `strategy._clip_to_cost_basis_anchor`, which reads
+    # `decision.market_probability + metadata["fee_prob"]` -- both of which are
+    # the VWAP-based figures set below. So the dollar budget is enforced at the
+    # honest price, not at the level-0 estimate, without a second walk here.
+    #
+    # With no `ask_ladder` on the quote this reduces EXACTLY to the previous
+    # level-0 arithmetic (`weather_common.ladder.ask_levels` synthesises a
+    # one-level ladder from top-of-book), so a ladderless quote is unaffected.
+    try:
+        cost_detail = depth_aware_trade_cost_prob(
+            ask_levels=reachable,
+            quantity=float(candidate),
+            price_scale=scale,
+            fee_coefficient=fee_coefficient,
+            slippage_floor_prob=cfg.slippage_prob,
+        )
+    except NoExecutableDepthError:
+        # No real depth is a no-trade, never a level-0-priced trade.
+        return None
+    vwap_ask_p = cost_detail.executable_price
+    if vwap_ask_p <= 0.0 or vwap_ask_p >= 1.0:
+        # Defensive: a degenerate deeper level (bad venue data) must not
+        # produce a degenerate VWAP once the top-of-book guard has passed.
+        return None
+    fee_prob = cost_detail.fee_prob
+    cost = cost_detail.total_prob
+    quantity = math.floor(cost_detail.fillable_quantity)
     if quantity < 1:
+        return None
+
+    # Edge vs the VWAP-priced ask actually consumed, never the level-0 tick.
+    edge = model_p - vwap_ask_p - cost
+    if edge < cfg.min_edge_after_costs:
         return None
 
     # STRUCTURALLY 0 on every interior bucket -- the venue's ladder interiors
@@ -470,7 +541,7 @@ def evaluate_instrument(
         instrument_id=contract.instrument_id,
         intent=SideIntent.LONG_YES,
         model_probability=model_p,
-        market_probability=ask_p,
+        market_probability=vwap_ask_p,
         edge=edge,
         conviction=min(1.0, margin_f / float(CONVICTION_FULL_MARGIN_F)),
         quantity=float(quantity),
@@ -490,7 +561,22 @@ def evaluate_instrument(
             # two cost terms separate and named.
             "fee_coefficient": fee_coefficient,
             "fee_prob": fee_prob,
-            "slippage_prob": cfg.slippage_prob,
+            # The EFFECTIVE execution term actually charged --
+            # `max(cfg.slippage_prob, VWAP - level-0 ask)`. The configured
+            # floor is carried beside it as `slippage_floor_prob` so s8.5's
+            # "computed edge at slippage_prob in {0.000, 0.010}" stays
+            # re-derivable offline and the two are never confused.
+            "slippage_prob": cost_detail.slippage_prob,
+            "slippage_floor_prob": cfg.slippage_prob,
+            "level0_ask_prob": ask_p,
+            "vwap_ask_prob": vwap_ask_p,
+            # RAW venue units, unlike every price above. The execution layer
+            # prices its marketable IOC limit off this and only this: a limit
+            # at the VWAP would stop halfway up the ladder the edge was
+            # computed over, turning a priced order into a partial fill at an
+            # unmodelled average.
+            "worst_ask_raw": cost_detail.worst_price / scale,
+            "depth_exhausted": int(cost_detail.depth_exhausted),
             # `A`, carried on the decision because it is the number the
             # EXECUTION layer needs to hold the POSITION -- not merely this
             # decision -- inside the design budget. `quantity` above is a

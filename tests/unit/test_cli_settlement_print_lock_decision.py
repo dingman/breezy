@@ -113,6 +113,7 @@ def _quote(
     ts_event: dt.datetime = NOW,
     ask_size: float = 500.0,
     mid: float | None = None,
+    ask_ladder: tuple[tuple[float, float], ...] | None = None,
 ) -> MarketQuote:
     return MarketQuote(
         instrument_id=INSTRUMENT_ID,
@@ -122,6 +123,7 @@ def _quote(
         ask_size=ask_size if ask is not None else None,
         ts_event=ts_event,
         mid=mid,
+        ask_ladder=ask_ladder,
     )
 
 
@@ -824,3 +826,138 @@ def test_sizing_does_not_consume_conviction() -> None:
     assert interior.conviction == 0.0
     assert tail.conviction == 1.0
     assert interior.quantity == tail.quantity
+
+
+# ---------------------------------------------------------------------------
+# BL-25 D1 -- the edge is priced at the price the order would actually PAY
+#
+# The shipped cost was `venue_fee_prob(level-0 ask) + a flat slippage_prob`,
+# and the size was clipped to level-0 `ask_size`. Measured over the captured
+# ladder (`data/` AND `live/`): a $24.53 order exceeds level-0 ask size in
+# 57.4% of snapshots, exhausts all ten recorded levels in 6.5%, and 36.0% of
+# snapshots concede more than the flat 0.01 from the recorded book alone.
+# Cost is a function of SIZE, so the decision walks the ladder for the size it
+# intends and re-gates the edge at that VWAP.
+# ---------------------------------------------------------------------------
+
+
+def test_a_quote_with_no_ladder_prices_exactly_as_it_did_before() -> None:
+    """Backward compatibility pin: no ladder means the walk is level 0."""
+    decision = _evaluate(quote=_quote(ask=0.90, ask_size=7.0))
+
+    assert decision is not None
+    assert decision.market_probability == pytest.approx(0.90)
+    assert decision.quantity == 7.0
+    assert decision.metadata["slippage_prob"] == pytest.approx(SLIPPAGE)
+
+
+def test_the_strategy_never_sizes_past_the_price_its_own_ioc_limit_can_lift() -> None:
+    """The execution seam is a marketable IOC LIMIT at `ask + slippage_prob`.
+
+    At the shipped one-tick `slippage_prob` a rung at 0.92 against a 0.90 ask
+    is TWO ticks up and cannot fill, so it is neither sized against nor priced
+    against. Modelling a fill this strategy structurally cannot get is the
+    failure this bound prevents.
+    """
+    decision = _evaluate(
+        quote=_quote(ask=0.90, ask_size=2.0, ask_ladder=((0.90, 2.0), (0.92, 40.0))),
+    )
+
+    assert decision is not None
+    assert decision.quantity == 2.0
+    assert decision.market_probability == pytest.approx(0.90)
+    assert decision.metadata["slippage_prob"] == pytest.approx(SLIPPAGE)
+
+
+def test_the_edge_is_priced_at_the_ladder_vwap_not_the_level_zero_tick() -> None:
+    """A rung the limit CAN lift is sized against AND priced against.
+
+    Level 0 offers 2 contracts at 0.90; the next rung is one tick up at 0.91,
+    inside the marketable limit, so the order takes it -- and the edge is
+    computed at the VWAP of what it took, not at 0.90.
+    """
+    decision = _evaluate(
+        quote=_quote(ask=0.90, ask_size=2.0, ask_ladder=((0.90, 2.0), (0.91, 40.0))),
+    )
+
+    assert decision is not None
+    assert decision.quantity > 2.0
+    assert 0.90 < decision.market_probability < 0.91
+    assert decision.metadata["level0_ask_prob"] == pytest.approx(0.90)
+    assert decision.metadata["vwap_ask_prob"] == decision.market_probability
+    # Every rung it priced is one the IOC limit reaches.
+    assert decision.metadata["worst_ask_raw"] == pytest.approx(0.91)
+
+
+def test_walking_the_ladder_is_charged_through_the_price_not_double_counted() -> None:
+    """Where the book concession lands, and where it deliberately does NOT.
+
+    The concession is charged ONCE, through the executable price: the edge is
+    netted against the VWAP, not the level-0 tick. It is NOT also added to
+    `slippage_prob`, which for this strategy is provably pinned at its
+    configured floor -- the marketable IOC limit means no rung above
+    `ask + slippage_prob` is ever lifted, so the concession is bounded by
+    `slippage_prob` by construction. Adding it twice would charge the same
+    dollar of adverse price movement to the edge in two places.
+    """
+    cfg = _cfg(slippage_prob=0.05)
+    quote = _quote(ask=0.90, ask_size=1.0, ask_ladder=((0.90, 1.0), (0.94, 500.0)))
+
+    walked = _evaluate(cfg=cfg, quote=quote)
+    level0_only = _evaluate(cfg=cfg, quote=_quote(ask=0.90, ask_size=500.0))
+
+    assert walked is not None
+    assert level0_only is not None
+    # Priced through the ladder: the VWAP is strictly worse than 0.90 ...
+    assert walked.market_probability > 0.90
+    assert walked.edge < level0_only.edge
+    # ... and the concession is charged there, not a second time as slippage.
+    assert walked.metadata["slippage_prob"] == pytest.approx(0.05)
+    assert walked.metadata["slippage_floor_prob"] == pytest.approx(0.05)
+
+
+def test_the_effective_slippage_can_never_exceed_the_marketable_limit_budget() -> None:
+    """The invariant that makes the single charge above safe, swept."""
+    for floor in (0.01, 0.03, 0.05):
+        for deep_price in (0.905, 0.92, 0.94, 0.99):
+            decision = _evaluate(
+                cfg=_cfg(slippage_prob=floor),
+                quote=_quote(
+                    ask=0.90, ask_size=1.0, ask_ladder=((0.90, 1.0), (deep_price, 5_000.0)),
+                ),
+            )
+            if decision is None:
+                continue
+            slippage = decision.metadata["slippage_prob"]
+            assert isinstance(slippage, float)
+            assert slippage == pytest.approx(floor)
+            worst = decision.metadata["worst_ask_raw"]
+            assert isinstance(worst, float)
+            assert worst <= 0.90 + floor + 1e-12
+
+
+def test_a_ladder_whose_true_vwap_kills_the_edge_is_not_a_trade() -> None:
+    """Level 0 clears the floor on its own; the size it can actually get does not."""
+    level0_only = _evaluate(cfg=_cfg(slippage_prob=0.05), quote=_quote(ask=0.90, ask_size=500.0))
+    assert level0_only is not None
+
+    walked = _evaluate(
+        cfg=_cfg(slippage_prob=0.05),
+        quote=_quote(ask=0.90, ask_size=1.0, ask_ladder=((0.90, 1.0), (0.95, 5_000.0))),
+    )
+
+    assert walked is None
+
+
+def test_the_decision_records_the_worst_rung_the_order_would_touch() -> None:
+    """RAW venue units, so the execution layer can compare it to its limit."""
+    decision = _evaluate(
+        quote=_quote(ask=0.90, ask_size=2.0, ask_ladder=((0.90, 2.0), (0.91, 40.0))),
+    )
+
+    assert decision is not None
+    assert decision.metadata["worst_ask_raw"] == pytest.approx(0.91)
+
+
+def test_a_ladder_of_pure_padding_is_not_a_trade() -> None:
+    assert _evaluate(quote=_quote(ask=0.90, ask_size=0.0, ask_ladder=((0.0, 0.0),))) is None

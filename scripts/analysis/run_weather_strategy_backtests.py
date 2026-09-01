@@ -567,6 +567,62 @@ class RunResult:
     fills: list[FillSummary] = field(default_factory=list)
     positions: list[PositionSummary] = field(default_factory=list)
     ending_balance_usd: float | None = None
+    #: The account the engine was FUNDED with for this run. Emitted per row so
+    #: a reader can always reconstruct the denominator of
+    #: `return_on_starting_balance_pct` without going back to the manifest --
+    #: see the two-denominator note below.
+    starting_balance_usd: float = float(STARTING_BALANCE_USD)
+
+    @property
+    def realized_pnl_usd(self) -> float:
+        """Realised PnL summed across this run's positions, in dollars."""
+        return sum(p.realized_pnl or 0.0 for p in self.positions)
+
+    @property
+    def capital_deployed_usd(self) -> float:
+        """Cash actually PUT AT RISK: the buy-side cost basis of every fill.
+
+        For a long-only taker in a 0/1 binary this is the entire downside --
+        premium paid is the whole of what can be lost. A SELL returns cash and
+        is therefore not additional capital deployed, so it is excluded rather
+        than summed as `abs(notional)`.
+
+        `0.0` for a run that never filled, which is honestly "no capital was
+        deployed", not "a zero return".
+        """
+        return sum(f.quantity * f.avg_price for f in self.fills if f.side == "BUY")
+
+    @property
+    def return_on_starting_balance_pct(self) -> float | None:
+        """PnL against the CONFIGURED account balance.
+
+        Kept because it is the figure every prior run reported and removing it
+        would break comparison with them -- but it is NOT a return on the
+        capital this strategy risked: `STARTING_BALANCE_USD` is a harness
+        setting, and the strategy's own cost-basis anchor deploys ~$24.53 of
+        it. Read it beside `return_on_capital_deployed_pct`, never alone.
+        """
+        if self.starting_balance_usd <= 0.0:
+            return None
+        return 100.0 * self.realized_pnl_usd / self.starting_balance_usd
+
+    @property
+    def return_on_capital_deployed_pct(self) -> float | None:
+        """PnL against the capital actually deployed -- the honest denominator.
+
+        BL-25 D3. A -$5.41 result is -0.054% of a $10,000 configured balance
+        and roughly -20% of the ~$24.53 the strategy actually put at risk.
+        Return-on-configured-balance is not a return; it is a statement about
+        how the harness was funded.
+
+        `None` -- never 0.0, never a zero-division -- when nothing was
+        deployed. A run with no fills has no return to report, and reporting
+        one would be fabricating a number.
+        """
+        deployed = self.capital_deployed_usd
+        if deployed <= 0.0:
+            return None
+        return 100.0 * self.realized_pnl_usd / deployed
 
     def to_json(self) -> dict[str, Any]:
         return {
@@ -595,6 +651,14 @@ class RunResult:
                 for p in self.positions
             ],
             "ending_balance_usd": self.ending_balance_usd,
+            # BOTH denominators, unambiguously labelled, plus the input each
+            # one is computed from -- so no reader ever has to guess which
+            # base a percentage is against (BL-25 D3).
+            "starting_balance_usd": self.starting_balance_usd,
+            "realized_pnl_usd": self.realized_pnl_usd,
+            "capital_deployed_usd": self.capital_deployed_usd,
+            "return_on_starting_balance_pct": self.return_on_starting_balance_pct,
+            "return_on_capital_deployed_pct": self.return_on_capital_deployed_pct,
         }
 
 
@@ -940,29 +1004,50 @@ def _fill_detail(result: RunResult) -> str:
     return ",".join(parts)
 
 
-def _print_summary(results: list[RunResult]) -> None:
+def _summary_lines(results: list[RunResult]) -> list[str]:
+    """The summary table, as lines, so its content is testable.
+
+    TWO RETURN COLUMNS, BOTH LABELLED (BL-25 D3). `ret_bal%` is PnL over the
+    CONFIGURED starting balance -- the figure prior runs reported, kept so
+    they stay comparable. `ret_cap%` is PnL over the capital actually
+    deployed, which is the only one of the two that is a return. `cap_usd`
+    carries the denominator itself so neither percentage is a black box.
+    """
     header = (
         f"{'condition':<10} {'strategy':<28} {'scenario':<24} {'status':<10} {'orders':>6} "
-        f"{'fills':>5} {'realized_pnl':>13} {'balance':>10}  fills_detail"
+        f"{'fills':>5} {'realized_pnl':>13} {'balance':>10} {'cap_usd':>9} "
+        f"{'ret_bal%':>9} {'ret_cap%':>9}  fills_detail"
     )
-    print(header)
-    print("-" * len(header))
+    lines = [header, "-" * len(header)]
     for r in results:
-        realized = sum(p.realized_pnl or 0.0 for p in r.positions)
-        realized_str = f"{realized:+.2f}" if r.status == STATUS_COMPLETED else "n/a"
+        completed = r.status == STATUS_COMPLETED
+        realized_str = f"{r.realized_pnl_usd:+.2f}" if completed else "n/a"
         balance_str = f"{r.ending_balance_usd:.2f}" if r.ending_balance_usd is not None else "n/a"
-        if r.status == STATUS_COMPLETED:
+        deployed = r.capital_deployed_usd
+        cap_str = f"{deployed:.2f}" if completed and deployed > 0.0 else "n/a"
+        ret_bal = r.return_on_starting_balance_pct
+        ret_cap = r.return_on_capital_deployed_pct
+        ret_bal_str = f"{ret_bal:+.4f}" if completed and ret_bal is not None else "n/a"
+        ret_cap_str = f"{ret_cap:+.2f}" if completed and ret_cap is not None else "n/a"
+        if completed:
             detail = r.status
         elif r.status == STATUS_COMPLETED_ALL_REFUSED:
             reasons = ",".join(f"{k}={v}" for k, v in sorted(r.refusal_counts.items()))
             detail = f"{r.status}:{reasons}"
         else:
             detail = f"{r.status}:{r.refusal_type}"
-        print(
+        lines.append(
             f"{r.condition:<10} {r.strategy:<28} {r.scenario:<24} {detail:<10} "
             f"{r.orders_submitted:>6} {len(r.fills):>5} {realized_str:>13} "
-            f"{balance_str:>10}  {_fill_detail(r)}",
+            f"{balance_str:>10} {cap_str:>9} {ret_bal_str:>9} {ret_cap_str:>9}  "
+            f"{_fill_detail(r)}",
         )
+    return lines
+
+
+def _print_summary(results: list[RunResult]) -> None:
+    for line in _summary_lines(results):
+        print(line)
 
 
 def _forecast_sources_and_overrides(

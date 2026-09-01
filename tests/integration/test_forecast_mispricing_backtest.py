@@ -146,9 +146,28 @@ def _padded_side(
     return orders, counts
 
 
+#: Ask-side depth, deliberately larger than the ~75 contracts this scenario's
+#: sizing rule asks for.
+#:
+#: It used to be 50, which was SMALLER than the intent -- and before BL-25 D2
+#: that difference was invisible: `RiskManager.evaluate_order` clipped to the
+#: position, notional and equity caps but never to the book, so the strategy
+#: submitted a 75-lot MARKET order into a 50-lot book, filled 50, and left a
+#: 25-lot remainder working forever. A permanently unfilled remainder is not
+#: a rejection, so nothing surfaced it. With the depth clip in place the first
+#: order is sized to the book and fills completely, and the strategy then
+#: (correctly) asks for the rest against a book it has just consumed -- which
+#: the venue answers `no market`. Serving the intent from real depth keeps
+#: this test measuring what its name says (a strategy that trades and
+#: settles) instead of an artefact of an over-sized order.
+_ASK_DEPTH_CONTRACTS: int = 100
+
+
 def _depth(instrument: BinaryOption) -> OrderBookDepth10:
     bids, bid_counts = _padded_side(instrument, OrderSide.BUY, "0.28", 50)
-    asks, ask_counts = _padded_side(instrument, OrderSide.SELL, "0.30", 50)
+    asks, ask_counts = _padded_side(
+        instrument, OrderSide.SELL, "0.30", _ASK_DEPTH_CONTRACTS,
+    )
     return OrderBookDepth10(
         instrument_id=instrument.id,
         bids=bids,

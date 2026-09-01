@@ -68,13 +68,19 @@ Polymarket.us to Kalshi.com a wiring change, not a strategy rewrite.
 from __future__ import annotations
 
 import math
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
+from dataclasses import dataclass
 from typing import Final, Protocol, runtime_checkable
+
+from breezy.strategy.weather_common.ladder import walk_ask_ladder
 
 __all__ = [
     "INSTRUMENT_INFO_FEE_COEFFICIENT_KEY",
+    "DepthAwareTradeCost",
     "FeeCoefficientSource",
+    "NoExecutableDepthError",
     "UnknownFeeScheduleError",
+    "depth_aware_trade_cost_prob",
     "fee_coefficient_from_info",
     "trade_cost_prob",
     "venue_fee_prob",
@@ -193,6 +199,138 @@ def trade_cost_prob(
         executable_price=executable_price,
         fee_coefficient=fee_coefficient,
     ) + slippage_prob
+
+
+class NoExecutableDepthError(ValueError):
+    """A cost was requested against a book that offers no real depth.
+
+    Raised by :func:`depth_aware_trade_cost_prob` rather than falling back to
+    the level-0 tick or to a zero price. Same posture as
+    :class:`UnknownFeeScheduleError`: an unanswerable input is a NO-TRADE,
+    never a free or optimistically-priced one. Note that Nautilus's own
+    ``OrderBook.get_avg_px_for_quantity`` takes the opposite posture and
+    returns ``0.0`` when it cannot compute an average (``book.pyx:578-580``),
+    which is precisely why Breezy does not route through it -- see
+    :mod:`breezy.strategy.weather_common.ladder`.
+    """
+
+
+@dataclass(frozen=True, slots=True)
+class DepthAwareTradeCost:
+    """Taker cost for one intended size, priced off the ladder it consumes.
+
+    Every price field is in PROBABILITY units (raw venue prices already
+    multiplied by ``price_scale``). The two cost terms stay separately named
+    for the reason the module docstring gives: they behave oppositely as
+    ``p -> 1``, and a single writable "total cost" scalar is the field in
+    which the unsafe configuration gets written.
+    """
+
+    #: VWAP of the ladder actually consumed -- the price the order would pay.
+    executable_price: float
+    #: Level-0 ask, kept so the concession is legible and the old figure is
+    #: still on the record rather than silently replaced.
+    top_of_book_price: float
+    #: Worst rung the fill would touch, in PROBABILITY units. The execution
+    #: layer prices its marketable limit off this, never off the VWAP: a limit
+    #: at the average price stops halfway up the ladder it was priced for.
+    worst_price: float
+    #: ``theta * p * (1 - p)`` at ``executable_price``, never at level 0.
+    fee_prob: float
+    #: ``max(slippage_floor_prob, executable_price - top_of_book_price)``.
+    slippage_prob: float
+    #: ``fee_prob + slippage_prob``. Derived, never writable.
+    total_prob: float
+    #: What the recorded ladder could actually supply -- the largest size a
+    #: caller may honestly claim.
+    fillable_quantity: float
+    requested_quantity: float
+    #: The ladder ran out before the request was absorbed.
+    depth_exhausted: bool
+
+
+def depth_aware_trade_cost_prob(
+    *,
+    ask_levels: Sequence[tuple[float, float]],
+    quantity: float,
+    price_scale: float,
+    fee_coefficient: float,
+    slippage_floor_prob: float,
+) -> DepthAwareTradeCost:
+    """:func:`trade_cost_prob`, but priced at the VWAP of the size being taken.
+
+    WHY THE FLAT TERM IS THE WRONG SHAPE, NOT MERELY THE WRONG VALUE (BL-25 D1)
+    --------------------------------------------------------------------------
+    :func:`trade_cost_prob` adds a CONSTANT ``slippage_prob`` to a fee priced
+    at the level-0 ask. Measured over the captured ladder at
+    ``~/.local/share/breezy/catalog/quote_tape/polymarket_us`` (``data/`` AND
+    ``live/``): a $24.53 order exceeds level-0 ask size in **57.4%** of
+    snapshots and exhausts all ten recorded levels in **6.5%**; realised
+    walk-the-book slippage (VWAP - level-0 ask) is 0.0026 at the median but
+    **0.137 at p90** and **0.661 at p99**, and **36.0%** of snapshots exceed
+    the flat 0.01 floor from the recorded book ALONE -- before any market
+    impact or adverse selection. Cost therefore depends on SIZE, which no
+    additive constant can express.
+
+    ``ask_levels`` is ``(price, size)`` best-first in RAW venue units (see
+    :mod:`breezy.strategy.weather_common.ladder`); ``price_scale`` converts to
+    probability units, exactly as ``MarketQuote.implied_ask`` does.
+
+    THE FLOOR IS A MAX, NEVER A REPLACEMENT. ``slippage_floor_prob`` is the
+    shipped execution term (one tick on this venue's 0.01 grid, and still
+    UNMEASURED as an impact/adverse-selection estimate -- BL-19 s8.2/s8.5).
+    The book-derived concession can only RAISE it: a deep flat book computes
+    zero concession, and a floor of zero there would restore the exact unsafe
+    configuration the structured cost term exists to forbid.
+
+    Raises
+    ------
+    ValueError
+        On anything :func:`venue_fee_prob` refuses -- an unusable
+        ``fee_coefficient`` is refused here exactly as it is there, and there
+        is deliberately NO default for it, so an unresolved schedule cannot be
+        priced through this function either. Also on a negative or non-finite
+        ``slippage_floor_prob`` or a non-positive/non-finite ``price_scale``.
+    NoExecutableDepthError
+        When ``ask_levels`` offers no real depth, or ``quantity`` is
+        non-positive.
+    """
+    if not math.isfinite(slippage_floor_prob) or slippage_floor_prob < 0.0:
+        raise ValueError(
+            f"Slippage floor {slippage_floor_prob!r} is negative or non-finite; a "
+            "negative execution term is a rebate on execution and there is no such thing",
+        )
+    if not math.isfinite(price_scale) or price_scale <= 0.0:
+        raise ValueError(
+            f"Price scale {price_scale!r} is non-positive or non-finite; refusing to "
+            "convert a raw venue ladder into probability units through it",
+        )
+    walk = walk_ask_ladder(ask_levels, quantity)
+    if walk is None:
+        raise NoExecutableDepthError(
+            f"No executable ask depth for a request of {quantity!r} contracts; refusing "
+            "to price a fill against a book that cannot supply one. An empty book is a "
+            "no-trade, never a zero-cost trade",
+        )
+    executable_price = walk.vwap_price * price_scale
+    top_of_book_price = walk.top_of_book_price * price_scale
+    worst_price = walk.worst_price * price_scale
+    slippage_prob = max(slippage_floor_prob, walk.price_concession * price_scale)
+    fee_prob = venue_fee_prob(
+        executable_price=executable_price,
+        fee_coefficient=fee_coefficient,
+    )
+    return DepthAwareTradeCost(
+        executable_price=executable_price,
+        top_of_book_price=top_of_book_price,
+        worst_price=worst_price,
+        fee_prob=fee_prob,
+        slippage_prob=slippage_prob,
+        total_prob=fee_prob + slippage_prob,
+        fillable_quantity=walk.filled_quantity,
+        requested_quantity=walk.requested_quantity,
+        depth_exhausted=walk.exhausted,
+    )
 
 
 def fee_coefficient_from_info(info: object) -> float | None:

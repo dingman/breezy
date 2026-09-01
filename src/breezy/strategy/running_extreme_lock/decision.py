@@ -86,6 +86,7 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
 from breezy.domain.weather_bucket_facts import Measure
+from breezy.strategy.weather_common.ladder import walk_ask_ladder
 from breezy.strategy.weather_common.models import SideIntent, SignalDecision, ensure_aware
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
@@ -125,39 +126,25 @@ def _vwap_ask_for_quantity(
     ladder: Sequence[tuple[float, float]],
     quantity: float,
 ) -> tuple[float, float] | None:
-    """Volume-weighted average ask price for filling up to ``quantity``.
+    """Thin adapter over :func:`weather_common.ladder.walk_ask_ladder`.
 
-    ``ladder`` is ``(price, size)`` pairs in best-first order, in RAW venue
-    price units -- the same units as ``MarketQuote.ask``/``.implied_ask``'s
-    own contract; the caller scales the returned price the same way it scales
-    ``implied_ask`` (VWAP is linear in price, so scaling the levels first or
-    the result after are equivalent). A degenerate level (``size <= 0`` or
-    ``price <= 0`` -- ``OrderBookDepth10``'s ``NULL_ORDER`` padding, see
-    ``breezy.strategy.resting_ladder.RestingLadderStrategy._best`` for the
-    same guard against this exact padding) is skipped, never treated as free
-    liquidity.
+    THE WALK ITSELF NO LONGER LIVES HERE (BL-25 D2). It was private to this
+    module while `cli_settlement_print_lock.decision`,
+    `weather_common.risk.RiskManager.evaluate_order` and the offline gate
+    classifier in `scripts/analysis/weather_strategy_backtest_lib` all needed
+    the same arithmetic; four copies of a book walk is four places for the
+    fill price to drift from the price the edge was computed at. See
+    `weather_common.ladder` for the padding, exhaustion and unit semantics
+    this function's callers rely on -- all unchanged.
 
-    Returns ``None`` only when the ladder offers strictly zero real depth.
-    Otherwise returns ``(vwap_price, filled_quantity)`` where
-    ``filled_quantity = min(quantity, total_real_depth)`` -- callers use the
-    FILLED amount as the actual tradable size, never the requested
-    ``quantity`` itself, when the ladder cannot cover the full request.
+    Kept as a named function, returning the same `(vwap_price,
+    filled_quantity)` tuple it always returned, because the sole caller below
+    and the record in `weather_strategy_backtest_lib` both read it that way.
     """
-    remaining = quantity
-    filled = 0.0
-    notional = 0.0
-    for price, size in ladder:
-        if remaining <= 0.0:
-            break
-        if size <= 0.0 or price <= 0.0:
-            continue
-        take = min(remaining, size)
-        notional += take * price
-        filled += take
-        remaining -= take
-    if filled <= 0.0:
+    walk = walk_ask_ladder(ladder, quantity)
+    if walk is None:
         return None
-    return notional / filled, filled
+    return walk.vwap_price, walk.filled_quantity
 
 
 def _model_p_for_margin(margin_f: int, model_p_table: Mapping[int, float]) -> float:

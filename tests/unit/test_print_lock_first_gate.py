@@ -380,3 +380,49 @@ def test_the_record_carries_the_edge_at_zero_slippage_so_the_threshold_re_derive
     assert record.edge_at_zero_slippage is not None
     assert record.edge_at_zero_slippage > record.edge
     assert record.edge_at_zero_slippage == pytest.approx(record.edge + 0.01)
+
+
+# ---------------------------------------------------------------------------
+# BL-25 D1 -- the offline record must price what the SHIPPED decision priced
+# ---------------------------------------------------------------------------
+
+
+def test_the_recorded_vwap_is_the_price_the_shipped_decision_actually_used() -> None:
+    """The record is decoded offline as "what the strategy saw".
+
+    A `vwap_ask` walked over a different size, or over rungs the strategy's
+    own marketable IOC limit could never lift, would decode a null into the
+    wrong answer -- the same failure `GateLadderDriftError` exists to prevent
+    for the gate ladder.
+    """
+    from breezy.strategy.cli_settlement_print_lock.decision import evaluate_instrument
+    from breezy.strategy.cli_settlement_print_lock.strategy import (
+        MEASURED_P_STABLE_WILSON_LOWER,
+    )
+
+    quote = _quote(ask=0.90, ask_size=2.0, ask_ladder=((0.90, 2.0), (0.91, 400.0)))
+    record = _record(quote=quote)
+    decision = evaluate_instrument(
+        contract=_contract(),
+        quote=quote,
+        observation=_observation(),
+        now=_NOW,
+        p_stable=MEASURED_P_STABLE_WILSON_LOWER,
+        cfg=_cfg(),
+    )
+
+    assert decision is not None
+    assert record.vwap_ask is not None
+    assert record.vwap_ask == pytest.approx(decision.market_probability)
+    assert record.vwap_ask_filled_qty == pytest.approx(decision.quantity)
+    assert record.edge == pytest.approx(decision.edge)
+
+
+def test_the_record_never_prices_a_rung_the_ioc_limit_cannot_lift() -> None:
+    """Two ticks up at the shipped one-tick slippage: not reachable, not priced."""
+    record = _record(
+        quote=_quote(ask=0.90, ask_size=2.0, ask_ladder=((0.90, 2.0), (0.92, 400.0))),
+    )
+
+    assert record.vwap_ask == pytest.approx(0.90)
+    assert record.vwap_ask_filled_qty == pytest.approx(2.0)
