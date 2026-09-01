@@ -55,6 +55,25 @@ Everything therefore reduces to ONE empirical question:
 
 Nobody knows. It is unanswerable from held data.
 
+## SUPERSEDED IN PRIORITY (2026-09-01) — read this first
+
+The evening window this spec was written around tests the two TAIL locks, and
+both are now measured as outlier strategies: H1 fired 0/4 and H2 fired 0/4 on
+the first in-window capture. A six-rung ladder centred on the forecast is a
+window AROUND the expected max, so the day lands in the interiors and both open
+tails are the outlier rungs.
+
+**The lead strategy is now `cli_settlement_print_lock`, and its window is
+05:00-13:00Z (the FINAL print), not 19:00-01:00Z.** Buy YES on the unique
+bucket containing the printed final. Interiors are dead after the PRELIMINARY
+but sound after the FINAL — the revision has already happened (p_stable
+99.989%). Evening capture is still worth running, but as a cheap base-rate
+counter for tail reachability, not as the economic test.
+
+See `docs/evidence/h2_lower_tail_rejected_2026-09-01.md`.
+
+Everything below still applies to whichever window is being captured.
+
 ## Gate 0-PRE — the parser must be able to SEE a one-sided book (BLOCKING)
 
 **Do this before any capture. Capture without it records nothing on the target

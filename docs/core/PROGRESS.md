@@ -87,26 +87,15 @@ certain contracts are nearly free). Break-even ask at margin 0 is 0.99663.
 Decide these deliberately or a null capture reads as a dead market. Tick is
 0.01, so 0.995 is not a real price.
 
-### [HIGH] BL-21 — H1's trigger never fires on the LISTED tail
+### [MED] BL-21 — both tail-locks are outlier strategies; base rate unknown
 
-First in-window capture (2026-09-01, 18m49s, 60 instruments, 10088 depth
-records, all five stations): `running_extreme_lock`'s trigger fired **zero**
-times. The venue lists exactly ONE `gte<N>f` per city-day, set 4-8F ABOVE the
-day's actual (MDW 91 vs 97, MIA 91 vs 95, NYC 78 vs 86, SFO 67 vs 72), so
-`H >= X` was never satisfied.
-
-The margin-conditional Wilson table was built by sweeping floors in `[H-5, H]`
-— floors the venue never lists. It describes a population the strategy cannot
-trade. **Trigger FREQUENCY, not edge size, is now the binding question.**
-
-All 1824 measured asks sit below the 0.99663 break-even (0.01-0.21) and that is
-MEANINGLESS: those are unreached tails priced correctly. Any analysis must gate
-on `H >= X` BEFORE comparing an ask to a break-even, or it will read a 0.02 ask
-on a tail needing 6F more heat as a 99.7% lock.
-`docs/evidence/first_in_window_capture_2026-09-01.md`.
-
-Open: how often does the daily max beat the venue's listed top rung? Historical
-listings are unavailable, so this needs forward capture or a defensible proxy.
+H1 fired 0/4 and H2 0/4 on the first in-window capture; the venue lists one
+`gte<N>f` and one `ltXf` per city-day, positioned outside the day's actual, so
+the day lands in the interiors. The margin table was built by sweeping floors
+in `[H-5,H]` the venue never lists. Pre-registered kill: trigger rate < 0.20
+over captured station-days. Any ask/break-even comparison MUST gate on the
+trigger first — an unfired tail shows pennies that read as free certainty.
+`first_in_window_capture_2026-09-01.md`, `h2_lower_tail_rejected_2026-09-01.md`.
 
 ### [LOW] BL-22 — 60 spurious `cache.instrument is None` ERRORs per cycle
 
@@ -115,11 +104,24 @@ Cosmetic, data is sound: the check runs with no `await` after publishing
 at `:724` passes, and WS frames resolve via `_instrument_provider.find()` first
 (`:1020-1022`). Fix before an unattended run or it buries real errors.
 
-### [MED] BL-13 — `cli_settlement_print_lock` not implemented
+### [HIGH] BL-13 — build `cli_settlement_print_lock` (NOW THE LEAD STRATEGY)
 
-Both pre-registered gates PASS on archive (p_stable 99.989% N=9106; halt-window
-98.66% N=9164). Economic confirmation blocked on BL-18.
-`lagged_anomaly_tail` stays build-order 3, unstarted.
+Both tail-locks are outlier strategies against the measured ladder: a six-rung
+ladder centred on the forecast is a WINDOW around the expected max, so the
+interiors catch the mode and both open tails are the outlier rungs. Measured
+2026-08-31: H1 (upper) fired 0/4, H2 (lower) fired 0/4.
+`docs/evidence/h2_lower_tail_rejected_2026-09-01.md`.
+
+Print-lock triggers on the FINAL CLI print and buys YES on the unique bucket
+CONTAINING the printed value — usually an interior, so it is designed to fire on
+most station-days. This does NOT contradict G-01: interiors are dead AFTER THE
+PRELIMINARY (revision breaks exact equality) but sound AFTER THE FINAL (the
+revision already happened). p_stable 99.989% (9105/9106), halt-window 98.66%
+(9041/9164). Long-only, taker, no forecast, exclusive-bucket logic already in
+`RiskManager`.
+
+**Its capture window is 05:00-13:00Z, NOT the evening.** Evening tape only
+measures tail reachability; morning tape tests the strategy that can fire.
 
 ### [MED] BL-14 — `RefusalAlerter` alerts on `SHORTS_DISABLED` only
 
