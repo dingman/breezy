@@ -31,6 +31,7 @@ from nautilus_trader.model.objects import Price, Quantity
 from nautilus_trader.portfolio import Portfolio
 from nautilus_trader.test_kit.stubs.component import TestComponentStubs
 
+from breezy.adapters.polymarket_us.parsing import FEE_COEFFICIENT_KEY
 from breezy.domain.weather_bucket_facts import (
     CLIMATE_DAY_KEY,
     MEASURE_KEY,
@@ -45,12 +46,15 @@ from breezy.strategy.cli_settlement_print_lock.config import (
     CliSettlementPrintLockConfig,
 )
 from breezy.strategy.cli_settlement_print_lock.strategy import (
+    ABSOLUTE_SLIPPAGE_FLOOR_PROB,
     MEASURED_P_STABLE_WILSON_LOWER,
     MEASURED_STATIONS,
     CliSettlementPrintLockStrategy,
     EdgeFloorInversionError,
+    FeeCoefficientMismatchError,
     MissingFeeCoefficientSourceError,
     MissingObservationBoundError,
+    NegativeEdgeFloorError,
     NoTradableMeasureError,
     UnmeasuredStationError,
     UnpricedInstrumentError,
@@ -62,6 +66,11 @@ INSTRUMENT_ID = InstrumentId(Symbol("nyc-80-84"), Venue("POLYMARKET_US"))
 
 #: [MEASURED] every captured weather market carries `feeCoefficient: 0.06`.
 THETA = 0.06
+
+#: "this test did not set the key at all", distinct from "the key is present
+#: and holds `None`" -- the venue writes a literal `None` when it could not
+#: parse a coefficient, and those two cases are treated differently.
+_ABSENT: object = object()
 
 
 class _Fees:
@@ -304,6 +313,7 @@ def _weather_instrument(
     *,
     price_increment: str = "0.01",
     station: str = "NYC",
+    fee_coefficient: object = _ABSENT,
 ) -> BinaryOption:
     symbol = Symbol("nyc-80-84")
     increment = Price.from_str(price_increment)
@@ -327,15 +337,30 @@ def _weather_instrument(
         taker_fee=Decimal(0),
         ts_event=0,
         ts_init=0,
-        info={
-            WEATHER_FACTS_STATUS_KEY: WEATHER_FACTS_STATUS_KNOWN,
-            SETTLEMENT_STATION_KEY: station,
-            CLIMATE_DAY_KEY: "2026-08-28",
-            MEASURE_KEY: "high",
-            STRIKE_LOWER_F_KEY: 80,
-            STRIKE_UPPER_F_KEY: 84,
-        },
+        info=_info(station, fee_coefficient),
     )
+
+
+def _info(station: str, fee_coefficient: object) -> dict[str, object]:
+    """`Instrument.info`, carrying the venue's own theta only when asked.
+
+    ABSENT by default, because a hand-built instrument carries no venue
+    authority and the cross-check in `on_start` has nothing to compare
+    against. A REAL Polymarket.us instrument always carries the key
+    (`parsing.py:1225` writes it unconditionally), which is what the
+    mismatch tests below exercise.
+    """
+    info: dict[str, object] = {
+        WEATHER_FACTS_STATUS_KEY: WEATHER_FACTS_STATUS_KNOWN,
+        SETTLEMENT_STATION_KEY: station,
+        CLIMATE_DAY_KEY: "2026-08-28",
+        MEASURE_KEY: "high",
+        STRIKE_LOWER_F_KEY: 80,
+        STRIKE_UPPER_F_KEY: 84,
+    }
+    if fee_coefficient is not _ABSENT:
+        info[FEE_COEFFICIENT_KEY] = fee_coefficient
+    return info
 
 
 def _register(
@@ -383,23 +408,22 @@ def test_an_unpriced_instrument_raises_at_on_start_rather_than_trading_free() ->
         strategy.on_start()
 
 
-def test_slippage_below_one_tick_raises_at_on_start() -> None:
-    """The tick floor lives at `on_start` because `tick_size` is PER INSTRUMENT.
+def test_slippage_below_the_absolute_floor_raises_at_construction() -> None:
+    """The floor is now ABSOLUTE and is checked before any instrument exists.
 
     Plan s2.2's closure proof: to trade at 0.99 an operator must write
-    `slippage_prob <= 0.001302`, and every such value is below the 0.01 tick.
+    `slippage_prob <= 0.001302`. That used to be closed by the 0.01 tick,
+    which made the guard a property of the VENUE's price granularity rather
+    than of execution -- see
+    `test_a_finer_tick_does_not_loosen_the_slippage_floor`.
     """
-    instrument = _weather_instrument()
-    strategy = _strategy(_config(slippage_prob=0.001302))
-    _register(strategy, instrument)
-
     with pytest.raises(UnpricedInstrumentError):
-        strategy.on_start()
+        _strategy(_config(slippage_prob=0.001302))
 
 
-def test_slippage_exactly_one_tick_is_accepted_because_the_floor_is_not_strict() -> None:
+def test_slippage_exactly_at_the_floor_is_accepted_because_it_is_not_strict() -> None:
     instrument = _weather_instrument()
-    strategy = _strategy(_config(slippage_prob=0.01))
+    strategy = _strategy(_config(slippage_prob=ABSOLUTE_SLIPPAGE_FLOOR_PROB))
     _register(strategy, instrument)
 
     strategy.on_start()
@@ -407,15 +431,164 @@ def test_slippage_exactly_one_tick_is_accepted_because_the_floor_is_not_strict()
     assert str(instrument.id) in strategy._contracts
 
 
-def test_the_tick_floor_follows_the_instruments_own_increment_not_a_literal() -> None:
-    """A finer tick loosens the floor -- the design self-corrects (plan s2.8.4)."""
-    instrument = _weather_instrument(price_increment="0.001")
-    strategy = _strategy(_config(slippage_prob=0.005))
+def test_a_finer_tick_does_not_loosen_the_slippage_floor() -> None:
+    """EXECUTED COUNTER-EXAMPLE, closed.
+
+    With `tick_size=0.001` the old per-instrument floor admitted
+    `slippage_prob=0.001`, and `worst_admissible_ask(...)` then returns 0.99
+    at edge +0.005302 -- the exact trade BL-19 s8.2 computes as **-0.003698**
+    and the whole cost contract exists to refuse. A taker's slippage is a
+    function of BOOK DEPTH and LATENCY, not of the venue's price granularity:
+    halving the tick does not halve the adverse move. The floor is therefore
+    `max(ABSOLUTE_SLIPPAGE_FLOOR_PROB, tick)` (BL-19 s8.5).
+    """
+    with pytest.raises(UnpricedInstrumentError):
+        _strategy(_config(slippage_prob=0.005))
+
+    with pytest.raises(UnpricedInstrumentError):
+        _strategy(_config(slippage_prob=0.001))
+
+
+def test_a_coarser_tick_still_raises_the_floor_above_the_absolute_one() -> None:
+    """The absolute floor is a FLOOR, not a replacement: `max`, not a constant."""
+    instrument = _weather_instrument(price_increment="0.05")
+    strategy = _strategy(_config(slippage_prob=0.01))
+    _register(strategy, instrument)
+
+    with pytest.raises(UnpricedInstrumentError):
+        strategy.on_start()
+
+
+def test_a_non_finite_slippage_is_refused_at_construction() -> None:
+    """`nan < 0.01` is `False`, so a bare comparison lets `nan` through.
+
+    It then raises inside `trade_cost_prob` from a DATA HANDLER, mid-session,
+    which is exactly the loud-at-the-gate/silent-in-flight inversion every
+    other guard in this module exists to prevent.
+    """
+    for bad in (float("nan"), float("inf"), float("-inf")):
+        with pytest.raises(UnpricedInstrumentError):
+            _strategy(_config(slippage_prob=bad))
+
+
+# ---------------------------------------------------------------------------
+# The edge floors must be NON-NEGATIVE, not merely ordered
+# ---------------------------------------------------------------------------
+
+
+def test_negative_edge_floors_are_refused_even_though_they_are_ordered() -> None:
+    """A two-line config edit, no error today, and negative expectation.
+
+    `EdgeFloorInversionError` checks only the RELATIVE order, so
+    `min_model_edge == min_edge_after_costs == -0.02` passes it. Then
+    `decision.py:430` admits ask 0.99 at edge -0.003698, `risk.py:421`'s
+    `abs(edge) < min_model_edge` can never fire against a negative threshold,
+    and `worst_admissible_ask` clamps `a_max` to 1.0 -- a $25.00 anchor on a
+    trade with negative expectation.
+    """
+    with pytest.raises(NegativeEdgeFloorError):
+        _strategy(_config(min_model_edge=-0.02, min_edge_after_costs=-0.02))
+
+
+def test_a_single_negative_floor_is_refused_on_either_side() -> None:
+    with pytest.raises(NegativeEdgeFloorError):
+        _strategy(_config(min_model_edge=-0.001, min_edge_after_costs=0.005))
+    with pytest.raises(NegativeEdgeFloorError):
+        _strategy(_config(min_model_edge=0.0, min_edge_after_costs=-0.005))
+
+
+def test_a_zero_edge_floor_is_accepted_because_zero_is_not_negative() -> None:
+    """Zero expectation is a defensible (if useless) floor; negative is not."""
+    assert _strategy(_config(min_model_edge=0.0, min_edge_after_costs=0.0)) is not None
+
+
+def test_non_finite_edge_floors_are_refused() -> None:
+    """`nan > nan` is `False`, so the inversion check passes a `nan` pair."""
+    with pytest.raises(NegativeEdgeFloorError):
+        _strategy(_config(min_model_edge=float("nan"), min_edge_after_costs=0.005))
+    with pytest.raises(NegativeEdgeFloorError):
+        _strategy(_config(min_model_edge=0.005, min_edge_after_costs=float("nan")))
+
+
+# ---------------------------------------------------------------------------
+# The injected theta is cross-checked against the instrument in hand
+# ---------------------------------------------------------------------------
+
+
+def test_on_start_refuses_an_injected_theta_that_disagrees_with_the_market() -> None:
+    """`FeeCoefficientSource.fee_coefficient_for` takes an OPAQUE string.
+
+    Nothing in the Protocol obliges an implementation to return a value ABOUT
+    the instrument it was asked for -- the shipped
+    `PolymarketUSFeeCoefficients` holds its OWN copied mapping
+    (`run_weather_strategy_backtests.py:438-442`), so a mis-keyed or drifted
+    map answers with another market's theta and the whole cost model is
+    silently priced off the wrong number. `on_start` already holds the
+    instrument, whose `info[FEE_COEFFICIENT_KEY]` is the venue's own
+    authority; comparing them is free.
+    """
+    instrument = _weather_instrument(fee_coefficient="0.06")
+    strategy = _strategy(fees=_Fees(theta=0.02))
+    _register(strategy, instrument)
+
+    with pytest.raises(FeeCoefficientMismatchError):
+        strategy.on_start()
+
+
+def test_on_start_accepts_an_injected_theta_that_matches_the_market() -> None:
+    instrument = _weather_instrument(fee_coefficient="0.06")
+    strategy = _strategy()
     _register(strategy, instrument)
 
     strategy.on_start()
 
-    assert strategy._contracts[str(instrument.id)].tick_size == pytest.approx(0.001)
+    assert strategy._contracts[str(instrument.id)].fee_coefficient == pytest.approx(THETA)
+
+
+def test_an_instrument_carrying_no_coefficient_at_all_skips_the_cross_check() -> None:
+    """FAIL-OPEN, deliberately and narrowly: absence is not disagreement.
+
+    A real Polymarket.us instrument ALWAYS carries the key (`parsing.py:1225`
+    writes it unconditionally, `None` included). An instrument with no key at
+    all is hand-built or from a venue whose wiring does not publish one, and
+    carries no authority to check against.
+    """
+    instrument = _weather_instrument()
+    strategy = _strategy()
+    _register(strategy, instrument)
+
+    strategy.on_start()
+
+    assert strategy._contracts[str(instrument.id)].fee_coefficient == pytest.approx(THETA)
+
+
+def test_an_instrument_whose_own_coefficient_is_unusable_is_refused() -> None:
+    """PRESENT-but-unusable is the venue saying "unknown", never "any value".
+
+    `parsing.py:1225` writes a literal `None` when it could not parse a
+    coefficient. An injected source that nonetheless answered with a number
+    did not read THIS instrument.
+    """
+    for unusable in (None, True, "not-a-decimal", 1.5):
+        instrument = _weather_instrument(fee_coefficient=unusable)
+        strategy = _strategy()
+        _register(strategy, instrument)
+
+        with pytest.raises(UnpricedInstrumentError):
+            strategy.on_start()
+
+
+def test_the_venue_neutral_info_key_is_the_one_the_adapter_writes() -> None:
+    """DRY across a layer boundary that forbids the import.
+
+    `weather_common.costs` must not name a venue (its own module docstring),
+    so the key is re-declared there rather than imported from
+    `adapters.polymarket_us.parsing`. This test is the anti-drift pin the
+    import would otherwise have provided.
+    """
+    from breezy.strategy.weather_common.costs import INSTRUMENT_INFO_FEE_COEFFICIENT_KEY
+
+    assert INSTRUMENT_INFO_FEE_COEFFICIENT_KEY == FEE_COEFFICIENT_KEY
 
 
 def test_an_unmeasured_station_is_refused_at_on_start_not_silently_at_decision() -> None:

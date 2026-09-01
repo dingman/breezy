@@ -491,5 +491,13 @@ def evaluate_instrument(
             "fee_coefficient": fee_coefficient,
             "fee_prob": fee_prob,
             "slippage_prob": cfg.slippage_prob,
+            # `A`, carried on the decision because it is the number the
+            # EXECUTION layer needs to hold the POSITION -- not merely this
+            # decision -- inside the design budget. `quantity` above is a
+            # TARGET LEVEL, and a target level alone cannot bound a position
+            # that is topped up on every depth tick as the ask falls (see
+            # `strategy._maybe_submit`). Re-deriving it there would duplicate
+            # this module's arithmetic at a second site.
+            "cost_basis_anchor": anchor,
         },
     )

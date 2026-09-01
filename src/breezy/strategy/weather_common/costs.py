@@ -68,14 +68,31 @@ Polymarket.us to Kalshi.com a wiring change, not a strategy rewrite.
 from __future__ import annotations
 
 import math
-from typing import Protocol, runtime_checkable
+from collections.abc import Mapping
+from typing import Final, Protocol, runtime_checkable
 
 __all__ = [
+    "INSTRUMENT_INFO_FEE_COEFFICIENT_KEY",
     "FeeCoefficientSource",
     "UnknownFeeScheduleError",
+    "fee_coefficient_from_info",
     "trade_cost_prob",
     "venue_fee_prob",
 ]
+
+#: The ``Instrument.info`` key under which a venue adapter publishes that
+#: market's OWN fee coefficient.
+#:
+#: RE-DECLARED HERE RATHER THAN IMPORTED, deliberately. This module names no
+#: venue (see the module docstring), and importing
+#: ``breezy.adapters.polymarket_us.parsing.FEE_COEFFICIENT_KEY`` would weld
+#: every strategy that reads a cost to one exchange -- against the
+#: Polymarket.us -> Kalshi.com portability priority. The two spellings are
+#: pinned equal by
+#: ``test_the_venue_neutral_info_key_is_the_one_the_adapter_writes``, which is
+#: the anti-drift guarantee the import would otherwise have provided. A future
+#: venue's wiring publishes the SAME key.
+INSTRUMENT_INFO_FEE_COEFFICIENT_KEY: Final[str] = "fee_coefficient"
 
 
 class UnknownFeeScheduleError(ValueError):
@@ -176,3 +193,58 @@ def trade_cost_prob(
         executable_price=executable_price,
         fee_coefficient=fee_coefficient,
     ) + slippage_prob
+
+
+def fee_coefficient_from_info(info: object) -> float | None:
+    """The coefficient the INSTRUMENT ITSELF carries, or ``None`` if it carries none.
+
+    The venue's own value is the AUTHORITY on that market's fee schedule. A
+    :class:`FeeCoefficientSource` is an injected PULL seam that takes an opaque
+    ``instrument_id`` string and has no structural obligation to answer about
+    the market it was asked for -- so a caller holding both should compare
+    them. This is the read that makes that comparison possible without naming
+    a venue.
+
+    Three outcomes, and the difference between the last two matters:
+
+    * key ABSENT -> ``None``. There is no authority to check against. A REAL
+      venue instrument always carries the key (the Polymarket.us parser writes
+      it unconditionally, ``None`` included); an instrument without it is
+      hand-built or comes from wiring that publishes none.
+    * key PRESENT but unusable (``None``, a ``bool`` round-trip, undecodable
+      text, non-finite, or outside ``[0, 1]``) -> raises. That is the venue
+      saying "unknown", which is a NO-TRADE, never "any value will do" -- the
+      same posture ``breezy.adapters.polymarket_us.fees`` takes when it
+      refuses rather than trading free.
+    * key present and usable -> the ``float``.
+
+    Raises
+    ------
+    UnknownFeeScheduleError
+        When the key is present but carries no usable coefficient.
+    """
+    if not isinstance(info, Mapping):
+        return None
+    if INSTRUMENT_INFO_FEE_COEFFICIENT_KEY not in info:
+        return None
+    raw = info[INSTRUMENT_INFO_FEE_COEFFICIENT_KEY]
+    value: float | None = None
+    # `bool` is a subclass of `int`, so a boolean is a plausible round-trip
+    # accident and must never be read as 0.0/1.0.
+    if isinstance(raw, bool):
+        value = None
+    elif isinstance(raw, int | float):
+        value = float(raw)
+    elif isinstance(raw, str):
+        try:
+            value = float(raw)
+        except ValueError:
+            value = None
+    if value is None or not math.isfinite(value) or value < 0.0 or value > 1.0:
+        raise UnknownFeeScheduleError(
+            f"{INSTRUMENT_INFO_FEE_COEFFICIENT_KEY!r} is present on this instrument but "
+            f"carries no usable coefficient ({raw!r}). A present-but-unusable value is "
+            "the venue saying the fee schedule is UNKNOWN, which is a no-trade, never "
+            "a licence to price the market off an injected number instead.",
+        )
+    return value

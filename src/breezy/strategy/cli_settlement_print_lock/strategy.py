@@ -61,6 +61,24 @@ arrive client-scoped via ``subscribe_data(..., client_id=NWS_BACKTEST_CLIENT_ID)
 ``expiration_ns`` (the native settlement deadline) -- this strategy has no
 forecast and therefore no ``ForecastSource`` to read a horizon from.
 
+EXECUTION SEAM
+--------------
+Orders are MARKETABLE LIMITS at ``ask + slippage_prob``, IOC, never unpriced
+market orders. ``slippage_prob`` is the load-bearing safety input -- the whole
+"ask 0.99 is unwritable" contract rests on it -- and a market order carries no
+price, so nothing downstream would hold a fill to the cost the edge model
+charged. This strategy's trigger is a PUBLIC print: every participant receives
+it at the same instant, so the quoted offer is exactly the offer everyone else
+is lifting, and a taker with no price limit walks the book. The visible-depth
+clip in ``decision.py`` does NOT close that -- ``market_quote_from_depth`` reads
+LEVEL-0 size, which makes "price quoted is price paid" true only for a LIMIT.
+
+For the same reason the admissible QUOTE AGE depends on which event is asking:
+see :data:`PRINT_ARRIVAL_MAX_QUOTE_AGE_MINUTES`. And because the observation
+is FINAL and never changes while the ask keeps moving, the dollar cost basis
+is bounded at the POSITION, not per decision --
+``_clip_to_cost_basis_anchor``.
+
 NOT IMPLEMENTED, DELIBERATELY
 -----------------------------
 * Clock alerts for the expected CLI window. The brief lists them as
@@ -75,9 +93,10 @@ NOT IMPLEMENTED, DELIBERATELY
 from __future__ import annotations
 
 import datetime as dt
+import math
 from typing import TYPE_CHECKING, Final
 
-from nautilus_trader.model.enums import OrderSide
+from nautilus_trader.model.enums import OrderSide, TimeInForce
 from nautilus_trader.trading.strategy import Strategy
 
 from breezy.domain.nws_climate_day import NwsClimateDay
@@ -93,8 +112,10 @@ from breezy.strategy.cli_settlement_print_lock.decision import (
 from breezy.strategy.depth10 import market_quote_from_depth
 from breezy.strategy.weather_common.bucket_contract import MispricingContract
 from breezy.strategy.weather_common.costs import (
+    INSTRUMENT_INFO_FEE_COEFFICIENT_KEY,
     FeeCoefficientSource,
     UnknownFeeScheduleError,
+    fee_coefficient_from_info,
 )
 from breezy.strategy.weather_common.freshness import SignalFreshness
 from breezy.strategy.weather_common.models import MarketQuote, hours_until
@@ -116,16 +137,84 @@ if TYPE_CHECKING:  # pragma: no cover - typing only
     from breezy.strategy.weather_common.models import SignalDecision
 
 __all__ = [
+    "ABSOLUTE_SLIPPAGE_FLOOR_PROB",
+    "COST_BASIS_EXHAUSTED_REFUSAL",
     "MEASURED_P_STABLE_WILSON_LOWER",
     "MEASURED_STATIONS",
+    "PRINT_ARRIVAL_MAX_QUOTE_AGE_MINUTES",
     "CliSettlementPrintLockStrategy",
     "EdgeFloorInversionError",
+    "FeeCoefficientMismatchError",
     "MissingFeeCoefficientSourceError",
     "MissingObservationBoundError",
+    "NegativeEdgeFloorError",
     "NoTradableMeasureError",
     "UnmeasuredStationError",
     "UnpricedInstrumentError",
 ]
+
+#: The slippage floor that does NOT depend on the venue's price granularity,
+#: in probability units.
+#:
+#: WHY AN ABSOLUTE CONSTANT AND NOT THE TICK. The floor used to be
+#: ``slippage_prob >= instrument.price_increment`` alone. A taker's slippage is
+#: a function of BOOK DEPTH and LATENCY; the tick is a function of the venue's
+#: price GRANULARITY, and halving the tick does not halve the adverse move.
+#: Executed counter-example on the old rule: at ``tick_size = 0.001``,
+#: ``slippage_prob = 0.001`` was legal and ``worst_admissible_ask(...)``
+#: returned **0.99** with edge **+0.005302** -- the exact trade BL-19 s8.2
+#: computes as **-0.003698** and the whole cost contract exists to refuse.
+#:
+#: The value is BL-19 s8.5's placeholder, unchanged: one 0.01 tick at the
+#: observed tick size, explicitly UNMEASURED, covering quote-age drift and
+#: queue risk only (the depth component is priced separately by the visible-
+#: depth clip in ``decision.py``). It is a FLOOR, not a replacement -- the
+#: effective bound is ``max(ABSOLUTE_SLIPPAGE_FLOOR_PROB, tick_size)``, so a
+#: COARSER venue grid still raises it. When s8.5's instrumentation yields a
+#: measured figure this constant is RE-DERIVED from it, never removed: a floor
+#: of zero restores exactly the configuration the cost contract exists to
+#: forbid. A BUILD-side decision, not an operator-reserved control.
+ABSOLUTE_SLIPPAGE_FLOOR_PROB: Final[float] = 0.01
+
+#: The MAXIMUM age, in minutes, of the cached book this strategy will act on
+#: when the trigger is a CLI PRINT ARRIVAL rather than a book update.
+#:
+#: ``stale_quote_minutes`` (15.0) is the general bound and stays in force on
+#: the book-driven path. It is far too loose on the print-driven one, and the
+#: difference is not data quality -- it is ADVERSE SELECTION. The final print
+#: is PUBLIC: every participant sees it at the same instant, so the offer
+#: quoted before it is precisely the offer everyone else is lifting. At ask
+#: 0.98 the entire modelled edge is +0.005720 -- 0.57 of ONE tick -- so a
+#: single tick of post-print movement is already a loss.
+#:
+#: One minute, fail-closed, pending BL-19 s8.5's measurement of realised
+#: fills: no bound on the rate at which these books move has ever been
+#: measured, so the honest choice is the tightest bound that still permits a
+#: trade at all. The cost of being tight is only a DELAY -- the observation is
+#: stored and ``on_order_book_depth`` re-evaluates on the next book update,
+#: which by construction carries a zero-age quote.
+PRINT_ARRIVAL_MAX_QUOTE_AGE_MINUTES: Final[float] = 1.0
+
+#: Counted refusal reason for a top-up refused by the POSITION-level cost
+#: basis anchor. A FIXED string, never composed from a value -- see
+#: ``weather_common.refusals``: an unbounded key space is a memory leak, not
+#: a counter. Recorded by the strategy layer rather than by
+#: ``RiskManager.evaluate_order`` (so it is deliberately NOT a member of
+#: ``COUNTED_REFUSAL_REASONS``, which documents that method's own closed set),
+#: exactly as the decision layer already records ``shorts_disabled`` --
+#: ``weather_common.refusals`` is explicit that both layers count into the one
+#: counter, because counting only the risk manager leaves the counter at zero
+#: for refusals that never reach it (BL-10 / BL-19 s8.5 null class N1).
+COST_BASIS_EXHAUSTED_REFUSAL: Final[str] = "cost_basis_exhausted"
+
+#: ``RiskManager.quote_tradable``'s own spelling, reused so the strategy-side
+#: print-arrival bound and the risk-side general bound land on ONE counter key.
+_STALE_QUOTE_REFUSAL: Final[str] = "stale_quote"
+
+#: Guards ``ceil``/``floor`` against a representation error in an exact tick
+#: multiple (0.01 has no exact binary representation). Same role and magnitude
+#: as ``decision._TICK_EPSILON``.
+_TICK_EPSILON: Final[float] = 1e-9
 
 
 class MissingObservationBoundError(ValueError):
@@ -172,7 +261,9 @@ class UnpricedInstrumentError(ValueError):
     """Raised at ``on_start`` for an instrument this strategy cannot cost.
 
     Two causes, one posture: the market carries no usable fee coefficient, or
-    the configured ``slippage_prob`` is below the instrument's own tick.
+    the configured ``slippage_prob`` is below the effective slippage floor
+    (:data:`ABSOLUTE_SLIPPAGE_FLOOR_PROB`, raised to the instrument's own tick
+    when that tick is coarser), including a non-finite value.
 
     Same reasoning, and for the same reason, as
     :class:`MissingObservationBoundError` above: both are STATIC properties of
@@ -184,10 +275,83 @@ class UnpricedInstrumentError(ValueError):
     coefficient raises rather than trading free; this is that rule, moved to
     the gate.
 
-    The tick floor lives here rather than in ``config.py`` because
-    ``tick_size`` is PER INSTRUMENT and unknown at config construction --
-    ``bucket_contract.py`` records that the captured universe carries more
-    than one tick size.
+    WHERE EACH HALF OF THE SLIPPAGE FLOOR IS CHECKED. The ABSOLUTE half
+    (:data:`ABSOLUTE_SLIPPAGE_FLOOR_PROB`, and the finiteness check) needs no
+    instrument and is therefore raised from ``__init__``, the earliest point
+    at which it is knowable. Only the per-instrument half -- a venue whose
+    tick is COARSER than the absolute floor -- has to wait for ``on_start``.
+
+    The tick half used to be the WHOLE floor, justified by a claim in
+    ``bucket_contract.py`` that "the captured universe carries more than one
+    tick size". That claim is RETRACTED: a re-run of the sweep over
+    ``docs/evidence/venue/polymarket_us/raw/*.json`` finds
+    ``orderPriceMinTickSize == 0.01`` in 729/729 observations; the field that
+    varies is ``minimumTradeQty``. The floor no longer rests on it either way
+    -- see :data:`ABSOLUTE_SLIPPAGE_FLOOR_PROB` for why a price-granularity
+    bound was never the right shape for an execution cost.
+    """
+
+
+class NegativeEdgeFloorError(ValueError):
+    """Raised when either edge floor is negative or non-finite.
+
+    :class:`EdgeFloorInversionError` above checks only the RELATIVE order of
+    the two floors, so ``min_model_edge = min_edge_after_costs = -0.02``
+    satisfies it. That pair is a two-line config edit with no error and
+    negative expectation:
+
+    * ``decision.py``'s ``edge < cfg.min_edge_after_costs`` admits ask 0.99 at
+      edge **-0.003698** (BL-19 s8.2);
+    * ``risk.py:421``'s ``abs(edge) < limits.min_model_edge`` can NEVER fire
+      against a negative threshold, because ``abs`` is non-negative -- the
+      re-application that exists to catch exactly this is disarmed;
+    * ``worst_admissible_ask`` clamps ``a_max`` to 1.0, so the derived cost
+      basis anchor becomes the full **$25.00** rather than $24.53.
+
+    A floor of ZERO is accepted: "no positive expectation required" is a
+    defensible (if useless) setting. A NEGATIVE floor is a requirement to
+    lose money, which is not a setting. Non-finite is refused in the same
+    place because ``nan`` compares ``False`` against everything, so a ``nan``
+    floor passes both the inversion check and the decision-layer gate.
+    """
+
+
+class FeeCoefficientMismatchError(ValueError):
+    """Raised at ``on_start`` when the injected ``theta`` is not this market's.
+
+    :class:`~breezy.strategy.weather_common.costs.FeeCoefficientSource`
+    is a PULL seam whose one method takes an OPAQUE ``instrument_id`` string.
+    Nothing in the Protocol obliges an implementation to return a value ABOUT
+    the instrument it was asked for, and the shipped
+    ``PolymarketUSFeeCoefficients`` holds its own COPIED mapping built at the
+    wiring site -- so a mis-keyed, partially-built or drifted map answers with
+    another market's coefficient and every cost this strategy computes is
+    priced off the wrong number, silently and forever.
+
+    ``on_start`` already holds the ``Instrument``, whose own
+    ``info[fee_coefficient]`` is the venue's authority on its own fee
+    schedule. Comparing the two is free and turns a silent mispricing into a
+    startup failure.
+
+    STALENESS IS NOT HANDLED, AND THAT IS THE DECISION. ``theta`` is resolved
+    once and frozen, with no ``on_instrument`` refresh, because:
+
+    1. A fee schedule is a STATIC property of a market. The captured corpus
+       carries ``feeCoefficient == 0.06`` in 729/729 observations across 680
+       distinct slugs, spanning both OPEN and RESOLVED markets, and **no slug
+       ever disagrees with itself across duplicate observations**
+       (``docs/core/archive/PROGRESS-pre-2026-08-31-backlog-replacement.md``
+       lines 941-944). There is no observed instance of the thing a refresh
+       would track.
+    2. A refresh would MUTATE a cost input mid-session that the decision layer
+       treats as a constant, so two evaluations of the same book could size
+       and price differently for a reason no recorded decision explains. That
+       is a larger hazard than the one it closes, and it would also require
+       subscribing to instrument updates that nothing else in this strategy
+       needs.
+
+    If a venue is ever observed re-pricing a live market, the correct response
+    is a loud REFUSAL on change, not a silent re-read.
     """
 
 
@@ -295,6 +459,38 @@ class CliSettlementPrintLockStrategy(SharedExposureMixin, Strategy):
                 "strategy would evaluate no instrument at all and be indistinguishable "
                 "from one that merely found no opportunity. Enable at least one measure.",
             )
+        if not math.isfinite(config.slippage_prob):
+            raise UnpricedInstrumentError(
+                f"CliSettlementPrintLockConfig.slippage_prob {config.slippage_prob!r} is "
+                "not a finite number. `nan < floor` is False, so a non-finite value "
+                "passes every bare comparison and only raises later, inside "
+                "`trade_cost_prob`, from a DATA HANDLER mid-session -- the exact "
+                "loud-at-the-gate / silent-in-flight inversion every other guard here "
+                "exists to prevent.",
+            )
+        if config.slippage_prob < ABSOLUTE_SLIPPAGE_FLOOR_PROB:
+            raise UnpricedInstrumentError(
+                f"CliSettlementPrintLockConfig.slippage_prob {config.slippage_prob} is "
+                f"below the absolute floor {ABSOLUTE_SLIPPAGE_FLOOR_PROB}. Slippage is "
+                "determined by BOOK DEPTH and LATENCY, not by the venue's price "
+                "granularity, and it is the ONLY writable cost input -- a value below "
+                "the floor is how ask 0.99 gets admitted (BL-19 s8.2: edge -0.003698 "
+                "there). See ABSOLUTE_SLIPPAGE_FLOOR_PROB.",
+            )
+        for name, floor in (
+            ("min_model_edge", config.min_model_edge),
+            ("min_edge_after_costs", config.min_edge_after_costs),
+        ):
+            if not math.isfinite(floor) or floor < 0.0:
+                raise NegativeEdgeFloorError(
+                    f"CliSettlementPrintLockConfig.{name} is {floor!r}. An edge floor "
+                    "must be a finite, non-negative number: `risk.py:421` compares "
+                    "`abs(edge)` against it, so a NEGATIVE floor can never fire and a "
+                    "`nan` floor compares False against everything -- either one "
+                    "disarms the re-application silently and admits ask 0.99 at edge "
+                    "-0.003698. Zero is accepted; below zero is a requirement to lose "
+                    "money, which is not a setting.",
+                )
         if config.min_model_edge > config.min_edge_after_costs:
             raise EdgeFloorInversionError(
                 f"CliSettlementPrintLockConfig has min_model_edge "
@@ -353,13 +549,19 @@ class CliSettlementPrintLockStrategy(SharedExposureMixin, Strategy):
                     "listing is a venue event, not a licence to extrapolate.",
                 )
             tick_size = float(instrument.price_increment)
-            if self._config.slippage_prob < tick_size:
+            # A FLOOR, raised by a coarser grid and never lowered by a finer
+            # one. The absolute half is already refused in `__init__`; only a
+            # tick COARSER than it can still bind here.
+            slippage_floor = max(ABSOLUTE_SLIPPAGE_FLOOR_PROB, tick_size)
+            if self._config.slippage_prob < slippage_floor:
                 raise UnpricedInstrumentError(
                     f"CliSettlementPrintLockConfig.slippage_prob "
-                    f"{self._config.slippage_prob} is below {instrument_id}'s own tick "
-                    f"{tick_size}. Slippage cannot be smaller than the smallest "
+                    f"{self._config.slippage_prob} is below {instrument_id}'s effective "
+                    f"slippage floor {slippage_floor} (the greater of "
+                    f"{ABSOLUTE_SLIPPAGE_FLOOR_PROB} and this market's own tick "
+                    f"{tick_size}). Slippage cannot be smaller than the smallest "
                     "representable adverse price move, and it is the ONLY writable "
-                    "cost input -- a value below one tick is how ask 0.99 gets "
+                    "cost input -- a value below the floor is how ask 0.99 gets "
                     "admitted (BL-19 s8.2: edge -0.003698 there).",
                 )
             try:
@@ -372,6 +574,7 @@ class CliSettlementPrintLockStrategy(SharedExposureMixin, Strategy):
                     "counted by the refusal counter and would present as a market with "
                     "no opportunities.",
                 ) from exc
+            self._assert_theta_is_this_markets(instrument_id, instrument.info, theta)
             contract = MispricingContract(
                 instrument_id=str(instrument_id),
                 facts=facts,
@@ -398,6 +601,40 @@ class CliSettlementPrintLockStrategy(SharedExposureMixin, Strategy):
         )
         self._refusal_alerter = RefusalAlerter(self.refusals, site=str(self.id))
         self.subscribe_data(nws_climate_day_data_type(), client_id=NWS_BACKTEST_CLIENT_ID)
+
+    def _assert_theta_is_this_markets(
+        self, instrument_id: InstrumentId, info: object, theta: float,
+    ) -> None:
+        """Cross-check the INJECTED coefficient against the instrument in hand.
+
+        See :class:`FeeCoefficientMismatchError` for why an injected value is
+        not self-certifying, and for the explicit decision not to handle
+        staleness.
+        """
+        try:
+            own = fee_coefficient_from_info(info)
+        except UnknownFeeScheduleError as exc:
+            raise UnpricedInstrumentError(
+                f"{instrument_id} carries {INSTRUMENT_INFO_FEE_COEFFICIENT_KEY!r} but no "
+                f"usable value in it, while the injected FeeCoefficientSource answered "
+                f"{theta}. A present-but-unusable coefficient is the venue saying its fee "
+                "schedule is UNKNOWN, which is a no-trade -- so the injected number did "
+                "not come from this market.",
+            ) from exc
+        if own is None:
+            # FAIL-OPEN, narrowly: the instrument publishes no coefficient at
+            # all, so there is no authority to check against. A real venue
+            # instrument always carries the key.
+            return
+        if abs(own - theta) > 1e-12:
+            raise FeeCoefficientMismatchError(
+                f"The injected FeeCoefficientSource returned theta {theta} for "
+                f"{instrument_id}, but that market's own "
+                f"{INSTRUMENT_INFO_FEE_COEFFICIENT_KEY!r} is {own}. The instrument is the "
+                "venue's authority on its own fee schedule; an injected value that "
+                "disagrees with it is a value about some OTHER market, and every cost "
+                "this strategy computes would be priced off it.",
+            )
 
     def _measure_enabled(self, measure: Measure) -> bool:
         return self._config.use_tmax if measure is Measure.HIGH else self._config.use_tmin
@@ -436,7 +673,9 @@ class CliSettlementPrintLockStrategy(SharedExposureMixin, Strategy):
         if quote is None:
             return
         self._quotes[iid] = quote
-        self._evaluate_and_act(iid)
+        # Book-driven: the quote being evaluated IS this update, so its age is
+        # zero and the general bound is the right one.
+        self._evaluate_and_act(iid, max_quote_age_minutes=self._config.stale_quote_minutes)
 
     def on_data(self, data: Data) -> None:
         if type(data) is not NwsClimateDay:
@@ -456,12 +695,21 @@ class CliSettlementPrintLockStrategy(SharedExposureMixin, Strategy):
                 is_superseded=data.is_superseded,
                 published_at=_ns_to_datetime(data.issuance_time_ns),
             )
-            self._evaluate_and_act(iid)
+            # Print-driven: the book is whatever was LAST CACHED, and the
+            # trigger is public information every participant receives at the
+            # same instant. See PRINT_ARRIVAL_MAX_QUOTE_AGE_MINUTES.
+            self._evaluate_and_act(
+                iid,
+                max_quote_age_minutes=min(
+                    self._config.stale_quote_minutes,
+                    PRINT_ARRIVAL_MAX_QUOTE_AGE_MINUTES,
+                ),
+            )
 
     # ------------------------------------------------------------------
     # Decision + execution
     # ------------------------------------------------------------------
-    def _evaluate_and_act(self, instrument_id: str) -> None:
+    def _evaluate_and_act(self, instrument_id: str, *, max_quote_age_minutes: float) -> None:
         contract = self._contracts[instrument_id]
         quote = self._quotes.get(instrument_id)
         observation = self._observations.get(instrument_id)
@@ -490,7 +738,15 @@ class CliSettlementPrintLockStrategy(SharedExposureMixin, Strategy):
             self._report_refusals()
             return
         current_qty = float(self.portfolio.net_position(self._nt_ids[instrument_id]))
-        self._maybe_submit(contract, quote, decision, observation, now, current_qty)
+        self._maybe_submit(
+            contract,
+            quote,
+            decision,
+            observation,
+            now,
+            current_qty,
+            max_quote_age_minutes,
+        )
 
     def _maybe_submit(
         self,
@@ -500,6 +756,7 @@ class CliSettlementPrintLockStrategy(SharedExposureMixin, Strategy):
         observation: CliPrintObservation,
         now: dt.datetime,
         current_qty: float,
+        max_quote_age_minutes: float,
     ) -> None:
         nt_id = self._nt_ids[contract.instrument_id]
         if self.cache.orders_open(instrument_id=nt_id):
@@ -515,6 +772,32 @@ class CliSettlementPrintLockStrategy(SharedExposureMixin, Strategy):
         observation_age_hours = (now - observation.published_at).total_seconds() / 3600.0
         # Unit proof: this delta is minutes, the unit `stale_quote_minutes` expects.
         quote_age_minutes = (now - quote.ts_event).total_seconds() / 60.0
+        # The TRIGGER-DEPENDENT bound, applied ahead of (and never instead of)
+        # `RiskManager.quote_tradable`'s general one: risk is constructed once
+        # and holds a single `stale_quote_minutes`, while the admissible age
+        # here depends on WHICH event is asking. Only the tighter of the two
+        # can fire here; risk still applies its own bound, its `future_quote`
+        # guard for a negative age, and everything else. Counted under the
+        # SAME key `quote_tradable` uses, so an operator reads one number.
+        if quote_age_minutes > max_quote_age_minutes:
+            self.refusals.record(_STALE_QUOTE_REFUSAL)
+            self.log.info(
+                f"RISK block {contract.instrument_id}: stale_quote "
+                f"age={quote_age_minutes:.2f}m > {max_quote_age_minutes:.2f}m",
+            )
+            self._report_refusals()
+            return
+
+        delta = self._clip_to_cost_basis_anchor(contract, decision, delta)
+        if delta < 1.0:
+            self.refusals.record(COST_BASIS_EXHAUSTED_REFUSAL)
+            self.log.info(
+                f"RISK block {contract.instrument_id}: {COST_BASIS_EXHAUSTED_REFUSAL} "
+                f"edge={decision.edge:.3f}",
+            )
+            self._report_refusals()
+            return
+
         deadline = self._deadlines[contract.instrument_id]
         assert self._risk is not None
         risk_decision = self._risk.evaluate_order(
@@ -534,32 +817,135 @@ class CliSettlementPrintLockStrategy(SharedExposureMixin, Strategy):
             )
             self._report_refusals()
             return
-        self._submit_delta(contract, risk_decision.clipped_quantity, decision)
+        self._submit_delta(contract, risk_decision.clipped_quantity, decision, quote)
+
+    def _clip_to_cost_basis_anchor(
+        self,
+        contract: MispricingContract,
+        decision: SignalDecision,
+        delta: float,
+    ) -> float:
+        """Bound the POSITION's cost basis by ``A``, not merely this decision's.
+
+        ``decision.quantity`` is a TARGET LEVEL, and this strategy tops up to
+        it on every depth tick. The observation is FINAL and NEVER CHANGES --
+        only the ask moves -- so as the ask falls ``A / premium`` rises and the
+        old rule bought MORE, averaging down through the entire decline. Each
+        decision genuinely committed the design's $24.53; the POSITION did not.
+        Measured over a monotone decline from 0.98 to 0.16 the old rule
+        deployed **$62.60**, 2.55x the anchor, and it deployed it SPECIFICALLY
+        BECAUSE the market disagreed more -- which is the shape of a wrong
+        bucket mapping or a pending correction, not of a bigger edge.
+
+        The basis already committed is read from the NATIVE position
+        (``Position.avg_px_open`` plus its own ``commissions()``), never
+        re-derived from the current ask: at a falling ask a current-price
+        estimate understates the historical basis and re-opens the ratchet.
+        Working orders cannot double-count, because ``_maybe_submit`` has
+        already returned if any order is open on this instrument.
+        """
+        anchor = decision.metadata.get("cost_basis_anchor")
+        fee_prob = decision.metadata.get("fee_prob")
+        if not isinstance(anchor, float) or not isinstance(fee_prob, float):
+            # The decision layer always supplies both. A decision that does not
+            # is not one this execution path can bound, so it does not trade.
+            self.log.error(
+                f"decision for {contract.instrument_id} carries no cost basis anchor; "
+                "refusing to size against an unbounded budget",
+            )
+            return 0.0
+        premium = decision.market_probability + fee_prob
+        if premium <= 0.0:
+            return 0.0
+        remaining = anchor - self._committed_basis(contract)
+        affordable = math.floor(max(0.0, remaining) / premium + _TICK_EPSILON)
+        return min(delta, float(affordable))
+
+    def _committed_basis(self, contract: MispricingContract) -> float:
+        """Dollars this instrument's OPEN position has already committed.
+
+        NAUTILUS NULL HYPOTHESIS (L-1), checked first: ``Position`` already
+        maintains ``avg_px_open`` (``model/position.pyx:95``, updated on every
+        fill by ``_calculate_avg_px_open_px`` at ``:963``) and ``commissions()``
+        (``:864``), and ``Cache.positions_open(instrument_id=...)`` already
+        indexes them per instrument. Nothing is re-implemented here: this is
+        the sum the framework already computes, converted from raw venue price
+        units to payout dollars by the contract's own ``price_scale``.
+        """
+        total = 0.0
+        nt_id = self._nt_ids[contract.instrument_id]
+        for position in self.cache.positions_open(instrument_id=nt_id):
+            total += float(position.quantity) * position.avg_px_open * contract.price_scale
+            total += sum(float(money.as_double()) for money in position.commissions())
+        return total
 
     def _submit_delta(
         self,
         contract: MispricingContract,
         signed_delta: float,
         decision: SignalDecision,
+        quote: MarketQuote,
     ) -> None:
         nt_id = self._nt_ids[contract.instrument_id]
         instrument = self.cache.instrument(nt_id)
         if instrument is None:
             self.log.error(f"instrument vanished from cache: {contract.instrument_id}")
             return
-        # Taker against the live ask only -- a market order IS a taker fill.
-        # No post-only, no maker rebate, and no emitted limit price, so the
-        # venue's 0.01 tick cannot be violated here.
-        order = self.order_factory.market(
+        limit_price = self._marketable_limit_price(contract, quote)
+        if limit_price is None:
+            self.log.error(f"no ask to price against: {contract.instrument_id}")
+            return
+        # MARKETABLE LIMIT, IOC -- a taker fill that CANNOT pay more than the
+        # price the edge was computed at plus the slippage that edge already
+        # charged. An unpriced MARKET order carried no such bound: this
+        # strategy is triggered by a PUBLIC print, so the quoted level is
+        # exactly the level every other participant lifts at the same instant,
+        # and the taker walks the book at whatever is left. Depth clipping does
+        # not save that -- `market_quote_from_depth` takes level-0 size, which
+        # guarantees "price quoted is price paid" only for a LIMIT.
+        #
+        # `post_only` stays False (the default): this is a taker, and
+        # `backtest_order_guard` refuses a post-only order outright because
+        # `PolymarketUSFeeModel` would price a maker fill wrong in SIGN.
+        order = self.order_factory.limit(
             instrument_id=nt_id,
             order_side=OrderSide.BUY,
             quantity=instrument.make_qty(abs(signed_delta)),
+            price=instrument.make_price(limit_price),
+            time_in_force=TimeInForce.IOC,
         )
         self.submit_order(order)
         self.log.info(
             f"ORDER {contract.instrument_id} qty={signed_delta:+.1f} "
-            f"intent=LONG_YES edge={decision.edge:.3f} reason={decision.reason}",
+            f"limit={limit_price} intent=LONG_YES edge={decision.edge:.3f} "
+            f"reason={decision.reason}",
         )
+
+    def _marketable_limit_price(
+        self, contract: MispricingContract, quote: MarketQuote,
+    ) -> float | None:
+        """``ask + slippage_prob``, in RAW venue units, ON the tick grid.
+
+        ``slippage_prob`` is in PROBABILITY units and the order price is in the
+        venue's own units, so it is divided by ``price_scale`` before being
+        added (identity at the shipped scale of 1.0). It is then rounded UP to
+        a whole number of ticks -- never down, which would emit a limit tighter
+        than the cost the edge model charged -- and snapped to the grid, so the
+        emitted price is representable by construction rather than by
+        arithmetic luck. Capped at the maximum price of a binary (probability
+        1.0), which no admissible ask can reach anyway: the edge floor already
+        refuses ask 0.99.
+        """
+        if quote.ask is None:
+            return None
+        tick = contract.tick_size
+        if tick <= 0.0:
+            return None
+        slippage_raw = self._config.slippage_prob / contract.price_scale
+        ticks = math.ceil(slippage_raw / tick - _TICK_EPSILON)
+        raw = quote.ask + ticks * tick
+        snapped = math.floor(raw / tick + 0.5) * tick
+        return min(snapped, 1.0 / contract.price_scale)
 
     def _report_refusals(self) -> None:
         """Push this evaluation's refusal counts through the alert path.

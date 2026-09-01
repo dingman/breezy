@@ -38,8 +38,35 @@ class MispricingContract:
 
     instrument_id: str
     facts: WeatherBucketFacts
-    #: The instrument's own minimum price increment (``float(instrument.price_increment)``),
-    #: never a literal default -- the captured universe carries more than one tick size.
+    #: The instrument's own minimum price increment
+    #: (``float(instrument.price_increment)``), never a literal default.
+    #:
+    #: CORRECTED 2026-09-01. This field previously claimed "the captured
+    #: universe carries more than one tick size". It does not, and never did:
+    #: a re-run of the recursive sweep over
+    #: ``docs/evidence/venue/polymarket_us/raw/*.json`` (26 files, 729 market
+    #: observations across 680 distinct slugs) finds
+    #: ``orderPriceMinTickSize == 0.01`` in **729/729**, with no exceptions
+    #: -- matching ``docs/core/archive/PROGRESS-pre-2026-08-31-backlog-replacement.md``
+    #: line 945. The field that actually VARIES in that corpus is
+    #: ``minimumTradeQty`` (405 observations at 0.01, 324 at 1), i.e. the SIZE
+    #: increment, not the price tick; the original comment conflated the two.
+    #:
+    #: The field stays per-instrument anyway -- reading a venue fact per market
+    #: is right regardless of how uniform today's capture happens to be -- but
+    #: NOTHING SAFETY-CRITICAL MAY REST ON TICK VARIATION. It used to: the
+    #: print-lock slippage floor was ``slippage_prob >= tick``, which on a
+    #: hypothetical 0.001-tick market admitted ``slippage_prob = 0.001`` and
+    #: with it ask 0.99 at edge +0.005302 -- the exact trade BL-19 s8.2
+    #: computes as -0.003698. That floor is now
+    #: ``max(ABSOLUTE_SLIPPAGE_FLOOR_PROB, tick)``. See
+    #: ``breezy.strategy.cli_settlement_print_lock.strategy``.
+    #:
+    #: (``docs/evidence/bl19_edge_and_cost_decision_2026-09-01.md`` s1 and
+    #: falsifier 5 both cite the retracted claim, sourcing it to this comment.
+    #: Falsifier 5 -- "tick size is not 0.01 on the traded instruments" --
+    #: remains a legitimate thing to watch for; what is retracted is the claim
+    #: that it has ALREADY been observed.)
     tick_size: float
     #: 1.0 for markets already priced in [0, 1]; overridable per-strategy via
     #: config for a cent-priced venue.

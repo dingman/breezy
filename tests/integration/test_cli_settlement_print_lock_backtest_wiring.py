@@ -37,7 +37,13 @@ from typing import Any
 import pytest
 from nautilus_trader.model.currencies import USD
 from nautilus_trader.model.data import BookOrder, InstrumentClose, OrderBookDepth10
-from nautilus_trader.model.enums import AssetClass, InstrumentCloseType, OrderSide
+from nautilus_trader.model.enums import (
+    AssetClass,
+    InstrumentCloseType,
+    OrderSide,
+    OrderType,
+    TimeInForce,
+)
 from nautilus_trader.model.events import OrderFilled
 from nautilus_trader.model.identifiers import InstrumentId, Symbol, Venue
 from nautilus_trader.model.instruments import BinaryOption
@@ -59,6 +65,14 @@ from breezy.domain.weather_bucket_facts import (
 )
 from breezy.runtime.backtest_feed import as_backtest_data
 from breezy.runtime.backtest_harness import BreezyBacktestConfig, run_backtest
+from breezy.strategy.cli_settlement_print_lock.config import MIN_EDGE_AFTER_COSTS_BL19
+from breezy.strategy.cli_settlement_print_lock.decision import (
+    cost_basis_anchor,
+    worst_admissible_ask,
+)
+from breezy.strategy.cli_settlement_print_lock.strategy import (
+    MEASURED_P_STABLE_WILSON_LOWER,
+)
 from tests.unit.test_persistence_catalog import make_climate_day
 
 
@@ -177,6 +191,35 @@ def _close(instrument: BinaryOption) -> InstrumentClose:
     )
 
 
+def _depth_at(
+    instrument: BinaryOption, *, ask: str, size: int, ts_ns: int, sequence: int,
+) -> OrderBookDepth10:
+    """One tradable snapshot at `ask`, with a bid one 0.02 spread below.
+
+    Two-sided deliberately: the backtest matching engine returns NO FILLS from
+    a book whose bid side is entirely padding, so a one-sided snapshot tests
+    the engine rather than the strategy. The spread is held at 0.02, inside
+    `max_bid_ask_spread` (0.06), so `quote_tradable` never refuses for a
+    reason this test is not about.
+    """
+    bid_value = round(float(ask) - 0.02, instrument.price_precision)
+    bids, bid_counts = _padded_side(
+        instrument, OrderSide.BUY, f"{bid_value:.{instrument.price_precision}f}", size,
+    )
+    asks, ask_counts = _padded_side(instrument, OrderSide.SELL, ask, size)
+    return OrderBookDepth10(
+        instrument_id=instrument.id,
+        bids=bids,
+        asks=asks,
+        bid_counts=bid_counts,
+        ask_counts=ask_counts,
+        flags=0,
+        sequence=sequence,
+        ts_event=ts_ns,
+        ts_init=ts_ns,
+    )
+
+
 def _config(instrument: BinaryOption) -> BreezyBacktestConfig:
     return BreezyBacktestConfig(
         instruments=(instrument,),
@@ -285,5 +328,248 @@ def test_cli_settlement_print_lock_reaches_on_data_and_submits_an_order() -> Non
         assert strategy.refusals.counts == {} or all(
             count == 0 for count in strategy.refusals.counts.values()
         )
+    finally:
+        engine.dispose()
+
+
+# ---------------------------------------------------------------------------
+# The execution mechanism actually enforces the modelled slippage
+# ---------------------------------------------------------------------------
+
+
+def test_the_submitted_order_is_a_marketable_limit_capped_at_ask_plus_slippage() -> None:
+    """An UNPRICED market order defeats `slippage_prob` at execution time.
+
+    `slippage_prob` is the load-bearing safety input -- the whole "ask 0.99 is
+    unwritable" guarantee rests on it -- but a `MARKET` order carries no price
+    at all, so nothing downstream holds the fill to the number the edge model
+    charged. The final print is PUBLIC: every participant sees it at once, the
+    quoted level is swept, and the taker walks the book at whatever is left.
+
+    A marketable LIMIT at `ask + slippage_prob`, IOC, makes the modelled cost
+    STRUCTURAL: no fill can occur above the price the edge was computed at
+    plus the slippage that edge already paid for, and anything worse simply
+    does not trade.
+    """
+    instrument = _instrument()
+    strategy = _strategy(instrument)
+
+    engine = run_backtest(_config(instrument), strategies=(strategy,))
+    try:
+        submitted = [
+            order
+            for order in engine.cache.orders()
+            if not str(order.client_order_id).startswith("EXPIRATION-LEG")
+        ]
+        assert len(submitted) == 1
+        order = submitted[0]
+        assert order.order_type == OrderType.LIMIT
+        assert order.time_in_force == TimeInForce.IOC
+        # ask 0.90 + one 0.01 tick of modelled slippage, ON THE GRID.
+        assert order.price == Price.from_str("0.91")
+        assert order.price.precision == instrument.price_precision
+    finally:
+        engine.dispose()
+
+
+def test_a_print_arriving_against_a_stale_cached_book_does_not_trade() -> None:
+    """Adverse selection by construction, and the counter must SEE it.
+
+    `_evaluate_and_act` is driven from `on_data` -- CLI print arrival -- against
+    the LAST CACHED depth quote, and `stale_quote_minutes` is 15.0. A settled
+    source firing against a ten-minute-old book is not a stale-data edge case,
+    it is the definition of adverse selection: the print is public, so the
+    quoted offer is exactly what everyone else is lifting.
+
+    The refusal is COUNTED (`stale_quote`), never a silent pre-signal `None`
+    -- BL-19 s8.5 null class N1 / BL-10.
+    """
+    instrument = _instrument()
+    strategy = _strategy(instrument)
+    config = BreezyBacktestConfig(
+        instruments=(instrument,),
+        # The book lands FIRST and is never refreshed; the print arrives ten
+        # minutes later, inside `stale_quote_minutes` and well outside the
+        # print-arrival bound.
+        market_data=[
+            _depth_at(
+                instrument, ask="0.90", size=500, ts_ns=_HOUR_NS, sequence=0,
+            ),
+            _close(instrument),
+        ],
+        weather_data=as_backtest_data(
+            [
+                make_climate_day(
+                    station=STATION,
+                    climate_day=CLIMATE_DAY,
+                    tmax_f=_PRINTED_TMAX_F,
+                    is_final=True,
+                    correction_flag=False,
+                    is_superseded=False,
+                    issuance_time_ns=_HOUR_NS + 10 * 60 * 1_000_000_000,
+                    retrieved_at_ns=_HOUR_NS + 10 * 60 * 1_000_000_000,
+                    ts_event=_HOUR_NS + 10 * 60 * 1_000_000_000,
+                ),
+            ],
+        ),
+        settlement_prices={instrument.id: 1.0},
+        starting_balances=(Money(STARTING_BALANCE_USD, instrument.quote_currency),),
+    )
+
+    # Submitting NOTHING is the assertion. The harness otherwise raises
+    # `SilentRunError` on an idle strategy, which is the correct default and
+    # is exactly what this run exists to observe.
+    engine = run_backtest(config, strategies=(strategy,), allow_idle_strategies=True)
+    try:
+        fills = [
+            event
+            for order in engine.cache.orders()
+            for event in order.events
+            if isinstance(event, OrderFilled) and event.order_side == OrderSide.BUY
+        ]
+        assert fills == []
+        assert strategy.refusals.count("stale_quote") >= 1
+    finally:
+        engine.dispose()
+
+
+# ---------------------------------------------------------------------------
+# The dollar anchor is a POSITION budget, not a per-decision one
+# ---------------------------------------------------------------------------
+
+#: A monotone decline from the tightest admissible entry. The OBSERVATION is
+#: final and never changes -- only the ask moves -- so every one of these ticks
+#: re-forms the SAME signal at a larger `A / premium`.
+_DECLINE_ASKS: tuple[str, ...] = (
+    "0.98", "0.90", "0.80", "0.70", "0.60", "0.50", "0.40", "0.30", "0.20", "0.16",
+)
+
+
+def _declining_config(instrument: BinaryOption) -> BreezyBacktestConfig:
+    half_hour_ns = _HOUR_NS // 2
+    depths = [
+        _depth_at(
+            instrument,
+            ask=ask,
+            size=500,
+            ts_ns=_HOUR_NS + index * half_hour_ns,
+            sequence=index,
+        )
+        for index, ask in enumerate(_DECLINE_ASKS)
+    ]
+    return BreezyBacktestConfig(
+        instruments=(instrument,),
+        market_data=[*depths, _close(instrument)],
+        weather_data=as_backtest_data(
+            [
+                make_climate_day(
+                    station=STATION,
+                    climate_day=CLIMATE_DAY,
+                    tmax_f=_PRINTED_TMAX_F,
+                    is_final=True,
+                    correction_flag=False,
+                    is_superseded=False,
+                    issuance_time_ns=_PRINT_NS,
+                    retrieved_at_ns=_PRINT_NS,
+                    ts_event=_PRINT_NS,
+                ),
+            ],
+        ),
+        settlement_prices={instrument.id: 1.0},
+        starting_balances=(Money(STARTING_BALANCE_USD, instrument.quote_currency),),
+    )
+
+
+def _anchor() -> float:
+    """`A`, re-derived from the shipped constants rather than transcribed."""
+    return cost_basis_anchor(
+        base_quantity=25.0,
+        worst_ask=worst_admissible_ask(
+            model_p=MEASURED_P_STABLE_WILSON_LOWER,
+            fee_coefficient=0.06,
+            slippage_prob=runner.SLIPPAGE_PROB_CLI_SETTLEMENT_PRINT_LOCK,
+            min_edge_after_costs=MIN_EDGE_AFTER_COSTS_BL19,
+            tick_size=0.01,
+        ),
+        fee_coefficient=0.06,
+    )
+
+
+def _premium_paid(engine: Any, instrument: BinaryOption) -> float:
+    """Dollars actually committed: fill notional PLUS the venue commission."""
+    total = 0.0
+    for order in engine.cache.orders():
+        for event in order.events:
+            if not isinstance(event, OrderFilled) or event.order_side != OrderSide.BUY:
+                continue
+            total += float(event.last_px) * float(event.last_qty)
+            total += float(event.commission.as_double())
+    return total
+
+
+def test_a_falling_ask_cannot_ratchet_the_position_past_the_dollar_anchor() -> None:
+    """MULTI-TICK, by construction: no single decision can show this.
+
+    `decision.quantity` is a TARGET LEVEL and `_maybe_submit` tops up to it on
+    every depth tick. The observation is FINAL and never changes -- only the
+    ask moves -- so as the ask falls `A / premium` rises and the strategy buys
+    MORE, averaging down through the whole decline. Each decision genuinely is
+    a $24.53 basis; the POSITION is not.
+
+    The scenario this refuses: the bucket mapping is wrong, or the print will
+    be corrected, and the market marks the bucket down all session. The old
+    rule read every step as a bigger edge and deployed multiples of the design
+    budget SPECIFICALLY BECAUSE the market disagreed more.
+    """
+    instrument = _instrument()
+    strategy = _strategy(instrument)
+
+    engine = run_backtest(_declining_config(instrument), strategies=(strategy,))
+    try:
+        fills = [
+            event
+            for order in engine.cache.orders()
+            for event in order.events
+            if isinstance(event, OrderFilled) and event.order_side == OrderSide.BUY
+        ]
+        spent = _premium_paid(engine, instrument)
+        assert fills, "the scenario must actually trade, or it proves nothing"
+        # `A` is derived with the EXACT fee; the venue rounds each fill's
+        # commission to a whole cent (`PolymarketUSFeeModel._round_bankers`),
+        # so the realised basis can exceed it by at most one cent PER FILL.
+        # That is the venue's rounding, not the ratchet: the same scenario
+        # before this change spent $62.60, 2.55x the anchor.
+        tolerance = 0.01 * len(fills)
+        assert spent <= _anchor() + tolerance, (
+            f"position basis {spent:.4f} exceeds the ${_anchor():.4f} anchor "
+            f"by more than {tolerance:.2f} of per-fill cent rounding"
+        )
+        assert spent < 2.0 * _anchor()
+    finally:
+        engine.dispose()
+
+
+def test_the_first_entry_of_the_decline_is_unchanged_by_the_position_budget() -> None:
+    """The clamp binds only on TOP-UPS -- the first decision is untouched.
+
+    Guards against "fixing" the ratchet by shrinking the strategy: the entry
+    at the tightest admissible ask must still be the full `base_quantity`.
+    """
+    instrument = _instrument()
+    strategy = _strategy(instrument)
+
+    engine = run_backtest(_declining_config(instrument), strategies=(strategy,))
+    try:
+        first = min(
+            (
+                event
+                for order in engine.cache.orders()
+                for event in order.events
+                if isinstance(event, OrderFilled) and event.order_side == OrderSide.BUY
+            ),
+            key=lambda event: event.ts_event,
+        )
+        assert float(first.last_px) == pytest.approx(0.98)
+        assert float(first.last_qty) == pytest.approx(25.0)
     finally:
         engine.dispose()
