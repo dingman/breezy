@@ -185,7 +185,7 @@ import argparse
 import datetime as dt
 import json
 import sys
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Final
@@ -202,13 +202,18 @@ from nautilus_trader.trading.strategy import Strategy
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from weather_strategy_backtest_lib import (
+    GATE_NO_QUOTE,
+    PROVENANCE_REAL,
     STATUS_COMPLETED,
     STATUS_COMPLETED_ALL_REFUSED,
+    PrintLockGateRecord,
     Scenario,
     build_settlement_scenarios,
     derive_completion_status,
+    first_blocking_gate,
     hours_until,
     latest_publication_at_or_before,
+    select_book_backed_instrument_ids,
     select_tradable_instrument_ids,
     settlement_prices_for_scenario,
 )
@@ -239,12 +244,15 @@ from breezy.strategy.cli_settlement_print_lock import (
     CliSettlementPrintLockConfig,
     CliSettlementPrintLockStrategy,
 )
+from breezy.strategy.cli_settlement_print_lock.decision import CliPrintObservation
+from breezy.strategy.depth10 import market_quote_from_depth
 from breezy.strategy.forecast_mispricing import ForecastMispricingConfig, ForecastMispricingStrategy
 from breezy.strategy.forecast_revision import ForecastRevisionConfig, ForecastRevisionStrategy
 from breezy.strategy.running_extreme_lock import (
     RunningExtremeLockConfig,
     RunningExtremeLockStrategy,
 )
+from breezy.strategy.weather_common.bucket_contract import MispricingContract
 from breezy.strategy.weather_common.costs import (
     FeeCoefficientSource,
     UnknownFeeScheduleError,
@@ -804,6 +812,7 @@ def _run_one(
     weather_data: list[Any],
     forecast_source: ForecastSource | None,
     config_overrides: dict[str, Any],
+    log_level: str = "WARNING",
 ) -> RunResult:
     instruments = [ti.instrument for ti in tape_instruments]
     instrument_ids = tuple(i.id for i in instruments)
@@ -823,6 +832,7 @@ def _run_one(
         weather_data=weather_data,
         settlement_prices=settlement_prices,
         starting_balances=(Money(STARTING_BALANCE_USD, USD),),
+        log_level=log_level,
     )
     strategy = _build_strategy(
         strategy_kind,
@@ -1051,12 +1061,506 @@ def _forecast_sources_and_overrides(
     return sources, overrides
 
 
+# ---------------------------------------------------------------------------
+# LIVE-CAPTURE MODE (`--tape-instance-id`)
+# ---------------------------------------------------------------------------
+#
+# The default (`legacy`) path above reads the quote catalog's already-converted
+# `data/` partition, which holds the 2026-08-30 tape. A live recorder run is
+# staged somewhere else entirely: `<catalog_root>/live/<instance_id>/`, in
+# FEATHER, and the only sanctioned way to read it back is the native
+# `ParquetDataCatalog.convert_stream_to_data(instance_id, T,
+# subdirectory="live")` (`persistence/catalog/parquet.py:2604`;
+# `runtime/quote_tape_cli` documents exactly this call). This section is that
+# wiring and nothing more -- no strategy change, no shipped constant change.
+#
+# NULL HYPOTHESIS (checked before any of it was written):
+#   * The feather -> parquet conversion is NATIVE. `convert_stream_to_data` is
+#     used verbatim; nothing here parses a feather file.
+#   * Reading instruments/depth/quotes back is NATIVE: `catalog.instruments()`,
+#     `catalog.order_book_depth10()`, `catalog.quote_ticks()`.
+#   * Backtest replay of the weather custom type is NATIVE: `add_data(...,
+#     client_id=...)` through `breezy.runtime.backtest_harness`.
+# What is genuinely absent, and therefore authored here: the CHOICE of target
+# catalog (the capture root is read-only evidence, so every converted row goes
+# to a SEPARATE work root), the climate-day filter, and the s8.5 record.
+
+
+def _convert_live_capture(
+    *,
+    quote_catalog: Path,
+    instance_id: str,
+    subdirectory: str,
+    work_catalog: Path,
+) -> ParquetDataCatalog:
+    """Convert one live-recorder run into a SEPARATE work catalog, natively.
+
+    `other_catalog` is mandatory here, not incidental: the capture root is
+    evidence and is never written to. `convert_stream_to_data` writes parquet
+    into whichever catalog it is handed, and it SKIPS (with a bare `print`, no
+    exception -- `parquet.py:2680`) any file whose computed name already
+    exists, so a re-run against a populated work root is a silent partial
+    no-op. The work root is therefore required to be empty or absent.
+    """
+    if work_catalog.resolve() == quote_catalog.resolve() or quote_catalog.resolve() in (
+        work_catalog.resolve().parents
+    ):
+        raise ValueError(
+            f"--work-catalog {work_catalog} is inside the capture root {quote_catalog}. "
+            "The capture is read-only evidence; converted rows must go somewhere else.",
+        )
+    if work_catalog.exists() and any(work_catalog.iterdir()):
+        raise ValueError(
+            f"--work-catalog {work_catalog} is not empty. `convert_stream_to_data` "
+            "silently SKIPS a write whose filename already exists (parquet.py:2680, a "
+            "bare print), so converting into a populated root can produce a partial "
+            "tape with no error. Point it at a fresh directory.",
+        )
+    work_catalog.mkdir(parents=True, exist_ok=True)
+    source = ParquetDataCatalog(str(quote_catalog))
+    work = ParquetDataCatalog(str(work_catalog))
+    for data_cls in (BinaryOption, InstrumentClose, QuoteTick, OrderBookDepth10):
+        source.convert_stream_to_data(
+            instance_id,
+            data_cls,
+            other_catalog=work,
+            subdirectory=subdirectory,
+        )
+    return work
+
+
+def _select_capture_instruments(
+    catalog: ParquetDataCatalog,
+    *,
+    climate_day: dt.date,
+) -> list[TapeInstrument]:
+    """Every captured instrument for `climate_day` that carries ORDER-BOOK depth.
+
+    Depth-only, via `select_book_backed_instrument_ids` -- see that function
+    for why the quote-AND-depth rule is the wrong one for an asks-only book,
+    and why relaxing it here is not a relaxation of anything the forecast
+    strategies rely on.
+
+    `catalog.instruments()` returns one row per RECORDED definition, and the
+    recorder re-publishes definitions on every discovery cycle, so the same
+    `InstrumentId` appears many times. De-duplicated on `id`, keeping the
+    first, so an instrument is counted once.
+    """
+    by_id: dict[str, Instrument] = {}
+    for instrument in catalog.instruments():
+        by_id.setdefault(instrument.id.value, instrument)
+
+    facts_by_id: dict[str, WeatherBucketFacts] = {}
+    for instrument_id, instrument in by_id.items():
+        facts = read_weather_bucket_facts(instrument.info)
+        if facts.climate_day == climate_day:
+            facts_by_id[instrument_id] = facts
+
+    depth_counts: dict[str, int] = {}
+    depths_by_id: dict[str, list[OrderBookDepth10]] = {}
+    quotes_by_id: dict[str, list[QuoteTick]] = {}
+    for instrument_id in facts_by_id:
+        depths = catalog.order_book_depth10(instrument_ids=[instrument_id])
+        depths_by_id[instrument_id] = depths
+        depth_counts[instrument_id] = len(depths)
+        quotes_by_id[instrument_id] = catalog.quote_ticks(instrument_ids=[instrument_id])
+
+    result: list[TapeInstrument] = []
+    for instrument_id in select_book_backed_instrument_ids(depth_counts):
+        instrument = by_id[instrument_id]
+        if not isinstance(instrument, BinaryOption):
+            raise TypeError(
+                f"{instrument_id} is a {type(instrument).__name__}, not a BinaryOption",
+            )
+        result.append(
+            TapeInstrument(
+                instrument=instrument,
+                facts=facts_by_id[instrument_id],
+                depths=depths_by_id[instrument_id],
+                quotes=quotes_by_id[instrument_id],
+            ),
+        )
+    return result
+
+
+def _load_climate_day_records(
+    weather_catalog_root: Path,
+    *,
+    stations: Sequence[str],
+    climate_day: dt.date,
+) -> list[NwsClimateDay]:
+    """Every non-superseded `NwsClimateDay` for `climate_day`, at its REAL ts_init.
+
+    NOT restamped. The legacy path restamps because its real retrieval
+    timestamps fall OUTSIDE the tape window; on a live capture that spans the
+    morning final prints they fall INSIDE it, so the honest wiring is to feed
+    them exactly where they landed. Sorted by `ts_init` for readability only
+    -- `BacktestEngine.add_data` sorts by `ts_init` itself
+    (`backtest/engine.pyx:903`), and `ts_event` is never read on the replay
+    path.
+    """
+    records: list[NwsClimateDay] = []
+    for station in stations:
+        station_catalog = open_station_catalog(weather_catalog_root, WEATHER_VENUE, station)
+        records.extend(
+            record
+            for record in read_climate_days(station_catalog)
+            if record.climate_day == climate_day and not record.is_superseded
+        )
+    return sorted(records, key=lambda r: r.ts_init)
+
+
+def _settled_readings(records: Sequence[NwsClimateDay]) -> dict[str, int]:
+    """Per station, the highest-`revision_seq` FINAL print's `tmax_f`.
+
+    This is the SETTLEMENT truth for the run: the venue settles weather
+    contracts on the NWS Daily Climate Report, and only the final issuance is
+    settlement-grade (`nws-cli-settlement`). Raises rather than guessing.
+    """
+    best: dict[str, NwsClimateDay] = {}
+    for record in records:
+        if not record.is_final:
+            continue
+        current = best.get(record.station)
+        if current is None or record.revision_seq > current.revision_seq:
+            best[record.station] = record
+    readings: dict[str, int] = {}
+    for station, record in best.items():
+        if record.tmax_f is None:
+            raise LookupError(
+                f"{station} {record.climate_day.isoformat()} final print carries no "
+                f"tmax_f (flagged missing/trace); refusing to fabricate a settlement",
+            )
+        readings[station] = record.tmax_f
+    return readings
+
+
+def _print_lock_gate_records(
+    *,
+    tape_instruments: Sequence[TapeInstrument],
+    records: Sequence[NwsClimateDay],
+    fee_coefficients: FeeCoefficientSource,
+    cfg: CliSettlementPrintLockConfig,
+) -> list[PrintLockGateRecord]:
+    """One BL-19 s8.5 decision-input record per (instrument, CLI print).
+
+    Written REGARDLESS of whether an order forms, because two of the four
+    nulls s8.5 enumerates are invisible at the `RefusalCounter`. Computes NO
+    trading result -- see `first_blocking_gate`.
+
+    The decision instant is the print's own `ts_init` (when the record reached
+    the strategy), and the book is the last depth snapshot at or before that
+    instant -- exactly the state `CliSettlementPrintLockStrategy.on_data`
+    evaluates against (`self._quotes[iid]` is whatever was last cached).
+    """
+    out: list[PrintLockGateRecord] = []
+    for tape_instrument in tape_instruments:
+        instrument = tape_instrument.instrument
+        instrument_id = instrument.id.value
+        theta: float | None
+        try:
+            theta = fee_coefficients.fee_coefficient_for(instrument_id)
+        except UnknownFeeScheduleError:
+            theta = None
+        contract = MispricingContract(
+            instrument_id=instrument_id,
+            facts=tape_instrument.facts,
+            tick_size=float(instrument.price_increment),
+            price_scale=1.0,
+            fee_coefficient=theta,
+        )
+        deadline = dt.datetime.fromtimestamp(
+            instrument.expiration_ns / 1_000_000_000, tz=dt.UTC,
+        )
+        depths = sorted(tape_instrument.depths, key=lambda d: d.ts_init)
+        for record in records:
+            if not tape_instrument.facts.applies_to(record.station, record.climate_day):
+                continue
+            now = dt.datetime.fromtimestamp(record.ts_init / 1_000_000_000, tz=dt.UTC)
+            latest = None
+            for depth in depths:
+                if depth.ts_init <= record.ts_init:
+                    latest = depth
+                else:
+                    break
+            quote = market_quote_from_depth(latest, include_ask_ladder=True) if latest else None
+            observation = CliPrintObservation(
+                station=record.station,
+                climate_day=record.climate_day,
+                tmax_f=record.tmax_f,
+                tmin_f=record.tmin_f,
+                is_final=record.is_final,
+                correction_flag=record.correction_flag,
+                is_superseded=record.is_superseded,
+                published_at=dt.datetime.fromtimestamp(
+                    record.issuance_time_ns / 1_000_000_000, tz=dt.UTC,
+                ),
+            )
+            if quote is None:
+                out.append(
+                    _no_quote_record(
+                        contract=contract,
+                        observation=observation,
+                        now=now,
+                        deadline=deadline,
+                        cfg=cfg,
+                    ),
+                )
+                continue
+            out.append(
+                first_blocking_gate(
+                    contract=contract,
+                    quote=quote,
+                    observation=observation,
+                    now=now,
+                    deadline=deadline,
+                    cfg=cfg,
+                ),
+            )
+    return out
+
+
+def _no_quote_record(
+    *,
+    contract: MispricingContract,
+    observation: CliPrintObservation,
+    now: dt.datetime,
+    deadline: dt.datetime,
+    cfg: CliSettlementPrintLockConfig,
+) -> PrintLockGateRecord:
+    """The s8.5 record for "the strategy had no cached book at print time" (N0)."""
+    return PrintLockGateRecord(
+        instrument_id=contract.instrument_id,
+        station=contract.facts.settlement_station,
+        climate_day=contract.facts.climate_day,
+        deadline=deadline,
+        decided_at=now,
+        cli_issued_at=observation.published_at,
+        hours_to_settlement=(deadline - now).total_seconds() / 3600.0,
+        printed_f=observation.tmax_f,
+        is_final=observation.is_final,
+        correction_flag=observation.correction_flag,
+        is_superseded=observation.is_superseded,
+        bucket_lower_f=contract.facts.lower_f,
+        bucket_upper_f=contract.facts.upper_f,
+        bucket_contains_print=None,
+        level0_ask=None,
+        level0_ask_size=None,
+        vwap_ask=None,
+        vwap_ask_filled_qty=None,
+        fee_coefficient=contract.fee_coefficient,
+        fee_prob=None,
+        slippage_prob=cfg.slippage_prob,
+        model_probability=None,
+        edge=None,
+        edge_at_zero_slippage=None,
+        quote_age_minutes=None,
+        gate=GATE_NO_QUOTE,
+        decision_formed=False,
+        counted_by_refusal_counter=False,
+    )
+
+
+def _run_live_capture(args: argparse.Namespace) -> int:
+    """The live-capture run: one climate day, real prints, real settlement."""
+    climate_day = dt.date.fromisoformat(args.climate_day)
+    stations = tuple(s.strip().upper() for s in args.stations.split(",") if s.strip())
+    strategy_kinds = tuple(k.strip() for k in args.strategies.split(",") if k.strip())
+
+    print(f"LIVE CAPTURE instance={args.tape_instance_id} subdirectory={args.tape_subdirectory}")
+    catalog = _convert_live_capture(
+        quote_catalog=args.quote_catalog,
+        instance_id=args.tape_instance_id,
+        subdirectory=args.tape_subdirectory,
+        work_catalog=args.work_catalog,
+    )
+    tape_instruments = _select_capture_instruments(catalog, climate_day=climate_day)
+    if not tape_instruments:
+        print(
+            f"REFUSAL: no captured instrument for climate_day={climate_day.isoformat()} "
+            f"carries order-book depth.",
+        )
+        return 1
+    print(
+        f"REAL: {len(tape_instruments)} book-backed instruments for "
+        f"climate_day={climate_day.isoformat()}:",
+    )
+    for ti in tape_instruments:
+        print(
+            f"  {ti.instrument.id.value}: {len(ti.depths)} depth rows, "
+            f"{len(ti.quotes)} quote rows, station={ti.facts.settlement_station}, "
+            f"bucket=[{ti.facts.lower_f}, {ti.facts.upper_f}], "
+            f"endDate={dt.datetime.fromtimestamp(ti.instrument.expiration_ns / 1e9, tz=dt.UTC)}",
+        )
+
+    records = _load_climate_day_records(
+        args.weather_catalog_root, stations=stations, climate_day=climate_day,
+    )
+    print(f"REAL: {len(records)} non-superseded NwsClimateDay records, at their REAL ts_init:")
+    for record in records:
+        print(
+            f"  {record.station} {record.climate_day.isoformat()} tmax_f={record.tmax_f} "
+            f"is_final={record.is_final} rev={record.revision_seq} "
+            f"corr={record.correction_flag} "
+            f"issued={dt.datetime.fromtimestamp(record.issuance_time_ns / 1e9, tz=dt.UTC)} "
+            f"ts_init={dt.datetime.fromtimestamp(record.ts_init / 1e9, tz=dt.UTC)}",
+        )
+
+    observed = _settled_readings(records)
+    print(f"REAL settlement readings (highest-revision FINAL print per station): {observed}")
+    missing = sorted({ti.facts.settlement_station for ti in tape_instruments} - set(observed))
+    if missing:
+        print(
+            f"REFUSAL: no FINAL print for station(s) {missing}; settlement price would have "
+            f"to be fabricated. Refusing rather than assuming an outcome.",
+        )
+        return 1
+
+    weather_data = as_backtest_data(list(records))
+    closes = [_synthesize_close(ti) for ti in tape_instruments]
+    print(
+        f"CONSTRUCTED: {len(closes)} CONTRACT_EXPIRED closes (the tape carries ZERO; "
+        f"verified via catalog.instrument_closes()).",
+    )
+
+    scenario = Scenario(
+        name="real_final_print",
+        observed_by_station=observed,
+        provenance_by_station={station: PROVENANCE_REAL for station in observed},
+    )
+
+    instruments = [ti.instrument for ti in tape_instruments]
+    fee_source = PolymarketUSFeeCoefficients({str(i.id): i for i in instruments})
+    gate_cfg = CliSettlementPrintLockConfig(
+        instrument_ids=tuple(i.id for i in instruments),
+        stale_observation_hours=STALE_OBSERVATION_HOURS_CLI_SETTLEMENT_PRINT_LOCK,
+        slippage_prob=SLIPPAGE_PROB_CLI_SETTLEMENT_PRINT_LOCK,
+    )
+    gate_records = _print_lock_gate_records(
+        tape_instruments=tape_instruments,
+        records=records,
+        fee_coefficients=fee_source,
+        cfg=gate_cfg,
+    )
+
+    results: list[RunResult] = []
+    for strategy_kind in strategy_kinds:
+        result = _run_one(
+            condition="live_capture",
+            strategy_kind=strategy_kind,
+            scenario=scenario,
+            tape_instruments=tape_instruments,
+            closes=closes,
+            weather_data=weather_data,
+            forecast_source=None,
+            config_overrides={},
+            log_level=args.log_level,
+        )
+        results.append(result)
+        print(
+            f"ran strategy={strategy_kind} scenario={scenario.name} status={result.status} "
+            f"orders={result.orders_submitted} fills={len(result.fills)}"
+            + (
+                f" refusal={result.refusal_type}: {result.refusal_message}"
+                if result.status == "REFUSED"
+                else ""
+            ),
+        )
+
+    print()
+    _print_summary(results)
+    print()
+    print("=== BL-19 s8.5 per-station-day decision record (first blocking gate) ===")
+    by_gate: dict[str, int] = {}
+    for gate_record in gate_records:
+        by_gate[gate_record.gate] = by_gate.get(gate_record.gate, 0) + 1
+    for gate, count in sorted(by_gate.items()):
+        print(f"  first_gate={gate:<24} {count} (instrument, print) pairs")
+
+    args.output_dir.mkdir(parents=True, exist_ok=True)
+    timestamp = dt.datetime.now(tz=dt.UTC).strftime("%Y%m%dT%H%M%S%z")
+    output_path = args.output_dir / f"print_lock_live_capture_{timestamp}.json"
+    output_path.write_text(
+        json.dumps(
+            {
+                "generated_at_utc": dt.datetime.now(tz=dt.UTC).isoformat(),
+                "mode": "live_capture",
+                "quote_catalog": str(args.quote_catalog),
+                "tape_instance_id": args.tape_instance_id,
+                "tape_subdirectory": args.tape_subdirectory,
+                "work_catalog": str(args.work_catalog),
+                "weather_catalog_root": str(args.weather_catalog_root),
+                "climate_day": climate_day.isoformat(),
+                "starting_balance_usd": STARTING_BALANCE_USD,
+                "account_base_currency": USD.code,
+                "real_observed_by_station": observed,
+                "tradable_instrument_ids": [ti.instrument.id.value for ti in tape_instruments],
+                "climate_day_records": [
+                    {
+                        "station": r.station,
+                        "climate_day": r.climate_day.isoformat(),
+                        "tmax_f": r.tmax_f,
+                        "is_final": r.is_final,
+                        "revision_seq": r.revision_seq,
+                        "correction_flag": r.correction_flag,
+                        "issuance_time_ns": r.issuance_time_ns,
+                        "ts_init": r.ts_init,
+                    }
+                    for r in records
+                ],
+                "results": [r.to_json() for r in results],
+                "decision_records": [g.to_json() for g in gate_records],
+            },
+            indent=2,
+            sort_keys=True,
+        ),
+    )
+    print(f"Wrote {output_path}")
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--quote-catalog", type=Path, default=DEFAULT_QUOTE_CATALOG_PATH)
     parser.add_argument("--weather-catalog-root", type=Path, default=DEFAULT_WEATHER_CATALOG_ROOT)
     parser.add_argument("--output-dir", type=Path, default=DEFAULT_OUTPUT_DIR)
+    parser.add_argument(
+        "--tape-instance-id",
+        default=None,
+        help=(
+            "Read the tape from `<quote-catalog>/<subdir>/<instance-id>/` (a live "
+            "recorder run) instead of the already-converted `data/` partition. "
+            "Selects LIVE-CAPTURE mode."
+        ),
+    )
+    parser.add_argument("--tape-subdirectory", default="live")
+    parser.add_argument(
+        "--work-catalog",
+        type=Path,
+        default=None,
+        help=(
+            "Where the converted parquet lands. MUST be outside the capture root: the "
+            "capture is read-only evidence."
+        ),
+    )
+    parser.add_argument("--climate-day", default=None)
+    parser.add_argument("--stations", default="NYC,MIA,MDW,LAX,SFO")
+    parser.add_argument("--strategies", default="cli_settlement_print_lock")
+    parser.add_argument(
+        "--log-level",
+        default="WARNING",
+        help=(
+            "Engine log level for LIVE-CAPTURE mode. `INFO` surfaces the strategy's own "
+            "per-instrument subscription lines, which is the positive control that the "
+            "run was WIRED and not merely quiet."
+        ),
+    )
     args = parser.parse_args(argv)
+
+    if args.tape_instance_id is not None:
+        if args.work_catalog is None or args.climate_day is None:
+            parser.error("--tape-instance-id requires --work-catalog and --climate-day")
+        return _run_live_capture(args)
 
     catalog = ParquetDataCatalog(str(args.quote_catalog))
     tape_instruments = _select_tape_instruments(catalog)

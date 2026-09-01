@@ -33,19 +33,34 @@ from __future__ import annotations
 import datetime as dt
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
+from typing import TYPE_CHECKING
 
 from breezy.domain.weather_bucket_facts import WeatherBucketFacts
 
+if TYPE_CHECKING:  # pragma: no cover - typing only
+    from breezy.strategy.cli_settlement_print_lock.config import (
+        CliSettlementPrintLockConfig,
+    )
+    from breezy.strategy.cli_settlement_print_lock.decision import CliPrintObservation
+    from breezy.strategy.weather_common.bucket_contract import MispricingContract
+    from breezy.strategy.weather_common.models import MarketQuote
+
 __all__ = [
+    "PRINT_LOCK_GATES",
     "PROVENANCE_ASSUMED",
     "PROVENANCE_REAL",
     "STATUS_COMPLETED",
     "STATUS_COMPLETED_ALL_REFUSED",
+    "UNCOUNTED_GATES",
+    "GateLadderDriftError",
+    "PrintLockGateRecord",
     "Scenario",
     "build_settlement_scenarios",
     "derive_completion_status",
+    "first_blocking_gate",
     "hours_until",
     "latest_publication_at_or_before",
+    "select_book_backed_instrument_ids",
     "select_tradable_instrument_ids",
     "settlement_prices_for_scenario",
 ]
@@ -272,3 +287,419 @@ def latest_publication_at_or_before(
     if not applicable:
         return None
     return max(applicable, key=lambda p: p[0])
+
+
+# ---------------------------------------------------------------------------
+# BL-19 s8.5 -- the per-station-day decision-input record
+# ---------------------------------------------------------------------------
+#
+# `docs/evidence/bl19_edge_and_cost_decision_2026-09-01.md` s8.5 enumerates
+# four distinguishable nulls for `cli_settlement_print_lock`, and says that TWO
+# of them are INVISIBLE at the `RefusalCounter`:
+#
+#   N0  no CLI final reached the strategy before the halt window   -> uncounted
+#   N1  trigger fired; a PURE gate returned `None`                 -> uncounted
+#   N2  signal formed; refused at the edge floor                   -> counted
+#   N3  signal formed; no book / no ask / insufficient liquidity   -> counted
+#
+# A pre-signal `None` never reaches `RiskManager.evaluate_order` and so is
+# never counted (`risk.py`; the same class as BL-10). At the counter, N1 is
+# indistinguishable from N0, and "the market had no edge" is indistinguishable
+# from "the mapping was wrong". **A null therefore proves nothing unless the
+# decision INPUTS and the FIRST gate are recorded per station-day.**
+#
+# WHAT THIS IS NOT
+# ----------------
+# It computes NO trading result. There is no fill, no PnL and no ROI anywhere
+# below -- those come only from the `BacktestEngine`. What it records is the
+# set of INPUTS a decision was taken on, plus the identity of the first shipped
+# predicate that said no.
+#
+# WHY IT IS EVIDENCE AND NOT A SECOND OPINION
+# --------------------------------------------
+# Every predicate consulted below is the SHIPPED one, imported from
+# `breezy.strategy.cli_settlement_print_lock` -- `facts.applies_to`,
+# `facts.contains`, `MEASURED_STATIONS`, `quote.implied_ask`, `venue_fee_prob`,
+# `trade_cost_prob`, `worst_admissible_ask`, `cost_basis_anchor`. None is
+# re-implemented. And `first_blocking_gate` CROSS-CHECKS its own verdict
+# against the shipped `evaluate_instrument`: if the classifier and the strategy
+# ever disagree about whether a decision forms, it RAISES
+# (`GateLadderDriftError`) instead of reporting. A record that could silently
+# describe a gate ladder the running strategy does not have would be worse
+# than no record at all.
+
+#: No gate stopped it: the shipped decision layer formed a `SignalDecision`.
+#: Everything downstream of that (`_maybe_submit`, `RiskManager.evaluate_order`)
+#: IS counted by the `RefusalCounter`, which is authoritative from here on.
+GATE_NONE = "none"
+#: Strategy-level, `_evaluate_and_act`: `hours_to_settlement <=
+#: halt_hours_before_settlement`. Returns with NO refusal recorded. N0.
+GATE_HALT_WINDOW = "halt_window"
+#: Strategy-level: no depth cached for this instrument yet.
+GATE_NO_QUOTE = "no_quote"
+#: Strategy-level: no CLI print received for this instrument yet. N0.
+GATE_NO_OBSERVATION = "no_observation"
+GATE_APPLIES_TO = "applies_to"
+GATE_LOOKAHEAD = "lookahead"
+GATE_NOT_FINAL = "not_final"
+GATE_SUPERSEDED = "superseded"
+GATE_CORRECTION = "correction"
+GATE_UNMEASURED_STATION = "unmeasured_station"
+GATE_MEASURE_DISABLED = "measure_disabled"
+GATE_NO_PRINTED_VALUE = "no_printed_value"
+GATE_BUCKET_NOT_CONTAINING = "bucket_not_containing"
+GATE_MIN_STABLE_PROB = "min_stable_prob"
+GATE_NO_ASK = "no_ask"
+GATE_DEGENERATE_ASK = "degenerate_ask"
+GATE_NO_FEE_COEFFICIENT = "no_fee_coefficient"
+GATE_EDGE_BELOW_MINIMUM = "edge_below_minimum"
+GATE_QUANTITY_BELOW_ONE = "quantity_below_one"
+
+#: Every gate identity, in the SHIPPED evaluation order. The order is part of
+#: the contract: "the FIRST gate that stopped it" is only meaningful against a
+#: ladder whose order matches the running strategy's.
+PRINT_LOCK_GATES: tuple[str, ...] = (
+    GATE_NO_QUOTE,
+    GATE_NO_OBSERVATION,
+    GATE_HALT_WINDOW,
+    GATE_APPLIES_TO,
+    GATE_LOOKAHEAD,
+    GATE_NOT_FINAL,
+    GATE_SUPERSEDED,
+    GATE_CORRECTION,
+    GATE_UNMEASURED_STATION,
+    GATE_MEASURE_DISABLED,
+    GATE_NO_PRINTED_VALUE,
+    GATE_BUCKET_NOT_CONTAINING,
+    GATE_MIN_STABLE_PROB,
+    GATE_NO_ASK,
+    GATE_DEGENERATE_ASK,
+    GATE_NO_FEE_COEFFICIENT,
+    GATE_EDGE_BELOW_MINIMUM,
+    GATE_QUANTITY_BELOW_ONE,
+    GATE_NONE,
+)
+
+#: The gates that are NOT visible at the `RefusalCounter` -- s8.5's N0/N1.
+#: Reported alongside every record so a reader never has to remember which is
+#: which.
+UNCOUNTED_GATES: frozenset[str] = frozenset(PRINT_LOCK_GATES) - {GATE_NONE}
+
+
+class GateLadderDriftError(RuntimeError):
+    """The classifier and the SHIPPED decision function disagreed.
+
+    Raised rather than logged. The record exists to make a null decodable; a
+    record built from a gate ladder that no longer matches
+    `cli_settlement_print_lock.decision.evaluate_instrument` would make a null
+    decodable into the WRONG answer, which is strictly worse than refusing to
+    answer.
+    """
+
+
+@dataclass(frozen=True, slots=True)
+class PrintLockGateRecord:
+    """One station-day/instrument decision-input record, per BL-19 s8.5.
+
+    Persisted regardless of whether an order formed. Carries no fill, no PnL
+    and no ROI: those are the engine's to report.
+    """
+
+    instrument_id: str
+    station: str
+    climate_day: dt.date
+    #: The instrument's own `endDate` (`expiration_ns`), which is the deadline
+    #: `cli_settlement_print_lock` measures `hours_to_settlement` against.
+    deadline: dt.datetime
+    #: The decision instant -- for a print-driven evaluation, the moment the
+    #: CLI record reached the strategy.
+    decided_at: dt.datetime
+    cli_issued_at: dt.datetime
+    hours_to_settlement: float
+    printed_f: int | None
+    is_final: bool
+    correction_flag: bool
+    is_superseded: bool
+    bucket_lower_f: int | None
+    bucket_upper_f: int | None
+    bucket_contains_print: bool | None
+    level0_ask: float | None
+    level0_ask_size: float | None
+    #: VWAP ask for the quantity the decision layer would have requested, walked
+    #: over `MarketQuote.ask_ladder` with the SHIPPED
+    #: `running_extreme_lock.decision._vwap_ask_for_quantity`. Equal to
+    #: `level0_ask` when the quote carries no ladder.
+    vwap_ask: float | None
+    vwap_ask_filled_qty: float | None
+    fee_coefficient: float | None
+    fee_prob: float | None
+    slippage_prob: float
+    model_probability: float | None
+    #: `model_p - ask - fee(ask) - slippage_prob`, from the SHIPPED cost
+    #: functions.
+    edge: float | None
+    #: The same edge with `slippage_prob = 0`, so s8.5's "computed edge at
+    #: slippage_prob in {0.000, 0.010}" is on the record and the threshold
+    #: re-derives offline from a measured slippage figure.
+    edge_at_zero_slippage: float | None
+    quote_age_minutes: float | None
+    #: The FIRST gate that stopped it, or `GATE_NONE`.
+    gate: str
+    decision_formed: bool
+    #: `False` for every gate at or before the decision layer -- s8.5's N0/N1.
+    counted_by_refusal_counter: bool
+
+    def to_json(self) -> dict[str, object]:
+        return {
+            "instrument_id": self.instrument_id,
+            "station": self.station,
+            "climate_day": self.climate_day.isoformat(),
+            "deadline": self.deadline.isoformat(),
+            "decided_at": self.decided_at.isoformat(),
+            "cli_issued_at": self.cli_issued_at.isoformat(),
+            "hours_to_settlement": self.hours_to_settlement,
+            "printed_f": self.printed_f,
+            "is_final": self.is_final,
+            "correction_flag": self.correction_flag,
+            "is_superseded": self.is_superseded,
+            "bucket_lower_f": self.bucket_lower_f,
+            "bucket_upper_f": self.bucket_upper_f,
+            "bucket_contains_print": self.bucket_contains_print,
+            "level0_ask": self.level0_ask,
+            "level0_ask_size": self.level0_ask_size,
+            "vwap_ask": self.vwap_ask,
+            "vwap_ask_filled_qty": self.vwap_ask_filled_qty,
+            "fee_coefficient": self.fee_coefficient,
+            "fee_prob": self.fee_prob,
+            "slippage_prob": self.slippage_prob,
+            "model_probability": self.model_probability,
+            "edge": self.edge,
+            "edge_at_zero_slippage": self.edge_at_zero_slippage,
+            "quote_age_minutes": self.quote_age_minutes,
+            "first_gate": self.gate,
+            "decision_formed": self.decision_formed,
+            "counted_by_refusal_counter": self.counted_by_refusal_counter,
+        }
+
+
+def select_book_backed_instrument_ids(depth_counts: Mapping[str, int]) -> list[str]:
+    """Instrument ids carrying at least one ORDER-BOOK DEPTH row.
+
+    The sibling of :func:`select_tradable_instrument_ids`, NOT a relaxation of
+    it -- that rule stays exactly as it is, and is still the right one for the
+    forecast strategies, which quote from `QuoteTick`.
+
+    Why a depth-only rule is sound for `cli_settlement_print_lock`: its own
+    module docstring states "A long-only taker needs an ASK and nothing else.
+    An asks-only book ... is TRADED". Its only market-data handler is
+    `on_order_book_depth`; it never reads a `QuoteTick`. And under
+    `BookType.L2_MBP` the harness's `InvalidConfiguration: No order book data
+    found` guard fires for a QUOTE-ONLY leg, which is the opposite shape.
+
+    Why the distinction is load-bearing on the live capture rather than
+    hypothetical: `parse_book_top` requires a best level on BOTH sides, so a
+    market whose bid side has emptied records depth and **zero** `QuoteTick`s.
+    That is the state of every terminal weather ladder, and applying the
+    quote-AND-depth rule to it discards exactly the instruments the print-lock
+    strategy exists to trade.
+    """
+    return sorted(iid for iid, count in depth_counts.items() if count > 0)
+
+
+def first_blocking_gate(
+    *,
+    contract: MispricingContract,
+    quote: MarketQuote,
+    observation: CliPrintObservation,
+    now: dt.datetime,
+    deadline: dt.datetime,
+    cfg: CliSettlementPrintLockConfig,
+) -> PrintLockGateRecord:
+    """Classify the FIRST shipped gate that stops this decision, and record its inputs.
+
+    Replays the SHIPPED predicates in the SHIPPED order and then CROSS-CHECKS
+    the verdict against the shipped
+    :func:`~breezy.strategy.cli_settlement_print_lock.decision.evaluate_instrument`.
+
+    Raises
+    ------
+    GateLadderDriftError
+        If the classifier's verdict disagrees with the shipped decision
+        function about whether a decision forms.
+
+    """
+    # Imported here, not at module scope: this module is loaded by the runner
+    # AND by unit tests that do not otherwise need the strategy package.
+    from breezy.strategy.cli_settlement_print_lock.decision import (
+        MEASURED_STATIONS,
+        cost_basis_anchor,
+        evaluate_instrument,
+        worst_admissible_ask,
+    )
+    from breezy.strategy.cli_settlement_print_lock.strategy import (
+        MEASURED_P_STABLE_WILSON_LOWER,
+    )
+    from breezy.strategy.running_extreme_lock.decision import _vwap_ask_for_quantity
+    from breezy.strategy.weather_common.costs import trade_cost_prob, venue_fee_prob
+
+    # The SHIPPED `hours_until`, deliberately not this module's same-named
+    # helper: the two take their arguments in OPPOSITE order
+    # (`models.hours_until(later, now)` vs `hours_until(now, deadline)` above),
+    # and `cli_settlement_print_lock.strategy` calls the shipped one. Using
+    # anything else here would flip the sign of every halt-window verdict.
+    from breezy.strategy.weather_common.models import (
+        ensure_aware,
+    )
+    from breezy.strategy.weather_common.models import (
+        hours_until as shipped_hours_until,
+    )
+
+    facts = contract.facts
+    scale = (
+        cfg.price_scale_override if cfg.price_scale_override is not None else contract.price_scale
+    )
+    hours_to_settlement = shipped_hours_until(deadline, now)
+
+    printed_f = observation.tmax_f if facts.measure.value == "high" else observation.tmin_f
+    contains = facts.contains(printed_f) if printed_f is not None else None
+    ask_p = quote.implied_ask(scale)
+    theta = contract.fee_coefficient
+
+    fee_prob: float | None = None
+    edge: float | None = None
+    edge_zero_slip: float | None = None
+    if ask_p is not None and 0.0 < ask_p < 1.0 and theta is not None:
+        fee_prob = venue_fee_prob(executable_price=ask_p, fee_coefficient=theta)
+        cost = trade_cost_prob(
+            executable_price=ask_p,
+            fee_coefficient=theta,
+            slippage_prob=cfg.slippage_prob,
+        )
+        edge = MEASURED_P_STABLE_WILSON_LOWER - ask_p - cost
+        edge_zero_slip = edge + cfg.slippage_prob
+
+    # The quantity the shipped sizing rule would ask for, so the VWAP walk is
+    # taken at the INTENDED size rather than an arbitrary one (s8.5).
+    vwap_ask: float | None = None
+    vwap_filled: float | None = None
+    if ask_p is not None and theta is not None and 0.0 < ask_p < 1.0 and fee_prob is not None:
+        anchor = cost_basis_anchor(
+            base_quantity=cfg.base_quantity,
+            worst_ask=worst_admissible_ask(
+                model_p=MEASURED_P_STABLE_WILSON_LOWER,
+                fee_coefficient=theta,
+                slippage_prob=cfg.slippage_prob,
+                min_edge_after_costs=cfg.min_edge_after_costs,
+                tick_size=contract.tick_size,
+            ),
+            fee_coefficient=theta,
+        )
+        intended = min(cfg.max_quantity, anchor / (ask_p + fee_prob), quote.ask_size or 0.0)
+        ladder = (
+            quote.ask_ladder
+            if quote.ask_ladder is not None
+            else ((quote.ask or 0.0, quote.ask_size or 0.0),)
+        )
+        walked = _vwap_ask_for_quantity(ladder, max(intended, 0.0))
+        if walked is not None:
+            vwap_ask = walked[0] * scale
+            vwap_filled = walked[1]
+
+    if hours_to_settlement <= cfg.halt_hours_before_settlement:
+        gate = GATE_HALT_WINDOW
+    elif not facts.applies_to(observation.station, observation.climate_day):
+        gate = GATE_APPLIES_TO
+    elif ensure_aware(observation.published_at) > ensure_aware(now):
+        gate = GATE_LOOKAHEAD
+    elif not observation.is_final:
+        gate = GATE_NOT_FINAL
+    elif observation.is_superseded:
+        gate = GATE_SUPERSEDED
+    elif observation.correction_flag:
+        gate = GATE_CORRECTION
+    elif facts.settlement_station not in MEASURED_STATIONS:
+        gate = GATE_UNMEASURED_STATION
+    elif not (cfg.use_tmax if facts.measure.value == "high" else cfg.use_tmin):
+        gate = GATE_MEASURE_DISABLED
+    elif printed_f is None:
+        gate = GATE_NO_PRINTED_VALUE
+    elif not contains:
+        gate = GATE_BUCKET_NOT_CONTAINING
+    elif MEASURED_P_STABLE_WILSON_LOWER < cfg.min_stable_prob:
+        gate = GATE_MIN_STABLE_PROB
+    elif ask_p is None:
+        gate = GATE_NO_ASK
+    elif ask_p <= 0.0 or ask_p >= 1.0:
+        gate = GATE_DEGENERATE_ASK
+    elif theta is None:
+        gate = GATE_NO_FEE_COEFFICIENT
+    elif edge is None or edge < cfg.min_edge_after_costs:
+        gate = GATE_EDGE_BELOW_MINIMUM
+    else:
+        gate = GATE_NONE
+
+    # CROSS-CHECK against the shipped decision function. `evaluate_instrument`
+    # knows nothing about the halt window (that gate lives one level up in
+    # `_evaluate_and_act`), so it is only consulted once the halt window is
+    # cleared.
+    if gate != GATE_HALT_WINDOW:
+        decision = evaluate_instrument(
+            contract=contract,
+            quote=quote,
+            observation=observation,
+            now=now,
+            p_stable=MEASURED_P_STABLE_WILSON_LOWER,
+            cfg=cfg,
+        )
+        if decision is None and gate == GATE_NONE:
+            # The one gate below the edge floor that this classifier cannot
+            # reach without duplicating the shipped sizing arithmetic: the
+            # floor-to-whole-contracts clip. Attribute it, then re-check.
+            gate = GATE_QUANTITY_BELOW_ONE
+        if (decision is not None) != (gate == GATE_NONE):
+            raise GateLadderDriftError(
+                f"first_blocking_gate classified {contract.instrument_id!r} as "
+                f"{gate!r} (decision_formed={gate == GATE_NONE}) but the SHIPPED "
+                f"cli_settlement_print_lock.decision.evaluate_instrument returned "
+                f"{'a SignalDecision' if decision is not None else 'None'}. The gate "
+                f"ladder in this classifier no longer matches the running strategy's; "
+                f"refusing to emit a decision record that would decode a null into the "
+                f"wrong answer.",
+            )
+        if decision is not None:
+            # Prefer the SHIPPED edge over the locally recomputed one wherever
+            # both exist, so the record can never disagree with the strategy.
+            edge = decision.edge
+            edge_zero_slip = decision.edge + cfg.slippage_prob
+
+    decision_formed = gate == GATE_NONE
+    return PrintLockGateRecord(
+        instrument_id=contract.instrument_id,
+        station=facts.settlement_station,
+        climate_day=facts.climate_day,
+        deadline=deadline,
+        decided_at=now,
+        cli_issued_at=observation.published_at,
+        hours_to_settlement=hours_to_settlement,
+        printed_f=printed_f,
+        is_final=observation.is_final,
+        correction_flag=observation.correction_flag,
+        is_superseded=observation.is_superseded,
+        bucket_lower_f=facts.lower_f,
+        bucket_upper_f=facts.upper_f,
+        bucket_contains_print=contains,
+        level0_ask=ask_p,
+        level0_ask_size=quote.ask_size,
+        vwap_ask=vwap_ask,
+        vwap_ask_filled_qty=vwap_filled,
+        fee_coefficient=theta,
+        fee_prob=fee_prob,
+        slippage_prob=cfg.slippage_prob,
+        model_probability=MEASURED_P_STABLE_WILSON_LOWER,
+        edge=edge,
+        edge_at_zero_slippage=edge_zero_slip,
+        quote_age_minutes=(now - quote.ts_event).total_seconds() / 60.0,
+        gate=gate,
+        decision_formed=decision_formed,
+        counted_by_refusal_counter=decision_formed,
+    )

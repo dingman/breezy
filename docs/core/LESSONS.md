@@ -341,3 +341,33 @@ has never had teeth has never been pressure-tested for precision.
 what the action assumes. Fail-closed on an imprecise signal is not conservative
 — it converts routine noise into an outage, which is strictly worse than the
 silent failure it replaced.
+
+## L-7 — Public information has no offer side (2026-09-01)
+
+**What happened.** `cli_settlement_print_lock` was built on the thesis that the
+book has not yet absorbed the final CLI print. On the first admissible run,
+Nautilus submitted 0 orders. The reason was not a gate: on all five stations the
+bucket containing the printed value carried **0 asks across 3332 depth rows**,
+with bids of 0.99 x 7682 on the NYC winner. The losing rungs mirrored it --
+asks at 0.01 in huge size, no bids. The strategy identified the correct contract
+every single time and could not buy it.
+
+**The rule.** A strategy that acts on information ALREADY PUBLIC to the venue is
+not competing on speed or accuracy -- it is asking someone to sell it a contract
+that is known to pay $1. Nobody does. Before designing any strategy, ask what
+the COUNTERPARTY believes at the moment of the fill: if the answer is "the same
+thing we believe, from the same public source", the offer side will be empty and
+the edge is unharvestable regardless of how correct the model is.
+
+**Corollary — a settlement-truth edge must be priced BEFORE settlement is
+knowable.** The `p_stable` measurement (99.989%) was never wrong; it was a
+measurement about a moment at which no trade is available. Measured certainty
+and executable certainty are different quantities, and only the second pays.
+
+**Method note that made this legible.** Two independent nulls landed on the same
+window (no legal window, and no ask). Because 90 per-decision records were
+persisted with the FIRST blocking gate, the null was decodable offline instead
+of mute -- `RefusalCounter` was EMPTY, since nothing reached the decision layer.
+A null with no persisted inputs would have been indistinguishable from a dead
+market. See [[verify-agent-claims-against-artifact]]: the 0-ask count was
+confirmed independently through the native catalog reader before being acted on.
