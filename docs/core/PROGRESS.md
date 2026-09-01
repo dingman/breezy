@@ -192,12 +192,11 @@ either count it under the same bounded key set or document why not.
 
 ### Programme sequence (carried forward from 2026-08-30)
 
-- **P1** — harden then supervise the quote tape (watchdog exiting non-zero on
-  degradation, conversion-time integrity check, convert-and-prune retention,
-  attended smoke run, then a systemd unit). Prices are the one irreplaceable
-  stream. Three CRITICALs open: reconnect gives up then runs forever doing
-  nothing; unclean shutdown silently voids a whole daily feather file; the
-  `websocket.py`/`factories.py` pool rewrite is uncommitted.
+- **P1** — harden then supervise the quote tape; prices are the one
+  irreplaceable stream. CONFIRMED open: reconnect exhaustion sets `_degraded`
+  and RETURNS (`websocket.py:678-684`), so the supervisor ends and the node runs
+  forever doing nothing — must exit non-zero for systemd. UNVERIFIED: whether
+  unclean shutdown voids a daily feather file (read the writer close path).
 - **P2/P3** — forecast probes (Open-Meteo `/v1/previous-runs`; IEM AFOS forecast
   PIL) then forecast ingestion. Breezy ingests **no forecast data at all**, so
   every forecast-strategy ROI is inadmissible until P3 lands. DEPRIORITISED:

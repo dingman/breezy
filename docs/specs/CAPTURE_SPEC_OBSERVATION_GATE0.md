@@ -173,6 +173,29 @@ is illustrative only.
 - The two operator-reserved controls (maximum daily budget; maximum per
   position) have no values and must not be invented here.
 
+## Operational notes for the run (verified 2026-09-01)
+
+- **Entrypoint:** `breezy.runtime.quote_tape_cli.main()` (console: `breezy-quote-tape`),
+  which builds a `TradingNode` with `PolymarketUSLiveDataClientFactory`.
+- **Instrument targeting:** discovery defaults to `load_all=True`
+  (`factories.py:304-317`). To pin the run to the five upper-tail slugs, set
+  **`POLYMARKET_US_MARKET_SLUGS`** (`factories.py:121`) to the exact comma-
+  separated slug list for the target date. No code change needed.
+- **Subscription cap is 10 per connection** (`websocket.py:167`), sent BATCHED
+  per connection, with a pool that shards beyond the cap
+  (`factories.py:410-416`). Five slugs sit under the cap — single shard. Note
+  the documented silent-truncation trap: one-slug-per-envelope past the cap
+  draws NO error frame, which is why positive-liveness confirmation
+  (`websocket.py:288-294,711-730`) must stay ON.
+- **ATTENDED runs only, for now.** Reconnect exhaustion sets `_degraded` and
+  RETURNS (`websocket.py:678-684`), ending the supervisor task; the node then
+  runs forever doing nothing. A human watching the ERROR line can restart. This
+  is survivable for a 6-hour attended screening window and is NOT survivable
+  for an unattended 14-day run.
+- **Before Gate 0B:** the reconnect path must exit non-zero (so systemd
+  restarts it), and the streaming-writer close path must be read to settle
+  whether an unclean shutdown voids a daily feather file — currently UNVERIFIED.
+
 ## Dependency
 
 Both 0A and 0B require operator-gated venue access (PROGRESS.md G-13/G-14).
