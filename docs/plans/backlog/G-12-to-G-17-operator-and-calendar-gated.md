@@ -14,10 +14,28 @@ them.
 present (`~/.config/breezy/polymarket.env`: `POLYMARKET_US_KEY_ID`,
 `POLYMARKET_US_SECRET_KEY_FILE`), D1/KYC is satisfied, and the gate has been
 opened for **four** read-only smoke runs (one 2026-08-25, three 2026-08-30).
-The real blocker is that **all four returned `Connectivity verdict: FAIL`** —
-authenticated connectivity was never proven, so zero venue payload was
-captured. Unlock is therefore *diagnose and fix authenticated connectivity*,
-which needs no further operator action.
+**SUPERSEDED SAME DAY by diagnosis — read this, not the line above.** All four
+runs did return `Connectivity verdict: FAIL`, but the verdict is
+`authenticated_ok AND quotes_delivered > 0 AND node_failure is None`
+(`scripts/venue/polymarket_us_auth_smoke.py:1363`) — it fails on the QUOTE
+count, not on auth. **Authenticated connectivity IS proven:**
+`READONLY_AUTH_SMOKE_2026-08-30T154900+0000.md:34-38` shows step B
+(`GET /v1/portfolio/positions`, authenticated) -> **200**, with the
+path+query-signed variant -> **401** as a discriminating negative control, and
+step D (deliberately stale -120s) -> **200**, i.e. the venue does not enforce a
+signing window. **G-12 IS RESOLVED:** the 2026-08-25 run value-matched the key
+against a configured slug and recorded `marketData.marketSlug`
+(`READONLY_AUTH_SMOKE_2026-08-25T221131+0000.md:2144`) — this is a parsed
+payload, NOT log text. The `MARKET_SLUG_KEY = "marketSlug"` leaf guess
+(`data.py:160`) is CORRECT under a `marketData` parent, which the nested lookup
+at `data.py:616-622` already handles.
+
+**Clock skew is REFUTED as a cause.** The "56593 ms host clock offset" in the
+report headers is a measurement artifact: `_clock_offset_ms`
+(`polymarket_us_auth_smoke.py:890-907`) compares `time.time()` *at call time*
+against the *first* response's `Date` header, and is called at checkpoint time,
+so it measures elapsed run duration. Real signing-time offset is logged at
+`:49164` — **779 ms**, against a 15 000 ms guard that never fired.
 
 **Why it matters more than it looks.** `MARKET_SLUG_KEY = "marketSlug"` is an
 unresolved venue guess, and every routing decision in the recorder rests on it.
@@ -44,13 +62,26 @@ against `.invalid` hosts prove nothing about the live venue.
 live run has happened.** Zero authenticated calls" is **false**: four
 authenticated read-only smoke runs were executed against
 `https://api.polymarket.us` and are archived under
-`docs/evidence/venue/polymarket_us/READONLY_AUTH_SMOKE_*.md`. What remains true
-is the *conclusion*, not the reason — **all four failed** (`Connectivity
-verdict: FAIL`; the 2026-08-30 runs also report `teardown health: FAILED`,
-`RuntimeError: Event loop stopped before Future completed`), so no venue frame
-has ever reached parquet. Note the ~872 `marketSlug` occurrences in the 2.8 MB
-capture are Breezy's own log text, **not** venue JSON keys — the slug field name
-is still unresolved. 2401 green tests do not establish that a real frame
+`docs/evidence/venue/polymarket_us/READONLY_AUTH_SMOKE_*.md`. The four `FAIL` verdicts are real but mean
+something narrower than they read: the formula fails on `quotes_delivered > 0`,
+not on auth (see G-12 above). **Venue frames HAVE reached the Nautilus
+DataEngine** — the 2026-08-25 run delivered **11 QuoteTicks from 11 frames**
+with 1 instrument loaded (`READONLY_AUTH_SMOKE_2026-08-25T221131+0000.md:2150-2152`).
+Only the *parquet* clause survives.
+
+**THE ACTUAL OPEN DEFECT (was never diagnosed until 2026-09-01):** the
+2026-08-30 run loaded **60 instruments**, received **268 WS frames** (218
+`market_data`, 50 `error`) and delivered **0 QuoteTicks** (`:49085-49089`,
+`:70-73`) — a 0% conversion rate where 08-25 got 100%. Two differences to test:
+60 instruments vs 1, and the 08-30 runs subscribed to **2026-08-31** slugs
+(`tc-temp-nychigh-2026-08-31-...`) while running on 08-30, i.e. **next-day
+markets**. One-sided books explain at most 35 of the 218 frames (183 carry
+`marketData.bids[0]`), so `parse_book_top`'s one-sided refusal
+(`parsing.py:606-633`) is NOT a sufficient explanation.
+
+**Caveat on the ~872 `marketSlug` hits in the 2.8 MB file:** those specific
+occurrences are Breezy's own log text. Do not cite that file for slug
+resolution — cite the 08-25 run, which resolved it by value-matching. 2401 green tests do not establish that a real frame
 reaches parquet. This is exactly the standing lesson of this repo."
 
 **Exit criterion:** one real frame, from the real venue, written to parquet and

@@ -1,3 +1,13 @@
+> **CORRECTED 2026-09-01 — conclusion stands, premise does not.**
+> This appendum argues from a "130906 ms host clock offset". That figure is a
+> measurement artifact, not skew: `_clock_offset_ms`
+> (`scripts/venue/polymarket_us_auth_smoke.py:890-907`) compares `time.time()` at
+> call time against the FIRST response's `Date` header and is called at checkpoint
+> time, so it measures elapsed run duration (08-25 ran 22:11:31 -> ~22:13:41 = 130 s).
+> Real signing-time offset was **779 ms** against a 15 000 ms guard that never fired.
+> The conclusion — **the venue does not enforce a signing window** — still holds, but
+> on step D alone (a deliberately stale -120s request returned 200).
+
 # Polymarket.us Venue Facts Signing Window Addendum - 2026-08-26
 
 This is a dated sibling to `VENUE_FACTS_2026-08-25.md`, not an edit to that
