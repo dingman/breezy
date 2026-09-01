@@ -411,3 +411,46 @@ the write buffer (~8 KB), not the flush interval -- salvage recovered 491/500
 records -- so a truncated tail is usually recoverable and should be salvaged
 rather than discarded. Pinned by
 `tests/contract/test_quote_tape_unclean_shutdown.py`.
+
+## L-9 — On this venue the near-certain rung is never offered; stop designing lock strategies (2026-09-01)
+
+**What happened.** Three independent strategy families, three refutations, one
+mechanism.
+
+| Strategy | Trigger | Result |
+|---|---|---|
+| `cli_settlement_print_lock` | after the FINAL CLI print | winner rung **0 asks / 3332 rows**, 5 stations |
+| H1/H2 `running_extreme_lock` tails | after a preliminary print | fired **0/4**; venue lists tails 4-8 F outside the day |
+| H4 headroom-1 afternoon lock | after the diurnal peak, BEFORE any print | condition held **375/375, 381/381, 372/372**; ask present **0.00%** |
+
+H4 was designed specifically to escape the first two by triggering EARLIER, on a
+physical observation rather than a publication. It failed identically. The
+adjacent rungs were offered on ~100% of rows at 0.01-0.02 throughout: the ladder
+is liquid, and the offer is absent on exactly the rung our model likes.
+
+**The rule.** On this venue, a LONG-ONLY TAKER cannot harvest certainty. Every
+strategy of the form "identify the outcome that is nearly determined, then buy
+it" requires a counterparty to sell a contract known to pay $1, and no such
+counterparty exists at any hour we have observed -- before or after the print,
+before or after the physical lock. Moving the trigger earlier does not help,
+because the market maker reprices off the same public observations we do and is
+not slower than us (Breezy polls CLI on a 300 s timer; it is structurally
+slower). **Do not design another lock strategy. The null is not "we picked the
+wrong hour"; it is "this trade has no seller."**
+
+**Where the remaining edge must live.** If certainty is unsellable, the only
+harvestable region is where genuine UNCERTAINTY remains -- an offer exists
+precisely because the outcome is still in doubt. Winning there requires being
+BETTER CALIBRATED than the market while both sides are still uncertain, which is
+a forecasting edge, not a lock. Note what that implies and do not skip past it:
+Breezy currently ingests **no forecast data at all**, so the entire strategy
+family that could work is blocked on a capability that has been deprioritised
+twice (programme P2/P3). Any next hypothesis should either live in that family
+and carry forecast ingestion as its Gate 0, or state explicitly why it escapes
+this lesson.
+
+**Method note.** All three nulls were decodable because per-decision inputs were
+persisted and the tape was verified before interpretation ([[L-8]]). The H4 run
+also shows the right shape for a cheap kill: measure whether the ORDER IS
+AVAILABLE before measuring whether it is profitable. An absent ask is not a
+pricing problem that a better model or a lower break-even can solve.
