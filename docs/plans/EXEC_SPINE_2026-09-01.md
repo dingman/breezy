@@ -475,7 +475,15 @@ behavioural test**. `test_runtime_backtest_order_guard.py:307` asserts the *sour
 mentions `_refuse_naked_short` only in a docstring. R-6 adds real tests for both before
 extending either.
 
-**The exemption keys on the RECONCILIATION tag ONLY — never on order type.**
+**The exemption keys on the RECONCILIATION tag ONLY — never on order type. BUT R-9 ADDS A
+SECOND, DIFFERENT KEY, AND MISSING IT REFUSES EVERY SETTLEMENT LEG.** R-9's settlement orders
+must be CLAIMED via `external_order_claims` (`trading/config.py:91`), or `_generate_order`
+assigns `StrategyId("EXTERNAL")` (`execution_engine.py:3552-3568`), the fill forms
+`<instrument>-EXTERNAL` under netting OMS, and the Breezy position never closes. A **claimed**
+order carries `tags = None` — NOT `["RECONCILIATION"]`. So a purely tag-keyed exemption refuses
+every settlement leg, and the failure looks like a working guard. **R-6 exempts on the union of:
+(a) the RECONCILIATION tag, and (b) the deterministic settlement `ClientOrderId`
+(`SETTLE-<instrument_id>-<climate_day>`).** Nothing else.
 `generate_missing_orders` emits **MARKET** order events (`live/config.py:108-110`, verified:
 "If MARKET order events will be generated during reconciliation"), not LIMIT. A type-keyed
 exemption would be wrong today and silently wrong if the type changes upstream. Exempt exactly:
@@ -959,6 +967,7 @@ second venue"). This section extends that practice to the exec spine.
 | OQ-6 | Does an unfiltered `GET /v1/orders/open` return orders Breezy did not place? | R-1 | No — **and R-5 is blocked until it is closed** |
 | OQ-7 | Does the existing `_SHORT` ban collide with reading `intent` on an open order? | R-4 | No |
 | OQ-8 | What is the venue's **minimum/floor** taker fee in absolute USD? | R-8 precondition (docs snapshot, or OQ-3-cleared preview) | No — **and R-8 is blocked until it is bounded** |
+| OQ-9 | Does `/v1/portfolio/activities` emit `ACTIVITY_TYPE_POSITION_RESOLUTION` for a held market, and does the resolution leg carry a commission? | R-9, observed once after a real settlement | **Yes** — blocks R-9 *done*, not R-9 *build* |
 
 ## Verification
 
