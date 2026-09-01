@@ -258,6 +258,12 @@ breezy = "breezy:main"
 # must start on a host with no venue configuration, and the quote-tape recorder
 # must refuse to start without it. See `breezy.runtime.quote_tape_cli`.
 breezy-quote-tape = "breezy.runtime.quote_tape_cli:main"
+# BL-23. A THIRD process, and deliberately not a flag on the recorder: it must
+# run on a host with no venue configuration, opens no socket, holds no
+# credential, and reads the tape READ-ONLY. See
+# `breezy.runtime.quote_tape_preflight_cli` for the exit contract (3 =
+# TRUNCATION DETECTED).
+breezy-quote-tape-preflight = "breezy.runtime.quote_tape_preflight_cli:main"
 
 [build-system]
 requires = ["uv_build>=0.12.5,<0.13.0"]
