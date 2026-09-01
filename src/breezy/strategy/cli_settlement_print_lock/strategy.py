@@ -86,11 +86,16 @@ from breezy.ingest.nws_actor import nws_climate_day_data_type
 from breezy.runtime.backtest_feed import NWS_BACKTEST_CLIENT_ID
 from breezy.strategy.cli_settlement_print_lock.config import CliSettlementPrintLockConfig
 from breezy.strategy.cli_settlement_print_lock.decision import (
+    MEASURED_STATIONS,
     CliPrintObservation,
     evaluate_instrument,
 )
 from breezy.strategy.depth10 import market_quote_from_depth
 from breezy.strategy.weather_common.bucket_contract import MispricingContract
+from breezy.strategy.weather_common.costs import (
+    FeeCoefficientSource,
+    UnknownFeeScheduleError,
+)
 from breezy.strategy.weather_common.freshness import SignalFreshness
 from breezy.strategy.weather_common.models import MarketQuote, hours_until
 from breezy.strategy.weather_common.refusals import RefusalAlerter, RefusalCounter
@@ -112,9 +117,14 @@ if TYPE_CHECKING:  # pragma: no cover - typing only
 
 __all__ = [
     "MEASURED_P_STABLE_WILSON_LOWER",
+    "MEASURED_STATIONS",
     "CliSettlementPrintLockStrategy",
+    "EdgeFloorInversionError",
+    "MissingFeeCoefficientSourceError",
     "MissingObservationBoundError",
     "NoTradableMeasureError",
+    "UnmeasuredStationError",
+    "UnpricedInstrumentError",
 ]
 
 
@@ -142,6 +152,69 @@ class NoTradableMeasureError(ValueError):
     :class:`MissingObservationBoundError` exists to prevent -- and equally
     invisible, since "evaluated nothing" and "refused everything" look
     identical from outside. Fail at construction instead.
+    """
+
+
+class MissingFeeCoefficientSourceError(ValueError):
+    """Raised when this strategy is wired with no fee-coefficient source.
+
+    Mirrors
+    ``breezy.strategy.weather_common.forecast_source.MissingForecastSourceError``
+    exactly, including the explicit ``is None`` check, so a caller that pushes
+    ``None`` through an ``Optional``-typed call site gets a loud, immediate
+    refusal rather than a strategy that quietly never trades -- or, worse, one
+    that falls back to a hardcoded fee and trades a market whose real schedule
+    nobody read.
+    """
+
+
+class UnpricedInstrumentError(ValueError):
+    """Raised at ``on_start`` for an instrument this strategy cannot cost.
+
+    Two causes, one posture: the market carries no usable fee coefficient, or
+    the configured ``slippage_prob`` is below the instrument's own tick.
+
+    Same reasoning, and for the same reason, as
+    :class:`MissingObservationBoundError` above: both are STATIC properties of
+    a market, so deferring the refusal to decision time converts a loud
+    startup failure into a permanent, SILENT no-op that the refusal counter
+    cannot see (BL-19 s8.5 null class N1 -- a pre-signal ``None`` never reaches
+    ``evaluate_order`` and is never counted, the same class as BL-10).
+    ``adapters.polymarket_us.fees`` is explicit that an unparseable
+    coefficient raises rather than trading free; this is that rule, moved to
+    the gate.
+
+    The tick floor lives here rather than in ``config.py`` because
+    ``tick_size`` is PER INSTRUMENT and unknown at config construction --
+    ``bucket_contract.py`` records that the captured universe carries more
+    than one tick size.
+    """
+
+
+class UnmeasuredStationError(ValueError):
+    """Raised at ``on_start`` for a station ``p_stable`` was never measured on.
+
+    :data:`MEASURED_STATIONS` is the support of
+    :data:`MEASURED_P_STABLE_WILSON_LOWER`. The decision layer refuses an
+    unmeasured station too (that gate is the independently-reusable one), but
+    refusing here as well turns a silent per-record ``None`` into a loud
+    startup failure -- a new city listing is a routine VENUE event that would
+    otherwise present as "the market had no opportunities".
+    """
+
+
+class EdgeFloorInversionError(ValueError):
+    """Raised when ``min_model_edge`` exceeds ``min_edge_after_costs``.
+
+    The two are one concept spelled twice: the decision layer applies
+    ``min_edge_after_costs`` to the cost-netted edge, and
+    ``RiskManager.evaluate_order`` re-applies ``abs(edge) < min_model_edge``
+    (``risk.py:421``) to that SAME already-netted number. An inverted pair
+    means every signal the decision layer forms is refused 100% of the time as
+    ``edge_below_minimum`` -- and ``RefusalAlerter._conditions`` builds only a
+    ``SHORTS_DISABLED`` condition, so nothing alerts and the strategy is
+    indistinguishable from a market with no opportunities. Exactly the failure
+    class :class:`MissingObservationBoundError` exists to prevent.
     """
 
 
@@ -189,8 +262,21 @@ MEASURED_P_STABLE_WILSON_LOWER: Final[float] = 0.996896
 class CliSettlementPrintLockStrategy(SharedExposureMixin, Strategy):
     """Buys YES, taker, on the bucket containing the FINAL CLI printed value."""
 
-    def __init__(self, config: CliSettlementPrintLockConfig) -> None:
+    def __init__(
+        self,
+        config: CliSettlementPrintLockConfig,
+        fee_coefficients: FeeCoefficientSource,
+    ) -> None:
         super().__init__(config)
+        if fee_coefficients is None:
+            raise MissingFeeCoefficientSourceError(
+                "CliSettlementPrintLockStrategy requires a FeeCoefficientSource: the "
+                "venue fee is theta * p * (1 - p) with theta a PER-MARKET venue fact, "
+                "and there is deliberately no config field and no default for it -- a "
+                "strategy-side default would reintroduce the fallback "
+                "breezy.adapters.polymarket_us.fees refuses. Inject one at the "
+                "construction site.",
+            )
         if config.stale_observation_hours is None:
             raise MissingObservationBoundError(
                 "CliSettlementPrintLockConfig.stale_observation_hours is None. This is an "
@@ -209,7 +295,19 @@ class CliSettlementPrintLockStrategy(SharedExposureMixin, Strategy):
                 "strategy would evaluate no instrument at all and be indistinguishable "
                 "from one that merely found no opportunity. Enable at least one measure.",
             )
+        if config.min_model_edge > config.min_edge_after_costs:
+            raise EdgeFloorInversionError(
+                f"CliSettlementPrintLockConfig has min_model_edge "
+                f"{config.min_model_edge} > min_edge_after_costs "
+                f"{config.min_edge_after_costs}. RiskManager.evaluate_order re-applies "
+                "min_model_edge to the number this strategy's decision layer has "
+                "ALREADY cost-netted, so every formed signal would be refused as "
+                "'edge_below_minimum' -- and RefusalAlerter only ever alerts on "
+                "SHORTS_DISABLED, so that refusal is invisible in live. These are two "
+                "spellings of ONE floor; both default to MIN_EDGE_AFTER_COSTS_BL19.",
+            )
         self._config: CliSettlementPrintLockConfig = config
+        self._fee_coefficients: FeeCoefficientSource = fee_coefficients
         self._contracts: dict[str, MispricingContract] = {}
         self._nt_ids: dict[str, InstrumentId] = {}
         self._deadlines: dict[str, dt.datetime] = {}
@@ -244,15 +342,46 @@ class CliSettlementPrintLockStrategy(SharedExposureMixin, Strategy):
                     f"use_tmin={self._config.use_tmin}); skipping subscription.",
                 )
                 continue
+            if facts.settlement_station not in MEASURED_STATIONS:
+                raise UnmeasuredStationError(
+                    f"{instrument_id} settles on station "
+                    f"{facts.settlement_station!r}, which is not one of the "
+                    f"{sorted(MEASURED_STATIONS)} p_stable was measured on. The "
+                    "shipped bound is the PER-STATION one precisely because the five "
+                    "measured WFOs are not exchangeable (revision rates 4.50%-13.96%), "
+                    "so an unmeasured sixth office has no bound at all. A new city "
+                    "listing is a venue event, not a licence to extrapolate.",
+                )
+            tick_size = float(instrument.price_increment)
+            if self._config.slippage_prob < tick_size:
+                raise UnpricedInstrumentError(
+                    f"CliSettlementPrintLockConfig.slippage_prob "
+                    f"{self._config.slippage_prob} is below {instrument_id}'s own tick "
+                    f"{tick_size}. Slippage cannot be smaller than the smallest "
+                    "representable adverse price move, and it is the ONLY writable "
+                    "cost input -- a value below one tick is how ask 0.99 gets "
+                    "admitted (BL-19 s8.2: edge -0.003698 there).",
+                )
+            try:
+                theta = self._fee_coefficients.fee_coefficient_for(str(instrument_id))
+            except UnknownFeeScheduleError as exc:
+                raise UnpricedInstrumentError(
+                    f"No usable fee coefficient for {instrument_id}. An unresolved fee "
+                    "schedule is a NO-TRADE, never a free trade: refusing at on_start "
+                    "rather than at decision time, because a pre-signal None is never "
+                    "counted by the refusal counter and would present as a market with "
+                    "no opportunities.",
+                ) from exc
             contract = MispricingContract(
                 instrument_id=str(instrument_id),
                 facts=facts,
-                tick_size=float(instrument.price_increment),
+                tick_size=tick_size,
                 price_scale=(
                     self._config.price_scale_override
                     if self._config.price_scale_override is not None
                     else 1.0
                 ),
+                fee_coefficient=theta,
             )
             self._contracts[str(instrument_id)] = contract
             self._nt_ids[str(instrument_id)] = instrument_id
@@ -288,7 +417,11 @@ class CliSettlementPrintLockStrategy(SharedExposureMixin, Strategy):
             halt_hours_before_settlement=cfg.halt_hours_before_settlement,
             stale_observation_hours=cfg.stale_observation_hours,
             stale_quote_minutes=cfg.stale_quote_minutes,
-            transaction_cost_prob=cfg.transaction_cost_prob,
+            # `transaction_cost_prob` is NOT forwarded: the field is dead in
+            # `risk.py` (the identifier appears there exactly once, at its own
+            # definition on line 116 -- `evaluate_order` never reads it and
+            # `edge_after_costs` takes `cost` by injection), and this strategy
+            # no longer has a total-cost scalar to forward anyway.
             allow_short=cfg.allow_short,
         )
 

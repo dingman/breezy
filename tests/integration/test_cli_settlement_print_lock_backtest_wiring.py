@@ -32,7 +32,9 @@ import sys
 from decimal import Decimal
 from pathlib import Path
 from types import ModuleType
+from typing import Any
 
+import pytest
 from nautilus_trader.model.currencies import USD
 from nautilus_trader.model.data import BookOrder, InstrumentClose, OrderBookDepth10
 from nautilus_trader.model.enums import AssetClass, InstrumentCloseType, OrderSide
@@ -126,7 +128,12 @@ def _instrument() -> BinaryOption:
             STRIKE_LOWER_F_KEY: _STRIKE_LOWER_F,
             STRIKE_UPPER_F_KEY: _STRIKE_UPPER_F,
             FEE_SCHEDULE_STATUS_KEY: FEE_SCHEDULE_STATUS_KNOWN,
-            FEE_COEFFICIENT_KEY: "0",
+            # The MEASURED venue coefficient: 20/20 captured weather markets
+            # carry `feeCoefficient: 0.06`. Not "0" -- a free venue is the one
+            # cost assumption this strategy's design exists to make
+            # unwritable, and a wiring test that silently trades free would
+            # not exercise the fee path at all.
+            FEE_COEFFICIENT_KEY: "0.06",
         },
     )
 
@@ -195,16 +202,59 @@ def _config(instrument: BinaryOption) -> BreezyBacktestConfig:
     )
 
 
+def _fees(instrument: BinaryOption) -> Any:
+    return runner.PolymarketUSFeeCoefficients({str(instrument.id): instrument})
+
+
+def _strategy(instrument: BinaryOption) -> Any:
+    return runner._build_strategy(
+        "cli_settlement_print_lock", (instrument.id,), None, _fees(instrument),
+    )
+
+
 def test_runner_builds_cli_settlement_print_lock_without_a_forecast_source() -> None:
     instrument = _instrument()
-    strategy = runner._build_strategy(
-        "cli_settlement_print_lock", (instrument.id,), None,
-    )
+    strategy = _strategy(instrument)
 
     assert isinstance(strategy, runner.CliSettlementPrintLockStrategy)
     assert strategy.config.stale_observation_hours == (
         runner.STALE_OBSERVATION_HOURS_CLI_SETTLEMENT_PRINT_LOCK
     )
+
+
+def test_the_runner_supplies_the_slippage_term_explicitly_at_the_one_call_site() -> None:
+    """No default exists in the config, so the runner must name it -- and the
+    named value must be at least one tick on this venue's 0.01 grid."""
+    instrument = _instrument()
+    strategy = _strategy(instrument)
+
+    assert strategy.config.slippage_prob == (
+        runner.SLIPPAGE_PROB_CLI_SETTLEMENT_PRINT_LOCK
+    )
+    assert strategy.config.slippage_prob >= float(instrument.price_increment)
+
+
+def test_the_runner_refuses_to_build_this_strategy_with_no_fee_source() -> None:
+    """There is no default coefficient anywhere. A `None` is a caller bug."""
+    instrument = _instrument()
+
+    with pytest.raises(ValueError, match="fee_coefficients"):
+        runner._build_strategy(
+            "cli_settlement_print_lock", (instrument.id,), None, None,
+        )
+
+
+def test_on_start_resolves_the_venue_fee_onto_every_traded_contract() -> None:
+    """Proves the injection reaches the DECISION layer, not just the ctor."""
+    instrument = _instrument()
+    strategy = _strategy(instrument)
+
+    engine = run_backtest(_config(instrument), strategies=(strategy,))
+    try:
+        contract = strategy._contracts[str(instrument.id)]
+        assert contract.fee_coefficient == pytest.approx(0.06)
+    finally:
+        engine.dispose()
 
 
 def test_the_derived_stale_observation_bound_is_not_the_preliminary_window_bound() -> None:
@@ -220,9 +270,7 @@ def test_the_derived_stale_observation_bound_is_not_the_preliminary_window_bound
 def test_cli_settlement_print_lock_reaches_on_data_and_submits_an_order() -> None:
     """WIRING PROOF ONLY -- see the module docstring. Not an economics claim."""
     instrument = _instrument()
-    strategy = runner._build_strategy(
-        "cli_settlement_print_lock", (instrument.id,), None,
-    )
+    strategy = _strategy(instrument)
 
     engine = run_backtest(_config(instrument), strategies=(strategy,))
     try:

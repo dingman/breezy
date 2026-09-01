@@ -18,40 +18,91 @@ asks-only book (see `decision.py`).
 
 from __future__ import annotations
 
-import pytest
-from nautilus_trader.model.data import BookOrder, OrderBookDepth10
-from nautilus_trader.model.enums import OrderSide
-from nautilus_trader.model.identifiers import InstrumentId, Symbol, Venue
-from nautilus_trader.model.objects import Price, Quantity
+from decimal import Decimal
 
-from breezy.strategy.cli_settlement_print_lock.config import CliSettlementPrintLockConfig
+import pytest
+from nautilus_trader.common.component import TestClock
+from nautilus_trader.model.currencies import USD
+from nautilus_trader.model.data import BookOrder, OrderBookDepth10
+from nautilus_trader.model.enums import AssetClass, OrderSide
+from nautilus_trader.model.identifiers import InstrumentId, Symbol, TraderId, Venue
+from nautilus_trader.model.instruments import BinaryOption
+from nautilus_trader.model.objects import Price, Quantity
+from nautilus_trader.portfolio import Portfolio
+from nautilus_trader.test_kit.stubs.component import TestComponentStubs
+
+from breezy.domain.weather_bucket_facts import (
+    CLIMATE_DAY_KEY,
+    MEASURE_KEY,
+    SETTLEMENT_STATION_KEY,
+    STRIKE_LOWER_F_KEY,
+    STRIKE_UPPER_F_KEY,
+    WEATHER_FACTS_STATUS_KEY,
+    WEATHER_FACTS_STATUS_KNOWN,
+)
+from breezy.strategy.cli_settlement_print_lock.config import (
+    MIN_EDGE_AFTER_COSTS_BL19,
+    CliSettlementPrintLockConfig,
+)
 from breezy.strategy.cli_settlement_print_lock.strategy import (
     MEASURED_P_STABLE_WILSON_LOWER,
+    MEASURED_STATIONS,
     CliSettlementPrintLockStrategy,
+    EdgeFloorInversionError,
+    MissingFeeCoefficientSourceError,
     MissingObservationBoundError,
     NoTradableMeasureError,
+    UnmeasuredStationError,
+    UnpricedInstrumentError,
 )
 from breezy.strategy.depth10 import market_quote_from_depth
+from breezy.strategy.weather_common.costs import UnknownFeeScheduleError
 
 INSTRUMENT_ID = InstrumentId(Symbol("nyc-80-84"), Venue("POLYMARKET_US"))
+
+#: [MEASURED] every captured weather market carries `feeCoefficient: 0.06`.
+THETA = 0.06
+
+
+class _Fees:
+    """A `FeeCoefficientSource` that answers, or REFUSES -- never defaults."""
+
+    def __init__(self, theta: float | None = THETA) -> None:
+        self._theta = theta
+
+    def fee_coefficient_for(self, instrument_id: str) -> float:
+        if self._theta is None:
+            raise UnknownFeeScheduleError(f"no fee schedule for {instrument_id}")
+        return self._theta
 
 
 def _config(**overrides: object) -> CliSettlementPrintLockConfig:
     fields: dict[str, object] = {
         "instrument_ids": (INSTRUMENT_ID,),
         "stale_observation_hours": 9.0,
+        "slippage_prob": 0.01,
         **overrides,
     }
     return CliSettlementPrintLockConfig(**fields)  # type: ignore[arg-type]
 
 
+def _strategy(
+    config: CliSettlementPrintLockConfig | None = None,
+    fees: object | None = None,
+) -> CliSettlementPrintLockStrategy:
+    return CliSettlementPrintLockStrategy(
+        _config() if config is None else config,
+        _Fees() if fees is None else fees,  # type: ignore[arg-type]
+    )
+
+
 def test_constructing_with_stale_observation_hours_none_raises() -> None:
     with pytest.raises(MissingObservationBoundError):
-        CliSettlementPrintLockStrategy(_config(stale_observation_hours=None))
+        _strategy(_config(stale_observation_hours=None))
 
 
 def test_constructing_with_an_explicit_bound_succeeds() -> None:
-    strategy = CliSettlementPrintLockStrategy(_config())
+    strategy = _strategy()
 
     assert strategy is not None
 
@@ -62,26 +113,93 @@ def test_omitting_stale_observation_hours_is_a_type_error() -> None:
         CliSettlementPrintLockConfig(instrument_ids=(INSTRUMENT_ID,))  # type: ignore[call-arg]
 
 
+def test_omitting_slippage_prob_is_a_type_error() -> None:
+    """The ONLY writable cost input, and it is REQUIRED -- no default anywhere.
+
+    Plan s2.2: the fee is not configurable at all, so this is the one term an
+    operator writes, and it is named for the single thing it actually is.
+    """
+    with pytest.raises(TypeError):
+        CliSettlementPrintLockConfig(  # type: ignore[call-arg]
+            instrument_ids=(INSTRUMENT_ID,),
+            stale_observation_hours=9.0,
+        )
+
+
+def test_omitting_the_fee_coefficient_source_is_a_type_error() -> None:
+    """REQUIRED and POSITIONAL -- the `ForecastSource` precedent, exactly."""
+    with pytest.raises(TypeError):
+        CliSettlementPrintLockStrategy(_config())  # type: ignore[call-arg]
+
+
+def test_a_none_fee_coefficient_source_raises_rather_than_defaulting() -> None:
+    """A caller pushing `None` through an `Optional`-typed site still fails loud."""
+    with pytest.raises(MissingFeeCoefficientSourceError):
+        CliSettlementPrintLockStrategy(_config(), None)  # type: ignore[arg-type]
+
+
 def test_disabling_both_measures_raises_rather_than_shipping_a_silent_no_op() -> None:
     with pytest.raises(NoTradableMeasureError):
-        CliSettlementPrintLockStrategy(_config(use_tmax=False, use_tmin=False))
+        _strategy(_config(use_tmax=False, use_tmin=False))
 
 
 def test_allow_short_defaults_false() -> None:
     assert _config().allow_short is False
 
 
-def test_edge_and_cost_floors_default_to_the_inherited_risk_limits() -> None:
-    """BL-19 is pending: these must be config, not literals, so the decision
-    lands as a config change rather than a rewrite."""
-    from breezy.strategy.weather_common.risk import RiskLimits
+def test_no_field_on_this_config_denotes_a_TOTAL_cost() -> None:
+    """STRUCTURAL, and strictly stronger than the plumbing equality it replaces.
 
-    limits = RiskLimits()
+    The old assertion pinned `cfg.transaction_cost_prob == limits.
+    transaction_cost_prob`: an equality between two copies of a field NOTHING
+    reads. `transaction_cost_prob` appears in `weather_common/risk.py` exactly
+    once -- its own definition at line 116 -- and `edge_after_costs` takes
+    `cost` by injection, so `RiskManager` never reads it.
+
+    What replaces it is the thing that actually keeps the hazard closed: there
+    must be NO field in which a total cost can be written. The unsafe edit
+    (`transaction_cost_prob = 0.0006` + a 0.005 floor -> trades at ask 0.99,
+    which BL-19 s8.2 computes as -0.003698) then has no target at all. This
+    fails RED on any future re-add, including under a new name.
+    """
+    names = set(CliSettlementPrintLockConfig.__struct_fields__)
+
+    assert not any("transaction_cost" in name for name in names)
+    assert not any(name in {"cost_prob", "total_cost_prob", "cost"} for name in names)
+    # The ONE writable cost input, named for the single term it actually is.
+    assert "slippage_prob" in names
+    assert not any("fee" in name for name in names), (
+        "the fee is a VENUE FACT resolved per instrument, never a config field"
+    )
+
+
+def test_the_two_edge_floors_are_the_bl19_value_and_cannot_invert() -> None:
+    """ONE floor, spelled twice, derived from ONE source -- not two knobs.
+
+    `RiskManager.evaluate_order` re-applies `abs(edge) < min_model_edge`
+    (`risk.py:421`) to the number the decision layer already cost-netted. If
+    `min_model_edge` were left ABOVE `min_edge_after_costs`, the decision layer
+    would emit signals the risk layer refuses 100% of the time as
+    `edge_below_minimum` -- and `RefusalAlerter._conditions`
+    (`weather_common/refusals.py:134-151`) builds only a `SHORTS_DISABLED`
+    condition, so nothing would alert and the strategy would look like a market
+    with no opportunities.
+    """
     cfg = _config()
 
-    assert cfg.min_model_edge == limits.min_model_edge
-    assert cfg.min_edge_after_costs == limits.min_model_edge
-    assert cfg.transaction_cost_prob == limits.transaction_cost_prob
+    assert cfg.min_edge_after_costs == pytest.approx(MIN_EDGE_AFTER_COSTS_BL19)
+    assert cfg.min_model_edge == pytest.approx(MIN_EDGE_AFTER_COSTS_BL19)
+    assert cfg.min_model_edge <= cfg.min_edge_after_costs
+
+
+def test_an_inverted_pair_of_edge_floors_raises_at_construction() -> None:
+    """The invariant is enforced, not merely defaulted correctly."""
+    with pytest.raises(EdgeFloorInversionError):
+        _strategy(_config(min_model_edge=0.04, min_edge_after_costs=0.005))
+
+
+def test_equal_floors_are_accepted_because_the_bound_is_not_strict() -> None:
+    assert _strategy(_config(min_model_edge=0.005, min_edge_after_costs=0.005)) is not None
 
 
 def _wilson_lower_bound(hit: int, n: int, z: float = 1.959963984540054) -> float:
@@ -171,3 +289,146 @@ def test_an_asks_only_depth10_renders_the_padded_bid_as_none_not_zero() -> None:
     assert quote.bid is None
     assert quote.ask == pytest.approx(0.90)
     assert quote.mid is None
+
+
+# ---------------------------------------------------------------------------
+# `on_start`: the fee schedule and the tick floor are resolved LOUDLY, once
+# ---------------------------------------------------------------------------
+#
+# Driven through a REAL registered `Strategy` (the pattern
+# `tests/unit/test_strategy_harness_probe.py` established): `Actor.cache` is a
+# read-only Cython attribute and cannot be replaced on an instance.
+
+
+def _weather_instrument(
+    *,
+    price_increment: str = "0.01",
+    station: str = "NYC",
+) -> BinaryOption:
+    symbol = Symbol("nyc-80-84")
+    increment = Price.from_str(price_increment)
+    size_increment = Quantity.from_str("1")
+    return BinaryOption(
+        instrument_id=InstrumentId(symbol, Venue("POLYMARKET_US")),
+        raw_symbol=symbol,
+        outcome="Yes",
+        description="NYC daily high 80-84F",
+        asset_class=AssetClass.ALTERNATIVE,
+        currency=USD,
+        price_precision=increment.precision,
+        price_increment=increment,
+        size_precision=size_increment.precision,
+        size_increment=size_increment,
+        activation_ns=0,
+        expiration_ns=8 * 3_600_000_000_000,
+        max_quantity=None,
+        min_quantity=Quantity.from_int(1),
+        maker_fee=Decimal(0),
+        taker_fee=Decimal(0),
+        ts_event=0,
+        ts_init=0,
+        info={
+            WEATHER_FACTS_STATUS_KEY: WEATHER_FACTS_STATUS_KNOWN,
+            SETTLEMENT_STATION_KEY: station,
+            CLIMATE_DAY_KEY: "2026-08-28",
+            MEASURE_KEY: "high",
+            STRIKE_LOWER_F_KEY: 80,
+            STRIKE_UPPER_F_KEY: 84,
+        },
+    )
+
+
+def _register(
+    strategy: CliSettlementPrintLockStrategy, instrument: BinaryOption,
+) -> None:
+    clock = TestClock()
+    msgbus = TestComponentStubs.msgbus()
+    cache = TestComponentStubs.cache()
+    cache.add_instrument(instrument)
+    portfolio = Portfolio(msgbus=msgbus, cache=cache, clock=clock)
+    strategy.register(
+        trader_id=TraderId("BACKTEST-001"),
+        portfolio=portfolio,
+        msgbus=msgbus,
+        cache=cache,
+        clock=clock,
+    )
+
+
+def test_on_start_resolves_the_fee_coefficient_onto_the_contract() -> None:
+    instrument = _weather_instrument()
+    strategy = _strategy()
+    _register(strategy, instrument)
+
+    strategy.on_start()
+
+    contract = strategy._contracts[str(instrument.id)]
+    assert contract.fee_coefficient == pytest.approx(THETA)
+
+
+def test_an_unpriced_instrument_raises_at_on_start_rather_than_trading_free() -> None:
+    """A fee schedule is a STATIC property, so the refusal belongs at the gate.
+
+    Deferring it to decision time converts a loud startup failure into a
+    permanent, SILENT no-op the refusal counter cannot see (BL-19 s8.5 null
+    class N1: a pre-signal `None` never reaches `evaluate_order` and is never
+    counted). `fees.py:90-92` refuses rather than trading free; this is that
+    rule, moved to the gate.
+    """
+    instrument = _weather_instrument()
+    strategy = _strategy(fees=_Fees(theta=None))
+    _register(strategy, instrument)
+
+    with pytest.raises(UnpricedInstrumentError):
+        strategy.on_start()
+
+
+def test_slippage_below_one_tick_raises_at_on_start() -> None:
+    """The tick floor lives at `on_start` because `tick_size` is PER INSTRUMENT.
+
+    Plan s2.2's closure proof: to trade at 0.99 an operator must write
+    `slippage_prob <= 0.001302`, and every such value is below the 0.01 tick.
+    """
+    instrument = _weather_instrument()
+    strategy = _strategy(_config(slippage_prob=0.001302))
+    _register(strategy, instrument)
+
+    with pytest.raises(UnpricedInstrumentError):
+        strategy.on_start()
+
+
+def test_slippage_exactly_one_tick_is_accepted_because_the_floor_is_not_strict() -> None:
+    instrument = _weather_instrument()
+    strategy = _strategy(_config(slippage_prob=0.01))
+    _register(strategy, instrument)
+
+    strategy.on_start()
+
+    assert str(instrument.id) in strategy._contracts
+
+
+def test_the_tick_floor_follows_the_instruments_own_increment_not_a_literal() -> None:
+    """A finer tick loosens the floor -- the design self-corrects (plan s2.8.4)."""
+    instrument = _weather_instrument(price_increment="0.001")
+    strategy = _strategy(_config(slippage_prob=0.005))
+    _register(strategy, instrument)
+
+    strategy.on_start()
+
+    assert strategy._contracts[str(instrument.id)].tick_size == pytest.approx(0.001)
+
+
+def test_an_unmeasured_station_is_refused_at_on_start_not_silently_at_decision() -> None:
+    """A sixth city is a routine VENUE event. It must not reach the tape at all."""
+    instrument = _weather_instrument(station="BOS")
+    strategy = _strategy()
+    _register(strategy, instrument)
+
+    with pytest.raises(UnmeasuredStationError):
+        strategy.on_start()
+
+
+def test_the_strategy_reexports_the_allow_list_beside_the_measured_constant() -> None:
+    """The bound and its SUPPORT are one measurement and are read together."""
+    assert MEASURED_STATIONS == frozenset({"NYC", "MIA", "MDW", "LAX", "SFO"})
+    assert len(MEASURED_STATIONS) == 5

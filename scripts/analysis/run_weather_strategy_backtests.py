@@ -185,6 +185,7 @@ import argparse
 import datetime as dt
 import json
 import sys
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Final
@@ -212,6 +213,11 @@ from weather_strategy_backtest_lib import (
     settlement_prices_for_scenario,
 )
 
+from breezy.adapters.polymarket_us.errors import FeeScheduleUnknownError
+
+# DELIBERATE private-name import -- see `PolymarketUSFeeCoefficients` below for
+# why the public promotion could not be made in this change.
+from breezy.adapters.polymarket_us.fees import _fee_coefficient
 from breezy.domain.nws_climate_day import NwsClimateDay
 from breezy.domain.weather_bucket_facts import WeatherBucketFacts, read_weather_bucket_facts
 from breezy.persistence.catalog import open_station_catalog, read_climate_days
@@ -229,13 +235,20 @@ from breezy.strategy.calibration_mean_reversion import (
     CalibrationMeanReversionConfig,
     CalibrationMeanReversionStrategy,
 )
-from breezy.strategy.forecast_mispricing import ForecastMispricingConfig, ForecastMispricingStrategy
-from breezy.strategy.forecast_revision import ForecastRevisionConfig, ForecastRevisionStrategy
 from breezy.strategy.cli_settlement_print_lock import (
     CliSettlementPrintLockConfig,
     CliSettlementPrintLockStrategy,
 )
-from breezy.strategy.running_extreme_lock import RunningExtremeLockConfig, RunningExtremeLockStrategy
+from breezy.strategy.forecast_mispricing import ForecastMispricingConfig, ForecastMispricingStrategy
+from breezy.strategy.forecast_revision import ForecastRevisionConfig, ForecastRevisionStrategy
+from breezy.strategy.running_extreme_lock import (
+    RunningExtremeLockConfig,
+    RunningExtremeLockStrategy,
+)
+from breezy.strategy.weather_common.costs import (
+    FeeCoefficientSource,
+    UnknownFeeScheduleError,
+)
 from breezy.strategy.weather_common.forecast_source import ForecastSource
 from breezy.strategy.weather_common.models import ForecastSnapshot
 
@@ -292,6 +305,31 @@ STALE_OBSERVATION_HOURS_RUNNING_EXTREME_LOCK: Final[float] = 12.665
 #: BUILD-side decision, not an operator-reserved control.
 STALE_OBSERVATION_HOURS_CLI_SETTLEMENT_PRINT_LOCK: Final[float] = 9.0
 
+#: `CliSettlementPrintLockConfig.slippage_prob` has no shipped default either,
+#: and for the same reason: it is the ONLY writable cost input, so an implicit
+#: value would be an unowned economic assumption. The venue fee is NOT here --
+#: it is `theta * p * (1 - p)` read per instrument from the market's own
+#: `feeCoefficient` through `PolymarketUSFeeCoefficients`, and it is not
+#: configurable at all.
+#:
+#: The value is UNMEASURED. 0.01 is ONE TICK on this venue's 0.01 grid -- the
+#: smallest representable adverse price move -- and is a placeholder, not a
+#: measurement (`docs/evidence/bl19_edge_and_cost_decision_2026-09-01.md` s2,
+#: s8.2, s8.6). Say plainly what it decides: at ask 0.99 the edge after FEE
+#: ALONE is +0.006302 and clears the 0.005 floor; only this placeholder pushes
+#: it to -0.003698. So the single number deciding whether print-lock may pay
+#: 0.99 is a figure nobody has measured. s8.5's per-station-day record exists
+#: to replace it -- `SignalDecision.metadata` carries `fee_coefficient`,
+#: `fee_prob` and `slippage_prob` precisely so the threshold is re-derivable
+#: OFFLINE from a recorded tape, without re-running the capture.
+#:
+#: It is floored at the instrument's own `price_increment` in `on_start`
+#: (`UnpricedInstrumentError`). A floor of ZERO would restore the exact unsafe
+#: configuration the structured cost term exists to forbid, so if realised
+#: fills show slippage below one tick the floor is RE-DERIVED, never removed.
+#: A BUILD-side decision, not an operator-reserved control.
+SLIPPAGE_PROB_CLI_SETTLEMENT_PRINT_LOCK: Final[float] = 0.01
+
 DEFAULT_QUOTE_CATALOG_PATH: Final[Path] = Path(
     "/home/jon/.local/share/breezy/catalog/quote_tape/polymarket_us",
 )
@@ -347,6 +385,77 @@ REALISTIC_PUBLISHED_AT_OFFSET_HOURS: Final[float] = 6.0
 REVISION_PUB1_OFFSET_MINUTES: Final[float] = 1.0
 REVISION_PUB2_OFFSET_MINUTES: Final[float] = 3.0
 REVISION_STEP_F: Final[float] = 3.0
+
+
+class PolymarketUSFeeCoefficients:
+    """A `FeeCoefficientSource` backed by already-parsed Polymarket.us markets.
+
+    WHY THIS LIVES IN THIS SCRIPT AND NOT IN `src/breezy/`
+    ------------------------------------------------------
+    It must reach BOTH `breezy.adapters.polymarket_us` (for the validated
+    coefficient read) and `breezy.strategy.weather_common.costs` (for the
+    error type the strategy layer catches). Under `pyproject.toml`'s layers
+    contract -- `strategy` > `runtime` > `adapters`, `exhaustive = true` --
+    the only module inside `breezy` that may import both is one in the
+    `strategy` layer, and putting it there would weld a strategy package to
+    one venue, against Breezy's portability priority. A `runtime` home fails
+    `lint-imports` outright ("breezy.runtime is not allowed to import
+    breezy.strategy").
+
+    So it lives at the construction site, which is EXACTLY the precedent
+    `_SequenceForecastSource` below already sets for the identical problem:
+    the injected Protocol is venue-neutral and lives in `weather_common`, the
+    concrete implementation lives with the wiring. See the
+    "DEVIATION FROM THE PLAN" note in the module docstring of
+    `breezy.strategy.weather_common.costs`'s consumer.
+
+    NAUTILUS NULL HYPOTHESIS (L-1). Nautilus exposes no API that resolves a
+    market's fee COEFFICIENT for a contemplated price. `Instrument.taker_fee`
+    is a flat notional rate (`adapters.polymarket_us.fees` documents its
+    unbounded relative error as `p -> 1`), and `FeeModel.get_commission`
+    (`backtest/models/fee.pyx:38`) prices an ALREADY-FILLED order and returns
+    `Money`. The gap is real.
+
+    REFUSE, NEVER DEFAULT. The read is DELEGATED to the adapter's own
+    already-validated `_fee_coefficient` rather than re-implemented, so the
+    gate-time resolution and the settlement-time authority cannot diverge on
+    what counts as usable: it checks the status marker (barrier F1) and then
+    re-validates the value -- absence, `bool` round-trip, undecodable text,
+    and the `[0, 1]` range -- because the marker lives in a loosely-typed
+    `info` dict and must never on its own license a computation. Every failure
+    becomes `UnknownFeeScheduleError`, so the strategy layer never catches an
+    adapter-specific type.
+
+    (`_fee_coefficient` is module-private. The design asks for it to be
+    PROMOTED to a public `read_fee_coefficient`; that rename could not be made
+    because `src/breezy/adapters/polymarket_us/` was under concurrent edit and
+    read-only for this change. The design's stated fallback -- duplicating the
+    ~25 lines of validation -- is worse: a DRY violation on a fail-closed
+    path, with two places for the rule to rot. Re-point this one line when the
+    adapter is writable again.)
+    """
+
+    def __init__(self, instruments: Mapping[str, Instrument]) -> None:
+        # Copied, not aliased: a source that silently gained or lost markets
+        # after construction would make the once-at-`on_start` resolution a
+        # lie about what was actually read.
+        self._instruments: dict[str, Instrument] = dict(instruments)
+
+    def fee_coefficient_for(self, instrument_id: str) -> float:
+        """Return this market's `theta`, or raise. Never returns a default."""
+        instrument = self._instruments.get(instrument_id)
+        if instrument is None:
+            raise UnknownFeeScheduleError(
+                f"No Polymarket.us instrument held for {instrument_id!r}, so its fee "
+                "schedule is unknown. An unheld market is 'we do not know', never "
+                "'free' -- refusing rather than pricing a trade at zero.",
+            )
+        try:
+            return float(_fee_coefficient(instrument))
+        except FeeScheduleUnknownError as exc:
+            raise UnknownFeeScheduleError(
+                f"Refusing to price {instrument_id!r}: {exc}",
+            ) from exc
 
 
 @dataclass(frozen=True, slots=True)
@@ -623,6 +732,7 @@ def _build_strategy(
     kind: str,
     instrument_ids: tuple[InstrumentId, ...],
     forecast_source: ForecastSource | None,
+    fee_coefficients: FeeCoefficientSource | None = None,
     **config_overrides: Any,
 ) -> Strategy:
     """Build one strategy of `kind`. Every field but `instrument_ids` is a
@@ -635,14 +745,26 @@ def _build_strategy(
     structurally cannot accept a `ForecastSource`. It is mandatory for the
     three forecast-driven kinds; a `None` there is a caller bug, not a case
     to fabricate a forecast for.
+
+    `fee_coefficients` is mandatory for `cli_settlement_print_lock`, the one
+    strategy that nets its edge against the venue's own per-market fee rather
+    than a scalar. A `None` there is a caller bug too -- there is deliberately
+    no default coefficient anywhere in the system, because a default is how a
+    market whose schedule nobody read gets traded as though it were free.
     """
     if kind == "cli_settlement_print_lock":
+        if fee_coefficients is None:
+            raise ValueError(
+                f"strategy kind {kind!r} requires a fee_coefficients source, got None",
+            )
         return CliSettlementPrintLockStrategy(
             CliSettlementPrintLockConfig(
                 instrument_ids=instrument_ids,
                 stale_observation_hours=STALE_OBSERVATION_HOURS_CLI_SETTLEMENT_PRINT_LOCK,
+                slippage_prob=SLIPPAGE_PROB_CLI_SETTLEMENT_PRINT_LOCK,
                 **config_overrides,
             ),
+            fee_coefficients,
         )
     if kind == "running_extreme_lock":
         return RunningExtremeLockStrategy(
@@ -703,7 +825,11 @@ def _run_one(
         starting_balances=(Money(STARTING_BALANCE_USD, USD),),
     )
     strategy = _build_strategy(
-        strategy_kind, instrument_ids, forecast_source, **config_overrides,
+        strategy_kind,
+        instrument_ids,
+        forecast_source,
+        PolymarketUSFeeCoefficients({str(i.id): i for i in instruments}),
+        **config_overrides,
     )
 
     try:

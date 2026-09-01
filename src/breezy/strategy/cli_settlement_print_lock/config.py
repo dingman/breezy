@@ -45,6 +45,34 @@ Deviations from the brief's SUGGESTED field list, each deliberate:
   that gate off would be a switch whose only setting is "trade the measured-
   dead path". The gate is hard-coded in ``decision.py`` and pinned by
   ``test_a_preliminary_print_is_never_traded``.
+* No ``require_correction_flag_clear`` flag either, and for the IDENTICAL
+  reason. ``p_stable`` is measured first-final -> last-pre-settlement, so a
+  CORRECTION *is* the failure event being counted -- the 1 in 1821 that the
+  Wilson bound charges. A corrected record therefore sits OUTSIDE the
+  denominator entirely; trading one is not "the same edge with a caveat", it
+  is the complement of the measurement. The refusal is hard-coded in
+  ``decision.py`` and pinned by
+  ``test_the_correction_gate_cannot_be_turned_off_because_there_is_no_knob``.
+* No station field, allow-list or override. ``MEASURED_P_STABLE_WILSON_LOWER``
+  was measured on KNYC/KMIA/KMDW/KLAX/KSFO only, and the argument for using
+  the PER-STATION bound rather than the pooled one is that those five WFOs are
+  NOT exchangeable (revision rates 4.50%-13.96%). That argument refutes
+  extrapolation to an UNMEASURED sixth office far more strongly than it
+  refutes pooling across the five. A new city listing is a routine venue
+  event, not a code change, so the allow-list is hard-coded
+  (``decision.MEASURED_STATIONS``) and fails closed.
+* No total-cost scalar. ``transaction_cost_prob`` is DELETED, because the
+  dangerous configuration is a one-line edit of exactly that field: setting
+  it to the fee alone (0.0006) with a 0.005 floor admits ask 0.99, which
+  ``docs/evidence/bl19_edge_and_cost_decision_2026-09-01.md`` s8.2 computes as
+  **-0.003698** after one tick of slippage. The fee is a VENUE FACT resolved
+  per instrument by injection and is not configurable at all; ``slippage_prob``
+  is the only writable cost input, is REQUIRED, and is floored at the
+  instrument's own tick in ``strategy.on_start``. See
+  ``docs/plans/print_lock_adverse_selection_and_cost_2026-09-01.md`` s2.
+* No ``edge_qty_scale``. Sizing no longer depends on edge at all -- see
+  ``base_quantity`` below and the same plan's s1. The field is DELETED rather
+  than zeroed, because a zeroed knob is a knob that re-enables the defect.
 * No ``max_daily_trading_budget`` / ``max_notional_per_position``. Those two
   are operator-reserved and stay UNSET here, exactly as in every other
   weather strategy. Sizing is bounded by the payout-dollar caps below.
@@ -57,14 +85,30 @@ from typing import Final
 from nautilus_trader.model.identifiers import InstrumentId
 from nautilus_trader.trading.config import StrategyConfig
 
-from breezy.strategy.weather_common.risk import RiskLimits
+__all__ = ["MIN_EDGE_AFTER_COSTS_BL19", "CliSettlementPrintLockConfig"]
 
-__all__ = ["CliSettlementPrintLockConfig"]
-
-#: The INHERITED risk defaults, read once so the two BL-19 fields below can
-#: default to them by reference instead of by copied literal. See those
-#: fields for why that matters.
-_RISK_DEFAULTS: Final[RiskLimits] = RiskLimits()
+#: BL-19 s8.6's edge floor for this strategy, in probability units.
+#:
+#: ONE number, referenced twice, because ``min_model_edge`` and
+#: ``min_edge_after_costs`` are two spellings of ONE concept and must not
+#: drift apart. Derivation
+#: (``docs/evidence/bl19_edge_and_cost_decision_2026-09-01.md`` s8.2, at
+#: ``model_p`` = 0.996896 and ``theta`` = 0.06 with one tick of slippage):
+#: ask 0.98 clears at edge **+0.005720**, ask 0.99 fails at **-0.003698**. So
+#: 0.005 is the value that admits exactly the two ticks the evidence says are
+#: tradable, with a 6.1x cushion over the 0.3104% Wilson-implied failure rate.
+#:
+#: WHY ONE CONSTANT AND NOT TWO DEFAULTS. ``RiskManager.evaluate_order``
+#: re-applies ``abs(edge) < min_model_edge`` (``risk.py:421``) to the number
+#: the decision layer has ALREADY cost-netted. Setting one per BL-19 and
+#: leaving the other at the inherited 0.04 would make the decision layer emit
+#: signals the risk layer refuses 100% of the time as ``edge_below_minimum``
+#: -- and ``RefusalAlerter._conditions`` builds only a ``SHORTS_DISABLED``
+#: condition, so nothing would alert and the strategy would look like a market
+#: with no opportunities. ``CliSettlementPrintLockStrategy.__init__``
+#: additionally REFUSES any pair with ``min_model_edge >
+#: min_edge_after_costs``, so the invariant survives an override too.
+MIN_EDGE_AFTER_COSTS_BL19: Final[float] = 0.005
 
 
 class CliSettlementPrintLockConfig(StrategyConfig, frozen=True):
@@ -86,26 +130,41 @@ class CliSettlementPrintLockConfig(StrategyConfig, frozen=True):
         into the running system, so a future table revision that fell below
         the published kill line would stop the strategy instead of quietly
         trading a dead edge.
-    require_correction_flag_clear : bool
-        Refuse a record whose ``correction_flag`` is set (CCA/CCB or
-        correction text in the raw product). ``is_superseded`` is refused
-        unconditionally and is NOT governed by this flag.
+    slippage_prob : float
+        REQUIRED, no default. The execution half of the taker cost, in
+        probability units -- queue risk and quote-age drift, NOT the venue
+        fee, which is resolved per instrument from the market's own ``theta``.
+        UNMEASURED: 0.01 is a placeholder whose measurement obligation is
+        named in ``docs/evidence/bl19_edge_and_cost_decision_2026-09-01.md``
+        s8.5. Validated ``>= instrument.price_increment`` at ``on_start``,
+        which is where the per-instrument tick is known.
     use_tmax, use_tmin : bool
         Measure-class enables. See the module docstring.
-    base_quantity, max_quantity, edge_qty_scale : float
-        Position sizing: ``base_quantity + edge_qty_scale * edge``, clipped to
-        ``max_quantity``, to the visible ask depth, and floored to a whole
-        contract. Contract counts, not dollars -- the payout-dollar caps
-        below and ``RiskManager.evaluate_order`` do the dollar clipping, and
-        the two operator-reserved dollar controls stay unset.
+    base_quantity, max_quantity : float
+        Position sizing, CONSTANT-COST-BASIS: the clip is
+        ``floor(min(max_quantity, A / (ask + fee(ask)), visible_depth))``
+        where ``A = base_quantity * (a_max + fee(a_max))`` and ``a_max`` is the
+        worst ask the edge gate admits. ``base_quantity`` is therefore the
+        clip at the TIGHTEST admissible entry and ``A`` is the dollars that
+        clip already commits -- a DERIVED quantity, never a field, because a
+        dollar-denominated per-decision knob is one rename away from an
+        operator-reserved control. Size still rises as the contract gets
+        cheaper; what no longer rises is the money at risk. See
+        ``docs/plans/print_lock_adverse_selection_and_cost_2026-09-01.md`` s1.
+        The payout-dollar caps below and ``RiskManager.evaluate_order`` do the
+        remaining dollar clipping, and the two operator-reserved dollar
+        controls stay unset.
     max_position_contracts, max_event_notional, max_location_notional,
     max_simultaneous_positions, max_equity_fraction, min_model_edge,
     max_bid_ask_spread, min_liquidity_contracts, min_hours_to_settlement,
-    halt_hours_before_settlement, stale_quote_minutes, transaction_cost_prob,
+    halt_hours_before_settlement, stale_quote_minutes,
     allow_short : see ``breezy.strategy.weather_common.risk.RiskLimits``.
     min_edge_after_costs : float
-        The DECISION layer's own edge floor (the brief's pass-through
-        intent). ``RiskManager`` independently enforces ``min_model_edge``.
+        The DECISION layer's own edge floor. ``RiskManager`` independently
+        re-applies ``min_model_edge`` to the same cost-netted number, so the
+        two must satisfy ``min_model_edge <= min_edge_after_costs`` -- both
+        default to :data:`MIN_EDGE_AFTER_COSTS_BL19` and the strategy refuses
+        an inverted pair at construction.
     starting_equity : float
         Fallback equity for the equity-fraction risk check when the native
         account balance is unavailable.
@@ -118,18 +177,19 @@ class CliSettlementPrintLockConfig(StrategyConfig, frozen=True):
     instrument_ids: tuple[InstrumentId, ...]
     #: REQUIRED -- no default. See the module docstring.
     stale_observation_hours: float | None
+    #: REQUIRED -- no default. The ONLY writable cost input; the venue fee is
+    #: NOT configurable. Floored at the instrument's own tick in ``on_start``.
+    slippage_prob: float
 
     # Print-lock semantics.
     min_stable_prob: float = 0.97
-    require_correction_flag_clear: bool = True
     #: Measure-class ENABLES, not field selectors -- see the module docstring.
     use_tmax: bool = True
     use_tmin: bool = False
 
-    # Signal sizing.
+    # Signal sizing -- CONSTANT COST BASIS, never affine in edge.
     base_quantity: float = 25.0
     max_quantity: float = 150.0
-    edge_qty_scale: float = 400.0
 
     # Risk limits (breezy.strategy.weather_common.risk.RiskLimits).
     max_position_contracts: float = 250.0
@@ -137,20 +197,16 @@ class CliSettlementPrintLockConfig(StrategyConfig, frozen=True):
     max_location_notional: float = 2_000.0
     max_simultaneous_positions: int = 12
     max_equity_fraction: float = 0.08
-    # --- BL-19 -----------------------------------------------------------
-    # `min_model_edge` (0.04), `min_edge_after_costs` and
-    # `transaction_cost_prob` (0.015) are KNOWN to be mis-set for
-    # near-certain contracts: a bucket whose measured `p_stable` is 0.9994
-    # can only clear a 4c edge floor at an ask <= ~0.944, which is a price a
-    # settled-source contract has usually already left. The correct values
-    # are a SEPARATE decision in flight (BL-19); this strategy deliberately
-    # picks none. All three are plumbed as config that DEFAULTS to the
-    # inherited `RiskLimits` value by reference (`_RISK_DEFAULTS`), never as
-    # a copied literal, so when BL-19 lands it is a config/limits change at
-    # the call site rather than an edit to this strategy.
-    min_model_edge: float = _RISK_DEFAULTS.min_model_edge
-    min_edge_after_costs: float = _RISK_DEFAULTS.min_model_edge
-    transaction_cost_prob: float = _RISK_DEFAULTS.transaction_cost_prob
+    # --- BL-19, LANDED ---------------------------------------------------
+    # The inherited `RiskLimits` values (min_model_edge 0.04,
+    # transaction_cost_prob 0.015) are mis-set for near-certain contracts:
+    # together they demand ask <= 0.9419 on a bucket the model calls 99.69%
+    # certain, i.e. ask <= 0.94 on the grid -- a price a settled-source
+    # contract has already left. BL-19 s8.6 replaces them. Both floors now
+    # reference ONE constant so they cannot drift apart, and the total-cost
+    # scalar is GONE rather than retuned (see the module docstring).
+    min_model_edge: float = MIN_EDGE_AFTER_COSTS_BL19
+    min_edge_after_costs: float = MIN_EDGE_AFTER_COSTS_BL19
     # ---------------------------------------------------------------------
     max_bid_ask_spread: float = 0.06
     min_liquidity_contracts: float = 25.0

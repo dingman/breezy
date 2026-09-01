@@ -49,11 +49,62 @@ Unlike ``running_extreme_lock``'s margin-conditioned table, there is exactly
 ONE published figure here -- no per-margin conditioning of the FINAL print's
 stability has been measured. The distance from the printed value to the
 nearest bucket boundary is therefore carried as CONVICTION and metadata only,
-never smuggled into the probability: a print sitting on a boundary loses the
-bucket to a 1F correction, while a print in the middle survives one, and that
-is a real difference in exposure quality even though no measured probability
-yet distinguishes them. Inventing a margin-conditioned table for the final
-would be fabricating evidence.
+never smuggled into the probability, and never consumed by sizing.
+
+``conviction`` IS STRUCTURALLY 0.0 ON EVERY INTERIOR BUCKET. SAY SO.
+--------------------------------------------------------------------
+The venue's ladder interiors are TWO-DEGREE CLOSED intervals: slug
+``gte56lt57f`` decodes to ``[56, 57]``, because
+``adapters.polymarket_us.symbology.assert_bounds_cross_checked`` reads ``lt``
+as ``<= N`` *inside a range* (standalone it is ``<= N-1``). Every printed
+value inside such a bucket is therefore ON one of its two bounds, so
+``_boundary_margin_f`` -- ``min(printed - lower, upper - printed)`` -- is
+identically **0** for every interior print, and ``CONVICTION_FULL_MARGIN_F``
+is reachable ONLY in the open tails, where one bound is absent. There is no
+"middle" for an interior print to sit in. The field is retained (it is a
+required :class:`SignalDecision` field, and it is genuinely informative in the
+tails) but it is a CONSTANT ZERO on the buckets this strategy exists to buy,
+and nothing downstream may read it as a corroborating variable.
+
+Sizing deliberately does NOT consume it. Sizing UP on boundary margin would
+fabricate evidence: no measured margin-keyed table exists for the FINAL print
+(BL-19 s8.1(1)), and the omission is currently CONSERVATIVE -- conditioning on
+margin could only RAISE ``model_p``. Sizing DOWN at margin 0 is defensible but
+would be a second undermined knob for a hazard constant-cost-basis sizing
+already bounds, so it is a named follow-up, not this change.
+
+WHICH STATIONS THIS IS MEASURED ON (:data:`MEASURED_STATIONS`)
+---------------------------------------------------------------
+``p_stable`` was measured on FIVE stations and no others. The whole argument
+for shipping the PER-STATION bound rather than the pooled one is that those
+five WFOs are **not exchangeable** -- measured preliminary->final revision
+rates span 4.50% to 13.96%. That argument refutes extrapolation to an
+UNMEASURED sixth office far more strongly than it refutes pooling across the
+five, so a contract whose ``settlement_station`` is outside the measured set
+is REFUSED here, hard-coded exactly as the ``is_final`` gate is. A new city
+listing is a routine venue event, not a code change; fail closed.
+
+COST, AND WHY THERE IS NO TOTAL-COST SCALAR
+--------------------------------------------
+The edge is netted against ``fee(ask) + slippage_prob``, computed by
+``weather_common.costs``, never against a single configurable constant. The
+venue fee is ``theta * p * (1 - p)`` with ``theta`` a VENUE FACT riding on
+``contract.fee_coefficient``, resolved once per instrument at ``on_start``;
+``slippage_prob`` is the only writable term and is floored at one tick. A
+``None`` coefficient is a NO-TRADE, never a free trade. See
+``docs/plans/print_lock_adverse_selection_and_cost_2026-09-01.md`` s2.
+
+SIZING: CONSTANT DOLLAR COST BASIS, NEVER AFFINE IN EDGE
+---------------------------------------------------------
+The replaced rule was ``base_quantity + edge_qty_scale * edge``, which is
+strictly increasing in edge and therefore strictly increasing in how much the
+book DISAGREES with us -- committing $26.49 at ask 0.98 and ~$101 at ask 0.66,
+3.8x more money on the least-corroborated signal. For a long-only binary the
+loss when wrong is the premium paid, so the exposure question is cost basis,
+not contract count. The rule here holds that basis flat across the whole
+admitted band: a systematic mapping or resolution-timing fault can no longer
+escalate its own capital consumption by producing a larger apparent edge.
+Nothing the edge gate admits is refused by this -- only the size changes.
 
 EXECUTION
 ---------
@@ -82,10 +133,12 @@ one-sided-book branch. A book with no ASK is not tradable at all and returns
 
 RECORD-SHAPE GATES
 ------------------
-``correction_flag`` is refused under ``require_correction_flag_clear``
-(default ``True``); ``is_superseded`` is refused unconditionally -- a record
-that has been replaced is not evidence about anything, regardless of config.
-A record whose own ``published_at`` is in the future relative to the decision
+``correction_flag`` and ``is_superseded`` are BOTH refused unconditionally,
+with no config field for either. A corrected record sits outside the
+``p_stable`` denominator entirely -- the measurement is first-final -> last
+pre-settlement, so a correction IS the failure event being counted -- and a
+superseded record has been replaced and is not evidence about anything. A
+record whose own ``published_at`` is in the future relative to the decision
 clock has not happened yet and is refused as look-ahead.
 """
 
@@ -97,6 +150,7 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, Final
 
 from breezy.domain.weather_bucket_facts import Measure
+from breezy.strategy.weather_common.costs import trade_cost_prob, venue_fee_prob
 from breezy.strategy.weather_common.models import SideIntent, SignalDecision, ensure_aware
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
@@ -105,16 +159,45 @@ if TYPE_CHECKING:  # pragma: no cover - typing only
     from breezy.strategy.weather_common.bucket_contract import MispricingContract
     from breezy.strategy.weather_common.models import MarketQuote
 
-__all__ = ["CliPrintObservation", "evaluate_instrument"]
+__all__ = [
+    "MEASURED_STATIONS",
+    "CliPrintObservation",
+    "cost_basis_anchor",
+    "evaluate_instrument",
+    "worst_admissible_ask",
+]
+
+#: The stations ``p_stable`` was actually measured on, in the vocabulary
+#: ``WeatherBucketFacts.settlement_station`` carries -- the registry's
+#: ``cli_location`` (``src/breezy/registry/sites.toml``), which
+#: ``adapters.polymarket_us.parsing._weather_info`` writes into
+#: ``SETTLEMENT_STATION_KEY``. NOT the ICAO form the evidence documents quote
+#: (KNYC/KMIA/KMDW/KLAX/KSFO), which never reaches a contract.
+#:
+#: HARD-CODED, exactly as the ``is_final`` gate is, and for the same reason: a
+#: flag that could turn it off would be a switch whose only alternative
+#: setting trades an UNMEASURED station on a bound measured somewhere else.
+#: See the module docstring's "WHICH STATIONS" section.
+MEASURED_STATIONS: Final[frozenset[str]] = frozenset({"NYC", "MIA", "MDW", "LAX", "SFO"})
 
 #: Degrees of clearance from the nearest FINITE bucket boundary at which
 #: conviction reaches 1.0. Two degrees, because the printed value must move
 #: strictly PAST a boundary to leave the bucket: at margin 0 a single 1F
 #: correction loses the bucket, at margin 1 it takes two, and beyond that the
 #: distinction stops carrying information at the resolution NWS publishes
-#: (whole degrees F). Conviction only, never probability -- see the module
-#: docstring.
+#: (whole degrees F). Conviction only, never probability, and never sizing.
+#:
+#: REACHABLE ONLY IN THE OPEN TAILS. The venue's ladder interiors are
+#: two-degree CLOSED intervals (``gte56lt57f`` -> ``[56, 57]``), so every
+#: interior print sits ON a bound and its margin is 0. This threshold
+#: therefore describes a case that exists only where one bound is absent --
+#: see the module docstring's conviction section.
 CONVICTION_FULL_MARGIN_F: Final[int] = 2
+
+#: Guards the tick-grid floor against binary representation error: 0.98 / 0.01
+#: is 97.99999999999999 in IEEE-754, which would floor to 0.97 and quietly
+#: refuse the strategy's best entry.
+_TICK_EPSILON: Final[float] = 1e-9
 
 
 @dataclass(frozen=True, slots=True)
@@ -168,6 +251,14 @@ def _boundary_margin_f(facts: WeatherBucketFacts, printed_f: int) -> int:
     can revise "out of" a bound that does not exist), and at least one bound
     is always finite -- ``read_weather_bucket_facts`` refuses a bucket with
     neither.
+
+    IDENTICALLY 0 FOR EVERY INTERIOR PRINT on the venue's real ladder, whose
+    interiors are two-degree closed intervals: with ``upper == lower + 1``,
+    ``min(printed - lower, upper - printed)`` takes the minimum of a pair that
+    always contains a zero. The function is not wrong and is not dead -- it is
+    genuinely informative in the OPEN TAILS -- but any reader treating its
+    output as a per-bucket quality signal on an interior is reading a
+    constant. See the module docstring.
     """
     distances = [
         printed_f - facts.lower_f if facts.lower_f is not None else None,
@@ -175,6 +266,72 @@ def _boundary_margin_f(facts: WeatherBucketFacts, printed_f: int) -> int:
     ]
     finite = [d for d in distances if d is not None]
     return min(finite) if finite else 0
+
+
+def worst_admissible_ask(
+    *,
+    model_p: float,
+    fee_coefficient: float,
+    slippage_prob: float,
+    min_edge_after_costs: float,
+    tick_size: float | None,
+) -> float:
+    """The HIGHEST ask the edge gate admits, solved exactly, then put on the grid.
+
+    Solves ``model_p - a - theta*a*(1 - a) - slippage_prob = min_edge_after_costs``
+    for ``a``, i.e. the quadratic ``theta*a^2 - (1 + theta)*a + K = 0`` with
+    ``K = model_p - slippage_prob - min_edge_after_costs``, taking the smaller
+    root (the one in ``[0, 1]``). At the shipped constants -- ``model_p``
+    0.996896, ``theta`` 0.06, slippage 0.01, floor 0.005 -- that is
+    ``0.06 a^2 - 1.06 a + 0.981896 = 0`` -> **a = 0.98076408**, and 0.98 once
+    floored to a 0.01 tick.
+
+    ``tick_size=None`` returns the exact root, which is what the arithmetic
+    pin in the tests asserts. Every caller in the running system passes the
+    instrument's OWN increment: a finer tick moves the answer off 0.98 and the
+    anchor with it, which is the design self-correcting rather than a table
+    going stale.
+
+    The discriminant is never negative: ``(1 + theta)^2 - 4*theta*K`` with
+    ``K <= 1`` is at least ``(1 - theta)^2``.
+    """
+    remainder = model_p - slippage_prob - min_edge_after_costs
+    if fee_coefficient <= 0.0:
+        # Degenerate (and REAL -- a venue may publish theta = 0): the equation
+        # is linear, and the quadratic formula would divide by zero.
+        root = remainder
+    else:
+        b = 1.0 + fee_coefficient
+        root = (b - math.sqrt(b * b - 4.0 * fee_coefficient * remainder)) / (
+            2.0 * fee_coefficient
+        )
+    root = min(max(root, 0.0), 1.0)
+    if tick_size is None or tick_size <= 0.0:
+        return root
+    return math.floor(root / tick_size + _TICK_EPSILON) * tick_size
+
+
+def cost_basis_anchor(
+    *,
+    base_quantity: float,
+    worst_ask: float,
+    fee_coefficient: float,
+) -> float:
+    """``A = base_quantity * (a_max + fee(a_max))`` -- dollars, per decision.
+
+    NOT a new risk budget and deliberately NOT a config field: it is the cost
+    basis the shipped ``base_quantity`` ALREADY commits at the strategy's
+    tightest admissible entry, read back off values the config already holds.
+    Exposing it would create a dollar-denominated per-decision knob one rename
+    away from "maximum notional per position", which is operator-reserved. It
+    stays derived, in code, at the one call site
+    (``docs/plans/print_lock_adverse_selection_and_cost_2026-09-01.md`` s1.7).
+
+    At the shipped constants: ``25 * (0.98 + 0.001176)`` = **$24.5294**.
+    """
+    return base_quantity * (
+        worst_ask + venue_fee_prob(executable_price=worst_ask, fee_coefficient=fee_coefficient)
+    )
 
 
 def evaluate_instrument(
@@ -204,7 +361,17 @@ def evaluate_instrument(
         return None
     if observation.is_superseded:
         return None
-    if observation.correction_flag and cfg.require_correction_flag_clear:
+    if observation.correction_flag:
+        # UNCONDITIONAL, and hard-coded exactly as `is_final` is. A CCA/CCB
+        # correction is not "the same edge with a caveat": `p_stable` is
+        # measured first-final -> last-pre-settlement, so a correction IS the
+        # failure event the denominator counts. See `config.py` for the
+        # identical no-knob argument applied to `require_final_print`.
+        return None
+    if facts.settlement_station not in MEASURED_STATIONS:
+        # `p_stable` was measured on five stations whose own revision rates
+        # span 4.50%-13.96%, i.e. demonstrably NOT exchangeable. A sixth
+        # office has no bound at all. Fail closed -- module docstring.
         return None
 
     if not _measure_enabled(facts.measure, cfg):
@@ -239,28 +406,65 @@ def evaluate_instrument(
     if ask_p <= 0.0 or ask_p >= 1.0:
         return None
 
+    fee_coefficient = contract.fee_coefficient
+    if fee_coefficient is None:
+        # An unresolved fee schedule is a NO-TRADE, never a free trade
+        # (`adapters.polymarket_us.fees`: "a market whose coefficient we could
+        # not parse raises rather than trading free"). Unreachable through
+        # `strategy.py`, which raises `UnpricedInstrumentError` at `on_start`
+        # -- this is the independent-reuse guard, same posture as the
+        # degenerate-ask guard above.
+        return None
+
     # Edge against the ASK actually paid, never the midpoint -- every fill is
     # a taker (module docstring, and the brief's non-negotiable look-ahead /
-    # execution rules).
-    edge = model_p - ask_p - cfg.transaction_cost_prob
+    # execution rules). Cost is the venue's own concave fee PLUS the execution
+    # term, computed separately and never read from one configurable scalar.
+    fee_prob = venue_fee_prob(executable_price=ask_p, fee_coefficient=fee_coefficient)
+    cost = trade_cost_prob(
+        executable_price=ask_p,
+        fee_coefficient=fee_coefficient,
+        slippage_prob=cfg.slippage_prob,
+    )
+    edge = model_p - ask_p - cost
     if edge < cfg.min_edge_after_costs:
         return None
 
-    # Sizing: the largest WHOLE contract count this signal asks for, bounded
-    # by the visible ask depth so the price above is the price the whole
-    # order actually pays. Payout-dollar caps (`max_event_notional`,
-    # `max_location_notional`, `max_position_contracts`,
-    # `max_equity_fraction`, `max_simultaneous_positions`) and the two
-    # operator-reserved dollar controls are applied downstream by
-    # `RiskManager.evaluate_order`, which clips -- this module never reasons
-    # in current market value.
-    visible_depth = quote.ask_size or 0.0
-    quantity = math.floor(
-        min(cfg.max_quantity, cfg.base_quantity + cfg.edge_qty_scale * edge, visible_depth),
+    # Sizing: CONSTANT DOLLAR COST BASIS. The largest WHOLE contract count
+    # whose PREMIUM (`ask + fee(ask)` -- the entire downside of a long-only
+    # binary) stays within the anchor `A`, bounded by `max_quantity` and by
+    # the visible ask depth so the price above is the price the whole order
+    # actually pays. Never affine in `edge`: see the module docstring. Nothing
+    # the edge gate admitted above can be refused here, because
+    # `A / (ask + fee(ask)) >= base_quantity` for every `ask <= a_max`.
+    #
+    # Payout-dollar caps (`max_event_notional`, `max_location_notional`,
+    # `max_position_contracts`, `max_equity_fraction`,
+    # `max_simultaneous_positions`) and the two operator-reserved dollar
+    # controls are applied downstream by `RiskManager.evaluate_order`, which
+    # clips -- this module never reasons in current market value.
+    anchor = cost_basis_anchor(
+        base_quantity=cfg.base_quantity,
+        worst_ask=worst_admissible_ask(
+            model_p=model_p,
+            fee_coefficient=fee_coefficient,
+            slippage_prob=cfg.slippage_prob,
+            min_edge_after_costs=cfg.min_edge_after_costs,
+            tick_size=contract.tick_size,
+        ),
+        fee_coefficient=fee_coefficient,
     )
+    premium = ask_p + fee_prob
+    visible_depth = quote.ask_size or 0.0
+    quantity = math.floor(min(cfg.max_quantity, anchor / premium, visible_depth))
     if quantity < 1:
         return None
 
+    # STRUCTURALLY 0 on every interior bucket -- the venue's ladder interiors
+    # are two-degree CLOSED intervals, so every interior print sits ON a bound.
+    # Non-zero only in the open tails. Reported, never consumed by sizing; see
+    # the module docstring's conviction section for why sizing up on it would
+    # fabricate evidence.
     margin_f = _boundary_margin_f(facts, printed_f)
     return SignalDecision(
         instrument_id=contract.instrument_id,
@@ -277,5 +481,15 @@ def evaluate_instrument(
             "bucket_lower_f": facts.lower_f,
             "bucket_upper_f": facts.upper_f,
             "boundary_margin_f": margin_f,
+            # LOAD-BEARING, not decoration. With `market_probability` (the
+            # ask) and `model_probability` already on the record, these three
+            # make BL-19 s8.5's "computed edge at slippage_prob in {0.000,
+            # 0.010}" reconstructible OFFLINE from any recorded decision --
+            # so a measured slippage figure re-derives the threshold without
+            # re-running the capture. That is the whole point of keeping the
+            # two cost terms separate and named.
+            "fee_coefficient": fee_coefficient,
+            "fee_prob": fee_prob,
+            "slippage_prob": cfg.slippage_prob,
         },
     )

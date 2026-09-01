@@ -44,6 +44,16 @@ class MispricingContract:
     #: 1.0 for markets already priced in [0, 1]; overridable per-strategy via
     #: config for a cent-priced venue.
     price_scale: float = 1.0
+    #: The venue's per-market fee coefficient (``theta``), resolved ONCE at
+    #: ``on_start`` from a
+    #: :class:`breezy.strategy.weather_common.costs.FeeCoefficientSource`.
+    #: ``None`` means UNRESOLVED, and an unresolved schedule is a NO-TRADE,
+    #: never a free trade -- ``breezy.adapters.polymarket_us.fees`` raises
+    #: rather than trading free, and a strategy-side default would reintroduce
+    #: exactly the fallback the adapter refuses. Defaults ``None`` so the three
+    #: forecast strategies, which still use their own scalar
+    #: ``transaction_cost_prob``, are unaffected by this field.
+    fee_coefficient: float | None = None
     #: Payout dollars per contract at YES. Binary options here always pay 1.0.
     contract_size: float = 1.0
 
