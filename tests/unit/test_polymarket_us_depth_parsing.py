@@ -190,14 +190,106 @@ class TestDepth:
 
         assert batch.num_rows == 1
 
-    def test_an_empty_side_is_refused_rather_than_recorded_as_a_flat_book(
-        self, closed_book: dict[str, Any], open_instrument: BinaryOption
+    def test_empty_bids_with_populated_offers_records_the_ask_ladder(
+        self, open_book: dict[str, Any], open_instrument: BinaryOption
     ) -> None:
-        """A settled market has `bids: []`. Zero is not a price."""
-        with pytest.raises(VenuePayloadError):
-            parse_order_book_depth10(
-                closed_book, instrument=open_instrument, ts_init=TS_INIT
-            )
+        """A missing bid is a legitimate venue state, not a malformed payload.
+
+        Observation-lock strategies trade leftover asks on books whose bid
+        side is empty. Discarding the whole frame (including the ask ladder)
+        makes that state unrecordable.
+        """
+        two_sided = parse_order_book_depth10(
+            open_book, instrument=open_instrument, ts_init=TS_INIT
+        )
+        expected_asks = [order.price for order in two_sided.asks if order.size > 0]
+        expected_ask_sizes = [order.size for order in two_sided.asks if order.size > 0]
+
+        book = json.loads(json.dumps(open_book))
+        book["marketData"]["bids"] = []
+        depth = parse_order_book_depth10(book, instrument=open_instrument, ts_init=TS_INIT)
+
+        real_bids = [order for order in depth.bids if order.size > 0]
+        real_asks = [order for order in depth.asks if order.size > 0]
+        assert real_bids == []
+        assert [order.price for order in real_asks] == expected_asks
+        assert [order.size for order in real_asks] == expected_ask_sizes
+        assert len(depth.bids) == DEPTH10_LEVELS
+        assert all(order.size == 0 for order in depth.bids)
+        assert all(
+            order.price.precision == open_instrument.price_precision for order in depth.bids
+        )
+
+    def test_empty_offers_with_populated_bids_records_the_bid_ladder(
+        self, open_book: dict[str, Any], open_instrument: BinaryOption
+    ) -> None:
+        two_sided = parse_order_book_depth10(
+            open_book, instrument=open_instrument, ts_init=TS_INIT
+        )
+        expected_bids = [order.price for order in two_sided.bids if order.size > 0]
+        expected_bid_sizes = [order.size for order in two_sided.bids if order.size > 0]
+
+        book = json.loads(json.dumps(open_book))
+        book["marketData"]["offers"] = []
+        depth = parse_order_book_depth10(book, instrument=open_instrument, ts_init=TS_INIT)
+
+        real_bids = [order for order in depth.bids if order.size > 0]
+        real_asks = [order for order in depth.asks if order.size > 0]
+        assert real_asks == []
+        assert [order.price for order in real_bids] == expected_bids
+        assert [order.size for order in real_bids] == expected_bid_sizes
+        assert len(depth.asks) == DEPTH10_LEVELS
+        assert all(order.size == 0 for order in depth.asks)
+
+    def test_a_one_sided_book_round_trips_through_the_arrow_encoder(
+        self, open_book: dict[str, Any], open_instrument: BinaryOption
+    ) -> None:
+        from nautilus_trader.serialization.arrow.serializer import ArrowSerializer
+
+        book = json.loads(json.dumps(open_book))
+        book["marketData"]["bids"] = []
+        depth = parse_order_book_depth10(book, instrument=open_instrument, ts_init=TS_INIT)
+
+        batch = ArrowSerializer.serialize_batch([depth], data_cls=OrderBookDepth10)
+
+        assert batch.num_rows == 1
+
+    def test_a_malformed_level_on_a_one_sided_book_is_still_rejected(
+        self, open_book: dict[str, Any], open_instrument: BinaryOption
+    ) -> None:
+        """Allowing an empty side must not loosen per-level validation."""
+        book = json.loads(json.dumps(open_book))
+        book["marketData"]["bids"] = []
+        book["marketData"]["offers"][0]["px"]["value"] = "1.50"
+        with pytest.raises(VenuePayloadError, match="outside the binary-option range"):
+            parse_order_book_depth10(book, instrument=open_instrument, ts_init=TS_INIT)
+
+    def test_a_one_sided_book_is_not_treated_as_crossed(
+        self, open_book: dict[str, Any], open_instrument: BinaryOption
+    ) -> None:
+        """The crossed-book check must not IndexError when a side is empty."""
+        book = json.loads(json.dumps(open_book))
+        book["marketData"]["bids"] = []
+        depth = parse_order_book_depth10(book, instrument=open_instrument, ts_init=TS_INIT)
+        assert any(order.size > 0 for order in depth.asks)
+
+    def test_a_fully_empty_book_is_refused_rather_than_recorded_as_a_flat_book(
+        self, open_book: dict[str, Any], open_instrument: BinaryOption
+    ) -> None:
+        """A fully empty book is still not a price.
+
+        The settled capture has ``bids: []`` and ``offers: []``. Padding both
+        sides with zero would record a flat book the venue did not send. A
+        *one-sided* book (empty bids, populated offers, or the reverse) is
+        the legitimate live state and is tested separately. This case is
+        both sides empty, with a matching instrument slug so the refusal is
+        the empty book, not a slug mismatch.
+        """
+        book = json.loads(json.dumps(open_book))
+        book["marketData"]["bids"] = []
+        book["marketData"]["offers"] = []
+        with pytest.raises(VenuePayloadError, match="no populated side"):
+            parse_order_book_depth10(book, instrument=open_instrument, ts_init=TS_INIT)
 
     def test_a_crossed_book_is_refused(
         self, open_book: dict[str, Any], open_instrument: BinaryOption

@@ -6,16 +6,11 @@ evidence summaries do not live here. They live in git history,
 
 ## Maintenance contract (BINDING, enforced)
 
-- **Hard budget: 250 lines / 12 KB**, enforced by
-  `.claude/hooks/progress-size-gate.sh` (`PostToolUse`). Consolidate when it
-  blocks; never raise the budget.
-- **An item leaves this file when it closes** — delete it, don't rewrite it as
-  a `[CLOSED]` narrative. The commit is the record.
-- **Never restate evidence** (link `docs/evidence/`) **or a durable rule**
-  (that is `docs/core/LESSONS.md`).
-- **Severity tags mark OPEN items only.**
-
-Rationale: L-5. Pre-shrink copy in `docs/core/archive/`.
+Hard budget **250 lines / 12 KB** (`.claude/hooks/progress-size-gate.sh`);
+consolidate when it blocks, never raise it. An item LEAVES this file when it
+closes — the commit is the record. Never restate evidence (link
+`docs/evidence/`) or durable rules (`docs/core/LESSONS.md`). Severity tags mark
+OPEN items only. Rationale L-5; pre-shrink copy in `docs/core/archive/`.
 
 ---
 
@@ -29,104 +24,124 @@ decision is delegated to the build side:
 
 **Values are not yet supplied and MUST be obtained before any live enablement.**
 
-Two consequences that are not optional:
+Two consequences that are not optional (tracked by P4):
 
-- **The daily-budget control has no home.** `RiskLimits`
-  (`strategy/weather_common/risk.py:47-62`) has no time dimension at all.
-  Nothing enforces a daily notional or loss ceiling.
+- **The daily-budget control has no home.** `RiskLimits` (`risk.py:47-62`) has
+  no time dimension; nothing enforces a daily notional or loss ceiling.
 - **The per-position knob silently detunes the rest.** `max_event_notional`
-  (1000) and `max_location_notional` (2000) are absolute dollars; only
-  `max_equity_fraction` scales with equity. No portfolio-wide cap
-  (`max_total_notional`) exists.
+  (1000) / `max_location_notional` (2000) are absolute dollars; only
+  `max_equity_fraction` scales. No portfolio-wide `max_total_notional` exists.
 
 ---
 
 ## Standing verdicts that gate future work
 
+- **Backtest ROI base: BL-17 resolved, not a code bug.** The `...T174940`
+  report came from a script inode that no longer exists; all 12 others base on
+  $10,000. Real-provenance ROI is **-0.054%**, not -5.41%.
+  `docs/evidence/backtest_roi_measurement_2026-08-31.md`.
+
 - **G-02 — ROI feasibility: NO-GO** on committing to the downstream adapter /
   settlement / execution build (~$3–15/day net per 100 contracts per city-day).
   Free falsification and tape capture stay in scope.
   `docs/evidence/roi_feasibility_2026-08-26.md`.
-- **G-01 — Prelim→final revision study: SUPERSEDED 2026-08-31 → POWERED, FAIL.**
-  The N=44 UNDERPOWERED run used the live catalog only (`Archive data used: no`).
-  Re-run against the held AFOS archive (N≈1820/site) under the SAME pre-registered
-  rule: LAX/MIA PASS; **MDW 13.96%, NYC 11.79%, SFO 4.50% FAIL** Wilson-upper≤0.05.
-  A stronger constraint, not a release. **Interior-bucket strategies are dead on
-  MDW/NYC/SFO** (they need exact equality). Open-tail paths are unaffected: 97% of
-  revisions are UPWARD, downward rate 0.21%.
+- **G-01 — Prelim→final revision: POWERED, FAIL** (superseded the N=44 run).
+  AFOS archive N≈1820/site, same pre-registered rule: LAX/MIA PASS; **MDW 13.96%,
+  NYC 11.79%, SFO 4.50% FAIL** Wilson-upper≤0.05. **Interior-bucket strategies
+  are dead on MDW/NYC/SFO** (they need exact equality). Open tails unaffected:
+  97% of revisions UPWARD, downward rate 0.21%.
   `docs/evidence/observation_lock_falsification_2026-08-31.md`.
 - **Historical forecasts are NOT proven unavailable.** `CLI_BACKFILL_PLAN.md:46`
   claims otherwise from *repo state*, not availability. Open-Meteo
   `/v1/previous-runs` was deferred, never rejected. Still unverified.
 - **Price history genuinely is forward-only.** No public trade tape; expired
   markets return null prices keeping only `settlementPx`.
-- **There is no NO-side instrument, and there cannot be one** (BL-6, closed
-  2026-08-31). NO is a side of the SAME book, not a second market;
-  `parsing.py:_market_sides` refuses any side whose `identifier != slug`.
+- **There is no NO-side instrument, and there cannot be one** (BL-6). NO is a
+  side of the SAME book; `parsing.py:_market_sides` refuses any side whose
+  `identifier != slug`. **P5 rescoped** to "support `outcomeSide` / price
+  inversion on the same instrument".
   `docs/evidence/no_side_instrument_probe_2026-08-31.md`.
-  **P5 is rescoped** from "add NO-side instrument support" to "support
-  `outcomeSide` / price inversion on the same instrument" — smaller, different
-  work. Live acceptance of `outcomeSide=NO` stays the operator-gated probe.
 - **The stale-quote gate is wired but unreachable for two of three strategies.**
-  `evaluate_order` refuses `shorts_disabled` BEFORE it calls `quote_tradable`
-  (`risk.py:296-306`). `calibration_mean_reversion` and `forecast_revision`
-  emit only shorts, so their orders die at the earlier gate. BL-1's fix is
-  therefore proven by unit test, NOT by the backtest: the post-change re-run
-  shows zero `stale_quote` refusals and an unchanged fill count (24 -> 24, all
-  `forecast_mispricing`). The gate goes live for the other two only once shorts
-  are expressible.
+  `evaluate_order` refuses `shorts_disabled` before calling `quote_tradable`
+  (`risk.py:296-306`), and two strategies emit only shorts. BL-1's fix is proven
+  by unit test, NOT by backtest (fills unchanged 24 -> 24, all
+  `forecast_mispricing`). Live only once shorts are expressible.
 - **The `naive`/`realistic` conditions are NOT redundant** (BL-4, reversed
-  2026-08-31). Making refusals visible falsified the byte-identical claim:
-  `forecast_revision` naive refuses nothing; realistic refuses 860
+  2026-08-31). `forecast_revision` naive refuses nothing; realistic refuses 860
   `shorts_disabled`. "Never signalled" is not "signalled 860 times, all
-  refused." Both conditions stay; the collapse was withdrawn.
+  refused." Both stay.
 
 ---
 
 ## BACKLOG — observation-lock strategies (opened 2026-08-31)
 
 Evidence: `docs/evidence/observation_lock_falsification_2026-08-31.md`.
-Landed this batch: shared-risk `SignalFreshness` contract (observation-kind
-orders gate on `RiskLimits.stale_observation_hours`, unset ⇒ refuse);
-`SharedExposureMixin` + harness guard closing the silent private-exposure-view
-gap; `running_extreme_lock` v1 (open-tail only, margin-conditioned model_p).
+
+### [CRITICAL] BL-20 — strategies read a synthetic 0.00 as a real price
+
+(BL-18, the one-sided-book parser refusal, is fixed — the commit is the record.)
+
+`OrderBookDepth10` pads an empty side with ten `Price(0)/Quantity(0)` levels, so
+the pad sits at index 0. `RestingLadder._best` skips `size == 0`;
+`ForecastHighEdgeBuyer._best_ask`, `running_extreme_lock`'s top-of-book copy,
+`forecast_mispricing`, `calibration_mean_reversion` and `forecast_revision` do
+NOT — a one-sided snapshot reads as bid=0 / mid=ask/2. Native `to_quote_tick()`
+shares the flaw; do not quote from it.
+
+**Do not backtest or trade off one-sided Depth10 until every consumer skips
+`size == 0` and passes `None` for a missing side.** Blocks Gate 0A's
+interpretation, not its capture.
+
+### [HIGH] BL-19 — shipped config refuses `running_extreme_lock`'s whole region
+
+`min_model_edge=0.04` (`risk.py:100`, `config.py:113`, gated `risk.py:411`): at
+p_model 0.9968 an ask of 0.970 gives edge 0.0268 < 0.04 -> refused; needs ask
+<= ~0.957. `transaction_cost_prob=0.015` (`risk.py:116`) is ~25x the true fee at
+p=0.99 (~0.0002; fee is `theta*C*p*(1-p)`, concave, max at p=0.50, so near-
+certain contracts are nearly free). Break-even ask at margin 0 is 0.99663.
+Decide these deliberately or a null capture reads as a dead market. Tick is
+0.01, so 0.995 is not a real price.
 
 ### [HIGH] BL-11 — `stale_observation_hours` has no shipped value
 
-Derived recommendation is **12.665h** (max-over-sites P99 issuance gap, MIA
-12.3167h, + live receipt P99 0.3488h). NOT the pooled P99 (12.52h): MIA's own P99
-exceeds the pooled figure, so a pooled bound spuriously refuses MIA's slowest ~1%
-of legitimate days. No shipped config declares it (a test pins that). Observed MAX
-gap is 18.80h, so any P99 bound fires on rare legitimate days — decide whether
-that is acceptable before live enablement.
+Derived recommendation **12.665h** = max-over-sites P99 issuance gap (MIA
+12.3167h) + live receipt P99 0.3488h. NOT the pooled P99 (12.52h): MIA's own
+P99 exceeds it, so a pooled bound spuriously refuses MIA's slowest ~1% of
+legitimate days. Observed MAX gap 18.80h, so any P99 bound fires on rare
+legitimate days — accept that before live enablement.
 
-### [HIGH] BL-12 — observation strategies cannot be backtested
+### [MED] BL-12 — CORRECTED: the seam exists; the gap is one dispatch branch
 
-`scripts/analysis/run_weather_strategy_backtests.py` is forecast-plumbing
-end-to-end (`ForecastSource` injection, `published_at`-offset sweep). An
-observation-only strategy has nothing of that shape to plug into, and faking a
-forecast is forbidden. `running_extreme_lock` is therefore unit-tested but has
-NO backtest run. Needs an observation-shaped harness path.
+Earlier text ("cannot be backtested") was overstated. `backtest_harness.py:792`
+already calls `engine.add_data(weather_data, client_id=NWS_BACKTEST_CLIENT_ID)`
+generically and `running_extreme_lock/strategy.py:269` is already subscribed.
+Whole gap: `_build_strategy` (`run_weather_strategy_backtests.py:564-590`) has
+branches for only the three forecast strategies and takes `forecast_source` as
+a MANDATORY positional the observation strategy cannot accept. Add a branch,
+make the param optional. An ECONOMIC result is blocked by BL-18, not by shape.
 
 ### [MED] BL-13 — `cli_settlement_print_lock` not implemented
 
-Both pre-registered gates PASS on archive data (p_stable 99.989% N=9106;
-halt-window 98.66% N=9164). Blocked only on BL-12 for economic confirmation.
+Both pre-registered gates PASS on archive (p_stable 99.989% N=9106; halt-window
+98.66% N=9164). Economic confirmation blocked on BL-18.
 `lagged_anomaly_tail` stays build-order 3, unstarted.
 
 ### [MED] BL-14 — `RefusalAlerter` alerts on `SHORTS_DISABLED` only
 
 `refusals.py:134-151` hardcodes one condition, so a run refused entirely for
-`stale_observation` / `observation_limit_unset` counts but never alerts in live.
-Mitigated for now by the construction-time raise in `running_extreme_lock`;
-generalise `_conditions` over the counted key set.
+`stale_observation` / `observation_limit_unset` never alerts in live.
+Generalise `_conditions` over the counted key set.
 
 ### [MED] BL-15 — `stale_forecast` fails open on a negative age (BL-9 class)
 
-`risk.py` checks only `>`. A negative age makes a signal look infinitely fresh.
-`quote_tradable` already has the `future_quote` guard for exactly this
-(`risk.py:278-279`). Deliberately deferred from the freshness change because it
-is a behavior change on the forecast path; needs its own `future_signal` reason.
+`risk.py` checks only `>`; a negative age looks infinitely fresh.
+`quote_tradable` already guards this (`risk.py:278-279`). Needs its own
+`future_signal` reason.
+
+### [MED] BL-16 — `settlement_halt` is dead code; the 1.0h halt never fires
+
+`risk.py:395-398` checks halt (1.0h) before `min_hours_to_settlement` (2.0h); a
+decreasing clock always crosses 2.0 first. Decide if the two knobs are one.
 
 ---
 
@@ -152,9 +167,8 @@ see it: for this one strategy a stale or wide-spread quote is still silently
 unrecorded. Predates BL-8; found while fixing it.
 
 **Acceptance:** decide whether a pre-signal quote refusal is a gag or ordinary
-market conditions (BL-8 drew that line at "the strategy formed an order" — say
-whether this sits on the same side), then either count it under the same
-bounded key set or document why it must not be counted.
+market conditions (BL-8 drew that line at "the strategy formed an order"), then
+either count it under the same bounded key set or document why not.
 
 ---
 
@@ -184,11 +198,10 @@ bounded key set or document why it must not be counted.
   stream. Three CRITICALs open: reconnect gives up then runs forever doing
   nothing; unclean shutdown silently voids a whole daily feather file; the
   `websocket.py`/`factories.py` pool rewrite is uncommitted.
-- **P2** — two read-only probes: Open-Meteo `/v1/previous-runs`
-  availability/depth, and whether IEM AFOS serves a forecast PIL.
-- **P3** — forecast ingestion, scoped by whichever P2 branch wins. Breezy
-  currently ingests **no forecast data at all**; every backtest forecast is
-  synthetic.
+- **P2/P3** — forecast probes (Open-Meteo `/v1/previous-runs`; IEM AFOS forecast
+  PIL) then forecast ingestion. Breezy ingests **no forecast data at all**, so
+  every forecast-strategy ROI is inadmissible until P3 lands. DEPRIORITISED:
+  the observation family needs no forecast and is the route to the stop gate.
 - **P4** — daily-budget gate and portfolio-wide cap (see operator contract).
   BL-3 is the first increment.
 - **P6** — wire boundary-conditional preliminary-revision cost into sizing;
@@ -196,14 +209,22 @@ bounded key set or document why it must not be counted.
 
 ### Blocked, with unlock condition
 
+**Venue access is NO LONGER GATED** (operator, 2026-09-01). G-12/G-13/G-15 are
+released; the remaining blockers are technical, not permission.
+
+G-12 (resolve `MARKET_SLUG_KEY` live) and G-15 (fee schedule discovery) are now
+plain work items, no longer blocked. Still blocked:
+
 | ID | Item | Unlock |
 |---|---|---|
-| G-12 | Resolve `MARKET_SLUG_KEY` against the live venue | operator-gated venue access |
-| G-13 | Gating live run of the recorder | operator-gated venue access |
-| G-14 | Start continuous capture under systemd | G-13 |
-| G-15 | Fee schedule discovery | operator-gated venue access |
-| G-16 | Accumulate ≥14 days of joined tape | calendar: 14 days after G-14 |
-| G-17 | Phase 1.5 premise falsification GO/NO-GO | G-16. **NO-GO stops the programme.** |
+| G-14 | Continuous capture under systemd | P1 recorder CRITICALs |
+| G-16 | ≥14 days of joined tape | calendar: 14 days after G-14 |
+| G-17 | Phase 1.5 premise GO/NO-GO | G-16. **NO-GO stops the programme.** |
+
+**Immediate path to the ROI stop gate** (`docs/specs/CAPTURE_SPEC_OBSERVATION_GATE0.md`):
+BL-18 parser fix -> Gate 0A screening capture (3 station-days, 19:00-01:00Z,
+five UPPER-tail slugs, pre-registered kill at median ask >= 0.99663) -> P1
+recorder hardening -> Gate 0B (>=14 station-days) -> observation backtest.
 
 ---
 

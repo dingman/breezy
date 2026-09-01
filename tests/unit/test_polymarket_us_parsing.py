@@ -590,6 +590,30 @@ def test_an_empty_book_is_rejected_loudly(closed_book: dict[str, Any]) -> None:
         parse_book_top(closed_book)
 
 
+def test_a_one_sided_book_is_rejected_without_inventing_a_bid(
+    open_book: dict[str, Any],
+) -> None:
+    """``QuoteTick`` is two-sided. An empty bid is a real venue state but not a quote.
+
+    Inventing a bid of 0 (or any other price) would fabricate a top of book
+    the venue did not send. Depth capture records the populated side via
+    ``parse_order_book_depth10``; this path must still refuse.
+    """
+    book = json.loads(json.dumps(open_book))
+    book["marketData"]["bids"] = []
+    with pytest.raises(VenuePayloadError, match="empty"):
+        parse_book_top(book)
+
+
+def test_a_one_sided_book_is_rejected_without_inventing_an_ask(
+    open_book: dict[str, Any],
+) -> None:
+    book = json.loads(json.dumps(open_book))
+    book["marketData"]["offers"] = []
+    with pytest.raises(VenuePayloadError, match="empty"):
+        parse_book_top(book)
+
+
 def test_a_crossed_book_is_rejected(open_book: dict[str, Any]) -> None:
     open_book["marketData"]["offers"][0]["px"]["value"] = "0.4000"
     with pytest.raises(VenuePayloadError, match="crossed"):

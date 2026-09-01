@@ -514,19 +514,16 @@ def _parse_fee_coefficient(market: Mapping[str, Any]) -> tuple[Decimal | None, s
 def _parse_levels(levels: object, *, side: str) -> list[tuple[Decimal, Decimal]]:
     """Validate and return EVERY level of one book side, in venue order.
 
-    Previously this function range-checked all levels and then returned a
-    single ``min()``/``max()``. Every level below the top was validated and
-    discarded, which made slippage-at-size unmeasurable from the recorded tape
-    -- see ``tests/unit/test_polymarket_us_depth_parsing.py`` for why that
-    biases the Phase 1.5 gate. The validation is unchanged; only the discarding
-    is gone.
+    An empty JSON array is a valid parsed side: a missing bid or offer is a
+    legitimate venue state on thin weather markets, not a malformed payload.
+    Per-level checks (type, binary price range, positive size) are unchanged.
+    Callers that need a two-sided quote must require a populated side
+    themselves -- see ``_require_best_level``.
     """
     if not isinstance(levels, Sequence) or isinstance(levels, (str, bytes)):
         raise VenuePayloadError(
             f"Book side {side!r} must be a JSON array, got {type(levels).__name__}"
         )
-    if not levels:
-        raise VenuePayloadError(f"Book side {side!r} is empty; there is no top of book to quote")
     parsed: list[tuple[Decimal, Decimal]] = []
     for index, level in enumerate(levels):
         if not isinstance(level, Mapping):
@@ -552,8 +549,17 @@ def _parse_levels(levels: object, *, side: str) -> list[tuple[Decimal, Decimal]]
     return parsed
 
 
-def _best_level(levels: object, *, side: str, want_lowest: bool) -> tuple[Decimal, Decimal]:
+def _require_best_level(levels: object, *, side: str, want_lowest: bool) -> tuple[Decimal, Decimal]:
+    """Return the best ``(price, size)`` of one side, or refuse an empty side.
+
+    ``QuoteTick`` is a two-sided quote. Inventing a bid (or ask) of 0 -- or
+    any other price -- would fabricate a top of book the venue did not send.
+    Empty is therefore an error here, not a default. Depth capture uses
+    ``parse_book_levels``, which records the populated side instead.
+    """
     parsed = _parse_levels(levels, side=side)
+    if not parsed:
+        raise VenuePayloadError(f"Book side {side!r} is empty; there is no top of book to quote")
     return min(parsed) if want_lowest else max(parsed)
 
 
@@ -566,13 +572,20 @@ def parse_book_levels(
     a slippage walk (level ``n`` is the ``n``-th best), and a venue that stops
     sorting a side would otherwise produce a silently wrong slippage estimate
     from a tape that looks perfectly well formed.
+
+    A one-sided book (empty bids or empty offers, but not both) is returned
+    as-is: the populated side is the recordable market state. A fully empty
+    book is still refused -- padding both sides with zero is not a price.
+    The crossed-book check runs only when both sides are populated.
     """
     market_data = _require_mapping(payload, "marketData", context="order book payload")
     bids = _parse_levels(_require(market_data, "bids", error=VenuePayloadError), side="bids")
     asks = _parse_levels(_require(market_data, "offers", error=VenuePayloadError), side="offers")
     bids.sort(key=lambda level: level[0], reverse=True)
     asks.sort(key=lambda level: level[0])
-    if bids[0][0] > asks[0][0]:
+    if not bids and not asks:
+        raise VenuePayloadError("Order book has no populated side; there is nothing to record")
+    if bids and asks and bids[0][0] > asks[0][0]:
         raise VenuePayloadError(
             f"Order book is crossed: best bid {bids[0][0]} exceeds best offer {asks[0][0]}"
         )
@@ -590,12 +603,16 @@ def parse_book_top(payload: Mapping[str, Any]) -> tuple[Decimal, Decimal, Decima
 
     The best level is selected by price rather than by array position, so a
     venue that stops sorting a side cannot silently produce a wrong top of book.
+
+    A one-sided book cannot form this return value: there is no bid (or no
+    ask) to quote. This function refuses rather than inventing a price. Depth
+    capture uses ``parse_book_levels``, which records the populated side.
     """
     market_data = _require_mapping(payload, "marketData", context="order book payload")
-    bid_price, bid_size = _best_level(
+    bid_price, bid_size = _require_best_level(
         _require(market_data, "bids", error=VenuePayloadError), side="bids", want_lowest=False
     )
-    ask_price, ask_size = _best_level(
+    ask_price, ask_size = _require_best_level(
         _require(market_data, "offers", error=VenuePayloadError), side="offers", want_lowest=True
     )
     if bid_price > ask_price:
@@ -659,10 +676,13 @@ def parse_order_book_depth10(
     **Why the native type and not a custom one.** ``OrderBookDepth10`` is
     Arrow-registered (``serialization/arrow/serializer.py``), is a
     per-instrument table in ``StreamingFeatherWriter``
-    (``persistence/writer.py:137-147``), partitions natively into
-    ``data/order_book_depths/<instrument_id>/``, and carries ``to_quote_tick()``
-    for free. Measured end to end before this function was written. A custom
-    depth type would have reimplemented all of that.
+    (``persistence/writer.py:137-147``), and partitions natively into
+    ``data/order_book_depths/<instrument_id>/``. Measured end to end before
+    this function was written. A custom depth type would have reimplemented
+    all of that. Do not quote from ``to_quote_tick()``: on a one-sided book
+    that native helper reads the size-0 pad as a 0 price. Two-sided quotes
+    stay on ``parse_quote_tick`` / ``parse_book_top``; depth consumers must
+    skip ``size == 0``.
 
     **Truncation is real and is the price of the native carrier.** The
     committed capture ``book_open_510636.json`` has **12 bid levels and 14 offer

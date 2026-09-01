@@ -265,10 +265,12 @@ class TestMarketDataFrameFanOut:
     ) -> None:
         """A book that stops being quotable must be visible, not silent.
 
-        It is deliberately NOT a "dropped frame": the frame still carried the
-        venue's state and mark price, and those are kept. The distinct counter
-        is what lets an operator see a tape that has quietly stopped carrying
-        prices while still looking busy.
+        ``QuoteTick`` is two-sided, so an empty bid cannot form a quote and
+        the failure is counted. It is deliberately NOT a "dropped frame":
+        the frame still carried the ask ladder, the venue's state, and the
+        mark price, and those are kept. The distinct counter is what lets
+        an operator see a tape that has quietly stopped carrying two-sided
+        quotes while still looking busy.
         """
         from nautilus_trader.model.data import InstrumentStatus
 
@@ -278,7 +280,10 @@ class TestMarketDataFrameFanOut:
         harness.feed.deliver(frame)
 
         assert harness.of(QuoteTick) == []
-        assert harness.of(OrderBookDepth10) == []
+        depths = harness.of(OrderBookDepth10)
+        assert len(depths) == 1
+        assert [order for order in depths[0].bids if order.size > 0] == []
+        assert [order for order in depths[0].asks if order.size > 0]
         assert harness.client.quote_parse_failures == 1
         assert harness.client.dropped_frames == 0
         assert len(harness.of(InstrumentStatus)) == 1
