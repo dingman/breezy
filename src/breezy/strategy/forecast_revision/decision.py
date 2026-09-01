@@ -58,7 +58,7 @@ Correctness therefore REQUIRES a polling cadence strictly finer than BOTH the
 real forecast-issuance interval and ``reaction_window_minutes``. The durable
 fix is a ``ForecastSource`` that can return every publication since the last
 poll; that is plan increment I-6 (see
-``docs/plans/FORECAST_INGESTION_PLAN.md``), not a change to the Protocol here,
+``docs/plans/archive/FORECAST_INGESTION_PLAN.md``), not a change to the Protocol here,
 and the strategy is degraded until it lands. The behaviour is pinned by
 ``test_a_publication_missed_between_polls_is_merged_not_scored``.
 

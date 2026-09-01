@@ -7,7 +7,7 @@ settlement extreme, this strategy buys YES, taker, on the ONE ladder bucket
 containing that value -- usually an INTERIOR bucket, which is the point. See
 ``decision.py`` for the full edge hypothesis, why an interior bucket is sound
 after the final and dead after a preliminary, and the record-shape gates. See
-``docs/strategies/breezy_strategy_cli_settlement_print_lock.md`` for the design
+``docs/strategies/archive/breezy_strategy_cli_settlement_print_lock.md`` for the design
 brief this implements.
 
 WHY THIS STRATEGY REQUIRES AN EXPLICIT stale_observation_hours

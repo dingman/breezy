@@ -1,7 +1,7 @@
 """The preserved trading decision: a same-day running extreme, already inside
 the open-ended tail, versus the live ask.
 
-Edge hypothesis (see ``docs/strategies/breezy_strategy_running_extreme_lock.md``):
+Edge hypothesis (see ``docs/strategies/archive/breezy_strategy_running_extreme_lock.md``):
 once the official running high ``H`` for a station/climate-day is already
 ``>=`` the lower bound of an open-ended "X or above" contract, that contract
 can only settle YES unless the observation is later revised down across the

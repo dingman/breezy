@@ -1,3 +1,10 @@
+> **STATUS 2026-09-01 — DESIGN ONLY, NOT IMPLEMENTED, NOT GATED IN.** No
+> `src/breezy/strategy/lagged_anomaly_tail/` package exists. This design has
+> not passed any economic gate: it has no entry in `docs/evidence/` and is not
+> scheduled in `docs/plans/EXEC_SPINE_2026-09-01.md`. Before implementing,
+> confirm its executable path is expressible as BUYING YES only —
+> `allow_short=False` is permanent and refuses SHORT_YES before any quote check.
+
 # Breezy / Nautilus Strategy Handoff
 ## `lagged_anomaly_tail`
 

@@ -9,9 +9,15 @@ them.
 
 ## G-12 — Resolve `MARKET_SLUG_KEY` against the live venue
 
-**Unlock:** operator opens the three-lock credential gate
-(`BREEZY_VENUE_LIVE=1` AND `BREEZY_ALLOW_CREDENTIALED_PYTEST=1` AND
-`--venue-live`), which requires D1 (KYC).
+**Unlock:** ~~operator opens the three-lock credential gate~~ — **CORRECTED
+2026-09-01: this gate is already open and is NOT the blocker.** Credentials are
+present (`~/.config/breezy/polymarket.env`: `POLYMARKET_US_KEY_ID`,
+`POLYMARKET_US_SECRET_KEY_FILE`), D1/KYC is satisfied, and the gate has been
+opened for **four** read-only smoke runs (one 2026-08-25, three 2026-08-30).
+The real blocker is that **all four returned `Connectivity verdict: FAIL`** —
+authenticated connectivity was never proven, so zero venue payload was
+captured. Unlock is therefore *diagnose and fix authenticated connectivity*,
+which needs no further operator action.
 
 **Why it matters more than it looks.** `MARKET_SLUG_KEY = "marketSlug"` is an
 unresolved venue guess, and every routing decision in the recorder rests on it.
@@ -34,9 +40,17 @@ against `.invalid` hosts prove nothing about the live venue.
 
 **Unlock:** same three-lock gate; depends on G-12.
 
-**Current state, verbatim from PROGRESS.md:** "**No live run has happened.**
-Zero authenticated calls, zero live-network verification; every venue host in
-every test is `.invalid`. 2401 green tests do not establish that a real frame
+**Current state (CORRECTED 2026-09-01).** The previously-quoted line "**No
+live run has happened.** Zero authenticated calls" is **false**: four
+authenticated read-only smoke runs were executed against
+`https://api.polymarket.us` and are archived under
+`docs/evidence/venue/polymarket_us/READONLY_AUTH_SMOKE_*.md`. What remains true
+is the *conclusion*, not the reason — **all four failed** (`Connectivity
+verdict: FAIL`; the 2026-08-30 runs also report `teardown health: FAILED`,
+`RuntimeError: Event loop stopped before Future completed`), so no venue frame
+has ever reached parquet. Note the ~872 `marketSlug` occurrences in the 2.8 MB
+capture are Breezy's own log text, **not** venue JSON keys — the slug field name
+is still unresolved. 2401 green tests do not establish that a real frame
 reaches parquet. This is exactly the standing lesson of this repo."
 
 **Exit criterion:** one real frame, from the real venue, written to parquet and

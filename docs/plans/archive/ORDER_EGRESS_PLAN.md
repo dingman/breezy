@@ -27,7 +27,7 @@ independent adversarial lenses (architecture/omission, security/cage,
 runtime/execution-path, prediction-market/domain), each blind to the others, and
 **all four returned BLOCK**. Revision 2 closed 15 of those 16 findings and drew
 2 BLOCK / 2 APPROVE-WITH-CHANGES. This revision resolves R2-BL-1..R2-BL-5 and
-every HIGH item in `docs/plans/ORDER_EGRESS_PLAN_REVIEW_R2_2026-08-31.md`, or
+every HIGH item in `docs/plans/archive/ORDER_EGRESS_PLAN_REVIEW_R2_2026-08-31.md`, or
 rebuts a finding with evidence. §2 is the disposition for both rounds.
 **Created:** 2026-08-31. **Revised (rev 2, rev 3):** 2026-08-31.
 

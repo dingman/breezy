@@ -1,3 +1,8 @@
+> **ARCHIVED 2026-09-01 — IMPLEMENTED, not refuted.** This design was built:
+> `src/breezy/strategy/cli_settlement_print_lock/`. The code is authoritative;
+> this doc is the original handoff spec and may have drifted. Economics:
+> `docs/evidence/bl19_edge_and_cost_decision_2026-09-01.md`.
+
 # Breezy / Nautilus Strategy Handoff
 ## `cli_settlement_print_lock`
 
@@ -182,7 +187,7 @@ use_tmin: bool = False             # only if instrument is a min bucket
 > registry `cli_location` (`"NYC"`), NOT the ICAO form (`KNYC`) used elsewhere
 > in these documents — building it from the docs would refuse every station.
 >
-> Rationale: `docs/plans/print_lock_adverse_selection_and_cost_2026-09-01.md`
+> Rationale: `docs/plans/archive/print_lock_adverse_selection_and_cost_2026-09-01.md`
 > and `docs/evidence/bl19_edge_and_cost_decision_2026-09-01.md` §8.
 
 Do not put `max_daily_trading_budget` or `max_notional_per_position` numbers in config. Size as a function of those caps **when the operator assigns them**, plus existing payout-dollar caps (`max_event_notional`, `max_location_notional`, `max_position_contracts`, `max_equity_fraction`, `max_simultaneous_positions`).

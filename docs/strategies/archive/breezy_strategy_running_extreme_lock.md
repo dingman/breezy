@@ -1,3 +1,7 @@
+> **ARCHIVED 2026-09-01 — IMPLEMENTED, not refuted.** Built as
+> `src/breezy/strategy/running_extreme_lock/` (v1, commit d62566c). The code is
+> authoritative; this doc is the original handoff spec and may have drifted.
+
 # Breezy / Nautilus Strategy Handoff
 ## `running_extreme_lock`
 

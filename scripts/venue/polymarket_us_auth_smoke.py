@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Operator connectivity proof for Polymarket.us -- read-only, GET-only.
 
-Authority: ``docs/plans/POLYMARKET_US_READONLY_AUTH_PLAN.md`` (revision 2)
+Authority: ``docs/plans/archive/POLYMARKET_US_READONLY_AUTH_PLAN.md`` (revision 2)
 section 10 (``:1306-1352``), section 9 Step 15, controls S5, S8 and S15.
 
 This script answers ONE operator question -- *are we actually connected to

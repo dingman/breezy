@@ -10,15 +10,15 @@ and is answered in §13.
 
 Subordinate to, and consistent with:
 
-- `docs/plans/POLYMARKET_US_BUILD_PLAN.md` — binding constraints (`:13-25`),
+- `docs/plans/archive/POLYMARKET_US_BUILD_PLAN.md` — binding constraints (`:13-25`),
   evidence standard (`:27-35`), transport decision (`:37-56`), phase table
   (`:58-71`), safety notes (`:101-113`).
 - `docs/plans/TRADING_ENABLEMENT_PLAN.md` — Phase 2 read-path work items
   (`:316-357`), env settings list (`:610-619`), mypy registration
   (`:596-609`).
-- `docs/plans/TRADING_ENABLEMENT_FINDINGS.md` — gap register (`:212-249`),
+- `docs/plans/archive/TRADING_ENABLEMENT_FINDINGS.md` — gap register (`:212-249`),
   non-negotiables (`:252-274`).
-- `docs/plans/TRADING_ENABLEMENT_REVIEW.md` — SEC-3 / SEC-4 (`:108-116`).
+- `docs/plans/archive/TRADING_ENABLEMENT_REVIEW.md` — SEC-3 / SEC-4 (`:108-116`).
 - `docs/evidence/venue/polymarket_us/VENUE_FACTS_2026-08-25.md`.
 - Docs snapshots under `docs/evidence/venue/polymarket_us/docs_snapshots/`.
 - SDK snapshot `docs/evidence/venue/polymarket_us/sdk_snapshot/polymarket_us_0.1.2/`.
@@ -924,7 +924,7 @@ See §10.
 | `tests/unit/test_polymarket_us_phase0_safety.py` | widen the SDK import ban to prefix-match `polymarket_us.*` (barrier B5) |
 | `tests/unit/test_polymarket_us_dependency_pin.py` | assert the `pynacl` pin |
 | `docs/plans/TRADING_ENABLEMENT_PLAN.md` | errata for D1 + D3 |
-| `docs/plans/POLYMARKET_US_BUILD_PLAN.md` | errata for the `AsyncPolymarketUS` evidence claim (D4) |
+| `docs/plans/archive/POLYMARKET_US_BUILD_PLAN.md` | errata for the `AsyncPolymarketUS` evidence claim (D4) |
 | `.claude/skills/polymarket-us-integration/SKILL.md` | correct the unsourced "query string is INCLUDED" line (`:83`) |
 | `docs/evidence/venue/polymarket_us/VENUE_FACTS_2026-08-25.md` | append: the canonical-string determination, the delimiter weakness (§5.1), the rate-limit surface question (§8), the WS-auth determination (§5.3) |
 

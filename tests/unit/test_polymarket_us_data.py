@@ -1,6 +1,6 @@
 """Data-client contract for the Polymarket.us read-only slice (plan Step 11).
 
-Authority: ``docs/plans/POLYMARKET_US_READONLY_AUTH_PLAN.md`` section 6
+Authority: ``docs/plans/archive/POLYMARKET_US_READONLY_AUTH_PLAN.md`` section 6
 (``data.py`` blueprint, ``:830-881``), section 8.3 quote flow (``:1059-1073``)
 and section 9 Step 11 (``:1241-1251``).
 

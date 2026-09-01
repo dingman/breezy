@@ -1,6 +1,6 @@
 """Polymarket.us live market-data client (read-only slice).
 
-Authority: ``docs/plans/POLYMARKET_US_READONLY_AUTH_PLAN.md`` (revision 2)
+Authority: ``docs/plans/archive/POLYMARKET_US_READONLY_AUTH_PLAN.md`` (revision 2)
 section 6 ``data.py`` (``:830-881``) and section 8.3 quote flow
 (``:1059-1073``).
 

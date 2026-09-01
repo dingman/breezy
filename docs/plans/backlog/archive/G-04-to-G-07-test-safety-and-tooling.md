@@ -23,7 +23,7 @@ only changes Breezy tests/tooling around native extension points.
 
 Problem:
 
-- `docs/plans/TRADING_ENABLEMENT_REVIEW.md` STK-1 says a
+- `docs/plans/archive/TRADING_ENABLEMENT_REVIEW.md` STK-1 says a
   `nautilus_pyo3` client can reach the OS and return ECONNREFUSED while the
   Python `socket` monkeypatch is green.
 - The current autouse fixture patches `socket.socket.connect` and

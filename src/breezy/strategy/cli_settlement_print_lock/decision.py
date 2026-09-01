@@ -2,7 +2,7 @@
 settlement value, and exactly one ladder bucket contains it.
 
 Edge hypothesis (see
-``docs/strategies/breezy_strategy_cli_settlement_print_lock.md``): Polymarket.us
+``docs/strategies/archive/breezy_strategy_cli_settlement_print_lock.md``): Polymarket.us
 weather contracts settle on the local WFO Daily Climate Report (CLI), not on a
 weather app and not on the venue clock. Once the FINAL CLI for climate day D
 has printed value ``V``, the bucket containing ``V`` can only settle NO if a
@@ -92,7 +92,7 @@ venue fee is ``theta * p * (1 - p)`` with ``theta`` a VENUE FACT riding on
 ``contract.fee_coefficient``, resolved once per instrument at ``on_start``;
 ``slippage_prob`` is the only writable term and is floored at one tick. A
 ``None`` coefficient is a NO-TRADE, never a free trade. See
-``docs/plans/print_lock_adverse_selection_and_cost_2026-09-01.md`` s2.
+``docs/plans/archive/print_lock_adverse_selection_and_cost_2026-09-01.md`` s2.
 
 SIZING: CONSTANT DOLLAR COST BASIS, NEVER AFFINE IN EDGE
 ---------------------------------------------------------
@@ -331,7 +331,7 @@ def cost_basis_anchor(
     Exposing it would create a dollar-denominated per-decision knob one rename
     away from "maximum notional per position", which is operator-reserved. It
     stays derived, in code, at the one call site
-    (``docs/plans/print_lock_adverse_selection_and_cost_2026-09-01.md`` s1.7).
+    (``docs/plans/archive/print_lock_adverse_selection_and_cost_2026-09-01.md`` s1.7).
 
     At the shipped constants: ``25 * (0.98 + 0.001176)`` = **$24.5294**.
     """

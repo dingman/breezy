@@ -80,10 +80,16 @@ PART 2 — HARD CONSTRAINTS (each is load-bearing; design around ALL of them)
    Separately, the empirical top-of-book bid on these weather markets is
    almost always absent (median top-of-book bid size is a small fraction of
    one contract) — even where a short is theoretically representable, there
-   is no depth to sell into. Consequently, of the three strategies that
-   exist today, two emit ONLY short (`SHORT_YES`) signals and are refused by
-   the risk layer's default `allow_short=False` before they ever reach a
-   quote check — they do not trade. **Any design whose edge requires
+   is no depth to sell into. Consequently the shorts-only
+   trap is real and already cost us one strategy. **(Counts corrected
+   2026-09-01.)** FIVE strategies exist today, not three:
+   `calibration_mean_reversion` is **SHORT_YES-only** and is refused by the
+   risk layer's permanent `allow_short=False` before it ever reaches a quote
+   check — it does not trade; `forecast_mispricing` and `forecast_revision`
+   each have both a LONG and a SHORT branch, so they trade only on their long
+   branch; `cli_settlement_print_lock` and `running_extreme_lock` are
+   **LONG_YES-only by construction** (`decision.py` has no branch that can
+   return `SHORT_YES`) and are the shape to imitate. **Any design whose edge requires
    selling, shorting, or "fading" a YES price upward is dead on arrival.**
    Every proposed strategy's executable path must be expressible entirely
    as BUYING YES (or declining to trade).

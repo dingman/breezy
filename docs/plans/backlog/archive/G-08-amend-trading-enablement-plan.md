@@ -7,7 +7,7 @@ amendments). **Effect:** lifts the BLOCK ruling that currently gates Phase 2.
 
 `docs/plans/TRADING_ENABLEMENT_PLAN.md` carries the header **BLOCKED PENDING
 AMENDMENT**. All four adversarial reviewers returned BLOCK. The ruling in
-`docs/plans/TRADING_ENABLEMENT_REVIEW.md` is "Amend before implementation."
+`docs/plans/archive/TRADING_ENABLEMENT_REVIEW.md` is "Amend before implementation."
 Phases 0 and 1 cleared; Phase 1.5 must be restructured.
 
 Thirty-eight findings must be resolved into the plan: SEC-1..8, ARC-1..8,

@@ -6,7 +6,7 @@
 
 **Subordinate to, and does not supersede:**
 
-- `docs/plans/GO_LIVE_PLAN.md` — phase sequencing A–F and operator gates D1–D5.
+- `docs/plans/archive/GO_LIVE_PLAN.md` — phase sequencing A–F and operator gates D1–D5.
 - `docs/plans/TRADING_ENABLEMENT_PLAN.md` (+ `_AMENDMENTS.md`) — the 85-requirement
   register. **It carries a BLOCK header and this document does not lift it.**
 - `docs/evidence/asymmetric_gate_prereg_2026-08-26.md` revision 14 — **BINDING**.
@@ -1188,6 +1188,12 @@ immutable foundation and is accepted. Run-to-completion idempotency is therefore
 obtained differently, from three native or near-native mechanisms:
 
 1. **Durable cache.** `CacheConfig.database` (field verified present) is enabled.
+   **CORRECTION 2026-09-01:** Redis is the ONLY backend (`system/kernel.py:312`;
+   `:324-329` raises for anything else; `common/config.py:385` requires >=6.2), and
+   `docs/plans/EXEC_SPINE_2026-09-01.md` DECLINES that dependency in favour of a
+   Breezy `SqliteStateStore` fill record. Nautilus does persist orders and positions
+   natively when configured (`cache/cache.pyx:393-394`, `:1366-1368`;
+   `cache/database.pyx:709-755`) — so this is a DECLINED NATIVE, not a gap (L-11).
    `cache.database = None` is unacceptable once orders exist (REQ-OPS-13), and
    `generate_missing_orders=True` cannot be the recovery story because it
    *synthesises* orders it cannot match.
@@ -1196,6 +1202,14 @@ obtained differently, from three native or near-native mechanisms:
    which restores a counter, not an identity. Tier-1 needs identity: the same
    decision, re-derived after a crash, must produce the **same** client order ID
    so a retry is a duplicate the venue rejects rather than a second position.
+   **REFUTED 2026-09-01 FOR THIS VENUE — DO NOT BUILD IDEMPOTENCY ON IT.**
+   Polymarket.us `CreateOrderParams`
+   (`docs/evidence/venue/polymarket_us/sdk_snapshot/.../types/orders.py:111-128`)
+   carries NO client-order-id field, so the venue CANNOT reject a duplicate on
+   identity — a deterministic ID would be a mechanism that silently does nothing
+   while reading as protection. Idempotency must be enforced Breezy-side by an
+   un-retired submit-intent latch written before the request leaves the process
+   (EXEC_SPINE R-7), and `RetryManager` is banned by name (barrier B8).
    **Extension:** a deterministic ID derived from
    `(city, climate_day, cluster_id, decision_seq)`. *Null hypothesis line:*
    checked `OrderFactory` and `ClientOrderId` — Nautilus supplies the type and

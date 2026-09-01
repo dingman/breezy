@@ -3,7 +3,7 @@ attached at the TOP of `NwsIngestActor.poll_once`.
 
 Why the attachment point is the whole test subject
 ---------------------------------------------------
-`docs/plans/PHASE_CD_COLLECTION_DURABILITY_DESIGN.md` §3 "Attachment point"
+`docs/plans/archive/PHASE_CD_COLLECTION_DURABILITY_DESIGN.md` §3 "Attachment point"
 puts `reconcile` beside `check_staleness()` and BEFORE the `network_allowed()`
 early return, because that is the only line reached on every timer fire. The
 304 branch, the no-new-products branch and the network-disallowed branch all

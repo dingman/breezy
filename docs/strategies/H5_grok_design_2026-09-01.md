@@ -39,7 +39,7 @@ Not “the market is dumb.” Three stacked, named mechanisms. Only the first is
 
 The venue lists a **fixed** 12 F window: one `lt<N>f`, four inclusive 2 F interiors, one `gte<N>f`. That grid is placed when the city-day is listed (~24–48 h out) and **does not move**. Forecasts do.
 
-Open-Meteo previous-runs already serve hourly `temperature_2m_previous_day1..7` on `previous-runs-api.open-meteo.com/v1/forecast`, unkeyed, valid-time anchored, archive to 2019 (`docs/evidence/open_meteo_previous_runs_probe_2026-08-31T005848Z/PROBE_REPORT.md`). Default Breezy error model at 24 h is σ = 2.8 F, at 48 h σ = 3.7 F (`probability.py:409-420`). A 3–6 F overnight revision is ordinary NWP. A 2 F rung under a 3 F revision is a different contract.
+Open-Meteo previous-runs already serve hourly `temperature_2m_previous_day1..7` on `previous-runs-api.open-meteo.com/v1/forecast`, unkeyed, valid-time anchored, archive **2022-01..2023-12 plus present, NON-CONTIGUOUS** (see §Archive hole below; L-8 amendment — the "2019" reading was a 2xx-with-no-datum misread, corrected 2026-09-01). Default Breezy error model at 24 h is σ = 2.8 F, at 48 h σ = 3.7 F (`probability.py:409-420`). A 3–6 F overnight revision is ordinary NWP. A 2 F rung under a 3 F revision is a different contract.
 
 The MM **can** reprice (MDW 09-01 tail at 0.21 proves it). The harvestable error is if they reprice the favorite toward 0.99 / empty-ask and **leave the newly-likely cheap rungs in the 0.01 dump**, rather than lifting those asks to 0.05–0.15. H4’s late book is consistent with “everything that is not the winner is 0.01.” If that dumping rule is applied **before** determination, M1 is live.
 
@@ -89,7 +89,7 @@ This is the H1/H2 lesson as a gate: do not buy a 0.01 on a rung the day has alre
 
 **Forecast state.** A previous-run snapshot whose `ts_init` (availability) is ≤ decision time. Stale if older than 8 h (`stale_forecast_hours` already in `RiskLimits`). No snapshot → no trade (`ForecastSource.snapshot → None` already means skip; never fabricate from CLI).
 
-**Numeric entry.** Let `a` = depth-aware ask VWAP from native `OrderBook.simulate_fills` (L-1c in `docs/plans/print_lock_adverse_selection_and_cost_2026-09-01.md`; do not hand-roll a walker). Venue fee `θ = 0.06` on 60/60 weather markets:
+**Numeric entry.** Let `a` = depth-aware ask VWAP from native `OrderBook.simulate_fills` (L-1c in `docs/plans/archive/print_lock_adverse_selection_and_cost_2026-09-01.md`; do not hand-roll a walker). Venue fee `θ = 0.06` on 60/60 weather markets:
 
 ```
 cost(a) = a + θ · a · (1 − a)
@@ -153,7 +153,7 @@ Wilson-95% **lower** bound is `model_p`. Empty cell → no trade (`n/a`, never 0
 
 **Lookahead.** `fit` on records with `target_date < train_end_exclusive` (`calibration.py` already raises). Probe captures in `docs/evidence/open_meteo_previous_runs_probe_*` are **EVIDENCE ONLY — NEVER INGEST** (both probe reports). A production `LiveDataClient` must stamp `ts_init` = retrieval time. Backdating a previous-run under a plausible timestamp is lookahead.
 
-**Archive hole.** `archive_reaches_2024_01 = REFUTED` (`open_meteo_coverage_bisect_probe_2026-08-31T011135Z`). 2022–2023 contiguous; 2024-01-01 all-null on every model tested. Training is ~2019–2023 plus whatever 2025–2026 the next coverage probe clears. Do not claim “five years of forecasts” until 2025 is measured.
+**Archive hole.** `archive_reaches_2024_01 = REFUTED` (`open_meteo_coverage_bisect_probe_2026-08-31T011135Z`). 2022–2023 contiguous; 2024-01-01 all-null on every model tested. Training is ~2022–2023 plus whatever 2025–2026 the next coverage probe clears — TWO years, not five. Below 2022-01 was never probed; do not assume it. Do not claim “five years of forecasts” until 2025 is measured.
 
 **Nautilus seam (L-1).**
 
@@ -220,7 +220,7 @@ Denominator needed: ~100 station-days of D+1 books (20 calendar days × 5 cities
 
 **K2 — M2 unmeasured. Value-modality, not T*.** Histogram of CLI `tmax_f` at LAX and SFO by season (n≈450/season already on disk). Dead-as-fattening-mechanism if unimodal with IQR ≲ 6 F: a 12 F ladder covers the mass and tails are not fat. Does not kill M1.
 
-**K3 — table skill in the cheap region only.** Leave-one-year-out on 2019–2023 previous-runs vs CLI. Compare log-loss of the table vs (a) unconditional monthly climatology of the listed-shape tails, (b) Gaussian `WeatherProbabilityEngine` with fitted bias/σ. **Dead if** the table does not beat (a) by ≥ 0.01 mean log-loss **on the subset of rungs that would have been cheap-open**, or if buy-cell realized frequency is within 2 pp of the flat monthly rate. Do not score the favorite rung — we cannot buy it.
+**K3 — table skill in the cheap region only.** Leave-one-year-out on **2022–2023** previous-runs vs CLI — two folds, not five; K3's power must be recomputed against that. Compare log-loss of the table vs (a) unconditional monthly climatology of the listed-shape tails, (b) Gaussian `WeatherProbabilityEngine` with fitted bias/σ. **Dead if** the table does not beat (a) by ≥ 0.01 mean log-loss **on the subset of rungs that would have been cheap-open**, or if buy-cell realized frequency is within 2 pp of the flat monthly rate. Do not score the favorite rung — we cannot buy it.
 
 **K4 — M1 mechanism.** On D+1, when `|OM_max − rung_mid|` shrinks by ≥ 3 F across two previous-runs and the rung is still open: does the ask **leave** {0.01, 0.02, 0.03} within 60 min of the new run’s `ts_init`? **Dead if** ≥ 80% of such events already have `ask > 0.03` at the first post-revision snapshot. The MM saw the same NWP.
 

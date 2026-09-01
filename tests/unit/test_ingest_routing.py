@@ -1,6 +1,6 @@
 """Row-by-row tests for the poll-outcome error-routing table.
 
-Every row of `docs/plans/PHASE1_ACTOR_BRIEF.md` §5 gets an explicit test here,
+Every row of `docs/plans/archive/PHASE1_ACTOR_BRIEF.md` §5 gets an explicit test here,
 including the three the brief singles out as easy to get wrong:
 
 * **F4** -- a 400 or 404 comes back as a *normal* `FetchResult`, with no

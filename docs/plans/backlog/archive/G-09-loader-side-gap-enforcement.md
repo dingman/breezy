@@ -68,7 +68,7 @@ receive unpartitioned rows.
 
 ## Files Touched
 
-- `docs/plans/backlog/G-09-loader-side-gap-enforcement.md` first, before code.
+- `docs/plans/backlog/archive/G-09-loader-side-gap-enforcement.md` first, before code.
 - `src/breezy/persistence/quote_tape_gaps.py` for the loader API.
 - `src/breezy/persistence/__init__.py` only if exporting the new loader follows
   existing package style after inspection.

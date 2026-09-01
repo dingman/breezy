@@ -2,7 +2,7 @@
 
 Generated 2026-09-01T18:51:04+00:00 from
 `scripts/analysis/h4_preliminary_economic_read.py`.
-Climate day: **2026-08-31**. Strategy: `docs/strategies/H4_headroom1_afternoon_lock.md`.
+Climate day: **2026-08-31**. Strategy: `docs/strategies/archive/H4_headroom1_afternoon_lock.md`.
 
 ## 0. What this is, and the bounds on reading it
 
@@ -71,7 +71,7 @@ about the trigger, not an economic result: there was nothing to price.
 ## 3. Ask prices on the `h == 1` rung
 
 Depth-aware VWAP for a **$24.53** notional (the cost basis already
-derived in `docs/plans/print_lock_adverse_selection_and_cost_2026-09-01.md`),
+derived in `docs/plans/archive/print_lock_adverse_selection_and_cost_2026-09-01.md`),
 walking the captured ask ladder in whole contracts — never level 0 alone.
 `depth-limited` means the ladder ran out before the notional was absorbed.
 

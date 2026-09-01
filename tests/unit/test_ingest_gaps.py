@@ -1,6 +1,6 @@
 """Tests for the durable gap ledger (`src/breezy/ingest/gaps.py`).
 
-Governing ruling: `docs/plans/PHASE_CD_COLLECTION_DURABILITY_DESIGN.md` SS3
+Governing ruling: `docs/plans/archive/PHASE_CD_COLLECTION_DURABILITY_DESIGN.md` SS3
 (WI-10). Every test uses a frozen/injected nanosecond clock -- never
 `time.time()` -- and performs zero network I/O. No hard-coded absolute
 "today"; every instant used is explicitly constructed from a fixed

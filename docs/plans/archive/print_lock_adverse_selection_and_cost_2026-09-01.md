@@ -7,7 +7,7 @@ document. Read-only against `src/breezy/strategy/cli_settlement_print_lock/**`,
 `.venv/lib/python3.13/site-packages/nautilus_trader/` tree.
 
 Consumes: `docs/evidence/bl19_edge_and_cost_decision_2026-09-01.md` §8,
-`docs/strategies/breezy_strategy_cli_settlement_print_lock.md` §5 + CORRECTION,
+`docs/strategies/archive/breezy_strategy_cli_settlement_print_lock.md` §5 + CORRECTION,
 `docs/evidence/first_in_window_capture_2026-09-01.md`,
 `docs/evidence/observation_lock_falsification_2026-08-31.md`,
 `docs/evidence/venue/polymarket_us/VENUE_FACTS_2026-08-25.md`.
@@ -766,7 +766,7 @@ that tick before proceeding.
     stronger structural pin (§2.6).
 
 **Phase 4 — docs.**
-13. Amend `docs/strategies/breezy_strategy_cli_settlement_print_lock.md` §5's
+13. Amend `docs/strategies/archive/breezy_strategy_cli_settlement_print_lock.md` §5's
     CORRECTION block to note that the 0.98 ceiling is now enforced
     structurally rather than by a config value, and record §3's two findings
     in `docs/core/PROGRESS.md`.

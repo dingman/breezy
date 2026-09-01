@@ -2,7 +2,7 @@
 :class:`~breezy.strategy.cli_settlement_print_lock.strategy.CliSettlementPrintLockStrategy`.
 
 Field set follows the design brief's plug-in contract
-(``docs/strategies/breezy_strategy_cli_settlement_print_lock.md``, "Plug-in
+(``docs/strategies/archive/breezy_strategy_cli_settlement_print_lock.md``, "Plug-in
 contract (implement exactly)") and the sizing/risk pass-through shape shared
 by every other weather strategy
 (:class:`breezy.strategy.weather_common.risk.RiskLimits`).
@@ -69,7 +69,7 @@ Deviations from the brief's SUGGESTED field list, each deliberate:
   per instrument by injection and is not configurable at all; ``slippage_prob``
   is the only writable cost input, is REQUIRED, and is floored at the
   instrument's own tick in ``strategy.on_start``. See
-  ``docs/plans/print_lock_adverse_selection_and_cost_2026-09-01.md`` s2.
+  ``docs/plans/archive/print_lock_adverse_selection_and_cost_2026-09-01.md`` s2.
 * No ``edge_qty_scale``. Sizing no longer depends on edge at all -- see
   ``base_quantity`` below and the same plan's s1. The field is DELETED rather
   than zeroed, because a zeroed knob is a knob that re-enables the defect.
@@ -150,7 +150,7 @@ class CliSettlementPrintLockConfig(StrategyConfig, frozen=True):
         dollar-denominated per-decision knob is one rename away from an
         operator-reserved control. Size still rises as the contract gets
         cheaper; what no longer rises is the money at risk. See
-        ``docs/plans/print_lock_adverse_selection_and_cost_2026-09-01.md`` s1.
+        ``docs/plans/archive/print_lock_adverse_selection_and_cost_2026-09-01.md`` s1.
         The payout-dollar caps below and ``RiskManager.evaluate_order`` do the
         remaining dollar clipping, and the two operator-reserved dollar
         controls stay unset.

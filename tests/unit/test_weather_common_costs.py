@@ -1,7 +1,7 @@
 """Unit tests for `breezy.strategy.weather_common.costs`.
 
 The cost seam BL-19 s8.6 specifies and
-`docs/plans/print_lock_adverse_selection_and_cost_2026-09-01.md` s2 designs:
+`docs/plans/archive/print_lock_adverse_selection_and_cost_2026-09-01.md` s2 designs:
 two SEPARATELY NAMED pure terms, never one scalar. The point of the split is
 that they behave OPPOSITELY as `p -> 1` -- the venue fee vanishes (0.000594 at
 0.99) while the execution term does not -- so a single "total cost" field is

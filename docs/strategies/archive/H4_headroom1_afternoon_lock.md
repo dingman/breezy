@@ -1,3 +1,7 @@
+> **ARCHIVED 2026-09-01 — DESIGN INPUT ONLY, economics measured.** No package
+> exists under `src/breezy/strategy/`. Read the measured read first:
+> `docs/evidence/h4_preliminary_economic_read_2026-09-01.md`.
+
 # H4 — Headroom-1 afternoon lock (supersedes H3, 2026-09-01)
 
 Iteration 4. H3 is REFUTED at headroom 0 and SURVIVES, narrowed, at headroom 1.

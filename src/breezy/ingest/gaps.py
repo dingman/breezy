@@ -1,7 +1,7 @@
 """Durable gap ledger: which climate days were expected, observed, missing.
 
-Governing ruling: ``docs/plans/PHASE_CD_COLLECTION_DURABILITY_DESIGN.md`` SS3
-(WI-10), read together with ``docs/plans/NWS_COLLECTION_RUNTIME_PLAN_ADDENDUM.md``
+Governing ruling: ``docs/plans/archive/PHASE_CD_COLLECTION_DURABILITY_DESIGN.md`` SS3
+(WI-10), read together with ``docs/plans/archive/NWS_COLLECTION_RUNTIME_PLAN_ADDENDUM.md``
 for why the design's original citations needed re-verifying against this repo.
 
 **The blind spot this closes.** ``gate.check_freshness`` (``ingest/gate.py``)

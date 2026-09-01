@@ -7,7 +7,7 @@ Date: 2026-08-26
 Measure how often an NWS CLI preliminary daily-maximum-temperature value is
 revised by the later final CLI product for Breezy's live venue sites.
 
-This addresses DOM-11 in `docs/plans/TRADING_ENABLEMENT_REVIEW.md`: after the
+This addresses DOM-11 in `docs/plans/archive/TRADING_ENABLEMENT_REVIEW.md`: after the
 preliminary CLI product publishes, the stated `tmax` is no longer a lower bound.
 The remaining truth risk for a post-preliminary trade is the probability that a
 later final product changes that `tmax`.
@@ -81,7 +81,7 @@ an archive mode added and documented separately.
 
 ## Deliverables
 
-- `docs/plans/backlog/G-01-preliminary-final-revision-rate-study.md`
+- `docs/plans/backlog/archive/G-01-preliminary-final-revision-rate-study.md`
 - `docs/evidence/preliminary_final_revision_prereg_2026-08-26.md`
 - `scripts/analysis/preliminary_final_revision_rate_study.py`
 - `docs/evidence/preliminary_final_revision_2026-08-26.md`

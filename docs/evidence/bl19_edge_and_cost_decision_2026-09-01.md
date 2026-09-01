@@ -9,7 +9,7 @@ this document. Read-only analysis against
 
 Evidence consumed: `observation_lock_falsification_2026-08-31.md`,
 `h2_lower_tail_rejected_2026-09-01.md`, `first_in_window_capture_2026-09-01.md`,
-`docs/strategies/FEEDBACK_FOR_GROK_2026-08-31.md` ss3/5, `docs/core/PROGRESS.md`
+`docs/strategies/archive/FEEDBACK_FOR_GROK_2026-08-31.md` ss3/5, `docs/core/PROGRESS.md`
 BL-19 / BL-21 / BL-13 / BL-10 / P6.
 
 Every number below is either (a) recomputed here from a formula in source, and
@@ -486,7 +486,7 @@ recommendation to `running_extreme_lock`; that strategy fired 0/4 on the first
 in-window capture and is no longer the lead. The 05:00-13:00Z capture will test
 BL-13's economics, so BL-13 needs its own derivation.
 
-Worked from the design spec `docs/strategies/breezy_strategy_cli_settlement_print_lock.md`
+Worked from the design spec `docs/strategies/archive/breezy_strategy_cli_settlement_print_lock.md`
 (ss5, 8, "Plug-in contract", "Sizing", "Look-ahead rule") ONLY. Nothing under
 `src/breezy/strategy/cli_settlement_print_lock/` was read or written — that
 package is being created concurrently.

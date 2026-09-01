@@ -1,6 +1,6 @@
 """Poll-outcome error routing: one pure decision per possible poll result.
 
-Implements the routing table in `docs/plans/PHASE1_ACTOR_BRIEF.md` §5. Every
+Implements the routing table in `docs/plans/archive/PHASE1_ACTOR_BRIEF.md` §5. Every
 transport, status-code, parse, write and supervision outcome of an NWS poll
 maps to exactly one :class:`GateAction`, with a severity and the handful of
 flags the Actor needs to execute it.

@@ -126,7 +126,7 @@ from typing import Final, Protocol, runtime_checkable
 from breezy.adapters.polymarket_us.credentials import PolymarketUSCredentials
 
 #: Operator gate D4. No default, no coercion, no inference: the value must be
-#: exactly ``"1"``. ``docs/plans/GO_LIVE_PLAN.md`` §5: "No agent, and no
+#: exactly ``"1"``. ``docs/plans/archive/GO_LIVE_PLAN.md`` §5: "No agent, and no
 #: automation in this repo, may set D4." That rule is enforced by the AST
 #: barrier ``test_no_shipped_code_can_set_the_operator_trading_gate``, which
 #: bans every environment write from ``src/`` and ``scripts/`` outright.

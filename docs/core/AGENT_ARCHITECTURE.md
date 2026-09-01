@@ -71,7 +71,7 @@ The two decisive evidence findings that shaped everything:
    reproduced on ≥2 markets and signed off (rev. H4); credential leak into git ⇒ pre-commit guard for
    `X-PM-Signature`/`X-PM-Access-Key` patterns and base64-Ed25519-length blobs; runaway probing ⇒ backoff +
    circuit breaker (20 req/s, 429s, 5s stopgap).
-7. **Verdict**: REQUIRED — but **PARALLEL TRACK, NOT CRITICAL PATH** (rev. C1). Gated on KYC + operator budget.
+7. **Verdict**: REQUIRED — but **PARALLEL TRACK, NOT CRITICAL PATH** (rev. C1). ~~Gated on KYC + operator budget.~~ **Venue access was RELEASED by the operator 2026-09-01 — no longer gated.**
 8. **Absorbs**: API/schema discovery, auth verification, rule-text capture, venue error taxonomy.
 
 ### 3. `nautilus-trader-patterns` — skill, PROJECT-SCOPED (`.claude/skills/`)
@@ -137,7 +137,7 @@ The two decisive evidence findings that shaped everything:
 **Stage 0 (unblocked, starts today)** — `nautilus-trader-patterns` (#3) → `nws-cli-settlement` (#5)
 **Stage 1 (unblocked)** — #1 seams (b)+(d): weather custom-data types, catalog, backtest replay, NWS ingestion,
   provenance/revision write path, contract tests pinning Nautilus gotchas
-**Stage 2 (PARALLEL, KYC + operator-budget gated)** — `polymarket-us-discovery` (#2) → enriches
+**Stage 2 (PARALLEL; venue access released 2026-09-01, no longer gated)** — `polymarket-us-discovery` (#2) → enriches
   `polymarket-us-integration` (#4)
 **Stage 3 (venue-dependent)** — #1 seams (a)+(c): adapter transport/auth, reconnection/watchdog, reconciliation reports
 **Continuous** — tdd-guide (RED→GREEN), python-reviewer, security-reviewer, prediction-market-reviewer, doc-updater

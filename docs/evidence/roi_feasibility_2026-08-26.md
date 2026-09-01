@@ -52,10 +52,10 @@ Quoted-from-repo-artifact inputs:
   taker `0.09` rather than `0.06`
   (`docs/plans/TRADING_ENABLEMENT_PLAN.md:487-490`).
 - The review says this ROI arithmetic is one of the studies that can return a
-  NO-GO before any adapter code (`docs/plans/TRADING_ENABLEMENT_REVIEW.md:269-276`).
+  NO-GO before any adapter code (`docs/plans/archive/TRADING_ENABLEMENT_REVIEW.md:269-276`).
 - DOM-13 says the central estimate from the worked example is "tens of dollars
   per day gross" before committing to 63 blocking requirements
-  (`docs/plans/TRADING_ENABLEMENT_REVIEW.md:216-218`).
+  (`docs/plans/archive/TRADING_ENABLEMENT_REVIEW.md:216-218`).
 
 The plan sections requested do **not** state a measured account size, intended
 contract quantity, market close, realized ask, slippage, or opportunity-cost
@@ -132,8 +132,8 @@ Assumed input register:
 |---|---:|---|---|
 | Contract unit `C` | 100 contracts | Neutral as a scaling unit; favorable if misread as executable size | The repo has no intended size or capital ceiling. Reporting per 100 contracts avoids inventing bankroll. |
 | Clusters per city-day | 1 | Unfavorable to ROI | REQ-RISK-04 says adjacent strikes on one city-day are one bet (`docs/plans/TRADING_ENABLEMENT_PLAN.md:144`). |
-| Pessimistic reachable cities | 3 | Unfavorable to ROI | DOM-9 says LAX/SFO may be unreachable if trading closes before 17:00-19:00 ET (`docs/plans/TRADING_ENABLEMENT_REVIEW.md:198-200`). |
-| Central / optimistic reachable cities | 5 | Favorable to ROI | GO LIVE says all five current sites are NYC/SFO/MIA/MDW/LAX (`docs/plans/GO_LIVE_PLAN.md:17-20`). |
+| Pessimistic reachable cities | 3 | Unfavorable to ROI | DOM-9 says LAX/SFO may be unreachable if trading closes before 17:00-19:00 ET (`docs/plans/archive/TRADING_ENABLEMENT_REVIEW.md:198-200`). |
+| Central / optimistic reachable cities | 5 | Favorable to ROI | GO LIVE says all five current sites are NYC/SFO/MIA/MDW/LAX (`docs/plans/archive/GO_LIVE_PLAN.md:17-20`). |
 | Pessimistic fill `p` | 0.99 | Unfavorable to ROI | Represents the market nearly pricing P=1 or two 0.01 ticks of adverse fill versus a 0.97 example. |
 | Central fill `p` | 0.98 | Mildly unfavorable to ROI | Represents a one-tick adverse fill on a 0.97 offer. |
 | Optimistic fill `p` | 0.97 | Favorable to ROI | Preserves the 0.97 worked-example neighborhood without slippage. |

@@ -1,6 +1,6 @@
 """Decision D2: three independent unlocks for a credentialed pytest session.
 
-Authority: ``docs/plans/POLYMARKET_US_READONLY_AUTH_PLAN.md`` (revision 2)
+Authority: ``docs/plans/archive/POLYMARKET_US_READONLY_AUTH_PLAN.md`` (revision 2)
 D2, and control S9 in section 11.
 
 Before this change, ``pytest_sessionstart`` aborted unconditionally when any

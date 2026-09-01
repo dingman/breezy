@@ -1,6 +1,6 @@
 """Config contract for the Polymarket.us data client (plan revision 2, Step 8).
 
-Authority: ``docs/plans/POLYMARKET_US_READONLY_AUTH_PLAN.md`` section 6
+Authority: ``docs/plans/archive/POLYMARKET_US_READONLY_AUTH_PLAN.md`` section 6
 (``config.py`` blueprint, ``:602-630``) and section 9 Step 8 (``:1207-1214``).
 
 Two properties are load-bearing and both are pinned here:

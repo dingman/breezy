@@ -1,6 +1,6 @@
 """Offline contract for the venue connectivity smoke script (plan Step 15).
 
-Authority: ``docs/plans/POLYMARKET_US_READONLY_AUTH_PLAN.md`` (revision 2)
+Authority: ``docs/plans/archive/POLYMARKET_US_READONLY_AUTH_PLAN.md`` (revision 2)
 section 10 (smoke procedure and evidence, ``:1306-1352``), control S15 (core
 dumps, ``:1374``) and SEC-4 (``TRADING_ENABLEMENT_REVIEW.md:115-116``).
 

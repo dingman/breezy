@@ -4,7 +4,7 @@ WHAT THIS IS
 ------------
 A DESCRIPTIVE MEASUREMENT over one captured climate day (2026-08-31) at four
 stations. It answers exactly one question, the one
-``docs/strategies/H4_headroom1_afternoon_lock.md`` names as its binding gate:
+``docs/strategies/archive/H4_headroom1_afternoon_lock.md`` names as its binding gate:
 
     at or after the station's pre-registered trigger hour, when headroom
     ``h = upper_f - R(t)`` is exactly 1, IS THERE AN ASK ON THAT RUNG?
@@ -112,7 +112,7 @@ __all__ = [
 # -- H4's pre-registered parameters, copied from the brief, never re-derived --
 
 #: Trigger hour in LOCAL STANDARD time, per
-#: `docs/strategies/H4_headroom1_afternoon_lock.md`.
+#: `docs/strategies/archive/H4_headroom1_afternoon_lock.md`.
 H4_TRIGGER_HOURS: Final[Mapping[str, int]] = {
     "MDW": 16,
     "MIA": 14,
@@ -140,7 +140,7 @@ def trigger_hour_for(city: str) -> int | None:
 H4_SEASONAL_EXCLUSIONS: Final[Mapping[str, tuple[str, ...]]] = {"MDW": ("DJF",)}
 
 #: The per-position cost basis already derived elsewhere in this repo
-#: (`docs/plans/print_lock_adverse_selection_and_cost_2026-09-01.md`, the
+#: (`docs/plans/archive/print_lock_adverse_selection_and_cost_2026-09-01.md`, the
 #: `A / (ask_p + fee(ask_p))` sizing rule). Used here ONLY as the notional the
 #: depth-aware VWAP is measured over. It is not a risk budget being set, and
 #: it is not an operator-reserved control.
@@ -998,7 +998,7 @@ def build_report(
     add(f"Generated {generated_at.isoformat()} from")
     add("`scripts/analysis/h4_preliminary_economic_read.py`.")
     add(f"Climate day: **{TARGET_CLIMATE_DAY.isoformat()}**. Strategy: "
-        "`docs/strategies/H4_headroom1_afternoon_lock.md`.")
+        "`docs/strategies/archive/H4_headroom1_afternoon_lock.md`.")
     add("")
     add("## 0. What this is, and the bounds on reading it")
     add("")
@@ -1100,7 +1100,7 @@ def build_report(
     add("## 3. Ask prices on the `h == 1` rung")
     add("")
     add(f"Depth-aware VWAP for a **${NOTIONAL_USD:.2f}** notional (the cost basis already")
-    add("derived in `docs/plans/print_lock_adverse_selection_and_cost_2026-09-01.md`),")
+    add("derived in `docs/plans/archive/print_lock_adverse_selection_and_cost_2026-09-01.md`),")
     add("walking the captured ask ladder in whole contracts — never level 0 alone.")
     add("`depth-limited` means the ladder ran out before the notional was absorbed.")
     add("")

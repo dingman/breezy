@@ -54,9 +54,11 @@ Two consequences that are not optional (tracked by P4):
 - **Lock strategies are DEAD on this venue — see LESSONS L-9.** Three families,
   three refutations, one mechanism: the near-certain rung is never offered. The
   ladder is liquid; only the winning rung is unoffered. Do not design a fourth.
-- **Historical forecasts ARE available — VERIFIED 2026-08-31, was stale here.**
-  `previous-runs-api.open-meteo.com/v1/forecast` (hourly surface) returns 200;
-  archive depth confirmed to **2019**; publication-lag and restatement captured.
+- **Historical forecasts exist but are NON-CONTIGUOUS.**
+  `previous-runs-api.open-meteo.com/v1/forecast` yields **2022-01..2023-12 plus
+  the present, hole between** (2024-01-01 = 0/168, every model). "Back to 2019"
+  was a 200-OK-with-no-datum misread (L-8 amendment); below 2022 was never
+  probed. Publication-lag and restatement captured.
   `docs/evidence/open_meteo_previous_runs_probe_2026-08-31T005848Z/`. IEM AFOS
   forecast PIL is reachable but FAILS its pre-registered bar (parse rate 0.5125
   vs >=0.9; issuance/office attribution 238/240). **But a forecast archive
@@ -89,9 +91,7 @@ Evidence: `docs/evidence/observation_lock_falsification_2026-08-31.md`.
 
 Gate 0 RESOLVED: no live intraday ingest (transport hardcodes CLI, two URL
 builders, `_fetch` private at `ingest/http.py:769`), but ~5 yr of 5-min ASOS is
-on disk. Open-Meteo previous-runs reaches **2022-01..2023-12 plus the present,
-with a hole between** — the "2019" claim was a 200-OK-with-no-datum misread, see
-LESSONS L-8 amendment. `R(t)` cannot enter a Nautilus
+on disk. `R(t)` cannot enter a Nautilus
 backtest — no `Data` subclass, no catalog wiring, no client. Plan (unreviewed):
 `docs/plans/intraday_observation_ingest_2026-09-01.md` — peer-reviewed
 2026-09-01: RESUME WITH AMENDMENTS (re-anchor off the dead lock predicate;
@@ -189,11 +189,9 @@ plain work items, no longer blocked. Still blocked:
 a function of fill prices; price history is forward-only, so no amount of weather
 or forecast data produces a historical ROI. Both P2 probe reports say it
 outright: a forecast archive yields a CALIBRATION dataset, not a backtest.
-Measured: total addressable notional at any eventually-winning rung across the
-whole capture is **$0.574**, which nets NEGATIVE after fees and is refused by
-`min_liquidity_contracts=25` anyway. Sample power: sigma/mu ~ 8 per trade, so
-n ~ 300 station-days (~60 clean calendar days at 5 stations) before a CI lower
-bound can clear break-even.
+Measured: total addressable notional at any eventually-winning rung is **$0.574**
+(NEGATIVE after fees; refused by `min_liquidity_contracts=25`). Power: sigma/mu
+~ 8, so n ~ 300 station-days (~60 clean days at 5 stations) to clear break-even.
 
 **Ordered path to a real-money ROI verdict (revised 2026-09-01):** (1) BL-25
 DONE; (2) K1 gates the calibration family BEFORE any forecast build —
@@ -209,15 +207,18 @@ AccountState
 and is what de-inerts every Nautilus cap (`risk/engine.pyx:682-692` returns True
 with no account); (5) forecast ingest (`docs/plans/forecast_ingest_2026-09-01.md`)
 HELD until K1 reports; (6) accumulate ~300 station-days; (7) settle CAPACITY.
-Backtest stays frozen in the REFUTATION + plumbing role — it cannot produce the
-ROI evidence, because offer survival is a counterfactual about the venue's
-reaction to OUR order and exists in no recording.
+Backtest stays frozen in the REFUTATION + plumbing role: offer survival is a
+counterfactual about the venue's reaction to OUR order, recorded nowhere.
 
 ---
 
 ## Pointers
 
-Durable rules `docs/core/LESSONS.md` (L-1..L-10, all binding) · evidence
-`docs/evidence/` · plans `docs/plans/` · runbook
+Durable rules `docs/core/LESSONS.md` (L-1..L-11, all binding) · evidence
+`docs/evidence/` · live plan `docs/plans/EXEC_SPINE_2026-09-01.md` · runbook
 `docs/core/RUNBOOK_NWS_COLLECTION.md` · strategy authoring
 `docs/specs/STRATEGY_QUICKSTART.md` · pre-shrink history `docs/core/archive/`
+
+**Docs purge 2026-09-01.** 36 docs moved to the three `archive/` dirs (each has
+a README listing the stale claims inside); citations repointed; 1 file deleted;
+**zero bytes deleted from `docs/evidence/`**. Nothing in `archive/` is live.

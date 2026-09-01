@@ -1,6 +1,6 @@
 """The cage's rule constants are EQUALITY-pinned, in both directions.
 
-Authority: ``docs/plans/EXEC_CLIENT_NOSEND_PLAN.md`` (revision 3) increment
+Authority: ``docs/plans/archive/EXEC_CLIENT_NOSEND_PLAN.md`` (revision 3) increment
 NS-2, counters 1, 3, 5, 7 and 8.
 
 WHY THIS MODULE EXISTS, MEASURED RATHER THAN ASSERTED

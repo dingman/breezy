@@ -80,7 +80,7 @@ escalating log evidence, not a silent stop.
 
 ## Files Touched
 
-- `docs/plans/backlog/G-10-tape-disk-alerting.md`
+- `docs/plans/backlog/archive/G-10-tape-disk-alerting.md`
 - `src/breezy/runtime/settings.py`
 - `src/breezy/runtime/quote_tape_disk_monitor.py`
 - `src/breezy/runtime/quote_tape_cli.py`

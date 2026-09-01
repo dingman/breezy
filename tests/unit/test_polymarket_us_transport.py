@@ -1,6 +1,6 @@
 """Step 5 (transport half): ``NautilusHttpTransport`` and ``VenueResponse``.
 
-Authority: ``docs/plans/POLYMARKET_US_READONLY_AUTH_PLAN.md`` (revision 2)
+Authority: ``docs/plans/archive/POLYMARKET_US_READONLY_AUTH_PLAN.md`` (revision 2)
 section 6 ``transport.py``, section 8 (rate-limit budget), section 9 Step 5.
 
 Two classes of test live here and both are load-bearing:

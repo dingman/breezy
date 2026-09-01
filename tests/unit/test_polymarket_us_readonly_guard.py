@@ -1,6 +1,6 @@
 """Repo-wide read-only barriers B1-B6 for the Polymarket.us slice.
 
-Authority: ``docs/plans/POLYMARKET_US_READONLY_AUTH_PLAN.md`` (revision 2)
+Authority: ``docs/plans/archive/POLYMARKET_US_READONLY_AUTH_PLAN.md`` (revision 2)
 sections 2.1 (barriers B1-B6), 9 Step 13, and 11 controls S11/S16.
 
 This is a **guard suite**, not a TDD step: there is no implementation that

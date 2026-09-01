@@ -1,3 +1,7 @@
+> **ARCHIVED 2026-09-01 — CONSUMED.** This feedback was folded into
+> `docs/prompts/GROK_STRATEGY_DESIGN_BRIEF.md`; that brief is authoritative.
+> Counts of existing strategies in this doc are stale (five exist, not three).
+
 # Feedback on the three-strategy handoff pack
 
 To: the strategy-document author. From: implementation.

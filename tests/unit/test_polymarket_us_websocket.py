@@ -1,6 +1,6 @@
 """Markets WebSocket client -- plan revision 2, sections 5.3, 6 and 9 Step 10.
 
-Authority: ``docs/plans/POLYMARKET_US_READONLY_AUTH_PLAN.md``.
+Authority: ``docs/plans/archive/POLYMARKET_US_READONLY_AUTH_PLAN.md``.
 
 The load-bearing fact this suite exists to pin (plan section 5.3, verified
 against ``core/nautilus_pyo3.pyi:5530-5566``): ``WebSocketConfig.headers`` is

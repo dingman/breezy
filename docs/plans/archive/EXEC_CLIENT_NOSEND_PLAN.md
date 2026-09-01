@@ -41,7 +41,7 @@
 > ordering prerequisite of any order submission, not a convenience. Enforce it
 > with a test, not a sentence.
 
-**What this document is.** `docs/plans/ORDER_EGRESS_PLAN.md` (revision 3, 2246
+**What this document is.** `docs/plans/archive/ORDER_EGRESS_PLAN.md` (revision 3, 2246
 lines) designed the settlement identity, a four-type authority algebra and the
 process container in one document with dense cross-references; three adversarial
 rounds returned 16, then 5, then ~7 blocking findings, and the defect rate was

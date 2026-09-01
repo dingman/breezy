@@ -238,7 +238,13 @@ false.** The repo passes the class rather than calling it — `node_factory: Nod
 node.build(); node.run()` (`:151-156`). A real `TradingNode` is built and run today by
 the quote-tape process. The true gap is narrower and still real: no trading-ROLE node
 config (`build_quote_tape_node_config` pins `exec_clients={}`, `strategies=[]`) and no
-`breezy-trade` entry point. L-3's substance survives — no increment built the
+`breezy-trade` entry point.
+
+**Amendment 2026-09-01:** that entry point now EXISTS —
+`breezy-trade = "breezy.runtime.trade_cli:main"` (`pyproject.toml:240`, EXEC SPINE R-2,
+commit b5c7eb9) — alongside `build_trade_node_config`, so the node-config half is closed too.
+What remains absent is any execution CLIENT: `src/breezy/adapters/polymarket_us/exec/` is
+empty. The lesson is unchanged — a `[V]` belongs on the inference, not on the command. L-3's substance survives — no increment built the
 trading-role container — but its headline overstated the gap, and the overstatement
 was carried into a plan as a `[V]`-tagged fact.
 
@@ -381,7 +387,7 @@ becomes PHYSICALLY DETERMINED and observable to anyone watching the same
 instrument, not the moment a bulletin is issued. Any future strategy that names
 a publication event as its trigger is anchored to the wrong clock and will
 arrive late by exactly the publication lag. This is the measurement that
-generated H3 (`docs/strategies/H3_intraday_running_max_lock.md`).
+generated H3 (`docs/strategies/archive/H3_intraday_running_max_lock.md`).
 
 ## L-8 — A 0-row read is not a quiet market until the tape is verified (2026-09-01)
 
@@ -411,6 +417,34 @@ the write buffer (~8 KB), not the flush interval -- salvage recovered 491/500
 records -- so a truncated tail is usually recoverable and should be salvaged
 rather than discarded. Pinned by
 `tests/contract/test_quote_tape_unclean_shutdown.py`.
+
+### L-8 amendment — a 2xx is not a datum (2026-09-01)
+
+The same failure has now occurred on the HTTP surface, and the coordinator
+committed it. The Open-Meteo probe report records
+`q3_archive_depth_2019` as **HTTP 200, 5079 bytes**
+(`docs/evidence/open_meteo_previous_runs_probe_2026-08-31T005848Z/PROBE_REPORT.md:39`).
+Reading only that row, the coordinator asserted "forecast archive depth
+confirmed back to 2019" and propagated it into two agent briefs.
+
+The very next section of the same report says the step is **partial**: "2xx, but
+the payload did not carry the datum this step was designed to extract"
+(`:62`). Only `q3_archive_depth_2022` ANSWERED, with `rows=168` (`:61`). The
+report even states the conclusion explicitly at `:83` — coverage is
+"NON-CONTIGUOUS ... an unexplained gap, not a clearance". A dedicated bisect
+probe then measured `2024-01-01 -> 0/168` for all four models, bracketing the
+boundary between 2023-12-09 and 2024-01-01.
+
+**The rule, generalised:** a status code, a byte count, and a non-empty response
+are all compatible with zero usable data. **Every coverage or availability claim
+must cite a ROW COUNT, never a status code, and must be read together with the
+report's own answered/partial classification.** The probe had already done the
+work correctly; the error was entirely in the reading.
+
+Corollary for briefs: a fact asserted into a subagent brief propagates at the
+speed of dispatch and is expensive to recall — two briefs and one external
+design run were seeded with the false 2019 claim before it was caught. Verify a
+load-bearing premise BEFORE it enters a brief, not after the returns land.
 
 ## L-9 — On this venue the near-certain rung is never offered; stop designing lock strategies (2026-09-01)
 
@@ -454,34 +488,6 @@ persisted and the tape was verified before interpretation ([[L-8]]). The H4 run
 also shows the right shape for a cheap kill: measure whether the ORDER IS
 AVAILABLE before measuring whether it is profitable. An absent ask is not a
 pricing problem that a better model or a lower break-even can solve.
-
-### L-8 amendment — a 2xx is not a datum (2026-09-01)
-
-The same failure has now occurred on the HTTP surface, and the coordinator
-committed it. The Open-Meteo probe report records
-`q3_archive_depth_2019` as **HTTP 200, 5079 bytes**
-(`docs/evidence/open_meteo_previous_runs_probe_2026-08-31T005848Z/PROBE_REPORT.md:39`).
-Reading only that row, the coordinator asserted "forecast archive depth
-confirmed back to 2019" and propagated it into two agent briefs.
-
-The very next section of the same report says the step is **partial**: "2xx, but
-the payload did not carry the datum this step was designed to extract"
-(`:62`). Only `q3_archive_depth_2022` ANSWERED, with `rows=168` (`:61`). The
-report even states the conclusion explicitly at `:83` — coverage is
-"NON-CONTIGUOUS ... an unexplained gap, not a clearance". A dedicated bisect
-probe then measured `2024-01-01 -> 0/168` for all four models, bracketing the
-boundary between 2023-12-09 and 2024-01-01.
-
-**The rule, generalised:** a status code, a byte count, and a non-empty response
-are all compatible with zero usable data. **Every coverage or availability claim
-must cite a ROW COUNT, never a status code, and must be read together with the
-report's own answered/partial classification.** The probe had already done the
-work correctly; the error was entirely in the reading.
-
-Corollary for briefs: a fact asserted into a subagent brief propagates at the
-speed of dispatch and is expensive to recall — two briefs and one external
-design run were seeded with the false 2019 claim before it was caught. Verify a
-load-bearing premise BEFORE it enters a brief, not after the returns land.
 
 ### L-9 amendment — the cheap side is mostly a lottery already lost (2026-09-01)
 

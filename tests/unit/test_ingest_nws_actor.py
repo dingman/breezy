@@ -1,6 +1,6 @@
 """Unit tests for `breezy.ingest.nws_actor.NwsIngestActor`.
 
-Governing spec: `docs/plans/PHASE1_ACTOR_BRIEF.md`. Every test below pins one
+Governing spec: `docs/plans/archive/PHASE1_ACTOR_BRIEF.md`. Every test below pins one
 ruling from that document; the section reference is named in the docstring so a
 future edit that "simplifies" a branch fails against the ruling rather than
 against a stylistic preference.

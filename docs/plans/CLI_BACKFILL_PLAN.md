@@ -1,6 +1,6 @@
 # Historical NWS CLI backfill — implementation plan
 
-**Status:** REVISION 2. Not executed. Revised after adversarial peer review by four independent reviewers (architecture, job/refusal machinery, analytical value, citation audit) — 4× APPROVE-WITH-CHANGES, 0 BLOCK. Decisions D1–D12 in §12 record what changed and why.
+**Status:** REVISION 2. **EXECUTED THROUGH I-2 — do not re-implement.** `src/breezy/domain/archived_climate_day.py`, `archived_raw_product.py`, `src/breezy/ingest/archive_records.py` and `src/breezy/persistence/archive_catalog.py` are on disk (commits `cf33468`, `7a61015`, `0ab94f2`), and the resulting AFOS dataset (N~1820/site) is the basis of `docs/evidence/observation_lock_falsification_2026-08-31.md`. Re-verify every file:line before extending; note §494 calls the schema freeze irreversible on first write. Revised after adversarial peer review by four independent reviewers (architecture, job/refusal machinery, analytical value, citation audit) — 4× APPROVE-WITH-CHANGES, 0 BLOCK. Decisions D1–D12 in §12 record what changed and why.
 **Scope:** ingest historical, verbatim NWS CLI text products from the Iowa Environmental Mesonet (IEM) AFOS archive into a **structurally separate** research store, for calibration and out-of-sample validation. Not settlement. Not live.
 
 **Read §0 first.** Every claim about *this repository* carries a `file:line` citation. Claims about the IEM service and about NautilusTrader internals are marked `[UNVERIFIED]` or `[REPO-ASSERTED]` and are not load-bearing without the increment that measures them.
@@ -33,7 +33,7 @@ It has been **run over 2021-01-01 → 2025-12-31 for all five cities** (`:60-61`
 
 - `docs/evidence/settlement_alignment_2026-08-25.md:24-26` — validation bridge **passed**, 36 overlapping final records, **0 mismatches**.
 - `:58-73` — over five station-years per city, `archive_parse_error` is **1–2 per city**, `missing_cli_final` **4–17 per city**.
-- `docs/plans/GO_LIVE_PLAN.md:108-109` — *"the alignment study drew ~1,800 city-days per site from the IEM archive."*
+- `docs/plans/archive/GO_LIVE_PLAN.md:108-109` — *"the alignment study drew ~1,800 city-days per site from the IEM archive."*
 
 **Consequences.** (1) The archive's 2021–2025 coverage and parser compatibility are *measured*, not assumed. (2) The `000` problem is already worked around — by **rewriting the product text** (`:449` synthesises `"\n000\n" + body`), which is disqualifying for an ingest path (§4.1). (3) The real novelty is **provenance, storage separation, resumability and refusal**.
 
@@ -44,7 +44,7 @@ It has been **run over 2021-01-01 → 2025-12-31 for all five cities** (`:60-61`
 - REQ-DATA-09 is *"Historical backfill of **forecasts + observations + settled outcomes**, sufficient for the model-grade bar (>=2,000 settled pairs...)"* — `docs/plans/TRADING_ENABLEMENT_PLAN.md:117`.
 - The Tier-2 bar is *">=400 settled pairs **per traded stratum** and >=2,000 overall"*, calibration *"fitted walk-forward only"* — `:578-581`.
 - Historical **forecasts** are unavailable: `docs/evidence/decision_time_clearance_prereg_2026-08-27.md:189-194` pre-registers bindingly that a forecast-based estimator *"cannot be backtested at all in this repository ... it must first accumulate a forecast archive of its own"*.
-- Historical **prices** are unavailable and unbackfillable: `docs/plans/GO_LIVE_PLAN.md:109-111` — *"those markets did not exist before 2026, so no vendor can backfill them. Every uncaptured day is permanently lost."* Echoed at `adapters/polymarket_us/data.py:684-688` and `runtime/node_config.py:225-226`.
+- Historical **prices** are unavailable and unbackfillable: `docs/plans/archive/GO_LIVE_PLAN.md:109-111` — *"those markets did not exist before 2026, so no vendor can backfill them. Every uncaptured day is permanently lost."* Echoed at `adapters/polymarket_us/data.py:684-688` and `runtime/node_config.py:225-226`.
 
 **What this delivers:** the **observation/label side only** — a ~69,000-product, ~18-year verbatim CLI archive (~34,700 station-days; see OQ-6, which corrects Revision 1's unreconciled "~32,000") and a derived per-station-day truth series. Sufficient to establish climatology, fit and validate an *observation-side* model out-of-sample, and give any future forecast-error model a labelled target. It supplies **one half of a settled pair, never the pair.** REQ-DATA-09 remains open on the forecast and outcome halves.
 

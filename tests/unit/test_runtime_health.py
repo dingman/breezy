@@ -1,6 +1,6 @@
 """Tests for the health snapshot + alert sink (src/breezy/runtime/health.py).
 
-WI-12. See docs/plans/PHASE_CD_COLLECTION_DURABILITY_DESIGN.md §4 for the
+WI-12. See docs/plans/archive/PHASE_CD_COLLECTION_DURABILITY_DESIGN.md §4 for the
 authoritative design this file pins.
 
 Zero network I/O anywhere in this file: `WebhookAlertSink` tests use

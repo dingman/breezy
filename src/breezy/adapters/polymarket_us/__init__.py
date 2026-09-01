@@ -1,6 +1,6 @@
 """Polymarket.us Nautilus extension package -- read-only authenticated slice.
 
-Authority: ``docs/plans/POLYMARKET_US_READONLY_AUTH_PLAN.md`` (revision 2).
+Authority: ``docs/plans/archive/POLYMARKET_US_READONLY_AUTH_PLAN.md`` (revision 2).
 
 What this package is
 --------------------

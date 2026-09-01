@@ -2,7 +2,7 @@
 
 **Date:** 2026-08-26  
 **Plan Revision:** 2026-08-26-G-08  
-**Source Findings:** `docs/plans/TRADING_ENABLEMENT_REVIEW.md` (38 findings)
+**Source Findings:** `docs/plans/archive/TRADING_ENABLEMENT_REVIEW.md` (38 findings)
 
 ## Purpose
 

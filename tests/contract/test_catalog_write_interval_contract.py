@@ -54,7 +54,7 @@ pytestmark = pytest.mark.contract
 
 # Anchored to "now", not a fixed calendar date: a hard-coded absolute date has
 # already once made an unrelated test fail the moment the wall clock passed it
-# (docs/plans/NWS_COLLECTION_RUNTIME_PLAN.md, WI-1). Nothing here drives a real
+# (docs/plans/archive/NWS_COLLECTION_RUNTIME_PLAN.md, WI-1). Nothing here drives a real
 # clock or timer -- these are plain field values on hand-built `Data` records --
 # but the base stays relative on principle.
 _NOW = dt.datetime.now(tz=dt.UTC).replace(minute=0, second=0, microsecond=0)

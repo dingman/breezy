@@ -1,6 +1,6 @@
 """Serializable configuration for the Polymarket.us live data client.
 
-Authority: ``docs/plans/POLYMARKET_US_READONLY_AUTH_PLAN.md`` (revision 2)
+Authority: ``docs/plans/archive/POLYMARKET_US_READONLY_AUTH_PLAN.md`` (revision 2)
 section 6 ``config.py`` (``:602-630``), section 7 environment contract
 (``:930-952``) and section 8.2 quota design.
 

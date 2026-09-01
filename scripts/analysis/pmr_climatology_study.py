@@ -36,7 +36,7 @@ SECONDARY quantity:  ``P(M > R(t)  | station, hour, season, headroom)``
 conditioning variable. It is NEVER pooled: a rule that triggers the instant
 ``R(t)`` reaches a rung fires at ``headroom = 0``, the worst-conditioned cell,
 so a pooled number silently under-prices exactly the cell that would trade
-most (``docs/strategies/FEEDBACK_FOR_GROK_2026-08-31.md`` section 3, item 7).
+most (``docs/strategies/archive/FEEDBACK_FOR_GROK_2026-08-31.md`` section 3, item 7).
 ``headroom == 1 - margin`` where ``margin = R(t) - floor``; both are surfaced
 because the surrounding studies speak in margins and the rung phase is not
 known a priori (phase 0 and phase 1 simply swap the two labels).

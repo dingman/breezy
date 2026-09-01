@@ -1,8 +1,20 @@
 # Trading Enablement Plan — Breezy on Polymarket.us
 
+> **SUPERSEDED 2026-09-01 — read `docs/plans/EXEC_SPINE_2026-09-01.md` instead.**
+> The status block below says "Phase 2+ build work is not authorized." That is
+> **no longer true and must not be acted on**: R-1 (venue shape capture) and R-2
+> (trade node config) are LANDED and green on `feat/data-capture-and-risk`.
+> The 2026-08-26 ROI **NO-GO** was computed from a worked example, and the stop
+> gate has since been restated as *positive ROI from real, very small marketable
+> orders with the CI lower bound clearing break-even* — a quantity no
+> backtest or worked example in this repo can produce. The ROI question is not
+> answered here; it was **reframed as something only live-small orders can
+> settle**. Retained for the amendment history and the D-lock definitions only.
+
+
 Status: **BLOCKED — ROI NO-GO / ASYMMETRIC GATE NOT AUTHORIZED**. Revision
 2026-08-26-G-08 incorporates the full adversarial amendment set from
-`docs/plans/TRADING_ENABLEMENT_REVIEW.md`; the prior **BLOCKED PENDING
+`docs/plans/archive/TRADING_ENABLEMENT_REVIEW.md`; the prior **BLOCKED PENDING
 AMENDMENT** state is lifted only for amendment completeness. The programme
 remains blocked on substance: `docs/evidence/roi_feasibility_2026-08-26.md`
 returns **NO-GO** for committing to the downstream adapter / settlement /
@@ -13,10 +25,10 @@ irreversible read-only tape capture remain in scope. Phase 2+ build work is not
 authorized until the ROI ruling is reversed by measured evidence and the
 asymmetric settlement gate is reviewed, computed and passes.
 
-Original status: PLAN (peer review pending). Input: `docs/plans/TRADING_ENABLEMENT_FINDINGS.md`
+Original status: PLAN (peer review pending). Input: `docs/plans/archive/TRADING_ENABLEMENT_FINDINGS.md`
 (treated as settled for its section A resolutions). Repo state:
 `docs/core/PROGRESS.md` (Phase 1 ingestion built and live-validated) and
-`docs/plans/GO_LIVE_PLAN.md` (authoritative current sequencing).
+`docs/plans/archive/GO_LIVE_PLAN.md` (authoritative current sequencing).
 
 Section A of the findings is not re-litigated here. Where the findings record an
 `[UNKNOWN]`, this plan states BOTH branches and never schedules work that assumes
@@ -193,7 +205,7 @@ Tier 2) / `LATER`.
 | REQ-OPS-11 | `CliContentError`-rate-per-site alert (fail-closed parsing turns one bad token into a full site outage; the `100R` fix closed one instance, not the class). | [VERIFIED] PROGRESS.md | BLOCKS-SCALE |
 | REQ-OPS-12 | Correct PROGRESS.md's `has_msgbus_backing` note (REQ-DATA-06) and record this plan. | [VERIFIED] | BLOCKS-FIRST-TRADE |
 | REQ-OPS-13 | Native-cache backing or a durable idempotency/order journal with a written crash-recovery procedure. `cache.database=None` is not acceptable once orders exist; `generate_missing_orders=True` cannot be the recovery story because it synthesizes orders it cannot match. | [INFERRED] ARC-1 | BLOCKS-FIRST-TRADE |
-| REQ-OPS-14 | Test-safety/tooling baseline from `docs/plans/backlog/G-04-to-G-07-test-safety-and-tooling.md`: pyo3 HTTP/WebSocket constructor block installed before collection, exact Nautilus pin, registered `venue_live` marker, import-linter layering and .com-adapter ban. Residual for STK-1: this is an in-process constructor block for known pyo3 clients, not a kernel-level egress block; a complete block needs an external network namespace or CI firewall. | [VERIFIED] G-04..G-07 | BLOCKS-FIRST-TRADE |
+| REQ-OPS-14 | Test-safety/tooling baseline from `docs/plans/backlog/archive/G-04-to-G-07-test-safety-and-tooling.md`: pyo3 HTTP/WebSocket constructor block installed before collection, exact Nautilus pin, registered `venue_live` marker, import-linter layering and .com-adapter ban. Residual for STK-1: this is an in-process constructor block for known pyo3 clients, not a kernel-level egress block; a complete block needs an external network namespace or CI firewall. | [VERIFIED] G-04..G-07 | BLOCKS-FIRST-TRADE |
 | REQ-OPS-15 | `SettlementGate._load_site` READ PATH specification: the gate carries an in-instance cache whose safety invariant is enforced in `gate.py`; a second reader must not cache the first result forever, falsifying `require_open`'s own "never rely on an earlier decision" promise. Specify that the strategy reads fresh on every check, or introduce a maximum staleness bound. The current default is unsafe. | [INFERRED] SEC-2 | BLOCKS-FIRST-TRADE |
 | REQ-OPS-16 | Module-scoped mypy waivers pre-declared. `strict = true` plus `disallow_subclassing_any` will reject `FeeModel`, `Strategy` and the live client subclasses on day one; the repo deliberately keeps such waivers module-scoped rather than package-wide. Pre-declare them in `py.typed` comments alongside the imports at the top of the module. | [INFERRED] STK-5 | BLOCKS-FIRST-TRADE |
 | REQ-OPS-17 | Fixture strategy: a loopback fake venue echoing raw header bytes (the `allow_socket` marker currently has zero users), contract tests over captured payloads, and slug property tests asserting REJECTION, not only round-trip. A round-trip-only property is satisfied by identity. | [INFERRED] STK-7 | BLOCKS-FIRST-TRADE |

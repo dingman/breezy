@@ -1,3 +1,7 @@
+> **ARCHIVED 2026-09-01 — DESIGN INPUT ONLY.** No package named for this design
+> exists under `src/breezy/strategy/`. Its mechanism was carried forward into
+> `running_extreme_lock`. Do not implement this doc directly.
+
 # H3 — Intraday running-max lock (hypothesis for critique, 2026-09-01)
 
 Iteration 3. H1 and H2 (tail locks) fired 0/4. `cli_settlement_print_lock` was

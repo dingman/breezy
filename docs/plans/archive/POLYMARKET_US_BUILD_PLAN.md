@@ -7,7 +7,7 @@ Supersedes for implementation sequencing:
 
 This plan preserves the decision that the shipped NautilusTrader `.com`
 Polymarket adapter cannot be repointed to Polymarket.us. It folds in the
-adversarial review in `docs/plans/POLYMARKET_US_CONNECTOR_REVIEW.md` and the
+adversarial review in `docs/plans/archive/POLYMARKET_US_CONNECTOR_REVIEW.md` and the
 four reconciled specialist reviews supplied on 2026-08-25.
 
 ## Binding Constraints

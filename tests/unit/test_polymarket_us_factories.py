@@ -1,6 +1,6 @@
 """Factory and node wiring for the Polymarket.us read-only slice (plan Step 12).
 
-Authority: ``docs/plans/POLYMARKET_US_READONLY_AUTH_PLAN.md`` (revision 2)
+Authority: ``docs/plans/archive/POLYMARKET_US_READONLY_AUTH_PLAN.md`` (revision 2)
 section 6 ``factories.py`` (``:883-905``), section 7 environment contract
 (``:930-949``), section 8.3 startup flow (``:1026-1042``) and control S3.
 

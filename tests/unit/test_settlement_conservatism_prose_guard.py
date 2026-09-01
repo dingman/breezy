@@ -101,7 +101,7 @@ def test_p1_no_hits_on_the_shipped_tree() -> None:
 
 def test_p1_scan_covers_plans_core_evidence_src_and_scripts() -> None:
     paths = {path.relative_to(REPO_ROOT).as_posix() for path in iter_p1_scan_paths()}
-    assert "docs/plans/SETTLEMENT_REPORTING_PLAN.md" in paths
+    assert "docs/plans/archive/SETTLEMENT_REPORTING_PLAN.md" in paths
     assert "docs/core/PROGRESS.md" in paths
     assert "docs/evidence/asymmetric_gate_prereg_2026-08-26.md" in paths
     assert "src/breezy/settlement/coverage.py" in paths

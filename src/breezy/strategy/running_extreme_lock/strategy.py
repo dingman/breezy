@@ -9,7 +9,7 @@ surviving bucket, taker, against the live ask. See ``decision.py`` for the
 full edge hypothesis, the v1 scope (open tail only -- no interior bucket, no
 low-measure tail), the margin-conditioned probability table, and the
 acknowledged fat tail. See
-``docs/strategies/breezy_strategy_running_extreme_lock.md`` for the design
+``docs/strategies/archive/breezy_strategy_running_extreme_lock.md`` for the design
 brief this implements, and the observation-freshness plan
 (``PLAN_observation_freshness.md``, peer-reviewed) for the risk-layer
 contract (``SignalFreshness`` / ``RiskLimits.stale_observation_hours``) this

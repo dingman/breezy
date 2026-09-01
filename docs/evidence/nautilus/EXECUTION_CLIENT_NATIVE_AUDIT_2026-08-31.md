@@ -184,7 +184,7 @@ venue rejections after `OrderSubmitted`.
 
 # ADDENDUM 2026-08-31 — the native notional cap fails open THREE ways
 
-Found while authoring `docs/plans/ORDER_EGRESS_PLAN.md`; **all re-verified by the
+Found while authoring `docs/plans/archive/ORDER_EGRESS_PLAN.md`; **all re-verified by the
 orchestrator directly against `NT/risk/engine.pyx`.** This supersedes the optimistic
 framing of H-2 above: the cap is correctly *denominated*, and by default it never
 *fires*.

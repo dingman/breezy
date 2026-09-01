@@ -1,6 +1,6 @@
 """The per-``(venue, city)`` NWS ingest Actor.
 
-Governing spec: ``docs/plans/PHASE1_ACTOR_BRIEF.md``. One instance per site,
+Governing spec: ``docs/plans/archive/PHASE1_ACTOR_BRIEF.md``. One instance per site,
 five in production. It polls the NWS API on a Nautilus timer, routes every
 outcome through :mod:`breezy.ingest.routing` into the one
 :class:`~breezy.ingest.gate.SettlementGate`, persists settlement-grade records

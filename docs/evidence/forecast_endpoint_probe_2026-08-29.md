@@ -10,7 +10,7 @@ point-in-time forecast design this probe exists to protect.
 Generated at UTC: 2026-08-29T03:51:17Z
 
 Scope: live, read-only GET probe against `api.weather.gov` for Increment I-0 of
-`docs/plans/FORECAST_INGESTION_PLAN.md`.
+`docs/plans/archive/FORECAST_INGESTION_PLAN.md`.
 
 Payload directory:
 `docs/evidence/forecast_endpoint_probe_2026-08-29_payloads/`

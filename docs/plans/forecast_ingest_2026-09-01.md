@@ -344,7 +344,7 @@ Reuses `NwsIngestActor`'s timer shape and nothing of its gate coupling.
 7. Does `ParquetDataCatalog.query` push `start=` down on `ts_event` as well as
    `ts_init`? Affects R-4 only, never correctness — the vintage filter never
    moves into the catalog.
-8. Relationship to `docs/plans/FORECAST_INGESTION_PLAN.md` (rev 2, NWS-first,
+8. Relationship to `docs/plans/archive/FORECAST_INGESTION_PLAN.md` (rev 2, NWS-first,
    not executed). Its D8 (one-batch-one-write), D10 (schema final at first cut),
    D12 (evidence-only), D13 (`issuance_time_ns` naming) are adopted here. Whether
    that plan is superseded or runs alongside is a coordination decision.

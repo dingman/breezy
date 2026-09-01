@@ -682,7 +682,7 @@ Calibration corpus — real shipped lines, all correctly non-firing:
 ```
 fires=False | scripts/analysis/settlement_bucket_guard_band.py:84   data label
 fires=False | docs/evidence/settlement_bucket_gate_2026-08-25.md:83 table header
-fires=False | docs/plans/GO_LIVE_PLAN.md:90                         measurement
+fires=False | docs/plans/archive/GO_LIVE_PLAN.md:90                         measurement
 fires=False | docs/core/PROGRESS.md:766-768                         prohibition
 fires=False | docs/plans/backlog/G-20-…:37-39                       prohibition
 fires=False | docs/evidence/asymmetric_gate_prereg_…:851            prohibition

@@ -1,10 +1,10 @@
 # Data capture and risk — implementation plan
 
-**Status:** REVISION 2. Not executed. Revision 1 was reviewed adversarially by four independent reviewers and **blocked**. This revision resolves every blocking finding, or records why a finding was rejected.
+**Status:** REVISION 2. **PARTIALLY EXECUTED — do not re-implement landed work.** P0 (`scripts/archive/backup_irreplaceable_data.py`), P1 (`runtime/quote_tape_disk_monitor.py`, `quote_tape_preflight_cli.py`), P2 (both probes — `docs/evidence/open_meteo_*`, `iem_afos_forecast_pil_probe_*`) and P5 (`docs/evidence/no_side_instrument_probe_2026-08-31.md`) have landed. P3 is superseded by `docs/plans/forecast_ingest_2026-09-01.md`. P4/P6/P7 remain open. This plan underpins LESSONS L-2 and L-3 — re-verify citations before resuming. Revision 1 was reviewed adversarially by four independent reviewers and **blocked**. This revision resolves every blocking finding, or records why a finding was rejected.
 
 **What changed from revision 1.** Two independent null-hypothesis audits against installed `nautilus-trader==1.231.0` struck six proposals (three were already native, three shrank). Four adversarial reviews then found that revision 1 had introduced a **new critical defect while simplifying** — it silently changed the unit every risk cap is measured in — and that its kill-switch, its budget accounting, its enumeration, and its systemd exit-code contract were each unsound. §0.4 records all of it, including two claims I made that the source contradicts.
 
-**Companion:** `docs/plans/FORECAST_INGESTION_PLAN.md` (revision 2, separately peer-reviewed). **This plan does not restate or re-plan it.** §4.P3 states only the delta and the sequencing constraint.
+**Companion:** `docs/plans/archive/FORECAST_INGESTION_PLAN.md` (revision 2, separately peer-reviewed). **This plan does not restate or re-plan it.** §4.P3 states only the delta and the sequencing constraint.
 
 ---
 

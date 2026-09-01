@@ -1,3 +1,6 @@
+> **ARCHIVED 2026-09-01.** Superseded as the live plug-in contract by
+> `docs/prompts/GROK_STRATEGY_DESIGN_BRIEF.md` (PART 1). Kept for history.
+
 # Breezy × Nautilus strategy handoff pack
 
 Three **design-only** implementation briefs. Each file is a drop-in spec for one new package under `src/breezy/strategy/<name>/` (`config.py`, `decision.py`, `strategy.py`).

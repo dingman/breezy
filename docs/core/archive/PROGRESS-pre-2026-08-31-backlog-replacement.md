@@ -18,7 +18,7 @@ State of the work. Backlog items are tracked here, not in the design docs.
 
 
 Design: `docs/plans/WEATHER_INGESTION_PROPOSAL.md` (v6, operator-approved 2026-08-22)
-and `docs/plans/PHASE1_ACTOR_BRIEF.md`.
+and `docs/plans/archive/PHASE1_ACTOR_BRIEF.md`.
 
 Persistence is native NautilusTrader `ParquetDataCatalog` for weather records
 (the data plane), with a SQLite `StateStore` for the settlement gate and the
@@ -667,7 +667,7 @@ every routing decision rests on it. If it is wrong the recorder captures
 nothing and looks exactly like a quiet market.
 
 Live venue tests are behind the deliberate three-lock gate of
-`docs/plans/POLYMARKET_US_READONLY_AUTH_PLAN.md` D2 (`BREEZY_VENUE_LIVE=1`
+`docs/plans/archive/POLYMARKET_US_READONLY_AUTH_PLAN.md` D2 (`BREEZY_VENUE_LIVE=1`
 AND `BREEZY_ALLOW_CREDENTIALED_PYTEST=1` AND the `--venue-live` flag). That
 gate exists so no automation trips it incidentally; unlocking it is an
 operator decision.
@@ -719,7 +719,7 @@ adopted as a rescue without one.
 
 ## GO LIVE backlog (opened 2026-08-26)
 
-Roadmap: `docs/plans/GO_LIVE_PLAN.md`. Per-item execution plans:
+Roadmap: `docs/plans/archive/GO_LIVE_PLAN.md`. Per-item execution plans:
 `docs/plans/backlog/G-*.md`.
 
 **Scope boundary:** this backlog covers work up to — and deliberately NOT
@@ -825,7 +825,7 @@ Status vocabulary: `TODO` / `IN PROGRESS` / `GREEN` / `BLOCKED (<unlock>)`.
   rule and for the "never import the .com adapter" ban.
 - **G-08 — Amend TRADING_ENABLEMENT_PLAN with the full finding set.** `GREEN`
   All 38 findings resolved, 0 argued-rejected. Traceability table at
-  `docs/plans/TRADING_ENABLEMENT_PLAN_AMENDMENTS.md`. Eight new requirements
+  `docs/plans/archive/TRADING_ENABLEMENT_PLAN_AMENDMENTS.md`. Eight new requirements
   added (REQ-VENUE-18, REQ-OPS-13..17, REQ-ALPHA-09..10); Phase 3 split into
   3a/3b per ARC-7; Phase 0 items labelled non-TDD per STK-11. Spot-verified by
   the coordinator by grepping six cited requirement IDs in the amended plan —
@@ -894,7 +894,7 @@ Status vocabulary: `TODO` / `IN PROGRESS` / `GREEN` / `BLOCKED (<unlock>)`.
   metadata for the auth-smoke probe path only.
 
   **[SUPERSEDED — original TODO text below]**
-  Plan: `docs/plans/backlog/G-18-autonomous-market-discovery.md`.
+  Plan: `docs/plans/backlog/archive/G-18-autonomous-market-discovery.md`.
   Opened on operator direction: the bot must discover markets itself and will
   never be handed a slug list. `POLYMARKET_US_MARKET_SLUGS` is static and
   required while weather slugs are **per-day**, so continuous capture would

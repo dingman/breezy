@@ -1,6 +1,6 @@
 """Step 5 (client half): ``PolymarketUSHttpClient`` read-only GET surface.
 
-Authority: ``docs/plans/POLYMARKET_US_READONLY_AUTH_PLAN.md`` (revision 2)
+Authority: ``docs/plans/archive/POLYMARKET_US_READONLY_AUTH_PLAN.md`` (revision 2)
 section 6 ``http.py``, section 8.2/8.3, section 9 Step 5.
 
 Every test here is offline: the transport is a recording double implementing

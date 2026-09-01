@@ -3,7 +3,7 @@
 **Status:** **REVISION 2, 2026-09-01. R-1 and R-2 are LANDED and green. R-3 … R-6 are
 buildable. R-7 is RE-PLAN (two CRITICALs, fixes named below). R-9 is RE-PLAN — it has no
 live mechanism at all and a design is in flight.**
-**Date:** 2026-09-01. Supersedes `docs/plans/EXEC_CLIENT_NOSEND_PLAN.md` (1993 lines; terminal
+**Date:** 2026-09-01. Supersedes `docs/plans/archive/EXEC_CLIENT_NOSEND_PLAN.md` (1993 lines; terminal
 state was a process that refuses every order — zero evidence value against the stop gate).
 
 **Review history (2026-09-01, condensed — all findings now closed in this revision).**
@@ -86,9 +86,11 @@ have misled an implementer:
 - The synthetic zero is at `live/reconciliation.py:493` inside
   `create_inferred_order_filled_event`, behind **three** branches on the order report
   (`:486`, `:488`) — not "five fallbacks on `avg_px_open`", and not in `execution_engine.py`,
-  where `make_price(0.0)` does not occur. Two escapes precede it
-  (`execution_engine.py:2871-2877` quote-tick, `:2880-2881` `current_avg_px`), so a single
-  cached quote tick prevents it.
+  where `make_price(0.0)` does not occur. **The two apparent escapes
+  (`execution_engine.py:2871-2877` quote-tick, `:2880-2881` `current_avg_px`) are
+  UNREACHABLE** — `calculate_reconciliation_price` returns `avg_px_open` itself, measured
+  `Price(0.300)`, so the `is None` branch at `:2863` is never entered. An earlier reading here
+  said "a single cached quote tick prevents it"; that is REFUTED and deleted. See R-9.
 - Nautilus does not say "FOREIGN". Unclaimed reconciled orders get
   `StrategyId("EXTERNAL")` (`execution_engine.py:3556`).
 - `nautilus_trader/cache/postgres/` and `nautilus_trader/infrastructure/` **do not exist** in
@@ -336,9 +338,10 @@ Two inherited traps *(both PORTABLE — Nautilus behaviour, not venue behaviour)
   reached only when `order.avg_px is None` AND `report.avg_px` is falsy (`:486`) AND
   `report.price is None` (`:488`) — **three branches on the report, not five fallbacks**, and
   not in `execution_engine.py`, where `make_price(0.0)` does not occur. The reachable path:
-  `execution_engine.py:2854-2860` → `None` → `:2871-2877` quote-tick escape → `:2880-2881`
-  `current_avg_px` escape → `:2986-3011` synthetic MARKET report → `:3220` → `:493`. **Two
-  escapes precede it**, so a single cached quote tick prevents it.
+  `execution_engine.py:2854-2860` → `:2986-3011` synthetic MARKET report →
+  `:3220` → `:493`. **The `:2871-2877` quote-tick and `:2880-2881` `current_avg_px` escapes are
+  UNREACHABLE** — `calculate_reconciliation_price` returns `avg_px_open`, not `None`, so
+  `:2863` never branches into them. The hazard is UNCONDITIONAL; no cached quote prevents it.
   `UserPosition` has **no average-entry field**, but it does carry `cost` and `qtyBought`
   (`sdk_snapshot/.../types/portfolio.py:24-26`), which together DO give a derivable entry —
   that is exactly what OQ-1 asks. **Design:** for Breezy-opened positions supply `avg_px_open`

@@ -38,7 +38,7 @@ source exists):
     strategy's `ForecastSource`. Fixed, and deliberately NOT derived from any
     settlement observation (real or swept) -- see `_SyntheticForecastSource`.
     Breezy has no forecast ingestion at all
-    (`docs/plans/FORECAST_INGESTION_PLAN.md` is unbuilt).
+    (`docs/plans/archive/FORECAST_INGESTION_PLAN.md` is unbuilt).
   * The settlement-scenario SWEEP candidates (every scenario after
     `primary_real_preliminary`) -- sensitivity values around the real
     preliminary reading, never a measured outcome.

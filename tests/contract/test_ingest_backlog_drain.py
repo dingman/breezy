@@ -1,7 +1,7 @@
 """WI-11 -- does a multi-day backlog of missed NWS CLI products drain inside
 the ~7-day api.weather.gov retention window?
 
-Governing spec: `docs/plans/NWS_COLLECTION_RUNTIME_PLAN.md` lines 269-282.
+Governing spec: `docs/plans/archive/NWS_COLLECTION_RUNTIME_PLAN.md` lines 269-282.
 
 Three of the four candidate defeats the plan names are ALREADY DISPROVEN
 against current code and are deliberately NOT re-tested here:

@@ -1,6 +1,6 @@
 """Tests for the product_uuid -> raw_sha256 integrity index.
 
-Governing ruling: docs/plans/PHASE1_ACTOR_BRIEF.md SS3.4. The supersession key
+Governing ruling: docs/plans/archive/PHASE1_ACTOR_BRIEF.md SS3.4. The supersession key
 ``(venue, city, climate_day, issuance_class, revision_seq)`` cannot see the one
 event it most needs to -- the same NWS ``product_uuid`` observed twice with a
 *different* ``raw_sha256``. That is upstream mutation of an already-issued

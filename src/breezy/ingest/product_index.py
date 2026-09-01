@@ -1,6 +1,6 @@
 """First-write-wins ``product_uuid -> raw_sha256`` integrity index.
 
-Governing ruling: ``docs/plans/PHASE1_ACTOR_BRIEF.md`` SS3.4, consumed at step 5
+Governing ruling: ``docs/plans/archive/PHASE1_ACTOR_BRIEF.md`` SS3.4, consumed at step 5
 of the SS6 poll sequence.
 
 **The blind spot this closes.** Supersession keys on

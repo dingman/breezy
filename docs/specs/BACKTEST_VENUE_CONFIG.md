@@ -1,7 +1,9 @@
 # Backtest venue configuration — POLYMARKET_US
 
-Status: **specified, not yet implemented.** No `add_venue(...)` call for
-POLYMARKET_US exists anywhere in `src/` or `scripts/` as of 2026-08-27. This
+Status: **IMPLEMENTED.** `src/breezy/runtime/backtest_harness.py:713-714` calls
+`engine.add_venue(venue=POLYMARKET_US_VENUE, ...)` and names this document as its
+authority at `backtest_harness.py:3`. (The previous line — "specified, not yet
+implemented ... as of 2026-08-27" — was true when written and is now false.) This
 document fixes the argument values before the harness is written, so that the
 defaults — several of which are silently wrong for a 0-1 binary market — are
 chosen deliberately rather than inherited.

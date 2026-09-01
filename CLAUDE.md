@@ -33,19 +33,51 @@ It must delegate **all implementation, investigation, code analysis, testing, de
 
 Route every unit of non-coordinator work in this order:
 
-1. **Codex first.** The **Codex Claude Code plugin** is the default destination for all implementation, investigation, debugging, and analysis work. Prefer it over Claude sub-agents whenever it can do the job.
-2. **Claude sub-agents second**, as the fallback — see the trigger below.
+1. **Grok Build CLI first.** The `grok` CLI (via the `grok-build` plugin) is the
+   default destination for **building the bot** — implementation, refactor, and
+   build-fix work — and is preferred for investigation and analysis too.
+2. **Codex second.** The Codex Claude Code plugin, when grok is unusable or the
+   work suits it better.
+3. **Claude sub-agents third**, as the final fallback — see the trigger below.
 
-**Fallback trigger.** Fall back to the standard sub-agent procedure (global CLAUDE.md §2: specialist fan-out, matched agent + skill, parallel seams) only when Codex is genuinely unusable, evidenced by one of:
+**Fallback trigger.** Move down the order only when the current destination is
+genuinely unusable, evidenced by one of:
 
-* `codex:setup` reports `ready: false`, or Codex is not installed / not authenticated.
-* Codex usage, quota, or rate limit is exhausted.
-* A hard tool error or PreToolUse block on the Codex path.
-* The work is Claude-native coordination surface that Codex cannot address (writing briefs, merging agent findings, plan/spec authoring).
+* The CLI is not installed, not on `PATH`, or not authenticated (`grok models`
+  reports "not authenticated"; `codex:setup` reports `ready: false`).
+* Usage, quota, or rate limit is exhausted.
+* A hard tool error or PreToolUse block on that path.
+* The work is Claude-native coordination surface neither CLI can address
+  (writing briefs, merging agent findings, plan/spec authoring).
 
-Report the fallback and its trigger — never fall back silently, and never let "Codex was busy" become an excuse to do the work inline.
+Report the fallback and its trigger — never fall back silently, and never let
+"the CLI was busy" become an excuse to do the work inline.
 
-**Verification is unconditional.** Codex output is evidence to be checked, exactly like sub-agent output: verify claims against the artifact, require real RED→GREEN test output, and re-run gates yourself. Delegation moves the work, never the accountability.
+### Grok delegation guardrails (BINDING)
+
+`/grok-build:delegate` and the `grok-delegate` agent **default to `--write`**:
+the sandbox flag is dropped entirely and the run is auto-approved with
+`--cwd <repo>`. A write-capable external agent can therefore violate this
+repo's invariants silently. Every grok delegation must:
+
+1. **Carry the hard invariants in the brief**, restated explicitly — Nautilus
+   Trader is immutable; `allow_short` stays `False`; never weaken or delete a
+   safety, settlement, or contract test to go green; never assign a value to an
+   operator-reserved control (max daily budget, max per position); never touch
+   live-trading enablement or the NO-SEND execution-egress firewall.
+2. **Be read-only unless the task is actually a write.** Investigation,
+   analysis, and review must explicitly request read-only, because write is the
+   default — silence grants write access.
+3. **Be verified against the artifact, unconditionally.** A grok "done" or
+   "tests pass" is a claim, not evidence: read the diff, re-run the gates
+   yourself via `scripts/ci/run_tests_no_egress.sh`, and require real RED→GREEN
+   output. Delegation moves the work, never the accountability.
+
+**Accepted consequence of this decision:** grok transmits repo content — diffs,
+untracked files, and for `/grok-build:import` the full Claude transcript — to
+xAI. That is inherent to using it and is an accepted operator decision, not a
+defect to re-litigate. It does not relax the NO-SEND firewall, which governs
+what the *test and execution* paths may reach, and stays in force.
 
 The main session may:
 
