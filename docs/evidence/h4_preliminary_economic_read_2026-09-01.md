@@ -196,3 +196,36 @@ cannot speak to it.
 fill and no P&L. Whether any observed price would have been *worth* taking is
 a question for NautilusTrader, and it does not arise while the ask is absent.
 
+
+---
+
+## 8. COVERAGE CORRECTION (main session, verified independently 2026-09-01)
+
+§1 of this document states the usable capture spans **00:40:38Z-00:59:53Z
+(19m15s)**. That understates the evidence actually on disk, and the correction
+strengthens the verdict rather than weakening it.
+
+Verified by direct native read of the MDW winning rung
+(`tc-temp-mdwhigh-2026-08-31-gte91lt92f`), rows per UTC hour on 2026-09-01:
+
+    00:00Z   58   <- in climate day
+    03:00Z  122   <- in climate day
+    04:00Z  161   <- in climate day
+    05:00Z  179   <- in climate day
+    06:00Z   16      (climate day ended 06:00Z)
+    07-13Z  340
+
+- MDW's climate day 2026-08-31 ends **09-01 06:00Z** (CST, `std_utc_offset_hours
+  = -6.0`), and its trigger is 16h LST = **22:00Z on 08-31**.
+- **520 of 876** rows on that rung fall INSIDE the climate day and AFTER the
+  trigger — not the 375 instants this study sampled. The 01:00-03:11Z hole is
+  the known recorder-restart gap, not missing evidence.
+- The independent tape audit measured **0 asks across all 876 rows** of this
+  rung, spanning 13.3 h. So the 0.00% ask-availability finding rests on a far
+  wider window than §1 claims.
+
+**Net effect:** the direction of the verdict is unchanged and its support is
+broader. `REFUTED_ON_OBSERVED_WINDOW` still stands, and the un-captured EARLY
+part of each trigger window (2.68 h MDW, 5.68 h MIA, 1.68 h SFO) remains the only
+region this cannot speak to. Recorded per LESSONS L-4: a corrected fact is swept
+at every site that asserts it, not only where it was noticed.
