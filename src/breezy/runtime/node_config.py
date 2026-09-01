@@ -1,6 +1,6 @@
 """Builds the `TradingNodeConfig` for each Breezy process ROLE.
 
-Two roles, two functions, deliberately not one parameterised function:
+Three roles, three functions, deliberately not one parameterised function:
 
 * :func:`build_node_config` -- the NWS-ingestion process. Actor-driven,
   zero data clients, zero venue configuration. It must start on a host that
@@ -8,6 +8,11 @@ Two roles, two functions, deliberately not one parameterised function:
 * :func:`build_quote_tape_node_config` -- the venue quote-tape recorder.
   One read-only data client, native streaming persistence, zero Actors,
   zero exec clients. It cannot start without venue configuration.
+* :func:`build_trade_node_config` -- the trading process (EXEC SPINE R-2).
+  One read-only data client, no streaming, and -- in THIS increment -- still
+  zero exec clients, zero strategies and zero exec algorithms: it is a
+  process shell that can start, run and stop, and cannot submit an order.
+  It additionally refuses to start without a trading identity of its own.
 
 Collapsing them would make venue configuration a hard startup requirement of
 the weather collector; that regression has already happened once and the
@@ -57,6 +62,7 @@ from msgspec.structs import replace as msgspec_replace
 from nautilus_trader.common import Environment
 from nautilus_trader.config import (
     CacheConfig,
+    LiveExecEngineConfig,
     LoggingConfig,
     TradingNodeConfig,
 )
@@ -81,7 +87,11 @@ from breezy.adapters.polymarket_us.tape_records import (
     VenueSettlementSnapshot,
 )
 from breezy.persistence.catalog import CatalogPathError
-from breezy.runtime.settings import BreezyRuntimeSettings, PolymarketUSQuoteTapeSettings
+from breezy.runtime.settings import (
+    BreezyRuntimeSettings,
+    BreezyTradeSettings,
+    PolymarketUSQuoteTapeSettings,
+)
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
     # Import-time only. At RUNTIME the adapter package must be reached from
@@ -142,9 +152,11 @@ def validated_trader_id(value: str) -> TraderId:
     """
     if not _TRADER_ID_PATTERN.match(value):
         raise NodeConfigError(
-            f"trader_id {value!r} is malformed: it must be two non-empty, "
-            "whitespace-free segments separated by a single hyphen (e.g. "
-            "'BREEZY-001'). Set BREEZY_TRADER_ID accordingly."
+            f"trader_id {value!r} is malformed: it must be EXACTLY two "
+            "non-empty, whitespace-free segments separated by a single hyphen "
+            "(e.g. 'BREEZY-001'); a second hyphen is not allowed. Set the "
+            "trader-id variable for this role accordingly -- BREEZY_TRADER_ID "
+            "for ingestion, BREEZY_TRADE_TRADER_ID for the trading process."
         )
     return TraderId(value)
 
@@ -471,5 +483,105 @@ def build_quote_tape_node_config(
             rotation_time=QUOTE_TAPE_ROTATION_TIME,
             rotation_timezone=QUOTE_TAPE_ROTATION_TIMEZONE,
         ),
+    )
+    return cast(TradingNodeConfig, config)
+
+
+def build_trade_node_config(
+    settings: BreezyTradeSettings,
+    data_client_config: PolymarketUSDataClientConfig,
+) -> TradingNodeConfig:
+    """Return the `TradingNodeConfig` for the **trading** process (EXEC SPINE R-2).
+
+    A THIRD role, and a third function, for the reason the first two are
+    separate: the weather collector must start on a host with no venue
+    configuration, the recorder must refuse to start without it, and this one
+    must additionally refuse to start without a trading identity of its own
+    (:data:`breezy.runtime.settings.TRADE_TRADER_ID_VAR`). Collapsing any two
+    of the three makes one role's requirement another role's outage.
+
+    Null hypothesis, re-checked against the installed ``nautilus-trader==1.231.0``:
+    **Nautilus already provides the process shell.** ``TradingNode`` /
+    ``NautilusKernel`` build every engine, install the signal handlers
+    (``system/kernel.py:558-572``) and own start/stop. This function therefore
+    authors no process machinery. It maps settings onto native config objects,
+    and makes exactly one non-default decision (the in-flight pin below).
+
+    **What this increment CANNOT do: submit an order.** That is a structural
+    property of the returned config, not a convention:
+
+    * ``exec_clients={}`` -- no venue-facing execution transport exists;
+    * ``strategies=[]`` -- nothing that calls ``submit_order``
+      (``trading/strategy.pyx``);
+    * ``exec_algorithms=[]`` -- the third route, easy to misread as data-side
+      because ``ExecAlgorithm`` subclasses ``Actor``, but it carries
+      ``submit_order``/``modify_order``/``cancel_order`` in its own right
+      (``execution/algorithm.pyx``) and the kernel instantiates every entry
+      unconditionally.
+
+    All three are stated as empty literals rather than defaulted, so the
+    intent is visible in review and checkable from source --
+    ``TestTheReadOnlyCageIsDeclaredNotDefaulted`` reads this call.
+
+    **``inflight_check_interval_ms=0`` -- READ THIS BEFORE CHANGING IT.**
+
+    The authority for the disable is CODE, not the config docstring:
+    ``live/execution_engine.py:574-575`` and ``:591-592`` both guard on
+    ``if self.inflight_check_interval_ms > 0`` before arming the in-flight
+    timer and before contributing an interval, and ``:383-386`` schedules the
+    continuous-reconciliation task at all only if one of the three intervals
+    is truthy. Zero therefore genuinely disables in-flight checking; verified
+    by reading the installed source, not inferred from documentation.
+
+    The config docstring (``live/config.py:111-114``) says only "the interval
+    (milliseconds) between checking whether in-flight orders have exceeded
+    their time-in-flight threshold. This should not be set less than the
+    ``inflight_check_threshold_ms``." It documents **no** disable semantic,
+    and its "should not be set less than" guidance does not contemplate 0 --
+    0 is trivially less than the 5000 ms default threshold. A future reader
+    who follows the docstring alone will "helpfully" raise this to 5000 and
+    silently re-arm in-flight checking. Do not.
+
+    Why the pin matters here specifically: **Polymarket.us has no
+    client-order-id.** ``_check_inflight_orders``
+    (``live/execution_engine.py:701``) issues ``QueryOrder`` commands to
+    VERIFY -- it does not resubmit -- but after ``inflight_check_retries``
+    attempts it calls ``_resolve_inflight_order``, resolving as FAILED an
+    order we have no id with which to ask about. A false terminal on a venue
+    with no deduplication key is the first step toward a doubled position.
+
+    **``CacheConfig(database=None, flush_on_start=False)``** -- identical to
+    both sibling builders. ``kernel.py:311-329`` accepts only ``'redis'`` for
+    either backing store; there is no Redis in this deployment, and Breezy's
+    durable state deliberately lives outside the Nautilus cache.
+
+    **No streaming.** The recorder writes the tape; the trader does not. A
+    second process streaming into the same catalog root would interleave two
+    runs' feather files and make the tape unattributable.
+
+    **No operator-reserved control appears here.** Max daily budget and max
+    per position are the operator's two values, added as mechanism in a later
+    increment, never assigned by Breezy, and fail-closed when absent. There is
+    nothing to reference from a node config, so nothing is referenced.
+    """
+    # Deferred to call time to break the package import cycle documented at
+    # the TYPE_CHECKING block at the top of this module.
+    from breezy.adapters.polymarket_us.factories import POLYMARKET_US_CLIENT_NAME
+
+    # `msgspec.Struct` config classes are untyped to mypy (compiled Nautilus
+    # surface), so the constructor call is typed as Any at this one boundary.
+    config: Any = TradingNodeConfig(
+        environment=Environment.LIVE,
+        trader_id=validated_trader_id(settings.trader_id),
+        logging=LoggingConfig(log_level=settings.log_level),
+        cache=CacheConfig(database=None, flush_on_start=False),
+        message_bus=None,
+        catalogs=[],
+        actors=[],
+        data_clients={POLYMARKET_US_CLIENT_NAME: data_client_config},
+        exec_clients={},
+        strategies=[],
+        exec_algorithms=[],
+        exec_engine=LiveExecEngineConfig(inflight_check_interval_ms=0),
     )
     return cast(TradingNodeConfig, config)

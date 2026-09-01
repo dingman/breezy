@@ -139,6 +139,12 @@ ignore_imports = [
     "breezy.runtime.logging_bridge -> nautilus_trader",
     "breezy.runtime.node_config -> nautilus_trader",
     "breezy.runtime.quote_tape_cli -> nautilus_trader",
+    # Same class as `quote_tape_cli` above and no wider: a process entrypoint
+    # naming the native `TradingNode` / `TradingNodeConfig` it drives. A
+    # per-module entry, never a `breezy.runtime.**` wildcard -- the point of
+    # this contract is that adding a new Nautilus-touching module is a
+    # decision somebody makes in this file.
+    "breezy.runtime.trade_cli -> nautilus_trader",
 ]
 
 [[tool.importlinter.contracts]]
@@ -264,6 +270,12 @@ breezy-quote-tape = "breezy.runtime.quote_tape_cli:main"
 # `breezy.runtime.quote_tape_preflight_cli` for the exit contract (3 =
 # TRUNCATION DETECTED).
 breezy-quote-tape-preflight = "breezy.runtime.quote_tape_preflight_cli:main"
+# EXEC SPINE R-2. A FOURTH process, deliberately not a flag on the recorder:
+# it refuses to start without a trading identity of its own
+# (`BREEZY_TRADE_TRADER_ID`, no default), writes no tape, and in this
+# increment carries NO execution client -- it is the process shell only. See
+# `breezy.runtime.trade_cli` for the exit contract.
+breezy-trade = "breezy.runtime.trade_cli:main"
 
 [build-system]
 requires = ["uv_build>=0.12.5,<0.13.0"]

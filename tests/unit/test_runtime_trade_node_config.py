@@ -1,0 +1,220 @@
+"""EXEC SPINE R-2: the trading process's settings and node config.
+
+Scope of the increment under test, stated so a later reader cannot mistake it:
+this is CONFIG AND PROCESS ONLY. The trading process must start, reach
+``RUNNING`` and stop cleanly while carrying **no execution client and no order
+path at all**. Every assertion below that mentions execution is therefore an
+assertion about ABSENCE, and it is deliberate rather than incidental.
+
+Three things are pinned that a casual reading would treat as details:
+
+* ``exec_clients``/``strategies``/``exec_algorithms`` are all empty. Each one
+  alone is a route to ``submit_order``; the cage is the set, not any member.
+* ``inflight_check_interval_ms == 0``. Polymarket.us has **no
+  client-order-id**, so nothing that re-queries or re-resolves an order by id
+  can be trusted here. Verified against the installed
+  ``nautilus_trader/live/execution_engine.py``: ``0`` is the value that keeps
+  the continuous-reconciliation task from ever being scheduled (``:383-386``)
+  and that zeroes the in-flight branch inside it (``:574-575``, ``:591-592``,
+  ``:648``).
+* ``CacheConfig(database=None, flush_on_start=False)`` -- identical to both
+  sibling builders, because the only accepted database type is Redis
+  (``system/kernel.py:311-329``) and Breezy's durable state does not live in
+  the Nautilus cache.
+"""
+
+from __future__ import annotations
+
+import pytest
+from nautilus_trader.common import Environment
+from nautilus_trader.config import TradingNodeConfig
+from nautilus_trader.model.identifiers import TraderId
+
+from breezy.adapters.polymarket_us.config import PolymarketUSDataClientConfig
+from breezy.adapters.polymarket_us.factories import POLYMARKET_US_CLIENT_NAME
+from breezy.runtime.node_config import NodeConfigError, build_trade_node_config
+from breezy.runtime.settings import (
+    TRADE_TRADER_ID_VAR,
+    BreezyTradeSettings,
+    SettingsError,
+    load_trade_settings,
+)
+
+#: The environment a provisioned trading host carries. Venue values are
+#: ``.invalid`` hosts: nothing in this file performs network I/O.
+TRADE_ENV: dict[str, str] = {
+    TRADE_TRADER_ID_VAR: "BREEZYTRADE-001",
+}
+
+
+def make_trade_settings(**overrides: object) -> BreezyTradeSettings:
+    base: dict[str, object] = {
+        "trader_id": "BREEZYTRADE-001",
+        "log_level": "INFO",
+    }
+    base.update(overrides)
+    return BreezyTradeSettings(**base)  # type: ignore[arg-type]
+
+
+def make_data_client_config() -> PolymarketUSDataClientConfig:
+    return PolymarketUSDataClientConfig(
+        # Deliberate test-double origin off the venue domain.
+        allow_foreign_origin=True,
+        api_base_url="https://api.example.invalid",
+        gateway_base_url="https://gateway.example.invalid",
+        ws_url="wss://ws.example.invalid",
+        instrument_reload_interval_mins=5,
+        user_agent="breezy-test/1.0 (+mailto:ops@example.invalid)",
+    )
+
+
+# ---------------------------------------------------------------------------
+# Settings
+# ---------------------------------------------------------------------------
+
+
+class TestTradeSettings:
+    def test_trader_id_is_required_with_no_default(self) -> None:
+        # Unlike the collector and the recorder, the trading role has NO
+        # fallback trader id. `TraderId` is stamped on every order and every
+        # position this process will ever create; inheriting the collector's
+        # shared `BREEZY-001` would make venue-side and log-side attribution
+        # ambiguous, and would let a host provisioned only for weather ingest
+        # start a trading process by accident.
+        with pytest.raises(SettingsError) as excinfo:
+            load_trade_settings({})
+
+        assert TRADE_TRADER_ID_VAR in str(excinfo.value)
+
+    def test_blank_trader_id_is_refused(self) -> None:
+        with pytest.raises(SettingsError):
+            load_trade_settings({TRADE_TRADER_ID_VAR: "   "})
+
+    def test_trader_id_comes_from_the_trading_role_variable(self) -> None:
+        assert load_trade_settings(TRADE_ENV).trader_id == "BREEZYTRADE-001"
+
+    def test_the_collector_trader_id_does_not_satisfy_the_trading_role(self) -> None:
+        with pytest.raises(SettingsError):
+            load_trade_settings({"BREEZY_TRADER_ID": "BREEZY-001"})
+
+    def test_log_level_is_read_and_validated(self) -> None:
+        settings = load_trade_settings({**TRADE_ENV, "BREEZY_LOG_LEVEL": "DEBUG"})
+
+        assert settings.log_level == "DEBUG"
+
+        with pytest.raises(SettingsError):
+            load_trade_settings({**TRADE_ENV, "BREEZY_LOG_LEVEL": "LOUD"})
+
+    def test_needs_no_weather_collector_variables(self) -> None:
+        assert "BREEZY_SITES" not in TRADE_ENV
+        assert "BREEZY_CATALOG_BASE" not in TRADE_ENV
+
+        assert load_trade_settings(TRADE_ENV).trader_id == "BREEZYTRADE-001"
+
+    def test_carries_no_operator_reserved_control(self) -> None:
+        # The two operator-reserved controls -- max DAILY budget and max PER
+        # POSITION -- are added as mechanism in R-6 and are never given a value
+        # anywhere in the repo. A settings object that carried a field for
+        # either would be the place a default silently appeared.
+        fields = set(BreezyTradeSettings.__dataclass_fields__)
+        reserved = {"daily", "budget", "position", "notional", "max"}
+
+        assert not any(word in name for name in fields for word in reserved), fields
+
+
+# ---------------------------------------------------------------------------
+# The node config
+# ---------------------------------------------------------------------------
+
+
+class TestTradeNodeConfig:
+    def test_returns_a_live_trading_node_config(self) -> None:
+        config = build_trade_node_config(make_trade_settings(), make_data_client_config())
+
+        assert isinstance(config, TradingNodeConfig)
+        assert config.environment == Environment.LIVE
+
+    def test_registers_exactly_the_read_only_data_client(self) -> None:
+        config = build_trade_node_config(make_trade_settings(), make_data_client_config())
+
+        assert set(config.data_clients) == {POLYMARKET_US_CLIENT_NAME}
+
+    def test_declares_no_execution_client_strategy_or_exec_algorithm(self) -> None:
+        # R-2 cannot submit an order. `exec_clients={}` removes the
+        # venue-facing transport, `strategies=[]` removes the component that
+        # calls `submit_order` (`trading/strategy.pyx`), and
+        # `exec_algorithms=[]` removes the third, easily-missed route
+        # (`execution/algorithm.pyx` carries `submit_order` in its own right).
+        config = build_trade_node_config(make_trade_settings(), make_data_client_config())
+
+        assert config.exec_clients == {}
+        assert config.strategies == []
+        assert config.exec_algorithms == []
+
+    def test_pins_the_inflight_check_interval_to_zero(self) -> None:
+        # The venue has no client-order-id. `_check_inflight_orders`
+        # (`live/execution_engine.py:701`) issues `QueryOrder` commands to
+        # VERIFY -- it never resubmits -- but after
+        # `inflight_check_retries` it calls `_resolve_inflight_order`, a
+        # FALSE TERMINAL on an order we cannot query by id. Zero removes the
+        # whole loop.
+        config = build_trade_node_config(make_trade_settings(), make_data_client_config())
+
+        assert config.exec_engine is not None
+        assert config.exec_engine.inflight_check_interval_ms == 0
+
+    def test_starts_no_continuous_reconciliation_polling(self) -> None:
+        # `live/execution_engine.py:383-386` schedules the continuous
+        # reconciliation task if ANY of the three intervals is truthy. Pinning
+        # the in-flight interval to zero is only half the statement; this
+        # asserts the other two are absent too, so the task is never created.
+        # If a Nautilus upgrade gives either a default, this fails loudly
+        # rather than starting a poller nobody asked for.
+        config = build_trade_node_config(make_trade_settings(), make_data_client_config())
+
+        assert config.exec_engine is not None
+        assert config.exec_engine.open_check_interval_secs is None
+        assert config.exec_engine.position_check_interval_secs is None
+
+    def test_uses_no_redis_backed_cache_or_message_bus(self) -> None:
+        config = build_trade_node_config(make_trade_settings(), make_data_client_config())
+
+        assert config.cache is not None
+        assert config.cache.database is None
+        assert config.cache.flush_on_start is False
+        assert config.message_bus is None
+
+    def test_declares_no_actors_and_registers_no_data_engine_catalogs(self) -> None:
+        config = build_trade_node_config(make_trade_settings(), make_data_client_config())
+
+        assert config.actors == []
+        assert config.catalogs == []
+
+    def test_writes_no_tape(self) -> None:
+        # The recorder streams; the trader does not. A second process writing
+        # into the tape root would interleave two runs' feather files under
+        # one catalog and make the recorded tape unattributable.
+        config = build_trade_node_config(make_trade_settings(), make_data_client_config())
+
+        assert config.streaming is None
+
+    def test_trader_id_comes_from_settings(self) -> None:
+        config = build_trade_node_config(
+            make_trade_settings(trader_id="BREEZYTRADE-042"), make_data_client_config()
+        )
+
+        assert config.trader_id == TraderId("BREEZYTRADE-042")
+
+    def test_malformed_trader_id_raises_node_config_error(self) -> None:
+        with pytest.raises(NodeConfigError):
+            build_trade_node_config(
+                make_trade_settings(trader_id="nope"), make_data_client_config()
+            )
+
+    def test_log_level_comes_from_settings(self) -> None:
+        config = build_trade_node_config(
+            make_trade_settings(log_level="WARNING"), make_data_client_config()
+        )
+
+        assert config.logging is not None
+        assert config.logging.log_level == "WARNING"

@@ -337,7 +337,14 @@ class TestTheReadOnlyCageIsDeclaredNotDefaulted:
 
     def test_the_repo_builds_exactly_the_node_configs_this_rule_covers(self) -> None:
         # Guards the rule against silently going vacuous if a build site moves.
-        assert len(_node_config_calls()) == 2
+        #
+        # Raised 2 -> 3 on 2026-09-01 for EXEC SPINE R-2's
+        # `build_trade_node_config`. Raising this number is only legitimate
+        # alongside the new site actually passing the per-field rule below --
+        # the count exists so a new `TradingNodeConfig(...)` cannot appear
+        # WITHOUT a reviewer deciding, in this file, that its execution cage
+        # was checked.
+        assert len(_node_config_calls()) == 3
 
     @pytest.mark.parametrize("field", ["exec_clients", "strategies", "exec_algorithms"])
     def test_every_node_config_declares_the_field_empty(self, field: str) -> None:

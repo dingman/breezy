@@ -73,6 +73,23 @@ _QUOTE_TAPE_DISK_CHECK_INTERVAL_VAR = (
     "BREEZY_POLYMARKET_US_QUOTE_TAPE_DISK_CHECK_INTERVAL_SECONDS"
 )
 
+#: The TRADING role's own trader id. Read ONLY by
+#: :func:`load_trade_settings`, and deliberately a DIFFERENT variable from
+#: ``BREEZY_TRADER_ID`` with NO default.
+#:
+#: ``TraderId`` is stamped on every order and every position the trading
+#: process will ever create. Two reasons this is separate and required:
+#:
+#: * a host provisioned only for weather ingestion carries
+#:   ``BREEZY_TRADER_ID`` (which defaults anyway), so reusing it would let a
+#:   collector host start a trading process by accident -- the fail-OPEN
+#:   direction, on the one process that can eventually spend money;
+#: * an order attributed to the collector's shared ``BREEZY-001`` is
+#:   ambiguous in the venue's records and in ours.
+#:
+#: There is no default because there is no correct value to invent.
+TRADE_TRADER_ID_VAR = "BREEZY_TRADE_TRADER_ID"
+
 _DEFAULT_TRADER_ID = "BREEZY-001"
 
 #: G-19 item B11 asked for this to be derived from the NWS CLI issuance
@@ -614,4 +631,65 @@ def load_quote_tape_settings(
         max_file_bytes_warning=max_file_bytes_warning,
         max_file_bytes_error=max_file_bytes_error,
         disk_check_interval_seconds=disk_check_interval_seconds,
+    )
+
+
+# ---------------------------------------------------------------------------
+# EXEC SPINE R-2 -- the TRADING role
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True, slots=True)
+class BreezyTradeSettings:
+    """Validated settings for the **trading** role.
+
+    A THIRD type alongside :class:`BreezyRuntimeSettings` and
+    :class:`PolymarketUSQuoteTapeSettings`, for the reason the other two are
+    separate: three processes, three jobs, three different things that must
+    make them refuse to start. Folding the trading role's required identity
+    onto a shared type would make it mandatory for the weather collector and
+    the recorder as well, which is exactly the outage this repo has already
+    taken once.
+
+    Deliberately SMALL. Everything the trading process needs beyond an
+    identity and a log level is owned elsewhere and is not re-read here:
+
+    * venue endpoints, user agent and signing belong to
+      :func:`breezy.adapters.polymarket_us.factories.config_from_env`, which
+      already implements the section 7 environment contract; a second reader
+      would be a second competing policy for the same variables;
+    * the two OPERATOR-RESERVED controls -- max daily budget and max per
+      position -- are **not fields here and never will be**. They are added as
+      mechanism in a later increment, they are never given a value by Breezy,
+      and their absence must fail closed. A settings field is precisely where
+      a default would silently appear, so there is none.
+    """
+
+    trader_id: str
+    log_level: str
+
+
+def load_trade_settings(env: Mapping[str, str] | None = None) -> BreezyTradeSettings:
+    """Load and validate the trading process's own settings.
+
+    Exactly one required variable, :data:`TRADE_TRADER_ID_VAR`, with no
+    default and no fallback to the collector's ``BREEZY_TRADER_ID``. Calling
+    this IS the act of starting the trading role, so failing here fails the
+    right process and never the weather collector.
+
+    The trader id's SHAPE is validated later, by
+    :func:`breezy.runtime.node_config.validated_trader_id`, which owns that
+    rule for all three roles. What is checked here is presence and
+    non-blankness -- the part that is an environment-contract question rather
+    than an identifier-format one.
+    """
+    active_env: Mapping[str, str] = os.environ if env is None else env
+
+    raw = _require(active_env, TRADE_TRADER_ID_VAR)
+    if not raw.strip():
+        raise SettingsError(f"{TRADE_TRADER_ID_VAR} is required and must not be blank")
+
+    return BreezyTradeSettings(
+        trader_id=raw.strip(),
+        log_level=_parse_log_level(active_env),
     )
