@@ -137,6 +137,7 @@ from nautilus_trader.model.instruments import BinaryOption, Instrument
 from nautilus_trader.model.objects import Price, Quantity
 
 from breezy.adapters.polymarket_us.errors import (
+    EmptyBookSideError,
     FeeScheduleUnknownError,
     InstrumentDefinitionError,
     VenuePayloadError,
@@ -556,10 +557,20 @@ def _require_best_level(levels: object, *, side: str, want_lowest: bool) -> tupl
     any other price -- would fabricate a top of book the venue did not send.
     Empty is therefore an error here, not a default. Depth capture uses
     ``parse_book_levels``, which records the populated side instead.
+
+    The refusal is an :class:`~breezy.adapters.polymarket_us.errors.EmptyBookSideError`
+    -- a ``VenuePayloadError`` subclass, so every existing caller and test is
+    unaffected -- purely so the caller can separate this EXPECTED condition
+    from a genuinely malformed payload without matching on message text. Every
+    other refusal on this path (malformed level, out-of-range price,
+    non-positive size, crossed book) stays a plain ``VenuePayloadError`` and
+    stays loud.
     """
     parsed = _parse_levels(levels, side=side)
     if not parsed:
-        raise VenuePayloadError(f"Book side {side!r} is empty; there is no top of book to quote")
+        raise EmptyBookSideError(
+            f"Book side {side!r} is empty; there is no top of book to quote", side=side
+        )
     return min(parsed) if want_lowest else max(parsed)
 
 

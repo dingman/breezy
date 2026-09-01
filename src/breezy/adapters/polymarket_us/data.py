@@ -74,7 +74,7 @@ from nautilus_trader.model.identifiers import ClientId, InstrumentId, Venue
 from nautilus_trader.model.instruments import BinaryOption, Instrument
 
 from breezy.adapters.polymarket_us.config import PolymarketUSDataClientConfig
-from breezy.adapters.polymarket_us.errors import PolymarketUSError
+from breezy.adapters.polymarket_us.errors import EmptyBookSideError, PolymarketUSError
 from breezy.adapters.polymarket_us.feed_fault import record_fatal_feed_fault
 from breezy.adapters.polymarket_us.parsing import (
     EXPIRED_MARKET_STATES,
@@ -110,6 +110,7 @@ __all__ = [
     "FATAL_SHUTDOWN_REQUEST_BUDGET",
     "MARKET_SLUG_KEY",
     "MISSING_ROUTING_KEY_WARN_EVERY",
+    "ONE_SIDED_BOOK_SUMMARY_EVERY",
     "POLYMARKET_US_VENUE",
     "FrameDiagnostic",
     "MarketsFeed",
@@ -125,6 +126,7 @@ __all__ = [
     "diagnose_frame_payload",
     "frame_class_counts",
     "instrument_boundaries_ns",
+    "should_report_at_count",
     "should_warn_at_count",
     "subscription_changes_after_discovery",
 ]
@@ -161,6 +163,21 @@ MARKET_SLUG_KEY: Final[str] = "marketSlug"
 #: Rate limited because on a wrong key guess EVERY frame lands there, and a
 #: log line per frame is a denial of service against the operator's attention.
 MISSING_ROUTING_KEY_WARN_EVERY: Final[int] = 100
+
+#: How often the running one-sided-book TOTAL is restated in the log.
+#:
+#: The per-instrument notice fires once and then never again, so on a long
+#: unattended run the last line about a one-sided book would be minutes old
+#: while the condition kept occurring tens of thousands of times. This restates
+#: the running total at a deliberately coarse cadence -- roughly eight lines an
+#: hour at the rate measured on a 60-market weather capture -- so the VOLUME is
+#: legible from the log alone, without an operator attaching to the process to
+#: read :attr:`PolymarketUSDataClient.one_sided_book_refusals`.
+#:
+#: Coarser than :data:`MISSING_ROUTING_KEY_WARN_EVERY` on purpose: that alarm
+#: signals a possible total feed outage and must be seen early, whereas this
+#: one describes a condition that is already known to be benign and handled.
+ONE_SIDED_BOOK_SUMMARY_EVERY: Final[int] = 1000
 
 #: How often the safe-mode watchdog samples the socket's degraded flag.
 DEFAULT_FEED_WATCH_INTERVAL_SECS: Final[float] = 5.0
@@ -457,6 +474,25 @@ class QuoteTickParser(Protocol):
     ) -> QuoteTick: ...
 
 
+def should_report_at_count(count: int, *, every: int) -> bool:
+    """Report on the FIRST occurrence, then once every ``every`` occurrences.
+
+    The one rate-limit rule in this module, parameterised by cadence. Reports
+    immediately so a new condition is visible within one frame rather than
+    after a hundred, then bounds itself so a condition that occurs at the full
+    frame rate of the feed cannot become a denial of service against the
+    operator's attention.
+
+    A pure function, and separate from the caller, because ``Component._log``
+    is ``cdef readonly`` (``common/component.pxd:226``) and therefore cannot
+    be substituted in a test -- the policy would otherwise be unverifiable,
+    and an unverifiable rate limiter is how a report quietly becomes silence.
+    """
+    if count <= 0 or every <= 0:
+        return False
+    return count == 1 or count % every == 0
+
+
 def should_warn_at_count(count: int) -> bool:
     """Rate-limit policy for a repeating WARN, shared by every such alarm here.
 
@@ -472,10 +508,11 @@ def should_warn_at_count(count: int) -> bool:
     Warns on the FIRST occurrence (so a wrong key guess is visible within one
     frame, not after a hundred), then once every
     :data:`MISSING_ROUTING_KEY_WARN_EVERY` occurrences.
+
+    Delegates to :func:`should_report_at_count` rather than restating the
+    rule, so the one-sided-book summary and this warning cannot drift apart.
     """
-    if count <= 0:
-        return False
-    return count == 1 or count % MISSING_ROUTING_KEY_WARN_EVERY == 0
+    return should_report_at_count(count, every=MISSING_ROUTING_KEY_WARN_EVERY)
 
 
 def _classify_frame(payload: Mapping[str, Any]) -> str:
@@ -676,6 +713,11 @@ class PolymarketUSDataClient(LiveMarketDataClient):
         self._depth_levels_truncated: int = 0
         self._clock_offset_samples: int = 0
         self._quote_parse_failures: int = 0
+        # One-sided-book accounting. Reported once per INSTRUMENT, never once
+        # per frame -- the same shape as `_silent_subscription_slugs` above,
+        # for the same reason: the condition recurs at the full frame rate.
+        self._one_sided_book_instruments: set[str] = set()
+        self._one_sided_book_refusals: int = 0
         self._expired_without_terminal_settlement: int = 0
         self._missing_cache_alerts: int = 0
 
@@ -741,6 +783,45 @@ class PolymarketUSDataClient(LiveMarketDataClient):
         ``tests/unit/test_quote_tape_consumer_contract.py::TestCounterSemantics``.
         """
         return self._quote_parse_failures
+
+    @property
+    def one_sided_book_refusals(self) -> int:
+        """Quote refusals caused by an empty book side. The VOLUME, at a glance.
+
+        This is the routine, expected case and carries NO data loss: the
+        populated side is still recorded as ``OrderBookDepth10`` (BL-18), and
+        the venue's state, mark price and settlement provenance are still
+        recorded beside it. What is lost is only the two-sided ``QuoteTick``,
+        which the venue did not supply the inputs for.
+
+        Counts REFUSALS, not frames or markets -- it is exactly the number of
+        log lines this condition used to emit at ERROR, one per frame, so an
+        operator comparing this against :attr:`one_sided_book_instruments`
+        sees both how loud the old reporting was and how few distinct markets
+        are behind it.
+
+        A SUBSET of :attr:`quote_parse_failures`, never a separate population:
+        every refusal counted here also increments that counter, because the
+        frame genuinely yielded no quote. The two must never be summed.
+        """
+        return self._one_sided_book_refusals
+
+    @property
+    def one_sided_book_instruments(self) -> int:
+        """Distinct instruments seen with a one-sided book. The REPORT count.
+
+        Exactly the number of log lines the condition has produced, because
+        the notice fires once per instrument on first sighting and never
+        again for that instrument. A market that goes one-sided for the first
+        time therefore still produces a fresh line, while a market that has
+        been one-sided for eight hours produces none.
+
+        Deliberately NOT reset when a market recovers to a two-sided book:
+        the question this answers is "which markets have ever failed to
+        quote", and re-reporting a market that flaps would reintroduce the
+        per-frame noise this replaces.
+        """
+        return len(self._one_sided_book_instruments)
 
     @property
     def expired_without_terminal_settlement(self) -> int:
@@ -1312,9 +1393,24 @@ class PolymarketUSDataClient(LiveMarketDataClient):
         is measured against); the rest log at DEBUG, because their absence is
         routinely legitimate and an ERROR per frame would drown the operator.
         Nothing is ever substituted for a value the venue did not send.
+
+        **One refusal is exempt from that ERROR, by TYPE.** An empty book side
+        is the venue's normal state on a thin weather market, is already fully
+        handled (depth is still recorded), and arrives here at the full frame
+        rate: a live 60-market capture produced 85 ERROR lines in its first
+        minute, roughly 50,000 over a ten-hour run, which buries the one real
+        error an unattended operator needs to see. It is therefore routed to
+        :meth:`_note_one_sided_book`, which reports it once per instrument at
+        INFO. The routing is on
+        :class:`~breezy.adapters.polymarket_us.errors.EmptyBookSideError`, not
+        on the message text, so a malformed level, an out-of-range price, a
+        crossed book or a moved schema all still take the ERROR branch below.
         """
         try:
             return parser(payload, instrument=instrument, ts_init=ts_init)
+        except EmptyBookSideError as exc:
+            self._note_one_sided_book(instrument, exc)
+            return None
         except (PolymarketUSError, ValueError, KeyError, TypeError) as exc:
             message = (
                 f"Could not parse {label} for {instrument.id}: {type(exc).__name__}"
@@ -1324,6 +1420,56 @@ class PolymarketUSDataClient(LiveMarketDataClient):
             else:
                 self._log.debug(message)
             return None
+
+    def _note_one_sided_book(self, instrument: Instrument, exc: EmptyBookSideError) -> None:
+        """Report an expected, already-handled one-sided book. Once per instrument.
+
+        **Severity is INFO, and that is the fix.** The condition is routine
+        (the repo's measured median top-of-book bid on these markets is 0.3
+        contracts), it is fully handled (the populated side is still recorded
+        as depth), and it needs no operator action. Logging it at ERROR once
+        per frame is what BL-22 was, in a different file: a log an operator
+        cannot read is a log that hides the failure it exists to surface.
+
+        **Cadence follows the precedent already in this class.**
+        :meth:`_report_new_silent_subscriptions` reports once per SLUG rather
+        than once per sample, for the same reason -- a per-occurrence line is
+        emitted at the rate of the feed, not at the rate of new information.
+        The set is what bounds it, and it is also what guarantees a market
+        that goes one-sided for the FIRST time still produces a fresh line.
+
+        **Volume stays legible** through :attr:`one_sided_book_refusals`, which
+        is restated in the log every
+        :data:`ONE_SIDED_BOOK_SUMMARY_EVERY` refusals so an unattended run does
+        not go hours with no indication of the rate.
+
+        Nothing about capture changes here: this method only counts and logs.
+        """
+        self._one_sided_book_refusals += 1
+        instrument_key = str(instrument.id)
+        if instrument_key not in self._one_sided_book_instruments:
+            self._one_sided_book_instruments.add(instrument_key)
+            self._log.info(
+                f"Order book for {instrument_key} has an empty {exc.side!r} side, so no "
+                "two-sided QuoteTick can be formed. EXPECTED and HANDLED: the populated "
+                "side IS still being recorded as depth, along with the venue state, mark "
+                "price and settlement provenance. Reported once per instrument -- "
+                f"{self._one_sided_book_refusals} refusal(s) across "
+                f"{len(self._one_sided_book_instruments)} instrument(s) so far. A payload "
+                "malformed for any other reason is a different condition and is still "
+                "reported at ERROR."
+            )
+            return
+        if should_report_at_count(
+            self._one_sided_book_refusals, every=ONE_SIDED_BOOK_SUMMARY_EVERY
+        ):
+            self._log.info(
+                f"{self._one_sided_book_refusals} quote(s) refused so far because a book "
+                f"side was empty, across {len(self._one_sided_book_instruments)} "
+                f"instrument(s); {self._quotes_published} quote(s) published. Running "
+                "total only -- the condition is expected on thin weather markets and "
+                "depth capture is unaffected."
+            )
 
     def _note_depth_truncation(
         self, payload: Mapping[str, Any], depth: Any, ts_init: int

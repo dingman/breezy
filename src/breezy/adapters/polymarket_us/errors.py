@@ -18,6 +18,7 @@ __all__ = [
     "CredentialConfigError",
     "CredentialSerializationError",
     "CredentialSourceError",
+    "EmptyBookSideError",
     "FeeScheduleUnknownError",
     "GatewayForbiddenError",
     "InstrumentDefinitionError",
@@ -134,6 +135,43 @@ class VenuePayloadError(PolymarketUSError, ValueError):
     still sitting inside the one adapter-wide taxonomy so a caller can write
     ``except PolymarketUSError`` and miss nothing.
     """
+
+
+class EmptyBookSideError(VenuePayloadError):
+    """One side of the order book carried no levels, so there is no top of book.
+
+    **This is the venue's NORMAL state, not a fault.** The repo's own
+    measurement of Polymarket.us weather markets puts the median top-of-book
+    bid at 0.3 contracts, and the ``polymarket-us-integration`` discovery log
+    records ``marketData.bids == []`` on 5/5 frames of a deep-out-of-the-money
+    strike. A ten-hour capture of ~60 markets meets this condition tens of
+    thousands of times.
+
+    Its own class purely so the CALL SITE can tell it apart. The behaviour is
+    unchanged and deliberately so: ``QuoteTick`` is two-sided, and
+    :func:`~breezy.adapters.polymarket_us.parsing.parse_book_top` still
+    refuses rather than inventing a bid, while
+    :func:`~breezy.adapters.polymarket_us.parsing.parse_book_levels` still
+    records the populated side as depth (BL-18, commit ``b6e4982``). What
+    changes is only how the refusal is REPORTED: an expected, already-handled
+    condition logged at ERROR once per frame buries the one genuine error an
+    unattended operator needs to see, which is the same operational failure as
+    BL-22.
+
+    A ``VenuePayloadError`` subclass, not a sibling, so every existing
+    ``except VenuePayloadError`` and every existing
+    ``pytest.raises(VenuePayloadError)`` keeps holding. Discriminating on the
+    message text instead would have been a substring match against a sentence
+    -- silently broken by any rewording, and unable to distinguish this from a
+    crossed book or a malformed level, both of which stay loud.
+
+    ``side`` is the venue's own spelling of the empty side (``"bids"`` or
+    ``"offers"``) so the report can name it without re-parsing the message.
+    """
+
+    def __init__(self, message: str, *, side: str) -> None:
+        super().__init__(message)
+        self.side: str = side
 
 
 class InstrumentDefinitionError(VenuePayloadError):
