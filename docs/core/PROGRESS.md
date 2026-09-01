@@ -51,21 +51,17 @@ Two consequences that are not optional (tracked by P4):
   are dead on MDW/NYC/SFO** (they need exact equality). Open tails unaffected:
   97% of revisions UPWARD, downward rate 0.21%.
   `docs/evidence/observation_lock_falsification_2026-08-31.md`.
-- **`cli_settlement_print_lock` is REFUTED on real data (2026-09-01).** Two
-  independent nulls on the same window: no legal window, and no ask. On all five
-  stations the bucket containing the printed value carried **0 asks across 3332
-  depth rows**. The settlement-truth edge is measured-certain and
-  unexecutable. `docs/evidence/print_lock_refuted_2026-09-01.md`; rule L-7.
-- **The book reprices on PHYSICAL determination, not on the print.** The NYC
-  winner had no ask at 03:30Z -- 3 h BEFORE its final printed, ~10 h after its
-  climate day ended. The ladder itself is liquid (2026-08-31: 18653/21985 rows
-  carry an ask, 84.8%; 2026-09-01: 100424/100431, 100.0%); only the winning rung
-  is unoffered. Any trigger anchored to a publication event arrives late by the
-  publication lag. L-7 amendment.
-
-- **Historical forecasts are NOT proven unavailable.** `CLI_BACKFILL_PLAN.md:46`
-  claims otherwise from *repo state*, not availability. Open-Meteo
-  `/v1/previous-runs` was deferred, never rejected. Still unverified.
+- **Lock strategies are DEAD on this venue — see LESSONS L-9.** Three families,
+  three refutations, one mechanism: the near-certain rung is never offered. The
+  ladder is liquid; only the winning rung is unoffered. Do not design a fourth.
+- **Historical forecasts ARE available — VERIFIED 2026-08-31, was stale here.**
+  `previous-runs-api.open-meteo.com/v1/forecast` (hourly surface) returns 200;
+  archive depth confirmed to **2019**; publication-lag and restatement captured.
+  `docs/evidence/open_meteo_previous_runs_probe_2026-08-31T005848Z/`. IEM AFOS
+  forecast PIL is reachable but FAILS its pre-registered bar (parse rate 0.5125
+  vs >=0.9; issuance/office attribution 238/240). **But a forecast archive
+  yields a CALIBRATION dataset, not a backtest** — a backtest also needs prices,
+  and those are forward-only (next line). Both probe reports say so explicitly.
 - **Price history genuinely is forward-only.** No public trade tape; expired
   markets return null prices keeping only `settlementPx`.
 - **There is no NO-side instrument, and there cannot be one** (BL-6). NO is a
@@ -89,31 +85,16 @@ Two consequences that are not optional (tracked by P4):
 
 Evidence: `docs/evidence/observation_lock_falsification_2026-08-31.md`.
 
-### [HIGH] BL-24 — H3's Gate 0: does Breezy hold ANY intraday observation?
+### [HIGH] BL-24 — no intraday observation type exists in-bot
 
-H3 needs `R(t)`, the running observed max, updated intraday and available with
-no look-ahead. `running_extreme_lock` reads `observation.tmax_f`, which comes
-from CLI PRELIMINARY/FINAL products -- end-of-period summaries, not intraday.
-If no hourly/METAR/ASOS path exists, `R(t)` does not exist inside the bot and H3
-is unimplementable until it does. Two look-ahead traps to settle in the same
-pass: for FINALS `ts_event` is climate-day END, not the observed high's
-measurement time; and `BacktestEngine` orders by `ts_init`, so a running max
-built from measurement timestamps and stamped available afterwards LEAKS.
-
-**Acceptance:** a cited YES/NO on intraday ingest; per-class `ts_event`/`ts_init`
-provenance; and, if NO, the smallest native-first extension named against an
-existing actor/data-client pattern. Observations are backfillable from the NWS
-archive, so this gates H3's labelling, not today's capture.
-
-### [MED] BL-21 — both tail-locks are outlier strategies; base rate unknown
-
-H1 fired 0/4 and H2 0/4 on the first in-window capture; the venue lists one
-`gte<N>f` and one `ltXf` per city-day, positioned outside the day's actual, so
-the day lands in the interiors. The margin table was built by sweeping floors
-in `[H-5,H]` the venue never lists. Pre-registered kill: trigger rate < 0.20
-over captured station-days. Any ask/break-even comparison MUST gate on the
-trigger first — an unfired tail shows pennies that read as free certainty.
-`first_in_window_capture_2026-09-01.md`, `h2_lower_tail_rejected_2026-09-01.md`.
+Gate 0 RESOLVED: no live intraday ingest (transport hardcodes CLI, two URL
+builders, `_fetch` private at `ingest/http.py:769`), but ~5 yr of 5-min ASOS is
+on disk and Open-Meteo previous-runs reaches 2019. `R(t)` cannot enter a Nautilus
+backtest — no `Data` subclass, no catalog wiring, no client. Plan (unreviewed):
+`docs/plans/intraday_observation_ingest_2026-09-01.md`. Two traps it found:
+barrier W1 (`test_weather_data_type_barrier.py:94`) does not cover a new record
+class, and `test_probe_containment.py:297-310` asserts set EQUALITY so a third
+endpoint turns it RED — widen both, never relax.
 
 ### [MED] BL-14 — `RefusalAlerter` alerts on `SHORTS_DISABLED` only
 
@@ -129,8 +110,20 @@ Generalise `_conditions` over the counted key set.
 
 ### [MED] BL-16 — `settlement_halt` is dead code; the 1.0h halt never fires
 
-`risk.py:395-398` checks halt (1.0h) before `min_hours_to_settlement` (2.0h); a
+`risk.py:395-398` checks halt before `min_hours_to_settlement` (2.0h); a
 decreasing clock always crosses 2.0 first. Decide if the two knobs are one.
+
+### [HIGH] BL-25 — three cost/sizing defects the tape already proves wrong
+
+Measured over the captured ladder: a $24.53 order exceeds level-0 size in 57.4%
+of snapshots and exhausts all 10 levels in 6.5%; realised walk-the-book slippage
+is p90 0.137 / p99 0.661, and 36.0% of snapshots exceed the flat 0.01 floor from
+the recorded book ALONE. Fix all three: (1) `trade_cost_prob`
+(`weather_common/costs.py:165-195`) is depth-blind — make it a VWAP walk;
+(2) `risk.py:485` returns `clipped_quantity=signed_qty_delta`, never clipped to
+`quote.ask_size` — clip to ladder depth; (3) ROI is reported on a configured
+$10,000 balance (`run_weather_strategy_backtests.py:350`), so -$5.41 shows as
+-0.054% when it is ~-20% on capital actually deployed — report both.
 
 ---
 
@@ -169,10 +162,7 @@ either count it under the same bounded key set or document why not.
 | CF-6 | MED | `tests/live/test_nws_live_ingest.py:86` hardcodes a personal contact; must be a role address |
 | CF-7 | MED | `BREEZY_USER_AGENT` required on offline paths (`SharedIngestState.__init__`) |
 | CF-8 | MED | Sibling-station products unmarked in the integrity index; wasted fetches |
-| CF-9 | LOW | `_store_validators` can pair a fresh ETag with a stale `Last-Modified` |
-| CF-10 | LOW | `respx` intercepts below httpx header validation; no mocked test catches a bad UA |
 | CF-11 | LOW | `ruff format --check`: 31 unformatted files; formatting is in no gate |
-| CF-12 | LOW | Gate log `state=BLOCKED reason=successful_poll` is cosmetically misleading |
 | CF-13 | UNPROVEN | No CCA/CCB CORRECTION seen live; supersession path fixture-covered only |
 
 ### Programme sequence (carried forward from 2026-08-30)
@@ -205,16 +195,25 @@ plain work items, no longer blocked. Still blocked:
 | G-16 | ≥14 days of joined tape | calendar: 14 days after G-14 |
 | G-17 | Phase 1.5 premise GO/NO-GO | G-16. **NO-GO stops the programme.** |
 
-**Immediate path to the ROI stop gate.** The observation family's
-settlement-truth branch is closed (print-lock refuted). The live hypothesis is
-**H3** (`docs/strategies/H3_intraday_running_max_lock.md`): buy the bucket
-holding the running observed max `R(t)` after the diurnal peak, while the book
-still offers it. Its Gate 0 is a DATA prerequisite, not a modelling one --
-Breezy's ingest is CLI-product-driven and may hold no intraday observation at
-all, in which case `R(t)` does not exist inside the bot. Sequence: settle Gate 0
--> keep the recorder alive through 2026-09-02 13:00Z so the 09-01 peak window
-and its finals are both on tape -> label the 09-01 tape by `R(t)` -> H3 kill
-criteria 1-4.
+**The stop gate as written is UNSATISFIABLE by backtest on this venue.** ROI is
+a function of fill prices; price history is forward-only, so no amount of weather
+or forecast data produces a historical ROI. Both P2 probe reports say it
+outright: a forecast archive yields a CALIBRATION dataset, not a backtest.
+Measured: total addressable notional at any eventually-winning rung across the
+whole capture is **$0.574**, which nets NEGATIVE after fees and is refused by
+`min_liquidity_contracts=25` anyway. Sample power: sigma/mu ~ 8 per trade, so
+n ~ 300 station-days (~60 clean calendar days at 5 stations) before a CI lower
+bound can clear break-even.
+
+**Ordered path to a real-money ROI verdict:** (1) BL-25 — fix the three
+cost/sizing defects the tape already disproves; (2) continuous trigger-covering
+capture, not 19-minute slices; (3) freeze backtest in the REFUTATION + plumbing
+role only; (4) paper/live-small is REQUIRED — offer survival and market impact
+are counterfactuals about the venue's reaction to OUR order and exist in no
+recording; (5) feed measured latency/fill-probability/survival back as backtest
+inputs; (6) accumulate ~300 station-days; (7) settle CAPACITY first — with the
+winner-side book at ~$0.58 and the bid side empty, a correct strategy may still
+be uninvestable at size. Steps 4-6 cannot be shortened by engineering.
 
 ---
 
