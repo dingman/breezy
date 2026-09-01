@@ -34,6 +34,7 @@ from breezy.adapters.polymarket_us.factories import (
     POLYMARKET_US_CLIENT_NAME,
     PolymarketUSLiveDataClientFactory,
 )
+from breezy.adapters.polymarket_us.safety import MAX_ORDER_NOTIONAL_USD_ENV_VAR
 from breezy.runtime import trade_cli
 from breezy.runtime.settings import TRADE_TRADER_ID_VAR
 from breezy.runtime.trade_cli import (
@@ -55,6 +56,23 @@ TRADE_ENV: dict[str, str] = {
     "POLYMARKET_US_WS_URL": "wss://ws.example.invalid",
     "POLYMARKET_US_USER_AGENT": "breezy-test/1.0 (+mailto:ops@example.invalid)",
 }
+
+
+#: Test-local stand-in for the operator's per-order USD ceiling
+#: (`BREEZY_MAX_ORDER_NOTIONAL_USD`). `build_trade_node_config` configures the
+#: NATIVE per-order notional cap from that control and FAILS CLOSED when it is
+#: absent, so every builder call in this module needs it present. The number is
+#: arbitrary and test-local: it is not a production risk setting, and it is not
+#: either operator-reserved control (max daily budget, max per position),
+#: neither of which is read, defaulted or inferred anywhere on this path. The
+#: refusal itself is covered by
+#: `tests/contract/test_native_order_cap_wiring.py`, which is where it belongs.
+OPERATOR_ORDER_CEILING_USD = "25"
+
+
+@pytest.fixture(autouse=True)
+def _operator_order_ceiling(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv(MAX_ORDER_NOTIONAL_USD_ENV_VAR, OPERATOR_ORDER_CEILING_USD)
 
 
 class RecordingNode:
@@ -312,6 +330,33 @@ def test_a_host_provisioned_only_for_weather_ingest_cannot_start_the_trader() ->
     assert code == EXIT_CONFIG_ERROR
     assert TRADE_TRADER_ID_VAR in err.getvalue()
     assert RecordingNode.instances == []
+
+
+def test_a_missing_operator_order_ceiling_is_a_configuration_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A host with no per-order ceiling starts NOTHING, and is told why.
+
+    `build_trade_node_config` configures the native per-order notional cap
+    from `BREEZY_MAX_ORDER_NOTIONAL_USD` and refuses when that operator
+    control is absent -- the process must never come up uncapped. Absence is
+    an operator provisioning fault: exit 2 and one readable line naming the
+    control, not a traceback reported as an engineering crash.
+
+    This routes correctly with no change to `_CONFIG_ERRORS`:
+    `LiveTradingPermissionError` subclasses `PermissionError`, which
+    subclasses `OSError`, which that tuple already names. Asserted rather than
+    assumed -- narrowing `OSError` there later would silently turn this
+    refusal into an exit-1 crash report.
+    """
+    monkeypatch.delenv(MAX_ORDER_NOTIONAL_USD_ENV_VAR, raising=False)
+    err = io.StringIO()
+
+    code = run(env=TRADE_ENV, node_factory=RecordingNode, stderr=err)
+
+    assert code == EXIT_CONFIG_ERROR
+    assert MAX_ORDER_NOTIONAL_USD_ENV_VAR in err.getvalue()
+    assert RecordingNode.instances == [], "no node is built without a ceiling"
 
 
 def test_a_malformed_trader_id_is_a_configuration_error_not_a_crash() -> None:

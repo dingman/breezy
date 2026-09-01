@@ -63,6 +63,7 @@ from nautilus_trader.common import Environment
 from nautilus_trader.config import (
     CacheConfig,
     LiveExecEngineConfig,
+    LiveRiskEngineConfig,
     LoggingConfig,
     TradingNodeConfig,
 )
@@ -487,6 +488,65 @@ def build_quote_tape_node_config(
     return cast(TradingNodeConfig, config)
 
 
+def build_trade_risk_engine_config(
+    market_slugs: tuple[str, ...],
+) -> LiveRiskEngineConfig:
+    """Return the trading process's NATIVE pre-trade risk configuration.
+
+    Nothing here is new machinery: ``RiskEngine`` already implements a
+    per-order notional cap (``risk/engine.pyx:675-679``, denial reason
+    ``NOTIONAL_EXCEEDS_MAX_PER_ORDER`` at ``:912-917``) and the kernel already
+    builds the engine from this config. Until now Breezy configured **no**
+    native risk caps at all, so that mechanism sat unused.
+
+    **Shape, read from source, not guessed.**
+    ``RiskEngineConfig.max_notional_per_order`` is ``dict[str, int]``
+    (``risk/config.py:44``) keyed by instrument-ID string --
+    ``_initialize_risk_checks`` calls ``InstrumentId.from_str_c`` on every key
+    (``risk/engine.pyx:193-196``). It is NOT a scalar and there is no
+    all-instruments form, so the cap can only cover instrument IDs that exist
+    when the config is built. That is why ``market_slugs`` is the input.
+
+    **Residual, stated rather than papered over.** Markets discovered at
+    runtime by the instrument provider are NOT in this mapping and are NOT
+    covered by this cap; only statically declared slugs
+    (``POLYMARKET_US_MARKET_SLUGS``) are. The always-applicable
+    per-order chokepoint remains
+    :func:`breezy.adapters.polymarket_us.safety.authorize_live_order_submission`,
+    which enforces the operator's exact ``Decimal`` ceiling on every order.
+    This function adds a second, native, independent line of defence for the
+    markets it can key; it does not replace the first.
+
+    **And a second residual, already pinned elsewhere.** Every cap below
+    ``risk/engine.pyx:684-689`` is inert until a real ``AccountState`` is
+    cached -- see ``tests/contract/test_risk_engine_ordering_enforcement.py``,
+    which is the authority on that ordering constraint.
+
+    The VALUE is the operator's, never Breezy's: it comes from
+    :func:`~breezy.adapters.polymarket_us.safety.operator_max_order_notional_whole_usd`,
+    which fails closed when the control is absent. There is deliberately no
+    default, no fallback and no literal on this path. The two OPERATOR-RESERVED
+    controls -- max daily budget and max per position -- are NOT here, are not
+    derivable from what is here, and are never assigned by this repo.
+    """
+    # Deferred to call time to break the package import cycle documented at
+    # the TYPE_CHECKING block at the top of this module.
+    from breezy.adapters.polymarket_us.safety import (
+        operator_max_order_notional_whole_usd,
+    )
+    from breezy.adapters.polymarket_us.symbology import slug_to_instrument_id
+
+    ceiling_usd = operator_max_order_notional_whole_usd()
+    return LiveRiskEngineConfig(
+        # Stated, not defaulted: `bypass=True` disables every pre-trade check
+        # including the cap above (`risk/engine.pyx:273-277`).
+        bypass=False,
+        max_notional_per_order={
+            str(slug_to_instrument_id(slug)): ceiling_usd for slug in market_slugs
+        },
+    )
+
+
 def build_trade_node_config(
     settings: BreezyTradeSettings,
     data_client_config: PolymarketUSDataClientConfig,
@@ -563,6 +623,18 @@ def build_trade_node_config(
     per position are the operator's two values, added as mechanism in a later
     increment, never assigned by Breezy, and fail-closed when absent. There is
     nothing to reference from a node config, so nothing is referenced.
+
+    **Native pre-trade risk caps ARE configured here**, via
+    :func:`build_trade_risk_engine_config` -- read its docstring for the shape
+    the cap takes and for the two residuals it does not close. The per-order
+    notional ceiling is the operator's existing
+    ``BREEZY_MAX_ORDER_NOTIONAL_USD``, which is a per-ORDER control and is not
+    one of the two reserved ones. Building this config therefore RAISES
+    ``LiveTradingPermissionError`` when that control is unset: the trading
+    process refuses to start rather than starting uncapped. The two read-only
+    roles above are unaffected -- they have no execution surface and no risk
+    engine traffic, so requiring a trading ceiling from them would only make a
+    weather host fail for a value it can never use.
     """
     # Deferred to call time to break the package import cycle documented at
     # the TYPE_CHECKING block at the top of this module.
@@ -583,5 +655,6 @@ def build_trade_node_config(
         strategies=[],
         exec_algorithms=[],
         exec_engine=LiveExecEngineConfig(inflight_check_interval_ms=0),
+        risk_engine=build_trade_risk_engine_config(data_client_config.market_slugs),
     )
     return cast(TradingNodeConfig, config)

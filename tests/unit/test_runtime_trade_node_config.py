@@ -32,6 +32,7 @@ from nautilus_trader.model.identifiers import TraderId
 
 from breezy.adapters.polymarket_us.config import PolymarketUSDataClientConfig
 from breezy.adapters.polymarket_us.factories import POLYMARKET_US_CLIENT_NAME
+from breezy.adapters.polymarket_us.safety import MAX_ORDER_NOTIONAL_USD_ENV_VAR
 from breezy.runtime.node_config import NodeConfigError, build_trade_node_config
 from breezy.runtime.settings import (
     TRADE_TRADER_ID_VAR,
@@ -66,6 +67,23 @@ def make_data_client_config() -> PolymarketUSDataClientConfig:
         instrument_reload_interval_mins=5,
         user_agent="breezy-test/1.0 (+mailto:ops@example.invalid)",
     )
+
+
+#: Test-local stand-in for the operator's per-order USD ceiling
+#: (`BREEZY_MAX_ORDER_NOTIONAL_USD`). `build_trade_node_config` configures the
+#: NATIVE per-order notional cap from that control and FAILS CLOSED when it is
+#: absent, so every builder call in this module needs it present. The number is
+#: arbitrary and test-local: it is not a production risk setting, and it is not
+#: either operator-reserved control (max daily budget, max per position),
+#: neither of which is read, defaulted or inferred anywhere on this path. The
+#: refusal itself is covered by
+#: `tests/contract/test_native_order_cap_wiring.py`, which is where it belongs.
+OPERATOR_ORDER_CEILING_USD = "25"
+
+
+@pytest.fixture(autouse=True)
+def _operator_order_ceiling(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv(MAX_ORDER_NOTIONAL_USD_ENV_VAR, OPERATOR_ORDER_CEILING_USD)
 
 
 # ---------------------------------------------------------------------------

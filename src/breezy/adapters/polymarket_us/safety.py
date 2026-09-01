@@ -524,6 +524,48 @@ def _read_operator_count(name: str) -> int:
     return count
 
 
+def operator_max_order_notional_whole_usd() -> int:
+    """The operator's per-order notional ceiling, floored to whole USD.
+
+    The SAME control the permit issuer reads
+    (:data:`MAX_ORDER_NOTIONAL_USD_ENV_VAR`), read through the SAME mechanism,
+    so there is exactly one reader and one refusal policy for it. Absence,
+    blankness and malformation all raise here; nothing defaults.
+
+    Why whole USD, and why this lives with the control rather than at the call
+    site: ``RiskEngineConfig.max_notional_per_order`` is typed
+    ``dict[str, int]`` (``risk/config.py:44``), so the native cap can only
+    carry an integer. Flooring is the conservative direction -- a $25.99
+    ceiling becomes a $25 native cap, tighter than the operator asked for,
+    never looser. The exact ``Decimal`` ceiling is still enforced to the cent
+    by :func:`authorize_live_order_submission`; this is defence in depth
+    beneath it, not a replacement for it.
+
+    A ceiling below one whole USD has no integer representation: ``0`` is
+    falsy and ``risk/engine.pyx:678`` (``if max_notional_setting:``) skips the
+    check entirely for it, so a sub-dollar ceiling would silently mean NO cap.
+    That is refused rather than rounded in either direction.
+
+    Returns:
+        The floored ceiling in whole USD, always >= 1.
+
+    Raises:
+        LiveTradingPermissionError: if the control is unset, blank, malformed,
+            non-positive, or cannot be expressed as a whole-USD cap. The
+            message names the control and never echoes its value.
+    """
+    ceiling = _read_operator_money(MAX_ORDER_NOTIONAL_USD_ENV_VAR)
+    whole = int(ceiling)  # Truncation toward zero; `_read_operator_money` is > 0.
+    if whole < 1:
+        raise LiveTradingPermissionError(
+            f"{MAX_ORDER_NOTIONAL_USD_ENV_VAR} is below one whole USD and cannot "
+            f"be expressed as a native per-order cap: "
+            f"`RiskEngineConfig.max_notional_per_order` is typed dict[str, int] "
+            f"and a zero there disables the check outright"
+        )
+    return whole
+
+
 def issue_live_trading_permit(*, clock: SupportsTimestampNs) -> LiveTradingPermit:
     """Mint the ONE kind of authority the chokepoint accepts.
 
