@@ -103,10 +103,14 @@ break-even lands between 0.99 and 1.00, so the only tradable prices are 0.99,
 strategy has three or four distinguishable decisions, not a continuum.
 
 Note `MispricingContract.tick_size` (`weather_common/bucket_contract.py:41-43`)
-is per-instrument and its own comment warns "the captured universe carries more
-than one tick size". BL-19's "tick is 0.01" is an observed fact about the
-captured instruments, not a venue invariant; the derivation below is written in
-ticks, and the shipped scalar is its value at a 0.01 tick.
+is per-instrument. **Its comment used to warn that "the captured universe carries
+more than one tick size"; that claim is RETRACTED (2026-09-01) — it was never
+true.** A re-sweep of `docs/evidence/venue/polymarket_us/raw/*.json` gives 729/729
+markets at `orderPriceMinTickSize = 0.01`; the field that actually varies is
+`minimumTradeQty` (324 at "1", 405 at "0.01"), i.e. the SIZE increment, not the
+price tick. BL-19's "tick is 0.01" therefore rests on 729/729 observations rather
+than on a warning. It remains an observed fact about captured instruments, not a
+venue invariant; the derivation below is written in ticks.
 
 ---
 
@@ -459,10 +463,12 @@ trigger rate, not the edge gate (s5).
    scales linearly in `theta`. It is a per-market value (`fees.py:90`); 0.06 is
    the documented worked example. A materially larger `theta` moves break-even
    down and the whole table with it.
-5. **Tick size is not 0.01 on the traded instruments.** `bucket_contract.py:41-43`
-   warns the captured universe carries more than one. At a 0.001 tick, prices
-   between 0.99 and break-even become representable and the entire
-   "0.98 or better" conclusion is replaced by a finer grid.
+5. **Tick size is not 0.01 on the traded instruments.** Still a legitimate
+   falsifier, but note what is retracted: it has NOT already been observed.
+   729/729 captured markets tick 0.01 (see §1). At a 0.001 tick, prices between
+   0.99 and break-even become representable and the entire "0.98 or better"
+   conclusion is replaced by a finer grid — which is why the shipped slippage
+   floor is now `max(0.01, tick)` and no longer tracks the tick downward.
 6. **The margin table's population bias is measured and found small.** The 5.9x
    cushion is chosen because the bias is known to exist and is unquantified. If
    forward capture shows the venue's listed floors behave like the swept floors,
