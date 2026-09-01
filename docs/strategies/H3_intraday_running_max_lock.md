@@ -102,6 +102,21 @@ Four deltas: a `NwsStationObservation` `Data` subclass with `register_arrow`
 builder on `HttpTransport`; the Actor itself. The host allowlist already permits
 `api.weather.gov` (`shared_state.py:99`) and needs no change.
 
+**Blast radius of the transport change (codegraph, not inferred).** The two-URL
+limit is a DELIBERATE invariant, stated at `ingest/http.py:562-566`: "The ORIGIN
+is configurable so tests can retarget it; the PATHS are not... A caller supplies
+what to fetch, never where on the origin to fetch it from." Both public methods
+funnel into the private `_fetch` (`:769`), so a third endpoint cannot be reached
+from outside and must be added INSIDE `HttpTransport`. Dependents:
+`fetch_discovery_list` (`:656`) 48 callers in `nws_actor.py`; `fetch_product`
+(`:713`) 15 callers; `HttpTransport` (`:522`) 10 callers in `shared_state.py`
+and `probe_transport.py`. All three are covered by
+**`tests/unit/test_probe_containment.py`** -- an existing containment contract
+over what this transport may reach. A new URL builder must SATISFY that
+contract, not merely be added beside it, and that test must not be weakened to
+accommodate it. This raises the cost of the BL-24 delta above the four-step
+estimate above.
+
 **Nautilus has NO running-max primitive** — verified by full class inventory of
 `indicators/` and `data/aggregation.pyx`. `DonchianChannel` is a fixed-count
 rolling window over `Price` and will not take custom `Data`; `BarBuilder` keeps a
