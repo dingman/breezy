@@ -1173,3 +1173,42 @@ async def test_pool_close_logs_the_exception_type_and_never_the_venue_error_text
     assert _CLOSE_ERROR_SENTINEL not in logged, (
         f"venue-controlled exception text reached a log record: {logged!r}"
     )
+
+
+# --------------------------------------------------------------------------
+# supervisor death -- the OTHER way the reconnect loop stops silently
+# --------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_a_supervisor_that_dies_unexpectedly_is_reported_as_degraded() -> None:
+    """An exception must not end supervision in silence.
+
+    Exhausting the retry budget already sets ``is_degraded``, and the data
+    client's watchdog turns that into safe mode and a non-zero process exit.
+    An UNEXPECTED exception took a different route: the supervisor task ended,
+    ``_degraded`` stayed False, ``is_connected`` stayed True, and nothing
+    downstream could tell the feed had stopped being supervised. For an
+    unattended run that is the same fatal outcome as exhaustion -- no further
+    reconnection will ever be attempted -- so it must produce the same signal.
+
+    Nothing here reconnects or retries on the client's behalf; it only makes
+    an already-fatal state legible to the watchdog that already polls for it.
+    """
+    signer, _ = _new_signer()
+    ws = _make_ws(ws_url="wss://api.example.invalid", signer=signer)
+
+    class ExplodingClient:
+        """A native client whose state probe raises, as a broken FFI call would."""
+
+        def is_reconnecting(self) -> bool:
+            raise RuntimeError("native websocket state probe failed")
+
+        def is_closed(self) -> bool:  # pragma: no cover - never reached
+            return True
+
+    ws._client = ExplodingClient()  # type: ignore[assignment]
+
+    await ws._supervise()
+
+    assert ws.is_degraded is True, "an unexpected supervisor death must fail closed"

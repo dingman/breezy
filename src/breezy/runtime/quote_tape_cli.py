@@ -76,6 +76,10 @@ from breezy.adapters.polymarket_us.factories import (
     PolymarketUSLiveDataClientFactory,
     config_from_env,
 )
+from breezy.adapters.polymarket_us.feed_fault import (
+    clear_fatal_feed_fault,
+    fatal_feed_fault,
+)
 from breezy.persistence.catalog import CatalogPathError
 from breezy.runtime.logging_bridge import install as install_logging_bridge
 from breezy.runtime.logging_bridge import uninstall as uninstall_logging_bridge
@@ -138,6 +142,38 @@ def _report(stderr: TextIO, prefix: str, exc: BaseException, *, expected: bool) 
     logger.log(level, "%s: %s", prefix, exc, exc_info=True)
 
 
+def _exit_code_for_completed_run(stderr: TextIO) -> int:
+    """Translate a stopped node into an exit status the supervisor can read.
+
+    ``TradingNode.run()`` returns ``None`` (``live/node.py:283-302``) and the
+    kernel keeps no record of why it stopped (no ``reason`` anywhere in
+    ``system/kernel.py``), so a node that shut itself down after losing its
+    market-data feed returns EXACTLY like one stopped by an operator SIGTERM.
+
+    For an UNATTENDED capture window those two must not share an exit code. A
+    recorder that loses its feed at minute four of eight hours and exits 0
+    leaves systemd reporting success over an empty tape, and leaves
+    ``Restart=on-failure`` with nothing to act on. The data client latches the
+    fault at the instant it requests the native shutdown; this is where that
+    one bit becomes the process's answer to ``systemctl status``.
+
+    A ``KeyboardInterrupt`` is routed through here too: a fatal feed fault
+    followed by a Ctrl-C is still a failed run, and reporting the interrupt
+    would hide the cause.
+    """
+    fault = fatal_feed_fault()
+    if fault is None:
+        return EXIT_OK
+
+    print(
+        f"breezy-quote-tape: FATAL market-data fault in {fault.component}: {fault.reason}. "
+        "The recorder shut down; the tape ends here.",
+        file=stderr,
+    )
+    logger.error("fatal market-data fault in %s: %s", fault.component, fault.reason)
+    return EXIT_RUNTIME_ERROR
+
+
 def _run_node(config: TradingNodeConfig, node_factory: NodeFactory, stderr: TextIO) -> int:
     """Build, run and ALWAYS dispose the node. Never raises.
 
@@ -154,7 +190,7 @@ def _run_node(config: TradingNodeConfig, node_factory: NodeFactory, stderr: Text
         )
         node.build()
         node.run()
-        return EXIT_OK
+        return _exit_code_for_completed_run(stderr)
     except KeyboardInterrupt:
         # A deliberate stop is NOT a failure. `TradingNode.run` catches only
         # `RuntimeError` (`live/node.py:293-300`), and although the kernel
@@ -165,7 +201,7 @@ def _run_node(config: TradingNodeConfig, node_factory: NodeFactory, stderr: Text
         # tell systemd, and the operator watching a months-long recorder, that
         # the run broke when it was simply stopped.
         print("breezy-quote-tape: interrupted; shutting down", file=stderr)
-        return EXIT_OK
+        return _exit_code_for_completed_run(stderr)
     except BaseException as exc:  # noqa: BLE001 - the process exit contract lives here
         _report(stderr, "quote-tape node failed", exc, expected=False)
         return EXIT_RUNTIME_ERROR
@@ -211,6 +247,9 @@ def run(
     """
     out = sys.stderr if stderr is None else stderr
     install_logging_bridge()
+    # THIS run's fault, never an inherited one. The latch is process-scoped
+    # and a stale value would fail a healthy capture window.
+    clear_fatal_feed_fault()
     try:
         try:
             settings = load_quote_tape_settings(env)

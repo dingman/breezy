@@ -75,6 +75,7 @@ from nautilus_trader.model.instruments import BinaryOption, Instrument
 
 from breezy.adapters.polymarket_us.config import PolymarketUSDataClientConfig
 from breezy.adapters.polymarket_us.errors import PolymarketUSError
+from breezy.adapters.polymarket_us.feed_fault import record_fatal_feed_fault
 from breezy.adapters.polymarket_us.parsing import (
     EXPIRED_MARKET_STATES,
     TERMINAL_SETTLEMENT_METHOD,
@@ -161,6 +162,19 @@ MISSING_ROUTING_KEY_WARN_EVERY: Final[int] = 100
 
 #: How often the safe-mode watchdog samples the socket's degraded flag.
 DEFAULT_FEED_WATCH_INTERVAL_SECS: Final[float] = 5.0
+
+#: How long the missing-instrument alert waits for the data engine to drain
+#: its queue before it reports an instrument as absent from the cache (BL-22).
+#:
+#: Generous on purpose, and free when nothing is wrong: the check returns the
+#: instant every instrument resolves, so this ceiling is only ever paid by a
+#: cycle that has a genuine problem to report. Being impatient here is what
+#: produced 60 spurious ERROR lines per discovery cycle.
+INSTRUMENT_CACHE_DRAIN_TIMEOUT_SECS: Final[float] = 5.0
+
+#: Poll interval while waiting for the above. Short enough to be invisible on
+#: the connect path, long enough not to spin the loop.
+INSTRUMENT_CACHE_DRAIN_POLL_SECS: Final[float] = 0.01
 
 #: Publish one :class:`VenueClockOffset` every N market-data frames carrying a
 #: venue timestamp. Frame-driven rather than time-driven so the sampler costs
@@ -565,6 +579,10 @@ class PolymarketUSDataClient(LiveMarketDataClient):
         self._feed_watchdog: asyncio.Task[None] | None = None
         self._update_instruments_task: asyncio.Task[None] | None = None
         self._safe_mode: bool = False
+        # Guards the ONE-SHOT native shutdown request in `sample_feed_health`.
+        # That method is public and callable on a cadence, so without this a
+        # dead feed would spray `ShutdownSystem` commands at the kernel.
+        self._fatal_shutdown_requested: bool = False
         # The owning node's NATIVE `instance_id`, threaded via config because
         # neither `MessageBus` nor `LiveDataClientFactory.create` exposes it
         # (see `PolymarketUSDataClientConfig.recorder_instance_id`). Falls back
@@ -589,6 +607,7 @@ class PolymarketUSDataClient(LiveMarketDataClient):
         self._clock_offset_samples: int = 0
         self._quote_parse_failures: int = 0
         self._expired_without_terminal_settlement: int = 0
+        self._missing_cache_alerts: int = 0
 
     # -- state ------------------------------------------------------------
 
@@ -711,6 +730,22 @@ class PolymarketUSDataClient(LiveMarketDataClient):
         """True while the feed is down RIGHT NOW and quotes are being lost."""
         return self._gap_opened_ns is not None
 
+    @property
+    def missing_cache_alerts(self) -> int:
+        """Instruments reported absent from the cache after an engine push.
+
+        Non-zero means a discovered market that the streaming writer cannot
+        resolve, and therefore quotes that would be silently dropped from the
+        tape (``persistence/writer.py:212-232`` returns without writing when
+        the instrument is absent). It counts REPORTS, not distinct markets: a
+        slug missing on three discovery cycles increments three times.
+
+        Deliberately NOT incremented for an instrument the data engine has
+        merely not drained from its queue yet -- see
+        :meth:`_alert_on_missing_cache_after_push`.
+        """
+        return self._missing_cache_alerts
+
     # -- lifecycle --------------------------------------------------------
 
     async def _connect(self) -> None:
@@ -718,7 +753,7 @@ class PolymarketUSDataClient(LiveMarketDataClient):
         self._log.info("Initializing instruments...")
         await self._instrument_provider.initialize()
         self._send_all_instruments_to_data_engine()
-        self._alert_on_missing_cache_after_push(self._provider_active_slugs())
+        await self._alert_on_missing_cache_after_push(self._provider_active_slugs())
 
         await self._feed.connect()
         await self._reconcile_discovered_subscriptions(cycle="initial")
@@ -860,7 +895,7 @@ class PolymarketUSDataClient(LiveMarketDataClient):
         self._send_all_instruments_to_data_engine()
         after_slugs = self._provider_active_slugs()
         self._alert_on_discovery_counts(before=before, after=len(after_slugs))
-        self._alert_on_missing_cache_after_push(after_slugs)
+        await self._alert_on_missing_cache_after_push(after_slugs)
         await self._reconcile_discovered_subscriptions(cycle="reload")
 
     async def _reconcile_discovered_subscriptions(self, *, cycle: str) -> None:
@@ -930,15 +965,78 @@ class PolymarketUSDataClient(LiveMarketDataClient):
                 f"from {before} to {after} without a resolved-market explanation"
             )
 
-    def _alert_on_missing_cache_after_push(self, slugs: Sequence[str]) -> None:
-        for slug in slugs:
-            instrument_id = slug_to_instrument_id(slug, self.venue)
-            if self._cache.instrument(instrument_id) is None:
-                self._log.error(
-                    "Polymarket.us discovery found slug "
-                    f"{slug!r} but cache.instrument({instrument_id}) is None after "
-                    "publishing instruments to the data engine"
-                )
+    async def _alert_on_missing_cache_after_push(self, slugs: Sequence[str]) -> None:
+        """Report discovered markets the data engine never put in the cache.
+
+        The condition is real and worth an ERROR: an instrument absent from
+        the cache is one ``StreamingFeatherWriter.write`` cannot resolve, and
+        it returns without writing rather than complaining
+        (``persistence/writer.py:212-232``) -- so that market's quotes leave
+        the tape silently.
+
+        What was wrong (BL-22) was the TIMING, not the alert. This ran
+        immediately after ``_send_all_instruments_to_data_engine()`` with no
+        ``await`` in between, and ``DataClient._handle_data`` only
+        ``_msgbus.send``s to the ``DataEngine.process`` endpoint
+        (``data/client.pyx:1262-1263``). On a live node that endpoint is
+        ``LiveDataEngine.process`` (``live/data_engine.py:324-343``), which
+        ENQUEUES onto an ``asyncio.Queue`` drained by the ``_run_data_queue``
+        task (``:477-497``). Until the loop yields, nothing has been cached
+        and EVERY instrument looks missing: 60 ERROR lines per discovery
+        cycle, every cycle, for the whole run. In an eight-hour unattended log
+        that is where a real error goes to hide.
+
+        So this now OBSERVES the engine's post-processing state instead of
+        racing it: it waits, bounded, for the cache to reflect the push and
+        alerts only on what is still absent when the engine has had its
+        chance. Bounded rather than open-ended because a stalled engine must
+        delay the connect path, never deadlock it.
+        """
+        for slug, instrument_id in await self._await_instrument_cache(slugs):
+            self._missing_cache_alerts += 1
+            self._log.error(
+                "Polymarket.us discovery found slug "
+                f"{slug!r} but cache.instrument({instrument_id}) is None "
+                f"{INSTRUMENT_CACHE_DRAIN_TIMEOUT_SECS:.0f}s after publishing "
+                "instruments to the data engine; the streaming writer cannot "
+                "resolve it and its quotes would be dropped from the tape"
+            )
+
+    async def _await_instrument_cache(
+        self, slugs: Sequence[str]
+    ) -> tuple[tuple[str, InstrumentId], ...]:
+        """Wait, bounded, for pushed instruments to appear. Return the absent.
+
+        Returns as soon as every slug resolves, so a healthy cycle costs at
+        most one event-loop turn. Only a genuinely missing instrument pays the
+        full deadline, and it pays it once per discovery cycle.
+
+        The cache is polled rather than awaited on an event because Nautilus
+        offers no completion signal for the queue: ``LiveDataEngine`` exposes
+        ``data_qsize()`` but the engine is not reachable from a ``DataClient``,
+        and an empty queue would in any case not prove the last item had
+        finished being handled. The cache IS the post-processing state this
+        alert is about, so it is the thing observed.
+        """
+        pending = tuple(
+            (slug, slug_to_instrument_id(slug, self.venue)) for slug in slugs
+        )
+        deadline_ns = self._clock.timestamp_ns() + int(
+            INSTRUMENT_CACHE_DRAIN_TIMEOUT_SECS * 1_000_000_000
+        )
+        first_pass = True
+        while True:
+            pending = tuple(
+                entry for entry in pending if self._cache.instrument(entry[1]) is None
+            )
+            if not pending:
+                return ()
+            if self._clock.timestamp_ns() >= deadline_ns:
+                return pending
+            # One bare loop turn first: on a live node that is normally all
+            # the queue drain needs, so the happy path adds no fixed delay.
+            await asyncio.sleep(0 if first_pass else INSTRUMENT_CACHE_DRAIN_POLL_SECS)
+            first_pass = False
 
     # -- subscriptions ----------------------------------------------------
 
@@ -1314,14 +1412,54 @@ class PolymarketUSDataClient(LiveMarketDataClient):
 
         self._safe_mode = True
         self._set_connected(False)
-        self._log.error(
-            "Markets feed lost and not recoverable; entering safe mode "
-            "(client marked disconnected, no further quotes). "
+        reason = (
+            "Polymarket.us markets feed lost and not recoverable; "
             f"{self._tape_gaps} tape gap(s) observed, "
             f"{self._tape_gap_seconds_total:.1f}s of quotes lost so far -- "
-            "this final gap remains OPEN and its quotes are unrecoverable.",
+            "this final gap remains OPEN and its quotes are unrecoverable"
         )
+        self._log.error(
+            f"{reason}. Entering safe mode (client marked disconnected, no "
+            "further quotes) and shutting the node down.",
+        )
+        self._request_fatal_shutdown(reason)
         return False
+
+    def _request_fatal_shutdown(self, reason: str) -> None:
+        """Stop the whole process, cleanly, and make the exit status say so.
+
+        Before this, losing the feed ended the socket's supervisor coroutine
+        and nothing else: the node kept running, subscribed to nothing,
+        writing an empty tape, while systemd reported ``active (running)``.
+        Attended runs had a human to notice. The unattended run does not.
+
+        **The shutdown is NATIVE.** ``Component.shutdown_system``
+        (``common/component.pyx:2162-2182``) publishes ``ShutdownSystem``,
+        which ``NautilusKernel._on_shutdown_system``
+        (``system/kernel.py:613-638``) turns into a clean ``stop_async()``.
+        Nothing here reimplements a shutdown.
+
+        **It must NOT be a hard exit.** A clean stop is what runs
+        ``StreamingFeatherWriter.close()`` (``persistence/writer.py:596-611``)
+        and appends the Arrow end-of-stream marker. Killing the process
+        instead can leave a truncated trailing message, which
+        ``ParquetDataCatalog._read_feather_file``
+        (``persistence/catalog/parquet.py:2795-2800``) swallows -- converting
+        the ENTIRE day's tape to zero rows in silence. Measured in
+        ``tests/contract/test_quote_tape_unclean_shutdown.py``. Exiting hard
+        to report a lost feed would destroy the tape recorded before it.
+
+        **Only the exit STATUS is authored.** ``TradingNode.run()`` returns
+        ``None`` and the kernel keeps no shutdown reason, so a fatal fault and
+        an operator SIGTERM are indistinguishable to the caller. The latch in
+        :mod:`breezy.adapters.polymarket_us.feed_fault` carries that one bit
+        out to the CLI, which turns it into a non-zero exit code.
+        """
+        if self._fatal_shutdown_requested:
+            return
+        self._fatal_shutdown_requested = True
+        record_fatal_feed_fault(str(self.id), reason)
+        self.shutdown_system(reason)
 
     def _open_tape_gap(self, now_ns: int) -> None:
         if self._gap_opened_ns is not None:

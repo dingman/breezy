@@ -664,24 +664,55 @@ class PolymarketUSMarketsWebSocket:
     # -- supervision ------------------------------------------------------
 
     async def _supervise(self) -> None:
-        """Poll for a dead socket and reconnect with freshly signed headers."""
-        while not self._closing:
-            await asyncio.sleep(self._poll_secs)
-            client = self._client
-            if self._closing or client is None:
-                continue
-            if client.is_reconnecting() or not client.is_closed():
-                continue
-            self._log.warning(
-                "Polymarket.us markets websocket closed; reconnecting with fresh signature"
-            )
-            if not await self._reconnect_with_backoff():
-                self._degraded = True
-                self._log.error(
-                    "Polymarket.us markets websocket reconnection abandoned after "
-                    f"{self._reconnect_max_attempts} retries; the market data feed is down"
+        """Poll for a dead socket and reconnect with freshly signed headers.
+
+        Every exit from this coroutine other than a deliberate close is FATAL
+        for the feed: nothing else in the process reconnects this socket, and
+        Nautilus has no notion of a data client that stopped producing
+        (``LiveDataEngine.connect`` calls ``client.connect()`` once and never
+        looks again). So both fatal exits -- retry exhaustion and an
+        unexpected exception -- must set ``is_degraded``, which is the signal
+        ``PolymarketUSDataClient.sample_feed_health`` already polls and now
+        escalates to a clean node shutdown with a non-zero exit status.
+
+        Before this, only exhaustion set it. An exception ended the task
+        silently: ``is_connected`` stayed True, ``is_degraded`` stayed False,
+        and an unattended recorder kept a healthy-looking, permanently
+        unsupervised socket for the rest of the capture window.
+
+        Cancellation is deliberately NOT degradation and is re-raised
+        untouched -- ``close()`` sets ``_closing`` before it cancels, and a
+        cancelled supervisor is a shutdown, not a feed failure.
+        """
+        try:
+            while not self._closing:
+                await asyncio.sleep(self._poll_secs)
+                client = self._client
+                if self._closing or client is None:
+                    continue
+                if client.is_reconnecting() or not client.is_closed():
+                    continue
+                self._log.warning(
+                    "Polymarket.us markets websocket closed; reconnecting with fresh signature"
                 )
-                return
+                if not await self._reconnect_with_backoff():
+                    self._degraded = True
+                    self._log.error(
+                        "Polymarket.us markets websocket reconnection abandoned after "
+                        f"{self._reconnect_max_attempts} retries; the market data feed is down"
+                    )
+                    return
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001 - deliberate: see below
+            # Type name only, never the message: transport exception text is
+            # venue-controlled and must not reach a log record.
+            self._degraded = True
+            self._log.error(
+                "Polymarket.us markets websocket supervisor died unexpectedly "
+                f"({type(exc).__name__}); no further reconnection will be "
+                "attempted and the market data feed is down"
+            )
 
     async def _reconnect_with_backoff(self) -> bool:
         retry_manager: RetryManager[bool] = RetryManager(
