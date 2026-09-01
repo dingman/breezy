@@ -1,6 +1,8 @@
 # EXEC SPINE — shortest sound path to one real, filled, reconciled order
 
-**Status:** **REVISED 2026-09-01 — review findings RESOLVED; R-1 … R-9 are buildable in order.**
+**Status:** **REVISION 2, 2026-09-01. R-1 and R-2 are LANDED and green. R-3 … R-6 are
+buildable. R-7 is RE-PLAN (two CRITICALs, fixes named below). R-9 is RE-PLAN — it has no
+live mechanism at all and a design is in flight.**
 **Date:** 2026-09-01. Supersedes `docs/plans/EXEC_CLIENT_NOSEND_PLAN.md` (1993 lines; terminal
 state was a process that refuses every order — zero evidence value against the stop gate).
 
@@ -36,6 +38,62 @@ Three defects and seven conditions were raised; R-1 … R-4 and R-6 survived in 
 > **Provenance note (L-10).** Defect 1 originated as coordinator shorthand in a commissioning
 > brief that the planner promoted to a verified native. Hence the standing rule below: every
 > null-hypothesis verdict cites a `file:line` that was actually opened.
+
+## REVISION 2 — what the second review round changed
+
+Three blind reviewers (native-substitution, security, adversarial execution-path) returned
+against Revision 1. Every finding below was re-verified by the coordinator against source
+before being accepted; the citations are the coordinator's own.
+
+**The load-bearing one: R-9 does not exist.** Revision 1 called settlement-as-exit "a
+mapping increment, not a research one". That is false. `check_instrument_expiration` lives
+at `backtest/engine.pyx:3680,5919,5934` and **nowhere else in installed Nautilus** — zero
+live occurrences. `realized_pnl` appears in `src/breezy/` only inside a docstring
+(`runtime/backtest_harness.py:855`). The live data client can subscribe to `InstrumentClose`
+(`live/data_client.py:676,1014`) but no live execution path closes a position on one. So a
+live filled position is **never closed by settlement and never produces a realized-PnL row**
+— the goal state's final clause is produced by no increment. R-9 was also the only increment
+carrying no null-hypothesis verdict, which is exactly the hole the standing rule exists to
+catch. Re-planning now.
+
+**The double-submit path Revision 1 missed.** `DEFINITIVE_ACCEPT` was defined as "an `id`
+came back", which retires the latch *before* the fill is durable. `executions` is
+`total=False` (`sdk_snapshot/.../types/orders.py:129-133`), so an accept carrying no inline
+executions retires the intent while the position is unrecorded — and the next signal doubles
+it. Retire-on-accept now additionally requires a durably-written fill record or an explicit
+zero-fill terminal.
+
+**The latch was durable but undiscoverable.** `StateStore` is exactly `get(key)` / `set(key,
+value)` (`src/breezy/ingest/gate.py:298-300`) and `SqliteStateStore` adds only
+`close`/`_query_pragma` — **no enumeration, no prefix scan, no delete** (verified: its public
+surface is `__init__`, `get`, `set`, `close`, `__enter__`, `__exit__`). Keying the intent on
+a Breezy-generated uuid meant a restarted process could not ask "does an un-retired intent
+exist?", because the uuid died with the process. The natural workaround is an in-memory uuid
+— precisely the in-process flag the design rejects. Fixed by a **singleton key**.
+
+**A tooling defect nearly voided every null-hypothesis verdict in this plan.** The Grep tool
+wraps ripgrep, which honours `.gitignore`; `.gitignore:1` is `.venv/`, where installed
+Nautilus lives. Recursive Grep under `.venv/` returns **zero matches with no error**,
+indistinguishable from a true negative. Measured: `rg -l 'Nautech Systems'` in
+`nautilus_trader/live/` → 0 files; `--no-ignore` → 15. Revision 1's "0 files" negatives were
+therefore methodologically void. **Re-run by the coordinator with shell grep, they HOLD**:
+`AMBIGUOUS`, `Ambiguous`, `retryable`, `RETRYABLE` are each 0 files, on a search proven to
+descend (`retry_` → 32 files, `ambiguous` → 3, all prose). R-7's verdict survives; the method
+did not. See the new standing constraint.
+
+**Corrections to Revision 1's own citations**, each of which was wrong in a way that would
+have misled an implementer:
+- The synthetic zero is at `live/reconciliation.py:493` inside
+  `create_inferred_order_filled_event`, behind **three** branches on the order report
+  (`:486`, `:488`) — not "five fallbacks on `avg_px_open`", and not in `execution_engine.py`,
+  where `make_price(0.0)` does not occur. Two escapes precede it
+  (`execution_engine.py:2871-2877` quote-tick, `:2880-2881` `current_avg_px`), so a single
+  cached quote tick prevents it.
+- Nautilus does not say "FOREIGN". Unclaimed reconciled orders get
+  `StrategyId("EXTERNAL")` (`execution_engine.py:3556`).
+- `nautilus_trader/cache/postgres/` and `nautilus_trader/infrastructure/` **do not exist** in
+  1.231.0. Redis is the only cache backend (`system/kernel.py:312`, `:324-329` raises
+  otherwise).
 
 ## Goal state
 
@@ -92,7 +150,7 @@ restart → mass status + fill record reconcile → settlement closes → one re
 |---|---|
 | Four-type authority algebra | One chokepoint already exists (`safety.py:626`, verified). |
 | Full six-coroutine denial surface | Only `_submit_order` / `_cancel_order` get real bodies. |
-| `/v1/portfolio/activities` fill mapping | Moot if `synchronousExecution` returns `executions` inline (OQ-4). |
+| ~~`/v1/portfolio/activities` fill mapping~~ **RESTORED — no longer a non-goal** | The cut was a non-sequitur twice over. Inline `executions` cannot exist in the case the latch is FOR (no response arrived), and they say nothing about settlement. That endpoint is the only source of `ACTIVITY_TYPE_POSITION_RESOLUTION`, `PositionResolution{beforePosition, afterPosition}` and `Trade.realizedPnl`/`costBasis` (`sdk_snapshot/.../types/portfolio.py:9-11,53-65,67-73`). Without it the operator-clearing protocol cannot produce the venue order id it demands — `GET /v1/orders/open` never shows a filled IOC, and `retrieve(order_id)` needs the id that was lost. **Read-only, lands at R-4, as the latch's evidence source and R-9's cash source.** |
 | `reports.execution.{venue}` post-application verifier as a **blocker** | Alert only. |
 | `exec/direction.py` | No consumer on this path. |
 | Any classification beyond Breezy's own three outcomes (R-7) | **Not** because a native taxonomy exists — none does. Because three outcomes are what the latch needs; a fourth has no distinct action. |
@@ -105,6 +163,11 @@ restart → mass status + fill record reconcile → settlement closes → one re
   REFUTED (no native; Breezy-owned) — **with the `file:line` actually opened.** A fabricated
   native is the specific failure that caused this revision; an unverifiable citation is a
   defect regardless of whether the conclusion is right.
+- **A negative about installed Nautilus is only evidence if the search could have found a
+  positive.** The Grep tool cannot see under `.venv/` (ripgrep honours `.gitignore:1`). Use
+  shell `grep -rn --include='*.py' --include='*.pyx' PATTERN "$NT"`, and in the same command
+  grep a term known to be present, so the descent is proven. A bare "0 matches" with no
+  positive control does not close a null hypothesis.
 - **Every increment carries a portability tag** (VENUE-SPECIFIC / PORTABLE / MIXED). The tag is
   documentation of a seam, never a licence to add indirection.
 - **Long-only, taker.** `allow_short=False` (`strategy/weather_common/risk.py:139`) never changes.
@@ -163,7 +226,7 @@ default argument, or an `os.environ.get(NAME, <fallback>)`.
 
 ## Increments
 
-### R-1 — Live shape capture (value-free) — **VENUE-SPECIFIC** — blocked until conditions 1-3
+### R-1 — Live shape capture (value-free) — **VENUE-SPECIFIC** — **LANDED e7ccfbd, gate green**
 
 **Null hypothesis:** a Nautilus surface records venue response *shapes* without values.
 **REFUTED (Breezy-owned)** — the host is `scripts/venue/polymarket_us_auth_smoke.py`
@@ -193,7 +256,7 @@ slug-keyed map**, all three absent; `test_unknown_key_becomes_a_count`;
 `test_shape_capture_artifact_mode_is_0600`.
 **Done when:** artifacts for all three paths exist, all four tests green. **OQ-6 closes here.**
 
-### R-2 — Trading process — **PORTABLE**
+### R-2 — Trading process — **PORTABLE** — **LANDED b5c7eb9, gate green**
 
 **Null hypothesis:** Nautilus provides the process shell. **CONFIRMED** — `TradingNode` /
 `NautilusKernel`. Breezy adds a config builder and an entry point.
@@ -214,8 +277,21 @@ code). Config pins `CacheConfig(database=None, flush_on_start=False)` and
 > future reader does not "helpfully" raise it to 5000 and silently re-arm in-flight checking on
 > a venue with no client-order-id. (Distinct from OQ-5, which closes what the *retries* do.)
 
-**RED:** builder returns a config with exactly one exec client and the data client;
-`inflight_check_interval_ms` is 0; entry point exits non-zero on a latched fault.
+**A SECOND false-terminal loop was unpinned, and must be pinned.** Disabling
+`inflight_check_interval_ms` closes only one of two paths to a fabricated terminal state.
+`_resolve_inflight_order` fabricates `OrderRejected(reason="UNKNOWN")` for a `SUBMITTED`
+order with no venue contact at all (`live/execution_engine.py:767-786`). The identical
+outcome is reachable from `open_check_interval_secs` (`live/config.py:188`), which drives
+`_resolve_order_not_found_at_venue` after `open_check_missing_retries` (default 5,
+`live/config.py:192`) at `execution_engine.py:1382-1425`, "before marking as REJECTED". Its
+default is `None`, so it is off today — but a false REJECTED re-arms the strategy to submit
+again, so "off by default" is not a pin. **The RED asserts `open_check_interval_secs is
+None` and `position_check_interval_secs is None` (`live/config.py:188,195`) in the same
+assertion as `inflight_check_interval_ms == 0`.**
+
+**RED:** builder returns a config with the data client and **zero** exec clients;
+`inflight_check_interval_ms` is 0 and both check intervals are `None`; entry point exits
+non-zero on a latched fault.
 **Done when:** the process reaches `RUNNING` and exits `STOPPED` cleanly, with no exec client
 behaviour yet.
 
@@ -253,14 +329,39 @@ Two inherited traps *(both PORTABLE — Nautilus behaviour, not venue behaviour)
 - `generate_mass_status` returns `None` on **any** exception (`live/execution_client.py:498-514`,
   verified — `except Exception` at `:512`, `return None` at `:514`) → reconciliation failure →
   the trader never starts, silently. Catch and report **inside**; never leak.
-- `avg_px_open is None` walks five fallbacks ending at `instrument.make_price(0.0)`.
-  `UserPosition` has **no average-entry field** (`cost`, `qtyBought`, `netPosition`, all
-  `total=False`). **Design:** for Breezy-opened positions, supply `avg_px_open` from the
-  **durable fill record**; **refuse** foreign positions, never synthesize.
+- The synthetic zero is real but Revision 1 mislocated it. It is `live/reconciliation.py:493`
+  (`last_px = instrument.make_price(0.0)`) inside `create_inferred_order_filled_event`,
+  reached only when `order.avg_px is None` AND `report.avg_px` is falsy (`:486`) AND
+  `report.price is None` (`:488`) — **three branches on the report, not five fallbacks**, and
+  not in `execution_engine.py`, where `make_price(0.0)` does not occur. The reachable path:
+  `execution_engine.py:2854-2860` → `None` → `:2871-2877` quote-tick escape → `:2880-2881`
+  `current_avg_px` escape → `:2986-3011` synthetic MARKET report → `:3220` → `:493`. **Two
+  escapes precede it**, so a single cached quote tick prevents it.
+  `UserPosition` has **no average-entry field**, but it does carry `cost` and `qtyBought`
+  (`sdk_snapshot/.../types/portfolio.py:24-26`), which together DO give a derivable entry —
+  that is exactly what OQ-1 asks. **Design:** for Breezy-opened positions supply `avg_px_open`
+  from the durable fill record. For an unmatched position, **refuse to TRADE, not to START**:
+  Revision 1's "refuse foreign positions" would leave the node unable to boot while holding
+  real risk, which is worse than the risk. Start, reconcile, alert, and deny every submit.
 
-**Durable state, built here** *(mechanism PORTABLE, keying VENUE-SPECIFIC)*. No client-order-id
-exists at this venue, so every Breezy order would reconcile as EXTERNAL, and `database=None`
-means a restart orphans it. `SqliteStateStore` holds two key prefixes:
+**Durable state, built here** *(mechanism PORTABLE, keying VENUE-SPECIFIC)*. **The
+justification in Revision 1 was wrong and is replaced.** It said "a restart orphans the
+position", stated as a property of Nautilus. It is not — it is a property of our
+CONFIGURATION. Nautilus DOES persist orders and positions natively when a cache database is
+configured: `cache/cache.pyx:393-394` restores orders and `:1366-1368` rebuilds
+`_index_venue_order_ids[venue_order_id] = client_order_id`, so the venue-id map is native;
+`cache/database.pyx:709-755` `load_position` replays the stored `OrderFilled` events and
+reconstructs the `Position`, so `avg_px_open` is DERIVED from fills and survives byte-exact,
+making the fill record native too. The only backend is Redis (`system/kernel.py:312`,
+`:324-329` raises otherwise; `common/config.py:385` requires ≥6.2). **We decline that
+dependency** — an external server as a hard runtime requirement of the trading process is a
+new failure mode, a new operational surface, and a second network egress the N2 firewall
+does not model. So: the Breezy store is a DELIBERATE REFUSAL of a native, not a gap. Stating
+it as a gap is the same failure mode as a fabricated native, one sign flipped.
+
+No client-order-id exists at this venue, so every Breezy order would reconcile as
+`StrategyId("EXTERNAL")` (`execution_engine.py:3556` — Nautilus's actual term; "FOREIGN" is
+ours), and with `database=None` nothing survives. `SqliteStateStore` holds two key prefixes:
 `exec/polymarket_us/venue_id/<id>` → `ClientOrderId`, and `exec/polymarket_us/fill/<id>` → the
 fill record. The `exec/<venue>/` namespace **is** the seam: a second venue gets its own prefix,
 not a shared one. **Opened inside `_connect`** (thread affinity, §Goal state).
@@ -380,7 +481,7 @@ over a *set* daily budget is refused; an **unset** daily budget refuses everythi
 missing control.
 **Done when:** the live node reconciles with the guard installed and no crash.
 
-### R-7 — `_submit_order` + `POST /v1/orders` with the durable ambiguity latch — **MIXED** — REWRITTEN
+### R-7 — `_submit_order` + `POST /v1/orders` with the durable ambiguity latch — **MIXED** — **RE-PLAN (two CRITICALs; fixes named inline)**
 
 **Null hypothesis:** Nautilus classifies ambiguous submits. **REFUTED — no such native exists.**
 Verified by exhaustive search of installed nautilus_trader 1.231.0: `AMBIGUOUS|Ambiguous` → **0
@@ -392,6 +493,57 @@ files**; `retryable|RETRYABLE` → **0 files**. The three-outcome taxonomy below
 (anything else, including every transport-level failure). Ambiguity is the **default**, not a
 leaf: an unrecognized response is AMBIGUOUS.
 
+**CRITICAL-1 — the latch was durable but UNDISCOVERABLE. Fixed by a singleton key.**
+Durability holds: `sqlite_store.py:123-124` sets `journal_mode=WAL` + `synchronous=FULL` and
+`:175-176` commits per `set`, so the record is fsynced and survives `SIGKILL`; `CancelledError`
+cannot unwrite it. **Retrieval was the defect.** `StateStore` is exactly `get(key)` /
+`set(key, value)` (`ingest/gate.py:298-300`) and `SqliteStateStore`'s entire public surface is
+`__init__`, `get`, `set`, `close`, `__enter__`, `__exit__` — **no enumeration, no prefix scan,
+no delete**. A uuid-keyed intent is unfindable after the process that generated the uuid dies,
+which makes the RED "a restart with an un-retired intent on disk refuses every submit"
+unimplementable, and pushes an implementer straight to an in-memory uuid — the in-process flag
+this design exists to reject. **Fix: one singleton key `exec/polymarket_us/intent/current`,
+value = the record plus a state field. The latch is one `get()`. The uuid lives INSIDE the
+value, so portability is preserved, and at-most-one-outstanding-intent becomes structural
+rather than a rule.**
+
+**CRITICAL-2 — no mutual exclusion. The clear tool can disarm a latch on a live in-flight
+POST.** Sequence: node commits the intent → the POST is in flight and the venue has already
+accepted → an operator runs `breezy-clear-submit-intent`, checks open orders, sees nothing,
+supplies the "no order exists" token → retirement written → the node's next signal submits
+again → **doubled position**. The token's natural evidence is structurally blind here: a
+filled IOC is **not an open order**, so an empty open-orders list is equally consistent with
+"no order" and "filled order". Nothing required the trading process to be DOWN, and SQLite WAL
+serves two writers happily, so there was no accidental protection. Two `breezy-trade`
+processes would likewise both see no latch and both submit. **Fix: (a) the trading process
+holds an exclusive `flock` on a lockfile beside the store for its entire lifetime, and the
+clear tool must acquire it exclusively or refuse — the idiom already exists at
+`persistence/catalog.py` and `runtime/health.py`; (b) the "no order exists" token requires a
+positions-endpoint plus fill-record artifact, NEVER open-orders emptiness.**
+
+**CRITICAL-3 — `DEFINITIVE_ACCEPT` retired the latch before the fill was durable.** This is
+the one ordering that actually doubles a position. `executions` is `total=False`
+(`sdk_snapshot/.../types/orders.py:129-133`), so a response can carry an `id` and no
+executions; Revision 1 retired on the `id` alone, leaving a real position unrecorded with the
+latch open. **Fix: retire-on-accept requires `id` present AND a durably-written fill record,
+or an explicit zero-fill terminal state. Otherwise stay latched.**
+
+**Startup auto-retirement (removes the most common false positive).** If the process dies
+after the fill record is written but before the intent is retired, Revision 1 halted trading
+until a human intervened even though the evidence was already on disk. At startup, auto-retire
+any intent whose fingerprint matches a durable fill record. Purely local, no venue call.
+
+**Store failure modes must fail CLOSED, and be tested that way.** The `PRAGMA journal_mode=WAL`
+return value is discarded (`sqlite_store.py:126`), so on a filesystem without shared memory
+SQLite silently stays in rollback-journal mode; durability is unaffected (`synchronous=FULL`
+fsyncs either way, so the `SIGKILL` claim stands) but a concurrent reader can then make `set()`
+raise `database is locked` after `timeout_s=5.0` (`:118`), and a full or read-only disk raises
+`OperationalError` from `:174`. These fail closed **only if uncaught**: the intent write
+precedes the POST with **no `try/except` around it**, and a RED test plants a raising store and
+asserts **no POST occurs**. Retirement must NOT be a `set()` on the same key — `_UPSERT_SQL`
+(`:83-86`) would overwrite and destroy the intent; keep an append-only retirement value so the
+audit trail survives.
+
 **Barrier B8 — `RetryManager` is FORBIDDEN by name.** `live/retry.py:65 RetryManager[T]` and
 `:242 RetryManagerPool[T]` exist and are **not** wired into `LiveExecutionClient` (verified: 0
 matches for `RetryManager|retry` in `live/execution_client.py`). They are opt-in, and they are
@@ -400,6 +552,34 @@ client-order-id auto-resubmits and doubles the position.** New barrier B8 in
 `test_polymarket_us_readonly_guard.py`: no module under `src/` or `scripts/` may import from
 `nautilus_trader.live.retry`, reference `RetryManager`/`RetryManagerPool`, or pass a `retry_*`
 kwarg on the submit path. Non-vacuity: plant a module importing `RetryManager` and B8 must fire.
+
+**B8 as first specified missed the highest-probability real vector.** Nautilus ships its OWN
+Polymarket adapter — `adapters/polymarket/execution.py` — which imports `RetryManagerPool` at
+`:104`, constructs it at `:221`, and runs order submission through `retry_manager.run(...)`
+(verified: ~13 call sites, `_submit_order` at `:1281`). That is a working auto-resubmit
+execution client whose package name is **one suffix away from our venue** and is the first
+thing an implementer will read. A ban on `nautilus_trader.live.retry` does not fire on
+`from nautilus_trader.adapters.polymarket.execution import ...`; the retry pool arrives
+transitively and unnamed. Worse, that import is not even venue-classified — C4 matches only
+`polymarket_us` / `breezy.adapters.polymarket_us`
+(`test_polymarket_us_readonly_guard.py:159,236-241`). **B8 additionally bans any import of, or
+subclassing from, `nautilus_trader.adapters.polymarket*`, and `importlib.import_module` with a
+dotted string literal containing `live.retry`.**
+
+**B9 (new) — nothing pinned who may CALL the write transport.** R-5 allowlists
+`exec/write_transport.py` out of V1-V4 and R-7 narrows B6 to one permit caller, but no barrier
+constrains the transport's caller set: any later module importing it reaches `POST /v1/orders`
+bypassing both `safety.py:626` and the intent latch, with every barrier green. **B9 puts the
+transport's public callable in the `BARRED_CALLEES` mechanism with a one-caller exact-path pin
+— same shape as B6, no new machinery.**
+
+**The B4 allowlist is a pinned module constant, never a parameter.** `find_barred_callers`
+deliberately takes no exemption argument and that absence is itself pinned; an `allowlist=`
+parameter on `find_write_egress_violations` would reintroduce exactly that shape. Make it a
+module-level frozenset registered in `test_cage_rule_constants_are_pinned.py`, which already
+pins `_WRITE_METHODS`, `_WRITE_ATTRS`, `BARRED_CALLEES` and `_EGRESS_PATH_PREFIXES`
+(`:128-207`) with widened/narrowed neighbours. So configured, the non-vacuity proofs are real
+rather than ceremonial.
 
 **Write-ahead intent record — the latch, made durable by construction** *(PORTABLE)*. Before the
 POST, Breezy writes `exec/polymarket_us/intent/<uuid>` to `SqliteStateStore`
@@ -428,6 +608,13 @@ the reconciliation resolved to, **or** the literal token for "reconciliation pro
 exists"; (3) writes a retirement record carrying the operator id and the resolution; (4) never
 runs automatically, never on a timer, and is never called from the trading process. Clearing on
 a schedule, or on startup, would defeat the latch entirely.
+
+**"Never called from the trading process" IS testable, but not under the current scan roots.**
+`scan_barred_callers` runs over `EGRESS_SCAN_ROOTS = ("src","scripts")`
+(`test_polymarket_us_readonly_guard.py:136,436`); only B5 uses `REPO_WIDE_SCAN_ROOTS` (`:139`,
+which includes `tests`). So a conftest, fixture, or CI helper calling the clear function is
+invisible to the barrier. **The clear function's name goes in `BARRED_CALLEES` scanned
+REPO-WIDE, pinned to exactly one caller at its own `__main__`.**
 
 **Chokepoint narrowing (B6/B7), paired.** Narrow **B6** (`BARRED_CALLEES`,
 `test_polymarket_us_readonly_guard.py:401-405`, verified) to **exactly one** caller of
@@ -460,9 +647,22 @@ operator ack; **B8 non-vacuity**; **B6/B7 non-vacuity**.
 
 ### R-8 — The first real order — **VENUE-SPECIFIC**
 
-**Fee floor is bounded FIRST.** The prior "~$0.01 plus fees" is unbounded: a minimum/floor taker
-fee can exceed a one-cent notional by orders of magnitude, so the "bounded known loss" framing
-was unsupported. **Precondition:** obtain the venue's fee schedule — the docs snapshot, or
+**Fee floor is bounded FIRST, and the model cannot do it.** The prior "~$0.01 plus fees" is
+unbounded: a minimum/floor taker fee can exceed a one-cent notional by orders of magnitude, so
+the "bounded known loss" framing was unsupported. It is worse than unsupported — **the modelled
+fee is identically zero at R-8's size.** `fees.py:186-187` computes
+`theta * qty * price * (1 - price)` and banker's-rounds to the quote currency; at theta=0.06,
+1 contract @ 0.01 that is $0.000594 → **$0.00**. And the formula structurally CANNOT express a
+floor: `venue_fee_prob` (`costs.py:140-168`) returns per-contract probability units and
+`trade_cost_prob` (`:171-201`) adds only fee + slippage — there is no fixed-per-order term
+anywhere in the cost stack. Treating the floor as a one-off R-8 cost, as Revision 1 did, never
+propagates it into the trading gate, so every later sizing decision would still be made against
+a fee model that rounds small orders to free.
+**Therefore: (a) add a fixed-cost term to `DepthAwareTradeCost` BEFORE OQ-8 returns; (b) the
+fill record stores the venue's MEASURED commission — `Execution.commissionNotionalCollected`
+and `Order.commissionNotionalTotalCollected`/`commissionsBasisPoints`
+(`sdk_snapshot/.../types/orders.py:90-92,108`) — because a realized return computed from a
+modelled fee is not a realized return.** **Precondition:** obtain the venue's fee schedule — the docs snapshot, or
 `/v1/order/preview` **only if OQ-3 proves it non-mutating** — and record a worst-case total cost
 `notional + max(percentage_fee, minimum_fee)`. **If that bound cannot be established, R-8 does
 not run.** If it exceeds the operator's per-order ceiling, R-8 does not run. See OQ-8.
@@ -471,15 +671,51 @@ Operator present. **One contract**, marketable, IOC, targeting a **losing rung o
 in large size** (L-7/L-9): maximum path evidence at minimum bounded cost. This proves the order
 path — **it is not an ROI sample**, and no ROI claim may cite it.
 
+**`last_px` is the wrong quantity, and R-8 cannot catch it.** The fill record was specified to
+store `last_px`. For qty >= 2, `executions` is a list and the correct entry price is
+`order.avgPx` (`sdk_snapshot/.../types/orders.py:86`), not `Execution.lastPx` (`:101`). At
+R-8's qty = 1 a partial fill is **structurally impossible** — `quantity`, `cumQuantity` and
+`leavesQuantity` are all `int` (`:78-80`) — so the design is correct at n=1 and **silently
+wrong from n=2**, and no R-8 test can detect it. Store `avgPx` and `cumQuantity`; add a unit
+test at n=2 with two executions at different prices.
+
 **Done when** the goal-state predicate holds in full, **including clause 5 (OQ-1 closed and
 pinned) and clause 6 (intent retired)**.
 
-### R-9 — Settlement as exit — **PORTABLE (economics) / VENUE-SPECIFIC (plumbing)**
+### R-9 — Settlement as exit — **RE-PLAN REQUIRED. This increment does not exist.**
 
-Not needed to place one order; **strictly required to compute the ROI confidence interval.**
-Settlement truth is already in hand and venue-portable — both venues settle on NWS — so the
-*economics* carry over intact even if the resolution-report mapping does not. This is a mapping
-increment, not a research one. Existing settlement tests are protected; none may be weakened.
+**Revision 1 called this "a mapping increment, not a research one". That was the plan's worst
+error, and it was invisible because R-9 was the ONLY increment carrying no null-hypothesis
+verdict** — the standing rule exists precisely to catch this, and skipping it here hid a hole
+in the goal state for a whole revision.
+
+Verified by the coordinator: `check_instrument_expiration` exists at
+`backtest/engine.pyx:3680,5919,5934` and **NOWHERE else in installed Nautilus** — zero live
+occurrences. `realized_pnl` appears in `src/breezy/` only inside a docstring
+(`runtime/backtest_harness.py:855`). The live data client can subscribe to `InstrumentClose`
+(`live/data_client.py:676,1014`), but no live execution path closes a position when one
+arrives. **A live filled position is never closed by settlement and never produces a
+realized-PnL row.** Settlement-as-exit works in `BacktestEngine` and only there.
+
+Consequences that must be stated plainly: the goal state's final clause ("a filled position
+produces one realized-PnL row through settlement") is produced by **no increment in this
+plan**, and the estimator that clause feeds is named nowhere. A plan can be increment-correct
+and still never arrive; this one does not arrive.
+
+**The estimator must be named, and the plan's own n is inconsistent with the repo's.**
+`required_n_to_discriminate` already exists at
+`scripts/analysis/k1_cheap_open_settlement.py:324` and returns **n = 96** via a Wilson interval
+(`POWER_P_ALT=0.03`, `POWER_P_NULL=0.01`, `:165-166`). This plan's "n ~ 300" is a Wald interval
+on returns — the classic badly-covered interval at ~9 expected wins — and the two were never
+reconciled. Wilson is valid only if every trade is at ONE price; at varying prices the
+Bernoulli reduction breaks and a bootstrap is required. Note also that `POWER_P_NULL = 0.01` is
+break-even **before fees**: with theta alone it is 1.06% (n = 107), and with a $0.01 per-order
+floor it is 2% (**n = 753**). The fee floor therefore moves the sample requirement by ~7x, which
+is a programme-level fact, not a detail.
+
+A design for this increment is in flight. Until it lands, **R-9 is not buildable and nothing
+downstream of it may be scheduled.** Settlement truth is still in hand and still venue-portable
+(both venues settle on NWS), so the *economics* carry over — but the mechanism does not exist. Existing settlement tests are protected; none may be weakened.
 Keep the settlement decision keyed on the NWS observation, **never** on a venue resolution
 field: that single choice is what makes the economics survive a swap.
 
