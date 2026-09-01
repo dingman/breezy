@@ -77,15 +77,19 @@ Two consequences that are not optional (tracked by P4):
 
 Evidence: `docs/evidence/observation_lock_falsification_2026-08-31.md`.
 
-### [HIGH] BL-19 — shipped config refuses `running_extreme_lock`'s whole region
+### [HIGH] BL-19 — shipped config refuses the observation family's whole region
 
-`min_model_edge=0.04` (`risk.py:100`, `config.py:113`, gated `risk.py:411`): at
-p_model 0.9968 an ask of 0.970 gives edge 0.0268 < 0.04 -> refused; needs ask
-<= ~0.957. `transaction_cost_prob=0.015` (`risk.py:116`) is ~25x the true fee at
-p=0.99 (~0.0002; fee is `theta*C*p*(1-p)`, concave, max at p=0.50, so near-
-certain contracts are nearly free). Break-even ask at margin 0 is 0.99663.
-Decide these deliberately or a null capture reads as a dead market. Tick is
-0.01, so 0.995 is not a real price.
+DECIDED for BOTH strategies, NOT YET APPLIED to config — that is what remains.
+`docs/evidence/bl19_edge_and_cost_decision_2026-09-01.md`: `min_model_edge`
+0.04 -> 0.005; flat `transaction_cost_prob` -> `fee(p)+slippage`; `theta`
+per-instrument, never defaulted (`fees.py:90` forbids a fallback);
+`slippage_prob` 0.01 UNMEASURED and load-bearing. Print-lock's `model_p`
+(0.996896) already shipped in 05aa5f9; the two cost knobs still inherit
+`RiskLimits` by reference. CORRECTION: `decision.py:296` subtracts the cost
+BEFORE the floor, so the shipped requirement is ask <= 0.9418 (0.94 on the
+grid), not the ~0.957 previously recorded here. The SPEC's pre-registered kill
+ceiling had the same defect and would have declared the lead dead at 0.94 —
+corrected to 0.98 in `docs/strategies/breezy_strategy_cli_settlement_print_lock.md` §5.
 
 ### [MED] BL-21 — both tail-locks are outlier strategies; base rate unknown
 
@@ -97,31 +101,21 @@ over captured station-days. Any ask/break-even comparison MUST gate on the
 trigger first — an unfired tail shows pennies that read as free certainty.
 `first_in_window_capture_2026-09-01.md`, `h2_lower_tail_rejected_2026-09-01.md`.
 
-### [LOW] BL-22 — 60 spurious `cache.instrument is None` ERRORs per cycle
+### [HIGH] BL-23 — a truncated tape is discarded SILENTLY, not corrupted
 
-Cosmetic, data is sound: the check runs with no `await` after publishing
-(`data.py:720-721`) so the engine has not processed yet; the authoritative gate
-at `:724` passes, and WS frames resolve via `_instrument_provider.find()` first
-(`:1020-1022`). Fix before an unattended run or it buries real errors.
-
-### [HIGH] BL-13 — build `cli_settlement_print_lock` (NOW THE LEAD STRATEGY)
-
-Both tail-locks are outlier strategies against the measured ladder: a six-rung
-ladder centred on the forecast is a WINDOW around the expected max, so the
-interiors catch the mode and both open tails are the outlier rungs. Measured
-2026-08-31: H1 (upper) fired 0/4, H2 (lower) fired 0/4.
-`docs/evidence/h2_lower_tail_rejected_2026-09-01.md`.
-
-Print-lock triggers on the FINAL CLI print and buys YES on the unique bucket
-CONTAINING the printed value — usually an interior, so it is designed to fire on
-most station-days. This does NOT contradict G-01: interiors are dead AFTER THE
-PRELIMINARY (revision breaks exact equality) but sound AFTER THE FINAL (the
-revision already happened). p_stable 99.989% (9105/9106), halt-window 98.66%
-(9041/9164). Long-only, taker, no forecast, exclusive-bucket logic already in
-`RiskManager`.
-
-**Its capture window is 05:00-13:00Z, NOT the evening.** Evening tape only
-measures tail reachability; morning tape tests the strategy that can fire.
+Measured 2026-09-01 against a real SIGKILL. An unclean death does NOT void the
+file: `close()` only appends the end-of-stream marker, and a clean EOF at a
+message boundary reads fine. But if the file ends MID-MESSAGE,
+`ParquetDataCatalog._read_feather_file` catches `(pa.ArrowInvalid, OSError)` and
+returns `None` (`parquet.py:2795-2800`), which `convert_stream_to_data` turns
+into `continue` (`:2644-2646`). Conversion then "succeeds" over an EMPTY
+catalog: 228 KB on disk, 0 rows delivered, no exception, no log line. Loss is
+bounded by the file buffer (~8 KB, not the 10 s flush interval) — salvage
+recovered 491/500 records — and by one day (`SCHEDULED_DATES` closes rotated
+files). **Never read a 0-row `convert_stream_to_data` as a quiet market.**
+Wanted, in order: a read-back preflight that reports truncation loudly; a
+salvage reader on the proven prefix recovery. Pinned by
+`tests/contract/test_quote_tape_unclean_shutdown.py`.
 
 ### [MED] BL-14 — `RefusalAlerter` alerts on `SHORTS_DISABLED` only
 
@@ -190,10 +184,10 @@ either count it under the same bounded key set or document why not.
 ### Programme sequence (carried forward from 2026-08-30)
 
 - **P1** — harden then supervise the quote tape; prices are the one
-  irreplaceable stream. CONFIRMED open: reconnect exhaustion sets `_degraded`
-  and RETURNS (`websocket.py:678-684`), so the supervisor ends and the node runs
-  forever doing nothing — must exit non-zero for systemd. UNVERIFIED: whether
-  unclean shutdown voids a daily feather file (read the writer close path).
+  irreplaceable stream. Exit-status and fail-closed supervision LANDED
+  (79b9b44); the feather question is ANSWERED — see BL-23, which is the
+  remaining P1 work. Still untested end-to-end: the native shutdown joint
+  (`kernel.py:585` + `:613-638`) is confirmed by source, not by a live-node run.
 - **P2/P3** — forecast probes (Open-Meteo `/v1/previous-runs`; IEM AFOS forecast
   PIL) then forecast ingestion. Breezy ingests **no forecast data at all**, so
   every forecast-strategy ROI is inadmissible until P3 lands. DEPRIORITISED:
@@ -218,9 +212,9 @@ plain work items, no longer blocked. Still blocked:
 | G-17 | Phase 1.5 premise GO/NO-GO | G-16. **NO-GO stops the programme.** |
 
 **Immediate path to the ROI stop gate** (`docs/specs/CAPTURE_SPEC_OBSERVATION_GATE0.md`):
-BL-18 parser fix -> Gate 0A screening capture (3 station-days, 19:00-01:00Z,
-five UPPER-tail slugs, pre-registered kill at median ask >= 0.99663) -> P1
-recorder hardening -> Gate 0B (>=14 station-days) -> observation backtest.
+BL-13 print-lock build + BL-19 -> P1 recorder hardening -> morning capture
+(05:00-13:00Z, the final-print window) -> Gate 0B (>=14 station-days) ->
+observation backtest. The evening tape only measures tail reachability.
 
 ---
 

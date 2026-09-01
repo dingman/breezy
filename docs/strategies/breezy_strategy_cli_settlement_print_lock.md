@@ -65,6 +65,32 @@ Using historical NWS climate-day records already stored by Breezy (`revision_seq
 - Operational kill: fraction of station-days where first morning CLI timestamp still leaves `hours_to_settlement` above the current halt. **Dead if** that fraction `< 0.20`.
 - Economic confirmation uses **in-life** `OrderBookDepth10` only. Do not reconstruct bid/ask of expired markets.
 
+> **CORRECTION (2026-09-01, implementation side — supersedes the ask ceiling
+> above).** The pre-registered ceiling `p_stable - c - 0.03` with `c` = 2¢
+> evaluates to **0.94** on the 0.01 tick grid (0.9469 at the per-station
+> `p_stable` = 0.996896; 0.9494 pooled — both floor to 0.94). Near-certain
+> contracts do not trade anywhere near 0.94, so applying this ceiling
+> literally would declare a live strategy dead on arrival.
+>
+> The defect is that `c` = 2¢ and the 3¢ buffer are flat constants, while the
+> venue fee is `theta*C*p*(1-p)` — concave, maximal at p = 0.50, and ~0.0006 at
+> p = 0.99. A flat cost charges a near-certain contract the fee MAXIMUM of a
+> coin-flip contract. This is BL-19's failure mode relocated out of config and
+> into the falsification test, where it would have produced a false NEGATIVE
+> that looked like a clean pre-registered kill.
+>
+> **Replacement ceiling: `break_even - min_model_edge - slippage_prob`
+> = 0.996698 - 0.005 - 0.01 = 0.9817 -> 0.98 on the grid.** Derivation and the
+> per-station basis: `docs/evidence/bl19_edge_and_cost_decision_2026-09-01.md`
+> §8. The `p_stable < 0.97` kill and the 0.20 operational kill are UNCHANGED
+> and remain binding — this correction touches the ask ceiling only.
+>
+> Note that 0.98-vs-0.99 rests on `slippage_prob` = 0.01, which is UNMEASURED.
+> If realised slippage is ~0 for a marketable taker at level 0, 0.99 is
+> honestly profitable and this ceiling refuses a real trade. On a 0.01 grid
+> there is no intermediate price, so this one unmeasured number decides the
+> whole test. Measure it before treating a 0.99-clustered tape as a kill.
+
 ---
 
 ### 6. Data dependencies
