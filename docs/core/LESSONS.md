@@ -454,3 +454,66 @@ persisted and the tape was verified before interpretation ([[L-8]]). The H4 run
 also shows the right shape for a cheap kill: measure whether the ORDER IS
 AVAILABLE before measuring whether it is profitable. An absent ask is not a
 pricing problem that a better model or a lower break-even can solve.
+
+### L-8 amendment — a 2xx is not a datum (2026-09-01)
+
+The same failure has now occurred on the HTTP surface, and the coordinator
+committed it. The Open-Meteo probe report records
+`q3_archive_depth_2019` as **HTTP 200, 5079 bytes**
+(`docs/evidence/open_meteo_previous_runs_probe_2026-08-31T005848Z/PROBE_REPORT.md:39`).
+Reading only that row, the coordinator asserted "forecast archive depth
+confirmed back to 2019" and propagated it into two agent briefs.
+
+The very next section of the same report says the step is **partial**: "2xx, but
+the payload did not carry the datum this step was designed to extract"
+(`:62`). Only `q3_archive_depth_2022` ANSWERED, with `rows=168` (`:61`). The
+report even states the conclusion explicitly at `:83` — coverage is
+"NON-CONTIGUOUS ... an unexplained gap, not a clearance". A dedicated bisect
+probe then measured `2024-01-01 -> 0/168` for all four models, bracketing the
+boundary between 2023-12-09 and 2024-01-01.
+
+**The rule, generalised:** a status code, a byte count, and a non-empty response
+are all compatible with zero usable data. **Every coverage or availability claim
+must cite a ROW COUNT, never a status code, and must be read together with the
+report's own answered/partial classification.** The probe had already done the
+work correctly; the error was entirely in the reading.
+
+Corollary for briefs: a fact asserted into a subagent brief propagates at the
+speed of dispatch and is expensive to recall — two briefs and one external
+design run were seeded with the false 2019 claim before it was caught. Verify a
+load-bearing premise BEFORE it enters a brief, not after the returns land.
+
+### L-9 amendment — the cheap side is mostly a lottery already lost (2026-09-01)
+
+L-9 sent the programme toward "where uncertainty remains", and the first reading
+of the microstructure pointed at the deep books on the cheap rungs (median
+~35,991 contracts offered at 0.01, against 0.58 at 0.99 on winners). The
+coordinator framed that inversion as the tradeable region. **That framing was
+wrong and must not be repeated.**
+
+Those deep 0.01 offers are overwhelmingly **post-peak**: rungs the climate day
+has already missed. Their true probability is residual METAR<->CLI basis plus
+late-rise, not "a 1% event" — buying them is buying a lottery that has already
+lost, and paying the 0.01 tick floor as the entry fee. H1/H2 are the same object
+in costume: listed tails 4-8 F from the printed high, triggered 0/4, asks at
+0.01 correctly pricing a non-event.
+
+Nor is the pre-event cheap rung automatically juicy. At 24 h the forecast error
+is roughly sigma ~= 2.8 F, so a 6 F tail is about `1 - Phi(6/2.8) ~= 1.6%`
+against a 1% minimum tick — **fair to slightly expensive after fees**, not a
+100:1 mispricing. A tick floor that coarse means a genuine sub-tick edge cannot
+even be expressed; the existing engine's `p_floor = 0.01` is an accidental
+confession of exactly that.
+
+**What survives:** only the PRE-EVENT (D+1) cheap-open book, which is
+structurally different from the post-peak dump and is at present essentially
+unmeasured. **Gate it before building for it.** The measurement (K1) is: first
+cheap-open ask per `(station, climate_day, rung)` on the D+1 book, scored
+against the eventual CLI integer final, Wilson 95%. If the upper bound sits at
+or below break-even, the calibration family is dead too — and that result is
+worth far more than the forecast-ingestion build it saves.
+
+**The ordering rule this reinforces:** measure whether the trade is AVAILABLE,
+then whether the population is REAL, and only then build the model. The
+programme has twice run the settlement-side test first and terminated at "gate
+PASS, economics unknown."

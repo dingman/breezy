@@ -1,6 +1,45 @@
 # The NO-SEND execution client — implementation plan
 
-**Status:** Revision 3, not executed. **Created:** 2026-08-31.
+**Status:** Revision 3 — **PARTIALLY EXECUTED, AND SUPERSEDED IN SCOPE.**
+**Created:** 2026-08-31. **Status corrected:** 2026-09-01.
+
+> **Do not resume this document as a work plan.** Two corrections, both verified
+> on disk on 2026-09-01:
+>
+> 1. **The former "not executed" status line was FALSE.** NS-0 and NS-2 artifacts
+>    are on disk and match this spec's shape:
+>    `src/breezy/adapters/polymarket_us/exec/__init__.py` (docstring-only, as NS-0
+>    specifies) and `tests/unit/test_cage_rule_constants_are_pinned.py`. Resuming
+>    from the old line would have re-implemented landed work. (Verified: the
+>    artifacts exist and match the specified shape. NOT verified: that they are
+>    green, or that they match every RED line-by-line.)
+> 2. **Every line citation in this document is stale.** Spot-checked: B6a and the
+>    N2 pin have both moved roughly 150 lines from the positions cited here. Any
+>    narrowing "measured against the baseline" would measure against nothing.
+>    Re-derive citations before relying on them.
+>
+> **Why the scope is superseded.** This plan's terminal state is a process that
+> refuses every order (see §1). That state was designed on 2026-08-31, when a
+> backtest could still be imagined to satisfy the programme's stop gate. Under
+> the restated gate — positive ROI from real, very small marketable orders with
+> the confidence-interval lower bound clearing break-even — a
+> refuses-everything process has an ROI evidence value of exactly zero.
+> NS-0..NS-5 is mis-scoped **as a plan**; NS-3/NS-4/NS-5 remain largely correct
+> **as increments** and are carried forward into the replacement spine.
+>
+> **Carry forward unchanged:** NS-5's paired barrier discipline (RED 16 and its
+> Barriers section) — the N2 set grows to six in the same commit that narrows
+> B6b from "zero subclasses" to "exactly one at an exact path with a non-vacuity
+> proof", with B6a explicitly held at `== 0`. That is the strongest engineering
+> in this document.
+>
+> **A safety fact this plan never names, now verified in installed Nautilus:**
+> `risk/engine.pyx:684-689` — when `account_for_venue` returns `None`, the risk
+> check does `return True` ("Temporary early return"); `:691-692` does the same
+> for margin accounts. **Every notional and position cap is INERT until a real
+> `AccountState` is in the cache.** Emitting that account is therefore a hard
+> ordering prerequisite of any order submission, not a convenience. Enforce it
+> with a test, not a sentence.
 
 **What this document is.** `docs/plans/ORDER_EGRESS_PLAN.md` (revision 3, 2246
 lines) designed the settlement identity, a four-type authority algebra and the
