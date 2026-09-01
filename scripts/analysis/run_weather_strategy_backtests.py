@@ -231,6 +231,10 @@ from breezy.strategy.calibration_mean_reversion import (
 )
 from breezy.strategy.forecast_mispricing import ForecastMispricingConfig, ForecastMispricingStrategy
 from breezy.strategy.forecast_revision import ForecastRevisionConfig, ForecastRevisionStrategy
+from breezy.strategy.cli_settlement_print_lock import (
+    CliSettlementPrintLockConfig,
+    CliSettlementPrintLockStrategy,
+)
 from breezy.strategy.running_extreme_lock import RunningExtremeLockConfig, RunningExtremeLockStrategy
 from breezy.strategy.weather_common.forecast_source import ForecastSource
 from breezy.strategy.weather_common.models import ForecastSnapshot
@@ -249,6 +253,44 @@ from breezy.strategy.weather_common.models import ForecastSnapshot
 #: an operator-reserved control (see `docs/evidence/observation_lock_falsification_2026-08-31.md`
 #: section 4).
 STALE_OBSERVATION_HOURS_RUNNING_EXTREME_LOCK: Final[float] = 12.665
+
+#: `RiskLimits.stale_observation_hours` has no shipped default, so this
+#: construction site must supply one. It is DERIVED FOR THIS STRATEGY'S OWN
+#: CADENCE and is deliberately NOT the 12.665h above: that number bounds the
+#: preliminary->first-final ISSUANCE gap (how long a PRELIMINARY must stay
+#: usable until the final lands), which is not a quantity this strategy's
+#: signal has at all. `cli_settlement_print_lock`'s signal IS the final
+#: print, so its bound is the FINAL-PRINT-TO-LAST-LEGAL-DECISION window:
+#:
+#:   earliest FINAL print          05:00Z  (the 05:00-13:00Z capture window,
+#:                                 docs/core/PROGRESS.md BL-13; the brief's
+#:                                 "12:30-05:00 local on D+1")
+#:   latest venue settlement       16:00Z  (11:00 ET under EST -- the METAR
+#:                                 review path from the brief's section 1;
+#:                                 the ordinary 08:00 ET path is 12:00Z EDT
+#:                                 / 13:00Z EST, all earlier)
+#:   risk halt                     -2.0h   (`min_hours_to_settlement`, which
+#:                                 binds above `halt_hours_before_settlement`
+#:                                 = 1.0 -- see the evidence document's
+#:                                 halt-window row)
+#:   latest legal decision         14:00Z
+#:   MAX legitimate print age      14:00Z - 05:00Z = 9.0h
+#:
+#: No receipt-lag term is added, unlike the sibling's `+ 0.3488h`. That term
+#: exists there because the sibling's bound must cover "until the next
+#: product ARRIVES"; here the bound covers "until a wall-clock deadline",
+#: and age is measured from ISSUANCE (`SignalFreshness` contract), so a
+#: record received late is already old on arrival and consumes no extra
+#: headroom.
+#:
+#: Accepted consequence: this is the widest corner (EST + METAR review), so
+#: on an ordinary EDT 08:00 ET day the bound is looser than strictly needed.
+#: That is the right direction for a LIVENESS backstop -- a too-tight bound
+#: refuses legitimate trades invisibly (counted `stale_observation`, alerted
+#: on by nothing -- BL-14), while a loose one is still bounded by the
+#: settlement halt this strategy already enforces per instrument. A
+#: BUILD-side decision, not an operator-reserved control.
+STALE_OBSERVATION_HOURS_CLI_SETTLEMENT_PRINT_LOCK: Final[float] = 9.0
 
 DEFAULT_QUOTE_CATALOG_PATH: Final[Path] = Path(
     "/home/jon/.local/share/breezy/catalog/quote_tape/polymarket_us",
@@ -588,12 +630,20 @@ def _build_strategy(
     module docstring's "TWO CONDITIONS" section for which run passes which
     overrides and why each one is justified on its own.
 
-    `forecast_source` is `None` for `running_extreme_lock` -- an
-    observation-kind strategy that structurally cannot accept a
-    `ForecastSource` (see `RunningExtremeLockStrategy.__init__`). It is
-    mandatory for the three forecast-driven kinds; a `None` there is a
-    caller bug, not a case to fabricate a forecast for.
+    `forecast_source` is `None` for the two OBSERVATION-kind strategies,
+    `cli_settlement_print_lock` and `running_extreme_lock`, which
+    structurally cannot accept a `ForecastSource`. It is mandatory for the
+    three forecast-driven kinds; a `None` there is a caller bug, not a case
+    to fabricate a forecast for.
     """
+    if kind == "cli_settlement_print_lock":
+        return CliSettlementPrintLockStrategy(
+            CliSettlementPrintLockConfig(
+                instrument_ids=instrument_ids,
+                stale_observation_hours=STALE_OBSERVATION_HOURS_CLI_SETTLEMENT_PRINT_LOCK,
+                **config_overrides,
+            ),
+        )
     if kind == "running_extreme_lock":
         return RunningExtremeLockStrategy(
             RunningExtremeLockConfig(
