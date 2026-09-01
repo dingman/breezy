@@ -121,9 +121,21 @@ estimate above.
 `indicators/` and `data/aggregation.pyx`. `DonchianChannel` is a fixed-count
 rolling window over `Price` and will not take custom `Data`; `BarBuilder` keeps a
 running high (`aggregation.pyx:150-154`) but is keyed on `Price` from
-tick/bar types. The strategy computes R(t) itself, exactly as
-`running_extreme_lock/strategy.py:304` already does. L-1 null hypothesis:
+tick/bar types. The strategy must compute R(t) itself. L-1 null hypothesis:
 REFUTED for the running max, CONFIRMED for the actor/timer/catalog plumbing.
+
+**CORRECTION (2026-09-01).** An earlier revision of this file claimed the
+strategy "computes R(t) itself, exactly as `running_extreme_lock/strategy.py:304`
+already does." **That was FALSE and is retracted.** Verified against source:
+`on_data` (`:304-319`) reads `data.tmax_f` straight off an `NwsClimateDay` CLI
+product into `RunningExtremeObservation(tmax_f=data.tmax_f, ...)`, and
+`decision.py:212` then does `running_f = observation.tmax_f`. There is no fold,
+no accumulator and no `max()` over observations anywhere in
+`src/breezy/strategy/`. The "running high" in that strategy is the running high
+**NWS already computed and printed**. So the accumulator is absent from Breezy as
+well as from Nautilus, and must be authored -- it is not an existing pattern to
+copy. (Same pass: `_submit_delta:412` uses `order_factory.market(...)`, so that
+strategy is a MARKET-order taker, unlike print-lock's bounded marketable limit.)
 
 Do NOT propose that Claude, Grok or Codex backtest or simulate. Nautilus alone
 runs backtests and execution.
