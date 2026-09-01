@@ -1,6 +1,127 @@
 # EXEC SPINE — shortest sound path to one real, filled, reconciled order
 
-**Status:** ACTIVE. Supersedes `docs/plans/EXEC_CLIENT_NOSEND_PLAN.md` (1993 lines; terminal
+**Status:** **RE-PLAN REQUIRED — DO NOT BUILD R-5, R-7, OR THE GOAL-STATE PREDICATE.**
+Peer-reviewed 2026-09-01; verdict RE-PLAN (bounded). R-1..R-4 and R-6 survive
+review. Three defects, all independently verified by the coordinator against
+installed source:
+
+> 1. **R-7's null hypothesis is FABRICATED.** The plan claims "CONFIRMED present
+>    — the native Command-outcome taxonomy is exactly `{terminal, retryable,
+>    AMBIGUOUS}`". **No such taxonomy exists**: `AMBIGUOUS|Ambiguous` and
+>    `retryable|RETRYABLE` each match in **0 files** across installed
+>    nautilus_trader 1.231.0. Worse, it is load-bearing for a scope CUT (the
+>    non-goals table), so a fabricated native was used to justify building less.
+>    Provenance: the coordinator supplied that vocabulary in the commissioning
+>    brief as a cut, and the planner elevated it to a verified native. Both links
+>    failed; the upstream cause was the brief. See LESSONS L-10.
+>    **MISSED real native:** `live/retry.py:65 RetryManager[T]` / `:242
+>    RetryManagerPool[T]` DO exist and are NOT wired into `LiveExecutionClient`
+>    (0 references in `live/execution_client.py`) — opt-in. It is the first thing
+>    an implementer reaches for, and wiring it to `submit_order` **auto-resubmits
+>    and doubles the position** on a venue with no client-order-id. R-7 must
+>    forbid it by name.
+> 2. **The goal-state predicate is UNREACHABLE as written.** It requires a
+>    restart reconciling "without a synthetic zero price", but R-2 pins
+>    `CacheConfig(database=None)` (memory-only), so after restart nothing is
+>    in-process and R-4's rule refuses the position as foreign. The venue-id map
+>    cannot rescue it: a filled IOC is not an open order, and
+>    `PositionStatusReport` carries no order id. The criterion also depends on
+>    OQ-1, which the plan defers past R-8. Fix: persist a durable FILL RECORD at
+>    fill time so "Breezy-opened" survives restart, and make OQ-1 a precondition
+>    of declaring R-8 done.
+> 3. **R-5's "cannot open exposure" is FALSE.**
+>    `CancelAllOrdersParams(TypedDict, total=False)` — `slugs` is **OPTIONAL**
+>    (`sdk_snapshot/.../types/orders.py:153-156`). A venue that ignores an
+>    unrecognized or malformed `slugs` falls through to cancelling EVERY resting
+>    order on the account, including operator-placed ones. "Prove the slug flat"
+>    proves that slug flat, not the account — and OQ-6 (does `GET /v1/orders/open`
+>    return foreign orders?) is still open. Precondition on WHOLE-ACCOUNT
+>    flatness, unfiltered, re-verified immediately before and after. Also an
+>    internal contradiction: a two-hypothesis discriminator needs two POSTs plus
+>    the flatness GET, but the text says "two requests, max".
+>
+> **Further required amendments** (verified): the `SUBMIT_AMBIGUOUS` latch has no
+> stated durability — in-process only means a restart clears it and resubmits,
+> the sharpest un-named money loss; it must persist and must trigger on
+> `CancelledError` too (`live/cancellation.py:32` cancels pending tasks on
+> shutdown, and `CancelledError` is a `BaseException`, so it escapes the
+> `except Exception` at `live/execution_client.py:512`). Add a write-ahead intent
+> record BEFORE the POST. Verify `SqliteStateStore` thread affinity
+> (`sqlite_store.py:120,128-135` raises off the constructing thread) against the
+> event-loop thread. `generate_missing_orders` emits **MARKET** events per
+> `live/config.py:108-110`, not LIMIT — R-6's exemption must key on the
+> RECONCILIATION tag only. `live/execution_engine.pyx` does not exist; it is
+> `.py`. OQ-5 is closable NOW from `live/config.py:119-121` ("retry attempts to
+> **verify**") — the plan's reading was right. R-8's "~$0.01 plus fees" is
+> unbounded: a minimum/floor taker fee can exceed the notional by orders of
+> magnitude — bound it first. `install_order_guard` and `_refuse_naked_short`
+> have NO covering tests; R-6 must add them. Specify how the operator-reserved
+> values arrive at runtime (never from a repo file, fixture, or committed env)
+> with a test asserting no default exists on any path.
+
+**SECURITY REVIEW (2026-09-01) — VERDICT: SAFE WITH NAMED CONDITIONS.** R-1 and
+R-5 are BLOCKED until conditions 1-7 are met. Two CRITICAL findings, both
+verified by the coordinator:
+
+> **C1 — R-1 would write the operator's portfolio into a GIT-TRACKED directory.**
+> `EVIDENCE_DIRECTORY = Path("docs/evidence/venue/polymarket_us")`
+> (`polymarket_us_auth_smoke.py:154`) holds **135 tracked files** and matched no
+> ignore rule. The 0600/0700 file-mode discipline is real but orthogonal — mode
+> bits do nothing against `git add`. PARTLY MITIGATED 2026-09-01: a
+> `docs/evidence/venue/**/PRIVATE_*` ignore rule was added and verified (existing
+> artifacts unaffected). R-1 MUST use that prefix, and must ship a test asserting
+> its artifact path is git-ignored.
+>
+> **C2 — the leak check the plan leans on cannot see money.** `write_evidence`
+> (`:714-722`) calls `find_secret_leak_offsets(text, secret_values)`, which scans
+> ONLY for the supplied credential strings. It offers **zero** protection against
+> a balance or position reaching the artifact. R-1 needs an INDEPENDENT
+> no-money assertion; citing this one is a false assurance.
+
+**Conditions, all required:**
+1. R-1 artifacts use the `PRIVATE_` prefix, with a test asserting the path is
+   git-ignored. (C1)
+2. R-1 adds an independent no-money assertion; it must not rely on
+   `find_secret_leak_offsets` for value-freedom. (C2)
+3. R-1 emits only ALLOWLISTED schema key names — an unrecognized key becomes a
+   COUNT, never a name (a slug-keyed map would otherwise publish the portfolio as
+   field names). Drop "scales", or reduce it to a type name: digit count or
+   exponent discloses magnitude while matching no sentinel. Extend the sentinel
+   test to plant sentinels in KEYS and in a slug-keyed map — as proposed it plants
+   only values and is blind to both. (H1)
+4. R-5 must also narrow **B4** (`find_write_egress_violations`,
+   `test_polymarket_us_readonly_guard.py:257-291` — V1 on literal "POST", V2 on
+   `_ORDER_PATH_RE` which `/v1/orders/open/cancel` MATCHES, V3 on `.post`/
+   `.request`, V4 on the `getattr` bypass), and R-7 must narrow **B6**
+   (`BARRED_CALLEES`, `:401-405`) to one chokepoint caller — each with a
+   remove-the-caller non-vacuity proof. The plan named neither. B4 done loosely
+   re-opens write egress repo-wide. (H2)
+5. The write transport goes UNDER `exec/`, or E1/E2/E3 and the B3 receiver test
+   are extended to name it, in the SAME commit, with the N2 exact-set pin
+   updated. A `PolymarketUSWriteTransport` in `transport.py` matches NO N2 rule —
+   the repo's first write-capable network surface would ship outside its own
+   firewall while every barrier stayed green. (H3)
+6. The write transport reuses `redact_headers`/`redact_url`; no canonical string,
+   body, or unredacted header may reach a log or exception. The canonical string
+   carries **no nonce** (`signing.py:134`, ±30 s tolerance at `:89`), so a
+   captured key/timestamp/signature triple is a 30-second bearer credential for an
+   ARBITRARY body at that path — and with no client-order-id a replay cannot be
+   deduplicated. (H4)
+7. R-5 proves the WHOLE ACCOUNT flat via an unfiltered `GET /v1/orders/open`, not
+   one slug. (H5, and see defect 3 above.)
+
+**Clean, confirmed:** the operator-control machinery has no permissive default
+and no unset-means-unlimited path — `_require_operator_value` (`safety.py:494-500`)
+refuses absence, `issue_live_trading_permit` (`:541-545`) requires an explicit
+enable with no coercion, and `_refuse` (`:221-225`) emits only
+`type(value).__name__`, never a value. R-6's new controls inherit a sound pattern
+IF they reuse `_require_operator_value`. Nothing in the plan weakens a settlement
+or contract test, vendors Nautilus, or touches `allow_short`.
+
+**Dead citation:** the plan cites `_probe_signing_variants`; the real function is
+`_probe_canonical_string` (`polymarket_us_auth_smoke.py:1042`).
+
+Supersedes `docs/plans/EXEC_CLIENT_NOSEND_PLAN.md` (1993 lines; terminal
 state was a process that refuses every order — zero evidence value against the stop gate, and
 unreviewable at that length).
 **Date:** 2026-09-01

@@ -517,3 +517,45 @@ worth far more than the forecast-ingestion build it saves.
 then whether the population is REAL, and only then build the model. The
 programme has twice run the settlement-side test first and terminated at "gate
 PASS, economics unknown."
+
+## L-10 — A brief's vocabulary becomes a subagent's verified fact (2026-09-01)
+
+The EXEC SPINE plan asserted, as a **CONFIRMED present** Nautilus native, "the
+native Command-outcome taxonomy … is exactly `{terminal, retryable,
+AMBIGUOUS}`", and used it to JUSTIFY CUTTING SCOPE ("more is speculative").
+
+**No such taxonomy exists.** `AMBIGUOUS|Ambiguous` and `retryable|RETRYABLE` each
+match in **0 files** across installed `nautilus_trader` 1.231.0.
+
+**Provenance is the lesson.** The coordinator wrote that three-word set into the
+commissioning brief's non-goals list — not as a claim about Nautilus, merely as a
+convenient label for a scope cut. The planner read authoritative-sounding
+vocabulary in an authoritative document and promoted it to a verified native.
+Neither party checked. The upstream cause was the brief.
+
+Worse, the same session had ALREADY recorded this failure shape: the L-8
+amendment's own corollary says "verify a load-bearing premise BEFORE it enters a
+brief, not after the returns land." It was written and then violated within the
+hour — this was the **third** false premise seeded into a brief in one session
+(the others: the Open-Meteo 2019 archive depth, and the D1 walk-the-book cost
+characterisation that a marketable IOC LIMIT makes impossible).
+
+**The rule.** Anything a brief states in the register of fact — a version, an API
+name, a taxonomy, a coverage span, an execution semantic — must be VERIFIED
+before dispatch or explicitly marked `UNVERIFIED — confirm before relying`. A
+subagent cannot distinguish the coordinator's shorthand from the coordinator's
+knowledge, and it has every incentive to treat the brief as ground truth.
+
+**The countermeasure that worked.** The mandatory adversarial peer-review caught
+it, which is precisely why the planning gate is not discretionary. The near-miss
+is instructive: an ordering test HAD already been implemented from this same
+unreviewed plan. It was test-only and harmless, but the review gate was skipped
+to get there. **Run the gate before implementing, not after — including when the
+increment looks too small to need it.**
+
+**Also record the missed real native.** `live/retry.py:65 RetryManager[T]` and
+`:242 RetryManagerPool[T]` DO exist and are NOT wired into `LiveExecutionClient`
+(0 references). It is the first thing an implementer reaches for, and wiring it
+to `submit_order` on a venue with **no client-order-id** auto-resubmits and
+silently doubles the position. Fabricating a native hid a real one that is
+actively dangerous. See [[validate-nautilus-before-planning]].

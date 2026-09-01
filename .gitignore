@@ -11,3 +11,11 @@ __pycache__/
 secrets/
 .coverage
 .coverage.*
+
+# Private venue artifacts (EXEC SPINE R-1 shape capture).
+# `docs/evidence/venue/polymarket_us/` is GIT-TRACKED (135 files), and the
+# smoke script's leak check (`find_secret_leak_offsets`) scans ONLY for supplied
+# credential strings — it cannot see a balance or a position. Anything derived
+# from an authenticated private endpoint must carry the PRIVATE_ prefix so it
+# can never be added by a bare `git add docs/`.
+docs/evidence/venue/**/PRIVATE_*
