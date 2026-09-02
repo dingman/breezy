@@ -63,12 +63,35 @@ balance on a fill, and `_publish_account_state` is reached only from `_connect`
 and `_query_account`. `QueryAccount` is emitted only by `Strategy.query_account`
 — **no Breezy strategy calls it** (0 hits across `src/` and `scripts/`).
 
-**Hazard.** Node connects with a real $1,200 balance. Trading draws it to $180.
-`balance_total` still reports 1200.00, so an "8% cap" authorises $96 — 53% of
-true equity. If the first tick lands before the account reaches `Portfolio`,
-`_equity()` returns `10_000.0` and the cap authorises $800 against $1,200.
-Neither case logs: **a constant and a stale reading are indistinguishable from
-a measurement.**
+**Hazard.** A constant and a stale reading are indistinguishable from a
+measurement, and nothing logs the difference.
+
+**Severity corrected on review — my first statement of it was wrong.** I wrote
+that the cap "authorises $96 — 53% of true equity", which conflated payout with
+cash. `contract_size = 1.0`, so `order_notional` is **max payout, not cash
+outlay**: the cap is `0.08 x equity` *contracts*. `max_position_contracts=250`
+therefore dominates whenever `0.08 x E > 250`, i.e. above E = $3,125, and at the
+fabricated $10,000 the equity cap is 800 contracts and **inert**. Real cost at a
+live-small $1,200: intended cap 96 contracts, actual 250 — **2.6x intended**,
+not 8.3x, because `max_position` clamps it. Cash bite is price-dependent: 250
+contracts at a 5c ask is $12.50; at 0.90 it is $225, i.e. 19% of a $1,200
+account against an intended 8%. Real, bounded, and worst at high ask prices.
+
+**A third mechanism, worse than either, found in review.** `risk.py:557` reads
+`if portfolio.equity > 0 and order_notional > limits.max_equity_fraction *
+portfolio.equity`. At `equity == 0.0` the condition is False: no clip, no
+refusal, full size. The cap disappears exactly when the balance reads zero.
+
+**But zero is NOT established as ruin — my second error here.** `balance_total`
+returns the venue's `currentBalance` on an `AccountType.CASH` account. Position
+value is a *separate* venue field, `assetNotional`, which nothing in Breezy
+reads. Whether `currentBalance` includes position notional is **UNVERIFIED**.
+So `equity == 0.0` is at least as plausibly "fully deployed and solvent" as
+"drained". Refusing new BUYS at zero cash is right; refusing SELLS would
+deadlock the close-only exit — the trap `risk.py:570-577` explicitly refuses to
+create for the depth clip. Any fix must gate its refusals on
+`signed_qty_delta > 0`. Two independent reviews reached that requirement
+separately.
 
 ## T-5 [MEDIUM] Settlement halt is unreachable when the forecast source returns None
 
