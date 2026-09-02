@@ -92,7 +92,6 @@ from ma_prelock_winner_ask_study import (
     DEFAULT_QUOTE_TAPE_CATALOG,
     DEFAULT_SETTLEMENT_CATALOG,
     MIN_AFTERNOON_COVERAGE_MINUTES,
-    MIN_AFTERNOON_STATION_DAYS,
     MIN_EXECUTABLE_SIZE,
     afternoon_coverage_minutes,
     collect_preflight_summary,
@@ -123,9 +122,13 @@ from breezy.normalize.climate_day import standard_time_zone
 
 __all__ = [
     "ARCHIVE_HOURS",
+    "ASK_BANDS",
     "DENSE_STATIONS",
     "FEE_THETA",
     "N_MIN",
+    "POOLED_KILL_N_MIN",
+    "STRATUM_KILL_N_MIN",
+    "SURVIVE_N_MIN",
     "WIDTH_INTERIOR",
     "WIDTH_OPEN_LOWER",
     "WIDTH_OPEN_UPPER",
@@ -135,16 +138,24 @@ __all__ = [
     "HoldCase",
     "MbStationDaySummary",
     "MbVerdict",
+    "RealizedStratum",
     "aggregate_hold_cases",
+    "all_visited_cells_dead_by_construction",
+    "break_even",
     "build_archive_table",
     "build_current_rung_trials",
     "build_hold_cases",
     "build_mb_station_day_summary",
+    "build_realized_stratum",
     "build_report",
+    "classify_ask_band",
     "classify_width",
     "evaluate_mb",
+    "evaluate_mb_family",
     "find_lagged_entry",
     "first_executable_trial",
+    "gather_taken_trials",
+    "is_taken_trial",
     "proxy_rung",
 ]
 
@@ -161,9 +172,29 @@ N_MIN: Final[int] = 90
 #: fee coefficient, `theta * C * p * (1 - p)`.
 FEE_THETA: Final[float] = 0.06
 
+
+def break_even(ask: float) -> float:
+    """`ask + theta*ask*(1-ask)` -- the settle rate at which `ask` breaks even."""
+    return ask + FEE_THETA * ask * (1.0 - ask)
+
 #: SS1's latency sensitivity sweep. K-B must hold at 10 AND 15.
 LAG_MINUTES_SWEEP: Final[tuple[int, ...]] = (5, 10, 15)
 K_B_REQUIRED_LAGS: Final[tuple[int, ...]] = (10, 15)
+
+#: Kill-amendment thresholds (`docs/evidence/grok_mb_kill_amendment_2026-09-02.md`).
+#: Evidence is the REALIZED hold rate of TAKEN trials against ask+fee, never
+#: the archive base rate against ask -- the base rate is unconditional and the
+#: ask is forecast-conditioned, so the original screen could neither fire nor
+#: confirm (audited 09-02: MDW 09-01 noon, p_hold_lower=0.594 vs ask=0.06,
+#: "edge"=+0.53 by the old formula, yet the day settled ABOVE that rung).
+#: Kill MAY fire at this floor (pooled or any stratum); survive needs more.
+POOLED_KILL_N_MIN: Final[int] = 60
+STRATUM_KILL_N_MIN: Final[int] = 60
+SURVIVE_N_MIN: Final[int] = 150
+
+#: `{(0.05,0.15], (0.15,0.30], (0.30,0.95)}` -- covers the taken screen's ask
+#: band `(0.05, 0.95)` with no gap and no overlap.
+ASK_BANDS: Final[tuple[tuple[float, float], ...]] = ((0.05, 0.15), (0.15, 0.30), (0.30, 0.95))
 
 WIDTH_INTERIOR: Final[str] = "interior_2F"
 WIDTH_OPEN_UPPER: Final[str] = "open_upper"
@@ -377,6 +408,22 @@ def classify_width(rung: Rung, running_f: int) -> tuple[str, int | None]:
     return WIDTH_OPEN_LOWER, None
 
 
+def classify_ask_band(ask: float) -> tuple[float, float]:
+    """Which of `ASK_BANDS` an ask in the taken screen's `(0.05, 0.95)` falls in.
+
+    Left-open, right-closed except the top band, which stays right-open at
+    the screen's own `0.95` ceiling -- together the three bands partition
+    `(0.05, 0.95)` with no gap and no overlap.
+    """
+    if 0.05 < ask <= 0.15:
+        return (0.05, 0.15)
+    if 0.15 < ask <= 0.30:
+        return (0.15, 0.30)
+    if 0.30 < ask < 0.95:
+        return (0.30, 0.95)
+    raise ValueError(f"ask {ask!r} is outside the taken screen's (0.05, 0.95) band")
+
+
 @dataclass(frozen=True, slots=True)
 class CurrentRungTrial:
     """One (depth instant, lag) evaluation of the CURRENT rung `R(t)` is in.
@@ -470,7 +517,7 @@ def build_current_rung_trials(
         edge = (
             None
             if p_hold_lower is None or entry_ask is None
-            else p_hold_lower - entry_ask - FEE_THETA * entry_ask * (1.0 - entry_ask)
+            else p_hold_lower - break_even(entry_ask)
         )
         trials.append(
             CurrentRungTrial(
@@ -574,16 +621,6 @@ def build_mb_station_day_summary(
     )
 
 
-@dataclass(frozen=True, slots=True)
-class MbVerdict:
-    lag_minutes: int
-    outcome: Literal["MB_DEAD", "UNDERPOWERED", "ALIVE"]
-    n_afternoon: int
-    any_edge_positive: bool
-    all_visited_cells_dead: bool
-    detail: str
-
-
 def _cell_is_dead_by_construction(trial: CurrentRungTrial) -> bool:
     """Pre-filter cells (SS1): open-lower and interior m=1 never trade."""
     if trial.width == WIDTH_OPEN_LOWER:
@@ -593,51 +630,232 @@ def _cell_is_dead_by_construction(trial: CurrentRungTrial) -> bool:
     return trial.p_hold_lower is None
 
 
-def evaluate_mb(
-    summaries: Sequence[MbStationDaySummary], *, lag_minutes: int
-) -> MbVerdict:
-    """SS1 kill sentence at one lag."""
-    scored = [summary for summary in summaries if summary.status == "SCORED"]
-    covered = tuple(summary for summary in scored if summary.afternoon_covered)
-    n_afternoon = len(covered)
-    executables = tuple(
-        summary.first_executable for summary in covered if summary.first_executable is not None
-    )
-    any_edge_positive = any(
-        trial.edge is not None and trial.edge > 0.0 for trial in executables
-    )
-    all_visited_cells_dead = bool(executables) and all(
-        _cell_is_dead_by_construction(trial) for trial in executables
+def is_taken_trial(trial: CurrentRungTrial | None) -> bool:
+    """The kill-amendment's TAKEN filter, applied to a station-day's ONE
+
+    candidate (its first lagged executable current-rung snapshot). `trial`
+    already satisfies `.executable` (ask band + K-depth) by construction --
+    this adds the archive-side selection: `edge > 0` and a live cell. The
+    archive still SELECTS; it is no longer the evidence (kill-amendment memo).
+    A station-day whose first executable snapshot fails this contributes NO
+    trial at all -- there is no "search further into the day" (one trial per
+    station-day, kill-amendment SS "Independence").
+    """
+    if trial is None:
+        return False
+    return (
+        trial.edge is not None
+        and trial.edge > 0.0
+        and not _cell_is_dead_by_construction(trial)
     )
 
-    if n_afternoon < MIN_AFTERNOON_STATION_DAYS:
-        outcome: Literal["MB_DEAD", "UNDERPOWERED", "ALIVE"] = "UNDERPOWERED"
-        detail = (
-            f"n_afternoon={n_afternoon} < {MIN_AFTERNOON_STATION_DAYS} at "
-            f"lag={lag_minutes}min; UNDERPOWERED, not dead"
+
+def gather_taken_trials(
+    summaries: Sequence[MbStationDaySummary],
+) -> tuple[CurrentRungTrial, ...]:
+    """One trial per afternoon-covered, taken station-day (never snapshot-weighted)."""
+    covered = (
+        summary
+        for summary in summaries
+        if summary.status == "SCORED" and summary.afternoon_covered
+    )
+    taken: list[CurrentRungTrial] = []
+    for summary in covered:
+        trial = summary.first_executable
+        if trial is not None and is_taken_trial(trial):
+            taken.append(trial)
+    return tuple(taken)
+
+
+def all_visited_cells_dead_by_construction(summaries: Sequence[MbStationDaySummary]) -> bool:
+    """Structural family-dead check: every cell the TAPE ever visited (every
+
+    captured instant's current rung, not just the one taken per day) is
+    `n/a` / `m=1` / open-lower. Distinct from the taken set, which by
+    definition never contains a dead-by-construction cell -- checking only
+    taken trials here would be vacuously false.
+    """
+    visited = tuple(
+        trial
+        for summary in summaries
+        if summary.status == "SCORED" and summary.afternoon_covered
+        for trial in summary.trials
+    )
+    return bool(visited) and all(_cell_is_dead_by_construction(trial) for trial in visited)
+
+
+@dataclass(frozen=True, slots=True)
+class RealizedStratum:
+    """Realized hold rate of TAKEN trials in one stratum (pooled/station/ask-band)."""
+
+    label: str
+    n: int
+    k: int
+    mean_ask: float
+    break_even: float
+    wilson_lower: float
+    wilson_upper: float
+
+    @property
+    def realized_hold_rate(self) -> float:
+        return self.k / self.n if self.n else 0.0
+
+    @property
+    def cell_dead(self) -> bool:
+        """Wilson-95% UPPER below this stratum's own break-even, at n >= 60."""
+        return self.n >= STRATUM_KILL_N_MIN and self.wilson_upper < self.break_even
+
+    @property
+    def survives(self) -> bool:
+        """Wilson-95% LOWER above break-even, at n >= 150 (pooled-scale only)."""
+        return self.n >= SURVIVE_N_MIN and self.wilson_lower > self.break_even
+
+
+def build_realized_stratum(
+    label: str, taken: Sequence[CurrentRungTrial]
+) -> RealizedStratum | None:
+    """`None` for an empty stratum -- a rate over nothing is undefined, not 0."""
+    priced = tuple(trial for trial in taken if trial.entry_ask is not None)
+    if not priced:
+        return None
+    n = len(priced)
+    k = sum(1 for trial in priced if trial.held)
+    mean_ask = sum(trial.entry_ask for trial in priced if trial.entry_ask is not None) / n
+    lower, upper = wilson_interval(k, n)
+    return RealizedStratum(
+        label=label,
+        n=n,
+        k=k,
+        mean_ask=mean_ask,
+        break_even=break_even(mean_ask),
+        wilson_lower=lower,
+        wilson_upper=upper,
+    )
+
+
+def _station_strata(taken: Sequence[CurrentRungTrial]) -> tuple[RealizedStratum, ...]:
+    by_station: dict[str, list[CurrentRungTrial]] = defaultdict(list)
+    for trial in taken:
+        by_station[trial.city].append(trial)
+    strata = (
+        build_realized_stratum(f"station:{city}", by_station[city])
+        for city in sorted(by_station)
+    )
+    return tuple(stratum for stratum in strata if stratum is not None)
+
+
+def _ask_band_strata(taken: Sequence[CurrentRungTrial]) -> tuple[RealizedStratum, ...]:
+    by_band: dict[tuple[float, float], list[CurrentRungTrial]] = defaultdict(list)
+    for trial in taken:
+        if trial.entry_ask is not None:
+            by_band[classify_ask_band(trial.entry_ask)].append(trial)
+    strata = (
+        build_realized_stratum(f"ask_band:{band[0]}-{band[1]}", by_band.get(band, ()))
+        for band in ASK_BANDS
+    )
+    return tuple(stratum for stratum in strata if stratum is not None)
+
+
+@dataclass(frozen=True, slots=True)
+class MbVerdict:
+    """Kill-amendment verdict at one lag (`grok_mb_kill_amendment_2026-09-02.md`)."""
+
+    lag_minutes: int
+    outcome: Literal["MB_DEAD", "UNDERPOWERED", "ALIVE"]
+    n_taken: int
+    pooled: RealizedStratum | None
+    station_strata: tuple[RealizedStratum, ...]
+    ask_band_strata: tuple[RealizedStratum, ...]
+    all_visited_cells_dead: bool
+    detail: str
+
+    @property
+    def cell_dead_strata(self) -> tuple[RealizedStratum, ...]:
+        return tuple(
+            stratum
+            for stratum in (*self.station_strata, *self.ask_band_strata)
+            if stratum.cell_dead
         )
-    elif not any_edge_positive or all_visited_cells_dead:
-        outcome = "MB_DEAD"
+
+
+def evaluate_mb(
+    taken: Sequence[CurrentRungTrial],
+    *,
+    lag_minutes: int,
+    all_visited_cells_dead: bool = False,
+) -> MbVerdict:
+    """Kill-amendment verdict: REALIZED hold rate of TAKEN trials vs ask+fee.
+
+    Never the archive base rate against ask -- that screen can neither fire
+    nor confirm (the 09-02 audit: MDW 09-01 noon had p_hold_lower=0.594 vs
+    ask=0.06, "edge"=+0.53 by the superseded formula, and the day settled
+    ABOVE that rung anyway; base rates clear low asks on most days by
+    construction, which is not evidence of an edge).
+    """
+    pooled = build_realized_stratum("pooled", taken)
+    station_strata = _station_strata(taken)
+    ask_band_strata = _ask_band_strata(taken)
+    cell_dead = tuple(
+        stratum for stratum in (*station_strata, *ask_band_strata) if stratum.cell_dead
+    )
+    n_taken = pooled.n if pooled is not None else 0
+    pooled_kill = pooled is not None and pooled.cell_dead
+    pooled_survive = (
+        pooled is not None and pooled.survives and not cell_dead and not all_visited_cells_dead
+    )
+
+    if pooled_kill or bool(cell_dead) or all_visited_cells_dead:
+        outcome: Literal["MB_DEAD", "UNDERPOWERED", "ALIVE"] = "MB_DEAD"
+        if all_visited_cells_dead:
+            why = "every tape-visited cell is n/a/m=1/open-lower"
+        elif pooled_kill:
+            assert pooled is not None  # implied by pooled_kill
+            why = (
+                f"pooled Wilson-upper {pooled.wilson_upper:.4f} < "
+                f"break-even {pooled.break_even:.4f} at n={n_taken}"
+            )
+        else:
+            why = (
+                f"{len(cell_dead)} stratum(-a) cell-dead: "
+                f"{', '.join(s.label for s in cell_dead)}"
+            )
+        detail = f"lag={lag_minutes}min: MB_DEAD -- {why}"
+    elif pooled_survive:
+        outcome = "ALIVE"
+        assert pooled is not None
         detail = (
-            f"n_afternoon={n_afternoon} >= {MIN_AFTERNOON_STATION_DAYS} at "
-            f"lag={lag_minutes}min; no station-day's first executable snapshot "
-            f"clears p_hold_lower > ask + fee, or every visited cell is "
-            f"n/a / m=1 / open-lower"
+            f"lag={lag_minutes}min: n_taken={n_taken} >= {SURVIVE_N_MIN}, pooled "
+            f"Wilson-lower {pooled.wilson_lower:.4f} > break-even {pooled.break_even:.4f}, "
+            f"no stratum cell-dead"
         )
     else:
-        outcome = "ALIVE"
+        outcome = "UNDERPOWERED"
         detail = (
-            f"n_afternoon={n_afternoon} at lag={lag_minutes}min; at least one "
-            f"station-day clears edge > 0 in a live cell"
+            f"lag={lag_minutes}min: n_taken={n_taken}; kill needs n>={POOLED_KILL_N_MIN}, "
+            f"survive needs n>={SURVIVE_N_MIN} -- not dead, not alive"
         )
     return MbVerdict(
         lag_minutes=lag_minutes,
         outcome=outcome,
-        n_afternoon=n_afternoon,
-        any_edge_positive=any_edge_positive,
+        n_taken=n_taken,
+        pooled=pooled,
+        station_strata=station_strata,
+        ask_band_strata=ask_band_strata,
         all_visited_cells_dead=all_visited_cells_dead,
         detail=detail,
     )
+
+
+def evaluate_mb_family(
+    verdicts_by_lag: Mapping[int, MbVerdict],
+) -> Literal["MB_DEAD", "UNDERPOWERED", "ALIVE"]:
+    """Family verdict: MB_DEAD/ALIVE require both K-B lags (10 and 15) to agree."""
+    required = tuple(verdicts_by_lag[lag] for lag in K_B_REQUIRED_LAGS)
+    if all(verdict.outcome == "MB_DEAD" for verdict in required):
+        return "MB_DEAD"
+    if all(verdict.outcome == "ALIVE" for verdict in required):
+        return "ALIVE"
+    return "UNDERPOWERED"
 
 
 # ---------------------------------------------------------------------------
@@ -697,11 +915,21 @@ def _fmt_edge(value: float | None) -> str:
     return "n/a" if value is None else f"{value:+.4f}"
 
 
+def _fmt_stratum_row(stratum: RealizedStratum) -> str:
+    dead = "CELL-DEAD" if stratum.cell_dead else ""
+    return (
+        f"| {stratum.label} | {stratum.n} | {stratum.k} | {stratum.realized_hold_rate:.4f} | "
+        f"{stratum.mean_ask:.4f} | {stratum.break_even:.4f} | {stratum.wilson_lower:.4f} | "
+        f"{stratum.wilson_upper:.4f} | {dead} |"
+    )
+
+
 def build_report(
     *,
     archive: Mapping[ArchiveCellKey, ArchiveCell],
     summaries_by_lag: Mapping[int, Sequence[MbStationDaySummary]],
     verdicts: Mapping[int, MbVerdict],
+    family_outcome: Literal["MB_DEAD", "UNDERPOWERED", "ALIVE"],
     preflight: str,
     generated_at: dt.datetime,
 ) -> str:
@@ -757,9 +985,9 @@ def build_report(
         add("")
         add(
             "| station | day | status | coverage (min) | h | m | width | held | "
-            "ask | size | p_hold_lower | edge |"
+            "ask | size | p_hold_lower | edge | taken |"
         )
-        add("|---|---|---|---:|---:|---|---|---|---:|---:|---:|---:|")
+        add("|---|---|---|---:|---:|---|---|---|---:|---:|---:|---:|---|")
         ordered = sorted(summaries_by_lag[lag], key=lambda item: (item.city, item.climate_day))
         for summary in ordered:
             trial = summary.first_executable
@@ -767,22 +995,59 @@ def build_report(
                 add(
                     f"| {summary.city} | {summary.climate_day.isoformat()} | "
                     f"{summary.status} | {summary.afternoon_coverage_minutes:.1f} | "
-                    f"- | - | - | - | - | - | - | - |"
+                    f"- | - | - | - | - | - | - | - | - |"
                 )
                 continue
             m_text = "-" if trial.m is None else str(trial.m)
+            taken_text = "TAKEN" if is_taken_trial(trial) else ""
             add(
                 f"| {summary.city} | {summary.climate_day.isoformat()} | {summary.status} | "
                 f"{summary.afternoon_coverage_minutes:.1f} | {trial.hour_lst} | {m_text} | "
                 f"{trial.width} | {trial.held} | {_fmt_price(trial.entry_ask)} | "
                 f"{_fmt_price(trial.entry_size)} | "
                 f"{'n/a' if trial.p_hold_lower is None else f'{trial.p_hold_lower:.4f}'} | "
-                f"{_fmt_edge(trial.edge)} |"
+                f"{_fmt_edge(trial.edge)} | {taken_text} |"
             )
         add("")
         verdict = verdicts[lag]
-        add(f"**{verdict.outcome}** -- {verdict.detail}")
+        add(
+            "#### Realized-hold evidence (kill amendment: "
+            "`docs/evidence/grok_mb_kill_amendment_2026-09-02.md`)"
+        )
         add("")
+        add(
+            "| stratum | n | k | realized rate | mean ask | break-even | "
+            "Wilson-lower | Wilson-upper | |"
+        )
+        add("|---|---:|---:|---:|---:|---:|---:|---:|---|")
+        if verdict.pooled is not None:
+            add(_fmt_stratum_row(verdict.pooled))
+        for stratum in (*verdict.station_strata, *verdict.ask_band_strata):
+            add(_fmt_stratum_row(stratum))
+        add("")
+        add(f"**{verdict.outcome}** (lag={lag}min) -- {verdict.detail}")
+        add("")
+    add("## Family verdict (both K-B lags, 10 and 15, must agree)")
+    add("")
+    add(f"**{family_outcome}**")
+    add("")
+    add("## Independence and the clock")
+    add("")
+    add(
+        "One trial per station-day; snapshot-weighted pools are forbidden. "
+        "Same-calendar-day stations are weakly dependent (shared synoptic "
+        "weather) -- the Wilson interval is anti-conservative when treating "
+        "several same-day station-days as independent draws "
+        "(`docs/evidence/grok_mb_kill_amendment_2026-09-02.md`)."
+    )
+    add("")
+    add(
+        "Clock (memo): ~3 taken trials/day at the archive's dense-station rate "
+        "-> n=60 around 2026-09-22, n=150 around 2026-10-21, both still SON. "
+        "If taken stays at the 09-01 rate (~1/day), n=60/150 are 60/150 "
+        "calendar days out. Archive table is frozen; only the tape-side "
+        "Wilson waits."
+    )
     return "\n".join(lines) + "\n"
 
 
@@ -882,13 +1147,20 @@ def main(argv: Sequence[str] | None = None) -> int:
             )
 
     verdicts = {
-        lag: evaluate_mb(summaries_by_lag[lag], lag_minutes=lag) for lag in LAG_MINUTES_SWEEP
+        lag: evaluate_mb(
+            gather_taken_trials(summaries_by_lag[lag]),
+            lag_minutes=lag,
+            all_visited_cells_dead=all_visited_cells_dead_by_construction(summaries_by_lag[lag]),
+        )
+        for lag in LAG_MINUTES_SWEEP
     }
+    family_outcome = evaluate_mb_family(verdicts)
 
     report = build_report(
         archive=archive,
         summaries_by_lag=summaries_by_lag,
         verdicts=verdicts,
+        family_outcome=family_outcome,
         preflight=preflight,
         generated_at=dt.datetime.now(tz=dt.UTC).replace(microsecond=0),
     )

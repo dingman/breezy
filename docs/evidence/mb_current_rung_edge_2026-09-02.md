@@ -1,6 +1,6 @@
 # M_B -- current-rung p_hold x ask edge measurement and its kill
 
-Generated 2026-09-02T22:45:07+00:00 from
+Generated 2026-09-02T23:35:26+00:00 from
 `scripts/analysis/mb_current_rung_edge_study.py`. Spec:
 `docs/evidence/grok_mb_design_2026-09-02.md` SS1 / SS2.
 
@@ -15,7 +15,9 @@ A descriptive join, not a backtest: no order, fill, position, fee or P&L appears
 > information-conditioned (forecast, trend). On 09-01 MDW the day settled 93 > the noon rung
 > [91,92] — the market's 0.06 was right. A base-rate edge is not evidence of mispricing; the
 > discriminating statistic is the REALIZED hold rate of taken current-rung trials vs ask + fee
-> (Wilson upper bound), which needs n ≈ 60–150 trials. Kill amendment pending Grok.
+> (Wilson upper bound), which needs n ≈ 60–150 trials. **Kill amendment implemented**
+> (`docs/evidence/grok_mb_kill_amendment_2026-09-02.md`): see the per-lag "Realized-hold evidence"
+> tables and the Family verdict section below.
 
 ## Tape integrity (LESSON L-8) -- verified before interpretation
 
@@ -163,49 +165,82 @@ A descriptive join, not a backtest: no order, fill, position, fee or P&L appears
 
 ### lag = 5 min
 
-| station | day | status | coverage (min) | h | m | width | held | ask | size | p_hold_lower | edge |
-|---|---|---|---:|---:|---|---|---|---:|---:|---:|---:|
-| LAX | 2026-08-31 | SCORED | 19.0 | - | - | - | - | - | - | - | - |
-| LAX | 2026-09-01 | SCORED | 299.9 | 12 | - | open_lower | False | 0.1700 | 28.0000 | n/a | n/a |
-| MDW | 2026-08-31 | SCORED | 0.0 | - | - | - | - | - | - | - | - |
-| MDW | 2026-09-01 | SCORED | 300.0 | 12 | 0 | interior_2F | False | 0.0600 | 41.0000 | 0.5944 | +0.5311 |
-| MIA | 2026-08-30 | SCORED | 0.0 | - | - | - | - | - | - | - | - |
-| MIA | 2026-08-31 | SCORED | 0.0 | - | - | - | - | - | - | - | - |
-| MIA | 2026-09-01 | SCORED | 299.9 | - | - | - | - | - | - | - | - |
-| SFO | 2026-08-31 | SCORED | 19.0 | - | - | - | - | - | - | - | - |
-| SFO | 2026-09-01 | SCORED | 299.9 | 12 | 0 | interior_2F | True | 0.6600 | 24.0100 | 0.4606 | -0.2129 |
+| station | day | status | coverage (min) | h | m | width | held | ask | size | p_hold_lower | edge | taken |
+|---|---|---|---:|---:|---|---|---|---:|---:|---:|---:|---|
+| LAX | 2026-08-31 | SCORED | 19.0 | - | - | - | - | - | - | - | - | - |
+| LAX | 2026-09-01 | SCORED | 299.9 | 12 | - | open_lower | False | 0.1700 | 28.0000 | n/a | n/a |  |
+| MDW | 2026-08-31 | SCORED | 0.0 | - | - | - | - | - | - | - | - | - |
+| MDW | 2026-09-01 | SCORED | 300.0 | 12 | 0 | interior_2F | False | 0.0600 | 41.0000 | 0.5944 | +0.5311 | TAKEN |
+| MIA | 2026-08-30 | SCORED | 0.0 | - | - | - | - | - | - | - | - | - |
+| MIA | 2026-08-31 | SCORED | 0.0 | - | - | - | - | - | - | - | - | - |
+| MIA | 2026-09-01 | SCORED | 299.9 | - | - | - | - | - | - | - | - | - |
+| SFO | 2026-08-31 | SCORED | 19.0 | - | - | - | - | - | - | - | - | - |
+| SFO | 2026-09-01 | SCORED | 299.9 | 12 | 0 | interior_2F | True | 0.6600 | 24.0100 | 0.4606 | -0.2129 |  |
 
-**UNDERPOWERED** -- n_afternoon=4 < 15 at lag=5min; UNDERPOWERED, not dead
+#### Realized-hold evidence (kill amendment: `docs/evidence/grok_mb_kill_amendment_2026-09-02.md`)
+
+| stratum | n | k | realized rate | mean ask | break-even | Wilson-lower | Wilson-upper | |
+|---|---:|---:|---:|---:|---:|---:|---:|---|
+| pooled | 1 | 0 | 0.0000 | 0.0600 | 0.0634 | 0.0000 | 0.7935 |  |
+| station:MDW | 1 | 0 | 0.0000 | 0.0600 | 0.0634 | 0.0000 | 0.7935 |  |
+| ask_band:0.05-0.15 | 1 | 0 | 0.0000 | 0.0600 | 0.0634 | 0.0000 | 0.7935 |  |
+
+**UNDERPOWERED** (lag=5min) -- lag=5min: n_taken=1; kill needs n>=60, survive needs n>=150 -- not dead, not alive
 
 ### lag = 10 min
 
-| station | day | status | coverage (min) | h | m | width | held | ask | size | p_hold_lower | edge |
-|---|---|---|---:|---:|---|---|---|---:|---:|---:|---:|
-| LAX | 2026-08-31 | SCORED | 19.0 | - | - | - | - | - | - | - | - |
-| LAX | 2026-09-01 | SCORED | 299.9 | 12 | - | open_lower | False | 0.1700 | 175.0000 | n/a | n/a |
-| MDW | 2026-08-31 | SCORED | 0.0 | - | - | - | - | - | - | - | - |
-| MDW | 2026-09-01 | SCORED | 300.0 | 12 | 0 | interior_2F | False | 0.0600 | 40.0000 | 0.5944 | +0.5311 |
-| MIA | 2026-08-30 | SCORED | 0.0 | - | - | - | - | - | - | - | - |
-| MIA | 2026-08-31 | SCORED | 0.0 | - | - | - | - | - | - | - | - |
-| MIA | 2026-09-01 | SCORED | 299.9 | - | - | - | - | - | - | - | - |
-| SFO | 2026-08-31 | SCORED | 19.0 | - | - | - | - | - | - | - | - |
-| SFO | 2026-09-01 | SCORED | 299.9 | 12 | 0 | interior_2F | True | 0.6600 | 29.0100 | 0.4606 | -0.2129 |
+| station | day | status | coverage (min) | h | m | width | held | ask | size | p_hold_lower | edge | taken |
+|---|---|---|---:|---:|---|---|---|---:|---:|---:|---:|---|
+| LAX | 2026-08-31 | SCORED | 19.0 | - | - | - | - | - | - | - | - | - |
+| LAX | 2026-09-01 | SCORED | 299.9 | 12 | - | open_lower | False | 0.1700 | 175.0000 | n/a | n/a |  |
+| MDW | 2026-08-31 | SCORED | 0.0 | - | - | - | - | - | - | - | - | - |
+| MDW | 2026-09-01 | SCORED | 300.0 | 12 | 0 | interior_2F | False | 0.0600 | 40.0000 | 0.5944 | +0.5311 | TAKEN |
+| MIA | 2026-08-30 | SCORED | 0.0 | - | - | - | - | - | - | - | - | - |
+| MIA | 2026-08-31 | SCORED | 0.0 | - | - | - | - | - | - | - | - | - |
+| MIA | 2026-09-01 | SCORED | 299.9 | - | - | - | - | - | - | - | - | - |
+| SFO | 2026-08-31 | SCORED | 19.0 | - | - | - | - | - | - | - | - | - |
+| SFO | 2026-09-01 | SCORED | 299.9 | 12 | 0 | interior_2F | True | 0.6600 | 29.0100 | 0.4606 | -0.2129 |  |
 
-**UNDERPOWERED** -- n_afternoon=4 < 15 at lag=10min; UNDERPOWERED, not dead
+#### Realized-hold evidence (kill amendment: `docs/evidence/grok_mb_kill_amendment_2026-09-02.md`)
+
+| stratum | n | k | realized rate | mean ask | break-even | Wilson-lower | Wilson-upper | |
+|---|---:|---:|---:|---:|---:|---:|---:|---|
+| pooled | 1 | 0 | 0.0000 | 0.0600 | 0.0634 | 0.0000 | 0.7935 |  |
+| station:MDW | 1 | 0 | 0.0000 | 0.0600 | 0.0634 | 0.0000 | 0.7935 |  |
+| ask_band:0.05-0.15 | 1 | 0 | 0.0000 | 0.0600 | 0.0634 | 0.0000 | 0.7935 |  |
+
+**UNDERPOWERED** (lag=10min) -- lag=10min: n_taken=1; kill needs n>=60, survive needs n>=150 -- not dead, not alive
 
 ### lag = 15 min
 
-| station | day | status | coverage (min) | h | m | width | held | ask | size | p_hold_lower | edge |
-|---|---|---|---:|---:|---|---|---|---:|---:|---:|---:|
-| LAX | 2026-08-31 | SCORED | 19.0 | - | - | - | - | - | - | - | - |
-| LAX | 2026-09-01 | SCORED | 299.9 | 12 | - | open_lower | False | 0.0800 | 150.0000 | n/a | n/a |
-| MDW | 2026-08-31 | SCORED | 0.0 | - | - | - | - | - | - | - | - |
-| MDW | 2026-09-01 | SCORED | 300.0 | 12 | 0 | interior_2F | False | 0.0600 | 65.0000 | 0.5944 | +0.5311 |
-| MIA | 2026-08-30 | SCORED | 0.0 | - | - | - | - | - | - | - | - |
-| MIA | 2026-08-31 | SCORED | 0.0 | - | - | - | - | - | - | - | - |
-| MIA | 2026-09-01 | SCORED | 299.9 | - | - | - | - | - | - | - | - |
-| SFO | 2026-08-31 | SCORED | 19.0 | - | - | - | - | - | - | - | - |
-| SFO | 2026-09-01 | SCORED | 299.9 | 12 | 0 | interior_2F | True | 0.6600 | 29.0100 | 0.4606 | -0.2129 |
+| station | day | status | coverage (min) | h | m | width | held | ask | size | p_hold_lower | edge | taken |
+|---|---|---|---:|---:|---|---|---|---:|---:|---:|---:|---|
+| LAX | 2026-08-31 | SCORED | 19.0 | - | - | - | - | - | - | - | - | - |
+| LAX | 2026-09-01 | SCORED | 299.9 | 12 | - | open_lower | False | 0.0800 | 150.0000 | n/a | n/a |  |
+| MDW | 2026-08-31 | SCORED | 0.0 | - | - | - | - | - | - | - | - | - |
+| MDW | 2026-09-01 | SCORED | 300.0 | 12 | 0 | interior_2F | False | 0.0600 | 65.0000 | 0.5944 | +0.5311 | TAKEN |
+| MIA | 2026-08-30 | SCORED | 0.0 | - | - | - | - | - | - | - | - | - |
+| MIA | 2026-08-31 | SCORED | 0.0 | - | - | - | - | - | - | - | - | - |
+| MIA | 2026-09-01 | SCORED | 299.9 | - | - | - | - | - | - | - | - | - |
+| SFO | 2026-08-31 | SCORED | 19.0 | - | - | - | - | - | - | - | - | - |
+| SFO | 2026-09-01 | SCORED | 299.9 | 12 | 0 | interior_2F | True | 0.6600 | 29.0100 | 0.4606 | -0.2129 |  |
 
-**UNDERPOWERED** -- n_afternoon=4 < 15 at lag=15min; UNDERPOWERED, not dead
+#### Realized-hold evidence (kill amendment: `docs/evidence/grok_mb_kill_amendment_2026-09-02.md`)
 
+| stratum | n | k | realized rate | mean ask | break-even | Wilson-lower | Wilson-upper | |
+|---|---:|---:|---:|---:|---:|---:|---:|---|
+| pooled | 1 | 0 | 0.0000 | 0.0600 | 0.0634 | 0.0000 | 0.7935 |  |
+| station:MDW | 1 | 0 | 0.0000 | 0.0600 | 0.0634 | 0.0000 | 0.7935 |  |
+| ask_band:0.05-0.15 | 1 | 0 | 0.0000 | 0.0600 | 0.0634 | 0.0000 | 0.7935 |  |
+
+**UNDERPOWERED** (lag=15min) -- lag=15min: n_taken=1; kill needs n>=60, survive needs n>=150 -- not dead, not alive
+
+## Family verdict (both K-B lags, 10 and 15, must agree)
+
+**UNDERPOWERED**
+
+## Independence and the clock
+
+One trial per station-day; snapshot-weighted pools are forbidden. Same-calendar-day stations are weakly dependent (shared synoptic weather) -- the Wilson interval is anti-conservative when treating several same-day station-days as independent draws (`docs/evidence/grok_mb_kill_amendment_2026-09-02.md`).
+
+Clock (memo): ~3 taken trials/day at the archive's dense-station rate -> n=60 around 2026-09-22, n=150 around 2026-10-21, both still SON. If taken stays at the 09-01 rate (~1/day), n=60/150 are 60/150 calendar days out. Archive table is frozen; only the tape-side Wilson waits.

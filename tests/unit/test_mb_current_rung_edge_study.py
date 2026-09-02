@@ -354,30 +354,119 @@ def test_classify_width_interior_margins_and_open_tails(mb: ModuleType) -> None:
 
 
 # ---------------------------------------------------------------------------
-# evaluate_mb -- the SS1 kill sentence
+# evaluate_mb -- the kill-amendment: REALIZED hold rate of TAKEN trials vs
+# ask+fee, never the archive base rate against ask
+# (`docs/evidence/grok_mb_kill_amendment_2026-09-02.md`)
 # ---------------------------------------------------------------------------
 
 
-def _summary(
-    mb: ModuleType,
-    *,
-    city: str,
-    coverage: float,
-    trial: object | None,
-) -> object:
-    return mb.MbStationDaySummary(
-        city=city,
-        climate_day=_CLIMATE_DAY,
-        status="SCORED",
-        lag_minutes=10,
-        afternoon_coverage_minutes=coverage,
-        trials=() if trial is None else (trial,),
-        first_executable=trial,
+def _taken_trials(
+    mb: ModuleType, *, city: str, n: int, k: int, ask: float
+) -> tuple[object, ...]:
+    """`n` synthetic TAKEN trials at one station, `k` of which held, all at `ask`."""
+    held_flags = [True] * k + [False] * (n - k)
+    return tuple(
+        mb.CurrentRungTrial(
+            city=city,
+            climate_day=_CLIMATE_DAY,
+            t=_lst_to_utc(12, 0),
+            ts_lst=_lst_to_utc(12, 0),
+            hour_lst=12,
+            running_f=93,
+            rung_instrument_id="x",
+            width=mb.WIDTH_INTERIOR,
+            m=0,
+            held=flag,
+            lag_minutes=10,
+            entry_ts=_lst_to_utc(12, 10),
+            entry_ask=ask,
+            entry_size=5.0,
+            p_hold_lower=0.90,
+            edge=0.90 - ask - 0.06 * ask * (1.0 - ask),
+        )
+        for flag in held_flags
     )
 
 
-def _positive_edge_trial(mb: ModuleType) -> object:
-    return mb.CurrentRungTrial(
+def test_evaluate_mb_kills_at_n60_when_realized_rate_is_near_zero(mb: ModuleType) -> None:
+    # k=0/n=60 at ask=0.06: Wilson-95% upper = z^2/(n+z^2) ~= 0.0602, just under
+    # BE(0.06) ~= 0.0634 -- the exact "near-zero realized rate" the amendment
+    # names as what n=60 CAN kill (even k=1 already clears break-even at this
+    # ask: upper ~= 0.0886 > BE, so the kill floor is genuinely this tight).
+    taken = _taken_trials(mb, city="MDW", n=60, k=0, ask=0.06)
+    verdict = mb.evaluate_mb(taken, lag_minutes=10)
+    assert verdict.outcome == "MB_DEAD"
+    assert verdict.n_taken == 60
+    assert verdict.pooled is not None
+    assert verdict.pooled.wilson_upper < verdict.pooled.break_even
+
+
+def test_evaluate_mb_does_not_kill_at_n60_when_upper_clears_break_even(
+    mb: ModuleType,
+) -> None:
+    taken = _taken_trials(mb, city="MDW", n=60, k=20, ask=0.06)
+    verdict = mb.evaluate_mb(taken, lag_minutes=10)
+    assert verdict.outcome != "MB_DEAD"
+    assert verdict.pooled is not None
+    assert verdict.pooled.wilson_upper > verdict.pooled.break_even
+
+
+def test_evaluate_mb_survives_at_n150_when_lower_clears_break_even(mb: ModuleType) -> None:
+    taken = _taken_trials(mb, city="MDW", n=150, k=40, ask=0.06)
+    verdict = mb.evaluate_mb(taken, lag_minutes=10)
+    assert verdict.outcome == "ALIVE"
+    assert verdict.n_taken == 150
+    assert verdict.pooled is not None
+    assert verdict.pooled.wilson_lower > verdict.pooled.break_even
+
+
+def test_evaluate_mb_is_underpowered_below_n60_regardless_of_realized_rate(
+    mb: ModuleType,
+) -> None:
+    taken = _taken_trials(mb, city="MDW", n=59, k=59, ask=0.06)  # 100% realized hold
+    verdict = mb.evaluate_mb(taken, lag_minutes=10)
+    assert verdict.outcome == "UNDERPOWERED"
+    assert verdict.n_taken == 59
+
+
+def test_evaluate_mb_reports_a_cell_dead_stratum_inside_a_pooled_non_kill(
+    mb: ModuleType,
+) -> None:
+    # Station A: 60 trials, mostly held (pooled rate looks healthy).
+    # Station B: 60 trials, k=2 (near-zero) -- dead on its OWN, even though the
+    # pooled 120-trial rate (60/120 = 50%) clears break-even easily.
+    station_a = _taken_trials(mb, city="A", n=60, k=58, ask=0.06)
+    station_b = _taken_trials(mb, city="B", n=60, k=0, ask=0.06)  # near-zero -- see above
+    taken = station_a + station_b
+
+    verdict = mb.evaluate_mb(taken, lag_minutes=10)
+
+    assert verdict.n_taken == 120
+    dead_labels = {stratum.label for stratum in verdict.cell_dead_strata}
+    assert "station:B" in dead_labels
+    station_b_stratum = next(s for s in verdict.station_strata if s.label == "station:B")
+    assert station_b_stratum.cell_dead is True
+    station_a_stratum = next(s for s in verdict.station_strata if s.label == "station:A")
+    assert station_a_stratum.cell_dead is False
+
+
+def test_evaluate_mb_family_requires_both_lag_10_and_15_to_agree(mb: ModuleType) -> None:
+    dead_at_10 = mb.evaluate_mb(_taken_trials(mb, city="MDW", n=60, k=0, ask=0.06), lag_minutes=10)
+    alive_at_15 = mb.evaluate_mb(
+        _taken_trials(mb, city="MDW", n=150, k=40, ask=0.06), lag_minutes=15
+    )
+    family = mb.evaluate_mb_family({10: dead_at_10, 15: alive_at_15})
+    assert family == "UNDERPOWERED"  # disagreement -- neither lag confirms the other
+
+    both_dead = {
+        10: mb.evaluate_mb(_taken_trials(mb, city="MDW", n=60, k=0, ask=0.06), lag_minutes=10),
+        15: mb.evaluate_mb(_taken_trials(mb, city="MDW", n=60, k=0, ask=0.06), lag_minutes=15),
+    }
+    assert mb.evaluate_mb_family(both_dead) == "MB_DEAD"
+
+
+def test_gather_taken_trials_excludes_negative_edge_and_dead_cells(mb: ModuleType) -> None:
+    positive_edge = mb.CurrentRungTrial(
         city="MDW",
         climate_day=_CLIMATE_DAY,
         t=_lst_to_utc(13, 0),
@@ -395,50 +484,44 @@ def _positive_edge_trial(mb: ModuleType) -> object:
         p_hold_lower=0.90,
         edge=0.90 - 0.30 - 0.06 * 0.30 * 0.70,
     )
-
-
-def test_evaluate_mb_is_underpowered_below_15_afternoon_covered_days(mb: ModuleType) -> None:
-    summaries = [
-        _summary(mb, city="MDW", coverage=300.0, trial=_positive_edge_trial(mb))
-        for _index in range(4)
-    ]
-    verdict = mb.evaluate_mb(summaries, lag_minutes=10)
-    assert verdict.outcome == "UNDERPOWERED"
-    assert verdict.n_afternoon == 4
-
-
-def test_evaluate_mb_is_dead_at_15_plus_days_with_no_positive_edge(mb: ModuleType) -> None:
-    dead_trial = mb.CurrentRungTrial(
-        city="MDW",
+    negative_edge = mb.CurrentRungTrial(
+        city="SFO",
         climate_day=_CLIMATE_DAY,
         t=_lst_to_utc(13, 0),
         ts_lst=_lst_to_utc(13, 0),
         hour_lst=13,
-        running_f=93,
-        rung_instrument_id="x",
+        running_f=70,
+        rung_instrument_id="y",
         width=mb.WIDTH_INTERIOR,
         m=0,
         held=True,
         lag_minutes=10,
         entry_ts=_lst_to_utc(13, 10),
-        entry_ask=0.90,
+        entry_ask=0.66,
         entry_size=5.0,
-        p_hold_lower=0.90,
-        edge=0.90 - 0.90 - 0.06 * 0.90 * 0.10,  # negative edge
+        p_hold_lower=0.46,
+        edge=0.46 - 0.66 - 0.06 * 0.66 * 0.34,
     )
-    summaries = [
-        _summary(mb, city=f"S{i}", coverage=300.0, trial=dead_trial) for i in range(16)
-    ]
-    verdict = mb.evaluate_mb(summaries, lag_minutes=10)
-    assert verdict.outcome == "MB_DEAD"
-    assert verdict.n_afternoon == 16
-
-
-def test_evaluate_mb_is_alive_at_15_plus_days_with_one_positive_edge(mb: ModuleType) -> None:
-    summaries = [
-        _summary(mb, city=f"S{i}", coverage=300.0, trial=_positive_edge_trial(mb))
-        for i in range(15)
-    ]
-    verdict = mb.evaluate_mb(summaries, lag_minutes=10)
-    assert verdict.outcome == "ALIVE"
-    assert verdict.any_edge_positive is True
+    summaries = (
+        mb.MbStationDaySummary(
+            city="MDW",
+            climate_day=_CLIMATE_DAY,
+            status="SCORED",
+            lag_minutes=10,
+            afternoon_coverage_minutes=300.0,
+            trials=(positive_edge,),
+            first_executable=positive_edge,
+        ),
+        mb.MbStationDaySummary(
+            city="SFO",
+            climate_day=_CLIMATE_DAY,
+            status="SCORED",
+            lag_minutes=10,
+            afternoon_coverage_minutes=300.0,
+            trials=(negative_edge,),
+            first_executable=negative_edge,
+        ),
+    )
+    taken = mb.gather_taken_trials(summaries)
+    assert len(taken) == 1
+    assert taken[0].city == "MDW"
