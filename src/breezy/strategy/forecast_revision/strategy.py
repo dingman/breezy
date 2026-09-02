@@ -381,7 +381,29 @@ class ForecastRevisionStrategy(SharedExposureMixin, Strategy):
         risk_decision = self._risk.evaluate_order(
             contract=contract,
             signed_qty_delta=delta,
-            hours_to_settlement=forecast.horizon_hours,
+            # THE CLOCK, NEVER THE FORECAST'S SELF-REPORTED HORIZON (T-8).
+            # `ForecastSnapshot.horizon_hours` is live-to-settlement by PROSE
+            # CONTRACT only -- the `ForecastSource` Protocol carries no
+            # liveness constraint (T-7) -- so a frozen source reporting 24.0 at
+            # T-minus-90min handed `min_hours_to_settlement` (2.0) a value that
+            # satisfied it, and a NEW position opened inside the window that
+            # gate exists to close. The exposure is exactly `T-t in (1.0, 2.0)h`:
+            # below `halt_hours_before_settlement` the settlement halt in
+            # `_evaluate_and_act` has already flattened and returned.
+            #
+            # Same spelling as that halt, deliberately -- one deadline
+            # (`_deadlines[...]`, the instrument's own native `expiration_ns`),
+            # one `now` (`self.clock.utc_now()`, passed down from
+            # `_evaluate_and_act`), so the entry gate and the exit read one
+            # visibly identical time base. `risk.py`'s own
+            # `halt_hours_before_settlement` check is redundant after T-5 and
+            # is deliberately left in place as a second line of defence.
+            #
+            # NOT a re-plumbing of `horizon_hours` itself: the probability
+            # model's horizon, the horizon-scaled sizing term and
+            # `expected_probability_se` are untouched, and sigma keeps the
+            # ISSUANCE lead T-11 gave it.
+            hours_to_settlement=hours_until(self._deadlines[contract.instrument_id], now),
             signal_age=SignalFreshness.forecast(forecast_age_hours),
             edge=decision.edge,
             portfolio=self._portfolio_snapshot(),

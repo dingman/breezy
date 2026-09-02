@@ -17,13 +17,17 @@ REQUIRED constructor argument -- never a config field, never defaulted, never
 constructed internally. See that module's docstring for the full contract,
 in particular why ``ForecastSnapshot.horizon_hours`` must already be the live
 hours-remaining-to-settlement as of the ``now`` the source was called with.
-As of T-5 the SETTLEMENT HALT is the one thing that no longer reads
-``horizon_hours``: it is a time decision, evaluated from the instrument's own
-native ``expiration_ns`` against ``self.clock.utc_now()`` BEFORE the forecast
-is consulted, so a provider outage can no longer disable the exit. Everything
-else -- the probability model's horizon, horizon-scaled sizing, and the risk
-snapshot's ``hours_to_settlement`` -- still reads ``horizon_hours`` and still
-depends on the source keeping it live.
+EVERY TIME GATE NOW READS THE CLOCK, NOT THAT VALUE. The settlement halt
+(T-5) and the ``min_hours_to_settlement`` entry gate handed to
+``RiskManager.evaluate_order`` (T-8) are both evaluated from the instrument's
+own native ``expiration_ns`` against ``self.clock.utc_now()`` -- one deadline,
+one clock, one spelling (``hours_until(self._deadlines[iid], now)``) -- so a
+provider outage cannot disable the exit and a frozen source cannot open a
+position inside the window the entry gate exists to close. What still reads
+``horizon_hours``, and still depends on the source keeping it live, is the
+PRICING side: the probability model's horizon and horizon-scaled sizing. The
+forecast-error model reads neither -- ``sigma`` takes the lead AT ISSUANCE
+(T-11, ``weather_common.models.issuance_lead_hours``).
 Passing ``None`` (or omitting the argument) is refused at construction; this
 strategy contains no code path that derives a forecast from
 ``NwsClimateDay.tmax_f`` or any other settlement-derived value, and none
@@ -362,7 +366,29 @@ class ForecastMispricingStrategy(SharedExposureMixin, Strategy):
         risk_decision = self._risk.evaluate_order(
             contract=contract,
             signed_qty_delta=delta,
-            hours_to_settlement=forecast.horizon_hours,
+            # THE CLOCK, NEVER THE FORECAST'S SELF-REPORTED HORIZON (T-8).
+            # `ForecastSnapshot.horizon_hours` is live-to-settlement by PROSE
+            # CONTRACT only -- the `ForecastSource` Protocol carries no
+            # liveness constraint (T-7) -- so a frozen source reporting 24.0 at
+            # T-minus-90min handed `min_hours_to_settlement` (2.0) a value that
+            # satisfied it, and a NEW position opened inside the window that
+            # gate exists to close. The exposure is exactly `T-t in (1.0, 2.0)h`:
+            # below `halt_hours_before_settlement` the settlement halt in
+            # `_evaluate_and_act` has already flattened and returned.
+            #
+            # Same spelling as that halt, deliberately -- one deadline
+            # (`_deadlines[...]`, the instrument's own native `expiration_ns`),
+            # one `now` (`self.clock.utc_now()`, passed down from
+            # `_evaluate_and_act`), so the entry gate and the exit read one
+            # visibly identical time base. `risk.py`'s own
+            # `halt_hours_before_settlement` check is redundant after T-5 and
+            # is deliberately left in place as a second line of defence.
+            #
+            # NOT a re-plumbing of `horizon_hours` itself: the probability
+            # model's horizon, the horizon-scaled sizing term and
+            # `expected_probability_se` are untouched, and sigma keeps the
+            # ISSUANCE lead T-11 gave it.
+            hours_to_settlement=hours_until(self._deadlines[contract.instrument_id], now),
             signal_age=SignalFreshness.forecast(forecast_age_hours),
             edge=decision.edge,
             portfolio=self._portfolio_snapshot(),

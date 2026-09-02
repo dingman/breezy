@@ -27,9 +27,8 @@ Everything is parametrized over the strategies rather than copied per file,
 because the DEFECT is a copy: a test written once and run against each real
 ``_maybe_submit`` / ``_flatten`` / ``_portfolio_snapshot`` body is the shape
 that would have caught it. What differs per strategy -- constructor
-dependencies, ``_maybe_submit`` arity, whether a settlement deadline or a
-cost-basis anchor is consulted -- lives in a small rig subclass and nowhere
-else.
+dependencies, ``_maybe_submit`` arity, whether a cost-basis anchor is
+consulted -- lives in a small rig subclass and nowhere else.
 
 The portfolio is a ``PortfolioFacade`` double so a settled position can be
 stated directly; everything else -- orders, cache indexes, order status
@@ -193,16 +192,12 @@ class _SettledPositionPortfolio(PortfolioFacade):  # type: ignore[misc]  # compi
 class _Rig:
     """One real strategy, one real cache, one real order factory.
 
-    Subclasses supply only what differs: how the strategy is constructed, how
-    its ``_maybe_submit`` is called, and whether it consults a settlement
-    deadline.
+    Subclasses supply only what differs: how the strategy is constructed and
+    how its ``_maybe_submit`` is called. Every strategy is given the same
+    stated settlement deadline, which all five now read.
     """
 
     name: str = "base"
-    #: `running_extreme_lock` / `cli_settlement_print_lock` read
-    #: `self._deadlines[...]` inside `_maybe_submit`; the forecast strategies
-    #: take `hours_to_settlement` from the forecast horizon instead.
-    needs_deadlines: bool = False
     #: Only `calibration_mean_reversion` and `forecast_revision` define
     #: `_flatten`, and therefore only they carry a class B site.
     has_flatten: bool = False
@@ -248,8 +243,15 @@ class _Rig:
         # explicitly below.
         self.strategy._contracts = {self.local_id: self.contract}
         self.strategy._nt_ids = {self.local_id: self.instrument_id}
-        if self.needs_deadlines:
-            self.strategy._deadlines = {self.local_id: DEADLINE}
+        # ALL FIVE strategies now read `self._deadlines[...]` inside
+        # `_maybe_submit`: `running_extreme_lock` and
+        # `cli_settlement_print_lock` always did, and since T-8 the three
+        # forecast strategies derive `hours_to_settlement` from the same
+        # native deadline instead of from `forecast.horizon_hours`, which was
+        # live by prose contract only (T-7). `DEADLINE` is stated at exactly
+        # the 24.0 hours the forecast fixture below reports, so the fixture is
+        # self-consistent and nothing this module measures moves.
+        self.strategy._deadlines = {self.local_id: DEADLINE}
         self.limits = RiskLimits(
             max_position_contracts=MAX_POSITION_CONTRACTS,
             stale_observation_hours=STALE_OBSERVATION_HOURS,
@@ -401,7 +403,6 @@ class _ForecastRevisionRig(_Rig):
 
 class _RunningExtremeLockRig(_Rig):
     name = "running_extreme_lock"
-    needs_deadlines = True
 
     def _build_strategy(self) -> Strategy:
         config = RunningExtremeLockConfig(
@@ -423,7 +424,6 @@ class _RunningExtremeLockRig(_Rig):
 
 class _CliSettlementPrintLockRig(_Rig):
     name = "cli_settlement_print_lock"
-    needs_deadlines = True
 
     def _build_strategy(self) -> Strategy:
         config = CliSettlementPrintLockConfig(

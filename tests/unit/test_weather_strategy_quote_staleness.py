@@ -27,6 +27,14 @@ NOW = dt.datetime(2026, 8, 28, 12, 0, tzinfo=dt.UTC)
 CLIMATE_DAY = dt.date(2026, 8, 28)
 INSTRUMENT_ID = "NYC-GE80.POLYMARKET_US"
 
+#: The instrument's own settlement instant (``_deadlines[instrument_id]``,
+#: from the native ``expiration_ns``). Stated at exactly the 24.0 hours this
+#: module's forecast fixture reports, so the fixture is self-consistent and
+#: the time gates are as far out of the way of quote staleness as they always
+#: were: since T-8 ``_maybe_submit`` derives ``hours_to_settlement`` from this
+#: deadline and the tick clock rather than from ``forecast.horizon_hours``.
+DEADLINE = NOW + dt.timedelta(hours=24)
+
 MaybeSubmit = Callable[
     [
         object,
@@ -116,6 +124,7 @@ class _StrategyHarness:
         self.log = _Log()
         self.clock = _Clock()
         self._nt_ids = {contract.instrument_id: object()}
+        self._deadlines = {contract.instrument_id: DEADLINE}
         self._risk = RiskManager(
             RiskLimits(stale_quote_minutes=15.0),
             {contract.instrument_id: contract},

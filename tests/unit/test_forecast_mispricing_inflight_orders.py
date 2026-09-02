@@ -68,6 +68,16 @@ TRADER_ID = TraderId("BREEZY-INFLIGHT-002")
 NOW = dt.datetime(2026, 4, 22, 12, 0, tzinfo=dt.UTC)
 CLIMATE_DAY = dt.date(2026, 4, 23)
 
+#: The instrument's own settlement instant (``_deadlines[instrument_id]``,
+#: from the native ``expiration_ns``), stated at exactly the 24.0 hours this
+#: module's forecast fixture reports so the fixture is self-consistent.
+#: Comfortably outside ``min_hours_to_settlement`` /
+#: ``halt_hours_before_settlement``, which is where the time gates have to
+#: stay for this module to be measuring the in-flight gate: since T-8
+#: ``_maybe_submit`` reads them from this deadline and the tick clock rather
+#: than from ``forecast.horizon_hours``.
+DEADLINE = NOW + dt.timedelta(hours=24)
+
 #: Test-local stand-in for the operator's cumulative position ceiling. Stated
 #: here as a FIXTURE ARGUMENT -- no default anywhere in the shipped config or
 #: `RiskLimits` is changed by this module.
@@ -194,6 +204,7 @@ class _Rig:
         # explicitly below.
         self.strategy._contracts = {self.local_id: self.contract}
         self.strategy._nt_ids = {self.local_id: self.instrument_id}
+        self.strategy._deadlines = {self.local_id: DEADLINE}
         self.limits = RiskLimits(max_position_contracts=MAX_POSITION_CONTRACTS)
         self.risk = RiskManager(
             self.limits,

@@ -12,16 +12,18 @@ and is now unit-testable with no Nautilus object, cache or clock in scope.
 Three adaptations from the bundle, all forced by the surrounding plumbing
 change and none of them touching the math:
 
-1. ``hours_left`` comes from ``forecast.horizon_hours`` rather than from
-   ``self.hours_to_settlement(contract, now)``. The bundle computed that from a
-   FABRICATED per-contract settlement clock (a hardcoded ``time(23, 59)`` in a
-   hardcoded ``"America/Chicago"``, wrong for four of the venue's five cities).
-   Breezy has no wall-clock settlement source at the strategy layer -- see
-   ``breezy.strategy.weather_common.forecast_source`` for the contract that
-   replaces it, and ``bucket_contract`` for why the clock was removed.
-   ``hours_left`` is a LIVE time gate and correctly reads that live value. The
-   FORECAST-ERROR horizon under ``cal_p`` is a different quantity and no
-   longer shares it -- see ``settlement_deadline`` below and T-11.
+1. ``hours_left`` comes from ``hours_until(settlement_deadline, now)`` rather
+   than from ``self.hours_to_settlement(contract, now)``. The bundle computed
+   that from a FABRICATED per-contract settlement clock (a hardcoded
+   ``time(23, 59)`` in a hardcoded ``"America/Chicago"``, wrong for four of the
+   venue's five cities); ``bucket_contract`` records why that clock was
+   removed. It read ``forecast.horizon_hours`` in between, which is a LIVE
+   value by prose contract only (T-7) -- so a frozen source disabled the
+   ``calibration_horizon_flatten`` EXIT outright (T-8). It now reads the
+   instrument's own native deadline against ``now``, the same time base as the
+   settlement halt. The FORECAST-ERROR horizon under ``cal_p`` is a third
+   quantity again and shares neither -- see ``settlement_deadline`` below and
+   T-11.
 2. ``cal_p`` comes from ``engine.bucket_probability(contract.facts, ...)``
    rather than ``engine.contract_probability(contract, ...)`` -- a rename forced
    by ``MispricingContract`` wrapping real venue facts instead of the bundle's
@@ -45,6 +47,7 @@ from typing import TYPE_CHECKING
 from breezy.strategy.weather_common.models import (
     SideIntent,
     SignalDecision,
+    hours_until,
     issuance_lead_hours,
 )
 from breezy.strategy.weather_common.refusals import SHORTS_DISABLED, RefusalCounter
@@ -102,7 +105,23 @@ def evaluate_instrument(
     refuses a forecast older than ``stale_forecast_hours`` before sigma is
     reached), so the lead and the live horizon can diverge without bound here.
     """
-    hours_left = forecast.horizon_hours
+    # THE CLOCK, NEVER THE FORECAST'S SELF-REPORTED HORIZON (T-8). This gate
+    # is an EXIT: it flattens a held position once too little trading time
+    # remains. Read from `forecast.horizon_hours` it inherited that value's
+    # prose-only liveness contract (T-7), so against a source frozen at 24.0
+    # the exit could never fire AT ALL -- the same class of defect as T-5's
+    # settlement halt, at a different exit.
+    #
+    # `settlement_deadline` is the instrument's own native `expiration_ns`,
+    # already in scope here because T-11 put it there, and `now` was always a
+    # parameter -- so this needs no new plumbing and no new time source. It is
+    # the same `hours_until(deadline, now)` spelling the settlement halt and
+    # the entry gate use.
+    #
+    # `expected_probability_se` below still takes `forecast.horizon_hours`,
+    # deliberately, and sigma still takes the ISSUANCE lead (T-11). The three
+    # horizons on this record stay distinct.
+    hours_left = hours_until(settlement_deadline, now)
     if hours_left < cfg.min_horizon_hours:
         if abs(current_qty) > 1e-9:
             return SignalDecision(
