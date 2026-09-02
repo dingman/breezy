@@ -206,14 +206,35 @@ now derives its horizon from the clock and the native `expiration_ns`, but
 `hours_to_settlement < halt_hours_before_settlement` (`risk.py:517`), with
 `min_hours_to_settlement` right behind it.
 
-**Live sequence, from the review.** A source caches its horizon at listing
-(24.0). At T-45min the clock-derived halt correctly flattens. At T-90min the
-clock says 1.5 h — outside the halt — while the forecast still says 24.0, so
-`min_hours_to_settlement=2.0` never binds and a **new position opens 90 minutes
-before settlement**. Worse, `ForecastErrorModel.sigma` then selects the 24 h bin
-(~2.8 degF, `probability.py:415`) instead of the ~1.4 degF appropriate to
-90 minutes, **overstating edge on a near-certain bucket**. This is one
-non-conforming `ForecastSource` away from live ([[T-7]]).
+**RETRACTED, both halves — I was wrong twice and the corrections matter.**
+
+I claimed a frozen horizon lets a **new position open 90 minutes before
+settlement**. It cannot. `risk.py:531` refuses the order on
+`forecast_age_hours = now - published_at`, which is clock-derived and immune to
+a lying `horizon_hours`. **No order ships.** The real exposure is narrower: the
+`:519` `min_hours_to_settlement` gate can fail open only in the window
+T-t in (1.0, 2.0) h — one hour wide — and divergence on any *submitted* order is
+bounded by `stale_forecast_hours = 8.0`.
+
+I also claimed the 24 h sigma bin **overstates** edge. **Backwards.** σ models
+forecast error, a property of the forecast, and a forecast's error distribution
+does not shrink because the clock advanced. A 24 h-lead forecast read at T-90min
+still carries 24 h-lead error. Feeding the clock-derived 1.5 h would select the
+~1.4 degF bin instead of ~2.8 degF — **halving σ and OVERSTATING edge**. So σ
+must stay on issuance lead, and "re-plumb the horizon everywhere" would have
+introduced a new bug. See [[T-11]].
+
+**What survives:** `risk.py:517`'s halt gate is now redundant (T-5 flattens
+upstream first), and `:519` is the one live gate exposure. T-8 is therefore
+much smaller than written above — two call sites, not a five-strategy
+re-plumbing.
+
+**And an exit that a frozen source disables entirely:**
+`calibration_mean_reversion/decision.py:88` reads `hours_left =
+forecast.horizon_hours` to gate a `calibration_horizon_flatten` at
+`min_horizon_hours = 6.0`. Against a frozen 24.0 that exit **never fires**. Same
+class as T-5, different exit; conforming sources are unaffected, so this is
+primarily a test-fidelity gap that becomes real the moment a source freezes.
 
 Follow-up: derive the entry horizon from `_deadlines` as well, so one time base
 serves both gates.
@@ -257,3 +278,35 @@ correctly uses the lib variant.
 
 Containment is structural rather than deliberate, so it holds only while the
 import boundary does. Renaming one of them removes the trap permanently.
+
+
+## T-11 [HIGH] The backtest understates forecast error, so measured ROI is overstated
+
+Found while scoping T-8, and the highest-value defect in this document because
+it corrupts the numbers every strategy decision rests on.
+
+`ForecastSnapshot.horizon_hours` serves two incompatible purposes with one
+value. Time gates want the **live time-to-settlement**.
+`ForecastErrorModel.sigma` (`probability.py:223`) models **forecast error**,
+which is a property of the forecast — its **lead time at issuance**.
+
+`_SequenceForecastSource.snapshot`
+(`scripts/analysis/run_weather_strategy_backtests.py:491-514`) returns the
+latest publication at or before `now` — its `published_at` and
+`expected_high_f` — while setting `horizon_hours = hours_until(now, deadline)`.
+So a forecast **issued at T-24h and read at T-3h reaches σ as a 3-hour
+forecast**, selecting a ~1.4 degF bin for a forecast carrying ~2.8 degF error.
+
+**σ understated ~2x -> edge overstated -> measured backtest ROI overstated**,
+worst on the near-certain buckets where sizing is largest.
+
+Note the source is **conforming to the stated contract** (`forecast_source.py`
+says `horizon_hours` must be the live hours-remaining). The contract itself is
+wrong for σ's purposes. The fix passes `hours_until(deadline,
+forecast.published_at)` to σ and leaves `horizon_hours` alone for the gates —
+`published_at` already exists at `models.py:110`, so the correct value was
+always available and simply never used.
+
+Expected consequence, stated in advance so it cannot be quietly absorbed:
+**backtest edge and PnL should move DOWN.** A move up would contradict the
+analysis and falsify it.
