@@ -126,18 +126,6 @@ egress firewall; or invent an operator-reserved value. Every increment carries
 an **L-1 null-hypothesis verdict** citing installed source under
 `.venv/lib/python3.13/site-packages/nautilus_trader/` first.
 
-### [MEDIUM] BL-10 — One strategy refuses quotes before the counter can see it
-
-`forecast_mispricing/decision.py:71` calls `risk.quote_tradable(...)` as a
-pre-check BEFORE forming a signal, discards the reason into `_why`, and returns
-`None`. That refusal never reaches `evaluate_order`, so BL-8's counting cannot
-see it: for this one strategy a stale or wide-spread quote is still silently
-unrecorded. Predates BL-8; found while fixing it.
-
-**Acceptance:** decide whether a pre-signal quote refusal is a gag or ordinary
-market conditions (BL-8 drew that line at "the strategy formed an order"), then
-either count it under the same bounded key set or document why not.
-
 ---
 
 ## Carried forward — open, not selected for this batch
@@ -152,6 +140,7 @@ either count it under the same bounded key set or document why not.
 | CF-6 | MED | `tests/live/test_nws_live_ingest.py:86` hardcodes a personal contact; use a role address |
 | CF-7 | MED | `BREEZY_USER_AGENT` required on offline paths (`SharedIngestState.__init__`) |
 | CF-8 | MED | Sibling-station products unmarked in integrity index; wasted fetches |
+| BL-10 | LOW | `forecast_mispricing/decision.py:71` pre-signal `quote_tradable` refusal is invisible to BL-8's counter (family KILLED; moot until revived) |
 | CF-11 | LOW | `ruff format --check`: 31 unformatted files; not in any gate |
 | CF-14 | MED | One bad market aborts the WHOLE discovery cycle; 1 blocked 30 new subs 09-02 (L-17) |
 | CF-13 | UNPROVEN | No CCA/CCB CORRECTION seen live; supersession path fixture-covered only |
@@ -178,7 +167,7 @@ forecast ingest → ~300 station-days → CAPACITY).
 **EXEC SPINE follow-ups:** `docs/plans/EXEC_SPINE_2026-09-01.md` §R-4
 "review amendments". Guard before R-9: divides by zero for an unpriced
 forward; settlement-as-exit bypasses `_submit_order`'s refusal latch.
-**Write path — PLAN CONVERGED (Rev 6, `ab399c3`), R-6.5a IN PROGRESS.**
+**Write path — PLAN CONVERGED (Rev 6, `ab399c3`); R-6.5a `4f76137` + R-6.5P `38f2426` LANDED; PARKED at the operator step** (rest a BUY 1@$0.01, run `polymarket_us_write_signing_probe.py --positive-control`, expect `PREFLIGHT_NOT_EMPTY`).
 `docs/plans/EXEC_SPINE_R65_R7_2026-09-02.md`: four blind reviews + two
 confirmers. Order: R-6.5a (seam: `private_read` discards `response.status`,
 so R-6d's classifier is unreachable; zero barrier changes) → R-6.5P (probe;
@@ -198,18 +187,18 @@ at met lock, never dump into a 0.3-lot bid); T-6 stale node_config docstring;
 T-10 reversed-arg `hours_until` in scripts/; `max_simultaneous_positions`
 unexercised end-to-end. Nautilus cannot cancel an INITIALIZED order.
 
-**[VERDICT] NO FAMILY HAS AN EXECUTABLE EDGE (audit 2026-09-02).** Forecast
-family KILLED by Grok (`docs/evidence/grok_forecast_family_verdict_2026-09-02.md`;
-revive only with real ingest, σ calibrated vs NWS, paper join n≥150).
-Observation-lock (`running_extreme_lock`, `cli_settlement_print_lock`) passes
-settlement gates but is REFUTED on execution ×3 (L-9): the settling rung is
-uniquely unoffered — 0 asks/3,332 rows post-print, 0/58–0/59 pre-print, a 7.7k
-BID queue at 0.99 (`print_lock_refuted_2026-09-01.md`, `h4_preliminary_economic_read_2026-09-01.md` §4.1).
-K1 is a DIFFERENT edge (cheap D-1, median ask 0.16), not this family — an
-earlier note here said otherwise; wrong. **Untested window:** does the winner
-carry an ask BEFORE the physical lock while an intraday running max already
-implies it? Needs BL-24's ASOS×tape join (cache ends 01-02, tape starts 08-30).
-Design routed to Grok.
+**[VERDICT] NO FAMILY HAS A PROVEN EDGE; ONE IS UNDER MEASUREMENT (M_B).**
+Forecast family KILLED (`grok_forecast_family_verdict_2026-09-02.md`). Post-lock
+observation family REFUTED on execution ×3 (L-9). Cheap-D-1 (K1) DEAD ≥2c on
+Kalshi, n=0 here. Grok (`grok_no_edge_verdict_2026-09-02.md`): no long-only
+edge; measure once, then stop. **M_A** (`ma_prelock_winner_ask_2026-09-02.md`):
+the PRE-lock afternoon window IS offered — 09-01 winner at 0.21×25 (MDW),
+0.65×18 (SFO) while R(t) in-rung. **M_B** (`mb_current_rung_edge_2026-09-02.md`,
+archive p_hold AUDITED correct; kill amended `grok_mb_kill_amendment_2026-09-02.md`):
+realized hold of taken current-rung trials vs ask+fee — kill n≥60, survive
+n≥150; today n_taken=1. Clock: ~09-22 / ~10-21 at 3/day. Accrues via
+`breezy-mb-daily.timer` (13:30Z) + `breezy-quote-tape-ingest.timer`. **No new
+strategy package, BL-24, forecast ingest, or R-6.5b/R-7 until M_B survives.**
 
 ---
 
