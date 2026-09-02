@@ -34,6 +34,7 @@ from breezy.adapters.polymarket_us.errors import (
     BoundsSemanticsError,
     FeeScheduleUnknownError,
     InstrumentDefinitionError,
+    SiteRegistryMismatchError,
     VenuePayloadError,
 )
 from breezy.adapters.polymarket_us.parsing import (
@@ -316,13 +317,17 @@ def test_parser_refuses_bounds_when_venue_prose_disagrees_with_slug(
 
 
 def test_parser_refuses_unmapped_weather_city_token(open_market: dict[str, Any]) -> None:
+    """CF-14a A3: a registry mismatch is a config bug, not a payload error --
+    it must raise `SiteRegistryMismatchError`, never `InstrumentDefinitionError`
+    (`docs/plans/CF14_DISCOVERY_ISOLATION_2026-09-02.md`)."""
     market = open_market["market"]
     market["slug"] = "tc-temp-denhigh-2026-08-25-lt79f"
     for side in market["marketSides"]:
         side["identifier"] = "tc-temp-denhigh-2026-08-25-lt79f"
 
-    with pytest.raises(InstrumentDefinitionError, match="venue_city_token"):
+    with pytest.raises(SiteRegistryMismatchError, match="venue_city_token") as exc_info:
         parse_binary_option(open_market, venue=POLYMARKET_US_VENUE, ts_init=TS_INIT)
+    assert not isinstance(exc_info.value, VenuePayloadError)
 
 
 def test_fee_coefficient_is_validated_and_marks_the_schedule_known(

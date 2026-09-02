@@ -112,6 +112,71 @@ class DiscoveredMarket:
     payload: Mapping[str, Any]
 
 
+@dataclass(frozen=True, slots=True)
+class _StageThreeFailure:
+    """One stage-3 (bounds/instrument-definition) failure, named for the tally.
+
+    CF-14a A2 (docs/plans/CF14_DISCOVERY_ISOLATION_2026-09-02.md). ``city`` and
+    ``cohort`` fall back to ``None`` rather than raising: a slug that stops
+    parsing mid-cycle is itself informative and must not crash the very
+    diagnostic built to explain it.
+    """
+
+    slug: str
+    city: str | None
+    cohort: str | None
+    exception: VenuePayloadError
+
+    @classmethod
+    def from_exception(cls, slug: str, exception: VenuePayloadError) -> _StageThreeFailure:
+        parsed = parse_weather_slug(slug)
+        return cls(
+            slug=slug,
+            city=parsed.city if parsed is not None else None,
+            cohort=parsed.climate_date if parsed is not None else None,
+            exception=exception,
+        )
+
+
+def _cohort_failure_tally(
+    *,
+    discovered_count: int,
+    loaded: Sequence[tuple[str, str | None]],
+    failures: Sequence[_StageThreeFailure],
+) -> str:
+    """Render the ONE ERROR line naming every stage-3 failure (CF-14a A2).
+
+    Today's incident log named one field of one market and nothing about the
+    other 19; this names slug, city, cohort and exception type for EVERY
+    failure, plus per-cohort loaded/failed counts, in a single message.
+    """
+    cohort_counts: dict[str, dict[str, int]] = {}
+
+    def _bump(cohort: str | None, key: str) -> None:
+        bucket = cohort_counts.setdefault(cohort or "unknown", {"loaded": 0, "failed": 0})
+        bucket[key] += 1
+
+    for _slug, cohort in loaded:
+        _bump(cohort, "loaded")
+    for failure in failures:
+        _bump(failure.cohort, "failed")
+
+    failure_lines = "; ".join(
+        f"slug={failure.slug!r} city={failure.city!r} cohort={failure.cohort!r} "
+        f"error_type={type(failure.exception).__name__} message={failure.exception}"
+        for failure in sorted(failures, key=lambda item: item.slug)
+    )
+    cohort_lines = "; ".join(
+        f"{cohort}: loaded={counts['loaded']} failed={counts['failed']}"
+        for cohort, counts in sorted(cohort_counts.items())
+    )
+    return (
+        "Polymarket.us discovery cycle aborting: "
+        f"{len(failures)} of {discovered_count} discovered market(s) failed stage-3 "
+        f"parsing. Failures: {failure_lines}. Per-cohort counts: {cohort_lines}."
+    )
+
+
 def discovery_candidate_slugs(
     payload: Mapping[str, Any],
     *,
@@ -270,28 +335,72 @@ class PolymarketUSInstrumentProvider(InstrumentProvider):
         if len(set(slugs)) != len(slugs):
             raise VenuePayloadError("Polymarket.us market discovery returned duplicate slugs")
 
-        active_slugs: list[str] = []
         resolved: dict[str, str] = {}
+        # CF-14a A4: instruments are built here, LOCALLY, and never handed to
+        # `self.add()` until the whole cohort's verdict is known -- otherwise
+        # evaluate-all (A1) would make the known `_instruments` leak
+        # (`.venv/.../nautilus_trader/common/providers.py:152-192`, never
+        # cleared) strictly WORSE by adding every parseable market before an
+        # abort instead of only the ones that preceded today's first raise.
+        pending_adds: list[tuple[str, Any]] = []
+        failures: list[_StageThreeFailure] = []
         for market in discovered:
             if market.resolved_reason is not None:
                 resolved[market.slug] = market.resolved_reason
                 continue
-            self._assert_bounds(market.payload, market.slug)
-            payload = {"market": market.payload}
-            instrument = parse_binary_option(
-                payload,
-                venue=self._venue,
-                ts_init=self._clock.timestamp_ns(),
-                sites=self._sites,
-                venue_key=REGISTRY_VENUE_KEY,
-            )
-            if instrument.id.symbol.value != market.slug:
-                raise VenuePayloadError(
-                    f"Discovered market slug {market.slug!r} but the parser produced "
-                    f"{instrument.id.symbol.value!r}"
+            try:
+                self._assert_bounds(market.payload, market.slug)
+                payload = {"market": market.payload}
+                instrument = parse_binary_option(
+                    payload,
+                    venue=self._venue,
+                    ts_init=self._clock.timestamp_ns(),
+                    sites=self._sites,
+                    venue_key=REGISTRY_VENUE_KEY,
                 )
+                if instrument.id.symbol.value != market.slug:
+                    raise VenuePayloadError(
+                        f"Discovered market slug {market.slug!r} but the parser produced "
+                        f"{instrument.id.symbol.value!r}"
+                    )
+            except VenuePayloadError as exc:
+                # CF-14a A1: evaluate every market before deciding, instead of
+                # raising on the first stage-3 failure. `SiteRegistryMismatchError`
+                # (A3) is deliberately NOT a `VenuePayloadError` and so is
+                # deliberately NOT caught here: a registry/config mismatch is
+                # not a per-market payload defect this tally is about, and it
+                # still aborts immediately, exactly as it does today.
+                failures.append(_StageThreeFailure.from_exception(market.slug, exc))
+                continue
+            pending_adds.append((market.slug, instrument))
+
+        if failures:
+            # CF-14a C1: the tally is logged HERE, by the provider, before the
+            # raise -- `_run_one_reload_cycle` (`data.py:1055-1063`) never
+            # reaches its own downstream code on abort, so a tally logged
+            # after `initialize(reload=True)` returns could never fire in the
+            # exact case it exists for.
+            parsed_pending = [
+                (slug, parsed.climate_date if (parsed := parse_weather_slug(slug)) else None)
+                for slug, _instrument in pending_adds
+            ]
+            self._discovery_log.error(
+                _cohort_failure_tally(
+                    discovered_count=len(discovered),
+                    loaded=parsed_pending,
+                    failures=failures,
+                )
+            )
+            # CF-14a C2: re-raise the FIRST collected failure, unchanged in
+            # type, message and ordering identity, so abort semantics are
+            # LITERALLY unchanged at the exception level and no existing
+            # assertion needs touching.
+            raise failures[0].exception
+
+        active_slugs: list[str] = []
+        for slug, instrument in pending_adds:
             self.add(instrument)
-            active_slugs.append(market.slug)
+            active_slugs.append(slug)
 
         self._market_slugs = slugs
         self._active_market_slugs = tuple(active_slugs)

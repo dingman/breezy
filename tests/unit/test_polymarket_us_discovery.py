@@ -20,7 +20,12 @@ from nautilus_trader.config import InstrumentProviderConfig
 from nautilus_trader.model.identifiers import InstrumentId, Symbol
 
 from breezy.adapters.polymarket_us.config import PolymarketUSMarketDiscoveryConfig
-from breezy.adapters.polymarket_us.errors import BoundsSemanticsError, VenuePayloadError
+from breezy.adapters.polymarket_us.errors import (
+    BoundsSemanticsError,
+    InstrumentDefinitionError,
+    SiteRegistryMismatchError,
+    VenuePayloadError,
+)
 from breezy.adapters.polymarket_us.http import PolymarketUSHttpClient
 from breezy.adapters.polymarket_us.provider import (
     MARKET_LIST_PATH,
@@ -52,6 +57,14 @@ class RecordingListTransport:
     def __init__(self, pages: Sequence[Mapping[str, Any]]) -> None:
         self._pages = [json.dumps(page).encode("utf-8") for page in pages]
         self.calls: list[tuple[str, str]] = []
+
+    def set_pages(self, pages: Sequence[Mapping[str, Any]]) -> None:
+        """Swap the pages returned by a subsequent discovery cycle.
+
+        Additive test helper only -- existing tests construct pages once via
+        the constructor and never call this.
+        """
+        self._pages = [json.dumps(page).encode("utf-8") for page in pages]
 
     async def get(self, url: str, *, headers: dict[str, str], quota_key: str) -> VenueResponse:
         self.calls.append((url, quota_key))
@@ -92,6 +105,27 @@ def wrapped_market(name: str) -> dict[str, Any]:
     payload = raw_json(name)
     market = payload["market"]
     assert isinstance(market, dict)
+    return market
+
+
+def market_with_slug(slug: str, *, base: str = "market_open_510636_by_slug.json") -> dict[str, Any]:
+    """A structurally-valid market payload re-keyed onto a distinct ``slug``.
+
+    Only the slug (and the ``marketSides`` identifiers that must agree with
+    it) changes; the bounds tokens are left untouched so the venue prose in
+    the captured fixture keeps corroborating them.
+    """
+    market = wrapped_market(base)
+    market["slug"] = slug
+    for side in market["marketSides"]:
+        side["identifier"] = slug
+    return market
+
+
+def broken_market(slug: str, *, delete_field: str) -> dict[str, Any]:
+    """A ``market_with_slug`` payload missing one required field."""
+    market = market_with_slug(slug)
+    del market[delete_field]
     return market
 
 
@@ -259,3 +293,186 @@ def test_subscription_plan_never_subscribes_before_cache_contains_the_instrument
     )
 
     assert set(plan.subscribe) <= cached
+
+
+# ---------------------------------------------------------------------------
+# CF-14a -- evaluate-all-then-decide, a complete failure tally, abort
+# semantics UNCHANGED (docs/plans/CF14_DISCOVERY_ISOLATION_2026-09-02.md)
+# ---------------------------------------------------------------------------
+
+
+def _error_messages(logger: NullLogger) -> list[str]:
+    return [msg for level, msg in logger.messages if level == "error"]
+
+
+@pytest.mark.asyncio
+async def test_every_failing_market_is_evaluated_before_the_cycle_raises() -> None:
+    """3 failures produce 3 tally entries, not 1 (A1)."""
+    slugs = [
+        "tc-temp-nychigh-2026-08-25-lt79f",
+        "tc-temp-nychigh-2026-08-26-lt79f",
+        "tc-temp-nychigh-2026-08-27-lt79f",
+    ]
+    markets = [broken_market(slug, delete_field="minimumTradeQty") for slug in slugs]
+    provider, _, logger = provider_for_pages(
+        [page_with(*markets)], discovery=PolymarketUSMarketDiscoveryConfig(limit=10)
+    )
+
+    with pytest.raises(InstrumentDefinitionError):
+        await provider.load_all_async()
+
+    tallies = _error_messages(logger)
+    assert len(tallies) == 1, "the tally must be one ERROR log, not one per failure"
+    assert tallies[0].count("slug=") == 3
+    for slug in slugs:
+        assert slug in tallies[0]
+
+
+@pytest.mark.asyncio
+async def test_tally_content_is_order_independent() -> None:
+    """Failing-first and failing-last give identical tally content."""
+    bad_a = broken_market("tc-temp-nychigh-2026-08-25-lt79f", delete_field="minimumTradeQty")
+    bad_b = broken_market("tc-temp-nychigh-2026-08-26-lt79f", delete_field="orderPriceMinTickSize")
+
+    provider_first, _, logger_first = provider_for_pages(
+        [page_with(bad_a, bad_b)], discovery=PolymarketUSMarketDiscoveryConfig(limit=10)
+    )
+    with pytest.raises(InstrumentDefinitionError):
+        await provider_first.load_all_async()
+
+    provider_last, _, logger_last = provider_for_pages(
+        [page_with(bad_b, bad_a)], discovery=PolymarketUSMarketDiscoveryConfig(limit=10)
+    )
+    with pytest.raises(InstrumentDefinitionError):
+        await provider_last.load_all_async()
+
+    assert _error_messages(logger_first) == _error_messages(logger_last)
+
+
+@pytest.mark.asyncio
+async def test_tally_is_emitted_before_the_raise_and_survives_the_abort_path() -> None:
+    """Pins C1: the tally must fire even though a caller of ``load_all_async``
+    (mirroring ``_run_one_reload_cycle``, ``data.py:1058``) never reaches any
+    code after the raise."""
+    bad = broken_market("tc-temp-nychigh-2026-08-25-lt79f", delete_field="minimumTradeQty")
+    provider, _, logger = provider_for_pages([page_with(bad)])
+
+    downstream_reached = False
+    try:
+        await provider.load_all_async()
+        downstream_reached = True  # pragma: no cover - must never execute
+    except InstrumentDefinitionError:
+        pass
+
+    assert downstream_reached is False
+    assert any("tc-temp-nychigh-2026-08-25-lt79f" in msg for msg in _error_messages(logger))
+
+
+@pytest.mark.asyncio
+async def test_raised_exception_is_the_first_collected_failure_unchanged() -> None:
+    """Pins C2: type, message and ordering identity are preserved."""
+    bad_first = broken_market("tc-temp-nychigh-2026-08-25-lt79f", delete_field="minimumTradeQty")
+    bad_second = broken_market(
+        "tc-temp-nychigh-2026-08-26-lt79f", delete_field="orderPriceMinTickSize"
+    )
+    provider, _, _ = provider_for_pages(
+        [page_with(bad_first, bad_second)], discovery=PolymarketUSMarketDiscoveryConfig(limit=10)
+    )
+
+    with pytest.raises(InstrumentDefinitionError, match="minimumTradeQty") as exc_info:
+        await provider.load_all_async()
+
+    assert "orderPriceMinTickSize" not in str(exc_info.value)
+
+
+@pytest.mark.asyncio
+async def test_a_cohort_total_failure_still_aborts_with_instrument_definition_error() -> None:
+    """Regression-pins today's incident: every market failing still hard-aborts."""
+    bad_a = broken_market("tc-temp-nychigh-2026-08-25-lt79f", delete_field="minimumTradeQty")
+    bad_b = broken_market("tc-temp-nychigh-2026-08-26-lt79f", delete_field="minimumTradeQty")
+    provider, _, _ = provider_for_pages(
+        [page_with(bad_a, bad_b)], discovery=PolymarketUSMarketDiscoveryConfig(limit=10)
+    )
+
+    with pytest.raises(InstrumentDefinitionError):
+        await provider.load_all_async()
+
+
+@pytest.mark.asyncio
+async def test_mixed_cohort_aborts_and_tally_names_every_bad_market() -> None:
+    """3 good + 3 bad still aborts, and the tally names all 3 bad ones."""
+    good_slugs = [f"tc-temp-nychigh-2026-08-{day}-lt79f" for day in (20, 21, 22)]
+    bad_slugs = [f"tc-temp-nychigh-2026-08-{day}-lt79f" for day in (23, 24, 25)]
+    goods = [market_with_slug(slug) for slug in good_slugs]
+    bads = [broken_market(slug, delete_field="minimumTradeQty") for slug in bad_slugs]
+    provider, _, logger = provider_for_pages(
+        [page_with(*goods, *bads)], discovery=PolymarketUSMarketDiscoveryConfig(limit=10)
+    )
+
+    with pytest.raises(InstrumentDefinitionError):
+        await provider.load_all_async()
+
+    tally = _error_messages(logger)[0]
+    for slug in bad_slugs:
+        assert f"slug={slug!r}" in tally
+    for slug in good_slugs:
+        assert f"slug={slug!r}" not in tally
+    assert provider.count == 0
+
+
+@pytest.mark.asyncio
+async def test_state_is_unchanged_from_pre_cycle_values_on_abort() -> None:
+    """On abort, ``count``/``market_slugs``/``active_market_slugs``/
+    ``resolved_market_reasons`` are all unchanged from pre-cycle (pins A4)."""
+    good = market_with_slug("tc-temp-nychigh-2026-08-25-lt79f")
+    provider, transport, _ = provider_for_pages([page_with(good)])
+    await provider.load_all_async()
+
+    pre_count = provider.count
+    pre_market_slugs = provider.market_slugs
+    pre_active_slugs = provider.active_market_slugs
+    pre_resolved = dict(provider.resolved_market_reasons)
+
+    bad = broken_market("tc-temp-nychigh-2026-08-26-lt79f", delete_field="minimumTradeQty")
+    transport.set_pages([page_with(bad)])
+
+    with pytest.raises(InstrumentDefinitionError):
+        await provider.load_all_async()
+
+    assert provider.count == pre_count
+    assert provider.market_slugs == pre_market_slugs
+    assert provider.active_market_slugs == pre_active_slugs
+    assert dict(provider.resolved_market_reasons) == pre_resolved
+
+
+@pytest.mark.asyncio
+async def test_all_markets_are_added_on_a_fully_successful_cycle() -> None:
+    """On success, ``self.add()`` still fires for every loaded market."""
+    slugs = [f"tc-temp-nychigh-2026-08-{day}-lt79f" for day in (20, 21, 22)]
+    markets = [market_with_slug(slug) for slug in slugs]
+    provider, _, _ = provider_for_pages(
+        [page_with(*markets)], discovery=PolymarketUSMarketDiscoveryConfig(limit=10)
+    )
+
+    await provider.load_all_async()
+
+    assert provider.count == 3
+    assert set(provider.active_market_slugs) == set(slugs)
+    for slug in slugs:
+        assert provider.find(InstrumentId(Symbol(slug), POLYMARKET_US_VENUE)) is not None
+
+
+@pytest.mark.asyncio
+async def test_a_site_registry_mismatch_is_distinguishable_from_a_venue_payload_error() -> None:
+    """Pins A3: a ``discovery.city_codes`` <-> ``SiteRegistry`` mismatch is a
+    Breezy config bug, not a venue payload error, and must not masquerade as
+    ``InstrumentDefinitionError`` -- see CF-14b's future per-market gate."""
+    market = market_with_slug("tc-temp-zzzhigh-2026-08-25-lt79f")
+    market["question"] = "Highest temperature in Nowhereland on August 25?"
+    discovery = PolymarketUSMarketDiscoveryConfig(limit=2, city_codes=("zzz",))
+    provider, _, _ = provider_for_pages([page_with(market)], discovery=discovery)
+
+    with pytest.raises(SiteRegistryMismatchError) as exc_info:
+        await provider.load_all_async()
+
+    assert not isinstance(exc_info.value, VenuePayloadError)

@@ -140,6 +140,7 @@ from breezy.adapters.polymarket_us.errors import (
     EmptyBookSideError,
     FeeScheduleUnknownError,
     InstrumentDefinitionError,
+    SiteRegistryMismatchError,
     VenuePayloadError,
 )
 from breezy.adapters.polymarket_us.symbology import (
@@ -1225,7 +1226,11 @@ def _weather_info(
     try:
         site = sites.site_for_venue_city_token(venue_key, parsed.city)
     except SiteNotFoundError as exc:
-        raise InstrumentDefinitionError(
+        # CF-14a A3: this is a `discovery.city_codes` <-> `SiteRegistry`
+        # mismatch -- a Breezy config bug, not a venue payload error -- so it
+        # must NOT masquerade as `InstrumentDefinitionError`. See
+        # `SiteRegistryMismatchError`'s docstring.
+        raise SiteRegistryMismatchError(
             f"Market {slug!r} carries venue_city_token {parsed.city!r}, but no "
             f"settlement site is registered for venue {venue_key!r}"
         ) from exc

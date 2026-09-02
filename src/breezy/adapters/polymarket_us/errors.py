@@ -27,6 +27,7 @@ __all__ = [
     "MethodNotPermittedError",
     "PolymarketUSError",
     "SignatureClockSkewError",
+    "SiteRegistryMismatchError",
     "VenueAuthError",
     "VenuePayloadError",
     "VenueRateLimitError",
@@ -261,6 +262,25 @@ class FeeScheduleUnknownError(PolymarketUSError):
     :func:`~breezy.adapters.polymarket_us.parsing.assert_fee_schedule_known`,
     which every fee-consuming path must call. Not a ``VenuePayloadError``: the
     payload is fine, it is Breezy's knowledge of the schedule that is missing.
+    """
+
+
+class SiteRegistryMismatchError(PolymarketUSError):
+    """A discovered market names a city with no registered settlement site.
+
+    CF-14a (docs/plans/CF14_DISCOVERY_ISOLATION_2026-09-02.md, item A3).
+    Previously this condition -- ``SiteRegistry.site_for_venue_city_token``
+    raising ``SiteNotFoundError`` -- was re-raised *as*
+    ``InstrumentDefinitionError``, making a ``discovery.city_codes`` <->
+    ``SiteRegistry`` mismatch (a Breezy CONFIG bug) indistinguishable from a
+    venue payload error (a venue DATA bug).
+
+    Deliberately **not** a :class:`VenuePayloadError` subclass: the payload is
+    fine, and nothing about it can be "isolated" as a per-market data defect
+    the way a malformed instrument definition can. Keeping this distinct now
+    means a future per-market isolation gate keyed on payload-error identity
+    (CF-14b) can never accidentally treat a systemic registry gap as a
+    skippable single-market failure.
     """
 
 
