@@ -1,30 +1,28 @@
-> # ⚠ THIS NUMBER IS CHALLENGED — DO NOT CITE THE 53% (coordinator, 2026-09-02)
+> # ⚠ RESOLVED — this pooled 53% is confirmed inflated; use the corrected 12.1% instead (2026-09-02T061722Z)
 >
-> The pooled `P(win | setup)` of ~53% below is very likely INFLATED by including
-> instants from BEFORE the day's diurnal peak, and must not be used until the
-> per-hour profile is measured and the statistic is recomputed post-peak.
+> The challenge below was CORRECT. The per-hour diagnostic and corrected,
+> hour-restricted recompute are in
+> `docs/evidence/cli_basis_setup_win_rate_corrected_2026-09-02T061722Z.md`,
+> pre-registered in `scripts/analysis/pre_registration_2026-09-02T061500Z.md`
+> and produced by `scripts/analysis/cli_basis_hourly_profile_study.py`.
 >
-> The evidence for the challenge: this study evaluates `for hour in range(24)`
-> (`cli_basis_setup_win_rate_study.py:174`), so a 09:00 instant with headroom 1
-> counts as a "setup". At 09:00 the running max is nowhere near the day's max,
-> and the threshold is then crossed by ORDINARY DIURNAL WARMING -- which is not
-> this family's thesis and which the venue prices correctly. The thesis requires
-> that the observation looks FINAL (post-peak) while the CLI still prints higher.
+> Measured, not merely argued: `P(win | setup)` at hour 0 runs 87-99%
+> (station-dependent) while `P(R_h == R_23)` (running max already at its
+> end-of-day value) is only 1-10% there -- the "win" is overwhelmingly
+> ordinary diurnal warming, not CLI-vs-ASOS basis. Both curves flatten by
+> hour 16-17. Restricting to local-standard hour `>= 17` (reusing, not
+> re-deriving, `cli_basis_boundary_study.STUDY_HOURS[0]`) and recomputing
+> with the SAME pooling/verdict pipeline used below gives pooled
+> **n=101,590, k=12,528, Wilson 95% lower=0.1213** -- a **PASS**, still
+> ~1.9x the 0.06285 break-even, but roughly 4.4x smaller than the 0.5284
+> this document originally reported. The correction does not kill the
+> family; it does mean any sizing built on the number below would have been
+> wrong by roughly that factor.
 >
-> The study justifies dropping the hour restriction by saying the running max
-> "has converged well before local-standard hour 17". That over-reads the source
-> finding, which was only `P(R_17 == R_23) = 99.40%` at LAX -- convergence
-> BETWEEN 17 and 23, saying nothing about 09:00. The coordinator's instruction to
-> drop the hour filter carried the same over-reach and is corrected here.
->
-> The arithmetic points the same way: the boundary study measures LAX at hour 23
-> as **25.27%**, while this study pools LAX to **52%**. The gap is the pre-peak
-> hours, and the honest figure for the thesis is the ~16-26% one.
->
-> Both figures still clear the 0.06285 break-even, so this does not by itself
-> kill the family -- but a 2x overstatement of the win probability would flow
-> straight into sizing, and the one REAL event resolved so far LOST
-> (`cli_basis_offer_gate_settlement_2026-09-02T053500Z.md`).
+> The rest of this document is kept verbatim as the historical record of the
+> original (inflated) measurement and the challenge that caught it. Do not
+> cite the 0.5284/52% figures below for anything; cite the corrected
+> document instead.
 
 # CLI-basis candidate #2 -- archive-side `P(win | setup)` (Item 3)
 
