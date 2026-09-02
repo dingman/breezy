@@ -257,3 +257,51 @@ One malformed market aborting the whole discovery cycle is a genuine amplifier
 losing fail-closed semantics for genuinely corrupt payloads needs its own
 design: partial-cycle success semantics, skip-vs-abort when a DIFFERENT required
 field fails, and whether a skipped market is retried next cycle or flagged.
+
+---
+
+# CORRECTION 10:30Z — "capture went to zero" is WRONG; the loss was narrower
+
+Peer review of the CF-14 plan flagged that this document's cost claim
+contradicts the code, and the tape settles it against me. **Measured directly
+in the catalog for the outage window 09:45:30Z–10:09:41Z:**
+
+```
+132 files written, ALL for 2026-09-01 instruments:
+  30 order_book_depths   30 mark_price_update   30 custom_venue_settlement_snapshot
+  30 custom_quote_tape_gap    5 quote_tick    3 custom_depth_truncation
+```
+
+So capture did **NOT** go to zero, and the phrases "capture went to zero" and
+"stopped capture dead" earlier in this file are **incorrect**. Already-subscribed
+09-01 instruments kept recording throughout.
+
+**What was actually lost:** the 2026-09-03 cohort was never SUBSCRIBED, so its
+opening tape — the segment the venue had just created at 09:45:30Z — does not
+exist. That remains unrecoverable and remains the real cost. But it is a loss of
+*new subscriptions*, not of all capture.
+
+**Why the distinction matters beyond bookkeeping.** The code says an aborted
+reload cycle raises at `data.py:1058`, BEFORE
+`_reconcile_discovered_subscriptions` at `:1059-1063`, leaving `self._feed`
+untouched — so an abort can only ever cost new subscriptions. This measurement
+confirms the code, and my narrative was the thing that was wrong. Any argument
+about how urgently CF-14 is needed must be built on the narrow cost, not the
+dramatic one; "aborting is nearly free for already-subscribed markets" is the
+defensible claim, and it makes CF-14 a smaller win than this document implied.
+
+**A second correction, same source.** This file's Part 1 asserted the venue runs
+one listing run per day. That is falsified by this file's OWN evidence: two
+cohorts entered discovery within 25 minutes on 2026-09-02 — the re-opened 09-01
+cohort (flip 09:14–09:19Z, discovered 09:20:13Z) and the new 09-03 cohort
+(`createdAt` 09:45:30Z). A re-opened market is NOT filtered as resolved:
+`_resolved_reason` (`provider.py:185-193`) returns `None` for
+`archived!=True, closed!=True, status=OPEN`, which is exactly a re-open, and
+this file's own line records "loaded 5 active market(s), observed **0
+resolved**". Re-opened cohorts are fully live in discovery.
+
+That has teeth for CF-14: during 09:45:30–10:09:41 the 09-03 cohort-total
+failure aborted every cycle, so any 09-01 market that re-opened inside that
+window was also never subscribed. Cross-cohort amplification is therefore
+**measured, not hypothetical**, and a design that aborts on cohort-total failure
+does not fix it.
