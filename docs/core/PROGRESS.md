@@ -36,9 +36,6 @@ Two consequences that are not optional (tracked by P4):
 
 ## Standing verdicts that gate future work
 
-- **Backtest ROI base:** real-provenance ROI is **-0.054%**, not -5.41%
-  (BL-17 closed). `docs/evidence/backtest_roi_measurement_2026-08-31.md`.
-
 - **G-02 — ROI feasibility: NO-GO** on committing to the downstream adapter /
   settlement / execution build (~$3–15/day net per 100 contracts per city-day).
   Free falsification and tape capture stay in scope.
@@ -180,8 +177,7 @@ items now. The remaining blockers are technical, not permission:
 
 | ID | Item | Unlock |
 |---|---|---|
-| G-14 | Continuous capture under systemd | P1 recorder CRITICALs |
-| G-16 | ≥14 days of joined tape | calendar: 14 days after G-14 |
+| G-16 | ≥14 days of joined tape | calendar; G-14 CLOSED 09-02 (1c95f18) |
 | G-17 | Phase 1.5 premise GO/NO-GO | G-16. **NO-GO stops the programme.** |
 
 **The stop gate as written is UNSATISFIABLE by backtest on this venue.** ROI is
@@ -200,8 +196,11 @@ elapsed time, not code. Viable at ask<=0.03 in ~20d / <=0.05 in ~9d; the 0.01
 tick needs ~359d, so no plan may wait on it. Re-runs daily, unattended; (3) capture supervised to 2026-10-01 (D+1 book exists only if the recorder
 runs before local midnight); (4) execute the EXEC SPINE R-1..R-9
 (`docs/plans/EXEC_SPINE_2026-09-01.md`). **R-1/R-2/R-3 LANDED** (2788d11).
-R-4 publishes the first AccountState and is what de-inerts every Nautilus cap
-(`risk/engine.pyx:682-692` returns True with no account); (5) forecast ingest (`docs/plans/forecast_ingest_2026-09-01.md`)
+**R-4 LANDED (a331ef8) but is NOT WIRED**: `exec_clients={}` is still pinned
+(`node_config.py:217,473,654`) and no construction site exists, so "de-inerts
+every Nautilus cap" (`risk/engine.pyx:682-692` returns True with no account) is
+true of the CLASS and false of the PROCESS -- `max_notional_per_order` is
+configured and INERT today. Wiring it is the next increment; (5) forecast ingest (`docs/plans/forecast_ingest_2026-09-01.md`)
 HELD until K1 reports; (6) accumulate ~300 station-days; (7) settle CAPACITY.
 Backtest stays frozen in the REFUTATION + plumbing role: offer survival is a
 counterfactual about the venue's reaction to OUR order, recorded nowhere.
