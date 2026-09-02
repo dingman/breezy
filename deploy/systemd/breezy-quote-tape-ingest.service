@@ -1,0 +1,58 @@
+[Unit]
+# The catalog-conversion step `breezy.runtime.quote_tape_cli` deliberately
+# leaves out of scope (see that module's docstring, "Reading the tape back
+# (deliberately NOT automated here)"). Until this unit exists, turning the
+# recorder's streamed feather into the parquet layout every analysis script
+# queries has been run by hand twice, ever -- 199,079 depth rows for the
+# 2026-09-01 afternoon sat invisible on disk until a manual conversion.
+# Sibling of breezy-k1-daily.service and breezy-offer-gate-daily.service:
+# same oneshot/no-[Install] shape, for the same reason -- this process is
+# started BY its timer, never enabled directly.
+Description=Breezy Polymarket.us quote-tape catalog ingest (periodic)
+Documentation=file:///home/jon/breezy/deploy/systemd/README.md
+Documentation=file:///home/jon/breezy/src/breezy/runtime/quote_tape_ingest_cli.py
+# Not a hard dependency: this reads and writes local disk only, and opens no
+# socket -- same posture as breezy-k1-daily.service. The recorder need not be
+# up at the moment this runs; a currently-live instance is skipped by the
+# live-write-avoidance rule (see the module docstring), never converted.
+After=network-online.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=/home/jon/breezy
+UMask=0077
+
+# No EnvironmentFile: this process holds no venue credential and opens no
+# socket, unlike breezy-quote-tape.service. It shares only the ONE variable
+# both the recorder and this process must agree on, so they can never be
+# pointed at different catalog roots by accident (same value as
+# breezy-quote-tape.service's Environment= line).
+Environment=BREEZY_POLYMARKET_US_QUOTE_TAPE_CATALOG=/home/jon/.local/share/breezy/catalog/quote_tape/polymarket_us
+
+# Read-only queries `systemctl --user is-active breezy-quote-tape.service` to
+# decide whether the newest instance is currently live (see the module
+# docstring's live-write-avoidance rule) -- it sends no signal to the
+# recorder and never restarts it.
+ExecStart=/home/jon/breezy/.venv/bin/python3 /home/jon/breezy/.venv/bin/breezy-quote-tape-ingest
+
+# Mirrors breezy-k1-daily.service and breezy-offer-gate-daily.service: for
+# Type=oneshot this bounds the whole run. A conversion pass over a full
+# day's tape is a bounded local disk operation, not a network wait.
+TimeoutStartSec=1800
+
+# No Restart=. A missed ingest pass is not an incident: the feather tape it
+# reads keeps accumulating on disk regardless, and the next scheduled pass
+# (or a later --dry-run/inspection) subsumes it. The timer's Persistent=true
+# is what recovers a run missed across a reboot.
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=breezy-quote-tape-ingest
+
+# NO SuccessExitStatus. Exit 0 = ran (even if every instance was skipped as
+# live, truncated, or already converted); exit 2 = usage/configuration error
+# (no catalog root, or the configured path is not a directory). See
+# src/breezy/runtime/quote_tape_ingest_cli.py's module docstring.
+
+# NOTE: no [Install] section. This unit is started BY the timer, never
+# enabled directly. `systemctl --user enable breezy-quote-tape-ingest.timer`
+# is the only thing to enable.

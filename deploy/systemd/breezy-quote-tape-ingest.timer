@@ -1,0 +1,33 @@
+[Unit]
+Description=Periodic trigger for the Breezy quote-tape catalog ingest
+Documentation=file:///home/jon/breezy/deploy/systemd/README.md
+Documentation=file:///home/jon/breezy/src/breezy/runtime/quote_tape_ingest_cli.py
+
+[Timer]
+Unit=breezy-quote-tape-ingest.service
+
+# Every 6 hours, on the hour, staggered off the daily jobs' :30/:45 minute
+# offsets so a coincident run never starts in the same tick as
+# breezy-k1-daily.timer (22:30 UTC) or breezy-offer-gate-daily.timer
+# (22:45 UTC). UTC is stated explicitly (this host's clock is UTC -- see
+# breezy-k1-daily.timer's own comment) so the schedule cannot move if the
+# host timezone is ever changed. Six-hourly rather than daily: the parquet
+# catalog every analysis script queries should not lag the recorder by up to
+# a full day, and each pass is a bounded, idempotent local disk operation
+# (see the ingest module's docstring) -- running it more often costs nothing
+# beyond the per-instance preflight scan of instances already fully marked
+# converted.
+OnCalendar=*-*-* 00,06,12,18:15:00 UTC
+
+# A run missed because the host was down fires as soon as the timer is next
+# active, instead of silently waiting for the next 6-hour tick -- mirrors
+# breezy-k1-daily.timer and breezy-offer-gate-daily.timer.
+Persistent=true
+
+# The operation is a local disk read/write with no venue rate limit to
+# respect, and a deterministic time makes correlating a pass with the tape
+# and the daily measurements easier.
+AccuracySec=1min
+
+[Install]
+WantedBy=timers.target
