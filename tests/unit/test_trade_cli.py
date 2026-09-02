@@ -29,10 +29,11 @@ from typing import Any, ClassVar
 
 import pytest
 
-from breezy.adapters.polymarket_us import feed_fault
+from breezy.adapters.polymarket_us import exec_fault, feed_fault
 from breezy.adapters.polymarket_us.factories import (
     POLYMARKET_US_CLIENT_NAME,
     PolymarketUSLiveDataClientFactory,
+    PolymarketUSLiveExecClientFactory,
 )
 from breezy.adapters.polymarket_us.safety import MAX_ORDER_NOTIONAL_USD_ENV_VAR
 from breezy.runtime import trade_cli
@@ -55,6 +56,10 @@ TRADE_ENV: dict[str, str] = {
     "POLYMARKET_US_GATEWAY_BASE": "https://gateway.example.invalid",
     "POLYMARKET_US_WS_URL": "wss://ws.example.invalid",
     "POLYMARKET_US_USER_AGENT": "breezy-test/1.0 (+mailto:ops@example.invalid)",
+    # EXEC SPINE W: `exec_config_from_env`'s two REQUIRED, venue-specific
+    # variables (OQ-I; see `factories.py`'s own doc comments on both).
+    "POLYMARKET_US_ACCOUNT_NUMBER": "001",
+    "POLYMARKET_US_EXEC_STATE_DB": "/tmp/breezy-trade-cli-test-exec-state.db",
 }
 
 
@@ -134,9 +139,11 @@ class FeedLostNode(RecordingNode):
 def _clean_process_state() -> Iterator[None]:
     RecordingNode.instances.clear()
     feed_fault.clear_fatal_feed_fault()
+    exec_fault.clear_fatal_exec_fault()
     yield
     RecordingNode.instances.clear()
     feed_fault.clear_fatal_feed_fault()
+    exec_fault.clear_fatal_exec_fault()
 
 
 # ---------------------------------------------------------------------------
@@ -169,25 +176,32 @@ def test_exactly_one_data_client_factory_is_registered_under_the_routing_name() 
     assert set(node.config.data_clients) == {POLYMARKET_US_CLIENT_NAME}
 
 
-def test_no_execution_client_factory_is_ever_registered() -> None:
-    """R-2 has no order path at all. A later increment adds one; not this one."""
+def test_exactly_one_execution_client_factory_is_registered_under_the_routing_name() -> None:
+    """EXEC SPINE W. R-4's client had ZERO construction sites before this;
+    the trading process now registers it, under the SAME routing name the
+    data client uses -- and still declares no strategy and no exec algorithm,
+    so nothing on this path can originate an order."""
     run(env=TRADE_ENV, node_factory=RecordingNode, stderr=io.StringIO())
     node = RecordingNode.instances[0]
 
-    assert node.exec_client_factories == []
-    assert node.config.exec_clients == {}
+    assert node.exec_client_factories == [
+        (POLYMARKET_US_CLIENT_NAME, PolymarketUSLiveExecClientFactory)
+    ]
+    assert set(node.config.exec_clients) == {POLYMARKET_US_CLIENT_NAME}
     assert node.config.strategies == []
     assert node.config.exec_algorithms == []
 
 
-def test_the_entrypoint_source_registers_no_execution_surface() -> None:
+def test_the_entrypoint_source_registers_no_strategy_or_exec_algorithm_or_raw_submit() -> None:
     """Structural, not behavioural -- and deliberately so.
 
-    The behavioural test above proves this run registered nothing. It cannot
-    prove a *conditional* registration on a branch the test does not take.
-    Reading the source closes that gap: the increment's promise is that the
-    process is INCAPABLE of reaching an order path, and a call that is not
-    written cannot be reached.
+    The behavioural test above proves this run registered an exec CLIENT. It
+    cannot prove a *conditional* registration of a strategy or exec algorithm
+    on a branch the test does not take. Reading the source closes that gap:
+    the increment's promise is that the process is still INCAPABLE of
+    reaching an order path, and a call that is not written cannot be reached.
+    ``add_exec_client_factory`` is deliberately NOT asserted absent here --
+    EXEC SPINE W adds it, on purpose, in the behavioural test above.
     """
     source = Path(trade_cli.__file__).read_text(encoding="utf-8")
     tree = ast.parse(source)
@@ -197,7 +211,6 @@ def test_the_entrypoint_source_registers_no_execution_surface() -> None:
         if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
     }
 
-    assert "add_exec_client_factory" not in called
     assert "submit_order" not in called
     assert "add_strategy" not in called
     assert "add_exec_algorithm" not in called
@@ -289,6 +302,73 @@ def test_a_ctrl_c_after_a_latched_fault_is_still_a_failed_run() -> None:
 
 
 # ---------------------------------------------------------------------------
+# EXEC SPINE W, risk 2 -- the latched EXECUTION fault, done-predicate clause 7
+# ---------------------------------------------------------------------------
+
+
+class ExecFaultNode(RecordingNode):
+    """A run whose execution client failed to connect -- exactly what a
+    real ``_connect`` failure leaves behind: an otherwise clean stop, with
+    the ONLY evidence in the process-scoped exec-fault latch (see
+    ``exec/client.py``'s wrapped ``_connect`` and
+    ``tests/unit/test_polymarket_us_exec_client.py::test_a_failed_connect_is_observable_and_does_not_exit_zero``
+    for the client-side half of this exact chain).
+    """
+
+    def run(self) -> None:
+        self.calls.append("run")
+        exec_fault.record_fatal_exec_fault("POLYMARKET_US", "_connect failed: PermissionError")
+
+
+def test_a_latched_execution_fault_is_reported_as_a_runtime_failure() -> None:
+    """Without this check the process would exit `EXIT_OK` having never
+    reconciled and never traded -- see `_exit_code_for_completed_run`'s own
+    docstring for the full native chain that makes this silent otherwise."""
+    err = io.StringIO()
+
+    code = run(env=TRADE_ENV, node_factory=ExecFaultNode, stderr=err)
+
+    assert code == EXIT_RUNTIME_ERROR
+    assert code != EXIT_OK
+    assert "execution-client" in err.getvalue().lower()
+
+
+def test_a_latched_execution_fault_still_disposes_the_node() -> None:
+    run(env=TRADE_ENV, node_factory=ExecFaultNode, stderr=io.StringIO())
+
+    assert RecordingNode.instances[0].calls == ["build", "run", "dispose"]
+
+
+def test_a_stale_execution_fault_from_an_earlier_run_cannot_fail_a_healthy_one() -> None:
+    """The latch is process-scoped and cleared at entry: it reports THIS run."""
+    exec_fault.record_fatal_exec_fault("POLYMARKET_US", "a fault from before this run")
+    err = io.StringIO()
+
+    code = run(env=TRADE_ENV, node_factory=RecordingNode, stderr=err)
+
+    assert code == EXIT_OK
+
+
+def test_an_execution_fault_is_checked_before_a_feed_fault() -> None:
+    """Both latched is an edge case, not a real scenario -- but the exec
+    fault is the more actionable of the two (nothing reconciled at all), so
+    it is reported first when both happen to be set."""
+
+    class BothFaultsNode(RecordingNode):
+        def run(self) -> None:
+            self.calls.append("run")
+            feed_fault.record_fatal_feed_fault("POLYMARKET_US", "feed lost")
+            exec_fault.record_fatal_exec_fault("POLYMARKET_US", "_connect failed")
+
+    err = io.StringIO()
+
+    code = run(env=TRADE_ENV, node_factory=BothFaultsNode, stderr=err)
+
+    assert code == EXIT_RUNTIME_ERROR
+    assert "execution-client" in err.getvalue().lower()
+
+
+# ---------------------------------------------------------------------------
 # Misconfiguration
 # ---------------------------------------------------------------------------
 
@@ -298,6 +378,9 @@ def test_a_ctrl_c_after_a_latched_fault_is_still_a_failed_run() -> None:
     [
         TRADE_TRADER_ID_VAR,
         "POLYMARKET_US_USER_AGENT",
+        # EXEC SPINE W, OQ-I: no default, no fallback, no derivation.
+        "POLYMARKET_US_ACCOUNT_NUMBER",
+        "POLYMARKET_US_EXEC_STATE_DB",
     ],
 )
 def test_every_missing_required_variable_exits_two_and_names_itself(name: str) -> None:

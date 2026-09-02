@@ -31,7 +31,9 @@ per position), neither of which appears here at all.
 from __future__ import annotations
 
 import json
+import tempfile
 from dataclasses import dataclass
+from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 import nautilus_trader
@@ -50,7 +52,10 @@ from nautilus_trader.model.objects import AccountBalance, Money, Price, Quantity
 from nautilus_trader.portfolio.portfolio import Portfolio
 from nautilus_trader.risk.engine import RiskEngine
 
-from breezy.adapters.polymarket_us.config import PolymarketUSDataClientConfig
+from breezy.adapters.polymarket_us.config import (
+    PolymarketUSDataClientConfig,
+    PolymarketUSExecClientConfig,
+)
 from breezy.adapters.polymarket_us.parsing import parse_binary_option
 from breezy.adapters.polymarket_us.safety import (
     MAX_ORDER_NOTIONAL_USD_ENV_VAR,
@@ -108,6 +113,16 @@ def _data_client_config(*slugs: str) -> PolymarketUSDataClientConfig:
         instrument_reload_interval_mins=5,
         user_agent="breezy-test/1.0 (+mailto:ops@example.invalid)",
         market_slugs=slugs,
+    )
+
+
+def _exec_client_config(*slugs: str) -> PolymarketUSExecClientConfig:
+    """EXEC SPINE W. `state_store_opener` stays unset -- this file never
+    builds a real `TradingNode`, so it is never read."""
+    return PolymarketUSExecClientConfig(
+        venue=_data_client_config(*slugs),
+        account_number="001",
+        state_store_path=str(Path(tempfile.mkdtemp()) / "exec_state.db"),
     )
 
 
@@ -173,7 +188,9 @@ def _rig() -> _Rig:
     instrument = _instrument()
     slug = str(instrument.id.symbol.value)
 
-    node_config = build_trade_node_config(_trade_settings(), _data_client_config(slug))
+    node_config = build_trade_node_config(
+        _trade_settings(), _data_client_config(slug), _exec_client_config(slug)
+    )
 
     clock = TestClock()
     msgbus = MessageBus(trader_id=TRADER_ID, clock=clock)
@@ -256,7 +273,9 @@ def test_the_enforced_cap_is_the_operator_value_not_a_breezy_default(
 
     for raw in ("7", "31"):
         monkeypatch.setenv(MAX_ORDER_NOTIONAL_USD_ENV_VAR, raw)
-        config = build_trade_node_config(_trade_settings(), _data_client_config(slug))
+        config = build_trade_node_config(
+            _trade_settings(), _data_client_config(slug), _exec_client_config(slug)
+        )
 
         # Keyed by the INSTRUMENT ID string, not the bare slug:
         # `_initialize_risk_checks` calls `InstrumentId.from_str_c` on every
@@ -282,19 +301,25 @@ def test_the_cap_is_keyed_by_every_declared_market_and_nothing_else() -> None:
     slugs = tuple(dict.fromkeys(str(p["market"]["slug"]) for p in payloads[:3]))
     assert len(slugs) >= 2, "need at least two distinct captured slugs"
 
-    with_slugs = build_trade_node_config(_trade_settings(), _data_client_config(*slugs))
+    with_slugs = build_trade_node_config(
+        _trade_settings(), _data_client_config(*slugs), _exec_client_config(*slugs)
+    )
     assert set(with_slugs.risk_engine.max_notional_per_order) == {
         str(slug_to_instrument_id(slug)) for slug in slugs
     }
 
-    without_slugs = build_trade_node_config(_trade_settings(), _data_client_config())
+    without_slugs = build_trade_node_config(
+        _trade_settings(), _data_client_config(), _exec_client_config()
+    )
     assert without_slugs.risk_engine.max_notional_per_order == {}
 
 
 @pytest.mark.usefixtures("operator_ceiling")
 def test_pre_trade_risk_checks_are_never_bypassed() -> None:
     """``bypass=True`` would silently disable every check above."""
-    config = build_trade_node_config(_trade_settings(), _data_client_config())
+    config = build_trade_node_config(
+        _trade_settings(), _data_client_config(), _exec_client_config()
+    )
 
     assert config.risk_engine is not None
     assert config.risk_engine.bypass is False
@@ -312,7 +337,7 @@ def test_an_unset_operator_control_refuses_instead_of_running_uncapped(
     monkeypatch.delenv(MAX_ORDER_NOTIONAL_USD_ENV_VAR, raising=False)
 
     with pytest.raises(LiveTradingPermissionError) as excinfo:
-        build_trade_node_config(_trade_settings(), _data_client_config())
+        build_trade_node_config(_trade_settings(), _data_client_config(), _exec_client_config())
 
     assert MAX_ORDER_NOTIONAL_USD_ENV_VAR in str(excinfo.value)
 
@@ -325,7 +350,7 @@ def test_a_blank_operator_control_is_absence_not_a_zero_ceiling(
     monkeypatch.setenv(MAX_ORDER_NOTIONAL_USD_ENV_VAR, raw)
 
     with pytest.raises(LiveTradingPermissionError) as excinfo:
-        build_trade_node_config(_trade_settings(), _data_client_config())
+        build_trade_node_config(_trade_settings(), _data_client_config(), _exec_client_config())
 
     assert MAX_ORDER_NOTIONAL_USD_ENV_VAR in str(excinfo.value)
 
@@ -342,7 +367,7 @@ def test_a_sub_dollar_ceiling_refuses_rather_than_disabling_the_check(
     monkeypatch.setenv(MAX_ORDER_NOTIONAL_USD_ENV_VAR, "0.50")
 
     with pytest.raises(LiveTradingPermissionError) as excinfo:
-        build_trade_node_config(_trade_settings(), _data_client_config())
+        build_trade_node_config(_trade_settings(), _data_client_config(), _exec_client_config())
 
     assert MAX_ORDER_NOTIONAL_USD_ENV_VAR in str(excinfo.value)
 
@@ -356,7 +381,7 @@ def test_the_refusal_names_the_control_never_the_value(
     monkeypatch.setenv(MAX_ORDER_NOTIONAL_USD_ENV_VAR, raw)
 
     with pytest.raises(LiveTradingPermissionError) as excinfo:
-        build_trade_node_config(_trade_settings(), _data_client_config())
+        build_trade_node_config(_trade_settings(), _data_client_config(), _exec_client_config())
 
     message = str(excinfo.value)
     assert MAX_ORDER_NOTIONAL_USD_ENV_VAR in message

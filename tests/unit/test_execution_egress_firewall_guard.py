@@ -700,6 +700,17 @@ def test_n2_the_shipped_tree_has_exactly_the_expected_execution_egress_modules()
     read/map only and neither performs I/O, but E0 classifies by PATH and is
     right to: what makes them egress surfaces is where they live, not what
     they currently do.
+
+    EXEC SPINE W adds the LAST row. ``PolymarketUSLiveExecClientFactory``
+    (``adapters/polymarket_us/factories.py``) subclasses
+    ``LiveExecClientFactory`` -- one of ``_EGRESS_CLASS_BASES`` -- so E2 fires
+    on it exactly as it does on ``exec/client.py``'s own base. ``factories.py``
+    sits OUTSIDE the ``exec/`` prefix, so E0/E1 do not fire on it, and it
+    defines none of the six order-lifecycle coroutines, so E3 does not either
+    -- ONE new row, not seven. Non-vacuity: delete the row below and this test
+    must go red the moment the factory class exists; see
+    ``test_n2_e0_does_not_fire_outside_the_exec_package`` for the general
+    shape of that proof.
     """
     found = [(v.path, v.rule) for v in find_execution_egress_modules()]
     assert found == [
@@ -718,6 +729,8 @@ def test_n2_the_shipped_tree_has_exactly_the_expected_execution_egress_modules()
         ("src/breezy/adapters/polymarket_us/exec/client.py", "E3"),
         ("src/breezy/adapters/polymarket_us/exec/endpoints.py", "E0"),
         ("src/breezy/adapters/polymarket_us/exec/reports.py", "E0"),
+        # EXEC SPINE W: `PolymarketUSLiveExecClientFactory(LiveExecClientFactory)`.
+        ("src/breezy/adapters/polymarket_us/factories.py", "E2"),
     ]
 
 
@@ -2404,14 +2417,24 @@ def exec_importing_test_modules(roots: tuple[str, ...] = TEST_SCAN_ROOTS) -> set
 
 def test_x1_the_live_scan_actually_reaches_a_test_that_imports_the_exec_package() -> None:
     """Set EQUALITY, in X3's shape: a rename cannot re-vacuum the scan, and a
-    new exec test cannot appear without a reviewer seeing it here."""
+    new exec test cannot appear without a reviewer seeing it here.
+
+    EXEC SPINE W adds two: `test_polymarket_us_factories.py` now imports
+    `PolymarketUSExecutionClient` to assert the factory's return type, and
+    `test_exec_client_wiring_contract.py` drives a real node built with a
+    real `PolymarketUSExecutionClient`. Neither carries any of
+    `SOCKET_RESTORING_MARKERS` -- both stub the transport, exactly like the
+    data-side suite already does.
+    """
     assert exec_importing_test_modules() == {
         "tests/contract/test_exec_client_reconciliation_contract.py",
+        "tests/contract/test_exec_client_wiring_contract.py",
         "tests/unit/test_polymarket_us_exec_client.py",
         "tests/unit/test_polymarket_us_exec_endpoints.py",
         "tests/unit/test_polymarket_us_exec_positions.py",
         "tests/unit/test_polymarket_us_exec_reports.py",
         "tests/unit/test_polymarket_us_exec_snapshot_drift.py",
+        "tests/unit/test_polymarket_us_factories.py",
     }
 
 

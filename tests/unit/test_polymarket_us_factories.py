@@ -38,7 +38,9 @@ from __future__ import annotations
 import asyncio
 import base64
 import inspect
-from collections.abc import Mapping
+from collections.abc import Iterator, Mapping
+from decimal import Decimal
+from pathlib import Path
 from typing import Any, ClassVar
 
 import pytest
@@ -46,25 +48,34 @@ from nacl.signing import SigningKey
 from nautilus_trader.common.component import LiveClock, MessageBus
 from nautilus_trader.config import InstrumentProviderConfig
 from nautilus_trader.core.uuid import UUID4
-from nautilus_trader.live.factories import LiveDataClientFactory
+from nautilus_trader.live.factories import LiveDataClientFactory, LiveExecClientFactory
 from nautilus_trader.model.identifiers import ClientId, TraderId
 from nautilus_trader.test_kit.stubs.component import TestComponentStubs
 
 from breezy.adapters.polymarket_us import factories as factories_module
-from breezy.adapters.polymarket_us.config import PolymarketUSDataClientConfig
+from breezy.adapters.polymarket_us.config import (
+    PolymarketUSDataClientConfig,
+    PolymarketUSExecClientConfig,
+)
 from breezy.adapters.polymarket_us.credentials import (
     PolymarketUSCredentials,
     PolymarketUSSecretsRefConfig,
 )
 from breezy.adapters.polymarket_us.data import PolymarketUSDataClient
+from breezy.adapters.polymarket_us.exec.client import PolymarketUSExecutionClient
+from breezy.adapters.polymarket_us.exec.endpoints import ACCOUNT_BALANCES_PATH
 from breezy.adapters.polymarket_us.factories import (
+    ACCOUNT_NUMBER_ENV_VAR,
     API_BASE_ENV_VAR,
     DISCOVERY_RELOAD_INTERVAL_ENV_VAR,
+    EXEC_STATE_DB_ENV_VAR,
     GATEWAY_BASE_ENV_VAR,
     USER_AGENT_ENV_VAR,
     WS_URL_ENV_VAR,
     PolymarketUSLiveDataClientFactory,
+    PolymarketUSLiveExecClientFactory,
     config_from_env,
+    exec_config_from_env,
 )
 from breezy.adapters.polymarket_us.parsing import parse_quote_tick
 from breezy.adapters.polymarket_us.provider import PolymarketUSInstrumentProvider
@@ -154,6 +165,30 @@ def make_config(**overrides: Any) -> PolymarketUSDataClientConfig:
     }
     kwargs.update(overrides)
     return PolymarketUSDataClientConfig(**kwargs)
+
+
+@pytest.fixture(autouse=True)
+def _clear_shared_polymarket_us_caches() -> Iterator[None]:
+    """Isolate every test from defect A's fix.
+
+    ``_shared_polymarket_us_signer``/``_transport``/``_http_client``/
+    ``_instrument_provider`` are process-global ``functools.lru_cache``s,
+    keyed by VALUE on ``PolymarketUSDataClientConfig`` -- deliberately, so
+    the data and exec factories share one object graph (defect A). Many
+    tests in this module build a client from an equal-valued default config
+    (``make_config()``), so without clearing these between tests the SECOND
+    such test would silently receive the FIRST test's cached -- and
+    differently stubbed -- object graph instead of building its own.
+    """
+    factories_module._shared_polymarket_us_signer.cache_clear()
+    factories_module._shared_polymarket_us_transport.cache_clear()
+    factories_module._shared_polymarket_us_http_client.cache_clear()
+    factories_module._shared_polymarket_us_instrument_provider.cache_clear()
+    yield
+    factories_module._shared_polymarket_us_signer.cache_clear()
+    factories_module._shared_polymarket_us_transport.cache_clear()
+    factories_module._shared_polymarket_us_http_client.cache_clear()
+    factories_module._shared_polymarket_us_instrument_provider.cache_clear()
 
 
 @pytest.fixture
@@ -398,6 +433,259 @@ def test_create_rejects_a_config_of_the_wrong_type(wired: dict[str, Any]) -> Non
 
 
 # ---------------------------------------------------------------------------
+# EXEC SPINE W -- PolymarketUSLiveExecClientFactory
+# ---------------------------------------------------------------------------
+
+ACCOUNT_NUMBER = "acct-001"
+
+
+def make_exec_config(tmp_path: Path, **overrides: Any) -> PolymarketUSExecClientConfig:
+    kwargs: dict[str, Any] = {
+        "venue": make_config(),
+        "account_number": ACCOUNT_NUMBER,
+        "state_store_path": str(tmp_path / "exec_state.db"),
+        # Never opened by `create()` itself -- see the class docstring -- but
+        # `PolymarketUSExecutionClient.__init__` requires a callable.
+        "state_store_opener": lambda: pytest.fail(  # pragma: no cover - never called here
+            "the factory must never open the store; only _connect may"
+        ),
+    }
+    kwargs.update(overrides)
+    return PolymarketUSExecClientConfig(**kwargs)
+
+
+def build_exec_client(
+    config: PolymarketUSExecClientConfig,
+    *,
+    name: str = CLIENT_NAME,
+) -> PolymarketUSExecutionClient:
+    clock = LiveClock()
+    trader_id = TraderId("SMOKE-001")
+    msgbus = MessageBus(trader_id=trader_id, clock=clock)
+    cache = TestComponentStubs.cache()
+    loop = asyncio.new_event_loop()
+    try:
+        return PolymarketUSLiveExecClientFactory.create(
+            loop=loop,
+            name=name,
+            config=config,
+            msgbus=msgbus,
+            cache=cache,
+            clock=clock,
+        )
+    finally:
+        loop.close()
+
+
+def test_exec_factory_subclasses_the_native_base_and_create_is_a_staticmethod() -> None:
+    """``add_exec_client_factory`` takes the CLASS, exactly as the data side."""
+    assert issubclass(PolymarketUSLiveExecClientFactory, LiveExecClientFactory)
+    raw = inspect.getattr_static(PolymarketUSLiveExecClientFactory, "create")
+    assert isinstance(raw, staticmethod)
+
+
+def test_exec_create_derives_the_client_id_and_venue(tmp_path: Path, wired: dict[str, Any]) -> None:
+    client = build_exec_client(make_exec_config(tmp_path))
+
+    assert client.id == ClientId(CLIENT_NAME)
+    assert client.venue == POLYMARKET_US_VENUE
+    assert isinstance(client, PolymarketUSExecutionClient)
+
+
+def test_exec_create_derives_the_account_id_from_account_number(
+    tmp_path: Path, wired: dict[str, Any]
+) -> None:
+    """OQ-I: `account_number` is the ONLY source of the `AccountId` suffix."""
+    client = build_exec_client(make_exec_config(tmp_path, account_number="9999"))
+
+    assert repr(client).endswith("refusals=0)")
+    assert f"{CLIENT_NAME}-9999" in repr(client)
+
+
+def test_exec_create_never_opens_the_injected_store(tmp_path: Path, wired: dict[str, Any]) -> None:
+    """The opener is forwarded, never called -- construction happens off the
+    main thread, inside `_connect`, on the execution engine's own loop."""
+    client = build_exec_client(make_exec_config(tmp_path))
+
+    assert client.state_store_owner_thread is None
+
+
+def test_exec_create_forwards_the_timeouts(tmp_path: Path, wired: dict[str, Any]) -> None:
+    client = build_exec_client(
+        make_exec_config(
+            tmp_path, instrument_wait_timeout_s=12.0, account_registration_timeout_s=34.0
+        )
+    )
+
+    assert client._instrument_wait_timeout_s == 12.0
+    assert client._account_registration_timeout_s == 34.0
+
+
+def test_exec_create_rejects_a_config_of_the_wrong_type(wired: dict[str, Any]) -> None:
+    with pytest.raises(SettingsError, match="PolymarketUSExecClientConfig"):
+        build_exec_client("not-a-config")  # type: ignore[arg-type]
+
+
+def test_exec_create_rejects_a_config_with_no_store_opener(
+    tmp_path: Path, wired: dict[str, Any]
+) -> None:
+    """`exec_config_from_env` always leaves this unset (layer contract); only
+    `build_trade_node_config` may fill it in. A config that reaches the
+    factory unset means that injection was skipped."""
+    config = make_exec_config(tmp_path, state_store_opener=None)
+
+    with pytest.raises(SettingsError, match="state_store_opener"):
+        build_exec_client(config)
+
+
+def test_exec_create_wires_its_own_instrument_provider(
+    tmp_path: Path, wired: dict[str, Any]
+) -> None:
+    client = build_exec_client(make_exec_config(tmp_path))
+    provider = client._instrument_provider
+
+    assert isinstance(provider, PolymarketUSInstrumentProvider)
+    assert provider.venue == POLYMARKET_US_VENUE
+
+
+class RecordingTransport:
+    """Records every GET this factory's `private_read` closure issues."""
+
+    instances: ClassVar[list[RecordingTransport]] = []
+
+    def __init__(self, **kwargs: Any) -> None:
+        self.calls: list[dict[str, Any]] = []
+        RecordingTransport.instances.append(self)
+
+    async def get(self, url: str, *, headers: Mapping[str, str], quota_key: str) -> Any:
+        self.calls.append({"url": url, "headers": dict(headers), "quota_key": quota_key})
+        from breezy.adapters.polymarket_us.transport import VenueResponse
+
+        body = (
+            b'{"balances": [{"currency": "USD", "currentBalance": 4242.42, '
+            b'"buyingPower": 4242.42, "lastUpdated": "2026-09-02T00:00:00Z"}]}'
+        )
+        return VenueResponse(status=200, headers={}, body=body)
+
+
+def test_the_wired_private_read_signs_exactly_one_get_over_the_bare_path(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, wired: dict[str, Any]
+) -> None:
+    """The GET-only guarantee lives HERE (class docstring): no `query`
+    parameter exists on the closure at all, so the signed string and the
+    fetched URL can never drift apart."""
+    RecordingTransport.instances = []
+    monkeypatch.setattr(factories_module, "NautilusHttpTransport", RecordingTransport)
+    client = build_exec_client(make_exec_config(tmp_path))
+
+    payload = asyncio.run(client._private_read(ACCOUNT_BALANCES_PATH))
+
+    assert len(RecordingTransport.instances) == 1
+    recorded = RecordingTransport.instances[0].calls
+    assert len(recorded) == 1
+    assert recorded[0]["url"].endswith(ACCOUNT_BALANCES_PATH)
+    assert "?" not in recorded[0]["url"], "no query string may ever reach a signed private read"
+    # Decimal-preserving decode (`decode_private_payload`), not the plain
+    # `json.loads` `PolymarketUSHttpClient._decode` would have used.
+    balance = payload["balances"][0]
+    assert isinstance(balance["currentBalance"], Decimal)
+    assert balance["currentBalance"] == Decimal("4242.42")
+
+
+def test_the_wired_private_read_has_no_query_parameter_in_its_signature(
+    tmp_path: Path, wired: dict[str, Any]
+) -> None:
+    """Non-vacuity for the test above, at the signature rather than the call:
+    a query CANNOT be smuggled in because the closure accepts none."""
+    client = build_exec_client(make_exec_config(tmp_path))
+
+    params = inspect.signature(client._private_read).parameters
+    assert list(params) == ["path"]
+
+
+# ---------------------------------------------------------------------------
+# EXEC SPINE W -- exec_config_from_env
+# ---------------------------------------------------------------------------
+
+
+def make_exec_env(tmp_path: Path, **overrides: str) -> dict[str, str]:
+    env = make_env()
+    env[ACCOUNT_NUMBER_ENV_VAR] = ACCOUNT_NUMBER
+    env[EXEC_STATE_DB_ENV_VAR] = str(tmp_path / "exec_state.db")
+    env.update(overrides)
+    return env
+
+
+def test_exec_config_from_env_builds_the_documented_configuration(tmp_path: Path) -> None:
+    config = exec_config_from_env(make_exec_env(tmp_path))
+
+    assert config.account_number == ACCOUNT_NUMBER
+    assert config.state_store_path == str(tmp_path / "exec_state.db")
+    assert config.state_store_opener is None, "only build_trade_node_config may inject this"
+    assert config.venue is not None
+    assert config.venue.user_agent == USER_AGENT
+
+
+def test_exec_config_from_env_names_account_number_with_no_default(tmp_path: Path) -> None:
+    """OQ-I: zero producers anywhere else -- this is the ONLY source."""
+    env = make_exec_env(tmp_path)
+    del env[ACCOUNT_NUMBER_ENV_VAR]
+
+    with pytest.raises(SettingsError) as excinfo:
+        exec_config_from_env(env)
+
+    assert ACCOUNT_NUMBER_ENV_VAR in str(excinfo.value)
+
+
+def test_exec_config_from_env_account_number_is_stable_across_a_restart(tmp_path: Path) -> None:
+    """OQ-I's stability half: the source is a static environment variable,
+    read fresh each call, never generated -- so two 'restarts' against the
+    SAME operator configuration must agree byte-for-byte."""
+    env = make_exec_env(tmp_path)
+
+    first = exec_config_from_env(env)
+    second = exec_config_from_env(dict(env))  # a fresh mapping, same content
+
+    assert first.account_number == second.account_number == ACCOUNT_NUMBER
+
+
+def test_exec_config_from_env_names_the_state_db_with_no_default(tmp_path: Path) -> None:
+    env = make_exec_env(tmp_path)
+    del env[EXEC_STATE_DB_ENV_VAR]
+
+    with pytest.raises(SettingsError) as excinfo:
+        exec_config_from_env(env)
+
+    assert EXEC_STATE_DB_ENV_VAR in str(excinfo.value)
+
+
+def test_exec_config_from_env_rejects_a_relative_state_db_path(tmp_path: Path) -> None:
+    with pytest.raises(SettingsError, match="absolute"):
+        exec_config_from_env(make_exec_env(tmp_path, **{EXEC_STATE_DB_ENV_VAR: "relative/path.db"}))
+
+
+def test_exec_config_from_env_rejects_a_dotdot_segment(tmp_path: Path) -> None:
+    with pytest.raises(SettingsError, match=r"\.\."):
+        exec_config_from_env(
+            make_exec_env(tmp_path, **{EXEC_STATE_DB_ENV_VAR: str(tmp_path / ".." / "exec.db")})
+        )
+
+
+def test_exec_config_from_env_reuses_config_from_env_for_shared_venue_facts(
+    tmp_path: Path,
+) -> None:
+    """Not a second, competing environment policy -- verified rather than
+    merely asserted: the same override that moves the data client's origin
+    moves the exec client's."""
+    env = make_exec_env(tmp_path, **{API_BASE_ENV_VAR: "https://staging.example.invalid"})
+
+    exec_cfg = exec_config_from_env({**env, "POLYMARKET_US_ALLOW_FOREIGN_ORIGIN": "1"})
+
+    assert exec_cfg.venue is not None
+    assert exec_cfg.venue.api_base_url == "https://staging.example.invalid"
+
+
+# ---------------------------------------------------------------------------
 # Section 7 environment contract
 # ---------------------------------------------------------------------------
 
@@ -458,8 +746,18 @@ def test_config_from_env_carries_no_secret_value() -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_module_defines_no_execution_client_factory() -> None:
-    source = inspect.getsource(factories_module)
+def test_the_data_client_factory_itself_defines_no_execution_surface() -> None:
+    """R-2's boundary, narrowed rather than deleted at EXEC SPINE W.
+
+    Before W, no execution-client factory existed anywhere in this module and
+    this test asserted that absence directly. W adds exactly ONE --
+    ``PolymarketUSLiveExecClientFactory``, covered by its own suite below --
+    so the property worth keeping is narrower: the DATA client factory class
+    itself still defines no ``create`` beyond the one native contract
+    declares, and still never touches ``exec_clients``/``submit_order``.
+    """
+    source = inspect.getsource(PolymarketUSLiveDataClientFactory)
 
     assert "LiveExecClientFactory" not in source
     assert "LiveExecutionClientFactory" not in source
+    assert "submit_order" not in source

@@ -36,6 +36,7 @@ from __future__ import annotations
 import asyncio
 import json
 import threading
+from collections.abc import Iterator
 from concurrent.futures import ThreadPoolExecutor
 from decimal import Decimal
 from typing import TYPE_CHECKING, Any, Final
@@ -97,6 +98,10 @@ from breezy.adapters.polymarket_us.exec.endpoints import (
     PORTFOLIO_POSITIONS_PATH,
 )
 from breezy.adapters.polymarket_us.exec.reports import build_execution_mass_status
+from breezy.adapters.polymarket_us.exec_fault import (
+    clear_fatal_exec_fault,
+    fatal_exec_fault,
+)
 from breezy.adapters.polymarket_us.parsing import FEE_COEFFICIENT_KEY, parse_binary_option
 from breezy.adapters.polymarket_us.symbology import POLYMARKET_US_VENUE
 from breezy.runtime.sqlite_store import SqliteStateStore
@@ -134,6 +139,15 @@ RECORDED_QUANTITY: Final[Decimal] = Decimal(4)
 RECORDED_COST: Final[Decimal] = RECORDED_OPEN_PRICE * RECORDED_QUANTITY
 
 TS_INIT: Final[int] = 1_787_617_213_000_000_000
+
+
+@pytest.fixture(autouse=True)
+def _clean_exec_fault_latch() -> Iterator[None]:
+    """The exec-fault latch is process-global (`exec_fault.py`); a test that
+    forces `_connect` to fail must not poison a later, unrelated test."""
+    clear_fatal_exec_fault()
+    yield
+    clear_fatal_exec_fault()
 
 
 # ---------------------------------------------------------------------------
@@ -237,7 +251,7 @@ def _build_rig(
     read = _PrivateReadStub(
         {
             ACCOUNT_BALANCES_PATH: _balances_payload(),
-            PORTFOLIO_POSITIONS_PATH: {"positions": dict(positions or {})},
+            PORTFOLIO_POSITIONS_PATH: {"positions": dict(positions or {}), "eof": True},
         },
     )
 
@@ -336,6 +350,14 @@ async def test_connect_publishes_an_account_state_with_the_issued_id_and_a_usd_b
     assert balance.currency.code == "USD"
 
     assert rig.cache.account_for_venue(POLYMARKET_US_VENUE) is not None
+
+    # EXEC SPINE W done-predicate clauses 1 & 2: a healthy connect must be
+    # distinguishable from one that latched a refusal purely by coincidence
+    # (e.g. an instrument-load timeout also denies every order). Both must
+    # hold on the SAME successful connect this test already exercises.
+    assert rig.client.trading_refusals == ()
+    assert rig.client._instrument_provider.count > 0
+
     await rig.client._disconnect()
 
 
@@ -599,10 +621,49 @@ def test_declared_positions_refuses_a_foreign_shape(payload: dict[str, Any]) -> 
 
 
 def test_declared_positions_accepts_a_genuinely_empty_map() -> None:
-    """`{"positions": {}}` IS the true "nothing held" shape, and must NOT be
-    refused -- the empty-dict case is what the three refusals above exist to
-    keep distinct."""
-    assert PolymarketUSExecutionClient._declared_positions({"positions": {}}) == {}
+    """`{"positions": {}, "eof": True}` IS the true "nothing held" shape, and
+    must NOT be refused -- the empty-dict case is what the three refusals
+    above exist to keep distinct. `eof: True` is required here too (R-4P-1):
+    an empty page that is NOT the last page is still a truncation."""
+    assert (
+        PolymarketUSExecutionClient._declared_positions({"positions": {}, "eof": True}) == {}
+    )
+
+
+# ---------------------------------------------------------------------------
+# R-4P-1 -- a non-terminal page is a REFUSAL, never a silently-accepted
+# partial book. `GetUserPositionsResponse` is cursor-paginated (`eof`,
+# `nextCursor` alongside `positions`); R-4 as originally landed read only
+# `payload["positions"]` and stopped, so a real multi-page account would
+# reconcile page 1 and call it the whole book -- an under-reported book
+# that every risk cap sizes off. This is the INTERIM fix only
+# (R-4P-1): refuse the truncation. Cursor-following pagination (R-4P-2) is
+# deliberately deferred.
+# ---------------------------------------------------------------------------
+
+
+def test_a_non_terminal_positions_page_latches_a_refusal() -> None:
+    """`eof: False` is an explicit, unambiguous "there is more"."""
+    with pytest.raises(ExecutionReportMappingError, match="eof"):
+        PolymarketUSExecutionClient._declared_positions({"positions": {}, "eof": False})
+
+
+def test_an_absent_eof_is_treated_as_non_terminal() -> None:
+    """`GetUserPositionsResponse` is `total=False`: an absent `eof` is
+    UNKNOWN, not `True`. Treating "absent" as "complete" is exactly the R-4
+    defect, so absence must refuse exactly like an explicit `False`."""
+    with pytest.raises(ExecutionReportMappingError, match="eof"):
+        PolymarketUSExecutionClient._declared_positions({"positions": {}})
+
+
+def test_a_terminal_page_reconciles_normally() -> None:
+    """Non-vacuity: the increment must not refuse EVERY page -- only
+    non-terminal ones. `eof: True` with real positions passes through."""
+    positions = {"some-slug": {"netPosition": "1"}}
+    assert (
+        PolymarketUSExecutionClient._declared_positions({"positions": positions, "eof": True})
+        == positions
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -701,6 +762,7 @@ async def test_a_position_matching_a_durable_fill_record_is_priced_from_it(
     rig.client.record_fill(_record(rig, qty=RECORDED_QUANTITY, cost=RECORDED_COST))
     rig.read._payloads[PORTFOLIO_POSITIONS_PATH] = {
         "positions": {_slug(rig.instrument): _position(_slug(rig.instrument))},
+        "eof": True,
     }
 
     mass_status = await rig.client.generate_mass_status()
@@ -731,6 +793,7 @@ async def test_two_venue_orders_average_by_TOTAL_cost_not_by_the_first_record(
     rig.client.record_fill(_record(rig, order="V-OPEN-2", qty=Decimal(3), cost=Decimal("1.20")))
     rig.read._payloads[PORTFOLIO_POSITIONS_PATH] = {
         "positions": {_slug(rig.instrument): _position(_slug(rig.instrument))},
+        "eof": True,
     }
 
     mass_status = await rig.client.generate_mass_status()
@@ -758,6 +821,7 @@ async def test_a_rewritten_record_is_a_cumulative_update_not_a_second_fill(
     rig.client.record_fill(_record(rig, qty=Decimal(4), cost=Decimal("1.50")))
     rig.read._payloads[PORTFOLIO_POSITIONS_PATH] = {
         "positions": {_slug(rig.instrument): _position(_slug(rig.instrument))},
+        "eof": True,
     }
 
     assert len(rig.client.fill_records_for(rig.instrument.id)) == 1
@@ -782,6 +846,7 @@ async def test_a_sell_record_nets_against_the_long_records(tmp_path: Path) -> No
     )
     rig.read._payloads[PORTFOLIO_POSITIONS_PATH] = {
         "positions": {_slug(rig.instrument): _position(_slug(rig.instrument), net="3")},
+        "eof": True,
     }
 
     mass_status = await rig.client.generate_mass_status()
@@ -806,6 +871,7 @@ async def test_a_position_whose_size_exceeds_the_durable_record_is_still_forward
     rig.client.record_fill(_record(rig, qty=Decimal(1), cost=RECORDED_OPEN_PRICE))
     rig.read._payloads[PORTFOLIO_POSITIONS_PATH] = {
         "positions": {_slug(rig.instrument): _position(_slug(rig.instrument))},
+        "eof": True,
     }
 
     mass_status = await rig.client.generate_mass_status()
@@ -1383,6 +1449,72 @@ async def test_a_latched_refusal_persists_across_a_reconnect_after_the_condition
         "a resolved condition must not erase a refusal that already fired"
     )
     await rig.client._disconnect()
+
+
+# ---------------------------------------------------------------------------
+# EXEC SPINE W, risk 2 -- a failed `_connect` must not exit `EXIT_OK` silently
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_a_failed_connect_is_observable_and_does_not_exit_zero(tmp_path: Path) -> None:
+    """The exact chain risk 2 names, driven for real through the NATIVE
+    `connect()` scheduler -- not by calling `_connect()` directly.
+
+    `LiveExecutionClient.connect()` (`live/execution_client.py:239-249`)
+    schedules `_connect()` as a task with `actions=lambda:
+    self._set_connected(True)`. Its own `_on_task_completed`
+    (`:204-232`) retrieves `task.exception()`, LOGS it, and returns WITHOUT
+    calling `actions` when it is not `None` -- so `_set_connected(True)` never
+    runs, and the task itself completes normally as far as the event loop is
+    concerned. Nothing re-raises. Absent the fault latch this client's
+    `_connect` now wraps, that is a completely silent failure: `is_connected`
+    stays `False`, but nothing else on this client, and nothing in
+    `breezy-trade`, would ever know why -- see
+    `test_a_latched_execution_fault_is_reported_as_a_runtime_failure` in
+    `tests/unit/test_trade_cli.py` for the other half of this chain.
+    """
+
+    def _raising_opener() -> Any:
+        raise PermissionError("the state store directory is not writable")
+
+    rig = _build_rig(tmp_path, store_opener=_raising_opener)
+    rig.client.start()  # drive the FSM to RUNNING, exactly as the kernel does
+    assert fatal_exec_fault() is None
+
+    rig.client.connect()
+    tasks = list(rig.client._tasks)
+    assert len(tasks) == 1, "connect() must schedule exactly one task"
+
+    done, pending = await asyncio.wait(tasks, timeout=5.0)
+    assert pending == set()
+    assert done == set(tasks), "the task must complete, not hang"
+
+    # The defect this test pins: the task completing did NOT mean it succeeded.
+    assert rig.client.is_connected is False
+
+    fault = fatal_exec_fault()
+    assert fault is not None, (
+        "a failed _connect must be observable outside the client -- an "
+        "operator (or breezy-trade) reading only `is_connected` cannot tell "
+        "'never started' from 'refused to connect'"
+    )
+    assert fault.component == str(rig.client.id)
+    assert "PermissionError" in fault.reason
+
+
+@pytest.mark.asyncio
+async def test_a_successful_connect_never_latches_an_exec_fault(tmp_path: Path) -> None:
+    """Non-vacuity for the test above: the happy path must not also latch."""
+    rig = _build_rig(tmp_path)
+    rig.client.start()
+
+    rig.client.connect()
+    tasks = list(rig.client._tasks)
+    await asyncio.wait(tasks, timeout=5.0)
+
+    assert rig.client.is_connected is True
+    assert fatal_exec_fault() is None
 
 
 # ---------------------------------------------------------------------------

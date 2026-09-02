@@ -713,23 +713,32 @@ def test_b5_scan_covers_tests_as_well_as_src_and_scripts() -> None:
 
 
 #: The execution-client surface this slice is allowed to contain, as an exact
-#: MAP from path to the class it may define -- never a path allowlist.
+#: MAP from path to ``"ClassName(BaseName)"`` -- never a path allowlist.
 #:
-#: NARROWED BY EXEC_SPINE R-4, and the narrowing is the whole point of the
-#: increment: R-4 IS the live execution client, so a rule reading "no live
-#: execution client exists" could not survive it and stating otherwise would
-#: be a lie about shipped code. What replaces it is strictly more specific --
-#: an equality on (path, class name), so a SECOND client, a client at another
-#: path, or a factory anywhere still fails, and the module that is permitted
-#: is named rather than merely counted.
+#: NARROWED BY EXEC_SPINE R-4, and NARROWED AGAIN BY W. R-4 IS the live
+#: execution client, so a rule reading "no live execution client exists"
+#: could not survive it and stating otherwise would be a lie about shipped
+#: code. W registers that client with a REAL node -- the whole point of the
+#: increment (``docs/plans/EXEC_SPINE_R5_R6_2026-09-02.md`` section 3) -- via
+#: exactly one ``LiveExecClientFactory`` subclass, so the second row below is
+#: a deliberate, reviewed widening, not the "factory anywhere" bypass
+#: ``test_the_execution_client_rule_detects_a_factory_anywhere`` still proves
+#: this rule catches. Each entry stays an equality on (path, class, base), so
+#: a SECOND client or factory, or either at another path, still fails.
 #:
 #: Its inertness is not asserted here. It is enforced next door by E0-NOSEND
 #: (``test_execution_egress_firewall_guard.py``), which refuses an ``await``
 #: inside any of the six order coroutines under ``exec/`` -- the mechanical
-#: form of "no order may become sendable".
+#: form of "no order may become sendable" -- and by N2's own exact-set pin,
+#: which the factory's ``LiveExecClientFactory`` base also trips (E2).
 PERMITTED_EXECUTION_CLIENTS: Mapping[str, str] = MappingProxyType(
     {
-        "src/breezy/adapters/polymarket_us/exec/client.py": "PolymarketUSExecutionClient",
+        "src/breezy/adapters/polymarket_us/exec/client.py": (
+            "PolymarketUSExecutionClient(LiveExecutionClient)"
+        ),
+        "src/breezy/adapters/polymarket_us/factories.py": (
+            "PolymarketUSLiveExecClientFactory(LiveExecClientFactory)"
+        ),
     },
 )
 
@@ -765,12 +774,13 @@ def test_the_slice_defines_exactly_the_permitted_execution_clients() -> None:
     )
     for path, details in found.items():
         expected = PERMITTED_EXECUTION_CLIENTS[path]
+        base_name = expected[expected.index("(") + 1 : -1]
         # Sorted, because `ast.walk` is breadth-first and the ORDER of the
         # import and the class definition is not the property under test.
         assert sorted(details) == sorted(
             [
-                f"{expected}(LiveExecutionClient)",
-                "imports LiveExecutionClient",
+                expected,
+                f"imports {base_name}",
             ],
         ), details
 
@@ -790,7 +800,13 @@ def test_the_execution_client_rule_detects_a_second_client() -> None:
 
 
 def test_the_execution_client_rule_detects_a_factory_anywhere() -> None:
-    """Factories stay banned outright -- R-4 wires no client into a node."""
+    """Factories stay banned OUTSIDE the named allowlist entry (EXEC SPINE W).
+
+    The detector itself does not consult `PERMITTED_EXECUTION_CLIENTS` --
+    that mapping is applied only by the live-tree scan above -- so this proof
+    is unaffected by W's widening: a factory planted at any OTHER path (as
+    here) is still caught.
+    """
     source = (
         "from nautilus_trader.live.factories import LiveExecClientFactory\n"
         "\n"

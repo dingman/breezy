@@ -1,23 +1,27 @@
 """The `breezy-trade` console entrypoint: the Breezy trading process.
 
-EXEC SPINE R-2. A FOURTH process alongside `breezy` (weather ingestion),
-`breezy-quote-tape` (venue tape recorder) and `breezy-quote-tape-preflight`,
-for the reason each of those is separate: different configuration
-requirements, different failure consequences. The weather collector must start
-on a host with no venue configuration; this one must refuse to start without
-venue configuration AND without a trading identity of its own
-(``BREEZY_TRADE_TRADER_ID``, no default -- see
-``breezy.runtime.settings.TRADE_TRADER_ID_VAR``).
+EXEC SPINE R-2 (process shell) / W (execution client wiring). A FOURTH process
+alongside `breezy` (weather ingestion), `breezy-quote-tape` (venue tape
+recorder) and `breezy-quote-tape-preflight`, for the reason each of those is
+separate: different configuration requirements, different failure
+consequences. The weather collector must start on a host with no venue
+configuration; this one must refuse to start without venue configuration AND
+without a trading identity of its own (``BREEZY_TRADE_TRADER_ID``, no default
+-- see ``breezy.runtime.settings.TRADE_TRADER_ID_VAR``).
 
-WHAT THIS PROCESS CANNOT DO, IN THIS INCREMENT
-----------------------------------------------
-It cannot submit an order. Not "does not"; cannot. There is no execution
-client, no execution-client factory registration, no strategy and no
-execution algorithm anywhere on this path, and
-:func:`breezy.runtime.node_config.build_trade_node_config` states all three as
-empty literals. A later increment adds the execution client under its own
-review; until then this module is a process SHELL: it starts, reaches
-``RUNNING``, and stops cleanly.
+WHAT THIS PROCESS CANNOT DO, STILL
+-----------------------------------
+It cannot submit an order. Not "does not"; cannot. EXEC SPINE W registers a
+real execution-client factory (``PolymarketUSLiveExecClientFactory``) so the
+process now RECONCILES the venue account and REFUSES every order -- but no
+strategy and no execution algorithm exist anywhere on this path, and
+:func:`breezy.runtime.node_config.build_trade_node_config` states both as
+empty literals. The execution client's own cage --
+``PolymarketUSExecutionClient._submit_order``/``_cancel_order`` carry an
+unconditional denial body, and its other four lifecycle coroutines raise -- is
+unchanged by W. This module is still a process SHELL in the sense that
+matters: it starts, reconciles, refuses, reaches ``RUNNING``, and stops
+cleanly.
 
 That is not a small thing to have. The repo's standing failure mode is a green
 suite over a deployment that never started, and every subsequent increment
@@ -28,8 +32,8 @@ the process shell.** ``TradingNode``/``NautilusKernel`` build the engines, own
 start and stop, and install SIGTERM/SIGINT/SIGABRT handlers for every
 non-BACKTEST environment (``system/kernel.py:558-572``). This module installs
 none of its own and authors no process machinery. It loads settings, builds
-one config, registers ONE read-only data-client factory, and translates the
-outcome into an exit code.
+one config, registers the read-only data-client factory and the execution-
+client factory, and translates the outcome into an exit code.
 
 The exit contract matches ``breezy.runtime.quote_tape_cli``:
 
@@ -39,20 +43,25 @@ Outcome                      Code  Example
 Clean shutdown                  0  SIGTERM -> graceful stop
 Configuration / environment     2  ``BREEZY_TRADE_TRADER_ID`` unset,
                                    ``POLYMARKET_US_USER_AGENT`` unset,
+                                   ``POLYMARKET_US_ACCOUNT_NUMBER`` unset,
                                    malformed trader id, unreadable key file
 Runtime failure                 1  the node raised while building or running,
                                    OR the run ended behind a LATCHED fatal
-                                   market-data fault
+                                   market-data fault, OR the run ended behind a
+                                   LATCHED fatal execution-client fault (a
+                                   failed ``_connect`` -- EXEC SPINE risk 2)
 ===========================  ====  ==========================================
 
 The last row is the one that needs stating. ``TradingNode.run()`` returns
 ``None`` (``live/node.py:283-302``) and the kernel keeps no record of WHY it
-stopped, so a node that shut itself down after losing its market-data feed
-returns exactly like one stopped by an operator SIGTERM. For a trading process
-that difference is larger than it is for a recorder: a trader running blind is
-a trader whose next decision is made on stale prices. The process-scoped latch
-written by the data client at the instant it requests the native shutdown is
-where that one bit survives, and this module is where it becomes the answer to
+stopped, so a node that shut itself down after losing its market-data feed, or
+whose execution client never finished connecting, returns exactly like one
+stopped by an operator SIGTERM. For a trading process that difference is
+larger than it is for a recorder: a trader running blind, or one that never
+reconciled, is a trader whose next decision is made on stale or absent state.
+The process-scoped latches written by the data client and the execution
+client at the instant each detects its own unrecoverable fault are where that
+one bit survives, and this module is where it becomes the answer to
 ``systemctl status``.
 """
 
@@ -66,10 +75,16 @@ from typing import Protocol, TextIO
 from nautilus_trader.config import TradingNodeConfig
 from nautilus_trader.live.node import TradingNode
 
+from breezy.adapters.polymarket_us.exec_fault import (
+    clear_fatal_exec_fault,
+    fatal_exec_fault,
+)
 from breezy.adapters.polymarket_us.factories import (
     POLYMARKET_US_CLIENT_NAME,
     PolymarketUSLiveDataClientFactory,
+    PolymarketUSLiveExecClientFactory,
     config_from_env,
+    exec_config_from_env,
 )
 from breezy.adapters.polymarket_us.feed_fault import (
     clear_fatal_feed_fault,
@@ -100,12 +115,17 @@ _CONFIG_ERRORS: tuple[type[BaseException], ...] = (
 class Node(Protocol):
     """The `TradingNode` surface this module drives.
 
-    Deliberately does NOT declare ``add_exec_client_factory``. The protocol is
-    the shape of what this entrypoint is allowed to touch, and in this
-    increment that shape has no execution surface at all.
+    EXEC SPINE W adds ``add_exec_client_factory``: the trading process now
+    registers exactly one execution-client factory, alongside the read-only
+    data client. That is still not an order path -- ``strategies=[]`` and
+    ``exec_algorithms=[]`` stay pinned in ``build_trade_node_config``, so
+    nothing calls ``submit_order`` -- it is the client that RECONCILES and
+    REFUSES.
     """
 
     def add_data_client_factory(self, name: str, factory: type) -> None: ...
+
+    def add_exec_client_factory(self, name: str, factory: type) -> None: ...
 
     def build(self) -> None: ...
 
@@ -127,10 +147,34 @@ def _report(stderr: TextIO, prefix: str, exc: BaseException, *, expected: bool) 
 def _exit_code_for_completed_run(stderr: TextIO) -> int:
     """Translate a stopped node into an exit status the supervisor can read.
 
-    A ``KeyboardInterrupt`` is routed through here too: a fatal feed fault
-    followed by a Ctrl-C is still a failed run, and reporting the interrupt
-    would hide the cause.
+    A ``KeyboardInterrupt`` is routed through here too: a fatal fault followed
+    by a Ctrl-C is still a failed run, and reporting the interrupt would hide
+    the cause.
+
+    The execution fault is checked FIRST. Without this check, EXEC SPINE risk
+    2 is real: a failed ``_connect`` (a durability failure, or -- as measured
+    live against the venue -- an account-balance read returning 500/503) is
+    swallowed by ``LiveExecutionClient``'s own task-completion handler
+    (``nautilus_trader/live/execution_client.py:212-226``), which logs the
+    exception and simply skips marking the client connected. Nothing
+    downstream re-raises it, ``_await_engines_connected``
+    (``nautilus_trader/system/kernel.py:1310-1316``) only WARNS on the
+    resulting timeout, and the node stops as if nothing had gone wrong. Absent
+    this check the process would exit ``EXIT_OK`` having never reconciled and
+    never traded, with a supervisor reading success.
     """
+    exec_fault = fatal_exec_fault()
+    if exec_fault is not None:
+        print(
+            f"breezy-trade: FATAL execution-client fault in {exec_fault.component}: "
+            f"{exec_fault.reason}. The trading process shut down.",
+            file=stderr,
+        )
+        logger.error(
+            "fatal execution-client fault in %s: %s", exec_fault.component, exec_fault.reason
+        )
+        return EXIT_RUNTIME_ERROR
+
     fault = fatal_feed_fault()
     if fault is None:
         return EXIT_OK
@@ -147,20 +191,27 @@ def _exit_code_for_completed_run(stderr: TextIO) -> int:
 def _run_node(config: TradingNodeConfig, node_factory: NodeFactory, stderr: TextIO) -> int:
     """Build, run and ALWAYS dispose the node. Never raises.
 
-    ``add_data_client_factory`` takes the registration NAME and the factory
-    CLASS (``live/node.py:230``), and that name must equal the key used in
-    ``TradingNodeConfig.data_clients`` (``live/node_builder.py:163,177``) --
-    otherwise the builder resolves nothing, logs an error nobody reads, and
-    the process runs happily with no market data at all.
+    ``add_data_client_factory``/``add_exec_client_factory`` take the
+    registration NAME and the factory CLASS (``live/node.py:230``, and the
+    execution equivalent), and that name must equal the key used in
+    ``TradingNodeConfig.data_clients``/``exec_clients``
+    (``live/node_builder.py:163,177``, ``:201-246``) -- otherwise the builder
+    resolves nothing, logs an error nobody reads, and the process runs happily
+    with no market data, or no execution client, at all.
 
-    Exactly ONE factory is registered here, and it is the read-only data
-    client. There is no execution-client registration in this increment.
+    Exactly TWO factories are registered here: the read-only data client, and
+    -- as of EXEC SPINE W -- the reconciling, order-refusing execution client.
+    Neither registration is an order path: see the ``Node`` protocol's
+    docstring.
     """
     node: Node | None = None
     try:
         node = node_factory(config)
         node.add_data_client_factory(
             POLYMARKET_US_CLIENT_NAME, PolymarketUSLiveDataClientFactory
+        )
+        node.add_exec_client_factory(
+            POLYMARKET_US_CLIENT_NAME, PolymarketUSLiveExecClientFactory
         )
         node.build()
         node.run()
@@ -209,11 +260,13 @@ def run(
     # THIS run's fault, never an inherited one. The latch is process-scoped
     # and a stale value would fail a healthy run.
     clear_fatal_feed_fault()
+    clear_fatal_exec_fault()
     try:
         try:
             settings = load_trade_settings(env)
             data_client_config = config_from_env(env)
-            config = build_trade_node_config(settings, data_client_config)
+            exec_client_config = exec_config_from_env(env)
+            config = build_trade_node_config(settings, data_client_config, exec_client_config)
         except _CONFIG_ERRORS as exc:
             _report(out, "configuration error", exc, expected=True)
             return EXIT_CONFIG_ERROR

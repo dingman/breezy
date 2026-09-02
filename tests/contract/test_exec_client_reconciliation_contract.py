@@ -56,12 +56,19 @@ from breezy.adapters.polymarket_us.exec.endpoints import (
     PORTFOLIO_POSITIONS_PATH,
 )
 from breezy.adapters.polymarket_us.fees import polymarket_us_fee
+from breezy.adapters.polymarket_us.safety import MAX_ORDER_NOTIONAL_USD_ENV_VAR
 from breezy.adapters.polymarket_us.symbology import POLYMARKET_US_VENUE
+from breezy.runtime.node_config import build_trade_node_config
 from breezy.runtime.sqlite_store import SqliteStateStore
 from tests.unit.polymarket_us_exec_shapes import (
     TS_EVENT_TEXT,
     build_instrument,
     build_position,
+)
+from tests.unit.test_runtime_trade_node_config import (
+    make_data_client_config,
+    make_exec_client_config,
+    make_trade_settings,
 )
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
@@ -96,7 +103,7 @@ async def _flat_account_read(path: str) -> Mapping[str, Any]:
             ],
         }
     if path == PORTFOLIO_POSITIONS_PATH:
-        return {"positions": {}}
+        return {"positions": {}, "eof": True}
     raise AssertionError(f"unexpected private read of {path!r}")
 
 
@@ -108,7 +115,7 @@ def _position_read(slug: str, *, bought: str = "4", sold: str = "0") -> Any:
 
     async def _read(path: str) -> Mapping[str, Any]:
         if path == PORTFOLIO_POSITIONS_PATH:
-            return {"positions": {slug: position}}
+            return {"positions": {slug: position}, "eof": True}
         return await _flat_account_read(path)
 
     return _read
@@ -121,19 +128,38 @@ async def _broken_read(path: str) -> Mapping[str, Any]:
     raise RuntimeError("the venue position read failed")
 
 
-#: The engine configuration every test here builds. Held as a module constant
-#: so the settlement pin below reads the SAME object the engine is built from.
-#:
-#: ``position_check_interval_secs=None`` is a SAFETY condition, not tidiness --
-#: see ``test_the_settlement_landmine_stays_disarmed_only_while_the_position_
-#: check_is_off``.
-ENGINE_CONFIG: Final[LiveExecEngineConfig] = LiveExecEngineConfig(
-    # R-2's pins: the in-flight and open/position background checks are
-    # disabled so this contract does not arm timers it never awaits.
-    inflight_check_interval_ms=0,
-    open_check_interval_secs=None,
-    position_check_interval_secs=None,
-)
+#: Test-local stand-in for the operator's per-order USD ceiling
+#: (`BREEZY_MAX_ORDER_NOTIONAL_USD`). `build_trade_node_config` fails closed
+#: without it (see `_engine_config` below) -- not a production risk setting,
+#: and not either operator-reserved control (max daily budget, max per
+#: position), neither of which is read, defaulted or inferred on this path.
+OPERATOR_ORDER_CEILING_USD = "25"
+
+
+@pytest.fixture(autouse=True)
+def _operator_order_ceiling(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv(MAX_ORDER_NOTIONAL_USD_ENV_VAR, OPERATOR_ORDER_CEILING_USD)
+
+
+def _engine_config() -> LiveExecEngineConfig:
+    """The REAL shipped config -- EXEC SPINE risk 13, closed.
+
+    R-4's original pin built its OWN ``LiveExecEngineConfig`` by hand here,
+    independently of ``build_trade_node_config``. A pin that asserts over a
+    config nobody ships stays green through an edit that adds
+    ``position_check_interval_secs`` to the real builder, re-arming the
+    settlement-zero landmine
+    (``test_the_settlement_landmine_stays_disarmed_only_while_the_position_
+    check_is_off`` below) with the old pin still passing. Pulling it from the
+    actual output of :func:`build_trade_node_config` is what closes that gap:
+    a later change to the shipped config is what this function returns,
+    not a parallel copy of today's values.
+    """
+    config = build_trade_node_config(
+        make_trade_settings(), make_data_client_config(), make_exec_client_config()
+    )
+    assert config.exec_engine is not None
+    return config.exec_engine
 
 
 def test_the_settlement_landmine_stays_disarmed_only_while_the_position_check_is_off() -> None:
@@ -153,7 +179,7 @@ def test_the_settlement_landmine_stays_disarmed_only_while_the_position_check_is
     no venue involvement. So the disarm is a two-part condition and both parts
     are pinned: the client (unit suite) and the engine (here).
     """
-    assert ENGINE_CONFIG.position_check_interval_secs is None
+    assert _engine_config().position_check_interval_secs is None
     loop = asyncio.new_event_loop()
     try:
         engine, _, _, _, _ = _build_engine(loop)
@@ -175,7 +201,7 @@ def _build_engine(
         msgbus=msgbus,
         cache=cache,
         clock=clock,
-        config=ENGINE_CONFIG,
+        config=_engine_config(),
     )
     return engine, cache, msgbus, clock, portfolio
 
@@ -267,6 +293,49 @@ async def test_a_failed_venue_read_still_reconciles_and_latches_a_refusal(
 
     assert await engine.reconcile_execution_state(timeout_secs=5.0) is True
     assert client.trading_refusals != ()
+    await client._disconnect()
+
+
+async def _truncated_positions_read(path: str) -> Mapping[str, Any]:
+    """A venue that never sets `eof: true` -- page 1 forever, through the real
+    engine. R-4P-1: this must latch a refusal, never reconcile as if page 1
+    were the whole book."""
+    if path == ACCOUNT_BALANCES_PATH:
+        return await _flat_account_read(path)
+    if path == PORTFOLIO_POSITIONS_PATH:
+        return {"positions": {}, "nextCursor": "some-opaque-cursor"}
+    raise AssertionError(f"unexpected private read of {path!r}")
+
+
+@pytest.mark.asyncio
+async def test_a_non_terminal_positions_page_still_reconciles_but_latches_a_refusal(
+    tmp_path: Path,
+) -> None:
+    """R-4P-1, end to end. The defect this closes: R-4 as originally landed
+    read only `payload["positions"]` and never inspected `eof`, so a real
+    multi-page account would reconcile page 1 and call it the complete book
+    -- an under-report every risk cap sizes off. The interim fix converts
+    that silent truncation into a loud, latched refusal (never a raised
+    exception that fails reconciliation, and never cursor-following
+    pagination -- R-4P-2 is deliberately deferred).
+    """
+    loop = asyncio.get_running_loop()
+    engine, cache, msgbus, clock, _portfolio = _build_engine(loop)
+    client = _build_client(
+        loop,
+        tmp_path,
+        read=_truncated_positions_read,
+        cache=cache,
+        msgbus=msgbus,
+        clock=clock,
+    )
+    engine.register_client(client)
+    await client._connect()
+
+    assert await engine.reconcile_execution_state(timeout_secs=5.0) is True
+    assert client.trading_refusals != ()
+    assert any("eof" in reason for reason in client.trading_refusals), client.trading_refusals
+    assert cache.positions_open() == []
     await client._disconnect()
 
 
@@ -410,7 +479,7 @@ class _SwitchableRead:
                 position["netPosition"] = "0"
                 position["qtyBought"] = "4"
                 position["qtySold"] = "4"
-            return {"positions": {self._slug: position}}
+            return {"positions": {self._slug: position}, "eof": True}
         raise AssertionError(f"unexpected private read of {path!r}")
 
 

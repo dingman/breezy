@@ -511,18 +511,31 @@ CAGE_RULE_PINS: tuple[RulePin, ...] = (
         attr="PERMITTED_EXECUTION_CLIENTS",
         expected=MappingProxyType(
             {
-                "src/breezy/adapters/polymarket_us/exec/client.py": ("PolymarketUSExecutionClient"),
+                "src/breezy/adapters/polymarket_us/exec/client.py": (
+                    "PolymarketUSExecutionClient(LiveExecutionClient)"
+                ),
+                "src/breezy/adapters/polymarket_us/factories.py": (
+                    "PolymarketUSLiveExecClientFactory(LiveExecClientFactory)"
+                ),
             }
         ),
         widened=MappingProxyType(
             {
-                "src/breezy/adapters/polymarket_us/exec/client.py": ("PolymarketUSExecutionClient"),
-                "src/breezy/runtime/shadow.py": "ShadowExecutionClient",
+                "src/breezy/adapters/polymarket_us/exec/client.py": (
+                    "PolymarketUSExecutionClient(LiveExecutionClient)"
+                ),
+                "src/breezy/adapters/polymarket_us/factories.py": (
+                    "PolymarketUSLiveExecClientFactory(LiveExecClientFactory)"
+                ),
+                "src/breezy/runtime/shadow.py": "ShadowExecutionClient(LiveExecutionClient)",
             }
         ),
         narrowed=MappingProxyType({}),
         why="R-4 narrowed 'this slice defines NO execution client' into an "
-        "equality on (path, class). The widened neighbour is a second client "
+        "equality on (path, class, base). EXEC SPINE W widened it again to "
+        "add the ONE permitted `LiveExecClientFactory` subclass that wires "
+        "R-4's client into a real node (docs/plans/EXEC_SPINE_R5_R6_"
+        "2026-09-02.md section 3). The widened neighbour is a second client "
         "at another path, which is the shape a bypass takes",
     ),
     RulePin(

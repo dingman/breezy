@@ -304,6 +304,34 @@ def _node_config_calls() -> list[ast.Call]:
     ]
 
 
+def _node_config_call_by_builder() -> dict[str, ast.Call]:
+    """Map each top-level builder function name to ITS `TradingNodeConfig(...)` call.
+
+    Keyed by function name rather than by line order: robust to the three
+    builders being reordered in the module, which mere `lineno` sorting is not.
+    """
+    tree = ast.parse(NODE_CONFIG_SOURCE.read_text(encoding="utf-8"))
+    calls: dict[str, ast.Call] = {}
+    for node in tree.body:
+        if not isinstance(node, ast.FunctionDef):
+            continue
+        for inner in ast.walk(node):
+            if (
+                isinstance(inner, ast.Call)
+                and isinstance(inner.func, ast.Name)
+                and inner.func.id == "TradingNodeConfig"
+            ):
+                calls[node.name] = inner
+    return calls
+
+
+def _keyword_value(call: ast.Call, name: str) -> ast.expr | None:
+    for kw in call.keywords:
+        if kw.arg == name:
+            return kw.value
+    return None
+
+
 def _empty_literal_keywords(call: ast.Call) -> set[str]:
     """Keyword names in `call` bound to an empty list or dict literal."""
     return {
@@ -346,10 +374,50 @@ class TestTheReadOnlyCageIsDeclaredNotDefaulted:
         # was checked.
         assert len(_node_config_calls()) == 3
 
-    @pytest.mark.parametrize("field", ["exec_clients", "strategies", "exec_algorithms"])
+    @pytest.mark.parametrize("field", ["strategies", "exec_algorithms"])
     def test_every_node_config_declares_the_field_empty(self, field: str) -> None:
+        """Unaffected by EXEC SPINE W: nothing anywhere in this module
+        originates an order. `exec_clients` is checked separately below,
+        because W deliberately narrows it for exactly one of the three roles.
+        """
         for call in _node_config_calls():
             assert field in _empty_literal_keywords(call), (
                 f"{NODE_CONFIG_SOURCE.name}:{call.lineno}: TradingNodeConfig(...) does not "
                 f"declare `{field}` as an empty literal"
             )
+
+    @pytest.mark.parametrize("builder", ["build_node_config", "build_quote_tape_node_config"])
+    def test_the_two_read_only_roles_still_declare_exec_clients_empty(self, builder: str) -> None:
+        """The weather collector and the quote-tape recorder: UNCHANGED by W.
+        Neither has any venue-facing execution transport, and neither should
+        ever grow one -- collapsing either into the trading role's
+        requirement is the exact regression the three-role split prevents.
+        """
+        call = _node_config_call_by_builder()[builder]
+        assert "exec_clients" in _empty_literal_keywords(call), (
+            f"{NODE_CONFIG_SOURCE.name}:{call.lineno}: {builder}'s TradingNodeConfig(...) "
+            "does not declare `exec_clients` as an empty literal"
+        )
+
+    def test_the_trade_node_config_declares_exec_clients_as_a_literal_dict_not_a_default(
+        self,
+    ) -> None:
+        """EXEC SPINE W's own widening of this cage.
+
+        `exec_clients` is no longer EMPTY for the trading role -- that is the
+        entire point of the increment -- but "declared, not defaulted" must
+        still hold: the keyword must be a literal ``dict`` at the call site,
+        never an omitted keyword left to the Nautilus default and never a
+        bare name whose shape a reviewer cannot see without following it.
+        Exactly one entry, matching the plan's "exactly one exec client"
+        clause -- see `tests/unit/test_runtime_trade_node_config.py::
+        test_the_trade_node_config_registers_exactly_one_exec_client` for the
+        behavioural half of this same property.
+        """
+        call = _node_config_call_by_builder()["build_trade_node_config"]
+        value = _keyword_value(call, "exec_clients")
+        assert isinstance(value, ast.Dict), (
+            f"{NODE_CONFIG_SOURCE.name}:{call.lineno}: build_trade_node_config's "
+            "TradingNodeConfig(...) does not declare `exec_clients` as a literal dict"
+        )
+        assert len(value.keys) == 1

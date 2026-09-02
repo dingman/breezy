@@ -93,6 +93,7 @@ from breezy.runtime.settings import (
     BreezyTradeSettings,
     PolymarketUSQuoteTapeSettings,
 )
+from breezy.runtime.sqlite_store import SqliteStateStore
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
     # Import-time only. At RUNTIME the adapter package must be reached from
@@ -103,7 +104,10 @@ if TYPE_CHECKING:  # pragma: no cover - typing only
     # the cycle and raises `ImportError: partially initialized module`.
     # Measured, not hypothesised. Keeping it under TYPE_CHECKING means mypy
     # still checks the signature with the real type.
-    from breezy.adapters.polymarket_us.config import PolymarketUSDataClientConfig
+    from breezy.adapters.polymarket_us.config import (
+        PolymarketUSDataClientConfig,
+        PolymarketUSExecClientConfig,
+    )
 
 #: The ingest Actor's ``"pkg.mod:Class"`` colon path.
 #:
@@ -550,8 +554,9 @@ def build_trade_risk_engine_config(
 def build_trade_node_config(
     settings: BreezyTradeSettings,
     data_client_config: PolymarketUSDataClientConfig,
+    exec_client_config: PolymarketUSExecClientConfig,
 ) -> TradingNodeConfig:
-    """Return the `TradingNodeConfig` for the **trading** process (EXEC SPINE R-2).
+    """Return the `TradingNodeConfig` for the **trading** process (EXEC SPINE W).
 
     A THIRD role, and a third function, for the reason the first two are
     separate: the weather collector must start on a host with no venue
@@ -567,21 +572,46 @@ def build_trade_node_config(
     authors no process machinery. It maps settings onto native config objects,
     and makes exactly one non-default decision (the in-flight pin below).
 
-    **What this increment CANNOT do: submit an order.** That is a structural
-    property of the returned config, not a convention:
+    **EXEC SPINE W wires the execution client in, and it is STILL not able to
+    submit an order.** R-4's ``PolymarketUSExecutionClient`` had ZERO
+    construction sites until this increment: ``PolymarketUSLiveExecClientFactory``
+    (``adapters/polymarket_us/factories.py``) is registered against this exact
+    ``exec_clients`` key by ``breezy.runtime.trade_cli``, so the client that
+    was previously only exercised by fixtures is now CONSTRUCTED by the node.
+    That de-inerts every Nautilus risk cap for the first time in the running
+    process (``risk/engine.pyx:684-689`` returns ``True`` -- order allowed --
+    while no ``AccountState`` is cached). What remains a structural property
+    of the returned config, not a convention, is that nothing can ORIGINATE an
+    order:
 
-    * ``exec_clients={}`` -- no venue-facing execution transport exists;
     * ``strategies=[]`` -- nothing that calls ``submit_order``
       (``trading/strategy.pyx``);
-    * ``exec_algorithms=[]`` -- the third route, easy to misread as data-side
+    * ``exec_algorithms=[]`` -- the second route, easy to misread as data-side
       because ``ExecAlgorithm`` subclasses ``Actor``, but it carries
       ``submit_order``/``modify_order``/``cancel_order`` in its own right
       (``execution/algorithm.pyx``) and the kernel instantiates every entry
       unconditionally.
 
-    All three are stated as empty literals rather than defaulted, so the
-    intent is visible in review and checkable from source --
-    ``TestTheReadOnlyCageIsDeclaredNotDefaulted`` reads this call.
+    Both are stated as empty literals rather than defaulted, so the intent is
+    visible in review and checkable from source --
+    ``TestTheReadOnlyCageIsDeclaredNotDefaulted`` reads this call. The
+    execution client's OWN cage -- ``_submit_order`` and ``_cancel_order``
+    carry an unconditional denial body, and the other four lifecycle
+    coroutines raise -- is R-4's, unchanged by W (``exec/client.py``).
+
+    **``exec_client_config.state_store_opener`` is injected HERE, not earlier.**
+    ``breezy.adapters.polymarket_us.factories`` is an ``adapters`` package and
+    may not import :class:`~breezy.runtime.sqlite_store.SqliteStateStore`
+    (``runtime`` sits ABOVE ``adapters`` in the import-linter layer contract),
+    so :func:`~breezy.adapters.polymarket_us.factories.exec_config_from_env`
+    always leaves this field ``None``. This function is on the ``runtime``
+    side of that boundary, so it is where the real opener is built and
+    threaded through via ``msgspec.structs.replace`` -- the identical pattern
+    :func:`build_quote_tape_node_config` already uses for
+    ``recorder_instance_id``. The opener is never CALLED here: the store is
+    thread-confined (``sqlite_store.py:120,128-135``) and must be constructed
+    on the execution engine's own event loop, inside ``_connect`` -- see
+    ``exec/client.py``'s module docstring.
 
     **``inflight_check_interval_ms=0`` -- READ THIS BEFORE CHANGING IT.**
 
@@ -640,6 +670,20 @@ def build_trade_node_config(
     # the TYPE_CHECKING block at the top of this module.
     from breezy.adapters.polymarket_us.factories import POLYMARKET_US_CLIENT_NAME
 
+    # `PolymarketUSExecClientConfig.state_store_path` is typed `str | None`
+    # because `None` is only the constructor default that lets
+    # `__post_init__` raise a clear error; that same `__post_init__` already
+    # guarantees a non-empty string by the time an instance exists. Narrowed
+    # here, once, for mypy -- not re-validated.
+    state_store_path = cast(str, exec_client_config.state_store_path)
+
+    # See the docstring: the store is opened only inside `_connect`, on the
+    # execution engine's own loop -- this closure never runs here.
+    exec_client_config = msgspec_replace(
+        exec_client_config,
+        state_store_opener=lambda: SqliteStateStore(state_store_path),
+    )
+
     # `msgspec.Struct` config classes are untyped to mypy (compiled Nautilus
     # surface), so the constructor call is typed as Any at this one boundary.
     config: Any = TradingNodeConfig(
@@ -651,7 +695,7 @@ def build_trade_node_config(
         catalogs=[],
         actors=[],
         data_clients={POLYMARKET_US_CLIENT_NAME: data_client_config},
-        exec_clients={},
+        exec_clients={POLYMARKET_US_CLIENT_NAME: exec_client_config},
         strategies=[],
         exec_algorithms=[],
         exec_engine=LiveExecEngineConfig(inflight_check_interval_ms=0),

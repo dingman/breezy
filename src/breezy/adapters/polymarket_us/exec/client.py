@@ -247,6 +247,7 @@ from breezy.adapters.polymarket_us.exec.reports import (
     parse_account_balances,
     parse_position_status_report,
 )
+from breezy.adapters.polymarket_us.exec_fault import record_fatal_exec_fault
 from breezy.adapters.polymarket_us.fees import polymarket_us_fee
 from breezy.adapters.polymarket_us.parsing import _to_decimal
 from breezy.adapters.polymarket_us.symbology import slug_to_instrument_id
@@ -581,12 +582,39 @@ class PolymarketUSExecutionClient(LiveExecutionClient):
         status is always attributable even if a later step degrades; the store
         is opened HERE so it is constructed on the loop thread that writes it;
         durability is proven by round-trip before anything is written to it.
+
+        **Wrapped in a fault latch, deliberately not a swallow.** Every
+        statement below either raises (a durability failure at
+        :meth:`_open_state_store`) or refuses internally and returns (the
+        instrument wait, the registration wait) -- except
+        :meth:`_publish_account_state`, which has no internal try/except and
+        propagates whatever the injected venue read raises. Left unwrapped,
+        such a failure is swallowed by the NATIVE task-completion handler
+        (``nautilus_trader/live/execution_client.py:212-226``): it logs the
+        exception and simply skips ``_set_connected(True)``, so the task
+        completes normally and ``breezy-trade`` would exit ``EXIT_OK`` having
+        never reconciled (EXEC SPINE risk 2). Recording the fault here, then
+        RE-RAISING unchanged, adds an observable trace without altering the
+        native control flow one bit -- the same "record, then re-raise"
+        idiom :meth:`_open_state_store` already uses for its own durability
+        failure.
         """
-        self._set_account_id(self._issued_account_id)
-        self._open_state_store()
-        await self._wait_for_instruments()
-        await self._publish_account_state()
-        await self._confirm_account_registered()
+        try:
+            self._set_account_id(self._issued_account_id)
+            self._open_state_store()
+            await self._wait_for_instruments()
+            await self._publish_account_state()
+            await self._confirm_account_registered()
+        except BaseException as exc:
+            record_fatal_exec_fault(
+                component=str(self.id),
+                reason=(
+                    f"_connect failed before the client reached a connected "
+                    f"state ({type(exc).__name__}: {exc}); no order can ever "
+                    "be evaluated against a client that never connected"
+                ),
+            )
+            raise
 
     async def _disconnect(self) -> None:
         """Close the durable store. A failing close does not fail the shutdown.
@@ -890,6 +918,22 @@ class PolymarketUSExecutionClient(LiveExecutionClient):
             raise ExecutionReportMappingError(
                 f"the venue position response carries a {type(positions).__name__} "
                 "under 'positions' where an object keyed by market slug was declared"
+            )
+        if payload.get("eof") is not True:
+            # R-4P-1 (interim; R-4P-2 cursor-following pagination is
+            # deliberately deferred). `GetUserPositionsResponse` is
+            # cursor-paginated -- it carries `nextCursor` and `eof` alongside
+            # `positions` -- and this client does not follow a cursor. Page 1
+            # is not the whole book, so treating it as one silently
+            # under-reports exposure to every risk cap that sizes off
+            # `portfolio.net_position`. `eof` is `total=False` on the venue's
+            # own TypedDict, so an ABSENT `eof` is UNKNOWN, never `True` --
+            # only an explicit `eof: true` is a terminal page.
+            raise ExecutionReportMappingError(
+                "the venue position response is not marked eof=true; page 1 "
+                "is not necessarily the whole book and this client does not "
+                "follow a cursor (R-4P-1: refuse rather than silently "
+                "truncate)"
             )
         return positions
 

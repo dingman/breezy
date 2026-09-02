@@ -25,12 +25,18 @@ Three things are pinned that a casual reading would treat as details:
 
 from __future__ import annotations
 
+import tempfile
+from pathlib import Path
+
 import pytest
 from nautilus_trader.common import Environment
 from nautilus_trader.config import TradingNodeConfig
 from nautilus_trader.model.identifiers import TraderId
 
-from breezy.adapters.polymarket_us.config import PolymarketUSDataClientConfig
+from breezy.adapters.polymarket_us.config import (
+    PolymarketUSDataClientConfig,
+    PolymarketUSExecClientConfig,
+)
 from breezy.adapters.polymarket_us.factories import POLYMARKET_US_CLIENT_NAME
 from breezy.adapters.polymarket_us.safety import MAX_ORDER_NOTIONAL_USD_ENV_VAR
 from breezy.runtime.node_config import NodeConfigError, build_trade_node_config
@@ -67,6 +73,21 @@ def make_data_client_config() -> PolymarketUSDataClientConfig:
         instrument_reload_interval_mins=5,
         user_agent="breezy-test/1.0 (+mailto:ops@example.invalid)",
     )
+
+
+def make_exec_client_config(**overrides: object) -> PolymarketUSExecClientConfig:
+    """EXEC SPINE W. ``state_store_opener`` is left unset here on purpose --
+    it is `build_trade_node_config`'s own job to inject it (see that
+    function's docstring), and this helper's callers exist to test exactly
+    that function.
+    """
+    base: dict[str, object] = {
+        "venue": make_data_client_config(),
+        "account_number": "001",
+        "state_store_path": str(Path(tempfile.mkdtemp()) / "exec_state.db"),
+    }
+    base.update(overrides)
+    return PolymarketUSExecClientConfig(**base)  # type: ignore[arg-type]
 
 
 #: Test-local stand-in for the operator's per-order USD ceiling
@@ -147,25 +168,60 @@ class TestTradeSettings:
 
 class TestTradeNodeConfig:
     def test_returns_a_live_trading_node_config(self) -> None:
-        config = build_trade_node_config(make_trade_settings(), make_data_client_config())
+        config = build_trade_node_config(
+            make_trade_settings(), make_data_client_config(), make_exec_client_config()
+        )
 
         assert isinstance(config, TradingNodeConfig)
         assert config.environment == Environment.LIVE
 
     def test_registers_exactly_the_read_only_data_client(self) -> None:
-        config = build_trade_node_config(make_trade_settings(), make_data_client_config())
+        config = build_trade_node_config(
+            make_trade_settings(), make_data_client_config(), make_exec_client_config()
+        )
 
         assert set(config.data_clients) == {POLYMARKET_US_CLIENT_NAME}
 
-    def test_declares_no_execution_client_strategy_or_exec_algorithm(self) -> None:
-        # R-2 cannot submit an order. `exec_clients={}` removes the
-        # venue-facing transport, `strategies=[]` removes the component that
-        # calls `submit_order` (`trading/strategy.pyx`), and
-        # `exec_algorithms=[]` removes the third, easily-missed route
-        # (`execution/algorithm.pyx` carries `submit_order` in its own right).
-        config = build_trade_node_config(make_trade_settings(), make_data_client_config())
+    def test_the_trade_node_config_registers_exactly_one_exec_client(self) -> None:
+        """EXEC SPINE W. R-4's client had ZERO construction sites before this;
+        the key equals `POLYMARKET_US_CLIENT_NAME` because the derived
+        `AccountId` issuer (`exec/client.py:535-537`) is the one every other
+        assumption keys on."""
+        config = build_trade_node_config(
+            make_trade_settings(), make_data_client_config(), make_exec_client_config()
+        )
 
-        assert config.exec_clients == {}
+        assert set(config.exec_clients) == {POLYMARKET_US_CLIENT_NAME}
+
+    def test_the_exec_client_config_state_store_opener_is_injected_here(self) -> None:
+        """`exec_config_from_env` always leaves this `None` -- an `adapters`
+        package may not import `SqliteStateStore` (`runtime` sits ABOVE
+        `adapters`). This function is on the `runtime` side of that boundary
+        and is where the real opener is threaded through, exactly the way
+        `build_quote_tape_node_config` threads `recorder_instance_id`."""
+        exec_config = make_exec_client_config()
+        assert exec_config.state_store_opener is None  # the input is unfilled
+
+        config = build_trade_node_config(
+            make_trade_settings(), make_data_client_config(), exec_config
+        )
+
+        built = config.exec_clients[POLYMARKET_US_CLIENT_NAME]
+        assert built.state_store_opener is not None
+        assert callable(built.state_store_opener)
+
+    def test_the_trade_node_config_still_declares_no_strategies_and_no_exec_algorithms(
+        self,
+    ) -> None:
+        # W wires a client that RECONCILES and REFUSES; it does not make the
+        # node able to ORIGINATE an order. `strategies=[]` removes the
+        # component that calls `submit_order` (`trading/strategy.pyx`), and
+        # `exec_algorithms=[]` removes the second, easily-missed route
+        # (`execution/algorithm.pyx` carries `submit_order` in its own right).
+        config = build_trade_node_config(
+            make_trade_settings(), make_data_client_config(), make_exec_client_config()
+        )
+
         assert config.strategies == []
         assert config.exec_algorithms == []
 
@@ -176,7 +232,9 @@ class TestTradeNodeConfig:
         # `inflight_check_retries` it calls `_resolve_inflight_order`, a
         # FALSE TERMINAL on an order we cannot query by id. Zero removes the
         # whole loop.
-        config = build_trade_node_config(make_trade_settings(), make_data_client_config())
+        config = build_trade_node_config(
+            make_trade_settings(), make_data_client_config(), make_exec_client_config()
+        )
 
         assert config.exec_engine is not None
         assert config.exec_engine.inflight_check_interval_ms == 0
@@ -188,14 +246,18 @@ class TestTradeNodeConfig:
         # asserts the other two are absent too, so the task is never created.
         # If a Nautilus upgrade gives either a default, this fails loudly
         # rather than starting a poller nobody asked for.
-        config = build_trade_node_config(make_trade_settings(), make_data_client_config())
+        config = build_trade_node_config(
+            make_trade_settings(), make_data_client_config(), make_exec_client_config()
+        )
 
         assert config.exec_engine is not None
         assert config.exec_engine.open_check_interval_secs is None
         assert config.exec_engine.position_check_interval_secs is None
 
     def test_uses_no_redis_backed_cache_or_message_bus(self) -> None:
-        config = build_trade_node_config(make_trade_settings(), make_data_client_config())
+        config = build_trade_node_config(
+            make_trade_settings(), make_data_client_config(), make_exec_client_config()
+        )
 
         assert config.cache is not None
         assert config.cache.database is None
@@ -203,7 +265,9 @@ class TestTradeNodeConfig:
         assert config.message_bus is None
 
     def test_declares_no_actors_and_registers_no_data_engine_catalogs(self) -> None:
-        config = build_trade_node_config(make_trade_settings(), make_data_client_config())
+        config = build_trade_node_config(
+            make_trade_settings(), make_data_client_config(), make_exec_client_config()
+        )
 
         assert config.actors == []
         assert config.catalogs == []
@@ -212,13 +276,17 @@ class TestTradeNodeConfig:
         # The recorder streams; the trader does not. A second process writing
         # into the tape root would interleave two runs' feather files under
         # one catalog and make the recorded tape unattributable.
-        config = build_trade_node_config(make_trade_settings(), make_data_client_config())
+        config = build_trade_node_config(
+            make_trade_settings(), make_data_client_config(), make_exec_client_config()
+        )
 
         assert config.streaming is None
 
     def test_trader_id_comes_from_settings(self) -> None:
         config = build_trade_node_config(
-            make_trade_settings(trader_id="BREEZYTRADE-042"), make_data_client_config()
+            make_trade_settings(trader_id="BREEZYTRADE-042"),
+            make_data_client_config(),
+            make_exec_client_config(),
         )
 
         assert config.trader_id == TraderId("BREEZYTRADE-042")
@@ -226,13 +294,39 @@ class TestTradeNodeConfig:
     def test_malformed_trader_id_raises_node_config_error(self) -> None:
         with pytest.raises(NodeConfigError):
             build_trade_node_config(
-                make_trade_settings(trader_id="nope"), make_data_client_config()
+                make_trade_settings(trader_id="nope"),
+                make_data_client_config(),
+                make_exec_client_config(),
             )
 
     def test_log_level_comes_from_settings(self) -> None:
         config = build_trade_node_config(
-            make_trade_settings(log_level="WARNING"), make_data_client_config()
+            make_trade_settings(log_level="WARNING"),
+            make_data_client_config(),
+            make_exec_client_config(),
         )
 
         assert config.logging is not None
         assert config.logging.log_level == "WARNING"
+
+    def test_state_store_path_is_not_narrowed_by_a_bare_assert(self) -> None:
+        """``assert`` is STRIPPED under ``python -O``; a narrowing that relies
+        on it silently vanishes in an optimized interpreter and a ``None``
+        could then flow into ``SqliteStateStore(None)``. Regression for the
+        MEDIUM defect: ``state_store_path`` must be narrowed with ``cast(str,
+        ...)`` (this file's own idiom, used twice elsewhere), never with a
+        bare ``assert ... is not None``.
+        """
+        import ast
+        import inspect
+
+        from breezy.runtime import node_config
+
+        source = inspect.getsource(node_config.build_trade_node_config)
+        tree = ast.parse(source)
+        assert_nodes = [node for node in ast.walk(tree) if isinstance(node, ast.Assert)]
+        assert assert_nodes == [], (
+            "build_trade_node_config must not use a bare `assert` for "
+            "type-narrowing (it is stripped under `python -O`); found: "
+            f"{[ast.dump(node) for node in assert_nodes]}"
+        )

@@ -37,16 +37,18 @@ Breezy policy rather than venue truth.
 
 from __future__ import annotations
 
+from pathlib import Path
 from urllib.parse import urlsplit
 
 import msgspec
-from nautilus_trader.live.config import LiveDataClientConfig
+from nautilus_trader.live.config import LiveDataClientConfig, LiveExecClientConfig
 
 from breezy.adapters.polymarket_us.credentials import (
     PolymarketUSSecretsRefConfig,
     assert_config_type_excludes_secrets,
 )
 from breezy.adapters.polymarket_us.signing import SigningVariant
+from breezy.ingest.gate import StateStoreOpener
 from breezy.registry.sites import SiteRegistry, default_registry
 from breezy.runtime.settings import SettingsError
 
@@ -57,6 +59,7 @@ __all__ = [
     "POLYMARKET_US_ORIGIN_DOMAIN",
     "POLYMARKET_US_WS_BASE_URL",
     "PolymarketUSDataClientConfig",
+    "PolymarketUSExecClientConfig",
     "PolymarketUSMarketDiscoveryConfig",
     "discovery_city_codes_from_registry",
 ]
@@ -453,3 +456,106 @@ def _is_required_field_present(name: str, value: object) -> bool:
 
 
 assert_config_type_excludes_secrets(PolymarketUSDataClientConfig)
+
+
+class PolymarketUSExecClientConfig(LiveExecClientConfig, frozen=True):
+    """Configuration for :class:`PolymarketUSExecutionClient` (EXEC SPINE W).
+
+    Deliberately a THIN wrapper around an embedded
+    :class:`PolymarketUSDataClientConfig` (``venue``) rather than a second,
+    parallel declaration of every origin/discovery/quota field: the exec
+    client needs the SAME venue facts (API origin, user agent, signing
+    variant, market discovery) the data client already validates, and
+    re-deriving them here would be a second, competing policy for the same
+    values (the exact failure mode ``config_from_env``'s docstring warns
+    against). ``venue.__post_init__`` already ran when ``venue`` itself was
+    constructed, so nothing here re-validates it.
+
+    Parameters
+    ----------
+    venue : PolymarketUSDataClientConfig
+        The shared venue facts: origins, credentials reference, user agent,
+        signing variant and market discovery. REQUIRED -- the ``None``
+        default exists only so ``__post_init__`` can raise a clear
+        :class:`~breezy.runtime.settings.SettingsError` rather than a bare
+        ``TypeError`` when it is omitted.
+    account_number : str | None
+        The operator's Polymarket.us account identifier. Becomes the
+        ``AccountId`` suffix (``exec/client.py:535-537``). REQUIRED, with NO
+        default and NO derivation from anything else -- OQ-I
+        (``docs/plans/EXEC_SPINE_R5_R6_2026-09-02.md`` section 3, increment W,
+        item 5). Its source is the operator's venue configuration, read once
+        by :func:`breezy.adapters.polymarket_us.factories.exec_config_from_env`
+        from :data:`breezy.adapters.polymarket_us.factories.ACCOUNT_NUMBER_ENV_VAR`
+        -- the same mechanism (an environment variable read fresh at process
+        start, never generated or cached) that already makes the venue
+        credentials themselves stable across a restart. A changed value
+        RE-LABELS every future event under a new ``AccountId`` but orphans
+        nothing in the durable store, whose keys are prefixed by venue, not by
+        account (``exec/client.py:80-92``).
+    state_store_path : str | None
+        Absolute filesystem path to the durable SQLite state store
+        (``breezy.runtime.sqlite_store.SqliteStateStore``). REQUIRED, absolute,
+        no ``..`` segment -- the same shape rule
+        :func:`breezy.runtime.settings.load_quote_tape_settings` already
+        applies to the quote-tape catalog root.
+    state_store_opener : StateStoreOpener | None
+        The RUNTIME-layer closure that opens the store. This module (an
+        ``adapters`` package) may not import
+        ``breezy.runtime.sqlite_store.SqliteStateStore`` directly -- the
+        import-linter layer contract puts ``runtime`` ABOVE ``adapters``
+        (``pyproject.toml`` ``[tool.importlinter]``) -- so this field is
+        always ``None`` when :func:`exec_config_from_env` builds the config,
+        and is filled in by ``breezy.runtime.node_config.build_trade_node_config``
+        via ``msgspec.structs.replace``, exactly the way
+        ``build_quote_tape_node_config`` threads ``recorder_instance_id``
+        through :class:`PolymarketUSDataClientConfig` after the fact.
+    instrument_wait_timeout_s, account_registration_timeout_s : float
+        Forwarded verbatim to :class:`PolymarketUSExecutionClient`.
+    """
+
+    venue: PolymarketUSDataClientConfig | None = None
+    account_number: str | None = None
+    state_store_path: str | None = None
+    state_store_opener: StateStoreOpener | None = None
+    instrument_wait_timeout_s: float = 30.0
+    account_registration_timeout_s: float = 30.0
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.venue, PolymarketUSDataClientConfig):
+            raise SettingsError(
+                "PolymarketUSExecClientConfig.venue is required and must be a "
+                f"PolymarketUSDataClientConfig; got {type(self.venue).__name__}"
+            )
+        if not _is_present(self.account_number):
+            raise SettingsError(
+                "PolymarketUSExecClientConfig.account_number is required and has "
+                "no default: it becomes the AccountId suffix and cannot be "
+                "derived from anything else"
+            )
+        if not _is_present(self.state_store_path):
+            raise SettingsError(
+                "PolymarketUSExecClientConfig.state_store_path is required and "
+                "has no default"
+            )
+        path = Path(self.state_store_path)  # type: ignore[arg-type]
+        if not path.is_absolute():
+            raise SettingsError(
+                "PolymarketUSExecClientConfig.state_store_path must be an "
+                f"absolute path, was {self.state_store_path!r}"
+            )
+        if any(part == ".." for part in path.parts):
+            raise SettingsError(
+                "PolymarketUSExecClientConfig.state_store_path must not contain "
+                f"a '..' segment, was {self.state_store_path!r}"
+            )
+        for name in ("instrument_wait_timeout_s", "account_registration_timeout_s"):
+            value = getattr(self, name)
+            if isinstance(value, bool) or not isinstance(value, (int, float)) or value <= 0:
+                raise SettingsError(
+                    f"PolymarketUSExecClientConfig.{name} must be a positive "
+                    f"number, was {value!r}"
+                )
+
+
+assert_config_type_excludes_secrets(PolymarketUSExecClientConfig)

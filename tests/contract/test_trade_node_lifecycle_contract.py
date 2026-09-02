@@ -50,6 +50,7 @@ from breezy.adapters.polymarket_us.symbology import POLYMARKET_US_VENUE
 from breezy.runtime.node_config import build_trade_node_config
 from tests.unit.test_runtime_trade_node_config import (
     make_data_client_config,
+    make_exec_client_config,
     make_trade_settings,
 )
 
@@ -124,7 +125,9 @@ async def _wait_until(predicate: Any, timeout: float = _WAIT_TIMEOUT_S) -> None:
 
 @pytest.fixture(name="node")
 def _node() -> Iterator[TradingNode]:
-    config = build_trade_node_config(make_trade_settings(), make_data_client_config())
+    config = build_trade_node_config(
+        make_trade_settings(), make_data_client_config(), make_exec_client_config()
+    )
     loop = asyncio.new_event_loop()
     node = TradingNode(config, loop=loop)
     try:
@@ -142,7 +145,9 @@ def test_the_trade_node_reaches_running_and_stops_cleanly() -> None:
     teardown noise buries the real cause -- which is precisely the failure
     shape this repo has been burned by before.
     """
-    config = build_trade_node_config(make_trade_settings(), make_data_client_config())
+    config = build_trade_node_config(
+        make_trade_settings(), make_data_client_config(), make_exec_client_config()
+    )
     loop = asyncio.new_event_loop()
     node = TradingNode(config, loop=loop)
     node.add_data_client_factory(POLYMARKET_US_CLIENT_NAME, _SilentDataClientFactory)
@@ -156,8 +161,16 @@ def test_the_trade_node_reaches_running_and_stops_cleanly() -> None:
             await _wait_until(lambda: node.trader.is_running)
             seen["running"] = node.trader.is_running
 
-            # The increment's boundary, observed on the RUNNING system: there
-            # is no execution client, so there is no order path.
+            # This file's OWN boundary, not the trade config's: EXEC SPINE W
+            # made `config.exec_clients` non-empty, but this test registers
+            # only the silent DATA factory -- no exec factory -- so
+            # `build_exec_clients` (`live/node_builder.py:201-246`) logs one
+            # error and registers nothing for it. The real, factory-backed
+            # construction is covered by
+            # `tests/unit/test_polymarket_us_factories.py` (unit) and by the
+            # offline object-graph proof in this increment's own report; this
+            # file stays about the KERNEL LIFECYCLE, not about the venue
+            # object graph.
             seen["exec_clients"] = list(node.kernel.exec_engine.registered_clients)
 
             # Observed on the live ENGINE, not on the config object: a config
