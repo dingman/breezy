@@ -616,3 +616,31 @@ positive control in the same command, e.g. `expiration_ns` = 0 across `live/`,
 of every Breezy surface against its nearest native, including the inverse finding
 that Breezy configures **no** native risk caps at all. See [[L-10]],
 [[validate-nautilus-before-planning]], [[native-substitution-is-a-unit-change]].
+
+## L-12 — Widen an exact-set barrier, never relax it
+
+Two barriers in this repo assert **set EQUALITY**, so legitimate new work turns
+them RED and the tempting fix is to loosen the assertion:
+
+- `tests/unit/test_weather_data_type_barrier.py:94` (W1) does not cover a new
+  weather record class.
+- `tests/unit/test_probe_containment.py:297-310` asserts set equality, so adding
+  a third endpoint turns it RED.
+
+The same shape governs the execution-egress firewall: N2, X3 and E0-INERT in
+`tests/unit/test_execution_egress_firewall_guard.py` are exact-set equalities
+whose docstrings require a new `exec/` module to update the set **in the same
+commit**.
+
+**The rule: WIDEN the expected set, never relax the comparison.** Never convert
+`==` to `in`, to a subset test, or to an allowlist. An equality that a reviewer
+must consciously update is the mechanism — it is what makes a new
+execution-egress module impossible to land silently. Relaxing it keeps the test
+green while deleting the only thing it was protecting.
+
+Corollary, learned landing R-3 (2026-09-01): membership in an exact set proves a
+module **exists**, never that it is **inert**. E0 listed modules; it took
+E0-INERT to assert that none of them can reach the network. When you widen a set,
+ask what the set actually proves — and whether the property you care about is
+asserted anywhere at all. Both X1 and X3 had been **silently vacuous**, scanning
+a package no test imported.

@@ -1,6 +1,6 @@
 # EXEC SPINE — shortest sound path to one real, filled, reconciled order
 
-**Status:** **REVISION 2, 2026-09-01. R-1 and R-2 are LANDED and green. R-3 … R-6 are
+**Status:** **REVISION 2, 2026-09-01. R-1, R-2 and R-3 are LANDED and green. R-4 … R-6 are
 buildable. R-7 is RE-PLAN (two CRITICALs, fixes named below). R-9 is RE-PLAN — it has no
 live mechanism at all and a design is in flight.**
 **Date:** 2026-09-01. Supersedes `docs/plans/archive/EXEC_CLIENT_NOSEND_PLAN.md` (1993 lines; terminal
@@ -299,7 +299,7 @@ non-zero on a latched fault.
 **Done when:** the process reaches `RUNNING` and exits `STOPPED` cleanly, with no exec client
 behaviour yet.
 
-### R-3 — `exec/endpoints.py` + report mappers — **VENUE-SPECIFIC**
+### R-3 — `exec/endpoints.py` + report mappers — **VENUE-SPECIFIC** — **LANDED 2788d11, gate green (4787)**
 
 **Null hypothesis:** Nautilus supplies the report *types*. **CONFIRMED** — `OrderStatusReport`,
 `FillReport`, `PositionStatusReport`, `ExecutionMassStatus`. Breezy supplies venue→report

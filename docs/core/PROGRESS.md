@@ -96,10 +96,8 @@ backtest — no `Data` subclass, no catalog wiring, no client. Plan (unreviewed)
 `docs/plans/intraday_observation_ingest_2026-09-01.md` — peer-reviewed
 2026-09-01: RESUME WITH AMENDMENTS (re-anchor off the dead lock predicate;
 demote I-4; `build_running_max_days` at `pmr_climatology_study.py:351` is an
-EXISTING untested fold to PORT, not author). Two traps it found:
-barrier W1 (`test_weather_data_type_barrier.py:94`) does not cover a new record
-class, and `test_probe_containment.py:297-310` asserts set EQUALITY so a third
-endpoint turns it RED — widen both, never relax.
+EXISTING untested fold to PORT, not author). Two barrier traps it found are
+recorded as L-12 in `docs/core/LESSONS.md`.
 
 ### [MED] BL-14 — `RefusalAlerter` alerts on `SHORTS_DISABLED` only
 
@@ -195,14 +193,15 @@ Measured: total addressable notional at any eventually-winning rung is **$0.574*
 
 **Ordered path to a real-money ROI verdict (revised 2026-09-01):** (1) BL-25
 DONE; (2) K1 gates the calibration family BEFORE any forecast build —
-`docs/evidence/k1_cheap_open_2026-09-01.md`. Measured n=0, but **30 D+1 entries
-are captured** (09-01, the first full 5-station D+1 day) and enter the
-population automatically once their CLI goes FINAL — what is missing is elapsed
-time, not code. Viable at ask<=0.03 in ~20d / ask<=0.05 in ~9d; the 0.01 tick
-needs ~359d, so no plan may wait on it. Re-runs daily, unattended; (3) capture supervised to 2026-10-01 (D+1 book exists only if the recorder
+`docs/evidence/k1_cheap_open_2026-09-01.md`. Measured n=0; 30 D+1 entries are
+captured (09-01) and enter the population once their CLI goes FINAL — missing is
+elapsed time, not code. Viable at ask<=0.03 in ~20d / <=0.05 in ~9d; the 0.01
+tick needs ~359d, so no plan may wait on it. Re-runs daily, unattended; (3) capture supervised to 2026-10-01 (D+1 book exists only if the recorder
 runs before local midnight); (4) execute the EXEC SPINE R-1..R-9
-(`docs/plans/EXEC_SPINE_2026-09-01.md`, REVISED d582462 after peer review; the
-new latch/clearing/B8 material is itself under review) — R-4 publishes the first
+(`docs/plans/EXEC_SPINE_2026-09-01.md`). **R-1/R-2/R-3 LANDED** (2788d11, 4787
+green). R-3's first green build hid a CRITICAL -- `avgPx` bypassed the price
+guard and Nautilus books it via `make_price`, accepting 1.35 on a 0/1 binary;
+caught by review, not by the gate — R-4 publishes the first
 AccountState
 and is what de-inerts every Nautilus cap (`risk/engine.pyx:682-692` returns True
 with no account); (5) forecast ingest (`docs/plans/forecast_ingest_2026-09-01.md`)
@@ -214,7 +213,7 @@ counterfactual about the venue's reaction to OUR order, recorded nowhere.
 
 ## Pointers
 
-Durable rules `docs/core/LESSONS.md` (L-1..L-11, all binding) · evidence
+Durable rules `docs/core/LESSONS.md` (L-1..L-12, all binding) · evidence
 `docs/evidence/` · live plan `docs/plans/EXEC_SPINE_2026-09-01.md` · runbook
 `docs/core/RUNBOOK_NWS_COLLECTION.md` · strategy authoring
 `docs/specs/STRATEGY_QUICKSTART.md` · pre-shrink history `docs/core/archive/`
