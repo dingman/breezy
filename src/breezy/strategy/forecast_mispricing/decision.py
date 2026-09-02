@@ -17,7 +17,18 @@ change and neither touching the math itself:
    ``breezy.strategy.weather_common.forecast_source`` for why: the bundle had
    a fabricated settlement clock to compute that independently; Breezy does
    not, so the one horizon the injected forecast source is required to keep
-   live (see that module's docstring) now serves both purposes.
+   live (see that module's docstring) serves the TIME-BASED terms here.
+
+   THAT COLLAPSE USED TO GO ONE STEP FURTHER, AND IT WAS WRONG. The live
+   horizon also reached ``ForecastErrorModel.sigma``, which models forecast
+   ERROR -- a property of the forecast's lead AT ISSUANCE, not of how much
+   clock is left. A T-24h forecast read at T-3h was priced with the 3-hour
+   error bin (~1.4 degF) instead of its own 24-hour bin (~2.8 degF),
+   understating sigma ~2x, overstating edge, and inflating measured backtest
+   ROI. The two time bases are now separate: ``settlement_deadline`` (the
+   instrument's native ``expiration_ns``) plus
+   ``weather_common.models.issuance_lead_hours`` feeds sigma, while
+   ``forecast.horizon_hours`` still feeds the horizon-scaled sizing (T-11).
 2. ``model_p`` comes from ``engine.bucket_probability(contract.facts, ...)``
    rather than ``engine.contract_probability(contract, ...)`` -- a rename
    forced by ``breezy.strategy.weather_common.bucket_contract.MispricingContract``
@@ -29,7 +40,11 @@ from __future__ import annotations
 from datetime import datetime
 from typing import TYPE_CHECKING
 
-from breezy.strategy.weather_common.models import SideIntent, SignalDecision
+from breezy.strategy.weather_common.models import (
+    SideIntent,
+    SignalDecision,
+    issuance_lead_hours,
+)
 from breezy.strategy.weather_common.refusals import SHORTS_DISABLED, RefusalCounter
 from breezy.strategy.weather_common.risk import edge_after_costs
 
@@ -53,9 +68,17 @@ def evaluate_instrument(
     engine: WeatherProbabilityEngine,
     risk: RiskManager,
     cfg: ForecastMispricingConfig,
+    settlement_deadline: datetime,
     refusals: RefusalCounter | None = None,
 ) -> SignalDecision | None:
-    """Return the desired position change, or ``None`` for "do nothing"."""
+    """Return the desired position change, or ``None`` for "do nothing".
+
+    ``settlement_deadline`` is the instrument's OWN native ``expiration_ns``
+    (``strategy._deadlines[instrument_id]``). It exists so the FORECAST-ERROR
+    horizon can be the forecast's lead at issuance while ``horizon_hours``
+    stays the live hours-to-settlement the time gates need -- see
+    ``weather_common.models.issuance_lead_hours``.
+    """
     if forecast.is_stale(now, cfg.stale_forecast_hours):
         return SignalDecision(
             instrument_id=contract.instrument_id,
@@ -72,8 +95,10 @@ def evaluate_instrument(
     if not ok:
         return None
 
+    # SIGMA TAKES THE LEAD AT ISSUANCE, NEVER THE LIVE HORIZON (T-11).
+    sigma_lead_h = issuance_lead_hours(settlement_deadline, forecast)
     model_p = engine.bucket_probability(
-        contract.facts, forecast.expected_high_f, forecast.horizon_hours,
+        contract.facts, forecast.expected_high_f, sigma_lead_h,
     )
     scale = (
         cfg.price_scale_override if cfg.price_scale_override is not None else contract.price_scale
@@ -159,10 +184,12 @@ def evaluate_instrument(
 
     _, sigma = engine.mu_sigma(
         forecast.expected_high_f,
-        forecast.horizon_hours,
+        sigma_lead_h,
         contract.facts.settlement_station,
         contract.facts.climate_day,
     )
+    # ... and the SIZING term takes the live horizon, which is what "how much
+    # time is left to be wrong in" actually means. Both meanings, side by side.
     hours_left = max(forecast.horizon_hours, 0.5)
     horizon_frac = min(1.0, hours_left / 48.0)
     horizon_frac = max(horizon_frac, cfg.horizon_size_floor)
@@ -184,7 +211,12 @@ def evaluate_instrument(
         metadata={
             "sigma_f": sigma,
             "nws_high": forecast.expected_high_f,
+            # LIVE hours-to-settlement (time gates, sizing) ...
             "horizon_h": forecast.horizon_hours,
+            # ... and the forecast's own lead at issuance, which is what
+            # `sigma_f` above was computed from. Recorded separately so a
+            # decision log can never be read as though one implied the other.
+            "sigma_lead_h": sigma_lead_h,
             "long_edge": long_edge,
             "short_edge": short_edge,
         },

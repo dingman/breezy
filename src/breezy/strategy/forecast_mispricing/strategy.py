@@ -313,6 +313,11 @@ class ForecastMispricingStrategy(SharedExposureMixin, Strategy):
             engine=self._engine,
             risk=self._risk,
             cfg=self._config,
+            # The SAME native deadline the settlement halt read above, handed
+            # down so the error model can date the forecast by its lead AT
+            # ISSUANCE while `forecast.horizon_hours` keeps serving the live
+            # time-based terms (T-11, `weather_common.models`).
+            settlement_deadline=self._deadlines[instrument_id],
             refusals=self.refusals,
         )
         if decision is None:

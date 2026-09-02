@@ -157,7 +157,12 @@ class ForecastRevision:
     prob_revision: float
     prev_prob: float
     new_prob: float
-    #: Hours the settlement horizon shrank between the two publications.
+    #: Hours of LEAD the newer publication gave up against the older one --
+    #: ``current_lead - previous_lead``, i.e. the negated gap between the two
+    #: issuance times. Both inputs are issuance leads, not live horizons (see
+    #: :meth:`ForecastErrorModel.sigma`), so this is a property of the two
+    #: forecasts and does not move with the clock. Reported only; no branch in
+    #: any strategy reads it.
     horizon_change_h: float
 
 
@@ -221,6 +226,18 @@ class ForecastErrorModel:
         return 0.0 if found is None else found
 
     def sigma(self, location_id: str, target_date: date, horizon_hours: float) -> float:
+        """Forecast-error standard deviation in degrees F.
+
+        ``horizon_hours`` MUST be the forecast's LEAD AT ISSUANCE
+        (``hours_until(deadline, published_at)``), never
+        ``ForecastSnapshot.horizon_hours``, which is the live
+        hours-to-settlement. Error is a property of the forecast and is fixed
+        when it is published; a 24-hour-out prediction does not become a
+        3-hour-out prediction by being read 21 hours later. Every caller
+        obtains this value from
+        ``breezy.strategy.weather_common.models.issuance_lead_hours``, which
+        exists so the two horizons cannot be confused at a call site (T-11).
+        """
         keys = self.lookup_keys(location_id, target_date, horizon_hours)
         found = self._first_override(self.sigma_by_key, keys)
         if found is not None:

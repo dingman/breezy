@@ -34,6 +34,7 @@ __all__ = [
     "SignalDecision",
     "ensure_aware",
     "hours_until",
+    "issuance_lead_hours",
 ]
 
 
@@ -103,6 +104,15 @@ class ForecastSnapshot:
     ``breezy.strategy.forecast_mispricing.forecast_source.ForecastSource``
     for the injection contract and why ``horizon_hours`` here is the live
     hours-remaining-to-settlement, not a value frozen at issuance.
+
+    TWO TIME BASES LIVE ON THIS RECORD, AND THEY ARE NOT INTERCHANGEABLE.
+    ``horizon_hours`` answers "how long until this settles?" -- it moves with
+    the clock, and it is what the settlement halt, the minimum-horizon
+    flatten, and the horizon-scaled sizing term want. The FORECAST ERROR
+    model wants the other one: how far ahead this forecast was looking when
+    it was ISSUED, which is ``hours_until(deadline, published_at)`` and does
+    not move at all. Never feed ``horizon_hours`` to
+    ``ForecastErrorModel.sigma`` -- see :func:`issuance_lead_hours` (T-11).
     """
 
     location_id: str
@@ -144,3 +154,45 @@ def ensure_aware(ts: datetime) -> datetime:
 
 def hours_until(later: datetime, now: datetime) -> float:
     return (ensure_aware(later) - ensure_aware(now)).total_seconds() / 3600.0
+
+
+def issuance_lead_hours(deadline: datetime, forecast: ForecastSnapshot) -> float:
+    """Hours from a forecast's ISSUANCE to settlement -- the ONLY horizon `sigma` may take.
+
+    ``ForecastErrorModel.sigma(location_id, target_date, horizon_hours)`` models
+    FORECAST ERROR, which is a property of the forecast: a 24-hour-out
+    prediction carries roughly 2.8 degF of error, a 3-hour-out prediction
+    roughly 1.4 degF. That distribution belongs to the forecast and is fixed
+    the moment it is published. It does NOT shrink because the clock advanced
+    toward the deadline -- the forecast did not get any better by being read
+    later.
+
+    Feeding ``ForecastSnapshot.horizon_hours`` (the LIVE hours-to-settlement)
+    to ``sigma`` therefore reads a stale forecast as though it were a fresh
+    one, understating sigma by roughly the ratio of the two horizons.
+    Understated sigma pushes the model probability toward 0 or 1, which
+    OVERSTATES edge -- worst on the near-certain buckets, where sizing is
+    largest. That is a measurement corruption, not a cosmetic one: it inflates
+    backtest ROI (T-11,
+    ``docs/core/findings/BLIND_RISK_VIEWS_2026-09-02.md``).
+
+    ``deadline`` is the instrument's OWN native ``expiration_ns``, held per
+    instrument as ``_deadlines[instrument_id]`` at the strategy layer -- the
+    same value the settlement halt reads, never a wall clock refabricated here.
+
+    Deliberately a free function taking BOTH values rather than a method or a
+    second stored field: it cannot be reached without naming a deadline, so
+    ``sigma(..., issuance_lead_hours(deadline, forecast))`` and
+    ``sigma(..., forecast.horizon_hours)`` can never be mistaken for each
+    other at a call site. A stored field would have to be recomputed by every
+    ``ForecastSource`` implementation (the seam T-7 has just shown is pinned
+    by prose alone), and a method on the snapshot taking ``now`` would be
+    wrong for a STORED publication -- ``forecast_revision`` keeps a history
+    whose entries' ``horizon_hours`` were live at their own, now unrecoverable,
+    observation instants.
+
+    Negative once ``published_at`` is past the deadline, exactly as
+    :func:`hours_until` is; ``sigma`` floors its own input at
+    ``min_horizon_hours``, so no clamping is applied or needed here.
+    """
+    return hours_until(deadline, forecast.published_at)

@@ -53,12 +53,32 @@ computable wall-clock deadline. Rather than re-fabricate one, this seam
 requires ``ForecastSource.snapshot`` to return a ``horizon_hours`` that is
 ALREADY the live hours-remaining-to-settlement as of the ``now`` it was
 called with -- not a value frozen at the forecast's original issuance time.
-The strategy uses this one number for both the probability model's horizon
-AND the settlement-halt / horizon-scaled-sizing decisions the bundle used to
-compute separately. This is reported as a deliberate collapsing of two
-previously-separate time bases -- see the integration report for why, and
-treat it as a real constraint on any ``ForecastSource`` implementation, not
-an implementation detail to route around.
+
+That requirement is now PINNED BY A TEST, not by this paragraph alone:
+``tests/contract/test_forecast_source_liveness_contract.py`` asserts that two
+reads of the same publication at ``t`` and ``t + d`` return horizons differing
+by ``d``. A ``Protocol`` can constrain a signature and never a value, so
+before that guard existed the contract was prose with nothing behind it
+(T-7, ``docs/core/findings/BLIND_RISK_VIEWS_2026-09-02.md``). The guard
+targets the analysis/backtest source deliberately and exempts the frozen test
+doubles -- see its docstring for which implementations it covers and why.
+
+WHAT ``horizon_hours`` IS *NOT* USED FOR
+-----------------------------------------
+This value was ALSO fed to ``ForecastErrorModel.sigma``, collapsing two time
+bases into one number. That was wrong and has been undone (T-11). Forecast
+error is a property of the FORECAST -- of how far ahead it was looking when it
+was issued -- and does not shrink as the clock runs down toward settlement. A
+forecast published 24 hours out and read three hours out was being priced with
+the three-hour error bin, understating sigma roughly twofold, overstating edge,
+and inflating measured backtest ROI on exactly the near-certain buckets where
+sizing is largest. Strategies now derive the error horizon with
+``breezy.strategy.weather_common.models.issuance_lead_hours(deadline,
+forecast)`` against the instrument's own native ``expiration_ns``, and
+``horizon_hours`` serves the TIME-BASED terms only: the settlement halt, the
+minimum-horizon flatten, the horizon-scaled sizing, and the risk manager's
+``hours_to_settlement``. Those genuinely want the live value -- which is why
+the liveness requirement above stands unchanged and matters more, not less.
 """
 
 from __future__ import annotations

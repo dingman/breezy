@@ -42,6 +42,14 @@ T0 = dt.datetime(2026, 8, 28, 6, 0, tzinfo=dt.UTC)
 T1 = dt.datetime(2026, 8, 28, 8, 0, tzinfo=dt.UTC)
 NOW = dt.datetime(2026, 8, 28, 8, 30, tzinfo=dt.UTC)
 INSTRUMENT_ID = "NYC-GE80.POLYMARKET_US"
+#: The instrument's native settlement deadline (`expiration_ns`). Chosen to be
+#: CONSISTENT with the fixture's own live horizons -- `T0 + 26h == T1 + 24h ==
+#: DEADLINE` -- so each publication's lead at issuance equals the
+#: `horizon_hours` these tests already gave it, and every sigma below is the
+#: same number it always was. What changed (T-11) is that the error model now
+#: reads the lead rather than the live horizon; where the two coincide, as
+#: here, nothing moves.
+DEADLINE = dt.datetime(2026, 8, 29, 8, 0, tzinfo=dt.UTC)
 
 
 def _metric(decision: SignalDecision, key: str) -> float:
@@ -126,6 +134,7 @@ def _evaluate(
         state=state,
         engine=WeatherProbabilityEngine(),
         cfg=cfg if cfg is not None else ForecastRevisionConfig(instrument_ids=()),
+        settlement_deadline=DEADLINE,
         refusals=refusals,
     )
 
@@ -407,6 +416,7 @@ def test_a_ladder_sibling_nets_out_its_own_market_move() -> None:
         # it is off by default. What is under test is `unabsorbed`, not the
         # permission.
         cfg=ForecastRevisionConfig(instrument_ids=(), allow_short=True),
+        settlement_deadline=DEADLINE,
     )
     assert decision is not None
     market_dp = _metric(decision, "dP_market")

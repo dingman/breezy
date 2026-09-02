@@ -19,6 +19,9 @@ change and none of them touching the math:
    Breezy has no wall-clock settlement source at the strategy layer -- see
    ``breezy.strategy.weather_common.forecast_source`` for the contract that
    replaces it, and ``bucket_contract`` for why the clock was removed.
+   ``hours_left`` is a LIVE time gate and correctly reads that live value. The
+   FORECAST-ERROR horizon under ``cal_p`` is a different quantity and no
+   longer shares it -- see ``settlement_deadline`` below and T-11.
 2. ``cal_p`` comes from ``engine.bucket_probability(contract.facts, ...)``
    rather than ``engine.contract_probability(contract, ...)`` -- a rename forced
    by ``MispricingContract`` wrapping real venue facts instead of the bundle's
@@ -39,7 +42,11 @@ from __future__ import annotations
 from datetime import datetime
 from typing import TYPE_CHECKING
 
-from breezy.strategy.weather_common.models import SideIntent, SignalDecision
+from breezy.strategy.weather_common.models import (
+    SideIntent,
+    SignalDecision,
+    issuance_lead_hours,
+)
 from breezy.strategy.weather_common.refusals import SHORTS_DISABLED, RefusalCounter
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
@@ -82,9 +89,19 @@ def evaluate_instrument(
     current_qty: float,
     engine: WeatherProbabilityEngine,
     cfg: CalibrationMeanReversionConfig,
+    settlement_deadline: datetime,
     refusals: RefusalCounter | None = None,
 ) -> SignalDecision | None:
-    """Return the desired position change, or ``None`` for "do nothing"."""
+    """Return the desired position change, or ``None`` for "do nothing".
+
+    ``settlement_deadline`` is the instrument's OWN native ``expiration_ns``
+    (``strategy._deadlines[instrument_id]``), used ONLY to date the forecast's
+    lead at issuance for the error model -- see
+    ``weather_common.models.issuance_lead_hours``. THIS STRATEGY HAS NO
+    DECISION-LAYER STALENESS GATE (unlike ``forecast_mispricing``, which
+    refuses a forecast older than ``stale_forecast_hours`` before sigma is
+    reached), so the lead and the live horizon can diverge without bound here.
+    """
     hours_left = forecast.horizon_hours
     if hours_left < cfg.min_horizon_hours:
         if abs(current_qty) > 1e-9:
@@ -105,8 +122,13 @@ def evaluate_instrument(
         if age_min < cfg.stable_forecast_minutes:
             return None
 
+    # SIGMA TAKES THE LEAD AT ISSUANCE, NEVER THE LIVE HORIZON (T-11): the
+    # error of a forecast is set when it is published and does not shrink as
+    # the clock runs down.
     cal_p = engine.bucket_probability(
-        contract.facts, forecast.expected_high_f, forecast.horizon_hours,
+        contract.facts,
+        forecast.expected_high_f,
+        issuance_lead_hours(settlement_deadline, forecast),
     )
     scale = (
         cfg.price_scale_override if cfg.price_scale_override is not None else contract.price_scale
@@ -119,6 +141,12 @@ def evaluate_instrument(
     if mid_p is None or bid_p is None or ask_p is None:
         return None
 
+    # DELIBERATELY THE LIVE HORIZON, not the issuance lead.
+    # `expected_probability_se` is not a forecast-error model and never calls
+    # `sigma`: it scales how far a QUOTE may sit from a calibrated probability,
+    # and that dispersion is a function of how much trading time is left, which
+    # is the live value. Left exactly as it was by T-11, which moved only the
+    # forecast-error horizon.
     se = engine.expected_probability_se(
         cal_p, forecast.horizon_hours, extra_market_noise=cfg.extra_market_noise,
     )

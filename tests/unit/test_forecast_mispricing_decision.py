@@ -113,6 +113,13 @@ def _evaluate(
         engine=_engine(),
         risk=_risk(contract),
         cfg=cfg or _cfg(),
+        # The instrument's native settlement deadline, derived from the
+        # fixture so the world it describes is self-consistent: the forecast
+        # is published AT `NOW` by default, so its lead at issuance and its
+        # live horizon coincide and every sigma below is the same number it
+        # always was. Tests that publish EARLIER separate the two on purpose
+        # -- see `test_forecast_sigma_uses_issuance_lead.py` (T-11).
+        settlement_deadline=NOW + dt.timedelta(hours=forecast.horizon_hours),
         refusals=refusals,
     )
 

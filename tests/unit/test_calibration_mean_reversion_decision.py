@@ -100,14 +100,22 @@ def _evaluate(
     cfg: CalibrationMeanReversionConfig | None = None,
     refusals: RefusalCounter | None = None,
 ) -> SignalDecision | None:
+    snapshot = forecast if forecast is not None else _forecast()
     return evaluate_instrument(
         contract=_contract(),
         quote=quote,
-        forecast=forecast if forecast is not None else _forecast(),
+        forecast=snapshot,
         now=NOW,
         current_qty=current_qty,
         engine=WeatherProbabilityEngine(),
         cfg=cfg if cfg is not None else CalibrationMeanReversionConfig(instrument_ids=()),
+        # The instrument's native settlement deadline, derived from the
+        # fixture's own live horizon so the world it describes is
+        # self-consistent: `horizon_hours` really is hours-to-settlement at
+        # `NOW`. The forecast's lead at issuance is then that horizon plus its
+        # age, which is what the error model now reads -- see
+        # `test_forecast_sigma_uses_issuance_lead.py` (T-11).
+        settlement_deadline=NOW + dt.timedelta(hours=snapshot.horizon_hours),
         refusals=refusals,
     )
 

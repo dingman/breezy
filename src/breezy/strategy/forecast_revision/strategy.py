@@ -331,6 +331,12 @@ class ForecastRevisionStrategy(SharedExposureMixin, Strategy):
             state=self._state,
             engine=self._engine,
             cfg=self._config,
+            # The SAME native deadline the settlement halt read above, handed
+            # down so EACH STORED PUBLICATION can be dated by its own lead at
+            # issuance -- a snapshot's `horizon_hours` was live at its own
+            # observation instant and cannot be re-derived later (T-11,
+            # `weather_common.models`).
+            settlement_deadline=self._deadlines[instrument_id],
             refusals=self.refusals,
         )
         if decision is None:

@@ -87,6 +87,7 @@ from breezy.strategy.weather_common.models import (
     SideIntent,
     SignalDecision,
     ensure_aware,
+    issuance_lead_hours,
 )
 from breezy.strategy.weather_common.refusals import SHORTS_DISABLED, RefusalCounter
 
@@ -215,9 +216,19 @@ def evaluate_instrument(
     state: RevisionState,
     engine: WeatherProbabilityEngine,
     cfg: ForecastRevisionConfig,
+    settlement_deadline: datetime,
     refusals: RefusalCounter | None = None,
 ) -> SignalDecision | None:
-    """Return the desired position change, or ``None`` for "do nothing"."""
+    """Return the desired position change, or ``None`` for "do nothing".
+
+    ``settlement_deadline`` is the instrument's OWN native ``expiration_ns``
+    (``strategy._deadlines[instrument_id]``). It is what lets EACH STORED
+    PUBLICATION be dated independently: a snapshot held in ``state`` carries a
+    ``horizon_hours`` that was live at ITS OWN observation instant, which is
+    unrecoverable later, so the only durable way to ask "how far ahead was
+    this publication looking?" is against the deadline -- see
+    ``weather_common.models.issuance_lead_hours`` (T-11).
+    """
     hist = state.history(contract)
     if len(hist) < 2:
         return None
@@ -240,18 +251,26 @@ def evaluate_instrument(
         # not a gag, it is no executable price (BL-20).
         return None
 
+    # SIGMA TAKES EACH PUBLICATION'S OWN LEAD AT ISSUANCE, NEVER THE LIVE
+    # HORIZON (T-11). This is the strategy where the distinction is starkest:
+    # `previous` and `current` are two forecasts of the SAME settlement made
+    # at different times, so they carry genuinely different error, and the
+    # revision's whole premise is comparing them. Reading both through a
+    # single live horizon priced them as equally good.
+    previous_lead_h = issuance_lead_hours(settlement_deadline, previous)
+    current_lead_h = issuance_lead_hours(settlement_deadline, current)
     rev = engine.revision(
         contract.facts,
         previous.expected_high_f,
-        previous.horizon_hours,
+        previous_lead_h,
         current.expected_high_f,
-        current.horizon_hours,
+        current_lead_h,
     )
     d_t = rev.forecast_revision_f
     d_p = rev.prob_revision
     _, sigma_prev = engine.mu_sigma(
         previous.expected_high_f,
-        previous.horizon_hours,
+        previous_lead_h,
         contract.facts.settlement_station,
         contract.facts.climate_day,
     )
