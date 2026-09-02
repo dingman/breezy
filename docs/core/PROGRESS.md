@@ -60,6 +60,16 @@ Two consequences that are not optional (tracked by P4):
   0.5125 vs >=0.9; attribution 238/240). **A forecast archive yields a
   CALIBRATION dataset, not a backtest** — a backtest also needs prices, and those
   are forward-only (next line).
+- **Candidate family #2 (CLI-basis boundary tail): archive gate PASSED, NOT a
+  GO.** `P(CLI_final >= R+1)` clears the 0.06285 break-even on LAX/MIA/SFO/MDW
+  (16-26%). **NYC is DISCARDED** -- its 56-60% is a station-cadence artifact
+  (KNYC hourly; downsampling the dense four reproduces it exactly, L-13). The
+  "late-day" framing is dead: `P(R_17==R_23)`=99.4%, so this is the
+  UNCONDITIONAL CLI-vs-ASOS basis and entry is headroom-triggered at any hour.
+  The binding test is the live OFFER GATE -- whether the venue ever offers that
+  tail at <=0.05 in takeable size -- which is what killed the prior three
+  families and is unanswerable from any archive.
+  `docs/evidence/cli_basis_boundary_study_2026-09-02T044737Z.md`.
 - **Price history genuinely is forward-only.** No public trade tape; expired
   markets return null prices keeping only `settlementPx`.
 - **There is no NO-side instrument, and there cannot be one** (BL-6). NO is a
@@ -205,7 +215,7 @@ guarded before R-9 lands.
 
 ## Pointers
 
-Durable rules `docs/core/LESSONS.md` (L-1..L-12, all binding) · evidence
+Durable rules `docs/core/LESSONS.md` (L-1..L-13, all binding) · evidence
 `docs/evidence/` · live plan `docs/plans/EXEC_SPINE_2026-09-01.md` · runbook
 `docs/core/RUNBOOK_NWS_COLLECTION.md` · strategy authoring
 `docs/specs/STRATEGY_QUICKSTART.md` · pre-shrink history `docs/core/archive/`
