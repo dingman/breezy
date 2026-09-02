@@ -175,3 +175,85 @@ The 09-02 cohort remains unlisted and is now ~23h overdue. Keep watching; if
 nothing appears by ~12:00Z, escalate to venue support. A venue that re-opens
 expired markets before listing new ones is behaving oddly enough that the
 "listing job did not run" reading should be held loosely.
+
+---
+
+# UPDATE 10:10Z — the 09-02 skip is CONFIRMED, and a SECOND, Breezy-side incident
+
+## Part 1 — the listing gap resolves, but not as "delayed"
+
+At ~09:45:30Z the venue listed a cohort — for **2026-09-03**, skipping 09-02
+entirely. Measured `createdAt` on the new markets is `2026-09-02T09:45:30Z`,
+which lands exactly inside the D-1 ~09:45-10:30Z schedule derived earlier. So
+the venue's daily listing job is **working normally**; the only run that failed
+was the single one on 09-01 that would have produced the 09-02 cohort.
+
+**2026-09-02 is therefore a confirmed NO-MARKET day** — the third such gap after
+2026-08-28 and (by the same mechanism) itself. No escalation to venue support is
+warranted: nothing is broken venue-side now. The earlier note's advice to
+escalate if nothing appeared by 12:00Z is superseded.
+
+For the strategy work this is the reinforcement of the earlier point: the venue
+calendar has holes, they are not announced, and a period's trading-day count is
+an OBSERVED quantity.
+
+## Part 2 — the new cohort exposed a Breezy defect that stopped capture dead
+
+The moment the 09-03 cohort appeared, discovery began failing every 60s:
+
+```
+[ERROR] DataClient-POLYMARKET_US: Polymarket.us discovery reload cycle failed
+(InstrumentDefinitionError: Polymarket.us payload is missing required field
+'updatedAt'); the reload loop continues and will retry on the next scheduled pass.
+```
+
+Measured against the live gateway: **20/20 of the newly-listed markets carry
+`createdAt` and NONE carries `updatedAt`.** The venue omits the field on a
+market it has never modified since listing; it appears on first update. Breezy
+required it, and because one unparseable market aborts the entire discovery
+cycle, a single never-updated market blocked ALL of them. Capture went to zero.
+
+**This invalidates the morning triage's prediction** that "Breezy picks it up
+automatically with no intervention." It did not. That prediction rested on the
+parser being "proven healthy, 100/100 accepted" — true of the sample, which
+consisted entirely of already-updated markets, and false of the newly-listed
+population. Recorded as L-17.
+
+### Fix and rollout
+
+`parsing.py` now falls back to `createdAt` for `ts_event` when `updatedAt` is
+absent — semantically correct, since a market never updated was last changed
+when it was created. Deliberately NOT a synthesised `0`/`now()`, which would
+corrupt the tape rather than refuse it; `createdAt` stays required, so a payload
+with neither still raises. Exactly one field widened.
+
+Verified against the REAL live payload before rollout: 20/20 parse, `ts_event`
+equals the parsed `createdAt`. Gate 5116 passed.
+
+Rolled out by `systemctl --user restart` (SIGTERM, `KillSignal=15`,
+`TimeoutStopSec=120`) — never SIGKILL, which leaves a mid-message Arrow tail
+that makes the native read path return zero rows silently.
+
+```
+10:09:22 [old pid 3459201] discovery reload cycle failed (InstrumentDefinitionError)
+10:09:41 [new pid  670812] discovery cycle loaded 30 active market(s)
+10:09:41 [new pid  670812] Loaded 30 instruments
+```
+
+Post-restart: 0 errors, 30 instruments subscribed, **196 catalog files written
+in the following 120s**, newest 4s old.
+
+### Cost, stated plainly
+
+Cohort created 09:45:30Z; capture restored 09:09:41Z+ (10:09:41Z). **~24 minutes
+of a new cohort's opening tape is permanently lost** — the segment with the most
+price discovery and the least competition. That is the real cost of treating a
+sampled field as a required one.
+
+### Follow-up filed, not fixed
+
+One malformed market aborting the whole discovery cycle is a genuine amplifier
+(1 bad market blocked 30 good ones). Isolating a single market's failure without
+losing fail-closed semantics for genuinely corrupt payloads needs its own
+design: partial-cycle success semantics, skip-vs-abort when a DIFFERENT required
+field fails, and whether a skipped market is retried next cycle or flagged.

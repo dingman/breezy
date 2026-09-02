@@ -815,3 +815,50 @@ about a specific dispatch path, not a general truth. Determine which of the
 three paths applies before accepting it — and prefer reproducing it over reading
 for it, as was done here. Related: [[L-15]] (run the executable oracle rather
 than reasoning about what it would say).
+
+---
+
+## L-17 — A field present in every sample you have seen is not thereby REQUIRED (2026-09-02)
+
+`parse_binary_option` treated `updatedAt` as required (`parsing.py:1281`). Every
+market payload ever inspected carried it, so it looked mandatory. It is not:
+the venue omits it on a market it has **never modified since listing**. Measured
+live — of the 20 freshly-listed 2026-09-03 markets, **20/20 carried `createdAt`
+and none carried `updatedAt`**. Older cohorts all carry it, alongside
+`ep3SyncedAt` stamps, because by the time anyone had looked at them they had
+been updated at least once.
+
+**Why every sample lied.** The field appears after a STATE TRANSITION. Any
+sample gathered from markets that have existed for a while is drawn entirely
+from the post-transition population; the pre-transition state is invisible
+precisely because it is brief and early. `updatedAt`, `resolvedAt`, `closedAt`,
+`firstFillAt`, `lastTradeAt` are all this shape. **Optionality is a property of
+the producer's contract, not of your sample**, and a sample can only ever
+establish presence, never necessity.
+
+**What made it total rather than partial.** One unparseable market aborts the
+WHOLE discovery cycle, so a single never-updated market blocked all 30 and
+capture went to zero — on a forward-only tape, for ~24 minutes of a new
+cohort's opening price discovery, which is the most informative and least
+contested segment there is.
+
+**How to apply.** For every `_require`, ask: *what lifecycle state of this
+record would legitimately lack this field?* Newly-created is the canonical
+answer and the one your sample structurally cannot contain. Where a field is a
+transition timestamp, prefer an explicit fallback to the creation timestamp
+(a record never updated was last changed when it was created) over either
+requiring it or defaulting to `0`/`now()` — **a synthesised timestamp silently
+corrupts a tape, which is strictly worse than refusing it.** Widen exactly the
+one field the producer has proven optional and no others ([[L-12]]).
+
+**The forecasting failure worth keeping.** The triage that had just closed the
+morning's listing-gap incident predicted "Breezy will pick the cohort up
+automatically with no intervention." That prediction was confidently wrong, and
+wrong for this reason: it reasoned from the 100 markets it had parsed
+successfully, every one of them already updated. A verdict of "the parser is
+proven healthy — 100/100 accepted" was true of the sample and false of the
+population. When a component is declared healthy on a sample, state which
+population the sample came from, and treat any *new* population — a fresh
+cohort, a new venue state, a first-of-its-kind record — as unproven until it
+arrives. Related: [[L-15]] (run the executable oracle), [[L-13]] (a statistic
+is not comparable across the regimes it was not sampled from).
