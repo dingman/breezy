@@ -1,6 +1,8 @@
 # T-1 — `orders_open` blindness at the strategy layer
 
-Design plan, 2026-09-02. No source edits. Nautilus 1.231.0 immutable.
+Design plan, 2026-09-02. **Revision 2.** No source edits. Nautilus 1.231.0 immutable.
+
+**Changelog (R1 -> R2).** Four targeted changes, no restructuring: (1) §4 gains a missed scope item, the `_NoOpenOrdersCache` stub at `tests/unit/test_weather_strategy_quote_staleness.py:59-61`; (2) **D4's premise now verifies TRUE** on a stronger mechanism than R1 gave, so the 5146/1/4/3 baseline should not move; (3) the empirical check is nonetheless promoted from expectation to an explicit **merge gate**; (4) D3's hazard **attribution is corrected** — the gate blindness is pre-existing, not created by the guard fix. §5 and §6 re-ranked accordingly. Severity finding (§0) and census corrections (§1) unchanged — both reviewed and approved.
 
 ## 0. Verdict on the priority question
 
@@ -8,7 +10,7 @@ Design plan, 2026-09-02. No source edits. Nautilus 1.231.0 immutable.
 
 The guard screens `event.side != OrderSide.SELL -> return` (`backtest_order_guard.py:234-235`). It is a **SELL-only** backstop. This bot is long-only; BUYs are the dominant flow. So inside an INITIALIZED/SUBMITTED window a strategy: passes the blind gate; computes `delta = target_qty - current_qty` from `portfolio.net_position`, which excludes the in-flight order; re-submits the same delta — a duplicate BUY, up to 2x intended size — against risk caps blind by the **same** query, since `pending_qty` feeds `net_qty` (`risk.py:180`) and every cap reads `net_qty` (`risk.py:248, 256, 350, 453, 455, 474`).
 
-`risk.py:454-455` is `max_position_contracts` — an **operator-reserved control** (default 250.0, `risk.py:97`). A blind `pending_qty` lets an operator-reserved cap be silently exceeded, and the `room` clip at `:455` is computed from the same false number. No guard, engine check or Nautilus rule catches an oversized BUY. That is the case for fixing T-1, and it is stronger than the one PROGRESS records.
+`risk.py:454-455` is `max_position_contracts` — an **operator-reserved control** (default 250.0, `risk.py:97`). **Cap breach, confirmed by sequence:** settled 0 -> BUY 200 passes (`projected = 0+200 <= 250`) -> a later cycle inside the submit->ACCEPTED window still reads `net_qty = 0`, because the gate and `pending_qty` are the same blind query -> second BUY 200 passes -> net 400 against a 250 cap. There is no downstream catch: `max_notional_per_order` is a per-ORDER ceiling re-evaluated per submit, the cum-notional check is a per-invocation cash-solvency test, and Nautilus's `RiskEngine` holds **zero** cumulative position caps. `max_position_contracts` is the only one, and it is fed by the blind query.
 
 Fix it — scoped by §2, which finds one of the three uses should be fixed by DELETING the query, and one left alone.
 
@@ -51,17 +53,17 @@ Two corrections that change the work: **class B is not a skip-gate** — it gate
 
 Nautilus's `cancel_all_orders` (`strategy.pyx:1215-1300`) already queries `orders_open` **plus** `orders_emulated` **plus** `orders_inflight`, logs and returns cleanly when all three are empty (`:1266-1270`), and skips INITIALIZED in its cancel loop (a venue that has not seen an order cannot cancel it). The Breezy gate is a NARROWER pre-filter in front of a WIDER native query — it can only suppress a cancel Nautilus would have performed.
 
-That suppression is now a live hazard created by the guard fix: a SUBMITTED reducing SELL is invisible to the gate, no cancel is issued, and `close_all_positions` (`strategy.pyx:1418-1489`) submits a further SELL for the whole position. The guard sums both and raises `NakedShortRefusedError`; on live, `install_live_order_guard` re-raises. **The exit path can now abort.**
+**Attribution, corrected (R2).** The gate blindness here is **pre-existing** — the Breezy gate has always read the blind query, so a SUBMITTED reducing SELL has always escaped cancellation before `close_all_positions` (`strategy.pyx:1418-1489`) submits a further SELL for the whole position. What the guard fix changed is only the **symptom**: that pair previously passed as a silent naked short, and now raises `NakedShortRefusedError` (re-raised on live by `install_live_order_guard`), so the exit path aborts visibly. That is the guard working as designed, not damage it caused.
 
-**Stated honestly: this does not fully close it.** Cancel is asynchronous — the SELL moves to PENDING_CANCEL, which the guard still counts, and `close_all_positions` runs in the same synchronous call; an INITIALIZED SELL cannot be cancelled at all. A flatten can still be refused. That residual is a cancel/close *sequencing* defect, not a query defect: track separately, explicitly out of T-1 scope.
+Deleting the cancel-gate **shrinks** this window rather than widening it: Nautilus's own `cancel_all_orders` reaches the SUBMITTED order through `orders_inflight`, which the Breezy pre-filter was suppressing. **Honest residual, unchanged:** INITIALIZED is skipped in the cancel loop and cannot be cancelled at all, and cancel is asynchronous — the SELL moves to PENDING_CANCEL, which the guard still counts, while `close_all_positions` runs in the same synchronous call. A flatten can still be refused. The residual is **narrowed, not closed**; it is a cancel/close *sequencing* defect, tracked separately and explicitly out of T-1 scope.
 
 *Rejected — widening B like A/C.* Strictly worse: keeps a redundant gate whose only possible effect is suppressing a correct native cancel.
 
-### D4 — the behaviour change on class A, quantified
+### D4 — the behaviour change on class A (premise now VERIFIED)
 
 Widening A makes strategies skip when an order is INITIALIZED or SUBMITTED but not yet ACCEPTED. The newly-skipped shape is exactly: a second decision cycle firing inside the submit-to-accept window on the same instrument.
 
-- **Backtest:** expected ~zero additional skips — submission is synchronous. **Unverified; see §5.**
+- **Backtest: no additional skips. Premise verified (R2).** R1 argued from `OrderInitialized` being published before `cache.add_order` — that speaks to *visibility*, not *timing*, and was the weaker claim. The actual mechanism is the call stack: `Strategy.submit_order` -> `MessageBus.send`, which is a **direct in-process `handler(msg)` call, not a queue** -> `RiskEngine._handle_submit_order` -> the submit throttler, which defers only above a configured rate this bot never approaches, with `latency_model=None` in the harness. The whole chain therefore runs synchronously in one call stack and the order reaches ACCEPTED before control returns for the next `QuoteTick`. **No plausible mechanism exists for the widened gate to drop a backtest cycle, so the 5146/1/4/3 baseline should not move.** Merge gate in §4 measures rather than assumes it.
 - **Live:** one network round-trip per submission. `_evaluate_and_act` fires on every `QuoteTick`/`OrderBookDepth10`, so a handful of cycles per submission fall in the window on a fast book.
 
 **Desirable, not merely safe.** What "proceeded" in that window was a duplicate order sized against a position that did not yet include the first — a 2x BUY, not a trade the strategy chose. Skipping forgoes no trade: the original is still working and the next cycle re-evaluates.
@@ -70,7 +72,7 @@ Widening A makes strategies skip when an order is INITIALIZED or SUBMITTED but n
 
 **RECOMMENDATION.** Widen the query; do **not** change the representation now.
 
-- Widening fixes what the signed net CAN express: aggregate committed exposure. A long-only book is BUY-dominated and same-signed, so the net is lossless in the common case and `net_qty` / `max_position_contracts` become correct. That is §0's operator-cap harm, fixed.
+- Widening fixes what the signed net CAN express: aggregate committed exposure. A long-only book is BUY-dominated and same-signed, so the net is lossless in the common case and `net_qty` / `max_position_contracts` become correct. That is §0's operator-cap harm, fixed. Confirmed further: class A's gate permits at most **one** working order per instrument, so the mixed-sign net cannot arise while the gate holds — the representation does not defeat the fix.
 - Widening does **not** fix the jointly-naked case at `risk.py:192-197`: a +50 net may be a 60 BUY against a 10 SELL, and the SELL component is unrecoverable from a signed scalar. **The representation is a real limitation and must not be advertised as fixed.**
 - Not theatre, because that case is now genuinely covered elsewhere: the guard sums working SELLs from `cache.orders(...)` plus the cache-subordinate shim, in **both** modes (`backtest_order_guard.py:396-465`).
 
@@ -85,7 +87,7 @@ Same change. It is wrong on three counts, not one: (1) its two "independent cove
 ## 3. RED list (each must fail on today's tree)
 
 - **RED-1** (C, headline) — `net_position=0`, one SUBMITTED BUY of 200 cached; assert `pending_qty` == 200, `net_qty` == 200. Today: 0.
-- **RED-2** (C -> operator cap) — settled 200, SUBMITTED BUY 100, `max_position_contracts=250`; assert a further +100 refuses `max_position` or clips `room` to 0. Today it passes ~unclipped.
+- **RED-2** (C -> operator cap) — settled 0, one SUBMITTED BUY 200, `max_position_contracts=250`; assert a second +200 refuses `max_position` or clips `room` to 50. Today it passes unclipped to net 400. This is §0's confirmed breach sequence.
 - **RED-3** (A) — one SUBMITTED order; assert `_maybe_submit` emits no second `submit_order`. Today it submits.
 - **RED-4** (A) — INITIALIZED (not yet SUBMITTED); same assertion. Guards the `orders_open+orders_inflight` shortcut rejected in D1.
 - **RED-5** (B) — SUBMITTED SELL present, `_flatten` invoked; assert a `CancelAllOrders` command is issued. Today none is sent.
@@ -95,24 +97,28 @@ Same change. It is wrong on three counts, not one: (1) its two "independent cove
 
 A/C coverage for **all five** strategies, not one — they are five copies, and a test on one proves nothing about the other four.
 
-## 4. Scope, sequencing, and what must NOT change
+## 4. Scope, sequencing, merge gate, and what must NOT change
 
 1. `weather_common/inflight.py` + unit tests (RED-1, RED-7).
-2. `forecast_mispricing` — A (`:298`), B (`:391`), C (`:402`), delete `:429-433`. Land and gate alone; it is the template.
-3. Replicate to `calibration_mean_reversion`, `forecast_revision`, `running_extreme_lock`, `cli_settlement_print_lock` (latter two: no B).
-4. `risk.py:157-206` docstrings + `PROGRESS.md:197-202` (D6).
+2. **Widen the test stub (R2, previously missed).** `tests/unit/test_weather_strategy_quote_staleness.py:59-61` — `_NoOpenOrdersCache` defines only `orders_open`, is bound as `self.cache` in `_StrategyHarness:71`, and is driven against **real** `_maybe_submit` bodies via `STRATEGY_MAYBE_SUBMIT:43` (parametrized at `:145`). It breaks with `AttributeError` the instant class A/C switch to the shared helper. Same shape as the three `_FakeCache` widenings the guard increments needed. Widen the stub (add `orders`), never delete or skip the test.
+3. `forecast_mispricing` — A (`:298`), B (`:391`), C (`:402`), delete `:429-433`. Land and gate alone; it is the template.
+4. Replicate to `calibration_mean_reversion`, `forecast_revision`, `running_extreme_lock`, `cli_settlement_print_lock` (latter two: no B).
+5. `risk.py:157-206` docstrings + `PROGRESS.md:197-202` (D6).
 
 Optionally one commit per strategy; never split the docstring from the code change — D6 is the point of T-1.
 
-**Must not change:** anything under `.venv/**/nautilus_trader/`; `backtest_order_guard.py` behaviour (a cross-reference comment is the most it may receive); `settled_qty`'s return value; `PortfolioSnapshot` field names/types; `resting_ladder.py:262` (class D — a probe whose `open_orders_at_sweep` counter is a venue-behaviour *measurement* pinned by `tests/integration/test_resting_ladder_backtest.py`; widening it would silently redefine what was measured); `allow_short`; any barrier file. No new order-send or egress path.
+**MERGE GATE for class A (R2).** Do not land class A on D4's argument alone. Required: RED-3 and RED-4 green, **and** a real backtest run showing the baseline **5146 passed / 1 skipped / 4 deselected / 3 xfailed unchanged**. D4's mechanism is now well-argued, but it is inferred, and it is config-conditional — it holds because `latency_model=None` and the submit throttler sits below its rate in *this* harness, which a future config could change without touching this code. This session has produced repeated cases of a confident premise proving wrong, so the premise is measured, not assumed. If the count moves, the widened gate is dropping cycles, D4's conclusion is falsified, and class A is re-argued on measured numbers before merge — the count is never reconciled by weakening an assertion.
 
-## 5. Unverified
+**Must not change:** anything under `.venv/**/nautilus_trader/`; `backtest_order_guard.py` behaviour (a cross-reference comment is the most it may receive); `settled_qty`'s return value; `PortfolioSnapshot` field names/types; `resting_ladder.py:262` (class D — a probe whose `open_orders_at_sweep` counter is a venue-behaviour *measurement* pinned by `tests/integration/test_resting_ladder_backtest.py`; widening it would silently redefine what was measured); `allow_short`; edge, fee and break-even math (untouched by every change here — confirmed); any barrier file. No new order-send or egress path.
 
-- **Whether backtest submission is synchronous end-to-end** (D4's "~zero additional skips"). Reasoned from the guard's note that `OrderInitialized` is published *before* `cache.add_order` (`strategy.pyx:855-871`), not measured. **This determines whether the 5146/1/4/3 baseline moves.** Measure before assuming the count holds; if backtest skip counts shift, integration fixtures' expected fill counts move with them — a legitimate, must-be-explained baseline change, never grounds to weaken an assertion.
-- Everything else in §1-§2 is verified against source. Two items the brief left open are now closed: only 3 strategies have `_flatten`, and no strategy submits an `OrderList` (so class C needs no shim analogue).
+## 5. Verification status
+
+- **D4's premise: VERIFIED** (was R1's sole open item). Mechanism in D4; conclusion is that the baseline should not move. It remains an *inference from configuration*, which is why §4's merge gate measures it anyway.
+- Everything in §1 and §2 is verified against source. Items closed since the brief: only 3 strategies have `_flatten`; no strategy submits an `OrderList` (class C needs no shim analogue); `_NoOpenOrdersCache`'s single-method shape confirmed at `:59-61`.
+- Nothing in this plan is now unverified. The open risks below are judgement calls, not unmeasured facts.
 
 ## 6. Least-confident decision
 
-**D4 — that widening class A costs ~zero trades.** Everything else rests on verified source; this rests on an unmeasured assumption about backtest submission timing. If submission is *not* synchronous there, strategies begin skipping cycles they previously took, the baseline moves, and "desirable, not merely safe" needs re-argument on measured numbers rather than the duplicate-order argument alone. RED-3/RED-4 plus a backtest run settle it; do not merge class A until they have.
+**D3's residual scoping** (promoted from second place now that D4 verifies). Deleting the cancel-gate narrows the flatten-refusal window but does not close it: INITIALIZED SELLs are uncancellable and PENDING_CANCEL still counts toward the guard's sum. I judge that acceptable to leave open because the pre-existing alternative is a silent naked short and the residual is strictly smaller than today's window — but that is a scoping judgement, not a proof. If review disagrees, T-1 grows a cancel/close sequencing increment and is re-scoped rather than shipped as "fixed".
 
-Second: **D3's residual.** Deleting the cancel-gate improves `_flatten`, but the async-cancel race means a flatten can still be refused. If review judges that unacceptable to leave open, T-1 grows a sequencing increment and should be re-scoped rather than shipped as "fixed".
+Second: **D5's deferral** of the `pending_buy_qty`/`pending_sell_qty` split. Sound while class A's gate holds one working order per instrument, so the mixed-sign net cannot arise; it becomes wrong the moment any strategy is allowed concurrent working orders. Whoever relaxes that gate must revisit D5 in the same change.
