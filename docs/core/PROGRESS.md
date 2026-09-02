@@ -197,16 +197,20 @@ ceiling and operator gate are asserted but unenforced — whoever lands R-7 must
 wire it and relax B6 deliberately in that commit, or the send path ships with
 no operator gate at all.
 
-**[RESOLVED 2026-09-02] T-1 — `orders_open` blindness at the STRATEGY layer.**
-Verified census, 14 sites: 5 class A in-flight gates + 3 class B *cancel*-gates
-(opposite failure direction from a skip-gate) + 5 class C `pending_qty` feeds +
-1 class D ladder probe (`resting_ladder.py:262` — a venue-behaviour
-measurement, never a feed). The old "8 skip-gates + 5 feeds" binned to 13 and
-mis-binned three. A/C now read `weather_common/inflight.py`; B deleted;
-D untouched; `risk.py`'s docstring corrected with them.
-**Still OPEN, out of T-1's scope:** `_flatten`'s cancel is async and cannot
-reach an INITIALIZED order, so `close_all_positions` can still race it into a
-guard refusal — a cancel/close SEQUENCING defect, narrowed, not closed.
+**[HIGH] Blind-risk-view audit, 2026-09-02 — T-1 was not the only instance.**
+Three sweeps found the same shape elsewhere. Detail, with verified evidence and
+failure sequences: `docs/core/findings/BLIND_RISK_VIEWS_2026-09-02.md`.
+T-2 `_flatten` returns early on a settled-only qty, so a working order is never
+cancelled and fills after the settling observation is public (FIXING).
+T-3 `open_position_count()` is settled-only: 20 positions against a cap of 12.
+T-4 `_equity()` falls back to `starting_equity=10_000.0` and never refreshes —
+no strategy calls `query_account` — so `max_equity_fraction` sizes off a
+constant. T-5 settlement halt sits below `if forecast is None: return`.
+Also inventoried there: the live-trading permit system is wired to nothing, and
+the whole strategy risk surface is backtest-only (`strategies=[]`) — both
+preconditions on go-live, neither a live hole today.
+**Residual under all of it:** Nautilus cannot cancel an INITIALIZED
+order at all, so cancel/close sequencing stays narrowed, not closed.
 
 ---
 
