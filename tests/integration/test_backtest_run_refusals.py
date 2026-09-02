@@ -676,3 +676,89 @@ def test_an_order_list_of_two_sells_within_the_net_long_is_jointly_naked(
     finally:
         if engine is not None:
             engine.dispose()
+
+
+# ---------------------------------------------------------------------------
+# RED-13: two PLAIN `submit_order` SELLs defeat the guard too -- no order
+# list, no `reduce_only`, nothing exotic. docs/plans/ORDER_LIST_BYPASS_2026-
+# 09-02.md §0 G6, closed by Increment 1 (widening `_working_sell_quantity`
+# from `cache.orders_open(...)` to `cache.orders(...)` filtered to
+# `not is_closed`).
+# ---------------------------------------------------------------------------
+
+
+class _TwoPlainSellsNakedShortProbeConfig(StrategyConfig, frozen=True):
+    instrument_id: object
+    quantity: Decimal
+
+
+class _TwoPlainSellsNakedShortProbe(Strategy):  # type: ignore[misc]  # Strategy is a compiled Cython class erasing to Any
+    """Enters a long, then exits it with TWO sequential plain `submit_order`
+    SELLs, each sized to the whole position -- no `OrderList`, no
+    `reduce_only`.
+
+    Each `submit_order` publishes its `OrderInitialized` BEFORE calling
+    `cache.add_order` (`trading/strategy.pyx:855-859`), but the FIRST sell's
+    `cache.add_order` has already run (it happened when the first sell's own
+    `OrderSubmitted`/`OrderAccepted` events processed, upstream of this
+    handler) by the time the second is screened -- it sits in the cache as
+    `SUBMITTED`, invisible to `cache.orders_open(...)` (G5), so the
+    pre-Increment-1 guard read `pending=0` for the second sell and approved
+    both.
+    """
+
+    def __init__(self, config: _TwoPlainSellsNakedShortProbeConfig) -> None:
+        super().__init__(config)
+        self.entered = False
+        self.sells_submitted = 0
+
+    def on_start(self) -> None:
+        self.subscribe_order_book_depth(self.config.instrument_id)
+
+    def on_order_book_depth(self, depth: object) -> None:
+        del depth
+        if self.entered:
+            return
+        self.entered = True
+        instrument = self.cache.instrument(self.config.instrument_id)
+        self.submit_order(
+            self.order_factory.market(
+                instrument_id=instrument.id,
+                order_side=OrderSide.BUY,
+                quantity=instrument.make_qty(self.config.quantity),
+            ),
+        )
+
+    def on_order_filled(self, event: object) -> None:
+        if self.sells_submitted >= 2 or event.order_side != OrderSide.BUY:  # type: ignore[attr-defined]
+            return
+        instrument = self.cache.instrument(self.config.instrument_id)
+        for _ in range(2):
+            self.sells_submitted += 1
+            self.submit_order(
+                self.order_factory.limit(
+                    instrument_id=instrument.id,
+                    order_side=OrderSide.SELL,
+                    quantity=instrument.make_qty(self.config.quantity),
+                    price=instrument.make_price(Decimal("0.10")),
+                    time_in_force=TimeInForce.GTC,
+                ),
+            )
+
+
+def test_two_plain_submit_order_sells_within_the_net_long_are_jointly_naked(
+    tape: SyntheticBinaryTape,
+) -> None:
+    strategy = _TwoPlainSellsNakedShortProbe(
+        _TwoPlainSellsNakedShortProbeConfig(
+            instrument_id=tape.instrument.id,
+            quantity=Decimal(CLIP),
+        ),
+    )
+    engine = None
+    try:
+        with pytest.raises(ValueError, match="naked short of"):
+            engine = run_backtest(_config(tape), strategies=(strategy,))
+    finally:
+        if engine is not None:
+            engine.dispose()

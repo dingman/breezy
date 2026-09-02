@@ -17,7 +17,7 @@ from typing import TYPE_CHECKING
 
 import pytest
 from nautilus_trader.core.uuid import UUID4
-from nautilus_trader.model.enums import OrderSide, OrderType, TimeInForce
+from nautilus_trader.model.enums import OrderSide, OrderStatus, OrderType, TimeInForce
 from nautilus_trader.model.events import OrderInitialized
 from nautilus_trader.model.identifiers import (
     ClientOrderId,
@@ -43,6 +43,7 @@ if TYPE_CHECKING:  # pragma: no cover - typing only
 
 INSTRUMENT = InstrumentId(Symbol("synthetic-guard-market"), Venue("POLYMARKET_US"))
 NO_SIDE_EVIDENCE_DOC = "docs/evidence/no_side_instrument_probe_2026-08-31.md"
+_DEFAULT_WORKING_CLIENT_ORDER_ID = ClientOrderId("O-WORKING")
 
 
 class _FakePortfolio:
@@ -55,19 +56,44 @@ class _FakePortfolio:
 
 
 class _FakeOrder:
-    def __init__(self, *, side: OrderSide, leaves: Decimal, reduce_only: bool = False) -> None:
+    """Widened per `docs/plans/ORDER_LIST_BYPASS_2026-09-02.md` §6: the
+    pre-Increment-1 double carried only `side`/`leaves_qty`/`is_reduce_only`,
+    which is structurally blind to the INITIALIZED/SUBMITTED bypass -- it
+    could only ever represent an already-`orders_open`-visible order.
+    `is_closed` and `client_order_id` let a test express a not-yet-open
+    (or already-terminal) order, and `status` backs the guard's
+    diagnosability message (RED-23).
+    """
+
+    def __init__(
+        self,
+        *,
+        side: OrderSide,
+        leaves: Decimal,
+        reduce_only: bool = False,
+        is_closed: bool = False,
+        status: OrderStatus = OrderStatus.SUBMITTED,
+        client_order_id: ClientOrderId = _DEFAULT_WORKING_CLIENT_ORDER_ID,
+    ) -> None:
         self.side = side
         self.leaves_qty = Quantity(leaves, 0)
         self.is_reduce_only = reduce_only
+        self.is_closed = is_closed
+        self.status = status
+        self.client_order_id = client_order_id
 
 
 class _FakeCache:
-    def __init__(self, open_orders: Sequence[_FakeOrder] = ()) -> None:
-        self._open = list(open_orders)
+    """`orders` replaces `orders_open` as the guard's read (§2): a dict-backed,
+    unfiltered-by-openness view, matching real `Cache.orders(...)`.
+    """
 
-    def orders_open(self, *, instrument_id: InstrumentId | None = None) -> list[_FakeOrder]:
+    def __init__(self, orders: Sequence[_FakeOrder] = ()) -> None:
+        self._orders = list(orders)
+
+    def orders(self, *, instrument_id: InstrumentId | None = None) -> list[_FakeOrder]:
         del instrument_id
-        return self._open
+        return self._orders
 
 
 def _guard(
@@ -475,3 +501,107 @@ def test_two_reduce_only_sells_within_the_net_long_are_jointly_naked() -> None:
 
     with pytest.raises(NakedShortRefusedError):
         guard.on_order_event(_initialized(quantity=10, reduce_only=True))
+
+
+# ---------------------------------------------------------------------------
+# docs/plans/ORDER_LIST_BYPASS_2026-09-02.md §2/§6, Increment 1: `orders_open`
+# is the wrong set -- INITIALIZED/SUBMITTED are invisible to it, but already
+# committed. Widen the query to `cache.orders(...)` filtered to SELL and
+# `not is_closed`.
+# ---------------------------------------------------------------------------
+
+
+def test_a_submitted_but_unaccepted_sell_counts_against_the_budget() -> None:
+    """RED-14. The mechanism, not the symptom: a `SUBMITTED` SELL is absent
+    from `orders_open()` (`Order.is_open_c()` excludes it) but is a real
+    commitment `_working_sell_quantity` must count -- `leaves_qty` at
+    `SUBMITTED` equals the full `quantity`, no fill has touched it yet.
+    """
+    working = [
+        _FakeOrder(
+            side=OrderSide.SELL,
+            leaves=Decimal(10),
+            is_closed=False,
+            status=OrderStatus.SUBMITTED,
+        ),
+    ]
+
+    with pytest.raises(NakedShortRefusedError):
+        _guard(net=Decimal(10), open_orders=working).on_order_event(_initialized(quantity=10))
+
+
+def test_a_closed_sell_does_not_count_against_the_budget() -> None:
+    """RED-15, MUST PASS. The anti-false-refusal floor: `FILLED` and `DENIED`
+    SELLs are terminal (`Order.is_closed_c()`) and contribute 0 to `pending`,
+    so a plain SELL of the whole net long still passes with either sitting in
+    the cache.
+    """
+    closed = [
+        _FakeOrder(
+            side=OrderSide.SELL,
+            leaves=Decimal(10),
+            is_closed=True,
+            status=OrderStatus.FILLED,
+        ),
+        _FakeOrder(
+            side=OrderSide.SELL,
+            leaves=Decimal(10),
+            is_closed=True,
+            status=OrderStatus.DENIED,
+        ),
+    ]
+
+    _guard(net=Decimal(10), open_orders=closed).on_order_event(_initialized(quantity=10))
+
+
+def test_a_legitimate_full_exit_still_passes_under_the_widened_set() -> None:
+    """RED-16, MUST PASS. Regression floor: net 100, no working orders, a
+    plain SELL of 100 -- a full, legitimate exit -- still passes under the
+    widened `not is_closed` query.
+    """
+    _guard(net=Decimal(100)).on_order_event(_initialized(quantity=100))
+
+
+def test_two_plain_submit_order_sells_within_the_net_long_are_jointly_naked_unit() -> None:
+    """RED-13's unit-level twin. `submit_order` publishes `OrderInitialized`
+    BEFORE `cache.add_order` (`trading/strategy.pyx:855-859`), so at the
+    moment the SECOND sell is screened the FIRST is already `SUBMITTED` in
+    the cache -- invisible to `orders_open()`, visible to the widened query.
+    Net 10, one working plain SELL of 10 already `SUBMITTED`, an incoming
+    plain SELL of 10: jointly naked, no `reduce_only` and no order list.
+    """
+    working = [_FakeOrder(side=OrderSide.SELL, leaves=Decimal(10), status=OrderStatus.SUBMITTED)]
+
+    with pytest.raises(NakedShortRefusedError):
+        _guard(net=Decimal(10), open_orders=working).on_order_event(_initialized(quantity=10))
+
+
+def test_the_refusal_names_every_order_it_counted() -> None:
+    """RED-23. §2.1's required mitigation: the message must name each
+    contributor to `pending` by `client_order_id` and `status`, so an
+    operator can tell "blocked by a stuck SUBMITTED order" from "the
+    strategy genuinely oversold" without instrumenting the cache by hand.
+    """
+    working = [
+        _FakeOrder(
+            side=OrderSide.SELL,
+            leaves=Decimal(6),
+            status=OrderStatus.SUBMITTED,
+            client_order_id=ClientOrderId("O-STUCK"),
+        ),
+        _FakeOrder(
+            side=OrderSide.SELL,
+            leaves=Decimal(4),
+            status=OrderStatus.ACCEPTED,
+            client_order_id=ClientOrderId("O-RESTING"),
+        ),
+    ]
+
+    with pytest.raises(NakedShortRefusedError) as excinfo:
+        _guard(net=Decimal(10), open_orders=working).on_order_event(_initialized(quantity=1))
+
+    message = str(excinfo.value)
+    assert "O-STUCK" in message
+    assert "SUBMITTED" in message
+    assert "O-RESTING" in message
+    assert "ACCEPTED" in message

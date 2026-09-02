@@ -280,7 +280,11 @@ class _FakePortfolio:
 
 
 class _FakeCache:
-    def orders_open(self, *, instrument_id: InstrumentId | None = None) -> Sequence[object]:
+    """`orders`, not `orders_open` -- the guard reads `cache.orders(...)` since
+    `docs/plans/ORDER_LIST_BYPASS_2026-09-02.md` Increment 1 (§2).
+    """
+
+    def orders(self, *, instrument_id: InstrumentId | None = None) -> Sequence[object]:
         del instrument_id
         return ()
 

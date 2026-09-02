@@ -98,7 +98,13 @@ class _FakePortfolio:
 
 
 class _FakeCache:
-    def orders_open(self, *, instrument_id: InstrumentId | None = None) -> Sequence[Any]:
+    """`orders`, not `orders_open` -- the guard reads `cache.orders(...)` since
+    `docs/plans/ORDER_LIST_BYPASS_2026-09-02.md` Increment 1 (§2); every test
+    in this module screens against a net of 0 with no working orders either
+    way, so an always-empty return is unaffected by which method is called.
+    """
+
+    def orders(self, *, instrument_id: InstrumentId | None = None) -> Sequence[Any]:
         del instrument_id
         return ()
 

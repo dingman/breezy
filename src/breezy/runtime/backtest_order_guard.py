@@ -82,6 +82,7 @@ if TYPE_CHECKING:  # pragma: no cover - typing only
     from nautilus_trader.common.component import MessageBus
     from nautilus_trader.core.message import Event
     from nautilus_trader.model.identifiers import InstrumentId
+    from nautilus_trader.model.orders.base import Order
     from nautilus_trader.portfolio import Portfolio
 
 logger = logging.getLogger(__name__)
@@ -217,9 +218,18 @@ class BacktestOrderGuard:
             return
         instrument_id = event.instrument_id
         net = self._net_long(instrument_id)
-        pending = self._working_sell_quantity(instrument_id)
+        working = self._working_sell_orders(instrument_id)
+        pending = sum((order.leaves_qty.as_decimal() for order in working), Decimal(0))
         quantity = event.quantity.as_decimal()
         if pending + quantity > net:
+            contributors = (
+                ", ".join(
+                    f"{order.client_order_id} [{order.status.name}]="
+                    f"{order.leaves_qty.as_decimal()}"
+                    for order in working
+                )
+                or "none"
+            )
             raise NakedShortRefusedError(
                 f"{event.client_order_id} would SELL {quantity} of {instrument_id} "
                 f"against a net long of {net} (with {pending} already working) -- a "
@@ -241,10 +251,41 @@ class BacktestOrderGuard:
                 f"licence to skip this check: it is an ordinary, attacker-settable "
                 f"flag (any strategy can set it), so it is screened exactly like "
                 f"every other SELL -- a genuinely reducing sell still passes, "
-                f"because it satisfies this same inequality by construction.",
+                f"because it satisfies this same inequality by construction. "
+                f"Orders counted toward `pending` (client_order_id [status]=leaves_qty): "
+                f"{contributors} -- a stuck SUBMITTED order here, not a strategy that "
+                f"oversold, may be why this was refused; see "
+                f"`docs/plans/ORDER_LIST_BYPASS_2026-09-02.md` §2.1.",
             )
 
     # -- internals ---------------------------------------------------------
+
+    def _working_sell_orders(self, instrument_id: InstrumentId) -> list[Order]:
+        """SELL orders already committed against this instrument, not yet closed.
+
+        Reads `cache.orders(...)` -- every order this instrument has ever
+        seen, dict-backed so there is no double-count -- rather than
+        `cache.orders_open(...)`. `Order.is_open_c()` (`model/orders/base.pyx`)
+        is `ACCEPTED / TRIGGERED / PENDING_CANCEL / PENDING_UPDATE /
+        PARTIALLY_FILLED`; it excludes `INITIALIZED` and `SUBMITTED`, and
+        `Cache.add_order` never writes `_index_orders_open` (only
+        `update_order` does). So two ordinary sequential `submit_order` SELLs
+        each within the net long both screened against `orders_open() == []`
+        and both passed -- a genuine naked short, no flag and no order list
+        required (`docs/plans/ORDER_LIST_BYPASS_2026-09-02.md` §0 G5/G6).
+
+        `not order.is_closed` is a strict SUPERSET of `is_open`: it adds only
+        `INITIALIZED` / `SUBMITTED` / `EMULATED` / `RELEASED`, so `pending`
+        only WIDENS and the guard's accepted set only NARROWS -- the safe
+        direction. `leaves_qty` equals the full `quantity` at `INITIALIZED`
+        and is reduced only by fills, so it is the correct outstanding
+        commitment at every status this now counts.
+        """
+        return [
+            order
+            for order in self._cache.orders(instrument_id=instrument_id)
+            if order.side == OrderSide.SELL and not order.is_closed
+        ]
 
     def _working_sell_quantity(self, instrument_id: InstrumentId) -> Decimal:
         """Unfilled quantity on SELL orders already working for this instrument.
@@ -257,21 +298,18 @@ class BacktestOrderGuard:
         `Strategy.submit_order` publishes `OrderInitialized` BEFORE it calls
         `cache.add_order` (`trading/strategy.pyx:855-871`).
 
-        EVERY open SELL counts, `reduce_only` included -- the same divergence
-        from Nautilus's own `submitted_sell_qty` (F5,
+        EVERY not-yet-closed SELL counts, `reduce_only` included -- the same
+        divergence from Nautilus's own `submitted_sell_qty` (F5,
         `docs/plans/REDUCE_ONLY_BYPASS_2026-09-02.md`) that closes the
         jointly-naked pair of `reduce_only` sells: excluding them would make
         the FIRST one invisible to the budget the second is screened against.
 
-        `Cache.orders_open` guarantees no ordering (`cache.pyx:4719`); this is
-        a SUM, so the result does not depend on one.
+        See `_working_sell_orders` for why this reads `cache.orders(...)`
+        rather than `cache.orders_open(...)`. `Cache.orders` guarantees no
+        ordering either; this is a SUM, so the result does not depend on one.
         """
         return sum(
-            (
-                order.leaves_qty.as_decimal()
-                for order in self._cache.orders_open(instrument_id=instrument_id)
-                if order.side == OrderSide.SELL
-            ),
+            (order.leaves_qty.as_decimal() for order in self._working_sell_orders(instrument_id)),
             Decimal(0),
         )
 
