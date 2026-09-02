@@ -6,12 +6,19 @@
 # quote tape (forward-only, already on disk) and the settlement-alignment
 # ASOS cache (cache-only, zero network -- see the script's module docstring,
 # "THE HARD DEPENDENCY: NO LIVE INTRADAY ASOS INGEST").
+#
+# Item 4 (2026-09-02): an `ExecStartPre=` now refreshes recent ASOS via
+# `asos_recent_refresh.py` BEFORE the scan runs -- see that script's module
+# docstring for why this is a separate step rather than folded into the
+# scan itself (the scan's zero-network guarantee is load-bearing for the
+# no-egress test sandbox). This makes `network-online.target` a REAL
+# dependency for the refresh half of this unit, unlike before.
 Description=Breezy CLI-basis candidate #2 offer-gate scan (daily)
 Documentation=file:///home/jon/breezy/deploy/systemd/README.md
 Documentation=file:///home/jon/breezy/scripts/analysis/cli_basis_offer_gate_scan.py
-# Not a hard dependency: this reads the tape and the ASOS cache from local
-# disk and makes zero network calls of its own.
+Documentation=file:///home/jon/breezy/scripts/analysis/asos_recent_refresh.py
 After=network-online.target
+Wants=network-online.target
 
 [Service]
 Type=oneshot
@@ -38,6 +45,15 @@ UMask=0077
 # a dated, committed snapshot belongs under `docs/evidence/` and is written
 # deliberately, not by the timer. The verdict is one `print()` in `main()`,
 # visible via `journalctl --user -u breezy-offer-gate-daily.service`.
+#
+# ExecStartPre refreshes recent ASOS ahead of the scan (Item 4, BL-24: the
+# settlement-alignment cache otherwise never advances past whatever
+# incidental fetch last populated it, and the scan starves). Prefixed `-` so
+# an UNEXPECTED crash in the refresh script (as opposed to the per-site
+# shortfalls it already reports and swallows internally) can never block the
+# scan from running on whatever is already cached -- belt-and-suspenders on
+# top of the script's own fail-soft design, never a substitute for it.
+ExecStartPre=-/home/jon/breezy/.venv/bin/python /home/jon/breezy/scripts/analysis/asos_recent_refresh.py
 ExecStart=/home/jon/breezy/.venv/bin/python /home/jon/breezy/scripts/analysis/cli_basis_offer_gate_scan.py --output %h/.local/share/breezy/offer_gate/offer_gate_latest.md
 
 # Mirrors breezy-k1-daily.service's TimeoutStartSec: for Type=oneshot this

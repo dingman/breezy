@@ -17,10 +17,13 @@ data, matching the K1 precedent (`tests/unit/test_k1_cheap_open_settlement.py`).
 
 from __future__ import annotations
 
+import datetime as dt
+import json
 import sys
 from dataclasses import dataclass
 from decimal import Decimal
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -28,6 +31,9 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, (REPO_ROOT / "scripts/analysis").as_posix())
 
 from cli_basis_offer_gate_scan import (
+    BLOCKED_NO_OBSERVATION_DATA,
+    BLOCKED_NO_QUALIFYING_SETUP,
+    BLOCKED_TAPE_PREFLIGHT_FAILED,
     CHEAP_ASK_CEILING,
     CONTAMINATED_STATIONS,
     DEAD_UPPER_BOUND,
@@ -36,7 +42,9 @@ from cli_basis_offer_gate_scan import (
     MIN_LIQUIDITY_CONTRACTS,
     QUALIFYING_HEADROOM,
     AskLevel,
+    classify_blocked_reason,
     classify_instance,
+    fee_coefficient_from_instrument,
     genuine_ask_levels,
     headroom_f,
     is_open_upper_tail_facts,
@@ -46,7 +54,16 @@ from cli_basis_offer_gate_scan import (
     load_recent_asos_rows,
     notional_at_qualifying_levels,
     qualifying_ask_levels,
+    station_days_only_on_corrupt_tape,
 )
+
+# A REAL `BinaryOption`, built the same way `test_polymarket_us_fee_model.py`
+# builds one -- from a captured venue payload through the real parser --
+# rather than a hand-rolled fake, so `fee_coefficient_from_instrument` is
+# exercised against the exact `.info` shape `parse_binary_option` produces.
+from nautilus_trader.model.instruments import BinaryOption
+
+from breezy.adapters.polymarket_us.parsing import parse_binary_option
 
 # The repo's own preflight primitives -- pinned so this scan's LIVE/CORRUPT
 # classification cannot silently diverge from what
@@ -59,6 +76,52 @@ from breezy.persistence.feather_preflight import (
 
 # The min-liquidity floor is a single shared field, never re-hardcoded here.
 from breezy.strategy.weather_common.risk import RiskLimits
+
+_OPEN_MARKET_PAYLOAD_PATH = (
+    REPO_ROOT
+    / "docs"
+    / "evidence"
+    / "venue"
+    / "polymarket_us"
+    / "raw"
+    / "market_open_510636_by_slug.json"
+)
+_TS_INIT = 1_787_617_213_000_000_000
+
+
+def _binary_option_with_fee_coefficient(theta: object) -> BinaryOption:
+    payload: dict[str, Any] = json.loads(_OPEN_MARKET_PAYLOAD_PATH.read_text(encoding="utf-8"))
+    payload["market"]["feeCoefficient"] = theta
+    return parse_binary_option(payload, ts_init=_TS_INIT)
+
+
+def _binary_option_with_raw_info(instrument: BinaryOption, info: dict[str, Any]) -> BinaryOption:
+    """Clone ``instrument`` with a hand-set ``info`` (``info`` is read-only).
+
+    Bypasses `parse_binary_option`'s own fee-coefficient validation, which
+    already refuses an out-of-range value at parse time -- this exercises
+    `fee_coefficient_from_instrument`'s OWN defensive read against a shape
+    that could only ever reach it via a round-trip or serialisation bug, not
+    through the real parser.
+    """
+    return BinaryOption(
+        instrument_id=instrument.id,
+        raw_symbol=instrument.raw_symbol,
+        outcome=instrument.outcome,
+        description=instrument.description,
+        asset_class=instrument.asset_class,
+        currency=instrument.quote_currency,
+        price_precision=instrument.price_precision,
+        price_increment=instrument.price_increment,
+        size_precision=instrument.size_precision,
+        size_increment=instrument.size_increment,
+        activation_ns=instrument.activation_ns,
+        expiration_ns=instrument.expiration_ns,
+        min_quantity=instrument.min_quantity,
+        ts_event=instrument.ts_event,
+        ts_init=instrument.ts_init,
+        info=info,
+    )
 
 # ---------------------------------------------------------------------------
 # min_liquidity_contracts is read from the shared risk config, not hardcoded
@@ -438,6 +501,103 @@ def test_dead_and_go_bounds_are_pre_registered_at_ten_percent() -> None:
 # ---------------------------------------------------------------------------
 # NYC contamination: excluded from the aggregate feeding the kill rule
 # ---------------------------------------------------------------------------
+
+
+# ---------------------------------------------------------------------------
+# Item 2: the three-way blocked-reason split
+# ---------------------------------------------------------------------------
+
+
+def test_classify_blocked_reason_is_admissible_when_boundary_was_hit() -> None:
+    assert classify_blocked_reason(boundary_hits=1, asos_row_count=0) is None
+    assert classify_blocked_reason(boundary_hits=5, asos_row_count=500) is None
+
+
+def test_classify_blocked_reason_no_observation_data_when_asos_cache_is_empty() -> None:
+    """Zero cached ASOS rows means we CANNOT KNOW whether the setup occurred --
+    fixable by fetching, and must never be read as a genuine no-setup day.
+    """
+    assert classify_blocked_reason(boundary_hits=0, asos_row_count=0) == (
+        BLOCKED_NO_OBSERVATION_DATA
+    )
+
+
+def test_classify_blocked_reason_no_qualifying_setup_when_asos_exists_but_never_hit() -> None:
+    """ASOS coverage exists, but headroom never reached 1-or-2: a genuine,
+    countable base-rate fact -- the ONLY blocked reason allowed to feed `n`.
+    """
+    assert classify_blocked_reason(boundary_hits=0, asos_row_count=300) == (
+        BLOCKED_NO_QUALIFYING_SETUP
+    )
+
+
+def test_blocked_reasons_are_three_distinct_stable_codes() -> None:
+    codes = {
+        BLOCKED_NO_OBSERVATION_DATA,
+        BLOCKED_NO_QUALIFYING_SETUP,
+        BLOCKED_TAPE_PREFLIGHT_FAILED,
+    }
+    assert len(codes) == 3
+
+
+def test_station_days_only_on_corrupt_tape_surfaces_a_corrupt_only_day() -> None:
+    """A station-day seen ONLY inside a CORRUPT instance is invisible to the
+    clean-instance pipeline entirely -- this is the THIRD blocked state, and
+    must be surfaced rather than silently absorbed into "never happened".
+    """
+    corrupt = {("LAX", dt.date(2026, 8, 30))}
+    clean: set[tuple[str, dt.date]] = set()
+    assert station_days_only_on_corrupt_tape(
+        corrupt_station_days=corrupt, clean_station_days=clean
+    ) == frozenset({("LAX", dt.date(2026, 8, 30))})
+
+
+def test_station_days_only_on_corrupt_tape_excludes_a_day_also_seen_clean() -> None:
+    """A station-day covered by AT LEAST ONE clean instance is not tape-failed
+    -- the existing ASOS-based classification governs it instead, even if a
+    different, unrelated instance also happened to be corrupt that day.
+    """
+    key = ("LAX", dt.date(2026, 8, 30))
+    assert station_days_only_on_corrupt_tape(
+        corrupt_station_days={key}, clean_station_days={key}
+    ) == frozenset()
+
+
+def test_station_days_only_on_corrupt_tape_empty_when_nothing_is_corrupt() -> None:
+    assert (
+        station_days_only_on_corrupt_tape(corrupt_station_days=set(), clean_station_days=set())
+        == frozenset()
+    )
+
+
+# ---------------------------------------------------------------------------
+# Fee-coefficient extraction: read from the market, never hardcoded
+# ---------------------------------------------------------------------------
+
+
+def test_fee_coefficient_from_instrument_reads_the_markets_own_theta() -> None:
+    instrument = _binary_option_with_fee_coefficient("0.06")
+    assert fee_coefficient_from_instrument(instrument) == Decimal("0.06")
+
+
+def test_fee_coefficient_from_instrument_is_none_when_coefficient_is_missing() -> None:
+    instrument = _binary_option_with_fee_coefficient(None)
+    assert fee_coefficient_from_instrument(instrument) is None
+
+
+def test_fee_coefficient_from_instrument_is_none_for_an_out_of_range_value() -> None:
+    base = _binary_option_with_fee_coefficient("0.06")
+    tampered = _binary_option_with_raw_info(base, {**base.info, "fee_coefficient": "1.5"})
+    assert fee_coefficient_from_instrument(tampered) is None
+
+
+def test_fee_coefficient_from_instrument_is_none_for_a_boolean_value() -> None:
+    """`bool` is a subclass of `int` -- a plausible round-trip accident, and
+    explicitly guarded against in `fees.py`'s own reader (mirrored here).
+    """
+    base = _binary_option_with_fee_coefficient("0.06")
+    tampered = _binary_option_with_raw_info(base, {**base.info, "fee_coefficient": True})
+    assert fee_coefficient_from_instrument(tampered) is None
 
 
 def test_contaminated_stations_is_exactly_nyc() -> None:

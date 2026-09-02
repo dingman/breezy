@@ -132,7 +132,7 @@ import datetime as dt
 import sys
 from collections import Counter, defaultdict
 from collections.abc import Iterable, Mapping, Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from decimal import Decimal
 from pathlib import Path
 from typing import Any, Final, Literal
@@ -161,6 +161,7 @@ from settlement_alignment_study import (
     parse_asos_rows,
 )
 
+from breezy.adapters.polymarket_us.parsing import FEE_COEFFICIENT_KEY
 from breezy.adapters.polymarket_us.symbology import parse_weather_slug
 from breezy.adapters.polymarket_us.tape_records import DepthTruncation
 from breezy.domain.weather_bucket_facts import (
@@ -179,6 +180,9 @@ from breezy.runtime.quote_tape_preflight_cli import WRITER_ACTIVITY_GRACE_NS
 from breezy.strategy.weather_common.risk import RiskLimits
 
 __all__ = [
+    "BLOCKED_NO_OBSERVATION_DATA",
+    "BLOCKED_NO_QUALIFYING_SETUP",
+    "BLOCKED_TAPE_PREFLIGHT_FAILED",
     "CHEAP_ASK_CEILING",
     "CONTAMINATED_STATIONS",
     "DEAD_UPPER_BOUND",
@@ -189,7 +193,9 @@ __all__ = [
     "AskLevel",
     "InstrumentFacts",
     "StationDayResult",
+    "classify_blocked_reason",
     "classify_instance",
+    "fee_coefficient_from_instrument",
     "genuine_ask_levels",
     "headroom_f",
     "is_open_upper_tail_facts",
@@ -200,6 +206,7 @@ __all__ = [
     "main",
     "notional_at_qualifying_levels",
     "qualifying_ask_levels",
+    "station_days_only_on_corrupt_tape",
 ]
 
 VENUE: Final[str] = "polymarket_us"
@@ -233,6 +240,33 @@ DEAD_UPPER_BOUND: Final[float] = 0.10
 GO_LOWER_BOUND: Final[float] = 0.10
 
 InstanceVerdict = Literal["CLEAN", "EMPTY", "LIVE", "CORRUPT"]
+
+#: The three DISTINCT reasons a station-day can be inadmissible (Item 2: the
+#: prior single conflated reason -- "ASOS coverage never reached a
+#: headroom-1-or-2 instant" -- silently merged "we hold no ASOS for this
+#: station-day, so we cannot know" with "we hold the ASOS and the headroom
+#: genuinely never reached 1-2", which are different facts feeding different
+#: conclusions. Only `BLOCKED_NO_QUALIFYING_SETUP` is a genuine base-rate
+#: observation; the other two mean the day teaches us nothing either way.
+BLOCKED_NO_OBSERVATION_DATA: Final[str] = "NO_OBSERVATION_DATA"
+BLOCKED_NO_QUALIFYING_SETUP: Final[str] = "NO_QUALIFYING_SETUP"
+BLOCKED_TAPE_PREFLIGHT_FAILED: Final[str] = "TAPE_PREFLIGHT_FAILED"
+
+BLOCKED_REASON_DESCRIPTIONS: Final[Mapping[str, str]] = {
+    BLOCKED_NO_OBSERVATION_DATA: (
+        "no cached ASOS observation for this station -- fixable by fetching, "
+        "not evidence about the setup's base rate"
+    ),
+    BLOCKED_NO_QUALIFYING_SETUP: (
+        "ASOS coverage exists but headroom never reached 1-or-2 this "
+        "station-day -- a genuine no-setup day"
+    ),
+    BLOCKED_TAPE_PREFLIGHT_FAILED: (
+        "this station-day's open-tail instrument exists ONLY on a CORRUPT "
+        "quote-tape instance -- its quotes cannot be trusted, independent of "
+        "ASOS coverage"
+    ),
+}
 
 
 # ---------------------------------------------------------------------------
@@ -369,6 +403,83 @@ def classify_instance(
             return "LIVE"
         return "CORRUPT"
     return "CLEAN"
+
+
+# ---------------------------------------------------------------------------
+# Blocked-reason classification (Item 2: split the conflated reason)
+# ---------------------------------------------------------------------------
+
+
+def classify_blocked_reason(*, boundary_hits: int, asos_row_count: int) -> str | None:
+    """Which of the three BLOCKED states applies, or `None` if admissible.
+
+    `boundary_hits > 0` means the scan COULD have observed a qualifying
+    offer this station-day (ASOS coverage reached a headroom-1-or-2 instant
+    on a CLEAN tape), regardless of whether one was actually found -- that
+    is admissibility, unchanged from before this split. Below that, the
+    reason is exactly one of two DIFFERENT facts, previously conflated into
+    one sentence: zero cached ASOS rows for the station means "we cannot
+    know" (`BLOCKED_NO_OBSERVATION_DATA`); ASOS rows present but the
+    boundary never held means "we know, and it didn't happen"
+    (`BLOCKED_NO_QUALIFYING_SETUP`) -- a genuine, countable base-rate fact.
+    Only the second may ever be read as evidence about how often the setup
+    occurs; the first is fixable by fetching, and must never be silently
+    folded into the same denominator.
+    """
+    if boundary_hits > 0:
+        return None
+    if asos_row_count == 0:
+        return BLOCKED_NO_OBSERVATION_DATA
+    return BLOCKED_NO_QUALIFYING_SETUP
+
+
+def station_days_only_on_corrupt_tape(
+    *,
+    corrupt_station_days: Iterable[tuple[str, dt.date]],
+    clean_station_days: Iterable[tuple[str, dt.date]],
+) -> frozenset[tuple[str, dt.date]]:
+    """Station-days whose open-tail instrument exists ONLY on CORRUPT tape.
+
+    A station-day whose only sighting is inside a CORRUPT-classified
+    instance never reaches the clean-instance pipeline at all today, so it
+    is invisible to the report -- not even a row -- and a missing row reads,
+    incorrectly, as "this station-day never had an open-tail market". This
+    is the THIRD blocked state (Item 2): a real data-loss incident (L-8),
+    orthogonal to ASOS coverage, and it must be surfaced as its own row
+    rather than silently absorbed into either ASOS-based reason.
+    """
+    return frozenset(corrupt_station_days) - frozenset(clean_station_days)
+
+
+# ---------------------------------------------------------------------------
+# Fee-coefficient extraction -- best-effort, diagnostic only (never charges)
+# ---------------------------------------------------------------------------
+
+
+def fee_coefficient_from_instrument(instrument: BinaryOption) -> Decimal | None:
+    """This market's `theta`, read from `instrument.info`, or `None`.
+
+    Mirrors `PolymarketUSFeeModel`'s own read of
+    `instrument.info[FEE_COEFFICIENT_KEY]`
+    (`breezy.adapters.polymarket_us.fees._fee_coefficient`) -- NEVER a second,
+    hardcoded value -- but is deliberately non-raising: this scan reports
+    theta as a diagnostic fact about a qualifying event, not as a live fee
+    charge, so a market whose coefficient is absent or unparseable is
+    reported as `None` ("fee unknown") rather than aborting the whole scan.
+    """
+    info = instrument.info
+    if not isinstance(info, Mapping):
+        return None
+    raw = info.get(FEE_COEFFICIENT_KEY)
+    if raw is None or isinstance(raw, bool):
+        return None
+    try:
+        theta = Decimal(str(raw))
+    except Exception:  # noqa: BLE001 -- any malformed value is just "unknown"
+        return None
+    if not theta.is_finite() or theta < 0 or theta > 1:
+        return None
+    return theta
 
 
 # ---------------------------------------------------------------------------
@@ -541,6 +652,12 @@ class QualifyingInstant:
     best_ask: Decimal
     best_ask_size: Decimal
     notional: Decimal
+    #: The instrument identity and the FULL qualifying ask-level breakdown at
+    #: this instant -- needed downstream (Item 1's settlement join) to price
+    #: realized fees exactly, level by level, rather than approximating from
+    #: the aggregate notional alone.
+    instrument_id: str = ""
+    levels: tuple[AskLevel, ...] = field(default_factory=tuple)
 
 
 @dataclass(frozen=True, slots=True)
@@ -558,6 +675,15 @@ class StationDayResult:
     max_notional: Decimal
     blocked_reason: str | None
     hour_histogram: Mapping[int, int] = field(default_factory=dict)
+    #: The open-tail rung's own strike, and the peak-notional instant's full
+    #: identity/level breakdown/fee facts -- populated only when `event` is
+    #: True, and consumed by the settlement-join module (Item 1) rather than
+    #: recomputed there. `None`/`()` for every non-event row.
+    strike_f: int | None = None
+    peak_instrument_id: str | None = None
+    peak_levels: tuple[AskLevel, ...] = field(default_factory=tuple)
+    fee_coefficient: Decimal | None = None
+    quote_currency_precision: int | None = None
 
 
 def _ns_to_utc(ts_ns: int) -> dt.datetime:
@@ -647,6 +773,8 @@ def _evaluate_instrument(
                 best_ask=best.price,
                 best_ask_size=best.size,
                 notional=notional_at_qualifying_levels(qualifiers),
+                instrument_id=facts.instrument_id,
+                levels=qualifiers,
             )
         )
     return qualifying, boundary_hits
@@ -689,6 +817,9 @@ def _aggregate_station_day(
         max_notional=peak_notional_instant.notional,
         blocked_reason=None,
         hour_histogram=dict(histogram),
+        strike_f=peak_notional_instant.strike_f,
+        peak_instrument_id=peak_notional_instant.instrument_id,
+        peak_levels=peak_notional_instant.levels,
     )
 
 
@@ -759,8 +890,21 @@ def build_scan(
     clean_dirs = [
         tape_root / "live" / c.instance_id for c in classifications if c.verdict == "CLEAN"
     ]
+    corrupt_dirs = [
+        tape_root / "live" / c.instance_id for c in classifications if c.verdict == "CORRUPT"
+    ]
 
     binary_options = _load_stream(clean_dirs, "binary_option", BinaryOption)
+    # Identity-only read of CORRUPT instances' instrument registrations, so a
+    # station-day that exists ONLY on a corrupt tape (Item 2's third blocked
+    # state) is detected at all -- never used for quotes/depths/fees, which
+    # stay CLEAN-only throughout.
+    corrupt_binary_options = _load_stream(corrupt_dirs, "binary_option", BinaryOption)
+    corrupt_station_days = {
+        (facts.station, facts.climate_day)
+        for facts in (_instrument_facts(instrument) for instrument in corrupt_binary_options)
+        if facts is not None
+    }
     depths = _load_stream(clean_dirs, "order_book_depths", OrderBookDepth10)
     quotes = _load_stream(clean_dirs, "quote_tick", QuoteTick)
     truncations = _load_stream(clean_dirs, "custom_depth_truncation", DepthTruncation)
@@ -816,28 +960,51 @@ def build_scan(
         by_station_day[(facts.station, facts.climate_day)].extend(qualifying)
         boundary_hits_by_day[(facts.station, facts.climate_day)] += boundary_hits
 
+    binary_option_by_id = {str(instrument.id): instrument for instrument in binary_options}
+
     results: list[StationDayResult] = []
     for station, climate_day in sorted(station_days_seen):
         instants = by_station_day.get((station, climate_day), [])
         hits = boundary_hits_by_day.get((station, climate_day), 0)
-        blocked_reason = None
-        admissible = hits > 0
-        if not admissible:
-            row_count = asos_row_counts.get(station, 0)
-            blocked_reason = (
-                f"no ASOS observation cache for {station}"
-                if row_count == 0
-                else "ASOS coverage never reached a headroom-1-or-2 instant this station-day"
-            )
+        blocked_reason = classify_blocked_reason(
+            boundary_hits=hits, asos_row_count=asos_row_counts.get(station, 0)
+        )
+        result = _aggregate_station_day(
+            station=station,
+            climate_day=climate_day,
+            instants=instants,
+            admissible=blocked_reason is None,
+            blocked_reason=blocked_reason,
+        )
+        if result.event and result.peak_instrument_id is not None:
+            instrument = binary_option_by_id.get(result.peak_instrument_id)
+            if instrument is not None:
+                result = replace(
+                    result,
+                    fee_coefficient=fee_coefficient_from_instrument(instrument),
+                    quote_currency_precision=instrument.quote_currency.precision,
+                )
+        results.append(result)
+
+    # Item 2's third blocked state: a station-day whose open-tail instrument
+    # exists ONLY on a CORRUPT tape instance never reaches `station_days_seen`
+    # (which is derived from CLEAN instances only) and would otherwise be
+    # invisible -- not even a row -- rather than reported as a real, named
+    # data-loss incident.
+    tape_failed_station_days = station_days_only_on_corrupt_tape(
+        corrupt_station_days=corrupt_station_days, clean_station_days=station_days_seen
+    )
+    for station, climate_day in sorted(tape_failed_station_days):
         results.append(
             _aggregate_station_day(
                 station=station,
                 climate_day=climate_day,
-                instants=instants,
-                admissible=admissible,
-                blocked_reason=blocked_reason,
+                instants=(),
+                admissible=False,
+                blocked_reason=BLOCKED_TAPE_PREFLIGHT_FAILED,
             )
         )
+    results.sort(key=lambda r: (r.station, r.climate_day))
 
     dense_admissible = [r for r in results if r.dense and r.admissible]
     n = len(dense_admissible)
@@ -913,18 +1080,24 @@ def render_report(scan: Mapping[str, Any]) -> str:
     add("")
     add(
         "| Station | Climate day | Dense? | Admissible | Event | Qualifying "
-        "instants | Best ask | Size | Max notional | Blocked reason |"
+        "instants | Strike | Best ask | Size | Max notional | Blocked reason |"
     )
-    add("|---|---|:--:|:--:|:--:|---:|---:|---:|---:|---|")
+    add("|---|---|:--:|:--:|:--:|---:|---:|---:|---:|---:|---|")
     for r in scan["station_day_results"]:
         label = "CONTAMINATED" if not r.dense else "dense"
+        reason_text = "-"
+        if r.blocked_reason is not None:
+            reason_text = (
+                f"{r.blocked_reason} ({BLOCKED_REASON_DESCRIPTIONS.get(r.blocked_reason, '')})"
+            )
         add(
             f"| {r.station} | {r.climate_day.isoformat()} | {label} | "
             f"{'yes' if r.admissible else 'no'} | {'YES' if r.event else 'no'} | "
             f"{r.n_qualifying_instants} | "
+            f"{'gte' + str(r.strike_f) + 'f' if r.strike_f is not None else '-'} | "
             f"{r.best_ask if r.best_ask is not None else '-'} | "
             f"{r.best_ask_size if r.best_ask_size is not None else '-'} | "
-            f"{r.max_notional} | {r.blocked_reason or '-'} |"
+            f"{r.max_notional} | {reason_text} |"
         )
     add("")
     add("### Hour-of-day breakdown (diagnostic only -- NOT a gate; see docstring)")

@@ -202,7 +202,13 @@ def test_is_non_sentinel_final_false_for_preliminary(study: ModuleType) -> None:
 # ---------------------------------------------------------------------------
 
 
-def _running_max_day(pmr: ModuleType, *, city: str, climate_day: dt.date, running_max_f: tuple):
+def _running_max_day(
+    pmr: ModuleType,
+    *,
+    city: str,
+    climate_day: dt.date,
+    running_max_f: tuple[int | None, ...],
+) -> object:
     return pmr.RunningMaxDay(
         city=city,
         climate_day=climate_day,
@@ -217,8 +223,8 @@ def _running_max_day(pmr: ModuleType, *, city: str, climate_day: dt.date, runnin
     )
 
 
-def _series_with(hour_values: dict) -> tuple:
-    series = [None] * 24
+def _series_with(hour_values: dict[int, int]) -> tuple[int | None, ...]:
+    series: list[int | None] = [None] * 24
     for hour, value in hour_values.items():
         series[hour] = value
     return tuple(series)
