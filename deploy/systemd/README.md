@@ -283,6 +283,38 @@ systemd 259 (259.5-0ubuntu3.4). Host clock is UTC (`timedatectl`: `Etc/UTC`).
 
 ---
 
+## TRAP: editing a symlinked unit does NOT reload it
+
+The units here are symlinked into `~/.config/systemd/user/` so the repo is the
+deployed truth. That is the point — and it is also the trap, because systemd
+caches the unit it PARSED at load time. Editing the file in the repo changes
+what a human reads and NOT what systemd runs, silently, with no warning at the
+edit site.
+
+Caught live on 2026-09-02: `breezy-offer-gate-daily.service` gained an
+`ExecStartPre=` that refreshes recent ASOS before the scan. On disk it was
+there; `systemctl --user show ... -p ExecStartPre` returned EMPTY, and
+`NeedDaemonReload` was `yes`. That night's timer would have run the OLD unit,
+skipped the refresh, and reported "no observation data" for every station-day —
+losing a day of accumulation on a programme whose binding constraint IS
+elapsed calendar time, and reporting it as a normal empty result.
+
+**After ANY edit to a file in this directory:**
+
+```bash
+systemctl --user daemon-reload
+systemctl --user show <unit> -p NeedDaemonReload --value   # must print: no
+systemctl --user show <unit> -p ExecStart -p ExecStartPre  # must match the file
+```
+
+`daemon-reload` re-reads configuration and starts/stops nothing: a running
+service keeps its old config until it is restarted, so this is safe to run while
+`breezy-quote-tape.service` is recording. Verified — the recorder's MainPID was
+identical either side of the reload.
+
+Do not trust the timer's `NEXT` column as evidence the unit is current. It shows
+when the timer will fire, never which version of the service it will fire.
+
 ## G-14 status — DONE 2026-09-02T04:38Z
 
 - **ACTIVATED AND VERIFIED.** Units symlinked into `~/.config/systemd/user/`,
