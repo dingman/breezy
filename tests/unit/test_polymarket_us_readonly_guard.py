@@ -61,6 +61,17 @@ Step 1 -- classify each ``*.py`` file under ``src/`` and ``scripts/`` as
        and C2 miss), so before C5 every write-verb rule silently did not
        apply to it. Measured before landing: C5 newly classifies 15 shipped
        modules and adds ZERO V1-V4, F1 or E0-E3 findings.
+  (C6) its AST references ``HttpClient`` or ``nautilus_pyo3`` anywhere --
+       import, attribute chain, or a type annotation -- by exact identifier,
+       never a substring. The concrete escape C6 closes is a helper that
+       fails C1-C5 outright (no venue import, no venue literal, outside both
+       path prefixes) because it receives an already-constructed
+       ``HttpClient`` as a parameter and calls a write verb on it. Measured
+       before landing against the shipped ``src/`` and ``scripts/`` trees:
+       C6 reclassifies ZERO additional real modules, because every module
+       that names ``HttpClient``/``nautilus_pyo3`` as a live identifier
+       already matches C1 or C2, and the modules that only mention them in
+       comments or docstrings are untouched -- C6 reads names, not strings.
 
 A file that is not venue-touching is exempt from the write-verb rules. That
 exemption is deliberate and load-bearing: ``src/breezy/runtime/health.py``
@@ -84,7 +95,13 @@ Step 2 -- inside a venue-touching file, report a violation for ANY of:
        where receiver inference is statically undecidable;
   (V4) a ``getattr(x, "post")``-style call: ``ast.Call`` to the bare name
        ``getattr`` whose second positional argument is a constant string
-       in the V3 name set. Without this, V3 is trivially bypassed.
+       in the V3 or V5 name set. Without this, V3/V5 are trivially bypassed;
+  (V5) an ``ast.Attribute`` whose ``attr``, or a bare ``ast.Name`` whose
+       ``id``, is a write-capable ``nautilus_pyo3`` free function
+       (``http_post``, ``http_patch``, ``http_delete``). Neither a receiver
+       method call (V3 miss -- the name is ``http_post``, not ``post``) nor
+       a string literal (V1 miss), so a module-level free-function call was
+       invisible to every rule above it.
 
 RESIDUAL GAP, stated rather than papered over, and NARROWER since C5: a
 module that names the venue NOWHERE -- not its host, not its name, not its
@@ -148,6 +165,24 @@ SDK_ROOT_PACKAGE = "polymarket_us"
 
 _WRITE_METHODS = frozenset({"POST", "PUT", "PATCH", "DELETE"})
 _WRITE_ATTRS = frozenset({"post", "put", "patch", "delete", "request"})
+#: V5 -- module-level free functions in ``nautilus_trader.core.nautilus_pyo3``
+#: that perform an HTTP write verb, per the installed ``.pyi``
+#: (``http_get``, ``http_post``, ``http_patch``, ``http_delete``,
+#: ``http_download``). These bypass V1 (no write-method string literal
+#: appears) AND V3 (``nautilus_pyo3.http_post(...)`` is an ``ast.Attribute``
+#: named ``http_post``, not ``post`` -- a different name, not a different
+#: node shape -- and ``from ... import http_post`` then ``http_post(...)``
+#: is a bare ``ast.Name`` call, not an ``ast.Attribute`` at all). Kept as a
+#: separate set from ``_WRITE_ATTRS`` deliberately: ``_WRITE_ATTRS`` holds
+#: generic receiver-method names (``post``, ``request``, ...) that collide
+#: constantly with ordinary bare identifiers (a ``request`` parameter, a
+#: ``post`` loop variable) and would be unusable as a bare-``Name`` rule;
+#: these ``http_*`` names are specific enough to check as bare names too.
+#: ``http_get`` and ``http_download`` are excluded on purpose: a read verb
+#: and a file-download verb, not venue write egress. There is no
+#: ``http_put`` in the upstream ``.pyi`` -- HTTP PUT has no pyo3
+#: free-function form to evade through, so none is pinned here.
+_WRITE_FUNCTIONS = frozenset({"http_post", "http_patch", "http_delete"})
 _ORDER_PATH_RE = re.compile(r"/v\d+/orders?\b", re.IGNORECASE)
 _VENUE_HOST_RE = re.compile(
     r"\b(?:api|gateway)\.polymarket\.us\b|\bpolymarketexchange\.com\b",
@@ -160,6 +195,23 @@ _VENUE_HOST_RE = re.compile(
 #: under the write-verb rules.
 _VENUE_NAME_RE = re.compile(r"polymarket", re.IGNORECASE)
 _ADAPTER_PACKAGE = "breezy.adapters.polymarket_us"
+
+#: C6 -- names that put a module on the pyo3 HTTP-client surface even when
+#: it names no venue host, venue string, SDK import, or adapter path: a
+#: helper that receives an already-constructed ``HttpClient`` as a parameter
+#: (matched via its type annotation), or that references
+#: ``nautilus_pyo3`` anywhere -- import, attribute chain, or bare name.
+#: Exact identifier match only, never a substring: this is what keeps an
+#: ``asyncio.Queue``-typed parameter (``Queue`` != ``HttpClient``) and a
+#: plain-string docstring mention (a ``str`` constant, not a ``Name``/
+#: ``Attribute`` node) from tripping it. Broadening classification is
+#: always the safe direction for a scan gate (see the ``_VENUE_NAME_RE``
+#: comment above); measured before landing against the shipped ``src/`` and
+#: ``scripts/`` trees, C6 reclassifies ZERO additional real modules --every
+#: file that names ``HttpClient``/``nautilus_pyo3`` as literal identifiers
+#: already matches C1 or C2, and the three modules that only mention them in
+#: comments or docstrings are untouched, because C6 does not read strings.
+_HTTP_CLIENT_SURFACE_NAMES = frozenset({"HttpClient", "nautilus_pyo3"})
 
 #: C2 -- script directories whose contents are venue-touching BY PATH.
 #:
@@ -246,16 +298,21 @@ def is_venue_touching(path: str, tree: ast.AST) -> bool:
             return True  # C4
         if module == _ADAPTER_PACKAGE or module.startswith(_ADAPTER_PACKAGE + "."):
             return True  # C4
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Name) and node.id in _HTTP_CLIENT_SURFACE_NAMES:
+            return True  # C6
+        if isinstance(node, ast.Attribute) and node.attr in _HTTP_CLIENT_SURFACE_NAMES:
+            return True  # C6
     return False
 
 
 # --------------------------------------------------------------------------
-# Step 2 -- B4 write-egress rules (V1-V4)
+# Step 2 -- B4 write-egress rules (V1-V5)
 # --------------------------------------------------------------------------
 
 
 def find_write_egress_violations(path: str, source: str) -> list[Violation]:
-    """Apply rules V1-V4 to one module. Non-venue-touching modules pass."""
+    """Apply rules V1-V5 to one module. Non-venue-touching modules pass."""
     tree = ast.parse(source, filename=path)
     if not is_venue_touching(path, tree):
         return []
@@ -268,9 +325,28 @@ def find_write_egress_violations(path: str, source: str) -> list[Violation]:
                 found.append(Violation(path, node.lineno, "V1", f"write-method literal {text!r}"))
             if _ORDER_PATH_RE.search(text):
                 found.append(Violation(path, node.lineno, "V2", f"order-path literal {text!r}"))
-        elif isinstance(node, ast.Attribute) and node.attr in _WRITE_ATTRS:
+        elif isinstance(node, ast.Attribute):
+            if node.attr in _WRITE_ATTRS:
+                found.append(
+                    Violation(path, node.lineno, "V3", f"write-capable attribute .{node.attr}")
+                )
+            elif node.attr in _WRITE_FUNCTIONS:
+                found.append(
+                    Violation(
+                        path,
+                        node.lineno,
+                        "V5",
+                        f"write-capable free function .{node.attr}",
+                    )
+                )
+        elif isinstance(node, ast.Name) and node.id in _WRITE_FUNCTIONS:
             found.append(
-                Violation(path, node.lineno, "V3", f"write-capable attribute .{node.attr}")
+                Violation(
+                    path,
+                    node.lineno,
+                    "V5",
+                    f"write-capable free function {node.id}",
+                )
             )
         elif (
             isinstance(node, ast.Call)
@@ -279,7 +355,7 @@ def find_write_egress_violations(path: str, source: str) -> list[Violation]:
             and len(node.args) >= 2
             and isinstance(node.args[1], ast.Constant)
             and isinstance(node.args[1].value, str)
-            and node.args[1].value in _WRITE_ATTRS
+            and node.args[1].value in _WRITE_ATTRS | _WRITE_FUNCTIONS
         ):
             found.append(
                 Violation(
@@ -611,6 +687,187 @@ def test_b4_scan_covers_both_src_and_scripts() -> None:
     scanned = {path for path, _ in iter_python_sources(EGRESS_SCAN_ROOTS)}
     assert any(p.startswith("src/") for p in scanned)
     assert any(p.startswith("scripts/") for p in scanned)
+
+
+# ==========================================================================
+# Evasion 1 (V5) -- ``nautilus_pyo3`` module-level free HTTP write functions
+# ==========================================================================
+
+
+def test_b4_detects_the_free_function_escape_via_attribute_access() -> None:
+    """The exact measured escape: ``nautilus_pyo3.http_post(...)`` has no
+    ``"POST"`` string literal and no ``.post`` attribute -- V1 and V3 both
+    miss it before V5.
+    """
+    source = (
+        "import polymarket_us\n"
+        "from nautilus_trader.core import nautilus_pyo3\n"
+        "\n"
+        "\n"
+        "def send(url, body):\n"
+        "    return nautilus_pyo3.http_post(url, body=body)\n"
+    )
+    assert "POST" not in source
+    violations = find_write_egress_violations("scripts/venue/evil.py", source)
+    assert [v.rule for v in violations] == ["V5"]
+    assert "http_post" in violations[0].detail
+
+
+def test_b4_detects_the_free_function_escape_via_bare_name_after_import() -> None:
+    """``from ... import http_post`` then ``http_post(...)`` is an
+    ``ast.Name`` call, not an ``ast.Attribute`` -- a second, distinct shape
+    the attribute-only rule above cannot see."""
+    source = (
+        "import polymarket_us\n"
+        "from nautilus_trader.core.nautilus_pyo3 import http_post\n"
+        "\n"
+        "\n"
+        "def send(url, body):\n"
+        "    return http_post(url, body=body)\n"
+    )
+    violations = find_write_egress_violations("scripts/venue/evil.py", source)
+    assert [v.rule for v in violations] == ["V5"]
+    assert violations[0].detail == "write-capable free function http_post"
+
+
+def test_b4_detects_http_patch_and_http_delete_free_functions_too() -> None:
+    """Enumerated from the ``.pyi``, not just the one function a reviewer
+    happened to measure."""
+    for name in ("http_patch", "http_delete"):
+        source = (
+            f"from nautilus_trader.core.nautilus_pyo3 import {name}\n"
+            "import polymarket_us\n"
+            "\n"
+            "\n"
+            f"def go(url):\n    return {name}(url)\n"
+        )
+        violations = find_write_egress_violations("scripts/venue/evil.py", source)
+        assert [v.rule for v in violations] == ["V5"], name
+
+
+def test_b4_does_not_flag_the_read_and_download_free_functions() -> None:
+    """Non-vacuity in the other direction: ``http_get``/``http_download`` are
+    read/file verbs, deliberately excluded from ``_WRITE_FUNCTIONS``."""
+    source = (
+        "import polymarket_us\n"
+        "from nautilus_trader.core.nautilus_pyo3 import http_get, http_download\n"
+        "\n"
+        "\n"
+        "def go(url):\n"
+        "    http_download(url, '/tmp/out')\n"
+        "    return http_get(url)\n"
+    )
+    assert find_write_egress_violations("scripts/venue/evil.py", source) == []
+
+
+def test_b4_detects_the_getattr_bypass_of_a_free_function_name() -> None:
+    """V4's bypass check must cover V5's name set too, not just V3's."""
+    source = (
+        "import polymarket_us\n"
+        "from nautilus_trader.core import nautilus_pyo3\n"
+        "\n"
+        "\n"
+        "def go(url):\n"
+        "    return getattr(nautilus_pyo3, 'http_post')(url)\n"
+    )
+    rules = {v.rule for v in find_write_egress_violations("scripts/venue/evil.py", source)}
+    assert "V4" in rules
+
+
+def test_b4_a_bare_name_matching_a_free_function_outside_a_venue_module_is_exempt() -> None:
+    """The exemption still holds: a non-venue module using the plain
+    identifier ``http_post`` for something unrelated is not scanned at all,
+    because it never becomes venue-touching."""
+    source = "def http_post(url, body):\n    return _local_sender(url, body)\n"
+    assert find_write_egress_violations("src/breezy/runtime/health.py", source) == []
+
+
+# ==========================================================================
+# Evasion 2 (C6) -- a helper receiving an already-constructed HttpClient
+# ==========================================================================
+
+#: The planted helper: no venue import, no venue string, no SDK import,
+#: outside both path prefixes -- it fails C1-C5 outright, and reaches a
+#: write verb through a parameter typed ``HttpClient``.
+_PLANTED_HTTP_CLIENT_PARAMETER_HELPER = (
+    "from nautilus_trader.core.nautilus_pyo3 import HttpClient\n"
+    "\n"
+    "\n"
+    "def send(client: HttpClient, url, body):\n"
+    "    return client.post(url, body=body)\n"
+)
+
+
+def test_c6_classifies_a_helper_receiving_an_already_constructed_httpclient() -> None:
+    path = "src/breezy/ingest/rogue_helper.py"
+    tree = ast.parse(_PLANTED_HTTP_CLIENT_PARAMETER_HELPER, filename=path)
+    assert is_venue_touching(path, tree) is True
+
+
+def test_c6_the_planted_helper_matches_none_of_c1_to_c5() -> None:
+    """Pins WHY the helper was undetected before C6, same discipline as C5."""
+    path = "src/breezy/ingest/rogue_helper.py"
+    tree = ast.parse(_PLANTED_HTTP_CLIENT_PARAMETER_HELPER, filename=path)
+
+    assert not path.startswith("src/breezy/adapters/polymarket_us/")  # C1
+    assert not any(path.startswith(prefix) for prefix in VENUE_TOUCHING_SCRIPT_PREFIXES)  # C2
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Constant) and isinstance(node.value, str):
+            assert not _VENUE_HOST_RE.search(node.value)  # C3
+            assert not _VENUE_NAME_RE.search(node.value)  # C5
+    for module in _imported_module_strings(tree):
+        assert module.split(".")[0] != SDK_ROOT_PACKAGE  # C4
+        assert not module.startswith(_ADAPTER_PACKAGE)  # C4
+
+
+def test_c6_makes_the_write_verb_rule_apply_to_the_planted_helper() -> None:
+    path = "src/breezy/ingest/rogue_helper.py"
+    violations = find_write_egress_violations(path, _PLANTED_HTTP_CLIENT_PARAMETER_HELPER)
+    assert "V3" in {v.rule for v in violations}
+
+
+def test_c6_does_not_classify_a_module_using_an_asyncio_queue_typed_parameter() -> None:
+    """Near miss 1: ``Queue`` is not ``HttpClient`` -- exact match only."""
+    source = (
+        "import asyncio\n"
+        "\n"
+        "\n"
+        "def drain(q: asyncio.Queue) -> None:\n"
+        "    q.put(1)\n"
+    )
+    tree = ast.parse(source, filename="src/breezy/runtime/whatever.py")
+    assert is_venue_touching("src/breezy/runtime/whatever.py", tree) is False
+
+
+def test_c6_does_not_classify_a_module_calling_dict_get() -> None:
+    """Near miss 2: ``.get`` on an ordinary mapping is not the HTTP surface."""
+    source = "def read(d):\n    return d.get('key')\n"
+    tree = ast.parse(source, filename="src/breezy/runtime/whatever.py")
+    assert is_venue_touching("src/breezy/runtime/whatever.py", tree) is False
+
+
+def test_c6_does_not_classify_a_module_that_only_mentions_it_in_a_docstring() -> None:
+    """Near miss 3: this is the real shape of ``src/breezy/ingest/http.py`` --
+    a prose mention inside a string constant, not a ``Name``/``Attribute``
+    node. C6 must not turn a docstring into a classification."""
+    source = (
+        '"""Uses nautilus_pyo3.HttpClient for venue traffic, not this module."""\n'
+        "\n"
+        "def fetch(url):\n"
+        "    return _local_get(url)\n"
+    )
+    tree = ast.parse(source, filename="src/breezy/ingest/http.py")
+    assert is_venue_touching("src/breezy/ingest/http.py", tree) is False
+
+
+def test_c6_measured_against_the_real_tree_adds_no_new_violations() -> None:
+    """L-15: run the classifier over the shipped tree, don't reason about it.
+
+    Every real module that references ``HttpClient``/``nautilus_pyo3`` as a
+    live identifier already matches C1 or C2, so C6 must not change the
+    live B4 finding count.
+    """
+    assert scan_write_egress() == []
 
 
 # ==========================================================================
