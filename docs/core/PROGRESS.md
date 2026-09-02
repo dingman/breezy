@@ -190,11 +190,18 @@ forecast ingest → ~300 station-days → CAPACITY).
 forward; settlement-as-exit bypasses `_submit_order`'s refusal latch.
 **[HIGH, TRACKED] `submit_order_list` defeats the naked-short guard** —
 publishes every member's `OrderInitialized` before `cache.add_order`
-(`trading/strategy.pyx:944-981`), so `_working_sell_quantity` reads
-`pending=0` per member. `xfail(strict=True)`
-(`docs/plans/REDUCE_ONLY_BYPASS_2026-09-02.md` §6); needs mutable state to
-fix. `reduce_only` no longer exempts a SELL (§1/§2, landed). **R-4's standing
-refusal (`exec/client.py:1338-1350`) stays GATED on this.**
+(`trading/strategy.pyx:944-981`), so the guard sees `pending=0` per member.
+`xfail(strict=True)` RED-12; needs mutable state
+(`docs/plans/ORDER_LIST_BYPASS_2026-09-02.md` Increment 2). The wider
+SUBMITTED-blindness and `reduce_only` are CLOSED (d7c6063, e83b8e0).
+**R-4's standing refusal (`exec/client.py:1338-1350`) stays GATED on RED-12.**
+
+**[HIGH, TRACKED] T-1 — the same blindness at the STRATEGY layer.**
+`weather_common/risk.py:198-204` documents two independent covers for the
+jointly-naked case; both call `cache.orders_open`, which is one query with a
+hole. 14 call sites / 6 modules: 8 skip-gates, and 5 feeding
+`_signed_open_order_qty`, so the risk snapshot's own in-flight view is blind
+too. Correct that docstring in the same change.
 
 ---
 
