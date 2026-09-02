@@ -717,3 +717,52 @@ increment is sized wrong, and the widenings get done under implementation
 pressure rather than under review. That is the condition under which someone
 relaxes a comparison instead of widening a set — which is exactly what L-12
 exists to prevent.
+
+---
+
+## L-15 — When a barrier's scope is decided by a classifier, RUN the classifier (2026-09-02)
+
+The R-6a increment plan stated its barrier basis as: "`backtest_order_guard.py`
+carries **0** venue references, so B4 never classifies it and V1-V4 do not
+apply." Both halves were false. The file carries **6** venue references, and
+`is_venue_touching()` returns **True** on it — classifier rule **C5**
+(`_VENUE_NAME_RE = /polymarket/i`, `test_polymarket_us_readonly_guard.py:230`)
+matches the venue's NAME in *any* `ast.Constant`, and a module docstring **is**
+an `ast.Constant`. The file had been inside barrier B4's scope the entire time.
+
+The conclusion — "no barrier files change" — happened to survive, because the
+increment adds no write verb. That near-miss is the point: a false premise that
+reaches a true conclusion is not caught by the conclusion being true.
+
+**Why the derivation failed even though L-14 was followed.** L-14 fixed *not
+deriving the list*. This is the next failure inward: the list WAS derived, but
+one input to it was **guessed by reading the file** when the thing that decides
+it is an **importable, executable function**. Nobody has to reason about whether
+a docstring counts as a string constant, or whether "0 venue references" is even
+the right question — `is_venue_touching(path, ast.parse(src))` answers it in one
+line, and `find_write_egress_violations(path, src)` returns the current
+violations as data:
+
+```python
+import ast, sys; sys.path.insert(0, "tests/unit")
+from test_polymarket_us_readonly_guard import is_venue_touching, find_write_egress_violations
+```
+
+**How to apply.** Before asserting in any plan, brief, or review that a barrier
+does or does not apply to a file: import the barrier's own predicate and call it
+on that file. Report the measured boolean, not a reading of the source. If a
+barrier's scope cannot be evaluated by calling something, say the scope is
+UNKNOWN rather than inferring it — an inferred exemption is the one that gets
+discovered by a red gate at landing time.
+
+**The trap this particular case was hiding.** Because the file *is* in scope,
+rule V3 applies to it: V3 refuses any `ast.Attribute` named `post`, `put`,
+`patch`, `delete`, or `request` — **syntactically, on any object at all**.
+Nautilus's `MessageBus` has a `.request()` method. An installer written as
+`msgbus.request(...)` would trip V3 inside a file the plan called exempt, and
+the tempting "fix" — narrowing the classifier or shrinking the attribute set —
+is precisely the [[L-12]] violation: widen an exact-set barrier, never relax the
+comparison. Use `msgbus.subscribe(...)`; the code bends, the barrier does not.
+
+Related: L-12 (never relax an exact-set barrier), L-14 (derive the barrier list,
+never recall it).

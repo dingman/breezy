@@ -474,9 +474,25 @@ existing source-string assertion); `test_refuse_naked_short_refuses_and_names_th
 `test_a_claimed_settlement_order_with_tags_none_passes_the_live_guard` (the trap that looks like
 a working guard); `test_an_untagged_unclaimed_market_sell_is_still_refused`.
 
-**Barrier files that change: none — and Revision 3 states the basis rather than the assertion.**
-Checked against the enumerated list in §3 W: `backtest_order_guard.py` carries **0** venue
-references, so B4 never classifies it and V1-V4 do not apply; it adds no cage constant, so the
+**Barrier files that change: none — basis CORRECTED in Revision 5; the conclusion held, the
+reasoning did not.** Revision 3 asserted `backtest_order_guard.py` carries **0** venue references,
+so B4 never classifies it. **Both halves are false, and were measured false on 2026-09-02:** the
+file carries **6** venue references (module docstring line 6, docstrings 93/106, f-strings
+145/165/166), and `is_venue_touching()` returns **True** on it — classifier rule **C5**
+(`_VENUE_NAME_RE = /polymarket/i`) matches the venue's NAME in *any* `ast.Constant`, and a module
+docstring is an `ast.Constant`. The file has been in B4 scope all along; it simply has **0**
+current V1-V4 violations (also measured). So R-6a lands clean — but **because it adds no write
+verb, not because the file is unclassified.**
+
+**The live trap this correction exposes:** V3 bans any `ast.Attribute` whose name is in
+`{post, put, patch, delete, request}` — *syntactically, on any object whatsoever*. Nautilus's
+`MessageBus` HAS a `.request()` method. An installer written as `msgbus.request(...)` would trip
+V3 inside a file the plan claimed was exempt. Mirror `install_order_guard` and use
+`msgbus.subscribe(topic=..., handler=...)`; `subscribe` is not in the banned set. Do NOT
+"fix" a V3 hit by narrowing the classifier or the attribute set — that is the exact L-12
+violation (widen an exact-set barrier, never relax the comparison).
+
+Continuing the enumerated §3 W check: it adds no cage constant, so the
 `CAGE_RULE_PINS` equality (`test_cage_rule_constants_are_pinned.py:780`) is unaffected; it adds
 no exemption, so the exemption **count** pin (`:808`) is unaffected; and it defines no class
 whose base is in `_EGRESS_CLASS_BASES`, so N2 is unaffected.
