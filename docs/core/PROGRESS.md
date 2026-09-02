@@ -204,14 +204,15 @@ Backtest stays REFUTATION + plumbing only: offer survival is a counterfactual
 about the venue's reaction to OUR order, recorded nowhere.
 
 **EXEC SPINE follow-ups:** `docs/plans/EXEC_SPINE_2026-09-01.md` §R-4
-"review amendments". Guard before R-9: R-9's per-trade return divides by zero
-for an unpriced forward; settlement-as-exit bypasses `_submit_order`'s refusal
-latch. **[HIGH] `reduce_only` is a naked-short bypass** — public OrderFactory
-kwarg, RiskEngine skips its check when `position_id is None` (the
-`submit_order` default), and `_working_sell_quantity` excludes reduce-only
-sells from `pending`, so two such sells each sized to net long are jointly
-naked. Latent (strike_ladder is BUY-only). **Removing R-4's standing refusal
-(`exec/client.py:1338-1350`) is GATED on fixing this**, not on R-9.
+"review amendments". Guard before R-9: divides by zero for an unpriced
+forward; settlement-as-exit bypasses `_submit_order`'s refusal latch.
+**[HIGH, TRACKED] `submit_order_list` defeats the naked-short guard** —
+publishes every member's `OrderInitialized` before `cache.add_order`
+(`trading/strategy.pyx:944-981`), so `_working_sell_quantity` reads
+`pending=0` per member. `xfail(strict=True)`
+(`docs/plans/REDUCE_ONLY_BYPASS_2026-09-02.md` §6); needs mutable state to
+fix. `reduce_only` no longer exempts a SELL (§1/§2, landed). **R-4's standing
+refusal (`exec/client.py:1338-1350`) stays GATED on this.**
 
 ---
 

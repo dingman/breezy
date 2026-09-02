@@ -33,7 +33,10 @@ from typing import TYPE_CHECKING
 
 import pytest
 from nautilus_trader.model.enums import OrderSide, TimeInForce
+from nautilus_trader.model.events import OrderInitialized
+from nautilus_trader.model.identifiers import OrderListId
 from nautilus_trader.model.objects import Money
+from nautilus_trader.model.orders.list import OrderList
 from nautilus_trader.trading.config import StrategyConfig
 from nautilus_trader.trading.strategy import Strategy
 
@@ -46,6 +49,7 @@ from breezy.runtime.backtest_harness import (
     backtest,
     run_backtest,
 )
+from breezy.runtime.backtest_order_guard import ORDER_EVENT_TOPIC, install_order_guard
 from breezy.strategy.harness_probe import BreezyHarnessProbe, BreezyHarnessProbeConfig
 from tests.support.synthetic_binary_tape import SyntheticBinaryTape, synthetic_binary_tape
 from tests.unit.test_persistence_catalog import make_climate_day
@@ -489,3 +493,186 @@ def test_the_naked_short_guard_lives_in_the_harness_not_in_the_strategy(
 
     with pytest.raises(ValueError, match="naked short of"):
         run_backtest(_config(tape), strategies=(strategy,))
+
+
+# ---------------------------------------------------------------------------
+# RED-9: the settlement leg publishes no `OrderInitialized` -- behind §1/§2
+# ---------------------------------------------------------------------------
+
+
+def test_the_expiration_settlement_leg_publishes_no_order_initialized_to_the_guard(
+    tape: SyntheticBinaryTape,
+) -> None:
+    """RED-9, load-bearing. Widening `_refuse_naked_short` to run for every
+    SELL (dropping the `reduce_only` exemption) can only be safe if the
+    engine's own settlement leg -- a `reduce_only` SELL sized to the whole
+    position -- never reaches the guard at all (F7). Proved behaviourally,
+    independent of the guard's own screening: a second handler subscribed to
+    the SAME topic (`ORDER_EVENT_TOPIC`) captures every `OrderInitialized`
+    published during a full run that holds a position to expiry, and none of
+    them is the `EXPIRATION-LEG-<uuid4>` the engine builds directly via
+    `cache.add_order` + `_generate_order_accepted`
+    (`backtest/engine.pyx:5945-5978`).
+    """
+    engine = harness.build_backtest_engine(_config(tape))
+    captured: list[OrderInitialized] = []
+
+    def _capture(event: object) -> None:
+        if type(event) is OrderInitialized:
+            captured.append(event)
+
+    engine.kernel.msgbus.subscribe(topic=ORDER_EVENT_TOPIC, handler=_capture)
+    install_order_guard(engine)
+    probe = _probe(tape)
+    engine.add_strategy(probe)
+    try:
+        engine.run()
+    finally:
+        engine.dispose()
+
+    # Positive control: the probe's own entry order DID publish one, so an
+    # empty `captured` would mean the subscription never worked at all.
+    assert captured
+    assert not any(
+        str(event.client_order_id).startswith("EXPIRATION-LEG-") for event in captured
+    )
+
+
+# ---------------------------------------------------------------------------
+# RED-10: the accept window (§5, corrected) does not endanger settlement
+# ---------------------------------------------------------------------------
+
+
+class _AcceptWatchingProbe(BreezyHarnessProbe):
+    """RED-10. Overrides `on_order_accepted` -- the window §5 names as the
+    only currently-reachable residual behind `_working_sell_quantity`'s
+    counting (no Breezy strategy did this before this test) -- and submits
+    nothing from it. If reached, the leg is still open at full size with the
+    position still open at full size, so any further SELL screened during
+    this window is genuinely naked; §5 concludes this can only produce a
+    CORRECT refusal, never a false one, and this probe never submits from the
+    hook at all, so nothing should fire here either way.
+    """
+
+    def __init__(self, config: BreezyHarnessProbeConfig) -> None:
+        super().__init__(config)
+        self.accepted = 0
+
+    def on_order_accepted(self, event: object) -> None:
+        del event
+        self.accepted += 1
+
+
+def test_a_harness_run_holding_a_long_to_expiration_still_settles_under_the_guard(
+    tape: SyntheticBinaryTape,
+) -> None:
+    probe = _AcceptWatchingProbe(
+        BreezyHarnessProbeConfig(instrument_id=tape.instrument.id, trade_quantity=Decimal(CLIP)),
+    )
+
+    engine = run_backtest(_config(tape), strategies=(probe,))
+    try:
+        # Positive control: the accept hook actually fired (for the probe's
+        # own entry, and again for the engine's settlement leg, which shares
+        # the probe's `strategy_id`) -- an untouched `accepted == 0` would
+        # mean this test exercised nothing.
+        assert probe.accepted >= 1
+        assert [p.is_closed for p in engine.cache.positions()] == [True]
+    finally:
+        engine.dispose()
+
+
+# ---------------------------------------------------------------------------
+# RED-12: `submit_order_list` defeats the guard outright -- TRACKED, not fixed
+# ---------------------------------------------------------------------------
+
+
+class _OrderListNakedShortProbeConfig(StrategyConfig, frozen=True):
+    instrument_id: object
+    quantity: Decimal
+
+
+class _OrderListNakedShortProbe(Strategy):  # type: ignore[misc]  # Strategy is a compiled Cython class erasing to Any
+    """Enters a long, then exits it via `submit_order_list` with TWO plain
+    SELLs each sized to the whole position -- no `reduce_only`, nothing
+    attacker-settable.
+
+    `Strategy.submit_order_list` publishes every member's `OrderInitialized`
+    in one loop BEFORE any of them reaches `cache.add_order`
+    (`trading/strategy.pyx:944-981`), so `_working_sell_quantity` reads
+    `pending=0` for EVERY member -- both sells pass and net a naked short.
+    """
+
+    def __init__(self, config: _OrderListNakedShortProbeConfig) -> None:
+        super().__init__(config)
+        self.entered = False
+        self.listed = False
+
+    def on_start(self) -> None:
+        self.subscribe_order_book_depth(self.config.instrument_id)
+
+    def on_order_book_depth(self, depth: object) -> None:
+        del depth
+        if self.entered:
+            return
+        self.entered = True
+        instrument = self.cache.instrument(self.config.instrument_id)
+        self.submit_order(
+            self.order_factory.market(
+                instrument_id=instrument.id,
+                order_side=OrderSide.BUY,
+                quantity=instrument.make_qty(self.config.quantity),
+            ),
+        )
+
+    def on_order_filled(self, event: object) -> None:
+        if self.listed or event.order_side != OrderSide.BUY:  # type: ignore[attr-defined]
+            return
+        self.listed = True
+        instrument = self.cache.instrument(self.config.instrument_id)
+        legs = [
+            self.order_factory.limit(
+                instrument_id=instrument.id,
+                order_side=OrderSide.SELL,
+                quantity=instrument.make_qty(self.config.quantity),
+                price=instrument.make_price(Decimal("0.10")),
+                time_in_force=TimeInForce.GTC,
+            )
+            for _ in range(2)
+        ]
+        self.submit_order_list(OrderList(OrderListId("OL-1"), legs))
+
+
+@pytest.mark.xfail(
+    strict=True,
+    reason=(
+        "TRACKED, NOT FIXED (docs/plans/REDUCE_ONLY_BYPASS_2026-09-02.md §6). "
+        "`Strategy.submit_order_list` publishes every member's "
+        "`OrderInitialized` in one loop BEFORE any of them reaches "
+        "`cache.add_order` (`trading/strategy.pyx:944-981`, F12), so "
+        "`_working_sell_quantity` reads `pending=0` for every member of the "
+        "list -- two plain SELLs each within the net long both pass and net "
+        "a naked short. `ExecAlgorithm` does the reverse and is safe "
+        "(`algorithm.pyx:1194-1210`, F13: cache before publish), so this is a "
+        "Nautilus ordering defect the guard must absorb, not a design "
+        "intent -- and Nautilus is immutable, so it cannot be corrected "
+        "upstream. NOT fixed here: closing it needs mutable "
+        "approved-but-uncached state with a real eviction lifecycle, which "
+        "would make the guard stateful -- most of why it is auditable today. "
+        "`strict=True`: an XPASS means this hole closed and the marker must "
+        "come off, gating removal of R-4's standing refusal on BOTH classes."
+    ),
+)
+def test_an_order_list_of_two_sells_within_the_net_long_is_jointly_naked(
+    tape: SyntheticBinaryTape,
+) -> None:
+    strategy = _OrderListNakedShortProbe(
+        _OrderListNakedShortProbeConfig(instrument_id=tape.instrument.id, quantity=Decimal(CLIP)),
+    )
+    engine = None
+    try:
+        with pytest.raises(ValueError, match="naked short of"):
+            engine = run_backtest(_config(tape), strategies=(strategy,))
+    finally:
+        if engine is not None:
+            engine.dispose()

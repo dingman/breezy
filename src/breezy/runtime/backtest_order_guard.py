@@ -32,6 +32,15 @@ did not. Verified live: a LIMIT SELL for 500 contracts against a ZERO position
 and $1,000 of cash was accepted and filled 50, with no rejection and no
 warning. The guard therefore lives here, where it cannot be forgotten.
 
+That Nautilus exemption is quoted here to explain the mechanism it bypasses,
+not as a model for this guard's own rule below: ``reduce_only`` is an
+ordinary, attacker-settable ``OrderFactory`` kwarg, Nautilus only validates it
+when ``command.position_id is not None`` (never true on the default
+``submit_order`` path), and even when it does run the check is
+jointly-naked-blind -- N reduce-only sells each within the net long all pass.
+``_refuse_naked_short`` below therefore grants the flag no exemption at all;
+see ``docs/plans/REDUCE_ONLY_BYPASS_2026-09-02.md``.
+
 Why the message bus, and why ``OrderInitialized``
 -------------------------------------------------
 
@@ -192,7 +201,19 @@ class BacktestOrderGuard:
         )
 
     def _refuse_naked_short(self, event: OrderInitialized) -> None:
-        if event.side != OrderSide.SELL or event.reduce_only:
+        """Refuse a SELL that exceeds the net long, INCLUDING a ``reduce_only`` one.
+
+        ``reduce_only`` confers no exemption here: it is an ordinary,
+        attacker-settable ``OrderFactory`` kwarg (F1,
+        `docs/plans/REDUCE_ONLY_BYPASS_2026-09-02.md`), and Nautilus's own
+        validation of it is skipped on the default ``submit_order`` path and
+        jointly-naked-blind even when it runs (F2/F3). A GENUINELY reducing
+        sell satisfies ``pending + quantity <= net`` by the definition of
+        reducing, so running the identical test for every SELL cannot refuse
+        a legitimate exit -- it can only refuse the sells that are naked
+        regardless of the flag.
+        """
+        if event.side != OrderSide.SELL:
             return
         instrument_id = event.instrument_id
         net = self._net_long(instrument_id)
@@ -212,11 +233,15 @@ class BacktestOrderGuard:
                 f"after the fill the account shows MORE free cash than before. "
                 f"Terminal PnL arithmetic stays correct, so the backtest looks fine. "
                 f"Size every SELL from `self.portfolio.net_position(...)` MINUS any "
-                f"already-working, non-reduce-only SELL quantity -- the same "
+                f"already-working SELL quantity -- the same "
                 f"subtraction `_working_sell_quantity` performs -- never from "
                 f"`net_position(...)` alone, or a working exit sized to part of the "
                 f"position plus a settlement leg sized to the whole of it will "
-                f"double-count and refuse a real close.",
+                f"double-count and refuse a real close. `reduce_only` is not a "
+                f"licence to skip this check: it is an ordinary, attacker-settable "
+                f"flag (any strategy can set it), so it is screened exactly like "
+                f"every other SELL -- a genuinely reducing sell still passes, "
+                f"because it satisfies this same inequality by construction.",
             )
 
     # -- internals ---------------------------------------------------------
@@ -232,6 +257,12 @@ class BacktestOrderGuard:
         `Strategy.submit_order` publishes `OrderInitialized` BEFORE it calls
         `cache.add_order` (`trading/strategy.pyx:855-871`).
 
+        EVERY open SELL counts, `reduce_only` included -- the same divergence
+        from Nautilus's own `submitted_sell_qty` (F5,
+        `docs/plans/REDUCE_ONLY_BYPASS_2026-09-02.md`) that closes the
+        jointly-naked pair of `reduce_only` sells: excluding them would make
+        the FIRST one invisible to the budget the second is screened against.
+
         `Cache.orders_open` guarantees no ordering (`cache.pyx:4719`); this is
         a SUM, so the result does not depend on one.
         """
@@ -239,7 +270,7 @@ class BacktestOrderGuard:
             (
                 order.leaves_qty.as_decimal()
                 for order in self._cache.orders_open(instrument_id=instrument_id)
-                if order.side == OrderSide.SELL and not order.is_reduce_only
+                if order.side == OrderSide.SELL
             ),
             Decimal(0),
         )

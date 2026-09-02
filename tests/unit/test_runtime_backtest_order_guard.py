@@ -168,15 +168,15 @@ def test_a_sell_one_unit_beyond_the_net_long_is_refused() -> None:
             Decimal(10),
             (_FakeOrder(side=OrderSide.SELL, leaves=Decimal(10), reduce_only=True),),
             {"quantity": 10},
-            False,
-            id="working-reduce-only-sell-does-not-count",
+            True,
+            id="working-reduce-only-sell-counts",
         ),
         pytest.param(
             Decimal(0),
             (),
             {"quantity": 500, "reduce_only": True},
-            False,
-            id="reduce-only",
+            True,
+            id="reduce-only-confers-no-exemption",
         ),
         pytest.param(
             Decimal(0),
@@ -256,21 +256,97 @@ def test_a_working_BUY_does_not_count_against_the_sell_budget() -> None:
     _guard(net=Decimal(10), open_orders=working).on_order_event(_initialized(quantity=10))
 
 
-def test_a_working_reduce_only_sell_does_not_count_against_the_budget() -> None:
-    """The engine's own settlement leg is `reduce_only`; it cannot make a
-    strategy's legitimate exit look naked.
+def test_a_working_reduce_only_sell_counts_against_the_budget() -> None:
+    """RED-3. Inversion of the pre-fix `..._does_not_count_against_the_budget`.
+
+    A working `reduce_only` SELL of 10 plus an incoming plain SELL of 10
+    against a net long of 10 is jointly naked -- `_working_sell_quantity` no
+    longer excludes `reduce_only` orders from `pending` (F5: Nautilus's own
+    overselling accounting counts every open sell, reduce-only included).
     """
     working = [_FakeOrder(side=OrderSide.SELL, leaves=Decimal(10), reduce_only=True)]
 
-    _guard(net=Decimal(10), open_orders=working).on_order_event(_initialized(quantity=10))
+    with pytest.raises(NakedShortRefusedError):
+        _guard(net=Decimal(10), open_orders=working).on_order_event(_initialized(quantity=10))
 
 
-def test_a_reduce_only_sell_is_exempt() -> None:
-    _guard(net=Decimal(0)).on_order_event(_initialized(quantity=500, reduce_only=True))
+def test_a_reduce_only_sell_against_no_position_is_still_refused() -> None:
+    """RED-1. Inversion of `test_a_reduce_only_sell_is_exempt`, same inputs.
+
+    `reduce_only` is an ordinary, attacker-settable `OrderFactory` kwarg
+    (F1); an exemption keyed on it is a documented bypass, closed by running
+    the identical net-long test for every SELL.
+    """
+    with pytest.raises(NakedShortRefusedError):
+        _guard(net=Decimal(0)).on_order_event(_initialized(quantity=500, reduce_only=True))
+
+
+def test_an_oversized_reduce_only_sell_is_refused() -> None:
+    """RED-4. Net 100, no working orders, a `reduce_only` SELL of 101 is
+    refused -- without depending on Nautilus's own `position_id`-gated check
+    (F2) ever firing.
+    """
+    with pytest.raises(NakedShortRefusedError):
+        _guard(net=Decimal(100)).on_order_event(_initialized(quantity=101, reduce_only=True))
+
+
+def test_a_legitimate_reduce_only_exit_sized_to_the_net_long_passes() -> None:
+    """RED-5, MUST PASS. The anti-R-6a case: a genuinely reducing sell
+    satisfies `pending + quantity <= net` by the definition of reducing, so
+    running the identical test for every SELL cannot refuse a real exit.
+    """
+    _guard(net=Decimal(100)).on_order_event(_initialized(quantity=100, reduce_only=True))
+
+
+def test_a_partial_reduce_only_exit_beside_a_working_reduce_only_exit_passes() -> None:
+    """RED-6, MUST PASS. The accounting is additive, not a blanket ban: a
+    working `reduce_only` exit of 40 plus an incoming `reduce_only` exit of
+    60 against a net long of 100 sums to exactly the net long.
+    """
+    working = [_FakeOrder(side=OrderSide.SELL, leaves=Decimal(40), reduce_only=True)]
+
+    _guard(net=Decimal(100), open_orders=working).on_order_event(
+        _initialized(quantity=60, reduce_only=True),
+    )
+
+
+def test_a_mixed_working_pair_is_jointly_naked() -> None:
+    """RED-7. The flag confers nothing in either direction: a working plain
+    SELL of 10 plus an incoming `reduce_only` SELL of 10 against a net long
+    of 10 is jointly naked exactly like the all-plain or all-reduce-only
+    cases.
+    """
+    working = [_FakeOrder(side=OrderSide.SELL, leaves=Decimal(10))]
+
+    with pytest.raises(NakedShortRefusedError):
+        _guard(net=Decimal(10), open_orders=working).on_order_event(
+            _initialized(quantity=10, reduce_only=True),
+        )
 
 
 def test_a_buy_is_never_a_naked_short() -> None:
     _guard(net=Decimal(0)).on_order_event(_initialized(side=OrderSide.BUY, quantity=500))
+
+
+def test_a_reduce_only_buy_is_never_a_naked_short() -> None:
+    """RED-8. Regression floor: the side check, not the flag, is what exempts
+    a BUY -- `reduce_only=True` on a BUY must not somehow trip the SELL rule.
+    """
+    _guard(net=Decimal(0)).on_order_event(
+        _initialized(side=OrderSide.BUY, quantity=500, reduce_only=True),
+    )
+
+
+def test_the_refusal_message_says_reduce_only_is_not_a_licence() -> None:
+    """RED-11. `:202-220` is the only remediation a future author reads --
+    it must say outright that `reduce_only` does not exempt a SELL here.
+    """
+    with pytest.raises(NakedShortRefusedError) as excinfo:
+        _guard(net=Decimal(0)).on_order_event(_initialized(quantity=1, reduce_only=True))
+
+    message = str(excinfo.value)
+    assert "reduce_only" in message
+    assert "not a licence" in message
 
 
 # ---------------------------------------------------------------------------
@@ -373,32 +449,27 @@ def test_a_settlement_leg_is_refused_when_a_working_exit_sell_is_outstanding() -
 
 
 # ---------------------------------------------------------------------------
-# R-6a §3/D6b: `reduce_only` is a TRACKED, unremediated bypass -- xfail only.
+# docs/plans/REDUCE_ONLY_BYPASS_2026-09-02.md §1+§2: `reduce_only` REMEDIATED.
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "TRACKED, UNREMEDIATED bypass of the SAME class R-6a's tag/prefix "
-        "deletion just closed (docs/plans/R6A_GUARD_SEMANTICS_2026-09-02.md "
-        "§3). `_refuse_naked_short`'s own first line exempts EVERY "
-        "reduce_only SELL outright, by size or position (see "
-        "`test_a_reduce_only_sell_is_exempt`, kept -- R-9's own settlement "
-        "leg needs it). Chain (M2, M8): `reduce_only` is an ordinary, "
-        "attacker-settable `OrderFactory` kwarg; Nautilus's `RiskEngine` "
-        "only validates reduce-only when `command.position_id is not None` "
-        "(`risk/engine.pyx:424`), and `Strategy.submit_order`'s "
-        "`position_id` defaults to `None`. Two reduce-only sells each sized "
-        "to the net long therefore BOTH pass and are jointly naked. NOT "
-        "fixed here -- growing a safety control's scope mid-correction is "
-        "out of scope by design (D6b); this pins the hazard and gates "
-        "removal of R-4's standing refusal on its own future fix. "
-        "`strict=True`: an XPASS means the bypass closed and this marker "
-        "must come off, not stay for cosmetic reasons."
-    ),
-)
 def test_two_reduce_only_sells_within_the_net_long_are_jointly_naked() -> None:
+    """RED-2, the headline case. Was `xfail(strict=True)` under
+    R-6a §3/D6b, TRACKING this exact bypass: `_refuse_naked_short` exempted
+    every `reduce_only` SELL outright, and `_working_sell_quantity` excluded
+    `reduce_only` orders from `pending`, so two reduce-only sells each sized
+    to the net long both passed and were jointly naked.
+
+    Both deletions were required to close it, and neither alone is
+    sufficient (execution-verified, C1 of Revision 2): dropping only the
+    `_refuse_naked_short` exemption still passes this exact pair, because the
+    first sell stays invisible in `pending`; dropping only the
+    `_working_sell_quantity` exclusion still passes one oversized
+    `reduce_only` sell, because the exemption's early return fires first.
+    The marker comes off in the SAME commit as both deletions -- a reviewer
+    ran this body against the both-deletions module and got
+    `XPASS(strict)`, which fails the suite if left on.
+    """
     working = [_FakeOrder(side=OrderSide.SELL, leaves=Decimal(10), reduce_only=True)]
     guard = _guard(net=Decimal(10), open_orders=working)
 
