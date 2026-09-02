@@ -412,19 +412,38 @@ class ForecastRevisionStrategy(SharedExposureMixin, Strategy):
     def _flatten(self, instrument_id: str, reason: str) -> None:
         nt_id = self._nt_ids[instrument_id]
         qty = float(self.portfolio.net_position(nt_id))
-        if abs(qty) < 1e-9:
+        # `portfolio.net_position` is SETTLED-ONLY -- a `Position` exists only
+        # once a fill has been applied -- so a zero here does NOT mean "nothing
+        # to do". A BUY submitted on the previous tick is still live, and if it
+        # is not cancelled HERE it fills after the settlement-determining
+        # observation is already public: exactly what `flatten_on_observation`
+        # exists to prevent, and silently, since the guard returned before the
+        # log line. `working_orders` (`weather_common.inflight`) is the view
+        # that can see it -- `not order.is_closed` over `cache.orders(...)`,
+        # which includes INITIALIZED and SUBMITTED where `orders_open` does not.
+        working = working_orders(self.cache, nt_id)
+        if abs(qty) < 1e-9 and not working:
             return
-        # UNCONDITIONAL, deliberately. `Strategy.cancel_all_orders`
-        # (`trading/strategy.pyx`) already queries `orders_open` PLUS
-        # `orders_emulated` PLUS `orders_inflight`, and logs-and-returns
-        # cleanly when all three are empty. A Breezy-side `orders_open`
-        # pre-filter was strictly narrower than the native query it guarded,
-        # so its only possible effect was suppressing a cancel Nautilus would
-        # correctly have performed -- e.g. of a SUBMITTED reducing SELL, which
-        # `close_all_positions` below would then have doubled up on.
+        # Neither exit call is gated on a Breezy-side query. Both no-op
+        # cleanly on an empty set -- `Strategy.cancel_all_orders`
+        # (`trading/strategy.pyx`) runs its own `orders_open` PLUS
+        # `orders_emulated` PLUS `orders_inflight` lookup and logs-and-returns
+        # when all three are empty; `close_all_positions` finds no position --
+        # and any pre-filter narrower than the native query can only suppress
+        # a cancel that should have happened.
+        #
+        # RESIDUAL, deliberately not claimed as closed: native
+        # `cancel_all_orders` (`trading/strategy.pyx:1297`) explicitly
+        # `continue`s on `OrderStatus.INITIALIZED`, and INITIALIZED is in none
+        # of `orders_open` / `orders_inflight` / `orders_emulated`. An
+        # INITIALIZED order therefore still cannot be cancelled by anyone.
+        # This closes the SUBMITTED window, which is the reachable one; it
+        # does not close INITIALIZED.
         self.cancel_all_orders(nt_id)
         self.close_all_positions(nt_id)
-        self.log.info(f"FLATTEN {instrument_id} qty={qty:.1f} reason={reason}")
+        self.log.info(
+            f"FLATTEN {instrument_id} qty={qty:.1f} working={len(working)} reason={reason}",
+        )
 
     def _portfolio_snapshot(self) -> PortfolioSnapshot:
         nt_ids = self._risk.instrument_ids(self._nt_ids) if self._risk is not None else self._nt_ids
