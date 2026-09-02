@@ -508,6 +508,23 @@ CAGE_RULE_PINS: tuple[RulePin, ...] = (
     ),
     RulePin(
         module="readonly",
+        attr="B4_EXEMPT_PATHS",
+        expected=frozenset({"scripts/venue/polymarket_us_write_signing_probe.py"}),
+        widened=frozenset(
+            {
+                "scripts/venue/polymarket_us_write_signing_probe.py",
+                "scripts/venue/a_second_write_script.py",
+            }
+        ),
+        narrowed=frozenset(),
+        why="R-6.5P's B4 allowlist: the ONE module exempt from the write-egress "
+        "scan. The widened neighbour is the real hazard -- a second exemption "
+        "would silently admit another write-capable script with no paired "
+        "review; the narrowed neighbour re-arms the scan against the probe "
+        "itself and would fail its own mandatory trip-before-exemption test.",
+    ),
+    RulePin(
+        module="readonly",
         attr="PERMITTED_EXECUTION_CLIENTS",
         expected=MappingProxyType(
             {
@@ -688,7 +705,12 @@ _MODULES = {"readonly": readonly, "firewall": firewall}
 #: Every exemption the cage grants, as an EXACT path. Counter 1: a directory
 #: prefix would be a blanket allowance, and an entry naming a file that does
 #: not exist is an allowance nobody is checking.
-CAGE_EXEMPTIONS: tuple[str, ...] = (readonly.SDK_IMPORT_ORACLE,)
+#:
+#: R-6.5P (EXEC SPINE) grows this from one to two: the write-signing probe is
+#: the plan family's first genuine B4 NARROWING, paired with the two-direction
+#: non-vacuity in ``test_polymarket_us_readonly_guard.py``. ``B4_EXEMPT_PATHS``
+#: is read here, not restated, so the two constants cannot drift apart.
+CAGE_EXEMPTIONS: tuple[str, ...] = (readonly.SDK_IMPORT_ORACLE, *sorted(readonly.B4_EXEMPT_PATHS))
 
 
 def _pin_ids() -> list[str]:
@@ -775,6 +797,8 @@ def test_the_pin_table_covers_every_rule_constant_the_plan_names() -> None:
         "firewall.EXEC_ORDER_COROUTINE_PERMITTED_CALLEES",
         "firewall.EXEC_DECLARED_UNIMPLEMENTED_COROUTINES",
         "readonly.PERMITTED_EXECUTION_CLIENTS",
+        # EXEC SPINE R-6.5P: the plan family's first genuine B4 narrowing.
+        "readonly.B4_EXEMPT_PATHS",
     }
     assert plans_nine <= pinned, f"unpinned: {sorted(plans_nine - pinned)}"
     assert pinned == plans_nine | added_with_a_reason
@@ -805,13 +829,15 @@ def test_every_cage_exemption_is_an_exact_path_not_a_prefix() -> None:
         assert not entry.endswith("/")
 
 
-def test_the_cage_grants_exactly_one_exemption() -> None:
-    """An equality, not ``<=``: a second exemption must be argued for.
+def test_the_cage_grants_exactly_two_exemptions() -> None:
+    """An equality, not ``<=``: a THIRD exemption must be argued for.
 
-    NS-2 creates no allowlist. The V2 allowlist the plan contemplates arrives
-    with ``exec/endpoints.py`` at NS-4, together with its own ``== 1`` pin.
+    NS-2 created the first (``SDK_IMPORT_ORACLE``, ``== 1``). R-6.5P adds the
+    second (the write-signing probe's ``B4_EXEMPT_PATHS`` entry) -- the plan
+    family's first genuine B4 narrowing. The name states the truth at ``== 2``;
+    the old name would now be a lie about shipped code.
     """
-    assert len(CAGE_EXEMPTIONS) == 1
+    assert len(CAGE_EXEMPTIONS) == 2
 
 
 # ==========================================================================

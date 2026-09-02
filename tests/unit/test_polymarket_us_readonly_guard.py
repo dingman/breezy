@@ -225,6 +225,16 @@ VENUE_TOUCHING_SCRIPT_PREFIXES: tuple[str, ...] = (
     "scripts/probes/",
 )
 
+#: B4's allowlist (R-6.5P, plan family's first genuine NARROWING). A
+#: MODULE-LEVEL frozenset, never a parameter to :func:`find_write_egress_violations`
+#: or :func:`scan_write_egress` -- the same shape discipline
+#: ``test_b7_the_caller_barrier_has_no_exemption_mechanism`` pins for the
+#: B6/B7 sibling. Its ONLY member is the write-signing probe: an exact path,
+#: not a prefix, so it never widens to cover a second script.
+B4_EXEMPT_PATHS: frozenset[str] = frozenset(
+    {"scripts/venue/polymarket_us_write_signing_probe.py"}
+)
+
 
 @dataclass(frozen=True, slots=True)
 class Violation:
@@ -369,9 +379,19 @@ def find_write_egress_violations(path: str, source: str) -> list[Violation]:
 
 
 def scan_write_egress(roots: tuple[str, ...] = EGRESS_SCAN_ROOTS) -> list[Violation]:
+    """Apply :func:`find_write_egress_violations` to every scanned module.
+
+    ``B4_EXEMPT_PATHS`` is consulted HERE, not threaded into
+    :func:`find_write_egress_violations` as a parameter -- that function's
+    signature stays ``(path, source)``, the same shape discipline
+    ``test_b7_the_caller_barrier_has_no_exemption_mechanism`` pins for the
+    B6/B7 sibling rule. An exempted path is skipped entirely: the exemption
+    is for exactly one file, by exact path, never a prefix.
+    """
     return [
         v
         for path, src in iter_python_sources(roots)
+        if path not in B4_EXEMPT_PATHS
         for v in find_write_egress_violations(path, src)
     ]
 
@@ -685,6 +705,162 @@ def test_b4_actually_covers_the_shipped_health_module_as_a_non_venue_file() -> N
 
 def test_b4_scan_covers_both_src_and_scripts() -> None:
     scanned = {path for path, _ in iter_python_sources(EGRESS_SCAN_ROOTS)}
+    assert any(p.startswith("src/") for p in scanned)
+    assert any(p.startswith("scripts/") for p in scanned)
+
+
+# ==========================================================================
+# R-6.5P -- the B4 allowlist (plan family's first genuine NARROWING)
+# ==========================================================================
+
+#: Repo-relative path to the one file the allowlist covers, read once so the
+#: non-vacuity proofs below cannot drift from the exemption itself.
+_WRITE_SIGNING_PROBE_PATH = next(iter(B4_EXEMPT_PATHS))
+
+
+def test_the_probe_actually_trips_b4_before_the_exemption_is_applied() -> None:
+    """Mandatory: an exemption that exempts nothing is a route around the barrier.
+
+    Runs :func:`find_write_egress_violations` directly -- bypassing
+    ``scan_write_egress``'s allowlist filter entirely -- against the REAL
+    probe source. Must be non-empty, or B4_EXEMPT_PATHS exempts a file B4
+    was never going to flag anyway.
+    """
+    path = REPO_ROOT / _WRITE_SIGNING_PROBE_PATH
+    source = path.read_text(encoding="utf-8")
+    violations = find_write_egress_violations(_WRITE_SIGNING_PROBE_PATH, source)
+    assert violations != [], "the probe must trip B4 raw, or the exemption exempts nothing"
+    assert {v.rule for v in violations} & {"V1", "V2", "V3"}
+
+
+def test_b4_exemption_non_vacuity_removing_the_entry_trips_the_scan() -> None:
+    """Direction 1: without its allowlist entry, the real probe trips the LIVE scan."""
+    path = REPO_ROOT / _WRITE_SIGNING_PROBE_PATH
+    source = path.read_text(encoding="utf-8")
+    narrowed_allowlist: frozenset[str] = frozenset()
+    violations = [
+        v
+        for p, src in [(_WRITE_SIGNING_PROBE_PATH, source)]
+        if p not in narrowed_allowlist
+        for v in find_write_egress_violations(p, src)
+    ]
+    assert violations != []
+
+
+def test_b4_exemption_non_vacuity_a_second_script_with_the_same_literals_still_trips() -> None:
+    """Direction 2: the exemption is an EXACT path, not a shared shape."""
+    source = (REPO_ROOT / _WRITE_SIGNING_PROBE_PATH).read_text(encoding="utf-8")
+    violations = find_write_egress_violations("scripts/venue/a_copycat_script.py", source)
+    assert violations != []
+
+
+def test_scan_write_egress_is_clean_with_the_exemption_applied() -> None:
+    """The exemption in place: the live scan (with the probe on disk) is 0."""
+    assert scan_write_egress() == []
+
+
+# ==========================================================================
+# D4 -- the probe-script zero-importers pin
+# ==========================================================================
+
+#: Bare module name (no path, no ``.py``): what an ``import``/``from``/
+#: ``importlib``/``__import__``/dotted-string form would all have to name.
+_PROBE_MODULE_NAME = "polymarket_us_write_signing_probe"
+
+#: D4's explicitness: BOTH roots, never one -- a probe importable only from
+#: ``scripts/`` would still reach the trading process from another script.
+PROBE_IMPORTER_SCAN_ROOTS: tuple[str, ...] = ("src", "scripts")
+
+
+def find_probe_importers(path: str, source: str) -> list[Violation]:
+    """Report every way ``path`` could reach the write-signing probe module.
+
+    Four forms, per D4: a plain ``import``, a ``from ... import``, the two
+    dynamic spellings (``importlib.import_module``, ``__import__``), and any
+    dotted-string literal naming the module -- the re-export/dynamic-load
+    blind spot a naive ``import`` scan would miss entirely. The probe's own
+    file is never scanned (self-reference in its own docstring is not an
+    importer); callers exclude it via ``PROBE_SCRIPT_PATH``.
+    """
+    tree = ast.parse(source, filename=path)
+    found: list[Violation] = []
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            for alias in node.names:
+                if _PROBE_MODULE_NAME in alias.name.split("."):
+                    found.append(Violation(path, node.lineno, "D4", f"import {alias.name}"))
+        elif (
+            isinstance(node, ast.ImportFrom)
+            and node.module
+            and _PROBE_MODULE_NAME in node.module.split(".")
+        ):
+            found.append(Violation(path, node.lineno, "D4", f"from {node.module} import ..."))
+        elif isinstance(node, ast.Call):
+            func = node.func
+            name = func.attr if isinstance(func, ast.Attribute) else getattr(func, "id", "")
+            if name in ("import_module", "__import__") and node.args:
+                arg = node.args[0]
+                if (
+                    isinstance(arg, ast.Constant)
+                    and isinstance(arg.value, str)
+                    and _PROBE_MODULE_NAME in arg.value
+                ):
+                    found.append(Violation(path, node.lineno, "D4", f"{name}({arg.value!r})"))
+        elif (
+            isinstance(node, ast.Constant)
+            and isinstance(node.value, str)
+            and _PROBE_MODULE_NAME in node.value
+        ):
+            found.append(
+                Violation(path, node.lineno, "D4", f"dotted-string literal {node.value!r}")
+            )
+    return found
+
+
+def scan_probe_importers(roots: tuple[str, ...] = PROBE_IMPORTER_SCAN_ROOTS) -> list[Violation]:
+    return [
+        v
+        for path, src in iter_python_sources(roots)
+        if path != _WRITE_SIGNING_PROBE_PATH
+        for v in find_probe_importers(path, src)
+    ]
+
+
+def test_the_probe_has_zero_importers_in_src_or_scripts() -> None:
+    violations = scan_probe_importers()
+    assert violations == [], "D4 violations:\n" + "\n".join(str(v) for v in violations)
+
+
+def test_probe_importer_scan_detects_a_plain_import() -> None:
+    source = "import polymarket_us_write_signing_probe\n"
+    assert find_probe_importers("scripts/venue/other.py", source) != []
+
+
+def test_probe_importer_scan_detects_a_from_import() -> None:
+    source = "from polymarket_us_write_signing_probe import run_probe\n"
+    assert find_probe_importers("src/breezy/rogue.py", source) != []
+
+
+def test_probe_importer_scan_detects_importlib_import_module() -> None:
+    source = (
+        "import importlib\n\n\ndef go():\n"
+        "    return importlib.import_module('polymarket_us_write_signing_probe')\n"
+    )
+    assert find_probe_importers("src/breezy/rogue.py", source) != []
+
+
+def test_probe_importer_scan_detects_dunder_import() -> None:
+    source = "__import__('polymarket_us_write_signing_probe')\n"
+    assert find_probe_importers("scripts/analysis/rogue.py", source) != []
+
+
+def test_probe_importer_scan_detects_a_dotted_string_literal() -> None:
+    source = "NAME = 'scripts.venue.polymarket_us_write_signing_probe'\n"
+    assert find_probe_importers("src/breezy/rogue.py", source) != []
+
+
+def test_probe_importer_scan_covers_both_src_and_scripts_roots() -> None:
+    scanned = {path for path, _ in iter_python_sources(PROBE_IMPORTER_SCAN_ROOTS)}
     assert any(p.startswith("src/") for p in scanned)
     assert any(p.startswith("scripts/") for p in scanned)
 
