@@ -1277,9 +1277,21 @@ def parse_binary_option(
     expiration_ns = parse_rfc3339_nanos(
         _require(market, "endDate", error=InstrumentDefinitionError), field="endDate"
     )
-    ts_event = parse_rfc3339_nanos(
-        _require(market, "updatedAt", error=InstrumentDefinitionError), field="updatedAt"
-    )
+    # `updatedAt` is absent on markets the venue has never modified since
+    # listing (measured live, 2026-09-03 cohort: 20/20 newly-listed markets
+    # carry `createdAt` but no `updatedAt`). A market that was never updated
+    # was last changed when it was created, so `createdAt` is the correct
+    # `ts_event` -- never a synthesised `0` or `now()`, which would silently
+    # corrupt a forward-only tape. `createdAt` stays REQUIRED: if a market
+    # carries neither timestamp, refuse loudly rather than widen `ts_event`
+    # into an optional field.
+    updated_at = market.get("updatedAt")
+    if updated_at is not None:
+        ts_event = parse_rfc3339_nanos(updated_at, field="updatedAt")
+    else:
+        ts_event = parse_rfc3339_nanos(
+            _require(market, "createdAt", error=InstrumentDefinitionError), field="createdAt"
+        )
     if expiration_ns <= activation_ns:
         raise InstrumentDefinitionError(
             f"Market {slug!r} expires at or before it activates "

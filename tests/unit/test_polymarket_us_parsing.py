@@ -203,6 +203,43 @@ def test_activation_and_expiration_come_from_start_and_end_date(
     assert open_instrument.ts_event != open_instrument.ts_init
 
 
+def test_market_missing_updated_at_falls_back_to_created_at_for_ts_event(
+    open_market: dict[str, Any],
+) -> None:
+    """The venue omits ``updatedAt`` on markets that have never been modified.
+
+    Measured live on the 2026-09-03 cohort: 20/20 newly-listed markets carry
+    ``createdAt`` but no ``updatedAt``. A market that has never been updated
+    was last changed when it was created, so ``ts_event`` falls back to the
+    parsed ``createdAt`` rather than refusing the whole instrument.
+    """
+    market = open_market["market"]
+    del market["updatedAt"]
+
+    instrument = parse_binary_option(open_market, venue=POLYMARKET_US_VENUE, ts_init=TS_INIT)
+
+    assert instrument.ts_event == parse_rfc3339_nanos(
+        "2026-08-24T09:45:21Z", field="createdAt"
+    )
+
+
+def test_market_missing_both_updated_at_and_created_at_still_refuses(
+    open_market: dict[str, Any],
+) -> None:
+    """Both timestamps absent is unrecognised venue behaviour -- keep refusing.
+
+    ``ts_event`` must never be synthesised (no ``0``, no ``now()``); when
+    neither source timestamp exists, ``parse_binary_option`` still raises
+    rather than widening ``ts_event`` into an optional field.
+    """
+    market = open_market["market"]
+    del market["updatedAt"]
+    del market["createdAt"]
+
+    with pytest.raises(InstrumentDefinitionError, match="createdAt"):
+        parse_binary_option(open_market, venue=POLYMARKET_US_VENUE, ts_init=TS_INIT)
+
+
 def test_closed_market_with_integer_min_trade_qty_parses_at_precision_zero(
     closed_market: dict[str, Any],
 ) -> None:
