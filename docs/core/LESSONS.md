@@ -766,3 +766,52 @@ comparison. Use `msgbus.subscribe(...)`; the code bends, the barrier does not.
 
 Related: L-12 (never relax an exact-set barrier), L-14 (derive the barrier list,
 never recall it).
+
+---
+
+## L-16 — A raise inside a Nautilus `LiveClock` timer callback is silently discarded (2026-09-02)
+
+Reproduced directly against the pinned wheel (`nautilus_trader==1.231.0`): a
+`LiveClock` default handler that raises has its exception **vanish**. No
+propagation out of `asyncio.run`, no `sys.unraisablehook`, no
+`threading.excepthook`, exit code 0, process continues.
+
+```
+asyncio.run RETURNED NORMALLY (no propagation)
+callback fired: 1 | unraisablehook: 0 | threading.excepthook: 0
+```
+
+The dispatch is Rust-side, so the exception never reaches a Python frame that
+would surface it. `Actor.register_default_handler(self.handle_event)`
+(`common/actor.pyx:722`) wires `on_time_event`-driven callbacks through this
+same mechanism, so it generalises to any strategy acting on a timer — which is
+the natural shape for a forecast-driven weather strategy.
+
+**Why this matters beyond the one bug.** "Raise to refuse" is the idiom Breezy's
+safety guards use, and it is correct in backtest, where a raise deterministically
+aborts a single-threaded run. Live, the same raise has THREE different fates and
+only one of them is loud:
+
+| Path | Fate of the raise |
+|---|---|
+| Engine queue task | caught → `_handle_queue_exception` → `os._exit(1)` — process dies, but bypasses the CLI's `finally`/exit-code mapping, so the operator gets exit 1 with **no cause line** |
+| `MessageBus.publish_c` dispatch | no try/except around `sub.handler(msg)`; unwinds into whichever frame published |
+| **`LiveClock` timer callback** | **silently discarded — no signal at all** |
+
+`graceful_shutdown_on_exception` defaults `False`
+(`live/config.py:60,78,201`), and all three live engines end at
+`os._exit(1)  # Immediate crash`.
+
+**How to apply.** Never rely on a raise alone to inform an operator in a live
+Nautilus node. A refusal must **write its own operator-visible record at the
+moment it refuses** — latch the fault AND write the line to line-buffered stderr
+right there — because the process may die without unwinding, or may not die at
+all. The safety property (the order never reaches `cache.add_order`) survives on
+every path; only the *observability* does not, and a safety control nobody can
+tell fired is one you will believe never fired.
+
+Corollary for reviewers: "an uncaught exception here kills the node" is a claim
+about a specific dispatch path, not a general truth. Determine which of the
+three paths applies before accepting it — and prefer reproducing it over reading
+for it, as was done here. Related: [[L-15]] (run the executable oracle rather
+than reasoning about what it would say).
