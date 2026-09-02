@@ -167,7 +167,7 @@ schedule discovery) are plain work items. Remaining blockers are technical:
 
 | ID | Item | Unlock |
 |---|---|---|
-| G-16 | ≥14 days of joined tape. K1 ran under systemd 09-02: n=30, largest cell 8 of 96 needed | calendar |
+| G-16 | ≥14 days of joined tape. K1 09-02: n=30, largest cell 8/96. **Kalshi prior `e97f392`: cheap-D-1 DEAD at ask ≥2c, 2023+, all 5 stations** (`docs/evidence/k1_kalshi_prior_2026-09-02.md`) | calendar |
 | G-17 | Phase 1.5 premise GO/NO-GO | G-16. **NO-GO stops the programme.** |
 
 **Programme path and the stop-gate constraint:** see
