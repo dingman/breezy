@@ -1,0 +1,37 @@
+[Unit]
+# G-14. The daily K1 study, triggered by breezy-k1-daily.timer.
+# Replaces the PPID-1 `k1_daily.sh` while-loop in the /tmp session scratchpad,
+# which does not survive a reboot.
+Description=Breezy K1 cheap-open D+1 settlement measurement (daily)
+Documentation=file:///home/jon/breezy/deploy/systemd/README.md
+# Not a hard dependency: the measurement reads the tape from disk and does not
+# require the recorder to be up at the moment it runs. It DOES need the
+# network for nothing at all -- it is a pure local read.
+After=network-online.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=/home/jon/breezy
+UMask=0077
+
+# No EnvironmentFile. Deliberate, and the point of the separation: this
+# process holds NO venue credential and opens no socket. It reads the quote
+# tape and the NWS settlement catalog from disk, both of which it defaults to
+# absolutely (scripts/analysis/k1_cheap_open_settlement.py:143-146), so it can
+# run on a host with no Polymarket.us configuration at all.
+ExecStart=/home/jon/breezy/deploy/systemd/k1-daily-run.sh
+
+# Mirrors the `timeout 1800` the stopgap driver wrapped the run in
+# (k1_daily.sh:21). For Type=oneshot this bounds the whole run.
+TimeoutStartSec=1800
+
+# No Restart=. A missed daily measurement is not an incident -- the tape keeps
+# growing and tomorrow's run subsumes today's. The timer's Persistent=true is
+# what recovers a run missed across a reboot.
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=breezy-k1-daily
+
+# NOTE: no [Install] section. This unit is started BY the timer, never
+# enabled directly. `systemctl --user enable breezy-k1-daily.timer` is the
+# only thing to enable.

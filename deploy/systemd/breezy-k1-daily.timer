@@ -1,0 +1,26 @@
+[Unit]
+Description=Daily trigger for the Breezy K1 cheap-open settlement measurement
+Documentation=file:///home/jon/breezy/deploy/systemd/README.md
+
+[Timer]
+Unit=breezy-k1-daily.service
+
+# The stopgap driver ran once at launch and then `sleep 86400`
+# (k1_daily.sh:33), so its de-facto schedule is its start instant repeating
+# every 24h. `ps` puts that start at 2026-09-01 22:30:21 and this host's clock
+# is UTC (`timedatectl`: Time zone Etc/UTC), so the cadence being preserved is
+# 22:30Z daily. UTC is stated explicitly rather than inherited, so the
+# schedule cannot move if the host timezone is ever changed.
+OnCalendar=*-*-* 22:30:00 UTC
+
+# The whole reason this replaces a /tmp while-loop: a run missed because the
+# host was down fires as soon as the timer is next active, instead of being
+# silently skipped until the following day.
+Persistent=true
+
+# The measurement is a local disk read with no venue rate limit to respect,
+# and a deterministic time makes correlating a snapshot with the tape easier.
+AccuracySec=1min
+
+[Install]
+WantedBy=timers.target

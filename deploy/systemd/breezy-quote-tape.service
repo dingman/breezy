@@ -1,0 +1,94 @@
+[Unit]
+# G-14. Reboot-durable supervision for the ONE irreplaceable data stream.
+# Polymarket.us price history is forward-only: an hour not recorded is an hour
+# that can never be obtained. Until this unit is installed the recorder is a
+# PPID-1 orphan in a /tmp session scratchpad with no unit at all -- it does not
+# survive a reboot, and /tmp reaping would delete its supervisor scripts.
+#
+# Conventions below MIRROR breezy-nws-ingest.service (the only Breezy unit in
+# ~/.config/systemd/user), with two deliberate divergences documented in
+# deploy/systemd/README.md: RestartSec and the StartLimit window.
+Description=Breezy Polymarket.us quote-tape recorder (user scope)
+Documentation=file:///home/jon/breezy/deploy/systemd/README.md
+Documentation=file:///home/jon/breezy/docs/core/RUNBOOK_NWS_COLLECTION.md
+After=network-online.target
+Wants=network-online.target
+# Rate-limit a hot restart loop without abandoning capture during a transient
+# outage. DIVERGES from the NWS unit's 3/300s: at RestartSec=30 that window is
+# exhausted by a ~2-minute network outage, which would leave the tape dead
+# until an operator noticed. 20 attempts per hour still fails closed on a
+# genuine exit-2 misconfiguration (~10 minutes), and still bounds the loop.
+StartLimitBurst=20
+StartLimitIntervalSec=3600
+
+[Service]
+Type=simple
+WorkingDirectory=/home/jon/breezy
+# Mirrors the NWS unit. The tape is not a secret but it is strategy-inferable
+# (which markets Breezy watches, and from when); the recorder already creates
+# its root 0700 via `prepare_quote_tape_root`.
+UMask=0077
+
+# Exactly the file both supervisor loops source
+# (tape_supervisor.sh:17, tape_supervisor_k1.sh:27 -- `. /home/jon/.config/breezy/polymarket.env`).
+# Supplies POLYMARKET_US_{KEY_ID,SECRET_KEY_FILE,API_BASE,GATEWAY_BASE,WS_URL,
+# MARKET_SLUGS,USER_AGENT}. Note BREEZY_USER_AGENT is NOT used by this role:
+# the venue user agent is POLYMARKET_US_USER_AGENT, owned by
+# `polymarket_us.factories.config_from_env`, never by runtime/settings.py
+# (src/breezy/runtime/settings.py:12-16).
+EnvironmentFile=/home/jon/.config/breezy/polymarket.env
+
+# The one variable the supervisors export on top of that env file
+# (tape_supervisor.sh:18; tape_supervisor_k1.sh:9+28). Required with NO
+# default and must be absolute -- src/breezy/runtime/settings.py:557-576.
+Environment=BREEZY_POLYMARKET_US_QUOTE_TAPE_CATALOG=/home/jon/.local/share/breezy/catalog/quote_tape/polymarket_us
+
+# Byte-identical to what the supervisors launch (tape_supervisor.sh:21-22,
+# tape_supervisor_k1.sh:31-32) and to the running recorder's
+# /proc/<pid>/cmdline. The explicit interpreter form is kept rather than the
+# NWS unit's bare console script so the cutover changes supervision ONLY.
+ExecStart=/home/jon/breezy/.venv/bin/python3 /home/jon/breezy/.venv/bin/breezy-quote-tape
+
+Restart=always
+# The supervisors poll `pgrep -f "[b]in/breezy-quote-tape"` every 30s
+# (tape_supervisor.sh:31) / 60s (tape_supervisor_k1.sh:46) and restart on the
+# next tick, so 30s is the cadence being replaced, not a regression from it.
+RestartSec=30
+
+# SIGTERM is the signal the recorder's CLEAN-shutdown path actually handles.
+# Proven: NautilusKernel._setup_loop registers SIGTERM/SIGINT/SIGABRT on the
+# event loop for every non-BACKTEST environment
+# (.venv/.../nautilus_trader/system/kernel.py:558-572, reached from :284-287),
+# and a clean stop is what runs StreamingFeatherWriter.close(), which appends
+# the Arrow end-of-stream marker
+# (tests/contract/test_quote_tape_unclean_shutdown.py:220-235).
+# This is the whole ballgame: SIGKILL instead leaves a mid-message tail, and
+# ParquetDataCatalog._read_feather_file then returns ZERO rows in total
+# silence (same file, :166-187). Never stop this unit with SIGKILL.
+KillSignal=SIGTERM
+
+# Generous on purpose. The writer flushes only every 10s
+# (QUOTE_TAPE_FLUSH_INTERVAL_MS, src/breezy/runtime/node_config.py:292), and a
+# Nautilus graceful stop then disconnects clients and disposes the kernel.
+# When TimeoutStopSec expires systemd escalates to SIGKILL, which is exactly
+# the silent-zero-rows failure above -- so this must never be the binding
+# constraint. The default 90s is replaced with 120s for headroom.
+TimeoutStopSec=120
+
+# journald, matching the NWS unit -- deliberately NOT the supervisors'
+# append-to-a-file-in-/tmp. journald is reboot-durable, rotated, and queryable
+# per-unit (`journalctl --user -u breezy-quote-tape`); the /tmp log is exactly
+# the thing G-14 exists to remove. The recorder's own diagnostics already
+# reach stdout/stderr through `breezy.runtime.logging_bridge`.
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=breezy-quote-tape
+
+# NO SuccessExitStatus. The exit contract must reach `systemctl status`:
+#   0 = clean shutdown, 1 = FATAL market-data fault (fail-closed; commit
+#   79b9b44 exists precisely so a dead feed is not reported as success),
+#   2 = configuration/environment error.
+# See src/breezy/runtime/quote_tape_cli.py:52-61 and :145-174.
+
+[Install]
+WantedBy=default.target
