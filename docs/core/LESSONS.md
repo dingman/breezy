@@ -959,3 +959,57 @@ exercise: they are where the change alters *meaning* rather than merely types,
 and they are exactly what a call-site census cannot see. And when a plan claims
 the type system will enforce something, write the escape hatch out and check
 whether it compiles.
+
+## L-20 — The catalog you query is not the tape you capture (2026-09-02)
+
+**Rule.** Before concluding that the quote tape lacks a window, a day, or an
+instrument, compare the parquet catalog under `<catalog>/data/` against the
+Arrow IPC streams under `<catalog>/live/<instance>/` — row counts per instance,
+per data type — and run `breezy-quote-tape-ingest` (or the preflight) first.
+An analysis that reads `data/` measures **what has been converted**, not what
+was captured.
+
+**Why.** M_A reported `n_afternoon = 0` — "the tape has no 12:00–17:00 LST
+coverage" — and Grok's memo, my report, and a ten-line diagnosis brief were all
+about to treat that as a capture defect. 199,079 `OrderBookDepth10` rows for the
+09-01 afternoon were sitting in `live/5a111bca…`, unconverted, because
+`convert_stream_to_data` had been run by hand exactly twice and
+`quote_tape_cli.py` declares conversion out of scope. After conversion:
+`n_afternoon = 4`, 9,588 qualifying snapshots, and the first non-dead signal in
+the programme. The wrong reading would have cost nothing visible — it would
+simply have kept the family "dead" for want of data that already existed.
+
+**How to apply.** The six-hourly `breezy-quote-tape-ingest.timer` now bounds the
+lag, and the live writer is skipped (no end-of-stream marker; convert only
+after a clean SIGTERM). But the rule outlives the timer: any "the data is
+missing" verdict names the layer it looked at, and a zero from a query is a
+[[measure-catalog-freshness-with-epoch]]-class measurement bug until the
+stream directory has been checked. Companion to [[L-18]]: "no coverage" is a
+claim about a mechanism (conversion) that had not run.
+
+## L-21 — A climatological base rate is not the comparator for a market price (2026-09-02)
+
+**Rule.** When an archive-derived probability (unconditional on the day's
+information) exceeds a venue ask by a wide margin, the default reading is
+"the archive answers a different question," not "the market is wrong." The
+statistic that can discriminate is the **realized** outcome rate of the trials
+the screen would have taken, against `ask + fee`, at a sample size the kill
+criterion names in advance.
+
+**Why.** M_B's archive table said P(CLI max lands in the 2°F rung the running
+max sits in at noon) has a Wilson-lower of 0.59 for MDW-SON, and the venue
+priced that rung at 0.06 on 09-01 — a formal "edge" of +0.53. The table was
+audited and reproduced exactly; nothing was wrong with it. The day settled two
+degrees above the rung. A market maker prices off the forecast and the
+warming trend; the archive pools every historical day regardless. Grok's
+original kill sentence compared the archive bound to the ask and therefore
+could neither fire nor confirm; it was amended to the realized hold rate
+(kill n≥60, survive n≥150).
+
+**How to apply.** Any screen built from history alone is a **selector**, never
+the edge; write the kill in terms of what actually happened to the selected
+trials. And do not fake the missing conditioning (forecast, trend) into the
+screen after seeing a miss — that is moving the goalposts, and the forecast
+family was killed for exactly the lack of that ingest. Companion to
+[[L-9]] (three refutations of "identify the near-certain rung, then buy it")
+and [[L-18]].
