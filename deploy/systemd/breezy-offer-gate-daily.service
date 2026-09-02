@@ -1,0 +1,57 @@
+[Unit]
+# Daily offer-gate scan for CLI-basis candidate #2, triggered by
+# breezy-offer-gate-daily.timer. Sibling of breezy-k1-daily.service: same
+# oneshot/no-Install/no-EnvironmentFile shape, for the same reason -- this
+# process holds no venue credential, opens no socket, and reads only the
+# quote tape (forward-only, already on disk) and the settlement-alignment
+# ASOS cache (cache-only, zero network -- see the script's module docstring,
+# "THE HARD DEPENDENCY: NO LIVE INTRADAY ASOS INGEST").
+Description=Breezy CLI-basis candidate #2 offer-gate scan (daily)
+Documentation=file:///home/jon/breezy/deploy/systemd/README.md
+Documentation=file:///home/jon/breezy/scripts/analysis/cli_basis_offer_gate_scan.py
+# Not a hard dependency: this reads the tape and the ASOS cache from local
+# disk and makes zero network calls of its own.
+After=network-online.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=/home/jon/breezy
+UMask=0077
+
+# No EnvironmentFile, deliberately: this scan carries no venue credential and
+# defaults both its inputs absolutely
+# (scripts/analysis/cli_basis_offer_gate_scan.py:
+#  DEFAULT_QUOTE_TAPE_PATH, DEFAULT_ASOS_CACHE_DIR), so it runs on a host with
+# no Polymarket.us configuration at all -- same posture as breezy-k1-daily.
+#
+# ExecStart is deliberately a single plain command with NO shell, NO `$(...)`
+# substitution and NO `%`-date-format specifiers: an earlier draft embedded a
+# multi-line `/bin/bash -c '...'` driver directly here and `systemd-analyze
+# --user verify` printed "Ignoring unknown escape sequences" for it --
+# non-empty output, i.e. a FAIL by this repo's own verification convention
+# (see deploy/systemd/README.md section 2). `%h` is a systemd-NATIVE
+# specifier (the invoking user's home directory, valid in `--user` units),
+# resolved by systemd itself rather than by a shell, so it carries none of
+# that risk. The script creates the output directory itself
+# (`output_path.parent.mkdir(parents=True, exist_ok=True)`), so no `mkdir -p`
+# is needed here either. Today's snapshot overwrites `offer_gate_latest.md`;
+# a dated, committed snapshot belongs under `docs/evidence/` and is written
+# deliberately, not by the timer. The verdict is one `print()` in `main()`,
+# visible via `journalctl --user -u breezy-offer-gate-daily.service`.
+ExecStart=/home/jon/breezy/.venv/bin/python /home/jon/breezy/scripts/analysis/cli_basis_offer_gate_scan.py --output %h/.local/share/breezy/offer_gate/offer_gate_latest.md
+
+# Mirrors breezy-k1-daily.service's TimeoutStartSec: for Type=oneshot this
+# bounds the whole run, and this scan reads a comparable (or smaller) slice
+# of the same tape plus a cache-only ASOS read.
+TimeoutStartSec=1800
+
+# No Restart=. A missed daily scan is not an incident: the tape and the ASOS
+# cache keep growing, and tomorrow's run subsumes today's. The timer's
+# Persistent=true is what recovers a run missed across a reboot.
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=breezy-offer-gate-daily
+
+# NOTE: no [Install] section. This unit is started BY the timer, never
+# enabled directly. `systemctl --user enable breezy-offer-gate-daily.timer`
+# is the only thing to enable.

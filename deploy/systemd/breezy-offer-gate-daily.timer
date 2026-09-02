@@ -1,0 +1,28 @@
+[Unit]
+Description=Daily trigger for the Breezy CLI-basis offer-gate scan
+Documentation=file:///home/jon/breezy/deploy/systemd/README.md
+Documentation=file:///home/jon/breezy/scripts/analysis/cli_basis_offer_gate_scan.py
+
+[Timer]
+Unit=breezy-offer-gate-daily.service
+
+# Scheduled AFTER breezy-k1-daily.timer (22:30 UTC), per the brief -- this
+# scan is independent of K1's output and does not need to run after it for
+# correctness, but staggering local disk-bound daily jobs avoids any needless
+# overlap. UTC is stated explicitly (this host's clock is UTC -- see
+# breezy-k1-daily.timer's own comment) so the schedule cannot move if the
+# host timezone is ever changed.
+OnCalendar=*-*-* 22:45:00 UTC
+
+# Mirrors breezy-k1-daily.timer: a run missed because the host was down
+# fires as soon as the timer is next active, instead of being silently
+# skipped until the following day.
+Persistent=true
+
+# The measurement is a local disk read (tape) plus a cache-only ASOS read,
+# with no venue rate limit to respect, and a deterministic time makes
+# correlating a snapshot with the tape and the K1 run easier.
+AccuracySec=1min
+
+[Install]
+WantedBy=timers.target
