@@ -1,0 +1,65 @@
+{
+ "cursor": "CgwI2rDV1AYQ-NjjrwESFktYSElHSE5ZLTI2U0VQMDEtQjg3LjU",
+ "markets": [
+  {
+   "cap_strike": null,
+   "close_time": "2026-09-02T05:00:00Z",
+   "event_ticker": "KXHIGHNY-26SEP01",
+   "expiration_value": "82.00",
+   "floor_strike": 90,
+   "market_type": "binary",
+   "open_time": "2026-08-31T14:00:00Z",
+   "result": "no",
+   "rules_primary": "If the maximum temperature recorded at New York City (CLINYC) for Sep 1, 2026, is greater than 90\u00b0 fahrenheit according to The Weather Company, then the market resolves to Yes.",
+   "status": "finalized",
+   "strike_type": "greater",
+   "ticker": "KXHIGHNY-26SEP01-T90",
+   "title": "Will the maximum temperature be >90\u00b0 on Sep 1, 2026?"
+  },
+  {
+   "cap_strike": 83,
+   "close_time": "2026-09-02T05:00:00Z",
+   "event_ticker": "KXHIGHNY-26SEP01",
+   "expiration_value": "82.00",
+   "floor_strike": null,
+   "market_type": "binary",
+   "open_time": "2026-08-31T14:00:00Z",
+   "result": "yes",
+   "rules_primary": "If the maximum temperature recorded at New York City (CLINYC) for Sep 1, 2026, is less than 83\u00b0 fahrenheit according to The Weather Company, then the market resolves to Yes.",
+   "status": "finalized",
+   "strike_type": "less",
+   "ticker": "KXHIGHNY-26SEP01-T83",
+   "title": "Will the maximum temperature be <83\u00b0 on Sep 1, 2026?"
+  },
+  {
+   "cap_strike": 90,
+   "close_time": "2026-09-02T05:00:00Z",
+   "event_ticker": "KXHIGHNY-26SEP01",
+   "expiration_value": "82.00",
+   "floor_strike": 89,
+   "market_type": "binary",
+   "open_time": "2026-08-31T14:00:00Z",
+   "result": "no",
+   "rules_primary": "If the maximum temperature recorded at New York City (CLINYC) for Sep 1, 2026, is between 89-90\u00b0 fahrenheit according to The Weather Company, then the market resolves to Yes.",
+   "status": "finalized",
+   "strike_type": "between",
+   "ticker": "KXHIGHNY-26SEP01-B89.5",
+   "title": "Will the maximum temperature be 89-90\u00b0 on Sep 1, 2026?"
+  },
+  {
+   "cap_strike": 88,
+   "close_time": "2026-09-02T05:00:00Z",
+   "event_ticker": "KXHIGHNY-26SEP01",
+   "expiration_value": "82.00",
+   "floor_strike": 87,
+   "market_type": "binary",
+   "open_time": "2026-08-31T14:00:00Z",
+   "result": "no",
+   "rules_primary": "If the maximum temperature recorded at New York City (CLINYC) for Sep 1, 2026, is between 87-88\u00b0 fahrenheit according to The Weather Company, then the market resolves to Yes.",
+   "status": "finalized",
+   "strike_type": "between",
+   "ticker": "KXHIGHNY-26SEP01-B87.5",
+   "title": "Will the maximum temperature be 87-88\u00b0 on Sep 1, 2026?"
+  }
+ ]
+}
