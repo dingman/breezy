@@ -105,6 +105,38 @@ but the exit it disables is the one the halt exists for, and the trade was
 plausibly never made with this consequence in view. Decide explicitly.
 `running_extreme_lock:333` uses a clock-derived horizon and is not exposed.
 
+## T-7 [MEDIUM, NEW] The `ForecastSource` liveness contract is prose, and it is already violated
+
+Found while implementing T-5. `forecast_mispricing:18-19` and
+`forecast_source.py:53-56` state that `ForecastSnapshot.horizon_hours` "must
+already be the live hours-remaining-to-settlement as of the `now` the source was
+called with." **`ForecastSource` is a `Protocol` with no liveness constraint, and
+no test pins it.** Of four in-repo implementations, one conforms
+(`run_weather_strategy_backtests.py:513`, `hours_until(now, deadline)`) and
+**two are explicitly frozen** — `_SyntheticForecastSource` admits it in its own
+docstring ("held constant for this short test run rather than recomputed from
+`now`"), and `_ConstantForecastSource` returns 24.0 and ignores `now` entirely.
+
+**The divergence is realized, not hypothetical.** In two live-exercised fixtures
+the instrument's native `expiration_ns` puts settlement 0.004-0.28 hours away
+while the forecast source reports a constant 24.0 — a gap of nearly a full day,
+in the value that feeds `hours_to_settlement` on every `PortfolioSnapshot` and
+therefore every risk cap that reads it.
+
+Consequence to weigh at go-live: a risk cap keyed on hours-to-settlement is only
+as live as an unpinned prose contract. Whether this is inert in production
+depends on the conforming implementation being the only one used outside tests —
+worth confirming rather than assuming, since the same reasoning ("only the good
+implementation is real") is what left the contract unpinned.
+
+Also noted, same investigation: `settlement_deadline_by_station` in the backtest
+script is keyed by **station** and takes the first matching instrument's
+`expiration_ns` via `next(...)`. A station whose bucket ladder carried
+non-uniform expirations would feed an arbitrary bucket's deadline where a
+clock-derived value is per-instrument. Uniformity is asserted for synthetic tapes
+(`tests/contract/test_multi_instrument_weather_strategy.py:114-118`) but nothing
+enforces it in the script.
+
 ## T-6 [LOW] `node_config.py:11-14` describes a removed mechanism
 
 The module summary says `build_trade_node_config` has "zero exec clients". It
@@ -163,3 +195,65 @@ on unknown depth; `quote_tradable` checking negative age before staleness;
 `_iter_mount_entries` degrading to fail-closed `UNDETERMINED`; `settled_qty`
 correctly excluding pending for the close-only guard; the `SharedExposureMixin`
 inheritance across all five strategies.
+
+## T-8 [MEDIUM] T-5 fixes the EXIT; ENTRY is still gated on the frozen horizon
+
+Residual after T-5, stated so it is not mistaken for closed. The settlement halt
+now derives its horizon from the clock and the native `expiration_ns`, but
+`hours_to_settlement=forecast.horizon_hours` still flows into the
+`PortfolioSnapshot` (`forecast_mispricing:360`, `calibration:386`,
+`revision:378`), and `RiskManager.evaluate_order`'s **first** gate is
+`hours_to_settlement < halt_hours_before_settlement` (`risk.py:517`), with
+`min_hours_to_settlement` right behind it.
+
+**Live sequence, from the review.** A source caches its horizon at listing
+(24.0). At T-45min the clock-derived halt correctly flattens. At T-90min the
+clock says 1.5 h — outside the halt — while the forecast still says 24.0, so
+`min_hours_to_settlement=2.0` never binds and a **new position opens 90 minutes
+before settlement**. Worse, `ForecastErrorModel.sigma` then selects the 24 h bin
+(~2.8 degF, `probability.py:415`) instead of the ~1.4 degF appropriate to
+90 minutes, **overstating edge on a near-certain bucket**. This is one
+non-conforming `ForecastSource` away from live ([[T-7]]).
+
+Follow-up: derive the entry horizon from `_deadlines` as well, so one time base
+serves both gates.
+
+## T-9 [MEDIUM, POLICY] `halt_hours_before_settlement = 1.0` is an artifact, and flattening may be value-destroying
+
+Two separate concerns, neither measured.
+
+**The threshold.** 1.0 h is measured against the venue's `endDate`
+(`parsing.py:1282`), which is administrative. The daily high locks mid-afternoon
+local, so the economically meaningful lock time and the venue's end time are
+different instants. The value is **UNVERIFIED by any measurement** and was
+plausibly never chosen against data.
+
+**The action may be worse than the exposure.** `_flatten` calls
+`close_all_positions` unconditionally into a weather book whose bid side is
+~0.3 contracts deep — a taker dump of a position that is about to pay $1. For a
+position that is *winning* and near-certain, halting by dumping into an empty
+bid destroys value that simply holding to settlement would realise.
+
+**Correct policy plausibly differs by strategy family**, and the codebase already
+splits this way: `running_extreme_lock:337` treats the halt as **entry-only** and
+returns rather than flattening. The forecast family flattens. Whether the
+forecast family should flatten unconditionally, or only when the position is
+losing or unhedged, is an open trading-policy question — not a defect to patch
+blind. Decide it against measured settlement outcomes, not intuition.
+
+## T-10 [MEDIUM, TRAP] Two `hours_until` functions with REVERSED argument order
+
+`weather_common/models.py:145` is `hours_until(later, now)`.
+`scripts/analysis/weather_strategy_backtest_lib.py:250` is
+`hours_until(now, deadline)`. **Same name, opposite argument order, and a wrong
+import silently flips the sign of every horizon** — no error, no type mismatch,
+just a negative horizon that reads as "already past settlement".
+
+Currently contained, verified: `src/` imports nothing from `scripts/` (0
+occurrences), so production code cannot reach the reversed variant, and T-5's
+three new call sites all use the `models.py` one with `(deadline, now)`, matching
+the `running_extreme_lock` precedent. `run_weather_strategy_backtests.py:513`
+correctly uses the lib variant.
+
+Containment is structural rather than deliberate, so it holds only while the
+import boundary does. Renaming one of them removes the trap permanently.

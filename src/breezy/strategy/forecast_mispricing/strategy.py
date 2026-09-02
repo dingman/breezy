@@ -17,6 +17,13 @@ REQUIRED constructor argument -- never a config field, never defaulted, never
 constructed internally. See that module's docstring for the full contract,
 in particular why ``ForecastSnapshot.horizon_hours`` must already be the live
 hours-remaining-to-settlement as of the ``now`` the source was called with.
+As of T-5 the SETTLEMENT HALT is the one thing that no longer reads
+``horizon_hours``: it is a time decision, evaluated from the instrument's own
+native ``expiration_ns`` against ``self.clock.utc_now()`` BEFORE the forecast
+is consulted, so a provider outage can no longer disable the exit. Everything
+else -- the probability model's horizon, horizon-scaled sizing, and the risk
+snapshot's ``hours_to_settlement`` -- still reads ``horizon_hours`` and still
+depends on the source keeping it live.
 Passing ``None`` (or omitting the argument) is refused at construction; this
 strategy contains no code path that derives a forecast from
 ``NwsClimateDay.tmax_f`` or any other settlement-derived value, and none
@@ -82,7 +89,12 @@ from breezy.strategy.weather_common.forecast_source import (
 )
 from breezy.strategy.weather_common.freshness import SignalFreshness
 from breezy.strategy.weather_common.inflight import signed_working_qty, working_orders
-from breezy.strategy.weather_common.models import ForecastSnapshot, MarketQuote, SideIntent
+from breezy.strategy.weather_common.models import (
+    ForecastSnapshot,
+    MarketQuote,
+    SideIntent,
+    hours_until,
+)
 from breezy.strategy.weather_common.probability import (
     ForecastErrorModel,
     HorizonSigmaParams,
@@ -138,6 +150,10 @@ class ForecastMispricingStrategy(SharedExposureMixin, Strategy):
         self._contracts: dict[str, MispricingContract] = {}
         self._nt_ids: dict[str, InstrumentId] = {}
         self._quotes: dict[str, MarketQuote] = {}
+        #: Settlement deadline per instrument, taken from the NATIVE
+        #: `Instrument.expiration_ns` at subscribe time. The settlement halt
+        #: reads this, never a forecast -- see `_evaluate_and_act`.
+        self._deadlines: dict[str, datetime] = {}
         self._risk: RiskManager | None = None
         self._shared_exposure_view: SharedExposureView | None = None
         # PUBLIC: shared by the DECISION layer and the RISK layer, which refuse
@@ -176,6 +192,7 @@ class ForecastMispricingStrategy(SharedExposureMixin, Strategy):
             )
             self._contracts[str(instrument_id)] = contract
             self._nt_ids[str(instrument_id)] = instrument_id
+            self._deadlines[str(instrument_id)] = _ns_to_datetime(instrument.expiration_ns)
             self.subscribe_quote_ticks(instrument_id)
             self.subscribe_order_book_depth(instrument_id)
             self.log.info(f"ForecastMispricingStrategy subscribed {instrument_id}")
@@ -254,6 +271,30 @@ class ForecastMispricingStrategy(SharedExposureMixin, Strategy):
         if quote is None:
             return
         now = self.clock.utc_now()
+        # THE SETTLEMENT HALT IS A TIME DECISION, EVALUATED BEFORE THE FORECAST.
+        # It used to sit downstream of `if forecast is None: return`, so a
+        # provider dropping the station/day disabled the exit outright: 200
+        # contracts held at T-minus-70min rode into settlement with nothing
+        # ever attempted, and silently, because the `FLATTEN` line is
+        # downstream of that return too (T-5,
+        # `docs/core/findings/BLIND_RISK_VIEWS_2026-09-02.md`). Nothing about
+        # "how long until this contract settles" needs a forecast to answer.
+        #
+        # The deadline is the instrument's OWN native `expiration_ns`,
+        # recorded in `on_start` -- the spelling `running_extreme_lock`
+        # already uses, and not a settlement wall clock reconstructed at the
+        # strategy layer (see `tests/unit/test_weather_strategy_settlement_clock.py`).
+        #
+        # DELIBERATELY UNCHANGED: a missing forecast OUTSIDE this window still
+        # skips evaluation and flattens nothing -- "never
+        # flatten-for-lack-of-forecast" is a stated trade
+        # (`weather_common.forecast_source`), and only the time-based exit is
+        # taken back from it.
+        if hours_until(self._deadlines[instrument_id], now) <= (
+            self._config.halt_hours_before_settlement
+        ):
+            self._flatten(instrument_id, "settlement_halt")
+            return
         forecast = self._forecast_source.snapshot(
             station=contract.facts.settlement_station,
             climate_day=contract.facts.climate_day,
@@ -261,10 +302,6 @@ class ForecastMispricingStrategy(SharedExposureMixin, Strategy):
         )
         if forecast is None:
             return
-        if forecast.horizon_hours <= self._config.halt_hours_before_settlement:
-            self._flatten(instrument_id, "settlement_halt")
-            return
-
         current_qty = float(self.portfolio.net_position(self._nt_ids[instrument_id]))
         assert self._risk is not None  # built in on_start, before any data can arrive
         decision = evaluate_instrument(

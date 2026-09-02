@@ -94,7 +94,17 @@ def _instrument() -> BinaryOption:
         size_precision=size_increment.precision,
         size_increment=size_increment,
         activation_ns=0,
-        expiration_ns=1_000_000_000_000,
+        # 24h, NOT the old 1_000s. That value was arbitrary while NOTHING read
+        # it -- `BinaryOption` is not in `ENGINE_EXPIRING_INSTRUMENT_CLASSES`
+        # (`model/instruments/base.pyx:67`), so the engine never expires it on
+        # time. T-5 makes `expiration_ns` the strategy's SETTLEMENT HORIZON:
+        # the settlement halt reads it against `clock.utc_now()` rather than
+        # trusting `ForecastSnapshot.horizon_hours`, so it must agree with
+        # `_ConstantForecastSource`'s own `horizon_hours=24.0`. At 1_000s it did
+        # not -- the clock starts at 0 and `test_the_refusal_is_counted_once...`
+        # advances it to 1_800s, i.e. PAST expiry -- so every tick halted before
+        # the decision layer and no short was ever refused to alert about.
+        expiration_ns=86_400_000_000_000,
         max_quantity=None,
         min_quantity=Quantity.from_int(1),
         maker_fee=Decimal(0),

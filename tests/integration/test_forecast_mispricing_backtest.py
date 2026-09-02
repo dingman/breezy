@@ -114,7 +114,21 @@ def _instrument() -> BinaryOption:
         size_precision=size_increment.precision,
         size_increment=size_increment,
         activation_ns=0,
-        expiration_ns=10 * _STEP_NS + _CLOSE_GAP_NS + _STEP_NS,
+        # 24h, NOT the old `10 * _STEP_NS + _CLOSE_GAP_NS + _STEP_NS` (16s).
+        # That value was arbitrary while NOTHING read it: `BinaryOption` is not
+        # in `ENGINE_EXPIRING_INSTRUMENT_CLASSES`
+        # (`model/instruments/base.pyx:67`), so `_instrument_has_expiration` is
+        # False, the engine's time-based expiration branch can never fire, and
+        # the `InstrumentClose` at `_close()` is the SOLE settlement trigger
+        # (`breezy.runtime.backtest_harness`). T-5 makes `expiration_ns` the
+        # strategy's SETTLEMENT HORIZON -- the settlement halt now reads it
+        # against the clock instead of trusting `ForecastSnapshot.horizon_hours`
+        # -- so it must agree with this fixture's own forecast horizon. At 16s
+        # it did not: the source below claims 24h remain while the instrument
+        # expired in seconds, so every tick sat inside the 1.0h halt window and
+        # the strategy correctly refused to trade a contract about to settle.
+        # Settlement itself is unmoved: `_close()` still fires at t=7s.
+        expiration_ns=86_400 * _STEP_NS,
         max_quantity=None,
         min_quantity=Quantity.from_int(1),
         maker_fee=Decimal(0),
