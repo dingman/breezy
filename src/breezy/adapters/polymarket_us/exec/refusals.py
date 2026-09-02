@@ -63,27 +63,29 @@ default rather than being guessed transient on the strength of its name. The
 write path's two distinct error types arrive at R-6.5, which is where a
 timeout can be classified honestly.
 
-WHO CALLS THIS, AND WHY NOBODY DOES YET
------------------------------------------
+WHO CALLS THIS -- R-6.5a GIVES IT ITS FIRST PRODUCTION CALLER
+----------------------------------------------------------------
 
-Nothing does, deliberately -- the same shape R-4 landed in (a library with
-zero construction sites) and for the same reason: the consumer arrives with
-the increment that has something to do with the verdict. Recorded for that
-increment, because it is a real seam and not a detail: the exec client cannot
-feed this function today. ``PrivateRead`` (``exec/client.py``) yields an
-already-decoded mapping and raises typed errors -- ``VenueRateLimitError`` and
-``VenueTransportError`` carry neither a status nor a body, and only
-``VenueStatusError`` carries a status. The status/body pair lives at the
-transport boundary, on ``VenueResponse``, OUTSIDE ``exec/`` -- which is also
-why this function takes plain ints and bytes: importing the transport's
-response type into this package is banned outright by E0-INERT.
+Until R-6.5a, nothing did -- the same shape R-4 landed in (a library with zero
+construction sites). The consumer has now arrived: the injected
+``private_read`` closure (``factories.py``) raises :class:`PrivateReadRefused`
+on any non-2xx status instead of decoding the body as a payload -- the
+``PrivateRead`` protocol's own docstring (``exec/client.py``) states this as
+an obligation every implementation must meet, present or future
+(Kalshi included). ``PolymarketUSExecutionClient.generate_position_status_
+reports`` catches it and calls :func:`classify_venue_refusal` with its
+``status`` and ``body`` directly -- the status/body pair that used to live
+only at the transport boundary, on ``VenueResponse``, OUTSIDE ``exec/``. This
+module still takes plain ints and bytes rather than importing that type:
+``exec/`` importing ``transport.py`` is banned outright by E0-INERT, and
+``PrivateReadRefused`` is what carries the pair across that boundary legally.
 """
 
 from __future__ import annotations
 
 import json
 from collections.abc import Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import Enum
 from typing import Final
 
@@ -93,11 +95,77 @@ __all__ = [
     "RATE_LIMIT_STATUS",
     "TRANSIENT_GRPC_CODES",
     "ClassifiedRefusal",
+    "PrivateReadRefused",
     "RefusalClass",
     "classify_venue_refusal",
     "grpc_status_code",
     "refusals_after_successful_reconcile",
 ]
+
+
+@dataclass(frozen=True)
+class PrivateReadRefused(Exception):
+    """The venue answered a private read with a non-2xx HTTP status.
+
+    RAISED by an injected :class:`~breezy.adapters.polymarket_us.exec.client.
+    PrivateRead` implementation -- never returned as a decoded mapping. See
+    that protocol's own docstring for the obligation this type exists to
+    satisfy: before R-6.5a, ``factories.py``'s ``private_read`` closure
+    discarded ``response.status`` outright and handed a 503's
+    ``google.rpc.Status`` body to :func:`~breezy.adapters.polymarket_us.
+    exec.endpoints.decode_private_payload` as if it were a payload, which
+    meant :func:`classify_venue_refusal` could never be fed a real caller.
+    This type is that feed.
+
+    ``status`` and ``body`` are exactly :func:`classify_venue_refusal`'s two
+    keyword parameters. ``path`` is the bare path that was signed -- never a
+    full URL, which a caller conforming to the protocol never has either.
+
+    No ``slots=True``: on an ``Exception`` subclass it buys nothing --
+    ``BaseException`` already carries a ``__dict__``, so the slot declaration
+    does not stop an arbitrary attribute from being attached, and dropping it
+    removes a false sense of closure the docstring must not imply.
+
+    ``__reduce__`` is required, not optional: the dataclass-generated
+    ``__init__`` never calls ``Exception.__init__``, so ``self.args == ()``,
+    and ``BaseException``'s own ``__reduce__`` reconstructs via
+    ``cls(*self.args)`` -- a ``TypeError`` on ``pickle.dumps``,
+    ``copy.copy``, or ``copy.deepcopy``, which
+    ``logging.handlers.QueueHandler`` triggers by pickling ``exc_info``.
+    Overriding it explicitly is the fix; a ``__post_init__`` that calls
+    ``super().__init__(...)`` would work too but leaves a second, redundant
+    ``args`` tuple sitting beside the three real fields for no benefit.
+
+    **The body is the operator's own financial position and must never reach
+    a log, an exception message, a ``repr``, or an artefact.**
+    ``field(repr=False)`` stops the dataclass-GENERATED ``__repr__`` alone --
+    it does not touch ``str()``, and ``dataclasses.asdict`` ignores it
+    entirely -- so both dunders below are overridden explicitly, and
+    ``asdict``/``astuple`` applied to this type anywhere under ``src/`` are
+    flagged by an AST LINT, not proven absent by it -- see
+    :func:`find_asdict_or_astuple_on_private_read_refused` in
+    ``tests/unit/test_polymarket_us_exec_refusals.py`` for exactly what it
+    can and cannot see.
+    """
+
+    status: int
+    path: str
+    body: bytes = field(repr=False)
+
+    def __str__(self) -> str:
+        return f"PrivateReadRefused(path={self.path!r}, status={self.status})"
+
+    __repr__ = __str__
+
+    def __reduce__(self) -> tuple[type[PrivateReadRefused], tuple[int, str, bytes]]:
+        """Pickle/``copy`` support: reconstruct through the real fields.
+
+        ``BaseException.__reduce__`` reconstructs via ``cls(*self.args)``,
+        and ``self.args`` is empty here (the dataclass ``__init__`` never
+        calls ``Exception.__init__``). Returning the field tuple directly is
+        what makes ``pickle``, ``copy.copy`` and ``copy.deepcopy`` work.
+        """
+        return (PrivateReadRefused, (self.status, self.path, self.body))
 
 
 class RefusalClass(Enum):

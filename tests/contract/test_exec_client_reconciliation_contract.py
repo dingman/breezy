@@ -32,6 +32,7 @@ order, and opens no socket. Every order it does hand to the engine is denied.
 from __future__ import annotations
 
 import asyncio
+import json
 from decimal import Decimal
 from typing import TYPE_CHECKING, Any, Final
 
@@ -55,6 +56,7 @@ from breezy.adapters.polymarket_us.exec.endpoints import (
     ACCOUNT_BALANCES_PATH,
     PORTFOLIO_POSITIONS_PATH,
 )
+from breezy.adapters.polymarket_us.exec.refusals import PrivateReadRefused, RefusalClass
 from breezy.adapters.polymarket_us.fees import polymarket_us_fee
 from breezy.adapters.polymarket_us.safety import MAX_ORDER_NOTIONAL_USD_ENV_VAR
 from breezy.adapters.polymarket_us.symbology import POLYMARKET_US_VENUE
@@ -294,6 +296,110 @@ async def test_a_failed_venue_read_still_reconciles_and_latches_a_refusal(
     assert await engine.reconcile_execution_state(timeout_secs=5.0) is True
     assert client.trading_refusals != ()
     await client._disconnect()
+
+
+class _StatusAwarePrivateRead:
+    """A minimal, DOCSTRING-COMPLIANT ``PrivateRead``: raises on non-2xx.
+
+    Not ``factories.py``'s own closure -- D2 asks for a contract test over
+    ANY ``PrivateRead``, because the obligation is written into the
+    PROTOCOL's docstring for every future implementer (Kalshi included), not
+    into one closure. The "response" is dialled directly, in exactly the
+    shape a compliant implementation must react to.
+    """
+
+    def __init__(self, *, status: int, body: bytes) -> None:
+        self._status = status
+        self._body = body
+
+    async def __call__(self, path: str) -> Mapping[str, Any]:
+        if path == ACCOUNT_BALANCES_PATH:
+            return await _flat_account_read(path)
+        if not 200 <= self._status < 300:
+            raise PrivateReadRefused(status=self._status, path=path, body=self._body)
+        decoded: Mapping[str, Any] = json.loads(self._body, parse_float=Decimal)
+        return decoded
+
+
+class _ContractViolatingPrivateRead:
+    """The DEFECT this increment closes, reproduced as a fake.
+
+    Decodes a non-2xx body instead of raising -- exactly what
+    ``factories.py``'s closure did before R-6.5a. Wired through the real
+    engine to show what "failing the contract" costs: the position read
+    still ends up refused (the body does not parse as
+    ``{"positions": ..., "eof": ...}``), but the TRANSIENT signal is lost and
+    the refusal defaults to DURABLE, which is the whole point of the
+    obligation ``PrivateRead.__call__``'s docstring states.
+    """
+
+    def __init__(self, *, body: bytes) -> None:
+        self._body = body
+
+    async def __call__(self, path: str) -> Mapping[str, Any]:
+        if path == ACCOUNT_BALANCES_PATH:
+            return await _flat_account_read(path)
+        decoded: Mapping[str, Any] = json.loads(self._body, parse_float=Decimal)
+        return decoded
+
+
+@pytest.mark.asyncio
+async def test_a_non_2xx_private_read_must_raise_never_decode_the_body_as_a_payload(
+    tmp_path: Path,
+) -> None:
+    """R-6.5a's defect, closed and pinned as a contract over ANY ``PrivateRead``.
+
+    Before this increment, a non-2xx private read decoded its body as if it
+    were a payload; ``classify_venue_refusal`` could never be reached. Two
+    scenarios, through the SAME real engine: a compliant implementation
+    (raises ``PrivateReadRefused``) is classified correctly, and a
+    non-compliant one (decodes instead) is not -- proving the obligation is
+    load-bearing, not decorative. Today this fails with ``ImportError``:
+    ``PrivateReadRefused`` does not exist yet.
+    """
+    grpc_503 = json.dumps({"code": 14, "message": "unavailable", "details": []}).encode("utf-8")
+
+    loop = asyncio.get_running_loop()
+    engine, cache, msgbus, clock, _portfolio = _build_engine(loop)
+    compliant_dir = tmp_path / "compliant"
+    compliant_dir.mkdir()
+    compliant = _build_client(
+        loop,
+        compliant_dir,
+        read=_StatusAwarePrivateRead(status=503, body=grpc_503),
+        cache=cache,
+        msgbus=msgbus,
+        clock=clock,
+    )
+    engine.register_client(compliant)
+    await compliant._connect()
+
+    assert await engine.reconcile_execution_state(timeout_secs=5.0) is True
+    assert compliant.trading_refusals != ()
+    assert compliant._trading_refusals[-1].classification is RefusalClass.TRANSIENT
+    await compliant._disconnect()
+
+    engine2, cache2, msgbus2, clock2, _portfolio2 = _build_engine(loop)
+    violating_dir = tmp_path / "violating"
+    violating_dir.mkdir()
+    violating = _build_client(
+        loop,
+        violating_dir,
+        read=_ContractViolatingPrivateRead(body=grpc_503),
+        cache=cache2,
+        msgbus=msgbus2,
+        clock=clock2,
+    )
+    engine2.register_client(violating)
+    await violating._connect()
+
+    assert await engine2.reconcile_execution_state(timeout_secs=5.0) is True
+    assert violating.trading_refusals != ()
+    assert violating._trading_refusals[-1].classification is RefusalClass.DURABLE, (
+        "a PrivateRead that decodes instead of raising loses the TRANSIENT "
+        "signal entirely -- this is what 'failing the contract' costs"
+    )
+    await violating._disconnect()
 
 
 async def _truncated_positions_read(path: str) -> Mapping[str, Any]:

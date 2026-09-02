@@ -84,6 +84,7 @@ from breezy.adapters.polymarket_us.exec.endpoints import (
     PRIVATE_READ_QUOTA_KEY,
     decode_private_payload,
 )
+from breezy.adapters.polymarket_us.exec.refusals import PrivateReadRefused
 from breezy.adapters.polymarket_us.http import PolymarketUSHttpClient
 from breezy.adapters.polymarket_us.parsing import parse_quote_tick
 from breezy.adapters.polymarket_us.provider import PolymarketUSInstrumentProvider
@@ -708,6 +709,18 @@ class PolymarketUSLiveExecClientFactory(LiveExecClientFactory):
             replace a private-surface money literal with a different `float`
             (`exec/endpoints.py` module docstring). ``decode_private_payload``
             is the Decimal-preserving decode this surface requires.
+
+            R-6.5a: any non-2xx status is raised as ``PrivateReadRefused`` --
+            carrying the status, the bare path, and the raw body -- rather
+            than handed to ``decode_private_payload``.
+            ``NautilusHttpTransport.get`` (``transport.py``) returns a
+            ``VenueResponse`` for any status short of a 3xx or a transport
+            fault, so before this check a 503 whose body was a
+            ``google.rpc.Status`` JSON object decoded as if it were a
+            payload, and ``classify_venue_refusal`` (``exec/refusals.py``)
+            could never be reached. See ``PrivateRead.__call__``'s own
+            docstring (``exec/client.py``): every implementation, present or
+            future, carries this same obligation.
             """
             headers = dict(signer.sign_headers("GET", path, query_string=""))
             response = await transport.get(
@@ -715,6 +728,8 @@ class PolymarketUSLiveExecClientFactory(LiveExecClientFactory):
                 headers=headers,
                 quota_key=PRIVATE_READ_QUOTA_KEY,
             )
+            if not 200 <= response.status < 300:
+                raise PrivateReadRefused(status=response.status, path=path, body=response.body)
             return decode_private_payload(response.body, context=path)
 
         return PolymarketUSExecutionClient(

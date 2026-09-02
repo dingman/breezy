@@ -58,7 +58,9 @@ says so.
 from __future__ import annotations
 
 import ast
+import copy
 import json
+import pickle
 from pathlib import Path
 from typing import Final
 
@@ -66,14 +68,17 @@ import pytest
 
 from breezy.adapters.polymarket_us.exec.refusals import (
     ClassifiedRefusal,
+    PrivateReadRefused,
     RefusalClass,
     classify_venue_refusal,
     grpc_status_code,
     refusals_after_successful_reconcile,
 )
 
+REPO_ROOT: Final[Path] = Path(__file__).resolve().parents[2]
+SRC_ROOT: Final[Path] = REPO_ROOT / "src"
 REFUSALS_SOURCE: Final[Path] = (
-    Path(__file__).resolve().parents[2]
+    REPO_ROOT
     / "src"
     / "breezy"
     / "adapters"
@@ -81,6 +86,9 @@ REFUSALS_SOURCE: Final[Path] = (
     / "exec"
     / "refusals.py"
 )
+
+#: A body an operator would never want anywhere near a log or an artefact.
+SECRET_BODY: Final[bytes] = b'{"currentBalance": 999999.99, "note": "do not leak this"}'
 
 #: The venue's text was measured IDENTICAL across codes 5, 12, 13 and 14. Its
 #: exact wording was not recorded, so this stands in for it: what the capture
@@ -357,3 +365,232 @@ def test_the_envelope_decoder_reads_only_a_true_integer_code() -> None:
     assert grpc_status_code(b"not json at all") is None
     assert grpc_status_code(None) is None
     assert grpc_status_code('{"code": 14}') == 14
+
+
+# ---------------------------------------------------------------------------
+# R-6.5a -- PrivateReadRefused: the status-carrying refusal that never leaks
+# the body, RAISED across the read seam instead of a decoded mapping
+# ---------------------------------------------------------------------------
+
+
+def test_private_read_refused_str_never_contains_the_body() -> None:
+    """The body is the operator's own financial position; ``str()`` may name
+    only the path and the status -- never the payload."""
+    err = PrivateReadRefused(status=503, path="/v1/portfolio/positions", body=SECRET_BODY)
+    rendered = str(err)
+    assert SECRET_BODY.decode("utf-8") not in rendered
+    assert "999999.99" not in rendered
+    assert "503" in rendered
+    assert "/v1/portfolio/positions" in rendered
+
+
+def test_private_read_refused_repr_never_contains_the_body() -> None:
+    """``field(repr=False)`` alone would stop only the dataclass-generated
+    ``repr`` -- this pins the OVERRIDE, not the field option."""
+    err = PrivateReadRefused(status=404, path="/v1/account/balances", body=SECRET_BODY)
+    rendered = repr(err)
+    assert SECRET_BODY.decode("utf-8") not in rendered
+    assert "999999.99" not in rendered
+    assert "404" in rendered
+    assert "/v1/account/balances" in rendered
+
+
+def test_private_read_refused_round_trips_through_pickle_and_deepcopy() -> None:
+    """``BaseException.__reduce__`` reconstructs via ``cls(*self.args)``, and
+    the dataclass-generated ``__init__`` never calls ``Exception.__init__``,
+    so ``self.args == ()`` and that reconstruction raises ``TypeError`` --
+    exactly what ``logging.handlers.QueueHandler`` triggers when it pickles
+    ``exc_info``. ``__reduce__`` must be overridden to survive `pickle` and
+    `copy` unchanged, with the body still never surfacing in `str()`.
+    """
+    err = PrivateReadRefused(status=503, path="/v1/portfolio/positions", body=SECRET_BODY)
+
+    restored = pickle.loads(pickle.dumps(err))
+    assert restored.status == err.status
+    assert restored.path == err.path
+    assert restored.body == err.body
+    assert SECRET_BODY.decode("utf-8") not in str(restored)
+
+    deep = copy.deepcopy(err)
+    assert deep.status == err.status
+    assert deep.path == err.path
+    assert deep.body == err.body
+    assert SECRET_BODY.decode("utf-8") not in str(deep)
+
+    shallow = copy.copy(err)
+    assert shallow.status == err.status
+    assert shallow.path == err.path
+    assert shallow.body == err.body
+
+
+def _dataclasses_call_aliases(tree: ast.AST) -> dict[str, str]:
+    """Every LOCAL bare name that resolves back to ``asdict``/``astuple``.
+
+    Covers ``from dataclasses import asdict`` (identity) AND
+    ``from dataclasses import asdict as a`` (import alias) -- the first
+    evasion: a bare-name call through an aliased import has no literal
+    ``asdict``/``astuple`` token anywhere in the call itself. The attribute
+    form (``dataclasses.asdict(x)`` / ``dc.asdict(x)`` under any module
+    alias) needs no alias table: it is matched on ``.attr`` alone, which does
+    not care what the object before the dot is bound to.
+    """
+    aliases: dict[str, str] = {"asdict": "asdict", "astuple": "astuple"}
+    for node in ast.walk(tree):
+        if isinstance(node, ast.ImportFrom) and node.module == "dataclasses":
+            for alias in node.names:
+                if alias.name in {"asdict", "astuple"} and alias.asname:
+                    aliases[alias.asname] = alias.name
+    return aliases
+
+
+def _names_typed_as_private_read_refused(tree: ast.AST) -> set[str]:
+    """Every local name this module ever binds to a ``PrivateReadRefused``.
+
+    Three DIRECT sources: an ``except PrivateReadRefused as <name>:``
+    handler, a parameter annotated ``PrivateReadRefused``, or a variable
+    annotated the same way. Then a TRANSITIVE closure over plain
+    reassignment (the second evasion: ``x = err`` is a bare ``ast.Assign``
+    with no annotation at all) -- ``x = err`` then ``y = x`` both end up
+    typed, in one fixed-point pass over the small local name set.
+    """
+    names: set[str] = set()
+    for node in ast.walk(tree):
+        annotation: ast.expr | None = None
+        bound_name: str | None = None
+        if isinstance(node, ast.ExceptHandler) and node.name is not None:
+            annotation = node.type
+            bound_name = node.name
+        elif isinstance(node, ast.arg) and node.annotation is not None:
+            annotation = node.annotation
+            bound_name = node.arg
+        elif (
+            isinstance(node, ast.AnnAssign)
+            and isinstance(node.target, ast.Name)
+            and node.annotation is not None
+        ):
+            annotation = node.annotation
+            bound_name = node.target.id
+        if annotation is None or bound_name is None:
+            continue
+        annotation_names = {n.id for n in ast.walk(annotation) if isinstance(n, ast.Name)}
+        if "PrivateReadRefused" in annotation_names:
+            names.add(bound_name)
+
+    changed = True
+    while changed:
+        changed = False
+        for node in ast.walk(tree):
+            if not (
+                isinstance(node, ast.Assign)
+                and len(node.targets) == 1
+                and isinstance(node.targets[0], ast.Name)
+                and isinstance(node.value, ast.Name)
+            ):
+                continue
+            target_name = node.targets[0].id
+            if node.value.id in names and target_name not in names:
+                names.add(target_name)
+                changed = True
+    return names
+
+
+def _asdict_or_astuple_targets(tree: ast.AST) -> set[str]:
+    """Every bare name passed as the sole argument to ``asdict``/``astuple``,
+    reached either directly or through an aliased import (see
+    :func:`_dataclasses_call_aliases`)."""
+    bare_aliases = _dataclasses_call_aliases(tree)
+    targets: set[str] = set()
+    for node in ast.walk(tree):
+        if not (isinstance(node, ast.Call) and node.args and isinstance(node.args[0], ast.Name)):
+            continue
+        func = node.func
+        is_asdict_or_astuple = (isinstance(func, ast.Name) and func.id in bare_aliases) or (
+            isinstance(func, ast.Attribute) and func.attr in {"asdict", "astuple"}
+        )
+        if is_asdict_or_astuple:
+            targets.add(node.args[0].id)
+    return targets
+
+
+def find_asdict_or_astuple_on_private_read_refused(source: str) -> bool:
+    """``True`` iff ``source`` calls ``asdict``/``astuple`` on a name typed
+    (directly or via plain reassignment) ``PrivateReadRefused``, including
+    through an aliased ``from dataclasses import asdict as ...``.
+
+    ``asdict`` ignores ``field(repr=False)`` entirely (measured: it walks
+    every field), so this is a structural LINT, not a behavioural stop and
+    not a proof of absence: it sees annotated names, ``except``-bound names,
+    names assigned from an already-typed name (one fixed-point pass), and
+    aliased ``dataclasses`` imports -- it does not do general type inference,
+    so a name typed only through a return value, a container, or a
+    multi-hop attribute chain is invisible to it.
+    """
+    tree = ast.parse(source)
+    typed = _names_typed_as_private_read_refused(tree)
+    called = _asdict_or_astuple_targets(tree)
+    return bool(typed & called)
+
+
+def test_the_asdict_ban_fires_on_a_planted_call_and_not_on_an_unrelated_dataclass() -> None:
+    """Non-vacuity, both directions, plus the real scan over ``src/``.
+
+    ``dataclasses.asdict``/``astuple`` recurse through every field regardless
+    of ``repr=False`` -- the override on ``__str__``/``__repr__`` is a patch
+    for the paths those two dunders reach, and this scan is what closes the
+    third one D2's own least-confident note admits it cannot enumerate.
+    """
+    banned_source = (
+        "from dataclasses import asdict\n"
+        "from breezy.adapters.polymarket_us.exec.refusals import PrivateReadRefused\n"
+        "\n"
+        "def handle(err: PrivateReadRefused) -> dict:\n"
+        "    return asdict(err)\n"
+    )
+    safe_source = (
+        "from dataclasses import asdict, dataclass\n"
+        "\n"
+        "@dataclass\n"
+        "class Unrelated:\n"
+        "    x: int\n"
+        "\n"
+        "def handle(value: Unrelated) -> dict:\n"
+        "    return asdict(value)\n"
+    )
+
+    assert find_asdict_or_astuple_on_private_read_refused(banned_source) is True
+    assert find_asdict_or_astuple_on_private_read_refused(safe_source) is False
+
+    for path in sorted(SRC_ROOT.rglob("*.py")):
+        source = path.read_text(encoding="utf-8")
+        assert not find_asdict_or_astuple_on_private_read_refused(source), (
+            f"{path} applies asdict/astuple to a value typed PrivateReadRefused"
+        )
+
+
+def test_the_asdict_ban_fires_on_an_aliased_import() -> None:
+    """Evasion 1: ``from dataclasses import asdict as a`` then ``a(err)`` has
+    no literal ``asdict``/``astuple`` token anywhere in the call site."""
+    aliased_source = (
+        "from dataclasses import asdict as a\n"
+        "from breezy.adapters.polymarket_us.exec.refusals import PrivateReadRefused\n"
+        "\n"
+        "def handle(err: PrivateReadRefused) -> dict:\n"
+        "    return a(err)\n"
+    )
+    assert find_asdict_or_astuple_on_private_read_refused(aliased_source) is True
+
+
+def test_the_asdict_ban_fires_on_a_bare_reassignment() -> None:
+    """Evasion 2: ``x = err`` is a bare ``ast.Assign`` with no annotation at
+    all, so a scan keyed only on annotated/``except``-bound names misses it
+    -- and it must chain, since ``y = x`` is one more hop of the same kind."""
+    reassigned_source = (
+        "from dataclasses import asdict\n"
+        "from breezy.adapters.polymarket_us.exec.refusals import PrivateReadRefused\n"
+        "\n"
+        "def handle(err: PrivateReadRefused) -> dict:\n"
+        "    x = err\n"
+        "    y = x\n"
+        "    return asdict(y)\n"
+    )
+    assert find_asdict_or_astuple_on_private_read_refused(reassigned_source) is True

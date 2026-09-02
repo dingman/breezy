@@ -241,6 +241,13 @@ from breezy.adapters.polymarket_us.exec.endpoints import (
     ACCOUNT_BALANCES_PATH,
     PORTFOLIO_POSITIONS_PATH,
 )
+from breezy.adapters.polymarket_us.exec.refusals import (
+    ClassifiedRefusal,
+    PrivateReadRefused,
+    RefusalClass,
+    classify_venue_refusal,
+    refusals_after_successful_reconcile,
+)
 from breezy.adapters.polymarket_us.exec.reports import (
     build_execution_mass_status,
     derive_position_cost_basis,
@@ -343,6 +350,18 @@ class PrivateRead(Protocol):
     module imports no network-capable client at all: the transport, the signer
     and the base URLs are assembled outside the ``exec/`` package, and barrier
     E0-INERT's transport-import ban keeps it that way.
+
+    **On any non-2xx HTTP status, an implementation MUST raise
+    :class:`~breezy.adapters.polymarket_us.exec.refusals.PrivateReadRefused`
+    -- carrying that status, the bare ``path``, and the raw body -- rather
+    than return a decoded mapping.** Before R-6.5a, the shipped closure
+    (``factories.py``) discarded the status and decoded whatever body came
+    back, so a 503 carrying a ``google.rpc.Status`` JSON object was handed to
+    the caller as if it were a real payload and
+    :func:`~breezy.adapters.polymarket_us.exec.refusals.classify_venue_refusal`
+    could never be reached. This obligation binds every implementation,
+    present or future -- a second venue (Kalshi) inherits it from this
+    docstring rather than rediscovering the defect.
     """
 
     async def __call__(self, path: str) -> Mapping[str, Any]: ...
@@ -539,7 +558,7 @@ class PolymarketUSExecutionClient(LiveExecutionClient):
 
         self._store: ClosableStateStore | None = None
         self._store_thread: int | None = None
-        self._trading_refusals: list[str] = []
+        self._trading_refusals: list[ClassifiedRefusal] = []
         self._settled_positions: list[InstrumentId] = []
 
     # -- observable state ---------------------------------------------------
@@ -551,8 +570,13 @@ class PolymarketUSExecutionClient(LiveExecutionClient):
         Populated by reconciliation. R-4 refuses every order regardless; this
         is the evidence an operator needs about WHY the venue state could not
         be attributed, and it is what R-6/R-7 key their own refusal on.
+
+        R-6.5a: the internal latch is now a list of
+        :class:`~breezy.adapters.polymarket_us.exec.refusals.ClassifiedRefusal`
+        (TRANSIENT/DURABLE), never exposed here -- every existing consumer of
+        this property reads reason strings, and none of them move.
         """
-        return tuple(self._trading_refusals)
+        return tuple(refusal.reason for refusal in self._trading_refusals)
 
     @property
     def settled_positions(self) -> tuple[InstrumentId, ...]:
@@ -889,9 +913,20 @@ class PolymarketUSExecutionClient(LiveExecutionClient):
             payload = await self._private_read(PORTFOLIO_POSITIONS_PATH)
             positions = self._declared_positions(payload)
         except Exception as exc:  # noqa: BLE001 - see the docstring: NOTHING may reach the native handler
+            # R-6.5a: a status-carrying refusal is classified TRANSIENT/
+            # DURABLE on its actual HTTP status and gRPC code; anything else
+            # (a transport fault, a mapping-shape error) keeps the DURABLE
+            # default `classify_venue_refusal` itself defines -- this is the
+            # ONE production caller that feeds it a real status and body.
+            classification = (
+                classify_venue_refusal(status=exc.status, body=exc.body)
+                if isinstance(exc, PrivateReadRefused)
+                else RefusalClass.DURABLE
+            )
             self._refuse(
                 "the venue position read failed "
-                f"({type(exc).__name__}: {exc}); no position can be attributed"
+                f"({type(exc).__name__}: {exc}); no position can be attributed",
+                classification=classification,
             )
             return []
 
@@ -964,6 +999,20 @@ class PolymarketUSExecutionClient(LiveExecutionClient):
         except (ExecutionReportMappingError, VenuePayloadError) as exc:
             self._refuse(f"the position in market {slug!r} could not be mapped: {exc}")
             return None
+
+        # R-6.5a: this is "an instrument's reconciliation succeeded" -- the
+        # payload for `slug` was read AND mapped without error. Chosen as the
+        # narrowest point that covers every outcome below it (expired, FLAT,
+        # or a live LONG) rather than duplicating the call in each branch.
+        # Nothing in THIS client's own refusal producers is instrument-scoped
+        # yet (only the whole-account read failure in
+        # `generate_position_status_reports` classifies today, and that one
+        # is account-wide, not per-instrument), so this re-derivation has no
+        # production trigger to fire against until a later increment adds
+        # one -- the same shape R-6d's classifier itself landed in.
+        self._trading_refusals = list(
+            refusals_after_successful_reconcile(self._trading_refusals, instrument=slug)
+        )
 
         report = mapped.report
         if mapped.expired:
@@ -1339,7 +1388,7 @@ class PolymarketUSExecutionClient(LiveExecutionClient):
             reason = (
                 "this client has latched a trading refusal and will not act on "
                 "venue state it could not attribute: "
-                f"{self._trading_refusals[0]}"
+                f"{self._trading_refusals[0].reason}"
             )
         elif self._cache.account_for_venue(self.venue) is None:
             reason = (
@@ -1396,25 +1445,58 @@ class PolymarketUSExecutionClient(LiveExecutionClient):
 
     # -- refusals -----------------------------------------------------------
 
-    def _refuse(self, reason: str) -> None:
+    def _refuse(
+        self,
+        reason: str,
+        *,
+        classification: RefusalClass = RefusalClass.DURABLE,
+    ) -> None:
         """Record a reason this client cannot be trusted to trade, and alert.
 
         ERROR, not WARNING: an unattributable position is the operator's
         problem to resolve, and the node will go on running -- refusing -- in
         the meantime. Deduplicated so a per-reconcile loop cannot bury the log.
 
-        **R-6c: the FIRST refusal also degrades the component.** An ERROR line
-        and a ``trading_refusals`` property are both things a HUMAN reads;
-        neither is a state anything can act on. ``Component.degrade()``
-        (``$NT/common/component.pyx:2098-2127``) is the native FSM transition
-        for exactly this -- "running, but not healthy" -- and it publishes a
-        ``ComponentStateChanged`` on ``events.system.<component_id>``
-        (``:2210-2225``). Nothing here reimplements it and nothing here
-        subscribes to it: the operator-facing subscriber lives at the wiring
-        layer in ``breezy.runtime.component_health_watch``, because
+        ``classification`` (R-6.5a) defaults to
+        :attr:`~breezy.adapters.polymarket_us.exec.refusals.RefusalClass.DURABLE`
+        -- the safe default that keeps invariant 1 unweakened for every
+        producer that does not (yet) have an HTTP status to classify from.
+        The signature keeps ``(reason: str)`` as its whole positional shape so
+        the 25-site producer pin
+        (``tests/unit/test_exec_refusal_health_surface.py``, keyed by
+        enclosing-function#ordinal) does not move: this is a keyword-only
+        addition, not a change to how any existing call site is shaped.
+        Every latched entry is instrument-UNSCOPED (``instrument=""``) from
+        this method -- no producer here names one yet -- so nothing recorded
+        through this method can ever be cleared by
+        :meth:`_map_position`'s :func:`~breezy.adapters.polymarket_us.exec.
+        refusals.refusals_after_successful_reconcile` call, which matches
+        refusals only by a specific instrument.
+
+        **R-6c: the first refusal while not yet degraded also degrades the
+        component.** An ERROR line and a ``trading_refusals`` property are
+        both things a HUMAN reads; neither is a state anything can act on.
+        ``Component.degrade()`` (``$NT/common/component.pyx:2098-2127``) is
+        the native FSM transition for exactly this -- "running, but not
+        healthy" -- and it publishes a ``ComponentStateChanged`` on
+        ``events.system.<component_id>`` (``:2210-2225``). Nothing here
+        reimplements it and nothing here subscribes to it: the
+        operator-facing subscriber lives at the wiring layer in
+        ``breezy.runtime.component_health_watch``, because
         ``breezy.runtime.health`` is a module NO module under ``exec/`` may
         import (barrier E0-TRANSPORT,
         ``tests/unit/test_execution_egress_firewall_guard.py``).
+
+        **R-6.5a fix: gated on ``self.is_degraded`` (native FSM state), never
+        on ``self._trading_refusals`` being momentarily empty.**
+        :meth:`_map_position`'s reconciliation-clearing call
+        (:func:`~breezy.adapters.polymarket_us.exec.refusals.
+        refusals_after_successful_reconcile`) can drop every remaining entry
+        for one instrument and leave the list empty while the component is
+        STILL degraded from an earlier refusal. The list's own emptiness is
+        therefore not a proxy for "never yet degraded" -- only the
+        component's own state is, and tracking a second, parallel boolean
+        here would just be a second place for the two to drift.
 
         Legal from ``RUNNING``, which is always this client's state when a
         refusal fires: ``NautilusKernel.start_async`` runs ``_start_engines()``
@@ -1435,12 +1517,14 @@ class PolymarketUSExecutionClient(LiveExecutionClient):
         ``tests/unit/test_exec_refusal_health_surface.py``), so nothing here
         stops the node, publishes a shutdown, or writes a fault latch.
         """
-        if reason in self._trading_refusals:
+        if any(refusal.reason == reason for refusal in self._trading_refusals):
             return
-        first_refusal = not self._trading_refusals
-        self._trading_refusals.append(reason)
+        was_already_degraded = self.is_degraded
+        self._trading_refusals.append(
+            ClassifiedRefusal(instrument="", reason=reason, classification=classification)
+        )
         self._log.error(f"Trading refused: {reason}")
-        if first_refusal:
+        if not was_already_degraded:
             self.degrade()
 
     def __repr__(self) -> str:

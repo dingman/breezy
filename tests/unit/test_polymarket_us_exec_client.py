@@ -33,12 +33,15 @@ strictly stronger.
 
 from __future__ import annotations
 
+import ast
 import asyncio
+import inspect
 import json
 import threading
 from collections.abc import Iterator
 from concurrent.futures import ThreadPoolExecutor
 from decimal import Decimal
+from pathlib import Path
 from typing import TYPE_CHECKING, Any, Final
 
 import pytest
@@ -92,10 +95,16 @@ from breezy.adapters.polymarket_us.exec.client import (
     VENUE_ORDER_ID_KEY_PREFIX,
     DurableFillRecord,
     PolymarketUSExecutionClient,
+    PrivateRead,
 )
 from breezy.adapters.polymarket_us.exec.endpoints import (
     ACCOUNT_BALANCES_PATH,
     PORTFOLIO_POSITIONS_PATH,
+)
+from breezy.adapters.polymarket_us.exec.refusals import (
+    ClassifiedRefusal,
+    PrivateReadRefused,
+    RefusalClass,
 )
 from breezy.adapters.polymarket_us.exec.reports import build_execution_mass_status
 from breezy.adapters.polymarket_us.exec_fault import (
@@ -114,7 +123,6 @@ from tests.unit.polymarket_us_exec_shapes import (
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
     from collections.abc import Mapping
-    from pathlib import Path
 
     from nautilus_trader.model.instruments import BinaryOption
 
@@ -511,6 +519,91 @@ async def test_mass_status_is_never_none_when_the_venue_read_fails(
     await rig.client._disconnect()
 
 
+# ---------------------------------------------------------------------------
+# R-6.5a -- a status-carrying refusal is classified on its real status,
+# never decoded as if it were a payload
+# ---------------------------------------------------------------------------
+
+
+def _grpc_body(code: int) -> bytes:
+    return json.dumps({"code": code, "message": "x", "details": []}).encode("utf-8")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("status", "body", "expected"),
+    [
+        pytest.param(503, _grpc_body(14), RefusalClass.TRANSIENT, id="503-unavailable-transient"),
+        pytest.param(404, _grpc_body(5), RefusalClass.DURABLE, id="404-not-found-durable"),
+    ],
+)
+async def test_a_failed_positions_read_latches_the_status_derived_classification(
+    tmp_path: Path,
+    status: int,
+    body: bytes,
+    expected: RefusalClass,
+) -> None:
+    """A `PrivateReadRefused` reaching `generate_position_status_reports` is
+    classified from its OWN status and body, not defaulted blind.
+
+    Today `_trading_refusals` is `list[str]` and no classification exists at
+    all, so this fails before it can even reach the assertion below.
+    """
+    rig = _build_rig(tmp_path)
+    await rig.client._connect()
+    rig.read.raises[PORTFOLIO_POSITIONS_PATH] = PrivateReadRefused(
+        status=status, path=PORTFOLIO_POSITIONS_PATH, body=body
+    )
+
+    mass_status = await rig.client.generate_mass_status()
+
+    assert mass_status is not None
+    assert rig.client.trading_refusals != ()
+    assert rig.client._trading_refusals[-1].classification is expected
+    await rig.client._disconnect()
+
+
+def test_classify_venue_refusal_has_a_production_caller() -> None:
+    """The inverse of R-6e's zero-callers pin.
+
+    `classify_venue_refusal` shipped in R-6d with no caller anywhere in
+    `src/`; R-6.5a gives it its first one, in the except branch that catches
+    `PrivateReadRefused`. Today this fails: no such call exists yet.
+    """
+    source = Path(client_module.__file__).read_text(encoding="utf-8")
+    assert "classify_venue_refusal(" in source
+
+
+def test_private_read_call_still_takes_only_a_path() -> None:
+    """PIN: the GET-only, no-query guarantee. D1/D2/D3 touch the refusal
+    store and the closure's body, never `PrivateRead.__call__`'s signature."""
+    params = list(inspect.signature(PrivateRead.__call__).parameters)
+    assert params == ["self", "path"]
+
+
+def test_refuse_producer_count_stays_pinned_at_twenty_five() -> None:
+    """PIN: R-6.5a adds no new `self._refuse(...)` call site.
+
+    D3 changes the STORE's element type and one caller's keyword arguments;
+    it neither adds nor removes a producer. The authoritative, triaged
+    inventory is `tests/unit/test_exec_refusal_health_surface.py::
+    REFUSAL_PRODUCERS`; this is the cheap local pin that catches a moved
+    count without importing that module's internals.
+    """
+    source = Path(client_module.__file__).read_text(encoding="utf-8")
+    tree = ast.parse(source)
+    count = sum(
+        1
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr == "_refuse"
+        and isinstance(node.func.value, ast.Name)
+        and node.func.value.id == "self"
+    )
+    assert count == 25
+
+
 @pytest.mark.asyncio
 async def test_mass_status_is_never_none_when_the_ASSEMBLY_itself_fails(
     tmp_path: Path,
@@ -686,6 +779,108 @@ def _position(
     payload["qtySold"] = sold
     payload["cost"] = {"value": cost, "currency": "USD"}
     return payload
+
+
+@pytest.mark.asyncio
+async def test_a_transient_refusal_for_one_instrument_is_dropped_after_it_reconciles(
+    tmp_path: Path,
+) -> None:
+    """`refusals_after_successful_reconcile` wired at `_map_position`'s
+    success point -- the narrowest one that covers every outcome under it
+    (expired, FLAT, or a live LONG), right after the payload is mapped and
+    before any of those three are distinguished.
+
+    This client has no per-instrument HTTP status to classify from today
+    (only the whole-account positions/balances reads carry one, and neither
+    is scoped to a single instrument), so the TRANSIENT/DURABLE pair here is
+    PLANTED directly rather than produced by a live failure -- what is under
+    test is the WIRING, that a successful reconcile of `slug` re-derives the
+    refusal set exactly as `refusals_after_successful_reconcile` does. The
+    classifier itself is covered in isolation by
+    `test_polymarket_us_exec_refusals.py`.
+
+    Today `refusals_after_successful_reconcile` has zero callers, so nothing
+    clears the seeded transient entry and this fails.
+    """
+    slug = _slug(build_instrument())
+    other_slug = "highest-temperature-in-chicago-on-september-2"
+    rig = _build_rig(tmp_path)
+    await rig.client._connect()
+    rig.client._trading_refusals = [
+        ClassifiedRefusal(
+            instrument=slug, reason="transient here", classification=RefusalClass.TRANSIENT
+        ),
+        ClassifiedRefusal(
+            instrument=slug, reason="durable here", classification=RefusalClass.DURABLE
+        ),
+        ClassifiedRefusal(
+            instrument=other_slug,
+            reason="transient elsewhere",
+            classification=RefusalClass.TRANSIENT,
+        ),
+    ]
+
+    report = rig.client._map_position(slug, _position(slug))
+
+    assert report is not None
+    reasons = {refusal.reason for refusal in rig.client._trading_refusals}
+    assert "transient here" not in reasons, reasons
+    assert "durable here" in reasons, reasons
+    assert "transient elsewhere" in reasons, reasons
+    await rig.client._disconnect()
+
+
+@pytest.mark.asyncio
+async def test_a_second_degrade_is_never_triggered_once_the_refusal_list_empties(
+    tmp_path: Path,
+) -> None:
+    """The double-degrade trap: `_map_position`'s reconciliation-clearing
+    call can empty `_trading_refusals` entirely while the component is
+    STILL degraded from an earlier refusal. Keying the next `degrade()` call
+    on "the list was empty a moment ago" recomputes `True` and fires a
+    SECOND, invalid FSM transition -- caught and logged as an ERROR by
+    Nautilus's own `_trigger_fsm`, not raised, so nothing but a spy or the
+    log itself would ever show it.
+
+    Reproduced today (RED) against the unfixed gate: a durable-fill-matched
+    reconcile of `slug` empties the seeded TRANSIENT entry with no NEW
+    refusal appended in the same call, then a second, unrelated `_refuse`
+    finds an empty list and re-degrades. The fix keys on `self.is_degraded`
+    (the native FSM state), never on the list's momentary emptiness.
+    """
+    rig = _build_rig(tmp_path)
+    rig.client.start()
+    assert rig.client.is_running
+    await rig.client._connect()
+    slug = _slug(rig.instrument)
+    rig.client.record_fill(_record(rig, qty=RECORDED_QUANTITY, cost=RECORDED_COST))
+
+    rig.client._trading_refusals = [
+        ClassifiedRefusal(
+            instrument=slug, reason="transient here", classification=RefusalClass.TRANSIENT
+        ),
+    ]
+    rig.client.degrade()
+    assert rig.client.is_degraded
+
+    degrade_calls: list[None] = []
+    original_degrade = rig.client.degrade
+
+    def _spy() -> None:
+        degrade_calls.append(None)
+        original_degrade()
+
+    rig.client.degrade = _spy
+
+    report = rig.client._map_position(slug, _position(slug))
+    assert report is not None
+    assert rig.client._trading_refusals == [], rig.client._trading_refusals
+
+    rig.client._refuse("a second, unrelated reason")
+
+    assert degrade_calls == [], "degrade() must not fire again once already DEGRADED"
+    assert rig.client.is_degraded
+    await rig.client._disconnect()
 
 
 @pytest.mark.asyncio
