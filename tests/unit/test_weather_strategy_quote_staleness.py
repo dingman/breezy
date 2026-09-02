@@ -56,8 +56,25 @@ STRATEGY_MAYBE_SUBMIT: tuple[tuple[str, MaybeSubmit], ...] = (
 )
 
 
-class _NoOpenOrdersCache:
+class _NoWorkingOrdersCache:
+    """No order of ANY status -- the shape every `_maybe_submit` gate must see through.
+
+    `orders` was added alongside `orders_open` when the strategies' in-flight
+    gate moved onto `breezy.strategy.weather_common.inflight.working_orders`
+    (T-1): that helper reads `cache.orders(...)` and filters on
+    `not order.is_closed`, because `orders_open` excludes INITIALIZED and
+    SUBMITTED. Both methods are kept -- this double stands in for a real
+    `Cache`, and a strategy that still asked the narrower question would
+    otherwise fail here for the wrong reason (an `AttributeError`) instead of
+    on its own behaviour.
+    """
+
+    def orders(self, *, instrument_id: object) -> list[object]:
+        del instrument_id
+        return []
+
     def orders_open(self, *, instrument_id: object) -> list[object]:
+        del instrument_id
         return []
 
 
@@ -68,7 +85,7 @@ class _Log:
 
 class _StrategyHarness:
     def __init__(self, contract: MispricingContract) -> None:
-        self.cache = _NoOpenOrdersCache()
+        self.cache = _NoWorkingOrdersCache()
         self.log = _Log()
         self._nt_ids = {contract.instrument_id: object()}
         self._risk = RiskManager(
