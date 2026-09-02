@@ -19,6 +19,7 @@ __all__ = [
     "CredentialSerializationError",
     "CredentialSourceError",
     "EmptyBookSideError",
+    "ExecutionReportMappingError",
     "FeeScheduleUnknownError",
     "GatewayForbiddenError",
     "InstrumentDefinitionError",
@@ -182,6 +183,36 @@ class InstrumentDefinitionError(VenuePayloadError):
     instrument definition must abort the load. The instrument provider raises
     this rather than skipping the market, so a venue schema change surfaces as
     a failed start-up instead of a silently short instrument list.
+    """
+
+
+class ExecutionReportMappingError(VenuePayloadError):
+    """A private-endpoint payload cannot be mapped to a native execution report.
+
+    Distinct from the general payload error because the *consequence* differs,
+    in the same way :class:`InstrumentDefinitionError` is distinct: a bad quote
+    frame is dropped and the next one used, whereas a balance, order, fill or
+    position that cannot be mapped is an input to RECONCILIATION -- the process
+    that decides what Breezy believes it owns and what it may still spend.
+    Coercing one, defaulting one, or silently skipping one produces a confident
+    and wrong account state, which is the failure this class exists to make
+    loud and attributable.
+
+    Raised for exactly four situations, all of them refusals:
+
+    * a field the SDK snapshot declares is absent (never defaulted -- an
+      absent balance is not a zero balance);
+    * a field carries a value outside the shapes the snapshot declares (an
+      unrecognised order state, execution type, side, type or time-in-force);
+    * the payload carries a key the snapshot does NOT declare, which means the
+      venue's shape moved under a surface we reconcile money against;
+    * a money value would not survive the native constructor unchanged --
+      ``Money(Decimal("0.3125"), USD)`` returns ``Money(0.31, USD)`` without a
+      word, so the refusal is interposed in Breezy ahead of it.
+
+    A ``VenuePayloadError`` subclass, not a sibling, so every existing
+    ``except VenuePayloadError`` keeps holding and a caller can still write
+    ``except PolymarketUSError`` and miss nothing.
     """
 
 

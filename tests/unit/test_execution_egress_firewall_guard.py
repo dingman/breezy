@@ -693,9 +693,20 @@ def test_n2_the_shipped_tree_has_exactly_the_expected_execution_egress_modules()
     that adds a module under ``exec/`` fails here until it updates the
     expected set in the same commit. That is the point: a new execution-egress
     module cannot land silently.
+
+    R-3 is the first increment to exercise that: ``endpoints.py`` (GET path
+    templates plus a Decimal-preserving decoder) and ``reports.py`` (venue
+    payload -> native execution report mapping) are registered below. Both are
+    read/map only and neither performs I/O, but E0 classifies by PATH and is
+    right to: what makes them egress surfaces is where they live, not what
+    they currently do.
     """
     found = [(v.path, v.rule) for v in find_execution_egress_modules()]
-    assert found == [("src/breezy/adapters/polymarket_us/exec/__init__.py", "E0")]
+    assert found == [
+        ("src/breezy/adapters/polymarket_us/exec/__init__.py", "E0"),
+        ("src/breezy/adapters/polymarket_us/exec/endpoints.py", "E0"),
+        ("src/breezy/adapters/polymarket_us/exec/reports.py", "E0"),
+    ]
 
 
 def test_n2_scan_covers_both_src_and_scripts() -> None:
@@ -1414,13 +1425,23 @@ def test_x3_the_live_scan_actually_reaches_the_exec_package() -> None:
 
     Without this the live test above would pass identically if the scan
     walked an empty root -- which is exactly how a vacuous barrier reads.
+
+    Since R-3 the root is no longer empty: the token scan now reads two
+    modules of real source, so the live test above stopped being vacuous. The
+    equality is kept anyway, for the same reason N2's is -- a module that
+    appears under ``exec/`` without a reviewer noticing is the thing being
+    prevented.
     """
     scanned = {
         path
         for path, _ in iter_python_sources(EGRESS_SCAN_ROOTS)
         if path.startswith(EXEC_PACKAGE_PATH_PREFIX)
     }
-    assert scanned == {"src/breezy/adapters/polymarket_us/exec/__init__.py"}
+    assert scanned == {
+        "src/breezy/adapters/polymarket_us/exec/__init__.py",
+        "src/breezy/adapters/polymarket_us/exec/endpoints.py",
+        "src/breezy/adapters/polymarket_us/exec/reports.py",
+    }
 
 
 @pytest.mark.parametrize("token", sorted(BANNED_EXEC_DIRECTION_TOKENS))
@@ -1474,3 +1495,245 @@ def test_x3_does_not_fire_outside_the_exec_package() -> None:
     """``risk.py``'s correct-in-context comment is why this scope exists."""
     source = "OUTCOME_SIDE_NO = 'no'\n\n\ndef no_price(price):\n    return 1 - price\n"
     assert find_exec_direction_violations("src/breezy/strategy/risk.py", source) == []
+
+
+# ==========================================================================
+# E0-INERT -- the shipped exec/ modules must be inert, not merely classified
+# ==========================================================================
+#
+# COMPENSATING STRENGTHENING, banked while it is free. E0 says every module
+# under ``exec/`` IS an execution-egress surface, by path. That is a statement
+# about WHERE a module lives; it is not, and cannot be, a statement about what
+# the module DOES. Set membership proves a module EXISTS -- never that it is
+# INERT.
+#
+# R-3 ships two real modules under that path whose entire claim is that they
+# perform no I/O of any kind: a table of GET path templates plus pure decoders
+# and mappers. Both hold today, so the rule costs nothing to add and closes
+# the gap between "classified" and "harmless" before the increment that would
+# make it expensive. It is a PROHIBITION, in the idiom of X3: the vocabulary
+# by which egress would enter is banned outright rather than proven absent.
+#
+# Strengthening only. Nothing below relaxes E0, which continues to classify
+# every module here regardless of what this rule finds.
+
+
+#: Dotted module prefixes that can open a socket, directly or through a
+#: runtime. ``asyncio`` is here because R-3 is synchronous by contract: a
+#: coroutine under ``exec/`` is the shape an I/O path arrives in.
+NETWORK_IMPORT_PREFIXES = frozenset(
+    {
+        "aiohttp",
+        "asyncio",
+        "http",
+        "httpx",
+        "nautilus_trader.core.nautilus_pyo3",
+        "nautilus_trader.network",
+        "requests",
+        "socket",
+        "ssl",
+        "urllib",
+        "websocket",
+        "websockets",
+    }
+)
+
+
+def find_exec_inertness_violations(path: str, source: str) -> list[Violation]:
+    """E0-INERT: a module under ``exec/`` may not import a network client or
+    define a coroutine.
+
+    Two independent passes, because neither alone is enough. The import pass
+    catches the CAPABILITY arriving (``import httpx``, ``from
+    nautilus_trader.core.nautilus_pyo3 import HttpClient``); the async pass
+    catches the SHAPE that I/O arrives in, which can be written without any
+    banned import at all.
+    """
+    tree = ast.parse(source, filename=path)
+    violations: list[Violation] = []
+
+    for module in _imported_module_strings(tree):
+        parts = module.split(".")
+        heads = {".".join(parts[: depth + 1]) for depth in range(len(parts))}
+        for prefix in sorted(heads & NETWORK_IMPORT_PREFIXES):
+            violations.append(
+                Violation(
+                    path,
+                    0,
+                    "E0-INERT",
+                    f"imports {module!r}, a network-capable module ({prefix})",
+                )
+            )
+
+    for node in ast.walk(tree):
+        if isinstance(node, ast.ImportFrom):
+            for alias in node.names:
+                if alias.name in NATIVE_NETWORK_CLIENT_NAMES:
+                    violations.append(
+                        Violation(
+                            path,
+                            node.lineno,
+                            "E0-INERT",
+                            f"imports the native network client {alias.name!r}",
+                        )
+                    )
+        elif isinstance(node, ast.AsyncFunctionDef):
+            violations.append(
+                Violation(
+                    path,
+                    node.lineno,
+                    "E0-INERT",
+                    f"defines the coroutine {node.name!r}; this slice is read/map only",
+                )
+            )
+        elif isinstance(node, (ast.Await, ast.AsyncFor, ast.AsyncWith)):
+            violations.append(
+                Violation(path, node.lineno, "E0-INERT", "carries async control flow")
+            )
+    return violations
+
+
+def scan_exec_module_inertness(
+    roots: tuple[str, ...] = EGRESS_SCAN_ROOTS,
+) -> list[Violation]:
+    return [
+        v
+        for path, source in iter_python_sources(roots)
+        if path.startswith(EXEC_PACKAGE_PATH_PREFIX)
+        for v in find_exec_inertness_violations(path, source)
+    ]
+
+
+def test_e0_inert_no_shipped_exec_module_can_reach_the_network() -> None:
+    """The live barrier."""
+    violations = scan_exec_module_inertness()
+    assert violations == [], "E0-INERT violations:\n" + "\n".join(str(v) for v in violations)
+
+
+def test_e0_inert_the_live_scan_actually_reaches_the_exec_package() -> None:
+    """Non-vacuity of the SCAN's reach, in X3's shape and for X3's reason."""
+    scanned = {
+        path
+        for path, _ in iter_python_sources(EGRESS_SCAN_ROOTS)
+        if path.startswith(EXEC_PACKAGE_PATH_PREFIX)
+    }
+    assert scanned == {
+        "src/breezy/adapters/polymarket_us/exec/__init__.py",
+        "src/breezy/adapters/polymarket_us/exec/endpoints.py",
+        "src/breezy/adapters/polymarket_us/exec/reports.py",
+    }
+
+
+@pytest.mark.parametrize(
+    "statement",
+    [
+        "import httpx",
+        "import socket",
+        "import asyncio",
+        "from urllib.request import urlopen",
+        "import http.client",
+        "from nautilus_trader.core.nautilus_pyo3 import HttpClient",
+    ],
+)
+def test_e0_inert_detects_each_network_capable_import(statement: str) -> None:
+    source = f'"""Docstring."""\n\n{statement}\n'
+    violations = find_exec_inertness_violations(f"{EXEC_PACKAGE_PATH_PREFIX}client.py", source)
+    assert [v.rule for v in violations][:1] == ["E0-INERT"]
+
+
+def test_e0_inert_detects_a_coroutine_definition() -> None:
+    source = '"""Docstring."""\n\n\nasync def read(path):\n    return path\n'
+    violations = find_exec_inertness_violations(f"{EXEC_PACKAGE_PATH_PREFIX}client.py", source)
+    assert [v.rule for v in violations] == ["E0-INERT"]
+    assert "coroutine" in violations[0].detail
+
+
+def test_e0_inert_detects_async_control_flow_without_a_banned_import() -> None:
+    """An ``await`` needs no import at all, which is why the second pass exists."""
+    source = (
+        '"""Docstring."""\n'
+        "\n"
+        "\n"
+        "def outer(send):\n"
+        "    async def inner():\n"
+        "        async with send() as response:\n"
+        "            return await response\n"
+        "\n"
+        "    return inner\n"
+    )
+    rules = {v.rule for v in find_exec_inertness_violations("src/breezy/x/exec/c.py", source)}
+    assert rules == {"E0-INERT"}
+
+
+def test_e0_inert_does_not_fire_on_the_shipped_read_only_idiom() -> None:
+    """Control: the pure-mapping shape R-3 actually ships must stay legal."""
+    source = (
+        '"""Docstring."""\n'
+        "\n"
+        "import json\n"
+        "from decimal import Decimal\n"
+        "\n"
+        "from nautilus_trader.model.objects import Money\n"
+        "\n"
+        "\n"
+        "def decode(body):\n"
+        "    return json.loads(body, parse_float=Decimal)\n"
+    )
+    assert find_exec_inertness_violations(f"{EXEC_PACKAGE_PATH_PREFIX}endpoints.py", source) == []
+
+
+def test_e0_inert_is_scoped_to_the_exec_package() -> None:
+    """``transport.py`` legitimately holds the venue HTTP client. This rule is
+    a prohibition under ``exec/`` only, exactly like X3."""
+    scanned = {path for path, _ in iter_python_sources(EGRESS_SCAN_ROOTS)}
+    assert "src/breezy/adapters/polymarket_us/transport.py" in scanned
+    assert [
+        v.path for v in scan_exec_module_inertness()
+    ] == []
+
+
+# ==========================================================================
+# X1 non-vacuity -- the live marker scan must actually reach an exec test
+# ==========================================================================
+#
+# X1's live scan passed identically whether or not ANY shipped test imported
+# ``exec/``: a rule that reaches nothing reports nothing. X3's live scan ships
+# a companion pin for exactly this reason (``test_x3_the_live_scan_actually_
+# reaches_the_exec_package``); X1's did not, so its non-vacuity rested on an
+# unpinned test filename and a rename would have re-vacuumed it in silence.
+
+
+def exec_importing_test_modules(roots: tuple[str, ...] = TEST_SCAN_ROOTS) -> set[str]:
+    """Every scanned test module that X1's rule can actually fire on."""
+    return {
+        path
+        for path, source in iter_python_sources(roots)
+        if _imports_exec_package(ast.parse(source, filename=path))
+    }
+
+
+def test_x1_the_live_scan_actually_reaches_a_test_that_imports_the_exec_package() -> None:
+    """Set EQUALITY, in X3's shape: a rename cannot re-vacuum the scan, and a
+    new exec test cannot appear without a reviewer seeing it here."""
+    assert exec_importing_test_modules() == {
+        "tests/unit/test_polymarket_us_exec_endpoints.py",
+        "tests/unit/test_polymarket_us_exec_positions.py",
+        "tests/unit/test_polymarket_us_exec_reports.py",
+        "tests/unit/test_polymarket_us_exec_snapshot_drift.py",
+    }
+
+
+def test_x1_the_reach_detector_is_the_same_predicate_the_rule_uses() -> None:
+    """The pin above is worth nothing if it uses a second, looser import test.
+
+    ``_imports_exec_package`` is the SAME function ``find_exec_test_marker_
+    violations`` gates on, so a module counted as reachable here is exactly a
+    module X1 would inspect.
+    """
+    marked = _PLANTED_EXEC_TEST_WITH_MARKER
+    assert _imports_exec_package(ast.parse(marked))
+    assert [v.rule for v in find_exec_test_marker_violations("tests/unit/t.py", marked)] == ["X1"]
+
+    unrelated = _PLANTED_MARKED_TEST_OUTSIDE_THE_EXEC_PACKAGE
+    assert not _imports_exec_package(ast.parse(unrelated))
+    assert find_exec_test_marker_violations("tests/live/t.py", unrelated) == []

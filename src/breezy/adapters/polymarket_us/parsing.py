@@ -349,9 +349,22 @@ def _require_mapping(payload: object, key: str, *, context: str) -> Mapping[str,
     return value
 
 
-def _require(payload: Mapping[str, Any], key: str, *, error: type[VenuePayloadError]) -> Any:
+def _require(
+    payload: Mapping[str, Any],
+    key: str,
+    *,
+    error: type[VenuePayloadError],
+    context: str = "Polymarket.us payload",
+) -> Any:
+    """Read a required field, or refuse. Never defaults, never coerces.
+
+    ``context`` names the payload the field was expected on. It exists so a
+    caller with several nested shapes in flight (the execution-report mappers
+    read an ``Execution`` that embeds an ``Order``) can attribute the refusal
+    without maintaining a second copy of this function.
+    """
     if key not in payload or payload[key] is None:
-        raise error(f"Polymarket.us payload is missing required field {key!r}")
+        raise error(f"{context} is missing required field {key!r}")
     return payload[key]
 
 
@@ -408,28 +421,82 @@ def _assert_representable(
     return quantised
 
 
-def _build_price(value: Decimal, *, precision: int, field: str) -> Price:
+def _assert_price_representable(
+    value: Decimal,
+    *,
+    precision: int,
+    field: str,
+    error: type[VenuePayloadError] = VenuePayloadError,
+) -> Decimal:
+    """Return ``value`` checked as a PRICE, or raise. The whole price guard.
+
+    Two refusals, in order: outside the binary-option range ``[0, 1]``, and
+    carrying a significant digit below the instrument's tick. Split out of
+    :func:`_build_price` so a caller that needs the CHECKED DECIMAL rather than
+    a native ``Price`` -- ``OrderStatusReport.avg_px`` is typed
+    ``Decimal | None`` -- runs the identical guard instead of a weaker one.
+    That gap was real: ``avg_px`` reaches ``instrument.make_price()`` inside
+    Nautilus reconciliation, which rounds in silence.
+
+    ``error`` is threaded so the refusal lands in the CALLER's taxonomy. A
+    module that documents "everything here raises X" cannot keep that promise
+    if a shared primitive hardcodes a sibling class.
+    """
     if value < _PRICE_MIN or value > _PRICE_MAX:
-        raise VenuePayloadError(
+        raise error(
             f"Field {field!r} value {value} is outside the binary-option range "
             f"[{_PRICE_MIN}, {_PRICE_MAX}]"
         )
-    quantised = _assert_representable(
-        value, precision=precision, field=field, error=VenuePayloadError
+    return _assert_representable(value, precision=precision, field=field, error=error)
+
+
+def _build_price(
+    value: Decimal,
+    *,
+    precision: int,
+    field: str,
+    error: type[VenuePayloadError] = VenuePayloadError,
+) -> Price:
+    quantised = _assert_price_representable(
+        value, precision=precision, field=field, error=error
     )
     return Price.from_str(format(quantised, f".{precision}f"))
 
 
-def _build_quantity(value: Decimal, *, precision: int, field: str) -> Quantity:
-    if value <= 0:
-        raise VenuePayloadError(f"Field {field!r} value {value} is not a positive size")
-    quantised = _assert_representable(
-        value, precision=precision, field=field, error=VenuePayloadError
-    )
+def _build_quantity(
+    value: Decimal,
+    *,
+    precision: int,
+    field: str,
+    error: type[VenuePayloadError] = VenuePayloadError,
+    allow_zero: bool = False,
+) -> Quantity:
+    """Build a native ``Quantity``, or refuse. Never rounds, never clamps.
+
+    ``allow_zero`` exists for the REPORT surface: a zero fill quantity on an
+    unfilled order is a fact, whereas a zero size on a book level is not a
+    level. The default stays strict.
+
+    The refusal names the FIELD and not the value: the same primitive reads
+    public book sizes and the operator's own order and position sizes, and a
+    message that echoes the number leaks the latter the first time a logger is
+    attached to it.
+    """
+    if value < 0 or (value == 0 and not allow_zero):
+        raise error(
+            f"Field {field!r} is not a usable size (negative, or zero where a "
+            "positive size is required); value withheld"
+        )
+    quantised = _assert_representable(value, precision=precision, field=field, error=error)
     return Quantity.from_str(format(quantised, f".{precision}f"))
 
 
-def parse_rfc3339_nanos(value: object, *, field: str) -> int:
+def parse_rfc3339_nanos(
+    value: object,
+    *,
+    field: str,
+    error: type[VenuePayloadError] = VenuePayloadError,
+) -> int:
     """Parse a venue RFC 3339 UTC timestamp to UNIX nanoseconds, losslessly.
 
     The venue emits nine fractional digits (``...T00:19:48.120237895Z``).
@@ -440,20 +507,28 @@ def parse_rfc3339_nanos(value: object, *, field: str) -> int:
     Only the ``Z`` form is accepted. A numeric offset is not something the
     venue has been observed to send, and guessing at one is how a timestamp
     ends up hours wrong.
+
+    ``error`` is threaded for the same reason it is on the money primitives: a
+    module that documents "every refusal here raises X" cannot keep that
+    promise while a shared primitive hardcodes a sibling class. The execution
+    report mappers read three timestamps -- ``createTime``, ``transactTime``
+    and ``updateTime`` -- and a caller writing ``except
+    ExecutionReportMappingError`` would otherwise miss all three. The default
+    keeps every market-data caller unchanged.
     """
     if not isinstance(value, str):
-        raise VenuePayloadError(
+        raise error(
             f"Field {field!r} must be an RFC 3339 UTC string, got {type(value).__name__}"
         )
     match = _RFC3339_RE.match(value)
     if match is None:
-        raise VenuePayloadError(f"Field {field!r} is not an RFC 3339 UTC timestamp ending in 'Z'")
+        raise error(f"Field {field!r} is not an RFC 3339 UTC timestamp ending in 'Z'")
     try:
         moment = datetime.strptime(  # noqa: DTZ007 - tz is fixed UTC by the regex
             f"{match.group('date')}T{match.group('time')}", "%Y-%m-%dT%H:%M:%S"
         )
     except ValueError:
-        raise VenuePayloadError(f"Field {field!r} is not a valid calendar date/time") from None
+        raise error(f"Field {field!r} is not a valid calendar date/time") from None
     seconds = calendar.timegm(moment.timetuple())
     fraction = match.group("fraction") or ""
     nanos = int(fraction.ljust(_FRACTION_DIGITS, "0")) if fraction else 0

@@ -217,6 +217,62 @@ CAGE_RULE_PINS: tuple[RulePin, ...] = (
     ),
     RulePin(
         module="firewall",
+        attr="NETWORK_IMPORT_PREFIXES",
+        expected=frozenset(
+            {
+                "aiohttp",
+                "asyncio",
+                "http",
+                "httpx",
+                "nautilus_trader.core.nautilus_pyo3",
+                "nautilus_trader.network",
+                "requests",
+                "socket",
+                "ssl",
+                "urllib",
+                "websocket",
+                "websockets",
+            }
+        ),
+        widened=frozenset(
+            {
+                "aiohttp",
+                "asyncio",
+                "ftplib",
+                "http",
+                "httpx",
+                "nautilus_trader.core.nautilus_pyo3",
+                "nautilus_trader.network",
+                "requests",
+                "socket",
+                "ssl",
+                "urllib",
+                "websocket",
+                "websockets",
+            }
+        ),
+        narrowed=frozenset(
+            {
+                "aiohttp",
+                "asyncio",
+                "http",
+                "httpx",
+                "nautilus_trader.network",
+                "requests",
+                "socket",
+                "ssl",
+                "urllib",
+                "websocket",
+                "websockets",
+            }
+        ),
+        why="E0-INERT (R-3). E0 proves a module EXISTS under exec/; this set is "
+        "what proves the shipped ones are INERT. The narrowed neighbour drops "
+        "the pyo3 prefix -- the ONE import that reaches a Rust client the "
+        "in-process block cannot constrain",
+    ),
+    RulePin(
+        module="firewall",
         attr="_EGRESS_MODULE_BASENAMES",
         expected=frozenset(
             {
@@ -439,6 +495,7 @@ def test_the_pin_table_covers_every_rule_constant_the_plan_names() -> None:
         "firewall.SOCKET_RESTORING_MARKERS",
         "firewall.BANNED_NATIVE_NAMES",
         "firewall.BANNED_EXEC_DIRECTION_TOKENS",
+        "firewall.NETWORK_IMPORT_PREFIXES",
     }
     assert plans_nine <= pinned, f"unpinned: {sorted(plans_nine - pinned)}"
     assert pinned == plans_nine | added_with_a_reason
