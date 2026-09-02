@@ -1635,3 +1635,251 @@ def test_a_position_reducing_sell_is_not_clipped_to_ask_depth() -> None:
 
     assert decision.allowed is True
     assert decision.clipped_quantity == pytest.approx(-50.0)
+
+
+# ---------------------------------------------------------------------------
+# T-3 -- `open_position_count()` read a SETTLED-ONLY view
+#
+# `position_qty` is built solely from `portfolio.net_position(...)`, and a
+# native `Position` exists only after a FILL. So the one consumer of this
+# count -- the `max_simultaneous_positions` refusal -- was blind to every
+# order still in flight, while EVERY other cap in `evaluate_order` asks
+# `net_qty` (settled + pending, the field T-1 widened to include INITIALIZED
+# and SUBMITTED).
+#
+# Hazard, from `docs/core/findings/BLIND_RISK_VIEWS_2026-09-02.md` s T-3: cap
+# 12, all instruments flat, a depth/quote burst delivers ticks for 20
+# contracts on ONE handler thread so all 20 evaluate before any fill returns.
+# The per-instrument in-flight gate is keyed on *that* instrument and cannot
+# see the other 19; the count read 0 on every pass, so the cap never bound
+# and 20 BUYs went out against a cap of 12.
+# ---------------------------------------------------------------------------
+
+
+def _contract_on_day(instrument_id: str, *, day_offset: int) -> MispricingContract:
+    """A bucket on its OWN climate day, so the exclusivity check never fires.
+
+    The position-count cap sits AFTER `exclusive_conflict` in
+    `evaluate_order`. Buckets sharing a station/climate-day refuse as
+    `exclusive_bucket_conflict` several steps earlier, and a test built from
+    them would go green for the wrong reason.
+    """
+    return MispricingContract(
+        instrument_id=instrument_id,
+        facts=WeatherBucketFacts(
+            settlement_station=STATION,
+            climate_day=CLIMATE_DAY + dt.timedelta(days=day_offset),
+            measure=Measure.HIGH,
+            lower_f=80,
+            upper_f=None,
+        ),
+        tick_size=0.01,
+    )
+
+
+def test_twelve_working_buys_with_nothing_settled_bind_the_simultaneous_cap() -> None:
+    """RED-1: the burst, at the refusal. Cap 12, 12 in flight, 0 settled."""
+    contracts = {f"I{i}": _contract_on_day(f"I{i}", day_offset=i) for i in range(13)}
+    risk = RiskManager(RiskLimits(max_simultaneous_positions=12), contracts)
+    portfolio = PortfolioSnapshot(
+        pending_qty={f"I{i}": 10.0 for i in range(12)},
+        equity=10_000.0,
+    )
+
+    decision = risk.evaluate_order(
+        contract=contracts["I12"],  # the 13th, itself flat and unordered
+        signed_qty_delta=5.0,
+        hours_to_settlement=24.0,
+        signal_age=FRESH,
+        edge=0.50,
+        portfolio=portfolio,
+        quote=_quote(),
+        quote_age_minutes=0.0,
+    )
+
+    assert decision.allowed is False
+    assert decision.reason == "max_simultaneous_positions"
+
+
+def test_the_simultaneous_cap_refusal_is_recorded_on_the_counter() -> None:
+    """The refusal is a gag on an order the strategy formed -- it must count."""
+    counter = RefusalCounter()
+    contracts = {f"I{i}": _contract_on_day(f"I{i}", day_offset=i) for i in range(13)}
+    risk = RiskManager(
+        RiskLimits(max_simultaneous_positions=12), contracts, refusals=counter,
+    )
+
+    risk.evaluate_order(
+        contract=contracts["I12"],
+        signed_qty_delta=5.0,
+        hours_to_settlement=24.0,
+        signal_age=FRESH,
+        edge=0.50,
+        portfolio=PortfolioSnapshot(
+            pending_qty={f"I{i}": 10.0 for i in range(12)}, equity=10_000.0,
+        ),
+        quote=_quote(),
+        quote_age_minutes=0.0,
+    )
+
+    assert counter.counts["max_simultaneous_positions"] == 1
+    assert set(counter.counts) <= risk_module.COUNTED_REFUSAL_REASONS
+
+
+def test_open_position_count_sees_in_flight_orders_with_nothing_settled() -> None:
+    """RED-2: the burst, at the count itself. 20 in flight, 0 settled."""
+    portfolio = PortfolioSnapshot(pending_qty={f"I{i}": 10.0 for i in range(20)})
+
+    assert portfolio.open_position_count() == 20
+
+
+def test_an_instrument_both_settled_and_working_occupies_exactly_one_slot() -> None:
+    """RED-3: the union must not double-count a key present in both dicts."""
+    portfolio = PortfolioSnapshot(position_qty={"A": 10.0}, pending_qty={"A": 5.0})
+
+    assert portfolio.open_position_count() == 1
+
+
+def test_the_count_is_the_union_of_settled_and_pending_instruments() -> None:
+    """RED-3, wider: the two dicts carry DIFFERENT key sets.
+
+    Iterating either one's `.values()` alone under-counts: `position_qty`
+    misses the purely in-flight instruments, `pending_qty` misses the purely
+    settled ones.
+    """
+    portfolio = PortfolioSnapshot(
+        position_qty={"settled_only": 10.0, "both": 4.0},
+        pending_qty={"pending_only": -7.0, "both": 3.0},
+    )
+
+    assert portfolio.open_position_count() == 3
+
+
+def test_a_settled_only_portfolio_counts_exactly_as_it_always_did() -> None:
+    """RED-4, a PIN and not a defect test -- green before AND after T-3.
+
+    With no pending quantity at all, `net_qty` degenerates to
+    `position_qty.get(...)`, so the widened count must return precisely the
+    old number. A zero-quantity key stays uncounted, as before.
+    """
+    portfolio = PortfolioSnapshot(position_qty={"A": 10.0, "B": -5.0, "C": 0.0})
+
+    assert portfolio.open_position_count() == 2
+
+
+def test_a_working_sell_that_offsets_a_settled_long_does_not_free_the_slot() -> None:
+    """A slot is ANY exposure, settled OR pending -- deliberately NOT a net.
+
+    The netting reading is the one this test used to assert, and it is
+    wrong HERE even though it is right for every other cap. Netting frees
+    the slot on the strength of a fill that has not happened: the sell may
+    be rejected, cancelled, or simply rest unfilled -- and on these weather
+    markets resting unfilled is the NORMAL case, not the tail, because the
+    measured median top-of-book bid is ~0.3 contracts. Free the slot on that
+    assumption and the strategy opens a 13th position against a cap of 12,
+    which is precisely the defect class this audit exists to close: a limit
+    relaxed on state that has not happened yet.
+
+    A position you are TRYING to exit is still exposure until the fill
+    lands.
+    """
+    portfolio = PortfolioSnapshot(position_qty={"A": 10.0}, pending_qty={"A": -10.0})
+
+    assert portfolio.open_position_count() == 1
+
+
+def test_adding_to_a_settled_position_is_still_allowed_at_the_cap() -> None:
+    """RED-5: the fix must not turn the cap into a blanket freeze.
+
+    The refusal's second clause (`abs(net_qty(candidate)) < 1e-9`) is
+    untouched by T-3: a candidate that already occupies one of the N slots
+    consumes no NEW slot, so an add-to-existing order goes through with the
+    cap at its limit. Here the candidate's slot is settled.
+    """
+    contracts = {f"I{i}": _contract_on_day(f"I{i}", day_offset=i) for i in range(12)}
+    risk = RiskManager(RiskLimits(max_simultaneous_positions=12), contracts)
+    portfolio = PortfolioSnapshot(
+        position_qty={"I0": 10.0},
+        pending_qty={f"I{i}": 10.0 for i in range(1, 12)},
+        equity=10_000.0,
+    )
+    assert portfolio.open_position_count() == 12  # the cap is AT its limit
+
+    decision = risk.evaluate_order(
+        contract=contracts["I0"],
+        signed_qty_delta=5.0,
+        hours_to_settlement=24.0,
+        signal_age=FRESH,
+        edge=0.50,
+        portfolio=portfolio,
+        quote=_quote(),
+        quote_age_minutes=0.0,
+    )
+
+    assert decision.allowed is True
+    assert decision.clipped_quantity == pytest.approx(5.0)
+
+
+def test_adding_to_an_in_flight_position_is_allowed_at_the_cap() -> None:
+    """RED-5, the newly reachable half.
+
+    Before T-3 a purely in-flight candidate was invisible to the count, so
+    this path was never even reached. After it, the candidate occupies one of
+    the 12 slots via `pending_qty` -- and the same second clause must still
+    let the add through rather than refuse it.
+    """
+    contracts = {f"I{i}": _contract_on_day(f"I{i}", day_offset=i) for i in range(12)}
+    risk = RiskManager(RiskLimits(max_simultaneous_positions=12), contracts)
+    portfolio = PortfolioSnapshot(
+        pending_qty={f"I{i}": 10.0 for i in range(12)},
+        equity=10_000.0,
+    )
+    assert portfolio.open_position_count() == 12
+
+    decision = risk.evaluate_order(
+        contract=contracts["I0"],
+        signed_qty_delta=5.0,
+        hours_to_settlement=24.0,
+        signal_age=FRESH,
+        edge=0.50,
+        portfolio=portfolio,
+        quote=_quote(),
+        quote_age_minutes=0.0,
+    )
+
+    assert decision.allowed is True
+    assert decision.clipped_quantity == pytest.approx(5.0)
+
+
+def test_a_flat_candidate_is_refused_when_every_slot_is_exiting_but_unfilled() -> None:
+    """The concrete 13th-position sequence, end to end at the refusal.
+
+    Twelve settled positions, each with a working sell that would close it,
+    cap at 12, a flat 13th candidate arrives. Under a NET reading all twelve
+    net to zero, the cap reads empty and the 13th goes out -- and if those
+    sells do not fill (see
+    `test_a_working_sell_that_offsets_a_settled_long_does_not_free_the_slot`
+    for why that is the expected case here) the bot holds 13 positions
+    against a cap of 12.
+    """
+    contracts = {f"I{i}": _contract_on_day(f"I{i}", day_offset=i) for i in range(13)}
+    risk = RiskManager(RiskLimits(max_simultaneous_positions=12), contracts)
+    portfolio = PortfolioSnapshot(
+        position_qty={f"I{i}": 10.0 for i in range(12)},
+        pending_qty={f"I{i}": -10.0 for i in range(12)},
+        equity=10_000.0,
+    )
+
+    decision = risk.evaluate_order(
+        contract=contracts["I12"],
+        signed_qty_delta=5.0,
+        hours_to_settlement=24.0,
+        signal_age=FRESH,
+        edge=0.50,
+        portfolio=portfolio,
+        quote=_quote(),
+        quote_age_minutes=0.0,
+    )
+
+    assert decision.allowed is False
+    assert decision.reason == "max_simultaneous_positions"

@@ -229,7 +229,62 @@ class PortfolioSnapshot:
         return self.position_qty.get(instrument_id, 0.0)
 
     def open_position_count(self) -> int:
-        return sum(1 for q in self.position_qty.values() if abs(q) > 1e-9)
+        """Instruments occupying a position SLOT -- settled OR pending.
+
+        It read `position_qty.values()` alone (T-3), which is settled-only
+        -- a native `Position` exists only after a FILL -- so the one
+        consumer of this count, the `max_simultaneous_positions`
+        refusal, was blind to every order still in flight while its sibling
+        `pending_qty` (the field T-1 widened to include INITIALIZED and
+        SUBMITTED) sat unread in this same snapshot.
+
+        WHAT THAT COST: cap 12, all instruments flat, a depth/quote burst
+        delivers ticks for 20 contracts on ONE handler thread, so all 20
+        evaluate before any fill returns. The per-instrument in-flight gate
+        is keyed on *that* instrument and cannot see the other 19; this count
+        returned 0 on every pass, so the cap never bound and 20 BUYs went out
+        against a cap of 12.
+
+        Iterated over the UNION of both key sets, never one dict's
+        `.values()`: the dicts carry different keys, so either alone
+        under-counts (`position_qty` misses the purely in-flight
+        instruments, `pending_qty` the purely settled ones). An instrument
+        present in BOTH dicts is one key in that union and so counts exactly
+        once, never twice.
+
+        DELIBERATELY NOT `net_qty`, AND DELIBERATELY INCONSISTENT WITH IT.
+        Do not harmonise this back. Every other cap asks "how much am I
+        COMMITTED TO?", where signed netting is the right arithmetic. This
+        one asks "how many contracts am I SIMULTANEOUSLY IN?", where it is
+        not: a slot is occupied by ANY exposure, settled OR pending, and a
+        settled long with a fully-offsetting working sell holds its slot.
+
+        WHY THE NETTING READING IS WRONG HERE. Netting frees the slot on the
+        strength of a fill that has not happened. The sell may be rejected,
+        cancelled, or simply rest unfilled -- and on these weather markets
+        resting unfilled is the NORMAL case, not the tail: the measured
+        median top-of-book bid is ~0.3 contracts. Free the slot on that
+        assumption and the strategy opens a 13th position against a cap of
+        12, which is the same defect class as the T-3 bug above -- a limit
+        relaxed on state that has not happened yet. A position you are
+        TRYING to exit is still exposure until the fill lands.
+
+        ASSUMPTION, recorded as one. `pending_qty` is a SIGNED net, so in
+        principle a BUY and a SELL could cancel to zero and hide a slot from
+        the `pending_qty` term. They cannot while T-1's class A gate holds,
+        which permits at most one working order per instrument -- see
+        `docs/plans/T1_STRATEGY_INFLIGHT_BLINDNESS_2026-09-02.md` D5, which
+        defers the `pending_buy_qty`/`pending_sell_qty` split on exactly that
+        ground. Whoever allows concurrent working orders per instrument must
+        revisit D5 AND this line in the same change.
+        """
+        instrument_ids = self.position_qty.keys() | self.pending_qty.keys()
+        return sum(
+            1
+            for iid in instrument_ids
+            if abs(self.position_qty.get(iid, 0.0)) > 1e-9
+            or abs(self.pending_qty.get(iid, 0.0)) > 1e-9
+        )
 
 
 @dataclass(slots=True)
