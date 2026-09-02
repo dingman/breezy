@@ -60,16 +60,17 @@ Two consequences that are not optional (tracked by P4):
   0.5125 vs >=0.9; attribution 238/240). **A forecast archive yields a
   CALIBRATION dataset, not a backtest** — a backtest also needs prices, and those
   are forward-only (next line).
-- **Candidate family #2 (CLI-basis boundary tail): archive gate PASSED, NOT a
-  GO.** `P(CLI_final >= R+1)` clears the 0.06285 break-even on LAX/MIA/SFO/MDW
-  (16-26%). **NYC is DISCARDED** -- its 56-60% is a station-cadence artifact
-  (KNYC hourly; downsampling the dense four reproduces it exactly, L-13). The
-  "late-day" framing is dead: `P(R_17==R_23)`=99.4%, so this is the
-  UNCONDITIONAL CLI-vs-ASOS basis and entry is headroom-triggered at any hour.
-  The binding test is the live OFFER GATE -- whether the venue ever offers that
-  tail at <=0.05 in takeable size -- which is what killed the prior three
-  families and is unanswerable from any archive.
-  `docs/evidence/cli_basis_boundary_study_2026-09-02T044737Z.md`.
+- **Candidate #2 (CLI-basis boundary tail): edge REAL but THIN; NOT a GO.**
+  Corrected `P(win|setup, h>=17)` = **12.3%** pooled (n=101,590, Wilson lower
+  0.1213) -- ~1.9x the 0.06285 break-even; MDW weakest ~1.5x. An earlier 53%
+  was inflated 4.4x by pre-peak hours (L-13 corollary) and is retracted. NYC
+  DISCARDED (cadence artifact). **The one resolved live event LOST** (LAX
+  2026-08-31, offered $0.01, settled 79 vs strike 80). **Adverse selection is
+  unsettled and the archive cannot settle it**: separating a true 5% from 12%
+  needs ~245 resolved offered trades, plausibly 1.5+ yr. Offer-gate scan runs
+  nightly 22:45Z and accumulates unattended; sizing is capped at 250 contracts
+  (`RiskLimits`), i.e. $2.50-$12.50/trade -- economics are thin by construction.
+  `docs/evidence/cli_basis_setup_win_rate_corrected_2026-09-02T061722Z.md`.
 - **Price history genuinely is forward-only.** No public trade tape; expired
   markets return null prices keeping only `settlementPx`.
 - **There is no NO-side instrument, and there cannot be one** (BL-6). NO is a
