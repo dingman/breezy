@@ -568,9 +568,7 @@ async def test_recording_transport_records_transport_failure_as_its_own_event() 
     class FlakyReadTransport:
         calls = 0
 
-        async def get(
-            self, url: str, *, headers: Mapping[str, str], quota_key: str
-        ) -> Any:
+        async def get(self, url: str, *, headers: Mapping[str, str], quota_key: str) -> Any:
             del quota_key
             self.calls += 1
             if self.calls == 1:
@@ -1179,9 +1177,7 @@ def test_clock_skew_guard_refuses_when_no_venue_date_header_was_measured() -> No
 # read has begun, so the hook stops guessing.
 
 
-def _capture_hook(
-    guard: Any, exc: BaseException, capsys: pytest.CaptureFixture[str]
-) -> str:
+def _capture_hook(guard: Any, exc: BaseException, capsys: pytest.CaptureFixture[str]) -> str:
     hook = smoke.build_safe_excepthook(guard)
     hook(type(exc), exc, None)
     captured = capsys.readouterr()
@@ -1361,4 +1357,128 @@ def test_main_arms_the_guard_the_hook_was_built_with(
     assert built, "main() never built the safe excepthook"
     assert built[0].credential_read_begun is True, (
         "main() passed prepare() a different guard than the hook observes"
+    )
+
+
+# ---------------------------------------------------------------------------
+# R-5R-3 -- the canonical-string probe takes its path from the caller
+#
+# OQ-M ("is the query string part of the signed canonical string?") is a hard
+# precondition of R-4P-2: pagination is the first thing in Breezy that puts a
+# query on a signed request, and choosing the wrong variant 401s every page
+# after the first. The probe used to be pinned to the portfolio path, which the
+# 2026-09-02 capture measured at 503 -- so the discriminator could not run at
+# all while that one endpoint was unavailable. The path is a caller argument
+# now, so the probe can be pointed at whichever private path is answering.
+# ---------------------------------------------------------------------------
+
+
+class _CannedInner:
+    """A GET-only transport double answering from a per-URL script."""
+
+    def __init__(self, statuses: Mapping[str, int], default: int = 200) -> None:
+        self.statuses = statuses
+        self.default = default
+        self.urls: list[str] = []
+
+    async def get(self, url: str, *, headers: Mapping[str, str], quota_key: str) -> Any:
+        from breezy.adapters.polymarket_us.transport import VenueResponse
+
+        self.urls.append(url)
+        status = next(
+            (code for fragment, code in self.statuses.items() if fragment in url),
+            self.default,
+        )
+        return VenueResponse(status=status, headers={}, body=b"{}")
+
+
+class _QuietLog:
+    def debug(self, message: str) -> None: ...
+
+    def info(self, message: str) -> None: ...
+
+    def warning(self, message: str) -> None: ...
+
+    def error(self, message: str) -> None: ...
+
+
+def _canonical_probe_client_factory(transport: Any) -> Any:
+    from nautilus_trader.common.component import LiveClock
+
+    from breezy.adapters.polymarket_us.http import PolymarketUSHttpClient
+    from breezy.adapters.polymarket_us.signing import Ed25519RequestSigner
+
+    credentials = make_credentials(make_secret(), LEAK_SAFE_KEY_ID)
+
+    def build_client(variant: Any) -> Any:
+        return PolymarketUSHttpClient(
+            transport=transport,
+            signer=Ed25519RequestSigner.for_variant(
+                credentials, clock=LiveClock(), variant=variant
+            ),
+            api_base_url="https://api.example.invalid",
+            gateway_base_url="https://gateway.example.invalid",
+            logger=_QuietLog(),
+        )
+
+    return build_client
+
+
+@pytest.mark.asyncio
+async def test_the_canonical_string_probe_takes_its_path_as_a_caller_argument() -> None:
+    """Both variant reads hit the path the CALLER named, not a module literal."""
+    inner = _CannedInner({})
+    transport = smoke.RecordingTransport(inner=inner)
+    caller_path = "/v1/portfolio/activities"
+
+    records, _finding = await smoke._probe_canonical_string(
+        None, transport, _canonical_probe_client_factory(transport), path=caller_path
+    )
+
+    assert len(inner.urls) == 2
+    assert all(url.startswith(f"https://api.example.invalid{caller_path}?") for url in inner.urls)
+    assert [record.path for record in records] == [caller_path, caller_path]
+
+
+@pytest.mark.asyncio
+async def test_the_canonical_string_probe_still_defaults_to_the_portfolio_path() -> None:
+    """The default is unchanged, so an existing invocation is not re-pointed."""
+    inner = _CannedInner({})
+    transport = smoke.RecordingTransport(inner=inner)
+
+    records, _finding = await smoke._probe_canonical_string(
+        None, transport, _canonical_probe_client_factory(transport)
+    )
+
+    assert [record.path for record in records] == [smoke.PORTFOLIO_PATH] * 2
+
+
+@pytest.mark.parametrize(
+    ("path_only", "path_with_query", "expected_fragment"),
+    [
+        (200, 401, "Path ONLY is signed"),
+        (401, 200, "query string IS part of the canonical string"),
+        (200, 200, "BOTH forms were accepted"),
+        (503, 503, "Inconclusive"),
+        (None, None, "Inconclusive"),
+    ],
+)
+def test_the_canonical_string_outcome_has_exactly_four_coded_shapes(
+    path_only: int | None, path_with_query: int | None, expected_fragment: str
+) -> None:
+    """The classifier is total: every status pair lands in one named shape."""
+    answer = smoke.classify_canonical_string_outcome(
+        path_only=path_only, path_with_query=path_with_query
+    )
+    assert expected_fragment in answer
+
+
+def test_the_canonical_probe_path_is_a_cli_argument_defaulting_to_the_configured_path() -> None:
+    """The re-point is an operator argument, never an edit to a source literal."""
+    assert smoke._parse_args([]).canonical_probe_path == smoke.PORTFOLIO_PATH
+    assert (
+        smoke._parse_args(
+            ["--canonical-probe-path", "/v1/portfolio/activities"]
+        ).canonical_probe_path
+        == "/v1/portfolio/activities"
     )

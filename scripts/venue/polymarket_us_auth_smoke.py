@@ -127,6 +127,7 @@ __all__ = [
     "assert_smoke_enabled",
     "build_safe_excepthook",
     "build_safe_loop_exception_handler",
+    "classify_canonical_string_outcome",
     "describe_exception",
     "disable_core_dumps",
     "drain_node_task",
@@ -1039,16 +1040,46 @@ async def _probe_authenticated(
         )
 
 
+def classify_canonical_string_outcome(*, path_only: int | None, path_with_query: int | None) -> str:
+    """Reduce the two measured statuses to one of FOUR coded shapes.
+
+    Total by construction: every pair of statuses -- including the pair where
+    neither request reached the venue at all -- lands in exactly one named
+    outcome. Extracted from :func:`_probe_canonical_string` so the same coded
+    vocabulary can classify a measurement taken by the R-5R-0 runner, rather
+    than being re-derived (and quietly re-worded) at a second call site.
+    """
+    if path_only == 200 and path_with_query != 200:
+        return "Path ONLY is signed; the default builder is correct."
+    if path_with_query == 200 and path_only != 200:
+        return (
+            "The query string IS part of the canonical string; switch "
+            "signing_variant to path_with_query."
+        )
+    if path_only == 200 and path_with_query == 200:
+        return "BOTH forms were accepted; the venue does not verify the query segment."
+    return f"Inconclusive: path_only={path_only}, path_with_query={path_with_query}."
+
+
 async def _probe_canonical_string(
     prepared: Prepared,
     transport: RecordingTransport,
     build_client: Any,
+    *,
+    path: str = PORTFOLIO_PATH,
 ) -> tuple[list[RequestRecord], Finding]:
     """Step C: is the query string part of the signed canonical string?
 
     Both builders ship. The default (path-only) is the evidence-backed
     hypothesis; this measures it rather than assuming it, and records BOTH
     outcomes so "they both work" is a recordable answer rather than a failure.
+
+    ``path`` is a CALLER argument. It was pinned to :data:`PORTFOLIO_PATH`
+    until R-5R-3, which made the probe unrunnable whenever that one endpoint
+    was unavailable -- exactly the state measured on 2026-09-02, when the
+    portfolio path returned 503 while another private path returned 200. The
+    discriminator is about the SIGNATURE, not about any particular endpoint,
+    so any private path that answers at all can carry it.
     """
     from breezy.adapters.polymarket_us.signing import SigningVariant
 
@@ -1058,9 +1089,7 @@ async def _probe_canonical_string(
     for variant in (SigningVariant.PATH_ONLY, SigningVariant.PATH_WITH_QUERY):
         client = build_client(variant)
         try:
-            await client.get_authenticated(
-                PORTFOLIO_PATH, query=query, quota_key=QUOTA_KEY_PORTFOLIO
-            )
+            await client.get_authenticated(path, query=query, quota_key=QUOTA_KEY_PORTFOLIO)
             note = "accepted"
         except PolymarketUSError as exc:
             note = f"rejected: {type(exc).__name__}"
@@ -1068,26 +1097,17 @@ async def _probe_canonical_string(
             transport,
             step="C",
             label=f"query-bearing read signed {variant.value}",
-            path=PORTFOLIO_PATH,
+            path=path,
             query_string="limit=1",
             note=note,
         )
         records.append(record)
         outcomes[variant.value] = record.status
 
-    path_only = outcomes.get("path_only")
-    with_query = outcomes.get("path_with_query")
-    if path_only == 200 and with_query != 200:
-        answer = "Path ONLY is signed; the default builder is correct."
-    elif with_query == 200 and path_only != 200:
-        answer = (
-            "The query string IS part of the canonical string; switch "
-            "signing_variant to path_with_query."
-        )
-    elif path_only == 200 and with_query == 200:
-        answer = "BOTH forms were accepted; the venue does not verify the query segment."
-    else:
-        answer = f"Inconclusive: path_only={path_only}, path_with_query={with_query}."
+    answer = classify_canonical_string_outcome(
+        path_only=outcomes.get("path_only"),
+        path_with_query=outcomes.get("path_with_query"),
+    )
     return records, Finding(
         key="C",
         question="Is the query string part of the signed canonical string?",
@@ -1292,6 +1312,15 @@ def _parse_args(argv: Sequence[str] | None) -> argparse.Namespace:
         action="store_true",
         help="Skip step G (the deliberate read burst).",
     )
+    parser.add_argument(
+        "--canonical-probe-path",
+        default=PORTFOLIO_PATH,
+        help=(
+            "Private path step C signs against (R-5R-3). Defaults to the "
+            "portfolio path; re-point it at any private path that answers "
+            "when that one does not."
+        ),
+    )
     return parser.parse_args(argv)
 
 
@@ -1416,7 +1445,7 @@ async def run_smoke(
         checkpoint_now("Smoke run in progress: authenticated read has been checkpointed.")
 
         canonical_records, canonical_finding = await _probe_canonical_string(
-            prepared, transport, build_client
+            prepared, transport, build_client, path=args.canonical_probe_path
         )
         records.extend(canonical_records)
         findings.append(canonical_finding)
@@ -1745,8 +1774,7 @@ def build_safe_excepthook(guard: CredentialGuard) -> Callable[..., None]:
     ) -> None:
         if guard.credential_read_begun:
             print(
-                f"FATAL (uncaught): {exc_type.__name__}. "
-                f"{POST_CREDENTIAL_SUPPRESSION_NOTE}",
+                f"FATAL (uncaught): {exc_type.__name__}. {POST_CREDENTIAL_SUPPRESSION_NOTE}",
                 file=sys.stderr,
             )
             return
