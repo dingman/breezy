@@ -178,14 +178,19 @@ forecast ingest → ~300 station-days → CAPACITY).
 **EXEC SPINE follow-ups:** `docs/plans/EXEC_SPINE_2026-09-01.md` §R-4
 "review amendments". Guard before R-9: divides by zero for an unpriced
 forward; settlement-as-exit bypasses `_submit_order`'s refusal latch.
-**R-7 preconditions (both verified 2026-09-02).** The R-4 standing refusal
-(`exec/client.py`) stays: no send path exists (signer GET-only, no write
-transport), so removal would delete the only DENIAL, not enable a send. And
-`safety.py assert_live_order_submission_permitted` — the operator-permit
-chokepoint — has ZERO callers, its capability token zero consumers, and B6/B7
-ban wiring it. R-7 must wire both deliberately in one commit, with a consumer
-that requires the authorization. R-6e (`operator_controls.py`) and R-7-PRE
-(`account_presence_halt.py`) landed as zero-call-site libraries the same way.
+**Write path — PLAN CONVERGED (Rev 6, `ab399c3`), R-6.5a IN PROGRESS.**
+`docs/plans/EXEC_SPINE_R65_R7_2026-09-02.md`: four blind reviews + two
+confirmers. Order: R-6.5a (seam: `private_read` discards `response.status`,
+so R-6d's classifier is unreachable; zero barrier changes) → R-6.5P (probe;
+OQ-B answered by mechanism — operator rests BUY 1@$0.01, probe must refuse
+`PREFLIGHT_NOT_EMPTY`; preview WITHDRAWN, OQ-3 unproven) → R-6.5b (write
+transport in a small `write_transport.py`, B4 exemption is a NARROWING) →
+R-7 (authorization is the write closure's first positional; caps re-read per
+call; ledger releases only on 4xx+Status+no `order.id`; fee floor is an R-8
+precondition; native inflight resolution DECLINED — it guesses). The R-4
+standing refusal stays until R-7: with no send path, removing it deletes the
+only DENIAL. B4 evasions found by that review (`nautilus_pyo3.http_post`,
+C1–C5-blind helper) CLOSED `5221da3` (V5 + C6, 13 tests).
 
 **Blind-risk-view audit, 2026-09-02 — RESOLVED except policy.** T-1..T-5, T-7,
 T-8, T-11 landed (see `docs/core/findings/BLIND_RISK_VIEWS_2026-09-02.md`).
