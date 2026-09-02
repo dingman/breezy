@@ -69,15 +69,33 @@ DataEngine** — the 2026-08-25 run delivered **11 QuoteTicks from 11 frames**
 with 1 instrument loaded (`READONLY_AUTH_SMOKE_2026-08-25T221131+0000.md:2150-2152`).
 Only the *parquet* clause survives.
 
-**THE ACTUAL OPEN DEFECT (was never diagnosed until 2026-09-01):** the
-2026-08-30 run loaded **60 instruments**, received **268 WS frames** (218
-`market_data`, 50 `error`) and delivered **0 QuoteTicks** (`:49085-49089`,
-`:70-73`) — a 0% conversion rate where 08-25 got 100%. Two differences to test:
-60 instruments vs 1, and the 08-30 runs subscribed to **2026-08-31** slugs
-(`tc-temp-nychigh-2026-08-31-...`) while running on 08-30, i.e. **next-day
-markets**. One-sided books explain at most 35 of the 218 frames (183 carry
-`marketData.bids[0]`), so `parse_book_top`'s one-sided refusal
-(`parsing.py:606-633`) is NOT a sufficient explanation.
+**The "0 QuoteTicks" is a MEASUREMENT ARTIFACT, not a data-path defect
+(diagnosed 2026-09-02, every claim verified against the artifact).** The
+2026-08-30 run loaded 60 instruments and received 218 `market_data` + 50
+`error` frames. The smoke's witness counts ticks for **only the two configured
+slugs** (`polymarket_us_auth_smoke.py:1604-1616`), and those two sat past the
+venue's undocumented **10-subscriptions-per-connection cap**
+(`websocket.py:168`), so they were never subscribed and could never tick.
+Exactly **60 distinct requestIds** = 60 subscribe envelopes: 10 accepted (the
+first 10 of the list, all same-day `2026-08-30` slugs, 218 frames, 183 of them
+two-sided), 50 rejected. The accepted 10 almost certainly published quotes that
+nothing counted — `quotes_published` (`data.py:762`) exists but the report never
+renders it. **Next-day-slug hypothesis REFUTED**: every frame that arrived was
+same-day. The 08-25 run got 11/11 because it configured 1 slug, under the cap.
+
+Why the smoke saw 50 rejections: it constructs a bare single-connection
+`PolymarketUSMarketsWebSocket` (`smoke:1207`) and **bypasses the sharding
+pool**. The production factory (`factories.py:417`) builds
+`PolymarketUSMarketsWebSocketPool`, which shards across connections — but that
+pool has **never been exercised against the live venue**, because the only live
+runs are the smoke. Also contradicted: `websocket.py:76-87` says one-envelope-
+per-slug produced ZERO error frames; 08-30 shows 50 explicit ones.
+
+**Real next steps, in order:** (1) render the adapter's own counters in the
+smoke (`quotes_published`, `quote_parse_failures`, `dropped_frames`,
+`frames_missing_routing_key`) so a 0 is self-explaining; (2) route the smoke
+through the factory so the pool is what gets tested live; (3) re-run once with
+same-day slugs. No bot code change is indicated by this evidence.
 
 **Caveat on the ~872 `marketSlug` hits in the 2.8 MB file:** those specific
 occurrences are Breezy's own log text. Do not cite that file for slug
