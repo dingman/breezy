@@ -74,6 +74,7 @@ from typing import Any, Protocol, TextIO
 
 from nautilus_trader.config import TradingNodeConfig
 from nautilus_trader.live.node import TradingNode
+from nautilus_trader.model.identifiers import ClientId
 
 from breezy.adapters.polymarket_us.exec_fault import (
     clear_fatal_exec_fault,
@@ -92,6 +93,7 @@ from breezy.adapters.polymarket_us.feed_fault import (
     fatal_feed_fault,
 )
 from breezy.runtime.backtest_order_guard import install_live_order_guard
+from breezy.runtime.component_health_watch import install_component_degraded_alert
 from breezy.runtime.logging_bridge import install as install_logging_bridge
 from breezy.runtime.logging_bridge import uninstall as uninstall_logging_bridge
 from breezy.runtime.node_config import NodeConfigError, build_trade_node_config
@@ -222,6 +224,35 @@ def _order_guard_reporter(stderr: TextIO) -> Callable[[ValueError], None]:
     return _report
 
 
+def _exec_client_refusal_reader(node: Node) -> Callable[[], tuple[str, ...]]:
+    """Build the ``reasons`` reader R-6c's degraded-alert subscriber requires.
+
+    Resolved LAZILY, at the instant the alert fires, for two reasons. The
+    refusals do not exist yet at wiring time -- ``_connect`` has not run --
+    and holding the client object in a closure from ``build()`` onward would
+    outlive the node's own registry for no benefit.
+
+    ``ExecutionEngine._clients`` is a ``cdef readonly`` dict
+    (``$NT/execution/engine.pxd:52``): read-only by declaration, and already
+    the idiom ``tests/contract/test_exec_client_wiring_contract.py`` uses to
+    reach the registered client. There is no public accessor -- the engine
+    exposes ``registered_clients`` (``ClientId``\\ s only, ``engine.pyx:212``)
+    and nothing that returns the object.
+
+    A missing client yields ``()``, never an exception: this reader runs
+    inside a message-bus handler, and a degraded component must still produce
+    its alert even if the lookup comes up empty.
+    """
+
+    def _read() -> tuple[str, ...]:
+        client = node.kernel.exec_engine._clients.get(ClientId(POLYMARKET_US_CLIENT_NAME))
+        if client is None:
+            return ()
+        return tuple(client.trading_refusals)
+
+    return _read
+
+
 def _run_node(config: TradingNodeConfig, node_factory: NodeFactory, stderr: TextIO) -> int:
     """Build, run and ALWAYS dispose the node. Never raises.
 
@@ -266,6 +297,11 @@ def _run_node(config: TradingNodeConfig, node_factory: NodeFactory, stderr: Text
             node.kernel.cache,
             node.kernel.msgbus,
             on_refusal=_order_guard_reporter(stderr),
+        )
+        install_component_degraded_alert(
+            node.kernel.msgbus,
+            component_id=POLYMARKET_US_CLIENT_NAME,
+            reasons=_exec_client_refusal_reader(node),
         )
         node.run()
         return _exit_code_for_completed_run(stderr)

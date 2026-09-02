@@ -1402,11 +1402,46 @@ class PolymarketUSExecutionClient(LiveExecutionClient):
         ERROR, not WARNING: an unattributable position is the operator's
         problem to resolve, and the node will go on running -- refusing -- in
         the meantime. Deduplicated so a per-reconcile loop cannot bury the log.
+
+        **R-6c: the FIRST refusal also degrades the component.** An ERROR line
+        and a ``trading_refusals`` property are both things a HUMAN reads;
+        neither is a state anything can act on. ``Component.degrade()``
+        (``$NT/common/component.pyx:2098-2127``) is the native FSM transition
+        for exactly this -- "running, but not healthy" -- and it publishes a
+        ``ComponentStateChanged`` on ``events.system.<component_id>``
+        (``:2210-2225``). Nothing here reimplements it and nothing here
+        subscribes to it: the operator-facing subscriber lives at the wiring
+        layer in ``breezy.runtime.component_health_watch``, because
+        ``breezy.runtime.health`` is a module NO module under ``exec/`` may
+        import (barrier E0-TRANSPORT,
+        ``tests/unit/test_execution_egress_firewall_guard.py``).
+
+        Legal from ``RUNNING``, which is always this client's state when a
+        refusal fires: ``NautilusKernel.start_async`` runs ``_start_engines()``
+        (``$NT/system/kernel.py:1021``) -- which calls ``client.start()``
+        SYNCHRONOUSLY via ``ExecutionEngine._start``
+        (``$NT/execution/engine.pyx:666-668``) -- BEFORE ``_connect_clients()``
+        (``:1022``) schedules ``_connect``. It is also SAFE from any other
+        state without a guard here: ``_trigger_fsm`` catches
+        ``InvalidStateTrigger``, logs it and returns without publishing
+        (``component.pyx:2188-2196``), so a refusal can never raise out of
+        this method on account of the FSM.
+
+        Driven ONCE, off the same latch that dedupes the ERROR log, so the
+        subscriber alerts exactly once no matter how many reconcile cycles
+        refuse. **DEGRADED is a health INDICATOR, not a kill switch**: several
+        of the twenty-five producers that reach this method are ROUTINE on an
+        account an operator has also traded by hand (the full triage lives in
+        ``tests/unit/test_exec_refusal_health_surface.py``), so nothing here
+        stops the node, publishes a shutdown, or writes a fault latch.
         """
         if reason in self._trading_refusals:
             return
+        first_refusal = not self._trading_refusals
         self._trading_refusals.append(reason)
         self._log.error(f"Trading refused: {reason}")
+        if first_refusal:
+            self.degrade()
 
     def __repr__(self) -> str:
         return (

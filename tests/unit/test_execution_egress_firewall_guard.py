@@ -2425,10 +2425,22 @@ def test_x1_the_live_scan_actually_reaches_a_test_that_imports_the_exec_package(
     real `PolymarketUSExecutionClient`. Neither carries any of
     `SOCKET_RESTORING_MARKERS` -- both stub the transport, exactly like the
     data-side suite already does.
+
+    R-6c adds one: `test_exec_refusal_health_surface.py` imports
+    `exec.endpoints` and drives the real client through `_connect` to prove a
+    refusal degrades the component. WIDENED, not relaxed (L-6/L-12): the
+    comparison is still `==`, and the effect of this row is to bring that
+    module INSIDE X1's rule, which it satisfies -- it carries no marker at
+    all, and its whole point is that `_refuse` is a LOCAL latch reachable with
+    no socket. Note for the next increment: this equality fires on any new
+    TEST that imports `exec/`, independently of what the increment does to
+    `src/`, so an increment whose barrier analysis covers only E0/E1/E2/E3 and
+    the cage constants will miss it (L-15).
     """
     assert exec_importing_test_modules() == {
         "tests/contract/test_exec_client_reconciliation_contract.py",
         "tests/contract/test_exec_client_wiring_contract.py",
+        "tests/unit/test_exec_refusal_health_surface.py",
         "tests/unit/test_polymarket_us_exec_client.py",
         "tests/unit/test_polymarket_us_exec_endpoints.py",
         "tests/unit/test_polymarket_us_exec_positions.py",
