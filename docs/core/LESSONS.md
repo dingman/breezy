@@ -916,3 +916,46 @@ discipline as [[L-15]] (run the executable oracle rather than reasoning about
 what it would say) and [[L-17]] (a sample establishes presence, never
 necessity) — and the reason [[L-12]] insists a barrier is widened by measured
 need rather than by argument.
+
+## L-19 — Measure a blast radius by SIMULATING the change, not by counting call sites (2026-09-02)
+
+Reviewing the T-4 plan, which changes `PortfolioSnapshot.equity` from
+`float = 10_000.0` to `float | None = None`, the reviewer did not reason about
+what would break. It patched `PortfolioSnapshot.__init__.__defaults__` to `None`
+and the five `_equity()` bodies to drop their fallback, via a pytest plugin,
+then ran the full suite against the unmodified repo.
+
+That produced a number no census could: **16 failures, of which 15 were
+`TypeError` at the arithmetic site and one was not.** The odd one out —
+`test_calibration_mean_reversion_shorts_disabled_alert.py:193` — fails on
+*assertions* instead (`refusals.total() == 0` -> 1, `len(orders) == 1` -> 0),
+because its rig has no venue account. It is the **control** proving the
+shorts-disabled alert tracks the permission rather than the market, so it must
+be repaired with a stub account and never by relaxing the assertion. A grep for
+`PortfolioSnapshot(` would have listed it among 89 sites with nothing to
+distinguish it; a census of "sites relying on the default" would have missed it
+entirely, because it *passes* `equity` explicitly.
+
+**The count was also simply wrong by hand.** The plan said 88/39/49; the AST
+census said **89/40/49**. The uncounted site re-fabricates the constant by hand
+(`test_weather_strategy_quote_staleness.py:99`,
+`PortfolioSnapshot(equity=10_000.0)`), so it would have survived the whole fix
+as a live fabrication *and* been invisible to a structural guard on the default.
+
+**A second finding of the same shape, about the enforcement itself.** The plan
+leaned on strict mypy to prevent misuse of the new optional. Measured with a
+repro: an unguarded read in another method IS caught — but
+**`portfolio.equity or 0.0` type-checks clean** and silently restores the exact
+fabrication the change removes, and mypy flags **zero** of the 49
+default-reliant sites. The type change is a real but PARTIAL control. Claiming
+a type makes an invalid state unrepresentable is itself a claim to check
+([[L-18]]): `T | None` plus `or` is `T` again, with no diagnostic.
+
+**How to apply.** For any change to a widely-constructed type's default or
+nullability, spend the ten minutes to simulate it — monkeypatch the default,
+run the suite, read the failures — BEFORE writing the scope section. The
+failures that are not the expected exception type are the ones worth the whole
+exercise: they are where the change alters *meaning* rather than merely types,
+and they are exactly what a call-site census cannot see. And when a plan claims
+the type system will enforce something, write the escape hatch out and check
+whether it compiles.
