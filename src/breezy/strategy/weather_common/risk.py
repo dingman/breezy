@@ -42,6 +42,8 @@ if TYPE_CHECKING:  # pragma: no cover - typing only
 
 __all__ = [
     "COUNTED_REFUSAL_REASONS",
+    "EQUITY_NONPOSITIVE",
+    "EQUITY_UNOBSERVED",
     "PortfolioSnapshot",
     "RiskDecision",
     "RiskLimits",
@@ -49,6 +51,23 @@ __all__ = [
     "SharedExposureView",
     "edge_after_costs",
 ]
+
+#: No account balance was ever OBSERVED, so there is no denominator to size
+#: the equity-fraction cap against. Distinct from a measured zero below:
+#: `equity` is `float | None` precisely because a float cannot say this.
+EQUITY_UNOBSERVED: Final[str] = "equity_unobserved"
+
+#: A balance WAS observed, and it is zero or negative.
+#:
+#: UNVERIFIED, recorded rather than asserted: whether the venue's
+#: `currentBalance` (what `Account.balance_total` reports on this
+#: `AccountType.CASH` account) includes the value of open positions. Its
+#: sibling `assetNotional` is a separate field nothing in Breezy reads. So a
+#: zero here is at least as plausibly "fully deployed and solvent" as
+#: "drained", and this reason deliberately says only what was measured.
+#: Refusing a NEW buy is correct under either reading, which is why the
+#: uncertainty does not have to be resolved to act on it.
+EQUITY_NONPOSITIVE: Final[str] = "equity_nonpositive"
 
 #: Every distinct key `RiskManager.evaluate_order` can record on the
 #: `RefusalCounter` it is passed. Fixed and finite by construction -- see
@@ -78,6 +97,8 @@ COUNTED_REFUSAL_REASONS: Final[frozenset[str]] = frozenset(
         "max_event_notional",
         "max_location_notional",
         "max_simultaneous_positions",
+        EQUITY_UNOBSERVED,
+        EQUITY_NONPOSITIVE,
         "equity_fraction",
         "insufficient_depth",
     },
@@ -171,7 +192,18 @@ class PortfolioSnapshot:
 
     position_qty: dict[str, float] = field(default_factory=dict)  # signed YES qty
     pending_qty: dict[str, float] = field(default_factory=dict)
-    equity: float = 10_000.0
+    #: Account equity as OBSERVED, or `None` for never observed. NOT a float
+    #: with a sentinel value: `float` cannot express "unobserved", and this
+    #: field defaulted to a literal `10_000.0` that the equity-fraction cap
+    #: then sized itself against as though somebody had counted the money.
+    #: `None` is the default because the absence of an observation is the
+    #: correct starting state, and every read of it is forced to say what it
+    #: does about that (T-4). Populate it from
+    #: `breezy.strategy.weather_common.equity.observed_equity`, which is the
+    #: only reader; never from a config constant, and never with an
+    #: `or`-default, which type-checks clean and silently reinstates the
+    #: fabrication (pinned by `test_equity_observability_guard.py`).
+    equity: float | None = None
 
     def net_qty(self, instrument_id: str) -> float:
         """Settled position PLUS signed working orders.
@@ -553,14 +585,48 @@ class RiskManager:
         ):
             return self._refuse("max_simultaneous_positions")
 
-        order_notional = abs(signed_qty_delta) * contract.contract_size
-        if portfolio.equity > 0 and order_notional > limits.max_equity_fraction * portfolio.equity:
-            clipped = (limits.max_equity_fraction * portfolio.equity) / max(
-                contract.contract_size, 1e-9,
-            )
-            if clipped < 1.0:
-                return self._refuse("equity_fraction")
-            signed_qty_delta = clipped if signed_qty_delta > 0 else -clipped
+        # EQUITY, BUY SIDE ONLY -- the WHOLE block, not merely the two
+        # refusals below (T-4).
+        #
+        # Gating the whole block is a correctness requirement of the `None`
+        # type, not a stylistic extension: this block's own predicate used to
+        # be `portfolio.equity > 0`, which raises `TypeError` on `None`, so a
+        # reducing sell would die at the gate rather than pass it. And that
+        # predicate was itself fail-open -- false at `equity == 0.0`, so the
+        # one balance that should stop a buy was the one that skipped the cap
+        # entirely and let the order through at FULL size.
+        #
+        # It also closes a PRE-EXISTING exit trap, and that is a real
+        # behaviour change: `signed_qty_delta = clipped if ... else -clipped`
+        # clipped SELLS too, so a reducing sell of 200 against an observed
+        # equity of $10 clipped to 0.8, fell below one contract, and was
+        # refused `equity_fraction`. That is the same failure the depth clip
+        # below explicitly declines to create ("clipping an exit to that would
+        # trap positions the close-only guard exists to let out"), and it bit
+        # hardest on a small account, which is exactly when getting out
+        # matters. With `allow_short=False` every sell reaching here has
+        # already been netted against `settled_qty` and is therefore
+        # REDUCING, so letting it past this cap cannot open exposure.
+        #
+        # The resulting state -- new buys refused, exits allowed -- is
+        # reduce-only, and it is monotonically de-risking. Its one genuine
+        # defect is silence, which is why both refusals below carry a
+        # timestamped, state-naming note into the strategy's log (see
+        # `weather_common.equity.reduce_only_refusal_note`).
+        if signed_qty_delta > 0:
+            equity = portfolio.equity
+            if equity is None:
+                return self._refuse(EQUITY_UNOBSERVED)
+            if equity <= 0.0:
+                return self._refuse(EQUITY_NONPOSITIVE)
+            order_notional = signed_qty_delta * contract.contract_size
+            if order_notional > limits.max_equity_fraction * equity:
+                clipped = (limits.max_equity_fraction * equity) / max(
+                    contract.contract_size, 1e-9,
+                )
+                if clipped < 1.0:
+                    return self._refuse("equity_fraction")
+                signed_qty_delta = clipped
 
         # DEPTH, last and tightest (BL-25 D2). Every clip above is a POLICY
         # cap -- how much we are willing to hold. This one is a FACT about the

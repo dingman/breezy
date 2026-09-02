@@ -137,12 +137,45 @@ class _StubFeeCoefficients:
         return 0.06
 
 
+#: A STATED account balance for the stub venue account below.
+#:
+#: This portfolio double used to return ``account -> None`` so ``_equity()``
+#: would fall back to ``config.starting_equity`` -- a fabricated constant
+#: that T-4 deleted, because an unobserved balance now refuses a new BUY
+#: (``equity_unobserved``) instead of inventing a denominator. These tests
+#: measure the IN-FLIGHT gate, so they state an observation rather than lean
+#: on the absence of one. At ``max_equity_fraction=0.08`` this authorises 800
+#: contracts against an ``ORDER_QTY`` of 200: the equity clip stays exactly as
+#: far out of the way as it was before, so what these tests measure is
+#: unchanged.
+OBSERVED_EQUITY = 10_000.0
+
+
+class _StubBalance:
+    """`Account.balance_total` returns `Money | None`; only `as_double` is read."""
+
+    def __init__(self, amount: float) -> None:
+        self._amount = amount
+
+    def as_double(self) -> float:
+        return self._amount
+
+
+class _StubAccount:
+    def __init__(self, balance: float) -> None:
+        self._balance = balance
+
+    def balance_total(self, currency: Any) -> _StubBalance:
+        del currency
+        return _StubBalance(self._balance)
+
+
 class _SettledPositionPortfolio(PortfolioFacade):  # type: ignore[misc]  # compiled Cython base erases to Any
     """States the SETTLED position only -- the quantity in-flight orders are missing from.
 
-    ``account`` returns ``None`` so ``_equity`` falls back to
-    ``config.starting_equity``, keeping the equity-fraction clip out of the
-    way of what these tests measure.
+    ``account`` reports :data:`OBSERVED_EQUITY`, which keeps the
+    equity-fraction clip out of the way of what these tests measure without
+    relying on an equity nobody observed.
     """
 
     def __init__(self, net: float) -> None:
@@ -152,8 +185,9 @@ class _SettledPositionPortfolio(PortfolioFacade):  # type: ignore[misc]  # compi
         del instrument_id, account_id
         return self._net
 
-    def account(self, venue: Any) -> None:
+    def account(self, venue: Any) -> _StubAccount:
         del venue
+        return _StubAccount(OBSERVED_EQUITY)
 
 
 class _Rig:

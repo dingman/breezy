@@ -56,6 +56,19 @@ STRATEGY_MAYBE_SUBMIT: tuple[tuple[str, MaybeSubmit], ...] = (
 )
 
 
+#: A STATED equity for this harness, and the reason it is stated.
+#:
+#: This double overrides `_portfolio_snapshot` wholesale, so it reaches NO
+#: equity reader at all -- not `weather_common.equity.observed_equity`, not a
+#: config field. It was a bare `10_000.0` written inline, which is the same
+#: fabricated number T-4 deleted from the five configs, arrived at
+#: independently and invisible to any structural guard on that default.
+#: Named here so a reader can tell a deliberate test fixture from the
+#: fabrication, and set well clear of `max_equity_fraction` so the equity cap
+#: never binds on a module whose subject is quote staleness.
+STATED_EQUITY = 10_000.0
+
+
 class _NoWorkingOrdersCache:
     """No order of ANY status -- the shape every `_maybe_submit` gate must see through.
 
@@ -83,10 +96,25 @@ class _Log:
         pass
 
 
+class _Clock:
+    """`_maybe_submit` stamps every refusal it logs with the tick clock.
+
+    T-4 made two of those refusals (`equity_unobserved`, `equity_nonpositive`)
+    carry a timestamped, reduce-only-naming note, because reduce-only entered
+    silently reads exactly like a strategy that saw no opportunity. This
+    double supplies the clock that note is stamped from; the value is never
+    asserted here, since this module's subject is quote staleness.
+    """
+
+    def timestamp_ns(self) -> int:
+        return 0
+
+
 class _StrategyHarness:
     def __init__(self, contract: MispricingContract) -> None:
         self.cache = _NoWorkingOrdersCache()
         self.log = _Log()
+        self.clock = _Clock()
         self._nt_ids = {contract.instrument_id: object()}
         self._risk = RiskManager(
             RiskLimits(stale_quote_minutes=15.0),
@@ -96,7 +124,7 @@ class _StrategyHarness:
         self.reported_refusals = 0
 
     def _portfolio_snapshot(self) -> PortfolioSnapshot:
-        return PortfolioSnapshot(equity=10_000.0)
+        return PortfolioSnapshot(equity=STATED_EQUITY)
 
     def _report_refusals(self) -> None:
         self.reported_refusals += 1

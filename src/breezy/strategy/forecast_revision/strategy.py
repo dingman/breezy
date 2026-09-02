@@ -75,6 +75,10 @@ from breezy.strategy.depth10 import market_quote_from_depth
 from breezy.strategy.forecast_revision.config import ForecastRevisionConfig
 from breezy.strategy.forecast_revision.decision import RevisionState, evaluate_instrument
 from breezy.strategy.weather_common.bucket_contract import MispricingContract
+from breezy.strategy.weather_common.equity import (
+    observed_equity,
+    reduce_only_refusal_note,
+)
 from breezy.strategy.weather_common.forecast_source import (
     ForecastSource,
     MissingForecastSourceError,
@@ -348,7 +352,10 @@ class ForecastRevisionStrategy(SharedExposureMixin, Strategy):
         if not risk_decision.allowed:
             self.log.info(
                 f"RISK block {contract.instrument_id}: {risk_decision.reason} "
-                f"edge={decision.edge:.3f}",
+                f"edge={decision.edge:.3f}"
+                + reduce_only_refusal_note(
+                    risk_decision.reason, tick_ts_ns=self.clock.timestamp_ns(),
+                ),
             )
             self._report_refusals()
             return
@@ -457,21 +464,8 @@ class ForecastRevisionStrategy(SharedExposureMixin, Strategy):
         return PortfolioSnapshot(
             position_qty=position_qty,
             pending_qty=pending_qty,
-            equity=self._equity(),
+            equity=observed_equity(self.cache, self.portfolio, self._nt_ids),
         )
-
-    def _equity(self) -> float:
-        for nt_id in self._nt_ids.values():
-            instrument = self.cache.instrument(nt_id)
-            if instrument is None:
-                continue
-            account = self.portfolio.account(nt_id.venue)
-            if account is None:
-                continue
-            balance = account.balance_total(instrument.quote_currency)
-            if balance is not None:
-                return float(balance.as_double())
-        return self._config.starting_equity
 
 
 def _ns_to_datetime(ts_event: int) -> datetime:

@@ -63,9 +63,6 @@ class ForecastRevisionConfig(StrategyConfig, frozen=True):
     halt_hours_before_settlement, stale_forecast_hours, stale_quote_minutes,
     transaction_cost_prob, allow_short : see
         ``breezy.strategy.weather_common.risk.RiskLimits``.
-    starting_equity : float
-        Fallback equity for the equity-fraction risk check when the native
-        account balance is unavailable.
     error_distribution, student_t_df, sigma_floor_f, sigma_per_sqrt_hour_f,
     p_floor : see ``breezy.strategy.weather_common.probability.ForecastErrorModel``.
     use_limit_orders, limit_inside_ticks, flatten_on_observation,
@@ -110,7 +107,6 @@ class ForecastRevisionConfig(StrategyConfig, frozen=True):
     #: naked short of its own), and ``True`` is reachable only by writing it at
     #: a call site -- an explicit operator act, never a default.
     allow_short: bool = False
-    starting_equity: float = 10_000.0
 
     # Probability model (breezy.strategy.weather_common.probability.ForecastErrorModel).
     error_distribution: str = "gaussian"

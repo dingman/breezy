@@ -117,6 +117,10 @@ from breezy.strategy.weather_common.costs import (
     UnknownFeeScheduleError,
     fee_coefficient_from_info,
 )
+from breezy.strategy.weather_common.equity import (
+    observed_equity,
+    reduce_only_refusal_note,
+)
 from breezy.strategy.weather_common.freshness import SignalFreshness
 from breezy.strategy.weather_common.inflight import signed_working_qty, working_orders
 from breezy.strategy.weather_common.models import MarketQuote, hours_until
@@ -823,7 +827,10 @@ class CliSettlementPrintLockStrategy(SharedExposureMixin, Strategy):
         if not risk_decision.allowed:
             self.log.info(
                 f"RISK block {contract.instrument_id}: {risk_decision.reason} "
-                f"edge={decision.edge:.3f}",
+                f"edge={decision.edge:.3f}"
+                + reduce_only_refusal_note(
+                    risk_decision.reason, tick_ts_ns=self.clock.timestamp_ns(),
+                ),
             )
             self._report_refusals()
             return
@@ -980,21 +987,8 @@ class CliSettlementPrintLockStrategy(SharedExposureMixin, Strategy):
         return PortfolioSnapshot(
             position_qty=position_qty,
             pending_qty=pending_qty,
-            equity=self._equity(),
+            equity=observed_equity(self.cache, self.portfolio, self._nt_ids),
         )
-
-    def _equity(self) -> float:
-        for nt_id in self._nt_ids.values():
-            instrument = self.cache.instrument(nt_id)
-            if instrument is None:
-                continue
-            account = self.portfolio.account(nt_id.venue)
-            if account is None:
-                continue
-            balance = account.balance_total(instrument.quote_currency)
-            if balance is not None:
-                return float(balance.as_double())
-        return self._config.starting_equity
 
 
 def _ns_to_datetime(ts_event: int) -> dt.datetime:

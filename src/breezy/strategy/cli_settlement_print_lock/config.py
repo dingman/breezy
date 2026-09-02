@@ -165,9 +165,6 @@ class CliSettlementPrintLockConfig(StrategyConfig, frozen=True):
         two must satisfy ``min_model_edge <= min_edge_after_costs`` -- both
         default to :data:`MIN_EDGE_AFTER_COSTS_BL19` and the strategy refuses
         an inverted pair at construction.
-    starting_equity : float
-        Fallback equity for the equity-fraction risk check when the native
-        account balance is unavailable.
     price_scale_override : float | None
         Overrides ``contract.price_scale`` (1.0 for [0, 1]-priced markets)
         when the venue prices in a different unit.
@@ -220,6 +217,5 @@ class CliSettlementPrintLockConfig(StrategyConfig, frozen=True):
     #: the only naked-short control in the system regardless
     #: (``breezy.strategy.weather_common.risk.RiskLimits.allow_short``).
     allow_short: bool = False
-    starting_equity: float = 10_000.0
 
     price_scale_override: float | None = None

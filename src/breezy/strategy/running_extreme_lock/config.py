@@ -83,9 +83,6 @@ class RunningExtremeLockConfig(StrategyConfig, frozen=True):
     max_bid_ask_spread, min_liquidity_contracts, min_hours_to_settlement,
     halt_hours_before_settlement, stale_quote_minutes, transaction_cost_prob,
     allow_short : see ``breezy.strategy.weather_common.risk.RiskLimits``.
-    starting_equity : float
-        Fallback equity used for the equity-fraction risk check when the
-        native account balance is unavailable.
     price_scale_override : float | None
         Overrides ``contract.price_scale`` (1.0 for [0, 1]-priced markets)
         when the venue prices in a different unit.
@@ -122,6 +119,5 @@ class RunningExtremeLockConfig(StrategyConfig, frozen=True):
     #: only naked-short control in the system regardless
     #: (``breezy.strategy.weather_common.risk.RiskLimits.allow_short``).
     allow_short: bool = False
-    starting_equity: float = 10_000.0
 
     price_scale_override: float | None = None

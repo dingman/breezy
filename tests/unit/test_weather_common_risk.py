@@ -40,6 +40,15 @@ NOW = dt.datetime(2026, 8, 28, 12, 0, tzinfo=dt.UTC)
 #: times over. Tests that exercise staleness itself build their own.
 FRESH = SignalFreshness.forecast(0.0)
 
+#: An OBSERVED account balance, for the three tests whose subject is some
+#: OTHER gate and which merely have to get PAST the equity block. T-4 made
+#: `PortfolioSnapshot.equity` default to `None` ("never observed"), and a BUY
+#: against an unobserved balance is refused `equity_unobserved` -- so those
+#: three needed a stated observation, not a relaxed assertion. Wide enough
+#: that `max_equity_fraction` never binds at the sizes they use, so a clip
+#: seen in any of them is never this cap.
+OBSERVED_EQUITY = 10_000.0
+
 
 def _contract(
     instrument_id: str, *, lower_f: int | None, upper_f: int | None,
@@ -197,7 +206,7 @@ def test_buckets_on_different_climate_days_are_not_exclusive() -> None:
         tick_size=0.01,
     )
     risk = RiskManager(RiskLimits(), {"A": bucket_a, "C": bucket_other_day})
-    portfolio = PortfolioSnapshot(position_qty={"A": 10.0})
+    portfolio = PortfolioSnapshot(position_qty={"A": 10.0}, equity=OBSERVED_EQUITY)
 
     decision = risk.evaluate_order(
         contract=bucket_other_day,
@@ -389,7 +398,7 @@ def test_an_allowed_order_records_no_refusal() -> None:
         hours_to_settlement=24.0,
         signal_age=FRESH,
         edge=0.50,
-        portfolio=PortfolioSnapshot(),
+        portfolio=PortfolioSnapshot(equity=OBSERVED_EQUITY),
         quote=_quote(),
         quote_age_minutes=0.0,
     )
@@ -641,7 +650,7 @@ def test_asks_only_quote_is_tradable_when_ask_liquidity_clears_the_floor() -> No
         hours_to_settlement=24.0,
         signal_age=FRESH,
         edge=0.50,
-        portfolio=PortfolioSnapshot(),
+        portfolio=PortfolioSnapshot(equity=OBSERVED_EQUITY),
         quote=quote,
         quote_age_minutes=0.0,
     )
@@ -1367,9 +1376,26 @@ def test_every_recorded_refusal_reason_is_within_the_counted_set() -> None:
         signal_age=FRESH, edge=0.50, portfolio=PortfolioSnapshot(equity=1.0),
         quote=_quote(), quote_age_minutes=0.0,
     )
+    # equity_unobserved (T-4) -- BUY, because the whole equity block is
+    # buy-side gated.
+    risk.evaluate_order(
+        contract=contract_a, signed_qty_delta=10.0, hours_to_settlement=24.0,
+        signal_age=FRESH, edge=0.50, portfolio=PortfolioSnapshot(equity=None),
+        quote=_quote(), quote_age_minutes=0.0,
+    )
+    # equity_nonpositive (T-4)
+    risk.evaluate_order(
+        contract=contract_a, signed_qty_delta=10.0, hours_to_settlement=24.0,
+        signal_age=FRESH, edge=0.50, portfolio=PortfolioSnapshot(equity=0.0),
+        quote=_quote(), quote_age_minutes=0.0,
+    )
 
     assert set(counter.counts) <= risk_module.COUNTED_REFUSAL_REASONS
     assert counter.total() > 0
+    # RED-8: the header above claims this test drives EVERY refusal branch.
+    # Leaving the two new ones undriven would make that claim false.
+    assert counter.count(EQUITY_UNOBSERVED_REASON) == 1
+    assert counter.count(EQUITY_NONPOSITIVE_REASON) == 1
 
 
 # ---------------------------------------------------------------------------
@@ -1883,3 +1909,220 @@ def test_a_flat_candidate_is_refused_when_every_slot_is_exiting_but_unfilled() -
 
     assert decision.allowed is False
     assert decision.reason == "max_simultaneous_positions"
+
+
+# ---------------------------------------------------------------------------
+# T-4 -- `float` cannot express "unobserved", and the policy treated every
+# float as a measurement
+#
+# `PortfolioSnapshot.equity` defaulted to a literal `10_000.0` and
+# `_equity()` fell back to `config.starting_equity`, so the equity-fraction
+# cap sized itself against money nobody had counted. The cap ALSO evaporated
+# at `equity == 0.0`, because its own predicate was `portfolio.equity > 0`.
+#
+# The whole equity block is now gated `signed_qty_delta > 0`. That is a
+# correctness requirement of the `None` type, not a preference: the old
+# predicate raises `TypeError` on `None`, so a reducing SELL would die at the
+# gate. It also closes a PRE-EXISTING exit trap -- see
+# `test_a_reducing_sell_is_not_clipped_against_a_tiny_observed_equity`.
+# ---------------------------------------------------------------------------
+
+#: Spelled as literals here on purpose: importing them at module scope would
+#: turn a missing constant into ~200 collection errors instead of the handful
+#: of failures that actually name the defect. `test_the_two_equity_refusal
+#: _reasons_are_the_constants_risk_exports` pins the two spellings together.
+EQUITY_UNOBSERVED_REASON = "equity_unobserved"
+EQUITY_NONPOSITIVE_REASON = "equity_nonpositive"
+
+
+def test_a_fresh_snapshot_reports_equity_as_unobserved() -> None:
+    """RED-3: the default is the ABSENCE of an observation, not a constant."""
+    assert PortfolioSnapshot().equity is None
+
+
+def test_a_buy_against_unobserved_equity_is_refused() -> None:
+    """RED-4: no measurement, no cap, no order.
+
+    Fail-closed, and narrow: this refuses NEW exposure only. See the sell
+    cases below for why the exit stays open.
+    """
+    contract = _contract("A", lower_f=80, upper_f=None)
+    counter = RefusalCounter()
+    risk = RiskManager(RiskLimits(), {"A": contract}, refusals=counter)
+
+    decision = risk.evaluate_order(
+        contract=contract,
+        signed_qty_delta=10.0,
+        hours_to_settlement=24.0,
+        signal_age=FRESH,
+        edge=0.50,
+        portfolio=PortfolioSnapshot(equity=None),
+        quote=_quote(),
+        quote_age_minutes=0.0,
+    )
+
+    assert decision.allowed is False
+    assert decision.reason == EQUITY_UNOBSERVED_REASON
+    assert counter.count(EQUITY_UNOBSERVED_REASON) == 1
+
+
+@pytest.mark.parametrize("equity", [0.0, -1.0])
+def test_a_buy_against_non_positive_equity_is_refused(equity: float) -> None:
+    """RED-5 / RED-6: at zero the cap used to EVAPORATE and pass full size.
+
+    `if portfolio.equity > 0 and ...` is false at zero, so the branch was
+    skipped entirely -- the one equity value that should stop a buy was the
+    one that disabled the check. Whether the venue's `currentBalance` means
+    "drained" or "fully deployed" is UNVERIFIED; refusing a new buy on zero
+    cash is right under either reading.
+    """
+    contract = _contract("A", lower_f=80, upper_f=None)
+    counter = RefusalCounter()
+    risk = RiskManager(RiskLimits(), {"A": contract}, refusals=counter)
+
+    decision = risk.evaluate_order(
+        contract=contract,
+        signed_qty_delta=10.0,
+        hours_to_settlement=24.0,
+        signal_age=FRESH,
+        edge=0.50,
+        portfolio=PortfolioSnapshot(equity=equity),
+        quote=_quote(),
+        quote_age_minutes=0.0,
+    )
+
+    assert decision.allowed is False
+    assert decision.reason == EQUITY_NONPOSITIVE_REASON
+    assert counter.count(EQUITY_NONPOSITIVE_REASON) == 1
+
+
+def test_the_two_equity_refusal_reasons_are_the_constants_risk_exports() -> None:
+    """One spelling for the reason, the counter and the log note."""
+    assert risk_module.EQUITY_UNOBSERVED == EQUITY_UNOBSERVED_REASON
+    assert risk_module.EQUITY_NONPOSITIVE == EQUITY_NONPOSITIVE_REASON
+
+
+def test_both_equity_refusals_are_within_the_counted_set() -> None:
+    """RED-8: a refusal reason outside `COUNTED_REFUSAL_REASONS` is a reason
+    no operator dashboard can bound. This is the L-12 WIDENING of an exact
+    set -- the barrier's own assertions are `<=` and membership, never
+    equality, which is why widening is permitted where relaxing is not.
+    """
+    assert EQUITY_UNOBSERVED_REASON in risk_module.COUNTED_REFUSAL_REASONS
+    assert EQUITY_NONPOSITIVE_REASON in risk_module.COUNTED_REFUSAL_REASONS
+
+
+def test_a_reducing_sell_survives_unobserved_equity() -> None:
+    """RED-10: the exit is NOT gagged by a missing measurement.
+
+    With `allow_short=False` every sell that survives the close-only guard is
+    reducing, so refusing one traps a position the guard exists to let out --
+    the same failure the depth clip explicitly declines to create. Before the
+    gating this raised `TypeError` on `None > 0`.
+    """
+    contract = _contract("A", lower_f=80, upper_f=None)
+    counter = RefusalCounter()
+    risk = RiskManager(RiskLimits(), {"A": contract}, refusals=counter)
+
+    decision = risk.evaluate_order(
+        contract=contract,
+        signed_qty_delta=-50.0,
+        hours_to_settlement=24.0,
+        signal_age=FRESH,
+        edge=0.50,
+        portfolio=PortfolioSnapshot(position_qty={"A": 50.0}, equity=None),
+        quote=_quote(),
+        quote_age_minutes=0.0,
+    )
+
+    assert decision.allowed is True
+    assert decision.clipped_quantity == pytest.approx(-50.0)
+    assert counter.total() == 0
+
+
+def test_a_reducing_sell_is_not_clipped_against_a_tiny_observed_equity() -> None:
+    """RED-11: a PRE-EXISTING exit trap, closed as a consequence of the gating.
+
+    `signed_qty_delta = clipped if signed_qty_delta > 0 else -clipped` clipped
+    SELLS too. A reducing sell of 200 against an OBSERVED equity of $10 and
+    `max_equity_fraction=0.08` clipped to 0.8, fell under one contract, and
+    was refused `equity_fraction` -- an exit refused because the account is
+    small, which is exactly when exiting matters. Not created by T-4; not
+    separable from it either, since the `None` guard rewrites the same
+    predicate.
+    """
+    contract = _contract("A", lower_f=80, upper_f=None)
+    counter = RefusalCounter()
+    risk = RiskManager(RiskLimits(max_equity_fraction=0.08), {"A": contract}, refusals=counter)
+
+    decision = risk.evaluate_order(
+        contract=contract,
+        signed_qty_delta=-200.0,
+        hours_to_settlement=24.0,
+        signal_age=FRESH,
+        edge=0.50,
+        portfolio=PortfolioSnapshot(position_qty={"A": 200.0}, equity=10.0),
+        quote=_quote(),
+        quote_age_minutes=0.0,
+    )
+
+    assert decision.allowed is True
+    assert decision.clipped_quantity == pytest.approx(-200.0)
+    assert counter.count("equity_fraction") == 0
+
+
+def test_a_sell_against_zero_equity_still_passes() -> None:
+    """A PIN, not a defect test -- green BEFORE and after T-4.
+
+    At `equity == 0.0` the old cap evaporated, so this sell already passed;
+    it passes now because the block is buy-side gated. It pins that the
+    buy-side refusal did not spill onto the exit, and nothing more. Listing
+    it as a defect test would be a false claim about what T-4 fixed.
+    """
+    contract = _contract("A", lower_f=80, upper_f=None)
+    counter = RefusalCounter()
+    risk = RiskManager(RiskLimits(), {"A": contract}, refusals=counter)
+
+    decision = risk.evaluate_order(
+        contract=contract,
+        signed_qty_delta=-50.0,
+        hours_to_settlement=24.0,
+        signal_age=FRESH,
+        edge=0.50,
+        portfolio=PortfolioSnapshot(position_qty={"A": 50.0}, equity=0.0),
+        quote=_quote(),
+        quote_age_minutes=0.0,
+    )
+
+    assert decision.allowed is True
+    assert counter.total() == 0
+
+
+def test_a_buy_is_still_clipped_to_the_equity_fraction_when_equity_is_observed() -> None:
+    """The control: gating the block did not disable the cap it guards."""
+    contract = _contract("A", lower_f=80, upper_f=None)
+    risk = RiskManager(
+        RiskLimits(max_equity_fraction=0.08, max_position_contracts=10_000.0),
+        {"A": contract},
+    )
+
+    decision = risk.evaluate_order(
+        contract=contract,
+        signed_qty_delta=1_000.0,
+        hours_to_settlement=24.0,
+        signal_age=FRESH,
+        edge=0.50,
+        portfolio=PortfolioSnapshot(equity=1_000.0),
+        quote=MarketQuote(
+            instrument_id="ANY",
+            bid=0.40,
+            ask=0.42,
+            bid_size=1_000.0,
+            ask_size=1_000.0,
+            ts_event=NOW,
+        ),
+        quote_age_minutes=0.0,
+    )
+
+    assert decision.allowed is True
+    assert decision.clipped_quantity == pytest.approx(80.0)
