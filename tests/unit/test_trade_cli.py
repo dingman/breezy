@@ -30,7 +30,7 @@ from typing import Any, ClassVar
 
 import pytest
 from nautilus_trader.core.uuid import UUID4
-from nautilus_trader.model.enums import OrderSide, OrderType, TimeInForce
+from nautilus_trader.model.enums import OrderSide, OrderType, TimeInForce, TradingState
 from nautilus_trader.model.events import OrderInitialized
 from nautilus_trader.model.identifiers import (
     ClientOrderId,
@@ -50,7 +50,7 @@ from breezy.adapters.polymarket_us.factories import (
 )
 from breezy.adapters.polymarket_us.safety import MAX_ORDER_NOTIONAL_USD_ENV_VAR
 from breezy.runtime import trade_cli
-from breezy.runtime.backtest_order_guard import NakedShortRefusedError
+from breezy.runtime.backtest_order_guard import ORDER_EVENT_TOPIC, NakedShortRefusedError
 from breezy.runtime.settings import TRADE_TRADER_ID_VAR
 from breezy.runtime.trade_cli import (
     EXIT_CONFIG_ERROR,
@@ -128,6 +128,9 @@ class _FakeGuardCache:
     records a shim entry -- ``None`` unconditionally is correct.
     """
 
+    #: A stand-in for a cached ``Account``. Only its NULLITY is ever read.
+    account: ClassVar[object] = object()
+
     def orders(self, *, instrument_id: InstrumentId | None = None) -> tuple[Any, ...]:
         del instrument_id
         return ()
@@ -135,14 +138,52 @@ class _FakeGuardCache:
     def order(self, client_order_id: ClientOrderId) -> None:
         del client_order_id
 
+    def account_for_venue(self, venue: Venue) -> object | None:
+        """R-7-PRE's addition: the guard asks whether an account is cached.
+
+        Returns a NON-``None`` sentinel by default -- "the account is there" --
+        so every test above keeps measuring what it measured before R-7-PRE
+        existed. ``_FakeAccountlessKernel`` below is the variant that answers
+        ``None``, and it is the only place the halt can fire.
+        """
+        del venue
+        return self.account
+
+
+class _FakeAccountlessGuardCache(_FakeGuardCache):
+    """The cache mid-race: instruments known, no ``AccountState`` yet."""
+
+    def account_for_venue(self, venue: Venue) -> object | None:
+        del venue
+        return None
+
+
+class _FakeRiskEngine:
+    """Stands in for the ONE surface R-7-PRE's guard uses: ``set_trading_state``."""
+
+    def __init__(self) -> None:
+        self.states: list[TradingState] = []
+
+    def set_trading_state(self, state: TradingState) -> None:
+        self.states.append(state)
+
 
 class _FakeKernel:
-    """Stands in for the slice of ``NautilusKernel`` R-6a's guard reads."""
+    """Stands in for the slice of ``NautilusKernel`` R-6a's/R-7-PRE's guards read."""
+
+    cache_type: ClassVar[type[_FakeGuardCache]] = _FakeGuardCache
 
     def __init__(self) -> None:
         self.portfolio = _FakeGuardPortfolio()
-        self.cache = _FakeGuardCache()
+        self.cache = self.cache_type()
         self.msgbus = _FakeMsgBus()
+        self.risk_engine = _FakeRiskEngine()
+
+
+class _FakeAccountlessKernel(_FakeKernel):
+    """A kernel whose cache has no account -- R-7-PRE's hazard, reproduced."""
+
+    cache_type: ClassVar[type[_FakeGuardCache]] = _FakeAccountlessGuardCache
 
 
 class RecordingNode:
@@ -486,6 +527,123 @@ def test_trade_cli_writes_the_refusal_to_stderr_and_latches_it() -> None:
     fault = exec_fault.fatal_exec_fault()
     assert fault is not None
     assert trade_cli._exit_code_for_completed_run(err) == EXIT_RUNTIME_ERROR
+
+
+# ---------------------------------------------------------------------------
+# R-7-PRE: a node whose account never arrived halts itself, end to end
+# ---------------------------------------------------------------------------
+
+
+class AccountlessNode(RecordingNode):
+    """A node mid-race: built and wired, but no ``AccountState`` cached yet."""
+
+    def __init__(self, config: Any) -> None:
+        super().__init__(config)
+        self.kernel = _FakeAccountlessKernel()
+
+
+def test_trade_cli_halts_the_risk_engine_when_no_account_is_cached() -> None:
+    """R-7-PRE, driven through the handler the CLI itself subscribed.
+
+    Nautilus's ``_check_orders_risk_for_account`` returns ``True`` -- order
+    ALLOWED -- while ``cache.account_for_venue(...)`` is ``None``, and Nautilus
+    is immutable, so the denial has to be the native ``TradingState.HALTED``.
+    This asserts the CLI wires the thing that enters that state: a BUY (so
+    R-6a's naked-short rule is not what fires) with no account cached leaves
+    the risk engine HALTED, the operator told, and the run unable to report
+    success.
+    """
+    err = io.StringIO()
+    code = run(env=TRADE_ENV, node_factory=AccountlessNode, stderr=err)
+    assert code == EXIT_OK  # the fake node's own `run()` published nothing
+
+    node = RecordingNode.instances[0]
+    order_handlers = [
+        handler for topic, handler in node.kernel.msgbus.subscriptions if topic == ORDER_EVENT_TOPIC
+    ]
+    assert len(order_handlers) == 2, "R-6a's guard and R-7-PRE's halt, both wired"
+
+    initialized = OrderInitialized(
+        trader_id=TraderId("BREEZYTRADE-001"),
+        strategy_id=StrategyId("EXTERNAL"),
+        instrument_id=_GUARD_TEST_INSTRUMENT,
+        client_order_id=ClientOrderId("O-ACCOUNTLESS-1"),
+        order_side=OrderSide.BUY,
+        order_type=OrderType.MARKET,
+        quantity=Quantity(1, 0),
+        time_in_force=TimeInForce.GTC,
+        post_only=False,
+        reduce_only=False,
+        quote_quantity=False,
+        options={},
+        emulation_trigger=0,
+        trigger_instrument_id=None,
+        contingency_type=0,
+        order_list_id=None,
+        linked_order_ids=None,
+        parent_order_id=None,
+        exec_algorithm_id=None,
+        exec_algorithm_params=None,
+        exec_spawn_id=None,
+        tags=None,
+        event_id=UUID4(),
+        ts_init=0,
+    )
+    for handler in order_handlers:
+        handler(initialized)
+
+    assert node.kernel.risk_engine.states == [TradingState.HALTED]
+    assert "breezy-trade: FATAL account-presence halt" in err.getvalue()
+    fault = exec_fault.fatal_exec_fault()
+    assert fault is not None
+    assert trade_cli._exit_code_for_completed_run(err) == EXIT_RUNTIME_ERROR
+
+
+def test_a_cached_account_leaves_the_risk_engine_active() -> None:
+    """The mitigation is account-CONDITIONAL, not a second blanket refusal.
+
+    Identical event, identical wiring, an account in the cache: the trading
+    state is untouched and the operator is told nothing.
+    """
+    err = io.StringIO()
+    run(env=TRADE_ENV, node_factory=RecordingNode, stderr=err)
+
+    node = RecordingNode.instances[0]
+    order_handlers = [
+        handler for topic, handler in node.kernel.msgbus.subscriptions if topic == ORDER_EVENT_TOPIC
+    ]
+    initialized = OrderInitialized(
+        trader_id=TraderId("BREEZYTRADE-001"),
+        strategy_id=StrategyId("EXTERNAL"),
+        instrument_id=_GUARD_TEST_INSTRUMENT,
+        client_order_id=ClientOrderId("O-ACCOUNTED-1"),
+        order_side=OrderSide.BUY,
+        order_type=OrderType.MARKET,
+        quantity=Quantity(1, 0),
+        time_in_force=TimeInForce.GTC,
+        post_only=False,
+        reduce_only=False,
+        quote_quantity=False,
+        options={},
+        emulation_trigger=0,
+        trigger_instrument_id=None,
+        contingency_type=0,
+        order_list_id=None,
+        linked_order_ids=None,
+        parent_order_id=None,
+        exec_algorithm_id=None,
+        exec_algorithm_params=None,
+        exec_spawn_id=None,
+        tags=None,
+        event_id=UUID4(),
+        ts_init=0,
+    )
+    for handler in order_handlers:
+        handler(initialized)
+
+    assert node.kernel.risk_engine.states == []
+    assert "account-presence halt" not in err.getvalue()
+    assert exec_fault.fatal_exec_fault() is None
 
 
 # ---------------------------------------------------------------------------

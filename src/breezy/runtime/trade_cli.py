@@ -92,6 +92,7 @@ from breezy.adapters.polymarket_us.feed_fault import (
     clear_fatal_feed_fault,
     fatal_feed_fault,
 )
+from breezy.runtime.account_presence_halt import install_account_presence_halt
 from breezy.runtime.backtest_order_guard import install_live_order_guard
 from breezy.runtime.component_health_watch import install_component_degraded_alert
 from breezy.runtime.logging_bridge import install as install_logging_bridge
@@ -224,6 +225,25 @@ def _order_guard_reporter(stderr: TextIO) -> Callable[[ValueError], None]:
     return _report
 
 
+def _account_halt_reporter(stderr: TextIO) -> Callable[[str], None]:
+    """Build the ``on_halt`` callback R-7-PRE's installer requires.
+
+    A halt is not a tidy shutdown, so it gets the same treatment as an
+    order-guard refusal: one line on ``stderr`` at the instant it happens, and
+    the process-scoped exec-fault latch, so the run cannot end in ``EXIT_OK``
+    while the node was refusing every order. ``flush=True`` for the same reason
+    :func:`_order_guard_reporter` uses it -- an exit route must not beat the
+    write.
+    """
+
+    def _report(reason: str) -> None:
+        print(f"breezy-trade: FATAL account-presence halt: {reason}", file=stderr, flush=True)
+        record_fatal_exec_fault(POLYMARKET_US_CLIENT_NAME, reason)
+        logger.error("account-presence halt: %s", reason)
+
+    return _report
+
+
 def _exec_client_refusal_reader(node: Node) -> Callable[[], tuple[str, ...]]:
     """Build the ``reasons`` reader R-6c's degraded-alert subscriber requires.
 
@@ -281,6 +301,18 @@ def _run_node(config: TradingNodeConfig, node_factory: NodeFactory, stderr: Text
     refusal to ``stderr`` and the exec-fault latch AT THE INSTANT it fires,
     then the guard still re-raises -- see that function's own docstring for
     why the latch alone, checked only after the node stops, is not enough.
+
+    R-7-PRE installs :func:`~breezy.runtime.account_presence_halt.
+    install_account_presence_halt` in the SAME idiom, and this call site is
+    load-bearing rather than incidental. Nautilus's
+    ``_check_orders_risk_for_account`` returns ``True`` -- order ALLOWED -- when
+    ``cache.account_for_venue(...)`` is ``None``, and Nautilus is immutable, so
+    the only available denial is the native ``TradingState.HALTED``. Nothing in
+    the framework enters that state on its own; this line is what does.
+    ``tests/contract/test_account_presence_halt_contract.py`` pins it, so R-7
+    -- which gives the execution client's ``_submit_order`` a real body and
+    removes the standing refusal that currently masks the fail-open -- cannot
+    drop it by accident.
     """
     node: Node | None = None
     try:
@@ -302,6 +334,12 @@ def _run_node(config: TradingNodeConfig, node_factory: NodeFactory, stderr: Text
             node.kernel.msgbus,
             component_id=POLYMARKET_US_CLIENT_NAME,
             reasons=_exec_client_refusal_reader(node),
+        )
+        install_account_presence_halt(
+            node.kernel.msgbus,
+            node.kernel.cache,
+            node.kernel.risk_engine,
+            on_halt=_account_halt_reporter(stderr),
         )
         node.run()
         return _exit_code_for_completed_run(stderr)
