@@ -178,39 +178,33 @@ forecast ingest → ~300 station-days → CAPACITY).
 **EXEC SPINE follow-ups:** `docs/plans/EXEC_SPINE_2026-09-01.md` §R-4
 "review amendments". Guard before R-9: divides by zero for an unpriced
 forward; settlement-as-exit bypasses `_submit_order`'s refusal latch.
-**R-4 gate: conditions MET, removal REFUSED (reviewed 2026-09-02).** The
-guard's three bypasses are closed — forged tags (70d68e8), `reduce_only`
-(e83b8e0), both cache-visibility holes (d7c6063, c5818cc). This entry
-previously claimed removal "enables order sends" — **false**: the signer
-permits only GET (`signing.py:84`), no write transport exists in `src/`, and
-R-6.5/R-7 are unlanded. Removal would delete the only DENIAL on the path,
-leaving an order with neither `OrderDenied` nor a send — hanging in-flight
-silently, strictly worse for zero gain. Hold until R-6.5/R-7 land the send in
-the same change, `_cancel_order` gains a real path, and the live guard covers
-BUY (it is SELL-only). Guard also still DORMANT (`strategies=[]`).
+**R-7 preconditions (both verified 2026-09-02).** The R-4 standing refusal
+(`exec/client.py`) stays: no send path exists (signer GET-only, no write
+transport), so removal would delete the only DENIAL, not enable a send. And
+`safety.py assert_live_order_submission_permitted` — the operator-permit
+chokepoint — has ZERO callers, its capability token zero consumers, and B6/B7
+ban wiring it. R-7 must wire both deliberately in one commit, with a consumer
+that requires the authorization. R-6e (`operator_controls.py`) and R-7-PRE
+(`account_presence_halt.py`) landed as zero-call-site libraries the same way.
 
-**[HIGH, NEW] The operator-permit chokepoint has zero callers.**
-`safety.py:668 assert_live_order_submission_permitted` is called nowhere in
-`src/` (only re-exported, `__init__.py:120`), and barrier B6/B7
-(`test_polymarket_us_readonly_guard.py`) BANS it from having one. Permit,
-ceiling and operator gate are asserted but unenforced — whoever lands R-7 must
-wire it and relax B6 deliberately in that commit, or the send path ships with
-no operator gate at all.
+**Blind-risk-view audit, 2026-09-02 — RESOLVED except policy.** T-1..T-5, T-7,
+T-8, T-11 landed (see `docs/core/findings/BLIND_RISK_VIEWS_2026-09-02.md`).
+**Still OPEN:** T-9 exit policy — Grok's verdict: hold to settlement, halt
+entry-only, cancel working buys at met lock, never dump into a 0.3-lot bid
+(`docs/evidence/grok_forecast_family_verdict_2026-09-02.md`); T-6 stale
+node_config docstring; T-10 reversed-arg `hours_until` in scripts/;
+`max_simultaneous_positions` unexercised end-to-end. Residual: Nautilus cannot
+cancel an INITIALIZED order, so cancel/close sequencing is narrowed, not closed.
 
-**[HIGH] Blind-risk-view audit, 2026-09-02 — T-1 was not the only instance.**
-Three sweeps found the same shape elsewhere. Detail, with verified evidence and
-failure sequences: `docs/core/findings/BLIND_RISK_VIEWS_2026-09-02.md`.
-T-2 `_flatten` returns early on a settled-only qty, so a working order is never
-cancelled and fills after the settling observation is public (FIXING).
-T-3 `open_position_count()` is settled-only: 20 positions against a cap of 12.
-T-4 `_equity()` falls back to `starting_equity=10_000.0` and never refreshes —
-no strategy calls `query_account` — so `max_equity_fraction` sizes off a
-constant. T-5 settlement halt sits below `if forecast is None: return`.
-Also inventoried there: the live-trading permit system is wired to nothing, and
-the whole strategy risk surface is backtest-only (`strategies=[]`) — both
-preconditions on go-live, neither a live hole today.
-**Residual under all of it:** Nautilus cannot cancel an INITIALIZED
-order at all, so cancel/close sequencing stays narrowed, not closed.
+**[VERDICT] Forecast family KILLED for live-small (Grok, 2026-09-02).** Under
+honest σ the family has little or no defensible edge at real forecast leads;
+`min_entry_edge=0.06` is an artifact (defensible bar ~0.10-0.12); the live
+strategy prices with a flat cost, not the venue fee, and builds σ without
+`sigma_by_key`; and Breezy ingests NO forecasts, so every backtest was synthetic.
+Not deleted — not a candidate for S-1. **S-1 targets the observation-lock
+family** (`running_extreme_lock`, `cli_settlement_print_lock`), which needs no
+forecast and is what K1 measures. Revive only after: real forecast ingest, σ
+calibrated vs the NWS archive (kill if RMSE > 1.3x σ), and a paper join n≥150.
 
 ---
 
