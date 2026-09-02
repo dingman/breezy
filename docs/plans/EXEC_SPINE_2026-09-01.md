@@ -404,6 +404,40 @@ empty account returns empty-but-non-`None`; a foreign position with no derivable
 
 ### R-5 — Live signing probe (paired barrier) — **VENUE-SPECIFIC** — REWRITTEN
 
+#### R-4 review amendments (2026-09-02)
+
+Closed by the review with no code change (measured, not fixed): the `DurableFillRecord.from_bytes`
+NaN/Infinity decode hole (now routed through `parsing._to_decimal`); FLAT-on-HELD suppression
+end-to-end (`tests/contract/test_exec_client_reconciliation_contract.py::test_a_flat_venue_report_on_a_held_long_is_never_forwarded`);
+the native `_query_order`→`_send_order_status_report` seam, pinned closed; and the balance-after-
+reconciling-a-forward question — **measured correction**: `Portfolio.update_order` never touches the
+balance at all, because Breezy's account carries `calculate_account_state=False` (default, never
+overridden). The venue's published balance is therefore never stale; there is no re-publish hook to
+build.
+
+Follow-ups opened, not built:
+
+- **R-5** — discover whether the venue's `cost` field is net of fees (module docstring invariant 5);
+  a step-2 price is sound for sizing but unverified for PnL truth until this closes.
+- **R-6** — if `calculate_account_state` is ever flipped True for this issuer, the balance-untouched
+  pin (`test_balance_after_reconciling_a_priced_forward_reads_the_real_venue_balance`) will fail; that
+  is the signal to build a post-reconciliation re-publish (`_publish_account_state` again), never a
+  timer/scheduler.
+- **R-6** — `_committed_basis` (`strategy/cli_settlement_print_lock/strategy.py:884`) reads
+  `position.avg_px_open` directly; per invariant 4 that is the NET REMAINING COST BASIS after any
+  partial exit, not the entry print, and it must exclude refused/unattributable positions before R-6
+  narrows the node-global latch.
+- **R-6** — classify transient (429/5xx/timeout at boot) vs durable refusals, so a transport blip is
+  not a restart-only latch.
+- **R-9** — the per-trade return `r_i = realized_pnl/(avg_px_open*qty*multiplier)` (this plan, ~:844)
+  divides by zero for an unpriced forward (`avg_px_open=0`, invariant 3); guard it and exclude from
+  the BCa sample.
+- **R-9** — settlement-as-exit via `_send_order_status_report` bypasses `_submit_order`'s refusal
+  latch entirely (the seam pinned above); R-9 must consult `trading_refusals` itself and never close
+  an unattributable position.
+
+### R-5 — Live signing probe (paired barrier) — **VENUE-SPECIFIC** — REWRITTEN
+
 **Null hypothesis:** signing is unknown. **REFUTED** — `sdk_snapshot/.../auth.py` documents
 `message = f"{timestamp}{method}{path}"`, no body; `client.py:132` uses it for **every** method
 including POST. Residual risk is exactly one live confirmation (OQ-2).

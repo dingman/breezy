@@ -49,7 +49,10 @@ from nautilus_trader.model.instruments import BinaryOption
 from nautilus_trader.model.objects import Quantity
 
 from breezy.adapters.polymarket_us.errors import ExecutionReportMappingError
-from breezy.adapters.polymarket_us.exec.reports import parse_position_status_report
+from breezy.adapters.polymarket_us.exec.reports import (
+    derive_position_cost_basis,
+    parse_position_status_report,
+)
 from tests.unit.polymarket_us_exec_shapes import (
     ACCOUNT_ID,
     REPORT_ID,
@@ -332,3 +335,70 @@ def test_a_malformed_position_timestamp_stays_inside_the_mapping_taxonomy(
             report_id=REPORT_ID,
             ts_init=TS_INIT,
         )
+
+
+
+# ---------------------------------------------------------------------------
+# `derive_position_cost_basis` -- the SECOND source of `avg_px_open`, sound
+# only while `qtySold == 0`
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("mutation", "reason"),
+    [
+        (lambda p: p.pop("qtySold"), "missing qtySold"),
+        (lambda p: p.pop("qtyBought"), "missing qtyBought"),
+        (lambda p: p.pop("cost"), "missing cost"),
+        (lambda p: p.__setitem__("qtySold", "1"), "qtySold != 0"),
+        (lambda p: p.__setitem__("qtyBought", "0"), "qtyBought == 0"),
+        (lambda p: p.__setitem__("qtyBought", "-1"), "qtyBought < 0"),
+        (
+            lambda p: p.__setitem__("cost", {"value": "0", "currency": "USD"}),
+            "cost == 0",
+        ),
+        (
+            lambda p: p.__setitem__("cost", {"value": "-2.08", "currency": "USD"}),
+            "cost < 0",
+        ),
+    ],
+    ids=[
+        "missing-qtySold",
+        "missing-qtyBought",
+        "missing-cost",
+        "qtySold-nonzero",
+        "qtyBought-zero",
+        "qtyBought-negative",
+        "cost-zero",
+        "cost-negative",
+    ],
+)
+def test_derive_position_cost_basis_refuses_by_returning_none(
+    position: dict[str, Any],
+    mutation: Any,
+    reason: str,
+) -> None:
+    """Every condition that makes `cost / qtyBought` unsound returns `None`,
+    never an exception and never a best-effort number. `None` is the caller's
+    signal to forward the position UNPRICED plus a refusal -- an exception
+    here would instead escape to `generate_mass_status`'s outer handler and
+    (before EXEC_SPINE R-4's review fix) drop every OTHER position too."""
+    payload = dict(position)
+    mutation(payload)
+
+    assert derive_position_cost_basis(payload) is None, reason
+
+
+def test_derive_position_cost_basis_happy_path_is_cost_over_qty_bought(
+    position: dict[str, Any],
+) -> None:
+    """`qtySold == 0` removes the netting ambiguity: `cost / qtyBought` is the
+    entry price under either reading of what `cost` nets."""
+    payload = {
+        **position,
+        "qtySold": "0",
+        "qtyBought": "4",
+        "cost": {"value": "2.08", "currency": "USD"},
+    }
+
+    assert derive_position_cost_basis(payload) == Decimal("2.08") / Decimal(4)

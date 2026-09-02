@@ -712,24 +712,97 @@ def test_b5_scan_covers_tests_as_well_as_src_and_scripts() -> None:
 # ==========================================================================
 
 
-def test_adapter_package_defines_no_live_execution_client() -> None:
+#: The execution-client surface this slice is allowed to contain, as an exact
+#: MAP from path to the class it may define -- never a path allowlist.
+#:
+#: NARROWED BY EXEC_SPINE R-4, and the narrowing is the whole point of the
+#: increment: R-4 IS the live execution client, so a rule reading "no live
+#: execution client exists" could not survive it and stating otherwise would
+#: be a lie about shipped code. What replaces it is strictly more specific --
+#: an equality on (path, class name), so a SECOND client, a client at another
+#: path, or a factory anywhere still fails, and the module that is permitted
+#: is named rather than merely counted.
+#:
+#: Its inertness is not asserted here. It is enforced next door by E0-NOSEND
+#: (``test_execution_egress_firewall_guard.py``), which refuses an ``await``
+#: inside any of the six order coroutines under ``exec/`` -- the mechanical
+#: form of "no order may become sendable".
+PERMITTED_EXECUTION_CLIENTS: Mapping[str, str] = MappingProxyType(
+    {
+        "src/breezy/adapters/polymarket_us/exec/client.py": "PolymarketUSExecutionClient",
+    },
+)
+
+
+def find_execution_client_definitions(path: str, source: str) -> list[Violation]:
+    """Every live-execution-client definition or import in one module."""
     banned = {"LiveExecutionClient", "LiveExecClientFactory", "LiveExecutionClientFactory"}
-    offenders: list[Violation] = []
+    found: list[Violation] = []
+    tree = ast.parse(source, filename=path)
+    for node in ast.walk(tree):
+        if isinstance(node, ast.ClassDef):
+            for base in node.bases:
+                name = base.attr if isinstance(base, ast.Attribute) else getattr(base, "id", "")
+                if name in banned:
+                    found.append(Violation(path, node.lineno, "NG", f"{node.name}({name})"))
+        elif isinstance(node, ast.ImportFrom) and node.module:
+            for alias in node.names:
+                if alias.name in banned:
+                    found.append(Violation(path, node.lineno, "NG", f"imports {alias.name}"))
+    return found
+
+
+def test_the_slice_defines_exactly_the_permitted_execution_clients() -> None:
+    """An EQUALITY on (path, class), not a count and not a path allowlist."""
+    found: dict[str, list[str]] = {}
     for path, source in iter_python_sources(("src", "scripts")):
-        tree = ast.parse(source, filename=path)
-        for node in ast.walk(tree):
-            if isinstance(node, ast.ClassDef):
-                for base in node.bases:
-                    name = base.attr if isinstance(base, ast.Attribute) else getattr(base, "id", "")
-                    if name in banned:
-                        offenders.append(Violation(path, node.lineno, "NG", f"{node.name}({name})"))
-            elif isinstance(node, ast.ImportFrom) and node.module:
-                for alias in node.names:
-                    if alias.name in banned:
-                        offenders.append(
-                            Violation(path, node.lineno, "NG", f"imports {alias.name}")
-                        )
-    assert offenders == [], "execution-client violations:\n" + "\n".join(str(o) for o in offenders)
+        for violation in find_execution_client_definitions(path, source):
+            found.setdefault(path, []).append(violation.detail)
+
+    assert set(found) == set(PERMITTED_EXECUTION_CLIENTS), (
+        "execution-client surface changed:\n"
+        + "\n".join(f"{p}: {d}" for p, d in sorted(found.items()))
+    )
+    for path, details in found.items():
+        expected = PERMITTED_EXECUTION_CLIENTS[path]
+        # Sorted, because `ast.walk` is breadth-first and the ORDER of the
+        # import and the class definition is not the property under test.
+        assert sorted(details) == sorted(
+            [
+                f"{expected}(LiveExecutionClient)",
+                "imports LiveExecutionClient",
+            ],
+        ), details
+
+
+def test_the_execution_client_rule_detects_a_second_client() -> None:
+    """Non-vacuity: the shape a bypass would arrive in is a NEW module."""
+    source = (
+        "from nautilus_trader.live.execution_client import LiveExecutionClient\n"
+        "\n"
+        "\n"
+        "class ShadowExecutionClient(LiveExecutionClient):\n"
+        "    pass\n"
+    )
+    found = find_execution_client_definitions("src/breezy/runtime/shadow.py", source)
+    assert [v.rule for v in found] == ["NG", "NG"]
+    assert "src/breezy/runtime/shadow.py" not in PERMITTED_EXECUTION_CLIENTS
+
+
+def test_the_execution_client_rule_detects_a_factory_anywhere() -> None:
+    """Factories stay banned outright -- R-4 wires no client into a node."""
+    source = (
+        "from nautilus_trader.live.factories import LiveExecClientFactory\n"
+        "\n"
+        "\n"
+        "class PolymarketUSExecClientFactory(LiveExecClientFactory):\n"
+        "    pass\n"
+    )
+    found = find_execution_client_definitions(
+        "src/breezy/adapters/polymarket_us/exec/client.py",
+        source,
+    )
+    assert [v.rule for v in found] == ["NG", "NG"]
 
 
 #: The planted caller B6's non-vacuity proof uses. An order path, in source.

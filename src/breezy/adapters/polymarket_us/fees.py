@@ -49,7 +49,7 @@ from breezy.adapters.polymarket_us.parsing import (
     assert_fee_schedule_known,
 )
 
-__all__ = ["PolymarketUSFeeModel"]
+__all__ = ["PolymarketUSFeeModel", "polymarket_us_fee"]
 
 _ZERO = Decimal(0)
 _ONE = Decimal(1)
@@ -172,19 +172,7 @@ class PolymarketUSFeeModel(FeeModel):  # type: ignore[misc]
         if side == LiquiditySide.MAKER:
             self._refuse_or_warn_on_maker(order, instrument)
 
-        theta = _fee_coefficient(instrument)
-
-        price = fill_px.as_decimal()
-        if price < _ZERO or price > _ONE:
-            # Outside [0, 1] the p*(1-p) term turns NEGATIVE and would pay us
-            # a rebate. Refuse rather than manufacture income from a bad tick.
-            raise ValueError(
-                f"Fill price {price} is outside the binary-option range [0, 1]; "
-                f"refusing to compute a Polymarket.us fee for {instrument.id}"
-            )
-
-        exact = theta * fill_qty.as_decimal() * price * (_ONE - price)
-        return Money(_round_bankers(exact, instrument.quote_currency), instrument.quote_currency)
+        return polymarket_us_fee(instrument, fill_qty, fill_px)
 
     @staticmethod
     def _refuse_or_warn_on_maker(order: Order, instrument: Instrument) -> None:
@@ -207,6 +195,48 @@ class PolymarketUSFeeModel(FeeModel):  # type: ignore[misc]
                 "treatment before enabling this path."
             )
         warnings.warn(_MAKER_SIGN_WARNING, UserWarning, stacklevel=3)
+
+
+def polymarket_us_fee(instrument: Instrument, quantity: Quantity, price: Price) -> Money:
+    """Return ``theta * C * p * (1 - p)`` for ``instrument``, banker's-rounded.
+
+    The venue's fee arithmetic, with no liquidity-side opinion of its own --
+    that judgement belongs to the caller, because the two callers make it
+    differently and for different reasons:
+
+    * :meth:`PolymarketUSFeeModel.get_commission` has an ``Order`` and can
+      distinguish post-only (maker-only) INTENT from an incidental maker fill;
+    * ``PolymarketUSExecutionClient.calculate_commission``
+      (``execution/client.pyx:165``, the native reconciliation extension point)
+      has only a ``LiquiditySide`` and refuses MAKER outright, because Breezy
+      is taker-only and R-3 already refuses maker fills at the mapper.
+
+    Extracted so those two share ONE implementation of the fee. A second copy
+    in the execution client is how the reconciled fee and the modelled fee
+    drift apart, and the whole reason ``assert_fee_schedule_known`` exists is
+    that a fee nobody can point at becomes an implied zero.
+
+    Raises
+    ------
+    FeeScheduleUnknownError
+        If this market's ``theta`` is absent or unusable. Never defaulted --
+        an unknown schedule refuses; it does not trade free.
+    ValueError
+        If ``price`` is outside ``[0, 1]``.
+    """
+    theta = _fee_coefficient(instrument)
+
+    fill_price = price.as_decimal()
+    if fill_price < _ZERO or fill_price > _ONE:
+        # Outside [0, 1] the p*(1-p) term turns NEGATIVE and would pay us
+        # a rebate. Refuse rather than manufacture income from a bad tick.
+        raise ValueError(
+            f"Fill price {fill_price} is outside the binary-option range [0, 1]; "
+            f"refusing to compute a Polymarket.us fee for {instrument.id}"
+        )
+
+    exact = theta * quantity.as_decimal() * fill_price * (_ONE - fill_price)
+    return Money(_round_bankers(exact, instrument.quote_currency), instrument.quote_currency)
 
 
 def _fee_coefficient(instrument: Instrument) -> Decimal:

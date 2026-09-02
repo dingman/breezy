@@ -273,6 +273,260 @@ CAGE_RULE_PINS: tuple[RulePin, ...] = (
     ),
     RulePin(
         module="firewall",
+        attr="EXEC_ASYNC_LIFECYCLE_MODULES",
+        expected=frozenset({"src/breezy/adapters/polymarket_us/exec/client.py"}),
+        widened=frozenset(
+            {
+                "src/breezy/adapters/polymarket_us/exec/client.py",
+                "src/breezy/adapters/polymarket_us/exec/transport.py",
+            }
+        ),
+        narrowed=frozenset(),
+        why="R-4's E0-INERT NARROWING, and the single most dangerous constant "
+        "added by that increment: every path listed here is exempt from the "
+        "async ban. The WIDENED neighbour is the real hazard -- one extra "
+        "entry silently exempts a second module, which is how a send path "
+        "would arrive. (Narrowing it to empty only re-arms the ban and would "
+        "fail the shipped client's own tests, which is why it is the safe "
+        "direction and still pinned.)",
+    ),
+    RulePin(
+        module="firewall",
+        attr="EXEC_PERMITTED_COROUTINE_NAMES",
+        expected=frozenset(
+            {
+                "_connect",
+                "_disconnect",
+                "_query_account",
+                "_query_order",
+                "_submit_order",
+                "_submit_order_list",
+                "_modify_order",
+                "_cancel_order",
+                "_cancel_all_orders",
+                "_batch_cancel_orders",
+                "generate_order_status_report",
+                "generate_order_status_reports",
+                "generate_fill_reports",
+                "generate_position_status_reports",
+                "generate_mass_status",
+                "_publish_account_state",
+                "_wait_for_instruments",
+                "_confirm_account_registered",
+                "__call__",
+            }
+        ),
+        widened=frozenset(
+            {
+                "_connect",
+                "_disconnect",
+                "_query_account",
+                "_query_order",
+                "_submit_order",
+                "_submit_order_list",
+                "_modify_order",
+                "_cancel_order",
+                "_cancel_all_orders",
+                "_batch_cancel_orders",
+                "generate_order_status_report",
+                "generate_order_status_reports",
+                "generate_fill_reports",
+                "generate_position_status_reports",
+                "generate_mass_status",
+                "_publish_account_state",
+                "_wait_for_instruments",
+                "_confirm_account_registered",
+                "__call__",
+                "_send_signed_request",
+            }
+        ),
+        narrowed=frozenset({"_connect", "_disconnect"}),
+        why="R-4 strengthening 1: the coroutine INVENTORY of an async-permitted "
+        "module. The widened neighbour is a plausible send coroutine, which is "
+        "exactly what this set exists to make un-addable in silence",
+    ),
+    RulePin(
+        module="firewall",
+        attr="BANNED_EXEC_TRANSPORT_MODULES",
+        expected=frozenset(
+            {
+                "breezy.adapters.polymarket_us.data",
+                "breezy.adapters.polymarket_us.http",
+                "breezy.adapters.polymarket_us.websocket",
+                "breezy.ingest.http",
+                "breezy.ingest.probe_transport",
+                "breezy.runtime.health",
+            }
+        ),
+        widened=frozenset(
+            {
+                "breezy.adapters.polymarket_us.data",
+                "breezy.adapters.polymarket_us.http",
+                "breezy.adapters.polymarket_us.websocket",
+                "breezy.ingest.http",
+                "breezy.ingest.probe_transport",
+                "breezy.runtime.health",
+                "breezy.runtime.quote_tape_cli",
+            }
+        ),
+        narrowed=frozenset(
+            {
+                "breezy.adapters.polymarket_us.data",
+                "breezy.adapters.polymarket_us.websocket",
+                "breezy.ingest.http",
+                "breezy.ingest.probe_transport",
+                "breezy.runtime.health",
+            }
+        ),
+        why="R-4 strengthening 2: the Breezy modules that own a socket. The "
+        "narrowed neighbour drops `http`, which is the SHORTEST route from "
+        "under exec/ to an authenticated request",
+    ),
+    RulePin(
+        module="firewall",
+        attr="BANNED_EXEC_TRANSPORT_NAMES",
+        expected=frozenset(
+            {
+                "MarketsFeed",
+                "NautilusHttpTransport",
+                "PolymarketUSDataClient",
+                "PolymarketUSHttpClient",
+                "PolymarketUSMarketsWebSocketPool",
+                "WebhookAlertSink",
+            }
+        ),
+        widened=frozenset(
+            {
+                "MarketsFeed",
+                "NautilusHttpTransport",
+                "PolymarketUSDataClient",
+                "PolymarketUSHttpClient",
+                "PolymarketUSMarketsWebSocketPool",
+                "WebhookAlertSink",
+                "LoggingAlertSink",
+            }
+        ),
+        narrowed=frozenset(
+            {
+                "MarketsFeed",
+                "PolymarketUSDataClient",
+                "PolymarketUSHttpClient",
+                "PolymarketUSMarketsWebSocketPool",
+                "WebhookAlertSink",
+            }
+        ),
+        why="R-4 strengthening 2, by NAME: the module ban cannot reach "
+        "`transport.NautilusHttpTransport`, because `transport` is not banned "
+        "wholesale (exec/endpoints.py imports a quota-key constant from it)",
+    ),
+    RulePin(
+        module="firewall",
+        attr="ORDER_LIFECYCLE_COROUTINES",
+        expected=frozenset(
+            {
+                "_submit_order",
+                "_submit_order_list",
+                "_modify_order",
+                "_cancel_order",
+                "_cancel_all_orders",
+                "_batch_cancel_orders",
+            }
+        ),
+        widened=frozenset(
+            {
+                "_submit_order",
+                "_submit_order_list",
+                "_modify_order",
+                "_cancel_order",
+                "_cancel_all_orders",
+                "_batch_cancel_orders",
+                "_place_order",
+            }
+        ),
+        narrowed=frozenset(
+            {
+                "_submit_order_list",
+                "_modify_order",
+                "_cancel_order",
+                "_cancel_all_orders",
+                "_batch_cancel_orders",
+            }
+        ),
+        why="R-4 strengthening 3 (E0-NOSEND): the coroutines that may not "
+        "await. The narrowed neighbour drops `_submit_order` -- the ONE that "
+        "sends an order -- and nothing else in the suite would have noticed",
+    ),
+    RulePin(
+        module="firewall",
+        attr="EXEC_ORDER_COROUTINE_PERMITTED_CALLEES",
+        expected=frozenset(
+            {
+                "self._log.error",
+                "self._log.warning",
+                "self.generate_order_denied",
+                "self.generate_order_cancel_rejected",
+                "self._cache.account_for_venue",
+                "self._clock.timestamp_ns",
+                "self._unsupported",
+                "NotImplementedError",
+            }
+        ),
+        widened=frozenset(
+            {
+                "self._log.error",
+                "self._log.warning",
+                "self.generate_order_denied",
+                "self.generate_order_cancel_rejected",
+                "self._cache.account_for_venue",
+                "self._clock.timestamp_ns",
+                "self._unsupported",
+                "NotImplementedError",
+                "self.create_task",
+            }
+        ),
+        narrowed=frozenset({"self._log.error"}),
+        why="E0-NOSEND's allowlist: what an order coroutine may CALL. The "
+        "widened neighbour adds `self.create_task`, which is the NATIVE "
+        "mechanism `live/execution_client.py:246-256` drives the lifecycle "
+        "with -- one line, no `await`, and the order is on the wire",
+    ),
+    RulePin(
+        module="firewall",
+        attr="EXEC_DECLARED_UNIMPLEMENTED_COROUTINES",
+        expected=frozenset({"_query_order"}),
+        widened=frozenset({"_query_order", "_query_account"}),
+        narrowed=frozenset(),
+        why="the escape hatch that lets the coroutine INVENTORY be an equality "
+        "rather than a subset. The widened neighbour parks `_query_account` in "
+        "it -- the method `live/execution_client.py:332` calls with nothing "
+        "defining it in the base -- which is how a deletion would pass. "
+        "`_query_order` (the only member actually pinned) is a DIFFERENT "
+        "fate from `_query_account`: the base defines a real method that "
+        "runs unmodified and can call `_send_order_status_report` on a "
+        "non-None report -- 'unimplemented' here means the native default "
+        "runs, never that the coroutine raises AttributeError",
+    ),
+    RulePin(
+        module="readonly",
+        attr="PERMITTED_EXECUTION_CLIENTS",
+        expected=MappingProxyType(
+            {
+                "src/breezy/adapters/polymarket_us/exec/client.py": ("PolymarketUSExecutionClient"),
+            }
+        ),
+        widened=MappingProxyType(
+            {
+                "src/breezy/adapters/polymarket_us/exec/client.py": ("PolymarketUSExecutionClient"),
+                "src/breezy/runtime/shadow.py": "ShadowExecutionClient",
+            }
+        ),
+        narrowed=MappingProxyType({}),
+        why="R-4 narrowed 'this slice defines NO execution client' into an "
+        "equality on (path, class). The widened neighbour is a second client "
+        "at another path, which is the shape a bypass takes",
+    ),
+    RulePin(
+        module="firewall",
         attr="_EGRESS_MODULE_BASENAMES",
         expected=frozenset(
             {
@@ -496,6 +750,18 @@ def test_the_pin_table_covers_every_rule_constant_the_plan_names() -> None:
         "firewall.BANNED_NATIVE_NAMES",
         "firewall.BANNED_EXEC_DIRECTION_TOKENS",
         "firewall.NETWORK_IMPORT_PREFIXES",
+        # EXEC_SPINE R-4: one narrowing constant and four that pay for it.
+        # Pinning one's own new rules is the same counter applied to one's own
+        # work -- and the narrowing constant in particular is the single line
+        # that could exempt a future module from the async ban.
+        "firewall.EXEC_ASYNC_LIFECYCLE_MODULES",
+        "firewall.EXEC_PERMITTED_COROUTINE_NAMES",
+        "firewall.BANNED_EXEC_TRANSPORT_MODULES",
+        "firewall.BANNED_EXEC_TRANSPORT_NAMES",
+        "firewall.ORDER_LIFECYCLE_COROUTINES",
+        "firewall.EXEC_ORDER_COROUTINE_PERMITTED_CALLEES",
+        "firewall.EXEC_DECLARED_UNIMPLEMENTED_COROUTINES",
+        "readonly.PERMITTED_EXECUTION_CLIENTS",
     }
     assert plans_nine <= pinned, f"unpinned: {sorted(plans_nine - pinned)}"
     assert pinned == plans_nine | added_with_a_reason

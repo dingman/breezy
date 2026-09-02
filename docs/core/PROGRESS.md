@@ -36,10 +36,8 @@ Two consequences that are not optional (tracked by P4):
 
 ## Standing verdicts that gate future work
 
-- **Backtest ROI base: BL-17 resolved, not a code bug.** The `...T174940`
-  report came from a script inode that no longer exists; all 12 others base on
-  $10,000. Real-provenance ROI is **-0.054%**, not -5.41%.
-  `docs/evidence/backtest_roi_measurement_2026-08-31.md`.
+- **Backtest ROI base:** real-provenance ROI is **-0.054%**, not -5.41%
+  (BL-17 closed). `docs/evidence/backtest_roi_measurement_2026-08-31.md`.
 
 - **G-02 — ROI feasibility: NO-GO** on committing to the downstream adapter /
   settlement / execution build (~$3–15/day net per 100 contracts per city-day).
@@ -56,14 +54,12 @@ Two consequences that are not optional (tracked by P4):
   ladder is liquid; only the winning rung is unoffered. Do not design a fourth.
 - **Historical forecasts exist but are NON-CONTIGUOUS.**
   `previous-runs-api.open-meteo.com/v1/forecast` yields **2022-01..2023-12 plus
-  the present, hole between** (2024-01-01 = 0/168, every model). "Back to 2019"
-  was a 200-OK-with-no-datum misread (L-8 amendment); below 2022 was never
-  probed. Publication-lag and restatement captured.
-  `docs/evidence/open_meteo_previous_runs_probe_2026-08-31T005848Z/`. IEM AFOS
-  forecast PIL is reachable but FAILS its pre-registered bar (parse rate 0.5125
-  vs >=0.9; issuance/office attribution 238/240). **But a forecast archive
-  yields a CALIBRATION dataset, not a backtest** — a backtest also needs prices,
-  and those are forward-only (next line). Both probe reports say so explicitly.
+  the present, hole between** (2024-01-01 = 0/168, every model); below 2022 was
+  never probed. `docs/evidence/open_meteo_previous_runs_probe_2026-08-31T005848Z/`.
+  IEM AFOS forecast PIL is reachable but FAILS its pre-registered bar (parse rate
+  0.5125 vs >=0.9; attribution 238/240). **A forecast archive yields a
+  CALIBRATION dataset, not a backtest** — a backtest also needs prices, and those
+  are forward-only (next line).
 - **Price history genuinely is forward-only.** No public trade tape; expired
   markets return null prices keeping only `settlementPx`.
 - **There is no NO-side instrument, and there cannot be one** (BL-6). NO is a
@@ -74,12 +70,10 @@ Two consequences that are not optional (tracked by P4):
 - **The stale-quote gate is wired but unreachable for two of three strategies.**
   `evaluate_order` refuses `shorts_disabled` before calling `quote_tradable`
   (`risk.py:296-306`), and two strategies emit only shorts. BL-1's fix is proven
-  by unit test, NOT by backtest (fills unchanged 24 -> 24, all
-  `forecast_mispricing`). Live only once shorts are expressible.
-- **The `naive`/`realistic` conditions are NOT redundant** (BL-4, reversed
-  2026-08-31). `forecast_revision` naive refuses nothing; realistic refuses 860
-  `shorts_disabled`. "Never signalled" is not "signalled 860 times, all
-  refused." Both stay.
+  by unit test, NOT by backtest. Live only once shorts are expressible.
+- **The `naive`/`realistic` conditions are NOT redundant** (BL-4).
+  `forecast_revision` naive refuses nothing; realistic refuses 860
+  `shorts_disabled`. Both stay.
 
 ---
 
@@ -96,8 +90,7 @@ backtest — no `Data` subclass, no catalog wiring, no client. Plan (unreviewed)
 `docs/plans/intraday_observation_ingest_2026-09-01.md` — peer-reviewed
 2026-09-01: RESUME WITH AMENDMENTS (re-anchor off the dead lock predicate;
 demote I-4; `build_running_max_days` at `pmr_climatology_study.py:351` is an
-EXISTING untested fold to PORT, not author). Two barrier traps it found are
-recorded as L-12 in `docs/core/LESSONS.md`.
+EXISTING untested fold to PORT, not author).
 
 ### [MED] BL-14 — `RefusalAlerter` alerts on `SHORTS_DISABLED` only
 
@@ -157,10 +150,9 @@ either count it under the same bounded key set or document why not.
 ### Programme sequence (carried forward from 2026-08-30)
 
 - **P1** — harden then supervise the quote tape; prices are the one
-  irreplaceable stream. Exit-status and fail-closed supervision LANDED
-  (79b9b44); the feather question is ANSWERED — see BL-23, which is the
-  remaining P1 work. Still untested end-to-end: the native shutdown joint
-  (`kernel.py:585` + `:613-638`) is confirmed by source, not by a live-node run.
+  irreplaceable stream. BL-23 is the remaining P1 work. Still untested end to
+  end: the native shutdown joint (`kernel.py:585` + `:613-638`) is confirmed by
+  source, not by a live-node run.
 - **P2/P3** — forecast probes then ingestion. Breezy ingests **no forecast data
   at all**, so every forecast-strategy ROI is inadmissible. DEPRIORITISED; the
   observation family needs no forecast. See item (5) below.
@@ -171,11 +163,9 @@ either count it under the same bounded key set or document why not.
 
 ### Blocked, with unlock condition
 
-**Venue access is NO LONGER GATED** (operator, 2026-09-01). G-12/G-13/G-15 are
-released; the remaining blockers are technical, not permission.
-
-G-12 (resolve `MARKET_SLUG_KEY` live) and G-15 (fee schedule discovery) are now
-plain work items, no longer blocked. Still blocked:
+**Venue access is NO LONGER GATED** (operator, 2026-09-01): G-12 (resolve
+`MARKET_SLUG_KEY` live), G-13 and G-15 (fee schedule discovery) are plain work
+items now. The remaining blockers are technical, not permission:
 
 | ID | Item | Unlock |
 |---|---|---|
@@ -198,16 +188,18 @@ captured (09-01) and enter the population once their CLI goes FINAL — missing 
 elapsed time, not code. Viable at ask<=0.03 in ~20d / <=0.05 in ~9d; the 0.01
 tick needs ~359d, so no plan may wait on it. Re-runs daily, unattended; (3) capture supervised to 2026-10-01 (D+1 book exists only if the recorder
 runs before local midnight); (4) execute the EXEC SPINE R-1..R-9
-(`docs/plans/EXEC_SPINE_2026-09-01.md`). **R-1/R-2/R-3 LANDED** (2788d11, 4787
-green). R-3's first green build hid a CRITICAL -- `avgPx` bypassed the price
-guard and Nautilus books it via `make_price`, accepting 1.35 on a 0/1 binary;
-caught by review, not by the gate — R-4 publishes the first
-AccountState
-and is what de-inerts every Nautilus cap (`risk/engine.pyx:682-692` returns True
-with no account); (5) forecast ingest (`docs/plans/forecast_ingest_2026-09-01.md`)
+(`docs/plans/EXEC_SPINE_2026-09-01.md`). **R-1/R-2/R-3 LANDED** (2788d11).
+R-4 publishes the first AccountState and is what de-inerts every Nautilus cap
+(`risk/engine.pyx:682-692` returns True with no account); (5) forecast ingest (`docs/plans/forecast_ingest_2026-09-01.md`)
 HELD until K1 reports; (6) accumulate ~300 station-days; (7) settle CAPACITY.
 Backtest stays frozen in the REFUTATION + plumbing role: offer survival is a
 counterfactual about the venue's reaction to OUR order, recorded nowhere.
+
+**EXEC SPINE follow-ups (R-4 + its 2026-09-02 review):** see
+`docs/plans/EXEC_SPINE_2026-09-01.md` §R-4 "review amendments". Most
+dangerous: R-9's per-trade return divides by zero for an unpriced forward and
+settlement-as-exit bypasses `_submit_order`'s refusal latch — both must be
+guarded before R-9 lands.
 
 ---
 
@@ -217,7 +209,3 @@ Durable rules `docs/core/LESSONS.md` (L-1..L-12, all binding) · evidence
 `docs/evidence/` · live plan `docs/plans/EXEC_SPINE_2026-09-01.md` · runbook
 `docs/core/RUNBOOK_NWS_COLLECTION.md` · strategy authoring
 `docs/specs/STRATEGY_QUICKSTART.md` · pre-shrink history `docs/core/archive/`
-
-**Docs purge 2026-09-01.** 36 docs moved to the three `archive/` dirs (each has
-a README listing the stale claims inside); citations repointed; 1 file deleted;
-**zero bytes deleted from `docs/evidence/`**. Nothing in `archive/` is live.

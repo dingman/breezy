@@ -44,7 +44,7 @@ EXEC_DIR: Final[Path] = (
     REPO_ROOT / "src" / "breezy" / "adapters" / "polymarket_us" / "exec"
 )
 
-EXEC_MODULES: Final[tuple[str, ...]] = ("endpoints.py", "reports.py")
+EXEC_MODULES: Final[tuple[str, ...]] = ("client.py", "endpoints.py", "reports.py")
 
 TS_INIT: Final[int] = 1_787_617_213_000_000_000
 TS_EVENT_TEXT: Final[str] = "2026-08-25T00:19:48.120237895Z"
@@ -59,6 +59,20 @@ def build_instrument() -> BinaryOption:
     """The instrument every exec suite maps onto, from a real captured market."""
     market: dict[str, Any] = json.loads(
         (RAW / "market_open_510636_by_slug.json").read_text(encoding="utf-8")
+    )
+    return parse_binary_option(market, venue=POLYMARKET_US_VENUE, ts_init=TS_INIT)
+
+
+def build_second_instrument() -> BinaryOption:
+    """A SECOND, distinct instrument from a different captured market.
+
+    Exists so a suite proving instrument-A-isolation (a corrupt record, a
+    malformed payload) does not have to fabricate a synthetic slug: this is a
+    real captured market, parsed the same way, with an ``InstrumentId``
+    guaranteed distinct from :func:`build_instrument`'s.
+    """
+    market: dict[str, Any] = json.loads(
+        (RAW / "market_closed_15806_by_slug.json").read_text(encoding="utf-8")
     )
     return parse_binary_option(market, venue=POLYMARKET_US_VENUE, ts_init=TS_INIT)
 

@@ -501,14 +501,21 @@ def test_the_unguarded_reconciliation_realizes_exactly_zero(rig: _Rig) -> None:
 @pytest.mark.xfail(
     strict=True,
     reason=(
-        "RED for EXEC_SPINE R-9. Nothing in Breezy yet supplies an NWS-keyed "
-        "settlement price to the reconciliation path -- "
-        "`src/breezy/adapters/polymarket_us/exec/` is empty, so there is no "
-        "`_send_order_status_report` seam and no `SettlementExitActor`. The "
-        "assertions below are at FULL strength and are NOT to be weakened. "
-        "`strict=True` means this file goes RED the moment R-9's guard lands: "
-        "an XPASS fails the suite, forcing the marker off. That is the "
-        "intended signal, not a regression."
+        "RED for EXEC_SPINE R-9, STILL. R-4 landed "
+        "`src/breezy/adapters/polymarket_us/exec/client.py`, so the module is "
+        "no longer empty and the `_send_order_status_report` seam IS "
+        "reachable -- it is the native `_query_order` path, CALLED (not "
+        "absent) at `live/execution_client.py:516-532`, closed only because "
+        "this client's own `generate_order_status_report` always returns "
+        "`None` (pinned by "
+        "`tests/unit/test_polymarket_us_exec_client.py::"
+        "test_native_query_order_never_reaches_the_send_seam`). What is still "
+        "genuinely missing is R-9's OWN guard: nothing yet supplies an "
+        "NWS-keyed settlement price to that seam, and no `SettlementExitActor` "
+        "exists to drive it. The assertions below are at FULL strength and "
+        "are NOT to be weakened. `strict=True` means this file goes RED the "
+        "moment R-9's guard lands: an XPASS fails the suite, forcing the "
+        "marker off. That is the intended signal, not a regression."
     ),
 )
 def test_reconciliation_fallback_price_is_never_booked(rig: _Rig) -> None:

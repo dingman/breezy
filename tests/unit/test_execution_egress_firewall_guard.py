@@ -704,6 +704,18 @@ def test_n2_the_shipped_tree_has_exactly_the_expected_execution_egress_modules()
     found = [(v.path, v.rule) for v in find_execution_egress_modules()]
     assert found == [
         ("src/breezy/adapters/polymarket_us/exec/__init__.py", "E0"),
+        ("src/breezy/adapters/polymarket_us/exec/client.py", "E0"),
+        # R-4's client is the first module here that E2 and E3 can SEE: it
+        # subclasses `LiveExecutionClient` and defines all six order
+        # coroutines. Six E3 rows, one per coroutine -- the COUNT is part of
+        # the pin, so a seventh order verb cannot appear silently.
+        ("src/breezy/adapters/polymarket_us/exec/client.py", "E2"),
+        ("src/breezy/adapters/polymarket_us/exec/client.py", "E3"),
+        ("src/breezy/adapters/polymarket_us/exec/client.py", "E3"),
+        ("src/breezy/adapters/polymarket_us/exec/client.py", "E3"),
+        ("src/breezy/adapters/polymarket_us/exec/client.py", "E3"),
+        ("src/breezy/adapters/polymarket_us/exec/client.py", "E3"),
+        ("src/breezy/adapters/polymarket_us/exec/client.py", "E3"),
         ("src/breezy/adapters/polymarket_us/exec/endpoints.py", "E0"),
         ("src/breezy/adapters/polymarket_us/exec/reports.py", "E0"),
     ]
@@ -1439,6 +1451,7 @@ def test_x3_the_live_scan_actually_reaches_the_exec_package() -> None:
     }
     assert scanned == {
         "src/breezy/adapters/polymarket_us/exec/__init__.py",
+        "src/breezy/adapters/polymarket_us/exec/client.py",
         "src/breezy/adapters/polymarket_us/exec/endpoints.py",
         "src/breezy/adapters/polymarket_us/exec/reports.py",
     }
@@ -1539,23 +1552,321 @@ NETWORK_IMPORT_PREFIXES = frozenset(
 )
 
 
-def find_exec_inertness_violations(path: str, source: str) -> list[Violation]:
-    """E0-INERT: a module under ``exec/`` may not import a network client or
-    define a coroutine.
+#: E0-INERT NARROWING (R-4), paid for by the three strengthenings below.
+#:
+#: R-3 could be inert because it was pure mapping. A ``LiveExecutionClient``
+#: cannot: ``live/execution_client.py:598-633`` declares ``_connect``,
+#: ``_disconnect`` and all six order coroutines as ``async def``, and
+#: ``:246-256`` drives them through ``create_task``. So the async BAN is
+#: narrowed to exactly the modules named here, and ONLY the async passes plus
+#: the ``asyncio`` import are relaxed for them -- every other network-capable
+#: import stays banned, for them as for every other module under ``exec/``.
+#:
+#: A frozenset of EXACT paths, never a prefix: a prefix would relax the rule
+#: for every module later added beside the client.
+EXEC_ASYNC_LIFECYCLE_MODULES = frozenset({"src/breezy/adapters/polymarket_us/exec/client.py"})
 
-    Two independent passes, because neither alone is enough. The import pass
-    catches the CAPABILITY arriving (``import httpx``, ``from
-    nautilus_trader.core.nautilus_pyo3 import HttpClient``); the async pass
-    catches the SHAPE that I/O arrives in, which can be written without any
-    banned import at all.
+#: STRENGTHENING 1 of 3. Inside an async-permitted module, only these
+#: coroutine names may exist. The narrowing above buys the SHAPE of I/O; this
+#: keeps the INVENTORY closed, so a new coroutine -- which is how a send path
+#: would arrive -- cannot appear without a reviewer editing this set.
+#:
+#: Every name is either a Nautilus lifecycle method the base declares, or a
+#: Breezy private the client's own docstring accounts for.
+EXEC_PERMITTED_COROUTINE_NAMES = frozenset(
+    {
+        # Nautilus `LiveExecutionClient` coroutines (`live/execution_client.py`)
+        "_connect",
+        "_disconnect",
+        "_query_account",
+        "_query_order",
+        "_submit_order",
+        "_submit_order_list",
+        "_modify_order",
+        "_cancel_order",
+        "_cancel_all_orders",
+        "_batch_cancel_orders",
+        "generate_order_status_report",
+        "generate_order_status_reports",
+        "generate_fill_reports",
+        "generate_position_status_reports",
+        "generate_mass_status",
+        # Breezy privates, each named in the client's module docstring.
+        "_publish_account_state",
+        "_wait_for_instruments",
+        "_confirm_account_registered",
+        # The injected read protocol's own call signature.
+        "__call__",
+    }
+)
+
+#: STRENGTHENING 2 of 3. Breezy modules that CARRY a network client. E0-INERT
+#: listed only stdlib and third-party prefixes, so the shortest route to the
+#: network from under ``exec/`` -- ``from breezy.adapters.polymarket_us.http
+#: import PolymarketUSHttpClient`` -- matched NOTHING. It does now, for every
+#: module under ``exec/``, async-permitted or not.
+#:
+#: ``transport`` is not banned wholesale because ``exec/endpoints.py`` already
+#: imports ``QUOTA_KEY_PORTFOLIO`` from it, and a quota key is a constant, not
+#: a socket. The class that owns the socket is banned by NAME instead.
+BANNED_EXEC_TRANSPORT_MODULES = frozenset(
+    {
+        "breezy.adapters.polymarket_us.data",
+        "breezy.adapters.polymarket_us.http",
+        "breezy.adapters.polymarket_us.websocket",
+        "breezy.ingest.http",
+        "breezy.ingest.probe_transport",
+        "breezy.runtime.health",
+    }
+)
+
+#: STRENGTHENING 2, second half: the client CLASSES themselves, wherever they
+#: are imported from and however they are reached, including as an attribute
+#: on an otherwise-permitted module.
+BANNED_EXEC_TRANSPORT_NAMES = frozenset(
+    {
+        "MarketsFeed",
+        "NautilusHttpTransport",
+        "PolymarketUSDataClient",
+        "PolymarketUSHttpClient",
+        "PolymarketUSMarketsWebSocketPool",
+        "WebhookAlertSink",
+    }
+)
+
+#: STRENGTHENING 3 of 3. The order-lifecycle coroutines, which R-4 must leave
+#: unsendable. Their refusal is made MECHANICAL rather than asserted in prose,
+#: by an allowlist of what their bodies may CALL -- see
+#: :data:`EXEC_ORDER_COROUTINE_PERMITTED_CALLEES`.
+#:
+#: An earlier form of this rule banned only ``await``, on the reasoning that
+#: every send path at this venue is async (``http.py:116``
+#: ``get_authenticated`` is a coroutine, and so is every transport method under
+#: it). That reasoning is TRUE of the transport and FALSE of the coroutine
+#: body: scheduling the coroutine (``self.create_task(...)``,
+#: ``asyncio.create_task(...)``), hopping through a synchronous helper, or
+#: handing it to a thread all reach the same transport with no ``await`` in
+#: sight. R-7 lands the submit path and must narrow THIS rule, in its own
+#: commit, with its own compensating strengthening -- which is the point of
+#: stating it here.
+ORDER_LIFECYCLE_COROUTINES = frozenset(
+    {
+        "_submit_order",
+        "_submit_order_list",
+        "_modify_order",
+        "_cancel_order",
+        "_cancel_all_orders",
+        "_batch_cancel_orders",
+    }
+)
+
+#: STRENGTHENING 3, second half. The ONLY callees an order coroutine may
+#: invoke, as the dotted name written in the source.
+#:
+#: An ``await`` ban alone was measured to be worth far less than it reads. On
+#: the async-PERMITTED module every one of these passed it CLEAN:
+#: ``self.create_task(self._private_read('/x'))`` -- the exact native mechanism
+#: the narrowing's own docstring cites -- ``asyncio.create_task(...)``, a plain
+#: synchronous hop ``self._send(command)``, and
+#: ``threading.Thread(target=...).start()``. None of them contains an
+#: ``await``, and every one of them can send an order.
+#:
+#: So the rule is inverted: an order coroutine may make ONLY the calls listed
+#: here, and ANY other call -- by name, by attribute, or on the result of
+#: another call -- is a violation. An allowlist cannot be defeated by finding a
+#: mechanism nobody thought to ban.
+EXEC_ORDER_COROUTINE_PERMITTED_CALLEES = frozenset(
+    {
+        # Logging a refusal.
+        "self._log.error",
+        "self._log.warning",
+        # The native denial surface (`execution/client.pyx`), which publishes an
+        # event on the message bus and reaches no venue.
+        "self.generate_order_denied",
+        "self.generate_order_cancel_rejected",
+        # Reading local state: the cached account, the clock, the refusal text.
+        "self._cache.account_for_venue",
+        "self._clock.timestamp_ns",
+        # The shared "this path is not implemented" message, and the raise.
+        "self._unsupported",
+        "NotImplementedError",
+    }
+)
+
+#: Coroutines named in :data:`EXEC_PERMITTED_COROUTINE_NAMES` that the shipped
+#: client does NOT define, so the inventory check can be an EQUALITY.
+#:
+#: A subset check (``defined <= permitted``) passes just as happily when a
+#: coroutine is DELETED, which is how ``_query_account`` -- the method
+#: ``live/execution_client.py:332`` calls with nothing defining it in the base
+#: -- could disappear without a failure. ``_query_order`` is declared here
+#: because the base DOES define it and this client does not override it.
+#:
+#: "Declared unimplemented" means two DIFFERENT fates, and this set only ever
+#: holds the second one. ``_query_account`` is genuinely absent -- the base
+#: has nothing defining it, so the ``QueryAccount`` path would raise
+#: ``AttributeError`` were it ever left undeclared. ``_query_order`` is NOT
+#: absent: the base defines a real method (``live/execution_client.py:516-532``)
+#: that calls ``generate_order_status_report`` and, if the result is
+#: non-``None``, ``_send_order_status_report`` -- a report-injection seam that
+#: bypasses ``_submit_order``'s refusal latch. For this entry, "unimplemented"
+#: means the NATIVE default RUNS, unmodified, every time; the seam stays
+#: closed only because this client's own ``generate_order_status_report``
+#: always returns ``None`` (pinned in
+#: ``tests/unit/test_polymarket_us_exec_client.py`` by
+#: ``test_native_query_order_never_reaches_the_send_seam``), never because
+#: the coroutine is missing or raises.
+EXEC_DECLARED_UNIMPLEMENTED_COROUTINES = frozenset({"_query_order"})
+
+
+def _dotted_import_strings(tree: ast.AST) -> set[str]:
+    """Every dotted name an import statement binds, module and member alike."""
+    found: set[str] = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            for alias in node.names:
+                found.add(alias.name)
+        elif isinstance(node, ast.ImportFrom) and node.module:
+            found.add(node.module)
+            for alias in node.names:
+                found.add(f"{node.module}.{alias.name}")
+    return found
+
+
+def find_exec_transport_violations(path: str, source: str) -> list[Violation]:
+    """E0-TRANSPORT: no module under ``exec/`` may reach a Breezy network client.
+
+    The compensating strengthening for the async narrowing, and it closes a
+    hole that predates it: E0-INERT's prefix list is stdlib and third-party
+    only, so the capability could always have arrived through a Breezy module
+    that owns a socket. It cannot now.
     """
     tree = ast.parse(source, filename=path)
     violations: list[Violation] = []
 
+    for dotted in sorted(_dotted_import_strings(tree)):
+        if dotted in BANNED_EXEC_TRANSPORT_MODULES:
+            violations.append(
+                Violation(path, 0, "E0-TRANSPORT", f"imports {dotted!r}, which owns a socket")
+            )
+    for node in ast.walk(tree):
+        name = ""
+        if isinstance(node, ast.ImportFrom):
+            for alias in node.names:
+                if alias.name in BANNED_EXEC_TRANSPORT_NAMES:
+                    violations.append(
+                        Violation(
+                            path,
+                            node.lineno,
+                            "E0-TRANSPORT",
+                            f"imports the network client {alias.name!r}",
+                        )
+                    )
+            continue
+        if isinstance(node, ast.Attribute):
+            name = node.attr
+        elif isinstance(node, ast.Name):
+            name = node.id
+        if name in BANNED_EXEC_TRANSPORT_NAMES:
+            violations.append(
+                Violation(
+                    path,
+                    getattr(node, "lineno", 0),
+                    "E0-TRANSPORT",
+                    f"reaches the network client {name!r}",
+                )
+            )
+    return violations
+
+
+def _dotted_callee(node: ast.expr) -> str | None:
+    """Render a call target as the dotted name written in the source.
+
+    ``None`` when the target is not a plain dotted name -- a call on the result
+    of another call (``threading.Thread(...).start()``), a subscript, a lambda.
+    Those are violations by construction: an allowlist cannot vet an expression
+    whose value is not decidable from the source text.
+    """
+    if isinstance(node, ast.Name):
+        return node.id
+    if isinstance(node, ast.Attribute):
+        base = _dotted_callee(node.value)
+        return None if base is None else f"{base}.{node.attr}"
+    return None
+
+
+def find_exec_send_path_violations(path: str, source: str) -> list[Violation]:
+    """E0-NOSEND: what an order-lifecycle coroutine under ``exec/`` may DO.
+
+    Two rules, and the second is the one that carries the weight:
+
+    1. No ``await``, ``async for`` or ``async with``.
+    2. No call except the ones in
+       :data:`EXEC_ORDER_COROUTINE_PERMITTED_CALLEES`.
+
+    Rule 1 alone was MEASURED to be nearly empty (see that constant's comment):
+    ``self.create_task(...)``, ``asyncio.create_task(...)``, a synchronous
+    ``self._send(...)`` and ``threading.Thread(...).start()`` all passed it
+    clean, and each of them sends. "No order may become sendable" is a claim
+    about EVERY mechanism, so the rule has to be an allowlist.
+    """
+    if not path.startswith(EXEC_PACKAGE_PATH_PREFIX):
+        return []
+    tree = ast.parse(source, filename=path)
+    violations: list[Violation] = []
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.AsyncFunctionDef | ast.FunctionDef):
+            continue
+        if node.name not in ORDER_LIFECYCLE_COROUTINES:
+            continue
+        for inner in ast.walk(node):
+            if isinstance(inner, ast.Await | ast.AsyncFor | ast.AsyncWith):
+                violations.append(
+                    Violation(
+                        path,
+                        inner.lineno,
+                        "E0-NOSEND",
+                        f"{node.name}() awaits; an order path is exactly what that is",
+                    )
+                )
+            elif isinstance(inner, ast.Call):
+                callee = _dotted_callee(inner.func)
+                if callee not in EXEC_ORDER_COROUTINE_PERMITTED_CALLEES:
+                    violations.append(
+                        Violation(
+                            path,
+                            inner.lineno,
+                            "E0-NOSEND",
+                            f"{node.name}() calls "
+                            f"{callee or ast.dump(inner.func)[:48]}, which is not one of "
+                            "the refusal-only callees an order path may reach",
+                        )
+                    )
+    return violations
+
+
+def find_exec_inertness_violations(path: str, source: str) -> list[Violation]:
+    """E0-INERT: a module under ``exec/`` may not import a network client, and
+    may not define a coroutine unless it is an async-lifecycle module.
+
+    Three passes now, none of which alone is enough. The import pass catches
+    the CAPABILITY arriving (``import httpx``, ``from
+    nautilus_trader.core.nautilus_pyo3 import HttpClient``); the async pass
+    catches the SHAPE that I/O arrives in, which can be written without any
+    banned import at all; the name pass keeps the coroutine inventory of an
+    async-permitted module closed.
+    """
+    tree = ast.parse(source, filename=path)
+    violations: list[Violation] = []
+    async_permitted = path in EXEC_ASYNC_LIFECYCLE_MODULES
+    banned_prefixes = (
+        NETWORK_IMPORT_PREFIXES - {"asyncio"} if async_permitted else NETWORK_IMPORT_PREFIXES
+    )
+
     for module in _imported_module_strings(tree):
         parts = module.split(".")
         heads = {".".join(parts[: depth + 1]) for depth in range(len(parts))}
-        for prefix in sorted(heads & NETWORK_IMPORT_PREFIXES):
+        for prefix in sorted(heads & banned_prefixes):
             violations.append(
                 Violation(
                     path,
@@ -1578,18 +1889,32 @@ def find_exec_inertness_violations(path: str, source: str) -> list[Violation]:
                         )
                     )
         elif isinstance(node, ast.AsyncFunctionDef):
-            violations.append(
-                Violation(
-                    path,
-                    node.lineno,
-                    "E0-INERT",
-                    f"defines the coroutine {node.name!r}; this slice is read/map only",
+            if not async_permitted:
+                violations.append(
+                    Violation(
+                        path,
+                        node.lineno,
+                        "E0-INERT",
+                        f"defines the coroutine {node.name!r}; this slice is read/map only",
+                    )
                 )
-            )
-        elif isinstance(node, (ast.Await, ast.AsyncFor, ast.AsyncWith)):
+            elif node.name not in EXEC_PERMITTED_COROUTINE_NAMES:
+                violations.append(
+                    Violation(
+                        path,
+                        node.lineno,
+                        "E0-INERT",
+                        f"defines the coroutine {node.name!r}, which is not a "
+                        "declared execution-client lifecycle method",
+                    )
+                )
+        elif isinstance(node, (ast.Await, ast.AsyncFor, ast.AsyncWith)) and not async_permitted:
             violations.append(
                 Violation(path, node.lineno, "E0-INERT", "carries async control flow")
             )
+
+    violations.extend(find_exec_transport_violations(path, source))
+    violations.extend(find_exec_send_path_violations(path, source))
     return violations
 
 
@@ -1619,9 +1944,27 @@ def test_e0_inert_the_live_scan_actually_reaches_the_exec_package() -> None:
     }
     assert scanned == {
         "src/breezy/adapters/polymarket_us/exec/__init__.py",
+        "src/breezy/adapters/polymarket_us/exec/client.py",
         "src/breezy/adapters/polymarket_us/exec/endpoints.py",
         "src/breezy/adapters/polymarket_us/exec/reports.py",
     }
+
+
+#: The path every E0-INERT detector proof plants against.
+#:
+#: It is deliberately NOT ``client.py``. Before R-4 these proofs used the
+#: client's own path, which after the async narrowing would have made three of
+#: them assert that a permitted module is permitted -- a detector proving
+#: nothing, which is the exact defect ``test_cage_rule_constants_are_pinned``
+#: exists to catch one level up. A module NOT in
+#: ``EXEC_ASYNC_LIFECYCLE_MODULES`` keeps them measuring the unnarrowed rule.
+_PLANTED_INERT_PATH = f"{EXEC_PACKAGE_PATH_PREFIX}planted_not_the_client.py"
+
+
+def test_the_planted_inert_path_is_not_an_async_permitted_module() -> None:
+    """The proofs above are worth nothing if the path they plant on is exempt."""
+    assert _PLANTED_INERT_PATH not in EXEC_ASYNC_LIFECYCLE_MODULES
+    assert _PLANTED_INERT_PATH.startswith(EXEC_PACKAGE_PATH_PREFIX)
 
 
 @pytest.mark.parametrize(
@@ -1637,13 +1980,13 @@ def test_e0_inert_the_live_scan_actually_reaches_the_exec_package() -> None:
 )
 def test_e0_inert_detects_each_network_capable_import(statement: str) -> None:
     source = f'"""Docstring."""\n\n{statement}\n'
-    violations = find_exec_inertness_violations(f"{EXEC_PACKAGE_PATH_PREFIX}client.py", source)
+    violations = find_exec_inertness_violations(_PLANTED_INERT_PATH, source)
     assert [v.rule for v in violations][:1] == ["E0-INERT"]
 
 
 def test_e0_inert_detects_a_coroutine_definition() -> None:
     source = '"""Docstring."""\n\n\nasync def read(path):\n    return path\n'
-    violations = find_exec_inertness_violations(f"{EXEC_PACKAGE_PATH_PREFIX}client.py", source)
+    violations = find_exec_inertness_violations(_PLANTED_INERT_PATH, source)
     assert [v.rule for v in violations] == ["E0-INERT"]
     assert "coroutine" in violations[0].detail
 
@@ -1687,9 +2030,356 @@ def test_e0_inert_is_scoped_to_the_exec_package() -> None:
     a prohibition under ``exec/`` only, exactly like X3."""
     scanned = {path for path, _ in iter_python_sources(EGRESS_SCAN_ROOTS)}
     assert "src/breezy/adapters/polymarket_us/transport.py" in scanned
-    assert [
-        v.path for v in scan_exec_module_inertness()
-    ] == []
+    assert [v.path for v in scan_exec_module_inertness()] == []
+
+
+# ==========================================================================
+# The R-4 NARROWING, and the three strengthenings that pay for it
+# ==========================================================================
+#
+# What was narrowed, stated plainly so it cannot be read as a deletion:
+# E0-INERT banned `async def`, `await` and `import asyncio` under `exec/`
+# outright. A `LiveExecutionClient` cannot honour that -- Nautilus declares
+# `_connect`, `_disconnect` and all six order coroutines as `async def`
+# (`live/execution_client.py:598-633`) and drives them through `create_task`
+# (`:246-256`). Nautilus is immutable, so the alternatives were: reimplement
+# the lifecycle synchronously (a fork of the framework in all but name), move
+# the client OUT of `exec/` (evading the classification by relocation, which
+# is worse than narrowing it), or narrow precisely and pay for it. This is the
+# third.
+#
+# The narrowing is exactly: for the modules in `EXEC_ASYNC_LIFECYCLE_MODULES`,
+# and ONLY those, the async passes are skipped and `asyncio` is removed from
+# the banned import prefixes. Every other banned prefix, and every other rule,
+# applies unchanged.
+#
+# Paid for by three rules that did not exist before, each strictly additive:
+#
+#   1. EXEC_PERMITTED_COROUTINE_NAMES -- an async-permitted module's coroutine
+#      INVENTORY is closed. Before R-4 there was no such rule because there
+#      were no coroutines to inventory.
+#   2. E0-TRANSPORT -- no module under `exec/` may reach a Breezy network
+#      client. This closes a hole OLDER than the narrowing: E0-INERT's prefix
+#      list is stdlib and third-party only, so `from
+#      breezy.adapters.polymarket_us.http import PolymarketUSHttpClient`
+#      matched nothing at all.
+#   3. E0-NOSEND -- an order-lifecycle coroutine may call ONLY the refusal
+#      callees on `EXEC_ORDER_COROUTINE_PERMITTED_CALLEES`, and may not
+#      `await`. "No order may become sendable" stops being prose a reviewer
+#      must re-check and becomes a scan. It is an ALLOWLIST because the
+#      `await`-only form it replaces passed four measured send shapes clean.
+
+
+def test_the_async_narrowing_names_exactly_one_module_and_it_exists() -> None:
+    """A narrowing that grew a second member without a reviewer noticing would
+    be indistinguishable from a deletion of the rule."""
+    assert EXEC_ASYNC_LIFECYCLE_MODULES == frozenset(
+        {"src/breezy/adapters/polymarket_us/exec/client.py"},
+    )
+    for relative in EXEC_ASYNC_LIFECYCLE_MODULES:
+        assert (REPO_ROOT / relative).is_file(), f"{relative} names no file"
+        assert relative.startswith(EXEC_PACKAGE_PATH_PREFIX)
+
+
+def test_the_narrowing_is_scoped_a_second_exec_module_still_may_not_await() -> None:
+    """Non-vacuity of the narrowing's SCOPE: it is a path allowlist, not an
+    exemption for the package."""
+    source = '"""Docstring."""\n\n\nasync def fetch(read):\n    return await read()\n'
+    permitted = find_exec_inertness_violations(
+        "src/breezy/adapters/polymarket_us/exec/client.py",
+        source,
+    )
+    assert [v.rule for v in permitted] == ["E0-INERT"]  # only the NAME rule fires
+    assert "not a declared execution-client lifecycle method" in permitted[0].detail
+
+    neighbour = find_exec_inertness_violations(_PLANTED_INERT_PATH, source)
+    assert {v.rule for v in neighbour} == {"E0-INERT"}
+    assert any("coroutine" in v.detail for v in neighbour)
+    assert any("async control flow" in v.detail for v in neighbour)
+
+
+def test_the_async_permitted_module_still_may_not_import_a_network_client() -> None:
+    """Only ``asyncio`` was removed from the prefix ban, and only here."""
+    for statement in (
+        "import httpx",
+        "import socket",
+        "from nautilus_trader.core.nautilus_pyo3 import HttpClient",
+    ):
+        source = f'"""Docstring."""\n\n{statement}\n'
+        violations = find_exec_inertness_violations(
+            "src/breezy/adapters/polymarket_us/exec/client.py",
+            source,
+        )
+        assert violations != [], statement
+
+
+def test_the_shipped_exec_coroutines_are_EXACTLY_the_declared_inventory() -> None:
+    """The live barrier for strengthening 1, as an EQUALITY.
+
+    ``defined <= EXEC_PERMITTED_COROUTINE_NAMES`` was a subset, and a subset
+    check is satisfied by DELETION as well as by conformance: dropping
+    ``_query_account`` -- which ``live/execution_client.py:332`` calls with
+    nothing defining it in the base, so its absence makes the ``QueryAccount``
+    path raise ``AttributeError`` -- would have passed silently. The declared
+    inventory is now accounted for name by name.
+    """
+    scanned = 0
+    for path, source in iter_python_sources(EGRESS_SCAN_ROOTS):
+        if path not in EXEC_ASYNC_LIFECYCLE_MODULES:
+            continue
+        scanned += 1
+        defined = {
+            node.name
+            for node in ast.walk(ast.parse(source, filename=path))
+            if isinstance(node, ast.AsyncFunctionDef)
+        }
+        assert defined | EXEC_DECLARED_UNIMPLEMENTED_COROUTINES == (
+            EXEC_PERMITTED_COROUTINE_NAMES
+        ), {
+            "undeclared": sorted(defined - EXEC_PERMITTED_COROUTINE_NAMES),
+            "missing": sorted(
+                EXEC_PERMITTED_COROUTINE_NAMES - defined - EXEC_DECLARED_UNIMPLEMENTED_COROUTINES,
+            ),
+        }
+        assert not (defined & EXEC_DECLARED_UNIMPLEMENTED_COROUTINES), (
+            "a coroutine declared UNIMPLEMENTED is implemented; move it out of "
+            "EXEC_DECLARED_UNIMPLEMENTED_COROUTINES in this commit"
+        )
+    assert scanned == len(EXEC_ASYNC_LIFECYCLE_MODULES)
+
+
+def test_the_unimplemented_declaration_cannot_hide_a_deleted_coroutine() -> None:
+    """Non-vacuity of the equality: the escape hatch is itself accounted for.
+
+    Every name declared unimplemented must be a name the permitted inventory
+    contains, or the set would be a place to park anything.
+    """
+    assert EXEC_DECLARED_UNIMPLEMENTED_COROUTINES < EXEC_PERMITTED_COROUTINE_NAMES
+    assert "_submit_order" not in EXEC_DECLARED_UNIMPLEMENTED_COROUTINES
+
+
+def test_the_coroutine_inventory_rule_detects_a_new_name() -> None:
+    """Non-vacuity of strengthening 1: a plausible I/O coroutine is refused."""
+    source = '"""Docstring."""\n\n\nasync def _send(payload):\n    return payload\n'
+    violations = find_exec_inertness_violations(
+        "src/breezy/adapters/polymarket_us/exec/client.py",
+        source,
+    )
+    assert [v.rule for v in violations] == ["E0-INERT"]
+    assert "_send" in violations[0].detail
+
+
+@pytest.mark.parametrize(
+    "statement",
+    [
+        "from breezy.adapters.polymarket_us.http import PolymarketUSHttpClient",
+        "import breezy.adapters.polymarket_us.http",
+        "from breezy.adapters.polymarket_us.websocket import PolymarketUSMarketsWebSocketPool",
+        "from breezy.adapters.polymarket_us.transport import NautilusHttpTransport",
+        "from breezy.runtime.health import WebhookAlertSink",
+        "from breezy.ingest.http import something",
+    ],
+)
+def test_e0_transport_detects_every_breezy_route_to_a_socket(statement: str) -> None:
+    """Non-vacuity of strengthening 2, on the async-PERMITTED module -- the one
+    the narrowing could otherwise have opened up."""
+    source = f'"""Docstring."""\n\n{statement}\n'
+    violations = find_exec_transport_violations(
+        "src/breezy/adapters/polymarket_us/exec/client.py",
+        source,
+    )
+    assert [v.rule for v in violations][:1] == ["E0-TRANSPORT"], statement
+
+
+def test_e0_transport_closes_a_hole_the_original_inertness_rule_never_saw() -> None:
+    """The measured justification for strengthening 2, not an assertion of it.
+
+    Run the PRE-R-4 rule -- imports and async shape only -- over a module that
+    imports the venue HTTP client. It reports nothing: the class is reached
+    through a Breezy module, and no Breezy module was ever in
+    ``NETWORK_IMPORT_PREFIXES``. That is the hole, and it predates the
+    narrowing this rule pays for.
+    """
+    source = (
+        '"""Docstring."""\n'
+        "\n"
+        "from breezy.adapters.polymarket_us.http import PolymarketUSHttpClient\n"
+        "\n"
+        "\n"
+        "def build(transport, signer):\n"
+        "    return PolymarketUSHttpClient(transport=transport, signer=signer)\n"
+    )
+    tree = ast.parse(source)
+    prefix_hits = [
+        module
+        for module in _imported_module_strings(tree)
+        if {".".join(module.split(".")[: d + 1]) for d in range(len(module.split(".")))}
+        & NETWORK_IMPORT_PREFIXES
+    ]
+    assert prefix_hits == []  # the ORIGINAL rule sees nothing
+    assert find_exec_transport_violations(_PLANTED_INERT_PATH, source) != []
+
+
+def test_e0_transport_does_not_fire_on_the_shipped_quota_key_import() -> None:
+    """Control: ``exec/endpoints.py`` imports a quota-key CONSTANT from
+    ``transport``. A constant is not a socket, and banning the module
+    wholesale would have forced a shipped, harmless import to be rewritten to
+    suit a barrier."""
+    source = (
+        '"""Docstring."""\n'
+        "\n"
+        "from breezy.adapters.polymarket_us.transport import QUOTA_KEY_PORTFOLIO\n"
+    )
+    assert find_exec_transport_violations(_PLANTED_INERT_PATH, source) == []
+
+
+def test_no_shipped_exec_order_coroutine_awaits_anything() -> None:
+    """The live barrier for strengthening 3: R-4 cannot send, mechanically."""
+    violations = [
+        v
+        for path, source in iter_python_sources(EGRESS_SCAN_ROOTS)
+        for v in find_exec_send_path_violations(path, source)
+    ]
+    assert violations == [], "E0-NOSEND violations:\n" + "\n".join(str(v) for v in violations)
+
+
+def test_e0_nosend_scan_actually_reaches_the_six_order_coroutines() -> None:
+    """A rule that reaches nothing reports nothing -- X3's lesson, applied.
+
+    The six coroutines must be PRESENT in the shipped client, or the live
+    barrier above is measuring an empty set.
+    """
+    source = (REPO_ROOT / "src/breezy/adapters/polymarket_us/exec/client.py").read_text()
+    defined = {
+        node.name for node in ast.walk(ast.parse(source)) if isinstance(node, ast.AsyncFunctionDef)
+    }
+    assert ORDER_LIFECYCLE_COROUTINES <= defined, sorted(ORDER_LIFECYCLE_COROUTINES - defined)
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        "    return await send(command)\n",
+        "    async with session() as s:\n        return s\n",
+        "    async for chunk in stream():\n        return chunk\n",
+    ],
+)
+def test_e0_nosend_detects_an_order_coroutine_that_reaches_out(body: str) -> None:
+    """Non-vacuity of strengthening 3, in all three async shapes."""
+    source = f'"""Docstring."""\n\n\nasync def _submit_order(command):\n{body}'
+    violations = find_exec_send_path_violations(
+        "src/breezy/adapters/polymarket_us/exec/client.py",
+        source,
+    )
+    assert [v.rule for v in violations][:1] == ["E0-NOSEND"]
+
+
+def test_e0_nosend_permits_the_denial_body_r4_actually_ships() -> None:
+    """Control: a refusal that logs and denies is legal, or the rule would
+    forbid the very thing it exists to protect."""
+    source = (
+        '"""Docstring."""\n'
+        "\n"
+        "\n"
+        "async def _submit_order(self, command):\n"
+        "    self._log.error('refused')\n"
+        "    self.generate_order_denied(\n"
+        "        reason='refused',\n"
+        "        ts_event=self._clock.timestamp_ns(),\n"
+        "    )\n"
+    )
+    assert (
+        find_exec_send_path_violations(
+            "src/breezy/adapters/polymarket_us/exec/client.py",
+            source,
+        )
+        == []
+    )
+
+
+#: The four send mechanisms an ``await`` ban does NOT see. Each was RUN
+#: against the pre-allowlist rule on the async-permitted module and came back
+#: CLEAN; each of them can put an order on the wire.
+_AWAIT_FREE_SEND_SHAPES: tuple[tuple[str, str], ...] = (
+    (
+        "native create_task",
+        # `live/execution_client.py:246-256` drives the lifecycle through
+        # exactly this, and the narrowing's own docstring cites it.
+        "    self.create_task(self._private_read('/x'))\n",
+    ),
+    ("asyncio create_task", "    asyncio.create_task(self._private_read('/x'))\n"),
+    ("a synchronous hop", "    self._send(command)\n"),
+    ("a thread", "    threading.Thread(target=self._send, args=(command,)).start()\n"),
+)
+
+
+@pytest.mark.parametrize(
+    ("label", "body"),
+    _AWAIT_FREE_SEND_SHAPES,
+    ids=[label for label, _ in _AWAIT_FREE_SEND_SHAPES],
+)
+def test_e0_nosend_detects_the_send_shapes_that_carry_no_await(
+    label: str,
+    body: str,
+) -> None:
+    """The measured justification for the allowlist, as four live RED proofs.
+
+    Under the ``await``-only rule every one of these returned ``[]`` on
+    ``exec/client.py`` -- the async-PERMITTED module, where it matters most.
+    """
+    source = f'"""Docstring."""\n\n\nasync def _submit_order(self, command):\n{body}'
+    violations = find_exec_send_path_violations(
+        "src/breezy/adapters/polymarket_us/exec/client.py",
+        source,
+    )
+    assert [v.rule for v in violations][:1] == ["E0-NOSEND"], label
+    assert not any(isinstance(n, ast.Await) for n in ast.walk(ast.parse(source))), (
+        f"{label} must contain NO await, or it proves nothing about the new rule"
+    )
+
+
+def test_e0_nosend_detects_a_call_on_the_result_of_a_call() -> None:
+    """A callee this rule cannot NAME is refused, never waved through: the
+    allowlist is only sound if an unrenderable target is a violation."""
+    source = (
+        '"""Docstring."""\n'
+        "\n"
+        "\n"
+        "async def _cancel_order(self, command):\n"
+        "    self._transport()(command)\n"
+    )
+    violations = find_exec_send_path_violations(
+        "src/breezy/adapters/polymarket_us/exec/client.py",
+        source,
+    )
+    assert [v.rule for v in violations][:1] == ["E0-NOSEND"]
+
+
+def test_the_order_coroutine_callee_allowlist_reaches_no_venue() -> None:
+    """The allowlist is the rule's whole surface, so it is read here too.
+
+    Every entry is either a log, a native event generator that publishes on
+    the message bus, a read of local state, or the shared unsupported-message
+    helper. Nothing on it takes a path, a payload or a socket.
+    """
+    assert EXEC_ORDER_COROUTINE_PERMITTED_CALLEES == frozenset(
+        {
+            "self._log.error",
+            "self._log.warning",
+            "self.generate_order_denied",
+            "self.generate_order_cancel_rejected",
+            "self._cache.account_for_venue",
+            "self._clock.timestamp_ns",
+            "self._unsupported",
+            "NotImplementedError",
+        }
+    )
+    for callee in EXEC_ORDER_COROUTINE_PERMITTED_CALLEES:
+        assert "read" not in callee, callee
+        assert "send" not in callee
+        assert "post" not in callee
+        assert "request" not in callee
+        assert "create_task" not in callee
 
 
 # ==========================================================================
@@ -1716,6 +2406,8 @@ def test_x1_the_live_scan_actually_reaches_a_test_that_imports_the_exec_package(
     """Set EQUALITY, in X3's shape: a rename cannot re-vacuum the scan, and a
     new exec test cannot appear without a reviewer seeing it here."""
     assert exec_importing_test_modules() == {
+        "tests/contract/test_exec_client_reconciliation_contract.py",
+        "tests/unit/test_polymarket_us_exec_client.py",
         "tests/unit/test_polymarket_us_exec_endpoints.py",
         "tests/unit/test_polymarket_us_exec_positions.py",
         "tests/unit/test_polymarket_us_exec_reports.py",

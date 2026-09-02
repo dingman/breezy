@@ -42,12 +42,18 @@ through an order Breezy placed, because Breezy never amends.
 THREE THINGS THIS MODULE DELIBERATELY DOES NOT DO
 --------------------------------------------------
 
-1. **It does not derive a position's average open price.** ``UserPosition``
-   has no average-entry field. ``cost``/``qtyBought``
+1. **It does not derive a position's average open price** *in the mapper*.
+   ``UserPosition`` has no average-entry field. ``cost``/``qtyBought``
    (``types/portfolio.py:25-27``) look like a derivation, but whether ``cost``
    is net of sells is undefined by the snapshot and unobserved live, and the
    plan assigns the entry price to R-4's durable fill record (OQ-1).
-   ``avg_px_open`` is therefore left ``None`` rather than filled with a guess.
+   :func:`parse_position_status_report` therefore leaves ``avg_px_open``
+   ``None`` rather than filling it with a guess.
+   :func:`derive_position_cost_basis` is the separately-called FALLBACK for
+   the case where no fill record exists, and it is sound only under
+   ``qtySold == 0`` -- the one condition that removes the ambiguity. It is a
+   distinct function precisely so the mapper's output cannot silently acquire
+   a derived number.
 2. **It does not resolve a ``ClientOrderId``.** The venue payload carries no
    field for one, so every report leaves it ``None``. R-4 owns the
    venue-id -> client-id map and attaches it.
@@ -152,6 +158,7 @@ __all__ = [
     "ORDER_STATE_TO_ORDER_STATUS",
     "MappedPosition",
     "build_execution_mass_status",
+    "derive_position_cost_basis",
     "parse_account_balances",
     "parse_fill_report",
     "parse_order_status_report",
@@ -912,6 +919,51 @@ def parse_position_status_report(
         ),
         expired=expired,
     )
+
+
+def derive_position_cost_basis(payload: Mapping[str, Any]) -> Decimal | None:
+    """The venue's own average entry price, or ``None`` when it cannot be one.
+
+    This is the SECOND source of a position's ``avg_px_open``, used only when
+    Breezy's durable fill records cannot supply one. It is deliberately narrow.
+
+    ``UserPosition`` (``types/portfolio.py:21-34``) carries no average-entry
+    field. ``cost`` and ``qtyBought`` look like a derivation, and item 1 of
+    this module's docstring declines to make one -- because whether ``cost`` is
+    NET OF SELLS is undefined by the snapshot and unobserved live. Under
+    ``qtySold == 0`` that ambiguity does not exist: there are no sells for
+    ``cost`` to be net of, so ``cost / qtyBought`` is the entry price under
+    either reading. Outside that condition it is refused, which is why this
+    returns ``None`` rather than a best effort.
+
+    ``None`` is not "zero" and never becomes one: the caller forwards the
+    position UNPRICED and latches a trading refusal instead.
+    """
+    context = "position cost basis"
+    if payload.get("qtySold") is None or payload.get("qtyBought") is None:
+        return None
+    if payload.get("cost") is None:
+        return None
+
+    sold = _to_decimal(
+        payload["qtySold"], field=f"{context}.qtySold", error=ExecutionReportMappingError
+    )
+    if sold != 0:
+        return None
+
+    bought = _to_decimal(
+        payload["qtyBought"], field=f"{context}.qtyBought", error=ExecutionReportMappingError
+    )
+    if bought <= 0:
+        return None
+
+    cost = _amount_field(payload, "cost", context=context)
+    if cost <= 0:
+        # A non-positive cost on a long the venue says was BOUGHT is a
+        # contradiction, not a free position. Refused, never divided.
+        return None
+
+    return cost / bought
 
 
 # ---------------------------------------------------------------------------
