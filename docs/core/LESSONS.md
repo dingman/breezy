@@ -644,3 +644,40 @@ E0-INERT to assert that none of them can reach the network. When you widen a set
 ask what the set actually proves — and whether the property you care about is
 asserted anywhere at all. Both X1 and X3 had been **silently vacuous**, scanning
 a package no test imported.
+
+## L-13 — An extremum statistic is not comparable across different sampling cadences (2026-09-02)
+
+The CLI-basis boundary study measured `P(CLI_final >= R_h + 1)` per station,
+where `R_h` is the ASOS RUNNING MAXIMUM. NYC returned 56-60% against 16-26% for
+the other four stations, and it passed the pre-registered bar by nine times over.
+It was an artifact. KNYC reports **hourly**, ~24 observations/day; the others
+report every 5 minutes, ~321/day.
+
+**A running maximum computed from a sparse series is biased LOW**, because fewer
+samples means fewer chances to catch the peak. Every statistic of the form "did
+the truth exceed our observed extremum" is therefore biased HIGH by exactly the
+sparsity, and the bias does not announce itself — the cell had n=1808, a tight
+Wilson interval, and was stationary across five years. Power, precision and
+stability are all properties of the SAMPLE; none of them detects this.
+
+**The rule: before comparing an extremum-derived statistic across sources,
+compare the sources' sampling cadences. Where they differ, DOWNSAMPLE THE DENSE
+SOURCE to the sparse one's resolution and recompute.** That experiment is cheap,
+it is causal, and it settles the question in one run. Here it moved LAX 25.27% ->
+64.34%, MIA 25.50% -> 64.29%, SFO 22.29% -> 60.92%, MDW 15.55% -> 54.98% — every
+dense station landing on NYC's measured value. That is not evidence NYC is
+special; it is proof the metric reads cadence, not weather.
+
+Corollary, and the more general trap: **a filter that selects almost everything
+is not a condition, and a statistic conditioned on it is unconditional.** The
+same study framed its result as a late-day effect over hours 17..23, but
+`P(R_17 == R_23)` is 99.40% at LAX — the running max had already converged, so
+the hour filter added no information and the number was the unconditional
+CLI-vs-ASOS basis wearing a condition's clothing. Before believing a conditional
+edge, measure how much the condition actually excludes. If a "condition" is true
+of ~99% of the sample, the edge it appears to isolate belongs to the population,
+and is very likely already in the price.
+
+See also L-1 (validate before building) and the standing note that an
+underpowered verdict describes the sample, not the world — this is its mirror
+image: a WELL-powered verdict can also describe the sample rather than the world.
