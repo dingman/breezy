@@ -282,11 +282,18 @@ class _FakePortfolio:
 class _FakeCache:
     """`orders`, not `orders_open` -- the guard reads `cache.orders(...)` since
     `docs/plans/ORDER_LIST_BYPASS_2026-09-02.md` Increment 1 (§2).
+
+    `order` is Increment 2's addition (§6): `post_only_beats_naked_short`
+    never reaches `_refuse_naked_short`'s shim consultation (the post-only
+    refusal raises first), so `None` unconditionally is correct here too.
     """
 
     def orders(self, *, instrument_id: InstrumentId | None = None) -> Sequence[object]:
         del instrument_id
         return ()
+
+    def order(self, client_order_id: ClientOrderId) -> None:
+        del client_order_id
 
 
 _GUARD_INSTRUMENT = InstrumentId(Symbol("synthetic-guard-precedence"), Venue("POLYMARKET_US"))

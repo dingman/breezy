@@ -81,7 +81,7 @@ if TYPE_CHECKING:  # pragma: no cover - typing only
     from nautilus_trader.cache.base import CacheFacade
     from nautilus_trader.common.component import MessageBus
     from nautilus_trader.core.message import Event
-    from nautilus_trader.model.identifiers import InstrumentId
+    from nautilus_trader.model.identifiers import ClientOrderId, InstrumentId
     from nautilus_trader.model.orders.base import Order
     from nautilus_trader.portfolio import Portfolio
 
@@ -133,11 +133,28 @@ class BacktestOrderGuard:
     Holds the ``Portfolio`` rather than a snapshot of it: the net position is
     read at submit time, which is the only instant at which "naked" is a
     well-defined question.
+
+    ``_shim`` closes ``docs/plans/ORDER_LIST_BYPASS_2026-09-02.md`` Increment
+    2 (RED-12): ``Strategy.submit_order_list`` publishes every member's
+    ``OrderInitialized`` in one loop BEFORE any of them reaches
+    ``cache.add_order`` (``trading/strategy.pyx:944-981``), so the
+    cache-sourced sum in ``_working_sell_orders`` reads ``pending=0`` for
+    every member. The shim records the ``ClientOrderId``/quantity of every
+    SELL this guard has itself approved; an entry counts toward ``pending``
+    **only while** ``self._cache.order(client_order_id) is None`` (§3). That
+    makes liveness a PREDICATE evaluated fresh every screening rather than an
+    event-driven lifecycle -- there is no eviction event to miss, because
+    ``Strategy._deny_order`` calls ``cache.add_order`` before it ever applies
+    ``OrderDenied`` (G7), so every denial path makes its entry inert for
+    free. Disjoint by construction from the cache-sourced sum on that one
+    predicate, so the same order can never be counted twice regardless of
+    which sum currently sees it (RED-20).
     """
 
     def __init__(self, portfolio: Portfolio, cache: CacheFacade) -> None:
         self._portfolio = portfolio
         self._cache = cache
+        self._shim: dict[ClientOrderId, tuple[InstrumentId, Decimal]] = {}
 
     def on_order_event(self, event: Event) -> None:
         """Screen ``OrderInitialized``; ignore every other order event.
@@ -219,14 +236,19 @@ class BacktestOrderGuard:
         instrument_id = event.instrument_id
         net = self._net_long(instrument_id)
         working = self._working_sell_orders(instrument_id)
+        shim_entries = self._shim_entries(instrument_id)
         pending = sum((order.leaves_qty.as_decimal() for order in working), Decimal(0))
+        pending += sum((qty for _coid, qty in shim_entries), Decimal(0))
         quantity = event.quantity.as_decimal()
         if pending + quantity > net:
             contributors = (
                 ", ".join(
-                    f"{order.client_order_id} [{order.status.name}]="
-                    f"{order.leaves_qty.as_decimal()}"
-                    for order in working
+                    [
+                        f"{order.client_order_id} [{order.status.name}]="
+                        f"{order.leaves_qty.as_decimal()}"
+                        for order in working
+                    ]
+                    + [f"{coid} [awaiting cache]={qty}" for coid, qty in shim_entries],
                 )
                 or "none"
             )
@@ -252,11 +274,21 @@ class BacktestOrderGuard:
                 f"flag (any strategy can set it), so it is screened exactly like "
                 f"every other SELL -- a genuinely reducing sell still passes, "
                 f"because it satisfies this same inequality by construction. "
-                f"Orders counted toward `pending` (client_order_id [status]=leaves_qty): "
+                f"Orders counted toward `pending` (client_order_id [status]=leaves_qty, or "
+                f"[awaiting cache]=quantity for a not-yet-cached order-list member): "
                 f"{contributors} -- a stuck SUBMITTED order here, not a strategy that "
                 f"oversold, may be why this was refused; see "
                 f"`docs/plans/ORDER_LIST_BYPASS_2026-09-02.md` §2.1.",
             )
+        # Record ONLY after both refusal rules have passed (`_refuse_post_only`
+        # ran first, in `on_order_event`; the check above is this rule's own).
+        # Recording before screening would make a refused member leave a live
+        # entry that refuses everything after it forever -- RED-24, §3's
+        # ordering constraint. The entry is redundant, never wrong, the
+        # instant `cache.add_order` runs for this same order: `_shim_entries`
+        # treats it as dead from that point on (`cache.order(coid) is not
+        # None`), which is why no eviction event is needed.
+        self._shim[event.client_order_id] = (instrument_id, quantity)
 
     # -- internals ---------------------------------------------------------
 
@@ -307,11 +339,47 @@ class BacktestOrderGuard:
         See `_working_sell_orders` for why this reads `cache.orders(...)`
         rather than `cache.orders_open(...)`. `Cache.orders` guarantees no
         ordering either; this is a SUM, so the result does not depend on one.
+
+        Includes the shim (`_shim_entries`) since Increment 2: a member of an
+        `OrderList` this guard has approved but that has not yet reached the
+        cache is exactly as much an outstanding commitment as a cache-visible
+        one, and the two sums are disjoint by construction (see the class
+        docstring).
         """
-        return sum(
+        working_qty = sum(
             (order.leaves_qty.as_decimal() for order in self._working_sell_orders(instrument_id)),
             Decimal(0),
         )
+        shim_qty = sum(
+            (qty for _coid, qty in self._shim_entries(instrument_id)),
+            Decimal(0),
+        )
+        return working_qty + shim_qty
+
+    def _shim_entries(self, instrument_id: InstrumentId) -> list[tuple[ClientOrderId, Decimal]]:
+        """Guard-approved SELLs for ``instrument_id`` not yet visible in the cache.
+
+        An entry is live only while ``self._cache.order(client_order_id) is
+        None`` (§3) -- once the order reaches the cache, by ANY path (a
+        normal accept, or a denial, which G7 shows always calls
+        ``cache.add_order`` first), the cache-sourced sum in
+        ``_working_sell_orders`` takes over and this entry is redundant.
+        Pruning dead entries here is memory hygiene only, never correctness:
+        an unpruned dead entry would still contribute nothing, because
+        callers only ever sum the LIVE entries this returns.
+        """
+        live: list[tuple[ClientOrderId, Decimal]] = []
+        dead: list[ClientOrderId] = []
+        for client_order_id, (shim_instrument_id, quantity) in self._shim.items():
+            if shim_instrument_id != instrument_id:
+                continue
+            if self._cache.order(client_order_id) is None:
+                live.append((client_order_id, quantity))
+            else:
+                dead.append(client_order_id)
+        for client_order_id in dead:
+            del self._shim[client_order_id]
+        return live
 
     def _net_long(self, instrument_id: InstrumentId) -> Decimal:
         """Net position, floored at zero.

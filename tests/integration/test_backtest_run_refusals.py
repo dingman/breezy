@@ -643,29 +643,19 @@ class _OrderListNakedShortProbe(Strategy):  # type: ignore[misc]  # Strategy is 
         self.submit_order_list(OrderList(OrderListId("OL-1"), legs))
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "TRACKED, NOT FIXED (docs/plans/REDUCE_ONLY_BYPASS_2026-09-02.md §6). "
-        "`Strategy.submit_order_list` publishes every member's "
-        "`OrderInitialized` in one loop BEFORE any of them reaches "
-        "`cache.add_order` (`trading/strategy.pyx:944-981`, F12), so "
-        "`_working_sell_quantity` reads `pending=0` for every member of the "
-        "list -- two plain SELLs each within the net long both pass and net "
-        "a naked short. `ExecAlgorithm` does the reverse and is safe "
-        "(`algorithm.pyx:1194-1210`, F13: cache before publish), so this is a "
-        "Nautilus ordering defect the guard must absorb, not a design "
-        "intent -- and Nautilus is immutable, so it cannot be corrected "
-        "upstream. NOT fixed here: closing it needs mutable "
-        "approved-but-uncached state with a real eviction lifecycle, which "
-        "would make the guard stateful -- most of why it is auditable today. "
-        "`strict=True`: an XPASS means this hole closed and the marker must "
-        "come off, gating removal of R-4's standing refusal on BOTH classes."
-    ),
-)
 def test_an_order_list_of_two_sells_within_the_net_long_is_jointly_naked(
     tape: SyntheticBinaryTape,
 ) -> None:
+    """CLOSED by `docs/plans/ORDER_LIST_BYPASS_2026-09-02.md` Increment 2 (§3):
+    a cache-subordinate shim records every SELL the guard itself approves,
+    live only while `cache.order(client_order_id) is None`. That covers
+    exactly this shape -- `Strategy.submit_order_list` publishes every
+    member's `OrderInitialized` in one loop BEFORE any of them reaches
+    `cache.add_order` (`trading/strategy.pyx:944-981`), so the cache-sourced
+    sum alone reads `pending=0` for every member -- without any eviction
+    event to miss, since an entry that DOES reach the cache (by any path)
+    is inert from that point on by the same predicate.
+    """
     strategy = _OrderListNakedShortProbe(
         _OrderListNakedShortProbeConfig(instrument_id=tape.instrument.id, quantity=Decimal(CLIP)),
     )

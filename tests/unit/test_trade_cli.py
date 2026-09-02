@@ -122,11 +122,18 @@ class _FakeGuardCache:
 
     ``orders``, not ``orders_open`` -- the guard reads ``cache.orders(...)``
     since ``docs/plans/ORDER_LIST_BYPASS_2026-09-02.md`` Increment 1 (§2).
+
+    ``order`` is Increment 2's addition (§6): the naked short driven through
+    here is always against a net of 0, so it is refused and the guard never
+    records a shim entry -- ``None`` unconditionally is correct.
     """
 
     def orders(self, *, instrument_id: InstrumentId | None = None) -> tuple[Any, ...]:
         del instrument_id
         return ()
+
+    def order(self, client_order_id: ClientOrderId) -> None:
+        del client_order_id
 
 
 class _FakeKernel:

@@ -102,11 +102,20 @@ class _FakeCache:
     `docs/plans/ORDER_LIST_BYPASS_2026-09-02.md` Increment 1 (§2); every test
     in this module screens against a net of 0 with no working orders either
     way, so an always-empty return is unaffected by which method is called.
+
+    `order` is Increment 2's addition (§6): the guard's shim consults
+    `cache.order(coid)` for every entry it holds. Every SELL in this module
+    is refused (net is always 0), so the guard never records a shim entry
+    here in the first place -- `order` returning `None` unconditionally is
+    correct, not merely unexercised.
     """
 
     def orders(self, *, instrument_id: InstrumentId | None = None) -> Sequence[Any]:
         del instrument_id
         return ()
+
+    def order(self, client_order_id: ClientOrderId) -> None:
+        del client_order_id
 
 
 class _FakeLiveMessageBus:

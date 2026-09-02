@@ -44,6 +44,7 @@ if TYPE_CHECKING:  # pragma: no cover - typing only
 INSTRUMENT = InstrumentId(Symbol("synthetic-guard-market"), Venue("POLYMARKET_US"))
 NO_SIDE_EVIDENCE_DOC = "docs/evidence/no_side_instrument_probe_2026-08-31.md"
 _DEFAULT_WORKING_CLIENT_ORDER_ID = ClientOrderId("O-WORKING")
+_DEFAULT_EVENT_CLIENT_ORDER_ID = ClientOrderId("O-1")
 
 
 class _FakePortfolio:
@@ -86,14 +87,28 @@ class _FakeOrder:
 class _FakeCache:
     """`orders` replaces `orders_open` as the guard's read (§2): a dict-backed,
     unfiltered-by-openness view, matching real `Cache.orders(...)`.
+
+    `order(client_order_id)` is Increment 2's addition (§6): the guard's
+    shim treats an entry as live only while this returns `None`, so a test
+    must be able to make an order APPEAR in the cache after construction --
+    `add` mimics `Strategy`/`_deny_order` calling `cache.add_order` on the
+    exact same `ClientOrderId` the guard already approved.
     """
 
     def __init__(self, orders: Sequence[_FakeOrder] = ()) -> None:
         self._orders = list(orders)
+        self._by_client_order_id = {order.client_order_id: order for order in self._orders}
 
     def orders(self, *, instrument_id: InstrumentId | None = None) -> list[_FakeOrder]:
         del instrument_id
         return self._orders
+
+    def order(self, client_order_id: ClientOrderId) -> _FakeOrder | None:
+        return self._by_client_order_id.get(client_order_id)
+
+    def add(self, order: _FakeOrder) -> None:
+        self._orders.append(order)
+        self._by_client_order_id[order.client_order_id] = order
 
 
 def _guard(
@@ -110,12 +125,19 @@ def _initialized(
     quantity: int = 1,
     post_only: bool = False,
     reduce_only: bool = False,
+    client_order_id: ClientOrderId = _DEFAULT_EVENT_CLIENT_ORDER_ID,
 ) -> OrderInitialized:
+    """`client_order_id` is parametrized since Increment 2 (§6): screening
+    several list-shaped members in sequence (RED-17/18/20/21/24) requires
+    each to carry its OWN id, since the guard's shim keys on it -- the
+    default keeps every pre-Increment-2 call site (a single event per test)
+    unchanged.
+    """
     return OrderInitialized(
         trader_id=TraderId("BREEZY-BACKTEST-001"),
         strategy_id=StrategyId("S-1"),
         instrument_id=INSTRUMENT,
-        client_order_id=ClientOrderId("O-1"),
+        client_order_id=client_order_id,
         order_side=side,
         order_type=OrderType.LIMIT,
         quantity=Quantity(quantity, 0),
@@ -605,3 +627,130 @@ def test_the_refusal_names_every_order_it_counted() -> None:
     assert "SUBMITTED" in message
     assert "O-RESTING" in message
     assert "ACCEPTED" in message
+
+
+# ---------------------------------------------------------------------------
+# docs/plans/ORDER_LIST_BYPASS_2026-09-02.md §3/§6, Increment 2: a cache-
+# subordinate shim closes RED-12 (the order-list bypass). An approved SELL's
+# `ClientOrderId` is recorded in the shim only AFTER both refusal rules pass
+# (RED-24, the ordering constraint that makes the residual `1..k-1`, not
+# `1..k`); the entry counts toward `pending` only while
+# `cache.order(coid) is None` (RED-20/21) -- disjoint by construction from
+# the cache-sourced sum, so no order is ever double-counted.
+# ---------------------------------------------------------------------------
+
+
+def test_a_single_member_order_list_within_the_net_long_passes() -> None:
+    """RED-17. Net 10, one screening of a SELL of 10 -- no working orders, no
+    prior approvals. §1's rejection made executable: a one-member "list" is
+    not itself the attack shape and must not be refused merely for existing.
+    """
+    _guard(net=Decimal(10)).on_order_event(_initialized(quantity=10))
+
+
+def test_a_three_member_order_list_refuses_on_the_third_leg() -> None:
+    """RED-18. Net 20, three plain SELLs of 10 screened one at a time -- the
+    exact shape `submit_order_list`'s publish loop produces, since none
+    reaches `cache.add_order` before the next is screened (RED-12's
+    integration-level pin). Legs 1-2 pass and accumulate in the shim; leg 3
+    is refused, with the overage in the message: the shim ACCUMULATES, it
+    does not ban the list outright (§1).
+    """
+    guard = _guard(net=Decimal(20))
+
+    guard.on_order_event(_initialized(quantity=10, client_order_id=ClientOrderId("OL-1")))
+    guard.on_order_event(_initialized(quantity=10, client_order_id=ClientOrderId("OL-2")))
+
+    with pytest.raises(NakedShortRefusedError) as excinfo:
+        guard.on_order_event(_initialized(quantity=10, client_order_id=ClientOrderId("OL-3")))
+
+    message = str(excinfo.value)
+    assert "naked short of 10" in message
+    assert "OL-1" in message
+    assert "OL-2" in message
+    assert "awaiting cache" in message
+
+
+def test_an_approved_sell_stops_being_counted_once_the_cache_holds_it() -> None:
+    """RED-20. The disjointness invariant: approve a SELL of 10 (shim-only,
+    since the fake cache starts empty -- the order-list shape), then have
+    the cache pick the SAME order up as `SUBMITTED` (the normal-submit
+    shape, `strategy.pyx` :944-981 vs :855-871). `pending` must read 10, not
+    20 -- the cache-sourced and shim-sourced sums are disjoint on one
+    predicate (`cache.order(coid) is None`), so the same order is never
+    counted twice regardless of which sum currently sees it.
+    """
+    cache = _FakeCache()
+    guard = BacktestOrderGuard(_FakePortfolio(Decimal(10)), cache)
+    approved_id = ClientOrderId("OL-1")
+
+    guard.on_order_event(_initialized(quantity=10, client_order_id=approved_id))
+
+    cache.add(
+        _FakeOrder(
+            side=OrderSide.SELL,
+            leaves=Decimal(10),
+            status=OrderStatus.SUBMITTED,
+            client_order_id=approved_id,
+        ),
+    )
+
+    with pytest.raises(NakedShortRefusedError) as excinfo:
+        guard.on_order_event(_initialized(quantity=1, client_order_id=ClientOrderId("OL-2")))
+
+    assert "naked short of 1" in str(excinfo.value)
+
+
+def test_a_denied_order_list_member_stops_counting() -> None:
+    """RED-21. G7: `Strategy._deny_order`/`_deny_order_list` call
+    `cache.add_order` BEFORE applying `OrderDenied` (closed), for all three
+    denial paths (duplicate list id, duplicate client order id,
+    `MARKET_EXIT_IN_PROGRESS`). By the time the NEXT member is screened, a
+    denied member sits in the cache as closed -- 0 from the cache-sourced
+    sum (`is_closed`) AND its shim entry is inert
+    (`cache.order(coid) is not None`), so it contributes 0 from either sum:
+    the collapsed eviction table (§3).
+    """
+    cache = _FakeCache()
+    guard = BacktestOrderGuard(_FakePortfolio(Decimal(10)), cache)
+    denied_id = ClientOrderId("OL-1")
+
+    guard.on_order_event(_initialized(quantity=10, client_order_id=denied_id))
+
+    cache.add(
+        _FakeOrder(
+            side=OrderSide.SELL,
+            leaves=Decimal(10),
+            is_closed=True,
+            status=OrderStatus.DENIED,
+            client_order_id=denied_id,
+        ),
+    )
+
+    # Would be jointly naked (10 + 10 > 10) if either sum still counted the
+    # denied member.
+    guard.on_order_event(_initialized(quantity=10, client_order_id=ClientOrderId("OL-2")))
+
+
+def test_a_refused_member_leaves_no_shim_entry() -> None:
+    """RED-24. §3's record-after-approve constraint, made executable: the
+    guard must record an approved SELL only AFTER both refusal rules pass,
+    never before screening. Net 20, three plain SELLs of 10: legs 1-2 pass
+    (shim now holds 20), leg 3 is refused (naked short of 10) and must NOT
+    be recorded. A probe leg of 1 afterwards sees `pending == 20`, not `30`
+    -- if leg 3 had wrongly been recorded the probe's overage would read
+    `11`, not `1`. Get the ordering backwards and a refused order leaves a
+    live entry that refuses everything after it forever.
+    """
+    guard = _guard(net=Decimal(20))
+
+    guard.on_order_event(_initialized(quantity=10, client_order_id=ClientOrderId("OL-1")))
+    guard.on_order_event(_initialized(quantity=10, client_order_id=ClientOrderId("OL-2")))
+
+    with pytest.raises(NakedShortRefusedError):
+        guard.on_order_event(_initialized(quantity=10, client_order_id=ClientOrderId("OL-3")))
+
+    with pytest.raises(NakedShortRefusedError) as excinfo:
+        guard.on_order_event(_initialized(quantity=1, client_order_id=ClientOrderId("OL-4")))
+
+    assert "naked short of 1" in str(excinfo.value)
