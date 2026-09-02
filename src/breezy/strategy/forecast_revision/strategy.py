@@ -80,6 +80,7 @@ from breezy.strategy.weather_common.forecast_source import (
     MissingForecastSourceError,
 )
 from breezy.strategy.weather_common.freshness import SignalFreshness
+from breezy.strategy.weather_common.inflight import signed_working_qty, working_orders
 from breezy.strategy.weather_common.models import ForecastSnapshot, MarketQuote, SideIntent
 from breezy.strategy.weather_common.probability import (
     ForecastErrorModel,
@@ -99,7 +100,6 @@ if TYPE_CHECKING:  # pragma: no cover - typing only
     from nautilus_trader.core.data import Data
     from nautilus_trader.model.data import OrderBookDepth10, QuoteTick
     from nautilus_trader.model.identifiers import InstrumentId
-    from nautilus_trader.model.orders.base import Order
 
     from breezy.strategy.weather_common.models import SignalDecision
 
@@ -317,7 +317,11 @@ class ForecastRevisionStrategy(SharedExposureMixin, Strategy):
         current_qty: float,
     ) -> None:
         nt_id = self._nt_ids[contract.instrument_id]
-        if self.cache.orders_open(instrument_id=nt_id):
+        # INITIALIZED and SUBMITTED count: `cache.orders_open(...)` excludes
+        # both, so this gate used to read an empty book inside the
+        # submit -> ACCEPTED window and let a duplicate order through
+        # (`weather_common.inflight`).
+        if working_orders(self.cache, nt_id):
             self.log.debug(f"skip {contract.instrument_id}: working order exists")
             return
         target_qty = (
@@ -410,8 +414,15 @@ class ForecastRevisionStrategy(SharedExposureMixin, Strategy):
         qty = float(self.portfolio.net_position(nt_id))
         if abs(qty) < 1e-9:
             return
-        if self.cache.orders_open(instrument_id=nt_id):
-            self.cancel_all_orders(nt_id)
+        # UNCONDITIONAL, deliberately. `Strategy.cancel_all_orders`
+        # (`trading/strategy.pyx`) already queries `orders_open` PLUS
+        # `orders_emulated` PLUS `orders_inflight`, and logs-and-returns
+        # cleanly when all three are empty. A Breezy-side `orders_open`
+        # pre-filter was strictly narrower than the native query it guarded,
+        # so its only possible effect was suppressing a cancel Nautilus would
+        # correctly have performed -- e.g. of a SUBMITTED reducing SELL, which
+        # `close_all_positions` below would then have doubled up on.
+        self.cancel_all_orders(nt_id)
         self.close_all_positions(nt_id)
         self.log.info(f"FLATTEN {instrument_id} qty={qty:.1f} reason={reason}")
 
@@ -421,7 +432,7 @@ class ForecastRevisionStrategy(SharedExposureMixin, Strategy):
             iid: float(self.portfolio.net_position(nt_id)) for iid, nt_id in nt_ids.items()
         }
         pending_qty = {
-            iid: _signed_open_order_qty(self.cache.orders_open(instrument_id=nt_id))
+            iid: signed_working_qty(working_orders(self.cache, nt_id))
             for iid, nt_id in nt_ids.items()
         }
         return PortfolioSnapshot(
@@ -446,10 +457,3 @@ class ForecastRevisionStrategy(SharedExposureMixin, Strategy):
 
 def _ns_to_datetime(ts_event: int) -> datetime:
     return datetime.fromtimestamp(ts_event / 1_000_000_000, tz=UTC)
-
-
-def _signed_open_order_qty(orders: list[Order]) -> float:
-    total = 0.0
-    for order in orders:
-        total += float(order.signed_decimal_qty())
-    return total

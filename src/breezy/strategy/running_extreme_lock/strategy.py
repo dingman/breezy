@@ -126,6 +126,7 @@ from breezy.strategy.running_extreme_lock.decision import (
 )
 from breezy.strategy.weather_common.bucket_contract import MispricingContract
 from breezy.strategy.weather_common.freshness import SignalFreshness
+from breezy.strategy.weather_common.inflight import signed_working_qty, working_orders
 from breezy.strategy.weather_common.models import MarketQuote, hours_until
 from breezy.strategy.weather_common.refusals import RefusalAlerter, RefusalCounter
 from breezy.strategy.weather_common.risk import (
@@ -140,7 +141,6 @@ if TYPE_CHECKING:  # pragma: no cover - typing only
     from nautilus_trader.core.data import Data
     from nautilus_trader.model.data import OrderBookDepth10
     from nautilus_trader.model.identifiers import InstrumentId
-    from nautilus_trader.model.orders.base import Order
 
     from breezy.strategy.weather_common.models import SignalDecision
 
@@ -362,7 +362,11 @@ class RunningExtremeLockStrategy(SharedExposureMixin, Strategy):
         current_qty: float,
     ) -> None:
         nt_id = self._nt_ids[contract.instrument_id]
-        if self.cache.orders_open(instrument_id=nt_id):
+        # INITIALIZED and SUBMITTED count: `cache.orders_open(...)` excludes
+        # both, so this gate used to read an empty book inside the
+        # submit -> ACCEPTED window and let a duplicate order through
+        # (`weather_common.inflight`).
+        if working_orders(self.cache, nt_id):
             self.log.debug(f"skip {contract.instrument_id}: working order exists")
             return
         # LONG_YES only -- decision.py never returns any other intent. A
@@ -436,7 +440,7 @@ class RunningExtremeLockStrategy(SharedExposureMixin, Strategy):
             iid: float(self.portfolio.net_position(nt_id)) for iid, nt_id in nt_ids.items()
         }
         pending_qty = {
-            iid: _signed_open_order_qty(self.cache.orders_open(instrument_id=nt_id))
+            iid: signed_working_qty(working_orders(self.cache, nt_id))
             for iid, nt_id in nt_ids.items()
         }
         return PortfolioSnapshot(
@@ -461,10 +465,3 @@ class RunningExtremeLockStrategy(SharedExposureMixin, Strategy):
 
 def _ns_to_datetime(ts_event: int) -> dt.datetime:
     return dt.datetime.fromtimestamp(ts_event / 1_000_000_000, tz=dt.UTC)
-
-
-def _signed_open_order_qty(orders: list[Order]) -> float:
-    total = 0.0
-    for order in orders:
-        total += float(order.signed_decimal_qty())
-    return total

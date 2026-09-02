@@ -158,9 +158,15 @@ class PortfolioSnapshot:
 
     Unlike the bundle's ``PortfolioSnapshot``, this is not a strategy-owned,
     incrementally-mutated ledger: the strategy re-derives it on every
-    decision from ``Strategy.portfolio.net_position`` and
-    ``Strategy.cache.orders_open`` (both native), so it can never drift from
-    what Nautilus itself believes is true.
+    decision from ``Strategy.portfolio.net_position`` and ``Strategy.cache``
+    (both native), so it can never drift from what Nautilus itself believes
+    is true.
+
+    The cache query is ``breezy.strategy.weather_common.inflight``'s
+    ``working_orders`` -- ``cache.orders(...)`` filtered on
+    ``not order.is_closed`` -- and NOT ``cache.orders_open(...)``, which
+    excludes ``INITIALIZED`` and ``SUBMITTED`` and so read an empty book
+    inside the submit -> ACCEPTED window (T-1).
     """
 
     position_qty: dict[str, float] = field(default_factory=dict)  # signed YES qty
@@ -194,14 +200,31 @@ class PortfolioSnapshot:
         the settled long are jointly naked, and this method cannot see the
         first one. It is not fixable from `pending_qty`, which is a single
         SIGNED net per instrument -- a +50 net can be a 60-lot buy against a
-        10-lot sell, so the sell component is not recoverable here. What
-        covers it today: every strategy skips evaluation entirely while any
-        order is working (`cache.orders_open`), and in backtests
-        :class:`breezy.runtime.backtest_order_guard.BacktestOrderGuard` sums
-        working sell quantity straight from the cache at submit time. The
-        first of those is incidental and the second is backtest-only, so a
-        change that widens the portfolio snapshot must re-examine this -- see
-        the plan's P4.
+        10-lot sell, so the sell component is not recoverable here.
+
+        WHAT COVERS IT: exactly one thing, at submit time, in BOTH modes --
+        :class:`breezy.runtime.backtest_order_guard.BacktestOrderGuard`, which
+        sums working SELL quantity straight from the cache rather than from
+        any signed net. `install_live_order_guard` wires that same class onto
+        a live `MessageBus`, so it is not backtest-only; this docstring
+        previously said it was, and that was stale.
+
+        It is the ONLY cover, and this docstring previously claimed two.
+        Neither of the other candidates is one. The strategies' in-flight
+        gate read the SAME query this snapshot did, so the pair was one query
+        with one hole, not two independent covers. And the gate never guarded
+        the FLAT path at all: `_flatten` goes straight to
+        `close_all_positions` without consulting it (T-1 removed the only
+        query that path ever made, a cancel pre-filter, because Nautilus's own
+        `cancel_all_orders` already asks the wider question).
+
+        T-1 widened the query behind `pending_qty` to include INITIALIZED and
+        SUBMITTED (`breezy.strategy.weather_common.inflight`). It deliberately
+        did NOT change the REPRESENTATION: `pending_qty` is still a signed
+        net and still cannot express the jointly-naked case, so this gap is
+        exactly as open as it was. `settled_qty` itself is unchanged, and
+        remains the only quantity a sell may net against. A change that splits
+        `pending_qty` into buy and sell legs is what would close it.
         """
         return self.position_qty.get(instrument_id, 0.0)
 

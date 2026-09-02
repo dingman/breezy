@@ -118,6 +118,7 @@ from breezy.strategy.weather_common.costs import (
     fee_coefficient_from_info,
 )
 from breezy.strategy.weather_common.freshness import SignalFreshness
+from breezy.strategy.weather_common.inflight import signed_working_qty, working_orders
 from breezy.strategy.weather_common.models import MarketQuote, hours_until
 from breezy.strategy.weather_common.refusals import RefusalAlerter, RefusalCounter
 from breezy.strategy.weather_common.risk import (
@@ -132,7 +133,6 @@ if TYPE_CHECKING:  # pragma: no cover - typing only
     from nautilus_trader.core.data import Data
     from nautilus_trader.model.data import OrderBookDepth10
     from nautilus_trader.model.identifiers import InstrumentId
-    from nautilus_trader.model.orders.base import Order
 
     from breezy.strategy.weather_common.models import SignalDecision
 
@@ -765,7 +765,11 @@ class CliSettlementPrintLockStrategy(SharedExposureMixin, Strategy):
         max_quote_age_minutes: float,
     ) -> None:
         nt_id = self._nt_ids[contract.instrument_id]
-        if self.cache.orders_open(instrument_id=nt_id):
+        # INITIALIZED and SUBMITTED count: `cache.orders_open(...)` excludes
+        # both, so this gate used to read an empty book inside the
+        # submit -> ACCEPTED window and let a duplicate order through
+        # (`weather_common.inflight`).
+        if working_orders(self.cache, nt_id):
             self.log.debug(f"skip {contract.instrument_id}: working order exists")
             return
         # LONG_YES only -- `decision.py` never returns any other intent. A
@@ -848,7 +852,9 @@ class CliSettlementPrintLockStrategy(SharedExposureMixin, Strategy):
         re-derived from the current ask: at a falling ask a current-price
         estimate understates the historical basis and re-opens the ratchet.
         Working orders cannot double-count, because ``_maybe_submit`` has
-        already returned if any order is open on this instrument.
+        already returned if any order is WORKING on this instrument -- which
+        now includes one merely ``INITIALIZED`` or ``SUBMITTED``, the two
+        statuses ``orders_open`` missed (``weather_common.inflight``, T-1).
         """
         anchor = decision.metadata.get("cost_basis_anchor")
         fee_prob = decision.metadata.get("fee_prob")
@@ -968,7 +974,7 @@ class CliSettlementPrintLockStrategy(SharedExposureMixin, Strategy):
             iid: float(self.portfolio.net_position(nt_id)) for iid, nt_id in nt_ids.items()
         }
         pending_qty = {
-            iid: _signed_open_order_qty(self.cache.orders_open(instrument_id=nt_id))
+            iid: signed_working_qty(working_orders(self.cache, nt_id))
             for iid, nt_id in nt_ids.items()
         }
         return PortfolioSnapshot(
@@ -993,10 +999,3 @@ class CliSettlementPrintLockStrategy(SharedExposureMixin, Strategy):
 
 def _ns_to_datetime(ts_event: int) -> dt.datetime:
     return dt.datetime.fromtimestamp(ts_event / 1_000_000_000, tz=dt.UTC)
-
-
-def _signed_open_order_qty(orders: list[Order]) -> float:
-    total = 0.0
-    for order in orders:
-        total += float(order.signed_decimal_qty())
-    return total

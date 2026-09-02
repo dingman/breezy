@@ -197,12 +197,16 @@ ceiling and operator gate are asserted but unenforced — whoever lands R-7 must
 wire it and relax B6 deliberately in that commit, or the send path ships with
 no operator gate at all.
 
-**[HIGH, TRACKED] T-1 — the same blindness at the STRATEGY layer.**
-`weather_common/risk.py:198-204` documents two independent covers for the
-jointly-naked case; both call `cache.orders_open`, which is one query with a
-hole. 14 call sites / 6 modules: 8 skip-gates, and 5 feeding
-`_signed_open_order_qty`, so the risk snapshot's own in-flight view is blind
-too. Correct that docstring in the same change.
+**[RESOLVED 2026-09-02] T-1 — `orders_open` blindness at the STRATEGY layer.**
+Verified census, 14 sites: 5 class A in-flight gates + 3 class B *cancel*-gates
+(opposite failure direction from a skip-gate) + 5 class C `pending_qty` feeds +
+1 class D ladder probe (`resting_ladder.py:262` — a venue-behaviour
+measurement, never a feed). The old "8 skip-gates + 5 feeds" binned to 13 and
+mis-binned three. A/C now read `weather_common/inflight.py`; B deleted;
+D untouched; `risk.py`'s docstring corrected with them.
+**Still OPEN, out of T-1's scope:** `_flatten`'s cancel is async and cannot
+reach an INITIALIZED order, so `close_all_positions` can still race it into a
+guard refusal — a cancel/close SEQUENCING defect, narrowed, not closed.
 
 ---
 
