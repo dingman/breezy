@@ -681,3 +681,39 @@ and is very likely already in the price.
 See also L-1 (validate before building) and the standing note that an
 underpowered verdict describes the sample, not the world — this is its mirror
 image: a WELL-powered verdict can also describe the sample rather than the world.
+
+## L-14 — A barrier list is DERIVED from "what would refuse this?", never recalled (2026-09-02)
+
+Three plan revisions across four increments each stated which barrier tests a
+change would touch, and each was wrong the same way. Increment W's list read
+"N2 exact-set pin ... Nothing else." Building it turned FOUR barriers red:
+`PERMITTED_EXECUTION_CLIENTS` (`test_polymarket_us_readonly_guard.py:734-743`,
+whose docstring said outright "Factories stay banned outright"), its meta-pin
+(`test_cage_rule_constants_are_pinned.py:511,777`), and
+`TestTheReadOnlyCageIsDeclaredNotDefaulted` (`test_runtime_node_config.py:347`),
+the last tripping TWICE — once on the build-site count, once on the per-field
+rule. Auditing the rest of the plan on the same suspicion moved one increment's
+list from two entries to NINE.
+
+**Why the error is systematic rather than careless.** A barrier list written
+from memory is a list of the tests the author READ. The barriers that actually
+gate a change are the ones that would REFUSE it, and several of those fire on
+properties nobody looks up: an equality over a pin TABLE that every new constant
+must join; a COUNT pin that trips on each new allowlist ENTRY, so two entries
+are two changes and not one; widened/narrowed-neighbour tests that come free
+with every new pin; and scans whose roots (`src` + `scripts` + `tests`) are
+broader than the package under edit.
+
+**The rule: derive the list by asking "what would refuse this?" and answer it by
+running the suite against a deliberately broken version of the change — not by
+recalling which files were read.** A barrier list is a falsifiable claim, so
+test it. In this repo the cheap derivation is: grep the barrier files for the
+constant, the class base, the path prefix, and the config field the change
+touches, then check each hit for a count pin and a meta-pin above it.
+
+Corollary, and the reason this matters beyond tidiness: an under-enumerated
+barrier list makes a change look SMALLER than it is at planning time, so the
+increment is sized wrong, and the widenings get done under implementation
+pressure rather than under review. That is the condition under which someone
+relaxes a comparison instead of widening a set — which is exactly what L-12
+exists to prevent.
