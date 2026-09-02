@@ -6,6 +6,17 @@ Generated 2026-09-02T22:45:07+00:00 from
 
 A descriptive join, not a backtest: no order, fill, position, fee or P&L appears anywhere in this pipeline. NautilusTrader is the exclusive owner of backtesting and execution.
 
+> **Audit 2026-09-02 23:10Z (prediction-market-reviewer, independent recomputation):** Part A is
+> CORRECT — MDW-SON-h12 m=0 reproduced exactly (n=455, 291 holds, Wilson-lower 0.5944); LST
+> alignment uses fixed standard offsets (`climate_day.py:24-35`); R(h) is through h:59; m=0/m=1
+> are separate cells selected by the real ladder in Part B; the ASOS→CLI basis biases p_hold DOWN
+> (CLI > ASOS day-end max on 284/1825 MDW days, all scored as misses). **Interpretation
+> corrected:** the archive p_hold is an unconditional climatological base rate; the venue ask is
+> information-conditioned (forecast, trend). On 09-01 MDW the day settled 93 > the noon rung
+> [91,92] — the market's 0.06 was right. A base-rate edge is not evidence of mispricing; the
+> discriminating statistic is the REALIZED hold rate of taken current-rung trials vs ask + fee
+> (Wilson upper bound), which needs n ≈ 60–150 trials. Kill amendment pending Grok.
+
 ## Tape integrity (LESSON L-8) -- verified before interpretation
 
 > breezy-quote-tape-preflight over /home/jon/.local/share/breezy/catalog/quote_tape/polymarket_us: all 989 staged files carrying M_A's target station-day instruments are INTACT -- 1252168 rows, 0 truncated, 0 unreadable, 0 empty.
