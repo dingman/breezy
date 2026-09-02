@@ -1,0 +1,52 @@
+[Unit]
+# Daily driver for M_A (ma_prelock_winner_ask_study.py, the SS2/SS3
+# pre-lock winner-ask measurement) and M_B (mb_current_rung_edge_study.py,
+# the current-rung archive-vs-tape edge measurement), triggered by
+# breezy-mb-daily.timer. Sibling of breezy-k1-daily.service: same
+# oneshot/no-Install shape, same wrapper-script driver style
+# (deploy/systemd/mb-daily-run.sh mirrors k1-daily-run.sh), for the same
+# reason -- the timer owns cadence, the script owns the work.
+#
+# Unlike K1, this unit DOES need the network: mb-daily-run.sh runs
+# asos_recent_refresh.py first (Item 4's pattern, reused here) so the two
+# studies' cache-only, raise-on-miss ASOS reads
+# (ma_prelock_winner_ask_study.py:load_asos_series_for_day) have a
+# byte-identical cache entry to read on the day this window has advanced
+# past what was previously fetched -- see mb-daily-run.sh's own header for
+# why `--since` (not `--lookback-days`) is what keeps the two anchors
+# identical day over day.
+Description=Breezy M_A + M_B tape-side measurement studies (daily)
+Documentation=file:///home/jon/breezy/deploy/systemd/README.md
+Documentation=file:///home/jon/breezy/scripts/analysis/ma_prelock_winner_ask_study.py
+Documentation=file:///home/jon/breezy/scripts/analysis/mb_current_rung_edge_study.py
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=/home/jon/breezy
+UMask=0077
+
+# No EnvironmentFile, deliberately: neither study nor the ASOS refresh holds
+# a venue credential. Both studies default their quote-tape and settlement
+# catalog paths absolutely (ma_prelock_winner_ask_study.py:
+# DEFAULT_QUOTE_TAPE_CATALOG, DEFAULT_SETTLEMENT_CATALOG), and the refresh
+# talks only to the public IEM ASOS endpoint -- same posture as
+# breezy-k1-daily.service and breezy-offer-gate-daily.service.
+ExecStart=/home/jon/breezy/deploy/systemd/mb-daily-run.sh
+
+# Double breezy-k1-daily.service's budget: this unit runs a network fetch
+# across five sites PLUS two full measurement scripts in sequence, not one
+# local disk-only read. For Type=oneshot this bounds the whole run.
+TimeoutStartSec=3600
+
+# No Restart=. A missed daily run is not an incident -- the tape and the
+# ASOS cache keep growing, and tomorrow's run subsumes today's. The timer's
+# Persistent=true is what recovers a run missed across a reboot.
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=breezy-mb-daily
+
+# NOTE: no [Install] section. This unit is started BY the timer, never
+# enabled directly. `systemctl --user enable breezy-mb-daily.timer` is the
+# only thing to enable.

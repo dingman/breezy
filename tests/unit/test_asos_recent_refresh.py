@@ -20,7 +20,12 @@ import pytest
 REPO_ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, (REPO_ROOT / "scripts/analysis").as_posix())
 
-from asos_recent_refresh import RefreshReport, refresh_recent_asos, refresh_window
+from asos_recent_refresh import (
+    RefreshReport,
+    lookback_days_since,
+    refresh_recent_asos,
+    refresh_window,
+)
 from settlement_alignment_study import load_sites
 
 _LAX_SPEC = next(spec for spec in load_sites() if spec.city == "LAX")
@@ -184,3 +189,32 @@ def test_refresh_recent_asos_is_empty_for_no_sites(tmp_path: Path) -> None:
     )
     assert report.results == ()
     assert report.any_shortfall is False
+
+
+# ---------------------------------------------------------------------------
+# lookback_days_since -- pure. Backs `--since`, an absolute-anchor alternative
+# to `--lookback-days` that does not drift a day further from the anchor
+# every day this unit runs (see ma_prelock_winner_ask_study.py:ASOS_FETCH_START).
+# ---------------------------------------------------------------------------
+
+
+def test_lookback_days_since_spans_from_since_to_today() -> None:
+    assert (
+        lookback_days_since(today=dt.date(2026, 9, 5), since=dt.date(2026, 8, 30)) == 6
+    )
+
+
+def test_lookback_days_since_is_zero_when_since_is_today() -> None:
+    assert lookback_days_since(today=dt.date(2026, 9, 2), since=dt.date(2026, 9, 2)) == 0
+
+
+def test_lookback_days_since_rejects_since_after_today() -> None:
+    with pytest.raises(ValueError, match="since"):
+        lookback_days_since(today=dt.date(2026, 8, 30), since=dt.date(2026, 9, 5))
+
+
+def test_parse_args_since_defaults_to_none_and_parses_an_iso_date() -> None:
+    from asos_recent_refresh import _parse_args
+
+    assert _parse_args([]).since is None
+    assert _parse_args(["--since", "2026-08-30"]).since == dt.date(2026, 8, 30)

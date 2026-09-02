@@ -346,3 +346,72 @@ when the timer will fire, never which version of the service it will fire.
   `breezy-quote-tape-preflight` — a preflight running during an outage read as
   "recorder is up" and would have SUPPRESSED the restart. Any future
   process-liveness check must use `pgrep -x -f "<full ExecStart>"`.
+
+---
+
+## `breezy-mb-daily` — M_A + M_B tape-side studies (2026-09-02, PREPARED, NOT ACTIVATED)
+
+`breezy-mb-daily.service` + `.timer` run `ma_prelock_winner_ask_study.py`
+(M_A) and `mb_current_rung_edge_study.py` (M_B) daily at **13:30 UTC** via a
+wrapper script, `deploy/systemd/mb-daily-run.sh`, in the same style as
+`k1-daily-run.sh`: the timer owns cadence, the script owns the work. M_A runs
+first; M_B runs **unconditionally** afterward — a failed or cache-starved M_A
+never skips M_B's own daily sample. The schedule sits after the 12:15 UTC
+quote-tape-catalog ingest tick, after every dense station's previous climate
+day has closed (latest, SFO/LAX at UTC-8, closes at 08:00 UTC) and its CLI
+final has normally posted, and staggered a full hour off `breezy-k1-daily`
+(22:30 UTC) / `breezy-offer-gate-daily` (22:45 UTC) — see the timer file's own
+comment for the full reasoning.
+
+Both studies previously hard-coded `ASOS_FETCH_END` to a literal date with a
+comment instructing a human to hand-edit it forward each day
+(`ma_prelock_winner_ask_study.py`, imported by `mb_current_rung_edge_study.py`)
+— exactly what an unattended daily timer cannot do. `default_asos_fetch_end()`
+replaces it with a through-**today** default (not yesterday: a station-day
+without a posted CLI final already scores PENDING rather than a false
+"zero-qualifying" result, so including today's still-open climate day is
+safe). `ASOS_FETCH_START` stays a fixed anchor, so the window only ever
+widens — this is the mechanism by which "the tape-side sample accrues" across
+runs, not merely "the same report gets rewritten daily."
+
+Both studies are **cache-only** for ASOS: `load_asos_series_for_day` raises
+`SystemExit` on a cache miss rather than fetching, keyed on the exact IEM
+ASOS URL for `(ASOS_FETCH_START, ASOS_FETCH_END)`
+(`settlement_alignment_study.py:cache_path_for_url` hashes the whole URL, so
+no partial or nearby-range cache file satisfies it). `asos_recent_refresh.py`
+(Item 4's fetcher) previously only supported a `--lookback-days` window
+relative to *today*, which can **never** produce that exact URL against a
+*fixed* `ASOS_FETCH_START` — its window's start drifts a day further from the
+anchor every day the timer fires. `mb-daily-run.sh` therefore calls it with
+the new `--since <ASOS_FETCH_START literal>` flag instead
+(`lookback_days_since`), which pins the fetch's start to the exact same
+anchor and its end to `today` — matching `default_asos_fetch_end()` exactly,
+so the refreshed cache entry is the one the studies actually read. The
+`--since` literal in `mb-daily-run.sh` duplicates
+`ma_prelock_winner_ask_study.ASOS_FETCH_START`; there is no shared import
+across the shell/Python boundary, so both must be updated together if that
+anchor ever moves — the wrapper script's header says so at the point of use.
+
+Artefacts land under `~/.local/share/breezy/derived/`, dated
+(`ma_prelock_winner_ask_<date>.md`, `mb_current_rung_edge_<date>.md`), one
+snapshot per day — the unit never writes into `docs/evidence/`; promoting a
+snapshot there is a deliberate, reviewed step, same convention as
+`breezy-k1-daily` and `breezy-offer-gate-daily`.
+
+Validation performed (no unit activated):
+
+```
+$ systemd-analyze --user verify deploy/systemd/breezy-mb-daily.service \
+    deploy/systemd/breezy-mb-daily.timer
+(no output)
+EXIT=0
+
+$ bash -n deploy/systemd/mb-daily-run.sh
+OK
+```
+
+To activate: symlink both unit files into `~/.config/systemd/user/` (§2's
+pattern), `daemon-reload`, then
+`systemctl --user enable --now breezy-mb-daily.timer` — deliberately not run
+here; see the TRAP section above for the post-edit `daemon-reload` discipline
+that applies to any future edit of this unit too.

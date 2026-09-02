@@ -1,0 +1,43 @@
+[Unit]
+Description=Daily trigger for the Breezy M_A + M_B tape-side measurement studies
+Documentation=file:///home/jon/breezy/deploy/systemd/README.md
+Documentation=file:///home/jon/breezy/scripts/analysis/ma_prelock_winner_ask_study.py
+Documentation=file:///home/jon/breezy/scripts/analysis/mb_current_rung_edge_study.py
+
+[Timer]
+Unit=breezy-mb-daily.service
+
+# 13:30 UTC -- chosen for three reasons together:
+# 1. AFTER the 12:15 UTC quote-tape-catalog ingest tick
+#    (breezy-quote-tape-ingest.timer's *-*-* 00,06,12,18:15:00 UTC), so the
+#    parquet catalog M_A/M_B query is never more than 75 minutes stale.
+# 2. AFTER every dense station's previous climate day has closed AND its CLI
+#    final has normally posted. Dense stations run on fixed local standard
+#    time (no DST): SFO/LAX at UTC-8, MIA at UTC-5, MDW at UTC-6
+#    (settlement_alignment_study.py:load_sites). The latest to close, SFO/
+#    LAX, ends its climate day at 08:00 UTC, and the NWS CLI product for a
+#    station is ordinarily issued within a few hours of local midnight --
+#    well inside the 08:00-13:30 UTC gap. `default_asos_fetch_end()` (through
+#    TODAY, not yesterday) makes this a safety margin rather than a hard
+#    requirement: a still-open climate day is already scored PENDING, never
+#    a false result, if a final is unusually late.
+# 3. STAGGERED off breezy-k1-daily.timer (22:30 UTC) and
+#    breezy-offer-gate-daily.timer (22:45 UTC): a different hour entirely,
+#    not merely a different minute, so this run can never land in the same
+#    tick as either. UTC is stated explicitly (this host's clock is UTC --
+#    see breezy-k1-daily.timer's own comment) so the schedule cannot move if
+#    the host timezone is ever changed.
+OnCalendar=*-*-* 13:30:00 UTC
+
+# A run missed because the host was down fires as soon as the timer is next
+# active, instead of being silently skipped until the following day --
+# mirrors breezy-k1-daily.timer and breezy-offer-gate-daily.timer.
+Persistent=true
+
+# This unit's ASOS refresh half has no venue rate limit of its own concern
+# (IEM ASOS is public data), and a deterministic time makes correlating a
+# snapshot with the tape and the other daily jobs easier.
+AccuracySec=1min
+
+[Install]
+WantedBy=timers.target

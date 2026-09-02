@@ -128,6 +128,7 @@ __all__ = [
     "build_station_day_summary",
     "collect_preflight_summary",
     "collect_window_instants",
+    "default_asos_fetch_end",
     "discover_station_days",
     "evaluate_family_a",
     "first_ask_at_or_above",
@@ -164,10 +165,24 @@ MIN_AFTERNOON_STATION_DAYS: Final[int] = 15
 #: K-depth (SS3): level-0 size below one contract is unexecutable.
 MIN_EXECUTABLE_SIZE: Final[float] = 1.0
 
-#: "2026-08-30 -> last complete climate day." Run 2026-09-02: 09-02 is not
-#: yet a complete climate day, so the last complete day is 09-01.
+def default_asos_fetch_end(*, today: dt.date | None = None) -> dt.date:
+    """"2026-08-30 -> through today" -- a daily unattended run (deploy/systemd/
+    breezy-mb-daily.timer) must advance this window itself; a hard-coded date
+    here is exactly the hand-maintained value that timer replaces. Through
+    TODAY, not yesterday: a station-day whose CLI final has not posted yet is
+    already scored PENDING, never a false zero-qualifying result (see
+    `load_settled_tmax_for_day` / the PENDING-vs-SCORED tests), so including
+    today's still-open climate day is safe, and it is what lets
+    `asos_recent_refresh.py --since` (the matching absolute-anchor fetch)
+    land on the exact same URL this module's cache-only read requires.
+    """
+    return today if today is not None else dt.date.today()
+
+
+#: "2026-08-30 -> last complete climate day." Fixed anchor; the end advances
+#: daily via `default_asos_fetch_end` rather than being hand-edited.
 ASOS_FETCH_START: Final[dt.date] = dt.date(2026, 8, 30)
-ASOS_FETCH_END: Final[dt.date] = dt.date(2026, 9, 1)
+ASOS_FETCH_END: Final[dt.date] = default_asos_fetch_end()
 
 DEFAULT_QUOTE_TAPE_CATALOG: Final[Path] = (
     Path.home() / ".local/share/breezy/catalog/quote_tape/polymarket_us"

@@ -80,6 +80,7 @@ __all__ = [
     "RefreshOutcome",
     "RefreshReport",
     "SiteRefreshResult",
+    "lookback_days_since",
     "main",
     "refresh_recent_asos",
     "refresh_window",
@@ -121,6 +122,17 @@ def refresh_window(*, today: dt.date, lookback_days: int) -> tuple[dt.date, dt.d
     if lookback_days < 0:
         raise ValueError(f"lookback_days must be >= 0, was {lookback_days}")
     return today - dt.timedelta(days=lookback_days), today
+
+
+def lookback_days_since(*, today: dt.date, since: dt.date) -> int:
+    """`lookback_days` that pins `refresh_window`'s start to an absolute
+    `since`, instead of one that drifts a day further from a fixed anchor
+    (e.g. `ma_prelock_winner_ask_study.ASOS_FETCH_START`) every day a fixed
+    `--lookback-days` runs. Backs `--since` below.
+    """
+    if since > today:
+        raise ValueError(f"since ({since}) must not be after today ({today})")
+    return (today - since).days
 
 
 def refresh_recent_asos(
@@ -189,6 +201,13 @@ def _parse_args(argv: Sequence[str] | None) -> argparse.Namespace:
         "--cache-dir", default=DEFAULT_SETTLEMENT_ALIGNMENT_CACHE_DIR.as_posix()
     )
     parser.add_argument("--lookback-days", type=int, default=DEFAULT_LOOKBACK_DAYS)
+    parser.add_argument(
+        "--since",
+        type=dt.date.fromisoformat,
+        default=None,
+        help="Absolute start date (YYYY-MM-DD), overriding --lookback-days with a "
+        "window that does not drift a day further from this anchor every run.",
+    )
     parser.add_argument("--delay-seconds", type=float, default=1.0)
     return parser.parse_args(argv)
 
@@ -197,14 +216,20 @@ def main(argv: Sequence[str] | None = None) -> int:
     args = _parse_args(argv)
     cache_dir = Path(args.cache_dir)
     sites = load_sites()
+    today = dt.datetime.now(dt.UTC).date()
+    lookback_days = (
+        lookback_days_since(today=today, since=args.since)
+        if args.since is not None
+        else args.lookback_days
+    )
 
     with httpx.Client(headers={"User-Agent": USER_AGENT}) as client:
         report = refresh_recent_asos(
             client=client,
             cache_dir=cache_dir,
             sites=sites,
-            today=dt.datetime.now(dt.UTC).date(),
-            lookback_days=args.lookback_days,
+            today=today,
+            lookback_days=lookback_days,
             delay_s=args.delay_seconds,
         )
 

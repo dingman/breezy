@@ -384,3 +384,21 @@ def test_k_a_verdict_is_family_a_dead_at_fifteen_days_with_zero_qualifying_cells
     assert verdict.outcome == "FAMILY_A_DEAD"
     assert verdict.n_afternoon == 15
     assert verdict.qualifying_count == 0
+
+
+# ---------------------------------------------------------------------------
+# default_asos_fetch_end -- the through-today default that replaces a
+# hand-maintained hard-coded ASOS_FETCH_END, so a daily unattended run
+# advances the window itself (deploy/systemd/breezy-mb-daily.timer). A
+# station-day whose CLI final has not posted yet is already handled as
+# PENDING, never a false "zero-qualifying" result (see the PENDING-vs-SCORED
+# tests above), so including today's still-open climate day is safe.
+# ---------------------------------------------------------------------------
+
+
+def test_default_asos_fetch_end_returns_the_given_today(ma: ModuleType) -> None:
+    assert ma.default_asos_fetch_end(today=dt.date(2026, 9, 5)) == dt.date(2026, 9, 5)
+
+
+def test_default_asos_fetch_end_uses_the_real_today_when_omitted(ma: ModuleType) -> None:
+    assert ma.default_asos_fetch_end() == dt.date.today()
