@@ -69,3 +69,42 @@ K1's pre-registered methodology to Kalshi history and run it. The
 **venue-specific** half does not: Polymarket.us's own rate is still gated on our
 capture. And **neither half moves the mechanical go-live date**, which is gated
 on the exec spine (R-6d → R-7), not on data.
+
+## Companion finding, same day: Polymarket.us itself retains NO ask history
+
+Checked empirically, GET-only, ~400 paced requests, no 429 — so the Kalshi
+prior is the *only* external source, not merely the best one.
+
+- **No retail price-history endpoint.** The whole retail market-data surface is
+  six point-in-time paths (`/v1/markets`, `/market/id`, `/market/slug`,
+  `/{slug}/book`, `/{slug}/bbo`, `/{slug}/settlement`). Fifteen speculative
+  history-shaped GETs → 404. Candlestick/historical data exists only on the
+  institutional Exchange (Private Key JWT, gRPC/FIX), unreachable with retail
+  Ed25519 keys.
+- **One undocumented route, `GET gateway /v1/price-history`, answers 400
+  INVALID_ARGUMENT where near-miss paths 404** — the route exists, the
+  arguments are rejected, ~45 GET shapes tried. Most likely a gRPC-gateway
+  transcode wanting a POST body, which is outside the read-only allowlist and
+  was deliberately not attempted. **UNRESOLVED**, and nothing about `.com`'s
+  `/prices-history` transfers.
+- **What resolved markets retain:** 3,683 climate markets over 123 station-days
+  (2026-04-22 → 2026-09-03), queryable indefinitely, each carrying a single
+  daily trade summary (`openPx/closePx/highPx/lowPx/lastTradePx`, `*SetTime`,
+  `sharesTraded`, `settlementPx`). **One row per market, not a series**; no
+  depth; `bids`/`offers` emptied at expiry; every quote-derived field null or
+  dropped on resolution.
+- **Why `openPx` is not ask-at-open.** It is trade-derived (absent exactly where
+  `sharesTraded` is null, 105/105). `openSetTime` minus local-standard midnight
+  ranged −11.0 h to +22.45 h, **median +13.1 h** — the modal first print lands
+  mid-station-day, not the evening before. Only 59/128 printed pre-midnight.
+  K1 specifies a resting offer with size; a print is a fill. Substituting is a
+  unit change ([[native-substitution-is-a-unit-change]]), not a data source.
+- **K1-qualifying asks recoverable from the venue: zero.** Cheap pre-midnight
+  *prints* exist (central estimate ~150 over 123 days, UNVERIFIED from two
+  samples, and liquidity ramped so the archive is non-uniform) but they are the
+  wrong quantity.
+
+**Net for the operator's question:** the family-viability prior comes from
+Kalshi and can be had today; Polymarket.us's own rate comes from our recorder
+and nowhere else. Discovery log appended, all rows `provisional: true`, at
+`.claude/skills/polymarket-us-integration/SKILL.md`.
