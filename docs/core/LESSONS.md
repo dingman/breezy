@@ -837,10 +837,15 @@ the producer's contract, not of your sample**, and a sample can only ever
 establish presence, never necessity.
 
 **What made it total rather than partial.** One unparseable market aborts the
-WHOLE discovery cycle, so a single never-updated market blocked all 30 and
-capture went to zero — on a forward-only tape, for ~24 minutes of a new
-cohort's opening price discovery, which is the most informative and least
-contested segment there is.
+WHOLE discovery cycle, so a single never-updated market blocked all 30 for ~24
+minutes. **Measured correction — the first draft of this lesson overstated it,
+and a lesson about overstating from a sample must not itself overstate:**
+capture did NOT go to zero. Already-subscribed markets kept recording (132 files
+in that window, including quote ticks); an aborted reload raises before
+`_reconcile_discovered_subscriptions`, so it can only cost NEW subscriptions.
+The real loss is that the new cohort was never subscribed, so its opening price
+discovery — the most informative and least contested segment there is — does not
+exist on a forward-only tape.
 
 **How to apply.** For every `_require`, ask: *what lifecycle state of this
 record would legitimately lack this field?* Newly-created is the canonical

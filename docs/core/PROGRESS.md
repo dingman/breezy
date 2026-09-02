@@ -153,7 +153,7 @@ either count it under the same bounded key set or document why not.
 | CF-7 | MED | `BREEZY_USER_AGENT` required on offline paths (`SharedIngestState.__init__`) |
 | CF-8 | MED | Sibling-station products unmarked in integrity index; wasted fetches |
 | CF-11 | LOW | `ruff format --check`: 31 unformatted files; not in any gate |
-| CF-14 | MED | One bad market aborts the WHOLE discovery cycle; 1 blocked 30, zeroing capture 09-02 (L-17) |
+| CF-14 | MED | One bad market aborts the WHOLE discovery cycle; 1 blocked 30 new subs 09-02 (L-17) |
 | CF-13 | UNPROVEN | No CCA/CCB CORRECTION seen live; supersession path fixture-covered only |
 
 ### Programme sequence (carried forward from 2026-08-30)
