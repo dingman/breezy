@@ -58,6 +58,7 @@ about the problem at all.
 
 from __future__ import annotations
 
+import logging
 from decimal import Decimal
 from typing import TYPE_CHECKING, Final
 
@@ -65,17 +66,23 @@ from nautilus_trader.model.enums import OrderSide
 from nautilus_trader.model.events import OrderInitialized
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
+    from collections.abc import Callable
+
     from nautilus_trader.backtest.engine import BacktestEngine
     from nautilus_trader.cache.base import CacheFacade
+    from nautilus_trader.common.component import MessageBus
     from nautilus_trader.core.message import Event
     from nautilus_trader.model.identifiers import InstrumentId
     from nautilus_trader.portfolio import Portfolio
+
+logger = logging.getLogger(__name__)
 
 __all__ = [
     "ORDER_EVENT_TOPIC",
     "BacktestOrderGuard",
     "NakedShortRefusedError",
     "PostOnlyRefusedError",
+    "install_live_order_guard",
     "install_order_guard",
 ]
 
@@ -131,6 +138,39 @@ class BacktestOrderGuard:
         """
         if type(event) is not OrderInitialized:
             return
+        if event.reconciliation:
+            # !! THIS BRANCH CANNOT FIRE ON nautilus_trader==1.231.0. !!
+            # It is forward-compatible insurance, NOT present protection --
+            # do not read it as "reconciliation orders are exempt". They are
+            # exempt only because the event never arrives at all. Two
+            # INDEPENDENT measured reasons, either alone sufficient:
+            #   1. Nothing publishes a reconciliation `OrderInitialized`.
+            #      Exactly three sites publish an init event -- strategy.pyx
+            #      :858, :950, algorithm.pyx:1209 -- all strategy/exec-algo
+            #      submission. `_generate_order` builds the event and returns
+            #      it WITHOUT publishing (`live/execution_engine.py:3611`).
+            #   2. `OrderInitialized.reconciliation` is a hardcoded
+            #      `return False  # Internal system event`
+            #      (`model/events/order.pyx:481`) -- it ignores the value the
+            #      constructor stored. Measured: building the event with
+            #      `reconciliation=True` and reading the property back yields
+            #      `False`, via the SAME call shape Nautilus itself uses at
+            #      `live/execution_engine.py:3608`. A Nautilus defect, and
+            #      Nautilus is immutable here, so it cannot be patched.
+            # `test_runtime_live_order_guard.py` pins both at full strength
+            # under `xfail(strict=True)`, so an XPASS -- Nautilus fixing the
+            # property -- fails the suite and forces a re-read of this block.
+            #
+            # WHY KEEP IT ANYWAY: if either reason above ever changes, this is
+            # out of jurisdiction for BOTH rules below, not just naked-short.
+            # Reconciliation copies `post_only=report.post_only` straight off
+            # the venue report (`live/execution_engine.py:3592`), so a resting
+            # post-only order found at the venue on restart would be refused by
+            # `_refuse_post_only` -- crash-looping while holding a real venue
+            # position. And unlike a tag or a ClientOrderId prefix, the flag is
+            # unforgeable: `OrderFactory` cannot set it (see
+            # `test_the_order_factory_cannot_set_the_reconciliation_flag`).
+            return
         self._refuse_post_only(event)
         self._refuse_naked_short(event)
 
@@ -171,7 +211,12 @@ class BacktestOrderGuard:
                 f"can never fire, position-reducing sells are exempted outright, and "
                 f"after the fill the account shows MORE free cash than before. "
                 f"Terminal PnL arithmetic stays correct, so the backtest looks fine. "
-                f"Size every SELL from `self.cache`/`self.portfolio.net_position(...)`.",
+                f"Size every SELL from `self.portfolio.net_position(...)` MINUS any "
+                f"already-working, non-reduce-only SELL quantity -- the same "
+                f"subtraction `_working_sell_quantity` performs -- never from "
+                f"`net_position(...)` alone, or a working exit sized to part of the "
+                f"position plus a settlement leg sized to the whole of it will "
+                f"double-count and refuse a real close.",
             )
 
     # -- internals ---------------------------------------------------------
@@ -206,8 +251,8 @@ class BacktestOrderGuard:
         one ever exists it is itself the failure this guard describes.
         """
         net = self._portfolio.net_position(instrument_id)
-        if net is None:
-            return Decimal(0)
+        if net is None:  # defensive floor only: `Portfolio.net_position` always
+            return Decimal(0)  # returns `Decimal`, never `None`, in this Nautilus.
         return max(Decimal(str(net)), Decimal(0))
 
 
@@ -219,4 +264,65 @@ def install_order_guard(engine: BacktestEngine) -> BacktestOrderGuard:
     """
     guard = BacktestOrderGuard(engine.portfolio, engine.cache)
     engine.kernel.msgbus.subscribe(topic=ORDER_EVENT_TOPIC, handler=guard.on_order_event)
+    return guard
+
+
+def install_live_order_guard(
+    portfolio: Portfolio,
+    cache: CacheFacade,
+    msgbus: MessageBus,
+    on_refusal: Callable[[ValueError], None],
+) -> BacktestOrderGuard:
+    """Subscribe a :class:`BacktestOrderGuard` to a LIVE node's message bus.
+
+    ``BacktestOrderGuard`` is venue- and mode-agnostic despite its name: every
+    rule it enforces (unmodelled post-only economics, a naked short) is a
+    property of the ORDER, not of the engine that raised it, and this
+    function is the proof -- the same class, unmodified, is wired onto a
+    live ``MessageBus`` here exactly as it is onto a backtest one by
+    :func:`install_order_guard`. Renaming the class to say so is out of
+    scope for this increment: it is used by name in backtest tests, and
+    renaming it here would touch files this increment has no other reason to
+    change.
+
+    Mirrors :func:`install_order_guard`'s shape (``engine.kernel.msgbus`` ->
+    ``msgbus`` directly, since a live ``TradingNode`` has no engine object of
+    its own): a plain ``msgbus.subscribe(topic=..., handler=...)``, never
+    ``msgbus.request(...)`` -- ``request`` is one of the write verbs barrier
+    B4 bans syntactically, on any object, inside a venue-touching module,
+    and this module IS venue-touching (its docstrings and f-strings name the
+    venue). ``subscribe`` is not in that banned set.
+
+    ``on_refusal`` is REQUIRED, not defaulted, so a refusal on a live node can
+    never be silently swallowed by omission: a bare ``msgbus.subscribe(...,
+    handler=guard.on_order_event)`` (:func:`install_order_guard`'s shape, kept
+    for backtest) would let the refusal propagate but report nothing at the
+    instant it happens -- on the engine-queue path ``os._exit(1)`` beats the
+    CLI's own ``FATAL`` print, and on a ``LiveClock`` timer callback the
+    exception is discarded outright and the process exits 0. The subscribed
+    handler is therefore a WRAPPER around ``guard.on_order_event``, not the
+    bare bound method itself: it reports at the moment of refusal, THEN
+    re-raises, so the refusal still aborts exactly as it did before -- only
+    reporting is added.
+
+    Returns the guard so a caller (and a test) can hold it; the node holds
+    only the bound handler.
+    """
+    guard = BacktestOrderGuard(portfolio, cache)
+
+    def _report_then_reraise(event: Event) -> None:
+        try:
+            guard.on_order_event(event)
+        except (PostOnlyRefusedError, NakedShortRefusedError) as exc:
+            try:
+                on_refusal(exc)
+            except Exception:  # a broken reporter must not replace the cause
+                logger.exception("order-guard refusal reporter failed")
+            # Deliberately OUTSIDE the inner `try/except`, and NOT a
+            # `finally`: a bare `raise` inside a `finally` re-raises
+            # `sys.exc_info()`, which -- if `on_refusal` itself raised -- is
+            # the REPORTER's exception, not this refusal (D4's objection).
+            raise
+
+    msgbus.subscribe(topic=ORDER_EVENT_TOPIC, handler=_report_then_reraise)
     return guard

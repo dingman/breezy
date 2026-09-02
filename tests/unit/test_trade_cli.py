@@ -24,10 +24,23 @@ from __future__ import annotations
 import ast
 import io
 from collections.abc import Iterator
+from decimal import Decimal
 from pathlib import Path
 from typing import Any, ClassVar
 
 import pytest
+from nautilus_trader.core.uuid import UUID4
+from nautilus_trader.model.enums import OrderSide, OrderType, TimeInForce
+from nautilus_trader.model.events import OrderInitialized
+from nautilus_trader.model.identifiers import (
+    ClientOrderId,
+    InstrumentId,
+    StrategyId,
+    Symbol,
+    TraderId,
+    Venue,
+)
+from nautilus_trader.model.objects import Quantity
 
 from breezy.adapters.polymarket_us import exec_fault, feed_fault
 from breezy.adapters.polymarket_us.factories import (
@@ -37,12 +50,18 @@ from breezy.adapters.polymarket_us.factories import (
 )
 from breezy.adapters.polymarket_us.safety import MAX_ORDER_NOTIONAL_USD_ENV_VAR
 from breezy.runtime import trade_cli
+from breezy.runtime.backtest_order_guard import NakedShortRefusedError
 from breezy.runtime.settings import TRADE_TRADER_ID_VAR
 from breezy.runtime.trade_cli import (
     EXIT_CONFIG_ERROR,
     EXIT_OK,
     EXIT_RUNTIME_ERROR,
     run,
+)
+
+#: A synthetic instrument for RED-13's directly-constructed refusable event.
+_GUARD_TEST_INSTRUMENT = InstrumentId(
+    Symbol("synthetic-trade-cli-guard-market"), Venue("POLYMARKET_US")
 )
 
 #: What a provisioned trading host carries. Venue values are `.invalid` hosts;
@@ -80,6 +99,41 @@ def _operator_order_ceiling(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv(MAX_ORDER_NOTIONAL_USD_ENV_VAR, OPERATOR_ORDER_CEILING_USD)
 
 
+class _FakeMsgBus:
+    """Stands in for the ONE surface R-6a's installer uses: ``subscribe``."""
+
+    def __init__(self) -> None:
+        self.subscriptions: list[tuple[str, Any]] = []
+
+    def subscribe(self, *, topic: str, handler: Any) -> None:
+        self.subscriptions.append((topic, handler))
+
+
+class _FakeGuardPortfolio:
+    """Enough of ``Portfolio`` for R-6a's guard to actually evaluate an event."""
+
+    def net_position(self, instrument_id: InstrumentId) -> Decimal:
+        del instrument_id
+        return Decimal(0)
+
+
+class _FakeGuardCache:
+    """Enough of ``CacheFacade`` for R-6a's guard to actually evaluate an event."""
+
+    def orders_open(self, *, instrument_id: InstrumentId | None = None) -> tuple[Any, ...]:
+        del instrument_id
+        return ()
+
+
+class _FakeKernel:
+    """Stands in for the slice of ``NautilusKernel`` R-6a's guard reads."""
+
+    def __init__(self) -> None:
+        self.portfolio = _FakeGuardPortfolio()
+        self.cache = _FakeGuardCache()
+        self.msgbus = _FakeMsgBus()
+
+
 class RecordingNode:
     """Stands in for ``TradingNode``; records the wiring calls made on it."""
 
@@ -90,6 +144,7 @@ class RecordingNode:
         self.data_client_factories: list[tuple[str, type]] = []
         self.exec_client_factories: list[tuple[str, type]] = []
         self.calls: list[str] = []
+        self.kernel = _FakeKernel()
         RecordingNode.instances.append(self)
 
     def add_data_client_factory(self, name: str, factory: type) -> None:
@@ -366,6 +421,60 @@ def test_an_execution_fault_is_checked_before_a_feed_fault() -> None:
 
     assert code == EXIT_RUNTIME_ERROR
     assert "execution-client" in err.getvalue().lower()
+
+
+# ---------------------------------------------------------------------------
+# R-6a §4: a live order-guard refusal is reported to the operator, end to end
+# ---------------------------------------------------------------------------
+
+
+def test_trade_cli_writes_the_refusal_to_stderr_and_latches_it() -> None:
+    """RED-13. Drives a naked short through the handler R-6a's installer
+    actually subscribed onto ``_FakeMsgBus``, then asserts the operator
+    signal end to end: the stderr line is written AT REFUSAL TIME (not only
+    via the latch), ``fatal_exec_fault()`` is populated, and
+    ``_exit_code_for_completed_run`` reports ``EXIT_RUNTIME_ERROR``.
+    """
+    err = io.StringIO()
+    code = run(env=TRADE_ENV, node_factory=RecordingNode, stderr=err)
+    assert code == EXIT_OK  # the fake node's own `run()` published nothing
+
+    node = RecordingNode.instances[0]
+    _, handler = node.kernel.msgbus.subscriptions[0]
+    naked_short = OrderInitialized(
+        trader_id=TraderId("BREEZYTRADE-001"),
+        strategy_id=StrategyId("EXTERNAL"),
+        instrument_id=_GUARD_TEST_INSTRUMENT,
+        client_order_id=ClientOrderId("O-1"),
+        order_side=OrderSide.SELL,
+        order_type=OrderType.MARKET,
+        quantity=Quantity(500, 0),
+        time_in_force=TimeInForce.GTC,
+        post_only=False,
+        reduce_only=False,
+        quote_quantity=False,
+        options={},
+        emulation_trigger=0,
+        trigger_instrument_id=None,
+        contingency_type=0,
+        order_list_id=None,
+        linked_order_ids=None,
+        parent_order_id=None,
+        exec_algorithm_id=None,
+        exec_algorithm_params=None,
+        exec_spawn_id=None,
+        tags=None,
+        event_id=UUID4(),
+        ts_init=0,
+    )
+
+    with pytest.raises(NakedShortRefusedError):
+        handler(naked_short)
+
+    assert "breezy-trade: FATAL order-guard refusal" in err.getvalue()
+    fault = exec_fault.fatal_exec_fault()
+    assert fault is not None
+    assert trade_cli._exit_code_for_completed_run(err) == EXIT_RUNTIME_ERROR
 
 
 # ---------------------------------------------------------------------------

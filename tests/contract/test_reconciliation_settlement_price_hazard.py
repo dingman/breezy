@@ -86,6 +86,7 @@ from nautilus_trader.cache.config import CacheConfig
 from nautilus_trader.common.component import LiveClock, MessageBus
 from nautilus_trader.common.factories import OrderFactory
 from nautilus_trader.core import nautilus_pyo3
+from nautilus_trader.core.message import Event
 from nautilus_trader.core.uuid import UUID4
 from nautilus_trader.execution.reports import PositionStatusReport
 from nautilus_trader.live.config import LiveExecEngineConfig
@@ -101,6 +102,7 @@ from nautilus_trader.model.enums import (
 from nautilus_trader.model.events import (
     AccountState,
     OrderFilled,
+    OrderInitialized,
     OrderSubmitted,
     PositionClosed,
     PositionEvent,
@@ -120,6 +122,7 @@ from nautilus_trader.trading.config import StrategyConfig
 from nautilus_trader.trading.strategy import Strategy
 
 from breezy.adapters.polymarket_us.parsing import parse_binary_option
+from breezy.runtime.backtest_order_guard import ORDER_EVENT_TOPIC, BacktestOrderGuard
 from tests.unit.conftest import iter_captured_market_payloads
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
@@ -179,6 +182,7 @@ class _Rig:
 
     engine: LiveExecutionEngine
     cache: Cache
+    portfolio: Portfolio
     instrument: BinaryOption
     account_id: AccountId
     position_id: PositionId
@@ -336,6 +340,7 @@ def _build_rig(
     rig = _Rig(
         engine=engine,
         cache=cache,
+        portfolio=portfolio,
         instrument=instrument,
         account_id=account_id,
         position_id=position_id,
@@ -411,9 +416,38 @@ def test_the_unguarded_reconciliation_books_the_open_price(rig: _Rig) -> None:
     assert synthesised[0].side == OrderSide.SELL
     # R-9 test 7's premise, measured. A CLAIMED instrument's reconciliation
     # order carries `tags=None` (`live/execution_engine.py:3567`); only the
-    # UNCLAIMED branch sets `["RECONCILIATION"]` (`:3563`). So R-6's guard
-    # exemption cannot key on that tag or every settlement leg is refused.
+    # UNCLAIMED branch sets `["RECONCILIATION"]` (`:3563`). R-6a's guard no
+    # longer keys on a tag at all -- its exemption keys on
+    # `event.reconciliation` instead (`backtest_order_guard.py`), which is
+    # unforgeable through any public construction path. See RED-6 below:
+    # this event is never even published to the guard's topic, so the
+    # exemption's reach on THIS path is moot in 1.231.0 either way.
     assert synthesised[0].tags is None
+
+
+def test_reconciliation_publishes_no_order_initialized_to_the_guard(rig: _Rig) -> None:
+    """R-6a RED-6 (D2/§2, M1). The guard's handler must never see an
+    `OrderInitialized` synthesised by reconciliation -- proven here
+    BEHAVIOURALLY, on the exact rig `test_the_unguarded_reconciliation_
+    books_the_open_price` drives, rather than assumed from a
+    publisher-shape grep that a future `publish(topic=..., msg=...)` call
+    could silently stop matching. A REAL `BacktestOrderGuard` is subscribed
+    to the SAME message bus the engine was built with; if it ever raised
+    (it would, since the synthesised leg is a full-size SELL) this test
+    would fail as loudly as a naked short in production.
+    """
+    guard = BacktestOrderGuard(rig.portfolio, rig.cache)
+    received: list[Event] = []
+
+    def _handler(event: Event) -> None:
+        received.append(event)
+        guard.on_order_event(event)  # must never raise -- see the assertion below
+
+    rig.engine._msgbus.subscribe(topic=ORDER_EVENT_TOPIC, handler=_handler)
+
+    assert rig.engine._reconcile_position_report_netting(rig.flat_venue_report()) is True
+
+    assert not any(type(event) is OrderInitialized for event in received)
 
 
 def test_the_cached_quote_bid_is_never_consulted_for_a_flat_target(

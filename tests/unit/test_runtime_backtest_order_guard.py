@@ -35,6 +35,7 @@ from breezy.runtime.backtest_order_guard import (
     BacktestOrderGuard,
     NakedShortRefusedError,
     PostOnlyRefusedError,
+    install_order_guard,
 )
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
@@ -305,3 +306,101 @@ def test_the_harness_installs_the_guard() -> None:
     source = Path(HARNESS_SOURCE_PATH).read_text(encoding="utf-8")
 
     assert "install_order_guard(engine)" in source
+
+
+# ---------------------------------------------------------------------------
+# R-6a §4: the backtest installer is UNCHANGED -- bare handler, no wrapper.
+# ---------------------------------------------------------------------------
+
+
+class _FakeEngineMsgBus:
+    def __init__(self) -> None:
+        self.subscriptions: list[tuple[str, object]] = []
+
+    def subscribe(self, *, topic: str, handler: object) -> None:
+        self.subscriptions.append((topic, handler))
+
+
+class _FakeEngineKernel:
+    def __init__(self) -> None:
+        self.msgbus = _FakeEngineMsgBus()
+
+
+class _FakeEngine:
+    """Stands in for the slice of ``BacktestEngine`` ``install_order_guard`` reads."""
+
+    def __init__(self) -> None:
+        self.portfolio = _FakePortfolio(Decimal(0))
+        self.cache = _FakeCache()
+        self.kernel = _FakeEngineKernel()
+
+
+def test_the_backtest_installer_still_subscribes_the_bare_handler() -> None:
+    """RED-10. R-6a §4 adds a reporting wrapper to the LIVE installer only;
+    ``install_order_guard`` (backtest) keeps subscribing the guard's bare
+    bound method directly, so a refusal still aborts ``engine.run()``
+    exactly as before -- no reporter, no wrapper, no behaviour change."""
+    engine = _FakeEngine()
+
+    guard = install_order_guard(engine)
+
+    assert len(engine.kernel.msgbus.subscriptions) == 1
+    topic, handler = engine.kernel.msgbus.subscriptions[0]
+    assert topic == ORDER_EVENT_TOPIC
+    assert handler == guard.on_order_event
+
+
+# ---------------------------------------------------------------------------
+# R-6a §2/D5: the naked-short remediation text names subtracting working sells.
+# ---------------------------------------------------------------------------
+
+
+def test_a_settlement_leg_is_refused_when_a_working_exit_sell_is_outstanding() -> None:
+    """RED-8 (D5). A working, non-reduce-only exit SELL of 40 against a net
+    long of 100, followed by a settlement leg sized to the FULL 100, is
+    refused -- `40 + 100 > 100`. The message must name SUBTRACTING working
+    sells, correcting the pre-R-6a remediation text that named only
+    `net_position(...)` and would have under-sized the very fix it
+    prescribes."""
+    working = [_FakeOrder(side=OrderSide.SELL, leaves=Decimal(40))]
+
+    with pytest.raises(NakedShortRefusedError) as excinfo:
+        _guard(net=Decimal(100), open_orders=working).on_order_event(_initialized(quantity=100))
+
+    message = str(excinfo.value)
+    assert "already-working" in message
+    assert "_working_sell_quantity" in message
+
+
+# ---------------------------------------------------------------------------
+# R-6a §3/D6b: `reduce_only` is a TRACKED, unremediated bypass -- xfail only.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.xfail(
+    strict=True,
+    reason=(
+        "TRACKED, UNREMEDIATED bypass of the SAME class R-6a's tag/prefix "
+        "deletion just closed (docs/plans/R6A_GUARD_SEMANTICS_2026-09-02.md "
+        "§3). `_refuse_naked_short`'s own first line exempts EVERY "
+        "reduce_only SELL outright, by size or position (see "
+        "`test_a_reduce_only_sell_is_exempt`, kept -- R-9's own settlement "
+        "leg needs it). Chain (M2, M8): `reduce_only` is an ordinary, "
+        "attacker-settable `OrderFactory` kwarg; Nautilus's `RiskEngine` "
+        "only validates reduce-only when `command.position_id is not None` "
+        "(`risk/engine.pyx:424`), and `Strategy.submit_order`'s "
+        "`position_id` defaults to `None`. Two reduce-only sells each sized "
+        "to the net long therefore BOTH pass and are jointly naked. NOT "
+        "fixed here -- growing a safety control's scope mid-correction is "
+        "out of scope by design (D6b); this pins the hazard and gates "
+        "removal of R-4's standing refusal on its own future fix. "
+        "`strict=True`: an XPASS means the bypass closed and this marker "
+        "must come off, not stay for cosmetic reasons."
+    ),
+)
+def test_two_reduce_only_sells_within_the_net_long_are_jointly_naked() -> None:
+    working = [_FakeOrder(side=OrderSide.SELL, leaves=Decimal(10), reduce_only=True)]
+    guard = _guard(net=Decimal(10), open_orders=working)
+
+    with pytest.raises(NakedShortRefusedError):
+        guard.on_order_event(_initialized(quantity=10, reduce_only=True))

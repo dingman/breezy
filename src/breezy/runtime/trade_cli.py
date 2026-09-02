@@ -70,7 +70,7 @@ from __future__ import annotations
 import logging
 import sys
 from collections.abc import Callable, Mapping
-from typing import Protocol, TextIO
+from typing import Any, Protocol, TextIO
 
 from nautilus_trader.config import TradingNodeConfig
 from nautilus_trader.live.node import TradingNode
@@ -78,6 +78,7 @@ from nautilus_trader.live.node import TradingNode
 from breezy.adapters.polymarket_us.exec_fault import (
     clear_fatal_exec_fault,
     fatal_exec_fault,
+    record_fatal_exec_fault,
 )
 from breezy.adapters.polymarket_us.factories import (
     POLYMARKET_US_CLIENT_NAME,
@@ -90,6 +91,7 @@ from breezy.adapters.polymarket_us.feed_fault import (
     clear_fatal_feed_fault,
     fatal_feed_fault,
 )
+from breezy.runtime.backtest_order_guard import install_live_order_guard
 from breezy.runtime.logging_bridge import install as install_logging_bridge
 from breezy.runtime.logging_bridge import uninstall as uninstall_logging_bridge
 from breezy.runtime.node_config import NodeConfigError, build_trade_node_config
@@ -121,7 +123,17 @@ class Node(Protocol):
     ``exec_algorithms=[]`` stay pinned in ``build_trade_node_config``, so
     nothing calls ``submit_order`` -- it is the client that RECONCILES and
     REFUSES.
+
+    R-6a adds ``kernel``, read only AFTER ``build()`` to install the
+    long-only order guard -- see ``_run_node``. Untyped (``Any``) rather than
+    a hand-written Protocol: ``NautilusKernel`` (`live/node.py:80-82`) ships
+    no stub, and a Protocol built to match it structurally fails mypy's
+    conformance check for `TradingNode` in a way a real stub would not --
+    the SAME reason :func:`install_order_guard` leaves ``engine.kernel``
+    untyped for a ``BacktestEngine``.
     """
+
+    kernel: Any
 
     def add_data_client_factory(self, name: str, factory: type) -> None: ...
 
@@ -188,6 +200,28 @@ def _exit_code_for_completed_run(stderr: TextIO) -> int:
     return EXIT_RUNTIME_ERROR
 
 
+def _order_guard_reporter(stderr: TextIO) -> Callable[[ValueError], None]:
+    """Build the ``on_refusal`` callback R-6a's live installer requires.
+
+    Reports AT THE MOMENT of refusal, not only via the latch -- latch-then-
+    re-raise alone is not enough on either failure path: on the engine-queue
+    path ``os._exit(1)`` (a failed non-``RuntimeError`` swallowed elsewhere in
+    the kernel) beats ``_exit_code_for_completed_run``, so the ``FATAL`` line
+    printed there would never run; and on a ``LiveClock`` timer callback the
+    exception is discarded outright and the process exits 0, so the latch
+    written here is the only signal that survives that path. ``flush=True``
+    on a line-buffered ``stderr`` makes the write complete before either exit
+    route can beat it.
+    """
+
+    def _report(exc: ValueError) -> None:
+        print(f"breezy-trade: FATAL order-guard refusal: {exc}", file=stderr, flush=True)
+        record_fatal_exec_fault(POLYMARKET_US_CLIENT_NAME, str(exc))
+        logger.error("order-guard refusal: %s", exc)
+
+    return _report
+
+
 def _run_node(config: TradingNodeConfig, node_factory: NodeFactory, stderr: TextIO) -> int:
     """Build, run and ALWAYS dispose the node. Never raises.
 
@@ -203,6 +237,19 @@ def _run_node(config: TradingNodeConfig, node_factory: NodeFactory, stderr: Text
     -- as of EXEC SPINE W -- the reconciling, order-refusing execution client.
     Neither registration is an order path: see the ``Node`` protocol's
     docstring.
+
+    R-6a installs the long-only order guard onto ``node.kernel.msgbus`` AFTER
+    ``build()``, the same shape :func:`~breezy.runtime.backtest_order_guard.
+    install_order_guard` uses for a ``BacktestEngine`` (``engine.kernel.
+    msgbus``). It is a ``msgbus.subscribe(...)``, not an ``Actor`` --
+    ``actors=[]`` in ``build_trade_node_config`` stays an untouched empty
+    literal, and nothing here is a new order path: this node still cannot
+    call ``submit_order`` (see the ``Node`` protocol's docstring).
+
+    The ``on_refusal=_order_guard_reporter(stderr)`` argument reports a
+    refusal to ``stderr`` and the exec-fault latch AT THE INSTANT it fires,
+    then the guard still re-raises -- see that function's own docstring for
+    why the latch alone, checked only after the node stops, is not enough.
     """
     node: Node | None = None
     try:
@@ -214,6 +261,12 @@ def _run_node(config: TradingNodeConfig, node_factory: NodeFactory, stderr: Text
             POLYMARKET_US_CLIENT_NAME, PolymarketUSLiveExecClientFactory
         )
         node.build()
+        install_live_order_guard(
+            node.kernel.portfolio,
+            node.kernel.cache,
+            node.kernel.msgbus,
+            on_refusal=_order_guard_reporter(stderr),
+        )
         node.run()
         return _exit_code_for_completed_run(stderr)
     except KeyboardInterrupt:
