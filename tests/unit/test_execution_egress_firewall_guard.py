@@ -728,6 +728,13 @@ def test_n2_the_shipped_tree_has_exactly_the_expected_execution_egress_modules()
         ("src/breezy/adapters/polymarket_us/exec/client.py", "E3"),
         ("src/breezy/adapters/polymarket_us/exec/client.py", "E3"),
         ("src/breezy/adapters/polymarket_us/exec/endpoints.py", "E0"),
+        # EXEC SPINE R-6d: `refusals.py` classifies a venue refusal as
+        # TRANSIENT or DURABLE. Like `endpoints.py` and `reports.py` it is
+        # pure and performs no I/O -- and like them it is an egress surface
+        # by PATH, which is the classification E0 exists to make. ONE new row:
+        # it defines no class in `_EGRESS_CLASS_BASES` (E2) and no
+        # order-lifecycle function (E3).
+        ("src/breezy/adapters/polymarket_us/exec/refusals.py", "E0"),
         ("src/breezy/adapters/polymarket_us/exec/reports.py", "E0"),
         # EXEC SPINE W: `PolymarketUSLiveExecClientFactory(LiveExecClientFactory)`.
         ("src/breezy/adapters/polymarket_us/factories.py", "E2"),
@@ -1466,6 +1473,11 @@ def test_x3_the_live_scan_actually_reaches_the_exec_package() -> None:
         "src/breezy/adapters/polymarket_us/exec/__init__.py",
         "src/breezy/adapters/polymarket_us/exec/client.py",
         "src/breezy/adapters/polymarket_us/exec/endpoints.py",
+        # EXEC SPINE R-6d: the transient/durable refusal classifier. Pure,
+        # stdlib-only, and under `exec/` because that is where the venue's
+        # error payloads are parsed -- WIDENED, not relaxed: the comparison
+        # stays `==` and the new module is brought INSIDE both scans.
+        "src/breezy/adapters/polymarket_us/exec/refusals.py",
         "src/breezy/adapters/polymarket_us/exec/reports.py",
     }
 
@@ -1959,6 +1971,11 @@ def test_e0_inert_the_live_scan_actually_reaches_the_exec_package() -> None:
         "src/breezy/adapters/polymarket_us/exec/__init__.py",
         "src/breezy/adapters/polymarket_us/exec/client.py",
         "src/breezy/adapters/polymarket_us/exec/endpoints.py",
+        # EXEC SPINE R-6d: the transient/durable refusal classifier. Pure,
+        # stdlib-only, and under `exec/` because that is where the venue's
+        # error payloads are parsed -- WIDENED, not relaxed: the comparison
+        # stays `==` and the new module is brought INSIDE both scans.
+        "src/breezy/adapters/polymarket_us/exec/refusals.py",
         "src/breezy/adapters/polymarket_us/exec/reports.py",
     }
 
@@ -2436,6 +2453,13 @@ def test_x1_the_live_scan_actually_reaches_a_test_that_imports_the_exec_package(
     TEST that imports `exec/`, independently of what the increment does to
     `src/`, so an increment whose barrier analysis covers only E0/E1/E2/E3 and
     the cage constants will miss it (L-15).
+
+    R-6d adds one more: `test_polymarket_us_exec_refusals.py` imports
+    `exec.refusals`, the transient/durable classifier. WIDENED, not relaxed,
+    on the same terms: the comparison is still `==`, the module carries no
+    marker at all, and it cannot want one -- the classifier is a pure
+    function over an int and a byte string, so the suite never opens a
+    socket and never constructs a client.
     """
     assert exec_importing_test_modules() == {
         "tests/contract/test_exec_client_reconciliation_contract.py",
@@ -2444,6 +2468,7 @@ def test_x1_the_live_scan_actually_reaches_a_test_that_imports_the_exec_package(
         "tests/unit/test_polymarket_us_exec_client.py",
         "tests/unit/test_polymarket_us_exec_endpoints.py",
         "tests/unit/test_polymarket_us_exec_positions.py",
+        "tests/unit/test_polymarket_us_exec_refusals.py",
         "tests/unit/test_polymarket_us_exec_reports.py",
         "tests/unit/test_polymarket_us_exec_snapshot_drift.py",
         "tests/unit/test_polymarket_us_factories.py",

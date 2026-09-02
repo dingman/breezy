@@ -44,7 +44,16 @@ EXEC_DIR: Final[Path] = (
     REPO_ROOT / "src" / "breezy" / "adapters" / "polymarket_us" / "exec"
 )
 
-EXEC_MODULES: Final[tuple[str, ...]] = ("client.py", "endpoints.py", "reports.py")
+EXEC_MODULES: Final[tuple[str, ...]] = (
+    "client.py",
+    "endpoints.py",
+    # EXEC SPINE R-6d. Listed so the `float(` ban and the
+    # no-parallel-report-class scan in `test_polymarket_us_exec_endpoints.py`
+    # cover the refusal classifier too; an inventory that lags the
+    # directory silently exempts whatever was added last.
+    "refusals.py",
+    "reports.py",
+)
 
 TS_INIT: Final[int] = 1_787_617_213_000_000_000
 TS_EVENT_TEXT: Final[str] = "2026-08-25T00:19:48.120237895Z"
