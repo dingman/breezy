@@ -192,24 +192,24 @@ standing refusal stays until R-7: with no send path, removing it deletes the
 only DENIAL. B4 evasions found by that review (`nautilus_pyo3.http_post`,
 C1–C5-blind helper) CLOSED `5221da3` (V5 + C6, 13 tests).
 
-**Blind-risk-view audit, 2026-09-02 — RESOLVED except policy.** T-1..T-5, T-7,
-T-8, T-11 landed (see `docs/core/findings/BLIND_RISK_VIEWS_2026-09-02.md`).
-**Still OPEN:** T-9 exit policy — Grok's verdict: hold to settlement, halt
-entry-only, cancel working buys at met lock, never dump into a 0.3-lot bid
-(`docs/evidence/grok_forecast_family_verdict_2026-09-02.md`); T-6 stale
-node_config docstring; T-10 reversed-arg `hours_until` in scripts/;
-`max_simultaneous_positions` unexercised end-to-end. Residual: Nautilus cannot
-cancel an INITIALIZED order, so cancel/close sequencing is narrowed, not closed.
+**Open from the blind-risk-view audit** (`docs/core/findings/BLIND_RISK_VIEWS_2026-09-02.md`):
+T-9 exit policy (Grok: hold to settlement, entry-only halt, cancel working buys
+at met lock, never dump into a 0.3-lot bid); T-6 stale node_config docstring;
+T-10 reversed-arg `hours_until` in scripts/; `max_simultaneous_positions`
+unexercised end-to-end. Nautilus cannot cancel an INITIALIZED order.
 
-**[VERDICT] Forecast family KILLED for live-small (Grok, 2026-09-02).** Under
-honest σ the family has little or no defensible edge at real forecast leads;
-`min_entry_edge=0.06` is an artifact (defensible bar ~0.10-0.12); the live
-strategy prices with a flat cost, not the venue fee, and builds σ without
-`sigma_by_key`; and Breezy ingests NO forecasts, so every backtest was synthetic.
-Not deleted — not a candidate for S-1. **S-1 targets the observation-lock
-family** (`running_extreme_lock`, `cli_settlement_print_lock`), which needs no
-forecast and is what K1 measures. Revive only after: real forecast ingest, σ
-calibrated vs the NWS archive (kill if RMSE > 1.3x σ), and a paper join n≥150.
+**[VERDICT] NO FAMILY HAS AN EXECUTABLE EDGE (audit 2026-09-02).** Forecast
+family KILLED by Grok (`docs/evidence/grok_forecast_family_verdict_2026-09-02.md`;
+revive only with real ingest, σ calibrated vs NWS, paper join n≥150).
+Observation-lock (`running_extreme_lock`, `cli_settlement_print_lock`) passes
+settlement gates but is REFUTED on execution ×3 (L-9): the settling rung is
+uniquely unoffered — 0 asks/3,332 rows post-print, 0/58–0/59 pre-print, a 7.7k
+BID queue at 0.99 (`print_lock_refuted_2026-09-01.md`, `h4_preliminary_economic_read_2026-09-01.md` §4.1).
+K1 is a DIFFERENT edge (cheap D-1, median ask 0.16), not this family — an
+earlier note here said otherwise; wrong. **Untested window:** does the winner
+carry an ask BEFORE the physical lock while an intraday running max already
+implies it? Needs BL-24's ASOS×tape join (cache ends 01-02, tape starts 08-30).
+Design routed to Grok.
 
 ---
 
