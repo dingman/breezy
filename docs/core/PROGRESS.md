@@ -144,15 +144,16 @@ either count it under the same bounded key set or document why not.
 
 | ID | Sev | Item |
 |---|---|---|
-| CF-1 | OPEN | Non-uniform record counts (28/28/28/30/38); extra MDW/LAX records an unverified inference |
+| CF-1 | OPEN | Non-uniform record counts (28/28/28/30/38); extra MDW/LAX an unverified inference |
 | CF-2 | MED | `never_substitute` in `registry/sites.toml` has no consumer |
 | CF-3 | MED | Unbounded whole-catalog reads per lookup (`persistence/catalog.py:693`) |
 | CF-4 | MED | `is_record` parsed, never persisted; `tmax_flag` `None` on record days. Not a settlement defect |
 | CF-5 | MED | Fail-closed parsing: one bad token blocks a whole site for that poll |
-| CF-6 | MED | `tests/live/test_nws_live_ingest.py:86` hardcodes a personal contact; must be a role address |
+| CF-6 | MED | `tests/live/test_nws_live_ingest.py:86` hardcodes a personal contact; use a role address |
 | CF-7 | MED | `BREEZY_USER_AGENT` required on offline paths (`SharedIngestState.__init__`) |
-| CF-8 | MED | Sibling-station products unmarked in the integrity index; wasted fetches |
-| CF-11 | LOW | `ruff format --check`: 31 unformatted files; formatting is in no gate |
+| CF-8 | MED | Sibling-station products unmarked in integrity index; wasted fetches |
+| CF-11 | LOW | `ruff format --check`: 31 unformatted files; not in any gate |
+| CF-14 | MED | One bad market aborts the WHOLE discovery cycle; 1 blocked 30, zeroing capture 09-02 (L-17) |
 | CF-13 | UNPROVEN | No CCA/CCB CORRECTION seen live; supersession path fixture-covered only |
 
 ### Programme sequence (carried forward from 2026-08-30)
@@ -163,7 +164,7 @@ either count it under the same bounded key set or document why not.
   source, not by a live-node run.
 - **P2/P3** — forecast probes then ingestion. Breezy ingests **no forecast data
   at all**, so every forecast-strategy ROI is inadmissible. DEPRIORITISED; the
-  observation family needs no forecast. See item (5) below.
+  observation family needs none. See (5).
 - **P4** — daily-budget gate and portfolio-wide cap (see operator contract).
   BL-3 is the first increment.
 - **P6** — wire boundary-conditional preliminary-revision cost into sizing;
@@ -171,43 +172,46 @@ either count it under the same bounded key set or document why not.
 
 ### Blocked, with unlock condition
 
-**Venue access is NO LONGER GATED** (operator, 2026-09-01): G-12 (resolve
-`MARKET_SLUG_KEY` live), G-13 and G-15 (fee schedule discovery) are plain work
-items now. The remaining blockers are technical, not permission:
+**Venue access is NO LONGER GATED** (operator, 2026-09-01); G-13/G-15 (fee
+schedule discovery) are plain work items. Remaining blockers are technical:
 
 | ID | Item | Unlock |
 |---|---|---|
-| G-16 | ≥14 days of joined tape | calendar; G-14 CLOSED 09-02 (1c95f18) |
+| G-16 | ≥14 days of joined tape | calendar |
 | G-17 | Phase 1.5 premise GO/NO-GO | G-16. **NO-GO stops the programme.** |
 
 **The stop gate as written is UNSATISFIABLE by backtest on this venue.** ROI is
-a function of fill prices; price history is forward-only, so no amount of weather
-or forecast data produces a historical ROI. Both P2 probe reports say it
-outright: a forecast archive yields a CALIBRATION dataset, not a backtest.
+a function of fill prices; price history is forward-only, so no weather or
+forecast data produces a historical ROI. Both P2 probes: a forecast archive
+yields a CALIBRATION dataset, not a backtest.
 Measured: total addressable notional at any eventually-winning rung is **$0.574**
 (NEGATIVE after fees; refused by `min_liquidity_contracts=25`). Power: sigma/mu
 ~ 8, so n ~ 300 station-days (~60 clean days at 5 stations) to clear break-even.
 
-**Ordered path to a real-money ROI verdict (revised 2026-09-01):** (1) BL-25
-DONE; (2) K1 gates the calibration family BEFORE any forecast build —
-`docs/evidence/k1_cheap_open_2026-09-01.md`. Measured n=0; 30 D+1 entries are
-captured (09-01) and enter the population once their CLI goes FINAL — missing is
-elapsed time, not code. Viable at ask<=0.03 in ~20d / <=0.05 in ~9d; the 0.01
-tick needs ~359d, so no plan may wait on it. Re-runs daily, unattended; (3) capture supervised to 2026-10-01 (D+1 book exists only if the recorder
-runs before local midnight); (4) execute the EXEC SPINE R-1..R-9
-(`docs/plans/EXEC_SPINE_2026-09-01.md`). **R-1/R-2/R-3 LANDED** (2788d11).
-**R-4+W LANDED/WIRED** (5e09535) -- caps live. Next: R-6a/c/d/e local;
-R-5R + R-6.5P VENUE-GATED (private backend 500/503; auth proven). R-4P-2
-(cursor pagination) open. Plan `docs/plans/EXEC_SPINE_R5_R6_2026-09-02.md`; (5) forecast ingest (`docs/plans/forecast_ingest_2026-09-01.md`)
+**Ordered path to a real-money ROI verdict (revised 2026-09-01):**
+(2) K1 gates the calibration family BEFORE any forecast build —
+`docs/evidence/k1_cheap_open_2026-09-01.md`. n=0; 30 D+1 entries captured
+(09-01) enter the population once their CLI goes FINAL — missing is elapsed
+time, not code. Viable at ask<=0.03 in ~20d / <=0.05 in ~9d; the 0.01
+tick needs ~359d, so no plan may wait on it. Re-runs daily, unattended; (3) capture supervised to 2026-10-01 (D+1 book needs the recorder up before
+local midnight); (4) execute the EXEC SPINE
+(`docs/plans/EXEC_SPINE_2026-09-01.md`; R-1..R-4, W, R-6a landed). Next:
+R-6c/d/e local; R-5R + R-6.5P VENUE-GATED (private backend 500/503, auth
+proven); R-4P-2 (cursor pagination) open. Plan
+`docs/plans/EXEC_SPINE_R5_R6_2026-09-02.md`; (5) forecast ingest (`docs/plans/forecast_ingest_2026-09-01.md`)
 HELD until K1 reports; (6) accumulate ~300 station-days; (7) settle CAPACITY.
-Backtest stays frozen in the REFUTATION + plumbing role: offer survival is a
-counterfactual about the venue's reaction to OUR order, recorded nowhere.
+Backtest stays REFUTATION + plumbing only: offer survival is a counterfactual
+about the venue's reaction to OUR order, recorded nowhere.
 
-**EXEC SPINE follow-ups (R-4 + its 2026-09-02 review):** see
-`docs/plans/EXEC_SPINE_2026-09-01.md` §R-4 "review amendments". Most
-dangerous: R-9's per-trade return divides by zero for an unpriced forward and
-settlement-as-exit bypasses `_submit_order`'s refusal latch — both must be
-guarded before R-9 lands.
+**EXEC SPINE follow-ups:** `docs/plans/EXEC_SPINE_2026-09-01.md` §R-4
+"review amendments". Guard before R-9: R-9's per-trade return divides by zero
+for an unpriced forward; settlement-as-exit bypasses `_submit_order`'s refusal
+latch. **[HIGH] `reduce_only` is a naked-short bypass** — public OrderFactory
+kwarg, RiskEngine skips its check when `position_id is None` (the
+`submit_order` default), and `_working_sell_quantity` excludes reduce-only
+sells from `pending`, so two such sells each sized to net long are jointly
+naked. Latent (strike_ladder is BUY-only). **Removing R-4's standing refusal
+(`exec/client.py:1338-1350`) is GATED on fixing this**, not on R-9.
 
 ---
 
