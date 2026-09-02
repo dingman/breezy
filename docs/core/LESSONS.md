@@ -867,3 +867,52 @@ population the sample came from, and treat any *new* population — a fresh
 cohort, a new venue state, a first-of-its-kind record — as unproven until it
 arrives. Related: [[L-15]] (run the executable oracle), [[L-13]] (a statistic
 is not comparable across the regimes it was not sampled from).
+
+## L-18 — A counterfactual is a claim about a mechanism you have not run (2026-09-02)
+
+Two of my own errors in one review round, same shape: I recorded what *would
+happen if something changed*, as fact, without tracing the mechanism that would
+have to carry it.
+
+**Instance 1, the dangerous one.** `PROGRESS.md` stated that removing the R-4
+standing refusal (`exec/client.py:1338-1350`) "**enables order sends**". False.
+The signer permits only GET (`signing.py:84`), no write transport exists under
+`src/`, and R-6.5/R-7 are unlanded — there is no send to enable. Removing R-4
+would have deleted the only **denial** on the path, so a submitted order would
+receive neither `OrderDenied` nor a send and would hang in flight silently.
+The entry did not merely overstate a benefit; it inverted the sign. It made a
+strictly-worse change look like the natural next step, and it had sat in the
+backlog as a standing invitation to make it.
+
+**Instance 2, cheap but instructive.** The T-1 plan required RED-7
+(`PARTIALLY_FILLED`) to fail on the pre-fix tree. It cannot: `PARTIALLY_FILLED`
+is already inside `is_open_c` (`base.pyx:421-430`), so the narrow query always
+saw it. The widening's only status-visible change is `INITIALIZED`/`SUBMITTED`.
+One look at the membership list would have caught it; instead the implementer
+found it at the code, having first written a test that could not go red.
+
+**Why this class survives review.** A counterfactual reads like an observation
+and is graded like one. "Removing X enables Y" has the grammar of a measurement
+but the content of a prediction, and nothing in the sentence marks which. Both
+instances were **one grep from disproof** — membership of a status list, and
+the presence of a write verb. Neither was hard; both were simply never run,
+because the claim already sounded settled.
+
+**The sharpest instance of the same family, found in that review.** A safety
+control can be asserted and unenforced: `safety.py:668
+assert_live_order_submission_permitted` — the operator-permit chokepoint for
+live submission — has **zero callers in `src/`** (only a re-export at
+`__init__.py:120`), and barrier B6/B7 actively *bans* it from acquiring one. It
+reads in every document as the gate on live order submission. It gates nothing.
+**A function with no caller is not a control**, however exactly it is named.
+
+**How to apply.** Before writing that changing X produces Y — especially in
+`PROGRESS.md`, a plan, or a commit message, where it becomes the premise of
+someone else's work — name the mechanism that carries Y and check it exists.
+Mark it `UNVERIFIED` if you did not. When citing a control as a cover, check it
+has a **caller**, not just a definition and a good name; when asserting a test
+will go red, check the predicate actually changes for the case you chose. Same
+discipline as [[L-15]] (run the executable oracle rather than reasoning about
+what it would say) and [[L-17]] (a sample establishes presence, never
+necessity) — and the reason [[L-12]] insists a barrier is widened by measured
+need rather than by argument.
