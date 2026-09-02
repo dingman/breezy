@@ -156,19 +156,9 @@ either count it under the same bounded key set or document why not.
 | CF-14 | MED | One bad market aborts the WHOLE discovery cycle; 1 blocked 30 new subs 09-02 (L-17) |
 | CF-13 | UNPROVEN | No CCA/CCB CORRECTION seen live; supersession path fixture-covered only |
 
-### Programme sequence (carried forward from 2026-08-30)
+### Programme sequence
 
-- **P1** — harden then supervise the quote tape; prices are the one
-  irreplaceable stream. BL-23 is the remaining P1 work. Still untested end to
-  end: the native shutdown joint (`kernel.py:585` + `:613-638`) is confirmed by
-  source, not by a live-node run.
-- **P2/P3** — forecast probes then ingestion. Breezy ingests **no forecast data
-  at all**, so every forecast-strategy ROI is inadmissible. DEPRIORITISED; the
-  observation family needs none. See (5).
-- **P4** — daily-budget gate and portfolio-wide cap (see operator contract).
-  BL-3 is the first increment.
-- **P6** — wire boundary-conditional preliminary-revision cost into sizing;
-  `min_model_edge=0.04` is plausibly smaller than the revision cost it covers.
+P1–P6 narrative moved to `docs/core/PROGRAMME_PATH.md` (size gate). Active P-work is tracked as backlog IDs above.
 
 ### Blocked, with unlock condition
 
@@ -188,11 +178,24 @@ forecast ingest → ~300 station-days → CAPACITY).
 **EXEC SPINE follow-ups:** `docs/plans/EXEC_SPINE_2026-09-01.md` §R-4
 "review amendments". Guard before R-9: divides by zero for an unpriced
 forward; settlement-as-exit bypasses `_submit_order`'s refusal latch.
-**R-4 gate: conditions MET, removal NOT taken.** The guard's three known
-bypasses are closed — forged tags (70d68e8), `reduce_only` (e83b8e0), and both
-cache-visibility holes (d7c6063, c5818cc). Removing the standing refusal
-(`exec/client.py:1338-1350`) enables order sends and is a SEPARATE decision
-needing its own review; the guard is also still DORMANT (`strategies=[]`).
+**R-4 gate: conditions MET, removal REFUSED (reviewed 2026-09-02).** The
+guard's three bypasses are closed — forged tags (70d68e8), `reduce_only`
+(e83b8e0), both cache-visibility holes (d7c6063, c5818cc). This entry
+previously claimed removal "enables order sends" — **false**: the signer
+permits only GET (`signing.py:84`), no write transport exists in `src/`, and
+R-6.5/R-7 are unlanded. Removal would delete the only DENIAL on the path,
+leaving an order with neither `OrderDenied` nor a send — hanging in-flight
+silently, strictly worse for zero gain. Hold until R-6.5/R-7 land the send in
+the same change, `_cancel_order` gains a real path, and the live guard covers
+BUY (it is SELL-only). Guard also still DORMANT (`strategies=[]`).
+
+**[HIGH, NEW] The operator-permit chokepoint has zero callers.**
+`safety.py:668 assert_live_order_submission_permitted` is called nowhere in
+`src/` (only re-exported, `__init__.py:120`), and barrier B6/B7
+(`test_polymarket_us_readonly_guard.py`) BANS it from having one. Permit,
+ceiling and operator gate are asserted but unenforced — whoever lands R-7 must
+wire it and relax B6 deliberately in that commit, or the send path ships with
+no operator gate at all.
 
 **[HIGH, TRACKED] T-1 — the same blindness at the STRATEGY layer.**
 `weather_common/risk.py:198-204` documents two independent covers for the

@@ -26,3 +26,17 @@ proven); R-4P-2 (cursor pagination) open. Plan
 HELD until K1 reports; (6) accumulate ~300 station-days; (7) settle CAPACITY.
 Backtest stays REFUTATION + plumbing only: offer survival is a counterfactual
 about the venue's reaction to OUR order, recorded nowhere.
+
+## Programme sequence (carried forward from 2026-08-30)
+
+- **P1** — harden then supervise the quote tape; prices are the one
+  irreplaceable stream. BL-23 is the remaining P1 work. Still untested end to
+  end: the native shutdown joint (`kernel.py:585` + `:613-638`) is confirmed by
+  source, not by a live-node run.
+- **P2/P3** — forecast probes then ingestion. Breezy ingests **no forecast data
+  at all**, so every forecast-strategy ROI is inadmissible. DEPRIORITISED; the
+  observation family needs none. See (5).
+- **P4** — daily-budget gate and portfolio-wide cap (see operator contract).
+  BL-3 is the first increment.
+- **P6** — wire boundary-conditional preliminary-revision cost into sizing;
+  `min_model_edge=0.04` is plausibly smaller than the revision cost it covers.
