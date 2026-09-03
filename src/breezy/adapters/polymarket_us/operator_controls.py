@@ -1,4 +1,5 @@
-"""The two operator-reserved controls, as MECHANISM ONLY (EXEC SPINE R-6e).
+(
+    """The two operator-reserved controls, as MECHANISM ONLY (EXEC SPINE R-6e).
 
 WHAT THIS MODULE IS
 -------------------
@@ -87,11 +88,22 @@ R-6d's refusal classifier landed in. The consumer is the R-7 submit path,
 which does not exist yet; pre-wiring it into ``exec/client.py`` now would put
 an order-path change inside an increment whose whole subject is a policy
 mechanism, and R-4's standing refusal keeps that path closed regardless.
+
+THE FEE FLOOR, AND WHY THIS CAP IS PRE-FEE
+------------------------------------------
+
 """
+    "R-8 does not proceed until the venue's minimum taker fee is measured and "
+    "`fees.py` models it; until then the per-position cost control "
+    "(`operator_max_position_cost_usd()`) is cost-BEFORE-fee and the operator "
+    "sizes accordingly."
+)
 
 from __future__ import annotations
 
+import itertools
 import threading
+from dataclasses import dataclass
 from datetime import UTC, date, datetime
 from decimal import ROUND_UP, Decimal
 from typing import Final
@@ -125,6 +137,11 @@ OPERATOR_RESERVED_CONTROL_ENV_VARS: Final = (
 _CENT: Final = Decimal("0.01")
 
 _NS_PER_SECOND: Final = 1_000_000_000
+
+#: Process-wide monotonic booking ids so two ledgers cannot collide on the
+#: same ``(cost, day, booking_id)`` triple. Incremented under the issuing
+#: ledger's lock; ``count.__next__`` is atomic under the GIL besides.
+_BOOKING_IDS = itertools.count(1)
 
 
 def operator_max_daily_budget_usd() -> Decimal:
@@ -187,6 +204,16 @@ def _require_decimal(value: object, label: str) -> Decimal:
     return value
 
 
+def _round_cost_up_to_cent(amount: Decimal) -> Decimal:
+    """Quantise a USD amount UP to the cent.
+
+    Shared by :func:`order_cost_usd` (the cap) and
+    :meth:`DailySpendLedger.true_up_booking` so a true-up cannot round
+    differently from an authorisation.
+    """
+    return amount.quantize(_CENT, rounding=ROUND_UP)
+
+
 def order_cost_usd(*, price_usd: Decimal, quantity: Decimal) -> Decimal:
     """The USD cost of an order: ``price x quantity``, rounded UP to the cent.
 
@@ -201,7 +228,23 @@ def order_cost_usd(*, price_usd: Decimal, quantity: Decimal) -> Decimal:
     """
     price = _require_decimal(price_usd, "price_usd")
     qty = _require_decimal(quantity, "quantity")
-    return (price * qty).quantize(_CENT, rounding=ROUND_UP)
+    return _round_cost_up_to_cent(price * qty)
+
+
+@dataclass(frozen=True, slots=True)
+class SpendBooking:
+    """A grant made by :meth:`DailySpendLedger.authorize_order_cost`.
+
+    ``cost`` is the USD amount booked against the day, ``day`` is the UTC
+    calendar day of the grant, and ``booking_id`` is a process-monotonic
+    nonce. Released or trued-up at most once. A booking from a previous UTC
+    day cannot be released or trued-up against today's accumulator: the day
+    already rolled, the spend is gone.
+    """
+
+    cost: Decimal
+    day: date
+    booking_id: int
 
 
 class DailySpendLedger:
@@ -218,16 +261,28 @@ class DailySpendLedger:
     failure mode (a stale file re-granting or wrongly refusing budget).
     """
 
-    __slots__ = ("_day", "_last_ns", "_lock", "_spent_usd")
+    __slots__ = (
+        "_bookings",
+        "_day",
+        "_last_ns",
+        "_lock",
+        "_released_ids",
+        "_spent_usd",
+        "_trued_up_ids",
+    )
 
     def __init__(self) -> None:
         #: One lock, because a strategy and a reconciliation task can
         #: authorise concurrently and a read-modify-write of the accumulator
         #: is exactly the shape that double-spends a budget under a race.
+        #: Release and true-up take the same lock.
         self._lock = threading.Lock()
         self._day: date | None = None
         self._spent_usd = Decimal(0)
         self._last_ns = 0
+        self._bookings: dict[int, SpendBooking] = {}
+        self._released_ids: set[int] = set()
+        self._trued_up_ids: set[int] = set()
 
     def spent_today_usd(self, *, now_ns: int) -> Decimal:
         """USD spent on the UTC day containing ``now_ns``. Never mutates.
@@ -247,7 +302,7 @@ class DailySpendLedger:
         price_usd: Decimal,
         quantity: Decimal,
         now_ns: int,
-    ) -> Decimal:
+    ) -> SpendBooking:
         """Refuse or record the cost of one order against both controls.
 
         Both controls are read FIRST, before either is applied, so an absent
@@ -262,7 +317,8 @@ class DailySpendLedger:
                 sampled here.
 
         Returns:
-            The cost recorded against the day's budget, in USD.
+            A frozen :class:`SpendBooking` for the grant. ``booking.cost`` is
+            the USD amount recorded against the day's budget.
 
         Raises:
             LiveTradingPermissionError: if either control is unset or
@@ -296,6 +352,18 @@ class DailySpendLedger:
                     f"clock moved backwards, and spent budget is never resurrected"
                 )
             if self._day != day:
+                # Prior-day bookings are already unreleasable / untrue-up-able
+                # by the day rule; drop them so a long-lived node cannot grow
+                # without bound. Membership checks in _require_open_booking
+                # run after the day rule, so pruning cannot change the error.
+                self._bookings = {
+                    booking_id: booking
+                    for booking_id, booking in self._bookings.items()
+                    if booking.day == day
+                }
+                keep = set(self._bookings)
+                self._released_ids.intersection_update(keep)
+                self._trued_up_ids.intersection_update(keep)
                 self._day = day
                 self._spent_usd = Decimal(0)
             if self._spent_usd + cost > daily_budget:
@@ -303,6 +371,104 @@ class DailySpendLedger:
                     f"{MAX_DAILY_BUDGET_USD_ENV_VAR} refuses this order: it would carry "
                     f"today's USD notional past the operator's daily budget"
                 )
+            booking = SpendBooking(cost=cost, day=day, booking_id=next(_BOOKING_IDS))
+            self._bookings[booking.booking_id] = booking
             self._spent_usd = self._spent_usd + cost
             self._last_ns = now_ns
-            return cost
+            return booking
+
+    def _require_open_booking(
+        self, booking: SpendBooking, *, now_ns: int, action: str
+    ) -> SpendBooking:
+        """Return ``booking`` if it is live on today's accumulator.
+
+        Caller MUST hold ``self._lock``. Does not roll the day: a previous-
+        UTC-day booking cannot be released or trued-up against today's
+        accumulator -- the day already rolled, the spend is gone.
+        """
+        if now_ns < self._last_ns:
+            raise LiveTradingPermissionError(
+                "the injected clock moved backwards, and spent budget is never resurrected"
+            )
+        day = utc_day_for_ns(now_ns)
+        if booking.day != day or self._day != booking.day:
+            raise LiveTradingPermissionError(
+                f"a booking from a previous UTC day cannot be {action} against "
+                "today's accumulator: the day already rolled, the spend is gone"
+            )
+        stored = self._bookings.get(booking.booking_id)
+        if stored is None or stored != booking:
+            raise LiveTradingPermissionError("booking is not known to this ledger")
+        if booking.booking_id in self._released_ids:
+            raise LiveTradingPermissionError("booking has already been released")
+        if booking.booking_id in self._trued_up_ids:
+            raise LiveTradingPermissionError("booking has already been trued up")
+        return stored
+
+    def release_booking(self, booking: SpendBooking, *, now_ns: int) -> None:
+        """Reverse a grant made by :meth:`authorize_order_cost` in full.
+
+        A booking can be released at most once. A booking from a previous UTC
+        day cannot be released against today's accumulator: the day already
+        rolled, the spend is gone. Spent never goes negative. Runs under the
+        same lock as :meth:`authorize_order_cost`. Does not roll the day.
+        """
+        if type(booking) is not SpendBooking:
+            raise LiveTradingPermissionError(
+                f"booking must be exactly SpendBooking, not {type(booking).__name__}"
+            )
+        with self._lock:
+            granted = self._require_open_booking(booking, now_ns=now_ns, action="released")
+            if self._spent_usd < granted.cost:
+                raise LiveTradingPermissionError("spent would go negative")
+            self._spent_usd = self._spent_usd - granted.cost
+            self._released_ids.add(granted.booking_id)
+            self._last_ns = now_ns
+
+    def true_up_booking(
+        self,
+        booking: SpendBooking,
+        *,
+        filled_cost_usd: Decimal,
+        now_ns: int,
+    ) -> Decimal:
+        """Replace the booked cost with the realized fill cost.
+
+        ``filled_cost_usd`` is the realized ``avgPx x cumQuantity`` cost,
+        rounded UP to the cent with the same helper :func:`order_cost_usd`
+        uses. It may be less than or equal to the booking (partial or full
+        fill). If it is greater, this raises: a fill cannot cost more than
+        authorized; that is an accounting error to surface, never absorb.
+        At most once per booking. A booking from a previous UTC day cannot
+        be trued up against today's accumulator: the day already rolled,
+        the spend is gone. Spent never goes negative. Runs under the same
+        lock as :meth:`authorize_order_cost`. Does not roll the day.
+        """
+        if type(booking) is not SpendBooking:
+            raise LiveTradingPermissionError(
+                f"booking must be exactly SpendBooking, not {type(booking).__name__}"
+            )
+        if type(filled_cost_usd) is not Decimal:
+            raise LiveTradingPermissionError(
+                f"filled_cost_usd must be exactly Decimal, not {type(filled_cost_usd).__name__}"
+            )
+        if not filled_cost_usd.is_finite():
+            raise LiveTradingPermissionError("filled_cost_usd must be a finite decimal amount")
+        if filled_cost_usd < Decimal(0):
+            raise LiveTradingPermissionError("filled_cost_usd must not be negative")
+        realized = _round_cost_up_to_cent(filled_cost_usd)
+        if realized > booking.cost:
+            raise LiveTradingPermissionError(
+                "a fill cannot cost more than authorized; that is an accounting error "
+                "to surface, never absorb"
+            )
+        with self._lock:
+            granted = self._require_open_booking(booking, now_ns=now_ns, action="trued up")
+            if self._spent_usd < granted.cost:
+                raise LiveTradingPermissionError("spent would go negative")
+            self._spent_usd = self._spent_usd - granted.cost + realized
+            if self._spent_usd < Decimal(0):
+                raise LiveTradingPermissionError("spent would go negative")
+            self._trued_up_ids.add(granted.booking_id)
+            self._last_ns = now_ns
+            return realized

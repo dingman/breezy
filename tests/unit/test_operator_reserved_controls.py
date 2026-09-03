@@ -197,7 +197,7 @@ def test_a_cost_exactly_at_the_position_cap_is_admitted() -> None:
         recorded = ledger.authorize_order_cost(
             price_usd=Decimal("0.25"), quantity=Decimal(100), now_ns=MIDDAY
         )
-    assert recorded == Decimal("25.00")
+    assert recorded.cost == Decimal("25.00")
 
 
 def test_a_cost_below_the_position_cap_is_admitted() -> None:
@@ -206,7 +206,7 @@ def test_a_cost_below_the_position_cap_is_admitted() -> None:
         recorded = ledger.authorize_order_cost(
             price_usd=Decimal("0.10"), quantity=Decimal(100), now_ns=MIDDAY
         )
-    assert recorded == Decimal("10.00")
+    assert recorded.cost == Decimal("10.00")
 
 
 def test_a_refused_order_costs_no_budget() -> None:
@@ -274,7 +274,7 @@ def test_the_budget_resets_at_the_day_boundary() -> None:
         recorded = ledger.authorize_order_cost(
             price_usd=Decimal("1.00"), quantity=Decimal(100), now_ns=_ns(2026, 9, 3, 0, 0)
         )
-        assert recorded == Decimal("100.00")
+        assert recorded.cost == Decimal("100.00")
         assert ledger.spent_today_usd(now_ns=_ns(2026, 9, 3, 0, 0)) == Decimal("100.00")
 
 
@@ -317,13 +317,13 @@ def test_concurrent_authorizations_never_overspend_the_day() -> None:
 
     def attempt() -> None:
         try:
-            cost = ledger.authorize_order_cost(
+            booking = ledger.authorize_order_cost(
                 price_usd=Decimal("1.00"), quantity=Decimal(10), now_ns=MIDDAY
             )
         except LiveTradingPermissionError:
             return
         with lock:
-            granted.append(cost)
+            granted.append(booking.cost)
 
     with _budget(daily="100.00", position="100.00"):
         threads = [threading.Thread(target=attempt) for _ in range(32)]
@@ -386,6 +386,269 @@ def test_the_ledger_samples_no_wall_clock_of_its_own() -> None:
     source = inspect.getsource(operator_controls)
     for forbidden in ("time.time", "time.monotonic", "datetime.now", "datetime.utcnow"):
         assert forbidden not in source
+
+
+# ---------------------------------------------------------------------------
+# R-7-PRE-2 -- release and true-up primitives (library only)
+# ---------------------------------------------------------------------------
+
+
+def test_releasing_a_booking_vacates_the_budget_for_an_identical_later_grant() -> None:
+    """Non-vacuity: without the release, the second grant is refused.
+
+    A string of definitive rejects would otherwise burn the daily budget with
+    $0 at risk. Releasing the first grant is what makes the identical second
+    grant admissible.
+    """
+    ledger = DailySpendLedger()
+    with _budget(daily="100.00", position="100.00"):
+        first = ledger.authorize_order_cost(
+            price_usd=Decimal("1.00"), quantity=Decimal(100), now_ns=MIDDAY
+        )
+        with pytest.raises(LiveTradingPermissionError):
+            ledger.authorize_order_cost(
+                price_usd=Decimal("1.00"), quantity=Decimal(100), now_ns=MIDDAY
+            )
+        ledger.release_booking(first, now_ns=MIDDAY)
+        second = ledger.authorize_order_cost(
+            price_usd=Decimal("1.00"), quantity=Decimal(100), now_ns=MIDDAY
+        )
+        assert ledger.spent_today_usd(now_ns=MIDDAY) == Decimal("100.00")
+        assert second.booking_id != first.booking_id
+
+
+def test_a_booking_can_be_released_at_most_once() -> None:
+    ledger = DailySpendLedger()
+    with _budget(daily="100.00", position="100.00"):
+        booking = ledger.authorize_order_cost(
+            price_usd=Decimal("0.40"), quantity=Decimal(100), now_ns=MIDDAY
+        )
+        ledger.release_booking(booking, now_ns=MIDDAY)
+        with pytest.raises(LiveTradingPermissionError):
+            ledger.release_booking(booking, now_ns=MIDDAY)
+        assert ledger.spent_today_usd(now_ns=MIDDAY) == Decimal(0)
+
+
+def test_a_previous_day_booking_cannot_be_released_against_today() -> None:
+    """The day already rolled, the spend is gone -- raise, never silently no-op.
+
+    Reuses the rollover clock fixture (``_ns``) so the UTC day boundary is the
+    same one ``test_the_budget_resets_at_the_day_boundary`` exercises.
+    """
+    ledger = DailySpendLedger()
+    grant_ns = _ns(2026, 9, 2, 12)
+    next_day_ns = _ns(2026, 9, 3, 0, 0)
+    with _budget(daily="100.00", position="100.00"):
+        booking = ledger.authorize_order_cost(
+            price_usd=Decimal("0.50"), quantity=Decimal(100), now_ns=grant_ns
+        )
+        with pytest.raises(LiveTradingPermissionError) as excinfo:
+            ledger.release_booking(booking, now_ns=next_day_ns)
+        assert "day already rolled" in str(excinfo.value)
+        assert ledger.spent_today_usd(now_ns=grant_ns) == Decimal("50.00")
+        assert ledger.spent_today_usd(now_ns=next_day_ns) == Decimal(0)
+
+
+def test_release_never_takes_spent_below_zero() -> None:
+    ledger = DailySpendLedger()
+    with _budget(daily="100.00", position="50.00"):
+        first = ledger.authorize_order_cost(
+            price_usd=Decimal("0.40"), quantity=Decimal(100), now_ns=MIDDAY
+        )
+        second = ledger.authorize_order_cost(
+            price_usd=Decimal("0.10"), quantity=Decimal(100), now_ns=MIDDAY
+        )
+        ledger.release_booking(first, now_ns=MIDDAY)
+        ledger.release_booking(second, now_ns=MIDDAY)
+        spent = ledger.spent_today_usd(now_ns=MIDDAY)
+        assert spent == Decimal(0)
+        assert spent >= Decimal(0)
+        with pytest.raises(LiveTradingPermissionError):
+            ledger.release_booking(first, now_ns=MIDDAY)
+        assert ledger.spent_today_usd(now_ns=MIDDAY) == Decimal(0)
+
+
+def test_true_up_to_a_smaller_cost_lowers_spent_today() -> None:
+    ledger = DailySpendLedger()
+    with _budget(daily="100.00", position="50.00"):
+        booking = ledger.authorize_order_cost(
+            price_usd=Decimal("0.40"), quantity=Decimal(100), now_ns=MIDDAY
+        )
+        assert ledger.spent_today_usd(now_ns=MIDDAY) == Decimal("40.00")
+        ledger.true_up_booking(booking, filled_cost_usd=Decimal("25.00"), now_ns=MIDDAY)
+        assert ledger.spent_today_usd(now_ns=MIDDAY) == Decimal("25.00")
+
+
+def test_true_up_above_the_booking_raises() -> None:
+    ledger = DailySpendLedger()
+    with _budget(daily="100.00", position="50.00"):
+        booking = ledger.authorize_order_cost(
+            price_usd=Decimal("0.40"), quantity=Decimal(100), now_ns=MIDDAY
+        )
+        with pytest.raises(LiveTradingPermissionError) as excinfo:
+            ledger.true_up_booking(booking, filled_cost_usd=Decimal("40.01"), now_ns=MIDDAY)
+        assert "accounting error" in str(excinfo.value)
+        assert ledger.spent_today_usd(now_ns=MIDDAY) == Decimal("40.00")
+
+
+def test_true_up_twice_raises() -> None:
+    ledger = DailySpendLedger()
+    with _budget(daily="100.00", position="50.00"):
+        booking = ledger.authorize_order_cost(
+            price_usd=Decimal("0.40"), quantity=Decimal(100), now_ns=MIDDAY
+        )
+        ledger.true_up_booking(booking, filled_cost_usd=Decimal("25.00"), now_ns=MIDDAY)
+        with pytest.raises(LiveTradingPermissionError):
+            ledger.true_up_booking(booking, filled_cost_usd=Decimal("10.00"), now_ns=MIDDAY)
+        assert ledger.spent_today_usd(now_ns=MIDDAY) == Decimal("25.00")
+
+
+def test_true_up_after_release_raises() -> None:
+    """Cross-operation: a released booking is closed; true-up must not reopen it."""
+    ledger = DailySpendLedger()
+    with _budget(daily="100.00", position="50.00"):
+        booking = ledger.authorize_order_cost(
+            price_usd=Decimal("0.40"), quantity=Decimal(100), now_ns=MIDDAY
+        )
+        ledger.release_booking(booking, now_ns=MIDDAY)
+        with pytest.raises(LiveTradingPermissionError) as excinfo:
+            ledger.true_up_booking(booking, filled_cost_usd=Decimal("10.00"), now_ns=MIDDAY)
+        assert "already been released" in str(excinfo.value)
+        assert ledger.spent_today_usd(now_ns=MIDDAY) == Decimal(0)
+
+
+def test_release_after_true_up_raises() -> None:
+    """Cross-operation: a trued-up booking is closed; release must not reopen it."""
+    ledger = DailySpendLedger()
+    with _budget(daily="100.00", position="50.00"):
+        booking = ledger.authorize_order_cost(
+            price_usd=Decimal("0.40"), quantity=Decimal(100), now_ns=MIDDAY
+        )
+        ledger.true_up_booking(booking, filled_cost_usd=Decimal("25.00"), now_ns=MIDDAY)
+        with pytest.raises(LiveTradingPermissionError) as excinfo:
+            ledger.release_booking(booking, now_ns=MIDDAY)
+        assert "already been trued up" in str(excinfo.value)
+        assert ledger.spent_today_usd(now_ns=MIDDAY) == Decimal("25.00")
+
+
+def test_true_up_of_a_previous_day_booking_raises() -> None:
+    ledger = DailySpendLedger()
+    grant_ns = _ns(2026, 9, 2, 12)
+    next_day_ns = _ns(2026, 9, 3, 0, 0)
+    with _budget(daily="100.00", position="100.00"):
+        booking = ledger.authorize_order_cost(
+            price_usd=Decimal("0.50"), quantity=Decimal(100), now_ns=grant_ns
+        )
+        with pytest.raises(LiveTradingPermissionError) as excinfo:
+            ledger.true_up_booking(booking, filled_cost_usd=Decimal("10.00"), now_ns=next_day_ns)
+        assert "day already rolled" in str(excinfo.value)
+        assert ledger.spent_today_usd(now_ns=grant_ns) == Decimal("50.00")
+
+
+def test_day_rollover_prunes_prior_day_bookings() -> None:
+    """Rollover drops prior-day rows; the day-rule refusal is unchanged.
+
+    Prior-day bookings are already unreleasable and untrue-up-able, so pruning
+    them must not change the error a caller sees. After the first grant of the
+    new day, none of the three containers still holds a prior-day id.
+    """
+    ledger = DailySpendLedger()
+    grant_ns = _ns(2026, 9, 2, 12)
+    next_day_ns = _ns(2026, 9, 3, 0, 0)
+    with _budget(daily="100.00", position="100.00"):
+        open_booking = ledger.authorize_order_cost(
+            price_usd=Decimal("0.20"), quantity=Decimal(100), now_ns=grant_ns
+        )
+        released = ledger.authorize_order_cost(
+            price_usd=Decimal("0.10"), quantity=Decimal(100), now_ns=grant_ns
+        )
+        trued = ledger.authorize_order_cost(
+            price_usd=Decimal("0.10"), quantity=Decimal(100), now_ns=grant_ns
+        )
+        ledger.release_booking(released, now_ns=grant_ns)
+        ledger.true_up_booking(trued, filled_cost_usd=Decimal("5.00"), now_ns=grant_ns)
+        prior_ids = {open_booking.booking_id, released.booking_id, trued.booking_id}
+
+        with pytest.raises(LiveTradingPermissionError) as release_before:
+            ledger.release_booking(open_booking, now_ns=next_day_ns)
+        with pytest.raises(LiveTradingPermissionError) as true_up_before:
+            ledger.true_up_booking(
+                open_booking, filled_cost_usd=Decimal("1.00"), now_ns=next_day_ns
+            )
+        release_error = str(release_before.value)
+        true_up_error = str(true_up_before.value)
+        assert "day already rolled" in release_error
+        assert "day already rolled" in true_up_error
+
+        today = ledger.authorize_order_cost(
+            price_usd=Decimal("0.30"), quantity=Decimal(100), now_ns=next_day_ns
+        )
+
+        with pytest.raises(LiveTradingPermissionError) as release_after:
+            ledger.release_booking(open_booking, now_ns=next_day_ns)
+        with pytest.raises(LiveTradingPermissionError) as true_up_after:
+            ledger.true_up_booking(
+                open_booking, filled_cost_usd=Decimal("1.00"), now_ns=next_day_ns
+            )
+        assert str(release_after.value) == release_error
+        assert str(true_up_after.value) == true_up_error
+
+        assert prior_ids.isdisjoint(ledger._bookings)
+        assert prior_ids.isdisjoint(ledger._released_ids)
+        assert prior_ids.isdisjoint(ledger._trued_up_ids)
+        assert today.booking_id in ledger._bookings
+        today_day = utc_day_for_ns(next_day_ns)
+        assert all(booking.day == today_day for booking in ledger._bookings.values())
+
+
+def test_true_up_and_authorize_share_the_rounding_helper() -> None:
+    """Pin by identity: true-up rounds through the same helper the cap uses."""
+    import inspect
+
+    from breezy.adapters.polymarket_us import operator_controls as oc
+
+    true_up = DailySpendLedger.true_up_booking  # AttributeError on HEAD
+    helper = oc._round_cost_up_to_cent  # AttributeError until the helper is extracted
+    assert inspect.getclosurevars(oc.order_cost_usd).globals["_round_cost_up_to_cent"] is helper
+    assert inspect.getclosurevars(true_up).globals["_round_cost_up_to_cent"] is helper
+
+    ledger = DailySpendLedger()
+    with _budget(daily="100.00", position="50.00"):
+        booking = ledger.authorize_order_cost(
+            price_usd=Decimal("0.40"), quantity=Decimal(100), now_ns=MIDDAY
+        )
+        ledger.true_up_booking(booking, filled_cost_usd=Decimal("10.001"), now_ns=MIDDAY)
+        assert ledger.spent_today_usd(now_ns=MIDDAY) == helper(Decimal("10.001"))
+        assert helper(Decimal("10.001")) == Decimal("10.01")
+
+
+def test_authorize_returns_a_frozen_booking_record() -> None:
+    import dataclasses
+
+    from breezy.adapters.polymarket_us.operator_controls import SpendBooking
+
+    ledger = DailySpendLedger()
+    with _budget(daily="100.00", position="25.00"):
+        booking = ledger.authorize_order_cost(
+            price_usd=Decimal("0.25"), quantity=Decimal(100), now_ns=MIDDAY
+        )
+    assert type(booking) is SpendBooking
+    assert booking.cost == Decimal("25.00")
+    assert booking.day == utc_day_for_ns(MIDDAY)
+    assert type(booking.booking_id) is int
+    assert booking.booking_id > 0
+    assert dataclasses.is_dataclass(booking) and booking.__dataclass_params__.frozen
+
+
+def test_module_docstring_states_the_fee_floor_precondition() -> None:
+    from breezy.adapters.polymarket_us import operator_controls
+
+    assert (
+        "R-8 does not proceed until the venue's minimum taker fee is measured and "
+        "`fees.py` models it; until then the per-position cost control "
+        "(`operator_max_position_cost_usd()`) is cost-BEFORE-fee and the operator "
+        "sizes accordingly."
+    ) in (operator_controls.__doc__ or "")
 
 
 # ---------------------------------------------------------------------------
