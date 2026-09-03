@@ -13,10 +13,14 @@ byte-identical to what it does when the market is fairly priced.
     observation and completely different facts.
 
 The refusal is correct in both cases. What is not acceptable is that the
-operator cannot tell which one they are looking at. So every ``shorts_disabled``
-refusal is counted, and the count is surfaced through the alert path that
-already exists (:mod:`breezy.runtime.health`) rather than a second, private
-channel: :class:`~breezy.runtime.health.AlertState` supplies the
+operator cannot tell which one they are looking at. So every refusal reason
+tracked in :class:`RefusalCounter` is counted, and the count is surfaced
+through the alert path that already exists (:mod:`breezy.runtime.health`)
+rather than a second, private channel: ``RefusalAlerter`` emits one alert
+condition per reason present in the counter -- ``shorts_disabled`` keeps its
+dedicated ``SHORTS_DISABLED_REFUSALS`` event name and wording, and every
+other reason gets a generic ``<REASON>_REFUSALS`` event.
+:class:`~breezy.runtime.health.AlertState` supplies the
 false->true transition dedupe and the 24h re-notify, and
 :func:`~breezy.runtime.health.resolve_alert_sink` picks the logging sink by
 default and the webhook only when ``BREEZY_ALERT_WEBHOOK_URL`` is set.
