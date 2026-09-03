@@ -27,6 +27,36 @@ Null hypothesis, checked before writing any of this:
   a byte-identical re-run safe, but says nothing about SKIPPING the re-scan
   of an instance already known to be fully converted, and nothing about
   isolating one data type's ``ValueError`` from the rest -- both handled here.
+* **Row-wise writing is native too.** ``ParquetDataCatalog.write_data`` takes
+  ``skip_disjoint_check=True`` (``parquet.py:255-310``, documented as the
+  escape "when consolidating or re-writing chunks where you manage intervals
+  explicitly") and ``read_live_run``/``read_backtest`` (``:2519``, ``:2541``)
+  read a stream back as deserialised objects. No native path converts a
+  stream WITH the check skipped -- ``convert_stream_to_data`` exposes no such
+  parameter -- so the instrument-definition path below is the smallest
+  composition of those two public calls, not new persistence machinery.
+
+Instrument definitions convert row-wise (the re-emission defect)
+----------------------------------------------------------------
+``convert_stream_to_data`` converts feather files ONE AT A TIME, deriving
+each file's interval from ``[min ts_init, max ts_init]``, and raises
+``ValueError`` when that interval overlaps one already in the type's data
+directory. For capture-timed types (quotes, depth, trades) intervals are
+monotonic and never overlap. Instrument definitions are different in kind:
+the recorder re-emits a definition with its ORIGINAL ``ts_init``, so a later
+one-row file's POINT interval lands strictly inside the interval of the
+initial multi-row file. That overlap is permanent -- it refused
+``BinaryOption`` on every timer run for three days, and the first refusal
+also aborted the remaining feather files of that type.
+
+So for types whose ``ts_init`` is a definition stamp rather than a capture
+stamp (:func:`_is_instrument_definition`), this module reads the streamed
+objects, drops every ``(instrument_id, ts_init)`` already present in the
+catalog, and writes only what is genuinely new with
+``skip_disjoint_check=True``. De-duplication is what makes skipping the check
+safe: the check exists to stop the same rows being written twice, and that
+property is enforced here directly instead. Every other type keeps the single
+native call unchanged.
 
 Live-write avoidance (the hard safety property)
 ------------------------------------------------
@@ -95,8 +125,9 @@ import time
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import TextIO
+from typing import Any, TextIO
 
+from nautilus_trader.model.instruments import Instrument
 from nautilus_trader.persistence.catalog.parquet import ParquetDataCatalog
 from nautilus_trader.persistence.funcs import class_to_filename
 
@@ -135,7 +166,21 @@ MARKER_PREFIX = ".converted-"
 #: what is actually on disk the next time that constant changes.
 DEFAULT_DATA_TYPES: tuple[type, ...] = tuple(QUOTE_TAPE_INCLUDE_TYPES)
 
-ConvertFn = Callable[[ParquetDataCatalog, str, type, str], None]
+#: Rows landed in the catalog for this type.
+CONVERTED = "converted"
+
+#: The type converted successfully and every streamed row was already in the
+#: catalog. Distinct from ``CONVERTED`` so a re-emission-only interval is
+#: legible in the log without printing any instrument id or value.
+CONVERTED_NOTHING_NEW = "converted-nothing-new"
+
+#: The stream subdirectories Nautilus itself supports, each with its own
+#: public reader. ``_read_feather(kind=...)`` is private; these two are not.
+_STREAM_SUBDIRECTORIES = ("live", "backtest")
+
+#: A convert function returns the outcome string it achieved, or ``None`` to
+#: mean the plain :data:`CONVERTED` outcome.
+ConvertFn = Callable[[ParquetDataCatalog, str, type, str], str | None]
 ServiceActiveProbe = Callable[[], bool]
 
 
@@ -155,11 +200,170 @@ def _mark_converted(instance_dir: Path, data_cls: type) -> None:
     _marker_path(instance_dir, data_cls).touch()
 
 
+def _is_instrument_definition(data_cls: type) -> bool:
+    """True when ``ts_init`` stamps a DEFINITION rather than a capture moment.
+
+    ``Instrument`` is the whole predicate, and it is exact rather than
+    convenient: an instrument definition is the only thing the recorder
+    re-publishes verbatim -- carrying the ``ts_init`` of its first
+    publication -- so it is the only thing whose feather intervals can go
+    backwards. Everything else on the tape is stamped when it was captured
+    and is therefore monotonic by construction.
+    """
+    return issubclass(data_cls, Instrument)
+
+
+def _read_streamed(
+    catalog: ParquetDataCatalog, instance_id: str, data_cls: type, subdirectory: str
+) -> list[Any]:
+    """Deserialise one type's streamed feather files, via the public reader."""
+    if subdirectory not in _STREAM_SUBDIRECTORIES:
+        raise ValueError(
+            f"cannot read streamed {class_to_filename(data_cls)} from "
+            f"subdirectory {subdirectory!r}: expected one of "
+            f"{', '.join(_STREAM_SUBDIRECTORIES)}"
+        )
+    reader = catalog.read_live_run if subdirectory == "live" else catalog.read_backtest
+    try:
+        # `raise_on_failed_deserialize=True` is deliberate: the native default
+        # PRINTS the failure and DROPS the rows, and dropping rows before
+        # writing the success marker is precisely the invisible-data defect
+        # this module exists to end. It turns a schema drift into a loud
+        # per-type failure instead of a marker over missing rows.
+        streamed = reader(instance_id, data_cls=data_cls, raise_on_failed_deserialize=True)
+    except (MemoryError, RecursionError):
+        # Interpreter-level exhaustion says nothing about this data type and
+        # everything about the process. Never dressed up as a type failure
+        # that the next timer run would cheerfully retry.
+        raise
+    except Exception as exc:  # re-raised as THIS type's failure only
+        raise ValueError(f"could not read streamed {class_to_filename(data_cls)}: {exc}") from exc
+    if not isinstance(streamed, list):
+        # `return_as_dict` is left at its default, so this is unreachable
+        # today; asserting it keeps a future native default-flip from
+        # silently iterating a dict's KEYS as if they were definitions.
+        # ValueError, not TypeError, ON PURPOSE: `ingest_instance` isolates a
+        # ValueError as THIS type's failure, and any other exception aborts
+        # the whole instance. A wrong return type is one type's problem.
+        raise ValueError(  # noqa: TRY004
+            f"reader for {class_to_filename(data_cls)} returned "
+            f"{type(streamed).__name__}, expected list"
+        )
+    return sorted(streamed, key=lambda obj: obj.ts_init)
+
+
+def _same_definition(landed: Any, streamed: Any) -> bool:
+    """Compare two definitions by CONTENT.
+
+    ``Instrument.__eq__`` compares ``id`` alone (``instruments/base.pyx``
+    :299-302), so ``==`` cannot tell a re-emission that changed a field from
+    one that changed nothing -- it answers "same instrument", which is
+    already true by construction here. ``to_dict`` is the public,
+    round-trip-stable field view every ``Instrument`` subclass implements.
+    """
+    return bool(type(landed).to_dict(landed) == type(streamed).to_dict(streamed))
+
+
+def convert_instrument_definitions(
+    catalog: ParquetDataCatalog, instance_id: str, data_cls: type, subdirectory: str
+) -> str:
+    """Land the definitions this instance streamed that are not in the catalog.
+
+    Row-wise rather than file-wise because a re-emitted definition keeps its
+    original ``ts_init`` (see the module docstring): the native per-file
+    conversion refuses the resulting overlap permanently. De-duplicating on
+    ``(instrument_id, ts_init)`` -- against the catalog AND within the stream
+    -- is what earns ``skip_disjoint_check=True``, which is otherwise the one
+    guard against writing the same rows twice.
+
+    Reading every existing definition back is affordable precisely because
+    definitions are few: one row per market per re-emission, against millions
+    of quote rows that never come near this path.
+
+    Two consequences on disk, stated because both are load-bearing and
+    neither is reversible by this module.
+
+    **The catalog layout is mixed, and only an UNFILTERED query spans it.**
+    The streamed feather carries no ``instrument_id`` schema metadata, so the
+    native converter derived no identifier and wrote FLAT to
+    ``data/<type>/``, while ``write_data`` files rows under
+    ``data/<type>/<instrument_id>/``. ``get_file_list_from_data_cls`` globs
+    ``data/<type>/**/*.parquet`` and matches both, so an unfiltered
+    :meth:`ParquetDataCatalog.query` returns the union -- which is what the
+    de-duplication above relies on. An IDENTIFIER-FILTERED query does NOT:
+    ``filter_files`` derives a file's identifier from
+    ``file_path.split("/")[-2]`` (``parquet.py:2249``), which for a flat file
+    is the data-type directory, so ``query(<type>, identifiers=[...])`` and
+    ``catalog.instruments(instrument_ids=[...])`` silently omit every flat
+    row. **Never filter by identifier for this type**; query it unfiltered and
+    filter in Python. Pinned by
+    ``TestTheMixedCatalogLayoutIsPinned`` in the test module.
+
+    **``data/<type>/<instrument_id>/`` is now permanently non-disjoint.**
+    That is the whole point of ``skip_disjoint_check=True``, but it makes
+    every native operation that ASSUMES disjoint intervals unsound for this
+    type: ``consolidate_data`` (aborts on overlap), ``query_last_timestamp``
+    and ``extend_file_name`` (filename-interval reasoning), and any future
+    ``write_data`` for this type WITHOUT the flag (it would raise, exactly as
+    ``convert_stream_to_data`` does). Separately, per-instrument
+    subdirectories turn ``delete_data_range(<type>, identifier=None)`` into a
+    real RECURSIVE delete (``parquet.py:1421-1440``: the ``/data/<type>/``
+    substring now matches, where a flat layout made it a no-op) -- the exact
+    hazard :mod:`breezy.persistence.catalog` calls settlement-critical and
+    designs around. No caller does any of these today; this note is here so
+    that stays a decision rather than an accident.
+    """
+    streamed = _read_streamed(catalog, instance_id, data_cls, subdirectory)
+    known: dict[tuple[str, int], Any] = {
+        (definition.id.value, definition.ts_init): definition
+        for definition in catalog.query(data_cls=data_cls)
+    }
+
+    fresh: list[Any] = []
+    divergent = 0
+    for definition in streamed:
+        key = (definition.id.value, definition.ts_init)
+        landed = known.get(key)
+        if landed is not None:
+            if not _same_definition(landed, definition):
+                divergent += 1
+            continue
+        known[key] = definition
+        fresh.append(definition)
+
+    if divergent:
+        # A COUNT, never an id: `TypeConversionResult` and this module's log
+        # lines are value-free by contract. The landed row wins -- deciding
+        # which revision of a definition is authoritative is the trading
+        # path's call, not the ingest timer's -- but it is never silent.
+        logger.warning(
+            "instance %s: %d streamed %s row(s) share an already-landed "
+            "(instrument_id, ts_init) but differ in content; skipped, the "
+            "landed row stands",
+            instance_id,
+            divergent,
+            class_to_filename(data_cls),
+        )
+
+    if not fresh:
+        return CONVERTED_NOTHING_NEW
+
+    catalog.write_data(fresh, skip_disjoint_check=True)
+    return CONVERTED
+
+
 def default_convert(
     catalog: ParquetDataCatalog, instance_id: str, data_cls: type, subdirectory: str
-) -> None:
-    """The one native call this whole module exists to schedule and guard."""
+) -> str:
+    """The one native call this module exists to schedule and guard.
+
+    Instrument definitions take the row-wise path instead; every other type
+    is one ``convert_stream_to_data``, unchanged.
+    """
+    if _is_instrument_definition(data_cls):
+        return convert_instrument_definitions(catalog, instance_id, data_cls, subdirectory)
     catalog.convert_stream_to_data(instance_id, data_cls, subdirectory=subdirectory)
+    return CONVERTED
 
 
 def default_service_active_probe(unit: str = DEFAULT_SERVICE_UNIT) -> bool:
@@ -253,7 +457,10 @@ class TypeConversionResult:
     """The outcome for one data type within one instance."""
 
     data_cls: type
-    outcome: str  # "converted" | "skipped-already-converted" | "would-convert" | "failed"
+    #: "converted" | "converted-nothing-new" | "skipped-already-converted"
+    #: | "would-convert" | "failed". Value-free by contract: never an
+    #: instrument id, never a price.
+    outcome: str
     detail: str = ""
 
 
@@ -303,7 +510,7 @@ def ingest_instance(
             )
             continue
         try:
-            convert_fn(catalog, instance_id, data_cls, subdirectory)
+            outcome = convert_fn(catalog, instance_id, data_cls, subdirectory)
         except ValueError as exc:
             logger.error(
                 "instance %s: conversion of %s failed: %s",
@@ -314,7 +521,7 @@ def ingest_instance(
             type_results.append(TypeConversionResult(data_cls, "failed", str(exc)))
             continue
         _mark_converted(instance_dir, data_cls)
-        type_results.append(TypeConversionResult(data_cls, "converted"))
+        type_results.append(TypeConversionResult(data_cls, outcome or CONVERTED))
     return InstanceIngestResult(
         instance_id=instance_id, outcome="converted", type_results=tuple(type_results)
     )
