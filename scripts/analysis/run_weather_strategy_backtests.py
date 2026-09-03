@@ -211,7 +211,7 @@ from weather_strategy_backtest_lib import (
     build_settlement_scenarios,
     derive_completion_status,
     first_blocking_gate,
-    hours_until,
+    hours_from_now_until,
     latest_publication_at_or_before,
     select_book_backed_instrument_ids,
     select_tradable_instrument_ids,
@@ -510,7 +510,7 @@ class _SequenceForecastSource:
             target_date=climate_day,
             published_at=published_at,
             expected_high_f=expected_high_f,
-            horizon_hours=hours_until(now, deadline),
+            horizon_hours=hours_from_now_until(now, deadline),
         )
 
 

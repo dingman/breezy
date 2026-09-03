@@ -13,7 +13,7 @@ actually needs to get right before it ever touches the harness:
 * **Scenario construction** -- the REAL-vs-ASSUMED settlement sweep
   (:func:`build_settlement_scenarios`).
 
-:func:`hours_until` is the one small piece of arithmetic the runner's
+:func:`hours_from_now_until` is the one small piece of arithmetic the runner's
 synthetic ``ForecastSource`` needs to make ``horizon_hours`` a LIVE quantity
 (computed from the current backtest clock, not frozen at forecast-issuance
 time) -- see ``breezy.strategy.weather_common.forecast_source`` for why that
@@ -59,7 +59,7 @@ __all__ = [
     "build_settlement_scenarios",
     "derive_completion_status",
     "first_blocking_gate",
-    "hours_until",
+    "hours_from_now_until",
     "latest_publication_at_or_before",
     "select_book_backed_instrument_ids",
     "select_tradable_instrument_ids",
@@ -247,7 +247,7 @@ def derive_completion_status(
     return STATUS_COMPLETED
 
 
-def hours_until(now: dt.datetime, deadline: dt.datetime) -> float:
+def hours_from_now_until(now: dt.datetime, deadline: dt.datetime) -> float:
     """Hours from ``now`` to ``deadline``; negative once ``now`` is past it.
 
     Both arguments must be timezone-aware. This is the one place the synthetic
@@ -255,6 +255,12 @@ def hours_until(now: dt.datetime, deadline: dt.datetime) -> float:
     the backtest clock's current instant), rather than freezing it at forecast
     issuance -- see ``breezy.strategy.weather_common.forecast_source`` for why
     a frozen value would be wrong.
+
+    T-10: named with the argument order spelled out (``now`` first, then
+    ``deadline``) so it can never be confused with
+    ``breezy.strategy.weather_common.models.hours_until(later, now)``, which
+    takes the SAME two kinds of value in the OPPOSITE order. The two are not
+    interchangeable: swapping them silently flips the sign of the horizon.
 
     Raises
     ------
@@ -547,11 +553,13 @@ def first_blocking_gate(
     )
     from breezy.strategy.weather_common.ladder import ask_levels, levels_within_price
 
-    # The SHIPPED `hours_until`, deliberately not this module's same-named
-    # helper: the two take their arguments in OPPOSITE order
-    # (`models.hours_until(later, now)` vs `hours_until(now, deadline)` above),
-    # and `cli_settlement_print_lock.strategy` calls the shipped one. Using
-    # anything else here would flip the sign of every halt-window verdict.
+    # The SHIPPED `hours_until`, deliberately not this module's
+    # `hours_from_now_until` (T-10: renamed off the collision-prone name they
+    # used to share): the two take their arguments in OPPOSITE order
+    # (`models.hours_until(later, now)` vs `hours_from_now_until(now, deadline)`
+    # above), and `cli_settlement_print_lock.strategy` calls the shipped one.
+    # Using anything else here would flip the sign of every halt-window
+    # verdict.
     from breezy.strategy.weather_common.models import (
         ensure_aware,
     )

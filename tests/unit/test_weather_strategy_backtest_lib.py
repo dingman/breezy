@@ -5,8 +5,8 @@ Covers exactly the three pure-logic areas the runner depends on:
 instrument selection (which tape instruments actually carry book+quote
 data), settlement-price mapping (bucket containment -> 0.0/1.0), and
 scenario construction (the REAL-vs-ASSUMED settlement sweep). Also covers
-the ``hours_until`` helper the synthetic forecast source uses to compute a
-LIVE horizon.
+the ``hours_from_now_until`` helper the synthetic forecast source uses to
+compute a LIVE horizon.
 
 Loaded via ``importlib`` from its file path, matching the existing pattern in
 ``tests/unit/test_price_conditional_settlement_analysis.py``: ``scripts/``
@@ -215,48 +215,66 @@ def test_build_settlement_scenarios_no_sweep_candidates_for_station_adds_nothing
 
 
 # ---------------------------------------------------------------------------
-# hours_until
+# hours_from_now_until (T-10: renamed from the collision-prone `hours_until`,
+# which shared its name with `breezy.strategy.weather_common.models.hours_until`
+# but took its arguments in the OPPOSITE order -- see that module's docstring
+# cross-reference for the full history.)
 # ---------------------------------------------------------------------------
 
 
-def test_hours_until_positive_when_deadline_is_in_the_future() -> None:
+def test_hours_from_now_until_positive_when_deadline_is_two_hours_after_now() -> None:
+    """RED (T-10): pins the sign/order against the NEW, order-explicit name."""
+    now = dt.datetime(2026, 8, 30, 16, 5, tzinfo=dt.UTC)
+    deadline = now + dt.timedelta(hours=2)
+
+    result = lib.hours_from_now_until(now, deadline)
+
+    assert result == pytest.approx(2.0)
+
+
+def test_hours_until_name_no_longer_exists_on_the_module() -> None:
+    """RED (T-10): pins that the collision-prone name cannot be reintroduced."""
+    assert not hasattr(lib, "hours_until")
+
+
+def test_hours_from_now_until_positive_when_deadline_is_in_the_future() -> None:
     now = dt.datetime(2026, 8, 30, 16, 5, tzinfo=dt.UTC)
     deadline = dt.datetime(2026, 8, 31, 5, 0, tzinfo=dt.UTC)
 
-    result = lib.hours_until(now, deadline)
+    result = lib.hours_from_now_until(now, deadline)
 
     assert result == pytest.approx(12 + 55 / 60)
 
 
-def test_hours_until_zero_when_now_equals_deadline() -> None:
+def test_hours_from_now_until_zero_when_now_equals_deadline() -> None:
     moment = dt.datetime(2026, 8, 30, 16, 5, tzinfo=dt.UTC)
 
-    assert lib.hours_until(moment, moment) == 0.0
+    assert lib.hours_from_now_until(moment, moment) == 0.0
 
 
-def test_hours_until_negative_when_now_is_past_the_deadline() -> None:
+def test_hours_from_now_until_negative_when_now_is_past_the_deadline() -> None:
     now = dt.datetime(2026, 8, 31, 6, 0, tzinfo=dt.UTC)
     deadline = dt.datetime(2026, 8, 31, 5, 0, tzinfo=dt.UTC)
 
-    result = lib.hours_until(now, deadline)
+    result = lib.hours_from_now_until(now, deadline)
 
     assert result == pytest.approx(-1.0)
 
 
-def test_hours_until_rejects_naive_now() -> None:
+def test_hours_from_now_until_rejects_naive_now() -> None:
     now = dt.datetime(2026, 8, 30, 16, 5)  # noqa: DTZ001 - deliberately naive
     deadline = dt.datetime(2026, 8, 31, 5, 0, tzinfo=dt.UTC)
 
     with pytest.raises(ValueError, match="timezone-aware"):
-        lib.hours_until(now, deadline)
+        lib.hours_from_now_until(now, deadline)
 
 
-def test_hours_until_rejects_naive_deadline() -> None:
+def test_hours_from_now_until_rejects_naive_deadline() -> None:
     now = dt.datetime(2026, 8, 30, 16, 5, tzinfo=dt.UTC)
     deadline = dt.datetime(2026, 8, 31, 5, 0)  # noqa: DTZ001 - deliberately naive
 
     with pytest.raises(ValueError, match="timezone-aware"):
-        lib.hours_until(now, deadline)
+        lib.hours_from_now_until(now, deadline)
 
 
 # ---------------------------------------------------------------------------

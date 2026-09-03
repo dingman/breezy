@@ -35,9 +35,9 @@ explicitly, so adding a new frozen double stays legal while a production
 source that stops recomputing does not.
 
 STATUS: this is a PIN, not a defect test. ``_SequenceForecastSource`` already
-conforms (``hours_until(now, deadline)``, recomputed per call), so this passes
-on the tree that introduced it. That is the point: T-7 is that the property
-was unpinned, not that the shipped source violated it.
+conforms (``hours_from_now_until(now, deadline)``, recomputed per call), so
+this passes on the tree that introduced it. That is the point: T-7 is that
+the property was unpinned, not that the shipped source violated it.
 """
 
 from __future__ import annotations
