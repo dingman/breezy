@@ -184,7 +184,7 @@ C1–C5-blind helper) CLOSED `5221da3` (V5 + C6, 13 tests).
 **Open from the blind-risk-view audit** (`docs/core/findings/BLIND_RISK_VIEWS_2026-09-02.md`):
 T-9 exit policy (Grok: hold to settlement, entry-only halt, cancel working buys
 at met lock, never dump into a 0.3-lot bid); T-6 stale node_config docstring;
-T-10 reversed-arg `hours_until` in scripts/; `max_simultaneous_positions`
+`max_simultaneous_positions`
 unexercised end-to-end. Nautilus cannot cancel an INITIALIZED order.
 
 **[VERDICT] NO FAMILY HAS A PROVEN EDGE; ONE IS UNDER MEASUREMENT (M_B).**
