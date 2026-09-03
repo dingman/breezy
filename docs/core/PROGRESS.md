@@ -100,23 +100,6 @@ backtest — no `Data` subclass, no catalog wiring, no client. Plan (unreviewed)
 demote I-4; `build_running_max_days` at `pmr_climatology_study.py:351` is an
 EXISTING untested fold to PORT, not author).
 
-### [MED] BL-14 — `RefusalAlerter` alerts on `SHORTS_DISABLED` only
-
-`refusals.py:134-151` hardcodes one condition, so a run refused entirely for
-`stale_observation` / `observation_limit_unset` never alerts in live.
-Generalise `_conditions` over the counted key set.
-
-### [MED] BL-15 — `stale_forecast` fails open on a negative age (BL-9 class)
-
-`risk.py` checks only `>`; a negative age looks infinitely fresh.
-`quote_tradable` already guards this (`risk.py:278-279`). Needs its own
-`future_signal` reason.
-
-### [MED] BL-16 — `settlement_halt` is dead code; the 1.0h halt never fires
-
-`risk.py:395-398` checks halt before `min_hours_to_settlement` (2.0h); a
-decreasing clock always crosses 2.0 first. Decide if the two knobs are one.
-
 ## BACKLOG — selected for execution (opened 2026-08-31)
 
 **Binding constraints on EVERY item in this file.** No item may: set
@@ -142,7 +125,7 @@ an **L-1 null-hypothesis verdict** citing installed source under
 | CF-8 | MED | Sibling-station products unmarked in integrity index; wasted fetches |
 | BL-10 | LOW | `forecast_mispricing/decision.py:71` pre-signal `quote_tradable` refusal is invisible to BL-8's counter (family KILLED; moot until revived) |
 | CF-11 | LOW | `ruff format --check`: 31 unformatted files; not in any gate |
-| CF-14 | MED | One bad market aborts the WHOLE discovery cycle; 1 blocked 30 new subs 09-02 (L-17) |
+| CF-14b | DEFERRED | Per-market discovery isolation. CF-14a (tally) LANDED `2aa1e7f`; reopen only when the tally shows a genuine 1-of-N failure (`docs/plans/CF14_DISCOVERY_ISOLATION_2026-09-02.md`) |
 | CF-13 | UNPROVEN | No CCA/CCB CORRECTION seen live; supersession path fixture-covered only |
 
 ### Programme sequence
@@ -198,12 +181,21 @@ the PRE-lock afternoon window IS offered — 09-01 winner at 0.21×25 (MDW),
 archive p_hold AUDITED correct; kill amended `grok_mb_kill_amendment_2026-09-02.md`):
 realized hold of taken current-rung trials vs ask+fee — kill n≥60, survive
 n≥150; today n_taken=1. Clock: ~09-22 / ~10-21 at 3/day. Accrues via
-`breezy-mb-daily.timer` (13:30Z) + `breezy-quote-tape-ingest.timer`. **No new
+`breezy-mb-daily.timer` (13:30Z) + `breezy-quote-tape-ingest.timer`. **The venue skips
+~9% of station-days** (no 09-02 cohort was ever listed; 12 of ~135 days absent —
+`docs/evidence/venue/polymarket_us/MISSING_COHORT_2026-09-02_2026-09-03.md`), so add
+about a week to each clock estimate. **No new
 strategy package, BL-24, forecast ingest, or R-6.5b/R-7 until M_B survives.**
 
 ---
 
 ## Pointers
+
+2026-09-03: Kalshi plan `docs/plans/KALSHI_INTEGRATION_PLAN_2026-09-03.md` (plan
+only, gated on the Polymarket.us E2E proof; 41 VERIFIED / 20 UNVERIFIED / 10 MISSING).
+Polymarket.us docs re-check `docs/evidence/venue/polymarket_us/DOCS_RECHECK_2026-09-03.md`
+(no venue max size; no retail idempotency key; fees/tick/min-qty unchanged;
+`api.polymarket.us/v1/events` now 401s unauthenticated; public reads use the gateway).
 
 Durable rules `docs/core/LESSONS.md` (L-1..L-13, all binding) · evidence
 `docs/evidence/` · live plan `docs/plans/EXEC_SPINE_2026-09-01.md` · runbook

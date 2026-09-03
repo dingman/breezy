@@ -1034,3 +1034,34 @@ is still held, and an instance mutex serialises the read-modify-write.
 **Detection.** Any brief for a guard primitive that lists the lock as a
 separate bullet from the guarded object. Ask: can the object exist unlocked?
 If yes, rewrite before dispatch.
+
+## L-23 — A configuration snapshot is not the effective runtime; the journal is (2026-09-03)
+
+Hunting the missing 2026-09-02 station-day, a sub-agent read
+`instrument_reload_interval_mins: null` from every recorder instance's
+`config.json` and concluded discovery ran exactly once per process, so a cohort
+listed mid-session could never be picked up. Confident, specific, wrong: the
+recorder journal showed the reload loop firing 6-hourly and retrying every 60 s
+after a failure (`quote_tape_cli.py:263` overrides the field at start-up), and
+the venue had simply never listed a 09-02 cohort at all — a by-slug `404` with
+09-01 and 09-03 as passing positive controls settled it.
+
+**Why this is binding.** A persisted config field records what was *written*,
+not what the process *does*; overrides, defaults resolved at construction, and
+CLI flags all live between the file and the behaviour. The failure shape is the
+same as L-8 and L-20: a plausible artefact standing in for the measurement. It
+would have produced a "fix" (set the interval) that changed nothing and closed
+the ticket on a gap the venue owns.
+
+**The rule.** A root cause about *what a running process did* must cite the
+process's own record — the journal, the emitted tally, the on-disk output — and
+must survive a positive control. A config value, a docstring, or a default is a
+hypothesis about behaviour, never evidence of it. Before naming a cause that
+implies "we never asked the venue", prove the venue had something to give
+(L-8): fetch the missing key by identifier and fetch its neighbours the same way.
+
+**How to apply.** When a finding rests on a config or snapshot field, ask "what
+line would this process have logged if that were true?" and go read it. When a
+finding says "the data was never captured", classify it VENUE-NEVER-LISTED /
+LISTED-BUT-FILTERED / LISTED-AND-ABORTED only after the by-identifier probe with
+neighbours as controls. Related: [[L-8]], [[L-18]], [[L-20]].
