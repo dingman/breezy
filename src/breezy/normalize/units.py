@@ -19,15 +19,23 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Literal
 
-SentinelFlag = Literal["NONE", "M", "T", "MS", "MB"]
+SentinelFlag = Literal["NONE", "M", "T", "MS", "MB", "UNREADABLE"]
 """The published-value state for a settlement temperature field.
 
-- "NONE": a genuine numeric value is present in `value_f`.
-- "M":    missing (NWS renders this as `M` or `MM` in the raw product).
-- "T":    trace amount (used for precipitation-adjacent fields; some
-          CLI products render a temperature-position field as `T`).
-- "MS":   missing, value at a specific observation time.
-- "MB":   missing, value at midnight.
+- "NONE":       a genuine numeric value is present in `value_f`.
+- "M":          missing (NWS renders this as `M` or `MM` in the raw product).
+- "T":          trace amount (used for precipitation-adjacent fields; some
+                CLI products render a temperature-position field as `T`).
+- "MS":         missing, value at a specific observation time.
+- "MB":         missing, value at midnight.
+- "UNREADABLE": OURS, not NWS's -- the field's row was absent or its token
+                could not be parsed by `parse_temperature_token`. Deliberately
+                distinct from "M"/"T"/"MS"/"MB": those assert what NWS itself
+                published; this asserts only that WE could not read it.
+                Collapsing the two would fabricate a claim NWS never made.
+                Reserved for non-settlement-bearing fields (tmin/tavg) --
+                see `breezy.normalize.cli_parse.parse_cli_product`, which
+                keeps the settlement-bearing MAXIMUM fail-closed.
 """
 
 

@@ -271,14 +271,19 @@ def test_unrecognized_temperature_token_is_a_content_failure() -> None:
         )
 
 
-def test_missing_minimum_row_is_a_content_failure() -> None:
-    with pytest.raises(CliContentError):
-        _parse(
-            VALID_NYC_PREFIX
-            + "...THE CENTRAL PARK NY CLIMATE SUMMARY FOR AUGUST 21 2026...\n"
-            "TEMPERATURE (F)\n YESTERDAY\n  MAXIMUM 79\n\n"
-            "PRECIPITATION (IN)\n"
-        )
+def test_missing_minimum_row_is_tolerated_maximum_still_settles() -> None:
+    """MINIMUM is not settlement-bearing (see `is_settlement_grade`), so its
+    absence must not deny the site its settlement-bearing MAXIMUM for this
+    poll -- CF-5. Contrast `test_missing_observed_subsection_is_a_content_failure`,
+    where the WHOLE observed subsection (including MAXIMUM) is absent."""
+    parsed = _parse(
+        VALID_NYC_PREFIX
+        + "...THE CENTRAL PARK NY CLIMATE SUMMARY FOR AUGUST 21 2026...\n"
+        "TEMPERATURE (F)\n YESTERDAY\n  MAXIMUM 79\n\n"
+        "PRECIPITATION (IN)\n"
+    )
+    assert parsed.tmax.value_f == 79
+    assert parsed.tmin.sentinel == "UNREADABLE"
 
 
 # ---------------------------------------------------------------------------

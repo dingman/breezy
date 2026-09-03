@@ -38,6 +38,7 @@ import datetime as dt
 import hashlib
 import inspect
 import json
+import logging
 import threading
 from collections.abc import Callable, Iterator, Sequence
 from pathlib import Path
@@ -918,6 +919,47 @@ async def test_happy_path_persists_publishes_and_opens_the_gate(
     assert days[0].climate_day == dt.date(2026, 8, 21)
     assert raws[0].verify_digest() is True
     assert shared.gate.status(VENUE, CITY).state is GateState.OPEN
+
+
+@pytest.mark.asyncio
+async def test_malformed_minimum_token_does_not_block_the_site_and_warns(
+    actor: NwsIngestActor,
+    shared: SharedIngestState,
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """CF-5: MINIMUM is not settlement-bearing, so a malformed MINIMUM token
+    must not hard-block the site for this poll -- the settlement-bearing
+    MAXIMUM must still be persisted, with a single WARNING naming the site,
+    field and offending token (no payload dump)."""
+    text = load_product_text(NYC_FINAL).replace(
+        "MINIMUM         63", "MINIMUM         GARBAGE"
+    )
+    payload = product_payload(NYC_FINAL)
+    payload["productText"] = text
+
+    with (
+        caplog.at_level(logging.WARNING, logger="breezy.ingest.nws_actor"),
+        respx.mock(assert_all_called=False) as mock,
+    ):
+        mock_discovery(mock, NYC_FINAL)
+        mock.get(product_url(NYC_FINAL)).mock(return_value=httpx.Response(200, json=payload))
+        actor.on_start()
+        await actor.poll_once()
+
+    assert shared.gate.status(VENUE, CITY).state is GateState.OPEN
+
+    catalog = open_station_catalog(tmp_path / "nws", VENUE, CITY)
+    days = read_climate_days(catalog)
+    assert len(days) == 1
+    assert days[0].tmax_f == 79
+    assert days[0].tmin_flag == "UNREADABLE"
+
+    warnings = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
+    assert any(
+        "NYC" in message and "tmin" in message and "GARBAGE" in message
+        for message in warnings
+    ), warnings
 
 
 @pytest.mark.asyncio

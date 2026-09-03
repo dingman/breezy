@@ -1208,6 +1208,22 @@ class NwsIngestActor(Actor):
             )
             raise _AbortPoll from exc
 
+        # CF-5: a non-settlement-bearing field (tmin/tavg) that could not be
+        # read must not have hard-blocked this poll -- `parse_cli_product`
+        # already carried it through as an explicit `UNREADABLE` sentinel
+        # instead of raising. One WARNING per field, naming exactly the site,
+        # product and offending token -- never the whole product body.
+        for warning in parsed.field_warnings:
+            logger.warning(
+                "%s/%s CLI%s: field %s could not be read (token=%r); "
+                "settlement-bearing fields are unaffected",
+                self._venue,
+                self._city,
+                self._site.cli_location,
+                warning.field,
+                warning.token,
+            )
+
         logger.info(
             "%s/%s prepared %s product %s for climate day %s (correction_evidence=%s)",
             self._venue,

@@ -310,6 +310,30 @@ class CliStructuralHeader:
 
 
 @dataclass(frozen=True, slots=True)
+class UnreadableField:
+    """One non-settlement-bearing field this poll could not read.
+
+    CF-5: a single bad token in a field the settlement path does not use
+    (tmin/tavg -- only tmax is settlement-bearing, see
+    `is_settlement_grade`) must not hard-block the whole site for a poll.
+    Instead of raising, `parse_cli_product` records one of these per
+    unreadable field so the caller (which owns logging; this module does
+    not -- see the module docstring) can emit exactly one WARNING naming
+    the field and the offending token, with no payload dump.
+    """
+
+    field: str
+    """`"tmin"` or `"tavg"` -- the `ParsedCliProduct` attribute name, not
+    the raw CLI row label, so a caller never has to know the CLI wire
+    format to log a useful message."""
+
+    token: str
+    """The raw, unparsed token text, or the literal `"<absent>"` when the
+    row itself was missing rather than merely malformed. Never the whole
+    product body -- this is the single offending token only."""
+
+
+@dataclass(frozen=True, slots=True)
 class ParsedCliProduct:
     """The settlement-relevant fields extracted from one CLI product."""
 
@@ -326,6 +350,10 @@ class ParsedCliProduct:
     correction flag. Required provenance -- no default, because a field
     that silently defaults to "not a correction" is a supersession bug
     waiting to happen."""
+
+    field_warnings: tuple[UnreadableField, ...] = ()
+    """Non-settlement-bearing fields (tmin/tavg) this poll could not read.
+    Empty on the ordinary happy path. See `UnreadableField`."""
 
     @property
     def is_correction_bbb(self) -> bool:
@@ -369,6 +397,34 @@ def _extract_temperature(block: str, pattern: re.Pattern[str], label: str) -> Te
     if match is None:
         raise CliContentError(f"no {label} value found in TEMPERATURE (F) block")
     return parse_temperature_token(match.group("token"))
+
+
+def _extract_temperature_tolerant(
+    block: str, pattern: re.Pattern[str], *, field: str
+) -> tuple[TemperatureReadingF, UnreadableField | None]:
+    """Like `_extract_temperature`, but for a NON-settlement-bearing field.
+
+    Never raises. An absent row or an unparseable token yields an explicit
+    `UNREADABLE` sentinel -- never a guess, and never silently dropped --
+    paired with an `UnreadableField` naming what went wrong, for the caller
+    to log. Only tmin/tavg may use this path; tmax stays on
+    `_extract_temperature`, which still raises -- settlement truth is never
+    guessed (CF-5).
+    """
+    match = pattern.search(block)
+    if match is None:
+        return (
+            TemperatureReadingF(value_f=None, sentinel="UNREADABLE"),
+            UnreadableField(field=field, token="<absent>"),
+        )
+    token = match.group("token")
+    try:
+        return parse_temperature_token(token), None
+    except CliContentError:
+        return (
+            TemperatureReadingF(value_f=None, sentinel="UNREADABLE"),
+            UnreadableField(field=field, token=token),
+        )
 
 
 def check_structural_allowlist(product_text: str, *, cli_location: str) -> CliStructuralHeader:
@@ -577,14 +633,23 @@ def parse_cli_product(
         )
     observed = observed_match.group("subsection")
 
+    # MAXIMUM is settlement-bearing (see `is_settlement_grade`) and stays
+    # fail-closed: an unreadable tmax raises, same as always.
     tmax = _extract_temperature(observed, _MAXIMUM_RE, "MAXIMUM")
-    tmin = _extract_temperature(observed, _MINIMUM_RE, "MINIMUM")
-    tavg = _extract_temperature(observed, _AVERAGE_RE, "AVERAGE")
+    # MINIMUM/AVERAGE are NOT settlement-bearing. A bad token there must not
+    # cost the site its settlement-bearing tmax for this poll (CF-5) -- it
+    # is carried through as an explicit `UNREADABLE` sentinel instead.
+    tmin, tmin_warning = _extract_temperature_tolerant(observed, _MINIMUM_RE, field="tmin")
+    tavg, tavg_warning = _extract_temperature_tolerant(observed, _AVERAGE_RE, field="tavg")
+    field_warnings = tuple(w for w in (tmin_warning, tavg_warning) if w is not None)
 
     # Physical sanity LAST: every field is present and typed, so a
     # violation here means the product is malformed or the parser is
     # wrong -- either way it must never reach settlement. Raises
-    # `CliSanityError`, which is NOT a `CliParseError`.
+    # `CliSanityError`, which is NOT a `CliParseError`. Sentinel-bearing
+    # readings (including the new `UNREADABLE` kind) are checked for
+    # nothing here, same as any other sentinel -- see
+    # `check_physical_sanity`'s docstring.
     check_physical_sanity(tmax=tmax, tmin=tmin, tavg=tavg)
 
     return ParsedCliProduct(
@@ -595,4 +660,5 @@ def parse_cli_product(
         tavg=tavg,
         awips_pil=header.awips_pil,
         wmo_bbb=header.wmo_bbb,
+        field_warnings=field_warnings,
     )

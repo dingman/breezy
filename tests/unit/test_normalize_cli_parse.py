@@ -19,6 +19,7 @@ import pytest
 from breezy.normalize import cli_parse
 from breezy.normalize.classify import classify_issuance
 from breezy.normalize.cli_parse import (
+    CliContentError,
     CliNotOurProductError,
     CliParseError,
     CliStructuralError,
@@ -319,18 +320,83 @@ def test_parse_temperature_token_rejects_empty_token() -> None:
         parse_temperature_token("")
 
 
-def test_ambiguous_product_rejected_when_a_single_temperature_line_is_missing() -> None:
+def test_ambiguous_product_tolerates_a_missing_minimum_line_but_keeps_tmax() -> None:
     """MAXIMUM present but MINIMUM absent from the YESTERDAY observed
-    subsection must reject the whole product rather than return tmin as a
-    guess.
+    subsection must NOT reject the whole product: only tmax is
+    settlement-bearing (see `is_settlement_grade`), so a missing/malformed
+    tmin must not deny the site its settlement-bearing tmax for this poll.
+    tmin is carried through as an explicit `UNREADABLE` sentinel -- never
+    guessed -- and the caller is told which field went unread.
     """
     missing_minimum = (
         _VALID_NYC_PREFIX
         + "...THE CENTRAL PARK NY CLIMATE SUMMARY FOR AUGUST 21 2026...\n"
         "TEMPERATURE (F)\n YESTERDAY\n  MAXIMUM 79\n\nPRECIPITATION\n"
     )
-    with pytest.raises(CliParseError):
-        parse_cli_product(missing_minimum, cli_location="NYC", body_header_regex=NYC_HEADER_REGEX)
+    parsed = parse_cli_product(
+        missing_minimum, cli_location="NYC", body_header_regex=NYC_HEADER_REGEX
+    )
+
+    assert parsed.tmax == TemperatureReadingF(value_f=79, sentinel="NONE")
+    assert parsed.tmin == TemperatureReadingF(value_f=None, sentinel="UNREADABLE")
+    assert parsed.tavg == TemperatureReadingF(value_f=None, sentinel="UNREADABLE")
+    assert [w.field for w in parsed.field_warnings] == ["tmin", "tavg"]
+    assert all(w.token == "<absent>" for w in parsed.field_warnings)
+
+
+def test_malformed_minimum_token_does_not_block_tmax_settlement() -> None:
+    """A malformed (not merely absent) MINIMUM token must also not abort
+    the whole product -- same reasoning as the absent case above."""
+    text = (
+        _VALID_NYC_PREFIX
+        + "...THE CENTRAL PARK NY CLIMATE SUMMARY FOR AUGUST 21 2026...\n"
+        "TEMPERATURE (F)\n YESTERDAY\n  MAXIMUM 79\n  MINIMUM GARBAGE\n"
+        "  AVERAGE 71\n\nPRECIPITATION\n"
+    )
+    parsed = parse_cli_product(text, cli_location="NYC", body_header_regex=NYC_HEADER_REGEX)
+
+    assert parsed.tmax == TemperatureReadingF(value_f=79, sentinel="NONE")
+    assert parsed.tmin == TemperatureReadingF(value_f=None, sentinel="UNREADABLE")
+    assert len(parsed.field_warnings) == 1
+    assert parsed.field_warnings[0].field == "tmin"
+    assert parsed.field_warnings[0].token == "GARBAGE"
+
+
+def test_malformed_average_token_does_not_block_tmax_settlement() -> None:
+    text = (
+        _VALID_NYC_PREFIX
+        + "...THE CENTRAL PARK NY CLIMATE SUMMARY FOR AUGUST 21 2026...\n"
+        "TEMPERATURE (F)\n YESTERDAY\n  MAXIMUM 79\n  MINIMUM 63\n"
+        "  AVERAGE JUNK\n\nPRECIPITATION\n"
+    )
+    parsed = parse_cli_product(text, cli_location="NYC", body_header_regex=NYC_HEADER_REGEX)
+
+    assert parsed.tmax == TemperatureReadingF(value_f=79, sentinel="NONE")
+    assert parsed.tavg == TemperatureReadingF(value_f=None, sentinel="UNREADABLE")
+    assert [w.field for w in parsed.field_warnings] == ["tavg"]
+    assert parsed.field_warnings[0].token == "JUNK"
+
+
+def test_malformed_maximum_token_still_raises_content_error() -> None:
+    """Regression pin: MAXIMUM is settlement-bearing (see
+    `is_settlement_grade`) and MUST stay fail-closed -- settlement truth is
+    never guessed."""
+    text = (
+        _VALID_NYC_PREFIX
+        + "...THE CENTRAL PARK NY CLIMATE SUMMARY FOR AUGUST 21 2026...\n"
+        "TEMPERATURE (F)\n YESTERDAY\n  MAXIMUM GARBAGE\n  MINIMUM 63\n"
+        "  AVERAGE 71\n\nPRECIPITATION\n"
+    )
+    with pytest.raises(CliContentError):
+        parse_cli_product(text, cli_location="NYC", body_header_regex=NYC_HEADER_REGEX)
+
+
+def test_a_well_formed_product_has_no_field_warnings() -> None:
+    """The happy path must not manufacture warnings out of nothing."""
+    parsed = parse_cli_product(
+        _load("nyc_final_2026-08-21"), cli_location="NYC", body_header_regex=NYC_HEADER_REGEX
+    )
+    assert parsed.field_warnings == ()
 
 
 def test_ambiguous_product_is_rejected_not_partially_parsed() -> None:
