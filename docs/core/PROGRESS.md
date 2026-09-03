@@ -119,13 +119,13 @@ an **L-1 null-hypothesis verdict** citing installed source under
 | CF-2 | MED | `never_substitute` in `registry/sites.toml` has no consumer |
 | CF-3 | MED | Unbounded whole-catalog reads per lookup (`persistence/catalog.py:693`) |
 | CF-4 | MED | `is_record` parsed, never persisted; `tmax_flag` `None` on record days. Not a settlement defect |
-| CF-5 | MED | Fail-closed parsing: one bad token blocks a whole site for that poll |
+| CF-5b | MED | Route chronic `UNREADABLE` (CF-5, `71ad992`) through `AlertState`, not a bare per-poll WARNING |
 | CF-6 | MED | `tests/live/test_nws_live_ingest.py:86` hardcodes a personal contact; use a role address |
 | CF-7 | MED | `BREEZY_USER_AGENT` required on offline paths (`SharedIngestState.__init__`) |
 | CF-8 | MED | Sibling-station products unmarked in integrity index; wasted fetches |
 | BL-10 | LOW | `forecast_mispricing/decision.py:71` pre-signal `quote_tradable` refusal is invisible to BL-8's counter (family KILLED; moot until revived) |
 | CF-11 | LOW | `ruff format --check`: 31 unformatted files; not in any gate |
-| CF-14b | DEFERRED | Per-market discovery isolation. CF-14a (tally) LANDED `2aa1e7f`; reopen only when the tally shows a genuine 1-of-N failure (`docs/plans/CF14_DISCOVERY_ISOLATION_2026-09-02.md`) |
+| CF-14b | DEFERRED | Per-market discovery isolation; reopen only when the CF-14a tally (`2aa1e7f`) shows a genuine 1-of-N failure (`docs/plans/CF14_DISCOVERY_ISOLATION_2026-09-02.md`) |
 | CF-13 | UNPROVEN | No CCA/CCB CORRECTION seen live; supersession path fixture-covered only |
 
 ### Programme sequence
