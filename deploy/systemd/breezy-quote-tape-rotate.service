@@ -1,0 +1,60 @@
+[Unit]
+# Closes the gap `breezy-quote-tape-ingest.timer` cannot close on its own:
+# the recorder only opens a NEW `live/<instance_id>/` directory on process
+# start (`quote_tape_cli.py`'s module docstring, "Reading the tape back"),
+# never on a calendar boundary, even though the writer's own daily
+# SCHEDULED_DATES rotation (`node_config.QUOTE_TAPE_ROTATION_MODE`,
+# `tests/contract/test_quote_tape_unclean_shutdown.py::
+# test_the_recorder_rotates_daily_so_a_kill_can_only_endanger_one_day`)
+# closes each day's *file* with its end-of-stream marker inside that SAME
+# instance directory. The ingest CLI's live-write-avoidance rule
+# (`quote_tape_ingest_cli.py`'s module docstring, rule (b)) skips the whole
+# instance -- marker-closed files and all -- for as long as it is both the
+# most-recently-started instance AND `breezy-quote-tape.service` reports
+# active. Left alone, that instance (and every rotation-closed day inside
+# it) never reaches the parquet catalog `breezy-mb-daily` reads, until the
+# next unrelated process restart.
+Description=Breezy Polymarket.us quote-tape daily instance rotation
+Documentation=file:///home/jon/breezy/deploy/systemd/README.md
+Documentation=file:///home/jon/breezy/src/breezy/runtime/quote_tape_ingest_cli.py
+# A local systemctl call against a unit already running in this same user
+# manager. No network needed and no venue socket is touched here.
+After=network-online.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=/home/jon/breezy
+UMask=0077
+
+# No EnvironmentFile: this process holds no venue credential and opens no
+# socket, same posture as breezy-quote-tape-ingest.service. It sends exactly
+# one signal -- a restart request to the user manager for the recorder unit
+# -- and nothing else.
+#
+# try-restart (not restart): if an operator has deliberately stopped
+# breezy-quote-tape.service (maintenance, incident response), this daily
+# rotation must NEVER be what brings capture back up silently at 09:00 UTC.
+# try-restart is a no-op against an inactive unit; restart would start it
+# unconditionally, overriding that deliberate stop. When the recorder IS
+# active (the normal case under Restart=always), try-restart and restart
+# are identical: this unit only ever closes a currently-live instance, it
+# never decides on its own that the recorder should be running.
+ExecStart=/usr/bin/systemctl --user try-restart breezy-quote-tape.service
+
+# A single systemctl call against a local unit; the recorder's own
+# TimeoutStopSec=120 clean-shutdown budget is the only slow step in this
+# chain, so bound generously over that rather than mirror it exactly.
+TimeoutStartSec=180
+
+# No Restart=. A missed rotation is not an incident: the live instance
+# simply keeps accumulating for one more day, exactly as it does today, and
+# the next scheduled rotation (or a later manual restart) subsumes it. The
+# timer's Persistent=true is what recovers a rotation missed across a
+# reboot.
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=breezy-quote-tape-rotate
+
+# NOTE: no [Install] section. This unit is started BY the timer, never
+# enabled directly. `systemctl --user enable breezy-quote-tape-rotate.timer`
+# is the only thing to enable.

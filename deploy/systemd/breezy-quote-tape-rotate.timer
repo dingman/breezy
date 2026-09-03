@@ -1,0 +1,39 @@
+[Unit]
+Description=Daily trigger for the Breezy quote-tape recorder instance rotation
+Documentation=file:///home/jon/breezy/deploy/systemd/README.md
+Documentation=file:///home/jon/breezy/src/breezy/runtime/quote_tape_ingest_cli.py
+
+[Timer]
+Unit=breezy-quote-tape-rotate.service
+
+# 09:00 UTC daily -- deliberately BEFORE the 12:15 UTC ingest tick
+# (`breezy-quote-tape-ingest.timer`) and staggered a full 3h15m ahead of it,
+# not adjacent: every station's daily settlement closes by 08:00 UTC (New
+# York, UTC-4 in DST; the latest US station this repo watches), so 09:00 UTC
+# is after the last settlement of the prior cohort and before Polymarket.us's
+# ~09:45 UTC listing of the next cohort -- the one calendar window where the
+# recorder has nothing time-sensitive to capture, so a ~2s rotation gap
+# (measured at cutover, README.md's G-14 status section) costs nothing. The
+# rotation-closed instance then sits idle past the ingest CLI's own 30-minute
+# live-write grace window (`quote_tape_ingest_cli.DEFAULT_LIVE_GRACE_MINUTES`)
+# for well over two hours before 12:15 UTC ever runs, so the 12:15 ingest
+# pass is guaranteed to see a genuinely quiet, non-live instance and convert
+# it -- landing it in the parquet catalog in time for `breezy-mb-daily`'s
+# 13:30 UTC read. Full daily sequence: rotate 09:00 -> ingest 12:15 ->
+# mb-daily 13:30. UTC is stated explicitly (this host's clock is UTC -- see
+# breezy-k1-daily.timer's own comment) so the schedule cannot move if the
+# host timezone is ever changed.
+OnCalendar=*-*-* 09:00:00 UTC
+
+# A rotation missed because the host was down fires as soon as the timer is
+# next active, instead of silently waiting a full extra day for the next
+# tick -- mirrors every other Breezy timer in this directory.
+Persistent=true
+
+# A local systemctl call with no venue rate limit to respect, and a
+# deterministic time makes correlating a rotation with the tape and the
+# later ingest/mb-daily runs easier.
+AccuracySec=1min
+
+[Install]
+WantedBy=timers.target

@@ -415,3 +415,63 @@ pattern), `daemon-reload`, then
 `systemctl --user enable --now breezy-mb-daily.timer` — deliberately not run
 here; see the TRAP section above for the post-edit `daemon-reload` discipline
 that applies to any future edit of this unit too.
+
+---
+
+## `breezy-quote-tape-rotate` — daily recorder instance rotation (2026-09-03, PREPARED, NOT ACTIVATED)
+
+Closes a gap `breezy-quote-tape-ingest.timer` cannot close by itself. The
+recorder's writer already rotates every calendar day internally
+(`node_config.QUOTE_TAPE_ROTATION_MODE = RotationMode.SCHEDULED_DATES`,
+1-day interval, pinned by
+`tests/contract/test_quote_tape_unclean_shutdown.py::
+test_the_recorder_rotates_daily_so_a_kill_can_only_endanger_one_day`), which
+closes each day's *file* with its Arrow end-of-stream marker. But the ingest
+CLI's live-write-avoidance rule (`quote_tape_ingest_cli.py`'s module
+docstring, rule (b)) skips the whole *instance directory* — every
+already-marker-closed day inside it included — for as long as it is both the
+most-recently-started instance and `breezy-quote-tape.service` reports
+active. A new instance directory is opened only on process start, so a
+recorder left running for days leaves days of marker-closed, ingest-eligible
+data sitting behind that one still-open instance, invisible to the parquet
+catalog `breezy-mb-daily` reads. Measured 2026-09-02: instance `dbb0354a…`
+had been live since 10:56Z with no calendar-driven path to close it.
+
+`breezy-quote-tape-rotate.service` + `.timer` run
+`systemctl --user try-restart breezy-quote-tape.service` daily at
+**09:00 UTC**: after every station's 08:00 UTC settlement and before
+Polymarket.us's ~09:45 UTC listing of the next cohort — the one window where
+the recorder has nothing time-sensitive to capture, so the ~2 s rotation gap
+measured at the original G-14 cutover (see that section above) costs
+nothing. `try-restart`, not `restart`: if an operator has deliberately
+stopped the recorder, this timer must never be what silently brings it back
+up — `try-restart` is a no-op against an inactive unit, `restart` would start
+it unconditionally. Full daily sequence and why each stagger exists:
+**rotate 09:00 UTC → ingest 12:15 UTC → mb-daily 13:30 UTC**. The
+09:00→12:15 gap is deliberate, not incidental: it clears the ingest CLI's
+30-minute live-write grace window (`DEFAULT_LIVE_GRACE_MINUTES`) by over two
+hours, so 12:15's pass is guaranteed to see the rotated-off instance as
+genuinely quiet and convert it, landing it in the catalog before
+`breezy-mb-daily` reads at 13:30.
+
+A daily `try-restart` does not interact badly with the recorder's own
+`Restart=always` / `StartLimitBurst=20` / `StartLimitIntervalSec=3600`
+(1 hour): systemd counts both automatic and manual restarts against the same
+budget, but one restart per day is nowhere near the 20-per-hour ceiling, so
+no adjustment to `breezy-quote-tape.service` is needed or made — only the
+new rotate unit was added.
+
+Validation performed (no unit activated):
+
+```
+$ systemd-analyze --user verify deploy/systemd/breezy-quote-tape-rotate.service \
+    deploy/systemd/breezy-quote-tape-rotate.timer
+(no output)
+EXIT=0
+```
+
+To activate: symlink both unit files into `~/.config/systemd/user/` (§2's
+pattern), `daemon-reload`, then
+`systemctl --user enable --now breezy-quote-tape-rotate.timer` — deliberately
+not run here; see the TRAP section above for the post-edit `daemon-reload`
+discipline that applies to any future edit of this unit too.
