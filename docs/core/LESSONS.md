@@ -1013,3 +1013,24 @@ screen after seeing a miss — that is moving the goalposts, and the forecast
 family was killed for exactly the lack of that ingest. Companion to
 [[L-9]] (three refutations of "identify the near-certain rung, then buy it")
 and [[L-18]].
+
+## L-22 — A safety primitive's exclusion must be unforgeable, not offered (2026-09-03)
+
+**Rule.** When a library exists to prevent a double action (a submit-intent
+latch, a writer lock, a kill switch), the mechanism that makes it exclusive
+is part of the primitive's constructor, never a sibling helper the call site
+is trusted to remember. If the object can be built without the lock, the
+design has a fail-open path by construction, and no call-site discipline or
+docstring closes it.
+
+**Instance.** The first R-7 latch brief specified `SubmitIntentLatch(store)`
+plus a separate `hold_submit_intent_process_lock()` context manager. The
+security review reproduced two `arm()` calls both returning OPEN (get-then-set
+with nothing binding the flock to the latch) and one arm overwriting the
+other's durable record. Fix `5d41eaa`: `open_submit_intent_latch()` is the
+only constructor, holds the flock for its lifetime, every method asserts it
+is still held, and an instance mutex serialises the read-modify-write.
+
+**Detection.** Any brief for a guard primitive that lists the lock as a
+separate bullet from the guarded object. Ask: can the object exist unlocked?
+If yes, rewrite before dispatch.
