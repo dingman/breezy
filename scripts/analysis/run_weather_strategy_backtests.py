@@ -25,8 +25,11 @@ REAL vs ASSUMED vs CONSTRUCTED -- READ THIS BEFORE THE NUMBERS BELOW
   * `WeatherBucketFacts` (bucket bounds, station, measure) -- read from each
     instrument's `info`.
   * The NYC and MIA PRELIMINARY `NwsClimateDay` observations for
-    2026-08-30 (`tmax_f=78` NYC, `tmax_f=91` MIA; `is_final=False`,
-    `revision_seq=1`), read live from the weather catalog via
+    2026-08-30 (`tmax_f=79` NYC, `tmax_f=91` MIA; `is_final=False`,
+    `revision_seq=1` -- see
+    `docs/evidence/backtest_roi_measurement_2026-08-31.md:55` and
+    `docs/evidence/h4_preliminary_economic_read_2026-09-01.md:109`), read
+    live from the weather catalog via
     `breezy.persistence.catalog.read_climate_days`. PRELIMINARY, not FINAL --
     this repository's own measured preliminary/final revision rate is ~7.1%
     (`/home/jon/.local/share/breezy/derived/settlement-truth/coverage.json`),
@@ -1067,6 +1070,25 @@ def _partition_supported_stations(
     return supported, excluded
 
 
+def _exclusion_report_fields(
+    *,
+    excluded_stations: Sequence[str],
+    excluded_instrument_ids: Sequence[str],
+) -> dict[str, Any]:
+    """The JSON-report fragment labelling a narrowed (or un-narrowed) tape.
+
+    Stations dropped for lacking a constructed forecast input (see
+    `_partition_supported_stations`) must be visible in the artifact, not just
+    printed to stdout -- an unlabelled narrowed sample is a reporting defect.
+    Both lists are empty (not omitted) when nothing was excluded.
+    """
+    return {
+        "excluded_stations": sorted(excluded_stations),
+        "excluded_instrument_ids": sorted(excluded_instrument_ids),
+        "exclusion_reason": "no constructed forecast input; not fabricated",
+    }
+
+
 def _forecast_sources_and_overrides(
     *,
     tape_start_dt: dt.datetime,
@@ -1680,12 +1702,12 @@ def main(argv: list[str] | None = None) -> int:
     _supported_stations, _excluded_stations = _partition_supported_stations(
         ti.facts.settlement_station for ti in tape_instruments
     )
+    _excluded_instrument_ids = [
+        ti.instrument.id.value
+        for ti in tape_instruments
+        if ti.facts.settlement_station in _excluded_stations
+    ]
     if _excluded_stations:
-        _excluded_instrument_ids = [
-            ti.instrument.id.value
-            for ti in tape_instruments
-            if ti.facts.settlement_station in _excluded_stations
-        ]
         print(
             f"EXCLUDED {len(_excluded_instrument_ids)} instrument(s) for station(s) "
             f"{_excluded_stations}: no constructed forecast input and no REAL preliminary "
@@ -1797,6 +1819,10 @@ def main(argv: list[str] | None = None) -> int:
                 "realistic_published_at_offset_hours": REALISTIC_PUBLISHED_AT_OFFSET_HOURS,
                 "revision_sequence_step_f": REVISION_STEP_F,
                 "tradable_instrument_ids": [ti.instrument.id.value for ti in tape_instruments],
+                **_exclusion_report_fields(
+                    excluded_stations=_excluded_stations,
+                    excluded_instrument_ids=_excluded_instrument_ids,
+                ),
                 "scenarios": [
                     {
                         "name": s.name,

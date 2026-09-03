@@ -83,6 +83,31 @@ def test_partition_supported_stations_excludes_nothing_when_all_known() -> None:
 
 
 # ---------------------------------------------------------------------------
+# _exclusion_report_fields
+# ---------------------------------------------------------------------------
+
+
+def test_exclusion_report_fields_labels_a_narrowed_tape() -> None:
+    fields = runner._exclusion_report_fields(
+        excluded_stations=["MDW", "LAX"],
+        excluded_instrument_ids=["poly-b.MDW", "poly-a.LAX"],
+    )
+    assert fields["excluded_stations"] == ["LAX", "MDW"]
+    assert fields["excluded_instrument_ids"] == ["poly-a.LAX", "poly-b.MDW"]
+    assert fields["exclusion_reason"] == "no constructed forecast input; not fabricated"
+
+
+def test_exclusion_report_fields_is_empty_for_an_unnarrowed_tape() -> None:
+    fields = runner._exclusion_report_fields(
+        excluded_stations=[],
+        excluded_instrument_ids=[],
+    )
+    assert fields["excluded_stations"] == []
+    assert fields["excluded_instrument_ids"] == []
+    assert fields["exclusion_reason"] == "no constructed forecast input; not fabricated"
+
+
+# ---------------------------------------------------------------------------
 # _forecast_sources_and_overrides
 # ---------------------------------------------------------------------------
 
