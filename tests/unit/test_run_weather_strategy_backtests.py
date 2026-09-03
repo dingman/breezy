@@ -64,6 +64,25 @@ def test_conditions_carries_both_naive_and_realistic() -> None:
 
 
 # ---------------------------------------------------------------------------
+# _partition_supported_stations
+# ---------------------------------------------------------------------------
+
+
+def test_partition_supported_stations_splits_known_from_unknown() -> None:
+    supported, excluded = runner._partition_supported_stations(
+        ["NYC", "SFO", "MIA", "LAX", "MDW"],
+    )
+    assert supported == ("NYC", "MIA")
+    assert excluded == ("SFO", "LAX", "MDW")
+
+
+def test_partition_supported_stations_excludes_nothing_when_all_known() -> None:
+    supported, excluded = runner._partition_supported_stations(["MIA", "NYC"])
+    assert supported == ("MIA", "NYC")
+    assert excluded == ()
+
+
+# ---------------------------------------------------------------------------
 # _forecast_sources_and_overrides
 # ---------------------------------------------------------------------------
 
@@ -87,6 +106,61 @@ def test_forecast_sources_and_overrides_has_one_key_per_condition_and_strategy_k
     }
     assert set(sources) == expected_keys
     assert set(overrides) == expected_keys
+
+
+def test_a_station_without_a_constructed_forecast_input_is_excluded_not_defaulted(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    # SFO (and any other station the catalog grows to cover) has no entry in
+    # ASSUMED_FORECAST_HIGH_F. Per L-17/L-12, the runner must never invent a
+    # default for it -- it must exclude SFO from the constructed-forecast
+    # condition, name the exclusion on stdout, and proceed for the stations it
+    # DOES have inputs for, rather than raising KeyError.
+    tape_start_dt = dt.datetime(2026, 8, 30, 16, 5, tzinfo=dt.UTC)
+    settlement_deadline_by_station = {
+        "NYC": dt.datetime(2026, 8, 31, 5, 0, tzinfo=dt.UTC),
+        "MIA": dt.datetime(2026, 8, 31, 5, 0, tzinfo=dt.UTC),
+        "SFO": dt.datetime(2026, 8, 31, 5, 0, tzinfo=dt.UTC),
+    }
+
+    sources, overrides = runner._forecast_sources_and_overrides(
+        tape_start_dt=tape_start_dt,
+        settlement_deadline_by_station=settlement_deadline_by_station,
+    )
+
+    expected_keys = {
+        f"{condition}:{kind}"
+        for condition in runner.CONDITIONS
+        for kind in runner.STRATEGY_KINDS
+    }
+    assert set(sources) == expected_keys
+    assert set(overrides) == expected_keys
+    for source in sources.values():
+        assert "SFO" not in source.publications_by_station
+        assert "NYC" in source.publications_by_station
+        assert "MIA" in source.publications_by_station
+
+    captured = capsys.readouterr()
+    assert "SFO" in captured.out
+    assert "no constructed forecast input" in captured.out
+
+
+def test_a_tape_with_only_known_stations_prints_no_exclusion(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    tape_start_dt = dt.datetime(2026, 8, 30, 16, 5, tzinfo=dt.UTC)
+    settlement_deadline_by_station = {
+        "NYC": dt.datetime(2026, 8, 31, 5, 0, tzinfo=dt.UTC),
+        "MIA": dt.datetime(2026, 8, 31, 5, 0, tzinfo=dt.UTC),
+    }
+
+    runner._forecast_sources_and_overrides(
+        tape_start_dt=tape_start_dt,
+        settlement_deadline_by_station=settlement_deadline_by_station,
+    )
+
+    captured = capsys.readouterr()
+    assert "no constructed forecast input" not in captured.out
 
 
 def test_realistic_published_at_differs_from_naive_published_at() -> None:

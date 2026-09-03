@@ -185,7 +185,7 @@ import argparse
 import datetime as dt
 import json
 import sys
-from collections.abc import Mapping, Sequence
+from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Final
@@ -1050,6 +1050,23 @@ def _print_summary(results: list[RunResult]) -> None:
         print(line)
 
 
+def _partition_supported_stations(
+    stations: Iterable[str],
+) -> tuple[tuple[str, ...], tuple[str, ...]]:
+    """Split ``stations`` into (supported, excluded) against `ASSUMED_FORECAST_HIGH_F`.
+
+    "Supported" means this script has a constructed forecast input (and, for
+    the legacy tape path, a REAL preliminary observation -- both are keyed to
+    the same NYC/MIA constants) for that station. A station the tape grows to
+    cover with neither must be excluded, never silently defaulted -- see
+    LESSONS L-17/L-12.
+    """
+    ordered = tuple(dict.fromkeys(stations))
+    supported = tuple(s for s in ordered if s in ASSUMED_FORECAST_HIGH_F)
+    excluded = tuple(s for s in ordered if s not in ASSUMED_FORECAST_HIGH_F)
+    return supported, excluded
+
+
 def _forecast_sources_and_overrides(
     *,
     tape_start_dt: dt.datetime,
@@ -1066,7 +1083,14 @@ def _forecast_sources_and_overrides(
     realistic_published_at = tape_start_dt - dt.timedelta(
         hours=REALISTIC_PUBLISHED_AT_OFFSET_HOURS,
     )
-    stations = tuple(settlement_deadline_by_station)
+    stations, excluded_stations = _partition_supported_stations(settlement_deadline_by_station)
+    if excluded_stations:
+        print(
+            f"EXCLUDED from the constructed-forecast condition: {excluded_stations}; "
+            f"no constructed forecast input for {excluded_stations} (see "
+            f"ASSUMED_FORECAST_HIGH_F) -- not fabricated, so these stations get no "
+            f"forecast signal in this run rather than a silently-defaulted one.",
+        )
 
     naive_source = _SequenceForecastSource(
         publications_by_station={
@@ -1652,6 +1676,29 @@ def main(argv: list[str] | None = None) -> int:
     if not tape_instruments:
         print("REFUSAL: no instrument on the tape carries both depth and quote data.")
         return 1
+
+    _supported_stations, _excluded_stations = _partition_supported_stations(
+        ti.facts.settlement_station for ti in tape_instruments
+    )
+    if _excluded_stations:
+        _excluded_instrument_ids = [
+            ti.instrument.id.value
+            for ti in tape_instruments
+            if ti.facts.settlement_station in _excluded_stations
+        ]
+        print(
+            f"EXCLUDED {len(_excluded_instrument_ids)} instrument(s) for station(s) "
+            f"{_excluded_stations}: no constructed forecast input and no REAL preliminary "
+            f"observation for {_excluded_stations} (see ASSUMED_FORECAST_HIGH_F, "
+            f"_load_real_observations) -- not fabricated, so excluded rather than defaulted.",
+        )
+        tape_instruments = [
+            ti for ti in tape_instruments if ti.facts.settlement_station in _supported_stations
+        ]
+        if not tape_instruments:
+            print("REFUSAL: no tradable instrument remains for a supported station.")
+            return 1
+
     print(f"REAL: {len(tape_instruments)} tradable instruments selected from the tape:")
     for ti in tape_instruments:
         print(
