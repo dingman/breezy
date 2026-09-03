@@ -167,7 +167,8 @@ forecast ingest → ~300 station-days → CAPACITY).
 **EXEC SPINE follow-ups:** `docs/plans/EXEC_SPINE_2026-09-01.md` §R-4
 "review amendments". Guard before R-9: divides by zero for an unpriced
 forward; settlement-as-exit bypasses `_submit_order`'s refusal latch.
-**Write path — PLAN CONVERGED (Rev 6, `ab399c3`); R-6.5a `4f76137` + R-6.5P `38f2426` LANDED; PARKED at the operator step** (rest a BUY 1@$0.01, run `polymarket_us_write_signing_probe.py --positive-control`, expect `PREFLIGHT_NOT_EMPTY`).
+**Write path — PLAN CONVERGED (Rev 7, `d1e8e33`); LANDED: R-6.5a `4f76137`, R-6.5P `38f2426`, R-6.5b-0 `43723a1` (shared client, B3-M), ledger primitives `e329667`, R-7 intent latch `5d41eaa` (zero call sites; lock-bound factory); PARKED at the operator step** (rest a BUY 1@$0.01, run `polymarket_us_write_signing_probe.py --positive-control`, expect `PREFLIGHT_NOT_EMPTY`). Grok builds, Claude verifies.
+Ingest defect `252918a`: instrument definitions convert row-wise (re-emitted `ts_init` broke the native disjoint check every run); never identifier-filter `BinaryOption` queries.
 `docs/plans/EXEC_SPINE_R65_R7_2026-09-02.md`: four blind reviews + two
 confirmers. Order: R-6.5a (seam: `private_read` discards `response.status`,
 so R-6d's classifier is unreachable; zero barrier changes) → R-6.5P (probe;
