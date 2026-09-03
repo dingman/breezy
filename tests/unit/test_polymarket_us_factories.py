@@ -53,6 +53,7 @@ from nautilus_trader.model.identifiers import ClientId, TraderId
 from nautilus_trader.test_kit.stubs.component import TestComponentStubs
 
 from breezy.adapters.polymarket_us import factories as factories_module
+from breezy.adapters.polymarket_us import transport as transport_module
 from breezy.adapters.polymarket_us.config import (
     PolymarketUSDataClientConfig,
     PolymarketUSExecClientConfig,
@@ -111,20 +112,11 @@ class StubTransport:
     def __init__(
         self,
         *,
-        timeout_secs: int,
-        default_quota: Any,
-        keyed_quotas: list[tuple[str, Any]],
-        default_headers: dict[str, str],
+        client: Any,
         permitted_quota_keys: frozenset[str] | None = None,
-        check_proxy_env: bool = True,
-        approved_proxy_env_vars: frozenset[str] | None = None,
     ) -> None:
-        self.timeout_secs = timeout_secs
-        self.default_quota = default_quota
-        self.keyed_quotas = keyed_quotas
-        self.default_headers = dict(default_headers)
-        self.check_proxy_env = check_proxy_env
-        self.approved_proxy_env_vars = approved_proxy_env_vars
+        self.client = client
+        self.permitted_quota_keys = permitted_quota_keys
         StubTransport.instances.append(self)
 
     async def get(
@@ -184,11 +176,13 @@ def _clear_shared_polymarket_us_caches() -> Iterator[None]:
     factories_module._shared_polymarket_us_transport.cache_clear()
     factories_module._shared_polymarket_us_http_client.cache_clear()
     factories_module._shared_polymarket_us_instrument_provider.cache_clear()
+    transport_module.build_shared_http_client._reset_for_tests()
     yield
     factories_module._shared_polymarket_us_signer.cache_clear()
     factories_module._shared_polymarket_us_transport.cache_clear()
     factories_module._shared_polymarket_us_http_client.cache_clear()
     factories_module._shared_polymarket_us_instrument_provider.cache_clear()
+    transport_module.build_shared_http_client._reset_for_tests()
 
 
 @pytest.fixture
@@ -199,6 +193,11 @@ def wired(monkeypatch: pytest.MonkeyPatch) -> dict[str, Any]:
     loop_states: list[bool] = []
     credentials = make_credentials()
     seen_refs: list[PolymarketUSSecretsRefConfig] = []
+    factory_calls: list[dict[str, Any]] = []
+
+    def fake_shared_client(**kwargs: Any) -> object:
+        factory_calls.append(kwargs)
+        return object()
 
     def fake_loader(
         secrets_ref: PolymarketUSSecretsRefConfig, **kwargs: Any
@@ -214,12 +213,14 @@ def wired(monkeypatch: pytest.MonkeyPatch) -> dict[str, Any]:
         return credentials
 
     monkeypatch.setattr(factories_module, "NautilusHttpTransport", StubTransport)
+    monkeypatch.setattr(factories_module, "build_shared_http_client", fake_shared_client)
     monkeypatch.setattr(factories_module, "load_polymarket_us_credentials", fake_loader)
     return {
         "calls": calls,
         "loop_states": loop_states,
         "credentials": credentials,
         "seen_refs": seen_refs,
+        "factory_calls": factory_calls,
     }
 
 
@@ -340,7 +341,7 @@ def test_create_passes_the_configured_user_agent_to_the_transport(
 ) -> None:
     build_client(make_config())
 
-    assert StubTransport.instances[0].default_headers["User-Agent"] == USER_AGENT
+    assert wired["factory_calls"][0]["default_headers"]["User-Agent"] == USER_AGENT
 
 
 def test_create_never_reads_the_ingest_user_agent_variable() -> None:
@@ -354,10 +355,10 @@ def test_create_budgets_the_transport_from_the_config_quotas(
     wired: dict[str, Any],
 ) -> None:
     build_client(make_config(http_timeout_secs=7, instrument_requests_per_minute=4))
-    transport = StubTransport.instances[0]
+    call = wired["factory_calls"][0]
 
-    assert transport.timeout_secs == 7
-    assert [key for key, _ in transport.keyed_quotas] == [
+    assert call["timeout_secs"] == 7
+    assert [key for key, _ in call["keyed_quotas"]] == [
         "discovery",
         "instruments",
         "book",
@@ -601,6 +602,36 @@ def test_the_wired_private_read_has_no_query_parameter_in_its_signature(
 
     params = inspect.signature(client._private_read).parameters
     assert list(params) == ["path"]
+
+
+# ---------------------------------------------------------------------------
+# R-6.5b-0 -- shared HttpClient injected into the read transport
+# ---------------------------------------------------------------------------
+
+
+_REPO_ROOT = Path(__file__).resolve().parents[2]
+_FACTORIES_MODULE_PATH = "src/breezy/adapters/polymarket_us/factories.py"
+
+
+def test_shared_transport_injects_the_client_from_the_factory(
+    wired: dict[str, Any], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """R-6.5b-0: ``_shared_polymarket_us_transport`` injects the factory client."""
+    sentinel = object()
+    monkeypatch.setattr(
+        factories_module, "build_shared_http_client", lambda **_kwargs: sentinel
+    )
+    build_client(make_config())
+
+    assert StubTransport.instances[0].client is sentinel
+
+
+def test_factories_module_has_no_write_egress() -> None:
+    """R-6.5b-0 RED 7 / L-15: B4 on factories.py is empty (pin; may already pass)."""
+    from tests.unit.test_polymarket_us_readonly_guard import find_write_egress_violations
+
+    source = (_REPO_ROOT / _FACTORIES_MODULE_PATH).read_text(encoding="utf-8")
+    assert find_write_egress_violations(_FACTORIES_MODULE_PATH, source) == []
 
 
 # ---------------------------------------------------------------------------

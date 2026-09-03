@@ -525,6 +525,26 @@ CAGE_RULE_PINS: tuple[RulePin, ...] = (
     ),
     RulePin(
         module="readonly",
+        attr="B3M_SCAN_ROOTS",
+        expected=("src",),
+        widened=("src", "scripts"),
+        narrowed=(),
+        why="B3-M reach: no module-level name may hold an HttpClient. Narrowing "
+        "it to () disarms the scan; widening it is the safe direction and is "
+        "still pinned so a silent expansion of the rule's blast radius is visible",
+    ),
+    RulePin(
+        module="readonly",
+        attr="B3M_HTTP_CLIENT_CTOR_NAMES",
+        expected=frozenset({"HttpClient"}),
+        widened=frozenset({"HttpClient", "WebSocketClient"}),
+        narrowed=frozenset(),
+        why="B3-M constructor names. Emptying the set makes every holder "
+        "invisible; adding WebSocketClient is a different surface and must "
+        "not arrive as a silent one-token widening of this HTTP rule",
+    ),
+    RulePin(
+        module="readonly",
         attr="PERMITTED_EXECUTION_CLIENTS",
         expected=MappingProxyType(
             {
@@ -799,6 +819,9 @@ def test_the_pin_table_covers_every_rule_constant_the_plan_names() -> None:
         "readonly.PERMITTED_EXECUTION_CLIENTS",
         # EXEC SPINE R-6.5P: the plan family's first genuine B4 narrowing.
         "readonly.B4_EXEMPT_PATHS",
+        # R-6.5b-0 review: B3-M, no module-level HttpClient holder.
+        "readonly.B3M_SCAN_ROOTS",
+        "readonly.B3M_HTTP_CLIENT_CTOR_NAMES",
     }
     assert plans_nine <= pinned, f"unpinned: {sorted(plans_nine - pinned)}"
     assert pinned == plans_nine | added_with_a_reason

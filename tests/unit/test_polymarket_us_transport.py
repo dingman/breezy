@@ -27,11 +27,13 @@ import threading
 import time
 from collections.abc import Iterator, Mapping
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
 from typing import Any, ClassVar
 
 import pytest
 from nautilus_trader.core import nautilus_pyo3
 
+from breezy.adapters.polymarket_us import transport as transport_module
 from breezy.adapters.polymarket_us.errors import VenueTransportError
 from breezy.adapters.polymarket_us.transport import (
     OBSERVED_RESPONSE_HEADERS,
@@ -46,7 +48,9 @@ from breezy.adapters.polymarket_us.transport import (
     VenueResponse,
     build_default_quota,
     build_keyed_quotas,
+    build_shared_http_client,
 )
+from breezy.ingest.http import ProxyEnvironmentError
 
 _USER_AGENT = "breezy-transport-test/1.0 (+mailto:ops@example.com)"
 
@@ -89,6 +93,13 @@ class _RecordingHttpClient:
         return self.response
 
 
+@pytest.fixture(autouse=True)
+def _reset_shared_http_client() -> Iterator[None]:
+    transport_module.build_shared_http_client._reset_for_tests()
+    yield
+    transport_module.build_shared_http_client._reset_for_tests()
+
+
 @pytest.fixture()
 def recording_client(monkeypatch: pytest.MonkeyPatch) -> Iterator[type[_RecordingHttpClient]]:
     _RecordingHttpClient.instances = []
@@ -97,13 +108,19 @@ def recording_client(monkeypatch: pytest.MonkeyPatch) -> Iterator[type[_Recordin
     _RecordingHttpClient.instances = []
 
 
-def _transport() -> NautilusHttpTransport:
-    return NautilusHttpTransport(
-        timeout_secs=5,
-        default_quota=build_default_quota(),
-        keyed_quotas=build_keyed_quotas(),
-        default_headers={"User-Agent": _USER_AGENT},
-    )
+def _transport(**overrides: Any) -> NautilusHttpTransport:
+    kwargs: dict[str, Any] = {
+        "timeout_secs": 5,
+        "default_quota": build_default_quota(),
+        "keyed_quotas": build_keyed_quotas(),
+        "default_headers": {"User-Agent": _USER_AGENT},
+    }
+    kwargs.update(overrides)
+    permitted = kwargs.pop("permitted_quota_keys", None)
+    client = build_shared_http_client(**kwargs)
+    if permitted is None:
+        return NautilusHttpTransport(client=client)
+    return NautilusHttpTransport(client=client, permitted_quota_keys=permitted)
 
 
 # --------------------------------------------------------------------------
@@ -324,12 +341,7 @@ def loopback_server() -> Iterator[str]:
 @pytest.mark.asyncio
 async def test_transport_round_trips_against_a_loopback_server(loopback_server: str) -> None:
     """The real pyo3 client, exercising ``header_keys`` end to end."""
-    transport = NautilusHttpTransport(
-        timeout_secs=5,
-        default_quota=build_default_quota(),
-        keyed_quotas=build_keyed_quotas(),
-        default_headers={"User-Agent": _USER_AGENT},
-    )
+    transport = _transport()
     response = await transport.get(
         f"{loopback_server}/v1/market/slug/tc-temp-nychigh-2026-08-25-lt79f",
         headers={"X-Probe": "1"},
@@ -350,11 +362,8 @@ async def test_keyed_quota_throttles_the_real_client_at_the_loopback_server(
 ) -> None:
     """A keyed quota genuinely delays calls beyond its burst; the default does not."""
     throttled_key = "throttled-probe"
-    transport = NautilusHttpTransport(
-        timeout_secs=5,
-        default_quota=build_default_quota(),
+    transport = _transport(
         keyed_quotas=[(throttled_key, nautilus_pyo3.Quota.rate_per_second(2))],
-        default_headers={"User-Agent": _USER_AGENT},
         permitted_quota_keys=frozenset({throttled_key, QUOTA_KEY_DEFAULT}),
     )
     url = f"{loopback_server}/v1/probe"
@@ -377,12 +386,7 @@ async def test_keyed_quota_throttles_the_real_client_at_the_loopback_server(
 @pytest.mark.allow_socket
 @pytest.mark.asyncio
 async def test_connection_refused_on_loopback_raises_venue_transport_error() -> None:
-    transport = NautilusHttpTransport(
-        timeout_secs=2,
-        default_quota=build_default_quota(),
-        keyed_quotas=build_keyed_quotas(),
-        default_headers={"User-Agent": _USER_AGENT},
-    )
+    transport = _transport(timeout_secs=2)
     # Port 1 on loopback: reserved, never bound by this suite.
     with pytest.raises(VenueTransportError):
         await asyncio.wait_for(
@@ -395,3 +399,165 @@ def test_response_headers_mapping_type_is_a_mapping() -> None:
     response = VenueResponse(status=200, headers={"retry-after": "1"}, body=b"")
     mapping: Mapping[str, str] = response.headers
     assert mapping["retry-after"] == "1"
+
+
+# --------------------------------------------------------------------------
+# R-6.5b-0 -- shared HttpClient factory (injected, never stored)
+# --------------------------------------------------------------------------
+
+
+_REPO_ROOT = Path(__file__).resolve().parents[2]
+_TRANSPORT_MODULE_PATH = "src/breezy/adapters/polymarket_us/transport.py"
+
+
+def _shared_client_kwargs(**overrides: Any) -> dict[str, Any]:
+    kwargs: dict[str, Any] = {
+        "timeout_secs": 5,
+        "default_quota": build_default_quota(),
+        "keyed_quotas": build_keyed_quotas(),
+        "default_headers": {"User-Agent": _USER_AGENT},
+    }
+    kwargs.update(overrides)
+    return kwargs
+
+
+def test_build_shared_http_client_is_importable() -> None:
+    """R-6.5b-0 RED 1: the shared-client factory must exist."""
+    assert callable(build_shared_http_client)
+
+
+def test_build_shared_http_client_refuses_an_unapproved_proxy_environment(
+    recording_client: type[_RecordingHttpClient],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """R-6.5b-0 RED 2: the proxy-env guard fires from the factory, not ``__init__``.
+
+    The previous locus was ``NautilusHttpTransport.__init__`` (pinned in
+    ``test_transport_construction_refuses_an_unapproved_proxy_environment``);
+    that test is updated to this same factory locus, never deleted.
+    """
+    monkeypatch.setenv("HTTP_PROXY", "http://127.0.0.1:9")
+    with pytest.raises(ProxyEnvironmentError):
+        build_shared_http_client(**_shared_client_kwargs())
+
+
+def test_build_shared_http_client_refuses_an_empty_user_agent(
+    recording_client: type[_RecordingHttpClient],
+) -> None:
+    """R-6.5b-0 RED 3: the User-Agent guard fires from the factory."""
+    with pytest.raises(ValueError, match="User-Agent"):
+        build_shared_http_client(**_shared_client_kwargs(default_headers={"User-Agent": ""}))
+
+
+def test_two_transports_built_from_the_factory_share_one_client(
+    recording_client: type[_RecordingHttpClient],
+) -> None:
+    """R-6.5b-0 RED 4: one factory return value, injected into both wrappers."""
+    client_a = build_shared_http_client(**_shared_client_kwargs())
+    client_b = build_shared_http_client(**_shared_client_kwargs())
+    assert client_a is client_b
+
+    first = NautilusHttpTransport(client=client_a)
+    second = NautilusHttpTransport(client=client_b)
+    assert first is not second
+
+
+def test_shared_http_client_is_not_bound_at_module_level() -> None:
+    """R-6.5b-0 review 1(a): the holder is a closure cell, not a module global."""
+    assert hasattr(transport_module, "_SHARED_HTTP_CLIENT") is False
+
+
+def test_build_shared_http_client_reset_seam_builds_a_new_client(
+    recording_client: type[_RecordingHttpClient],
+) -> None:
+    """R-6.5b-0 review 1(a): ``_reset_for_tests`` drops the cell; the next build is new."""
+    reset = getattr(build_shared_http_client, "_reset_for_tests", None)
+    assert callable(reset)
+    first = build_shared_http_client(**_shared_client_kwargs())
+    reset()
+    second = build_shared_http_client(**_shared_client_kwargs())
+    assert first is not second
+
+
+def test_build_shared_http_client_refuses_a_second_call_with_a_different_timeout(
+    recording_client: type[_RecordingHttpClient],
+) -> None:
+    """R-6.5b-0 review 2: a cache hit with a different timeout_secs is a ValueError."""
+    first = build_shared_http_client(**_shared_client_kwargs())
+    with pytest.raises(ValueError, match="timeout_secs"):
+        build_shared_http_client(**_shared_client_kwargs(timeout_secs=10))
+    assert build_shared_http_client(**_shared_client_kwargs()) is first
+
+
+def test_build_shared_http_client_returns_the_same_object_for_identical_args(
+    recording_client: type[_RecordingHttpClient],
+) -> None:
+    """R-6.5b-0 review 2: identical args (same objects) reuse the singleton."""
+    kwargs = _shared_client_kwargs()
+    first = build_shared_http_client(**kwargs)
+    second = build_shared_http_client(**kwargs)
+    assert first is second
+
+
+def test_shared_client_mismatch_names_the_parameter_not_header_values(
+    recording_client: type[_RecordingHttpClient],
+) -> None:
+    """R-6.5b-0 review 2: the error names ``default_headers``, never header values."""
+    build_shared_http_client(**_shared_client_kwargs())
+    other_agent = "breezy-other-agent/9.9 (+mailto:other@example.com)"
+    with pytest.raises(ValueError, match="default_headers") as excinfo:
+        build_shared_http_client(
+            **_shared_client_kwargs(default_headers={"User-Agent": other_agent})
+        )
+    message = str(excinfo.value)
+    assert other_agent not in message
+    assert _USER_AGENT not in message
+
+
+def test_build_shared_http_client_refuses_a_second_call_with_different_quotas(
+    recording_client: type[_RecordingHttpClient],
+) -> None:
+    """R-6.5b-0 review 2: a cache hit with a different quota spec is a ValueError."""
+    build_shared_http_client(**_shared_client_kwargs())
+    with pytest.raises(ValueError, match="keyed_quotas"):
+        build_shared_http_client(
+            **_shared_client_kwargs(keyed_quotas=build_keyed_quotas(book_requests_per_minute=99))
+        )
+
+
+def test_constructed_transport_exposes_no_write_capable_receiver() -> None:
+    """R-6.5b-0 RED 5 / B3 pin: the wrapper still does not store the client."""
+    from tests.unit.test_polymarket_us_readonly_guard import (
+        find_write_capable_receiver_exposures,
+    )
+
+    class _WriteCapable:
+        def post(self) -> object:
+            return object()
+
+        async def get(self, *_args: Any, **_kwargs: Any) -> object:
+            return object()
+
+    transport = NautilusHttpTransport(client=_WriteCapable())
+    assert find_write_capable_receiver_exposures(transport) == []
+
+
+def test_nautilus_http_transport_requires_a_prebuilt_client(
+    recording_client: type[_RecordingHttpClient],
+) -> None:
+    """R-6.5b-0 RED 6: local construction is gone; omitting ``client=`` is TypeError."""
+    with pytest.raises(TypeError):
+        NautilusHttpTransport(  # type: ignore[call-arg]
+            timeout_secs=5,
+            default_quota=build_default_quota(),
+            keyed_quotas=build_keyed_quotas(),
+            default_headers={"User-Agent": _USER_AGENT},
+        )
+
+
+def test_transport_module_has_no_write_egress() -> None:
+    """R-6.5b-0 RED 7 / L-15: B4 on transport.py is empty (pin; may already pass)."""
+    from tests.unit.test_polymarket_us_readonly_guard import find_write_egress_violations
+
+    source = (_REPO_ROOT / _TRANSPORT_MODULE_PATH).read_text(encoding="utf-8")
+    assert find_write_egress_violations(_TRANSPORT_MODULE_PATH, source) == []

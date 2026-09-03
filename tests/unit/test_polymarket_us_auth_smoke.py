@@ -35,7 +35,7 @@ import sys
 from collections.abc import Iterator, Mapping
 from contextlib import contextmanager
 from pathlib import Path
-from types import ModuleType
+from types import ModuleType, SimpleNamespace
 from typing import Any
 
 import pytest
@@ -1482,3 +1482,32 @@ def test_the_canonical_probe_path_is_a_cli_argument_defaulting_to_the_configured
         ).canonical_probe_path
         == "/v1/portfolio/activities"
     )
+
+
+def test_build_read_transport_constructs_a_nautilus_http_transport(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The smoke's own builder must construct without TypeError (R-6.5b-0)."""
+    from nautilus_trader.core import nautilus_pyo3
+
+    from breezy.adapters.polymarket_us import transport as transport_module
+    from breezy.adapters.polymarket_us.transport import NautilusHttpTransport
+
+    class _FakeHttpClient:
+        def __init__(self, **kwargs: Any) -> None:
+            self.kwargs = kwargs
+
+    config = SimpleNamespace(
+        http_timeout_secs=10,
+        global_requests_per_second=15,
+        instrument_requests_per_minute=6,
+        book_requests_per_minute=12,
+        user_agent=USER_AGENT,
+    )
+    transport_module.build_shared_http_client._reset_for_tests()
+    monkeypatch.setattr(nautilus_pyo3, "HttpClient", _FakeHttpClient)
+    try:
+        built = smoke._build_read_transport(config)
+    finally:
+        transport_module.build_shared_http_client._reset_for_tests()
+    assert isinstance(built, NautilusHttpTransport)

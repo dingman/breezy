@@ -16,8 +16,8 @@ the node" clause -- the literal defect W exists to fix
 (``exec_clients={}`` was pinned at ``node_config.py`` with zero construction
 sites anywhere in the repo).
 
-No socket: ``PolymarketUSLiveExecClientFactory.NautilusHttpTransport`` is
-replaced with a fake before ``node.build()`` runs, exactly the way
+No socket: ``NautilusHttpTransport`` and ``build_shared_http_client`` are
+replaced with fakes before ``node.build()`` runs, exactly the way
 ``tests/unit/test_polymarket_us_factories.py`` stubs the same seam for the
 data-side factory -- this does not weaken ``tests/conftest.py``'s pyo3
 network-client block, it stands in one level above it. A REAL Ed25519
@@ -42,6 +42,7 @@ from nautilus_trader.live.node import TradingNode
 from nautilus_trader.model.identifiers import ClientId
 
 from breezy.adapters.polymarket_us import factories as factories_module
+from breezy.adapters.polymarket_us import transport as transport_module
 from breezy.adapters.polymarket_us.exec.client import PolymarketUSExecutionClient
 from breezy.adapters.polymarket_us.factories import (
     POLYMARKET_US_CLIENT_NAME,
@@ -92,6 +93,9 @@ def _operator_order_ceiling(monkeypatch: pytest.MonkeyPatch) -> None:
 def _stub_exec_transport(monkeypatch: pytest.MonkeyPatch) -> None:
     _NoOpTransport.instances = []
     monkeypatch.setattr(factories_module, "NautilusHttpTransport", _NoOpTransport)
+    monkeypatch.setattr(
+        factories_module, "build_shared_http_client", lambda **_kwargs: object()
+    )
 
 
 @pytest.fixture(autouse=True)
@@ -107,11 +111,13 @@ def _clear_shared_polymarket_us_caches() -> Iterator[None]:
     factories_module._shared_polymarket_us_transport.cache_clear()
     factories_module._shared_polymarket_us_http_client.cache_clear()
     factories_module._shared_polymarket_us_instrument_provider.cache_clear()
+    transport_module.build_shared_http_client._reset_for_tests()
     yield
     factories_module._shared_polymarket_us_signer.cache_clear()
     factories_module._shared_polymarket_us_transport.cache_clear()
     factories_module._shared_polymarket_us_http_client.cache_clear()
     factories_module._shared_polymarket_us_instrument_provider.cache_clear()
+    transport_module.build_shared_http_client._reset_for_tests()
 
 
 @pytest.fixture(autouse=True)

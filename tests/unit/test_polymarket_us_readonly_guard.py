@@ -145,12 +145,18 @@ from pathlib import Path
 from types import MappingProxyType
 from typing import Any
 
-import pytest
-
 REPO_ROOT = Path(__file__).resolve().parents[2]
 
 #: Roots scanned for the write-verb barrier (B4).
 EGRESS_SCAN_ROOTS = ("src", "scripts")
+
+#: Roots scanned for B3-M (no module-level name may hold an ``HttpClient``).
+#: ``src/`` only: a test that plants a holder is not a production exposure.
+B3M_SCAN_ROOTS: tuple[str, ...] = ("src",)
+
+#: Constructor names that count as an ``HttpClient`` build. Matched as a bare
+#: ``Name`` or as an ``Attribute.attr``; exact identifier, never a substring.
+B3M_HTTP_CLIENT_CTOR_NAMES: frozenset[str] = frozenset({"HttpClient"})
 
 #: Roots scanned for the SDK import ban (B5) and the ``.get_value()`` ban (S16).
 REPO_WIDE_SCAN_ROOTS = ("src", "scripts", "tests")
@@ -410,6 +416,107 @@ class _WriteCapableHttpClient:
 
     def post(self, *_args: Any, **_kwargs: Any) -> object:
         return object()
+
+
+def _is_http_client_ctor(func: ast.expr) -> bool:
+    if isinstance(func, ast.Name):
+        return func.id in B3M_HTTP_CLIENT_CTOR_NAMES
+    if isinstance(func, ast.Attribute):
+        return func.attr in B3M_HTTP_CLIENT_CTOR_NAMES
+    return False
+
+
+def _is_http_client_call(node: ast.AST) -> bool:
+    return isinstance(node, ast.Call) and _is_http_client_ctor(node.func)
+
+
+def _contains_http_client_call(node: ast.AST) -> bool:
+    return any(_is_http_client_call(child) for child in ast.walk(node))
+
+
+def find_module_level_http_client_holders(path: str, source: str) -> list[Violation]:
+    """Flag a module-level name that holds, or is later filled with, an HttpClient.
+
+    Reuses C-classification: a non-venue-touching module is out of scope.
+    Bindings inspected are ``ast.Assign`` / ``ast.AnnAssign`` in ``tree.body``
+    only -- a client captured inside a function or closure is not a module
+    global and is not reported.
+    """
+    tree = ast.parse(source, filename=path)
+    if not is_venue_touching(path, tree):
+        return []
+
+    found: list[Violation] = []
+    holder_names: set[str] = set()
+
+    for stmt in tree.body:
+        names: list[str]
+        value: ast.expr | None
+        if isinstance(stmt, ast.Assign):
+            names = [target.id for target in stmt.targets if isinstance(target, ast.Name)]
+            value = stmt.value
+        elif isinstance(stmt, ast.AnnAssign) and isinstance(stmt.target, ast.Name):
+            names = [stmt.target.id]
+            value = stmt.value
+        else:
+            continue
+        if value is None:
+            continue
+        if _is_http_client_call(value):
+            for name in names:
+                found.append(
+                    Violation(
+                        path,
+                        stmt.lineno,
+                        "B3-M",
+                        f"module-level {name} bound to HttpClient()",
+                    )
+                )
+        elif _contains_http_client_call(value) and isinstance(
+            value, (ast.List, ast.Dict, ast.Set, ast.Tuple)
+        ):
+            for name in names:
+                found.append(
+                    Violation(
+                        path,
+                        stmt.lineno,
+                        "B3-M",
+                        f"module-level {name} holds HttpClient() in a literal",
+                    )
+                )
+        elif isinstance(value, (ast.List, ast.Dict, ast.Set)):
+            holder_names.update(names)
+
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        if not isinstance(node.func, ast.Attribute) or node.func.attr != "append":
+            continue
+        if not isinstance(node.func.value, ast.Name):
+            continue
+        name = node.func.value.id
+        if name not in holder_names:
+            continue
+        if node.args and _contains_http_client_call(node.args[0]):
+            found.append(
+                Violation(
+                    path,
+                    node.lineno,
+                    "B3-M",
+                    f"module-level {name} appended with HttpClient()",
+                )
+            )
+    return found
+
+
+def scan_module_level_http_client_holders(
+    roots: tuple[str, ...] = B3M_SCAN_ROOTS,
+) -> list[Violation]:
+    return [
+        v
+        for path, src in iter_python_sources(roots)
+        for v in find_module_level_http_client_holders(path, src)
+    ]
 
 
 def find_write_capable_receiver_exposures(obj: object) -> list[Violation]:
@@ -1051,21 +1158,10 @@ def test_c6_measured_against_the_real_tree_adds_no_new_violations() -> None:
 # ==========================================================================
 
 
-def test_b3_constructed_transport_exposes_no_write_capable_receiver(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    from nautilus_trader.core import nautilus_pyo3
-
+def test_b3_constructed_transport_exposes_no_write_capable_receiver() -> None:
     from breezy.adapters.polymarket_us.transport import NautilusHttpTransport
 
-    monkeypatch.setattr(nautilus_pyo3, "HttpClient", _WriteCapableHttpClient)
-
-    transport = NautilusHttpTransport(
-        timeout_secs=5,
-        default_quota=object(),
-        keyed_quotas=[],
-        default_headers={"User-Agent": "breezy-b3-test/1.0 (+mailto:ops@example.com)"},
-    )
+    transport = NautilusHttpTransport(client=_WriteCapableHttpClient())
 
     violations = find_write_capable_receiver_exposures(transport)
     assert violations == [], "B3 receiver exposure(s):\n" + "\n".join(
@@ -1085,6 +1181,59 @@ def test_b3_detector_catches_the_bound_method_self_escape() -> None:
 
     assert [v.rule for v in violations] == ["B3"]
     assert "_get.__self__ exposes write-capable receiver" in violations[0].detail
+
+
+# ==========================================================================
+# Barrier B3-M -- no module-level name may hold an HttpClient
+# ==========================================================================
+
+
+def test_b3m_detects_a_module_level_list_appended_with_http_client() -> None:
+    """Non-vacuity: a module-level holder plus ``.append(HttpClient(...))`` fires."""
+    source = (
+        "from typing import Any\n"
+        "\n"
+        "from nautilus_trader.core import nautilus_pyo3\n"
+        "\n"
+        "_X: list[Any] = []\n"
+        "_X.append(nautilus_pyo3.HttpClient("
+        "default_headers={}, header_keys=[], keyed_quotas=[], "
+        "default_quota=None, timeout_secs=5))\n"
+    )
+    path = "src/breezy/adapters/polymarket_us/evil_holder.py"
+    violations = find_module_level_http_client_holders(path, source)
+    assert violations != []
+    assert {v.rule for v in violations} == {"B3-M"}
+
+
+def test_b3m_does_not_flag_a_client_captured_inside_a_function() -> None:
+    """Non-vacuity, other direction: a closure-cell client is not a module binding."""
+    source = (
+        "from typing import Any\n"
+        "\n"
+        "from nautilus_trader.core import nautilus_pyo3\n"
+        "\n"
+        "def _make_build_shared_http_client():\n"
+        "    holder: list[Any] = []\n"
+        "\n"
+        "    def build_shared_http_client():\n"
+        "        if not holder:\n"
+        "            holder.append(nautilus_pyo3.HttpClient("
+        "default_headers={}, header_keys=[], keyed_quotas=[], "
+        "default_quota=None, timeout_secs=5))\n"
+        "        return holder[0]\n"
+        "\n"
+        "    return build_shared_http_client\n"
+        "\n"
+        "build_shared_http_client = _make_build_shared_http_client()\n"
+    )
+    path = "src/breezy/adapters/polymarket_us/ok_holder.py"
+    assert find_module_level_http_client_holders(path, source) == []
+
+
+def test_b3m_no_module_level_http_client_holder_in_src() -> None:
+    """L-15: B3-M over ``src/`` is empty."""
+    assert scan_module_level_http_client_holders() == []
 
 
 # ==========================================================================

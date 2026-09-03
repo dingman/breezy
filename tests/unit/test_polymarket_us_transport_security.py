@@ -30,6 +30,7 @@ from typing import Any, ClassVar
 import pytest
 from nautilus_trader.core import nautilus_pyo3
 
+from breezy.adapters.polymarket_us import transport as transport_module
 from breezy.adapters.polymarket_us.config import (
     POLYMARKET_US_ALLOW_FOREIGN_ORIGIN_ENV_VAR,
     PolymarketUSDataClientConfig,
@@ -42,6 +43,7 @@ from breezy.adapters.polymarket_us.transport import (
     NautilusHttpTransport,
     build_default_quota,
     build_keyed_quotas,
+    build_shared_http_client,
 )
 from breezy.ingest.http import ProxyEnvironmentError
 from breezy.runtime.settings import SettingsError
@@ -89,6 +91,13 @@ class _RecordingHttpClient:
         return self.response
 
 
+@pytest.fixture(autouse=True)
+def _reset_shared_http_client() -> Iterator[None]:
+    transport_module.build_shared_http_client._reset_for_tests()
+    yield
+    transport_module.build_shared_http_client._reset_for_tests()
+
+
 @pytest.fixture()
 def recording_client(monkeypatch: pytest.MonkeyPatch) -> Iterator[type[_RecordingHttpClient]]:
     _RecordingHttpClient.instances = []
@@ -105,7 +114,11 @@ def _transport(**overrides: Any) -> NautilusHttpTransport:
         "default_headers": {"User-Agent": _USER_AGENT},
     }
     kwargs.update(overrides)
-    return NautilusHttpTransport(**kwargs)
+    permitted = kwargs.pop("permitted_quota_keys", None)
+    client = build_shared_http_client(**kwargs)
+    if permitted is None:
+        return NautilusHttpTransport(client=client)
+    return NautilusHttpTransport(client=client, permitted_quota_keys=permitted)
 
 
 # --------------------------------------------------------------------------
@@ -301,10 +314,19 @@ def test_transport_construction_refuses_an_unapproved_proxy_environment(
     ``breezy.ingest.http`` has enforced this since it was written
     (``ingest/http.py:557,783``); the path carrying SIGNING CREDENTIALS was
     outside that control.
+
+    Locus update (R-6.5b-0 D1): the guard moved with client construction to
+    ``build_shared_http_client``. This test is the previous ``__init__``
+    locus, updated, never deleted.
     """
     monkeypatch.setenv(var, "http://127.0.0.1:9")
     with pytest.raises(ProxyEnvironmentError):
-        _transport()
+        build_shared_http_client(
+            timeout_secs=5,
+            default_quota=build_default_quota(),
+            keyed_quotas=build_keyed_quotas(),
+            default_headers={"User-Agent": _USER_AGENT},
+        )
 
 
 def test_all_proxy_is_a_known_uncovered_variable(

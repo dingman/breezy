@@ -177,6 +177,28 @@ def _prepared(runner: ModuleType) -> Any:
     return runner.Prepared(core_limit=(0, 0), config=_config(), credentials=_credentials())
 
 
+def test_build_read_transport_constructs_a_nautilus_http_transport(
+    runner: ModuleType, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The runner's own builder must construct without TypeError (R-6.5b-0)."""
+    from nautilus_trader.core import nautilus_pyo3
+
+    from breezy.adapters.polymarket_us import transport as transport_module
+    from breezy.adapters.polymarket_us.transport import NautilusHttpTransport
+
+    class _FakeHttpClient:
+        def __init__(self, **kwargs: Any) -> None:
+            self.kwargs = kwargs
+
+    transport_module.build_shared_http_client._reset_for_tests()
+    monkeypatch.setattr(nautilus_pyo3, "HttpClient", _FakeHttpClient)
+    try:
+        built = runner._build_read_transport(_config())
+    finally:
+        transport_module.build_shared_http_client._reset_for_tests()
+    assert isinstance(built, NautilusHttpTransport)
+
+
 async def _run(
     runner: ModuleType,
     *,

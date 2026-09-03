@@ -1324,6 +1324,32 @@ def _parse_args(argv: Sequence[str] | None) -> argparse.Namespace:
     return parser.parse_args(argv)
 
 
+def _build_read_transport(config: Any) -> PolymarketUSReadTransport:
+    """The shipped GET-only transport, budgeted exactly as the smoke budgets it.
+
+    Imported here, not at module import, so ``--help`` and the opt-in gate in
+    :func:`prepare` stay credential-free and client-free. The factory's own
+    guards run when this is called, which is only after ``prepare``.
+    """
+    from breezy.adapters.polymarket_us.transport import (
+        NautilusHttpTransport,
+        build_default_quota,
+        build_keyed_quotas,
+        build_shared_http_client,
+    )
+
+    client = build_shared_http_client(
+        timeout_secs=config.http_timeout_secs,
+        default_quota=build_default_quota(config.global_requests_per_second),
+        keyed_quotas=build_keyed_quotas(
+            instrument_requests_per_minute=config.instrument_requests_per_minute,
+            book_requests_per_minute=config.book_requests_per_minute,
+        ),
+        default_headers={"User-Agent": str(config.user_agent)},
+    )
+    return NautilusHttpTransport(client=client)
+
+
 async def run_smoke(
     prepared: Prepared,
     args: argparse.Namespace,
@@ -1335,11 +1361,6 @@ async def run_smoke(
 
     from breezy.adapters.polymarket_us.http import PolymarketUSHttpClient
     from breezy.adapters.polymarket_us.signing import Ed25519RequestSigner, SigningVariant
-    from breezy.adapters.polymarket_us.transport import (
-        NautilusHttpTransport,
-        build_default_quota,
-        build_keyed_quotas,
-    )
 
     config = prepared.config
     started_at = dt.datetime.now(tz=dt.UTC).isoformat(timespec="seconds")
@@ -1354,15 +1375,7 @@ async def run_smoke(
     previous_loop_handler = loop.get_exception_handler()
     loop.set_exception_handler(build_safe_loop_exception_handler(counter, secrets))
 
-    inner = NautilusHttpTransport(
-        timeout_secs=config.http_timeout_secs,
-        default_quota=build_default_quota(config.global_requests_per_second),
-        keyed_quotas=build_keyed_quotas(
-            instrument_requests_per_minute=config.instrument_requests_per_minute,
-            book_requests_per_minute=config.book_requests_per_minute,
-        ),
-        default_headers={"User-Agent": str(config.user_agent)},
-    )
+    inner = _build_read_transport(config)
     transport = RecordingTransport(inner=inner)
 
     def build_client(variant: SigningVariant) -> Any:

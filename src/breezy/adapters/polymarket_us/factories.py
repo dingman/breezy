@@ -94,6 +94,7 @@ from breezy.adapters.polymarket_us.transport import (
     NautilusHttpTransport,
     build_default_quota,
     build_keyed_quotas,
+    build_shared_http_client,
 )
 from breezy.adapters.polymarket_us.websocket import PolymarketUSMarketsWebSocketPool
 from breezy.runtime.settings import SettingsError, proxy_env_check_enabled
@@ -463,7 +464,7 @@ def _shared_polymarket_us_transport(
 ) -> NautilusHttpTransport:
     """The ONE transport -- and therefore the ONE rate-limiter token bucket."""
     user_agent = _required(config.user_agent, field="user_agent")
-    return NautilusHttpTransport(
+    client = build_shared_http_client(
         timeout_secs=config.http_timeout_secs,
         default_quota=build_default_quota(config.global_requests_per_second),
         keyed_quotas=build_keyed_quotas(
@@ -476,6 +477,7 @@ def _shared_polymarket_us_transport(
         # comment previously carried on each factory's own construction.
         check_proxy_env=proxy_env_check_enabled(),
     )
+    return NautilusHttpTransport(client=client)
 
 
 @lru_cache(maxsize=1)

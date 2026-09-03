@@ -155,6 +155,28 @@ def _prepared(probe: ModuleType) -> Any:
     return probe.Prepared(core_limit=(0, 0), config=_config(), credentials=_credentials())
 
 
+def test_build_read_transport_constructs_a_nautilus_http_transport(
+    probe: ModuleType, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The probe's own builder must construct without TypeError (R-6.5b-0)."""
+    from nautilus_trader.core import nautilus_pyo3
+
+    from breezy.adapters.polymarket_us import transport as transport_module
+    from breezy.adapters.polymarket_us.transport import NautilusHttpTransport
+
+    class _FakeHttpClient:
+        def __init__(self, **kwargs: Any) -> None:
+            self.kwargs = kwargs
+
+    transport_module.build_shared_http_client._reset_for_tests()
+    monkeypatch.setattr(nautilus_pyo3, "HttpClient", _FakeHttpClient)
+    try:
+        built = probe._build_read_transport(_config())
+    finally:
+        transport_module.build_shared_http_client._reset_for_tests()
+    assert isinstance(built, NautilusHttpTransport)
+
+
 def _clock_at(timestamp_ms: int) -> TestClock:
     clock = TestClock()
     clock.set_time(timestamp_ms * 1_000_000)

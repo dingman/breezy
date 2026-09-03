@@ -29,6 +29,7 @@ is wanted.
 
 from __future__ import annotations
 
+import hashlib
 from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass
 from typing import Any, Protocol, runtime_checkable
@@ -61,6 +62,7 @@ __all__ = [
     "assert_permitted_quota_key",
     "build_default_quota",
     "build_keyed_quotas",
+    "build_shared_http_client",
 ]
 
 #: Response headers we ask the Rust client to surface. ``HttpClient`` hides
@@ -194,7 +196,11 @@ def build_default_quota(
             f"cap of {RETAIL_GLOBAL_REQUESTS_PER_SECOND} requests/second; "
             f"got {requests_per_second}"
         )
-    return nautilus_pyo3.Quota.rate_per_second(requests_per_second)
+    return _record_quota_spec(
+        nautilus_pyo3.Quota.rate_per_second(requests_per_second),
+        kind="rate_per_second",
+        burst=requests_per_second,
+    )
 
 
 def build_keyed_quotas(
@@ -223,26 +229,179 @@ def build_keyed_quotas(
     return [
         (
             QUOTA_KEY_DISCOVERY,
-            nautilus_pyo3.Quota.rate_per_minute(discovery_requests_per_minute),
+            _record_quota_spec(
+                nautilus_pyo3.Quota.rate_per_minute(discovery_requests_per_minute),
+                kind="rate_per_minute",
+                burst=discovery_requests_per_minute,
+            ),
         ),
         (
             QUOTA_KEY_INSTRUMENTS,
-            nautilus_pyo3.Quota.rate_per_minute(instrument_requests_per_minute),
+            _record_quota_spec(
+                nautilus_pyo3.Quota.rate_per_minute(instrument_requests_per_minute),
+                kind="rate_per_minute",
+                burst=instrument_requests_per_minute,
+            ),
         ),
-        (QUOTA_KEY_BOOK, nautilus_pyo3.Quota.rate_per_minute(book_requests_per_minute)),
-        (QUOTA_KEY_PORTFOLIO, nautilus_pyo3.Quota.rate_per_minute(portfolio_requests_per_minute)),
+        (
+            QUOTA_KEY_BOOK,
+            _record_quota_spec(
+                nautilus_pyo3.Quota.rate_per_minute(book_requests_per_minute),
+                kind="rate_per_minute",
+                burst=book_requests_per_minute,
+            ),
+        ),
+        (
+            QUOTA_KEY_PORTFOLIO,
+            _record_quota_spec(
+                nautilus_pyo3.Quota.rate_per_minute(portfolio_requests_per_minute),
+                kind="rate_per_minute",
+                burst=portfolio_requests_per_minute,
+            ),
+        ),
     ]
+
+
+#: Specs of ``Quota`` objects this module constructed, keyed by ``id()``.
+#: ``Quota`` is opaque (no rate attributes, identity-hashed) so a cache key
+#: cannot read the burst off the object; this table is the digest of the
+#: spec, not a holder of the Quota.
+_QUOTA_SPECS: dict[int, tuple[str, int]] = {}
+
+
+def _record_quota_spec(quota: Any, *, kind: str, burst: int) -> Any:
+    _QUOTA_SPECS[id(quota)] = (kind, burst)
+    return quota
+
+
+def _quota_spec(quota: Any) -> tuple[object, ...]:
+    recorded = _QUOTA_SPECS.get(id(quota))
+    if recorded is not None:
+        return recorded
+    return ("opaque", type(quota).__name__, id(quota))
+
+
+def _headers_digest(headers: Mapping[str, str]) -> str:
+    canonical = tuple(sorted((str(key), str(value)) for key, value in headers.items()))
+    return hashlib.sha256(repr(canonical).encode("utf-8")).hexdigest()
+
+
+@dataclass(frozen=True, slots=True)
+class _SharedClientConstruction:
+    timeout_secs: int
+    default_quota_spec: tuple[object, ...]
+    keyed_quotas_spec: tuple[tuple[str, tuple[object, ...]], ...]
+    headers_digest: str
+
+
+def _raise_construction_mismatch(
+    stored: _SharedClientConstruction, incoming: _SharedClientConstruction
+) -> None:
+    if stored.timeout_secs != incoming.timeout_secs:
+        differing = "timeout_secs"
+    elif stored.default_quota_spec != incoming.default_quota_spec:
+        differing = "default_quota"
+    elif stored.keyed_quotas_spec != incoming.keyed_quotas_spec:
+        differing = "keyed_quotas"
+    elif stored.headers_digest != incoming.headers_digest:
+        differing = "default_headers"
+    else:
+        differing = "arguments"
+    raise ValueError(
+        "build_shared_http_client already constructed; "
+        f"{differing} differs from the first build and the singleton's "
+        "config never updates"
+    )
+
+
+def _make_build_shared_http_client() -> Any:
+    holder: list[Any] = []
+
+    def build_shared_http_client(
+        *,
+        timeout_secs: int,
+        default_quota: Any,
+        keyed_quotas: list[tuple[str, Any]],
+        default_headers: dict[str, str],
+        check_proxy_env: bool = True,
+        approved_proxy_env_vars: frozenset[str] | None = None,
+    ) -> Any:
+        """Return the process-wide ``nautilus_pyo3.HttpClient``.
+
+        Why an explicit holder, not ``@lru_cache(maxsize=1)``: ``default_headers``
+        is a ``dict`` and ``keyed_quotas`` is a ``list`` (unhashable -- the first
+        call would ``TypeError``), and ``Quota`` is hashable by identity -- two
+        ``build_default_quota(15)`` objects compare unequal -- so a cache keyed
+        on the arguments would mint a second bucket. The Quota is a client-side
+        pacing bucket handed to the constructor; a second client halves that
+        preventative control (plan §3 D1). Guards run on every call so a dirty
+        proxy env or empty User-Agent cannot sneak through on a cache hit: they
+        protect a construction ATTEMPT. The singleton's constructor arguments
+        (timeout, quotas, headers) never update after the first successful
+        build; a later call with a different configuration is a ``ValueError``,
+        not a silent reuse.
+
+        The process holds one client, which assumes a single asyncio event loop
+        and no worker threads sharing this factory.
+
+        `reqwest` honours HTTP_PROXY/HTTPS_PROXY/ALL_PROXY from the environment
+        whenever no explicit proxy is configured, and no proxy is configured
+        here. Measured: an `HTTP_PROXY` listener received a request carrying
+        `x-pm-access-key` and `x-pm-signature`. `breezy.ingest.http` has guarded
+        its own client this way since it was written (`ingest/http.py:557,783`);
+        the path carrying SIGNING CREDENTIALS was the one left outside that
+        control. Checked before the client is constructed so a dirty environment
+        is a startup failure, never a dispatched request. `check_proxy_env` is
+        threaded from `BREEZY_ALLOW_PROXY_ENV` so this adapter and the ingest
+        client obey one operator switch rather than two.
+        """
+        if check_proxy_env:
+            assert_clean_proxy_env(approved_proxy_env_vars)
+        if timeout_secs <= 0:
+            raise ValueError(f"timeout_secs must be positive; got {timeout_secs}")
+        if not default_headers.get("User-Agent"):
+            raise ValueError(
+                "A non-empty User-Agent is required: gap G15 makes the effective "
+                "User-Agent the attributable signal if the gateway ever refuses a "
+                "non-browser fetch"
+            )
+        incoming = _SharedClientConstruction(
+            timeout_secs=timeout_secs,
+            default_quota_spec=_quota_spec(default_quota),
+            keyed_quotas_spec=tuple((key, _quota_spec(quota)) for key, quota in keyed_quotas),
+            headers_digest=_headers_digest(default_headers),
+        )
+        if holder:
+            stored: _SharedClientConstruction = holder[0][0]
+            if stored != incoming:
+                _raise_construction_mismatch(stored, incoming)
+            return holder[0][1]
+        client = nautilus_pyo3.HttpClient(
+            default_headers=default_headers,
+            header_keys=list(OBSERVED_RESPONSE_HEADERS),
+            keyed_quotas=keyed_quotas,
+            default_quota=default_quota,
+            timeout_secs=timeout_secs,
+        )
+        holder.append((incoming, client))
+        return client
+
+    build_shared_http_client._reset_for_tests = holder.clear  # type: ignore[attr-defined]
+    return build_shared_http_client
+
+
+build_shared_http_client = _make_build_shared_http_client()
 
 
 class NautilusHttpTransport:
     """GET-only wrapper over ``nautilus_pyo3.HttpClient`` (barrier B3).
 
-    The constructor builds the client as a LOCAL and keeps only a GET-only
-    callable object closed over that local. Storing the client itself would put
-    ``transport._client.post(...)`` one attribute hop away from any caller.
-    Storing ``client.get`` is also insufficient because bound methods expose
-    their receiver as ``__self__``. ``__slots__`` prevents a client being
-    attached afterwards.
+    The constructor takes a prebuilt client as a keyword-only argument and
+    keeps only a GET-only callable object closed over that argument. Storing
+    the client itself would put ``transport._client.post(...)`` one attribute
+    hop away from any caller. Storing ``client.get`` is also insufficient
+    because bound methods expose their receiver as ``__self__``. ``__slots__``
+    prevents a client being attached afterwards.
 
     The Python object graph can still reach the client through deliberate
     closure-cell introspection on the callable's class method. That is a
@@ -285,43 +444,10 @@ class NautilusHttpTransport:
     def __init__(
         self,
         *,
-        timeout_secs: int,
-        default_quota: Any,
-        keyed_quotas: list[tuple[str, Any]],
-        default_headers: dict[str, str],
+        client: Any,
         permitted_quota_keys: frozenset[str] = PERMITTED_QUOTA_KEYS,
-        check_proxy_env: bool = True,
-        approved_proxy_env_vars: frozenset[str] | None = None,
     ) -> None:
-        # `reqwest` honours HTTP_PROXY/HTTPS_PROXY/ALL_PROXY from the
-        # environment whenever no explicit proxy is configured, and no proxy is
-        # configured here. Measured: an `HTTP_PROXY` listener received a
-        # request carrying `x-pm-access-key` and `x-pm-signature`.
-        # `breezy.ingest.http` has guarded its own client this way since it was
-        # written (`ingest/http.py:557,783`); the path carrying SIGNING
-        # CREDENTIALS was the one left outside that control. Checked before the
-        # client is constructed so a dirty environment is a startup failure,
-        # never a dispatched request. `check_proxy_env` is threaded from
-        # `BREEZY_ALLOW_PROXY_ENV` so this adapter and the ingest client obey
-        # one operator switch rather than two.
-        if check_proxy_env:
-            assert_clean_proxy_env(approved_proxy_env_vars)
-        if timeout_secs <= 0:
-            raise ValueError(f"timeout_secs must be positive; got {timeout_secs}")
-        if not default_headers.get("User-Agent"):
-            raise ValueError(
-                "A non-empty User-Agent is required: gap G15 makes the effective "
-                "User-Agent the attributable signal if the gateway ever refuses a "
-                "non-browser fetch"
-            )
-        client = nautilus_pyo3.HttpClient(
-            default_headers=default_headers,
-            header_keys=list(OBSERVED_RESPONSE_HEADERS),
-            keyed_quotas=keyed_quotas,
-            default_quota=default_quota,
-            timeout_secs=timeout_secs,
-        )
-        # Barrier B3. `client` is a local and is never stored.
+        # Barrier B3. `client` is a constructor argument and is never stored.
         self._get: Callable[..., Awaitable[Any]] = _build_get_only_callable(client)
         self._permitted_quota_keys: frozenset[str] = permitted_quota_keys
 

@@ -121,6 +121,7 @@ from breezy.adapters.polymarket_us.transport import (
     PolymarketUSReadTransport,
     build_default_quota,
     build_keyed_quotas,
+    build_shared_http_client,
 )
 
 __all__ = [
@@ -299,7 +300,7 @@ def _json_top_level_type(body: bytes | None) -> str | None:
 
 def _build_read_transport(config: Any) -> PolymarketUSReadTransport:
     """The shipped GET-only transport, budgeted exactly as the smoke budgets it."""
-    return NautilusHttpTransport(
+    client = build_shared_http_client(
         timeout_secs=config.http_timeout_secs,
         default_quota=build_default_quota(config.global_requests_per_second),
         keyed_quotas=build_keyed_quotas(
@@ -308,6 +309,7 @@ def _build_read_transport(config: Any) -> PolymarketUSReadTransport:
         ),
         default_headers={"User-Agent": str(config.user_agent)},
     )
+    return NautilusHttpTransport(client=client)
 
 
 def _build_write_client(config: Any) -> Any:
