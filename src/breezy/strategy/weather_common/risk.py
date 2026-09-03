@@ -83,6 +83,7 @@ COUNTED_REFUSAL_REASONS: Final[frozenset[str]] = frozenset(
         "too_close_to_settlement",
         "stale_forecast",
         "stale_observation",
+        "future_signal",
         "observation_limit_unset",
         "edge_below_minimum",
         SHORTS_DISABLED,
@@ -528,6 +529,17 @@ class RiskManager:
         max_age_hours = limits.max_signal_age_hours(signal_age.kind)
         if max_age_hours is None:
             return self._refuse("observation_limit_unset")
+        # `signal_age.age_hours` NEGATIVE means the evidence is timestamped
+        # AHEAD of the decision clock: clock skew or a leaked-future signal,
+        # not freshness. Checked as its own bounded reason and BEFORE the
+        # staleness check below, which only ever fires on the positive side
+        # of zero -- without this, the more wrong (more negative) the
+        # timestamp, the "fresher" the signal looks, and the staleness gate
+        # fails open forever on that input. Same shape as `quote_tradable`'s
+        # `now_ts_age_minutes < 0` guard (BL-9); this is its forecast-signal
+        # counterpart (BL-15).
+        if signal_age.age_hours < 0:
+            return self._refuse("future_signal")
         if signal_age.age_hours > max_age_hours:
             return self._refuse(_STALE_REASON[signal_age.kind])
         if abs(edge) < limits.min_model_edge:

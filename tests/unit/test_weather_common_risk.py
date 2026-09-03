@@ -1050,6 +1050,79 @@ def test_forecast_age_exactly_at_the_stale_forecast_boundary_is_accepted() -> No
 
 
 # ---------------------------------------------------------------------------
+# BL-15 -- `signal_age.age_hours < 0` (evidence timestamped in the FUTURE
+# relative to the decision clock: clock skew or a leaked-future signal) must
+# not look "fresher than fresh" and pass the `> max_age_hours` staleness
+# check. Same shape as `quote_tradable`'s `now_ts_age_minutes < 0` guard
+# (BL-9) -- its own bounded reason, checked BEFORE the staleness comparison,
+# so the sign of the age is refused, not silently treated as freshness.
+# ---------------------------------------------------------------------------
+
+
+def test_a_future_dated_forecast_signal_is_refused_as_future_signal() -> None:
+    contract = _contract("A", lower_f=80, upper_f=None)
+    counter = RefusalCounter()
+    risk = RiskManager(RiskLimits(stale_forecast_hours=8.0), {"A": contract}, refusals=counter)
+
+    decision = risk.evaluate_order(
+        contract=contract,
+        signed_qty_delta=10.0,
+        hours_to_settlement=24.0,
+        signal_age=SignalFreshness.forecast(-1.0),  # ahead of the decision clock
+        edge=0.50,
+        portfolio=PortfolioSnapshot(equity=10_000.0),
+        quote=_quote(),
+        quote_age_minutes=0.0,
+    )
+
+    assert decision.allowed is False
+    assert decision.reason == "future_signal"
+    assert counter.count("future_signal") == 1
+
+
+def test_zero_age_forecast_signal_is_still_accepted() -> None:
+    contract = _contract("A", lower_f=80, upper_f=None)
+    risk = RiskManager(RiskLimits(stale_forecast_hours=8.0), {"A": contract})
+
+    decision = risk.evaluate_order(
+        contract=contract,
+        signed_qty_delta=10.0,
+        hours_to_settlement=24.0,
+        signal_age=SignalFreshness.forecast(0.0),
+        edge=0.50,
+        portfolio=PortfolioSnapshot(equity=10_000.0),
+        quote=_quote(),
+        quote_age_minutes=0.0,
+    )
+
+    assert decision.allowed is True
+
+
+def test_forecast_age_above_the_limit_still_refuses_as_stale_forecast_not_future_signal() -> None:
+    """The new negative-age guard must not shadow the existing positive-side
+    staleness check -- a stale (positive) age still reports `stale_forecast`.
+    """
+    contract = _contract("A", lower_f=80, upper_f=None)
+    counter = RefusalCounter()
+    risk = RiskManager(RiskLimits(stale_forecast_hours=8.0), {"A": contract}, refusals=counter)
+
+    decision = risk.evaluate_order(
+        contract=contract,
+        signed_qty_delta=10.0,
+        hours_to_settlement=24.0,
+        signal_age=SignalFreshness.forecast(9.0),
+        edge=0.50,
+        portfolio=PortfolioSnapshot(equity=10_000.0),
+        quote=_quote(),
+        quote_age_minutes=0.0,
+    )
+
+    assert decision.allowed is False
+    assert decision.reason == "stale_forecast"
+    assert counter.count("stale_forecast") == 1
+
+
+# ---------------------------------------------------------------------------
 # C2 -- `stale_observation_hours` fail-closed default, and no shipped config
 # declares one (the missing half of the `allow_short` discipline, applied to
 # the new field: see `test_bare_risk_limits_forbid_shorting` /
@@ -1244,6 +1317,12 @@ def test_every_recorded_refusal_reason_is_within_the_counted_set() -> None:
         signal_age=SignalFreshness.forecast(999.0), edge=0.50,
         portfolio=PortfolioSnapshot(), quote=_quote(), quote_age_minutes=0.0,
     )
+    # future_signal (BL-15)
+    risk.evaluate_order(
+        contract=contract_a, signed_qty_delta=10.0, hours_to_settlement=24.0,
+        signal_age=SignalFreshness.forecast(-1.0), edge=0.50,
+        portfolio=PortfolioSnapshot(), quote=_quote(), quote_age_minutes=0.0,
+    )
     # stale_observation
     risk_obs = RiskManager(
         RiskLimits(stale_observation_hours=1.0), {"A": contract_a}, refusals=counter,
@@ -1396,6 +1475,8 @@ def test_every_recorded_refusal_reason_is_within_the_counted_set() -> None:
     # Leaving the two new ones undriven would make that claim false.
     assert counter.count(EQUITY_UNOBSERVED_REASON) == 1
     assert counter.count(EQUITY_NONPOSITIVE_REASON) == 1
+    # BL-15: future_signal must also be driven, not merely added to the set.
+    assert counter.count("future_signal") == 1
 
 
 # ---------------------------------------------------------------------------
