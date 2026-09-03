@@ -103,7 +103,7 @@ The bot **is armed to self-discover weather markets** (live node, start + reload
 Read-only, from files only: NO shell and NO subagents in this run (`run_terminal_command` and `spawn_subagent` are unavailable — do not attempt them). Repo root is the cwd (Breezy, Nautilus Trader 1.231.0, Polymarket.us daily-high weather markets). Under 170 lines.
 
 ## Invariants (binding — restate them; no recommendation may violate them)
-Nautilus Trader is immutable. `allow_short` stays `False`. Never weaken/delete a safety, settlement, barrier or contract test. Never assign a value to an operator-reserved control (max daily budget `BREEZY_MAX_DAILY_BUDGET_USD`, max per position `BREEZY_MAX_POSITION_COST_USD`). Never touch live-trading enablement (`BREEZY_TRADING_ENABLED`) or the NO-SEND execution-egress firewall. The bot has never sent a live order; this brief asks for none.
+Nautilus Trader is immutable. `allow_short` stays `False`. Never weaken/delete a safety, settlement, barrier or contract test. Never assign a value to an operator-reserved control (max daily budget the max-daily-budget control, max per position the max-per-position control). Never touch live-trading enablement (`BREEZY_TRADING_ENABLED`) or the NO-SEND execution-egress firewall. The bot has never sent a live order; this brief asks for none.
 
 ## The operator's requirement, verbatim
 "The bot must be armed to self-discover the available markets and positions, then evaluate using a backtested strategy, to trade on forecasted winning positions. Validate this."
