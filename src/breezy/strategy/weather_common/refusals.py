@@ -96,6 +96,17 @@ class RefusalCounter:
         return sum(self.counts.values())
 
 
+def _refusal_event(reason: str) -> str:
+    """`AlertPayload.event` for a refusal reason with no dedicated constant.
+
+    Matches the shape `SHORTS_DISABLED_EVENT` already has --
+    `"shorts_disabled".upper() + "_REFUSALS" == SHORTS_DISABLED_EVENT` -- so
+    every reason gets an event name in one consistent vocabulary rather than
+    `SHORTS_DISABLED` alone being special-cased into a hand-picked constant.
+    """
+    return f"{reason.upper()}_REFUSALS"
+
+
 class RefusalAlerter:
     """Turns a :class:`RefusalCounter` into the existing alert path's vocabulary.
 
@@ -132,20 +143,41 @@ class RefusalAlerter:
         return self._state.dispatch(self._sink, self._conditions(), now_ns=now_ns)
 
     def _conditions(self) -> tuple[AlertCondition, ...]:
-        refused = self._counter.count(SHORTS_DISABLED)
-        return (
-            AlertCondition(
-                key=AlertConditionKey(kind=SHORTS_DISABLED_EVENT, site=self._site),
-                # Passed even when inactive, so `AlertState` sees the
-                # true->false edge and a later refusal alerts again rather than
-                # being muted as a repeat.
-                active=refused > 0,
-                severity="WARN",
-                event=SHORTS_DISABLED_EVENT,
-                detail=(
-                    f"{refused} order(s) refused as {SHORTS_DISABLED}; a strategy whose "
-                    f"only signal is SHORT_YES is structurally disabled, so its "
-                    f"no trades are not evidence of an efficient market"
-                ),
-            ),
+        """One `AlertCondition` per refusal reason ever recorded, this process.
+
+        `SHORTS_DISABLED` is not special-cased against the rest: any counted
+        refusal reason -- `stale_observation`, `observation_limit_unset`, or
+        any other key `RefusalCounter.record` has seen -- gets its own
+        condition, keyed and dedupe-tracked independently, so a run refused
+        entirely for a reason other than shorts-disablement still alerts
+        rather than passing through this module silently. Iterating
+        `self._counter.counts` (not a fixed reason set) is what makes this
+        generalise: any reason the counter has ever seen is covered, with no
+        second, drifting list of reasons to keep in sync.
+        """
+        return tuple(
+            self._condition_for(reason) for reason in self._counter.counts
+        )
+
+    def _condition_for(self, reason: str) -> AlertCondition:
+        refused = self._counter.count(reason)
+        event = SHORTS_DISABLED_EVENT if reason == SHORTS_DISABLED else _refusal_event(reason)
+        detail = (
+            (
+                f"{refused} order(s) refused as {SHORTS_DISABLED}; a strategy whose "
+                f"only signal is SHORT_YES is structurally disabled, so its "
+                f"no trades are not evidence of an efficient market"
+            )
+            if reason == SHORTS_DISABLED
+            else f"{refused} order(s) refused as {reason}"
+        )
+        return AlertCondition(
+            key=AlertConditionKey(kind=event, site=self._site),
+            # Passed even when inactive, so `AlertState` sees the
+            # true->false edge and a later refusal alerts again rather than
+            # being muted as a repeat.
+            active=refused > 0,
+            severity="WARN",
+            event=event,
+            detail=detail,
         )

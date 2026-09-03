@@ -137,3 +137,45 @@ def test_the_detail_names_the_structural_disablement_not_just_a_number() -> None
     detail = sink.payloads[0].detail
     assert SHORTS_DISABLED in detail
     assert "no trades" in detail
+
+
+def test_a_stale_observation_only_refusal_alerts() -> None:
+    """A refusal reason other than SHORTS_DISABLED must still reach the sink."""
+    counter = RefusalCounter()
+    sink = _RecordingSink()
+    alerter = RefusalAlerter(counter, site=SITE, sink=sink)
+
+    counter.record("stale_observation")
+    emitted = alerter.report(now_ns=1_000)
+
+    assert emitted == 1
+    assert len(sink.payloads) == 1
+    payload = sink.payloads[0]
+    assert "stale_observation" in payload.detail
+    assert payload.site == SITE
+    assert payload.severity == "WARN"
+
+
+def test_two_refusal_reasons_alert_naming_both() -> None:
+    """A run refused for two distinct reasons alerts once per reason, each named."""
+    counter = RefusalCounter()
+    sink = _RecordingSink()
+    alerter = RefusalAlerter(counter, site=SITE, sink=sink)
+
+    counter.record("stale_observation")
+    counter.record(SHORTS_DISABLED)
+    emitted = alerter.report(now_ns=1_000)
+
+    assert emitted == 2
+    details = [payload.detail for payload in sink.payloads]
+    assert any("stale_observation" in detail for detail in details)
+    assert any(SHORTS_DISABLED in detail for detail in details)
+
+
+def test_zero_refusals_of_any_kind_does_not_alert() -> None:
+    counter = RefusalCounter()
+    sink = _RecordingSink()
+    alerter = RefusalAlerter(counter, site=SITE, sink=sink)
+
+    assert alerter.report(now_ns=1_000) == 0
+    assert sink.payloads == []
