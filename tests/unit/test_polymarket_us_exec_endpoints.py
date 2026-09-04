@@ -240,20 +240,132 @@ def test_buying_power_above_the_total_balance_is_refused() -> None:
         parse_account_balances(payload)
 
 
-def test_sub_cent_balance_is_refused_rather_than_rounded() -> None:
-    """``Money(Decimal("0.005"), USD)`` silently returns ``0.01`` -- measured."""
+def test_sub_cent_balance_is_quantized_down_not_refused() -> None:
+    """R-4 correction 2026-09-04: the venue now reports sub-cent balances.
+
+    ``currentBalance``/``buyingPower`` are Nautilus portfolio bookkeeping, not
+    an observation or a price, so they are quantized to ``USD.precision``
+    with ``ROUND_DOWN`` at construction rather than refused -- unlike the
+    price guard, which stays strict (see
+    ``test_polymarket_us_exec_reports.py::test_sub_tick_avg_px_is_refused_rather_than_silently_rounded``).
+    """
     payload = {
         "balances": [
             {
                 "currency": "USD",
-                "currentBalance": Decimal("1.005"),
-                "buyingPower": Decimal("1.005"),
+                "currentBalance": Decimal("100.123456"),
+                "buyingPower": Decimal("50.999999"),
+            }
+        ]
+    }
+
+    (balance,) = parse_account_balances(payload)
+
+    assert balance.total == Money(Decimal("100.12"), USD)
+    assert balance.free == Money(Decimal("50.99"), USD)
+    assert balance.locked == balance.total - balance.free
+    assert balance.locked.as_decimal() >= 0
+
+
+def test_sub_cent_balance_locked_is_derived_after_quantization() -> None:
+    payload = {
+        "balances": [
+            {
+                "currency": "USD",
+                "currentBalance": Decimal("100.123456"),
+                "buyingPower": Decimal("50.999999"),
+            }
+        ]
+    }
+
+    (balance,) = parse_account_balances(payload)
+
+    assert balance.locked == Money(Decimal("49.13"), USD)
+
+
+def test_sub_cent_balance_rounds_toward_zero_not_half_even() -> None:
+    """``100.005`` at precision 2 ROUND_DOWN is ``100.00``, not ``100.01``."""
+    payload = {
+        "balances": [
+            {
+                "currency": "USD",
+                "currentBalance": Decimal("100.005"),
+                "buyingPower": Decimal("100.005"),
+            }
+        ]
+    }
+
+    (balance,) = parse_account_balances(payload)
+
+    assert balance.total == Money(Decimal("100.00"), USD)
+    assert balance.free == Money(Decimal("100.00"), USD)
+
+
+def test_exact_cent_balances_are_unchanged_by_quantization() -> None:
+    payload = {
+        "balances": [
+            {"currency": "USD", "currentBalance": Decimal("12.34"), "buyingPower": Decimal("10.00")}
+        ]
+    }
+
+    (balance,) = parse_account_balances(payload)
+
+    assert balance.total == Money(Decimal("12.34"), USD)
+    assert balance.free == Money(Decimal("10.00"), USD)
+    assert balance.locked == Money(Decimal("2.34"), USD)
+
+
+def test_buying_power_that_only_exceeds_total_after_quantization_is_refused() -> None:
+    """A sub-cent overage that rounds into an apparent negative encumbrance
+    still hits the existing negative-encumbrance refusal, unchanged."""
+    payload = {
+        "balances": [
+            {
+                "currency": "USD",
+                "currentBalance": Decimal("1.001"),
+                "buyingPower": Decimal("1.019"),
             }
         ]
     }
 
     with pytest.raises(ExecutionReportMappingError):
         parse_account_balances(payload)
+
+
+def test_balance_quantization_logs_one_record_with_only_the_count(caplog) -> None:
+    payload = {
+        "balances": [
+            {
+                "currency": "USD",
+                "currentBalance": Decimal("100.123456"),
+                "buyingPower": Decimal("50.999999"),
+            }
+        ]
+    }
+
+    with caplog.at_level("INFO"):
+        parse_account_balances(payload)
+
+    records = [r for r in caplog.records if "non-exact" in r.getMessage().lower()]
+    assert len(records) == 1
+    message = records[0].getMessage()
+    assert "2" in message
+    for leaked in ("100.123456", "50.999999", "100.12", "50.99", "currentBalance", "buyingPower"):
+        assert leaked not in message
+
+
+def test_balance_quantization_does_not_log_when_already_exact(caplog) -> None:
+    payload = {
+        "balances": [
+            {"currency": "USD", "currentBalance": Decimal("12.34"), "buyingPower": Decimal("10.00")}
+        ]
+    }
+
+    with caplog.at_level("INFO"):
+        parse_account_balances(payload)
+
+    records = [r for r in caplog.records if "non-exact" in r.getMessage().lower()]
+    assert records == []
 
 
 def test_empty_balances_list_is_refused() -> None:

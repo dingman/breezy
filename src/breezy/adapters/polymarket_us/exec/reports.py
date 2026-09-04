@@ -114,8 +114,9 @@ because this is the module whose output reaches that code path.
 
 from __future__ import annotations
 
+import logging
 from collections.abc import Mapping, Sequence
-from decimal import Decimal
+from decimal import ROUND_DOWN, Decimal
 from typing import Any, Final, NamedTuple
 
 from nautilus_trader.core.uuid import UUID4
@@ -153,6 +154,8 @@ from breezy.adapters.polymarket_us.parsing import (
     _require as _require_field,
 )
 from breezy.adapters.polymarket_us.symbology import POLYMARKET_US_VENUE
+
+logger = logging.getLogger(__name__)
 
 __all__ = [
     "ORDER_STATE_TO_ORDER_STATUS",
@@ -590,6 +593,20 @@ def parse_account_balances(payload: Mapping[str, Any]) -> tuple[AccountBalance, 
     They are accepted DECLARED-BUT-UNREAD, never merged into the snapshot-
     matched set itself, so the strict refusal below stays strict for any
     field beyond those six.
+
+    ``currentBalance`` and ``buyingPower`` are QUANTIZED to ``USD.precision``
+    with ``ROUND_DOWN`` rather than refused when they carry sub-cent
+    precision (peer-reviewed 2026-09-04, second live-launch incident: the
+    venue began reporting sub-cent balances). These two fields are Nautilus
+    portfolio bookkeeping, not an observation, a price, or a settlement
+    number -- Breezy's own sizing (``operator_controls.py::
+    authorize_order_cost``) never reads them -- so A13's "a spanning interval
+    is refused, never rounded" does not apply here, and ``ROUND_DOWN`` never
+    overstates equity or spending power. See
+    ``docs/evidence/grok_live_small_spec_rev2_2026-09-04.md:31,67``. Every
+    other money and price field in this module (``avg_px`` included) stays
+    strict-refuse via ``_assert_representable``/``_assert_price_representable``
+    -- untouched by this carve-out.
     """
     context = "account balances response"
     _assert_known_keys(payload, known=_BALANCES_RESPONSE_KEYS, context=context)
@@ -604,13 +621,33 @@ def parse_account_balances(payload: Mapping[str, Any]) -> tuple[AccountBalance, 
             f"{context} carried no balance entry; an absent balance is not a zero "
             "balance, and defaulting one would publish spending power we cannot see"
         )
-    return tuple(
-        _parse_account_balance(entry, context=f"{context} balances[{index}]")
-        for index, entry in enumerate(entries)
-    )
+    non_exact_count = 0
+    balances: list[AccountBalance] = []
+    for index, entry in enumerate(entries):
+        balance, entry_non_exact_count = _parse_account_balance(
+            entry, context=f"{context} balances[{index}]"
+        )
+        balances.append(balance)
+        non_exact_count += entry_non_exact_count
+    if non_exact_count:
+        logger.info(
+            "account balances response: %d balance field(s) carried non-exact "
+            "precision and were quantized down to the instrument precision",
+            non_exact_count,
+        )
+    return tuple(balances)
 
 
-def _parse_account_balance(payload: object, *, context: str) -> AccountBalance:
+def _quantize_balance_field(value: Decimal, *, precision: int) -> tuple[Decimal, bool]:
+    """Quantize a balance field toward zero; report whether it was non-exact."""
+    quantum = Decimal(1).scaleb(-precision)
+    quantised = value.quantize(quantum, rounding=ROUND_DOWN)
+    return quantised, quantised != value
+
+
+def _parse_account_balance(
+    payload: object, *, context: str
+) -> tuple[AccountBalance, int]:
     balance = _assert_known_keys(
         payload,
         known=_USER_BALANCE_KEYS | _USER_BALANCE_DRIFT_ALLOWED_KEYS,
@@ -624,26 +661,20 @@ def _parse_account_balance(payload: object, *, context: str) -> AccountBalance:
             "refusing to treat it as a USD balance"
         )
 
-    total = _assert_representable(
-        _to_decimal(
-            _require(balance, "currentBalance", context=context),
-            field=f"{context}.currentBalance",
-            error=ExecutionReportMappingError,
-        ),
-        precision=USD.precision,
+    raw_total = _to_decimal(
+        _require(balance, "currentBalance", context=context),
         field=f"{context}.currentBalance",
         error=ExecutionReportMappingError,
     )
-    free = _assert_representable(
-        _to_decimal(
-            _require(balance, "buyingPower", context=context),
-            field=f"{context}.buyingPower",
-            error=ExecutionReportMappingError,
-        ),
-        precision=USD.precision,
+    raw_free = _to_decimal(
+        _require(balance, "buyingPower", context=context),
         field=f"{context}.buyingPower",
         error=ExecutionReportMappingError,
     )
+    total, total_non_exact = _quantize_balance_field(raw_total, precision=USD.precision)
+    free, free_non_exact = _quantize_balance_field(raw_free, precision=USD.precision)
+    non_exact_count = int(total_non_exact) + int(free_non_exact)
+
     locked = total - free
     if locked < 0:
         raise ExecutionReportMappingError(
@@ -654,10 +685,13 @@ def _parse_account_balance(payload: object, *, context: str) -> AccountBalance:
             "message is what R-4 attaches a logger to"
         )
 
-    return AccountBalance(
-        total=_usd_money(total, field=f"{context}.currentBalance"),
-        locked=_usd_money(locked, field=f"{context}.locked"),
-        free=_usd_money(free, field=f"{context}.buyingPower"),
+    return (
+        AccountBalance(
+            total=_usd_money(total, field=f"{context}.currentBalance"),
+            locked=_usd_money(locked, field=f"{context}.locked"),
+            free=_usd_money(free, field=f"{context}.buyingPower"),
+        ),
+        non_exact_count,
     )
 
 
