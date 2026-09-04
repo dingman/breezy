@@ -1,6 +1,6 @@
 # FAMILY_TALLY_V2_BLUEPRINT_2026-09-04 — Rev 2
 
-Status: REVISED after two adversarial reviews and the strategy-lead score-statistic ruling; pending convergence check. Implements plan S2+S3 with v1 byte-unmodified.
+Status: CONVERGED 2026-09-04 (two adversarial reviews + strategy-lead score-statistic ruling + convergence pass; the two minimal edits — call-site line numbers post-b08166c and the tie guard — applied). Implements plan S2+S3 with v1 byte-unmodified.
 
 ## Blueprint — PREREG v2 / Kalshi sibling tally (plan S2+S3) — Rev 2
 
@@ -80,7 +80,9 @@ class BoundaryArtefact:
     def remaining_alpha(self, t_history_completed: Sequence[float]) -> float    # 0.025 - spent(last completed look)
 def load_boundary_artefact(path: Path, *, expected_sha256: str) -> BoundaryArtefact
     # raises BoundaryPinMismatch on sha drift; raises on i_max != 40, alpha != 0.025,
-    # non-monotone t_history, t outside (0,1], or a reference fixture the solver cannot reproduce.
+    # a strictly DECREASING t_history, t outside (0,1], or a reference fixture the solver cannot reproduce.
+    # A TIE (t_k == t_{k-1}: no new information) is VALID: the spending increment is 0 and the look's
+    # boundary is degenerate (b_eff=+inf, b_fut=-inf ⇒ CONTINUE-forced), never an error (convergence edit).
 
 # persistence/family_manifest.py
 @dataclass(frozen=True, slots=True, kw_only=True)
@@ -117,8 +119,8 @@ def main(argv=None) -> int      # --family REQUIRED, --store-dir, --output, --as
 - **Non-vacuous BE golden** — asks 0.10/0.50/0.90 at θ=0.06: `mean(BE_i) < break_even(mean_ask)` strictly, gap pinned numerically (Jensen; addendum item 3).
 - **Mixed-θ fixture** — rows with fees from θ=0.06 and θ=0.07 in one stratum: `π` is the arithmetic mean of per-row `BE_i`, not any single-θ `break_even`. (Proves the math; a real family is single-venue and never pooled.)
 - **v1-rows-through-v2 refusal** — a `current_rung_hold/trial/…` row with `climate_day < d0_climate_day` raises; a Kalshi-prefixed row in the PM-v2 tally raises; symmetric case raises. Non-vacuity: the same rows minus the barrier build a stratum.
-- **Non-modification pin** — AST source-text extraction (no import, so no side effects, though import is safe: `mb_current_rung_edge_study.py` is `__main__`-guarded, precedent `tests/unit/test_mb_current_rung_edge_study.py`) over `scripts/analysis/mb_current_rung_edge_study.py`: `FEE_THETA` (`:176`), `break_even` (`:179-181`), `RealizedStratum` (`:701-724`), `build_realized_stratum` (`:727-746`), each sha256-pinned. Plus the v1 call sites **re-derived after b08166c** (the structural-dead stop shifted them): `live_family_tally.py:192` (`station:` stratum), `:205` (`ask:` band), `:289` (`pooled`) — line-anchored source text, equality-pinned. Both directions, with two neighbour proofs each (one widened, one narrowed mutant asserted REFUSED by the same predicate), per `test_cage_rule_constants_are_pinned.py`.
-- **Boundary artefact** — sha mismatch raises; `i_max != 40` raises; non-monotone `t_history` raises; the 16-row equal-t reference fixture is reproduced by the solver to 1e-9; `remaining_alpha` at look 0 is exactly 0.025.
+- **Non-modification pin** — AST source-text extraction (no import, so no side effects, though import is safe: `mb_current_rung_edge_study.py` is `__main__`-guarded, precedent `tests/unit/test_mb_current_rung_edge_study.py`) over `scripts/analysis/mb_current_rung_edge_study.py`: `FEE_THETA` (`:176`), `break_even` (`:179-181`), `RealizedStratum` (`:701-724`), `build_realized_stratum` (`:727-746`), each sha256-pinned. Plus the v1 call sites **re-derived after b08166c** (the structural-dead stop shifted them): `live_family_tally.py:193` (`station:` stratum), `:205` (`ask:` band), `:289` (`pooled`) — line-anchored source text, equality-pinned. Both directions, with two neighbour proofs each (one widened, one narrowed mutant asserted REFUSED by the same predicate), per `test_cage_rule_constants_are_pinned.py`.
+- **Boundary artefact** — sha mismatch raises; a tie in `t_history` (`t_k == t_{k-1}`) does NOT raise and yields the degenerate ±inf pair, while a strict decrease raises; `i_max != 40` raises; non-monotone `t_history` raises; the 16-row equal-t reference fixture is reproduced by the solver to 1e-9; `remaining_alpha` at look 0 is exactly 0.025.
 - **Truncation** (own suite) — `CONTINUE` is unreachable: `terminal_look`'s return type admits only SURVIVE/KILL and a `b_fut < S < b_eff` fixture returns **KILL**; `LOSS_STOP` with `S ≥ b_eff` still returns KILL; `D0_165` admits both verdicts on the appropriate fixtures; `I_MAX` fires when `I ≥ 40` at n<160 and spends remaining α; at n=160 with `I<40` the terminal `b_eff` equals 1.959963984540054.
 - **Strata/`cell_dead`** — false at n=59, true at n=60 with `wilson_upper < π`; the inlined Wilson matches `archive_correction_probe.wilson_interval` on 200 random `(k,n)` pairs (imported **in the test only**, never in `src/`).
 - **BCa terminal-only** — a `CONTINUE` look invokes no `compute_roi_bound` (monkeypatched call counter); a terminal look invokes it exactly once.

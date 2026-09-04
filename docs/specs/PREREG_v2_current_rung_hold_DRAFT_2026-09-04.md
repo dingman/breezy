@@ -152,6 +152,7 @@ live/paper barrier (`live_family_tally.py:139-171`).
   LD-OBF spending function of **`t`** (not of `n`); look schedule `n_k = 10..160` step 10, each
   look's `S_k`/`I_k` evaluated at realized per-row `BE_i` (§3, §5); `I_max = 40` (`n_max/4`,
   fixed constant, never re-derived from a sample).
+- **Tie guard (convergence edit).** `I_k` is a sum of non-negative terms, so `t` can never decrease; the solver must accept a tie (`t_k == t_{k-1}`, zero new information) as a valid look with a zero spending increment and a degenerate boundary (CONTINUE-forced), and raise only on a strict decrease, which can only be a wiring defect.
 - **Boundary solver, not a fixed table.** Because `t_k = I_k/I_max` depends on the realized sample
   of `BE_i` values rather than a deterministic function of `n_k`, the generator's primary output
   is a **boundary solver** — a function `b^eff(t)`, `b^fut(t)` over `t ∈ [0,1]` — not 16
