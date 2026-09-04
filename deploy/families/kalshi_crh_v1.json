@@ -1,0 +1,15 @@
+{
+  "family_id": "kalshi_crh_v1",
+  "venue": "kalshi",
+  "trial_id_prefix": "kalshi:current_rung_hold/trial/",
+  "d0_climate_day": "2099-01-01",
+  "boundary_artefact_path": "deploy/families/gs_boundary_kalshi_crh_v1.json",
+  "boundary_inputs_sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+  "stations": [
+    "LAX",
+    "MDW",
+    "MIA",
+    "SFO"
+  ],
+  "status": "DRAFT_NOT_REGISTERED"
+}
