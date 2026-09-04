@@ -4,7 +4,7 @@
 family. NO VERDICT.** n=4 station-days cannot reach the PREREG v1 floors
 (kill n≥60, survive n≥150). Nothing here is an ROI inference; every number
 below was printed by `scripts/analysis/current_rung_hold_paper_replay.py`
-at branch tip `8aaff91` (driver fixes `ed35e37`, `56abfcc`, `27c6910`,
+at branch tips `8aaff91`/`35a0049` (driver fixes `ed35e37`, `56abfcc`, `27c6910`,
 `8aaff91`; strategy `4ffcbbb`).
 
 ## Inputs
@@ -41,11 +41,23 @@ The one scored trial (MDW 2026-09-01, lag 30, `tc-temp-mdwhigh-2026-09-01-gte91l
 settlement_tmax_f=94 pnl=-0.06 settlement_basis=nws_final`. Wilson hold
 interval [0.0000, 0.7935] (n=1). `BCa: n<30 — bound not computed`.
 
-Every lag-45 arm refuses `observation_unavailable`: the package pins
-`stale_observation_hours=0.75` (45 min), so a 45-minute receipt lag makes
-every observation stale at receipt. That is the spec's own bound acting as
-designed, not a data gap; PREREG v1's lag-45 arm is therefore a
-staleness-refusal arm unless the spec revises the bound.
+The lag-45 arms above ran under the rev 2 bound `stale_observation_hours=0.75`
+(45 min): receipt = observed + 45 made every observation fresh for one
+nanosecond, so every arm refused `observation_unavailable`. Grok ruled (A) in
+`grok_live_small_spec_rev3_delta_2026-09-04.md`: the bound gives, pinned at
+50 min (max live lag 45 + 5-min cadence), integer-minute nanoseconds, both
+arms kept, archive table unchanged (`35a0049`). Re-run of the four lag-45
+arms at branch tip `35a0049`:
+
+| station | lag | strategy refusals (counted) | wait-state diagnostics | scored |
+|---|---|---|---|---|
+| SFO | 45 | `observation_unavailable` 1; outside_window 1152 | — | 0 |
+| MDW | 45 | outside_window 25069 | not_executable 581; rung_not_current 3258 | **1** (same trial: entry 0.06, fill 0.06, not held, pnl −0.06) |
+| MIA | 45 | outside_window 8342 | not_executable 1917; rung_not_current 2 | 0 |
+| LAX | 45 | `illegal_cell` 1; outside_window 43706 | not_executable 11 | 0 |
+
+SFO's remaining refusal is a genuinely stale running max at its first
+executable snapshot (age > 50 min), counted as the spec requires.
 
 ## What the mechanism test caught (all fixed, all gated)
 
