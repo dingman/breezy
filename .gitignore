@@ -19,3 +19,4 @@ secrets/
 # from an authenticated private endpoint must carry the PRIVATE_ prefix so it
 # can never be added by a bare `git add docs/`.
 docs/evidence/venue/**/PRIVATE_*
+.venv

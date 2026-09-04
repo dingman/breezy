@@ -220,6 +220,7 @@ from __future__ import annotations
 import asyncio
 import json
 import threading
+from collections.abc import Mapping
 from dataclasses import dataclass
 from decimal import Decimal, InvalidOperation
 from typing import TYPE_CHECKING, Any, Final, Protocol, Self
@@ -228,15 +229,24 @@ from nautilus_trader.core.uuid import UUID4
 from nautilus_trader.execution.reports import PositionStatusReport
 from nautilus_trader.live.execution_client import LiveExecutionClient
 from nautilus_trader.model.currencies import USD
-from nautilus_trader.model.enums import AccountType, LiquiditySide, OmsType, PositionSide
+from nautilus_trader.model.enums import (
+    AccountType,
+    LiquiditySide,
+    OmsType,
+    OrderSide,
+    OrderType,
+    PositionSide,
+)
 from nautilus_trader.model.identifiers import AccountId, ClientOrderId, VenueOrderId
 
+import breezy.adapters.polymarket_us.write_transport as write_transport  # noqa: PLR0402
 from breezy.adapters.polymarket_us.errors import (
     ExecutionReportMappingError,
     FeeScheduleUnknownError,
     PolymarketUSError,
     VenuePayloadError,
 )
+from breezy.adapters.polymarket_us.exec import submit_chain
 from breezy.adapters.polymarket_us.exec.endpoints import (
     ACCOUNT_BALANCES_PATH,
     PORTFOLIO_POSITIONS_PATH,
@@ -252,17 +262,20 @@ from breezy.adapters.polymarket_us.exec.reports import (
     build_execution_mass_status,
     derive_position_cost_basis,
     parse_account_balances,
+    parse_order_status_report,
     parse_position_status_report,
 )
 from breezy.adapters.polymarket_us.exec_fault import record_fatal_exec_fault
 from breezy.adapters.polymarket_us.fees import polymarket_us_fee
 from breezy.adapters.polymarket_us.parsing import _to_decimal
+from breezy.adapters.polymarket_us.safety import (
+    LiveTradingPermissionError,
+    assert_live_order_submission_permitted,
+)
 from breezy.adapters.polymarket_us.symbology import slug_to_instrument_id
 from breezy.ingest.gate import assert_state_store_durable
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
-    from collections.abc import Mapping
-
     from nautilus_trader.cache.cache import Cache
     from nautilus_trader.common.component import LiveClock, MessageBus
     from nautilus_trader.common.providers import InstrumentProvider
@@ -331,13 +344,7 @@ _RECORD_SIGNS: Final[Mapping[str, Decimal]] = {
 _DEFAULT_INSTRUMENT_WAIT_SECONDS: Final[float] = 30.0
 _DEFAULT_ACCOUNT_REGISTRATION_SECONDS: Final[float] = 30.0
 
-#: The standing refusal. Carried in the ``OrderDenied`` reason so an operator
-#: reading a denial learns which increment owns the ability, rather than
-#: suspecting a transient venue fault.
-_STANDING_ORDER_REFUSAL: Final[str] = (
-    "EXEC_SPINE R-4 refuses every order: this client reconciles and does "
-    "nothing else, and no send path exists in it"
-)
+
 
 
 class PrivateRead(Protocol):
@@ -489,6 +496,14 @@ class PolymarketUSExecutionClient(LiveExecutionClient):
         account_number: str,
         instrument_wait_timeout_s: float = _DEFAULT_INSTRUMENT_WAIT_SECONDS,
         account_registration_timeout_s: float = _DEFAULT_ACCOUNT_REGISTRATION_SECONDS,
+        order_sender: Any = None,
+        write_signer: Any = None,
+        live_trading_permit: Any = None,
+        spend_ledger: Any = None,
+        submit_intent_latch: Any = None,
+        credentials: Any = None,
+        api_base_url: str = "",
+        retirement_reasons: Any = None,
     ) -> None:
         """Build the client. Every input is checked here, not at first use.
 
@@ -560,6 +575,19 @@ class PolymarketUSExecutionClient(LiveExecutionClient):
         self._store_thread: int | None = None
         self._trading_refusals: list[ClassifiedRefusal] = []
         self._settled_positions: list[InstrumentId] = []
+        self._order_sender = order_sender
+        self._write_signer = write_signer
+        self._permit = live_trading_permit
+        self._ledger = spend_ledger
+        # The composition root's ALREADY-OPENED latch (never a factory, never
+        # an opener this client could call). Injected once at construction;
+        # this client's own lifecycle never opens or closes it -- see
+        # `_reconcile_submit_intent` and `_disconnect`.
+        self._latch: Any = submit_intent_latch
+        self._credentials = credentials
+        self._api_base_url = api_base_url
+        self._retirement_reasons = retirement_reasons
+        self._intent_reconciled: bool = False
 
     # -- observable state ---------------------------------------------------
 
@@ -629,6 +657,7 @@ class PolymarketUSExecutionClient(LiveExecutionClient):
             await self._wait_for_instruments()
             await self._publish_account_state()
             await self._confirm_account_registered()
+            self._reconcile_submit_intent()
         except BaseException as exc:
             record_fatal_exec_fault(
                 component=str(self.id),
@@ -640,6 +669,44 @@ class PolymarketUSExecutionClient(LiveExecutionClient):
             )
             raise
 
+    def _has_durable_fill_record(self, fingerprint: str) -> bool:
+        """Nothing supplies a fill probe today; absence is False, never synthesised."""
+        del fingerprint
+        return False
+
+    def _reconcile_submit_intent(self) -> None:
+        """Reconcile the INJECTED latch before any ``arm`` (R-7).
+
+        ``self._latch`` is the composition root's already-opened
+        :class:`~breezy.runtime.submit_intent.SubmitIntentLatch` (see
+        ``PolymarketUSExecClientConfig.submit_intent_latch``). This client
+        never opens one -- a second ``open_submit_intent_latch`` here would
+        flock-conflict with the composition root and kill the process (L-22:
+        the latch's exclusion is unforgeable, not offered). With the field
+        unset, D6 (``_submit_order``'s ``self._intent_reconciled is not
+        True`` check) denies every order.
+
+        The thread assertion is fail-closed, not a courtesy: ``SubmitIntent``
+        is guarded by an in-process ``threading.Lock``
+        (``submit_intent.py::SubmitIntentLatch._mutex``), never a
+        cross-thread primitive, so reconciling from any thread but the one
+        that opened the latch is a correctness bug this client must refuse
+        outright rather than silently tolerate.
+        """
+        if self._latch is None or self._store is None:
+            self._intent_reconciled = False
+            return
+        assert threading.get_ident() == self._latch.opening_thread_ident, (
+            "the submit-intent latch must be reconciled on the thread that "
+            "opened it; this client never opens its own latch and refuses "
+            "to adopt one from another thread"
+        )
+        self._latch.reconcile_at_startup(
+            has_durable_fill_record=self._has_durable_fill_record,
+            now_ns=self._clock.timestamp_ns(),
+        )
+        self._intent_reconciled = True
+
     async def _disconnect(self) -> None:
         """Close the durable store. A failing close does not fail the shutdown.
 
@@ -647,7 +714,15 @@ class PolymarketUSExecutionClient(LiveExecutionClient):
         written to afterwards, and the close is wrapped because at that point
         the only handle is the local one: an exception escaping here would
         abort the disconnect over a resource that is already unreachable.
+
+        The submit-intent latch is NOT closed here. It is the composition
+        root's, opened and released by its own ``ExitStack``
+        (``breezy.app.trade.run``) for the process lifetime -- this client
+        only ever reconciled it, never opened it, so it has nothing of its
+        own to release. Only the reconciled flag, which is this connection's,
+        resets.
         """
+        self._intent_reconciled = False
         store = self._store
         self._store = None
         if store is None:
@@ -858,17 +933,50 @@ class PolymarketUSExecutionClient(LiveExecutionClient):
         self,
         command: GenerateOrderStatusReport,
     ) -> OrderStatusReport | None:
-        """No single-order read surface is declared in this increment.
+        """By-id order read on the private read seam (R-7-STATUS).
 
-        Returning ``None`` is the native contract for "not found" here
-        (``live/execution_client.py:343``), and ``_query_order`` logs a
-        warning on it rather than raising.
+        Returning ``None`` remains the native contract for "not found"
+        (``live/execution_client.py:343``). The path is templated so V2 does
+        not see the private order resource as one literal.
         """
-        self._log.warning(
-            "No order status read surface exists in EXEC_SPINE R-4; "
-            "returning None for the order status query",
-        )
-        return None
+        venue_order_id = getattr(command, "venue_order_id", None)
+        if venue_order_id is None:
+            self._log.warning(
+                "No venue_order_id on the order status query; returning None",
+            )
+            return None
+        path = submit_chain.order_by_id_path(str(venue_order_id))
+        try:
+            payload = await self._private_read(path)
+        except Exception as exc:  # noqa: BLE001 - None is the native not-found contract
+            self._log.warning(
+                f"order status read failed ({type(exc).__name__}: {exc}); returning None"
+            )
+            return None
+        instrument = self._cache.instrument(command.instrument_id)
+        if instrument is None:
+            return None
+        body: Mapping[str, Any]
+        nested = payload.get("order") if isinstance(payload, Mapping) else None
+        if isinstance(nested, Mapping):
+            body = nested
+        elif isinstance(payload, Mapping):
+            body = payload
+        else:
+            return None
+        try:
+            return parse_order_status_report(
+                body,
+                instrument=instrument,
+                account_id=self._issued_account_id,
+                report_id=UUID4(),
+                ts_init=self._clock.timestamp_ns(),
+            )
+        except Exception as exc:  # noqa: BLE001 - unmappable is not-found, not a crash
+            self._log.warning(
+                f"order status payload did not map ({type(exc).__name__}: {exc})"
+            )
+            return None
 
     async def generate_order_status_reports(
         self,
@@ -1367,44 +1475,256 @@ class PolymarketUSExecutionClient(LiveExecutionClient):
     # -- the order surface: refusal, and nothing else -----------------------
 
     async def _submit_order(self, command: SubmitOrder) -> None:
-        """Refuse. Always, and for a reason the operator can act on.
-
-        Three preconditions, checked in order of what they mean:
-
-        1. **A latched trading refusal.** This is the STRUCTURAL gate, and the
-           only one of the three that survives R-4. R-6 removes the standing
-           denial below; the refusal set is the mechanism it inherits, so it is
-           first here and is proven on its own in the unit suite -- while there
-           is still a suite that can distinguish it from the standing denial.
-        2. **No cached account.** The belt-and-braces fallback named in the
-           plan's §Ordering section: while ``cache.account_for_venue(...)`` is
-           ``None`` every Nautilus cap fails OPEN
-           (``risk/engine.pyx:684-689``), so an order arriving in that state is
-           the one case where "denied" and "denied by a cap" differ.
-        3. **The standing R-4 refusal**, which has no exception.
-        """
+        """Authorize, arm, POST, retire. Deny before any venue contact."""
         order = command.order
+        now_ns = self._clock.timestamp_ns()
         if self._trading_refusals:
-            reason = (
-                "this client has latched a trading refusal and will not act on "
-                "venue state it could not attribute: "
-                f"{self._trading_refusals[0].reason}"
+            reason = submit_chain.latched_refusal_reason(self._trading_refusals[0].reason)
+            self._log.error(f"Refusing {order.client_order_id!r}: {reason}")
+            self.generate_order_denied(
+                strategy_id=order.strategy_id,
+                instrument_id=order.instrument_id,
+                client_order_id=order.client_order_id,
+                reason=reason,
+                ts_event=now_ns,
             )
-        elif self._cache.account_for_venue(self.venue) is None:
-            reason = (
-                f"no AccountState is cached for {self.venue}, so every Nautilus "
-                "risk cap is inert; refusing"
+            return
+        if self._cache.account_for_venue(self.venue) is None:
+            reason = submit_chain.missing_account_reason(self.venue)
+            self._log.error(f"Refusing {order.client_order_id!r}: {reason}")
+            self.generate_order_denied(
+                strategy_id=order.strategy_id,
+                instrument_id=order.instrument_id,
+                client_order_id=order.client_order_id,
+                reason=reason,
+                ts_event=now_ns,
             )
-        else:
-            reason = _STANDING_ORDER_REFUSAL
-        self._log.error(f"Refusing {order.client_order_id!r}: {reason}")
-        self.generate_order_denied(
-            strategy_id=order.strategy_id,
-            instrument_id=order.instrument_id,
-            client_order_id=order.client_order_id,
-            reason=reason,
-            ts_event=self._clock.timestamp_ns(),
+            return
+        if self._order_sender is None:
+            reason = submit_chain.SENDER_ABSENT_REASON
+            self._log.error(f"Refusing {order.client_order_id!r}: {reason}")
+            self.generate_order_denied(
+                strategy_id=order.strategy_id,
+                instrument_id=order.instrument_id,
+                client_order_id=order.client_order_id,
+                reason=reason,
+                ts_event=now_ns,
+            )
+            return
+        if write_transport.WRITE_CANONICAL_STRING_VERIFIED is not True:
+            reason = submit_chain.CANONICAL_UNVERIFIED_REASON
+            self._log.error(f"Refusing {order.client_order_id!r}: {reason}")
+            self.generate_order_denied(
+                strategy_id=order.strategy_id,
+                instrument_id=order.instrument_id,
+                client_order_id=order.client_order_id,
+                reason=reason,
+                ts_event=now_ns,
+            )
+            return
+        instrument = self._cache.instrument(order.instrument_id)
+        unmappable = submit_chain.unmappable_order_reason(order, instrument)
+        if unmappable is not None:
+            self._log.error(f"Refusing {order.client_order_id!r}: {unmappable}")
+            self.generate_order_denied(
+                strategy_id=order.strategy_id,
+                instrument_id=order.instrument_id,
+                client_order_id=order.client_order_id,
+                reason=unmappable,
+                ts_event=now_ns,
+            )
+            return
+        if submit_chain.permit_is_missing(self._permit):
+            reason = submit_chain.PERMIT_ABSENT_REASON
+            self._log.error(f"Refusing {order.client_order_id!r}: {reason}")
+            self.generate_order_denied(
+                strategy_id=order.strategy_id,
+                instrument_id=order.instrument_id,
+                client_order_id=order.client_order_id,
+                reason=reason,
+                ts_event=now_ns,
+            )
+            return
+        try:
+            assert_live_order_submission_permitted(
+                credentials=self._credentials,
+                permit=self._permit,
+                manual_order_indicator=False,
+                order_notional_usd=submit_chain.order_notional_usd(order),
+                request_fingerprint=submit_chain.order_fingerprint_bytes(order),
+                now_ns=now_ns,
+            )
+        except LiveTradingPermissionError as exc:
+            reason = f"{exc}; this client refuses to submit"
+            self._log.error(f"Refusing {order.client_order_id!r}: {reason}")
+            self.generate_order_denied(
+                strategy_id=order.strategy_id,
+                instrument_id=order.instrument_id,
+                client_order_id=order.client_order_id,
+                reason=reason,
+                ts_event=now_ns,
+            )
+            return
+        body = submit_chain.build_order_body(order, instrument)
+        encoded = submit_chain.encode_order_body(body)
+        try:
+            booking = self._ledger.authorize_order_cost(
+                price_usd=submit_chain.order_price_decimal(order),
+                quantity=submit_chain.order_quantity_decimal(order),
+                now_ns=now_ns,
+            )
+        except LiveTradingPermissionError as exc:
+            reason = f"{exc}; this client refuses to submit"
+            self._log.error(f"Refusing {order.client_order_id!r}: {reason}")
+            self.generate_order_denied(
+                strategy_id=order.strategy_id,
+                instrument_id=order.instrument_id,
+                client_order_id=order.client_order_id,
+                reason=reason,
+                ts_event=now_ns,
+            )
+            return
+        if self._intent_reconciled is not True:
+            self._ledger.release_booking(booking, now_ns=now_ns)
+            reason = submit_chain.RECONCILE_NOT_RUN_REASON
+            self._log.error(f"Refusing {order.client_order_id!r}: {reason}")
+            self.generate_order_denied(
+                strategy_id=order.strategy_id,
+                instrument_id=order.instrument_id,
+                client_order_id=order.client_order_id,
+                reason=reason,
+                ts_event=now_ns,
+            )
+            return
+        try:
+            intent = self._latch.arm(submit_chain.intent_fingerprint(order), now_ns=now_ns)
+        except Exception as exc:  # noqa: BLE001 - store/latch failures must deny, not crash the loop
+            self._ledger.release_booking(booking, now_ns=now_ns)
+            if submit_chain.is_latch_arm_refusal(exc):
+                reason = submit_chain.LATCH_ARM_REFUSED_REASON
+            else:
+                reason = submit_chain.STORE_RAISED_REASON
+            self._log.error(f"Refusing {order.client_order_id!r}: {reason}")
+            self.generate_order_denied(
+                strategy_id=order.strategy_id,
+                instrument_id=order.instrument_id,
+                client_order_id=order.client_order_id,
+                reason=reason,
+                ts_event=now_ns,
+            )
+            return
+        headers = self._write_signer.sign_headers(
+            write_transport._WRITE_METHOD,
+            write_transport.ORDERS_PATH,
         )
+        try:
+            response = await self._order_sender.post_order(
+                self._api_base_url,
+                headers=headers,
+                body=encoded,
+            )
+        except Exception as exc:
+            self._refuse(submit_chain.AMBIGUOUS_REASON)
+            self._log.error(submit_chain.AMBIGUOUS_REASON)
+            if submit_chain.is_cancelled(exc):
+                raise
+            return
+        outcome = submit_chain.classify_create_order_outcome(
+            response,
+            instrument=instrument,
+            account_id=self._issued_account_id,
+            ts_init=now_ns,
+        )
+        retire_name = outcome.retirement_name
+        if (
+            outcome.kind == submit_chain.KIND_ACCEPT_FILL
+            and outcome.fill is not None
+            and retire_name is not None
+            and outcome.filled_cost_usd is not None
+        ):
+            self._ledger.true_up_booking(
+                booking, filled_cost_usd=outcome.filled_cost_usd, now_ns=now_ns
+            )
+            self._latch.retire(
+                intent.intent_id,
+                submit_chain.retirement_member(self._retirement_reasons, retire_name),
+                now_ns=now_ns,
+            )
+            self.generate_order_submitted(
+                strategy_id=order.strategy_id,
+                instrument_id=order.instrument_id,
+                client_order_id=order.client_order_id,
+                ts_event=now_ns,
+            )
+            fill = outcome.fill
+            self.generate_order_filled(
+                strategy_id=order.strategy_id,
+                instrument_id=order.instrument_id,
+                client_order_id=order.client_order_id,
+                venue_order_id=fill.venue_order_id,
+                venue_position_id=None,
+                trade_id=fill.trade_id,
+                order_side=OrderSide.BUY,
+                order_type=OrderType.LIMIT,
+                last_qty=fill.last_qty,
+                last_px=fill.last_px,
+                quote_currency=USD,
+                commission=fill.commission,
+                liquidity_side=LiquiditySide.TAKER,
+                ts_event=fill.ts_event,
+            )
+            return
+        if (
+            outcome.kind == submit_chain.KIND_ZERO_FILL
+            and retire_name is not None
+            and outcome.venue_order_id is not None
+        ):
+            self._ledger.true_up_booking(
+                booking, filled_cost_usd=submit_chain.ZERO, now_ns=now_ns
+            )
+            self._latch.retire(
+                intent.intent_id,
+                submit_chain.retirement_member(self._retirement_reasons, retire_name),
+                now_ns=now_ns,
+            )
+            self.generate_order_submitted(
+                strategy_id=order.strategy_id,
+                instrument_id=order.instrument_id,
+                client_order_id=order.client_order_id,
+                ts_event=now_ns,
+            )
+            self.generate_order_canceled(
+                strategy_id=order.strategy_id,
+                instrument_id=order.instrument_id,
+                client_order_id=order.client_order_id,
+                venue_order_id=submit_chain.venue_order_id(outcome.venue_order_id),
+                ts_event=now_ns,
+            )
+            return
+        if outcome.kind == submit_chain.KIND_REJECT and retire_name is not None:
+            self._ledger.release_booking(booking, now_ns=now_ns)
+            self._latch.retire(
+                intent.intent_id,
+                submit_chain.retirement_member(self._retirement_reasons, retire_name),
+                now_ns=now_ns,
+            )
+            self.generate_order_rejected(
+                strategy_id=order.strategy_id,
+                instrument_id=order.instrument_id,
+                client_order_id=order.client_order_id,
+                reason=outcome.reason,
+                ts_event=now_ns,
+            )
+            return
+        self._refuse(submit_chain.AMBIGUOUS_REASON)
+        self._log.error(submit_chain.AMBIGUOUS_REASON)
+        if outcome.generate_submitted:
+            self.generate_order_submitted(
+                strategy_id=order.strategy_id,
+                instrument_id=order.instrument_id,
+                client_order_id=order.client_order_id,
+                ts_event=now_ns,
+            )
 
     async def _cancel_order(self, command: CancelOrder) -> None:
         """Refuse. There is nothing to cancel: nothing can be sent."""

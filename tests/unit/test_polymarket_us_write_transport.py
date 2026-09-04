@@ -144,6 +144,7 @@ def scan_write_transport_importers(
 _WRITE_TRANSPORT_EXPORT_NAMES = frozenset(
     {
         "CANCEL_ALL_PATH",
+        "ORDERS_PATH",
         "Ed25519WriteRequestSigner",
         "PERMITTED_WRITE_METHODS",
         "PolymarketUSWriteTransport",
@@ -217,11 +218,11 @@ def _rule_token(violation: Violation) -> tuple[str, str]:
     if violation.rule == "V1":
         return ("V1", "POST") if "POST" in detail else (violation.rule, detail)
     if violation.rule == "V2":
-        return (
-            ("V2", _CANCEL_ALL_PATH)
-            if _CANCEL_ALL_PATH in detail
-            else (violation.rule, detail)
-        )
+        if _CANCEL_ALL_PATH in detail:
+            return ("V2", _CANCEL_ALL_PATH)
+        if "/v1/orders" in detail:
+            return ("V2", "/v1/orders")
+        return (violation.rule, detail)
     if violation.rule == "V3":
         return ("V3", ".post") if ".post" in detail else (violation.rule, detail)
     return (violation.rule, detail)
@@ -412,7 +413,10 @@ def test_build_post_only_callable_has_exactly_one_caller() -> None:
 
 def test_write_transport_has_exactly_one_importer_and_it_does_not_re_export() -> None:
     importers = scan_write_transport_importers()
-    assert {v.path for v in importers} == {_FACTORIES_PATH}
+    assert {v.path for v in importers} == {
+        _FACTORIES_PATH,
+        "src/breezy/adapters/polymarket_us/exec/client.py",
+    }
 
     factories_source = (REPO_ROOT / _FACTORIES_PATH).read_text(encoding="utf-8")
     assert find_write_transport_reexports(_FACTORIES_PATH, factories_source) == []
@@ -504,17 +508,21 @@ def test_b3_the_constructed_write_transport_exposes_no_write_capable_receiver() 
 
 
 def test_b4_raw_content_is_exactly_the_three_expected_violations() -> None:
-    """Exact set ``[(V1,'POST'),(V2,'/v1/orders/open/cancel'),(V3,'.post')]``.
+    """Exact set of B4 literals inside the exempted write transport.
 
-    Non-vacuity both directions: without the exemption the real file trips
-    ``scan_write_egress``; a second file with the same literals still trips
-    with the exemption in place.
+    R-7 adds the create-order path ``/v1/orders`` beside cancel-all. The
+    exemption set (two files) is unchanged.
     """
     source = _write_transport_source()
     raw = find_write_egress_violations(_WRITE_TRANSPORT_PATH, source)
-    expected = [("V1", "POST"), ("V2", _CANCEL_ALL_PATH), ("V3", ".post")]
+    expected = [
+        ("V1", "POST"),
+        ("V2", _CANCEL_ALL_PATH),
+        ("V2", "/v1/orders"),
+        ("V3", ".post"),
+    ]
     assert sorted(_rule_token(v) for v in raw) == sorted(expected)
-    assert len(raw) == 3
+    assert len(raw) == 4
     assert _WRITE_TRANSPORT_PATH in B4_EXEMPT_PATHS
     assert scan_write_egress() == []
 

@@ -557,6 +557,7 @@ def build_trade_node_config(
     exec_client_config: PolymarketUSExecClientConfig,
     *,
     submit_intent_latch: object | None = None,
+    live_trading_permit: object | None = None,
 ) -> TradingNodeConfig:
     """Return the `TradingNodeConfig` for the **trading** process (EXEC SPINE W).
 
@@ -684,11 +685,17 @@ def build_trade_node_config(
     # ``submit_intent_latch`` is the composition root's already-opened latch
     # (object, never a factory). The exec client stores it; R-7's ``_connect``
     # is what will consume it. A second ``open_submit_intent_latch`` here
-    # would flock-conflict with the composition root and kill the process.
+    # would flock-conflict with the composition root and kill the process --
+    # so this function never opens one; it only threads through what the
+    # composition root already opened.
+    from breezy.runtime.submit_intent import RetirementReason
+
     exec_client_config = msgspec_replace(
         exec_client_config,
         state_store_opener=lambda: SqliteStateStore(state_store_path),
         submit_intent_latch=submit_intent_latch,
+        live_trading_permit=live_trading_permit,
+        retirement_reasons=RetirementReason,
     )
 
     # `msgspec.Struct` config classes are untyped to mypy (compiled Nautilus

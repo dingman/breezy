@@ -529,6 +529,8 @@ class PolymarketUSExecClientConfig(LiveExecClientConfig, frozen=True):
     submit_intent_latch: object | None = None
     instrument_wait_timeout_s: float = 30.0
     account_registration_timeout_s: float = 30.0
+    live_trading_permit: object | None = None
+    retirement_reasons: object | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.venue, PolymarketUSDataClientConfig):

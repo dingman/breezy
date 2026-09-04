@@ -644,6 +644,52 @@ def scan_barred_callers(roots: tuple[str, ...] = EGRESS_SCAN_ROOTS) -> list[Viol
     return [v for path, src in iter_python_sources(roots) for v in find_barred_callers(path, src)]
 
 
+def _enclosing_function(tree: ast.AST, lineno: int) -> str:
+    owner = "<module>"
+    for node in ast.walk(tree):
+        if isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef) and hasattr(node, "lineno"):
+            end = getattr(node, "end_lineno", node.lineno) or node.lineno
+            if node.lineno <= lineno <= end:
+                owner = node.name
+    return owner
+
+
+def barred_caller_sites(
+    rule: str, roots: tuple[str, ...] = EGRESS_SCAN_ROOTS
+) -> frozenset[tuple[str, str]]:
+    """Exact-set of ``(path, enclosing_function)`` for one BARRED_CALLEES rule."""
+    found: set[tuple[str, str]] = set()
+    for path, source in iter_python_sources(roots):
+        tree = ast.parse(source, filename=path)
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Call):
+                continue
+            func = node.func
+            name = func.attr if isinstance(func, ast.Attribute) else getattr(func, "id", "")
+            if BARRED_CALLEES.get(name) != rule:
+                continue
+            found.add((path, _enclosing_function(tree, node.lineno)))
+    return frozenset(found)
+
+
+def named_call_sites(
+    callee: str, roots: tuple[str, ...] = REPO_WIDE_SCAN_ROOTS
+) -> frozenset[tuple[str, str]]:
+    """Repo-wide ``(path, enclosing_function)`` for a Call named ``callee``."""
+    found: set[tuple[str, str]] = set()
+    for path, source in iter_python_sources(roots):
+        tree = ast.parse(source, filename=path)
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Call):
+                continue
+            func = node.func
+            name = func.attr if isinstance(func, ast.Attribute) else getattr(func, "id", "")
+            if name != callee:
+                continue
+            found.add((path, _enclosing_function(tree, node.lineno)))
+    return frozenset(found)
+
+
 # --------------------------------------------------------------------------
 # S16 -- ``.get_value()`` inside an ``assert``
 # --------------------------------------------------------------------------
@@ -1434,14 +1480,10 @@ _PLANTED_PERMIT_MINTER = (
 
 
 def test_safety_chokepoint_has_no_caller_in_this_slice() -> None:
-    """B6: the shipped chokepoint stays uncalled by src/ and scripts/.
-
-    A caller would mean an order path exists. Its own definition site and
-    its tests are naturally excluded because only ``src`` and ``scripts``
-    are scanned, and the definition is a ``FunctionDef``, not a ``Call``.
-    """
-    callers = [v for v in scan_barred_callers() if v.rule == "B6"]
-    assert callers == [], "B6 violations:\n" + "\n".join(str(c) for c in callers)
+    """B6: exactly one caller, ``exec/client.py::_submit_order``."""
+    assert barred_caller_sites("B6") == {
+        ("src/breezy/adapters/polymarket_us/exec/client.py", "_submit_order")
+    }
 
 
 def test_b6_detects_a_call_to_the_chokepoint() -> None:
@@ -1451,15 +1493,10 @@ def test_b6_detects_a_call_to_the_chokepoint() -> None:
 
 
 def test_permit_issuer_has_no_caller_in_this_slice() -> None:
-    """B7 (defect D-2): nothing in src/ or scripts/ may mint a permit.
-
-    ``issue_live_trading_permit`` reads the operator gate, both ceilings and
-    the operator identity from ``os.environ`` and takes no parameter but a
-    clock, so any caller anywhere in the tree grants itself authority. The
-    pin is ``== 0``, repo-wide across both scanned roots, with no allowlist.
-    """
-    callers = [v for v in scan_barred_callers() if v.rule == "B7"]
-    assert callers == [], "B7 violations:\n" + "\n".join(str(c) for c in callers)
+    """B7: exactly one caller, ``trade_cli.py::main``."""
+    assert barred_caller_sites("B7") == {
+        ("src/breezy/runtime/trade_cli.py", "main")
+    }
 
 
 def test_b7_detects_a_module_minting_a_permit_from_the_operator_environment() -> None:
@@ -1524,6 +1561,190 @@ def test_d3_the_post_only_callable_has_exactly_one_caller() -> None:
     ]
     assert src_scripts == [("src/breezy/adapters/polymarket_us/write_transport.py", "D3")]
     assert tests_hits == []
+
+
+def test_d3_post_order_does_not_reference_build_post_only_callable() -> None:
+    """R-7: post_order reuses self._post; it never calls _build_post_only_callable."""
+    path = REPO_ROOT / "src/breezy/adapters/polymarket_us/write_transport.py"
+    source = path.read_text(encoding="utf-8")
+    tree = ast.parse(source)
+    for node in ast.walk(tree):
+        if isinstance(node, ast.AsyncFunctionDef) and node.name == "post_order":
+            for inner in ast.walk(node):
+                dumped = ast.dump(inner)
+                assert "_build_post_only_callable" not in dumped
+            break
+    else:
+        raise AssertionError("post_order is missing")
+
+
+def _b8_violations(path: str, source: str) -> list[Violation]:
+    tree = ast.parse(source, filename=path)
+    found: list[Violation] = []
+    for dotted in _imported_module_strings(tree):
+        if dotted == "nautilus_trader.live.retry" or dotted.startswith(
+            "nautilus_trader.live.retry."
+        ):
+            found.append(Violation(path, 0, "B8", f"imports {dotted}"))
+        if dotted.startswith("nautilus_trader.adapters.polymarket"):
+            found.append(Violation(path, 0, "B8", f"imports {dotted}"))
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Name) and node.id in {"RetryManager", "RetryManagerPool"}:
+            found.append(Violation(path, node.lineno, "B8", f"names {node.id}"))
+        if isinstance(node, ast.Attribute) and node.attr in {"RetryManager", "RetryManagerPool"}:
+            found.append(Violation(path, node.lineno, "B8", f"names {node.attr}"))
+        if isinstance(node, ast.Call):
+            func = node.func
+            name = func.attr if isinstance(func, ast.Attribute) else getattr(func, "id", "")
+            if name in {"__import__", "import_module"} and node.args:
+                arg = node.args[0]
+                if (
+                    isinstance(arg, ast.Constant)
+                    and isinstance(arg.value, str)
+                    and "live.retry" in arg.value
+                ):
+                    found.append(Violation(path, node.lineno, "B8", f"{name}({arg.value!r})"))
+            if (
+                isinstance(func, ast.Call)
+                and isinstance(func.func, ast.Name)
+                and func.func.id == "getattr"
+            ):
+                found.append(Violation(path, node.lineno, "B8", "getattr chain"))
+            if name == "getattr" and node.args:
+                first = node.args[0]
+                second = node.args[1] if len(node.args) > 1 else None
+                if (
+                    isinstance(second, ast.Constant)
+                    and second.value == "live"
+                    and ast.dump(first).find("nautilus_trader") != -1
+                ):
+                    found.append(
+                        Violation(path, node.lineno, "B8", "getattr(nautilus_trader, 'live')")
+                    )
+        if isinstance(node, ast.keyword) and node.arg is not None and node.arg.startswith("retry_"):
+            found.append(Violation(path, node.lineno, "B8", f"retry_* kwarg {node.arg}"))
+    return found
+
+
+def test_b8_no_retry_manager_or_com_adapter() -> None:
+    """B8: no live.retry / RetryManager / .com adapter / retry_* on the submit path."""
+    submit_paths = (
+        "src/breezy/adapters/polymarket_us/exec/",
+        "src/breezy/adapters/polymarket_us/write_transport.py",
+        "src/breezy/adapters/polymarket_us/factories.py",
+    )
+    violations = [
+        v
+        for path, src in iter_python_sources(EGRESS_SCAN_ROOTS)
+        if path.startswith(submit_paths)
+        for v in _b8_violations(path, src)
+    ]
+    assert violations == [], "B8 violations:\n" + "\n".join(str(v) for v in violations)
+
+
+def test_b9_post_order_and_clear_submit_intent_have_exactly_one_caller_each() -> None:
+    """B9: own one-caller pin, never BARRED_CALLEES."""
+    assert named_call_sites("post_order") == {
+        ("src/breezy/adapters/polymarket_us/exec/client.py", "_submit_order")
+    }
+    assert named_call_sites("clear_submit_intent") == {
+        ("src/breezy/runtime/clear_submit_intent_cli.py", "main")
+    }
+
+
+def test_b6_b7_b8_b9_d3_non_vacuity() -> None:
+    """Planted second callers and banned forms each fire."""
+    extra_b6 = find_barred_callers(
+        "src/breezy/rogue.py",
+        "def extra():\n    assert_live_order_submission_permitted()\n",
+    )
+    assert [v.rule for v in extra_b6] == ["B6"]
+    extra_b7 = find_barred_callers(
+        "src/breezy/rogue.py",
+        "def extra():\n    issue_live_trading_permit(clock=None)\n",
+    )
+    assert [v.rule for v in extra_b7] == ["B7"]
+    b8_retry = _b8_violations(
+        "src/breezy/rogue.py",
+        "from nautilus_trader.live.retry import RetryManager\n",
+    )
+    assert [v.rule for v in b8_retry] == ["B8"]
+    b8_import = _b8_violations(
+        "src/breezy/rogue.py",
+        "__import__('nautilus_trader.live.retry')\n",
+    )
+    assert any(v.rule == "B8" for v in b8_import)
+    b8_getattr = _b8_violations(
+        "src/breezy/rogue.py",
+        "import nautilus_trader\n\ngetattr(nautilus_trader, 'live')\n",
+    )
+    assert any(v.rule == "B8" for v in b8_getattr)
+    b8_com = _b8_violations(
+        "src/breezy/rogue.py",
+        "from nautilus_trader.adapters.polymarket import execution\n",
+    )
+    assert any(v.rule == "B8" for v in b8_com)
+    planted_post = (
+        "def extra():\n    post_order()\n"
+    )
+    tree = ast.parse(planted_post)
+    calls = [
+        n
+        for n in ast.walk(tree)
+        if isinstance(n, ast.Call)
+        and (
+            (isinstance(n.func, ast.Name) and n.func.id == "post_order")
+            or (isinstance(n.func, ast.Attribute) and n.func.attr == "post_order")
+        )
+    ]
+    assert calls
+    planted_clear = "def extra():\n    clear_submit_intent()\n"
+    tree2 = ast.parse(planted_clear)
+    clear_calls = [
+        n
+        for n in ast.walk(tree2)
+        if isinstance(n, ast.Call)
+        and isinstance(n.func, ast.Name)
+        and n.func.id == "clear_submit_intent"
+    ]
+    assert clear_calls
+    second_d3 = find_barred_callers(
+        "src/breezy/rogue.py",
+        "def extra(client):\n    return _build_post_only_callable(client)\n",
+    )
+    assert [v.rule for v in second_d3] == ["D3"]
+
+
+def _modules_importing(token: str, roots: tuple[str, ...] = EGRESS_SCAN_ROOTS) -> frozenset[str]:
+    found: set[str] = set()
+    for path, source in iter_python_sources(roots):
+        if token not in source:
+            continue
+        tree = ast.parse(source, filename=path)
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Import):
+                for alias in node.names:
+                    if token in alias.name.split("."):
+                        found.add(path)
+            elif (
+                isinstance(node, ast.ImportFrom)
+                and node.module
+                and token in node.module.split(".")
+            ):
+                found.add(path)
+    return frozenset(found)
+
+
+def test_c10_submit_intent_and_operator_controls_reference_pins() -> None:
+    """Exact-set production importers after R-7 converted the zero-ref pins."""
+    assert _modules_importing("submit_intent") == {
+        "src/breezy/runtime/node_config.py",
+        "src/breezy/runtime/clear_submit_intent_cli.py",
+        "src/breezy/strategy/current_rung_hold/trial_day_latch.py",
+    }
+    assert _modules_importing("operator_controls") == {
+        "src/breezy/adapters/polymarket_us/factories.py",
+    }
 
 
 # ==========================================================================

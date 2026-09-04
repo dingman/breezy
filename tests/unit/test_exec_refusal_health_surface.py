@@ -73,9 +73,11 @@ _read_fill_index#2                  EXCEPTIONAL   the durable fill index is not 
 calculate_commission#1              ROUTINE       a MAKER fill; Breezy is taker-only, so not ours
 calculate_commission#2              EXCEPTIONAL   the fee schedule is UNKNOWN for this instrument
 calculate_commission#3              EXCEPTIONAL   a reconciliation fill could not be priced
+_submit_order#1                     EXCEPTIONAL   create-order POST raised; outcome is AMBIGUOUS
+_submit_order#2                     EXCEPTIONAL   create-order outcome is AMBIGUOUS after a response
 ==================================  ============  ================================================
 
-Seven ROUTINE, eighteen EXCEPTIONAL. Every one of the seven is reachable on
+Seven ROUTINE, twenty EXCEPTIONAL. Every one of the seven is reachable on
 an account in perfectly good order, which is the whole argument for INDICATOR
 over kill switch -- and one of them, ``_map_position#3``, is the non-long
 position refusal Revision 0's hand count missed entirely.
@@ -160,6 +162,8 @@ REFUSAL_PRODUCERS: Final[frozenset[str]] = frozenset(
         "calculate_commission#1",
         "calculate_commission#2",
         "calculate_commission#3",
+        "_submit_order#1",
+        "_submit_order#2",
     }
 )
 
@@ -237,7 +241,7 @@ def test_the_refusal_producer_set_is_exactly_pinned() -> None:
         "added": sorted(scanned - REFUSAL_PRODUCERS),
         "removed": sorted(REFUSAL_PRODUCERS - scanned),
     }
-    assert len(scanned) == 25
+    assert len(scanned) == 27
 
 
 def test_planting_a_twenty_sixth_refusal_breaks_the_pin() -> None:
@@ -252,7 +256,7 @@ def test_planting_a_twenty_sixth_refusal_breaks_the_pin() -> None:
     assert planted != source, "the plant site moved; update this test's anchor"
     scanned = _refusal_producers(planted)
     assert scanned != set(REFUSAL_PRODUCERS)
-    assert len(scanned) == 26
+    assert len(scanned) == 28
 
 
 def test_removing_a_refusal_breaks_the_pin() -> None:
@@ -285,7 +289,7 @@ def test_every_pinned_refusal_producer_is_triaged_here() -> None:
         "stale_rows": sorted(set(triaged) - REFUSAL_PRODUCERS),
     }
     counts = Counter(triaged.values())
-    assert counts == {"EXCEPTIONAL": 18, "ROUTINE": 7}, counts
+    assert counts == {"EXCEPTIONAL": 20, "ROUTINE": 7}, counts
 
 
 # ---------------------------------------------------------------------------

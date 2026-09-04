@@ -70,7 +70,7 @@ from __future__ import annotations
 import logging
 import sys
 from collections.abc import Callable, Mapping, Sequence
-from typing import Any, Protocol, TextIO
+from typing import TYPE_CHECKING, Any, Protocol, TextIO
 
 from nautilus_trader.common.actor import Actor
 from nautilus_trader.config import TradingNodeConfig
@@ -106,6 +106,10 @@ from breezy.runtime.settings import (
     load_trade_settings,
     proxy_env_check_enabled,
 )
+
+if TYPE_CHECKING:  # pragma: no cover - typing only
+    from breezy.adapters.polymarket_us.config import PolymarketUSExecClientConfig
+    from breezy.runtime.settings import BreezyTradeSettings
 
 logger = logging.getLogger(__name__)
 
@@ -416,6 +420,9 @@ def run(
     strategies: Sequence[Strategy] = (),
     submit_intent_latch: object | None = None,
     after_build: Callable[[Node], None] | None = None,
+    live_trading_permit: object | None = None,
+    settings: BreezyTradeSettings | None = None,
+    exec_client_config: PolymarketUSExecClientConfig | None = None,
 ) -> int:
     """Load settings, build the node config, run the node, return an exit code.
 
@@ -428,6 +435,14 @@ def run(
     already owns the section 7 environment contract; they are deliberately not
     re-read here, because a second reader is a second competing policy for the
     same variables.
+
+    ``settings`` and ``exec_client_config`` are optional passthroughs.
+    ``breezy.app.trade.run`` already loads both -- the settings to decide
+    whether ``current_rung_hold`` is on, the exec config to open the
+    submit-intent latch on the same store path -- before it ever reaches this
+    function. Re-reading either here would be a second, competing read of the
+    same environment variables at the same instant; when the caller already
+    has a value, it is passed straight through and neither loader runs again.
     """
     out = sys.stderr if stderr is None else stderr
     install_logging_bridge()
@@ -437,14 +452,17 @@ def run(
     clear_fatal_exec_fault()
     try:
         try:
-            settings = load_trade_settings(env)
+            if settings is None:
+                settings = load_trade_settings(env)
             data_client_config = config_from_env(env)
-            exec_client_config = exec_config_from_env(env)
+            if exec_client_config is None:
+                exec_client_config = exec_config_from_env(env)
             config = build_trade_node_config(
                 settings,
                 data_client_config,
                 exec_client_config,
                 submit_intent_latch=submit_intent_latch,
+                live_trading_permit=live_trading_permit,
             )
         except _CONFIG_ERRORS as exc:
             _report(out, "configuration error", exc, expected=True)
@@ -466,5 +484,13 @@ def run(
 
 
 def main() -> int:
-    """Console-script entrypoint. Returns the process exit code."""
+    """Console-script entrypoint. Returns the process exit code.
+
+    B7's ONE caller is ``breezy.app.trade`` -- the composition root the
+    ``breezy-trade`` console script actually enters
+    (``pyproject.toml [project.scripts]``). ``issue_live_trading_permit`` is
+    never called here: this module is a library entrypoint other callers
+    (``breezy.app.trade.run``) also reach directly, and a second issuer at
+    this call site would be a second, competing mint of the same permit.
+    """
     return run()

@@ -86,6 +86,7 @@ from breezy.adapters.polymarket_us.exec.endpoints import (
 )
 from breezy.adapters.polymarket_us.exec.refusals import PrivateReadRefused
 from breezy.adapters.polymarket_us.http import PolymarketUSHttpClient
+from breezy.adapters.polymarket_us.operator_controls import DailySpendLedger
 from breezy.adapters.polymarket_us.parsing import parse_quote_tick
 from breezy.adapters.polymarket_us.provider import PolymarketUSInstrumentProvider
 from breezy.adapters.polymarket_us.signing import Ed25519RequestSigner, SigningVariant
@@ -97,7 +98,11 @@ from breezy.adapters.polymarket_us.transport import (
     build_shared_http_client,
 )
 from breezy.adapters.polymarket_us.websocket import PolymarketUSMarketsWebSocketPool
-from breezy.adapters.polymarket_us.write_transport import PolymarketUSWriteTransport
+from breezy.adapters.polymarket_us.write_transport import (
+    WRITE_CANONICAL_STRING_VERIFIED,
+    Ed25519WriteRequestSigner,
+    PolymarketUSWriteTransport,
+)
 from breezy.runtime.settings import SettingsError, proxy_env_check_enabled
 
 __all__ = [
@@ -714,6 +719,10 @@ class PolymarketUSLiveExecClientFactory(LiveExecClientFactory):
         )
 
         stripped_api_base_url = venue_config.api_base_url.rstrip("/")
+        credentials = load_polymarket_us_credentials(venue_config.secrets)
+        write_signer = Ed25519WriteRequestSigner(credentials, clock=clock)
+        write = _shared_polymarket_us_write_transport(venue_config)
+        order_sender = write if WRITE_CANONICAL_STRING_VERIFIED is True else None
 
         async def private_read(path: str) -> Mapping[str, Any]:
             """The injected ``PrivateRead``: one signed GET, decoded Decimal-safe.
@@ -762,15 +771,13 @@ class PolymarketUSLiveExecClientFactory(LiveExecClientFactory):
             account_number=account_number,
             instrument_wait_timeout_s=config.instrument_wait_timeout_s,
             account_registration_timeout_s=config.account_registration_timeout_s,
+            order_sender=order_sender,
+            write_signer=write_signer,
+            live_trading_permit=config.live_trading_permit,
+            spend_ledger=DailySpendLedger(),
+            submit_intent_latch=config.submit_intent_latch,
+            credentials=credentials,
+            api_base_url=stripped_api_base_url,
+            retirement_reasons=config.retirement_reasons,
         )
-        # Composition-root latch, stored for R-7's ``_connect``. This increment
-        # does not consume it. The exec client never opens its own latch.
-        # ``LiveExecutionClient`` is Cython: extra attrs may be refused, in
-        # which case the injected config field is the remaining store.
-        try:
-            object.__setattr__(
-                client, "_submit_intent_latch", config.submit_intent_latch
-            )
-        except (AttributeError, TypeError):
-            pass
         return client

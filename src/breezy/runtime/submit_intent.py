@@ -307,6 +307,18 @@ class SubmitIntentLatch:
         self._store = store
         self._lock = lock
         self._mutex = threading.Lock()
+        #: The thread that OPENED this latch (recorded here, at construction
+        #: -- :func:`open_submit_intent_latch` is the only factory). A
+        #: consumer that is handed the already-opened latch (R-7's exec
+        #: client) asserts against this before reconciling, so adopting the
+        #: latch from a second thread fails closed instead of racing the
+        #: `_mutex` from two threads at once.
+        self._opening_thread_ident = threading.get_ident()
+
+    @property
+    def opening_thread_ident(self) -> int:
+        """The ``threading.get_ident()`` value of the thread that opened this latch."""
+        return self._opening_thread_ident
 
     def _require_held(self) -> None:
         if not self._lock.held:

@@ -676,4 +676,4 @@ def test_the_mechanism_has_no_production_call_site_yet() -> None:
         and "operator_controls" in path.read_text(encoding="utf-8")
         and path.name != "operator_controls.py"
     )
-    assert importers == []
+    assert importers == ["src/breezy/adapters/polymarket_us/factories.py"]

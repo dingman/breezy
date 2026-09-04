@@ -60,6 +60,7 @@ def run(
     env: Mapping[str, str] | None = None,
     node_factory: NodeFactory = TradingNode,
     stderr: TextIO | None = None,
+    live_trading_permit: object | None = None,
 ) -> int:
     """Load settings, compose strategies when the flag is on, run the node."""
     out = sys.stderr if stderr is None else stderr
@@ -70,7 +71,13 @@ def run(
         return EXIT_CONFIG_ERROR
 
     if not settings.current_rung_hold:
-        return trade_cli.run(env=env, node_factory=node_factory, stderr=out)
+        return trade_cli.run(
+            env=env,
+            node_factory=node_factory,
+            stderr=out,
+            live_trading_permit=live_trading_permit,
+            settings=settings,
+        )
 
     try:
         exec_client_config = exec_config_from_env(env)
@@ -109,6 +116,9 @@ def run(
                 after_build=lambda node: install_current_rung_hold_refusal_watch(
                     node, strategies
                 ),
+                live_trading_permit=live_trading_permit,
+                settings=settings,
+                exec_client_config=exec_client_config,
             )
     except (SettingsError, OSError, SubmitIntentLockHeld, SubmitIntentLockError) as exc:
         _report(out, "configuration error", exc, expected=True)
@@ -116,5 +126,25 @@ def run(
 
 
 def main() -> int:
-    """Console-script entrypoint. Returns the process exit code."""
-    return run()
+    """Console-script entrypoint. Returns the process exit code.
+
+    B7's ONE caller: this is the composition root the ``breezy-trade``
+    console script actually enters (``pyproject.toml [project.scripts]``),
+    so the live-trading permit is minted here, on the main thread, exactly
+    once, and threaded through to ``trade_cli.run`` -- never re-minted, and
+    never issued from ``breezy.runtime.trade_cli.main`` (a library
+    entrypoint other callers also reach directly).
+    """
+    from nautilus_trader.common.component import LiveClock
+
+    from breezy.adapters.polymarket_us.safety import (
+        LiveTradingPermissionError,
+        issue_live_trading_permit,
+    )
+
+    permit = None
+    try:
+        permit = issue_live_trading_permit(clock=LiveClock())
+    except LiveTradingPermissionError as exc:
+        trade_cli.logger.info("live-trading permit not issued: %s", exc)
+    return run(live_trading_permit=permit)

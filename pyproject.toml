@@ -257,6 +257,10 @@ breezy-trade = "breezy.app.trade:main"
 # venue credential, opens no socket, and never signals the recorder. See
 # `breezy.runtime.quote_tape_ingest_cli` for the live-write-avoidance rule.
 breezy-quote-tape-ingest = "breezy.runtime.quote_tape_ingest_cli:main"
+# A SIXTH process: the operator clear tool for an OPEN submit-intent latch.
+# Never a flag on breezy-trade, never on a timer, never at startup. See
+# `breezy.runtime.clear_submit_intent_cli`.
+breezy-clear-submit-intent = "breezy.runtime.clear_submit_intent_cli:main"
 
 [build-system]
 requires = ["uv_build>=0.12.5,<0.13.0"]

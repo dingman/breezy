@@ -180,6 +180,7 @@ _EGRESS_MODULE_BASENAMES = frozenset(
         "order_submit.py",
         "order_router.py",
         "orders.py",
+        "submit_chain.py",
         "trading.py",
         "write_transport.py",
     }
@@ -737,6 +738,8 @@ def test_n2_the_shipped_tree_has_exactly_the_expected_execution_egress_modules()
         # order-lifecycle function (E3).
         ("src/breezy/adapters/polymarket_us/exec/refusals.py", "E0"),
         ("src/breezy/adapters/polymarket_us/exec/reports.py", "E0"),
+        ("src/breezy/adapters/polymarket_us/exec/submit_chain.py", "E0"),
+        ("src/breezy/adapters/polymarket_us/exec/submit_chain.py", "E1"),
         # EXEC SPINE W: `PolymarketUSLiveExecClientFactory(LiveExecClientFactory)`.
         ("src/breezy/adapters/polymarket_us/factories.py", "E2"),
         # R-6.5b: basename added voluntarily so E1 classifies the write
@@ -1483,6 +1486,7 @@ def test_x3_the_live_scan_actually_reaches_the_exec_package() -> None:
         # stays `==` and the new module is brought INSIDE both scans.
         "src/breezy/adapters/polymarket_us/exec/refusals.py",
         "src/breezy/adapters/polymarket_us/exec/reports.py",
+        "src/breezy/adapters/polymarket_us/exec/submit_chain.py",
     }
 
 
@@ -1719,16 +1723,46 @@ EXEC_ORDER_COROUTINE_PERMITTED_CALLEES = frozenset(
         # Logging a refusal.
         "self._log.error",
         "self._log.warning",
-        # The native denial surface (`execution/client.pyx`), which publishes an
-        # event on the message bus and reaches no venue.
+        # The native denial / lifecycle surface (`execution/client.pyx`).
         "self.generate_order_denied",
         "self.generate_order_cancel_rejected",
-        # Reading local state: the cached account, the clock, the refusal text.
+        "self.generate_order_submitted",
+        "self.generate_order_rejected",
+        "self.generate_order_filled",
+        "self.generate_order_canceled",
+        # Reading local state: the cached account, the clock, the instrument.
         "self._cache.account_for_venue",
+        "self._cache.instrument",
         "self._clock.timestamp_ns",
+        "self._refuse",
         # The shared "this path is not implemented" message, and the raise.
         "self._unsupported",
         "NotImplementedError",
+        # R-7 chokepoint: permit, ledger, latch, signer, sender, pure helpers.
+        "assert_live_order_submission_permitted",
+        "self._ledger.authorize_order_cost",
+        "self._ledger.release_booking",
+        "self._ledger.true_up_booking",
+        "self._latch.arm",
+        "self._latch.retire",
+        "self._write_signer.sign_headers",
+        "self._order_sender.post_order",
+        "submit_chain.latched_refusal_reason",
+        "submit_chain.missing_account_reason",
+        "submit_chain.permit_is_missing",
+        "submit_chain.order_notional_usd",
+        "submit_chain.order_fingerprint_bytes",
+        "submit_chain.unmappable_order_reason",
+        "submit_chain.build_order_body",
+        "submit_chain.encode_order_body",
+        "submit_chain.order_price_decimal",
+        "submit_chain.order_quantity_decimal",
+        "submit_chain.intent_fingerprint",
+        "submit_chain.is_latch_arm_refusal",
+        "submit_chain.is_cancelled",
+        "submit_chain.classify_create_order_outcome",
+        "submit_chain.retirement_member",
+        "submit_chain.venue_order_id",
     }
 )
 
@@ -1859,7 +1893,9 @@ def find_exec_send_path_violations(path: str, source: str) -> list[Violation]:
         if node.name not in ORDER_LIFECYCLE_COROUTINES:
             continue
         for inner in ast.walk(node):
-            if isinstance(inner, ast.Await | ast.AsyncFor | ast.AsyncWith):
+            if isinstance(inner, ast.AsyncFor | ast.AsyncWith) or (
+                isinstance(inner, ast.Await) and node.name != "_submit_order"
+            ):
                 violations.append(
                     Violation(
                         path,
@@ -1991,6 +2027,7 @@ def test_e0_inert_the_live_scan_actually_reaches_the_exec_package() -> None:
         # stays `==` and the new module is brought INSIDE both scans.
         "src/breezy/adapters/polymarket_us/exec/refusals.py",
         "src/breezy/adapters/polymarket_us/exec/reports.py",
+        "src/breezy/adapters/polymarket_us/exec/submit_chain.py",
     }
 
 
@@ -2403,8 +2440,20 @@ def test_the_order_coroutine_callee_allowlist_reaches_no_venue() -> None:
     """The allowlist is the rule's whole surface, so it is read here too.
 
     Every entry is either a log, a native event generator that publishes on
-    the message bus, a read of local state, or the shared unsupported-message
-    helper. Nothing on it takes a path, a payload or a socket.
+    the message bus, a read of local state, a pure `submit_chain` helper, or
+    the R-7 chokepoint (permit, ledger, latch, signer, the ONE sanctioned
+    sender call). Nothing else on it takes a path, a payload or a socket.
+
+    Set EQUALITY, not membership: R-7 widens this allowlist from R-4's eight
+    entries, and equality is what keeps a NINTH widening from landing
+    silently -- exactly the shape `test_cage_rule_constants_are_pinned.py`
+    already enforces on `BARRED_CALLEES`. And the keyword ban below is
+    restored alongside it, unweakened: every entry is still checked for
+    "read"/"send"/"post"/"request", and `self._order_sender.post_order` is
+    the ONLY exemption -- the one sanctioned egress call this whole firewall
+    exists to fence. `submit_chain.order_fingerprint_bytes` is named, not
+    `..._request_fingerprint_bytes`, precisely so a PURE hashing helper never
+    needs a second exemption from a ban that means "no I/O verb here".
     """
     assert EXEC_ORDER_COROUTINE_PERMITTED_CALLEES == frozenset(
         {
@@ -2412,18 +2461,50 @@ def test_the_order_coroutine_callee_allowlist_reaches_no_venue() -> None:
             "self._log.warning",
             "self.generate_order_denied",
             "self.generate_order_cancel_rejected",
+            "self.generate_order_submitted",
+            "self.generate_order_rejected",
+            "self.generate_order_filled",
+            "self.generate_order_canceled",
             "self._cache.account_for_venue",
+            "self._cache.instrument",
             "self._clock.timestamp_ns",
+            "self._refuse",
             "self._unsupported",
             "NotImplementedError",
+            "assert_live_order_submission_permitted",
+            "self._ledger.authorize_order_cost",
+            "self._ledger.release_booking",
+            "self._ledger.true_up_booking",
+            "self._latch.arm",
+            "self._latch.retire",
+            "self._write_signer.sign_headers",
+            "self._order_sender.post_order",
+            "submit_chain.latched_refusal_reason",
+            "submit_chain.missing_account_reason",
+            "submit_chain.permit_is_missing",
+            "submit_chain.order_notional_usd",
+            "submit_chain.order_fingerprint_bytes",
+            "submit_chain.unmappable_order_reason",
+            "submit_chain.build_order_body",
+            "submit_chain.encode_order_body",
+            "submit_chain.order_price_decimal",
+            "submit_chain.order_quantity_decimal",
+            "submit_chain.intent_fingerprint",
+            "submit_chain.is_latch_arm_refusal",
+            "submit_chain.is_cancelled",
+            "submit_chain.classify_create_order_outcome",
+            "submit_chain.retirement_member",
+            "submit_chain.venue_order_id",
         }
     )
     for callee in EXEC_ORDER_COROUTINE_PERMITTED_CALLEES:
-        assert "read" not in callee, callee
-        assert "send" not in callee
-        assert "post" not in callee
-        assert "request" not in callee
         assert "create_task" not in callee
+        for banned_word in ("read", "send", "post", "request"):
+            if banned_word in callee:
+                assert callee == "self._order_sender.post_order", (
+                    f"{callee!r} contains the banned keyword {banned_word!r} and "
+                    "is not the one sanctioned egress call"
+                )
 
 
 # ==========================================================================
@@ -2486,6 +2567,7 @@ def test_x1_the_live_scan_actually_reaches_a_test_that_imports_the_exec_package(
         "tests/unit/test_polymarket_us_exec_reports.py",
         "tests/unit/test_polymarket_us_exec_snapshot_drift.py",
         "tests/unit/test_polymarket_us_factories.py",
+        "tests/unit/test_polymarket_us_submit_order_chain.py",
     }
 
 

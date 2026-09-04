@@ -53,6 +53,7 @@ EXEC_MODULES: Final[tuple[str, ...]] = (
     # directory silently exempts whatever was added last.
     "refusals.py",
     "reports.py",
+    "submit_chain.py",
 )
 
 TS_INIT: Final[int] = 1_787_617_213_000_000_000

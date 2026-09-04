@@ -36,6 +36,7 @@ from breezy.adapters.polymarket_us.transport import QUOTA_KEY_PORTFOLIO, VenueRe
 
 __all__ = [
     "CANCEL_ALL_PATH",
+    "ORDERS_PATH",
     "PERMITTED_WRITE_METHODS",
     "WRITE_CANONICAL_STRING_VERIFIED",
     "Ed25519WriteRequestSigner",
@@ -50,6 +51,7 @@ PERMITTED_WRITE_METHODS: frozenset[str] = frozenset({"POST"})
 _WRITE_METHOD: str = next(iter(PERMITTED_WRITE_METHODS))
 
 CANCEL_ALL_PATH: Final[str] = "/v1/orders/open/cancel"
+ORDERS_PATH: Final[str] = "/v1/orders"
 
 
 def _build_post_only_callable(client: Any) -> Callable[..., Awaitable[Any]]:
@@ -159,6 +161,25 @@ class PolymarketUSWriteTransport:
         try:
             response = await self._post(
                 url, headers=dict(headers), keys=[QUOTA_KEY_PORTFOLIO]
+            )
+        except (nautilus_pyo3.HttpError, nautilus_pyo3.HttpTimeoutError):
+            raise VenueTransportError(
+                f"{_WRITE_METHOD} {redact_url(url)} failed at the transport layer"
+            ) from None
+        return VenueResponse(
+            status=int(response.status),
+            headers=dict(response.headers),
+            body=bytes(response.body),
+        )
+
+    async def post_order(
+        self, base_url: str, *, headers: Mapping[str, str], body: bytes
+    ) -> VenueResponse:
+        """Dispatch the one pinned create-order write. Reuses ``self._post``."""
+        url = f"{base_url.rstrip('/')}{ORDERS_PATH}"
+        try:
+            response = await self._post(
+                url, headers=dict(headers), body=body, keys=[QUOTA_KEY_PORTFOLIO]
             )
         except (nautilus_pyo3.HttpError, nautilus_pyo3.HttpTimeoutError):
             raise VenueTransportError(

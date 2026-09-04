@@ -601,7 +601,7 @@ def test_refuse_producer_count_stays_pinned_at_twenty_five() -> None:
         and isinstance(node.func.value, ast.Name)
         and node.func.value.id == "self"
     )
-    assert count == 25
+    assert count == 27
 
 
 @pytest.mark.asyncio
