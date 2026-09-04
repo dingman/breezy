@@ -17,6 +17,13 @@ dependencies = [
     # indistinguishable from a guard that passes. Exact pin because this is
     # the cryptographic primitive under a safety barrier.
     "pynacl==1.6.2",
+    # CORE, promoted from the `backfill` extra (SCORER_TALLY_BCA_BRIEF_
+    # 2026-09-04.md, item 10). `settlement/roi_bound.py` (6e) is the R-9
+    # stop-gate BCa bootstrap consumer and imports `scipy.stats.bootstrap`
+    # at module scope; per L-1, reuse over hand-rolling a stop-gate
+    # quantity means it must actually be importable on a default checkout,
+    # not only when the `backfill` extra happens to be installed.
+    "scipy==1.18.1",
 ]
 
 [dependency-groups]
@@ -181,7 +188,7 @@ files = [
 # is typed as `pd.Timedelta`, so the streaming rotation config cannot be
 # expressed without touching it. Untyped at the boundary, strict within.
 [[tool.mypy.overrides]]
-module = ["pyarrow.*", "pandas.*", "nautilus_trader.*"]
+module = ["pyarrow.*", "pandas.*", "nautilus_trader.*", "scipy.*"]
 ignore_missing_imports = true
 follow_untyped_imports = false
 

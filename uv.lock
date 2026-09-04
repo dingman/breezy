@@ -130,6 +130,7 @@ dependencies = [
     { name = "httpx" },
     { name = "nautilus-trader" },
     { name = "pynacl" },
+    { name = "scipy" },
 ]
 
 [package.optional-dependencies]
@@ -160,6 +161,7 @@ requires-dist = [
     { name = "polymarket-us", marker = "extra == 'polymarket-us'", specifier = "==0.1.2" },
     { name = "pyiem", marker = "extra == 'backfill'", specifier = "==1.27.0" },
     { name = "pynacl", specifier = "==1.6.2" },
+    { name = "scipy", specifier = "==1.18.1" },
 ]
 provides-extras = ["backfill", "polymarket-us"]
 

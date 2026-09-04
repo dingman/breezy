@@ -39,14 +39,24 @@ from __future__ import annotations
 from collections.abc import Sequence
 from dataclasses import dataclass
 from decimal import Decimal
+from typing import Final
 
 __all__ = [
+    "EXCLUSION_FRACTION_CEILING",
     "SettlementCloseRefused",
     "TradeReturnInput",
     "TradeReturnSample",
     "assert_settlement_close_permitted",
     "compute_trade_returns",
 ]
+
+#: The exclusion-fraction ceiling this module's docstring (above) demands of
+#: the future BCa bootstrap consumer (`settlement/roi_bound.py`, EXEC_SPINE
+#: R-9, "6e" in `SCORER_TALLY_BCA_BRIEF_2026-09-04.md` item 10). Coordinator
+#: decision, overridable only downward by a future caller -- never upward.
+#: This is the ONE named constant; `roi_bound.py` imports it rather than
+#: restating the number.
+EXCLUSION_FRACTION_CEILING: Final[Decimal] = Decimal("0.20")
 
 #: Reason string for a trade whose `avg_px_open` is itself the problem --
 #: `None` (upstream never recorded an open price) or a real `Decimal(0)`.
