@@ -475,3 +475,61 @@ pattern), `daemon-reload`, then
 `systemctl --user enable --now breezy-quote-tape-rotate.timer` — deliberately
 not run here; see the TRAP section above for the post-edit `daemon-reload`
 discipline that applies to any future edit of this unit too.
+
+---
+
+## `breezy-live-tally` — 6d nightly live-family tally (2026-09-04, PREPARED, NOT ACTIVATED)
+
+`breezy-live-tally.service` + `.timer` run `scripts/analysis/
+live_family_tally.py` daily at **14:30 UTC** via a wrapper script,
+`deploy/systemd/live-tally-run.sh`, in the same style as `mb-daily-run.sh`:
+the timer owns cadence, the script owns the work. The script reads the 6c
+scored-trial parquet store (`~/.local/share/breezy/derived/scored_trials`,
+written by `scripts/analysis/score_live_trials.py`), builds realized-hold-rate
+strata (pooled / per-station / per-ask-band) over LIVE trials ONLY —
+`live_family_tally.assert_live_only` refuses the whole run if any row's
+`trial_id` is not a `current_rung_hold/trial/{station}/{climate_day}` key,
+so an archive trial can never be pooled into this tally (a plan decision of
+`docs/plans/SCORER_TALLY_BCA_BRIEF_2026-09-04.md` §6d, analogous to L-13 and
+L-21 but stated verbatim by neither) — then renders a Markdown report whose
+stratum table header is byte-identical to the M_B live section
+(`mb_current_rung_edge_study.py`) and appends the 6e BCa bootstrap line via
+`breezy.settlement.roi_bound.format_roi_bound`. This unit never prints the
+naive normal-approximation interval EXEC_SPINE R-9 refuses by name.
+
+Scheduled a full hour AFTER `breezy-mb-daily` (13:30 UTC) so the tally's read
+of the (unrelated) parquet store never races that unit's work, and a
+distinct hour from every other Breezy timer (`breezy-quote-tape-rotate`
+09:00, `breezy-k1-daily` 22:30, `breezy-offer-gate-daily` 22:45,
+`breezy-quote-tape-ingest` 00,06,12,18:15) — pinned by
+`tests/unit/test_deploy_timer_hours.py`, which parses every
+`deploy/systemd/*.timer`'s `OnCalendar=` line as text (no `systemd-analyze`
+shelling in the test suite; that check stays a manual step, below). No
+network: the store is local, and the unit carries no `EnvironmentFile`.
+
+Artefacts land under `~/.local/share/breezy/derived/`, dated
+(`live_family_tally_<date>.md`), one snapshot per day — same convention as
+`breezy-mb-daily`; the unit never writes into `docs/evidence/`.
+
+Validation performed (no unit activated):
+
+```
+$ bash -n deploy/systemd/live-tally-run.sh
+OK
+```
+
+**Manual step, not a pytest gate (per the brief's review item 9):**
+`systemd-analyze --user verify deploy/systemd/breezy-live-tally.service
+deploy/systemd/breezy-live-tally.timer` must be re-run once these unit files
+are present at their deployed absolute path (`/home/jon/breezy/deploy/
+systemd/...`, matching every `ExecStart=`/`Documentation=` line) — verify run
+from an agent worktree fails with "not executable: No such file or
+directory" purely because the wrapper script does not yet exist at that
+absolute host path, the same caveat that applies to any unit authored in a
+worktree before it lands on the main checkout.
+
+To activate: symlink both unit files into `~/.config/systemd/user/` (§2's
+pattern), `daemon-reload`, then
+`systemctl --user enable --now breezy-live-tally.timer` — deliberately not
+run here; see the TRAP section above for the post-edit `daemon-reload`
+discipline that applies to any future edit of this unit too.

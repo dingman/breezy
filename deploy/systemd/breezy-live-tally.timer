@@ -1,0 +1,27 @@
+[Unit]
+Description=Daily trigger for the Breezy 6d live-family tally
+Documentation=file:///home/jon/breezy/deploy/systemd/README.md
+Documentation=file:///home/jon/breezy/scripts/analysis/live_family_tally.py
+
+[Timer]
+Unit=breezy-live-tally.service
+
+# 14:30 UTC -- one hour AFTER breezy-mb-daily (13:30 UTC), so the tally's
+# own read is never racing that unit's work, and a distinct HOUR from every
+# other Breezy timer: breezy-quote-tape-rotate (09:00), breezy-mb-daily
+# (13:30), breezy-k1-daily (22:30), breezy-offer-gate-daily (22:45),
+# breezy-quote-tape-ingest (00,06,12,18:15). No two Breezy timers ever fire
+# in the same hour:minute tick (tests/unit/test_deploy_timer_hours.py).
+# UTC is stated explicitly (this host's clock is UTC) so the schedule
+# cannot move if the host timezone is ever changed.
+OnCalendar=*-*-* 14:30:00 UTC
+
+# A run missed because the host was down fires as soon as the timer is
+# next active, instead of being silently skipped until the following day
+# -- mirrors breezy-mb-daily.timer.
+Persistent=true
+
+AccuracySec=1min
+
+[Install]
+WantedBy=timers.target

@@ -1,0 +1,41 @@
+[Unit]
+# Daily driver for the 6d live-family tally (scripts/analysis/
+# live_family_tally.py) over the 6c scored-trial parquet store, triggered
+# by breezy-live-tally.timer. Sibling of breezy-mb-daily.service: same
+# oneshot/no-Install shape, same wrapper-script driver style
+# (deploy/systemd/live-tally-run.sh mirrors mb-daily-run.sh) -- the timer
+# owns cadence, the script owns the work.
+#
+# No network: the 6c store is a local parquet directory
+# (`~/.local/share/breezy/derived/scored_trials`, written by
+# `scripts/analysis/score_live_trials.py`), and this unit only reads it.
+Description=Breezy 6d live-family tally (daily)
+Documentation=file:///home/jon/breezy/deploy/systemd/README.md
+Documentation=file:///home/jon/breezy/scripts/analysis/live_family_tally.py
+Documentation=file:///home/jon/breezy/docs/plans/SCORER_TALLY_BCA_BRIEF_2026-09-04.md
+
+[Service]
+Type=oneshot
+WorkingDirectory=/home/jon/breezy
+UMask=0077
+
+# No EnvironmentFile, deliberately: this unit holds no venue credential --
+# it reads a local parquet directory and writes a local Markdown report,
+# same posture as breezy-mb-daily.service.
+ExecStart=/home/jon/breezy/deploy/systemd/live-tally-run.sh
+
+# The tally is a local parquet scan plus a bootstrap (6e's BCa, B=10,000
+# resamples) -- generous but well under breezy-mb-daily's network-bound
+# budget.
+TimeoutStartSec=600
+
+# No Restart=. A missed daily run is not an incident -- tomorrow's run
+# subsumes today's over the still-growing store. The timer's
+# Persistent=true is what recovers a run missed across a reboot.
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=breezy-live-tally
+
+# NOTE: no [Install] section. This unit is started BY the timer, never
+# enabled directly. `systemctl --user enable breezy-live-tally.timer` is
+# the only thing to enable.
