@@ -89,7 +89,7 @@ Two consequences that are not optional (tracked by P4):
 
 Evidence: `docs/evidence/observation_lock_falsification_2026-08-31.md`.
 
-### [HIGH] BL-24 — live intraday R(t): plan CONVERGED `docs/plans/BL24_LIVE_RT_2026-09-04.md` (Seam A pure fold + domain type; Seam B IEM transport + actor). Lag is on the ASK, never on R.
+### [HIGH] BL-24 — live R(t): Seam A `baaa424`+A-2 `5b830fc` LANDED (interval fix pending review BLOCK); Seam B brief CONVERGED `docs/plans/BL24_SEAM_B_BRIEF_2026-09-04.md` (NWS API, not IEM). Lag is on the ASK, never on R.
 
 ## BACKLOG — selected for execution (opened 2026-08-31)
 
@@ -153,8 +153,7 @@ R-7 (authorization is the write closure's first positional; caps re-read per
 call; ledger releases only on 4xx+Status+no `order.id`; fee floor is an R-8
 precondition; native inflight resolution DECLINED — it guesses). The R-4
 standing refusal stays until R-7: with no send path, removing it deletes the
-only DENIAL. B4 evasions found by that review (`nautilus_pyo3.http_post`,
-C1–C5-blind helper) CLOSED `5221da3` (V5 + C6, 13 tests).
+only DENIAL.
 
 **Open from the blind-risk-view audit** (`docs/core/findings/BLIND_RISK_VIEWS_2026-09-02.md`):
 T-9 exit policy (Grok: hold to settlement, entry-only halt, cancel working buys
@@ -174,12 +173,10 @@ realized hold of taken current-rung trials vs ask+fee — kill n≥60, survive
 n≥150; today n_taken=1. **Live family = lags 30/45, NYC excluded, interval rule**
 (`grok_live_small_spec_rev2_2026-09-04.md`); clock ~09-27 / ~10-30 at 3/day. Accrues via
 `breezy-mb-daily.timer` (13:30Z) + `breezy-quote-tape-ingest.timer`. **The venue skips
-~9% of station-days** (no 09-02 cohort was ever listed; 12 of ~135 days absent —
-`docs/evidence/venue/polymarket_us/MISSING_COHORT_2026-09-02_2026-09-03.md`), so add
-about a week to each clock estimate. **09-04 operator override: the M_B gate no longer parks the plumbing** — build the
+~9% of station-days** (`docs/evidence/venue/polymarket_us/MISSING_COHORT_2026-09-02_2026-09-03.md`): add a week to each clock. **09-04 operator override: the M_B gate no longer parks the plumbing** — build the
 write path (`docs/plans/EXEC_SPINE_NEXT_2026-09-04.md`, R-6.5b CONVERGED) and live R(t)
 (`docs/plans/BL24_LIVE_RT_2026-09-04.md`); only enablement, budgets and the OP-1..OP-4
-positive control stay operator-only. M_B's kill rule still binds the family.
+positive control stay operator-only. M_B's kill rule still binds the family. **current_rung_hold landed 09-04:** archive table `7babe06`, trial latch `19ea5fb`, config `15f04f4`, BCa ROI bound 6e `6ddca6e` (`docs/plans/SCORER_TALLY_BCA_BRIEF_2026-09-04.md`). Next: 6c scorer, 6d tally, decision/strategy, Seam B, R-6.5b.
 
 ---
 
