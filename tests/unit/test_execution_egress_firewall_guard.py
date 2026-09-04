@@ -181,6 +181,7 @@ _EGRESS_MODULE_BASENAMES = frozenset(
         "order_router.py",
         "orders.py",
         "trading.py",
+        "write_transport.py",
     }
 )
 #: Class-name suffixes / bases that constitute an execution-egress surface (E2).
@@ -738,6 +739,9 @@ def test_n2_the_shipped_tree_has_exactly_the_expected_execution_egress_modules()
         ("src/breezy/adapters/polymarket_us/exec/reports.py", "E0"),
         # EXEC SPINE W: `PolymarketUSLiveExecClientFactory(LiveExecClientFactory)`.
         ("src/breezy/adapters/polymarket_us/factories.py", "E2"),
+        # R-6.5b: basename added voluntarily so E1 classifies the write
+        # transport. No E0 (outside exec/), no E2, no E3.
+        ("src/breezy/adapters/polymarket_us/write_transport.py", "E1"),
     ]
 
 

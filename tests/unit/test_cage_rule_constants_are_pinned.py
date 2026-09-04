@@ -180,18 +180,20 @@ CAGE_RULE_PINS: tuple[RulePin, ...] = (
             {
                 "assert_live_order_submission_permitted": "B6",
                 "issue_live_trading_permit": "B7",
+                "_build_post_only_callable": "D3",
             }
         ),
         widened=MappingProxyType(
             {
                 "assert_live_order_submission_permitted": "B6",
                 "issue_live_trading_permit": "B7",
+                "_build_post_only_callable": "D3",
                 "consume": "B8",
             }
         ),
         narrowed=MappingProxyType({"assert_live_order_submission_permitted": "B6"}),
-        why="B6/B7 (NS-2 defect D-2). The narrowed neighbour is the real "
-        "hazard: dropping the issuer re-opens self-issuance in one token",
+        why="B6/B7 (NS-2 defect D-2) plus R-6.5b D3. The narrowed neighbour is "
+        "the real hazard: dropping the issuer re-opens self-issuance in one token",
     ),
     RulePin(
         module="firewall",
@@ -509,19 +511,24 @@ CAGE_RULE_PINS: tuple[RulePin, ...] = (
     RulePin(
         module="readonly",
         attr="B4_EXEMPT_PATHS",
-        expected=frozenset({"scripts/venue/polymarket_us_write_signing_probe.py"}),
+        expected=frozenset(
+            {
+                "scripts/venue/polymarket_us_write_signing_probe.py",
+                "src/breezy/adapters/polymarket_us/write_transport.py",
+            }
+        ),
         widened=frozenset(
             {
                 "scripts/venue/polymarket_us_write_signing_probe.py",
+                "src/breezy/adapters/polymarket_us/write_transport.py",
                 "scripts/venue/a_second_write_script.py",
             }
         ),
-        narrowed=frozenset(),
-        why="R-6.5P's B4 allowlist: the ONE module exempt from the write-egress "
-        "scan. The widened neighbour is the real hazard -- a second exemption "
-        "would silently admit another write-capable script with no paired "
-        "review; the narrowed neighbour re-arms the scan against the probe "
-        "itself and would fail its own mandatory trip-before-exemption test.",
+        narrowed=frozenset({"scripts/venue/polymarket_us_write_signing_probe.py"}),
+        why="R-6.5P's B4 allowlist plus R-6.5b's shipped write transport. The "
+        "widened neighbour is the real hazard -- a third exemption would "
+        "silently admit another write-capable module with no paired review; "
+        "the narrowed neighbour re-arms the scan against the write transport.",
     ),
     RulePin(
         module="readonly",
@@ -587,6 +594,7 @@ CAGE_RULE_PINS: tuple[RulePin, ...] = (
                 "order_router.py",
                 "orders.py",
                 "trading.py",
+                "write_transport.py",
             }
         ),
         widened=frozenset(
@@ -598,6 +606,7 @@ CAGE_RULE_PINS: tuple[RulePin, ...] = (
                 "order_router.py",
                 "orders.py",
                 "trading.py",
+                "write_transport.py",
                 "broker.py",
             }
         ),
@@ -726,10 +735,10 @@ _MODULES = {"readonly": readonly, "firewall": firewall}
 #: prefix would be a blanket allowance, and an entry naming a file that does
 #: not exist is an allowance nobody is checking.
 #:
-#: R-6.5P (EXEC SPINE) grows this from one to two: the write-signing probe is
-#: the plan family's first genuine B4 NARROWING, paired with the two-direction
-#: non-vacuity in ``test_polymarket_us_readonly_guard.py``. ``B4_EXEMPT_PATHS``
-#: is read here, not restated, so the two constants cannot drift apart.
+#: Derived, never hand-edited. R-6.5P grew this from one to two (the write-
+#: signing probe); R-6.5b grows it to three (the shipped write transport).
+#: ``B4_EXEMPT_PATHS`` is read here, not restated, so the constants cannot
+#: drift apart.
 CAGE_EXEMPTIONS: tuple[str, ...] = (readonly.SDK_IMPORT_ORACLE, *sorted(readonly.B4_EXEMPT_PATHS))
 
 
@@ -852,15 +861,16 @@ def test_every_cage_exemption_is_an_exact_path_not_a_prefix() -> None:
         assert not entry.endswith("/")
 
 
-def test_the_cage_grants_exactly_two_exemptions() -> None:
-    """An equality, not ``<=``: a THIRD exemption must be argued for.
+def test_the_cage_grants_exactly_three_exemptions() -> None:
+    """An equality, not ``<=``: a FOURTH exemption must be argued for.
 
     NS-2 created the first (``SDK_IMPORT_ORACLE``, ``== 1``). R-6.5P adds the
     second (the write-signing probe's ``B4_EXEMPT_PATHS`` entry) -- the plan
-    family's first genuine B4 narrowing. The name states the truth at ``== 2``;
-    the old name would now be a lie about shipped code.
+    family's first genuine B4 narrowing. R-6.5b adds the third (the shipped
+    write transport). The name states the truth at ``== 3``; the old name
+    would now be a lie about shipped code.
     """
-    assert len(CAGE_EXEMPTIONS) == 2
+    assert len(CAGE_EXEMPTIONS) == 3
 
 
 # ==========================================================================

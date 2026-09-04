@@ -231,14 +231,17 @@ VENUE_TOUCHING_SCRIPT_PREFIXES: tuple[str, ...] = (
     "scripts/probes/",
 )
 
-#: B4's allowlist (R-6.5P, plan family's first genuine NARROWING). A
-#: MODULE-LEVEL frozenset, never a parameter to :func:`find_write_egress_violations`
-#: or :func:`scan_write_egress` -- the same shape discipline
+#: B4's allowlist (R-6.5P, plan family's first genuine NARROWING; R-6.5b
+#: adds the shipped write transport). A MODULE-LEVEL frozenset, never a
+#: parameter to :func:`find_write_egress_violations` or :func:`scan_write_egress`
+#: -- the same shape discipline
 #: ``test_b7_the_caller_barrier_has_no_exemption_mechanism`` pins for the
-#: B6/B7 sibling. Its ONLY member is the write-signing probe: an exact path,
-#: not a prefix, so it never widens to cover a second script.
+#: B6/B7 sibling. Exact paths, not a prefix.
 B4_EXEMPT_PATHS: frozenset[str] = frozenset(
-    {"scripts/venue/polymarket_us_write_signing_probe.py"}
+    {
+        "scripts/venue/polymarket_us_write_signing_probe.py",
+        "src/breezy/adapters/polymarket_us/write_transport.py",
+    }
 )
 
 
@@ -392,7 +395,7 @@ def scan_write_egress(roots: tuple[str, ...] = EGRESS_SCAN_ROOTS) -> list[Violat
     signature stays ``(path, source)``, the same shape discipline
     ``test_b7_the_caller_barrier_has_no_exemption_mechanism`` pins for the
     B6/B7 sibling rule. An exempted path is skipped entirely: the exemption
-    is for exactly one file, by exact path, never a prefix.
+    is by exact path, never a prefix.
     """
     return [
         v
@@ -605,6 +608,7 @@ BARRED_CALLEES: Mapping[str, str] = MappingProxyType(
     {
         "assert_live_order_submission_permitted": "B6",
         "issue_live_trading_permit": "B7",
+        "_build_post_only_callable": "D3",
     }
 )
 
@@ -820,9 +824,11 @@ def test_b4_scan_covers_both_src_and_scripts() -> None:
 # R-6.5P -- the B4 allowlist (plan family's first genuine NARROWING)
 # ==========================================================================
 
-#: Repo-relative path to the one file the allowlist covers, read once so the
-#: non-vacuity proofs below cannot drift from the exemption itself.
-_WRITE_SIGNING_PROBE_PATH = next(iter(B4_EXEMPT_PATHS))
+#: Repo-relative path to the probe the R-6.5P half of the allowlist covers.
+#: Literal, never ``next(iter(B4_EXEMPT_PATHS))``: with two members that
+#: re-points three tests at an arbitrary file.
+_WRITE_SIGNING_PROBE_PATH = "scripts/venue/polymarket_us_write_signing_probe.py"
+assert _WRITE_SIGNING_PROBE_PATH in B4_EXEMPT_PATHS
 
 
 def test_the_probe_actually_trips_b4_before_the_exemption_is_applied() -> None:
@@ -1497,7 +1503,27 @@ def test_b7_the_caller_barrier_has_no_exemption_mechanism() -> None:
     assert set(BARRED_CALLEES) == {
         "assert_live_order_submission_permitted",
         "issue_live_trading_permit",
+        "_build_post_only_callable",
     }
+
+
+def test_d3_the_post_only_callable_has_exactly_one_caller() -> None:
+    """D3: ``_build_post_only_callable`` is called from write_transport.py only.
+
+    The constructor Call is the one site (a FunctionDef is not a Call). A
+    second caller, including under ``tests/``, is a new send-capable mint.
+    """
+    src_scripts = [
+        (v.path, v.rule) for v in scan_barred_callers() if v.rule == "D3"
+    ]
+    tests_hits = [
+        (v.path, v.rule)
+        for path, src in iter_python_sources(("tests",))
+        for v in find_barred_callers(path, src)
+        if v.rule == "D3"
+    ]
+    assert src_scripts == [("src/breezy/adapters/polymarket_us/write_transport.py", "D3")]
+    assert tests_hits == []
 
 
 # ==========================================================================

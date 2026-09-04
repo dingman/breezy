@@ -97,6 +97,7 @@ from breezy.adapters.polymarket_us.transport import (
     build_shared_http_client,
 )
 from breezy.adapters.polymarket_us.websocket import PolymarketUSMarketsWebSocketPool
+from breezy.adapters.polymarket_us.write_transport import PolymarketUSWriteTransport
 from breezy.runtime.settings import SettingsError, proxy_env_check_enabled
 
 __all__ = [
@@ -458,13 +459,10 @@ def _shared_polymarket_us_signer(
     )
 
 
-@lru_cache(maxsize=1)
-def _shared_polymarket_us_transport(
-    config: PolymarketUSDataClientConfig,
-) -> NautilusHttpTransport:
-    """The ONE transport -- and therefore the ONE rate-limiter token bucket."""
+def _shared_polymarket_us_client(config: PolymarketUSDataClientConfig) -> Any:
+    """The ONE pyo3 HttpClient. Both wrappers call this; a second client halves Quota."""
     user_agent = _required(config.user_agent, field="user_agent")
-    client = build_shared_http_client(
+    return build_shared_http_client(
         timeout_secs=config.http_timeout_secs,
         default_quota=build_default_quota(config.global_requests_per_second),
         keyed_quotas=build_keyed_quotas(
@@ -477,6 +475,23 @@ def _shared_polymarket_us_transport(
         # comment previously carried on each factory's own construction.
         check_proxy_env=proxy_env_check_enabled(),
     )
+
+
+@lru_cache(maxsize=1)
+def _shared_polymarket_us_write_transport(
+    config: PolymarketUSDataClientConfig,
+) -> PolymarketUSWriteTransport:
+    """Constructed here; nothing dispatches through it until R-7."""
+    return PolymarketUSWriteTransport(client=_shared_polymarket_us_client(config))
+
+
+@lru_cache(maxsize=1)
+def _shared_polymarket_us_transport(
+    config: PolymarketUSDataClientConfig,
+) -> NautilusHttpTransport:
+    """The ONE transport -- and therefore the ONE rate-limiter token bucket."""
+    client = _shared_polymarket_us_client(config)
+    _shared_polymarket_us_write_transport(config)
     return NautilusHttpTransport(client=client)
 
 
