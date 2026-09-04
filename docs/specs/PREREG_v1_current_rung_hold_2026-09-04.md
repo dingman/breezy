@@ -52,7 +52,7 @@ falsified if the Wilson **upper** bound falls below `BE` at n ≥ 60 pooled or i
 Evaluated by `evaluate_decision` (`decision.py:238-287`), in this binding order:
 1. `trial_day_consumed` (latch) → refuse. 2. instrument fee coefficient ≠ `0.06` →
 `fee_schedule_mismatch`. 3. no running max, or staleness > `0.75 h` → `observation_unavailable`.
-4. interval spans two rungs → `observation_ambiguous` (never rounded, never midpointed — L-17).
+4. interval spans two rungs → `observation_ambiguous` (never rounded, never midpointed — A13, spec rev2 §1b).
 5. name the containing rung. 6. cell not legal → `illegal_cell`. 7. `not_executable`.
 8. no defined table cell → `p_hold_undefined` (undefined, never "worst cell",
 `archive_table.py:18-20`). 9. `p_hold_lower ≤ BE` → `edge_below_break_even`; else **Take**:
@@ -95,8 +95,8 @@ an archive-only faster-feed upper bound and does not license live (spec rev2 §1
 
 ## 5. The exact pre-declared analysis (frozen)
 
-- **Strata:** pooled, per-station, and per **entry_ask band** `(0.05,0.15)`, `(0.15,0.30)`,
-  `(0.30,0.95)` (`mb_current_rung_edge_study.py:210,424`).
+- **Strata:** pooled, per-station, and per **entry_ask band** `(0.05,0.15]`, `(0.15,0.30]`,
+  `(0.30,0.95)` (left-open/right-closed except the top band, exactly as `classify_ask_band` partitions) (`mb_current_rung_edge_study.py:210,424`).
 - **Interval:** Wilson, `z = 1.959963984540054`, the one shared constant
   (`archive_correction_probe.py:66,352`) — a second Wilson implementation is a defect.
 - **KILL:** pooled `n ≥ 60` with Wilson **upper** < `BE(mean entry_ask)`, or any stratum with
@@ -130,6 +130,10 @@ an archive-only faster-feed upper bound and does not license live (spec rev2 §1
 - Expected clock: n=60 at D0+22, n=150 at D0+55 under the optimistic 2.73 taken/calendar-day
   assumption; earliest D0 = 2026-09-05 → 2026-09-27 / 2026-10-30 (spec rev2 §6). Do NOT lower the
   n floors.
+- **Pending trials at the horizon.** A trial still PENDING at D0 + 165 (no FINAL, fallback window not
+  expired) is excluded from `n` and from the stop-rule ΣPnL until scored or fallback-stamped. No new
+  trial is taken after D0 + 165 regardless of `n`; the family stays open only long enough to resolve
+  trials filled before that date.
 
 ## 7. What will NOT change after the first order
 
@@ -172,3 +176,12 @@ Amending v1 in place is prohibited.
 5. **OQ-4 synchronous execution is unmeasured.** The end-to-end latency of the synchronous submit
    path under live conditions has not been measured; slippage (`fill_px − entry_ask`) is carried as
    a required column specifically so this shows up as data rather than as an assumption.
+6. **The live first-executable-snapshot selection loop is UNBUILT.** `decision.py` is a pure
+   per-snapshot function and the trial-day latch only records consumption; the selection of the
+   FIRST executable snapshot lives in `strategy.py` (build-order step 6, not yet landed). Its
+   equivalence to the archive study's first-executable definition is a build requirement that must
+   be RED-tested against the study's fixtures before enablement.
+7. **The `[12:00, 17:00)` LST window is not enforced by `decision.py`.** It has no window refusal
+   reason; today the restriction exists only through the frozen table's populated `hour_lst` keys
+   (12–16) and the unbuilt caller that derives `hour_lst`. The caller must refuse outside the window
+   with a counted reason before enablement.
