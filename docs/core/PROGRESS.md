@@ -171,7 +171,8 @@ the PRE-lock afternoon window IS offered — 09-01 winner at 0.21×25 (MDW),
 0.65×18 (SFO) while R(t) in-rung. **M_B** (`mb_current_rung_edge_2026-09-02.md`,
 archive p_hold AUDITED correct; kill amended `grok_mb_kill_amendment_2026-09-02.md`):
 realized hold of taken current-rung trials vs ask+fee — kill n≥60, survive
-n≥150; today n_taken=1. Clock: ~09-22 / ~10-21 at 3/day. Accrues via
+n≥150; today n_taken=1. **Live family = lags 30/45, NYC excluded, interval rule**
+(`grok_live_small_spec_rev2_2026-09-04.md`); clock ~09-27 / ~10-30 at 3/day. Accrues via
 `breezy-mb-daily.timer` (13:30Z) + `breezy-quote-tape-ingest.timer`. **The venue skips
 ~9% of station-days** (no 09-02 cohort was ever listed; 12 of ~135 days absent —
 `docs/evidence/venue/polymarket_us/MISSING_COHORT_2026-09-02_2026-09-03.md`), so add
