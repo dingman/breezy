@@ -91,6 +91,7 @@ from breezy.adapters.polymarket_us.websocket import (
     PolymarketUSMarketsWebSocket,
     PolymarketUSMarketsWebSocketPool,
 )
+from breezy.adapters.polymarket_us.write_transport import PolymarketUSWriteTransport
 from breezy.runtime.settings import SettingsError
 
 CLIENT_NAME = "POLYMARKET_US"
@@ -547,6 +548,38 @@ def test_exec_create_wires_its_own_instrument_provider(
 
     assert isinstance(provider, PolymarketUSInstrumentProvider)
     assert provider.venue == POLYMARKET_US_VENUE
+
+
+def test_exec_create_wires_the_live_write_transport_when_canonical_verified(
+    tmp_path: Path, wired: dict[str, Any], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """C5: with the flip landed (``write_transport.py:48`` now True), the
+    factory binds the live sender at construction time. Patched in the
+    factories module's own namespace since ``WRITE_CANONICAL_STRING_VERIFIED``
+    is read there via a ``from``-import (``factories.py:102``, ``:725``).
+    """
+    monkeypatch.setattr(factories_module, "WRITE_CANONICAL_STRING_VERIFIED", True)
+
+    client = build_exec_client(make_exec_config(tmp_path))
+
+    assert isinstance(client._order_sender, PolymarketUSWriteTransport)
+
+
+def test_exec_create_wires_no_order_sender_when_canonical_unverified(
+    tmp_path: Path, wired: dict[str, Any], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Companion to the above: the blocking controls from here on are
+    ``order_enablement.py``'s permit preconditions, ``safety.py``'s
+    live-trading permit, the operator caps, and the exact-``"1"``
+    enablement variable -- this flag no longer gates a fresh factory build
+    once it is True, so the False branch must be forced to prove it still
+    declines to wire a sender.
+    """
+    monkeypatch.setattr(factories_module, "WRITE_CANONICAL_STRING_VERIFIED", False)
+
+    client = build_exec_client(make_exec_config(tmp_path))
+
+    assert client._order_sender is None
 
 
 class RecordingTransport:

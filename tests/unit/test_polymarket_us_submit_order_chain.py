@@ -77,6 +77,16 @@ def write_canonical_verified(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(write_transport, "WRITE_CANONICAL_STRING_VERIFIED", True)
 
 
+@pytest.fixture
+def write_canonical_unverified(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The companion monkeypatch that pins WRITE_CANONICAL_STRING_VERIFIED
+    False for refusal tests, now that the module default is True (C5, the
+    OP-4 positive-control flip). This module remains the ONE place allowed
+    to set the attribute -- see ``setattr_hits`` below.
+    """
+    monkeypatch.setattr(write_transport, "WRITE_CANONICAL_STRING_VERIFIED", False)
+
+
 def _balances_payload() -> dict[str, Any]:
     return {
         "balances": [
@@ -456,10 +466,53 @@ async def test_a_latch_left_open_by_a_prior_crash_refuses_every_submit_until_cle
     assert "latch" in denials[0].reason.lower()
 
 
+def _find_write_transport_canonical_setattr_sites() -> list[str]:
+    """Files with an AST ``setattr(write_transport, "WRITE_CANONICAL_STRING_VERIFIED", ...)``.
+
+    Scoped to the TARGET object, not just the attribute name: the exec chain
+    (``exec/client.py:1507``) and ``order_enablement.py:203`` both read the
+    flag as a bare ``write_transport.WRITE_CANONICAL_STRING_VERIFIED`` module
+    attribute at call time, so patching THAT object is the only thing that
+    can move the real barrier. A test patching a different object's own
+    ``from``-imported local copy (e.g. ``factories_module``'s binding at
+    ``factories.py:102``, read only by the factory's own construction-time
+    wiring at ``:725``) cannot influence the exec chain at all and is
+    deliberately excluded -- narrowing the scan to what the barrier actually
+    means is a widening of legitimate test sites, never a loosening of the
+    barrier itself.
+    """
+    hits: list[str] = []
+    for path, source in iter_python_sources(("tests",)):
+        if "WRITE_CANONICAL_STRING_VERIFIED" not in source or "setattr" not in source:
+            continue
+        tree = ast.parse(source, filename=path)
+        file_hit = False
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Call):
+                continue
+            func = node.func
+            name = func.attr if isinstance(func, ast.Attribute) else getattr(func, "id", "")
+            if name != "setattr" or len(node.args) < 2:
+                continue
+            target = node.args[0]
+            target_name = target.id if isinstance(target, ast.Name) else None
+            attr_arg = node.args[1]
+            attr_literal = attr_arg.value if isinstance(attr_arg, ast.Constant) else None
+            if (
+                target_name == "write_transport"
+                and attr_literal == "WRITE_CANONICAL_STRING_VERIFIED"
+            ):
+                file_hit = True
+        if file_hit:
+            hits.append(path)
+    return hits
+
+
 @pytest.mark.asyncio
 async def test_no_post_is_reachable_while_the_write_canonical_string_is_unverified(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    write_canonical_unverified: None,
 ) -> None:
     assert write_transport.WRITE_CANONICAL_STRING_VERIFIED is False
     sender = _FakeSender()
@@ -473,22 +526,9 @@ async def test_no_post_is_reachable_while_the_write_canonical_string_is_unverifi
     assert len(denials) == 1
     assert "canonical" in denials[0].reason.lower()
 
-    setattr_hits: list[str] = []
-    for path, source in iter_python_sources(("tests",)):
-        if "WRITE_CANONICAL_STRING_VERIFIED" not in source:
-            continue
-        tree = ast.parse(source, filename=path)
-        for node in ast.walk(tree):
-            if not isinstance(node, ast.Call):
-                continue
-            func = node.func
-            name = func.attr if isinstance(func, ast.Attribute) else getattr(func, "id", "")
-            if name != "setattr":
-                continue
-            dumped = ast.dump(node)
-            if "WRITE_CANONICAL_STRING_VERIFIED" in dumped:
-                setattr_hits.append(path)
-    assert setattr_hits == ["tests/unit/test_polymarket_us_submit_order_chain.py"]
+    assert _find_write_transport_canonical_setattr_sites() == [
+        "tests/unit/test_polymarket_us_submit_order_chain.py"
+    ]
 
 
 @pytest.mark.asyncio
@@ -771,9 +811,9 @@ async def test_the_commission_booked_is_the_measured_venue_number_not_the_modell
 
 
 def test_no_post_is_reachable_scan_finds_exactly_one_monkeypatch_fixture() -> None:
-    """Structural half of test 6: one setattr fixture, no second construction path."""
-    hits = []
-    for path, source in iter_python_sources(("tests",)):
-        if "setattr" in source and "WRITE_CANONICAL_STRING_VERIFIED" in source:
-            hits.append(path)
-    assert hits == ["tests/unit/test_polymarket_us_submit_order_chain.py"]
+    """Structural half of test 6: one module may setattr the flag the exec
+    chain actually reads; a second construction path is refused.
+    """
+    assert _find_write_transport_canonical_setattr_sites() == [
+        "tests/unit/test_polymarket_us_submit_order_chain.py"
+    ]

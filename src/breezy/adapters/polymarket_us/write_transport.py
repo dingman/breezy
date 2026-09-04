@@ -45,7 +45,11 @@ __all__ = [
 
 #: Flips only along the OP-4 probe artefact path. R-7 must refuse to wire a
 #: call site while this is False.
-WRITE_CANONICAL_STRING_VERIFIED: Final[bool] = False
+#: Flipped True on the evidence of the live bot-driven positive control:
+#: ``docs/evidence/venue/polymarket_us/PRIVATE_write_sequence_probe_20260904T170856Z.json``,
+#: verdict ``CLOSED_YES_BOTH_VERBS``
+#: (sha256 46b3a75e4918c1749b20cede6b72344b1289333bb166fd6ea3cfa2b1aaf0d617).
+WRITE_CANONICAL_STRING_VERIFIED: Final[bool] = True
 
 PERMITTED_WRITE_METHODS: frozenset[str] = frozenset({"POST"})
 _WRITE_METHOD: str = next(iter(PERMITTED_WRITE_METHODS))

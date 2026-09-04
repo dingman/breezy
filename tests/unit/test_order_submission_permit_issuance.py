@@ -11,10 +11,13 @@ names the failed precondition only, never a value (L-22 shape,
 pattern). Reuses the shipped fixtures rather than inventing parallel ones:
 ``enable_operator_gate``/``credentials`` (live-trading permit issuance),
 ``operator_control_env`` (the ONE whitelisted seam for the two operator-
-reserved caps -- never named here), and ``write_canonical_verified`` (the
-ONE monkeypatch fixture for ``WRITE_CANONICAL_STRING_VERIFIED``, imported
-rather than re-defined so the repo-wide "exactly one fixture" scan in
-``test_polymarket_us_submit_order_chain.py`` stays green).
+reserved caps -- never named here), and ``write_canonical_verified`` /
+``write_canonical_unverified`` (the two monkeypatch fixtures for
+``WRITE_CANONICAL_STRING_VERIFIED``, imported rather than re-defined so the
+repo-wide "only this module may patch it" scan in
+``test_polymarket_us_submit_order_chain.py`` stays green -- the module
+default is True since C5's OP-4 positive-control flip, so refusal tests now
+use ``write_canonical_unverified`` explicitly).
 """
 
 from __future__ import annotations
@@ -48,6 +51,7 @@ from tests.unit.test_polymarket_us_permit_issuance import (
     enable_operator_gate,
 )
 from tests.unit.test_polymarket_us_submit_order_chain import (
+    write_canonical_unverified,  # noqa: F401 -- reused as a fixture, see module docstring
     write_canonical_verified,  # noqa: F401 -- reused as a fixture, see module docstring
 )
 
@@ -150,10 +154,12 @@ def test_live_trading_permit_expired_refuses(
 
 def test_write_canonical_string_unverified_refuses(
     monkeypatch: pytest.MonkeyPatch,
+    write_canonical_unverified: None,  # noqa: F811
 ) -> None:
-    """No ``write_canonical_verified`` fixture here -- the predicate is
-    ``False`` by default (``write_transport.py:48``), exactly the structural
-    unreachability the design section calls out.
+    """The ``write_canonical_unverified`` fixture pins the predicate False --
+    since C5's OP-4 positive-control flip the module default is True, so
+    this refusal is no longer reachable by default and must be forced,
+    exactly the structural unreachability the design section calls out.
     """
     enable_operator_gate(monkeypatch)
     clock = clock_at()
@@ -244,6 +250,7 @@ def test_orders_not_requested_message_names_no_value(
 
 def test_write_canonical_unverified_message_names_no_value(
     monkeypatch: pytest.MonkeyPatch,
+    write_canonical_unverified: None,  # noqa: F811
     caplog: pytest.LogCaptureFixture,
 ) -> None:
     enable_operator_gate(monkeypatch, operator_id="the-operator-value")

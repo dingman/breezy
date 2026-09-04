@@ -566,11 +566,20 @@ def test_the_shipped_write_signer_and_the_probe_produce_the_same_canonical_strin
 
 
 # --------------------------------------------------------------------------
-# 10. unverified premise stays False until OP-4
+# 10. premise verified True by the OP-4 live bot-driven positive control
 # --------------------------------------------------------------------------
 
 
-def test_write_canonical_string_verified_is_false_until_op4() -> None:
+def test_write_canonical_string_verified_is_true_after_op4() -> None:
+    """C5: flipped on the evidence of the live bot-driven positive control --
+    ``docs/evidence/venue/polymarket_us/PRIVATE_write_sequence_probe_20260904T170856Z.json``,
+    verdict ``CLOSED_YES_BOTH_VERBS`` (rest 200, enumeration 200, cancel 200,
+    postflight 200), sha256
+    ``46b3a75e4918c1749b20cede6b72344b1289333bb166fd6ea3cfa2b1aaf0d617``.
+    The blocking controls from here are ``order_enablement.py``'s permit
+    preconditions, ``safety.py``'s live-trading permit, the operator caps,
+    and the exact-``"1"`` enablement variable -- never this flag again.
+    """
     from breezy.adapters.polymarket_us.write_transport import WRITE_CANONICAL_STRING_VERIFIED
 
-    assert WRITE_CANONICAL_STRING_VERIFIED is False
+    assert WRITE_CANONICAL_STRING_VERIFIED is True
