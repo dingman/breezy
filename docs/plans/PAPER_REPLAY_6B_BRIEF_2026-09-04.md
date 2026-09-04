@@ -95,3 +95,5 @@ Reviewers: trading-bot-architect (APPROVE-WITH-AMENDMENTS; all four Nautilus cit
 9. Data-availability counts (13/10 quote-tick, 17/13 depth station-days; 09-02 only in `live/`) are plausible but unverified by the reviewers — the driver prints both counts at run time and refuses a silently partial conversion (L-20).
 
 Build gate: lands after the strategy review amendments (latch factory as context manager + `on_stop`) are on the branch; the driver takes the latch factory by injection.
+
+**Layer correction (2026-09-04, from the wiring-brief review):** `runtime` may not import `strategy`. The backtest-only subclass therefore lives at `src/breezy/strategy/current_rung_hold/backtest_only.py` (NOT `runtime/paper_replay.py`); `runtime/paper_replay.py` keeps only strategy-agnostic helpers (observation loading, engine config, fills→`FilledTrial`) and takes the strategy as a constructed object; the one importer of the subclass is the driver `scripts/analysis/current_rung_hold_paper_replay.py` (+ its tests), pinned by the one-importer scan.
