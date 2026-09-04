@@ -510,6 +510,14 @@ class PolymarketUSExecClientConfig(LiveExecClientConfig, frozen=True):
         via ``msgspec.structs.replace``, exactly the way
         ``build_quote_tape_node_config`` threads ``recorder_instance_id``
         through :class:`PolymarketUSDataClientConfig` after the fact.
+    submit_intent_latch : object | None
+        The already-opened submit-intent latch owned by the composition root.
+        Typed ``object`` so this adapters module does not import
+        ``breezy.runtime.submit_intent`` (runtime sits above adapters). The
+        object is injected by ``build_trade_node_config``, never constructed
+        here, never a factory. This increment stores it; R-7's ``_connect``
+        is what will consume it. The exec client NEVER calls
+        ``open_submit_intent_latch``.
     instrument_wait_timeout_s, account_registration_timeout_s : float
         Forwarded verbatim to :class:`PolymarketUSExecutionClient`.
     """
@@ -518,6 +526,7 @@ class PolymarketUSExecClientConfig(LiveExecClientConfig, frozen=True):
     account_number: str | None = None
     state_store_path: str | None = None
     state_store_opener: StateStoreOpener | None = None
+    submit_intent_latch: object | None = None
     instrument_wait_timeout_s: float = 30.0
     account_registration_timeout_s: float = 30.0
 

@@ -96,6 +96,19 @@ TRADE_TRADER_ID_VAR = "BREEZY_TRADE_TRADER_ID"
 #: idiom. The ingest node and the tape recorder never read it.
 LIVE_OBSERVATIONS_VAR = "BREEZY_LIVE_OBSERVATIONS"
 
+#: Shadow-mode ``current_rung_hold`` enablement for the TRADING role. OFF
+#: unless set to exactly ``"1"``. Requires :data:`LIVE_OBSERVATIONS_VAR` --
+#: the strategy prices against ``StationObservation``, so enabling it without
+#: the publisher would latch ``observation_unavailable`` on every station-day
+#: and burn the one trial. The tape recorder never reads this variable.
+CURRENT_RUNG_HOLD_VAR = "BREEZY_CURRENT_RUNG_HOLD"
+
+#: Trade-role catalog root used as the pre-build discovery source when
+#: :data:`CURRENT_RUNG_HOLD_VAR` is on. Distinct from
+#: :data:`QUOTE_TAPE_CATALOG_VAR`, which remains the recorder's single-reader
+#: contract. Required, absolute, no ``..`` segment, only when the flag is on.
+TRADE_CATALOG_ROOT_VAR = "BREEZY_TRADE_CATALOG_ROOT"
+
 _DEFAULT_TRADER_ID = "BREEZY-001"
 
 #: G-19 item B11 asked for this to be derived from the NWS CLI issuance
@@ -274,6 +287,29 @@ def _parse_check_proxy_env(env: Mapping[str, str]) -> bool:
 
 def _parse_live_observations(env: Mapping[str, str]) -> bool:
     return env.get(LIVE_OBSERVATIONS_VAR) == "1"
+
+
+def _parse_current_rung_hold(env: Mapping[str, str]) -> bool:
+    return env.get(CURRENT_RUNG_HOLD_VAR) == "1"
+
+
+def _parse_trade_catalog_root(env: Mapping[str, str]) -> Path:
+    """Parse :data:`TRADE_CATALOG_ROOT_VAR`; required, absolute, no ``..``."""
+    raw = _require(env, TRADE_CATALOG_ROOT_VAR)
+    if not raw.strip():
+        raise SettingsError(f"{TRADE_CATALOG_ROOT_VAR} is required and must not be blank")
+    if "\x00" in raw:
+        raise SettingsError(f"{TRADE_CATALOG_ROOT_VAR} must not contain a NUL byte")
+    catalog_root = Path(raw.strip())
+    if not catalog_root.is_absolute():
+        raise SettingsError(
+            f"{TRADE_CATALOG_ROOT_VAR} must be an absolute path, was {raw!r}"
+        )
+    if any(part == ".." for part in catalog_root.parts):
+        raise SettingsError(
+            f"{TRADE_CATALOG_ROOT_VAR} must not contain a '..' segment, was {raw!r}"
+        )
+    return catalog_root
 
 
 def proxy_env_check_enabled(env: Mapping[str, str] | None = None) -> bool:
@@ -680,6 +716,13 @@ class BreezyTradeSettings:
     #: BL-24 Seam B: whether the NWS observation Actors are registered on
     #: this node. Default OFF; see :data:`LIVE_OBSERVATIONS_VAR`.
     live_observations: bool = False
+    #: Shadow-mode ``current_rung_hold``. Default OFF; see
+    #: :data:`CURRENT_RUNG_HOLD_VAR`. ``orders_enabled`` is not a field here
+    #: and cannot be reached from this object.
+    current_rung_hold: bool = False
+    #: Pre-build discovery catalog, set only when ``current_rung_hold`` is on.
+    #: See :data:`TRADE_CATALOG_ROOT_VAR`.
+    catalog_root: Path | None = None
 
 
 def load_trade_settings(env: Mapping[str, str] | None = None) -> BreezyTradeSettings:
@@ -702,8 +745,21 @@ def load_trade_settings(env: Mapping[str, str] | None = None) -> BreezyTradeSett
     if not raw.strip():
         raise SettingsError(f"{TRADE_TRADER_ID_VAR} is required and must not be blank")
 
+    live_observations = _parse_live_observations(active_env)
+    current_rung_hold = _parse_current_rung_hold(active_env)
+    if current_rung_hold and not live_observations:
+        raise SettingsError(
+            f"{CURRENT_RUNG_HOLD_VAR}=1 requires {LIVE_OBSERVATIONS_VAR}=1: "
+            "the strategy prices against StationObservation, so enabling it "
+            "without the publisher would latch observation_unavailable on "
+            "every station-day and burn the one trial"
+        )
+    catalog_root = _parse_trade_catalog_root(active_env) if current_rung_hold else None
+
     return BreezyTradeSettings(
         trader_id=raw.strip(),
         log_level=_parse_log_level(active_env),
-        live_observations=_parse_live_observations(active_env),
+        live_observations=live_observations,
+        current_rung_hold=current_rung_hold,
+        catalog_root=catalog_root,
     )

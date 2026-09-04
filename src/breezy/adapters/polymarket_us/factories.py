@@ -749,7 +749,7 @@ class PolymarketUSLiveExecClientFactory(LiveExecClientFactory):
                 raise PrivateReadRefused(status=response.status, path=path, body=response.body)
             return decode_private_payload(response.body, context=path)
 
-        return PolymarketUSExecutionClient(
+        client = PolymarketUSExecutionClient(
             loop=loop,
             client_id=ClientId(name),
             venue=POLYMARKET_US_VENUE,
@@ -763,3 +763,14 @@ class PolymarketUSLiveExecClientFactory(LiveExecClientFactory):
             instrument_wait_timeout_s=config.instrument_wait_timeout_s,
             account_registration_timeout_s=config.account_registration_timeout_s,
         )
+        # Composition-root latch, stored for R-7's ``_connect``. This increment
+        # does not consume it. The exec client never opens its own latch.
+        # ``LiveExecutionClient`` is Cython: extra attrs may be refused, in
+        # which case the injected config field is the remaining store.
+        try:
+            object.__setattr__(
+                client, "_submit_intent_latch", config.submit_intent_latch
+            )
+        except (AttributeError, TypeError):
+            pass
+        return client

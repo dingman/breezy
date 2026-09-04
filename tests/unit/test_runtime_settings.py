@@ -15,11 +15,16 @@ import pytest
 
 from breezy.registry.sites import default_registry
 from breezy.runtime.settings import (
+    CURRENT_RUNG_HOLD_VAR,
+    LIVE_OBSERVATIONS_VAR,
+    TRADE_CATALOG_ROOT_VAR,
+    TRADE_TRADER_ID_VAR,
     BreezyRuntimeSettings,
     SettingsError,
     derive_disk_thresholds,
     load_quote_tape_settings,
     load_settings,
+    load_trade_settings,
     probe_total_bytes,
 )
 
@@ -708,3 +713,37 @@ def test_the_default_probe_walks_up_to_the_nearest_existing_ancestor(
     assert not root.exists()
 
     assert probe_total_bytes(root) == shutil.disk_usage(tmp_path).total
+
+
+# ---------------------------------------------------------------------------
+# Trading-role current_rung_hold flag (exact ``== "1"`` idiom)
+# ---------------------------------------------------------------------------
+
+_TRADE_ONLY_ENV = {TRADE_TRADER_ID_VAR: "BREEZYTRADE-001"}
+
+
+def test_current_rung_hold_flag_is_exact_one() -> None:
+    """RED 10: absent / ``"0"`` / ``"true"`` / ``"1"`` → False, False, False, True."""
+    absent = load_trade_settings(_TRADE_ONLY_ENV).current_rung_hold
+    zero = load_trade_settings({**_TRADE_ONLY_ENV, CURRENT_RUNG_HOLD_VAR: "0"}).current_rung_hold
+    true = load_trade_settings(
+        {**_TRADE_ONLY_ENV, CURRENT_RUNG_HOLD_VAR: "true"}
+    ).current_rung_hold
+    one = load_trade_settings(
+        {
+            **_TRADE_ONLY_ENV,
+            CURRENT_RUNG_HOLD_VAR: "1",
+            LIVE_OBSERVATIONS_VAR: "1",
+            TRADE_CATALOG_ROOT_VAR: "/tmp/breezy-trade-catalog",
+        }
+    ).current_rung_hold
+    assert (absent, zero, true, one) == (False, False, False, True)
+
+
+def test_current_rung_hold_without_live_observations_is_a_settings_error() -> None:
+    with pytest.raises(SettingsError) as excinfo:
+        load_trade_settings({**_TRADE_ONLY_ENV, CURRENT_RUNG_HOLD_VAR: "1"})
+    message = str(excinfo.value)
+    assert CURRENT_RUNG_HOLD_VAR in message
+    assert LIVE_OBSERVATIONS_VAR in message
+

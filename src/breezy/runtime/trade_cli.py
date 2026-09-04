@@ -76,6 +76,7 @@ from nautilus_trader.common.actor import Actor
 from nautilus_trader.config import TradingNodeConfig
 from nautilus_trader.live.node import TradingNode
 from nautilus_trader.model.identifiers import ClientId
+from nautilus_trader.trading.strategy import Strategy
 
 from breezy.adapters.polymarket_us.exec_fault import (
     clear_fatal_exec_fault,
@@ -294,6 +295,8 @@ def _run_node(
     stderr: TextIO,
     *,
     actors: Sequence[Actor] = (),
+    strategies: Sequence[Strategy] = (),
+    after_build: Callable[[Node], None] | None = None,
 ) -> int:
     """Build, run and ALWAYS dispose the node. Never raises.
 
@@ -303,6 +306,13 @@ def _run_node(
     ``composition.build_ingest_node`` registers the ingest Actors.
     ``build_trade_node_config`` keeps ``actors=[]``; these are not an order
     path (an Actor is not a Strategy and cannot ``submit_order``).
+
+    Shadow-mode ``current_rung_hold`` strategies -- constructed ABOVE this
+    module by ``breezy.app.trade`` -- are registered the same way, through
+    the NATIVE ``node.trader.add_strategy`` BEFORE ``build()``
+    (``trading/trader.py:375-420``). ``build_trade_node_config`` keeps
+    ``strategies=[]``; these are already-built objects, never an order path
+    (``orders_enabled`` stays False and is unreachable from env).
 
     ``add_data_client_factory``/``add_exec_client_factory`` take the
     registration NAME and the factory CLASS (``live/node.py:230``, and the
@@ -353,6 +363,8 @@ def _run_node(
         )
         for actor in actors:
             node.trader.add_actor(actor)
+        for strategy in strategies:
+            node.trader.add_strategy(strategy)
         node.build()
         install_live_order_guard(
             node.kernel.portfolio,
@@ -371,6 +383,8 @@ def _run_node(
             node.kernel.risk_engine,
             on_halt=_account_halt_reporter(stderr),
         )
+        if after_build is not None:
+            after_build(node)
         node.run()
         return _exit_code_for_completed_run(stderr)
     except KeyboardInterrupt:
@@ -399,6 +413,9 @@ def run(
     env: Mapping[str, str] | None = None,
     node_factory: NodeFactory = TradingNode,
     stderr: TextIO | None = None,
+    strategies: Sequence[Strategy] = (),
+    submit_intent_latch: object | None = None,
+    after_build: Callable[[Node], None] | None = None,
 ) -> int:
     """Load settings, build the node config, run the node, return an exit code.
 
@@ -423,7 +440,12 @@ def run(
             settings = load_trade_settings(env)
             data_client_config = config_from_env(env)
             exec_client_config = exec_config_from_env(env)
-            config = build_trade_node_config(settings, data_client_config, exec_client_config)
+            config = build_trade_node_config(
+                settings,
+                data_client_config,
+                exec_client_config,
+                submit_intent_latch=submit_intent_latch,
+            )
         except _CONFIG_ERRORS as exc:
             _report(out, "configuration error", exc, expected=True)
             return EXIT_CONFIG_ERROR
@@ -431,7 +453,14 @@ def run(
         actors: Sequence[Actor] = ()
         if settings.live_observations:
             actors = build_live_observation_actors(check_proxy_env=proxy_env_check_enabled(env))
-        return _run_node(config, node_factory, out, actors=actors)
+        return _run_node(
+            config,
+            node_factory,
+            out,
+            actors=actors,
+            strategies=strategies,
+            after_build=after_build,
+        )
     finally:
         uninstall_logging_bridge()
 

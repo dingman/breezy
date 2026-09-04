@@ -73,9 +73,13 @@ name = "Breezy top-level source packages follow the documented layer direction"
 type = "layers"
 containers = ["breezy"]
 layers = [
-    # `strategy` is the TOP layer: a strategy reaches down into `runtime` for
-    # the backtest feed's shared `ClientId` and into `ingest` for the shared
-    # weather `DataType` factories. Nothing may reach back up into it -- the
+    # `app` is the TOP layer: the process composition root constructs
+    # strategies and hands already-built objects down to `runtime`. Runtime
+    # never imports strategy.
+    "app",
+    # `strategy` reaches down into `runtime` for the backtest feed's shared
+    # `ClientId` and into `ingest` for the shared weather `DataType`
+    # factories. Nothing below `app` may reach back up into it -- the
     # harness in `runtime` takes strategies as constructed objects.
     "strategy",
     "runtime",
@@ -244,7 +248,7 @@ breezy-quote-tape-preflight = "breezy.runtime.quote_tape_preflight_cli:main"
 # (`BREEZY_TRADE_TRADER_ID`, no default), writes no tape, and in this
 # increment carries NO execution client -- it is the process shell only. See
 # `breezy.runtime.trade_cli` for the exit contract.
-breezy-trade = "breezy.runtime.trade_cli:main"
+breezy-trade = "breezy.app.trade:main"
 # A FIFTH process, deliberately not automated inside the recorder itself: the
 # recorder writer must never also be the process that reads its own output
 # back. Converts streamed feather under `<catalog>/live/<instance>/` into the

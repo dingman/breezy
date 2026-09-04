@@ -191,11 +191,16 @@ class _RecordingTrader:
 
     def __init__(self, calls: list[str]) -> None:
         self.actors: list[Any] = []
+        self.strategies: list[Any] = []
         self._calls = calls
 
     def add_actor(self, actor: Any) -> None:
         self.actors.append(actor)
         self._calls.append("add_actor")
+
+    def add_strategy(self, strategy: Any) -> None:
+        self.strategies.append(strategy)
+        self._calls.append("add_strategy")
 
 
 class RecordingNode:
@@ -318,8 +323,9 @@ def test_the_entrypoint_source_registers_no_strategy_or_exec_algorithm_or_raw_su
     The behavioural test above proves this run registered an exec CLIENT. It
     cannot prove a *conditional* registration of a strategy or exec algorithm
     on a branch the test does not take. Reading the source closes that gap:
-    the increment's promise is that the process is still INCAPABLE of
-    reaching an order path, and a call that is not written cannot be reached.
+    ``submit_order`` and ``add_exec_algorithm`` stay unwritten. ``add_strategy``
+    is the native registration of already-constructed shadow-mode strategies
+    (``orders_enabled`` stays False) and is not an order path.
     ``add_exec_client_factory`` is deliberately NOT asserted absent here --
     EXEC SPINE W adds it, on purpose, in the behavioural test above.
     """
@@ -332,8 +338,10 @@ def test_the_entrypoint_source_registers_no_strategy_or_exec_algorithm_or_raw_su
     }
 
     assert "submit_order" not in called
-    assert "add_strategy" not in called
     assert "add_exec_algorithm" not in called
+    # Native registration of already-constructed shadow-mode strategies
+    # (``orders_enabled`` stays False). Not an order path.
+    assert "add_strategy" in called
 
 
 def test_ctrl_c_is_a_clean_shutdown_not_a_runtime_failure() -> None:

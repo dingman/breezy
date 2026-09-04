@@ -25,11 +25,40 @@ written here and their values are never written anywhere in this repository
 | 0.8 | **R-7** — `_submit_order` gets a body; startup calls `reconcile_at_startup` before the first `arm`; standing refusal removed | TODO — `exec/client.py` still ends at `_STANDING_ORDER_REFUSAL` | **TODO** |
 | 0.9 | **R-7-STATUS** — by-id order read on the READ seam (blocks R-8) | TODO | **TODO** |
 | 0.10 | **Seam B** — NWS observation publisher (A12); `0.75 h` staleness is miscalibrated without it | TODO | **TODO** |
-| 0.11 | **current_rung_hold steps 4–7** — `config.py`, `decision.py`, `strategy.py`, PREREG artefact (plus 6b/6c/6d) | TODO — `src/breezy/strategy/current_rung_hold/` does not exist | **TODO** |
+| 0.11 | **current_rung_hold steps 4–7** — `config.py`, `decision.py`, `strategy.py`, PREREG artefact (plus 6b/6c/6d) | FLAG-OFF runtime wiring landed (`breezy.app.trade`, `composition.py`); `orders_enabled` stays False and unreachable from env; PREREG + 6c/6d still open | **PARTIAL** |
 | 0.12 | Gate green: `scripts/ci/run_tests_no_egress.sh`, passed count never dropped | TODO at each increment | **TODO** |
 
 Nothing below is started until 0.7–0.12 are closed, EXCEPT OP-1..OP-4, which are R-6.5b's own
 precondition (OQ-D) and are run first.
+
+## Shadow mode
+
+`current_rung_hold` can be registered on the trading node without submitting an order.
+`orders_enabled` stays False and cannot be flipped from the environment.
+
+Both flags must be exactly `1`. The catalog root is required only when the strategy flag is on.
+
+| Role | Variable | Value |
+|---|---|---|
+| Live NWS observation publisher | `BREEZY_LIVE_OBSERVATIONS` | `1` |
+| Shadow-mode `current_rung_hold` | `BREEZY_CURRENT_RUNG_HOLD` | `1` |
+| Trade-role catalog root (pre-build discovery) | `BREEZY_TRADE_CATALOG_ROOT` | absolute path, no `..` |
+
+`BREEZY_CURRENT_RUNG_HOLD=1` without `BREEZY_LIVE_OBSERVATIONS=1` is a configuration error (exit 2) and names both variables.
+
+The composition root (`breezy.app.trade`) is the sole opener of the submit-intent latch. The exec client stores the injected latch and does not open a second one.
+
+journalctl strings to grep:
+
+- `CurrentRungHoldStrategy subscribed <instrument-id>` — the strategy armed a market
+- `TAKE recorded, no submit (orders_enabled=False):` — the shadow-mode signal; a trial was taken and no order was sent
+- `OUTSIDE_DECISION_WINDOW_REFUSALS`
+- `OBSERVATION_UNAVAILABLE_REFUSALS`
+- `OBSERVATION_AMBIGUOUS_REFUSALS`
+- `FEE_SCHEDULE_MISMATCH_REFUSALS`
+- `TRIAL_DAY_CONSUMED_REFUSALS`
+
+A station that resolves zero instruments for today's climate day is skipped and counted; the process refuses to start only when every station resolves zero.
 
 ## 1. OP-1 — rest a BUY of 1 contract at $0.01, by hand
 
