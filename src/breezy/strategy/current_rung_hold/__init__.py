@@ -5,7 +5,8 @@ Public surface, incrementally: :class:`TrialDayLatch` and
 rule this latch is bound by (trial commit precedes intent arm, which
 precedes the POST, which precedes intent retire) -- and
 :class:`CurrentRungHoldConfig`, see ``config.py`` for its construction-time
-validations.
+validations -- and :func:`evaluate_decision`, see ``decision.py`` for the
+PURE (no Nautilus, no I/O, no clock) rule order it follows.
 """
 
 from __future__ import annotations
@@ -16,6 +17,14 @@ from breezy.strategy.current_rung_hold.config import (
     CurrentRungHoldConfig,
     InvalidOrderQuantityError,
     UnsupportedStationError,
+)
+from breezy.strategy.current_rung_hold.decision import (
+    REFUSAL_REASONS,
+    Decision,
+    DecisionInputs,
+    Refuse,
+    Take,
+    evaluate_decision,
 )
 from breezy.strategy.current_rung_hold.trial_day_latch import (
     TrialDayAlreadyConsumed,
@@ -28,10 +37,15 @@ from breezy.strategy.current_rung_hold.trial_day_latch import (
 )
 
 __all__ = [
+    "REFUSAL_REASONS",
     "AllowShortNotPermittedError",
     "ArchiveTablePinMismatchError",
     "CurrentRungHoldConfig",
+    "Decision",
+    "DecisionInputs",
     "InvalidOrderQuantityError",
+    "Refuse",
+    "Take",
     "TrialDayAlreadyConsumed",
     "TrialDayInvalidReason",
     "TrialDayLatch",
@@ -39,5 +53,6 @@ __all__ = [
     "TrialDayRecord",
     "TrialDayRecordCorrupt",
     "UnsupportedStationError",
+    "evaluate_decision",
     "open_trial_day_latch",
 ]

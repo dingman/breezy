@@ -8,14 +8,22 @@ match the frozen corpus sha the module actually ships
 (``archive_table.CORPUS_SHA256``) -- never a second hard-coded copy of it.
 
 Operator-reserved caps (maximum daily trading budget; maximum notional per
-position) are NOT fields on this config -- they come from ``operator_controls``
-at runtime (see ``docs/plans/CURRENT_RUNG_HOLD_BLUEPRINT_2026-09-04.md`` §2).
-A test below asserts no field name on this config even mentions budget,
-daily, or a position cap.
+position) are NOT fields on this config -- they come from the operator's
+own reserved control surface at runtime (see
+``docs/plans/CURRENT_RUNG_HOLD_BLUEPRINT_2026-09-04.md`` §2). A test below
+asserts no field name on this config LITERALLY matches a field name on
+``breezy.strategy.weather_common.risk.RiskLimits`` -- the repo's one
+canonical risk-cap dataclass, and every reserved-cap-shaped field name
+(``max_position_contracts``, ``max_event_notional``, etc.) already lives
+there. Comparing against its real field names (rather than an ad-hoc
+substring list) is precise where a substring list is guesswork: it catches
+any literal collision without maintaining a second, drifting vocabulary of
+"looks like a cap" strings.
 """
 
 from __future__ import annotations
 
+import dataclasses
 from decimal import Decimal
 
 import pytest
@@ -28,10 +36,7 @@ from breezy.strategy.current_rung_hold.config import (
     InvalidOrderQuantityError,
     UnsupportedStationError,
 )
-
-#: Substrings that would identify an operator-reserved control if they
-#: appeared in a field name on this config. Case-insensitive.
-_FORBIDDEN_FIELD_SUBSTRINGS: tuple[str, ...] = ("budget", "daily", "position_cap", "poscap")
+from breezy.strategy.weather_common.risk import RiskLimits
 
 
 def test_default_construction_succeeds() -> None:
@@ -89,12 +94,26 @@ def test_config_is_frozen() -> None:
 
 
 def test_config_has_no_operator_reserved_field_name() -> None:
-    field_names = CurrentRungHoldConfig.__struct_fields__
-    for name in field_names:
-        lowered = name.lower()
-        for forbidden in _FORBIDDEN_FIELD_SUBSTRINGS:
-            assert forbidden not in lowered, (
-                f"field {name!r} looks like an operator-reserved control; "
-                "those come from operator_controls at runtime, never a "
-                "config field"
-            )
+    field_names = frozenset(CurrentRungHoldConfig.__struct_fields__)
+    # `RiskLimits` carries several fields (`allow_short`,
+    # `stale_observation_hours`, ...) that every sibling weather-strategy
+    # config LEGITIMATELY shares by name -- those are not reserved caps.
+    # The reserved-CAP-shaped fields are exactly the `max_*` ceilings
+    # (`max_position_contracts`, `max_event_notional`,
+    # `max_location_notional`, `max_simultaneous_positions`,
+    # `max_equity_fraction`): the ones a `budget`/`position_cap` substring
+    # scan was trying to approximate. Comparing against these literal names
+    # (rather than an ad-hoc substring list) is precise where a substring
+    # list is guesswork.
+    reserved_cap_field_names = frozenset(
+        field.name
+        for field in dataclasses.fields(RiskLimits)
+        if field.name.startswith("max_")
+    )
+    collisions = field_names & reserved_cap_field_names
+    assert not collisions, (
+        f"field(s) {sorted(collisions)!r} literally match a RiskLimits "
+        "reserved-cap field name; reserved-cap-shaped fields come from the "
+        "operator's own reserved control surface at runtime, never a "
+        "config field"
+    )
