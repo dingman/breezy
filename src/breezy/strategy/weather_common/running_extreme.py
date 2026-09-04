@@ -52,25 +52,42 @@ it (see ``StationObservation``) as descriptive provenance, but this
 accumulator does not use it to build a METAR row's bounds.
 
 `value_at` returns a frozen :class:`RunningMax` describing the running max
-as ``[lower_f, upper_f)`` (upper EXCLUSIVE):
+as ``[lower_f, upper_f]`` -- CLOSED at BOTH ends, matching
+``WeatherBucketFacts.contains`` (``breezy/domain/weather_bucket_facts.py``,
+verified against 114/114 real venue ladders):
 
 * ``lower_f`` = the max, over every eligible row, of ``round_half_up_f`` of
   that row's Celsius-tenths LOWER bound (its own ``temp_c_tenths`` for a
-  METAR row, or ``temp_c_tenths - precision_c_tenths // 2`` otherwise).
-* ``upper_f`` = the max, over every eligible row, of ``round_half_up_f`` of
-  that row's Celsius-tenths UPPER bound (its own ``temp_c_tenths`` for a
-  METAR row, or ``temp_c_tenths + precision_c_tenths // 2`` otherwise).
+  METAR row, or ``temp_c_tenths - precision_c_tenths // 2`` otherwise). The
+  lower end of a non-METAR row's real interval is CLOSED (``x - 0.5`` is
+  itself achievable), and `round_half_up_f` is monotone non-decreasing, so
+  the rounded value AT that closed lower endpoint is exactly the maximum
+  achievable there -- no special derivation needed.
+* ``upper_f`` = the max, over every eligible row, of that row's CLOSED upper
+  Fahrenheit bound: its own ``round_half_up_f(temp_c_tenths)`` for a METAR
+  row (an exact point), or ``breezy.domain.temperature.max_rounded_f_below``
+  applied to ``temp_c_tenths + precision_c_tenths // 2`` otherwise. A
+  non-METAR row's real interval is HALF-OPEN on the upper end
+  (``[x - 0.5, x + 0.5)``) and the real temperature is continuous, not
+  confined to the tenths grid -- so the largest ACHIEVABLE rounded
+  Fahrenheit value is the supremum of `round_half_up_f` over reals
+  approaching that exclusive bound from below, not `round_half_up_f` of the
+  bound itself (worked example: a 29 C row's real interval is
+  ``[28.5, 29.5)`` C; 29.4 C is inside it and rounds to 85 F, so ``upper_f``
+  is 85, not `round_half_up_f(295) == 85` by coincidence but
+  `round_half_up_f(294) == 84` would UNDER-count if the exclusive tenths
+  boundary itself were rounded naively -- see `max_rounded_f_below`'s
+  docstring for the exact derivation).
 * ``exact_f`` is set (non-``None``) only when the row that determines
   ``upper_f`` (ties broken toward a METAR row, then toward the latest
   ``observed_at_ns``) is itself a METAR row -- in that case the interval
   collapses to that row's own rounded value.
 
-`RunningMax.is_ambiguous(rung_width_f)` states whether the interval
-``[lower_f, upper_f)`` spans more than one venue rung of the given width (the
-Polymarket.us weather rungs are 1 F buckets, ``gteXXltYYf`` -- see
-``docs/plans/BL24_LIVE_RT_2026-09-04.md`` amendment A13); a rung decision on
-an ambiguous interval must be REFUSED by the caller, never rounded or
-guessed (L-17).
+Use :meth:`RunningMax.spans` against the ACTUAL venue ladder (closed-closed
+rungs, exactly the shape ``WeatherBucketFacts.lower_f``/``upper_f`` expose)
+to decide whether ``[lower_f, upper_f]`` can be resolved to one rung; a rung
+decision on a spanning interval must be REFUSED by the caller, never rounded
+or guessed (L-17).
 """
 
 from __future__ import annotations
@@ -81,11 +98,10 @@ from dataclasses import dataclass
 from itertools import pairwise
 from typing import Final
 
-from breezy.domain.temperature import round_half_up_f
+from breezy.domain.temperature import max_rounded_f_below, round_half_up_f
 from breezy.normalize.climate_day import climate_day_for_instant
 
 _NS_PER_SECOND: Final[int] = 1_000_000_000
-_DEFAULT_RUNG_WIDTH_F: Final[int] = 1
 
 
 def _instant_from_ns(instant_ns: int) -> dt.datetime:
@@ -117,19 +133,32 @@ class _Row:
             return self.temp_c_tenths
         return self.temp_c_tenths - self._half_width_c_tenths()
 
-    def upper_c_tenths(self) -> int:
+    def upper_f_closed(self) -> int:
+        """The row's CLOSED upper Fahrenheit bound.
+
+        A METAR row is an exact point: its own rounded value. A non-METAR
+        row's real interval is half-open on the upper end
+        (``[x - half_width, x + half_width)``), so the achievable maximum is
+        the supremum of `round_half_up_f` over reals approaching that
+        exclusive Celsius-tenths bound from below -- see
+        `breezy.domain.temperature.max_rounded_f_below`.
+        """
         if self.is_metar:
-            return self.temp_c_tenths
-        return self.temp_c_tenths + self._half_width_c_tenths()
+            return round_half_up_f(self.temp_c_tenths)
+        upper_c_tenths_exclusive = self.temp_c_tenths + self._half_width_c_tenths()
+        return max_rounded_f_below(upper_c_tenths_exclusive)
 
 
 @dataclass(frozen=True, slots=True)
 class RunningMax:
-    """The running maximum as a Fahrenheit INTERVAL `[lower_f, upper_f)`.
+    """The running maximum as a Fahrenheit INTERVAL `[lower_f, upper_f]`.
 
-    `upper_f` is EXCLUSIVE, matching the venue's own rung convention
-    (`gteXXltYYf`). `exact_f` is set only when the interval collapses to a
-    single Fahrenheit integer because the maximizing row was a METAR (exact,
+    Both ends are CLOSED, matching `WeatherBucketFacts.contains`
+    (`breezy/domain/weather_bucket_facts.py`, verified against 114/114 real
+    venue ladders) -- NOT the venue's own half-open rung-label convention
+    (`gteXXltYYf`), which is a display convention, not this interval's
+    shape. `exact_f` is set only when the interval collapses to a single
+    Fahrenheit integer because the maximizing row was a METAR (exact,
     tenths) reading -- see the module docstring's "Interval-valued `R(t)`"
     section for the exact definition of `lower_f`/`upper_f`/`exact_f`.
     """
@@ -140,63 +169,34 @@ class RunningMax:
     source_observed_at_ns: int
     source_received_at_ns: int
 
-    def is_ambiguous(self, rung_width_f: int = _DEFAULT_RUNG_WIDTH_F) -> bool:
-        """`True` iff `[lower_f, upper_f)` spans more than one `rung_width_f`-wide rung.
-
-        ADVISORY ONLY: this assumes a UNIFORM, width-aligned ladder (rung
-        boundaries at every multiple of `rung_width_f`). Real venue ladders
-        are not width-aligned -- e.g. Polymarket.us weather markets phase
-        rungs oddly (`[91,92]`-style) with open-ended tails -- so this
-        method cannot answer containment against the actual ladder. Use
-        :meth:`spans` against the real rung boundaries for that; this method
-        is a cheap, width-only estimate.
-
-        A rung boundary is a multiple of `rung_width_f`. The interval is
-        ambiguous when its lower bound and its largest contained integer
-        degree (`upper_f - 1`, since `upper_f` is exclusive) do not fall in
-        the same rung.
-        """
-        if rung_width_f <= 0:
-            raise ValueError(f"`rung_width_f` must be positive, was {rung_width_f}")
-        if self.upper_f <= self.lower_f:
-            return False
-        lower_rung = self.lower_f // rung_width_f
-        upper_rung = (self.upper_f - 1) // rung_width_f
-        return lower_rung != upper_rung
-
     def spans(self, bounds: Sequence[tuple[int | None, int | None]]) -> bool:
-        """`True` iff `[lower_f, upper_f)` cannot be resolved to ONE rung of `bounds`.
+        """`True` iff `[lower_f, upper_f]` (closed both ends) cannot be resolved to ONE rung.
 
-        Unlike `is_ambiguous`, this takes the ACTUAL venue ladder rather
-        than assuming a uniform width: real ladders are not width-aligned
-        (Polymarket.us weather rungs phase oddly, e.g. `[91, 92)` next to
-        `[92, 94)`, with open-ended tails). Each element of `bounds` is
-        `(rung_lower_f, rung_upper_f)`; either bound may be `None` for an
-        open (unbounded) tail rung. `bounds` order and coverage are the
-        caller's responsibility -- this method does not validate that
-        `bounds` tiles the real number line without gaps or overlaps.
+        `bounds` uses the SAME closed-closed convention as
+        `WeatherBucketFacts.lower_f`/`upper_f` -- pass those fields straight
+        through. Each element is `(rung_lower_f, rung_upper_f)`; either
+        bound may be `None` for an open (unbounded) tail rung. `bounds`
+        order and coverage are the caller's responsibility -- this method
+        does not validate that `bounds` tiles the real number line without
+        gaps or overlaps.
 
-        Ambiguous (returns `True`) both when the interval's lower bound and
-        its largest contained integer degree (`upper_f - 1`) fall in
+        Ambiguous (returns `True`) both when `lower_f` and `upper_f` fall in
         DIFFERENT listed rungs, and when either endpoint falls in NO listed
         rung at all -- this method fails closed rather than assume
         containment it cannot prove.
         """
-        if self.upper_f <= self.lower_f:
-            return False
-        largest_contained_f = self.upper_f - 1
 
         def _rung_index(value: int) -> int | None:
             for index, (rung_lower, rung_upper) in enumerate(bounds):
                 if rung_lower is not None and value < rung_lower:
                     continue
-                if rung_upper is not None and value >= rung_upper:
+                if rung_upper is not None and value > rung_upper:
                     continue
                 return index
             return None
 
         lower_rung = _rung_index(self.lower_f)
-        upper_rung = _rung_index(largest_contained_f)
+        upper_rung = _rung_index(self.upper_f)
         if lower_rung is None or upper_rung is None:
             return True
         return lower_rung != upper_rung
@@ -290,10 +290,10 @@ class RunningExtremeAccumulator:
         # `source_observed_at_ns` are picked deterministically.
         def _sort_key(item: tuple[int, _Row]) -> tuple[int, bool, int]:
             observed_at_ns, row = item
-            return (round_half_up_f(row.upper_c_tenths()), row.is_metar, observed_at_ns)
+            return (row.upper_f_closed(), row.is_metar, observed_at_ns)
 
         max_observed_at_ns, max_row = max(eligible, key=_sort_key)
-        upper_f = round_half_up_f(max_row.upper_c_tenths())
+        upper_f = max_row.upper_f_closed()
         exact_f = round_half_up_f(max_row.temp_c_tenths) if max_row.is_metar else None
 
         return RunningMax(

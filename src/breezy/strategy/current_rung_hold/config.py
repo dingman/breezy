@@ -43,7 +43,7 @@ NOT operator controls
 
 The two operator-reserved caps (maximum daily trading budget; maximum
 notional per position) are deliberately absent from this config. They are
-supplied by ``operator_controls`` at runtime, exactly as every other weather
+supplied by the operator-reserved control module at runtime, exactly as every other weather
 strategy in this repo leaves them unset in its own ``StrategyConfig`` --- see
 ``breezy.strategy.weather_common.risk.RiskLimits`` and the sibling configs'
 docstrings ("the two operator-reserved dollar controls ... stay unset here").

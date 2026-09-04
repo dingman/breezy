@@ -10,10 +10,16 @@ amendment A3 (hour-resolution comparison), extended by amendment A13
 from __future__ import annotations
 
 import datetime as dt
+import math
+from fractions import Fraction
 from types import ModuleType
 
 import pytest
 
+from breezy.domain.temperature import (
+    max_rounded_f_below,
+    round_half_up_f,
+)
 from breezy.strategy.weather_common.running_extreme import (
     CoverageReport,
     RunningExtremeAccumulator,
@@ -141,7 +147,6 @@ def test_agrees_with_the_offline_oracle_at_each_local_standard_hour_end(
         assert running_max.lower_f == expected, hour
         assert running_max.upper_f == expected, hour
         assert running_max.exact_f == expected, hour
-        assert running_max.is_ambiguous() is False, hour
 
 
 # ---------------------------------------------------------------------------
@@ -308,13 +313,36 @@ def test_a_row_received_after_now_is_invisible_until_its_own_receipt_instant() -
 # ---------------------------------------------------------------------------
 
 
-def test_an_integer_row_that_straddles_two_f_rungs_is_ambiguous() -> None:
+def test_a_29c_row_has_closed_upper_bound_85_not_the_naive_exclusive_85() -> None:
+    """Worked example from the Seam A-2 defect report.
+
+    A 29 C row's real interval is `[28.5, 29.5)` C. 29.4 C is inside that
+    interval and rounds to 85 F, so the achievable maximum is 85 -- CLOSED,
+    i.e. `upper_f == 85`, not an exclusive bound that would (wrongly)
+    exclude 85 from the reachable set.
+    """
     accumulator = RunningExtremeAccumulator(std_utc_offset_hours=_LAX_STD_OFFSET_HOURS)
     climate_day = dt.date(2025, 1, 15)
     instant = _local_midnight_utc(climate_day, _LAX_STD_OFFSET_HOURS) + dt.timedelta(hours=1)
 
-    # 10.0 C, full width 1.0 C (`[9.5, 10.5)` C) -> `[49, 51)` F: a 2 F-wide
-    # interval that spans two 1 F rungs (49-50 and 50-51).
+    _push_integer_row(accumulator, instant_utc=instant, temp_c_tenths=290)
+
+    running_max = accumulator.value_at(_ns(instant))
+    assert running_max is not None
+    assert running_max.exact_f is None
+    assert running_max.lower_f == 83
+    assert running_max.upper_f == 85
+    # 29.4 C is a real, achievable value strictly inside `[28.5, 29.5)` C.
+    assert round_half_up_f(294) == 85
+
+
+def test_an_integer_row_that_straddles_two_f_rungs_has_a_two_wide_closed_interval() -> None:
+    accumulator = RunningExtremeAccumulator(std_utc_offset_hours=_LAX_STD_OFFSET_HOURS)
+    climate_day = dt.date(2025, 1, 15)
+    instant = _local_midnight_utc(climate_day, _LAX_STD_OFFSET_HOURS) + dt.timedelta(hours=1)
+
+    # 10.0 C, full width 1.0 C (`[9.5, 10.5)` C). 10.4 C is achievable and
+    # rounds to 51 F, so the closed interval is `[49, 51]`.
     _push_integer_row(accumulator, instant_utc=instant, temp_c_tenths=100)
 
     running_max = accumulator.value_at(_ns(instant))
@@ -322,19 +350,22 @@ def test_an_integer_row_that_straddles_two_f_rungs_is_ambiguous() -> None:
     assert running_max.exact_f is None
     assert running_max.lower_f == 49
     assert running_max.upper_f == 51
-    assert running_max.is_ambiguous() is True
+    assert round_half_up_f(104) == 51
+    ladder = [(None, 49), (49, 50), (50, 51), (51, None)]
+    assert running_max.spans(ladder) is True
 
 
-def test_a_later_metar_row_that_exceeds_an_ambiguous_integer_row_collapses() -> None:
+def test_a_later_metar_row_that_exceeds_a_wide_integer_row_collapses() -> None:
     accumulator = RunningExtremeAccumulator(std_utc_offset_hours=_LAX_STD_OFFSET_HOURS)
     climate_day = dt.date(2025, 1, 15)
     first = _local_midnight_utc(climate_day, _LAX_STD_OFFSET_HOURS) + dt.timedelta(hours=1)
     second = first + dt.timedelta(minutes=5)
 
     _push_integer_row(accumulator, instant_utc=first, temp_c_tenths=100)
-    ambiguous = accumulator.value_at(_ns(first))
-    assert ambiguous is not None
-    assert ambiguous.is_ambiguous() is True
+    wide = accumulator.value_at(_ns(first))
+    assert wide is not None
+    assert wide.lower_f == 49
+    assert wide.upper_f == 51
 
     # A METAR reading clearly above the integer row's interval -- the
     # running max collapses to an exact value.
@@ -343,90 +374,230 @@ def test_a_later_metar_row_that_exceeds_an_ambiguous_integer_row_collapses() -> 
     assert collapsed is not None
     assert collapsed.exact_f is not None
     assert collapsed.lower_f == collapsed.upper_f == collapsed.exact_f
-    assert collapsed.is_ambiguous() is False
     assert collapsed.source_observed_at_ns == _ns(second)
 
 
-def test_running_max_is_frozen_and_upper_bound_is_exclusive() -> None:
+def test_running_max_is_frozen_with_a_closed_closed_interval() -> None:
     running_max = RunningMax(
         lower_f=46, upper_f=48, exact_f=None, source_observed_at_ns=0, source_received_at_ns=0
     )
-    assert running_max.is_ambiguous(rung_width_f=1) is True
-    assert running_max.is_ambiguous(rung_width_f=2) is False
+    assert running_max.lower_f == 46
+    assert running_max.upper_f == 48
     with pytest.raises(AttributeError):
         running_max.lower_f = 0  # type: ignore[misc]
 
 
-def test_is_ambiguous_rejects_a_non_positive_rung_width() -> None:
-    running_max = RunningMax(
-        lower_f=46, upper_f=47, exact_f=46, source_observed_at_ns=0, source_received_at_ns=0
+# ---------------------------------------------------------------------------
+# `max_rounded_f_below` -- exhaustive sweep against direct enumeration
+# (BL-24 Seam A-2 fix). Every integer C from -40 to 45; for each, a fine
+# real-valued grid (hundredths, plus values approaching `T + 0.5` from
+# below) inside `[T - 0.5, T + 0.5)` C is rounded with the SAME formula the
+# production code uses (`round_half_up_f`, exact `Fraction` arithmetic --
+# never `float`), and the observed min/max must equal the closed-form
+# `RunningMax` bounds: `round_half_up_f` at the closed lower end, and
+# `max_rounded_f_below` at the exclusive upper end.
+# ---------------------------------------------------------------------------
+
+
+def _round_half_up_f_exact(c_tenths: Fraction) -> int:
+    fahrenheit = (c_tenths / 10) * 9 / 5 + 32
+    return math.floor(fahrenheit + Fraction(1, 2))
+
+
+@pytest.mark.parametrize("whole_c", range(-40, 46))
+def test_bounds_match_exhaustive_enumeration_for_every_whole_celsius_degree(
+    whole_c: int,
+) -> None:
+    lower_c_tenths = whole_c * 10 - 5
+    upper_c_tenths_exclusive = whole_c * 10 + 5
+
+    observed: set[int] = set()
+    # A grid at 1/100-of-a-tenth-C resolution across the full half-open
+    # interval (1000 points for a 10-tenths-wide interval).
+    steps = (upper_c_tenths_exclusive - lower_c_tenths) * 100
+    for step in range(steps):
+        observed.add(_round_half_up_f_exact(lower_c_tenths + Fraction(step, 100)))
+    # Values approaching the exclusive upper bound arbitrarily closely.
+    observed.add(
+        _round_half_up_f_exact(Fraction(upper_c_tenths_exclusive) - Fraction(1, 10**9))
     )
-    with pytest.raises(ValueError, match="rung_width_f"):
-        running_max.is_ambiguous(rung_width_f=0)
+
+    expected_lower = round_half_up_f(lower_c_tenths)
+    expected_upper = max_rounded_f_below(upper_c_tenths_exclusive)
+
+    assert min(observed) == expected_lower, whole_c
+    assert max(observed) == expected_upper, whole_c
 
 
 # ---------------------------------------------------------------------------
-# `spans` -- containment against the ACTUAL (non-width-aligned) venue ladder
+# Differential: `upper_f` for a non-METAR (interval) row matches the offline
+# oracle `build_running_max_days` fed the WORST-CASE (highest-rounding) real
+# value strictly inside that row's interval -- extends the existing
+# all-METAR differential (above) to interval rows, which it did not cover.
 # ---------------------------------------------------------------------------
 
-#: A Polymarket.us-style phased ladder: open-ended tails, oddly-sized rungs.
+
+def test_agrees_with_the_offline_oracle_at_the_worst_case_for_interval_rows(
+    study: ModuleType,
+) -> None:
+    climate_day = dt.date(2025, 1, 15)
+    tz = dt.timezone(dt.timedelta(hours=_LAX_STD_OFFSET_HOURS))
+    midnight_local = dt.datetime.combine(climate_day, dt.time(0, 0), tzinfo=tz)
+
+    metar_tenths_by_hour = {2: 50, 14: 100}
+    integer_tenths_by_hour = {0: 290, 6: -50, 10: 449, 20: 0}
+    half_width_c_tenths = _INTEGER_PRECISION_C_TENTHS // 2
+    epsilon_c_tenths = Fraction(1, 10**6)
+
+    accumulator = RunningExtremeAccumulator(std_utc_offset_hours=_LAX_STD_OFFSET_HOURS)
+    oracle_rows = []
+
+    for hour, tenths in sorted(metar_tenths_by_hour.items()):
+        instant = (midnight_local + dt.timedelta(hours=hour)).astimezone(dt.UTC)
+        _push_metar_row(accumulator, instant_utc=instant, temp_c_tenths=tenths)
+        oracle_rows.append(
+            study.MetarTemperature(
+                city="LAX",
+                valid_utc=instant,
+                climate_day=climate_day,
+                temp_c_tenths=tenths,
+                temp_f=study.c_tenths_to_f(tenths),
+                rounded_f=study.round_half_up_f(tenths),
+                raw_metar=_metar_row(
+                    station="LAX",
+                    valid=instant.strftime("%Y-%m-%d %H:%M"),
+                    t_group=_f_to_t_group(tenths),
+                )["metar"],
+            )
+        )
+
+    for hour, tenths in sorted(integer_tenths_by_hour.items()):
+        instant = (midnight_local + dt.timedelta(hours=hour)).astimezone(dt.UTC)
+        _push_integer_row(accumulator, instant_utc=instant, temp_c_tenths=tenths)
+        # The worst-case real value strictly inside `[.., T + half_width)`:
+        # approaches the exclusive upper bound arbitrarily closely. A METAR
+        # `T`-group cannot encode a non-tenths value, so the oracle row is
+        # built directly rather than round-tripped through the ASCII parser.
+        worst_case_c_tenths = Fraction(tenths + half_width_c_tenths) - epsilon_c_tenths
+        worst_case_f = (worst_case_c_tenths / 10) * 9 / 5 + 32
+        oracle_rows.append(
+            study.MetarTemperature(
+                city="LAX",
+                valid_utc=instant,
+                climate_day=climate_day,
+                temp_c_tenths=tenths,
+                temp_f=float(worst_case_f),
+                rounded_f=study.round_half_up_f(float(worst_case_c_tenths)),
+                raw_metar="<synthetic worst-case oracle row>",
+            )
+        )
+
+    (oracle_day,) = study.build_running_max_days(
+        city="LAX",
+        temperatures=tuple(oracle_rows),
+        std_utc_offset_hours=_LAX_STD_OFFSET_HOURS,
+    )
+
+    checked_hours = sorted({*metar_tenths_by_hour, *integer_tenths_by_hour})
+    for hour in checked_hours:
+        hour_end_local = midnight_local + dt.timedelta(hours=hour + 1)
+        hour_end_ns = _ns(hour_end_local.astimezone(dt.UTC)) - 1
+        running_max = accumulator.value_at(hour_end_ns)
+        assert running_max is not None, hour
+        assert running_max.upper_f == oracle_day.running_max_f[hour], hour
+
+
+# ---------------------------------------------------------------------------
+# `spans` -- containment against the ACTUAL (non-width-aligned) venue ladder.
+# `bounds` is CLOSED-CLOSED, the same convention `WeatherBucketFacts.lower_f`
+# / `upper_f` expose (verified against 114/114 real ladders) -- so these
+# fixtures are expressed exactly as `WeatherBucketFacts` would hand them to
+# a caller, not the venue's half-open display convention.
+# ---------------------------------------------------------------------------
+
+#: A Polymarket.us-style phased ladder expressed CLOSED-CLOSED: open-ended
+#: tails, oddly-sized rungs. Equivalent half-open venue labels in comments.
 _PHASED_LADDER: list[tuple[int | None, int | None]] = [
-    (None, 79),  # "lt79f"
-    (79, 91),
-    (91, 92),  # a genuinely 1 F-wide rung, phased oddly against its neighbours
-    (92, 94),
+    (None, 78),  # "lt79f"
+    (79, 90),
+    (91, 91),  # a genuinely 1 F-wide rung, phased oddly against its neighbours
+    (92, 93),
     (94, None),  # "gte94f"
 ]
 
 
 def test_spans_is_false_when_the_interval_fits_one_ladder_rung() -> None:
     running_max = RunningMax(
-        lower_f=80, upper_f=81, exact_f=80, source_observed_at_ns=0, source_received_at_ns=0
+        lower_f=80, upper_f=80, exact_f=80, source_observed_at_ns=0, source_received_at_ns=0
     )
     assert running_max.spans(_PHASED_LADDER) is False
 
 
 def test_spans_is_true_when_the_interval_crosses_two_ladder_rungs() -> None:
-    # [90, 93) crosses the 79-91, 91-92, and 92-94 rungs.
+    # [90, 92] crosses the 79-90, 91-91, and 92-93 rungs.
     running_max = RunningMax(
-        lower_f=90, upper_f=93, exact_f=None, source_observed_at_ns=0, source_received_at_ns=0
+        lower_f=90, upper_f=92, exact_f=None, source_observed_at_ns=0, source_received_at_ns=0
     )
     assert running_max.spans(_PHASED_LADDER) is True
 
 
 def test_spans_fits_the_narrow_odd_rung_that_a_uniform_width_would_miss() -> None:
-    """`[91, 92)` is a genuine single rung on the real ladder.
-
-    A UNIFORM 1 F-width `is_ambiguous` would call this unambiguous too, but
-    a 2 F-width `is_ambiguous` would wrongly call it ambiguous -- `spans`
-    answers correctly against the real ladder regardless of any assumed
-    width.
-    """
+    """`[91, 91]` is a genuine single rung on the real ladder."""
     running_max = RunningMax(
-        lower_f=91, upper_f=92, exact_f=91, source_observed_at_ns=0, source_received_at_ns=0
+        lower_f=91, upper_f=91, exact_f=91, source_observed_at_ns=0, source_received_at_ns=0
     )
     assert running_max.spans(_PHASED_LADDER) is False
 
 
 def test_spans_is_true_when_an_endpoint_falls_in_no_listed_rung() -> None:
     """Fails closed: a gap in the caller's ladder is never assumed safe."""
-    sparse_ladder: list[tuple[int | None, int | None]] = [(None, 50), (60, None)]
+    sparse_ladder: list[tuple[int | None, int | None]] = [(None, 49), (60, None)]
     running_max = RunningMax(
-        lower_f=55, upper_f=56, exact_f=55, source_observed_at_ns=0, source_received_at_ns=0
+        lower_f=55, upper_f=55, exact_f=55, source_observed_at_ns=0, source_received_at_ns=0
     )
     assert running_max.spans(sparse_ladder) is True
 
 
 def test_spans_handles_open_ended_tail_rungs() -> None:
     running_max = RunningMax(
-        lower_f=95, upper_f=96, exact_f=95, source_observed_at_ns=0, source_received_at_ns=0
+        lower_f=95, upper_f=95, exact_f=95, source_observed_at_ns=0, source_received_at_ns=0
     )
     assert running_max.spans(_PHASED_LADDER) is False
 
     below_all = RunningMax(
-        lower_f=10, upper_f=11, exact_f=10, source_observed_at_ns=0, source_received_at_ns=0
+        lower_f=10, upper_f=10, exact_f=10, source_observed_at_ns=0, source_received_at_ns=0
     )
     assert below_all.spans(_PHASED_LADDER) is False
+
+
+# ---------------------------------------------------------------------------
+# `spans` against `WeatherBucketFacts`-shaped closed rungs directly (item e).
+# ---------------------------------------------------------------------------
+
+
+def test_spans_refuses_an_interval_that_falls_between_two_wbf_style_rungs() -> None:
+    # Rungs "(.., 84]" and "[85, ..)" -- an interval [84, 85] straddles both.
+    wbf_ladder: list[tuple[int | None, int | None]] = [(None, 84), (85, None)]
+    running_max = RunningMax(
+        lower_f=84, upper_f=85, exact_f=None, source_observed_at_ns=0, source_received_at_ns=0
+    )
+    assert running_max.spans(wbf_ladder) is True
+
+
+def test_spans_is_false_when_wholly_inside_one_wbf_style_rung() -> None:
+    wbf_ladder: list[tuple[int | None, int | None]] = [(80, 84)]
+    running_max = RunningMax(
+        lower_f=83, upper_f=84, exact_f=None, source_observed_at_ns=0, source_received_at_ns=0
+    )
+    assert running_max.spans(wbf_ladder) is False
+
+
+def test_spans_fails_closed_when_an_endpoint_matches_no_wbf_style_rung() -> None:
+    wbf_ladder: list[tuple[int | None, int | None]] = [(80, 84), (90, 95)]
+    running_max = RunningMax(
+        lower_f=86, upper_f=86, exact_f=86, source_observed_at_ns=0, source_received_at_ns=0
+    )
+    assert running_max.spans(wbf_ladder) is True
 
 
 # ---------------------------------------------------------------------------

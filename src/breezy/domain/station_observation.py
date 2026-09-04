@@ -85,13 +85,15 @@ class StationObservation(Data):
         converted to Fahrenheit or rounded on this record (see module
         docstring).
     precision_c_tenths : int
-        The half-width, in tenths of a degree Celsius, of the interval the
-        true value is known to lie within: ``5`` for a METAR ``T``-group
-        reading (tenths resolution -- the true value lies in
-        ``[temp_c_tenths - 5, temp_c_tenths + 5)`` tenths), ``10`` for an
-        integer-Celsius row such as the NWS 5-minute API (the true value
-        lies in ``[x - 0.5, x + 0.5)`` degrees C, i.e. 10 tenths wide).
-        Amendment A13.
+        The FULL width, in tenths of a degree Celsius, of the reporting
+        interval -- NOT a half-width: ``10`` for an integer-Celsius row such
+        as the NWS 5-minute API (the true value lies in
+        ``[x - 0.5, x + 0.5)`` degrees C, i.e. a 10-tenths-wide interval,
+        half-width 5 either side of ``x``), ``5`` for a METAR ``T``-group
+        reading -- recorded only as descriptive provenance, since a METAR
+        row's own tenths-resolution value is consumed as an EXACT point (see
+        ``breezy.strategy.weather_common.running_extreme``), never widened
+        into an interval by this field. Amendment A13.
     is_metar : bool
         ``True`` when this reading came from a METAR ``T``-group (tenths
         resolution); ``False`` for an integer-Celsius source. Amendment A13.
