@@ -346,6 +346,12 @@ async def test_take_reaches_post_order_exactly_once_via_the_real_strategy_path(
         await _drain_pending_tasks()
 
     assert len(rig.sender.calls) == 1, "post_order must fire exactly once"
+    sent_body = json.loads(rig.sender.calls[0]["body"])
+    assert sent_body["action"] == "ORDER_ACTION_BUY"
+    assert sent_body["quantity"] == 1
+    assert sent_body["price"] == {"value": "0.40", "currency": "USD"}
+    assert sent_body["tif"] == "TIME_IN_FORCE_IMMEDIATE_OR_CANCEL"
+    assert "postOnly" not in sent_body
     record = strategy._latch.record(STATION, CLIMATE_DAY.isoformat())
     assert record is not None
     assert record.reason == "taken"

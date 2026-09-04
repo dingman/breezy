@@ -6,11 +6,14 @@ inside ``issue`` (the real construction path), so what THIS module pins is
 only the accidental-construction guard on ``__init__`` -- the seal check, the
 no-arg refusal, that the type is not a msgspec ``Struct``, and that no field
 value ever appears in ``repr()``. It never calls ``OrderSubmissionPermit.issue``
-by that name: this commit ships ``runtime/order_enablement.py`` with ZERO
-call sites of ``issue`` anywhere (B11,
-``test_polymarket_us_readonly_guard.py``), and a test calling it here would
-make that pin vacuous to check but also simply wrong -- ``issue`` has no
-legitimate caller yet.
+by that name: ``issue`` has exactly one PRODUCTION caller repo-wide,
+``app/trade.py::main`` (B11, ``test_polymarket_us_readonly_guard.py``), and a
+test calling it here would add a second call site to that pin. The test
+modules that DO exercise ``issue``'s refusal matrix
+(``test_order_submission_permit_issuance.py``,
+``test_current_rung_hold_order_submission_wiring.py``) call through a local
+alias for the same reason -- and B11's exact-set pin is alias-resolved, so
+those call sites are still counted, just not added to this module.
 """
 
 from __future__ import annotations

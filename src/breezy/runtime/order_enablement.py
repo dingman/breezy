@@ -12,8 +12,15 @@ A sealed object cannot be a field on a msgspec ``Struct``-based
 running code, never decoded out of a persisted or replayed strategy config.
 The AST barrier that makes this the guarantee -- pinning ``issue`` and the
 one construction site to an exact, reviewed call-set -- lives in
-``tests/unit/test_polymarket_us_readonly_guard.py`` (B11). In THIS commit
-that pin is a zero-call-site refusal: nothing anywhere calls ``issue`` yet.
+``tests/unit/test_polymarket_us_readonly_guard.py`` (B11): one pin on
+``OrderSubmissionPermit.issue``'s callers, one permanent pin on
+``OrderSubmissionPermit(``'s construction sites (only ``issue`` itself may
+construct it). ``issue`` has exactly one PRODUCTION caller,
+``app/trade.py::main``; the pin also covers ``tests/`` and is alias-resolved
+-- a rebind like ``_ISSUE = OrderSubmissionPermit.issue`` followed by
+``_ISSUE(...)`` still counts as a call site of ``issue``, not a silent
+evasion of the scanner. Residual, same class as B5/B8: dynamic ``getattr``
+dispatch is not resolved.
 
 ``orders_enabled`` on ``CurrentRungHoldConfig`` is not, and can never be, this
 capability: any bool or string field on a frozen msgspec config is exactly
@@ -53,6 +60,7 @@ __all__ = [
     "OrderSubmissionRefused",
     "OrdersNotRequestedError",
     "RungHoldNotReadyError",
+    "SettingsNotSettingsLikeError",
     "WriteCanonicalStringUnverifiedError",
 ]
 
@@ -102,6 +110,16 @@ class OperatorCapsNotConfiguredError(OrderSubmissionRefused):
 
 class RungHoldNotReadyError(OrderSubmissionRefused):
     """The current-rung-hold / live-observations settings are not both set."""
+
+
+class SettingsNotSettingsLikeError(OrderSubmissionRefused):
+    """``settings`` does not structurally satisfy ``SettingsLike``.
+
+    ``SettingsLike`` was declared ``runtime_checkable`` but never actually
+    checked -- a plain object missing one of the three required attributes
+    fell through to an ``AttributeError`` deep inside the precondition
+    chain instead of a named refusal at the door.
+    """
 
 
 @runtime_checkable
@@ -163,6 +181,11 @@ class OrderSubmissionPermit:
         path -- the checks live here, in the construction path, not in a
         sibling helper (L-22).
         """
+        if not isinstance(settings, SettingsLike):
+            raise SettingsNotSettingsLikeError(
+                "settings must satisfy the SettingsLike protocol"
+            )
+
         if settings.orders_enabled_requested is not True:
             raise OrdersNotRequestedError(
                 "orders_enabled_requested must be exactly True; enablement was "

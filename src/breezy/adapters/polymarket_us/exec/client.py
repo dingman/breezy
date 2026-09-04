@@ -14,13 +14,24 @@ included, therefore turns on for the FIRST time at the moment this client
 connects. That behaviour is pinned by
 ``tests/contract/test_risk_engine_ordering_enforcement.py``.
 
-**It also refuses every order, and nothing here can be configured to do
-otherwise.** ``_submit_order`` and ``_cancel_order`` carry denial bodies; the
-other four lifecycle coroutines raise. No order-path literal appears in this
-module, and none may: barrier V2
-(``tests/unit/test_polymarket_us_readonly_guard.py``) refuses one inside any
-venue-touching module with no allowlist, and the increment that genuinely
-needs it lands that barrier change under the plan's paired-barrier rule.
+**It submits at most one order per station-day, and every other lifecycle
+coroutine still refuses.** ``_submit_order`` is BUY-only, IOC, quantity-1,
+and permit-gated: it denies before any venue contact unless the trading
+refusals are clear, an account exists, the write-canonical string has been
+verified (``write_transport.WRITE_CANONICAL_STRING_VERIFIED``, which stays
+``False`` outside an explicit operator-approved increment), a live
+``OrderSubmissionPermit`` is present, and
+``assert_live_order_submission_permitted`` (B6) passes. Once armed, the
+durable submit-intent latch (``runtime/submit_intent.py``) makes the POST
+one-shot per station-day even across a process restart -- a second attempt
+for an already-consumed day is refused by the latch before ``post_order`` is
+ever reached. ``_cancel_order`` still carries a denial body; the remaining
+lifecycle coroutines raise. The order-path literal itself lives only in
+``write_transport.py`` (``ORDERS_PATH``), which this module reads through
+the attribute rather than spelling out itself: barrier V2
+(``tests/unit/test_polymarket_us_readonly_guard.py``) refuses a bare
+order-path literal inside any OTHER venue-touching module with no
+allowlist.
 
 NULL-HYPOTHESIS VERDICTS, WITH THE `path:line` ACTUALLY OPENED
 --------------------------------------------------------------

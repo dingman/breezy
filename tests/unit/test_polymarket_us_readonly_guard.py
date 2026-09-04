@@ -674,19 +674,68 @@ def barred_caller_sites(
     return frozenset(found)
 
 
+def _resolve_local_aliases(tree: ast.AST, callee: str) -> frozenset[str]:
+    """Names, within ONE module's AST, that are simple rebindings of ``callee``.
+
+    Closes the alias blind spot: a one-line rebind ``_x = Cls.method`` (or
+    ``_x = some_name``) followed by ``_x(...)`` evades a scanner that only
+    matches the literal attribute/name text. Resolved forms, module-level or
+    inside a function body, single assignment targets only:
+
+    * ``Name = Attribute(..., attr=callee)`` -- e.g. ``_ISSUE = Cls.issue``.
+    * ``Name = Name(id=callee)`` -- a direct rebind of another alias (or of
+      ``callee`` itself), so chains of aliases resolve transitively.
+    * ``import x as alias`` / ``from x import callee as alias`` -- an
+      import-level alias of the SAME bare name.
+
+    Residual (by design, same class as B5/B8): dynamic ``getattr`` dispatch,
+    tuple/starred assignment targets, and aliases assembled across more than
+    one assignment statement.
+    """
+    aliases = {callee}
+    changed = True
+    while changed:
+        changed = False
+        for node in ast.walk(tree):
+            if (
+                isinstance(node, ast.Assign)
+                and len(node.targets) == 1
+                and isinstance(node.targets[0], ast.Name)
+            ):
+                target = node.targets[0].id
+                if target in aliases:
+                    continue
+                value = node.value
+                resolved = (
+                    isinstance(value, ast.Attribute) and value.attr in aliases
+                ) or (isinstance(value, ast.Name) and value.id in aliases)
+                if resolved:
+                    aliases.add(target)
+                    changed = True
+            elif isinstance(node, ast.ImportFrom | ast.Import):
+                for alias in node.names:
+                    if alias.name in aliases and alias.asname and alias.asname not in aliases:
+                        aliases.add(alias.asname)
+                        changed = True
+    return frozenset(aliases)
+
+
 def named_call_sites(
     callee: str, roots: tuple[str, ...] = REPO_WIDE_SCAN_ROOTS
 ) -> frozenset[tuple[str, str]]:
-    """Repo-wide ``(path, enclosing_function)`` for a Call named ``callee``."""
+    """Repo-wide ``(path, enclosing_function)`` for a Call named ``callee``,
+    OR through a simple local alias of it (:func:`_resolve_local_aliases`).
+    """
     found: set[tuple[str, str]] = set()
     for path, source in iter_python_sources(roots):
         tree = ast.parse(source, filename=path)
+        aliases = _resolve_local_aliases(tree, callee)
         for node in ast.walk(tree):
             if not isinstance(node, ast.Call):
                 continue
             func = node.func
             name = func.attr if isinstance(func, ast.Attribute) else getattr(func, "id", "")
-            if name != callee:
+            if name not in aliases:
                 continue
             found.add((path, _enclosing_function(tree, node.lineno)))
     return frozenset(found)
@@ -1764,22 +1813,90 @@ def test_b6_b7_b8_b9_d3_non_vacuity() -> None:
 # stated in the diff review): the R-8/A3 commit shipped
 # ``runtime/order_enablement.py`` with NO caller of
 # ``OrderSubmissionPermit.issue`` anywhere in the repository
-# (``named_call_sites("issue") == frozenset()``). This CRH wiring commit
-# widens that to exactly one caller, ``app/trade.py::main`` -- the
-# composition root, mirroring B7's ``issue_live_trading_permit`` pin. It must
-# never be relaxed back past this set. The second pin is permanent:
-# ``OrderSubmissionPermit`` itself may only ever be constructed from inside
-# its own ``issue`` classmethod.
-
-
-def test_b11_issue_has_exactly_one_caller() -> None:
-    """B11 part one, WIDENED: ``issue`` has exactly one caller repo-wide,
-    ``app/trade.py::main``. OLD: ``frozenset()``. NEW: the one composition
-    root site below.
-    """
-    assert named_call_sites("issue") == {
+# (``named_call_sites("issue") == frozenset()``). The CRH wiring commit
+# widened that to exactly one PRODUCTION caller, ``app/trade.py::main`` --
+# the composition root, mirroring B7's ``issue_live_trading_permit`` pin.
+#
+# WIDENED AGAIN (review finding 2, alias blind spot): ``named_call_sites``
+# now resolves simple local aliases (:func:`_resolve_local_aliases`), so a
+# rebind like ``_ISSUE = OrderSubmissionPermit.issue`` followed by
+# ``_ISSUE(...)`` counts as a call site of ``issue`` instead of silently
+# evading the scanner. Two test modules use exactly that alias shape
+# (``test_order_submission_permit_issuance.py``'s ``_ISSUE``,
+# ``test_current_rung_hold_order_submission_wiring.py``'s ``_ISSUE``), so the
+# exact set widens from ``{("src/breezy/app/trade.py", "main")}`` to that
+# ONE production site plus every test function that calls through those
+# aliases -- enumerated in full below. No new PRODUCTION caller was added;
+# every added entry is a test exercising ``issue``'s refusal matrix or the
+# CRH wiring rig, already reachable before this commit only because the
+# scanner could not see through the alias.
+_B11_ISSUE_SITES: frozenset[tuple[str, str]] = frozenset(
+    {
         ("src/breezy/app/trade.py", "main"),
+        (
+            "tests/unit/test_current_rung_hold_order_submission_wiring.py",
+            "_build_wiring_rig",
+        ),
+        (
+            "tests/unit/test_order_submission_permit_issuance.py",
+            "test_all_preconditions_satisfied_issues_a_permit",
+        ),
+        (
+            "tests/unit/test_order_submission_permit_issuance.py",
+            "test_current_rung_hold_not_ready_refuses",
+        ),
+        (
+            "tests/unit/test_order_submission_permit_issuance.py",
+            "test_live_observations_not_ready_refuses",
+        ),
+        (
+            "tests/unit/test_order_submission_permit_issuance.py",
+            "test_live_trading_permit_expired_refuses",
+        ),
+        (
+            "tests/unit/test_order_submission_permit_issuance.py",
+            "test_live_trading_permit_wrong_type_refuses",
+        ),
+        (
+            "tests/unit/test_order_submission_permit_issuance.py",
+            "test_operator_caps_absent_refuses",
+        ),
+        (
+            "tests/unit/test_order_submission_permit_issuance.py",
+            "test_operator_caps_and_rung_hold_messages_name_no_value",
+        ),
+        (
+            "tests/unit/test_order_submission_permit_issuance.py",
+            "test_orders_not_requested_message_names_no_value",
+        ),
+        (
+            "tests/unit/test_order_submission_permit_issuance.py",
+            "test_orders_not_requested_refuses",
+        ),
+        (
+            "tests/unit/test_order_submission_permit_issuance.py",
+            "test_settings_not_satisfying_settingslike_protocol_refuses",
+        ),
+        (
+            "tests/unit/test_order_submission_permit_issuance.py",
+            "test_write_canonical_string_unverified_refuses",
+        ),
+        (
+            "tests/unit/test_order_submission_permit_issuance.py",
+            "test_write_canonical_unverified_message_names_no_value",
+        ),
     }
+)
+
+
+def test_b11_issue_has_exactly_one_production_caller_plus_alias_resolved_test_sites() -> None:
+    """B11 part one, WIDENED (alias resolution): ``issue`` has exactly one
+    PRODUCTION caller, ``app/trade.py::main``, plus the alias-resolved test
+    sites in ``_B11_ISSUE_SITES``. OLD: ``{("src/breezy/app/trade.py",
+    "main")}``. NEW: ``_B11_ISSUE_SITES`` (see the module comment above for
+    the full old -> new rationale).
+    """
+    assert named_call_sites("issue") == _B11_ISSUE_SITES
 
 
 def test_b11_issue_pin_is_not_vacuous_against_a_planted_conftest_caller(
@@ -1838,6 +1955,74 @@ def test_b11_issue_pin_is_not_vacuous_against_a_planted_second_caller(
     assert named_call_sites("issue", roots=("src",)) == {
         ("src/rogue_module.py", "extra"),
     }
+
+
+def test_named_call_sites_resolves_a_simple_local_alias(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Review finding 2 non-vacuity, direction one: a one-line rebind
+    ``_ALIAS = Cls.method`` followed by ``_ALIAS(...)`` -- exactly the shape
+    ``test_order_submission_permit_issuance.py``'s ``_ISSUE`` and
+    ``test_current_rung_hold_order_submission_wiring.py``'s ``_ISSUE`` use --
+    is caught as a call site of ``method`` by the REAL scanner.
+    """
+    (tmp_path / "src").mkdir()
+    (tmp_path / "src" / "aliasing_module.py").write_text(
+        "class Cls:\n"
+        "    @classmethod\n"
+        "    def method(cls):\n"
+        "        return None\n"
+        "\n"
+        "\n"
+        "_ALIAS = Cls.method\n"
+        "\n"
+        "\n"
+        "def caller():\n"
+        "    return _ALIAS()\n"
+    )
+    monkeypatch.setattr(
+        "tests.unit.test_polymarket_us_readonly_guard.REPO_ROOT", tmp_path
+    )
+    assert named_call_sites("method", roots=("src",)) == {
+        ("src/aliasing_module.py", "caller"),
+    }
+
+
+def test_named_call_sites_alias_resolution_does_not_over_match_an_unrelated_name(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Review finding 2 non-vacuity, direction two: the SAME planted module
+    exposes a second, unrelated function -- alias resolution for ``method``
+    must not spuriously catch calls to ``other``.
+    """
+    (tmp_path / "src").mkdir()
+    (tmp_path / "src" / "aliasing_module.py").write_text(
+        "class Cls:\n"
+        "    @classmethod\n"
+        "    def method(cls):\n"
+        "        return None\n"
+        "\n"
+        "\n"
+        "_ALIAS = Cls.method\n"
+        "\n"
+        "\n"
+        "def other():\n"
+        "    return None\n"
+        "\n"
+        "\n"
+        "def caller():\n"
+        "    other()\n"
+        "    return _ALIAS()\n"
+    )
+    monkeypatch.setattr(
+        "tests.unit.test_polymarket_us_readonly_guard.REPO_ROOT", tmp_path
+    )
+    assert named_call_sites("other", roots=("src",)) == {
+        ("src/aliasing_module.py", "caller"),
+    }
+    assert named_call_sites("an_unrelated_name_nobody_calls", roots=("src",)) == frozenset()
 
 
 def _modules_importing(token: str, roots: tuple[str, ...] = EGRESS_SCAN_ROOTS) -> frozenset[str]:

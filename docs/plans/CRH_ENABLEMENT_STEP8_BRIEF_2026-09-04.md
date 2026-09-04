@@ -260,14 +260,16 @@ Reviewers: architect (REVISE), security-reviewer (CONVERGE + R1–R3), predictio
 (REVISE). Merged decisions:
 
 1. **Preconditions live in the constructor (L-22).** `OrderSubmissionPermit` cannot exist
-   unvalidated: the six checks run inside its construction path (`@classmethod issue(...)` IS the
+   unvalidated: the five checks run inside its construction path (`@classmethod issue(...)` IS the
    constructor; `__init__` refuses without the internal seal). The module sentinel is an
    accidental-construction guard only. The security claim is **data-unforgeability** (a sealed object
    cannot be a msgspec `StrategyConfig` field, so it is reachable only from code, never from decoded
    config; `common/config.py:241`, `trading/config.py:149-154`) and the **B11 AST one-caller pin +
    one-construction-site pin are the guarantee**. Rewrite the Goal accordingly. Drop the
    `__init_subclass__`/`__reduce__`/deepcopy assertions from T2; keep seal check, no-arg refusal,
-   not-a-Struct.
+   not-a-Struct. A sixth candidate check, venue-credential completeness, is deliberately NOT one
+   of the five: `issue` carries no credentials object, so completeness is enforced downstream at
+   D3 (`safety.assert_live_order_submission_permitted`), not here (`order_enablement.py:25-32`).
 2. **`orders_enabled` stays a refused field** (removing it would delete live RED assertions, L-12);
    docstring rewrite only. The `_maybe_submit` gate keeps the `stale_observation_minutes` `int`
    conjunct alongside the permit.

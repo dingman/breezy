@@ -38,6 +38,7 @@ from breezy.runtime.order_enablement import (
     OrdersNotRequestedError,
     OrderSubmissionPermit,
     RungHoldNotReadyError,
+    SettingsNotSettingsLikeError,
     WriteCanonicalStringUnverifiedError,
 )
 from tests.unit.operator_control_env import operator_control_env
@@ -52,15 +53,17 @@ from tests.unit.test_polymarket_us_submit_order_chain import (
 
 _ = credentials  # imported for parity with the shipped rig; not used directly here
 
-#: B11 pins ``named_call_sites("issue") == {("src/breezy/app/trade.py", "main")}``
-#: repo-wide, INCLUDING ``tests/`` (``REPO_WIDE_SCAN_ROOTS``) -- deliberately
-#: stricter than B6/B7, which scope to ``src``/``scripts`` only, because the
-#: whole security claim here is an exact one-caller AST pin (converged review
-#: item 1). Every call below binds through this local alias rather than
-#: writing ``OrderSubmissionPermit.issue(`` literally, so exercising the
-#: refusal matrix in tests never adds a second call site to that pin (the
-#: scanner matches on the literal attribute/name text ``"issue"``, and a
-#: local name bound to the same classmethod is not that text).
+#: B11 pins ``named_call_sites("issue")`` to exactly one PRODUCTION caller,
+#: ``("src/breezy/app/trade.py", "main")``, repo-wide, INCLUDING ``tests/``
+#: (``REPO_WIDE_SCAN_ROOTS``) -- deliberately stricter than B6/B7, which
+#: scope to ``src``/``scripts`` only, because the whole security claim here
+#: is an exact-set AST pin (converged review item 1). Every call below binds
+#: through this local alias rather than writing ``OrderSubmissionPermit.issue(``
+#: literally; the scanner is alias-aware (review finding 2,
+#: ``_resolve_local_aliases`` in ``test_polymarket_us_readonly_guard.py``), so
+#: each test function below IS still counted as a call site of ``issue`` --
+#: enumerated explicitly, alongside the production caller, in
+#: ``_B11_ISSUE_SITES``.
 _ISSUE = OrderSubmissionPermit.issue
 
 
@@ -283,3 +286,27 @@ def test_operator_caps_and_rung_hold_messages_name_no_value(
                 clock=clock,
             )
         _assert_message_names_no_value(exc_rung.value)
+
+
+def test_settings_not_satisfying_settingslike_protocol_refuses(
+    monkeypatch: pytest.MonkeyPatch,
+    write_canonical_verified: None,  # noqa: F811
+) -> None:
+    """Finding 4: ``SettingsLike`` is declared ``runtime_checkable`` but was
+    never actually checked -- a plain object missing the three required
+    attributes must be refused by name at the door, not fall through to an
+    ``AttributeError`` deep inside the precondition chain.
+    """
+    enable_operator_gate(monkeypatch)
+    clock = clock_at()
+    live_permit = issue_live_trading_permit(clock=clock)
+
+    class _PlainObject:
+        pass
+
+    with _caps(), pytest.raises(SettingsNotSettingsLikeError):
+        _ISSUE(
+            settings=_PlainObject(),
+            live_trading_permit=live_permit,
+            clock=clock,
+        )
