@@ -29,6 +29,7 @@ from breezy.adapters.polymarket_us.errors import (
 from breezy.adapters.polymarket_us.http import PolymarketUSHttpClient
 from breezy.adapters.polymarket_us.provider import (
     MARKET_LIST_PATH,
+    MAX_DISCOVERY_PAGES,
     PolymarketUSInstrumentProvider,
     discovery_candidate_slugs,
 )
@@ -263,8 +264,7 @@ async def test_zero_discovery_cycle_raises_and_alerts_loudly() -> None:
         await provider.load_all_async()
 
     assert any(
-        level == "error" and "discovery returned zero" in msg
-        for level, msg in logger.messages
+        level == "error" and "discovery returned zero" in msg for level, msg in logger.messages
     )
 
 
@@ -476,3 +476,87 @@ async def test_a_site_registry_mismatch_is_distinguishable_from_a_venue_payload_
         await provider.load_all_async()
 
     assert not isinstance(exc_info.value, VenuePayloadError)
+
+
+# ---------------------------------------------------------------------------
+# Duplicate-slug rejection, page cap, and resolved-market exclusion
+# ---------------------------------------------------------------------------
+
+_DUPLICATE_SLUG = "tc-temp-nychigh-2026-08-25-lt79f"
+
+
+@pytest.mark.asyncio
+async def test_provider_rejects_duplicate_slug_across_pages() -> None:
+    """The same slug returned on two consecutive pages aborts the cycle
+    instead of silently deduplicating it (``load_all_async``, provider.py
+    ~334-336: the duplicate check runs over ALL discovered markets across
+    every page, not per-page)."""
+    market = market_with_slug(_DUPLICATE_SLUG)
+    provider, transport, _ = provider_for_pages(
+        [page_with(market), page_with(market), page_with()],
+        discovery=PolymarketUSMarketDiscoveryConfig(limit=1),
+    )
+
+    with pytest.raises(VenuePayloadError, match="duplicate slugs"):
+        await provider.load_all_async()
+
+    assert len(transport.calls) == 3
+
+
+@pytest.mark.asyncio
+async def test_provider_rejects_duplicate_slug_within_one_page() -> None:
+    """The same slug appearing twice on a single page aborts the cycle
+    instead of silently deduplicating it."""
+    market = market_with_slug(_DUPLICATE_SLUG)
+    provider, transport, _ = provider_for_pages(
+        [page_with(market, market)],
+        discovery=PolymarketUSMarketDiscoveryConfig(limit=10),
+    )
+
+    with pytest.raises(VenuePayloadError, match="duplicate slugs"):
+        await provider.load_all_async()
+
+    assert len(transport.calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_provider_stops_at_the_page_cap_and_reports_it() -> None:
+    """A transport that always returns a full page never loops past
+    ``MAX_DISCOVERY_PAGES``: the request count equals the cap and the
+    provider raises ``VenuePayloadError`` naming the cap (provider.py
+    ~468-473) rather than looping forever or truncating silently."""
+    market = market_with_slug(_DUPLICATE_SLUG)
+    provider, transport, _ = provider_for_pages(
+        [page_with(market)],
+        discovery=PolymarketUSMarketDiscoveryConfig(limit=1),
+    )
+
+    with pytest.raises(VenuePayloadError, match=f"{MAX_DISCOVERY_PAGES}-page cap"):
+        await provider.load_all_async()
+
+    assert len(transport.calls) == MAX_DISCOVERY_PAGES
+
+
+@pytest.mark.asyncio
+async def test_resolved_markets_are_excluded_from_active_slugs_but_retained_for_lookup() -> None:
+    """A resolved market stays in ``market_slugs`` (the discovered-universe
+    lookup set ``load_ids_async`` consults, provider.py ~250-258) but is
+    excluded from ``active_market_slugs`` and is never added as a loadable
+    instrument (provider.py ~400-406: resolved markets are recorded and
+    ``continue``-d before the instrument is ever built)."""
+    provider, _, _ = provider_for_pages(
+        [
+            page_with(
+                wrapped_market("market_open_510636_by_slug.json"),
+                wrapped_market("market_closed_15806_by_slug.json"),
+            )
+        ],
+        discovery=PolymarketUSMarketDiscoveryConfig(limit=10),
+    )
+
+    await provider.load_all_async()
+
+    assert set(provider.market_slugs) == {OPEN_SLUG, EXPIRED_SLUG}
+    assert provider.active_market_slugs == (OPEN_SLUG,)
+    assert EXPIRED_SLUG in provider.resolved_market_reasons
+    assert provider.find(InstrumentId(Symbol(EXPIRED_SLUG), POLYMARKET_US_VENUE)) is None
