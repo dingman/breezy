@@ -1756,6 +1756,59 @@ def test_b6_b7_b8_b9_d3_non_vacuity() -> None:
     assert [v.rule for v in second_d3] == ["D3"]
 
 
+# ==========================================================================
+# Barrier B11 -- OrderSubmissionPermit: zero call sites (this commit)
+# ==========================================================================
+#
+# ``runtime/order_enablement.py`` ships in this commit with NO caller of
+# ``OrderSubmissionPermit.issue`` anywhere in the repository. A later CRH
+# wiring commit widens the first pin below to exactly one caller,
+# ``app/trade.py::main`` -- it must never be relaxed back past that set
+# (L-12). The second pin is permanent: ``OrderSubmissionPermit`` itself may
+# only ever be constructed from inside its own ``issue`` classmethod.
+
+
+def test_b11_issue_order_submission_permit_has_no_caller_yet() -> None:
+    """B11 part one: zero callers of ``issue`` anywhere, this commit."""
+    assert named_call_sites("issue") == frozenset()
+
+
+def test_b11_order_submission_permit_is_constructed_at_exactly_one_site() -> None:
+    """B11 part two: ``OrderSubmissionPermit(`` is constructed at exactly one
+    site in production code -- its own ``issue`` classmethod.
+
+    Scoped to ``EGRESS_SCAN_ROOTS`` (``src``, ``scripts``), the same scope
+    ``barred_caller_sites`` uses for B6/B7: a unit test exercising the
+    permit's ``__init__`` directly (seal check, no-arg refusal) constructs it
+    from ``tests/``, by design, without going through ``issue`` -- exactly
+    the reason the B6/B7 tests call their guarded functions directly from
+    ``tests/`` without tripping the production-only pin.
+    """
+    assert named_call_sites("OrderSubmissionPermit", roots=EGRESS_SCAN_ROOTS) == {
+        ("src/breezy/runtime/order_enablement.py", "issue")
+    }
+
+
+def test_b11_issue_pin_is_not_vacuous_against_a_planted_second_caller(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """B11 non-vacuity, same shape as the B9 proof: a planted second caller of
+    ``issue`` under a throwaway tree, walked by the REAL scanner.
+    """
+    (tmp_path / "src").mkdir()
+    (tmp_path / "src" / "rogue_module.py").write_text(
+        "def extra(permit_cls, settings, permit, clock):\n"
+        "    return permit_cls.issue(settings=settings, live_trading_permit=permit, clock=clock)\n"
+    )
+    monkeypatch.setattr(
+        "tests.unit.test_polymarket_us_readonly_guard.REPO_ROOT", tmp_path
+    )
+    assert named_call_sites("issue", roots=("src",)) == {
+        ("src/rogue_module.py", "extra"),
+    }
+
+
 def _modules_importing(token: str, roots: tuple[str, ...] = EGRESS_SCAN_ROOTS) -> frozenset[str]:
     found: set[str] = set()
     for path, source in iter_python_sources(roots):
@@ -1796,6 +1849,11 @@ def test_c10_submit_intent_and_operator_controls_reference_pins() -> None:
     }
     assert _modules_importing("operator_controls") == {
         "src/breezy/adapters/polymarket_us/factories.py",
+        # WIDENED (L-12), not relaxed: A3 adds the sealed order-submission
+        # permit, whose ``issue`` reads both operator caps present-and-
+        # positive through the same two accessor functions ``factories.py``
+        # already imports the ledger from.
+        "src/breezy/runtime/order_enablement.py",
     }
 
 

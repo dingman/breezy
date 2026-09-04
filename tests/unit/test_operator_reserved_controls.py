@@ -659,11 +659,13 @@ def test_module_docstring_states_the_fee_floor_precondition() -> None:
 def test_the_mechanism_has_no_production_call_site_yet() -> None:
     """Ships as a library, the shape R-4 and R-6d landed in.
 
-    The consumer is R-7's submit path. Pre-wiring it into ``exec/client.py``
-    would put an order-path change inside a policy increment, and R-4's
-    standing refusal keeps that path closed regardless. When R-7 lands, this
-    test is the one that must be updated deliberately -- an accidental early
-    wiring fails it.
+    R-7's submit path (``factories.py``) is one consumer. CRH enablement
+    step 8's sealed order-submission permit (``runtime/order_enablement.py``,
+    A3) is a second: ``issue`` reads both operator caps present-and-positive
+    through the same two accessor functions, before any ledger booking
+    exists. WIDENED, not relaxed (L-12) -- a THIRD importer arriving here
+    undeclared is still the accidental-wiring signal this test exists to
+    catch.
     """
     from pathlib import Path
 
@@ -676,4 +678,7 @@ def test_the_mechanism_has_no_production_call_site_yet() -> None:
         and "operator_controls" in path.read_text(encoding="utf-8")
         and path.name != "operator_controls.py"
     )
-    assert importers == ["src/breezy/adapters/polymarket_us/factories.py"]
+    assert importers == [
+        "src/breezy/adapters/polymarket_us/factories.py",
+        "src/breezy/runtime/order_enablement.py",
+    ]
