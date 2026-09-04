@@ -49,3 +49,37 @@ D0 · stations LAX, MDW, MIA, SFO (NYC excluded, L-13) · window [12:00,17:00) L
 
 ## 8. Least-confident decisions (peer review must settle)
 1 width-based `is_ambiguous` vs ladder containment (containment chosen; A-2 helper advisory) · 2 latch store: `SqliteStateStore`+flock vs folding into R-7's store · 3 latch before the taken test (chosen, faithful to the study) · 4 frozen archive table vs runtime load (frozen chosen) · 5 ask-only `MarketQuote` path in `evaluate_order` (`risk.py:409-416`) unexecuted — RED test first · 6 Seam B feed must be NWS (A12) or `0.75 h` is miscalibrated; PREREG must name the feed.
+
+---
+
+## Peer review 2026-09-04 — CONVERGED (trading-bot-architect, prediction-market-reviewer, python-reviewer, security-reviewer; all ACCEPT/APPROVE-WITH-AMENDMENTS)
+
+**Contradiction resolved — latch store: FOLD.** The trial-day latch shares ONE `SqliteStateStore`
+file and ONE flock with R-7's submit-intent latch (namespaced keys
+`current_rung_hold/trial/{station}/{climate_day}` beside `CURRENT_INTENT_KEY`), opened once at
+`on_start` through the existing L-22 constructor `open_submit_intent_latch`
+(`runtime/submit_intent.py:489`); `trial_day_latch.py` is a thin API over that opened store,
+NOT a second opener. Design review's "keep separate, revisit after R-7" is superseded: two
+independent locks leave crash windows that do not align.
+
+**Ordering rule (security, binding):** `trial_day_latch.commit(station, climate_day)` MUST
+durably commit (SQLite COMMIT returned) strictly before `SubmitIntentLatch.arm()`; `arm()`
+precedes the POST; the POST precedes `retire()`. On restart the trial latch is authoritative
+for "may this station-day be evaluated again" (checked first, unconditionally, decision step
+2); the submit-intent latch is authoritative for "does an in-flight order need
+reconciliation" (`reconcile_at_startup`, runs second). A consumed trial with no intent is
+safe (lost trial, no order). An intent with no trial record is the forbidden state — the
+ordering makes it unreachable.
+
+**Amendments (binding on the build):**
+1. **Receipt gating is Seam A-2's contract:** `RunningMax.value_at(now_ns)` includes only rows with `received_at_ns ≤ now_ns`, mirroring `running_max_at`'s `valid ≤ t` (`h4_preliminary_economic_read.py:336-347`); `RunningMax.source_received_at_ns` is what the strategy prices against (`quote.ts_event ≥ source_received_at_ns`). `decision.py` never re-derives receipt filtering. Contract test is an A-2 deliverable.
+2. **Fee coefficient — fail closed:** `decision.py` asserts the traded instrument's `feeCoefficient == FEE_THETA_FOR_BE (0.06)` and refuses (`fee_schedule_mismatch`, counted) otherwise; BE and the paid fee never diverge silently, and live stays comparable to the archive selector computed at 0.06.
+3. **Station validation:** `config.py` raises at construction if `station ∉ {LAX, MDW, MIA, SFO}` (mirroring `NoTradableMeasureError`, `cli_settlement_print_lock/strategy.py:240-248`); a mis-wired KNYC fails loudly, never refuses silently.
+4. **Latch JSON is Decimal-safe:** `ask`/`p_hold_lower` serialised as `str(Decimal)`, parsed via `Decimal(...)`; `reason` pinned to the closed set `{observation_unavailable, observation_ambiguous, not_taken, taken}` by a RED test. Paths: `latch_db_path`/`latch_lock_path` REQUIRED (no default), resolved under the runtime state dir (as `PolymarketUSExecClientConfig.state_store_path`, `node_config.py:673-684`), validated non-repo at construction, opened 0600 via fchmod (as `health.py:274-293`).
+5. **Archive table generator:** `scripts/analysis/generate_current_rung_hold_archive_table.py` writes `archive_table.py` (type `Mapping[tuple[str, str, int, int, int], Decimal | None]`) with a provenance header; `test_regenerating_the_frozen_table_is_byte_identical`. Nightly ALERT-ONLY check (never a runtime refusal) that the pinned corpus hash matches the latest study run.
+6. **Containment predicate** (domain): `WeatherBucketFacts.contains()` (`domain/weather_bucket_facts.py:64-73`) — interior `lower_f ≤ r ≤ upper_f` (closed; `upper_f` is already the inclusive bound derived from the venue's `lt` grammar, `symbology.py:349-471`); open lower tail `r ≤ upper_f`; open upper tail `r ≥ lower_f`. The interval trades iff `contains(lower_f)` and `contains(upper_f_inclusive)` name the SAME rung.
+7. **Test harness precedent:** `tests/unit/test_cli_settlement_print_lock_strategy_construction.py:366-380` (`_register` helper: `TestClock`, `TestComponentStubs.msgbus()/cache()`, `Portfolio`, `strategy.register`).
+8. **Submit coroutine naming** anticipates `ORDER_LIFECYCLE_COROUTINES` (egress firewall); the strategy submits only through Nautilus `submit_order`.
+9. **PREREG gains `feed: NWS api.weather.gov (A12)`** and the frozen table sha.
+
+**L-3 gaps → build order becomes:** 1 widen `COUNTED_REFUSAL_REASONS` (+`observation_ambiguous`, `fee_schedule_mismatch`) · 2 archive table generator + module · 3 trial-day latch on the shared store · 4 `config.py` · 5 `decision.py` (gated on Seam A-2) · 6 `strategy.py` + TestClock harness · **6b backtest/paper harness increment** feeding replayed `StationObservation` + depth via `BreezyBacktestConfig`/`as_backtest_data` (`STRATEGY_QUICKSTART.md:117-138`), every submit refused before R-7 · **6c settlement scorer**: CLI FINAL `tmax_f` join computing `held` per filled trial · **6d nightly live-family tally job** (n, k, Wilson vs BE → KILL/SURVIVE/UNDERPOWERED) as a systemd timer beside `breezy-mb-daily` · 7 PREREG artefact · **7b operator runbook** (`docs/plans/R8_OPERATOR_RUNBOOK.md`: OP-1..OP-4, enablement, the two caps by role, the clear tool) · 8 live-small enablement (operator-only).
