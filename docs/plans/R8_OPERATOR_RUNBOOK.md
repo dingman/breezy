@@ -148,18 +148,41 @@ lowered, no post-hoc screen.
 Ordering rule: PREREG committed, then enablement, then the node. A PREREG written after a fill is not
 a pre-registration.
 
-## 6. Enablement — the operator's shell only
+## 6. Enablement — the operator's shell only (amended 2026-09-04, step-8 peer review)
 
-In the shell that will launch the node, and nowhere else, export three values:
-1. the **live-trading enablement variable** (`safety.py:133`; it must be exactly `"1"` — no default,
-   no coercion, no inference);
-2. the **maximum daily budget** — a rolling UTC-calendar-day USD notional ceiling;
-3. the **maximum per position** — a USD *cost* ceiling (price × quantity, rounded up to the cent),
-   not a contract count, and **pre-fee**.
+In the shell that will launch the node, and nowhere else, export **seven** values, in two classes.
 
-Never place any of the three in a file: not a `.env`, not a systemd unit, not a shell rc file, not a
-commit. `src/` and `scripts/` are structurally incapable of writing them, and the repo assigns no
-value to any of them anywhere.
+**Durable role caps** — re-read on every authorization, never cached:
+1. the **maximum daily budget** — a UTC-calendar-day USD notional ceiling, enforced by the
+   in-process `DailySpendLedger` (it is process-local: one process per trading day; the ledger
+   re-keys at 00:00 UTC mid-session, and the durable trial-day latch — ≤1 order per station-day,
+   ≤4 orders ≈ $3.80 pre-fee — is the binding cross-restart limit);
+2. the **maximum per position** — a USD *cost* ceiling (price × quantity, rounded up to the cent),
+   not a contract count, and **pre-fee**. With quantity 1 and asks strictly below 0.95, a
+   whole-dollar cap admits the entire band; a cap below $0.95 refuses its top.
+
+**Per-process session values** — read once at start by `issue_live_trading_permit`
+(`safety.py:583-592`); they reset on every restart:
+3. the **live-trading enablement variable** (`safety.py:133`; exactly `"1"` — no default, no coercion);
+4. the **order-submission request flag** `BREEZY_ORDERS_ENABLED=1` (not a reserved control; refused
+   unless `BREEZY_CURRENT_RUNG_HOLD=1` and `BREEZY_LIVE_OBSERVATIONS=1` are also set; it is a
+   REQUEST that the permit constructor validates — a bool is never the gate);
+5. the **per-order notional ceiling** — whole-USD granularity (`safety.py:560-566`); must be ≥ the
+   per-position cap or every order is refused;
+6. the **session notional** — floor: station count × $1;
+7. the **session order count** — floor: the number of configured stations (four); anything lower
+   silently truncates the day;
+8. the **operator identity** string (logged never by value; permit `repr` is suppressed).
+
+The permit lives **10 hours** (`PERMIT_TTL_NS`, retargeted 2026-09-04 from 15 minutes: the union of
+the four decision windows is 17:00 UTC → 01:00 UTC next day, plus 1 h slack each side). Launch the
+node once per trading day **before 17:00 UTC**; it is never re-minted in-process.
+
+Never place any of the values in a file: not a `.env`, not a systemd unit, not a shell rc file, not
+a commit, not a launcher script. `src/` and `scripts/` are structurally incapable of writing them, and
+the repo assigns no value to any of them anywhere. Accepted residual exposure of shell exports (the
+same class already accepted for the enablement variable): the values are readable from
+`/proc/<pid>/environ` by same-UID processes and may persist in shell history outside the repo.
 
 Absence fails closed: both caps are re-read on **every** authorization
 (`operator_controls.py:147-166`, `:333-337`) and raise on absence, blankness, malformation or
@@ -223,6 +246,8 @@ job. Any SELL, any modify, any second contract → stop the node immediately. A 
 missing operator control → the export did not reach the process.
 
 ## 8. Crash and recovery
+
+**Any restart inside the window makes that day's selector uptime-conditional** (the "first executable snapshot" the archive table was measured on may fall in the gap) and resets the per-process daily ledger and session budgets; the durable trial-day latch still bounds the day. Disclosed here so a crash day is never mistaken for a PREREG-comparable day without saying so.
 
 `retire()` writes the history key **before** the singleton, so a crash leaves the singleton **OPEN**
 and every subsequent submit is refused **account-wide** (`submit_intent.py:1-19`, `:365-421`). That is
