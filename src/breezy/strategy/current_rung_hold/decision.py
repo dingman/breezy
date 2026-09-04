@@ -18,7 +18,7 @@ build order step 5, refined by this increment's dispatch brief):
    the paid fee must never diverge silently from the archive selector, which
    was computed at ``FEE_THETA_FOR_BE``).
 3. no ``RunningMax`` yet, or its staleness exceeds
-   ``config.stale_observation_hours`` -> ``observation_unavailable``.
+   ``config.stale_observation_minutes`` -> ``observation_unavailable``.
 4. ``RunningMax.spans(ladder)`` -- the observation interval cannot be
    resolved to one rung -> ``observation_ambiguous`` (never rounded, never
    midpointed -- A13 (spec rev2 §1b)).
@@ -146,7 +146,11 @@ REFUSAL_REASONS: Final[frozenset[str]] = frozenset(
     }
 )
 
-_NS_PER_HOUR: Final[int] = 3_600_000_000_000
+#: Rev 3 delta (2026-09-04): the stale bound is computed from integer
+#: MINUTES, never a repeating float hours value (``50/60`` is not dyadic;
+#: unlike the retired ``0.75`` it cannot be safely multiplied into a
+#: nanosecond bound with ``int(hours * 3.6e12)``).
+_NS_PER_MINUTE: Final[int] = 60_000_000_000
 _CENT: Final[Decimal] = Decimal("0.01")
 _ONE: Final[Decimal] = Decimal(1)
 
@@ -261,7 +265,7 @@ def evaluate_decision(inputs: DecisionInputs) -> Decision:
         return Refuse("fee_schedule_mismatch")
 
     running_max = inputs.running_max
-    stale_bound_ns = int(inputs.config.stale_observation_hours * _NS_PER_HOUR)
+    stale_bound_ns = inputs.config.stale_observation_minutes * _NS_PER_MINUTE
     if (
         running_max is None
         or inputs.staleness_ns is None

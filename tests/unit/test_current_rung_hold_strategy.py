@@ -342,7 +342,7 @@ class TestObservationRefusals:
     ) -> None:
         rig = _register_and_start(store_path=store_path, instruments=(interior_instrument,))
         strategy = rig.strategy
-        # Pushed 2 hours before the quote -- well past the 0.75h staleness bound.
+        # Pushed 2 hours before the quote -- well past the 50 min staleness bound.
         stale_ns = WINDOW_OPEN_NS - 2 * 3_600_000_000_000
         strategy.on_data(_observation(temp_c_tenths=300, observed_at_ns=stale_ns))
         quote = _quote(INTERIOR_ID, ask="0.40", ts_event=WINDOW_OPEN_NS)

@@ -37,7 +37,7 @@ _HOUR_LST = 12
 _INTERIOR_WIDTH_CODE = 0
 _M_ZERO = 0
 
-_STALE_BOUND_NS = int(0.75 * 3_600_000_000_000)
+_STALE_BOUND_NS = 50 * 60 * 1_000_000_000  # rev 3 delta (2026-09-04): 50 min, integer minutes -> ns
 
 
 def _exact_running_max(reading_f: int, *, source_observed_at_ns: int = 0) -> RunningMax:
@@ -140,6 +140,22 @@ def test_a_stale_running_max_is_refused_observation_unavailable() -> None:
 def test_a_running_max_exactly_at_the_stale_bound_is_not_refused() -> None:
     decision = evaluate_decision(_take_case_inputs(staleness_ns=_STALE_BOUND_NS))
     assert isinstance(decision, Take)
+
+
+def test_a_lag_45_receipt_plus_one_tick_is_not_refused_observation_unavailable() -> None:
+    """Rev 3's characterizing widen: a lag-45 receipt (`received = observed +
+    45 min`) plus one 5-minute ASOS cadence tick, minus one nanosecond, is
+    age `50 min - 1 ns` -- under the new 50-minute bound, so this must NOT
+    hit `observation_unavailable` (other refusals may still fire, but not
+    this one). Before rev 3 (45-minute bound) this exact age was refused."""
+    age_ns = 45 * 60 * 1_000_000_000 + 5 * 60 * 1_000_000_000 - 1
+    decision = evaluate_decision(_take_case_inputs(staleness_ns=age_ns))
+    assert decision != Refuse("observation_unavailable")
+
+
+def test_a_running_max_one_ns_past_the_50_minute_bound_is_refused() -> None:
+    decision = evaluate_decision(_take_case_inputs(staleness_ns=_STALE_BOUND_NS + 1))
+    assert decision == Refuse("observation_unavailable")
 
 
 def test_a_running_max_spanning_two_rungs_is_refused_observation_ambiguous() -> None:

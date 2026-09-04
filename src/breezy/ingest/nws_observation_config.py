@@ -40,8 +40,12 @@ MIN_REQUEST_SPACING_NS: Final[int] = 1_000_000_000
 #: Amendment A12: cadence >= 92 s per NWS `max-age`; 300 s chosen.
 DEFAULT_OBSERVATION_POLL_INTERVAL_SECONDS: Final[int] = 300
 
-#: Grok rev 2 section 5: `stale_observation_hours = 0.75` for LAX/MDW/MIA/SFO.
-DEFAULT_STALENESS_BOUND_SECONDS: Final[int] = 2_700
+#: Spec rev 3 delta (2026-09-04), replacing rev 2 section 5's
+#: `stale_observation_hours = 0.75` (2_700 s / 45 min exactly) for
+#: LAX/MDW/MIA/SFO. New bound: `max(K_B_REQUIRED_LAGS_LIVE) + 5 min ASOS
+#: cadence` = 45 + 5 = 50 min, so the ingest rebuild trust window stays in
+#: lockstep with `current_rung_hold.config.STALE_OBSERVATION_MINUTES`.
+DEFAULT_STALENESS_BOUND_SECONDS: Final[int] = 3_000
 
 _ICAO_PATTERN: Final[re.Pattern[str]] = re.compile(r"\A[A-Z]{4}\Z")
 

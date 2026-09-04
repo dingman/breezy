@@ -498,7 +498,7 @@ class CurrentRungHoldStrategy(Strategy):
     def _maybe_submit(self, instrument_id: str, decision: Take) -> None:
         if not (
             self._config.orders_enabled
-            and isinstance(self._config.stale_observation_hours, float)
+            and isinstance(self._config.stale_observation_minutes, int)
         ):
             self.log.info(
                 f"TAKE recorded, no submit (orders_enabled={self._config.orders_enabled}): "

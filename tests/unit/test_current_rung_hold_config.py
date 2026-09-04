@@ -42,7 +42,7 @@ from breezy.strategy.weather_common.risk import RiskLimits
 def test_default_construction_succeeds() -> None:
     config = CurrentRungHoldConfig()
     assert config.stations == ("LAX", "MDW", "MIA", "SFO")
-    assert config.stale_observation_hours == 0.75
+    assert config.stale_observation_minutes == 50
     assert config.required_fee_coefficient == Decimal("0.06")
     assert config.executable_ask_lower == Decimal("0.05")
     assert config.executable_ask_upper == Decimal("0.95")
@@ -82,6 +82,11 @@ def test_allow_short_true_is_refused() -> None:
         CurrentRungHoldConfig(allow_short=True)
 
 
+def test_stale_observation_minutes_non_positive_is_refused() -> None:
+    with pytest.raises(ValueError, match="stale_observation_minutes"):
+        CurrentRungHoldConfig(stale_observation_minutes=0)
+
+
 def test_archive_table_pin_mismatch_is_refused() -> None:
     with pytest.raises(ArchiveTablePinMismatchError):
         CurrentRungHoldConfig(archive_table_pin="not-the-real-sha")
@@ -96,7 +101,8 @@ def test_config_is_frozen() -> None:
 def test_config_has_no_operator_reserved_field_name() -> None:
     field_names = frozenset(CurrentRungHoldConfig.__struct_fields__)
     # `RiskLimits` carries several fields (`allow_short`,
-    # `stale_observation_hours`, ...) that every sibling weather-strategy
+    # `stale_observation_hours` on sibling configs, ...) that every
+    # sibling weather-strategy
     # config LEGITIMATELY shares by name -- those are not reserved caps.
     # The reserved-CAP-shaped fields are exactly the `max_*` ceilings
     # (`max_position_contracts`, `max_event_notional`,

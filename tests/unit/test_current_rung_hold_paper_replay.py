@@ -62,7 +62,10 @@ from breezy.runtime.submit_intent import open_submit_intent_latch
 from breezy.settlement.roi_bound import ROIBound, ROIBoundUnderpowered
 from breezy.settlement.trial_scorer import FilledTrial, ScoredTrial, score_trial
 from breezy.strategy.current_rung_hold.backtest_only import CurrentRungHoldBacktestStrategy
-from breezy.strategy.current_rung_hold.config import CurrentRungHoldConfig
+from breezy.strategy.current_rung_hold.config import (
+    STALE_OBSERVATION_MINUTES,
+    CurrentRungHoldConfig,
+)
 from breezy.strategy.current_rung_hold.trial_day_latch import (
     TrialDayLatch,
     open_trial_day_latch,
@@ -716,6 +719,23 @@ def test_received_at_ns_is_synthesized_as_observed_plus_lag() -> None:
     assert len(observations) == 1
     obs = observations[0]
     assert obs.received_at_ns == obs.observed_at_ns + 30 * NS_PER_MIN
+
+
+def test_a_lag_45_receipt_leaves_a_positive_window_under_the_stale_bound() -> None:
+    """Mirrors ``test_current_rung_hold_decision.py``'s characterizing widen
+    on the paper-replay path: a lag-45 receipt (`received = observed + 45
+    min`) plus one 5-minute ASOS cadence tick, minus one nanosecond, must
+    stay strictly under the decision-layer stale bound
+    (``STALE_OBSERVATION_MINUTES`` = 50 min) so the lag-45 arm is not
+    structurally empty (rev 3 delta, 2026-09-04)."""
+    rows = [{"station": ICAO, "valid": "2026-09-03 12:00", "metar": "KLAX T03000167"}]
+    inputs = PaperReplayInputs(lag_minutes=45)
+    obs = load_replay_observations(station=ICAO, rows=rows, inputs=inputs)[0]
+    assert obs.received_at_ns == obs.observed_at_ns + 45 * NS_PER_MIN
+    bound_ns = STALE_OBSERVATION_MINUTES * NS_PER_MIN
+    quote_ts_ns = obs.received_at_ns + 5 * NS_PER_MIN - 1
+    staleness_ns = quote_ts_ns - obs.observed_at_ns
+    assert staleness_ns < bound_ns
 
 
 def test_precision_arms_are_both_present_and_default_is_pessimistic() -> None:

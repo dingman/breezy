@@ -19,9 +19,9 @@ Station allow-list (A14)
 ``SUPPORTED_STATIONS`` is exactly the four dense stations the archive study
 (``archive_table.py``) was measured on. NYC/KNYC is deliberately excluded:
 it is an HOURLY-only station (no 5-minute NWS feed), so the
-``stale_observation_hours`` bound this package pins (0.75h / 45min, the
-spec's measured value for the five-minute-feed stations) is miscalibrated
-for it -- see the spec's ``stale_observation_hours`` table, which gives KNYC
+``stale_observation_minutes`` bound this package pins (50 min, rev 3's
+``max(K_B_REQUIRED_LAGS_LIVE) + 5 min ASOS cadence``) is miscalibrated for
+it -- see the spec's ``stale_observation_hours`` table, which gives KNYC
 its own, larger, NOT-YET-ADOPTED bound and states "Not this package".
 Constructing with any station outside the allow-list is refused loudly
 (:class:`UnsupportedStationError`) rather than silently ignored -- a
@@ -75,12 +75,21 @@ __all__ = [
 #: was measured on. NYC/KNYC is excluded -- see the module docstring.
 SUPPORTED_STATIONS: Final[tuple[str, ...]] = ("LAX", "MDW", "MIA", "SFO")
 
+#: The observation-liveness bound in whole minutes: rev 3 delta
+#: (2026-09-04), replacing rev 2's ``stale_observation_hours = 0.75``
+#: (45 min exactly). Derivation: ``max(K_B_REQUIRED_LAGS_LIVE) + 5 min ASOS
+#: cadence`` = 45 + 5 = 50 -- the shortest bound that leaves a positive open
+#: interval after a lag-45 receipt so quote ticks in the 5-minute gap are
+#: not refused ``observation_unavailable`` (see the module docstring's
+#: "Station allow-list" note and ``decision.py``'s nanosecond conversion).
+STALE_OBSERVATION_MINUTES: Final[int] = 50
+
 
 class UnsupportedStationError(ValueError):
     """Raised when ``stations`` names anything outside :data:`SUPPORTED_STATIONS`.
 
     NYC/KNYC is the station this exists to catch (A14, hourly-only feed,
-    ``0.75h`` staleness bound miscalibrated) but the check is a plain
+    ``50 min`` staleness bound miscalibrated) but the check is a plain
     allow-list, not an NYC-specific carve-out -- any unmeasured sixth
     station is refused the same way.
     """
@@ -148,15 +157,20 @@ class CurrentRungHoldConfig(StrategyConfig, frozen=True):
         Every station this instance may trade. Must be a subset of
         :data:`SUPPORTED_STATIONS`; NYC/KNYC and any other unmeasured
         station raise :class:`UnsupportedStationError` at construction.
-    stale_observation_hours : float
-        The observation-liveness bound (age = measurement/issuance time,
-        never ingest time). Pinned at 0.75h (45 min) for the five-minute-feed
-        stations this package trades -- see the spec's
+    stale_observation_minutes : int
+        The observation-liveness bound in whole minutes (age =
+        measurement/issuance time, never ingest time). Pinned at 50 min --
+        rev 3 delta (2026-09-04): ``max(K_B_REQUIRED_LAGS_LIVE) + 5 min ASOS
+        cadence`` (45 + 5), replacing rev 2's ``0.75 h``. Computed from
+        integer minutes, never a repeating float hours value (``50/60`` is
+        not dyadic; unlike ``0.75`` it cannot be safely multiplied into a
+        nanosecond bound with ``int(hours * 3.6e12)``) -- see
+        :data:`STALE_OBSERVATION_MINUTES` and the spec's
         ``stale_observation_hours`` table. Unlike
-        ``RunningExtremeLockConfig``'s field of the same name, this one is
-        NOT ``float | None`` with no default: the spec gives one number for
-        every supported station, so there is nothing for a call site to
-        legitimately override.
+        ``RunningExtremeLockConfig``'s ``stale_observation_hours`` field,
+        this one is NOT optional with no default: the spec gives one number
+        for every supported station, so there is nothing for a call site to
+        legitimately override. Validated ``> 0`` in ``__post_init__``.
     required_fee_coefficient : Decimal
         The fee coefficient the archive selector's break-even constant
         (``FEE_THETA_FOR_BE``) was computed against. ``decision.py`` refuses
@@ -198,7 +212,7 @@ class CurrentRungHoldConfig(StrategyConfig, frozen=True):
     #: sites) -- see ``strategy.py``'s ``on_start``.
     instrument_ids: tuple[InstrumentId, ...] = ()
     stations: tuple[str, ...] = ("LAX", "MDW", "MIA", "SFO")
-    stale_observation_hours: float = 0.75
+    stale_observation_minutes: int = STALE_OBSERVATION_MINUTES
     required_fee_coefficient: Decimal = Decimal("0.06")
     executable_ask_lower: Decimal = Decimal("0.05")
     executable_ask_upper: Decimal = Decimal("0.95")
@@ -213,6 +227,11 @@ class CurrentRungHoldConfig(StrategyConfig, frozen=True):
     orders_enabled: bool = False
 
     def __post_init__(self) -> None:
+        if self.stale_observation_minutes <= 0:
+            raise ValueError(
+                "stale_observation_minutes must be positive, was "
+                f"{self.stale_observation_minutes!r}"
+            )
         unsupported = [station for station in self.stations if station not in SUPPORTED_STATIONS]
         if unsupported:
             raise UnsupportedStationError(

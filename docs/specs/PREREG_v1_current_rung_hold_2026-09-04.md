@@ -51,7 +51,7 @@ falsified if the Wilson **upper** bound falls below `BE` at n ≥ 60 pooled or i
 
 Evaluated by `evaluate_decision` (`decision.py:238-287`), in this binding order:
 1. `trial_day_consumed` (latch) → refuse. 2. instrument fee coefficient ≠ `0.06` →
-`fee_schedule_mismatch`. 3. no running max, or staleness > `0.75 h` → `observation_unavailable`.
+`fee_schedule_mismatch`. 3. no running max, or staleness > `50 min` (rev 3 delta, 2026-09-04; was `0.75 h`) → `observation_unavailable`.
 4. interval spans two rungs → `observation_ambiguous` (never rounded, never midpointed — A13, spec rev2 §1b).
 5. name the containing rung. 6. cell not legal → `illegal_cell`. 7. `not_executable`.
 8. no defined table cell → `p_hold_undefined` (undefined, never "worst cell",
@@ -59,7 +59,7 @@ Evaluated by `evaluate_decision` (`decision.py:238-287`), in this binding order:
 LONG_YES, quantity 1, limit = displayed level-0 ask, IOC, hold to settlement.
 
 **Frozen parameter defaults** (`config.py:179-189`): `stations=("LAX","MDW","MIA","SFO")` ·
-`stale_observation_hours=0.75` · `required_fee_coefficient=Decimal("0.06")` ·
+`stale_observation_minutes=50` (rev 3 delta, 2026-09-04; was `stale_observation_hours=0.75`) · `required_fee_coefficient=Decimal("0.06")` ·
 `executable_ask_lower=Decimal("0.05")` · `executable_ask_upper=Decimal("0.95")` (both strict) ·
 `minimum_displayed_size=1` · `order_quantity=1` · `allow_short=False` (constructing `True` raises,
 L-22) · `archive_table_pin=CORPUS_SHA256` · `entry_only_halt=True`.
