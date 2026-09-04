@@ -1,0 +1,110 @@
+{
+ "log": [
+  {
+   "at": "2026-09-04T22:24:28+00:00",
+   "path": "/v1/events",
+   "params": {
+    "seriesId": [
+     36
+    ],
+    "limit": 500,
+    "offset": 0
+   },
+   "ok": true,
+   "len_events": 0,
+   "envelope": [
+    "events"
+   ]
+  },
+  {
+   "at": "2026-09-04T22:24:29+00:00",
+   "path": "/v1/events",
+   "params": {
+    "seriesId": [
+     38
+    ],
+    "limit": 500,
+    "offset": 0
+   },
+   "ok": true,
+   "len_events": 0,
+   "envelope": [
+    "events"
+   ]
+  },
+  {
+   "at": "2026-09-04T22:24:31+00:00",
+   "path": "/v1/events",
+   "params": {
+    "seriesId": [
+     40
+    ],
+    "limit": 500,
+    "offset": 0
+   },
+   "ok": true,
+   "len_events": 0,
+   "envelope": [
+    "events"
+   ]
+  },
+  {
+   "at": "2026-09-04T22:24:32+00:00",
+   "path": "/v1/events",
+   "params": {
+    "seriesId": [
+     42
+    ],
+    "limit": 500,
+    "offset": 0
+   },
+   "ok": true,
+   "len_events": 0,
+   "envelope": [
+    "events"
+   ]
+  },
+  {
+   "at": "2026-09-04T22:24:33+00:00",
+   "path": "/v1/events",
+   "params": {
+    "seriesId": [
+     44
+    ],
+    "limit": 500,
+    "offset": 0
+   },
+   "ok": true,
+   "len_events": 0,
+   "envelope": [
+    "events"
+   ]
+  },
+  {
+   "at": "2026-09-04T22:24:34+00:00",
+   "path": "/v1/events",
+   "params": {
+    "seriesId": [
+     36
+    ],
+    "limit": 500,
+    "offset": 0,
+    "archived": true,
+    "closed": true
+   },
+   "ok": true,
+   "len_events": 0,
+   "envelope": [
+    "events"
+   ]
+  }
+ ],
+ "events": {
+  "{\"seriesId\": [36], \"limit\": 500, \"offset\": 0}": [],
+  "{\"seriesId\": [38], \"limit\": 500, \"offset\": 0}": [],
+  "{\"seriesId\": [40], \"limit\": 500, \"offset\": 0}": [],
+  "{\"seriesId\": [42], \"limit\": 500, \"offset\": 0}": [],
+  "{\"seriesId\": [44], \"limit\": 500, \"offset\": 0}": [],
+  "{\"seriesId\": [36], \"limit\": 500, \"offset\": 0, \"archived\": true, \"closed\": true}": []
+ }
+}
