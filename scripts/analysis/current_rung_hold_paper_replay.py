@@ -33,6 +33,7 @@ from nautilus_trader.model.objects import Money
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
     from nautilus_trader.core.data import Data
+    from nautilus_trader.model.identifiers import InstrumentId
 
     from breezy.domain.nws_climate_day import NwsClimateDay
 
@@ -41,13 +42,17 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from archive_correction_probe import wilson_interval
 from run_weather_strategy_backtests import (
+    WEATHER_VENUE,
     TapeInstrument,
     _convert_live_capture,
     _load_climate_day_records,
     _select_capture_instruments,
+    _synthesize_close,
 )
+from weather_strategy_backtest_lib import settlement_prices_for_scenario
 
 from breezy.persistence.scored_trial_store import write_scored_trials
+from breezy.registry.sites import default_registry
 from breezy.runtime.backtest_feed import as_backtest_data
 from breezy.runtime.backtest_harness import DEFAULT_BACKTEST_TRADER_ID, backtest
 from breezy.runtime.paper_replay import (
@@ -85,6 +90,7 @@ __all__ = [
     "VenueOutsideLiveDirError",
     "build_provenance_header",
     "climate_day_records_to_settlement",
+    "close_source_label",
     "run_one_precision_arm",
 ]
 
@@ -194,6 +200,60 @@ def _entry_context_for(
     )
 
 
+SettlementByKey = dict[tuple[str, str], "NwsClimateDay"]
+
+
+def close_source_label(tape_instruments: Sequence[TapeInstrument]) -> str:
+    """Which settlement-close source this run uses -- printed verbatim in the
+    run header, never inferred by a reader from behaviour.
+
+    `_select_capture_instruments` populates `TapeInstrument.closes` from the
+    capture's OWN recorded `CONTRACT_EXPIRED` closes when present; a tape
+    with none for ANY instrument falls back to the documented
+    `_synthesize_close` precedent (`run_weather_strategy_backtests.py:722-738`)
+    for every instrument in this run -- a cosmetic `close_price`, real
+    economics from `settlement_prices` derived from the FINAL climate day.
+    """
+    if all(ti.closes for ti in tape_instruments):
+        return "closes=recorded"
+    return "closes=synthesized_after_last_tick (price cosmetic; settlement_prices from FINAL)"
+
+
+def _settlement_prices_for_synthesis(
+    tape_instruments: Sequence[TapeInstrument], settlement_by_key: SettlementByKey,
+) -> dict[InstrumentId, float]:
+    """`settlement_prices_for_scenario` restricted to the instruments that
+    need a SYNTHESIZED close, using ONLY stations with a FINAL record.
+
+    An instrument whose (station, climate_day) has no FINAL record yet is
+    deliberately left OUT of both the returned prices and (by the caller)
+    the closes list -- the existing `SettlementInvariantError`
+    (`assert_settlement_invariants`'s CLOSE rule) then refuses the run, the
+    same refusal path a genuinely close-less capture already takes. Never a
+    fabricated settlement price for a PENDING station-day.
+    """
+    facts_by_id = {
+        ti.instrument.id: ti.facts
+        for ti in tape_instruments
+        if not ti.closes
+        and (ti.facts.settlement_station, ti.facts.climate_day.isoformat())
+        in settlement_by_key
+    }
+    observed_by_station = {
+        ti.facts.settlement_station: cast(
+            int,
+            settlement_by_key[
+                (ti.facts.settlement_station, ti.facts.climate_day.isoformat())
+            ].tmax_f,
+        )
+        for ti in tape_instruments
+        if ti.instrument.id in facts_by_id
+    }
+    if not facts_by_id:
+        return {}
+    return settlement_prices_for_scenario(facts_by_id, observed_by_station)
+
+
 def run_one_precision_arm(
     *,
     tape_instruments: Sequence[TapeInstrument],
@@ -202,6 +262,7 @@ def run_one_precision_arm(
     lag_minutes: int,
     precision_mode: PrecisionMode,
     latch_store_path: Path,
+    settlement_by_key: SettlementByKey,
 ) -> tuple[FilledTrial, ...]:
     """Run one (lag, precision) arm of the replay and return its `FilledTrial`s.
 
@@ -209,8 +270,15 @@ def run_one_precision_arm(
     `build_paper_replay_config` refuses a quote-only instrument (RED test 2).
     """
     inputs = PaperReplayInputs(lag_minutes=lag_minutes, precision_mode=precision_mode)
+    # `StationObservation.station` must carry the IEM ASOS/ICAO id
+    # (`CurrentRungHoldStrategy.on_data` maps it back via `_STATION_BY_ICAO`,
+    # `strategy.py:162-166`) -- NOT the settlement station code `station`
+    # (used below for `CurrentRungHoldConfig.stations`, a different registry
+    # key). Native accessor, mirrors `breezy/registry/sites.toml`'s
+    # `iem_asos_id` (`registry/sites.py::SettlementSite.iem_asos_id`).
+    icao = default_registry().settlement_site(WEATHER_VENUE, station).iem_asos_id
     observations = load_replay_observations(
-        station=station, rows=observation_rows, inputs=inputs,
+        station=icao, rows=observation_rows, inputs=inputs,
     )
     instruments = [ti.instrument for ti in tape_instruments]
     market_data: list[Data] = []
@@ -224,15 +292,34 @@ def run_one_precision_arm(
 
     # The capture's OWN recorded `InstrumentClose`s (`TapeInstrument.closes`,
     # populated by `_select_capture_instruments`) -- stamped as recorded,
-    # never synthesized. `instruments_without_close` is NEVER passed here: an
-    # instrument the capture genuinely never closed must still refuse via
+    # never synthesized, for instruments that carry one. `instruments_without_
+    # close` is NEVER passed here: an instrument with neither a recorded
+    # close NOR a FINAL climate day to synthesize one from still refuses via
     # `SettlementInvariantError` (the invariant working, not a bypass).
-    closes: list[Data] = [close for ti in tape_instruments for close in ti.closes]
-    settlement_prices = {
+    recorded_closes: list[Data] = [close for ti in tape_instruments for close in ti.closes]
+    settlement_prices: dict[InstrumentId, float] = {
         close.instrument_id: float(close.close_price)
         for ti in tape_instruments
         for close in ti.closes
     }
+
+    # `run_weather_strategy_backtests.py::_synthesize_close` precedent (module
+    # docstring): one CONSTRUCTED `CONTRACT_EXPIRED` close per instrument that
+    # the capture itself never closed, strictly after that instrument's last
+    # market-data record, with a COSMETIC `close_price`. Real economics flow
+    # ONLY through `settlement_prices`, derived here from the FINAL climate
+    # day via `settlement_prices_for_scenario` -- never the synthesized
+    # close's own price.
+    synthesized_settlement_prices = _settlement_prices_for_synthesis(
+        tape_instruments, settlement_by_key,
+    )
+    synthesized_closes: list[Data] = [
+        _synthesize_close(ti)
+        for ti in tape_instruments
+        if not ti.closes and ti.instrument.id in synthesized_settlement_prices
+    ]
+    closes: list[Data] = [*recorded_closes, *synthesized_closes]
+    settlement_prices = {**settlement_prices, **synthesized_settlement_prices}
 
     config = build_paper_replay_config(
         instruments=instruments,
@@ -285,9 +372,6 @@ def climate_day_records_to_settlement(
         for station, record in best.items():
             by_key[(station, climate_day.isoformat())] = record
     return by_key
-
-
-SettlementByKey = dict[tuple[str, str], "NwsClimateDay"]
 
 
 def _pairs_with_settlement(
@@ -354,6 +438,7 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     observation_rows = read_asos_rows(args.asos_cache_csv)
     settlement = climate_day_records_to_settlement(tape_instruments, args.weather_catalog_root)
+    print(close_source_label(tape_instruments))
 
     all_trials: list[FilledTrial] = []
     now_ns = max(
@@ -378,6 +463,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             lag_minutes=args.lag_minutes,
             precision_mode=precision_mode,
             latch_store_path=args.work_catalog / f"latch_{precision_mode}.db",
+            settlement_by_key=settlement,
         )
         all_trials.extend(trials)
         _print_roi_and_wilson(trials, settlement, now_ns)

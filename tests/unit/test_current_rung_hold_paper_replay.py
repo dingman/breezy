@@ -41,6 +41,7 @@ from breezy.domain.weather_bucket_facts import (
     STRIKE_UPPER_F_KEY,
     WEATHER_FACTS_STATUS_KEY,
     WEATHER_FACTS_STATUS_KNOWN,
+    read_weather_bucket_facts,
 )
 from breezy.runtime.backtest_feed import as_backtest_data
 from breezy.runtime.backtest_harness import SettlementInvariantError, backtest
@@ -58,7 +59,7 @@ from breezy.runtime.paper_replay import (
 from breezy.runtime.sqlite_store import SqliteStateStore
 from breezy.runtime.submit_intent import open_submit_intent_latch
 from breezy.settlement.roi_bound import ROIBound, ROIBoundUnderpowered
-from breezy.settlement.trial_scorer import FilledTrial
+from breezy.settlement.trial_scorer import FilledTrial, ScoredTrial, score_trial
 from breezy.strategy.current_rung_hold.backtest_only import CurrentRungHoldBacktestStrategy
 from breezy.strategy.current_rung_hold.config import CurrentRungHoldConfig
 from breezy.strategy.current_rung_hold.trial_day_latch import (
@@ -361,6 +362,126 @@ def test_a_capture_with_no_close_still_refuses_settlement_invariant(tmp_path: Pa
         config, strategies=(strategy,), allow_idle_strategies=True,
     ):
         pass  # pragma: no cover - must raise before yielding
+
+
+# ---------------------------------------------------------------------------
+# RED -- a capture with NO recorded close but a FINAL climate day synthesizes
+# a close per the `_synthesize_close` precedent; PnL is provably driven by
+# `settlement_prices` (from the FINAL record), never the cosmetic close price.
+# ---------------------------------------------------------------------------
+def _final_climate_day(*, tmax_f: int) -> NwsClimateDay:
+    return NwsClimateDay(
+        station=STATION,
+        climate_day=CLIMATE_DAY,
+        tmax_f=tmax_f,
+        tmin_f=63,
+        tavg_f=75,
+        tavg_flag=None,
+        tmax_flag=None,
+        tmin_flag=None,
+        is_final=True,
+        correction_flag=False,
+        revision_seq=1,
+        is_superseded=False,
+        issuing_office="KLAX",
+        issuance_time_ns=WINDOW_OPEN_NS - 1_000,
+        retrieved_at_ns=WINDOW_OPEN_NS,
+        parser_version="test",
+        registry_version="test",
+        raw_sha256="c" * 64,
+        source_channel="cli_daily",
+        schema_version=CLIMATE_DAY_SCHEMA_VERSION,
+        ts_event=WINDOW_OPEN_NS,
+    )
+
+
+def _tape_instrument_no_close(driver: ModuleType, *, ask: str, size: int) -> object:
+    instrument = _instrument()
+    facts = read_weather_bucket_facts(instrument.info)
+    depth_ts = WINDOW_OPEN_NS - 1_000
+    quote = _quote(ask=ask, size=size, ts_event=WINDOW_OPEN_NS)
+    depth = _depth(ask=ask, size=size, ts_event=depth_ts)
+    return driver.TapeInstrument(
+        instrument=instrument, facts=facts, depths=[depth], quotes=[quote], closes=[],
+    )
+
+
+_OBSERVATION_ROWS = [{"station": ICAO, "valid": "2026-09-04 19:55", "metar": "KLAX T03000167"}]
+
+
+def test_close_source_label_is_recorded_when_every_instrument_has_a_close(
+    driver: ModuleType,
+) -> None:
+    instrument = _instrument()
+    facts = read_weather_bucket_facts(instrument.info)
+    with_close = driver.TapeInstrument(
+        instrument=instrument,
+        facts=facts,
+        depths=[],
+        quotes=[],
+        closes=[_close(price="1.00", ts_event=WINDOW_OPEN_NS + NS_PER_MIN)],
+    )
+    assert driver.close_source_label([with_close]) == "closes=recorded"
+
+
+def test_close_source_label_is_synthesized_when_a_close_is_missing(driver: ModuleType) -> None:
+    without_close = _tape_instrument_no_close(driver, ask="0.40", size=10)
+    assert driver.close_source_label([without_close]) == (
+        "closes=synthesized_after_last_tick (price cosmetic; settlement_prices from FINAL)"
+    )
+
+
+def test_a_capture_with_no_close_but_a_final_climate_day_synthesizes_and_settles(
+    driver: ModuleType, tmp_path: Path,
+) -> None:
+    """Bucket 86-87 CONTAINS tmax_f=87 -> held=True. The synthesized close's
+    OWN `close_price` is the cosmetic 0.5 (`_synthesize_close`) -- if that
+    ever leaked into settlement, `assert_settlement_invariants`'s ENDPOINT
+    rule would refuse the run outright (0.5 is not 0.0/1.0). The run
+    completing AND `pnl == 1 - fill_px - fee` prove settlement came from
+    `settlement_prices` (built from the FINAL record), never the close price.
+    """
+    tape_instrument = _tape_instrument_no_close(driver, ask="0.40", size=10)
+    final = _final_climate_day(tmax_f=87)
+    settlement_by_key = {(STATION, CLIMATE_DAY.isoformat()): final}
+
+    trials = driver.run_one_precision_arm(
+        tape_instruments=[tape_instrument],
+        observation_rows=_OBSERVATION_ROWS,
+        station=STATION,
+        lag_minutes=1,
+        precision_mode="nws_integer_c",
+        latch_store_path=tmp_path / "state.db",
+        settlement_by_key=settlement_by_key,
+    )
+    assert len(trials) == 1
+    trial = trials[0]
+    assert trial.fill_px == Decimal("0.40")
+
+    scored = score_trial(trial, final, now_ns=WINDOW_OPEN_NS + 10_000)
+    assert isinstance(scored, ScoredTrial)
+    assert scored.held is True
+    assert scored.pnl == Decimal(1) - trial.fill_px - trial.fee
+
+
+def test_a_capture_with_no_close_and_no_final_climate_day_is_refused(
+    driver: ModuleType, tmp_path: Path,
+) -> None:
+    """PENDING station-day: no recorded close, no FINAL to synthesize a
+    settlement price from -- refused via the same `SettlementInvariantError`
+    a genuinely close-less capture already takes, never a fabricated price."""
+    tape_instrument = _tape_instrument_no_close(driver, ask="0.40", size=10)
+
+    with pytest.raises(SettlementInvariantError):
+        driver.run_one_precision_arm(
+            tape_instruments=[tape_instrument],
+            observation_rows=_OBSERVATION_ROWS,
+            station=STATION,
+            lag_minutes=1,
+            precision_mode="nws_integer_c",
+            latch_store_path=tmp_path / "state.db",
+            settlement_by_key={},
+        )
 
 
 # ---------------------------------------------------------------------------
