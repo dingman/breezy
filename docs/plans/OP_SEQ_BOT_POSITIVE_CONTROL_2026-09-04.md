@@ -33,7 +33,7 @@ Sequence (single `run_sequence` coroutine; every step's stop is terminal — no 
 | S5 | `_signed_post_cancel_all` — unchanged (`:379-412`) | 1 (signed, write) | 200, or non-401/403 carrying `CancelAllOrdersResponse` | `CANCEL_NOT_OK` → **STOP, un-flat, never retried**; artefact written; exit 2 |
 | S6 | Post-flight signed `GET /v1/orders/open` | 1 (signed) | 200 + empty | `POSTFLIGHT_NOT_200` / `POSTFLIGHT_NOT_EMPTY` — describe the read, do not by themselves answer OQ-D |
 
-Verdict field (computed, never a free-text word): `CLOSED_YES_BOTH_VERBS` iff S3 200-with-id **and** S4 enumerated-and-unfilled **and** S5 ok **and** S6 200-empty; `CLOSED_NO` iff S3 401/403; `INCONCLUSIVE` otherwise. Full budget: **4 signed + 1 unsigned** requests; every refusal path issues strictly fewer.
+Verdict field (computed, never a free-text word): `CLOSED_YES_BOTH_VERBS` iff S3 200-with-id **and** S4 enumerated-and-unfilled **and** S5 ok **and** S6 200-empty; `CLOSED_NO` iff S3 401/403; `INCONCLUSIVE` otherwise. Full budget: **5 signed + 1 unsigned** requests (S1, S3, S4, S5, S6 signed; S2 public); every refusal path issues strictly fewer.
 
 Interruption: `_write_intent_marker` moves to **immediately before S3** (the first write) and is widened to record both write paths as constants. The existing `except BaseException` → partial artefact + re-raise (`:561-577`) wraps S3–S6, with `INTERRUPTED` as the value of the postflight reason (schema unchanged in shape, per `:178-182`).
 
