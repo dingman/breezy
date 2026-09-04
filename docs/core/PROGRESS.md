@@ -64,13 +64,12 @@ an **L-1 null-hypothesis verdict** citing installed source under
 
 ---
 
-### Clock-speed track (opened 2026-09-04) — answer to "why can't we speed this up"
-Time-to-verdict = independent station-days × take rate; the same city on two venues is ONE settlement event. Levers, all peer-reviewed:
-- **[HIGH] Kalshi sibling family on NEW stations** — Kalshi lists 24 US daily-high cities (PM lists 5); 18/19 candidates pass 5-min TEMPERATURE cadence on both feeds; KDEN HELD (live 5-min absent 09-03), KHOU archive hole. Plan `docs/plans/KALSHI_CRH_EXPANSION_PLAN_2026-09-04.md` Rev 2 + convergence addendum (S2/S9 await the strategy-lead ruling; S4 blocked on Kalshi's settlement clock = S0). Evidence `docs/evidence/venue/kalshi/`, `docs/evidence/kalshi_station_*_2026-09-04.md`. Operator-only on the critical path: Kalshi account/KYC/funding/API key (S11).
-- **[MED] PREREG v2 group-sequential** (Lan-DeMets OBF on Wilson, α=0.025, looks every 10 fills, n_max 160 pending ruling) — `docs/specs/PREREG_v2_current_rung_hold_DRAFT_2026-09-04.md`; cost-free only if registered before the first PM fill; ~24% fewer fills under a real edge, none under a leak. Boundaries come from a generator script, never authored.
-- **[MED] Capture uptime** — recorder `MemoryHigh=2G/MemoryMax=3G` (loaded, binds at 09:00Z rotation), cache caps, SIGKILL-truncated instance salvage wired (review pending, uncommitted).
-- **[MED] Corpus parser defect** — `settlement_alignment_study.parse_metar_t_group` drops 4-digit T-groups (KBOS 7→59 rows/day); fix lands only in the rev2 pinned table, v1 untouched.
-- Rejected by ruling: SPRT α=0.05, shadow/paper/archive/Kalshi rows in live n, retroactive scoring, qty>1, NYC, pooling venues.
+### Clock-speed track (opened 2026-09-04)
+Time-to-verdict = independent station-days × take rate; one city on two venues is ONE weather event (Kalshi settles on The Weather Company, not the NWS CLI). Rulings: `docs/evidence/grok_*_2026-09-04.md`.
+- **[HIGH] Kalshi sibling family on NEW stations** — plan `docs/plans/KALSHI_CRH_EXPANSION_PLAN_2026-09-04.md` Rev 3 (converged); PREREG draft `docs/specs/PREREG_v1_kalshi_current_rung_hold_DRAFT_2026-09-04.md`. 18/19 candidates pass temp cadence; KDEN excluded unless live 5-min resumes; KHOU archive hole. Open: S4 registry (in flight), S5–S7 read path, S8 per-station CLI-final-vs-TWC reconciliation (n≥90, Wilson-lower >0.99), S9 rev2 cells + `parse_metar_t_group` 4-digit fix (v1 table untouched). **Operator-only, critical path:** Kalshi account/KYC/eligibility/funding/API key (S11); fee-schedule PDF via a browser or first-fill θ derivation.
+- **[MED] PREREG v2 family** (`docs/specs/PREREG_v2_current_rung_hold_DRAFT_2026-09-04.md` rev b; blueprint `docs/plans/FAMILY_TALLY_V2_BLUEPRINT_2026-09-04.md` Rev 2). Open: boundary generator/solver + drift simulation (in flight), artefact loader, `family_tally_v2.py`, two concrete timers, registration before the first PM fill.
+- **[LOW] Recorder salvage** de-dup relies on per-instance non-overlap (asserted); fill-time reader `--fill-source` not yet in the live-tally unit's invocation.
+- Rejected by ruling: SPRT α=0.05, plug-in-π Z, freeze-π, shadow/paper/archive/Kalshi rows in live n, retroactive scoring, `venue` column/stratum, qty>1, NYC, pooling venues.
 
 ## Carried forward — open, not selected for this batch
 
