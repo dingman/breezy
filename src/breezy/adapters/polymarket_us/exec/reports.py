@@ -599,10 +599,9 @@ def parse_account_balances(payload: Mapping[str, Any]) -> tuple[AccountBalance, 
     precision (peer-reviewed 2026-09-04, second live-launch incident: the
     venue began reporting sub-cent balances). These two fields are Nautilus
     portfolio bookkeeping, not an observation, a price, or a settlement
-    number -- Breezy's own sizing (``operator_controls.py::
-    authorize_order_cost``) never reads them -- so A13's "a spanning interval
-    is refused, never rounded" does not apply here, and ``ROUND_DOWN`` never
-    overstates equity or spending power. See
+    number -- Breezy's own sizing gate never reads them -- so A13's "a
+    spanning interval is refused, never rounded" does not apply here, and
+    ``ROUND_DOWN`` never overstates equity or spending power. See
     ``docs/evidence/grok_live_small_spec_rev2_2026-09-04.md:31,67``. Every
     other money and price field in this module (``avg_px`` included) stays
     strict-refuse via ``_assert_representable``/``_assert_price_representable``
