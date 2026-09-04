@@ -54,9 +54,9 @@ import pyarrow as pa
 from nautilus_trader.core.data import Data
 from nautilus_trader.serialization.arrow.serializer import register_arrow
 
+from breezy.domain.climate_day import climate_day_for_instant
 from breezy.domain.strict_arrow import make_strict_decoder, make_strict_encoder
 from breezy.domain.validation import require_int, require_text
-from breezy.normalize.climate_day import climate_day_for_instant
 
 STATION_OBSERVATION_SCHEMA_VERSION: Final[int] = 1
 
@@ -146,7 +146,7 @@ class StationObservation(Data):
         Computed on demand rather than stored: the fixed standard-time
         offset is a per-site registry value, and storing it here would
         duplicate that SSOT on every record. Never DST-aware -- see
-        `breezy.normalize.climate_day.climate_day_for_instant`.
+        `breezy.domain.climate_day.climate_day_for_instant`.
 
         Uses integer `divmod`, never float division: `observed_at_ns / 1e9`
         loses sub-microsecond precision at real epoch magnitudes, which is
