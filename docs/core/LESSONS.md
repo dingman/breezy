@@ -1065,3 +1065,26 @@ line would this process have logged if that were true?" and go read it. When a
 finding says "the data was never captured", classify it VENUE-NEVER-LISTED /
 LISTED-BUT-FILTERED / LISTED-AND-ABORTED only after the by-identifier probe with
 neighbours as controls. Related: [[L-8]], [[L-18]], [[L-20]].
+
+## L-24 — A fixture that always satisfies an invariant never tests the driver that must supply it (2026-09-04)
+
+**What happened.** The 6b paper-replay harness landed with 15 green unit tests,
+three of them running a real `BacktestEngine`. The first real run over the
+captured tape refused all 14 invocations at `SettlementInvariantError`: the
+driver had never loaded the tape's `InstrumentClose` stream, so no tradeable
+instrument could ever settle. Every unit fixture had been built with a close
+record in hand, so the invariant was satisfied by construction and the driver's
+omission was invisible to the suite. The invariant itself worked exactly as
+designed; the tests around it had only ever fed it the happy input.
+
+**The rule.** For every fail-closed invariant a driver must satisfy, the driver's
+tests carry the NEGATIVE fixture (the input the driver is responsible for
+supplying, omitted) and assert the invariant fires — and the driver's positive
+path is exercised at least once against the real artefact, not only against
+fixtures that pre-satisfy it. A refusal on first real use is a result (L-8,
+L-18); a suite that never produced that refusal in miniature is the defect.
+
+**How to apply.** When a brief names an invariant the new code must satisfy,
+add a RED test titled "…still refuses when <the driver's input> is absent" next
+to the happy path, and schedule one real-artefact run in the build sequence
+before calling the increment done. Related: [[L-8]], [[L-18]], [[L-20]].
