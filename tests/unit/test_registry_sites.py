@@ -245,6 +245,28 @@ def test_never_substitute_is_populated_for_every_site(registry: SiteRegistry) ->
         assert len(site.never_substitute) > 0
 
 
+def test_iem_asos_id_is_read_for_every_site(registry: SiteRegistry) -> None:
+    # BL-24 amendment A5: values from settlement_alignment_study.py:65-71.
+    expected = {
+        "NYC": "KNYC",
+        "SFO": "KSFO",
+        "MIA": "KMIA",
+        "MDW": "KMDW",
+        "LAX": "KLAX",
+    }
+    for city, iem_asos_id in expected.items():
+        site = registry.settlement_site("polymarket_us", city)
+        assert site.iem_asos_id == iem_asos_id
+
+
+def test_known_iem_asos_ids_is_the_closed_set_across_every_site(
+    registry: SiteRegistry,
+) -> None:
+    assert registry.known_iem_asos_ids() == frozenset(
+        {"KNYC", "KSFO", "KMIA", "KMDW", "KLAX"},
+    )
+
+
 def test_registry_version_is_exposed(registry: SiteRegistry) -> None:
     assert registry.registry_version == "1.0.0"
 

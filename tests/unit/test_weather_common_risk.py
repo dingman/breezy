@@ -2093,6 +2093,17 @@ def test_both_equity_refusals_are_within_the_counted_set() -> None:
     assert EQUITY_NONPOSITIVE_REASON in risk_module.COUNTED_REFUSAL_REASONS
 
 
+def test_observation_unavailable_is_within_the_counted_set() -> None:
+    """BL-24 amendment A4: the decision layer's refusal shares this fixed set.
+
+    `"observation_unavailable"` is never emitted by `RiskManager.evaluate_order`
+    itself -- the branch lives in the decision layer (Seam B) -- but the
+    reason string is declared here so both counters draw from one bounded
+    vocabulary. L-12 widening: membership only, never equality.
+    """
+    assert "observation_unavailable" in risk_module.COUNTED_REFUSAL_REASONS
+
+
 def test_a_reducing_sell_survives_unobserved_equity() -> None:
     """RED-10: the exit is NOT gagged by a missing measurement.
 

@@ -81,6 +81,7 @@ import pytest
 from nautilus_trader.model.data import DataType
 
 from breezy.domain.nws_climate_day import NwsClimateDay
+from breezy.ingest.iem_observations import station_observation_data_type
 from breezy.ingest.nws_actor import nws_climate_day_data_type, nws_raw_product_data_type
 from tests.unit.test_polymarket_us_readonly_guard import iter_python_sources
 
@@ -91,11 +92,21 @@ if TYPE_CHECKING:  # pragma: no cover - typing only
 WEATHER_SCAN_ROOTS = ("src", "scripts")
 
 #: The record classes that have exactly one legitimate `DataType` each.
-_RECORD_NAMES = frozenset({"NwsClimateDay", "NwsRawProduct"})
+_RECORD_NAMES = frozenset({"NwsClimateDay", "NwsRawProduct", "StationObservation"})
 
-#: The two shared factories, and the ONE module they are allowed to live in.
-_FACTORY_NAMES = frozenset({"nws_climate_day_data_type", "nws_raw_product_data_type"})
-_FACTORY_MODULE = "src/breezy/ingest/nws_actor.py"
+#: The shared factories, and the ONE module each is allowed to live in.
+_FACTORY_NAMES = frozenset(
+    {"nws_climate_day_data_type", "nws_raw_product_data_type", "station_observation_data_type"},
+)
+
+#: Per-module count of legitimate shared-factory `DataType` constructions
+#: (amendment A9, BL-24). `nws_actor.py` carries the original two; the IEM
+#: observation factory lives in its own module rather than growing a third
+#: construction site inside `nws_actor.py`.
+_FACTORY_MODULES: dict[str, int] = {
+    "src/breezy/ingest/nws_actor.py": 2,
+    "src/breezy/ingest/iem_observations.py": 1,
+}
 
 
 @dataclass(frozen=True, slots=True)
@@ -164,7 +175,7 @@ def find_inline_data_type_constructions(
     """
     tree = ast.parse(source, filename=path)
     exempt = (
-        _exempt_factory_calls(tree) if allow_factories and path == _FACTORY_MODULE else set()
+        _exempt_factory_calls(tree) if allow_factories and path in _FACTORY_MODULES else set()
     )
     return [
         DataTypeViolation(path, call.lineno, f"constructs DataType({record}) inline")
@@ -207,7 +218,10 @@ def test_the_shared_factories_return_one_object_not_merely_an_equal_one() -> Non
     """Identity is the property the barrier protects, so it is asserted here."""
     assert nws_climate_day_data_type() is nws_climate_day_data_type()
     assert nws_raw_product_data_type() is nws_raw_product_data_type()
+    assert station_observation_data_type() is station_observation_data_type()
     assert nws_climate_day_data_type() is not nws_raw_product_data_type()
+    assert station_observation_data_type() is not nws_climate_day_data_type()
+    assert station_observation_data_type() is not nws_raw_product_data_type()
 
 
 def test_the_shared_factories_carry_no_metadata() -> None:
@@ -221,6 +235,8 @@ def test_the_shared_factories_carry_no_metadata() -> None:
     assert nws_climate_day_data_type().topic == "NwsClimateDay*"
     assert nws_raw_product_data_type().metadata == {}
     assert nws_raw_product_data_type().topic == "NwsRawProduct*"
+    assert station_observation_data_type().metadata == {}
+    assert station_observation_data_type().topic == "StationObservation*"
 
 
 # ---------------------------------------------------------------------------
@@ -234,22 +250,29 @@ def test_no_module_constructs_a_weather_data_type_inline() -> None:
     assert not violations, "\n".join(str(v) for v in violations)
 
 
-def test_the_exemption_covers_exactly_the_two_shared_factories() -> None:
-    """Non-vacuity: without the exemption, the factory module IS flagged.
+@pytest.mark.parametrize(
+    ("factory_module", "expected_count"),
+    sorted(_FACTORY_MODULES.items()),
+)
+def test_the_exemption_covers_exactly_the_shared_factories_per_module(
+    factory_module: str, expected_count: int,
+) -> None:
+    """Non-vacuity: without the exemption, each factory module IS flagged.
 
-    Two hits, one per factory. If this drops to zero the detector has stopped
-    detecting and the repo-wide scan above is passing for the wrong reason.
+    One hit per factory in that module. If any count drops to zero the
+    detector has stopped detecting and the repo-wide scan above is passing
+    for the wrong reason.
     """
     source = next(
-        src for path, src in iter_python_sources(("src",)) if path == _FACTORY_MODULE
+        src for path, src in iter_python_sources(("src",)) if path == factory_module
     )
 
     unexempt = find_inline_data_type_constructions(
-        _FACTORY_MODULE, source, allow_factories=False
+        factory_module, source, allow_factories=False
     )
-    exempt = find_inline_data_type_constructions(_FACTORY_MODULE, source)
+    exempt = find_inline_data_type_constructions(factory_module, source)
 
-    assert len(unexempt) == 2
+    assert len(unexempt) == expected_count
     assert exempt == []
 
 
@@ -278,6 +301,7 @@ def test_the_exemption_is_bound_to_the_factory_module_not_the_function_name() ->
         ("bare call", "DataType(NwsClimateDay)\n"),
         ("with metadata", 'DataType(NwsClimateDay, {"p": 1, "q": 2})\n'),
         ("raw product", "DataType(NwsRawProduct)\n"),
+        ("station observation", "DataType(StationObservation)\n"),
         ("dotted callee", "data.DataType(NwsClimateDay)\n"),
         ("dotted record", "nws.NwsRawProduct\nDataType(nws.NwsRawProduct)\n"),
         ("keyword form", "DataType(type=NwsClimateDay)\n"),
@@ -298,6 +322,7 @@ def test_the_rule_detects_an_inline_construction(label: str, source: str) -> Non
     [
         ("a foreign record class", "DataType(QuoteTick)\n"),
         ("a call to the shared factory", "nws_climate_day_data_type()\n"),
+        ("a call to the IEM shared factory", "station_observation_data_type()\n"),
         ("an unrelated callee", "SomethingElse(NwsClimateDay)\n"),
         ("a bare reference", "records = [NwsClimateDay]\n"),
     ],

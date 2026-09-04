@@ -33,6 +33,10 @@ from breezy.domain.selection import (
     latest_by_climate_day,
     select_climate_day,
 )
+from breezy.domain.station_observation import (
+    STATION_OBSERVATION_SCHEMA_VERSION,
+    StationObservation,
+)
 from breezy.domain.strict_arrow import SchemaDriftError
 
 __all__ = [
@@ -41,12 +45,14 @@ __all__ = [
     "CLIMATE_DAY_SCHEMA_VERSION",
     "MISSING_VALUE_FLAGS",
     "RAW_PRODUCT_SCHEMA_VERSION",
+    "STATION_OBSERVATION_SCHEMA_VERSION",
     "ArchivedClimateDay",
     "ArchivedRawProduct",
     "ClimateDayKey",
     "NwsClimateDay",
     "NwsRawProduct",
     "SchemaDriftError",
+    "StationObservation",
     "climate_day_key",
     "latest_by_climate_day",
     "select_climate_day",

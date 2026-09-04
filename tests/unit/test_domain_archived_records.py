@@ -144,6 +144,7 @@ def test_archived_modules_register_arrow_once_each() -> None:
     for relative in (
         "src/breezy/domain/archived_climate_day.py",
         "src/breezy/domain/archived_raw_product.py",
+        "src/breezy/domain/station_observation.py",
     ):
         tree = ast.parse((_ROOT / relative).read_text())
         calls = [

@@ -21,6 +21,13 @@ def test_loader_rejects_missing_required_field() -> None:
         load_registry(FIXTURES_DIR / "missing_required_field.toml")
 
 
+def test_loader_rejects_missing_iem_asos_id() -> None:
+    # iem_asos_id is required (BL-24 amendment A5): live IEM station
+    # validation is against this closed set, never derived from icao.
+    with pytest.raises(RegistryError, match="iem_asos_id"):
+        load_registry(FIXTURES_DIR / "missing_iem_asos_id.toml")
+
+
 def test_loader_rejects_missing_iana_tz() -> None:
     # iana_tz is still required at load time even though no accessor
     # surfaces it -- validation and exposure are independent concerns.
@@ -81,6 +88,7 @@ registry_version = "test"
 
 [sites.polymarket_us.NYC]
 icao = "KNYC"
+iem_asos_id = "KNYC"
 cli_location = "NYC"
 issuing_office = "KOKX"
 body_header_regex = "^NYC$"
@@ -103,6 +111,7 @@ elevation_m = 46.0
 
 [sites.polymarket_us.ALT]
 icao = "KABC"
+iem_asos_id = "KABC"
 cli_location = "ABC"
 issuing_office = "KOKX"
 body_header_regex = "^ABC$"

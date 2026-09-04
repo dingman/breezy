@@ -1,7 +1,10 @@
-# Malformed fixture: top-level registry_version is omitted entirely.
+# Malformed fixture: iem_asos_id omitted. Required (BL-24 amendment A5):
+# station validation for the live IEM poller is against this closed set,
+# never derived from icao.
+registry_version = "test-1"
+
 [sites.polymarket_us.TST]
 icao = "KABC"
-iem_asos_id = "KABC"
 cli_location = "ZZZ"
 venue_city_token = "tst"
 issuing_office = "KXYZ"

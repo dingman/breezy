@@ -112,6 +112,7 @@ registry_version = "test"
 
 [sites.polymarket_us.BOS]
 icao = "KBOS"
+iem_asos_id = "KBOS"
 cli_location = "BOS"
 issuing_office = "KBOX"
 body_header_regex = "^BOS$"
@@ -134,6 +135,7 @@ elevation_m = 6.0
 
 [sites.polymarket_us.DAL]
 icao = "KDAL"
+iem_asos_id = "KDAL"
 cli_location = "DAL"
 issuing_office = "KFWD"
 body_header_regex = "^DAL$"
@@ -156,6 +158,7 @@ elevation_m = 148.0
 
 [sites.kalshi.SEA]
 icao = "KSEA"
+iem_asos_id = "KSEA"
 cli_location = "SEA"
 issuing_office = "KSEW"
 body_header_regex = "^SEA$"

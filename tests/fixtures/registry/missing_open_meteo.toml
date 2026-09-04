@@ -3,6 +3,7 @@ registry_version = "test-1"
 
 [sites.polymarket_us.TST]
 icao = "KABC"
+iem_asos_id = "KABC"
 cli_location = "ZZZ"
 venue_city_token = "tst"
 issuing_office = "KXYZ"

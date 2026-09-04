@@ -83,6 +83,12 @@ COUNTED_REFUSAL_REASONS: Final[frozenset[str]] = frozenset(
         "too_close_to_settlement",
         "stale_forecast",
         "stale_observation",
+        # Decision-layer reason (`weather_common/refusals.py`), NOT emitted
+        # by `RiskManager.evaluate_order`, which has no observation value to
+        # judge -- see `docs/plans/BL24_LIVE_RT_2026-09-04.md` amendment A4.
+        # Counted here so the decision layer's counter shares the one fixed,
+        # finite reason set.
+        "observation_unavailable",
         "future_signal",
         "observation_limit_unset",
         "edge_below_minimum",

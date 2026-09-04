@@ -42,6 +42,7 @@ DEFAULT_REGISTRY_PATH: Final[Path] = Path(__file__).resolve().parent / "sites.to
 
 _REQUIRED_IDENTIFIER_FIELDS: Final[tuple[str, ...]] = (
     "icao",
+    "iem_asos_id",
     "cli_location",
     "issuing_office",
     "body_header_regex",
@@ -108,6 +109,7 @@ class SettlementSite:
     venue: str
     city: str
     icao: str
+    iem_asos_id: str
     cli_location: str
     issuing_office: str
     body_header_regex: Pattern[str]
@@ -216,6 +218,7 @@ def _build_settlement_site(venue: str, city: str, table: dict[str, Any]) -> Sett
         venue=venue,
         city=city,
         icao=str(table["icao"]),
+        iem_asos_id=str(table["iem_asos_id"]),
         cli_location=str(table["cli_location"]),
         issuing_office=str(table["issuing_office"]),
         body_header_regex=_compile_header_regex(str(table["body_header_regex"]), site_key),
@@ -345,6 +348,15 @@ class SiteRegistry:
     def pairs(self) -> tuple[tuple[str, str], ...]:
         """All `(venue, city)` pairs known to this registry."""
         return tuple(self._settlement_sites.keys())
+
+    def known_iem_asos_ids(self) -> frozenset[str]:
+        """The closed set of registered `iem_asos_id` values, across every site.
+
+        Validation against IEM station ids must use this closed set, never a
+        shape regex: IEM ids satisfy `_CLI_LOCATION_PATTERN` too, so a
+        pattern cannot separate a legitimate id from an unregistered one.
+        """
+        return frozenset(site.iem_asos_id for site in self._settlement_sites.values())
 
     def settlement_site(self, venue: str, city: str) -> SettlementSite:
         """Return the settlement identity for `(venue, city)`.
