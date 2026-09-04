@@ -21,12 +21,12 @@ written here and their values are never written anywhere in this repository
 | 0.4 | R-9-PRE — settlement/exit guards | commit `b418424` | LANDED |
 | 0.5 | R-7-PRE-2 — `DailySpendLedger` release + true-up | commit `e329667` (`operator_controls.py:408-474`) | LANDED, zero call sites |
 | 0.6 | R-7 latch library — durable submit-intent latch, L-22 locked constructor | commit `5d41eaa` (`src/breezy/runtime/submit_intent.py`) | LANDED, zero call sites |
-| 0.7 | **R-6.5b** — `write_transport.py`, `PERMITTED_WRITE_METHODS={"POST"}`, `post_cancel_all`, B4 narrowing | TODO — the module does not exist in `src/breezy/adapters/polymarket_us/` | **TODO** |
-| 0.8 | **R-7** — `_submit_order` gets a body; startup calls `reconcile_at_startup` before the first `arm`; standing refusal removed | TODO — `exec/client.py` still ends at `_STANDING_ORDER_REFUSAL` | **TODO** |
-| 0.9 | **R-7-STATUS** — by-id order read on the READ seam (blocks R-8) | TODO | **TODO** |
-| 0.10 | **Seam B** — NWS observation publisher (A12); `0.75 h` staleness is miscalibrated without it | TODO | **TODO** |
-| 0.11 | **current_rung_hold steps 4–7** — `config.py`, `decision.py`, `strategy.py`, PREREG artefact (plus 6b/6c/6d) | FLAG-OFF runtime wiring landed (`breezy.app.trade`, `composition.py`); `orders_enabled` stays False and unreachable from env; PREREG + 6c/6d still open | **PARTIAL** |
-| 0.12 | Gate green: `scripts/ci/run_tests_no_egress.sh`, passed count never dropped | TODO at each increment | **TODO** |
+| 0.7 | **R-6.5b** — `write_transport.py`, `PERMITTED_WRITE_METHODS={"POST"}`, `post_cancel_all`, `post_order`, B4 narrowing; `WRITE_CANONICAL_STRING_VERIFIED: Final[bool] = False` (line 48) | commit `092695c`; `src/breezy/adapters/polymarket_us/write_transport.py:40-175` | LANDED, 092695c |
+| 0.8 | **R-7** — `_submit_order` gets D1–D9 body; startup calls `reconcile_at_startup` before the first `arm`; `exec/submit_chain.py` classifies shape/response | commit `092695c`; `src/breezy/adapters/polymarket_us/exec/client.py:1484-1550`; `src/breezy/adapters/polymarket_us/exec/submit_chain.py` | LANDED, 092695c; refined 02bfd63 |
+| 0.9 | **R-7-STATUS** — by-id order read on the READ seam (`exec/client.py::generate_order_status_report`, templated path, no new B4 row) | LANDED `092695c` | **LANDED** |
+| 0.10 | **Seam B** — NWS observation publisher (A12); `0.75 h` staleness | LANDED `e9492bc` (flag `BREEZY_LIVE_OBSERVATIONS=1`), staleness gating `86d6a63` | **LANDED** |
+| 0.11 | **current_rung_hold steps 4–7** — `config.py`, `decision.py`, `strategy.py`, PREREG artefact (plus 6c/6d) | FLAG-OFF runtime wiring landed (commit `c86bd10`); `orders_enabled` stays False and unreachable from env (`src/breezy/runtime/settings.py`); per-tick refusal counts (commit `2aa3e3a`); config/decision/strategy landed (`15f04f4`, `348f9c8`, `74cfa7c`+fixes); 6c scorer `24950d1`/`43e38ff`, 6d tally `abcc1ad` (timer PREPARED, not enabled), 6e BCa `6ddca6e`; PREREG v1 DRAFT at `docs/specs/PREREG_v1_current_rung_hold_2026-09-04.md` — the operator step is to commit it as binding before the first order | **PARTIAL (operator: PREREG binding + timer enable)** |
+| 0.12 | Gate green: `scripts/ci/run_tests_no_egress.sh`, passed count never dropped | green at every landing 09-04 (5856 → 7452+) | **HELD** |
 
 Nothing below is started until 0.7–0.12 are closed, EXCEPT OP-1..OP-4, which are R-6.5b's own
 precondition (OQ-D) and are run first.
@@ -46,7 +46,7 @@ Both flags must be exactly `1`. The catalog root is required only when the strat
 
 `BREEZY_CURRENT_RUNG_HOLD=1` without `BREEZY_LIVE_OBSERVATIONS=1` is a configuration error (exit 2) and names both variables.
 
-The composition root (`breezy.app.trade`) is the sole opener of the submit-intent latch. The exec client stores the injected latch and does not open a second one.
+The composition root (`breezy.app.trade:main`, commit `092695c`; `pyproject.toml:251`) is the sole opener of the submit-intent latch. The exec client stores the injected latch and does not open a second one.
 
 journalctl strings to grep:
 
@@ -135,7 +135,7 @@ in the shipped probe.
 
 ## 5. PREREG committed — BEFORE the first order
 
-`docs/evidence/PREREG_current_rung_hold_<D0>.md` must be **committed before the first order**
+`docs/specs/PREREG_v1_current_rung_hold_2026-09-04.md` (v1 DRAFT exists; remove its draft line to make it binding) must be **committed as binding before the first order**
 (blueprint §3, §6 step 7). Fields (§7): D0 · stations LAX, MDW, MIA, SFO (NYC excluded, L-13) ·
 window [12:00,17:00) LST · `L_extra=0` with archive arms 30 and 45 agreeing · `stale_observation_hours=0.75` ·
 feed: NWS `api.weather.gov` (A12) · ask band (0.05,0.95), depth ≥1.0, size 1, IOC, hold to settlement ·
@@ -178,8 +178,7 @@ Start the node from that same shell:
 ```
 .venv/bin/breezy-trade
 ```
-(`[project.scripts] breezy-trade = "breezy.runtime.trade_cli:main"`, `pyproject.toml:240`). It takes no
-arguments; all configuration is read from the environment by `config_from_env` / `exec_config_from_env`.
+(`pyproject.toml:251`: `breezy-trade = "breezy.app.trade:main"`). It takes no arguments; all configuration is read from the environment by `config_from_env` / `exec_config_from_env`.
 There is **no systemd unit for the trade node**, and there must not be one: a unit file would put the
 enablement value in a file. `deploy/systemd/` carries the tape, ingest, and study units only.
 
@@ -213,25 +212,16 @@ On restart, `reconcile_at_startup` repairs only two cases: a matching history re
 verbatim), or `has_durable_fill_record(fingerprint) is True`. **Nothing supplies that fill probe
 today**, so in practice a crash mid-POST leaves the latch OPEN.
 
-The only remaining exit is an operator clear tool. **MISSING — build item.** There is no
-`breezy-clear-submit-intent` console script (`pyproject.toml` ships exactly four: `breezy-quote-tape`,
-`breezy-quote-tape-preflight`, `breezy-trade`, `breezy-quote-tape-ingest`), no clear/reset/reconcile
-CLI under `scripts/`, and no clear entry point in `submit_intent.py` or `trade_cli.py`. The
-`OPERATOR_CLEARED` retirement reason exists (`submit_intent.py:78`) with no tool to emit it. Per
-Rev 7 §5, that tool must refuse without an operator acknowledgement, must require a positions +
-fill-record artefact, must never accept open-orders emptiness as proof, and must take the same
-exclusive flock — the node and the clear tool can never both act.
-
-Until it exists: **never re-arm before reconciliation.** Do not delete the state store, do not edit the
-singleton by hand, do not restart with a fresh store path. Stop, obtain the positions/fill evidence
-from the venue, and hand the case to the build side.
+The only remaining exit is an operator clear tool. **LANDED** — `breezy-clear-submit-intent` (commit `092695c`; `pyproject.toml:263`; `src/breezy/runtime/clear_submit_intent_cli.py:69-163`). Requires operator ack
+(`BREEZY_CLEAR_SUBMIT_INTENT_ACK="1"`), `--yes`, `--resolution` (order-id=<id> or no-order-exists), and `--evidence` (positions + fill-record artefact). Exit codes: 0 (cleared), 2 (refused), 3 (nothing OPEN). The tool refuses without an operator acknowledgement, requires positions + fill-record evidence, never accepts open-orders emptiness as proof, and takes the same exclusive flock — the node and the clear tool can never both act.
 
 ## 9. Kill / survive
 
-The nightly live-family verdict is a **build item (6d)**: a systemd timer beside `breezy-mb-daily`
-that tallies the live family (n, k, Wilson interval vs BE → KILL / SURVIVE / UNDERPOWERED). It does
-not exist yet. When it lands, its live section is read at
-`~/.local/share/breezy/derived/mb_current_rung_edge_<date>.md`. Today that path is written by
+The nightly live-family verdict (6d, `abcc1ad`) is `scripts/analysis/live_family_tally.py` driven by
+`deploy/systemd/breezy-live-tally.timer` (14:30 UTC, PREPARED — the operator enables it with
+`systemctl --user enable --now breezy-live-tally.timer` after `systemd-analyze --user verify`). It tallies
+the live family (n, k, Wilson vs BE → KILL / SURVIVE / UNDERPOWERED; SURVIVE also needs ΣPnL>0) and prints
+the BCa lower bound on ROI — the stop-gate quantity. Its output path is set by the unit's `--output`. Today that path is written by
 `scripts/analysis/mb_current_rung_edge_study.py` via `deploy/systemd/mb-daily-run.sh:62-63` and
 carries the ARCHIVE study only — no live section.
 
