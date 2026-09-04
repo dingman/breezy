@@ -109,6 +109,18 @@ CURRENT_RUNG_HOLD_VAR = "BREEZY_CURRENT_RUNG_HOLD"
 #: contract. Required, absolute, no ``..`` segment, only when the flag is on.
 TRADE_CATALOG_ROOT_VAR = "BREEZY_TRADE_CATALOG_ROOT"
 
+#: CRH enablement step 8 (converged review item 7): a build-side REQUEST
+#: for the order path to be reachable, not an enablement by itself. OFF
+#: unless set to exactly ``"1"`` -- same idiom as :data:`LIVE_OBSERVATIONS_VAR`
+#: and :data:`CURRENT_RUNG_HOLD_VAR`. Requires both of those to already be on:
+#: the strategy has no order path to gate without ``current_rung_hold``, and
+#: no fresh price to gate it against without ``live_observations``. This
+#: field is a REQUEST that ``runtime.order_enablement.issue_order_submission_
+#: permit`` reads and validates alongside five other preconditions -- it is
+#: never, on its own, sufficient to submit an order. It is a build-side flag,
+#: not an operator-reserved control, so its name may appear in tracked files.
+ORDERS_ENABLED_VAR = "BREEZY_ORDERS_ENABLED"
+
 _DEFAULT_TRADER_ID = "BREEZY-001"
 
 #: G-19 item B11 asked for this to be derived from the NWS CLI issuance
@@ -291,6 +303,10 @@ def _parse_live_observations(env: Mapping[str, str]) -> bool:
 
 def _parse_current_rung_hold(env: Mapping[str, str]) -> bool:
     return env.get(CURRENT_RUNG_HOLD_VAR) == "1"
+
+
+def _parse_orders_enabled(env: Mapping[str, str]) -> bool:
+    return env.get(ORDERS_ENABLED_VAR) == "1"
 
 
 def _parse_trade_catalog_root(env: Mapping[str, str]) -> Path:
@@ -723,6 +739,16 @@ class BreezyTradeSettings:
     #: Pre-build discovery catalog, set only when ``current_rung_hold`` is on.
     #: See :data:`TRADE_CATALOG_ROOT_VAR`.
     catalog_root: Path | None = None
+    #: CRH enablement step 8: a REQUEST that the order path be reachable.
+    #: Default OFF; see :data:`ORDERS_ENABLED_VAR`. This is NOT an
+    #: enablement -- it can never, by itself, cause an order to be
+    #: submitted. It is one of six preconditions
+    #: ``runtime.order_enablement.issue_order_submission_permit`` reads off
+    #: this already-loaded settings object (never re-parsing the env) before
+    #: minting the sealed, unforgeable ``OrderSubmissionPermit`` that the
+    #: strategy actually gates on. Requires ``current_rung_hold`` and
+    #: ``live_observations`` to both be True; refused otherwise at load time.
+    orders_enabled_requested: bool = False
 
 
 def load_trade_settings(env: Mapping[str, str] | None = None) -> BreezyTradeSettings:
@@ -754,6 +780,14 @@ def load_trade_settings(env: Mapping[str, str] | None = None) -> BreezyTradeSett
             "without the publisher would latch observation_unavailable on "
             "every station-day and burn the one trial"
         )
+    orders_enabled_requested = _parse_orders_enabled(active_env)
+    if orders_enabled_requested and not (current_rung_hold and live_observations):
+        raise SettingsError(
+            f"{ORDERS_ENABLED_VAR}=1 requires {CURRENT_RUNG_HOLD_VAR}=1 and "
+            f"{LIVE_OBSERVATIONS_VAR}=1: a request for the order path to be "
+            "reachable is meaningless without the strategy and its price "
+            "source both enabled"
+        )
     catalog_root = _parse_trade_catalog_root(active_env) if current_rung_hold else None
 
     return BreezyTradeSettings(
@@ -762,4 +796,5 @@ def load_trade_settings(env: Mapping[str, str] | None = None) -> BreezyTradeSett
         live_observations=live_observations,
         current_rung_hold=current_rung_hold,
         catalog_root=catalog_root,
+        orders_enabled_requested=orders_enabled_requested,
     )

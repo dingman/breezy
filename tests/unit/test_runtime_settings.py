@@ -17,6 +17,7 @@ from breezy.registry.sites import default_registry
 from breezy.runtime.settings import (
     CURRENT_RUNG_HOLD_VAR,
     LIVE_OBSERVATIONS_VAR,
+    ORDERS_ENABLED_VAR,
     TRADE_CATALOG_ROOT_VAR,
     TRADE_TRADER_ID_VAR,
     BreezyRuntimeSettings,
@@ -746,4 +747,78 @@ def test_current_rung_hold_without_live_observations_is_a_settings_error() -> No
     message = str(excinfo.value)
     assert CURRENT_RUNG_HOLD_VAR in message
     assert LIVE_OBSERVATIONS_VAR in message
+
+
+# ---------------------------------------------------------------------------
+# A1 -- BREEZY_ORDERS_ENABLED (single parse; converged review item 7)
+# ---------------------------------------------------------------------------
+
+_BOTH_SIBLINGS_ENV = {
+    **_TRADE_ONLY_ENV,
+    CURRENT_RUNG_HOLD_VAR: "1",
+    LIVE_OBSERVATIONS_VAR: "1",
+    TRADE_CATALOG_ROOT_VAR: "/tmp/breezy-trade-catalog",
+}
+
+
+def test_orders_enabled_requested_is_exact_one() -> None:
+    """Same ``== "1"`` idiom as the two siblings: absent / ``" 1"`` /
+    ``"true"`` / ``"yes"`` -> False; ``"1"`` (with both siblings set) -> True.
+    """
+    absent = load_trade_settings(_BOTH_SIBLINGS_ENV).orders_enabled_requested
+    padded = load_trade_settings(
+        {**_BOTH_SIBLINGS_ENV, ORDERS_ENABLED_VAR: " 1"}
+    ).orders_enabled_requested
+    true_word = load_trade_settings(
+        {**_BOTH_SIBLINGS_ENV, ORDERS_ENABLED_VAR: "true"}
+    ).orders_enabled_requested
+    yes_word = load_trade_settings(
+        {**_BOTH_SIBLINGS_ENV, ORDERS_ENABLED_VAR: "yes"}
+    ).orders_enabled_requested
+    one = load_trade_settings(
+        {**_BOTH_SIBLINGS_ENV, ORDERS_ENABLED_VAR: "1"}
+    ).orders_enabled_requested
+
+    assert (absent, padded, true_word, yes_word, one) == (False, False, False, False, True)
+
+
+def test_orders_enabled_requested_defaults_false_and_is_shadow_by_default() -> None:
+    assert load_trade_settings(_TRADE_ONLY_ENV).orders_enabled_requested is False
+
+
+def test_orders_enabled_without_current_rung_hold_is_a_settings_error() -> None:
+    with pytest.raises(SettingsError) as excinfo:
+        load_trade_settings({**_TRADE_ONLY_ENV, ORDERS_ENABLED_VAR: "1"})
+    message = str(excinfo.value)
+    assert ORDERS_ENABLED_VAR in message
+    assert CURRENT_RUNG_HOLD_VAR in message
+    assert LIVE_OBSERVATIONS_VAR in message
+
+
+def test_orders_enabled_without_live_observations_is_a_settings_error() -> None:
+    """``current_rung_hold`` alone cannot be True without ``live_observations``
+    (the prior cross-flag refusal), so this combination is refused by that
+    earlier check before the new one is ever reached -- still refused,
+    which is the property under test.
+    """
+    with pytest.raises(SettingsError) as excinfo:
+        load_trade_settings(
+            {
+                **_TRADE_ONLY_ENV,
+                ORDERS_ENABLED_VAR: "1",
+                CURRENT_RUNG_HOLD_VAR: "1",
+                TRADE_CATALOG_ROOT_VAR: "/tmp/breezy-trade-catalog",
+            }
+        )
+    message = str(excinfo.value)
+    assert CURRENT_RUNG_HOLD_VAR in message
+    assert LIVE_OBSERVATIONS_VAR in message
+
+
+def test_orders_enabled_with_both_siblings_set_is_accepted() -> None:
+    settings = load_trade_settings({**_BOTH_SIBLINGS_ENV, ORDERS_ENABLED_VAR: "1"})
+
+    assert settings.orders_enabled_requested is True
+    assert settings.current_rung_hold is True
+    assert settings.live_observations is True
 
