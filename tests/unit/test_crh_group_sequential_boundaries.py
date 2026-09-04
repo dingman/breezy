@@ -195,15 +195,48 @@ def test_build_output_shape_and_reproducible_sha():
     }
 
 
+def test_build_output_usage_field_labels_reference_table_as_fixture_only():
+    """R1 (domain review 2026-09-04): a consumer must not index `reference_table`
+    by n_k instead of computing the realized t_k = min(1, I_k/I_max) and
+    calling `boundary_for` -- the payload must self-label as a regression
+    fixture, not a live-lookup table."""
+    out = gs.build_output(0.025, 160, 10)
+    assert "usage" in out
+    assert "regression_fixture_only" in out["usage"]
+
+
+def test_build_output_solver_fingerprint_present_and_not_authoritative():
+    """H2 (domain review 2026-09-04): `inputs_sha256` correctly excludes the
+    numerical-grid constants (spec pins design inputs only), but a silent
+    change to GRID_NPTS / GRID_HALFWIDTH_SD / brentq xtol moves b_eff(16) by
+    ~1.2e-3 while the sha stays identical. `solver_fingerprint` is a second,
+    explicitly diagnostic field that DOES change with those constants."""
+    out = gs.build_output(0.025, 160, 10)
+    assert "solver_fingerprint" in out
+    fp = out["solver_fingerprint"]
+    assert isinstance(fp, str)
+    assert len(fp) == 64
+    assert all(c in "0123456789abcdef" for c in fp)
+
+
+def test_solver_fingerprint_changes_with_grid_constant_but_inputs_sha_does_not(monkeypatch):
+    out_before = gs.build_output(0.025, 160, 10)
+    monkeypatch.setattr(gs, "GRID_NPTS", gs.GRID_NPTS + 1)
+    out_after = gs.build_output(0.025, 160, 10)
+    assert out_after["solver_fingerprint"] != out_before["solver_fingerprint"]
+    assert out_after["inputs_sha256"] == out_before["inputs_sha256"]
+
+
 def test_simulation_fixed_pi_type_i_within_mc_bound():
-    """Bound is widened beyond the pure Monte-Carlo margin (alpha +
-    3*MC-SE) to also absorb the finite numerical-grid recursion's tail
-    imprecision (see module docstring); it still pins Type I close to the
-    nominal 0.025, not an arbitrary pass."""
+    """Bound is the same 3*MC-SE margin the drift test uses (H3 hardening,
+    domain review 2026-09-04) -- informational, not the adopted statistic,
+    but tightened from the previously loose alpha+0.015 bound; it still pins
+    Type I close to the nominal 0.025, not an arbitrary pass."""
     rows = gs.build_reference_table(0.025, 160, 10, gs.i_max_for(160))
     n_reps = 20_000
     result = gs.simulate_fixed_pi(rows, pi=0.41, delta=0.15, n_reps=n_reps, seed=20260904)
-    assert result["leak_p_eq_pi"]["p_efficacy"] <= 0.025 + 0.015
+    mc_se = np.sqrt(0.025 * 0.975 / n_reps)
+    assert result["leak_p_eq_pi"]["p_efficacy"] <= 0.025 + 3 * mc_se
     assert 10 <= result["leak_p_eq_pi"]["asn"] <= 160
     assert result["edge_p_eq_pi_plus_delta"]["p_efficacy"] > result["leak_p_eq_pi"]["p_efficacy"]
 

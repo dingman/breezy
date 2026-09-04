@@ -194,5 +194,7 @@
       "p_underpowered": 0.9495
     }
   },
-  "spending_id": "lan_demets_obrien_fleming_1983_symmetric_two_one_sided"
+  "solver_fingerprint": "a06526c55d3ecca07282e86ccae6ffd4379d6ab6855e2759f0cccb31a313dc0b",
+  "spending_id": "lan_demets_obrien_fleming_1983_symmetric_two_one_sided",
+  "usage": "regression_fixture_only; live boundaries via boundary_for(t_history) at realized t_k = min(1, I_k/I_max)"
 }

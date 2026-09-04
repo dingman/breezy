@@ -101,6 +101,7 @@ SPENDING_FUNCTION_ID: Final[str] = "lan_demets_obrien_fleming_1983_symmetric_two
 # it is a numerical-accuracy knob only.
 GRID_NPTS: Final[int] = 2001
 GRID_HALFWIDTH_SD: Final[float] = 9.0
+BRENTQ_XTOL: Final[float] = 1e-10
 
 # Fixture for the drifting-ask simulation (SS "Simulation").
 DRIFT_ASK_LOW: Final[float] = 0.20
@@ -222,8 +223,8 @@ def boundary_for(
         def cross_fut(b: float, lower=lower, target=target) -> float:
             return lower(b) - target
 
-        b_eff = brentq(cross_eff, newgrid[0], newgrid[-1], xtol=1e-10)
-        b_fut = brentq(cross_fut, newgrid[0], newgrid[-1], xtol=1e-10)
+        b_eff = brentq(cross_eff, newgrid[0], newgrid[-1], xtol=BRENTQ_XTOL)
+        b_fut = brentq(cross_fut, newgrid[0], newgrid[-1], xtol=BRENTQ_XTOL)
 
         mask = (newgrid > b_fut) & (newgrid < b_eff)
         dens = newdens * mask
@@ -333,6 +334,29 @@ def sha256_of_inputs(manifest: dict) -> str:
     return hashlib.sha256(blob).hexdigest()
 
 
+def solver_fingerprint() -> str:
+    """Diagnostic sha256 over the numerical-grid constants (`GRID_NPTS`,
+    `GRID_HALFWIDTH_SD`, `BRENTQ_XTOL`) and the spending function id. This is
+    NOT the registered inputs pin (`inputs_sha256`, which correctly excludes
+    these per the spec -- SS7 pins design inputs only, not numerical-accuracy
+    knobs) and is never used for admission. It exists so a silent change to a
+    grid constant -- which moves `b_eff`/`b_fut` by a small but real amount
+    even though `inputs_sha256` stays byte-identical -- is at least visible
+    in the artefact; read module globals at call time so it tracks whatever
+    values were actually in effect when the table was built."""
+    blob = json.dumps(
+        {
+            "grid_npts": GRID_NPTS,
+            "grid_halfwidth_sd": GRID_HALFWIDTH_SD,
+            "brentq_xtol": BRENTQ_XTOL,
+            "spending_function_id": SPENDING_FUNCTION_ID,
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return hashlib.sha256(blob).hexdigest()
+
+
 def build_output(
     alpha: float, n_max: int, look_step: int, *, truncate_at: int | None = None
 ) -> dict:
@@ -347,6 +371,11 @@ def build_output(
         "i_max": i_max,
         "look_step": look_step,
         "inputs_sha256": sha,
+        "solver_fingerprint": solver_fingerprint(),
+        "usage": (
+            "regression_fixture_only; live boundaries via boundary_for(t_history) "
+            "at realized t_k = min(1, I_k/I_max)"
+        ),
         "reference_table": [r.to_dict() for r in rows],
     }
 
