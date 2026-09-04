@@ -2658,6 +2658,18 @@ def test_x1_the_live_scan_actually_reaches_a_test_that_imports_the_exec_package(
     # `_FakeSender`/`_FakeSigner` (imported from
     # `test_polymarket_us_submit_order_chain.py`, never a parallel fake), so
     # it never opens a socket either.
+    #
+    # Fill-tally spine adds two: `test_fill_time_count.py` and
+    # `test_live_family_tally_fill_source_cli.py` both import
+    # `DurableFillRecord` from `exec.client` to build fixtures for fill-time
+    # accounting and the fill-source CLI tally, respectively. WIDENED, not
+    # relaxed (L-6/L-12): the comparison is still `==`; neither module
+    # carries `SOCKET_RESTORING_MARKERS`, and neither constructs a client or
+    # opens a socket -- `DurableFillRecord` is a plain data record, so both
+    # suites build it directly from literal fields.
+    #
+    # Old -> new (this row only): added `tests/unit/test_fill_time_count.py`
+    # and `tests/unit/test_live_family_tally_fill_source_cli.py`.
     assert exec_importing_test_modules() == {
         "tests/contract/test_exec_client_reconciliation_contract.py",
         "tests/contract/test_exec_client_wiring_contract.py",
@@ -2668,6 +2680,8 @@ def test_x1_the_live_scan_actually_reaches_a_test_that_imports_the_exec_package(
         "tests/unit/test_polymarket_us_exec_positions.py",
         "tests/unit/test_polymarket_us_exec_refusals.py",
         "tests/unit/test_polymarket_us_exec_reports.py",
+        "tests/unit/test_fill_time_count.py",
+        "tests/unit/test_live_family_tally_fill_source_cli.py",
         "tests/unit/test_polymarket_us_exec_snapshot_drift.py",
         "tests/unit/test_polymarket_us_factories.py",
         "tests/unit/test_polymarket_us_submit_order_chain.py",
