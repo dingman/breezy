@@ -482,6 +482,9 @@ def test_a_capture_with_no_close_but_a_final_climate_day_synthesizes_and_settles
     # with the trials -- this arm fills, so no `outside_decision_window`
     # refusal is expected.
     assert result.strategy_refusals == {}
+    # WAIT-state diagnostics -- a fill on the first executable snapshot
+    # leaves no diagnostic recorded either.
+    assert result.strategy_diagnostics == {}
 
     scored = score_trial(trial, final, now_ns=WINDOW_OPEN_NS + 10_000)
     assert isinstance(scored, ScoredTrial)
@@ -727,6 +730,9 @@ def test_run_one_precision_arm_returns_the_strategys_own_refusal_counts(
     )
     assert result.trials == ()
     assert result.strategy_refusals == {"outside_decision_window": 1}
+    # The quote never enters the decision window, so it never reaches
+    # the WAIT-state diagnostics checks either.
+    assert result.strategy_diagnostics == {}
 
 
 def test_print_roi_and_wilson_uses_the_scoring_vocabulary_label(

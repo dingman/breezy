@@ -360,10 +360,18 @@ class PrecisionArmResult:
     from the 6c scorer's `refused` count over `FilledTrial`s -- see
     `_print_roi_and_wilson`'s `scoring_refused` label; the two must never be
     conflated under one name.
+
+    `strategy_diagnostics` is the strategy's `self.diagnostics` snapshot --
+    the WAIT-state counts (`in_window_not_executable`,
+    `in_window_no_running_max_yet`, `in_window_rung_not_current`), a
+    DIFFERENT vocabulary again from `strategy_refusals` (see
+    `strategy.py`'s `_DIAG_*` module docstring: never a refusal reason,
+    never added to `RefusalAlerter`).
     """
 
     trials: tuple[FilledTrial, ...]
     strategy_refusals: Mapping[str, int] = field(default_factory=dict)
+    strategy_diagnostics: Mapping[str, int] = field(default_factory=dict)
 
 
 def run_one_precision_arm(
@@ -399,7 +407,7 @@ def run_one_precision_arm(
         market_data.extend(ti.quotes)
         market_data.extend(ti.depths)
     if not market_data:
-        return PrecisionArmResult(trials=(), strategy_refusals={})
+        return PrecisionArmResult(trials=(), strategy_refusals={}, strategy_diagnostics={})
     ts_values = [record.ts_init for record in market_data]
     capture_window_ns = (min(ts_values), max(ts_values))
 
@@ -461,7 +469,9 @@ def run_one_precision_arm(
             )
         trials = filled_trials_from_engine(engine, entry_contexts)
     return PrecisionArmResult(
-        trials=trials, strategy_refusals=dict(strategy.refusals.counts),
+        trials=trials,
+        strategy_refusals=dict(strategy.refusals.counts),
+        strategy_diagnostics=dict(strategy.diagnostics.counts),
     )
 
 
@@ -605,6 +615,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         # (a) reporting gap: the strategy's own refusal counts, sorted for a
         # deterministic line -- never conflated with `scoring_refused` above.
         print(f"strategy refusals: {dict(sorted(result.strategy_refusals.items()))}")
+        # WAIT-state diagnostics (`strategy.py`'s `_DIAG_*`) -- a DIFFERENT
+        # vocabulary from `strategy_refusals` above, never conflated.
+        print(f"strategy diagnostics: {dict(sorted(result.strategy_diagnostics.items()))}")
         _print_roi_and_wilson(result.trials, settlement, now_ns)
 
     scored, _refused = score_trials(
