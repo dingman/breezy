@@ -1088,3 +1088,32 @@ L-18); a suite that never produced that refusal in miniature is the defect.
 add a RED test titled "…still refuses when <the driver's input> is absent" next
 to the happy path, and schedule one real-artefact run in the build sequence
 before calling the increment done. Related: [[L-8]], [[L-18]], [[L-20]].
+
+## L-25 — A fill better than the displayed ask is a defect signature, not price improvement (2026-09-04)
+
+**What happened.** The first paper replay to reach a decision (MDW 2026-09-01,
+`current_rung_hold`, instance `5a111bca`) scored one trial and printed
+`slippage: mean=-0.11` — an execution 11 cents BETTER than the ask, presented as
+favourable. A read-only reconstruction showed two driver defects and no price
+improvement: `entry_ask` was the tape's FIRST quote (08:28 LST, 0.15), four
+hours before the decision, while the strategy's own latch held the real
+decision ask (0.06); and the decision `QuoteTick` and its `OrderBookDepth10`
+carry the identical `ts_init` (one venue message), so the quote was delivered
+first and the IOC crossed the PREVIOUS snapshot's already-removed 0.04 level.
+The adapter agreed with itself at every instant; the driver's recording and
+ordering did not.
+
+**The rule.** For a taker order whose limit is the displayed best ask of one
+message, `fill_px <= ask` is the only permitted relation; `fill_px < ask` means
+the order crossed a book the decision never saw. A replay guards that relation
+and raises, records the entry price from the decision instant (the latch), and
+applies same-timestamp book updates BEFORE the quote derived from them. A
+flattering number is scrutinised harder than a disappointing one — the
+mechanism test exists to catch exactly the error that would inflate ROI.
+
+**How to apply.** When a replay or backtest prints negative slippage, a fill
+below the decision ask, or a fee of zero on a non-trivial fill, treat it as a
+bug until the decision tick and the adjacent depth snapshots have been
+reconstructed from the catalog. Never source an "entry" price from a
+convenient row (first quote, last quote) when the decision path already
+records the real one. Related: [[L-18]], [[L-24]].
