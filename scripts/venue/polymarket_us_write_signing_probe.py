@@ -1,72 +1,50 @@
-"""R-6.5P -- the Polymarket.us write-SIGNING probe, evidence-only (EXEC SPINE).
+"""The Polymarket.us write-SIGNING probe, evidence-only (EXEC SPINE / R-OP-SEQ).
 
-Authority: ``docs/plans/EXEC_SPINE_R65_R7_2026-09-02.md`` section 1;
-``docs/plans/EXEC_SPINE_R5_R6_2026-09-02.md`` section 3 R-6.5P;
-``docs/plans/EXEC_SPINE_2026-09-01.md`` (R-6.5P origin).
+Authority: ``docs/plans/EXEC_SPINE_R65_R7_2026-09-02.md`` section 1 (R-6.5P
+origin); ``docs/plans/OP_SEQ_BOT_POSITIVE_CONTROL_2026-09-04.md`` (R-OP-SEQ,
+``--sequence``).
 
 **What this answers.** OQ-D: does this repo's Ed25519 signer -- unmodified,
 GET-only by construction (``PERMITTED_METHODS``, barrier B2) -- produce a
-canonical string the venue accepts on a WRITE verb? Nothing here widens
-``PERMITTED_METHODS`` or touches ``signing.py``: the POST is signed by hand,
-using the same public canonical-string builder
+canonical string the venue accepts on a WRITE verb? The POST is signed by
+hand, using the same public canonical-string builder
 (:func:`~breezy.adapters.polymarket_us.signing.build_canonical_path_without_query`,
 OQ-M closed: the query string is never signed) and the same private
 key-loading helper the signer itself uses, over ``method="POST"`` -- a value
-:meth:`~breezy.adapters.polymarket_us.signing.Ed25519RequestSigner.sign_headers`
-would itself refuse to sign.
+``sign_headers`` itself would refuse to sign. Nothing here widens
+``PERMITTED_METHODS`` or touches ``signing.py``.
 
-**The write verb.** ``POST /v1/orders/open/cancel`` -- cancel ALL open orders
-(SDK snapshot ``docs/evidence/venue/polymarket_us/sdk_snapshot/
-polymarket_us_0.1.2/resources/orders.py:59-64``). No preview, no single-order
-cancel: ``POST /v1/order/preview`` stays withdrawn (OQ-3 is unproven and the
-standing rule is "if unproven, never call it").
+**Two modes.** ``--positive-control`` (legacy, R-6.5P): the operator rests a
+BUY 1@$0.01 by hand; the probe must refuse at the pre-flight with
+:data:`PREFLIGHT_NOT_EMPTY`, and issues ``POST /v1/orders/open/cancel``
+(cancel-all) on its one write path once the account is proven flat.
+``--sequence`` (R-OP-SEQ): the bot rests its OWN control
+(``POST /v1/orders``), enumerates it, cancels it, and re-verifies flat --
+S0-S6 in :func:`run_sequence`. Both modes share the hard safety gate: REFUSE
+past pre-flight unless an unfiltered ``GET /v1/orders/open`` is 200-and-empty,
+held to the same standard post-write. Reason codes never carry a count or a
+length; emptiness is decided in memory and never written down.
 
-**The hard safety gate.** This script REFUSES TO RUN past its pre-flight
-unless an unfiltered ``GET /v1/orders/open`` returns HTTP 200 with an empty
-order list, and holds the post-write GET to the same standard. Two distinct
-reason codes -- never a value -- record which half of that compound
-condition failed: :data:`PREFLIGHT_NOT_200` carries the HTTP status, and
-:data:`PREFLIGHT_NOT_EMPTY` carries NOTHING -- no count, no length. Emptiness
-is decided in memory and never written down.
+**Value-free artefacts, closed schemas (L-8).** v1 (7 fields, legacy) and v2
+(13 fields, sequence) carry only statuses, reason codes, response *type
+names*, and (v2) the computed verdict -- never a body, a count, an order id,
+or a list length. ``PRIVATE_``-prefixed, ``0600`` under a ``0700`` directory.
 
-**Positive control (D1, ``--positive-control``).** The operator has rested a
-BUY 1@$0.01 by hand. This run must refuse at the pre-flight with
-:data:`PREFLIGHT_NOT_EMPTY` -- that refusal, and only that refusal, answers
-OQ-B ``ANSWERED``. If the pre-flight instead comes back 200-and-empty in this
-mode, the venue did not enumerate an order Breezy never placed: OQ-B is
-answered NO, R-6.5P is dead as designed, and this script exits non-zero with
-:data:`OQB_NO` **without ever constructing the write client or issuing the
-POST**, and writes no artefact.
-
-**Value-free artefact, 7 fields, closed schema (L-8).** Only statuses, reason
-codes, and the WRITE response's top-level JSON *type name* are ever recorded
--- never a body, a count, an order id, or a list length. ``PRIVATE_``-prefixed,
-``0600``, under a ``0700`` directory, following R-5R-0's conventions exactly
-(``polymarket_us_private_shape_probe.py``, ``polymarket_us_auth_smoke.py``).
-
-**Request budget: exactly three signed requests** on the only path that
-reaches the write -- pre-flight GET, the one POST, post-flight GET. Every
-refusal path issues strictly fewer.
-
-**Narrow excepts only.** The POST's transport failures are caught as
+**Narrow excepts only.** POST transport failures are caught as
 ``except (nautilus_pyo3.HttpError, nautilus_pyo3.HttpTimeoutError)`` --
-never bare ``Exception``, never ``BaseException`` -- and produce two DISTINCT
-Breezy-owned types rather than one collapsed type (the read path's own
-comment at ``transport.py:343`` is the model for the tuple, not for the
-collapse). ``asyncio.CancelledError`` is a ``BaseException`` in 3.13 and is
-never caught here; it propagates.
+never bare ``Exception``/``BaseException`` -- as two DISTINCT Breezy-owned
+types. ``asyncio.CancelledError`` propagates uncaught.
 
-**Order-submission barriers B1-B3 are unmodified and irrelevant to this
-file's write capability.** This script does not go through
-``PolymarketUSHttpClient`` or ``NautilusHttpTransport`` for the POST -- both
-are GET-only by construction (B1, B3) -- it builds a second, raw
-``nautilus_pyo3.HttpClient`` for exactly one write. That is precisely what
-barrier B4 exists to catch, and this file is the plan family's first
-deliberate, reviewed exemption from it: see
-``tests/unit/test_polymarket_us_readonly_guard.py``'s ``B4_EXEMPT_PATHS`` and
-``tests/unit/test_cage_rule_constants_are_pinned.py``'s ``CAGE_EXEMPTIONS``.
-This module is not importable by the trading process (scripts are not a
-package) and a zero-importers pin keeps it that way.
+**The one B4 exemption.** This script builds a second, raw
+``nautilus_pyo3.HttpClient`` for its writes -- exactly what barrier B4 exists
+to catch, and this file is the plan family's one deliberate, reviewed
+exemption from it (``tests/unit/test_polymarket_us_readonly_guard.py``'s
+``B4_EXEMPT_PATHS``, ``tests/unit/test_cage_rule_constants_are_pinned.py``'s
+``CAGE_EXEMPTIONS``). Not importable by the trading process (scripts are not
+a package); a zero-importers pin keeps it that way. Instrument selection,
+body-building, schema/artefact rendering and writing live in the pure sibling
+module ``_write_sequence.py`` -- local disk I/O only, zero venue egress, so
+it needs no exemption of its own.
 """
 
 from __future__ import annotations
@@ -74,12 +52,10 @@ from __future__ import annotations
 import argparse
 import asyncio
 import base64
-import datetime as dt
 import json
-import os
 import sys
-from collections.abc import Callable, Mapping
-from dataclasses import dataclass
+from collections.abc import Awaitable, Callable, Mapping
+from dataclasses import fields
 from pathlib import Path
 from typing import Any, Final
 
@@ -91,6 +67,37 @@ for _entry in (REPO_ROOT / "src", _SCRIPT_DIRECTORY):  # pragma: no cover - boot
     if str(_entry) not in sys.path:
         sys.path.insert(0, str(_entry))
 
+from _write_sequence import (
+    CLOSED_NO,
+    CLOSED_YES_BOTH_VERBS,
+    INCONCLUSIVE,
+    INTENT_MARKER_TOKEN,
+    MARKER_DOCUMENT_FIELDS,
+    PRIVATE_ARTIFACT_PREFIX,
+    PRIVATE_SHAPE_DIRECTORY,
+    PROBE_DOCUMENT_FIELDS,
+    SEQUENCE_DOCUMENT_FIELDS,
+    ArtifactSchemaError,
+    CollectingLog,
+    ProbeObservation,
+    ProbeRefusal,
+    SequenceObservation,
+    build_control_order_body,
+    classify_enumeration,
+    compute_verdict,
+    is_empty_open_orders,
+    json_top_level_type,
+    market_list_query,
+    observation_document,
+    probe_artifact_filename,
+    probe_intent_marker_filename,
+    render_probe_report,
+    select_control_instrument,
+    sequence_artifact_filename,
+    write_intent_marker,
+    write_probe_artifact,
+    write_sequence_artifact,
+)
 from polymarket_us_auth_smoke import (
     CredentialGuard,
     Prepared,
@@ -101,6 +108,7 @@ from polymarket_us_auth_smoke import (
     prepare,
 )
 
+from breezy.adapters.polymarket_us.config import PolymarketUSMarketDiscoveryConfig
 from breezy.adapters.polymarket_us.credentials import PolymarketUSCredentials
 from breezy.adapters.polymarket_us.errors import PolymarketUSError
 from breezy.adapters.polymarket_us.http import PolymarketUSHttpClient
@@ -116,6 +124,7 @@ from breezy.adapters.polymarket_us.signing import (
     build_canonical_path_without_query,
 )
 from breezy.adapters.polymarket_us.transport import (
+    QUOTA_KEY_DISCOVERY,
     QUOTA_KEY_PORTFOLIO,
     NautilusHttpTransport,
     PolymarketUSReadTransport,
@@ -125,8 +134,15 @@ from breezy.adapters.polymarket_us.transport import (
 )
 
 __all__ = [
+    "CANCEL_NOT_OK",
+    "CLOSED_NO",
+    "CLOSED_YES_BOTH_VERBS",
+    "CONTROL_FILLED",
+    "INCONCLUSIVE",
     "INTENT_MARKER_TOKEN",
     "INTERRUPTED",
+    "MARKER_DOCUMENT_FIELDS",
+    "NO_ELIGIBLE_INSTRUMENT",
     "OQB_NO",
     "PERMITTED_METHODS",
     "POSTFLIGHT_NOT_200",
@@ -136,9 +152,13 @@ __all__ = [
     "PRIVATE_ARTIFACT_PREFIX",
     "PRIVATE_SHAPE_DIRECTORY",
     "PROBE_DOCUMENT_FIELDS",
+    "REST_AMBIGUOUS",
+    "REST_UNAUTHORIZED",
+    "SEQUENCE_DOCUMENT_FIELDS",
     "ArtifactSchemaError",
     "ProbeObservation",
     "ProbeRefusal",
+    "SequenceObservation",
     "WriteTimeoutError",
     "WriteTransportError",
     "main",
@@ -148,154 +168,52 @@ __all__ = [
     "probe_intent_marker_filename",
     "render_probe_report",
     "run_probe",
+    "run_sequence",
+    "sequence_artifact_filename",
     "write_probe_artifact",
+    "write_sequence_artifact",
 ]
 
-#: Shared with the other R-5R/R-6.5P evidence: one place an operator looks.
-PRIVATE_SHAPE_DIRECTORY: Final[Path] = Path("docs/evidence/venue/polymarket_us")
-PRIVATE_ARTIFACT_PREFIX: Final[str] = "PRIVATE_"
-SHAPE_DIR_MODE: Final[int] = 0o700
-SHAPE_FILE_MODE: Final[int] = 0o600
-
-#: The two endpoints this probe touches. Hardcoded, not caller arguments: this
-#: file is the one deliberate B4 exemption in the tree (D4), so nothing is
-#: gained by hiding the order-path literals from the scan they are exempt
-#: from, and everything is gained by making them auditable at a glance.
+#: Endpoints this probe touches. Hardcoded (D4 exemption): auditable at a glance.
 _OPEN_ORDERS_PATH: Final[str] = "/v1/orders/open"
 _CANCEL_ALL_PATH: Final[str] = "/v1/orders/open/cancel"
+_ORDERS_PATH: Final[str] = "/v1/orders"
+_MARKET_LIST_PATH: Final[str] = "/v1/markets"
+
+#: Paths this file signs a POST for; enforced by ``_sign_write_headers``/``_signed_post``.
+_SIGNABLE_WRITE_PATHS: Final[frozenset[str]] = frozenset({_CANCEL_ALL_PATH, _ORDERS_PATH})
 
 _WRITE_QUOTA_KEY: Final[str] = QUOTA_KEY_PORTFOLIO
+#: S4's one bounded re-read delay (read-your-writes is not venue-documented).
+_ENUMERATION_RETRY_SLEEP_SECS: Final[float] = 0.25
 
-#: D1's two pre-flight reason codes. Never carry a count or a length.
+#: D1's pre-/post-flight reason codes. Never carry a count or a length.
 PREFLIGHT_NOT_200: Final[str] = "PREFLIGHT_NOT_200"
 PREFLIGHT_NOT_EMPTY: Final[str] = "PREFLIGHT_NOT_EMPTY"
-#: The post-write half, held to the same standard.
 POSTFLIGHT_NOT_200: Final[str] = "POSTFLIGHT_NOT_200"
 POSTFLIGHT_NOT_EMPTY: Final[str] = "POSTFLIGHT_NOT_EMPTY"
 #: D1's positive-control failure: the venue did not enumerate an order Breezy
-#: never placed. OQ-B is answered NO. The POST is never reached in this branch.
+#: never placed; also reused for R-OP-SEQ's S4 "id absent" branch.
 OQB_NO: Final[str] = "OQB_NO"
-#: Security follow-up: the process was interrupted (KeyboardInterrupt /
-#: CancelledError / any BaseException) between the POST and the post-flight
-#: GET. A VALUE of ``postflight_reason`` -- not a new field, so the closed
-#: 7-field schema is unchanged.
+#: The process was interrupted between a write and the post-flight GET. A
+#: VALUE of ``postflight_reason``, not a new field.
 INTERRUPTED: Final[str] = "INTERRUPTED"
-#: The write-ahead intent marker's only content word. Written IMMEDIATELY
-#: BEFORE the POST is issued, so an interruption that kills the process
-#: before ANY response arrives -- including the final artefact write -- still
-#: leaves a durable, on-disk record that a live cancel-all fired.
-INTENT_MARKER_TOKEN: Final[str] = "WRITE_ATTEMPTED"
 
-_ARTIFACT_TITLE: Final[str] = "breezy venue write-signing probe (value-free)"
-
-#: The COMPLETE set of fields an artefact carries (L-8). A closed schema is
-#: what makes "this file states no conclusion" a property a test can assert.
-PROBE_DOCUMENT_FIELDS: Final[frozenset[str]] = frozenset(
-    {
-        "artifact",
-        "preflight_status",
-        "preflight_reason",
-        "write_status",
-        "write_response_type",
-        "postflight_status",
-        "postflight_reason",
-    }
-)
-
-_STAMP_CHARSET: Final[str] = (
-    "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_-"
-)
-
-
-def _is_plain_token(value: str) -> bool:
-    return bool(value) and all(character in _STAMP_CHARSET for character in value)
-
-
-class ProbeRefusal(PolymarketUSError):
-    """The hard safety gate refused this run before any write was attempted."""
+#: R-OP-SEQ stop codes (S2-S5 of the bot-driven positive-control sequence).
+NO_ELIGIBLE_INSTRUMENT: Final[str] = "NO_ELIGIBLE_INSTRUMENT"
+REST_UNAUTHORIZED: Final[str] = "REST_UNAUTHORIZED"
+REST_AMBIGUOUS: Final[str] = "REST_AMBIGUOUS"
+CONTROL_FILLED: Final[str] = "CONTROL_FILLED"
+CANCEL_NOT_OK: Final[str] = "CANCEL_NOT_OK"
 
 
 class WriteTransportError(PolymarketUSError):
-    """The one POST failed at the transport layer (``nautilus_pyo3.HttpError``)."""
+    """A write failed at the transport layer (``nautilus_pyo3.HttpError``)."""
 
 
 class WriteTimeoutError(PolymarketUSError):
-    """The one POST timed out at the transport layer.
-
-    Kept DISTINCT from :class:`WriteTransportError` rather than collapsed into
-    one type -- ``transport.py:343``'s narrow ``except`` tuple is the model
-    here, its single resulting exception type is not.
-    """
-
-
-class ArtifactSchemaError(PolymarketUSError):
-    """The rendered artefact does not match the closed 7-field schema."""
-
-
-@dataclass(frozen=True, slots=True)
-class ProbeObservation:
-    """Everything this probe may publish. Statuses and reason codes only."""
-
-    preflight_status: int | None
-    preflight_reason: str | None
-    write_status: int | None
-    write_response_type: str | None
-    postflight_status: int | None
-    postflight_reason: str | None
-
-
-class _CollectingLog:
-    """A ``SupportsVenueLog`` that keeps lines instead of printing them."""
-
-    __slots__ = ("lines",)
-
-    def __init__(self) -> None:
-        self.lines: list[str] = []
-
-    def debug(self, message: str) -> None:
-        self.lines.append(message)
-
-    def info(self, message: str) -> None:
-        self.lines.append(message)
-
-    def warning(self, message: str) -> None:
-        self.lines.append(message)
-
-    def error(self, message: str) -> None:
-        self.lines.append(message)
-
-
-def _is_empty_open_orders(body: bytes | None) -> bool | None:
-    """Whether ``body`` decodes to ``{"orders": []}``.
-
-    Checked ONCE, in memory, and never recorded (D1): the artefact carries the
-    reason code this produced, never the list or its length. ``None`` means
-    the body could not be read as the expected shape at all, which the caller
-    treats the same as "not proven empty".
-    """
-    if not body:
-        return None
-    try:
-        payload = json.loads(body)
-    except (UnicodeDecodeError, ValueError):
-        return None
-    if not isinstance(payload, dict):
-        return None
-    orders = payload.get("orders")
-    if not isinstance(orders, list):
-        return None
-    return len(orders) == 0
-
-
-def _json_top_level_type(body: bytes | None) -> str | None:
-    """The top-level JSON type name of ``body`` -- never its content."""
-    if not body:
-        return None
-    try:
-        payload = json.loads(body)
-    except (UnicodeDecodeError, ValueError):
-        return None
-    return type(payload).__name__
+    """A write timed out at the transport layer. Kept DISTINCT from
+    :class:`WriteTransportError` rather than collapsed into one type."""
 
 
 def _build_read_transport(config: Any) -> PolymarketUSReadTransport:
@@ -313,12 +231,9 @@ def _build_read_transport(config: Any) -> PolymarketUSReadTransport:
 
 
 def _build_write_client(config: Any) -> Any:
-    """A SECOND, raw pyo3 client used for exactly one POST.
-
-    Deliberately NOT ``NautilusHttpTransport``: that wrapper has no ``post``
-    method at all (barrier B3). This is the one write-capable reference in
-    the tree, contained to this one exempted file.
-    """
+    """A SECOND, raw pyo3 client for writes -- NOT ``NautilusHttpTransport``,
+    which has no ``post`` (barrier B3). Write capability stays in this one
+    exempted file."""
     return nautilus_pyo3.HttpClient(
         default_headers={"User-Agent": str(config.user_agent)},
         header_keys=[],
@@ -331,12 +246,8 @@ def _build_write_client(config: Any) -> Any:
 async def _signed_get_open_orders(
     client: PolymarketUSHttpClient, transport: RecordingTransport
 ) -> tuple[int | None, bytes | None]:
-    """One unfiltered ``GET /v1/orders/open``. Never raises.
-
-    Mirrors ``polymarket_us_private_shape_probe.capture``: only
-    :class:`PolymarketUSError` is absorbed here, so a defect in this script
-    still propagates rather than being reported as a venue observation.
-    """
+    """One unfiltered ``GET /v1/orders/open``. Never raises -- only
+    :class:`PolymarketUSError` is absorbed."""
     try:
         await client.get_authenticated(_OPEN_ORDERS_PATH, quota_key=_WRITE_QUOTA_KEY)
     except PolymarketUSError:
@@ -352,20 +263,19 @@ def _sign_write_headers(
     credentials: PolymarketUSCredentials,
     signer: Ed25519RequestSigner,
     clock: Any,
+    *,
+    path: str = _CANCEL_ALL_PATH,
 ) -> list[tuple[str, str]]:
-    """Sign a POST the way ``sign_headers`` signs a GET, minus barrier B2.
-
-    Same canonical builder (:func:`build_canonical_path_without_query` --
-    OQ-M closed, path-only is signed), same private key-loading helper the
-    signer itself uses, same three header names, over ``method="POST"`` --
-    which ``sign_headers`` itself would refuse to sign. ``PERMITTED_METHODS``
-    and ``sign_headers`` are read here, never copied, and neither is widened
-    by this function's existence.
-    """
+    """Sign a POST the way ``sign_headers`` signs a GET, minus barrier B2 --
+    same canonical builder, same key loader, same headers, over ``POST``.
+    ``path`` is constrained to :data:`_SIGNABLE_WRITE_PATHS`; the default
+    preserves the legacy cancel-all-only behaviour byte-for-byte."""
+    if path not in _SIGNABLE_WRITE_PATHS:
+        raise ValueError(f"refusing to sign an unrecognised write path: {path!r}")
     timestamp_ms = clock.timestamp_ms()
     signer.assert_within_window(timestamp_ms)
     canonical = build_canonical_path_without_query(
-        CanonicalRequest(timestamp_ms=timestamp_ms, method="POST", path=_CANCEL_ALL_PATH)
+        CanonicalRequest(timestamp_ms=timestamp_ms, method="POST", path=path)
     )
     signing_key = _load_signing_key(credentials.secret_key.get_value())
     signature = base64.b64encode(signing_key.sign(canonical).signature).decode("ascii")
@@ -376,6 +286,42 @@ def _sign_write_headers(
     ]
 
 
+async def _signed_post(
+    write_client: Any,
+    api_base_url: str,
+    credentials: PolymarketUSCredentials,
+    signer: Ed25519RequestSigner,
+    clock: Any,
+    *,
+    path: str,
+    body: Mapping[str, Any],
+) -> tuple[int, str | None, bytes | None]:
+    """The ONE signed-POST primitive. Computes the canonical string AND the
+    URL from ``path``, validated against :data:`_SIGNABLE_WRITE_PATHS`, no
+    query. The two wrappers below are thin, body-fixed callers -- no second
+    egress path."""
+    if path not in _SIGNABLE_WRITE_PATHS:
+        raise ValueError(f"refusing to POST an unrecognised write path: {path!r}")
+    headers = dict(_sign_write_headers(credentials, signer, clock, path=path))
+    headers["Content-Type"] = "application/json"
+    url = f"{api_base_url.rstrip('/')}{path}"
+    try:
+        response = await write_client.post(
+            url,
+            headers=headers,
+            body=json.dumps(body).encode("ascii"),
+            keys=[_WRITE_QUOTA_KEY],
+        )
+    except (nautilus_pyo3.HttpError, nautilus_pyo3.HttpTimeoutError) as exc:
+        if isinstance(exc, nautilus_pyo3.HttpTimeoutError):
+            raise WriteTimeoutError(f"POST {path} timed out at the transport layer") from None
+        raise WriteTransportError(
+            f"POST {path} failed at the transport layer: {type(exc).__name__}"
+        ) from None
+    response_body = bytes(response.body)
+    return int(response.status), json_top_level_type(response_body), response_body
+
+
 async def _signed_post_cancel_all(
     write_client: Any,
     api_base_url: str,
@@ -383,82 +329,54 @@ async def _signed_post_cancel_all(
     signer: Ed25519RequestSigner,
     clock: Any,
 ) -> tuple[int, str | None]:
-    """The ONE write this script performs. No ``query`` parameter, no ``body`` parameter.
-
-    A query smuggled into the path would sign one string while the venue
-    verifies another (same reasoning as ``PrivateRead.__call__(self, path)``);
-    a caller-supplied body would do the same for a POST whose canonical string
-    never signs the body at all. Both are refused by construction: neither
-    parameter exists.
-    """
-    headers = dict(_sign_write_headers(credentials, signer, clock))
-    headers["Content-Type"] = "application/json"
-    url = f"{api_base_url.rstrip('/')}{_CANCEL_ALL_PATH}"
-    try:
-        response = await write_client.post(
-            url,
-            headers=headers,
-            body=json.dumps({}).encode("ascii"),
-            keys=[_WRITE_QUOTA_KEY],
-        )
-    except (nautilus_pyo3.HttpError, nautilus_pyo3.HttpTimeoutError) as exc:
-        if isinstance(exc, nautilus_pyo3.HttpTimeoutError):
-            raise WriteTimeoutError(
-                f"POST {_CANCEL_ALL_PATH} timed out at the transport layer"
-            ) from None
-        raise WriteTransportError(
-            f"POST {_CANCEL_ALL_PATH} failed at the transport layer: {type(exc).__name__}"
-        ) from None
-    return int(response.status), _json_top_level_type(bytes(response.body))
-
-
-def probe_intent_marker_filename(*, stamp: str | None = None) -> str:
-    """``PRIVATE_``-prefixed filename for the write-ahead intent marker."""
-    suffix = ""
-    if stamp is not None:
-        if not _is_plain_token(stamp):
-            raise ValueError("stamp must be a plain [A-Za-z0-9_-] token")
-        suffix = f"_{stamp}"
-    return f"{PRIVATE_ARTIFACT_PREFIX}write_signing_probe_intent{suffix}.json"
-
-
-def _write_intent_marker(*, directory: Path, stamp: str | None) -> Path:
-    """Write-ahead marker, written IMMEDIATELY BEFORE the POST is issued.
-
-    Value-free: the write PATH (a constant, not a request/response value), a
-    wall-clock timestamp, and the literal :data:`INTENT_MARKER_TOKEN`. Same
-    ``0600``-under-``0700``, ``O_EXCL`` discipline as the final artefact, so
-    an interruption between this write and the final artefact -- including
-    one that kills the process before any response arrives -- still leaves a
-    durable, on-disk record that a live cancel-all fired.
-    """
-    filename = probe_intent_marker_filename(stamp=stamp)
-    text = (
-        json.dumps(
-            {
-                "artifact": "breezy venue write-signing probe intent marker (value-free)",
-                "path": _CANCEL_ALL_PATH,
-                "written_at_utc": dt.datetime.now(tz=dt.UTC).isoformat(),
-                "marker": INTENT_MARKER_TOKEN,
-            },
-            indent=2,
-            sort_keys=True,
-        )
-        + "\n"
+    """The legacy write (R-6.5P). No ``query``/``body`` parameter -- both
+    refused by construction, never accepted from a caller."""
+    status, response_type, _body = await _signed_post(
+        write_client, api_base_url, credentials, signer, clock, path=_CANCEL_ALL_PATH, body={}
     )
-    directory.mkdir(parents=True, exist_ok=True)
-    directory.chmod(SHAPE_DIR_MODE)
-    path = directory / filename
-    descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, SHAPE_FILE_MODE)
+    return status, response_type
+
+
+def _extract_order_id(body: bytes | None) -> str | None:
+    """The create-order response's ``id`` field, read once, never persisted."""
+    if not body:
+        return None
     try:
-        handle = os.fdopen(descriptor, "w", encoding="utf-8")
-    except BaseException:
-        os.close(descriptor)
-        raise
-    with handle:
-        handle.write(text)
-    os.chmod(path, SHAPE_FILE_MODE)
-    return path
+        payload = json.loads(body)
+    except (UnicodeDecodeError, ValueError):
+        return None
+    if not isinstance(payload, dict):
+        return None
+    order_id = payload.get("id")
+    return order_id if isinstance(order_id, str) and order_id else None
+
+
+async def _signed_post_order(
+    write_client: Any,
+    api_base_url: str,
+    credentials: PolymarketUSCredentials,
+    signer: Ed25519RequestSigner,
+    clock: Any,
+    *,
+    slug: str,
+) -> tuple[int, str | None, str | None]:
+    """The S3 control write. Takes a slug, never caller bytes -- the body is
+    built in-function by :func:`build_control_order_body`."""
+    status, response_type, body = await _signed_post(
+        write_client,
+        api_base_url,
+        credentials,
+        signer,
+        clock,
+        path=_ORDERS_PATH,
+        body=build_control_order_body(slug),
+    )
+    return status, response_type, _extract_order_id(body)
+
+
+#: ``probe_intent_marker_filename``, ``write_intent_marker`` and
+#: ``MARKER_DOCUMENT_FIELDS`` (converged review item 6) live in
+#: ``_write_sequence`` -- local disk I/O only, no venue egress.
 
 
 async def run_probe(
@@ -472,20 +390,15 @@ async def run_probe(
     read_transport_factory: Callable[[Any], PolymarketUSReadTransport] = _build_read_transport,
     write_client_factory: Callable[[Any], Any] = _build_write_client,
 ) -> ProbeObservation:
-    """Run the probe end to end, in the order the hard safety gate depends on.
-
-    Exactly three signed requests reach the venue on the only path that
-    reaches the write: the pre-flight GET, the one POST, the post-flight GET
-    -- in that order, in this function (mechanised order check, D-6.5P
-    HARD SAFETY GATE item 1). Every refusal path issues strictly fewer.
-    """
+    """Run the legacy probe end to end: pre-flight GET, one POST,
+    post-flight GET, in that order. Every refusal path issues strictly
+    fewer requests."""
     from nautilus_trader.common.component import LiveClock
 
     filename = probe_artifact_filename(stamp=stamp)
     if (directory / filename).exists():
         raise FileExistsError(
-            f"{directory / filename} already exists; supply a new --stamp. "
-            "Refused before any request rather than after it."
+            f"{directory / filename} already exists; supply a new --stamp."
         )
 
     prepared = prepare_fn(env, guard=guard)
@@ -501,30 +414,27 @@ async def run_probe(
         signer=signer,
         api_base_url=str(config.api_base_url),
         gateway_base_url=str(config.gateway_base_url),
-        logger=_CollectingLog(),
+        logger=CollectingLog(),
     )
+
+    def _obs(**overrides: Any) -> ProbeObservation:
+        fields: dict[str, Any] = {
+            "preflight_status": None,
+            "preflight_reason": None,
+            "write_status": None,
+            "write_response_type": None,
+            "postflight_status": None,
+            "postflight_reason": None,
+        }
+        fields.update(overrides)
+        return ProbeObservation(**fields)
 
     # --- pre-flight: unfiltered GET, before any write is attempted ---------
     preflight_status, preflight_body = await _signed_get_open_orders(read_client, read_transport)
     if preflight_status != 200:
-        return ProbeObservation(
-            preflight_status=preflight_status,
-            preflight_reason=PREFLIGHT_NOT_200,
-            write_status=None,
-            write_response_type=None,
-            postflight_status=None,
-            postflight_reason=None,
-        )
-    preflight_empty = _is_empty_open_orders(preflight_body)
-    if not preflight_empty:
-        return ProbeObservation(
-            preflight_status=preflight_status,
-            preflight_reason=PREFLIGHT_NOT_EMPTY,
-            write_status=None,
-            write_response_type=None,
-            postflight_status=None,
-            postflight_reason=None,
-        )
+        return _obs(preflight_status=preflight_status, preflight_reason=PREFLIGHT_NOT_200)
+    if not is_empty_open_orders(preflight_body):
+        return _obs(preflight_status=preflight_status, preflight_reason=PREFLIGHT_NOT_EMPTY)
     if positive_control:
         # The positive-control order was NOT enumerated: OQ-B is answered NO.
         # The write client is never constructed and the POST is never issued.
@@ -540,7 +450,7 @@ async def run_probe(
     # here to the final artefact write, this durable marker is what proves a
     # live cancel-all fired, rather than leaving the operator believing
     # nothing happened.
-    _write_intent_marker(directory=directory, stamp=stamp)
+    write_intent_marker(directory=directory, stamp=stamp, paths=(_CANCEL_ALL_PATH,))
     write_client = write_client_factory(config)
 
     write_status: int | None = None
@@ -558,17 +468,12 @@ async def run_probe(
         postflight_status, postflight_body = await _signed_get_open_orders(
             read_client, read_transport
         )
-    except BaseException:
-        # Never swallowed: a partial, honest artefact is written and the
-        # original exception (KeyboardInterrupt, CancelledError, or any
-        # other fault) is re-raised unchanged.
+    except BaseException:  # never swallowed: partial artefact, then re-raise
         write_probe_artifact(
-            ProbeObservation(
+            _obs(
                 preflight_status=preflight_status,
-                preflight_reason=None,
                 write_status=write_status,
                 write_response_type=write_response_type,
-                postflight_status=None,
                 postflight_reason=INTERRUPTED,
             ),
             directory=directory,
@@ -579,14 +484,13 @@ async def run_probe(
     postflight_reason: str | None
     if postflight_status != 200:
         postflight_reason = POSTFLIGHT_NOT_200
-    elif not _is_empty_open_orders(postflight_body):
+    elif not is_empty_open_orders(postflight_body):
         postflight_reason = POSTFLIGHT_NOT_EMPTY
     else:
         postflight_reason = None
 
-    return ProbeObservation(
+    return _obs(
         preflight_status=preflight_status,
-        preflight_reason=None,
         write_status=write_status,
         write_response_type=write_response_type,
         postflight_status=postflight_status,
@@ -594,70 +498,213 @@ async def run_probe(
     )
 
 
-def probe_artifact_filename(*, stamp: str | None = None) -> str:
-    """``PRIVATE_``-prefixed filename, matching the ``.gitignore`` rule."""
-    suffix = ""
-    if stamp is not None:
-        if not _is_plain_token(stamp):
-            raise ValueError("stamp must be a plain [A-Za-z0-9_-] token")
-        suffix = f"_{stamp}"
-    return f"{PRIVATE_ARTIFACT_PREFIX}write_signing_probe{suffix}.json"
+#: ``probe_artifact_filename``, ``observation_document``, ``render_probe_report``,
+#: ``write_probe_artifact``, ``sequence_artifact_filename`` and
+#: ``write_sequence_artifact`` all live in ``_write_sequence`` -- local disk
+#: I/O only, no venue egress, so no B4 exemption is needed for them.
 
 
-def observation_document(observation: ProbeObservation) -> dict[str, Any]:
-    """The closed document. Every field is a status, a reason code, or a type name."""
-    document: dict[str, Any] = {
-        "artifact": _ARTIFACT_TITLE,
-        "preflight_status": observation.preflight_status,
-        "preflight_reason": observation.preflight_reason,
-        "write_status": observation.write_status,
-        "write_response_type": observation.write_response_type,
-        "postflight_status": observation.postflight_status,
-        "postflight_reason": observation.postflight_reason,
-    }
-    if set(document) != PROBE_DOCUMENT_FIELDS:
-        raise ArtifactSchemaError("the probe document does not match its closed schema")
-    return document
-
-
-def render_probe_report(observation: ProbeObservation) -> str:
-    """Render the artefact body. Deterministic: no timestamp, no digest."""
-    return json.dumps(observation_document(observation), indent=2, sort_keys=True) + "\n"
-
-
-def write_probe_artifact(
-    observation: ProbeObservation,
+async def _enumerate_control_with_retry(
+    read_client: PolymarketUSHttpClient,
+    read_transport: RecordingTransport,
     *,
+    order_id: str,
+    sleep: Callable[[float], Awaitable[None]],
+) -> tuple[int | None, str]:
+    """S4: one enumeration read, plus exactly one bounded 250ms retry before
+    OQB_NO -- read-your-writes consistency is not venue-documented. Never a
+    loop, never adaptive backoff."""
+    status, body = await _signed_get_open_orders(read_client, read_transport)
+    kind = classify_enumeration(status, body, order_id)
+    if kind == "absent":
+        await sleep(_ENUMERATION_RETRY_SLEEP_SECS)
+        status, body = await _signed_get_open_orders(read_client, read_transport)
+        kind = classify_enumeration(status, body, order_id)
+    return status, kind
+
+
+def _cancel_ok(cancel_status: int | None, cancel_response_type: str | None) -> bool:
+    """S5 pass: 200, or non-401/403 carrying a ``CancelAllOrdersResponse``-shaped body."""
+    if cancel_status == 200:
+        return True
+    return cancel_status not in (401, 403) and cancel_response_type == "dict"
+
+
+async def run_sequence(
+    *,
+    env: Mapping[str, str] | None = None,
     directory: Path = PRIVATE_SHAPE_DIRECTORY,
     stamp: str | None = None,
-) -> Path:
-    """Render, re-verify the schema, then write ``0600`` under a ``0700`` directory.
+    guard: CredentialGuard | None = None,
+    prepare_fn: Callable[..., Prepared] = prepare,
+    read_transport_factory: Callable[[Any], PolymarketUSReadTransport] = _build_read_transport,
+    write_client_factory: Callable[[Any], Any] = _build_write_client,
+    discovery: PolymarketUSMarketDiscoveryConfig | None = None,
+    sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
+) -> SequenceObservation:
+    """Run the bot-driven positive-control sequence S0-S6, in order. Every
+    stop is terminal (except S4's one bounded re-read). S2 (no eligible
+    instrument) raises without writing an artefact; every other stop returns
+    an observation for the caller to persist."""
+    from nautilus_trader.common.component import LiveClock
 
-    ``O_EXCL`` means an existing artefact is never silently overwritten -- a
-    re-probe carries a new stamp or it fails loudly.
-    """
-    filename = probe_artifact_filename(stamp=stamp)
-    if not filename.startswith(PRIVATE_ARTIFACT_PREFIX) or os.sep in filename:
-        raise ArtifactSchemaError("refusing to write an artefact without the PRIVATE_ prefix")
+    if discovery is None:
+        discovery = PolymarketUSMarketDiscoveryConfig()
+    filename = sequence_artifact_filename(stamp=stamp)
+    if (directory / filename).exists():
+        raise FileExistsError(
+            f"{directory / filename} already exists; supply a new --stamp."
+        )
 
-    text = render_probe_report(observation)
-    if set(json.loads(text)) != PROBE_DOCUMENT_FIELDS:
-        raise ArtifactSchemaError("round-tripped document does not match the closed schema")
+    prepared = prepare_fn(env, guard=guard)
+    config = prepared.config
+    credentials = prepared.credentials
+    clock = LiveClock()
+    variant = SigningVariant(config.signing_variant)
+    signer = Ed25519RequestSigner.for_variant(credentials, clock=clock, variant=variant)
 
-    directory.mkdir(parents=True, exist_ok=True)
-    directory.chmod(SHAPE_DIR_MODE)
+    read_transport = RecordingTransport(inner=read_transport_factory(config))
+    read_client = PolymarketUSHttpClient(
+        transport=read_transport,
+        signer=signer,
+        api_base_url=str(config.api_base_url),
+        gateway_base_url=str(config.gateway_base_url),
+        logger=CollectingLog(),
+    )
 
-    path = directory / filename
-    descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, SHAPE_FILE_MODE)
+    def _obs(**overrides: Any) -> SequenceObservation:
+        """Build one observation. Every field defaults to ``None``/``INCONCLUSIVE``."""
+        fields: dict[str, Any] = {
+            "preflight_status": None,
+            "preflight_reason": None,
+            "selection_reason": None,
+            "rest_status": None,
+            "rest_reason": None,
+            "enumeration_status": None,
+            "enumeration_reason": None,
+            "cancel_status": None,
+            "cancel_response_type": None,
+            "postflight_status": None,
+            "postflight_reason": None,
+            "verdict": INCONCLUSIVE,
+        }
+        fields.update(overrides)
+        return SequenceObservation(**fields)
+
+    # --- S1: pre-flight, unfiltered, before any write is attempted --------
+    preflight_status, preflight_body = await _signed_get_open_orders(read_client, read_transport)
+    if preflight_status != 200:
+        return _obs(preflight_status=preflight_status, preflight_reason=PREFLIGHT_NOT_200)
+    if not is_empty_open_orders(preflight_body):
+        return _obs(preflight_status=preflight_status, preflight_reason=PREFLIGHT_NOT_EMPTY)
+
+    # --- S2: instrument selection, one PUBLIC read -------------------------
+    market_payload = await read_client.get_public(
+        _MARKET_LIST_PATH,
+        query=market_list_query(discovery),
+        quota_key=QUOTA_KEY_DISCOVERY,
+    )
+    slug = select_control_instrument(market_payload, city_codes=discovery.city_codes)
+    if slug is None:
+        raise ProbeRefusal(
+            f"{NO_ELIGIBLE_INSTRUMENT}: no weather-bucket market satisfied the eligibility "
+            "rules (not resolved/closed, ask >= $0.20, tick $0.01, min qty <= 1). No POST "
+            "was issued; no artefact was written."
+        )
+
+    # --- S3 onward: the write-ahead marker, then the first write ----------
+    write_intent_marker(directory=directory, stamp=stamp, paths=(_ORDERS_PATH, _CANCEL_ALL_PATH))
+    write_client = write_client_factory(config)
+
+    rest_status: int | None = None
+    order_id: str | None = None
+    enumeration_status: int | None = None
+    enumeration_reason: str | None = None
+    cancel_status: int | None = None
+    cancel_response_type: str | None = None
     try:
-        handle = os.fdopen(descriptor, "w", encoding="utf-8")
+        rest_status, _rest_response_type, order_id = await _signed_post_order(
+            write_client, str(config.api_base_url), credentials, signer, clock, slug=slug
+        )
+
+        if rest_status in (401, 403):
+            return _obs(
+                preflight_status=preflight_status,
+                rest_status=rest_status,
+                rest_reason=REST_UNAUTHORIZED,
+                verdict=CLOSED_NO,
+            )
+
+        order_id_present = rest_status == 200 and order_id is not None
+        rest_reason: str | None = None if order_id_present else REST_AMBIGUOUS
+        enumeration_ok = False
+
+        if order_id_present:
+            assert order_id is not None
+            enumeration_status, kind = await _enumerate_control_with_retry(
+                read_client, read_transport, order_id=order_id, sleep=sleep
+            )
+            if kind == "absent":
+                enumeration_reason = OQB_NO
+            elif kind == "filled":
+                enumeration_reason = CONTROL_FILLED
+            else:
+                enumeration_ok = True
+
+        # --- S5: cleanup cancel-all, issued whenever S3 was not a clean 401/403
+        cancel_status, cancel_response_type = await _signed_post_cancel_all(
+            write_client, str(config.api_base_url), credentials, signer, clock
+        )
+        cancel_ok = _cancel_ok(cancel_status, cancel_response_type)
+
+        # --- S6: post-flight, held to the same standard as S1 -------------
+        postflight_status, postflight_body = await _signed_get_open_orders(
+            read_client, read_transport
+        )
     except BaseException:
-        os.close(descriptor)
+        write_sequence_artifact(
+            _obs(
+                preflight_status=preflight_status,
+                rest_status=rest_status,
+                enumeration_status=enumeration_status,
+                enumeration_reason=enumeration_reason,
+                cancel_status=cancel_status,
+                cancel_response_type=cancel_response_type,
+                postflight_reason=INTERRUPTED,
+            ),
+            directory=directory,
+            stamp=stamp,
+        )
         raise
-    with handle:
-        handle.write(text)
-    os.chmod(path, SHAPE_FILE_MODE)
-    return path
+
+    if postflight_status != 200:
+        postflight_reason: str | None = POSTFLIGHT_NOT_200
+    elif not is_empty_open_orders(postflight_body):
+        postflight_reason = POSTFLIGHT_NOT_EMPTY
+    else:
+        postflight_reason = None
+    postflight_ok = postflight_reason is None
+
+    verdict = compute_verdict(
+        rest_status=rest_status,
+        order_id_present=order_id_present,
+        enumeration_ok=enumeration_ok,
+        cancel_ok=cancel_ok,
+        postflight_ok=postflight_ok,
+    )
+
+    return _obs(
+        preflight_status=preflight_status,
+        rest_status=rest_status,
+        rest_reason=rest_reason,
+        enumeration_status=enumeration_status,
+        enumeration_reason=enumeration_reason,
+        cancel_status=cancel_status,
+        cancel_response_type=cancel_response_type,
+        postflight_status=postflight_status,
+        postflight_reason=postflight_reason,
+        verdict=verdict,
+    )
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -668,6 +715,13 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         default=False,
         help="The operator has rested a BUY 1@$0.01 by hand (D1). Refuses at "
         "the pre-flight and never issues the POST.",
+    )
+    parser.add_argument(
+        "--sequence",
+        action="store_true",
+        default=False,
+        help="R-OP-SEQ: the bot rests, enumerates, cancels and re-verifies its "
+        "own positive control (S0-S6), in one run.",
     )
     parser.add_argument(
         "--stamp",
@@ -681,49 +735,65 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="Where to write the PRIVATE_ artefact.",
     )
     namespace: argparse.Namespace = parser.parse_args(argv)
+    if namespace.sequence and namespace.positive_control:
+        parser.error("--sequence and --positive-control are mutually exclusive")
     return namespace
 
 
-def main(argv: list[str] | None = None) -> int:
-    """Operator entrypoint. Returns 0 when an OBSERVATION was recorded.
+def _report(observation: ProbeObservation | SequenceObservation, path: Path) -> None:
+    """Print every field (no body, no id, no slug) plus the artefact path."""
+    for field in fields(observation):
+        print(f"{field.name:19}: {getattr(observation, field.name)}")
+    print(f"{'artefact':19}: {path}")
 
-    This script measures and, on the one permitted path, writes -- it never
-    judges. A refused run at any gate is reported as a refusal, not a fault.
-    """
-    guard = CredentialGuard()
-    sys.excepthook = build_safe_excepthook(guard)
 
-    args = parse_args(argv)
+def _run_refusable(coro: Any) -> tuple[Any, int | None]:
+    """Run ``coro``; ``(result, None)`` on success, ``(None, exit_code)`` on a
+    refusal. Shared by both CLI modes so the refusal taxonomy is stated once."""
     try:
-        observation = asyncio.run(
-            run_probe(
-                positive_control=args.positive_control,
-                directory=args.evidence_dir,
-                stamp=args.stamp,
-                guard=guard,
-            )
-        )
-    except ProbeRefusal as exc:
+        return asyncio.run(coro), None
+    except (ProbeRefusal, SmokeRefusal) as exc:
         print(f"REFUSED: {exc}", file=sys.stderr)
-        return 2
-    except SmokeRefusal as exc:
-        print(f"REFUSED: {exc}", file=sys.stderr)
-        return 2
+        return None, 2
     except (ValueError, FileExistsError, ArtifactSchemaError) as exc:
         print(f"REFUSED: {describe_exception(exc, ())}", file=sys.stderr)
-        return 2
+        return None, 2
     except PolymarketUSError as exc:
         print(f"CONFIGURATION ERROR: {describe_exception(exc, ())}", file=sys.stderr)
-        return 2
+        return None, 2
 
+
+def main(argv: list[str] | None = None) -> int:
+    """Operator entrypoint. Measures and writes; never judges. A refused run
+    at any gate is reported as a refusal, not a fault."""
+    guard = CredentialGuard()
+    sys.excepthook = build_safe_excepthook(guard)
+    args = parse_args(argv)
+
+    if args.sequence:
+        sequence_observation, code = _run_refusable(
+            run_sequence(directory=args.evidence_dir, stamp=args.stamp, guard=guard)
+        )
+        if code is not None:
+            return code
+        sequence_path = write_sequence_artifact(
+            sequence_observation, directory=args.evidence_dir, stamp=args.stamp
+        )
+        _report(sequence_observation, sequence_path)
+        return 0 if sequence_observation.verdict in (CLOSED_YES_BOTH_VERBS, CLOSED_NO) else 2
+
+    observation, code = _run_refusable(
+        run_probe(
+            positive_control=args.positive_control,
+            directory=args.evidence_dir,
+            stamp=args.stamp,
+            guard=guard,
+        )
+    )
+    if code is not None:
+        return code
     path = write_probe_artifact(observation, directory=args.evidence_dir, stamp=args.stamp)
-    print(f"preflight status  : {observation.preflight_status}")
-    print(f"preflight reason  : {observation.preflight_reason}")
-    print(f"write status      : {observation.write_status}")
-    print(f"write resp. type  : {observation.write_response_type}")
-    print(f"postflight status : {observation.postflight_status}")
-    print(f"postflight reason : {observation.postflight_reason}")
-    print(f"artefact          : {path}")
+    _report(observation, path)
     return 0
 
 
