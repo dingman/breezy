@@ -46,6 +46,7 @@ Two consequences that are not optional (tracked by P4):
   ladder is liquid; only the winning rung is unoffered. Do not design a fourth.
 - **Historical forecasts: NON-CONTIGUOUS (2022-01..2023-12 + present); a forecast archive is a CALIBRATION set, not a backtest** — prices are forward-only. `docs/evidence/open_meteo_previous_runs_probe_2026-08-31T005848Z/`.
 - **Candidate #2 (CLI-basis boundary tail): edge REAL but THIN, NOT a GO** — corrected P(win|setup,h>=17)=12.3% (~1.9x BE); adverse selection unsettled (~245 resolved offered trades needed); offer-gate scan accumulates nightly 22:45Z. `docs/evidence/cli_basis_setup_win_rate_corrected_2026-09-02T061722Z.md`.
+- **Venue weather surface (09-04) = 5 cities × daily HIGH only**: 3,743 climate markets, 100% parsed by the repo grammar, no other city or measure; Polymarket.us offers no station lever, Kalshi does. `docs/evidence/venue/polymarket_us/WEATHER_SURFACE_ENUMERATION_20260904T222013Z.md`.
 - **Price history genuinely is forward-only.** No public trade tape; expired
   markets return null prices keeping only `settlementPx`.
 - **No NO-side instrument exists (BL-6)** — NO is a side of the SAME book; P5 rescoped to `outcomeSide`/price inversion. `docs/evidence/no_side_instrument_probe_2026-08-31.md`.
@@ -67,7 +68,7 @@ an **L-1 null-hypothesis verdict** citing installed source under
 ### Clock-speed track (opened 2026-09-04)
 Time-to-verdict = independent station-days × take rate; one city on two venues is ONE weather event (Kalshi settles on The Weather Company, not the NWS CLI). Rulings: `docs/evidence/grok_*_2026-09-04.md`.
 - **[HIGH] Kalshi sibling family on NEW stations** — plan `docs/plans/KALSHI_CRH_EXPANSION_PLAN_2026-09-04.md` Rev 3 (converged); PREREG draft `docs/specs/PREREG_v1_kalshi_current_rung_hold_DRAFT_2026-09-04.md`. 18/19 candidates pass temp cadence; KDEN excluded unless live 5-min resumes; KHOU archive hole. Open: S4 registry (in flight), S5–S7 read path, S8 per-station CLI-final-vs-TWC reconciliation (n≥90, Wilson-lower >0.99), S9 rev2 cells + `parse_metar_t_group` 4-digit fix (v1 table untouched). **Operator-only, critical path:** Kalshi account/KYC/eligibility/funding/API key (S11); fee-schedule PDF via a browser or first-fill θ derivation.
-- **[MED] PREREG v2 family** (`docs/specs/PREREG_v2_current_rung_hold_DRAFT_2026-09-04.md` rev b; blueprint `docs/plans/FAMILY_TALLY_V2_BLUEPRINT_2026-09-04.md` Rev 2). Open: boundary generator/solver + drift simulation (in flight), artefact loader, `family_tally_v2.py`, two concrete timers, registration before the first PM fill.
+- **[MED] PREREG v2 family** (`docs/specs/PREREG_v2_current_rung_hold_DRAFT_2026-09-04.md` rev b; blueprint `docs/plans/FAMILY_TALLY_V2_BLUEPRINT_2026-09-04.md` Rev 2; items 1,3–6,8 landed). Open: boundary generator — terminal look must SPEND the remaining α, never force z (`ca94177`; first draft measured cumulative α 0.0312, fix in flight) — then `persistence/gs_boundary_artefact.py` loader + `scripts/analysis/family_tally_v2.py`, Codex adversarial review of the sequential methodology, registration before the first PM fill.
 - **[LOW] Recorder salvage** de-dup relies on per-instance non-overlap (asserted); fill-time reader `--fill-source` not yet in the live-tally unit's invocation.
 - Rejected by ruling: SPRT α=0.05, plug-in-π Z, freeze-π, shadow/paper/archive/Kalshi rows in live n, retroactive scoring, `venue` column/stratum, qty>1, NYC, pooling venues.
 
@@ -119,22 +120,12 @@ at met lock, never dump into a 0.3-lot bid); T-6 stale node_config docstring;
 `max_simultaneous_positions`
 unexercised end-to-end. Nautilus cannot cancel an INITIALIZED order.
 
-**[VERDICT] NO FAMILY HAS A PROVEN EDGE; ONE IS UNDER MEASUREMENT (M_B).**
-Forecast family KILLED (`grok_forecast_family_verdict_2026-09-02.md`). Post-lock
-observation family REFUTED on execution ×3 (L-9). Cheap-D-1 (K1) DEAD ≥2c on
-Kalshi, n=0 here. Grok (`grok_no_edge_verdict_2026-09-02.md`): no long-only
-edge; measure once, then stop. **M_A** (`ma_prelock_winner_ask_2026-09-02.md`):
-the PRE-lock afternoon window IS offered — 09-01 winner at 0.21×25 (MDW),
-0.65×18 (SFO) while R(t) in-rung. **M_B** (`mb_current_rung_edge_2026-09-02.md`,
-archive p_hold AUDITED correct; kill amended `grok_mb_kill_amendment_2026-09-02.md`):
-realized hold of taken current-rung trials vs ask+fee — kill n≥60, survive
-n≥150; today n_taken=1. **Live family = lags 30/45, NYC excluded, interval rule**
-(`grok_live_small_spec_rev2_2026-09-04.md`); clock ~09-27 / ~10-30 at 3/day. Accrues via
-`breezy-mb-daily.timer` (13:30Z) + `breezy-quote-tape-ingest.timer`. **The venue skips
-~9% of station-days** (`docs/evidence/venue/polymarket_us/MISSING_COHORT_2026-09-02_2026-09-03.md`): add a week to each clock. **09-04 operator override: the M_B gate no longer parks the plumbing** — build the
-write path (`docs/plans/EXEC_SPINE_NEXT_2026-09-04.md`, R-6.5b CONVERGED) and live R(t)
-(`docs/plans/BL24_LIVE_RT_2026-09-04.md`); only enablement, budgets and the OP-1..OP-4
-positive control stay operator-only. M_B's kill rule still binds the family. **current_rung_hold landed 09-04** (table→6e, strategy, 6b replay, shadow wiring `c86bd10`; git log `7babe06..c86bd10`). **Paper replay DONE `8aaff91`** (`docs/evidence/paper_replay_current_rung_hold_2026-09-04.md`: 4 driver defects fixed, 1 trial, lag-45 = staleness arm). **Step 8 enablement LANDED 09-04** (`docs/plans/CRH_ENABLEMENT_STEP8_BRIEF_2026-09-04.md`; `6838cca..a5e6d15`: permit TTL 10h, sealed `OrderSubmissionPermit` B11, gate wired; PREREG BINDING `3bcb9c1`; tally timer ON; caps supplied, values only in the launch shell). **LIVE since 2026-09-04 17:54 UTC** (`BREEZY-L001`, launched from a shell with the seven §6 values; exec reconciled, NWS actors running, 4 strategies subscribed). OPEN: [MED] live strategies each subscribed all 24 instruments (no per-station skip; latch bounds ≤1/station-day); [LOW] `SubscribeData(client_id=BREEZY-NWS)` logs an ERROR live (msgbus subscription still effective); balances drift + sub-cent quantize landed (`docs/evidence/venue/polymarket_us/BALANCES_SHAPE_DRIFT_2026-09-04.md`). **Recorder: hung disconnected 6.7h 09-03 (fixed `6fcadae`); OPEN: no `MemoryHigh`, truncated-instance quarantine drops a day.**
+**[VERDICT] NO FAMILY HAS A PROVEN EDGE; ONE IS UNDER LIVE MEASUREMENT.**
+Forecast family KILLED; post-lock lock family REFUTED ×3 (L-9); K1 DEAD ≥2c (`docs/evidence/grok_*_2026-09-02.md`). **M_A**: the pre-lock afternoon window IS offered. **M_B** (kill n≥60 / survive n≥150, `grok_mb_kill_amendment_2026-09-02.md`): 09-04 run n_taken=2 (both 09-01, both lost); 09-02 VENUE-NEVER-LISTED, 09-03 lost to the recorder outage. **Live family** = lags 30/45, NYC excluded, interval rule (`grok_live_small_spec_rev2_2026-09-04.md`); accrues via `breezy-mb-daily.timer` 13:30Z + `breezy-live-tally.timer` 14:30Z (09-04 tally n=0). The venue skips ~9% of station-days (`MISSING_COHORT_2026-09-02_2026-09-03.md`). M_B's kill rule binds the family; the plumbing is no longer parked (operator 09-04).
+**LIVE since 2026-09-04 17:54 UTC** (`BREEZY-L001`; one process per trading day from a shell exporting the seven §6 values, `docs/plans/R8_OPERATOR_RUNBOOK.md`). **21:42Z the node was SIGTERMed by the coordinator session ending** (nohup inside the session's process group); relaunched 22:06Z detached (own SID). OPEN:
+- **[HIGH] No session-independent daily relaunch.** Plan `docs/plans/TRADE_NODE_DAILY_RELAUNCH_2026-09-04.md` (Rev 3 in convergence: security APPROVE, architecture REVISE). Prerequisite in flight: Breezy-owned `live-trading permit issued issued_at_ns= expires_at_ns=` INFO line + `LIVE_TRADING_PERMIT_REFUSED` WARN alert (`app/trade.py`). Until built: every coordinator session checks `pgrep -f 'breezy-trade$'` at start and relaunches before 17:00 UTC.
+- [MED] live strategies each subscribe all 24 instruments (latch bounds ≤1/station-day); [LOW] `SubscribeData(client_id=BREEZY-NWS)` ERROR line is cosmetic.
+- Recorder: `MemoryHigh=2G/MemoryMax=3G` + truncated-instance salvage landed `d46b725`, fail-fast `6fcadae`; healthy 09-04 22:00Z (252 files/h).
 
 ---
 
