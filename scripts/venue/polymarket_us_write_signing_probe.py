@@ -184,8 +184,7 @@ _MARKET_LIST_PATH: Final[str] = "/v1/markets"
 _SIGNABLE_WRITE_PATHS: Final[frozenset[str]] = frozenset({_CANCEL_ALL_PATH, _ORDERS_PATH})
 
 _WRITE_QUOTA_KEY: Final[str] = QUOTA_KEY_PORTFOLIO
-#: S4's one bounded re-read delay (read-your-writes is not venue-documented).
-_ENUMERATION_RETRY_SLEEP_SECS: Final[float] = 0.25
+_ENUMERATION_RETRY_SLEEP_SECS: Final[float] = 0.25  # S4's one bounded re-read delay
 
 #: D1's pre-/post-flight reason codes. Never carry a count or a length.
 PREFLIGHT_NOT_200: Final[str] = "PREFLIGHT_NOT_200"
