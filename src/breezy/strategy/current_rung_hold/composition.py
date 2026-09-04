@@ -121,12 +121,22 @@ def resolve_station_instrument_ids(
 
     Identifier-filtered ``catalog.instruments(instrument_ids=[...])`` silently
     omits every flat-written row -- always call ``instruments()`` with no ids.
+
+    ``catalog.instruments()`` returns ONE ROW PER RECORDED DEFINITION: the
+    quote-tape recorder re-emits an instrument's definition on every
+    discovery cycle, so the same ``InstrumentId`` can appear many times.
+    De-duplicated per station on ``id``, keeping first-seen order -- the same
+    rule ``run_weather_strategy_backtests.py::_select_capture_instruments``
+    already applies to the paper-replay driver -- so each id is subscribed to
+    exactly once downstream in ``CurrentRungHoldStrategy.on_start``.
     """
     catalog = ParquetDataCatalog(str(catalog_root))
     raw = catalog.instruments()
     instruments = list(raw) if raw is not None else []
 
-    buckets: dict[str, list[InstrumentId]] = {station: [] for station in SUPPORTED_STATIONS}
+    buckets: dict[str, dict[InstrumentId, None]] = {
+        station: {} for station in SUPPORTED_STATIONS
+    }
     for instrument in instruments:
         parsed = _facts_from_instrument(instrument)
         if parsed is None:
@@ -139,9 +149,37 @@ def resolve_station_instrument_ids(
         if climate_day != today_by_station.get(station):
             continue
         instrument_id = getattr(instrument, "id", None)
-        if isinstance(instrument_id, InstrumentId):
-            buckets[station].append(instrument_id)
-    return {station: tuple(ids) for station, ids in buckets.items()}
+        if not isinstance(instrument_id, InstrumentId):
+            continue
+        # dict-as-ordered-set: de-duplicates on id while keeping the FIRST
+        # recorded definition's position -- a plain `list` would re-append
+        # every re-emitted duplicate.
+        buckets[station].setdefault(instrument_id, None)
+
+    # id -> re-parsed settlement station, built once (not per bucket) so the
+    # pairing guard below costs one pass, not a rescan per id.
+    station_by_id: dict[InstrumentId, str] = {}
+    for instrument in instruments:
+        instrument_id = getattr(instrument, "id", None)
+        if not isinstance(instrument_id, InstrumentId) or instrument_id in station_by_id:
+            continue
+        parsed = _facts_from_instrument(instrument)
+        if parsed is not None:
+            station_by_id[instrument_id] = parsed[0]
+
+    resolved = {station: tuple(ids) for station, ids in buckets.items()}
+    for station, ids in resolved.items():
+        # Pairing guard: every id this function hands to a station's
+        # `CurrentRungHoldConfig.instrument_ids` must itself re-parse to
+        # that same station -- a bucketing bug here would silently
+        # subscribe one station's strategy to another station's market.
+        for instrument_id in ids:
+            reparsed_station = station_by_id.get(instrument_id)
+            assert reparsed_station == station, (
+                f"resolve_station_instrument_ids: {instrument_id} bucketed under "
+                f"{station!r} re-parses to {reparsed_station!r}"
+            )
+    return resolved
 
 
 def _zero_instruments_message(

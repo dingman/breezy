@@ -9,12 +9,15 @@ from decimal import Decimal
 from pathlib import Path
 
 import pytest
+from nautilus_trader.common.component import TestClock
 from nautilus_trader.model.currencies import USD
 from nautilus_trader.model.enums import AssetClass
-from nautilus_trader.model.identifiers import InstrumentId, Symbol, Venue
+from nautilus_trader.model.identifiers import InstrumentId, Symbol, TraderId, Venue
 from nautilus_trader.model.instruments import BinaryOption
 from nautilus_trader.model.objects import Price, Quantity
 from nautilus_trader.persistence.catalog.parquet import ParquetDataCatalog
+from nautilus_trader.portfolio import Portfolio
+from nautilus_trader.test_kit.stubs.component import TestComponentStubs
 
 from breezy.domain.weather_bucket_facts import (
     CLIMATE_DAY_KEY,
@@ -44,6 +47,7 @@ def _binary(
     slug: str,
     *,
     info: dict[str, object],
+    ts: int = 0,
 ) -> BinaryOption:
     instrument_id = InstrumentId(Symbol(slug), _POLYMARKET_VENUE)
     increment = Price.from_str("0.01")
@@ -65,8 +69,14 @@ def _binary(
         min_quantity=Quantity.from_int(1),
         maker_fee=Decimal("0.06"),
         taker_fee=Decimal("0.06"),
-        ts_event=0,
-        ts_init=0,
+        # ``ts_event``/``ts_init`` are DISTINCT per call (default ``ts=0``
+        # keeps every other test's byte-identical, single-file behavior
+        # unchanged): the real recorder's re-emitted definitions carry
+        # distinct discovery-cycle timestamps, which is exactly what makes
+        # ``ParquetDataCatalog`` write a NEW file per cycle instead of
+        # silently skipping an identical-name duplicate.
+        ts_event=ts,
+        ts_init=ts,
         info=info,
     )
 
@@ -151,6 +161,34 @@ def test_discovery_falls_back_to_the_slug_when_facts_are_unknown(tmp_path: Path)
     ]
 
 
+def test_discovery_dedupes_a_definition_re_emitted_across_recorder_cycles(
+    tmp_path: Path,
+) -> None:
+    """The quote-tape recorder re-emits every instrument's definition each
+    discovery cycle (docstring above), so ``catalog.instruments()`` returns
+    the SAME ``InstrumentId`` many times over several ``write_data`` calls.
+    ``resolve_station_instrument_ids`` must collapse those to one id per
+    station, first-seen, not one entry per recorded row.
+    """
+    for cycle in range(4):
+        _write(
+            tmp_path,
+            [
+                _binary(
+                    "tc-temp-laxhigh-2026-09-04-gte80lt81f",
+                    info=_known(station="LAX", day=_DAY),
+                    ts=cycle,
+                )
+            ],
+        )
+
+    resolved = resolve_station_instrument_ids(tmp_path, _TODAY)
+
+    assert [str(iid) for iid in resolved["LAX"]] == [
+        "tc-temp-laxhigh-2026-09-04-gte80lt81f.POLYMARKET_US"
+    ]
+
+
 @contextmanager
 def _unused_latch_factory() -> Iterator[object]:
     yield object()
@@ -197,6 +235,59 @@ def test_per_station_degradation_skips_zero_and_builds_the_rest(tmp_path: Path) 
     assert strategy._config.orders_enabled is False
     assert str(strategy.id) == "CurrentRungHoldStrategy-SFO"
     assert strategy.order_id_tag == "SFO"
+
+
+def test_on_start_subscribes_each_instrument_exactly_once_despite_re_emitted_definitions(
+    tmp_path: Path,
+) -> None:
+    """End-to-end through ``build_current_rung_hold_strategies`` + a real
+    ``on_start``: a catalog holding the SAME instrument recorded 3 times
+    (re-emitted definitions, as ``resolve_station_instrument_ids`` documents)
+    must still yield exactly ONE ``subscribe_quote_ticks`` call per
+    instrument -- never one per recorded row.
+    """
+    instrument = _binary(
+        "tc-temp-sfohigh-2026-09-04-gte70lt71f",
+        info=_known(station="SFO", day=_DAY),
+    )
+    for cycle in range(3):
+        _write(
+            tmp_path,
+            [
+                _binary(
+                    "tc-temp-sfohigh-2026-09-04-gte70lt71f",
+                    info=_known(station="SFO", day=_DAY),
+                    ts=cycle,
+                )
+            ],
+        )
+
+    strategies = build_current_rung_hold_strategies(
+        catalog_root=tmp_path,
+        today_by_station=_TODAY,
+        trial_day_latch_factory=_unused_latch_factory,
+    )
+    assert len(strategies) == 1
+    strategy = strategies[0]
+    assert strategy._config.instrument_ids == (instrument.id,)
+
+    clock = TestClock()
+    msgbus = TestComponentStubs.msgbus()
+    cache = TestComponentStubs.cache()
+    cache.add_instrument(instrument)
+    portfolio = Portfolio(msgbus=msgbus, cache=cache, clock=clock)
+    strategy.register(
+        trader_id=TraderId("BACKTEST-001"),
+        portfolio=portfolio,
+        msgbus=msgbus,
+        cache=cache,
+        clock=clock,
+    )
+    subscribed: list[InstrumentId] = []
+    strategy.subscribe_quote_ticks = subscribed.append  # type: ignore[method-assign]
+    strategy.start()
+
+    assert subscribed == [instrument.id]
 
 
 class _FakeRefusals:
