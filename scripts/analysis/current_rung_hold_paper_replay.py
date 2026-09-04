@@ -222,10 +222,23 @@ def run_one_precision_arm(
     ts_values = [record.ts_init for record in market_data]
     capture_window_ns = (min(ts_values), max(ts_values))
 
+    # The capture's OWN recorded `InstrumentClose`s (`TapeInstrument.closes`,
+    # populated by `_select_capture_instruments`) -- stamped as recorded,
+    # never synthesized. `instruments_without_close` is NEVER passed here: an
+    # instrument the capture genuinely never closed must still refuse via
+    # `SettlementInvariantError` (the invariant working, not a bypass).
+    closes: list[Data] = [close for ti in tape_instruments for close in ti.closes]
+    settlement_prices = {
+        close.instrument_id: float(close.close_price)
+        for ti in tape_instruments
+        for close in ti.closes
+    }
+
     config = build_paper_replay_config(
         instruments=instruments,
-        market_data=market_data,
+        market_data=[*market_data, *closes],
         weather_data=as_backtest_data(list(observations)),
+        settlement_prices=settlement_prices,
         starting_balances=(Money(STARTING_BALANCE_USD, USD),),
         capture_window_ns=capture_window_ns,
     )

@@ -519,12 +519,21 @@ class _SequenceForecastSource:
 
 @dataclass(frozen=True, slots=True)
 class TapeInstrument:
-    """One tradable instrument plus the REAL data selected for it."""
+    """One tradable instrument plus the REAL data selected for it.
+
+    `closes` is empty by default: `_select_tape_instruments`'s source tape
+    carries ZERO real `InstrumentClose` records (module docstring), so that
+    path leaves it empty and synthesizes a close separately via
+    `_synthesize_close`. `_select_capture_instruments` populates it from the
+    capture's OWN recorded closes -- never synthesized -- so a paper-replay
+    caller can feed them straight into `market_data`.
+    """
 
     instrument: BinaryOption
     facts: WeatherBucketFacts
     depths: list[OrderBookDepth10]
     quotes: list[QuoteTick]
+    closes: list[InstrumentClose] = field(default_factory=list)
 
     @property
     def last_market_data_ts_init(self) -> int:
@@ -1290,11 +1299,18 @@ def _select_capture_instruments(
     depth_counts: dict[str, int] = {}
     depths_by_id: dict[str, list[OrderBookDepth10]] = {}
     quotes_by_id: dict[str, list[QuoteTick]] = {}
+    closes_by_id: dict[str, list[InstrumentClose]] = {}
     for instrument_id in facts_by_id:
         depths = catalog.order_book_depth10(instrument_ids=[instrument_id])
         depths_by_id[instrument_id] = depths
         depth_counts[instrument_id] = len(depths)
         quotes_by_id[instrument_id] = catalog.quote_ticks(instrument_ids=[instrument_id])
+        # The capture's OWN recorded closes for this instrument, converted by
+        # `_convert_live_capture` alongside the quotes/depths above -- never
+        # synthesized here (unlike `_select_tape_instruments`).
+        closes_by_id[instrument_id] = catalog.instrument_closes(
+            instrument_ids=[instrument_id],
+        )
 
     result: list[TapeInstrument] = []
     for instrument_id in select_book_backed_instrument_ids(depth_counts):
@@ -1309,6 +1325,7 @@ def _select_capture_instruments(
                 facts=facts_by_id[instrument_id],
                 depths=depths_by_id[instrument_id],
                 quotes=quotes_by_id[instrument_id],
+                closes=closes_by_id[instrument_id],
             ),
         )
     return result

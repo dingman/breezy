@@ -20,7 +20,11 @@ Every market-data record a caller feeds :func:`build_paper_replay_config`
 must fall inside the converted capture's own timestamp window
 (``capture_window_ns``) -- an injected synthetic quote whose ``ts_init``
 falls outside that window is refused, not silently accepted
-(RED test 1).
+(RED test 1). The capture's own recorded ``InstrumentClose`` records are the
+one exception: they are stamped at venue settlement, strictly after the
+window, and are checked against the capture's own close records instead of
+``capture_window_ns`` -- never synthesized here (see
+``_assert_no_foreign_market_data``).
 
 The lag-anchor correction (review item 4)
 -------------------------------------------
@@ -45,7 +49,7 @@ from dataclasses import dataclass
 from decimal import Decimal
 from typing import TYPE_CHECKING, Final, Literal
 
-from nautilus_trader.model.data import OrderBookDepth10, QuoteTick
+from nautilus_trader.model.data import InstrumentClose, OrderBookDepth10, QuoteTick
 from nautilus_trader.model.enums import OrderStatus
 
 from breezy.domain.station_observation import StationObservation
@@ -201,8 +205,23 @@ def load_replay_observations(
 def _assert_no_foreign_market_data(
     market_data: Sequence[Data], capture_window_ns: tuple[int, int],
 ) -> None:
+    """Every non-close record must fall inside `capture_window_ns`.
+
+    `InstrumentClose` records are exempt from this window, not unchecked:
+    they are bound to the capture's OWN close records instead of the quote
+    window (RED "closes come at settlement"). A real settlement close is
+    stamped when the venue terminally settles the market, which is strictly
+    AFTER the last quote/depth record in the window -- checking it against
+    `[lo, hi]` would reject every real close as "foreign". The type-EXACT
+    check mirrors `backtest_harness._expired_closes`: only an actual
+    `InstrumentClose` is exempt, never a look-alike.
+    """
     lo, hi = capture_window_ns
-    foreign = [record for record in market_data if not (lo <= record.ts_init <= hi)]
+    foreign = [
+        record
+        for record in market_data
+        if type(record) is not InstrumentClose and not (lo <= record.ts_init <= hi)
+    ]
     if foreign:
         raise ForeignReplayDataError(
             f"{len(foreign)} market-data record(s) carry a ts_init outside the "
@@ -259,7 +278,7 @@ def filled_trials_from_engine(
     engine: BacktestEngine,
     entry_contexts: Mapping[str, ReplayEntryContext],
 ) -> tuple[FilledTrial, ...]:
-    """Every FILLED order in `engine.cache`, turned into a `FilledTrial`.
+    """Every FILLED entry order in `engine.cache`, turned into a `FilledTrial`.
 
     `trial_id` is derived internally (`paper_replay/current_rung_hold/
     trial/{station}/{climate_day}`) -- never a caller-supplied argument
@@ -268,10 +287,22 @@ def filled_trials_from_engine(
     skipped, never fabricated a trial. `CurrentRungHoldConfig.order_quantity`
     is pinned to 1, so the venue's per-order commission IS the per-contract
     fee -- no division.
+
+    A real `InstrumentClose` in `market_data` makes
+    `SimulatedExchange.check_instrument_expiration` flatten any still-open
+    position with its OWN synthetic `MarketOrder`
+    (`backtest/engine.pyx:5952`, `client_order_id="EXPIRATION-LEG-<uuid>"`,
+    `tags=["EXPIRATION_<venue>_CLOSE"]`) -- FILLED, same instrument, and
+    otherwise indistinguishable from a real entry to this function. That
+    settlement-close leg is excluded here by its `client_order_id` prefix, or
+    it would be double-counted as a second trial per instrument.
     """
+    _EXPIRATION_LEG_PREFIX: Final[str] = "EXPIRATION-LEG-"
     trials: list[FilledTrial] = []
     for order in engine.cache.orders():
         if order.status != OrderStatus.FILLED:
+            continue
+        if str(order.client_order_id).startswith(_EXPIRATION_LEG_PREFIX):
             continue
         instrument_id = str(order.instrument_id)
         ctx = entry_contexts.get(instrument_id)

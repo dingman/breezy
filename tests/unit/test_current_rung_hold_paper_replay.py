@@ -21,8 +21,8 @@ from types import ModuleType
 
 import pytest
 from nautilus_trader.model.currencies import USD
-from nautilus_trader.model.data import BookOrder, OrderBookDepth10, QuoteTick
-from nautilus_trader.model.enums import AssetClass, OrderSide
+from nautilus_trader.model.data import BookOrder, InstrumentClose, OrderBookDepth10, QuoteTick
+from nautilus_trader.model.enums import AssetClass, InstrumentCloseType, OrderSide
 from nautilus_trader.model.identifiers import InstrumentId, Symbol, Venue
 from nautilus_trader.model.instruments import BinaryOption
 from nautilus_trader.model.objects import Money, Price, Quantity
@@ -43,7 +43,7 @@ from breezy.domain.weather_bucket_facts import (
     WEATHER_FACTS_STATUS_KNOWN,
 )
 from breezy.runtime.backtest_feed import as_backtest_data
-from breezy.runtime.backtest_harness import backtest
+from breezy.runtime.backtest_harness import SettlementInvariantError, backtest
 from breezy.runtime.paper_replay import (
     PRECISION_ARMS,
     ForeignReplayDataError,
@@ -276,6 +276,94 @@ def test_an_ioc_at_displayed_size_one_fills_exactly_one_contract_at_the_displaye
 
 
 # ---------------------------------------------------------------------------
+# RED tests (a)/(b) -- the capture's own recorded `InstrumentClose` is used,
+# never `instruments_without_close`; a capture with no close still refuses.
+# ---------------------------------------------------------------------------
+def _close(*, price: str, ts_event: int) -> InstrumentClose:
+    return InstrumentClose(
+        instrument_id=INSTRUMENT_ID,
+        close_price=Price.from_str(price),
+        close_type=InstrumentCloseType.CONTRACT_EXPIRED,
+        ts_event=ts_event,
+        ts_init=ts_event,
+    )
+
+
+def test_a_capture_with_a_real_close_builds_and_runs_the_engine(tmp_path: Path) -> None:
+    """(a) A fixture capture WITH a real recorded close builds the engine and
+    fills -- no `instruments_without_close` bypass anywhere in this path."""
+    instrument = _instrument()
+    depth_ts = WINDOW_OPEN_NS - 1_000
+    quote = _quote(ask="0.40", size=10, ts_event=WINDOW_OPEN_NS)
+    depth = _depth(ask="0.40", size=10, ts_event=depth_ts)
+    # Stamped strictly AFTER the quote window -- a real settlement close, not
+    # a synthetic one, and outside [lo, hi] on purpose (RED "closes come at
+    # settlement").
+    close = _close(price="1.00", ts_event=WINDOW_OPEN_NS + NS_PER_MIN)
+    observation_ns = WINDOW_OPEN_NS - 5 * NS_PER_MIN
+    from breezy.domain.station_observation import StationObservation
+
+    observation = StationObservation(
+        station=ICAO,
+        observed_at_ns=observation_ns,
+        received_at_ns=observation_ns + NS_PER_MIN,
+        temp_c_tenths=300,
+        precision_c_tenths=5,
+        is_metar=True,
+        source_channel="iem_asos_metar",
+        assumed_publication_lag_ns=1,
+    )
+    config = build_paper_replay_config(
+        instruments=[instrument],
+        market_data=[quote, depth, close],
+        weather_data=as_backtest_data([observation]),
+        settlement_prices={instrument.id: 1.0},
+        starting_balances=(Money(10_000, USD),),
+        capture_window_ns=(depth_ts, WINDOW_OPEN_NS),
+        # Deliberately NOT passing `instruments_without_close` -- the real
+        # close above is what satisfies the invariant.
+    )
+    cfg = CurrentRungHoldConfig(instrument_ids=(instrument.id,), stations=(STATION,))
+    strategy = CurrentRungHoldBacktestStrategy(
+        cfg, trial_day_latch_factory=_latch_factory(tmp_path / "state.db"),
+    )
+    with backtest(config, strategies=(strategy,), allow_idle_strategies=True) as engine:
+        ctx = ReplayEntryContext(
+            station=STATION,
+            climate_day=CLIMATE_DAY.isoformat(),
+            bucket=None,
+            entry_ask=Decimal("0.40"),
+            scheduled_release_at_ns=WINDOW_OPEN_NS + 7 * 24 * 3_600_000_000_000,
+        )
+        trials = filled_trials_from_engine(engine, {str(instrument.id): ctx})
+    assert len(trials) == 1
+    assert trials[0].fill_px == Decimal("0.40")
+
+
+def test_a_capture_with_no_close_still_refuses_settlement_invariant(tmp_path: Path) -> None:
+    """(b) No close record anywhere -- the invariant must NOT be bypassed."""
+    instrument = _instrument()
+    depth_ts = WINDOW_OPEN_NS - 1_000
+    quote = _quote(ask="0.40", size=10, ts_event=WINDOW_OPEN_NS)
+    depth = _depth(ask="0.40", size=10, ts_event=depth_ts)
+    config = build_paper_replay_config(
+        instruments=[instrument],
+        market_data=[quote, depth],
+        starting_balances=(Money(10_000, USD),),
+        capture_window_ns=(depth_ts, WINDOW_OPEN_NS),
+        # No close, no `instruments_without_close` -- must still refuse.
+    )
+    cfg = CurrentRungHoldConfig(instrument_ids=(instrument.id,), stations=(STATION,))
+    strategy = CurrentRungHoldBacktestStrategy(
+        cfg, trial_day_latch_factory=_latch_factory(tmp_path / "state.db"),
+    )
+    with pytest.raises(SettlementInvariantError), backtest(
+        config, strategies=(strategy,), allow_idle_strategies=True,
+    ):
+        pass  # pragma: no cover - must raise before yielding
+
+
+# ---------------------------------------------------------------------------
 # `load_replay_observations` -- receipt synthesis, precision arms
 # ---------------------------------------------------------------------------
 def test_lag_minutes_has_no_default_and_is_required() -> None:
@@ -497,6 +585,23 @@ def test_the_strategy_object_is_the_shipped_one(driver: ModuleType) -> None:
         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
     }
     assert not (forbidden_names & defined_names)
+
+
+def test_the_driver_never_passes_instruments_without_close() -> None:
+    """(c) The driver never bypasses the settlement invariant: a capture
+    instrument that never closes must refuse, not be waived by name. Checked
+    at the AST call-site level (never a caller-supplied keyword argument),
+    not a bare text search -- the module legitimately DISCUSSES the
+    invariant in comments/docstrings without ever invoking the bypass."""
+    source = (_SCRIPTS_ANALYSIS_DIR / "current_rung_hold_paper_replay.py").read_text()
+    tree = ast.parse(source)
+    used = {
+        keyword.arg
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call)
+        for keyword in node.keywords
+    }
+    assert "instruments_without_close" not in used
 
 
 def test_no_inline_wilson_or_bootstrap_arithmetic(driver: ModuleType) -> None:
