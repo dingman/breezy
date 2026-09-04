@@ -1,0 +1,45 @@
+[Unit]
+# Daily driver for the PREREG v2 sibling tally, family pm_us_crh_v2
+# (scripts/analysis/family_tally_v2.py via deploy/systemd/
+# family-tally-v2-run.sh), triggered by breezy-pm-crh-v2-tally.timer.
+# Sibling of breezy-live-tally.service: same oneshot/no-Install shape, same
+# wrapper-script driver style -- the timer owns cadence, the script owns
+# the work. The family id (pm_us_crh_v2) is the wrapper's ONLY argument;
+# it is never inferred, so this unit and breezy-kalshi-crh-tally.service
+# can share one wrapper safely. Scheduled to run AFTER the v1 live tally
+# (breezy-live-tally.timer, 14:30 UTC), so this family's own read never
+# races that unit's independent work.
+#
+# No network: the PREREG v2 store is a local parquet directory
+# (`~/.local/share/breezy/derived/scored_trials`, same store
+# breezy-live-tally.service reads), plus the local family manifest
+# (`deploy/families/pm_us_crh_v2.json`).
+Description=Breezy PREREG v2 family tally -- pm_us_crh_v2 (daily)
+Documentation=file:///home/jon/breezy/deploy/systemd/README.md
+Documentation=file:///home/jon/breezy/scripts/analysis/family_tally_v2.py
+Documentation=file:///home/jon/breezy/docs/plans/FAMILY_TALLY_V2_BLUEPRINT_2026-09-04.md
+
+[Service]
+Type=oneshot
+WorkingDirectory=/home/jon/breezy
+UMask=0077
+
+# No EnvironmentFile, deliberately: this unit holds no venue credential --
+# it reads a local parquet directory and writes a local Markdown report,
+# same posture as breezy-live-tally.service.
+ExecStart=/home/jon/breezy/deploy/systemd/family-tally-v2-run.sh pm_us_crh_v2
+
+# Same budget as breezy-live-tally.service: a local parquet scan plus a
+# bootstrap (BCa), well under breezy-mb-daily's network-bound budget.
+TimeoutStartSec=600
+
+# No Restart=. A missed daily run is not an incident -- tomorrow's run
+# subsumes today's over the still-growing store. The timer's
+# Persistent=true is what recovers a run missed across a reboot.
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=breezy-pm-crh-v2-tally
+
+# NOTE: no [Install] section. This unit is started BY the timer, never
+# enabled directly. `systemctl --user enable breezy-pm-crh-v2-tally.timer`
+# is the only thing to enable.

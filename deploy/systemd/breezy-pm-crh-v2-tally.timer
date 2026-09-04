@@ -1,0 +1,29 @@
+[Unit]
+Description=Daily trigger for the Breezy PREREG v2 family tally (pm_us_crh_v2)
+Documentation=file:///home/jon/breezy/deploy/systemd/README.md
+Documentation=file:///home/jon/breezy/scripts/analysis/family_tally_v2.py
+
+[Timer]
+Unit=breezy-pm-crh-v2-tally.service
+
+# 15:30 UTC -- one hour AFTER breezy-live-tally (14:30 UTC, the v1 tally),
+# so this family's own read never races that unit's work, and a distinct
+# HOUR from every other Breezy timer: breezy-quote-tape-rotate (09:00),
+# breezy-mb-daily (13:30), breezy-live-tally (14:30),
+# breezy-kalshi-crh-tally (16:30), breezy-k1-daily (22:30),
+# breezy-offer-gate-daily (22:45), breezy-quote-tape-ingest (00,06,12,18:15).
+# No two Breezy timers ever fire in the same hour:minute tick
+# (tests/unit/test_deploy_timer_hours.py). UTC is stated explicitly (this
+# host's clock is UTC) so the schedule cannot move if the host timezone is
+# ever changed.
+OnCalendar=*-*-* 15:30:00 UTC
+
+# A run missed because the host was down fires as soon as the timer is
+# next active, instead of being silently skipped until the following day
+# -- mirrors breezy-live-tally.timer.
+Persistent=true
+
+AccuracySec=1min
+
+[Install]
+WantedBy=timers.target

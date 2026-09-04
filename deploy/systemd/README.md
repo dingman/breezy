@@ -542,3 +542,50 @@ pattern), `daemon-reload`, then
 `systemctl --user enable --now breezy-live-tally.timer` — deliberately not
 run here; see the TRAP section above for the post-edit `daemon-reload`
 discipline that applies to any future edit of this unit too.
+
+---
+
+## `breezy-pm-crh-v2-tally` — PREREG v2 family tally, PM-only (2026-09-04, PREPARED, NOT ACTIVATED)
+
+One concrete unit pair runs `scripts/analysis/family_tally_v2.py` (the CLI
+sibling of `live_family_tally.py`, built in a parallel commit) via
+`deploy/systemd/family-tally-v2-run.sh`: **`breezy-pm-crh-v2-tally`** at
+**15:30 UTC** for family `pm_us_crh_v2` — an hour after `breezy-live-tally`
+(14:30 UTC) so v1's read is never raced. No templated `@.service` unit: the
+repo has no precedent for one, so this is a concrete pair per the existing
+convention.
+
+The Kalshi sibling unit pair (`breezy-kalshi-crh-tally.{service,timer}`,
+family `kalshi_crh_v1`, 16:30 UTC) is **parked on branch
+`wip/kalshi-s4-registry`**, not on main — per the 2026-09-04 operator
+priority: Kalshi is not prioritized until Polymarket.us is working. The
+`kalshi_crh_v1` family manifest still exists on disk
+(`deploy/families/kalshi_crh_v1.json`), so the wrapper still lists it as a
+valid family id even with no unit invoking it.
+
+**The family id is the wrapper's only argument — one invocation per family,
+family named by argument, never inferred.** `family-tally-v2-run.sh` takes
+the family id as `$1`, validates it against the manifests present in
+`deploy/families/*.json` (basename without `.json`), and fails loudly
+(exit 2, naming the valid ids in its stderr) on an unknown or missing id,
+rather than silently tallying the wrong family. `breezy-pm-crh-v2-tally
+.service`'s `ExecStart=` passes its family id explicitly (`...
+family-tally-v2-run.sh pm_us_crh_v2`) — the wrapper is shared-ready for a
+future Kalshi unit but never infers or defaults the argument. The wrapper
+reads the same scored-trials store and writes into the same reports
+directory convention as `live-tally-run.sh` (`BREEZY_SCORED_TRIALS_DIR` /
+`BREEZY_LIVE_TALLY_OUTPUT_DIR` overrides), naming its output file by family
+id so future sibling tallies' artefacts never collide on disk.
+
+Validation performed (no unit activated):
+
+```
+$ bash -n deploy/systemd/family-tally-v2-run.sh
+OK
+```
+
+To activate: symlink the pair into `~/.config/systemd/user/` (§2's
+pattern), `daemon-reload`, then
+`systemctl --user enable --now breezy-pm-crh-v2-tally.timer` — deliberately
+not run here; see the TRAP section above for the post-edit `daemon-reload`
+discipline that applies to any future edit of this unit too.
