@@ -53,6 +53,7 @@ from mb_current_rung_edge_study import (
     classify_ask_band,
 )
 
+from fill_time_count import count_filled_takes
 from structural_dead_stop import StructuralDeadVerdict, structural_dead
 
 from breezy.persistence.scored_trial_store import read_scored_trials
@@ -450,10 +451,32 @@ def main(argv: Sequence[str] | None = None) -> int:
         "--provenance", choices=("live", "paper_replay"), default="live",
         help="which unforgeable barrier to run -- see build_live_family_tally",
     )
+    parser.add_argument(
+        "--fill-source", type=Path, default=None,
+        help="exec-state SqliteStateStore path for the v1 structural-dead stop's "
+        "FILL-TIME filled-Takes count (see fill_time_count.py); omitted means "
+        "filled_takes=None and the stop is never evaluated",
+    )
+    parser.add_argument(
+        "--covered-listed-station-days", type=int, default=None,
+        help="the v1 structural-dead stop's covered-listed-station-days "
+        "denominator (see structural_dead_stop.py); omitted means the stop "
+        "is never evaluated",
+    )
     args = parser.parse_args(argv)
 
     rows = read_scored_trials(args.store_dir)
-    tally = build_live_family_tally(rows, provenance=args.provenance)
+    filled_takes = (
+        None
+        if args.fill_source is None
+        else count_filled_takes(args.fill_source, family_prefix=_LIVE_TRIAL_ID_PREFIX)
+    )
+    tally = build_live_family_tally(
+        rows,
+        provenance=args.provenance,
+        covered_listed_station_days=args.covered_listed_station_days,
+        filled_takes=filled_takes,
+    )
     report = render_markdown(
         tally, source_paths=(args.store_dir,), as_of=args.as_of, provenance=args.provenance,
     )
