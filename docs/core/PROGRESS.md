@@ -135,7 +135,7 @@ forecast ingest → ~300 station-days → CAPACITY).
 **EXEC SPINE follow-ups:** `docs/plans/EXEC_SPINE_2026-09-01.md` §R-4
 "review amendments". Guard before R-9: divides by zero for an unpriced
 forward; settlement-as-exit bypasses `_submit_order`'s refusal latch.
-**Write path — PLAN CONVERGED (Rev 7, `d1e8e33`); LANDED: R-6.5a `4f76137`, R-6.5P `38f2426`, R-6.5b-0 `43723a1`, ledger `e329667`, latch `5d41eaa`, R-6.5b `757daba`, R-7 send path `092695c`+`02bfd63` clear tool `breezy-clear-submit-intent`); **OP-SEQ bot-driven positive control PASSED 09-04 17:08Z** (`CLOSED_YES_BOTH_VERBS`, `docs/plans/OP_SEQ_BOT_POSITIVE_CONTROL_2026-09-04.md`), `WRITE_CANONICAL_STRING_VERIFIED=True`; blocking controls are now the sealed order permit, the 10h live-trading permit, the caps, and the exact-`"1"` enablement variable.** Grok builds, Claude verifies.
+**Write path VERIFIED 09-04** (R-6.5a..R-7 landed `4f76137..02bfd63`; OP-SEQ live positive control `CLOSED_YES_BOTH_VERBS`, `docs/plans/OP_SEQ_BOT_POSITIVE_CONTROL_2026-09-04.md`; `WRITE_CANONICAL_STRING_VERIFIED=True`; blocking controls: sealed order permit, 10h live-trading permit, caps, exact-`"1"` enablement). Grok builds, Claude verifies.
 R-7 rules still open (`docs/plans/EXEC_SPINE_R65_R7_2026-09-02.md`): authorization is the write closure's first positional; caps re-read per call; ledger releases only on 4xx+Status+no `order.id`; IOC zero-fill is terminal (R-7 brief converged); native inflight resolution DECLINED. The R-4 standing refusal stays until R-7 lands.
 
 **Open from the blind-risk-view audit** (`docs/core/findings/BLIND_RISK_VIEWS_2026-09-02.md`):
