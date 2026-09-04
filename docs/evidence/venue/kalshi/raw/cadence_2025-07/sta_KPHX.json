@@ -1,0 +1,70 @@
+{
+    "@context": [
+        "https://geojson.org/geojson-ld/geojson-context.jsonld",
+        {
+            "@version": "1.1",
+            "wx": "https://api.weather.gov/ontology#",
+            "s": "https://schema.org/",
+            "geo": "http://www.opengis.net/ont/geosparql#",
+            "unit": "http://codes.wmo.int/common/unit/",
+            "@vocab": "https://api.weather.gov/ontology#",
+            "geometry": {
+                "@id": "s:GeoCoordinates",
+                "@type": "geo:wktLiteral"
+            },
+            "city": "s:addressLocality",
+            "state": "s:addressRegion",
+            "distance": {
+                "@id": "s:Distance",
+                "@type": "s:QuantitativeValue"
+            },
+            "bearing": {
+                "@type": "s:QuantitativeValue"
+            },
+            "value": {
+                "@id": "s:value"
+            },
+            "unitCode": {
+                "@id": "s:unitCode",
+                "@type": "@id"
+            },
+            "forecastOffice": {
+                "@type": "@id"
+            },
+            "forecastGridData": {
+                "@type": "@id"
+            },
+            "publicZone": {
+                "@type": "@id"
+            },
+            "county": {
+                "@type": "@id"
+            }
+        }
+    ],
+    "id": "https://api.weather.gov/stations/KPHX",
+    "type": "Feature",
+    "geometry": {
+        "type": "Point",
+        "coordinates": [
+            -112.003465,
+            33.427799
+        ]
+    },
+    "properties": {
+        "@id": "https://api.weather.gov/stations/KPHX",
+        "@type": "wx:ObservationStation",
+        "elevation": {
+            "unitCode": "wmoUnit:m",
+            "value": 339.852
+        },
+        "stationIdentifier": "KPHX",
+        "name": "Phoenix, Phoenix Sky Harbor International Airport",
+        "timeZone": "America/Phoenix",
+        "provider": "ASOS-HFM",
+        "subProvider": "",
+        "forecast": "https://api.weather.gov/zones/forecast/AZZ543",
+        "county": "https://api.weather.gov/zones/county/AZC013",
+        "fireWeatherZone": "https://api.weather.gov/zones/fire/AZZ132"
+    }
+}

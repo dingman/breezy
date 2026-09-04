@@ -1,0 +1,14 @@
+HTTP/2 200 
+content-type: application/json
+date: Fri, 04 Sep 2026 20:53:16 GMT
+x-content-type-options: nosniff
+x-kalshi-cache-hits: 5
+cache-control: public, max-age=15
+content-security-policy: default-src 'none';
+strict-transport-security: max-age=31536000; includeSubDomains
+vary: Accept-Encoding,Accept-Language
+x-cache: Miss from cloudfront
+via: 1.1 a3a495e79f7ccf2b46891b2bff5bdbe0.cloudfront.net (CloudFront)
+x-amz-cf-pop: DFW56-P9
+x-amz-cf-id: 1dAOyXjqMW5X9BPJbU-8k8HcaWv2se856cMIZhuTc87IGSyNSv1ieg==
+

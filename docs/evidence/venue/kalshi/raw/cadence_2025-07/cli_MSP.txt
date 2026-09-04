@@ -1,0 +1,105 @@
+
+778 
+CDUS43 KMPX 040741
+CLIMSP
+
+CLIMATE REPORT 
+NATIONAL WEATHER SERVICE TWIN CITIES/CHANHASSEN MN
+241 AM CDT FRI SEP 04 2026
+
+...................................
+
+...THE TWIN CITIES MN CLIMATE SUMMARY FOR SEPTEMBER 3 2026...
+
+CLIMATE NORMAL PERIOD 1991 TO 2020
+CLIMATE RECORD PERIOD 1871 TO 2026
+
+
+WEATHER ITEM   OBSERVED TIME   RECORD YEAR NORMAL DEPARTURE LAST      
+                VALUE   (LST)  VALUE       VALUE  FROM      YEAR     
+                                                  NORMAL           
+...................................................................
+TEMPERATURE (F)                                                          
+ YESTERDAY                                                           
+  MAXIMUM         90    206 PM  97    1925  77     13       66       
+                                      2023                           
+  MINIMUM         74    737 AM  32    1974  59     15       48       
+  AVERAGE         82                        68     14       57     
+
+PRECIPITATION (IN)                                                    
+  YESTERDAY        0.02          1.08 1887   0.10  -0.08      T       
+  MONTH TO DATE    0.06                      0.31  -0.25     0.37     
+  SINCE SEP 1      0.06                      0.31  -0.25     0.37     
+  SINCE JAN 1     16.35                     23.55  -7.20    23.67     
+
+SNOWFALL (IN)                                                              
+  YESTERDAY        0.0           0.0    MM   0.0    0.0      0.0      
+  MONTH TO DATE    0.0                       0.0    0.0      0.0      
+  SINCE SEP 1      0.0                       0.0    0.0      0.0      
+  SINCE JUL 1      0.0                       0.0    0.0       T       
+  SNOW DEPTH       0                                                 
+
+DEGREE DAYS                                                           
+ HEATING                                                              
+  YESTERDAY        0                         1     -1        8        
+  MONTH TO DATE    0                         3     -3        8        
+  SINCE SEP 1      0                         3     -3        8        
+  SINCE JUL 1      0                        17    -17       16        
+
+ COOLING                                                              
+  YESTERDAY       17                         5     12        0        
+  MONTH TO DATE   43                        15     28        9        
+  SINCE SEP 1     43                        15     28        9        
+  SINCE JAN 1   1052                       753    299      862        
+...................................................................
+
+
+WIND (MPH)                                                            
+  HIGHEST WIND SPEED    20   HIGHEST WIND DIRECTION    SE (150)       
+  HIGHEST GUST SPEED    27   HIGHEST GUST DIRECTION    SE (150)       
+  AVERAGE WIND SPEED     9.2                                        
+
+
+SKY COVER                                                             
+  POSSIBLE SUNSHINE  MM                                                 
+  AVERAGE SKY COVER 0.5                                                 
+
+
+WEATHER CONDITIONS                                                    
+THE FOLLOWING WEATHER WAS RECORDED YESTERDAY.                         
+  THUNDERSTORM                                                        
+  LIGHT RAIN                                                          
+
+
+RELATIVE HUMIDITY (PERCENT)
+ HIGHEST    85           400 AM                                      
+ LOWEST     45           200 PM                                      
+ AVERAGE    65                                                        
+
+..........................................................
+
+
+THE TWIN CITIES MN CLIMATE NORMALS FOR TODAY
+                         NORMAL    RECORD    YEAR                     
+ MAXIMUM TEMPERATURE (F)   77        98      1925                      
+                                             2023                     
+ MINIMUM TEMPERATURE (F)   59        39      1885                      
+                                             1974                     
+
+
+SUNRISE AND SUNSET                                                    
+SEPTEMBER  4 2026.....SUNRISE   639 AM CDT   SUNSET   744 PM CDT     
+SEPTEMBER  5 2026.....SUNRISE   640 AM CDT   SUNSET   742 PM CDT     
+
+
+-  INDICATES NEGATIVE NUMBERS.
+R  INDICATES RECORD WAS SET OR TIED.
+MM INDICATES DATA IS MISSING.
+T  INDICATES TRACE AMOUNT.
+
+
+
+
+$$
+
+

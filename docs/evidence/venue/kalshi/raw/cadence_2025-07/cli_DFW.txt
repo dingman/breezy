@@ -1,0 +1,94 @@
+
+779 
+CDUS44 KFWD 040644
+CLIDFW
+
+CLIMATE REPORT 
+NATIONAL WEATHER SERVICE FORT WORTH TX
+144 AM CDT FRI SEP 04 2026
+
+...................................
+
+...THE DALLAS/FORT WORTH CLIMATE SUMMARY FOR SEPTEMBER 3 2026...
+
+CLIMATE NORMAL PERIOD 1991 TO 2020
+CLIMATE RECORD PERIOD 1898 TO 2026
+
+
+WEATHER ITEM   OBSERVED TIME   RECORD YEAR NORMAL DEPARTURE LAST      
+                VALUE   (LST)  VALUE       VALUE  FROM      YEAR     
+                                                  NORMAL           
+...................................................................
+TEMPERATURE (F)                                                          
+ YESTERDAY                                                           
+  MAXIMUM         94    424 PM 109    2000  92      2       91       
+  MINIMUM         76    116 AM  60    1974  73      3       71       
+  AVERAGE         85                        82      3       81     
+
+PRECIPITATION (IN)                                                    
+  YESTERDAY        0.00          2.18 1976   0.09  -0.09     0.00     
+  MONTH TO DATE    0.00                      0.29  -0.29     0.04     
+  SINCE SEP 1      0.00                      0.29  -0.29     0.04     
+  SINCE JAN 1     22.61                     24.84  -2.23    27.09     
+
+DEGREE DAYS                                                           
+ HEATING                                                              
+  YESTERDAY        0                         0      0        0        
+  MONTH TO DATE    0                         0      0        0        
+  SINCE SEP 1      0                         0      0        0        
+  SINCE JUL 1      0                         0      0        0        
+
+ COOLING                                                              
+  YESTERDAY       20                        17      3       16        
+  MONTH TO DATE   69                        53     16       50        
+  SINCE SEP 1     69                        53     16       50        
+  SINCE JAN 1   2923                      2281    642     2417        
+...................................................................
+
+
+WIND (MPH)                                                            
+  HIGHEST WIND SPEED    22   HIGHEST WIND DIRECTION     S (160)       
+  HIGHEST GUST SPEED    30   HIGHEST GUST DIRECTION     S (160)       
+  AVERAGE WIND SPEED    10.7                                        
+
+
+SKY COVER                                                             
+  POSSIBLE SUNSHINE  MM                                                 
+  AVERAGE SKY COVER 0.5                                                 
+
+
+WEATHER CONDITIONS                                                    
+THE FOLLOWING WEATHER WAS RECORDED YESTERDAY.                         
+  NO SIGNIFICANT WEATHER WAS OBSERVED.                                  
+
+
+RELATIVE HUMIDITY (PERCENT)
+ HIGHEST    77           700 AM                                      
+ LOWEST     49           300 PM                                      
+ AVERAGE    63                                                        
+
+..........................................................
+
+
+THE DALLAS/FORT WORTH CLIMATE NORMALS FOR TODAY
+                         NORMAL    RECORD    YEAR                     
+ MAXIMUM TEMPERATURE (F)   92       111      2000                      
+ MINIMUM TEMPERATURE (F)   72        55      1974                      
+
+
+SUNRISE AND SUNSET                                                    
+SEPTEMBER  4 2026.....SUNRISE   705 AM CDT   SUNSET   749 PM CDT     
+SEPTEMBER  5 2026.....SUNRISE   705 AM CDT   SUNSET   748 PM CDT     
+
+
+-  INDICATES NEGATIVE NUMBERS.
+R  INDICATES RECORD WAS SET OR TIED.
+MM INDICATES DATA IS MISSING.
+T  INDICATES TRACE AMOUNT.
+
+
+
+
+$$
+
+

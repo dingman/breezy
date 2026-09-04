@@ -1,0 +1,102 @@
+
+591 
+CDUS45 KPSR 040825
+CLIPHX
+
+CLIMATE REPORT 
+NATIONAL WEATHER SERVICE PHOENIX AZ
+125 AM MST FRI SEP 04 2026
+
+...................................
+
+...THE PHOENIX AZ CLIMATE SUMMARY FOR SEPTEMBER 3 2026...
+
+CLIMATE NORMAL PERIOD 1991 TO 2020
+CLIMATE RECORD PERIOD 1895 TO 2026
+
+
+WEATHER ITEM   OBSERVED TIME   RECORD YEAR NORMAL DEPARTURE LAST      
+                VALUE   (LST)  VALUE       VALUE  FROM      YEAR     
+                                                  NORMAL           
+...................................................................
+TEMPERATURE (F)                                                          
+ YESTERDAY                                                           
+  MAXIMUM        103    329 PM 112    1945 104     -1      106       
+                                      1948                           
+                                      1983                           
+  MINIMUM         86    701 AM  64    1964  82      4       78       
+  AVERAGE         95                        93      2       92     
+
+PRECIPITATION (IN)                                                    
+  YESTERDAY        0.00          0.35 1989   0.03  -0.03     0.03     
+  MONTH TO DATE    0.00                      0.08  -0.08     0.03     
+  SINCE OCT 1      5.81                      6.73  -0.92     2.00     
+  SINCE JAN 1      1.73                      4.86  -3.13     2.00     
+
+SNOWFALL (IN)                                                              
+  YESTERDAY        0.0                                                
+  MONTH TO DATE    0.0                                                
+  SINCE JAN 1      0.0                                                
+  SINCE JUL 1      0.0                                                
+  SNOW DEPTH       0                                                 
+
+DEGREE DAYS                                                           
+ HEATING                                                              
+  YESTERDAY        0                         0      0        0        
+  MONTH TO DATE    0                         0      0        0        
+  SINCE SEP 1      0                         0      0        0        
+  SINCE JUL 1      0                         0      0        0        
+
+ COOLING                                                              
+  YESTERDAY       30                        28      2       27        
+  MONTH TO DATE   86                        84      2       93        
+  SINCE SEP 1     86                        84      2       93        
+  SINCE JAN 1   4596                      3641    955     4085        
+...................................................................
+
+
+WIND (MPH)                                                            
+  HIGHEST WIND SPEED    18   HIGHEST WIND DIRECTION     S (160)       
+  HIGHEST GUST SPEED    27   HIGHEST GUST DIRECTION    SE (150)       
+  AVERAGE WIND SPEED     8.5                                        
+
+
+SKY COVER                                                             
+  AVERAGE SKY COVER 0.4                                                 
+
+
+WEATHER CONDITIONS                                                    
+THE FOLLOWING WEATHER WAS RECORDED YESTERDAY.                         
+  HAZE                                                                
+
+
+RELATIVE HUMIDITY (PERCENT)
+ HIGHEST    51           700 AM                                      
+ LOWEST     18           200 AM                                      
+ AVERAGE    35                                                        
+
+..........................................................
+
+
+THE PHOENIX AZ CLIMATE NORMALS FOR TODAY
+                         NORMAL    RECORD    YEAR                     
+ MAXIMUM TEMPERATURE (F)  104       114      2020                      
+ MINIMUM TEMPERATURE (F)   82        60      1921                      
+
+
+SUNRISE AND SUNSET                                                    
+SEPTEMBER  4 2026.....SUNRISE   604 AM MST   SUNSET   649 PM MST     
+SEPTEMBER  5 2026.....SUNRISE   605 AM MST   SUNSET   648 PM MST     
+
+
+-  INDICATES NEGATIVE NUMBERS.
+R  INDICATES RECORD WAS SET OR TIED.
+MM INDICATES DATA IS MISSING.
+T  INDICATES TRACE AMOUNT.
+
+
+
+
+$$
+
+

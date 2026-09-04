@@ -1,0 +1,75 @@
+
+219 
+CDUS45 KBOU 041231
+CLIDEN
+
+CLIMATE REPORT 
+NATIONAL WEATHER SERVICE DENVER/BOULDER
+631 AM MDT FRI SEP 04 2026
+
+...................................
+
+...THE DENVER CO CLIMATE SUMMARY FOR SEPTEMBER 4 2026...
+VALID AS OF 0600 AM LOCAL TIME.
+
+CLIMATE NORMAL PERIOD 1991 TO 2020
+CLIMATE RECORD PERIOD 1872 TO 2026
+
+
+WEATHER ITEM   OBSERVED TIME   RECORD YEAR NORMAL DEPARTURE LAST      
+                VALUE   (LST)  VALUE       VALUE  FROM      YEAR     
+                                                  NORMAL           
+...................................................................
+TEMPERATURE (F)                                                          
+ TODAY                                                               
+  MAXIMUM         75   1205 AM  97    1960  84     -9       86       
+                                      1995                           
+  MINIMUM         62    442 AM  40    1874  54      8       55       
+                                      1961                           
+                                      1968                           
+  AVERAGE         69                        69      0       71     
+
+PRECIPITATION (IN)                                                    
+  TODAY            0.00          1.94 1909   0.04  -0.04              
+  MONTH TO DATE    T                         0.17  -0.17              
+  SINCE JAN 1      7.24                     11.32  -4.08              
+
+...................................................................
+
+
+WIND (MPH)                                                            
+  HIGHEST WIND SPEED    13   HIGHEST WIND DIRECTION    SW (240)       
+  HIGHEST GUST SPEED    15   HIGHEST GUST DIRECTION    SW (240)       
+  AVERAGE WIND SPEED     6.9                                        
+
+
+RELATIVE HUMIDITY (PERCENT)
+ HIGHEST    52           500 AM                                      
+ LOWEST     30          1200 AM                                      
+ AVERAGE    41                                                        
+
+..........................................................
+
+
+THE DENVER CO CLIMATE NORMALS FOR TOMORROW
+                         NORMAL    RECORD    YEAR                     
+ MAXIMUM TEMPERATURE (F)   84       101      2020                      
+ MINIMUM TEMPERATURE (F)   54        38      1962                      
+
+
+SUNRISE AND SUNSET                                                    
+SEPTEMBER  4 2026.....SUNRISE   629 AM MDT   SUNSET   725 PM MDT     
+SEPTEMBER  5 2026.....SUNRISE   630 AM MDT   SUNSET   723 PM MDT     
+
+
+-  INDICATES NEGATIVE NUMBERS.
+R  INDICATES RECORD WAS SET OR TIED.
+MM INDICATES DATA IS MISSING.
+T  INDICATES TRACE AMOUNT.
+
+
+
+
+$$
+
+

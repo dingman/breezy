@@ -1,0 +1,94 @@
+
+484 
+CDUS44 KOUN 040628
+CLIOKC
+
+CLIMATE REPORT 
+NATIONAL WEATHER SERVICE NORMAN OK
+128 AM CDT FRI SEP 04 2026
+
+...................................
+
+...THE OKLAHOMA CITY CLIMATE SUMMARY FOR SEPTEMBER 3 2026...
+
+CLIMATE NORMAL PERIOD 1991 TO 2020
+CLIMATE RECORD PERIOD 1890 TO 2026
+
+
+WEATHER ITEM   OBSERVED TIME   RECORD YEAR NORMAL DEPARTURE LAST      
+                VALUE   (LST)  VALUE       VALUE  FROM      YEAR     
+                                                  NORMAL           
+...................................................................
+TEMPERATURE (F)                                                          
+ YESTERDAY                                                           
+  MAXIMUM         95    438 PM 108    2000  88      7       86       
+  MINIMUM         72    622 AM  47    1974  66      6       57       
+  AVERAGE         84                        77      7       72     
+
+PRECIPITATION (IN)                                                    
+  YESTERDAY        0.00          3.16 1926   0.12  -0.12     0.00     
+  MONTH TO DATE    0.00                      0.38  -0.38     0.12     
+  SINCE SEP 1      0.00                      0.38  -0.38     0.12     
+  SINCE JAN 1     14.44                     26.26 -11.82    35.93     
+
+DEGREE DAYS                                                           
+ HEATING                                                              
+  YESTERDAY        0                         0      0        0        
+  MONTH TO DATE    0                         0      0        0        
+  SINCE SEP 1      0                         0      0        0        
+  SINCE JUL 1      0                         0      0        0        
+
+ COOLING                                                              
+  YESTERDAY       19                        12      7        7        
+  MONTH TO DATE   62                        36     26       27        
+  SINCE SEP 1     62                        36     26       27        
+  SINCE JAN 1   2225                      1591    634     1587        
+...................................................................
+
+
+WIND (MPH)                                                            
+  HIGHEST WIND SPEED    21   HIGHEST WIND DIRECTION    SE (140)       
+  HIGHEST GUST SPEED    28   HIGHEST GUST DIRECTION    SE (140)       
+  AVERAGE WIND SPEED    12.1                                        
+
+
+SKY COVER                                                             
+  AVERAGE SKY COVER 0.1                                                 
+
+
+WEATHER CONDITIONS                                                    
+THE FOLLOWING WEATHER WAS RECORDED YESTERDAY.                         
+  NO SIGNIFICANT WEATHER WAS OBSERVED.                                  
+
+
+RELATIVE HUMIDITY (PERCENT)
+ HIGHEST    84           600 AM                                      
+ LOWEST     44           500 PM                                      
+ AVERAGE    64                                                        
+
+..........................................................
+
+
+THE OKLAHOMA CITY CLIMATE NORMALS FOR TODAY
+                         NORMAL    RECORD    YEAR                     
+ MAXIMUM TEMPERATURE (F)   88       107      1998                      
+ MINIMUM TEMPERATURE (F)   65        46      1891                      
+                                             1974                     
+
+
+SUNRISE AND SUNSET                                                    
+SEPTEMBER  4 2026.....SUNRISE   705 AM CDT   SUNSET   753 PM CDT     
+SEPTEMBER  5 2026.....SUNRISE   706 AM CDT   SUNSET   752 PM CDT     
+
+
+-  INDICATES NEGATIVE NUMBERS.
+R  INDICATES RECORD WAS SET OR TIED.
+MM INDICATES DATA IS MISSING.
+T  INDICATES TRACE AMOUNT.
+
+
+
+
+$$
+
+

@@ -1,0 +1,105 @@
+
+254 
+CDUS41 KLWX 040624
+CLIDCA
+
+CLIMATE REPORT 
+NATIONAL WEATHER SERVICE BALTIMORE MD/WASHINGTON DC 
+224 AM EDT FRI SEP 04 2026
+
+...................................
+
+...THE WASHINGTON NATIONAL DC CLIMATE SUMMARY FOR SEPTEMBER 3 2026...
+
+CLIMATE NORMAL PERIOD: 1991 TO 2020
+CLIMATE RECORD PERIOD: 1871 TO 2026
+
+
+WEATHER ITEM   OBSERVED TIME   RECORD YEAR NORMAL DEPARTURE LAST      
+                VALUE   (LST)  VALUE       VALUE  FROM      YEAR     
+                                                  NORMAL           
+...................................................................
+TEMPERATURE (F)                                                          
+ YESTERDAY                                                           
+  MAXIMUM         91   3:21 PM  98    1953  85      6       83        
+  MINIMUM         71  11:39 PM  48    1892  68      3       60        
+                                      1909                           
+  AVERAGE         81                        76      5       72     
+
+PRECIPITATION (IN)                                                    
+  YESTERDAY        1.25          1.67 1974   0.13   1.12     0.00     
+  MONTH TO DATE    1.58                      0.38   1.20     0.00     
+  SINCE SEP 1      1.58                      0.38   1.20     0.00     
+  SINCE JAN 1     23.14                     28.29  -5.15    27.26     
+
+SNOWFALL (IN)                                                              
+  YESTERDAY        0.0          MM      MM   0.0    0.0      0.0      
+  MONTH TO DATE    0.0                       0.0    0.0      0.0      
+  SINCE SEP 1      0.0                       0.0    0.0      0.0      
+  SINCE JUL 1      0.0                       0.0    0.0      0.0      
+  SNOW DEPTH      MM                                                  
+
+DEGREE DAYS                                                           
+ HEATING                                                              
+  YESTERDAY        0                         0      0        0        
+  MONTH TO DATE    0                         0      0        0        
+  SINCE SEP 1      0                         0      0        0        
+  SINCE JUL 1      0                         0      0        0        
+
+ COOLING                                                              
+  YESTERDAY       16                        12      4        7        
+  MONTH TO DATE   57                        36     21       16        
+  SINCE SEP 1     57                        36     21       16        
+  SINCE JAN 1   1666                      1488    178     1481        
+...................................................................
+
+
+WIND (MPH)                                                            
+  HIGHEST WIND SPEED    43   HIGHEST WIND DIRECTION    NW (300)       
+  HIGHEST GUST SPEED    64   HIGHEST GUST DIRECTION    NW (300)       
+  AVERAGE WIND SPEED     8.5                                        
+
+
+SKY COVER                                                             
+  AVERAGE SKY COVER 0.8                                                 
+
+
+WEATHER CONDITIONS                                                    
+THE FOLLOWING WEATHER WAS RECORDED YESTERDAY.                         
+  THUNDERSTORM                                                        
+  HEAVY RAIN                                                          
+  LIGHT RAIN                                                          
+  HAZE                                                                
+
+
+RELATIVE HUMIDITY (PERCENT)
+ HIGHEST    96          11:00 PM                                      
+ LOWEST     57           2:00 PM                                      
+ AVERAGE    77                                                        
+
+..........................................................
+
+
+THE WASHINGTON NATIONAL DC CLIMATE NORMALS FOR TODAY
+                         NORMAL    RECORD    YEAR                     
+ MAXIMUM TEMPERATURE (F)   85        98      2023                      
+ MINIMUM TEMPERATURE (F)   68        49      1872                      
+                                             1908                     
+
+
+SUNRISE AND SUNSET                                                    
+SEPTEMBER  4 2026.....SUNRISE   6:40 AM EDT   SUNSET   7:34 PM EDT     
+SEPTEMBER  5 2026.....SUNRISE   6:41 AM EDT   SUNSET   7:32 PM EDT     
+
+
+-  INDICATES NEGATIVE NUMBERS.
+R  INDICATES RECORD WAS SET OR TIED.
+MM INDICATES DATA IS MISSING.
+T  INDICATES TRACE AMOUNT.
+
+
+
+
+$$
+
+

@@ -1,0 +1,101 @@
+
+548 
+CDUS46 KLOX 040840
+CLILAX
+
+CLIMATE REPORT 
+NATIONAL WEATHER SERVICE LOS ANGELES/OXNARD
+140 AM PDT FRI SEP 04 2026
+
+...................................
+
+...THE LOS ANGELES INTL AIRPORT CA CLIMATE SUMMARY FOR SEPTEMBER 3 2026...
+
+CLIMATE NORMAL PERIOD: 1991 TO 2020
+CLIMATE RECORD PERIOD: 1944 TO 2026
+
+
+WEATHER ITEM   OBSERVED TIME   RECORD YEAR NORMAL DEPARTURE LAST      
+                VALUE   (LST)  VALUE       VALUE  FROM      YEAR     
+                                                  NORMAL           
+...................................................................
+TEMPERATURE (F)                                                          
+ YESTERDAY                                                           
+  MAXIMUM         78  11:51 AM  97    2017  77      1       80        
+  MINIMUM         67   5:23 AM  57    2010  65      2       69        
+  AVERAGE         73                        71      2       75     
+
+PRECIPITATION (IN)                                                    
+  YESTERDAY        0.00          0.04 1985   0.01  -0.01     0.00     
+  MONTH TO DATE    0.00                      0.01  -0.01     0.00     
+  SINCE JUL 1      T                         0.05  -0.05      T       
+  SINCE OCT 1     13.53                     12.13   1.40     5.11     
+  SINCE JAN 1      5.49                      8.59  -3.10     5.08     
+
+SNOWFALL (IN)                                                              
+  YESTERDAY       MM                                                  
+  MONTH TO DATE    T                                                  
+  SINCE SEP 1      T                                                  
+  SINCE JUL 1      T                                                  
+
+DEGREE DAYS                                                           
+ HEATING                                                              
+  YESTERDAY        0                         0      0        0        
+  MONTH TO DATE    0                         0      0        0        
+  SINCE SEP 1      0                         0      0        0        
+  SINCE JUL 1      0                         3     -3        0        
+
+ COOLING                                                              
+  YESTERDAY        8                         6      2       10        
+  MONTH TO DATE   20                        18      2       29        
+  SINCE SEP 1     20                        18      2       29        
+  SINCE JAN 1    778                       457    321      426        
+...................................................................
+
+
+WIND (MPH)                                                            
+  HIGHEST WIND SPEED    17   HIGHEST WIND DIRECTION     W (270)       
+  HIGHEST GUST SPEED    23   HIGHEST GUST DIRECTION     S (200)       
+  AVERAGE WIND SPEED     8.0                                        
+
+
+SKY COVER                                                             
+  POSSIBLE SUNSHINE  MM                                                 
+  AVERAGE SKY COVER 0.4                                                 
+
+
+WEATHER CONDITIONS                                                    
+THE FOLLOWING WEATHER WAS RECORDED YESTERDAY.                         
+  NO SIGNIFICANT WEATHER WAS OBSERVED.                                  
+
+
+RELATIVE HUMIDITY (PERCENT)
+ HIGHEST    84           5:00 AM                                      
+ LOWEST     60           9:00 AM                                      
+ AVERAGE    72                                                        
+
+..........................................................
+
+
+THE LOS ANGELES INTL AIRPORT CA CLIMATE NORMALS FOR TODAY
+                         NORMAL    RECORD    YEAR                     
+ MAXIMUM TEMPERATURE (F)   77       106      1988                      
+ MINIMUM TEMPERATURE (F)   65        56      2010                      
+
+
+SUNRISE AND SUNSET                                                    
+SEPTEMBER  4 2026.....SUNRISE   6:29 AM PDT   SUNSET   7:15 PM PDT     
+SEPTEMBER  5 2026.....SUNRISE   6:30 AM PDT   SUNSET   7:14 PM PDT     
+
+
+-  INDICATES NEGATIVE NUMBERS.
+R  INDICATES RECORD WAS SET OR TIED.
+MM INDICATES DATA IS MISSING.
+T  INDICATES TRACE AMOUNT.
+
+
+
+
+$$
+
+

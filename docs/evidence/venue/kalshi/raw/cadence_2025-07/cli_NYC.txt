@@ -1,0 +1,104 @@
+
+007 
+CDUS41 KOKX 040625
+CLINYC
+
+CLIMATE REPORT 
+NATIONAL WEATHER SERVICE NEW YORK, NY
+225 AM EDT FRI SEP 04 2026
+
+...................................
+
+...THE CENTRAL PARK NY CLIMATE SUMMARY FOR SEPTEMBER 3 2026...
+
+CLIMATE NORMAL PERIOD 1991 TO 2020
+CLIMATE RECORD PERIOD 1869 TO 2026
+
+
+WEATHER ITEM   OBSERVED TIME   RECORD YEAR NORMAL DEPARTURE LAST      
+                VALUE   (LST)  VALUE       VALUE  FROM      YEAR     
+                                                  NORMAL           
+...................................................................
+TEMPERATURE (F)                                                          
+ YESTERDAY                                                           
+  MAXIMUM         84    458 PM  99    1929  80      4       79       
+  MINIMUM         67   1253 AM  50    1885  66      1       61       
+                                      1893                           
+  AVERAGE         76                        73      3       70     
+
+PRECIPITATION (IN)                                                    
+  YESTERDAY        0.12          3.32 1969   0.13  -0.01     0.00     
+  MONTH TO DATE    0.78                      0.41   0.37     0.00     
+  SINCE SEP 1      0.78                      0.41   0.37     0.00     
+  SINCE JAN 1     32.13                     33.28  -1.15    27.26     
+
+SNOWFALL (IN)                                                              
+  YESTERDAY        0.0           0.0  2001   0.0    0.0      0.0      
+                                      2002                           
+  MONTH TO DATE    0.0                       0.0    0.0      0.0      
+  SINCE SEP 1      0.0                       0.0    0.0      0.0      
+  SINCE JUL 1      0.0                       0.0    0.0      0.0      
+  SNOW DEPTH       0                                                 
+
+DEGREE DAYS                                                           
+ HEATING                                                              
+  YESTERDAY        0                         0      0        0        
+  MONTH TO DATE    0                         0      0        0        
+  SINCE SEP 1      0                         0      0        0        
+  SINCE JUL 1      0                         1     -1        1        
+
+ COOLING                                                              
+  YESTERDAY       11                         8      3        5        
+  MONTH TO DATE   24                        26     -2       17        
+  SINCE SEP 1     24                        26     -2       17        
+  SINCE JAN 1   1126                      1066     60     1086        
+...................................................................
+
+
+WIND (MPH)                                                            
+  HIGHEST WIND SPEED    12   HIGHEST WIND DIRECTION    SW (240)       
+  HIGHEST GUST SPEED    22   HIGHEST GUST DIRECTION    SW (230)       
+  AVERAGE WIND SPEED     4.0                                        
+
+
+SKY COVER                                                             
+  AVERAGE SKY COVER 0.4                                                 
+
+
+WEATHER CONDITIONS                                                    
+THE FOLLOWING WEATHER WAS RECORDED YESTERDAY.                         
+  LIGHT RAIN                                                          
+  FOG                                                                 
+
+
+RELATIVE HUMIDITY (PERCENT)
+ HIGHEST   100           100 AM                                      
+ LOWEST     65           500 PM                                      
+ AVERAGE    83                                                        
+
+..........................................................
+
+
+THE CENTRAL PARK NY CLIMATE NORMALS FOR TODAY
+                         NORMAL    RECORD    YEAR                     
+ MAXIMUM TEMPERATURE (F)   80        97      1929                      
+ MINIMUM TEMPERATURE (F)   66        47      1872                      
+                                             1883                     
+
+
+SUNRISE AND SUNSET                                                    
+SEPTEMBER  4 2026.....SUNRISE   626 AM EDT   SUNSET   723 PM EDT     
+SEPTEMBER  5 2026.....SUNRISE   627 AM EDT   SUNSET   722 PM EDT     
+
+
+-  INDICATES NEGATIVE NUMBERS.
+R  INDICATES RECORD WAS SET OR TIED.
+MM INDICATES DATA IS MISSING.
+T  INDICATES TRACE AMOUNT.
+
+
+
+
+$$
+
+

@@ -1,0 +1,97 @@
+
+296 
+CDUS44 KHGX 040637
+CLIHOU
+
+CLIMATE REPORT 
+NATIONAL WEATHER SERVICE HOUSTON/GALVESTON TX
+137 AM CDT FRI SEP 04 2026
+
+...................................
+
+...THE HOUSTON/HOBBY AIRPORT CLIMATE SUMMARY FOR SEPTEMBER 3 2026...
+
+CLIMATE NORMAL PERIOD: 1991 TO 2020
+CLIMATE RECORD PERIOD: 1930 TO 2026
+
+
+WEATHER ITEM   OBSERVED TIME   RECORD YEAR NORMAL DEPARTURE LAST      
+                VALUE   (LST)  VALUE       VALUE  FROM      YEAR     
+                                                  NORMAL           
+...................................................................
+TEMPERATURE (F)                                                          
+ YESTERDAY                                                           
+  MAXIMUM         93  12:48 PM 103    2000  92      1       95        
+  MINIMUM         75   2:59 PM  65    1974  75      0       76        
+  AVERAGE         84                        83      1       86     
+
+PRECIPITATION (IN)                                                    
+  YESTERDAY        2.42          3.33 1957   0.20   2.22     0.00     
+  MONTH TO DATE    2.43                      0.63   1.80     0.92     
+  SINCE SEP 1      2.43                      0.63   1.80     0.92     
+  SINCE JAN 1     33.96                     36.47  -2.51    36.34     
+
+SNOWFALL (IN)                                                              
+  YESTERDAY        0.0                                                
+  MONTH TO DATE    0.0                                                
+  SINCE SEP 1      0.0                                                
+  SINCE JUL 1      0.0                                                
+
+DEGREE DAYS                                                           
+ HEATING                                                              
+  YESTERDAY        0                         0      0        0        
+  MONTH TO DATE    0                         0      0        0        
+  SINCE SEP 1      0                         0      0        0        
+  SINCE JUL 1      0                         0      0        0        
+
+ COOLING                                                              
+  YESTERDAY       19                        18      1       21        
+  MONTH TO DATE   60                        56      4       57        
+  SINCE SEP 1     60                        56      4       57        
+  SINCE JAN 1   2987                      2551    436     2931        
+...................................................................
+
+
+WIND (MPH)                                                            
+  HIGHEST WIND SPEED    20   HIGHEST WIND DIRECTION    NE (30)        
+  HIGHEST GUST SPEED    27   HIGHEST GUST DIRECTION    NE (30)        
+  AVERAGE WIND SPEED     5.4                                        
+
+
+WEATHER CONDITIONS                                                    
+THE FOLLOWING WEATHER WAS RECORDED YESTERDAY.                         
+  THUNDERSTORM                                                        
+  HEAVY RAIN                                                          
+  LIGHT RAIN                                                          
+
+
+RELATIVE HUMIDITY (PERCENT)
+ HIGHEST    94                                                        
+ LOWEST     56                                                        
+ AVERAGE    75                                                        
+
+..........................................................
+
+
+THE HOUSTON/HOBBY AIRPORT CLIMATE NORMALS FOR TODAY
+                         NORMAL    RECORD    YEAR                     
+ MAXIMUM TEMPERATURE (F)   91       108      2000                      
+ MINIMUM TEMPERATURE (F)   75        59      1934                      
+
+
+SUNRISE AND SUNSET                                                    
+SEPTEMBER  4 2026.....SUNRISE   7:00 AM CDT   SUNSET   7:40 PM CDT     
+SEPTEMBER  5 2026.....SUNRISE   7:01 AM CDT   SUNSET   7:38 PM CDT     
+
+
+-  INDICATES NEGATIVE NUMBERS.
+R  INDICATES RECORD WAS SET OR TIED.
+MM INDICATES DATA IS MISSING.
+T  INDICATES TRACE AMOUNT.
+
+
+
+
+$$
+
+

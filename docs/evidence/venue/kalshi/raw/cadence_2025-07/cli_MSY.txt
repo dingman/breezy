@@ -1,0 +1,102 @@
+
+520 
+CDUS44 KLIX 040750
+CLIMSY
+
+CLIMATE REPORT 
+NATIONAL WEATHER SERVICE NEW ORLEANS
+250 AM CDT FRI SEP 04 2026
+
+...................................
+
+...THE NEW ORLEANS CLIMATE SUMMARY FOR SEPTEMBER 3 2026...
+
+CLIMATE NORMAL PERIOD: 1991 TO 2020
+CLIMATE RECORD PERIOD: 1946 TO 2026
+
+
+WEATHER ITEM   OBSERVED TIME   RECORD YEAR NORMAL DEPARTURE LAST      
+                VALUE   (LST)  VALUE       VALUE  FROM      YEAR     
+                                                  NORMAL           
+...................................................................
+TEMPERATURE (F)                                                          
+ YESTERDAY                                                           
+  MAXIMUM         90   1:03 PM  97    1947  90      0       92        
+  MINIMUM         77   6:06 AM  67    1954  76      1       71        
+                                      1987                           
+  AVERAGE         84                        83      1       82     
+
+PRECIPITATION (IN)                                                    
+  YESTERDAY        0.00          6.25 2011   0.22  -0.22     0.00     
+  MONTH TO DATE    0.26                      0.66  -0.40     0.00     
+  SINCE SEP 1      0.26                      0.66  -0.40     0.00     
+  SINCE JAN 1     44.55                     46.51  -1.96    48.92     
+
+SNOWFALL (IN)                                                              
+  YESTERDAY        0.0                                                
+  MONTH TO DATE    0.0                                                
+  SINCE SEP 1      0.0                                                
+  SINCE JUL 1      0.0                                                
+  SNOW DEPTH      MM                                                  
+
+DEGREE DAYS                                                           
+ HEATING                                                              
+  YESTERDAY        0                         0      0        0        
+  MONTH TO DATE    0                         0      0        0        
+  SINCE SEP 1      0                         0      0        0        
+  SINCE JUL 1      0                         0      0        0        
+
+ COOLING                                                              
+  YESTERDAY       19                        18      1       17        
+  MONTH TO DATE   59                        54      5       52        
+  SINCE SEP 1     59                        54      5       52        
+  SINCE JAN 1   2705                      2437    268     2807        
+...................................................................
+
+
+WIND (MPH)                                                            
+  HIGHEST WIND SPEED    13   HIGHEST WIND DIRECTION    NE (30)        
+  HIGHEST GUST SPEED    18   HIGHEST GUST DIRECTION    NE (50)        
+  AVERAGE WIND SPEED     4.1                                        
+
+
+SKY COVER                                                             
+  POSSIBLE SUNSHINE  MM                                                 
+  AVERAGE SKY COVER 0.5                                                 
+
+
+WEATHER CONDITIONS                                                    
+THE FOLLOWING WEATHER WAS RECORDED YESTERDAY.                         
+  THUNDERSTORM                                                        
+
+
+RELATIVE HUMIDITY (PERCENT)
+ HIGHEST    96           3:00 AM                                      
+ LOWEST     62          12:00 PM                                      
+ AVERAGE    79                                                        
+
+..........................................................
+
+
+THE NEW ORLEANS CLIMATE NORMALS FOR TODAY
+                         NORMAL    RECORD    YEAR                     
+ MAXIMUM TEMPERATURE (F)   90        99      2000                      
+ MINIMUM TEMPERATURE (F)   76        62      1952                      
+
+
+SUNRISE AND SUNSET                                                    
+SEPTEMBER  4 2026.....SUNRISE   6:40 AM CDT   SUNSET   7:20 PM CDT     
+SEPTEMBER  5 2026.....SUNRISE   6:40 AM CDT   SUNSET   7:18 PM CDT     
+
+
+-  INDICATES NEGATIVE NUMBERS.
+R  INDICATES RECORD WAS SET OR TIED.
+MM INDICATES DATA IS MISSING.
+T  INDICATES TRACE AMOUNT.
+
+
+
+
+$$
+
+

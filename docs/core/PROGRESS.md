@@ -40,48 +40,16 @@ Two consequences that are not optional (tracked by P4):
   settlement / execution build (~$3–15/day net per 100 contracts per city-day).
   Free falsification and tape capture stay in scope.
   `docs/evidence/roi_feasibility_2026-08-26.md`.
-- **G-01 — Prelim→final revision: POWERED, FAIL** (superseded the N=44 run).
-  AFOS archive N≈1820/site, same pre-registered rule: LAX/MIA PASS; **MDW 13.96%,
-  NYC 11.79%, SFO 4.50% FAIL** Wilson-upper≤0.05. **Interior-bucket strategies
-  are dead on MDW/NYC/SFO** (they need exact equality). Open tails unaffected:
-  97% of revisions UPWARD, downward rate 0.21%.
-  `docs/evidence/observation_lock_falsification_2026-08-31.md`.
+- **G-01 — Prelim→final revision: POWERED, FAIL** on MDW/NYC/SFO (Wilson-upper≤0.05); interior-bucket strategies dead there; open tails unaffected. `docs/evidence/observation_lock_falsification_2026-08-31.md`.
 - **Lock strategies are DEAD on this venue — see LESSONS L-9.** Three families,
   three refutations, one mechanism: the near-certain rung is never offered. The
   ladder is liquid; only the winning rung is unoffered. Do not design a fourth.
-- **Historical forecasts exist but are NON-CONTIGUOUS.**
-  `previous-runs-api.open-meteo.com/v1/forecast` yields **2022-01..2023-12 plus
-  the present, hole between** (2024-01-01 = 0/168, every model); below 2022 was
-  never probed. `docs/evidence/open_meteo_previous_runs_probe_2026-08-31T005848Z/`.
-  IEM AFOS forecast PIL is reachable but FAILS its pre-registered bar (parse rate
-  0.5125 vs >=0.9; attribution 238/240). **A forecast archive yields a
-  CALIBRATION dataset, not a backtest** — a backtest also needs prices, and those
-  are forward-only (next line).
-- **Candidate #2 (CLI-basis boundary tail): edge REAL but THIN; NOT a GO.**
-  Corrected `P(win|setup, h>=17)` = **12.3%** pooled (n=101,590, Wilson lower
-  0.1213) -- ~1.9x the 0.06285 break-even; MDW weakest ~1.5x. An earlier 53%
-  was inflated 4.4x by pre-peak hours (L-13 corollary) and is retracted. NYC
-  DISCARDED (cadence artifact). **The one resolved live event LOST** (LAX
-  2026-08-31, offered $0.01, settled 79 vs strike 80). **Adverse selection is
-  unsettled and the archive cannot settle it**: separating a true 5% from 12%
-  needs ~245 resolved offered trades, plausibly 1.5+ yr. Offer-gate scan runs
-  nightly 22:45Z and accumulates unattended; sizing is capped at 250 contracts
-  (`RiskLimits`), i.e. $2.50-$12.50/trade -- economics are thin by construction.
-  `docs/evidence/cli_basis_setup_win_rate_corrected_2026-09-02T061722Z.md`.
+- **Historical forecasts: NON-CONTIGUOUS (2022-01..2023-12 + present); a forecast archive is a CALIBRATION set, not a backtest** — prices are forward-only. `docs/evidence/open_meteo_previous_runs_probe_2026-08-31T005848Z/`.
+- **Candidate #2 (CLI-basis boundary tail): edge REAL but THIN, NOT a GO** — corrected P(win|setup,h>=17)=12.3% (~1.9x BE); adverse selection unsettled (~245 resolved offered trades needed); offer-gate scan accumulates nightly 22:45Z. `docs/evidence/cli_basis_setup_win_rate_corrected_2026-09-02T061722Z.md`.
 - **Price history genuinely is forward-only.** No public trade tape; expired
   markets return null prices keeping only `settlementPx`.
-- **There is no NO-side instrument, and there cannot be one** (BL-6). NO is a
-  side of the SAME book; `parsing.py:_market_sides` refuses any side whose
-  `identifier != slug`. **P5 rescoped** to "support `outcomeSide` / price
-  inversion on the same instrument".
-  `docs/evidence/no_side_instrument_probe_2026-08-31.md`.
-- **The stale-quote gate is wired but unreachable for two of three strategies.**
-  `evaluate_order` refuses `shorts_disabled` before calling `quote_tradable`
-  (`risk.py:296-306`), and two strategies emit only shorts. BL-1's fix is proven
-  by unit test, NOT by backtest. Live only once shorts are expressible.
-- **The `naive`/`realistic` conditions are NOT redundant** (BL-4).
-  `forecast_revision` naive refuses nothing; realistic refuses 860
-  `shorts_disabled`. Both stay.
+- **No NO-side instrument exists (BL-6)** — NO is a side of the SAME book; P5 rescoped to `outcomeSide`/price inversion. `docs/evidence/no_side_instrument_probe_2026-08-31.md`.
+- **Stale-quote gate wired but unreachable for short-only strategies (BL-1, proven by unit test only); `naive`/`realistic` conditions are NOT redundant (BL-4).**
 
 ---
 
@@ -95,6 +63,14 @@ an **L-1 null-hypothesis verdict** citing installed source under
 `.venv/lib/python3.13/site-packages/nautilus_trader/` first.
 
 ---
+
+### Clock-speed track (opened 2026-09-04) — answer to "why can't we speed this up"
+Time-to-verdict = independent station-days × take rate; the same city on two venues is ONE settlement event. Levers, all peer-reviewed:
+- **[HIGH] Kalshi sibling family on NEW stations** — Kalshi lists 24 US daily-high cities (PM lists 5); 18/19 candidates pass 5-min TEMPERATURE cadence on both feeds; KDEN HELD (live 5-min absent 09-03), KHOU archive hole. Plan `docs/plans/KALSHI_CRH_EXPANSION_PLAN_2026-09-04.md` Rev 2 + convergence addendum (S2/S9 await the strategy-lead ruling; S4 blocked on Kalshi's settlement clock = S0). Evidence `docs/evidence/venue/kalshi/`, `docs/evidence/kalshi_station_*_2026-09-04.md`. Operator-only on the critical path: Kalshi account/KYC/funding/API key (S11).
+- **[MED] PREREG v2 group-sequential** (Lan-DeMets OBF on Wilson, α=0.025, looks every 10 fills, n_max 160 pending ruling) — `docs/specs/PREREG_v2_current_rung_hold_DRAFT_2026-09-04.md`; cost-free only if registered before the first PM fill; ~24% fewer fills under a real edge, none under a leak. Boundaries come from a generator script, never authored.
+- **[MED] Capture uptime** — recorder `MemoryHigh=2G/MemoryMax=3G` (loaded, binds at 09:00Z rotation), cache caps, SIGKILL-truncated instance salvage wired (review pending, uncommitted).
+- **[MED] Corpus parser defect** — `settlement_alignment_study.parse_metar_t_group` drops 4-digit T-groups (KBOS 7→59 rows/day); fix lands only in the rev2 pinned table, v1 untouched.
+- Rejected by ruling: SPRT α=0.05, shadow/paper/archive/Kalshi rows in live n, retroactive scoring, qty>1, NYC, pooling venues.
 
 ## Carried forward — open, not selected for this batch
 
