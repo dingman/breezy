@@ -63,6 +63,7 @@ RefusalReason = Literal[
     "rung_unresolved",
     "station_day_mismatch",
     "instrument_unavailable",
+    "malformed_input",
 ]
 
 
@@ -177,38 +178,10 @@ def score_trial(
             ),
         )
 
-    final = final_tmax_f(record)
-    settlement_basis: SettlementBasis
-    excluded_reason: str | None
-    settlement_tmax_f: int
-    revision_seq: int
-    raw_sha256: str
-
-    if final is not None:
-        assert record is not None
-        settlement_basis = "nws_final"
-        excluded_reason = None
-        settlement_tmax_f = final
-        revision_seq = record.revision_seq
-        raw_sha256 = record.raw_sha256
-    else:
-        fallback_due = now_ns >= trial.scheduled_release_at_ns + _SEVEN_DAYS_NS
-        if fallback_due and trial.venue_settlement_tmax_f is not None:
-            settlement_basis = "venue_last_fair_price_fallback"
-            excluded_reason = "venue_settled_without_nws"
-            settlement_tmax_f = trial.venue_settlement_tmax_f
-            revision_seq = 0
-            raw_sha256 = ""
-        else:
-            return ScoreRefusal(
-                trial_id=trial.trial_id,
-                reason=_pending_reason(record),
-                detail=(
-                    f"{trial.station} {trial.climate_day}: not settlement-grade "
-                    "and the venue fallback window has not both elapsed and produced a "
-                    "venue settlement reading"
-                ),
-            )
+    basis_result = _resolve_settlement_basis(trial, record, now_ns=now_ns)
+    if isinstance(basis_result, ScoreRefusal):
+        return basis_result
+    settlement_basis, excluded_reason, settlement_tmax_f, revision_seq, raw_sha256 = basis_result
 
     held = trial.bucket.contains(settlement_tmax_f)
     pnl = (Decimal(1) if held else Decimal(0)) - trial.fill_px - trial.fee
@@ -232,6 +205,40 @@ def score_trial(
         entry_ask=trial.entry_ask,
         fill_px=trial.fill_px,
         fee=trial.fee,
+    )
+
+
+def _resolve_settlement_basis(
+    trial: FilledTrial, record: NwsClimateDay | None, *, now_ns: int
+) -> tuple[SettlementBasis, str | None, int, int, str] | ScoreRefusal:
+    """Resolve `(basis, excluded_reason, settlement_tmax_f, revision_seq,
+    raw_sha256)` for one trial, or the refusal if neither an NWS final nor an
+    elapsed venue fallback is available yet. Extracted from `score_trial` so
+    that function stays a short dispatcher (review item 6); behaviour is
+    unchanged from the inlined form."""
+    final = final_tmax_f(record)
+    if final is not None:
+        assert record is not None
+        return "nws_final", None, final, record.revision_seq, record.raw_sha256
+
+    fallback_due = now_ns >= trial.scheduled_release_at_ns + _SEVEN_DAYS_NS
+    if fallback_due and trial.venue_settlement_tmax_f is not None:
+        return (
+            "venue_last_fair_price_fallback",
+            "venue_settled_without_nws",
+            trial.venue_settlement_tmax_f,
+            0,
+            "",
+        )
+
+    return ScoreRefusal(
+        trial_id=trial.trial_id,
+        reason=_pending_reason(record),
+        detail=(
+            f"{trial.station} {trial.climate_day}: not settlement-grade "
+            "and the venue fallback window has not both elapsed and produced a "
+            "venue settlement reading"
+        ),
     )
 
 

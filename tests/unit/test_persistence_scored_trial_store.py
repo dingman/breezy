@@ -3,8 +3,11 @@
 from __future__ import annotations
 
 import datetime as dt
+import os
 from decimal import Decimal
 from pathlib import Path
+
+import pytest
 
 from breezy.persistence.scored_trial_store import (
     SCORED_TRIAL_SCHEMA,
@@ -92,6 +95,21 @@ def test_the_schema_is_pinned_column_for_column() -> None:
         "fill_px",
         "fee",
     ]
+
+
+def test_a_failed_atomic_replace_leaves_no_target_and_no_tmp_file(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def _raise_replace(*_args: object, **_kwargs: object) -> None:
+        raise OSError("simulated os.replace failure")
+
+    monkeypatch.setattr(os, "replace", _raise_replace)
+
+    with pytest.raises(OSError, match="simulated os.replace failure"):
+        write_scored_trials(tmp_path, [_scored()], now_ns=_BASE_NS)
+
+    assert list(tmp_path.glob("scored_trials_*.parquet")) == []
+    assert list(tmp_path.glob(".scored_trials_*.tmp")) == []
 
 
 def test_a_re_scored_trial_dedupes_to_the_highest_score_seq(tmp_path: Path) -> None:
