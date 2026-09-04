@@ -90,6 +90,12 @@ _QUOTE_TAPE_DISK_CHECK_INTERVAL_VAR = (
 #: There is no default because there is no correct value to invent.
 TRADE_TRADER_ID_VAR = "BREEZY_TRADE_TRADER_ID"
 
+#: BL-24 Seam B section 6: registers the per-station NWS observation Actors
+#: on the TRADING node. OFF unless set to exactly ``"1"`` -- absent or any
+#: other value registers nothing. Parsed in the `_parse_check_proxy_env`
+#: idiom. The ingest node and the tape recorder never read it.
+LIVE_OBSERVATIONS_VAR = "BREEZY_LIVE_OBSERVATIONS"
+
 _DEFAULT_TRADER_ID = "BREEZY-001"
 
 #: G-19 item B11 asked for this to be derived from the NWS CLI issuance
@@ -264,6 +270,10 @@ def _parse_log_level(env: Mapping[str, str]) -> str:
 
 def _parse_check_proxy_env(env: Mapping[str, str]) -> bool:
     return env.get(_ALLOW_PROXY_ENV_VAR) != "1"
+
+
+def _parse_live_observations(env: Mapping[str, str]) -> bool:
+    return env.get(LIVE_OBSERVATIONS_VAR) == "1"
 
 
 def proxy_env_check_enabled(env: Mapping[str, str] | None = None) -> bool:
@@ -667,6 +677,9 @@ class BreezyTradeSettings:
 
     trader_id: str
     log_level: str
+    #: BL-24 Seam B: whether the NWS observation Actors are registered on
+    #: this node. Default OFF; see :data:`LIVE_OBSERVATIONS_VAR`.
+    live_observations: bool = False
 
 
 def load_trade_settings(env: Mapping[str, str] | None = None) -> BreezyTradeSettings:
@@ -692,4 +705,5 @@ def load_trade_settings(env: Mapping[str, str] | None = None) -> BreezyTradeSett
     return BreezyTradeSettings(
         trader_id=raw.strip(),
         log_level=_parse_log_level(active_env),
+        live_observations=_parse_live_observations(active_env),
     )

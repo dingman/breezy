@@ -1644,6 +1644,13 @@ BANNED_EXEC_TRANSPORT_MODULES = frozenset(
         "breezy.adapters.polymarket_us.http",
         "breezy.adapters.polymarket_us.websocket",
         "breezy.ingest.http",
+        # BL-24 Seam B (S1): the NWS observation parser, the transport that
+        # owns the socket, and the Actor that drives it. Widened, never
+        # relaxed (L-12).
+        "breezy.ingest.nws_observation_actor",
+        "breezy.ingest.nws_observation_config",
+        "breezy.ingest.nws_observation_transport",
+        "breezy.ingest.nws_observations",
         "breezy.ingest.probe_transport",
         "breezy.runtime.health",
     }
@@ -1656,6 +1663,9 @@ BANNED_EXEC_TRANSPORT_NAMES = frozenset(
     {
         "MarketsFeed",
         "NautilusHttpTransport",
+        # BL-24 Seam B (S1) -- widened, never relaxed (L-12).
+        "NwsObservationActor",
+        "NwsObservationTransport",
         "PolymarketUSDataClient",
         "PolymarketUSHttpClient",
         "PolymarketUSMarketsWebSocketPool",

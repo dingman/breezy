@@ -12,12 +12,17 @@ first at the alert sink.
 from __future__ import annotations
 
 from breezy.runtime.health import AlertPayload, AlertState
+from breezy.strategy.weather_common import risk as risk_module
 from breezy.strategy.weather_common.refusals import (
+    OBSERVATION_AMBIGUOUS,
+    OBSERVATION_UNAVAILABLE,
     SHORTS_DISABLED,
     SHORTS_DISABLED_EVENT,
     RefusalAlerter,
     RefusalCounter,
+    observation_refusal,
 )
+from breezy.strategy.weather_common.running_extreme import RunningMax
 
 SITE = "strategy/CalibrationMeanReversion-000"
 
@@ -179,3 +184,103 @@ def test_zero_refusals_of_any_kind_does_not_alert() -> None:
 
     assert alerter.report(now_ns=1_000) == 0
     assert sink.payloads == []
+
+
+# ---------------------------------------------------------------------------
+# BL-24 Seam B section 5 / amendment A4: the decision-layer observation refusal
+# ---------------------------------------------------------------------------
+
+#: Closed rung bounds exactly as `WeatherBucketFacts.lower_f`/`upper_f` expose
+#: them (post Seam A-2 fix): 2 F wide, an open tail either end.
+_RUNGS: tuple[tuple[int | None, int | None], ...] = (
+    (None, 79),
+    (80, 81),
+    (82, 83),
+    (84, 85),
+    (86, None),
+)
+_BOUND_NS = 2_700 * 1_000_000_000
+
+
+def _running_max(lower_f: int, upper_f: int, exact_f: int | None = None) -> RunningMax:
+    return RunningMax(
+        lower_f=lower_f,
+        upper_f=upper_f,
+        exact_f=exact_f,
+        source_observed_at_ns=1_000,
+        source_received_at_ns=2_000,
+    )
+
+
+def test_a_missing_running_max_refuses_observation_unavailable() -> None:
+    assert (
+        observation_refusal(
+            None, staleness_ns=10, staleness_bound_ns=_BOUND_NS, rung_bounds=_RUNGS
+        )
+        == OBSERVATION_UNAVAILABLE
+    )
+
+
+def test_a_staleness_over_the_bound_refuses_observation_unavailable() -> None:
+    running_max = _running_max(82, 83)
+    assert (
+        observation_refusal(
+            running_max,
+            staleness_ns=_BOUND_NS + 1,
+            staleness_bound_ns=_BOUND_NS,
+            rung_bounds=_RUNGS,
+        )
+        == OBSERVATION_UNAVAILABLE
+    )
+    # An unknown staleness (empty accumulator) is refused the same way.
+    assert (
+        observation_refusal(
+            running_max, staleness_ns=None, staleness_bound_ns=_BOUND_NS, rung_bounds=_RUNGS
+        )
+        == OBSERVATION_UNAVAILABLE
+    )
+    # Exactly AT the bound is still fresh.
+    assert (
+        observation_refusal(
+            running_max, staleness_ns=_BOUND_NS, staleness_bound_ns=_BOUND_NS, rung_bounds=_RUNGS
+        )
+        is None
+    )
+
+
+def test_an_interval_spanning_two_real_rungs_refuses_observation_ambiguous() -> None:
+    # [83, 84] straddles (82, 83) and (84, 85): the rung cannot be resolved.
+    assert (
+        observation_refusal(
+            _running_max(83, 84), staleness_ns=0, staleness_bound_ns=_BOUND_NS, rung_bounds=_RUNGS
+        )
+        == OBSERVATION_AMBIGUOUS
+    )
+    # [82, 83] sits inside one rung: no refusal.
+    assert (
+        observation_refusal(
+            _running_max(82, 83), staleness_ns=0, staleness_bound_ns=_BOUND_NS, rung_bounds=_RUNGS
+        )
+        is None
+    )
+
+
+def test_unavailable_takes_precedence_over_ambiguous() -> None:
+    assert (
+        observation_refusal(
+            _running_max(83, 84),
+            staleness_ns=_BOUND_NS + 1,
+            staleness_bound_ns=_BOUND_NS,
+            rung_bounds=_RUNGS,
+        )
+        == OBSERVATION_UNAVAILABLE
+    )
+
+
+def test_observation_ambiguous_is_within_the_counted_set() -> None:
+    """Converged item 3: Seam B adds NO reason literal; `refusals.py` is the one
+    source of the two strings and `risk.py`'s counted set carries them."""
+    assert OBSERVATION_AMBIGUOUS in risk_module.COUNTED_REFUSAL_REASONS
+    assert OBSERVATION_UNAVAILABLE in risk_module.COUNTED_REFUSAL_REASONS
+    assert OBSERVATION_AMBIGUOUS == "observation_ambiguous"
+    assert OBSERVATION_UNAVAILABLE == "observation_unavailable"

@@ -176,6 +176,10 @@ def test_no_real_captured_product_gains_a_false_positive() -> None:
     must remain free of correction evidence.
     """
     for directory in sorted(FIXTURES_DIR.iterdir()):
+        if not directory.is_dir():
+            # `tests/fixtures/nws/` also holds recorded observation JSON
+            # (BL-24 Seam B); only product directories are CLI captures.
+            continue
         text = (directory / "product.txt").read_text()
         expected = directory.name == "nyc_correction_synthetic_2026-08-21"
 

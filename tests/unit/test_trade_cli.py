@@ -51,7 +51,7 @@ from breezy.adapters.polymarket_us.factories import (
 from breezy.adapters.polymarket_us.safety import MAX_ORDER_NOTIONAL_USD_ENV_VAR
 from breezy.runtime import trade_cli
 from breezy.runtime.backtest_order_guard import ORDER_EVENT_TOPIC, NakedShortRefusedError
-from breezy.runtime.settings import TRADE_TRADER_ID_VAR
+from breezy.runtime.settings import LIVE_OBSERVATIONS_VAR, TRADE_TRADER_ID_VAR
 from breezy.runtime.trade_cli import (
     EXIT_CONFIG_ERROR,
     EXIT_OK,
@@ -186,6 +186,18 @@ class _FakeAccountlessKernel(_FakeKernel):
     cache_type: ClassVar[type[_FakeGuardCache]] = _FakeAccountlessGuardCache
 
 
+class _RecordingTrader:
+    """Stands in for ``Trader``; records the Actors registered natively on it."""
+
+    def __init__(self, calls: list[str]) -> None:
+        self.actors: list[Any] = []
+        self._calls = calls
+
+    def add_actor(self, actor: Any) -> None:
+        self.actors.append(actor)
+        self._calls.append("add_actor")
+
+
 class RecordingNode:
     """Stands in for ``TradingNode``; records the wiring calls made on it."""
 
@@ -197,6 +209,7 @@ class RecordingNode:
         self.exec_client_factories: list[tuple[str, type]] = []
         self.calls: list[str] = []
         self.kernel = _FakeKernel()
+        self.trader = _RecordingTrader(self.calls)
         RecordingNode.instances.append(self)
 
     def add_data_client_factory(self, name: str, factory: type) -> None:
@@ -747,3 +760,65 @@ def test_no_operator_reserved_control_appears_anywhere_in_the_entrypoint() -> No
 
     # The only numeric constants in this module are the three exit codes.
     assert literals <= {0, 1, 2}, literals
+
+
+# ---------------------------------------------------------------------------
+# BL-24 Seam B section 6: live observation Actors, flag OFF by default
+# ---------------------------------------------------------------------------
+
+
+def test_the_observation_actor_is_absent_unless_the_flag_is_set() -> None:
+    from breezy.ingest.nws_observation_actor import NwsObservationActor
+
+    run(env=TRADE_ENV, node_factory=RecordingNode, stderr=io.StringIO())
+    assert RecordingNode.instances[0].trader.actors == []
+    assert "add_actor" not in RecordingNode.instances[0].calls
+
+    RecordingNode.instances.clear()
+    run(
+        env={**TRADE_ENV, LIVE_OBSERVATIONS_VAR: "1"},
+        node_factory=RecordingNode,
+        stderr=io.StringIO(),
+    )
+    node = RecordingNode.instances[0]
+    actors = node.trader.actors
+    assert actors, "the flag registered no Actor"
+    assert all(isinstance(actor, NwsObservationActor) for actor in actors)
+    # Registered natively, BEFORE build (composition.py:462-484's shape).
+    assert node.calls.index("add_actor") < node.calls.index("build")
+    stations = {actor.station_icao for actor in actors}
+    assert stations == {"KLAX", "KMDW", "KMIA", "KSFO"}  # KNYC excluded (A14, item 8)
+    assert len({str(actor.id) for actor in actors}) == len(actors)
+
+
+def test_a_flag_value_other_than_one_registers_nothing() -> None:
+    run(
+        env={**TRADE_ENV, LIVE_OBSERVATIONS_VAR: "true"},
+        node_factory=RecordingNode,
+        stderr=io.StringIO(),
+    )
+    assert RecordingNode.instances[0].trader.actors == []
+
+
+def test_the_trade_node_config_still_declares_no_actors() -> None:
+    """`build_trade_node_config` keeps `actors=[]` (node_config.py:696) even with the flag."""
+    run(
+        env={**TRADE_ENV, LIVE_OBSERVATIONS_VAR: "1"},
+        node_factory=RecordingNode,
+        stderr=io.StringIO(),
+    )
+    node = RecordingNode.instances[0]
+    assert node.config.actors == []
+    assert node.config.strategies == []
+    assert node.config.exec_algorithms == []
+
+
+def test_the_tape_recorder_and_the_ingest_node_are_untouched() -> None:
+    """Only the trading entrypoint gains the observation Actors; the other two roles do not."""
+    from breezy.runtime import composition, quote_tape_cli, quote_tape_ingest_cli
+
+    for module in (composition, quote_tape_cli, quote_tape_ingest_cli):
+        source = Path(str(module.__file__)).read_text(encoding="utf-8")
+        assert "NwsObservationActor" not in source, module.__name__
+        assert "live_observations" not in source, module.__name__
+        assert "observation_composition" not in source, module.__name__

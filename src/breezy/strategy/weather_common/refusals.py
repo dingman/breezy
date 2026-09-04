@@ -50,6 +50,7 @@ market noise).
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from dataclasses import dataclass, field
 from typing import Final
 
@@ -60,13 +61,49 @@ from breezy.runtime.health import (
     AlertState,
     resolve_alert_sink,
 )
+from breezy.strategy.weather_common.running_extreme import RunningMax
 
 __all__ = [
+    "OBSERVATION_AMBIGUOUS",
+    "OBSERVATION_UNAVAILABLE",
     "SHORTS_DISABLED",
     "SHORTS_DISABLED_EVENT",
     "RefusalAlerter",
     "RefusalCounter",
+    "observation_refusal",
 ]
+
+#: BL-24 amendment A4 / Seam B section 5: the decision-layer observation
+#: refusals. THE one source of these two strings -- `risk.py`'s counted set
+#: and `current_rung_hold/decision.py` import them from here, never a second
+#: definition (converged review item 3).
+OBSERVATION_UNAVAILABLE: Final[str] = "observation_unavailable"
+OBSERVATION_AMBIGUOUS: Final[str] = "observation_ambiguous"
+
+
+def observation_refusal(
+    running_max: RunningMax | None,
+    *,
+    staleness_ns: int | None,
+    staleness_bound_ns: int,
+    rung_bounds: Sequence[tuple[int | None, int | None]],
+) -> str | None:
+    """The SMALLEST decision-layer observation check a strategy calls.
+
+    Returns `OBSERVATION_UNAVAILABLE` when there is no running max, or the
+    staleness is unknown or over the bound; `OBSERVATION_AMBIGUOUS` when the
+    `[lower_f, upper_f]` interval cannot be resolved to ONE rung
+    (`RunningMax.spans`, closed bounds exactly as `WeatherBucketFacts`
+    exposes them -- NOT `is_ambiguous`, which assumes a width-aligned ladder
+    the venue does not have); else `None`. Unavailable is checked first: a
+    stale interval's rung is moot. Pure, no Nautilus import; the strategy
+    counts the returned reason through its `RefusalCounter`.
+    """
+    if running_max is None or staleness_ns is None or staleness_ns > staleness_bound_ns:
+        return OBSERVATION_UNAVAILABLE
+    if running_max.spans(rung_bounds):
+        return OBSERVATION_AMBIGUOUS
+    return None
 
 #: The refusal reason, and simultaneously the ``RiskDecision.reason`` string
 #: the risk manager returns. One spelling, shared by the guard, the decision

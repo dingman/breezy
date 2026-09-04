@@ -358,6 +358,16 @@ class SiteRegistry:
         """
         return frozenset(site.iem_asos_id for site in self._settlement_sites.values())
 
+    def known_icaos(self) -> frozenset[str]:
+        """The closed set of registered `icao` values, across every site.
+
+        Same shape and same reason as `known_iem_asos_ids`: the NWS
+        observation transport validates its `{icao}` path segment against
+        this set, because a shape regex cannot separate KMDW from KORD and
+        a neighbouring station is never a substitute (BL-24 Seam B).
+        """
+        return frozenset(site.icao for site in self._settlement_sites.values())
+
     def settlement_site(self, venue: str, city: str) -> SettlementSite:
         """Return the settlement identity for `(venue, city)`.
 

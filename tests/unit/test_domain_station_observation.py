@@ -79,6 +79,21 @@ def test_iem_asos_metar_requires_a_positive_publication_lag() -> None:
         make_observation(source_channel="iem_asos_metar", assumed_publication_lag_ns=-1)
 
 
+def test_nws_api_observations_requires_a_positive_publication_lag() -> None:
+    """BL-24 Seam B section 1: the guard is WIDENED to the NWS channel, never relaxed."""
+    with pytest.raises(ValueError, match="assumed_publication_lag_ns"):
+        make_observation(source_channel="nws_api_observations", assumed_publication_lag_ns=0)
+    with pytest.raises(ValueError, match="assumed_publication_lag_ns"):
+        make_observation(source_channel="iem_asos_metar", assumed_publication_lag_ns=0)
+    record = make_observation(
+        source_channel="nws_api_observations",
+        is_metar=False,
+        precision_c_tenths=10,
+        assumed_publication_lag_ns=1,
+    )
+    assert record.source_channel == "nws_api_observations"
+
+
 def test_assumed_publication_lag_is_never_subtracted_from_observed_at() -> None:
     """Amendment A6: declared provenance only -- never folded into the instant."""
     record = make_observation(assumed_publication_lag_ns=999_000_000_000)

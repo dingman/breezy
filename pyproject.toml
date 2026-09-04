@@ -203,7 +203,7 @@ disallow_subclassing_any = false
 # module deliberately: a package-wide waiver would silently cover future ingest code
 # that has no such excuse.
 [[tool.mypy.overrides]]
-module = ["breezy.ingest.nws_actor"]
+module = ["breezy.ingest.nws_actor", "breezy.ingest.nws_observation_actor"]
 disallow_subclassing_any = false
 
 # `Strategy` and `StrategyConfig` are compiled Cython classes that erase to Any,

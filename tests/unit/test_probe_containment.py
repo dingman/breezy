@@ -307,6 +307,11 @@ def test_probe_transport_public_surface_is_get_only() -> None:
         # `test_the_settlement_fetch_methods_are_unreachable_from_a_probe`.
         "fetch_discovery_list",
         "fetch_product",
+        # NOT inherited (the settlement transport never defines it): a
+        # same-name defensive stub, CLOSED -- see
+        # `test_the_observation_method_is_unreachable_from_a_probe`.
+        # BL-24 Seam B, widened 4 -> 5 (L-12).
+        "fetch_station_observations",
     }
 
 
@@ -328,6 +333,23 @@ async def test_the_settlement_fetch_methods_are_unreachable_from_a_probe() -> No
         await transport.fetch_discovery_list("NYC")
     with pytest.raises(NotImplementedError):
         await transport.fetch_product("00000000-0000-0000-0000-000000000000")
+    with pytest.raises(NotImplementedError):
+        await transport.fetch_station_observations("KMDW", limit=1)
+
+
+@pytest.mark.asyncio
+async def test_the_observation_method_is_unreachable_from_a_probe() -> None:
+    """BL-24 Seam B: the NWS observation endpoint is closed on a probe (L-22).
+
+    `HttpTransport` never defines `fetch_station_observations` -- only
+    `NwsObservationTransport` does -- so this stub is a defensive same-name
+    method, not an override. It exists so the closure stays VISIBLE in the
+    public-surface equality set above.
+    """
+    transport = _transport()
+    with pytest.raises(NotImplementedError):
+        await transport.fetch_station_observations("KMDW", limit=500)
+    assert not hasattr(HttpTransport, "fetch_station_observations")
 
 
 # ==========================================================================

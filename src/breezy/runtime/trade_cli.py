@@ -69,9 +69,10 @@ from __future__ import annotations
 
 import logging
 import sys
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Mapping, Sequence
 from typing import Any, Protocol, TextIO
 
+from nautilus_trader.common.actor import Actor
 from nautilus_trader.config import TradingNodeConfig
 from nautilus_trader.live.node import TradingNode
 from nautilus_trader.model.identifiers import ClientId
@@ -98,7 +99,12 @@ from breezy.runtime.component_health_watch import install_component_degraded_ale
 from breezy.runtime.logging_bridge import install as install_logging_bridge
 from breezy.runtime.logging_bridge import uninstall as uninstall_logging_bridge
 from breezy.runtime.node_config import NodeConfigError, build_trade_node_config
-from breezy.runtime.settings import SettingsError, load_trade_settings
+from breezy.runtime.observation_composition import build_live_observation_actors
+from breezy.runtime.settings import (
+    SettingsError,
+    load_trade_settings,
+    proxy_env_check_enabled,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -137,6 +143,15 @@ class Node(Protocol):
     """
 
     kernel: Any
+
+    @property
+    def trader(self) -> Any:
+        """BL-24 Seam B: ``trader.add_actor`` registers the observation Actors
+        natively before ``build()``. A property because ``TradingNode.trader``
+        is one (``live/node.py:139``); untyped for the same reason as
+        ``kernel`` -- ``Trader`` (``trading/trader.py``) ships no stub this
+        Protocol could conform to."""
+        ...
 
     def add_data_client_factory(self, name: str, factory: type) -> None: ...
 
@@ -273,8 +288,21 @@ def _exec_client_refusal_reader(node: Node) -> Callable[[], tuple[str, ...]]:
     return _read
 
 
-def _run_node(config: TradingNodeConfig, node_factory: NodeFactory, stderr: TextIO) -> int:
+def _run_node(
+    config: TradingNodeConfig,
+    node_factory: NodeFactory,
+    stderr: TextIO,
+    *,
+    actors: Sequence[Actor] = (),
+) -> int:
     """Build, run and ALWAYS dispose the node. Never raises.
+
+    BL-24 Seam B: ``actors`` -- the NWS observation Actors, present only
+    when ``BREEZY_LIVE_OBSERVATIONS=1`` -- are registered through the NATIVE
+    ``node.trader.add_actor`` BEFORE ``build()``, exactly as
+    ``composition.build_ingest_node`` registers the ingest Actors.
+    ``build_trade_node_config`` keeps ``actors=[]``; these are not an order
+    path (an Actor is not a Strategy and cannot ``submit_order``).
 
     ``add_data_client_factory``/``add_exec_client_factory`` take the
     registration NAME and the factory CLASS (``live/node.py:230``, and the
@@ -323,6 +351,8 @@ def _run_node(config: TradingNodeConfig, node_factory: NodeFactory, stderr: Text
         node.add_exec_client_factory(
             POLYMARKET_US_CLIENT_NAME, PolymarketUSLiveExecClientFactory
         )
+        for actor in actors:
+            node.trader.add_actor(actor)
         node.build()
         install_live_order_guard(
             node.kernel.portfolio,
@@ -398,7 +428,10 @@ def run(
             _report(out, "configuration error", exc, expected=True)
             return EXIT_CONFIG_ERROR
 
-        return _run_node(config, node_factory, out)
+        actors: Sequence[Actor] = ()
+        if settings.live_observations:
+            actors = build_live_observation_actors(check_proxy_env=proxy_env_check_enabled(env))
+        return _run_node(config, node_factory, out, actors=actors)
     finally:
         uninstall_logging_bridge()
 

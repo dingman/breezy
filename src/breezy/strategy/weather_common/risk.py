@@ -33,7 +33,12 @@ from typing import TYPE_CHECKING, Final
 
 from breezy.strategy.weather_common.freshness import SignalKind
 from breezy.strategy.weather_common.ladder import available_ask_depth
-from breezy.strategy.weather_common.refusals import SHORTS_DISABLED, RefusalCounter
+from breezy.strategy.weather_common.refusals import (
+    OBSERVATION_AMBIGUOUS,
+    OBSERVATION_UNAVAILABLE,
+    SHORTS_DISABLED,
+    RefusalCounter,
+)
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
     from breezy.strategy.weather_common.bucket_contract import MispricingContract
@@ -87,15 +92,16 @@ COUNTED_REFUSAL_REASONS: Final[frozenset[str]] = frozenset(
         # by `RiskManager.evaluate_order`, which has no observation value to
         # judge -- see `docs/plans/BL24_LIVE_RT_2026-09-04.md` amendment A4.
         # Counted here so the decision layer's counter shares the one fixed,
-        # finite reason set.
-        "observation_unavailable",
+        # finite reason set. The string is defined ONCE, in `refusals.py`.
+        OBSERVATION_UNAVAILABLE,
         # Decision-layer reason (`current_rung_hold/decision.py`), NOT
         # emitted by `RiskManager.evaluate_order` -- the rung-containment
         # check that can find an observation interval straddling two rungs
         # has no analogue in this module. Counted here so both counters
         # share one fixed, finite reason set -- see
-        # `docs/plans/CURRENT_RUNG_HOLD_BLUEPRINT_2026-09-04.md` §3.
-        "observation_ambiguous",
+        # `docs/plans/CURRENT_RUNG_HOLD_BLUEPRINT_2026-09-04.md` §3. The
+        # string is defined ONCE, in `refusals.py`.
+        OBSERVATION_AMBIGUOUS,
         # Decision-layer reason (`current_rung_hold/decision.py`), NOT
         # emitted by `RiskManager.evaluate_order` -- the fail-closed check
         # that the traded instrument's fee coefficient matches the

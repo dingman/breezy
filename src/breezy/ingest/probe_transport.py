@@ -294,6 +294,21 @@ class ProbeTransport(HttpTransport):
             "so the settlement path cannot be reached from a probe."
         )
 
+    async def fetch_station_observations(self, icao: str, *, limit: int) -> FetchResult:
+        """Closed. NOT an override: `HttpTransport` never defines this method.
+
+        Only `NwsObservationTransport` (BL-24 Seam B) does. This same-name
+        stub is defensive -- it keeps the closure VISIBLE in the probe's
+        public-surface equality set (`tests/unit/test_probe_containment.py`),
+        so a future refactor that moves the method up the hierarchy turns
+        that barrier RED instead of quietly opening the settlement host to a
+        probe (L-22).
+        """
+        raise NotImplementedError(
+            "A ProbeTransport has no NWS observation endpoint. This method is "
+            "closed so api.weather.gov cannot be reached from a probe."
+        )
+
     # -- the probe surface --------------------------------------------------
 
     async def probe_get(

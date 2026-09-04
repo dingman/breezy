@@ -356,6 +356,10 @@ CAGE_RULE_PINS: tuple[RulePin, ...] = (
                 "breezy.adapters.polymarket_us.http",
                 "breezy.adapters.polymarket_us.websocket",
                 "breezy.ingest.http",
+                "breezy.ingest.nws_observation_actor",
+                "breezy.ingest.nws_observation_config",
+                "breezy.ingest.nws_observation_transport",
+                "breezy.ingest.nws_observations",
                 "breezy.ingest.probe_transport",
                 "breezy.runtime.health",
             }
@@ -366,6 +370,10 @@ CAGE_RULE_PINS: tuple[RulePin, ...] = (
                 "breezy.adapters.polymarket_us.http",
                 "breezy.adapters.polymarket_us.websocket",
                 "breezy.ingest.http",
+                "breezy.ingest.nws_observation_actor",
+                "breezy.ingest.nws_observation_config",
+                "breezy.ingest.nws_observation_transport",
+                "breezy.ingest.nws_observations",
                 "breezy.ingest.probe_transport",
                 "breezy.runtime.health",
                 "breezy.runtime.quote_tape_cli",
@@ -376,6 +384,10 @@ CAGE_RULE_PINS: tuple[RulePin, ...] = (
                 "breezy.adapters.polymarket_us.data",
                 "breezy.adapters.polymarket_us.websocket",
                 "breezy.ingest.http",
+                "breezy.ingest.nws_observation_actor",
+                "breezy.ingest.nws_observation_config",
+                "breezy.ingest.nws_observation_transport",
+                "breezy.ingest.nws_observations",
                 "breezy.ingest.probe_transport",
                 "breezy.runtime.health",
             }
@@ -391,6 +403,8 @@ CAGE_RULE_PINS: tuple[RulePin, ...] = (
             {
                 "MarketsFeed",
                 "NautilusHttpTransport",
+                "NwsObservationActor",
+                "NwsObservationTransport",
                 "PolymarketUSDataClient",
                 "PolymarketUSHttpClient",
                 "PolymarketUSMarketsWebSocketPool",
@@ -401,6 +415,8 @@ CAGE_RULE_PINS: tuple[RulePin, ...] = (
             {
                 "MarketsFeed",
                 "NautilusHttpTransport",
+                "NwsObservationActor",
+                "NwsObservationTransport",
                 "PolymarketUSDataClient",
                 "PolymarketUSHttpClient",
                 "PolymarketUSMarketsWebSocketPool",
@@ -411,6 +427,8 @@ CAGE_RULE_PINS: tuple[RulePin, ...] = (
         narrowed=frozenset(
             {
                 "MarketsFeed",
+                "NwsObservationActor",
+                "NwsObservationTransport",
                 "PolymarketUSDataClient",
                 "PolymarketUSHttpClient",
                 "PolymarketUSMarketsWebSocketPool",

@@ -267,6 +267,11 @@ def test_known_iem_asos_ids_is_the_closed_set_across_every_site(
     )
 
 
+def test_known_icaos_is_the_closed_set_across_every_site(registry: SiteRegistry) -> None:
+    """BL-24 Seam B section 2: the observation transport validates ICAOs against this set."""
+    assert registry.known_icaos() == frozenset({"KNYC", "KSFO", "KMIA", "KMDW", "KLAX"})
+
+
 def test_registry_version_is_exposed(registry: SiteRegistry) -> None:
     assert registry.registry_version == "1.0.0"
 

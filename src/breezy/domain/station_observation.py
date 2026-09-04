@@ -64,6 +64,11 @@ STATION_OBSERVATION_SCHEMA_VERSION: Final[int] = 2
 
 _NS_PER_SECOND: Final[int] = 1_000_000_000
 
+#: Channels whose `assumed_publication_lag_ns` must be strictly positive.
+#: WIDENED from the single IEM channel when the NWS API channel landed (BL-24
+#: Seam B) -- never relaxed: every live feed declares a measured lag.
+_POSITIVE_LAG_CHANNELS: Final[tuple[str, ...]] = ("iem_asos_metar", "nws_api_observations")
+
 
 class StationObservation(Data):
     """One station's raw 5-minute ASOS/METAR temperature reading.
@@ -139,10 +144,13 @@ class StationObservation(Data):
                 f"or coincide with the measurement it reports",
             )
 
-        if self.source_channel == "iem_asos_metar" and self.assumed_publication_lag_ns <= 0:
+        if (
+            self.source_channel in _POSITIVE_LAG_CHANNELS
+            and self.assumed_publication_lag_ns <= 0
+        ):
             raise ValueError(
                 "`assumed_publication_lag_ns` must be positive for "
-                "source_channel='iem_asos_metar', "
+                f"source_channel={self.source_channel!r}, "
                 f"was {self.assumed_publication_lag_ns}",
             )
 
