@@ -39,8 +39,13 @@ holds the seven values in memory/environ for the HOST'S UPTIME, every spawned ch
 exposure class as R3 (`/proc/<pid>/environ`, same-UID readable) but materially LONGER residency; not parity.
 Peer ruling: a supervisor holding values only in memory, forwarding via child `env=`, is the runbook's
 "automation shell" (R8 runbook :158-165), not the banned launcher-script artefact whose stated reason is disk
-persistence (:183-184). Source never committed, never under `deploy/`; lives outside the repo tree or as an
-in-memory `bash -c`/`python -c` body with NO values in argv.
+persistence (:183-184). **Coordinator decision (2026-09-04, build side):** the supervisor is a values-free,
+tested repo module (`src/breezy/runtime/trade_supervisor.py`, console entry `breezy-trade-supervisor`) in
+exactly the same category as `app/trade.py` — it reads the seven values only from its own environment,
+which the launching shell exports inline per runbook §6; nothing under `deploy/`, no unit, no file ever
+carries a value, NO values in argv. The runbook's "launcher script" ban is applied by its stated reason
+(a file carrying the enablement values), which a values-free module does not violate; an untracked,
+untested in-memory body would make the build-stage test obligations below impossible to honour.
 
 **Env vs argv:** values travel via `env=` only, matching `config_from_env`/`exec_config_from_env` (runbook:179).
 Supervisor argv carries a distinct token, `breezy-trade-supervisor-daily`, never substring-shared with the
