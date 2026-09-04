@@ -141,7 +141,7 @@ forecast ingest → ~300 station-days → CAPACITY).
 **EXEC SPINE follow-ups:** `docs/plans/EXEC_SPINE_2026-09-01.md` §R-4
 "review amendments". Guard before R-9: divides by zero for an unpriced
 forward; settlement-as-exit bypasses `_submit_order`'s refusal latch.
-**Write path — PLAN CONVERGED (Rev 7, `d1e8e33`); LANDED: R-6.5a `4f76137`, R-6.5P `38f2426`, R-6.5b-0 `43723a1`, ledger `e329667`, latch `5d41eaa`, R-6.5b write transport `757daba` (Grok build, 3 reviews); R-7 brief CONVERGED `docs/plans/R7_BUILD_BRIEF_2026-09-04.md`, Grok build in flight; PARKED at the operator step** (rest a BUY 1@$0.01, run `polymarket_us_write_signing_probe.py --positive-control`, expect `PREFLIGHT_NOT_EMPTY`). Grok builds, Claude verifies.
+**Write path — PLAN CONVERGED (Rev 7, `d1e8e33`); LANDED: R-6.5a `4f76137`, R-6.5P `38f2426`, R-6.5b-0 `43723a1`, ledger `e329667`, latch `5d41eaa`, R-6.5b `757daba`, R-7 send path `092695c`+`02bfd63` (structurally unreachable: `WRITE_CANONICAL_STRING_VERIFIED=False`, enablement absent; clear tool `breezy-clear-submit-intent`); PARKED at the operator step** (rest a BUY 1@$0.01, run `polymarket_us_write_signing_probe.py --positive-control`, expect `PREFLIGHT_NOT_EMPTY`). Grok builds, Claude verifies.
 Ingest defect `252918a`: instrument definitions convert row-wise (re-emitted `ts_init` broke the native disjoint check every run); never identifier-filter `BinaryOption` queries.
 R-7 rules still open (`docs/plans/EXEC_SPINE_R65_R7_2026-09-02.md`): authorization is the write closure's first positional; caps re-read per call; ledger releases only on 4xx+Status+no `order.id`; IOC zero-fill is terminal (R-7 brief converged); native inflight resolution DECLINED. The R-4 standing refusal stays until R-7 lands.
 
@@ -166,7 +166,7 @@ n≥150; today n_taken=1. **Live family = lags 30/45, NYC excluded, interval rul
 ~9% of station-days** (`docs/evidence/venue/polymarket_us/MISSING_COHORT_2026-09-02_2026-09-03.md`): add a week to each clock. **09-04 operator override: the M_B gate no longer parks the plumbing** — build the
 write path (`docs/plans/EXEC_SPINE_NEXT_2026-09-04.md`, R-6.5b CONVERGED) and live R(t)
 (`docs/plans/BL24_LIVE_RT_2026-09-04.md`); only enablement, budgets and the OP-1..OP-4
-positive control stay operator-only. M_B's kill rule still binds the family. **current_rung_hold landed 09-04:** table `7babe06`, latch `19ea5fb`, config `15f04f4`, decision+legal-cell `348f9c8`, 6c scorer `43e38ff`, 6d tally `abcc1ad` (timer prepared, not activated), 6e BCa `6ddca6e`; strategy `74cfa7c`+amendments (fee guard `0bd346f`), 6b paper replay `8ae12cd` (mechanism test, no verdict), PREREG v1 draft `docs/specs/PREREG_v1_current_rung_hold_2026-09-04.md`. Next: shadow-mode wiring (`docs/plans/CRH_RUNTIME_WIRING_BRIEF_2026-09-04.md`, Grok build in flight), R-7 correction.
+positive control stay operator-only. M_B's kill rule still binds the family. **current_rung_hold landed 09-04:** table `7babe06`, latch `19ea5fb`, config `15f04f4`, decision+legal-cell `348f9c8`, 6c scorer `43e38ff`, 6d tally `abcc1ad` (timer prepared, not activated), 6e BCa `6ddca6e`; strategy `74cfa7c`+amendments (fee guard `0bd346f`), 6b paper replay `8ae12cd` (mechanism test, no verdict), PREREG v1 draft `docs/specs/PREREG_v1_current_rung_hold_2026-09-04.md`. shadow-mode wiring `c86bd10` (`BREEZY_CURRENT_RUNG_HOLD` + `BREEZY_LIVE_OBSERVATIONS`, `breezy.app` top layer). Next: paper-replay real sweep memo; operator steps OP-1..OP-4.
 
 ---
 
