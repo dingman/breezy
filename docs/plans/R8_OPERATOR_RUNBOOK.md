@@ -24,8 +24,8 @@ written here and their values are never written anywhere in this repository
 | 0.7 | **R-6.5b** — `write_transport.py`, `PERMITTED_WRITE_METHODS={"POST"}`, `post_cancel_all`, `post_order`, B4 narrowing; `WRITE_CANONICAL_STRING_VERIFIED: Final[bool] = False` (line 48) | commit `092695c`; `src/breezy/adapters/polymarket_us/write_transport.py:40-175` | LANDED, 092695c |
 | 0.8 | **R-7** — `_submit_order` gets D1–D9 body; startup calls `reconcile_at_startup` before the first `arm`; `exec/submit_chain.py` classifies shape/response | commit `092695c`; `src/breezy/adapters/polymarket_us/exec/client.py:1484-1550`; `src/breezy/adapters/polymarket_us/exec/submit_chain.py` | LANDED, 092695c; refined 02bfd63 |
 | 0.9 | **R-7-STATUS** — by-id order read on the READ seam (`exec/client.py::generate_order_status_report`, templated path, no new B4 row) | LANDED `092695c` | **LANDED** |
-| 0.10 | **Seam B** — NWS observation publisher (A12); `0.75 h` staleness | LANDED `e9492bc` (flag `BREEZY_LIVE_OBSERVATIONS=1`), staleness gating `86d6a63` | **LANDED** |
-| 0.11 | **current_rung_hold steps 4–7** — `config.py`, `decision.py`, `strategy.py`, PREREG artefact (plus 6c/6d) | FLAG-OFF runtime wiring landed (commit `c86bd10`); `orders_enabled` stays False and unreachable from env (`src/breezy/runtime/settings.py`); per-tick refusal counts (commit `2aa3e3a`); config/decision/strategy landed (`15f04f4`, `348f9c8`, `74cfa7c`+fixes); 6c scorer `24950d1`/`43e38ff`, 6d tally `abcc1ad` (timer PREPARED, not enabled), 6e BCa `6ddca6e`; PREREG v1 DRAFT at `docs/specs/PREREG_v1_current_rung_hold_2026-09-04.md` — the operator step is to commit it as binding before the first order | **PARTIAL (operator: PREREG binding + timer enable)** |
+| 0.10 | **Seam B** — NWS observation publisher (A12); `50 min` staleness (rev 3 delta; was 0.75 h) | LANDED `e9492bc` (flag `BREEZY_LIVE_OBSERVATIONS=1`), staleness gating `86d6a63` | **LANDED** |
+| 0.11 | **current_rung_hold steps 4–7** — `config.py`, `decision.py`, `strategy.py`, PREREG artefact (plus 6c/6d) | FLAG-OFF runtime wiring landed (commit `c86bd10`); `orders_enabled` stays False and unreachable from env (`src/breezy/runtime/settings.py`); per-tick refusal counts (commit `2aa3e3a`); config/decision/strategy landed (`15f04f4`, `348f9c8`, `74cfa7c`+fixes); 6c scorer `24950d1`/`43e38ff`, 6d tally `abcc1ad` (timer PREPARED, not enabled), 6e BCa `6ddca6e`; PREREG v1 BINDING (draft line removed 2026-09-04, operator delegation); `breezy-live-tally.timer` ENABLED 2026-09-04 | **LANDED** |
 | 0.12 | Gate green: `scripts/ci/run_tests_no_egress.sh`, passed count never dropped | green at every landing 09-04 (5856 → 7452+) | **HELD** |
 
 Nothing below is started until 0.7–0.12 are closed, EXCEPT OP-1..OP-4, which are R-6.5b's own
@@ -137,7 +137,7 @@ in the shipped probe.
 
 `docs/specs/PREREG_v1_current_rung_hold_2026-09-04.md` (v1 DRAFT exists; remove its draft line to make it binding) must be **committed as binding before the first order**
 (blueprint §3, §6 step 7). Fields (§7): D0 · stations LAX, MDW, MIA, SFO (NYC excluded, L-13) ·
-window [12:00,17:00) LST · `L_extra=0` with archive arms 30 and 45 agreeing · `stale_observation_hours=0.75` ·
+window [12:00,17:00) LST · `L_extra=0` with archive arms 30 and 45 agreeing · `stale_observation_minutes=50` (rev 3 delta) ·
 feed: NWS `api.weather.gov` (A12) · ask band (0.05,0.95), depth ≥1.0, size 1, IOC, hold to settlement ·
 interval precision rule · unit = one filled taken trial per station-day · `held=1` iff CLI FINAL
 `tmax_f` ∈ the rung bought · `PnL = 1{held} − fill_px − fee` · `BE(ā)=ā+0.06·ā·(1−ā)` ·

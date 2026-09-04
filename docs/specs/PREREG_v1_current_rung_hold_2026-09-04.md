@@ -1,6 +1,5 @@
 # PREREG v1 — current_rung_hold live-small family (2026-09-04)
 
-Status: DRAFT under peer review; becomes binding at the commit that removes this line. The two PROPOSED stop rules in §6 are coordinator decisions accepted as written (D0 + 165 calendar days; cumulative ΣPnL ≤ −60 contract-units).
 
 Status: pre-registered BEFORE the first live order (blueprint build-order step 7,
 `docs/plans/CURRENT_RUNG_HOLD_BLUEPRINT_2026-09-04.md:45,85`). Nothing in this document is an
