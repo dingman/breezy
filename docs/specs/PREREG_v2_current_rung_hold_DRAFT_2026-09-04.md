@@ -84,6 +84,9 @@ plug-in `π_k` with `t_k = n_k/160` (the original rev-a form) — rejected for l
 increments under a drifting/re-estimated `π_k`; freezing `π` at look-1 — rejected as mis-centering
 later rows whose true `Bern(BE_i) ≠ π_1`.
 
+
+**Coordinator clarification (2026-09-04, binding on the generator; consistent with the ruling's unamended α):** the terminal look spends EXACTLY the remaining α (`0.025 − α_spent(previous looks)`), so cumulative α at the terminal look is 0.025 to 1e-6. The terminal boundary is whatever the Lan-DeMets recursion yields from that remainder (for LD-OBF with 16 equal looks it is slightly above `z`); it equals `z = 1.959963984540054` only in the single-look limit. "Terminal `b_eff` stays `z`" is satisfied by spending the remainder, never by forcing the boundary to `z`, which would inflate cumulative α above the registered level (measured 0.0312 in the first generator draft and rejected).
+
 ## 4. Truncation (AMENDED — remaining-α on realized information, family closed at truncation)
 
 Unchanged: v1's time stop (D0+165, v1 §6:121-123) and loss stop (ΣPnL ≤ −60 contract-units, v1
