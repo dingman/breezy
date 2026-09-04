@@ -239,6 +239,7 @@ from breezy.runtime.backtest_harness import (
     run_backtest,
 )
 from breezy.runtime.backtest_order_guard import NakedShortRefusedError, PostOnlyRefusedError
+from breezy.runtime.quote_tape_ingest_cli import default_convert
 from breezy.strategy.calibration_mean_reversion import (
     CalibrationMeanReversionConfig,
     CalibrationMeanReversionStrategy,
@@ -1216,7 +1217,17 @@ def _forecast_sources_and_overrides(
 #
 # NULL HYPOTHESIS (checked before any of it was written):
 #   * The feather -> parquet conversion is NATIVE. `convert_stream_to_data` is
-#     used verbatim; nothing here parses a feather file.
+#     used verbatim for every type except instrument definitions
+#     (`BinaryOption`); nothing here parses a feather file.
+#   * Instrument definitions go through `default_convert`
+#     (`breezy.runtime.quote_tape_ingest_cli`), reused rather than
+#     duplicated: the recorder re-emits a definition with its ORIGINAL
+#     `ts_init` on every discovery cycle, so an instance with more than one
+#     `binary_option_*.feather` produces overlapping intervals that
+#     `convert_stream_to_data`'s per-file conversion refuses forever
+#     (`parquet.py:2690`). `default_convert` already solved this row-wise
+#     for the ingest timer; it is called here unchanged, with its `target=`
+#     parameter pointed at the work catalog.
 #   * Reading instruments/depth/quotes back is NATIVE: `catalog.instruments()`,
 #     `catalog.order_book_depth10()`, `catalog.quote_ticks()`.
 #   * Backtest replay of the weather custom type is NATIVE: `add_data(...,
@@ -1259,13 +1270,17 @@ def _convert_live_capture(
     work_catalog.mkdir(parents=True, exist_ok=True)
     source = ParquetDataCatalog(str(quote_catalog))
     work = ParquetDataCatalog(str(work_catalog))
+    # `default_convert` is native `convert_stream_to_data` for every type
+    # EXCEPT instrument definitions (`BinaryOption`): the recorder re-emits a
+    # definition carrying its ORIGINAL `ts_init` on every discovery cycle, so
+    # more than one `binary_option_*.feather` under an instance produces
+    # overlapping intervals that the native per-file converter refuses
+    # forever (`parquet.py:2690`). `default_convert` already solved this
+    # row-wise for the ingest timer (`quote_tape_ingest_cli.py`); reused here
+    # verbatim via its `target=` parameter rather than re-implemented, so
+    # this is the same dispatch, writing into the SEPARATE work catalog.
     for data_cls in (BinaryOption, InstrumentClose, QuoteTick, OrderBookDepth10):
-        source.convert_stream_to_data(
-            instance_id,
-            data_cls,
-            other_catalog=work,
-            subdirectory=subdirectory,
-        )
+        default_convert(source, instance_id, data_cls, subdirectory, target=work)
     return work
 
 

@@ -265,16 +265,40 @@ def _same_definition(landed: Any, streamed: Any) -> bool:
 
 
 def convert_instrument_definitions(
-    catalog: ParquetDataCatalog, instance_id: str, data_cls: type, subdirectory: str
+    catalog: ParquetDataCatalog,
+    instance_id: str,
+    data_cls: type,
+    subdirectory: str,
+    *,
+    target: ParquetDataCatalog | None = None,
 ) -> str:
     """Land the definitions this instance streamed that are not in the catalog.
 
     Row-wise rather than file-wise because a re-emitted definition keeps its
     original ``ts_init`` (see the module docstring): the native per-file
     conversion refuses the resulting overlap permanently. De-duplicating on
-    ``(instrument_id, ts_init)`` -- against the catalog AND within the stream
-    -- is what earns ``skip_disjoint_check=True``, which is otherwise the one
-    guard against writing the same rows twice.
+    ``(instrument_id, ts_init)`` -- against the WRITE TARGET catalog AND
+    within the stream -- is what earns ``skip_disjoint_check=True``, which is
+    otherwise the one guard against writing the same rows twice.
+
+    ``target`` is the catalog the de-duplicated rows are queried against and
+    written to; it defaults to ``catalog`` itself, which reproduces every
+    caller's behaviour before this parameter existed byte for byte. Passing a
+    different ``target`` (e.g. a separate work catalog built from a read-only
+    capture -- see ``_convert_live_capture``) reads the streamed feather from
+    ``catalog`` but de-duplicates and writes against ``target`` instead,
+    exactly mirroring how ``convert_stream_to_data``'s own ``other_catalog``
+    parameter works for every other type.
+
+    Idempotency marker semantics do NOT change here: this function has never
+    written the ``.converted-<type>`` marker itself -- that is
+    :func:`ingest_instance`'s job, gated on the OUTCOME this function
+    returns, and it always marks against the streamed instance's OWN
+    directory under ``catalog`` regardless of where the rows landed. No
+    caller passes a foreign ``target`` through :func:`ingest_instance` today
+    (only :func:`default_convert`'s direct callers can), so there is nothing
+    to reconcile in practice; this note exists so a future caller that DOES
+    combine them makes that call deliberately rather than by accident.
 
     Reading every existing definition back is affordable precisely because
     definitions are few: one row per market per re-emission, against millions
@@ -313,10 +337,11 @@ def convert_instrument_definitions(
     designs around. No caller does any of these today; this note is here so
     that stays a decision rather than an accident.
     """
+    write_target = catalog if target is None else target
     streamed = _read_streamed(catalog, instance_id, data_cls, subdirectory)
     known: dict[tuple[str, int], Any] = {
         (definition.id.value, definition.ts_init): definition
-        for definition in catalog.query(data_cls=data_cls)
+        for definition in write_target.query(data_cls=data_cls)
     }
 
     fresh: list[Any] = []
@@ -348,21 +373,36 @@ def convert_instrument_definitions(
     if not fresh:
         return CONVERTED_NOTHING_NEW
 
-    catalog.write_data(fresh, skip_disjoint_check=True)
+    write_target.write_data(fresh, skip_disjoint_check=True)
     return CONVERTED
 
 
 def default_convert(
-    catalog: ParquetDataCatalog, instance_id: str, data_cls: type, subdirectory: str
+    catalog: ParquetDataCatalog,
+    instance_id: str,
+    data_cls: type,
+    subdirectory: str,
+    *,
+    target: ParquetDataCatalog | None = None,
 ) -> str:
     """The one native call this module exists to schedule and guard.
 
     Instrument definitions take the row-wise path instead; every other type
-    is one ``convert_stream_to_data``, unchanged.
+    is one ``convert_stream_to_data``, unchanged. ``target`` defaults to
+    ``None``, which is byte-for-byte the pre-existing behaviour (every
+    existing caller, including :func:`ingest_instance`, omits it); passing it
+    writes the converted rows into a SEPARATE catalog instead of ``catalog``
+    itself -- the shape ``_convert_live_capture`` needs to convert a
+    read-only capture into a disposable work catalog without duplicating this
+    function's dispatch logic.
     """
     if _is_instrument_definition(data_cls):
-        return convert_instrument_definitions(catalog, instance_id, data_cls, subdirectory)
-    catalog.convert_stream_to_data(instance_id, data_cls, subdirectory=subdirectory)
+        return convert_instrument_definitions(
+            catalog, instance_id, data_cls, subdirectory, target=target
+        )
+    catalog.convert_stream_to_data(
+        instance_id, data_cls, other_catalog=target, subdirectory=subdirectory
+    )
     return CONVERTED
 
 
