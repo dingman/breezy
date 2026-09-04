@@ -135,6 +135,14 @@ REFUSAL_REASONS: Final[frozenset[str]] = frozenset(
         # ONE set across both layers, exactly as ``observation_ambiguous``
         # already does for ``RiskManager``.
         "outside_decision_window",
+        # Strategy-layer reason (``strategy.py``'s ``on_start``): a
+        # configured instrument id absent from ``self.cache`` at start-up
+        # (L-23: ~9% of station-days never listed, and the live instrument
+        # provider may lag the catalog). NOT emitted by ``evaluate_decision``
+        # -- widened here, same shape as ``outside_decision_window``, so the
+        # trial-day latch's closed reason set stays ONE set with the shared
+        # refusal vocabulary.
+        "instrument_unresolved",
     }
 )
 

@@ -94,6 +94,12 @@ def test_refusal_reasons_is_the_closed_set_from_the_brief() -> None:
             # the trial-day latch's closed reason set covers it too -- see
             # `decision.py`'s `REFUSAL_REASONS` comment.
             "outside_decision_window",
+            # Strategy-layer reason (`strategy.py`'s `on_start`): a
+            # configured instrument id absent from the cache at start-up
+            # (L-23) is a counted, skipped refusal, never fatal to its
+            # sibling instruments -- widened here for the same reason
+            # `outside_decision_window` was.
+            "instrument_unresolved",
         }
     )
 

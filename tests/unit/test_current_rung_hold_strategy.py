@@ -243,6 +243,46 @@ class TestConstruction:
             strategy.on_start()
 
 
+class TestPartialInstrumentResolution:
+    """A configured id absent from the cache (L-23: ~9% of station-days
+    never listed, and the provider may lag the catalog) must not kill
+    every OTHER station's subscription -- only an unresolved id itself is
+    refused, counted, and skipped."""
+
+    def test_a_missing_instrument_is_skipped_counted_and_does_not_stop(
+        self, store_path: Path, interior_instrument: BinaryOption,
+    ) -> None:
+        missing_id = InstrumentId(Symbol("lax-missing"), Venue("POLYMARKET_US"))
+        cfg = CurrentRungHoldConfig(instrument_ids=(interior_instrument.id, missing_id))
+        rig = _register_and_start(
+            store_path=store_path, instruments=(interior_instrument,), config=cfg,
+        )
+        strategy = rig.strategy
+        assert strategy.is_running
+        assert str(interior_instrument.id) in strategy._facts
+        assert strategy.refusals.count("instrument_unresolved") == 1
+
+    def test_a_missing_instrument_does_not_consume_the_trial_day_latch(
+        self, store_path: Path, interior_instrument: BinaryOption,
+    ) -> None:
+        missing_id = InstrumentId(Symbol("lax-missing"), Venue("POLYMARKET_US"))
+        cfg = CurrentRungHoldConfig(instrument_ids=(interior_instrument.id, missing_id))
+        rig = _register_and_start(
+            store_path=store_path, instruments=(interior_instrument,), config=cfg,
+        )
+        strategy = rig.strategy
+        assert strategy._latch is not None
+        assert strategy._latch.is_consumed(STATION, CLIMATE_DAY.isoformat()) is False
+
+    def test_all_instruments_missing_stops_the_strategy(self, store_path: Path) -> None:
+        missing_id = InstrumentId(Symbol("lax-missing"), Venue("POLYMARKET_US"))
+        cfg = CurrentRungHoldConfig(instrument_ids=(missing_id,))
+        rig = _register_and_start(store_path=store_path, instruments=(), config=cfg)
+        strategy = rig.strategy
+        assert strategy.is_stopped
+        assert strategy.refusals.count("instrument_unresolved") == 1
+
+
 class TestFirstExecutableSnapshot:
     def test_first_executable_snapshot_is_the_only_candidate(
         self, store_path: Path, interior_instrument: BinaryOption,

@@ -140,6 +140,14 @@ _WIDTH_OPEN_LOWER: Final[int] = 2
 #: before a quote ever reaches that function.
 _OUTSIDE_DECISION_WINDOW: Final[str] = "outside_decision_window"
 
+#: Counted (``decision.REFUSAL_REASONS``), never emitted by
+#: ``evaluate_decision`` -- an ``on_start`` cache-resolution refusal, before
+#: any quote reaches this instrument at all. See ``on_start``'s docstring
+#: note: one unresolved id is skipped and counted, never fatal to its
+#: siblings; ALL configured ids unresolved is still fatal (unchanged
+#: fail-closed posture).
+_INSTRUMENT_UNRESOLVED: Final[str] = "instrument_unresolved"
+
 #: The venue key this package looks up every ``(venue, city)`` registry
 #: accessor with -- see ``breezy.registry.sites``. ``city`` is the station
 #: code itself (``LAX``/``MDW``/``MIA``/``SFO``), matching
@@ -235,12 +243,22 @@ class CurrentRungHoldStrategy(Strategy):
             for station in self._config.stations
         }
 
+        resolved_any = False
         for instrument_id in self._config.instrument_ids:
             instrument = self.cache.instrument(instrument_id)
             if instrument is None:
-                self.log.error(f"no instrument {instrument_id} in the cache; stopping")
-                self.stop()
-                return
+                # ONE unresolved id (L-23: ~9% of station-days never listed,
+                # and the live instrument provider may lag the catalog) is
+                # a counted, logged skip -- never fatal to every OTHER
+                # configured station's subscription. Fatal only when NO
+                # configured id resolves at all (checked after this loop).
+                self.log.warning(
+                    f"no instrument {instrument_id} in the cache; skipping "
+                    "subscription (refusal: instrument_unresolved)",
+                )
+                self.refusals.record(_INSTRUMENT_UNRESOLVED)
+                continue
+            resolved_any = True
             facts = read_weather_bucket_facts(instrument.info)
             if facts.measure is not Measure.HIGH:
                 self.log.warning(
@@ -260,6 +278,16 @@ class CurrentRungHoldStrategy(Strategy):
             self._ladders.setdefault(key, []).append((facts.lower_f, facts.upper_f))
             self.subscribe_quote_ticks(instrument_id)
             self.log.info(f"CurrentRungHoldStrategy subscribed {instrument_id}")
+
+        if self._config.instrument_ids and not resolved_any:
+            # Every configured id was unresolved -- the unchanged fail-closed
+            # posture: a strategy with nothing it could possibly subscribe to
+            # must not silently idle.
+            self.log.error(
+                "no configured instrument resolved from the cache; stopping",
+            )
+            self.stop()
+            return
 
         self.subscribe_data(station_observation_data_type())
 
