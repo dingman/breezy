@@ -30,9 +30,11 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Final, cast
 
 from nautilus_trader.model.currencies import USD
+from nautilus_trader.model.enums import OrderStatus
 from nautilus_trader.model.objects import Money
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
+    from nautilus_trader.backtest.engine import BacktestEngine
     from nautilus_trader.core.data import Data
     from nautilus_trader.model.identifiers import InstrumentId
 
@@ -57,6 +59,7 @@ from breezy.registry.sites import default_registry
 from breezy.runtime.backtest_feed import as_backtest_data
 from breezy.runtime.backtest_harness import DEFAULT_BACKTEST_TRADER_ID, backtest
 from breezy.runtime.paper_replay import (
+    EXPIRATION_LEG_PREFIX,
     PAPER_TRIAL_ID_PREFIX,
     PRECISION_ARMS,
     PaperReplayInputs,
@@ -141,6 +144,21 @@ class VenueOutsideLiveDirError(ValueError):
     """The paper writer's output path resolves under the live scored_trials
     directory. Raised, never silently redirected -- see `paper_replay.py`'s
     L-22 provenance docstring."""
+
+
+class EntryAskFromLatchMissingError(ValueError):
+    """D1: a filled entry order has no corroborating `reason=='taken'`
+    trial-day latch record to source its decision-instant `entry_ask` from.
+
+    The measured defect (2026-09-01 MDW): `entry_ask` was built from
+    ``ti.quotes[0].ask_price`` -- the FIRST quote of the WHOLE tape, four
+    hours before the real decision. The strategy's own trial-day latch
+    (`trial_day_latch.TrialDayLatch.record`) durably records the REAL
+    decision-instant ask under `reason="taken"` the moment it submits, so
+    that record is the only legitimate source. A filled order with no such
+    record (missing, wrong `reason`, or a mismatched `instrument_id`) is
+    refused here rather than ever defaulting to 0 or a tape quote.
+    """
 
 
 class NoDecisionWindowCoverageError(ValueError):
@@ -293,6 +311,71 @@ def _entry_context_for(
     )
 
 
+def _filled_instrument_ids(engine: BacktestEngine) -> list[str]:
+    """Every FILLED, non-expiration-leg order's `instrument_id` (D1).
+
+    Applies the SAME filter `filled_trials_from_engine` applies internally --
+    duplicated here (that filter is a private detail of a function this
+    module still calls afterwards) using the exported `EXPIRATION_LEG_PREFIX`
+    so this refusal can run BEFORE `entry_contexts` even exists.
+    """
+    return [
+        str(order.instrument_id)
+        for order in engine.cache.orders()
+        if order.status == OrderStatus.FILLED
+        and not str(order.client_order_id).startswith(EXPIRATION_LEG_PREFIX)
+    ]
+
+
+def _entry_contexts_from_latch(
+    tape_instruments: Sequence[TapeInstrument],
+    engine: BacktestEngine,
+    *,
+    station: str,
+    climate_day: str,
+    latch_store_path: Path,
+    scheduled_release_at_ns: int,
+) -> dict[str, ReplayEntryContext]:
+    """D1: `entry_ask` for the ONE latched instrument, sourced from the
+    strategy's own trial-day latch record -- never the tape's first quote.
+
+    Reads the latch AFTER `engine.run()` has already completed (the
+    strategy's own `on_stop` releases its flock before `backtest()` ever
+    yields the engine -- `strategy.py`'s "Close the trial-day latch this
+    strategy owns, unconditionally" -- so re-opening it here is safe, not a
+    second concurrent opener). A filled order on an instrument the latch does
+    not corroborate is refused (`EntryAskFromLatchMissingError`), never
+    silently dropped by `filled_trials_from_engine`'s `ctx is None` skip.
+    Instruments with no fill get no entry (they need none -- see the module
+    docstring).
+    """
+    filled_ids = _filled_instrument_ids(engine)
+    if not filled_ids:
+        return {}
+    with _latch_context(latch_store_path) as latch:
+        record = latch.record(station, climate_day)
+    valid = record is not None and record.reason == "taken"
+    unexplained = sorted({
+        instrument_id
+        for instrument_id in filled_ids
+        if not valid or record.instrument_id != instrument_id
+    })
+    if unexplained:
+        raise EntryAskFromLatchMissingError(
+            f"{station}/{climate_day}: filled order(s) on instrument(s) "
+            f"{unexplained!r} have no corroborating reason='taken' trial-day "
+            f"latch record (record={record!r}).",
+        )
+    ti = next(
+        ti for ti in tape_instruments if str(ti.instrument.id) == record.instrument_id
+    )
+    return {
+        record.instrument_id: _entry_context_for(
+            ti, scheduled_release_at_ns=scheduled_release_at_ns, entry_ask=record.ask,
+        ),
+    }
+
+
 SettlementByKey = dict[tuple[str, str], "NwsClimateDay"]
 
 
@@ -404,8 +487,22 @@ def run_one_precision_arm(
     instruments = [ti.instrument for ti in tape_instruments]
     market_data: list[Data] = []
     for ti in tape_instruments:
-        market_data.extend(ti.quotes)
+        # D2: depths BEFORE quotes. The adapter stamps a quote and its own
+        # depth snapshot with the IDENTICAL `ts_init` (one WS message --
+        # `adapters/polymarket_us/parsing.py:734,824`). `_group_market_data`
+        # groups by first-appearance order in this list
+        # (`backtest_harness.py`'s `market_data` docstring), and
+        # `BacktestEngine.add_data` re-sorts its accumulated `_data` by
+        # `ts_init` with Python's stable `sorted()`
+        # (`backtest/engine.pyx:899`, `self._data = sorted(self._data,
+        # key=lambda x: x.ts_init)`) after EACH `add_data` call. Whichever
+        # group is added first stays earlier for a tied `ts_init`, so
+        # depths-first here is what makes an `OrderBookDepth10` precede its
+        # own-instant `QuoteTick` -- the book already reflects the new
+        # snapshot when `on_quote_tick` submits the IOC, instead of the
+        # PREVIOUS (stale) snapshot.
         market_data.extend(ti.depths)
+        market_data.extend(ti.quotes)
     if not market_data:
         return PrecisionArmResult(trials=(), strategy_refusals={}, strategy_diagnostics={})
     ts_values = [record.ts_init for record in market_data]
@@ -460,13 +557,20 @@ def run_one_precision_arm(
     )
 
     with backtest(config, strategies=(strategy,), allow_idle_strategies=True) as engine:
-        entry_contexts: dict[str, ReplayEntryContext] = {}
-        for ti in tape_instruments:
-            entry_contexts[str(ti.instrument.id)] = _entry_context_for(
-                ti,
-                scheduled_release_at_ns=max(ts_values) + SEVEN_DAYS_NS,
-                entry_ask=Decimal(str(ti.quotes[0].ask_price)) if ti.quotes else Decimal(0),
-            )
+        # D1: `entry_ask` comes from the strategy's own trial-day latch
+        # record, never a tape quote. `tape_instruments` is non-empty here
+        # (guarded by the `market_data` emptiness check above) and every
+        # entry shares one `climate_day` -- `_select_capture_instruments`
+        # filters to exactly one before this function is ever called.
+        climate_day = tape_instruments[0].facts.climate_day.isoformat()
+        entry_contexts = _entry_contexts_from_latch(
+            tape_instruments,
+            engine,
+            station=station,
+            climate_day=climate_day,
+            latch_store_path=latch_store_path,
+            scheduled_release_at_ns=max(ts_values) + SEVEN_DAYS_NS,
+        )
         trials = filled_trials_from_engine(engine, entry_contexts)
     return PrecisionArmResult(
         trials=trials,

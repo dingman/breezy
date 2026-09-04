@@ -68,9 +68,11 @@ if TYPE_CHECKING:  # pragma: no cover - typing only
     from breezy.domain.weather_bucket_facts import WeatherBucketFacts
 
 __all__ = [
+    "EXPIRATION_LEG_PREFIX",
     "PAPER_TRIAL_ID_PREFIX",
     "PRECISION_ARMS",
     "ForeignReplayDataError",
+    "ImpossibleFillPriceError",
     "PaperReplayInputs",
     "PrecisionMode",
     "QuoteOnlyReplayError",
@@ -93,6 +95,12 @@ PAPER_TRIAL_ID_PREFIX: Final[str] = "paper_replay/current_rung_hold/trial"
 #: (converged peer review item 5). `nws_integer_c` is the default -- see
 #: `PaperReplayInputs.precision_mode`.
 PRECISION_ARMS: Final[tuple[str, ...]] = ("nws_integer_c", "archive_metar")
+
+#: `check_instrument_expiration`'s own synthetic settlement-close order id
+#: prefix (`backtest/engine.pyx:5952`) -- module-level and exported so a
+#: caller building `entry_contexts` (D1) can apply the SAME exclusion this
+#: module uses in `filled_trials_from_engine`, rather than re-deriving it.
+EXPIRATION_LEG_PREFIX: Final[str] = "EXPIRATION-LEG-"
 
 _NS_PER_MINUTE: Final[int] = 60_000_000_000
 #: Archive METAR native precision (`iem_observations.py` always stamps 5).
@@ -117,6 +125,21 @@ class QuoteOnlyReplayError(ValueError):
     `book_type != L1_MBP` (`engine.pyx:4509,4551`); feeding quotes with no
     depth would decide identically to a real run and fill NEVER, silently.
     Refused explicitly instead (RED test 2).
+    """
+
+
+class ImpossibleFillPriceError(ValueError):
+    """A BUY IOC filled BELOW its own decision-instant `entry_ask` (D3).
+
+    Every entry order this replay ever submits is a BUY IOC at
+    `limit=entry_ask` (`CurrentRungHoldStrategy`'s `order_side=OrderSide.BUY`,
+    `time_in_force=TimeInForce.IOC`, submitted at the displayed best ask) --
+    price improvement inside the SAME book snapshot the decision saw is
+    impossible for that order shape, so `fill_px < entry_ask` can only mean
+    the order crossed a DIFFERENT book than the one the decision priced off
+    (e.g. mis-ordered market data, D2's shape, or a wrong `entry_ask`). This
+    is refused as a fill-fidelity defect rather than ever reported as
+    negative slippage.
     """
 
 
@@ -296,13 +319,16 @@ def filled_trials_from_engine(
     otherwise indistinguishable from a real entry to this function. That
     settlement-close leg is excluded here by its `client_order_id` prefix, or
     it would be double-counted as a second trial per instrument.
+
+    D3: a fill below `ctx.entry_ask` is refused (`ImpossibleFillPriceError`)
+    rather than ever built into a `FilledTrial` -- see that error's
+    docstring.
     """
-    _EXPIRATION_LEG_PREFIX: Final[str] = "EXPIRATION-LEG-"
     trials: list[FilledTrial] = []
     for order in engine.cache.orders():
         if order.status != OrderStatus.FILLED:
             continue
-        if str(order.client_order_id).startswith(_EXPIRATION_LEG_PREFIX):
+        if str(order.client_order_id).startswith(EXPIRATION_LEG_PREFIX):
             continue
         instrument_id = str(order.instrument_id)
         ctx = entry_contexts.get(instrument_id)
@@ -311,6 +337,13 @@ def filled_trials_from_engine(
         fee = Decimal(0)
         for money in order.commissions():
             fee += Decimal(str(money.as_double()))
+        fill_px = Decimal(str(order.avg_px)) if order.avg_px is not None else Decimal(0)
+        if fill_px < ctx.entry_ask:
+            raise ImpossibleFillPriceError(
+                f"{instrument_id}: fill_px={fill_px} < entry_ask={ctx.entry_ask} "
+                f"(order {order.client_order_id}) -- a BUY IOC at limit=ask cannot "
+                "improve inside the same book snapshot the decision saw.",
+            )
         trial_id = f"{PAPER_TRIAL_ID_PREFIX}/{ctx.station}/{ctx.climate_day}"
         trials.append(
             FilledTrial(
@@ -319,7 +352,7 @@ def filled_trials_from_engine(
                 climate_day=ctx.climate_day,
                 instrument_id=instrument_id,
                 bucket=ctx.bucket,
-                fill_px=Decimal(str(order.avg_px)) if order.avg_px is not None else Decimal(0),
+                fill_px=fill_px,
                 fee=fee,
                 qty=Decimal(str(order.filled_qty)),
                 filled_at_ns=int(order.ts_last),

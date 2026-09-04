@@ -48,6 +48,7 @@ from breezy.runtime.backtest_harness import SettlementInvariantError, backtest
 from breezy.runtime.paper_replay import (
     PRECISION_ARMS,
     ForeignReplayDataError,
+    ImpossibleFillPriceError,
     PaperReplayInputs,
     QuoteOnlyReplayError,
     ReplayEntryContext,
@@ -261,6 +262,61 @@ def _run_engine(store_path: Path, *, ask: str, size: int) -> tuple[FilledTrial, 
 def test_an_ioc_below_minimum_displayed_size_records_no_fill(tmp_path: Path) -> None:
     trials = _run_engine(tmp_path / "state.db", ask="0.40", size=0)
     assert trials == ()
+
+
+# ---------------------------------------------------------------------------
+# RED test D3 -- a fill below its own decision-instant entry_ask is refused,
+# never silently reported as negative slippage. A BUY IOC at limit=ask can
+# only fill AT the displayed ask (this fixture's book) or be rejected --
+# never below it -- so an `entry_ask` set artificially ABOVE the true fill
+# reproduces the impossible-improvement shape without needing a second
+# (lower) book snapshot.
+# ---------------------------------------------------------------------------
+def test_a_fill_below_its_decision_instant_entry_ask_is_refused(tmp_path: Path) -> None:
+    instrument = _instrument()
+    depth_ts = WINDOW_OPEN_NS - 1_000
+    ask = "0.40"
+    quote = _quote(ask=ask, size=10, ts_event=WINDOW_OPEN_NS)
+    depth = _depth(ask=ask, size=10, ts_event=depth_ts)
+    observation_ns = WINDOW_OPEN_NS - 5 * NS_PER_MIN
+    from breezy.domain.station_observation import StationObservation
+
+    observation = StationObservation(
+        station=ICAO,
+        observed_at_ns=observation_ns,
+        received_at_ns=observation_ns + NS_PER_MIN,
+        temp_c_tenths=300,
+        precision_c_tenths=5,
+        is_metar=True,
+        source_channel="iem_asos_metar",
+        assumed_publication_lag_ns=1,
+    )
+    config = build_paper_replay_config(
+        instruments=[instrument],
+        market_data=[quote, depth],
+        weather_data=as_backtest_data([observation]),
+        starting_balances=(Money(10_000, USD),),
+        capture_window_ns=(depth_ts, WINDOW_OPEN_NS),
+        instruments_without_close=frozenset({instrument.id}),
+    )
+    cfg = CurrentRungHoldConfig(instrument_ids=(instrument.id,), stations=(STATION,))
+    strategy = CurrentRungHoldBacktestStrategy(
+        cfg, trial_day_latch_factory=_latch_factory(tmp_path / "state.db"),
+    )
+    with backtest(
+        config, strategies=(strategy,), allow_idle_strategies=True, allow_open_positions=True,
+    ) as engine:
+        # `entry_ask` deliberately ABOVE the true fill (0.40) -- the
+        # impossible-improvement shape D3 refuses.
+        ctx = ReplayEntryContext(
+            station=STATION,
+            climate_day=CLIMATE_DAY.isoformat(),
+            bucket=None,
+            entry_ask=Decimal("0.50"),
+            scheduled_release_at_ns=WINDOW_OPEN_NS + 7 * 24 * 3_600_000_000_000,
+        )
+        with pytest.raises(ImpossibleFillPriceError, match="0.40.*0.50|entry_ask=0.50"):
+            filled_trials_from_engine(engine, {str(instrument.id): ctx})
 
 
 def test_an_ioc_at_displayed_size_one_fills_exactly_one_contract_at_the_displayed_ask(
@@ -510,6 +566,139 @@ def test_a_capture_with_no_close_and_no_final_climate_day_is_refused(
             latch_store_path=tmp_path / "state.db",
             settlement_by_key={},
         )
+
+
+# ---------------------------------------------------------------------------
+# RED test D1 -- entry_ask comes from the trial-day latch, never the tape's
+# first quote. A decoy quote sits hours BEFORE the window at a materially
+# different ask; the real, in-window quote is what the strategy actually
+# decides and fills on.
+# ---------------------------------------------------------------------------
+def _tape_instrument_with_decoy_first_quote(
+    driver: ModuleType, *, decoy_ask: str, real_ask: str, size: int,
+) -> object:
+    instrument = _instrument()
+    facts = read_weather_bucket_facts(instrument.info)
+    decoy_quote = _quote(ask=decoy_ask, size=size, ts_event=_OUTSIDE_WINDOW_NS)
+    decoy_depth = _depth(ask=decoy_ask, size=size, ts_event=_OUTSIDE_WINDOW_NS - 1_000)
+    real_depth_ts = WINDOW_OPEN_NS - 1_000
+    real_quote = _quote(ask=real_ask, size=size, ts_event=WINDOW_OPEN_NS)
+    real_depth = _depth(ask=real_ask, size=size, ts_event=real_depth_ts)
+    return driver.TapeInstrument(
+        instrument=instrument,
+        facts=facts,
+        # Decoy first -- `ti.quotes[0]` is the OLD defect's source.
+        depths=[decoy_depth, real_depth],
+        quotes=[decoy_quote, real_quote],
+        closes=[],
+    )
+
+
+def test_entry_ask_comes_from_the_trial_day_latch_not_the_tapes_first_quote(
+    driver: ModuleType, tmp_path: Path,
+) -> None:
+    tape_instrument = _tape_instrument_with_decoy_first_quote(
+        driver, decoy_ask="0.15", real_ask="0.06", size=10,
+    )
+    final = _final_climate_day(tmax_f=87)
+    settlement_by_key = {(STATION, CLIMATE_DAY.isoformat()): final}
+
+    result = driver.run_one_precision_arm(
+        tape_instruments=[tape_instrument],
+        observation_rows=_OBSERVATION_ROWS,
+        station=STATION,
+        lag_minutes=1,
+        precision_mode="nws_integer_c",
+        latch_store_path=tmp_path / "state.db",
+        settlement_by_key=settlement_by_key,
+    )
+    assert len(result.trials) == 1
+    trial = result.trials[0]
+    # The OLD defect: entry_ask == Decimal("0.15") (the decoy, tape's first
+    # quote). The fix: entry_ask is the REAL decision-instant ask, which is
+    # also what the IOC fills at here (no slippage in this fixture's book).
+    assert trial.entry_ask == Decimal("0.06")
+    assert trial.entry_ask != Decimal("0.15")
+    assert trial.fill_px == Decimal("0.06")
+
+
+def test_a_fill_with_no_corroborating_latch_record_is_refused(
+    driver: ModuleType, tmp_path: Path,
+) -> None:
+    """The refusal half of D1: `_entry_contexts_from_latch` refuses a filled
+    instrument the latch does not corroborate, rather than silently dropping
+    it (`filled_trials_from_engine`'s own `ctx is None -> skip`)."""
+
+    class _FakeOrder:
+        def __init__(self, instrument_id: str) -> None:
+            self.status = driver.OrderStatus.FILLED
+            self.client_order_id = "O-1"
+            self.instrument_id = instrument_id
+
+    class _FakeCache:
+        def orders(self) -> list[_FakeOrder]:
+            return [_FakeOrder(str(INSTRUMENT_ID))]
+
+    class _FakeEngine:
+        def __init__(self) -> None:
+            self.cache = _FakeCache()
+
+    with pytest.raises(driver.EntryAskFromLatchMissingError):
+        driver._entry_contexts_from_latch(
+            [],
+            _FakeEngine(),
+            station=STATION,
+            climate_day=CLIMATE_DAY.isoformat(),
+            latch_store_path=tmp_path / "state.db",
+            scheduled_release_at_ns=WINDOW_OPEN_NS + 7 * 24 * 3_600_000_000_000,
+        )
+
+
+# ---------------------------------------------------------------------------
+# RED test D2 -- a quote and its own-instant depth snapshot (identical
+# ts_init, one WS message) must resolve depth-before-quote: the fill must
+# reflect the NEW snapshot's ask, never the stale, pre-existing one.
+# ---------------------------------------------------------------------------
+def _tape_instrument_with_tied_depth_update(
+    driver: ModuleType, *, stale_ask: str, new_ask: str, size: int,
+) -> object:
+    instrument = _instrument()
+    facts = read_weather_bucket_facts(instrument.info)
+    stale_depth = _depth(ask=stale_ask, size=size, ts_event=WINDOW_OPEN_NS - 1_000)
+    # SAME ts_init as the quote below -- one WS message (D2).
+    new_depth = _depth(ask=new_ask, size=size, ts_event=WINDOW_OPEN_NS)
+    quote = _quote(ask=new_ask, size=size, ts_event=WINDOW_OPEN_NS)
+    return driver.TapeInstrument(
+        instrument=instrument, facts=facts, depths=[stale_depth, new_depth], quotes=[quote],
+        closes=[],
+    )
+
+
+def test_a_quote_and_its_own_instant_depth_update_fills_the_new_snapshot(
+    driver: ModuleType, tmp_path: Path,
+) -> None:
+    tape_instrument = _tape_instrument_with_tied_depth_update(
+        driver, stale_ask="0.04", new_ask="0.06", size=10,
+    )
+    final = _final_climate_day(tmax_f=87)
+    settlement_by_key = {(STATION, CLIMATE_DAY.isoformat()): final}
+
+    result = driver.run_one_precision_arm(
+        tape_instruments=[tape_instrument],
+        observation_rows=_OBSERVATION_ROWS,
+        station=STATION,
+        lag_minutes=1,
+        precision_mode="nws_integer_c",
+        latch_store_path=tmp_path / "state.db",
+        settlement_by_key=settlement_by_key,
+    )
+    assert len(result.trials) == 1
+    trial = result.trials[0]
+    # The OLD defect: the quote sorts before its own-instant depth update, so
+    # the IOC fills against the STALE 0.04 level. The fix: 0.06, the level
+    # actually displayed at the decision instant.
+    assert trial.fill_px == Decimal("0.06")
+    assert trial.fill_px != Decimal("0.04")
 
 
 # ---------------------------------------------------------------------------
