@@ -873,3 +873,65 @@ def test_a_genuinely_absent_coefficient_still_says_absent() -> None:
         PolymarketUSFeeModel().get_commission(
             order, Quantity.from_int(100), Price.from_str("0.50"), tampered
         )
+
+
+# ---------------------------------------------------------------------------
+# R-8-PRE-1 -- venue has NO minimum taker fee; 1-contract bounds
+# ---------------------------------------------------------------------------
+#
+# See docs/evidence/venue/polymarket_us/OQ8_MINIMUM_FEE_2026-09-04.md: the
+# venue's fee docs state "Can fees ever be zero? Yes." with no floor, and that
+# fees are banker's-rounded to the cent. These two tests pin the 1-contract
+# bounds that R-8's precondition relies on: min = $0.00, and the per-fill
+# taker charge at C=1 is bounded above by bankers(theta * p * (1-p)), which is
+# $0.02 at the maximum p=0.50 for the docs' published theta=0.06. Both are
+# expected to pass immediately -- they pin EXISTING model behaviour, not new
+# code.
+
+
+def test_one_contract_at_one_cent_is_charged_zero_fee_documented_no_minimum() -> None:
+    """No minimum taker fee (OQ-8): 1 contract at p=0.01 rounds down to $0.00.
+
+    theta * 1 * 0.01 * 0.99 = 0.000594 -> bankers-rounds to $0.00. Confirms
+    the venue's own FAQ claim ("fees can round down to $0.00") against this
+    model at the documented theta=0.06, per
+    docs/evidence/venue/polymarket_us/OQ8_MINIMUM_FEE_2026-09-04.md.
+    """
+    instrument = with_theta("0.06")
+    model = PolymarketUSFeeModel()
+    order = order_with_liquidity(instrument, LiquiditySide.TAKER)
+
+    assert model.get_commission(
+        order, Quantity.from_int(1), Price.from_str("0.01"), instrument
+    ) == Money(Decimal("0.00"), instrument.quote_currency)
+
+
+@pytest.mark.parametrize("price", ["0.12", "0.25", "0.50", "0.75", "0.99"])
+def test_one_contract_taker_fee_is_bounded_by_two_cents_at_the_p_half_maximum(
+    price: str,
+) -> None:
+    """1-contract taker fee bound (R-8-PRE-1 precondition, OQ-8).
+
+    ``theta * p * (1-p)`` is concave and maximised at ``p = 0.50``, so the
+    per-fill charge at ``C = 1`` and the docs' published ``theta = 0.06`` is
+    bounded above by ``bankers(0.06 * 0.5 * 0.5) = $0.02`` for every price in
+    ``[0, 1]``. Each case is asserted equal to the model's own banker's
+    rounding of the exact figure, not just the bound, so this also pins the
+    exact 1-contract fee at each price. See
+    docs/evidence/venue/polymarket_us/OQ8_MINIMUM_FEE_2026-09-04.md.
+    """
+    theta = Decimal("0.06")
+    instrument = with_theta("0.06")
+    model = PolymarketUSFeeModel()
+    order = order_with_liquidity(instrument, LiquiditySide.TAKER)
+
+    p = Decimal(price)
+    exact = theta * p * (Decimal(1) - p)
+    expected = exact.quantize(Decimal("0.01"), rounding=ROUND_HALF_EVEN)
+
+    charged = model.get_commission(
+        order, Quantity.from_int(1), Price.from_str(price), instrument
+    )
+
+    assert charged == Money(expected, instrument.quote_currency)
+    assert charged.as_decimal() <= Decimal("0.02")
