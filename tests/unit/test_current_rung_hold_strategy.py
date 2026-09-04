@@ -50,6 +50,7 @@ from breezy.domain.weather_bucket_facts import (
     WEATHER_FACTS_STATUS_KNOWN,
 )
 from breezy.registry.sites import default_registry
+from breezy.runtime.backtest_feed import NWS_BACKTEST_CLIENT_ID
 from breezy.runtime.sqlite_store import SqliteStateStore
 from breezy.runtime.submit_intent import (
     SubmitIntentLockHeld,
@@ -663,3 +664,121 @@ class TestRefusalVisibility:
         strategy.on_quote_tick(before_window)  # must not raise
 
         assert strategy.refusals.count("outside_decision_window") == 1
+
+
+class TestObservationSubscription:
+    """Finding 1: `on_start` must subscribe the `StationObservation` stream
+    with the SAME `client_id` the backtest weather stream is registered
+    under (`NWS_BACKTEST_CLIENT_ID`, `runtime/backtest_feed.py`) -- matching
+    every sibling strategy's `nws_climate_day_data_type()` subscription
+    (`running_extreme_lock/strategy.py:274`, `forecast_revision/
+    strategy.py:210`, `cli_settlement_print_lock/strategy.py:607`).
+
+    `Actor.subscribe_data` (installed `nautilus_trader.common.actor.pyx`,
+    lines 1258-1296) makes the msgbus topic subscription UNCONDITIONALLY,
+    before it ever inspects `client_id` -- but the `SubscribeData` command
+    to `DataEngine.execute` is only constructed and sent past that same
+    check (line 1292: `if client_id is None and instrument_id is None:
+    self.log.error(...); return`). So a command reaching the captured
+    endpoint below is direct proof the error-and-return branch was NOT
+    taken: the log line these commands are gated by cannot have fired.
+    """
+
+    def test_on_start_sends_a_subscribe_data_command_with_the_shared_client_id(
+        self, store_path: Path, interior_instrument: BinaryOption,
+    ) -> None:
+        cfg = CurrentRungHoldConfig(instrument_ids=(interior_instrument.id,))
+        strategy = CurrentRungHoldStrategy(
+            cfg, trial_day_latch_factory=_open_latch_factory(store_path),
+        )
+        clock = TestClock()
+        clock.set_time(WINDOW_OPEN_NS)
+        msgbus = TestComponentStubs.msgbus()
+        cache = TestComponentStubs.cache()
+        cache.add_instrument(interior_instrument)
+        portfolio = Portfolio(msgbus=msgbus, cache=cache, clock=clock)
+        strategy.register(
+            trader_id=TraderId("BACKTEST-001"),
+            portfolio=portfolio,
+            msgbus=msgbus,
+            cache=cache,
+            clock=clock,
+        )
+        sent_commands: list[object] = []
+        msgbus.register(endpoint="DataEngine.execute", handler=sent_commands.append)
+
+        strategy.start()
+
+        observation_commands = [
+            command
+            for command in sent_commands
+            if type(command).__name__ == "SubscribeData"
+            and command.data_type.type.__name__ == "StationObservation"
+        ]
+        assert len(observation_commands) == 1
+        assert observation_commands[0].client_id == NWS_BACKTEST_CLIENT_ID
+
+
+class TestDiagnosticsCounter:
+    """Finding 2: the three WAIT-state `return`s inside `on_quote_tick`
+    (raw-executable false, no observation yet, rung not current) are not
+    orders being refused -- they are moments this station-day's ONE trial
+    has not arrived yet. They stay OUT of `self.refusals`,
+    `decision.REFUSAL_REASONS`, the latch's `_REASONS`, and
+    `risk.COUNTED_REFUSAL_REASONS` (unchanged), and are instead surfaced
+    through the separate, public `self.diagnostics` counter so an operator
+    can tell "no take yet" apart from "nothing will ever happen".
+    """
+
+    def test_raw_executable_false_increments_the_not_executable_diagnostic(
+        self, store_path: Path, interior_instrument: BinaryOption,
+    ) -> None:
+        rig = _register_and_start(store_path=store_path, instruments=(interior_instrument,))
+        strategy = rig.strategy
+
+        quote = _quote(INTERIOR_ID, ask="0.97", ts_event=WINDOW_OPEN_NS)
+        strategy.on_quote_tick(quote)
+
+        assert strategy.diagnostics.count("in_window_not_executable") == 1
+        assert strategy.refusals.total() == 0
+
+    def test_no_observation_yet_increments_the_no_running_max_diagnostic(
+        self, store_path: Path, interior_instrument: BinaryOption,
+    ) -> None:
+        rig = _register_and_start(store_path=store_path, instruments=(interior_instrument,))
+        strategy = rig.strategy
+
+        quote = _quote(INTERIOR_ID, ask="0.40", ts_event=WINDOW_OPEN_NS)
+        strategy.on_quote_tick(quote)
+
+        assert strategy.diagnostics.count("in_window_no_running_max_yet") == 1
+        assert strategy.refusals.total() == 0
+
+    def test_rung_not_current_increments_the_rung_not_current_diagnostic(
+        self, store_path: Path, interior_instrument: BinaryOption,
+    ) -> None:
+        rig = _register_and_start(store_path=store_path, instruments=(interior_instrument,))
+        strategy = rig.strategy
+        # 32F (0.0C, exact METAR point) is nowhere near this instrument's
+        # [86, 87] rung -- `facts.contains` is False at both ends, so this
+        # instrument cannot be the currently-active rung.
+        strategy.on_data(_observation(temp_c_tenths=0, observed_at_ns=WINDOW_OPEN_NS - 1))
+
+        quote = _quote(INTERIOR_ID, ask="0.40", ts_event=WINDOW_OPEN_NS)
+        strategy.on_quote_tick(quote)
+
+        assert strategy.diagnostics.count("in_window_rung_not_current") == 1
+        assert strategy.refusals.total() == 0
+
+    def test_diagnostics_never_reach_the_trial_day_latch(
+        self, store_path: Path, interior_instrument: BinaryOption,
+    ) -> None:
+        rig = _register_and_start(store_path=store_path, instruments=(interior_instrument,))
+        strategy = rig.strategy
+
+        quote = _quote(INTERIOR_ID, ask="0.97", ts_event=WINDOW_OPEN_NS)
+        strategy.on_quote_tick(quote)
+
+        assert strategy.diagnostics.count("in_window_not_executable") == 1
+        record = strategy._latch.record(STATION, CLIMATE_DAY.isoformat())  # type: ignore[union-attr]
+        assert record is None

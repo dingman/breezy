@@ -106,6 +106,7 @@ from breezy.domain.weather_bucket_facts import (
 )
 from breezy.ingest.iem_observations import station_observation_data_type
 from breezy.registry.sites import default_registry
+from breezy.runtime.backtest_feed import NWS_BACKTEST_CLIENT_ID
 from breezy.strategy.current_rung_hold.config import CurrentRungHoldConfig
 from breezy.strategy.current_rung_hold.decision import (
     Decision,
@@ -147,6 +148,19 @@ _OUTSIDE_DECISION_WINDOW: Final[str] = "outside_decision_window"
 #: siblings; ALL configured ids unresolved is still fatal (unchanged
 #: fail-closed posture).
 _INSTRUMENT_UNRESOLVED: Final[str] = "instrument_unresolved"
+
+#: WAIT-state diagnostics -- deliberately NOT refusal reasons. Each names a
+#: quote that arrived inside the decision window but was not yet this
+#: station-day's trial: ``evaluate_decision`` is never reached, nothing is
+#: recorded to the trial-day latch, and the refusal alerter never fires (see
+#: ``on_quote_tick``'s three matching ``return`` statements and the module
+#: docstring). They exist ONLY so an operator staring at a zero-take run can
+#: tell "nothing happened yet" apart from "nothing will ever happen" --
+#: never added to ``decision.REFUSAL_REASONS``, the latch's ``_REASONS``, or
+#: ``risk.COUNTED_REFUSAL_REASONS``.
+_DIAG_NOT_EXECUTABLE: Final[str] = "in_window_not_executable"
+_DIAG_NO_RUNNING_MAX_YET: Final[str] = "in_window_no_running_max_yet"
+_DIAG_RUNG_NOT_CURRENT: Final[str] = "in_window_rung_not_current"
 
 #: The venue key this package looks up every ``(venue, city)`` registry
 #: accessor with -- see ``breezy.registry.sites``. ``city`` is the station
@@ -210,6 +224,13 @@ class CurrentRungHoldStrategy(Strategy):
         #: strategy do nothing, or was it stopped from doing something?"
         #: (mirrors every sibling weather strategy's ``self.refusals``).
         self.refusals = RefusalCounter()
+        #: PUBLIC -- WAIT-state visibility, never a refusal (see
+        #: ``_DIAG_NOT_EXECUTABLE`` et al.'s module-level docstring). Reuses
+        #: ``RefusalCounter``'s dict-of-ints shape (it validates nothing
+        #: about *which* strings it is handed, so it is equally correct as
+        #: a plain named counter here) rather than inventing a parallel
+        #: type for three keys.
+        self.diagnostics = RefusalCounter()
         #: Set post-construction by
         #: ``composition.install_current_rung_hold_refusal_watch`` (never via
         #: ``__init__`` -- the alerter's ``site`` is ``str(strategy.id)``,
@@ -289,7 +310,9 @@ class CurrentRungHoldStrategy(Strategy):
             self.stop()
             return
 
-        self.subscribe_data(station_observation_data_type())
+        self.subscribe_data(
+            station_observation_data_type(), client_id=NWS_BACKTEST_CLIENT_ID,
+        )
 
     def on_stop(self) -> None:
         """Close the trial-day latch this strategy owns, unconditionally.
@@ -356,11 +379,13 @@ class CurrentRungHoldStrategy(Strategy):
             and size >= self._config.minimum_displayed_size
         )
         if not raw_executable:
+            self.diagnostics.record(_DIAG_NOT_EXECUTABLE)
             return  # in-window, not yet the candidate: wait, no latch (module docstring)
 
         accumulator = self._accumulators.get(station)
         running_max = None if accumulator is None else accumulator.value_at(now_ns)
         if running_max is None or accumulator is None:
+            self.diagnostics.record(_DIAG_NO_RUNNING_MAX_YET)
             return  # no observation yet: not this instrument's decision instant
         # Route to `evaluate_decision` whenever the observation interval
         # TOUCHES this instrument's rung at either end, not only when its
@@ -372,6 +397,7 @@ class CurrentRungHoldStrategy(Strategy):
         if not (
             facts.contains(running_max.lower_f) or facts.contains(running_max.upper_f)
         ):
+            self.diagnostics.record(_DIAG_RUNG_NOT_CURRENT)
             return  # this instrument's rung cannot be the current one
 
         if facts.upper_f is None:
