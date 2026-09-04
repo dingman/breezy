@@ -525,3 +525,128 @@ def test_gather_taken_trials_excludes_negative_edge_and_dead_cells(mb: ModuleTyp
     taken = mb.gather_taken_trials(summaries)
     assert len(taken) == 1
     assert taken[0].city == "MDW"
+
+
+# ---------------------------------------------------------------------------
+# Live family (lags 30/45) -- `docs/evidence/grok_live_small_spec_rev2_2026-09-04.md`
+# SS1/SS6: live receipts match the measured NWS publication lag, not the
+# archive's 10/15-min arms. 5/10/15 remain an archive-only upper bound;
+# 30/45 is the new live family and must be evaluated and reported SEPARATELY
+# from the archive family, never merged.
+# ---------------------------------------------------------------------------
+
+
+def test_lag_sweep_includes_the_live_arms_30_and_45(mb: ModuleType) -> None:
+    assert 30 in mb.LAG_MINUTES_SWEEP
+    assert 45 in mb.LAG_MINUTES_SWEEP
+    # Archive-only upper bound arms are kept, not replaced.
+    assert 5 in mb.LAG_MINUTES_SWEEP
+    assert 10 in mb.LAG_MINUTES_SWEEP
+    assert 15 in mb.LAG_MINUTES_SWEEP
+
+
+def test_k_b_required_lags_live_is_30_and_45_and_archive_is_unchanged(
+    mb: ModuleType,
+) -> None:
+    assert mb.K_B_REQUIRED_LAGS == (10, 15)
+    assert mb.K_B_REQUIRED_LAGS_LIVE == (30, 45)
+
+
+def test_evaluate_mb_family_live_requires_30_and_45_to_agree(mb: ModuleType) -> None:
+    dead_at_30 = mb.evaluate_mb(_taken_trials(mb, city="MDW", n=60, k=0, ask=0.06), lag_minutes=30)
+    alive_at_45 = mb.evaluate_mb(
+        _taken_trials(mb, city="MDW", n=150, k=40, ask=0.06), lag_minutes=45
+    )
+    live_family = mb.evaluate_mb_family(
+        {30: dead_at_30, 45: alive_at_45}, required_lags=mb.K_B_REQUIRED_LAGS_LIVE
+    )
+    assert live_family == "UNDERPOWERED"  # disagreement
+
+    both_dead = {
+        30: mb.evaluate_mb(_taken_trials(mb, city="MDW", n=60, k=0, ask=0.06), lag_minutes=30),
+        45: mb.evaluate_mb(_taken_trials(mb, city="MDW", n=60, k=0, ask=0.06), lag_minutes=45),
+    }
+    assert (
+        mb.evaluate_mb_family(both_dead, required_lags=mb.K_B_REQUIRED_LAGS_LIVE) == "MB_DEAD"
+    )
+
+
+def test_evaluate_mb_family_default_required_lags_is_still_the_archive_pair(
+    mb: ModuleType,
+) -> None:
+    # Existing callers that omit `required_lags` must keep measuring the
+    # archive family (10, 15) -- unchanged default, no call-site breakage.
+    both_dead = {
+        10: mb.evaluate_mb(_taken_trials(mb, city="MDW", n=60, k=0, ask=0.06), lag_minutes=10),
+        15: mb.evaluate_mb(_taken_trials(mb, city="MDW", n=60, k=0, ask=0.06), lag_minutes=15),
+    }
+    assert mb.evaluate_mb_family(both_dead) == "MB_DEAD"
+
+
+def test_dense_stations_excludes_nyc_for_the_live_family(mb: ModuleType) -> None:
+    # `docs/evidence/grok_live_small_spec_rev2_2026-09-04.md` SS1: "NYC
+    # excluded" for the live family. Reuse the existing CONTAMINATED_STATIONS
+    # / DENSE_STATIONS logic (`cli_basis_offer_gate_scan.CONTAMINATED_STATIONS`)
+    # rather than duplicate a station list -- DENSE_STATIONS already excludes
+    # NYC everywhere it is used (archive table AND tape join), so the live
+    # family's station set is DENSE_STATIONS itself, not a new constant.
+    assert "NYC" not in mb.DENSE_STATIONS
+    assert set(mb.DENSE_STATIONS) == {"LAX", "MDW", "MIA", "SFO"}
+
+
+def _empty_verdicts(mb: ModuleType) -> dict[int, object]:
+    return {lag: mb.evaluate_mb((), lag_minutes=lag) for lag in mb.LAG_MINUTES_SWEEP}
+
+
+def test_build_report_prints_both_family_verdicts_separately_labelled(
+    mb: ModuleType,
+) -> None:
+    summaries_by_lag = {lag: () for lag in mb.LAG_MINUTES_SWEEP}
+    verdicts = _empty_verdicts(mb)
+    report = mb.build_report(
+        archive={},
+        summaries_by_lag=summaries_by_lag,
+        verdicts=verdicts,
+        family_outcome_archive=mb.evaluate_mb_family(verdicts),
+        family_outcome_live=mb.evaluate_mb_family(
+            verdicts, required_lags=mb.K_B_REQUIRED_LAGS_LIVE
+        ),
+        preflight="ok",
+        generated_at=dt.datetime(2026, 9, 4, tzinfo=dt.UTC),
+    )
+    # Existing heading text/shape preserved for the archive family --
+    # nightly `breezy-mb-daily` consumers and any K1/offer-gate parser of
+    # this report see the same archive section they always have.
+    assert "## Part A -- archive p_hold table" in report
+    assert "## Part B -- tape join, per-station-day, per lag" in report
+    assert "## Independence and the clock" in report
+    # New: two separately labelled, never-merged family verdicts.
+    assert "archive (10, 15)" in report
+    assert "live (30, 45)" in report
+    archive_idx = report.index("archive (10, 15)")
+    live_idx = report.index("live (30, 45)")
+    assert archive_idx != live_idx
+
+
+def test_build_report_clock_section_prints_live_family_dates(mb: ModuleType) -> None:
+    summaries_by_lag = {lag: () for lag in mb.LAG_MINUTES_SWEEP}
+    verdicts = _empty_verdicts(mb)
+    report = mb.build_report(
+        archive={},
+        summaries_by_lag=summaries_by_lag,
+        verdicts=verdicts,
+        family_outcome_archive=mb.evaluate_mb_family(verdicts),
+        family_outcome_live=mb.evaluate_mb_family(
+            verdicts, required_lags=mb.K_B_REQUIRED_LAGS_LIVE
+        ),
+        preflight="ok",
+        generated_at=dt.datetime(2026, 9, 4, tzinfo=dt.UTC),
+    )
+    # Grok rev2 SS6 clock table: 3 taken/listed-day, ~9% venue skip,
+    # earliest D0=2026-09-05 -> n=60 at D0+22d (2026-09-27), n=150 at
+    # D0+55d (2026-10-30).
+    assert "9%" in report
+    assert "D0+22" in report
+    assert "D0+55" in report
+    assert "2026-09-27" in report
+    assert "2026-10-30" in report

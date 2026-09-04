@@ -125,6 +125,9 @@ __all__ = [
     "ASK_BANDS",
     "DENSE_STATIONS",
     "FEE_THETA",
+    "K_B_REQUIRED_LAGS",
+    "K_B_REQUIRED_LAGS_LIVE",
+    "LAG_MINUTES_SWEEP",
     "N_MIN",
     "POOLED_KILL_N_MIN",
     "STRATUM_KILL_N_MIN",
@@ -177,9 +180,19 @@ def break_even(ask: float) -> float:
     """`ask + theta*ask*(1-ask)` -- the settle rate at which `ask` breaks even."""
     return ask + FEE_THETA * ask * (1.0 - ask)
 
-#: SS1's latency sensitivity sweep. K-B must hold at 10 AND 15.
-LAG_MINUTES_SWEEP: Final[tuple[int, ...]] = (5, 10, 15)
+#: SS1's latency sensitivity sweep. The archive family (K-B) must hold at
+#: 10 AND 15; 5/10/15 are the archive-only upper bound (a faster feed we do
+#: not have). 30 and 45 are the LIVE family, matching the measured NWS
+#: publication lag (`docs/evidence/observation_source_latency_2026-09-04.md`;
+#: `docs/evidence/grok_live_small_spec_rev2_2026-09-04.md` SS1/SS6).
+LAG_MINUTES_SWEEP: Final[tuple[int, ...]] = (5, 10, 15, 30, 45)
 K_B_REQUIRED_LAGS: Final[tuple[int, ...]] = (10, 15)
+
+#: Live family required lags -- kill/survive agreement is evaluated
+#: SEPARATELY from the archive family above, never merged with it. A
+#: 10/15 archive SURVIVE does not license a live claim; only 30-and-45
+#: agreement does (`grok_live_small_spec_rev2_2026-09-04.md` SS1).
+K_B_REQUIRED_LAGS_LIVE: Final[tuple[int, ...]] = (30, 45)
 
 #: Kill-amendment thresholds (`docs/evidence/grok_mb_kill_amendment_2026-09-02.md`).
 #: Evidence is the REALIZED hold rate of TAKEN trials against ask+fee, never
@@ -848,9 +861,16 @@ def evaluate_mb(
 
 def evaluate_mb_family(
     verdicts_by_lag: Mapping[int, MbVerdict],
+    *,
+    required_lags: tuple[int, ...] = K_B_REQUIRED_LAGS,
 ) -> Literal["MB_DEAD", "UNDERPOWERED", "ALIVE"]:
-    """Family verdict: MB_DEAD/ALIVE require both K-B lags (10 and 15) to agree."""
-    required = tuple(verdicts_by_lag[lag] for lag in K_B_REQUIRED_LAGS)
+    """Family verdict: MB_DEAD/ALIVE require both `required_lags` to agree.
+
+    Defaults to the archive family (10, 15) so existing call sites are
+    unaffected. Pass `required_lags=K_B_REQUIRED_LAGS_LIVE` for the live
+    family (30, 45) -- the two verdicts are never merged into one.
+    """
+    required = tuple(verdicts_by_lag[lag] for lag in required_lags)
     if all(verdict.outcome == "MB_DEAD" for verdict in required):
         return "MB_DEAD"
     if all(verdict.outcome == "ALIVE" for verdict in required):
@@ -929,7 +949,8 @@ def build_report(
     archive: Mapping[ArchiveCellKey, ArchiveCell],
     summaries_by_lag: Mapping[int, Sequence[MbStationDaySummary]],
     verdicts: Mapping[int, MbVerdict],
-    family_outcome: Literal["MB_DEAD", "UNDERPOWERED", "ALIVE"],
+    family_outcome_archive: Literal["MB_DEAD", "UNDERPOWERED", "ALIVE"],
+    family_outcome_live: Literal["MB_DEAD", "UNDERPOWERED", "ALIVE"],
     preflight: str,
     generated_at: dt.datetime,
 ) -> str:
@@ -1027,9 +1048,18 @@ def build_report(
         add("")
         add(f"**{verdict.outcome}** (lag={lag}min) -- {verdict.detail}")
         add("")
-    add("## Family verdict (both K-B lags, 10 and 15, must agree)")
+    add("## Family verdict -- archive (10, 15) (both K-B lags must agree)")
     add("")
-    add(f"**{family_outcome}**")
+    add(f"**{family_outcome_archive}**")
+    add("")
+    add(
+        "## Family verdict -- live (30, 45) "
+        "(`docs/evidence/grok_live_small_spec_rev2_2026-09-04.md` SS1: lags "
+        "30 and 45 must agree; evaluated SEPARATELY from the archive family "
+        "above, never merged)"
+    )
+    add("")
+    add(f"**{family_outcome_live}**")
     add("")
     add("## Independence and the clock")
     add("")
@@ -1047,6 +1077,17 @@ def build_report(
         "If taken stays at the 09-01 rate (~1/day), n=60/150 are 60/150 "
         "calendar days out. Archive table is frozen; only the tape-side "
         "Wilson waits."
+    )
+    add("")
+    add(
+        "Live-family clock (memo, "
+        "`docs/evidence/grok_live_small_spec_rev2_2026-09-04.md` SS6): 3 "
+        "taken/listed-day at a ~9% venue skip rate (~2.73 taken/day). "
+        "Earliest D0=2026-09-05 -> n=60 at D0+22d (2026-09-27), n=150 at "
+        "D0+55d (2026-10-30), both SON. If taken stays at the 09-01 rate "
+        "(~1/listed-day), n=60 is D0+66d (2026-11-10) and n=150 is D0+165d "
+        "(2027-02-17). 3/listed-day is an optimistic cap -- skip-days are "
+        "not trials and are never counted toward n."
     )
     return "\n".join(lines) + "\n"
 
@@ -1154,13 +1195,15 @@ def main(argv: Sequence[str] | None = None) -> int:
         )
         for lag in LAG_MINUTES_SWEEP
     }
-    family_outcome = evaluate_mb_family(verdicts)
+    family_outcome_archive = evaluate_mb_family(verdicts)
+    family_outcome_live = evaluate_mb_family(verdicts, required_lags=K_B_REQUIRED_LAGS_LIVE)
 
     report = build_report(
         archive=archive,
         summaries_by_lag=summaries_by_lag,
         verdicts=verdicts,
-        family_outcome=family_outcome,
+        family_outcome_archive=family_outcome_archive,
+        family_outcome_live=family_outcome_live,
         preflight=preflight,
         generated_at=dt.datetime.now(tz=dt.UTC).replace(microsecond=0),
     )
