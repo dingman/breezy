@@ -116,3 +116,57 @@ Gate at every commit: `scripts/ci/run_tests_no_egress.sh`, passed count never dr
 ## Residue
 
 After C4, operator residue is **one command** — `.venv/bin/python scripts/venue/polymarket_us_write_signing_probe.py --sequence [--stamp <token>]` — plus reading its printed verdict. No UI clicks, no hand-placed order, no hand cancel, no manual flatness check, no code edits. Unchanged and out of scope: the operator-only enablement variable, maximum daily budget, and maximum per position (runbook §6) — this sequence assigns none of them and requires none of them, since it never touches the bot's exec path.
+
+## Converged peer review (2026-09-04, BINDING — overrides the sections above on conflict)
+
+Reviewers: architect (REVISE), security-reviewer (REVISE), prediction-market-reviewer (CONVERGE).
+Merged decisions:
+
+1. **Structure.** A PURE helper `scripts/venue/_write_sequence.py` (instrument selection, GTC body
+   builder, v2 document render + closed schema, verdict computation; ZERO `.post(`/`HttpClient`/
+   signing) imported by the probe. Every write egress stays in the B4-exempt probe file, so
+   `B4_EXEMPT_PATHS` (2) and the cage rows are untouched and the zero-importers pin is unaffected
+   (the probe importing a helper is the reverse direction of `find_probe_importers`). The probe stays
+   under the 800-line ceiling.
+2. **One signed-POST helper.** `_signed_post(*, path, body)` computes the canonical string AND the URL
+   from the same `path` argument (keyword-only, validated against
+   `_SIGNABLE_WRITE_PATHS = frozenset({_CANCEL_ALL_PATH, _ORDERS_PATH})` before use, no query);
+   `_signed_post_cancel_all` / `_signed_post_order` are thin body-fixed wrappers; a test asserts
+   `url.endswith(signed_path)` for both. Builder, key loader, headers: reused, never copied.
+3. **`--allow-taker-rest` is DROPPED.** A 400 on `participateDontInitiate` is `REST_AMBIGUOUS` →
+   one-shot cleanup → `INCONCLUSIVE`; the venue's maker-only reject-not-match is never removed.
+4. **Selection.** `discovery_candidate_slugs(payload, city_codes=...)` (keyword-only) for the slug
+   set, re-joined on the SAME `GET /v1/markets` payload for `bestAskQuote`, `orderPriceMinTickSize`,
+   `minimumTradeQty`, resolved/closed state; any `VenuePayloadError` → `NO_ELIGIBLE_INSTRUMENT`
+   (never a crash). Page 1 only (deterministic per payload, stated). Settlement-proximity exclusion
+   considered and not needed (T+1 08:00 ET settlement). Floor `$0.20`, tick `0.01`, min qty ≤ 1.
+5. **S4 tolerance.** One bounded re-read (fixed 250 ms sleep, exactly one retry, injected sleeper)
+   before `OQB_NO`; read-your-writes consistency is not documented by the venue.
+6. **Intent marker.** `paths: tuple[str, ...]`; legacy passes exactly `(_CANCEL_ALL_PATH,)`
+   (behaviour byte-identical); `MARKER_DOCUMENT_FIELDS` closed pin added.
+7. **Interruption.** The `except BaseException` partial artefact carries ALL 13 v2 fields with
+   `verdict=INCONCLUSIVE`; the runbook names the recovery: one legacy (cancel-all-only) run.
+8. **Artefact rule.** Written iff at least one SIGNED request was issued (S1 failures yes, S2 no).
+   v2 gets its OWN filename builder and writer (`write_sequence_artifact`); `PROBE_DOCUMENT_FIELDS
+   == 7` re-asserted in the new test module. A `.sha256` sidecar is written beside the artefact.
+9. **Body grammar.** Built in the helper; the test derives the expected key set from the imported
+   `ORDER_BODY_KEYS − {synchronousExecution, maxBlockTime} ∪ {participateDontInitiate}` and
+   `price` uses the same `f"{price:.2f}"` shape as `build_order_body`. `ORDER_BODY_KEYS` itself is
+   never widened (it would loosen the live IOC pin).
+10. **stdout test** covers the `describe_exception` path explicitly: no body, id, slug, header or
+    credential fragment on any branch including exceptions.
+11. **Cancel-all scope, restated:** impossible to cancel an unrelated order for IN-REPO writers
+    (only `write_transport.py:156,175` ← `exec/client.py`, unreachable while the flag is False);
+    runbook precondition: no manual venue order may exist for the run's duration.
+12. **C5 (the flip) is specified now:** add `write_canonical_unverified` beside
+    `write_canonical_verified` in `tests/unit/test_polymarket_us_submit_order_chain.py` (the only
+    module allowed to set the attribute, per its `setattr_hits` pin) and use it in
+    `test_order_submission_permit_issuance.py::test_write_canonical_string_unverified_refuses` and the
+    exec-chain refusal test; `test_polymarket_us_write_transport.py:576` becomes `is True`;
+    add a factories test that `order_sender` is the live write transport when the flag is True
+    (`factories.py:725`, bound by from-import at `:102`); state in the commit that
+    `order_enablement.py`'s gates remain the blocking controls. The commit message PASTES the
+    rendered artefact JSON verbatim plus its sha256; C5 lands only on `verdict=CLOSED_YES_BOTH_VERBS`.
+
+Build: C1–C3 in one worktree (helper + probe + tests, RED first), C4 runbook by the coordinator, then
+independent review (code-reviewer + security-reviewer), then the LIVE run, then C5.
