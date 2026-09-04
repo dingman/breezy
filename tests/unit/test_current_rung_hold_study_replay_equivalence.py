@@ -36,6 +36,10 @@ from nautilus_trader.model.objects import Price, Quantity
 from nautilus_trader.portfolio import Portfolio
 from nautilus_trader.test_kit.stubs.component import TestComponentStubs
 
+from breezy.adapters.polymarket_us.parsing import (
+    FEE_SCHEDULE_STATUS_KEY,
+    FEE_SCHEDULE_STATUS_KNOWN,
+)
 from breezy.domain.station_observation import StationObservation
 from breezy.domain.weather_bucket_facts import (
     CLIMATE_DAY_KEY,
@@ -115,6 +119,7 @@ def _interior_instrument() -> BinaryOption:
             MEASURE_KEY: "high",
             STRIKE_LOWER_F_KEY: 86,
             STRIKE_UPPER_F_KEY: 87,
+            FEE_SCHEDULE_STATUS_KEY: FEE_SCHEDULE_STATUS_KNOWN,
         },
     )
 

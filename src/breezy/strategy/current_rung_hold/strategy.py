@@ -95,6 +95,8 @@ from nautilus_trader.model.enums import OrderSide, TimeInForce
 from nautilus_trader.model.identifiers import InstrumentId
 from nautilus_trader.trading.strategy import Strategy
 
+from breezy.adapters.polymarket_us.errors import FeeScheduleUnknownError
+from breezy.adapters.polymarket_us.parsing import assert_fee_schedule_known
 from breezy.domain.season import season_for
 from breezy.domain.station_observation import StationObservation
 from breezy.domain.weather_bucket_facts import (
@@ -106,6 +108,7 @@ from breezy.ingest.iem_observations import station_observation_data_type
 from breezy.registry.sites import default_registry
 from breezy.strategy.current_rung_hold.config import CurrentRungHoldConfig
 from breezy.strategy.current_rung_hold.decision import (
+    Decision,
     DecisionInputs,
     Refuse,
     Take,
@@ -118,6 +121,7 @@ from breezy.strategy.weather_common.running_extreme import RunningExtremeAccumul
 if TYPE_CHECKING:  # pragma: no cover - typing only
     from nautilus_trader.core.data import Data
     from nautilus_trader.model.data import QuoteTick
+    from nautilus_trader.model.instruments import Instrument
 
 __all__ = [
     "CurrentRungHoldStrategy",
@@ -336,30 +340,35 @@ class CurrentRungHoldStrategy(Strategy):
             width_code, m_code = _WIDTH_INTERIOR, running_max.lower_f - facts.lower_f
 
         instrument = self.cache.instrument(tick.instrument_id)
-        fee_coefficient = (
-            instrument.maker_fee
-            if instrument is not None and isinstance(instrument.maker_fee, Decimal)
-            else Decimal(-1)
-        )
+        fee_coefficient = self._guarded_fee_coefficient(instrument)
 
-        inputs = DecisionInputs(
-            station=station,
-            climate_day=climate_day,
-            now_ns=now_ns,
-            ladder=self._ladders[(station, climate_day_key)],
-            fee_coefficient=fee_coefficient,
-            ask=ask,
-            size=size,
-            running_max=running_max,
-            staleness_ns=accumulator.staleness_ns(now_ns),
-            config=self._config,
-            season=season_for(climate_day),
-            hour_lst=hour_lst,
-            width_code=width_code,
-            m_code=m_code,
-            latch_consumed=False,
-        )
-        decision = evaluate_decision(inputs)
+        decision: Decision
+        if fee_coefficient is None:
+            # Barrier F1 (`tests/unit/test_polymarket_us_fee_guard.py`): an
+            # absent/unresolved fee schedule is routed to the SAME counted,
+            # latched refusal `evaluate_decision` emits for a KNOWN-but-
+            # mismatched coefficient (`decision.py`'s rule order step 2),
+            # never a raise and never a silent default.
+            decision = Refuse("fee_schedule_mismatch")
+        else:
+            inputs = DecisionInputs(
+                station=station,
+                climate_day=climate_day,
+                now_ns=now_ns,
+                ladder=self._ladders[(station, climate_day_key)],
+                fee_coefficient=fee_coefficient,
+                ask=ask,
+                size=size,
+                running_max=running_max,
+                staleness_ns=accumulator.staleness_ns(now_ns),
+                config=self._config,
+                season=season_for(climate_day),
+                hour_lst=hour_lst,
+                width_code=width_code,
+                m_code=m_code,
+                latch_consumed=False,
+            )
+            decision = evaluate_decision(inputs)
         reason = decision.reason if isinstance(decision, Refuse) else "taken"
         self._latch.consume(
             station,
@@ -373,6 +382,27 @@ class CurrentRungHoldStrategy(Strategy):
             self.refusals.record(decision.reason)
             return
         self._maybe_submit(iid, decision)
+
+    def _guarded_fee_coefficient(self, instrument: Instrument | None) -> Decimal | None:
+        """The instrument's fee coefficient, read ONLY after the venue guard passes.
+
+        ``instrument.maker_fee`` is a real, typed ``Decimal`` even while the
+        Polymarket.us fee schedule is UNKNOWN -- Nautilus defaults it, per
+        ``breezy.adapters.polymarket_us.parsing``'s module docstring -- so
+        every read must be preceded by :func:`assert_fee_schedule_known`
+        (barrier F1, ``tests/unit/test_polymarket_us_fee_guard.py``). Returns
+        ``None`` -- never raises, never defaults to a sentinel -- for a
+        missing instrument or an unresolved/unknown schedule; the caller
+        routes that to the existing ``fee_schedule_mismatch`` refusal.
+        """
+        if instrument is None:
+            return None
+        try:
+            assert_fee_schedule_known(instrument)
+        except FeeScheduleUnknownError:
+            return None
+        fee = instrument.maker_fee
+        return fee if isinstance(fee, Decimal) else None
 
     # ------------------------------------------------------------------
     # Execution -- see the module docstring: unreachable in this increment.

@@ -35,6 +35,10 @@ from nautilus_trader.model.objects import Price, Quantity
 from nautilus_trader.portfolio import Portfolio
 from nautilus_trader.test_kit.stubs.component import TestComponentStubs
 
+from breezy.adapters.polymarket_us.parsing import (
+    FEE_SCHEDULE_STATUS_KEY,
+    FEE_SCHEDULE_STATUS_KNOWN,
+)
 from breezy.domain.station_observation import StationObservation
 from breezy.domain.weather_bucket_facts import (
     CLIMATE_DAY_KEY,
@@ -71,8 +75,10 @@ OPEN_UPPER_ID = InstrumentId(Symbol("lax-88-plus"), Venue("POLYMARKET_US"))
 THETA = Decimal("0.06")
 
 
-def _facts_info(*, lower_f: int | None, upper_f: int | None) -> dict[str, object]:
-    return {
+def _facts_info(
+    *, lower_f: int | None, upper_f: int | None, fee_schedule_known: bool = True,
+) -> dict[str, object]:
+    info: dict[str, object] = {
         WEATHER_FACTS_STATUS_KEY: WEATHER_FACTS_STATUS_KNOWN,
         SETTLEMENT_STATION_KEY: STATION,
         CLIMATE_DAY_KEY: CLIMATE_DAY.isoformat(),
@@ -80,11 +86,15 @@ def _facts_info(*, lower_f: int | None, upper_f: int | None) -> dict[str, object
         STRIKE_LOWER_F_KEY: lower_f,
         STRIKE_UPPER_F_KEY: upper_f,
     }
+    if fee_schedule_known:
+        info[FEE_SCHEDULE_STATUS_KEY] = FEE_SCHEDULE_STATUS_KNOWN
+    return info
 
 
 def _instrument(
     instrument_id: InstrumentId, *, lower_f: int | None, upper_f: int | None,
     fee_coefficient: Decimal = THETA,
+    fee_schedule_known: bool = True,
 ) -> BinaryOption:
     increment = Price.from_str("0.01")
     size_increment = Quantity.from_str("1")
@@ -107,7 +117,9 @@ def _instrument(
         taker_fee=fee_coefficient,
         ts_event=0,
         ts_init=0,
-        info=_facts_info(lower_f=lower_f, upper_f=upper_f),
+        info=_facts_info(
+            lower_f=lower_f, upper_f=upper_f, fee_schedule_known=fee_schedule_known,
+        ),
     )
 
 
@@ -332,6 +344,55 @@ class TestObservationRefusals:
         record = strategy._latch.record(STATION, CLIMATE_DAY.isoformat())  # type: ignore[union-attr]
         assert record is not None
         assert record.reason == "observation_ambiguous"
+
+
+class TestFeeScheduleGuard:
+    """Barrier F1: the fee coefficient must come from a GUARDED read.
+
+    ``instrument.maker_fee`` is real, typed ``Decimal`` machinery even when
+    the venue's fee schedule is UNKNOWN (``BinaryOption`` defaults it, per
+    ``breezy.adapters.polymarket_us.parsing``'s module docstring) -- so the
+    strategy must call ``assert_fee_schedule_known`` before ever reading it,
+    and route an unresolved schedule to the SAME counted, latched
+    ``fee_schedule_mismatch`` refusal ``decision.py`` already emits for a
+    mismatched (but KNOWN) coefficient, never raise and never silently
+    default.
+    """
+
+    def test_an_unknown_fee_schedule_refuses_fee_schedule_mismatch(
+        self, store_path: Path,
+    ) -> None:
+        instrument = _instrument(
+            INTERIOR_ID, lower_f=86, upper_f=87, fee_schedule_known=False,
+        )
+        rig = _register_and_start(store_path=store_path, instruments=(instrument,))
+        strategy = rig.strategy
+        strategy.on_data(_observation(temp_c_tenths=300, observed_at_ns=WINDOW_OPEN_NS - 1))
+        quote = _quote(INTERIOR_ID, ask="0.40", ts_event=WINDOW_OPEN_NS)
+        strategy.on_quote_tick(quote)
+
+        assert strategy.refusals.count("fee_schedule_mismatch") == 1
+        record = strategy._latch.record(STATION, CLIMATE_DAY.isoformat())  # type: ignore[union-attr]
+        assert record is not None
+        assert record.reason == "fee_schedule_mismatch"
+
+    def test_a_known_fee_schedule_at_the_required_coefficient_proceeds(
+        self, store_path: Path,
+    ) -> None:
+        instrument = _instrument(
+            INTERIOR_ID, lower_f=86, upper_f=87,
+            fee_coefficient=Decimal("0.06"), fee_schedule_known=True,
+        )
+        rig = _register_and_start(store_path=store_path, instruments=(instrument,))
+        strategy = rig.strategy
+        strategy.on_data(_observation(temp_c_tenths=300, observed_at_ns=WINDOW_OPEN_NS - 1))
+        quote = _quote(INTERIOR_ID, ask="0.40", ts_event=WINDOW_OPEN_NS)
+        strategy.on_quote_tick(quote)
+
+        assert strategy.refusals.count("fee_schedule_mismatch") == 0
+        record = strategy._latch.record(STATION, CLIMATE_DAY.isoformat())  # type: ignore[union-attr]
+        assert record is not None
+        assert record.reason == "taken"
 
 
 class TestTakeNeverSubmits:
