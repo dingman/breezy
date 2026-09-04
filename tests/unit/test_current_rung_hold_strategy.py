@@ -62,6 +62,7 @@ from breezy.strategy.current_rung_hold.strategy import (
     MissingTrialDayLatchError,
 )
 from breezy.strategy.current_rung_hold.trial_day_latch import TrialDayLatch, open_trial_day_latch
+from breezy.strategy.weather_common.refusals import RefusalAlerter
 
 STATION = "LAX"
 ICAO = "KLAX"
@@ -542,3 +543,83 @@ class TestSpanningIntervalRouting:
         record = strategy._latch.record(STATION, CLIMATE_DAY.isoformat())  # type: ignore[union-attr]
         assert record is not None
         assert record.reason == "observation_ambiguous"
+
+
+class _RecordingSink:
+    """An `AlertSink` that keeps what it was handed (see
+    `test_weather_common_refusals.py`'s identical helper).
+    """
+
+    def __init__(self) -> None:
+        self.payloads: list[object] = []
+
+    def emit(self, payload: object) -> None:
+        self.payloads.append(payload)
+
+
+class TestRefusalVisibility:
+    """Review fix: a refusal must surface WITHOUT any component-degrade
+    event -- `on_quote_tick` reports through `strategy.refusal_alerter` on
+    the very tick that produced the refusal, never a
+    `COMPONENT_STATE_TOPIC` subscription. This harness never publishes to
+    `msgbus` at all (module docstring), so a passing test here is
+    per-tick-only proof, not an artifact of some other trigger firing.
+    """
+
+    def test_a_refusal_reaches_the_sink_on_its_own_tick_with_no_degrade_event(
+        self, store_path: Path, interior_instrument: BinaryOption,
+    ) -> None:
+        rig = _register_and_start(store_path=store_path, instruments=(interior_instrument,))
+        strategy = rig.strategy
+        sink = _RecordingSink()
+        strategy.refusal_alerter = RefusalAlerter(
+            strategy.refusals, site=str(strategy.id), sink=sink
+        )
+        strategy.on_data(_observation(temp_c_tenths=300, observed_at_ns=WINDOW_OPEN_NS - 1))
+
+        before_window = _quote(
+            INTERIOR_ID, ask="0.40", ts_event=WINDOW_OPEN_NS - 30 * NS_PER_MIN,
+        )
+        strategy.on_quote_tick(before_window)
+
+        assert strategy.refusals.count("outside_decision_window") == 1
+        assert len(sink.payloads) == 1
+        assert sink.payloads[0].event == "OUTSIDE_DECISION_WINDOW_REFUSALS"  # type: ignore[attr-defined]
+
+    def test_a_second_refusal_for_the_same_reason_does_not_re_notify(
+        self, store_path: Path, interior_instrument: BinaryOption,
+    ) -> None:
+        """`AlertState` dedupes the still-active condition: proves the
+        per-tick call is throttled by count-CHANGE (the false->true edge),
+        not by unconditionally re-emitting on every tick.
+        """
+        rig = _register_and_start(store_path=store_path, instruments=(interior_instrument,))
+        strategy = rig.strategy
+        sink = _RecordingSink()
+        strategy.refusal_alerter = RefusalAlerter(
+            strategy.refusals, site=str(strategy.id), sink=sink
+        )
+        strategy.on_data(_observation(temp_c_tenths=300, observed_at_ns=WINDOW_OPEN_NS - 1))
+
+        first = _quote(INTERIOR_ID, ask="0.40", ts_event=WINDOW_OPEN_NS - 30 * NS_PER_MIN)
+        strategy.on_quote_tick(first)
+        strategy.refusals.record("outside_decision_window")
+        strategy._report_refusal_change()
+
+        assert strategy.refusals.count("outside_decision_window") == 2
+        assert len(sink.payloads) == 1
+
+    def test_no_alerter_wired_is_a_no_op_not_a_raise(
+        self, store_path: Path, interior_instrument: BinaryOption,
+    ) -> None:
+        rig = _register_and_start(store_path=store_path, instruments=(interior_instrument,))
+        strategy = rig.strategy
+        assert strategy.refusal_alerter is None
+        strategy.on_data(_observation(temp_c_tenths=300, observed_at_ns=WINDOW_OPEN_NS - 1))
+
+        before_window = _quote(
+            INTERIOR_ID, ask="0.40", ts_event=WINDOW_OPEN_NS - 30 * NS_PER_MIN,
+        )
+        strategy.on_quote_tick(before_window)  # must not raise
+
+        assert strategy.refusals.count("outside_decision_window") == 1

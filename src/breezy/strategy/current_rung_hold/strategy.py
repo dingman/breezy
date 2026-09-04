@@ -115,7 +115,7 @@ from breezy.strategy.current_rung_hold.decision import (
     evaluate_decision,
 )
 from breezy.strategy.current_rung_hold.trial_day_latch import TrialDayLatch
-from breezy.strategy.weather_common.refusals import RefusalCounter
+from breezy.strategy.weather_common.refusals import RefusalAlerter, RefusalCounter
 from breezy.strategy.weather_common.running_extreme import RunningExtremeAccumulator
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
@@ -202,6 +202,19 @@ class CurrentRungHoldStrategy(Strategy):
         #: strategy do nothing, or was it stopped from doing something?"
         #: (mirrors every sibling weather strategy's ``self.refusals``).
         self.refusals = RefusalCounter()
+        #: Set post-construction by
+        #: ``composition.install_current_rung_hold_refusal_watch`` (never via
+        #: ``__init__`` -- the alerter's ``site`` is ``str(strategy.id)``,
+        #: only stable once ``Trader.add_strategy`` has assigned it). ``None``
+        #: until wired -- e.g. a unit test driving the strategy directly --
+        #: so ``_report_refusal_change`` degrades to a no-op rather than
+        #: raising. Review fix: the counter used to surface only on a rare
+        #: ``COMPONENT_STATE_TOPIC`` FSM-degrade event, so it stayed invisible
+        #: for a whole normal run; reporting here, on every refusal, needs no
+        #: new ``LiveClock`` timer (L-16) and is throttled by the refusal
+        #: itself -- a counter only ever increments, so every call is a real
+        #: count change, not a poll.
+        self.refusal_alerter: RefusalAlerter | None = None
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -305,6 +318,7 @@ class CurrentRungHoldStrategy(Strategy):
         hour_lst = _local_hour(now_ns, offset)
         if not (_WINDOW_START_HOUR_LST <= hour_lst < _WINDOW_END_HOUR_LST):
             self.refusals.record(_OUTSIDE_DECISION_WINDOW)
+            self._report_refusal_change()
             return
 
         ask = tick.ask_price.as_decimal()
@@ -380,8 +394,28 @@ class CurrentRungHoldStrategy(Strategy):
         )
         if isinstance(decision, Refuse):
             self.refusals.record(decision.reason)
+            self._report_refusal_change()
             return
         self._maybe_submit(iid, decision)
+
+    def _report_refusal_change(self) -> None:
+        """Surface this refusal's updated count through the existing alert
+        path, on THIS tick.
+
+        See ``weather_common.refusals.RefusalAlerter`` and
+        ``composition.install_current_rung_hold_refusal_watch``, which wires
+        ``self.refusal_alerter``. ``AlertState.dispatch`` (inside
+        ``RefusalAlerter.report``) dedupes an already-active condition, so an
+        ongoing refusal streak for the same reason does not spam the sink on
+        every tick -- only the false->true transition and the 24h re-notify
+        emit.
+        """
+        if self.refusal_alerter is None:
+            return
+        try:
+            self.refusal_alerter.report(now_ns=self.clock.timestamp_ns())
+        except Exception:
+            self.log.exception("current_rung_hold refusal report failed")
 
     def _guarded_fee_coefficient(self, instrument: Instrument | None) -> Decimal | None:
         """The instrument's fee coefficient, read ONLY after the venue guard passes.

@@ -202,11 +202,22 @@ def build_current_rung_hold_strategies(
 def install_current_rung_hold_refusal_watch(
     node: object, strategies: Sequence[CurrentRungHoldStrategy]
 ) -> None:
-    """Publish per-station refusal counts through the existing alert sink.
+    """Wire per-station refusal counts through the existing alert sink.
 
-    Subscribes to the same ``events.system.*`` topic the component-health
-    watch already uses -- no new ``LiveClock`` timer (L-16). Each event
-    re-evaluates ``RefusalAlerter``, which dedupes via ``AlertState``.
+    PRIMARY path: attaches one ``RefusalAlerter`` per strategy to
+    ``strategy.refusal_alerter``, so ``on_quote_tick`` reports its own
+    updated count on the very tick that produced a refusal -- during a
+    normal run, with no FSM degrade needed and no new ``LiveClock`` timer
+    (L-16). Review fix: the previous wiring surfaced counts ONLY on
+    ``COMPONENT_STATE_TOPIC``, which fires once at startup and otherwise
+    only on a degrade transition, so per-station refusal counters never
+    reached an operator during a normal live run.
+
+    SECONDARY path (kept): the same alerters are re-evaluated on
+    ``COMPONENT_STATE_TOPIC`` too, catching a station that degrades without
+    ever seeing a fresh quote. A missing ``msgbus`` used to make this whole
+    function return silently; it now logs a WARNING and still wires the
+    primary (per-tick) path, since that path needs no ``msgbus`` at all.
     """
     sink = resolve_alert_sink()
     alerters = tuple(
@@ -215,6 +226,9 @@ def install_current_rung_hold_refusal_watch(
     )
     if not alerters:
         return
+
+    for strategy, alerter in zip(strategies, alerters, strict=True):
+        strategy.refusal_alerter = alerter
 
     def _on_event(_event: object) -> None:
         now_ns = time.time_ns()
@@ -226,5 +240,11 @@ def install_current_rung_hold_refusal_watch(
 
     msgbus = getattr(getattr(node, "kernel", None), "msgbus", None)
     if msgbus is None:
+        logger.warning(
+            "current_rung_hold refusal watch: no msgbus on node; the "
+            "COMPONENT_STATE_TOPIC secondary refusal channel is disabled "
+            "for this run (per-tick reporting via strategy.refusal_alerter "
+            "is unaffected)"
+        )
         return
     msgbus.subscribe(topic=COMPONENT_STATE_TOPIC, handler=_on_event)

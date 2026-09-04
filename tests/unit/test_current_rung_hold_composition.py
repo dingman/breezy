@@ -197,3 +197,60 @@ def test_per_station_degradation_skips_zero_and_builds_the_rest(tmp_path: Path) 
     assert strategy._config.orders_enabled is False
     assert str(strategy.id) == "CurrentRungHoldStrategy-SFO"
     assert strategy.order_id_tag == "SFO"
+
+
+class _FakeRefusals:
+    def __init__(self) -> None:
+        self.counts: dict[str, int] = {}
+
+
+class _FakeStrategy:
+    """Duck-typed stand-in: `install_current_rung_hold_refusal_watch` only
+    reads `.refusals`/`.id` and sets `.refusal_alerter` -- it never
+    constructs a real `CurrentRungHoldStrategy`.
+    """
+
+    def __init__(self, strategy_id: str) -> None:
+        self.id = strategy_id
+        self.refusals = _FakeRefusals()
+        self.refusal_alerter: object | None = None
+
+
+class TestInstallRefusalWatch:
+    def test_a_strategy_is_wired_for_per_tick_reporting_with_no_msgbus_at_all(
+        self,
+    ) -> None:
+        """The primary (per-tick) path needs no `msgbus`, so a `node` with
+        none still gets `strategy.refusal_alerter` populated.
+        """
+        from breezy.strategy.current_rung_hold.composition import (
+            install_current_rung_hold_refusal_watch,
+        )
+
+        strategy = _FakeStrategy("CurrentRungHoldStrategy-LAX")
+        install_current_rung_hold_refusal_watch(object(), [strategy])  # type: ignore[list-item]
+
+        assert strategy.refusal_alerter is not None
+
+    def test_a_missing_msgbus_logs_a_warning_instead_of_failing_silently(
+        self, caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        from breezy.strategy.current_rung_hold.composition import (
+            install_current_rung_hold_refusal_watch,
+        )
+
+        class _KernellessNode:
+            kernel = None
+
+        strategy = _FakeStrategy("CurrentRungHoldStrategy-LAX")
+        with caplog.at_level("WARNING"):
+            install_current_rung_hold_refusal_watch(
+                _KernellessNode(), [strategy]  # type: ignore[list-item]
+            )
+
+        assert any(
+            record.levelname == "WARNING" and "msgbus" in record.getMessage()
+            for record in caplog.records
+        )
+        # The primary path still wires despite the missing msgbus.
+        assert strategy.refusal_alerter is not None
