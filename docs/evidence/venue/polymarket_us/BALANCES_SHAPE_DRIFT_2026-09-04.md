@@ -26,3 +26,21 @@ money surface); the node stayed `RUNNING` with `ExecEngine.check_connected() == 
 until stopped by hand — the exec client's `_connect` has no fail-fast path (the data client's was
 added in `6fcadae`). Disposition: widen the declared set with the six names as declared-but-unread
 (none is read for money), and give the exec `_connect` the same fatal-fault exit.
+
+## Addendum 17:36–17:45 UTC — sub-cent precision
+
+Second launch (17:36:17 UTC) after widening the declared set: `_connect` refused
+`Field 'account balances response balances[0].currentBalance' carries more precision than the
+instrument allows (precision 2); refusing to round a venue value` — and, with the new
+`shutdown_system` request, the node exited on its own (exit non-zero via the exec-fault latch).
+
+Value-free scale probe (one signed GET, digit counts only, `scratchpad/scale_probe/scale.py`):
+`rows=1`; every money field is a JSON **number**, not a string; `currentBalance`, `buyingPower`,
+`balanceReservation`, `bonusReservation`, `displayedBonus`, `displayedCash`, `availableToWithdraw`
+carry **4 decimal places** (all positive); `depositReservation`, `displayedAvailableSoon` are positive
+integers; `assetNotional`, `assetAvailable`, `pendingCredit`, `openOrders`, `unsettledFunds`,
+`marginRequirement` are zero integers. A positive `bonusReservation`/`displayedBonus` alongside
+4-dp balances is consistent with venue-side bonus accrual in sub-cent units; fees cannot produce it
+(banker's-rounded to cents). Disposition (peer-reviewed): quantize `currentBalance`→total and
+`buyingPower`→free to cents ROUND_DOWN for the Nautilus `AccountState` only, log a count once;
+price precision guards stay strict; Breezy's sizing never reads these fields.
