@@ -2561,6 +2561,15 @@ def test_x1_the_live_scan_actually_reaches_a_test_that_imports_the_exec_package(
     marker at all, and it cannot want one -- the classifier is a pure
     function over an int and a byte string, so the suite never opens a
     socket and never constructs a client.
+
+    R-OP-SEQ adds one more: `test_polymarket_us_write_sequence.py` imports
+    `ORDER_BODY_KEYS` from `exec.submit_chain` to derive the positive-control
+    GTC body key set (`CONTROL_ORDER_BODY_KEYS`) from the live IOC constant,
+    so grammar drift between the two fires in one place. WIDENED, not
+    relaxed: the comparison is still `==`, and the module carries no
+    `SOCKET_RESTORING_MARKERS` -- the probe/helper scripts it exercises
+    import nothing from `exec.*` themselves; only this test module's own
+    import statement brings it inside X1's rule.
     """
     # CRH step 8 wiring adds one: `test_current_rung_hold_order_submission_
     # wiring.py` imports `PolymarketUSExecutionClient` to drive the real
@@ -2584,6 +2593,7 @@ def test_x1_the_live_scan_actually_reaches_a_test_that_imports_the_exec_package(
         "tests/unit/test_polymarket_us_exec_snapshot_drift.py",
         "tests/unit/test_polymarket_us_factories.py",
         "tests/unit/test_polymarket_us_submit_order_chain.py",
+        "tests/unit/test_polymarket_us_write_sequence.py",
     }
 
 
