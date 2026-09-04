@@ -282,6 +282,25 @@ class TestTradeNodeConfig:
 
         assert config.streaming is None
 
+    def test_a_non_latch_submit_intent_latch_is_refused_at_config_build_time(
+        self,
+    ) -> None:
+        """``PolymarketUSExecClientConfig.submit_intent_latch`` is typed
+        ``object | None`` because ``adapters`` cannot import ``runtime``
+        (`exec/client.py` duck-types it as ``self._latch: Any``). This
+        function is on the ``runtime`` side of that boundary and CAN import
+        the real type, so a caller-supplied object that is not a genuine,
+        already-opened ``SubmitIntentLatch`` must be refused HERE -- before
+        it is threaded onto the exec client config at all -- never silently
+        accepted and duck-typed downstream."""
+        with pytest.raises(NodeConfigError):
+            build_trade_node_config(
+                make_trade_settings(),
+                make_data_client_config(),
+                make_exec_client_config(),
+                submit_intent_latch=object(),
+            )
+
     def test_trader_id_comes_from_settings(self) -> None:
         config = build_trade_node_config(
             make_trade_settings(trader_id="BREEZYTRADE-042"),

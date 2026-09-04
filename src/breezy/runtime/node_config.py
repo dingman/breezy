@@ -94,6 +94,7 @@ from breezy.runtime.settings import (
     PolymarketUSQuoteTapeSettings,
 )
 from breezy.runtime.sqlite_store import SqliteStateStore
+from breezy.runtime.submit_intent import SubmitIntentLatch
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
     # Import-time only. At RUNTIME the adapter package must be reached from
@@ -688,7 +689,27 @@ def build_trade_node_config(
     # would flock-conflict with the composition root and kill the process --
     # so this function never opens one; it only threads through what the
     # composition root already opened.
+    #
+    # `PolymarketUSExecClientConfig.submit_intent_latch` is typed `object |
+    # None` because the `adapters` package cannot import `runtime`
+    # (`runtime` sits ABOVE `adapters` in the import-linter layer contract,
+    # same reason `state_store_opener` is injected here and not in
+    # `exec_config_from_env`). The exec client therefore duck-types the field
+    # (`self._latch: Any`, `exec/client.py`) and cannot itself verify what it
+    # was handed. This is the one place on the `runtime` side of that
+    # boundary that CAN import the real type, so the check belongs here, not
+    # there: a caller that hands this function anything other than a real,
+    # already-opened `SubmitIntentLatch` (or `None`, meaning "no latch yet")
+    # is refused at config-build time, before it ever reaches the client.
     from breezy.runtime.submit_intent import RetirementReason
+
+    if submit_intent_latch is not None and not isinstance(
+        submit_intent_latch, SubmitIntentLatch
+    ):
+        raise NodeConfigError(
+            "submit_intent_latch must be a real breezy.runtime.submit_intent."
+            f"SubmitIntentLatch (or None); got {type(submit_intent_latch).__name__!r}"
+        )
 
     exec_client_config = msgspec_replace(
         exec_client_config,

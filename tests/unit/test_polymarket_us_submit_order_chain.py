@@ -91,8 +91,8 @@ def _balances_payload() -> dict[str, Any]:
 
 
 class _PrivateReadStub:
-    def __init__(self, payloads: dict[str, Any]) -> None:
-        self._payloads = payloads
+    def __init__(self, payloads: dict[str, Mapping[str, Any]]) -> None:
+        self._payloads: dict[str, Mapping[str, Any]] = payloads
         self.paths: list[str] = []
 
     async def __call__(self, path: str) -> Mapping[str, Any]:
@@ -527,7 +527,7 @@ async def test_a_4xx_with_a_status_body_and_no_order_id_retires_and_releases_the
         await rig.client._connect()
         await rig.client._submit_order(rig.limit_buy())
         spent = ledger.spent_today_usd(now_ns=rig.clock.timestamp_ns())
-        current = rig.client._latch.current()  # type: ignore[union-attr]
+        current = rig.client._latch.current()
         await rig.client._disconnect()
     assert sender.calls
     rejected = [e for e in rig.order_events if isinstance(e, OrderRejected)]
@@ -593,7 +593,7 @@ async def test_an_ambiguous_outcome_keeps_the_latch_open_and_does_not_release_th
         else:
             await rig.client._submit_order(rig.limit_buy())
         spent = ledger.spent_today_usd(now_ns=rig.clock.timestamp_ns())
-        current = rig.client._latch.current()  # type: ignore[union-attr]
+        current = rig.client._latch.current()
         await rig.client._disconnect()
     assert spent > Decimal(0)
     assert current is not None and current.state is SubmitIntentState.OPEN
@@ -651,10 +651,10 @@ async def test_reconcile_at_startup_runs_before_the_first_arm(
     sender = _FakeSender()
     with _caps("1000.00", "10.00"):
         rig = _build_chain_rig(tmp_path, monkeypatch=monkeypatch, sender=sender)
-        rig.client._intent_reconciled = False  # type: ignore[attr-defined]
+        rig.client._intent_reconciled = False
         # Skip connect; plant an account so the account-gate is not the denial.
         await rig.client._connect()
-        rig.client._intent_reconciled = False  # type: ignore[attr-defined]
+        rig.client._intent_reconciled = False
         await rig.client._submit_order(rig.limit_buy())
         await rig.client._disconnect()
     assert sender.calls == []
