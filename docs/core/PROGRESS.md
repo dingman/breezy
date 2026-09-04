@@ -166,7 +166,7 @@ n≥150; today n_taken=1. **Live family = lags 30/45, NYC excluded, interval rul
 ~9% of station-days** (`docs/evidence/venue/polymarket_us/MISSING_COHORT_2026-09-02_2026-09-03.md`): add a week to each clock. **09-04 operator override: the M_B gate no longer parks the plumbing** — build the
 write path (`docs/plans/EXEC_SPINE_NEXT_2026-09-04.md`, R-6.5b CONVERGED) and live R(t)
 (`docs/plans/BL24_LIVE_RT_2026-09-04.md`); only enablement, budgets and the OP-1..OP-4
-positive control stay operator-only. M_B's kill rule still binds the family. **current_rung_hold landed 09-04:** table `7babe06`, latch `19ea5fb`, config `15f04f4`, decision+legal-cell `348f9c8`, 6c scorer `43e38ff`, 6d tally `abcc1ad` (timer prepared, not activated), 6e BCa `6ddca6e`; PREREG v1 draft `docs/specs/PREREG_v1_current_rung_hold_2026-09-04.md`. Next: strategy (step 6), R-7.
+positive control stay operator-only. M_B's kill rule still binds the family. **current_rung_hold landed 09-04:** table `7babe06`, latch `19ea5fb`, config `15f04f4`, decision+legal-cell `348f9c8`, 6c scorer `43e38ff`, 6d tally `abcc1ad` (timer prepared, not activated), 6e BCa `6ddca6e`; strategy `74cfa7c`+amendments (fee guard `0bd346f`), 6b paper replay `8ae12cd` (mechanism test, no verdict), PREREG v1 draft `docs/specs/PREREG_v1_current_rung_hold_2026-09-04.md`. Next: shadow-mode wiring (`docs/plans/CRH_RUNTIME_WIRING_BRIEF_2026-09-04.md`, Grok build in flight), R-7 correction.
 
 ---
 
