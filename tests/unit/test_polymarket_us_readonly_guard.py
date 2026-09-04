@@ -145,6 +145,8 @@ from pathlib import Path
 from types import MappingProxyType
 from typing import Any
 
+import pytest
+
 REPO_ROOT = Path(__file__).resolve().parents[2]
 
 #: Roots scanned for the write-verb barrier (B4).
@@ -1493,9 +1495,13 @@ def test_b6_detects_a_call_to_the_chokepoint() -> None:
 
 
 def test_permit_issuer_has_no_caller_in_this_slice() -> None:
-    """B7: exactly one caller, ``trade_cli.py::main``."""
+    """B7: exactly one caller, ``app/trade.py::main`` (the composition root
+    the ``breezy-trade`` console script actually enters --
+    ``pyproject.toml [project.scripts]``). ``trade_cli.py::main`` is a
+    library entrypoint other callers also reach directly and mints nothing
+    itself."""
     assert barred_caller_sites("B7") == {
-        ("src/breezy/runtime/trade_cli.py", "main")
+        ("src/breezy/app/trade.py", "main")
     }
 
 
@@ -1652,6 +1658,41 @@ def test_b9_post_order_and_clear_submit_intent_have_exactly_one_caller_each() ->
     }
 
 
+def test_b9_named_call_sites_is_not_vacuous_against_a_planted_second_caller(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """B9 non-vacuity: the REAL ``named_call_sites`` scanner -- not a copy, not
+    a per-source helper -- run against a PLANTED repo tree, catching a
+    second ``post_order`` caller under both ``tests/`` (a conftest-shaped
+    file, exactly the surface a fixture could smuggle a second call through)
+    and plain ``src/`` (an ordinary module). Without this, the exact-set pin
+    above is unfalsifiable: it would pass identically whether the scanner
+    actually walks these roots or silently returns nothing for them.
+
+    ``REPO_ROOT`` is monkeypatched, not the roots tuple: :func:`iter_python_sources`
+    resolves every root as ``REPO_ROOT / root``, so this is the one seam that
+    lets the REAL function walk a throwaway tree instead of the live repo.
+    """
+    (tmp_path / "src").mkdir()
+    (tmp_path / "src" / "rogue_module.py").write_text(
+        "def extra(sender):\n    return sender.post_order()\n"
+    )
+    (tmp_path / "tests").mkdir()
+    (tmp_path / "tests" / "conftest.py").write_text(
+        "def fixture_helper(sender):\n    return sender.post_order()\n"
+    )
+
+    monkeypatch.setattr(
+        "tests.unit.test_polymarket_us_readonly_guard.REPO_ROOT", tmp_path
+    )
+    sites = named_call_sites("post_order", roots=("src", "tests"))
+    assert sites == {
+        ("src/rogue_module.py", "extra"),
+        ("tests/conftest.py", "fixture_helper"),
+    }
+
+
 def test_b6_b7_b8_b9_d3_non_vacuity() -> None:
     """Planted second callers and banned forms each fire."""
     extra_b6 = find_barred_callers(
@@ -1736,11 +1777,22 @@ def _modules_importing(token: str, roots: tuple[str, ...] = EGRESS_SCAN_ROOTS) -
 
 
 def test_c10_submit_intent_and_operator_controls_reference_pins() -> None:
-    """Exact-set production importers after R-7 converted the zero-ref pins."""
+    """Exact-set production importers after R-7 converted the zero-ref pins.
+
+    WIDENED, not relaxed (L-12): the CRH runtime wiring adds three importers
+    of its own, all opening or threading the SAME composition-root latch --
+    ``breezy.app.trade`` (opens it), ``current_rung_hold.composition``
+    (binds a ``TrialDayLatch`` to it via ``shared_state_binding``) and the
+    paper-replay analysis script (drives the same composition path
+    offline). None of them open a SECOND latch or a second store.
+    """
     assert _modules_importing("submit_intent") == {
         "src/breezy/runtime/node_config.py",
         "src/breezy/runtime/clear_submit_intent_cli.py",
         "src/breezy/strategy/current_rung_hold/trial_day_latch.py",
+        "src/breezy/strategy/current_rung_hold/composition.py",
+        "scripts/analysis/current_rung_hold_paper_replay.py",
+        "src/breezy/app/trade.py",
     }
     assert _modules_importing("operator_controls") == {
         "src/breezy/adapters/polymarket_us/factories.py",

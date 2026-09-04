@@ -168,6 +168,7 @@ class _ChainRig:
         instrument: Any,
         clock: LiveClock,
         tmp_path: Path,
+        latch_cm: Any = None,
     ) -> None:
         self.client = client
         self.sender = sender
@@ -175,6 +176,15 @@ class _ChainRig:
         self.instrument = instrument
         self.clock = clock
         self.tmp_path = tmp_path
+        # Keeps the `open_submit_intent_latch` generator-CM ALIVE for the
+        # rig's lifetime. Discarding the CM object (keeping only its
+        # `__enter__()` return value) drops its last reference, and CPython
+        # then finalises the generator via `GeneratorExit` -- which runs the
+        # `finally: lock.release()` inside `hold_submit_intent_process_lock`
+        # and silently drops the flock mid-test. Never exited on purpose
+        # (see `_build_chain_rig`): this rig's flock lives for the test,
+        # exactly as a real composition root's lives for the process.
+        self._latch_cm = latch_cm
 
     def limit_buy(
         self,
@@ -263,6 +273,7 @@ def _build_chain_rig(
     else:
         issued_permit = permit
 
+    latch_cm: Any = None
     if latch is ...:
         # The composition root's shape: a SEPARATE `SqliteStateStore` handle
         # from the one `state_store_opener` below builds for the client's
@@ -270,10 +281,11 @@ def _build_chain_rig(
         # `breezy.app.trade.run` has, and for the same reason (see its
         # module docstring). Opened, never exited: this rig's flock lives
         # for the test process, exactly as a real composition root's does
-        # for the trading process.
-        submit_intent_latch = open_submit_intent_latch(
-            SqliteStateStore(store_path), store_path
-        ).__enter__()
+        # for the trading process. `latch_cm` is retained on `_ChainRig`
+        # (below) so the generator-CM is not garbage-collected mid-test --
+        # see `_ChainRig.__init__`'s docstring comment for why that matters.
+        latch_cm = open_submit_intent_latch(SqliteStateStore(store_path), store_path)
+        submit_intent_latch = latch_cm.__enter__()
     else:
         submit_intent_latch = latch
     spend = ledger if ledger is not None else DailySpendLedger()
@@ -306,6 +318,7 @@ def _build_chain_rig(
         instrument=instrument,
         clock=clock,
         tmp_path=tmp_path,
+        latch_cm=latch_cm,
     )
 
 
