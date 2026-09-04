@@ -18,7 +18,7 @@ import sys
 from collections.abc import Mapping
 from contextlib import ExitStack
 from pathlib import Path
-from typing import TextIO
+from typing import Final, TextIO
 
 from nautilus_trader.live.node import TradingNode
 
@@ -26,6 +26,7 @@ from breezy.adapters.polymarket_us.factories import exec_config_from_env
 from breezy.domain.climate_day import climate_day_for_instant
 from breezy.registry.sites import default_registry
 from breezy.runtime import trade_cli
+from breezy.runtime.health import AlertPayload, emit_alert, resolve_alert_sink
 from breezy.runtime.order_enablement import OrderSubmissionPermit, OrderSubmissionRefused
 from breezy.runtime.settings import SettingsError, load_trade_settings
 from breezy.runtime.sqlite_store import SqliteStateStore
@@ -43,6 +44,25 @@ from breezy.strategy.current_rung_hold.composition import (
 from breezy.strategy.current_rung_hold.config import SUPPORTED_STATIONS
 
 _VENUE = "polymarket_us"
+
+#: ``AlertPayload.event``/``site``/``severity`` for a refused live-trading
+#: permit in ``main()`` -- the ONLY refusal here that continues the run in
+#: shadow mode (an ``OrderSubmissionPermit`` refusal a few lines later is
+#: FATAL and is not an alert candidate). ``site`` is ``"global"``, matching
+#: ``component_health_watch.py``'s convention for a process-wide condition.
+LIVE_TRADING_PERMIT_REFUSED_EVENT: Final[str] = "LIVE_TRADING_PERMIT_REFUSED"
+LIVE_TRADING_PERMIT_REFUSED_SEVERITY: Final[str] = "WARN"
+LIVE_TRADING_PERMIT_REFUSED_SITE: Final[str] = "global"
+
+#: ``AlertPayload.detail`` is a small closed set of static reasons -- never
+#: exception text, never a permit/config value (L-22 shape). ``main()`` has
+#: exactly one catch site for ``issue_live_trading_permit``'s
+#: ``LiveTradingPermissionError``, and distinguishing WHY it refused
+#: (``orders_not_enabled`` / ``permit_expired`` / ``permit_missing``) would
+#: mean parsing the exception's message -- not done here. So today this is
+#: the one reason ever emitted; the name stays a closed enum for when a
+#: second call site needs a different member.
+LIVE_TRADING_PERMIT_REFUSED_DETAIL: Final[str] = "permit_missing"
 
 
 def _today_by_station() -> dict[str, dt.date]:
@@ -116,9 +136,7 @@ def run(
                 stderr=out,
                 strategies=strategies,
                 submit_intent_latch=latch,
-                after_build=lambda node: install_current_rung_hold_refusal_watch(
-                    node, strategies
-                ),
+                after_build=lambda node: install_current_rung_hold_refusal_watch(node, strategies),
                 live_trading_permit=live_trading_permit,
                 settings=settings,
                 exec_client_config=exec_client_config,
@@ -169,6 +187,15 @@ def main() -> int:
         permit = issue_live_trading_permit(clock=LiveClock())
     except LiveTradingPermissionError as exc:
         trade_cli.logger.info("live-trading permit not issued: %s", exc)
+        emit_alert(
+            resolve_alert_sink(),
+            AlertPayload(
+                severity=LIVE_TRADING_PERMIT_REFUSED_SEVERITY,
+                event=LIVE_TRADING_PERMIT_REFUSED_EVENT,
+                site=LIVE_TRADING_PERMIT_REFUSED_SITE,
+                detail=LIVE_TRADING_PERMIT_REFUSED_DETAIL,
+            ),
+        )
 
     try:
         settings = load_trade_settings()
@@ -184,10 +211,22 @@ def main() -> int:
                 clock=LiveClock(),
             )
         except OrderSubmissionRefused as exc:
-            trade_cli.logger.info(
-                "order submission permit not issued: %s", type(exc).__name__
-            )
+            trade_cli.logger.info("order submission permit not issued: %s", type(exc).__name__)
             return EXIT_RUNTIME_ERROR
+        else:
+            # Both permits are minted at this point: ``issue`` above
+            # validated ``permit`` is a genuine, unexpired LiveTradingPermit,
+            # so its two non-``repr=False`` fields (``issued_at_ns``,
+            # ``expires_at_ns``) are the only values this line ever logs --
+            # never ``operator_id`` or any of the five other repr=False
+            # fields (security R2).
+            ttl_s = (permit.expires_at_ns - permit.issued_at_ns) // 1_000_000_000
+            trade_cli.logger.info(
+                "live-trading permit issued issued_at_ns=%d expires_at_ns=%d ttl_s=%d",
+                permit.issued_at_ns,
+                permit.expires_at_ns,
+                ttl_s,
+            )
 
     return run(
         live_trading_permit=permit,
