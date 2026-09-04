@@ -657,6 +657,23 @@ class PolymarketUSExecutionClient(LiveExecutionClient):
         native control flow one bit -- the same "record, then re-raise"
         idiom :meth:`_open_state_store` already uses for its own durability
         failure.
+
+        **Also requests the native shutdown, which the latch alone did not.**
+        ``BALANCES_SHAPE_DRIFT_2026-09-04.md``: latching the fault here was
+        already live, but nothing asked the kernel to stop -- the node stayed
+        ``RUNNING`` with ``ExecEngine.check_connected() == False`` for 60s
+        until killed by hand. ``self.shutdown_system(reason)``
+        (``Component.shutdown_system``, ``common/component.pyx:2163-2183``)
+        publishes the native ``ShutdownSystem`` command on
+        ``"commands.system.shutdown"``, which ``NautilusKernel
+        ._on_shutdown_system`` (``system/kernel.py:613-628``) turns into a
+        clean ``stop_async()`` -- the SAME mechanism
+        :meth:`~breezy.adapters.polymarket_us.data.PolymarketUSDataClient
+        ._request_fatal_shutdown` already uses for a data-client connect
+        failure. No parallel shutdown path is introduced: this calls the one
+        native method directly rather than re-deriving the data client's
+        retry-budgeted watchdog wrapper, which exists for a long-lived polling
+        loop this coroutine is not.
         """
         try:
             self._set_account_id(self._issued_account_id)
@@ -666,14 +683,13 @@ class PolymarketUSExecutionClient(LiveExecutionClient):
             await self._confirm_account_registered()
             self._reconcile_submit_intent()
         except BaseException as exc:
-            record_fatal_exec_fault(
-                component=str(self.id),
-                reason=(
-                    f"_connect failed before the client reached a connected "
-                    f"state ({type(exc).__name__}: {exc}); no order can ever "
-                    "be evaluated against a client that never connected"
-                ),
+            reason = (
+                f"_connect failed before the client reached a connected "
+                f"state ({type(exc).__name__}: {exc}); no order can ever "
+                "be evaluated against a client that never connected"
             )
+            record_fatal_exec_fault(component=str(self.id), reason=reason)
+            self.shutdown_system(reason)
             raise
 
     def _has_durable_fill_record(self, fingerprint: str) -> bool:

@@ -50,6 +50,7 @@ from nautilus_trader.cache.cache import Cache
 from nautilus_trader.cache.config import CacheConfig
 from nautilus_trader.common.component import LiveClock, MessageBus
 from nautilus_trader.common.factories import OrderFactory
+from nautilus_trader.common.messages import ShutdownSystem
 from nautilus_trader.common.providers import InstrumentProvider
 from nautilus_trader.core.uuid import UUID4
 from nautilus_trader.execution.messages import (
@@ -1696,6 +1697,37 @@ async def test_a_failed_connect_is_observable_and_does_not_exit_zero(tmp_path: P
     )
     assert fault.component == str(rig.client.id)
     assert "PermissionError" in fault.reason
+
+
+@pytest.mark.asyncio
+async def test_a_failed_connect_requests_a_native_system_shutdown(tmp_path: Path) -> None:
+    """BALANCES_SHAPE_DRIFT_2026-09-04: the latch alone left the node
+    ``RUNNING`` with ``ExecEngine.check_connected() == False`` for 60s until
+    killed by hand -- nothing asked the kernel to stop. `_connect` must also
+    publish the native `ShutdownSystem` command, exactly like the data
+    client's own connect-failure path does
+    (`test_polymarket_us_connect_fail_fast.py::
+    test_a_connect_failure_requests_a_native_system_shutdown`).
+    """
+    rig = _build_rig(tmp_path)
+    rig.read.raises[ACCOUNT_BALANCES_PATH] = PolymarketUSError(
+        "simulated reconcile failure: drifted balances shape refused"
+    )
+    published: list[Any] = []
+    rig.msgbus.subscribe("commands.system.shutdown", published.append)
+
+    rig.client.start()
+    rig.client.connect()
+    tasks = list(rig.client._tasks)
+    done, pending = await asyncio.wait(tasks, timeout=5.0)
+    assert pending == set()
+    assert done == set(tasks)
+
+    assert fatal_exec_fault() is not None
+    assert len(published) == 1, "exactly one ShutdownSystem command"
+    command = published[0]
+    assert isinstance(command, ShutdownSystem)
+    assert command.component_id == rig.client.id
 
 
 @pytest.mark.asyncio
