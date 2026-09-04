@@ -89,16 +89,7 @@ Two consequences that are not optional (tracked by P4):
 
 Evidence: `docs/evidence/observation_lock_falsification_2026-08-31.md`.
 
-### [HIGH] BL-24 — no intraday observation type exists in-bot
-
-Gate 0 RESOLVED: no live intraday ingest (transport hardcodes CLI, two URL
-builders, `_fetch` private at `ingest/http.py:769`), but ~5 yr of 5-min ASOS is
-on disk. `R(t)` cannot enter a Nautilus
-backtest — no `Data` subclass, no catalog wiring, no client. Plan (unreviewed):
-`docs/plans/intraday_observation_ingest_2026-09-01.md` — peer-reviewed
-2026-09-01: RESUME WITH AMENDMENTS (re-anchor off the dead lock predicate;
-demote I-4; `build_running_max_days` at `pmr_climatology_study.py:351` is an
-EXISTING untested fold to PORT, not author).
+### [HIGH] BL-24 — live intraday R(t): plan CONVERGED `docs/plans/BL24_LIVE_RT_2026-09-04.md` (Seam A pure fold + domain type; Seam B IEM transport + actor). Lag is on the ASK, never on R.
 
 ## BACKLOG — selected for execution (opened 2026-08-31)
 
@@ -184,8 +175,10 @@ n≥150; today n_taken=1. Clock: ~09-22 / ~10-21 at 3/day. Accrues via
 `breezy-mb-daily.timer` (13:30Z) + `breezy-quote-tape-ingest.timer`. **The venue skips
 ~9% of station-days** (no 09-02 cohort was ever listed; 12 of ~135 days absent —
 `docs/evidence/venue/polymarket_us/MISSING_COHORT_2026-09-02_2026-09-03.md`), so add
-about a week to each clock estimate. **No new
-strategy package, BL-24, forecast ingest, or R-6.5b/R-7 until M_B survives.**
+about a week to each clock estimate. **09-04 operator override: the M_B gate no longer parks the plumbing** — build the
+write path (`docs/plans/EXEC_SPINE_NEXT_2026-09-04.md`, R-6.5b CONVERGED) and live R(t)
+(`docs/plans/BL24_LIVE_RT_2026-09-04.md`); only enablement, budgets and the OP-1..OP-4
+positive control stay operator-only. M_B's kill rule still binds the family.
 
 ---
 
