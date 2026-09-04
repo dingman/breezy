@@ -104,6 +104,64 @@ def test_a_zero_quantity_denominator_is_also_excluded_never_divided() -> None:
     assert sample.included == ()
     assert len(sample.excluded) == 1
     assert sample.excluded[0][0] == "T4"
+    assert "zero return denominator" in sample.excluded[0][1]
+
+
+def test_an_unpriced_open_and_a_zero_denominator_get_distinct_reasons() -> None:
+    """An unpriced open (`avg_px_open` None/zero) and a priced-but-zero-qty
+    record reach the same refuse-to-divide outcome through different
+    upstream defects -- the reason string must say which."""
+    sample = compute_trade_returns(
+        [
+            TradeReturnInput(
+                trade_id="UNPRICED",
+                realized_pnl=Decimal("1.00"),
+                avg_px_open=None,
+                qty=Decimal(10),
+            ),
+            TradeReturnInput(
+                trade_id="ZERO_QTY",
+                realized_pnl=Decimal("1.00"),
+                avg_px_open=Decimal("0.20"),
+                qty=Decimal(0),
+            ),
+        ],
+    )
+    reasons = dict(sample.excluded)
+    assert "unpriced forward" in reasons["UNPRICED"]
+    assert "zero return denominator" in reasons["ZERO_QTY"]
+    assert reasons["UNPRICED"] != reasons["ZERO_QTY"]
+    assert len(sample.included) + len(sample.excluded) == len(
+        ["UNPRICED", "ZERO_QTY"]
+    )
+
+
+def test_realized_pnl_must_be_fee_inclusive_like_nautilus_position() -> None:
+    """`realized_pnl` MUST be sourced from Nautilus `Position.realized_pnl`
+    (`nautilus_trader/model/position.pyx`), which nets commission into the
+    figure on every fill (`position.pyx:901-902`,
+    `realized_pnl = -fill.commission.as_f64_c()` before the price-only PnL
+    is added). This pins that convention: a 1-contract BUY at 0.12 that
+    settles to 0 with a $0.01 commission has `realized_pnl = -0.12 - 0.01`,
+    NOT a price-only `-0.12` -- so `r_i` is worse than -1.0 exactly because
+    the fee is already netted in, not because this module adds it."""
+    fee_inclusive_pnl = Decimal("-0.12") - Decimal("0.01")
+    sample = compute_trade_returns(
+        [
+            TradeReturnInput(
+                trade_id="FEE1",
+                realized_pnl=fee_inclusive_pnl,
+                avg_px_open=Decimal("0.12"),
+                qty=Decimal(1),
+            ),
+        ],
+    )
+    assert sample.excluded == ()
+    trade_id, r = sample.included[0]
+    assert trade_id == "FEE1"
+    expected = (Decimal("-0.12") - Decimal("0.01")) / Decimal("0.12")
+    assert r == expected
+    assert r < Decimal("-1.0")
 
 
 def test_exclusion_count_is_explicit_across_a_mixed_sample() -> None:

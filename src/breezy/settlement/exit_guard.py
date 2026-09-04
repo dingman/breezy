@@ -24,6 +24,14 @@ a future `SettlementExitActor` calls immediately before it builds the
 synthetic `OrderStatusReport` -- not a sibling helper the call site is
 trusted to remember. It raises rather than returning a boolean specifically
 so a call site cannot silently discard a refused verdict.
+
+R-9 proper (the future BCa bootstrap consumer of `TradeReturnSample`) is not
+built here -- this module only refuses to divide. When that consumer lands,
+it MUST additionally assert an exclusion-fraction ceiling
+(`len(excluded) / (len(included) + len(excluded))`) against a threshold and
+fail closed above it: a sample that is mostly-excluded trades is not a
+sample the bootstrap should silently run on with whatever priced remainder
+happens to be left.
 """
 
 from __future__ import annotations
@@ -40,14 +48,25 @@ __all__ = [
     "compute_trade_returns",
 ]
 
-#: The single reason string used whenever a trade cannot be priced. Kept as
-#: one constant so both the zero-price and absent-price branches -- and the
-#: zero-denominator branch, which is the same hazard reached a different way
-#: -- produce an identical, greppable, matchable reason.
-_UNPRICED_FORWARD_REASON: str = (
-    "unpriced forward: avg_px_open is zero, absent, or produces a zero "
-    "return denominator (avg_px_open * qty * multiplier); refused rather "
-    "than divided or substituted with a price (see LESSONS.md L-17)"
+#: Reason string for a trade whose `avg_px_open` is itself the problem --
+#: `None` (upstream never recorded an open price) or a real `Decimal(0)`.
+#: This is the L-17 unpriced-forward hazard: it is refused, never
+#: substituted with a price.
+_UNPRICED_OPEN_REASON: str = (
+    "unpriced forward: avg_px_open is None or zero; refused rather than "
+    "divided or substituted with a price (see LESSONS.md L-17)"
+)
+
+#: Reason string for a trade whose `avg_px_open` IS priced but the full
+#: denominator (`avg_px_open * qty * multiplier`) is still zero because
+#: `qty` or `multiplier` is zero. Distinct from `_UNPRICED_OPEN_REASON`
+#: because the cause is a different field -- a caller triaging exclusions
+#: needs to know which upstream record is malformed, not just that a
+#: division was refused.
+_ZERO_DENOMINATOR_REASON: str = (
+    "zero return denominator: avg_px_open is priced but avg_px_open * qty "
+    "* multiplier is zero (qty or multiplier is zero); refused rather "
+    "than divided (see LESSONS.md L-17)"
 )
 
 
@@ -61,6 +80,17 @@ class TradeReturnInput:
     """
 
     trade_id: str
+    #: MUST be sourced from Nautilus `Position.realized_pnl`
+    #: (`nautilus_trader/model/position.pyx`) -- NOT a caller-derived
+    #: price-only PnL. `Position.realized_pnl` is fee-INCLUSIVE: on every
+    #: fill it seeds from `-fill.commission.as_f64_c()` before adding the
+    #: price-only PnL (`position.pyx:901-902`,
+    #: `_handle_buy_order_fill`/`_handle_sell_order_fill`), then accumulates
+    #: across fills (`position.pyx:919-922`). A caller that instead computes
+    #: `(close_px - open_px) * qty` and drops commission would understate
+    #: the loss (or overstate the gain) on every trade with a nonzero fee,
+    #: and the per-trade return `r_i` computed below would be silently
+    #: optimistic.
     realized_pnl: Decimal
     avg_px_open: Decimal | None
     qty: Decimal
@@ -70,8 +100,9 @@ class TradeReturnInput:
 @dataclass(frozen=True, kw_only=True)
 class TradeReturnSample:
     """The BCa bootstrap's raw material: included returns plus an explicit,
-    counted, attributable exclusion list. Never fewer entries than trades
-    passed in across both tuples combined."""
+    counted, attributable exclusion list. `len(included) + len(excluded)`
+    is always exactly `len(trades)` passed to `compute_trade_returns` --
+    never fewer, and never more."""
 
     included: tuple[tuple[str, Decimal], ...]
     excluded: tuple[tuple[str, str], ...]
@@ -80,21 +111,28 @@ class TradeReturnSample:
 def compute_trade_returns(trades: Sequence[TradeReturnInput]) -> TradeReturnSample:
     """Compute `r_i` for every priced trade; exclude, never divide, the rest.
 
-    A trade is excluded -- with `_UNPRICED_FORWARD_REASON` -- whenever
-    `avg_px_open` is `None`, `avg_px_open` is zero, or the full denominator
-    `avg_px_open * qty * multiplier` is zero (a zero quantity or multiplier
-    reaches the same hazard through a different field). No branch here ever
-    computes a division whose denominator could be zero.
+    A trade is excluded for one of two distinct causes, each with its own
+    reason string so a caller triaging exclusions knows which upstream
+    field is malformed:
+
+    - `_UNPRICED_OPEN_REASON` -- `avg_px_open` is `None` or zero (the L-17
+      unpriced-forward hazard).
+    - `_ZERO_DENOMINATOR_REASON` -- `avg_px_open` is priced but the full
+      denominator `avg_px_open * qty * multiplier` is still zero because
+      `qty` or `multiplier` is zero.
+
+    No branch here ever computes a division whose denominator could be
+    zero.
     """
     included: list[tuple[str, Decimal]] = []
     excluded: list[tuple[str, str]] = []
     for trade in trades:
         if trade.avg_px_open is None or trade.avg_px_open == 0:
-            excluded.append((trade.trade_id, _UNPRICED_FORWARD_REASON))
+            excluded.append((trade.trade_id, _UNPRICED_OPEN_REASON))
             continue
         denominator = trade.avg_px_open * trade.qty * trade.multiplier
         if denominator == 0:
-            excluded.append((trade.trade_id, _UNPRICED_FORWARD_REASON))
+            excluded.append((trade.trade_id, _ZERO_DENOMINATOR_REASON))
             continue
         included.append((trade.trade_id, trade.realized_pnl / denominator))
     return TradeReturnSample(included=tuple(included), excluded=tuple(excluded))
