@@ -146,3 +146,34 @@ def test_multiple_rows_mix_kept_and_dropped_independently() -> None:
 def test_station_observation_data_type_is_a_single_cached_object() -> None:
     assert station_observation_data_type() is station_observation_data_type()
     assert station_observation_data_type().metadata == {}
+
+
+# ---------------------------------------------------------------------------
+# `observed_at_ns` is built by integer construction, never float time math
+# ---------------------------------------------------------------------------
+
+
+def test_observed_at_ns_round_trips_a_minute_precision_timestamp_exactly() -> None:
+    """`observed_at_ns` must equal the calendar-exact nanosecond instant.
+
+    Computed independently via `datetime` field arithmetic (never
+    `.timestamp() * 1e9`) so this test cannot share the bug it is pinning.
+    """
+    import datetime as dt
+
+    valid_utc = dt.datetime(2026, 7, 15, 4, 7, tzinfo=dt.UTC)
+    epoch = dt.datetime(1970, 1, 1, tzinfo=dt.UTC)
+    expected_ns = int((valid_utc - epoch).total_seconds()) * 1_000_000_000
+
+    rows = [_metar_row(station="NYC", valid="2026-07-15 04:07", t_group="T01500070")]
+    observations, drops = iem_asos_rows_to_station_observations(
+        station="KNYC",
+        rows=rows,
+        source_channel="iem_asos_metar",
+        assumed_publication_lag_ns=30_000_000_000,
+        received_at_ns=_RECEIVED_AT_NS,
+    )
+
+    assert not drops
+    (observation,) = observations
+    assert observation.observed_at_ns == expected_ns

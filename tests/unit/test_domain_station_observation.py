@@ -33,6 +33,8 @@ def make_observation(**overrides: Any) -> StationObservation:
         "observed_at_ns": _JULY_OBSERVED_AT_NS,
         "received_at_ns": _JULY_RECEIVED_AT_NS,
         "temp_c_tenths": 250,
+        "precision_c_tenths": 5,
+        "is_metar": True,
         "source_channel": "iem_asos_metar",
         "assumed_publication_lag_ns": 30_000_000_000,
     }
@@ -115,6 +117,8 @@ def test_july_climate_day_uses_the_standard_offset_not_dst() -> None:
     [
         "station",
         "temp_c_tenths",
+        "precision_c_tenths",
+        "is_metar",
         "source_channel",
         "assumed_publication_lag_ns",
         "schema_version",
@@ -146,6 +150,38 @@ def test_schema_carries_no_settlement_like_column() -> None:
     names = set(StationObservation.schema().names)
     forbidden = {"tmax_f", "tmin_f", "tavg_f", "is_final", "temp_f", "rounded_f"}
     assert names.isdisjoint(forbidden)
+
+
+@pytest.mark.parametrize("precision_c_tenths", [0, -1, -5])
+def test_precision_c_tenths_must_be_positive(precision_c_tenths: int) -> None:
+    with pytest.raises(ValueError, match="precision_c_tenths"):
+        make_observation(precision_c_tenths=precision_c_tenths)
+
+
+def test_precision_c_tenths_and_is_metar_round_trip_through_to_dict() -> None:
+    metar_record = make_observation(precision_c_tenths=5, is_metar=True)
+    assert metar_record.precision_c_tenths == 5
+    assert metar_record.is_metar is True
+    restored = StationObservation.from_dict(metar_record.to_dict())
+    assert restored.precision_c_tenths == 5
+    assert restored.is_metar is True
+
+    integer_row = make_observation(
+        precision_c_tenths=10,
+        is_metar=False,
+        source_channel="nws_api_5min",
+        assumed_publication_lag_ns=1,
+    )
+    assert integer_row.precision_c_tenths == 10
+    assert integer_row.is_metar is False
+    restored_integer = StationObservation.from_dict(integer_row.to_dict())
+    assert restored_integer.precision_c_tenths == 10
+    assert restored_integer.is_metar is False
+
+
+def test_is_metar_rejects_a_non_bool() -> None:
+    with pytest.raises(TypeError):
+        make_observation(is_metar=1)
 
 
 def test_module_registers_arrow_exactly_once() -> None:

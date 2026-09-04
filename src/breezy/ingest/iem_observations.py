@@ -91,13 +91,18 @@ def iem_asos_rows_to_station_observations(
             drops["archive_parse_error"] += 1
             continue
 
-        observed_at_ns = int(valid_utc.timestamp() * 1_000_000_000)
+        # Integer construction only -- `valid_utc.timestamp()` is a `float`,
+        # and multiplying it by `1_000_000_000` before truncating risks
+        # losing precision at real epoch magnitudes (no float time math).
+        observed_at_ns = int(valid_utc.timestamp()) * 1_000_000_000
         observations.append(
             StationObservation(
                 station=station,
                 observed_at_ns=observed_at_ns,
                 received_at_ns=received_at_ns,
                 temp_c_tenths=temp_c_tenths,
+                precision_c_tenths=5,
+                is_metar=True,
                 source_channel=source_channel,
                 assumed_publication_lag_ns=assumed_publication_lag_ns,
             ),

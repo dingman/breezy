@@ -33,17 +33,59 @@ A missing interval is never interpolated -- an empty accumulator, or an
 instant that predates the earliest pushed row, answers `None`
 (`value_at`) and an unbounded `staleness_ns`, and callers are expected to
 refuse rather than invent a temperature (L-17).
+
+Interval-valued `R(t)` (amendment A13)
+---------------------------------------
+Not every source reports at METAR tenths resolution: the NWS 5-minute API
+reports a whole degree Celsius, meaning the true value lies somewhere in
+``[x - 0.5, x + 0.5)`` degrees C -- an INTERVAL, not a point. `push` now
+takes each row's own ``precision_c_tenths`` (in tenths of a degree C, the
+FULL width of the interval the true value is known to lie within -- e.g.
+``10`` for an integer-degree-C row, matching ``[x - 0.5, x + 0.5)``) and
+``is_metar`` flag.
+
+A METAR (``is_metar=True``) row is treated as an EXACT point regardless of
+its own ``precision_c_tenths`` -- METAR's own ``T``-group already reports
+tenths resolution, so its reading is the settlement-grade datum and is never
+widened into an interval here; ``precision_c_tenths`` is still recorded on
+it (see ``StationObservation``) as descriptive provenance, but this
+accumulator does not use it to build a METAR row's bounds.
+
+`value_at` returns a frozen :class:`RunningMax` describing the running max
+as ``[lower_f, upper_f)`` (upper EXCLUSIVE):
+
+* ``lower_f`` = the max, over every eligible row, of ``round_half_up_f`` of
+  that row's Celsius-tenths LOWER bound (its own ``temp_c_tenths`` for a
+  METAR row, or ``temp_c_tenths - precision_c_tenths // 2`` otherwise).
+* ``upper_f`` = the max, over every eligible row, of ``round_half_up_f`` of
+  that row's Celsius-tenths UPPER bound (its own ``temp_c_tenths`` for a
+  METAR row, or ``temp_c_tenths + precision_c_tenths // 2`` otherwise).
+* ``exact_f`` is set (non-``None``) only when the row that determines
+  ``upper_f`` (ties broken toward a METAR row, then toward the latest
+  ``observed_at_ns``) is itself a METAR row -- in that case the interval
+  collapses to that row's own rounded value.
+
+`RunningMax.is_ambiguous(rung_width_f)` states whether the interval
+``[lower_f, upper_f)`` spans more than one venue rung of the given width (the
+Polymarket.us weather rungs are 1 F buckets, ``gteXXltYYf`` -- see
+``docs/plans/BL24_LIVE_RT_2026-09-04.md`` amendment A13); a rung decision on
+an ambiguous interval must be REFUSED by the caller, never rounded or
+guessed (L-17).
 """
 
 from __future__ import annotations
 
 import datetime as dt
+from collections.abc import Sequence
 from dataclasses import dataclass
+from itertools import pairwise
 from typing import Final
 
+from breezy.domain.temperature import round_half_up_f
 from breezy.normalize.climate_day import climate_day_for_instant
 
 _NS_PER_SECOND: Final[int] = 1_000_000_000
+_DEFAULT_RUNG_WIDTH_F: Final[int] = 1
 
 
 def _instant_from_ns(instant_ns: int) -> dt.datetime:
@@ -62,8 +104,114 @@ def _instant_from_ns(instant_ns: int) -> dt.datetime:
 
 @dataclass(frozen=True, slots=True)
 class _Row:
-    rounded_f: int
-    temp_f: float
+    received_at_ns: int
+    temp_c_tenths: int
+    precision_c_tenths: int
+    is_metar: bool
+
+    def _half_width_c_tenths(self) -> int:
+        return self.precision_c_tenths // 2
+
+    def lower_c_tenths(self) -> int:
+        if self.is_metar:
+            return self.temp_c_tenths
+        return self.temp_c_tenths - self._half_width_c_tenths()
+
+    def upper_c_tenths(self) -> int:
+        if self.is_metar:
+            return self.temp_c_tenths
+        return self.temp_c_tenths + self._half_width_c_tenths()
+
+
+@dataclass(frozen=True, slots=True)
+class RunningMax:
+    """The running maximum as a Fahrenheit INTERVAL `[lower_f, upper_f)`.
+
+    `upper_f` is EXCLUSIVE, matching the venue's own rung convention
+    (`gteXXltYYf`). `exact_f` is set only when the interval collapses to a
+    single Fahrenheit integer because the maximizing row was a METAR (exact,
+    tenths) reading -- see the module docstring's "Interval-valued `R(t)`"
+    section for the exact definition of `lower_f`/`upper_f`/`exact_f`.
+    """
+
+    lower_f: int
+    upper_f: int
+    exact_f: int | None
+    source_observed_at_ns: int
+    source_received_at_ns: int
+
+    def is_ambiguous(self, rung_width_f: int = _DEFAULT_RUNG_WIDTH_F) -> bool:
+        """`True` iff `[lower_f, upper_f)` spans more than one `rung_width_f`-wide rung.
+
+        ADVISORY ONLY: this assumes a UNIFORM, width-aligned ladder (rung
+        boundaries at every multiple of `rung_width_f`). Real venue ladders
+        are not width-aligned -- e.g. Polymarket.us weather markets phase
+        rungs oddly (`[91,92]`-style) with open-ended tails -- so this
+        method cannot answer containment against the actual ladder. Use
+        :meth:`spans` against the real rung boundaries for that; this method
+        is a cheap, width-only estimate.
+
+        A rung boundary is a multiple of `rung_width_f`. The interval is
+        ambiguous when its lower bound and its largest contained integer
+        degree (`upper_f - 1`, since `upper_f` is exclusive) do not fall in
+        the same rung.
+        """
+        if rung_width_f <= 0:
+            raise ValueError(f"`rung_width_f` must be positive, was {rung_width_f}")
+        if self.upper_f <= self.lower_f:
+            return False
+        lower_rung = self.lower_f // rung_width_f
+        upper_rung = (self.upper_f - 1) // rung_width_f
+        return lower_rung != upper_rung
+
+    def spans(self, bounds: Sequence[tuple[int | None, int | None]]) -> bool:
+        """`True` iff `[lower_f, upper_f)` cannot be resolved to ONE rung of `bounds`.
+
+        Unlike `is_ambiguous`, this takes the ACTUAL venue ladder rather
+        than assuming a uniform width: real ladders are not width-aligned
+        (Polymarket.us weather rungs phase oddly, e.g. `[91, 92)` next to
+        `[92, 94)`, with open-ended tails). Each element of `bounds` is
+        `(rung_lower_f, rung_upper_f)`; either bound may be `None` for an
+        open (unbounded) tail rung. `bounds` order and coverage are the
+        caller's responsibility -- this method does not validate that
+        `bounds` tiles the real number line without gaps or overlaps.
+
+        Ambiguous (returns `True`) both when the interval's lower bound and
+        its largest contained integer degree (`upper_f - 1`) fall in
+        DIFFERENT listed rungs, and when either endpoint falls in NO listed
+        rung at all -- this method fails closed rather than assume
+        containment it cannot prove.
+        """
+        if self.upper_f <= self.lower_f:
+            return False
+        largest_contained_f = self.upper_f - 1
+
+        def _rung_index(value: int) -> int | None:
+            for index, (rung_lower, rung_upper) in enumerate(bounds):
+                if rung_lower is not None and value < rung_lower:
+                    continue
+                if rung_upper is not None and value >= rung_upper:
+                    continue
+                return index
+            return None
+
+        lower_rung = _rung_index(self.lower_f)
+        upper_rung = _rung_index(largest_contained_f)
+        if lower_rung is None or upper_rung is None:
+            return True
+        return lower_rung != upper_rung
+
+
+@dataclass(frozen=True, slots=True)
+class CoverageReport:
+    """Facts about the rows currently held, at or before some `now_ns` (amendment A8).
+
+    No policy is baked in here -- see :meth:`RunningExtremeAccumulator.coverage`.
+    """
+
+    first_observed_ns: int | None
+    last_observed_ns: int | None
+    largest_gap_ns: int | None
 
 
 class RunningExtremeAccumulator:
@@ -74,12 +222,32 @@ class RunningExtremeAccumulator:
         self._rows: dict[int, _Row] = {}
         self._current_climate_day: dt.date | None = None
 
-    def push(self, observed_at_ns: int, rounded_f: int, temp_f: float) -> None:
+    def push(
+        self,
+        observed_at_ns: int,
+        temp_c_tenths: int,
+        precision_c_tenths: int,
+        is_metar: bool,
+        received_at_ns: int,
+    ) -> None:
         """Record one observation, resetting the accumulator on a day change.
 
         A same-instant re-push REPLACES the stored row (see module
-        docstring) -- the new `rounded_f` may be lower than the one it
+        docstring) -- the new `temp_c_tenths` may be lower than the one it
         replaces, and that is accepted, not corrected upward.
+
+        `precision_c_tenths` is the full width, in tenths of a degree C, of
+        the interval the true value is known to lie within (amendment A13,
+        ignored for a METAR row -- see the module docstring); `is_metar`
+        marks a tenths-resolution (METAR) reading. `received_at_ns` is the
+        instant Breezy received this row -- `value_at` gates on it exactly
+        as it gates on `observed_at_ns` (module docstring amendment A1:
+        "measurement <= t AND receipt <= t"), so a row cannot be visible to
+        a live `now_ns` before Breezy actually had it, mirroring the
+        archive oracle's `running_max_at` gate (`valid <= t`,
+        `scripts/analysis/h4_preliminary_economic_read.py:336-347`). Feed
+        `received_at_ns == observed_at_ns` to reproduce the archive, which
+        has no separate receipt instant.
         """
         day = climate_day_for_instant(
             _instant_from_ns(observed_at_ns), self._std_utc_offset_hours,
@@ -87,10 +255,15 @@ class RunningExtremeAccumulator:
         if self._current_climate_day is not None and day != self._current_climate_day:
             self._rows = {}
         self._current_climate_day = day
-        self._rows[observed_at_ns] = _Row(rounded_f=rounded_f, temp_f=temp_f)
+        self._rows[observed_at_ns] = _Row(
+            received_at_ns=received_at_ns,
+            temp_c_tenths=temp_c_tenths,
+            precision_c_tenths=precision_c_tenths,
+            is_metar=is_metar,
+        )
 
-    def value_at(self, now_ns: int) -> int | None:
-        """`R(now_ns)`: the max `rounded_f` of rows measured at or before `now_ns`.
+    def value_at(self, now_ns: int) -> RunningMax | None:
+        """`R(now_ns)`: the running max, as an interval, of rows measured at or before `now_ns`.
 
         No `lag` parameter -- see the module docstring's amendment A1 note.
         Returns `None` when `now_ns` falls outside the currently-held
@@ -103,11 +276,33 @@ class RunningExtremeAccumulator:
         if day != self._current_climate_day:
             return None
         eligible = [
-            row.rounded_f for observed_at_ns, row in self._rows.items() if observed_at_ns <= now_ns
+            (observed_at_ns, row)
+            for observed_at_ns, row in self._rows.items()
+            if observed_at_ns <= now_ns and row.received_at_ns <= now_ns
         ]
         if not eligible:
             return None
-        return max(eligible)
+
+        lower_f = max(round_half_up_f(row.lower_c_tenths()) for _, row in eligible)
+
+        # The row that determines `upper_f`: ties broken toward a METAR row,
+        # then toward the latest `observed_at_ns`, so `exact_f` and
+        # `source_observed_at_ns` are picked deterministically.
+        def _sort_key(item: tuple[int, _Row]) -> tuple[int, bool, int]:
+            observed_at_ns, row = item
+            return (round_half_up_f(row.upper_c_tenths()), row.is_metar, observed_at_ns)
+
+        max_observed_at_ns, max_row = max(eligible, key=_sort_key)
+        upper_f = round_half_up_f(max_row.upper_c_tenths())
+        exact_f = round_half_up_f(max_row.temp_c_tenths) if max_row.is_metar else None
+
+        return RunningMax(
+            lower_f=lower_f,
+            upper_f=upper_f,
+            exact_f=exact_f,
+            source_observed_at_ns=max_observed_at_ns,
+            source_received_at_ns=max_row.received_at_ns,
+        )
 
     def staleness_ns(self, now_ns: int) -> int | None:
         """`now_ns` minus the newest observed instant, or `None` if empty."""
@@ -123,7 +318,43 @@ class RunningExtremeAccumulator:
             return None
         return min(self._rows)
 
-    @property
-    def covered(self) -> bool:
-        """`True` iff at least one observation is currently held."""
-        return bool(self._rows)
+    def coverage(self, now_ns: int, expected_cadence_ns: int) -> CoverageReport:
+        """Report facts about the currently-held rows, at or before `now_ns`.
+
+        `expected_cadence_ns` must be positive (a nonsensical cadence is
+        rejected fail-fast) but is NOT used to compute any field below --
+        amendment A8 states this deliberately: this method reports facts
+        only, never a policy verdict. Comparing `largest_gap_ns` against
+        `expected_cadence_ns` (e.g. "no gap over the staleness bound") is
+        Seam B's decision, made from these facts.
+
+        `largest_gap_ns` is the largest gap between two CONSECUTIVE stored
+        rows at or before `now_ns` -- `None` when fewer than two such rows
+        are held. It does not include the trailing gap from
+        `last_observed_ns` to `now_ns`; that fact is already available from
+        `staleness_ns`.
+        """
+        if expected_cadence_ns <= 0:
+            raise ValueError(
+                f"`expected_cadence_ns` must be positive, was {expected_cadence_ns}",
+            )
+
+        eligible_ns = sorted(
+            observed_at_ns for observed_at_ns in self._rows if observed_at_ns <= now_ns
+        )
+        if not eligible_ns:
+            return CoverageReport(
+                first_observed_ns=None, last_observed_ns=None, largest_gap_ns=None,
+            )
+
+        largest_gap_ns: int | None = None
+        if len(eligible_ns) >= 2:
+            largest_gap_ns = max(
+                later - earlier for earlier, later in pairwise(eligible_ns)
+            )
+
+        return CoverageReport(
+            first_observed_ns=eligible_ns[0],
+            last_observed_ns=eligible_ns[-1],
+            largest_gap_ns=largest_gap_ns,
+        )

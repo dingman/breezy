@@ -56,9 +56,11 @@ from nautilus_trader.serialization.arrow.serializer import register_arrow
 
 from breezy.domain.climate_day import climate_day_for_instant
 from breezy.domain.strict_arrow import make_strict_decoder, make_strict_encoder
-from breezy.domain.validation import require_int, require_text
+from breezy.domain.validation import require_bool, require_int, require_text
 
-STATION_OBSERVATION_SCHEMA_VERSION: Final[int] = 1
+#: Bumped to 2 when `precision_c_tenths`/`is_metar` were added (amendment
+#: A13, BL-24 Seam A-2) -- the Arrow schema gained two required columns.
+STATION_OBSERVATION_SCHEMA_VERSION: Final[int] = 2
 
 _NS_PER_SECOND: Final[int] = 1_000_000_000
 
@@ -82,6 +84,17 @@ class StationObservation(Data):
         Raw METAR ``T``-group value, tenths of a degree Celsius. Never
         converted to Fahrenheit or rounded on this record (see module
         docstring).
+    precision_c_tenths : int
+        The half-width, in tenths of a degree Celsius, of the interval the
+        true value is known to lie within: ``5`` for a METAR ``T``-group
+        reading (tenths resolution -- the true value lies in
+        ``[temp_c_tenths - 5, temp_c_tenths + 5)`` tenths), ``10`` for an
+        integer-Celsius row such as the NWS 5-minute API (the true value
+        lies in ``[x - 0.5, x + 0.5)`` degrees C, i.e. 10 tenths wide).
+        Amendment A13.
+    is_metar : bool
+        ``True`` when this reading came from a METAR ``T``-group (tenths
+        resolution); ``False`` for an integer-Celsius source. Amendment A13.
     source_channel : str
         Feed the reading came from (e.g. ``"iem_asos_metar"``).
     assumed_publication_lag_ns : int
@@ -99,6 +112,8 @@ class StationObservation(Data):
         observed_at_ns: int,
         received_at_ns: int,
         temp_c_tenths: int,
+        precision_c_tenths: int,
+        is_metar: bool,
         source_channel: str,
         assumed_publication_lag_ns: int,
         schema_version: int = STATION_OBSERVATION_SCHEMA_VERSION,
@@ -107,6 +122,8 @@ class StationObservation(Data):
         self.observed_at_ns = require_int(observed_at_ns, "observed_at_ns")
         self.received_at_ns = require_int(received_at_ns, "received_at_ns")
         self.temp_c_tenths = require_int(temp_c_tenths, "temp_c_tenths")
+        self.precision_c_tenths = require_int(precision_c_tenths, "precision_c_tenths")
+        self.is_metar = require_bool(is_metar, "is_metar")
         self.source_channel = require_text(source_channel, "source_channel")
         self.assumed_publication_lag_ns = require_int(
             assumed_publication_lag_ns, "assumed_publication_lag_ns",
@@ -125,6 +142,11 @@ class StationObservation(Data):
                 "`assumed_publication_lag_ns` must be positive for "
                 "source_channel='iem_asos_metar', "
                 f"was {self.assumed_publication_lag_ns}",
+            )
+
+        if self.precision_c_tenths <= 0:
+            raise ValueError(
+                f"`precision_c_tenths` must be positive, was {self.precision_c_tenths}",
             )
 
         self._ts_event = self.observed_at_ns
@@ -163,6 +185,8 @@ class StationObservation(Data):
             f"{type(self).__name__}("
             f"station={self.station!r}, "
             f"temp_c_tenths={self.temp_c_tenths}, "
+            f"precision_c_tenths={self.precision_c_tenths}, "
+            f"is_metar={self.is_metar}, "
             f"source_channel={self.source_channel!r}, "
             f"ts_event={self._ts_event}, ts_init={self._ts_init})"
         )
@@ -172,6 +196,8 @@ class StationObservation(Data):
         return {
             "station": self.station,
             "temp_c_tenths": self.temp_c_tenths,
+            "precision_c_tenths": self.precision_c_tenths,
+            "is_metar": self.is_metar,
             "source_channel": self.source_channel,
             "assumed_publication_lag_ns": self.assumed_publication_lag_ns,
             "schema_version": self.schema_version,
@@ -191,6 +217,8 @@ class StationObservation(Data):
             observed_at_ns=values["ts_event"],
             received_at_ns=values["ts_init"],
             temp_c_tenths=values["temp_c_tenths"],
+            precision_c_tenths=values["precision_c_tenths"],
+            is_metar=values["is_metar"],
             source_channel=values["source_channel"],
             assumed_publication_lag_ns=values["assumed_publication_lag_ns"],
             schema_version=values["schema_version"],
@@ -203,6 +231,8 @@ class StationObservation(Data):
             [
                 pa.field("station", pa.string(), nullable=False),
                 pa.field("temp_c_tenths", pa.int64(), nullable=False),
+                pa.field("precision_c_tenths", pa.int64(), nullable=False),
+                pa.field("is_metar", pa.bool_(), nullable=False),
                 pa.field("source_channel", pa.string(), nullable=False),
                 pa.field("assumed_publication_lag_ns", pa.int64(), nullable=False),
                 pa.field("schema_version", pa.int64(), nullable=False),
