@@ -2094,6 +2094,14 @@ def test_c10_submit_intent_and_operator_controls_reference_pins() -> None:
     (binds a ``TrialDayLatch`` to it via ``shared_state_binding``) and the
     paper-replay analysis script (drives the same composition path
     offline). None of them open a SECOND latch or a second store.
+
+    WIDENED again (TRADE_NODE_DAILY_RELAUNCH_2026-09-04, Rev 3, [B1]):
+    ``runtime.trade_supervisor`` imports ``submit_intent`` for ONE thing --
+    ``CURRENT_INTENT_KEY``/``SubmitIntent``/``SubmitIntentCorrupt``/
+    ``SubmitIntentState``, read via its own FRESH, unlocked
+    ``SqliteStateStore`` connection in ``probe_open_intent`` (the pre-launch
+    OPEN-intent probe). It never opens ``open_submit_intent_latch`` and
+    never holds the process lock -- a distinct, non-latch-owning reader.
     """
     assert _modules_importing("submit_intent") == {
         "src/breezy/runtime/node_config.py",
@@ -2102,6 +2110,7 @@ def test_c10_submit_intent_and_operator_controls_reference_pins() -> None:
         "src/breezy/strategy/current_rung_hold/composition.py",
         "scripts/analysis/current_rung_hold_paper_replay.py",
         "src/breezy/app/trade.py",
+        "src/breezy/runtime/trade_supervisor.py",
     }
     assert _modules_importing("operator_controls") == {
         "src/breezy/adapters/polymarket_us/factories.py",

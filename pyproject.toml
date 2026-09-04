@@ -261,6 +261,14 @@ breezy-quote-tape-ingest = "breezy.runtime.quote_tape_ingest_cli:main"
 # Never a flag on breezy-trade, never on a timer, never at startup. See
 # `breezy.runtime.clear_submit_intent_cli`.
 breezy-clear-submit-intent = "breezy.runtime.clear_submit_intent_cli:main"
+# A SEVENTH process: the detached daily launcher for `breezy-trade`
+# (TRADE_NODE_DAILY_RELAUNCH_2026-09-04.md). Values-free -- the seven
+# operator-reserved values travel only through its own forwarded `env=`,
+# never argv, never a file. Requires the distinct argv token
+# `breezy-trade-supervisor-daily` as its first positional argument so
+# `pgrep -f` can find it without substring-matching the node's own argv.
+# See `breezy.runtime.trade_supervisor`.
+breezy-trade-supervisor = "breezy.runtime.trade_supervisor:main"
 
 [build-system]
 requires = ["uv_build>=0.12.5,<0.13.0"]
