@@ -105,6 +105,36 @@ COUNTED_REFUSAL_REASONS: Final[frozenset[str]] = frozenset(
         # `docs/plans/CURRENT_RUNG_HOLD_BLUEPRINT_2026-09-04.md` peer review
         # amendment 2.
         "fee_schedule_mismatch",
+        # Decision-layer reason (`current_rung_hold/decision.py`): the
+        # at-most-one-trial-per-station-day latch's refusal. No analogue in
+        # this module -- counted here so both counters share one fixed,
+        # finite reason set.
+        "trial_day_consumed",
+        # Decision-layer reason (`current_rung_hold/decision.py`): the
+        # LEGAL CELL enforcement (blueprint step 6) -- `width_code == 2`
+        # (`open_lower`) is never legal, and `m_code == 1` is legal only
+        # paired with `width_code == 0`, enforced unforgeably regardless of
+        # whether the frozen table happens to have that key populated
+        # (L-22). No analogue in this module -- counted here so both
+        # counters share one fixed, finite reason set.
+        "illegal_cell",
+        # Decision-layer reason (`current_rung_hold/decision.py`): the
+        # executable-quote-band check (`executable_ask_lower < ask <
+        # executable_ask_upper` and a minimum displayed size). No analogue
+        # in this module -- counted here so both counters share one fixed,
+        # finite reason set.
+        "not_executable",
+        # Decision-layer reason (`current_rung_hold/decision.py`): the
+        # frozen table has no defined cell at the lookup key (an
+        # under-powered cell is undefined, never the worst cell). No
+        # analogue in this module -- counted here so both counters share
+        # one fixed, finite reason set.
+        "p_hold_undefined",
+        # Decision-layer reason (`current_rung_hold/decision.py`):
+        # `p_hold_lower` does not clear the break-even price. No analogue in
+        # this module -- counted here so both counters share one fixed,
+        # finite reason set.
+        "edge_below_break_even",
         "future_signal",
         "observation_limit_unset",
         "edge_below_minimum",

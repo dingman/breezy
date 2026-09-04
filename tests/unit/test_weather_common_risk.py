@@ -2132,6 +2132,42 @@ def test_fee_schedule_mismatch_is_within_the_counted_set() -> None:
     assert "fee_schedule_mismatch" in risk_module.COUNTED_REFUSAL_REASONS
 
 
+def test_trial_day_consumed_is_within_the_counted_set() -> None:
+    """`current_rung_hold/decision.py`'s at-most-one-trial-per-station-day
+    refusal shares this fixed set. L-12 widening: membership only.
+    """
+    assert "trial_day_consumed" in risk_module.COUNTED_REFUSAL_REASONS
+
+
+def test_illegal_cell_is_within_the_counted_set() -> None:
+    """`current_rung_hold/decision.py`'s LEGAL CELL enforcement (blueprint
+    step 6; L-22: a safety exclusion must be unforgeable, not offered)
+    shares this fixed set. L-12 widening: membership only.
+    """
+    assert "illegal_cell" in risk_module.COUNTED_REFUSAL_REASONS
+
+
+def test_not_executable_is_within_the_counted_set() -> None:
+    """`current_rung_hold/decision.py`'s executable-quote-band refusal
+    shares this fixed set. L-12 widening: membership only.
+    """
+    assert "not_executable" in risk_module.COUNTED_REFUSAL_REASONS
+
+
+def test_p_hold_undefined_is_within_the_counted_set() -> None:
+    """`current_rung_hold/decision.py`'s undefined-table-cell refusal
+    shares this fixed set. L-12 widening: membership only.
+    """
+    assert "p_hold_undefined" in risk_module.COUNTED_REFUSAL_REASONS
+
+
+def test_edge_below_break_even_is_within_the_counted_set() -> None:
+    """`current_rung_hold/decision.py`'s break-even refusal shares this
+    fixed set. L-12 widening: membership only.
+    """
+    assert "edge_below_break_even" in risk_module.COUNTED_REFUSAL_REASONS
+
+
 def test_a_reducing_sell_survives_unobserved_equity() -> None:
     """RED-10: the exit is NOT gagged by a missing measurement.
 

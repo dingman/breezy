@@ -85,6 +85,7 @@ def test_refusal_reasons_is_the_closed_set_from_the_brief() -> None:
             "observation_ambiguous",
             "fee_schedule_mismatch",
             "trial_day_consumed",
+            "illegal_cell",
             "not_executable",
             "p_hold_undefined",
             "edge_below_break_even",
@@ -160,6 +161,32 @@ def test_an_ask_at_or_above_the_executable_upper_bound_is_not_executable() -> No
 def test_a_size_below_the_minimum_displayed_size_is_not_executable() -> None:
     decision = evaluate_decision(_take_case_inputs(size=0))
     assert decision == Refuse("not_executable")
+
+
+def test_a_table_defined_cell_with_illegal_interior_margin_is_refused_illegal_cell() -> None:
+    """`(LAX, DJF, 12, interior_2F, m=1)` IS defined in the frozen table
+    (`Decimal("0.5197")`), and clears break-even against the default ask --
+    proving this is a REAL escape route the legal-cell rule must close, not
+    a hypothetical one. Legal ⟺ `(width_code == 0 AND m_code == 0)` OR
+    `width_code == 1` (blueprint step 6; `archive_table.py`'s header). A
+    cell existing in the table is never sufficient on its own -- the caller
+    passing an out-of-policy key must still be refused, unforgeable by the
+    caller (L-22).
+    """
+    decision = evaluate_decision(
+        _take_case_inputs(width_code=_INTERIOR_WIDTH_CODE, m_code=1)
+    )
+    assert decision == Refuse("illegal_cell")
+
+
+def test_open_lower_width_code_is_never_legal() -> None:
+    """`width_code == 2` (`open_lower`) is never legal, regardless of
+    `m_code`, and regardless of whether a cell happens to exist -- see
+    `archive_table.py`'s header ("`width_code`: 0 = interior_2F, 1 =
+    open_upper, 2 = open_lower") and the blueprint's binding LEGAL CELL rule.
+    """
+    decision = evaluate_decision(_take_case_inputs(width_code=2, m_code=0))
+    assert decision == Refuse("illegal_cell")
 
 
 def test_an_undefined_table_cell_is_refused_p_hold_undefined() -> None:
@@ -239,6 +266,15 @@ def test_first_executable_ask_is_the_only_candidate_even_if_a_later_ask_is_cheap
         pytest.param(
             {
                 "ask": Decimal("0.99"),
+                "width_code": _INTERIOR_WIDTH_CODE,
+                "m_code": 1,
+            },
+            "illegal_cell",
+            id="illegal-cell-beats-not-executable",
+        ),
+        pytest.param(
+            {
+                "ask": Decimal("0.99"),
                 "width_code": 1,
                 "m_code": 1,
             },
@@ -249,6 +285,11 @@ def test_first_executable_ask_is_the_only_candidate_even_if_a_later_ask_is_cheap
             {"width_code": 1, "m_code": 1},
             "p_hold_undefined",
             id="undefined-table-cell-beats-edge-below-break-even",
+        ),
+        pytest.param(
+            {"width_code": _INTERIOR_WIDTH_CODE, "m_code": 1},
+            "illegal_cell",
+            id="illegal-cell-beats-edge-below-break-even-even-when-the-cell-is-defined",
         ),
         pytest.param(
             {"ask": Decimal("0.80")},

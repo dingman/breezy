@@ -21,6 +21,7 @@ from breezy.runtime.submit_intent import (
     SubmitIntentLockNotHeld,
     open_submit_intent_latch,
 )
+from breezy.strategy.current_rung_hold.decision import REFUSAL_REASONS
 from breezy.strategy.current_rung_hold.trial_day_latch import (
     TrialDayAlreadyConsumed,
     TrialDayInvalidReason,
@@ -145,7 +146,8 @@ class TestConsumeAndRecord:
             assert trial_latch.record(STATION, CLIMATE_DAY) is None
 
     @pytest.mark.parametrize(
-        "reason", ["observation_unavailable", "observation_ambiguous", "not_taken", "taken"]
+        "reason",
+        sorted(REFUSAL_REASONS | {"taken"}),
     )
     def test_every_closed_set_reason_is_accepted(self, store_path: Path, reason: str) -> None:
         with open_submit_intent_latch(SqliteStateStore(store_path), store_path) as intent_latch:
@@ -182,7 +184,7 @@ class TestConsumeAndRecord:
                 latched_at_ns=NOW_NS + 1,
                 instrument_id=INSTRUMENT_ID,
                 ask=Decimal("0.22"),
-                reason="not_taken",
+                reason="observation_unavailable",
             )
             assert trial_latch.is_consumed(STATION, OTHER_CLIMATE_DAY) is True
 

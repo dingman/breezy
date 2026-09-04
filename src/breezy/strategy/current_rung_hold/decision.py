@@ -26,14 +26,26 @@ build order step 5, refined by this increment's dispatch brief):
    ``[lower_f, upper_f]`` interval (well-defined once step 4 has passed).
    This step never refuses on its own; it only names the rung a ``Take``
    reports.
-6. the quote is not executable (``executable_ask_lower < ask <
+6. the ``(width_code, m_code)`` pair the caller passed is not a LEGAL CELL
+   -> ``illegal_cell``. Legal iff ``(width_code == 0 AND m_code == 0)`` OR
+   ``width_code == 1`` -- ``width_code == 2`` (``open_lower``) is NEVER
+   legal, and ``m_code == 1`` is legal ONLY paired with ``width_code == 0``
+   (blueprint step 6; see ``archive_table.py``'s header for the encoding).
+   This check is ENFORCED here, not merely documented as the caller's
+   responsibility (L-22: a safety exclusion must be unforgeable, not
+   offered) -- it runs BEFORE the table lookup (step 8) precisely because a
+   cell existing in the frozen table is never sufficient on its own: several
+   out-of-policy keys (e.g. ``width_code=0, m_code=1``) ARE populated in the
+   table (measured, but never intended for live use) and would otherwise
+   silently reach ``Take``.
+7. the quote is not executable (``executable_ask_lower < ask <
    executable_ask_upper`` and ``size >= minimum_displayed_size``, both
    strict on price) -> ``not_executable``.
-7. the frozen table has no defined cell at
+8. the frozen table has no defined cell at
    ``(station, season, hour_lst, width_code, m_code)`` -> ``p_hold_undefined``
    (an under-powered cell is undefined, never the worst cell -- see
    ``archive_table.py``'s header).
-8. ``p_hold_lower`` does not clear the break-even price (``ask`` plus the
+9. ``p_hold_lower`` does not clear the break-even price (``ask`` plus the
    venue fee on that ask) -> ``edge_below_break_even``; otherwise ``Take``.
 
 Receipt gating (blueprint amendment, "Receipt gating is Seam A-2's
@@ -44,12 +56,12 @@ caller builds ``running_max`` and ``now_ns`` from the SAME instant a quote
 is priced against, a quote can never be priced ahead of the observation that
 sets ``running_max``.
 
-Legal-cell derivation (``season``/``hour_lst``/``width_code``/``m_code``) is
-the CALLER's responsibility (step 6, gated on Seam B) -- this module only
-looks the key up; it does not re-derive or second-guess it. See the
-blueprint's "taken test... legal cell" note for what the caller must never
-pass (``m_code == 1`` or ``open_lower`` outside their measured, intended
-use).
+Legal-cell derivation (``season``/``hour_lst``) is the CALLER's
+responsibility (step 6 of the caller's own wiring, gated on Seam B) -- this
+module does not re-derive ``season``/``hour_lst`` from the clock or
+``climate_day``. But WHICH ``(width_code, m_code)`` pairs are legal to trade
+is enforced here, in step 6 of the rule order above, not merely documented
+as a caller obligation -- see that step for the binding rule and why (L-22).
 
 One trial per station-day is the CALLER's latch (``trial_day_latch.py``):
 this module is pure and stateless, so ``Take`` is not itself a commit -- the
@@ -110,6 +122,7 @@ REFUSAL_REASONS: Final[frozenset[str]] = frozenset(
         "observation_ambiguous",
         "fee_schedule_mismatch",
         "trial_day_consumed",
+        "illegal_cell",
         "not_executable",
         "p_hold_undefined",
         "edge_below_break_even",
@@ -198,6 +211,20 @@ def _rung_index(value: int, ladder: Sequence[RungBounds]) -> int | None:
     return None
 
 
+def _is_legal_cell(width_code: int, m_code: int) -> bool:
+    """The binding LEGAL CELL rule (module docstring step 6).
+
+    ``width_code == 2`` (``open_lower``) is NEVER legal. ``m_code == 1`` is
+    legal ONLY paired with ``width_code == 0`` (interior_2F) -- never with
+    ``width_code == 1`` alone deciding it, since the open tails fix
+    ``m_code`` at 0 and have no margin axis (``archive_table.py``'s header).
+    Enforced here so a caller cannot pass an out-of-policy key and reach a
+    ``Take`` merely because the frozen table happens to have that cell
+    populated (L-22: unforgeable, not offered).
+    """
+    return (width_code == 0 and m_code == 0) or width_code == 1
+
+
 def _fee(ask: Decimal, fee_coefficient: Decimal) -> Decimal:
     """``theta * ask * (1 - ask)`` for ONE contract, banker's-rounded to the cent.
 
@@ -231,6 +258,9 @@ def evaluate_decision(inputs: DecisionInputs) -> Decision:
     rung_index = _rung_index(running_max.lower_f, inputs.ladder)
     assert rung_index is not None  # `spans` already proved containment.
     rung: RungBounds = inputs.ladder[rung_index]
+
+    if not _is_legal_cell(inputs.width_code, inputs.m_code):
+        return Refuse("illegal_cell")
 
     executable = (
         inputs.config.executable_ask_lower < inputs.ask < inputs.config.executable_ask_upper

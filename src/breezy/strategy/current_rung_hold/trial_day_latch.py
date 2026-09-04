@@ -55,13 +55,23 @@ from breezy.runtime.submit_intent import (
     SubmitIntentLockNotHeld,
     _HeldSubmitIntentLock,
 )
+from breezy.strategy.current_rung_hold.decision import REFUSAL_REASONS
 
-#: The closed set of trial-day outcomes. Widening this set is a schema
-#: change to every already-written record; it is intentionally not exposed
-#: as a public constant callers are invited to extend.
-_REASONS: Final[frozenset[str]] = frozenset(
-    {"observation_unavailable", "observation_ambiguous", "not_taken", "taken"}
-)
+#: The closed set of trial-day outcomes: every `decision.py` refusal reason
+#: (`REFUSAL_REASONS`) the caller might record verbatim, plus `"taken"` for
+#: a `Take`. Widening this set is a schema change to every already-written
+#: record, so it is intentionally not exposed as a public constant callers
+#: are invited to extend independently -- it derives from `REFUSAL_REASONS`
+#: itself rather than duplicating it, so the two can never silently drift.
+#:
+#: There used to be a bare, collapsed `"not_taken"` outcome here. It had
+#: zero production callers (no wiring site exists yet -- `strategy.py`,
+#: build order step 6, is not built) and would have thrown away exactly the
+#: fact an operator dashboard needs: WHICH `decision.py` rule refused the
+#: trial. Recording the real reason string instead is the more honest
+#: mapping, not a narrower one -- every `not_taken` caller this latch ever
+#: had is still representable, now with the actual reason preserved.
+_REASONS: Final[frozenset[str]] = frozenset(REFUSAL_REASONS | {"taken"})
 _SCHEMA_VERSION: Final[int] = 1
 
 
