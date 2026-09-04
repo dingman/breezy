@@ -442,15 +442,25 @@ def test_the_runtime_starts_with_none_of_the_derivable_env_vars_set() -> None:
     """
     settings = load_settings({"BREEZY_CATALOG_BASE": "/data/breezy"})
 
-    assert settings.sites == default_registry().pairs()
+    expected = tuple(
+        pair for pair in default_registry().pairs() if pair[0] == "polymarket_us"
+    )
+    assert settings.sites == expected
     assert settings.poll_interval_seconds == 300
 
 
-def test_unset_sites_defaults_to_every_registered_site() -> None:
+def test_unset_sites_defaults_to_every_registered_ingest_site() -> None:
+    """"Every registered site" means every ``polymarket_us`` entry -- a
+    registry entry for a venue with no ingest actor yet (``[sites.kalshi.*]``,
+    KALSHI_CRH_EXPANSION_PLAN_2026-09-04 S4) must never join the unset
+    default, or it would silently double-poll a shared station."""
     env = dict(MINIMAL_ENV)
     del env["BREEZY_SITES"]
 
-    assert load_settings(env).sites == default_registry().pairs()
+    expected = tuple(
+        pair for pair in default_registry().pairs() if pair[0] == "polymarket_us"
+    )
+    assert load_settings(env).sites == expected
 
 
 def test_the_derived_default_is_exactly_the_five_polymarket_us_cities() -> None:

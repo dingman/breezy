@@ -324,11 +324,19 @@ def test_the_derived_site_pairs_equal_the_settlement_registry_pairs(
 
     Derived purely from the venue's own series/event captures, then bound to
     the registry by ICAO. If the venue adds a sixth city, this fails RED.
+
+    Compared against the registry's ``polymarket_us`` pairs only: the
+    registry also carries sibling-venue entries (``[sites.kalshi.*]``,
+    KALSHI_CRH_EXPANSION_PLAN_2026-09-04 S4) with no ingest actor of their
+    own, so ``registry.pairs()`` unfiltered is no longer this venue's set.
     """
     registry = default_registry()
     pairs = derive_site_pairs(universe, registry)
+    polymarket_us_registry_pairs = {
+        pair for pair in registry.pairs() if pair[0] == "polymarket_us"
+    }
 
-    assert set(pairs) == set(registry.pairs())
+    assert set(pairs) == polymarket_us_registry_pairs
     assert pairs == tuple(sorted(pairs))
 
 

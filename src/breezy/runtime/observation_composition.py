@@ -32,7 +32,7 @@ from breezy.ingest.nws_observation_actor import (
     NwsObservationActorConfig,
     build_observation_transport,
 )
-from breezy.registry.sites import SiteRegistry, default_registry
+from breezy.registry.sites import SettlementSite, SiteRegistry, default_registry
 from breezy.runtime.composition import site_stagger_offset_seconds
 
 __all__ = [
@@ -61,12 +61,29 @@ def build_live_observation_actors(
     poll_interval_seconds: int = DEFAULT_OBSERVATION_POLL_INTERVAL_SECONDS,
     staleness_bound_seconds: int = DEFAULT_STALENESS_BOUND_SECONDS,
 ) -> tuple[NwsObservationActor, ...]:
-    """One Actor per eligible registry site, in registry order, staggered."""
+    """One Actor per eligible STATION, in registry order, staggered.
+
+    Keyed by ICAO, not by `(venue, city)`: `NwsObservationActorConfig` carries
+    only `station_icao` and `observation_actor_component_id` is derived from
+    it alone, because this Actor watches one physical station's live METAR
+    feed -- a venue-agnostic NWS fact. Since
+    KALSHI_CRH_EXPANSION_PLAN_2026-09-04 S4, the registry can hold TWO
+    `(venue, city)` entries for the same ICAO (`polymarket_us.LAX` and
+    `kalshi.LAX`); iterating `registry.pairs()` unfiltered would therefore
+    build two Actors with an IDENTICAL `component_id` for one station. The
+    first-seen `(venue, city)` per ICAO, in registry order, is kept -- a
+    second venue trading a station already observed adds no new observation
+    source.
+    """
     active_registry = default_registry() if registry is None else registry
-    eligible = [
-        (venue, city, active_registry.settlement_site(venue, city))
-        for venue, city in active_registry.pairs()
-    ]
+    eligible: list[tuple[str, str, SettlementSite]] = []
+    seen_icaos: set[str] = set()
+    for venue, city in active_registry.pairs():
+        site = active_registry.settlement_site(venue, city)
+        if site.icao in seen_icaos:
+            continue
+        seen_icaos.add(site.icao)
+        eligible.append((venue, city, site))
     eligible = [entry for entry in eligible if entry[2].icao not in EXCLUDED_ICAOS]
     site_count = len(eligible)
     transport_factory = partial(build_observation_transport, check_proxy_env=check_proxy_env)

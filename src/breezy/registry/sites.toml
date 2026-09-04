@@ -308,3 +308,236 @@ settlement_eligible = false
 lat = 33.93806
 lon = -118.38889
 elevation_m = 38.1
+
+# =============================================================================
+# Kalshi — sibling venue table (KALSHI_CRH_EXPANSION_PLAN_2026-09-04 S4)
+# =============================================================================
+#
+# A [sites.kalshi.*] ENTRY IS SETTLEMENT TRUTH ONLY -- IT IS NOT AN INGEST
+# SITE. This step (S4) adds registry identity for Kalshi's four shared
+# stations; there is no `KalshiIngestActor` and no Kalshi ingest deployment
+# (that lands at build-order S7). The running NWS-ingest unit's configured
+# site set (`BREEZY_SITES`, or the unset-default derivation in
+# `runtime/settings.py::_registry_site_pairs`/`_DERIVABLE_INGEST_VENUES`)
+# must NEVER include `kalshi:<city>` for a city already polled as
+# `polymarket_us:<city>`: a second `NwsIngestActor`/`NwsObservationActor`
+# reading the identical CLI product doubles the NWS request rate under the
+# ONE shared `CrossSite403Window` (`ingest/shared_state.py:429-432,594-611`)
+# for a station that is already covered. `_registry_site_pairs` filters the
+# unset-default derivation to `_DERIVABLE_INGEST_VENUES` (today
+# `polymarket_us` only) for exactly this reason; an explicit
+# `BREEZY_SITES=kalshi:LAX,polymarket_us:LAX` selection is NOT currently
+# refused by the loader/validator (`settings.py::_parse_sites` is
+# syntax-only; `SharedIngestState._validate_sites` checks registry
+# membership per pair, not cross-venue-same-ICAO collisions) -- this is a
+# known gap, to be closed alongside the Kalshi ingest actor at S7, not here.
+#
+# Same four PHYSICAL stations as the polymarket_us entries above -- icao,
+# cli_location, issuing_office, iana_tz, std_utc_offset_hours,
+# body_header_regex and both never_substitute lists are IDENTICAL to the PM
+# entries for LAX/MDW/MIA/SFO and are RE-VERIFIED LIVE on 2026-09-04 (not
+# copied blind): /stations/{icao} timezone matched, and the latest CLI
+# product body header for each city was refetched from api.weather.gov and
+# matches the existing regex byte-for-byte (see per-entry header quotes
+# below, each dated 2026-09-04). Kalshi lists no NYC daily-temperature
+# series in this batch, so no [sites.kalshi.NYC] entry exists.
+#
+# SETTLEMENT SOURCE IS THE WEATHER COMPANY, NOT THE NWS CLI DIRECTLY.
+# Kalshi's own rules text (S0 §10.4) names the CLI station as the
+# *identifier* ("the maximum temperature recorded at Los Angeles
+# (CLILAX) ... according to The Weather Company") but settles on The
+# Weather Company's reported value, not the raw CLI product. The CLI is
+# therefore outcome TRUTH for divergence measurement (plan S8/S15
+# per-station CLI-final-vs-TWC reconciliation, n>=90, Wilson-lower>0.99),
+# never assumed identical to the venue's settled result.
+#
+# SETTLEMENT-CLOCK VALUES -- stated from vendor evidence, not measured yet.
+# `settlement_time_local`/`settlement_timezone` = the LATER of the two
+# published ET instants ("the first 7:00 or 8:00 AM ET following the
+# release of the data"); nothing in Breezy acts before the deadline, so the
+# late bound is the conservative one (VERIFIED, docs/evidence/venue/kalshi/
+# s0_2026-09-04/S0_FINDINGS_2026-09-04.md §10.4).
+# `no_data_fallback_days = 7` -- VERIFIED from "or one week after".
+# `settlement_delay_time_local`/`settlement_delay_timezone` -- Kalshi
+# publishes NO CLI-disagreement review delay analogous to the PM venue's
+# 11:00 ET review clock; its only nearby mechanism is the unrelated 300s
+# `determined` dispute timer. VENUE-UNCONFIRMED: pinned pessimistically to
+# the same instant as `settlement_time_local`/`settlement_timezone` (i.e.
+# no earlier release than the deadline), to be REPLACED by the S15
+# 20-settlement observation campaign's measurement. Do not treat this pin
+# as a verified value.
+# =============================================================================
+
+# -----------------------------------------------------------------------------
+# Kalshi — Los Angeles (KXHIGHLAX)
+# Same station as [sites.polymarket_us.LAX]: AWIPS PIL CLILAX, WMO CDUS46 KLOX.
+# Header re-verified live 2026-09-04, product ef72ac35-9a4b-471c-a4fa-92ebb218fe65
+# (KLOX):
+#   ...THE LOS ANGELES INTL AIRPORT CA CLIMATE SUMMARY FOR SEPTEMBER 3 2026...
+# /stations/KLAX timeZone re-verified live 2026-09-04: America/Los_Angeles.
+# -----------------------------------------------------------------------------
+[sites.kalshi.LAX]
+icao = "KLAX"
+iem_asos_id = "KLAX"
+cli_location = "LAX"
+venue_city_token = "lax"
+issuing_office = "KLOX"
+iana_tz = "America/Los_Angeles"
+std_utc_offset_hours = -8.0
+body_header_regex = '^\.\.\.THE\s+LOS\s+ANGELES\s+INTL\s+AIRPORT\s+CA\s+CLIMATE\s+SUMMARY\s+FOR\b'
+# KBUR/KLGB are same-office (KLOX) siblings — the collision hazard.
+# KSNA (John Wayne) is a geographic neighbour issued by a DIFFERENT office
+# (KSGX); listed defensively, not a same-office collision.
+never_substitute = ["KBUR", "KLGB", "KSNA"]
+never_substitute_cli_locations = ["BUR", "LGB", "SNA"]
+# VENUE clock (Kalshi), stated from S0_FINDINGS_2026-09-04.md §10.4 — the
+# later published ET instant. NOT this site's local clock.
+settlement_time_local = "08:00"
+settlement_timezone = "America/New_York"
+# NWS-PRODUCT-derived, NOT venue-derived, and SHARED with polymarket_us:
+# this pair drives only the NWS CLI review-extension window (when a climate
+# day becomes EXPECTED, `ingest/gaps.py:419-441,1044-1050`,
+# `nws_actor.py:1696-1697`) -- a property of the NWS product for this
+# station, identical regardless of which venue settles on it. Pinning it to
+# `settlement_time_local` would collapse the 08:00-11:00 review window to
+# zero and manufacture false-positive gaps (`gaps.py:59-63`). Kalshi's own
+# review mechanism (the unrelated 300s `determined` dispute timer) plays no
+# part here.
+settlement_delay_time_local = "11:00"
+settlement_delay_timezone = "America/New_York"
+no_data_fallback_days = 7
+
+[sites.kalshi.LAX.open_meteo]
+settlement_eligible = false
+lat = 33.93806
+lon = -118.38889
+elevation_m = 38.1
+
+# -----------------------------------------------------------------------------
+# Kalshi — Chicago Midway (KXHIGHCHI)
+# Same station as [sites.polymarket_us.MDW]: AWIPS PIL CLIMDW, WMO CDUS43 KLOT.
+# Header re-verified live 2026-09-04, product 7aac1245-2c4a-494b-a686-f0714a29ac4f
+# (KLOT):
+#   ...THE CHICAGO-MIDWAY CLIMATE SUMMARY FOR SEPTEMBER 3 2026...
+# /stations/KMDW timeZone re-verified live 2026-09-04: America/Chicago.
+# -----------------------------------------------------------------------------
+[sites.kalshi.MDW]
+icao = "KMDW"
+iem_asos_id = "KMDW"
+cli_location = "MDW"
+venue_city_token = "mdw"
+issuing_office = "KLOT"
+iana_tz = "America/Chicago"
+std_utc_offset_hours = -6.0
+body_header_regex = '^\.\.\.THE\s+CHICAGO\s*-\s*MIDWAY\s+CLIMATE\s+SUMMARY\s+FOR\b'
+never_substitute = ["KORD"]
+never_substitute_cli_locations = ["ORD"]
+# VENUE clock (Kalshi), stated from S0_FINDINGS_2026-09-04.md §10.4 — the
+# later published ET instant. NOT this site's local clock.
+settlement_time_local = "08:00"
+settlement_timezone = "America/New_York"
+# NWS-PRODUCT-derived, NOT venue-derived, and SHARED with polymarket_us:
+# this pair drives only the NWS CLI review-extension window (when a climate
+# day becomes EXPECTED, `ingest/gaps.py:419-441,1044-1050`,
+# `nws_actor.py:1696-1697`) -- a property of the NWS product for this
+# station, identical regardless of which venue settles on it. Pinning it to
+# `settlement_time_local` would collapse the 08:00-11:00 review window to
+# zero and manufacture false-positive gaps (`gaps.py:59-63`). Kalshi's own
+# review mechanism (the unrelated 300s `determined` dispute timer) plays no
+# part here.
+settlement_delay_time_local = "11:00"
+settlement_delay_timezone = "America/New_York"
+no_data_fallback_days = 7
+
+[sites.kalshi.MDW.open_meteo]
+settlement_eligible = false
+lat = 41.78417
+lon = -87.75528
+elevation_m = 188.0616
+
+# -----------------------------------------------------------------------------
+# Kalshi — Miami (KXHIGHMIA)
+# Same station as [sites.polymarket_us.MIA]: AWIPS PIL CLIMIA, WMO CDUS42 KMFL.
+# Header re-verified live 2026-09-04, product 9148fcf0-6491-4064-96b1-08fa0e47647f
+# (KMFL):
+#   ...THE MIAMI CLIMATE SUMMARY FOR SEPTEMBER 4 2026...
+# /stations/KMIA timeZone re-verified live 2026-09-04: America/New_York.
+# -----------------------------------------------------------------------------
+[sites.kalshi.MIA]
+icao = "KMIA"
+iem_asos_id = "KMIA"
+cli_location = "MIA"
+venue_city_token = "mia"
+issuing_office = "KMFL"
+iana_tz = "America/New_York"
+std_utc_offset_hours = -5.0
+body_header_regex = '^\.\.\.THE\s+MIAMI\s+CLIMATE\s+SUMMARY\s+FOR\b'
+# KFLL/KAPF are same-office (KMFL) siblings — the collision hazard.
+# KMTH (Marathon) is a geographic neighbour issued by a DIFFERENT office
+# (KKEY); listed defensively, not a same-office collision.
+never_substitute = ["KFLL", "KAPF", "KMTH"]
+never_substitute_cli_locations = ["FLL", "APF", "MTH"]
+# VENUE clock (Kalshi), stated from S0_FINDINGS_2026-09-04.md §10.4 — the
+# later published ET instant. NOT this site's local clock.
+settlement_time_local = "08:00"
+settlement_timezone = "America/New_York"
+# NWS-PRODUCT-derived, NOT venue-derived, and SHARED with polymarket_us:
+# this pair drives only the NWS CLI review-extension window (when a climate
+# day becomes EXPECTED, `ingest/gaps.py:419-441,1044-1050`,
+# `nws_actor.py:1696-1697`) -- a property of the NWS product for this
+# station, identical regardless of which venue settles on it. Pinning it to
+# `settlement_time_local` would collapse the 08:00-11:00 review window to
+# zero and manufacture false-positive gaps (`gaps.py:59-63`). Kalshi's own
+# review mechanism (the unrelated 300s `determined` dispute timer) plays no
+# part here.
+settlement_delay_time_local = "11:00"
+settlement_delay_timezone = "America/New_York"
+no_data_fallback_days = 7
+
+[sites.kalshi.MIA.open_meteo]
+settlement_eligible = false
+lat = 25.79056
+lon = -80.31639
+elevation_m = 3.048
+
+# -----------------------------------------------------------------------------
+# Kalshi — San Francisco (KXHIGHTSFO)
+# Same station as [sites.polymarket_us.SFO]: AWIPS PIL CLISFO, WMO CDUS46 KMTR.
+# Header re-verified live 2026-09-04, product f3bdfde1-76ac-4731-b75d-b26794887dac
+# (KMTR):
+#   ...THE SAN FRANCISCO AIRPORT CLIMATE SUMMARY FOR SEPTEMBER 3 2026...
+# /stations/KSFO timeZone re-verified live 2026-09-04: America/Los_Angeles.
+# -----------------------------------------------------------------------------
+[sites.kalshi.SFO]
+icao = "KSFO"
+iem_asos_id = "KSFO"
+cli_location = "SFO"
+venue_city_token = "sfo"
+issuing_office = "KMTR"
+iana_tz = "America/Los_Angeles"
+std_utc_offset_hours = -8.0
+body_header_regex = '^\.\.\.THE\s+SAN\s+FRANCISCO\s+AIRPORT\s+CLIMATE\s+SUMMARY\s+FOR\b'
+never_substitute = ["KOAK", "KSJC"]
+never_substitute_cli_locations = ["OAK", "SJC"]
+# VENUE clock (Kalshi), stated from S0_FINDINGS_2026-09-04.md §10.4 — the
+# later published ET instant. NOT this site's local clock.
+settlement_time_local = "08:00"
+settlement_timezone = "America/New_York"
+# NWS-PRODUCT-derived, NOT venue-derived, and SHARED with polymarket_us:
+# this pair drives only the NWS CLI review-extension window (when a climate
+# day becomes EXPECTED, `ingest/gaps.py:419-441,1044-1050`,
+# `nws_actor.py:1696-1697`) -- a property of the NWS product for this
+# station, identical regardless of which venue settles on it. Pinning it to
+# `settlement_time_local` would collapse the 08:00-11:00 review window to
+# zero and manufacture false-positive gaps (`gaps.py:59-63`). Kalshi's own
+# review mechanism (the unrelated 300s `determined` dispute timer) plays no
+# part here.
+settlement_delay_time_local = "11:00"
+settlement_delay_timezone = "America/New_York"
+no_data_fallback_days = 7
+
+[sites.kalshi.SFO.open_meteo]
+settlement_eligible = false
+lat = 37.61961
+lon = -122.36558
+elevation_m = 3.048

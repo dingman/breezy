@@ -18,11 +18,14 @@ same variable.
 cities exist is a VENUE FACT, and the bot must discover venue facts itself
 -- an operator who has to recite the city list into an environment file is
 supplying something the venue already publishes. Unset therefore means
-"every `(venue, city)` Breezy holds settlement truth for", read from the
-site registry in force (`BREEZY_REGISTRY_PATH`, else the packaged
-`sites.toml`). Setting it narrows a run deliberately, which is a real
-operational need during a staged rollout; setting it BLANK is still a
-malformed value and is still refused.
+"every `(venue, city)` Breezy holds settlement truth for AND already has an
+ingest actor for" (`_DERIVABLE_INGEST_VENUES` -- today `polymarket_us`
+only; a registry entry for a venue with no ingest actor, e.g.
+`[sites.kalshi.*]`, is settlement truth but never an unset-default ingest
+target), read from the site registry in force (`BREEZY_REGISTRY_PATH`, else
+the packaged `sites.toml`). Setting it narrows a run deliberately, which is
+a real operational need during a staged rollout; setting it BLANK is still
+a malformed value and is still refused.
 
 That default is the registry, not the venue payload, on purpose. The
 registry is the narrower of the two and is the one that carries settlement
@@ -227,8 +230,25 @@ def _parse_sites(raw: str) -> tuple[tuple[str, str], ...]:
     return tuple(pairs)
 
 
+_DERIVABLE_INGEST_VENUES: tuple[str, ...] = ("polymarket_us",)
+"""Venues whose registry entries the unset-`BREEZY_SITES` default may derive.
+
+The registry can hold settlement truth for a venue with NO ingest actor at
+all -- `[sites.kalshi.*]` (KALSHI_CRH_EXPANSION_PLAN_2026-09-04 S4) is
+settlement identity only; there is no `KalshiIngestActor` (build-order S7)
+and no Kalshi execution client yet. Deriving the unset default from
+`registry.pairs()` unfiltered would silently register a SECOND
+`NwsObservationActor`/ingest Actor for the same station -- `kalshi:LAX`
+alongside `polymarket_us:LAX` -- doubling the NWS request rate against one
+`CrossSite403Window` for an ICAO already polled. Extend this tuple only when
+a venue's own ingest actor exists and is wired through
+`SharedIngestState`/`composition.py`, never merely because the venue has a
+registry entry.
+"""
+
+
 def _registry_site_pairs(registry_path: Path | None) -> tuple[tuple[str, str], ...]:
-    """Every `(venue, city)` in the registry in force, in file order.
+    """Every `(venue, city)` in `_DERIVABLE_INGEST_VENUES`, in file order.
 
     This is the ONLY filesystem read `load_settings` performs, and it happens
     only when `BREEZY_SITES` is unset -- the override path neither pays for it
@@ -245,7 +265,9 @@ def _registry_site_pairs(registry_path: Path | None) -> tuple[tuple[str, str], .
             f"site registry, but the registry could not be loaded "
             f"({_REGISTRY_PATH_VAR}={registry_path}): {exc}"
         ) from exc
-    return registry.pairs()
+    return tuple(
+        (venue, city) for venue, city in registry.pairs() if venue in _DERIVABLE_INGEST_VENUES
+    )
 
 
 def _resolve_sites(
