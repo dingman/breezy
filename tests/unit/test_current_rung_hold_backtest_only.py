@@ -200,7 +200,7 @@ def test_backtest_submit_enabled_actually_submits_unlike_the_parent(
     strategy = _register(store_path, clock=clock)
     strategy.on_start()
     submitted: list[object] = []
-    strategy.submit_order = submitted.append  # type: ignore[method-assign]
+    strategy.submit_order = submitted.append
     from breezy.strategy.current_rung_hold.decision import Take
 
     decision = Take(

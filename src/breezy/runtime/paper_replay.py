@@ -33,8 +33,9 @@ priced once its own ``ts_event >= received_at_ns`` for the observation that
 set the running max at that instant -- the two anchors diverge whenever the
 running max was set by a STALE row (held from an earlier observation), never
 whenever it was set by the freshest one. See
-``test_current_rung_hold_paper_replay.py::test_replay_receipt_time_is_synthesized_and_required``
-and its stale-anchor-divergence sibling.
+``tests/unit/test_current_rung_hold_paper_replay.py::test_received_at_ns_is_synthesized_as_observed_plus_lag``
+and ``tests/unit/test_paper_replay_lag_anchor.py`` (the stale-anchor-divergence
+sibling, lands separately).
 """
 
 from __future__ import annotations
@@ -50,6 +51,7 @@ from nautilus_trader.model.enums import OrderStatus
 from breezy.domain.station_observation import StationObservation
 from breezy.ingest.iem_observations import iem_asos_rows_to_station_observations
 from breezy.runtime.backtest_harness import BreezyBacktestConfig
+from breezy.settlement.roi_bound import ROIBoundResult, ROIBoundUnderpowered, format_roi_bound
 from breezy.settlement.trial_scorer import FilledTrial
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
@@ -71,6 +73,7 @@ __all__ = [
     "ReplayEntryContext",
     "build_paper_replay_config",
     "filled_trials_from_engine",
+    "format_roi_bound_for_paper_replay",
     "load_replay_observations",
 ]
 
@@ -294,3 +297,18 @@ def filled_trials_from_engine(
             ),
         )
     return tuple(trials)
+
+
+def format_roi_bound_for_paper_replay(result: ROIBoundResult) -> str:
+    """Render `result` for this module's paper-replay stdout.
+
+    Delegates every variant to the unmodified `breezy.settlement.roi_bound.
+    format_roi_bound` EXCEPT `ROIBoundUnderpowered`: that variant's spec
+    string (`"BCa: UNDERPOWERED (n<30)"`) carries the banned `UNDERPOWERED`
+    family-tally verdict token, and every real paper-replay run is n<=10
+    (module docstring's "MECHANISM TEST -- NO VERDICT"), so this always
+    fires here. Prints the mechanism-only phrasing instead.
+    """
+    if isinstance(result, ROIBoundUnderpowered):
+        return "BCa: n<30 — bound not computed"
+    return format_roi_bound(result)

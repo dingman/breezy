@@ -13,8 +13,8 @@ import ast
 import datetime as dt
 import importlib.util
 import sys
-from collections.abc import Iterator
-from contextlib import contextmanager
+from collections.abc import Callable, Iterator
+from contextlib import AbstractContextManager, contextmanager
 from decimal import Decimal
 from pathlib import Path
 from types import ModuleType
@@ -52,13 +52,19 @@ from breezy.runtime.paper_replay import (
     ReplayEntryContext,
     build_paper_replay_config,
     filled_trials_from_engine,
+    format_roi_bound_for_paper_replay,
     load_replay_observations,
 )
 from breezy.runtime.sqlite_store import SqliteStateStore
 from breezy.runtime.submit_intent import open_submit_intent_latch
+from breezy.settlement.roi_bound import ROIBound, ROIBoundUnderpowered
+from breezy.settlement.trial_scorer import FilledTrial
 from breezy.strategy.current_rung_hold.backtest_only import CurrentRungHoldBacktestStrategy
 from breezy.strategy.current_rung_hold.config import CurrentRungHoldConfig
-from breezy.strategy.current_rung_hold.trial_day_latch import open_trial_day_latch
+from breezy.strategy.current_rung_hold.trial_day_latch import (
+    TrialDayLatch,
+    open_trial_day_latch,
+)
 
 _REPO_ROOT = Path(__file__).resolve().parents[2]
 _SCRIPTS_ANALYSIS_DIR = _REPO_ROOT / "scripts" / "analysis"
@@ -126,7 +132,9 @@ def _quote(*, ask: str, size: int, ts_event: int) -> QuoteTick:
     )
 
 
-def _pad(side: OrderSide, levels: tuple[tuple[str, int], ...]) -> tuple[list, list]:
+def _pad(
+    side: OrderSide, levels: tuple[tuple[str, int], ...],
+) -> tuple[list[BookOrder], list[int]]:
     filler = BookOrder(side, Price(0, 2), Quantity(0, 0), 0)
     orders = [BookOrder(side, Price.from_str(px), Quantity(size, 0), 0) for px, size in levels]
     counts = [1] * len(orders)
@@ -153,12 +161,12 @@ def _depth(*, ask: str, size: int, ts_event: int) -> OrderBookDepth10:
 
 
 @contextmanager
-def _latch_context(store_path: Path) -> Iterator:
+def _latch_context(store_path: Path) -> Iterator[TrialDayLatch]:
     with open_submit_intent_latch(SqliteStateStore(store_path), store_path) as intent_latch:
         yield open_trial_day_latch(intent_latch)
 
 
-def _latch_factory(store_path: Path):
+def _latch_factory(store_path: Path) -> Callable[[], AbstractContextManager[TrialDayLatch]]:
     return lambda: _latch_context(store_path)
 
 
@@ -197,7 +205,7 @@ def test_a_quote_only_instrument_is_refused() -> None:
 # ---------------------------------------------------------------------------
 # RED tests 3-4 -- IOC fill mechanics, over a REAL BacktestEngine
 # ---------------------------------------------------------------------------
-def _run_engine(store_path: Path, *, ask: str, size: int):
+def _run_engine(store_path: Path, *, ask: str, size: int) -> tuple[FilledTrial, ...]:
     instrument = _instrument()
     # Depth strictly precedes the quote's own ts_init: under L2_MBP,
     # `process_quote_tick` never mutates the book (engine.pyx:4509,4551), so
@@ -299,6 +307,25 @@ def test_precision_arms_are_both_present_and_default_is_pessimistic() -> None:
     assert archive_obs.precision_c_tenths == 5
 
 
+def test_format_roi_bound_for_paper_replay_never_prints_underpowered(
+) -> None:
+    """Every real paper-replay run is n<=10 (module docstring), so
+    `ROIBoundUnderpowered` must never surface the banned `UNDERPOWERED`
+    family-tally verdict token here."""
+    rendered = format_roi_bound_for_paper_replay(ROIBoundUnderpowered(n=3))
+    assert rendered == "BCa: n<30 — bound not computed"
+    for banned in ("UNDERPOWERED", "KILL", "SURVIVE"):
+        assert banned not in rendered
+
+
+def test_format_roi_bound_for_paper_replay_delegates_other_variants() -> None:
+    result = ROIBound(lower_bound=Decimal("0.10"), n=42, theta_hat=Decimal("0.20"))
+    assert (
+        format_roi_bound_for_paper_replay(result)
+        == "BCa 95% lower bound on ROI: 0.10 (n=42, B=10000, seed=20260904)"
+    )
+
+
 # ---------------------------------------------------------------------------
 # Driver-level tests (dynamic module load)
 # ---------------------------------------------------------------------------
@@ -336,7 +363,7 @@ def test_lag_minutes_is_required_at_the_cli(driver: ModuleType) -> None:
 
 
 def test_the_provenance_header_states_lag_precision_n_ceiling_and_no_verdict(
-    driver: ModuleType,
+    driver: ModuleType, capsys: pytest.CaptureFixture[str],
 ) -> None:
     header = driver.build_provenance_header(
         lag_minutes=30, precision_mode="nws_integer_c", n_requested=1, n_data=1, n_live=1,
@@ -347,6 +374,19 @@ def test_the_provenance_header_states_lag_precision_n_ceiling_and_no_verdict(
     assert "n<=10" in header
     for banned in ("**KILL**", "**SURVIVE**", "**UNDERPOWERED**"):
         assert banned not in header
+
+    # Full paper stdout, not just the header: every real paper-replay run
+    # is n<=10, so `_print_roi_and_wilson`'s BCa line must never surface
+    # the banned UNDERPOWERED family-tally verdict token either. Scan the
+    # ROI-bound line's OWN output, isolated from the header's descriptive
+    # prose (which legitimately names the banned words while explaining
+    # this module never prints them as a verdict).
+    capsys.readouterr()  # discard anything printed above
+    driver._print_roi_and_wilson((), {}, 0)
+    captured = capsys.readouterr().out
+    assert "BCa: n<30 — bound not computed" in captured
+    for banned in ("UNDERPOWERED", "KILL", "SURVIVE"):
+        assert banned not in captured
 
 
 def test_settlement_comes_from_the_final_climate_day_only(driver: ModuleType) -> None:
@@ -466,7 +506,10 @@ def test_no_inline_wilson_or_bootstrap_arithmetic(driver: ModuleType) -> None:
     for node in ast.walk(tree):
         if isinstance(node, ast.ImportFrom):
             imported |= {alias.name for alias in node.names}
-    assert {"score_trials", "compute_roi_bound", "format_roi_bound", "wilson_interval"} <= imported
+    assert {
+        "score_trials", "compute_roi_bound", "format_roi_bound_for_paper_replay",
+        "wilson_interval",
+    } <= imported
     # No hand-rolled normal-approximation constant (the exact anticonservative
     # shape EXEC_SPINE R-9 refuses by name).
     assert "1.96" not in source

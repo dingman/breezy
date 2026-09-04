@@ -10,7 +10,8 @@ prints `MECHANISM TEST -- NO VERDICT` in place of one, and never reads
 
 No hand computation: every number this module prints comes from
 `breezy.settlement.trial_scorer.score_trials`,
-`breezy.settlement.roi_bound.compute_roi_bound`/`format_roi_bound`, or
+`breezy.settlement.roi_bound.compute_roi_bound`/
+`breezy.runtime.paper_replay.format_roi_bound_for_paper_replay`, or
 `archive_correction_probe.wilson_interval` (the study's own Wilson helper) --
 never an inline Wilson or bootstrap formula (RED "no hand computation" test).
 """
@@ -57,6 +58,7 @@ from breezy.runtime.paper_replay import (
     ReplayEntryContext,
     build_paper_replay_config,
     filled_trials_from_engine,
+    format_roi_bound_for_paper_replay,
     load_replay_observations,
 )
 from breezy.runtime.sqlite_store import SqliteStateStore
@@ -64,7 +66,6 @@ from breezy.runtime.submit_intent import open_submit_intent_latch
 from breezy.settlement.roi_bound import (
     ROIInputRow,
     compute_roi_bound,
-    format_roi_bound,
 )
 from breezy.settlement.trial_scorer import FilledTrial, score_trials
 from breezy.strategy.current_rung_hold.backtest_only import (
@@ -305,7 +306,7 @@ def _print_roi_and_wilson(
         ROIInputRow(pnl=row.pnl, cost=row.fill_px + row.fee, excluded_reason=None)
         for row in scored
     )
-    print(format_roi_bound(compute_roi_bound(roi_inputs)))
+    print(format_roi_bound_for_paper_replay(compute_roi_bound(roi_inputs)))
 
 
 def main(argv: Sequence[str] | None = None) -> int:
