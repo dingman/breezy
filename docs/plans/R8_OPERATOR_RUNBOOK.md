@@ -60,78 +60,36 @@ journalctl strings to grep:
 
 A station that resolves zero instruments for today's climate day is skipped and counted; the process refuses to start only when every station resolves zero.
 
-## 1. OP-1 — rest a BUY of 1 contract at $0.01, by hand
+## 1–4. OP-SEQ — the bot rests, proves, cancels and verifies its own positive control (rewritten 2026-09-04)
 
-Purpose: create the positive control that makes OP-2's refusal meaningful. A flat-account pre-flight
-cannot distinguish "the account is flat" from "the venue hid our order" (Rev 7 §1 D1).
-
-Steps, as far as the documents describe them: in the Polymarket.us UI, on any weather market whose
-best ask is far above $0.01, place a **limit BUY, quantity 1, price $0.01**. BUY, never SELL — a SELL
-on this account is a naked short. $0.01 far below best ask cannot execute unless someone sells into
-it, so the loss bound is **$0.01 plus fee**. The empty bid side is irrelevant to a resting BUY.
-
-What the operator must see: the order listed as **resting/open** in the venue's own UI.
-Wrong observation: it filled immediately, or it does not appear. Filled → the account is not flat and
-OP-2/OP-4 are both invalid; stop and reassess. Not visible → do not proceed; an unconfirmed order
-makes `PREFLIGHT_NOT_EMPTY` unattributable.
-
-Note: the exact UI click path is not described in any repo document. Only the order parameters above
-are specified.
-
-## 2. OP-2 — run the probe with the positive control
+Operator ruling 2026-09-04: resting and cancelling the control is the bot's job, never a venue-UI
+step. Plan: `docs/plans/OP_SEQ_BOT_POSITIVE_CONTROL_2026-09-04.md` (converged). One command:
 
 ```
-.venv/bin/python scripts/venue/polymarket_us_write_signing_probe.py --positive-control
+.venv/bin/python scripts/venue/polymarket_us_write_signing_probe.py --sequence [--stamp <token>]
 ```
-(optional: `--stamp <suffix>`, `--evidence-dir <path>`; default is the private-shape evidence dir.)
 
-Expected: refusal at the pre-flight with reason **`PREFLIGHT_NOT_EMPTY`**, exit code 2, **no artefact
-written**, and no POST issued (`:522-527`, `:171`). That, and only that, answers OQ-B YES.
+Precondition: no manual venue order may exist on the account for the run's duration (cancel-all
+would take it). Steps and stop rules, every stop terminal and never retried:
 
-Other observations and what they mean:
-- **`PREFLIGHT_NOT_200`** (`:512`, carries the HTTP status): transport fault, not evidence. **Re-run.**
-  Never treat it as the control succeeding.
-- **`OQB_NO`** (`:177`, `:528-535`): the unfiltered open-orders read reported an EMPTY list while the
-  control order was resting — the venue does not enumerate the whole account. **STOP.** OQ-B is
-  answered NO, whole-account flatness is unprovable, and the probe is dead as designed. Do not
-  proceed to OP-3/OP-4; escalate to the build side.
-- A run that *proceeds* past the pre-flight under `--positive-control` is the same failure as `OQB_NO`.
+| # | Step | Pass | Stop |
+|---|---|---|---|
+| S0 | artefact `O_EXCL` pre-check | absent | exit 2 before any request |
+| S1 | signed unfiltered `GET /v1/orders/open` | 200 + empty | `PREFLIGHT_NOT_200` (transport; re-run once) · `PREFLIGHT_NOT_EMPTY` (not flat; no write) |
+| S2 | public `GET /v1/markets`, deterministic pick: smallest eligible weather slug, best ask ≥ $0.20, tick 0.01, min qty ≤ 1, not resolved | one slug | `NO_ELIGIBLE_INSTRUMENT` (no write, no artefact) |
+| S3 | signed `POST /v1/orders`: limit BUY YES, qty 1, $0.01, GTC, `participateDontInitiate` | 200 + id | 401/403 → **CLOSED-NO**, nothing resting · other → `REST_AMBIGUOUS`, cleanup S5, `INCONCLUSIVE` |
+| S4 | signed open-orders read (one 250 ms re-read allowed) | our id, unfilled | `OQB_NO` / `CONTROL_FILLED` → cleanup S5, escalate |
+| S5 | signed cancel-all | 200 / `CancelAllOrdersResponse` | `CANCEL_NOT_OK` → **STOP un-flat, never retry** |
+| S6 | signed open-orders read | 200 + empty | `POSTFLIGHT_*` describes the read only |
 
-Stop rule: only `PREFLIGHT_NOT_EMPTY` licenses OP-3. A bare "refused" is not sufficient.
-
-## 3. OP-3 — cancel the resting BUY by hand, verify flat
-
-Cancel the OP-1 order in the venue UI. Then confirm in the UI that the unfiltered open-orders view is
-**empty**.
-
-**A failed cancel is a stop, not a retry** (Rev 7 §6). Cancellation runs over the same private
-surface; if it does not take, the account is left un-flat, OP-4 is blocked by its own control, and the
-correct action is to halt and report — not to re-issue cancels or to run OP-4 anyway.
-
-## 4. OP-4 — the real probe run on the proven-flat account
-
-```
-.venv/bin/python scripts/venue/polymarket_us_write_signing_probe.py
-```
-(no `--positive-control`). Run it immediately after OP-3, with the operator present.
-
-Expected: the pre-flight passes (200 + empty), one signed POST to the single pinned cancel-all path is
-issued, and a `PRIVATE_`-prefixed artefact is written with the closed 7-field schema — including
-`write_status` and `write_response_type`. stdout prints pre-flight status/reason, write status,
-write response type, post-flight status/reason, and the artefact path (`:719-727`).
-
-Reading the result (§D amendment 10, C-6):
-- OQ-D is **CLOSED-YES** iff `write_status` is **200**, or a non-401/403 status carrying a
-  `CancelAllOrdersResponse`-shaped body.
-- **401 or 403 → CLOSED-NO.** The signer's canonical string is not accepted on a write verb;
-  `WRITE_CANONICAL_STRING_VERIFIED` stays `False` and R-7 must refuse to wire a call site.
-- `POSTFLIGHT_NOT_200` / `POSTFLIGHT_NOT_EMPTY` / `INTERRUPTED` describe the post-flight read or an
-  interruption; they do not by themselves answer OQ-D, and an `INTERRUPTED` artefact is a partial,
-  honest record — report it, do not re-run blindly.
-
-The operator does not edit code. The **build side** flips `WRITE_CANONICAL_STRING_VERIFIED`, citing
-the artefact path in the commit message. The `AUTH_OK` token from older plan revisions does not exist
-in the shipped probe.
+Verdict `CLOSED_YES_BOTH_VERBS` iff S3 200+id, S4 enumerated-unfilled, S5 ok, S6 empty. Loss bound if
+the control ever fills: $0.01 (fee rounds to $0.00). The artefact
+`PRIVATE_write_sequence_probe[_<stamp>].json` (+ `.sha256`) is written iff a signed request was
+issued; it carries statuses, reason codes, response type names and the verdict — never a slug, id,
+count or body. An interruption after S3 writes a partial artefact with `verdict=INCONCLUSIVE`;
+recovery is one legacy cancel-all-only run (`--positive-control` is legacy and no longer part of the
+sequence). Only `CLOSED_YES_BOTH_VERBS` licenses C5: the build side flips
+`WRITE_CANONICAL_STRING_VERIFIED`, pasting the rendered artefact JSON and its sha256 into the commit.
 
 ## 5. PREREG committed — BEFORE the first order
 
