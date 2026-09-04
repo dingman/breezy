@@ -53,6 +53,8 @@ from mb_current_rung_edge_study import (
     classify_ask_band,
 )
 
+from structural_dead_stop import StructuralDeadVerdict, structural_dead
+
 from breezy.persistence.scored_trial_store import read_scored_trials
 from breezy.settlement.roi_bound import (
     ROIInputRow,
@@ -65,6 +67,7 @@ __all__ = [
     "STRATUM_TABLE_DIVIDER",
     "STRATUM_TABLE_HEADER",
     "LiveFamilyTally",
+    "StructuralDeadVerdict",
     "SlippageSummary",
     "assert_live_only",
     "assert_paper_only",
@@ -134,6 +137,11 @@ class LiveFamilyTally:
     n_excluded: int
     slippage: SlippageSummary
     bca_line: str
+    #: The v1 section 5:105-106 structural-dead stop (KILL-class, additive
+    #: to -- never a replacement of -- `pooled_kill`/`cell_dead` below).
+    #: `None` when the caller supplies no `covered_listed_station_days`
+    #: (the reader has its own I/O path; the tally never runs it itself).
+    structural_dead: StructuralDeadVerdict | None
 
 
 def assert_live_only(rows: Sequence[ScoredTrial]) -> None:
@@ -227,9 +235,36 @@ def _roi_bound_line(all_rows: Sequence[ScoredTrial]) -> str:
 
 
 def build_live_family_tally(
-    rows: Sequence[ScoredTrial], *, provenance: str = "live",
+    rows: Sequence[ScoredTrial],
+    *,
+    provenance: str = "live",
+    covered_listed_station_days: int | None = None,
+    filled_takes: int | None = None,
 ) -> LiveFamilyTally:
     """Build the pooled/station/ask-band strata, verdict, and BCa line.
+
+    `covered_listed_station_days`: the v1 section 5:105-106 structural-dead
+    stop's denominator (see `structural_dead_stop.py`), supplied by a caller
+    that has already run the catalog reader; `None` (default) means the
+    stop is not evaluated and every existing fixture's output is byte-for-
+    byte unchanged (golden -- see
+    `tests/unit/test_live_family_tally_structural_dead.py`).
+
+    `filled_takes` MUST be a FILL-TIME count (fills, including any not yet
+    settled/scored) -- e.g. a live fill-state store -- supplied by the
+    caller. It is deliberately NEVER derived from `len(rows)` here: `rows`
+    is the 6c SCORED-trial store, which only carries trials that have
+    already resolved a settlement basis (`trial_scorer.score_trial`
+    requires an NWS final or an elapsed venue fallback), so a Take that
+    filled today but has not settled yet is invisible to `rows` -- counting
+    it as zero fires a false KILL against the pin "one fill defeats it".
+    `None` (default, or whenever no fill-time source is reachable) FAILS
+    CLOSED via `structural_dead_stop.structural_dead`'s own `evaluable`
+    flag: the stop never fires, and `render_markdown` prints that it was
+    skipped. When both `covered_listed_station_days` and `filled_takes` are
+    given, `filled_takes` must be `>= len(rows)` by construction (a
+    fill-time count can only be a superset of the settled/scored subset);
+    violating this indicates a wired-in settled-only count and is refused.
 
     `provenance` selects which unforgeable barrier runs: `"live"` (default)
     dispatches to `assert_live_only`, UNMODIFIED; `"paper_replay"` dispatches
@@ -242,6 +277,12 @@ def build_live_family_tally(
         assert_paper_only(rows)
     else:
         assert_live_only(rows)
+    if filled_takes is not None and filled_takes < len(rows):
+        raise ValueError(
+            f"filled_takes={filled_takes} is less than len(rows)={len(rows)}: a "
+            "fill-time count can only be a superset of the settled/scored rows; "
+            "this looks like a settled-only count, which must never be passed here"
+        )
     priced = tuple(row for row in rows if row.excluded_reason is None)
     excluded_count = len(rows) - len(priced)
 
@@ -262,7 +303,22 @@ def build_live_family_tally(
     )
 
     n_taken = pooled.n if pooled is not None else 0
-    if pooled_kill or bool(cell_dead):
+
+    # v1 section 5:105-106, additive: evaluated ALONGSIDE the existing
+    # pooled_kill/cell_dead computation above, never altering it. `None`
+    # (the default) means the caller supplied no reader output, and this
+    # branch never fires -- every existing fixture is unchanged (golden).
+    structural = (
+        None
+        if covered_listed_station_days is None
+        else structural_dead(
+            covered_listed_station_days=covered_listed_station_days,
+            filled_takes=filled_takes,
+        )
+    )
+    structural_fired = structural is not None and structural.structural_dead
+
+    if pooled_kill or bool(cell_dead) or structural_fired:
         outcome = "KILL"
         if pooled_kill:
             assert pooled is not None
@@ -270,10 +326,16 @@ def build_live_family_tally(
                 f"pooled Wilson-upper {pooled.wilson_upper:.4f} < "
                 f"break-even {pooled.break_even:.4f} at n={n_taken}"
             )
-        else:
+        elif cell_dead:
             detail = (
                 f"{len(cell_dead)} stratum(-a) cell-dead: "
                 f"{', '.join(s.label for s in cell_dead)}"
+            )
+        else:
+            assert structural is not None
+            detail = (
+                f"structural-dead: {structural.covered_listed_station_days} "
+                f"covered-listed station-day(s), {structural.filled_takes} filled Take(s)"
             )
     elif pooled_survive:
         outcome = "SURVIVE"
@@ -298,6 +360,7 @@ def build_live_family_tally(
         n_excluded=excluded_count,
         slippage=_slippage_summary(priced),
         bca_line=_roi_bound_line(rows),
+        structural_dead=structural,
     )
 
 
@@ -358,6 +421,12 @@ def render_markdown(
     add("")
     add(f"**{tally.outcome}** -- {tally.detail}")
     add("")
+    if tally.structural_dead is not None and not tally.structural_dead.evaluable:
+        add(
+            "structural-dead stop (v1 section 5:105-106): SKIPPED -- no fill-time "
+            "count was available; never inferred from settled/scored rows alone."
+        )
+        add("")
     if tally.slippage.n == 0:
         add("slippage (fill_px - entry_ask): n=0")
     else:
