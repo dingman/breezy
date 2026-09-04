@@ -456,6 +456,39 @@ class TestTakeNeverSubmits:
         assert submitted == []
         assert len(strategy.cache.orders()) == 0
 
+    def test_shadow_default_never_submits_with_permit_none(
+        self, store_path: Path, interior_instrument: BinaryOption,
+    ) -> None:
+        """T6: with no ``order_submission_permit`` (the shadow default,
+        ``None``), ``submit_order``/``post_order`` are never reached.
+        """
+        rig = _register_and_start(store_path=store_path, instruments=(interior_instrument,))
+        strategy = rig.strategy
+        assert strategy._order_submission_permit is None
+        submitted: list[object] = []
+        strategy.submit_order = submitted.append  # type: ignore[method-assign]
+        strategy.on_data(_observation(temp_c_tenths=300, observed_at_ns=WINDOW_OPEN_NS - 1))
+        quote = _quote(INTERIOR_ID, ask="0.40", ts_event=WINDOW_OPEN_NS)
+        strategy.on_quote_tick(quote)
+        assert submitted == []
+
+    def test_shadow_log_line_names_the_permit_gate(self) -> None:
+        """T6 (static half): the runbook's grep target
+        (``R8_OPERATOR_RUNBOOK.md`` Shadow mode section) is the literal text
+        ``strategy.py``'s ``_maybe_submit`` emits -- ``Actor.log`` is
+        Nautilus's own Cython logger (not stdlib ``logging``), so ``caplog``
+        cannot observe it dynamically; the source text is the reliable
+        check.
+        """
+        import inspect
+
+        from breezy.strategy.current_rung_hold import strategy as strategy_module
+
+        source = inspect.getsource(strategy_module.CurrentRungHoldStrategy._maybe_submit)
+        assert "TAKE recorded, no submit" in source
+        assert "order_submission_permit=" in source
+        assert "'granted' if self._order_submission_permit is not None else 'none'" in source
+
 
 class TestAskBandEquivalence:
     def test_config_pins_the_archive_studys_qualifying_ask_band_and_size(self) -> None:

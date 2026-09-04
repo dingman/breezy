@@ -51,7 +51,7 @@ The composition root (`breezy.app.trade:main`, commit `092695c`; `pyproject.toml
 journalctl strings to grep:
 
 - `CurrentRungHoldStrategy subscribed <instrument-id>` — the strategy armed a market
-- `TAKE recorded, no submit (orders_enabled=False):` — the shadow-mode signal; a trial was taken and no order was sent
+- `TAKE recorded, no submit (order_submission_permit=none):` — the shadow-mode signal; a trial was taken and no order was sent (`order_submission_permit=granted` with no submit line following means the permit was granted but `stale_observation_minutes` is not an `int`, which cannot happen in a real deployment)
 - `OUTSIDE_DECISION_WINDOW_REFUSALS`
 - `OBSERVATION_UNAVAILABLE_REFUSALS`
 - `OBSERVATION_AMBIGUOUS_REFUSALS`
@@ -174,11 +174,31 @@ contract"); the build side neither suggests nor defaults them.
 
 ## 7. First run
 
+The launch shell exports **seven** values before the node starts (converged peer review item 5;
+`safety.py:583-592` names five of the seven, `operator_controls.py` the other two): the live-trading
+enablement variable, the maximum daily budget, the maximum per position, the per-order notional
+ceiling, the session notional ceiling, the session order count, and the operator identity — plus, when
+requesting the order path (step 8), the CRH enablement flag `BREEZY_ORDERS_ENABLED=1` (build-side, not
+operator-reserved — see `settings.py`'s `ORDERS_ENABLED_VAR`), `BREEZY_CURRENT_RUNG_HOLD=1` and
+`BREEZY_LIVE_OBSERVATIONS=1`. All of it goes only into the launching shell's own environment — never a
+file (§6).
+
+The live-trading permit's TTL is 10 hours (`safety.py:157`, the union of the four decision windows plus
+slack), and `OrderSubmissionPermit.issue` (`runtime/order_enablement.py`) checks it once at startup,
+beside the live-trading permit, and never re-mints. **One process per trading day**, started from that
+shell **before 17:00 UTC** (the latest decision window's close) so the permit is valid for the whole
+session; the durable trial-day latch is the real cross-restart bound regardless (at most one order per
+station-day, converged review item 3) — an unplanned restart makes that day's selector
+uptime-conditional, disclosed rather than hidden, and the daily budget re-keys at 00:00 UTC mid-session.
+
 Start the node from that same shell:
 ```
 .venv/bin/breezy-trade
 ```
-(`pyproject.toml:251`: `breezy-trade = "breezy.app.trade:main"`). It takes no arguments; all configuration is read from the environment by `config_from_env` / `exec_config_from_env`.
+(`pyproject.toml:251`: `breezy-trade = "breezy.app.trade:main"`). It takes no arguments; all configuration is read from the environment by `config_from_env` / `exec_config_from_env`. A refusal from
+`OrderSubmissionPermit.issue` (any of its five preconditions unmet, when the order path was requested)
+is fatal at startup, logged with the refusal class name only, exit code 1 — restart with the missing
+precondition corrected.
 There is **no systemd unit for the trade node**, and there must not be one: a unit file would put the
 enablement value in a file. `deploy/systemd/` carries the tape, ingest, and study units only.
 

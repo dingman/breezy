@@ -107,6 +107,7 @@ from breezy.domain.weather_bucket_facts import (
 from breezy.ingest.iem_observations import station_observation_data_type
 from breezy.registry.sites import default_registry
 from breezy.runtime.backtest_feed import NWS_BACKTEST_CLIENT_ID
+from breezy.runtime.order_enablement import OrderSubmissionPermit
 from breezy.strategy.current_rung_hold.config import CurrentRungHoldConfig
 from breezy.strategy.current_rung_hold.decision import (
     Decision,
@@ -210,10 +211,24 @@ class CurrentRungHoldStrategy(Strategy):
         *,
         trial_day_latch_factory: Callable[[], AbstractContextManager[TrialDayLatch]]
         | None = None,
+        order_submission_permit: OrderSubmissionPermit | None = None,
     ) -> None:
         super().__init__(config)
         self._config: CurrentRungHoldConfig = config
         self._latch_factory = trial_day_latch_factory
+        #: The sealed, unforgeable capability minted by
+        #: ``runtime.order_enablement.OrderSubmissionPermit.issue`` and
+        #: threaded in by the composition root (``app/trade.py::main`` ->
+        #: ``composition.build_current_rung_hold_strategies``). ``None`` is
+        #: the shadow default -- absence, never a default grant. This is the
+        #: gate ``_maybe_submit`` checks; ``config.orders_enabled`` stays
+        #: refused ``True`` forever and is never the mechanism (see
+        #: ``OrdersEnabledNotPermittedError``'s docstring). A fifth
+        #: distinct station-day beyond the four supported stations is
+        #: bounded only by the daily budget, not by this permit -- the
+        #: trial-day latch + fixed station list are what enforce ``<=4``
+        #: orders per day (converged review item 11).
+        self._order_submission_permit = order_submission_permit
         self._latch: TrialDayLatch | None = None
         self._exit_stack: ExitStack | None = None
         self._facts: dict[str, WeatherBucketFacts] = {}
@@ -497,21 +512,23 @@ class CurrentRungHoldStrategy(Strategy):
     # ------------------------------------------------------------------
     def _maybe_submit(self, instrument_id: str, decision: Take) -> None:
         if not (
-            self._config.orders_enabled
+            self._order_submission_permit is not None
             and isinstance(self._config.stale_observation_minutes, int)
         ):
             self.log.info(
-                f"TAKE recorded, no submit (orders_enabled={self._config.orders_enabled}): "
+                "TAKE recorded, no submit "
+                f"(order_submission_permit="
+                f"{'granted' if self._order_submission_permit is not None else 'none'}): "
                 f"{instrument_id} qty={decision.quantity} px={decision.limit_price} "
                 f"p_hold_lower={decision.p_hold_lower} break_even={decision.break_even}",
             )
             return
-        nt_id = InstrumentId.from_str(instrument_id)  # pragma: no cover - unreachable
-        instrument = self.cache.instrument(nt_id)  # pragma: no cover - unreachable
-        if instrument is None:  # pragma: no cover - unreachable
+        nt_id = InstrumentId.from_str(instrument_id)
+        instrument = self.cache.instrument(nt_id)
+        if instrument is None:
             self.log.error(f"instrument vanished from cache: {instrument_id}")
             return
-        order = self.order_factory.limit(  # pragma: no cover - unreachable
+        order = self.order_factory.limit(
             instrument_id=nt_id,
             order_side=OrderSide.BUY,
             quantity=instrument.make_qty(decision.quantity),
@@ -519,4 +536,4 @@ class CurrentRungHoldStrategy(Strategy):
             time_in_force=TimeInForce.IOC,
             post_only=False,
         )
-        self.submit_order(order)  # pragma: no cover - unreachable
+        self.submit_order(order)

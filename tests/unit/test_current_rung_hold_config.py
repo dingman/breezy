@@ -135,3 +135,38 @@ def test_orders_enabled_true_is_refused() -> None:
 def test_orders_enabled_defaults_false() -> None:
     config = CurrentRungHoldConfig()
     assert config.orders_enabled is False
+
+
+def test_orders_enabled_true_is_refused_via_msgspec_decode() -> None:
+    """T3 (WIDEN only): ``__post_init__`` runs on ``msgspec.json.decode`` too,
+    so a persisted or replayed config cannot smuggle ``orders_enabled=True``
+    in past construction-time validation. ``msgspec`` wraps whatever
+    ``__post_init__`` raises into its own ``ValidationError`` (verified
+    against the installed ``msgspec``, not assumed) -- the ORIGINAL message
+    text survives inside it, so the real refusal is still observable.
+    """
+    import msgspec
+
+    with pytest.raises(msgspec.ValidationError, match="orders_enabled must stay False"):
+        msgspec.json.decode(b'{"orders_enabled": true}', type=CurrentRungHoldConfig)
+
+
+def test_orders_enabled_true_is_refused_via_strategy_factory() -> None:
+    """T3 (WIDEN only): the real ``StrategyFactory.create`` path -- the same
+    one an ``ImportableStrategyConfig`` dict would take in production --
+    still refuses. This is the concrete case the ``OrdersEnabledNotPermittedError``
+    docstring's "a value that can be copied is not a capability" claim is
+    about: anyone who can write this dict can attempt this, and it is
+    refused every time (via ``NautilusConfig.parse``'s ``msgspec.json.decode``,
+    same wrapping as the decode test above).
+    """
+    import msgspec
+    from nautilus_trader.trading.config import ImportableStrategyConfig, StrategyFactory
+
+    importable = ImportableStrategyConfig(
+        strategy_path="breezy.strategy.current_rung_hold.strategy:CurrentRungHoldStrategy",
+        config_path="breezy.strategy.current_rung_hold.config:CurrentRungHoldConfig",
+        config={"orders_enabled": True},
+    )
+    with pytest.raises(msgspec.ValidationError, match="orders_enabled must stay False"):
+        StrategyFactory.create(importable)

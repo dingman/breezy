@@ -26,6 +26,7 @@ from breezy.adapters.polymarket_us.factories import exec_config_from_env
 from breezy.domain.climate_day import climate_day_for_instant
 from breezy.registry.sites import default_registry
 from breezy.runtime import trade_cli
+from breezy.runtime.order_enablement import OrderSubmissionPermit, OrderSubmissionRefused
 from breezy.runtime.settings import SettingsError, load_trade_settings
 from breezy.runtime.sqlite_store import SqliteStateStore
 from breezy.runtime.submit_intent import (
@@ -33,7 +34,7 @@ from breezy.runtime.submit_intent import (
     SubmitIntentLockHeld,
     open_submit_intent_latch,
 )
-from breezy.runtime.trade_cli import EXIT_CONFIG_ERROR, NodeFactory, _report
+from breezy.runtime.trade_cli import EXIT_CONFIG_ERROR, EXIT_RUNTIME_ERROR, NodeFactory, _report
 from breezy.strategy.current_rung_hold.composition import (
     build_current_rung_hold_strategies,
     install_current_rung_hold_refusal_watch,
@@ -61,6 +62,7 @@ def run(
     node_factory: NodeFactory = TradingNode,
     stderr: TextIO | None = None,
     live_trading_permit: object | None = None,
+    order_submission_permit: OrderSubmissionPermit | None = None,
 ) -> int:
     """Load settings, compose strategies when the flag is on, run the node."""
     out = sys.stderr if stderr is None else stderr
@@ -106,6 +108,7 @@ def run(
                 catalog_root=catalog_root,
                 today_by_station=today_by_station,
                 trial_day_latch_factory=factory,
+                order_submission_permit=order_submission_permit,
             )
             return trade_cli.run(
                 env=env,
@@ -134,6 +137,25 @@ def main() -> int:
     once, and threaded through to ``trade_cli.run`` -- never re-minted, and
     never issued from ``breezy.runtime.trade_cli.main`` (a library
     entrypoint other callers also reach directly).
+
+    B11's ONE caller: ``OrderSubmissionPermit.issue`` is minted here too,
+    immediately beside the live-trading permit, when ``BreezyTradeSettings.
+    orders_enabled_requested`` is True. Settings are loaded a second time
+    here (``run`` loads its own copy) rather than threaded through, because
+    this function must decide whether to mint the order-submission permit
+    BEFORE ``run`` builds anything -- both loads read the same ``env`` and
+    are pure validation, so they agree. A settings load failure here is
+    swallowed (``settings = None``): ``run`` performs the SAME load and
+    reports the real configuration error through its existing path, so the
+    error is never duplicated or reported twice.
+
+    A refusal from ``OrderSubmissionPermit.issue`` is FATAL, unlike a
+    live-trading-permit refusal (which degrades to shadow mode): the
+    operator explicitly requested the order path
+    (``BREEZY_ORDERS_ENABLED=1``) via ``orders_enabled_requested``, so a
+    request that cannot be honoured must stop the process loudly rather
+    than silently run in shadow mode with the operator's intent unmet. The
+    log line names the refusal class only, never a value (L-22 shape).
     """
     from nautilus_trader.common.component import LiveClock
 
@@ -147,4 +169,27 @@ def main() -> int:
         permit = issue_live_trading_permit(clock=LiveClock())
     except LiveTradingPermissionError as exc:
         trade_cli.logger.info("live-trading permit not issued: %s", exc)
-    return run(live_trading_permit=permit)
+
+    try:
+        settings = load_trade_settings()
+    except SettingsError:
+        settings = None
+
+    order_submission_permit = None
+    if settings is not None and settings.orders_enabled_requested:
+        try:
+            order_submission_permit = OrderSubmissionPermit.issue(
+                settings=settings,
+                live_trading_permit=permit,
+                clock=LiveClock(),
+            )
+        except OrderSubmissionRefused as exc:
+            trade_cli.logger.info(
+                "order submission permit not issued: %s", type(exc).__name__
+            )
+            return EXIT_RUNTIME_ERROR
+
+    return run(
+        live_trading_permit=permit,
+        order_submission_permit=order_submission_permit,
+    )

@@ -2562,9 +2562,19 @@ def test_x1_the_live_scan_actually_reaches_a_test_that_imports_the_exec_package(
     function over an int and a byte string, so the suite never opens a
     socket and never constructs a client.
     """
+    # CRH step 8 wiring adds one: `test_current_rung_hold_order_submission_
+    # wiring.py` imports `PolymarketUSExecutionClient` to drive the real
+    # order-submission path (`CurrentRungHoldStrategy.submit_order` -> a real
+    # `RiskEngine`/`ExecutionEngine` -> the exec client) end to end. WIDENED,
+    # not relaxed (L-6/L-12): it carries no `SOCKET_RESTORING_MARKERS`, same
+    # as every sibling exec suite -- it stubs the transport with the shipped
+    # `_FakeSender`/`_FakeSigner` (imported from
+    # `test_polymarket_us_submit_order_chain.py`, never a parallel fake), so
+    # it never opens a socket either.
     assert exec_importing_test_modules() == {
         "tests/contract/test_exec_client_reconciliation_contract.py",
         "tests/contract/test_exec_client_wiring_contract.py",
+        "tests/unit/test_current_rung_hold_order_submission_wiring.py",
         "tests/unit/test_exec_refusal_health_surface.py",
         "tests/unit/test_polymarket_us_exec_client.py",
         "tests/unit/test_polymarket_us_exec_endpoints.py",

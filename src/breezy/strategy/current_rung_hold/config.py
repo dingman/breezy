@@ -123,15 +123,25 @@ class AllowShortNotPermittedError(ValueError):
 class OrdersEnabledNotPermittedError(ValueError):
     """Raised when ``orders_enabled`` is constructed ``True``.
 
-    NO ORDER may be submittable from this increment: the strategy's order
-    path (``strategy.py``'s ``_maybe_submit``) ends at a ``Take`` decision
-    recorded to the trial-day latch, and reaches ``submit_order`` only when
-    ``orders_enabled`` is ``True`` -- the same L-22 unforgeable-exclusion
-    shape as :class:`AllowShortNotPermittedError`: refusing the flip at
-    construction, not merely defaulting it off, so no call site can silently
-    enable submission by passing ``orders_enabled=True``. A later increment
-    (blueprint build order step 8, operator-only enablement) is what may one
-    day construct this ``True``; this increment never does.
+    A bool can never be the order-submission gate, and this field exists so
+    no future call site re-introduces a forgeable flag. ``CurrentRungHoldConfig``
+    is a ``StrategyConfig``, i.e. a frozen ``msgspec.Struct`` (``NautilusConfig``,
+    ``common/config.py``): every field on it must be msgspec-encodable, and any
+    bool or string field is exactly reproducible by anyone who can write a
+    config dict through ``ImportableStrategyConfig`` + ``StrategyFactory.create``
+    (``trading/config.py``). A value that can be copied is not a capability --
+    only an object minted by code and refused by data qualifies (L-22 in
+    ``docs/core/LESSONS.md``).
+
+    The real gate is the injected, sealed ``OrderSubmissionPermit``
+    (``runtime/order_enablement.py``): it cannot be a field here (it is
+    deliberately not a ``msgspec.Struct``), it cannot be decoded out of
+    persisted or replayed config bytes, and it is minted at exactly one
+    call site (``app/trade.py::main``), AST-pinned (B11,
+    ``tests/unit/test_polymarket_us_readonly_guard.py``). ``strategy.py``'s
+    ``_maybe_submit`` gates on that permit, not on this field --
+    ``orders_enabled`` stays refused ``True`` forever, unconditionally, as
+    defence in depth over the permit gate, never as the primary mechanism.
     """
 
 

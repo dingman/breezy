@@ -34,6 +34,7 @@ from breezy.domain.weather_bucket_facts import (
 )
 from breezy.runtime.component_health_watch import COMPONENT_STATE_TOPIC
 from breezy.runtime.health import resolve_alert_sink
+from breezy.runtime.order_enablement import OrderSubmissionPermit
 from breezy.runtime.settings import SettingsError
 from breezy.runtime.submit_intent import SubmitIntentLatch
 from breezy.strategy.current_rung_hold.config import SUPPORTED_STATIONS, CurrentRungHoldConfig
@@ -160,12 +161,18 @@ def build_current_rung_hold_strategies(
     catalog_root: Path,
     today_by_station: Mapping[str, dt.date],
     trial_day_latch_factory: Callable[[], AbstractContextManager[TrialDayLatch]],
+    order_submission_permit: OrderSubmissionPermit | None = None,
 ) -> tuple[CurrentRungHoldStrategy, ...]:
     """One strategy per supported station that resolved at least one instrument.
 
     ``orders_enabled`` is never passed: the config default is False and
     constructing True is refused. ``strategy_id`` / ``order_id_tag`` are set
     per station so ``Trader.add_strategy`` uniqueness checks both pass.
+
+    ``order_submission_permit`` is the sealed capability minted by
+    ``app/trade.py::main`` via ``OrderSubmissionPermit.issue`` -- ``None`` is
+    the shadow default (no order path reachable), passed unchanged to every
+    station's strategy instance.
     """
     resolved = resolve_station_instrument_ids(catalog_root, today_by_station)
     if all(len(ids) == 0 for ids in resolved.values()):
@@ -193,7 +200,9 @@ def build_current_rung_hold_strategies(
         )
         strategies.append(
             CurrentRungHoldStrategy(
-                config, trial_day_latch_factory=trial_day_latch_factory
+                config,
+                trial_day_latch_factory=trial_day_latch_factory,
+                order_submission_permit=order_submission_permit,
             )
         )
     return tuple(strategies)

@@ -1757,20 +1757,51 @@ def test_b6_b7_b8_b9_d3_non_vacuity() -> None:
 
 
 # ==========================================================================
-# Barrier B11 -- OrderSubmissionPermit: zero call sites (this commit)
+# Barrier B11 -- OrderSubmissionPermit: exactly one caller (CRH step 8 wiring)
 # ==========================================================================
 #
-# ``runtime/order_enablement.py`` ships in this commit with NO caller of
-# ``OrderSubmissionPermit.issue`` anywhere in the repository. A later CRH
-# wiring commit widens the first pin below to exactly one caller,
-# ``app/trade.py::main`` -- it must never be relaxed back past that set
-# (L-12). The second pin is permanent: ``OrderSubmissionPermit`` itself may
-# only ever be constructed from inside its own ``issue`` classmethod.
+# WIDENED (L-12: never relaxed, only ever widened with the old -> new set
+# stated in the diff review): the R-8/A3 commit shipped
+# ``runtime/order_enablement.py`` with NO caller of
+# ``OrderSubmissionPermit.issue`` anywhere in the repository
+# (``named_call_sites("issue") == frozenset()``). This CRH wiring commit
+# widens that to exactly one caller, ``app/trade.py::main`` -- the
+# composition root, mirroring B7's ``issue_live_trading_permit`` pin. It must
+# never be relaxed back past this set. The second pin is permanent:
+# ``OrderSubmissionPermit`` itself may only ever be constructed from inside
+# its own ``issue`` classmethod.
 
 
-def test_b11_issue_order_submission_permit_has_no_caller_yet() -> None:
-    """B11 part one: zero callers of ``issue`` anywhere, this commit."""
-    assert named_call_sites("issue") == frozenset()
+def test_b11_issue_has_exactly_one_caller() -> None:
+    """B11 part one, WIDENED: ``issue`` has exactly one caller repo-wide,
+    ``app/trade.py::main``. OLD: ``frozenset()``. NEW: the one composition
+    root site below.
+    """
+    assert named_call_sites("issue") == {
+        ("src/breezy/app/trade.py", "main"),
+    }
+
+
+def test_b11_issue_pin_is_not_vacuous_against_a_planted_conftest_caller(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """B11 non-vacuity, second direction: a planted caller under a throwaway
+    ``tests/`` conftest is caught by the REAL repo-wide scanner too -- the
+    widened pin covers ``tests/`` (via ``REPO_WIDE_SCAN_ROOTS``), not just
+    ``src/``.
+    """
+    (tmp_path / "tests").mkdir()
+    (tmp_path / "tests" / "conftest.py").write_text(
+        "def extra(permit_cls, settings, permit, clock):\n"
+        "    return permit_cls.issue(settings=settings, live_trading_permit=permit, clock=clock)\n"
+    )
+    monkeypatch.setattr(
+        "tests.unit.test_polymarket_us_readonly_guard.REPO_ROOT", tmp_path
+    )
+    assert named_call_sites("issue", roots=("tests",)) == {
+        ("tests/conftest.py", "extra"),
+    }
 
 
 def test_b11_order_submission_permit_is_constructed_at_exactly_one_site() -> None:
