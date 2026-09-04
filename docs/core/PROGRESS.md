@@ -89,7 +89,7 @@ Two consequences that are not optional (tracked by P4):
 
 Evidence: `docs/evidence/observation_lock_falsification_2026-08-31.md`.
 
-### [HIGH] BL-24 — live R(t): Seam A `baaa424`+A-2 `5b830fc` LANDED (interval fix pending review BLOCK); Seam B brief CONVERGED `docs/plans/BL24_SEAM_B_BRIEF_2026-09-04.md` (NWS API, not IEM). Lag is on the ASK, never on R.
+### [MEDIUM] BL-24 — live R(t) LANDED: Seam A/A-2 (closed-closed interval fix `85170c0`), Seam B NWS actor `e9492bc` (flag-off, `BREEZY_LIVE_OBSERVATIONS`). Open: trim the 1.9 MB fixture; strategy wiring (step 6).
 
 ## BACKLOG — selected for execution (opened 2026-08-31)
 
@@ -141,19 +141,9 @@ forecast ingest → ~300 station-days → CAPACITY).
 **EXEC SPINE follow-ups:** `docs/plans/EXEC_SPINE_2026-09-01.md` §R-4
 "review amendments". Guard before R-9: divides by zero for an unpriced
 forward; settlement-as-exit bypasses `_submit_order`'s refusal latch.
-**Write path — PLAN CONVERGED (Rev 7, `d1e8e33`); LANDED: R-6.5a `4f76137`, R-6.5P `38f2426`, R-6.5b-0 `43723a1` (shared client, B3-M), ledger primitives `e329667`, R-7 intent latch `5d41eaa` (zero call sites; lock-bound factory); PARKED at the operator step** (rest a BUY 1@$0.01, run `polymarket_us_write_signing_probe.py --positive-control`, expect `PREFLIGHT_NOT_EMPTY`). Grok builds, Claude verifies.
+**Write path — PLAN CONVERGED (Rev 7, `d1e8e33`); LANDED: R-6.5a `4f76137`, R-6.5P `38f2426`, R-6.5b-0 `43723a1`, ledger `e329667`, latch `5d41eaa`, R-6.5b write transport `757daba` (Grok build, 3 reviews); R-7 brief CONVERGED `docs/plans/R7_BUILD_BRIEF_2026-09-04.md`, Grok build in flight; PARKED at the operator step** (rest a BUY 1@$0.01, run `polymarket_us_write_signing_probe.py --positive-control`, expect `PREFLIGHT_NOT_EMPTY`). Grok builds, Claude verifies.
 Ingest defect `252918a`: instrument definitions convert row-wise (re-emitted `ts_init` broke the native disjoint check every run); never identifier-filter `BinaryOption` queries.
-`docs/plans/EXEC_SPINE_R65_R7_2026-09-02.md`: four blind reviews + two
-confirmers. Order: R-6.5a (seam: `private_read` discards `response.status`,
-so R-6d's classifier is unreachable; zero barrier changes) → R-6.5P (probe;
-OQ-B answered by mechanism — operator rests BUY 1@$0.01, probe must refuse
-`PREFLIGHT_NOT_EMPTY`; preview WITHDRAWN, OQ-3 unproven) → R-6.5b (write
-transport in a small `write_transport.py`, B4 exemption is a NARROWING) →
-R-7 (authorization is the write closure's first positional; caps re-read per
-call; ledger releases only on 4xx+Status+no `order.id`; fee floor is an R-8
-precondition; native inflight resolution DECLINED — it guesses). The R-4
-standing refusal stays until R-7: with no send path, removing it deletes the
-only DENIAL.
+R-7 rules still open (`docs/plans/EXEC_SPINE_R65_R7_2026-09-02.md`): authorization is the write closure's first positional; caps re-read per call; ledger releases only on 4xx+Status+no `order.id`; IOC zero-fill is terminal (R-7 brief converged); native inflight resolution DECLINED. The R-4 standing refusal stays until R-7 lands.
 
 **Open from the blind-risk-view audit** (`docs/core/findings/BLIND_RISK_VIEWS_2026-09-02.md`):
 T-9 exit policy (Grok: hold to settlement, entry-only halt, cancel working buys
@@ -176,7 +166,7 @@ n≥150; today n_taken=1. **Live family = lags 30/45, NYC excluded, interval rul
 ~9% of station-days** (`docs/evidence/venue/polymarket_us/MISSING_COHORT_2026-09-02_2026-09-03.md`): add a week to each clock. **09-04 operator override: the M_B gate no longer parks the plumbing** — build the
 write path (`docs/plans/EXEC_SPINE_NEXT_2026-09-04.md`, R-6.5b CONVERGED) and live R(t)
 (`docs/plans/BL24_LIVE_RT_2026-09-04.md`); only enablement, budgets and the OP-1..OP-4
-positive control stay operator-only. M_B's kill rule still binds the family. **current_rung_hold landed 09-04:** archive table `7babe06`, trial latch `19ea5fb`, config `15f04f4`, BCa ROI bound 6e `6ddca6e` (`docs/plans/SCORER_TALLY_BCA_BRIEF_2026-09-04.md`). Next: 6c scorer, 6d tally, decision/strategy, Seam B, R-6.5b.
+positive control stay operator-only. M_B's kill rule still binds the family. **current_rung_hold landed 09-04:** table `7babe06`, latch `19ea5fb`, config `15f04f4`, decision+legal-cell `348f9c8`, 6c scorer `43e38ff`, 6d tally `abcc1ad` (timer prepared, not activated), 6e BCa `6ddca6e`; PREREG v1 draft `docs/specs/PREREG_v1_current_rung_hold_2026-09-04.md`. Next: strategy (step 6), R-7.
 
 ---
 
