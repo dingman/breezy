@@ -70,6 +70,8 @@ from nautilus_trader.model.identifiers import ClientId
 
 from breezy.domain.nws_climate_day import NwsClimateDay
 from breezy.domain.nws_raw_product import NwsRawProduct
+from breezy.domain.station_observation import StationObservation
+from breezy.ingest.iem_observations import station_observation_data_type
 from breezy.ingest.nws_actor import nws_climate_day_data_type, nws_raw_product_data_type
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
@@ -121,6 +123,12 @@ class UnfeedableRecordError(TypeError):
 _DATA_TYPE_FACTORIES: Final[dict[type[Data], Callable[[], DataType]]] = {
     NwsClimateDay: nws_climate_day_data_type,
     NwsRawProduct: nws_raw_product_data_type,
+    #: 6b paper-replay: `CurrentRungHoldStrategy.on_start` subscribes
+    #: `station_observation_data_type()` unconditionally (`strategy.py:247`),
+    #: so a backtest feeding it real `StationObservation` rows must be able
+    #: to reach that same shared topic through this module's one wrapping
+    #: step -- same client-scoped routing identity as the other two rows.
+    StationObservation: station_observation_data_type,
 }
 
 

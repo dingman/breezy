@@ -67,6 +67,7 @@ __all__ = [
     "LiveFamilyTally",
     "SlippageSummary",
     "assert_live_only",
+    "assert_paper_only",
     "break_even",
     "build_live_family_tally",
     "render_markdown",
@@ -76,6 +77,14 @@ __all__ = [
 #: The live latch's own key prefix (`current_rung_hold/trial/{station}/
 #: {climate_day}`) -- the ONLY provenance signal the 6c store carries.
 _LIVE_TRIAL_ID_PREFIX = "current_rung_hold/trial/"
+
+#: The paper-replay latch's own key prefix (6b, `paper_replay.
+#: PAPER_TRIAL_ID_PREFIX`) -- restated verbatim here, not imported, because
+#: `breezy.runtime.paper_replay` sits above this script in the layer graph
+#: the same way `breezy.persistence.scored_trial_store` does; the two
+#: prefixes are pinned never to collide by
+#: `tests/unit/test_live_family_tally_provenance.py`.
+_PAPER_TRIAL_ID_PREFIX = "paper_replay/current_rung_hold/trial/"
 
 #: Pinned column-for-column identical to the M_B live section's stratum
 #: table (`mb_current_rung_edge_study.py`'s `render_markdown`), per the
@@ -147,6 +156,21 @@ def assert_live_only(rows: Sequence[ScoredTrial]) -> None:
         )
 
 
+def assert_paper_only(rows: Sequence[ScoredTrial]) -> None:
+    """Symmetric to `assert_live_only`: refuse the paper tally if any row is
+    not a `paper_replay/current_rung_hold/trial/...` row (6b, L-22
+    provenance -- a live row must never pool into a mechanism-test tally
+    either)."""
+    offenders = tuple(
+        row.trial_id for row in rows if not row.trial_id.startswith(_PAPER_TRIAL_ID_PREFIX)
+    )
+    if offenders:
+        raise ValueError(
+            "refusing to tally: non-paper trial_id(s) found "
+            f"(live trials are never pooled into a paper_replay tally): {offenders!r}"
+        )
+
+
 def _rows_from_scored(scored: Sequence[ScoredTrial]) -> Sequence[CurrentRungTrial]:
     rows = tuple(_PricedRow(entry_ask=float(t.entry_ask), held=t.held) for t in scored)
     return cast(Sequence[CurrentRungTrial], rows)
@@ -202,15 +226,22 @@ def _roi_bound_line(all_rows: Sequence[ScoredTrial]) -> str:
     return format_roi_bound(compute_roi_bound(inputs))
 
 
-def build_live_family_tally(rows: Sequence[ScoredTrial]) -> LiveFamilyTally:
+def build_live_family_tally(
+    rows: Sequence[ScoredTrial], *, provenance: str = "live",
+) -> LiveFamilyTally:
     """Build the pooled/station/ask-band strata, verdict, and BCa line.
 
-    Raises via `assert_live_only` if `rows` contains a non-live trial_id.
-    Excludes any row with a non-`None` `excluded_reason` from every stratum
-    (review item 2) -- such rows are still counted by the BCa exclusion
-    fraction below, via `_roi_bound_line`, which sees the full input.
+    `provenance` selects which unforgeable barrier runs: `"live"` (default)
+    dispatches to `assert_live_only`, UNMODIFIED; `"paper_replay"` dispatches
+    to `assert_paper_only`. Excludes any row with a non-`None`
+    `excluded_reason` from every stratum (review item 2) -- such rows are
+    still counted by the BCa exclusion fraction below, via `_roi_bound_line`,
+    which sees the full input.
     """
-    assert_live_only(rows)
+    if provenance == "paper_replay":
+        assert_paper_only(rows)
+    else:
+        assert_live_only(rows)
     priced = tuple(row for row in rows if row.excluded_reason is None)
     excluded_count = len(rows) - len(priced)
 
@@ -298,6 +329,7 @@ def render_markdown(
     *,
     source_paths: Sequence[Path],
     as_of: str,
+    provenance: str = "live",
 ) -> str:
     lines: list[str] = []
 
@@ -306,6 +338,7 @@ def render_markdown(
 
     add("# Live family tally")
     add("")
+    add(f"provenance: {provenance}")
     add(f"as_of: {as_of}")
     add(f"git sha: {_git_sha()}")
     add(f"row count: {tally.n_scored} (excluded: {tally.n_excluded})")
@@ -344,11 +377,17 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("store_dir", type=Path, help="6c scored-trial parquet directory")
     parser.add_argument("--output", type=Path, default=None, help="path to write the report")
     parser.add_argument("--as-of", type=str, default="", help="as-of stamp for the header")
+    parser.add_argument(
+        "--provenance", choices=("live", "paper_replay"), default="live",
+        help="which unforgeable barrier to run -- see build_live_family_tally",
+    )
     args = parser.parse_args(argv)
 
     rows = read_scored_trials(args.store_dir)
-    tally = build_live_family_tally(rows)
-    report = render_markdown(tally, source_paths=(args.store_dir,), as_of=args.as_of)
+    tally = build_live_family_tally(rows, provenance=args.provenance)
+    report = render_markdown(
+        tally, source_paths=(args.store_dir,), as_of=args.as_of, provenance=args.provenance,
+    )
     print(report)
     if args.output is not None:
         args.output.parent.mkdir(parents=True, exist_ok=True)
