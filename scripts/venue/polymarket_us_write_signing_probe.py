@@ -99,6 +99,7 @@ from _write_sequence import (
     write_sequence_artifact,
 )
 from polymarket_us_auth_smoke import (
+    POST_CREDENTIAL_SUPPRESSION_NOTE,
     CredentialGuard,
     Prepared,
     RecordingTransport,
@@ -746,19 +747,35 @@ def _report(observation: ProbeObservation | SequenceObservation, path: Path) -> 
     print(f"{'artefact':19}: {path}")
 
 
-def _run_refusable(coro: Any) -> tuple[Any, int | None]:
+def _refusal_detail(exc: BaseException, guard: CredentialGuard) -> str:
+    """Render ``exc`` for a refusal/error line, gated the same way
+    :func:`~polymarket_us_auth_smoke.build_safe_excepthook` gates the uncaught
+    path: before a credential read begins there is no secret in the process to
+    leak, so the full (redaction-seamed) description is shown; once a
+    credential read has begun, only the type name is shown, matching that
+    hook's conservative post-credential branch exactly. Without this gate,
+    ``describe_exception`` was called with an empty secrets tuple regardless of
+    ``guard`` state -- the only literal-secret check it can do -- and a
+    caught, credential-adjacent exception's raw message (e.g. an echoed
+    header, order id, or body fragment) went straight to stderr."""
+    if guard.credential_read_begun:
+        return f"{type(exc).__name__}. {POST_CREDENTIAL_SUPPRESSION_NOTE}"
+    return describe_exception(exc, ())
+
+
+def _run_refusable(coro: Any, guard: CredentialGuard) -> tuple[Any, int | None]:
     """Run ``coro``; ``(result, None)`` on success, ``(None, exit_code)`` on a
     refusal. Shared by both CLI modes so the refusal taxonomy is stated once."""
     try:
         return asyncio.run(coro), None
     except (ProbeRefusal, SmokeRefusal) as exc:
-        print(f"REFUSED: {exc}", file=sys.stderr)
+        print(f"REFUSED: {_refusal_detail(exc, guard)}", file=sys.stderr)
         return None, 2
     except (ValueError, FileExistsError, ArtifactSchemaError) as exc:
-        print(f"REFUSED: {describe_exception(exc, ())}", file=sys.stderr)
+        print(f"REFUSED: {_refusal_detail(exc, guard)}", file=sys.stderr)
         return None, 2
     except PolymarketUSError as exc:
-        print(f"CONFIGURATION ERROR: {describe_exception(exc, ())}", file=sys.stderr)
+        print(f"CONFIGURATION ERROR: {_refusal_detail(exc, guard)}", file=sys.stderr)
         return None, 2
 
 
@@ -771,7 +788,8 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.sequence:
         sequence_observation, code = _run_refusable(
-            run_sequence(directory=args.evidence_dir, stamp=args.stamp, guard=guard)
+            run_sequence(directory=args.evidence_dir, stamp=args.stamp, guard=guard),
+            guard,
         )
         if code is not None:
             return code
@@ -787,7 +805,8 @@ def main(argv: list[str] | None = None) -> int:
             directory=args.evidence_dir,
             stamp=args.stamp,
             guard=guard,
-        )
+        ),
+        guard,
     )
     if code is not None:
         return code

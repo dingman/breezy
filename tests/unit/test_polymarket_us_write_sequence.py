@@ -676,6 +676,114 @@ def test_stdout_never_leaks_slug_id_or_credential(
 
 
 # ==========================================================================
+# Exception path (plan item 10, Converged peer review) -- describe_exception
+# must never let a secret-shaped fragment through ``main``'s except clauses.
+# ==========================================================================
+
+_LEAK_HEX_KEY = "a1b2c3d4e5f60718293a4b5c6d7e8f90112233445566778899aabbccddeeff"
+_LEAK_HEADER_LINE = "X-PM-ACCESS-KEY: 11111111-2222-3333-4444-555555555555"
+_LEAK_ORDER_ID = "order-9f3d2b1c"
+_LEAK_SLUG = "tc-temp-laxhigh-2026-09-04-gte84f"
+_LEAK_BODY_FRAGMENT = '{"price": "0.01", "size": "1", "side": "BUY"}'
+
+_LEAK_FRAGMENTS = (
+    _LEAK_HEX_KEY,
+    _LEAK_HEADER_LINE,
+    _LEAK_ORDER_ID,
+    _LEAK_SLUG,
+    _LEAK_BODY_FRAGMENT,
+)
+
+
+def _leaky_message() -> str:
+    return (
+        "synthetic failure carrying "
+        f"{_LEAK_HEX_KEY} {_LEAK_HEADER_LINE} {_LEAK_ORDER_ID} "
+        f"{_LEAK_SLUG} {_LEAK_BODY_FRAGMENT}"
+    )
+
+
+@pytest.mark.parametrize(
+    ("exc_attr", "prefix"),
+    [
+        ("ProbeRefusal", "REFUSED:"),
+        ("ArtifactSchemaError", "REFUSED:"),
+        ("PolymarketUSError", "CONFIGURATION ERROR:"),
+        ("ValueError", "REFUSED:"),
+        ("FileExistsError", "REFUSED:"),
+    ],
+)
+def test_run_sequence_exception_never_leaks_secret_shaped_fragments(
+    probe: ModuleType,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+    exc_attr: str,
+    prefix: str,
+) -> None:
+    """Every taxonomy branch ``main`` catches (docs/plans/OP_SEQ..., item 10):
+    ``run_sequence`` is armed to raise each caught type carrying synthetic
+    secret-shaped fragments (a fake 64-hex key, an ``X-PM-`` header line, an
+    order-id-looking token, a weather slug, and a JSON body fragment). None of
+    that material -- and no traceback -- may reach stdout or stderr, and the
+    documented ``REFUSED:``/``CONFIGURATION ERROR:`` prefix and non-zero exit
+    code must still be produced.
+
+    ``_fake_run_sequence`` arms ``kwargs["guard"]`` before raising -- the same
+    order real ``run_sequence``/``prepare`` use (credential read begins near
+    the top of the call, so essentially every downstream raise happens after
+    the arm), rather than leaving the double free to raise from a state real
+    code never reaches."""
+    argv = ["--sequence", "--evidence-dir", str(tmp_path), "--stamp", "exc"]
+    exception_types: dict[str, type[BaseException]] = {
+        "ProbeRefusal": probe.ProbeRefusal,
+        "ArtifactSchemaError": probe.ArtifactSchemaError,
+        "PolymarketUSError": probe.PolymarketUSError,
+        "ValueError": ValueError,
+        "FileExistsError": FileExistsError,
+    }
+    exc_type = exception_types[exc_attr]
+    message = _leaky_message()
+
+    async def _fake_run_sequence(**kwargs: Any) -> Any:
+        kwargs["guard"].mark_credential_read_begun()
+        raise exc_type(message)
+
+    monkeypatch.setattr(probe, "run_sequence", _fake_run_sequence)
+    code = probe.main(argv)
+    assert code == 2
+
+    captured = capsys.readouterr()
+    combined = captured.out + captured.err
+    for fragment in _LEAK_FRAGMENTS:
+        assert fragment not in combined
+    assert "Traceback" not in combined
+    assert prefix in captured.err
+
+
+def test_run_sequence_base_exception_after_credential_read_propagates(
+    probe: ModuleType,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A ``BaseException`` that is not an ``Exception`` (e.g. a keyboard
+    interrupt arriving mid-sequence, after the intent marker and the
+    credential read) is not one of ``_run_refusable``'s narrow excepts and
+    propagates uncaught -- matching the module's documented "Narrow excepts
+    only" stance for ``asyncio.CancelledError``. This is the safe behaviour:
+    nothing forces a print of its message."""
+    argv = ["--sequence", "--evidence-dir", str(tmp_path), "--stamp", "base-exc"]
+
+    async def _fake_run_sequence(**kwargs: Any) -> Any:
+        kwargs["guard"].mark_credential_read_begun()
+        raise KeyboardInterrupt("interrupted mid-sequence, after credential read")
+
+    monkeypatch.setattr(probe, "run_sequence", _fake_run_sequence)
+    with pytest.raises(KeyboardInterrupt):
+        probe.main(argv)
+
+
+# ==========================================================================
 # Widening (Tests list item 11) -- kept: legacy exactly-three-signed pin
 # ==========================================================================
 
