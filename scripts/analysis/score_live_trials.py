@@ -82,9 +82,10 @@ import logging
 import sys
 import time
 from collections.abc import Mapping, Sequence
+from dataclasses import dataclass
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 from breezy.domain.nws_climate_day import NwsClimateDay
 from breezy.domain.weather_bucket_facts import (
@@ -113,6 +114,71 @@ _MALFORMED_ROW_ERRORS: tuple[type[Exception], ...] = (
     TypeError,
     InvalidOperation,
 )
+
+#: Partial-fill admission gate (binding ruling,
+#: `docs/evidence/grok_partial_fill_ruling_2026-09-04.md` Q1): the
+#: registered v1 unit of observation is a 1-contract IOC filled Take. A fill
+#: with `qty != 1` is excluded fail-closed here, BEFORE `score_trial` --
+#: it enters neither the Wilson n/k nor the stop-rule sum(PnL). This is a
+#: closed set, never extended ad hoc: `partial_fill` (0 < qty < 1) and
+#: `multi_fill` (qty > 1) as a documented sibling for the over-fill case the
+#: ruling's wording also covers ("qty != 1"). `qty <= 0` is a different,
+#: malformed-input case (see `_validate_qty`) and is never a member of this
+#: set -- a zero-fill (IOC miss) "is not a trial at all" per the ruling, so
+#: it must never be silently scored NOR silently dropped; it is refused
+#: loudly through the existing `ScoreRefusal(reason="malformed_input")`
+#: channel instead, which the CLI already prints for every refusal.
+FillExclusionReason = Literal["partial_fill", "multi_fill"]
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
+class FillExclusion:
+    """One fill admitted-but-excluded before scoring (ruling Q1).
+
+    Never pooled into scoring, never written to the scored-trial store --
+    `ScoredTrial.excluded_reason` is a different, scoring-time concept (the
+    venue-fallback-without-NWS case). Reported in the CLI's exclusions
+    table so operators see coverage, not just totals.
+    """
+
+    trial_id: str
+    station: str
+    climate_day: str
+    qty: str
+    reason: FillExclusionReason
+    detail: str
+
+
+def _validate_qty(trial: FilledTrial) -> ScoreRefusal | None:
+    """`qty <= 0` is not a real fill and must never be silently scored or
+    silently dropped (ruling Q1: a zero-fill IOC miss "is not a trial at
+    all"). Refused loudly through the same `malformed_input` channel a
+    malformed JSONL row uses, so it always appears in the printed refusal
+    list. Returns `None` when `qty` is usable."""
+    if trial.qty <= 0:
+        return ScoreRefusal(
+            trial_id=trial.trial_id,
+            reason="malformed_input",
+            detail=f"qty must be positive, got {trial.qty!r}",
+        )
+    return None
+
+
+def _admit_fill(trial: FilledTrial) -> FillExclusion | None:
+    """Ruling Q1 admission gate. Assumes `trial.qty > 0` (call
+    `_validate_qty` first). Returns `None` when the fill is admitted
+    (`qty == 1`), else the `FillExclusion` to report."""
+    if trial.qty == 1:
+        return None
+    reason: FillExclusionReason = "partial_fill" if trial.qty < 1 else "multi_fill"
+    return FillExclusion(
+        trial_id=trial.trial_id,
+        station=trial.station,
+        climate_day=trial.climate_day,
+        qty=str(trial.qty),
+        reason=reason,
+        detail=f"qty {trial.qty} != 1; v1 unit is a 1-contract IOC fill (ruling Q1)",
+    )
 
 
 def read_filled_trials_jsonl(
@@ -270,15 +336,30 @@ def score_live_trials(
     city: str,
     derived_dir: Path,
     now_ns: int,
-) -> tuple[tuple[ScoredTrial, ...], tuple[ScoreRefusal, ...]]:
-    """Read fills, join to settlement truth, score, and write the parquet run."""
+) -> tuple[tuple[ScoredTrial, ...], tuple[ScoreRefusal, ...], tuple[FillExclusion, ...]]:
+    """Read fills, join to settlement truth, score, and write the parquet run.
+
+    The partial-fill admission gate (ruling Q1) runs first, between reading
+    fills and scoring: `qty <= 0` becomes a loud `malformed_input` refusal;
+    `qty != 1` becomes a `FillExclusion`, reported separately and never
+    passed to `score_trial`.
+    """
     filled_trials, jsonl_refusals = read_filled_trials_jsonl(fills_path)
     bucket_by_instrument = _read_bucket_facts_by_instrument_id(catalog_base, venue=venue, city=city)
     catalog = open_station_catalog(catalog_base, venue, city)
 
     pairs: list[tuple[FilledTrial, NwsClimateDay | None]] = []
     extra_refusals: list[ScoreRefusal] = list(jsonl_refusals)
+    excluded_fills: list[FillExclusion] = []
     for trial in filled_trials:
+        malformed_qty = _validate_qty(trial)
+        if malformed_qty is not None:
+            extra_refusals.append(malformed_qty)
+            continue
+        exclusion = _admit_fill(trial)
+        if exclusion is not None:
+            excluded_fills.append(exclusion)
+            continue
         if _already_fallback_scored(derived_dir, trial.trial_id):
             continue
         if trial.bucket is None and trial.instrument_id not in bucket_by_instrument:
@@ -351,7 +432,7 @@ def score_live_trials(
     )
     if stamped_scored:
         write_scored_trials(derived_dir, stamped_scored, now_ns=now_ns)
-    return stamped_scored, refused
+    return stamped_scored, refused, tuple(excluded_fills)
 
 
 def _parse_args(argv: Sequence[str] | None) -> argparse.Namespace:
@@ -366,7 +447,7 @@ def _parse_args(argv: Sequence[str] | None) -> argparse.Namespace:
 
 def main(argv: Sequence[str] | None = None) -> int:
     args = _parse_args(argv)
-    scored, refused = score_live_trials(
+    scored, refused, excluded = score_live_trials(
         fills_path=args.fills,
         catalog_base=args.catalog_base,
         venue=args.venue,
@@ -374,9 +455,19 @@ def main(argv: Sequence[str] | None = None) -> int:
         derived_dir=args.derived_dir,
         now_ns=time.time_ns(),
     )
-    print(f"scored {len(scored)} trial(s), refused {len(refused)} trial(s)")
+    print(
+        f"scored {len(scored)} trial(s), refused {len(refused)} trial(s), "
+        f"excluded {len(excluded)} fill(s)"
+    )
     for refusal in refused:
         print(f"  refused {refusal.trial_id}: {refusal.reason} -- {refusal.detail}")
+    if excluded:
+        print("excluded fills (admitted-but-excluded before scoring, ruling Q1):")
+        for fill in excluded:
+            print(
+                f"  excluded {fill.trial_id}: {fill.reason} qty={fill.qty} "
+                f"station={fill.station} climate_day={fill.climate_day} -- {fill.detail}"
+            )
     return 0
 
 

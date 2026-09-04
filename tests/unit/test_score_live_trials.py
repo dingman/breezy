@@ -3,8 +3,16 @@ review amendments). Covers: the JSONL reader (happy path + malformed rows
 never abort the batch), the `instrument_unavailable` refusal path, the
 `_already_fallback_scored` skip, `_next_score_seq`, the review-item-3
 re-score-only-on-change skip, the review-item-4 duplicate-instrument-id
-warning, and one end-to-end fixture run that writes a parquet file the store
-reader loads back.
+warning, one end-to-end fixture run that writes a parquet file the store
+reader loads back, and the partial-fill admission gate (binding ruling,
+`docs/evidence/grok_partial_fill_ruling_2026-09-04.md` Q1): `qty != 1` is
+excluded fail-closed before scoring and reported in an exclusions table;
+`qty <= 0` is refused loudly as malformed, never silently scored or dropped.
+
+The shared `_fill_row()` fixture default `qty` is `"1"` (the v1 unit of
+observation) -- it was `"10"` before this gate existed, which is now itself
+a `multi_fill` exclusion case, so tests that are not about `qty` specifically
+rely on the `"1"` default to keep scoring as before.
 """
 
 from __future__ import annotations
@@ -28,10 +36,14 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, (REPO_ROOT / "scripts/analysis").as_posix())
 
 from score_live_trials import (
+    FillExclusion,
+    _admit_fill,
     _already_fallback_scored,
     _next_score_seq,
     _read_bucket_facts_by_instrument_id,
     _unchanged_since_last_score,
+    _validate_qty,
+    main,
     read_filled_trials_jsonl,
     score_live_trials,
 )
@@ -67,7 +79,7 @@ def _fill_row(**overrides: Any) -> dict[str, Any]:
         "instrument_id": "LAX-2026-08-31-gte78lt80f",
         "fill_px": "0.42",
         "fee": "0.01",
-        "qty": "10",
+        "qty": "1",
         "filled_at_ns": _BASE_NS,
         "entry_ask": "0.40",
         "scheduled_release_at_ns": _BASE_NS,
@@ -333,7 +345,7 @@ def test_end_to_end_run_writes_a_parquet_file_the_store_reader_loads_back(
 
     fills_path.write_text(json.dumps(_fill_row()) + "\n", encoding="utf-8")
 
-    scored, refused = score_live_trials(
+    scored, refused, excluded = score_live_trials(
         fills_path=fills_path,
         catalog_base=catalog_base,
         venue=_VENUE,
@@ -342,6 +354,7 @@ def test_end_to_end_run_writes_a_parquet_file_the_store_reader_loads_back(
         now_ns=_BASE_NS,
     )
     assert refused == ()
+    assert excluded == ()
     assert len(scored) == 1
     assert scored[0].held is True
 
@@ -371,7 +384,7 @@ def test_a_trial_with_no_bucket_and_no_persisted_instrument_is_refused_unavailab
         json.dumps(_fill_row(trial_id="no-instrument", bucket=None)) + "\n", encoding="utf-8"
     )
 
-    scored, refused = score_live_trials(
+    scored, refused, excluded = score_live_trials(
         fills_path=fills_path,
         catalog_base=catalog_base,
         venue=_VENUE,
@@ -380,6 +393,7 @@ def test_a_trial_with_no_bucket_and_no_persisted_instrument_is_refused_unavailab
         now_ns=_BASE_NS,
     )
     assert scored == ()
+    assert excluded == ()
     assert len(refused) == 1
     assert refused[0].reason == "instrument_unavailable"
     assert refused[0].trial_id == "no-instrument"
@@ -408,7 +422,7 @@ def test_a_malformed_climate_day_on_a_parsed_trial_is_refused_not_fatal(tmp_path
     ]
     fills_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
-    scored, refused = score_live_trials(
+    scored, refused, _excluded = score_live_trials(
         fills_path=fills_path,
         catalog_base=catalog_base,
         venue=_VENUE,
@@ -419,3 +433,241 @@ def test_a_malformed_climate_day_on_a_parsed_trial_is_refused_not_fatal(tmp_path
     assert len(scored) == 1
     assert scored[0].trial_id == "good-day"
     assert any(r.trial_id == "bad-day" and r.reason == "malformed_input" for r in refused)
+
+
+# ---------------------------------------------------------------------------
+# partial-fill admission gate (ruling Q1,
+# docs/evidence/grok_partial_fill_ruling_2026-09-04.md): qty != 1 is excluded
+# fail-closed before score_trial; qty <= 0 is refused loudly as malformed.
+# ---------------------------------------------------------------------------
+
+
+def _admitted_trial(**overrides: Any) -> FilledTrial:
+    return FilledTrial(
+        trial_id=overrides.pop("trial_id", "t1"),
+        station=overrides.pop("station", _STATION),
+        climate_day=overrides.pop("climate_day", _DAY_ISO),
+        instrument_id=overrides.pop("instrument_id", "i"),
+        bucket=overrides.pop("bucket", None),
+        fill_px=overrides.pop("fill_px", Decimal("0.42")),
+        fee=overrides.pop("fee", Decimal("0.01")),
+        qty=overrides.pop("qty", Decimal(1)),
+        filled_at_ns=overrides.pop("filled_at_ns", _BASE_NS),
+        entry_ask=overrides.pop("entry_ask", Decimal("0.40")),
+        scheduled_release_at_ns=overrides.pop("scheduled_release_at_ns", _BASE_NS),
+        venue_settlement_tmax_f=overrides.pop("venue_settlement_tmax_f", None),
+    )
+
+
+def test_a_qty_of_exactly_one_is_admitted_not_excluded() -> None:
+    # Arrange
+    trial = _admitted_trial(qty=Decimal(1))
+    # Act
+    exclusion = _admit_fill(trial)
+    # Assert
+    assert exclusion is None
+
+
+def test_a_fractional_qty_is_excluded_as_partial_fill_with_full_coverage_fields() -> None:
+    # Arrange
+    trial = _admitted_trial(trial_id="frac", qty=Decimal("0.37"))
+    # Act
+    exclusion = _admit_fill(trial)
+    # Assert
+    assert isinstance(exclusion, FillExclusion)
+    assert exclusion.reason == "partial_fill"
+    assert exclusion.trial_id == "frac"
+    assert exclusion.qty == "0.37"
+    assert exclusion.station == _STATION
+    assert exclusion.climate_day == _DAY_ISO
+
+
+def test_a_qty_greater_than_one_is_excluded_as_multi_fill() -> None:
+    # Arrange
+    trial = _admitted_trial(trial_id="multi", qty=Decimal(10))
+    # Act
+    exclusion = _admit_fill(trial)
+    # Assert
+    assert isinstance(exclusion, FillExclusion)
+    assert exclusion.reason == "multi_fill"
+    assert exclusion.trial_id == "multi"
+    assert exclusion.qty == "10"
+
+
+def test_zero_qty_is_refused_as_malformed_not_excluded() -> None:
+    # Arrange
+    trial = _admitted_trial(trial_id="zero", qty=Decimal(0))
+    # Act
+    refusal = _validate_qty(trial)
+    # Assert
+    assert refusal is not None
+    assert refusal.reason == "malformed_input"
+    assert refusal.trial_id == "zero"
+    assert "qty" in refusal.detail
+
+
+def test_a_missing_qty_field_is_refused_as_malformed_input(tmp_path: Path) -> None:
+    # Arrange -- the JSONL row omits "qty" entirely (existing reader
+    # behaviour: a KeyError on parse becomes a malformed_input refusal, so
+    # this pins that "missing" is already covered, never silently dropped).
+    row = _fill_row(trial_id="no-qty")
+    del row["qty"]
+    path = tmp_path / "fills.jsonl"
+    path.write_text(json.dumps(row) + "\n", encoding="utf-8")
+    # Act
+    trials, refusals = read_filled_trials_jsonl(path)
+    # Assert
+    assert trials == ()
+    assert len(refusals) == 1
+    assert refusals[0].reason == "malformed_input"
+    assert refusals[0].trial_id == "no-qty"
+
+
+def test_the_reader_yields_qty_as_decimal_never_float_or_int(tmp_path: Path) -> None:
+    # Arrange
+    path = tmp_path / "fills.jsonl"
+    path.write_text(json.dumps(_fill_row(qty="1")) + "\n", encoding="utf-8")
+    # Act
+    trials, refusals = read_filled_trials_jsonl(path)
+    # Assert
+    assert refusals == ()
+    assert type(trials[0].qty) is Decimal
+    assert trials[0].qty == Decimal(1)
+
+
+def test_end_to_end_a_partial_fill_is_excluded_not_scored_and_reported(tmp_path: Path) -> None:
+    # Arrange
+    catalog_base = tmp_path / "catalog"
+    derived_dir = tmp_path / "derived"
+    fills_path = tmp_path / "fills.jsonl"
+    catalog = open_station_catalog(catalog_base, _VENUE, _CITY)
+    write_records(catalog, [_climate_day(tmax_f=79)])
+    fills_path.write_text(
+        json.dumps(_fill_row(trial_id="frac", qty="0.37")) + "\n", encoding="utf-8"
+    )
+
+    # Act
+    scored, refused, excluded = score_live_trials(
+        fills_path=fills_path,
+        catalog_base=catalog_base,
+        venue=_VENUE,
+        city=_CITY,
+        derived_dir=derived_dir,
+        now_ns=_BASE_NS,
+    )
+
+    # Assert -- never scored, never a plain refusal, reported as an exclusion
+    assert scored == ()
+    assert refused == ()
+    assert len(excluded) == 1
+    assert excluded[0].trial_id == "frac"
+    assert excluded[0].reason == "partial_fill"
+    assert excluded[0].qty == "0.37"
+    assert excluded[0].station == _STATION
+    assert excluded[0].climate_day == _DAY_ISO
+    # never persisted to the scored-trial store
+    assert read_scored_trials(derived_dir) == ()
+
+
+def test_end_to_end_a_multi_fill_is_excluded_not_scored_and_reported(tmp_path: Path) -> None:
+    # Arrange
+    catalog_base = tmp_path / "catalog"
+    derived_dir = tmp_path / "derived"
+    fills_path = tmp_path / "fills.jsonl"
+    catalog = open_station_catalog(catalog_base, _VENUE, _CITY)
+    write_records(catalog, [_climate_day(tmax_f=79)])
+    fills_path.write_text(
+        json.dumps(_fill_row(trial_id="multi", qty="10")) + "\n", encoding="utf-8"
+    )
+
+    # Act
+    scored, refused, excluded = score_live_trials(
+        fills_path=fills_path,
+        catalog_base=catalog_base,
+        venue=_VENUE,
+        city=_CITY,
+        derived_dir=derived_dir,
+        now_ns=_BASE_NS,
+    )
+
+    # Assert
+    assert scored == ()
+    assert refused == ()
+    assert len(excluded) == 1
+    assert excluded[0].reason == "multi_fill"
+    assert excluded[0].trial_id == "multi"
+
+
+def test_end_to_end_a_zero_qty_fill_is_refused_loudly_never_scored_never_silently_dropped(
+    tmp_path: Path,
+) -> None:
+    # Arrange -- pins (f): the JSONL placeholder reader parses qty="0" into a
+    # FilledTrial (it is valid Decimal syntax), so admission control -- not
+    # the reader -- is the only gate that stops a zero-fill (IOC miss) from
+    # reaching score_trial. Other FilledTrial construction sites
+    # (runtime/paper_replay.py, current_rung_hold_paper_replay.py) are a
+    # different fill source entirely and out of scope for this driver.
+    catalog_base = tmp_path / "catalog"
+    derived_dir = tmp_path / "derived"
+    fills_path = tmp_path / "fills.jsonl"
+    catalog = open_station_catalog(catalog_base, _VENUE, _CITY)
+    write_records(catalog, [_climate_day(tmax_f=79)])
+    fills_path.write_text(
+        json.dumps(_fill_row(trial_id="zero-fill", qty="0")) + "\n", encoding="utf-8"
+    )
+
+    # Act
+    scored, refused, excluded = score_live_trials(
+        fills_path=fills_path,
+        catalog_base=catalog_base,
+        venue=_VENUE,
+        city=_CITY,
+        derived_dir=derived_dir,
+        now_ns=_BASE_NS,
+    )
+
+    # Assert -- never scored, never silently dropped (i.e. it is neither
+    # absent from both tuples), refused loudly as malformed
+    assert scored == ()
+    assert excluded == ()
+    assert len(refused) == 1
+    assert refused[0].reason == "malformed_input"
+    assert refused[0].trial_id == "zero-fill"
+
+
+def test_main_prints_the_excluded_fills_table(tmp_path: Path, capsys: Any) -> None:
+    # Arrange
+    catalog_base = tmp_path / "catalog"
+    derived_dir = tmp_path / "derived"
+    fills_path = tmp_path / "fills.jsonl"
+    catalog = open_station_catalog(catalog_base, _VENUE, _CITY)
+    write_records(catalog, [_climate_day(tmax_f=79)])
+    fills_path.write_text(
+        json.dumps(_fill_row(trial_id="frac", qty="0.37")) + "\n", encoding="utf-8"
+    )
+
+    # Act
+    exit_code = main(
+        [
+            "--fills",
+            str(fills_path),
+            "--city",
+            _CITY,
+            "--venue",
+            _VENUE,
+            "--catalog-base",
+            str(catalog_base),
+            "--derived-dir",
+            str(derived_dir),
+        ]
+    )
+
+    # Assert
+    assert exit_code == 0
+    out = capsys.readouterr().out
+    assert "excluded 1 fill(s)" in out
+    assert "excluded fills" in out
+    assert "frac" in out
+    assert "partial_fill" in out
+    assert _STATION in out
+    assert _DAY_ISO in out
