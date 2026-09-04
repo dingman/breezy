@@ -140,6 +140,7 @@ from breezy.persistence.feather_preflight import (
 )
 from breezy.runtime.node_config import QUOTE_TAPE_INCLUDE_TYPES
 from breezy.runtime.quote_tape_preflight_cli import CATALOG_ENV_VAR
+from breezy.runtime.quote_tape_salvage import salvage_truncated_instance
 
 logger = logging.getLogger(__name__)
 
@@ -633,6 +634,14 @@ def run_ingest(
                 f"run breezy-quote-tape-preflight for detail"
             )
             logger.error("instance %s: refusing to convert -- %s", instance_id, reason)
+            if not dry_run and preflight_report.truncated:
+                salvage_truncated_instance(
+                    catalog,
+                    _instance_dir(catalog_root, instance_id, subdirectory),
+                    instance_id,
+                    data_types,
+                    preflight_report.truncated,
+                )
             results.append(InstanceIngestResult(instance_id, "skipped-truncated", reason))
             continue
 

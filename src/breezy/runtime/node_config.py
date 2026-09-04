@@ -296,6 +296,32 @@ QUOTE_TAPE_INCLUDE_TYPES: list[type] = [
 #: rate negligible for a handful of weather markets.
 QUOTE_TAPE_FLUSH_INTERVAL_MS: int = 10_000
 
+#: ``Cache`` tick/bar deque capacity for the quote-tape recorder, PER
+#: INSTRUMENT (``CacheConfig.tick_capacity``/``bar_capacity``,
+#: ``nautilus_trader/cache/config.py:56-58,73-74``; the deques themselves:
+#: ``cache/cache.pyx:117-118,1755-1988``). The native default is
+#: ``10_000`` each -- sized for a strategy process that reads ticks/bars back
+#: out of the cache. This recorder never does: it registers zero Actors and
+#: zero strategies (``build_quote_tape_node_config`` below), and nothing on
+#: its path calls ``Cache.quote_ticks``/``bars`` (checked with codegraph --
+#: every ``subscribe_quote_ticks``/cache-read caller in ``src/breezy/`` is a
+#: strategy module, none of which this process constructs). Left at the
+#: default, 30+ subscribed instruments each carry a 10_000-entry deque that is
+#: written and NEVER read -- pure unread headroom on a host that was OOM-killed
+#: at ~1.1 GB RSS (``tests/unit/test_polymarket_us_connect_fail_fast.py:3-4``).
+#: Pinned to ``1``, not ``0``: ``CacheConfig`` types both fields
+#: ``PositiveInt`` (``gt=0``) and msgspec does not enforce that constraint at
+#: direct-construction time (measured: ``CacheConfig(tick_capacity=0)``
+#: succeeds today) -- but that is an accident of this msgspec version, not a
+#: documented guarantee, and ``deque(maxlen=0)`` is also a needless edge case
+#: (some cache paths call ``.append`` unconditionally regardless of whether
+#: anything ever reads back). ``1`` satisfies the type's own contract, still
+#: collapses the per-instrument footprint by four orders of magnitude, and
+#: the writer never reads the cache back either way so no data is lost by
+#: shrinking it -- everything durable goes through the streaming feather
+#: writer, not the in-memory cache.
+QUOTE_TAPE_CACHE_CAPACITY: int = 1
+
 #: Mode the tape root is created with. Matches
 #: ``breezy.runtime.health.SNAPSHOT_DIR_MODE`` and the station-catalog
 #: convention. The tape is not a secret, but it is strategy-inferable: which
@@ -470,7 +496,12 @@ def build_quote_tape_node_config(
         environment=Environment.LIVE,
         trader_id=validated_trader_id(settings.trader_id),
         logging=LoggingConfig(log_level=settings.log_level),
-        cache=CacheConfig(database=None, flush_on_start=False),
+        cache=CacheConfig(
+            database=None,
+            flush_on_start=False,
+            tick_capacity=QUOTE_TAPE_CACHE_CAPACITY,
+            bar_capacity=QUOTE_TAPE_CACHE_CAPACITY,
+        ),
         message_bus=None,
         catalogs=[],
         actors=[],

@@ -59,6 +59,7 @@ from breezy.adapters.polymarket_us.tape_records import (
     VenueSettlementSnapshot,
 )
 from breezy.runtime.node_config import (
+    QUOTE_TAPE_CACHE_CAPACITY,
     NodeConfigError,
     build_quote_tape_node_config,
 )
@@ -321,6 +322,28 @@ class TestQuoteTapeNodeConfig:
         assert config.cache is not None
         assert config.cache.database is None
         assert config.message_bus is None
+
+    def test_cache_tick_and_bar_capacity_are_pinned_small_not_the_10k_default(
+        self, tmp_path: Path
+    ) -> None:
+        """The recorder never reads a tick back out of the cache (it only
+
+        subscribes and streams to the writer), so the native 10_000-per-
+        instrument default (``nautilus_trader/cache/config.py:73-74``) is
+        30+ unread deques of dead weight -- exactly the kind of headroom an
+        unattended host does not have once the recorder is OOM-killed at
+        ~1.1 GB RSS on a 31 GB host. Pinned to a named constant so the value
+        is reviewable, not buried in the call site.
+        """
+        config = build_quote_tape_node_config(
+            make_tape_settings(tmp_path), make_data_client_config()
+        )
+
+        assert config.cache is not None
+        assert config.cache.tick_capacity == QUOTE_TAPE_CACHE_CAPACITY
+        assert config.cache.bar_capacity == QUOTE_TAPE_CACHE_CAPACITY
+        assert config.cache.tick_capacity < 10_000
+        assert config.cache.bar_capacity < 10_000
 
     def test_streaming_targets_the_configured_root_and_only_the_tape_types(
         self, tmp_path: Path

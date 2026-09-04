@@ -243,6 +243,15 @@ before trying again.
   network outage and would abandon capture permanently. 20/hour still fails
   closed on a persistent exit-2 misconfiguration (~10 min) and still bounds a hot
   loop. This is the one place data-irreplaceability outranks convention-mirroring.
+- **`MemoryHigh=2G` / `MemoryMax=3G`** (added 2026-09-04, after the recorder
+  was OOM-killed at ~1.1 GB RSS with no per-cgroup ceiling set at all). Sized
+  from the measured post-incident steady state, MemoryCurrent ~= 1.10 GB /
+  MemoryPeak ~= 1.14 GB after 28 min uptime: `MemoryHigh` clears that with
+  ~1.8x headroom so ordinary operation is never throttled, and `MemoryMax`
+  stays under a tenth of the 31 GB host so this cgroup's own OOM kill — not
+  the host-wide OOM killer choosing among unrelated processes — is what fires
+  on a leak. `Restart=always` recovers from that kill like any other exit.
+  Pinned by `tests/unit/test_quote_tape_service_memory_ceiling.py`.
 - **No `SuccessExitStatus`.** The exit contract must reach `systemctl status`:
   0 clean, **1 fatal market-data fault**, 2 configuration error
   (`quote_tape_cli.py:52-61`, `:145-174`). Commit `79b9b44` exists precisely so a

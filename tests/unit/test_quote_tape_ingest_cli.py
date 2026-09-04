@@ -45,6 +45,7 @@ from nautilus_trader.model.instruments import BinaryOption
 from nautilus_trader.model.objects import Price, Quantity
 from nautilus_trader.persistence.catalog.parquet import ParquetDataCatalog
 from nautilus_trader.serialization.arrow.serializer import ArrowSerializer
+from nautilus_trader.test_kit.providers import TestInstrumentProvider
 
 from breezy.runtime.quote_tape_ingest_cli import (
     CONVERTED,
@@ -57,7 +58,17 @@ from breezy.runtime.quote_tape_ingest_cli import (
     run,
     run_ingest,
 )
+from breezy.persistence.feather_preflight import salvage_feather_file
 from breezy.runtime.quote_tape_preflight_cli import CATALOG_ENV_VAR
+from tests.contract.test_quote_tape_unclean_shutdown import (
+    INSTANCE_ID as _SIGKILL_INSTANCE_ID,
+)
+from tests.contract.test_quote_tape_unclean_shutdown import (
+    RECORD_COUNT as _SIGKILL_RECORD_COUNT,
+)
+from tests.contract.test_quote_tape_unclean_shutdown import (
+    _sigkill_a_real_writer,
+)
 
 
 def _recording_convert(
@@ -640,3 +651,196 @@ class TestStreamReadFailuresBecomeThisTypesFailure:
 
         with pytest.raises(ValueError, match="could not read streamed binary_option"):
             default_convert(catalog, INSTANCE, BinaryOption, "live")
+
+
+@pytest.mark.contract
+class TestATruncatedInstanceIsSalvagedNotDropped:
+    """A SIGKILL-truncated instance must not lose the whole day.
+
+    ``tests/contract/test_quote_tape_unclean_shutdown.py`` measured that the
+    native path returns zero rows for a truncated tape, and the ingest CLI
+    (before this test) quarantined the instance -- correctly refusing full
+    conversion -- but never landed the recoverable prefix either. This pins
+    the fix: the readable prefix must land in the catalog, the truncated
+    source file must survive untouched, and the loss must be reported.
+    """
+
+    def _truncate(self, tape: Path) -> None:
+        """Truncate the quote tape and backdate EVERY feather file the
+        writer staged for this instance -- not just the tape -- past the
+        live-grace window. A real ``StreamingFeatherWriter`` touches an
+        empty flat file for every registered data type on construction, and
+        ``classify_liveness`` looks at the WHOLE instance's write window, so
+        leaving those at "now" would classify the instance live regardless
+        of the tape's own mtime.
+        """
+        with tape.open("r+b") as handle:
+            handle.truncate(tape.stat().st_size - 64)
+        stamp = time.time() - 60 * 60  # outside the live-grace window
+        instance_dir = tape
+        while instance_dir.name != _SIGKILL_INSTANCE_ID:
+            instance_dir = instance_dir.parent
+        for path in instance_dir.rglob("*.feather"):
+            os.utime(path, (stamp, stamp))
+
+    def test_recoverable_rows_land_in_the_catalog(
+        self, tmp_path: Path, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        tape = _sigkill_a_real_writer(tmp_path, mode="flush")
+        original_bytes = tape.read_bytes()
+        self._truncate(tape)
+
+        with caplog.at_level(logging.ERROR, logger="breezy.runtime.quote_tape_salvage"):
+            results = run_ingest(
+                tmp_path,
+                data_types=(QuoteTick,),
+                service_active_probe=_never_active,
+            )
+
+        catalog = ParquetDataCatalog(str(tmp_path))
+        recovered_rows = len(catalog.query(data_cls=QuoteTick))
+        assert 0 < recovered_rows < _SIGKILL_RECORD_COUNT, (
+            "the salvageable prefix must be ingested, and the truncated tail "
+            "must genuinely still be lost"
+        )
+
+        # (b) the truncated source file is preserved untouched for forensics --
+        # byte for byte, not merely "still exists".
+        assert tape.exists()
+        assert tape.read_bytes() != original_bytes  # it was truncated by the test fixture
+        assert tape.stat().st_size == len(original_bytes) - 64
+        assert tape.read_bytes() == original_bytes[: len(original_bytes) - 64]
+
+        # The instance is still reported as quarantined, not fully converted.
+        assert results[0].instance_id == _SIGKILL_INSTANCE_ID
+        assert results[0].outcome == "skipped-truncated"
+
+        # (c) the loss is reported, with counts.
+        messages = " ".join(r.getMessage() for r in caplog.records)
+        assert "salvaged" in messages.lower()
+        assert str(recovered_rows) in messages
+
+    def test_a_second_run_does_not_duplicate_the_salvaged_rows(
+        self, tmp_path: Path
+    ) -> None:
+        tape = _sigkill_a_real_writer(tmp_path, mode="flush")
+        self._truncate(tape)
+
+        run_ingest(tmp_path, data_types=(QuoteTick,), service_active_probe=_never_active)
+        catalog = ParquetDataCatalog(str(tmp_path))
+        first_count = len(catalog.query(data_cls=QuoteTick))
+
+        run_ingest(tmp_path, data_types=(QuoteTick,), service_active_probe=_never_active)
+        second_count = len(catalog.query(data_cls=QuoteTick))
+
+        assert first_count > 0
+        assert second_count == first_count
+
+    def test_a_truncated_file_with_no_recoverable_rows_is_not_ingested(
+        self, tmp_path: Path
+    ) -> None:
+        """The header-only truncation case: nothing readable, nothing to land."""
+        instance_dir = tmp_path / "live" / INSTANCE / "quote_tick"
+        instance_dir.mkdir(parents=True, exist_ok=True)
+        tape = instance_dir / "quote_tick_0.feather"
+        # Not even a readable schema message.
+        tape.write_bytes(b"ARROW1\x00\x00garbage-not-a-real-stream")
+        stamp = time.time() - 60 * 60  # outside the live-grace window
+        os.utime(tape, (stamp, stamp))
+
+        results = run_ingest(
+            tmp_path,
+            data_types=(QuoteTick,),
+            service_active_probe=_never_active,
+        )
+
+        catalog = ParquetDataCatalog(str(tmp_path))
+        assert len(catalog.query(data_cls=QuoteTick)) == 0
+        assert results[0].outcome == "skipped-truncated"
+        assert tape.exists()
+
+    def test_a_salvage_failure_on_one_instance_does_not_abort_a_later_instance(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """Salvage must be isolated PER TRUNCATED FILE, exactly like
+        ``ingest_instance``'s own ``except ValueError`` isolates one data
+        type's conversion failure from the rest -- never a whole-run abort.
+        """
+        tape = _sigkill_a_real_writer(tmp_path, mode="flush")
+        self._truncate(tape)
+
+        # A second, ordinary instance the ingest CLI must still convert even
+        # though the first instance's salvage blows up.
+        _write_instrument_feather(
+            tmp_path, OTHER_INSTANCE, "binary_option_0.feather", [_binary_option("MKT-A", T0)]
+        )
+
+        import breezy.runtime.quote_tape_salvage as salvage_module
+
+        def _raise(path: Path) -> None:
+            raise ValueError("synthetic salvage failure")
+
+        monkeypatch.setattr(salvage_module, "salvage_feather_file", _raise)
+
+        with caplog.at_level(logging.ERROR, logger="breezy.runtime.quote_tape_salvage"):
+            results = run_ingest(
+                tmp_path,
+                data_types=(QuoteTick, BinaryOption),
+                service_active_probe=_never_active,
+            )
+
+        by_instance = {result.instance_id: result for result in results}
+        assert by_instance[INSTANCE].outcome == "skipped-truncated"
+        assert by_instance[OTHER_INSTANCE].outcome == "converted"
+        binary_outcomes = {
+            r.outcome
+            for r in by_instance[OTHER_INSTANCE].type_results
+            if r.data_cls is BinaryOption
+        }
+        assert binary_outcomes == {CONVERTED}
+
+        # And zero rows landed for the instance whose salvage raised -- no
+        # partial/corrupt write slipped through the failure.
+        catalog = ParquetDataCatalog(str(tmp_path))
+        assert len(catalog.query(data_cls=QuoteTick)) == 0
+
+        messages = " ".join(r.getMessage() for r in caplog.records)
+        assert "synthetic salvage failure" in messages
+
+    def test_a_salvaged_row_that_already_landed_is_not_duplicated(
+        self, tmp_path: Path
+    ) -> None:
+        """The de-duplication precedent ``convert_instrument_definitions``
+        sets for re-emitted definitions, generalised: writing salvaged rows
+        with ``skip_disjoint_check=True`` bypasses the ONLY native guard
+        against a duplicate, so salvage must not rely on running once.
+        """
+        tape = _sigkill_a_real_writer(tmp_path, mode="flush")
+        self._truncate(tape)
+
+        preview = salvage_feather_file(tape)
+        recovered_count = preview.rows_recovered
+        assert recovered_count > 1, "need at least one non-overlapping row too"
+
+        instrument = TestInstrumentProvider.default_fx_ccy("EUR/USD")
+        overlapping_tick = QuoteTick(
+            instrument_id=instrument.id,
+            bid_price=Price.from_str("1.00000"),
+            ask_price=Price.from_str("1.00010"),
+            bid_size=Quantity.from_int(1),
+            ask_size=Quantity.from_int(1),
+            ts_event=1_000_000_000,
+            ts_init=1_000_000_000,
+        )
+        catalog = ParquetDataCatalog(str(tmp_path))
+        catalog.write_data([overlapping_tick])
+
+        run_ingest(tmp_path, data_types=(QuoteTick,), service_active_probe=_never_active)
+
+        landed = catalog.query(data_cls=QuoteTick)
+        matching = [tick for tick in landed if tick.ts_init == 1_000_000_000]
+        assert len(matching) == 1, "the pre-landed row must not be duplicated"
+        assert len(landed) == 1 + (recovered_count - 1)

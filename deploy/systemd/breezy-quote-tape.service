@@ -24,6 +24,25 @@ StartLimitIntervalSec=3600
 [Service]
 Type=simple
 WorkingDirectory=/home/jon/breezy
+
+# Own cgroup memory ceiling, so this unit's OOM decision is never left to the
+# host-wide OOM killer choosing arbitrarily among every process on a 31 GB
+# box. Measured incident (2026-09-03 22:31 UTC,
+# tests/unit/test_polymarket_us_connect_fail_fast.py:3-4): the recorder was
+# killed with no MemoryHigh=/MemoryMax= configured at all -- zero per-cgroup
+# accounting, so it competed on equal footing with everything else on the
+# host. Measured steady state right after: MemoryCurrent ~= 1.10 GB,
+# MemoryPeak ~= 1.14 GB after 28 minutes uptime (30+ subscribed instruments).
+# MemoryHigh=2G gives the kernel a throttling signal (reclaim/backoff) at
+# roughly 1.8x the measured peak -- enough headroom that ordinary operation
+# is never throttled, but low enough to bite before the host itself is under
+# memory pressure. MemoryMax=3G is the hard ceiling this cgroup's own kill
+# fires at: still under a tenth of the 31 GB host, so a leak here is this
+# unit's cgroup OOM-killing ITSELF, not the host's global OOM killer picking
+# among unrelated processes to save the box. Restart=always (below) recovers
+# from that kill exactly like any other exit.
+MemoryHigh=2G
+MemoryMax=3G
 # Mirrors the NWS unit. The tape is not a secret but it is strategy-inferable
 # (which markets Breezy watches, and from when); the recorder already creates
 # its root 0700 via `prepare_quote_tape_root`.
