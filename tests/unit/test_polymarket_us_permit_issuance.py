@@ -53,6 +53,7 @@ from __future__ import annotations
 
 import ast
 import dataclasses
+import logging
 import pickle
 from collections.abc import Iterator
 from decimal import Decimal
@@ -386,7 +387,7 @@ def test_expiry_is_testable_without_sleeping(monkeypatch: pytest.MonkeyPatch) ->
 
     ``TestClock`` advances instantly, so the expiry boundary above runs in
     microseconds. A ``time.time_ns()`` read inside the check would make these
-    tests either untestable or a fifteen-minute sleep.
+    tests either untestable or a ten-hour sleep.
     """
     clock = clock_at()
     enable_operator_gate(monkeypatch)
@@ -1305,15 +1306,22 @@ def test_the_docstring_does_not_claim_the_spend_down_is_absent() -> None:
 # ==========================================================================
 
 
-def test_the_permit_ttl_is_pinned_to_fifteen_minutes() -> None:
+def test_the_permit_ttl_is_pinned_to_ten_hours() -> None:
     """Every other expiry test derives its expectation from this constant.
 
     Rebinding it to ``10**19`` (about 317 years) left the ENTIRE suite green.
     Expiry was tested relative to itself; this is the only assertion that
     makes the number mean something.
+
+    Derivation (step 8 peer review, 2026-09-04): one live-trading process is
+    launched per trading day and never re-minted in-process. The union of the
+    four stations' decision windows in local standard time -- MIA
+    [12:00,17:00) LST = 17:00 UTC start, through LAX/SFO [12:00,17:00) LST =
+    01:00 UTC the next day end -- spans 8 hours; plus 1 hour slack on each
+    side = 10 hours.
     """
-    assert PERMIT_TTL_NS == 15 * 60 * 1_000_000_000
-    assert PERMIT_TTL_NS == 900_000_000_000
+    assert PERMIT_TTL_NS == 10 * 60 * 60 * 1_000_000_000
+    assert PERMIT_TTL_NS == 36_000_000_000_000
 
 
 # ==========================================================================
@@ -1418,7 +1426,15 @@ def test_the_environ_mutation_scan_is_not_vacuous(tmp_path: Path) -> None:
 def test_the_permit_repr_does_not_publish_its_authenticity_tag(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """A traceback or log line would otherwise print a valid tag within its TTL."""
+    """A traceback or log line would otherwise print a valid tag within its TTL.
+
+    Security review round 2 (step 8, 2026-09-04) widened this: operator
+    identity and every spend ceiling also get ``field(repr=False)``, so a
+    traceback or a routine ``%s``/``%r`` log line -- the same shape
+    ``app/trade.py`` uses to log a caught exception -- cannot publish them
+    either. See ``test_a_logged_permit_never_publishes_operator_id_or_a_ceiling_value``
+    for the caplog-level assertion of the same rule.
+    """
     permit = issued(monkeypatch)
 
     rendered = repr(permit)
@@ -1426,7 +1442,10 @@ def test_the_permit_repr_does_not_publish_its_authenticity_tag(
     assert permit.authenticity.hex() not in rendered
     assert "authenticity" not in rendered
     assert permit.permit_id.hex() not in rendered
-    assert permit.operator_id in rendered  # still useful for an audit line
+    assert permit.operator_id not in rendered
+    assert str(permit.max_order_notional_usd) not in rendered
+    assert str(permit.budget_notional_usd) not in rendered
+    assert str(permit.budget_order_count) not in rendered
 
 
 def test_the_capability_repr_does_not_publish_its_nonce_or_tag(
@@ -1659,3 +1678,45 @@ def test_a_clock_returning_a_non_number_is_refused_as_a_permission_error(
 
     with pytest.raises(LiveTradingPermissionError, match="timestamp_ns"):
         issue_live_trading_permit(clock=BadClock())
+
+
+# ==========================================================================
+# S-MEDIUM-3 -- a permit is never logged by value (security R2)
+# ==========================================================================
+
+
+def test_a_logged_permit_never_publishes_operator_id_or_a_ceiling_value(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """``LiveTradingPermit`` value fields carry ``field(repr=False)``.
+
+    The same defect class as the forgeable-permit report: an object that
+    carries operator identity and spend ceilings must not put them where a
+    routine ``%s``/``%r`` log line -- the same shape ``app/trade.py`` uses to
+    log a caught exception -- can publish them by accident.
+    """
+    permit = issued(
+        monkeypatch,
+        operator_id="operator@example.com",
+        ceiling="5.00",
+        session_notional="1000.00",
+        order_count="100",
+    )
+    logger = logging.getLogger("breezy.test.permit_exposure")
+
+    with caplog.at_level(logging.DEBUG, logger=logger.name):
+        logger.debug("permit issued: %s / %r", permit, permit)
+
+    text = caplog.text
+    rendered = repr(permit)
+
+    sensitive_values = (
+        "operator@example.com",
+        "5.00",
+        "1000.00",
+        "100",
+    )
+    for value in sensitive_values:
+        assert value not in text, f"{value!r} leaked into a log record"
+        assert value not in rendered, f"{value!r} leaked into repr(permit)"

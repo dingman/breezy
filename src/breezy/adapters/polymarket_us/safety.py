@@ -148,13 +148,19 @@ SESSION_ORDER_COUNT_ENV_VAR: Final = "BREEZY_MAX_SESSION_ORDER_COUNT"
 #: The accountable human. Recorded on the permit so a journal entry names one.
 OPERATOR_ID_ENV_VAR: Final = "BREEZY_TRADING_OPERATOR_ID"
 
-#: How long an issued permit stays valid. Chosen to be shorter than any
-#: plausible unattended session: enablement should not outlive the operator's
-#: attention. Fifteen minutes, in nanoseconds. Pinned directly by
-#: ``test_the_permit_ttl_is_pinned_to_fifteen_minutes`` -- every other expiry
-#: test derives its expectation from this constant, so without that assertion
-#: the whole suite stayed green with the TTL rebound to ~317 years.
-PERMIT_TTL_NS: Final = 15 * 60 * 1_000_000_000
+#: How long an issued permit stays valid, in nanoseconds. Derivation (step 8
+#: peer review, 2026-09-04): one live-trading process is launched per trading
+#: day (``app/trade.py::main`` mints the permit exactly once, B7's one-caller
+#: pin) and is never re-minted in-process. The union of the four stations'
+#: decision windows in local standard time -- MIA [12:00,17:00) LST = 17:00
+#: UTC start, through LAX/SFO [12:00,17:00) LST = 01:00 UTC the next day end
+#: -- spans 8 hours; plus 1 hour slack on each side = 10 hours. The prior
+#: 15-minute value denied every candidate after minute 15 of an 8-hour window
+#: by construction, independent of any actual abuse. Pinned directly by
+#: ``test_the_permit_ttl_is_pinned_to_ten_hours`` -- every other expiry test
+#: derives its expectation from this constant, so without that assertion the
+#: whole suite stayed green with the TTL rebound to ~317 years.
+PERMIT_TTL_NS: Final = 10 * 60 * 60 * 1_000_000_000
 
 #: A plain money amount, to the cent. ASCII-only ``[0-9]`` rather than ``\d``
 #: (which matches fullwidth and Arabic-Indic digits) and ``\Z`` rather than
@@ -359,13 +365,13 @@ class LiveTradingPermit:
     ``ValueError`` about some field it happened to get wrong.
     """
 
-    operator_id: str
-    max_order_notional_usd: Decimal
+    operator_id: str = field(repr=False)
+    max_order_notional_usd: Decimal = field(repr=False)
     issued_at_ns: int
     expires_at_ns: int
     permit_id: bytes = field(repr=False)
-    budget_notional_usd: Decimal
-    budget_order_count: int
+    budget_notional_usd: Decimal = field(repr=False)
+    budget_order_count: int = field(repr=False)
     authenticity: bytes = field(repr=False)
 
     def _payload(self) -> bytes:
@@ -414,7 +420,7 @@ class LiveOrderSubmissionAuthorization:
     """
 
     request_digest: bytes = field(repr=False)
-    order_notional_usd: Decimal
+    order_notional_usd: Decimal = field(repr=False)
     expires_at_ns: int
     nonce: bytes = field(repr=False)
     authenticity: bytes = field(repr=False)
