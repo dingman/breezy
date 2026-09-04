@@ -22,8 +22,9 @@ import argparse
 import csv
 import datetime as dt
 import sys
-from collections.abc import Callable, Iterator, Sequence
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from contextlib import AbstractContextManager, contextmanager
+from dataclasses import dataclass, field
 from decimal import Decimal
 from pathlib import Path
 from typing import TYPE_CHECKING, Final, cast
@@ -77,6 +78,7 @@ from breezy.strategy.current_rung_hold.backtest_only import (
     CurrentRungHoldBacktestStrategy,
 )
 from breezy.strategy.current_rung_hold.config import CurrentRungHoldConfig
+from breezy.strategy.current_rung_hold.strategy import _local_hour
 from breezy.strategy.current_rung_hold.trial_day_latch import (
     TrialDayLatch,
     open_trial_day_latch,
@@ -86,13 +88,25 @@ __all__ = [
     "PROVENANCE_HEADER_TEMPLATE",
     "SEVEN_DAYS_NS",
     "STARTING_BALANCE_USD",
+    "NoDecisionWindowCoverageError",
     "UnlistedStationDayError",
     "VenueOutsideLiveDirError",
+    "assert_decision_window_has_coverage",
     "build_provenance_header",
     "climate_day_records_to_settlement",
     "close_source_label",
+    "print_tape_instrument_header",
     "run_one_precision_arm",
 ]
+
+#: The strategy's own `[12:00,17:00)` LST decision window (`strategy.py`'s
+#: `_WINDOW_START_HOUR_LST`/`_WINDOW_END_HOUR_LST`) -- duplicated here as
+#: plain constants rather than importing the private names, since the
+#: strategy module does not export them; the derivation itself (`_local_hour`)
+#: IS imported and reused, never re-derived (see the module's coverage
+#: precondition below).
+_WINDOW_START_HOUR_LST: Final[int] = 12
+_WINDOW_END_HOUR_LST: Final[int] = 17  # exclusive
 
 STARTING_BALANCE_USD: Final[int] = 10_000
 SEVEN_DAYS_NS: Final[int] = 7 * 24 * 60 * 60 * 1_000_000_000
@@ -129,6 +143,17 @@ class VenueOutsideLiveDirError(ValueError):
     L-22 provenance docstring."""
 
 
+class NoDecisionWindowCoverageError(ValueError):
+    """The tape carries zero `QuoteTick`s inside the station's own
+    `[12:00,17:00)` LST decision window for the requested climate day.
+
+    A 12-run sweep once printed `scored=0 refused=0` for every station-day
+    on a tape whose quotes spanned 19:30 to 05:47 LST -- entirely outside
+    the window -- because nothing refused the run before it silently
+    zero-filled (L-23 shape: an uncovered day is refused loudly, never a
+    silent zero)."""
+
+
 def build_provenance_header(
     *,
     lag_minutes: int,
@@ -160,6 +185,74 @@ def assert_requested_days_are_listed(
             f"requested day(s) not listed by the tape: "
             f"{[d.isoformat() for d in unlisted]!r}; listed days: "
             f"{sorted(d.isoformat() for d in listed)!r}",
+        )
+
+
+def _lst_instant(now_ns: int, std_utc_offset_hours: float) -> dt.datetime:
+    """The full LST instant for `now_ns`, for a diagnostic message.
+
+    Mirrors `_local_hour`'s own UTC-to-LST conversion (`strategy.py`); kept
+    separate because `_local_hour` intentionally returns only an hour, not
+    enough precision for a "the tape's LST span was X to Y" refusal message.
+    The actual [12,17) COVERAGE DECISION below is made by `_local_hour`
+    itself, never re-derived here.
+    """
+    seconds, nanoseconds = divmod(now_ns, 1_000_000_000)
+    instant = dt.datetime.fromtimestamp(seconds, tz=dt.UTC) + dt.timedelta(
+        microseconds=nanoseconds // 1_000,
+    )
+    tz = dt.timezone(dt.timedelta(hours=std_utc_offset_hours))
+    return instant.astimezone(tz)
+
+
+def assert_decision_window_has_coverage(
+    tape_instruments: Sequence[TapeInstrument], *, station: str, std_utc_offset_hours: float,
+) -> None:
+    """(b) A tape with zero `QuoteTick`s inside `[12:00,17:00)` LST is
+    refused loudly, never run to a silent zero-fill (module docstring;
+    L-23 shape). Counts EXACTLY what `CurrentRungHoldStrategy.on_quote_tick`
+    itself gates on: `_local_hour(tick.ts_event, std_utc_offset_hours)` in
+    `[_WINDOW_START_HOUR_LST, _WINDOW_END_HOUR_LST)` -- the same derivation,
+    imported, never re-derived.
+    """
+    quote_ts = [quote.ts_event for ti in tape_instruments for quote in ti.quotes]
+    if not quote_ts:
+        raise NoDecisionWindowCoverageError(
+            f"{station}: tape carries zero QuoteTicks; cannot cover the "
+            f"[{_WINDOW_START_HOUR_LST:02d}:00,{_WINDOW_END_HOUR_LST:02d}:00) LST decision window."
+        )
+    covered = any(
+        _WINDOW_START_HOUR_LST <= _local_hour(ts, std_utc_offset_hours) < _WINDOW_END_HOUR_LST
+        for ts in quote_ts
+    )
+    if covered:
+        return
+    lo = _lst_instant(min(quote_ts), std_utc_offset_hours)
+    hi = _lst_instant(max(quote_ts), std_utc_offset_hours)
+    raise NoDecisionWindowCoverageError(
+        f"{station}: tape's QuoteTicks span {lo.isoformat()} to {hi.isoformat()} LST, "
+        f"entirely outside the [{_WINDOW_START_HOUR_LST:02d}:00,{_WINDOW_END_HOUR_LST:02d}:00) "
+        "LST decision window; refusing rather than a silent zero-fill run (L-23 shape)."
+    )
+
+
+def print_tape_instrument_header(
+    tape_instruments: Sequence[TapeInstrument], std_utc_offset_hours: float,
+) -> None:
+    """(3) Per-instrument quote count, depth-update count, and the tape's own
+    LST span -- printed unconditionally in the run header, so a capture that
+    never reaches the decision window is visible without instrumentation."""
+    for ti in tape_instruments:
+        ts_values = [record.ts_event for record in (*ti.quotes, *ti.depths)]
+        span = (
+            f"{_lst_instant(min(ts_values), std_utc_offset_hours).isoformat()} to "
+            f"{_lst_instant(max(ts_values), std_utc_offset_hours).isoformat()}"
+            if ts_values
+            else "no market data"
+        )
+        print(
+            f"tape {ti.instrument.id}: quotes={len(ti.quotes)} "
+            f"depth_updates={len(ti.depths)} lst_span={span}"
         )
 
 
@@ -254,6 +347,25 @@ def _settlement_prices_for_synthesis(
     return settlement_prices_for_scenario(facts_by_id, observed_by_station)
 
 
+@dataclass(frozen=True, slots=True)
+class PrecisionArmResult:
+    """`run_one_precision_arm`'s full return.
+
+    (a) Reporting gap: the strategy's own `RefusalCounter.counts` snapshot
+    rides along with the arm's `FilledTrial`s, so a caller can never discard
+    the strategy object and lose visibility into refusals it counted
+    (`CurrentRungHoldStrategy.on_quote_tick` recorded 21,086
+    `outside_decision_window` refusals that a prior version of this driver
+    never reported). `strategy_refusals` is a wholly DIFFERENT vocabulary
+    from the 6c scorer's `refused` count over `FilledTrial`s -- see
+    `_print_roi_and_wilson`'s `scoring_refused` label; the two must never be
+    conflated under one name.
+    """
+
+    trials: tuple[FilledTrial, ...]
+    strategy_refusals: Mapping[str, int] = field(default_factory=dict)
+
+
 def run_one_precision_arm(
     *,
     tape_instruments: Sequence[TapeInstrument],
@@ -263,8 +375,9 @@ def run_one_precision_arm(
     precision_mode: PrecisionMode,
     latch_store_path: Path,
     settlement_by_key: SettlementByKey,
-) -> tuple[FilledTrial, ...]:
-    """Run one (lag, precision) arm of the replay and return its `FilledTrial`s.
+) -> PrecisionArmResult:
+    """Run one (lag, precision) arm of the replay; return its `FilledTrial`s
+    AND the strategy's own refusal counts (`PrecisionArmResult`).
 
     `tape_instruments` supplies BOTH `QuoteTick` and `OrderBookDepth10` --
     `build_paper_replay_config` refuses a quote-only instrument (RED test 2).
@@ -286,7 +399,7 @@ def run_one_precision_arm(
         market_data.extend(ti.quotes)
         market_data.extend(ti.depths)
     if not market_data:
-        return ()
+        return PrecisionArmResult(trials=(), strategy_refusals={})
     ts_values = [record.ts_init for record in market_data]
     capture_window_ns = (min(ts_values), max(ts_values))
 
@@ -346,7 +459,10 @@ def run_one_precision_arm(
                 scheduled_release_at_ns=max(ts_values) + SEVEN_DAYS_NS,
                 entry_ask=Decimal(str(ti.quotes[0].ask_price)) if ti.quotes else Decimal(0),
             )
-        return filled_trials_from_engine(engine, entry_contexts)
+        trials = filled_trials_from_engine(engine, entry_contexts)
+    return PrecisionArmResult(
+        trials=trials, strategy_refusals=dict(strategy.refusals.counts),
+    )
 
 
 def climate_day_records_to_settlement(
@@ -389,7 +505,14 @@ def _print_roi_and_wilson(
     scored, refused = score_trials(
         _pairs_with_settlement(trials, settlement_by_key), now_ns=now_ns,
     )
-    print(f"scored={len(scored)} refused={len(refused)}")
+    # Relabelled from the old `scored=... refused=...` -- `refused` here is
+    # the 6c scorer's own vocabulary over `FilledTrial`s, a DIFFERENT count
+    # from the strategy's own `RefusalCounter` (`PrecisionArmResult.
+    # strategy_refusals`, printed separately in `main`). The two must never
+    # share a bare `refused=` label -- that conflation is exactly how
+    # 21,086 real `outside_decision_window` refusals stayed invisible while
+    # this line printed `scored=0 refused=0` for every station-day.
+    print(f"scored={len(scored)} scoring_refused={len(refused)}")
     if scored:
         held = sum(1 for row in scored if row.held)
         lower, upper = wilson_interval(held, len(scored))
@@ -436,6 +559,19 @@ def main(argv: Sequence[str] | None = None) -> int:
     listed_days = sorted({ti.facts.climate_day for ti in tape_instruments})
     assert_requested_days_are_listed([climate_day], listed_days)
 
+    std_utc_offset_hours = default_registry().climate_day_window(
+        WEATHER_VENUE, args.station,
+    ).std_utc_offset_hours
+    # (3) Printed BEFORE the coverage precondition below, unconditionally --
+    # an uncovered tape's own counts/span must be visible even (especially)
+    # when this run goes on to refuse it.
+    print_tape_instrument_header(tape_instruments, std_utc_offset_hours)
+    # (b) L-23 shape: a tape with zero QuoteTicks inside the decision window
+    # is refused loudly here, never run to a silent `scored=0 refused=0`.
+    assert_decision_window_has_coverage(
+        tape_instruments, station=args.station, std_utc_offset_hours=std_utc_offset_hours,
+    )
+
     observation_rows = read_asos_rows(args.asos_cache_csv)
     settlement = climate_day_records_to_settlement(tape_instruments, args.weather_catalog_root)
     print(close_source_label(tape_instruments))
@@ -456,7 +592,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 n_live=len(tape_instruments),
             ),
         )
-        trials = run_one_precision_arm(
+        result = run_one_precision_arm(
             tape_instruments=tape_instruments,
             observation_rows=observation_rows,
             station=args.station,
@@ -465,8 +601,11 @@ def main(argv: Sequence[str] | None = None) -> int:
             latch_store_path=args.work_catalog / f"latch_{precision_mode}.db",
             settlement_by_key=settlement,
         )
-        all_trials.extend(trials)
-        _print_roi_and_wilson(trials, settlement, now_ns)
+        all_trials.extend(result.trials)
+        # (a) reporting gap: the strategy's own refusal counts, sorted for a
+        # deterministic line -- never conflated with `scoring_refused` above.
+        print(f"strategy refusals: {dict(sorted(result.strategy_refusals.items()))}")
+        _print_roi_and_wilson(result.trials, settlement, now_ns)
 
     scored, _refused = score_trials(
         _pairs_with_settlement(all_trials, settlement), now_ns=now_ns,

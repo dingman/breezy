@@ -408,6 +408,26 @@ def _tape_instrument_no_close(driver: ModuleType, *, ask: str, size: int) -> obj
 
 _OBSERVATION_ROWS = [{"station": ICAO, "valid": "2026-09-04 19:55", "metar": "KLAX T03000167"}]
 
+#: WINDOW_OPEN_NS is exactly 12:00 LST (see the module comment above); shift
+#: four hours earlier -> 08:00 LST, outside the [12:00,17:00) decision
+#: window on the SAME climate day.
+_OUTSIDE_WINDOW_NS = WINDOW_OPEN_NS - 4 * 3_600_000_000_000
+LAX_STD_UTC_OFFSET_HOURS = -8.0
+
+
+def _tape_instrument_outside_window(driver: ModuleType, *, ask: str, size: int) -> object:
+    """A tape whose only `QuoteTick` is outside the [12:00,17:00) LST window
+    -- the (b) no-coverage-precondition fixture: `on_quote_tick` would count
+    it `outside_decision_window` and never fill."""
+    instrument = _instrument()
+    facts = read_weather_bucket_facts(instrument.info)
+    depth_ts = _OUTSIDE_WINDOW_NS - 1_000
+    quote = _quote(ask=ask, size=size, ts_event=_OUTSIDE_WINDOW_NS)
+    depth = _depth(ask=ask, size=size, ts_event=depth_ts)
+    return driver.TapeInstrument(
+        instrument=instrument, facts=facts, depths=[depth], quotes=[quote], closes=[],
+    )
+
 
 def test_close_source_label_is_recorded_when_every_instrument_has_a_close(
     driver: ModuleType,
@@ -445,7 +465,7 @@ def test_a_capture_with_no_close_but_a_final_climate_day_synthesizes_and_settles
     final = _final_climate_day(tmax_f=87)
     settlement_by_key = {(STATION, CLIMATE_DAY.isoformat()): final}
 
-    trials = driver.run_one_precision_arm(
+    result = driver.run_one_precision_arm(
         tape_instruments=[tape_instrument],
         observation_rows=_OBSERVATION_ROWS,
         station=STATION,
@@ -454,9 +474,14 @@ def test_a_capture_with_no_close_but_a_final_climate_day_synthesizes_and_settles
         latch_store_path=tmp_path / "state.db",
         settlement_by_key=settlement_by_key,
     )
+    trials = result.trials
     assert len(trials) == 1
     trial = trials[0]
     assert trial.fill_px == Decimal("0.40")
+    # (a) reporting gap: the strategy's own refusal counts must ride along
+    # with the trials -- this arm fills, so no `outside_decision_window`
+    # refusal is expected.
+    assert result.strategy_refusals == {}
 
     scored = score_trial(trial, final, now_ns=WINDOW_OPEN_NS + 10_000)
     assert isinstance(scored, ScoredTrial)
@@ -678,6 +703,99 @@ def test_venue_skipped_days_are_refused_not_silently_zero(driver: ModuleType) ->
     with pytest.raises(driver.UnlistedStationDayError):
         driver.assert_requested_days_are_listed([dt.date(2026, 9, 2)], listed)
     driver.assert_requested_days_are_listed([dt.date(2026, 8, 30)], listed)  # must not raise
+
+
+# ---------------------------------------------------------------------------
+# (a) reporting gap -- `run_one_precision_arm` must surface the strategy's
+# own `RefusalCounter`, not discard the strategy object silently.
+# ---------------------------------------------------------------------------
+def test_run_one_precision_arm_returns_the_strategys_own_refusal_counts(
+    driver: ModuleType, tmp_path: Path,
+) -> None:
+    tape_instrument = _tape_instrument_outside_window(driver, ask="0.40", size=10)
+    final = _final_climate_day(tmax_f=87)
+    settlement_by_key = {(STATION, CLIMATE_DAY.isoformat()): final}
+
+    result = driver.run_one_precision_arm(
+        tape_instruments=[tape_instrument],
+        observation_rows=_OBSERVATION_ROWS,
+        station=STATION,
+        lag_minutes=1,
+        precision_mode="nws_integer_c",
+        latch_store_path=tmp_path / "state.db",
+        settlement_by_key=settlement_by_key,
+    )
+    assert result.trials == ()
+    assert result.strategy_refusals == {"outside_decision_window": 1}
+
+
+def test_print_roi_and_wilson_uses_the_scoring_vocabulary_label(
+    driver: ModuleType, capsys: pytest.CaptureFixture[str],
+) -> None:
+    """The 6c scorer's refusal vocabulary (over `FilledTrial`s) must never be
+    printed under the SAME label as the strategy's own `RefusalCounter`
+    (a different vocabulary, counted at `on_quote_tick` time) -- relabelled
+    `scoring_refused` so a reader cannot conflate the two."""
+    capsys.readouterr()
+    driver._print_roi_and_wilson((), {}, 0)
+    captured = capsys.readouterr().out
+    assert "scored=0 scoring_refused=0" in captured
+    assert "scored=0 refused=0" not in captured
+
+
+# ---------------------------------------------------------------------------
+# (b) no coverage precondition -- an uncovered station-day tape is refused
+# loudly, never a silent zero-fill run (L-23 shape).
+# ---------------------------------------------------------------------------
+def test_assert_decision_window_has_coverage_passes_when_a_quote_is_in_window(
+    driver: ModuleType,
+) -> None:
+    tape_instrument = _tape_instrument_no_close(driver, ask="0.40", size=10)
+    driver.assert_decision_window_has_coverage(
+        [tape_instrument], station=STATION, std_utc_offset_hours=LAX_STD_UTC_OFFSET_HOURS,
+    )  # must not raise
+
+
+def test_assert_decision_window_has_coverage_refuses_an_uncovered_tape(
+    driver: ModuleType,
+) -> None:
+    tape_instrument = _tape_instrument_outside_window(driver, ask="0.40", size=10)
+    with pytest.raises(driver.NoDecisionWindowCoverageError, match=r"08:00"):
+        driver.assert_decision_window_has_coverage(
+            [tape_instrument], station=STATION, std_utc_offset_hours=LAX_STD_UTC_OFFSET_HOURS,
+        )
+
+
+def test_assert_decision_window_has_coverage_refuses_a_tape_with_no_quotes_at_all(
+    driver: ModuleType,
+) -> None:
+    instrument = _instrument()
+    facts = read_weather_bucket_facts(instrument.info)
+    empty = driver.TapeInstrument(
+        instrument=instrument, facts=facts, depths=[], quotes=[], closes=[],
+    )
+    with pytest.raises(driver.NoDecisionWindowCoverageError):
+        driver.assert_decision_window_has_coverage(
+            [empty], station=STATION, std_utc_offset_hours=LAX_STD_UTC_OFFSET_HOURS,
+        )
+
+
+# ---------------------------------------------------------------------------
+# (3) run-header visibility -- per-instrument quote/depth counts and LST span
+# ---------------------------------------------------------------------------
+def test_print_tape_instrument_header_reports_counts_and_lst_span(
+    driver: ModuleType, capsys: pytest.CaptureFixture[str],
+) -> None:
+    tape_instrument = _tape_instrument_no_close(driver, ask="0.40", size=10)
+    capsys.readouterr()
+    driver.print_tape_instrument_header(
+        [tape_instrument], std_utc_offset_hours=LAX_STD_UTC_OFFSET_HOURS,
+    )
+    out = capsys.readouterr().out
+    assert str(INSTRUMENT_ID) in out
+    assert "quotes=1" in out
+    assert "depth_updates=1" in out
+    assert "12:00" in out  # WINDOW_OPEN_NS's own LST instant, in the span
 
 
 def test_paper_writer_refuses_a_live_scored_trials_output_path(driver: ModuleType) -> None:
