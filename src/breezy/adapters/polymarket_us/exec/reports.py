@@ -172,7 +172,11 @@ __all__ = [
 #: ``GetAccountBalancesResponse`` (``types/account.py:36-39``).
 _BALANCES_RESPONSE_KEYS: Final[frozenset[str]] = frozenset({"balances"})
 
-#: ``UserBalance`` (``types/account.py:19-33``).
+#: ``UserBalance`` (``types/account.py:19-33``). Kept in EXACT lockstep with
+#: the snapshot -- ``test_polymarket_us_exec_snapshot_drift.py`` asserts SET
+#: EQUALITY against ``typed_dict_keys("account.py", "UserBalance")`` -- so this
+#: set is NOT where a live-observed-but-unpinned field is added; see
+#: :data:`_USER_BALANCE_DRIFT_ALLOWED_KEYS` below for that.
 _USER_BALANCE_KEYS: Final[frozenset[str]] = frozenset(
     {
         "assetAvailable",
@@ -187,6 +191,28 @@ _USER_BALANCE_KEYS: Final[frozenset[str]] = frozenset(
         "pendingCredit",
         "pendingWithdrawals",
         "unsettledFunds",
+    }
+)
+
+#: Six fields observed live on ``GET /v1/account/balances`` on 2026-09-04 that
+#: the pinned SDK snapshot (``polymarket_us_0.1.2``, frozen at package release)
+#: does not declare -- see
+#: ``docs/evidence/venue/polymarket_us/BALANCES_SHAPE_DRIFT_2026-09-04.md``.
+#: Declared here, repo-side, as DECLARED-BUT-UNREAD: accepted so the
+#: reconciliation does not refuse an otherwise-healthy connect over a name it
+#: has never needed, but not merged into :data:`_USER_BALANCE_KEYS` itself --
+#: that set must stay exactly what the snapshot declares, or the drift check
+#: above goes vacuous. None of these six is read for money by
+#: :func:`_parse_account_balance`; a field the venue adds beyond THESE six is
+#: still an unknown key and is still refused.
+_USER_BALANCE_DRIFT_ALLOWED_KEYS: Final[frozenset[str]] = frozenset(
+    {
+        "availableToWithdraw",
+        "bonusReservation",
+        "depositReservation",
+        "displayedAvailableSoon",
+        "displayedBonus",
+        "displayedCash",
     }
 )
 
@@ -556,6 +582,14 @@ def parse_account_balances(payload: Mapping[str, Any]) -> tuple[AccountBalance, 
     Non-``USD`` is a hard refusal. ``BinaryOption`` is built with
     ``currency=USD`` (``parsing.py:1297``) and an account denominated in
     anything else cannot be netted against it.
+
+    Each row's key allowlist is ``_USER_BALANCE_KEYS`` widened by
+    ``_USER_BALANCE_DRIFT_ALLOWED_KEYS`` -- six fields observed live on
+    2026-09-04 that the pinned SDK snapshot does not declare (see
+    ``docs/evidence/venue/polymarket_us/BALANCES_SHAPE_DRIFT_2026-09-04.md``).
+    They are accepted DECLARED-BUT-UNREAD, never merged into the snapshot-
+    matched set itself, so the strict refusal below stays strict for any
+    field beyond those six.
     """
     context = "account balances response"
     _assert_known_keys(payload, known=_BALANCES_RESPONSE_KEYS, context=context)
@@ -577,7 +611,11 @@ def parse_account_balances(payload: Mapping[str, Any]) -> tuple[AccountBalance, 
 
 
 def _parse_account_balance(payload: object, *, context: str) -> AccountBalance:
-    balance = _assert_known_keys(payload, known=_USER_BALANCE_KEYS, context=context)
+    balance = _assert_known_keys(
+        payload,
+        known=_USER_BALANCE_KEYS | _USER_BALANCE_DRIFT_ALLOWED_KEYS,
+        context=context,
+    )
 
     currency = balance.get("currency")
     if currency != QUOTE_CURRENCY_CODE:

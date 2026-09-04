@@ -277,6 +277,54 @@ def test_unknown_balance_key_is_refused() -> None:
         parse_account_balances(payload)
 
 
+def test_drifted_balance_six_unread_fields_are_accepted_money_unchanged() -> None:
+    """BALANCES_SHAPE_DRIFT_2026-09-04: the six new fields are accepted, and
+    the money fields reconciliation actually reads are unaffected by them.
+    """
+    pre_drift = {
+        "balances": [
+            {"currency": "USD", "currentBalance": Decimal("12.34"), "buyingPower": Decimal("10.00")}
+        ]
+    }
+    drifted = {
+        "balances": [
+            {
+                "currency": "USD",
+                "currentBalance": Decimal("12.34"),
+                "buyingPower": Decimal("10.00"),
+                "availableToWithdraw": Decimal("10.00"),
+                "bonusReservation": Decimal(0),
+                "depositReservation": Decimal(0),
+                "displayedAvailableSoon": Decimal(0),
+                "displayedBonus": Decimal(0),
+                "displayedCash": Decimal("12.34"),
+            }
+        ]
+    }
+
+    assert parse_account_balances(drifted) == parse_account_balances(pre_drift)
+
+
+def test_a_seventh_unknown_field_still_refuses_even_alongside_the_six() -> None:
+    """The six-name widening is exact -- a genuinely new, unpinned field is
+    still refused, even when it arrives alongside the six already allowed.
+    """
+    payload = {
+        "balances": [
+            {
+                "currency": "USD",
+                "currentBalance": Decimal("1.00"),
+                "buyingPower": Decimal("1.00"),
+                "availableToWithdraw": Decimal("1.00"),
+                "someFutureField": Decimal("0.01"),
+            }
+        ]
+    }
+
+    with pytest.raises(ExecutionReportMappingError, match="someFutureField"):
+        parse_account_balances(payload)
+
+
 def test_balance_refusal_names_the_fields_not_the_operator_s_money() -> None:
     """``endpoints.py`` promises a private body is never echoed. Same rule here."""
     payload = {
