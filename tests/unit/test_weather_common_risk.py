@@ -2104,6 +2104,34 @@ def test_observation_unavailable_is_within_the_counted_set() -> None:
     assert "observation_unavailable" in risk_module.COUNTED_REFUSAL_REASONS
 
 
+def test_observation_ambiguous_is_within_the_counted_set() -> None:
+    """current_rung_hold blueprint step 1: the decision layer's ambiguous-
+    interval refusal shares this fixed set.
+
+    `"observation_ambiguous"` is never emitted by `RiskManager.evaluate_order`
+    itself -- the branch lives in the decision layer (`current_rung_hold`'s
+    rung-containment check) -- but the reason string is declared here so both
+    counters draw from one bounded vocabulary. L-12 widening: membership
+    only, never equality.
+    """
+    assert "observation_ambiguous" in risk_module.COUNTED_REFUSAL_REASONS
+
+
+def test_fee_schedule_mismatch_is_within_the_counted_set() -> None:
+    """current_rung_hold blueprint step 1 / amendment 2: the decision layer's
+    fail-closed fee-coefficient refusal shares this fixed set.
+
+    `"fee_schedule_mismatch"` is never emitted by `RiskManager.evaluate_order`
+    itself -- the branch lives in the decision layer (`current_rung_hold`'s
+    `decision.py`, which refuses when the traded instrument's fee
+    coefficient diverges from the break-even constant it was computed
+    against) -- but the reason string is declared here so both counters draw
+    from one bounded vocabulary. L-12 widening: membership only, never
+    equality.
+    """
+    assert "fee_schedule_mismatch" in risk_module.COUNTED_REFUSAL_REASONS
+
+
 def test_a_reducing_sell_survives_unobserved_equity() -> None:
     """RED-10: the exit is NOT gagged by a missing measurement.
 

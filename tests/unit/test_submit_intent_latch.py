@@ -682,6 +682,50 @@ class TestProcessLock:
         assert "ACQUIRED" not in completed.stdout
 
 
+class TestSharedStateBinding:
+    """`shared_state_binding` -- the accessor `current_rung_hold.trial_day_latch`
+    uses to bind a `TrialDayLatch` to this SAME store and flock, never a
+    second opener (L-22).
+    """
+
+    def test_returns_the_same_store_and_a_lock_that_reflects_this_latch(
+        self, store_path: Path
+    ) -> None:
+        store = _DictStore()
+        with open_submit_intent_latch(store, store_path) as latch:
+            bound_store, bound_lock = latch.shared_state_binding()
+            assert bound_store is store
+            assert bound_lock.held is True
+
+            # The bound lock is not a fresh grant: it is the exact token
+            # this latch holds, so mutating one is observed through both.
+            latch.arm(FINGERPRINT, now_ns=NOW_NS)
+            assert bound_store.get(CURRENT_INTENT_KEY) is not None
+
+        # Once this latch's own `with` exits, the SAME token the accessor
+        # returned reflects that release -- it grants nothing durable.
+        assert bound_lock.held is False
+
+    def test_raises_lock_not_held_once_this_latch_is_released(self, store_path: Path) -> None:
+        with open_submit_intent_latch(_DictStore(), store_path) as latch:
+            pass
+        with pytest.raises(SubmitIntentLockNotHeld):
+            latch.shared_state_binding()
+
+    def test_a_second_store_path_opener_still_raises_lock_held(self, store_path: Path) -> None:
+        """The accessor is not a side door: a second constructor over the
+        same store path is refused exactly as it is for `SubmitIntentLatch`
+        itself -- there is no second flock to acquire through it.
+        """
+        with open_submit_intent_latch(_DictStore(), store_path) as latch:
+            latch.shared_state_binding()
+            with (
+                pytest.raises(SubmitIntentLockHeld),
+                open_submit_intent_latch(_DictStore(), store_path),
+            ):
+                raise AssertionError("second factory must not yield")
+
+
 class TestSqliteRoundTrip:
     def test_arm_close_reopen_is_latched_then_retire_reopen_arm_succeeds(
         self, store_path: Path

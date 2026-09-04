@@ -440,6 +440,26 @@ class SubmitIntentLatch:
         self._store.set(CURRENT_INTENT_KEY, retired.to_bytes())
         return retired
 
+    def shared_state_binding(self) -> tuple[StateStore, _HeldSubmitIntentLock]:
+        """Return the exact ``(store, lock)`` this latch was opened with.
+
+        Read-only; grants no new access. Exists solely so
+        ``current_rung_hold.trial_day_latch.open_trial_day_latch`` can bind a
+        ``TrialDayLatch`` to the SAME store and the SAME exclusive flock this
+        instance already holds, rather than opening a second store or a
+        second flock (L-22: exclusion is unforgeable, not offered -- a
+        parallel opener would leave two independent locks with crash windows
+        that do not align, which is exactly the hazard the current_rung_hold
+        peer review folded away). The caller receives no more than this
+        instance already has: the store reference is the one already bound
+        to this latch, and the lock token's ``.held`` still reflects this
+        latch's own flock, so it flips to ``False`` the moment this latch's
+        factory ``with`` exits. Raises ``SubmitIntentLockNotHeld`` if that
+        has already happened.
+        """
+        self._require_held()
+        return self._store, self._lock
+
     def _retired_history(self, current: SubmitIntent) -> tuple[SubmitIntent, bytes] | None:
         if _INTENT_ID_RE.fullmatch(current.intent_id) is None:
             raise SubmitIntentCorrupt()

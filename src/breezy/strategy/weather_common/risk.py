@@ -89,6 +89,22 @@ COUNTED_REFUSAL_REASONS: Final[frozenset[str]] = frozenset(
         # Counted here so the decision layer's counter shares the one fixed,
         # finite reason set.
         "observation_unavailable",
+        # Decision-layer reason (`current_rung_hold/decision.py`), NOT
+        # emitted by `RiskManager.evaluate_order` -- the rung-containment
+        # check that can find an observation interval straddling two rungs
+        # has no analogue in this module. Counted here so both counters
+        # share one fixed, finite reason set -- see
+        # `docs/plans/CURRENT_RUNG_HOLD_BLUEPRINT_2026-09-04.md` §3.
+        "observation_ambiguous",
+        # Decision-layer reason (`current_rung_hold/decision.py`), NOT
+        # emitted by `RiskManager.evaluate_order` -- the fail-closed check
+        # that the traded instrument's fee coefficient matches the
+        # break-even constant the archive selector was computed against has
+        # no analogue in this module. Counted here so both counters share
+        # one fixed, finite reason set -- see
+        # `docs/plans/CURRENT_RUNG_HOLD_BLUEPRINT_2026-09-04.md` peer review
+        # amendment 2.
+        "fee_schedule_mismatch",
         "future_signal",
         "observation_limit_unset",
         "edge_below_minimum",
