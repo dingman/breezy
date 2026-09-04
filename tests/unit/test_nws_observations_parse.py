@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import datetime as dt
 import json
+import re
 from collections import Counter
 from pathlib import Path
 from typing import Any
@@ -154,6 +155,53 @@ def test_a_payload_without_a_features_list_is_refused() -> None:
         _parse({"type": "FeatureCollection"})
 
 
+#: Independent re-implementation of the parser's own `METAR_T_RE` (module
+#: docstring precision rule) -- a SEPARATE regex object, not an import of the
+#: parser's, so a parser regression cannot silently agree with itself here.
+_INDEPENDENT_METAR_T_RE = re.compile(
+    r"(?:^|\s)T(?P<air_sign>[01])(?P<air_tenths>\d{3})[01]\d{3}(?:\s|$)"
+)
+
+
+def _derive_expected_counts(payload: dict[str, Any]) -> tuple[int, int, int]:
+    """Walk the raw fixture JSON and independently classify every row.
+
+    Mirrors the parser's documented precedence exactly (module docstring):
+    a `temperature.unitCode` other than `wmoUnit:degC` is dropped first
+    (`unexpected_unit_code`, checked ahead of the T-group per the parser's
+    own row loop); else a non-empty `rawMessage` carrying a METAR T group is
+    exact (METAR); else an integer-valued `temperature.value` is an interval
+    row; else the row is dropped (`null_temperature_row` /
+    `unparseable_row`). Returns `(metar_count, interval_count,
+    dropped_count)`, computed from the raw JSON -- never by calling the
+    parser under test.
+    """
+    metar_count = 0
+    interval_count = 0
+    dropped_count = 0
+    for feature in payload["features"]:
+        properties = feature.get("properties", {})
+        temperature = properties.get("temperature", {})
+        raw_message = properties.get("rawMessage", "")
+        value = temperature.get("value")
+        unit_code = temperature.get("unitCode")
+
+        if unit_code != "wmoUnit:degC":
+            dropped_count += 1
+            continue
+        if isinstance(raw_message, str) and _INDEPENDENT_METAR_T_RE.search(raw_message):
+            metar_count += 1
+            continue
+        if value is None or isinstance(value, bool):
+            dropped_count += 1
+            continue
+        if isinstance(value, int) or (isinstance(value, float) and value.is_integer()):
+            interval_count += 1
+            continue
+        dropped_count += 1
+    return metar_count, interval_count, dropped_count
+
+
 def test_the_recorded_fixture_parses_with_only_the_documented_drop_reasons() -> None:
     payload = json.loads(FIXTURE_FILE.read_text(encoding="utf-8"))
 
@@ -166,6 +214,15 @@ def test_the_recorded_fixture_parses_with_only_the_documented_drop_reasons() -> 
     assert {o.precision_c_tenths for o in observations} <= {5, 10}
     assert any(o.is_metar for o in observations)
     assert any(not o.is_metar for o in observations)
+
+    expected_metar, expected_interval, expected_dropped = _derive_expected_counts(payload)
+    metar_count = sum(1 for o in observations if o.is_metar)
+    interval_count = sum(1 for o in observations if not o.is_metar)
+
+    assert expected_metar + expected_interval + expected_dropped == 500
+    assert metar_count == expected_metar
+    assert interval_count == expected_interval
+    assert sum(drops.values()) == expected_dropped
 
 
 # ---------------------------------------------------------------------------

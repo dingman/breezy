@@ -305,11 +305,22 @@ class RunningExtremeAccumulator:
         )
 
     def staleness_ns(self, now_ns: int) -> int | None:
-        """`now_ns` minus the newest observed instant, or `None` if empty."""
-        if not self._rows:
+        """`now_ns` minus the newest ELIGIBLE observed instant, or `None` if none.
+
+        Applies the same eligibility gate as `value_at`/`coverage`
+        (`observed_at_ns <= now_ns AND received_at_ns <= now_ns`, amendment
+        A1) -- a row observed or received in `now_ns`'s future must never
+        make staleness negative or hide a genuinely-stale accumulator behind
+        a not-yet-visible row.
+        """
+        eligible_observed_ns = [
+            observed_at_ns
+            for observed_at_ns, row in self._rows.items()
+            if observed_at_ns <= now_ns and row.received_at_ns <= now_ns
+        ]
+        if not eligible_observed_ns:
             return None
-        newest_observed_ns = max(self._rows)
-        return now_ns - newest_observed_ns
+        return now_ns - max(eligible_observed_ns)
 
     @property
     def earliest_observed_ns(self) -> int | None:

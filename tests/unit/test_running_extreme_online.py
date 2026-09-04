@@ -653,3 +653,61 @@ def test_coverage_largest_gap_is_none_with_fewer_than_two_rows() -> None:
     report = accumulator.coverage(_ns(only), expected_cadence_ns=300 * _NS_PER_SECOND)
     assert report.first_observed_ns == report.last_observed_ns == _ns(only)
     assert report.largest_gap_ns is None
+
+
+# ---------------------------------------------------------------------------
+# `staleness_ns` must gate eligibility exactly like `value_at`/`coverage`
+# (observed_at_ns <= now_ns AND received_at_ns <= now_ns) -- a row observed
+# or received in `now_ns`'s future must never be used to compute staleness.
+# ---------------------------------------------------------------------------
+
+
+def test_staleness_ignores_a_row_observed_in_the_future_of_now() -> None:
+    accumulator = RunningExtremeAccumulator(std_utc_offset_hours=_LAX_STD_OFFSET_HOURS)
+    climate_day = dt.date(2025, 1, 15)
+    midnight_local_utc = _local_midnight_utc(climate_day, _LAX_STD_OFFSET_HOURS)
+    eligible = midnight_local_utc + dt.timedelta(hours=1)
+    future = midnight_local_utc + dt.timedelta(hours=10)
+
+    _push_metar_row(accumulator, instant_utc=eligible, temp_c_tenths=100)
+    _push_metar_row(accumulator, instant_utc=future, temp_c_tenths=200)
+
+    # `now` is between the two instants: only the eligible row counts, so
+    # staleness is `now - eligible`, never negative from the future row.
+    now = midnight_local_utc + dt.timedelta(hours=5)
+    assert accumulator.staleness_ns(_ns(now)) == _ns(now) - _ns(eligible)
+
+
+def test_staleness_ignores_a_row_received_after_now_even_though_observed_before() -> None:
+    accumulator = RunningExtremeAccumulator(std_utc_offset_hours=_LAX_STD_OFFSET_HOURS)
+    climate_day = dt.date(2025, 1, 15)
+    midnight_local_utc = _local_midnight_utc(climate_day, _LAX_STD_OFFSET_HOURS)
+    eligible = midnight_local_utc + dt.timedelta(hours=1)
+    late_received = midnight_local_utc + dt.timedelta(hours=2)
+    received_at_ns = _ns(midnight_local_utc + dt.timedelta(hours=8))
+
+    _push_metar_row(accumulator, instant_utc=eligible, temp_c_tenths=100)
+    _push_metar_row(
+        accumulator,
+        instant_utc=late_received,
+        temp_c_tenths=200,
+        received_at_ns=received_at_ns,
+    )
+
+    # `now` is after `late_received`'s OWN instant but well before Breezy
+    # actually received it -- that row is ineligible (A1), so staleness
+    # reflects only the eligible row.
+    now = midnight_local_utc + dt.timedelta(hours=3)
+    assert accumulator.staleness_ns(_ns(now)) == _ns(now) - _ns(eligible)
+
+
+def test_staleness_is_none_when_no_row_is_eligible_even_though_rows_are_held() -> None:
+    accumulator = RunningExtremeAccumulator(std_utc_offset_hours=_LAX_STD_OFFSET_HOURS)
+    climate_day = dt.date(2025, 1, 15)
+    midnight_local_utc = _local_midnight_utc(climate_day, _LAX_STD_OFFSET_HOURS)
+    future = midnight_local_utc + dt.timedelta(hours=10)
+
+    _push_metar_row(accumulator, instant_utc=future, temp_c_tenths=100)
+
+    now = midnight_local_utc + dt.timedelta(hours=1)
+    assert accumulator.staleness_ns(_ns(now)) is None
