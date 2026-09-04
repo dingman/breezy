@@ -42,14 +42,16 @@ instant for that instrument yet.
 Window and legal-cell derivation
 ---------------------------------
 ``season``/``hour_lst`` are derived from the LOCAL STANDARD time of the
-quote's own ``ts_event`` at the station's fixed standard-time offset
-(``breezy.registry.sites.toml``'s per-site ``std_utc_offset_hours``, mirrored
-here as :data:`_STD_UTC_OFFSET_HOURS_BY_STATION` rather than imported --
-``strategy.py`` trades exactly the four :data:`SUPPORTED_STATIONS`, a closed
-set, so a private constant avoids pulling the full TOML-backed registry into
-the trading path for four numbers). ``season_for`` re-derives (not imports;
-``scripts/`` is unimportable from ``src/breezy``, see the layers contract)
-the single lookup at ``scripts/analysis/pmr_climatology_study.py:258``.
+quote's own ``ts_event`` at the station's fixed standard-time offset, read
+from :func:`breezy.registry.sites.default_registry` (``climate_day_window``,
+``breezy/registry/sites.toml``'s per-site ``std_utc_offset_hours``) ONCE per
+supported station in ``on_start`` and cached on
+``self._std_utc_offset_hours_by_station`` -- ``registry`` sits below
+``strategy`` in the layers contract (``pyproject.toml``), so this is a native
+import, never a private duplicate of the TOML values. ``season_for``
+(:mod:`breezy.domain.season`) re-derives (not imports; ``scripts/`` is
+unimportable from ``src/breezy``, see the layers contract) the single lookup
+at ``scripts/analysis/pmr_climatology_study.py:182-187``.
 ``width_code``/``m_code`` are derived from the CURRENTLY-active-rung
 instrument's own :class:`WeatherBucketFacts` bounds against
 ``running_max.lower_f`` -- ``width_code=0`` (interior) with
@@ -59,12 +61,33 @@ instrument's own :class:`WeatherBucketFacts` bounds against
 margin axis -- ``archive_table.py``'s header). A key that cannot be derived
 (no ``RunningMax`` yet) never reaches the table lookup at all: the strategy
 returns before building one -- see ``on_quote_tick``.
+
+Lag semantics vs. ``mb_current_rung_edge_study.py`` (stated, not papered over)
+--------------------------------------------------------------------------------
+The study's ``build_current_rung_trials`` reads its tradeable entry price at
+``t + lag_minutes`` (``find_lagged_entry(depth, not_before=t + lag)``,
+``:479-490``) -- a DELIBERATE forward offset from the observation instant
+``t`` that established the running max, modelling the latency between "the
+rung became current" and "an order could realistically reach the book"
+(SS2, ``:36-40``). This strategy applies NO such offset: ``on_quote_tick``
+prices whatever live ``QuoteTick`` arrives, at that tick's own ``ts_event``,
+the instant it arrives -- there is no synthetic delay inserted between the
+``StationObservation`` that sets ``running_max`` and the quote read.  The two
+are equivalent ONLY at ``lag_minutes=0`` (``tests/unit/
+test_current_rung_hold_study_replay_equivalence.py`` pins the replay at
+``lag_minutes=0`` for exactly this reason) -- an operator running the study
+at a nonzero ``lag_minutes`` is measuring a DIFFERENT execution model than
+this strategy implements. This is a live-vs-study divergence, not a bug:
+the live strategy is implicitly lag-0 because it reacts to real market data
+in real time, and adopting a nonzero synthetic lag here is out of scope for
+this increment.
 """
 
 from __future__ import annotations
 
 import datetime as dt
 from collections.abc import Callable
+from contextlib import AbstractContextManager, ExitStack
 from decimal import Decimal
 from typing import TYPE_CHECKING, Final
 
@@ -72,6 +95,7 @@ from nautilus_trader.model.enums import OrderSide, TimeInForce
 from nautilus_trader.model.identifiers import InstrumentId
 from nautilus_trader.trading.strategy import Strategy
 
+from breezy.domain.season import season_for
 from breezy.domain.station_observation import StationObservation
 from breezy.domain.weather_bucket_facts import (
     Measure,
@@ -79,6 +103,7 @@ from breezy.domain.weather_bucket_facts import (
     read_weather_bucket_facts,
 )
 from breezy.ingest.iem_observations import station_observation_data_type
+from breezy.registry.sites import default_registry
 from breezy.strategy.current_rung_hold.config import CurrentRungHoldConfig
 from breezy.strategy.current_rung_hold.decision import (
     DecisionInputs,
@@ -111,16 +136,12 @@ _WIDTH_OPEN_LOWER: Final[int] = 2
 #: before a quote ever reaches that function.
 _OUTSIDE_DECISION_WINDOW: Final[str] = "outside_decision_window"
 
-#: Standard meteorological seasons -- mirrors
-#: ``scripts/analysis/pmr_climatology_study.py:182-187`` (``_SEASON_BY_MONTH``),
-#: re-derived rather than imported (``scripts/`` is unimportable from
-#: ``src/breezy``).
-_SEASON_BY_MONTH: Final[dict[int, str]] = {
-    12: "DJF", 1: "DJF", 2: "DJF",
-    3: "MAM", 4: "MAM", 5: "MAM",
-    6: "JJA", 7: "JJA", 8: "JJA",
-    9: "SON", 10: "SON", 11: "SON",
-}
+#: The venue key this package looks up every ``(venue, city)`` registry
+#: accessor with -- see ``breezy.registry.sites``. ``city`` is the station
+#: code itself (``LAX``/``MDW``/``MIA``/``SFO``), matching
+#: ``breezy/registry/sites.toml``'s ``[sites.polymarket_us.<STATION>]``
+#: tables.
+_VENUE: Final[str] = "polymarket_us"
 
 #: The IEM ASOS station id (``StationObservation.station``) for each of the
 #: four :data:`~breezy.strategy.current_rung_hold.config.SUPPORTED_STATIONS`
@@ -132,19 +153,6 @@ _ICAO_BY_STATION: Final[dict[str, str]] = {
 _STATION_BY_ICAO: Final[dict[str, str]] = {
     icao: station for station, icao in _ICAO_BY_STATION.items()
 }
-
-#: The fixed standard-time UTC offset for each supported station -- mirrors
-#: ``breezy/registry/sites.toml``'s ``std_utc_offset_hours`` for
-#: ``polymarket_us.{LAX,MDW,MIA,SFO}``. NEVER DST-aware, matching the
-#: registry's own field of the same name.
-_STD_UTC_OFFSET_HOURS_BY_STATION: Final[dict[str, float]] = {
-    "LAX": -8.0, "MDW": -6.0, "MIA": -5.0, "SFO": -8.0,
-}
-
-
-def season_for(climate_day: dt.date) -> str:
-    """Standard meteorological season for ``climate_day``'s month."""
-    return _SEASON_BY_MONTH[climate_day.month]
 
 
 def _local_hour(now_ns: int, std_utc_offset_hours: float) -> int:
@@ -174,15 +182,18 @@ class CurrentRungHoldStrategy(Strategy):
         self,
         config: CurrentRungHoldConfig,
         *,
-        trial_day_latch_factory: Callable[[], TrialDayLatch] | None = None,
+        trial_day_latch_factory: Callable[[], AbstractContextManager[TrialDayLatch]]
+        | None = None,
     ) -> None:
         super().__init__(config)
         self._config: CurrentRungHoldConfig = config
         self._latch_factory = trial_day_latch_factory
         self._latch: TrialDayLatch | None = None
+        self._exit_stack: ExitStack | None = None
         self._facts: dict[str, WeatherBucketFacts] = {}
         self._ladders: dict[tuple[str, str], list[tuple[int | None, int | None]]] = {}
         self._accumulators: dict[str, RunningExtremeAccumulator] = {}
+        self._std_utc_offset_hours_by_station: dict[str, float] = {}
         #: PUBLIC -- readable by an operator or a test asking "did this
         #: strategy do nothing, or was it stopped from doing something?"
         #: (mirrors every sibling weather strategy's ``self.refusals``).
@@ -197,7 +208,15 @@ class CurrentRungHoldStrategy(Strategy):
                 "CurrentRungHoldStrategy was constructed with no "
                 "trial_day_latch_factory; see the module docstring."
             )
-        self._latch = self._latch_factory()
+        exit_stack = ExitStack()
+        self._latch = exit_stack.enter_context(self._latch_factory())
+        self._exit_stack = exit_stack
+
+        registry = default_registry()
+        self._std_utc_offset_hours_by_station = {
+            station: registry.climate_day_window(_VENUE, station).std_utc_offset_hours
+            for station in self._config.stations
+        }
 
         for instrument_id in self._config.instrument_ids:
             instrument = self.cache.instrument(instrument_id)
@@ -227,6 +246,22 @@ class CurrentRungHoldStrategy(Strategy):
 
         self.subscribe_data(station_observation_data_type())
 
+    def on_stop(self) -> None:
+        """Close the trial-day latch this strategy owns, unconditionally.
+
+        Runs the ``ExitStack``'s exit path -- the SAME stack ``on_start``
+        entered the latch factory's context manager through -- so a
+        start -> stop -> start cycle (a genuine Nautilus lifecycle, not just
+        a test artefact: engine restarts, live redeploys) releases the
+        underlying flock and re-arms cleanly on the next ``on_start``,
+        rather than leaking a stale hold that would raise
+        ``SubmitIntentLockHeld`` on the re-open.
+        """
+        exit_stack, self._exit_stack = self._exit_stack, None
+        self._latch = None
+        if exit_stack is not None:
+            exit_stack.close()
+
     # ------------------------------------------------------------------
     # Data handlers
     # ------------------------------------------------------------------
@@ -236,7 +271,7 @@ class CurrentRungHoldStrategy(Strategy):
         station = _STATION_BY_ICAO.get(data.station)
         if station is None or station not in self._config.stations:
             return
-        offset = _STD_UTC_OFFSET_HOURS_BY_STATION[station]
+        offset = self._std_utc_offset_hours_by_station[station]
         accumulator = self._accumulators.setdefault(
             station, RunningExtremeAccumulator(std_utc_offset_hours=offset),
         )
@@ -262,13 +297,13 @@ class CurrentRungHoldStrategy(Strategy):
             return  # entry-only halt: this station-day already has its one trial
 
         now_ns = tick.ts_event
-        offset = _STD_UTC_OFFSET_HOURS_BY_STATION[station]
+        offset = self._std_utc_offset_hours_by_station[station]
         hour_lst = _local_hour(now_ns, offset)
         if not (_WINDOW_START_HOUR_LST <= hour_lst < _WINDOW_END_HOUR_LST):
             self.refusals.record(_OUTSIDE_DECISION_WINDOW)
             return
 
-        ask = Decimal(str(tick.ask_price))
+        ask = tick.ask_price.as_decimal()
         size = int(tick.ask_size)
         raw_executable = (
             self._config.executable_ask_lower < ask < self._config.executable_ask_upper
@@ -281,7 +316,16 @@ class CurrentRungHoldStrategy(Strategy):
         running_max = None if accumulator is None else accumulator.value_at(now_ns)
         if running_max is None or accumulator is None:
             return  # no observation yet: not this instrument's decision instant
-        if not facts.contains(running_max.lower_f):
+        # Route to `evaluate_decision` whenever the observation interval
+        # TOUCHES this instrument's rung at either end, not only when its
+        # `lower_f` does -- an interval spanning two instruments (`lower_f`
+        # in a neighbour, `upper_f` in this one) must still reach
+        # `RunningMax.spans` on THIS instrument's tick and be counted
+        # `observation_ambiguous`, never silently skipped as "not yet this
+        # instrument's decision instant".
+        if not (
+            facts.contains(running_max.lower_f) or facts.contains(running_max.upper_f)
+        ):
             return  # this instrument's rung cannot be the current one
 
         if facts.upper_f is None:

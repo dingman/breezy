@@ -19,7 +19,8 @@ handlers, not its subscriptions).
 from __future__ import annotations
 
 import datetime as dt
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
+from contextlib import AbstractContextManager, contextmanager
 from decimal import Decimal
 from pathlib import Path
 
@@ -44,9 +45,14 @@ from breezy.domain.weather_bucket_facts import (
     WEATHER_FACTS_STATUS_KEY,
     WEATHER_FACTS_STATUS_KNOWN,
 )
+from breezy.registry.sites import default_registry
 from breezy.runtime.sqlite_store import SqliteStateStore
-from breezy.runtime.submit_intent import open_submit_intent_latch
-from breezy.strategy.current_rung_hold.config import CurrentRungHoldConfig
+from breezy.runtime.submit_intent import (
+    SubmitIntentLockHeld,
+    SubmitIntentLockNotHeld,
+    open_submit_intent_latch,
+)
+from breezy.strategy.current_rung_hold.config import SUPPORTED_STATIONS, CurrentRungHoldConfig
 from breezy.strategy.current_rung_hold.strategy import (
     CurrentRungHoldStrategy,
     MissingTrialDayLatchError,
@@ -137,25 +143,24 @@ class _Rig:
         self.strategy = strategy
 
 
-def _open_latch_factory(store_path: Path) -> Callable[[], TrialDayLatch]:
-    """Opens a real `SubmitIntentLatch`+`TrialDayLatch` pair, held for the test.
+@contextmanager
+def _open_latch_context(store_path: Path) -> Iterator[TrialDayLatch]:
+    """Opens a real `SubmitIntentLatch`+`TrialDayLatch` pair for the test.
 
-    Returned as a zero-arg factory -- `CurrentRungHoldStrategy.__init__`'s
-    `trial_day_latch_factory` -- rather than a pre-opened instance, so
-    `on_start` controls exactly when the shared store/flock is acquired.
-    The `_GeneratorContextManager` must be kept alive on the returned
-    closure itself: a purely local reference is GC-eligible the moment this
-    function returns, which runs the context manager's `finally` and
-    releases the flock before `on_start` ever calls the factory.
+    `CurrentRungHoldStrategy.__init__`'s `trial_day_latch_factory` is a
+    zero-arg callable returning a context manager yielding a `TrialDayLatch`
+    -- `on_start` enters it through its own `ExitStack` and `on_stop` closes
+    that stack, so the flock's lifetime is owned by the strategy's own
+    lifecycle, never by a GC-pinning trick on the factory closure.
     """
-    context = open_submit_intent_latch(SqliteStateStore(store_path), store_path)
-    intent_latch = context.__enter__()
+    with open_submit_intent_latch(SqliteStateStore(store_path), store_path) as intent_latch:
+        yield open_trial_day_latch(intent_latch)
 
-    def factory() -> TrialDayLatch:
-        return open_trial_day_latch(intent_latch)
 
-    factory._context = context  # type: ignore[attr-defined]  # keep the flock alive
-    return factory
+def _open_latch_factory(
+    store_path: Path,
+) -> Callable[[], AbstractContextManager[TrialDayLatch]]:
+    return lambda: _open_latch_context(store_path)
 
 
 def _register_and_start(
@@ -362,3 +367,117 @@ class TestAskBandEquivalence:
         assert cfg.executable_ask_lower == Decimal("0.05")
         assert cfg.executable_ask_upper == Decimal("0.95")
         assert cfg.minimum_displayed_size == 1
+
+
+class TestRegistryOffset:
+    @pytest.mark.parametrize("station", SUPPORTED_STATIONS)
+    def test_strategys_offset_equals_the_registrys(
+        self, store_path: Path, station: str,
+    ) -> None:
+        instrument = _instrument(
+            InstrumentId(Symbol(f"{station.lower()}-fixture"), Venue("POLYMARKET_US")),
+            lower_f=80, upper_f=81,
+        )
+        rig = _register_and_start(
+            store_path=store_path,
+            instruments=(instrument,),
+            config=CurrentRungHoldConfig(instrument_ids=(instrument.id,), stations=(station,)),
+        )
+        strategy = rig.strategy
+        expected = default_registry().climate_day_window("polymarket_us", station)
+        assert (
+            strategy._std_utc_offset_hours_by_station[station]
+            == expected.std_utc_offset_hours
+        )
+
+
+class TestLatchLifecycle:
+    def test_start_stop_start_rearms_without_a_stale_flock(
+        self, store_path: Path, interior_instrument: BinaryOption,
+    ) -> None:
+        rig = _register_and_start(store_path=store_path, instruments=(interior_instrument,))
+        strategy = rig.strategy
+        latch_after_first_start = strategy._latch
+        assert latch_after_first_start is not None
+        assert latch_after_first_start.is_consumed(STATION, CLIMATE_DAY.isoformat()) is False
+
+        strategy.stop()
+        assert strategy._latch is None
+        with pytest.raises(SubmitIntentLockNotHeld):
+            latch_after_first_start.is_consumed(STATION, CLIMATE_DAY.isoformat())
+
+        # A second `open_submit_intent_latch` over the SAME store path would
+        # raise `SubmitIntentLockHeld` were the first flock still held --
+        # proving `on_stop` genuinely released it, not merely nulled the
+        # strategy's own reference.
+        with open_submit_intent_latch(SqliteStateStore(store_path), store_path):
+            pass
+
+        # Nautilus's own FSM (`ComponentFSMFactory`) has no `STOPPED ->
+        # STARTING` edge -- only `RESUME`/`RESET`/`DISPOSE`/`FAULT` are legal
+        # from `STOPPED` (`nautilus_trader/common/component.pyx`, the state
+        # table). A genuine restart is `reset()` (`STOPPED -> READY`, via
+        # `on_reset`) then `start()` (`READY -> STARTING -> RUNNING`, via
+        # `on_start`) -- the same sequence a live redeploy or engine restart
+        # drives the strategy through.
+        strategy.reset()
+        strategy.start()
+        assert strategy._latch is not None
+        assert strategy._latch is not latch_after_first_start
+        assert strategy._latch.is_consumed(STATION, CLIMATE_DAY.isoformat()) is False
+
+    def test_a_second_concurrent_open_over_the_same_store_is_refused(
+        self, store_path: Path, interior_instrument: BinaryOption,
+    ) -> None:
+        rig = _register_and_start(store_path=store_path, instruments=(interior_instrument,))
+        with (
+            pytest.raises(SubmitIntentLockHeld),
+            open_submit_intent_latch(SqliteStateStore(store_path), store_path),
+        ):
+            pass
+        rig.strategy.stop()
+
+
+class TestSpanningIntervalRouting:
+    def test_an_interval_only_touching_this_instruments_upper_bound_is_counted_ambiguous(
+        self, store_path: Path,
+        interior_instrument: BinaryOption,
+        open_upper_instrument: BinaryOption,
+    ) -> None:
+        """`running_max` = `[85, 86]` -- `lower_f` (85) is OUTSIDE the interior
+        instrument's own facts (`[86, 87]`), but `upper_f` (86) is INSIDE
+        them. The old pre-filter (`facts.contains(running_max.lower_f)`
+        only) would silently skip the interior instrument's tick here --
+        never routing to `evaluate_decision`, never counting a refusal, even
+        though this interval genuinely touches the interior rung and is
+        ambiguous against the two-instrument ladder.
+        """
+        rig = _register_and_start(
+            store_path=store_path,
+            instruments=(interior_instrument, open_upper_instrument),
+        )
+        strategy = rig.strategy
+        # 29.7C rounds to 85F (`round_half_up_f`); 1C precision, non-METAR,
+        # closed-upper interval -> lower_f=85, upper_f=86 (verified via the
+        # accumulator's own published contract in `running_extreme.py`).
+        obs = StationObservation(
+            station=ICAO,
+            observed_at_ns=WINDOW_OPEN_NS - 1,
+            received_at_ns=WINDOW_OPEN_NS,
+            temp_c_tenths=297,
+            precision_c_tenths=10,
+            is_metar=False,
+            source_channel="nws_api_observations",
+            assumed_publication_lag_ns=1,
+        )
+        strategy.on_data(obs)
+        accumulator = strategy._accumulators[STATION]
+        running_max = accumulator.value_at(WINDOW_OPEN_NS)
+        assert running_max is not None and running_max.lower_f == 85 and running_max.upper_f == 86
+
+        quote = _quote(INTERIOR_ID, ask="0.40", ts_event=WINDOW_OPEN_NS)
+        strategy.on_quote_tick(quote)
+        assert strategy.refusals.count("observation_ambiguous") == 1
+        record = strategy._latch.record(STATION, CLIMATE_DAY.isoformat())  # type: ignore[union-attr]
+        assert record is not None
+        assert record.reason == "observation_ambiguous"
