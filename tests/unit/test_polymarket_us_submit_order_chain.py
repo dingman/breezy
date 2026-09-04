@@ -467,23 +467,18 @@ async def test_a_latch_left_open_by_a_prior_crash_refuses_every_submit_until_cle
 
 
 def _find_write_transport_canonical_setattr_sites() -> list[str]:
-    """Files with an AST ``setattr(write_transport, "WRITE_CANONICAL_STRING_VERIFIED", ...)``.
+    """Files with an AST ``setattr(<any target>, "WRITE_CANONICAL_STRING_VERIFIED", ...)``.
 
-    Scoped to the TARGET object, not just the attribute name: the exec chain
-    (``exec/client.py:1507``) and ``order_enablement.py:203`` both read the
-    flag as a bare ``write_transport.WRITE_CANONICAL_STRING_VERIFIED`` module
-    attribute at call time, so patching THAT object is the only thing that
-    can move the real barrier. A test patching a different object's own
-    ``from``-imported local copy (e.g. ``factories_module``'s binding at
-    ``factories.py:102``, read only by the factory's own construction-time
-    wiring at ``:725``) cannot influence the exec chain at all and is
-    deliberately excluded -- narrowing the scan to what the barrier actually
-    means is a widening of legitimate test sites, never a loosening of the
-    barrier itself.
+    Any-target, restored exactly to the original scan shape (L-12: a
+    barrier's scan scope is never narrowed, even when the narrower form
+    "feels" equivalent -- only the allowed-file SET may widen, and only with
+    evidence for each addition). Per-FILE, not per-call, so that this
+    module's two fixtures (``write_canonical_verified`` /
+    ``write_canonical_unverified``) collapse to one entry rather than two.
     """
     hits: list[str] = []
     for path, source in iter_python_sources(("tests",)):
-        if "WRITE_CANONICAL_STRING_VERIFIED" not in source or "setattr" not in source:
+        if "WRITE_CANONICAL_STRING_VERIFIED" not in source:
             continue
         tree = ast.parse(source, filename=path)
         file_hit = False
@@ -492,16 +487,10 @@ def _find_write_transport_canonical_setattr_sites() -> list[str]:
                 continue
             func = node.func
             name = func.attr if isinstance(func, ast.Attribute) else getattr(func, "id", "")
-            if name != "setattr" or len(node.args) < 2:
+            if name != "setattr":
                 continue
-            target = node.args[0]
-            target_name = target.id if isinstance(target, ast.Name) else None
-            attr_arg = node.args[1]
-            attr_literal = attr_arg.value if isinstance(attr_arg, ast.Constant) else None
-            if (
-                target_name == "write_transport"
-                and attr_literal == "WRITE_CANONICAL_STRING_VERIFIED"
-            ):
+            dumped = ast.dump(node)
+            if "WRITE_CANONICAL_STRING_VERIFIED" in dumped:
                 file_hit = True
         if file_hit:
             hits.append(path)
@@ -526,8 +515,13 @@ async def test_no_post_is_reachable_while_the_write_canonical_string_is_unverifi
     assert len(denials) == 1
     assert "canonical" in denials[0].reason.lower()
 
+    # Widened (never loosened): the factories test patches
+    # `factories_module`'s own from-imported binding to prove `order_sender`
+    # wiring in both directions; the `write_transport` attribute itself is
+    # still moved only by this module's two fixtures.
     assert _find_write_transport_canonical_setattr_sites() == [
-        "tests/unit/test_polymarket_us_submit_order_chain.py"
+        "tests/unit/test_polymarket_us_factories.py",
+        "tests/unit/test_polymarket_us_submit_order_chain.py",
     ]
 
 
@@ -814,6 +808,11 @@ def test_no_post_is_reachable_scan_finds_exactly_one_monkeypatch_fixture() -> No
     """Structural half of test 6: one module may setattr the flag the exec
     chain actually reads; a second construction path is refused.
     """
+    # Widened (never loosened): the factories test patches
+    # `factories_module`'s own from-imported binding to prove `order_sender`
+    # wiring in both directions; the `write_transport` attribute itself is
+    # still moved only by this module's two fixtures.
     assert _find_write_transport_canonical_setattr_sites() == [
-        "tests/unit/test_polymarket_us_submit_order_chain.py"
+        "tests/unit/test_polymarket_us_factories.py",
+        "tests/unit/test_polymarket_us_submit_order_chain.py",
     ]
