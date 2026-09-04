@@ -88,6 +88,11 @@ SyslogIdentifier=breezy-quote-tape
 #   0 = clean shutdown, 1 = FATAL market-data fault (fail-closed; commit
 #   79b9b44 exists precisely so a dead feed is not reported as success),
 #   2 = configuration/environment error.
+# Code 1 also covers an INITIAL connect failure (the data client's own
+# `_connect` raising, not just a later feed loss): PolymarketUSDataClient
+# latches the same fatal fault and requests the same native shutdown in
+# that case too, so a dead venue socket at start-up no longer leaves the
+# node "RUNNING" with zero quotes for RestartSec to never trigger on.
 # See src/breezy/runtime/quote_tape_cli.py:52-61 and :145-174.
 
 [Install]

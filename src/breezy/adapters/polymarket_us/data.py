@@ -919,7 +919,27 @@ class PolymarketUSDataClient(LiveMarketDataClient):
         self._send_all_instruments_to_data_engine()
         await self._alert_on_missing_cache_after_push(self._provider_active_slugs())
 
-        await self._feed.connect()
+        try:
+            await self._feed.connect()
+        except Exception as exc:  # noqa: BLE001 - any connect failure is fatal here
+            # Nautilus's own `LiveDataClient.connect()` wrapper
+            # (`live/data_client.py:222-234`) runs `_connect` in a task whose
+            # completion callback (`:190-210`) does nothing on failure but
+            # `self._log.exception(...)`: it never marks the client
+            # connected, never re-raises, and never asks the node to stop.
+            # `NautilusKernel.start_async` then only WARNS on the resulting
+            # connection timeout and returns (`system/kernel.py:1021-1023`,
+            # `:1298-1313`) -- so an unhandled `_connect` failure here would
+            # leave the node "RUNNING" forever, connected to nothing. Reuse
+            # the SAME fatal-fault latch and native shutdown request the
+            # feed-loss watchdog already uses below, from the one place a
+            # connect failure is actually observed.
+            self._safe_mode = True
+            self._set_connected(False)
+            reason = f"Polymarket.us markets feed failed to connect: {exc}"
+            self._request_fatal_shutdown(reason)
+            return
+
         await self._reconcile_discovered_subscriptions(cycle="initial")
 
         self._update_instruments_task = self.create_task(
