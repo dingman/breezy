@@ -16,6 +16,7 @@ from breezy.strategy.current_rung_hold.config import (
     ArchiveTablePinMismatchError,
     CurrentRungHoldConfig,
     InvalidOrderQuantityError,
+    OrdersEnabledNotPermittedError,
     UnsupportedStationError,
 )
 from breezy.strategy.current_rung_hold.decision import (
@@ -25,6 +26,11 @@ from breezy.strategy.current_rung_hold.decision import (
     Refuse,
     Take,
     evaluate_decision,
+)
+from breezy.strategy.current_rung_hold.strategy import (
+    CurrentRungHoldStrategy,
+    MissingTrialDayLatchError,
+    season_for,
 )
 from breezy.strategy.current_rung_hold.trial_day_latch import (
     TrialDayAlreadyConsumed,
@@ -41,9 +47,12 @@ __all__ = [
     "AllowShortNotPermittedError",
     "ArchiveTablePinMismatchError",
     "CurrentRungHoldConfig",
+    "CurrentRungHoldStrategy",
     "Decision",
     "DecisionInputs",
     "InvalidOrderQuantityError",
+    "MissingTrialDayLatchError",
+    "OrdersEnabledNotPermittedError",
     "Refuse",
     "Take",
     "TrialDayAlreadyConsumed",
@@ -55,4 +64,5 @@ __all__ = [
     "UnsupportedStationError",
     "evaluate_decision",
     "open_trial_day_latch",
+    "season_for",
 ]

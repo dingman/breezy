@@ -56,6 +56,7 @@ from __future__ import annotations
 from decimal import Decimal
 from typing import Final
 
+from nautilus_trader.model.identifiers import InstrumentId
 from nautilus_trader.trading.config import StrategyConfig
 
 from breezy.strategy.current_rung_hold.archive_table import CORPUS_SHA256
@@ -66,6 +67,7 @@ __all__ = [
     "ArchiveTablePinMismatchError",
     "CurrentRungHoldConfig",
     "InvalidOrderQuantityError",
+    "OrdersEnabledNotPermittedError",
     "UnsupportedStationError",
 ]
 
@@ -106,6 +108,21 @@ class AllowShortNotPermittedError(ValueError):
     this one refuses the flip outright -- see L-22 in
     ``docs/core/LESSONS.md``: a safety primitive's exclusion must be
     unforgeable, not merely offered as a default.
+    """
+
+
+class OrdersEnabledNotPermittedError(ValueError):
+    """Raised when ``orders_enabled`` is constructed ``True``.
+
+    NO ORDER may be submittable from this increment: the strategy's order
+    path (``strategy.py``'s ``_maybe_submit``) ends at a ``Take`` decision
+    recorded to the trial-day latch, and reaches ``submit_order`` only when
+    ``orders_enabled`` is ``True`` -- the same L-22 unforgeable-exclusion
+    shape as :class:`AllowShortNotPermittedError`: refusing the flip at
+    construction, not merely defaulting it off, so no call site can silently
+    enable submission by passing ``orders_enabled=True``. A later increment
+    (blueprint build order step 8, operator-only enablement) is what may one
+    day construct this ``True``; this increment never does.
     """
 
 
@@ -176,6 +193,10 @@ class CurrentRungHoldConfig(StrategyConfig, frozen=True):
     docstring's "NOT operator controls" section.
     """
 
+    #: Every weather-bucket market this strategy instance may trade. Empty
+    #: by default (no wired call site yet, build order step 6, zero call
+    #: sites) -- see ``strategy.py``'s ``on_start``.
+    instrument_ids: tuple[InstrumentId, ...] = ()
     stations: tuple[str, ...] = ("LAX", "MDW", "MIA", "SFO")
     stale_observation_hours: float = 0.75
     required_fee_coefficient: Decimal = Decimal("0.06")
@@ -187,6 +208,9 @@ class CurrentRungHoldConfig(StrategyConfig, frozen=True):
     archive_table_pin: str = CORPUS_SHA256
     #: Fixed. See the field's docstring above.
     entry_only_halt: bool = True
+    #: Must stay ``False`` in this increment; constructing ``True`` raises
+    #: :class:`OrdersEnabledNotPermittedError`. See that error's docstring.
+    orders_enabled: bool = False
 
     def __post_init__(self) -> None:
         unsupported = [station for station in self.stations if station not in SUPPORTED_STATIONS]
@@ -209,4 +233,9 @@ class CurrentRungHoldConfig(StrategyConfig, frozen=True):
             raise ArchiveTablePinMismatchError(
                 "archive_table_pin must equal archive_table.CORPUS_SHA256 "
                 f"({CORPUS_SHA256!r}), was {self.archive_table_pin!r}"
+            )
+        if self.orders_enabled:
+            raise OrdersEnabledNotPermittedError(
+                "orders_enabled must stay False in this increment; no order is "
+                "submittable yet (see the error's docstring)"
             )

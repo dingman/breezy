@@ -21,7 +21,7 @@ build order step 5, refined by this increment's dispatch brief):
    ``config.stale_observation_hours`` -> ``observation_unavailable``.
 4. ``RunningMax.spans(ladder)`` -- the observation interval cannot be
    resolved to one rung -> ``observation_ambiguous`` (never rounded, never
-   midpointed -- L-17).
+   midpointed -- A13 (spec rev2 §1b)).
 5. the CURRENT rung is whichever ladder rung contains the whole
    ``[lower_f, upper_f]`` interval (well-defined once step 4 has passed).
    This step never refuses on its own; it only names the rung a ``Take``
@@ -126,6 +126,15 @@ REFUSAL_REASONS: Final[frozenset[str]] = frozenset(
         "not_executable",
         "p_hold_undefined",
         "edge_below_break_even",
+        # Strategy-layer reason (``strategy.py``, build order step 6): a
+        # quote arriving outside the pinned ``[12:00,17:00)`` LST decision
+        # window. NOT emitted by ``evaluate_decision`` itself (the window
+        # check runs in the caller, before this function is ever invoked for
+        # that quote) -- widened here, not emitted here, so the trial-day
+        # latch's closed reason set and the shared refusal vocabulary stay
+        # ONE set across both layers, exactly as ``observation_ambiguous``
+        # already does for ``RiskManager``.
+        "outside_decision_window",
     }
 )
 

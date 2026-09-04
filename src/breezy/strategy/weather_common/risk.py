@@ -141,6 +141,11 @@ COUNTED_REFUSAL_REASONS: Final[frozenset[str]] = frozenset(
         # this module -- counted here so both counters share one fixed,
         # finite reason set.
         "edge_below_break_even",
+        # Strategy-layer reason (`current_rung_hold/strategy.py`): a quote
+        # outside the pinned `[12:00,17:00)` LST decision window. No
+        # analogue in this module or in `evaluate_decision` -- counted here
+        # so every layer's counter shares one fixed, finite reason set.
+        "outside_decision_window",
         "future_signal",
         "observation_limit_unset",
         "edge_below_minimum",

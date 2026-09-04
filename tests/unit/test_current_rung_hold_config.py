@@ -117,3 +117,15 @@ def test_config_has_no_operator_reserved_field_name() -> None:
         "operator's own reserved control surface at runtime, never a "
         "config field"
     )
+
+
+def test_orders_enabled_true_is_refused() -> None:
+    from breezy.strategy.current_rung_hold.config import OrdersEnabledNotPermittedError
+
+    with pytest.raises(OrdersEnabledNotPermittedError):
+        CurrentRungHoldConfig(orders_enabled=True)
+
+
+def test_orders_enabled_defaults_false() -> None:
+    config = CurrentRungHoldConfig()
+    assert config.orders_enabled is False

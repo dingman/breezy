@@ -89,6 +89,11 @@ def test_refusal_reasons_is_the_closed_set_from_the_brief() -> None:
             "not_executable",
             "p_hold_undefined",
             "edge_below_break_even",
+            # Strategy-layer reason (`strategy.py`, build order step 6):
+            # widened here (never emitted by `evaluate_decision` itself) so
+            # the trial-day latch's closed reason set covers it too -- see
+            # `decision.py`'s `REFUSAL_REASONS` comment.
+            "outside_decision_window",
         }
     )
 
