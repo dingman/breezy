@@ -121,6 +121,8 @@ from tests.conftest import (
 from tests.unit.test_polymarket_us_readonly_guard import (
     Violation,
     _imported_module_strings,
+    find_barred_callers,
+    find_write_egress_violations,
     is_venue_touching,
     iter_python_sources,
 )
@@ -169,7 +171,16 @@ _REACHED_TEXTS = (
 #: which E3 sees, and only one of which E2 would classify. ``endpoints.py``,
 #: the single module that will hold every venue order-path literal, matched
 #: NO rule before E0 existed.
-_EGRESS_PATH_PREFIXES = ("src/breezy/adapters/polymarket_us/exec/",)
+#: Old -> new (S1, KALSHI_CRH_EXPANSION_PLAN_2026-09-04 S1'): one prefix ->
+#: two. A future ``src/breezy/adapters/kalshi/exec/`` module must be an E0
+#: egress surface from before it exists, exactly like its Polymarket sibling.
+#: Pinned in ``test_cage_rule_constants_are_pinned.py``; its
+#: ``expected``/``widened``/``narrowed`` fixtures are updated in the same
+#: commit.
+_EGRESS_PATH_PREFIXES = (
+    "src/breezy/adapters/polymarket_us/exec/",
+    "src/breezy/adapters/kalshi/exec/",
+)
 
 #: Module basenames that constitute an execution-egress surface (E1).
 _EGRESS_MODULE_BASENAMES = frozenset(
@@ -512,11 +523,15 @@ def find_execution_egress_modules(
 
     Delegates to :func:`_scan_source`, which is the single implementation of
     rules E0-E3 -- so the ``*_detects_*`` proofs below exercise the very code
-    this live scan runs, not a second copy of it.
+    this live scan runs, not a second copy of it. E2 is passed the repo-wide
+    transitive base-name closure (:func:`egress_reaching_class_names`), so a
+    class need not name a Nautilus base directly to be caught -- only reach
+    one through another class defined anywhere else under ``roots``.
     """
+    closure = egress_reaching_class_names(roots)
     found: list[Violation] = []
     for path, source in iter_python_sources(roots):
-        found.extend(_scan_source(path, source))
+        found.extend(_scan_source(path, source, egress_class_bases=closure))
     return found
 
 
@@ -754,7 +769,64 @@ def test_n2_scan_covers_both_src_and_scripts() -> None:
     assert any(p.startswith("scripts/") for p in scanned)
 
 
-def _scan_source(path: str, source: str) -> list[Violation]:
+def _class_base_names(node: ast.ClassDef) -> set[str]:
+    """Immediate base names of ``node``, by identifier only (no imports)."""
+    return {
+        base.attr if isinstance(base, ast.Attribute) else getattr(base, "id", "")
+        for base in node.bases
+    } - {""}
+
+
+def _collect_class_bases(roots: tuple[str, ...] = EGRESS_SCAN_ROOTS) -> dict[str, set[str]]:
+    """Map every class NAME defined under ``roots`` to its immediate base
+    names, repo-wide. Pure AST, no imports -- the same discipline E2 already
+    uses for a single file, just gathered across every scanned module so a
+    base defined in one file can be resolved against a subclass in another.
+    """
+    bases_by_class: dict[str, set[str]] = {}
+    for path, source in iter_python_sources(roots):
+        try:
+            tree = ast.parse(source, filename=path)
+        except SyntaxError:  # pragma: no cover - defensive, mirrors _scan_source
+            continue
+        for node in ast.walk(tree):
+            if isinstance(node, ast.ClassDef):
+                bases_by_class.setdefault(node.name, set()).update(_class_base_names(node))
+    return bases_by_class
+
+
+def egress_reaching_class_names(roots: tuple[str, ...] = EGRESS_SCAN_ROOTS) -> frozenset[str]:
+    """E2, widened from immediate bases to a repo-wide transitive closure.
+
+    Old: ``_scan_source`` checked only ``node.bases`` within the ONE file
+    being scanned, so a Kalshi client subclassing a Breezy intermediate that
+    itself subclasses ``LiveExecutionClient`` was invisible -- the
+    intermediate's own base never crossed the file boundary.
+
+    New: a fixpoint over a repo-wide class-name -> base-names graph. Any
+    class whose base chain (by NAME, transitively, across every file under
+    ``roots``) reaches one of ``_EGRESS_CLASS_BASES`` is added to the
+    returned set, which ``_scan_source`` then checks in ADDITION to the
+    original constant -- a pure widening, never a replacement.
+    """
+    bases_by_class = _collect_class_bases(roots)
+    reaching: set[str] = set(_EGRESS_CLASS_BASES)
+    changed = True
+    while changed:
+        changed = False
+        for cls, bases in bases_by_class.items():
+            if cls not in reaching and bases & reaching:
+                reaching.add(cls)
+                changed = True
+    return frozenset(reaching)
+
+
+def _scan_source(
+    path: str,
+    source: str,
+    *,
+    egress_class_bases: frozenset[str] = frozenset(_EGRESS_CLASS_BASES),
+) -> list[Violation]:
     """Apply rules E0-E3 to ONE module. The single implementation.
 
     Four rules, all syntactic:
@@ -767,7 +839,13 @@ def _scan_source(path: str, source: str) -> list[Violation]:
             module is venue-touching (C1-C4 from the read-only guard), so a
             generic ``orders.py`` in a non-venue package does not fire;
       E2 -- it defines a class whose name ends with an execution-client
-            suffix, or that subclasses a Nautilus live-execution base;
+            suffix, or whose base chain reaches a Nautilus live-execution
+            base. ``egress_class_bases`` defaults to the direct
+            ``_EGRESS_CLASS_BASES`` set (this function's original,
+            single-file behaviour); :func:`find_execution_egress_modules`
+            passes the repo-wide transitive closure from
+            :func:`egress_reaching_class_names` instead, so the live scan
+            catches a subclass of a subclass across files;
       E3 -- it is venue-touching and defines a function whose name is an
             order-lifecycle verb, in either its bare or its underscored form.
     """
@@ -787,7 +865,7 @@ def _scan_source(path: str, source: str) -> list[Violation]:
                 continue
             for base in node.bases:
                 name = base.attr if isinstance(base, ast.Attribute) else getattr(base, "id", "")
-                if name in _EGRESS_CLASS_BASES:
+                if name in egress_class_bases:
                     found.append(Violation(path, node.lineno, "E2", f"class {node.name}({name})"))
         elif venue and isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef):
             if node.name in _EGRESS_FUNCTION_NAMES:
@@ -2611,3 +2689,108 @@ def test_x1_the_reach_detector_is_the_same_predicate_the_rule_uses() -> None:
     unrelated = _PLANTED_MARKED_TEST_OUTSIDE_THE_EXEC_PACKAGE
     assert not _imports_exec_package(ast.parse(unrelated))
     assert find_exec_test_marker_violations("tests/live/t.py", unrelated) == []
+
+
+# ==========================================================================
+# S1 (KALSHI_CRH_EXPANSION_PLAN_2026-09-04, S1') -- Kalshi widening
+# non-vacuity: E0 path prefix, E2 MRO closure, and the combined B4/B6/E1/E3
+# proof for a non-listed basename. WIDENING ONLY.
+# ==========================================================================
+
+
+def test_kalshi_e0_classifies_a_module_under_the_kalshi_exec_package_by_path() -> None:
+    """Old -> new: ``_EGRESS_PATH_PREFIXES`` gained
+    ``src/breezy/adapters/kalshi/exec/`` alongside the Polymarket entry."""
+    source = '"""Docstring only."""\n'
+    violations = _scan_source("src/breezy/adapters/kalshi/exec/transport.py", source)
+    assert [v.rule for v in violations] == ["E0"]
+
+
+def test_kalshi_e0_does_not_fire_outside_the_kalshi_exec_package() -> None:
+    """Non-vacuity: the same source one directory up is not classified."""
+    source = '"""Docstring only."""\n'
+    assert _scan_source("src/breezy/adapters/kalshi/transport.py", source) == []
+
+
+#: Item 4(a): a NON-listed E1 basename under the new Kalshi exec prefix, with
+#: a write verb (B4), a barred-callee call (B6), and an underscored order
+#: verb (E3) -- mirroring how the shipped ``exec/client.py`` (also not a
+#: listed E1 basename) is caught today by path/class/function, never by name.
+_KALSHI_NON_LISTED_BASENAME_PATH = "src/breezy/adapters/kalshi/exec/zz_not_listed_basename.py"
+_KALSHI_NON_LISTED_BASENAME_SOURCE = (
+    "import httpx\n"
+    "\n"
+    "\n"
+    "def _submit_order(order):\n"
+    "    assert_live_order_submission_permitted()\n"
+    "    return httpx.post(\n"
+    "        'https://api.elections.kalshi.com/trade-api/v2/orders', json=order\n"
+    "    )\n"
+)
+
+
+def test_kalshi_non_listed_basename_module_fails_b4_b6_e1_e3_like_its_pm_twin() -> None:
+    path = _KALSHI_NON_LISTED_BASENAME_PATH
+    source = _KALSHI_NON_LISTED_BASENAME_SOURCE
+    assert Path(path).name not in _EGRESS_MODULE_BASENAMES
+
+    tree = ast.parse(source, filename=path)
+    assert is_venue_touching(path, tree) is True
+
+    b4 = find_write_egress_violations(path, source)
+    assert b4 != []
+    assert {"V1", "V3"} & {v.rule for v in b4}
+
+    b6 = find_barred_callers(path, source)
+    assert [v.rule for v in b6] == ["B6"]
+
+    scanned = {v.rule for v in _scan_source(path, source)}
+    assert "E0" in scanned  # path prefix, unconditional
+    assert "E1" not in scanned  # non-listed basename -- proves it isn't basename-driven
+    assert "E3" in scanned  # underscored order verb on a venue-touching module
+
+
+def test_e2_mro_widened_from_immediate_bases_to_a_repo_wide_transitive_closure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Item 4(c): ``BreezyIntermediate(LiveExecutionClient)`` lives in one
+    file; ``class X(BreezyIntermediate)`` lives in another. The OLD
+    single-file immediate-bases check saw only ``BreezyIntermediate`` as
+    ``X``'s base -- never ``LiveExecutionClient`` -- so ``X`` was invisible.
+    The widened closure catches it.
+
+    ``REPO_ROOT`` is monkeypatched on the READONLY guard module, mirroring
+    ``test_b9_named_call_sites_is_not_vacuous_against_a_planted_second_caller``:
+    :func:`iter_python_sources` (and this module's :func:`_collect_class_bases`,
+    which calls it) resolve every root as ``REPO_ROOT / root`` against the
+    module where ``REPO_ROOT`` is looked up, which is the readonly guard.
+    """
+    src = tmp_path / "src"
+    src.mkdir()
+    (src / "intermediate.py").write_text(
+        "class BreezyIntermediate(LiveExecutionClient):\n    pass\n"
+    )
+    (src / "leaf.py").write_text("class X(BreezyIntermediate):\n    pass\n")
+
+    monkeypatch.setattr("tests.unit.test_polymarket_us_readonly_guard.REPO_ROOT", tmp_path)
+
+    found = find_execution_egress_modules(roots=("src",))
+    e2_hits = {(v.path, v.rule) for v in found}
+    assert ("src/leaf.py", "E2") in e2_hits
+    assert ("src/intermediate.py", "E2") in e2_hits
+
+
+def test_e2_mro_closure_is_additive_not_a_replacement() -> None:
+    """The direct suffix/base rule still fires with the default (non-closure)
+    ``egress_class_bases`` -- the closure widens ``find_execution_egress_
+    modules``'s live scan, it does not change ``_scan_source``'s own default."""
+    source = (
+        "from nautilus_trader.live.execution_client import LiveExecutionClient\n"
+        "\n"
+        "\n"
+        "class PolymarketUSExecClient(LiveExecutionClient):\n"
+        "    pass\n"
+    )
+    rules = {v.rule for v in _scan_source("src/breezy/whatever.py", source)}
+    assert "E2" in rules

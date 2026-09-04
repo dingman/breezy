@@ -150,11 +150,16 @@ CAGE_RULE_PINS: tuple[RulePin, ...] = (
     RulePin(
         module="readonly",
         attr="_VENUE_NAME_RE",
-        expected=re.compile(r"polymarket", re.IGNORECASE),
-        widened=re.compile(r"polymarket|kalshi", re.IGNORECASE),
+        # Old -> new (S1, KALSHI_CRH_EXPANSION_PLAN_2026-09-04 S1'):
+        # `r"polymarket"` -> `r"polymarket|kalshi"`. The widened/narrowed
+        # neighbours below are re-chosen so they stay distinct from the new
+        # `expected` in both directions.
+        expected=re.compile(r"polymarket|kalshi", re.IGNORECASE),
+        widened=re.compile(r"polymarket|kalshi|elections", re.IGNORECASE),
         narrowed=re.compile(r"polymarket"),
-        why="C5 (NS-2): classifies a module that names the venue without "
-        "naming its host -- the environment-driven escape",
+        why="C5 (NS-2, widened S1'): classifies a module that names the "
+        "venue without naming its host -- the environment-driven escape -- "
+        "for either Polymarket or Kalshi",
     ),
     RulePin(
         module="readonly",
@@ -207,15 +212,23 @@ CAGE_RULE_PINS: tuple[RulePin, ...] = (
     RulePin(
         module="firewall",
         attr="_EGRESS_PATH_PREFIXES",
-        expected=("src/breezy/adapters/polymarket_us/exec/",),
+        # Old -> new (S1, KALSHI_CRH_EXPANSION_PLAN_2026-09-04 S1'): one
+        # entry -> two (Kalshi's exec/ prefix added). The widened neighbour
+        # is re-chosen so it stays distinct from the new `expected`.
+        expected=(
+            "src/breezy/adapters/polymarket_us/exec/",
+            "src/breezy/adapters/kalshi/exec/",
+        ),
         widened=(
             "src/breezy/adapters/polymarket_us/exec/",
+            "src/breezy/adapters/kalshi/exec/",
             "src/breezy/adapters/polymarket_us/order/",
         ),
         narrowed=(),
-        why="E0, added by NS-0 AFTER the plan enumerated its nine constants. "
-        "Emptying it disarms the whole exec/ classification and, with it, "
-        "the sessionstart abort",
+        why="E0, added by NS-0 AFTER the plan enumerated its nine constants, "
+        "widened by S1' to add Kalshi's exec/ prefix before any file exists "
+        "under it. Emptying it disarms the whole exec/ classification and, "
+        "with it, the sessionstart abort",
     ),
     RulePin(
         module="firewall",

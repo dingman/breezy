@@ -171,6 +171,15 @@ SDK_IMPORT_ORACLE = "tests/unit/test_polymarket_us_signing.py"
 #: First dotted segment of the venue SDK distribution's import package.
 SDK_ROOT_PACKAGE = "polymarket_us"
 
+#: First dotted segment(s) of Kalshi's SDK/client distribution import
+#: package (S1, KALSHI_CRH_EXPANSION_PLAN_2026-09-04 S1'). ANY of these puts
+#: a module on the SDK-import surface (C4), same discipline as
+#: ``SDK_ROOT_PACKAGE`` above -- a pure addition, the Polymarket root is
+#: untouched. ``kalshi-python`` is the PyPI distribution name; its import
+#: package is ``kalshi_python``. ``kalshi`` is covered too in case a future
+#: distribution ships a bare top-level package of that name.
+KALSHI_SDK_ROOT_PACKAGES: frozenset[str] = frozenset({"kalshi", "kalshi_python"})
+
 _WRITE_METHODS = frozenset({"POST", "PUT", "PATCH", "DELETE"})
 _WRITE_ATTRS = frozenset({"post", "put", "patch", "delete", "request"})
 #: V5 -- module-level free functions in ``nautilus_trader.core.nautilus_pyo3``
@@ -192,8 +201,14 @@ _WRITE_ATTRS = frozenset({"post", "put", "patch", "delete", "request"})
 #: free-function form to evade through, so none is pinned here.
 _WRITE_FUNCTIONS = frozenset({"http_post", "http_patch", "http_delete"})
 _ORDER_PATH_RE = re.compile(r"/v\d+/orders?\b", re.IGNORECASE)
+#: C3 (Kalshi widening, S1'): old -- Polymarket's two origins only. New --
+#: Kalshi's API hosts added (``api.elections.kalshi.com`` is the host
+#: verified live against ``scripts/analysis/k1_kalshi_prior.py:213``;
+#: ``trading-api.kalshi.com`` and a bare ``kalshi.com`` are covered too, per
+#: docs/plans/KALSHI_CRH_EXPANSION_PLAN_2026-09-04.md).
 _VENUE_HOST_RE = re.compile(
-    r"\b(?:api|gateway)\.polymarket\.us\b|\bpolymarketexchange\.com\b",
+    r"\b(?:api|gateway)\.polymarket\.us\b|\bpolymarketexchange\.com\b"
+    r"|\b(?:api\.elections|trading-api)\.kalshi\.com\b|\bkalshi\.com\b",
     re.IGNORECASE,
 )
 #: C5 -- the venue's NAME anywhere in a string constant. Deliberately broader
@@ -201,8 +216,17 @@ _VENUE_HOST_RE = re.compile(
 #: (``POLYMARKET_US_API_BASE_URL``) and a venue-id string, not just an origin.
 #: Broad classification is the safe direction -- it only ever puts MORE modules
 #: under the write-verb rules.
-_VENUE_NAME_RE = re.compile(r"polymarket", re.IGNORECASE)
+#:
+#: Old -> new (S1'): ``r"polymarket"`` -> ``r"polymarket|kalshi"``. Pinned in
+#: ``test_cage_rule_constants_are_pinned.py`` -- its ``expected``/``widened``/
+#: ``narrowed`` fixtures are updated in the same commit.
+_VENUE_NAME_RE = re.compile(r"polymarket|kalshi", re.IGNORECASE)
 _ADAPTER_PACKAGE = "breezy.adapters.polymarket_us"
+#: C1/C4 (Kalshi widening, S1'): the Kalshi adapter package, mirroring
+#: ``_ADAPTER_PACKAGE`` above. A pure addition -- the Polymarket constant and
+#: its checks are untouched.
+_KALSHI_ADAPTER_PACKAGE = "breezy.adapters.kalshi"
+_KALSHI_ADAPTER_PATH_PREFIX = "src/breezy/adapters/kalshi/"
 
 #: C6 -- names that put a module on the pyo3 HTTP-client surface even when
 #: it names no venue host, venue string, SDK import, or adapter path: a
@@ -301,24 +325,32 @@ def _imported_module_strings(tree: ast.AST) -> Iterator[str]:
 
 
 def is_venue_touching(path: str, tree: ast.AST) -> bool:
-    """Return True when ``path`` may sit on a Polymarket.us egress path."""
+    """Return True when ``path`` may sit on a Polymarket.us OR Kalshi egress
+    path (S1'). Old -> new: every branch below gained a Kalshi equivalent
+    alongside its Polymarket check; no Polymarket branch was narrowed."""
     if path.startswith("src/breezy/adapters/polymarket_us/"):
         return True  # C1
+    if path.startswith(_KALSHI_ADAPTER_PATH_PREFIX):
+        return True  # C1 (Kalshi)
     if any(path.startswith(prefix) for prefix in VENUE_TOUCHING_SCRIPT_PREFIXES):
         return True  # C2
     for node in ast.walk(tree):
         if not isinstance(node, ast.Constant) or not isinstance(node.value, str):
             continue
         if _VENUE_HOST_RE.search(node.value):
-            return True  # C3
+            return True  # C3 (widened: Polymarket + Kalshi hosts)
         if _VENUE_NAME_RE.search(node.value):
-            return True  # C5
+            return True  # C5 (widened: Polymarket + Kalshi names)
     for module in _imported_module_strings(tree):
         segments = module.split(".")
         if segments[0] == SDK_ROOT_PACKAGE:
             return True  # C4
+        if segments[0] in KALSHI_SDK_ROOT_PACKAGES:
+            return True  # C4 (Kalshi)
         if module == _ADAPTER_PACKAGE or module.startswith(_ADAPTER_PACKAGE + "."):
             return True  # C4
+        if module == _KALSHI_ADAPTER_PACKAGE or module.startswith(_KALSHI_ADAPTER_PACKAGE + "."):
+            return True  # C4 (Kalshi)
     for node in ast.walk(tree):
         if isinstance(node, ast.Name) and node.id in _HTTP_CLIENT_SURFACE_NAMES:
             return True  # C6
@@ -578,13 +610,17 @@ def find_sdk_import_violations(path: str, source: str) -> list[Violation]:
     for node in ast.walk(tree):
         if isinstance(node, ast.Import):
             for alias in node.names:
-                if alias.name.split(".")[0] == SDK_ROOT_PACKAGE:
+                root = alias.name.split(".")[0]
+                if root == SDK_ROOT_PACKAGE or root in KALSHI_SDK_ROOT_PACKAGES:
                     found.append(Violation(path, node.lineno, "B5", f"import {alias.name}"))
         elif (
             isinstance(node, ast.ImportFrom)
             and node.level == 0
             and node.module
-            and node.module.split(".")[0] == SDK_ROOT_PACKAGE
+            and (
+                node.module.split(".")[0] == SDK_ROOT_PACKAGE
+                or node.module.split(".")[0] in KALSHI_SDK_ROOT_PACKAGES
+            )
         ):
             names = ", ".join(alias.name for alias in node.names)
             found.append(Violation(path, node.lineno, "B5", f"from {node.module} import {names}"))
@@ -878,7 +914,9 @@ def test_c5_the_planted_module_matches_none_of_c1_to_c4() -> None:
     assert hosts == []  # C3
     for module in _imported_module_strings(tree):
         assert module.split(".")[0] != SDK_ROOT_PACKAGE  # C4
+        assert module.split(".")[0] not in KALSHI_SDK_ROOT_PACKAGES  # C4 (Kalshi)
         assert not module.startswith(_ADAPTER_PACKAGE)  # C4
+        assert not module.startswith(_KALSHI_ADAPTER_PACKAGE)  # C4 (Kalshi)
 
 
 def test_c5_makes_the_write_verb_rules_apply_to_the_planted_module() -> None:
@@ -1203,7 +1241,9 @@ def test_c6_the_planted_helper_matches_none_of_c1_to_c5() -> None:
             assert not _VENUE_NAME_RE.search(node.value)  # C5
     for module in _imported_module_strings(tree):
         assert module.split(".")[0] != SDK_ROOT_PACKAGE  # C4
+        assert module.split(".")[0] not in KALSHI_SDK_ROOT_PACKAGES  # C4 (Kalshi)
         assert not module.startswith(_ADAPTER_PACKAGE)  # C4
+        assert not module.startswith(_KALSHI_ADAPTER_PACKAGE)  # C4 (Kalshi)
 
 
 def test_c6_makes_the_write_verb_rule_apply_to_the_planted_helper() -> None:
@@ -2105,3 +2145,90 @@ def test_s16_permits_get_value_outside_an_assert() -> None:
     )
     path = "src/breezy/adapters/polymarket_us/credentials.py"
     assert find_get_value_in_assert(path, source) == []
+
+
+# ==========================================================================
+# S1 (KALSHI_CRH_EXPANSION_PLAN_2026-09-04, S1') -- Kalshi equivalents for
+# C1/C3/C4/C5. WIDENING ONLY: every case below that is already True for a
+# Polymarket signal must remain True (asserted directly); Kalshi signals are
+# NEW True cases that were False before this commit.
+# ==========================================================================
+
+
+def test_kalshi_c1_path_is_venue_touching() -> None:
+    """C1 (Kalshi): old -- only ``adapters/polymarket_us/`` was path-True.
+    New -- ``adapters/kalshi/`` is path-True too."""
+    tree = ast.parse("x = 1\n")
+    assert is_venue_touching("src/breezy/adapters/kalshi/exec/client.py", tree) is True
+
+
+def test_kalshi_c3_host_is_venue_touching() -> None:
+    """C3 (Kalshi): old -- only the two Polymarket origins matched
+    ``_VENUE_HOST_RE``. New -- Kalshi's API hosts match too."""
+    for host in (
+        "https://api.elections.kalshi.com/trade-api/v2",
+        "https://trading-api.kalshi.com/trade-api/v2",
+        "https://kalshi.com/markets",
+    ):
+        tree = ast.parse(f'BASE = "{host}"\n')
+        assert is_venue_touching("src/breezy/somewhere.py", tree) is True, host
+
+
+def test_kalshi_c4_sdk_import_is_venue_touching() -> None:
+    """C4 (Kalshi): old -- only ``SDK_ROOT_PACKAGE`` (``polymarket_us``)
+    tripped the SDK-import branch. New -- either Kalshi SDK root package
+    name does too."""
+    for pkg in sorted(KALSHI_SDK_ROOT_PACKAGES):
+        tree = ast.parse(f"import {pkg}\n")
+        assert is_venue_touching("src/breezy/somewhere_else.py", tree) is True, pkg
+        tree_from = ast.parse(f"from {pkg}.auth import sign\n")
+        assert is_venue_touching("src/breezy/somewhere_else.py", tree_from) is True, pkg
+
+
+def test_kalshi_c5_name_is_venue_touching() -> None:
+    """C5 (Kalshi): old -- ``_VENUE_NAME_RE`` matched only ``polymarket``.
+    New -- ``kalshi``, case-insensitive, matches too."""
+    for text in ("Kalshi settlement", "KALSHI", "the kalshi venue"):
+        tree = ast.parse(f'NOTE = "{text}"\n')
+        assert is_venue_touching("src/breezy/somewhere_third.py", tree) is True, text
+
+
+def test_kalshi_c4_import_only_signal_module_outside_adapters_is_venue_touching() -> None:
+    """Non-vacuity item 4(b): the ONLY signal is ``import kalshi`` -- no
+    path, host, or name-string hit -- and it must still classify True."""
+    path = "src/breezy/ingest/kalshi_signal_only.py"
+    source = "import kalshi\n\n\ndef noop():\n    return None\n"
+    tree = ast.parse(source, filename=path)
+    assert not path.startswith("src/breezy/adapters/kalshi/")  # C1 miss
+    assert not path.startswith("src/breezy/adapters/polymarket_us/")  # C1 miss
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Constant) and isinstance(node.value, str):
+            assert not _VENUE_HOST_RE.search(node.value)  # C3 miss
+            assert not _VENUE_NAME_RE.search(node.value)  # C5 miss
+    assert is_venue_touching(path, tree) is True  # via C4 only
+
+
+def test_every_polymarket_classification_case_is_unchanged_by_the_kalshi_widening() -> None:
+    """Every existing Polymarket-only case keeps its current classification."""
+    cases = [
+        ("src/breezy/adapters/polymarket_us/anything.py", "x = 1\n", True),
+        ("scripts/venue/smoke.py", "x = 1\n", True),
+        ("scripts/probes/whatever.py", "x = 1\n", True),
+        ("src/breezy/x.py", 'B = "https://api.polymarket.us"\n', True),
+        ("src/breezy/x.py", "import polymarket_us.auth\n", True),
+        ("src/breezy/x.py", 'N = "Polymarket"\n', True),
+        ("src/breezy/runtime/health.py", "x = 1\n", False),
+    ]
+    for path, source, expected in cases:
+        tree = ast.parse(source, filename=path)
+        assert is_venue_touching(path, tree) is expected, path
+
+
+def test_kalshi_sdk_import_trips_b5_at_every_consumption_site() -> None:
+    """B5 (Kalshi): find_sdk_import_violations widened alongside C4."""
+    for pkg in sorted(KALSHI_SDK_ROOT_PACKAGES):
+        assert find_sdk_import_violations("scripts/venue/smoke.py", f"import {pkg}\n") != [], pkg
+        assert (
+            find_sdk_import_violations("scripts/venue/smoke.py", f"from {pkg}.auth import sign\n")
+            != []
+        ), pkg
