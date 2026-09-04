@@ -20,6 +20,7 @@ from breezy.settlement import roi_bound
 from breezy.settlement.exit_guard import EXCLUSION_FRACTION_CEILING
 from breezy.settlement.roi_bound import (
     ROIBound,
+    ROIBoundDegenerate,
     ROIBoundRefused,
     ROIBoundUnderpowered,
     ROIInputRow,
@@ -196,6 +197,93 @@ def test_differential_against_a_reference_bca_implementation_within_tolerance() 
 
 
 # ---------------------------------------------------------------------------
+# Degenerate samples: all-wins, all-losses, zero-variance pnl
+# ---------------------------------------------------------------------------
+
+
+def test_all_wins_sample_returns_degenerate_not_a_nan_bound() -> None:
+    rows = [ROIInputRow(pnl=Decimal(1), cost=Decimal(1), excluded_reason=None) for _ in range(40)]
+
+    result = compute_roi_bound(rows)
+
+    assert isinstance(result, ROIBoundDegenerate)
+    assert result.n == 40
+    assert not isinstance(result, ROIBound)
+
+
+def test_all_losses_sample_returns_degenerate_not_a_nan_bound() -> None:
+    rows = [ROIInputRow(pnl=Decimal(-1), cost=Decimal(1), excluded_reason=None) for _ in range(40)]
+
+    result = compute_roi_bound(rows)
+
+    assert isinstance(result, ROIBoundDegenerate)
+    assert result.n == 40
+
+
+def test_identical_pnl_rows_zero_variance_returns_degenerate() -> None:
+    rows = [
+        ROIInputRow(pnl=Decimal("0.5"), cost=Decimal(1), excluded_reason=None)
+        for _ in range(40)
+    ]
+
+    result = compute_roi_bound(rows)
+
+    assert isinstance(result, ROIBoundDegenerate)
+
+
+def test_no_result_variant_ever_carries_a_nan_or_inf_decimal_bound() -> None:
+    rows = [ROIInputRow(pnl=Decimal(1), cost=Decimal(1), excluded_reason=None) for _ in range(40)]
+
+    result = compute_roi_bound(rows)
+
+    if isinstance(result, ROIBound):
+        assert result.lower_bound.is_finite()
+
+
+# ---------------------------------------------------------------------------
+# Zero total cost / invalid inputs
+# ---------------------------------------------------------------------------
+
+
+def test_zero_total_cost_over_non_excluded_rows_returns_degenerate() -> None:
+    rows = [ROIInputRow(pnl=Decimal(1), cost=Decimal(0), excluded_reason=None) for _ in range(40)]
+
+    result = compute_roi_bound(rows)
+
+    assert result == ROIBoundDegenerate(n=40, reason="zero total cost")
+
+
+def test_negative_cost_row_returns_degenerate() -> None:
+    rows = _rows(39)
+    rows.append(ROIInputRow(pnl=Decimal(1), cost=Decimal(-1), excluded_reason=None))
+
+    result = compute_roi_bound(rows)
+
+    assert isinstance(result, ROIBoundDegenerate)
+    assert "negative" in result.reason
+
+
+def test_nan_decimal_pnl_input_returns_degenerate() -> None:
+    rows = _rows(39)
+    rows.append(ROIInputRow(pnl=Decimal("NaN"), cost=Decimal(1), excluded_reason=None))
+
+    result = compute_roi_bound(rows)
+
+    assert isinstance(result, ROIBoundDegenerate)
+    assert "pnl" in result.reason
+
+
+def test_nan_decimal_cost_input_returns_degenerate() -> None:
+    rows = _rows(39)
+    rows.append(ROIInputRow(pnl=Decimal(1), cost=Decimal("NaN"), excluded_reason=None))
+
+    result = compute_roi_bound(rows)
+
+    assert isinstance(result, ROIBoundDegenerate)
+    assert "cost" in result.reason
+
+
+# ---------------------------------------------------------------------------
 # format_roi_bound
 # ---------------------------------------------------------------------------
 
@@ -226,10 +314,17 @@ def test_format_bound_matches_the_spec_string_exactly() -> None:
     )
 
 
+def test_format_degenerate_matches_the_spec_string_exactly() -> None:
+    result = ROIBoundDegenerate(n=40, reason="zero total cost")
+
+    assert format_roi_bound(result) == "BCa: DEGENERATE — zero total cost (n=40)"
+
+
 def test_format_roi_bound_never_prints_wald_for_any_result_variant() -> None:
     variants: list[roi_bound.ROIBoundResult] = [
         ROIBoundRefused(exclusion_fraction=Decimal("0.5"), ceiling=EXCLUSION_FRACTION_CEILING),
         ROIBoundUnderpowered(n=0),
+        ROIBoundDegenerate(n=0, reason="zero total cost"),
         ROIBound(lower_bound=Decimal(0), n=30, theta_hat=Decimal(0)),
     ]
     for variant in variants:

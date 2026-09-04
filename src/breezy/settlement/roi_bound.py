@@ -35,17 +35,25 @@ cost for a row are always resampled together -- they are not independent
 samples), `n_resamples=10000`, and a seeded generator
 (`numpy.random.default_rng(20260904)`) for exact reproducibility.
 
-One-sided vs two-sided. `scipy.stats.bootstrap` does not directly expose a
-one-sided BCa interval, and its own `alternative="less"/"greater"` support is
-`percentile`-only, not `BCa`, in the scipy version this repo pins (1.18.1).
-The standard equivalence used here instead: for a two-sided BCa interval at
-confidence level `1 - alpha`, the LOWER endpoint is exactly the one-sided
-lower bound at confidence level `1 - alpha/2`. Requesting a one-sided 95%
-lower bound is therefore requesting a TWO-SIDED 90% interval
-(`confidence_level=0.90`) and keeping only its low end -- the high end is
-computed by scipy as a side effect and discarded. This is a standard
-BCa-interval identity (Efron & Tibshirani, *An Introduction to the
-Bootstrap*, ch. 14), not an approximation specific to this module.
+One-sided. `scipy.stats.bootstrap` supports a direct one-sided BCa interval
+via `alternative="greater"` together with `method="BCa"` in the scipy
+version this repo pins (1.18.1) -- `alternative=` is NOT percentile-only.
+Requesting the one-sided 95% lower bound is `confidence_level=0.95`,
+`alternative="greater"`, `method="BCa"`; the returned `.low` is the bound and
+`.high` is `inf` by construction and is discarded. This was previously
+computed via a two-sided-90% equivalence trick, which produced the same
+`.low` on the pinned fixture (0.05 either way) but relied on an incorrect
+docstring claim that `alternative=` was percentile-only for this scipy
+version -- corrected here.
+
+Degeneracy. A sample with zero variance in the bootstrap statistic (e.g. all
+wins, all losses, identical pnl rows) makes the BCa acceleration/bias
+correction undefined; scipy raises `DegenerateDataWarning` and returns a NaN
+lower bound. That warning is escalated to an error and caught, and the
+returned bound is independently checked with `math.isfinite` before any
+`Decimal` conversion, so degeneracy is caught even if scipy ever returns
+finite garbage without warning. Either path returns `ROIBoundDegenerate`,
+never a `ROIBound` wrapping `Decimal("NaN")`.
 
 The naive normal-approximation interval EXEC_SPINE refuses by name is
 never printed or referenced anywhere in this module (pinned by
@@ -54,14 +62,16 @@ the source-text pin in `tests/unit/test_settlement_roi_bound.py`).
 
 from __future__ import annotations
 
+import math
+import warnings
 from collections.abc import Sequence
 from dataclasses import dataclass
 from decimal import Decimal
-from typing import Final
+from typing import Final, assert_never
 
 import numpy as np
 from numpy.typing import NDArray
-from scipy.stats import bootstrap
+from scipy.stats import DegenerateDataWarning, bootstrap
 
 from breezy.settlement.exit_guard import EXCLUSION_FRACTION_CEILING
 
@@ -70,6 +80,7 @@ __all__ = [
     "MIN_NON_EXCLUDED_N",
     "SEED",
     "ROIBound",
+    "ROIBoundDegenerate",
     "ROIBoundRefused",
     "ROIBoundResult",
     "ROIBoundUnderpowered",
@@ -88,9 +99,9 @@ SEED: Final[int] = 20260904
 #: Below this many non-excluded rows the bootstrap is not run at all.
 MIN_NON_EXCLUDED_N: Final[int] = 30
 
-#: The two-sided confidence level whose LOWER endpoint is the one-sided 95%
-#: lower bound (see module docstring, "One-sided vs two-sided").
-_TWO_SIDED_CONFIDENCE_LEVEL: Final[float] = 0.90
+#: The one-sided confidence level for the lower bound (see module docstring,
+#: "One-sided").
+_CONFIDENCE_LEVEL: Final[float] = 0.95
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
@@ -133,7 +144,21 @@ class ROIBound:
     theta_hat: Decimal
 
 
-ROIBoundResult = ROIBoundRefused | ROIBoundUnderpowered | ROIBound
+@dataclass(frozen=True, slots=True, kw_only=True)
+class ROIBoundDegenerate:
+    """The BCa bootstrap could not produce a finite bound on this sample.
+
+    Covers zero-variance samples (all wins, all losses, identical pnl rows
+    -- scipy's `DegenerateDataWarning`), zero total cost over the
+    non-excluded rows (division by zero), and non-finite or negative
+    Decimal inputs. `reason` names which condition triggered it.
+    """
+
+    n: int
+    reason: str
+
+
+ROIBoundResult = ROIBoundRefused | ROIBoundUnderpowered | ROIBoundDegenerate | ROIBound
 
 
 def _ratio_of_sums(
@@ -165,40 +190,70 @@ def compute_roi_bound(rows: Sequence[ROIInputRow]) -> ROIBoundResult:
     if n < MIN_NON_EXCLUDED_N:
         return ROIBoundUnderpowered(n=n)
 
+    for row in included:
+        if not row.pnl.is_finite():
+            return ROIBoundDegenerate(n=n, reason="non-finite pnl input")
+        if not row.cost.is_finite():
+            return ROIBoundDegenerate(n=n, reason="non-finite cost input")
+        if row.cost < 0:
+            return ROIBoundDegenerate(n=n, reason="negative cost input")
+
+    total_pnl = sum((row.pnl for row in included), start=Decimal(0))
+    total_cost = sum((row.cost for row in included), start=Decimal(0))
+    if total_cost == 0:
+        return ROIBoundDegenerate(n=n, reason="zero total cost")
+
+    theta_hat = total_pnl / total_cost
+
     pnl_arr = np.array([float(row.pnl) for row in included], dtype=np.float64)
     cost_arr = np.array([float(row.cost) for row in included], dtype=np.float64)
 
-    theta_hat = sum((row.pnl for row in included), start=Decimal(0)) / sum(
-        (row.cost for row in included), start=Decimal(0)
-    )
+    try:
+        with warnings.catch_warnings():
+            warnings.simplefilter("error", DegenerateDataWarning)
+            result = bootstrap(
+                (pnl_arr, cost_arr),
+                _ratio_of_sums,
+                paired=True,
+                vectorized=True,
+                n_resamples=B_RESAMPLES,
+                random_state=np.random.default_rng(SEED),
+                confidence_level=_CONFIDENCE_LEVEL,
+                alternative="greater",
+                method="BCa",
+            )
+    except DegenerateDataWarning:
+        return ROIBoundDegenerate(
+            n=n, reason="degenerate bootstrap distribution (scipy DegenerateDataWarning)"
+        )
 
-    result = bootstrap(
-        (pnl_arr, cost_arr),
-        _ratio_of_sums,
-        paired=True,
-        vectorized=True,
-        n_resamples=B_RESAMPLES,
-        random_state=np.random.default_rng(SEED),
-        confidence_level=_TWO_SIDED_CONFIDENCE_LEVEL,
-        method="BCa",
-    )
-    lower_bound = Decimal(str(result.confidence_interval.low))
+    lower_bound_float = result.confidence_interval.low
+    if not math.isfinite(lower_bound_float):
+        return ROIBoundDegenerate(n=n, reason="non-finite BCa lower bound")
+
+    lower_bound = Decimal(str(lower_bound_float))
 
     return ROIBound(lower_bound=lower_bound, n=n, theta_hat=theta_hat)
 
 
 def format_roi_bound(result: ROIBoundResult) -> str:
     """Render `result` exactly per the spec (item 10) -- the ONLY place
-    these three strings are produced, so a caller (6d) never hand-formats
+    these four strings are produced, so a caller (6d) never hand-formats
     them differently."""
-    if isinstance(result, ROIBoundRefused):
-        return (
-            f"BCa: REFUSED — exclusion fraction {result.exclusion_fraction:.3f} "
-            f"exceeds ceiling {result.ceiling}"
-        )
-    if isinstance(result, ROIBoundUnderpowered):
-        return "BCa: UNDERPOWERED (n<30)"
-    return (
-        f"BCa 95% lower bound on ROI: {result.lower_bound} "
-        f"(n={result.n}, B={result.b_resamples}, seed={result.seed})"
-    )
+    match result:
+        case ROIBoundRefused():
+            return (
+                f"BCa: REFUSED — exclusion fraction {result.exclusion_fraction:.3f} "
+                f"exceeds ceiling {result.ceiling}"
+            )
+        case ROIBoundUnderpowered():
+            return "BCa: UNDERPOWERED (n<30)"
+        case ROIBoundDegenerate():
+            return f"BCa: DEGENERATE — {result.reason} (n={result.n})"
+        case ROIBound():
+            return (
+                f"BCa 95% lower bound on ROI: {result.lower_bound} "
+                f"(n={result.n}, B={result.b_resamples}, seed={result.seed})"
+            )
+        case _:
+            assert_never(result)
