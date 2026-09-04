@@ -9,7 +9,6 @@ null-hypothesis argument against Nautilus's own `Cache`.
 from __future__ import annotations
 
 import importlib.util
-import sqlite3
 from decimal import Decimal
 from pathlib import Path
 from types import ModuleType
@@ -17,6 +16,7 @@ from types import ModuleType
 import pytest
 
 from breezy.adapters.polymarket_us.exec.client import DurableFillRecord
+from breezy.runtime.sqlite_store import SqliteStateStore
 from breezy.strategy.current_rung_hold.trial_day_latch import TrialDayRecord
 
 _REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -42,13 +42,15 @@ def ftc_mod() -> ModuleType:
 
 
 def _make_state_db(path: Path, rows: dict[str, bytes]) -> None:
-    conn = sqlite3.connect(str(path))
+    """Write `rows` through the REAL `SqliteStateStore`, closed before the
+    reader opens read-only -- so a DDL/pragma change in `sqlite_store.py`
+    is caught here rather than by a hand-rolled schema drifting from it."""
+    store = SqliteStateStore(path)
     try:
-        conn.execute("CREATE TABLE state (key TEXT PRIMARY KEY, value BLOB NOT NULL)")
-        conn.executemany("INSERT INTO state (key, value) VALUES (?, ?)", rows.items())
-        conn.commit()
+        for key, value in rows.items():
+            store.set(key, value)
     finally:
-        conn.close()
+        store.close()
 
 
 def _trial_row(instrument_id: str, *, reason: str = "taken") -> bytes:

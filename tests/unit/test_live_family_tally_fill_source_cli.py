@@ -8,7 +8,6 @@
 from __future__ import annotations
 
 import importlib.util
-import sqlite3
 import sys
 from decimal import Decimal
 from pathlib import Path
@@ -17,6 +16,7 @@ from types import ModuleType
 import pytest
 
 from breezy.adapters.polymarket_us.exec.client import DurableFillRecord
+from breezy.runtime.sqlite_store import SqliteStateStore
 from breezy.strategy.current_rung_hold.trial_day_latch import TrialDayRecord
 
 _REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -44,13 +44,14 @@ def tally_mod() -> ModuleType:
 
 
 def _make_state_db(path: Path, rows: dict[str, bytes]) -> None:
-    conn = sqlite3.connect(str(path))
+    """Write `rows` through the REAL `SqliteStateStore`, closed before the
+    reader opens read-only -- see `test_fill_time_count.py`'s twin helper."""
+    store = SqliteStateStore(path)
     try:
-        conn.execute("CREATE TABLE state (key TEXT PRIMARY KEY, value BLOB NOT NULL)")
-        conn.executemany("INSERT INTO state (key, value) VALUES (?, ?)", rows.items())
-        conn.commit()
+        for key, value in rows.items():
+            store.set(key, value)
     finally:
-        conn.close()
+        store.close()
 
 
 def _trial_row(instrument_id: str) -> bytes:
@@ -107,6 +108,40 @@ def test_without_fill_source_the_structural_dead_line_is_skipped(
     out = capsys.readouterr().out
     assert exit_code == 0
     assert "SKIPPED" in out
+
+
+def test_fill_since_climate_day_excludes_an_earlier_trial_from_the_count(
+    tally_mod: ModuleType, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Pass-through only: an earlier taken+filled trial is scoped out by
+    `--fill-since-climate-day`, so filled_takes=0 fires the KILL at 15
+    covered-listed days -- proving the CLI actually threads the argument
+    through to `count_filled_takes`, not just accepting it."""
+    store_dir = tmp_path / "store"
+    store_dir.mkdir()
+    fill_db = tmp_path / "exec_state.sqlite"
+    _make_state_db(
+        fill_db,
+        {
+            f"{_LIVE_PREFIX}LAX/2026-08-01": _trial_row("LAX-2026-08-01-lt79f"),
+            "exec/polymarket_us/fill/order-1": _fill_row("order-1", "LAX-2026-08-01-lt79f"),
+        },
+    )
+    exit_code = tally_mod.main(
+        [
+            str(store_dir),
+            "--covered-listed-station-days",
+            "15",
+            "--fill-source",
+            str(fill_db),
+            "--fill-since-climate-day",
+            "2026-08-05",
+        ]
+    )
+    out = capsys.readouterr().out
+    assert exit_code == 0
+    assert "SKIPPED" not in out
+    assert "0 filled Take(s)" in out
 
 
 def test_fill_source_pointing_at_an_absent_file_is_also_skipped_not_fatal(

@@ -463,13 +463,23 @@ def main(argv: Sequence[str] | None = None) -> int:
         "denominator (see structural_dead_stop.py); omitted means the stop "
         "is never evaluated",
     )
+    parser.add_argument(
+        "--fill-since-climate-day", type=str, default=None,
+        help="ISO date pass-through to count_filled_takes's since_climate_day "
+        "(fill_time_count.py); scopes the fill-time count, never a computation "
+        "change here. Ignored when --fill-source is not given.",
+    )
     args = parser.parse_args(argv)
 
     rows = read_scored_trials(args.store_dir)
     filled_takes = (
         None
         if args.fill_source is None
-        else count_filled_takes(args.fill_source, family_prefix=_LIVE_TRIAL_ID_PREFIX)
+        else count_filled_takes(
+            args.fill_source,
+            family_prefix=_LIVE_TRIAL_ID_PREFIX,
+            since_climate_day=args.fill_since_climate_day,
+        )
     )
     tally = build_live_family_tally(
         rows,
