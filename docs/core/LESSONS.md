@@ -1117,3 +1117,33 @@ bug until the decision tick and the adjacent depth snapshots have been
 reconstructed from the catalog. Never source an "entry" price from a
 convenient row (first quote, last quote) when the decision path already
 records the real one. Related: [[L-18]], [[L-24]].
+
+## L-26 — A coordinator session is not a supervisor; a live process launched inside it dies with it (2026-09-04)
+
+**What happened.** The first live trade node (`BREEZY-L001`, 17:54 UTC) was
+started with `nohup .venv/bin/breezy-trade &` from a subshell inside the
+coordinator session. `nohup` only ignores SIGHUP. When that session ended at
+21:42 UTC the harness terminated the session's process group with SIGTERM, the
+node shut down cleanly (exit 0, account flat) with the LAX/SFO afternoon window
+still open, and the session-bound `CronCreate` relaunch died with the session
+too. Nothing alerted: a clean shutdown looks like an intended one. The runbook
+already said "one process per trading day, launched from an automation shell",
+and the automation shell chosen was the one thing guaranteed not to outlive the
+day.
+
+**The rule.** Any process that must outlive the conversation — a live node, a
+recorder, a daily relaunch — is started in its own session (`setsid` /
+`subprocess.Popen(..., start_new_session=True)`), verified with
+`ps -o pid,sid,pgid`, and supervised by something whose lifetime is the host's,
+never the coordinator's (a systemd unit where the runbook allows one; the
+detached in-memory supervisor of `docs/plans/TRADE_NODE_DAILY_RELAUNCH_2026-09-04.md`
+where it does not). A session-bound cron or `/loop` may *check* the process; it
+must never be the only thing that *starts* it.
+
+**How to apply.** Every session opens by checking `pgrep -f 'breezy-trade$'`
+(anchored — the supervisor's argv shares the prefix) and the newest trade log
+for `Received SIGTERM`; a SIGTERM that coincides with a session boundary is
+this lesson, not a venue event. When recovering, the seven enablement values
+are recovered in memory from the operator's own prior launch and never
+written to disk ([[L-22]] on unforgeable exclusion applies to the relaunch
+path too). Related: [[L-5]], [[L-23]].
