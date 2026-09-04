@@ -138,7 +138,9 @@ async def test_a_429_surfaces_as_the_existing_rate_limited_error() -> None:
 
 
 def test_the_body_cap_covers_a_full_500_row_response() -> None:
-    """The recorded 500-row KMDW response is ~1.93 MB; the settlement default is 128 KiB."""
+    """The recorded KMDW fixture (newest 300 rows of a full 500-row response,
+    trimmed to keep the test suite small -- see `test_nws_observations_parse.py`
+    module docstring) is still well over the 128 KiB settlement default."""
     fixture = Path(__file__).resolve().parents[1] / "fixtures" / "nws"
     size = (fixture / "kmdw_observations_2026-09-04.json").stat().st_size
     assert size > http_module.DEFAULT_MAX_BODY_BYTES

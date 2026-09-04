@@ -16,10 +16,14 @@ never by monkeypatching ``publish_data``.
 
 The fixture is the recorded ``GET /stations/KMDW/observations?limit=500``
 response at ``tests/fixtures/nws/kmdw_observations_2026-09-04.json``:
-fetched **2026-09-04T02:34:57Z** (``1788489297658387295`` ns), 500 rows,
-newest ``2026-09-04T02:20:00Z``, oldest ``2026-09-02T12:00:00Z`` -- so it
-reaches the current climate day's local-standard midnight
-(``2026-09-03T06:00:00Z``, CST) with ~24 h to spare.
+fetched **2026-09-04T02:34:57Z** (``1788489297658387295`` ns), trimmed to
+its newest 300 rows (the raw 500-row response's oldest row was
+``2026-09-02T12:00:00Z``; only rows older than the kept slice were
+dropped -- see ``test_nws_observations_parse.py`` module docstring).
+Newest ``2026-09-04T02:20:00Z``, oldest ``2026-09-03T03:25:00Z`` -- so it
+still reaches the current climate day's local-standard midnight
+(``2026-09-03T06:00:00Z``, CST) with ~2.5 h of lead-in margin ahead of the
+``rebuild_is_trusted`` gap window (45 min).
 
 No network I/O: the transport seam is a recording fake constructed by the
 Actor's own ``transport_factory`` on the Actor's own clock (A7, one clock).

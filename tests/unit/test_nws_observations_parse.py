@@ -10,6 +10,14 @@ COUNTED, never rounded (L-17).
 Rows below are shaped exactly like the recorded fixture
 ``tests/fixtures/nws/kmdw_observations_2026-09-04.json`` (fetched
 2026-09-04T02:34:57Z); only the fields the parser reads are carried.
+
+The recorded fixture itself is the newest 300 rows of the raw 500-row
+``GET /stations/KMDW/observations?limit=500`` response (fetched
+2026-09-04T02:34:57Z); the raw response's oldest row was
+2026-09-02T12:00:00Z. Only OLDEST rows were dropped to shrink the file --
+every kept row is byte-identical to the original recording (no field was
+edited or fabricated) -- so the counts below are derived from whatever the
+current fixture contains, never hardcoded to the original 500-row total.
 """
 
 from __future__ import annotations
@@ -207,9 +215,9 @@ def test_the_recorded_fixture_parses_with_only_the_documented_drop_reasons() -> 
 
     observations, drops = _parse(payload)
 
-    assert len(payload["features"]) == 500
+    total = len(payload["features"])
     assert set(drops) <= {"unparseable_row", "null_temperature_row", "unexpected_unit_code"}
-    assert len(observations) + sum(drops.values()) == 500
+    assert len(observations) + sum(drops.values()) == total
     assert all(o.received_at_ns > o.observed_at_ns for o in observations)
     assert {o.precision_c_tenths for o in observations} <= {5, 10}
     assert any(o.is_metar for o in observations)
@@ -219,7 +227,7 @@ def test_the_recorded_fixture_parses_with_only_the_documented_drop_reasons() -> 
     metar_count = sum(1 for o in observations if o.is_metar)
     interval_count = sum(1 for o in observations if not o.is_metar)
 
-    assert expected_metar + expected_interval + expected_dropped == 500
+    assert expected_metar + expected_interval + expected_dropped == total
     assert metar_count == expected_metar
     assert interval_count == expected_interval
     assert sum(drops.values()) == expected_dropped
