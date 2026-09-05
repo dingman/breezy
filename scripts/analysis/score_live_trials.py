@@ -489,6 +489,11 @@ def read_filled_trials_state_db(
     (or all) kept out of scoring. A `paper_replay/` latch key never matches
     `family_prefix` (plain `str.startswith`).
 
+    A decoded fill record with `cumulative_qty <= 0` (F1) raises
+    `FillSourceUnreadableError` instead of joining -- an unscorable durable
+    record is store corruption, not a fill-level exclusion, so it fails the
+    whole run rather than being silently excluded or dropped.
+
     Returns `(trials, exclusions, fee_reconciled_by_trial_id)`; the third
     member maps `trial_id -> (fee_reconciled, venue_order_id)` so the caller
     can pass both into `_admit_fill`. `FilledTrial.scheduled_release_at_ns`
@@ -549,6 +554,18 @@ def read_filled_trials_state_db(
             fill = DurableFillRecord.from_bytes(value)
         except ExecutionReportMappingError:
             continue
+        # F1: a record that DECODES but carries a non-positive cumulative_qty
+        # is unscorable -- `fill_px`/`fee` below divide by it -- and that is
+        # store corruption, not a fill-level exclusion (never a member of
+        # `FillExclusionReason`). Unlike `ExecutionReportMappingError` and
+        # `TrialDayRecordCorrupt` just above (silently skipped, one bad
+        # record among many), this fails the WHOLE run closed, mirroring the
+        # open/read failures at the top of this function that already raise
+        # `FillSourceUnreadableError` -- never the actual value.
+        if fill.cumulative_qty <= 0:
+            raise FillSourceUnreadableError(
+                "a durable fill record has a non-positive cumulative_qty"
+            )
         fills_by_instrument.setdefault(fill.instrument_id, []).append(fill)
 
     trials: list[FilledTrial] = []
@@ -801,13 +818,22 @@ def score_live_trials(
         preflight = node_store_path_check(fill_source_path, proc_root=proc_root)
         if preflight == "MISMATCH":
             raise NodeStorePreflightRefused("node_store_mismatch")
-        if preflight == "DISCOVERY_FAILED":
+        elif preflight == "DISCOVERY_FAILED":
             raise NodeStorePreflightRefused("node_store_discovery_failed")
-        if preflight == "NO_NODE":
+        elif preflight == "NO_NODE":
             logging.getLogger(__name__).warning(
                 "no anchored breezy-trade node found while checking the "
                 "fill-source store binding; continuing (schedule premise, NOTE-8)"
             )
+        elif preflight == "MATCH":
+            pass  # continues silently, per the module docstring
+        else:
+            # F2: `node_store_path_check`'s declared return type is the
+            # closed `NodeStorePathCheckResult` enum, but this is a runtime
+            # boundary crossing a module import, not a type-checked call --
+            # an unexpected token must fail closed rather than silently fall
+            # through as MATCH. Never the actual token (value-free, A5).
+            raise NodeStorePreflightRefused("node_store_preflight_unknown_result")
         cli_location = default_registry().settlement_site(venue, city).cli_location
         raw_trials, reader_exclusions, fee_reconciled_by_trial_id = read_filled_trials_state_db(
             fill_source_path,

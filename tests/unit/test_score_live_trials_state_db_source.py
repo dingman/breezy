@@ -392,6 +392,32 @@ def test_an_unreadable_store_raises_fill_source_unreadable(tmp_path: Path) -> No
         read_filled_trials_state_db(store_path, **_reader_kwargs())
 
 
+def test_a_zero_cumulative_qty_fill_raises_fill_source_unreadable(tmp_path: Path) -> None:
+    """F1: a fill record that DECODES but carries `cumulative_qty == 0` would
+    divide by zero computing `fill_px`/`fee` -- that is store corruption, not
+    a fill-level exclusion, so the reader refuses the whole run rather than
+    joining it or silently dropping it."""
+    store_path = tmp_path / "state.sqlite"
+    store = SqliteStateStore(store_path)
+    _seed_latch(store)
+    _seed_fill(store, venue_order_id="v1", cumulative_qty=Decimal(0))
+    store.close()
+
+    with pytest.raises(FillSourceUnreadableError):
+        read_filled_trials_state_db(store_path, **_reader_kwargs())
+
+
+def test_a_negative_cumulative_qty_fill_raises_fill_source_unreadable(tmp_path: Path) -> None:
+    store_path = tmp_path / "state.sqlite"
+    store = SqliteStateStore(store_path)
+    _seed_latch(store)
+    _seed_fill(store, venue_order_id="v1", cumulative_qty=Decimal(-1))
+    store.close()
+
+    with pytest.raises(FillSourceUnreadableError):
+        read_filled_trials_state_db(store_path, **_reader_kwargs())
+
+
 def test_an_empty_but_valid_store_fails_the_positive_control(tmp_path: Path) -> None:
     store_path = tmp_path / "state.sqlite"
     store = SqliteStateStore(store_path)
@@ -572,6 +598,27 @@ def test_node_preflight_match_continues_silently(tmp_path: Path) -> None:
     assert excluded == ()
 
 
+def test_node_preflight_unknown_token_fails_closed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """F2: `node_store_path_check`'s closed enum is not enforced by the
+    interpreter across the import boundary -- an unrecognised token must
+    never silently fall through to the MATCH ("continue") branch. Fails
+    closed via the existing `NodeStorePreflightRefused` channel, never the
+    unexpected token itself."""
+    store_path = tmp_path / "state.sqlite"
+    store = SqliteStateStore(store_path)
+    _seed_latch(store)
+    _seed_fill(store, venue_order_id="v1")
+    store.close()
+
+    monkeypatch.setattr(slt_module, "node_store_path_check", lambda *a, **k: "SOME_UNKNOWN_TOKEN")
+
+    with pytest.raises(NodeStorePreflightRefused) as exc_info:
+        score_live_trials(**_driver_kwargs(tmp_path, store_path))
+    assert "SOME_UNKNOWN_TOKEN" not in str(exc_info.value)
+
+
 # ---------------------------------------------------------------------------
 # CLI: two-source contract, the artefact, the binding wrapper argv
 # ---------------------------------------------------------------------------
@@ -642,6 +689,55 @@ def test_excluded_fills_artefact_has_exactly_eight_keys_and_is_idempotent(
         "filled_at_ns",
         "scored_run_utc",
     }
+
+
+def test_a_zero_cumulative_qty_fill_makes_main_refuse_without_scoring(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """F1, end to end through the CLI: `main()` exits non-zero, prints a
+    value-free refusal line, writes no scored row and no artefact line --
+    never the raw traceback a bare `decimal.DivisionByZero` would produce."""
+    store_path = tmp_path / "state.sqlite"
+    store = SqliteStateStore(store_path)
+    _seed_latch(store)
+    _seed_fill(
+        store,
+        venue_order_id="v1",
+        cumulative_qty=Decimal(0),
+        cumulative_cost=Decimal("0.42"),
+        cumulative_fee=Decimal("0.01"),
+    )
+    store.close()
+
+    manifest_path = _write_manifest(tmp_path)
+    derived_dir = tmp_path / "derived"
+    monkeypatch.setenv("POLYMARKET_US_EXEC_STATE_DB", str(store_path))
+    proc_root = tmp_path / "proc"
+    proc_root.mkdir()  # scannable, empty -- NO_NODE, never the real /proc
+
+    exit_code = main(
+        [
+            "--city",
+            _CITY,
+            "--family-manifest",
+            str(manifest_path),
+            "--derived-dir",
+            str(derived_dir),
+            "--catalog-base",
+            str(tmp_path / "catalog"),
+        ],
+        proc_root=proc_root,
+    )
+
+    assert exit_code != 0
+    captured = capsys.readouterr()
+    assert "score_live_trials: refused" in captured.err
+    # value-free: neither the seeded cost/fee nor a raw traceback leaks
+    assert "0.42" not in captured.err
+    assert "0.01" not in captured.err
+    assert "Traceback" not in captured.err
+    assert not (derived_dir / _EXCLUDED_FILLS_ARTEFACT_NAME).exists()
+    assert read_scored_trials(derived_dir) == ()
 
 
 def test_the_binding_wrapper_argv_parses_and_runs(
