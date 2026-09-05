@@ -35,11 +35,13 @@ from __future__ import annotations
 
 import ast
 import asyncio
+import dataclasses
 import inspect
 import json
 import threading
 from collections.abc import Iterator
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import contextmanager
 from decimal import Decimal
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Final
@@ -76,7 +78,7 @@ from nautilus_trader.model.enums import (
     PositionSide,
     TimeInForce,
 )
-from nautilus_trader.model.events import AccountState, OrderDenied
+from nautilus_trader.model.events import AccountState, OrderDenied, OrderFilled, OrderSubmitted
 from nautilus_trader.model.identifiers import (
     AccountId,
     ClientId,
@@ -90,6 +92,7 @@ from nautilus_trader.model.orders.list import OrderList
 
 import breezy.adapters.polymarket_us.exec.client as client_module
 from breezy.adapters.polymarket_us.errors import ExecutionReportMappingError, PolymarketUSError
+from breezy.adapters.polymarket_us.exec import submit_chain
 from breezy.adapters.polymarket_us.exec.client import (
     FILL_INDEX_KEY_PREFIX,
     FILL_KEY_PREFIX,
@@ -112,14 +115,41 @@ from breezy.adapters.polymarket_us.exec_fault import (
     clear_fatal_exec_fault,
     fatal_exec_fault,
 )
+from breezy.adapters.polymarket_us.operator_controls import (
+    MAX_DAILY_BUDGET_USD_ENV_VAR,
+    MAX_POSITION_COST_USD_ENV_VAR,
+    DailySpendLedger,
+)
 from breezy.adapters.polymarket_us.parsing import FEE_COEFFICIENT_KEY, parse_binary_option
+from breezy.adapters.polymarket_us.safety import issue_live_trading_permit
 from breezy.adapters.polymarket_us.symbology import POLYMARKET_US_VENUE
+from breezy.adapters.polymarket_us.transport import VenueResponse
 from breezy.runtime.sqlite_store import SqliteStateStore
+from breezy.runtime.submit_intent import (
+    RetirementReason,
+    SubmitIntentState,
+    open_submit_intent_latch,
+)
+from tests.unit.operator_control_env import operator_control_env
 from tests.unit.polymarket_us_exec_shapes import (
     TS_EVENT_TEXT,
+    build_execution,
     build_instrument,
+    build_order,
     build_position,
     build_second_instrument,
+)
+from tests.unit.test_polymarket_us_permit_issuance import credentials, enable_operator_gate
+from tests.unit.test_polymarket_us_submit_order_chain import (
+    # Reused, never redefined: `_find_write_transport_canonical_setattr_sites`
+    # (`test_polymarket_us_submit_order_chain.py`) pins an EXACT set of files
+    # that may `setattr` `write_transport.WRITE_CANONICAL_STRING_VERIFIED`; a
+    # second monkeypatch site here would widen it. This module never calls
+    # `setattr` on that attribute itself -- it imports the one fixture that
+    # already does, the same reuse pattern
+    # `test_order_submission_permit_issuance.py` and
+    # `test_current_rung_hold_order_submission_wiring.py` already use.
+    write_canonical_verified,  # noqa: F401
 )
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
@@ -314,6 +344,8 @@ def _record(
     qty: Decimal = RECORDED_QUANTITY,
     cost: Decimal = RECORDED_COST,
     side: str = "BUY",
+    fee: Decimal = Decimal("0.00"),
+    fee_reconciled: bool = True,
 ) -> DurableFillRecord:
     """One cumulative record for one venue order."""
     return DurableFillRecord(
@@ -323,6 +355,8 @@ def _record(
         order_side=side,
         cumulative_qty=qty,
         cumulative_cost=cost,
+        cumulative_fee=fee,
+        fee_reconciled=fee_reconciled,
         ts_event=TS_INIT,
     )
 
@@ -582,14 +616,20 @@ def test_private_read_call_still_takes_only_a_path() -> None:
     assert params == ["self", "path"]
 
 
-def test_refuse_producer_count_stays_pinned_at_twenty_five() -> None:
-    """PIN: R-6.5a adds no new `self._refuse(...)` call site.
+def test_refuse_producer_count_stays_pinned_at_twenty_seven() -> None:
+    """PIN: widened old(27) -> new(29) for I1b's exactly TWO new producers,
+    `self._refuse(_FILL_WRITE_FAILED)` and `self._refuse(_FEE_UNRECONCILED)`
+    in `_submit_order`'s `KIND_ACCEPT_FILL` branch
+    (LIVE_FILL_SCORING_CHAIN_2026-09-05). Never relaxed, only widened (L-12).
 
-    D3 changes the STORE's element type and one caller's keyword arguments;
-    it neither adds nor removes a producer. The authoritative, triaged
-    inventory is `tests/unit/test_exec_refusal_health_surface.py::
-    REFUSAL_PRODUCERS`; this is the cheap local pin that catches a moved
-    count without importing that module's internals.
+    The authoritative, triaged inventory is
+    `tests/unit/test_exec_refusal_health_surface.py::REFUSAL_PRODUCERS`; this
+    is the cheap local pin that catches a moved count without importing that
+    module's internals. **That module is outside this increment's edit
+    surface and now needs its own triage update** (its exact-set pin and
+    `test_planting_a_twenty_sixth_refusal_breaks_the_pin`'s magic numbers)
+    to add `_submit_order#3`/`_submit_order#4` -- reported, not silently
+    left red.
     """
     source = Path(client_module.__file__).read_text(encoding="utf-8")
     tree = ast.parse(source)
@@ -602,7 +642,7 @@ def test_refuse_producer_count_stays_pinned_at_twenty_five() -> None:
         and isinstance(node.func.value, ast.Name)
         and node.func.value.id == "self"
     )
-    assert count == 27
+    assert count == 29
 
 
 @pytest.mark.asyncio
@@ -1401,7 +1441,13 @@ async def test_a_fill_record_survives_reopening_the_store(tmp_path: Path) -> Non
 # ---------------------------------------------------------------------------
 
 
-def _raw_record(*, cumulative_qty: str = "4", cumulative_cost: str = "0.37") -> bytes:
+def _raw_record(
+    *,
+    cumulative_qty: str = "4",
+    cumulative_cost: str = "0.37",
+    cumulative_fee: str = "0.00",
+    fee_reconciled: bool = True,
+) -> bytes:
     return json.dumps(
         {
             "venueOrderId": "V-1",
@@ -1410,6 +1456,8 @@ def _raw_record(*, cumulative_qty: str = "4", cumulative_cost: str = "0.37") -> 
             "orderSide": "BUY",
             "cumulativeQty": cumulative_qty,
             "cumulativeCost": cumulative_cost,
+            "cumulativeFee": cumulative_fee,
+            "feeReconciled": fee_reconciled,
             "tsEvent": TS_INIT,
         },
     ).encode("utf-8")
@@ -1487,6 +1535,8 @@ async def test_a_corrupted_fill_record_for_one_instrument_does_not_drop_a_health
             order_side="BUY",
             cumulative_qty=Decimal(4),
             cumulative_cost=Decimal("NaN"),
+            cumulative_fee=Decimal("0.00"),
+            fee_reconciled=True,
             ts_event=TS_INIT,
         ),
     )
@@ -1875,3 +1925,525 @@ def _strip_fee_coefficient(node: Any) -> None:
 
 def rig_instrument() -> BinaryOption:
     return build_instrument()
+
+
+# ---------------------------------------------------------------------------
+# I1b -- `record_fill` is the FIRST action of the `KIND_ACCEPT_FILL` branch
+# (LIVE_FILL_SCORING_CHAIN_2026-09-05). Fixtures below are schema-shaped from
+# the SDK/OpenAPI snapshots (see `polymarket_us_exec_shapes.py`'s module
+# docstring) -- NOT a recorded response: every authenticated smoke run to
+# date recorded ``Connectivity verdict: FAIL``.
+# ---------------------------------------------------------------------------
+
+
+class _FakeOrderSender:
+    """Records every POST; returns the queued response."""
+
+    def __init__(self) -> None:
+        self.calls: list[dict[str, Any]] = []
+        self.response = VenueResponse(status=200, headers={}, body=b"{}")
+
+    async def post_order(
+        self,
+        base_url: str,
+        *,
+        headers: Mapping[str, str],
+        body: bytes,
+    ) -> VenueResponse:
+        self.calls.append({"base_url": base_url, "headers": dict(headers), "body": body})
+        return self.response
+
+
+class _FakeWriteSigner:
+    def sign_headers(self, method: str, path: str, **_kwargs: object) -> list[tuple[str, str]]:
+        return [("X-Test-Method", method), ("X-Test-Path", path)]
+
+
+def _accept_fill_body(
+    slug: str,
+    *,
+    order_id: str = "ord-i1b-1",
+    last_px: str = "0.37",
+    commission: str = "0.03",
+) -> bytes:
+    """A 200 create-order body classifying as `KIND_ACCEPT_FILL`, fully
+    fee-reconciled: one fill-type execution, order-level `avgPx`/`cumQuantity`
+    agreeing with it, no order-level commission total (so `fee_reconciled`
+    follows the per-leg sum, I1a `_cumulative_fee_and_reconciliation`)."""
+    order = build_order(slug)
+    order["id"] = order_id
+    order["quantity"] = 1
+    order["cumQuantity"] = 1
+    order["leavesQuantity"] = 0
+    order["state"] = "ORDER_STATE_FILLED"
+    order["price"] = {"value": last_px, "currency": "USD"}
+    order["avgPx"] = {"value": last_px, "currency": "USD"}
+    execution = build_execution(order)
+    execution["lastShares"] = "1"
+    execution["lastPx"] = {"value": last_px, "currency": "USD"}
+    execution["commissionNotionalCollected"] = {"value": commission, "currency": "USD"}
+    return json.dumps({"id": order_id, "executions": [execution]}).encode("utf-8")
+
+
+def _unreconciled_fee_body(slug: str, *, order_id: str = "ord-i1b-2") -> bytes:
+    """Same shape, but the order-level commission TOTAL contradicts the
+    per-leg sum -- `fee_reconciled=False` (I1a)."""
+    order = build_order(slug)
+    order["id"] = order_id
+    order["quantity"] = 1
+    order["cumQuantity"] = 1
+    order["leavesQuantity"] = 0
+    order["state"] = "ORDER_STATE_FILLED"
+    order["price"] = {"value": "0.37", "currency": "USD"}
+    order["avgPx"] = {"value": "0.37", "currency": "USD"}
+    order["commissionNotionalTotalCollected"] = {"value": "9.99", "currency": "USD"}
+    execution = build_execution(order)
+    execution["lastShares"] = "1"
+    execution["lastPx"] = {"value": "0.37", "currency": "USD"}
+    execution["commissionNotionalCollected"] = {"value": "0.03", "currency": "USD"}
+    return json.dumps({"id": order_id, "executions": [execution]}).encode("utf-8")
+
+
+def _zero_fill_body(*, order_id: str = "ord-i1b-zero") -> bytes:
+    return json.dumps(
+        {
+            "id": order_id,
+            "executions": [],
+            "state": "ORDER_STATE_CANCELED",
+            "cumQuantity": 0,
+        },
+    ).encode("utf-8")
+
+
+def _reject_body() -> bytes:
+    return json.dumps({"code": 3, "message": "invalid", "details": []}).encode("utf-8")
+
+
+class _AcceptFillRig:
+    """The client under test, wired all the way to a fake `post_order`."""
+
+    def __init__(
+        self,
+        *,
+        client: PolymarketUSExecutionClient,
+        sender: _FakeOrderSender,
+        order_events: list[Any],
+        trace: list[str],
+        instrument: Any,
+        clock: LiveClock,
+        submit_intent_latch: Any,
+        store_path: Path,
+        latch_cm: Any,
+    ) -> None:
+        self.client = client
+        self.sender = sender
+        self.order_events = order_events
+        self.trace = trace
+        self.instrument = instrument
+        self.clock = clock
+        self.submit_intent_latch = submit_intent_latch
+        self.store_path = store_path
+        # Kept alive for the rig's lifetime -- see `_ChainRig`'s identical
+        # note in `test_polymarket_us_submit_order_chain.py`: dropping this
+        # reference finalises the generator-CM via `GeneratorExit` and
+        # silently releases the flock mid-test.
+        self._latch_cm = latch_cm
+
+    def limit_buy(self, *, price: str = "0.37") -> SubmitOrder:
+        factory = OrderFactory(trader_id=TRADER_ID, strategy_id=STRATEGY_ID, clock=self.clock)
+        order = factory.limit(
+            instrument_id=self.instrument.id,
+            order_side=OrderSide.BUY,
+            quantity=Quantity(1, self.instrument.size_precision),
+            price=Price.from_str(price),
+            time_in_force=TimeInForce.IOC,
+        )
+        return SubmitOrder(
+            trader_id=TRADER_ID,
+            strategy_id=STRATEGY_ID,
+            order=order,
+            command_id=UUID4(),
+            ts_init=TS_INIT,
+        )
+
+
+def _build_accept_fill_rig(
+    tmp_path: Path,
+    *,
+    monkeypatch: pytest.MonkeyPatch,
+    sender: _FakeOrderSender | None = None,
+) -> _AcceptFillRig:
+    """The R-7 full stack: a real client, a real `SqliteStateStore`, a real
+    submit-intent latch, and a fake `post_order` -- the same shape
+    `test_polymarket_us_submit_order_chain.py`'s `_build_chain_rig` already
+    proves reaches a POST. Rebuilt here (not imported) because that module is
+    outside this increment's edit surface.
+
+    Callers must request the `write_canonical_verified` fixture (imported
+    above) themselves: this function does not flip
+    `WRITE_CANONICAL_STRING_VERIFIED` itself, so this file adds no second
+    `setattr` site for `_find_write_transport_canonical_setattr_sites`
+    to find.
+    """
+    loop = asyncio.get_running_loop()
+    clock = LiveClock()
+    msgbus = MessageBus(trader_id=TRADER_ID, clock=clock)
+    cache = Cache(database=None, config=CacheConfig(database=None, flush_on_start=False))
+    instrument = build_instrument()
+    cache.add_instrument(instrument)
+    provider = InstrumentProvider()
+    provider.add(instrument)
+    read = _PrivateReadStub(
+        {
+            ACCOUNT_BALANCES_PATH: _balances_payload(),
+            PORTFOLIO_POSITIONS_PATH: {"positions": {}, "eof": True},
+        },
+    )
+    order_events: list[Any] = []
+    trace: list[str] = []
+
+    def _on_account_state(state: AccountState) -> None:
+        if cache.account(state.account_id) is None:
+            cache.add_account(AccountFactory.create(state))
+        else:
+            cache.account(state.account_id).apply(state)
+
+    def _on_exec_event(event: Any) -> None:
+        order_events.append(event)
+        trace.append(type(event).__name__)
+
+    msgbus.register(endpoint="Portfolio.update_account", handler=_on_account_state)
+    msgbus.register(endpoint="ExecEngine.process", handler=_on_exec_event)
+
+    store_path = tmp_path / "exec_state.db"
+    fake_sender = sender if sender is not None else _FakeOrderSender()
+    enable_operator_gate(monkeypatch)
+    issued_permit = issue_live_trading_permit(clock=clock)
+    latch_cm = open_submit_intent_latch(SqliteStateStore(store_path), store_path)
+    submit_intent_latch = latch_cm.__enter__()
+
+    client = PolymarketUSExecutionClient(
+        loop=loop,
+        client_id=CLIENT_ID,
+        venue=POLYMARKET_US_VENUE,
+        instrument_provider=provider,
+        msgbus=msgbus,
+        cache=cache,
+        clock=clock,
+        private_read=read,
+        state_store_opener=lambda: SqliteStateStore(store_path),
+        account_number=ACCOUNT_NUMBER,
+        instrument_wait_timeout_s=1.0,
+        account_registration_timeout_s=1.0,
+        order_sender=fake_sender,
+        write_signer=_FakeWriteSigner(),
+        live_trading_permit=issued_permit,
+        spend_ledger=DailySpendLedger(),
+        submit_intent_latch=submit_intent_latch,
+        credentials=credentials(),
+        api_base_url="https://api.polymarket.us",
+        retirement_reasons=RetirementReason,
+    )
+    return _AcceptFillRig(
+        client=client,
+        sender=fake_sender,
+        order_events=order_events,
+        trace=trace,
+        instrument=instrument,
+        clock=clock,
+        submit_intent_latch=submit_intent_latch,
+        store_path=store_path,
+        latch_cm=latch_cm,
+    )
+
+
+@contextmanager
+def _accept_fill_caps() -> Iterator[None]:
+    """The operator ceilings `DailySpendLedger.authorize_order_cost` reads,
+    bound through the ONE whitelisted test seam (`operator_control_env.py`)
+    for the duration of the submit call only."""
+    with (
+        operator_control_env(MAX_DAILY_BUDGET_USD_ENV_VAR, "1000.00"),
+        operator_control_env(MAX_POSITION_COST_USD_ENV_VAR, "10.00"),
+    ):
+        yield
+
+
+def _reopened_fill_record(store_path: Path, venue_order_id: str) -> DurableFillRecord | None:
+    with SqliteStateStore(store_path) as reopened:
+        raw = reopened.get(f"{FILL_KEY_PREFIX}{venue_order_id}")
+    if raw is None:
+        return None
+    return DurableFillRecord.from_bytes(raw)
+
+
+# (a) ordering probe -- the store write happens BEFORE `true_up_booking`,
+# `_retire` and the published `OrderFilled`.
+@pytest.mark.asyncio
+async def test_record_fill_is_written_before_true_up_booking_retire_and_order_filled(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    write_canonical_verified: None,  # noqa: F811
+) -> None:
+    sender = _FakeOrderSender()
+    rig = _build_accept_fill_rig(tmp_path, monkeypatch=monkeypatch, sender=sender)
+    slug = _slug(rig.instrument)
+    sender.response = VenueResponse(status=200, headers={}, body=_accept_fill_body(slug))
+
+    original_record_fill = rig.client.record_fill
+    original_retire = rig.client._retire
+    # `DailySpendLedger` is `__slots__`-only (no instance `__dict__`), so the
+    # spy is installed on the CLASS, not the instance -- this rig's ledger is
+    # the only live instance for the duration of this test.
+    original_true_up = DailySpendLedger.true_up_booking
+
+    def _spy_record_fill(record: DurableFillRecord) -> None:
+        rig.trace.append("record_fill")
+        original_record_fill(record)
+
+    def _spy_true_up(ledger_self: Any, *args: Any, **kwargs: Any) -> Any:
+        rig.trace.append("true_up_booking")
+        return original_true_up(ledger_self, *args, **kwargs)
+
+    def _spy_retire(*args: Any, **kwargs: Any) -> Any:
+        rig.trace.append("_retire")
+        return original_retire(*args, **kwargs)
+
+    monkeypatch.setattr(rig.client, "record_fill", _spy_record_fill)
+    monkeypatch.setattr(DailySpendLedger, "true_up_booking", _spy_true_up)
+    monkeypatch.setattr(rig.client, "_retire", _spy_retire)
+
+    with _accept_fill_caps():
+        await rig.client._connect()
+        await rig.client._submit_order(rig.limit_buy())
+        await rig.client._disconnect()
+
+    assert rig.trace == [
+        "record_fill",
+        "true_up_booking",
+        "_retire",
+        "OrderSubmitted",
+        "OrderFilled",
+    ], rig.trace
+
+
+# (b) the record decodes with the venue fee and the reconciled flag.
+@pytest.mark.asyncio
+async def test_the_durable_record_decodes_with_the_venue_fee_and_the_reconciled_flag(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    write_canonical_verified: None,  # noqa: F811
+) -> None:
+    sender = _FakeOrderSender()
+    rig = _build_accept_fill_rig(tmp_path, monkeypatch=monkeypatch, sender=sender)
+    slug = _slug(rig.instrument)
+    sender.response = VenueResponse(
+        status=200,
+        headers={},
+        body=_accept_fill_body(slug, order_id="ord-i1b-decode", last_px="0.37", commission="0.03"),
+    )
+
+    with _accept_fill_caps():
+        await rig.client._connect()
+        await rig.client._submit_order(rig.limit_buy())
+        await rig.client._disconnect()
+
+    record = _reopened_fill_record(rig.store_path, "ord-i1b-decode")
+    assert record is not None
+    assert record.cumulative_qty == Decimal(1)
+    assert record.cumulative_cost == Decimal("0.37")
+    assert record.cumulative_fee == Decimal("0.03")
+    assert record.fee_reconciled is True
+
+
+# (c) FAILURE PATH -- `record_fill` raises.
+@pytest.mark.asyncio
+async def test_a_raising_record_fill_refuses_but_still_publishes_both_events(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    write_canonical_verified: None,  # noqa: F811
+) -> None:
+    sender = _FakeOrderSender()
+    rig = _build_accept_fill_rig(tmp_path, monkeypatch=monkeypatch, sender=sender)
+    slug = _slug(rig.instrument)
+    sender.response = VenueResponse(
+        status=200,
+        headers={},
+        body=_accept_fill_body(slug, order_id="ord-i1b-boom"),
+    )
+
+    def _boom(record: DurableFillRecord) -> None:
+        raise RuntimeError("simulated durable write failure")
+
+    monkeypatch.setattr(rig.client, "record_fill", _boom)
+
+    with _accept_fill_caps():
+        rig.client.start()  # drive the native FSM to RUNNING, as `_refuse` requires
+        await rig.client._connect()
+        await rig.client._submit_order(rig.limit_buy())  # must not raise
+        # Asserted BEFORE `_disconnect`: the native FSM's own DISCONNECTING/
+        # STOPPED transitions supersede DEGRADED, so this is the last point
+        # the refusal's own state effect is still directly observable.
+        assert rig.client.is_degraded is True
+        await rig.client._disconnect()
+
+    assert _reopened_fill_record(rig.store_path, "ord-i1b-boom") is None
+
+    current = rig.submit_intent_latch.current()
+    assert current is not None
+    assert current.state is SubmitIntentState.OPEN, (
+        "a failed evidence write must not retire the intent"
+    )
+
+    refusals = rig.client.trading_refusals
+    assert refusals.count(client_module._FILL_WRITE_FAILED) == 1, refusals
+
+    submitted = [e for e in rig.order_events if isinstance(e, OrderSubmitted)]
+    filled = [e for e in rig.order_events if isinstance(e, OrderFilled)]
+    assert len(submitted) == 1
+    assert len(filled) == 1
+
+
+# (d) `fee_reconciled=False` -- record still written, refusal latched, retire
+# and publish proceed.
+@pytest.mark.asyncio
+async def test_an_unreconciled_fee_still_writes_and_retires_but_latches_a_refusal(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    write_canonical_verified: None,  # noqa: F811
+) -> None:
+    sender = _FakeOrderSender()
+    rig = _build_accept_fill_rig(tmp_path, monkeypatch=monkeypatch, sender=sender)
+    slug = _slug(rig.instrument)
+    sender.response = VenueResponse(
+        status=200,
+        headers={},
+        body=_unreconciled_fee_body(slug, order_id="ord-i1b-unreconciled"),
+    )
+
+    with _accept_fill_caps():
+        await rig.client._connect()
+        await rig.client._submit_order(rig.limit_buy())
+        await rig.client._disconnect()
+
+    record = _reopened_fill_record(rig.store_path, "ord-i1b-unreconciled")
+    assert record is not None
+    assert record.fee_reconciled is False
+
+    assert rig.client.trading_refusals.count(client_module._FEE_UNRECONCILED) == 1
+
+    current = rig.submit_intent_latch.current()
+    assert current is not None
+    assert current.state is SubmitIntentState.RETIRED, "the fill is real; retire must still proceed"
+
+    filled = [e for e in rig.order_events if isinstance(e, OrderFilled)]
+    assert len(filled) == 1
+
+
+# (e) zero-fill and reject write no record.
+@pytest.mark.asyncio
+async def test_a_zero_fill_writes_no_durable_record(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    write_canonical_verified: None,  # noqa: F811
+) -> None:
+    sender = _FakeOrderSender()
+    rig = _build_accept_fill_rig(tmp_path, monkeypatch=monkeypatch, sender=sender)
+    sender.response = VenueResponse(
+        status=200,
+        headers={},
+        body=_zero_fill_body(order_id="ord-i1b-zero"),
+    )
+
+    with _accept_fill_caps():
+        await rig.client._connect()
+        await rig.client._submit_order(rig.limit_buy())
+        assert rig.client.fill_records_for(rig.instrument.id) == ()
+        await rig.client._disconnect()
+
+    assert _reopened_fill_record(rig.store_path, "ord-i1b-zero") is None
+
+
+@pytest.mark.asyncio
+async def test_a_reject_writes_no_durable_record(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    write_canonical_verified: None,  # noqa: F811
+) -> None:
+    sender = _FakeOrderSender()
+    rig = _build_accept_fill_rig(tmp_path, monkeypatch=monkeypatch, sender=sender)
+    sender.response = VenueResponse(status=400, headers={}, body=_reject_body())
+
+    with _accept_fill_caps():
+        await rig.client._connect()
+        await rig.client._submit_order(rig.limit_buy())
+        assert rig.client.fill_records_for(rig.instrument.id) == ()
+        await rig.client._disconnect()
+
+
+# (f) `to_bytes`/`from_bytes` round-trip with the new fields.
+def test_durable_fill_record_round_trips_the_fee_and_reconciled_flag() -> None:
+    record = DurableFillRecord(
+        venue_order_id="V-ROUNDTRIP-1",
+        client_order_id="O-19700101-000000-001-001-1",
+        instrument_id="some-instrument",
+        order_side="BUY",
+        cumulative_qty=Decimal(4),
+        cumulative_cost=Decimal("1.48"),
+        cumulative_fee=Decimal("0.12"),
+        fee_reconciled=False,
+        ts_event=TS_INIT,
+    )
+
+    raw = record.to_bytes()
+    decoded = json.loads(raw)
+    assert decoded["cumulativeFee"] == "0.12"
+    assert decoded["feeReconciled"] is False
+
+    assert DurableFillRecord.from_bytes(raw) == record
+
+
+# (g) `None` totals on an accept-fill outcome -- the same failure path as (c).
+@pytest.mark.asyncio
+async def test_none_order_level_totals_on_an_accept_fill_take_the_write_failure_path(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    write_canonical_verified: None,  # noqa: F811
+) -> None:
+    """Should be impossible after I1a (`classify_create_order_outcome` always
+    populates the totals together with a resolved `fill`), but pinned anyway:
+    a `CreateOrderOutcome` that is somehow `KIND_ACCEPT_FILL` with no totals
+    must refuse, never guess a zero."""
+    sender = _FakeOrderSender()
+    rig = _build_accept_fill_rig(tmp_path, monkeypatch=monkeypatch, sender=sender)
+    slug = _slug(rig.instrument)
+    sender.response = VenueResponse(
+        status=200,
+        headers={},
+        body=_accept_fill_body(slug, order_id="ord-i1b-none-totals"),
+    )
+
+    original_classify = submit_chain.classify_create_order_outcome
+
+    def _classify_with_none_totals(*args: Any, **kwargs: Any) -> Any:
+        outcome = original_classify(*args, **kwargs)
+        return dataclasses.replace(
+            outcome,
+            cumulative_qty=None,
+            cumulative_cost=None,
+            cumulative_fee=None,
+        )
+
+    monkeypatch.setattr(submit_chain, "classify_create_order_outcome", _classify_with_none_totals)
+
+    with _accept_fill_caps():
+        await rig.client._connect()
+        await rig.client._submit_order(rig.limit_buy())  # must not raise
+        await rig.client._disconnect()
+
+    assert _reopened_fill_record(rig.store_path, "ord-i1b-none-totals") is None
+    refusals = rig.client.trading_refusals
+    assert refusals.count(client_module._FILL_WRITE_FAILED) == 1, refusals
+
+    filled = [e for e in rig.order_events if isinstance(e, OrderFilled)]
+    assert len(filled) == 1

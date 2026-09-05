@@ -355,6 +355,23 @@ _RECORD_SIGNS: Final[Mapping[str, Decimal]] = {
 _DEFAULT_INSTRUMENT_WAIT_SECONDS: Final[float] = 30.0
 _DEFAULT_ACCOUNT_REGISTRATION_SECONDS: Final[float] = 30.0
 
+#: I1b -- the durable fill write (``record_fill``) itself raised. ONE fixed
+#: reason so `_refuse` dedupes on it (`_refuse` keys on the reason string,
+#: not a per-exception message); the exception detail goes in the ERROR log
+#: line instead, never here.
+_FILL_WRITE_FAILED: Final[str] = (
+    "the durable fill write raised; this client refuses further submits "
+    "until an operator investigates"
+)
+
+#: I1b -- the record was written, but the venue's cumulative fee could not be
+#: reconciled to its fill-type legs (`fee_reconciled=False`). The fill is
+#: real; only the fee is untrusted, so retire/publish still proceed.
+_FEE_UNRECONCILED: Final[str] = (
+    "a durable fill record's venue fee could not be reconciled to its legs; "
+    "this client refuses further submits until an operator investigates"
+)
+
 
 class PrivateRead(Protocol):
     """The injected authenticated read: one GET-shaped call, and nothing else.
@@ -381,6 +398,14 @@ class PrivateRead(Protocol):
     """
 
     async def __call__(self, path: str) -> Mapping[str, Any]: ...
+
+
+def _require_bool(value: object, *, field: str) -> bool:
+    """``feeReconciled`` must decode to exactly ``bool`` -- never ``0``/``1``
+    or a truthy string standing in for it (I1b)."""
+    if not isinstance(value, bool):
+        raise TypeError(f"{field} must be a JSON boolean, got {type(value).__name__}")
+    return value
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -416,6 +441,8 @@ class DurableFillRecord:
     order_side: str
     cumulative_qty: Decimal
     cumulative_cost: Decimal
+    cumulative_fee: Decimal
+    fee_reconciled: bool
     ts_event: int
 
     def to_bytes(self) -> bytes:
@@ -427,6 +454,8 @@ class DurableFillRecord:
                 "orderSide": self.order_side,
                 "cumulativeQty": str(self.cumulative_qty),
                 "cumulativeCost": str(self.cumulative_cost),
+                "cumulativeFee": str(self.cumulative_fee),
+                "feeReconciled": self.fee_reconciled,
                 "tsEvent": self.ts_event,
             },
             sort_keys=True,
@@ -473,6 +502,12 @@ class DurableFillRecord:
                     field="cumulativeCost",
                     error=ExecutionReportMappingError,
                 ),
+                cumulative_fee=_to_decimal(
+                    payload["cumulativeFee"],
+                    field="cumulativeFee",
+                    error=ExecutionReportMappingError,
+                ),
+                fee_reconciled=_require_bool(payload["feeReconciled"], field="feeReconciled"),
                 ts_event=int(payload["tsEvent"]),
             )
         except (KeyError, TypeError, ValueError, InvalidOperation) as exc:
@@ -992,9 +1027,10 @@ class PolymarketUSExecutionClient(LiveExecutionClient):
 
         The venue's open-order read surface is not declared by R-3's endpoint
         table, and barrier V2 refuses its path literal inside any
-        venue-touching module with no allowlist. Breezy has also submitted no
-        order -- this increment cannot -- so an empty list is not merely
-        permitted, it is TRUE.
+        venue-touching module with no allowlist. Breezy DOES submit orders
+        (R-7's ``_submit_order``, one per station-day) -- what remains
+        unimplemented is reading THEM BACK by status: this method returns an
+        empty list unconditionally, not because nothing was ever submitted.
         """
         return []
 
@@ -1588,12 +1624,71 @@ class PolymarketUSExecutionClient(LiveExecutionClient):
             and retire_name is not None
             and outcome.filled_cost_usd is not None
         ):
-            self._ledger.true_up_booking(
-                booking, filled_cost_usd=outcome.filled_cost_usd, now_ns=now_ns
-            )
-            self._retire(intent.intent_id, retire_name, now_ns)
-            self._generate_submitted(order, now_ns)
             fill = outcome.fill
+            # I1b (LIVE_FILL_SCORING_CHAIN_2026-09-05): `record_fill` is the
+            # FIRST effectful action of this branch -- before `true_up_booking`,
+            # `_retire`, `_generate_submitted` and `generate_order_filled` --
+            # so a crash right after the venue's answer still leaves durable
+            # evidence on disk (R-7; `SqliteStateStore.set` COMMITs before
+            # returning). Building `record` has no side effect of its own, so
+            # it stays inside this same `try`: an accept-fill outcome missing
+            # its order-level totals (should be impossible after I1a) is
+            # refused on the identical failure path, never guessed at.
+            record: DurableFillRecord | None = None
+            try:
+                if (
+                    outcome.cumulative_qty is None
+                    or outcome.cumulative_cost is None
+                    or outcome.cumulative_fee is None
+                ):
+                    raise PolymarketUSError(
+                        "an accept-fill outcome carried no order-level totals; "
+                        "a durable fill record cannot be built"
+                    )
+                record = DurableFillRecord(
+                    venue_order_id=fill.venue_order_id.value,
+                    client_order_id=order.client_order_id.value,
+                    instrument_id=order.instrument_id.value,
+                    order_side=LONG_ONLY_SIDE,
+                    cumulative_qty=outcome.cumulative_qty,
+                    cumulative_cost=outcome.cumulative_cost,
+                    cumulative_fee=outcome.cumulative_fee,
+                    fee_reconciled=outcome.fee_reconciled,
+                    ts_event=fill.ts_event,
+                )
+                self.record_fill(record)
+            except Exception as exc:  # noqa: BLE001 - deliberately broad: this
+                # guards ONE evidence write and ANY failure of it must halt
+                # trading rather than lose the event. Narrowing to the known
+                # raisers (an unreadable index, a store error, a `to_bytes`
+                # encode failure, or the totals guard above) would let an
+                # unlisted exception escape into the task handler, which
+                # swallows it -- silently losing both the record and the
+                # refusal.
+                if record is None:
+                    detail = "no record built"
+                else:
+                    fill_record_bytes = record.to_bytes()
+                    detail = fill_record_bytes.decode()
+                self._log.error(
+                    f"{_FILL_WRITE_FAILED}: {exc.__class__.__name__}: {exc}; record={detail}"
+                )
+                self._refuse(_FILL_WRITE_FAILED)
+            else:
+                self._ledger.true_up_booking(
+                    booking, filled_cost_usd=outcome.filled_cost_usd, now_ns=now_ns
+                )
+                self._retire(intent.intent_id, retire_name, now_ns)
+                if outcome.fee_reconciled is False:
+                    # The fill is real; only the fee is untrusted -- the
+                    # record is STILL written and retire/publish still
+                    # proceed. I2 keeps an unreconciled fill out of scoring.
+                    self._refuse(_FEE_UNRECONCILED)
+            self._generate_submitted(order, now_ns)  # UNCONDITIONAL: Nautilus's
+            # order FSM has NO (INITIALIZED, FILLED) transition
+            # (`_ORDER_STATE_TABLE`, `model/orders/base.pyx:94-157`), so
+            # skipping `OrderSubmitted` here would make the `OrderFilled`
+            # below unbookable -- the exact outcome this ordering prevents.
             self.generate_order_filled(
                 strategy_id=order.strategy_id,
                 instrument_id=order.instrument_id,

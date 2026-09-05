@@ -1844,6 +1844,16 @@ EXEC_ORDER_COROUTINE_PERMITTED_CALLEES = frozenset(
         "submit_chain.classify_create_order_outcome",
         "submit_chain.retirement_member",
         "submit_chain.venue_order_id",
+        # I1b (record_fill first in the accept-fill branch): old 41 -> new 46;
+        # all five are intra-module and inert (no transport). `record.to_bytes`
+        # and `fill_record_bytes.decode` render the durable-fill evidence into
+        # the `_FILL_WRITE_FAILED` log line; the other three build and persist
+        # that same evidence.
+        "self.record_fill",
+        "DurableFillRecord",
+        "PolymarketUSError",
+        "record.to_bytes",
+        "fill_record_bytes.decode",
     }
 )
 
@@ -2579,6 +2589,13 @@ def test_the_order_coroutine_callee_allowlist_reaches_no_venue() -> None:
             "submit_chain.classify_create_order_outcome",
             "submit_chain.retirement_member",
             "submit_chain.venue_order_id",
+            # I1b (record_fill first in the accept-fill branch): old 41 -> new
+            # 46; all five are intra-module and inert (no transport).
+            "self.record_fill",
+            "DurableFillRecord",
+            "PolymarketUSError",
+            "record.to_bytes",
+            "fill_record_bytes.decode",
         }
     )
     for callee in EXEC_ORDER_COROUTINE_PERMITTED_CALLEES:

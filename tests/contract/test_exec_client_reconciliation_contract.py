@@ -627,6 +627,8 @@ async def test_a_flat_venue_report_on_a_held_long_is_never_forwarded(
             order_side="BUY",
             cumulative_qty=Decimal(4),
             cumulative_cost=Decimal("1.48"),
+            cumulative_fee=Decimal("0.00"),
+            fee_reconciled=True,
             ts_event=clock.timestamp_ns(),
         ),
     )
@@ -732,6 +734,8 @@ async def test_balance_after_reconciling_a_priced_forward_reads_the_real_venue_b
             order_side="BUY",
             cumulative_qty=Decimal(4),
             cumulative_cost=Decimal("1.48"),  # 4 @ 0.37
+            cumulative_fee=Decimal("0.00"),
+            fee_reconciled=True,
             ts_event=clock.timestamp_ns(),
         ),
     )

@@ -68,6 +68,8 @@ def _fill_row(venue_order_id: str, instrument_id: str) -> bytes:
         order_side="BUY",
         cumulative_qty=Decimal(1),
         cumulative_cost=Decimal("0.40"),
+        cumulative_fee=Decimal("0.00"),
+        fee_reconciled=True,
         ts_event=1,
     ).to_bytes()
 

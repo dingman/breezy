@@ -75,9 +75,14 @@ calculate_commission#2              EXCEPTIONAL   the fee schedule is UNKNOWN fo
 calculate_commission#3              EXCEPTIONAL   a reconciliation fill could not be priced
 _submit_order#1                     EXCEPTIONAL   create-order POST raised; outcome is AMBIGUOUS
 _submit_order#2                     EXCEPTIONAL   create-order outcome is AMBIGUOUS after a response
+_submit_order#3                     EXCEPTIONAL   fail-closed: the durable fill record could not be
+                                                   built or written; evidence write is untrusted
+_submit_order#4                     EXCEPTIONAL   fail-closed attestation: the fill IS durable and
+                                                   published, but its fee could not be reconciled
 ==================================  ============  ================================================
 
-Seven ROUTINE, twenty EXCEPTIONAL. Every one of the seven is reachable on
+Seven ROUTINE, twenty-two EXCEPTIONAL (I1b added ``_submit_order#3``/``#4``:
+old 27 -> new 29). Every one of the seven is reachable on
 an account in perfectly good order, which is the whole argument for INDICATOR
 over kill switch -- and one of them, ``_map_position#3``, is the non-long
 position refusal Revision 0's hand count missed entirely.
@@ -164,6 +169,11 @@ REFUSAL_PRODUCERS: Final[frozenset[str]] = frozenset(
         "calculate_commission#3",
         "_submit_order#1",
         "_submit_order#2",
+        # I1b (record_fill first in the accept-fill branch): old 27 -> new 29;
+        # both new producers are fail-closed evidence/attestation refusals that
+        # still publish the fill (see the triage table above).
+        "_submit_order#3",
+        "_submit_order#4",
     }
 )
 
@@ -241,7 +251,7 @@ def test_the_refusal_producer_set_is_exactly_pinned() -> None:
         "added": sorted(scanned - REFUSAL_PRODUCERS),
         "removed": sorted(REFUSAL_PRODUCERS - scanned),
     }
-    assert len(scanned) == 27
+    assert len(scanned) == 29  # I1b: old 27 -> new 29
 
 
 def test_planting_a_twenty_sixth_refusal_breaks_the_pin() -> None:
@@ -256,7 +266,7 @@ def test_planting_a_twenty_sixth_refusal_breaks_the_pin() -> None:
     assert planted != source, "the plant site moved; update this test's anchor"
     scanned = _refusal_producers(planted)
     assert scanned != set(REFUSAL_PRODUCERS)
-    assert len(scanned) == 28
+    assert len(scanned) == 30  # I1b: old 28 -> new 30 (planting one more breaks the pin)
 
 
 def test_removing_a_refusal_breaks_the_pin() -> None:
@@ -289,7 +299,8 @@ def test_every_pinned_refusal_producer_is_triaged_here() -> None:
         "stale_rows": sorted(set(triaged) - REFUSAL_PRODUCERS),
     }
     counts = Counter(triaged.values())
-    assert counts == {"EXCEPTIONAL": 20, "ROUTINE": 7}, counts
+    # I1b: old {"EXCEPTIONAL": 20, "ROUTINE": 7} -> new {"EXCEPTIONAL": 22, "ROUTINE": 7}
+    assert counts == {"EXCEPTIONAL": 22, "ROUTINE": 7}, counts
 
 
 # ---------------------------------------------------------------------------
