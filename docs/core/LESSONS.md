@@ -1174,3 +1174,29 @@ the real path makes every later test's output land there too.
 name before and after the run. Treat a production log line whose timestamp
 precedes the process's own start line as a contamination signal. Related:
 [[L-20]], [[L-24]], [[L-26]].
+
+## L-28 — A shipped helper's default arguments are part of the population it measures (2026-09-05)
+
+**What happened.** Rev 2 of the live fill → scored-trial plan closed the v1
+structural-dead denominator gap with "a reusable computation SHIPS —
+`count_covered_listed_station_days_from_catalog` — so the wrapper just calls
+it; no increment needed." Round-2 review read the function: its `fetch_start`
+defaults to `ASOS_FETCH_START` = 2026-08-30, the archive study window, so
+called as written it would have counted six pre-live days per station, cleared
+`MIN_STRUCTURAL_DEAD_STATION_DAYS` (15) on the first evaluation, and paired
+that denominator with a numerator scoped to the live family's first day: a
+manufactured KILL of a family with zero live fills.
+
+**The rule.** "A function that computes this already exists" is a claim about
+a signature, not about a number. Before a plan wires a shipped computation into
+a stop, a tally or a threshold, it names EVERY argument that selects the
+population (start/end dates, station set, source catalog, venue) and shows
+that both sides of any ratio share one window from one declared source. A
+default that was correct for the study that wrote it is a foreign window
+here; "just call it" with defaults is prohibited on any live-consequence path.
+
+**How to apply.** When you cite a helper as the fix, quote its signature with
+defaults in the plan and write the call with every population argument
+explicit; add a RED test that pins numerator and denominator window equality.
+Related: [[L-2]] (a substitution is a unit change), [[L-3]] (reach the goal
+state), [[L-10]] (brief vocabulary becomes verified fact).
