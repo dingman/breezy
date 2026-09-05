@@ -117,7 +117,13 @@ class FillGeneration:
 
 @dataclass(frozen=True, slots=True)
 class CreateOrderOutcome:
-    """One classified create-order response. Absence of a field is absence."""
+    """One classified create-order response. Absence of a field is absence.
+
+    ``cumulative_qty``/``cumulative_cost``/``cumulative_fee``/
+    ``fee_reconciled`` are the I1a order-level totals (LIVE_FILL_SCORING_CHAIN
+    plan, section "I1a"): populated on ``KIND_ACCEPT_FILL`` only, ``None``/
+    ``False`` on every other kind.
+    """
 
     kind: str
     reason: str
@@ -125,6 +131,10 @@ class CreateOrderOutcome:
     venue_order_id: str | None
     fill: FillGeneration | None
     filled_cost_usd: Decimal | None
+    cumulative_qty: Decimal | None
+    cumulative_cost: Decimal | None
+    cumulative_fee: Decimal | None
+    fee_reconciled: bool
     generate_submitted: bool
 
 
@@ -402,6 +412,120 @@ def _filled_cost_from_execution(execution: Mapping[str, Any]) -> Decimal | None:
         return None
 
 
+#: I1a fee filter (``types/orders.py:34-43``). ``Execution`` is ``total=False``
+#: (``:95-108``), so a row carrying no ``type`` at all is never fill-type.
+_FILL_EXECUTION_TYPES: Final[frozenset[str]] = frozenset(
+    {"EXECUTION_TYPE_FILL", "EXECUTION_TYPE_PARTIAL_FILL"}
+)
+
+
+def _fill_type_executions(payload: Mapping[str, Any]) -> tuple[Mapping[str, Any], ...]:
+    """Every ``executions`` row whose ``type`` is a fill, in payload order.
+
+    A CANCELED/REJECTED/EXPIRED/NEW/REPLACE/DONE_FOR_DAY row -- or one with no
+    ``type`` at all -- is excluded here, so its commission is never summed.
+    """
+    executions = payload.get("executions")
+    if not isinstance(executions, list):
+        return ()
+    return tuple(
+        item
+        for item in executions
+        if isinstance(item, Mapping) and item.get("type") in _FILL_EXECUTION_TYPES
+    )
+
+
+def _sum_last_shares(executions: tuple[Mapping[str, Any], ...]) -> Decimal | None:
+    total = ZERO
+    for item in executions:
+        raw = item.get("lastShares")
+        if raw is None:
+            return None
+        try:
+            total += Decimal(str(raw))
+        except (InvalidOperation, ValueError):
+            return None
+    return total
+
+
+def _sum_fill_commission(executions: tuple[Mapping[str, Any], ...]) -> Decimal | None:
+    total = ZERO
+    for item in executions:
+        amount = _amount_decimal(item.get("commissionNotionalCollected"))
+        if amount is None:
+            return None
+        total += amount
+    return total
+
+
+def _cumulative_qty_and_cost(
+    execution: Mapping[str, Any],
+) -> tuple[Decimal | None, Decimal | None]:
+    """Qty and cost sourced TOGETHER, from the order snapshot on ``execution``,
+    or together from this one execution's leg -- never mixed (I1a).
+
+    Deliberately NOT a composition of ``_cum_quantity`` and
+    ``_filled_cost_from_execution``: those two succeed independently (one
+    could resolve order-level while the other falls back to the leg), which
+    would pair a whole-order quantity with a one-leg cost or the reverse --
+    exactly the defect I1a forbids. This atomically checks both preconditions
+    before choosing the order-level source.
+    """
+    order = execution.get("order")
+    if isinstance(order, Mapping):
+        avg = _amount_decimal(order.get("avgPx"))
+        raw_cum = order.get("cumQuantity")
+        if avg is not None and raw_cum is not None:
+            try:
+                cum = Decimal(str(raw_cum))
+            except (InvalidOperation, ValueError):
+                cum = None
+            if cum is not None:
+                return cum, avg * cum
+    last_px = _amount_decimal(execution.get("lastPx"))
+    last_shares = execution.get("lastShares")
+    if last_px is not None and last_shares is not None:
+        try:
+            qty = Decimal(str(last_shares))
+        except (InvalidOperation, ValueError):
+            return None, None
+        return qty, last_px * qty
+    return None, None
+
+
+def _order_total_commission(execution: Mapping[str, Any]) -> Decimal | None:
+    order = execution.get("order")
+    if isinstance(order, Mapping):
+        return _amount_decimal(order.get("commissionNotionalTotalCollected"))
+    return None
+
+
+def _cumulative_fee_and_reconciliation(
+    payload: Mapping[str, Any],
+    execution: Mapping[str, Any],
+    *,
+    cumulative_qty: Decimal | None,
+) -> tuple[Decimal | None, bool]:
+    """I1a fee + ``fee_reconciled``.
+
+    ``fee_reconciled`` = (sum of fill-type ``lastShares`` == ``cumulative_qty``)
+    AND (order total absent, OR order total == the per-leg fill-type sum). The
+    quantity identity alone catches a dropped leg (the sum falls short of
+    ``cumulative_qty``), so the absent-total branch needs no extra condition.
+    """
+    fill_type = _fill_type_executions(payload)
+    leg_qty = _sum_last_shares(fill_type)
+    leg_fee = _sum_fill_commission(fill_type)
+    qty_reconciled = (
+        cumulative_qty is not None and leg_qty is not None and leg_qty == cumulative_qty
+    )
+    order_total = _order_total_commission(execution)
+    if order_total is not None:
+        fee_reconciled = qty_reconciled and leg_fee is not None and order_total == leg_fee
+        return order_total, fee_reconciled
+    return leg_fee, qty_reconciled and leg_fee is not None
+
+
 def fill_generation(
     execution: Mapping[str, Any],
     *,
@@ -453,6 +577,10 @@ def classify_create_order_outcome(
             venue_order_id=None,
             fill=None,
             filled_cost_usd=None,
+            cumulative_qty=None,
+            cumulative_cost=None,
+            cumulative_fee=None,
+            fee_reconciled=False,
             generate_submitted=False,
         )
     status = int(response.status)
@@ -472,6 +600,10 @@ def classify_create_order_outcome(
             venue_order_id=None,
             fill=None,
             filled_cost_usd=None,
+            cumulative_qty=None,
+            cumulative_cost=None,
+            cumulative_fee=None,
+            fee_reconciled=False,
             generate_submitted=False,
         )
 
@@ -482,6 +614,10 @@ def classify_create_order_outcome(
                 execution, instrument=instrument, account_id=account_id, ts_init=ts_init
             )
             if fill is not None:
+                cumulative_qty, cumulative_cost = _cumulative_qty_and_cost(execution)
+                cumulative_fee, fee_reconciled = _cumulative_fee_and_reconciliation(
+                    payload, execution, cumulative_qty=cumulative_qty
+                )
                 return CreateOrderOutcome(
                     kind=KIND_ACCEPT_FILL,
                     reason="200 with durable fill record",
@@ -489,6 +625,10 @@ def classify_create_order_outcome(
                     venue_order_id=order_id,
                     fill=fill,
                     filled_cost_usd=fill.filled_cost_usd,
+                    cumulative_qty=cumulative_qty,
+                    cumulative_cost=cumulative_cost,
+                    cumulative_fee=cumulative_fee,
+                    fee_reconciled=fee_reconciled,
                     generate_submitted=True,
                 )
         executions = payload.get("executions")
@@ -507,6 +647,10 @@ def classify_create_order_outcome(
                 venue_order_id=order_id,
                 fill=None,
                 filled_cost_usd=ZERO,
+                cumulative_qty=None,
+                cumulative_cost=None,
+                cumulative_fee=None,
+                fee_reconciled=False,
                 generate_submitted=True,
             )
 
@@ -517,6 +661,10 @@ def classify_create_order_outcome(
         venue_order_id=order_id,
         fill=None,
         filled_cost_usd=None,
+        cumulative_qty=None,
+        cumulative_cost=None,
+        cumulative_fee=None,
+        fee_reconciled=False,
         generate_submitted=order_id is not None,
     )
 

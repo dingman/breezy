@@ -37,7 +37,14 @@ from breezy.adapters.polymarket_us.exec.endpoints import (
     ACCOUNT_BALANCES_PATH,
     PORTFOLIO_POSITIONS_PATH,
 )
-from breezy.adapters.polymarket_us.exec.submit_chain import ORDER_BODY_KEYS, encode_order_body
+from breezy.adapters.polymarket_us.exec.submit_chain import (
+    KIND_ACCEPT_FILL,
+    KIND_REJECT,
+    KIND_ZERO_FILL,
+    ORDER_BODY_KEYS,
+    classify_create_order_outcome,
+    encode_order_body,
+)
 from breezy.adapters.polymarket_us.operator_controls import (
     MAX_DAILY_BUDGET_USD_ENV_VAR,
     MAX_POSITION_COST_USD_ENV_VAR,
@@ -54,6 +61,7 @@ from breezy.runtime.submit_intent import (
 )
 from tests.unit.operator_control_env import operator_control_env, operator_control_unset
 from tests.unit.polymarket_us_exec_shapes import (
+    ACCOUNT_ID,
     TS_EVENT_TEXT,
     build_execution,
     build_instrument,
@@ -816,3 +824,276 @@ def test_no_post_is_reachable_scan_finds_exactly_one_monkeypatch_fixture() -> No
         "tests/unit/test_polymarket_us_factories.py",
         "tests/unit/test_polymarket_us_submit_order_chain.py",
     ]
+
+
+# ---------------------------------------------------------------------------
+# I1a -- order-level totals on the classified outcome
+# (docs/plans/LIVE_FILL_SCORING_CHAIN_2026-09-05.md, section "I1a")
+#
+# These fixtures are stated schema-shaped from the SDK/OpenAPI snapshots
+# (``types/orders.py:70-108``; ``docs_snapshots/api-reference_orders_create-
+# order_2026-08-25.md``) -- NO recorded 200 body exists for a multi-leg fill,
+# so nothing here is a captured response. Every execution's embedded "order"
+# is the SAME final snapshot: the synchronous-execution create-order call
+# resolves the whole order lifecycle in one round trip, so by the time the
+# response is serialized every leg carries the terminal order state, never a
+# stale intermediate one.
+# ---------------------------------------------------------------------------
+
+
+def _i1a_order(
+    slug: str,
+    *,
+    cum_quantity: str | None,
+    avg_px: str | None,
+    commission_total: str | None,
+) -> dict[str, Any]:
+    order = build_order(slug)
+    order["id"] = "ord-i1a"
+    order["quantity"] = 1
+    order["leavesQuantity"] = 0
+    order["state"] = "ORDER_STATE_FILLED"
+    if cum_quantity is None:
+        order.pop("cumQuantity", None)
+    else:
+        order["cumQuantity"] = cum_quantity
+    if avg_px is None:
+        order.pop("avgPx", None)
+    else:
+        order["avgPx"] = {"value": avg_px, "currency": "USD"}
+    if commission_total is not None:
+        order["commissionNotionalTotalCollected"] = {
+            "value": commission_total,
+            "currency": "USD",
+        }
+    return order
+
+
+def _i1a_leg(
+    order: dict[str, Any],
+    *,
+    exec_id: str,
+    trade_id: str,
+    last_shares: str,
+    last_px: str,
+    commission: str | None,
+    exec_type: str | None = "EXECUTION_TYPE_FILL",
+) -> dict[str, Any]:
+    execution = build_execution(order)
+    execution["id"] = exec_id
+    execution["tradeId"] = trade_id
+    execution["lastShares"] = last_shares
+    execution["lastPx"] = {"value": last_px, "currency": "USD"}
+    if commission is None:
+        execution.pop("commissionNotionalCollected", None)
+    else:
+        execution["commissionNotionalCollected"] = {"value": commission, "currency": "USD"}
+    if exec_type is None:
+        execution.pop("type", None)
+    else:
+        execution["type"] = exec_type
+    return execution
+
+
+def _classify_i1a(executions: list[dict[str, Any]]) -> Any:
+    body = json.dumps({"id": "ord-i1a", "executions": executions}).encode("utf-8")
+    response = VenueResponse(status=200, headers={}, body=body)
+    return classify_create_order_outcome(
+        response,
+        instrument=build_instrument(),
+        account_id=ACCOUNT_ID,
+        ts_init=TS_INIT,
+    )
+
+
+def test_i1a_multi_leg_fill_totals_are_order_level() -> None:
+    slug = str(build_instrument().raw_symbol)
+    order = _i1a_order(slug, cum_quantity="1", avg_px="0.414", commission_total="0.05")
+    leg_a = _i1a_leg(
+        order,
+        exec_id="exe-a",
+        trade_id="trd-a",
+        last_shares="0.6",
+        last_px="0.41",
+        commission="0.03",
+    )
+    leg_b = _i1a_leg(
+        order,
+        exec_id="exe-b",
+        trade_id="trd-b",
+        last_shares="0.4",
+        last_px="0.42",
+        commission="0.02",
+    )
+    outcome = _classify_i1a([leg_a, leg_b])
+    assert outcome.kind == KIND_ACCEPT_FILL
+    assert outcome.cumulative_qty == Decimal(1)
+    assert outcome.cumulative_cost == Decimal("0.414")
+    assert outcome.cumulative_fee == Decimal("0.05")
+    assert outcome.fee_reconciled is True
+
+
+def test_i1a_a_canceled_row_with_a_stale_commission_is_ignored() -> None:
+    slug = str(build_instrument().raw_symbol)
+    order = _i1a_order(slug, cum_quantity="1", avg_px="0.41", commission_total=None)
+    fill_leg = _i1a_leg(
+        order,
+        exec_id="exe-1",
+        trade_id="trd-1",
+        last_shares="1",
+        last_px="0.41",
+        commission="0.03",
+    )
+    stale_cancel = _i1a_leg(
+        order,
+        exec_id="exe-2",
+        trade_id="trd-2",
+        last_shares="0",
+        last_px="0.41",
+        commission="0.99",
+        exec_type="EXECUTION_TYPE_CANCELED",
+    )
+    outcome = _classify_i1a([fill_leg, stale_cancel])
+    assert outcome.kind == KIND_ACCEPT_FILL
+    assert outcome.cumulative_fee == Decimal("0.03")
+    assert outcome.fee_reconciled is True
+
+
+def test_i1a_order_total_mismatch_leaves_fee_unreconciled() -> None:
+    slug = str(build_instrument().raw_symbol)
+    order = _i1a_order(slug, cum_quantity="1", avg_px="0.41", commission_total="0.05")
+    fill_leg = _i1a_leg(
+        order,
+        exec_id="exe-1",
+        trade_id="trd-1",
+        last_shares="1",
+        last_px="0.41",
+        commission="0.03",
+    )
+    outcome = _classify_i1a([fill_leg])
+    assert outcome.kind == KIND_ACCEPT_FILL
+    assert outcome.fee_reconciled is False
+    assert outcome.cumulative_fee == Decimal("0.05")
+
+
+def test_i1a_two_fill_legs_with_no_order_total_reconcile_on_the_leg_sum() -> None:
+    slug = str(build_instrument().raw_symbol)
+    order = _i1a_order(slug, cum_quantity="1", avg_px="0.415", commission_total=None)
+    leg_a = _i1a_leg(
+        order,
+        exec_id="exe-a",
+        trade_id="trd-a",
+        last_shares="0.5",
+        last_px="0.41",
+        commission="0.02",
+    )
+    leg_b = _i1a_leg(
+        order,
+        exec_id="exe-b",
+        trade_id="trd-b",
+        last_shares="0.5",
+        last_px="0.42",
+        commission="0.02",
+    )
+    outcome = _classify_i1a([leg_a, leg_b])
+    assert outcome.kind == KIND_ACCEPT_FILL
+    assert outcome.cumulative_fee == Decimal("0.04")
+    assert outcome.fee_reconciled is True
+
+
+def test_i1a_a_leg_with_no_type_is_never_summed_and_leaves_fee_unreconciled() -> None:
+    slug = str(build_instrument().raw_symbol)
+    order = _i1a_order(slug, cum_quantity="1", avg_px="0.41", commission_total=None)
+    fill_leg = _i1a_leg(
+        order,
+        exec_id="exe-a",
+        trade_id="trd-a",
+        last_shares="0.5",
+        last_px="0.41",
+        commission="0.02",
+    )
+    untyped_leg = _i1a_leg(
+        order,
+        exec_id="exe-b",
+        trade_id="trd-b",
+        last_shares="0.5",
+        last_px="0.41",
+        commission="0.02",
+        exec_type=None,
+    )
+    outcome = _classify_i1a([fill_leg, untyped_leg])
+    assert outcome.kind == KIND_ACCEPT_FILL
+    assert outcome.fee_reconciled is False
+    assert outcome.cumulative_fee == Decimal("0.02")
+
+
+def test_i1a_a_dropped_leg_leaves_fee_unreconciled() -> None:
+    slug = str(build_instrument().raw_symbol)
+    order = _i1a_order(slug, cum_quantity="1", avg_px="0.41", commission_total=None)
+    fill_leg = _i1a_leg(
+        order,
+        exec_id="exe-a",
+        trade_id="trd-a",
+        last_shares="0.6",
+        last_px="0.41",
+        commission="0.03",
+    )
+    outcome = _classify_i1a([fill_leg])
+    assert outcome.kind == KIND_ACCEPT_FILL
+    assert outcome.cumulative_qty == Decimal(1)
+    assert outcome.fee_reconciled is False
+    assert outcome.cumulative_fee == Decimal("0.03")
+
+
+def test_i1a_qty_and_cost_fall_back_together_when_the_order_lacks_avgpx_and_cumquantity() -> None:
+    slug = str(build_instrument().raw_symbol)
+    order = _i1a_order(slug, cum_quantity=None, avg_px=None, commission_total=None)
+    fill_leg = _i1a_leg(
+        order,
+        exec_id="exe-a",
+        trade_id="trd-a",
+        last_shares="1",
+        last_px="0.41",
+        commission="0.03",
+    )
+    outcome = _classify_i1a([fill_leg])
+    assert outcome.kind == KIND_ACCEPT_FILL
+    assert outcome.cumulative_qty == Decimal(1)
+    assert outcome.cumulative_cost == Decimal("0.41")
+    assert outcome.fee_reconciled is True
+
+
+def test_i1a_reject_and_zero_fill_outcomes_carry_no_cumulative_totals() -> None:
+    reject_response = VenueResponse(status=400, headers={}, body=_status_reject_body())
+    reject_outcome = classify_create_order_outcome(
+        reject_response,
+        instrument=build_instrument(),
+        account_id=ACCOUNT_ID,
+        ts_init=TS_INIT,
+    )
+    assert reject_outcome.kind == KIND_REJECT
+    assert reject_outcome.cumulative_qty is None
+    assert reject_outcome.cumulative_cost is None
+    assert reject_outcome.cumulative_fee is None
+    assert reject_outcome.fee_reconciled is False
+
+    zero_body = json.dumps(
+        {
+            "id": "ord-i1a-zero",
+            "executions": [],
+            "state": "ORDER_STATE_CANCELED",
+            "cumQuantity": 0,
+        }
+    ).encode("utf-8")
+    zero_response = VenueResponse(status=200, headers={}, body=zero_body)
+    zero_outcome = classify_create_order_outcome(
+        zero_response,
+        instrument=build_instrument(),
+        account_id=ACCOUNT_ID,
+        ts_init=TS_INIT,
+    )
+    assert zero_outcome.kind == KIND_ZERO_FILL
+    assert zero_outcome.cumulative_qty is None
+    assert zero_outcome.cumulative_cost is None
+    assert zero_outcome.cumulative_fee is None
+    assert zero_outcome.fee_reconciled is False
