@@ -13,6 +13,10 @@ from pathlib import Path
 
 import pytest
 
+from breezy.adapters.polymarket_us.operator_controls import (
+    MAX_DAILY_BUDGET_USD_ENV_VAR,
+    MAX_POSITION_COST_USD_ENV_VAR,
+)
 from breezy.registry.sites import default_registry
 from breezy.runtime.settings import (
     CURRENT_RUNG_HOLD_VAR,
@@ -28,6 +32,7 @@ from breezy.runtime.settings import (
     load_trade_settings,
     probe_total_bytes,
 )
+from tests.unit.operator_control_env import operator_control_env
 
 MINIMAL_ENV = {
     "BREEZY_SITES": "polymarket_us:NYC",
@@ -821,4 +826,75 @@ def test_orders_enabled_with_both_siblings_set_is_accepted() -> None:
     assert settings.orders_enabled_requested is True
     assert settings.current_rung_hold is True
     assert settings.live_observations is True
+
+
+# ---------------------------------------------------------------------------
+# 2026-09-05 live-node investigation: reproduce the deployed process
+# environment shape and call the SAME loader `app/trade.py::main()` calls
+# (`load_trade_settings()`, no `env` argument -> real `os.environ`), to
+# confirm or refute "the loader raises on this env" as the root cause of the
+# missing permit-issued/refused log lines. It does not raise -- see the
+# module docstring note below and the `app/trade.py` fix this pins.
+# ---------------------------------------------------------------------------
+
+
+def test_loader_succeeds_on_the_exact_deployed_env_shape(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """RED-first repro for the 2026-09-05 missing-permit-lines investigation.
+
+    Builds every env var the live pid 795413 was confirmed to carry (fake
+    values, all boolean flags exactly ``"1"``), including a 0600-mode key
+    file, and calls `load_trade_settings()` with NO `env` argument -- the
+    exact call shape `main()` uses -- so this exercises `os.environ`
+    reading, not an injected mapping.
+
+    This is a negative/exonerating result: `load_trade_settings` does NOT
+    raise on this env. The `settings=None` "swallowed exception" hypothesis
+    named in the investigation brief is therefore refuted for a
+    correctly-shaped env; the real defect (fixed in `app/trade.py`) was
+    that `main()`'s permit-audit lines ran before Nautilus's logging
+    subsystem (and its stdlib bridge, `runtime.logging_bridge`) existed, so
+    they were silently discarded regardless of this loader's outcome.
+    """
+    key_file = tmp_path / "polymarket_us_secret.key"
+    key_file.write_text("fake-secret-key-material\n")
+    key_file.chmod(0o600)
+    catalog_root = tmp_path / "catalog_root"
+    catalog_root.mkdir()
+
+    deployed_env = {
+        "BREEZY_TRADE_TRADER_ID": "BREEZY-L001",
+        "BREEZY_LOG_LEVEL": "INFO",
+        "BREEZY_TRADING_ENABLED": "1",
+        "BREEZY_ORDERS_ENABLED": "1",
+        "BREEZY_CURRENT_RUNG_HOLD": "1",
+        "BREEZY_LIVE_OBSERVATIONS": "1",
+        "BREEZY_TRADE_CATALOG_ROOT": str(catalog_root),
+        "BREEZY_TRADING_OPERATOR_ID": "operator@example.com",
+        "BREEZY_MAX_ORDER_NOTIONAL_USD": "5.00",
+        "BREEZY_MAX_SESSION_NOTIONAL_USD": "100.00",
+        "BREEZY_MAX_SESSION_ORDER_COUNT": "100",
+        "POLYMARKET_US_KEY_ID": "fake-key-id",
+        "POLYMARKET_US_SECRET_KEY_FILE": str(key_file),
+        "POLYMARKET_US_ACCOUNT_NUMBER": "fake-account-0001",
+        "POLYMARKET_US_EXEC_STATE_DB": str(tmp_path / "exec_state.sqlite3"),
+    }
+    for name, value in deployed_env.items():
+        monkeypatch.setenv(name, value)
+
+    # The two operator-reserved caps (deployed pid 795413 carried both) are
+    # driven through the whitelisted seam, never as literal mapping entries --
+    # see tests/unit/test_operator_control_assignment_scan.py rule A4.
+    with (
+        operator_control_env(MAX_DAILY_BUDGET_USD_ENV_VAR, "1000.00"),
+        operator_control_env(MAX_POSITION_COST_USD_ENV_VAR, "10.00"),
+    ):
+        settings = load_trade_settings()
+
+    assert settings is not None
+    assert settings.orders_enabled_requested is True
+    assert settings.current_rung_hold is True
+    assert settings.live_observations is True
+    assert settings.trader_id == "BREEZY-L001"
 

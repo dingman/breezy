@@ -14,6 +14,8 @@ opens its own latch.
 from __future__ import annotations
 
 import datetime as dt
+import logging
+import os
 import sys
 from collections.abc import Mapping
 from contextlib import ExitStack
@@ -28,7 +30,7 @@ from breezy.registry.sites import default_registry
 from breezy.runtime import trade_cli
 from breezy.runtime.health import AlertPayload, emit_alert, resolve_alert_sink
 from breezy.runtime.order_enablement import OrderSubmissionPermit, OrderSubmissionRefused
-from breezy.runtime.settings import SettingsError, load_trade_settings
+from breezy.runtime.settings import ORDERS_ENABLED_VAR, SettingsError, load_trade_settings
 from breezy.runtime.sqlite_store import SqliteStateStore
 from breezy.runtime.submit_intent import (
     SubmitIntentLockError,
@@ -63,6 +65,58 @@ LIVE_TRADING_PERMIT_REFUSED_SITE: Final[str] = "global"
 #: the one reason ever emitted; the name stays a closed enum for when a
 #: second call site needs a different member.
 LIVE_TRADING_PERMIT_REFUSED_DETAIL: Final[str] = "permit_missing"
+
+
+#: ``main()``'s permit-audit lines run BEFORE ``trade_cli.run()`` ever
+#: builds a ``TradingNode`` -- and it is that construction which both
+#: installs ``runtime.logging_bridge`` on the ``breezy`` namespace AND
+#: initialises NautilusTrader's own native logging subsystem (the
+#: bridge's target ``Logger`` is a documented no-op until then). Without a
+#: handler, an audit line logged prior to that point inherits the stdlib
+#: root logger's default (WARNING, no handler), so it is silently
+#: discarded -- not queued, not raised, never seen -- regardless of
+#: whether the permit it describes was actually minted. That is the root
+#: cause of the missing "live-trading permit issued"/"order submission
+#: permit not issued" lines: the process's real stdout+stderr ARE
+#: captured into the per-launch log file (``trade_supervisor.py::spawn``,
+#: ``stdout=log_fh, stderr=STDOUT``), so a plain stdlib handler attached
+#: directly here -- independent of Nautilus's own init order -- is
+#: sufficient.
+#:
+#: The audit lines are logged through a DEDICATED logger
+#: (``breezy.app.trade.boot``, below), never ``trade_cli.logger``
+#: (``breezy.runtime.trade_cli``): ``trade_cli.logger`` is the same logger
+#: ``trade_cli.run()`` uses for the whole node's runtime faults
+#: (``trade_cli.py:208,222,243,262``), and once ``run()`` installs
+#: ``runtime.logging_bridge`` on the ``breezy`` namespace, any handler left
+#: attached directly to ``trade_cli.logger`` would print every one of
+#: those lines twice for the node's entire life -- once raw, once via the
+#: bridge. The dedicated boot logger keeps this handler scoped to the
+#: boot-only audit lines and off ``trade_cli.logger`` entirely. Idempotent:
+#: safe to call on every ``main()`` invocation.
+_BOOT_LOG_FORMAT: Final[str] = "%(asctime)s [%(levelname)s] %(name)s: %(message)s"
+
+#: Name of the dedicated boot-audit logger -- deliberately NOT
+#: ``trade_cli.logger`` (``breezy.runtime.trade_cli``); see the module
+#: note above ``_BOOT_LOG_FORMAT``.
+_BOOT_LOGGER_NAME: Final[str] = "breezy.app.trade.boot"
+_boot_logger = logging.getLogger(_BOOT_LOGGER_NAME)
+
+
+def _ensure_boot_logging_visible() -> None:
+    """Attach a plain stderr handler to the dedicated boot-audit logger
+    (``breezy.app.trade.boot``) so its INFO+ lines reach the process's own
+    stdout/stderr from the first line of ``main()``, well before
+    ``runtime.logging_bridge``/Nautilus's own logging subsystem exist.
+    Never touches ``trade_cli.logger``, the ``breezy`` bridge namespace,
+    or the root logger.
+    """
+    if any(isinstance(h, logging.StreamHandler) for h in _boot_logger.handlers):
+        return
+    handler = logging.StreamHandler(sys.stderr)
+    handler.setFormatter(logging.Formatter(_BOOT_LOG_FORMAT))
+    _boot_logger.addHandler(handler)
+    _boot_logger.setLevel(logging.INFO)
 
 
 def _today_by_station() -> dict[str, dt.date]:
@@ -162,10 +216,13 @@ def main() -> int:
     here (``run`` loads its own copy) rather than threaded through, because
     this function must decide whether to mint the order-submission permit
     BEFORE ``run`` builds anything -- both loads read the same ``env`` and
-    are pure validation, so they agree. A settings load failure here is
-    swallowed (``settings = None``): ``run`` performs the SAME load and
-    reports the real configuration error through its existing path, so the
-    error is never duplicated or reported twice.
+    are pure validation, so they agree. A settings load failure here always
+    logs one unmistakable line and sets ``settings = None``; ``run``
+    performs the SAME load and reports the real configuration error through
+    its existing path, so the error is never duplicated or reported twice.
+    If ``BREEZY_ORDERS_ENABLED=1`` was requested, the failure is additionally
+    FATAL here (``EXIT_RUNTIME_ERROR``) rather than silently degrading to a
+    node that can never submit.
 
     A refusal from ``OrderSubmissionPermit.issue`` is FATAL, unlike a
     live-trading-permit refusal (which degrades to shadow mode): the
@@ -182,11 +239,13 @@ def main() -> int:
         issue_live_trading_permit,
     )
 
+    _ensure_boot_logging_visible()
+
     permit = None
     try:
         permit = issue_live_trading_permit(clock=LiveClock())
     except LiveTradingPermissionError as exc:
-        trade_cli.logger.info("live-trading permit not issued: %s", exc)
+        _boot_logger.info("live-trading permit not issued: %s", exc)
         emit_alert(
             resolve_alert_sink(),
             AlertPayload(
@@ -199,8 +258,31 @@ def main() -> int:
 
     try:
         settings = load_trade_settings()
-    except SettingsError:
+    except SettingsError as exc:
         settings = None
+        if os.environ.get(ORDERS_ENABLED_VAR) == "1":
+            # The operator requested the order path
+            # (``BREEZY_ORDERS_ENABLED=1``) but settings could not even be
+            # validated -- a request that cannot be honoured must stop the
+            # process loudly (same "requested but unminted" contract as the
+            # ``OrderSubmissionRefused`` branch below), never run a node
+            # that can never submit in silence. Substring matches
+            # ``trade_supervisor_core.PERMIT_NOT_ISSUED_MARKER`` on purpose,
+            # so the daily-relaunch supervisor classifies this exit-1 the
+            # same deterministic way it already classifies a refused permit.
+            _boot_logger.error(
+                "order submission permit not issued: settings load failed (%s)",
+                type(exc).__name__,
+            )
+            return EXIT_RUNTIME_ERROR
+        # Orders were never requested (or the raw request can't be told from
+        # here): ``run`` performs the SAME load and reports the real
+        # configuration error through its existing path, so this is a
+        # breadcrumb, not a duplicate report -- but it must never be silent.
+        _boot_logger.info(
+            "order submission permit not minted: settings load failed (%s)",
+            type(exc).__name__,
+        )
 
     order_submission_permit = None
     if settings is not None and settings.orders_enabled_requested:
@@ -211,7 +293,7 @@ def main() -> int:
                 clock=LiveClock(),
             )
         except OrderSubmissionRefused as exc:
-            trade_cli.logger.info("order submission permit not issued: %s", type(exc).__name__)
+            _boot_logger.info("order submission permit not issued: %s", type(exc).__name__)
             return EXIT_RUNTIME_ERROR
         else:
             # Both permits are minted at this point: ``issue`` above
@@ -221,12 +303,19 @@ def main() -> int:
             # never ``operator_id`` or any of the five other repr=False
             # fields (security R2).
             ttl_s = (permit.expires_at_ns - permit.issued_at_ns) // 1_000_000_000
-            trade_cli.logger.info(
+            _boot_logger.info(
                 "live-trading permit issued issued_at_ns=%d expires_at_ns=%d ttl_s=%d",
                 permit.issued_at_ns,
                 permit.expires_at_ns,
                 ttl_s,
             )
+    elif settings is not None:
+        # ``orders_enabled_requested`` is False: a legitimate shadow-mode
+        # boot, not a failure -- but still a silent skip until now. Uses
+        # "not minted" (never "not issued") so it never collides with
+        # ``trade_supervisor_core.PERMIT_NOT_ISSUED_MARKER``, which must
+        # only match a genuine refusal of an actual request.
+        _boot_logger.info("order submission permit not minted: orders not requested")
 
     return run(
         live_trading_permit=permit,
