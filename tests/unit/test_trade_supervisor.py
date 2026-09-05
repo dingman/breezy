@@ -16,6 +16,7 @@ from __future__ import annotations
 import ast
 import datetime as dt
 import fcntl
+import logging
 import os
 import subprocess
 import sys
@@ -29,6 +30,7 @@ from breezy.runtime.sqlite_store import SqliteStateStore
 from breezy.runtime.submit_intent import RetirementReason, open_submit_intent_latch
 from breezy.runtime.trade_supervisor import (
     EXIT_CONFIG_ERROR,
+    EXIT_OK,
     NODE_CONSOLE_SCRIPT,
     ExecStateDbNotConfiguredError,
     IncrementalLogReader,
@@ -38,6 +40,9 @@ from breezy.runtime.trade_supervisor import (
     _do_self_check,
     _do_stop_prior,
     _run_forever,
+    _SupervisorFileHandler,
+    _SupervisorStreamHandler,
+    configure_supervisor_logging,
     count_lock_holders,
     find_adopted_node_log,
     hold_supervisor_lock,
@@ -51,6 +56,7 @@ from breezy.runtime.trade_supervisor import (
     resolve_store_path,
     spawn_node,
     supervisor_lock_path,
+    supervisor_log_path,
     terminate,
     terminate_after_toctou_recheck,
 )
@@ -1563,3 +1569,113 @@ class TestFindAdoptedNodeLog:
 
         result = find_adopted_node_log(tmp_path, os.getpid())
         assert result == new_log
+
+
+# ===========================================================================
+# Production observation: launched with argv/RLIMIT_CORE/lock all correct,
+# but `main` never configured logging, so every INFO `log_decision` line
+# (including the 17:05 PASS/FAIL line) was silently dropped by Python's
+# WARNING-only "lastResort" handler. Fixed in `configure_supervisor_logging`,
+# called from `main` after argv validation and before the lock.
+# ===========================================================================
+
+
+def _logger_under_test() -> logging.Logger:
+    return logging.getLogger("breezy.runtime.trade_supervisor")
+
+
+def _count_supervisor_handlers() -> int:
+    """This module's logger is process-global and pytest's own log-capture
+    plugin attaches its OWN handler(s) to every named logger (to support
+    ``caplog`` even when the logger under test sets ``propagate = False``,
+    which :func:`configure_supervisor_logging` deliberately does) --
+    unrelated to this module's own idempotency. Count only the two marker
+    subclasses this module itself ever adds."""
+    return sum(
+        isinstance(h, _SupervisorFileHandler | _SupervisorStreamHandler)
+        for h in _logger_under_test().handlers
+    )
+
+
+def _reset_supervisor_logging_handlers() -> None:
+    """Test-only teardown: this module's logger is process-global, so tests
+    that configure it must not leak ITS OWN handlers (or a stale target
+    path) into a later test. Never touches a handler this module didn't
+    add (e.g. pytest's own capture handler) -- that is pytest's to manage."""
+    logger = _logger_under_test()
+    for handler in list(logger.handlers):
+        if isinstance(handler, _SupervisorFileHandler | _SupervisorStreamHandler):
+            handler.close()
+            logger.removeHandler(handler)
+
+
+class TestSupervisorLoggingConfiguration:
+    def teardown_method(self) -> None:
+        _reset_supervisor_logging_handlers()
+
+    def _run_main_with_fake_loop(self, *, monkeypatch, tmp_path, home: Path):
+        monkeypatch.setenv("HOME", str(home))
+        store_path = tmp_path / "state" / "store.sqlite3"
+        store_path.parent.mkdir(parents=True, exist_ok=True)
+        monkeypatch.setenv(EXEC_STATE_DB_ENV_VAR, str(store_path))
+        monkeypatch.setattr("breezy.runtime.trade_supervisor._run_forever", lambda **_kwargs: None)
+        return main([SUPERVISOR_ARGV_TOKEN])
+
+    def test_main_writes_supervisor_started_into_the_log_file(self, monkeypatch, tmp_path):
+        home = tmp_path / "home"
+        home.mkdir()
+        exit_code = self._run_main_with_fake_loop(
+            monkeypatch=monkeypatch, tmp_path=tmp_path, home=home
+        )
+        assert exit_code == EXIT_OK
+
+        log_dir = home / ".local" / "share" / "breezy" / "logs"
+        log_path = supervisor_log_path(log_dir)
+        assert log_path.exists()
+        content = log_path.read_text()
+        assert "supervisor_started" in content
+        # UTC-formatted timestamp prefix, per line -- e.g. "2026-09-05T...Z".
+        assert "Z INFO breezy.runtime.trade_supervisor supervisor_started" in content
+
+    def test_sentinel_env_value_never_appears_in_the_log_file(self, monkeypatch, tmp_path):
+        home = tmp_path / "home"
+        home.mkdir()
+        monkeypatch.setenv("BREEZY_TOTALLY_SECRET_SENTINEL", "sentinel-value-should-never-leak")
+        self._run_main_with_fake_loop(monkeypatch=monkeypatch, tmp_path=tmp_path, home=home)
+
+        log_path = supervisor_log_path(home / ".local" / "share" / "breezy" / "logs")
+        assert "sentinel-value-should-never-leak" not in log_path.read_text()
+
+    def test_handlers_are_not_duplicated_on_a_second_main_call(self, monkeypatch, tmp_path):
+        home = tmp_path / "home"
+        home.mkdir()
+        self._run_main_with_fake_loop(monkeypatch=monkeypatch, tmp_path=tmp_path, home=home)
+        count_after_first = _count_supervisor_handlers()
+
+        self._run_main_with_fake_loop(monkeypatch=monkeypatch, tmp_path=tmp_path, home=home)
+        count_after_second = _count_supervisor_handlers()
+
+        assert count_after_first == count_after_second
+        assert count_after_first == 2  # file + stderr, exactly once each
+
+    def test_configure_supervisor_logging_is_idempotent_for_the_same_target(self, tmp_path):
+        log_dir = tmp_path / "logs"
+        configure_supervisor_logging(log_dir)
+        configure_supervisor_logging(log_dir)
+        assert _count_supervisor_handlers() == 2
+
+    def test_configure_supervisor_logging_replaces_handlers_for_a_new_target(self, tmp_path):
+        configure_supervisor_logging(tmp_path / "logs-a")
+        configure_supervisor_logging(tmp_path / "logs-b")
+        handlers = _logger_under_test().handlers
+        assert _count_supervisor_handlers() == 2
+        file_handlers = [h for h in handlers if isinstance(h, _SupervisorFileHandler)]
+        assert len(file_handlers) == 1
+        assert Path(file_handlers[0].baseFilename) == supervisor_log_path(tmp_path / "logs-b")
+
+    def test_configured_logger_actually_emits_at_info_level(self, tmp_path):
+        log_dir = tmp_path / "logs"
+        configure_supervisor_logging(log_dir)
+        log_decision("a_test_decision", pid=123)
+        content = supervisor_log_path(log_dir).read_text()
+        assert "a_test_decision pid=123" in content

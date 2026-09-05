@@ -37,7 +37,7 @@ from collections.abc import Callable, Iterator, Mapping
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Final
+from typing import Final, TextIO
 
 from breezy.adapters.polymarket_us.factories import EXEC_STATE_DB_ENV_VAR
 from breezy.runtime.health import AlertPayload, AlertSink, emit_alert, resolve_alert_sink
@@ -49,12 +49,15 @@ from breezy.runtime.submit_intent import (
     SubmitIntentState,
 )
 from breezy.runtime.trade_supervisor_core import (
+    LAUNCH_UTC,
     MAX_RELAUNCH_ATTEMPTS,
     MIN_RELAUNCH_GAP,
     NODE_ARGV_ANCHOR,
     PERMIT_ISSUED_MARKER,
     RELAUNCH_CUTOFF_UTC,
     SELF_CHECK_ALERT_DETAIL,
+    SELF_CHECK_UTC,
+    STOP_PRIOR_UTC,
     STRATEGY_SUBSCRIBED_MARKER,
     SUPERVISOR_ARGV_TOKEN,
     AlertDetail,
@@ -546,6 +549,71 @@ def alert(
 
 
 # ---------------------------------------------------------------------------
+# Logging configuration -- attaching real handlers so `log_decision`'s and
+# `alert`'s log lines actually reach a file and stderr at INFO, instead of
+# being silently dropped by Python's WARNING-only "lastResort" handler
+# (the failure mode observed in production: `main` never configured
+# logging, so B4/S6's one-line-per-decision observability -- including the
+# 17:05 PASS/FAIL line -- was unobservable).
+# ---------------------------------------------------------------------------
+
+
+class _SupervisorFileHandler(logging.FileHandler):
+    """Marker subclass -- distinguishes this module's own file handler from
+    any other ``FileHandler`` a caller (or a test) might attach to the same
+    logger, purely for the idempotency check below."""
+
+
+class _SupervisorStreamHandler(logging.StreamHandler[TextIO]):
+    """Marker subclass, matching :class:`_SupervisorFileHandler`."""
+
+
+def configure_supervisor_logging(log_dir: Path) -> None:
+    """Attach a line-flushed file handler on ``supervisor_log_path(log_dir)``
+    (append mode) plus a stderr handler, both at INFO, in UTC. Idempotent:
+    a repeated call with the SAME ``log_dir`` (e.g. a defensive re-entry in
+    ``main``) is a no-op; a call with a DIFFERENT ``log_dir`` (only
+    possible in-process, e.g. across tests) replaces the prior handlers
+    rather than accumulating duplicates or leaking file descriptors.
+
+    Every formatted line uses ``asctime`` in UTC (``Formatter.converter =
+    time.gmtime``, never local time) -- never an environ value: the
+    formatter interpolates only the record's own level/name/message, and
+    every ``log_decision``/``alert`` caller already restricts itself to
+    static strings and int/str fields (see their own docstrings).
+    """
+    target = supervisor_log_path(log_dir)
+    for handler in logger.handlers:
+        if isinstance(handler, _SupervisorFileHandler) and Path(handler.baseFilename) == target:
+            return  # already configured for this exact target
+
+    for handler in list(logger.handlers):
+        if isinstance(handler, _SupervisorFileHandler | _SupervisorStreamHandler):
+            handler.close()
+            logger.removeHandler(handler)
+
+    log_dir.mkdir(parents=True, exist_ok=True)
+    formatter = logging.Formatter(
+        fmt="%(asctime)sZ %(levelname)s %(name)s %(message)s",
+        datefmt="%Y-%m-%dT%H:%M:%S",
+    )
+    formatter.converter = _time.gmtime
+
+    file_handler = _SupervisorFileHandler(target, mode="a")
+    file_handler.setLevel(logging.INFO)
+    file_handler.setFormatter(formatter)
+
+    stream_handler = _SupervisorStreamHandler(sys.stderr)
+    stream_handler.setLevel(logging.INFO)
+    stream_handler.setFormatter(formatter)
+
+    logger.addHandler(file_handler)
+    logger.addHandler(stream_handler)
+    logger.setLevel(logging.INFO)
+    logger.propagate = False
+
+
+# ---------------------------------------------------------------------------
 # Injectable I/O surface for the schedule loop's phase handlers -- every
 # field defaults to the real OS-backed function; tests override individual
 # fields with fakes (process table, lock probe, spawner, log reader, alert
@@ -871,9 +939,13 @@ def main(argv: list[str] | None = None) -> int:
     Requires the distinct argv token :data:`SUPERVISOR_ARGV_TOKEN` as the
     first positional argument [R8] so ``pgrep -f
     'breezy-trade-supervisor-daily$'`` can find exactly this process without
-    substring-matching the node's own ``breezy-trade`` argv. Acquires the
-    supervisor's own mutual-exclusion flock; a second instance logs loudly
-    and exits 2 [R7a]. Beyond argv validation and lock acquisition this
+    substring-matching the node's own ``breezy-trade`` argv. Configures
+    logging (:func:`configure_supervisor_logging`) immediately after argv
+    validation and before the lock, so every subsequent line -- including
+    a configuration-error refusal -- actually reaches
+    ``supervisor_log_path(log_dir)`` and stderr. Acquires the supervisor's
+    own mutual-exclusion flock; a second instance logs loudly and exits 2
+    [R7a]. Beyond argv validation, logging, and lock acquisition this
     function only wires the real I/O helpers above together for the
     long-running daily loop -- the decisions themselves are exercised
     directly, with fakes, in the pure-core tests.
@@ -889,20 +961,28 @@ def main(argv: list[str] | None = None) -> int:
 
     apply_core_limit()
 
+    repo_root = Path(__file__).resolve().parents[3]
+    node_bin = repo_root / ".venv" / "bin" / NODE_CONSOLE_SCRIPT
+    log_dir = Path.home() / ".local" / "share" / "breezy" / "logs"
+    configure_supervisor_logging(log_dir)
+
     try:
         store_path = resolve_store_path(os.environ)
     except ExecStateDbNotConfiguredError as exc:
         log_decision("configuration_error", missing=str(exc))
         return EXIT_CONFIG_ERROR
 
-    repo_root = Path(__file__).resolve().parents[3]
-    node_bin = repo_root / ".venv" / "bin" / NODE_CONSOLE_SCRIPT
-    log_dir = Path.home() / ".local" / "share" / "breezy" / "logs"
-
     lock_path = supervisor_lock_path(store_path)
     try:
         with hold_supervisor_lock(lock_path):
-            log_decision("supervisor_started")
+            log_decision(
+                "supervisor_started",
+                stop_prior_utc=str(STOP_PRIOR_UTC),
+                launch_utc=str(LAUNCH_UTC),
+                self_check_utc=str(SELF_CHECK_UTC),
+                lock_path=str(lock_path),
+                log_dir=str(log_dir),
+            )
             _run_forever(
                 store_path=store_path,
                 repo_root=repo_root,
