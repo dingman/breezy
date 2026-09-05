@@ -21,7 +21,14 @@ UMask=0077
 
 # No EnvironmentFile, deliberately: this unit holds no venue credential --
 # it reads a local parquet directory and writes a local Markdown report,
-# same posture as breezy-mb-daily.service.
+# same posture as breezy-mb-daily.service. The one line below is a
+# non-secret filesystem path literal (I3 BLOCK-1.1,
+# docs/plans/LIVE_FILL_SCORING_CHAIN_2026-09-05.md), byte-identical to the
+# same line in breezy-score-live-trials.service (BLOCK-1.3): the wrapper's
+# node-env pre-flight and its --fill-source argument to
+# live_family_tally.py both resolve from this var.
+Environment=POLYMARKET_US_EXEC_STATE_DB=/home/jon/.local/share/breezy/state/exec_polymarket_us.sqlite
+
 ExecStart=/home/jon/breezy/deploy/systemd/live-tally-run.sh
 
 # The tally is a local parquet scan plus a bootstrap (6e's BCa, B=10,000

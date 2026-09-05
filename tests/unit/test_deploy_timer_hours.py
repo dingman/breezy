@@ -68,3 +68,19 @@ def test_every_timer_file_is_parsed_by_this_test() -> None:
     names = {path.name for path in timer_files}
     assert "breezy-live-tally.timer" in names
     assert "breezy-mb-daily.timer" in names
+    assert "breezy-score-live-trials.timer" in names
+
+
+def test_1415_utc_is_owned_by_exactly_one_timer() -> None:
+    # I3 (LIVE_FILL_SCORING_CHAIN_2026-09-05.md): 14:15 UTC is the new
+    # score-live-trials tick, free on the pre-existing schedule (09:00,
+    # 13:30, 14:30, 15:30, 22:30, 22:45, 00/06/12/18:15). This is a targeted
+    # restatement of the collision test above, scoped to the one tick this
+    # increment adds, so a future timer added at 14:15 fails loudly here
+    # even if the general collision test above were ever weakened.
+    owners = [
+        timer_path.name
+        for timer_path in _all_timer_files()
+        if ("14", "15") in _clock_ticks(timer_path)
+    ]
+    assert owners == ["breezy-score-live-trials.timer"]

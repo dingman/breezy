@@ -70,6 +70,14 @@ say() { echo "$(date -u +%Y-%m-%dT%H:%M:%SZ) $*" >> "$LOG"; }
 STAMP=$(date -u +%Y-%m-%d)
 STATUS=0
 
+# I3 (docs/plans/LIVE_FILL_SCORING_CHAIN_2026-09-05.md, BLOCK-2): assert the
+# 14:15 score-live-trials-run.sh success marker before tallying -- never
+# invoke the CLI against a partial or unscored store.
+if [ ! -f "$OUT/score_live_trials_ok_$STAMP" ]; then
+  say "FAMILY TALLY V2 ($FAMILY) SKIPPED -- no score-live-trials success marker for $STAMP"
+  exit 1
+fi
+
 if "$PY" "$REPO/scripts/analysis/family_tally_v2.py" \
      --family "$FAMILY" \
      --store-dir "$STORE_DIR" \

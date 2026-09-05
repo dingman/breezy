@@ -545,6 +545,52 @@ discipline that applies to any future edit of this unit too.
 
 ---
 
+## `breezy-score-live-trials` — I3 live-fill scoring run (2026-09-05, PREPARED, NOT ACTIVATED)
+
+`breezy-score-live-trials.service` + `.timer` run the 14:15 UTC increment of
+`docs/plans/LIVE_FILL_SCORING_CHAIN_2026-09-05.md` (I3) via
+`deploy/systemd/score-live-trials-run.sh`, in the same wrapper-owns-the-work
+style as `live-tally-run.sh`. Each run: (1) a node-env pre-flight (`"$PY" -m
+breezy.runtime.exec_state_db_path --check`) binding the run to the actual
+running `breezy-trade` node's exec state DB, value-free; (2) the
+covered-listed-station-days counter (`scripts/analysis/
+structural_dead_stop.py`), run exactly ONCE here — `live-tally-run.sh` no
+longer runs it, it only reads this run's dated `--output` JSON
+(`covered_listed_station_days_<date>.json`); (3) one `scripts/analysis/
+score_live_trials.py` invocation per station named in that JSON (today
+LAX/MDW/MIA/SFO, the `pm_us_crh_v2` family manifest's census), each
+resolving its fill source in-process from `POLYMARKET_US_EXEC_STATE_DB`
+(`--fill-source` is never passed). Only after the counter AND every city's
+invocation exit 0 does the wrapper write the ONE dated success marker,
+`score_live_trials_ok_<date>`, under `~/.local/share/breezy/derived/` — the
+SOLE writer of that marker anywhere in this repo. Both `breezy-live-tally`
+(14:30 UTC) and `breezy-pm-crh-v2-tally` (15:30 UTC) assert it before
+tallying, so neither can run against a partial or unscored store (BLOCK-2).
+
+Scheduled at **14:15 UTC**, free on the existing schedule and strictly
+before both tallies it gates — pinned by
+`tests/unit/test_deploy_timer_hours.py`. The unit carries one non-secret
+`Environment=POLYMARKET_US_EXEC_STATE_DB=...` path literal, byte-identical
+to the same line in `breezy-live-tally.service`
+(`tests/unit/test_score_live_trials_deploy.py`); no `EnvironmentFile=`, no
+venue credential, no enablement value.
+
+Validation performed (no unit activated):
+
+```
+$ bash -n deploy/systemd/score-live-trials-run.sh
+OK
+```
+
+To activate: symlink both unit files into `~/.config/systemd/user/` (§2's
+pattern), `daemon-reload`, then
+`systemctl --user enable --now breezy-score-live-trials.timer` —
+deliberately not run here; see the TRAP section above for the post-edit
+`daemon-reload` discipline that applies to any future edit of this unit
+too.
+
+---
+
 ## `breezy-pm-crh-v2-tally` — PREREG v2 family tally, PM-only (2026-09-04, PREPARED, NOT ACTIVATED)
 
 One concrete unit pair runs `scripts/analysis/family_tally_v2.py` (the CLI
@@ -554,6 +600,11 @@ sibling of `live_family_tally.py`, built in a parallel commit) via
 (14:30 UTC) so v1's read is never raced. No templated `@.service` unit: the
 repo has no precedent for one, so this is a concrete pair per the existing
 convention.
+
+**I3 (2026-09-05):** the wrapper now asserts `breezy-score-live-trials`'s
+(14:15 UTC) dated success marker before invoking the CLI, exiting non-zero
+with one value-free log line when it is absent for today's date — never
+tallying a partial or unscored store (BLOCK-2 above).
 
 The Kalshi sibling unit pair (`breezy-kalshi-crh-tally.{service,timer}`,
 family `kalshi_crh_v1`, 16:30 UTC) is **parked on branch

@@ -8,6 +8,7 @@ verified without it.
 
 from __future__ import annotations
 
+import datetime as _dt
 import json
 import os
 import subprocess
@@ -38,13 +39,28 @@ def _valid_family_ids() -> set[str]:
 
 
 def _run_wrapper(
-    family_arg: list[str], tmp_path: Path, *, stub_python: Path | None = None
+    family_arg: list[str],
+    tmp_path: Path,
+    *,
+    stub_python: Path | None = None,
+    create_marker: bool = True,
 ) -> subprocess.CompletedProcess:
+    # I3 (LIVE_FILL_SCORING_CHAIN_2026-09-05.md, BLOCK-2): the wrapper now
+    # asserts the 14:15 score-live-trials-run.sh success marker before
+    # tallying. Every pre-existing test in this module drives the wrapper
+    # PAST that assertion by default (create_marker=True) so it exercises
+    # exactly what it did before this increment; the two new marker tests
+    # below flip it off.
+    out_dir = tmp_path / "derived"
     env = dict(os.environ)
     env["BREEZY_SCORED_TRIALS_DIR"] = str(tmp_path / "scored_trials")
-    env["BREEZY_LIVE_TALLY_OUTPUT_DIR"] = str(tmp_path / "derived")
+    env["BREEZY_LIVE_TALLY_OUTPUT_DIR"] = str(out_dir)
     if stub_python is not None:
         env["BREEZY_FAMILY_TALLY_V2_PYTHON"] = str(stub_python)
+    if create_marker:
+        out_dir.mkdir(parents=True, exist_ok=True)
+        stamp = _dt.datetime.now(_dt.UTC).strftime("%Y-%m-%d")
+        (out_dir / f"score_live_trials_ok_{stamp}").touch()
     return subprocess.run(
         ["bash", str(_WRAPPER), *family_arg],
         cwd=_REPO_ROOT,
@@ -122,6 +138,34 @@ def test_wrapper_never_lists_a_boundary_artefact_json_as_a_valid_family_id(
     result = _run_wrapper(["gs_boundary_pm_us_crh_v2"], tmp_path)
     assert result.returncode == 2
     assert "gs_boundary_pm_us_crh_v2" not in _valid_family_ids()
+
+
+def test_wrapper_exits_nonzero_and_never_invokes_the_tally_when_marker_absent(
+    tmp_path: Path,
+) -> None:
+    stub = tmp_path / "stub_python.sh"
+    capture = tmp_path / "argv_capture.txt"
+    stub.write_text(f'#!/usr/bin/env bash\nprintf "%s\\n" "$@" >> "{capture}"\nexit 0\n')
+    stub.chmod(0o755)
+
+    family_id = min(_valid_family_ids())
+    result = _run_wrapper([family_id], tmp_path, stub_python=stub, create_marker=False)
+
+    assert result.returncode != 0
+    assert not capture.exists()
+
+
+def test_wrapper_invokes_the_tally_when_marker_present(tmp_path: Path) -> None:
+    stub = tmp_path / "stub_python.sh"
+    capture = tmp_path / "argv_capture.txt"
+    stub.write_text(f'#!/usr/bin/env bash\nprintf "%s\\n" "$@" > "{capture}"\nexit 0\n')
+    stub.chmod(0o755)
+
+    family_id = min(_valid_family_ids())
+    result = _run_wrapper([family_id], tmp_path, stub_python=stub, create_marker=True)
+
+    assert result.returncode == 0, result.stderr
+    assert capture.exists()
 
 
 def test_wrapper_reports_failure_from_the_stub_analysis_script(tmp_path: Path) -> None:

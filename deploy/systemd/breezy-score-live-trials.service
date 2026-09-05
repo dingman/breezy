@@ -1,0 +1,50 @@
+[Unit]
+# I3 driver for the 14:15 UTC live-fill scoring run
+# (docs/plans/LIVE_FILL_SCORING_CHAIN_2026-09-05.md section 3.0/I3),
+# triggered by breezy-score-live-trials.timer. Sibling of
+# breezy-live-tally.service: same oneshot/no-Install shape, same
+# wrapper-script driver style (deploy/systemd/score-live-trials-run.sh) --
+# the timer owns cadence, the script owns the work.
+#
+# This unit runs the covered-listed-station-days counter
+# (scripts/analysis/structural_dead_stop.py) exactly once and then
+# scripts/analysis/score_live_trials.py once per manifest station,
+# resolving its fill source from the exec state DB via
+# POLYMARKET_US_EXEC_STATE_DB below. It writes the ONE dated success marker
+# (score_live_trials_ok_<date>) both the 14:30 v1 tally
+# (breezy-live-tally.service) and the 15:30 v2 tally
+# (breezy-pm-crh-v2-tally.service) assert before running -- see BLOCK-2 in
+# the plan above.
+Description=Breezy I3 live-fill scoring (14:15 UTC daily)
+Documentation=file:///home/jon/breezy/deploy/systemd/README.md
+Documentation=file:///home/jon/breezy/scripts/analysis/score_live_trials.py
+Documentation=file:///home/jon/breezy/docs/plans/LIVE_FILL_SCORING_CHAIN_2026-09-05.md
+
+[Service]
+Type=oneshot
+WorkingDirectory=/home/jon/breezy
+UMask=0077
+
+# No EnvironmentFile: this is a single non-secret filesystem path literal
+# (I3 BLOCK-1.1), never a venue credential, byte-identical to the same
+# line in breezy-live-tally.service (BLOCK-1.3).
+Environment=POLYMARKET_US_EXEC_STATE_DB=/home/jon/.local/share/breezy/state/exec_polymarket_us.sqlite
+
+ExecStart=/home/jon/breezy/deploy/systemd/score-live-trials-run.sh
+
+# The counter walks the quote-tape Parquet catalog (load_depth per
+# station-day) and the scorer runs once per manifest station -- generous
+# but bounded, well under breezy-mb-daily's network-bound budget.
+TimeoutStartSec=1200
+
+# No Restart=. A missed run is not an incident on its own -- both tally
+# wrappers refuse loudly (no marker) rather than tally a partial/no-op
+# scoring run. The timer's Persistent=true is what recovers a run missed
+# across a reboot.
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=breezy-score-live-trials
+
+# NOTE: no [Install] section. This unit is started BY the timer, never
+# enabled directly. `systemctl --user enable breezy-score-live-trials.timer`
+# is the only thing to enable.
