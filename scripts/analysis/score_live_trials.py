@@ -478,21 +478,41 @@ def read_filled_trials_state_db(
     activity today must not refuse a correct store). Raises
     `StorePositiveControlFailedError` otherwise.
 
-    Join and its three integrity events -- EXCLUSIONS, never `ScoreRefusal`
-    (BLOCK-3): (i) an instrument matching more than one TAKEN latch (within
-    this run's `city`, since `since_climate_day`) excludes every one of its
-    fills as `ambiguous_latch`; (ii) an instrument matching no taken latch at
-    all excludes every one of its fills as `no_taken_latch`, with
-    `trial_id`/`station`/`climate_day` = `""` (allowed for this reason
-    only); (iii) more than one fill record joining ONE latch excludes EACH
-    fill as `duplicate_fill_for_latch`, one line per `venue_order_id`, both
-    (or all) kept out of scoring. A `paper_replay/` latch key never matches
-    `family_prefix` (plain `str.startswith`).
+    Cross-city scoping (F1, security review of 5cd169a): the deployed
+    wrapper runs this reader once per manifest station over ONE store
+    SHARED by every city. Taken latches are indexed for EVERY city in the
+    store (still `climate_day >= since_climate_day` and `family_prefix`),
+    never filtered to this run's `city` up front -- filtering the latch
+    index to `city` made every OTHER city's correctly-taken, correctly-filled
+    trade look like this city's `no_taken_latch`, a false exclusion that is
+    PERMANENT under the artefact's `(venue_order_id, reason)` idempotence
+    key. Each fill's instrument is classified against the FULL cross-city
+    index: (a) exactly one taken latch and its city == this run's `city` ->
+    processed as today; (b) exactly one taken latch belonging to ANOTHER
+    city -> silently SKIPPED (never scored, never excluded here -- it is
+    that city's own invocation's fill to take); (c) no taken latch under
+    ANY city -> `no_taken_latch`, with identical `reason`/`detail`/identity
+    fields regardless of which city's invocation produced it, so every
+    invocation agrees on the one artefact line; (d) more than one taken
+    latch across any cities -> `ambiguous_latch`, unchanged.
 
-    A decoded fill record with `cumulative_qty <= 0` (F1) raises
-    `FillSourceUnreadableError` instead of joining -- an unscorable durable
-    record is store corruption, not a fill-level exclusion, so it fails the
-    whole run rather than being silently excluded or dropped.
+    Join integrity events -- EXCLUSIONS, never `ScoreRefusal` (BLOCK-3):
+    (i) `ambiguous_latch` (case d above); (ii) `no_taken_latch` (case c
+    above), with `trial_id`/`station`/`climate_day` = `""` (allowed for this
+    reason only); (iii) more than one fill record joining ONE latch excludes
+    EACH fill as `duplicate_fill_for_latch`, one line per `venue_order_id`,
+    both (or all) kept out of scoring. A `paper_replay/` latch key never
+    matches `family_prefix` (plain `str.startswith`).
+
+    Fail-closed on store corruption (F3, supersedes an earlier
+    skip-and-count design): a latch record that raises `TrialDayRecordCorrupt`
+    or a fill record that raises `ExecutionReportMappingError` on decode, or
+    a decoded fill record with `cumulative_qty <= 0` (F1), each raise
+    `FillSourceUnreadableError` instead of being joined, skipped, or
+    excluded -- an undecodable or unscorable durable record is STORE
+    corruption, never a per-fill exclusion, so it fails the whole run
+    closed. The message names only the key prefix and the violated rule,
+    never the key's content or the raw bytes.
 
     Returns `(trials, exclusions, fee_reconciled_by_trial_id)`; the third
     member maps `trial_id -> (fee_reconciled, venue_order_id)` so the caller
@@ -524,9 +544,12 @@ def read_filled_trials_state_db(
     if not has_census_latch:
         raise StorePositiveControlFailedError("store_positive_control_failed")
 
-    # instrument_id -> every TAKEN latch for this run's `city`, on or after
-    # `since_climate_day` (ISO-8601 dates sort lexicographically).
-    latches_by_instrument: dict[str, list[tuple[str, str, Decimal]]] = {}
+    # instrument_id -> every TAKEN latch across ALL cities sharing this
+    # store (F1 -- never filtered to this run's `city` up front), on or
+    # after `since_climate_day` (ISO-8601 dates sort lexicographically).
+    # Each entry also carries the latch's own `station` so a fill can be
+    # classified below as this run's city, another city's, or no city's.
+    latches_by_instrument: dict[str, list[tuple[str, str, Decimal, str]]] = {}
     for key, value in rows:
         if not isinstance(key, str) or not key.startswith(family_prefix):
             continue
@@ -534,16 +557,21 @@ def read_filled_trials_state_db(
         if len(parts) != 2:
             continue
         station, climate_day = parts
-        if station != city or climate_day < since_climate_day:
+        if climate_day < since_climate_day:
             continue
         try:
             record = TrialDayRecord.from_bytes(value)
-        except TrialDayRecordCorrupt:
-            continue
+        except TrialDayRecordCorrupt as exc:
+            # F3 (fail-closed): an undecodable latch record is store
+            # corruption, never a silent skip -- never the key's content or
+            # the raw bytes.
+            raise FillSourceUnreadableError(
+                f"a record under the {family_prefix!r} key prefix could not be decoded"
+            ) from exc
         if record.reason != _TAKEN_REASON:
             continue
         latches_by_instrument.setdefault(record.instrument_id, []).append(
-            (key, climate_day, record.ask)
+            (key, climate_day, record.ask, station)
         )
 
     fills_by_instrument: dict[str, list[DurableFillRecord]] = {}
@@ -552,16 +580,19 @@ def read_filled_trials_state_db(
             continue
         try:
             fill = DurableFillRecord.from_bytes(value)
-        except ExecutionReportMappingError:
-            continue
+        except ExecutionReportMappingError as exc:
+            # F3 (fail-closed): an undecodable fill record is store
+            # corruption, never a silent skip -- never the key's content or
+            # the raw bytes.
+            raise FillSourceUnreadableError(
+                f"a record under the {FILL_KEY_PREFIX!r} key prefix could not be decoded"
+            ) from exc
         # F1: a record that DECODES but carries a non-positive cumulative_qty
         # is unscorable -- `fill_px`/`fee` below divide by it -- and that is
         # store corruption, not a fill-level exclusion (never a member of
-        # `FillExclusionReason`). Unlike `ExecutionReportMappingError` and
-        # `TrialDayRecordCorrupt` just above (silently skipped, one bad
-        # record among many), this fails the WHOLE run closed, mirroring the
-        # open/read failures at the top of this function that already raise
-        # `FillSourceUnreadableError` -- never the actual value.
+        # `FillExclusionReason`). Fails the WHOLE run closed, mirroring the
+        # open/read failures at the top of this function and the decode
+        # failures just above -- never the actual value.
         if fill.cumulative_qty <= 0:
             raise FillSourceUnreadableError(
                 "a durable fill record has a non-positive cumulative_qty"
@@ -575,6 +606,10 @@ def read_filled_trials_state_db(
     for instrument_id, fills in fills_by_instrument.items():
         entries = latches_by_instrument.get(instrument_id, [])
         if not entries:
+            # F1 (c): no taken latch under ANY city -- emitted identically
+            # by every city's invocation (no city-specific text), so the
+            # artefact's `(venue_order_id, reason)` idempotence key sees the
+            # same content no matter which invocation writes first.
             for fill in fills:
                 exclusions.append(
                     FillExclusion(
@@ -584,19 +619,20 @@ def read_filled_trials_state_db(
                         qty=str(fill.cumulative_qty),
                         reason="no_taken_latch",
                         detail=(
-                            f"no taken latch under {family_prefix!r} for city "
-                            f"{city!r} matches instrument {instrument_id!r}"
+                            f"no taken latch under {family_prefix!r} matches "
+                            f"instrument {instrument_id!r}"
                         ),
                         venue_order_id=fill.venue_order_id,
                         filled_at_ns=fill.ts_event,
                     )
                 )
             continue
-        # More than one latch: report against the FIRST-landed one, purely
-        # for diagnostics -- which latch is "the" trial is exactly what is
-        # ambiguous, mirroring `_read_bucket_facts_by_instrument_id`'s
-        # first-landed-stands idiom elsewhere in this module.
-        trial_id, climate_day, ask = entries[0]
+        # More than one latch (F1 (d), across any cities): report against
+        # the FIRST-landed one, purely for diagnostics -- which latch is
+        # "the" trial is exactly what is ambiguous, mirroring
+        # `_read_bucket_facts_by_instrument_id`'s first-landed-stands idiom
+        # elsewhere in this module.
+        trial_id, climate_day, ask, latch_station = entries[0]
         if len(entries) > 1:
             for fill in fills:
                 exclusions.append(
@@ -614,6 +650,13 @@ def read_filled_trials_state_db(
                         filled_at_ns=fill.ts_event,
                     )
                 )
+            continue
+        if latch_station != city:
+            # F1 (b): this instrument's ONE taken latch belongs to another
+            # city's invocation of this same shared store. That city's own
+            # run takes (or excludes) this fill; silently skipping here --
+            # never scoring, never excluding -- is what stops it becoming a
+            # false, permanent `no_taken_latch` under THIS city's run.
             continue
         if len(fills) > 1:
             for fill in fills:
@@ -966,17 +1009,42 @@ def _append_excluded_fills(
     `main()` is the SOLE appender (BLOCK-3): `score_live_trials()` returns
     ONE merged exclusion tuple (the reader's join exclusions plus
     `_admit_fill`'s), and this is the ONE write site for it.
+
+    F2 (security review of 5cd169a): the read-back of this artefact's OWN
+    prior content, used only to build the idempotence set, must never crash
+    this run -- a truncated trailing line left by a killed prior append is
+    expected, not exceptional. A line that fails `json.loads` or lacks the
+    `venue_order_id`/`reason` keys is skipped for the idempotence set and
+    logged once per malformed line, naming only the artefact path and the
+    1-based line number (never the line's content). The file is NEVER
+    rewritten -- the malformed line is left exactly as found. If the file's
+    existing content does not end with `\n` (the truncation case), a
+    leading `\n` is written before any new line so the next append never
+    concatenates onto a partial line.
     """
     if not exclusions:
         return
     path = derived_dir / _EXCLUDED_FILLS_ARTEFACT_NAME
     existing_keys: set[tuple[str, str]] = set()
+    needs_leading_newline = False
     if path.exists():
-        for line in path.read_text(encoding="utf-8").splitlines():
+        text = path.read_text(encoding="utf-8")
+        needs_leading_newline = bool(text) and not text.endswith("\n")
+        for lineno, line in enumerate(text.splitlines(), start=1):
             if not line.strip():
                 continue
-            row = json.loads(line)
-            existing_keys.add((row["venue_order_id"], row["reason"]))
+            try:
+                row = json.loads(line)
+                key = (row["venue_order_id"], row["reason"])
+            except (json.JSONDecodeError, KeyError, TypeError):
+                logging.getLogger(__name__).warning(
+                    "%s: line %d is malformed and was skipped for the "
+                    "idempotence set; the file is never rewritten",
+                    path,
+                    lineno,
+                )
+                continue
+            existing_keys.add(key)
     new_lines: list[str] = []
     for fill in exclusions:
         key = (fill.venue_order_id, fill.reason)
@@ -1001,6 +1069,8 @@ def _append_excluded_fills(
         return
     derived_dir.mkdir(parents=True, exist_ok=True)
     with path.open("a", encoding="utf-8") as fh:
+        if needs_leading_newline:
+            fh.write("\n")
         for line in new_lines:
             fh.write(line + "\n")
 

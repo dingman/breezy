@@ -37,9 +37,11 @@ sys.path.insert(0, (REPO_ROOT / "scripts/analysis").as_posix())
 import score_live_trials as slt_module
 from score_live_trials import (
     _EXCLUDED_FILLS_ARTEFACT_NAME,
+    FillExclusion,
     FillSourceUnreadableError,
     NodeStorePreflightRefused,
     StorePositiveControlFailedError,
+    _append_excluded_fills,
     _with_scheduled_release_at_ns,
     main,
     read_filled_trials_state_db,
@@ -418,6 +420,34 @@ def test_a_negative_cumulative_qty_fill_raises_fill_source_unreadable(tmp_path: 
         read_filled_trials_state_db(store_path, **_reader_kwargs())
 
 
+def test_a_corrupt_fill_record_raises_fill_source_unreadable(tmp_path: Path) -> None:
+    """F3 (fail-closed, supersedes an earlier skip-and-count design): a fill
+    key whose bytes do not decode is STORE corruption, never a silent skip
+    and never a per-fill exclusion -- the whole run refuses closed, exactly
+    like the non-positive `cumulative_qty` case just above."""
+    store_path = tmp_path / "state.sqlite"
+    store = SqliteStateStore(store_path)
+    _seed_latch(store)
+    store.set(f"{FILL_KEY_PREFIX}corrupt-v1", b"not valid json for a fill record")
+    store.close()
+
+    with pytest.raises(FillSourceUnreadableError):
+        read_filled_trials_state_db(store_path, **_reader_kwargs())
+
+
+def test_a_corrupt_latch_record_raises_fill_source_unreadable(tmp_path: Path) -> None:
+    """F3: a latch key under `family_prefix` whose bytes do not decode is
+    STORE corruption, never a silent skip -- the whole run refuses closed."""
+    store_path = tmp_path / "state.sqlite"
+    store = SqliteStateStore(store_path)
+    store.set(_latch_key(_STATION, _DAY_ISO), b"not valid json for a latch record")
+    _seed_fill(store, venue_order_id="v1")
+    store.close()
+
+    with pytest.raises(FillSourceUnreadableError):
+        read_filled_trials_state_db(store_path, **_reader_kwargs())
+
+
 def test_an_empty_but_valid_store_fails_the_positive_control(tmp_path: Path) -> None:
     store_path = tmp_path / "state.sqlite"
     store = SqliteStateStore(store_path)
@@ -441,6 +471,136 @@ def test_a_latch_for_another_census_station_passes_the_positive_control(tmp_path
     # latch or fill, so the join is empty -- an honest, valid result.
     assert trials == ()
     assert exclusions == ()
+
+
+def test_one_valid_latch_alongside_one_corrupt_latch_still_refuses(tmp_path: Path) -> None:
+    """F3 (c): the store positive control decodes NOTHING -- it only checks
+    key shape -- so a valid census latch must never mask a corrupt latch
+    elsewhere in the same store. The run still refuses closed."""
+    store_path = tmp_path / "state.sqlite"
+    store = SqliteStateStore(store_path)
+    _seed_latch(store, station=_STATION, climate_day=_DAY_ISO, instrument_id=_INSTRUMENT_ID)
+    store.set(_latch_key(_STATION, "2026-09-06"), b"not valid json for a latch record")
+    _seed_fill(store, venue_order_id="v1")
+    store.close()
+
+    with pytest.raises(FillSourceUnreadableError):
+        read_filled_trials_state_db(store_path, **_reader_kwargs())
+
+
+# ---------------------------------------------------------------------------
+# cross-city scoping over a store shared by every manifest station (F1)
+# ---------------------------------------------------------------------------
+
+
+def test_a_fill_for_another_citys_taken_latch_is_skipped_not_excluded(tmp_path: Path) -> None:
+    """F1 (security review of 5cd169a): the deployed wrapper runs this
+    scorer once per manifest station over ONE SHARED store. Seeds a LAX
+    taken latch + LAX fill AND an MDW taken latch + MDW fill in the SAME
+    store; running for `--city LAX` must yield exactly the LAX trial with
+    ZERO exclusions (the MDW fill is silently skipped, never touched), and
+    running for `--city MDW` must yield exactly the MDW trial with zero
+    exclusions."""
+    store_path = tmp_path / "state.sqlite"
+    store = SqliteStateStore(store_path)
+    _seed_latch(
+        store, station="LAX", climate_day=_DAY_ISO, instrument_id="lax-instr", ask=Decimal("0.40")
+    )
+    _seed_fill(store, venue_order_id="lax-v1", instrument_id="lax-instr")
+    _seed_latch(
+        store, station="MDW", climate_day=_DAY_ISO, instrument_id="mdw-instr", ask=Decimal("0.35")
+    )
+    _seed_fill(store, venue_order_id="mdw-v1", instrument_id="mdw-instr")
+    store.close()
+
+    lax_trials, lax_exclusions, lax_fee_map = read_filled_trials_state_db(
+        store_path,
+        **_reader_kwargs(city="LAX", cli_location="LAX", stations=("LAX", "MDW")),
+    )
+    assert lax_exclusions == ()
+    assert len(lax_trials) == 1
+    assert lax_trials[0].instrument_id == "lax-instr"
+    assert lax_fee_map == {_latch_key("LAX", _DAY_ISO): (True, "lax-v1")}
+
+    mdw_trials, mdw_exclusions, mdw_fee_map = read_filled_trials_state_db(
+        store_path,
+        **_reader_kwargs(city="MDW", cli_location="MDW", stations=("LAX", "MDW")),
+    )
+    assert mdw_exclusions == ()
+    assert len(mdw_trials) == 1
+    assert mdw_trials[0].instrument_id == "mdw-instr"
+    assert mdw_fee_map == {_latch_key("MDW", _DAY_ISO): (True, "mdw-v1")}
+
+
+def test_no_taken_latch_anywhere_is_identical_across_every_citys_invocation(
+    tmp_path: Path,
+) -> None:
+    """F1 (c): an instrument with NO taken latch under ANY city must produce
+    the identical `FillExclusion` no matter which city's invocation reads
+    the shared store -- the artefact's `(venue_order_id, reason)`
+    idempotence key means only the FIRST writer's content survives, so
+    every invocation must agree on that content."""
+    store_path = tmp_path / "state.sqlite"
+    store = SqliteStateStore(store_path)
+    _seed_latch(store, station="LAX", climate_day=_DAY_ISO, instrument_id="lax-instr")
+    _seed_latch(store, station="MDW", climate_day=_DAY_ISO, instrument_id="mdw-instr")
+    _seed_fill(store, venue_order_id="orphan-v1", instrument_id="no-such-instrument")
+    store.close()
+
+    lax_trials, lax_exclusions, _lax_fee_map = read_filled_trials_state_db(
+        store_path,
+        **_reader_kwargs(city="LAX", cli_location="LAX", stations=("LAX", "MDW")),
+    )
+    mdw_trials, mdw_exclusions, _mdw_fee_map = read_filled_trials_state_db(
+        store_path,
+        **_reader_kwargs(city="MDW", cli_location="MDW", stations=("LAX", "MDW")),
+    )
+
+    assert lax_trials == () and mdw_trials == ()
+    assert len(lax_exclusions) == 1 and len(mdw_exclusions) == 1
+    assert lax_exclusions[0].reason == mdw_exclusions[0].reason == "no_taken_latch"
+    assert lax_exclusions[0].detail == mdw_exclusions[0].detail
+    assert lax_exclusions[0].trial_id == mdw_exclusions[0].trial_id == ""
+    assert lax_exclusions[0].venue_order_id == mdw_exclusions[0].venue_order_id == "orphan-v1"
+
+
+def test_no_taken_latch_from_two_citys_invocations_writes_one_artefact_line(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """F1, end to end through the CLI: the deployed wrapper runs this
+    scorer once per manifest station over the SAME shared store and SAME
+    derived dir. A fill with no taken latch anywhere is `no_taken_latch`
+    from BOTH invocations -- idempotent on `(venue_order_id, reason)`, so
+    the artefact still carries exactly one line, never two."""
+    store_path = tmp_path / "state.sqlite"
+    store = SqliteStateStore(store_path)
+    _seed_latch(store, station="LAX", climate_day=_DAY_ISO, instrument_id="lax-instr")
+    _seed_fill(store, venue_order_id="orphan-v1", instrument_id="no-such-instrument")
+    store.close()
+
+    manifest_path = _write_manifest(tmp_path, stations=["LAX", "MDW"])
+    derived_dir = tmp_path / "derived"
+    monkeypatch.setenv("POLYMARKET_US_EXEC_STATE_DB", str(store_path))
+    proc_root = tmp_path / "proc"
+    proc_root.mkdir()  # scannable, empty -- NO_NODE, never the real /proc
+
+    common_argv = [
+        "--family-manifest",
+        str(manifest_path),
+        "--derived-dir",
+        str(derived_dir),
+        "--catalog-base",
+        str(tmp_path / "catalog"),
+    ]
+    assert main([*common_argv, "--city", "LAX"], proc_root=proc_root) == 0
+    assert main([*common_argv, "--city", "MDW"], proc_root=proc_root) == 0
+
+    artefact = derived_dir / _EXCLUDED_FILLS_ARTEFACT_NAME
+    raw_lines = artefact.read_text(encoding="utf-8").splitlines()
+    lines = [json.loads(line) for line in raw_lines if line.strip()]
+    assert len(lines) == 1
+    assert lines[0]["reason"] == "no_taken_latch"
+    assert lines[0]["venue_order_id"] == "orphan-v1"
 
 
 # ---------------------------------------------------------------------------
@@ -691,6 +851,58 @@ def test_excluded_fills_artefact_has_exactly_eight_keys_and_is_idempotent(
     }
 
 
+def test_a_truncated_trailing_artefact_line_does_not_crash_append(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """F2 (security review of 5cd169a): `_append_excluded_fills`'s own
+    read-back of the artefact's PRIOR content must tolerate a truncated
+    trailing line left by a killed prior run -- never crash this run. The
+    malformed line is left exactly as-is (never rewritten); the next append
+    begins on a fresh line even though the prior content did not end with
+    `\\n`."""
+    derived_dir = tmp_path / "derived"
+    derived_dir.mkdir()
+    artefact = derived_dir / _EXCLUDED_FILLS_ARTEFACT_NAME
+    good_line = json.dumps(
+        {
+            "trial_id": "t0",
+            "station": "LAX",
+            "climate_day": _DAY_ISO,
+            "venue_order_id": "v0",
+            "qty": "1",
+            "reason": "no_taken_latch",
+            "filled_at_ns": 1,
+            "scored_run_utc": "2026-09-04T00:00:00Z",
+        }
+    )
+    partial_line = '{"trial_id": "t1", "reason": "no_ta'
+    # deliberately no trailing "\n" -- the truncation case (killed mid-write)
+    artefact.write_text(good_line + "\n" + partial_line, encoding="utf-8")
+
+    exclusion = FillExclusion(
+        trial_id="",
+        station="",
+        climate_day="",
+        qty="1",
+        reason="no_taken_latch",
+        detail="orphan",
+        venue_order_id="v1",
+        filled_at_ns=2,
+    )
+
+    with caplog.at_level(logging.WARNING):
+        _append_excluded_fills(derived_dir, [exclusion], scored_run_utc="2026-09-05T00:00:00Z")
+
+    raw_lines = artefact.read_text(encoding="utf-8").splitlines()
+    assert raw_lines[0] == good_line
+    assert raw_lines[1] == partial_line  # left exactly as found, never rewritten
+    appended = json.loads(raw_lines[2])
+    assert appended["venue_order_id"] == "v1"
+    assert any(
+        "malformed" in r.message.lower() and str(artefact) in r.message for r in caplog.records
+    )
+
+
 def test_a_zero_cumulative_qty_fill_makes_main_refuse_without_scoring(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
@@ -735,6 +947,86 @@ def test_a_zero_cumulative_qty_fill_makes_main_refuse_without_scoring(
     # value-free: neither the seeded cost/fee nor a raw traceback leaks
     assert "0.42" not in captured.err
     assert "0.01" not in captured.err
+    assert "Traceback" not in captured.err
+    assert not (derived_dir / _EXCLUDED_FILLS_ARTEFACT_NAME).exists()
+    assert read_scored_trials(derived_dir) == ()
+
+
+def test_a_corrupt_fill_key_makes_main_refuse_without_scoring_or_artefact(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """F3 (a), end to end through the CLI: a fill key holding undecodable
+    bytes makes `main()` exit non-zero, print a value-free refused line, and
+    write no scored row and no artefact line -- never a silent skip."""
+    store_path = tmp_path / "state.sqlite"
+    store = SqliteStateStore(store_path)
+    _seed_latch(store)
+    store.set(f"{FILL_KEY_PREFIX}corrupt-v1", b"not valid json for a fill record")
+    store.close()
+
+    manifest_path = _write_manifest(tmp_path)
+    derived_dir = tmp_path / "derived"
+    monkeypatch.setenv("POLYMARKET_US_EXEC_STATE_DB", str(store_path))
+    proc_root = tmp_path / "proc"
+    proc_root.mkdir()
+
+    exit_code = main(
+        [
+            "--city",
+            _CITY,
+            "--family-manifest",
+            str(manifest_path),
+            "--derived-dir",
+            str(derived_dir),
+            "--catalog-base",
+            str(tmp_path / "catalog"),
+        ],
+        proc_root=proc_root,
+    )
+
+    assert exit_code != 0
+    captured = capsys.readouterr()
+    assert "score_live_trials: refused" in captured.err
+    assert "Traceback" not in captured.err
+    assert not (derived_dir / _EXCLUDED_FILLS_ARTEFACT_NAME).exists()
+    assert read_scored_trials(derived_dir) == ()
+
+
+def test_a_corrupt_latch_key_makes_main_refuse_without_scoring_or_artefact(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """F3 (b), end to end through the CLI: a latch key holding corrupt
+    bytes makes `main()` exit non-zero, print a value-free refused line,
+    and write no scored row and no artefact line -- never a silent skip."""
+    store_path = tmp_path / "state.sqlite"
+    store = SqliteStateStore(store_path)
+    store.set(_latch_key(_STATION, _DAY_ISO), b"not valid json for a latch record")
+    _seed_fill(store, venue_order_id="v1")
+    store.close()
+
+    manifest_path = _write_manifest(tmp_path)
+    derived_dir = tmp_path / "derived"
+    monkeypatch.setenv("POLYMARKET_US_EXEC_STATE_DB", str(store_path))
+    proc_root = tmp_path / "proc"
+    proc_root.mkdir()
+
+    exit_code = main(
+        [
+            "--city",
+            _CITY,
+            "--family-manifest",
+            str(manifest_path),
+            "--derived-dir",
+            str(derived_dir),
+            "--catalog-base",
+            str(tmp_path / "catalog"),
+        ],
+        proc_root=proc_root,
+    )
+
+    assert exit_code != 0
+    captured = capsys.readouterr()
+    assert "score_live_trials: refused" in captured.err
     assert "Traceback" not in captured.err
     assert not (derived_dir / _EXCLUDED_FILLS_ARTEFACT_NAME).exists()
     assert read_scored_trials(derived_dir) == ()
