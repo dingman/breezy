@@ -123,7 +123,7 @@ unexercised end-to-end. Nautilus cannot cancel an INITIALIZED order.
 **[VERDICT] NO FAMILY HAS A PROVEN EDGE; ONE IS UNDER LIVE MEASUREMENT.**
 Forecast family KILLED; post-lock lock family REFUTED ×3 (L-9); K1 DEAD ≥2c (`docs/evidence/grok_*_2026-09-02.md`). **M_A**: the pre-lock afternoon window IS offered. **M_B** (kill n≥60 / survive n≥150, `grok_mb_kill_amendment_2026-09-02.md`): 09-04 run n_taken=2 (both 09-01, both lost); 09-02 VENUE-NEVER-LISTED, 09-03 lost to the recorder outage. **Live family** = lags 30/45, NYC excluded, interval rule (`grok_live_small_spec_rev2_2026-09-04.md`); accrues via `breezy-mb-daily.timer` 13:30Z + `breezy-live-tally.timer` 14:30Z (09-04 tally n=0). The venue skips ~9% of station-days (`MISSING_COHORT_2026-09-02_2026-09-03.md`). M_B's kill rule binds the family; the plumbing is no longer parked (operator 09-04).
 **LIVE since 2026-09-04 17:54 UTC** (`BREEZY-L001`; supervisor pid 3348182 launches 16:50Z daily, `docs/plans/R8_OPERATOR_RUNBOOK.md`). 09-05: unattended cycle VERIFIED; self_check false-negative fixed `06d8900` (**restart the supervisor after 01:00Z, before 16:40Z 09-06**); permit audit lines were never written (L-30), fixed `f85a452`, first visible 17:46Z; RSS flat. OPEN:
-- **Zero live fills ever; live n=0** (venue private-read 5xx 17:46–19:51Z, reconnected 19:51Z). [LOW] `scripts/venue/polymarket_us_auth_smoke.py` bit-rotted (IndexError).
+- **First live order 20:19Z (SFO IOC @0.28) → AMBIGUOUS**; venue read 22:55Z: no order/fill/position. Intent OPEN = account-wide lockout: **retire after 01:00Z (`breezy-clear-submit-intent --resolution no-order-exists`, evidence in scratchpad), then restart supervisor** (cron 01:07Z). n=0. Ruling needed: taken zero-fill IOC counts for n?
 - **[HIGH] Structural-dead KILL automated `c21f9bf`** (v2 tally could never fire it at n<10). **Open ruling for the strategy lead:** "covered" counts recorder capture, not trade-node liveness/permit — 15 node-down days would KILL the family (`docs/evidence/codex_structural_dead_diff_review_2026-09-05.md`, domain review). Grok balance exhausted (402) and Codex quota (until ~20:08 local) — operator top-up; ruling queued.
 - Whole-tape paper replay `7e44abd` (`~/.local/share/breezy/derived/paper_replay/`): 12/12 CLEAN instances, 14 station-days replayed, take **6/14 per arm** (lags 30 = 45), 13 BLOCKED (5 empty window, 4 no FINAL, 4 NYC). NO VERDICT; on-disk report still shows the pooled `12/14` (code fixed, not regenerated).
 - [MED] strategies subscribe all 24 instruments; [LOW] `BREEZY-NWS` SubscribeData ERROR is cosmetic; recorder `7f353f94` salvage unverified, `887d2005` CORRUPT.
@@ -133,9 +133,7 @@ Forecast family KILLED; post-lock lock family REFUTED ×3 (L-9); K1 DEAD ≥2c (
 
 ## Pointers
 
-Polymarket.us docs re-check `docs/evidence/venue/polymarket_us/DOCS_RECHECK_2026-09-03.md`
-(no venue max size; no retail idempotency key; fees/tick/min-qty unchanged;
-`api.polymarket.us/v1/events` now 401s unauthenticated; public reads use the gateway).
+Polymarket.us docs re-check `docs/evidence/venue/polymarket_us/DOCS_RECHECK_2026-09-03.md`.
 
 Durable rules `docs/core/LESSONS.md` (L-1..L-13, all binding) · evidence
 `docs/evidence/` · live plan `docs/plans/EXEC_SPINE_2026-09-01.md` · runbook
