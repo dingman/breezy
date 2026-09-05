@@ -646,6 +646,47 @@ async def test_an_ambiguous_outcome_keeps_the_latch_open_and_does_not_release_th
     assert "nonce" not in joined.lower()
 
 
+def test_ambiguous_exception_path_source_logs_the_exception_type_never_its_str() -> None:
+    """The DEFECT: the exception path logged only the constant reason, with no
+    way to tell which exception fired or what it said. Nautilus's own Cython
+    ``self._log`` is not stdlib ``logging``, so ``caplog`` cannot observe it
+    dynamically -- see ``test_shadow_log_line_names_the_permit_gate`` in
+    ``test_current_rung_hold_strategy.py`` for the same, already-established
+    limitation in this codebase. The source text is the reliable check that
+    the exception's TYPE is now logged, and that its ``str`` -- which may
+    embed a secret-shaped URL or header -- never is."""
+    import inspect
+
+    source = inspect.getsource(PolymarketUSExecutionClient._submit_order)
+    start = source.index("response = await self._order_sender.post_order(")
+    end = source.index("outcome = submit_chain.classify_create_order_outcome(")
+    exception_block = source[start:end]
+    assert "path=exception" in exception_block
+    assert "exc_type={exc.__class__.__name__}" in exception_block
+    assert "client_order_id=" in exception_block
+    assert "{exc}" not in exception_block
+    assert "str(exc)" not in exception_block
+
+
+def test_ambiguous_classified_path_source_logs_the_venues_shape_not_its_body() -> None:
+    """The DEFECT: the classifier's AMBIGUOUS path logged only the constant
+    reason -- never the response status, the ``google.rpc.Status`` code, or
+    the body length. Source-text check for the same reason as above: the
+    residual AMBIGUOUS branch (the LAST ``self._refuse(AMBIGUOUS_REASON)`` in
+    the method -- the first is the exception path above) now logs
+    ``outcome.detail``, which ``classify_create_order_outcome`` computes as a
+    redacted status/shape/rpc-code/length summary
+    (``test_classify_ambiguous_status_body_off_the_4xx_range_reports_rpc_code_and_length``
+    pins its exact value for a 503 with a Status body)."""
+    import inspect
+
+    source = inspect.getsource(PolymarketUSExecutionClient._submit_order)
+    classified_block = source[source.rindex("self._refuse(submit_chain.AMBIGUOUS_REASON)") :]
+    assert "path=classified" in classified_block
+    assert "outcome.detail" in classified_block
+    assert "client_order_id=" in classified_block
+
+
 @pytest.mark.asyncio
 async def test_a_raising_state_store_before_the_post_means_no_post_occurs(
     tmp_path: Path,
@@ -1057,6 +1098,43 @@ def test_executions_with_only_non_fill_rows_are_ambiguous_not_accept_fill() -> N
     assert outcome.cumulative_cost is None
     assert outcome.cumulative_fee is None
     assert outcome.fee_reconciled is False
+
+
+def test_classify_ambiguous_with_no_response_reports_a_none_shaped_detail() -> None:
+    """No response at all (the transport never returned one) -- every detail
+    field is the ``none`` sentinel, never a guess."""
+    outcome = classify_create_order_outcome(
+        None, instrument=build_instrument(), account_id=ACCOUNT_ID, ts_init=1
+    )
+    assert outcome.kind == KIND_AMBIGUOUS
+    assert outcome.detail == "status=none body_kind=none rpc_code=none body_len=0"
+
+
+def test_classify_ambiguous_status_body_off_the_4xx_range_reports_rpc_code_and_length() -> None:
+    """A ``google.rpc.Status`` body at a status the classifier's REJECT branch
+    does not cover (503, not 4xx) falls through to AMBIGUOUS. The detail
+    reports the venue's actual answer -- status, shape, its rpc code, and the
+    body length -- never the body content itself."""
+    body = _status_reject_body()
+    response = VenueResponse(status=503, headers={}, body=body)
+    outcome = classify_create_order_outcome(
+        response, instrument=build_instrument(), account_id=ACCOUNT_ID, ts_init=1
+    )
+    assert outcome.kind == KIND_AMBIGUOUS
+    assert outcome.detail == (
+        f"status=503 body_kind=status-no-order-id rpc_code=3 body_len={len(body)}"
+    )
+
+
+def test_classify_ambiguous_unparseable_body_reports_that_shape() -> None:
+    response = VenueResponse(status=200, headers={}, body=b"not json")
+    outcome = classify_create_order_outcome(
+        response, instrument=build_instrument(), account_id=ACCOUNT_ID, ts_init=1
+    )
+    assert outcome.kind == KIND_AMBIGUOUS
+    assert outcome.detail == (
+        f"status=200 body_kind=unparseable rpc_code=none body_len={len(response.body)}"
+    )
 
 
 def test_i1a_order_total_mismatch_leaves_fee_unreconciled() -> None:

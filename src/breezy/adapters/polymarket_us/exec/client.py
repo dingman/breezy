@@ -1608,6 +1608,15 @@ class PolymarketUSExecutionClient(LiveExecutionClient):
         except Exception as exc:
             self._refuse(submit_chain.AMBIGUOUS_REASON)
             self._log.error(submit_chain.AMBIGUOUS_REASON)
+            # Exception TYPE only -- never its message, which may embed a
+            # URL, header, or other request detail the transport layer
+            # raised against (see `redact_url` at the transport boundary,
+            # which this log line does not have the luxury of re-applying).
+            self._log.error(
+                "create-order AMBIGUOUS detail: path=exception "
+                f"exc_type={exc.__class__.__name__} "
+                f"client_order_id={order.client_order_id.value}"
+            )
             if submit_chain.is_cancelled(exc):
                 raise
             return
@@ -1737,6 +1746,14 @@ class PolymarketUSExecutionClient(LiveExecutionClient):
             return
         self._refuse(submit_chain.AMBIGUOUS_REASON)
         self._log.error(submit_chain.AMBIGUOUS_REASON)
+        # `outcome.detail` is redacted (shape and length only, never body
+        # content) by `submit_chain._ambiguous_detail` -- safe to log even
+        # though the response it summarises may be adversarial.
+        if outcome.detail is not None:
+            self._log.error(
+                "create-order AMBIGUOUS detail: path=classified "
+                f"{outcome.detail} client_order_id={order.client_order_id.value}"
+            )
         if outcome.generate_submitted:
             self._generate_submitted(order, now_ns)
 
