@@ -2688,7 +2688,7 @@ def test_x1_the_live_scan_actually_reaches_a_test_that_imports_the_exec_package(
     # Old -> new (previous row): added `tests/unit/test_fill_time_count.py`
     # and `tests/unit/test_live_family_tally_fill_source_cli.py`.
     #
-    # Old -> new (this row, I2 live fill scoring chain,
+    # Old -> new (previous row, I2 live fill scoring chain,
     # `LIVE_FILL_SCORING_CHAIN_2026-09-05.md` I5): added
     # `tests/unit/test_score_live_trials_state_db_source.py`, which the plan
     # MANDATES import `DurableFillRecord` from `exec.client` directly to seed
@@ -2698,9 +2698,23 @@ def test_x1_the_live_scan_actually_reaches_a_test_that_imports_the_exec_package(
     # MARKERS` and constructs no client -- `DurableFillRecord` is a plain
     # data record, built directly from literal fields, exactly like its
     # fill-tally-spine siblings above.
+    #
+    # Old -> new (this row, I5 end-to-end contract test,
+    # `LIVE_FILL_SCORING_CHAIN_2026-09-05.md` I5): added
+    # `tests/contract/test_live_fill_scoring_chain_contract.py`, which the
+    # plan MANDATES import `DurableFillRecord` from `exec.client` directly
+    # (rather than seed from a hand-written JSON blob) so the real
+    # `_submit_order` accept-fill branch's on-disk record is decoded through
+    # the SAME encoding the module verifies -- never a second, drifting copy.
+    # WIDENED, not relaxed (L-12): the comparison is still `==`; the module
+    # carries no `SOCKET_RESTORING_MARKERS` -- it drives the REAL client
+    # through the shipped `_build_accept_fill_rig` (`test_polymarket_us_exec_
+    # client.py`), whose `post_order` is the injected `_FakeOrderSender`, so
+    # this suite never opens a socket either.
     assert exec_importing_test_modules() == {
         "tests/contract/test_exec_client_reconciliation_contract.py",
         "tests/contract/test_exec_client_wiring_contract.py",
+        "tests/contract/test_live_fill_scoring_chain_contract.py",
         "tests/unit/test_current_rung_hold_order_submission_wiring.py",
         "tests/unit/test_exec_refusal_health_surface.py",
         "tests/unit/test_polymarket_us_exec_client.py",
