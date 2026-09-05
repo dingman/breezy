@@ -369,12 +369,15 @@ def _cum_quantity(payload: Mapping[str, Any]) -> Decimal | None:
 
 
 def _durable_execution(payload: Mapping[str, Any]) -> Mapping[str, Any] | None:
-    executions = payload.get("executions")
-    if not isinstance(executions, list):
-        return None
-    for item in executions:
-        if not isinstance(item, Mapping):
-            continue
+    """First fill-type execution carrying a durable order id, price, size and
+    trade id.
+
+    Filtered through :func:`_fill_type_executions` (I1a's own fee filter) so a
+    CANCELED/REJECTED/EXPIRED/NEW/REPLACE/DONE_FOR_DAY row -- or one with no
+    ``type`` at all -- is never selected even when it happens to carry stale
+    ``lastPx``/``lastShares``/``tradeId`` values ahead of the real fill row.
+    """
+    for item in _fill_type_executions(payload):
         order = item.get("order")
         if not isinstance(order, Mapping):
             continue

@@ -28,8 +28,8 @@ from nautilus_trader.execution.messages import SubmitOrder
 from nautilus_trader.model.currencies import USD
 from nautilus_trader.model.enums import OrderSide, TimeInForce
 from nautilus_trader.model.events import OrderDenied, OrderFilled, OrderRejected, OrderSubmitted
-from nautilus_trader.model.identifiers import ClientId, StrategyId, TraderId
-from nautilus_trader.model.objects import Quantity
+from nautilus_trader.model.identifiers import ClientId, StrategyId, TradeId, TraderId
+from nautilus_trader.model.objects import Price, Quantity
 
 from breezy.adapters.polymarket_us import write_transport
 from breezy.adapters.polymarket_us.exec.client import PolymarketUSExecutionClient
@@ -39,6 +39,7 @@ from breezy.adapters.polymarket_us.exec.endpoints import (
 )
 from breezy.adapters.polymarket_us.exec.submit_chain import (
     KIND_ACCEPT_FILL,
+    KIND_AMBIGUOUS,
     KIND_REJECT,
     KIND_ZERO_FILL,
     ORDER_BODY_KEYS,
@@ -957,6 +958,105 @@ def test_i1a_a_canceled_row_with_a_stale_commission_is_ignored() -> None:
     assert outcome.kind == KIND_ACCEPT_FILL
     assert outcome.cumulative_fee == Decimal("0.03")
     assert outcome.fee_reconciled is True
+
+
+def test_a_stale_canceled_row_before_the_real_fill_is_never_durably_selected() -> None:
+    """Guards the I1b durable-execution selection, not just the I1a fee sum.
+
+    A CANCELED row that happens to carry ``lastPx``/``lastShares``/``tradeId``
+    and is LISTED BEFORE the real FILL row must never be the execution
+    ``_durable_execution`` hands to ``fill_generation``/``_cumulative_*`` --
+    only ``EXECUTION_TYPE_FILL``/``EXECUTION_TYPE_PARTIAL_FILL`` rows qualify.
+    """
+    slug = str(build_instrument().raw_symbol)
+    order = _i1a_order(slug, cum_quantity="1", avg_px="0.41", commission_total=None)
+    stale_cancel = _i1a_leg(
+        order,
+        exec_id="exe-1",
+        trade_id="trd-stale",
+        last_shares="1",
+        last_px="0.99",
+        commission="0.99",
+        exec_type="EXECUTION_TYPE_CANCELED",
+    )
+    fill_leg = _i1a_leg(
+        order,
+        exec_id="exe-2",
+        trade_id="trd-1",
+        last_shares="1",
+        last_px="0.41",
+        commission="0.03",
+    )
+    outcome = _classify_i1a([stale_cancel, fill_leg])
+    baseline = _classify_i1a([fill_leg])
+
+    assert outcome.kind == KIND_ACCEPT_FILL
+    assert outcome.fill is not None
+    assert outcome.fill.trade_id == TradeId("trd-1")
+    assert outcome.fill.last_px == Price.from_str("0.41")
+    assert outcome.cumulative_qty == baseline.cumulative_qty == Decimal(1)
+    assert outcome.cumulative_cost == baseline.cumulative_cost == Decimal("0.41")
+    assert outcome.cumulative_fee == baseline.cumulative_fee == Decimal("0.03")
+    assert outcome.fee_reconciled is baseline.fee_reconciled is True
+
+
+def test_an_untyped_row_before_the_real_fill_is_never_durably_selected() -> None:
+    """Same guard as above for a row carrying NO ``type`` at all (I1a's other
+    excluded case), listed before the real FILL row."""
+    slug = str(build_instrument().raw_symbol)
+    order = _i1a_order(slug, cum_quantity="1", avg_px="0.41", commission_total=None)
+    stale_untyped = _i1a_leg(
+        order,
+        exec_id="exe-1",
+        trade_id="trd-stale",
+        last_shares="1",
+        last_px="0.99",
+        commission="0.99",
+        exec_type=None,
+    )
+    fill_leg = _i1a_leg(
+        order,
+        exec_id="exe-2",
+        trade_id="trd-1",
+        last_shares="1",
+        last_px="0.41",
+        commission="0.03",
+    )
+    outcome = _classify_i1a([stale_untyped, fill_leg])
+    baseline = _classify_i1a([fill_leg])
+
+    assert outcome.kind == KIND_ACCEPT_FILL
+    assert outcome.fill is not None
+    assert outcome.fill.trade_id == TradeId("trd-1")
+    assert outcome.cumulative_qty == baseline.cumulative_qty == Decimal(1)
+    assert outcome.cumulative_cost == baseline.cumulative_cost == Decimal("0.41")
+    assert outcome.cumulative_fee == baseline.cumulative_fee == Decimal("0.03")
+    assert outcome.fee_reconciled is baseline.fee_reconciled is True
+
+
+def test_executions_with_only_non_fill_rows_are_ambiguous_not_accept_fill() -> None:
+    """A non-empty ``executions`` list holding only CANCELED/untyped rows has
+    no durable fill execution. It also fails the KIND_ZERO_FILL predicate
+    (that requires ``executions == []``), so the residual is KIND_AMBIGUOUS --
+    never KIND_ACCEPT_FILL on a stale row's data."""
+    slug = str(build_instrument().raw_symbol)
+    order = _i1a_order(slug, cum_quantity="0", avg_px=None, commission_total=None)
+    stale_cancel = _i1a_leg(
+        order,
+        exec_id="exe-1",
+        trade_id="trd-stale",
+        last_shares="1",
+        last_px="0.99",
+        commission="0.99",
+        exec_type="EXECUTION_TYPE_CANCELED",
+    )
+    outcome = _classify_i1a([stale_cancel])
+    assert outcome.kind == KIND_AMBIGUOUS
+    assert outcome.fill is None
+    assert outcome.cumulative_qty is None
+    assert outcome.cumulative_cost is None
+    assert outcome.cumulative_fee is None
+    assert outcome.fee_reconciled is False
 
 
 def test_i1a_order_total_mismatch_leaves_fee_unreconciled() -> None:
