@@ -122,18 +122,17 @@ unexercised end-to-end. Nautilus cannot cancel an INITIALIZED order.
 
 **[VERDICT] NO FAMILY HAS A PROVEN EDGE; ONE IS UNDER LIVE MEASUREMENT.**
 Forecast family KILLED; post-lock lock family REFUTED ×3 (L-9); K1 DEAD ≥2c (`docs/evidence/grok_*_2026-09-02.md`). **M_A**: the pre-lock afternoon window IS offered. **M_B** (kill n≥60 / survive n≥150, `grok_mb_kill_amendment_2026-09-02.md`): 09-04 run n_taken=2 (both 09-01, both lost); 09-02 VENUE-NEVER-LISTED, 09-03 lost to the recorder outage. **Live family** = lags 30/45, NYC excluded, interval rule (`grok_live_small_spec_rev2_2026-09-04.md`); accrues via `breezy-mb-daily.timer` 13:30Z + `breezy-live-tally.timer` 14:30Z (09-04 tally n=0). The venue skips ~9% of station-days (`MISSING_COHORT_2026-09-02_2026-09-03.md`). M_B's kill rule binds the family; the plumbing is no longer parked (operator 09-04).
-**LIVE since 2026-09-04 17:54 UTC** (`BREEZY-L001`; one process per trading day from a shell exporting the seven §6 values, `docs/plans/R8_OPERATOR_RUNBOOK.md`). **21:42Z the node was SIGTERMed by the coordinator session ending** (nohup inside the session's process group); relaunched 22:06Z detached (own SID). OPEN:
-- **[MED] Daily relaunch supervisor LIVE** (`breezy-trade-supervisor`, `cbcb1ab..2e033b8`, own-SID pid since 09-05 00:40Z, file log). Node stopped 04:24Z (memory incident below); first unattended cycle 16:40/16:50/17:05 UTC still unverified (Monitor armed). Follow-up: node memory cap via `systemd-run --scope -p MemoryHigh=` needs adoption + anchored-pgrep proof (planning gate).
-- Live fill → scored-trial chain LIVE 09-05 (`7fbc7eb`; plan `docs/plans/LIVE_FILL_SCORING_CHAIN_2026-09-05.md`). Open: verify the first 14:15 scorer / 14:30 v1 / 15:30 v2 journal runs; `generate_fill_reports` docstring stale; function-length/`sys.path` follow-ups.
-- [MED] live strategies each subscribe all 24 instruments (latch bounds ≤1/station-day); [LOW] `SubscribeData(client_id=BREEZY-NWS)` ERROR line is cosmetic.
-- Memory leak fixed `99b8db0` (L-29). Open: recorder SIGTERM stop timed out → systemd SIGKILL 04:34Z, instance `7f353f94` truncated (salvage at the next rotate must be verified); the 16:50Z node's RSS must stay flat.
+**LIVE since 2026-09-04 17:54 UTC** (`BREEZY-L001`; supervisor pid 3348182 launches 16:50Z daily, `docs/plans/R8_OPERATOR_RUNBOOK.md`). 09-05: unattended cycle VERIFIED; self_check false-negative fixed `06d8900` (**restart the supervisor after 01:00Z, before 16:40Z 09-06**); permit audit lines were never written (L-30), fixed `f85a452`, first visible 17:46Z; RSS flat. OPEN:
+- **[HIGH] Venue private read `/v1/account/balances` → 500 since ~17:46Z** (public WS healthy; taxonomy: backend degraded, not auth — cf. 09-02). Exec client fails fast by design; a detached loop relaunches every 10 min through 01:00Z. Zero live fills ever; live n=0.
+- **[HIGH] Structural-dead KILL automated `c21f9bf`** (v2 tally could never fire it at n<10). **Open ruling for the strategy lead:** "covered" counts recorder capture, not trade-node liveness/permit — 15 node-down days would KILL the family (`docs/evidence/codex_structural_dead_diff_review_2026-09-05.md`, domain review). Grok balance exhausted (402) and Codex quota (until ~20:08 local) — operator top-up; ruling queued.
+- Whole-tape paper replay `7e44abd` (`~/.local/share/breezy/derived/paper_replay/`): 12/12 CLEAN instances, 14 station-days replayed, take **6/14 per arm** (lags 30 = 45), 13 BLOCKED (5 empty window, 4 no FINAL, 4 NYC). NO VERDICT; on-disk report still shows the pooled `12/14` (code fixed, not regenerated).
+- [MED] strategies subscribe all 24 instruments; [LOW] `BREEZY-NWS` SubscribeData ERROR is cosmetic; recorder `7f353f94` salvage unverified, `887d2005` CORRUPT.
+- Clock: 4 cities × 0.91 listed × take 0.25–0.43 ⇒ 0.9–1.6 trials/day; n=60 KILL 38–66 d. Kalshi S11 (KYC/funding/key) remains the only station lever and is operator-only.
 
 ---
 
 ## Pointers
 
-2026-09-03: Kalshi plan `docs/plans/KALSHI_INTEGRATION_PLAN_2026-09-03.md` (plan
-only, gated on the Polymarket.us E2E proof; 41 VERIFIED / 20 UNVERIFIED / 10 MISSING).
 Polymarket.us docs re-check `docs/evidence/venue/polymarket_us/DOCS_RECHECK_2026-09-03.md`
 (no venue max size; no retail idempotency key; fees/tick/min-qty unchanged;
 `api.polymarket.us/v1/events` now 401s unauthenticated; public reads use the gateway).

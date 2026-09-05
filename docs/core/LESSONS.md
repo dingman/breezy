@@ -1227,3 +1227,17 @@ suspecting caches, threads or fds; confirm with a RED test that feeds N
 messages and asserts the collection's size is O(1) in N. Related: [[L-3]]
 (reach the goal state), [[L-19]] (simulate the change), [[L-27]] (process-
 global sinks).
+
+## L-30 — A missing log line proves only that nothing was written, not that nothing happened (2026-09-05)
+
+### What happened
+Eight trade-node logs since the first launch carried no `live-trading permit issued` line. Two agents in one session promoted that absence into "the node has no permit; the live trial could never fill", and a memory was written to that effect. A unit test on the exact deployed environment then showed the settings loader succeeds and `orders_enabled_requested` is True. The permit block in `main()` logged through stdlib `logging` before `trade_cli.run()` installed the Nautilus bridge; the root logger had no handler, so every audit line was dropped on every boot. The permit was almost certainly minted all along.
+
+### Why this is binding
+The inference "no line ⇒ no event" is only valid when the emitting path is known to be handled. Nautilus-logger lines and stdlib-logger lines share one file but not one handler, so a log can look complete while an entire audit stream is silently discarded. The wrong conclusion cost a hand relaunch of a healthy node during the trading window.
+
+### The rule
+Before concluding from an absent log line, prove the line CAN appear: find the emitter, find its handler at that moment of the process lifecycle, and if possible find one historical occurrence. If none of those is available, the state is UNKNOWN, never disproven, and the memory says so.
+
+### How to apply
+Boot-time audit lines go through a logger with its own handler attached before anything else runs (`breezy.app.trade.boot`, `f85a452`). An enabled-but-unminted node exits non-zero instead of running silently. Agents briefing from logs state the emitter and handler for any negative claim.
