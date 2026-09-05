@@ -312,3 +312,21 @@ by-id `generate_order_status_report` (:938-985) is already the mechanism. Deferr
 
 **Build order:** **I1a -> I1b -> {I2 || I3 || I3c} -> I5.** I1b consumes I1a's fields; I2/I3/I3c are mutually independent once the record shape is fixed and may be built in parallel; I5 binds the
 finished chain and is last.
+
+## 7. Build-time disposition (coordinator, 2026-09-05, before the stage-B fan-out)
+
+- **Where the counter runs.** §3.0(e) says the scorer wrapper "loops `manifest.stations`" but a shell wrapper cannot
+  load the manifest without a `$PY -c` call, which collides with the stub-interpreter test idiom (round 4). Disposition:
+  `score-live-trials-run.sh` (14:15) runs `structural_dead_stop.py --family-manifest "$FAMILY_MANIFEST" --output
+  "$OUT/covered_listed_station_days_$STAMP.json"` ONCE, FIRST; it then loops the `stations` array of that JSON
+  (`sed -nE 's/^    "([A-Z]{3,4})",?$/\1/p'` under `indent=2`, array items at indent 4) invoking the scorer per city;
+  the marker is written only after the counter AND every city exited 0. `live-tally-run.sh` (14:30) no longer invokes
+  the counter: it asserts the marker, then reads `count` and `fetch_start` from that same dated JSON (absent JSON ⇒
+  non-zero, value-free line). One counter run per day, one file, three consumers (scorer cities, v1 numerator window,
+  v1 denominator). The v1 wrapper's change list item "(3) invoke the counter" becomes "(3) read the counter JSON".
+- **I3 is built as two increments on disjoint files:** I3-counter (`scripts/analysis/structural_dead_stop.py` +
+  `tests/unit/test_structural_dead_stop_cli.py`) and I3-deploy (units, wrappers, deploy tests, timer-hours test); the
+  deploy tests stub `$PY`, so I3-deploy does not depend on I3-counter, the leaf, or I2 being built.
+- **The leaf `runtime/exec_state_db_path.py` (I2 R8/REVISE-1) is built as its own increment first**, so I2 and the
+  wrappers import one shipped module. `--check` exit codes: 0 on MATCH and NO_NODE (the token tells the wrapper which),
+  3 on MISMATCH and DISCOVERY_FAILED, 2 when the env var is unset/invalid; stdout is exactly one token.
