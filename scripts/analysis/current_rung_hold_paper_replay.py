@@ -119,7 +119,10 @@ SEVEN_DAYS_NS: Final[int] = 7 * 24 * 60 * 60 * 1_000_000_000
 DEFAULT_PAPER_STORE: Final[Path] = Path(
     "~/.local/share/breezy/derived/paper_replay/scored_trials",
 ).expanduser()
-_LIVE_STORE_MARKER: Final[str] = "derived/live/scored_trials"
+_LIVE_STORE_MARKERS: Final[tuple[str, str]] = (
+    "derived/scored_trials",
+    "derived/live/scored_trials",
+)
 
 PROVENANCE_HEADER_TEMPLATE: Final[str] = (
     "PROVENANCE: paper_replay -- mechanism test only, NOT the live_small "
@@ -275,7 +278,8 @@ def print_tape_instrument_header(
 
 
 def assert_paper_write_path_is_not_live(output_dir: Path) -> None:
-    if _LIVE_STORE_MARKER in str(output_dir.resolve()):
+    resolved = str(output_dir.resolve())
+    if any(marker in resolved for marker in _LIVE_STORE_MARKERS):
         raise VenueOutsideLiveDirError(
             f"--output-dir {output_dir} resolves under the live scored_trials "
             "directory; the paper writer refuses to write there (L-22).",
