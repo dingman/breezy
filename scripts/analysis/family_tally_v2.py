@@ -68,11 +68,12 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 import sys
 from collections import defaultdict
 from collections.abc import Sequence
 from dataclasses import dataclass
-from decimal import Decimal
+from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import Final, cast
 
@@ -108,13 +109,17 @@ from breezy.settlement.trial_scorer import ScoredTrial
 __all__ = [
     "STRATUM_TABLE_DIVIDER",
     "STRATUM_TABLE_HEADER",
+    "CoverageRow",
+    "ExcludedFill",
     "FamilyBarrierRefusal",
     "FamilyTallyV2",
     "LookRecord",
     "ProvenanceRefusal",
     "ScoredTrialDataIntegrityError",
     "build_family_tally_v2",
+    "coverage_rows",
     "main",
+    "read_excluded_fills",
     "render_markdown_v2",
 ]
 
@@ -144,6 +149,51 @@ class ProvenanceRefusal(ScoredTrialDataIntegrityError):
     """B1 (ruling Q4): `--store-dir` lacks a v2 live-provenance sidecar, or
     the sidecar declares a provenance other than `"live"` (e.g.
     `"paper_replay"`)."""
+
+
+#: I3c (`docs/plans/LIVE_FILL_SCORING_CHAIN_2026-09-05.md` 3.0(c)): the
+#: driver-local `FillExclusion`'s 8-key artefact line, read back here.
+_EXCLUDED_FILLS_FILENAME: Final[str] = "excluded_fills.jsonl"
+_EXCLUDED_FILL_KEYS: Final[tuple[str, ...]] = (
+    "trial_id",
+    "station",
+    "climate_day",
+    "venue_order_id",
+    "qty",
+    "reason",
+    "filled_at_ns",
+    "scored_run_utc",
+)
+#: 3.0(g): `YYYY-MM-DDTHH:MM:SSZ`, UTC and lexically sortable.
+_SCORED_RUN_UTC_RE: Final[re.Pattern[str]] = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$")
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
+class ExcludedFill:
+    """One line of `<store_dir>/excluded_fills.jsonl` (I3c, 3.0(c)) --
+    driver-local, never a `ScoreRefusal` (that struct carries only
+    `trial_id, reason, detail` and is v1-BINDING inside the AST-pure
+    `settlement` package)."""
+
+    trial_id: str
+    station: str
+    climate_day: str
+    venue_order_id: str
+    qty: Decimal
+    reason: str
+    filled_at_ns: int
+    scored_run_utc: str
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
+class CoverageRow:
+    """One `(reason, station, climate_day)` count in the I3c coverage
+    table -- reporting only (dn = dk = dI = dS = 0)."""
+
+    reason: str
+    station: str
+    climate_day: str
+    count: int
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
@@ -586,6 +636,139 @@ def _fmt_stratum_row(stratum: StratumV2) -> str:
     )
 
 
+def read_excluded_fills(store_dir: Path) -> tuple[ExcludedFill, ...]:
+    """Read `<store_dir>/excluded_fills.jsonl` (I3c, 3.0(c)).
+
+    An absent file returns no rows, never an error -- day one has none, not
+    a refusal. A malformed line (missing key, bad JSON, a `scored_run_utc`
+    not shaped `YYYY-MM-DDTHH:MM:SSZ`, or a non-decimal `qty`) refuses the
+    whole tally loudly.
+    """
+    path = store_dir / _EXCLUDED_FILLS_FILENAME
+    if not path.exists():
+        return ()
+    fills: list[ExcludedFill] = []
+    for lineno, line in enumerate(path.read_text(encoding="utf-8").splitlines(), start=1):
+        if not line.strip():
+            continue
+        fills.append(_excluded_fill_from_line(line, path=path, lineno=lineno))
+    return tuple(fills)
+
+
+def _excluded_fill_from_line(line: str, *, path: Path, lineno: int) -> ExcludedFill:
+    try:
+        row = json.loads(line)
+    except json.JSONDecodeError as exc:
+        raise ScoredTrialDataIntegrityError(
+            f"refusing to tally: malformed {path}:{lineno} -- invalid JSON: {exc}"
+        ) from exc
+    missing = [key for key in _EXCLUDED_FILL_KEYS if key not in row]
+    if missing:
+        raise ScoredTrialDataIntegrityError(
+            f"refusing to tally: malformed {path}:{lineno} -- missing key(s) {missing!r}"
+        )
+    scored_run_utc = row["scored_run_utc"]
+    if not isinstance(scored_run_utc, str) or not _SCORED_RUN_UTC_RE.match(scored_run_utc):
+        raise ScoredTrialDataIntegrityError(
+            f"refusing to tally: malformed {path}:{lineno} -- scored_run_utc "
+            f"{scored_run_utc!r} is not YYYY-MM-DDTHH:MM:SSZ"
+        )
+    try:
+        qty = Decimal(str(row["qty"]))
+    except (InvalidOperation, TypeError) as exc:
+        raise ScoredTrialDataIntegrityError(
+            f"refusing to tally: malformed {path}:{lineno} -- non-decimal qty {row['qty']!r}"
+        ) from exc
+    try:
+        filled_at_ns = int(row["filled_at_ns"])
+    except (TypeError, ValueError) as exc:
+        raise ScoredTrialDataIntegrityError(
+            f"refusing to tally: malformed {path}:{lineno} -- non-integer filled_at_ns "
+            f"{row['filled_at_ns']!r}"
+        ) from exc
+    reason = row["reason"]
+    if not isinstance(reason, str) or not reason:
+        raise ScoredTrialDataIntegrityError(
+            f"refusing to tally: malformed {path}:{lineno} -- empty/non-string reason"
+        )
+    return ExcludedFill(
+        trial_id=row["trial_id"],
+        station=row["station"],
+        climate_day=row["climate_day"],
+        venue_order_id=row["venue_order_id"],
+        qty=qty,
+        reason=reason,
+        filled_at_ns=filled_at_ns,
+        scored_run_utc=scored_run_utc,
+    )
+
+
+def _dedup_excluded_fills_by_venue_order_id(
+    excluded: Sequence[ExcludedFill],
+) -> dict[str, ExcludedFill]:
+    """I3c count rule: ONE entry per `venue_order_id` -- the line with the
+    lexicographically greatest `scored_run_utc` wins (3.0(g), a plain
+    string compare); ties (equal `scored_run_utc`) are resolved by
+    last-line-wins, since `excluded` is iterated in file order."""
+    latest: dict[str, ExcludedFill] = {}
+    for fill in excluded:
+        current = latest.get(fill.venue_order_id)
+        if current is None or fill.scored_run_utc >= current.scored_run_utc:
+            latest[fill.venue_order_id] = fill
+    return latest
+
+
+def coverage_rows(
+    excluded: Sequence[ExcludedFill], scored_trial_ids: frozenset[str]
+) -> tuple[CoverageRow, ...]:
+    """I3c count rule (strategy-lead Q2: "append-only jsonl is evidence,
+    not the count"): dedup to one entry per `venue_order_id`, drop any
+    entry whose `trial_id` already has a scored row (any `score_seq`), and
+    group/count the survivors by `(reason, station, climate_day)`, sorted.
+    """
+    latest = _dedup_excluded_fills_by_venue_order_id(excluded)
+    counts: dict[tuple[str, str, str], int] = defaultdict(int)
+    for fill in latest.values():
+        if fill.trial_id in scored_trial_ids:
+            continue
+        counts[(fill.reason, fill.station, fill.climate_day)] += 1
+    return tuple(
+        CoverageRow(reason=reason, station=station, climate_day=climate_day, count=count)
+        for (reason, station, climate_day), count in sorted(counts.items())
+    )
+
+
+def _coverage_section_lines(store_dir: Path | None) -> list[str]:
+    """I3c rendered section -- reporting only, changes no statistic and no
+    v2 boundary (dn = dk = dI = dS = 0)."""
+    lines: list[str] = [
+        "Coverage -- admission exclusions (reporting only; dn = dk = dI = dS = 0)",
+        "",
+    ]
+    artefact_path = None if store_dir is None else store_dir / _EXCLUDED_FILLS_FILENAME
+    if artefact_path is None or not artefact_path.exists():
+        lines.append("no exclusions recorded (artefact absent)")
+        lines.append("")
+        return lines
+    assert store_dir is not None
+    excluded = read_excluded_fills(store_dir)
+    scored_trial_ids = frozenset(t.trial_id for t in read_scored_trials(store_dir))
+    latest = _dedup_excluded_fills_by_venue_order_id(excluded)
+    dropped = sum(1 for fill in latest.values() if fill.trial_id in scored_trial_ids)
+    rows = coverage_rows(excluded, scored_trial_ids)
+    lines.append("| reason | station | climate_day | count |")
+    lines.append("|---|---|---|---:|")
+    for row in rows:
+        lines.append(f"| {row.reason} | {row.station} | {row.climate_day} | {row.count} |")
+    lines.append("")
+    lines.append(
+        f"artefact: {artefact_path}; lines read: {len(excluded)}; "
+        f"distinct venue_order_ids: {len(latest)}; dropped as already-scored: {dropped}"
+    )
+    lines.append("")
+    return lines
+
+
 def render_markdown_v2(tally: FamilyTallyV2, *, source_paths: Sequence[Path], as_of: str) -> str:
     lines: list[str] = []
 
@@ -679,6 +862,10 @@ def render_markdown_v2(tally: FamilyTallyV2, *, source_paths: Sequence[Path], as
     else:
         add("BCa: not computed (terminal-only; no completed terminal look yet)")
     add("")
+
+    store_dir = source_paths[0] if source_paths else None
+    for line in _coverage_section_lines(store_dir):
+        add(line)
     return "\n".join(lines)
 
 

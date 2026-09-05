@@ -590,3 +590,356 @@ def test_ordered_for_looks_with_store_dir_refuses_a_missing_sidecar_entry(
     row = _row(0, station="LAX")
     with pytest.raises(tally_mod.ScoredTrialDataIntegrityError, match=row.trial_id):
         tally_mod._ordered_for_looks((row,), store_dir=store_dir)
+
+
+# --- I3c: v2 coverage table reads the excluded-fills artefact --------------
+# `docs/plans/LIVE_FILL_SCORING_CHAIN_2026-09-05.md` 3.0(c)/(g)/(h), section
+# "I3c -- v2 coverage table reads the excluded-fills artefact"; ruling
+# `docs/evidence/grok_admission_exclusions_ack_2026-09-05.md` Q2/Q3.
+
+
+def _excluded_fill_line(
+    *,
+    trial_id: str = "",
+    station: str = "",
+    climate_day: str = "",
+    venue_order_id: str,
+    qty: str = "1",
+    reason: str,
+    filled_at_ns: int = 1,
+    scored_run_utc: str = "2026-09-05T14:15:00Z",
+) -> str:
+    return json.dumps(
+        {
+            "trial_id": trial_id,
+            "station": station,
+            "climate_day": climate_day,
+            "venue_order_id": venue_order_id,
+            "qty": qty,
+            "reason": reason,
+            "filled_at_ns": filled_at_ns,
+            "scored_run_utc": scored_run_utc,
+        }
+    )
+
+
+def test_read_excluded_fills_absent_artefact_is_empty_tuple(
+    tmp_path: Path, tally_mod: ModuleType
+) -> None:
+    store_dir = tmp_path / "store"
+    store_dir.mkdir()
+    assert tally_mod.read_excluded_fills(store_dir) == ()
+
+
+def test_render_reports_absent_artefact_line_when_no_excluded_fills_file(
+    tmp_path: Path, tally_mod: ModuleType, real_artefact: BoundaryArtefact
+) -> None:
+    store_dir = tmp_path / "store"
+    store_dir.mkdir()
+    manifest = _manifest(tmp_path)
+    rows = _rows(5)
+    tally = tally_mod.build_family_tally_v2(rows, manifest=manifest, artefact=real_artefact)
+    report = tally_mod.render_markdown_v2(tally, source_paths=(store_dir,), as_of="2026-09-11")
+    assert "no exclusions recorded (artefact absent)" in report
+
+
+def test_a_seeded_artefact_renders_counts_by_reason_station_climate_day(
+    tmp_path: Path, tally_mod: ModuleType, real_artefact: BoundaryArtefact
+) -> None:
+    store_dir = tmp_path / "store"
+    store_dir.mkdir()
+    (store_dir / "excluded_fills.jsonl").write_text(
+        "\n".join(
+            (
+                _excluded_fill_line(
+                    trial_id=f"{_PM_PREFIX}MIA/2026-09-11/x",
+                    station="MIA",
+                    climate_day="2026-09-11",
+                    venue_order_id="vo-1",
+                    reason="fill_below_ask",
+                ),
+                _excluded_fill_line(
+                    trial_id=f"{_PM_PREFIX}LAX/2026-09-12/y",
+                    station="LAX",
+                    climate_day="2026-09-12",
+                    venue_order_id="vo-2",
+                    reason="fee_unverified",
+                ),
+            )
+        )
+        + "\n"
+    )
+    manifest = _manifest(tmp_path)
+    rows = _rows(5)
+    tally = tally_mod.build_family_tally_v2(rows, manifest=manifest, artefact=real_artefact)
+    report = tally_mod.render_markdown_v2(tally, source_paths=(store_dir,), as_of="2026-09-11")
+    assert "| fill_below_ask | MIA | 2026-09-11 | 1 |" in report
+    assert "| fee_unverified | LAX | 2026-09-12 | 1 |" in report
+
+
+def test_two_lines_for_one_venue_order_id_count_once_with_the_latest_reason(
+    tmp_path: Path, tally_mod: ModuleType
+) -> None:
+    store_dir = tmp_path / "store"
+    store_dir.mkdir()
+    (store_dir / "excluded_fills.jsonl").write_text(
+        "\n".join(
+            (
+                _excluded_fill_line(
+                    trial_id="t1",
+                    station="MIA",
+                    climate_day="2026-09-11",
+                    venue_order_id="vo-1",
+                    reason="fee_unverified",
+                    scored_run_utc="2026-09-05T14:15:00Z",
+                ),
+                _excluded_fill_line(
+                    trial_id="t1",
+                    station="MIA",
+                    climate_day="2026-09-11",
+                    venue_order_id="vo-1",
+                    reason="fill_below_ask",
+                    scored_run_utc="2026-09-06T14:15:00Z",
+                ),
+            )
+        )
+        + "\n"
+    )
+    excluded = tally_mod.read_excluded_fills(store_dir)
+    assert len(excluded) == 2
+    rows = tally_mod.coverage_rows(excluded, frozenset())
+    assert rows == (
+        tally_mod.CoverageRow(
+            reason="fill_below_ask", station="MIA", climate_day="2026-09-11", count=1
+        ),
+    )
+
+
+def test_an_exclusion_whose_trial_id_has_a_scored_row_is_dropped(
+    tmp_path: Path, tally_mod: ModuleType
+) -> None:
+    from breezy.persistence.scored_trial_store import read_scored_trials, write_scored_trials
+
+    store_dir = tmp_path / "store"
+    scored_row = _row(0, climate_day="2026-09-11")
+    write_scored_trials(store_dir, (scored_row,), now_ns=1)
+    (store_dir / "excluded_fills.jsonl").write_text(
+        _excluded_fill_line(
+            trial_id=scored_row.trial_id,
+            station=scored_row.station,
+            climate_day=scored_row.climate_day,
+            venue_order_id="vo-1",
+            reason="fee_unverified",
+        )
+        + "\n"
+    )
+    scored_ids = frozenset(t.trial_id for t in read_scored_trials(store_dir))
+    excluded = tally_mod.read_excluded_fills(store_dir)
+    rows = tally_mod.coverage_rows(excluded, scored_ids)
+    assert rows == ()
+
+
+def test_an_exclusion_whose_trial_id_is_not_scored_still_counts(
+    tmp_path: Path, tally_mod: ModuleType
+) -> None:
+    from breezy.persistence.scored_trial_store import read_scored_trials, write_scored_trials
+
+    store_dir = tmp_path / "store"
+    scored_row = _row(0, climate_day="2026-09-11")
+    write_scored_trials(store_dir, (scored_row,), now_ns=1)
+    (store_dir / "excluded_fills.jsonl").write_text(
+        _excluded_fill_line(
+            trial_id="current_rung_hold/trial/MIA/2026-09-11/unscored",
+            station="MIA",
+            climate_day="2026-09-11",
+            venue_order_id="vo-2",
+            reason="fee_unverified",
+        )
+        + "\n"
+    )
+    scored_ids = frozenset(t.trial_id for t in read_scored_trials(store_dir))
+    excluded = tally_mod.read_excluded_fills(store_dir)
+    rows = tally_mod.coverage_rows(excluded, scored_ids)
+    assert rows == (
+        tally_mod.CoverageRow(
+            reason="fee_unverified", station="MIA", climate_day="2026-09-11", count=1
+        ),
+    )
+
+
+def test_a_malformed_excluded_fills_line_missing_keys_refuses_loudly(
+    tmp_path: Path, tally_mod: ModuleType
+) -> None:
+    store_dir = tmp_path / "store"
+    store_dir.mkdir()
+    (store_dir / "excluded_fills.jsonl").write_text('{"trial_id": "t1"}\n')
+    with pytest.raises(tally_mod.ScoredTrialDataIntegrityError):
+        tally_mod.read_excluded_fills(store_dir)
+
+
+def test_invalid_json_line_refuses_loudly(tmp_path: Path, tally_mod: ModuleType) -> None:
+    store_dir = tmp_path / "store"
+    store_dir.mkdir()
+    (store_dir / "excluded_fills.jsonl").write_text("not-json\n")
+    with pytest.raises(tally_mod.ScoredTrialDataIntegrityError):
+        tally_mod.read_excluded_fills(store_dir)
+
+
+def test_a_bad_scored_run_utc_format_refuses_loudly(tmp_path: Path, tally_mod: ModuleType) -> None:
+    store_dir = tmp_path / "store"
+    store_dir.mkdir()
+    (store_dir / "excluded_fills.jsonl").write_text(
+        _excluded_fill_line(
+            venue_order_id="vo-1", reason="fill_below_ask", scored_run_utc="2026-09-05"
+        )
+        + "\n"
+    )
+    with pytest.raises(tally_mod.ScoredTrialDataIntegrityError):
+        tally_mod.read_excluded_fills(store_dir)
+
+
+def test_a_non_decimal_qty_refuses_loudly(tmp_path: Path, tally_mod: ModuleType) -> None:
+    store_dir = tmp_path / "store"
+    store_dir.mkdir()
+    (store_dir / "excluded_fills.jsonl").write_text(
+        _excluded_fill_line(venue_order_id="vo-1", reason="fill_below_ask", qty="not-a-number")
+        + "\n"
+    )
+    with pytest.raises(tally_mod.ScoredTrialDataIntegrityError):
+        tally_mod.read_excluded_fills(store_dir)
+
+
+def test_v2_statistics_are_byte_identical_with_and_without_excluded_fills_artefact(
+    tmp_path: Path, tally_mod: ModuleType, real_artefact: BoundaryArtefact
+) -> None:
+    """dn = dk = dI = dS = 0 (strategy-lead ruling): the coverage table is
+    reporting only -- every existing statistic in the report is unchanged
+    whether or not the artefact exists."""
+    manifest = _manifest(tmp_path)
+    store_dir = tmp_path / "store"
+    store_dir.mkdir()
+    (store_dir / "provenance.json").write_text(json.dumps({"provenance": "live"}))
+    rows = _rows(20)
+    (store_dir / "fill_order.jsonl").write_text(
+        "\n".join(
+            json.dumps({"trial_id": row.trial_id, "score_seq": row.score_seq, "filled_at_ns": i})
+            for i, row in enumerate(rows)
+        )
+        + "\n"
+    )
+    tally = tally_mod.build_family_tally_v2(
+        rows, manifest=manifest, artefact=real_artefact, store_dir=store_dir
+    )
+    marker = "Coverage -- admission exclusions"
+    report_without = tally_mod.render_markdown_v2(
+        tally, source_paths=(store_dir,), as_of="2026-09-11"
+    )
+    assert marker in report_without
+
+    (store_dir / "excluded_fills.jsonl").write_text(
+        _excluded_fill_line(
+            trial_id="unrelated/trial",
+            station="LAX",
+            climate_day="2026-09-20",
+            venue_order_id="vo-9",
+            reason="fill_below_ask",
+        )
+        + "\n"
+    )
+    report_with = tally_mod.render_markdown_v2(tally, source_paths=(store_dir,), as_of="2026-09-11")
+
+    stats_without = report_without.split(marker, 1)[0]
+    stats_with = report_with.split(marker, 1)[0]
+    assert stats_without == stats_with
+    assert report_without != report_with
+
+
+def test_all_widened_closed_set_reasons_render_verbatim(
+    tmp_path: Path, tally_mod: ModuleType
+) -> None:
+    """The closed set is owned by the scorer; the tally renders every
+    reason string verbatim without validating membership."""
+    store_dir = tmp_path / "store"
+    store_dir.mkdir()
+    reasons = (
+        "partial_fill",
+        "multi_fill",
+        "fill_below_ask",
+        "fee_unverified",
+        "duplicate_fill_for_latch",
+        "no_taken_latch",
+        "ambiguous_latch",
+    )
+    lines = []
+    for i, reason in enumerate(reasons):
+        if reason == "no_taken_latch":
+            # empty trial_id/station/climate_day allowed for this reason
+            # ONLY (spec 3.0); groups under a blank station, never dropped.
+            lines.append(_excluded_fill_line(venue_order_id=f"vo-{i}", reason=reason))
+        else:
+            lines.append(
+                _excluded_fill_line(
+                    trial_id=f"t-{i}",
+                    station="MIA",
+                    climate_day="2026-09-11",
+                    venue_order_id=f"vo-{i}",
+                    reason=reason,
+                )
+            )
+    (store_dir / "excluded_fills.jsonl").write_text("\n".join(lines) + "\n")
+
+    excluded = tally_mod.read_excluded_fills(store_dir)
+    rows = tally_mod.coverage_rows(excluded, frozenset())
+    rendered_reasons = {row.reason for row in rows}
+    assert rendered_reasons == set(reasons)
+
+
+def test_coverage_section_footer_states_artefact_path_and_counts(
+    tmp_path: Path, tally_mod: ModuleType, real_artefact: BoundaryArtefact
+) -> None:
+    from breezy.persistence.scored_trial_store import write_scored_trials
+
+    store_dir = tmp_path / "store"
+    scored_row = _row(0, climate_day="2026-09-11")
+    write_scored_trials(store_dir, (scored_row,), now_ns=1)
+    (store_dir / "provenance.json").write_text(json.dumps({"provenance": "live"}))
+    (store_dir / "fill_order.jsonl").write_text(
+        json.dumps(
+            {
+                "trial_id": scored_row.trial_id,
+                "score_seq": scored_row.score_seq,
+                "filled_at_ns": 1,
+            }
+        )
+        + "\n"
+    )
+    (store_dir / "excluded_fills.jsonl").write_text(
+        "\n".join(
+            (
+                _excluded_fill_line(
+                    trial_id="unscored-1",
+                    station="MIA",
+                    climate_day="2026-09-11",
+                    venue_order_id="vo-1",
+                    reason="fill_below_ask",
+                ),
+                _excluded_fill_line(
+                    trial_id=scored_row.trial_id,
+                    station=scored_row.station,
+                    climate_day=scored_row.climate_day,
+                    venue_order_id="vo-2",
+                    reason="fee_unverified",
+                ),
+            )
+        )
+        + "\n"
+    )
+    manifest = _manifest(tmp_path)
+    tally = tally_mod.build_family_tally_v2(
+        (scored_row,), manifest=manifest, artefact=real_artefact, store_dir=store_dir
+    )
+    report = tally_mod.render_markdown_v2(tally, source_paths=(store_dir,), as_of="2026-09-11")
+    assert str(store_dir / "excluded_fills.jsonl") in report
+    assert "lines read: 2" in report
+    assert "distinct venue_order_ids: 2" in report
+    assert "dropped as already-scored: 1" in report
