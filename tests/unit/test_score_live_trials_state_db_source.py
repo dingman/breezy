@@ -37,12 +37,16 @@ sys.path.insert(0, (REPO_ROOT / "scripts/analysis").as_posix())
 import score_live_trials as slt_module
 from score_live_trials import (
     _EXCLUDED_FILLS_ARTEFACT_NAME,
+    _UNRESOLVED_TAKES_ARTEFACT_NAME,
     FillExclusion,
     FillSourceUnreadableError,
     NodeStorePreflightRefused,
     StorePositiveControlFailedError,
+    UnresolvedTake,
     _append_excluded_fills,
+    _append_unresolved_takes,
     _with_scheduled_release_at_ns,
+    find_unresolved_takes,
     main,
     read_filled_trials_state_db,
     score_live_trials,
@@ -64,6 +68,7 @@ from breezy.persistence.scored_trial_store import read_scored_trials
 from breezy.registry.settlement_clock import settlement_deadline_ns
 from breezy.registry.sites import default_registry
 from breezy.runtime.sqlite_store import SqliteStateStore
+from breezy.runtime.submit_intent import CURRENT_INTENT_KEY, SubmitIntent, SubmitIntentState
 from breezy.strategy.current_rung_hold.trial_day_latch import TrialDayRecord
 
 _BASE_NS = int(dt.datetime(2026, 9, 5, 6, 31, tzinfo=dt.UTC).timestamp() * 1_000_000_000)
@@ -1103,3 +1108,189 @@ def test_a_sentinel_env_value_never_appears_in_stdout_stderr_or_logs(
     assert sentinel not in captured.out
     assert sentinel not in captured.err
     assert all(sentinel not in record.getMessage() for record in caplog.records)
+
+
+# ---------------------------------------------------------------------------
+# I4 defect fix, `LIVE_FILL_SCORING_CHAIN_2026-09-05.md`: a `TrialDayRecord`
+# latched `reason="taken"` with no matching `DurableFillRecord` anywhere in
+# the store must never be silently invisible to both `scored_trials` and
+# `excluded_fills.jsonl` -- it is reported for VISIBILITY only, via the
+# separate `unresolved_takes.jsonl` sidecar, never scored/counted/tallied.
+# ---------------------------------------------------------------------------
+
+
+def _seed_open_intent(store: SqliteStateStore) -> None:
+    intent = SubmitIntent(
+        intent_id="a" * 32,
+        fingerprint="b" * 64,
+        created_ns=_BASE_NS,
+        state=SubmitIntentState.OPEN,
+        retired_ns=None,
+        retirement_reason=None,
+    )
+    store.set(CURRENT_INTENT_KEY, intent.to_bytes())
+
+
+def test_a_taken_latch_with_no_fill_and_an_open_intent_is_unresolved(tmp_path: Path) -> None:
+    store_path = tmp_path / "state.sqlite"
+    store = SqliteStateStore(store_path)
+    latch_key = _seed_latch(store, ask=Decimal("0.40"))
+    _seed_open_intent(store)
+    store.close()
+
+    unresolved = find_unresolved_takes(
+        store_path, family_prefix=_FAMILY_PREFIX, city=_CITY, since_climate_day=_DAY_ISO
+    )
+
+    assert len(unresolved) == 1
+    take = unresolved[0]
+    assert take.station == _CITY
+    assert take.climate_day == _DAY_ISO
+    assert take.trial == latch_key
+    assert take.ask == "0.40"
+    assert take.intent_state == "OPEN"
+
+
+def test_a_taken_latch_with_no_fill_and_no_intent_record_is_reported_absent(
+    tmp_path: Path,
+) -> None:
+    store_path = tmp_path / "state.sqlite"
+    store = SqliteStateStore(store_path)
+    _seed_latch(store)
+    store.close()  # no `exec/polymarket_us/intent/current` key at all
+
+    unresolved = find_unresolved_takes(
+        store_path, family_prefix=_FAMILY_PREFIX, city=_CITY, since_climate_day=_DAY_ISO
+    )
+
+    assert len(unresolved) == 1
+    assert unresolved[0].intent_state == "absent"
+
+
+def test_a_taken_latch_with_a_matching_fill_is_never_unresolved(tmp_path: Path) -> None:
+    store_path = tmp_path / "state.sqlite"
+    store = SqliteStateStore(store_path)
+    _seed_latch(store)
+    _seed_fill(store, venue_order_id="v1")
+    _seed_open_intent(store)  # even with an OPEN intent, a real fill resolves it
+    store.close()
+
+    unresolved = find_unresolved_takes(
+        store_path, family_prefix=_FAMILY_PREFIX, city=_CITY, since_climate_day=_DAY_ISO
+    )
+
+    assert unresolved == ()
+
+
+def test_a_not_taken_latch_is_never_reported_unresolved(tmp_path: Path) -> None:
+    store_path = tmp_path / "state.sqlite"
+    store = SqliteStateStore(store_path)
+    _seed_latch(store, reason="not_executable")
+    _seed_open_intent(store)
+    store.close()
+
+    unresolved = find_unresolved_takes(
+        store_path, family_prefix=_FAMILY_PREFIX, city=_CITY, since_climate_day=_DAY_ISO
+    )
+
+    assert unresolved == ()
+
+
+def test_another_citys_unresolved_take_is_never_reported_by_this_citys_run(
+    tmp_path: Path,
+) -> None:
+    store_path = tmp_path / "state.sqlite"
+    store = SqliteStateStore(store_path)
+    _seed_latch(store, station=_STATION)  # this run's own census latch (positive control)
+    _seed_fill(store, venue_order_id="v1")
+    _seed_latch(store, station="MDW", instrument_id="mdw-instr")  # another city's taken, no fill
+    store.close()
+
+    unresolved = find_unresolved_takes(
+        store_path, family_prefix=_FAMILY_PREFIX, city=_CITY, since_climate_day=_DAY_ISO
+    )
+
+    assert unresolved == ()
+
+
+def test_end_to_end_an_unresolved_take_writes_the_sidecar_and_warns_scored_trials_unchanged(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """RED: taken + no fill + OPEN intent => sidecar row + WARN; never
+    scored, never counted (`scored_trials`/`refused`/`excluded` untouched).
+    """
+    store_path = tmp_path / "state.sqlite"
+    store = SqliteStateStore(store_path)
+    _seed_latch(store, ask=Decimal("0.40"))
+    _seed_open_intent(store)
+    store.close()
+
+    with caplog.at_level(logging.WARNING):
+        scored, refused, excluded = score_live_trials(**_driver_kwargs(tmp_path, store_path))
+
+    assert scored == ()
+    assert refused == ()
+    assert excluded == ()
+    assert list(read_scored_trials(tmp_path / "derived")) == []
+
+    assert any(
+        "UNRESOLVED TAKE" in r.message
+        and _STATION in r.message
+        and _DAY_ISO in r.message
+        and "intent=OPEN" in r.message
+        and "breezy-clear-submit-intent" in r.message
+        for r in caplog.records
+    )
+
+    sidecar = tmp_path / "derived" / _UNRESOLVED_TAKES_ARTEFACT_NAME
+    sidecar_text = sidecar.read_text(encoding="utf-8")
+    lines = [json.loads(line) for line in sidecar_text.splitlines() if line.strip()]
+    assert len(lines) == 1
+    assert lines[0]["station"] == _STATION
+    assert lines[0]["climate_day"] == _DAY_ISO
+    assert lines[0]["trial"] == _latch_key(_STATION, _DAY_ISO)
+    assert lines[0]["ask"] == "0.40"
+    assert lines[0]["intent_state"] == "OPEN"
+
+
+def test_end_to_end_a_taken_latch_with_a_fill_writes_no_unresolved_sidecar(
+    tmp_path: Path,
+) -> None:
+    """RED: taken + fill => unchanged behaviour (a real, scored trial, no
+    `unresolved_takes.jsonl` at all)."""
+    catalog_base = tmp_path / "catalog"
+    resolved_instrument_id = _seed_instrument_and_final(catalog_base)
+    store_path = tmp_path / "state.sqlite"
+    store = SqliteStateStore(store_path)
+    _seed_latch(store, ask=Decimal("0.40"), instrument_id=resolved_instrument_id)
+    _seed_fill(store, venue_order_id="v1", instrument_id=resolved_instrument_id)
+    store.close()
+
+    scored, _refused, excluded = score_live_trials(
+        **_driver_kwargs(tmp_path, store_path, catalog_base=catalog_base)
+    )
+
+    assert len(scored) == 1
+    assert excluded == ()
+    assert not (tmp_path / "derived" / _UNRESOLVED_TAKES_ARTEFACT_NAME).exists()
+
+
+def test_append_unresolved_takes_is_idempotent_on_trial_and_intent_state(
+    tmp_path: Path,
+) -> None:
+    derived_dir = tmp_path / "derived"
+    take = UnresolvedTake(
+        station=_STATION,
+        climate_day=_DAY_ISO,
+        trial=_latch_key(_STATION, _DAY_ISO),
+        ask="0.40",
+        intent_state="OPEN",
+    )
+
+    _append_unresolved_takes(derived_dir, (take,), scored_run_utc="2026-09-05T14:15:00Z")
+    _append_unresolved_takes(derived_dir, (take,), scored_run_utc="2026-09-05T14:20:00Z")
+
+    lines = (derived_dir / _UNRESOLVED_TAKES_ARTEFACT_NAME).read_text(
+        encoding="utf-8"
+    ).splitlines()
+    assert len(lines) == 1

@@ -135,6 +135,15 @@ DEFAULT_DERIVED_DIR: Path = Path.home() / ".local/share/breezy/derived/scored_tr
 #: `--derived-dir`, alongside the scored-trial store (3.0 (f)).
 _EXCLUDED_FILLS_ARTEFACT_NAME = "excluded_fills.jsonl"
 
+#: Unresolved-takes artefact (I4 defect fix, `LIVE_FILL_SCORING_CHAIN_2026-
+#: 09-05.md` -- first live order, 2026-09-05 SFO): visibility only, sits
+#: beside `excluded_fills.jsonl` in `--derived-dir`. A row here is NEVER
+#: scored, counted, or tallied (PREREG v2 rules unchanged) -- it exists
+#: solely so a `TrialDayRecord(reason="taken")` with no matching
+#: `DurableFillRecord` anywhere in the store is never silently invisible to
+#: both `scored_trials` and `excluded_fills.jsonl`.
+_UNRESOLVED_TAKES_ARTEFACT_NAME = "unresolved_takes.jsonl"
+
 #: Fill-vs-ask guard tick (L-25): the venue's `orderPriceMinTickSize`, which
 #: every observed PM.us market payload carries as `0.01`
 #: (`docs/evidence/venue/polymarket_us/`) -- UNVERIFIED that this offline
@@ -145,6 +154,20 @@ _TICK: Final[Decimal] = Decimal("0.01")
 #: The one non-refusal `TrialDayRecord.reason` value (mirrors
 #: `fill_time_count.py`'s own `_TAKEN_REASON`).
 _TAKEN_REASON = "taken"
+
+#: Duplicated literal (never imported, C10): identical to
+#: `breezy.runtime.submit_intent.CURRENT_INTENT_KEY`. This module reads the
+#: account-wide submit-intent singleton's raw store value for VISIBILITY
+#: only (`find_unresolved_takes`'s `intent_state` sidecar field) through the
+#: same generic read-only store access already used for `TrialDayRecord`/
+#: `DurableFillRecord` -- it deliberately does not import `submit_intent`
+#: (C10's exact-set import pin covers `src`/`scripts`, not this literal).
+_CURRENT_INTENT_KEY = "exec/polymarket_us/intent/current"
+
+#: The `SubmitIntent.state` values this module recognizes when it decodes
+#: the raw intent JSON itself (mirrors `SubmitIntentState`'s members without
+#: importing the enum).
+_KNOWN_INTENT_STATES = frozenset({"OPEN", "RETIRED"})
 
 
 class FillSourceUnreadableError(Exception):
@@ -698,6 +721,146 @@ def read_filled_trials_state_db(
     return tuple(trials), tuple(exclusions), fee_reconciled_by_trial_id
 
 
+@dataclass(frozen=True, slots=True, kw_only=True)
+class UnresolvedTake:
+    """A `TrialDayRecord` latched `reason="taken"` with no matching
+    `DurableFillRecord` anywhere in the shared store (I4 defect: first live
+    order, 2026-09-05 SFO -- the trial-day latch said TAKEN, the
+    account-wide submit intent was OPEN (an ambiguous create-order
+    outcome), and no fill record existed at all).
+
+    Reported for VISIBILITY only -- never scored, never counted, never
+    tallied; PREREG v2 rules and the six-key counter are untouched by this
+    dataclass. `intent_state` is the account-wide
+    `exec/polymarket_us/intent/current` singleton's raw JSON `"state"` field
+    ("OPEN"/"RETIRED"), read directly off the store value without importing
+    `breezy.runtime.submit_intent` (C10), or `"absent"` when the key is
+    missing or the value does not decode.
+    """
+
+    station: str
+    climate_day: str
+    trial: str
+    ask: str
+    intent_state: str
+
+
+def _decode_intent_state(value: object) -> str:
+    """Decode the raw `_CURRENT_INTENT_KEY` store value's `"state"` field
+    without importing `breezy.runtime.submit_intent` (C10): parses the same
+    JSON shape `SubmitIntent.to_bytes` writes, by hand, and degrades to
+    `"absent"` on anything that doesn't decode to a known state -- this is a
+    visibility-only sidecar field, never a refusal path (see
+    `find_unresolved_takes`)."""
+    raw = value.decode("utf-8") if isinstance(value, bytes | bytearray) else value
+    if not isinstance(raw, str):
+        return "absent"
+    try:
+        payload: object = json.loads(raw)
+    except ValueError:
+        return "absent"
+    if not isinstance(payload, dict):
+        return "absent"
+    state = payload.get("state")
+    if isinstance(state, str) and state in _KNOWN_INTENT_STATES:
+        return state
+    return "absent"
+
+
+def find_unresolved_takes(
+    path: Path,
+    *,
+    family_prefix: str,
+    city: str,
+    since_climate_day: str,
+) -> tuple[UnresolvedTake, ...]:
+    """Every `{family_prefix}{city}/{climate_day}` latch with
+    `reason="taken"` (on or after `since_climate_day`) that has no matching
+    `DurableFillRecord` anywhere in the store (I4 defect fix).
+
+    Restricted to THIS run's own `city` (mirrors `read_filled_trials_state_db`'s
+    cross-city convention, F1): a shared store's other cities' own taken
+    latches are that city's own invocation's to report, never duplicated
+    here. Called only from the state-DB path of `score_live_trials`, after
+    `read_filled_trials_state_db` has already validated the store opens
+    read-only and passes the positive control -- this function repeats that
+    open (a second short-lived read-only connection) rather than widening
+    the frozen `read_filled_trials_state_db` return signature that 18+
+    existing call sites already unpack as a 3-tuple.
+
+    Fail-closed on the SAME latch/fill corruption as
+    `read_filled_trials_state_db` (F3): an undecodable `TrialDayRecord` or
+    `DurableFillRecord` is store corruption, never a silent skip. The
+    account-wide submit-intent singleton is the one exception -- it is
+    read-only diagnostic context for the sidecar row only, so a missing or
+    undecodable intent record degrades to `intent_state="absent"` rather
+    than failing this visibility-only reader closed.
+    """
+    conn = _open_readonly(path)
+    if conn is None:
+        raise FillSourceUnreadableError("the fill source could not be opened read-only")
+    try:
+        rows = conn.execute("SELECT key, value FROM state").fetchall()
+    except sqlite3.Error as exc:
+        raise FillSourceUnreadableError("the fill source could not be read") from exc
+    finally:
+        conn.close()
+
+    taken_latches: list[tuple[str, str, str, Decimal]] = []
+    for key, value in rows:
+        if not isinstance(key, str) or not key.startswith(family_prefix):
+            continue
+        parts = key[len(family_prefix) :].split("/")
+        if len(parts) != 2:
+            continue
+        station, climate_day = parts
+        if station != city or climate_day < since_climate_day:
+            continue
+        try:
+            record = TrialDayRecord.from_bytes(value)
+        except TrialDayRecordCorrupt as exc:
+            raise FillSourceUnreadableError(
+                f"a record under the {family_prefix!r} key prefix could not be decoded"
+            ) from exc
+        if record.reason != _TAKEN_REASON:
+            continue
+        taken_latches.append((key, climate_day, record.instrument_id, record.ask))
+
+    if not taken_latches:
+        return ()
+
+    filled_instrument_ids: set[str] = set()
+    for key, value in rows:
+        if not isinstance(key, str) or not key.startswith(FILL_KEY_PREFIX):
+            continue
+        try:
+            fill = DurableFillRecord.from_bytes(value)
+        except ExecutionReportMappingError as exc:
+            raise FillSourceUnreadableError(
+                f"a record under the {FILL_KEY_PREFIX!r} key prefix could not be decoded"
+            ) from exc
+        filled_instrument_ids.add(fill.instrument_id)
+
+    intent_state = "absent"
+    for key, value in rows:
+        if key != _CURRENT_INTENT_KEY:
+            continue
+        intent_state = _decode_intent_state(value)
+        break
+
+    return tuple(
+        UnresolvedTake(
+            station=city,
+            climate_day=climate_day,
+            trial=latch_key,
+            ask=str(ask),
+            intent_state=intent_state,
+        )
+        for latch_key, climate_day, instrument_id, ask in taken_latches
+        if instrument_id not in filled_instrument_ids
+    )
+
+
 def _with_scheduled_release_at_ns(trial: FilledTrial, *, venue: str, city: str) -> FilledTrial:
     """Replace the reader's placeholder `scheduled_release_at_ns` with the
     venue's real settlement instant for `trial.climate_day` -- `climate_day +
@@ -843,6 +1006,7 @@ def score_live_trials(
     """
     reader_exclusions: tuple[FillExclusion, ...] = ()
     fee_reconciled_by_trial_id: Mapping[str, tuple[bool, str]] = {}
+    unresolved_takes: tuple[UnresolvedTake, ...] = ()
 
     if fills_path is not None:
         filled_trials, jsonl_refusals = read_filled_trials_jsonl(fills_path)
@@ -890,6 +1054,29 @@ def score_live_trials(
             _with_scheduled_release_at_ns(trial, venue=venue, city=city) for trial in raw_trials
         )
         jsonl_refusals = ()
+        # I4 defect fix: visibility only -- never scored, counted, or
+        # tallied. Logged once per unresolved trial, then appended to the
+        # `unresolved_takes.jsonl` sidecar below, alongside `excluded_fills`.
+        # The asserts below are pure type-narrowing (mirroring
+        # `missing_state_db_args` above, which already proved these
+        # non-None at runtime) -- never a new runtime behaviour.
+        assert fill_source_path is not None
+        assert family_prefix is not None
+        assert since_climate_day is not None
+        unresolved_takes = find_unresolved_takes(
+            fill_source_path,
+            family_prefix=family_prefix,
+            city=city,
+            since_climate_day=since_climate_day,
+        )
+        for take in unresolved_takes:
+            logging.getLogger(__name__).warning(
+                "UNRESOLVED TAKE: %s %s intent=%s — not scored, not tallied; "
+                "resolve via breezy-clear-submit-intent",
+                take.station,
+                take.climate_day,
+                take.intent_state,
+            )
 
     bucket_by_instrument = _read_bucket_facts_by_instrument_id(catalog_base, venue=venue, city=city)
     catalog = open_station_catalog(catalog_base, venue, city)
@@ -998,6 +1185,13 @@ def score_live_trials(
             ],
         )
         write_scored_trials(derived_dir, stamped_scored, now_ns=now_ns)
+    # I4 defect fix: written unconditionally (idempotent, empty-safe, mirrors
+    # `_write_or_assert_live_provenance_sidecar` above) so an unresolved take
+    # is visible from THIS run, never deferred to `main()`'s separate
+    # `excluded_fills.jsonl` write site -- `unresolved_takes` has no
+    # `FillExclusion`-shaped identity (no venue_order_id at all: there is no
+    # fill), so it is never folded into that artefact or its reason enum.
+    _append_unresolved_takes(derived_dir, unresolved_takes, scored_run_utc=_scored_run_utc(now_ns))
     return stamped_scored, refused, tuple(excluded_fills)
 
 
@@ -1073,6 +1267,80 @@ def _append_excluded_fills(
             fh.write("\n")
         for line in new_lines:
             fh.write(line + "\n")
+
+
+def _append_unresolved_takes(
+    derived_dir: Path, unresolved: Sequence[UnresolvedTake], *, scored_run_utc: str
+) -> None:
+    """Append-only, idempotent on `(trial, intent_state)` (I4 defect fix).
+
+    Mirrors `_append_excluded_fills`'s idempotence/never-rewrite/truncation
+    handling exactly, over a SEPARATE artefact
+    (`unresolved_takes.jsonl`) -- an unresolved take has no
+    `FillExclusion`-shaped identity (there is no fill, so no
+    `venue_order_id`), and `FillExclusionReason` is a closed set never
+    extended ad hoc, so this is a new sidecar rather than a new member of
+    that enum. `score_live_trials` is the sole appender. VISIBILITY ONLY:
+    never read by scoring or tally logic anywhere in this module.
+    """
+    if not unresolved:
+        return
+    path = derived_dir / _UNRESOLVED_TAKES_ARTEFACT_NAME
+    existing_keys: set[tuple[str, str]] = set()
+    needs_leading_newline = False
+    if path.exists():
+        text = path.read_text(encoding="utf-8")
+        needs_leading_newline = bool(text) and not text.endswith("\n")
+        for lineno, line in enumerate(text.splitlines(), start=1):
+            if not line.strip():
+                continue
+            try:
+                row = json.loads(line)
+                key = (row["trial"], row["intent_state"])
+            except (json.JSONDecodeError, KeyError, TypeError):
+                logging.getLogger(__name__).warning(
+                    "%s: line %d is malformed and was skipped for the "
+                    "idempotence set; the file is never rewritten",
+                    path,
+                    lineno,
+                )
+                continue
+            existing_keys.add(key)
+    new_lines: list[str] = []
+    for take in unresolved:
+        key = (take.trial, take.intent_state)
+        if key in existing_keys:
+            continue
+        existing_keys.add(key)
+        new_lines.append(
+            json.dumps(
+                {
+                    "station": take.station,
+                    "climate_day": take.climate_day,
+                    "trial": take.trial,
+                    "ask": take.ask,
+                    "intent_state": take.intent_state,
+                    "scored_run_utc": scored_run_utc,
+                }
+            )
+        )
+    if not new_lines:
+        return
+    derived_dir.mkdir(parents=True, exist_ok=True)
+    with path.open("a", encoding="utf-8") as fh:
+        if needs_leading_newline:
+            fh.write("\n")
+        for line in new_lines:
+            fh.write(line + "\n")
+
+
+def _scored_run_utc(now_ns: int) -> str:
+    """The `scored_run_utc` stamp shared by `excluded_fills.jsonl` and
+    `unresolved_takes.jsonl` -- ONE implementation, never a second copy of
+    the formatting."""
+    return dt.datetime.fromtimestamp(now_ns / 1_000_000_000, tz=dt.UTC).strftime(
+        "%Y-%m-%dT%H:%M:%SZ"
+    )
 
 
 def _parse_args(argv: Sequence[str] | None) -> argparse.Namespace:
@@ -1181,10 +1449,7 @@ def main(argv: Sequence[str] | None = None, *, proc_root: Path = Path("/proc")) 
                 f"  excluded {fill.trial_id}: {fill.reason} qty={fill.qty} "
                 f"station={fill.station} climate_day={fill.climate_day} -- {fill.detail}"
             )
-    scored_run_utc = dt.datetime.fromtimestamp(now_ns / 1_000_000_000, tz=dt.UTC).strftime(
-        "%Y-%m-%dT%H:%M:%SZ"
-    )
-    _append_excluded_fills(args.derived_dir, excluded, scored_run_utc=scored_run_utc)
+    _append_excluded_fills(args.derived_dir, excluded, scored_run_utc=_scored_run_utc(now_ns))
     return 0
 
 
