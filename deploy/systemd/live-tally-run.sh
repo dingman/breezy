@@ -50,6 +50,22 @@ if [ ! -f "$CJSON" ]; then
   exit 1
 fi
 
+# F3: refuse a malformed/incomplete counter JSON before extracting with
+# sed -- a truncated file or one with duplicate matching lines must not be
+# silently accepted just because it contains a line the pattern matches.
+CJSON_FIRST_LINE=$(head -n1 "$CJSON")
+CJSON_LAST_LINE=$(tail -n1 "$CJSON")
+if [ "$CJSON_FIRST_LINE" != "{" ] || [ "$CJSON_LAST_LINE" != "}" ]; then
+  say "LIVE TALLY SKIPPED -- counter JSON is not well-shaped (missing braces)"
+  exit 1
+fi
+CJSON_COUNT_LINES=$(grep -cE '^  "count": [0-9]+,?$' "$CJSON")
+CJSON_FETCH_START_LINES=$(grep -cE '^  "fetch_start": "[0-9]{4}-[0-9]{2}-[0-9]{2}",?$' "$CJSON")
+if [ "$CJSON_COUNT_LINES" -ne 1 ] || [ "$CJSON_FETCH_START_LINES" -ne 1 ]; then
+  say "LIVE TALLY SKIPPED -- counter JSON count/fetch_start not exactly one line each"
+  exit 1
+fi
+
 COUNT=$(sed -nE 's/^  "count": ([0-9]+),?$/\1/p' "$CJSON")
 D0=$(sed -nE 's/^  "fetch_start": "([0-9]{4}-[0-9]{2}-[0-9]{2})",?$/\1/p' "$CJSON")
 

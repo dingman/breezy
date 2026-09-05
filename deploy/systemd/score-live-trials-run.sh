@@ -41,6 +41,11 @@ say() { echo "$(date -u +%Y-%m-%dT%H:%M:%SZ) $*" >> "$LOG"; }
 STAMP=$(date -u +%Y-%m-%d)
 STATUS=0
 
+# F2: drop any stale marker from an earlier same-day run BEFORE the
+# pre-flight -- so a later failing run never leaves a prior success's marker
+# in place for the tally wrappers to accept by mere existence.
+rm -f "$OUT/score_live_trials_ok_$STAMP"
+
 STATE_DB="${POLYMARKET_US_EXEC_STATE_DB:?POLYMARKET_US_EXEC_STATE_DB is required}"
 
 if ! CHECK_TOKEN=$("$PY" -m breezy.runtime.exec_state_db_path --check 2>>"$LOG"); then
@@ -57,6 +62,27 @@ if ! "$PY" "$REPO/scripts/analysis/structural_dead_stop.py" \
      --family-manifest "$FAMILY_MANIFEST" \
      --output "$CJSON" >>"$LOG" 2>&1; then
   say "SCORE LIVE TRIALS SKIPPED -- covered-listed station-days counter FAILED"
+  exit 1
+fi
+
+# F3: refuse a malformed/incomplete counter JSON before extracting with
+# sed -- a truncated file or one with duplicate matching lines must not be
+# silently accepted just because it contains a line the pattern matches.
+CJSON_FIRST_LINE=$(head -n1 "$CJSON")
+CJSON_LAST_LINE=$(tail -n1 "$CJSON")
+if [ "$CJSON_FIRST_LINE" != "{" ] || [ "$CJSON_LAST_LINE" != "}" ]; then
+  say "SCORE LIVE TRIALS SKIPPED -- counter JSON is not well-shaped (missing braces)"
+  exit 1
+fi
+CJSON_COUNT_LINES=$(grep -cE '^  "count": [0-9]+,?$' "$CJSON")
+CJSON_FETCH_START_LINES=$(grep -cE '^  "fetch_start": "[0-9]{4}-[0-9]{2}-[0-9]{2}",?$' "$CJSON")
+CJSON_STATION_LINES=$(grep -cE '^    "[A-Z]{3,4}",?$' "$CJSON")
+if [ "$CJSON_COUNT_LINES" -ne 1 ] || [ "$CJSON_FETCH_START_LINES" -ne 1 ]; then
+  say "SCORE LIVE TRIALS SKIPPED -- counter JSON count/fetch_start not exactly one line each"
+  exit 1
+fi
+if [ "$CJSON_STATION_LINES" -lt 1 ]; then
+  say "SCORE LIVE TRIALS SKIPPED -- counter JSON has no station lines"
   exit 1
 fi
 

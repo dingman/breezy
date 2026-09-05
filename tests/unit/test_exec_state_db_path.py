@@ -205,6 +205,59 @@ def test_node_store_path_check_skips_a_vanished_pid(tmp_path: Path) -> None:
     assert node_store_path_check(expected, proc_root=proc_root) == "MATCH"
 
 
+def test_node_store_path_check_discovery_failed_on_unreadable_cmdline(
+    tmp_path: Path,
+) -> None:
+    # F1: a directory in place of the cmdline file makes read_bytes() raise
+    # IsADirectoryError -- an OSError that is neither FileNotFoundError nor
+    # ProcessLookupError (the vanished-pid shape), the same failure family as
+    # EACCES/EIO on a real /proc entry. This must fail closed, distinct from
+    # NO_NODE, never escape as an exception.
+    proc_root = tmp_path / "proc"
+    expected = tmp_path / "store.sqlite3"
+    pid_dir = proc_root / "111"
+    pid_dir.mkdir(parents=True)
+    (pid_dir / "cmdline").mkdir()
+
+    assert node_store_path_check(expected, proc_root=proc_root) == "DISCOVERY_FAILED"
+
+
+def test_node_store_path_check_cmdline_failure_dominates_a_prior_match(
+    tmp_path: Path,
+) -> None:
+    # Fail-closed applies to the whole check, regardless of scan order: one
+    # genuinely-matching node must not mask another pid's unreadable cmdline.
+    proc_root = tmp_path / "proc"
+    expected = tmp_path / "store.sqlite3"
+    _write_process(
+        proc_root,
+        111,
+        [str(tmp_path / ".venv" / "bin" / "breezy-trade")],
+        {"POLYMARKET_US_EXEC_STATE_DB": str(expected)},
+    )
+    (proc_root / "222").mkdir(parents=True)
+    (proc_root / "222" / "cmdline").mkdir()
+
+    assert node_store_path_check(expected, proc_root=proc_root) == "DISCOVERY_FAILED"
+
+
+def test_node_store_path_check_never_leaks_on_a_cmdline_read_failure(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    proc_root = tmp_path / "proc"
+    expected = tmp_path / f"{_SENTINEL}.sqlite3"
+    pid_dir = proc_root / "111"
+    pid_dir.mkdir(parents=True)
+    (pid_dir / "cmdline").mkdir()
+
+    result = node_store_path_check(expected, proc_root=proc_root)
+
+    assert result == "DISCOVERY_FAILED"
+    captured = capsys.readouterr()
+    assert _SENTINEL not in captured.out
+    assert _SENTINEL not in captured.err
+
+
 def test_node_store_path_check_never_leaks_the_compared_value(
     tmp_path: Path, caplog: pytest.LogCaptureFixture, capsys: pytest.CaptureFixture[str]
 ) -> None:

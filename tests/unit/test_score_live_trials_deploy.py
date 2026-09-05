@@ -257,6 +257,64 @@ def test_unset_state_db_env_var_is_nonzero_and_never_invokes_python(tmp_path: Pa
     assert not argv_log.exists()
 
 
+def test_stale_marker_removed_when_a_later_run_fails(tmp_path: Path) -> None:
+    # F2: a prior successful run's marker must not survive a later same-day
+    # failed run -- both tally wrappers accept the marker by existence alone.
+    stub, _argv_log = _make_stub(tmp_path, scorer_fail_city="MDW")
+    marker = _marker_path(tmp_path)
+    marker.parent.mkdir(parents=True, exist_ok=True)
+    marker.touch()
+    assert marker.exists()
+
+    result = _run_wrapper(tmp_path, stub_python=stub)
+
+    assert result.returncode != 0
+    assert not marker.exists()
+
+
+def test_stale_marker_removed_then_rewritten_on_a_later_successful_run(
+    tmp_path: Path,
+) -> None:
+    stub, _argv_log = _make_stub(tmp_path)
+    marker = _marker_path(tmp_path)
+    marker.parent.mkdir(parents=True, exist_ok=True)
+    marker.write_text("stale-run-marker-content")
+
+    result = _run_wrapper(tmp_path, stub_python=stub)
+
+    assert result.returncode == 0, result.stderr
+    assert marker.exists()
+    assert marker.read_text() == ""
+
+
+def test_truncated_counter_json_missing_closing_brace_leaves_no_marker(
+    tmp_path: Path,
+) -> None:
+    lines = _default_counter_json().splitlines()
+    truncated = "\n".join(lines[:-1])  # drop the closing "}"
+    stub, argv_log = _make_stub(tmp_path, counter_json=truncated)
+
+    result = _run_wrapper(tmp_path, stub_python=stub)
+
+    assert result.returncode != 0
+    assert not _marker_path(tmp_path).exists()
+    assert not _scorer_calls(argv_log)
+
+
+def test_counter_json_with_duplicate_count_line_leaves_no_marker(tmp_path: Path) -> None:
+    lines = _default_counter_json().splitlines()
+    count_idx = next(i for i, line in enumerate(lines) if line.strip().startswith('"count"'))
+    duplicated = lines[: count_idx + 1] + [lines[count_idx]] + lines[count_idx + 1 :]
+    bad_json = "\n".join(duplicated)
+    stub, argv_log = _make_stub(tmp_path, counter_json=bad_json)
+
+    result = _run_wrapper(tmp_path, stub_python=stub)
+
+    assert result.returncode != 0
+    assert not _marker_path(tmp_path).exists()
+    assert not _scorer_calls(argv_log)
+
+
 def test_environment_lines_byte_identical_and_equal_pinned_literal() -> None:
     scorer_svc = (_SYSTEMD_DIR / "breezy-score-live-trials.service").read_text()
     tally_svc = (_SYSTEMD_DIR / "breezy-live-tally.service").read_text()

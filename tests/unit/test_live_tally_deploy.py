@@ -209,6 +209,53 @@ def test_check_match_or_no_node_invokes_the_tally(tmp_path: Path, token: str) ->
     assert len(_tally_calls(argv_log)) == 1
 
 
+def test_truncated_counter_json_missing_closing_brace_is_nonzero(tmp_path: Path) -> None:
+    _write_marker(tmp_path)
+    out = _out_dir(tmp_path)
+    out.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "count": 20,
+        "depth_root_present": True,
+        "fetch_end": "2026-09-05",
+        "fetch_start": "2026-09-05",
+        "manifest_sha256": "b" * 64,
+        "stations": ["LAX", "MDW", "MIA", "SFO"],
+    }
+    lines = json.dumps(payload, indent=2, sort_keys=True).splitlines()
+    truncated = "\n".join(lines[:-1])  # drop the closing "}"
+    (out / f"covered_listed_station_days_{_stamp()}.json").write_text(truncated)
+    stub, argv_log = _make_stub(tmp_path)
+
+    result = _run_wrapper(tmp_path, stub_python=stub)
+
+    assert result.returncode != 0
+    assert not _tally_calls(argv_log)
+
+
+def test_counter_json_with_duplicate_count_line_is_nonzero(tmp_path: Path) -> None:
+    _write_marker(tmp_path)
+    out = _out_dir(tmp_path)
+    out.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "count": 20,
+        "depth_root_present": True,
+        "fetch_end": "2026-09-05",
+        "fetch_start": "2026-09-05",
+        "manifest_sha256": "b" * 64,
+        "stations": ["LAX", "MDW", "MIA", "SFO"],
+    }
+    lines = json.dumps(payload, indent=2, sort_keys=True).splitlines()
+    count_idx = next(i for i, line in enumerate(lines) if line.strip().startswith('"count"'))
+    duplicated = lines[: count_idx + 1] + [lines[count_idx]] + lines[count_idx + 1 :]
+    (out / f"covered_listed_station_days_{_stamp()}.json").write_text("\n".join(duplicated))
+    stub, argv_log = _make_stub(tmp_path)
+
+    result = _run_wrapper(tmp_path, stub_python=stub)
+
+    assert result.returncode != 0
+    assert not _tally_calls(argv_log)
+
+
 def test_unset_state_db_env_var_is_nonzero(tmp_path: Path) -> None:
     _write_marker(tmp_path)
     _write_counter_json(tmp_path)

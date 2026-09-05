@@ -97,12 +97,29 @@ def resolve_store_path(environ: Mapping[str, str]) -> Path:
     return path
 
 
+class _CmdlineReadFailure(Exception):
+    """A ``cmdline`` read failed for a reason other than a vanished pid.
+
+    Raised for ``EACCES``/``EIO``-shaped errors (or, in tests, a directory
+    standing in for the file) so :func:`node_store_path_check` can fail
+    closed with ``DISCOVERY_FAILED`` instead of letting the exception
+    escape. Carries no path or value -- the caller never needs one.
+    """
+
+
 def _read_cmdline(pid_dir: Path) -> str | None:
-    """Return the joined argv, or ``None`` if the process vanished."""
+    """Return the joined argv, or ``None`` if the process vanished.
+
+    Raises :class:`_CmdlineReadFailure` for any other ``OSError`` (e.g.
+    ``PermissionError``/``EACCES``, ``EIO``) so the caller fails closed
+    rather than letting the exception escape.
+    """
     try:
         raw = (pid_dir / "cmdline").read_bytes()
     except (FileNotFoundError, ProcessLookupError):
         return None
+    except OSError:
+        raise _CmdlineReadFailure from None
     parts = raw.split(b"\0")
     if parts and parts[-1] == b"":
         parts = parts[:-1]
@@ -144,7 +161,10 @@ def node_store_path_check(
     mismatch = False
 
     for pid_dir in pid_dirs:
-        cmdline = _read_cmdline(pid_dir)
+        try:
+            cmdline = _read_cmdline(pid_dir)
+        except _CmdlineReadFailure:
+            return "DISCOVERY_FAILED"
         if cmdline is None:
             continue  # vanished between listing and read: a race, not a mismatch
         if not _NODE_ARGV_PATTERN.search(cmdline):
