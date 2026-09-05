@@ -50,6 +50,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from cli_basis_setup_win_rate_study import DENSE_STATIONS
 from h4_preliminary_economic_read import DepthObservation, load_depth
 from ma_prelock_winner_ask_study import (
+    AFTERNOON_WINDOW_END,
+    AFTERNOON_WINDOW_START,
     ASOS_FETCH_END,
     ASOS_FETCH_START,
     DEFAULT_QUOTE_TAPE_CATALOG,
@@ -59,12 +61,17 @@ from ma_prelock_winner_ask_study import (
     discover_station_days,
     instrument_ids_for,
 )
+from nautilus_trader.persistence.catalog.parquet import ParquetDataCatalog
 from settlement_alignment_study import load_sites
 
+from breezy.adapters.polymarket_us.tape_records import QuoteTapeGap, resolved_gaps_by_seq
+from breezy.normalize.climate_day import standard_time_zone
 from breezy.persistence.family_manifest import FamilyManifestError, load_family_manifest
+from breezy.persistence.quote_tape_gaps import load_partitioned_quote_tape_gaps
 
 __all__ = [
     "MIN_STRUCTURAL_DEAD_STATION_DAYS",
+    "QuoteTapeGapDataUnavailable",
     "StructuralDeadVerdict",
     "count_covered_listed_station_days_from_catalog",
     "covered_listed_station_days",
@@ -76,6 +83,10 @@ __all__ = [
 #: stop shares the exact same "15 station-days to discriminate" floor,
 #: never a second, potentially-drifting literal.
 MIN_STRUCTURAL_DEAD_STATION_DAYS = MIN_AFTERNOON_STATION_DAYS
+
+
+class QuoteTapeGapDataUnavailable(RuntimeError):
+    """Raised when the gap catalog cannot provide an authoritative gap set."""
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
@@ -126,11 +137,35 @@ def structural_dead(
 DepthLoader = Callable[[str, dt.date], Mapping[str, Sequence[DepthObservation]]]
 
 
+def _station_day_token(city: str, climate_day: dt.date) -> str:
+    return f"tc-temp-{city.lower()}high-{climate_day.isoformat()}-"
+
+
+def _gap_applies_to(gap: QuoteTapeGap, city: str, climate_day: dt.date) -> bool:
+    return _station_day_token(city, climate_day) in gap.instrument_id.value.lower()
+
+
+def _afternoon_window_ns(climate_day: dt.date, std_utc_offset_hours: float) -> tuple[int, int]:
+    tz = standard_time_zone(std_utc_offset_hours)
+    start = dt.datetime.combine(climate_day, AFTERNOON_WINDOW_START, tzinfo=tz)
+    end = dt.datetime.combine(climate_day, AFTERNOON_WINDOW_END, tzinfo=tz)
+    return (
+        int(start.timestamp() * 1_000_000_000),
+        int(end.timestamp() * 1_000_000_000),
+    )
+
+
+def _gap_overlaps_afternoon(gap: QuoteTapeGap, start_ns: int, end_ns: int) -> bool:
+    """True when the gap interval overlaps the half-open afternoon `[start, end)`."""
+    return gap.started_ns < end_ns and (not gap.resolved or gap.ended_ns > start_ns)
+
+
 def covered_listed_station_days(
     *,
     station_days: Sequence[tuple[str, dt.date]],
     load_depth_for_day: DepthLoader,
     std_utc_offset_by_city: Mapping[str, float],
+    resolved_gaps: Sequence[QuoteTapeGap] = (),
 ) -> int:
     """Count "afternoon-covered" days among the given "listed" station-days.
 
@@ -138,24 +173,38 @@ def covered_listed_station_days(
     (see module docstring), so this function performs no independent
     listing/skip-day logic of its own -- only the coverage test.
 
-    CAVEAT (no cheap census reader is currently wired in): a station-day the
-    venue DID list but whose capture had an OUTAGE (recorder down, disk
-    full, feed disconnect -- `docs/evidence/recorder hangs disconnected`
-    class of failure) is INDISTINGUISHABLE here from a day the venue never
-    listed at all -- both are simply absent from `station_days`, since
+    A listed day whose `[12:00, 17:00)` LST window overlaps a *resolved*
+    `QuoteTapeGap` (after `resolved_gaps_by_seq`; never raw `covers()` on
+    an open row that has a resolved partner) is not covered.
+
+    CAVEAT -- listed-vs-captured residual, fail-closed: a station-day the
+    venue DID list but whose capture had an OUTAGE that left NEITHER a
+    captured rung dir NOR a `QuoteTapeGap` row (process dead before any
+    subscribe) is INDISTINGUISHABLE here from a day the venue never listed
+    at all -- both are simply absent from `station_days`, since
     `discover_station_days` only sees what was actually captured. This
-    under-counts "listed" in exactly the outage case, which is
-    conservative for this stop (fewer covered-listed days delays a KILL,
-    never manufactures one) but would silently suppress a real dead-cell
-    signal if outages were frequent. `docs/evidence/venue_city_census_
-    2026-09-03.md` records the venue's independently-observed listing
-    calendar and could resolve this distinction, but it is a Markdown
-    evidence artifact, not a machine-readable store, so no code path here
-    cross-checks against it; a future census reader should compare its
-    count against `len(station_days)` and warn on a mismatch.
+    under-counts "listed" in that residual, which DELAYS a KILL, never
+    manufactures one. No live venue census call is made. Outage
+    observability is stderr (and the v2 markdown residual line), never an
+    extra JSON key -- the six-key `--output` contract stays pinned.
     """
+    collapsed = resolved_gaps_by_seq(resolved_gaps)
     count = 0
     for city, climate_day in station_days:
+        start_ns, end_ns = _afternoon_window_ns(
+            climate_day, std_utc_offset_by_city[city]
+        )
+        if any(
+            _gap_applies_to(gap, city, climate_day)
+            and _gap_overlaps_afternoon(gap, start_ns, end_ns)
+            for gap in collapsed
+        ):
+            print(
+                f"structural-dead-stop: {city} {climate_day.isoformat()} not covered "
+                "(afternoon overlapped a resolved QuoteTapeGap)",
+                file=sys.stderr,
+            )
+            continue
         depth = load_depth_for_day(city, climate_day)
         instants = collect_window_instants(
             depth,
@@ -197,7 +246,28 @@ def count_covered_listed_station_days_from_catalog(
         station_days=station_days,
         load_depth_for_day=_loader,
         std_utc_offset_by_city=std_utc_offset_by_city,
+        resolved_gaps=_resolved_gaps_from_catalog(catalog_root),
     )
+
+
+def _resolved_gaps_from_catalog(catalog_root: Path) -> tuple[QuoteTapeGap, ...]:
+    """Load collapsed gap rows; refuse when the partition cannot be read.
+
+    Residual: process-dead with neither dirs nor gap rows still looks like
+    never-listed and delays KILL. Never call raw `covers()` on open rows.
+    """
+    try:
+        partitioned = load_partitioned_quote_tape_gaps(
+            ParquetDataCatalog(str(catalog_root))
+        )
+    except (OSError, RuntimeError, TypeError, ValueError) as exc:
+        raise QuoteTapeGapDataUnavailable(
+            f"quote-tape gaps unavailable under {catalog_root}: {exc!r}"
+        ) from exc
+    gaps: list[QuoteTapeGap] = []
+    for part in partitioned.values():
+        gaps.extend(part)
+    return tuple(gaps)
 
 
 def _parse_args(argv: Sequence[str] | None) -> argparse.Namespace:
@@ -293,12 +363,16 @@ def main(argv: Sequence[str] | None = None) -> int:
     depth_root = catalog_root / "data" / "order_book_depths"
     depth_root_present = depth_root.is_dir()
     if depth_root_present:
-        count = count_covered_listed_station_days_from_catalog(
-            catalog_root=catalog_root,
-            cities=cities,
-            fetch_start=fetch_start,
-            fetch_end=ASOS_FETCH_END,
-        )
+        try:
+            count = count_covered_listed_station_days_from_catalog(
+                catalog_root=catalog_root,
+                cities=cities,
+                fetch_start=fetch_start,
+                fetch_end=ASOS_FETCH_END,
+            )
+        except QuoteTapeGapDataUnavailable as exc:
+            print(f"structural-dead-stop: refusing counter: {exc}", file=sys.stderr)
+            return 1
     else:
         # Conservative (covered_listed_station_days docstring, :136-151): an
         # absent depth root only DELAYS a KILL (count stays under the floor),

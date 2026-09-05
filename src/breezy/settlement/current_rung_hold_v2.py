@@ -226,19 +226,23 @@ def terminal_look(
     b_fut: float,
     total_pnl: Decimal,
     cell_dead: bool,
+    structural_fired: bool = False,
 ) -> Literal["SURVIVE", "KILL"]:
     """Terminal verdict at truncation (rev b Sec 4). `CONTINUE` is illegal
     here by construction (the return type admits only SURVIVE/KILL).
 
     `LOSS_STOP` -> KILL unconditionally (SURVIVE needs `total_pnl > 0`,
     impossible at a loss stop; any efficacy remaining-alpha computation
-    would be vacuous, rev b Sec 4).
+    would be vacuous, rev b Sec 4). Structural-dead is a separate KILL
+    authority and cannot be substituted by the clock.
 
     Otherwise, an inconclusive interior score (`b_fut < S < b_eff`) is
     fail-closed to KILL -- the family is stopping at the clock, not
     continuing (rev b Sec 4). `D0_165`/`I_MAX` admit SURVIVE only with
     `S >= b_eff AND total_pnl > 0 AND no cell_dead`; anything else is KILL.
     """
+    if structural_fired:
+        return "KILL"
     if reason is TruncationReason.LOSS_STOP:
         return "KILL"
     if b_fut < state.s < b_eff:

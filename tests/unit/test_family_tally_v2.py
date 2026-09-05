@@ -1074,3 +1074,146 @@ def test_coverage_section_footer_states_artefact_path_and_counts(
     assert "lines read: 2" in report
     assert "distinct venue_order_ids: 2" in report
     assert "dropped as already-scored: 1" in report
+
+
+# --- structural-dead pin (pm_us_crh_v2, additive KILL at n < look_step) ------
+
+
+def test_15_covered_0_fill_time_kills_at_n_lt_look_step(
+    tmp_path: Path, tally_mod: ModuleType
+) -> None:
+    manifest = _manifest(tmp_path)
+    artefact = _synthetic_artefact(i_max=1000.0, n_max=100, look_step=10)
+    tally = tally_mod.build_family_tally_v2(
+        (),
+        manifest=manifest,
+        artefact=artefact,
+        covered_listed_station_days=15,
+        filled_takes=0,
+    )
+    assert tally.verdict == "KILL"
+    report = tally_mod.render_markdown_v2(tally, source_paths=(tmp_path,), as_of="2026-09-05")
+    assert "**KILL**" in report
+    assert "structural-dead" in report
+
+
+def test_14_covered_0_fills_continues(tmp_path: Path, tally_mod: ModuleType) -> None:
+    manifest = _manifest(tmp_path)
+    artefact = _synthetic_artefact(i_max=1000.0, n_max=100, look_step=10)
+    tally = tally_mod.build_family_tally_v2(
+        (),
+        manifest=manifest,
+        artefact=artefact,
+        covered_listed_station_days=14,
+        filled_takes=0,
+    )
+    assert tally.verdict == "CONTINUE"
+    report = tally_mod.render_markdown_v2(tally, source_paths=(tmp_path,), as_of="2026-09-05")
+    assert "**CONTINUE**" in report
+    assert "**KILL**" not in report
+
+
+def test_15_covered_one_fill_time_fill_continues(
+    tmp_path: Path, tally_mod: ModuleType
+) -> None:
+    manifest = _manifest(tmp_path)
+    artefact = _synthetic_artefact(i_max=1000.0, n_max=100, look_step=10)
+    tally = tally_mod.build_family_tally_v2(
+        (),
+        manifest=manifest,
+        artefact=artefact,
+        covered_listed_station_days=15,
+        filled_takes=1,
+    )
+    assert tally.verdict == "CONTINUE"
+    report = tally_mod.render_markdown_v2(tally, source_paths=(tmp_path,), as_of="2026-09-05")
+    assert "**CONTINUE**" in report
+    assert "**KILL**" not in report
+
+
+def test_empty_looks_structural_kill_is_not_continue_n_lt_look_step(
+    tmp_path: Path, tally_mod: ModuleType
+) -> None:
+    """Structural KILL at n < look_step must not collapse to CONTINUE just
+    because `looks` is empty -- headline keys off tally.verdict."""
+    manifest = _manifest(tmp_path)
+    artefact = _synthetic_artefact(i_max=1000.0, n_max=100, look_step=10)
+    tally = tally_mod.build_family_tally_v2(
+        (),
+        manifest=manifest,
+        artefact=artefact,
+        covered_listed_station_days=15,
+        filled_takes=0,
+    )
+    assert tally.looks == ()
+    assert tally.verdict == "KILL"
+    report = tally_mod.render_markdown_v2(tally, source_paths=(tmp_path,), as_of="2026-09-05")
+    assert "**KILL**" in report
+    assert "**CONTINUE**" not in report
+    assert "structural-dead" in report
+    assert "evaluable and fired" in report
+    # The headline must attribute the KILL to the structural-dead stop
+    # firing, never to insufficient data -- that phrasing is reserved for a
+    # genuine n < look_step CONTINUE/KILL with no structural pin involved.
+    assert (
+        "**KILL** -- structural-dead stop fired "
+        "(15 covered listed station-days, 0 filled Takes)"
+    ) in report
+    assert "fewer than one completed look" not in report
+
+
+def test_paper_provenance_store_is_refused_before_structural_eval(
+    tmp_path: Path, tally_mod: ModuleType
+) -> None:
+    """A paper_replay sidecar is refused before structural_dead(); R2 (empty
+    unmarked store) is a missing-sidecar exception, not a paper admit."""
+    store_dir = tmp_path / "store"
+    store_dir.mkdir()
+    (store_dir / "provenance.json").write_text(json.dumps({"provenance": "paper_replay"}))
+    manifest = _manifest(tmp_path)
+    artefact = _synthetic_artefact(i_max=1000.0, n_max=100, look_step=10)
+    with pytest.raises(tally_mod.ProvenanceRefusal, match="paper_replay"):
+        tally_mod.build_family_tally_v2(
+            (),
+            manifest=manifest,
+            artefact=artefact,
+            store_dir=store_dir,
+            covered_listed_station_days=15,
+            filled_takes=0,
+        )
+
+
+def test_filled_takes_less_than_n_scored_is_refused(
+    tmp_path: Path, tally_mod: ModuleType
+) -> None:
+    """v1 live_family_tally.py:281-286: filled_takes must be a superset of
+    scored rows. A settled-only count smaller than len(rows) is a wiring
+    defect, never a silent KILL."""
+    manifest = _manifest(tmp_path)
+    artefact = _synthetic_artefact(i_max=1000.0, n_max=100, look_step=10)
+    rows = _rows(3)
+    with pytest.raises(ValueError, match="settled-only count"):
+        tally_mod.build_family_tally_v2(
+            rows,
+            manifest=manifest,
+            artefact=artefact,
+            covered_listed_station_days=15,
+            filled_takes=0,
+        )
+
+
+def test_draft_manifest_never_prints_kill(tmp_path: Path, tally_mod: ModuleType) -> None:
+    manifest = _manifest(tmp_path, status="DRAFT_NOT_REGISTERED", boundary_inputs_sha256="0" * 64)
+    artefact = _synthetic_artefact(i_max=1000.0, n_max=100, look_step=10)
+    tally = tally_mod.build_family_tally_v2(
+        (),
+        manifest=manifest,
+        artefact=artefact,
+        covered_listed_station_days=15,
+        filled_takes=0,
+    )
+    report = tally_mod.render_markdown_v2(tally, source_paths=(tmp_path,), as_of="2026-09-05")
+    assert "SHADOW" in report
+    assert "KILL" not in report
+    assert "SURVIVE" not in report
+    assert "CONTINUE" not in report

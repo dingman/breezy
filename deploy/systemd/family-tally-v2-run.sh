@@ -69,6 +69,9 @@ say() { echo "$(date -u +%Y-%m-%dT%H:%M:%SZ) $*" >> "$LOG"; }
 
 STAMP=$(date -u +%Y-%m-%d)
 STATUS=0
+# Structural-dead pin is pm_us_crh_v2 only -- never attached to kalshi_crh_v1.
+PM_FAMILY="pm_us_crh_v2"
+V2_D0_LITERAL="2026-09-05"  # pm_us_crh_v2.json d0_climate_day
 
 # I3 (docs/plans/LIVE_FILL_SCORING_CHAIN_2026-09-05.md, BLOCK-2): assert the
 # 14:15 score-live-trials-run.sh success marker before tallying -- never
@@ -78,11 +81,68 @@ if [ ! -f "$OUT/score_live_trials_ok_$STAMP" ]; then
   exit 1
 fi
 
+EXTRA_ARGS=()
+if [ "$FAMILY" = "$PM_FAMILY" ]; then
+  CHECK_TOKEN="refused"
+  if CHECK_TOKEN_OUTPUT=$("$PY" -m breezy.runtime.exec_state_db_path --check 2>>"$LOG"); then
+    CHECK_TOKEN="$CHECK_TOKEN_OUTPUT"
+  fi
+
+  if [ "$CHECK_TOKEN" != "MATCH" ]; then
+    MSG="FAMILY TALLY V2 ($FAMILY) STRUCTURAL-DEAD UNAVAILABLE -- node-env pre-flight token '$CHECK_TOKEN' (required MATCH); running sequential tally without structural args"
+    echo "$MSG"
+    say "$MSG"
+  else
+  CJSON="$OUT/covered_listed_station_days_$STAMP.json"
+  if [ ! -f "$CJSON" ]; then
+    say "FAMILY TALLY V2 ($FAMILY) SKIPPED -- no covered-listed station-days JSON for $STAMP"
+    exit 1
+  fi
+
+  # Shape-check copied from live-tally-run.sh:47-80 -- six-key JSON, sed-stable
+  # count/fetch_start. Extra keys are not added by the 14:15 writer.
+  CJSON_FIRST_LINE=$(head -n1 "$CJSON")
+  CJSON_LAST_LINE=$(tail -n1 "$CJSON")
+  if [ "$CJSON_FIRST_LINE" != "{" ] || [ "$CJSON_LAST_LINE" != "}" ]; then
+    say "FAMILY TALLY V2 ($FAMILY) SKIPPED -- counter JSON is not well-shaped (missing braces)"
+    exit 1
+  fi
+  CJSON_COUNT_LINES=$(grep -cE '^  "count": [0-9]+,?$' "$CJSON")
+  CJSON_FETCH_START_LINES=$(grep -cE '^  "fetch_start": "[0-9]{4}-[0-9]{2}-[0-9]{2}",?$' "$CJSON")
+  if [ "$CJSON_COUNT_LINES" -ne 1 ] || [ "$CJSON_FETCH_START_LINES" -ne 1 ]; then
+    say "FAMILY TALLY V2 ($FAMILY) SKIPPED -- counter JSON count/fetch_start not exactly one line each"
+    exit 1
+  fi
+
+  COUNT=$(sed -nE 's/^  "count": ([0-9]+),?$/\1/p' "$CJSON")
+  D0=$(sed -nE 's/^  "fetch_start": "([0-9]{4}-[0-9]{2}-[0-9]{2})",?$/\1/p' "$CJSON")
+
+  if [ -z "$COUNT" ] || [ -z "$D0" ]; then
+    say "FAMILY TALLY V2 ($FAMILY) SKIPPED -- could not extract count/fetch_start from $CJSON"
+    exit 1
+  fi
+
+  if [ "$D0" != "$V2_D0_LITERAL" ]; then
+    say "FAMILY TALLY V2 ($FAMILY) SKIPPED -- counter fetch_start drifted from the registered d0"
+    exit 1
+  fi
+
+  STATE_DB="${POLYMARKET_US_EXEC_STATE_DB:?POLYMARKET_US_EXEC_STATE_DB is required}"
+
+  EXTRA_ARGS=(
+    --covered-listed-station-days "$COUNT"
+    --fill-source "$STATE_DB"
+    --fill-since-climate-day "$D0"
+  )
+  fi
+fi
+
 if "$PY" "$REPO/scripts/analysis/family_tally_v2.py" \
      --family "$FAMILY" \
      --store-dir "$STORE_DIR" \
      --as-of "$STAMP" \
-     --output "$OUT/family_tally_v2_${FAMILY}_$STAMP.md" >/dev/null 2>>"$LOG"; then
+     --output "$OUT/family_tally_v2_${FAMILY}_$STAMP.md" \
+     "${EXTRA_ARGS[@]}" >/dev/null 2>>"$LOG"; then
   say "family tally v2 ($FAMILY) ok"
 else
   say "FAMILY TALLY V2 ($FAMILY) RUN FAILED (see stderr above in $LOG)"

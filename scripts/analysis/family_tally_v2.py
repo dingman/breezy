@@ -81,6 +81,7 @@ import pyarrow.parquet as pq
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
+from fill_time_count import count_filled_takes
 from mb_current_rung_edge_study import ASK_BANDS, classify_ask_band  # v1, read-only reuse
 from structural_dead_stop import StructuralDeadVerdict, structural_dead
 
@@ -130,6 +131,11 @@ __all__ = [
 #: explicitly `"paper_replay"`-marked one.
 _LIVE_PROVENANCE_VALUE: Final[str] = "live"
 _PROVENANCE_SIDECAR_NAME: Final[str] = "provenance.json"
+
+#: Live latch key prefix -- the fill-time count must never see paper_replay
+#: rows (`fill_time_count.py` startswith this prefix). Restated, not derived
+#: from `len(scored)`.
+_LIVE_TRIAL_ID_PREFIX: Final[str] = "current_rung_hold/trial/"
 
 #: v1 SS6:124-128, restated (never imported -- `mb_current_rung_edge_study`
 #: has no module-level constant for this; it is inlined in prose there).
@@ -493,6 +499,13 @@ def build_family_tally_v2(
 
     total_pnl = sum((row.pnl for row in non_excluded), start=Decimal(0))
 
+    if filled_takes is not None and filled_takes < len(rows):
+        raise ValueError(
+            f"filled_takes={filled_takes} is less than len(rows)={len(rows)}: a "
+            "fill-time count can only be a superset of the settled/scored rows; "
+            "this looks like a settled-only count, which must never be passed here"
+        )
+
     structural = (
         None
         if covered_listed_station_days is None
@@ -510,8 +523,15 @@ def build_family_tally_v2(
     t_history: list[float] = []
     verdict = "CONTINUE"
     bca_line: str | None = None
+    registered = manifest.status == "REGISTERED"
 
-    scheduled_ns = range(look_step, min(n, n_max) + 1, look_step)
+    # Structural-dead is a separate KILL authority: never overwritten by a
+    # later look_verdict/terminal_look assignment. Skip the look loop.
+    if structural_fired and registered:
+        verdict = "KILL"
+        scheduled_ns = range(0)
+    else:
+        scheduled_ns = range(look_step, min(n, n_max) + 1, look_step)
     for look_n in scheduled_ns:
         state = score(pooled_rows[:look_n])
         t = information_fraction(state.information, i_max=artefact.i_max)
@@ -542,6 +562,7 @@ def build_family_tally_v2(
                 b_fut=b_fut,
                 total_pnl=total_pnl,
                 cell_dead=any_cell_dead,
+                structural_fired=structural_fired,
             )
             looks.append(
                 LookRecord(
@@ -585,7 +606,12 @@ def build_family_tally_v2(
             break
 
     already_terminal = bool(looks) and looks[-1].terminal
-    if truncation is not None and not already_terminal and pooled_rows:
+    if (
+        not (structural_fired and registered)
+        and truncation is not None
+        and not already_terminal
+        and pooled_rows
+    ):
         # An off-grid explicit truncation (n does not land on a look_step
         # boundary): treated as a look too, never a skipped None (rev b
         # SS4).
@@ -600,6 +626,7 @@ def build_family_tally_v2(
             b_fut=b_fut,
             total_pnl=total_pnl,
             cell_dead=any_cell_dead,
+            structural_fired=structural_fired,
         )
         looks.append(
             LookRecord(
@@ -867,17 +894,49 @@ def render_markdown_v2(tally: FamilyTallyV2, *, source_paths: Sequence[Path], as
             reason_note = ", terminal=n_max_reached"
         else:
             reason_note = f", truncation={last.reason.value}"
-        add(f"**{last.verdict}** at look n={last.look_n} (t={last.t:.4f}){reason_note}")
+        add(f"**{tally.verdict}** at look n={last.look_n} (t={last.t:.4f}){reason_note}")
     else:
-        add("**CONTINUE** -- fewer than one completed look so far (n < look_step)")
+        structural_fired = (
+            tally.structural_dead is not None and tally.structural_dead.structural_dead
+        )
+        if structural_fired:
+            sd = tally.structural_dead
+            add(
+                f"**{tally.verdict}** -- structural-dead stop fired "
+                f"({sd.covered_listed_station_days} covered listed station-days, "
+                f"{sd.filled_takes} filled Takes)"
+            )
+        else:
+            add(
+                f"**{tally.verdict}** -- fewer than one completed look so far (n < look_step)"
+            )
     add("")
 
-    if tally.structural_dead is not None and not tally.structural_dead.evaluable:
-        add(
-            "structural-dead stop (v1 section 5:105-106): SKIPPED -- no "
-            "fill-time count was available."
-        )
-        add("")
+    if tally.structural_dead is not None:
+        if not tally.structural_dead.evaluable:
+            add(
+                "structural-dead stop (v1 section 5:105-106): SKIPPED -- no "
+                "fill-time count was available."
+            )
+            add("")
+        else:
+            sd = tally.structural_dead
+            fired_note = (
+                ", evaluable and fired"
+                if sd.structural_dead
+                else ", evaluable and not fired"
+            )
+            add(
+                "structural-dead stop (v1 section 5:105-106): "
+                f"{sd.covered_listed_station_days} covered-listed station-day(s), "
+                f"{sd.filled_takes} filled Take(s){fired_note}."
+            )
+            add(
+                "listed-vs-captured residual: process-dead with neither captured "
+                "dirs nor QuoteTapeGap rows is indistinguishable from never-listed "
+                "and delays the stop (fail-closed)."
+            )
+            add("")
 
     add("| look | n | t | S | I | b_eff | b_fut | verdict |")
     add("|---:|---:|---:|---:|---:|---:|---:|---|")
@@ -916,6 +975,30 @@ def main(argv: Sequence[str] | None = None) -> int:
         default=None,
         help="force a terminal look at the current n with this truncation reason",
     )
+    parser.add_argument(
+        "--fill-source",
+        type=Path,
+        default=None,
+        help="exec-state SqliteStateStore path for the structural-dead stop's "
+        "FILL-TIME filled-Takes count (see fill_time_count.py); omitted means "
+        "filled_takes=None and the stop is never evaluated",
+    )
+    parser.add_argument(
+        "--covered-listed-station-days",
+        type=int,
+        default=None,
+        help="the structural-dead stop's covered-listed-station-days "
+        "denominator (see structural_dead_stop.py); omitted means the stop "
+        "is never evaluated",
+    )
+    parser.add_argument(
+        "--fill-since-climate-day",
+        type=str,
+        default=None,
+        help="ISO date pass-through to count_filled_takes's since_climate_day "
+        "(fill_time_count.py); scopes the fill-time count. Ignored when "
+        "--fill-source is not given.",
+    )
     args = parser.parse_args(argv)
 
     repo_root = Path(__file__).resolve().parents[2]
@@ -935,6 +1018,15 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     rows = read_scored_trials(args.store_dir)
     truncation = TruncationReason(args.truncate) if args.truncate else None
+    filled_takes = (
+        None
+        if args.fill_source is None
+        else count_filled_takes(
+            args.fill_source,
+            family_prefix=_LIVE_TRIAL_ID_PREFIX,
+            since_climate_day=args.fill_since_climate_day,
+        )
+    )
 
     try:
         tally = build_family_tally_v2(
@@ -942,6 +1034,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             manifest=manifest,
             artefact=artefact,
             store_dir=args.store_dir,
+            covered_listed_station_days=args.covered_listed_station_days,
+            filled_takes=filled_takes,
             truncation=truncation,
         )
     except ProvenanceRefusal as exc:

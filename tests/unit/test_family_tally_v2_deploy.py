@@ -44,6 +44,8 @@ def _run_wrapper(
     *,
     stub_python: Path | None = None,
     create_marker: bool = True,
+    set_state_db: bool = True,
+    write_counter_json: bool = True,
 ) -> subprocess.CompletedProcess:
     # I3 (LIVE_FILL_SCORING_CHAIN_2026-09-05.md, BLOCK-2): the wrapper now
     # asserts the 14:15 score-live-trials-run.sh success marker before
@@ -57,10 +59,16 @@ def _run_wrapper(
     env["BREEZY_LIVE_TALLY_OUTPUT_DIR"] = str(out_dir)
     if stub_python is not None:
         env["BREEZY_FAMILY_TALLY_V2_PYTHON"] = str(stub_python)
+    if set_state_db:
+        env["POLYMARKET_US_EXEC_STATE_DB"] = str(tmp_path / "state" / "exec_polymarket_us.sqlite")
+    else:
+        env.pop("POLYMARKET_US_EXEC_STATE_DB", None)
     if create_marker:
         out_dir.mkdir(parents=True, exist_ok=True)
         stamp = _dt.datetime.now(_dt.UTC).strftime("%Y-%m-%d")
         (out_dir / f"score_live_trials_ok_{stamp}").touch()
+    if write_counter_json:
+        _write_counter_json(tmp_path)
     return subprocess.run(
         ["bash", str(_WRAPPER), *family_arg],
         cwd=_REPO_ROOT,
@@ -206,6 +214,182 @@ def test_concrete_unit_pair_exists_and_wires_to_wrapper(
 def test_pm_crh_v2_timer_fires_at_1530_utc() -> None:
     timer_text = (_SYSTEMD_DIR / "breezy-pm-crh-v2-tally.timer").read_text()
     assert "OnCalendar=*-*-* 15:30:00 UTC" in timer_text
+
+
+def _write_counter_json(
+    tmp_path: Path, *, fetch_start: str = "2026-09-05", count: int = 20
+) -> Path:
+    out = tmp_path / "derived"
+    out.mkdir(parents=True, exist_ok=True)
+    stamp = _dt.datetime.now(_dt.UTC).strftime("%Y-%m-%d")
+    payload = {
+        "count": count,
+        "depth_root_present": True,
+        "fetch_end": fetch_start,
+        "fetch_start": fetch_start,
+        "manifest_sha256": "b" * 64,
+        "stations": ["LAX", "MDW", "MIA", "SFO"],
+    }
+    path = out / f"covered_listed_station_days_{stamp}.json"
+    path.write_text(json.dumps(payload, indent=2, sort_keys=True))
+    return path
+
+
+def test_wrapper_passes_covered_listed_and_fill_source(tmp_path: Path) -> None:
+    """pm_us_crh_v2 only: same-day JSON + POLYMARKET_US_EXEC_STATE_DB + d0."""
+    capture = tmp_path / "argv_capture.txt"
+    stub = tmp_path / "stub_python.sh"
+    stub.write_text(
+        f"""#!/usr/bin/env bash
+case "$*" in
+  *"-m breezy.runtime.exec_state_db_path --check"*)
+    echo "MATCH"
+    exit 0
+    ;;
+  *)
+    printf "%s\\n" "$@" > "{capture}"
+    exit 0
+    ;;
+esac
+"""
+    )
+    stub.chmod(0o755)
+    _write_counter_json(tmp_path, count=42, fetch_start="2026-09-05")
+    result = _run_wrapper(
+        ["pm_us_crh_v2"],
+        tmp_path,
+        stub_python=stub,
+        set_state_db=True,
+        write_counter_json=False,
+    )
+    assert result.returncode == 0, result.stderr
+    argv_lines = capture.read_text().splitlines()
+    assert "--covered-listed-station-days" in argv_lines
+    assert argv_lines[argv_lines.index("--covered-listed-station-days") + 1] == "42"
+    assert "--fill-source" in argv_lines
+    assert argv_lines[argv_lines.index("--fill-source") + 1] == str(
+        tmp_path / "state" / "exec_polymarket_us.sqlite"
+    )
+    assert "--fill-since-climate-day" in argv_lines
+    assert argv_lines[argv_lines.index("--fill-since-climate-day") + 1] == "2026-09-05"
+
+    kalshi_capture = tmp_path / "kalshi_argv.txt"
+    kalshi_stub = tmp_path / "kalshi_stub.sh"
+    kalshi_stub.write_text(
+        f'#!/usr/bin/env bash\nprintf "%s\\n" "$@" > "{kalshi_capture}"\nexit 0\n'
+    )
+    kalshi_stub.chmod(0o755)
+    kalshi = _run_wrapper(["kalshi_crh_v1"], tmp_path, stub_python=kalshi_stub)
+    assert kalshi.returncode == 0, kalshi.stderr
+    kalshi_argv = kalshi_capture.read_text().splitlines()
+    assert "--covered-listed-station-days" not in kalshi_argv
+    assert "--fill-source" not in kalshi_argv
+    assert "--fill-since-climate-day" not in kalshi_argv
+
+
+def test_wrapper_skips_when_counter_json_absent(tmp_path: Path) -> None:
+    capture = tmp_path / "argv_capture.txt"
+    stub = tmp_path / "stub_python.sh"
+    stub.write_text(
+        f"""#!/usr/bin/env bash
+case "$*" in
+  *"-m breezy.runtime.exec_state_db_path --check"*)
+    echo "MATCH"
+    exit 0
+    ;;
+  *)
+    printf "%s\\n" "$@" > "{capture}"
+    exit 0
+    ;;
+esac
+"""
+    )
+    stub.chmod(0o755)
+    result = _run_wrapper(
+        ["pm_us_crh_v2"],
+        tmp_path,
+        stub_python=stub,
+        set_state_db=True,
+        write_counter_json=False,
+    )
+    assert result.returncode != 0
+    assert not capture.exists()
+
+
+def test_pm_wrapper_skips_structural_eval_when_node_check_returns_no_node(
+    tmp_path: Path,
+) -> None:
+    capture = tmp_path / "argv_capture.txt"
+    stub = tmp_path / "stub_python.sh"
+    stub.write_text(
+        f"""#!/usr/bin/env bash
+case "$*" in
+  *"-m breezy.runtime.exec_state_db_path --check"*)
+    echo "NO_NODE"
+    exit 0
+    ;;
+  *)
+    printf "%s\\n" "$@" > "{capture}"
+    exit 0
+    ;;
+esac
+"""
+    )
+    stub.chmod(0o755)
+    result = _run_wrapper(
+        ["pm_us_crh_v2"],
+        tmp_path,
+        stub_python=stub,
+        set_state_db=True,
+    )
+    assert result.returncode == 0, result.stderr
+    assert "STRUCTURAL-DEAD UNAVAILABLE" in result.stdout
+    assert "NO_NODE" in result.stdout
+    argv_lines = capture.read_text().splitlines()
+    assert "--family" in argv_lines
+    assert argv_lines[argv_lines.index("--family") + 1] == "pm_us_crh_v2"
+    assert "--fill-source" not in argv_lines
+    assert "--covered-listed-station-days" not in argv_lines
+    assert "--fill-since-climate-day" not in argv_lines
+
+
+def test_pm_wrapper_skips_structural_eval_when_node_check_refuses(
+    tmp_path: Path,
+) -> None:
+    """Codex review finding F2: a non-zero exit from the --check pre-flight
+    (refused/discovery-failed) must fall back to the sequential tally with no
+    structural args -- never exit 1 and never pass --fill-source on a token
+    that isn't MATCH."""
+    capture = tmp_path / "argv_capture.txt"
+    stub = tmp_path / "stub_python.sh"
+    stub.write_text(
+        f"""#!/usr/bin/env bash
+case "$*" in
+  *"-m breezy.runtime.exec_state_db_path --check"*)
+    exit 1
+    ;;
+  *)
+    printf "%s\\n" "$@" > "{capture}"
+    exit 0
+    ;;
+esac
+"""
+    )
+    stub.chmod(0o755)
+    result = _run_wrapper(
+        ["pm_us_crh_v2"],
+        tmp_path,
+        stub_python=stub,
+        set_state_db=True,
+    )
+    assert result.returncode == 0, result.stderr
+    assert "STRUCTURAL-DEAD UNAVAILABLE" in result.stdout
+    argv_lines = capture.read_text().splitlines()
+    assert "--family" in argv_lines
+    assert argv_lines[argv_lines.index("--family") + 1] == "pm_us_crh_v2"
+    assert "--fill-source" not in argv_lines
+    assert "--covered-listed-station-days" not in argv_lines
+    assert "--fill-since-climate-day" not in argv_lines
 
 
 def test_kalshi_crh_unit_pair_is_parked_off_main(tmp_path: Path) -> None:
