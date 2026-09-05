@@ -1208,7 +1208,8 @@ state), [[L-10]] (brief vocabulary becomes verified fact).
 swap was exhausted. `PolymarketUSDataClient._frame_diagnostics` was a plain
 list that `_handle_ws_frame` appended to on EVERY inbound websocket frame,
 before routing, with a full walk of the payload structure per frame; its only
-reader was one unit test. The same class powers the quote-tape recorder,
+readers were one unit test and the venue auth-smoke script -- nothing in the
+node or the recorder. The same class powers the quote-tape recorder,
 whose earlier "memory fix" (d46b725) added cgroup limits and a cache cap and
 never touched the list — the symptom was contained, the cause survived, and
 the recorder has been swapping against its ceiling ever since.

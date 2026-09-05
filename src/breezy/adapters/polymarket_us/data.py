@@ -58,6 +58,7 @@ from __future__ import annotations
 import asyncio
 import json
 import uuid
+from collections import deque
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any, Final, Protocol, runtime_checkable
@@ -181,6 +182,11 @@ ONE_SIDED_BOOK_SUMMARY_EVERY: Final[int] = 1000
 
 #: How often the safe-mode watchdog samples the socket's degraded flag.
 DEFAULT_FEED_WATCH_INTERVAL_SECS: Final[float] = 5.0
+
+#: Diagnostics retained for the most recent frames only. An unbounded list
+#: here leaked ~1 GB/h on the live node (2026-09-05); the only reader wants
+#: recent frame shapes, never the full-run history.
+FRAME_DIAGNOSTICS_CAPACITY: Final[int] = 64
 
 #: Topic ``Component.shutdown_system`` publishes on
 #: (``common/component.pyx:2182``). Duplicated here for ONE purpose -- a
@@ -702,7 +708,7 @@ class PolymarketUSDataClient(LiveMarketDataClient):
         self._dropped_frames: int = 0
         self._frames_missing_routing_key: int = 0
         self._quotes_published: int = 0
-        self._frame_diagnostics: list[FrameDiagnostic] = []
+        self._frame_diagnostics: deque[FrameDiagnostic] = deque(maxlen=FRAME_DIAGNOSTICS_CAPACITY)
         # Tape-gap accounting. `None` for "never sampled yet", so the very
         # first sample cannot be mistaken for a transition.
         self._feed_was_connected: bool | None = None
@@ -857,7 +863,10 @@ class PolymarketUSDataClient(LiveMarketDataClient):
 
     @property
     def frame_diagnostics(self) -> tuple[FrameDiagnostic, ...]:
-        """Return redaction-safe diagnostics for every inbound dict frame."""
+        """Return redaction-safe diagnostics for the most recent inbound dict frames.
+
+        Bounded to the last ``FRAME_DIAGNOSTICS_CAPACITY`` frames; see the constant.
+        """
         return tuple(self._frame_diagnostics)
 
     @property

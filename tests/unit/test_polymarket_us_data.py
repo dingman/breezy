@@ -49,6 +49,7 @@ from nautilus_trader.test_kit.stubs.component import TestComponentStubs
 from breezy.adapters.polymarket_us.config import PolymarketUSDataClientConfig
 from breezy.adapters.polymarket_us.data import (
     DISCOVERY_RELOAD_FLOOR_SECS,
+    FRAME_DIAGNOSTICS_CAPACITY,
     MARKET_SLUG_KEY,
     MISSING_ROUTING_KEY_WARN_EVERY,
     POLYMARKET_US_VENUE,
@@ -560,6 +561,45 @@ async def test_inbound_frame_diagnostics_capture_every_frame_class_and_structure
         "heartbeat": 1,
         "market_data": 1,
     }
+    await harness.client._disconnect()
+
+
+@pytest.mark.asyncio
+async def test_frame_diagnostics_ring_buffer_retains_only_the_latest_frames() -> None:
+    """An unbounded list here leaked ~1 GB/h on the live node (2026-09-05).
+
+    Feeding far more frames than the cap must retain exactly
+    ``FRAME_DIAGNOSTICS_CAPACITY`` entries, and they must be the LAST frames
+    seen (oldest evicted first), not an arbitrary subset.
+    """
+    harness = build_harness()
+    await harness.client._connect()
+
+    frame_count = 10_000
+    for seq in range(frame_count):
+        harness.feed.deliver({"heartbeat": {"seq": seq}})
+
+    diagnostics = harness.client.frame_diagnostics
+    assert len(diagnostics) == FRAME_DIAGNOSTICS_CAPACITY
+    kept_seqs = [int(diagnostic.safe_values["heartbeat.seq"]) for diagnostic in diagnostics]
+    expected_first_seq = frame_count - FRAME_DIAGNOSTICS_CAPACITY
+    assert kept_seqs == list(range(expected_first_seq, frame_count))
+    await harness.client._disconnect()
+
+
+@pytest.mark.asyncio
+async def test_frame_diagnostics_buffer_is_a_bounded_ring_not_an_unbounded_list() -> None:
+    """Memory pin, no tracemalloc: assert the maxlen directly rather than
+    inferring boundedness from behaviour alone."""
+    harness = build_harness()
+    await harness.client._connect()
+
+    assert harness.client._frame_diagnostics.maxlen == FRAME_DIAGNOSTICS_CAPACITY
+
+    for seq in range(10_000):
+        harness.feed.deliver({"heartbeat": {"seq": seq}})
+
+    assert len(harness.client._frame_diagnostics) == FRAME_DIAGNOSTICS_CAPACITY
     await harness.client._disconnect()
 
 
