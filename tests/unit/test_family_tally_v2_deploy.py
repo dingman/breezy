@@ -8,6 +8,7 @@ verified without it.
 
 from __future__ import annotations
 
+import json
 import os
 import subprocess
 from pathlib import Path
@@ -21,10 +22,24 @@ _FAMILIES_DIR = _REPO_ROOT / "deploy" / "families"
 
 
 def _valid_family_ids() -> set[str]:
-    return {p.stem for p in _FAMILIES_DIR.glob("*.json")}
+    """B6: a family manifest is valid only when its own `family_id` field
+    equals the file's basename -- excludes `gs_boundary_pm_us_crh_v2.json`
+    (a boundary artefact, never a family manifest, carries no `family_id`
+    field at all) from ever being mistaken for a family id."""
+    ids: set[str] = set()
+    for p in _FAMILIES_DIR.glob("*.json"):
+        try:
+            payload = json.loads(p.read_text())
+        except json.JSONDecodeError:
+            continue
+        if isinstance(payload, dict) and payload.get("family_id") == p.stem:
+            ids.add(p.stem)
+    return ids
 
 
-def _run_wrapper(family_arg: list[str], tmp_path: Path, *, stub_python: Path | None = None) -> subprocess.CompletedProcess:
+def _run_wrapper(
+    family_arg: list[str], tmp_path: Path, *, stub_python: Path | None = None
+) -> subprocess.CompletedProcess:
     env = dict(os.environ)
     env["BREEZY_SCORED_TRIALS_DIR"] = str(tmp_path / "scored_trials")
     env["BREEZY_LIVE_TALLY_OUTPUT_DIR"] = str(tmp_path / "derived")
@@ -75,11 +90,7 @@ def test_wrapper_rejects_missing_family_id(tmp_path: Path) -> None:
 def test_wrapper_passes_family_id_through_unmodified(tmp_path: Path, family_id: str) -> None:
     capture = tmp_path / "argv_capture.txt"
     stub = tmp_path / "stub_python.sh"
-    stub.write_text(
-        "#!/usr/bin/env bash\n"
-        f'printf "%s\\n" "$@" > "{capture}"\n'
-        "exit 0\n"
-    )
+    stub.write_text(f'#!/usr/bin/env bash\nprintf "%s\\n" "$@" > "{capture}"\nexit 0\n')
     stub.chmod(0o755)
 
     result = _run_wrapper([family_id], tmp_path, stub_python=stub)
@@ -92,6 +103,22 @@ def test_wrapper_passes_family_id_through_unmodified(tmp_path: Path, family_id: 
     assert "--output" in argv_lines
     output_arg = argv_lines[argv_lines.index("--output") + 1]
     assert family_id in output_arg
+    # B6: --as-of is passed a UTC date stamp (YYYY-MM-DD).
+    assert "--as-of" in argv_lines
+    as_of_arg = argv_lines[argv_lines.index("--as-of") + 1]
+    assert len(as_of_arg) == len("2026-09-04")
+    assert as_of_arg.count("-") == 2
+
+
+def test_wrapper_never_lists_a_boundary_artefact_json_as_a_valid_family_id(
+    tmp_path: Path,
+) -> None:
+    """B6: `gs_boundary_pm_us_crh_v2.json` sits in the same directory as the
+    family manifests but is never itself a family manifest (no `family_id`
+    field) -- the wrapper must never accept it as a `--family` value."""
+    result = _run_wrapper(["gs_boundary_pm_us_crh_v2"], tmp_path)
+    assert result.returncode == 2
+    assert "gs_boundary_pm_us_crh_v2" not in _valid_family_ids()
 
 
 def test_wrapper_reports_failure_from_the_stub_analysis_script(tmp_path: Path) -> None:
@@ -111,16 +138,16 @@ def test_wrapper_reports_failure_from_the_stub_analysis_script(tmp_path: Path) -
         ("breezy-pm-crh-v2-tally.service", "breezy-pm-crh-v2-tally.timer", "pm_us_crh_v2"),
     ],
 )
-def test_concrete_unit_pair_exists_and_wires_to_wrapper(service_name: str, timer_name: str, family_id: str) -> None:
+def test_concrete_unit_pair_exists_and_wires_to_wrapper(
+    service_name: str, timer_name: str, family_id: str
+) -> None:
     service_path = _SYSTEMD_DIR / service_name
     timer_path = _SYSTEMD_DIR / timer_name
     assert service_path.exists()
     assert timer_path.exists()
 
     service_text = service_path.read_text()
-    exec_start_lines = [
-        line for line in service_text.splitlines() if line.startswith("ExecStart=")
-    ]
+    exec_start_lines = [line for line in service_text.splitlines() if line.startswith("ExecStart=")]
     assert len(exec_start_lines) == 1
     assert "family-tally-v2-run.sh" in exec_start_lines[0]
     assert exec_start_lines[0].strip().endswith(family_id)

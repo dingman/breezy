@@ -105,6 +105,77 @@ from breezy.settlement.trial_scorer import (
 DEFAULT_NWS_CATALOG_BASE: Path = Path.home() / ".local/share/breezy/catalog"
 DEFAULT_DERIVED_DIR: Path = Path.home() / ".local/share/breezy/derived/scored_trials"
 
+#: B1 (v2-only live-provenance sidecar, ruling Q4
+#: `docs/evidence/grok_partial_fill_ruling_2026-09-04.md`): the 17-column
+#: `ScoredTrial` schema carries no provenance column and never will (v1 is
+#: binding/immutable) -- v2's `family_tally_v2.py --store-dir` refusal
+#: instead consults this directory-convention sidecar. Values are exactly
+#: `{"live", "paper_replay"}`; this driver, the only LIVE writer, writes
+#: (once) or asserts (every later run) `"live"` -- a paper-replay code path
+#: never writes this file at all, so an unmarked or replay-marked store is
+#: refused fail-closed by the v2 CLI, never silently admitted.
+_PROVENANCE_SIDECAR_NAME = "provenance.json"
+_LIVE_PROVENANCE_VALUE = "live"
+
+#: B3 (v2-only look ordering by fill time): `ScoredTrial` carries no fill
+#: timestamp, so this append-only sidecar records `(trial_id, score_seq) ->
+#: filled_at_ns` for every fill this driver persists a score for --
+#: `family_tally_v2.py` joins against it to order sequential looks
+#: chronologically instead of by the `climate_day`/`trial_id` proxy.
+_FILL_ORDER_SIDECAR_NAME = "fill_order.jsonl"
+
+
+class ProvenanceConflict(Exception):
+    """`<store_dir>/provenance.json` already declares a non-'live' provenance."""
+
+
+def _write_or_assert_live_provenance_sidecar(store_dir: Path) -> None:
+    """Write `provenance.json = {"provenance": "live"}` the first time this
+    store directory is scored into; on every later run, assert the existing
+    sidecar still says `"live"` -- refusing loudly (never silently
+    overwriting) if it declares anything else (e.g. `"paper_replay"`)."""
+    sidecar = store_dir / _PROVENANCE_SIDECAR_NAME
+    if sidecar.exists():
+        payload = json.loads(sidecar.read_text(encoding="utf-8"))
+        existing = payload.get("provenance")
+        if existing != _LIVE_PROVENANCE_VALUE:
+            raise ProvenanceConflict(
+                f"{sidecar}: already declares provenance={existing!r}; refusing to "
+                f"write/assert {_LIVE_PROVENANCE_VALUE!r} over it"
+            )
+        return
+    store_dir.mkdir(parents=True, exist_ok=True)
+    sidecar.write_text(json.dumps({"provenance": _LIVE_PROVENANCE_VALUE}), encoding="utf-8")
+
+
+def _append_fill_order_entries(store_dir: Path, entries: Sequence[Mapping[str, Any]]) -> None:
+    """Append-only, idempotent for a re-scored `(trial_id, score_seq)`: an
+    entry whose `(trial_id, score_seq)` key already exists in the sidecar is
+    never duplicated -- so re-running this driver against an already-scored
+    trial (review item 3's unchanged-record skip, or a genuine re-score) is
+    always safe to call again."""
+    path = store_dir / _FILL_ORDER_SIDECAR_NAME
+    existing_keys: set[tuple[str, int]] = set()
+    if path.exists():
+        for line in path.read_text(encoding="utf-8").splitlines():
+            if not line.strip():
+                continue
+            row = json.loads(line)
+            existing_keys.add((row["trial_id"], row["score_seq"]))
+    new_lines: list[str] = []
+    for entry in entries:
+        key = (entry["trial_id"], entry["score_seq"])
+        if key in existing_keys:
+            continue
+        existing_keys.add(key)
+        new_lines.append(json.dumps(dict(entry)))
+    if not new_lines:
+        return
+    store_dir.mkdir(parents=True, exist_ok=True)
+    with path.open("a", encoding="utf-8") as fh:
+        for line in new_lines:
+            fh.write(line + "\n")
+
 
 #: Exceptions a malformed JSONL row or a malformed `FilledTrial` field can
 #: raise while being parsed -- review item 2's per-row guard.
@@ -405,6 +476,8 @@ def score_live_trials(
             continue
         pairs.append((resolved_trial, record))
 
+    filled_at_ns_by_trial_id = {trial.trial_id: trial.filled_at_ns for trial, _record in pairs}
+
     scored, refused = score_trials(pairs, now_ns=now_ns)
     refused = refused + tuple(extra_refusals)
 
@@ -431,6 +504,18 @@ def score_live_trials(
         for row in scored
     )
     if stamped_scored:
+        _write_or_assert_live_provenance_sidecar(derived_dir)
+        _append_fill_order_entries(
+            derived_dir,
+            [
+                {
+                    "trial_id": row.trial_id,
+                    "score_seq": row.score_seq,
+                    "filled_at_ns": filled_at_ns_by_trial_id[row.trial_id],
+                }
+                for row in stamped_scored
+            ],
+        )
         write_scored_trials(derived_dir, stamped_scored, now_ns=now_ns)
     return stamped_scored, refused, tuple(excluded_fills)
 

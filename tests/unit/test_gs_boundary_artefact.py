@@ -115,6 +115,48 @@ def test_a_tampered_reference_row_value_is_refused_by_the_replay(tmp_path: Path)
         load_boundary_artefact(path, expected_sha256=payload["inputs_sha256"])
 
 
+def test_an_extreme_tail_row_tolerates_a_1e_2_boundary_perturbation(tmp_path: Path) -> None:
+    """B4: reference_table[0] (look_k=1, alpha_spent_eff=2.2e-15 << 1e-6) is
+    an extreme-tail early look at an unreachable ~7.8 SD boundary -- the
+    relaxed 5e-2 tolerance must let a 1e-2 perturbation load."""
+    payload = _payload()
+    payload["reference_table"][0]["b_eff"] += 1e-2
+    path = _write(tmp_path, payload)
+    artefact = load_boundary_artefact(path, expected_sha256=payload["inputs_sha256"])
+    assert artefact.inputs_sha256 == payload["inputs_sha256"]
+
+
+def test_a_non_extreme_tail_row_still_refuses_the_same_1e_2_perturbation(tmp_path: Path) -> None:
+    """B4: reference_table[7] (look_k=8, alpha_spent_eff=2.8e-3 >= 1e-6) is
+    NOT extreme-tail -- the tight 1e-6 tolerance must still refuse a 1e-2
+    perturbation on this row."""
+    payload = _payload()
+    assert payload["reference_table"][7]["alpha_spent_eff"] >= 1e-6
+    payload["reference_table"][7]["b_eff"] += 1e-2
+    path = _write(tmp_path, payload)
+    with pytest.raises(BoundaryPinMismatch):
+        load_boundary_artefact(path, expected_sha256=payload["inputs_sha256"])
+
+
+def test_n_max_not_a_multiple_of_look_step_is_refused(tmp_path: Path) -> None:
+    """B5: the look schedule invariant -- `n_max % look_step` must be 0."""
+    payload = _payload()
+    payload["look_step"] = 7  # n_max=160, 160 % 7 != 0
+    from breezy.persistence.gs_boundary_artefact import _inputs_manifest, _sha256_of_inputs
+
+    manifest = _inputs_manifest(
+        payload["alpha"],
+        payload["spending_id"],
+        payload["n_max"],
+        payload["i_max"],
+        payload["look_step"],
+    )
+    payload["inputs_sha256"] = _sha256_of_inputs(manifest)
+    path = _write(tmp_path, payload)
+    with pytest.raises(BoundaryArtefactValidationError):
+        load_boundary_artefact(path, expected_sha256=payload["inputs_sha256"])
+
+
 def test_a_missing_required_top_level_key_is_refused(tmp_path: Path) -> None:
     payload = _payload()
     del payload["look_step"]

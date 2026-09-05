@@ -37,6 +37,7 @@ class FamilyIdentity(Protocol):
 
     trial_id_prefix: str
     d0_climate_day: str
+    stations: tuple[str, ...]
 
 
 class FamilyBarrierRefusal(Exception):
@@ -46,20 +47,28 @@ class FamilyBarrierRefusal(Exception):
 def assert_family_only(rows: Sequence[ScoredTrial], manifest: FamilyIdentity) -> None:
     """Refuse the whole tally if any row is out of `manifest`'s family scope.
 
-    Two independent checks, either of which refuses the ENTIRE batch --
-    never a silent per-row drop: the trial-id must start with the family's
-    own prefix, and `climate_day` must not precede the family's registered
-    `d0_climate_day`. Symmetric by construction: swapping which manifest is
-    checked against which rows still refuses the mismatch.
+    Three independent checks, any of which refuses the ENTIRE batch -- never
+    a silent per-row drop: the trial-id must start with the family's own
+    prefix, `climate_day` must not precede the family's registered
+    `d0_climate_day`, and `station` must be in the family's registered
+    `stations` census (B2: a family manifest may deliberately exclude a
+    station -- e.g. `pm_us_crh_v2.json` excludes NYC -- and a row from an
+    excluded station must never be silently pooled into strata). Symmetric
+    by construction: swapping which manifest is checked against which rows
+    still refuses the mismatch.
     """
     for row in rows:
         if not row.trial_id.startswith(manifest.trial_id_prefix):
             raise FamilyBarrierRefusal(
-                f"{row.trial_id!r} does not start with family prefix "
-                f"{manifest.trial_id_prefix!r}"
+                f"{row.trial_id!r} does not start with family prefix {manifest.trial_id_prefix!r}"
             )
         if row.climate_day < manifest.d0_climate_day:
             raise FamilyBarrierRefusal(
                 f"{row.trial_id!r}: climate_day {row.climate_day!r} precedes "
                 f"family D0 {manifest.d0_climate_day!r}"
+            )
+        if row.station not in manifest.stations:
+            raise FamilyBarrierRefusal(
+                f"{row.trial_id!r}: station {row.station!r} is not in the "
+                f"family's registered station census {manifest.stations!r}"
             )

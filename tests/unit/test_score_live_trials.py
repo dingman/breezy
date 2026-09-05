@@ -26,6 +26,7 @@ from decimal import Decimal
 from pathlib import Path
 from typing import Any
 
+import pytest
 from nautilus_trader.model.currencies import USD
 from nautilus_trader.model.enums import AssetClass
 from nautilus_trader.model.identifiers import InstrumentId, Symbol, Venue
@@ -37,12 +38,15 @@ sys.path.insert(0, (REPO_ROOT / "scripts/analysis").as_posix())
 
 from score_live_trials import (
     FillExclusion,
+    ProvenanceConflict,
     _admit_fill,
     _already_fallback_scored,
+    _append_fill_order_entries,
     _next_score_seq,
     _read_bucket_facts_by_instrument_id,
     _unchanged_since_last_score,
     _validate_qty,
+    _write_or_assert_live_provenance_sidecar,
     main,
     read_filled_trials_jsonl,
     score_live_trials,
@@ -671,3 +675,127 @@ def test_main_prints_the_excluded_fills_table(tmp_path: Path, capsys: Any) -> No
     assert "partial_fill" in out
     assert _STATION in out
     assert _DAY_ISO in out
+
+
+# ---------------------------------------------------------------------------
+# B1: v2-only live-provenance sidecar (ruling Q4: provenance == "live",
+# never paper_replay, never a field on ScoredTrial/the 17-column schema).
+# ---------------------------------------------------------------------------
+
+
+def test_a_missing_provenance_sidecar_is_written_as_live(tmp_path: Path) -> None:
+    store_dir = tmp_path / "store"
+    store_dir.mkdir()
+    _write_or_assert_live_provenance_sidecar(store_dir)
+    sidecar = store_dir / "provenance.json"
+    assert json.loads(sidecar.read_text()) == {"provenance": "live"}
+
+
+def test_an_existing_live_sidecar_is_left_unchanged_idempotent(tmp_path: Path) -> None:
+    store_dir = tmp_path / "store"
+    store_dir.mkdir()
+    _write_or_assert_live_provenance_sidecar(store_dir)
+    _write_or_assert_live_provenance_sidecar(store_dir)  # second call: no raise
+    sidecar = store_dir / "provenance.json"
+    assert json.loads(sidecar.read_text()) == {"provenance": "live"}
+
+
+def test_a_conflicting_paper_replay_sidecar_is_refused_loudly(tmp_path: Path) -> None:
+    store_dir = tmp_path / "store"
+    store_dir.mkdir()
+    (store_dir / "provenance.json").write_text(json.dumps({"provenance": "paper_replay"}))
+    with pytest.raises(ProvenanceConflict):
+        _write_or_assert_live_provenance_sidecar(store_dir)
+
+
+def test_end_to_end_run_writes_the_live_provenance_sidecar_exactly_once(
+    tmp_path: Path,
+) -> None:
+    catalog_base = tmp_path / "catalog"
+    derived_dir = tmp_path / "derived"
+    fills_path = tmp_path / "fills.jsonl"
+
+    catalog = open_station_catalog(catalog_base, _VENUE, _CITY)
+    write_records(catalog, [_climate_day(tmax_f=79)])
+    fills_path.write_text(json.dumps(_fill_row()) + "\n", encoding="utf-8")
+
+    score_live_trials(
+        fills_path=fills_path,
+        catalog_base=catalog_base,
+        venue=_VENUE,
+        city=_CITY,
+        derived_dir=derived_dir,
+        now_ns=_BASE_NS,
+    )
+    sidecar = derived_dir / "provenance.json"
+    assert sidecar.exists()
+    assert json.loads(sidecar.read_text()) == {"provenance": "live"}
+
+
+# ---------------------------------------------------------------------------
+# B3: v2-only fill_order.jsonl sidecar (look ordering by fill time).
+# ---------------------------------------------------------------------------
+
+
+def test_append_fill_order_entries_writes_jsonl_rows(tmp_path: Path) -> None:
+    store_dir = tmp_path / "store"
+    store_dir.mkdir()
+    _append_fill_order_entries(
+        store_dir,
+        [{"trial_id": "t1", "score_seq": 0, "filled_at_ns": 100}],
+    )
+    path = store_dir / "fill_order.jsonl"
+    lines = path.read_text().splitlines()
+    assert len(lines) == 1
+    assert json.loads(lines[0]) == {"trial_id": "t1", "score_seq": 0, "filled_at_ns": 100}
+
+
+def test_append_fill_order_entries_is_append_only(tmp_path: Path) -> None:
+    store_dir = tmp_path / "store"
+    store_dir.mkdir()
+    _append_fill_order_entries(store_dir, [{"trial_id": "t1", "score_seq": 0, "filled_at_ns": 100}])
+    _append_fill_order_entries(store_dir, [{"trial_id": "t2", "score_seq": 0, "filled_at_ns": 200}])
+    path = store_dir / "fill_order.jsonl"
+    lines = [json.loads(line) for line in path.read_text().splitlines()]
+    assert len(lines) == 2
+    assert {row["trial_id"] for row in lines} == {"t1", "t2"}
+
+
+def test_append_fill_order_entries_is_idempotent_for_a_re_scored_trial_id_score_seq(
+    tmp_path: Path,
+) -> None:
+    store_dir = tmp_path / "store"
+    store_dir.mkdir()
+    _append_fill_order_entries(store_dir, [{"trial_id": "t1", "score_seq": 0, "filled_at_ns": 100}])
+    # Re-run with the SAME (trial_id, score_seq): must not duplicate.
+    _append_fill_order_entries(store_dir, [{"trial_id": "t1", "score_seq": 0, "filled_at_ns": 100}])
+    path = store_dir / "fill_order.jsonl"
+    lines = path.read_text().splitlines()
+    assert len(lines) == 1
+
+
+def test_end_to_end_run_appends_a_fill_order_entry_for_the_admitted_fill(
+    tmp_path: Path,
+) -> None:
+    catalog_base = tmp_path / "catalog"
+    derived_dir = tmp_path / "derived"
+    fills_path = tmp_path / "fills.jsonl"
+
+    catalog = open_station_catalog(catalog_base, _VENUE, _CITY)
+    write_records(catalog, [_climate_day(tmax_f=79)])
+    fills_path.write_text(json.dumps(_fill_row(trial_id="t1")) + "\n", encoding="utf-8")
+
+    score_live_trials(
+        fills_path=fills_path,
+        catalog_base=catalog_base,
+        venue=_VENUE,
+        city=_CITY,
+        derived_dir=derived_dir,
+        now_ns=_BASE_NS,
+    )
+    path = derived_dir / "fill_order.jsonl"
+    rows = [json.loads(line) for line in path.read_text().splitlines()]
+    assert len(rows) == 1
+    assert rows[0]["trial_id"] == "t1"
+    assert rows[0]["score_seq"] == 0
+    assert rows[0]["filled_at_ns"] == _BASE_NS

@@ -371,3 +371,113 @@ def test_family_flag_is_required_argparse_exits_2(tally_mod: ModuleType) -> None
 def test_unknown_family_id_exits_2_loudly(tmp_path: Path, tally_mod: ModuleType) -> None:
     rc = tally_mod.main(["--family", "not_a_real_family_xyz", "--store-dir", str(tmp_path)])
     assert rc == 2
+
+
+# --- B1: v2-only live-provenance barrier (ruling Q4) -------------------------
+
+
+def test_assert_live_provenance_refuses_a_missing_sidecar(
+    tmp_path: Path, tally_mod: ModuleType
+) -> None:
+    store_dir = tmp_path / "store"
+    store_dir.mkdir()
+    with pytest.raises(tally_mod.ProvenanceRefusal):
+        tally_mod._assert_live_provenance(store_dir)
+
+
+def test_assert_live_provenance_refuses_paper_replay(tmp_path: Path, tally_mod: ModuleType) -> None:
+    store_dir = tmp_path / "store"
+    store_dir.mkdir()
+    (store_dir / "provenance.json").write_text(json.dumps({"provenance": "paper_replay"}))
+    with pytest.raises(tally_mod.ProvenanceRefusal):
+        tally_mod._assert_live_provenance(store_dir)
+
+
+def test_assert_live_provenance_admits_live_non_vacuity(
+    tmp_path: Path, tally_mod: ModuleType
+) -> None:
+    store_dir = tmp_path / "store"
+    store_dir.mkdir()
+    (store_dir / "provenance.json").write_text(json.dumps({"provenance": "live"}))
+    tally_mod._assert_live_provenance(store_dir)  # no raise
+
+
+def test_cli_refuses_a_missing_provenance_sidecar_with_a_labelled_reason(
+    tmp_path: Path, tally_mod: ModuleType, capsys: Any
+) -> None:
+    store_dir = tmp_path / "store"
+    store_dir.mkdir()
+    rc = tally_mod.main(["--family", "pm_us_crh_v2", "--store-dir", str(store_dir)])
+    assert rc != 0
+    err = capsys.readouterr().err
+    assert "provenance" in err
+
+
+def test_cli_refuses_a_paper_replay_sidecar_with_a_labelled_reason(
+    tmp_path: Path, tally_mod: ModuleType, capsys: Any
+) -> None:
+    store_dir = tmp_path / "store"
+    store_dir.mkdir()
+    (store_dir / "provenance.json").write_text(json.dumps({"provenance": "paper_replay"}))
+    rc = tally_mod.main(["--family", "pm_us_crh_v2", "--store-dir", str(store_dir)])
+    assert rc != 0
+    err = capsys.readouterr().err
+    assert "paper_replay" in err
+
+
+def test_cli_admits_a_live_provenance_sidecar(tmp_path: Path, tally_mod: ModuleType) -> None:
+    store_dir = tmp_path / "store"
+    store_dir.mkdir()
+    (store_dir / "provenance.json").write_text(json.dumps({"provenance": "live"}))
+    rc = tally_mod.main(["--family", "pm_us_crh_v2", "--store-dir", str(store_dir)])
+    assert rc == 0
+
+
+# --- B3: fill-time look ordering (v2-only, active when store_dir is given) --
+
+
+def test_ordered_for_looks_without_store_dir_uses_the_climate_day_proxy(
+    tally_mod: ModuleType,
+) -> None:
+    row_later = _row(0, station="MIA", climate_day="2026-09-12")
+    row_earlier = _row(1, station="LAX", climate_day="2026-09-11")
+    ordered = tally_mod._ordered_for_looks((row_later, row_earlier))
+    assert [r.trial_id for r in ordered] == [row_earlier.trial_id, row_later.trial_id]
+
+
+def test_ordered_for_looks_with_store_dir_orders_by_fill_time_not_station(
+    tmp_path: Path, tally_mod: ModuleType
+) -> None:
+    store_dir = tmp_path / "store"
+    store_dir.mkdir()
+    # row_a sorts FIRST by the (climate_day, trial_id) proxy (station LAX <
+    # SFO) but fills LATER -- proves fill-time, not station text, drives it.
+    row_a = _row(0, station="LAX", climate_day="2026-09-11")
+    row_b = _row(1, station="SFO", climate_day="2026-09-11")
+
+    proxy_ordered = tally_mod._ordered_for_looks((row_a, row_b))
+    assert [r.trial_id for r in proxy_ordered] == [row_a.trial_id, row_b.trial_id]
+
+    fill_order = store_dir / "fill_order.jsonl"
+    fill_order.write_text(
+        "\n".join(
+            json.dumps(entry)
+            for entry in (
+                {"trial_id": row_a.trial_id, "score_seq": row_a.score_seq, "filled_at_ns": 200},
+                {"trial_id": row_b.trial_id, "score_seq": row_b.score_seq, "filled_at_ns": 100},
+            )
+        )
+        + "\n"
+    )
+    ordered = tally_mod._ordered_for_looks((row_a, row_b), store_dir=store_dir)
+    assert [r.trial_id for r in ordered] == [row_b.trial_id, row_a.trial_id]
+
+
+def test_ordered_for_looks_with_store_dir_refuses_a_missing_sidecar_entry(
+    tmp_path: Path, tally_mod: ModuleType
+) -> None:
+    store_dir = tmp_path / "store"
+    store_dir.mkdir()
+    row = _row(0, station="LAX")
+    with pytest.raises(tally_mod.ScoredTrialDataIntegrityError, match=row.trial_id):
+        tally_mod._ordered_for_looks((row,), store_dir=store_dir)

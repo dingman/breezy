@@ -158,6 +158,35 @@ def test_n_max_reached_with_information_below_i_max_is_also_reported_i_max(
     assert last.look_n == 10
 
 
+def test_n_max_reached_below_i_max_renders_terminal_n_max_reached_b7(
+    tmp_path: Path, tally_mod: ModuleType
+) -> None:
+    """B7: the report string (never a new TruncationReason member) says
+    `terminal=n_max_reached` for the natural "n=n_max, I<i_max" trigger."""
+    manifest = _manifest(tmp_path)
+    artefact = _synthetic_artefact(i_max=40.0, n_max=10, look_step=10)
+    rows = tuple(_row(i, ask="0.10", held=(i % 5 == 0)) for i in range(10))
+    tally = tally_mod.build_family_tally_v2(rows, manifest=manifest, artefact=artefact)
+    report = tally_mod.render_markdown_v2(tally, source_paths=(tmp_path,), as_of="2026-09-11")
+    assert "terminal=n_max_reached" in report
+    assert "truncation=I_MAX" not in report
+
+
+def test_i_max_crossing_before_n_max_still_renders_truncation_i_max_b7(
+    tmp_path: Path, tally_mod: ModuleType
+) -> None:
+    """B7 sibling case: a genuine I_MAX crossing (before n_max) keeps the
+    plain `truncation=I_MAX` label -- only the "n_max reached, I<i_max"
+    case gets the new report string."""
+    manifest = _manifest(tmp_path)
+    artefact = _synthetic_artefact(i_max=1.0, n_max=20, look_step=10)
+    rows = tuple(_row(i, ask="0.50", held=(i % 2 == 0)) for i in range(10))
+    tally = tally_mod.build_family_tally_v2(rows, manifest=manifest, artefact=artefact)
+    report = tally_mod.render_markdown_v2(tally, source_paths=(tmp_path,), as_of="2026-09-11")
+    assert "truncation=I_MAX" in report
+    assert "terminal=n_max_reached" not in report
+
+
 def test_loss_stop_fires_unconditionally_kill_even_with_a_survive_shaped_score(
     tmp_path: Path, tally_mod: ModuleType
 ) -> None:
@@ -241,6 +270,22 @@ def test_terminal_look_never_returns_continue(tmp_path: Path, tally_mod: ModuleT
         truncation=tally_mod.TruncationReason.LOSS_STOP,
     )
     assert tally.looks[-1].verdict in ("SURVIVE", "KILL")
+
+
+def test_n_max_reached_trigger_uses_ge_not_eq_b5(tmp_path: Path, tally_mod: ModuleType) -> None:
+    """B5: the terminal trigger is `look_n >= n_max`, not `look_n == n_max`
+    (defensive against a scheduled look ever landing past n_max, though
+    `load_boundary_artefact`'s own n_max%look_step==0 invariant means a
+    loaded artefact never reaches that state -- this pins the driver-level
+    behaviour directly, exercising a synthetic artefact the loader never
+    validates)."""
+    manifest = _manifest(tmp_path)
+    artefact = _synthetic_artefact(i_max=1000.0, n_max=10, look_step=10)
+    rows = tuple(_row(i, ask="0.10", held=(i % 5 == 0)) for i in range(10))
+    tally = tally_mod.build_family_tally_v2(rows, manifest=manifest, artefact=artefact)
+    last = tally.looks[-1]
+    assert last.terminal is True
+    assert last.look_n == 10  # == n_max, and >= n_max is equally true here
 
 
 def test_no_truncation_and_below_look_step_yields_no_looks_and_no_bca(

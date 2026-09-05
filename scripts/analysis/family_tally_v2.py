@@ -67,6 +67,7 @@ No network. No repo writes except `--output`.
 from __future__ import annotations
 
 import argparse
+import json
 import sys
 from collections import defaultdict
 from collections.abc import Sequence
@@ -110,11 +111,20 @@ __all__ = [
     "FamilyBarrierRefusal",
     "FamilyTallyV2",
     "LookRecord",
+    "ProvenanceRefusal",
     "ScoredTrialDataIntegrityError",
     "build_family_tally_v2",
     "main",
     "render_markdown_v2",
 ]
+
+#: B1 (ruling Q4): the only value `family_tally_v2.py` ever admits for a
+#: `--store-dir`'s `provenance.json` sidecar. `score_live_trials.py` is the
+#: sole writer of `"live"`; a paper-replay code path never writes this
+#: sidecar at all, so an unmarked store is refused exactly like an
+#: explicitly `"paper_replay"`-marked one.
+_LIVE_PROVENANCE_VALUE: Final[str] = "live"
+_PROVENANCE_SIDECAR_NAME: Final[str] = "provenance.json"
 
 #: v1 SS6:124-128, restated (never imported -- `mb_current_rung_edge_study`
 #: has no module-level constant for this; it is inlined in prose there).
@@ -130,6 +140,12 @@ class ScoredTrialDataIntegrityError(Exception):
     """An independent-reviewer fail-closed guard refused the whole tally."""
 
 
+class ProvenanceRefusal(ScoredTrialDataIntegrityError):
+    """B1 (ruling Q4): `--store-dir` lacks a v2 live-provenance sidecar, or
+    the sidecar declares a provenance other than `"live"` (e.g.
+    `"paper_replay"`)."""
+
+
 @dataclass(frozen=True, slots=True, kw_only=True)
 class LookRecord:
     """One completed look (interim or terminal) of the pooled sequential test."""
@@ -142,6 +158,13 @@ class LookRecord:
     verdict: str
     terminal: bool
     reason: TruncationReason | None
+    #: B7 (report string only, never a new `TruncationReason` member): True
+    #: exactly for the natural "n == n_max reached with I < i_max" trigger
+    #: (rev b SS3's third terminal trigger) -- `reason` itself stays
+    #: `TruncationReason.I_MAX` either way; this only tells the renderer to
+    #: print `terminal=n_max_reached` instead of `truncation=I_MAX` for
+    #: this specific sub-case.
+    n_max_reached_below_i_max: bool = False
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
@@ -237,16 +260,85 @@ def _assert_no_raw_score_seq_collisions(store_dir: Path) -> None:
         )
 
 
+def _assert_live_provenance(store_dir: Path) -> None:
+    """B1 (ruling Q4): refuse any `--store-dir` without a
+    `<store_dir>/provenance.json` sidecar declaring `provenance == "live"`.
+
+    Written by `score_live_trials.py` (the sole live writer); a paper-replay
+    code path never writes this sidecar, so an unmarked store is refused
+    the same as an explicitly `"paper_replay"`-marked one -- both fail
+    closed, never silently admitted.
+    """
+    sidecar = store_dir / _PROVENANCE_SIDECAR_NAME
+    if not sidecar.exists():
+        raise ProvenanceRefusal(
+            f"refusing to tally {store_dir}: no {_PROVENANCE_SIDECAR_NAME} sidecar -- "
+            "v2 requires provenance=='live' (ruling Q4); a paper-replay store never "
+            "writes this sidecar, so it is refused the same as one explicitly "
+            "marked 'paper_replay'"
+        )
+    payload = json.loads(sidecar.read_text(encoding="utf-8"))
+    provenance = payload.get("provenance")
+    if provenance != _LIVE_PROVENANCE_VALUE:
+        raise ProvenanceRefusal(
+            f"refusing to tally {store_dir}: {_PROVENANCE_SIDECAR_NAME} declares "
+            f"provenance={provenance!r}, not {_LIVE_PROVENANCE_VALUE!r} (ruling Q4)"
+        )
+
+
 def _stratum_row(trial: ScoredTrial) -> StratumRow:
     return StratumRow(
         entry_ask=trial.entry_ask, fee=trial.fee, held=trial.held, station=trial.station
     )
 
 
-def _ordered_for_looks(rows: Sequence[ScoredTrial]) -> tuple[ScoredTrial, ...]:
-    """Chronological proxy ordering for the sequential-look replay -- see
-    module docstring "Look ordering"."""
-    return tuple(sorted(rows, key=lambda r: (r.climate_day, r.trial_id)))
+def _load_fill_order_index(store_dir: Path) -> dict[tuple[str, int], int]:
+    """`(trial_id, score_seq) -> filled_at_ns` from the v2-only
+    `fill_order.jsonl` sidecar `score_live_trials.py` appends (B3)."""
+    path = store_dir / "fill_order.jsonl"
+    index: dict[tuple[str, int], int] = {}
+    if not path.exists():
+        return index
+    for line in path.read_text(encoding="utf-8").splitlines():
+        if not line.strip():
+            continue
+        row = json.loads(line)
+        index[(row["trial_id"], row["score_seq"])] = row["filled_at_ns"]
+    return index
+
+
+def _ordered_for_looks(
+    rows: Sequence[ScoredTrial], *, store_dir: Path | None = None
+) -> tuple[ScoredTrial, ...]:
+    """Ordering for the sequential-look replay -- see module docstring
+    "Look ordering".
+
+    B3 (v2-only): when `store_dir` is given, order is
+    `(filled_at_ns, climate_day, trial_id)`, joined against the
+    `fill_order.jsonl` sidecar `score_live_trials.py` appends for every
+    scored fill -- REFUSED fail-closed (naming the trial_id) if any row
+    here has no matching `(trial_id, score_seq)` sidecar entry. When
+    `store_dir` is `None` (driver-level unit tests exercising strata/verdict
+    logic against synthetic rows with no real store), the prior
+    `(climate_day, trial_id)` chronological-proxy ordering is used
+    unchanged.
+    """
+    if store_dir is None:
+        return tuple(sorted(rows, key=lambda r: (r.climate_day, r.trial_id)))
+    fill_order = _load_fill_order_index(store_dir)
+    missing = [r.trial_id for r in rows if (r.trial_id, r.score_seq) not in fill_order]
+    if missing:
+        raise ScoredTrialDataIntegrityError(
+            "refusing to order looks: no fill_order.jsonl sidecar entry for "
+            f"trial_id(s) {missing!r} -- score_live_trials.py must append one per "
+            "admitted fill (B3)"
+        )
+    return tuple(
+        sorted(
+            rows,
+            key=lambda r: (fill_order[(r.trial_id, r.score_seq)], r.climate_day, r.trial_id),
+        )
+    )
 
 
 def _station_strata(rows: Sequence[ScoredTrial]) -> tuple[StratumV2, ...]:
@@ -312,6 +404,7 @@ def build_family_tally_v2(
     _assert_no_partial_or_multi_fill(rows)
     if store_dir is not None:
         _assert_no_raw_score_seq_collisions(store_dir)
+        _assert_live_provenance(store_dir)
     # `FamilyManifest` (frozen/slots) satisfies `FamilyIdentity` structurally,
     # but mypy's Protocol check wants a settable attribute for a frozen
     # dataclass field; `live_family_tally.py`'s own `_PricedRow`/
@@ -320,7 +413,7 @@ def build_family_tally_v2(
     assert_family_only(rows, cast(FamilyIdentity, manifest))
 
     non_excluded = tuple(row for row in rows if row.excluded_reason is None)
-    ordered = _ordered_for_looks(non_excluded)
+    ordered = _ordered_for_looks(non_excluded, store_dir=store_dir)
     pooled_rows = tuple(_stratum_row(t) for t in ordered)
     pooled = build_stratum_v2("pooled", pooled_rows) if pooled_rows else None
     station_strata = _station_strata(non_excluded)
@@ -355,7 +448,9 @@ def build_family_tally_v2(
 
         reached_loss_stop = total_pnl <= LOSS_STOP_PNL
         reached_i_max = state.information >= artefact.i_max
-        reached_n_max = look_n == n_max
+        reached_n_max = (
+            look_n >= n_max
+        )  # B5: >= not == (see load_boundary_artefact's n_max%look_step==0 invariant)
         forced = truncation is not None and look_n == n
         is_terminal = reached_loss_stop or reached_i_max or reached_n_max or forced
 
@@ -364,6 +459,9 @@ def build_family_tally_v2(
                 TruncationReason.LOSS_STOP
                 if reached_loss_stop
                 else (truncation if forced and truncation is not None else TruncationReason.I_MAX)
+            )
+            n_max_reached_below_i_max = (
+                reason is TruncationReason.I_MAX and reached_n_max and not reached_i_max
             )
             b_eff, b_fut = artefact.boundary_for(tuple(t_history), is_terminal=True)
             verdict = terminal_look(
@@ -384,6 +482,7 @@ def build_family_tally_v2(
                     verdict=verdict,
                     terminal=True,
                     reason=reason,
+                    n_max_reached_below_i_max=n_max_reached_below_i_max,
                 )
             )
             bca_line = _roi_bound_line_v2(rows)
@@ -518,7 +617,14 @@ def render_markdown_v2(tally: FamilyTallyV2, *, source_paths: Sequence[Path], as
         )
     elif tally.looks:
         last = tally.looks[-1]
-        reason_note = f", truncation={last.reason.value}" if last.reason is not None else ""
+        if last.reason is None:
+            reason_note = ""
+        elif last.n_max_reached_below_i_max:
+            # B7: report string only -- `reason` itself stays I_MAX (no new
+            # TruncationReason member is ever added for this sub-case).
+            reason_note = ", terminal=n_max_reached"
+        else:
+            reason_note = f", truncation={last.reason.value}"
         add(f"**{last.verdict}** at look n={last.look_n} (t={last.t:.4f}){reason_note}")
     else:
         add("**CONTINUE** -- fewer than one completed look so far (n < look_step)")
@@ -584,13 +690,17 @@ def main(argv: Sequence[str] | None = None) -> int:
     rows = read_scored_trials(args.store_dir)
     truncation = TruncationReason(args.truncate) if args.truncate else None
 
-    tally = build_family_tally_v2(
-        rows,
-        manifest=manifest,
-        artefact=artefact,
-        store_dir=args.store_dir,
-        truncation=truncation,
-    )
+    try:
+        tally = build_family_tally_v2(
+            rows,
+            manifest=manifest,
+            artefact=artefact,
+            store_dir=args.store_dir,
+            truncation=truncation,
+        )
+    except ProvenanceRefusal as exc:
+        print(f"family_tally_v2: {exc}", file=sys.stderr)
+        return 3
     report = render_markdown_v2(tally, source_paths=(args.store_dir,), as_of=args.as_of)
     print(report)
     if args.output is not None:

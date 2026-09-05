@@ -92,6 +92,21 @@ GRID_HALFWIDTH_SD: Final[float] = 9.0
 #: Absolute tolerance for the load-time reference-fixture replay check.
 _REPRODUCTION_TOLERANCE: Final[float] = 1e-6
 
+#: B4 (loader reproduction tolerance): a reference row whose recorded
+#: `alpha_spent_eff` AND `alpha_spent_fut` are both below this threshold is
+#: an extreme-tail early look (boundaries ~7.8 SD, mathematically
+#: unreachable by any real score) where the recursive joint-density
+#: integration is numerically ill-conditioned -- tiny grid-resolution
+#: differences between this module's solver and the generator's
+#: (`crh_group_sequential_boundaries.py`) produce boundary differences well
+#: past 1e-6 despite both being correct to their own precision. Such a row
+#: compares its `b_eff`/`b_fut` at `_EXTREME_TAIL_REPRODUCTION_TOLERANCE`
+#: instead; `alpha_spent` itself is never independently recomputed by this
+#: loader (only recorded), so it always keeps the tight tolerance
+#: implicitly. Every other row keeps `_REPRODUCTION_TOLERANCE` unchanged.
+_EXTREME_TAIL_ALPHA_SPENT_THRESHOLD: Final[float] = 1e-6
+_EXTREME_TAIL_REPRODUCTION_TOLERANCE: Final[float] = 5e-2
+
 _REQUIRED_KEYS: Final[frozenset[str]] = frozenset(
     {
         "alpha",
@@ -256,6 +271,17 @@ def load_boundary_artefact(path: Path, *, expected_sha256: str) -> BoundaryArtef
     if float(alpha) != ALPHA_ONE_SIDED:
         raise BoundaryArtefactValidationError(f"{path}: alpha {alpha!r} != {ALPHA_ONE_SIDED!r}")
 
+    # B5 (look-schedule invariant): every scheduled look_n the driver ever
+    # visits is a multiple of look_step up to n_max (family_tally_v2.py's
+    # `scheduled_ns = range(look_step, min(n, n_max) + 1, look_step)`) --
+    # n_max itself must therefore land exactly on that grid, or the
+    # terminal "n_max reached" trigger could never fire on-schedule.
+    if int(n_max) % int(look_step) != 0:
+        raise BoundaryArtefactValidationError(
+            f"{path}: n_max {n_max!r} is not a multiple of look_step {look_step!r} "
+            "-- the look schedule would never land exactly on n_max"
+        )
+
     if not isinstance(reference_table_raw, list) or not reference_table_raw:
         raise BoundaryArtefactValidationError(f"{path}: reference_table must be non-empty")
 
@@ -319,14 +345,19 @@ def _replay_reference_rows(path: Path, rows: tuple[ReferenceRow, ...], *, alpha:
         t_history.append(row.t_k)
         is_terminal = idx == len(rows) - 1
         b_eff, b_fut = _solve_boundary(tuple(t_history), alpha, is_terminal=is_terminal)
-        if (
-            abs(b_eff - row.b_eff) > _REPRODUCTION_TOLERANCE
-            or abs(b_fut - row.b_fut) > _REPRODUCTION_TOLERANCE
-        ):
+        is_extreme_tail = (
+            row.alpha_spent_eff < _EXTREME_TAIL_ALPHA_SPENT_THRESHOLD
+            and row.alpha_spent_fut < _EXTREME_TAIL_ALPHA_SPENT_THRESHOLD
+        )
+        tolerance = (
+            _EXTREME_TAIL_REPRODUCTION_TOLERANCE if is_extreme_tail else _REPRODUCTION_TOLERANCE
+        )
+        if abs(b_eff - row.b_eff) > tolerance or abs(b_fut - row.b_fut) > tolerance:
             raise BoundaryPinMismatch(
                 f"{path}: reference_table[{idx}] (look_k={row.look_k}): this module's "
                 f"solver reproduces (b_eff={b_eff!r}, b_fut={b_fut!r}) but the artefact "
-                f"records (b_eff={row.b_eff!r}, b_fut={row.b_fut!r})"
+                f"records (b_eff={row.b_eff!r}, b_fut={row.b_fut!r}) (tolerance={tolerance!r}, "
+                f"extreme_tail={is_extreme_tail!r})"
             )
 
 

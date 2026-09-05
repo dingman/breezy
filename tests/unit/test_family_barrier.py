@@ -20,6 +20,10 @@ _D0 = "2026-09-10"
 class _FakeManifest:
     trial_id_prefix: str
     d0_climate_day: str
+    stations: tuple[str, ...]
+
+
+_CENSUS = ("LAX", "MDW", "MIA", "SFO")
 
 
 def _row(**overrides: Any) -> ScoredTrial:
@@ -47,7 +51,9 @@ def _row(**overrides: Any) -> ScoredTrial:
 
 
 def _pm_manifest(**overrides: Any) -> _FakeManifest:
-    defaults: dict[str, Any] = dict(trial_id_prefix=_PM_PREFIX, d0_climate_day=_D0)
+    defaults: dict[str, Any] = dict(
+        trial_id_prefix=_PM_PREFIX, d0_climate_day=_D0, stations=_CENSUS
+    )
     defaults.update(overrides)
     return _FakeManifest(**defaults)
 
@@ -116,3 +122,27 @@ def test_one_bad_row_refuses_the_whole_batch_not_a_silent_partial_drop() -> None
 def test_a_row_exactly_at_d0_is_not_refused_boundary_inclusive() -> None:
     rows = (_row(climate_day=_D0),)
     assert_family_only(rows, _pm_manifest())  # no raise
+
+
+# --- B2: station census -----------------------------------------------------
+
+
+def test_a_row_from_a_station_outside_the_census_is_refused() -> None:
+    rows = (_row(station="NYC", climate_day="2026-09-11"),)
+    with pytest.raises(FamilyBarrierRefusal):
+        assert_family_only(rows, _pm_manifest())
+
+
+def test_an_in_census_row_passes_non_vacuity() -> None:
+    rows = (_row(station="LAX", climate_day="2026-09-11"),)
+    assert_family_only(rows, _pm_manifest())  # no raise
+
+
+def test_one_off_census_row_refuses_the_whole_batch_not_a_silent_partial_drop() -> None:
+    rows = (
+        _row(station="LAX", climate_day="2026-09-11"),
+        _row(station="NYC", climate_day="2026-09-11"),
+        _row(station="SFO", climate_day="2026-09-12"),
+    )
+    with pytest.raises(FamilyBarrierRefusal):
+        assert_family_only(rows, _pm_manifest())
