@@ -535,6 +535,13 @@ CAGE_RULE_PINS: tuple[RulePin, ...] = (
                 "submit_chain.classify_create_order_outcome",
                 "submit_chain.retirement_member",
                 "submit_chain.venue_order_id",
+                # I1b (record_fill first in the accept-fill branch): old 41 ->
+                # new 46; all five are intra-module and inert (no transport).
+                "self.record_fill",
+                "DurableFillRecord",
+                "PolymarketUSError",
+                "record.to_bytes",
+                "fill_record_bytes.decode",
             }
         ),
         widened=frozenset(
@@ -580,6 +587,11 @@ CAGE_RULE_PINS: tuple[RulePin, ...] = (
                 "submit_chain.classify_create_order_outcome",
                 "submit_chain.retirement_member",
                 "submit_chain.venue_order_id",
+                "self.record_fill",
+                "DurableFillRecord",
+                "PolymarketUSError",
+                "record.to_bytes",
+                "fill_record_bytes.decode",
                 "self.create_task",
             }
         ),
