@@ -2685,8 +2685,19 @@ def test_x1_the_live_scan_actually_reaches_a_test_that_imports_the_exec_package(
     # opens a socket -- `DurableFillRecord` is a plain data record, so both
     # suites build it directly from literal fields.
     #
-    # Old -> new (this row only): added `tests/unit/test_fill_time_count.py`
+    # Old -> new (previous row): added `tests/unit/test_fill_time_count.py`
     # and `tests/unit/test_live_family_tally_fill_source_cli.py`.
+    #
+    # Old -> new (this row, I2 live fill scoring chain,
+    # `LIVE_FILL_SCORING_CHAIN_2026-09-05.md` I5): added
+    # `tests/unit/test_score_live_trials_state_db_source.py`, which the plan
+    # MANDATES import `DurableFillRecord` from `exec.client` directly to seed
+    # the state DB -- seeding from a hand-written JSON blob would test a
+    # second, drifting copy of the encoding. WIDENED, not relaxed (L-12): the
+    # comparison is still `==`; the module carries no `SOCKET_RESTORING_
+    # MARKERS` and constructs no client -- `DurableFillRecord` is a plain
+    # data record, built directly from literal fields, exactly like its
+    # fill-tally-spine siblings above.
     assert exec_importing_test_modules() == {
         "tests/contract/test_exec_client_reconciliation_contract.py",
         "tests/contract/test_exec_client_wiring_contract.py",
@@ -2703,6 +2714,7 @@ def test_x1_the_live_scan_actually_reaches_a_test_that_imports_the_exec_package(
         "tests/unit/test_polymarket_us_factories.py",
         "tests/unit/test_polymarket_us_submit_order_chain.py",
         "tests/unit/test_polymarket_us_write_sequence.py",
+        "tests/unit/test_score_live_trials_state_db_source.py",
     }
 
 

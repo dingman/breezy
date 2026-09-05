@@ -132,7 +132,6 @@ from datetime import timedelta
 from functools import lru_cache
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Final
-from zoneinfo import ZoneInfo
 
 from nautilus_trader.common.actor import Actor
 from nautilus_trader.core.data import Data
@@ -192,6 +191,7 @@ from breezy.persistence.catalog import (
     read_raw_products,
     write_records,
 )
+from breezy.registry.settlement_clock import settlement_deadline_ns
 
 if TYPE_CHECKING:  # pragma: no cover - typing only; see `_health` for the cycle.
     from breezy.runtime.health import (
@@ -2144,14 +2144,13 @@ class NwsIngestActor(Actor):
         offset used for the climate-day boundary and nothing else. They are
         separate accessors returning separate types precisely so this cannot be
         gotten wrong by autocomplete.
+
+        Promoted to ``breezy.registry.settlement_clock.settlement_deadline_ns``
+        (I2, ``LIVE_FILL_SCORING_CHAIN_2026-09-05.md``) so
+        ``score_live_trials.py``'s live fill reader shares this exact
+        arithmetic rather than a second copy.
         """
-        hour_text, minute_text = self._deadline.settlement_time_local.split(":")
-        when = dt.datetime.combine(
-            climate_day + dt.timedelta(days=1),
-            dt.time(int(hour_text), int(minute_text)),
-            tzinfo=ZoneInfo(self._deadline.settlement_timezone),
-        )
-        return int(when.timestamp()) * _NS_PER_SECOND
+        return settlement_deadline_ns(self._deadline, climate_day)
 
     async def _have_final_for(self, climate_day: dt.date, *, as_of_ts_init: int) -> bool:
         """Durable answer, read off the catalog rather than off process memory.

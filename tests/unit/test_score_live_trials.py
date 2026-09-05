@@ -74,6 +74,27 @@ _DAY_ISO = _DAY.isoformat()
 _VENUE = "polymarket_us"
 _CITY = "LAX"
 
+#: I2 (`LIVE_FILL_SCORING_CHAIN_2026-09-05.md` 3.0(a)): `--family-manifest`
+#: is now required on every CLI invocation, including a pure-JSONL fixture
+#: run -- this test module never reads its contents beyond the load itself.
+_MANIFEST_PAYLOAD: dict[str, Any] = {
+    "family_id": "pm_us_crh_v2",
+    "venue": _VENUE,
+    "trial_id_prefix": "current_rung_hold/trial/",
+    "d0_climate_day": _DAY_ISO,
+    "boundary_artefact_path": "deploy/families/gs_boundary_pm_us_crh_v2.json",
+    "boundary_inputs_sha256": "a" * 64,
+    "stations": [_STATION],
+    "status": "REGISTERED",
+}
+
+
+def _write_manifest(tmp_path: Path, **overrides: Any) -> Path:
+    payload = dict(_MANIFEST_PAYLOAD, **overrides)
+    path = tmp_path / "manifest.json"
+    path.write_text(json.dumps(payload), encoding="utf-8")
+    return path
+
 
 def _fill_row(**overrides: Any) -> dict[str, Any]:
     row: dict[str, Any] = {
@@ -655,6 +676,8 @@ def test_main_prints_the_excluded_fills_table(tmp_path: Path, capsys: Any) -> No
         [
             "--fills",
             str(fills_path),
+            "--family-manifest",
+            str(_write_manifest(tmp_path)),
             "--city",
             _CITY,
             "--venue",

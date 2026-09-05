@@ -15,6 +15,15 @@ with R-7/R-8) -- and is expected to be replaced wholesale once a real fill
 source exists; nothing downstream of `read_filled_trials_jsonl` depends on
 its shape.
 
+LIVE FILL SOURCE (`docs/plans/LIVE_FILL_SCORING_CHAIN_2026-09-05.md`, I2):
+`read_filled_trials_state_db` reads real fills straight from the exec
+`SqliteStateStore` (`--fill-source`, else `POLYMARKET_US_EXEC_STATE_DB`),
+joined to each trial's `current_rung_hold/trial/{station}/{climate_day}`
+latch by `instrument_id`. `--fills` (JSONL) and the state-DB source are
+mutually exclusive; exactly one is used per invocation. `--family-manifest`
+is REQUIRED on both, and supplies `since_climate_day` (`d0_climate_day`) and
+`stations` (the positive-control census) for the state-DB source.
+
 Instrument lookup (review item 7): `_read_bucket_facts_by_instrument_id`
 reads every instrument definition from the station's catalog via the native,
 UNFILTERED `catalog.instruments()` -- per `252918a`'s pinned layout note, a
@@ -79,14 +88,18 @@ import argparse
 import datetime as dt
 import json
 import logging
+import os
+import sqlite3
 import sys
 import time
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
-from typing import Any, Literal
+from typing import Any, Final, Literal
 
+from breezy.adapters.polymarket_us.errors import ExecutionReportMappingError
+from breezy.adapters.polymarket_us.exec.client import FILL_KEY_PREFIX, DurableFillRecord
 from breezy.domain.nws_climate_day import NwsClimateDay
 from breezy.domain.weather_bucket_facts import (
     Measure,
@@ -94,16 +107,68 @@ from breezy.domain.weather_bucket_facts import (
     read_weather_bucket_facts,
 )
 from breezy.persistence.catalog import open_station_catalog, read_climate_day_including_corrections
+from breezy.persistence.family_manifest import FamilyManifestError, load_family_manifest
 from breezy.persistence.scored_trial_store import read_scored_trials, write_scored_trials
+from breezy.registry.settlement_clock import settlement_deadline_ns
+from breezy.registry.sites import default_registry
+from breezy.runtime.exec_state_db_path import (
+    ExecStateDbNotConfiguredError,
+    node_store_path_check,
+    resolve_store_path,
+)
 from breezy.settlement.trial_scorer import (
     FilledTrial,
     ScoredTrial,
     ScoreRefusal,
     score_trials,
 )
+from breezy.strategy.current_rung_hold.trial_day_latch import TrialDayRecord, TrialDayRecordCorrupt
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from fill_time_count import _open_readonly  # ONE implementation, reused (I2)
 
 DEFAULT_NWS_CATALOG_BASE: Path = Path.home() / ".local/share/breezy/catalog"
 DEFAULT_DERIVED_DIR: Path = Path.home() / ".local/share/breezy/derived/scored_trials"
+
+#: Excluded-fills artefact (I2 3.0(c)/(f)): one JSON object per exclusion,
+#: exactly 8 keys, idempotent on `(venue_order_id, reason)`. Lives in
+#: `--derived-dir`, alongside the scored-trial store (3.0 (f)).
+_EXCLUDED_FILLS_ARTEFACT_NAME = "excluded_fills.jsonl"
+
+#: Fill-vs-ask guard tick (L-25): the venue's `orderPriceMinTickSize`, which
+#: every observed PM.us market payload carries as `0.01`
+#: (`docs/evidence/venue/polymarket_us/`) -- UNVERIFIED that this offline
+#: reader's fixtures carry it, hence the pinned module constant rather than a
+#: re-parse of `Instrument.price_increment`.
+_TICK: Final[Decimal] = Decimal("0.01")
+
+#: The one non-refusal `TrialDayRecord.reason` value (mirrors
+#: `fill_time_count.py`'s own `_TAKEN_REASON`).
+_TAKEN_REASON = "taken"
+
+
+class FillSourceUnreadableError(Exception):
+    """The state-DB fill source could not be opened read-only or read (A5).
+
+    The caller (`main`) exits non-zero without printing the path; the
+    wrapper (not this script) owns the missing-marker consequence.
+    """
+
+
+class StorePositiveControlFailedError(Exception):
+    """No latch under `family_prefix` for any manifest station exists in this
+    store at all (BLOCK-1.2): an openable but WRONG store must refuse, never
+    silently score zero."""
+
+
+class NodeStorePreflightRefused(Exception):
+    """`node_store_path_check` returned MISMATCH or DISCOVERY_FAILED
+    (REVISE-1/REVISE-4): `self.reason` is `node_store_mismatch` or
+    `node_store_discovery_failed`, never the compared path or value."""
+
+    def __init__(self, reason: str) -> None:
+        self.reason = reason
+        super().__init__(reason)
 
 #: B1 (v2-only live-provenance sidecar, ruling Q4
 #: `docs/evidence/grok_partial_fill_ruling_2026-09-04.md`): the 17-column
@@ -199,7 +264,23 @@ _MALFORMED_ROW_ERRORS: tuple[type[Exception], ...] = (
 #: it must never be silently scored NOR silently dropped; it is refused
 #: loudly through the existing `ScoreRefusal(reason="malformed_input")`
 #: channel instead, which the CLI already prints for every refusal.
-FillExclusionReason = Literal["partial_fill", "multi_fill"]
+#:
+#: Widened old -> new (I2 BLOCK-3, `LIVE_FILL_SCORING_CHAIN_2026-09-05.md`
+#: section 3.0(c)): `{"partial_fill", "multi_fill"}` -> plus
+#: `"fill_below_ask"` (L-25, the fill-vs-ask guard), `"fee_unverified"` (the
+#: venue's cumulative fee could not be reconciled to its legs), and the three
+#: join-integrity reasons the state-DB reader alone can raise --
+#: `"duplicate_fill_for_latch"`, `"no_taken_latch"`, `"ambiguous_latch"`.
+#: Widened, never relaxed (L-12): no member removed or re-spelled.
+FillExclusionReason = Literal[
+    "partial_fill",
+    "multi_fill",
+    "fill_below_ask",
+    "fee_unverified",
+    "duplicate_fill_for_latch",
+    "no_taken_latch",
+    "ambiguous_latch",
+]
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
@@ -210,6 +291,13 @@ class FillExclusion:
     `ScoredTrial.excluded_reason` is a different, scoring-time concept (the
     venue-fallback-without-NWS case). Reported in the CLI's exclusions
     table so operators see coverage, not just totals.
+
+    `venue_order_id` and `filled_at_ns` (I2 BLOCK-3, defaulted so the three
+    shipped construction sites -- `_admit_fill` and `test_score_live_trials.py`
+    -- stay green): the state-DB path always supplies the real
+    `venue_order_id`, so `(venue_order_id, reason)` idempotence
+    (`excluded_fills.jsonl`, 3.0 (c)) holds for every LIVE line; the JSONL
+    fixture path has no venue order id and keeps the `""` default.
     """
 
     trial_id: str
@@ -218,6 +306,8 @@ class FillExclusion:
     qty: str
     reason: FillExclusionReason
     detail: str
+    venue_order_id: str = ""
+    filled_at_ns: int = 0
 
 
 def _validate_qty(trial: FilledTrial) -> ScoreRefusal | None:
@@ -235,21 +325,61 @@ def _validate_qty(trial: FilledTrial) -> ScoreRefusal | None:
     return None
 
 
-def _admit_fill(trial: FilledTrial) -> FillExclusion | None:
-    """Ruling Q1 admission gate. Assumes `trial.qty > 0` (call
-    `_validate_qty` first). Returns `None` when the fill is admitted
-    (`qty == 1`), else the `FillExclusion` to report."""
-    if trial.qty == 1:
-        return None
-    reason: FillExclusionReason = "partial_fill" if trial.qty < 1 else "multi_fill"
-    return FillExclusion(
-        trial_id=trial.trial_id,
-        station=trial.station,
-        climate_day=trial.climate_day,
-        qty=str(trial.qty),
-        reason=reason,
-        detail=f"qty {trial.qty} != 1; v1 unit is a 1-contract IOC fill (ruling Q1)",
-    )
+def _admit_fill(
+    trial: FilledTrial,
+    *,
+    fee_reconciled: bool = True,
+    venue_order_id: str = "",
+    tick: Decimal = _TICK,
+) -> FillExclusion | None:
+    """Ruling Q1 admission gate, widened by I2 (BLOCK-3/L-25). Assumes
+    `trial.qty > 0` (call `_validate_qty` first). Returns `None` when the
+    fill is admitted, else the `FillExclusion` to report.
+
+    Order: `qty != 1` (ruling Q1) -> `fill_px < entry_ask - tick` (L-25,
+    strict: exactly one tick better is scored) -> `fee_reconciled is False`.
+    `fee_reconciled` and `venue_order_id` default to the JSONL fixture path's
+    behaviour (`True`/`""`); the state-DB path always supplies both real
+    values.
+    """
+    if trial.qty != 1:
+        reason: FillExclusionReason = "partial_fill" if trial.qty < 1 else "multi_fill"
+        return FillExclusion(
+            trial_id=trial.trial_id,
+            station=trial.station,
+            climate_day=trial.climate_day,
+            qty=str(trial.qty),
+            reason=reason,
+            detail=f"qty {trial.qty} != 1; v1 unit is a 1-contract IOC fill (ruling Q1)",
+            venue_order_id=venue_order_id,
+            filled_at_ns=trial.filled_at_ns,
+        )
+    if trial.fill_px < trial.entry_ask - tick:
+        return FillExclusion(
+            trial_id=trial.trial_id,
+            station=trial.station,
+            climate_day=trial.climate_day,
+            qty=str(trial.qty),
+            reason="fill_below_ask",
+            detail=(
+                f"fill_px {trial.fill_px} < entry_ask {trial.entry_ask} - tick "
+                f"{tick} (L-25 defect signature)"
+            ),
+            venue_order_id=venue_order_id,
+            filled_at_ns=trial.filled_at_ns,
+        )
+    if not fee_reconciled:
+        return FillExclusion(
+            trial_id=trial.trial_id,
+            station=trial.station,
+            climate_day=trial.climate_day,
+            qty=str(trial.qty),
+            reason="fee_unverified",
+            detail="the venue's cumulative fee could not be reconciled to its fill-type legs",
+            venue_order_id=venue_order_id,
+            filled_at_ns=trial.filled_at_ns,
+        )
+    return None
 
 
 def read_filled_trials_jsonl(
@@ -319,6 +449,221 @@ def _filled_trial_from_json(row: Mapping[str, Any]) -> FilledTrial:
         entry_ask=Decimal(row["entry_ask"]),
         scheduled_release_at_ns=int(row["scheduled_release_at_ns"]),
         venue_settlement_tmax_f=row.get("venue_settlement_tmax_f"),
+    )
+
+
+def read_filled_trials_state_db(
+    path: Path,
+    *,
+    family_prefix: str,
+    city: str,
+    cli_location: str,
+    since_climate_day: str,
+    stations: Sequence[str],
+) -> tuple[tuple[FilledTrial, ...], tuple[FillExclusion, ...], Mapping[str, tuple[bool, str]]]:
+    """Read real fills from the live exec `SqliteStateStore`, joined to each
+    trial's `current_rung_hold/trial/{station}/{climate_day}` latch by
+    `instrument_id` (I2, `LIVE_FILL_SCORING_CHAIN_2026-09-05.md`).
+
+    Opens `path` READ-ONLY via the shipped `fill_time_count._open_readonly`
+    (`mode=ro` URI, no flock) -- ONE implementation, never a second
+    read-only-connect. Raises `FillSourceUnreadableError` when the store
+    cannot be opened or read; the caller (`main`) is the one that turns that
+    into a non-zero exit (A5) -- this function never prints or logs the path.
+
+    Store positive control (BLOCK-1.2), checked BEFORE any join: an openable
+    but WRONG store must refuse, never silently score zero. Requires >= 1
+    latch key under `family_prefix` whose CITY segment is any member of
+    `stations` -- per-STORE, not per-city, deliberately (a station with no
+    activity today must not refuse a correct store). Raises
+    `StorePositiveControlFailedError` otherwise.
+
+    Join and its three integrity events -- EXCLUSIONS, never `ScoreRefusal`
+    (BLOCK-3): (i) an instrument matching more than one TAKEN latch (within
+    this run's `city`, since `since_climate_day`) excludes every one of its
+    fills as `ambiguous_latch`; (ii) an instrument matching no taken latch at
+    all excludes every one of its fills as `no_taken_latch`, with
+    `trial_id`/`station`/`climate_day` = `""` (allowed for this reason
+    only); (iii) more than one fill record joining ONE latch excludes EACH
+    fill as `duplicate_fill_for_latch`, one line per `venue_order_id`, both
+    (or all) kept out of scoring. A `paper_replay/` latch key never matches
+    `family_prefix` (plain `str.startswith`).
+
+    Returns `(trials, exclusions, fee_reconciled_by_trial_id)`; the third
+    member maps `trial_id -> (fee_reconciled, venue_order_id)` so the caller
+    can pass both into `_admit_fill`. `FilledTrial.scheduled_release_at_ns`
+    is a placeholder `0` here -- this reader takes no `venue` (the signature
+    above is frozen, Stage-0), so the caller resolves the real settlement
+    instant via `_with_scheduled_release_at_ns`, the one place `venue` and
+    `city` are both already in hand.
+    """
+    conn = _open_readonly(path)
+    if conn is None:
+        raise FillSourceUnreadableError("the fill source could not be opened read-only")
+    try:
+        rows = conn.execute("SELECT key, value FROM state").fetchall()
+    except sqlite3.Error as exc:
+        raise FillSourceUnreadableError("the fill source could not be read") from exc
+    finally:
+        conn.close()
+
+    station_census = set(stations)
+    has_census_latch = False
+    for key, _value in rows:
+        if not isinstance(key, str) or not key.startswith(family_prefix):
+            continue
+        parts = key[len(family_prefix) :].split("/")
+        if len(parts) == 2 and parts[0] in station_census:
+            has_census_latch = True
+            break
+    if not has_census_latch:
+        raise StorePositiveControlFailedError("store_positive_control_failed")
+
+    # instrument_id -> every TAKEN latch for this run's `city`, on or after
+    # `since_climate_day` (ISO-8601 dates sort lexicographically).
+    latches_by_instrument: dict[str, list[tuple[str, str, Decimal]]] = {}
+    for key, value in rows:
+        if not isinstance(key, str) or not key.startswith(family_prefix):
+            continue
+        parts = key[len(family_prefix) :].split("/")
+        if len(parts) != 2:
+            continue
+        station, climate_day = parts
+        if station != city or climate_day < since_climate_day:
+            continue
+        try:
+            record = TrialDayRecord.from_bytes(value)
+        except TrialDayRecordCorrupt:
+            continue
+        if record.reason != _TAKEN_REASON:
+            continue
+        latches_by_instrument.setdefault(record.instrument_id, []).append(
+            (key, climate_day, record.ask)
+        )
+
+    fills_by_instrument: dict[str, list[DurableFillRecord]] = {}
+    for key, value in rows:
+        if not isinstance(key, str) or not key.startswith(FILL_KEY_PREFIX):
+            continue
+        try:
+            fill = DurableFillRecord.from_bytes(value)
+        except ExecutionReportMappingError:
+            continue
+        fills_by_instrument.setdefault(fill.instrument_id, []).append(fill)
+
+    trials: list[FilledTrial] = []
+    exclusions: list[FillExclusion] = []
+    fee_reconciled_by_trial_id: dict[str, tuple[bool, str]] = {}
+
+    for instrument_id, fills in fills_by_instrument.items():
+        entries = latches_by_instrument.get(instrument_id, [])
+        if not entries:
+            for fill in fills:
+                exclusions.append(
+                    FillExclusion(
+                        trial_id="",
+                        station="",
+                        climate_day="",
+                        qty=str(fill.cumulative_qty),
+                        reason="no_taken_latch",
+                        detail=(
+                            f"no taken latch under {family_prefix!r} for city "
+                            f"{city!r} matches instrument {instrument_id!r}"
+                        ),
+                        venue_order_id=fill.venue_order_id,
+                        filled_at_ns=fill.ts_event,
+                    )
+                )
+            continue
+        # More than one latch: report against the FIRST-landed one, purely
+        # for diagnostics -- which latch is "the" trial is exactly what is
+        # ambiguous, mirroring `_read_bucket_facts_by_instrument_id`'s
+        # first-landed-stands idiom elsewhere in this module.
+        trial_id, climate_day, ask = entries[0]
+        if len(entries) > 1:
+            for fill in fills:
+                exclusions.append(
+                    FillExclusion(
+                        trial_id=trial_id,
+                        station=cli_location,
+                        climate_day=climate_day,
+                        qty=str(fill.cumulative_qty),
+                        reason="ambiguous_latch",
+                        detail=(
+                            f"instrument {instrument_id!r} matches {len(entries)} "
+                            "taken latches; the fill cannot be joined unambiguously"
+                        ),
+                        venue_order_id=fill.venue_order_id,
+                        filled_at_ns=fill.ts_event,
+                    )
+                )
+            continue
+        if len(fills) > 1:
+            for fill in fills:
+                exclusions.append(
+                    FillExclusion(
+                        trial_id=trial_id,
+                        station=cli_location,
+                        climate_day=climate_day,
+                        qty=str(fill.cumulative_qty),
+                        reason="duplicate_fill_for_latch",
+                        detail=(
+                            f"{len(fills)} fill records join latch {trial_id!r}; "
+                            "none is picked, both stay out of n"
+                        ),
+                        venue_order_id=fill.venue_order_id,
+                        filled_at_ns=fill.ts_event,
+                    )
+                )
+            continue
+        fill = fills[0]
+        trials.append(
+            FilledTrial(
+                trial_id=trial_id,
+                station=cli_location,
+                climate_day=climate_day,
+                instrument_id=instrument_id,
+                bucket=None,
+                fill_px=fill.cumulative_cost / fill.cumulative_qty,
+                fee=fill.cumulative_fee / fill.cumulative_qty,
+                qty=fill.cumulative_qty,
+                filled_at_ns=fill.ts_event,
+                entry_ask=ask,
+                scheduled_release_at_ns=0,
+                venue_settlement_tmax_f=None,
+            )
+        )
+        fee_reconciled_by_trial_id[trial_id] = (fill.fee_reconciled, fill.venue_order_id)
+
+    return tuple(trials), tuple(exclusions), fee_reconciled_by_trial_id
+
+
+def _with_scheduled_release_at_ns(trial: FilledTrial, *, venue: str, city: str) -> FilledTrial:
+    """Replace the reader's placeholder `scheduled_release_at_ns` with the
+    venue's real settlement instant for `trial.climate_day` -- `climate_day +
+    1` at the venue's settlement wall-clock, via the promoted
+    `breezy.registry.settlement_clock.settlement_deadline_ns` helper (never
+    midnight UTC, never a second copy of the arithmetic `nws_actor.py` also
+    uses). Runs as a driver-level step because `read_filled_trials_state_db`
+    takes no `venue` -- its signature is frozen (Stage-0) -- and `venue` and
+    `city` are both already in hand here.
+    """
+    deadline = default_registry().settlement_deadline(venue, city)
+    climate_day = dt.date.fromisoformat(trial.climate_day)
+    release_ns = settlement_deadline_ns(deadline, climate_day)
+    return FilledTrial(
+        trial_id=trial.trial_id,
+        station=trial.station,
+        climate_day=trial.climate_day,
+        instrument_id=trial.instrument_id,
+        bucket=trial.bucket,
+        fill_px=trial.fill_px,
+        fee=trial.fee,
+        qty=trial.qty,
+        filled_at_ns=trial.filled_at_ns,
+        entry_ask=trial.entry_ask,
+        scheduled_release_at_ns=release_ns,
+        venue_settlement_tmax_f=trial.venue_settlement_tmax_f,
     )
 
 
@@ -401,33 +746,95 @@ def _unchanged_since_last_score(
 
 def score_live_trials(
     *,
-    fills_path: Path,
+    fills_path: Path | None = None,
+    fill_source_path: Path | None = None,
+    family_prefix: str | None = None,
+    since_climate_day: str | None = None,
+    stations: Sequence[str] | None = None,
     catalog_base: Path,
     venue: str,
     city: str,
     derived_dir: Path,
     now_ns: int,
+    proc_root: Path = Path("/proc"),
 ) -> tuple[tuple[ScoredTrial, ...], tuple[ScoreRefusal, ...], tuple[FillExclusion, ...]]:
     """Read fills, join to settlement truth, score, and write the parquet run.
 
-    The partial-fill admission gate (ruling Q1) runs first, between reading
-    fills and scoring: `qty <= 0` becomes a loud `malformed_input` refusal;
-    `qty != 1` becomes a `FillExclusion`, reported separately and never
-    passed to `score_trial`.
+    Exactly one fill source: `fills_path` (JSONL fixture/replay) or
+    `fill_source_path` (the live exec state DB, I2) -- the caller (`main`)
+    enforces that exclusivity and resolves `fill_source_path` from
+    `--fill-source` or `POLYMARKET_US_EXEC_STATE_DB` when omitted. When
+    reading from the state DB, `family_prefix`/`since_climate_day`/`stations`
+    (from the required `--family-manifest`) are also required.
+
+    State-DB path only: runs the REVISE-1 node-env pre-flight first
+    (`node_store_path_check`, `proc_root` injectable for tests) -- MISMATCH
+    or DISCOVERY_FAILED raises `NodeStorePreflightRefused`; NO_NODE warns
+    once and continues (schedule premise, NOTE-8); MATCH continues silently.
+    Then `read_filled_trials_state_db` (BLOCK-1.2's positive control, BLOCK-3's
+    join exclusions) and `_with_scheduled_release_at_ns` (the venue's real
+    settlement instant, never midnight UTC) run before the shared join below.
+
+    The partial-fill admission gate (ruling Q1, widened by L-25/I2) runs
+    first, between reading fills and scoring: `qty <= 0` becomes a loud
+    `malformed_input` refusal; `qty != 1`, `fill_px < entry_ask - tick` or
+    `fee_reconciled is False` becomes a `FillExclusion`, reported separately
+    and never passed to `score_trial`.
     """
-    filled_trials, jsonl_refusals = read_filled_trials_jsonl(fills_path)
+    reader_exclusions: tuple[FillExclusion, ...] = ()
+    fee_reconciled_by_trial_id: Mapping[str, tuple[bool, str]] = {}
+
+    if fills_path is not None:
+        filled_trials, jsonl_refusals = read_filled_trials_jsonl(fills_path)
+    else:
+        missing_state_db_args = (
+            fill_source_path is None
+            or family_prefix is None
+            or since_climate_day is None
+            or stations is None
+        )
+        if missing_state_db_args:
+            raise ValueError(
+                "fill_source_path, family_prefix, since_climate_day and stations "
+                "are all required when fills_path is not given"
+            )
+        preflight = node_store_path_check(fill_source_path, proc_root=proc_root)
+        if preflight == "MISMATCH":
+            raise NodeStorePreflightRefused("node_store_mismatch")
+        if preflight == "DISCOVERY_FAILED":
+            raise NodeStorePreflightRefused("node_store_discovery_failed")
+        if preflight == "NO_NODE":
+            logging.getLogger(__name__).warning(
+                "no anchored breezy-trade node found while checking the "
+                "fill-source store binding; continuing (schedule premise, NOTE-8)"
+            )
+        cli_location = default_registry().settlement_site(venue, city).cli_location
+        raw_trials, reader_exclusions, fee_reconciled_by_trial_id = read_filled_trials_state_db(
+            fill_source_path,
+            family_prefix=family_prefix,
+            city=city,
+            cli_location=cli_location,
+            since_climate_day=since_climate_day,
+            stations=stations,
+        )
+        filled_trials = tuple(
+            _with_scheduled_release_at_ns(trial, venue=venue, city=city) for trial in raw_trials
+        )
+        jsonl_refusals = ()
+
     bucket_by_instrument = _read_bucket_facts_by_instrument_id(catalog_base, venue=venue, city=city)
     catalog = open_station_catalog(catalog_base, venue, city)
 
     pairs: list[tuple[FilledTrial, NwsClimateDay | None]] = []
     extra_refusals: list[ScoreRefusal] = list(jsonl_refusals)
-    excluded_fills: list[FillExclusion] = []
+    excluded_fills: list[FillExclusion] = list(reader_exclusions)
     for trial in filled_trials:
         malformed_qty = _validate_qty(trial)
         if malformed_qty is not None:
             extra_refusals.append(malformed_qty)
             continue
-        exclusion = _admit_fill(trial)
+        fee_reconciled, venue_order_id = fee_reconciled_by_trial_id.get(trial.trial_id, (True, ""))
+        exclusion = _admit_fill(trial, fee_reconciled=fee_reconciled, venue_order_id=venue_order_id)
         if exclusion is not None:
             excluded_fills.append(exclusion)
             continue
@@ -525,9 +932,72 @@ def score_live_trials(
     return stamped_scored, refused, tuple(excluded_fills)
 
 
+def _append_excluded_fills(
+    derived_dir: Path, exclusions: Sequence[FillExclusion], *, scored_run_utc: str
+) -> None:
+    """Append-only, idempotent on `(venue_order_id, reason)` (I2 3.0(c)).
+
+    `main()` is the SOLE appender (BLOCK-3): `score_live_trials()` returns
+    ONE merged exclusion tuple (the reader's join exclusions plus
+    `_admit_fill`'s), and this is the ONE write site for it.
+    """
+    if not exclusions:
+        return
+    path = derived_dir / _EXCLUDED_FILLS_ARTEFACT_NAME
+    existing_keys: set[tuple[str, str]] = set()
+    if path.exists():
+        for line in path.read_text(encoding="utf-8").splitlines():
+            if not line.strip():
+                continue
+            row = json.loads(line)
+            existing_keys.add((row["venue_order_id"], row["reason"]))
+    new_lines: list[str] = []
+    for fill in exclusions:
+        key = (fill.venue_order_id, fill.reason)
+        if key in existing_keys:
+            continue
+        existing_keys.add(key)
+        new_lines.append(
+            json.dumps(
+                {
+                    "trial_id": fill.trial_id,
+                    "station": fill.station,
+                    "climate_day": fill.climate_day,
+                    "venue_order_id": fill.venue_order_id,
+                    "qty": fill.qty,
+                    "reason": fill.reason,
+                    "filled_at_ns": fill.filled_at_ns,
+                    "scored_run_utc": scored_run_utc,
+                }
+            )
+        )
+    if not new_lines:
+        return
+    derived_dir.mkdir(parents=True, exist_ok=True)
+    with path.open("a", encoding="utf-8") as fh:
+        for line in new_lines:
+            fh.write(line + "\n")
+
+
 def _parse_args(argv: Sequence[str] | None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--fills", type=Path, required=True, help="JSONL FilledTrial input path")
+    parser.add_argument(
+        "--fills", type=Path, default=None, help="JSONL FilledTrial input path (fixture/replay)"
+    )
+    parser.add_argument(
+        "--fill-source",
+        type=Path,
+        default=None,
+        dest="fill_source",
+        help="state-DB fill source path; else POLYMARKET_US_EXEC_STATE_DB",
+    )
+    parser.add_argument(
+        "--family-manifest",
+        type=Path,
+        required=True,
+        dest="family_manifest",
+        help="strict family manifest (REGISTERED, no draft) -- required on both sources",
+    )
     parser.add_argument("--venue", type=str, default="polymarket_us")
     parser.add_argument("--city", type=str, required=True)
     parser.add_argument("--catalog-base", type=Path, default=DEFAULT_NWS_CATALOG_BASE)
@@ -535,16 +1005,73 @@ def _parse_args(argv: Sequence[str] | None) -> argparse.Namespace:
     return parser.parse_args(argv)
 
 
-def main(argv: Sequence[str] | None = None) -> int:
+def main(argv: Sequence[str] | None = None, *, proc_root: Path = Path("/proc")) -> int:
+    """`proc_root` is a keyword-only test seam (never a CLI flag, mirroring
+    `breezy.runtime.exec_state_db_path.main`'s own parameter): production
+    always scans the real `/proc`."""
     args = _parse_args(argv)
-    scored, refused, excluded = score_live_trials(
-        fills_path=args.fills,
-        catalog_base=args.catalog_base,
-        venue=args.venue,
-        city=args.city,
-        derived_dir=args.derived_dir,
-        now_ns=time.time_ns(),
-    )
+    log = logging.getLogger(__name__)
+
+    if args.fills is not None and args.fill_source is not None:
+        print(
+            "score_live_trials: --fills and --fill-source are mutually exclusive",
+            file=sys.stderr,
+        )
+        return 1
+
+    try:
+        manifest = load_family_manifest(args.family_manifest)
+    except (FamilyManifestError, OSError) as exc:
+        print(
+            f"score_live_trials: could not load --family-manifest: {type(exc).__name__}",
+            file=sys.stderr,
+        )
+        return 1
+
+    fill_source_path: Path | None = None
+    family_prefix: str | None = None
+    since_climate_day: str | None = None
+    stations: tuple[str, ...] | None = None
+    if args.fills is None:
+        if args.fill_source is not None:
+            fill_source_path = args.fill_source
+        else:
+            try:
+                fill_source_path = resolve_store_path(os.environ)
+            except ExecStateDbNotConfiguredError as exc:
+                print(f"score_live_trials: {exc}", file=sys.stderr)
+                return 1
+        # NOTE-3: the ONE rule for path logging -- a repo-pinned, non-secret
+        # filesystem literal, logged exactly once per invocation. Never the
+        # node-env pre-flight's compared values (those stay enum-only).
+        log.info("resolved fill-source path: %s", fill_source_path)
+        family_prefix = manifest.trial_id_prefix
+        since_climate_day = manifest.d0_climate_day
+        stations = manifest.stations
+
+    now_ns = time.time_ns()
+    try:
+        scored, refused, excluded = score_live_trials(
+            fills_path=args.fills,
+            fill_source_path=fill_source_path,
+            family_prefix=family_prefix,
+            since_climate_day=since_climate_day,
+            stations=stations,
+            catalog_base=args.catalog_base,
+            venue=args.venue,
+            city=args.city,
+            derived_dir=args.derived_dir,
+            now_ns=now_ns,
+            proc_root=proc_root,
+        )
+    except (
+        FillSourceUnreadableError,
+        StorePositiveControlFailedError,
+        NodeStorePreflightRefused,
+    ) as exc:
+        print(f"score_live_trials: refused: {exc}", file=sys.stderr)
+        return 1
+
     print(
         f"scored {len(scored)} trial(s), refused {len(refused)} trial(s), "
         f"excluded {len(excluded)} fill(s)"
@@ -558,6 +1085,10 @@ def main(argv: Sequence[str] | None = None) -> int:
                 f"  excluded {fill.trial_id}: {fill.reason} qty={fill.qty} "
                 f"station={fill.station} climate_day={fill.climate_day} -- {fill.detail}"
             )
+    scored_run_utc = dt.datetime.fromtimestamp(now_ns / 1_000_000_000, tz=dt.UTC).strftime(
+        "%Y-%m-%dT%H:%M:%SZ"
+    )
+    _append_excluded_fills(args.derived_dir, excluded, scored_run_utc=scored_run_utc)
     return 0
 
 
