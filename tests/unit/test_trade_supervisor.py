@@ -31,6 +31,13 @@ from breezy.runtime.trade_supervisor import (
     EXIT_CONFIG_ERROR,
     NODE_CONSOLE_SCRIPT,
     ExecStateDbNotConfiguredError,
+    IncrementalLogReader,
+    StopPriorRaceRefused,
+    SupervisorPorts,
+    _do_launch,
+    _do_self_check,
+    _do_stop_prior,
+    _run_forever,
     count_lock_holders,
     hold_supervisor_lock,
     intent_lock_is_free,
@@ -44,6 +51,7 @@ from breezy.runtime.trade_supervisor import (
     spawn_node,
     supervisor_lock_path,
     terminate,
+    terminate_after_toctou_recheck,
 )
 from breezy.runtime.trade_supervisor_core import (
     MAX_RELAUNCH_ATTEMPTS,
@@ -53,6 +61,7 @@ from breezy.runtime.trade_supervisor_core import (
     AlertDetail,
     ExitConfigErrorCause,
     LaunchAction,
+    Phase,
     PreLaunchProbeInvariantError,
     RelaunchCause,
     SelfCheckResult,
@@ -63,7 +72,13 @@ from breezy.runtime.trade_supervisor_core import (
     decide_relaunch,
     decide_stop_prior_action,
     disambiguate_exit_config_error,
+    initial_scheduler_state,
+    mark_phase_fired,
+    next_due,
+    parse_permit_expiry_ns,
     readiness_observed,
+    record_readiness_observed,
+    record_relaunch_attempt,
     self_check,
 )
 
@@ -758,3 +773,574 @@ def test_supervisor_console_entry_uses_the_distinct_argv_token_convention():
     assert 'breezy-trade-supervisor = "breezy.runtime.trade_supervisor:main"' in pyproject
     plan_path = REPO_ROOT / "docs/plans/TRADE_NODE_DAILY_RELAUNCH_2026-09-04.md"
     assert SUPERVISOR_ARGV_TOKEN in plan_path.read_text()
+
+
+# ===========================================================================
+# Coordinator round 2: the loop was a stub (`while True: sleep(30)`) with
+# zero call sites for any decision function -- security BLOCK. This section
+# covers the real, testable scheduler + wired loop.
+# ===========================================================================
+
+_DAY = dt.date(2026, 9, 4)
+
+
+def _utc(hour: int, minute: int, second: int = 0, *, day: dt.date = _DAY) -> dt.datetime:
+    return dt.datetime.combine(day, dt.time(hour, minute, second), tzinfo=dt.UTC)
+
+
+# ---------------------------------------------------------------------------
+# Pure scheduler: next_due / mark_phase_fired / record_* over plain values.
+# ---------------------------------------------------------------------------
+
+
+class TestNextDue:
+    def test_before_1640_nothing_is_due(self):
+        state = initial_scheduler_state(_DAY)
+        phase, fire_at = next_due(_utc(3, 0), state)
+        assert phase is Phase.NONE
+        assert fire_at == _utc(16, 40)
+
+    def test_stop_prior_due_in_its_window(self):
+        state = initial_scheduler_state(_DAY)
+        phase, fire_at = next_due(_utc(16, 45), state)
+        assert phase is Phase.STOP_PRIOR
+        assert fire_at == _utc(16, 40)
+
+    def test_stop_prior_never_double_fires_same_day(self):
+        state = mark_phase_fired(initial_scheduler_state(_DAY), Phase.STOP_PRIOR, _utc(16, 41))
+        phase, _ = next_due(_utc(16, 45), state)
+        assert phase is not Phase.STOP_PRIOR
+
+    def test_restart_at_1645_launch_still_due_at_1650(self):
+        # A restart at 16:45 does not skip today's LAUNCH -- it simply
+        # isn't due yet (LAUNCH_UTC hasn't arrived).
+        state = initial_scheduler_state(_DAY)
+        phase, _ = next_due(_utc(16, 45), state)
+        assert phase is Phase.STOP_PRIOR
+        state = mark_phase_fired(state, Phase.STOP_PRIOR, _utc(16, 45))
+        phase, fire_at = next_due(_utc(16, 50), state)
+        assert phase is Phase.LAUNCH
+        assert fire_at == _utc(16, 50)
+
+    def test_restart_at_1655_launch_due_immediately_if_not_fired(self):
+        # STOP_PRIOR's own window [16:40,16:50) has already closed by
+        # 16:55, so a fresh (post-restart) state goes straight to LAUNCH.
+        state = initial_scheduler_state(_DAY)
+        phase, fire_at = next_due(_utc(16, 55), state)
+        assert phase is Phase.LAUNCH
+        assert fire_at == _utc(16, 50)
+
+    def test_restart_at_1655_launch_already_done_yields_relaunch_check(self):
+        state = mark_phase_fired(initial_scheduler_state(_DAY), Phase.LAUNCH, _utc(16, 50))
+        phase, _ = next_due(_utc(16, 55), state)
+        assert phase is Phase.RELAUNCH_CHECK
+
+    def test_restart_at_1655_launch_done_and_ready_yields_nothing_until_self_check(self):
+        state = mark_phase_fired(initial_scheduler_state(_DAY), Phase.LAUNCH, _utc(16, 50))
+        state = record_readiness_observed(state, _utc(16, 52))
+        phase, _ = next_due(_utc(16, 55), state)
+        assert phase is Phase.NONE
+
+    def test_restart_at_1710_nothing_until_tomorrow(self):
+        # SELF_CHECK's own catch-up window [17:05, 17:10) has already
+        # closed by 17:10 -- no stale self-check fires this late.
+        state = initial_scheduler_state(_DAY)
+        phase, fire_at = next_due(_utc(17, 10), state)
+        assert phase is Phase.NONE
+        assert fire_at == _utc(16, 40, day=_DAY + dt.timedelta(days=1))
+
+    def test_restart_at_0300_waits_for_1640(self):
+        state = initial_scheduler_state(_DAY)
+        phase, fire_at = next_due(_utc(3, 0), state)
+        assert phase is Phase.NONE
+        assert fire_at == _utc(16, 40)
+
+    def test_restart_at_2350_nothing_until_tomorrow_1640(self):
+        state = initial_scheduler_state(_DAY)
+        state = mark_phase_fired(state, Phase.STOP_PRIOR, _utc(16, 40))
+        state = mark_phase_fired(state, Phase.LAUNCH, _utc(16, 50))
+        state = record_readiness_observed(state, _utc(16, 52))
+        state = mark_phase_fired(state, Phase.SELF_CHECK, _utc(17, 5))
+        phase, fire_at = next_due(_utc(23, 50), state)
+        assert phase is Phase.NONE
+        assert fire_at == _utc(16, 40, day=_DAY + dt.timedelta(days=1))
+
+    def test_self_check_due_in_its_window(self):
+        state = mark_phase_fired(initial_scheduler_state(_DAY), Phase.LAUNCH, _utc(16, 50))
+        state = record_readiness_observed(state, _utc(16, 52))
+        phase, fire_at = next_due(_utc(17, 5), state)
+        assert phase is Phase.SELF_CHECK
+        assert fire_at == _utc(17, 5)
+
+    def test_self_check_never_double_fires(self):
+        state = mark_phase_fired(initial_scheduler_state(_DAY), Phase.SELF_CHECK, _utc(17, 5))
+        phase, _ = next_due(_utc(17, 6), state)
+        assert phase is not Phase.SELF_CHECK
+
+    def test_day_rollover_resets_all_done_flags(self):
+        yesterday = _DAY - dt.timedelta(days=1)
+        state = initial_scheduler_state(yesterday)
+        state = mark_phase_fired(state, Phase.STOP_PRIOR, _utc(16, 40, day=yesterday))
+        state = mark_phase_fired(state, Phase.LAUNCH, _utc(16, 50, day=yesterday))
+        state = mark_phase_fired(state, Phase.SELF_CHECK, _utc(17, 5, day=yesterday))
+        phase, _ = next_due(_utc(16, 45), state)
+        assert phase is Phase.STOP_PRIOR
+
+    def test_readiness_observed_blocks_relaunch_check_forever_that_day(self):
+        state = mark_phase_fired(initial_scheduler_state(_DAY), Phase.LAUNCH, _utc(16, 50))
+        state = record_readiness_observed(state, _utc(16, 51))
+        for minute in range(51, 60):
+            phase, _ = next_due(_utc(16, minute), state)
+            assert phase is not Phase.RELAUNCH_CHECK
+
+    def test_relaunch_attempt_bookkeeping_round_trips(self):
+        state = initial_scheduler_state(_DAY)
+        state = record_relaunch_attempt(state, _utc(16, 51))
+        assert state.relaunch_attempts == 1
+        assert state.last_relaunch_attempt_at == _utc(16, 51)
+        state = record_relaunch_attempt(state, _utc(16, 55))
+        assert state.relaunch_attempts == 2
+
+
+def test_parse_permit_expiry_ns_extracts_the_real_marker_shape():
+    log = "live-trading permit issued issued_at_ns=100 expires_at_ns=999 ttl_s=1\n"
+    assert parse_permit_expiry_ns(log) == 999
+
+
+def test_parse_permit_expiry_ns_none_when_absent():
+    assert parse_permit_expiry_ns("nothing here") is None
+
+
+# ---------------------------------------------------------------------------
+# [H1] Incremental log reader -- a multi-MB prefix is never re-read.
+# ---------------------------------------------------------------------------
+
+
+class TestIncrementalLogReader:
+    def test_second_call_returns_only_new_bytes(self, tmp_path):
+        path = tmp_path / "node.log"
+        path.write_text("AAAA")
+        reader = IncrementalLogReader()
+        first = reader.read_new(path)
+        assert first == "AAAA"
+        with open(path, "a") as fh:
+            fh.write("BBBB")
+        second = reader.read_new(path)
+        assert "BBBB" in second
+        assert second.count("A") <= len("AAAA")  # no re-read of the old prefix
+
+    def test_multi_megabyte_prefix_is_read_at_most_once(self, tmp_path):
+        path = tmp_path / "node.log"
+        big_prefix = "x" * (5 * 1024 * 1024)
+        path.write_text(big_prefix)
+        reader = IncrementalLogReader()
+        reader.read_new(path)
+        assert reader.bytes_read(path) == len(big_prefix)
+        with open(path, "a") as fh:
+            fh.write("tail-marker")
+        second = reader.read_new(path)
+        # The second read must be small (carry + new bytes only), never the
+        # multi-MB prefix again.
+        assert len(second) < 10_000
+        assert "tail-marker" in second
+        assert reader.bytes_read(path) == len(big_prefix) + len("tail-marker")
+
+    def test_marker_split_across_two_reads_is_still_found(self, tmp_path):
+        path = tmp_path / "node.log"
+        marker = "live-trading permit issued issued_at_ns=1 expires_at_ns=2 ttl_s=3"
+        split_point = marker.index("issued_at_ns=") + 5
+        path.write_text(marker[:split_point])
+        reader = IncrementalLogReader(carry_bytes=64)
+        first = reader.read_new(path)
+        assert marker not in first
+        with open(path, "a") as fh:
+            fh.write(marker[split_point:])
+        second = reader.read_new(path)
+        assert marker in second
+
+    def test_truncated_file_resets_offset(self, tmp_path):
+        path = tmp_path / "node.log"
+        path.write_text("A" * 1000)
+        reader = IncrementalLogReader()
+        reader.read_new(path)
+        path.write_text("short")
+        result = reader.read_new(path)
+        assert "short" in result
+
+    def test_missing_file_returns_carry_without_raising(self, tmp_path):
+        reader = IncrementalLogReader()
+        assert reader.read_new(tmp_path / "missing.log") == ""
+
+
+# ---------------------------------------------------------------------------
+# [M2] /proc/locks lock-type filtering -- FLOCK only, never POSIX.
+# ---------------------------------------------------------------------------
+
+
+def _synthetic_locks_file(tmp_path: Path, *, lock_type: str, pid: int, target: Path) -> Path:
+    stat = target.stat()
+    major, minor = os.major(stat.st_dev), os.minor(stat.st_dev)
+    locks = tmp_path / "proc_locks"
+    locks.write_text(
+        f"1: {lock_type}  ADVISORY  WRITE {pid} {major:02x}:{minor:02x}:{stat.st_ino} 0 EOF\n"
+    )
+    return locks
+
+
+class TestFlockTypeFiltering:
+    def test_flock_line_is_recognised(self, tmp_path):
+        target = tmp_path / "x.lock"
+        target.touch()
+        locks = _synthetic_locks_file(tmp_path, lock_type="FLOCK", pid=4242, target=target)
+        assert resolve_lock_holder_pid(target, locks_path=locks) == 4242
+        assert count_lock_holders(target, locks_path=locks) == 1
+
+    def test_posix_line_on_the_same_inode_is_never_the_holder(self, tmp_path):
+        target = tmp_path / "x.lock"
+        target.touch()
+        locks = _synthetic_locks_file(tmp_path, lock_type="POSIX", pid=4242, target=target)
+        assert resolve_lock_holder_pid(target, locks_path=locks) is None
+        assert count_lock_holders(target, locks_path=locks) == 0
+
+    def test_posix_line_is_never_counted_alongside_a_real_flock_holder(self, tmp_path):
+        target = tmp_path / "x.lock"
+        target.touch()
+        stat = target.stat()
+        major, minor = os.major(stat.st_dev), os.minor(stat.st_dev)
+        locks = tmp_path / "proc_locks"
+        locks.write_text(
+            f"1: POSIX  ADVISORY  WRITE 111 {major:02x}:{minor:02x}:{stat.st_ino} 0 EOF\n"
+            f"2: FLOCK  ADVISORY  WRITE 222 {major:02x}:{minor:02x}:{stat.st_ino} 0 EOF\n"
+        )
+        assert resolve_lock_holder_pid(target, locks_path=locks) == 222
+        assert count_lock_holders(target, locks_path=locks) == 1
+
+    def test_real_flock_via_default_locks_path_still_works(self, tmp_path):
+        # End-to-end sanity against the REAL /proc/locks (no injected path),
+        # matching the round-1 test but confirming the FLOCK filter didn't
+        # break the real-kernel path.
+        lock_path = tmp_path / "real.lock"
+        fd = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o644)
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        try:
+            assert resolve_lock_holder_pid(lock_path) == os.getpid()
+        finally:
+            fcntl.flock(fd, fcntl.LOCK_UN)
+            os.close(fd)
+
+
+# ---------------------------------------------------------------------------
+# [L3] TOCTOU-safe terminate: recheck immediately before SIGTERM.
+# ---------------------------------------------------------------------------
+
+
+class TestTerminateAfterToctouRecheck:
+    def test_signals_when_pid_still_holds_the_lock(self):
+        sent: list[int] = []
+        terminate_after_toctou_recheck(
+            777,
+            intent_lock_path_=Path("/does/not/matter"),
+            resolve_holder=lambda _p: 777,
+            terminate_fn=sent.append,
+            is_alive=lambda _pid: True,
+        )
+        assert sent == [777]
+
+    def test_refuses_when_pid_no_longer_exists(self):
+        sent: list[int] = []
+        with pytest.raises(StopPriorRaceRefused):
+            terminate_after_toctou_recheck(
+                777,
+                intent_lock_path_=Path("/does/not/matter"),
+                resolve_holder=lambda _p: 777,
+                terminate_fn=sent.append,
+                is_alive=lambda _pid: False,
+            )
+        assert sent == []
+
+    def test_refuses_when_pid_no_longer_holds_the_lock(self):
+        sent: list[int] = []
+        with pytest.raises(StopPriorRaceRefused):
+            terminate_after_toctou_recheck(
+                777,
+                intent_lock_path_=Path("/does/not/matter"),
+                resolve_holder=lambda _p: 999,  # a DIFFERENT pid now holds it
+                terminate_fn=sent.append,
+                is_alive=lambda _pid: True,
+            )
+        assert sent == []
+
+    def test_never_sends_a_signal_other_than_via_terminate_fn(self):
+        # terminate_fn is the ONLY way this function ever signals a process
+        # -- confirmed by construction (no os.kill call site here); this
+        # test pins that the real default terminate_fn is `terminate`,
+        # which sends SIGTERM only.
+        import inspect
+
+        sig = inspect.signature(terminate_after_toctou_recheck)
+        assert sig.parameters["terminate_fn"].default is terminate
+
+
+# ---------------------------------------------------------------------------
+# Fakes for the wired daily loop.
+# ---------------------------------------------------------------------------
+
+
+class FakeClock:
+    def __init__(self, start: dt.datetime) -> None:
+        self.current = start
+
+    def __call__(self) -> dt.datetime:
+        return self.current
+
+    def advance(self, seconds: float) -> None:
+        self.current = self.current + dt.timedelta(seconds=seconds)
+
+
+class FakePopen:
+    def __init__(self, pid: int) -> None:
+        self.pid = pid
+
+
+class FakeSpawner:
+    def __init__(self) -> None:
+        self.calls: list[dict] = []
+        self._next_pid = 9000
+
+    def __call__(self, **kwargs) -> FakePopen:
+        self._next_pid += 1
+        self.calls.append(kwargs)
+        return FakePopen(self._next_pid)
+
+
+# A far-future expiry (2100-01-01T00:00:00Z in ns) -- comfortably beyond any
+# real test "now", unlike a small literal that reads as already-expired
+# against a real epoch-based nanosecond timestamp.
+_READY_LOG_LINES = (
+    "live-trading permit issued issued_at_ns=1 expires_at_ns=4102444800000000000 ttl_s=1\n"
+    "CurrentRungHoldStrategy subscribed X\n"
+)
+
+
+def _make_ports(**overrides) -> SupervisorPorts:
+    base = {
+        "find_node_pid": lambda: None,
+        "resolve_intent_lock_holder": lambda _p: None,
+        "intent_lock_free": lambda _p: True,
+        "count_intent_lock_holders": lambda _p: 0,
+        "terminate_after_recheck": lambda pid, **kw: None,
+        "process_alive": lambda _pid: False,
+        "probe_open_intent_state": lambda *a, **kw: False,
+        "spawn": FakeSpawner(),
+        "read_log_new": lambda _p: "",
+        "alert_sink": _RecordingAlertSink(),
+        "sigterm_poll_sleep": lambda _s: None,
+    }
+    base.update(overrides)
+    return SupervisorPorts(**base)
+
+
+# ---------------------------------------------------------------------------
+# The wired daily loop -- FakeClock + fake sleep advancing it + fake ports.
+# ---------------------------------------------------------------------------
+
+
+class TestRunForeverWiredLoop:
+    def _run(self, *, clock: FakeClock, ports: SupervisorPorts, max_iterations: int, tmp_path):
+        def fake_sleep(seconds: float) -> None:
+            clock.advance(seconds)
+
+        _run_forever(
+            store_path=tmp_path / "state" / "store.sqlite3",
+            repo_root=tmp_path,
+            node_bin=tmp_path / "node_bin",
+            log_dir=tmp_path / "logs",
+            clock=clock,
+            sleep=fake_sleep,
+            ports=ports,
+            max_iterations=max_iterations,
+        )
+
+    def test_exactly_one_sigterm_at_1640_when_pids_match(self, tmp_path):
+        clock = FakeClock(_utc(16, 39, 30))
+        terminate_calls: list[int] = []
+        ports = _make_ports(
+            find_node_pid=lambda: 555,
+            resolve_intent_lock_holder=lambda _p: 555,
+            terminate_after_recheck=lambda pid, **kw: terminate_calls.append(pid),
+        )
+        self._run(clock=clock, ports=ports, max_iterations=200, tmp_path=tmp_path)
+        assert terminate_calls == [555]
+
+    def test_exactly_one_spawn_at_1650(self, tmp_path):
+        clock = FakeClock(_utc(16, 49, 30))
+        spawner = FakeSpawner()
+        ports = _make_ports(spawn=spawner, intent_lock_free=lambda _p: True)
+        self._run(clock=clock, ports=ports, max_iterations=30, tmp_path=tmp_path)
+        assert len(spawner.calls) == 1
+
+    def test_exactly_one_self_check_line_at_1705(self, tmp_path, caplog):
+        clock = FakeClock(_utc(17, 4, 30))
+        ports = _make_ports()
+        with caplog.at_level("INFO"):
+            self._run(clock=clock, ports=ports, max_iterations=30, tmp_path=tmp_path)
+        self_check_lines = [r for r in caplog.records if "self_check" in r.getMessage()]
+        assert len(self_check_lines) == 1
+
+    def test_no_double_fire_across_a_sleep_overshoot(self, tmp_path):
+        # A fake sleep that overshoots past 16:50 in one jump must still
+        # fire LAUNCH exactly once, not once per iteration afterwards.
+        clock = FakeClock(_utc(16, 30, 0))
+        spawner = FakeSpawner()
+        ports = _make_ports(spawn=spawner)
+        self._run(clock=clock, ports=ports, max_iterations=400, tmp_path=tmp_path)
+        assert len(spawner.calls) == 1
+
+    def test_no_fire_before_1640_after_a_0300_start(self, tmp_path):
+        clock = FakeClock(_utc(3, 0, 0))
+        terminate_calls: list[int] = []
+        spawner = FakeSpawner()
+        ports = _make_ports(
+            terminate_after_recheck=lambda pid, **kw: terminate_calls.append(pid),
+            spawn=spawner,
+        )
+        # Advance only a few bounded-sleep iterations -- nowhere near 16:40.
+        self._run(clock=clock, ports=ports, max_iterations=5, tmp_path=tmp_path)
+        assert terminate_calls == []
+        assert spawner.calls == []
+        assert clock.current < _utc(16, 40)
+
+    def test_adoption_at_1640_after_a_0300_start(self, tmp_path):
+        clock = FakeClock(_utc(3, 0, 0))
+        terminate_calls: list[int] = []
+        ports = _make_ports(
+            find_node_pid=lambda: 42,
+            resolve_intent_lock_holder=lambda _p: 42,
+            terminate_after_recheck=lambda pid, **kw: terminate_calls.append(pid),
+        )
+        self._run(clock=clock, ports=ports, max_iterations=900, tmp_path=tmp_path)
+        assert terminate_calls == [42]
+
+    def test_exception_in_stop_prior_does_not_prevent_launch(self, tmp_path):
+        clock = FakeClock(_utc(16, 39, 0))
+        calls = {"n": 0}
+
+        def _boom_once_then_none():
+            # Only STOP_PRIOR's own call site should see the failure --
+            # LAUNCH's later (legitimate) call to the same port must
+            # succeed, or this test can't tell "contained" from "also
+            # broken".
+            calls["n"] += 1
+            if calls["n"] == 1:
+                raise ValueError("synthetic stop_prior failure")
+
+        spawner = FakeSpawner()
+        ports = _make_ports(find_node_pid=_boom_once_then_none, spawn=spawner)
+        self._run(clock=clock, ports=ports, max_iterations=60, tmp_path=tmp_path)
+        assert len(spawner.calls) == 1
+
+    def test_started_at_2350_does_nothing_until_1640_next_day(self, tmp_path):
+        clock = FakeClock(_utc(23, 50, 0))
+        terminate_calls: list[int] = []
+        spawner = FakeSpawner()
+        ports = _make_ports(
+            find_node_pid=lambda: 99,
+            resolve_intent_lock_holder=lambda _p: 99,
+            terminate_after_recheck=lambda pid, **kw: terminate_calls.append(pid),
+            spawn=spawner,
+        )
+        # Advance a bounded number of iterations -- not yet at tomorrow's
+        # 16:40, so nothing touches the "running" node.
+        self._run(clock=clock, ports=ports, max_iterations=10, tmp_path=tmp_path)
+        assert terminate_calls == []
+        assert spawner.calls == []
+
+    def test_readiness_stops_further_relaunch_checks_from_spawning(self, tmp_path):
+        clock = FakeClock(_utc(16, 49, 30))
+        spawner = FakeSpawner()
+        ports = _make_ports(
+            spawn=spawner,
+            process_alive=lambda _pid: True,
+            resolve_intent_lock_holder=lambda _p: spawner.calls and 9001,
+            read_log_new=lambda _p: _READY_LOG_LINES,
+        )
+        self._run(clock=clock, ports=ports, max_iterations=60, tmp_path=tmp_path)
+        assert len(spawner.calls) == 1  # never relaunched once ready
+
+    def test_phase_exception_is_contained_and_alerted(self, tmp_path):
+        clock = FakeClock(_utc(17, 4, 30))
+        sink = _RecordingAlertSink()
+
+        def _boom(**_kw):
+            raise RuntimeError("self-check exploded")
+
+        ports = _make_ports(alert_sink=sink, count_intent_lock_holders=_boom)
+        self._run(clock=clock, ports=ports, max_iterations=10, tmp_path=tmp_path)
+        assert any(p.detail == AlertDetail.PHASE_EXCEPTION_CONTAINED.value for p in sink.payloads)
+
+    def test_max_iterations_bounds_the_loop_for_tests(self, tmp_path):
+        clock = FakeClock(_utc(3, 0, 0))
+        ports = _make_ports()
+        # Must return (not hang) once max_iterations is exhausted.
+        self._run(clock=clock, ports=ports, max_iterations=3, tmp_path=tmp_path)
+
+
+class TestPhaseHandlersDirect:
+    def test_do_stop_prior_noop_when_nothing_tracked(self, tmp_path):
+        store_path = tmp_path / "state" / "store.sqlite3"
+        ports = _make_ports()
+        result = _do_stop_prior(ports=ports, store_path=store_path, tracked_pid=None)
+        assert result is None
+
+    def test_do_launch_refuses_when_lock_held(self, tmp_path):
+        store_path = tmp_path / "state" / "store.sqlite3"
+        sink = _RecordingAlertSink()
+        ports = _make_ports(intent_lock_free=lambda _p: False, alert_sink=sink)
+        pid, log = _do_launch(
+            ports=ports,
+            now=_utc(16, 50),
+            store_path=store_path,
+            repo_root=tmp_path,
+            node_bin=tmp_path / "node_bin",
+            log_dir=tmp_path / "logs",
+        )
+        assert (pid, log) == (None, None)
+        assert sink.payloads[-1].detail == AlertDetail.LAUNCH_BLOCKED_LOCK_HELD.value
+
+    def test_do_launch_refuses_when_node_pid_present_despite_free_lock(self, tmp_path):
+        store_path = tmp_path / "state" / "store.sqlite3"
+        probed: list[object] = []
+        ports = _make_ports(
+            find_node_pid=lambda: 123,
+            intent_lock_free=lambda _p: True,
+            probe_open_intent_state=lambda *a, **kw: probed.append(kw) or False,
+        )
+        pid, log = _do_launch(
+            ports=ports,
+            now=_utc(16, 50),
+            store_path=store_path,
+            repo_root=tmp_path,
+            node_bin=tmp_path / "node_bin",
+            log_dir=tmp_path / "logs",
+        )
+        assert (pid, log) == (None, None)
+        assert probed == []  # the probe must never run while a node pid is live
+
+    def test_do_self_check_pass_logs_no_alert(self, tmp_path):
+        store_path = tmp_path / "state" / "store.sqlite3"
+        sink = _RecordingAlertSink()
+        ports = _make_ports(
+            resolve_intent_lock_holder=lambda _p: 42,
+            count_intent_lock_holders=lambda _p: 1,
+            process_alive=lambda _pid: True,
+            read_log_new=lambda _p: _READY_LOG_LINES,
+            alert_sink=sink,
+        )
+        _do_self_check(
+            ports=ports,
+            now=_utc(17, 5),
+            store_path=store_path,
+            tracked_pid=42,
+            node_log=tmp_path / "n.log",
+        )
+        assert sink.payloads == []

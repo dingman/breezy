@@ -32,8 +32,10 @@ import resource
 import signal
 import subprocess
 import sys
-from collections.abc import Iterator, Mapping
+import time as _time
+from collections.abc import Callable, Iterator, Mapping
 from contextlib import contextmanager
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Final
 
@@ -47,9 +49,30 @@ from breezy.runtime.submit_intent import (
     SubmitIntentState,
 )
 from breezy.runtime.trade_supervisor_core import (
+    NODE_ARGV_ANCHOR,
+    PERMIT_ISSUED_MARKER,
+    SELF_CHECK_ALERT_DETAIL,
+    STRATEGY_SUBSCRIBED_MARKER,
     SUPERVISOR_ARGV_TOKEN,
     AlertDetail,
+    DaySchedulerState,
+    LaunchAction,
+    Phase,
+    SelfCheckResult,
+    StopPriorAction,
     assert_no_live_node_before_intent_probe,
+    classify_exit1_cause,
+    decide_launch_action,
+    decide_relaunch,
+    decide_stop_prior_action,
+    initial_scheduler_state,
+    mark_phase_fired,
+    next_due,
+    permit_expiry_valid,
+    readiness_observed,
+    record_readiness_observed,
+    record_relaunch_attempt,
+    self_check,
 )
 
 logger = logging.getLogger(__name__)
@@ -62,6 +85,25 @@ NODE_CONSOLE_SCRIPT: Final[str] = "breezy-trade"
 SUPERVISOR_LOCK_FILENAME: Final[str] = "trade-supervisor.lock"
 
 _SIGTERM_WAIT_S: Final[float] = 10.0
+_SIGTERM_POLL_ATTEMPTS: Final[int] = 20
+_SIGTERM_POLL_INTERVAL_S: Final[float] = 0.5
+
+#: Bounded poll interval for the main schedule loop -- an early return or a
+#: backwards clock step is always re-evaluated within this many seconds,
+#: never a single unbounded sleep.
+_SCHEDULE_POLL_INTERVAL_S: Final[float] = 60.0
+
+#: The real ``/proc/locks`` path. A parameter (not a hardcoded literal)
+#: everywhere it is read, so tests can point at a synthetic file with real
+#: dev/inode-matching content instead of the kernel's own table.
+DEFAULT_PROC_LOCKS_PATH: Final[Path] = Path("/proc/locks")
+
+#: /proc/locks' lock-type field: this module's own lock and the node's
+#: intent lock are both `fcntl.flock` (BSD) locks, which the kernel reports
+#: as `FLOCK`. A `POSIX` (`fcntl.lockf`/byte-range) entry on the SAME
+#: dev:inode is a DIFFERENT locking mechanism and must never be mistaken
+#: for -- or counted alongside -- the flock holder [M2].
+_FLOCK_LOCK_TYPE: Final[str] = "FLOCK"
 
 
 # ---------------------------------------------------------------------------
@@ -169,22 +211,28 @@ def intent_lock_is_free(lock_path: Path) -> bool:
         os.close(fd)
 
 
-def resolve_lock_holder_pid(lock_path: Path) -> int | None:
-    """[E5] Read ``/proc/locks`` and return the PID holding ``lock_path``,
-    cross-referenced by device+inode -- never assumed from ``pgrep`` alone.
-    Returns ``None`` when the file does not exist, is unlocked, or
-    ``/proc/locks`` is unreadable (fails closed to "no verified holder")."""
+def _iter_flock_holders(
+    lock_path: Path, *, locks_path: Path = DEFAULT_PROC_LOCKS_PATH
+) -> Iterator[int]:
+    """Yield every PID holding an ``FLOCK``-type lock on ``lock_path``'s
+    dev:inode, per ``locks_path`` (``/proc/locks`` in production, an
+    injectable synthetic file in tests). A ``POSIX`` (``fcntl.lockf``)
+    entry on the same inode is a different locking mechanism and is never
+    yielded [M2] -- this module and the node it supervises use
+    ``fcntl.flock`` exclusively."""
     try:
         stat = lock_path.stat()
     except OSError:
-        return None
+        return
     try:
-        raw = Path("/proc/locks").read_text()
+        raw = locks_path.read_text()
     except OSError:
-        return None
+        return
     for line in raw.splitlines():
         fields = line.split()
         if len(fields) < 6:
+            continue
+        if fields[1] != _FLOCK_LOCK_TYPE:
             continue
         devino = fields[5].split(":")
         if len(devino) != 3:
@@ -201,42 +249,30 @@ def resolve_lock_holder_pid(lock_path: Path) -> int | None:
             continue
         if os.makedev(major, minor) != stat.st_dev:
             continue
+        yield pid
+
+
+def resolve_lock_holder_pid(
+    lock_path: Path, *, locks_path: Path = DEFAULT_PROC_LOCKS_PATH
+) -> int | None:
+    """[E5/M2] Read ``/proc/locks`` and return the PID holding an
+    ``FLOCK``-type lock on ``lock_path``, cross-referenced by device+inode
+    -- never assumed from ``pgrep`` alone, and never a ``POSIX``
+    (``fcntl.lockf``) entry on the same inode. Returns ``None`` when the
+    file does not exist, is unlocked, or ``/proc/locks`` is unreadable
+    (fails closed to "no verified holder")."""
+    for pid in _iter_flock_holders(lock_path, locks_path=locks_path):
         return pid
     return None
 
 
-def count_lock_holders(lock_path: Path) -> int:
-    """[B4] How many distinct PIDs currently hold ``lock_path`` per
-    ``/proc/locks`` -- an exclusive flock structurally admits at most one,
-    so >1 is a defensive falsifiable signal the self-check reports on."""
-    try:
-        stat = lock_path.stat()
-    except OSError:
-        return 0
-    try:
-        raw = Path("/proc/locks").read_text()
-    except OSError:
-        return 0
-    holders: set[int] = set()
-    for line in raw.splitlines():
-        fields = line.split()
-        if len(fields) < 6:
-            continue
-        devino = fields[5].split(":")
-        if len(devino) != 3:
-            continue
-        major_s, minor_s, inode_s = devino
-        try:
-            pid = int(fields[4])
-            inode = int(inode_s)
-            major = int(major_s, 16)
-            minor = int(minor_s, 16)
-        except ValueError:
-            continue
-        if inode != stat.st_ino or os.makedev(major, minor) != stat.st_dev:
-            continue
-        holders.add(pid)
-    return len(holders)
+def count_lock_holders(lock_path: Path, *, locks_path: Path = DEFAULT_PROC_LOCKS_PATH) -> int:
+    """[B4/M2] How many distinct PIDs currently hold an ``FLOCK``-type
+    lock on ``lock_path`` per ``/proc/locks`` -- an exclusive flock
+    structurally admits at most one, so >1 is a defensive falsifiable
+    signal the self-check reports on. A ``POSIX`` entry on the same inode
+    is never counted here."""
+    return len(set(_iter_flock_holders(lock_path, locks_path=locks_path)))
 
 
 # ---------------------------------------------------------------------------
@@ -296,6 +332,36 @@ def terminate(pid: int) -> None:
     os.kill(pid, signal.SIGTERM)
 
 
+class StopPriorRaceRefused(RuntimeError):
+    """Raised by :func:`terminate_after_toctou_recheck` when ``pid`` no
+    longer verifies as the intent-flock holder immediately before the
+    signal would be sent."""
+
+
+def terminate_after_toctou_recheck(
+    pid: int,
+    *,
+    intent_lock_path_: Path,
+    resolve_holder: Callable[[Path], int | None] = resolve_lock_holder_pid,
+    terminate_fn: Callable[[int], None] = terminate,
+    is_alive: Callable[[int], bool] | None = None,
+) -> None:
+    """[L3] TOCTOU-safe SIGTERM: the stop-prior DECISION
+    (:func:`decide_stop_prior_action`) and the actual signal are two
+    separate moments: re-verify, immediately before sending it, that
+    ``pid`` (a) still exists and (b) still resolves as the FLOCK holder of
+    ``intent_lock_path_``'s inode. Either check failing raises
+    ``StopPriorRaceRefused`` -- the caller refuses and alerts rather than
+    signalling a PID that may since have been reused by an unrelated
+    process."""
+    alive_check = is_alive if is_alive is not None else process_is_alive
+    if not alive_check(pid):
+        raise StopPriorRaceRefused("pid no longer exists")
+    if resolve_holder(intent_lock_path_) != pid:
+        raise StopPriorRaceRefused("pid no longer holds the intent flock")
+    terminate_fn(pid)
+
+
 def process_is_alive(pid: int) -> bool:
     try:
         os.kill(pid, 0)
@@ -307,15 +373,54 @@ def process_is_alive(pid: int) -> bool:
 
 
 # ---------------------------------------------------------------------------
-# Log markers -- reading, never writing, the child's log.
+# Log markers -- reading, never writing, the child's log. [H1] Offset-
+# tracking: the node log grows ~100 KB/min, so re-reading the whole file on
+# every poll is unbounded I/O over a multi-hour session. This reader seeks
+# to the last byte offset it returned for a given path and reads only the
+# NEW bytes -- a multi-MB prefix is read at most once, ever.
 # ---------------------------------------------------------------------------
 
 
-def read_log_text(log_path: Path) -> str:
-    try:
-        return log_path.read_text(encoding="utf-8", errors="replace")
-    except OSError:
-        return ""
+class IncrementalLogReader:
+    """Per-path byte-offset log tail reader with a small carry-over buffer.
+
+    ``read_new(path)`` returns ``carry + newly-appended-bytes`` for marker
+    matching, where ``carry`` is the tail of the PREVIOUS return (bounded by
+    ``carry_bytes``) -- long enough that a control-flow marker split across
+    two poll boundaries (e.g. one read ends mid-``issued_at_ns=``) is still
+    found whole in the next call's return value, without re-reading
+    anything already returned. A shrunk file (rotation/truncation) resets
+    the tracked offset to 0 for that path.
+    """
+
+    def __init__(self, *, carry_bytes: int = 256) -> None:
+        self._carry_bytes = carry_bytes
+        self._offsets: dict[Path, int] = {}
+        self._carry: dict[Path, str] = {}
+
+    def read_new(self, path: Path) -> str:
+        try:
+            size = path.stat().st_size
+        except OSError:
+            return self._carry.get(path, "")
+        offset = self._offsets.get(path, 0)
+        if size < offset:
+            offset = 0
+        try:
+            with open(path, "rb") as fh:
+                fh.seek(offset)
+                new_bytes = fh.read()
+        except OSError:
+            return self._carry.get(path, "")
+        self._offsets[path] = offset + len(new_bytes)
+        combined = self._carry.get(path, "") + new_bytes.decode("utf-8", errors="replace")
+        self._carry[path] = combined[-self._carry_bytes :] if combined else ""
+        return combined
+
+    def bytes_read(self, path: Path) -> int:
+        """Test/introspection helper: total bytes consumed from ``path``
+        across every ``read_new`` call so far."""
+        return self._offsets.get(path, 0)
 
 
 # ---------------------------------------------------------------------------
@@ -395,6 +500,227 @@ def alert(
 
 
 # ---------------------------------------------------------------------------
+# Injectable I/O surface for the schedule loop's phase handlers -- every
+# field defaults to the real OS-backed function; tests override individual
+# fields with fakes (process table, lock probe, spawner, log reader, alert
+# sink).
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True, slots=True)
+class SupervisorPorts:
+    find_node_pid: Callable[[], int | None]
+    resolve_intent_lock_holder: Callable[[Path], int | None]
+    intent_lock_free: Callable[[Path], bool]
+    count_intent_lock_holders: Callable[[Path], int]
+    terminate_after_recheck: Callable[..., None]
+    process_alive: Callable[[int], bool]
+    probe_open_intent_state: Callable[..., bool]
+    spawn: Callable[..., subprocess.Popen[bytes]]
+    read_log_new: Callable[[Path], str]
+    alert_sink: AlertSink
+    sigterm_poll_sleep: Callable[[float], None] = field(default=_time.sleep)
+
+
+def default_ports(*, alert_sink: AlertSink | None = None) -> SupervisorPorts:
+    log_reader = IncrementalLogReader()
+    return SupervisorPorts(
+        find_node_pid=lambda: find_pid_by_argv(NODE_ARGV_ANCHOR),
+        resolve_intent_lock_holder=resolve_lock_holder_pid,
+        intent_lock_free=intent_lock_is_free,
+        count_intent_lock_holders=count_lock_holders,
+        terminate_after_recheck=terminate_after_toctou_recheck,
+        process_alive=process_is_alive,
+        probe_open_intent_state=probe_open_intent,
+        spawn=spawn_node,
+        read_log_new=log_reader.read_new,
+        alert_sink=alert_sink if alert_sink is not None else resolve_alert_sink(),
+    )
+
+
+# ---------------------------------------------------------------------------
+# Phase handlers -- one function per Phase, each a thin composition of the
+# pure decision in ``trade_supervisor_core`` and the ports above.
+# ---------------------------------------------------------------------------
+
+
+def _do_stop_prior(
+    *, ports: SupervisorPorts, store_path: Path, tracked_pid: int | None
+) -> int | None:
+    """[B2/E5/L3] Returns the PID still outstanding (None if none)."""
+    lock_path = intent_lock_path(store_path)
+    discovered = tracked_pid if tracked_pid is not None else ports.find_node_pid()
+    holder = ports.resolve_intent_lock_holder(lock_path)
+    action = decide_stop_prior_action(discovered_node_pid=discovered, lock_holder_pid=holder)
+
+    if action is StopPriorAction.NOOP:
+        log_decision("stop_prior_noop")
+        return None
+
+    if action is StopPriorAction.REFUSE_ALERT:
+        log_decision("stop_prior_refused")
+        alert(
+            ports.alert_sink,
+            event="TRADE_SUPERVISOR_STOP_PRIOR_REFUSED",
+            severity="CRITICAL",
+            detail=AlertDetail.ADOPTION_REFUSED,
+        )
+        return discovered
+
+    # SIGTERM_TRACKED.
+    assert discovered is not None
+    try:
+        ports.terminate_after_recheck(discovered, intent_lock_path_=lock_path)
+    except StopPriorRaceRefused:
+        log_decision("stop_prior_race_refused", pid=discovered)
+        alert(
+            ports.alert_sink,
+            event="TRADE_SUPERVISOR_STOP_PRIOR_REFUSED",
+            severity="WARN",
+            detail=AlertDetail.STOP_PRIOR_RACE_REFUSED,
+        )
+        return None
+    log_decision("stop_prior_sigterm", pid=discovered)
+    for _ in range(_SIGTERM_POLL_ATTEMPTS):
+        if ports.intent_lock_free(lock_path):
+            break
+        ports.sigterm_poll_sleep(_SIGTERM_POLL_INTERVAL_S)
+    return None
+
+
+def _do_launch(
+    *,
+    ports: SupervisorPorts,
+    now: dt.datetime,
+    store_path: Path,
+    repo_root: Path,
+    node_bin: Path,
+    log_dir: Path,
+) -> tuple[int | None, Path | None]:
+    """[R6/B1] Returns ``(pid, log_path)`` of the spawned child, or
+    ``(None, None)`` on refusal."""
+    node_pid = ports.find_node_pid()
+    lock_path = intent_lock_path(store_path)
+    lock_free = ports.intent_lock_free(lock_path)
+
+    if lock_free and node_pid is not None:
+        # [E5 scope] A node PID was discovered despite a free flock -- never
+        # probe the store while ANY node PID is live; refuse conservatively.
+        log_decision("launch_refused_pid_present", pid=node_pid)
+        return None, None
+
+    open_intent = ports.probe_open_intent_state(store_path, node_pid=None) if lock_free else False
+    action = decide_launch_action(lock_free=lock_free, open_intent_detected=open_intent)
+
+    if action is LaunchAction.REFUSE_LOCK_HELD:
+        log_decision("launch_refused_lock_held")
+        alert(
+            ports.alert_sink,
+            event="TRADE_SUPERVISOR_LAUNCH_REFUSED",
+            severity="WARN",
+            detail=AlertDetail.LAUNCH_BLOCKED_LOCK_HELD,
+        )
+        return None, None
+
+    if action is LaunchAction.REFUSE_INTENT_OPEN:
+        log_decision("launch_refused_intent_open")
+        alert(
+            ports.alert_sink,
+            event="TRADE_SUPERVISOR_LAUNCH_REFUSED",
+            severity="CRITICAL",
+            detail=AlertDetail.INTENT_OPEN_BLOCKS_ARM,
+        )
+        return None, None
+
+    log_path = node_log_path(log_dir, now)
+    proc = ports.spawn(node_bin=node_bin, repo_root=repo_root, env=os.environ, log_path=log_path)
+    log_decision("launched", pid=proc.pid)
+    return proc.pid, log_path
+
+
+def _do_relaunch_check(
+    *,
+    ports: SupervisorPorts,
+    state: DaySchedulerState,
+    now: dt.datetime,
+    tracked_pid: int | None,
+    node_log: Path | None,
+    store_path: Path,
+    repo_root: Path,
+    node_bin: Path,
+    log_dir: Path,
+) -> tuple[int | None, Path | None, DaySchedulerState]:
+    """[E4] Poll the tracked child: mark readiness, do nothing while it is
+    still starting, or apply the bounded-relaunch decision once it exits."""
+    if tracked_pid is None or node_log is None:
+        return tracked_pid, node_log, state
+
+    log_text = ports.read_log_new(node_log)
+    holder = ports.resolve_intent_lock_holder(intent_lock_path(store_path))
+    if readiness_observed(
+        holds_intent_lock=(holder == tracked_pid),
+        permit_issued=PERMIT_ISSUED_MARKER in log_text,
+        strategy_subscribed=STRATEGY_SUBSCRIBED_MARKER in log_text,
+    ):
+        log_decision("node_ready", pid=tracked_pid)
+        return tracked_pid, node_log, record_readiness_observed(state, now)
+
+    if ports.process_alive(tracked_pid):
+        return tracked_pid, node_log, state
+
+    cause = classify_exit1_cause(log_text)
+    decision = decide_relaunch(
+        now=now,
+        attempts_so_far=state.relaunch_attempts,
+        last_attempt_at=state.last_relaunch_attempt_at,
+        readiness_was_observed=state.readiness_observed,
+        cause=cause,
+    )
+    if not decision.should_relaunch:
+        log_decision("relaunch_declined", reason=decision.reason)
+        return None, node_log, state
+
+    log_decision("relaunching", attempt=state.relaunch_attempts + 1)
+    new_log = node_log_path(log_dir, now)
+    proc = ports.spawn(node_bin=node_bin, repo_root=repo_root, env=os.environ, log_path=new_log)
+    return proc.pid, new_log, record_relaunch_attempt(state, now)
+
+
+def _do_self_check(
+    *,
+    ports: SupervisorPorts,
+    now: dt.datetime,
+    store_path: Path,
+    tracked_pid: int | None,
+    node_log: Path | None,
+) -> None:
+    """[B4/E3] One PASS/FAIL line, and an alert through the shared sink on
+    FAIL with a fixed enum ``detail``."""
+    lock_path = intent_lock_path(store_path)
+    holder = ports.resolve_intent_lock_holder(lock_path)
+    holder_count = ports.count_intent_lock_holders(lock_path)
+    log_text = ports.read_log_new(node_log) if node_log is not None else ""
+    child_alive = tracked_pid is not None and ports.process_alive(tracked_pid)
+
+    result = self_check(
+        child_alive=child_alive,
+        flock_holder_count=holder_count,
+        flock_held_by_tracked_pid=(tracked_pid is not None and holder == tracked_pid),
+        permit_issued=PERMIT_ISSUED_MARKER in log_text,
+        permit_expiry_valid=permit_expiry_valid(log_text, now_ns=int(now.timestamp() * 1e9)),
+        strategy_subscribed=STRATEGY_SUBSCRIBED_MARKER in log_text,
+    )
+    log_decision("self_check", result=result.value)
+    if result is not SelfCheckResult.PASS:
+        alert(
+            ports.alert_sink,
+            event="TRADE_SUPERVISOR_SELF_CHECK_FAIL",
+            severity="WARN",
+            detail=SELF_CHECK_ALERT_DETAIL[result],
+        )
+
+
+# ---------------------------------------------------------------------------
 # Console entry.
 # ---------------------------------------------------------------------------
 
@@ -442,11 +768,20 @@ def main(argv: list[str] | None = None) -> int:
         log_decision("configuration_error", missing=str(exc))
         return EXIT_CONFIG_ERROR
 
+    repo_root = Path(__file__).resolve().parents[3]
+    node_bin = repo_root / ".venv" / "bin" / NODE_CONSOLE_SCRIPT
+    log_dir = Path.home() / ".local" / "share" / "breezy" / "logs"
+
     lock_path = supervisor_lock_path(store_path)
     try:
         with hold_supervisor_lock(lock_path):
             log_decision("supervisor_started")
-            _run_forever(store_path=store_path)
+            _run_forever(
+                store_path=store_path,
+                repo_root=repo_root,
+                node_bin=node_bin,
+                log_dir=log_dir,
+            )
     except SupervisorLockHeld:
         log_decision("second_supervisor_refused")
         alert(
@@ -462,17 +797,109 @@ def main(argv: list[str] | None = None) -> int:
     return EXIT_OK
 
 
-def _run_forever(*, store_path: Path) -> None:  # pragma: no cover - long-running I/O loop
-    """The actual daily schedule loop.
+def _default_clock() -> dt.datetime:
+    return dt.datetime.now(dt.UTC)
 
-    Deliberately thin: every decision it makes is delegated to the pure
-    functions in ``trade_supervisor_core`` plus the I/O helpers above, both
-    already covered directly by unit tests with fakes. This function itself
-    is process/time-bound (real ``time.sleep`` against real wall clock) and
-    is exercised operationally, not in the unit-test suite -- see the
-    module docstring and the coordinator invocation in the task report.
+
+def _run_forever(
+    *,
+    store_path: Path,
+    repo_root: Path,
+    node_bin: Path,
+    log_dir: Path,
+    clock: Callable[[], dt.datetime] = _default_clock,
+    sleep: Callable[[float], None] = _time.sleep,
+    ports: SupervisorPorts | None = None,
+    max_iterations: int | None = None,
+) -> None:
+    """The daily schedule loop.
+
+    Every decision is delegated to :func:`next_due`
+    (``trade_supervisor_core``) and the ``_do_*`` phase handlers above --
+    this function only sequences them: compute what is due, run it,
+    CONTAIN any exception per phase (one failing phase must never end the
+    supervisor), and sleep in bounded (<=60 s) chunks otherwise so an early
+    wakeup or a backwards clock step is re-evaluated on the next pass
+    rather than slept through. A ``KeyboardInterrupt`` (Ctrl-C / SIGINT)
+    ends the loop cleanly; it never touches the node, which runs in its
+    own session (``start_new_session=True`` in :func:`spawn_node``) and is
+    never signalled by anything other than :func:`terminate_after_toctou_recheck`.
+
+    ``clock``/``sleep``/``ports``/``max_iterations`` are injection points
+    for tests (a fake clock, a fake sleep that advances it, fakes for every
+    port). Production callers (``main``) use the real defaults and never
+    set ``max_iterations``.
     """
-    import time
+    active_ports = ports if ports is not None else default_ports()
+    state = initial_scheduler_state(clock().date())
+    tracked_pid: int | None = None
+    node_log: Path | None = None
+    iterations = 0
 
-    while True:
-        time.sleep(30)
+    try:
+        while max_iterations is None or iterations < max_iterations:
+            iterations += 1
+            now = clock()
+            phase, _fire_at = next_due(now, state)
+
+            if phase is Phase.NONE:
+                sleep(_SCHEDULE_POLL_INTERVAL_S)
+                continue
+
+            try:
+                if phase is Phase.STOP_PRIOR:
+                    tracked_pid = _do_stop_prior(
+                        ports=active_ports, store_path=store_path, tracked_pid=tracked_pid
+                    )
+                    state = mark_phase_fired(state, phase, now)
+                elif phase is Phase.LAUNCH:
+                    tracked_pid, node_log = _do_launch(
+                        ports=active_ports,
+                        now=now,
+                        store_path=store_path,
+                        repo_root=repo_root,
+                        node_bin=node_bin,
+                        log_dir=log_dir,
+                    )
+                    state = mark_phase_fired(state, phase, now)
+                elif phase is Phase.RELAUNCH_CHECK:
+                    tracked_pid, node_log, state = _do_relaunch_check(
+                        ports=active_ports,
+                        state=state,
+                        now=now,
+                        tracked_pid=tracked_pid,
+                        node_log=node_log,
+                        store_path=store_path,
+                        repo_root=repo_root,
+                        node_bin=node_bin,
+                        log_dir=log_dir,
+                    )
+                else:
+                    _do_self_check(
+                        ports=active_ports,
+                        now=now,
+                        store_path=store_path,
+                        tracked_pid=tracked_pid,
+                        node_log=node_log,
+                    )
+                    state = mark_phase_fired(state, phase, now)
+            except Exception as exc:  # noqa: BLE001 -- deliberate: one failing
+                # phase must never end the supervisor (see the coordinator's
+                # loop-wiring requirement). Named by TYPE only below, never
+                # the exception message -- see the module's value-free stance.
+                log_decision(
+                    "phase_exception_contained",
+                    phase=phase.value,
+                    error_type=type(exc).__name__,
+                )
+                alert(
+                    active_ports.alert_sink,
+                    event="TRADE_SUPERVISOR_PHASE_EXCEPTION",
+                    severity="CRITICAL",
+                    detail=AlertDetail.PHASE_EXCEPTION_CONTAINED,
+                )
+                if phase is not Phase.RELAUNCH_CHECK:
+                    state = mark_phase_fired(state, phase, now)
+    except KeyboardInterrupt:
+        log_decision("supervisor_interrupted")
+        return

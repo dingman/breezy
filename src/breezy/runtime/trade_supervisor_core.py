@@ -19,7 +19,8 @@ file's source, not merely asserted here.)
 from __future__ import annotations
 
 import datetime as dt
-from dataclasses import dataclass
+import re
+from dataclasses import dataclass, replace
 from enum import Enum
 from typing import Final
 
@@ -31,6 +32,16 @@ STOP_PRIOR_UTC: Final[dt.time] = dt.time(16, 40)
 LAUNCH_UTC: Final[dt.time] = dt.time(16, 50)
 SELF_CHECK_UTC: Final[dt.time] = dt.time(17, 5)
 RELAUNCH_CUTOFF_UTC: Final[dt.time] = dt.time(17, 0)
+
+#: The LAUNCH/RELAUNCH_CHECK window closes at the same instant the relaunch
+#: budget does -- one shared window, not two.
+LAUNCH_WINDOW_END_UTC: Final[dt.time] = RELAUNCH_CUTOFF_UTC
+
+#: SELF_CHECK's own catch-up window is narrow and deliberately does NOT
+#: extend to the next STOP_PRIOR: a supervisor restarting at 17:10 UTC does
+#: nothing until tomorrow's 16:40 rather than running a stale, late
+#: self-check (restart-scenario table, coordinator round 2).
+SELF_CHECK_WINDOW_END_UTC: Final[dt.time] = dt.time(17, 10)
 
 MAX_RELAUNCH_ATTEMPTS: Final[int] = 2
 MIN_RELAUNCH_GAP: Final[dt.timedelta] = dt.timedelta(minutes=3)
@@ -74,12 +85,14 @@ class AlertDetail(str, Enum):
 
     INTENT_OPEN_BLOCKS_ARM = "intent_open_blocks_arm"
     ADOPTION_REFUSED = "adoption_refused"
+    STOP_PRIOR_RACE_REFUSED = "stop_prior_race_refused"
     LAUNCH_BLOCKED_LOCK_HELD = "launch_blocked_lock_held"
     SECOND_SUPERVISOR_REFUSED = "second_supervisor_refused"
     SELF_CHECK_FAIL_NOT_READY = "self_check_fail_not_ready"
     SELF_CHECK_FAIL_SHADOW_MODE_NO_PERMIT = "self_check_fail_shadow_mode_no_permit"
     SELF_CHECK_FAIL_MULTIPLE_FLOCK_HOLDERS = "self_check_fail_multiple_flock_holders"
     SELF_CHECK_FAIL_CHILD_EXITED = "self_check_fail_child_exited"
+    PHASE_EXCEPTION_CONTAINED = "phase_exception_contained"
 
 
 class StopPriorAction(str, Enum):
@@ -266,3 +279,153 @@ def self_check(
     if not (permit_issued and permit_expiry_valid):
         return SelfCheckResult.FAIL_SHADOW_MODE_NO_PERMIT
     return SelfCheckResult.PASS
+
+
+_PERMIT_ISSUED_RE: Final[re.Pattern[str]] = re.compile(
+    r"live-trading permit issued issued_at_ns=(\d+) expires_at_ns=(\d+) ttl_s=(\d+)"
+)
+
+
+def parse_permit_expiry_ns(log_text: str) -> int | None:
+    """Extract ``expires_at_ns`` from the permit-issued marker line, or
+    ``None`` if the line is absent. Pure string parsing -- no I/O."""
+    match = _PERMIT_ISSUED_RE.search(log_text)
+    if match is None:
+        return None
+    return int(match.group(2))
+
+
+def permit_expiry_valid(log_text: str, *, now_ns: int) -> bool:
+    """[B4] "permit-issued line present with expiry beyond now"."""
+    expiry = parse_permit_expiry_ns(log_text)
+    return expiry is not None and expiry > now_ns
+
+
+# ---------------------------------------------------------------------------
+# Pure daily scheduler.
+#
+# `trade_supervisor._run_forever` is the I/O shell that calls `next_due` in
+# a loop and dispatches to real phase handlers; this section owns none of
+# that I/O and is fully unit-testable over plain datetimes.
+# ---------------------------------------------------------------------------
+
+
+class Phase(str, Enum):
+    """Which of the daily schedule's actions is due right now."""
+
+    NONE = "none"
+    STOP_PRIOR = "stop_prior"
+    LAUNCH = "launch"
+    RELAUNCH_CHECK = "relaunch_check"
+    SELF_CHECK = "self_check"
+
+
+@dataclass(frozen=True, slots=True)
+class DaySchedulerState:
+    """Per-trading-day "phase already fired" bookkeeping.
+
+    A fresh instance is produced whenever the UTC calendar date changes --
+    :func:`next_due` and the ``record_*``/``mark_*`` functions all detect
+    the rollover themselves, so the caller never has to remember to reset
+    it. Every phase fires at most once per day.
+    """
+
+    day: dt.date
+    stop_prior_done: bool = False
+    launch_done: bool = False
+    self_check_done: bool = False
+    readiness_observed: bool = False
+    relaunch_attempts: int = 0
+    last_relaunch_attempt_at: dt.datetime | None = None
+
+
+def initial_scheduler_state(day: dt.date) -> DaySchedulerState:
+    return DaySchedulerState(day=day)
+
+
+def _for_day(state: DaySchedulerState, day: dt.date) -> DaySchedulerState:
+    """Return ``state`` unchanged if it already belongs to ``day``,
+    otherwise a fresh state for ``day`` -- the day-rollover reset, applied
+    consistently by every function in this section."""
+    return state if state.day == day else initial_scheduler_state(day)
+
+
+def _at(day: dt.date, time_: dt.time) -> dt.datetime:
+    return dt.datetime.combine(day, time_, tzinfo=dt.UTC)
+
+
+def next_due(now_utc: dt.datetime, state: DaySchedulerState) -> tuple[Phase, dt.datetime]:
+    """The pure scheduler query: which single phase is due right now, and
+    when it was (or will be) canonically scheduled for today.
+
+    Read-only: never mutates ``state``, and tolerates ``state`` belonging
+    to a stale (prior) day by treating it as if every phase were undone
+    for today -- the caller supplies whatever state it has; a day rollover
+    is handled here, not by the caller. When nothing is due,
+    ``fire_at_utc`` names the NEXT scheduled event (today's remaining
+    phase, or tomorrow's STOP_PRIOR once every phase for today is done).
+    """
+    today = now_utc.date()
+    effective = _for_day(state, today)
+    t = now_utc.time()
+
+    if not effective.stop_prior_done and STOP_PRIOR_UTC <= t < LAUNCH_UTC:
+        return Phase.STOP_PRIOR, _at(today, STOP_PRIOR_UTC)
+
+    if not effective.launch_done and LAUNCH_UTC <= t < LAUNCH_WINDOW_END_UTC:
+        return Phase.LAUNCH, _at(today, LAUNCH_UTC)
+
+    if (
+        effective.launch_done
+        and not effective.readiness_observed
+        and LAUNCH_UTC <= t < LAUNCH_WINDOW_END_UTC
+    ):
+        return Phase.RELAUNCH_CHECK, _at(today, LAUNCH_UTC)
+
+    if not effective.self_check_done and SELF_CHECK_UTC <= t < SELF_CHECK_WINDOW_END_UTC:
+        return Phase.SELF_CHECK, _at(today, SELF_CHECK_UTC)
+
+    return Phase.NONE, _next_scheduled_event(today, effective, t)
+
+
+def _next_scheduled_event(today: dt.date, effective: DaySchedulerState, t: dt.time) -> dt.datetime:
+    """Informational only (never consulted for a DUE-NOW decision, which is
+    entirely governed by the branches above): the next phase time a caller
+    might want to log or sleep towards."""
+    if not effective.stop_prior_done and t < STOP_PRIOR_UTC:
+        return _at(today, STOP_PRIOR_UTC)
+    if not effective.launch_done and t < LAUNCH_UTC:
+        return _at(today, LAUNCH_UTC)
+    if not effective.self_check_done and t < SELF_CHECK_UTC:
+        return _at(today, SELF_CHECK_UTC)
+    return _at(today + dt.timedelta(days=1), STOP_PRIOR_UTC)
+
+
+def mark_phase_fired(
+    state: DaySchedulerState, phase: Phase, now_utc: dt.datetime
+) -> DaySchedulerState:
+    """Record that ``phase`` fired for today. ``RELAUNCH_CHECK`` and
+    ``NONE`` never set a "done" flag -- the relaunch window stays open
+    until readiness is observed or the window itself closes."""
+    effective = _for_day(state, now_utc.date())
+    if phase is Phase.STOP_PRIOR:
+        return replace(effective, stop_prior_done=True)
+    if phase is Phase.LAUNCH:
+        return replace(effective, launch_done=True)
+    if phase is Phase.SELF_CHECK:
+        return replace(effective, self_check_done=True)
+    return effective
+
+
+def record_relaunch_attempt(state: DaySchedulerState, now_utc: dt.datetime) -> DaySchedulerState:
+    effective = _for_day(state, now_utc.date())
+    return replace(
+        effective,
+        relaunch_attempts=effective.relaunch_attempts + 1,
+        last_relaunch_attempt_at=now_utc,
+    )
+
+
+def record_readiness_observed(state: DaySchedulerState, now_utc: dt.datetime) -> DaySchedulerState:
+    effective = _for_day(state, now_utc.date())
+    return replace(effective, readiness_observed=True)
