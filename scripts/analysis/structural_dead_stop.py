@@ -37,7 +37,10 @@ from __future__ import annotations
 
 import argparse
 import datetime as dt
+import json
+import os
 import sys
+import tempfile
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
@@ -58,13 +61,15 @@ from ma_prelock_winner_ask_study import (
 )
 from settlement_alignment_study import load_sites
 
+from breezy.persistence.family_manifest import FamilyManifestError, load_family_manifest
+
 __all__ = [
     "MIN_STRUCTURAL_DEAD_STATION_DAYS",
     "StructuralDeadVerdict",
-    "structural_dead",
-    "covered_listed_station_days",
     "count_covered_listed_station_days_from_catalog",
+    "covered_listed_station_days",
     "main",
+    "structural_dead",
 ]
 
 #: Reused verbatim from `ma_prelock_winner_ask_study` (SS2/SS3 K-A) -- this
@@ -203,15 +208,120 @@ def _parse_args(argv: Sequence[str] | None) -> argparse.Namespace:
         help="quote-tape Parquet catalog root (mirrors --quote-catalog on "
         "ma_prelock_winner_ask_study.py / mb_current_rung_edge_study.py)",
     )
+    parser.add_argument(
+        "--family-manifest",
+        default=None,
+        help="Registered family manifest (`load_family_manifest`, no allow_draft) "
+        "supplying fetch_start=d0_climate_day and cities=stations. Omit to keep "
+        "the study defaults (ASOS_FETCH_START, DENSE_STATIONS) unchanged.",
+    )
+    parser.add_argument(
+        "--output",
+        default=None,
+        help="Write the six-key JSON (count, depth_root_present, fetch_end, "
+        "fetch_start, manifest_sha256, stations) here instead of the human print.",
+    )
     return parser.parse_args(argv)
+
+
+def _write_output_json(
+    path: Path,
+    *,
+    count: int,
+    depth_root_present: bool,
+    fetch_end: dt.date,
+    fetch_start: dt.date,
+    manifest_sha256: str,
+    stations: Sequence[str],
+) -> None:
+    """Atomic (tmp + rename) write of the six-key `--output` JSON.
+
+    Mirrors the `tempfile.mkstemp` + `os.replace` idiom already used by
+    `scored_trial_store.write_scored_trials` -- a partial write is never
+    visible at `path`.
+    """
+    payload = {
+        "count": count,
+        "depth_root_present": depth_root_present,
+        "fetch_end": fetch_end.isoformat(),
+        "fetch_start": fetch_start.isoformat(),
+        "manifest_sha256": manifest_sha256,
+        "stations": list(stations),
+    }
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp_name = tempfile.mkstemp(dir=path.parent, prefix=".structural_dead_stop_", suffix=".tmp")
+    tmp_path = Path(tmp_name)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            json.dump(payload, handle, indent=2, sort_keys=True)
+        os.replace(tmp_path, path)
+    except BaseException:
+        tmp_path.unlink(missing_ok=True)
+        raise
 
 
 def main(argv: Sequence[str] | None = None) -> int:
     args = _parse_args(sys.argv[1:] if argv is None else argv)
-    count = count_covered_listed_station_days_from_catalog(
-        catalog_root=Path(args.catalog_root).expanduser()
-    )
-    print(f"covered-listed station-days: {count}")
+
+    if args.family_manifest is not None:
+        manifest_path = Path(args.family_manifest).expanduser()
+        try:
+            manifest = load_family_manifest(manifest_path)
+        except (FamilyManifestError, OSError):
+            print(
+                "structural-dead-stop: refusing --family-manifest (missing, unreadable, "
+                "or not REGISTERED)",
+                file=sys.stderr,
+            )
+            return 1
+        fetch_start = dt.date.fromisoformat(manifest.d0_climate_day)
+        cities: Sequence[str] = manifest.stations
+        manifest_sha256 = manifest.manifest_sha256
+    else:
+        fetch_start = ASOS_FETCH_START
+        cities = DENSE_STATIONS
+        manifest_sha256 = ""
+
+    catalog_root = Path(args.catalog_root).expanduser()
+    if not catalog_root.is_dir():
+        print(
+            f"structural-dead-stop: catalog root not found: {catalog_root}",
+            file=sys.stderr,
+        )
+        return 1
+
+    depth_root = catalog_root / "data" / "order_book_depths"
+    depth_root_present = depth_root.is_dir()
+    if depth_root_present:
+        count = count_covered_listed_station_days_from_catalog(
+            catalog_root=catalog_root,
+            cities=cities,
+            fetch_start=fetch_start,
+            fetch_end=ASOS_FETCH_END,
+        )
+    else:
+        # Conservative (covered_listed_station_days docstring, :136-151): an
+        # absent depth root only DELAYS a KILL (count stays under the floor),
+        # it never manufactures one -- so this is exit 0, not a fault.
+        count = 0
+
+    if args.output is not None:
+        output_path = Path(args.output).expanduser()
+        try:
+            _write_output_json(
+                output_path,
+                count=count,
+                depth_root_present=depth_root_present,
+                fetch_end=ASOS_FETCH_END,
+                fetch_start=fetch_start,
+                manifest_sha256=manifest_sha256,
+                stations=cities,
+            )
+        except OSError as exc:
+            print(f"structural-dead-stop: failed to write --output: {exc}", file=sys.stderr)
+            return 1
+    else:
+        print(f"covered-listed station-days: {count}")
     return 0
 
 
