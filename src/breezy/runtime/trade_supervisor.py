@@ -78,6 +78,7 @@ from breezy.runtime.trade_supervisor_core import (
     readiness_observed,
     record_readiness_observed,
     record_relaunch_attempt,
+    record_strategy_subscribed_seen,
     self_check,
 )
 
@@ -832,11 +833,17 @@ def _do_relaunch_check(
         return tracked_pid, node_log, state
 
     log_text = ports.read_log_new(node_log)
+    # [fix 2026-09-05] Latch the subscribed marker into state THE MOMENT this
+    # read sees it -- this poll may be the last one whose delta still holds
+    # it before later polls (waiting on a permit that never comes) drain the
+    # shared reader's offset past it.
+    if STRATEGY_SUBSCRIBED_MARKER in log_text:
+        state = record_strategy_subscribed_seen(state, now)
     holder = ports.resolve_intent_lock_holder(intent_lock_path(store_path))
     if readiness_observed(
         holds_intent_lock=(holder == tracked_pid),
         permit_issued=PERMIT_ISSUED_MARKER in log_text,
-        strategy_subscribed=STRATEGY_SUBSCRIBED_MARKER in log_text,
+        strategy_subscribed=state.strategy_subscribed_seen,
     ):
         log_decision("node_ready", pid=tracked_pid)
         return tracked_pid, node_log, record_readiness_observed(state, now)
@@ -876,13 +883,26 @@ def _do_self_check(
     log_dir: Path,
     tracked_pid: int | None,
     node_log: Path | None,
-) -> tuple[int | None, Path | None]:
+    state: DaySchedulerState | None = None,
+) -> tuple[int | None, Path | None, DaySchedulerState | None]:
     """[B4/E3/D2] One PASS/FAIL line, and an alert through the shared sink
     on FAIL with a fixed enum ``detail``. Adopts a live verified flock
     holder FIRST when nothing was tracked -- a supervisor that restarted
     after 17:00 with a healthy node already running must not report
     ``FAIL_CHILD_EXITED`` for it. Returns the (possibly adopted)
-    ``(tracked_pid, node_log)`` for the caller to keep carrying forward."""
+    ``(tracked_pid, node_log, state)`` for the caller to keep carrying
+    forward.
+
+    ``state`` is optional (defaults to ``None``) so a caller with no
+    scheduler state to thread through (e.g. a direct unit test of this
+    handler alone) still gets the old log-only ``strategy_subscribed``
+    behaviour. When supplied, [fix 2026-09-05] ``strategy_subscribed`` is
+    the sticky ``state.strategy_subscribed_seen`` latch OR'd with this
+    call's own live read -- RELAUNCH_CHECK's polling shares ONE
+    offset-draining ``IncrementalLogReader`` with this handler, so by the
+    time SELF_CHECK runs, the marker text the strategy emitted once at boot
+    may already be outside every reader delta; the latch is what makes that
+    survive [see ``DaySchedulerState.strategy_subscribed_seen``]."""
     lock_path = intent_lock_path(store_path)
     if tracked_pid is None:
         adoption = _attempt_adoption(ports=ports, lock_path=lock_path, log_dir=log_dir)
@@ -895,13 +915,21 @@ def _do_self_check(
     log_text = ports.read_log_new(node_log) if node_log is not None else ""
     child_alive = tracked_pid is not None and ports.process_alive(tracked_pid)
 
+    strategy_subscribed_live = STRATEGY_SUBSCRIBED_MARKER in log_text
+    if state is not None:
+        if strategy_subscribed_live and not state.strategy_subscribed_seen:
+            state = record_strategy_subscribed_seen(state, now)
+        strategy_subscribed = state.strategy_subscribed_seen
+    else:
+        strategy_subscribed = strategy_subscribed_live
+
     result = self_check(
         child_alive=child_alive,
         flock_holder_count=holder_count,
         flock_held_by_tracked_pid=(tracked_pid is not None and holder == tracked_pid),
         permit_issued=PERMIT_ISSUED_MARKER in log_text,
         permit_expiry_valid=permit_expiry_valid(log_text, now_ns=int(now.timestamp() * 1e9)),
-        strategy_subscribed=STRATEGY_SUBSCRIBED_MARKER in log_text,
+        strategy_subscribed=strategy_subscribed,
         log_available=node_log is not None,
     )
     log_decision("self_check", result=result.value)
@@ -912,7 +940,7 @@ def _do_self_check(
             severity="WARN",
             detail=SELF_CHECK_ALERT_DETAIL[result],
         )
-    return tracked_pid, node_log
+    return tracked_pid, node_log, state
 
 
 # ---------------------------------------------------------------------------
@@ -1080,14 +1108,17 @@ def _run_forever(
                         log_dir=log_dir,
                     )
                 else:
-                    tracked_pid, node_log = _do_self_check(
+                    tracked_pid, node_log, new_state = _do_self_check(
                         ports=active_ports,
                         now=now,
                         store_path=store_path,
                         log_dir=log_dir,
                         tracked_pid=tracked_pid,
                         node_log=node_log,
+                        state=state,
                     )
+                    if new_state is not None:
+                        state = new_state
                     state = mark_phase_fired(state, phase, now)
             except Exception as exc:  # noqa: BLE001 -- deliberate: one failing
                 # phase must never end the supervisor (see the coordinator's

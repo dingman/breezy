@@ -354,6 +354,16 @@ class DaySchedulerState:
     readiness_observed: bool = False
     relaunch_attempts: int = 0
     last_relaunch_attempt_at: dt.datetime | None = None
+    #: [fix 2026-09-05] Sticky latch: once ANY log read (RELAUNCH_CHECK's
+    #: polling reads or SELF_CHECK's own) has observed
+    #: ``STRATEGY_SUBSCRIBED_MARKER``, that fact is recorded here and never
+    #: cleared for the rest of the day. The strategy subscribes once, at
+    #: boot; a later read of the SAME shared, offset-draining
+    #: ``IncrementalLogReader`` seeing a delta that no longer contains the
+    #: marker text (because RELAUNCH_CHECK's polling already consumed past
+    #: it while waiting on a permit that never came) must not be treated as
+    #: "never subscribed".
+    strategy_subscribed_seen: bool = False
 
 
 def initial_scheduler_state(day: dt.date) -> DaySchedulerState:
@@ -446,3 +456,18 @@ def record_relaunch_attempt(state: DaySchedulerState, now_utc: dt.datetime) -> D
 def record_readiness_observed(state: DaySchedulerState, now_utc: dt.datetime) -> DaySchedulerState:
     effective = _for_day(state, now_utc.date())
     return replace(effective, readiness_observed=True)
+
+
+def record_strategy_subscribed_seen(
+    state: DaySchedulerState, now_utc: dt.datetime
+) -> DaySchedulerState:
+    """[fix 2026-09-05] Latch ``strategy_subscribed_seen`` -- called by the
+    I/O shell the moment ANY log read observes ``STRATEGY_SUBSCRIBED_MARKER``,
+    so the fact survives a LATER read of the same shared, offset-draining
+    reader whose delta no longer contains that text. Idempotent: a caller
+    that has already latched today's marker gets the same state back
+    unchanged."""
+    effective = _for_day(state, now_utc.date())
+    if effective.strategy_subscribed_seen:
+        return effective
+    return replace(effective, strategy_subscribed_seen=True)

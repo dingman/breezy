@@ -36,6 +36,7 @@ from breezy.runtime.trade_supervisor import (
     StopPriorRaceRefused,
     SupervisorPorts,
     _do_launch,
+    _do_relaunch_check,
     _do_self_check,
     _do_stop_prior,
     _run_forever,
@@ -84,6 +85,7 @@ from breezy.runtime.trade_supervisor_core import (
     readiness_observed,
     record_readiness_observed,
     record_relaunch_attempt,
+    record_strategy_subscribed_seen,
     self_check,
 )
 
@@ -1437,6 +1439,106 @@ class TestPhaseHandlersDirect:
             node_log=tmp_path / "n.log",
         )
         assert sink.payloads == []
+
+
+# ===========================================================================
+# Fix 2026-09-05 (traced live, both log files): `_do_self_check` computed
+# `strategy_subscribed` from `ports.read_log_new(node_log)` on the SAME
+# shared, offset-draining `IncrementalLogReader` that `_do_relaunch_check`
+# already drains while polling `readiness_observed` through the launch
+# window. `readiness_observed` needs `permit_issued`, which is legitimately
+# absent at boot, so the poller kept draining the offset past the
+# `CurrentRungHoldStrategy subscribed` lines; the reader's 256-byte carry
+# cannot hold them across the node's later, much larger, order-book-tick
+# volume. By SELF_CHECK time the shared reader's own delta held only later
+# noise, so `self_check` returned FAIL_NODE_NOT_READY for a subscription
+# that genuinely happened -- a false negative from two call sites sharing
+# one offset-consuming reader.
+# ===========================================================================
+
+
+class TestStickyStrategySubscribedAcrossSharedReader:
+    def test_self_check_does_not_false_fail_after_relaunch_polls_drain_the_marker(
+        self, tmp_path
+    ):
+        from breezy.runtime.trade_supervisor_core import STRATEGY_SUBSCRIBED_MARKER
+
+        node_log = tmp_path / "node.log"
+        # The strategy subscribes exactly once, early, at boot.
+        node_log.write_text(
+            "CurrentRungHoldStrategy subscribed instrument=X\n"
+            "CurrentRungHoldStrategy subscribed instrument=Y\n"
+        )
+        # ONE shared reader -- exactly like `default_ports()` wires it: both
+        # `_do_relaunch_check` and `_do_self_check` read through the same
+        # instance, so an earlier read's offset advance is visible to a
+        # later read from either call site.
+        reader = IncrementalLogReader()
+        sink = _RecordingAlertSink()
+        store_path = tmp_path / "state" / "store.sqlite3"
+        tracked_pid = 9001
+        ports = _make_ports(
+            resolve_intent_lock_holder=lambda _p: tracked_pid,
+            count_intent_lock_holders=lambda _p: 1,
+            process_alive=lambda _pid: True,
+            read_log_new=reader.read_new,
+            alert_sink=sink,
+        )
+        state = initial_scheduler_state(_DAY)
+        # >256 bytes of later, unrelated order-book-tick noise per poll --
+        # bigger than the reader's carry, and permit_issued never fires, so
+        # `readiness_observed` never latches via the pre-fix code path and
+        # RELAUNCH_CHECK keeps polling every pass through the window.
+        noise = "order book tick " + ("x" * 300) + "\n"
+        for i in range(5):
+            tracked_pid, node_log, state = _do_relaunch_check(
+                ports=ports,
+                state=state,
+                now=_utc(16, 50, i),
+                tracked_pid=tracked_pid,
+                node_log=node_log,
+                store_path=store_path,
+                repo_root=tmp_path,
+                node_bin=tmp_path / "node_bin",
+                log_dir=tmp_path / "logs",
+            )
+            with node_log.open("a") as fh:
+                fh.write(noise * 3)
+
+        # Sanity: permit was never issued, so readiness genuinely never
+        # latched -- this fix must not paper over that real gap.
+        assert state.readiness_observed is False
+
+        # By now the shared reader's own next delta holds only noise --
+        # the marker text is not present in any single read any more.
+        assert STRATEGY_SUBSCRIBED_MARKER not in reader.read_new(node_log)
+
+        _, _, state = _do_self_check(
+            ports=ports,
+            now=_utc(17, 5),
+            store_path=store_path,
+            log_dir=tmp_path / "logs",
+            tracked_pid=tracked_pid,
+            node_log=node_log,
+            state=state,
+        )
+
+        # The real, distinct failure (no permit was ever issued) must still
+        # surface -- this fix narrows the false negative, it does not mask
+        # a genuine one.
+        assert sink.payloads[-1].detail == (
+            AlertDetail.SELF_CHECK_FAIL_SHADOW_MODE_NO_PERMIT.value
+        )
+        assert sink.payloads[-1].detail != AlertDetail.SELF_CHECK_FAIL_NOT_READY.value
+
+    def test_record_strategy_subscribed_seen_is_sticky_and_idempotent(self):
+        state = initial_scheduler_state(_DAY)
+        assert state.strategy_subscribed_seen is False
+        state = record_strategy_subscribed_seen(state, _utc(16, 50, 5))
+        assert state.strategy_subscribed_seen is True
+        # Idempotent -- a later call the same day changes nothing else.
+        again = record_strategy_subscribed_seen(state, _utc(16, 55))
+        assert again == state
 
 
 # ===========================================================================
