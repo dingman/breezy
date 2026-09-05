@@ -1147,3 +1147,30 @@ this lesson, not a venue event. When recovering, the seven enablement values
 are recovered in memory from the operator's own prior launch and never
 written to disk ([[L-22]] on unforgeable exclusion applies to the relaunch
 path too). Related: [[L-5]], [[L-23]].
+
+## L-27 — A test that configures a process-global logger can write into the production audit log (2026-09-05)
+
+**What happened.** `breezy-trade-supervisor` gained a file handler in `main()`
+(`configure_supervisor_logging(log_dir)`, `log_dir` defaulting to
+`Path.home()/.local/share/breezy/logs`). Its unit suite, run four times
+through the no-egress gate, wrote ~15 KB of fake-PID decision lines
+(`launched pid=9001`, `self_check result=PASS_ADOPTED_LOG_UNKNOWN`) into the
+REAL `breezy-trade-supervisor.log` — the audit file the coordinator's monitor
+watches for the 16:40/16:50/17:05 UTC decisions — timestamped 00:39:48Z,
+seconds before the real `supervisor_started` at 00:40:18Z. The sandbox blocks
+network egress, not writes to `$HOME`. Lines in that file earlier than
+2026-09-05T00:40:18Z `supervisor_started` are test pollution, not history.
+
+**The rule.** A test suite for any module that opens a file, socket, lock, or
+logger handler from a HOME- or config-derived default path runs under an
+autouse fixture that redirects `Path.home()` (or injects the path) to
+`tmp_path`, and a guard test asserts the real path's size/mtime is unchanged
+after the module's tests. Process-global sinks (module loggers, `logging`
+handlers, singletons) are reset between tests, because one test that touches
+the real path makes every later test's output land there too.
+
+**How to apply.** Before accepting "the suite is green" for a module with a
+`main()` or a default path, `stat` the production artefacts that path could
+name before and after the run. Treat a production log line whose timestamp
+precedes the process's own start line as a contamination signal. Related:
+[[L-20]], [[L-24]], [[L-26]].
