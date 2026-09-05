@@ -933,7 +933,7 @@ def resolve_store_path(env: Mapping[str, str]) -> Path:
     return Path(raw)
 
 
-def main(argv: list[str] | None = None) -> int:
+def main(argv: list[str] | None = None, *, log_dir: Path | None = None) -> int:
     """Console-script entrypoint for ``breezy-trade-supervisor``.
 
     Requires the distinct argv token :data:`SUPERVISOR_ARGV_TOKEN` as the
@@ -949,6 +949,14 @@ def main(argv: list[str] | None = None) -> int:
     function only wires the real I/O helpers above together for the
     long-running daily loop -- the decisions themselves are exercised
     directly, with fakes, in the pure-core tests.
+
+    ``log_dir`` is an optional explicit override of the log directory,
+    resolved to ``Path.home() / ".local" / "share" / "breezy" / "logs"``
+    at CALL time (never import time) only when omitted. Production callers
+    (the real console script) never pass it, so behaviour there is
+    unchanged; tests can inject an explicit directory instead of relying on
+    every caller remembering to isolate ``Path.home()`` first -- the gap
+    that once let a test write straight into the real supervisor log.
     """
     args = sys.argv[1:] if argv is None else argv
     if not args or args[0] != SUPERVISOR_ARGV_TOKEN:
@@ -963,7 +971,8 @@ def main(argv: list[str] | None = None) -> int:
 
     repo_root = Path(__file__).resolve().parents[3]
     node_bin = repo_root / ".venv" / "bin" / NODE_CONSOLE_SCRIPT
-    log_dir = Path.home() / ".local" / "share" / "breezy" / "logs"
+    if log_dir is None:
+        log_dir = Path.home() / ".local" / "share" / "breezy" / "logs"
     configure_supervisor_logging(log_dir)
 
     try:

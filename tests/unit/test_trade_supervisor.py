@@ -92,6 +92,74 @@ from breezy.runtime.trade_supervisor_core import (
 REPO_ROOT = Path(__file__).resolve().parents[2]
 
 # ---------------------------------------------------------------------------
+# Production observation: a test in this module (`main()` called with no
+# HOME isolation) once wrote straight into the REAL
+# ``~/.local/share/breezy/logs/breezy-trade-supervisor.log`` -- then every
+# later test's `log_decision` call kept landing there too, because the
+# module logger is process-global and nothing tore the leaked FileHandler
+# down. These two autouse fixtures make that structurally impossible for
+# every test in this module, and the module-scoped one fails loudly if a
+# future test ever manages it anyway.
+#
+# ``_REAL_HOME``/``_REAL_SUPERVISOR_LOG_PATH`` are captured at IMPORT time,
+# before any fixture runs and before ``Path.home`` is ever monkeypatched --
+# they are read-only reference points, never a target this suite writes to.
+# ---------------------------------------------------------------------------
+
+_REAL_HOME = Path.home()
+_REAL_SUPERVISOR_LOG_DIR = _REAL_HOME / ".local" / "share" / "breezy" / "logs"
+
+
+def _stat_or_none(path: Path) -> tuple[int, float] | None:
+    try:
+        stat_result = path.stat()
+    except FileNotFoundError:
+        return None
+    return (stat_result.st_size, stat_result.st_mtime)
+
+
+@pytest.fixture(autouse=True)
+def _isolate_home_and_reset_supervisor_logger(monkeypatch, tmp_path):
+    """Autouse for EVERY test in this module: ``Path.home()`` never
+    resolves to the operator's real home for the duration of any test
+    here, and the module logger's own handlers (the two marker
+    subclasses -- never pytest's own capture handler) are torn down after
+    each test so a handler configured by one test can never carry that
+    test's (or a later test's) ``log_decision`` calls into a file left
+    over from a previous test.
+    """
+    fake_home = tmp_path / "home"
+    monkeypatch.setattr(Path, "home", classmethod(lambda cls: fake_home))
+    yield
+    _reset_supervisor_logging_handlers()
+
+
+@pytest.fixture(scope="module", autouse=True)
+def _guard_real_supervisor_log_untouched():
+    """Module-scoped finalizer: snapshot the REAL supervisor log's
+    size/mtime (via the never-monkeypatched ``_REAL_HOME`` above) before
+    the first test in this module runs, and assert it is byte-for-byte
+    unchanged after the last one. Read-only ``stat`` calls only -- this
+    never opens, truncates, or edits that file.
+    """
+    before = _stat_or_none(supervisor_log_path(_REAL_SUPERVISOR_LOG_DIR))
+    yield
+    after = _stat_or_none(supervisor_log_path(_REAL_SUPERVISOR_LOG_DIR))
+    assert after == before, (
+        "a test in tests/unit/test_trade_supervisor.py modified the REAL "
+        f"supervisor log at {supervisor_log_path(_REAL_SUPERVISOR_LOG_DIR)} "
+        f"-- (size, mtime) changed from {before} to {after}"
+    )
+
+
+def test_every_test_in_this_module_is_isolated_from_the_real_home_log_dir():
+    """Guards the isolation fixture itself: inside any test in this
+    module, ``Path.home()`` must never equal the real ``_REAL_HOME``
+    captured at import time."""
+    assert Path.home() != _REAL_HOME
+
+
+# ---------------------------------------------------------------------------
 # Obligation: pin the three control-flow substrings against the real
 # emitters -- read the actual source, don't just duplicate a literal.
 # ---------------------------------------------------------------------------
@@ -1679,3 +1747,31 @@ class TestSupervisorLoggingConfiguration:
         log_decision("a_test_decision", pid=123)
         content = supervisor_log_path(log_dir).read_text()
         assert "a_test_decision pid=123" in content
+
+    def test_main_accepts_an_explicit_log_dir_override_independent_of_home(
+        self, monkeypatch, tmp_path
+    ):
+        """The root fix for the production incident: `main` must not be
+        forced to derive its log directory from `Path.home()` -- it must
+        accept an explicit override, so a caller (including a test) can
+        always pin exactly where logging goes instead of relying on every
+        one of them remembering to isolate `Path.home()` first. This test
+        proves the override wins even when `Path.home()` (here the
+        module's own decoy, never the real one) points somewhere else
+        entirely -- no file appears there.
+        """
+        decoy_home = tmp_path / "decoy-home"
+        monkeypatch.setattr(Path, "home", classmethod(lambda cls: decoy_home))
+        decoy_home_log_dir = decoy_home / ".local" / "share" / "breezy" / "logs"
+
+        override_log_dir = tmp_path / "override-logs"
+        store_path = tmp_path / "state" / "store.sqlite3"
+        store_path.parent.mkdir(parents=True)
+        monkeypatch.setenv(EXEC_STATE_DB_ENV_VAR, str(store_path))
+        monkeypatch.setattr("breezy.runtime.trade_supervisor._run_forever", lambda **_kwargs: None)
+
+        exit_code = main([SUPERVISOR_ARGV_TOKEN], log_dir=override_log_dir)
+
+        assert exit_code == EXIT_OK
+        assert supervisor_log_path(override_log_dir).exists()
+        assert not decoy_home_log_dir.exists()
