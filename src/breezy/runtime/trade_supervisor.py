@@ -49,8 +49,11 @@ from breezy.runtime.submit_intent import (
     SubmitIntentState,
 )
 from breezy.runtime.trade_supervisor_core import (
+    MAX_RELAUNCH_ATTEMPTS,
+    MIN_RELAUNCH_GAP,
     NODE_ARGV_ANCHOR,
     PERMIT_ISSUED_MARKER,
+    RELAUNCH_CUTOFF_UTC,
     SELF_CHECK_ALERT_DETAIL,
     STRATEGY_SUBSCRIBED_MARKER,
     SUPERVISOR_ARGV_TOKEN,
@@ -92,6 +95,14 @@ _SIGTERM_POLL_INTERVAL_S: Final[float] = 0.5
 #: backwards clock step is always re-evaluated within this many seconds,
 #: never a single unbounded sleep.
 _SCHEDULE_POLL_INTERVAL_S: Final[float] = 60.0
+
+#: [D1] Pacing interval after a RELAUNCH_CHECK dispatch specifically -- a
+#: TIGHTER interval than the general schedule poll (the child may become
+#: ready or fail within seconds of being spawned), but every dispatch, not
+#: just a NONE result, must be followed by SOME bounded sleep: without
+#: this a live RELAUNCH_CHECK window (launched but not yet ready) is a
+#: zero-delay busy loop -- pegs a core, hammers /proc/locks and the log.
+_RELAUNCH_POLL_INTERVAL_S: Final[float] = 15.0
 
 #: The real ``/proc/locks`` path. A parameter (not a hardcoded literal)
 #: everywhere it is read, so tests can point at a synthetic file with real
@@ -437,6 +448,41 @@ def supervisor_log_path(log_dir: Path) -> Path:
     return log_dir / "breezy-trade-supervisor.log"
 
 
+def _process_start_time(pid: int) -> float | None:
+    """Best-effort process-start approximation: ``/proc/<pid>``'s own
+    ctime, which Linux sets at process creation. ``None`` if unreadable."""
+    try:
+        return Path(f"/proc/{pid}").stat().st_ctime
+    except OSError:
+        return None
+
+
+def find_adopted_node_log(log_dir: Path, pid: int) -> Path | None:
+    """[D2] Best-effort: the newest ``breezy-trade-*.log`` under
+    ``log_dir`` whose mtime is at or after ``pid``'s own process-start
+    time -- ``None`` if that can't be determined (unreadable
+    ``/proc/<pid>``, or no candidate log qualifies), in which case the
+    caller degrades gracefully rather than guessing."""
+    start = _process_start_time(pid)
+    if start is None:
+        return None
+    try:
+        candidates = sorted(
+            log_dir.glob("breezy-trade-*.log"),
+            key=lambda p: p.stat().st_mtime,
+            reverse=True,
+        )
+    except OSError:
+        return None
+    for candidate in candidates:
+        try:
+            if candidate.stat().st_mtime >= start:
+                return candidate
+        except OSError:
+            continue
+    return None
+
+
 def spawn_node(
     *,
     node_bin: Path,
@@ -520,6 +566,7 @@ class SupervisorPorts:
     read_log_new: Callable[[Path], str]
     alert_sink: AlertSink
     sigterm_poll_sleep: Callable[[float], None] = field(default=_time.sleep)
+    find_adopted_log: Callable[[Path, int], Path | None] = field(default=find_adopted_node_log)
 
 
 def default_ports(*, alert_sink: AlertSink | None = None) -> SupervisorPorts:
@@ -535,6 +582,7 @@ def default_ports(*, alert_sink: AlertSink | None = None) -> SupervisorPorts:
         spawn=spawn_node,
         read_log_new=log_reader.read_new,
         alert_sink=alert_sink if alert_sink is not None else resolve_alert_sink(),
+        find_adopted_log=find_adopted_node_log,
     )
 
 
@@ -588,17 +636,36 @@ def _do_stop_prior(
     return None
 
 
+def _attempt_adoption(
+    *, ports: SupervisorPorts, lock_path: Path, log_dir: Path
+) -> tuple[int, Path | None] | None:
+    """[D2] Verify a live discovered process IS the FLOCK holder -- never
+    assumed from ``pgrep`` alone -- and, on match, return
+    ``(pid, log_path)`` to adopt. ``log_path`` is ``None`` when it cannot
+    be determined (the caller degrades gracefully, see
+    :data:`SelfCheckResult.PASS_ADOPTED_LOG_UNKNOWN`). ``None`` overall
+    when no live process verifies as the holder."""
+    node_pid = ports.find_node_pid()
+    holder = ports.resolve_intent_lock_holder(lock_path)
+    if node_pid is None or holder is None or node_pid != holder:
+        return None
+    return node_pid, ports.find_adopted_log(log_dir, node_pid)
+
+
 def _do_launch(
     *,
     ports: SupervisorPorts,
+    state: DaySchedulerState,
     now: dt.datetime,
     store_path: Path,
     repo_root: Path,
     node_bin: Path,
     log_dir: Path,
-) -> tuple[int | None, Path | None]:
-    """[R6/B1] Returns ``(pid, log_path)`` of the spawned child, or
-    ``(None, None)`` on refusal."""
+) -> tuple[int | None, Path | None, DaySchedulerState, bool]:
+    """[R6/B1/D2/D3] Returns ``(pid, log_path, updated_state, done)`` --
+    ``done`` tells the caller whether LAUNCH should be marked fired this
+    pass (False only while a spawn-failure retry is still pending within
+    its bounded budget/gap [D3])."""
     node_pid = ports.find_node_pid()
     lock_path = intent_lock_path(store_path)
     lock_free = ports.intent_lock_free(lock_path)
@@ -607,12 +674,19 @@ def _do_launch(
         # [E5 scope] A node PID was discovered despite a free flock -- never
         # probe the store while ANY node PID is live; refuse conservatively.
         log_decision("launch_refused_pid_present", pid=node_pid)
-        return None, None
+        return None, None, state, True
 
     open_intent = ports.probe_open_intent_state(store_path, node_pid=None) if lock_free else False
     action = decide_launch_action(lock_free=lock_free, open_intent_detected=open_intent)
 
     if action is LaunchAction.REFUSE_LOCK_HELD:
+        # [D2] A supervisor restarted mid-window with a healthy node
+        # already holding the flock must ADOPT it, not report it dead.
+        adoption = _attempt_adoption(ports=ports, lock_path=lock_path, log_dir=log_dir)
+        if adoption is not None:
+            pid, log_path = adoption
+            log_decision("launch_adopted_live_node", pid=pid)
+            return pid, log_path, state, True
         log_decision("launch_refused_lock_held")
         alert(
             ports.alert_sink,
@@ -620,7 +694,7 @@ def _do_launch(
             severity="WARN",
             detail=AlertDetail.LAUNCH_BLOCKED_LOCK_HELD,
         )
-        return None, None
+        return None, None, state, True
 
     if action is LaunchAction.REFUSE_INTENT_OPEN:
         log_decision("launch_refused_intent_open")
@@ -630,12 +704,46 @@ def _do_launch(
             severity="CRITICAL",
             detail=AlertDetail.INTENT_OPEN_BLOCKS_ARM,
         )
-        return None, None
+        return None, None, state, True
+
+    # action is LAUNCH. [D3] A prior spawn attempt this window may have
+    # raised -- gate a retry on the SAME bounded budget RELAUNCH_CHECK
+    # uses (<=2 attempts, >=3 min apart, never at/after 17:00 UTC), never a
+    # free-running immediate retry loop.
+    if state.relaunch_attempts > 0:
+        exhausted = (
+            state.relaunch_attempts >= MAX_RELAUNCH_ATTEMPTS or now.time() >= RELAUNCH_CUTOFF_UTC
+        )
+        if exhausted:
+            log_decision("launch_spawn_retry_exhausted")
+            alert(
+                ports.alert_sink,
+                event="TRADE_SUPERVISOR_LAUNCH_REFUSED",
+                severity="CRITICAL",
+                detail=AlertDetail.LAUNCH_SPAWN_FAILED,
+            )
+            return None, None, state, True
+        gap_elapsed = (
+            state.last_relaunch_attempt_at is None
+            or (now - state.last_relaunch_attempt_at) >= MIN_RELAUNCH_GAP
+        )
+        if not gap_elapsed:
+            return None, None, state, False
 
     log_path = node_log_path(log_dir, now)
-    proc = ports.spawn(node_bin=node_bin, repo_root=repo_root, env=os.environ, log_path=log_path)
+    try:
+        proc = ports.spawn(
+            node_bin=node_bin, repo_root=repo_root, env=os.environ, log_path=log_path
+        )
+    except Exception as exc:  # noqa: BLE001 -- deliberate: a spawn failure
+        # is transient by definition [D3]; contained here and retried
+        # against the bounded relaunch budget above, never propagated to
+        # forfeit the day by marking LAUNCH fired with no tracked child.
+        log_decision("launch_spawn_failed", error_type=type(exc).__name__)
+        return None, None, record_relaunch_attempt(state, now), False
+
     log_decision("launched", pid=proc.pid)
-    return proc.pid, log_path
+    return proc.pid, log_path, state, True
 
 
 def _do_relaunch_check(
@@ -686,17 +794,34 @@ def _do_relaunch_check(
     return proc.pid, new_log, record_relaunch_attempt(state, now)
 
 
+#: Self-check results that are a PASS of some kind -- never alerted on.
+_SELF_CHECK_PASS_RESULTS: Final[frozenset[SelfCheckResult]] = frozenset(
+    {SelfCheckResult.PASS, SelfCheckResult.PASS_ADOPTED_LOG_UNKNOWN}
+)
+
+
 def _do_self_check(
     *,
     ports: SupervisorPorts,
     now: dt.datetime,
     store_path: Path,
+    log_dir: Path,
     tracked_pid: int | None,
     node_log: Path | None,
-) -> None:
-    """[B4/E3] One PASS/FAIL line, and an alert through the shared sink on
-    FAIL with a fixed enum ``detail``."""
+) -> tuple[int | None, Path | None]:
+    """[B4/E3/D2] One PASS/FAIL line, and an alert through the shared sink
+    on FAIL with a fixed enum ``detail``. Adopts a live verified flock
+    holder FIRST when nothing was tracked -- a supervisor that restarted
+    after 17:00 with a healthy node already running must not report
+    ``FAIL_CHILD_EXITED`` for it. Returns the (possibly adopted)
+    ``(tracked_pid, node_log)`` for the caller to keep carrying forward."""
     lock_path = intent_lock_path(store_path)
+    if tracked_pid is None:
+        adoption = _attempt_adoption(ports=ports, lock_path=lock_path, log_dir=log_dir)
+        if adoption is not None:
+            tracked_pid, node_log = adoption
+            log_decision("self_check_adopted_live_node", pid=tracked_pid)
+
     holder = ports.resolve_intent_lock_holder(lock_path)
     holder_count = ports.count_intent_lock_holders(lock_path)
     log_text = ports.read_log_new(node_log) if node_log is not None else ""
@@ -709,15 +834,17 @@ def _do_self_check(
         permit_issued=PERMIT_ISSUED_MARKER in log_text,
         permit_expiry_valid=permit_expiry_valid(log_text, now_ns=int(now.timestamp() * 1e9)),
         strategy_subscribed=STRATEGY_SUBSCRIBED_MARKER in log_text,
+        log_available=node_log is not None,
     )
     log_decision("self_check", result=result.value)
-    if result is not SelfCheckResult.PASS:
+    if result not in _SELF_CHECK_PASS_RESULTS:
         alert(
             ports.alert_sink,
             event="TRADE_SUPERVISOR_SELF_CHECK_FAIL",
             severity="WARN",
             detail=SELF_CHECK_ALERT_DETAIL[result],
         )
+    return tracked_pid, node_log
 
 
 # ---------------------------------------------------------------------------
@@ -853,15 +980,17 @@ def _run_forever(
                     )
                     state = mark_phase_fired(state, phase, now)
                 elif phase is Phase.LAUNCH:
-                    tracked_pid, node_log = _do_launch(
+                    tracked_pid, node_log, state, done = _do_launch(
                         ports=active_ports,
+                        state=state,
                         now=now,
                         store_path=store_path,
                         repo_root=repo_root,
                         node_bin=node_bin,
                         log_dir=log_dir,
                     )
-                    state = mark_phase_fired(state, phase, now)
+                    if done:
+                        state = mark_phase_fired(state, phase, now)
                 elif phase is Phase.RELAUNCH_CHECK:
                     tracked_pid, node_log, state = _do_relaunch_check(
                         ports=active_ports,
@@ -875,10 +1004,11 @@ def _run_forever(
                         log_dir=log_dir,
                     )
                 else:
-                    _do_self_check(
+                    tracked_pid, node_log = _do_self_check(
                         ports=active_ports,
                         now=now,
                         store_path=store_path,
+                        log_dir=log_dir,
                         tracked_pid=tracked_pid,
                         node_log=node_log,
                     )
@@ -900,6 +1030,18 @@ def _run_forever(
                 )
                 if phase is not Phase.RELAUNCH_CHECK:
                     state = mark_phase_fired(state, phase, now)
+
+            # [D1] EVERY dispatch is followed by a bounded sleep -- without
+            # this, a LAUNCH that leaves RELAUNCH_CHECK due every pass (not
+            # yet ready, not yet exited) is a zero-delay busy loop until
+            # readiness or the 17:00 UTC cutoff. Tighter for RELAUNCH_CHECK
+            # (the child may become ready or fail within seconds) than the
+            # general schedule poll.
+            sleep(
+                _RELAUNCH_POLL_INTERVAL_S
+                if phase is Phase.RELAUNCH_CHECK
+                else _SCHEDULE_POLL_INTERVAL_S
+            )
     except KeyboardInterrupt:
         log_decision("supervisor_interrupted")
         return

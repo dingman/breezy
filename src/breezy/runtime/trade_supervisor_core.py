@@ -87,6 +87,7 @@ class AlertDetail(str, Enum):
     ADOPTION_REFUSED = "adoption_refused"
     STOP_PRIOR_RACE_REFUSED = "stop_prior_race_refused"
     LAUNCH_BLOCKED_LOCK_HELD = "launch_blocked_lock_held"
+    LAUNCH_SPAWN_FAILED = "launch_spawn_failed"
     SECOND_SUPERVISOR_REFUSED = "second_supervisor_refused"
     SELF_CHECK_FAIL_NOT_READY = "self_check_fail_not_ready"
     SELF_CHECK_FAIL_SHADOW_MODE_NO_PERMIT = "self_check_fail_shadow_mode_no_permit"
@@ -130,6 +131,11 @@ class SelfCheckResult(str, Enum):
     """[B4/E3] The 17:05 UTC self-check's single PASS/FAIL line."""
 
     PASS = "PASS"
+    #: [D2] Adopted a verified live flock holder whose log location could
+    #: not be determined -- permit/subscribed markers are unreadable
+    #: without a log, so this PASSes on flock+liveness evidence alone
+    #: rather than reporting a false FAIL for a healthy node.
+    PASS_ADOPTED_LOG_UNKNOWN = "PASS_ADOPTED_LOG_UNKNOWN"
     FAIL_NODE_NOT_READY = "FAIL_NODE_NOT_READY"
     FAIL_SHADOW_MODE_NO_PERMIT = "FAIL_SHADOW_MODE_NO_PERMIT"
     FAIL_MULTIPLE_FLOCK_HOLDERS = "FAIL_MULTIPLE_FLOCK_HOLDERS"
@@ -263,18 +269,29 @@ def self_check(
     permit_issued: bool,
     permit_expiry_valid: bool,
     strategy_subscribed: bool,
+    log_available: bool = True,
 ) -> SelfCheckResult:
-    """[B4/E3] The 17:05 UTC self-check. Exactly one PASS/FAIL result.
+    """[B4/E3/D2] The 17:05 UTC self-check. Exactly one PASS/FAIL result.
 
     Shadow mode (flock held by the tracked PID and the strategy subscribed,
     but no valid permit-issued line) is its own distinct FAIL state, not a
     silent PASS and not folded into the generic not-ready case.
+
+    ``log_available=False`` (an adopted node whose log location could not
+    be determined) skips the log-derived checks (permit/subscribed, which
+    are unreadable without a log) and PASSes on flock+liveness evidence
+    alone, as ``PASS_ADOPTED_LOG_UNKNOWN`` -- never silently folded into a
+    plain ``PASS`` it did not actually verify.
     """
     if not child_alive:
         return SelfCheckResult.FAIL_CHILD_EXITED
     if flock_holder_count > 1:
         return SelfCheckResult.FAIL_MULTIPLE_FLOCK_HOLDERS
-    if not flock_held_by_tracked_pid or not strategy_subscribed:
+    if not flock_held_by_tracked_pid:
+        return SelfCheckResult.FAIL_NODE_NOT_READY
+    if not log_available:
+        return SelfCheckResult.PASS_ADOPTED_LOG_UNKNOWN
+    if not strategy_subscribed:
         return SelfCheckResult.FAIL_NODE_NOT_READY
     if not (permit_issued and permit_expiry_valid):
         return SelfCheckResult.FAIL_SHADOW_MODE_NO_PERMIT

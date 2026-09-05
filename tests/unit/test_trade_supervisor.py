@@ -39,6 +39,7 @@ from breezy.runtime.trade_supervisor import (
     _do_stop_prior,
     _run_forever,
     count_lock_holders,
+    find_adopted_node_log,
     hold_supervisor_lock,
     intent_lock_is_free,
     intent_lock_path,
@@ -465,6 +466,34 @@ class TestSelfCheck:
             strategy_subscribed=True,
         )
         assert result is SelfCheckResult.PASS
+
+    def test_log_unavailable_passes_as_adopted_log_unknown(self):
+        """[D2] An adopted node whose log location is unknown cannot have
+        its permit/subscribed markers checked -- PASSes on flock+liveness
+        evidence alone, as a DISTINCT result, never silently folded into a
+        plain PASS it did not actually verify."""
+        result = self_check(
+            child_alive=True,
+            flock_holder_count=1,
+            flock_held_by_tracked_pid=True,
+            permit_issued=False,
+            permit_expiry_valid=False,
+            strategy_subscribed=False,
+            log_available=False,
+        )
+        assert result is SelfCheckResult.PASS_ADOPTED_LOG_UNKNOWN
+
+    def test_log_unavailable_still_fails_when_not_holding_the_lock(self):
+        result = self_check(
+            child_alive=True,
+            flock_holder_count=1,
+            flock_held_by_tracked_pid=False,
+            permit_issued=False,
+            permit_expiry_valid=False,
+            strategy_subscribed=False,
+            log_available=False,
+        )
+        assert result is SelfCheckResult.FAIL_NODE_NOT_READY
 
     def test_child_exited_fails_first(self):
         result = self_check(
@@ -1296,15 +1325,16 @@ class TestPhaseHandlersDirect:
         store_path = tmp_path / "state" / "store.sqlite3"
         sink = _RecordingAlertSink()
         ports = _make_ports(intent_lock_free=lambda _p: False, alert_sink=sink)
-        pid, log = _do_launch(
+        pid, log, _state, done = _do_launch(
             ports=ports,
+            state=initial_scheduler_state(_DAY),
             now=_utc(16, 50),
             store_path=store_path,
             repo_root=tmp_path,
             node_bin=tmp_path / "node_bin",
             log_dir=tmp_path / "logs",
         )
-        assert (pid, log) == (None, None)
+        assert (pid, log, done) == (None, None, True)
         assert sink.payloads[-1].detail == AlertDetail.LAUNCH_BLOCKED_LOCK_HELD.value
 
     def test_do_launch_refuses_when_node_pid_present_despite_free_lock(self, tmp_path):
@@ -1315,15 +1345,16 @@ class TestPhaseHandlersDirect:
             intent_lock_free=lambda _p: True,
             probe_open_intent_state=lambda *a, **kw: probed.append(kw) or False,
         )
-        pid, log = _do_launch(
+        pid, log, _state, done = _do_launch(
             ports=ports,
+            state=initial_scheduler_state(_DAY),
             now=_utc(16, 50),
             store_path=store_path,
             repo_root=tmp_path,
             node_bin=tmp_path / "node_bin",
             log_dir=tmp_path / "logs",
         )
-        assert (pid, log) == (None, None)
+        assert (pid, log, done) == (None, None, True)
         assert probed == []  # the probe must never run while a node pid is live
 
     def test_do_self_check_pass_logs_no_alert(self, tmp_path):
@@ -1340,7 +1371,195 @@ class TestPhaseHandlersDirect:
             ports=ports,
             now=_utc(17, 5),
             store_path=store_path,
+            log_dir=tmp_path / "logs",
             tracked_pid=42,
             node_log=tmp_path / "n.log",
         )
         assert sink.payloads == []
+
+
+# ===========================================================================
+# Re-review (HEAD 7d52377): code REVISE, three loop defects.
+# D1 no pacing sleep after a non-NONE dispatch (busy loop during
+# RELAUNCH_CHECK); D2 a restart mid-window with a live holder never adopts
+# it (false FAIL_CHILD_EXITED for a healthy node); D3 a spawn exception
+# marks LAUNCH fired with no tracked child, forfeiting the day.
+# ===========================================================================
+
+
+class TestD1PacingSleep:
+    def test_every_iteration_sleeps_across_a_launch_to_relaunch_check_sequence(self, tmp_path):
+        # A FakeClock that only ever advances INSIDE `sleep` -- if any
+        # iteration dispatched a phase without sleeping afterwards, the
+        # clock would stall relative to the iteration count.
+        clock = FakeClock(_utc(16, 49, 30))
+        sleep_calls = {"n": 0}
+
+        def counting_sleep(seconds: float) -> None:
+            sleep_calls["n"] += 1
+            clock.advance(seconds)
+
+        spawner = FakeSpawner()
+        ports = _make_ports(
+            spawn=spawner,
+            process_alive=lambda _pid: True,
+            resolve_intent_lock_holder=lambda _p: 9001 if spawner.calls else None,
+            read_log_new=lambda _p: "",  # never ready -> RELAUNCH_CHECK fires repeatedly
+        )
+        iterations = 40
+        _run_forever(
+            store_path=tmp_path / "state" / "store.sqlite3",
+            repo_root=tmp_path,
+            node_bin=tmp_path / "node_bin",
+            log_dir=tmp_path / "logs",
+            clock=clock,
+            sleep=counting_sleep,
+            ports=ports,
+            max_iterations=iterations,
+        )
+        # Every one of the 40 iterations -- NONE waits AND every dispatched
+        # phase (including a repeatedly-due RELAUNCH_CHECK) -- called sleep
+        # exactly once. No zero-delay busy-loop iteration exists.
+        assert sleep_calls["n"] == iterations
+
+    def test_stub_sleep_called_once_per_real_time_iteration(self, tmp_path):
+        calls = {"n": 0}
+
+        def stub_sleep(_seconds: float) -> None:
+            calls["n"] += 1
+
+        ports = _make_ports()
+        _run_forever(
+            store_path=tmp_path / "state" / "store.sqlite3",
+            repo_root=tmp_path,
+            node_bin=tmp_path / "node_bin",
+            log_dir=tmp_path / "logs",
+            clock=lambda: dt.datetime.now(dt.UTC),
+            sleep=stub_sleep,
+            ports=ports,
+            max_iterations=3,
+        )
+        assert calls["n"] == 3
+
+
+class TestD2AdoptionMidWindow:
+    def _run(self, *, clock: FakeClock, ports: SupervisorPorts, max_iterations: int, tmp_path):
+        def fake_sleep(seconds: float) -> None:
+            clock.advance(seconds)
+
+        _run_forever(
+            store_path=tmp_path / "state" / "store.sqlite3",
+            repo_root=tmp_path,
+            node_bin=tmp_path / "node_bin",
+            log_dir=tmp_path / "logs",
+            clock=clock,
+            sleep=fake_sleep,
+            ports=ports,
+            max_iterations=max_iterations,
+        )
+
+    def test_1655_restart_with_live_holder_adopts_never_spawns_passes_at_1705(self, tmp_path):
+        clock = FakeClock(_utc(16, 55, 0))
+        spawner = FakeSpawner()
+        sink = _RecordingAlertSink()
+        ports = _make_ports(
+            spawn=spawner,
+            find_node_pid=lambda: 777,
+            intent_lock_free=lambda _p: False,
+            resolve_intent_lock_holder=lambda _p: 777,
+            count_intent_lock_holders=lambda _p: 1,
+            process_alive=lambda _pid: True,
+            find_adopted_log=lambda _log_dir, _pid: None,
+            alert_sink=sink,
+        )
+        self._run(clock=clock, ports=ports, max_iterations=80, tmp_path=tmp_path)
+        assert spawner.calls == []  # never spawned a second node
+        fail_alerts = [p for p in sink.payloads if "SELF_CHECK_FAIL" in p.event]
+        assert fail_alerts == []
+
+    def test_1706_restart_with_live_holder_adopts_at_self_check_passes(self, tmp_path):
+        clock = FakeClock(_utc(17, 6, 0))
+        spawner = FakeSpawner()
+        sink = _RecordingAlertSink()
+        ports = _make_ports(
+            spawn=spawner,
+            find_node_pid=lambda: 888,
+            resolve_intent_lock_holder=lambda _p: 888,
+            count_intent_lock_holders=lambda _p: 1,
+            process_alive=lambda _pid: True,
+            find_adopted_log=lambda _log_dir, _pid: None,
+            alert_sink=sink,
+        )
+        self._run(clock=clock, ports=ports, max_iterations=5, tmp_path=tmp_path)
+        assert spawner.calls == []
+        fail_alerts = [p for p in sink.payloads if "SELF_CHECK_FAIL" in p.event]
+        assert fail_alerts == []
+
+
+class TestD3SpawnExceptionRetriesWithinBudget:
+    def _run(self, *, clock: FakeClock, ports: SupervisorPorts, max_iterations: int, tmp_path):
+        def fake_sleep(seconds: float) -> None:
+            clock.advance(seconds)
+
+        _run_forever(
+            store_path=tmp_path / "state" / "store.sqlite3",
+            repo_root=tmp_path,
+            node_bin=tmp_path / "node_bin",
+            log_dir=tmp_path / "logs",
+            clock=clock,
+            sleep=fake_sleep,
+            ports=ports,
+            max_iterations=max_iterations,
+        )
+
+    def test_first_spawn_raises_second_succeeds_after_gap_exactly_two_calls(self, tmp_path):
+        clock = FakeClock(_utc(16, 49, 30))
+        calls = {"n": 0}
+
+        def flaky_spawn(**_kwargs):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                raise OSError("synthetic spawn failure")
+            return FakePopen(9999)
+
+        ports = _make_ports(spawn=flaky_spawn)
+        self._run(clock=clock, ports=ports, max_iterations=40, tmp_path=tmp_path)
+        assert calls["n"] == 2  # day not forfeited -- the retry actually ran
+
+    def test_two_spawn_raises_refuses_and_alerts_no_third_attempt(self, tmp_path):
+        clock = FakeClock(_utc(16, 49, 30))
+        sink = _RecordingAlertSink()
+        calls = {"n": 0}
+
+        def always_raise(**_kwargs):
+            calls["n"] += 1
+            raise OSError("synthetic spawn failure")
+
+        ports = _make_ports(spawn=always_raise, alert_sink=sink)
+        self._run(clock=clock, ports=ports, max_iterations=60, tmp_path=tmp_path)
+        assert calls["n"] == 2
+        assert any(p.detail == AlertDetail.LAUNCH_SPAWN_FAILED.value for p in sink.payloads)
+
+
+class TestFindAdoptedNodeLog:
+    def test_returns_none_when_process_start_time_unknown(self, tmp_path):
+        # PID 0 owns no /proc/0 directory readable this way in practice;
+        # use a PID that cannot possibly exist to force the "unknown" path.
+        assert find_adopted_node_log(tmp_path, 2**30) is None
+
+    def test_returns_the_newest_qualifying_log_for_the_current_process(self, tmp_path):
+        old_log = tmp_path / "breezy-trade-20260101T000000Z.log"
+        old_log.write_text("old")
+        import os
+        import time
+
+        # Backdate the old log well before this process's own start time so
+        # it is correctly excluded as stale.
+        past = time.time() - 3600
+        os.utime(old_log, (past, past))
+
+        new_log = tmp_path / "breezy-trade-20260904T165000Z.log"
+        new_log.write_text("new")
+
+        result = find_adopted_node_log(tmp_path, os.getpid())
+        assert result == new_log
