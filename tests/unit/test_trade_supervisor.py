@@ -32,7 +32,6 @@ from breezy.runtime.trade_supervisor import (
     EXIT_CONFIG_ERROR,
     EXIT_OK,
     NODE_CONSOLE_SCRIPT,
-    ExecStateDbNotConfiguredError,
     IncrementalLogReader,
     StopPriorRaceRefused,
     SupervisorPorts,
@@ -53,7 +52,6 @@ from breezy.runtime.trade_supervisor import (
     node_log_path,
     probe_open_intent,
     resolve_lock_holder_pid,
-    resolve_store_path,
     spawn_node,
     supervisor_lock_path,
     supervisor_log_path,
@@ -738,17 +736,6 @@ class _RecordingAlertSink:
 
     def emit(self, payload: AlertPayload) -> None:
         self.payloads.append(payload)
-
-
-def test_resolve_store_path_requires_the_env_var(monkeypatch):
-    monkeypatch.delenv(EXEC_STATE_DB_ENV_VAR, raising=False)
-    with pytest.raises(ExecStateDbNotConfiguredError):
-        resolve_store_path({})
-
-
-def test_resolve_store_path_reads_the_configured_path():
-    path = resolve_store_path({EXEC_STATE_DB_ENV_VAR: "/tmp/x/store.sqlite3"})
-    assert path == Path("/tmp/x/store.sqlite3")
 
 
 # ---------------------------------------------------------------------------

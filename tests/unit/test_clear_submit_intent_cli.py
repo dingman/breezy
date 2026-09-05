@@ -136,6 +136,47 @@ def test_clear_submit_intent_prints_the_open_intent_before_clearing(
     store2.close()
 
 
+def test_clear_submit_intent_refuses_when_exec_state_db_is_unset(tmp_path: Path) -> None:
+    """REVISE-7: the leaf resolver's raise maps to the SAME EXIT_REFUSED on
+    the same stream, value-free, naming the var rather than echoing a fixed
+    "is unset" wording that would be false for a relative path."""
+    evidence = _evidence(tmp_path, with_fill=False)
+    stderr = io.StringIO()
+    code = main(
+        ["--yes", "--resolution", "no-order-exists", "--evidence", str(evidence)],
+        env={OPERATOR_ACK_ENV_VAR: "1"},
+        stdout=io.StringIO(),
+        stderr=stderr,
+    )
+    assert code == EXIT_REFUSED
+    printed = stderr.getvalue()
+    assert EXEC_STATE_DB_ENV_VAR in printed
+    assert "refused" in printed
+
+
+def test_clear_submit_intent_accepts_the_measured_absolute_store_path_shape(
+    tmp_path: Path,
+) -> None:
+    """REVISE-7: the new validation provably cannot lock the operator out of
+    the running store -- an absolute path with no '~', '$HOME' or '..'
+    segment (the measured live shape) is accepted, same as today."""
+    store_path = tmp_path / "home" / "jon" / ".local" / "share" / "breezy" / "state" / "store.db"
+    SqliteStateStore(store_path).close()
+    code = main(
+        [
+            "--yes",
+            "--resolution",
+            "no-order-exists",
+            "--evidence",
+            str(_evidence(tmp_path, with_fill=False)),
+        ],
+        env=_env(store_path),
+        stdout=io.StringIO(),
+        stderr=io.StringIO(),
+    )
+    assert code == EXIT_NOTHING_OPEN
+
+
 def test_clear_submit_intent_exit_3_when_nothing_open(tmp_path: Path) -> None:
     store_path = tmp_path / "state.db"
     SqliteStateStore(store_path).close()

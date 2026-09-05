@@ -15,7 +15,7 @@ from collections.abc import Mapping
 from pathlib import Path
 from typing import TextIO
 
-from breezy.adapters.polymarket_us.factories import EXEC_STATE_DB_ENV_VAR
+from breezy.runtime.exec_state_db_path import ExecStateDbNotConfiguredError, resolve_store_path
 from breezy.runtime.sqlite_store import SqliteStateStore
 from breezy.runtime.submit_intent import (
     RetirementReason,
@@ -113,11 +113,11 @@ def clear_submit_intent(
         print(f"breezy-clear-submit-intent: {evidence_reason}; refused", file=err)
         return EXIT_REFUSED
 
-    raw_state_db = source.get(EXEC_STATE_DB_ENV_VAR, "").strip()
-    if not raw_state_db:
-        print("breezy-clear-submit-intent: exec state db is unset; refused", file=err)
+    try:
+        store_path = resolve_store_path(source)
+    except ExecStateDbNotConfiguredError as exc:
+        print(f"breezy-clear-submit-intent: {exc}; refused", file=err)
         return EXIT_REFUSED
-    store_path = Path(raw_state_db)
     store = SqliteStateStore(store_path)
     try:
         try:

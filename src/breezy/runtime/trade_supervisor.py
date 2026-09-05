@@ -39,7 +39,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Final, TextIO
 
-from breezy.adapters.polymarket_us.factories import EXEC_STATE_DB_ENV_VAR
+from breezy.runtime.exec_state_db_path import ExecStateDbNotConfiguredError, resolve_store_path
 from breezy.runtime.health import AlertPayload, AlertSink, emit_alert, resolve_alert_sink
 from breezy.runtime.sqlite_store import SqliteStateStore
 from breezy.runtime.submit_intent import (
@@ -918,19 +918,6 @@ def _do_self_check(
 # ---------------------------------------------------------------------------
 # Console entry.
 # ---------------------------------------------------------------------------
-
-
-class ExecStateDbNotConfiguredError(RuntimeError):
-    """Raised when the supervisor's own environment carries no exec state
-    DB path -- it needs this only to locate the store/intent-lock paths,
-    never to read or forward its value anywhere but ``env=`` at spawn time."""
-
-
-def resolve_store_path(env: Mapping[str, str]) -> Path:
-    raw = env.get(EXEC_STATE_DB_ENV_VAR, "").strip()
-    if not raw:
-        raise ExecStateDbNotConfiguredError(EXEC_STATE_DB_ENV_VAR)
-    return Path(raw)
 
 
 def main(argv: list[str] | None = None, *, log_dir: Path | None = None) -> int:
