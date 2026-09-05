@@ -52,6 +52,7 @@ def _run_wrapper(
         capture_output=True,
         text=True,
         timeout=30,
+        check=False,
     )
 
 
@@ -61,7 +62,9 @@ def test_wrapper_exists_and_is_executable() -> None:
 
 
 def test_wrapper_script_is_valid_bash() -> None:
-    result = subprocess.run(["bash", "-n", str(_WRAPPER)], capture_output=True, text=True)
+    result = subprocess.run(
+        ["bash", "-n", str(_WRAPPER)], capture_output=True, text=True, check=False
+    )
     assert result.returncode == 0, result.stderr
 
 
@@ -126,7 +129,7 @@ def test_wrapper_reports_failure_from_the_stub_analysis_script(tmp_path: Path) -
     stub.write_text("#!/usr/bin/env bash\nexit 1\n")
     stub.chmod(0o755)
 
-    family_id = sorted(_valid_family_ids())[0]
+    family_id = min(_valid_family_ids())
     result = _run_wrapper([family_id], tmp_path, stub_python=stub)
 
     assert result.returncode == 1

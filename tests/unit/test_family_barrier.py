@@ -27,33 +27,35 @@ _CENSUS = ("LAX", "MDW", "MIA", "SFO")
 
 
 def _row(**overrides: Any) -> ScoredTrial:
-    defaults: dict[str, Any] = dict(
-        trial_id="current_rung_hold/trial/LAX/2026-09-11/0",
-        station="LAX",
-        climate_day="2026-09-11",
-        instrument_id="instrument-1",
-        settlement_tmax_f=80,
-        held=True,
-        pnl=Decimal("0.10"),
-        revision_seq=0,
-        raw_sha256="deadbeef",
-        scored_at_ns=1,
-        score_seq=0,
-        settlement_basis="nws_final",
-        excluded_reason=None,
-        slippage=Decimal("0"),
-        entry_ask=Decimal("0.5"),
-        fill_px=Decimal("0.5"),
-        fee=Decimal("0.02"),
-    )
+    defaults: dict[str, Any] = {
+        "trial_id": "current_rung_hold/trial/LAX/2026-09-11/0",
+        "station": "LAX",
+        "climate_day": "2026-09-11",
+        "instrument_id": "instrument-1",
+        "settlement_tmax_f": 80,
+        "held": True,
+        "pnl": Decimal("0.10"),
+        "revision_seq": 0,
+        "raw_sha256": "deadbeef",
+        "scored_at_ns": 1,
+        "score_seq": 0,
+        "settlement_basis": "nws_final",
+        "excluded_reason": None,
+        "slippage": Decimal(0),
+        "entry_ask": Decimal("0.5"),
+        "fill_px": Decimal("0.5"),
+        "fee": Decimal("0.02"),
+    }
     defaults.update(overrides)
     return ScoredTrial(**defaults)
 
 
 def _pm_manifest(**overrides: Any) -> _FakeManifest:
-    defaults: dict[str, Any] = dict(
-        trial_id_prefix=_PM_PREFIX, d0_climate_day=_D0, stations=_CENSUS
-    )
+    defaults: dict[str, Any] = {
+        "trial_id_prefix": _PM_PREFIX,
+        "d0_climate_day": _D0,
+        "stations": _CENSUS,
+    }
     defaults.update(overrides)
     return _FakeManifest(**defaults)
 
