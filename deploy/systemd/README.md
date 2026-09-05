@@ -545,7 +545,18 @@ discipline that applies to any future edit of this unit too.
 
 ---
 
-## `breezy-score-live-trials` — I3 live-fill scoring run (2026-09-05, PREPARED, NOT ACTIVATED)
+## `breezy-score-live-trials` — I3 live-fill scoring run (2026-09-05, ACTIVATED 04:19 UTC)
+
+**Activation record (coordinator, 2026-09-05 04:19 UTC).** Symlinked both units into
+`~/.config/systemd/user/`, `daemon-reload` (also picks up `breezy-live-tally.service`'s new
+`Environment=` path line), `enable --now breezy-score-live-trials.timer` (next fire 14:15 UTC).
+Pre-deploy checks: live store 0 fill rows (read-only), node-env pre-flight `MATCH` against the
+running node, full unit suite green through the no-egress gate. Smoke run
+(`systemctl --user start breezy-score-live-trials.service`): `Result=success`, exit 0,
+`covered_listed_station_days_2026-09-05.json` + `score_live_trials_ok_2026-09-05` written,
+`scored 0 trial(s), refused 0 trial(s), excluded 0 fill(s)` for LAX/MDW/MIA/SFO (no fills yet).
+Chain evidence: `tests/contract/test_live_fill_scoring_chain_contract.py`; reviews:
+`docs/evidence/codex_fill_chain_review_2026-09-05.md`.
 
 `breezy-score-live-trials.service` + `.timer` run the 14:15 UTC increment of
 `docs/plans/LIVE_FILL_SCORING_CHAIN_2026-09-05.md` (I3) via
