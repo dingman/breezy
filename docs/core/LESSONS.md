@@ -1200,3 +1200,29 @@ defaults in the plan and write the call with every population argument
 explicit; add a RED test that pins numerator and denominator window equality.
 Related: [[L-2]] (a substitution is a unit change), [[L-3]] (reach the goal
 state), [[L-10]] (brief vocabulary becomes verified fact).
+
+## L-29 — A diagnostics buffer with no production consumer is an unbounded allocation (2026-09-05)
+
+**What happened.** The live trade node reached 5.0 GB resident in six hours
+(~1 GB/h, 4.85 GB anonymous heap, no fd or thread growth) and the host's 8 GB
+swap was exhausted. `PolymarketUSDataClient._frame_diagnostics` was a plain
+list that `_handle_ws_frame` appended to on EVERY inbound websocket frame,
+before routing, with a full walk of the payload structure per frame; its only
+reader was one unit test. The same class powers the quote-tape recorder,
+whose earlier "memory fix" (d46b725) added cgroup limits and a cache cap and
+never touched the list — the symptom was contained, the cause survived, and
+the recorder has been swapping against its ceiling ever since.
+
+**The rule.** Any per-message collection in a long-running process is bounded
+by construction (`deque(maxlen=...)`, a counter, or a periodic flush) and has
+a named production consumer; a collection whose only reader is a test is a
+leak wearing the grammar of observability. A memory ceiling on a unit is
+containment, not a fix: when a process sits at its `MemoryHigh`, the root
+cause is still open and goes on the register as such.
+
+**How to apply.** When a process's anonymous RSS grows linearly with message
+rate, search the message path for `.append(` on `self.*` attributes before
+suspecting caches, threads or fds; confirm with a RED test that feeds N
+messages and asserts the collection's size is O(1) in N. Related: [[L-3]]
+(reach the goal state), [[L-19]] (simulate the change), [[L-27]] (process-
+global sinks).
