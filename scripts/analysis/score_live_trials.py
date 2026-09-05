@@ -503,8 +503,13 @@ def score_live_trials(
         )
         for row in scored
     )
+    # R2(a): write/assert the live-provenance sidecar every time this
+    # driver runs against its derived store, even with zero admitted rows
+    # -- a fresh live node with no fills yet must not make family_tally_v2.py
+    # refuse the nightly tally for want of a sidecar (idempotent; a genuine
+    # provenance conflict still refuses regardless of row count).
+    _write_or_assert_live_provenance_sidecar(derived_dir)
     if stamped_scored:
-        _write_or_assert_live_provenance_sidecar(derived_dir)
         _append_fill_order_entries(
             derived_dir,
             [

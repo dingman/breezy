@@ -732,6 +732,63 @@ def test_end_to_end_run_writes_the_live_provenance_sidecar_exactly_once(
     assert json.loads(sidecar.read_text()) == {"provenance": "live"}
 
 
+def test_r2_sidecar_is_written_even_when_zero_rows_are_admitted(tmp_path: Path) -> None:
+    """R2(a): a fresh live node whose only fill so far is excluded (qty !=
+    1, admitted-but-excluded before scoring) still gets its provenance
+    sidecar written -- `family_tally_v2.py` must never refuse the nightly
+    tally for want of a sidecar just because zero rows were ever scored."""
+    catalog_base = tmp_path / "catalog"
+    derived_dir = tmp_path / "derived"
+    fills_path = tmp_path / "fills.jsonl"
+    catalog = open_station_catalog(catalog_base, _VENUE, _CITY)
+    write_records(catalog, [_climate_day(tmax_f=79)])
+    fills_path.write_text(
+        json.dumps(_fill_row(trial_id="frac", qty="0.37")) + "\n", encoding="utf-8"
+    )
+
+    scored, _refused, _excluded = score_live_trials(
+        fills_path=fills_path,
+        catalog_base=catalog_base,
+        venue=_VENUE,
+        city=_CITY,
+        derived_dir=derived_dir,
+        now_ns=_BASE_NS,
+    )
+
+    assert scored == ()
+    sidecar = derived_dir / "provenance.json"
+    assert sidecar.exists()
+    assert json.loads(sidecar.read_text()) == {"provenance": "live"}
+
+
+def test_r2_a_conflicting_sidecar_still_refuses_even_with_zero_admitted_rows(
+    tmp_path: Path,
+) -> None:
+    """R2(a), other side: the idempotent write is never a silent override --
+    a store already declaring a non-'live' provenance still refuses loudly
+    even when this run would have admitted zero rows."""
+    catalog_base = tmp_path / "catalog"
+    derived_dir = tmp_path / "derived"
+    fills_path = tmp_path / "fills.jsonl"
+    derived_dir.mkdir(parents=True)
+    (derived_dir / "provenance.json").write_text(json.dumps({"provenance": "paper_replay"}))
+    catalog = open_station_catalog(catalog_base, _VENUE, _CITY)
+    write_records(catalog, [_climate_day(tmax_f=79)])
+    fills_path.write_text(
+        json.dumps(_fill_row(trial_id="frac", qty="0.37")) + "\n", encoding="utf-8"
+    )
+
+    with pytest.raises(ProvenanceConflict):
+        score_live_trials(
+            fills_path=fills_path,
+            catalog_base=catalog_base,
+            venue=_VENUE,
+            city=_CITY,
+            derived_dir=derived_dir,
+            now_ns=_BASE_NS,
+        )
+
+
 # ---------------------------------------------------------------------------
 # B3: v2-only fill_order.jsonl sidecar (look ordering by fill time).
 # ---------------------------------------------------------------------------

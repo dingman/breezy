@@ -1,6 +1,6 @@
-# PREREG v2 — current_rung_hold (Polymarket.us) — group-sequential amendment (DRAFT, ratified-with-amendments 2026-09-04 (rev b))
+# PREREG v2 — current_rung_hold (Polymarket.us) — group-sequential amendment (BINDING, registered 2026-09-05 (rev b))
 
-Status: DRAFT, ratified-with-amendments (rev b). This revision applies the second binding ruling
+Status: BINDING (registered 2026-09-05 UTC; D0 = 2026-09-05 climate_day per §8). This revision applies the second binding ruling
 (`docs/evidence/grok_v2_score_statistic_ruling_2026-09-04.md`), which **amends** ratification
 (1)(a) [statistic] and (1)(c) [information fraction] only. It explicitly does **not** amend
 `n_max=160`, two one-sided α=0.025, Lan-DeMets O'Brien-Fleming (LD-OBF), pooled-only sequential
@@ -258,3 +258,36 @@ unspent Wilson peeks; calendar-time information fraction), plus:
 **Allowed on v1:** implement the already-registered structural-dead pin (§9); ALERT-only corpus
 hash check (v1 §7:144-145). The §8 D0 rule stands: any fill with `climate_day < d0_utc_day` is
 v1-only.
+
+## 13. Registration record (2026-09-05)
+
+Registered per the operator's delegation of PREREG binding to the build side (strategy-lead
+rulings: `docs/evidence/grok_v2_score_statistic_ruling_2026-09-04.md`,
+`docs/evidence/grok_prereg_v2_ratification_2026-09-04.md`,
+`docs/evidence/grok_partial_fill_ruling_2026-09-04.md`; domain-reviewer APPROVED registration
+contingent on R1 below). Precedent for making a PREREG binding: `git show 3bcb9c1` (v1's own
+one-line status change plus runbook rows and timer enablement).
+
+- **D0 = 2026-09-05** (UTC climate_day, §8). `deploy/families/pm_us_crh_v2.json` carries
+  `status: "REGISTERED"` and `d0_climate_day: "2026-09-05"`.
+- **Boundary artefact pin.** `deploy/families/gs_boundary_pm_us_crh_v2.json`'s
+  `inputs_sha256 = 471fd8a7ea781365d0e892cde87a65b5408126c07d8bb28e515b4c493c150e0c` (SS7's look
+  schedule `n_k = 10..160` step 10, two one-sided alpha=0.025, LD-OBF spending of `t`, `I_max=40`).
+- **Fill-time look ordering.** `ScoredTrial` carries no fill timestamp (SS8), so
+  `score_live_trials.py` appends `(trial_id, score_seq) -> filled_at_ns` to a `fill_order.jsonl`
+  sidecar for every scored fill; `family_tally_v2.py` replays looks in that real fill-time order
+  instead of the `climate_day`/`trial_id` proxy -- i.e. the SS7 look schedule ("every 10 filled
+  Takes") is evaluated against actual fill order, not against the chronological proxy. Disclosed
+  to the strategy lead.
+- **Provenance sidecar (ruling Q4).** `score_live_trials.py` is the sole writer of
+  `<store_dir>/provenance.json = {"provenance": "live"}`; `family_tally_v2.py --store-dir` refuses
+  any store lacking this sidecar or declaring anything else (e.g. `paper_replay`), except the
+  empty-store case below (R2).
+- **`q != 1` admission exclusion (ruling Q1/Q2).** A fill with `qty != 1` (partial or multi-fill)
+  is excluded before scoring -- never pooled into `n` or `k`, never silently scored as one contract.
+- **`held == (pnl > 0)` guard (ruling Q3).** Any scored row whose `held` disagrees with the sign of
+  its own `pnl` refuses the entire tally (`_assert_held_matches_pnl_sign`) -- the win definition is
+  asserted, never relabelled downstream.
+- **Empty-store n=0 rule (R2).** A store with no scored-trial rows and no provenance sidecar yet
+  (before this family's first fill) reports `n=0`/CONTINUE, not a refusal; a store WITH rows and
+  no/mismatched sidecar still refuses fail-closed.

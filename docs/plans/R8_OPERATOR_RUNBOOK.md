@@ -228,6 +228,13 @@ the BCa lower bound on ROI — the stop-gate quantity. Its output path is set by
 `scripts/analysis/mb_current_rung_edge_study.py` via `deploy/systemd/mb-daily-run.sh:62-63` and
 carries the ARCHIVE study only — no live section.
 
+PREREG v2 (registered 2026-09-05, `docs/specs/PREREG_v2_current_rung_hold_DRAFT_2026-09-04.md`)
+runs a SEPARATE sibling tally, `scripts/analysis/family_tally_v2.py`, driven by
+`deploy/systemd/breezy-pm-crh-v2-tally.timer` (15:30 UTC, one hour after the v1 tally, PREPARED —
+`family-tally-v2-run.sh pm_us_crh_v2`). It applies the group-sequential LD-OBF boundary to family
+`pm_us_crh_v2` over the same 6c scored-trial store, and is never a substitute for the v1 KILL/
+SURVIVE/UNDERPOWERED gate above.
+
 - **KILL** (n≥60 with the Wilson upper bound below pooled BE, or any dead n≥60 stratum): stop the node.
   The strategy is **dead by pre-registration**. No re-tuning, no floor lowered, no post-hoc screen.
 - **SURVIVE** (n≥150, Wilson lower bound above BE, no dead stratum, ΣPnL > 0): licenses **nothing

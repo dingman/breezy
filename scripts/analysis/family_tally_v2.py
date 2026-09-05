@@ -186,6 +186,12 @@ class FamilyTallyV2:
     total_pnl: Decimal
     bca_line: str | None
     structural_dead: StructuralDeadVerdict | None
+    #: R2(b): `--store-dir` had NO scored-trial rows AND no `provenance.json`
+    #: sidecar -- the state before `score_live_trials.py` has ever run
+    #: against a fresh live node with zero fills so far. Treated as n=0,
+    #: never refused (unlike a store WITH rows and no/mismatched sidecar,
+    #: which still refuses via `_assert_live_provenance`).
+    store_empty_no_sidecar: bool = False
 
 
 def _assert_held_matches_pnl_sign(rows: Sequence[ScoredTrial]) -> None:
@@ -402,9 +408,18 @@ def build_family_tally_v2(
     """
     _assert_held_matches_pnl_sign(rows)
     _assert_no_partial_or_multi_fill(rows)
+    store_empty_no_sidecar = False
     if store_dir is not None:
         _assert_no_raw_score_seq_collisions(store_dir)
-        _assert_live_provenance(store_dir)
+        sidecar_exists = (store_dir / _PROVENANCE_SIDECAR_NAME).exists()
+        if not rows and not sidecar_exists:
+            # R2(b): an empty store with no sidecar yet is not a refusal --
+            # it is the state before score_live_trials.py has ever run
+            # against this live node (zero fills so far). A store WITH
+            # rows and no/mismatched sidecar still refuses below.
+            store_empty_no_sidecar = True
+        else:
+            _assert_live_provenance(store_dir)
     # `FamilyManifest` (frozen/slots) satisfies `FamilyIdentity` structurally,
     # but mypy's Protocol check wants a settable attribute for a frozen
     # dataclass field; `live_family_tally.py`'s own `_PricedRow`/
@@ -559,6 +574,7 @@ def build_family_tally_v2(
         total_pnl=total_pnl,
         bca_line=bca_line,
         structural_dead=structural,
+        store_empty_no_sidecar=store_empty_no_sidecar,
     )
 
 
@@ -584,13 +600,23 @@ def render_markdown_v2(tally: FamilyTallyV2, *, source_paths: Sequence[Path], as
     add(f"status: {tally.status}")
     add(f"as_of: {as_of}")
     add(f"row count: {tally.n_scored} (excluded: {tally.n_excluded})")
+    if tally.store_empty_no_sidecar:
+        add("store empty; provenance sidecar not yet written")
     add("source parquet: " + ", ".join(str(p) for p in source_paths))
     add("")
     add(
         "provenance barrier (obligation e): the 17-column ScoredTrial "
         "schema carries no separate provenance column -- family/version "
-        "scope is enforced by trial_id prefix + registered d0_climate_day "
-        "only (breezy.settlement.family_barrier)."
+        "scope is enforced by three barriers, ANY of which refuses the "
+        "whole tally: trial_id prefix match AND climate_day >= the "
+        "registered d0_climate_day AND station in the registered station "
+        "census (breezy.settlement.family_barrier.assert_family_only). "
+        "In addition, --store-dir must carry a provenance.json sidecar "
+        "declaring provenance=='live' (written by score_live_trials.py, "
+        "ruling Q4) -- refused if missing or mismatched, except on an "
+        "empty store with no sidecar yet (n=0, not a refusal, R2) -- and "
+        "every scored fill's sequential-look position is read from the "
+        "store's fill_order.jsonl sidecar (B3)."
     )
     add(
         "qty guard (partial_or_multi_fill, obligation b): DORMANT against "

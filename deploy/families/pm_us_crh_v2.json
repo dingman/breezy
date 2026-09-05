@@ -2,7 +2,7 @@
   "family_id": "pm_us_crh_v2",
   "venue": "polymarket_us",
   "trial_id_prefix": "current_rung_hold/trial/",
-  "d0_climate_day": "2099-01-01",
+  "d0_climate_day": "2026-09-05",
   "boundary_artefact_path": "deploy/families/gs_boundary_pm_us_crh_v2.json",
   "boundary_inputs_sha256": "471fd8a7ea781365d0e892cde87a65b5408126c07d8bb28e515b4c493c150e0c",
   "stations": [
@@ -11,5 +11,5 @@
     "MIA",
     "SFO"
   ],
-  "status": "DRAFT_NOT_REGISTERED"
+  "status": "REGISTERED"
 }

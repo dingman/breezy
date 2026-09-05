@@ -268,18 +268,35 @@ def test_a_non_family_row_refuses_the_whole_tally(
         tally_mod.build_family_tally_v2(rows, manifest=manifest, artefact=real_artefact)
 
 
-def test_the_real_committed_pm_us_manifest_is_still_draft_and_now_correctly_pinned() -> None:
-    """Pins the deploy artefact this brief edits: `status`/`d0_climate_day`
-    untouched (still DRAFT_NOT_REGISTERED / a placeholder future date), but
-    `boundary_inputs_sha256` now matches the committed boundary artefact
-    exactly -- so `family_tally_v2.py --family pm_us_crh_v2` loads without
-    an `UnpinnedBoundaryArtefactError`/`BoundaryPinMismatch`, but still
-    renders SHADOW-only output (see `test_a_draft_manifest_renders_shadow_only...`
-    below) until an operator flips `status` to REGISTERED."""
+def test_the_real_committed_pm_us_manifest_is_registered_and_correctly_pinned() -> None:
+    """PREREG v2 registration (2026-09-05): `status` flipped to REGISTERED
+    and `d0_climate_day` set to the registration day -- the manifest loads
+    with NO `allow_draft` at all now (a caller that forgot the flag no
+    longer matters for this family). `boundary_inputs_sha256` is unchanged
+    and still matches the committed boundary artefact exactly."""
     real_manifest_path = _REPO_ROOT / "deploy" / "families" / "pm_us_crh_v2.json"
-    manifest = load_family_manifest(real_manifest_path, allow_draft=True)
-    assert manifest.status == "DRAFT_NOT_REGISTERED"
+    manifest = load_family_manifest(real_manifest_path)  # no allow_draft
+    assert manifest.status == "REGISTERED"
+    assert manifest.d0_climate_day == "2026-09-05"
     assert manifest.boundary_inputs_sha256 == _REAL_ARTEFACT_SHA
+
+
+def test_cli_renders_continue_verdict_vocabulary_for_the_real_registered_family_at_n_zero(
+    tmp_path: Path, tally_mod: ModuleType, capsys: Any
+) -> None:
+    """R2/R3: the real, now-REGISTERED `pm_us_crh_v2` manifest against an
+    empty store with no provenance sidecar yet renders n=0 CONTINUE verdict
+    vocabulary -- never SHADOW (that gate is DRAFT-only) and never a
+    ProvenanceRefusal (that refusal is reserved for a store WITH rows and
+    no/mismatched sidecar, R2(b))."""
+    store_dir = tmp_path / "store"
+    store_dir.mkdir()
+    rc = tally_mod.main(["--family", "pm_us_crh_v2", "--store-dir", str(store_dir)])
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "store empty; provenance sidecar not yet written" in out
+    assert "**CONTINUE**" in out
+    assert "SHADOW" not in out
 
 
 def test_a_draft_manifest_renders_shadow_only_never_verdict_vocabulary(
@@ -402,11 +419,17 @@ def test_assert_live_provenance_admits_live_non_vacuity(
     tally_mod._assert_live_provenance(store_dir)  # no raise
 
 
-def test_cli_refuses_a_missing_provenance_sidecar_with_a_labelled_reason(
+def test_cli_refuses_a_populated_store_with_a_missing_provenance_sidecar(
     tmp_path: Path, tally_mod: ModuleType, capsys: Any
 ) -> None:
+    """R2(b): the "no sidecar" exception applies ONLY to an empty store
+    (n=0, see `test_cli_renders_continue_verdict_vocabulary_for_the_real_
+    registered_family_at_n_zero` above) -- a store that already has scored
+    rows but no sidecar still refuses fail-closed."""
+    from breezy.persistence.scored_trial_store import write_scored_trials
+
     store_dir = tmp_path / "store"
-    store_dir.mkdir()
+    write_scored_trials(store_dir, _rows(1, prefix=_PM_PREFIX, climate_day="2026-09-10"), now_ns=1)
     rc = tally_mod.main(["--family", "pm_us_crh_v2", "--store-dir", str(store_dir)])
     assert rc != 0
     err = capsys.readouterr().err
@@ -431,6 +454,92 @@ def test_cli_admits_a_live_provenance_sidecar(tmp_path: Path, tally_mod: ModuleT
     (store_dir / "provenance.json").write_text(json.dumps({"provenance": "live"}))
     rc = tally_mod.main(["--family", "pm_us_crh_v2", "--store-dir", str(store_dir)])
     assert rc == 0
+
+
+# --- R2(b): four store-empty x sidecar-present combinations ----------------
+#
+# (rows=0, sidecar missing)  -> n=0, NOT refused, report notes the empty store
+# (rows=0, sidecar valid)    -> normal pass, no empty-store note
+# (rows>0, sidecar missing)  -> still refuses (ProvenanceRefusal)
+# (rows>0, sidecar mismatched) -> still refuses (ProvenanceRefusal)
+
+
+def test_r2_empty_rows_and_missing_sidecar_is_n_zero_not_refused(
+    tmp_path: Path, tally_mod: ModuleType, real_artefact: BoundaryArtefact
+) -> None:
+    manifest = _manifest(tmp_path)
+    store_dir = tmp_path / "store"
+    store_dir.mkdir()
+    tally = tally_mod.build_family_tally_v2(
+        (), manifest=manifest, artefact=real_artefact, store_dir=store_dir
+    )
+    assert tally.n_scored == 0
+    assert tally.store_empty_no_sidecar is True
+    report = tally_mod.render_markdown_v2(tally, source_paths=(store_dir,), as_of="2026-09-11")
+    assert "store empty; provenance sidecar not yet written" in report
+    assert "**CONTINUE**" in report
+
+
+def test_r2_empty_rows_and_a_valid_live_sidecar_is_the_normal_pass(
+    tmp_path: Path, tally_mod: ModuleType, real_artefact: BoundaryArtefact
+) -> None:
+    manifest = _manifest(tmp_path)
+    store_dir = tmp_path / "store"
+    store_dir.mkdir()
+    (store_dir / "provenance.json").write_text(json.dumps({"provenance": "live"}))
+    tally = tally_mod.build_family_tally_v2(
+        (), manifest=manifest, artefact=real_artefact, store_dir=store_dir
+    )
+    assert tally.n_scored == 0
+    assert tally.store_empty_no_sidecar is False
+    report = tally_mod.render_markdown_v2(tally, source_paths=(store_dir,), as_of="2026-09-11")
+    assert "store empty; provenance sidecar not yet written" not in report
+
+
+def test_r2_rows_present_and_missing_sidecar_still_refuses(
+    tmp_path: Path, tally_mod: ModuleType, real_artefact: BoundaryArtefact
+) -> None:
+    manifest = _manifest(tmp_path)
+    store_dir = tmp_path / "store"
+    store_dir.mkdir()
+    rows = _rows(5)
+    with pytest.raises(tally_mod.ProvenanceRefusal):
+        tally_mod.build_family_tally_v2(
+            rows, manifest=manifest, artefact=real_artefact, store_dir=store_dir
+        )
+
+
+def test_r2_rows_present_and_a_mismatched_sidecar_still_refuses(
+    tmp_path: Path, tally_mod: ModuleType, real_artefact: BoundaryArtefact
+) -> None:
+    manifest = _manifest(tmp_path)
+    store_dir = tmp_path / "store"
+    store_dir.mkdir()
+    (store_dir / "provenance.json").write_text(json.dumps({"provenance": "paper_replay"}))
+    rows = _rows(5)
+    with pytest.raises(tally_mod.ProvenanceRefusal):
+        tally_mod.build_family_tally_v2(
+            rows, manifest=manifest, artefact=real_artefact, store_dir=store_dir
+        )
+
+
+# --- R1: obligation (e) states all three barriers, provenance sidecar, and
+# the fill-order sidecar -------------------------------------------------
+
+
+def test_obligation_e_report_line_states_all_three_barriers_and_sidecars(
+    tmp_path: Path, tally_mod: ModuleType, real_artefact: BoundaryArtefact
+) -> None:
+    manifest = _manifest(tmp_path)
+    rows = _rows(5)
+    tally = tally_mod.build_family_tally_v2(rows, manifest=manifest, artefact=real_artefact)
+    report = tally_mod.render_markdown_v2(tally, source_paths=(tmp_path,), as_of="2026-09-11")
+    assert "trial_id prefix" in report
+    assert "d0_climate_day" in report
+    assert "station census" in report
+    assert "provenance.json" in report
+    assert "score_live_trials.py" in report
+    assert "fill_order.jsonl" in report
 
 
 # --- B3: fill-time look ordering (v2-only, active when store_dir is given) --
