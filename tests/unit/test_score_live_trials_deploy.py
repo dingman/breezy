@@ -146,6 +146,22 @@ def _marker_path(tmp_path: Path) -> Path:
     return tmp_path / "derived" / f"score_live_trials_ok_{stamp}"
 
 
+def _cjson_path(tmp_path: Path) -> Path:
+    stamp = _dt.datetime.now(_dt.UTC).strftime("%Y-%m-%d")
+    return tmp_path / "derived" / f"covered_listed_station_days_{stamp}.json"
+
+
+def _seed_stale_cjson(tmp_path: Path) -> Path:
+    """A well-shaped but STALE/foreign counter JSON -- wrong station list,
+    so a test can prove it either survived (bug) or was removed (fix)."""
+    cjson = _cjson_path(tmp_path)
+    cjson.parent.mkdir(parents=True, exist_ok=True)
+    stale = json.loads(_default_counter_json())
+    stale["stations"] = ["ZZZ"]
+    cjson.write_text(json.dumps(stale, indent=2, sort_keys=True))
+    return cjson
+
+
 def _scorer_calls(argv_log: Path) -> list[str]:
     if not argv_log.exists():
         return []
@@ -313,6 +329,39 @@ def test_counter_json_with_duplicate_count_line_leaves_no_marker(tmp_path: Path)
     assert result.returncode != 0
     assert not _marker_path(tmp_path).exists()
     assert not _scorer_calls(argv_log)
+
+
+def test_stale_counter_json_removed_when_counter_fails(tmp_path: Path) -> None:
+    # Trust-boundary residual (Codex re-check, MEDIUM): a stale or foreign
+    # well-shaped counter JSON must never survive to be read by a station
+    # loop or the v1 tally wrapper -- it must be gone the instant this run's
+    # own counter did not (re)write it.
+    stub, argv_log = _make_stub(tmp_path, counter_exit=1)
+    cjson = _seed_stale_cjson(tmp_path)
+    assert cjson.exists()
+
+    result = _run_wrapper(tmp_path, stub_python=stub)
+
+    assert result.returncode != 0
+    assert not cjson.exists()
+    assert not _marker_path(tmp_path).exists()
+    assert not _scorer_calls(argv_log)
+
+
+def test_stale_counter_json_replaced_by_this_runs_fresh_output_on_success(
+    tmp_path: Path,
+) -> None:
+    stub, argv_log = _make_stub(tmp_path)
+    cjson = _seed_stale_cjson(tmp_path)
+
+    result = _run_wrapper(tmp_path, stub_python=stub)
+
+    assert result.returncode == 0, result.stderr
+    assert cjson.exists()
+    fresh = json.loads(cjson.read_text())
+    assert fresh["stations"] == ["LAX", "MDW", "MIA", "SFO"]
+    assert _marker_path(tmp_path).exists()
+    assert len(_scorer_calls(argv_log)) == 4
 
 
 def test_environment_lines_byte_identical_and_equal_pinned_literal() -> None:

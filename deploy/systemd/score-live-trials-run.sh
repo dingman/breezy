@@ -57,6 +57,13 @@ if [ "$CHECK_TOKEN" = "NO_NODE" ]; then
 fi
 
 CJSON="$OUT/covered_listed_station_days_$STAMP.json"
+# Trust-boundary residual (Codex re-check, MEDIUM): remove any existing
+# counter JSON IMMEDIATELY before invoking the counter -- never leave a
+# stale/foreign well-shaped file in place for the station loop below or the
+# 14:30 v1 wrapper to read. If the counter then fails, this file stays
+# absent and both wrappers refuse (this one on the shape check below; v1 on
+# a missing file), rather than silently consuming yesterday's counts.
+rm -f "$CJSON"
 if ! "$PY" "$REPO/scripts/analysis/structural_dead_stop.py" \
      --catalog-root "$CATALOG_ROOT" \
      --family-manifest "$FAMILY_MANIFEST" \
