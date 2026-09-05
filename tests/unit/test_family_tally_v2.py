@@ -809,6 +809,137 @@ def test_a_non_decimal_qty_refuses_loudly(tmp_path: Path, tally_mod: ModuleType)
         tally_mod.read_excluded_fills(store_dir)
 
 
+# --- BLOCK-3: identity-field validation (LIVE_FILL_SCORING_CHAIN 3.0(c), I2) -
+# `venue_order_id` must be non-empty for every reason; `trial_id`/`station`/
+# `climate_day` must be non-empty for every reason EXCEPT `no_taken_latch`,
+# where all three may be `""` (no taken latch means no trial identity yet).
+
+
+def test_a_blank_venue_order_id_refuses_loudly_for_an_ordinary_reason(
+    tmp_path: Path, tally_mod: ModuleType
+) -> None:
+    store_dir = tmp_path / "store"
+    store_dir.mkdir()
+    (store_dir / "excluded_fills.jsonl").write_text(
+        _excluded_fill_line(
+            trial_id="t1",
+            station="MIA",
+            climate_day="2026-09-11",
+            venue_order_id="",
+            reason="fee_unverified",
+        )
+        + "\n"
+    )
+    with pytest.raises(tally_mod.ScoredTrialDataIntegrityError, match="venue_order_id"):
+        tally_mod.read_excluded_fills(store_dir)
+
+
+def test_a_blank_venue_order_id_refuses_loudly_even_for_no_taken_latch(
+    tmp_path: Path, tally_mod: ModuleType
+) -> None:
+    store_dir = tmp_path / "store"
+    store_dir.mkdir()
+    (store_dir / "excluded_fills.jsonl").write_text(
+        _excluded_fill_line(venue_order_id="", reason="no_taken_latch") + "\n"
+    )
+    with pytest.raises(tally_mod.ScoredTrialDataIntegrityError, match="venue_order_id"):
+        tally_mod.read_excluded_fills(store_dir)
+
+
+def test_a_blank_station_with_reason_fee_unverified_refuses_loudly(
+    tmp_path: Path, tally_mod: ModuleType
+) -> None:
+    store_dir = tmp_path / "store"
+    store_dir.mkdir()
+    (store_dir / "excluded_fills.jsonl").write_text(
+        _excluded_fill_line(
+            trial_id="t1",
+            station="",
+            climate_day="2026-09-11",
+            venue_order_id="vo-1",
+            reason="fee_unverified",
+        )
+        + "\n"
+    )
+    with pytest.raises(tally_mod.ScoredTrialDataIntegrityError, match="station"):
+        tally_mod.read_excluded_fills(store_dir)
+
+
+def test_a_blank_trial_id_with_reason_fill_below_ask_refuses_loudly(
+    tmp_path: Path, tally_mod: ModuleType
+) -> None:
+    store_dir = tmp_path / "store"
+    store_dir.mkdir()
+    (store_dir / "excluded_fills.jsonl").write_text(
+        _excluded_fill_line(
+            trial_id="",
+            station="MIA",
+            climate_day="2026-09-11",
+            venue_order_id="vo-1",
+            reason="fill_below_ask",
+        )
+        + "\n"
+    )
+    with pytest.raises(tally_mod.ScoredTrialDataIntegrityError, match="trial_id"):
+        tally_mod.read_excluded_fills(store_dir)
+
+
+def test_a_blank_climate_day_with_reason_duplicate_fill_for_latch_refuses_loudly(
+    tmp_path: Path, tally_mod: ModuleType
+) -> None:
+    store_dir = tmp_path / "store"
+    store_dir.mkdir()
+    (store_dir / "excluded_fills.jsonl").write_text(
+        _excluded_fill_line(
+            trial_id="t1",
+            station="MIA",
+            climate_day="",
+            venue_order_id="vo-1",
+            reason="duplicate_fill_for_latch",
+        )
+        + "\n"
+    )
+    with pytest.raises(tally_mod.ScoredTrialDataIntegrityError, match="climate_day"):
+        tally_mod.read_excluded_fills(store_dir)
+
+
+def test_no_taken_latch_accepts_blank_identity_fields_and_renders_them_blank(
+    tmp_path: Path, tally_mod: ModuleType
+) -> None:
+    store_dir = tmp_path / "store"
+    store_dir.mkdir()
+    (store_dir / "excluded_fills.jsonl").write_text(
+        _excluded_fill_line(venue_order_id="vo-1", reason="no_taken_latch") + "\n"
+    )
+    excluded = tally_mod.read_excluded_fills(store_dir)
+    assert len(excluded) == 1
+    fill = excluded[0]
+    assert fill.trial_id == ""
+    assert fill.station == ""
+    assert fill.climate_day == ""
+    rows = tally_mod.coverage_rows(excluded, frozenset())
+    assert rows == (
+        tally_mod.CoverageRow(reason="no_taken_latch", station="", climate_day="", count=1),
+    )
+
+
+def test_a_non_iso_climate_day_refuses_loudly(tmp_path: Path, tally_mod: ModuleType) -> None:
+    store_dir = tmp_path / "store"
+    store_dir.mkdir()
+    (store_dir / "excluded_fills.jsonl").write_text(
+        _excluded_fill_line(
+            trial_id="t1",
+            station="MIA",
+            climate_day="09/11/2026",
+            venue_order_id="vo-1",
+            reason="fee_unverified",
+        )
+        + "\n"
+    )
+    with pytest.raises(tally_mod.ScoredTrialDataIntegrityError, match="climate_day"):
+        tally_mod.read_excluded_fills(store_dir)
+
+
 def test_v2_statistics_are_byte_identical_with_and_without_excluded_fills_artefact(
     tmp_path: Path, tally_mod: ModuleType, real_artefact: BoundaryArtefact
 ) -> None:

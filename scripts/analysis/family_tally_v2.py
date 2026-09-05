@@ -166,6 +166,12 @@ _EXCLUDED_FILL_KEYS: Final[tuple[str, ...]] = (
 )
 #: 3.0(g): `YYYY-MM-DDTHH:MM:SSZ`, UTC and lexically sortable.
 _SCORED_RUN_UTC_RE: Final[re.Pattern[str]] = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$")
+#: shape only (mirrors `_SCORED_RUN_UTC_RE`'s non-calendar-validating style).
+_CLIMATE_DAY_RE: Final[re.Pattern[str]] = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+#: 3.0(c)/I2 BLOCK-3: the sole reason for which `trial_id`/`station`/
+#: `climate_day` may be blank -- a fill whose instrument never reached a
+#: taken latch has no trial identity yet.
+_NO_TAKEN_LATCH_REASON: Final[str] = "no_taken_latch"
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
@@ -641,8 +647,10 @@ def read_excluded_fills(store_dir: Path) -> tuple[ExcludedFill, ...]:
 
     An absent file returns no rows, never an error -- day one has none, not
     a refusal. A malformed line (missing key, bad JSON, a `scored_run_utc`
-    not shaped `YYYY-MM-DDTHH:MM:SSZ`, or a non-decimal `qty`) refuses the
-    whole tally loudly.
+    not shaped `YYYY-MM-DDTHH:MM:SSZ`, a non-decimal `qty`, a blank
+    `venue_order_id`, a blank `trial_id`/`station`/`climate_day` for any
+    reason other than `no_taken_latch`, or a `climate_day` not shaped
+    `YYYY-MM-DD`) refuses the whole tally loudly.
     """
     path = store_dir / _EXCLUDED_FILLS_FILENAME
     if not path.exists():
@@ -691,11 +699,36 @@ def _excluded_fill_from_line(line: str, *, path: Path, lineno: int) -> ExcludedF
         raise ScoredTrialDataIntegrityError(
             f"refusing to tally: malformed {path}:{lineno} -- empty/non-string reason"
         )
+    venue_order_id = row["venue_order_id"]
+    if not isinstance(venue_order_id, str) or not venue_order_id:
+        raise ScoredTrialDataIntegrityError(
+            f"refusing to tally: malformed {path}:{lineno} -- empty/non-string venue_order_id"
+        )
+    trial_id = row["trial_id"]
+    station = row["station"]
+    climate_day = row["climate_day"]
+    if reason != _NO_TAKEN_LATCH_REASON:
+        for field_name, value in (
+            ("trial_id", trial_id),
+            ("station", station),
+            ("climate_day", climate_day),
+        ):
+            if not isinstance(value, str) or not value:
+                raise ScoredTrialDataIntegrityError(
+                    f"refusing to tally: malformed {path}:{lineno} -- empty/non-string "
+                    f"{field_name} (reason {reason!r} requires it; only "
+                    f"{_NO_TAKEN_LATCH_REASON!r} may leave it blank)"
+                )
+    if climate_day and (not isinstance(climate_day, str) or not _CLIMATE_DAY_RE.match(climate_day)):
+        raise ScoredTrialDataIntegrityError(
+            f"refusing to tally: malformed {path}:{lineno} -- climate_day "
+            f"{climate_day!r} is not YYYY-MM-DD"
+        )
     return ExcludedFill(
-        trial_id=row["trial_id"],
-        station=row["station"],
-        climate_day=row["climate_day"],
-        venue_order_id=row["venue_order_id"],
+        trial_id=trial_id,
+        station=station,
+        climate_day=climate_day,
+        venue_order_id=venue_order_id,
         qty=qty,
         reason=reason,
         filled_at_ns=filled_at_ns,
