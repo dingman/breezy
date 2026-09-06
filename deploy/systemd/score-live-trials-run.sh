@@ -4,7 +4,7 @@
 # then the covered-listed-station-days counter (run ONCE, here, per section
 # 7's build-time disposition -- NOT by live-tally-run.sh), then one
 # `score_live_trials.py` invocation per manifest station. The dated success
-# marker `score_live_trials_ok_$STAMP` is the ONE thing both 14:30 and 15:30
+# marker `score_live_trials_ok_$STAMP` is the ONE thing both 14:30 and 17:15
 # tally wrappers assert before running (BLOCK-2): this script is its SOLE
 # writer, and only after the counter AND every city's scorer invocation
 # exited 0.

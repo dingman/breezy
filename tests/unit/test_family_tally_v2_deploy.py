@@ -11,10 +11,13 @@ from __future__ import annotations
 import datetime as _dt
 import json
 import os
+import re
 import subprocess
 from pathlib import Path
 
 import pytest
+
+from breezy.runtime.trade_supervisor_core import LAUNCH_WINDOW_END_UTC
 
 _REPO_ROOT = Path(__file__).resolve().parents[2]
 _SYSTEMD_DIR = _REPO_ROOT / "deploy" / "systemd"
@@ -46,7 +49,8 @@ def _run_wrapper(
     create_marker: bool = True,
     set_state_db: bool = True,
     write_counter_json: bool = True,
-) -> subprocess.CompletedProcess:
+    state_db: Path | None = None,
+) -> subprocess.CompletedProcess[str]:
     # I3 (LIVE_FILL_SCORING_CHAIN_2026-09-05.md, BLOCK-2): the wrapper now
     # asserts the 14:15 score-live-trials-run.sh success marker before
     # tallying. Every pre-existing test in this module drives the wrapper
@@ -60,7 +64,11 @@ def _run_wrapper(
     if stub_python is not None:
         env["BREEZY_FAMILY_TALLY_V2_PYTHON"] = str(stub_python)
     if set_state_db:
-        env["POLYMARKET_US_EXEC_STATE_DB"] = str(tmp_path / "state" / "exec_polymarket_us.sqlite")
+        env["POLYMARKET_US_EXEC_STATE_DB"] = str(
+            state_db
+            if state_db is not None
+            else tmp_path / "state" / "exec_polymarket_us.sqlite"
+        )
     else:
         env.pop("POLYMARKET_US_EXEC_STATE_DB", None)
     if create_marker:
@@ -117,7 +125,23 @@ def test_wrapper_rejects_missing_family_id(tmp_path: Path) -> None:
 def test_wrapper_passes_family_id_through_unmodified(tmp_path: Path, family_id: str) -> None:
     capture = tmp_path / "argv_capture.txt"
     stub = tmp_path / "stub_python.sh"
-    stub.write_text(f'#!/usr/bin/env bash\nprintf "%s\\n" "$@" > "{capture}"\nexit 0\n')
+    stub.write_text(
+        f"""#!/usr/bin/env bash
+case "$*" in
+  *"-m breezy.runtime.exec_state_db_path --check"*)
+    echo "MATCH"
+    exit 0
+    ;;
+  *"-m breezy.runtime.structural_pin_guard"*)
+    exit 0
+    ;;
+  *)
+    printf "%s\\n" "$@" > "{capture}"
+    exit 0
+    ;;
+esac
+"""
+    )
     stub.chmod(0o755)
 
     result = _run_wrapper([family_id], tmp_path, stub_python=stub)
@@ -211,9 +235,26 @@ def test_concrete_unit_pair_exists_and_wires_to_wrapper(
     assert f"Unit={service_name}" in timer_text
 
 
-def test_pm_crh_v2_timer_fires_at_1530_utc() -> None:
+def test_pm_crh_v2_timer_fires_at_1715_utc() -> None:
     timer_text = (_SYSTEMD_DIR / "breezy-pm-crh-v2-tally.timer").read_text()
-    assert "OnCalendar=*-*-* 15:30:00 UTC" in timer_text
+    assert "OnCalendar=*-*-* 17:15:00 UTC" in timer_text
+
+
+def test_pm_crh_v2_tally_tick_is_after_node_launch() -> None:
+    """A1: parse OnCalendar= and require the tick at/after launch-window end.
+
+    Compares the parsed ``dt.time`` to ``LAUNCH_WINDOW_END_UTC`` (not a
+    restated 16:50 literal). RED while the timer still fires at 15:30.
+    """
+    timer_text = (_SYSTEMD_DIR / "breezy-pm-crh-v2-tally.timer").read_text()
+    match = re.search(
+        r"^OnCalendar=\S+\s+(\d{2}):(\d{2}):(\d{2})\s+UTC\s*$",
+        timer_text,
+        re.MULTILINE,
+    )
+    assert match is not None, "breezy-pm-crh-v2-tally.timer has no parseable OnCalendar="
+    tick = _dt.time(int(match.group(1)), int(match.group(2)), int(match.group(3)))
+    assert tick >= LAUNCH_WINDOW_END_UTC
 
 
 def _write_counter_json(
@@ -244,6 +285,9 @@ def test_wrapper_passes_covered_listed_and_fill_source(tmp_path: Path) -> None:
 case "$*" in
   *"-m breezy.runtime.exec_state_db_path --check"*)
     echo "MATCH"
+    exit 0
+    ;;
+  *"-m breezy.runtime.structural_pin_guard"*)
     exit 0
     ;;
   *)
@@ -297,6 +341,9 @@ case "$*" in
     echo "MATCH"
     exit 0
     ;;
+  *"-m breezy.runtime.structural_pin_guard"*)
+    exit 0
+    ;;
   *)
     printf "%s\\n" "$@" > "{capture}"
     exit 0
@@ -316,7 +363,13 @@ esac
     assert not capture.exists()
 
 
-def test_pm_wrapper_skips_structural_eval_when_node_check_returns_no_node(
+def _wrapper_output_blob(result: subprocess.CompletedProcess[str], tmp_path: Path) -> str:
+    log_path = tmp_path / "derived" / "family_tally_v2.log"
+    log_text = log_path.read_text() if log_path.exists() else ""
+    return f"{result.stdout}{result.stderr}{log_text}"
+
+
+def test_pm_wrapper_exits_nonzero_and_does_not_invoke_tally_when_check_returns_no_node(
     tmp_path: Path,
 ) -> None:
     capture = tmp_path / "argv_capture.txt"
@@ -328,44 +381,8 @@ case "$*" in
     echo "NO_NODE"
     exit 0
     ;;
-  *)
-    printf "%s\\n" "$@" > "{capture}"
-    exit 0
-    ;;
-esac
-"""
-    )
-    stub.chmod(0o755)
-    result = _run_wrapper(
-        ["pm_us_crh_v2"],
-        tmp_path,
-        stub_python=stub,
-        set_state_db=True,
-    )
-    assert result.returncode == 0, result.stderr
-    assert "STRUCTURAL-DEAD UNAVAILABLE" in result.stdout
-    assert "NO_NODE" in result.stdout
-    argv_lines = capture.read_text().splitlines()
-    assert "--family" in argv_lines
-    assert argv_lines[argv_lines.index("--family") + 1] == "pm_us_crh_v2"
-    assert "--fill-source" not in argv_lines
-    assert "--covered-listed-station-days" not in argv_lines
-    assert "--fill-since-climate-day" not in argv_lines
-
-
-def test_pm_wrapper_skips_structural_eval_when_node_check_refuses(
-    tmp_path: Path,
-) -> None:
-    """Codex review finding F2: a non-zero exit from the --check pre-flight
-    (refused/discovery-failed) must fall back to the sequential tally with no
-    structural args -- never exit 1 and never pass --fill-source on a token
-    that isn't MATCH."""
-    capture = tmp_path / "argv_capture.txt"
-    stub = tmp_path / "stub_python.sh"
-    stub.write_text(
-        f"""#!/usr/bin/env bash
-case "$*" in
-  *"-m breezy.runtime.exec_state_db_path --check"*)
+  *"-m breezy.runtime.structural_pin_guard"*)
+    echo "UNAVAILABLE token='NO_NODE'" >&2
     exit 1
     ;;
   *)
@@ -382,14 +399,136 @@ esac
         stub_python=stub,
         set_state_db=True,
     )
+    blob = _wrapper_output_blob(result, tmp_path)
+    assert result.returncode != 0
+    assert "UNAVAILABLE" in blob or "PRE_LAUNCH" in blob
+    assert "NO_NODE" in blob
+    assert not capture.exists()
+
+
+def test_pm_wrapper_exits_nonzero_and_does_not_invoke_tally_when_check_refuses(
+    tmp_path: Path,
+) -> None:
+    """Non-zero --check (token 'refused') must fail-loud: no sequential tally."""
+    capture = tmp_path / "argv_capture.txt"
+    stub = tmp_path / "stub_python.sh"
+    stub.write_text(
+        f"""#!/usr/bin/env bash
+case "$*" in
+  *"-m breezy.runtime.exec_state_db_path --check"*)
+    exit 1
+    ;;
+  *"-m breezy.runtime.structural_pin_guard"*)
+    echo "UNAVAILABLE token='refused'" >&2
+    exit 1
+    ;;
+  *)
+    printf "%s\\n" "$@" > "{capture}"
+    exit 0
+    ;;
+esac
+"""
+    )
+    stub.chmod(0o755)
+    result = _run_wrapper(
+        ["pm_us_crh_v2"],
+        tmp_path,
+        stub_python=stub,
+        set_state_db=True,
+    )
+    blob = _wrapper_output_blob(result, tmp_path)
+    assert result.returncode != 0
+    assert "UNAVAILABLE" in blob or "PRE_LAUNCH" in blob
+    assert "refused" in blob
+    assert not capture.exists()
+
+
+def test_pm_wrapper_mismatch_exits_1_and_does_not_pass_fill_source(
+    tmp_path: Path,
+) -> None:
+    """A7/A12: --check exit 3 (MISMATCH) → wrapper exit 1, no --fill-source."""
+    capture = tmp_path / "argv_capture.txt"
+    guard_capture = tmp_path / "guard_argv.txt"
+    stub = tmp_path / "stub_python.sh"
+    stub.write_text(
+        f"""#!/usr/bin/env bash
+case "$*" in
+  *"-m breezy.runtime.exec_state_db_path --check"*)
+    echo "MISMATCH"
+    exit 3
+    ;;
+  *"-m breezy.runtime.structural_pin_guard"*)
+    printf "%s\\n" "$@" > "{guard_capture}"
+    exit 1
+    ;;
+  *)
+    printf "%s\\n" "$@" > "{capture}"
+    exit 0
+    ;;
+esac
+"""
+    )
+    stub.chmod(0o755)
+    other_db = tmp_path / "other" / "exec_polymarket_us.sqlite"
+    result = _run_wrapper(
+        ["pm_us_crh_v2"],
+        tmp_path,
+        stub_python=stub,
+        set_state_db=True,
+        state_db=other_db,
+    )
+    assert result.returncode == 1
+    assert not capture.exists()
+    assert guard_capture.exists()
+    guard_argv = guard_capture.read_text().splitlines()
+    assert "--token" in guard_argv
+    assert guard_argv[guard_argv.index("--token") + 1] == "MISMATCH"
+
+
+def test_pm_wrapper_invokes_structural_pin_guard_then_tally_on_match(
+    tmp_path: Path,
+) -> None:
+    tally_capture = tmp_path / "tally_argv.txt"
+    guard_capture = tmp_path / "guard_argv.txt"
+    stub = tmp_path / "stub_python.sh"
+    stub.write_text(
+        f"""#!/usr/bin/env bash
+case "$*" in
+  *"-m breezy.runtime.exec_state_db_path --check"*)
+    echo "MATCH"
+    exit 0
+    ;;
+  *"-m breezy.runtime.structural_pin_guard"*)
+    printf "%s\\n" "$@" > "{guard_capture}"
+    exit 0
+    ;;
+  *)
+    printf "%s\\n" "$@" > "{tally_capture}"
+    exit 0
+    ;;
+esac
+"""
+    )
+    stub.chmod(0o755)
+    result = _run_wrapper(
+        ["pm_us_crh_v2"],
+        tmp_path,
+        stub_python=stub,
+        set_state_db=True,
+    )
     assert result.returncode == 0, result.stderr
-    assert "STRUCTURAL-DEAD UNAVAILABLE" in result.stdout
-    argv_lines = capture.read_text().splitlines()
-    assert "--family" in argv_lines
-    assert argv_lines[argv_lines.index("--family") + 1] == "pm_us_crh_v2"
-    assert "--fill-source" not in argv_lines
-    assert "--covered-listed-station-days" not in argv_lines
-    assert "--fill-since-climate-day" not in argv_lines
+    assert guard_capture.exists()
+    guard_argv = guard_capture.read_text().splitlines()
+    assert "--family" in guard_argv
+    assert guard_argv[guard_argv.index("--family") + 1] == "pm_us_crh_v2"
+    assert "--token" in guard_argv
+    assert guard_argv[guard_argv.index("--token") + 1] == "MATCH"
+    assert "--now" not in guard_argv
+    tally_argv = tally_capture.read_text().splitlines()
+    assert "--covered-listed-station-days" in tally_argv
+    assert "--fill-source" in tally_argv
+    assert "--fill-since-climate-day" in tally_argv
+    assert tally_argv[tally_argv.index("--fill-since-climate-day") + 1] == "2026-09-05"
 
 
 def test_kalshi_crh_unit_pair_is_parked_off_main(tmp_path: Path) -> None:

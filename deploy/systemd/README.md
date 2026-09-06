@@ -575,7 +575,7 @@ resolving its fill source in-process from `POLYMARKET_US_EXEC_STATE_DB`
 invocation exit 0 does the wrapper write the ONE dated success marker,
 `score_live_trials_ok_<date>`, under `~/.local/share/breezy/derived/` — the
 SOLE writer of that marker anywhere in this repo. Both `breezy-live-tally`
-(14:30 UTC) and `breezy-pm-crh-v2-tally` (15:30 UTC) assert it before
+(14:30 UTC) and `breezy-pm-crh-v2-tally` (17:15 UTC) assert it before
 tallying, so neither can run against a partial or unscored store (BLOCK-2).
 
 Scheduled at **14:15 UTC**, free on the existing schedule and strictly
@@ -607,10 +607,10 @@ too.
 One concrete unit pair runs `scripts/analysis/family_tally_v2.py` (the CLI
 sibling of `live_family_tally.py`, built in a parallel commit) via
 `deploy/systemd/family-tally-v2-run.sh`: **`breezy-pm-crh-v2-tally`** at
-**15:30 UTC** for family `pm_us_crh_v2` — an hour after `breezy-live-tally`
-(14:30 UTC) so v1's read is never raced. No templated `@.service` unit: the
-repo has no precedent for one, so this is a concrete pair per the existing
-convention.
+**17:15 UTC** for family `pm_us_crh_v2` — after supervisor launch (16:50)
+and the 17:10 window end, so MATCH can bind the live node's sqlite. No
+templated `@.service` unit: the repo has no precedent for one, so this is
+a concrete pair per the existing convention.
 
 **I3 (2026-09-05):** the wrapper now asserts `breezy-score-live-trials`'s
 (14:15 UTC) dated success marker before invoking the CLI, exiting non-zero

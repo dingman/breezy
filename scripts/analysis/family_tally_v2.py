@@ -137,6 +137,10 @@ _PROVENANCE_SIDECAR_NAME: Final[str] = "provenance.json"
 #: from `len(scored)`.
 _LIVE_TRIAL_ID_PREFIX: Final[str] = "current_rung_hold/trial/"
 
+#: The only family whose CLI requires the three structural-dead population
+#: args (L-28). The wrapper keeps its own ``$PM_FAMILY`` copy.
+_PM_US_CRH_V2_FAMILY_ID: Final[str] = "pm_us_crh_v2"
+
 #: v1 SS6:124-128, restated (never imported -- `mb_current_rung_edge_study`
 #: has no module-level constant for this; it is inlined in prose there).
 LOSS_STOP_PNL: Final[Decimal] = Decimal(-60)
@@ -1011,6 +1015,20 @@ def main(argv: Sequence[str] | None = None) -> int:
         return 2
 
     manifest = load_family_manifest(manifest_path, allow_draft=True)
+    if args.family == _PM_US_CRH_V2_FAMILY_ID and (
+        args.covered_listed_station_days is None
+        or args.fill_source is None
+        or args.fill_since_climate_day is None
+        or args.fill_since_climate_day != manifest.d0_climate_day
+    ):
+        print(
+            "family_tally_v2: pm_us_crh_v2 requires --covered-listed-station-days, "
+            "--fill-source, and --fill-since-climate-day equal to the manifest "
+            f"d0_climate_day ({manifest.d0_climate_day!r}); "
+            f"got fill-since-climate-day={args.fill_since_climate_day!r}",
+            file=sys.stderr,
+        )
+        return 2
     artefact_path = repo_root / manifest.boundary_artefact_path
     artefact = load_boundary_artefact(
         artefact_path, expected_sha256=manifest.boundary_inputs_sha256

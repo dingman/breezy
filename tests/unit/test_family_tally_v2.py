@@ -36,6 +36,25 @@ _REAL_ARTEFACT_SHA = "471fd8a7ea781365d0e892cde87a65b5408126c07d8bb28e515b4c493c
 _FEE_THETA = Decimal("0.06")
 _PM_PREFIX = "current_rung_hold/trial/"
 _D0 = "2026-09-10"
+_PM_STRUCTURAL_D0 = "2026-09-05"
+
+
+def _pm_structural_cli_args(tmp_path: Path) -> list[str]:
+    """Controlled structural args so pm_us_crh_v2 CLI tests reach provenance.
+
+    ``fill_source`` is a missing sqlite so ``count_filled_takes`` returns
+    None (fail-closed, never zero) and the stop is not evaluated. Covered
+    listed is 0 -- below the fire threshold even if a count were present.
+    """
+    fill_source = tmp_path / "controlled_fill_source.sqlite"
+    return [
+        "--covered-listed-station-days",
+        "0",
+        "--fill-source",
+        str(fill_source),
+        "--fill-since-climate-day",
+        _PM_STRUCTURAL_D0,
+    ]
 
 
 def _load_module() -> ModuleType:
@@ -291,7 +310,15 @@ def test_cli_renders_continue_verdict_vocabulary_for_the_real_registered_family_
     no/mismatched sidecar, R2(b))."""
     store_dir = tmp_path / "store"
     store_dir.mkdir()
-    rc = tally_mod.main(["--family", "pm_us_crh_v2", "--store-dir", str(store_dir)])
+    rc = tally_mod.main(
+        [
+            "--family",
+            "pm_us_crh_v2",
+            "--store-dir",
+            str(store_dir),
+            *_pm_structural_cli_args(tmp_path),
+        ]
+    )
     assert rc == 0
     out = capsys.readouterr().out
     assert "store empty; provenance sidecar not yet written" in out
@@ -376,6 +403,91 @@ def test_bca_is_never_computed_while_the_look_stays_continue(
     assert tally.bca_line is None
 
 
+# --- CLI: pm_us_crh_v2 three-arg / D0 fence (L-28) --------------------------
+
+
+def test_pm_us_crh_v2_cli_refuses_omitted_structural_args(
+    tmp_path: Path, tally_mod: ModuleType, capsys: Any
+) -> None:
+    store_dir = tmp_path / "store"
+    store_dir.mkdir()
+    output = tmp_path / "report.md"
+    rc = tally_mod.main(
+        [
+            "--family",
+            "pm_us_crh_v2",
+            "--store-dir",
+            str(store_dir),
+            "--output",
+            str(output),
+        ]
+    )
+    captured = capsys.readouterr()
+    assert rc == 2
+    assert "CONTINUE" not in captured.out
+    assert not output.exists()
+    assert "covered-listed-station-days" in captured.err or "fill-source" in captured.err
+
+
+def test_pm_us_crh_v2_cli_refuses_when_fill_since_climate_day_omitted(
+    tmp_path: Path, tally_mod: ModuleType, capsys: Any
+) -> None:
+    store_dir = tmp_path / "store"
+    store_dir.mkdir()
+    output = tmp_path / "report.md"
+    fill_source = tmp_path / "controlled_fill_source.sqlite"
+    rc = tally_mod.main(
+        [
+            "--family",
+            "pm_us_crh_v2",
+            "--store-dir",
+            str(store_dir),
+            "--output",
+            str(output),
+            "--covered-listed-station-days",
+            "0",
+            "--fill-source",
+            str(fill_source),
+        ]
+    )
+    captured = capsys.readouterr()
+    assert rc == 2
+    assert "CONTINUE" not in captured.out
+    assert not output.exists()
+    assert "fill-since-climate-day" in captured.err
+
+
+def test_pm_us_crh_v2_cli_refuses_drifted_fill_since_climate_day(
+    tmp_path: Path, tally_mod: ModuleType, capsys: Any
+) -> None:
+    store_dir = tmp_path / "store"
+    store_dir.mkdir()
+    output = tmp_path / "report.md"
+    fill_source = tmp_path / "controlled_fill_source.sqlite"
+    rc = tally_mod.main(
+        [
+            "--family",
+            "pm_us_crh_v2",
+            "--store-dir",
+            str(store_dir),
+            "--output",
+            str(output),
+            "--covered-listed-station-days",
+            "0",
+            "--fill-source",
+            str(fill_source),
+            "--fill-since-climate-day",
+            "2026-08-30",
+        ]
+    )
+    captured = capsys.readouterr()
+    assert rc == 2
+    assert "CONTINUE" not in captured.out
+    assert not output.exists()
+    assert "2026-08-30" in captured.err
+    assert "2026-09-05" in captured.err
+
+
 # --- CLI: --family is required (argparse exits 2) ---------------------------
 
 
@@ -430,7 +542,15 @@ def test_cli_refuses_a_populated_store_with_a_missing_provenance_sidecar(
 
     store_dir = tmp_path / "store"
     write_scored_trials(store_dir, _rows(1, prefix=_PM_PREFIX, climate_day="2026-09-10"), now_ns=1)
-    rc = tally_mod.main(["--family", "pm_us_crh_v2", "--store-dir", str(store_dir)])
+    rc = tally_mod.main(
+        [
+            "--family",
+            "pm_us_crh_v2",
+            "--store-dir",
+            str(store_dir),
+            *_pm_structural_cli_args(tmp_path),
+        ]
+    )
     assert rc != 0
     err = capsys.readouterr().err
     assert "provenance" in err
@@ -442,7 +562,15 @@ def test_cli_refuses_a_paper_replay_sidecar_with_a_labelled_reason(
     store_dir = tmp_path / "store"
     store_dir.mkdir()
     (store_dir / "provenance.json").write_text(json.dumps({"provenance": "paper_replay"}))
-    rc = tally_mod.main(["--family", "pm_us_crh_v2", "--store-dir", str(store_dir)])
+    rc = tally_mod.main(
+        [
+            "--family",
+            "pm_us_crh_v2",
+            "--store-dir",
+            str(store_dir),
+            *_pm_structural_cli_args(tmp_path),
+        ]
+    )
     assert rc != 0
     err = capsys.readouterr().err
     assert "paper_replay" in err
@@ -452,7 +580,15 @@ def test_cli_admits_a_live_provenance_sidecar(tmp_path: Path, tally_mod: ModuleT
     store_dir = tmp_path / "store"
     store_dir.mkdir()
     (store_dir / "provenance.json").write_text(json.dumps({"provenance": "live"}))
-    rc = tally_mod.main(["--family", "pm_us_crh_v2", "--store-dir", str(store_dir)])
+    rc = tally_mod.main(
+        [
+            "--family",
+            "pm_us_crh_v2",
+            "--store-dir",
+            str(store_dir),
+            *_pm_structural_cli_args(tmp_path),
+        ]
+    )
     assert rc == 0
 
 
