@@ -40,7 +40,11 @@ from current_rung_hold_paper_replay import (
     read_asos_rows,
     run_one_precision_arm,
 )
-from run_weather_strategy_backtests import WEATHER_VENUE, TapeInstrument
+from run_weather_strategy_backtests import (
+    DEFAULT_WEATHER_CATALOG_ROOT,
+    WEATHER_VENUE,
+    TapeInstrument,
+)
 
 from breezy.domain.weather_bucket_facts import (
     WeatherFactsUnavailableError,
@@ -357,6 +361,11 @@ def _is_replay_complete(output_dir: Path) -> bool:
     return (output_dir / _REPLAY_COMPLETE_MARKER).exists()
 
 
+def _existing_mechanism_trial_count(output_dir: Path) -> int:
+    with (output_dir / "mechanism_trials.csv").open(newline="", encoding="utf-8") as handle:
+        return sum(1 for _row in csv.DictReader(handle))
+
+
 def _mark_replay_complete(output_dir: Path) -> None:
     """Write the completion marker LAST and atomically.
 
@@ -475,6 +484,7 @@ def replay_candidate_lags(
                     output_dir=output_dir,
                     work_catalog=work_catalog,
                     status="SKIPPED_EXISTING",
+                    n_trials=_existing_mechanism_trial_count(output_dir),
                 )
             )
             continue
@@ -821,7 +831,7 @@ def _parse_args(argv: Sequence[str]) -> argparse.Namespace:
     parser.add_argument("--asos-cache-csv", type=Path)
     parser.add_argument(
         "--weather-catalog-root",
-        default=Path("~/.local/share/breezy/catalog/polymarket_us").expanduser(),
+        default=DEFAULT_WEATHER_CATALOG_ROOT,
         type=Path,
     )
     parser.add_argument("--tape-subdirectory", default="live")

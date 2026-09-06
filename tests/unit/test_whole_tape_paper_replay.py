@@ -320,6 +320,10 @@ def test_existing_scored_trials_parquet_skips_that_lag_only(
     # this wrapper never produces (it writes `mechanism_trials.*`).
     existing = tmp_path / "paper" / "scored_trials" / "LAX" / day.isoformat() / "lag_30"
     existing.mkdir(parents=True)
+    (existing / "mechanism_trials.csv").write_text(
+        "station,climate_day,lag_minutes\n",
+        encoding="utf-8",
+    )
     (existing / "mechanism_trials.parquet").write_bytes(b"existing")
     (existing / whole_driver._REPLAY_COMPLETE_MARKER).write_text("ok\n", encoding="utf-8")
     calls: list[int] = []
@@ -381,6 +385,52 @@ def test_a_genuinely_completed_replay_skips_the_same_lag_on_rerun(
     second = whole_driver.replay_candidate_lags(candidate, now_ns=lambda: 2, **kwargs)
     assert second.attempts[0].status == "SKIPPED_EXISTING"
     assert calls == [30]  # not called again
+
+
+def test_completed_replay_skip_preserves_existing_mechanism_trial_count(
+    whole_driver: ModuleType,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    day = dt.date(2026, 9, 1)
+    candidate = whole_driver.Winner(
+        station="LAX",
+        climate_day=day,
+        instance_id="abc",
+        first_quote_ts=20 * 3_600_000_000_000,
+        tape_instruments=[_ti(station="LAX", day=day, quote_ts=(20 * 3_600_000_000_000,))],
+    )
+    output_dir = tmp_path / "paper" / "scored_trials" / "LAX" / day.isoformat() / "lag_30"
+    output_dir.mkdir(parents=True)
+    (output_dir / "mechanism_trials.csv").write_text(
+        "station,climate_day,lag_minutes\n"
+        "LAX,2026-09-01,30\n"
+        "LAX,2026-09-01,30\n",
+        encoding="utf-8",
+    )
+    (output_dir / whole_driver._REPLAY_COMPLETE_MARKER).write_text("ok\n", encoding="utf-8")
+
+    def replay_must_not_run(**_kwargs: object) -> SimpleNamespace:
+        raise AssertionError("completed replay should be skipped")
+
+    monkeypatch.setattr(
+        whole_driver,
+        "run_one_precision_arm",
+        replay_must_not_run,
+    )
+
+    result = whole_driver.replay_candidate_lags(
+        candidate,
+        lags=(30,),
+        output_root=tmp_path / "paper",
+        work_root=tmp_path / "work",
+        observation_rows=[],
+        settlement_by_key={},
+        now_ns=lambda: 2,
+    )
+
+    assert result.attempts[0].status == "SKIPPED_EXISTING"
+    assert result.attempts[0].n_trials == 2
 
 
 def test_crash_before_the_completion_marker_reruns_rather_than_skipping(
@@ -528,6 +578,30 @@ def test_default_derived_root_honours_the_env_override(
     monkeypatch.delenv(whole_driver.DERIVED_ROOT_ENV_VAR, raising=False)
     expected_default = Path.home() / ".local" / "share" / "breezy" / "derived"
     assert whole_driver.default_derived_root() == expected_default
+
+
+def test_weather_catalog_root_default_matches_production_driver_and_override_works(
+    whole_driver: ModuleType,
+    tmp_path: Path,
+) -> None:
+    default_args = whole_driver._parse_args(
+        ["--quote-catalog", str(tmp_path / "quote"), "--dry-run"]
+    )
+    assert default_args.weather_catalog_root == (
+        Path.home() / ".local" / "share" / "breezy" / "catalog"
+    )
+
+    explicit = tmp_path / "weather-catalog"
+    override_args = whole_driver._parse_args(
+        [
+            "--quote-catalog",
+            str(tmp_path / "quote"),
+            "--weather-catalog-root",
+            str(explicit),
+            "--dry-run",
+        ]
+    )
+    assert override_args.weather_catalog_root == explicit
 
 
 def test_run_refuses_an_uncontained_output_root_before_any_write(
