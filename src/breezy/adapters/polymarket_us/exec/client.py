@@ -408,6 +408,23 @@ def _require_bool(value: object, *, field: str) -> bool:
     return value
 
 
+def _optional_venue_fee_raw(raw: object) -> str | None:
+    """``venueFeeRaw`` is optional-on-read; a present value must be a string.
+
+    ``str(payload.get("venueFeeRaw"))`` on a missing/null key would yield the
+    string ``"None"`` and book a fake raw fee. Missing and JSON null are
+    ``None``; anything else that is not ``str`` is a mapping error.
+    """
+    if raw is None:
+        return None
+    if not isinstance(raw, str):
+        raise ExecutionReportMappingError(
+            f"a durable fill record is malformed: venueFeeRaw must be a string "
+            f"or null, got {type(raw).__name__}"
+        )
+    return raw
+
+
 @dataclass(frozen=True, kw_only=True)
 class DurableFillRecord:
     """What Breezy actually paid, on disk, CUMULATIVE per venue order.
@@ -444,6 +461,7 @@ class DurableFillRecord:
     cumulative_fee: Decimal
     fee_reconciled: bool
     ts_event: int
+    venue_fee_raw: str | None = None
 
     def to_bytes(self) -> bytes:
         return json.dumps(
@@ -457,6 +475,7 @@ class DurableFillRecord:
                 "cumulativeFee": str(self.cumulative_fee),
                 "feeReconciled": self.fee_reconciled,
                 "tsEvent": self.ts_event,
+                "venueFeeRaw": self.venue_fee_raw,
             },
             sort_keys=True,
         ).encode("utf-8")
@@ -465,7 +484,9 @@ class DurableFillRecord:
     def from_bytes(cls, raw: bytes) -> Self:
         """Decode a record, refusing anything that is not exactly one.
 
-        Every field is required. A partially-decodable record is refused
+        Every field is required except ``venueFeeRaw``, which is optional-on-read
+        so pre-GL-2 records still decode (``None``). A present non-string
+        ``venueFeeRaw`` is refused. A partially-decodable record is refused
         rather than defaulted: a fill record missing its price is not a fill
         record with a zero price.
         """
@@ -509,6 +530,7 @@ class DurableFillRecord:
                 ),
                 fee_reconciled=_require_bool(payload["feeReconciled"], field="feeReconciled"),
                 ts_event=int(payload["tsEvent"]),
+                venue_fee_raw=_optional_venue_fee_raw(payload.get("venueFeeRaw")),
             )
         except (KeyError, TypeError, ValueError, InvalidOperation) as exc:
             raise ExecutionReportMappingError(
@@ -1664,6 +1686,7 @@ class PolymarketUSExecutionClient(LiveExecutionClient):
                     cumulative_fee=outcome.cumulative_fee,
                     fee_reconciled=outcome.fee_reconciled,
                     ts_event=fill.ts_event,
+                    venue_fee_raw=fill.commission_raw,
                 )
                 self.record_fill(record)
             except Exception as exc:  # noqa: BLE001 - deliberately broad: this

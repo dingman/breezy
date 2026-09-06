@@ -2393,14 +2393,31 @@ def test_durable_fill_record_round_trips_the_fee_and_reconciled_flag() -> None:
         cumulative_fee=Decimal("0.12"),
         fee_reconciled=False,
         ts_event=TS_INIT,
+        venue_fee_raw="0.004",
     )
 
     raw = record.to_bytes()
     decoded = json.loads(raw)
     assert decoded["cumulativeFee"] == "0.12"
     assert decoded["feeReconciled"] is False
+    assert decoded["venueFeeRaw"] == "0.004"
+    assert set(decoded) == {
+        "venueOrderId",
+        "clientOrderId",
+        "instrumentId",
+        "orderSide",
+        "cumulativeQty",
+        "cumulativeCost",
+        "cumulativeFee",
+        "feeReconciled",
+        "tsEvent",
+        "venueFeeRaw",
+    }
 
     assert DurableFillRecord.from_bytes(raw) == record
+
+    missing = DurableFillRecord.from_bytes(_raw_record())
+    assert missing.venue_fee_raw is None
 
 
 # (g) `None` totals on an accept-fill outcome -- the same failure path as (c).

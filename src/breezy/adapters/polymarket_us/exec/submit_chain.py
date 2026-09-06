@@ -10,9 +10,10 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 from collections.abc import Mapping
 from dataclasses import dataclass
-from decimal import Decimal, InvalidOperation
+from decimal import ROUND_HALF_EVEN, Decimal, InvalidOperation
 from typing import Any, Final, cast
 
 from nautilus_trader.core.uuid import UUID4
@@ -24,6 +25,8 @@ from nautilus_trader.model.objects import Money, Price, Quantity
 from breezy.adapters.polymarket_us.errors import ExecutionReportMappingError, VenueTransportError
 from breezy.adapters.polymarket_us.exec.reports import parse_fill_report
 from breezy.adapters.polymarket_us.transport import VenueResponse
+
+logger = logging.getLogger(__name__)
 
 KIND_ACCEPT_FILL: Final[str] = "accept_fill"
 KIND_ZERO_FILL: Final[str] = "zero_fill"
@@ -111,6 +114,7 @@ class FillGeneration:
     last_qty: Quantity
     last_px: Price
     commission: Money
+    commission_raw: str
     ts_event: int
     filled_cost_usd: Decimal
 
@@ -510,6 +514,14 @@ def _order_total_commission(execution: Mapping[str, Any]) -> Decimal | None:
     return None
 
 
+def _bankers_cent(value: Decimal) -> Decimal | None:
+    """Venue fee quantum: banker's rounding to $0.01. Two exact ``==`` only."""
+    try:
+        return value.quantize(Decimal("0.01"), rounding=ROUND_HALF_EVEN)
+    except InvalidOperation:
+        return None
+
+
 def _cumulative_fee_and_reconciliation(
     payload: Mapping[str, Any],
     execution: Mapping[str, Any],
@@ -519,9 +531,12 @@ def _cumulative_fee_and_reconciliation(
     """I1a fee + ``fee_reconciled``.
 
     ``fee_reconciled`` = (sum of fill-type ``lastShares`` == ``cumulative_qty``)
-    AND (order total absent, OR order total == the per-leg fill-type sum). The
+    AND (order total absent, OR order total == the per-leg fill-type sum,
+    OR order total == bankers_cent(per-leg sum)). Two exact ``==``
+    equalities; the set is widened, never relaxed to a tolerance. The
     quantity identity alone catches a dropped leg (the sum falls short of
     ``cumulative_qty``), so the absent-total branch needs no extra condition.
+    ``cumulative_fee`` is the unrounded per-leg sum when reconciled.
     """
     fill_type = _fill_type_executions(payload)
     leg_qty = _sum_last_shares(fill_type)
@@ -531,8 +546,24 @@ def _cumulative_fee_and_reconciliation(
     )
     order_total = _order_total_commission(execution)
     if order_total is not None:
-        fee_reconciled = qty_reconciled and leg_fee is not None and order_total == leg_fee
-        return order_total, fee_reconciled
+        exact_match = leg_fee is not None and order_total == leg_fee
+        rounded_leg = _bankers_cent(leg_fee) if leg_fee is not None else None
+        bankers_match = (
+            not exact_match
+            and rounded_leg is not None
+            and order_total == rounded_leg
+        )
+        fee_reconciled = qty_reconciled and (exact_match or bankers_match)
+        if fee_reconciled and exact_match:
+            branch = "exact"
+        elif fee_reconciled and bankers_match:
+            branch = "bankers"
+        else:
+            branch = "none"
+        logger.info("i1a fee_reconciled=%s branch=%s", fee_reconciled, branch)
+        if fee_reconciled:
+            return leg_fee, True
+        return order_total, False
     return leg_fee, qty_reconciled and leg_fee is not None
 
 
@@ -556,12 +587,18 @@ def fill_generation(
     filled_cost = _filled_cost_from_execution(execution)
     if filled_cost is None:
         return None
+    collected = execution.get("commissionNotionalCollected")
+    if isinstance(collected, Mapping):
+        raw_value = collected.get("value")
+    else:
+        raw_value = collected
     return FillGeneration(
         venue_order_id=report.venue_order_id,
         trade_id=report.trade_id,
         last_qty=report.last_qty,
         last_px=report.last_px,
         commission=report.commission,
+        commission_raw=str(raw_value),
         ts_event=int(report.ts_event),
         filled_cost_usd=filled_cost,
     )

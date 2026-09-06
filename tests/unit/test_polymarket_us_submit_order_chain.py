@@ -29,7 +29,7 @@ from nautilus_trader.model.currencies import USD
 from nautilus_trader.model.enums import OrderSide, TimeInForce
 from nautilus_trader.model.events import OrderDenied, OrderFilled, OrderRejected, OrderSubmitted
 from nautilus_trader.model.identifiers import ClientId, StrategyId, TradeId, TraderId
-from nautilus_trader.model.objects import Price, Quantity
+from nautilus_trader.model.objects import Money, Price, Quantity
 
 from breezy.adapters.polymarket_us import write_transport
 from breezy.adapters.polymarket_us.exec.client import PolymarketUSExecutionClient
@@ -45,6 +45,7 @@ from breezy.adapters.polymarket_us.exec.submit_chain import (
     ORDER_BODY_KEYS,
     classify_create_order_outcome,
     encode_order_body,
+    fill_generation,
 )
 from breezy.adapters.polymarket_us.operator_controls import (
     MAX_DAILY_BUDGET_USD_ENV_VAR,
@@ -849,9 +850,92 @@ async def test_the_commission_booked_is_the_measured_venue_number_not_the_modell
         await rig.client._disconnect()
     filled = [e for e in rig.order_events if isinstance(e, OrderFilled)]
     assert len(filled) == 1
-    assert filled[0].commission == __import__(
-        "nautilus_trader.model.objects", fromlist=["Money"]
-    ).Money(Decimal("0.11"), USD)
+    assert filled[0].commission == Money(Decimal("0.11"), USD)
+
+
+def test_fill_generation_books_sub_cent_commission() -> None:
+    instrument = build_instrument()
+    execution = build_execution(build_order(str(instrument.raw_symbol)))
+    execution["commissionNotionalCollected"] = {"value": "0.004", "currency": "USD"}
+    result = fill_generation(
+        execution, instrument=instrument, account_id=ACCOUNT_ID, ts_init=TS_INIT
+    )
+    assert result is not None
+    assert result.commission == Money(0, USD)
+    assert result.commission_raw == "0.004"
+
+
+def test_fill_generation_returns_none_for_pathological_commission() -> None:
+    instrument = build_instrument()
+    execution = build_execution(build_order(str(instrument.raw_symbol)))
+    execution["commissionNotionalCollected"] = {
+        "value": "1E+999999",
+        "currency": "USD",
+    }
+    assert (
+        fill_generation(
+            execution, instrument=instrument, account_id=ACCOUNT_ID, ts_init=TS_INIT
+        )
+        is None
+    )
+
+
+def test_fill_generation_books_numeric_sub_cent_commission() -> None:
+    instrument = build_instrument()
+    execution = build_execution(build_order(str(instrument.raw_symbol)))
+    execution["commissionNotionalCollected"] = {"value": 0.004, "currency": "USD"}
+    result = fill_generation(
+        execution, instrument=instrument, account_id=ACCOUNT_ID, ts_init=TS_INIT
+    )
+    assert result is not None
+    assert result.commission == Money(0, USD)
+    assert result.commission_raw == str(0.004)
+
+
+def test_classify_create_order_outcome_books_a_sub_cent_fill() -> None:
+    slug = str(build_instrument().raw_symbol)
+    response = VenueResponse(
+        status=200,
+        headers={},
+        body=_durable_accept_body(slug, commission="0.004"),
+    )
+    outcome = classify_create_order_outcome(
+        response,
+        instrument=build_instrument(),
+        account_id=ACCOUNT_ID,
+        ts_init=TS_INIT,
+    )
+    assert outcome.kind == KIND_ACCEPT_FILL
+    assert outcome.fill is not None
+    assert outcome.fill.commission == Money(0, USD)
+    assert outcome.fill.commission_raw == "0.004"
+    assert outcome.cumulative_fee == Decimal("0.004")
+
+
+@pytest.mark.asyncio
+async def test_a_sub_cent_venue_fee_is_booked_as_bankers_zero_with_raw_audit(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    write_canonical_verified: None,
+) -> None:
+    sender = _FakeSender()
+    sender.response = VenueResponse(
+        status=200,
+        headers={},
+        body=_durable_accept_body(str(build_instrument().raw_symbol), commission="0.004"),
+    )
+    with _caps("1000.00", "10.00"):
+        rig = _build_chain_rig(tmp_path, monkeypatch=monkeypatch, sender=sender)
+        await rig.client._connect()
+        await rig.client._submit_order(rig.limit_buy())
+        records = rig.client.fill_records_for(rig.instrument.id)
+        await rig.client._disconnect()
+    filled = [e for e in rig.order_events if isinstance(e, OrderFilled)]
+    assert len(filled) == 1
+    assert filled[0].commission == Money(0, USD)
+    assert len(records) == 1
+    assert records[0].venue_fee_raw == "0.004"
+    assert records[0].cumulative_fee == Decimal("0.004")
 
 
 def test_no_post_is_reachable_scan_finds_exactly_one_monkeypatch_fixture() -> None:
@@ -1152,6 +1236,86 @@ def test_i1a_order_total_mismatch_leaves_fee_unreconciled() -> None:
     assert outcome.kind == KIND_ACCEPT_FILL
     assert outcome.fee_reconciled is False
     assert outcome.cumulative_fee == Decimal("0.05")
+
+
+def test_i1a_exact_total_reconciles_on_the_exact_branch(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    slug = str(build_instrument().raw_symbol)
+    order = _i1a_order(slug, cum_quantity="1", avg_px="0.41", commission_total="0.03")
+    fill_leg = _i1a_leg(
+        order,
+        exec_id="exe-1",
+        trade_id="trd-1",
+        last_shares="1",
+        last_px="0.41",
+        commission="0.03",
+    )
+    caplog.set_level("INFO", logger="breezy.adapters.polymarket_us.exec.submit_chain")
+    outcome = _classify_i1a([fill_leg])
+    assert outcome.kind == KIND_ACCEPT_FILL
+    assert outcome.fee_reconciled is True
+    assert outcome.cumulative_fee == Decimal("0.03")
+    assert "branch=exact" in caplog.text
+
+
+def test_i1a_bankers_rounded_total_against_sub_cent_leg_is_reconciled(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    slug = str(build_instrument().raw_symbol)
+    order = _i1a_order(slug, cum_quantity="1", avg_px="0.37", commission_total="0.00")
+    fill_leg = _i1a_leg(
+        order,
+        exec_id="exe-1",
+        trade_id="trd-1",
+        last_shares="1",
+        last_px="0.37",
+        commission="0.004",
+    )
+    caplog.set_level("INFO", logger="breezy.adapters.polymarket_us.exec.submit_chain")
+    outcome = _classify_i1a([fill_leg])
+    assert outcome.kind == KIND_ACCEPT_FILL
+    assert outcome.fee_reconciled is True
+    assert outcome.cumulative_fee == Decimal("0.004")
+    assert "branch=bankers" in caplog.text
+
+
+def test_i1a_bankers_rounded_total_against_live_threat_leg_is_reconciled(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    slug = str(build_instrument().raw_symbol)
+    order = _i1a_order(slug, cum_quantity="1", avg_px="0.28", commission_total="0.01")
+    fill_leg = _i1a_leg(
+        order,
+        exec_id="exe-1",
+        trade_id="trd-1",
+        last_shares="1",
+        last_px="0.28",
+        commission="0.012096",
+    )
+    caplog.set_level("INFO", logger="breezy.adapters.polymarket_us.exec.submit_chain")
+    outcome = _classify_i1a([fill_leg])
+    assert outcome.kind == KIND_ACCEPT_FILL
+    assert outcome.fee_reconciled is True
+    assert outcome.cumulative_fee == Decimal("0.012096")
+    assert "branch=bankers" in caplog.text
+
+
+def test_i1a_order_total_far_from_leg_is_not_reconciled_via_bankers() -> None:
+    slug = str(build_instrument().raw_symbol)
+    order = _i1a_order(slug, cum_quantity="1", avg_px="0.37", commission_total="0.02")
+    fill_leg = _i1a_leg(
+        order,
+        exec_id="exe-1",
+        trade_id="trd-1",
+        last_shares="1",
+        last_px="0.37",
+        commission="0.004",
+    )
+    outcome = _classify_i1a([fill_leg])
+    assert outcome.kind == KIND_ACCEPT_FILL
+    assert outcome.fee_reconciled is False
+    assert outcome.cumulative_fee == Decimal("0.02")
 
 
 def test_i1a_two_fill_legs_with_no_order_total_reconcile_on_the_leg_sum() -> None:
