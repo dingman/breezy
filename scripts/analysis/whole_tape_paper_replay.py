@@ -282,6 +282,25 @@ def corrupt_only_blocked_days(
     }
 
 
+def release_non_winner_tape(
+    clean_instances: Sequence[CleanInstance],
+    winners: Mapping[tuple[str, dt.date], Winner],
+) -> None:
+    """Clear quotes/depths on TapeInstruments no Winner retained.
+
+    `select_unique_clean_winners` aliases the Winner's own TapeInstrument
+    objects; clearing the lists in place drops OrderBookDepth10 / QuoteTick
+    payloads on every non-winner without copying the winner set.
+    """
+    retained = {id(ti) for winner in winners.values() for ti in winner.tape_instruments}
+    for instance in clean_instances:
+        for tape_instrument in instance.tape_instruments:
+            if id(tape_instrument) in retained:
+                continue
+            tape_instrument.quotes.clear()
+            tape_instrument.depths.clear()
+
+
 def select_unique_clean_winners(
     clean_instances: Sequence[CleanInstance],
     *,
@@ -632,7 +651,17 @@ def _load_clean_instance(
         work_catalog=work_catalog,
     )
     # Whole-tape wrapper needs all station-days carried by the instance. The
-    # current single-day selector is reused per discovered date, then merged.
+    # current single-day selector is reused per UNIQUE climate day, then merged.
+    # `catalog.instruments()` yields one row per RECORDED definition (the
+    # recorder republishes), so iterating rows called `_select_capture_instruments`
+    # once per duplicate -- each call reloads that day's full quotes+depths.
+    #
+    # `_select_capture_instruments` first-wins Instrument/facts by id via
+    # `setdefault`, so a duplicate id binds to its FIRST definition's climate
+    # day and facts. Unique-day loop order does not change which definition
+    # binds; `instruments_by_id` overwrites only replace an equal-content
+    # TapeInstrument for the same day (duplicates only repeat equal-content
+    # loads).
     #
     # finding 4: a missing/non-mapping `climate_date` (or any other malformed
     # weather fact) must not `continue` past silently. `read_weather_bucket_facts`
@@ -641,15 +670,18 @@ def _load_clean_instance(
     # in `run()`, never dropped without a trace.
     instruments_by_id: dict[str, TapeInstrument] = {}
     malformed_instrument_ids: list[str] = []
+    climate_days: dict[dt.date, None] = {}
     for instrument in catalog.instruments():
         try:
             facts = read_weather_bucket_facts(instrument.info)
         except WeatherFactsUnavailableError:
             malformed_instrument_ids.append(str(instrument.id))
             continue
+        climate_days.setdefault(facts.climate_day, None)
+    for climate_day in climate_days:
         for tape_instrument in _select_capture_instruments(
             catalog,
-            climate_day=facts.climate_day,
+            climate_day=climate_day,
         ):
             instruments_by_id[str(tape_instrument.instrument.id)] = tape_instrument
     return CleanInstance(
@@ -766,6 +798,8 @@ def run(
             blocked[key] = "UNSUPPORTED_STATION"
             continue
         winners[key] = winner
+    release_non_winner_tape(clean_instances, winners)
+    del clean_instances
 
     attempts: list[ReplayAttempt] = []
     if not dry_run:

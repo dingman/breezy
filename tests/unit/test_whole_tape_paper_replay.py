@@ -84,6 +84,20 @@ def _ti(
     )
 
 
+def _definition(instrument_id: str, day: dt.date, *, station: str = "LAX") -> SimpleNamespace:
+    return SimpleNamespace(
+        id=instrument_id,
+        info={
+            "weather_facts_status": "KNOWN",
+            "settlement_station": station,
+            "climate_date": day.isoformat(),
+            "measure": "high",
+            "strike_lower_f": 70,
+            "strike_upper_f": None,
+        },
+    )
+
+
 def test_paper_replay_refuses_both_live_scored_trials_roots(
     current_driver: ModuleType,
     tmp_path: Path,
@@ -924,3 +938,235 @@ def test_run_blocks_a_winner_with_no_final_settlement_record(
     )
     assert calls == []
     assert "BLOCKED:NO_FINAL_SETTLEMENT: 1" in report
+
+
+# ---------------------------------------------------------------------------
+# Seam A: select once per unique climate day; drop non-winner tape payloads
+# ---------------------------------------------------------------------------
+
+
+def test_load_clean_instance_selects_capture_instruments_once_per_unique_climate_day(
+    whole_driver: ModuleType,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """90 duplicate definition rows / 30 unique ids / 2 climate days must
+    call `_select_capture_instruments` twice (once per unique climate day),
+    not once per definition row. The selector first-wins Instrument/facts
+    by id; unique-day loop order does not change which definition binds,
+    and `instruments_by_id` overwrites only replace equal-content
+    TapeInstruments for the same day.
+    """
+    day1 = dt.date(2026, 9, 1)
+    day2 = dt.date(2026, 9, 2)
+    instruments: list[SimpleNamespace] = []
+    for day in (day1, day2):
+        for index in range(15):
+            instrument_id = f"id-{day.isoformat()}-{index}.INST"
+            for _duplicate in range(3):
+                instruments.append(_definition(instrument_id, day))
+    assert len(instruments) == 90
+    assert len({row.id for row in instruments}) == 30
+
+    fake_catalog = SimpleNamespace(instruments=lambda: instruments)
+    monkeypatch.setattr(whole_driver, "_convert_live_capture", lambda **_k: fake_catalog)
+    calls: list[dt.date] = []
+
+    def fake_select(_catalog: object, *, climate_day: dt.date) -> list[SimpleNamespace]:
+        calls.append(climate_day)
+        return [
+            _ti(
+                station="LAX",
+                day=climate_day,
+                quote_ts=(1,),
+                instrument_id=f"ti-{climate_day.isoformat()}",
+            )
+        ]
+
+    monkeypatch.setattr(whole_driver, "_select_capture_instruments", fake_select)
+
+    instance = whole_driver._load_clean_instance(
+        quote_catalog=tmp_path / "catalog",
+        instance_id="abc",
+        subdirectory="live",
+        work_root=tmp_path / "work",
+        now_ns=lambda: 1,
+    )
+    assert calls == [day1, day2]
+    assert {ti.instrument.id for ti in instance.tape_instruments} == {
+        "ti-2026-09-01",
+        "ti-2026-09-02",
+    }
+
+
+def test_run_releases_non_winner_instance_quotes_and_depths_after_winner_selection(
+    whole_driver: ModuleType,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """After `select_unique_clean_winners`, a non-winner CLEAN instance must
+    not still hold quotes/depths. The early-first instance wins; the late
+    instance's tape lists must be empty (or the instance unreferenced).
+    """
+    day = dt.date(2026, 9, 1)
+    early_first = 20 * 3_600_000_000_000
+    late_first = early_first + 235 * 60_000_000_000
+    winner_ti = _ti(
+        station="LAX",
+        day=day,
+        quote_ts=(early_first,),
+        depth_ts=(early_first, early_first + 1),
+        instrument_id="win-inst",
+    )
+    loser_ti = _ti(
+        station="LAX",
+        day=day,
+        quote_ts=(late_first,),
+        depth_ts=(late_first, late_first + 1, late_first + 2),
+        instrument_id="lose-inst",
+    )
+    winner_instance = whole_driver.CleanInstance("win", [winner_ti])
+    loser_instance = whole_driver.CleanInstance("lose", [loser_ti])
+    loaded = {"win": winner_instance, "lose": loser_instance}
+
+    monkeypatch.setattr(
+        whole_driver,
+        "classify_tape_instances",
+        lambda *_a, **_k: [
+            whole_driver.TapeClassification("win", "CLEAN", total_rows=2),
+            whole_driver.TapeClassification("lose", "CLEAN", total_rows=3),
+        ],
+    )
+    monkeypatch.setattr(
+        whole_driver,
+        "_load_clean_instance",
+        lambda **kwargs: loaded[str(kwargs["instance_id"])],
+    )
+    monkeypatch.setattr(whole_driver, "_station_offsets", lambda _days: {"LAX": -8.0})
+    monkeypatch.setattr(whole_driver, "_load_stream", lambda *_a, **_k: [])
+
+    whole_driver.run(
+        quote_catalog=tmp_path / "catalog",
+        output_root=tmp_path / "derived" / "paper_replay",
+        work_root=tmp_path / "derived" / "paper_replay" / "work",
+        asos_cache_csv=tmp_path / "asos.csv",
+        weather_catalog_root=tmp_path / "weather_catalog",
+        dry_run=True,
+        derived_root=tmp_path / "derived",
+    )
+    assert len(loser_ti.quotes) + len(loser_ti.depths) == 0
+    assert len(winner_ti.quotes) + len(winner_ti.depths) == 3
+
+
+def test_two_instance_winner_set_and_mechanism_trial_rows_stay_equivalent(
+    whole_driver: ModuleType,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """Winner set and replayed mechanism-trial / report rows for a 2-instance
+    fixture stay identical across the select/retention change.
+    """
+    day = dt.date(2026, 9, 1)
+    early_first = 20 * 3_600_000_000_000
+    late_first = early_first + 235 * 60_000_000_000
+    winner_ti = _ti(
+        station="LAX",
+        day=day,
+        quote_ts=(early_first,),
+        depth_ts=(early_first,),
+        instrument_id="win-inst",
+    )
+    loser_ti = _ti(
+        station="LAX",
+        day=day,
+        quote_ts=(late_first,),
+        depth_ts=(late_first,),
+        instrument_id="lose-inst",
+    )
+    loaded = {
+        "win": whole_driver.CleanInstance("win", [winner_ti]),
+        "lose": whole_driver.CleanInstance("lose", [loser_ti]),
+    }
+    monkeypatch.setattr(
+        whole_driver,
+        "classify_tape_instances",
+        lambda *_a, **_k: [
+            whole_driver.TapeClassification("win", "CLEAN", total_rows=2),
+            whole_driver.TapeClassification("lose", "CLEAN", total_rows=2),
+        ],
+    )
+    monkeypatch.setattr(
+        whole_driver,
+        "_load_clean_instance",
+        lambda **kwargs: loaded[str(kwargs["instance_id"])],
+    )
+    monkeypatch.setattr(whole_driver, "_station_offsets", lambda _days: {"LAX": -8.0})
+    monkeypatch.setattr(whole_driver, "_load_stream", lambda *_a, **_k: [])
+    monkeypatch.setattr(whole_driver, "read_asos_rows", lambda _path: [])
+    monkeypatch.setattr(
+        whole_driver,
+        "climate_day_records_to_settlement",
+        lambda *_a, **_k: {("LAX", day.isoformat()): object()},
+    )
+
+    def fake_arm(**_kwargs: object) -> SimpleNamespace:
+        return SimpleNamespace(
+            trials=(
+                SimpleNamespace(
+                    station="LAX",
+                    climate_day=day.isoformat(),
+                    instrument_id="win-inst",
+                    fill_px=Decimal("0.41"),
+                    entry_ask=Decimal("0.40"),
+                ),
+            ),
+            strategy_refusals={},
+            strategy_diagnostics={},
+        )
+
+    monkeypatch.setattr(whole_driver, "run_one_precision_arm", fake_arm)
+
+    report = whole_driver.run(
+        quote_catalog=tmp_path / "catalog",
+        output_root=tmp_path / "derived" / "paper_replay",
+        work_root=tmp_path / "derived" / "paper_replay" / "work",
+        asos_cache_csv=tmp_path / "asos.csv",
+        weather_catalog_root=tmp_path / "weather_catalog",
+        derived_root=tmp_path / "derived",
+        now_ns=lambda: 7,
+    )
+    assert report.startswith("MECHANISM TEST -- NO VERDICT")
+    assert whole_driver.LOOK_AHEAD_CAVEAT in report
+    assert "WHOLE TAPE -- 2 of 2 CLEAN instances" in report
+    assert "lag 30: 1/1" in report
+    assert "lag 45: 1/1" in report
+    assert "- eligible_clean_unique_winner: 1" in report
+    assert "- replayed: 1" in report
+    assert "LAX 2026-09-01 lag=30 RAN trials=1" in report
+    assert "LAX 2026-09-01 lag=45 RAN trials=1" in report
+    assert "lose" not in report.split("replay attempts:")[-1]
+
+    import csv as csv_module
+
+    for lag in (30, 45):
+        trial_path = (
+            tmp_path
+            / "derived"
+            / "paper_replay"
+            / "scored_trials"
+            / "LAX"
+            / day.isoformat()
+            / f"lag_{lag}"
+            / "mechanism_trials.csv"
+        )
+        with trial_path.open(newline="", encoding="utf-8") as handle:
+            rows = list(csv_module.DictReader(handle))
+        assert len(rows) == 1
+        assert rows[0]["instrument_id"] == "win-inst"
+        assert rows[0]["fill_px"] == "0.41"
+        assert rows[0]["entry_ask"] == "0.40"
+        assert rows[0]["precision_mode"] == "nws_integer_c"
+        assert rows[0]["lookahead_caveat"] == whole_driver.LOOK_AHEAD_CAVEAT
+        assert rows[0]["station"] == "LAX"
+        assert rows[0]["climate_day"] == day.isoformat()
+        assert rows[0]["lag_minutes"] == str(lag)
