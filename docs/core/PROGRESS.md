@@ -56,19 +56,17 @@ Merged analysis, evidence and unlock observables: `docs/evidence/GO_LIVE_BLOCKER
 
 | ID | Own | Sev | Blocker (evidence in the doc) | Size |
 |---|---|---|---|---|
-| GL-1 | B | CRIT | Sync IOC zero-fill classified AMBIGUOUS → DEGRADE + OPEN intent (`submit_chain.py:680-701` wants `state`/`cumQuantity` the documented `{id,executions}` body lacks); 09-05 SFO. Classify documented empty-executions as ZERO_FILL, log `body_kind` | M |
-| GL-2 | B | CRIT | Sub-cent taker fee fails `_assert_representable` (`reports.py:86-88,865-868`) → `fill_generation` None → a REAL fill is AMBIGUOUS and unbooked | S |
-| GL-3 | B | CRIT | `observation_ambiguous` consumes the station-day (`strategy.py:455-463`). RULED conformance fix (`codex_gl3_ambiguous_consume_ruling_2026-09-06.md`): skip-without-consume for ambiguous and non-executable; `observation_unavailable` stays latched; two mis-pinned strategy tests to correct. RED→GREEN | S |
+| GL-1 | B | CRIT | GL-1a shipped (`9ad11ff`): every create-order outcome carries redacted `body_kind`/`body_len`/`state=`/`cum=` tokens and `_submit_order` logs them for every kind (L-30). RULING REQUESTED: amend R-7 item 5 or resolve zero-fills via a GET /v1/order/{id} state read designed with GL-4 (L-32) | M |
 | GL-4 | B | HIGH | One AMBIGUOUS burns the rest of the day: latch OPEN until operator (`client.py:1747-1758`), `_has_durable_fill_record` stub (`:730-733`). Auto-retire after a no-order probe | M |
 | GL-5 | B | CRIT | WS reconnect storm: 09-05 189/241/281 five-second gaps per station window, 1673 reconnects → every afternoon uncovered under §9 any-overlap (`data.py:1685,1812`, `websocket.py`). 09-06 instance clean so far | L |
-| GL-6 | B | MED | v2 tally 15:30Z drops the structural-dead pin ("UNAVAILABLE token refused, required MATCH"): node launches 16:50Z, so the binding report never evaluates the KILL rule | S |
+| GL-6 | O | MED | Operator action remaining: `systemctl --user daemon-reload && systemctl --user restart breezy-pm-crh-v2-tally.timer`. The 17:15Z tick is inert until that reload runs | S |
 | GL-7 | O | SKIP | Operator 09-06: skip. Supervisor 2231261 + node stay in the uncapped `tmux-spawn-d35977dd` scope; SV-1 fix `c84317e` inactive until a relaunch | — |
 | GL-8 | B | MED | Instrument set frozen at 16:50 compose (`composition.py:116-150`), discovery reload clamped 21600 s: late-listed HIGH rungs never subscribed | M |
 | GL-9 | B | MED | Fill→ScoredTrial chain never run on real data (`record_fill` branch unexecuted, store has no parquet). Synthetic 200+fill body through the live chain in a test, then confirm on first fill | M |
 | GL-10 | O/B | DEFER | Operator 09-06: deprioritised. Alerts stay log-only (no `BREEZY_ALERT_WEBHOOK_URL`) | — |
 | GL-11 | B | LOW | Recorder OOM 09-04 (14.4 GB) / SIGKILL 09-05 at MemoryHigh predate the deque fix; 09-06 peak 914 MB. Watch | — |
 
-**KILL clock:** D0=09-05, counter 0 (09-05 uncovered). At 4 covered/day with 0 fills the 15th lands ~09-09/09-10; zero-fill and retired-AMBIGUOUS takes are not trials. GL-1..3 must land before the first clean covered cluster.
+**KILL clock:** D0=09-05, counter 0 (09-05 uncovered); at 4 covered/day with 0 fills the 15th lands ~09-09/09-10 and zero-fill/retired-AMBIGUOUS takes are not trials. GL-2 and GL-3 landed; GL-1 reclassification is under ruling before the first clean covered cluster.
 
 Verified NOT blockers 09-06: exec client connected + reconciled, balances 97.91, permit issued, caps/enablement present, OP-SEQ control CLOSED (GTC only), obs feed live, 24 rungs subscribed, rotation 09:00Z outside every window.
 
@@ -90,6 +88,7 @@ Verified NOT blockers 09-06: exec client connected + reconciled, balances 97.91,
 | CF-8 | MED | Sibling products never `observe()`d (`nws_actor.py:1161`); refetched every poll |
 | BL-10 | LOW | `forecast_mispricing/decision.py:71` pre-signal `quote_tradable` refusal is invisible to BL-8's counter (family KILLED; moot until revived) |
 | CF-11 | LOW | `ruff format --check`: 31 unformatted files; not in any gate |
+| CF-12 | MED | `uv run ruff check .` reports 24 errors and `uv run mypy` 313 errors in 31 files on the branch base, none in this session's files |
 | CF-14b | DEFERRED | Per-market discovery isolation; reopen on a genuine 1-of-N CF-14a failure (`docs/plans/CF14_DISCOVERY_ISOLATION_2026-09-02.md`) |
 | CF-13 | UNPROVEN | No CCA/CCB CORRECTION seen live; supersession path fixture-covered only |
 | PF-1 | MED | Perf residue 09-06: book levels parsed 2×/frame (`parsing.py:591`); CRH `is_consumed` SQLite/tick; salvage `collect=True` on 486 MB file |
@@ -106,7 +105,7 @@ P1–P6 narrative: `docs/core/PROGRAMME_PATH.md`. Active P-work is tracked as ba
 | G-16 | ≥14 days of joined tape. K1 09-02: n=30, largest cell 8/96. Kalshi prior `e97f392`: cheap-D-1 DEAD at ask ≥2c (`docs/evidence/k1_kalshi_prior_2026-09-02.md`) | calendar |
 | G-17 | Phase 1.5 premise GO/NO-GO | G-16. **NO-GO stops the programme.** |
 
-EXEC SPINE: write path verified 09-04 (`docs/plans/OP_SEQ_BOT_POSITIVE_CONTROL_2026-09-04.md`); R-7 rules still open (`docs/plans/EXEC_SPINE_R65_R7_2026-09-02.md`): IOC zero-fill is terminal (now GL-1), ledger releases only on 4xx+Status+no `order.id`. Blind-risk-view audit residue (`docs/core/findings/BLIND_RISK_VIEWS_2026-09-02.md`): T-9 exit policy, T-6 stale docstring, `max_simultaneous_positions` unexercised; Nautilus cannot cancel an INITIALIZED order.
+EXEC SPINE: write path verified 09-04 (`docs/plans/OP_SEQ_BOT_POSITIVE_CONTROL_2026-09-04.md`); R-7 rules still open (`docs/plans/EXEC_SPINE_R65_R7_2026-09-02.md`): IOC zero-fill is terminal (GL-1 ruling requested; see GL-1 row), ledger releases only on 4xx+Status+no `order.id`. Blind-risk-view audit residue (`docs/core/findings/BLIND_RISK_VIEWS_2026-09-02.md`): T-9 exit policy, T-6 stale docstring, `max_simultaneous_positions` unexercised; Nautilus cannot cancel an INITIALIZED order.
 
 **[VERDICT] NO FAMILY HAS A PROVEN EDGE; ONE IS UNDER LIVE MEASUREMENT.** Forecast family KILLED; lock family REFUTED ×3 (L-9); K1 DEAD ≥2c. M_B (kill n≥60 / survive n≥150): 09-04 n_taken=2, both lost. Live family = lags 30/45, NYC excluded, interval rule (`grok_live_small_spec_rev2_2026-09-04.md`); tallies 13:30Z/14:15Z/14:30Z/15:30Z. Venue skips ~9% of station-days.
 **LIVE since 2026-09-04 17:54 UTC** (`BREEZY-L001`; supervisor pid 2231261 since 09-06 01:08Z, launches 16:50Z daily, `docs/plans/R8_OPERATOR_RUNBOOK.md`; [LOW] start line prints twice). Live: 8 listed afternoons, take 1 (SFO 09-05 → AMBIGUOUS, retired), fill 0, n=0.
