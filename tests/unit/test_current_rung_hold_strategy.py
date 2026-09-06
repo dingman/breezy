@@ -380,12 +380,49 @@ class TestObservationRefusals:
         # as a candidate for the current rung; `upper_f == 89` falls in the
         # OPEN-UPPER rung instead, which is exactly the straddle `spans`
         # (and therefore `observation_ambiguous`) exists to catch.
+        sink = _RecordingSink()
+        strategy.refusal_alerter = RefusalAlerter(
+            strategy.refusals, site=str(strategy.id), sink=sink,
+        )
         quote = _quote(INTERIOR_ID, ask="0.40", ts_event=WINDOW_OPEN_NS)
         strategy.on_quote_tick(quote)
         assert strategy.refusals.count("observation_ambiguous") == 1
-        record = strategy._latch.record(STATION, CLIMATE_DAY.isoformat())  # type: ignore[union-attr]
-        assert record is not None
-        assert record.reason == "observation_ambiguous"
+        assert strategy._latch is not None
+        assert strategy._latch.is_consumed(STATION, CLIMATE_DAY.isoformat()) is False
+        record = strategy._latch.record(STATION, CLIMATE_DAY.isoformat())
+        assert record is None
+        # Skip-without-consume still surfaces through the existing alert path.
+        assert len(sink.payloads) == 1
+        assert sink.payloads[0].event == "OBSERVATION_AMBIGUOUS_REFUSALS"  # type: ignore[attr-defined]
+
+        # A second ambiguous tick keeps counting and still does not latch;
+        # AlertState dedupes the still-active condition.
+        second_ambiguous = _quote(
+            INTERIOR_ID, ask="0.40", ts_event=WINDOW_OPEN_NS + NS_PER_MIN,
+        )
+        strategy.on_quote_tick(second_ambiguous)
+        assert strategy.refusals.count("observation_ambiguous") == 2
+        assert strategy._latch.is_consumed(STATION, CLIMATE_DAY.isoformat()) is False
+        assert len(sink.payloads) == 1
+
+        # L-24 later-eligibility: a hotter METAR lifts lower_f/upper_f into
+        # the open-upper rung (running_extreme.py:286-301); that unambiguous
+        # executable quote can still consume.
+        strategy.on_data(
+            _observation(
+                temp_c_tenths=350,
+                observed_at_ns=WINDOW_OPEN_NS + 5 * NS_PER_MIN,
+            ),
+        )
+        later = _quote(
+            OPEN_UPPER_ID, ask="0.40", ts_event=WINDOW_OPEN_NS + 10 * NS_PER_MIN,
+        )
+        strategy.on_quote_tick(later)
+        assert strategy._latch.is_consumed(STATION, CLIMATE_DAY.isoformat()) is True
+        later_record = strategy._latch.record(STATION, CLIMATE_DAY.isoformat())
+        assert later_record is not None
+        # LAX/SON/12/open_upper p_hold_lower=0.7918; ask=0.40 clears break-even.
+        assert later_record.reason == "taken"
 
 
 class TestFeeScheduleGuard:
@@ -614,9 +651,29 @@ class TestSpanningIntervalRouting:
         quote = _quote(INTERIOR_ID, ask="0.40", ts_event=WINDOW_OPEN_NS)
         strategy.on_quote_tick(quote)
         assert strategy.refusals.count("observation_ambiguous") == 1
+        assert strategy._latch is not None
+        assert strategy._latch.is_consumed(STATION, CLIMATE_DAY.isoformat()) is False
+        record = strategy._latch.record(STATION, CLIMATE_DAY.isoformat())
+        assert record is None
+
+
+class TestAdmissionRefusalLatch:
+    """Skip-without-consume is exact: other post-decision Refuse reasons still latch."""
+
+    def test_edge_below_break_even_still_consumes(
+        self, store_path: Path, interior_instrument: BinaryOption,
+    ) -> None:
+        rig = _register_and_start(store_path=store_path, instruments=(interior_instrument,))
+        strategy = rig.strategy
+        # R(t) = 86F exactly -- inside [86, 87], unambiguous, executable.
+        strategy.on_data(_observation(temp_c_tenths=300, observed_at_ns=WINDOW_OPEN_NS - 1))
+        # LAX/SON/12/interior p_hold_lower=0.6982; ask=0.90 is inside the
+        # executable band but below break-even after the fee.
+        quote = _quote(INTERIOR_ID, ask="0.90", ts_event=WINDOW_OPEN_NS)
+        strategy.on_quote_tick(quote)
         record = strategy._latch.record(STATION, CLIMATE_DAY.isoformat())  # type: ignore[union-attr]
         assert record is not None
-        assert record.reason == "observation_ambiguous"
+        assert record.reason == "edge_below_break_even"
 
 
 class _RecordingSink:
