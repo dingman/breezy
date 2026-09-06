@@ -1255,3 +1255,17 @@ Treat `catalog.instruments()` (and any Nautilus catalog listing of definitions) 
 
 ### How to apply
 `whole_tape_paper_replay._load_clean_instance` selects once per unique climate day and `release_non_winner_tape` clears non-winner lists; `test_load_clean_instance_selects_capture_instruments_once_per_unique_climate_day` pins the call count. The same shape (per-prefix restart of a sequential recursion) was found in the group-sequential boundary replay the same day and fixed with `_iter_boundary_looks` (120 → 15 convolutions, bit-identical).
+
+## L-32 — A backlog row is a claim; search the prior ruling before planning (2026-09-06)
+
+### What happened
+PROGRESS.md row GL-1 instructed "Classify documented empty-executions as ZERO_FILL". A planner (a different model) produced a HIGH-confidence plan for that reclassification; of two independent plan reviewers, one missed the prior ruling and one found it. R-7 item 5 (`docs/plans/R7_BUILD_BRIEF_2026-09-04.md`) already rules that `200 + id + no executions + NON-terminal or absent status` stays AMBIGUOUS. The venue create-order snapshot (`docs/evidence/venue/polymarket_us/docs_snapshots/api-reference_orders_create-order_2026-08-25.md`) says the synchronous block waits until filled, canceled, or expired, up to `maxBlockTime` seconds, so an empty executions list at ~5.2 s (`maxBlockTime` = 5) is the TIMEOUT shape, not an IOC cancel. `tests/unit/test_polymarket_us_submit_order_chain.py` param `"200-id-no-exec"` pins that body as AMBIGUOUS. Implementing the row as written would have replaced a fail-closed outcome (latch OPEN, DEGRADE) with a fail-open one (retire the intent, book 0, `generate_order_canceled`) on a possibly working order. Only the diagnostics half (body_kind / body_len / state / cum detail tokens) shipped; the reclassification awaits a strategy-lead ruling.
+
+### Why this is binding
+A backlog row is written in the grammar of an instruction. A planner that treats it as the spec will not look for a converged decision that already classified the same input, and a reviewer asked only "is this plan correct against the row?" will not either. Fail-open on a live order-state is irreversible: booking 0 and canceling an order that may still fill is worse than leaving it AMBIGUOUS.
+
+### The rule
+Before a plan is dispatched for a backlog row that changes a classification, retirement, or settlement outcome, grep `docs/plans` and `docs/evidence` for a converged decision on the same input shape and cite it in the brief as CONFIRMS or CONTRADICTS. A CONTRADICTS halts the row for a ruling — never resolve it inside the plan. When a prior ruling and a backlog row disagree about an order-state outcome, the fail-closed reading stands until ruled. A pinned test of that body shape is itself a ruling.
+
+### How to apply
+The search is mechanical: the input shape (status, id present, executions empty, terminal vs not) plus the proposed new outcome word. Hits in a build brief, a coordinator decision, or a parametrized test named for that shape are in scope. A HIGH-confidence plan that never names the prior ruling has not searched. Related: L-10 (brief vocabulary becomes fact), L-12 (pinned tests are contracts), L-18 (an outcome claim is a mechanism claim).
