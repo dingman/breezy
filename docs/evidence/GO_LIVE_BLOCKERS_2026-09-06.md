@@ -43,8 +43,8 @@ broken, which only delays.
   balances 97.91 USD (enough for one lot); live-trading permit issued
   16:50:09Z with a 10 h TTL; submit intent RETIRED, not OPEN.
 - Operator caps and enablement are present in the live environment
-  (`BREEZY_MAX_DAILY_BUDGET_USD`, `BREEZY_MAX_POSITION_COST_USD`,
-  `BREEZY_TRADING_ENABLED` by name in pid 2231261's environ) and enforced per
+  (the reserved max daily budget cap, the reserved max per-position cost cap,
+  and `BREEZY_TRADING_ENABLED` by name in pid 2231261's environ) and enforced per
   grant by `DailySpendLedger.authorize_order_cost` (`factories.py:777`,
   `client.py:1581`, `operator_controls.py:299-373`). The PROGRESS line
   "values not yet supplied" was stale.
