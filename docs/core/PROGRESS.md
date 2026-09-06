@@ -65,8 +65,9 @@ Merged analysis, evidence and unlock observables: `docs/evidence/GO_LIVE_BLOCKER
 | GL-9 | B | MED | Fill→ScoredTrial chain never run on real data (`record_fill` branch unexecuted, store has no parquet). Synthetic 200+fill body through the live chain in a test, then confirm on first fill | M |
 | GL-10 | O/B | DEFER | Operator 09-06: deprioritised. Alerts stay log-only (no `BREEZY_ALERT_WEBHOOK_URL`) | — |
 | GL-11 | B | LOW | Recorder OOM 09-04 (14.4 GB) / SIGKILL 09-05 at MemoryHigh predate the deque fix; 09-06 peak 914 MB. Watch | — |
+| GL-12 | B | CRIT | Recorder is a zombie since the 09:00Z rotate: `try-restart` lands in the recurrent 02:00 PT empty-climate-listing hole, the initial `initialize()` raise is outside the 09-04 fail-fast wrap (`6fcadae` wraps only `_feed.connect()`), and Nautilus stays RUNNING after the 60 s engine timeout, so systemd never restarts it (13 h / 0 quotes on 09-06; 09-06 afternoons uncovered). Fix ranked: (1) retry empty discovery on initial `_connect` with backoff, (2) widen the fail-fast wrap to all of `_connect` + exit 1, (3) move the rotate tick past ~09:45Z listing; operator restore now: `systemctl --user try-restart breezy-quote-tape.service` | M |
 
-**KILL clock:** D0=09-05, counter 0 (09-05 uncovered); at 4 covered/day with 0 fills the 15th lands ~09-09/09-10 and zero-fill/retired-AMBIGUOUS takes are not trials. GL-2 and GL-3 landed; GL-1 reclassification is under ruling before the first clean covered cluster.
+**KILL clock:** D0=09-05, counter 0 (09-05 uncovered; 09-06 uncovered (recorder)); at 4 covered/day with 0 fills the 15th lands ~09-09/09-10 and zero-fill/retired-AMBIGUOUS takes are not trials. GL-2 and GL-3 landed; GL-1 reclassification is under ruling before the first clean covered cluster.
 
 Verified NOT blockers 09-06: exec client connected + reconciled, balances 97.91, permit issued, caps/enablement present, OP-SEQ control CLOSED (GTC only), obs feed live, 24 rungs subscribed, rotation 09:00Z outside every window.
 
