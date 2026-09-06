@@ -1,0 +1,135 @@
+"""READ-ONLY venue-state probe for the 2026-09-05T20:19:49Z SFO IOC submission.
+GET only. Repo signer + repo transport. Key id / account number redacted before disk or stdout."""
+from __future__ import annotations
+import asyncio, json, os, re, resource, subprocess, sys, time
+from decimal import Decimal
+from pathlib import Path
+from urllib.parse import urlencode
+resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
+sys.path.insert(0, "/home/jon/breezy/src")
+OUT = Path(__file__).resolve().parent
+SLUG = "tc-temp-sfohigh-2026-09-05-gte73lt74f"
+T0 = "2026-09-05T20:19:49"
+
+pid = subprocess.run(["pgrep", "-f", "breezy-trade$"], capture_output=True, text=True).stdout.split()[0]
+env: dict[str, str] = {}
+for kv in Path(f"/proc/{pid}/environ").read_bytes().split(b"\0"):
+    if b"=" in kv:
+        k, v = kv.split(b"=", 1); env[k.decode()] = v.decode(errors="replace")
+SECRETS = [s for s in (env.get("POLYMARKET_US_ACCOUNT_NUMBER", ""), env.get("POLYMARKET_US_KEY_ID", "")) if s]
+def red(s: str) -> str:
+    for sec in SECRETS: s = s.replace(sec, "<REDACTED>")
+    return s
+
+from breezy.adapters.polymarket_us.factories import config_from_env
+from breezy.adapters.polymarket_us.env import load_polymarket_us_credentials
+from breezy.adapters.polymarket_us.signing import Ed25519RequestSigner, SigningVariant
+from breezy.adapters.polymarket_us.transport import (QUOTA_KEY_PORTFOLIO, NautilusHttpTransport, build_default_quota, build_keyed_quotas, build_shared_http_client)
+from nautilus_trader.common.component import LiveClock
+
+config = config_from_env(env)
+creds = load_polymarket_us_credentials(config.secrets, env=env)
+signer = Ed25519RequestSigner.for_variant(creds, clock=LiveClock(), variant=SigningVariant(config.signing_variant))
+client = build_shared_http_client(timeout_secs=config.http_timeout_secs, default_quota=build_default_quota(config.global_requests_per_second),
+    keyed_quotas=build_keyed_quotas(instrument_requests_per_minute=config.instrument_requests_per_minute, book_requests_per_minute=config.book_requests_per_minute),
+    default_headers={"User-Agent": str(config.user_agent)})
+transport = NautilusHttpTransport(client=client)
+BASE = str(config.api_base_url).rstrip("/")
+LOG: list[dict] = []
+
+async def read(tag: str, path: str, query: dict | None = None):
+    attempts = []; status = None; body = b""
+    for attempt in range(1, 4):
+        headers = dict(signer.sign_headers("GET", path, query_string=""))
+        url = BASE + path + (("?" + urlencode(query, doseq=True)) if query else "")
+        t = time.time()
+        try:
+            resp = await transport.get(url, headers=headers, quota_key=QUOTA_KEY_PORTFOLIO)
+            status, body = int(resp.status), resp.body
+        except Exception as exc:  # transport fault: record class only
+            status, body = None, b""
+            attempts.append({"attempt": attempt, "status": None, "fault": type(exc).__name__, "elapsed_s": round(time.time()-t, 2)})
+        else:
+            attempts.append({"attempt": attempt, "status": status, "bytes": len(body), "elapsed_s": round(time.time()-t, 2)})
+        if status is not None and 200 <= status < 500: break
+        if attempt < 3: await asyncio.sleep(30)
+    text = red(body.decode("utf-8", errors="replace")) if body else ""
+    try: payload = json.loads(text, parse_float=Decimal) if text else None
+    except ValueError: payload = None
+    fn = OUT / f"{tag}.json"
+    fn.write_text(json.dumps({"path": path, "query": query, "attempts": attempts, "final_status": status, "payload": payload if payload is not None else text}, indent=1, default=str))
+    os.chmod(fn, 0o600)
+    LOG.append({"tag": tag, "path": path, "query": query, "attempts": attempts})
+    print(f"[{tag}] GET {path} q={query} -> {[a.get('status', a.get('fault')) for a in attempts]} file={fn}")
+    return status, payload
+
+def is_target_order(o: dict) -> bool:
+    if o.get("marketSlug") != SLUG and (o.get("marketMetadata") or {}).get("slug") != SLUG: return False
+    return True
+
+async def main():
+    found_ids: set[str] = set()
+    # (c) positions
+    st, p = await read("positions_all", "/v1/portfolio/positions")
+    pos = (p or {}).get("positions") if isinstance(p, dict) else None
+    if isinstance(pos, dict):
+        print("  positions keys:", list(pos.keys()))
+        if SLUG in pos: print("  TARGET POSITION:", json.dumps(pos[SLUG], default=str))
+        else: print("  target slug NOT in positions")
+    st, p = await read("positions_market", "/v1/portfolio/positions", {"market": SLUG})
+    if isinstance(p, dict): print("  filtered positions keys:", list((p.get("positions") or {}).keys()))
+    # (a) open orders
+    st, p = await read("orders_open_all", "/v1/orders/open")
+    if isinstance(p, dict):
+        orders = p.get("orders") or []
+        print(f"  open orders total={len(orders)}; on target slug={[o.get('id') for o in orders if is_target_order(o)]}")
+        for o in orders:
+            if is_target_order(o): found_ids.add(o.get("id")); print("  OPEN TARGET ORDER:", json.dumps(o, default=str)[:800])
+    st, p = await read("orders_open_slug", "/v1/orders/open", {"slugs": SLUG})
+    if isinstance(p, dict): print(f"  slug-filtered open orders={len(p.get('orders') or [])}")
+    # (b) activities: all pages (cap 10) + slug filter
+    acts_all = []; cursor = None
+    for page in range(10):
+        q = {"limit": 100}; 
+        if cursor: q["cursor"] = cursor
+        st, p = await read(f"activities_p{page}", "/v1/portfolio/activities", q)
+        if not isinstance(p, dict): break
+        acts_all.extend(p.get("activities") or [])
+        cursor = p.get("nextCursor")
+        if p.get("eof") or not cursor: break
+    print(f"  activities total={len(acts_all)}; types={sorted({a.get('type') for a in acts_all})}")
+    hits = []
+    for a in acts_all:
+        blob = json.dumps(a, default=str)
+        if SLUG in blob: hits.append(a)
+    print(f"  activities mentioning target slug={len(hits)}")
+    for a in hits:
+        print("  ACTIVITY:", json.dumps(a, default=str)[:900])
+        for k in ("orderId", "order_id"):
+            v = (a.get("trade") or {}).get(k)
+            if v: found_ids.add(v)
+    st, p = await read("activities_slug", "/v1/portfolio/activities", {"marketSlug": SLUG, "limit": 100})
+    if isinstance(p, dict):
+        acts = p.get("activities") or []
+        print(f"  slug-filtered activities={len(acts)}")
+        for a in acts:
+            print("  ACTIVITY(slug):", json.dumps(a, default=str)[:900])
+            for k in ("orderId", "order_id"):
+                v = (a.get("trade") or {}).get(k)
+                if v: found_ids.add(v)
+    # any activities near T0 (any market) as a timing cross-check
+    near = [a for a in acts_all if T0[:16] in json.dumps(a, default=str)]
+    print(f"  activities with timestamp minute {T0[:16]}: {len(near)}")
+    # (d) balances
+    st, p = await read("balances", "/v1/account/balances")
+    if isinstance(p, dict):
+        for b in p.get("balances") or []:
+            print("  BALANCE:", json.dumps({k: v for k, v in b.items() if k != "pendingWithdrawals"}, default=str))
+    # (a2) by-id if any id surfaced
+    for oid in sorted(i for i in found_ids if i):
+        st, p = await read(f"order_by_id_{oid[:12]}", f"/v1/order/{oid}")
+        if isinstance(p, dict): print("  ORDER BY ID:", json.dumps(p, default=str)[:1200])
+    if not found_ids: print("  no venue order id surfaced; /v1/order/{id} NOT probed (no id to supply)")
+    (OUT / "request_log.json").write_text(json.dumps(LOG, indent=1, default=str))
+
+asyncio.run(main())

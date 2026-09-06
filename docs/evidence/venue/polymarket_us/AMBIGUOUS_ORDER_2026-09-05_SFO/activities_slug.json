@@ -1,0 +1,143 @@
+{
+ "path": "/v1/portfolio/activities",
+ "query": {
+  "marketSlug": "tc-temp-sfohigh-2026-09-05-gte73lt74f",
+  "limit": 100
+ },
+ "attempts": [
+  {
+   "attempt": 1,
+   "status": 200,
+   "bytes": 3611,
+   "elapsed_s": 0.08
+  }
+ ],
+ "final_status": 200,
+ "payload": {
+  "activities": [
+   {
+    "type": "ACTIVITY_TYPE_REFERRAL_BONUS",
+    "accountBalanceChange": {
+     "transactionId": "<SCRUBBED>",
+     "status": "ACCOUNT_BALANCE_CHANGE_STATUS_COMPLETED",
+     "amount": {
+      "value": "20",
+      "currency": "USD"
+     },
+     "updateTime": "2026-09-03T04:22:12.131629828Z",
+     "paymentMethod": null,
+     "createTime": "2026-09-03T04:22:12.131629828Z",
+     "transactions": [
+      {
+       "transactionId": "<SCRUBBED>",
+       "status": "ACCOUNT_BALANCE_CHANGE_STATUS_COMPLETED",
+       "amount": {
+        "value": "20",
+        "currency": "USD"
+       },
+       "updateTime": "2026-09-03T04:22:12.131629828Z",
+       "paymentMethod": null,
+       "createTime": "2026-09-03T04:22:12.131629828Z",
+       "externalId": "<SCRUBBED>",
+       "description": "PROMOTION_DEPOSIT_BONUS incentive of 20.00",
+       "metadata": {
+        "incentive_type": "PROMOTION_DEPOSIT_BONUS"
+       },
+       "failureReason": "",
+       "failureCode": "",
+       "failureAction": null
+      }
+     ],
+     "externalId": "<SCRUBBED>",
+     "description": "PROMOTION_DEPOSIT_BONUS incentive of 20.00",
+     "metadata": {
+      "incentive_type": "PROMOTION_DEPOSIT_BONUS"
+     },
+     "failureReason": "",
+     "failureCode": "",
+     "failureAction": null
+    }
+   },
+   {
+    "type": "ACTIVITY_TYPE_ACCOUNT_DEPOSIT",
+    "accountBalanceChange": {
+     "transactionId": "<SCRUBBED>",
+     "status": "ACCOUNT_BALANCE_CHANGE_STATUS_PENDING",
+     "amount": {
+      "value": "10",
+      "currency": "USD"
+     },
+     "updateTime": "2026-09-03T04:22:11.866544484Z",
+     "paymentMethod": null,
+     "createTime": "2026-09-03T04:21:08.778874330Z",
+     "transactions": [
+      {
+       "transactionId": "<SCRUBBED>",
+       "status": "ACCOUNT_BALANCE_CHANGE_STATUS_PENDING",
+       "amount": {
+        "value": "10",
+        "currency": "USD"
+       },
+       "updateTime": "2026-09-03T04:22:11.866544484Z",
+       "paymentMethod": null,
+       "createTime": "2026-09-03T04:21:08.778874330Z",
+       "externalId": "<SCRUBBED>",
+       "description": "Polymarket Apple Pay Deposit - deposit allocated to Provided Account \"<SCRUBBED>\" (ClearingHouseId: \"\", ClearingMember(ID or Legal Name): \"\", AssociatedFundingSourceId: \"\", ClearingHouseFundingSourceId: \"\")",
+       "metadata": {},
+       "failureReason": "",
+       "failureCode": "",
+       "failureAction": null
+      }
+     ],
+     "externalId": "<SCRUBBED>",
+     "description": "Polymarket Apple Pay Deposit - deposit allocated to Provided Account \"<SCRUBBED>\" (ClearingHouseId: \"\", ClearingMember(ID or Legal Name): \"\", AssociatedFundingSourceId: \"\", ClearingHouseFundingSourceId: \"\")",
+     "metadata": {},
+     "failureReason": "",
+     "failureCode": "",
+     "failureAction": null
+    }
+   },
+   {
+    "type": "ACTIVITY_TYPE_ACCOUNT_DEPOSIT",
+    "accountBalanceChange": {
+     "transactionId": "<SCRUBBED>",
+     "status": "ACCOUNT_BALANCE_CHANGE_STATUS_COMPLETED",
+     "amount": {
+      "value": "50",
+      "currency": "USD"
+     },
+     "updateTime": "2026-07-29T17:02:22.700628968Z",
+     "paymentMethod": null,
+     "createTime": "2026-07-28T18:20:00.202456940Z",
+     "transactions": [
+      {
+       "transactionId": "<SCRUBBED>",
+       "status": "ACCOUNT_BALANCE_CHANGE_STATUS_COMPLETED",
+       "amount": {
+        "value": "50",
+        "currency": "USD"
+       },
+       "updateTime": "2026-07-29T17:02:22.700628968Z",
+       "paymentMethod": null,
+       "createTime": "2026-07-28T18:20:00.202456940Z",
+       "externalId": "<SCRUBBED>",
+       "description": "Polymarket Apple Pay Deposit - deposit allocated to Provided Account \"<SCRUBBED>\" (ClearingHouseId: \"\", ClearingMember(ID or Legal Name): \"\", AssociatedFundingSourceId: \"\", ClearingHouseFundingSourceId: \"\")",
+       "metadata": {},
+       "failureReason": "",
+       "failureCode": "",
+       "failureAction": null
+      }
+     ],
+     "externalId": "<SCRUBBED>",
+     "description": "Polymarket Apple Pay Deposit - deposit allocated to Provided Account \"<SCRUBBED>\" (ClearingHouseId: \"\", ClearingMember(ID or Legal Name): \"\", AssociatedFundingSourceId: \"\", ClearingHouseFundingSourceId: \"\")",
+     "metadata": {},
+     "failureReason": "",
+     "failureCode": "",
+     "failureAction": null
+    }
+   }
+  ],
+  "nextCursor": "",
+  "eof": true
+ }
+}

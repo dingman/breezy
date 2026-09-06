@@ -1,0 +1,2169 @@
+{
+ "path": "/v1/portfolio/activities",
+ "query": {
+  "limit": 100
+ },
+ "attempts": [
+  {
+   "attempt": 1,
+   "status": 200,
+   "bytes": 51539,
+   "elapsed_s": 0.1
+  }
+ ],
+ "final_status": 200,
+ "payload": {
+  "activities": [
+   {
+    "type": "ACTIVITY_TYPE_REFERRAL_BONUS",
+    "accountBalanceChange": {
+     "transactionId": "<SCRUBBED>",
+     "status": "ACCOUNT_BALANCE_CHANGE_STATUS_COMPLETED",
+     "amount": {
+      "value": "20",
+      "currency": "USD"
+     },
+     "updateTime": "2026-09-03T04:22:12.131629828Z",
+     "paymentMethod": null,
+     "createTime": "2026-09-03T04:22:12.131629828Z",
+     "transactions": [
+      {
+       "transactionId": "<SCRUBBED>",
+       "status": "ACCOUNT_BALANCE_CHANGE_STATUS_COMPLETED",
+       "amount": {
+        "value": "20",
+        "currency": "USD"
+       },
+       "updateTime": "2026-09-03T04:22:12.131629828Z",
+       "paymentMethod": null,
+       "createTime": "2026-09-03T04:22:12.131629828Z",
+       "externalId": "<SCRUBBED>",
+       "description": "PROMOTION_DEPOSIT_BONUS incentive of 20.00",
+       "metadata": {
+        "incentive_type": "PROMOTION_DEPOSIT_BONUS"
+       },
+       "failureReason": "",
+       "failureCode": "",
+       "failureAction": null
+      }
+     ],
+     "externalId": "<SCRUBBED>",
+     "description": "PROMOTION_DEPOSIT_BONUS incentive of 20.00",
+     "metadata": {
+      "incentive_type": "PROMOTION_DEPOSIT_BONUS"
+     },
+     "failureReason": "",
+     "failureCode": "",
+     "failureAction": null
+    }
+   },
+   {
+    "type": "ACTIVITY_TYPE_ACCOUNT_DEPOSIT",
+    "accountBalanceChange": {
+     "transactionId": "<SCRUBBED>",
+     "status": "ACCOUNT_BALANCE_CHANGE_STATUS_PENDING",
+     "amount": {
+      "value": "10",
+      "currency": "USD"
+     },
+     "updateTime": "2026-09-03T04:22:11.866544484Z",
+     "paymentMethod": null,
+     "createTime": "2026-09-03T04:21:08.778874330Z",
+     "transactions": [
+      {
+       "transactionId": "<SCRUBBED>",
+       "status": "ACCOUNT_BALANCE_CHANGE_STATUS_PENDING",
+       "amount": {
+        "value": "10",
+        "currency": "USD"
+       },
+       "updateTime": "2026-09-03T04:22:11.866544484Z",
+       "paymentMethod": null,
+       "createTime": "2026-09-03T04:21:08.778874330Z",
+       "externalId": "<SCRUBBED>",
+       "description": "Polymarket Apple Pay Deposit - deposit allocated to Provided Account \"<SCRUBBED>\" (ClearingHouseId: \"\", ClearingMember(ID or Legal Name): \"\", AssociatedFundingSourceId: \"\", ClearingHouseFundingSourceId: \"\")",
+       "metadata": {},
+       "failureReason": "",
+       "failureCode": "",
+       "failureAction": null
+      }
+     ],
+     "externalId": "<SCRUBBED>",
+     "description": "Polymarket Apple Pay Deposit - deposit allocated to Provided Account \"<SCRUBBED>\" (ClearingHouseId: \"\", ClearingMember(ID or Legal Name): \"\", AssociatedFundingSourceId: \"\", ClearingHouseFundingSourceId: \"\")",
+     "metadata": {},
+     "failureReason": "",
+     "failureCode": "",
+     "failureAction": null
+    }
+   },
+   {
+    "type": "ACTIVITY_TYPE_POSITION_RESOLUTION",
+    "positionResolution": {
+     "marketSlug": "tc-temp-nychigh-2026-08-09-gte94lt95f",
+     "beforePosition": {
+      "netPosition": "19",
+      "qtyBought": "19",
+      "qtySold": "0",
+      "cost": {
+       "value": "1.0000",
+       "currency": "USD"
+      },
+      "realized": {
+       "value": "0.0000",
+       "currency": "USD"
+      },
+      "bodPosition": "0",
+      "expired": false,
+      "updateTime": "2026-08-09T01:50:46.708524431Z",
+      "marketMetadata": {
+       "slug": "tc-temp-nychigh-2026-08-09-gte94lt95f",
+       "icon": "https://polymarket-upload.s3.us-east-2.amazonaws.com/us%20weather%20highest%20ny-a931766d31.png",
+       "title": "Highest temperature in NYC on August 9?",
+       "outcome": "Yes",
+       "eventSlug": "temp-nychigh-2026-08-09",
+       "subject": {
+        "id": 0,
+        "name": "94 to 95",
+        "subjectType": ""
+       },
+       "eventId": "75093"
+      },
+      "cashValue": {
+       "value": "0.1900",
+       "currency": "USD"
+      },
+      "avgPx": {
+       "value": "0.0500",
+       "currency": "USD"
+      },
+      "fees": {
+       "value": "0.0500",
+       "currency": "USD"
+      },
+      "baseCost": {
+       "value": "0.9500",
+       "currency": "USD"
+      },
+      "costPerShare": null,
+      "netPositionDecimal": "19.0000",
+      "qtyBoughtDecimal": "19.0000",
+      "qtySoldDecimal": "0.0000",
+      "bodPositionDecimal": "0.0000",
+      "comboLegDetails": []
+     },
+     "afterPosition": {
+      "netPosition": "0",
+      "qtyBought": "19",
+      "qtySold": "19",
+      "cost": {
+       "value": "0.0000",
+       "currency": "USD"
+      },
+      "realized": {
+       "value": "-0.9500",
+       "currency": "USD"
+      },
+      "bodPosition": "0",
+      "expired": false,
+      "updateTime": "2026-08-10T15:00:30.923680758Z",
+      "marketMetadata": {
+       "slug": "tc-temp-nychigh-2026-08-09-gte94lt95f",
+       "icon": "https://polymarket-upload.s3.us-east-2.amazonaws.com/us%20weather%20highest%20ny-a931766d31.png",
+       "title": "Highest temperature in NYC on August 9?",
+       "outcome": "None",
+       "eventSlug": "temp-nychigh-2026-08-09",
+       "subject": {
+        "id": 0,
+        "name": "94 to 95",
+        "subjectType": ""
+       },
+       "eventId": "75093"
+      },
+      "cashValue": {
+       "value": "0.0000",
+       "currency": "USD"
+      },
+      "avgPx": null,
+      "fees": null,
+      "baseCost": null,
+      "costPerShare": null,
+      "netPositionDecimal": "0.0000",
+      "qtyBoughtDecimal": "19.0000",
+      "qtySoldDecimal": "19.0000",
+      "bodPositionDecimal": "0.0000",
+      "comboLegDetails": []
+     },
+     "updateTime": "2026-08-10T15:00:30.923680758Z",
+     "tradeId": "<SCRUBBED>",
+     "side": "POSITION_RESOLUTION_SIDE_SHORT",
+     "market": {
+      "id": "<SCRUBBED>",
+      "question": "Highest temperature in NYC on August 9?",
+      "slug": "tc-temp-nychigh-2026-08-09-gte94lt95f",
+      "endDate": "2026-08-10T05:00:00Z",
+      "category": "climate",
+      "startDate": "2026-08-08T09:45:22Z",
+      "description": "Will the highest temperature recorded at Central Park (KNYC) in New York City for 2026-08-09 as reported by the National Weather Service's Climatological Report (Daily) be between 94F and 95F? Outcome verified from NWS Climatological Report.",
+      "active": true,
+      "marketType": "futures",
+      "closed": true,
+      "createdAt": "2026-08-08T09:45:22Z",
+      "updatedAt": "2026-09-05T22:21:21Z",
+      "archived": false,
+      "orderPriceMinTickSize": "0.01",
+      "gameStartTime": "2026-08-09T05:00:00Z",
+      "manualActivation": false,
+      "sportsMarketType": "futures",
+      "marketSides": [
+       {
+        "id": "<SCRUBBED>",
+        "marketSideType": "MARKET_SIDE_TYPE_INSTRUMENT",
+        "identifier": "tc-temp-nychigh-2026-08-09-gte94lt95f",
+        "createdAt": "2026-08-08T09:45:22Z",
+        "updatedAt": "2026-08-08T09:45:22Z",
+        "description": "Yes",
+        "price": "0",
+        "marketId": 387006,
+        "long": true,
+        "tradable": true
+       },
+       {
+        "id": "<SCRUBBED>",
+        "marketSideType": "MARKET_SIDE_TYPE_INSTRUMENT",
+        "identifier": "tc-temp-nychigh-2026-08-09-gte94lt95f",
+        "createdAt": "2026-08-08T09:45:22Z",
+        "updatedAt": "2026-08-08T09:45:22Z",
+        "description": "No",
+        "price": "1",
+        "marketId": 387006,
+        "long": false,
+        "tradable": true
+       }
+      ],
+      "outcomes": "[\"No\",\"Yes\"]",
+      "outcomePrices": "[\"0\",\"1\"]",
+      "ep3Status": "EXPIRED",
+      "status": "MARKET_STATUS_RESOLVED",
+      "sportsMarketTypeV2": "SPORTS_MARKET_TYPE_FUTURE",
+      "hidden": false,
+      "tags": [],
+      "title": "94 to 95",
+      "feeCoefficient": "0.06",
+      "sortOrder": 4,
+      "titleShort": "94 to 95",
+      "ep3SyncedAt": "2026-09-05T22:21:21Z",
+      "minimumTradeQty": "0.01",
+      "comboEnabled": false
+     },
+     "comboLegDetails": []
+    }
+   },
+   {
+    "type": "ACTIVITY_TYPE_POSITION_RESOLUTION",
+    "positionResolution": {
+     "marketSlug": "tc-temp-sfohigh-2026-08-08-gte74lt75f",
+     "beforePosition": {
+      "netPosition": "7",
+      "qtyBought": "7",
+      "qtySold": "0",
+      "cost": {
+       "value": "0.9976",
+       "currency": "USD"
+      },
+      "realized": {
+       "value": "0.0000",
+       "currency": "USD"
+      },
+      "bodPosition": "0",
+      "expired": false,
+      "updateTime": "2026-08-08T04:54:54.470204359Z",
+      "marketMetadata": {
+       "slug": "tc-temp-sfohigh-2026-08-08-gte74lt75f",
+       "icon": "https://polymarket-upload.s3.us-east-2.amazonaws.com/us%20weather%20highest%20sf-deab2f2750.png",
+       "title": "Highest temperature in San Francisco on August 8?",
+       "outcome": "Yes",
+       "eventSlug": "temp-sfohigh-2026-08-08",
+       "subject": {
+        "id": 0,
+        "name": "74 to 75",
+        "subjectType": ""
+       },
+       "eventId": "74334"
+      },
+      "cashValue": {
+       "value": "0.1356",
+       "currency": "USD"
+      },
+      "avgPx": {
+       "value": "0.1400",
+       "currency": "USD"
+      },
+      "fees": {
+       "value": "0.0484",
+       "currency": "USD"
+      },
+      "baseCost": {
+       "value": "0.9492",
+       "currency": "USD"
+      },
+      "costPerShare": null,
+      "netPositionDecimal": "6.7800",
+      "qtyBoughtDecimal": "6.7800",
+      "qtySoldDecimal": "0.0000",
+      "bodPositionDecimal": "0.0000",
+      "comboLegDetails": []
+     },
+     "afterPosition": {
+      "netPosition": "0",
+      "qtyBought": "7",
+      "qtySold": "7",
+      "cost": {
+       "value": "0.0000",
+       "currency": "USD"
+      },
+      "realized": {
+       "value": "-0.9492",
+       "currency": "USD"
+      },
+      "bodPosition": "0",
+      "expired": false,
+      "updateTime": "2026-08-09T15:00:55.965769370Z",
+      "marketMetadata": {
+       "slug": "tc-temp-sfohigh-2026-08-08-gte74lt75f",
+       "icon": "https://polymarket-upload.s3.us-east-2.amazonaws.com/us%20weather%20highest%20sf-deab2f2750.png",
+       "title": "Highest temperature in San Francisco on August 8?",
+       "outcome": "None",
+       "eventSlug": "temp-sfohigh-2026-08-08",
+       "subject": {
+        "id": 0,
+        "name": "74 to 75",
+        "subjectType": ""
+       },
+       "eventId": "74334"
+      },
+      "cashValue": {
+       "value": "0.0000",
+       "currency": "USD"
+      },
+      "avgPx": null,
+      "fees": null,
+      "baseCost": null,
+      "costPerShare": null,
+      "netPositionDecimal": "0.0000",
+      "qtyBoughtDecimal": "6.7800",
+      "qtySoldDecimal": "6.7800",
+      "bodPositionDecimal": "0.0000",
+      "comboLegDetails": []
+     },
+     "updateTime": "2026-08-09T15:00:55.965769370Z",
+     "tradeId": "<SCRUBBED>",
+     "side": "POSITION_RESOLUTION_SIDE_SHORT",
+     "market": {
+      "id": "<SCRUBBED>",
+      "question": "Highest temperature in San Francisco on August 8?",
+      "slug": "tc-temp-sfohigh-2026-08-08-gte74lt75f",
+      "endDate": "2026-08-09T08:00:00Z",
+      "category": "climate",
+      "startDate": "2026-08-07T09:45:53Z",
+      "description": "Will the highest temperature recorded at San Francisco International Airport (KSFO) in San Francisco for 2026-08-08 as reported by the National Weather Service's Climatological Report (Daily) be between 74F and 75F? Outcome verified from NWS Climatological Report.",
+      "active": true,
+      "marketType": "futures",
+      "closed": true,
+      "createdAt": "2026-08-07T09:45:53Z",
+      "updatedAt": "2026-09-05T22:19:42Z",
+      "archived": false,
+      "orderPriceMinTickSize": "0.01",
+      "gameStartTime": "2026-08-08T08:00:00Z",
+      "manualActivation": false,
+      "sportsMarketType": "futures",
+      "marketSides": [
+       {
+        "id": "<SCRUBBED>",
+        "marketSideType": "MARKET_SIDE_TYPE_INSTRUMENT",
+        "identifier": "tc-temp-sfohigh-2026-08-08-gte74lt75f",
+        "createdAt": "2026-08-07T09:45:53Z",
+        "updatedAt": "2026-08-07T09:45:53Z",
+        "description": "Yes",
+        "price": "0",
+        "marketId": 378492,
+        "long": true,
+        "tradable": true
+       },
+       {
+        "id": "<SCRUBBED>",
+        "marketSideType": "MARKET_SIDE_TYPE_INSTRUMENT",
+        "identifier": "tc-temp-sfohigh-2026-08-08-gte74lt75f",
+        "createdAt": "2026-08-07T09:45:53Z",
+        "updatedAt": "2026-08-07T09:45:53Z",
+        "description": "No",
+        "price": "1",
+        "marketId": 378492,
+        "long": false,
+        "tradable": true
+       }
+      ],
+      "outcomes": "[\"No\",\"Yes\"]",
+      "outcomePrices": "[\"0\",\"1\"]",
+      "ep3Status": "EXPIRED",
+      "status": "MARKET_STATUS_RESOLVED",
+      "sportsMarketTypeV2": "SPORTS_MARKET_TYPE_FUTURE",
+      "hidden": false,
+      "tags": [],
+      "title": "74 to 75",
+      "feeCoefficient": "0.06",
+      "sortOrder": 2,
+      "titleShort": "74 to 75",
+      "ep3SyncedAt": "2026-09-05T22:19:42Z",
+      "minimumTradeQty": "0.01",
+      "comboEnabled": false
+     },
+     "comboLegDetails": []
+    }
+   },
+   {
+    "type": "ACTIVITY_TYPE_TRADE",
+    "trade": {
+     "id": "<SCRUBBED>",
+     "aggressorExecution": {
+      "id": "<SCRUBBED>",
+      "order": {
+       "id": "<SCRUBBED>",
+       "marketSlug": "tc-temp-nychigh-2026-08-09-gte94lt95f",
+       "side": "ORDER_SIDE_BUY",
+       "type": "ORDER_TYPE_LIMIT",
+       "price": {
+        "value": "0.05",
+        "currency": "USD"
+       },
+       "quantity": 19,
+       "cumQuantity": 19,
+       "leavesQuantity": 0,
+       "tif": "TIME_IN_FORCE_IMMEDIATE_OR_CANCEL",
+       "goodTillTime": null,
+       "intent": "ORDER_INTENT_BUY_LONG",
+       "marketMetadata": {
+        "slug": "tc-temp-nychigh-2026-08-09-gte94lt95f",
+        "icon": "https://polymarket-upload.s3.us-east-2.amazonaws.com/us%20weather%20highest%20ny-a931766d31.png",
+        "title": "Highest temperature in NYC on August 9?",
+        "outcome": "Yes",
+        "eventSlug": "temp-nychigh-2026-08-09",
+        "subject": {
+         "id": 0,
+         "name": "94 to 95",
+         "subjectType": ""
+        },
+        "eventId": "75093"
+       },
+       "state": "ORDER_STATE_FILLED",
+       "commissionNotionalTotalCollected": {
+        "value": "0.0500",
+        "currency": "USD"
+       },
+       "commissionsBasisPoints": "0",
+       "makerCommissionsBasisPoints": "0",
+       "avgPx": {
+        "value": "0.0500",
+        "currency": "USD"
+       },
+       "cashOrderQty": {
+        "value": "0.0000",
+        "currency": "USD"
+       },
+       "insertTime": "2026-08-09T01:50:46.708524431Z",
+       "createTime": "2026-08-09T01:50:46.706921264Z",
+       "outcomeSide": "OUTCOME_SIDE_YES",
+       "action": "ORDER_ACTION_BUY",
+       "manualOrderIndicator": "MANUAL_ORDER_INDICATOR_AUTOMATIC",
+       "lastTransactTime": "2026-08-09T01:50:46.708524431Z"
+      },
+      "lastShares": "19.0000",
+      "lastPx": {
+       "value": "0.0500",
+       "currency": "USD"
+      },
+      "type": "EXECUTION_TYPE_FILL",
+      "text": "",
+      "orderRejectReason": "ORD_REJECT_REASON_EXCHANGE_OPTION",
+      "transactTime": "2026-08-09T01:50:46.708524431Z",
+      "legPrices": [],
+      "tradeId": "<SCRUBBED>",
+      "aggressor": true,
+      "commissionNotionalCollected": {
+       "value": "0.0500",
+       "currency": "USD"
+      },
+      "unsolicitedCancelReason": "UNSOLICITED_CXL_REASON_UNDEFINED",
+      "traceId": "",
+      "commissionSpreadPx": {
+       "value": "0.0500",
+       "currency": "USD"
+      },
+      "transactTradeDate": "2026-08-09T00:00:00Z"
+     },
+     "passiveExecution": {
+      "id": "<SCRUBBED>",
+      "order": {
+       "id": "<SCRUBBED>",
+       "marketSlug": "tc-temp-nychigh-2026-08-09-gte94lt95f",
+       "side": "ORDER_SIDE_SELL",
+       "type": "ORDER_TYPE_LIMIT",
+       "price": {
+        "value": "0.05",
+        "currency": "USD"
+       },
+       "quantity": 45,
+       "cumQuantity": 19,
+       "leavesQuantity": 26,
+       "tif": "TIME_IN_FORCE_GOOD_TILL_DATE",
+       "goodTillTime": "2026-08-09T01:51:04Z",
+       "intent": "ORDER_INTENT_BUY_SHORT",
+       "marketMetadata": {
+        "slug": "tc-temp-nychigh-2026-08-09-gte94lt95f",
+        "icon": "https://polymarket-upload.s3.us-east-2.amazonaws.com/us%20weather%20highest%20ny-a931766d31.png",
+        "title": "Highest temperature in NYC on August 9?",
+        "outcome": "No",
+        "eventSlug": "temp-nychigh-2026-08-09",
+        "subject": {
+         "id": 0,
+         "name": "94 to 95",
+         "subjectType": ""
+        },
+        "eventId": "75093"
+       },
+       "state": "ORDER_STATE_PARTIALLY_FILLED",
+       "commissionNotionalTotalCollected": {
+        "value": "-0.0100",
+        "currency": "USD"
+       },
+       "commissionsBasisPoints": "0",
+       "makerCommissionsBasisPoints": "0",
+       "avgPx": {
+        "value": "0.0500",
+        "currency": "USD"
+       },
+       "cashOrderQty": {
+        "value": "0.0000",
+        "currency": "USD"
+       },
+       "insertTime": "2026-08-09T01:50:34.678358137Z",
+       "createTime": "2026-08-09T01:50:34.676506225Z",
+       "outcomeSide": "OUTCOME_SIDE_NO",
+       "action": "ORDER_ACTION_BUY",
+       "manualOrderIndicator": "MANUAL_ORDER_INDICATOR_AUTOMATIC",
+       "lastTransactTime": "2026-08-09T01:50:46.708524431Z"
+      },
+      "lastShares": "19.0000",
+      "lastPx": {
+       "value": "0.0500",
+       "currency": "USD"
+      },
+      "type": "EXECUTION_TYPE_PARTIAL_FILL",
+      "text": "",
+      "orderRejectReason": "ORD_REJECT_REASON_EXCHANGE_OPTION",
+      "transactTime": "2026-08-09T01:50:46.708524431Z",
+      "legPrices": [],
+      "tradeId": "<SCRUBBED>",
+      "aggressor": false,
+      "commissionNotionalCollected": {
+       "value": "-0.0100",
+       "currency": "USD"
+      },
+      "unsolicitedCancelReason": "UNSOLICITED_CXL_REASON_UNDEFINED",
+      "traceId": "",
+      "commissionSpreadPx": {
+       "value": "0.9500",
+       "currency": "USD"
+      },
+      "transactTradeDate": "2026-08-09T00:00:00Z"
+     },
+     "marketSlug": "tc-temp-nychigh-2026-08-09-gte94lt95f",
+     "state": "TRADE_STATE_NEW",
+     "createTime": "2026-08-09T01:50:46.708524431Z",
+     "updateTime": "2026-08-09T01:50:46.708524431Z",
+     "price": {
+      "value": "0.0500",
+      "currency": "USD"
+     },
+     "qty": "19",
+     "cost": {
+      "value": "1",
+      "currency": "USD"
+     },
+     "aggressor": {
+      "id": "<SCRUBBED>",
+      "marketSlug": "tc-temp-nychigh-2026-08-09-gte94lt95f",
+      "side": "ORDER_SIDE_BUY",
+      "type": "ORDER_TYPE_LIMIT",
+      "price": {
+       "value": "0.05",
+       "currency": "USD"
+      },
+      "quantity": 19,
+      "cumQuantity": 19,
+      "leavesQuantity": 0,
+      "tif": "TIME_IN_FORCE_IMMEDIATE_OR_CANCEL",
+      "goodTillTime": null,
+      "intent": "ORDER_INTENT_BUY_LONG",
+      "marketMetadata": {
+       "slug": "tc-temp-nychigh-2026-08-09-gte94lt95f",
+       "icon": "https://polymarket-upload.s3.us-east-2.amazonaws.com/us%20weather%20highest%20ny-a931766d31.png",
+       "title": "Highest temperature in NYC on August 9?",
+       "outcome": "Yes",
+       "eventSlug": "temp-nychigh-2026-08-09",
+       "subject": {
+        "id": 0,
+        "name": "94 to 95",
+        "subjectType": ""
+       },
+       "eventId": "75093"
+      },
+      "state": "ORDER_STATE_FILLED",
+      "commissionNotionalTotalCollected": {
+       "value": "0.0500",
+       "currency": "USD"
+      },
+      "commissionsBasisPoints": "0",
+      "makerCommissionsBasisPoints": "0",
+      "avgPx": {
+       "value": "0.0500",
+       "currency": "USD"
+      },
+      "cashOrderQty": {
+       "value": "0.0000",
+       "currency": "USD"
+      },
+      "insertTime": "2026-08-09T01:50:46.708524431Z",
+      "createTime": "2026-08-09T01:50:46.706921264Z",
+      "outcomeSide": "OUTCOME_SIDE_YES",
+      "action": "ORDER_ACTION_BUY",
+      "manualOrderIndicator": "MANUAL_ORDER_INDICATOR_AUTOMATIC",
+      "lastTransactTime": "2026-08-09T01:50:46.708524431Z"
+     },
+     "passive": {
+      "id": "<SCRUBBED>",
+      "marketSlug": "tc-temp-nychigh-2026-08-09-gte94lt95f",
+      "side": "ORDER_SIDE_SELL",
+      "type": "ORDER_TYPE_LIMIT",
+      "price": {
+       "value": "0.05",
+       "currency": "USD"
+      },
+      "quantity": 45,
+      "cumQuantity": 19,
+      "leavesQuantity": 26,
+      "tif": "TIME_IN_FORCE_GOOD_TILL_DATE",
+      "goodTillTime": "2026-08-09T01:51:04Z",
+      "intent": "ORDER_INTENT_BUY_SHORT",
+      "marketMetadata": {
+       "slug": "tc-temp-nychigh-2026-08-09-gte94lt95f",
+       "icon": "https://polymarket-upload.s3.us-east-2.amazonaws.com/us%20weather%20highest%20ny-a931766d31.png",
+       "title": "Highest temperature in NYC on August 9?",
+       "outcome": "No",
+       "eventSlug": "temp-nychigh-2026-08-09",
+       "subject": {
+        "id": 0,
+        "name": "94 to 95",
+        "subjectType": ""
+       },
+       "eventId": "75093"
+      },
+      "state": "ORDER_STATE_PARTIALLY_FILLED",
+      "commissionNotionalTotalCollected": {
+       "value": "-0.0100",
+       "currency": "USD"
+      },
+      "commissionsBasisPoints": "0",
+      "makerCommissionsBasisPoints": "0",
+      "avgPx": {
+       "value": "0.0500",
+       "currency": "USD"
+      },
+      "cashOrderQty": {
+       "value": "0.0000",
+       "currency": "USD"
+      },
+      "insertTime": "2026-08-09T01:50:34.678358137Z",
+      "createTime": "2026-08-09T01:50:34.676506225Z",
+      "outcomeSide": "OUTCOME_SIDE_NO",
+      "action": "ORDER_ACTION_BUY",
+      "manualOrderIndicator": "MANUAL_ORDER_INDICATOR_AUTOMATIC",
+      "lastTransactTime": "2026-08-09T01:50:46.708524431Z"
+     },
+     "reportingCounterparty": "ORDER_SIDE_UNDEFINED",
+     "createTradeDate": "2026-08-09T00:00:00Z",
+     "updateTradeDate": "2026-08-09T00:00:00Z",
+     "tradeLinkId": "BRG7BGF1R9PH",
+     "isAggressor": true,
+     "market": {
+      "id": "<SCRUBBED>",
+      "question": "Highest temperature in NYC on August 9?",
+      "slug": "tc-temp-nychigh-2026-08-09-gte94lt95f",
+      "endDate": "2026-08-10T05:00:00Z",
+      "category": "climate",
+      "startDate": "2026-08-08T09:45:22Z",
+      "description": "Will the highest temperature recorded at Central Park (KNYC) in New York City for 2026-08-09 as reported by the National Weather Service's Climatological Report (Daily) be between 94F and 95F? Outcome verified from NWS Climatological Report.",
+      "active": true,
+      "marketType": "futures",
+      "closed": true,
+      "createdAt": "2026-08-08T09:45:22Z",
+      "updatedAt": "2026-09-05T22:21:21Z",
+      "archived": false,
+      "orderPriceMinTickSize": "0.01",
+      "gameStartTime": "2026-08-09T05:00:00Z",
+      "manualActivation": false,
+      "sportsMarketType": "futures",
+      "marketSides": [
+       {
+        "id": "<SCRUBBED>",
+        "marketSideType": "MARKET_SIDE_TYPE_INSTRUMENT",
+        "identifier": "tc-temp-nychigh-2026-08-09-gte94lt95f",
+        "createdAt": "2026-08-08T09:45:22Z",
+        "updatedAt": "2026-08-08T09:45:22Z",
+        "description": "Yes",
+        "price": "0",
+        "marketId": 387006,
+        "long": true,
+        "tradable": true
+       },
+       {
+        "id": "<SCRUBBED>",
+        "marketSideType": "MARKET_SIDE_TYPE_INSTRUMENT",
+        "identifier": "tc-temp-nychigh-2026-08-09-gte94lt95f",
+        "createdAt": "2026-08-08T09:45:22Z",
+        "updatedAt": "2026-08-08T09:45:22Z",
+        "description": "No",
+        "price": "1",
+        "marketId": 387006,
+        "long": false,
+        "tradable": true
+       }
+      ],
+      "outcomes": "[\"No\",\"Yes\"]",
+      "outcomePrices": "[\"0\",\"1\"]",
+      "ep3Status": "EXPIRED",
+      "status": "MARKET_STATUS_RESOLVED",
+      "sportsMarketTypeV2": "SPORTS_MARKET_TYPE_FUTURE",
+      "hidden": false,
+      "tags": [],
+      "title": "94 to 95",
+      "feeCoefficient": "0.06",
+      "sortOrder": 4,
+      "titleShort": "94 to 95",
+      "ep3SyncedAt": "2026-09-05T22:21:21Z",
+      "minimumTradeQty": "0.01",
+      "comboEnabled": false
+     },
+     "qtyDecimal": "19.0000",
+     "comboLegDetails": []
+    }
+   },
+   {
+    "type": "ACTIVITY_TYPE_TRADE",
+    "trade": {
+     "id": "<SCRUBBED>",
+     "aggressorExecution": {
+      "id": "<SCRUBBED>",
+      "order": {
+       "id": "<SCRUBBED>",
+       "marketSlug": "tc-temp-sfohigh-2026-08-08-gte74lt75f",
+       "side": "ORDER_SIDE_BUY",
+       "type": "ORDER_TYPE_LIMIT",
+       "price": {
+        "value": "0.14",
+        "currency": "USD"
+       },
+       "quantity": "6.78",
+       "cumQuantity": "6.78",
+       "leavesQuantity": 0,
+       "tif": "TIME_IN_FORCE_IMMEDIATE_OR_CANCEL",
+       "goodTillTime": null,
+       "intent": "ORDER_INTENT_BUY_LONG",
+       "marketMetadata": {
+        "slug": "tc-temp-sfohigh-2026-08-08-gte74lt75f",
+        "icon": "https://polymarket-upload.s3.us-east-2.amazonaws.com/us%20weather%20highest%20sf-deab2f2750.png",
+        "title": "Highest temperature in San Francisco on August 8?",
+        "outcome": "Yes",
+        "eventSlug": "temp-sfohigh-2026-08-08",
+        "subject": {
+         "id": 0,
+         "name": "74 to 75",
+         "subjectType": ""
+        },
+        "eventId": "74334"
+       },
+       "state": "ORDER_STATE_FILLED",
+       "commissionNotionalTotalCollected": {
+        "value": "0.0500",
+        "currency": "USD"
+       },
+       "commissionsBasisPoints": "0",
+       "makerCommissionsBasisPoints": "0",
+       "avgPx": {
+        "value": "0.1400",
+        "currency": "USD"
+       },
+       "cashOrderQty": {
+        "value": "0.0000",
+        "currency": "USD"
+       },
+       "insertTime": "2026-08-08T04:54:54.470204359Z",
+       "createTime": "2026-08-08T04:54:54.468774706Z",
+       "outcomeSide": "OUTCOME_SIDE_YES",
+       "action": "ORDER_ACTION_BUY",
+       "manualOrderIndicator": "MANUAL_ORDER_INDICATOR_AUTOMATIC",
+       "lastTransactTime": "2026-08-08T04:54:54.470204359Z"
+      },
+      "lastShares": "6.7800",
+      "lastPx": {
+       "value": "0.1400",
+       "currency": "USD"
+      },
+      "type": "EXECUTION_TYPE_FILL",
+      "text": "",
+      "orderRejectReason": "ORD_REJECT_REASON_EXCHANGE_OPTION",
+      "transactTime": "2026-08-08T04:54:54.470204359Z",
+      "legPrices": [],
+      "tradeId": "<SCRUBBED>",
+      "aggressor": true,
+      "commissionNotionalCollected": {
+       "value": "0.0500",
+       "currency": "USD"
+      },
+      "unsolicitedCancelReason": "UNSOLICITED_CXL_REASON_UNDEFINED",
+      "traceId": "",
+      "commissionSpreadPx": {
+       "value": "0.1400",
+       "currency": "USD"
+      },
+      "transactTradeDate": "2026-08-08T00:00:00Z"
+     },
+     "passiveExecution": {
+      "id": "<SCRUBBED>",
+      "order": {
+       "id": "<SCRUBBED>",
+       "marketSlug": "tc-temp-sfohigh-2026-08-08-gte74lt75f",
+       "side": "ORDER_SIDE_SELL",
+       "type": "ORDER_TYPE_LIMIT",
+       "price": {
+        "value": "0.14",
+        "currency": "USD"
+       },
+       "quantity": 54,
+       "cumQuantity": "6.78",
+       "leavesQuantity": "47.22",
+       "tif": "TIME_IN_FORCE_GOOD_TILL_CANCEL",
+       "goodTillTime": null,
+       "intent": "ORDER_INTENT_BUY_SHORT",
+       "marketMetadata": {
+        "slug": "tc-temp-sfohigh-2026-08-08-gte74lt75f",
+        "icon": "https://polymarket-upload.s3.us-east-2.amazonaws.com/us%20weather%20highest%20sf-deab2f2750.png",
+        "title": "Highest temperature in San Francisco on August 8?",
+        "outcome": "No",
+        "eventSlug": "temp-sfohigh-2026-08-08",
+        "subject": {
+         "id": 0,
+         "name": "74 to 75",
+         "subjectType": ""
+        },
+        "eventId": "74334"
+       },
+       "state": "ORDER_STATE_PARTIALLY_FILLED",
+       "commissionNotionalTotalCollected": {
+        "value": "-0.0100",
+        "currency": "USD"
+       },
+       "commissionsBasisPoints": "0",
+       "makerCommissionsBasisPoints": "0",
+       "avgPx": {
+        "value": "0.1400",
+        "currency": "USD"
+       },
+       "cashOrderQty": {
+        "value": "0.0000",
+        "currency": "USD"
+       },
+       "insertTime": "2026-08-08T04:53:13.344471643Z",
+       "createTime": "2026-08-08T04:53:13.343163776Z",
+       "outcomeSide": "OUTCOME_SIDE_NO",
+       "action": "ORDER_ACTION_BUY",
+       "manualOrderIndicator": "MANUAL_ORDER_INDICATOR_AUTOMATIC",
+       "lastTransactTime": "2026-08-08T04:54:54.470204359Z"
+      },
+      "lastShares": "6.7800",
+      "lastPx": {
+       "value": "0.1400",
+       "currency": "USD"
+      },
+      "type": "EXECUTION_TYPE_PARTIAL_FILL",
+      "text": "",
+      "orderRejectReason": "ORD_REJECT_REASON_EXCHANGE_OPTION",
+      "transactTime": "2026-08-08T04:54:54.470204359Z",
+      "legPrices": [],
+      "tradeId": "<SCRUBBED>",
+      "aggressor": false,
+      "commissionNotionalCollected": {
+       "value": "-0.0100",
+       "currency": "USD"
+      },
+      "unsolicitedCancelReason": "UNSOLICITED_CXL_REASON_UNDEFINED",
+      "traceId": "",
+      "commissionSpreadPx": {
+       "value": "0.8600",
+       "currency": "USD"
+      },
+      "transactTradeDate": "2026-08-08T00:00:00Z"
+     },
+     "marketSlug": "tc-temp-sfohigh-2026-08-08-gte74lt75f",
+     "state": "TRADE_STATE_NEW",
+     "createTime": "2026-08-08T04:54:54.470204359Z",
+     "updateTime": "2026-08-08T04:54:54.470204359Z",
+     "price": {
+      "value": "0.1400",
+      "currency": "USD"
+     },
+     "qty": "7",
+     "cost": {
+      "value": "0.9992",
+      "currency": "USD"
+     },
+     "aggressor": {
+      "id": "<SCRUBBED>",
+      "marketSlug": "tc-temp-sfohigh-2026-08-08-gte74lt75f",
+      "side": "ORDER_SIDE_BUY",
+      "type": "ORDER_TYPE_LIMIT",
+      "price": {
+       "value": "0.14",
+       "currency": "USD"
+      },
+      "quantity": "6.78",
+      "cumQuantity": "6.78",
+      "leavesQuantity": 0,
+      "tif": "TIME_IN_FORCE_IMMEDIATE_OR_CANCEL",
+      "goodTillTime": null,
+      "intent": "ORDER_INTENT_BUY_LONG",
+      "marketMetadata": {
+       "slug": "tc-temp-sfohigh-2026-08-08-gte74lt75f",
+       "icon": "https://polymarket-upload.s3.us-east-2.amazonaws.com/us%20weather%20highest%20sf-deab2f2750.png",
+       "title": "Highest temperature in San Francisco on August 8?",
+       "outcome": "Yes",
+       "eventSlug": "temp-sfohigh-2026-08-08",
+       "subject": {
+        "id": 0,
+        "name": "74 to 75",
+        "subjectType": ""
+       },
+       "eventId": "74334"
+      },
+      "state": "ORDER_STATE_FILLED",
+      "commissionNotionalTotalCollected": {
+       "value": "0.0500",
+       "currency": "USD"
+      },
+      "commissionsBasisPoints": "0",
+      "makerCommissionsBasisPoints": "0",
+      "avgPx": {
+       "value": "0.1400",
+       "currency": "USD"
+      },
+      "cashOrderQty": {
+       "value": "0.0000",
+       "currency": "USD"
+      },
+      "insertTime": "2026-08-08T04:54:54.470204359Z",
+      "createTime": "2026-08-08T04:54:54.468774706Z",
+      "outcomeSide": "OUTCOME_SIDE_YES",
+      "action": "ORDER_ACTION_BUY",
+      "manualOrderIndicator": "MANUAL_ORDER_INDICATOR_AUTOMATIC",
+      "lastTransactTime": "2026-08-08T04:54:54.470204359Z"
+     },
+     "passive": {
+      "id": "<SCRUBBED>",
+      "marketSlug": "tc-temp-sfohigh-2026-08-08-gte74lt75f",
+      "side": "ORDER_SIDE_SELL",
+      "type": "ORDER_TYPE_LIMIT",
+      "price": {
+       "value": "0.14",
+       "currency": "USD"
+      },
+      "quantity": 54,
+      "cumQuantity": "6.78",
+      "leavesQuantity": "47.22",
+      "tif": "TIME_IN_FORCE_GOOD_TILL_CANCEL",
+      "goodTillTime": null,
+      "intent": "ORDER_INTENT_BUY_SHORT",
+      "marketMetadata": {
+       "slug": "tc-temp-sfohigh-2026-08-08-gte74lt75f",
+       "icon": "https://polymarket-upload.s3.us-east-2.amazonaws.com/us%20weather%20highest%20sf-deab2f2750.png",
+       "title": "Highest temperature in San Francisco on August 8?",
+       "outcome": "No",
+       "eventSlug": "temp-sfohigh-2026-08-08",
+       "subject": {
+        "id": 0,
+        "name": "74 to 75",
+        "subjectType": ""
+       },
+       "eventId": "74334"
+      },
+      "state": "ORDER_STATE_PARTIALLY_FILLED",
+      "commissionNotionalTotalCollected": {
+       "value": "-0.0100",
+       "currency": "USD"
+      },
+      "commissionsBasisPoints": "0",
+      "makerCommissionsBasisPoints": "0",
+      "avgPx": {
+       "value": "0.1400",
+       "currency": "USD"
+      },
+      "cashOrderQty": {
+       "value": "0.0000",
+       "currency": "USD"
+      },
+      "insertTime": "2026-08-08T04:53:13.344471643Z",
+      "createTime": "2026-08-08T04:53:13.343163776Z",
+      "outcomeSide": "OUTCOME_SIDE_NO",
+      "action": "ORDER_ACTION_BUY",
+      "manualOrderIndicator": "MANUAL_ORDER_INDICATOR_AUTOMATIC",
+      "lastTransactTime": "2026-08-08T04:54:54.470204359Z"
+     },
+     "reportingCounterparty": "ORDER_SIDE_UNDEFINED",
+     "createTradeDate": "2026-08-08T00:00:00Z",
+     "updateTradeDate": "2026-08-08T00:00:00Z",
+     "tradeLinkId": "BQXZQFS069PT",
+     "isAggressor": true,
+     "market": {
+      "id": "<SCRUBBED>",
+      "question": "Highest temperature in San Francisco on August 8?",
+      "slug": "tc-temp-sfohigh-2026-08-08-gte74lt75f",
+      "endDate": "2026-08-09T08:00:00Z",
+      "category": "climate",
+      "startDate": "2026-08-07T09:45:53Z",
+      "description": "Will the highest temperature recorded at San Francisco International Airport (KSFO) in San Francisco for 2026-08-08 as reported by the National Weather Service's Climatological Report (Daily) be between 74F and 75F? Outcome verified from NWS Climatological Report.",
+      "active": true,
+      "marketType": "futures",
+      "closed": true,
+      "createdAt": "2026-08-07T09:45:53Z",
+      "updatedAt": "2026-09-05T22:19:42Z",
+      "archived": false,
+      "orderPriceMinTickSize": "0.01",
+      "gameStartTime": "2026-08-08T08:00:00Z",
+      "manualActivation": false,
+      "sportsMarketType": "futures",
+      "marketSides": [
+       {
+        "id": "<SCRUBBED>",
+        "marketSideType": "MARKET_SIDE_TYPE_INSTRUMENT",
+        "identifier": "tc-temp-sfohigh-2026-08-08-gte74lt75f",
+        "createdAt": "2026-08-07T09:45:53Z",
+        "updatedAt": "2026-08-07T09:45:53Z",
+        "description": "Yes",
+        "price": "0",
+        "marketId": 378492,
+        "long": true,
+        "tradable": true
+       },
+       {
+        "id": "<SCRUBBED>",
+        "marketSideType": "MARKET_SIDE_TYPE_INSTRUMENT",
+        "identifier": "tc-temp-sfohigh-2026-08-08-gte74lt75f",
+        "createdAt": "2026-08-07T09:45:53Z",
+        "updatedAt": "2026-08-07T09:45:53Z",
+        "description": "No",
+        "price": "1",
+        "marketId": 378492,
+        "long": false,
+        "tradable": true
+       }
+      ],
+      "outcomes": "[\"No\",\"Yes\"]",
+      "outcomePrices": "[\"0\",\"1\"]",
+      "ep3Status": "EXPIRED",
+      "status": "MARKET_STATUS_RESOLVED",
+      "sportsMarketTypeV2": "SPORTS_MARKET_TYPE_FUTURE",
+      "hidden": false,
+      "tags": [],
+      "title": "74 to 75",
+      "feeCoefficient": "0.06",
+      "sortOrder": 2,
+      "titleShort": "74 to 75",
+      "ep3SyncedAt": "2026-09-05T22:19:42Z",
+      "minimumTradeQty": "0.01",
+      "comboEnabled": false
+     },
+     "qtyDecimal": "6.7800",
+     "comboLegDetails": []
+    }
+   },
+   {
+    "type": "ACTIVITY_TYPE_TRADE",
+    "trade": {
+     "id": "<SCRUBBED>",
+     "aggressorExecution": {
+      "id": "<SCRUBBED>",
+      "order": {
+       "id": "<SCRUBBED>",
+       "marketSlug": "tc-temp-nychigh-2026-08-06-gte96f",
+       "side": "ORDER_SIDE_SELL",
+       "type": "ORDER_TYPE_LIMIT",
+       "price": {
+        "value": "0.01",
+        "currency": "USD"
+       },
+       "quantity": "7.63",
+       "cumQuantity": "7.63",
+       "leavesQuantity": 0,
+       "tif": "TIME_IN_FORCE_IMMEDIATE_OR_CANCEL",
+       "goodTillTime": null,
+       "intent": "ORDER_INTENT_SELL_LONG",
+       "marketMetadata": {
+        "slug": "tc-temp-nychigh-2026-08-06-gte96f",
+        "icon": "https://polymarket-upload.s3.us-east-2.amazonaws.com/us%20weather%20highest%20ny-a931766d31.png",
+        "title": "Highest temperature in NYC on August 6?",
+        "outcome": "Yes",
+        "eventSlug": "temp-nychigh-2026-08-06",
+        "subject": {
+         "id": 0,
+         "name": "96 or above",
+         "subjectType": ""
+        },
+        "eventId": "72741"
+       },
+       "state": "ORDER_STATE_FILLED",
+       "commissionNotionalTotalCollected": {
+        "value": "0.0000",
+        "currency": "USD"
+       },
+       "commissionsBasisPoints": "0",
+       "makerCommissionsBasisPoints": "0",
+       "avgPx": {
+        "value": "0.0100",
+        "currency": "USD"
+       },
+       "cashOrderQty": {
+        "value": "0.0000",
+        "currency": "USD"
+       },
+       "insertTime": "2026-08-05T16:04:55.312262249Z",
+       "createTime": "2026-08-05T16:04:55.310433662Z",
+       "outcomeSide": "OUTCOME_SIDE_YES",
+       "action": "ORDER_ACTION_SELL",
+       "manualOrderIndicator": "MANUAL_ORDER_INDICATOR_MANUAL",
+       "lastTransactTime": "2026-08-05T16:04:55.312262249Z"
+      },
+      "lastShares": "7.6300",
+      "lastPx": {
+       "value": "0.0100",
+       "currency": "USD"
+      },
+      "type": "EXECUTION_TYPE_FILL",
+      "text": "",
+      "orderRejectReason": "ORD_REJECT_REASON_EXCHANGE_OPTION",
+      "transactTime": "2026-08-05T16:04:55.312262249Z",
+      "legPrices": [],
+      "tradeId": "<SCRUBBED>",
+      "aggressor": true,
+      "commissionNotionalCollected": {
+       "value": "0.0000",
+       "currency": "USD"
+      },
+      "unsolicitedCancelReason": "UNSOLICITED_CXL_REASON_UNDEFINED",
+      "traceId": "",
+      "commissionSpreadPx": {
+       "value": "0.9900",
+       "currency": "USD"
+      },
+      "transactTradeDate": "2026-08-05T00:00:00Z"
+     },
+     "passiveExecution": {
+      "id": "<SCRUBBED>",
+      "order": {
+       "id": "<SCRUBBED>",
+       "marketSlug": "tc-temp-nychigh-2026-08-06-gte96f",
+       "side": "ORDER_SIDE_BUY",
+       "type": "ORDER_TYPE_LIMIT",
+       "price": {
+        "value": "0.01",
+        "currency": "USD"
+       },
+       "quantity": 50,
+       "cumQuantity": "7.63",
+       "leavesQuantity": "42.37",
+       "tif": "TIME_IN_FORCE_GOOD_TILL_CANCEL",
+       "goodTillTime": null,
+       "intent": "ORDER_INTENT_BUY_LONG",
+       "marketMetadata": {
+        "slug": "tc-temp-nychigh-2026-08-06-gte96f",
+        "icon": "https://polymarket-upload.s3.us-east-2.amazonaws.com/us%20weather%20highest%20ny-a931766d31.png",
+        "title": "Highest temperature in NYC on August 6?",
+        "outcome": "Yes",
+        "eventSlug": "temp-nychigh-2026-08-06",
+        "subject": {
+         "id": 0,
+         "name": "96 or above",
+         "subjectType": ""
+        },
+        "eventId": "72741"
+       },
+       "state": "ORDER_STATE_PARTIALLY_FILLED",
+       "commissionNotionalTotalCollected": {
+        "value": "0.0000",
+        "currency": "USD"
+       },
+       "commissionsBasisPoints": "0",
+       "makerCommissionsBasisPoints": "0",
+       "avgPx": {
+        "value": "0.0100",
+        "currency": "USD"
+       },
+       "cashOrderQty": {
+        "value": "0.0000",
+        "currency": "USD"
+       },
+       "insertTime": "2026-08-05T16:02:42.918520741Z",
+       "createTime": "2026-08-05T16:02:42.916715485Z",
+       "outcomeSide": "OUTCOME_SIDE_YES",
+       "action": "ORDER_ACTION_BUY",
+       "manualOrderIndicator": "MANUAL_ORDER_INDICATOR_AUTOMATIC",
+       "lastTransactTime": "2026-08-05T16:04:55.312262249Z"
+      },
+      "lastShares": "7.6300",
+      "lastPx": {
+       "value": "0.0100",
+       "currency": "USD"
+      },
+      "type": "EXECUTION_TYPE_PARTIAL_FILL",
+      "text": "",
+      "orderRejectReason": "ORD_REJECT_REASON_EXCHANGE_OPTION",
+      "transactTime": "2026-08-05T16:04:55.312262249Z",
+      "legPrices": [],
+      "tradeId": "<SCRUBBED>",
+      "aggressor": false,
+      "commissionNotionalCollected": {
+       "value": "0.0000",
+       "currency": "USD"
+      },
+      "unsolicitedCancelReason": "UNSOLICITED_CXL_REASON_UNDEFINED",
+      "traceId": "",
+      "commissionSpreadPx": {
+       "value": "0.0100",
+       "currency": "USD"
+      },
+      "transactTradeDate": "2026-08-05T00:00:00Z"
+     },
+     "marketSlug": "tc-temp-nychigh-2026-08-06-gte96f",
+     "state": "TRADE_STATE_NEW",
+     "createTime": "2026-08-05T16:04:55.312262249Z",
+     "updateTime": "2026-08-05T16:04:55.312262249Z",
+     "price": {
+      "value": "0.0100",
+      "currency": "USD"
+     },
+     "qty": "8",
+     "cost": {
+      "value": "0.0763",
+      "currency": "USD"
+     },
+     "aggressor": {
+      "id": "<SCRUBBED>",
+      "marketSlug": "tc-temp-nychigh-2026-08-06-gte96f",
+      "side": "ORDER_SIDE_SELL",
+      "type": "ORDER_TYPE_LIMIT",
+      "price": {
+       "value": "0.01",
+       "currency": "USD"
+      },
+      "quantity": "7.63",
+      "cumQuantity": "7.63",
+      "leavesQuantity": 0,
+      "tif": "TIME_IN_FORCE_IMMEDIATE_OR_CANCEL",
+      "goodTillTime": null,
+      "intent": "ORDER_INTENT_SELL_LONG",
+      "marketMetadata": {
+       "slug": "tc-temp-nychigh-2026-08-06-gte96f",
+       "icon": "https://polymarket-upload.s3.us-east-2.amazonaws.com/us%20weather%20highest%20ny-a931766d31.png",
+       "title": "Highest temperature in NYC on August 6?",
+       "outcome": "Yes",
+       "eventSlug": "temp-nychigh-2026-08-06",
+       "subject": {
+        "id": 0,
+        "name": "96 or above",
+        "subjectType": ""
+       },
+       "eventId": "72741"
+      },
+      "state": "ORDER_STATE_FILLED",
+      "commissionNotionalTotalCollected": {
+       "value": "0.0000",
+       "currency": "USD"
+      },
+      "commissionsBasisPoints": "0",
+      "makerCommissionsBasisPoints": "0",
+      "avgPx": {
+       "value": "0.0100",
+       "currency": "USD"
+      },
+      "cashOrderQty": {
+       "value": "0.0000",
+       "currency": "USD"
+      },
+      "insertTime": "2026-08-05T16:04:55.312262249Z",
+      "createTime": "2026-08-05T16:04:55.310433662Z",
+      "outcomeSide": "OUTCOME_SIDE_YES",
+      "action": "ORDER_ACTION_SELL",
+      "manualOrderIndicator": "MANUAL_ORDER_INDICATOR_MANUAL",
+      "lastTransactTime": "2026-08-05T16:04:55.312262249Z"
+     },
+     "passive": {
+      "id": "<SCRUBBED>",
+      "marketSlug": "tc-temp-nychigh-2026-08-06-gte96f",
+      "side": "ORDER_SIDE_BUY",
+      "type": "ORDER_TYPE_LIMIT",
+      "price": {
+       "value": "0.01",
+       "currency": "USD"
+      },
+      "quantity": 50,
+      "cumQuantity": "7.63",
+      "leavesQuantity": "42.37",
+      "tif": "TIME_IN_FORCE_GOOD_TILL_CANCEL",
+      "goodTillTime": null,
+      "intent": "ORDER_INTENT_BUY_LONG",
+      "marketMetadata": {
+       "slug": "tc-temp-nychigh-2026-08-06-gte96f",
+       "icon": "https://polymarket-upload.s3.us-east-2.amazonaws.com/us%20weather%20highest%20ny-a931766d31.png",
+       "title": "Highest temperature in NYC on August 6?",
+       "outcome": "Yes",
+       "eventSlug": "temp-nychigh-2026-08-06",
+       "subject": {
+        "id": 0,
+        "name": "96 or above",
+        "subjectType": ""
+       },
+       "eventId": "72741"
+      },
+      "state": "ORDER_STATE_PARTIALLY_FILLED",
+      "commissionNotionalTotalCollected": {
+       "value": "0.0000",
+       "currency": "USD"
+      },
+      "commissionsBasisPoints": "0",
+      "makerCommissionsBasisPoints": "0",
+      "avgPx": {
+       "value": "0.0100",
+       "currency": "USD"
+      },
+      "cashOrderQty": {
+       "value": "0.0000",
+       "currency": "USD"
+      },
+      "insertTime": "2026-08-05T16:02:42.918520741Z",
+      "createTime": "2026-08-05T16:02:42.916715485Z",
+      "outcomeSide": "OUTCOME_SIDE_YES",
+      "action": "ORDER_ACTION_BUY",
+      "manualOrderIndicator": "MANUAL_ORDER_INDICATOR_AUTOMATIC",
+      "lastTransactTime": "2026-08-05T16:04:55.312262249Z"
+     },
+     "reportingCounterparty": "ORDER_SIDE_UNDEFINED",
+     "createTradeDate": "2026-08-05T00:00:00Z",
+     "updateTradeDate": "2026-08-05T00:00:00Z",
+     "tradeLinkId": "BP33TYCAP9PT",
+     "isAggressor": true,
+     "costBasis": {
+      "value": "0.16",
+      "currency": "USD"
+     },
+     "originalPrice": {
+      "value": "0.02",
+      "currency": "USD"
+     },
+     "realizedPnl": {
+      "value": "-0.08",
+      "currency": "USD"
+     },
+     "effectiveOriginalPrice": {
+      "value": "0.02",
+      "currency": "USD"
+     },
+     "effectiveCostBasis": {
+      "value": "0.16",
+      "currency": "USD"
+     },
+     "effectiveRealizedPnl": {
+      "value": "-0.08",
+      "currency": "USD"
+     },
+     "market": {
+      "id": "<SCRUBBED>",
+      "question": "Highest temperature in NYC on August 6?",
+      "slug": "tc-temp-nychigh-2026-08-06-gte96f",
+      "endDate": "2026-08-07T05:00:00Z",
+      "category": "climate",
+      "startDate": "2026-08-05T09:45:25Z",
+      "description": "Will the highest temperature recorded at Central Park (KNYC) in New York City for 2026-08-06 as reported by the National Weather Service's Climatological Report (Daily) be greater than or equal to 96F? Outcome verified from NWS Climatological Report.",
+      "active": true,
+      "marketType": "futures",
+      "closed": true,
+      "createdAt": "2026-08-05T09:45:25Z",
+      "updatedAt": "2026-09-05T22:17:10Z",
+      "archived": false,
+      "orderPriceMinTickSize": "0.01",
+      "gameStartTime": "2026-08-06T05:00:00Z",
+      "manualActivation": false,
+      "sportsMarketType": "futures",
+      "marketSides": [
+       {
+        "id": "<SCRUBBED>",
+        "marketSideType": "MARKET_SIDE_TYPE_INSTRUMENT",
+        "identifier": "tc-temp-nychigh-2026-08-06-gte96f",
+        "createdAt": "2026-08-05T09:45:25Z",
+        "updatedAt": "2026-08-05T09:45:25Z",
+        "description": "Yes",
+        "marketId": 366418,
+        "long": true,
+        "tradable": true
+       },
+       {
+        "id": "<SCRUBBED>",
+        "marketSideType": "MARKET_SIDE_TYPE_INSTRUMENT",
+        "identifier": "tc-temp-nychigh-2026-08-06-gte96f",
+        "createdAt": "2026-08-05T09:45:25Z",
+        "updatedAt": "2026-08-05T09:45:25Z",
+        "description": "No",
+        "marketId": 366418,
+        "long": false,
+        "tradable": true
+       }
+      ],
+      "outcomes": "[\"No\",\"Yes\"]",
+      "outcomePrices": "[\"0\",\"0\"]",
+      "ep3Status": "EXPIRED",
+      "status": "MARKET_STATUS_RESOLVING",
+      "sportsMarketTypeV2": "SPORTS_MARKET_TYPE_FUTURE",
+      "hidden": false,
+      "tags": [],
+      "title": "96 or above",
+      "feeCoefficient": "0.06",
+      "sortOrder": 6,
+      "titleShort": "96 or above",
+      "ep3SyncedAt": "2026-09-05T22:17:10Z",
+      "minimumTradeQty": "0.01",
+      "comboEnabled": false
+     },
+     "qtyDecimal": "7.6300",
+     "comboLegDetails": []
+    }
+   },
+   {
+    "type": "ACTIVITY_TYPE_TRADE",
+    "trade": {
+     "id": "<SCRUBBED>",
+     "aggressorExecution": {
+      "id": "<SCRUBBED>",
+      "order": {
+       "id": "<SCRUBBED>",
+       "marketSlug": "tc-temp-nychigh-2026-08-06-gte96f",
+       "side": "ORDER_SIDE_BUY",
+       "type": "ORDER_TYPE_LIMIT",
+       "price": {
+        "value": "0.02",
+        "currency": "USD"
+       },
+       "quantity": "7.63",
+       "cumQuantity": "7.63",
+       "leavesQuantity": 0,
+       "tif": "TIME_IN_FORCE_IMMEDIATE_OR_CANCEL",
+       "goodTillTime": null,
+       "intent": "ORDER_INTENT_BUY_LONG",
+       "marketMetadata": {
+        "slug": "tc-temp-nychigh-2026-08-06-gte96f",
+        "icon": "https://polymarket-upload.s3.us-east-2.amazonaws.com/us%20weather%20highest%20ny-a931766d31.png",
+        "title": "Highest temperature in NYC on August 6?",
+        "outcome": "Yes",
+        "eventSlug": "temp-nychigh-2026-08-06",
+        "subject": {
+         "id": 0,
+         "name": "96 or above",
+         "subjectType": ""
+        },
+        "eventId": "72741"
+       },
+       "state": "ORDER_STATE_FILLED",
+       "commissionNotionalTotalCollected": {
+        "value": "0.0100",
+        "currency": "USD"
+       },
+       "commissionsBasisPoints": "0",
+       "makerCommissionsBasisPoints": "0",
+       "avgPx": {
+        "value": "0.0200",
+        "currency": "USD"
+       },
+       "cashOrderQty": {
+        "value": "0.0000",
+        "currency": "USD"
+       },
+       "insertTime": "2026-08-05T13:40:00.704590303Z",
+       "createTime": "2026-08-05T13:40:00.702778031Z",
+       "outcomeSide": "OUTCOME_SIDE_YES",
+       "action": "ORDER_ACTION_BUY",
+       "manualOrderIndicator": "MANUAL_ORDER_INDICATOR_AUTOMATIC",
+       "lastTransactTime": "2026-08-05T13:40:00.704590303Z"
+      },
+      "lastShares": "4.6300",
+      "lastPx": {
+       "value": "0.0200",
+       "currency": "USD"
+      },
+      "type": "EXECUTION_TYPE_FILL",
+      "text": "",
+      "orderRejectReason": "ORD_REJECT_REASON_EXCHANGE_OPTION",
+      "transactTime": "2026-08-05T13:40:00.704590303Z",
+      "legPrices": [],
+      "tradeId": "<SCRUBBED>",
+      "aggressor": true,
+      "commissionNotionalCollected": {
+       "value": "0.0100",
+       "currency": "USD"
+      },
+      "unsolicitedCancelReason": "UNSOLICITED_CXL_REASON_UNDEFINED",
+      "traceId": "",
+      "commissionSpreadPx": {
+       "value": "0.0200",
+       "currency": "USD"
+      },
+      "transactTradeDate": "2026-08-05T00:00:00Z"
+     },
+     "passiveExecution": {
+      "id": "<SCRUBBED>",
+      "order": {
+       "id": "<SCRUBBED>",
+       "marketSlug": "tc-temp-nychigh-2026-08-06-gte96f",
+       "side": "ORDER_SIDE_SELL",
+       "type": "ORDER_TYPE_LIMIT",
+       "price": {
+        "value": "0.02",
+        "currency": "USD"
+       },
+       "quantity": 6,
+       "cumQuantity": "4.63",
+       "leavesQuantity": "1.37",
+       "tif": "TIME_IN_FORCE_GOOD_TILL_CANCEL",
+       "goodTillTime": null,
+       "intent": "ORDER_INTENT_BUY_SHORT",
+       "marketMetadata": {
+        "slug": "tc-temp-nychigh-2026-08-06-gte96f",
+        "icon": "https://polymarket-upload.s3.us-east-2.amazonaws.com/us%20weather%20highest%20ny-a931766d31.png",
+        "title": "Highest temperature in NYC on August 6?",
+        "outcome": "No",
+        "eventSlug": "temp-nychigh-2026-08-06",
+        "subject": {
+         "id": 0,
+         "name": "96 or above",
+         "subjectType": ""
+        },
+        "eventId": "72741"
+       },
+       "state": "ORDER_STATE_PARTIALLY_FILLED",
+       "commissionNotionalTotalCollected": {
+        "value": "0.0000",
+        "currency": "USD"
+       },
+       "commissionsBasisPoints": "0",
+       "makerCommissionsBasisPoints": "0",
+       "avgPx": {
+        "value": "0.0200",
+        "currency": "USD"
+       },
+       "cashOrderQty": {
+        "value": "0.0000",
+        "currency": "USD"
+       },
+       "insertTime": "2026-08-05T13:36:23.670180660Z",
+       "createTime": "2026-08-05T13:36:23.667706074Z",
+       "outcomeSide": "OUTCOME_SIDE_NO",
+       "action": "ORDER_ACTION_BUY",
+       "manualOrderIndicator": "MANUAL_ORDER_INDICATOR_MANUAL",
+       "lastTransactTime": "2026-08-05T13:40:00.704590303Z"
+      },
+      "lastShares": "4.6300",
+      "lastPx": {
+       "value": "0.0200",
+       "currency": "USD"
+      },
+      "type": "EXECUTION_TYPE_PARTIAL_FILL",
+      "text": "",
+      "orderRejectReason": "ORD_REJECT_REASON_EXCHANGE_OPTION",
+      "transactTime": "2026-08-05T13:40:00.704590303Z",
+      "legPrices": [],
+      "tradeId": "<SCRUBBED>",
+      "aggressor": false,
+      "commissionNotionalCollected": {
+       "value": "0.0000",
+       "currency": "USD"
+      },
+      "unsolicitedCancelReason": "UNSOLICITED_CXL_REASON_UNDEFINED",
+      "traceId": "",
+      "commissionSpreadPx": {
+       "value": "0.9800",
+       "currency": "USD"
+      },
+      "transactTradeDate": "2026-08-05T00:00:00Z"
+     },
+     "marketSlug": "tc-temp-nychigh-2026-08-06-gte96f",
+     "state": "TRADE_STATE_NEW",
+     "createTime": "2026-08-05T13:40:00.704590303Z",
+     "updateTime": "2026-08-05T13:40:00.704590303Z",
+     "price": {
+      "value": "0.0200",
+      "currency": "USD"
+     },
+     "qty": "5",
+     "cost": {
+      "value": "0.1026",
+      "currency": "USD"
+     },
+     "aggressor": {
+      "id": "<SCRUBBED>",
+      "marketSlug": "tc-temp-nychigh-2026-08-06-gte96f",
+      "side": "ORDER_SIDE_BUY",
+      "type": "ORDER_TYPE_LIMIT",
+      "price": {
+       "value": "0.02",
+       "currency": "USD"
+      },
+      "quantity": "7.63",
+      "cumQuantity": "7.63",
+      "leavesQuantity": 0,
+      "tif": "TIME_IN_FORCE_IMMEDIATE_OR_CANCEL",
+      "goodTillTime": null,
+      "intent": "ORDER_INTENT_BUY_LONG",
+      "marketMetadata": {
+       "slug": "tc-temp-nychigh-2026-08-06-gte96f",
+       "icon": "https://polymarket-upload.s3.us-east-2.amazonaws.com/us%20weather%20highest%20ny-a931766d31.png",
+       "title": "Highest temperature in NYC on August 6?",
+       "outcome": "Yes",
+       "eventSlug": "temp-nychigh-2026-08-06",
+       "subject": {
+        "id": 0,
+        "name": "96 or above",
+        "subjectType": ""
+       },
+       "eventId": "72741"
+      },
+      "state": "ORDER_STATE_FILLED",
+      "commissionNotionalTotalCollected": {
+       "value": "0.0100",
+       "currency": "USD"
+      },
+      "commissionsBasisPoints": "0",
+      "makerCommissionsBasisPoints": "0",
+      "avgPx": {
+       "value": "0.0200",
+       "currency": "USD"
+      },
+      "cashOrderQty": {
+       "value": "0.0000",
+       "currency": "USD"
+      },
+      "insertTime": "2026-08-05T13:40:00.704590303Z",
+      "createTime": "2026-08-05T13:40:00.702778031Z",
+      "outcomeSide": "OUTCOME_SIDE_YES",
+      "action": "ORDER_ACTION_BUY",
+      "manualOrderIndicator": "MANUAL_ORDER_INDICATOR_AUTOMATIC",
+      "lastTransactTime": "2026-08-05T13:40:00.704590303Z"
+     },
+     "passive": {
+      "id": "<SCRUBBED>",
+      "marketSlug": "tc-temp-nychigh-2026-08-06-gte96f",
+      "side": "ORDER_SIDE_SELL",
+      "type": "ORDER_TYPE_LIMIT",
+      "price": {
+       "value": "0.02",
+       "currency": "USD"
+      },
+      "quantity": 6,
+      "cumQuantity": "4.63",
+      "leavesQuantity": "1.37",
+      "tif": "TIME_IN_FORCE_GOOD_TILL_CANCEL",
+      "goodTillTime": null,
+      "intent": "ORDER_INTENT_BUY_SHORT",
+      "marketMetadata": {
+       "slug": "tc-temp-nychigh-2026-08-06-gte96f",
+       "icon": "https://polymarket-upload.s3.us-east-2.amazonaws.com/us%20weather%20highest%20ny-a931766d31.png",
+       "title": "Highest temperature in NYC on August 6?",
+       "outcome": "No",
+       "eventSlug": "temp-nychigh-2026-08-06",
+       "subject": {
+        "id": 0,
+        "name": "96 or above",
+        "subjectType": ""
+       },
+       "eventId": "72741"
+      },
+      "state": "ORDER_STATE_PARTIALLY_FILLED",
+      "commissionNotionalTotalCollected": {
+       "value": "0.0000",
+       "currency": "USD"
+      },
+      "commissionsBasisPoints": "0",
+      "makerCommissionsBasisPoints": "0",
+      "avgPx": {
+       "value": "0.0200",
+       "currency": "USD"
+      },
+      "cashOrderQty": {
+       "value": "0.0000",
+       "currency": "USD"
+      },
+      "insertTime": "2026-08-05T13:36:23.670180660Z",
+      "createTime": "2026-08-05T13:36:23.667706074Z",
+      "outcomeSide": "OUTCOME_SIDE_NO",
+      "action": "ORDER_ACTION_BUY",
+      "manualOrderIndicator": "MANUAL_ORDER_INDICATOR_MANUAL",
+      "lastTransactTime": "2026-08-05T13:40:00.704590303Z"
+     },
+     "reportingCounterparty": "ORDER_SIDE_UNDEFINED",
+     "createTradeDate": "2026-08-05T00:00:00Z",
+     "updateTradeDate": "2026-08-05T00:00:00Z",
+     "tradeLinkId": "BP27QRACP9PT",
+     "isAggressor": true,
+     "market": {
+      "id": "<SCRUBBED>",
+      "question": "Highest temperature in NYC on August 6?",
+      "slug": "tc-temp-nychigh-2026-08-06-gte96f",
+      "endDate": "2026-08-07T05:00:00Z",
+      "category": "climate",
+      "startDate": "2026-08-05T09:45:25Z",
+      "description": "Will the highest temperature recorded at Central Park (KNYC) in New York City for 2026-08-06 as reported by the National Weather Service's Climatological Report (Daily) be greater than or equal to 96F? Outcome verified from NWS Climatological Report.",
+      "active": true,
+      "marketType": "futures",
+      "closed": true,
+      "createdAt": "2026-08-05T09:45:25Z",
+      "updatedAt": "2026-09-05T22:17:10Z",
+      "archived": false,
+      "orderPriceMinTickSize": "0.01",
+      "gameStartTime": "2026-08-06T05:00:00Z",
+      "manualActivation": false,
+      "sportsMarketType": "futures",
+      "marketSides": [
+       {
+        "id": "<SCRUBBED>",
+        "marketSideType": "MARKET_SIDE_TYPE_INSTRUMENT",
+        "identifier": "tc-temp-nychigh-2026-08-06-gte96f",
+        "createdAt": "2026-08-05T09:45:25Z",
+        "updatedAt": "2026-08-05T09:45:25Z",
+        "description": "Yes",
+        "marketId": 366418,
+        "long": true,
+        "tradable": true
+       },
+       {
+        "id": "<SCRUBBED>",
+        "marketSideType": "MARKET_SIDE_TYPE_INSTRUMENT",
+        "identifier": "tc-temp-nychigh-2026-08-06-gte96f",
+        "createdAt": "2026-08-05T09:45:25Z",
+        "updatedAt": "2026-08-05T09:45:25Z",
+        "description": "No",
+        "marketId": 366418,
+        "long": false,
+        "tradable": true
+       }
+      ],
+      "outcomes": "[\"No\",\"Yes\"]",
+      "outcomePrices": "[\"0\",\"0\"]",
+      "ep3Status": "EXPIRED",
+      "status": "MARKET_STATUS_RESOLVING",
+      "sportsMarketTypeV2": "SPORTS_MARKET_TYPE_FUTURE",
+      "hidden": false,
+      "tags": [],
+      "title": "96 or above",
+      "feeCoefficient": "0.06",
+      "sortOrder": 6,
+      "titleShort": "96 or above",
+      "ep3SyncedAt": "2026-09-05T22:17:10Z",
+      "minimumTradeQty": "0.01",
+      "comboEnabled": false
+     },
+     "qtyDecimal": "4.6300",
+     "comboLegDetails": []
+    }
+   },
+   {
+    "type": "ACTIVITY_TYPE_TRADE",
+    "trade": {
+     "id": "<SCRUBBED>",
+     "aggressorExecution": {
+      "id": "<SCRUBBED>",
+      "order": {
+       "id": "<SCRUBBED>",
+       "marketSlug": "tc-temp-nychigh-2026-08-06-gte96f",
+       "side": "ORDER_SIDE_BUY",
+       "type": "ORDER_TYPE_LIMIT",
+       "price": {
+        "value": "0.02",
+        "currency": "USD"
+       },
+       "quantity": "7.63",
+       "cumQuantity": 3,
+       "leavesQuantity": "4.63",
+       "tif": "TIME_IN_FORCE_IMMEDIATE_OR_CANCEL",
+       "goodTillTime": null,
+       "intent": "ORDER_INTENT_BUY_LONG",
+       "marketMetadata": {
+        "slug": "tc-temp-nychigh-2026-08-06-gte96f",
+        "icon": "https://polymarket-upload.s3.us-east-2.amazonaws.com/us%20weather%20highest%20ny-a931766d31.png",
+        "title": "Highest temperature in NYC on August 6?",
+        "outcome": "Yes",
+        "eventSlug": "temp-nychigh-2026-08-06",
+        "subject": {
+         "id": 0,
+         "name": "96 or above",
+         "subjectType": ""
+        },
+        "eventId": "72741"
+       },
+       "state": "ORDER_STATE_PARTIALLY_FILLED",
+       "commissionNotionalTotalCollected": {
+        "value": "0.0000",
+        "currency": "USD"
+       },
+       "commissionsBasisPoints": "0",
+       "makerCommissionsBasisPoints": "0",
+       "avgPx": {
+        "value": "0.0200",
+        "currency": "USD"
+       },
+       "cashOrderQty": {
+        "value": "0.0000",
+        "currency": "USD"
+       },
+       "insertTime": "2026-08-05T13:40:00.704590303Z",
+       "createTime": "2026-08-05T13:40:00.702778031Z",
+       "outcomeSide": "OUTCOME_SIDE_YES",
+       "action": "ORDER_ACTION_BUY",
+       "manualOrderIndicator": "MANUAL_ORDER_INDICATOR_AUTOMATIC",
+       "lastTransactTime": "2026-08-05T13:40:00.704590303Z"
+      },
+      "lastShares": "3.0000",
+      "lastPx": {
+       "value": "0.0200",
+       "currency": "USD"
+      },
+      "type": "EXECUTION_TYPE_PARTIAL_FILL",
+      "text": "",
+      "orderRejectReason": "ORD_REJECT_REASON_EXCHANGE_OPTION",
+      "transactTime": "2026-08-05T13:40:00.704590303Z",
+      "legPrices": [],
+      "tradeId": "<SCRUBBED>",
+      "aggressor": true,
+      "commissionNotionalCollected": {
+       "value": "0.0000",
+       "currency": "USD"
+      },
+      "unsolicitedCancelReason": "UNSOLICITED_CXL_REASON_UNDEFINED",
+      "traceId": "",
+      "commissionSpreadPx": {
+       "value": "0.0200",
+       "currency": "USD"
+      },
+      "transactTradeDate": "2026-08-05T00:00:00Z"
+     },
+     "passiveExecution": {
+      "id": "<SCRUBBED>",
+      "order": {
+       "id": "<SCRUBBED>",
+       "marketSlug": "tc-temp-nychigh-2026-08-06-gte96f",
+       "side": "ORDER_SIDE_SELL",
+       "type": "ORDER_TYPE_LIMIT",
+       "price": {
+        "value": "0.02",
+        "currency": "USD"
+       },
+       "quantity": 3,
+       "cumQuantity": 3,
+       "leavesQuantity": 0,
+       "tif": "TIME_IN_FORCE_GOOD_TILL_CANCEL",
+       "goodTillTime": null,
+       "intent": "ORDER_INTENT_BUY_SHORT",
+       "marketMetadata": {
+        "slug": "tc-temp-nychigh-2026-08-06-gte96f",
+        "icon": "https://polymarket-upload.s3.us-east-2.amazonaws.com/us%20weather%20highest%20ny-a931766d31.png",
+        "title": "Highest temperature in NYC on August 6?",
+        "outcome": "No",
+        "eventSlug": "temp-nychigh-2026-08-06",
+        "subject": {
+         "id": 0,
+         "name": "96 or above",
+         "subjectType": ""
+        },
+        "eventId": "72741"
+       },
+       "state": "ORDER_STATE_FILLED",
+       "commissionNotionalTotalCollected": {
+        "value": "0.0000",
+        "currency": "USD"
+       },
+       "commissionsBasisPoints": "0",
+       "makerCommissionsBasisPoints": "0",
+       "avgPx": {
+        "value": "0.0200",
+        "currency": "USD"
+       },
+       "cashOrderQty": {
+        "value": "0.0000",
+        "currency": "USD"
+       },
+       "insertTime": "2026-08-05T12:42:05.002952781Z",
+       "createTime": "2026-08-05T12:42:05.000885049Z",
+       "outcomeSide": "OUTCOME_SIDE_NO",
+       "action": "ORDER_ACTION_BUY",
+       "manualOrderIndicator": "MANUAL_ORDER_INDICATOR_AUTOMATIC",
+       "lastTransactTime": "2026-08-05T13:40:00.704590303Z"
+      },
+      "lastShares": "3.0000",
+      "lastPx": {
+       "value": "0.0200",
+       "currency": "USD"
+      },
+      "type": "EXECUTION_TYPE_FILL",
+      "text": "",
+      "orderRejectReason": "ORD_REJECT_REASON_EXCHANGE_OPTION",
+      "transactTime": "2026-08-05T13:40:00.704590303Z",
+      "legPrices": [],
+      "tradeId": "<SCRUBBED>",
+      "aggressor": false,
+      "commissionNotionalCollected": {
+       "value": "0.0000",
+       "currency": "USD"
+      },
+      "unsolicitedCancelReason": "UNSOLICITED_CXL_REASON_UNDEFINED",
+      "traceId": "",
+      "commissionSpreadPx": {
+       "value": "0.9800",
+       "currency": "USD"
+      },
+      "transactTradeDate": "2026-08-05T00:00:00Z"
+     },
+     "marketSlug": "tc-temp-nychigh-2026-08-06-gte96f",
+     "state": "TRADE_STATE_NEW",
+     "createTime": "2026-08-05T13:40:00.704590303Z",
+     "updateTime": "2026-08-05T13:40:00.704590303Z",
+     "price": {
+      "value": "0.0200",
+      "currency": "USD"
+     },
+     "qty": "3",
+     "cost": {
+      "value": "0.06",
+      "currency": "USD"
+     },
+     "aggressor": {
+      "id": "<SCRUBBED>",
+      "marketSlug": "tc-temp-nychigh-2026-08-06-gte96f",
+      "side": "ORDER_SIDE_BUY",
+      "type": "ORDER_TYPE_LIMIT",
+      "price": {
+       "value": "0.02",
+       "currency": "USD"
+      },
+      "quantity": "7.63",
+      "cumQuantity": 3,
+      "leavesQuantity": "4.63",
+      "tif": "TIME_IN_FORCE_IMMEDIATE_OR_CANCEL",
+      "goodTillTime": null,
+      "intent": "ORDER_INTENT_BUY_LONG",
+      "marketMetadata": {
+       "slug": "tc-temp-nychigh-2026-08-06-gte96f",
+       "icon": "https://polymarket-upload.s3.us-east-2.amazonaws.com/us%20weather%20highest%20ny-a931766d31.png",
+       "title": "Highest temperature in NYC on August 6?",
+       "outcome": "Yes",
+       "eventSlug": "temp-nychigh-2026-08-06",
+       "subject": {
+        "id": 0,
+        "name": "96 or above",
+        "subjectType": ""
+       },
+       "eventId": "72741"
+      },
+      "state": "ORDER_STATE_PARTIALLY_FILLED",
+      "commissionNotionalTotalCollected": {
+       "value": "0.0000",
+       "currency": "USD"
+      },
+      "commissionsBasisPoints": "0",
+      "makerCommissionsBasisPoints": "0",
+      "avgPx": {
+       "value": "0.0200",
+       "currency": "USD"
+      },
+      "cashOrderQty": {
+       "value": "0.0000",
+       "currency": "USD"
+      },
+      "insertTime": "2026-08-05T13:40:00.704590303Z",
+      "createTime": "2026-08-05T13:40:00.702778031Z",
+      "outcomeSide": "OUTCOME_SIDE_YES",
+      "action": "ORDER_ACTION_BUY",
+      "manualOrderIndicator": "MANUAL_ORDER_INDICATOR_AUTOMATIC",
+      "lastTransactTime": "2026-08-05T13:40:00.704590303Z"
+     },
+     "passive": {
+      "id": "<SCRUBBED>",
+      "marketSlug": "tc-temp-nychigh-2026-08-06-gte96f",
+      "side": "ORDER_SIDE_SELL",
+      "type": "ORDER_TYPE_LIMIT",
+      "price": {
+       "value": "0.02",
+       "currency": "USD"
+      },
+      "quantity": 3,
+      "cumQuantity": 3,
+      "leavesQuantity": 0,
+      "tif": "TIME_IN_FORCE_GOOD_TILL_CANCEL",
+      "goodTillTime": null,
+      "intent": "ORDER_INTENT_BUY_SHORT",
+      "marketMetadata": {
+       "slug": "tc-temp-nychigh-2026-08-06-gte96f",
+       "icon": "https://polymarket-upload.s3.us-east-2.amazonaws.com/us%20weather%20highest%20ny-a931766d31.png",
+       "title": "Highest temperature in NYC on August 6?",
+       "outcome": "No",
+       "eventSlug": "temp-nychigh-2026-08-06",
+       "subject": {
+        "id": 0,
+        "name": "96 or above",
+        "subjectType": ""
+       },
+       "eventId": "72741"
+      },
+      "state": "ORDER_STATE_FILLED",
+      "commissionNotionalTotalCollected": {
+       "value": "0.0000",
+       "currency": "USD"
+      },
+      "commissionsBasisPoints": "0",
+      "makerCommissionsBasisPoints": "0",
+      "avgPx": {
+       "value": "0.0200",
+       "currency": "USD"
+      },
+      "cashOrderQty": {
+       "value": "0.0000",
+       "currency": "USD"
+      },
+      "insertTime": "2026-08-05T12:42:05.002952781Z",
+      "createTime": "2026-08-05T12:42:05.000885049Z",
+      "outcomeSide": "OUTCOME_SIDE_NO",
+      "action": "ORDER_ACTION_BUY",
+      "manualOrderIndicator": "MANUAL_ORDER_INDICATOR_AUTOMATIC",
+      "lastTransactTime": "2026-08-05T13:40:00.704590303Z"
+     },
+     "reportingCounterparty": "ORDER_SIDE_UNDEFINED",
+     "createTradeDate": "2026-08-05T00:00:00Z",
+     "updateTradeDate": "2026-08-05T00:00:00Z",
+     "tradeLinkId": "BP27QRACP9PT",
+     "isAggressor": true,
+     "market": {
+      "id": "<SCRUBBED>",
+      "question": "Highest temperature in NYC on August 6?",
+      "slug": "tc-temp-nychigh-2026-08-06-gte96f",
+      "endDate": "2026-08-07T05:00:00Z",
+      "category": "climate",
+      "startDate": "2026-08-05T09:45:25Z",
+      "description": "Will the highest temperature recorded at Central Park (KNYC) in New York City for 2026-08-06 as reported by the National Weather Service's Climatological Report (Daily) be greater than or equal to 96F? Outcome verified from NWS Climatological Report.",
+      "active": true,
+      "marketType": "futures",
+      "closed": true,
+      "createdAt": "2026-08-05T09:45:25Z",
+      "updatedAt": "2026-09-05T22:17:10Z",
+      "archived": false,
+      "orderPriceMinTickSize": "0.01",
+      "gameStartTime": "2026-08-06T05:00:00Z",
+      "manualActivation": false,
+      "sportsMarketType": "futures",
+      "marketSides": [
+       {
+        "id": "<SCRUBBED>",
+        "marketSideType": "MARKET_SIDE_TYPE_INSTRUMENT",
+        "identifier": "tc-temp-nychigh-2026-08-06-gte96f",
+        "createdAt": "2026-08-05T09:45:25Z",
+        "updatedAt": "2026-08-05T09:45:25Z",
+        "description": "Yes",
+        "marketId": 366418,
+        "long": true,
+        "tradable": true
+       },
+       {
+        "id": "<SCRUBBED>",
+        "marketSideType": "MARKET_SIDE_TYPE_INSTRUMENT",
+        "identifier": "tc-temp-nychigh-2026-08-06-gte96f",
+        "createdAt": "2026-08-05T09:45:25Z",
+        "updatedAt": "2026-08-05T09:45:25Z",
+        "description": "No",
+        "marketId": 366418,
+        "long": false,
+        "tradable": true
+       }
+      ],
+      "outcomes": "[\"No\",\"Yes\"]",
+      "outcomePrices": "[\"0\",\"0\"]",
+      "ep3Status": "EXPIRED",
+      "status": "MARKET_STATUS_RESOLVING",
+      "sportsMarketTypeV2": "SPORTS_MARKET_TYPE_FUTURE",
+      "hidden": false,
+      "tags": [],
+      "title": "96 or above",
+      "feeCoefficient": "0.06",
+      "sortOrder": 6,
+      "titleShort": "96 or above",
+      "ep3SyncedAt": "2026-09-05T22:17:10Z",
+      "minimumTradeQty": "0.01",
+      "comboEnabled": false
+     },
+     "qtyDecimal": "3.0000",
+     "comboLegDetails": []
+    }
+   },
+   {
+    "type": "ACTIVITY_TYPE_ACCOUNT_DEPOSIT",
+    "accountBalanceChange": {
+     "transactionId": "<SCRUBBED>",
+     "status": "ACCOUNT_BALANCE_CHANGE_STATUS_COMPLETED",
+     "amount": {
+      "value": "50",
+      "currency": "USD"
+     },
+     "updateTime": "2026-07-29T17:02:22.700628968Z",
+     "paymentMethod": null,
+     "createTime": "2026-07-28T18:20:00.202456940Z",
+     "transactions": [
+      {
+       "transactionId": "<SCRUBBED>",
+       "status": "ACCOUNT_BALANCE_CHANGE_STATUS_COMPLETED",
+       "amount": {
+        "value": "50",
+        "currency": "USD"
+       },
+       "updateTime": "2026-07-29T17:02:22.700628968Z",
+       "paymentMethod": null,
+       "createTime": "2026-07-28T18:20:00.202456940Z",
+       "externalId": "<SCRUBBED>",
+       "description": "Polymarket Apple Pay Deposit - deposit allocated to Provided Account \"<SCRUBBED>\" (ClearingHouseId: \"\", ClearingMember(ID or Legal Name): \"\", AssociatedFundingSourceId: \"\", ClearingHouseFundingSourceId: \"\")",
+       "metadata": {},
+       "failureReason": "",
+       "failureCode": "",
+       "failureAction": null
+      }
+     ],
+     "externalId": "<SCRUBBED>",
+     "description": "Polymarket Apple Pay Deposit - deposit allocated to Provided Account \"<SCRUBBED>\" (ClearingHouseId: \"\", ClearingMember(ID or Legal Name): \"\", AssociatedFundingSourceId: \"\", ClearingHouseFundingSourceId: \"\")",
+     "metadata": {},
+     "failureReason": "",
+     "failureCode": "",
+     "failureAction": null
+    }
+   }
+  ],
+  "nextCursor": "",
+  "eof": true
+ }
+}

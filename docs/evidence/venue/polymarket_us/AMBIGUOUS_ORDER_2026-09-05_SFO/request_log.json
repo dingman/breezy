@@ -1,0 +1,102 @@
+[
+ {
+  "tag": "positions_all",
+  "path": "/v1/portfolio/positions",
+  "query": null,
+  "attempts": [
+   {
+    "attempt": 1,
+    "status": 200,
+    "bytes": 67,
+    "elapsed_s": 0.15
+   }
+  ]
+ },
+ {
+  "tag": "positions_market",
+  "path": "/v1/portfolio/positions",
+  "query": {
+   "market": "tc-temp-sfohigh-2026-09-05-gte73lt74f"
+  },
+  "attempts": [
+   {
+    "attempt": 1,
+    "status": 200,
+    "bytes": 67,
+    "elapsed_s": 0.16
+   }
+  ]
+ },
+ {
+  "tag": "orders_open_all",
+  "path": "/v1/orders/open",
+  "query": null,
+  "attempts": [
+   {
+    "attempt": 1,
+    "status": 200,
+    "bytes": 13,
+    "elapsed_s": 0.09
+   }
+  ]
+ },
+ {
+  "tag": "orders_open_slug",
+  "path": "/v1/orders/open",
+  "query": {
+   "slugs": "tc-temp-sfohigh-2026-09-05-gte73lt74f"
+  },
+  "attempts": [
+   {
+    "attempt": 1,
+    "status": 200,
+    "bytes": 13,
+    "elapsed_s": 0.05
+   }
+  ]
+ },
+ {
+  "tag": "activities_p0",
+  "path": "/v1/portfolio/activities",
+  "query": {
+   "limit": 100
+  },
+  "attempts": [
+   {
+    "attempt": 1,
+    "status": 200,
+    "bytes": 51539,
+    "elapsed_s": 0.1
+   }
+  ]
+ },
+ {
+  "tag": "activities_slug",
+  "path": "/v1/portfolio/activities",
+  "query": {
+   "marketSlug": "tc-temp-sfohigh-2026-09-05-gte73lt74f",
+   "limit": 100
+  },
+  "attempts": [
+   {
+    "attempt": 1,
+    "status": 200,
+    "bytes": 3611,
+    "elapsed_s": 0.08
+   }
+  ]
+ },
+ {
+  "tag": "balances",
+  "path": "/v1/account/balances",
+  "query": null,
+  "attempts": [
+   {
+    "attempt": 1,
+    "status": 200,
+    "bytes": 421,
+    "elapsed_s": 0.07
+   }
+  ]
+ }
+]

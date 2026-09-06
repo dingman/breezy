@@ -1,0 +1,21 @@
+{
+ "path": "/v1/portfolio/positions",
+ "query": {
+  "market": "tc-temp-sfohigh-2026-09-05-gte73lt74f"
+ },
+ "attempts": [
+  {
+   "attempt": 1,
+   "status": 200,
+   "bytes": 67,
+   "elapsed_s": 0.16
+  }
+ ],
+ "final_status": 200,
+ "payload": {
+  "positions": {},
+  "nextCursor": "",
+  "eof": true,
+  "availablePositions": []
+ }
+}
