@@ -677,7 +677,12 @@ def test_ambiguous_classified_path_source_logs_the_venues_shape_not_its_body() -
     ``outcome.detail``, which ``classify_create_order_outcome`` computes as a
     redacted status/shape/rpc-code/length summary
     (``test_classify_ambiguous_status_body_off_the_4xx_range_reports_rpc_code_and_length``
-    pins its exact value for a 503 with a Status body)."""
+    pins its exact value for a 503 with a Status body).
+
+    GL-1a: the pre-branch block (after classify, before the first
+    ``if outcome.kind`` branch) also logs ``outcome.detail`` so every kind
+    is diagnosable, not only the residual AMBIGUOUS refuse path.
+    """
     import inspect
 
     source = inspect.getsource(PolymarketUSExecutionClient._submit_order)
@@ -685,6 +690,14 @@ def test_ambiguous_classified_path_source_logs_the_venues_shape_not_its_body() -
     assert "path=classified" in classified_block
     assert "outcome.detail" in classified_block
     assert "client_order_id=" in classified_block
+    pre_branch = source[
+        source.index("outcome = submit_chain.classify_create_order_outcome(") : source.index(
+            "outcome.kind == submit_chain.KIND_ACCEPT_FILL"
+        )
+    ]
+    assert "create-order classified kind=" in pre_branch
+    assert "outcome.detail" in pre_branch
+    assert "client_order_id=" in pre_branch
 
 
 @pytest.mark.asyncio
@@ -1134,6 +1147,128 @@ def test_classify_ambiguous_unparseable_body_reports_that_shape() -> None:
     assert outcome.kind == KIND_AMBIGUOUS
     assert outcome.detail == (
         f"status=200 body_kind=unparseable rpc_code=none body_len={len(response.body)}"
+    )
+
+
+def test_every_classified_kind_sets_body_kind_and_body_len() -> None:
+    """GL-1a: every CreateOrderOutcome carries a redacted body_kind/body_len
+    detail, including REJECT / ACCEPT_FILL / ZERO_FILL which previously left
+    ``detail`` as None. Existing AMBIGUOUS strings at the none / 503-status /
+    unparseable pins stay exact.
+    """
+    instrument = build_instrument()
+    classify_kw = {
+        "instrument": instrument,
+        "account_id": ACCOUNT_ID,
+        "ts_init": TS_INIT,
+    }
+
+    none_outcome = classify_create_order_outcome(None, **classify_kw)
+    assert none_outcome.kind == KIND_AMBIGUOUS
+    assert none_outcome.detail == "status=none body_kind=none rpc_code=none body_len=0"
+
+    unparseable = VenueResponse(status=200, headers={}, body=b"not json")
+    unparseable_outcome = classify_create_order_outcome(unparseable, **classify_kw)
+    assert unparseable_outcome.kind == KIND_AMBIGUOUS
+    assert unparseable_outcome.detail == (
+        f"status=200 body_kind=unparseable rpc_code=none body_len={len(unparseable.body)}"
+    )
+
+    reject_body = _status_reject_body()
+    reject_response = VenueResponse(status=400, headers={}, body=reject_body)
+    reject_outcome = classify_create_order_outcome(reject_response, **classify_kw)
+    assert reject_outcome.kind == KIND_REJECT
+    assert reject_outcome.detail == (
+        f"status=400 body_kind=status-no-order-id rpc_code=3 body_len={len(reject_body)}"
+    )
+
+    empty_exec_body = json.dumps({"id": "ord-amb", "executions": []}).encode()
+    empty_exec_response = VenueResponse(status=200, headers={}, body=empty_exec_body)
+    empty_exec_outcome = classify_create_order_outcome(empty_exec_response, **classify_kw)
+    assert empty_exec_outcome.kind == KIND_AMBIGUOUS
+    assert empty_exec_outcome.detail == (
+        f"status=200 body_kind=empty-executions rpc_code=none body_len={len(empty_exec_body)}"
+    )
+
+    durable_body = _durable_accept_body(str(instrument.raw_symbol))
+    durable_response = VenueResponse(status=200, headers={}, body=durable_body)
+    durable_outcome = classify_create_order_outcome(durable_response, **classify_kw)
+    assert durable_outcome.kind == KIND_ACCEPT_FILL
+    assert durable_outcome.detail == (
+        f"status=200 body_kind=executions-present rpc_code=none body_len={len(durable_body)}"
+    )
+
+    unexpected_body = json.dumps({"not": "an-order"}).encode()
+    unexpected_response = VenueResponse(status=200, headers={}, body=unexpected_body)
+    unexpected_outcome = classify_create_order_outcome(unexpected_response, **classify_kw)
+    assert unexpected_outcome.kind == KIND_AMBIGUOUS
+    assert unexpected_outcome.detail == (
+        f"status=200 body_kind=unexpected-shape rpc_code=none body_len={len(unexpected_body)}"
+    )
+
+    zero_body = json.dumps(
+        {
+            "id": "ord-i1a-zero",
+            "executions": [],
+            "state": "ORDER_STATE_CANCELED",
+            "cumQuantity": 0,
+        }
+    ).encode()
+    zero_response = VenueResponse(status=200, headers={}, body=zero_body)
+    zero_outcome = classify_create_order_outcome(zero_response, **classify_kw)
+    assert zero_outcome.kind == KIND_ZERO_FILL
+    assert zero_outcome.detail == (
+        f"status=200 body_kind=empty-executions rpc_code=none body_len={len(zero_body)}"
+    )
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        {"id": "ord-amb"},
+        {"id": "x", "executions": None},
+        {"id": "x", "executions": [], "order": {"state": "ORDER_STATE_NEW"}},
+        {"id": "x", "executions": [], "cumQuantity": "not-a-number"},
+        {"id": "x", "executions": []},
+    ],
+    ids=[
+        "no-executions-key",
+        "executions-null",
+        "empty-exec-order-state-new",
+        "empty-exec-cumquantity-not-a-number",
+        "empty-exec-documented-timeout-shape",
+    ],
+)
+def test_ambiguous_exact_set_stays_ambiguous(body: dict[str, Any]) -> None:
+    """L-24: the exact AMBIGUOUS set is not reclassified. Empty executions
+    without a terminal IOC state stay AMBIGUOUS (R-7: 200 + id + no
+    executions + NON-terminal or absent status).
+    """
+    encoded = json.dumps(body).encode()
+    outcome = classify_create_order_outcome(
+        VenueResponse(status=200, headers={}, body=encoded),
+        instrument=build_instrument(),
+        account_id=ACCOUNT_ID,
+        ts_init=TS_INIT,
+    )
+    assert outcome.kind == KIND_AMBIGUOUS
+
+
+def test_documented_empty_executions_without_terminal_state_stays_ambiguous_per_r7() -> None:
+    """R-7 pin: ``{id, executions: []}`` at the 5 s ``_MAX_BLOCK_TIME``
+    (``submit_chain.py:293``) is the sync-block timeout shape, not ZERO_FILL.
+    200 + id + no executions + NON-terminal or absent status stays AMBIGUOUS.
+    """
+    encoded = json.dumps({"id": "x", "executions": []}).encode()
+    outcome = classify_create_order_outcome(
+        VenueResponse(status=200, headers={}, body=encoded),
+        instrument=build_instrument(),
+        account_id=ACCOUNT_ID,
+        ts_init=TS_INIT,
+    )
+    assert outcome.kind == KIND_AMBIGUOUS
+    assert outcome.detail == (
+        f"status=200 body_kind=empty-executions rpc_code=none body_len={len(encoded)}"
     )
 
 

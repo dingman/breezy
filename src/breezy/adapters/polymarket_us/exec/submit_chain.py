@@ -136,12 +136,12 @@ class CreateOrderOutcome:
     cumulative_fee: Decimal | None
     fee_reconciled: bool
     generate_submitted: bool
-    #: Redacted, log-only summary of an AMBIGUOUS outcome (``None`` on every
-    #: other kind). Carries only shape and length -- status code, a coarse
-    #: ``body_kind``, the ``google.rpc.Status`` code when present, and the
-    #: raw body's byte length -- never the body content itself, so it is
-    #: always safe to log even though the body may be adversarial or carry
-    #: venue-side account details.
+    #: Redacted, log-only summary of every classified outcome (never ``None``).
+    #: Carries only shape and length -- status code, a coarse ``body_kind``,
+    #: the ``google.rpc.Status`` code when present, and the raw body's byte
+    #: length -- never the body content itself, so it is always safe to log
+    #: even though the body may be adversarial or carry venue-side account
+    #: details.
     detail: str | None = None
 
 
@@ -578,12 +578,12 @@ _AMBIGUOUS_DETAIL_NO_RESPONSE: Final[str] = (
 )
 
 
-def _ambiguous_detail(
+def _body_detail(
     response: VenueResponse,
     payload: Mapping[str, Any] | None,
     order_id: str | None,
 ) -> str:
-    """Redacted, log-only summary of one AMBIGUOUS create-order response.
+    """Redacted, log-only summary of one classified create-order response.
 
     Reports shape and length only -- never the body content -- so the venue's
     answer is recoverable from the log without risking a leaked secret or
@@ -593,10 +593,18 @@ def _ambiguous_detail(
     rpc_code: int | None = None
     if payload is None:
         body_kind = "unparseable"
-    elif _is_google_rpc_status(payload) and order_id is None:
+    elif isinstance(payload, Mapping) and _is_google_rpc_status(payload) and order_id is None:
         body_kind = "status-no-order-id"
         code = payload.get("code")
         rpc_code = code if isinstance(code, int) else None
+    elif isinstance(payload, Mapping):
+        executions = payload.get("executions")
+        if isinstance(executions, list) and executions == []:
+            body_kind = "empty-executions"
+        elif isinstance(executions, list) and executions:
+            body_kind = "executions-present"
+        else:
+            body_kind = "unexpected-shape"
     else:
         body_kind = "unexpected-shape"
     rpc_code_str = "none" if rpc_code is None else str(rpc_code)
@@ -632,6 +640,7 @@ def classify_create_order_outcome(
     status = int(response.status)
     payload = _parse_json_object(response.body)
     order_id = _response_order_id(payload) if payload is not None else None
+    detail = _body_detail(response, payload, order_id)
 
     if (
         400 <= status < 500
@@ -651,6 +660,7 @@ def classify_create_order_outcome(
             cumulative_fee=None,
             fee_reconciled=False,
             generate_submitted=False,
+            detail=detail,
         )
 
     if status == 200 and payload is not None and order_id is not None:
@@ -676,6 +686,7 @@ def classify_create_order_outcome(
                     cumulative_fee=cumulative_fee,
                     fee_reconciled=fee_reconciled,
                     generate_submitted=True,
+                    detail=detail,
                 )
         executions = payload.get("executions")
         terminal = _terminal_state(payload)
@@ -698,6 +709,7 @@ def classify_create_order_outcome(
                 cumulative_fee=None,
                 fee_reconciled=False,
                 generate_submitted=True,
+                detail=detail,
             )
 
     return CreateOrderOutcome(
@@ -712,7 +724,7 @@ def classify_create_order_outcome(
         cumulative_fee=None,
         fee_reconciled=False,
         generate_submitted=order_id is not None,
-        detail=_ambiguous_detail(response, payload, order_id),
+        detail=detail,
     )
 
 
