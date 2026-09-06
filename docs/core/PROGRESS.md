@@ -62,10 +62,10 @@ Merged analysis, evidence and unlock observables: `docs/evidence/GO_LIVE_BLOCKER
 | GL-4 | B | HIGH | One AMBIGUOUS burns the rest of the day: latch OPEN until operator (`client.py:1747-1758`), `_has_durable_fill_record` stub (`:730-733`). Auto-retire after a no-order probe | M |
 | GL-5 | B | CRIT | WS reconnect storm: 09-05 189/241/281 five-second gaps per station window, 1673 reconnects → every afternoon uncovered under §9 any-overlap (`data.py:1685,1812`, `websocket.py`). 09-06 instance clean so far | L |
 | GL-6 | B | MED | v2 tally 15:30Z drops the structural-dead pin ("UNAVAILABLE token refused, required MATCH"): node launches 16:50Z, so the binding report never evaluates the KILL rule | S |
-| GL-7 | O | HIGH | Supervisor 2231261 + node in uncapped `tmux-spawn-d35977dd` scope (9.3 GB, 398 tasks, swap full). Relaunch the supervisor from a host-lifetime shell with the seven values outside 16:40–17:10Z; also activates SV-1 fix `c84317e` | S |
+| GL-7 | O | SKIP | Operator 09-06: skip. Supervisor 2231261 + node stay in the uncapped `tmux-spawn-d35977dd` scope; SV-1 fix `c84317e` inactive until a relaunch | — |
 | GL-8 | B | MED | Instrument set frozen at 16:50 compose (`composition.py:116-150`), discovery reload clamped 21600 s: late-listed HIGH rungs never subscribed | M |
 | GL-9 | B | MED | Fill→ScoredTrial chain never run on real data (`record_fill` branch unexecuted, store has no parquet). Synthetic 200+fill body through the live chain in a test, then confirm on first fill | M |
-| GL-10 | O/B | MED | Alerts log-only (no `BREEZY_ALERT_WEBHOOK_URL` in the supervisor env): DEGRADED/AMBIGUOUS invisible until the next session | S |
+| GL-10 | O/B | DEFER | Operator 09-06: deprioritised. Alerts stay log-only (no `BREEZY_ALERT_WEBHOOK_URL`) | — |
 | GL-11 | B | LOW | Recorder OOM 09-04 (14.4 GB) / SIGKILL 09-05 at MemoryHigh predate the deque fix; 09-06 peak 914 MB. Watch | — |
 
 **KILL clock:** D0=09-05, counter 0 (09-05 uncovered). At 4 covered/day with 0 fills the 15th lands ~09-09/09-10; zero-fill and retired-AMBIGUOUS takes are not trials. GL-1..3 must land before the first clean covered cluster.

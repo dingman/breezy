@@ -77,9 +77,10 @@ broken, which only delays.
 - H4: venue `commissionNotionalCollected` is unrounded; measure the decimal
   places on the first 200+fill body.
 
-## Operator-only questions
+## Operator answers (2026-09-06 19:40Z)
 
-1. Relaunch the supervisor from a durable shell (GL-7) before 09-07 16:40Z?
-2. Provide an alert sink (GL-10)?
-3. Rule on GL-3 as conformance (strategy lead), so the fix can deploy on a
-   registered family.
+1. GL-7: **skip** (operator). The supervisor and node stay in the uncapped
+   scope; the SV-1 fix stays inactive until some later relaunch.
+2. GL-10: **deprioritised** (operator). Alerts stay log-only for now.
+3. GL-3: **build-side determination** (operator). Ruling requested from the
+   strategy lead; recorded below when it lands.
