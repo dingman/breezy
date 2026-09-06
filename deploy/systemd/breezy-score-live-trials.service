@@ -12,7 +12,7 @@
 # resolving its fill source from the exec state DB via
 # POLYMARKET_US_EXEC_STATE_DB below. It writes the ONE dated success marker
 # (score_live_trials_ok_<date>) both the 14:30 v1 tally
-# (breezy-live-tally.service) and the 15:30 v2 tally
+# (breezy-live-tally.service) and the 17:15 v2 tally
 # (breezy-pm-crh-v2-tally.service) assert before running -- see BLOCK-2 in
 # the plan above.
 Description=Breezy I3 live-fill scoring (14:15 UTC daily)

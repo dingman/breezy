@@ -1,13 +1,15 @@
 """Pure structural-pin gate for the PREREG v2 family-tally wrapper.
 
 READY iff the node-env pre-flight token is exactly ``MATCH`` and UTC wall
-time is at or after :data:`LAUNCH_UTC`. Pre-launch MATCH is PRE_LAUNCH, not
-READY. Kalshi is NOT_APPLICABLE. No I/O and no default HOME path (L-27).
+time is at or after :data:`LAUNCH_WINDOW_END_UTC`. Pre-launch MATCH is
+PRE_LAUNCH, not READY. Kalshi is NOT_APPLICABLE. No I/O and no default
+HOME path (L-27).
 
-``Persistent=true`` boot catch-up before launch exits 1 with no report --
-accepted. AC #1 is MATCH at 17:15Z; the wrapper already requires the 14:15
-marker (and, after this gate, the same-day counter JSON) before it can
-write a binding report.
+``Persistent=true`` boot catch-up before launch-window end exits 1 with
+no report -- a binding report must not land before the day's first Take
+is legal. AC #1 is MATCH at 17:15Z; the wrapper already requires the
+14:15 marker (and, after this gate, the same-day counter JSON) before
+it can write a binding report.
 """
 
 from __future__ import annotations
@@ -17,7 +19,7 @@ import datetime as dt
 import sys
 from typing import Final, Literal
 
-from breezy.runtime.trade_supervisor_core import LAUNCH_UTC
+from breezy.runtime.trade_supervisor_core import LAUNCH_WINDOW_END_UTC
 
 __all__ = [
     "PM_FAMILY_ID",
@@ -44,7 +46,7 @@ def evaluate_pin_gate(family_id: str, check_token: str, now: dt.time) -> PinGate
     """
     if family_id != PM_FAMILY_ID:
         return "NOT_APPLICABLE"
-    if now < LAUNCH_UTC:
+    if now < LAUNCH_WINDOW_END_UTC:
         return "PRE_LAUNCH"
     if check_token == REQUIRED_TOKEN:
         return "READY"

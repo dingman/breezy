@@ -2,7 +2,7 @@
 
 The v2 tally's structural-dead pin is READY only when the node-env pre-flight
 token is exactly ``MATCH`` and UTC wall time is at or after
-``LAUNCH_UTC``. Pre-launch MATCH is PRE_LAUNCH, not READY. Kalshi is
+``LAUNCH_WINDOW_END_UTC``. Pre-launch MATCH is PRE_LAUNCH, not READY. Kalshi is
 NOT_APPLICABLE. The module is a pure predicate plus a ``main(argv) -> int``
 CLI the wrapper invokes; it has no default HOME path (L-27).
 """
@@ -17,7 +17,7 @@ from typing import Self
 
 import pytest
 
-from breezy.runtime.trade_supervisor_core import LAUNCH_UTC
+from breezy.runtime.trade_supervisor_core import LAUNCH_WINDOW_END_UTC
 
 _REAL_HOME = Path.home()
 _REAL_TALLY_LOG = _REAL_HOME / ".local" / "share" / "breezy" / "derived" / "family_tally_v2.log"
@@ -68,6 +68,18 @@ def test_pre_launch_match_is_pre_launch_not_ready() -> None:
     assert guard.evaluate_pin_gate(_PM_FAMILY, "MATCH", _PRE_LAUNCH) == "PRE_LAUNCH"
 
 
+def test_match_just_before_launch_utc_is_pre_launch() -> None:
+    """16:49 UTC is still before the day's first Take is legal."""
+    guard = _load_guard()
+    assert guard.evaluate_pin_gate(_PM_FAMILY, "MATCH", dt.time(16, 49)) == "PRE_LAUNCH"
+
+
+def test_match_inside_launch_window_is_pre_launch_not_ready() -> None:
+    """Persistent=true catch-up at 16:55 must not write a binding report."""
+    guard = _load_guard()
+    assert guard.evaluate_pin_gate(_PM_FAMILY, "MATCH", dt.time(16, 55)) == "PRE_LAUNCH"
+
+
 def test_post_launch_non_match_is_unavailable() -> None:
     guard = _load_guard()
     assert guard.evaluate_pin_gate(_PM_FAMILY, "NO_NODE", _POST_LAUNCH) == "UNAVAILABLE"
@@ -76,7 +88,7 @@ def test_post_launch_non_match_is_unavailable() -> None:
 def test_post_launch_match_is_ready() -> None:
     guard = _load_guard()
     assert guard.evaluate_pin_gate(_PM_FAMILY, "MATCH", _POST_LAUNCH) == "READY"
-    assert guard.evaluate_pin_gate(_PM_FAMILY, "MATCH", LAUNCH_UTC) == "READY"
+    assert guard.evaluate_pin_gate(_PM_FAMILY, "MATCH", LAUNCH_WINDOW_END_UTC) == "READY"
 
 
 def test_match_is_exact_not_a_set() -> None:

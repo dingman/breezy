@@ -448,6 +448,7 @@ def test_pm_wrapper_mismatch_exits_1_and_does_not_pass_fill_source(
 ) -> None:
     """A7/A12: --check exit 3 (MISMATCH) → wrapper exit 1, no --fill-source."""
     capture = tmp_path / "argv_capture.txt"
+    guard_capture = tmp_path / "guard_argv.txt"
     stub = tmp_path / "stub_python.sh"
     stub.write_text(
         f"""#!/usr/bin/env bash
@@ -457,7 +458,7 @@ case "$*" in
     exit 3
     ;;
   *"-m breezy.runtime.structural_pin_guard"*)
-    echo "UNAVAILABLE token='refused'" >&2
+    printf "%s\\n" "$@" > "{guard_capture}"
     exit 1
     ;;
   *)
@@ -478,6 +479,10 @@ esac
     )
     assert result.returncode == 1
     assert not capture.exists()
+    assert guard_capture.exists()
+    guard_argv = guard_capture.read_text().splitlines()
+    assert "--token" in guard_argv
+    assert guard_argv[guard_argv.index("--token") + 1] == "MISMATCH"
 
 
 def test_pm_wrapper_invokes_structural_pin_guard_then_tally_on_match(
@@ -518,6 +523,7 @@ esac
     assert guard_argv[guard_argv.index("--family") + 1] == "pm_us_crh_v2"
     assert "--token" in guard_argv
     assert guard_argv[guard_argv.index("--token") + 1] == "MATCH"
+    assert "--now" not in guard_argv
     tally_argv = tally_capture.read_text().splitlines()
     assert "--covered-listed-station-days" in tally_argv
     assert "--fill-source" in tally_argv
