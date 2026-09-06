@@ -6,14 +6,14 @@
 # wrapper-script driver style -- the timer owns cadence, the script owns
 # the work. The family id (pm_us_crh_v2) is the wrapper's ONLY argument;
 # it is never inferred, so this unit and breezy-kalshi-crh-tally.service
-# can share one wrapper safely. Scheduled to run AFTER the v1 live tally
-# (breezy-live-tally.timer, 14:30 UTC), so this family's own read never
-# races that unit's independent work.
+# can share one wrapper safely. Scheduled at 17:15 UTC (after 16:50 launch
+# / 17:10 window end) so MATCH can bind the live node's sqlite.
 #
 # No network: the PREREG v2 store is a local parquet directory
 # (`~/.local/share/breezy/derived/scored_trials`, same store
 # breezy-live-tally.service reads), plus the local family manifest
-# (`deploy/families/pm_us_crh_v2.json`).
+# (`deploy/families/pm_us_crh_v2.json`), plus the sqlite exec-state
+# Environment= line below (byte-identical to v1/scorer, BLOCK-1.1).
 Description=Breezy PREREG v2 family tally -- pm_us_crh_v2 (daily)
 Documentation=file:///home/jon/breezy/deploy/systemd/README.md
 Documentation=file:///home/jon/breezy/scripts/analysis/family_tally_v2.py
@@ -25,8 +25,12 @@ WorkingDirectory=/home/jon/breezy
 UMask=0077
 
 # No EnvironmentFile, deliberately: this unit holds no venue credential --
-# it reads a local parquet directory and writes a local Markdown report,
-# same posture as breezy-live-tally.service.
+# it reads a local parquet directory, a local sqlite exec-state DB, and
+# writes a local Markdown report. The one line below is a non-secret
+# filesystem path literal (I3 BLOCK-1.1), byte-identical to the same line
+# in breezy-score-live-trials.service and breezy-live-tally.service.
+Environment=POLYMARKET_US_EXEC_STATE_DB=/home/jon/.local/share/breezy/state/exec_polymarket_us.sqlite
+
 ExecStart=/home/jon/breezy/deploy/systemd/family-tally-v2-run.sh pm_us_crh_v2
 
 # Same budget as breezy-live-tally.service: a local parquet scan plus a

@@ -365,30 +365,34 @@ def test_stale_counter_json_replaced_by_this_runs_fresh_output_on_success(
 
 
 def test_environment_lines_byte_identical_and_equal_pinned_literal() -> None:
-    scorer_svc = (_SYSTEMD_DIR / "breezy-score-live-trials.service").read_text()
-    tally_svc = (_SYSTEMD_DIR / "breezy-live-tally.service").read_text()
-    scorer_lines = [
-        line
-        for line in scorer_svc.splitlines()
-        if line.startswith("Environment=POLYMARKET_US_EXEC_STATE_DB=")
-    ]
-    tally_lines = [
-        line
-        for line in tally_svc.splitlines()
-        if line.startswith("Environment=POLYMARKET_US_EXEC_STATE_DB=")
-    ]
-    assert len(scorer_lines) == 1
-    assert len(tally_lines) == 1
-    assert scorer_lines[0] == tally_lines[0] == _PINNED_STATE_DB_LITERAL
+    names = (
+        "breezy-score-live-trials.service",
+        "breezy-live-tally.service",
+        "breezy-pm-crh-v2-tally.service",
+    )
+    env_lines: list[str] = []
+    for name in names:
+        text = (_SYSTEMD_DIR / name).read_text()
+        matching = [
+            line
+            for line in text.splitlines()
+            if line.startswith("Environment=POLYMARKET_US_EXEC_STATE_DB=")
+        ]
+        assert len(matching) == 1, name
+        env_lines.append(matching[0])
+    assert env_lines[0] == env_lines[1] == env_lines[2] == _PINNED_STATE_DB_LITERAL
 
 
 def test_neither_i3_unit_carries_an_environment_file_directive() -> None:
     # Repo-wide: breezy-quote-tape.service legitimately carries an
     # EnvironmentFile= for venue credentials -- out of scope here. This
-    # increment's invariant is narrower: neither of the two units this
-    # plan touches (the new scorer unit, the existing tally unit it adds
-    # one Environment= line to) may carry one.
-    for name in ("breezy-score-live-trials.service", "breezy-live-tally.service"):
+    # increment's invariant is narrower: neither of the units that carry
+    # the pinned sqlite Environment= line may carry an EnvironmentFile=.
+    for name in (
+        "breezy-score-live-trials.service",
+        "breezy-live-tally.service",
+        "breezy-pm-crh-v2-tally.service",
+    ):
         assert "EnvironmentFile=" not in (_SYSTEMD_DIR / name).read_text(), name
 
 

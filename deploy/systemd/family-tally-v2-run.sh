@@ -84,15 +84,26 @@ fi
 EXTRA_ARGS=()
 if [ "$FAMILY" = "$PM_FAMILY" ]; then
   CHECK_TOKEN="refused"
-  if CHECK_TOKEN_OUTPUT=$("$PY" -m breezy.runtime.exec_state_db_path --check 2>>"$LOG"); then
+  # Capture stdout even on non-zero (MISMATCH/DISCOVERY_FAILED print a token
+  # then exit 3). Unset-env --check prints nothing and stays 'refused'.
+  CHECK_TOKEN_OUTPUT=$("$PY" -m breezy.runtime.exec_state_db_path --check 2>>"$LOG") || true
+  if [ -n "$CHECK_TOKEN_OUTPUT" ]; then
     CHECK_TOKEN="$CHECK_TOKEN_OUTPUT"
   fi
 
-  if [ "$CHECK_TOKEN" != "MATCH" ]; then
-    MSG="FAMILY TALLY V2 ($FAMILY) STRUCTURAL-DEAD UNAVAILABLE -- node-env pre-flight token '$CHECK_TOKEN' (required MATCH); running sequential tally without structural args"
+  # Persistent=true boot catch-up before 16:50 exits 1 with no report --
+  # accepted. AC #1 is MATCH at 17:15Z; the 14:15 marker is already required
+  # above. Time gate is binding: MATCH before LAUNCH_UTC is PRE_LAUNCH.
+  GUARD_OUT=$("$PY" -m breezy.runtime.structural_pin_guard --family "$FAMILY" --token "$CHECK_TOKEN" 2>&1)
+  GUARD_RC=$?
+  say "$GUARD_OUT"
+  if [ "$GUARD_RC" -ne 0 ]; then
+    MSG="FAMILY TALLY V2 ($FAMILY) STRUCTURAL PIN NOT READY -- $GUARD_OUT (token '$CHECK_TOKEN')"
     echo "$MSG"
     say "$MSG"
-  else
+    exit 1
+  fi
+
   CJSON="$OUT/covered_listed_station_days_$STAMP.json"
   if [ ! -f "$CJSON" ]; then
     say "FAMILY TALLY V2 ($FAMILY) SKIPPED -- no covered-listed station-days JSON for $STAMP"
@@ -134,7 +145,6 @@ if [ "$FAMILY" = "$PM_FAMILY" ]; then
     --fill-source "$STATE_DB"
     --fill-since-climate-day "$D0"
   )
-  fi
 fi
 
 if "$PY" "$REPO/scripts/analysis/family_tally_v2.py" \

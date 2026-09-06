@@ -7,8 +7,8 @@ Documentation=file:///home/jon/breezy/scripts/analysis/score_live_trials.py
 Unit=breezy-score-live-trials.service
 
 # 14:15 UTC -- free on the existing schedule (occupied: 09:00, 13:30,
-# 14:30, 15:30, 22:30, 22:45, 00/06/12/18:15), and BEFORE breezy-live-tally
-# (14:30) and breezy-pm-crh-v2-tally (15:30) so this unit's dated success
+# 14:30, 17:15, 22:30, 22:45, 00/06/12/18:15), and BEFORE breezy-live-tally
+# (14:30) and breezy-pm-crh-v2-tally (17:15) so this unit's dated success
 # marker exists before either tally's own OnCalendar tick -- ordering is by
 # the marker (BLOCK-2), never by `After=`, because `After=` does not order
 # units started by separate timers. UTC is stated explicitly (this host's
