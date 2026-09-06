@@ -83,6 +83,7 @@ from breezy.runtime.trade_supervisor_core import (
     next_due,
     parse_permit_expiry_ns,
     readiness_observed,
+    record_permit_issued_seen,
     record_readiness_observed,
     record_relaunch_attempt,
     record_strategy_subscribed_seen,
@@ -1539,6 +1540,555 @@ class TestStickyStrategySubscribedAcrossSharedReader:
         # Idempotent -- a later call the same day changes nothing else.
         again = record_strategy_subscribed_seen(state, _utc(16, 55))
         assert again == state
+
+
+# ===========================================================================
+# Fix 2026-09-06 (traced live): `_do_self_check` computed `permit_issued`
+# and `permit_expiry_valid` from `ports.read_log_new(node_log)` on the SAME
+# shared, offset-draining `IncrementalLogReader` that `_do_relaunch_check`
+# already drains while polling. Commit 06d8900 latched
+# `strategy_subscribed_seen` for this exact reason, but left the permit
+# marker un-latched. The permit is issued once at boot; by 17:05 the
+# reader's delta no longer contains that line, so a node that holds a
+# valid permit false-negatives as FAIL_SHADOW_MODE_NO_PERMIT.
+# ===========================================================================
+
+_FAR_FUTURE_EXPIRES_AT_NS = 4102444800000000000
+_PERMIT_ISSUED_LINE = (
+    "live-trading permit issued issued_at_ns=1788713409710026893 "
+    f"expires_at_ns={_FAR_FUTURE_EXPIRES_AT_NS} ttl_s=36000\n"
+)
+_STRATEGY_SUBSCRIBED_LINE = "CurrentRungHoldStrategy subscribed instrument=X\n"
+
+
+def _drain_relaunch_polls_past_boot_markers(
+    *,
+    tmp_path,
+    node_log: Path,
+    now_relaunch: dt.datetime,
+) -> tuple[IncrementalLogReader, _RecordingAlertSink, object, int, Path]:
+    """Shared IncrementalLogReader + five RELAUNCH_CHECK polls that leave
+    only later noise in the next delta -- the same drain that 06d8900
+    covered for the strategy marker."""
+    from breezy.runtime.trade_supervisor_core import (
+        PERMIT_ISSUED_MARKER,
+        STRATEGY_SUBSCRIBED_MARKER,
+    )
+
+    reader = IncrementalLogReader()
+    sink = _RecordingAlertSink()
+    store_path = tmp_path / "state" / "store.sqlite3"
+    tracked_pid = 9001
+    ports = _make_ports(
+        resolve_intent_lock_holder=lambda _p: tracked_pid,
+        count_intent_lock_holders=lambda _p: 1,
+        process_alive=lambda _pid: True,
+        read_log_new=reader.read_new,
+        alert_sink=sink,
+    )
+    state = initial_scheduler_state(now_relaunch.date())
+    noise = "order book tick " + ("x" * 300) + "\n"
+    for i in range(5):
+        tracked_pid, node_log, state = _do_relaunch_check(
+            ports=ports,
+            state=state,
+            now=now_relaunch.replace(second=i),
+            tracked_pid=tracked_pid,
+            node_log=node_log,
+            store_path=store_path,
+            repo_root=tmp_path,
+            node_bin=tmp_path / "node_bin",
+            log_dir=tmp_path / "logs",
+        )
+        with node_log.open("a") as fh:
+            fh.write(noise * 3)
+
+    leftover = reader.read_new(node_log)
+    assert STRATEGY_SUBSCRIBED_MARKER not in leftover
+    assert PERMIT_ISSUED_MARKER not in leftover
+    return reader, sink, state, tracked_pid, node_log
+
+
+class TestStickyPermitIssuedAcrossSharedReader:
+    def test_self_check_passes_when_permit_line_was_drained_by_relaunch_polls(self, tmp_path):
+        node_log = tmp_path / "node.log"
+        node_log.write_text(_STRATEGY_SUBSCRIBED_LINE + _PERMIT_ISSUED_LINE)
+        reader, sink, state, tracked_pid, node_log = _drain_relaunch_polls_past_boot_markers(
+            tmp_path=tmp_path,
+            node_log=node_log,
+            now_relaunch=_utc(16, 50),
+        )
+        ports = _make_ports(
+            resolve_intent_lock_holder=lambda _p: tracked_pid,
+            count_intent_lock_holders=lambda _p: 1,
+            process_alive=lambda _pid: True,
+            read_log_new=reader.read_new,
+            alert_sink=sink,
+        )
+
+        _, _, state = _do_self_check(
+            ports=ports,
+            now=_utc(17, 5),
+            store_path=tmp_path / "state" / "store.sqlite3",
+            log_dir=tmp_path / "logs",
+            tracked_pid=tracked_pid,
+            node_log=node_log,
+            state=state,
+        )
+
+        assert sink.payloads == []
+        assert state.permit_issued_seen_expires_at_ns == _FAR_FUTURE_EXPIRES_AT_NS
+
+    def test_self_check_still_fails_when_latched_permit_has_expired(self, tmp_path):
+        expired_ns = 1
+        node_log = tmp_path / "node.log"
+        node_log.write_text(
+            _STRATEGY_SUBSCRIBED_LINE
+            + (
+                "live-trading permit issued issued_at_ns=1788713409710026893 "
+                f"expires_at_ns={expired_ns} ttl_s=36000\n"
+            )
+        )
+        reader, sink, state, tracked_pid, node_log = _drain_relaunch_polls_past_boot_markers(
+            tmp_path=tmp_path,
+            node_log=node_log,
+            now_relaunch=_utc(16, 50),
+        )
+        ports = _make_ports(
+            resolve_intent_lock_holder=lambda _p: tracked_pid,
+            count_intent_lock_holders=lambda _p: 1,
+            process_alive=lambda _pid: True,
+            read_log_new=reader.read_new,
+            alert_sink=sink,
+        )
+
+        _, _, state = _do_self_check(
+            ports=ports,
+            now=_utc(17, 5),
+            store_path=tmp_path / "state" / "store.sqlite3",
+            log_dir=tmp_path / "logs",
+            tracked_pid=tracked_pid,
+            node_log=node_log,
+            state=state,
+        )
+
+        assert sink.payloads[-1].detail == (AlertDetail.SELF_CHECK_FAIL_SHADOW_MODE_NO_PERMIT.value)
+        assert state.permit_issued_seen_expires_at_ns == expired_ns
+
+    def test_permit_latch_resets_on_next_days_launch_so_stale_permit_cannot_pass(self, tmp_path):
+        yesterday = _DAY - dt.timedelta(days=1)
+        state = initial_scheduler_state(yesterday)
+        state = record_permit_issued_seen(
+            state, _utc(16, 50, day=yesterday), _FAR_FUTURE_EXPIRES_AT_NS
+        )
+        state = record_strategy_subscribed_seen(state, _utc(16, 50, day=yesterday))
+        assert state.permit_issued_seen_expires_at_ns == _FAR_FUTURE_EXPIRES_AT_NS
+        assert state.strategy_subscribed_seen is True
+
+        state = mark_phase_fired(state, Phase.LAUNCH, _utc(16, 50))
+        assert state.day == _DAY
+        assert state.permit_issued_seen_expires_at_ns is None
+        assert state.strategy_subscribed_seen is False
+
+        node_log = tmp_path / "today.log"
+        node_log.write_text(_STRATEGY_SUBSCRIBED_LINE)
+        sink = _RecordingAlertSink()
+        tracked_pid = 42
+        ports = _make_ports(
+            resolve_intent_lock_holder=lambda _p: tracked_pid,
+            count_intent_lock_holders=lambda _p: 1,
+            process_alive=lambda _pid: True,
+            read_log_new=lambda _p: node_log.read_text(),
+            alert_sink=sink,
+        )
+        _do_self_check(
+            ports=ports,
+            now=_utc(17, 5),
+            store_path=tmp_path / "state" / "store.sqlite3",
+            log_dir=tmp_path / "logs",
+            tracked_pid=tracked_pid,
+            node_log=node_log,
+            state=state,
+        )
+        assert sink.payloads[-1].detail == (AlertDetail.SELF_CHECK_FAIL_SHADOW_MODE_NO_PERMIT.value)
+
+    def test_record_permit_issued_seen_is_sticky_and_idempotent(self):
+        state = initial_scheduler_state(_DAY)
+        assert state.permit_issued_seen_expires_at_ns is None
+        state = record_permit_issued_seen(state, _utc(16, 50, 5), _FAR_FUTURE_EXPIRES_AT_NS)
+        assert state.permit_issued_seen_expires_at_ns == _FAR_FUTURE_EXPIRES_AT_NS
+        again = record_permit_issued_seen(state, _utc(16, 55), 99)
+        assert again == state
+        assert again.permit_issued_seen_expires_at_ns == _FAR_FUTURE_EXPIRES_AT_NS
+
+    def test_readiness_uses_latched_permit_when_lock_ownership_arrives_in_a_later_poll(
+        self, tmp_path, caplog
+    ):
+        """Poll 1 consumes the permit+subscribed lines while the intent lock
+        is still not held by the tracked pid; poll 2's delta is empty and
+        the holder is now the tracked pid. Readiness must use the latched
+        permit, not the live (empty) delta, or a healthy node never
+        records ``node_ready``."""
+        node_log = tmp_path / "node.log"
+        node_log.write_text(_STRATEGY_SUBSCRIBED_LINE + _PERMIT_ISSUED_LINE)
+        store_path = tmp_path / "state" / "store.sqlite3"
+        tracked_pid = 9001
+        session: dict = {"holder": None}
+        # Scripted deltas, not IncrementalLogReader: the reader's 256-byte
+        # carry would still return the short boot markers on an empty
+        # second read, which is not the "permit already consumed" case.
+        deltas = [_STRATEGY_SUBSCRIBED_LINE + _PERMIT_ISSUED_LINE, ""]
+        ports = _make_ports(
+            resolve_intent_lock_holder=lambda _p: session["holder"],
+            count_intent_lock_holders=lambda _p: 0 if session["holder"] is None else 1,
+            process_alive=lambda _pid: True,
+            read_log_new=lambda _p: deltas.pop(0) if deltas else "",
+        )
+        state = initial_scheduler_state(_DAY)
+
+        with caplog.at_level("INFO"):
+            _, _, state = _do_relaunch_check(
+                ports=ports,
+                state=state,
+                now=_utc(16, 50, 0),
+                tracked_pid=tracked_pid,
+                node_log=node_log,
+                store_path=store_path,
+                repo_root=tmp_path,
+                node_bin=tmp_path / "node_bin",
+                log_dir=tmp_path / "logs",
+            )
+        assert state.permit_issued_seen_expires_at_ns is not None
+        assert state.strategy_subscribed_seen is True
+        assert state.readiness_observed is False
+
+        session["holder"] = tracked_pid
+        with caplog.at_level("INFO"):
+            _, _, state = _do_relaunch_check(
+                ports=ports,
+                state=state,
+                now=_utc(16, 50, 1),
+                tracked_pid=tracked_pid,
+                node_log=node_log,
+                store_path=store_path,
+                repo_root=tmp_path,
+                node_bin=tmp_path / "node_bin",
+                log_dir=tmp_path / "logs",
+            )
+
+        assert state.readiness_observed is True
+        assert any("node_ready" in r.getMessage() for r in caplog.records)
+
+
+# ===========================================================================
+# Follow-up (2026-09-06): the permit/strategy latches must not survive a
+# same-day relaunch. `_for_day` only resets them on a calendar-day change;
+# `_do_relaunch_check` opens a NEW child with a NEW log via
+# `record_relaunch_attempt` and must clear both latches there. Evidence is
+# per-child: a relaunched node in SHADOW mode (no permit line) must not
+# inherit child 1's still-valid expiry, and a relaunched node that never
+# subscribes must not inherit child 1's `strategy_subscribed_seen`.
+# No existing test pinned the old cross-relaunch stickiness
+# (`test_record_strategy_subscribed_seen_is_sticky_and_idempotent` is
+# same-child idempotence; `test_permit_latch_resets_on_next_days_launch_*`
+# is `_for_day` rollover; `test_relaunch_attempt_bookkeeping_round_trips`
+# only checks attempt count/timestamp).
+# ===========================================================================
+
+_TRADING_NODE_FAILED_LINE = "breezy-trade: trading node failed: ConnectionError\n"
+_CHILD2_EXPIRES_AT_NS = 4200000000000000000
+_CHILD2_PERMIT_ISSUED_LINE = (
+    "live-trading permit issued issued_at_ns=1788713409710026894 "
+    f"expires_at_ns={_CHILD2_EXPIRES_AT_NS} ttl_s=36000\n"
+)
+
+
+def _latch_child1_then_relaunch_on_crash(
+    *,
+    tmp_path,
+    child1_log_text: str,
+) -> tuple[
+    SupervisorPorts,
+    object,
+    dict,
+    int,
+    Path,
+    IncrementalLogReader,
+    _RecordingAlertSink,
+    Path,
+    Path,
+]:
+    """Child 1 boots (markers latched, flock not held so readiness never
+    fires), crashes with a transient marker, and `_do_relaunch_check`
+    opens child 2 on a new log. Returns the live session so the caller
+    can write child 2's log and flip liveness/lock before self-check."""
+    log_dir = tmp_path / "logs"
+    log_dir.mkdir()
+    store_path = tmp_path / "state" / "store.sqlite3"
+    child1_log = tmp_path / "child1.log"
+    child1_log.write_text(child1_log_text)
+    child1_pid = 111
+    session: dict = {"alive": {child1_pid}, "holder": None}
+    reader = IncrementalLogReader()
+    sink = _RecordingAlertSink()
+    ports = _make_ports(
+        resolve_intent_lock_holder=lambda _p: session["holder"],
+        count_intent_lock_holders=lambda _p: 0 if session["holder"] is None else 1,
+        process_alive=lambda pid: pid in session["alive"],
+        read_log_new=reader.read_new,
+        alert_sink=sink,
+        spawn=FakeSpawner(),
+    )
+    from breezy.runtime.trade_supervisor_core import (
+        PERMIT_ISSUED_MARKER,
+        STRATEGY_SUBSCRIBED_MARKER,
+    )
+
+    state = initial_scheduler_state(_DAY)
+    _, _, state = _do_relaunch_check(
+        ports=ports,
+        state=state,
+        now=_utc(16, 50),
+        tracked_pid=child1_pid,
+        node_log=child1_log,
+        store_path=store_path,
+        repo_root=tmp_path,
+        node_bin=tmp_path / "node_bin",
+        log_dir=log_dir,
+    )
+    assert state.readiness_observed is False
+    if STRATEGY_SUBSCRIBED_MARKER in child1_log_text:
+        assert state.strategy_subscribed_seen is True
+    if PERMIT_ISSUED_MARKER in child1_log_text:
+        assert state.permit_issued_seen_expires_at_ns is not None
+
+    session["alive"].clear()
+    with child1_log.open("a") as fh:
+        fh.write(_TRADING_NODE_FAILED_LINE)
+    child2_pid, child2_log, state = _do_relaunch_check(
+        ports=ports,
+        state=state,
+        now=_utc(16, 58),
+        tracked_pid=child1_pid,
+        node_log=child1_log,
+        store_path=store_path,
+        repo_root=tmp_path,
+        node_bin=tmp_path / "node_bin",
+        log_dir=log_dir,
+    )
+    assert child2_pid is not None
+    assert child2_log is not None
+    assert child2_log != child1_log
+    assert state.relaunch_attempts == 1
+    return (
+        ports,
+        state,
+        session,
+        child2_pid,
+        child2_log,
+        reader,
+        sink,
+        store_path,
+        log_dir,
+    )
+
+
+class TestRelaunchClearsPerChildLatches:
+    def test_relaunched_child_must_earn_its_own_permit(self, tmp_path):
+        ports, state, session, child2_pid, child2_log, _reader, sink, store_path, log_dir = (
+            _latch_child1_then_relaunch_on_crash(
+                tmp_path=tmp_path,
+                child1_log_text=_STRATEGY_SUBSCRIBED_LINE + _PERMIT_ISSUED_LINE,
+            )
+        )
+        child2_log.write_text(_STRATEGY_SUBSCRIBED_LINE)
+        session["alive"].add(child2_pid)
+        session["holder"] = child2_pid
+
+        _, _, state = _do_self_check(
+            ports=ports,
+            now=_utc(17, 5),
+            store_path=store_path,
+            log_dir=log_dir,
+            tracked_pid=child2_pid,
+            node_log=child2_log,
+            state=state,
+        )
+
+        assert [p.detail for p in sink.payloads] == [
+            AlertDetail.SELF_CHECK_FAIL_SHADOW_MODE_NO_PERMIT.value
+        ]
+        assert state.permit_issued_seen_expires_at_ns is None
+
+    def test_relaunched_child_permit_is_latched_from_its_own_log(self, tmp_path):
+        ports, state, session, child2_pid, child2_log, reader, sink, store_path, log_dir = (
+            _latch_child1_then_relaunch_on_crash(
+                tmp_path=tmp_path,
+                child1_log_text=_STRATEGY_SUBSCRIBED_LINE + _PERMIT_ISSUED_LINE,
+            )
+        )
+        child2_log.write_text(_STRATEGY_SUBSCRIBED_LINE + _CHILD2_PERMIT_ISSUED_LINE)
+        session["alive"].add(child2_pid)
+        session["holder"] = child2_pid
+
+        from breezy.runtime.trade_supervisor_core import PERMIT_ISSUED_MARKER
+
+        noise = "order book tick " + ("x" * 300) + "\n"
+        for i in range(5):
+            _, child2_log, state = _do_relaunch_check(
+                ports=ports,
+                state=state,
+                now=_utc(16, 58, 5 + i),
+                tracked_pid=child2_pid,
+                node_log=child2_log,
+                store_path=store_path,
+                repo_root=tmp_path,
+                node_bin=tmp_path / "node_bin",
+                log_dir=log_dir,
+            )
+            with child2_log.open("a") as fh:
+                fh.write(noise * 3)
+        leftover = reader.read_new(child2_log)
+        assert PERMIT_ISSUED_MARKER not in leftover
+
+        _, _, state = _do_self_check(
+            ports=ports,
+            now=_utc(17, 5),
+            store_path=store_path,
+            log_dir=log_dir,
+            tracked_pid=child2_pid,
+            node_log=child2_log,
+            state=state,
+        )
+
+        assert sink.payloads == []
+        assert state.permit_issued_seen_expires_at_ns == _CHILD2_EXPIRES_AT_NS
+
+    def test_relaunched_child_must_earn_its_own_strategy_subscription(self, tmp_path):
+        ports, state, session, child2_pid, child2_log, _reader, sink, store_path, log_dir = (
+            _latch_child1_then_relaunch_on_crash(
+                tmp_path=tmp_path,
+                child1_log_text=_STRATEGY_SUBSCRIBED_LINE + _PERMIT_ISSUED_LINE,
+            )
+        )
+        child2_log.write_text("order book tick only\n")
+        session["alive"].add(child2_pid)
+        session["holder"] = child2_pid
+
+        _, _, state = _do_self_check(
+            ports=ports,
+            now=_utc(17, 5),
+            store_path=store_path,
+            log_dir=log_dir,
+            tracked_pid=child2_pid,
+            node_log=child2_log,
+            state=state,
+        )
+
+        assert [p.detail for p in sink.payloads] == [AlertDetail.SELF_CHECK_FAIL_NOT_READY.value]
+        assert state.strategy_subscribed_seen is False
+
+
+# ===========================================================================
+# Follow-up 2 (2026-09-06): adoption must also discard per-child latches.
+# `_do_self_check` (and `_do_launch`) can ADOPT a live flock-holder when
+# `tracked_pid is None`, swapping `tracked_pid`/`node_log` without clearing
+# `strategy_subscribed_seen` / `permit_issued_seen_expires_at_ns`. A stale
+# same-day latch from an earlier child then makes self-check PASS on the
+# previous node's expiry even when the adopted node's log has no permit.
+# Evidence is per-child: the adopted node must prove its own subscription
+# and permit from its own log. `_attempt_adoption` does not seek the
+# reader; the first `read_log_new` after adoption is the IncrementalLogReader
+# default for an unseen path (offset 0 -- START of the file, not the end).
+# ===========================================================================
+
+
+def _adopt_live_node_with_stale_latches(
+    *,
+    tmp_path,
+    adopted_log_text: str,
+) -> tuple[
+    SupervisorPorts,
+    object,
+    IncrementalLogReader,
+    _RecordingAlertSink,
+    Path,
+    Path,
+    Path,
+    int,
+]:
+    """Latch child-1 evidence, then present a different live flock-holder
+    whose log is `adopted_log_text`. Caller invokes `_do_self_check` with
+    `tracked_pid=None` so adoption runs."""
+    adopted_pid = 222
+    adopted_log = tmp_path / "adopted.log"
+    adopted_log.write_text(adopted_log_text)
+    log_dir = tmp_path / "logs"
+    log_dir.mkdir()
+    store_path = tmp_path / "state" / "store.sqlite3"
+    reader = IncrementalLogReader()
+    sink = _RecordingAlertSink()
+    ports = _make_ports(
+        find_node_pid=lambda: adopted_pid,
+        resolve_intent_lock_holder=lambda _p: adopted_pid,
+        count_intent_lock_holders=lambda _p: 1,
+        process_alive=lambda _pid: True,
+        find_adopted_log=lambda _log_dir, _pid: adopted_log,
+        read_log_new=reader.read_new,
+        alert_sink=sink,
+    )
+    state = initial_scheduler_state(_DAY)
+    state = record_permit_issued_seen(state, _utc(16, 50), _FAR_FUTURE_EXPIRES_AT_NS)
+    state = record_strategy_subscribed_seen(state, _utc(16, 50))
+    assert state.permit_issued_seen_expires_at_ns == _FAR_FUTURE_EXPIRES_AT_NS
+    assert state.strategy_subscribed_seen is True
+    return ports, state, reader, sink, store_path, log_dir, adopted_log, adopted_pid
+
+
+class TestAdoptionClearsPerChildLatches:
+    def test_adopted_node_must_earn_its_own_permit(self, tmp_path):
+        ports, state, _reader, sink, store_path, log_dir, _adopted_log, _pid = (
+            _adopt_live_node_with_stale_latches(
+                tmp_path=tmp_path,
+                adopted_log_text=_STRATEGY_SUBSCRIBED_LINE,
+            )
+        )
+
+        _, _, state = _do_self_check(
+            ports=ports,
+            now=_utc(17, 5),
+            store_path=store_path,
+            log_dir=log_dir,
+            tracked_pid=None,
+            node_log=None,
+            state=state,
+        )
+
+        assert [p.detail for p in sink.payloads] == [
+            AlertDetail.SELF_CHECK_FAIL_SHADOW_MODE_NO_PERMIT.value
+        ]
+        assert state.permit_issued_seen_expires_at_ns is None
+
+    def test_adopted_node_permit_is_latched_from_its_own_log(self, tmp_path):
+        ports, state, _reader, sink, store_path, log_dir, _adopted_log, _pid = (
+            _adopt_live_node_with_stale_latches(
+                tmp_path=tmp_path,
+                adopted_log_text=_STRATEGY_SUBSCRIBED_LINE + _CHILD2_PERMIT_ISSUED_LINE,
+            )
+        )
+
+        _, _, state = _do_self_check(
+            ports=ports,
+            now=_utc(17, 5),
+            store_path=store_path,
+            log_dir=log_dir,
+            tracked_pid=None,
+            node_log=None,
+            state=state,
+        )
+
+        assert sink.payloads == []
+        assert state.permit_issued_seen_expires_at_ns == _CHILD2_EXPIRES_AT_NS
 
 
 # ===========================================================================

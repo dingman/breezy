@@ -356,14 +356,28 @@ class DaySchedulerState:
     last_relaunch_attempt_at: dt.datetime | None = None
     #: [fix 2026-09-05] Sticky latch: once ANY log read (RELAUNCH_CHECK's
     #: polling reads or SELF_CHECK's own) has observed
-    #: ``STRATEGY_SUBSCRIBED_MARKER``, that fact is recorded here and never
-    #: cleared for the rest of the day. The strategy subscribes once, at
-    #: boot; a later read of the SAME shared, offset-draining
-    #: ``IncrementalLogReader`` seeing a delta that no longer contains the
-    #: marker text (because RELAUNCH_CHECK's polling already consumed past
-    #: it while waiting on a permit that never came) must not be treated as
-    #: "never subscribed".
+    #: ``STRATEGY_SUBSCRIBED_MARKER``, that fact is recorded here for the
+    #: current child. The strategy subscribes once, at boot; a later read
+    #: of the SAME shared, offset-draining ``IncrementalLogReader`` seeing
+    #: a delta that no longer contains the marker text (because
+    #: RELAUNCH_CHECK's polling already consumed past it while waiting on a
+    #: permit that never came) must not be treated as "never subscribed".
+    #: Reset by :func:`_for_day` on a new calendar day, by
+    #: :func:`record_relaunch_attempt` when a new child is launched, and
+    #: by :func:`record_child_adopted` when a live node is adopted --
+    #: evidence is per-child.
     strategy_subscribed_seen: bool = False
+    #: [fix 2026-09-06] Sticky latch for the permit-issued line's
+    #: ``expires_at_ns``. Same shared-reader drain as
+    #: ``strategy_subscribed_seen``: the permit is issued once, at boot, and
+    #: a later delta that no longer contains the line must not be treated as
+    #: "never issued". ``None`` means not yet seen for this child; reset by
+    #: :func:`_for_day` on a new calendar day, by
+    #: :func:`record_relaunch_attempt` when a new child is launched, and
+    #: by :func:`record_child_adopted` when a live node is adopted. The
+    #: stored expiry is still enforced at self-check. First-seen-wins
+    #: applies per child.
+    permit_issued_seen_expires_at_ns: int | None = None
 
 
 def initial_scheduler_state(day: dt.date) -> DaySchedulerState:
@@ -444,8 +458,26 @@ def mark_phase_fired(
     return effective
 
 
-def record_relaunch_attempt(state: DaySchedulerState, now_utc: dt.datetime) -> DaySchedulerState:
+def record_child_adopted(state: DaySchedulerState, now_utc: dt.datetime) -> DaySchedulerState:
+    """Clear both per-child evidence latches without touching relaunch
+    bookkeeping. Called when the I/O shell ADOPTS an already-live node
+    (``tracked_pid`` swapped to a different process) so that node's own
+    log is the only remaining evidence. :func:`record_relaunch_attempt`
+    reuses this primitive when a new child is launched."""
     effective = _for_day(state, now_utc.date())
+    return replace(
+        effective,
+        strategy_subscribed_seen=False,
+        permit_issued_seen_expires_at_ns=None,
+    )
+
+
+def record_relaunch_attempt(state: DaySchedulerState, now_utc: dt.datetime) -> DaySchedulerState:
+    """Record a new-child launch. Clears both per-child evidence latches
+    via :func:`record_child_adopted` so a relaunched child must prove its
+    own subscription and permit; :func:`_for_day` still owns the
+    calendar-day reset."""
+    effective = record_child_adopted(state, now_utc)
     return replace(
         effective,
         relaunch_attempts=effective.relaunch_attempts + 1,
@@ -471,3 +503,18 @@ def record_strategy_subscribed_seen(
     if effective.strategy_subscribed_seen:
         return effective
     return replace(effective, strategy_subscribed_seen=True)
+
+
+def record_permit_issued_seen(
+    state: DaySchedulerState, now_utc: dt.datetime, expires_at_ns: int
+) -> DaySchedulerState:
+    """[fix 2026-09-06] Latch ``permit_issued_seen_expires_at_ns`` -- called
+    by the I/O shell the moment ANY log read observes a parseable
+    ``PERMIT_ISSUED_MARKER`` line, so the expiry survives a LATER read of
+    the same shared, offset-draining reader whose delta no longer contains
+    that text. Idempotent: a caller that has already latched today's expiry
+    gets the same state back unchanged (the first-seen expiry wins)."""
+    effective = _for_day(state, now_utc.date())
+    if effective.permit_issued_seen_expires_at_ns is not None:
+        return effective
+    return replace(effective, permit_issued_seen_expires_at_ns=expires_at_ns)

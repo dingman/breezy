@@ -74,8 +74,11 @@ from breezy.runtime.trade_supervisor_core import (
     initial_scheduler_state,
     mark_phase_fired,
     next_due,
+    parse_permit_expiry_ns,
     permit_expiry_valid,
     readiness_observed,
+    record_child_adopted,
+    record_permit_issued_seen,
     record_readiness_observed,
     record_relaunch_attempt,
     record_strategy_subscribed_seen,
@@ -755,7 +758,7 @@ def _do_launch(
         if adoption is not None:
             pid, log_path = adoption
             log_decision("launch_adopted_live_node", pid=pid)
-            return pid, log_path, state, True
+            return pid, log_path, record_child_adopted(state, now), True
         log_decision("launch_refused_lock_held")
         alert(
             ports.alert_sink,
@@ -839,10 +842,13 @@ def _do_relaunch_check(
     # shared reader's offset past it.
     if STRATEGY_SUBSCRIBED_MARKER in log_text:
         state = record_strategy_subscribed_seen(state, now)
+    permit_expiry_ns = parse_permit_expiry_ns(log_text)
+    if permit_expiry_ns is not None:
+        state = record_permit_issued_seen(state, now, permit_expiry_ns)
     holder = ports.resolve_intent_lock_holder(intent_lock_path(store_path))
     if readiness_observed(
         holds_intent_lock=(holder == tracked_pid),
-        permit_issued=PERMIT_ISSUED_MARKER in log_text,
+        permit_issued=state.permit_issued_seen_expires_at_ns is not None,
         strategy_subscribed=state.strategy_subscribed_seen,
     ):
         log_decision("node_ready", pid=tracked_pid)
@@ -902,13 +908,19 @@ def _do_self_check(
     offset-draining ``IncrementalLogReader`` with this handler, so by the
     time SELF_CHECK runs, the marker text the strategy emitted once at boot
     may already be outside every reader delta; the latch is what makes that
-    survive [see ``DaySchedulerState.strategy_subscribed_seen``]."""
+    survive [see ``DaySchedulerState.strategy_subscribed_seen``].
+    [fix 2026-09-06] The same latch applies to the permit-issued line:
+    ``permit_issued`` is latched-or-live, and ``permit_expiry_valid`` is
+    evaluated against the latched ``expires_at_ns`` (or this call's live
+    delta if that is the first sighting)."""
     lock_path = intent_lock_path(store_path)
     if tracked_pid is None:
         adoption = _attempt_adoption(ports=ports, lock_path=lock_path, log_dir=log_dir)
         if adoption is not None:
             tracked_pid, node_log = adoption
             log_decision("self_check_adopted_live_node", pid=tracked_pid)
+            if state is not None:
+                state = record_child_adopted(state, now)
 
     holder = ports.resolve_intent_lock_holder(lock_path)
     holder_count = ports.count_intent_lock_holders(lock_path)
@@ -916,19 +928,32 @@ def _do_self_check(
     child_alive = tracked_pid is not None and ports.process_alive(tracked_pid)
 
     strategy_subscribed_live = STRATEGY_SUBSCRIBED_MARKER in log_text
+    permit_issued_live = PERMIT_ISSUED_MARKER in log_text
+    live_permit_expiry_ns = parse_permit_expiry_ns(log_text)
+    now_ns = int(now.timestamp() * 1e9)
     if state is not None:
         if strategy_subscribed_live and not state.strategy_subscribed_seen:
             state = record_strategy_subscribed_seen(state, now)
         strategy_subscribed = state.strategy_subscribed_seen
+        if live_permit_expiry_ns is not None and state.permit_issued_seen_expires_at_ns is None:
+            state = record_permit_issued_seen(state, now, live_permit_expiry_ns)
+        latched_permit_expiry_ns = state.permit_issued_seen_expires_at_ns
+        permit_issued = latched_permit_expiry_ns is not None or permit_issued_live
+        if latched_permit_expiry_ns is not None:
+            expiry_valid = latched_permit_expiry_ns > now_ns
+        else:
+            expiry_valid = permit_expiry_valid(log_text, now_ns=now_ns)
     else:
         strategy_subscribed = strategy_subscribed_live
+        permit_issued = permit_issued_live
+        expiry_valid = permit_expiry_valid(log_text, now_ns=now_ns)
 
     result = self_check(
         child_alive=child_alive,
         flock_holder_count=holder_count,
         flock_held_by_tracked_pid=(tracked_pid is not None and holder == tracked_pid),
-        permit_issued=PERMIT_ISSUED_MARKER in log_text,
-        permit_expiry_valid=permit_expiry_valid(log_text, now_ns=int(now.timestamp() * 1e9)),
+        permit_issued=permit_issued,
+        permit_expiry_valid=expiry_valid,
         strategy_subscribed=strategy_subscribed,
         log_available=node_log is not None,
     )
