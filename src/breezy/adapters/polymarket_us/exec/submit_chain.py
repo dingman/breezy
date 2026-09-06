@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 from collections.abc import Mapping
 from dataclasses import dataclass
 from decimal import Decimal, InvalidOperation
@@ -136,12 +137,12 @@ class CreateOrderOutcome:
     cumulative_fee: Decimal | None
     fee_reconciled: bool
     generate_submitted: bool
-    #: Redacted, log-only summary of an AMBIGUOUS outcome (``None`` on every
-    #: other kind). Carries only shape and length -- status code, a coarse
-    #: ``body_kind``, the ``google.rpc.Status`` code when present, and the
-    #: raw body's byte length -- never the body content itself, so it is
-    #: always safe to log even though the body may be adversarial or carry
-    #: venue-side account details.
+    #: Redacted, log-only summary of every classified outcome (never ``None``).
+    #: Carries only shape and length -- status code, a coarse ``body_kind``,
+    #: the ``google.rpc.Status`` code when present, and the raw body's byte
+    #: length -- never the body content itself, so it is always safe to log
+    #: even though the body may be adversarial or carry venue-side account
+    #: details.
     detail: str | None = None
 
 
@@ -576,33 +577,87 @@ def venue_order_id(order_id: str) -> VenueOrderId:
 _AMBIGUOUS_DETAIL_NO_RESPONSE: Final[str] = (
     "status=none body_kind=none rpc_code=none body_len=0"
 )
+_ORDER_STATE_TOKEN: Final[re.Pattern[str]] = re.compile(r"^ORDER_STATE_[A-Z_]+$")
 
 
-def _ambiguous_detail(
+def _state_detail_token(payload: Mapping[str, Any] | None) -> str:
+    """Closed-set ``state=`` token for the redacted create-order detail.
+
+    Uses the same top-level ``state``/``status`` then nested ``order`` lookup
+    as :func:`_terminal_state`. Emits the enum value only when it is a
+    ``str`` matching ``ORDER_STATE_[A-Z_]+``; any other present string is
+    ``other`` (never echoed); absence is ``absent``.
+    """
+    if not isinstance(payload, Mapping):
+        return "absent"
+    raw = _terminal_state(payload)
+    if raw is None:
+        return "absent"
+    if _ORDER_STATE_TOKEN.fullmatch(raw) is not None:
+        return raw
+    return "other"
+
+
+def _cum_detail_token(payload: Mapping[str, Any] | None) -> str:
+    """Closed-set ``cum=`` token for the redacted create-order detail.
+
+    Looks up ``cumQuantity`` top-level then nested ``order``, matching
+    :func:`_cum_quantity`. Emits ``absent``, ``0``, ``nonzero``, or
+    ``unparseable`` -- never the raw value.
+    """
+    if not isinstance(payload, Mapping):
+        return "absent"
+    raw = payload.get("cumQuantity")
+    if raw is None:
+        order = payload.get("order")
+        if isinstance(order, Mapping):
+            raw = order.get("cumQuantity")
+    if raw is None:
+        return "absent"
+    try:
+        qty = Decimal(str(raw))
+    except (InvalidOperation, ValueError):
+        return "unparseable"
+    if qty == ZERO:
+        return "0"
+    return "nonzero"
+
+
+def _body_detail(
     response: VenueResponse,
     payload: Mapping[str, Any] | None,
     order_id: str | None,
 ) -> str:
-    """Redacted, log-only summary of one AMBIGUOUS create-order response.
+    """Redacted, log-only summary of one classified create-order response.
 
     Reports shape and length only -- never the body content -- so the venue's
     answer is recoverable from the log without risking a leaked secret or
-    account detail embedded in an adversarial or malformed body.
+    account detail embedded in an adversarial or malformed body. Closed-set
+    tokens only: status, body_kind, rpc_code, body_len, state, cum.
     """
     body_len = len(response.body)
     rpc_code: int | None = None
     if payload is None:
         body_kind = "unparseable"
-    elif _is_google_rpc_status(payload) and order_id is None:
+    elif isinstance(payload, Mapping) and _is_google_rpc_status(payload) and order_id is None:
         body_kind = "status-no-order-id"
         code = payload.get("code")
         rpc_code = code if isinstance(code, int) else None
+    elif isinstance(payload, Mapping):
+        executions = payload.get("executions")
+        if isinstance(executions, list) and executions == []:
+            body_kind = "empty-executions"
+        elif isinstance(executions, list) and executions:
+            body_kind = "executions-present"
+        else:
+            body_kind = "unexpected-shape"
     else:
         body_kind = "unexpected-shape"
     rpc_code_str = "none" if rpc_code is None else str(rpc_code)
     return (
         f"status={response.status} body_kind={body_kind} "
-        f"rpc_code={rpc_code_str} body_len={body_len}"
+        f"rpc_code={rpc_code_str} body_len={body_len} "
+        f"state={_state_detail_token(payload)} cum={_cum_detail_token(payload)}"
     )
 
 
@@ -632,6 +687,7 @@ def classify_create_order_outcome(
     status = int(response.status)
     payload = _parse_json_object(response.body)
     order_id = _response_order_id(payload) if payload is not None else None
+    detail = _body_detail(response, payload, order_id)
 
     if (
         400 <= status < 500
@@ -651,6 +707,7 @@ def classify_create_order_outcome(
             cumulative_fee=None,
             fee_reconciled=False,
             generate_submitted=False,
+            detail=detail,
         )
 
     if status == 200 and payload is not None and order_id is not None:
@@ -676,6 +733,7 @@ def classify_create_order_outcome(
                     cumulative_fee=cumulative_fee,
                     fee_reconciled=fee_reconciled,
                     generate_submitted=True,
+                    detail=detail,
                 )
         executions = payload.get("executions")
         terminal = _terminal_state(payload)
@@ -698,6 +756,7 @@ def classify_create_order_outcome(
                 cumulative_fee=None,
                 fee_reconciled=False,
                 generate_submitted=True,
+                detail=detail,
             )
 
     return CreateOrderOutcome(
@@ -712,7 +771,7 @@ def classify_create_order_outcome(
         cumulative_fee=None,
         fee_reconciled=False,
         generate_submitted=order_id is not None,
-        detail=_ambiguous_detail(response, payload, order_id),
+        detail=detail,
     )
 
 

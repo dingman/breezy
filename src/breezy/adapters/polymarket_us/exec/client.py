@@ -1626,6 +1626,17 @@ class PolymarketUSExecutionClient(LiveExecutionClient):
             account_id=self._issued_account_id,
             ts_init=now_ns,
         )
+        classified_line = (
+            f"create-order classified kind={outcome.kind} {outcome.detail} "
+            f"client_order_id={order.client_order_id.value}"
+        )
+        if outcome.kind == submit_chain.KIND_AMBIGUOUS:
+            self._log.error(classified_line)
+        else:
+            # E0-NOSEND allowlists `_log.error` / `_log.warning` on this
+            # coroutine, not `_log.info`. WARNING is the closest permitted
+            # level for a non-AMBIGUOUS classified line.
+            self._log.warning(classified_line)
         retire_name = outcome.retirement_name
         if (
             outcome.kind == submit_chain.KIND_ACCEPT_FILL
@@ -1747,7 +1758,7 @@ class PolymarketUSExecutionClient(LiveExecutionClient):
         self._refuse(submit_chain.AMBIGUOUS_REASON)
         self._log.error(submit_chain.AMBIGUOUS_REASON)
         # `outcome.detail` is redacted (shape and length only, never body
-        # content) by `submit_chain._ambiguous_detail` -- safe to log even
+        # content) by `submit_chain._body_detail` -- safe to log even
         # though the response it summarises may be adversarial.
         if outcome.detail is not None:
             self._log.error(
