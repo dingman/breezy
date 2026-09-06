@@ -522,6 +522,44 @@ def _bankers_cent(value: Decimal) -> Decimal | None:
         return None
 
 
+def _amount_raw_string(amount: object) -> str | None:
+    """The venue's original Amount.value string, or ``None`` if absent."""
+    if isinstance(amount, Mapping):
+        raw = amount.get("value")
+    else:
+        raw = amount
+    if raw is None:
+        return None
+    return raw if isinstance(raw, str) else str(raw)
+
+
+def _per_leg_commission_raw(item: Mapping[str, Any]) -> str:
+    collected = item.get("commissionNotionalCollected")
+    if isinstance(collected, Mapping):
+        raw_value = collected.get("value")
+    else:
+        raw_value = collected
+    return str(raw_value)
+
+
+def _commission_raw_audit(
+    execution: Mapping[str, Any],
+    *,
+    payload: Mapping[str, Any] | None = None,
+) -> str:
+    """Order-level total raw when present, else joined per-leg raws."""
+    order = execution.get("order")
+    if isinstance(order, Mapping):
+        total_raw = _amount_raw_string(order.get("commissionNotionalTotalCollected"))
+        if total_raw is not None:
+            return total_raw
+    if payload is not None:
+        fill_type = _fill_type_executions(payload)
+        if fill_type:
+            return "+".join(_per_leg_commission_raw(item) for item in fill_type)
+    return _per_leg_commission_raw(execution)
+
+
 def _cumulative_fee_and_reconciliation(
     payload: Mapping[str, Any],
     execution: Mapping[str, Any],
@@ -536,7 +574,10 @@ def _cumulative_fee_and_reconciliation(
     equalities; the set is widened, never relaxed to a tolerance. The
     quantity identity alone catches a dropped leg (the sum falls short of
     ``cumulative_qty``), so the absent-total branch needs no extra condition.
-    ``cumulative_fee`` is the unrounded per-leg sum when reconciled.
+    ``cumulative_fee`` is the unrounded per-leg sum when reconciled on the
+    exact or absent-total branch. On the bankers branch the cash paid IS
+    the order-level total (what the venue billed); the exact legs live on
+    the raw audit string.
     """
     fill_type = _fill_type_executions(payload)
     leg_qty = _sum_last_shares(fill_type)
@@ -561,6 +602,8 @@ def _cumulative_fee_and_reconciliation(
         else:
             branch = "none"
         logger.info("i1a fee_reconciled=%s branch=%s", fee_reconciled, branch)
+        if fee_reconciled and bankers_match:
+            return order_total, True
         if fee_reconciled:
             return leg_fee, True
         return order_total, False
@@ -573,6 +616,7 @@ def fill_generation(
     instrument: object,
     account_id: object,
     ts_init: int,
+    payload: Mapping[str, Any] | None = None,
 ) -> FillGeneration | None:
     try:
         report = parse_fill_report(
@@ -587,18 +631,13 @@ def fill_generation(
     filled_cost = _filled_cost_from_execution(execution)
     if filled_cost is None:
         return None
-    collected = execution.get("commissionNotionalCollected")
-    if isinstance(collected, Mapping):
-        raw_value = collected.get("value")
-    else:
-        raw_value = collected
     return FillGeneration(
         venue_order_id=report.venue_order_id,
         trade_id=report.trade_id,
         last_qty=report.last_qty,
         last_px=report.last_px,
         commission=report.commission,
-        commission_raw=str(raw_value),
+        commission_raw=_commission_raw_audit(execution, payload=payload),
         ts_event=int(report.ts_event),
         filled_cost_usd=filled_cost,
     )
@@ -694,7 +733,11 @@ def classify_create_order_outcome(
         execution = _durable_execution(payload)
         if execution is not None:
             fill = fill_generation(
-                execution, instrument=instrument, account_id=account_id, ts_init=ts_init
+                execution,
+                instrument=instrument,
+                account_id=account_id,
+                ts_init=ts_init,
+                payload=payload,
             )
             if fill is not None:
                 cumulative_qty, cumulative_cost = _cumulative_qty_and_cost(execution)
