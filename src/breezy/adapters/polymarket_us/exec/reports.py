@@ -80,12 +80,22 @@ never performs binary float arithmetic.
 
 Native ``Money`` rounds to the currency precision in silence -- measured:
 ``Money(Decimal("0.3125"), USD)`` is ``Money(0.31, USD)`` and
-``Money(Decimal("0.005"), USD)`` is ``Money(0.01, USD)``. Every money value is
-therefore checked against ``USD.precision`` with ``_assert_representable``
-BEFORE the constructor sees it, and refused if it would change. A sub-cent
-commission is a refusal, not a rounding: if the venue really does bill below
-the cent, that is a modelling decision for the increment that observes it, not
-something this module should absorb by quietly dropping the remainder.
+``Money(Decimal("0.005"), USD)`` is ``Money(0.01, USD)``, and that second
+mode is NOT banker's. Fill ``commissionNotionalCollected`` is therefore
+banker's-rounded to ``USD.precision`` (the venue rule) BEFORE the constructor
+sees it, then checked with ``_assert_representable``. The original venue
+string is logged when rounding changes the value (and, on the submit path,
+stored as ``commission_raw``). A non-zero raw fee that books as ``0.00`` is
+a warning, not a silent zero. Prices, quantities, and every other USD amount
+still refuse extra precision -- a sub-tick price is a refusal, not a
+rounding. ``_assert_representable`` itself is unchanged.
+
+L-2 unit: unit before = venue Amount.value USD notional (unbounded decimal
+string); unit after (FillReport/OrderFilled.commission) = Money(USD) at
+precision 2, bankers-rounded; equal because both are USD notional -- the
+only change is the native Money quantum, which cannot carry sub-cents.
+unit after (DurableFillRecord.cumulative_fee) = same Decimal notional as
+before, unrounded.
 
 Prices go through the SAME guard whether the native field wants a ``Price`` or
 a ``Decimal``. ``OrderStatusReport.avg_px`` is typed ``Decimal | None``, which
@@ -116,7 +126,7 @@ from __future__ import annotations
 
 import logging
 from collections.abc import Mapping, Sequence
-from decimal import ROUND_DOWN, Decimal
+from decimal import ROUND_DOWN, ROUND_HALF_EVEN, Decimal, InvalidOperation
 from typing import Any, Final, NamedTuple
 
 from nautilus_trader.core.uuid import UUID4
@@ -644,6 +654,50 @@ def _quantize_balance_field(value: Decimal, *, precision: int) -> tuple[Decimal,
     return quantised, quantised != value
 
 
+def _quantize_commission_field(
+    value: Decimal,
+    *,
+    precision: int = USD.precision,
+    field: str = "commissionNotionalCollected",
+) -> Decimal:
+    """Quantize a fill commission with the venue's banker's rule.
+
+    The input is an untrusted venue decimal: ``InvalidOperation`` (extreme
+    exponent, more digits than the context precision) is mapped into
+    ``ExecutionReportMappingError`` so it cannot escape the classifier.
+    """
+    quantum = Decimal(1).scaleb(-precision)
+    try:
+        return value.quantize(quantum, rounding=ROUND_HALF_EVEN)
+    except InvalidOperation:
+        raise ExecutionReportMappingError(
+            f"Field {field!r} cannot be represented at precision {precision}"
+        ) from None
+
+
+def _usd_commission(value: Decimal, *, field: str, raw: str) -> Money:
+    """Build fill ``Money`` after explicit bankers rounding, never via ``Money``."""
+    booked = _quantize_commission_field(value, precision=USD.precision, field=field)
+    try:
+        raw_decimal = Decimal(raw)
+        nonzero_raw = raw_decimal != 0
+    except InvalidOperation:
+        nonzero_raw = True
+    changed = booked != value
+    if booked == 0 and nonzero_raw:
+        logger.warning(
+            "fill commission raw=%s booked=%s; non-zero venue fee rounded to zero",
+            raw,
+            format(booked, ".2f"),
+        )
+    elif changed:
+        logger.info("fill commission raw=%s booked=%s", raw, format(booked, ".2f"))
+    representable = _assert_representable(
+        booked, precision=USD.precision, field=field, error=ExecutionReportMappingError
+    )
+    return Money(representable, USD)
+
+
 def _parse_account_balance(
     payload: object, *, context: str
 ) -> tuple[AccountBalance, int]:
@@ -852,6 +906,27 @@ def parse_fill_report(
 
     _assert_taker_fill(execution, context=context)
 
+    commission_payload = _require(
+        execution, "commissionNotionalCollected", context=context
+    )
+    commission_dec = _parse_amount(
+        commission_payload,
+        field=f"{context}.commissionNotionalCollected",
+        error=ExecutionReportMappingError,
+    )
+    raw_value = (
+        commission_payload.get("value")
+        if isinstance(commission_payload, Mapping)
+        else commission_payload
+    )
+    if isinstance(raw_value, bool) or not isinstance(
+        raw_value, (str, int, float, Decimal)
+    ):
+        raise ExecutionReportMappingError(
+            f"{context} field 'commissionNotionalCollected.value' must be a "
+            f"number or numeric string, got {type(raw_value).__name__}"
+        )
+
     return FillReport(
         account_id=account_id,
         instrument_id=instrument.id,
@@ -862,9 +937,10 @@ def parse_fill_report(
             execution, "lastShares", instrument=instrument, context=context
         ),
         last_px=_price_field(execution, "lastPx", instrument=instrument, context=context),
-        commission=_usd_money(
-            _amount_field(execution, "commissionNotionalCollected", context=context),
+        commission=_usd_commission(
+            commission_dec,
             field=f"{context}.commissionNotionalCollected",
+            raw=str(raw_value),
         ),
         liquidity_side=LiquiditySide.TAKER,
         report_id=report_id,

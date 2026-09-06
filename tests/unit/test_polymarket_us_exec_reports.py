@@ -48,7 +48,9 @@ Siblings: the decode and the balances mapper are in
 
 from __future__ import annotations
 
-from decimal import Decimal
+import decimal
+import logging
+from decimal import Decimal, InvalidOperation
 from typing import Any
 
 import pytest
@@ -328,18 +330,125 @@ def test_unknown_execution_key_is_refused(
         )
 
 
-def test_sub_cent_commission_is_refused_rather_than_rounded(
+def _parse_fill_with_commission(
+    execution: dict[str, Any],
+    instrument: BinaryOption,
+    value: str | float,
+) -> Any:
+    return parse_fill_report(
+        {
+            **execution,
+            "commissionNotionalCollected": {"value": value, "currency": "USD"},
+        },
+        instrument=instrument,
+        account_id=ACCOUNT_ID,
+        report_id=REPORT_ID,
+        ts_init=TS_INIT,
+    )
+
+
+def test_sub_cent_commission_is_bankers_rounded_not_silently_altered_by_money(
     execution: dict[str, Any], instrument: BinaryOption
 ) -> None:
-    """``Money`` rounds to the currency precision without a word. We refuse."""
-    with pytest.raises(ExecutionReportMappingError):
-        parse_fill_report(
-            {**execution, "commissionNotionalCollected": {"value": "0.3125", "currency": "USD"}},
-            instrument=instrument,
-            account_id=ACCOUNT_ID,
-            report_id=REPORT_ID,
-            ts_init=TS_INIT,
+    """``Money(0.005, USD)`` is ``0.01``; venue bankers is ``0.00``. We take the venue rule."""
+    assert Money(Decimal("0.005"), USD) == Money(Decimal("0.01"), USD)
+    report = _parse_fill_with_commission(execution, instrument, "0.005")
+    assert report.commission == Money(0, USD)
+    already_cent = _parse_fill_with_commission(execution, instrument, "0.3125")
+    assert already_cent.commission == Money(Decimal("0.31"), USD)
+
+
+@pytest.mark.parametrize(
+    ("raw", "booked"),
+    [
+        ("0.004", "0.00"),
+        ("0.005", "0.00"),
+        ("0.0049", "0.00"),
+        ("0", "0.00"),
+        ("0.015", "0.02"),
+        ("0.03", "0.03"),
+        ("0.012096", "0.01"),
+    ],
+)
+def test_parse_fill_report_sub_cent_commission_is_bankers_rounded(
+    execution: dict[str, Any],
+    instrument: BinaryOption,
+    raw: str,
+    booked: str,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    caplog.set_level(logging.INFO, logger="breezy.adapters.polymarket_us.exec.reports")
+    report = _parse_fill_with_commission(execution, instrument, raw)
+    assert report.commission == Money(Decimal(booked), USD)
+    rounded = Decimal(raw) != Decimal(booked)
+    raw_nonzero = Decimal(raw) != 0
+    booked_zero = Decimal(booked) == 0
+    if rounded:
+        assert raw in caplog.text
+        assert booked in caplog.text
+    if booked_zero and raw_nonzero:
+        assert any(record.levelno == logging.WARNING for record in caplog.records)
+    elif not rounded:
+        assert not any(
+            record.levelno == logging.INFO and "commission" in record.getMessage().lower()
+            for record in caplog.records
         )
+
+
+def test_zero_raw_fee_books_zero_without_l25_warning(
+    execution: dict[str, Any],
+    instrument: BinaryOption,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    caplog.set_level(logging.WARNING, logger="breezy.adapters.polymarket_us.exec.reports")
+    report = _parse_fill_with_commission(execution, instrument, "0")
+    assert report.commission == Money(0, USD)
+    assert not any(record.levelno == logging.WARNING for record in caplog.records)
+
+
+def test_nonzero_raw_rounding_to_zero_emits_l25_warning(
+    execution: dict[str, Any],
+    instrument: BinaryOption,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    caplog.set_level(logging.WARNING, logger="breezy.adapters.polymarket_us.exec.reports")
+    report = _parse_fill_with_commission(execution, instrument, "0.004")
+    assert report.commission == Money(0, USD)
+    assert any(record.levelno == logging.WARNING for record in caplog.records)
+    assert "0.004" in caplog.text
+
+
+def test_quantize_commission_matches_fee_model_bankers() -> None:
+    from breezy.adapters.polymarket_us.exec.reports import _quantize_commission_field
+    from breezy.adapters.polymarket_us.fees import _round_bankers
+
+    for raw in ("0.004", "0.005", "0.025", "0.035"):
+        value = Decimal(raw)
+        assert _quantize_commission_field(value) == _round_bankers(value, USD)
+
+
+def test_numeric_commission_value_is_booked_via_str_coercion(
+    execution: dict[str, Any], instrument: BinaryOption
+) -> None:
+    report = _parse_fill_with_commission(execution, instrument, 0.004)
+    assert report.commission == Money(0, USD)
+
+
+@pytest.mark.parametrize(
+    "raw",
+    [
+        "1" + "0" * (decimal.getcontext().prec + 40),
+        "1E+999999",
+    ],
+)
+def test_pathological_commission_raises_mapping_error_not_invalid_operation(
+    execution: dict[str, Any], instrument: BinaryOption, raw: str
+) -> None:
+    with pytest.raises(ExecutionReportMappingError):
+        try:
+            _parse_fill_with_commission(execution, instrument, raw)
+        except InvalidOperation:
+            pytest.fail("InvalidOperation escaped parse_fill_report")
 
 
 def test_fill_missing_the_commission_is_refused_not_zeroed(

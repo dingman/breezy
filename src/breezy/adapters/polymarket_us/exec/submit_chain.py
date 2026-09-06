@@ -10,10 +10,11 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import re
 from collections.abc import Mapping
 from dataclasses import dataclass
-from decimal import Decimal, InvalidOperation
+from decimal import ROUND_HALF_EVEN, Decimal, InvalidOperation
 from typing import Any, Final, cast
 
 from nautilus_trader.core.uuid import UUID4
@@ -25,6 +26,8 @@ from nautilus_trader.model.objects import Money, Price, Quantity
 from breezy.adapters.polymarket_us.errors import ExecutionReportMappingError, VenueTransportError
 from breezy.adapters.polymarket_us.exec.reports import parse_fill_report
 from breezy.adapters.polymarket_us.transport import VenueResponse
+
+logger = logging.getLogger(__name__)
 
 KIND_ACCEPT_FILL: Final[str] = "accept_fill"
 KIND_ZERO_FILL: Final[str] = "zero_fill"
@@ -112,6 +115,7 @@ class FillGeneration:
     last_qty: Quantity
     last_px: Price
     commission: Money
+    commission_raw: str
     ts_event: int
     filled_cost_usd: Decimal
 
@@ -511,6 +515,52 @@ def _order_total_commission(execution: Mapping[str, Any]) -> Decimal | None:
     return None
 
 
+def _bankers_cent(value: Decimal) -> Decimal | None:
+    """Venue fee quantum: banker's rounding to $0.01. Two exact ``==`` only."""
+    try:
+        return value.quantize(Decimal("0.01"), rounding=ROUND_HALF_EVEN)
+    except InvalidOperation:
+        return None
+
+
+def _amount_raw_string(amount: object) -> str | None:
+    """The venue's original Amount.value string, or ``None`` if absent."""
+    if isinstance(amount, Mapping):
+        raw = amount.get("value")
+    else:
+        raw = amount
+    if raw is None:
+        return None
+    return raw if isinstance(raw, str) else str(raw)
+
+
+def _per_leg_commission_raw(item: Mapping[str, Any]) -> str:
+    collected = item.get("commissionNotionalCollected")
+    if isinstance(collected, Mapping):
+        raw_value = collected.get("value")
+    else:
+        raw_value = collected
+    return str(raw_value)
+
+
+def _commission_raw_audit(
+    execution: Mapping[str, Any],
+    *,
+    payload: Mapping[str, Any] | None = None,
+) -> str:
+    """Order-level total raw when present, else joined per-leg raws."""
+    order = execution.get("order")
+    if isinstance(order, Mapping):
+        total_raw = _amount_raw_string(order.get("commissionNotionalTotalCollected"))
+        if total_raw is not None:
+            return total_raw
+    if payload is not None:
+        fill_type = _fill_type_executions(payload)
+        if fill_type:
+            return "+".join(_per_leg_commission_raw(item) for item in fill_type)
+    return _per_leg_commission_raw(execution)
+
+
 def _cumulative_fee_and_reconciliation(
     payload: Mapping[str, Any],
     execution: Mapping[str, Any],
@@ -520,9 +570,15 @@ def _cumulative_fee_and_reconciliation(
     """I1a fee + ``fee_reconciled``.
 
     ``fee_reconciled`` = (sum of fill-type ``lastShares`` == ``cumulative_qty``)
-    AND (order total absent, OR order total == the per-leg fill-type sum). The
+    AND (order total absent, OR order total == the per-leg fill-type sum,
+    OR order total == bankers_cent(per-leg sum)). Two exact ``==``
+    equalities; the set is widened, never relaxed to a tolerance. The
     quantity identity alone catches a dropped leg (the sum falls short of
     ``cumulative_qty``), so the absent-total branch needs no extra condition.
+    ``cumulative_fee`` is the unrounded per-leg sum when reconciled on the
+    exact or absent-total branch. On the bankers branch the cash paid IS
+    the order-level total (what the venue billed); the exact legs live on
+    the raw audit string.
     """
     fill_type = _fill_type_executions(payload)
     leg_qty = _sum_last_shares(fill_type)
@@ -532,8 +588,26 @@ def _cumulative_fee_and_reconciliation(
     )
     order_total = _order_total_commission(execution)
     if order_total is not None:
-        fee_reconciled = qty_reconciled and leg_fee is not None and order_total == leg_fee
-        return order_total, fee_reconciled
+        exact_match = leg_fee is not None and order_total == leg_fee
+        rounded_leg = _bankers_cent(leg_fee) if leg_fee is not None else None
+        bankers_match = (
+            not exact_match
+            and rounded_leg is not None
+            and order_total == rounded_leg
+        )
+        fee_reconciled = qty_reconciled and (exact_match or bankers_match)
+        if fee_reconciled and exact_match:
+            branch = "exact"
+        elif fee_reconciled and bankers_match:
+            branch = "bankers"
+        else:
+            branch = "none"
+        logger.info("i1a fee_reconciled=%s branch=%s", fee_reconciled, branch)
+        if fee_reconciled and bankers_match:
+            return order_total, True
+        if fee_reconciled:
+            return leg_fee, True
+        return order_total, False
     return leg_fee, qty_reconciled and leg_fee is not None
 
 
@@ -543,6 +617,7 @@ def fill_generation(
     instrument: object,
     account_id: object,
     ts_init: int,
+    payload: Mapping[str, Any] | None = None,
 ) -> FillGeneration | None:
     try:
         report = parse_fill_report(
@@ -563,6 +638,7 @@ def fill_generation(
         last_qty=report.last_qty,
         last_px=report.last_px,
         commission=report.commission,
+        commission_raw=_commission_raw_audit(execution, payload=payload),
         ts_event=int(report.ts_event),
         filled_cost_usd=filled_cost,
     )
@@ -714,7 +790,11 @@ def classify_create_order_outcome(
         execution = _durable_execution(payload)
         if execution is not None:
             fill = fill_generation(
-                execution, instrument=instrument, account_id=account_id, ts_init=ts_init
+                execution,
+                instrument=instrument,
+                account_id=account_id,
+                ts_init=ts_init,
+                payload=payload,
             )
             if fill is not None:
                 cumulative_qty, cumulative_cost = _cumulative_qty_and_cost(execution)
