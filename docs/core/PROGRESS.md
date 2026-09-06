@@ -58,7 +58,7 @@ Merged analysis, evidence and unlock observables: `docs/evidence/GO_LIVE_BLOCKER
 |---|---|---|---|---|
 | GL-1 | B | CRIT | Sync IOC zero-fill classified AMBIGUOUS → DEGRADE + OPEN intent (`submit_chain.py:680-701` wants `state`/`cumQuantity` the documented `{id,executions}` body lacks); 09-05 SFO. Classify documented empty-executions as ZERO_FILL, log `body_kind` | M |
 | GL-2 | B | CRIT | Sub-cent taker fee fails `_assert_representable` (`reports.py:86-88,865-868`) → `fill_generation` None → a REAL fill is AMBIGUOUS and unbooked | S |
-| GL-3 | B | CRIT | `observation_ambiguous` consumes the station-day (`strategy.py:455-463`); spec rev2 §1b:84 says skip, do not consume. MIA/MDW consumed at window-open 09-05 and 09-06. Strategy-lead conformance ruling, then RED→GREEN | S |
+| GL-3 | B | CRIT | `observation_ambiguous` consumes the station-day (`strategy.py:455-463`). RULED conformance fix (`codex_gl3_ambiguous_consume_ruling_2026-09-06.md`): skip-without-consume for ambiguous and non-executable; `observation_unavailable` stays latched; two mis-pinned strategy tests to correct. RED→GREEN | S |
 | GL-4 | B | HIGH | One AMBIGUOUS burns the rest of the day: latch OPEN until operator (`client.py:1747-1758`), `_has_durable_fill_record` stub (`:730-733`). Auto-retire after a no-order probe | M |
 | GL-5 | B | CRIT | WS reconnect storm: 09-05 189/241/281 five-second gaps per station window, 1673 reconnects → every afternoon uncovered under §9 any-overlap (`data.py:1685,1812`, `websocket.py`). 09-06 instance clean so far | L |
 | GL-6 | B | MED | v2 tally 15:30Z drops the structural-dead pin ("UNAVAILABLE token refused, required MATCH"): node launches 16:50Z, so the binding report never evaluates the KILL rule | S |

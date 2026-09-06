@@ -82,5 +82,6 @@ broken, which only delays.
 1. GL-7: **skip** (operator). The supervisor and node stay in the uncapped
    scope; the SV-1 fix stays inactive until some later relaunch.
 2. GL-10: **deprioritised** (operator). Alerts stay log-only for now.
-3. GL-3: **build-side determination** (operator). Ruling requested from the
-   strategy lead; recorded below when it lands.
+3. GL-3: **build-side determination** (operator). Strategy-lead ruling
+   landed 19:55Z: CONFORMANCE fix, no amendment, no contamination —
+   `codex_gl3_ambiguous_consume_ruling_2026-09-06.md`.
