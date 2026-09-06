@@ -14,25 +14,14 @@ OPEN items only. Rationale L-5; pre-shrink copy in `docs/core/archive/`.
 
 ---
 
+
 ## Operator control contract (set 2026-08-30) — BINDING
 
-The operator reserves exactly **two** controls; every other engineering
-decision is delegated to the build side:
-
-1. **Maximum daily budget.**
-2. **Maximum per POSITION** — explicitly *not* per weather market.
-
-**Values are not yet supplied and MUST be obtained before any live enablement.**
-
-Two consequences that are not optional (tracked by P4):
-
-- **The daily-budget control has no home.** `RiskLimits` (`risk.py:47-62`) has
-  no time dimension; nothing enforces a daily notional or loss ceiling.
-- **The per-position knob silently detunes the rest.** `max_event_notional`
-  (1000) / `max_location_notional` (2000) are absolute dollars; only
-  `max_equity_fraction` scales. No portfolio-wide `max_total_notional` exists.
-
----
+Two reserved controls: **maximum daily budget** and **maximum per POSITION**
+(not per market). Values supplied 09-04 and live only in the launch shell,
+never on disk; present by NAME in the running supervisor/node environment
+(verified 09-06) and enforced per grant by `DailySpendLedger.authorize_order_cost`
+(`operator_controls.py:299-373`). Everything else is build-side.
 
 ## Standing verdicts that gate future work
 
@@ -54,7 +43,7 @@ Two consequences that are not optional (tracked by P4):
 
 ---
 
-## BACKLOG — selected for execution (opened 2026-08-31)
+## BACKLOG — selected for execution (opened 2026-09-06): GO-LIVE BLOCKERS
 
 **Binding constraints on EVERY item in this file.** No item may: set
 `allow_short=True`; weaken `BacktestOrderGuard` or any settlement invariant;
@@ -63,14 +52,30 @@ egress firewall; or invent an operator-reserved value. Every increment carries
 an **L-1 null-hypothesis verdict** citing installed source under
 `.venv/lib/python3.13/site-packages/nautilus_trader/` first.
 
----
+Merged analysis, evidence and unlock observables: `docs/evidence/GO_LIVE_BLOCKERS_2026-09-06.md`. Owner B = build, O = operator.
+
+| ID | Own | Sev | Blocker (evidence in the doc) | Size |
+|---|---|---|---|---|
+| GL-1 | B | CRIT | Sync IOC zero-fill classified AMBIGUOUS → DEGRADE + OPEN intent (`submit_chain.py:680-701` wants `state`/`cumQuantity` the documented `{id,executions}` body lacks); 09-05 SFO. Classify documented empty-executions as ZERO_FILL, log `body_kind` | M |
+| GL-2 | B | CRIT | Sub-cent taker fee fails `_assert_representable` (`reports.py:86-88,865-868`) → `fill_generation` None → a REAL fill is AMBIGUOUS and unbooked | S |
+| GL-3 | B | CRIT | `observation_ambiguous` consumes the station-day (`strategy.py:455-463`); spec rev2 §1b:84 says skip, do not consume. MIA/MDW consumed at window-open 09-05 and 09-06. Strategy-lead conformance ruling, then RED→GREEN | S |
+| GL-4 | B | HIGH | One AMBIGUOUS burns the rest of the day: latch OPEN until operator (`client.py:1747-1758`), `_has_durable_fill_record` stub (`:730-733`). Auto-retire after a no-order probe | M |
+| GL-5 | B | CRIT | WS reconnect storm: 09-05 189/241/281 five-second gaps per station window, 1673 reconnects → every afternoon uncovered under §9 any-overlap (`data.py:1685,1812`, `websocket.py`). 09-06 instance clean so far | L |
+| GL-6 | B | MED | v2 tally 15:30Z drops the structural-dead pin ("UNAVAILABLE token refused, required MATCH"): node launches 16:50Z, so the binding report never evaluates the KILL rule | S |
+| GL-7 | O | HIGH | Supervisor 2231261 + node in uncapped `tmux-spawn-d35977dd` scope (9.3 GB, 398 tasks, swap full). Relaunch the supervisor from a host-lifetime shell with the seven values outside 16:40–17:10Z; also activates SV-1 fix `c84317e` | S |
+| GL-8 | B | MED | Instrument set frozen at 16:50 compose (`composition.py:116-150`), discovery reload clamped 21600 s: late-listed HIGH rungs never subscribed | M |
+| GL-9 | B | MED | Fill→ScoredTrial chain never run on real data (`record_fill` branch unexecuted, store has no parquet). Synthetic 200+fill body through the live chain in a test, then confirm on first fill | M |
+| GL-10 | O/B | MED | Alerts log-only (no `BREEZY_ALERT_WEBHOOK_URL` in the supervisor env): DEGRADED/AMBIGUOUS invisible until the next session | S |
+| GL-11 | B | LOW | Recorder OOM 09-04 (14.4 GB) / SIGKILL 09-05 at MemoryHigh predate the deque fix; 09-06 peak 914 MB. Watch | — |
+
+**KILL clock:** D0=09-05, counter 0 (09-05 uncovered). At 4 covered/day with 0 fills the 15th lands ~09-09/09-10; zero-fill and retired-AMBIGUOUS takes are not trials. GL-1..3 must land before the first clean covered cluster.
+
+Verified NOT blockers 09-06: exec client connected + reconciled, balances 97.91, permit issued, caps/enablement present, OP-SEQ control CLOSED (GTC only), obs feed live, 24 rungs subscribed, rotation 09:00Z outside every window.
 
 ### Clock-speed track (opened 2026-09-04)
-Time-to-verdict = independent station-days × take rate; one city on two venues is ONE weather event (Kalshi settles on The Weather Company, not the NWS CLI). Rulings: `docs/evidence/grok_*_2026-09-04.md`.
-- **[HIGH] Kalshi sibling family on NEW stations** — plan `docs/plans/KALSHI_CRH_EXPANSION_PLAN_2026-09-04.md` Rev 3 (converged); PREREG draft `docs/specs/PREREG_v1_kalshi_current_rung_hold_DRAFT_2026-09-04.md`. 18/19 candidates pass temp cadence; KDEN excluded unless live 5-min resumes; KHOU archive hole. Open: S4 registry (in flight), S5–S7 read path, S8 per-station CLI-final-vs-TWC reconciliation (n≥90, Wilson-lower >0.99), S9 rev2 cells + `parse_metar_t_group` 4-digit fix (v1 table untouched). **Operator-only, critical path:** Kalshi account/KYC/eligibility/funding/API key (S11); fee-schedule PDF via a browser or first-fill θ derivation.
-- **PREREG v2 REGISTERED 2026-09-05** (`4975fba`; spec BINDING §13, manifest `pm_us_crh_v2` d0=2026-09-05, v2 tally timer 15:30 UTC, n=0). C1–C4 and the admission exclusions ACKNOWLEDGED by the strategy lead (`grok_admission_exclusions_ack_2026-09-05.md`, `0f095b3`); Kalshi sibling stays DRAFT.
-- **[LOW] Recorder salvage** de-dup relies on per-instance non-overlap (asserted). [LOW] commission `0.0111` exceeds price precision → `parse_fill_report` refuses → AMBIGUOUS (pre-existing; contract fixture adjusted).
-- Rejected by ruling: SPRT α=0.05, plug-in-π Z, freeze-π, shadow/paper/archive/Kalshi rows in live n, retroactive scoring, `venue` column/stratum, qty>1, NYC, pooling venues.
+- **[HIGH] Kalshi sibling family on NEW stations** — plan `docs/plans/KALSHI_CRH_EXPANSION_PLAN_2026-09-04.md` Rev 3; PREREG draft `docs/specs/PREREG_v1_kalshi_current_rung_hold_DRAFT_2026-09-04.md`. Open: S4 registry (`wip/kalshi-s4-registry`), S5–S7 read path, S8 CLI-final-vs-TWC reconciliation (n≥90), S9 rev2 cells. **Operator-only:** Kalshi account/KYC/funding/API key (S11); fee schedule. Not prioritised until Polymarket.us fills (operator 09-04).
+- **PREREG v2 REGISTERED 2026-09-05** (`4975fba`; spec BINDING §13, manifest `pm_us_crh_v2` d0=2026-09-05, v2 tally 15:30Z, n=0). C1–C4 and exclusions ACKNOWLEDGED (`grok_admission_exclusions_ack_2026-09-05.md`). Rejected by ruling: SPRT α=0.05, plug-in-π Z, freeze-π, shadow/paper/archive/Kalshi rows in live n, retroactive scoring, `venue` stratum, qty>1, NYC, pooling venues.
+- [LOW] Recorder salvage de-dup relies on per-instance non-overlap (asserted).
 
 ## Carried forward — open, not selected for this batch
 
@@ -88,47 +93,26 @@ Time-to-verdict = independent station-days × take rate; one city on two venues 
 | CF-14b | DEFERRED | Per-market discovery isolation; reopen on a genuine 1-of-N CF-14a failure (`docs/plans/CF14_DISCOVERY_ISOLATION_2026-09-02.md`) |
 | CF-13 | UNPROVEN | No CCA/CCB CORRECTION seen live; supersession path fixture-covered only |
 | PF-1 | MED | Perf residue 09-06: book levels parsed 2×/frame (`parsing.py:591`); CRH `is_consumed` SQLite/tick; salvage `collect=True` on 486 MB file |
-| SV-1 | HIGH | 17:05Z self-check false NO_PERMIT: permit marker un-latched in drained log delta (`trade_supervisor.py:930`); fix pending restart |
+
 
 ### Programme sequence
 
-P1–P6 narrative moved to `docs/core/PROGRAMME_PATH.md` (size gate). Active P-work is tracked as backlog IDs above.
+P1–P6 narrative: `docs/core/PROGRAMME_PATH.md`. Active P-work is tracked as backlog IDs above.
 
 ### Blocked, with unlock condition
 
-**Venue access is NO LONGER GATED** (operator, 2026-09-01); G-13/G-15 (fee
-schedule discovery) are plain work items. Remaining blockers are technical:
-
 | ID | Item | Unlock |
 |---|---|---|
-| G-16 | ≥14 days of joined tape. K1 09-02: n=30, largest cell 8/96. **Kalshi prior `e97f392`: cheap-D-1 DEAD at ask ≥2c, 2023+, all 5 stations** (`docs/evidence/k1_kalshi_prior_2026-09-02.md`) | calendar |
+| G-16 | ≥14 days of joined tape. K1 09-02: n=30, largest cell 8/96. Kalshi prior `e97f392`: cheap-D-1 DEAD at ask ≥2c (`docs/evidence/k1_kalshi_prior_2026-09-02.md`) | calendar |
 | G-17 | Phase 1.5 premise GO/NO-GO | G-16. **NO-GO stops the programme.** |
 
-**Programme path and the stop-gate constraint:** see
-`docs/core/PROGRAMME_PATH.md` — why the stop gate is unsatisfiable by
-backtest on this venue, and the ordered path (K1 → capture → EXEC SPINE →
-forecast ingest → ~300 station-days → CAPACITY).
+EXEC SPINE: write path verified 09-04 (`docs/plans/OP_SEQ_BOT_POSITIVE_CONTROL_2026-09-04.md`); R-7 rules still open (`docs/plans/EXEC_SPINE_R65_R7_2026-09-02.md`): IOC zero-fill is terminal (now GL-1), ledger releases only on 4xx+Status+no `order.id`. Blind-risk-view audit residue (`docs/core/findings/BLIND_RISK_VIEWS_2026-09-02.md`): T-9 exit policy, T-6 stale docstring, `max_simultaneous_positions` unexercised; Nautilus cannot cancel an INITIALIZED order.
 
-**EXEC SPINE follow-ups:** `docs/plans/EXEC_SPINE_2026-09-01.md` §R-4
-"review amendments". Guard before R-9: divides by zero for an unpriced
-forward; settlement-as-exit bypasses `_submit_order`'s refusal latch.
-**Write path VERIFIED 09-04** (R-6.5a..R-7 landed `4f76137..02bfd63`; OP-SEQ live positive control `CLOSED_YES_BOTH_VERBS`, `docs/plans/OP_SEQ_BOT_POSITIVE_CONTROL_2026-09-04.md`; `WRITE_CANONICAL_STRING_VERIFIED=True`; blocking controls: sealed order permit, 10h live-trading permit, caps, exact-`"1"` enablement). Grok builds, Claude verifies.
-R-7 rules still open (`docs/plans/EXEC_SPINE_R65_R7_2026-09-02.md`): authorization is the write closure's first positional; caps re-read per call; ledger releases only on 4xx+Status+no `order.id`; IOC zero-fill is terminal (R-7 brief converged); native inflight resolution DECLINED. The R-4 standing refusal stays until R-7 lands.
-
-**Open from the blind-risk-view audit** (`docs/core/findings/BLIND_RISK_VIEWS_2026-09-02.md`):
-T-9 exit policy (Grok: hold to settlement, entry-only halt, cancel working buys
-at met lock, never dump into a 0.3-lot bid); T-6 stale node_config docstring;
-`max_simultaneous_positions`
-unexercised end-to-end. Nautilus cannot cancel an INITIALIZED order.
-
-**[VERDICT] NO FAMILY HAS A PROVEN EDGE; ONE IS UNDER LIVE MEASUREMENT.**
-Forecast family KILLED; post-lock lock family REFUTED ×3 (L-9); K1 DEAD ≥2c (`docs/evidence/grok_*_2026-09-02.md`). **M_A**: the pre-lock afternoon window IS offered. **M_B** (kill n≥60 / survive n≥150, `grok_mb_kill_amendment_2026-09-02.md`): 09-04 run n_taken=2 (both 09-01, both lost); 09-02 VENUE-NEVER-LISTED, 09-03 lost to the recorder outage. **Live family** = lags 30/45, NYC excluded, interval rule (`grok_live_small_spec_rev2_2026-09-04.md`); accrues via `breezy-mb-daily.timer` 13:30Z + `breezy-live-tally.timer` 14:30Z (09-04 tally n=0). The venue skips ~9% of station-days (`MISSING_COHORT_2026-09-02_2026-09-03.md`). M_B's kill rule binds the family; the plumbing is no longer parked (operator 09-04).
-**LIVE since 2026-09-04 17:54 UTC** (`BREEZY-L001`; supervisor pid 2231261 since 09-06 01:08Z on the fixed self-check code, launches 16:50Z daily, `docs/plans/R8_OPERATOR_RUNBOOK.md`; [LOW] its start line prints twice — stdout and file logger share the log). Permit audit visible since `f85a452`. OPEN:
-- **First live order 09-05 20:19Z (SFO IOC @0.28) → AMBIGUOUS; venue shows no order/fill/position** (`docs/evidence/venue/polymarket_us/AMBIGUOUS_ORDER_2026-09-05_SFO/`). Intent RETIRED 01:08Z (OPERATOR_CLEARED, `no-order-exists`). n=0. Ruled 09-06 (`docs/evidence/codex_prereg_v2_rulings_2026-09-06.md`): zero-fill IOC and retired-AMBIGUOUS takes are takes, not trials (no n/k/S/I effect); `unresolved_takes.jsonl` never feeds the tally.
-- **[HIGH] Structural-dead KILL automated `c21f9bf`**. Ruled 09-06: "covered" = recorder capture only (PREREG v2 §9); adding node liveness/permit/intent state is a §12 screen and is forbidden. Consequence: node-down or intent-blocked afternoons count toward the 15 — node uptime every listed afternoon is now a KILL-avoidance requirement. 09-06 14:15Z read: all four 09-05 station-days NOT covered (resolved QuoteTapeGap).
-- Whole-tape paper replay `7e44abd` (`~/.local/share/breezy/derived/paper_replay/`): 12/12 CLEAN, 14 station-days, take **6/14 per arm**, 13 BLOCKED, NO VERDICT. Report still pooled `12/14`; regen feasible since 09-06 (n=1 80 s / 674 MB); run capped in a quiet window, never before 16:50Z.
+**[VERDICT] NO FAMILY HAS A PROVEN EDGE; ONE IS UNDER LIVE MEASUREMENT.** Forecast family KILLED; lock family REFUTED ×3 (L-9); K1 DEAD ≥2c. M_B (kill n≥60 / survive n≥150): 09-04 n_taken=2, both lost. Live family = lags 30/45, NYC excluded, interval rule (`grok_live_small_spec_rev2_2026-09-04.md`); tallies 13:30Z/14:15Z/14:30Z/15:30Z. Venue skips ~9% of station-days.
+**LIVE since 2026-09-04 17:54 UTC** (`BREEZY-L001`; supervisor pid 2231261 since 09-06 01:08Z, launches 16:50Z daily, `docs/plans/R8_OPERATOR_RUNBOOK.md`; [LOW] start line prints twice). Live: 8 listed afternoons, take 1 (SFO 09-05 → AMBIGUOUS, retired), fill 0, n=0.
+- Whole-tape paper replay `7e44abd`: 12/12 CLEAN, take **6/14 per arm**, 13 BLOCKED, NO VERDICT; regen feasible since 09-06 (n=1 80 s / 674 MB), run capped in a quiet window, never before 16:50Z.
 - [LOW] `BREEZY-NWS` SubscribeData ERROR is cosmetic; recorder `887d2005` CORRUPT (6 truncated).
-- Clock: 4 cities × 0.91 listed × take 0.25–0.43 ⇒ 0.9–1.6 trials/day; n=60 KILL 38–66 d. Kalshi S11 (KYC/funding/key) remains the only station lever and is operator-only.
+- Clock: 4 cities × 0.91 listed × take 0.25–0.43 ⇒ 0.9–1.6 trials/day; n=60 KILL 38–66 d. Kalshi S11 is the only station lever and is operator-only.
 
 ---
 
