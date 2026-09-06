@@ -1241,3 +1241,17 @@ Before concluding from an absent log line, prove the line CAN appear: find the e
 
 ### How to apply
 Boot-time audit lines go through a logger with its own handler attached before anything else runs (`breezy.app.trade.boot`, `f85a452`). An enabled-but-unminted node exits non-zero instead of running silently. Agents briefing from logs state the emitter and handler for any negative claim.
+
+## L-31 — A loop over `catalog.instruments()` runs once per republished definition, not once per instrument (2026-09-06)
+
+### What happened
+The whole-tape paper replay was recorded on 09-06 as "driver memory unbounded, ~0.5 GB/min" after a regeneration was SIGTERMed at 2.8 GB. Profiling that morning found the dominant cost was not loading: `_load_clean_instance` iterated `catalog.instruments()`, which yields one row per RECORDED definition, and the recorder republishes definitions on every reconnect — 210 rows for 60 ids over 2 climate days on one instance. Each row triggered `_select_capture_instruments`, which reloads that day's entire quote and depth set (~3 s), so a single instance never reached replay inside 600 s. The memory growth was a second, independent defect: every CLEAN instance's quotes/depths stayed alive after winner selection (~2 KiB per depth row).
+
+### Why this is binding
+Two different mechanisms were filed under one symptom because the symptom ("grows then dies") was described instead of measured. A per-row loop over a republished table is quadratic in tape length and hides behind any catalog helper that looks like a per-instrument call.
+
+### The rule
+Treat `catalog.instruments()` (and any Nautilus catalog listing of definitions) as a multiset: dedupe by instrument id or by the key you actually iterate on BEFORE doing per-row work, and count the calls into the selector in a test. A "memory" report on a driver needs the retained-object slope (objects at N vs 2N) and the call count of the heaviest helper, not an RSS-over-time description.
+
+### How to apply
+`whole_tape_paper_replay._load_clean_instance` selects once per unique climate day and `release_non_winner_tape` clears non-winner lists; `test_load_clean_instance_selects_capture_instruments_once_per_unique_climate_day` pins the call count. The same shape (per-prefix restart of a sequential recursion) was found in the group-sequential boundary replay the same day and fixed with `_iter_boundary_looks` (120 → 15 convolutions, bit-identical).

@@ -78,16 +78,16 @@ Time-to-verdict = independent station-days × take rate; one city on two venues 
 |---|---|---|
 | CF-1 | OPEN | Non-uniform record counts (28/28/28/30/38); extra MDW/LAX an unverified inference |
 | CF-2 | MED | `never_substitute` in `registry/sites.toml` has no consumer |
-| CF-3 | MED | Unbounded whole-catalog reads per lookup (`persistence/catalog.py:693`) |
 | CF-4 | MED | `is_record` parsed, never persisted; `tmax_flag` `None` on record days. Not a settlement defect |
 | CF-5b | MED | Route chronic `UNREADABLE` (CF-5, `71ad992`) through `AlertState`, not a bare per-poll WARNING |
 | CF-6 | MED | `tests/live/test_nws_live_ingest.py:86` hardcodes a personal contact; use a role address |
 | CF-7 | MED | `BREEZY_USER_AGENT` required on offline paths (`SharedIngestState.__init__`) |
-| CF-8 | MED | Sibling-station products unmarked in integrity index; wasted fetches |
+| CF-8 | MED | Sibling products never `observe()`d (`nws_actor.py:1161`); refetched every poll |
 | BL-10 | LOW | `forecast_mispricing/decision.py:71` pre-signal `quote_tradable` refusal is invisible to BL-8's counter (family KILLED; moot until revived) |
 | CF-11 | LOW | `ruff format --check`: 31 unformatted files; not in any gate |
 | CF-14b | DEFERRED | Per-market discovery isolation; reopen only when the CF-14a tally (`2aa1e7f`) shows a genuine 1-of-N failure (`docs/plans/CF14_DISCOVERY_ISOLATION_2026-09-02.md`) |
 | CF-13 | UNPROVEN | No CCA/CCB CORRECTION seen live; supersession path fixture-covered only |
+| PF-1 | MED | Perf residue 09-06: book levels parsed 2×/frame (`parsing.py:591`); CRH `is_consumed` SQLite per tick; salvage `collect=True` on 486 MB file |
 
 ### Programme sequence
 
@@ -125,7 +125,7 @@ Forecast family KILLED; post-lock lock family REFUTED ×3 (L-9); K1 DEAD ≥2c (
 **LIVE since 2026-09-04 17:54 UTC** (`BREEZY-L001`; supervisor pid 2231261 since 09-06 01:08Z on the fixed self-check code, launches 16:50Z daily, `docs/plans/R8_OPERATOR_RUNBOOK.md`; [LOW] its start line prints twice — stdout and file logger share the log). Permit audit visible since `f85a452`. OPEN:
 - **First live order 09-05 20:19Z (SFO IOC @0.28) → AMBIGUOUS; venue shows no order/fill/position** (`docs/evidence/venue/polymarket_us/AMBIGUOUS_ORDER_2026-09-05_SFO/`). Intent RETIRED 01:08Z (OPERATOR_CLEARED, `no-order-exists`). n=0. Ruled 09-06 (`docs/evidence/codex_prereg_v2_rulings_2026-09-06.md`): zero-fill IOC and retired-AMBIGUOUS takes are takes, not trials (no n/k/S/I effect); `unresolved_takes.jsonl` never feeds the tally.
 - **[HIGH] Structural-dead KILL automated `c21f9bf`**. Ruled 09-06: "covered" = recorder capture only (PREREG v2 §9); adding node liveness/permit/intent state is a §12 screen and is forbidden. Consequence: node-down or intent-blocked afternoons count toward the 15 — node uptime every listed afternoon is now a KILL-avoidance requirement. Counter is D0..today; first non-zero read expected 09-06 14:15Z. Grok balance still 402 at 03:20Z 09-06; Codex quota restored.
-- Whole-tape paper replay `7e44abd` (`~/.local/share/breezy/derived/paper_replay/`): 12/12 CLEAN, 14 station-days, take **6/14 per arm**, 13 BLOCKED, NO VERDICT. Report still pooled `12/14`: 09-06 regen SIGTERMed at 2.8 GB RSS after 5 min (~0.5 GB/min, swap full) — [LOW] driver memory unbounded; rerun only memory-capped in a quiet window, never before a 16:50Z launch.
+- Whole-tape paper replay `7e44abd` (`~/.local/share/breezy/derived/paper_replay/`): 12/12 CLEAN, 14 station-days, take **6/14 per arm**, 13 BLOCKED, NO VERDICT. Report still pooled `12/14`; regen feasible since 09-06 (n=1 80 s / 674 MB); run capped in a quiet window, never before 16:50Z.
 - [MED] strategies subscribe all 24 instruments; [LOW] `BREEZY-NWS` SubscribeData ERROR is cosmetic; recorder `7f353f94` salvage unverified, `887d2005` CORRUPT.
 - Clock: 4 cities × 0.91 listed × take 0.25–0.43 ⇒ 0.9–1.6 trials/day; n=60 KILL 38–66 d. Kalshi S11 (KYC/funding/key) remains the only station lever and is operator-only.
 
