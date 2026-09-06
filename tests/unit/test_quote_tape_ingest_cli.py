@@ -44,22 +44,26 @@ from nautilus_trader.model.identifiers import InstrumentId, Symbol, Venue
 from nautilus_trader.model.instruments import BinaryOption
 from nautilus_trader.model.objects import Price, Quantity
 from nautilus_trader.persistence.catalog.parquet import ParquetDataCatalog
+from nautilus_trader.persistence.funcs import class_to_filename
 from nautilus_trader.serialization.arrow.serializer import ArrowSerializer
 from nautilus_trader.test_kit.providers import TestInstrumentProvider
 
+from breezy.persistence.feather_preflight import inspect_feather_file, salvage_feather_file
 from breezy.runtime.quote_tape_ingest_cli import (
     CONVERTED,
     CONVERTED_NOTHING_NEW,
+    DEFAULT_DATA_TYPES,
     DEFAULT_LIVE_GRACE_MINUTES,
     EXIT_OK,
     EXIT_USAGE,
+    MARKER_PREFIX,
     default_convert,
     ingest_instance,
     run,
     run_ingest,
 )
-from breezy.persistence.feather_preflight import salvage_feather_file
 from breezy.runtime.quote_tape_preflight_cli import CATALOG_ENV_VAR
+from breezy.runtime.quote_tape_salvage import salvage_truncated_instance
 from tests.contract.test_quote_tape_unclean_shutdown import (
     INSTANCE_ID as _SIGKILL_INSTANCE_ID,
 )
@@ -267,6 +271,187 @@ class TestAlreadyConvertedTypesAreSkipped:
         )
 
         assert results[0].outcome == "converted"
+        assert results[0].type_results[0].outcome == "skipped-already-converted"
+        assert calls == []
+
+    def test_run_ingest_does_not_open_feathers_when_every_type_is_already_converted(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A fully-converted instance's frozen bytes must not be re-streamed.
+
+        ``scan_instance`` still walks every record batch even with
+        ``collect=False``. Periodic ingest therefore re-read gigabytes of
+        already-converted feather until this skip landed.
+        """
+        instance_dir = tmp_path / "live" / INSTANCE
+        for data_cls in DEFAULT_DATA_TYPES:
+            name = class_to_filename(data_cls)
+            _touch(
+                tmp_path,
+                INSTANCE,
+                f"{name}_0.feather",
+                age_minutes=DEFAULT_LIVE_GRACE_MINUTES + 5,
+            )
+            (instance_dir / f"{MARKER_PREFIX}{name}").touch()
+
+        opened: list[Path] = []
+        real_inspect = inspect_feather_file
+
+        def spy_inspect(path: Path) -> Any:
+            opened.append(path)
+            return real_inspect(path)
+
+        monkeypatch.setattr(
+            "breezy.persistence.feather_preflight.inspect_feather_file", spy_inspect
+        )
+        calls: list[tuple[str, type]] = []
+
+        results = run_ingest(
+            tmp_path,
+            data_types=DEFAULT_DATA_TYPES,
+            service_active_probe=_never_active,
+            convert_fn=_recording_convert(calls),
+        )
+
+        assert opened == []
+        assert len(results) == 1
+        assert {result.outcome for result in results[0].type_results} == {
+            "skipped-already-converted"
+        }
+        assert calls == []
+
+    def test_run_ingest_still_scans_when_one_converted_marker_is_missing(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Missing a single marker must not inherit the fully-converted skip."""
+        instance_dir = tmp_path / "live" / INSTANCE
+        skipped = DEFAULT_DATA_TYPES[-1]
+        for data_cls in DEFAULT_DATA_TYPES:
+            name = class_to_filename(data_cls)
+            _touch(
+                tmp_path,
+                INSTANCE,
+                f"{name}_0.feather",
+                age_minutes=DEFAULT_LIVE_GRACE_MINUTES + 5,
+            )
+            if data_cls is not skipped:
+                (instance_dir / f"{MARKER_PREFIX}{name}").touch()
+
+        opened: list[Path] = []
+        real_inspect = inspect_feather_file
+
+        def spy_inspect(path: Path) -> Any:
+            opened.append(path)
+            return real_inspect(path)
+
+        monkeypatch.setattr(
+            "breezy.persistence.feather_preflight.inspect_feather_file", spy_inspect
+        )
+        calls: list[tuple[str, type]] = []
+
+        results = run_ingest(
+            tmp_path,
+            data_types=DEFAULT_DATA_TYPES,
+            service_active_probe=_never_active,
+            convert_fn=_recording_convert(calls),
+        )
+
+        assert opened, "an instance missing a marker must still be scanned"
+        assert len(results) == 1
+        outcomes = {result.data_cls: result.outcome for result in results[0].type_results}
+        assert outcomes[skipped] == "converted"
+        assert calls == [(INSTANCE, skipped)]
+
+    def test_run_ingest_still_scans_when_an_unrequested_type_is_unconverted(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A narrow data_types skip must not hide an unmarked sibling feather.
+
+        ``run_ingest(..., data_types=(QuoteTick,))`` used to treat
+        ``.converted-quote_tick`` as "fully converted" and skip
+        ``scan_instance``. An unrequested ``instrument_close_0.feather``
+        in the same instance was then never inspected, so truncation of
+        that file was neither reported nor salvaged.
+        """
+        instance_dir = tmp_path / "live" / INSTANCE
+        _touch(
+            tmp_path,
+            INSTANCE,
+            "quote_tick_0.feather",
+            age_minutes=DEFAULT_LIVE_GRACE_MINUTES + 5,
+        )
+        (instance_dir / f"{MARKER_PREFIX}{class_to_filename(QuoteTick)}").touch()
+
+        close_path = instance_dir / "instrument_close_0.feather"
+        _write_typed_ipc_stream(
+            close_path, [_quote_tick(i) for i in range(20)], QuoteTick, close=False
+        )
+        _truncate_tail(close_path)
+        stamp = time.time() - (DEFAULT_LIVE_GRACE_MINUTES + 5) * 60
+        os.utime(close_path, (stamp, stamp))
+
+        opened: list[Path] = []
+        real_inspect = inspect_feather_file
+
+        def spy_inspect(path: Path) -> Any:
+            opened.append(path)
+            return real_inspect(path)
+
+        monkeypatch.setattr(
+            "breezy.persistence.feather_preflight.inspect_feather_file", spy_inspect
+        )
+        calls: list[tuple[str, type]] = []
+
+        results = run_ingest(
+            tmp_path,
+            data_types=(QuoteTick,),
+            service_active_probe=_never_active,
+            convert_fn=_recording_convert(calls),
+        )
+
+        assert opened, "an unmarked unrequested type must still be scanned"
+        assert any(path.name == "instrument_close_0.feather" for path in opened)
+        assert len(results) == 1
+        assert results[0].outcome == "skipped-truncated"
+        assert calls == []
+
+    def test_run_ingest_skips_scan_only_when_every_present_feather_type_is_marked(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Skip the BL-23 walk only when every on-disk type is marked, even
+        if the caller requested a narrower ``data_types`` than is present.
+        """
+        instance_dir = tmp_path / "live" / INSTANCE
+        for name in ("quote_tick", "instrument_close"):
+            _touch(
+                tmp_path,
+                INSTANCE,
+                f"{name}_0.feather",
+                age_minutes=DEFAULT_LIVE_GRACE_MINUTES + 5,
+            )
+            (instance_dir / f"{MARKER_PREFIX}{name}").touch()
+
+        opened: list[Path] = []
+        real_inspect = inspect_feather_file
+
+        def spy_inspect(path: Path) -> Any:
+            opened.append(path)
+            return real_inspect(path)
+
+        monkeypatch.setattr(
+            "breezy.persistence.feather_preflight.inspect_feather_file", spy_inspect
+        )
+        calls: list[tuple[str, type]] = []
+
+        results = run_ingest(
+            tmp_path,
+            data_types=(QuoteTick,),
+            service_active_probe=_never_active,
+            convert_fn=_recording_convert(calls),
+        )
+
+        assert opened == []
+        assert len(results) == 1
         assert results[0].type_results[0].outcome == "skipped-already-converted"
         assert calls == []
 
@@ -844,3 +1029,98 @@ class TestATruncatedInstanceIsSalvagedNotDropped:
         matching = [tick for tick in landed if tick.ts_init == 1_000_000_000]
         assert len(matching) == 1, "the pre-landed row must not be duplicated"
         assert len(landed) == 1 + (recovered_count - 1)
+
+
+def _quote_tick(index: int) -> QuoteTick:
+    instrument = TestInstrumentProvider.default_fx_ccy("EUR/USD")
+    return QuoteTick(
+        instrument_id=instrument.id,
+        bid_price=Price.from_str("1.00000"),
+        ask_price=Price.from_str("1.00010"),
+        bid_size=Quantity.from_int(1),
+        ask_size=Quantity.from_int(1),
+        ts_event=1_000_000_000 + index,
+        ts_init=1_000_000_000 + index,
+    )
+
+
+def _mark_price(index: int) -> MarkPriceUpdate:
+    instrument = TestInstrumentProvider.default_fx_ccy("EUR/USD")
+    return MarkPriceUpdate(
+        instrument_id=instrument.id,
+        value=Price.from_str("1.00000"),
+        ts_event=1_000_000_000 + index,
+        ts_init=1_000_000_000 + index,
+    )
+
+
+def _write_typed_ipc_stream(
+    path: Path, objects: Sequence[Any], data_cls: type, *, close: bool
+) -> None:
+    """Write ``objects`` as one Arrow IPC stream the salvage path can read."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    first = ArrowSerializer.serialize_batch([objects[0]], data_cls=data_cls)
+    with path.open("wb") as handle:
+        writer = pa.ipc.new_stream(handle, first.schema)
+        for obj in objects:
+            piece = ArrowSerializer.serialize_batch([obj], data_cls=data_cls)
+            if isinstance(piece, pa.RecordBatch):
+                writer.write_batch(piece)
+            else:
+                writer.write_table(piece)
+        if close:
+            writer.close()
+
+
+def _truncate_tail(path: Path, *, drop_bytes: int = 64) -> None:
+    with path.open("r+b") as handle:
+        handle.truncate(path.stat().st_size - drop_bytes)
+
+
+class TestSalvageIsolatesATypeWithNoArrowWrangler:
+    def test_salvage_isolates_a_type_with_no_arrow_wrangler_and_continues(
+        self, tmp_path: Path, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """A wrangler-None type must not abort salvage of a sibling file.
+
+        ``ArrowSerializer._deserialize_rust`` raises ``NotImplementedError``
+        for ``MarkPriceUpdate`` (Rust wrangler is ``None``). That used to
+        escape ``_ISOLATED_ERRORS`` and take down the whole ingest unit.
+        """
+        instance_dir = tmp_path / "live" / INSTANCE
+        quote_path = instance_dir / "quote_tick_0.feather"
+        mark_path = instance_dir / "mark_price_update_0.feather"
+        _write_typed_ipc_stream(
+            quote_path, [_quote_tick(i) for i in range(20)], QuoteTick, close=False
+        )
+        _write_typed_ipc_stream(
+            mark_path, [_mark_price(i) for i in range(20)], MarkPriceUpdate, close=False
+        )
+        _truncate_tail(quote_path)
+        _truncate_tail(mark_path)
+
+        quote_report = inspect_feather_file(quote_path)
+        mark_report = inspect_feather_file(mark_path)
+        assert quote_report.is_truncated
+        assert mark_report.is_truncated
+        assert quote_report.rows > 0
+
+        catalog = ParquetDataCatalog(str(tmp_path))
+        with caplog.at_level(logging.ERROR, logger="breezy.runtime.quote_tape_salvage"):
+            salvage_truncated_instance(
+                catalog,
+                instance_dir,
+                INSTANCE,
+                (MarkPriceUpdate, QuoteTick),
+                (mark_report, quote_report),
+            )
+
+        landed = catalog.query(data_cls=QuoteTick)
+        assert len(landed) > 0
+        assert (instance_dir / f".salvaged-{quote_path.name}").is_file()
+        assert not (instance_dir / f".salvaged-{mark_path.name}").is_file()
+
+        messages = " ".join(record.getMessage() for record in caplog.records)
+        assert "NotImplementedError" in messages
+        assert "skipped" in messages
+        assert "mark_price_update" in messages

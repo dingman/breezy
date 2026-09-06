@@ -89,11 +89,20 @@ signals or restarts the recorder.
 
 Truncation refusal
 ------------------
-Before converting, every instance not classified live is run through the
-BL-23 preflight (:func:`breezy.persistence.feather_preflight.scan_instance`).
-Any truncated or unreadable file anywhere under the instance refuses the
-WHOLE instance, logged with a reason -- never a silent partial conversion of
-whatever else happened to be intact.
+Before converting, every instance not classified live AND not already
+fully converted is run through the BL-23 preflight
+(:func:`breezy.persistence.feather_preflight.scan_instance`). Fully
+converted means every requested ``data_types`` entry AND every feather
+physically present under the instance has a ``.converted-<type>``
+marker (present types are derived from the recorder's
+``<class_to_filename>_<n>.feather`` names). A narrower ``data_types``
+argument therefore cannot hide an unmarked sibling file. Converted
+bytes are frozen and truncated instances never receive those markers, so
+skipping the scan does not change liveness or truncation semantics -- it
+avoids re-streaming gigabytes of already-landed feather on every timer
+tick. Any truncated or unreadable file anywhere under the instance
+refuses the WHOLE instance, logged with a reason -- never a silent
+partial conversion of whatever else happened to be intact.
 
 Idempotency
 -----------
@@ -195,6 +204,46 @@ def _marker_path(instance_dir: Path, data_cls: type) -> Path:
 
 def _is_marked_converted(instance_dir: Path, data_cls: type) -> bool:
     return _marker_path(instance_dir, data_cls).is_file()
+
+
+def _data_cls_for_feather(
+    instance_dir: Path, path: Path, known_types: Sequence[type]
+) -> type | None:
+    """Map a recorder feather path to its data class via ``class_to_filename``.
+
+    The recorder writes either a flat ``<class_to_filename>_<n>.feather``
+    or a per-instrument ``<class_to_filename>/...`` tree -- the same two
+    layouts ``StreamingFeatherWriter`` uses. ``None`` means the name is
+    unknown and the caller must scan.
+    """
+    try:
+        rel_parts = path.resolve().relative_to(instance_dir.resolve()).parts
+    except ValueError:
+        return None
+    if not rel_parts:
+        return None
+    for data_cls in known_types:
+        name = class_to_filename(data_cls)
+        if rel_parts[0] == name or rel_parts[-1].startswith(f"{name}_"):
+            return data_cls
+    return None
+
+
+def _instance_is_fully_converted(instance_dir: Path, data_types: Sequence[type]) -> bool:
+    """True when every requested type AND every on-disk feather type is marked.
+
+    A narrower ``data_types`` argument must not hide an unmarked sibling
+    file: any feather whose type is unmarked, or whose name maps to no
+    known type, is scanned as before.
+    """
+    if not all(_is_marked_converted(instance_dir, data_cls) for data_cls in data_types):
+        return False
+    known_types = tuple(dict.fromkeys((*data_types, *DEFAULT_DATA_TYPES)))
+    for path in iter_feather_files(instance_dir):
+        matched = _data_cls_for_feather(instance_dir, path, known_types)
+        if matched is None or not _is_marked_converted(instance_dir, matched):
+            return False
+    return True
 
 
 def _mark_converted(instance_dir: Path, data_cls: type) -> None:
@@ -621,6 +670,30 @@ def run_ingest(
             )
             continue
 
+        instance_dir = _instance_dir(catalog_root, instance_id, subdirectory)
+        if _instance_is_fully_converted(instance_dir, data_types):
+            # Converted bytes are frozen; truncated instances never earn these
+            # markers. Skip the BL-23 rescan so periodic ingest does not
+            # re-stream every already-converted feather file. Requires a
+            # marker for every requested type AND every type physically
+            # present under the instance.
+            if dry_run:
+                results.append(
+                    _dry_run_preview(catalog_root, instance_id, subdirectory, data_types)
+                )
+            else:
+                results.append(
+                    ingest_instance(
+                        catalog,
+                        catalog_root,
+                        instance_id,
+                        subdirectory,
+                        data_types,
+                        convert_fn=convert_fn,
+                    )
+                )
+            continue
+
         try:
             preflight_report = scan_instance(catalog_root, instance_id, subdirectory)
         except PreflightError as exc:
@@ -637,7 +710,7 @@ def run_ingest(
             if not dry_run and preflight_report.truncated:
                 salvage_truncated_instance(
                     catalog,
-                    _instance_dir(catalog_root, instance_id, subdirectory),
+                    instance_dir,
                     instance_id,
                     data_types,
                     preflight_report.truncated,

@@ -20,8 +20,11 @@ Two safety properties, both load-bearing:
   ``ingest_instance`` already gives an ordinary ``ValueError`` from
   ``convert_stream_to_data``. Caught narrowly: ``ValueError`` (deserialisation
   or non-disjoint-interval refusal), ``pyarrow.ArrowInvalid`` (a salvaged
-  table that still fails a later Arrow operation), and ``OSError`` (the
-  file vanishing or becoming unreadable between preflight and salvage). A
+  table that still fails a later Arrow operation), ``OSError`` (the
+  file vanishing or becoming unreadable between preflight and salvage), and
+  ``NotImplementedError`` (``ArrowSerializer._deserialize_rust`` when the
+  type's Rust wrangler is ``None`` -- measured for ``MarkPriceUpdate``,
+  also ``InstrumentClose`` / ``IndexPriceUpdate``). A
   ``MemoryError``/``RecursionError`` is deliberately NOT caught here, for the
   same reason ``_read_streamed`` does not catch it: it says nothing about
   this file and everything about the process.
@@ -70,9 +73,15 @@ SALVAGE_MARKER_PREFIX = ".salvaged-"
 #: Exceptions isolated to the ONE truncated file that raised them. Mirrors
 #: ``ingest_instance``'s own ``except ValueError`` isolation, widened to the
 #: failure modes salvage can hit that a plain conversion cannot: a salvaged
-#: table that still fails a later Arrow operation, or the file vanishing
-#: between preflight and salvage.
-_ISOLATED_ERRORS: tuple[type[BaseException], ...] = (ValueError, pa.ArrowInvalid, OSError)
+#: table that still fails a later Arrow operation, the file vanishing
+#: between preflight and salvage, or a type whose Arrow wrangler is ``None``
+#: (``ArrowSerializer._deserialize_rust`` raises ``NotImplementedError``).
+_ISOLATED_ERRORS: tuple[type[BaseException], ...] = (
+    ValueError,
+    pa.ArrowInvalid,
+    OSError,
+    NotImplementedError,
+)
 
 
 def _salvage_marker_path(instance_dir: Path, file_path: Path) -> Path:
