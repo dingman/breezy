@@ -18,18 +18,21 @@ config-level refusal, not the primary mechanism.
 FIRST-EXECUTABLE-SNAPSHOT selection (blueprint correction, Grok rev 2 over
 rev 1; ``mb_current_rung_edge_study.py:545-551``)
 --------------------------------------------------------------------------
-Per station-day, THE trial is the first quote, in the ``[12:00,17:00)`` LST
-window, on an instrument that COULD be the current rung (``running_max.lower_f``
-falls inside that instrument's own closed ``[lower_f, upper_f]`` facts -- the
-same lower-bound resolution ``evaluate_decision`` itself uses against the full
-ladder, so an ambiguous ``RunningMax`` spanning two rungs is still evaluated,
-never pre-filtered away), with ``0.05 < ask < 0.95`` and displayed size
-``>= 1``. That one quote is
-evaluated through :func:`evaluate_decision` exactly ONCE and the verbatim
-outcome (``"taken"`` or the refusal reason) is durably recorded to the
-trial-day latch before this station-day is ever looked at again --
-``on_quote_tick`` checks ``latch.is_consumed`` first, unconditionally, on
-every call.
+Per station-day, THE trial is the first UNAMBIGUOUS executable quote, in
+the ``[12:00,17:00)`` LST window, on an instrument that COULD be the
+current rung (``running_max.lower_f`` falls inside that instrument's own
+closed ``[lower_f, upper_f]`` facts -- the same lower-bound resolution
+``evaluate_decision`` itself uses against the full ladder, so an
+ambiguous ``RunningMax`` spanning two rungs is still evaluated, never
+pre-filtered away), with ``0.05 < ask < 0.95`` and displayed size
+``>= 1``. That one quote is evaluated through :func:`evaluate_decision`
+exactly ONCE and the verbatim outcome (``"taken"`` or the refusal
+reason) is durably recorded to the trial-day latch before this
+station-day is ever looked at again -- ``on_quote_tick`` checks
+``latch.is_consumed`` first, unconditionally, on every call. An
+``observation_ambiguous`` or non-executable snapshot does not consume:
+it is counted (ambiguous) or diagnosed (non-executable) and the latch
+stays open for a later unambiguous executable candidate.
 
 Restricting candidacy to the ladder's CURRENTLY-active-rung instrument (not
 any subscribed instrument) mirrors the archive study reading its lagged
@@ -117,7 +120,11 @@ from breezy.strategy.current_rung_hold.decision import (
     evaluate_decision,
 )
 from breezy.strategy.current_rung_hold.trial_day_latch import TrialDayLatch
-from breezy.strategy.weather_common.refusals import RefusalAlerter, RefusalCounter
+from breezy.strategy.weather_common.refusals import (
+    OBSERVATION_AMBIGUOUS,
+    RefusalAlerter,
+    RefusalCounter,
+)
 from breezy.strategy.weather_common.running_extreme import RunningExtremeAccumulator
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
@@ -452,6 +459,10 @@ class CurrentRungHoldStrategy(Strategy):
                 latch_consumed=False,
             )
             decision = evaluate_decision(inputs)
+        if isinstance(decision, Refuse) and decision.reason == OBSERVATION_AMBIGUOUS:
+            self.refusals.record(decision.reason)
+            self._report_refusal_change()
+            return
         reason = decision.reason if isinstance(decision, Refuse) else "taken"
         self._latch.consume(
             station,
