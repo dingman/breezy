@@ -61,7 +61,7 @@ import uuid
 from collections import deque
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
-from typing import Any, Final, Protocol, runtime_checkable
+from typing import Any, Final, Protocol, cast, runtime_checkable
 
 from nautilus_trader.cache.cache import Cache
 from nautilus_trader.common.component import LiveClock, MessageBus
@@ -545,10 +545,36 @@ def _walk_structure(
     value_types: dict[str, str],
     safe_values: dict[str, str],
 ) -> None:
+    # Shape diagnostic: sequences contribute only the first element.
     paths.append(prefix)
-    value_types[prefix] = type(value).__name__
-    if isinstance(value, str | int | float | bool) or value is None:
+    value_type = type(value)
+    value_types[prefix] = value_type.__name__
+    if value_type is str:
+        safe_values[prefix] = cast(str, value)
+        return
+    if value_type is int or value_type is float or value_type is bool or value is None:
         safe_values[prefix] = str(value)
+        return
+    if value_type is dict:
+        for key, child in cast(dict[Any, Any], value).items():
+            _walk_structure(
+                child,
+                prefix=f"{prefix}.{key}",
+                paths=paths,
+                value_types=value_types,
+                safe_values=safe_values,
+            )
+        return
+    if value_type is list:
+        typed_list = cast(list[Any], value)
+        if typed_list:
+            _walk_structure(
+                typed_list[0],
+                prefix=f"{prefix}[0]",
+                paths=paths,
+                value_types=value_types,
+                safe_values=safe_values,
+            )
         return
     if isinstance(value, Mapping):
         for key, child in value.items():
@@ -560,34 +586,14 @@ def _walk_structure(
                 safe_values=safe_values,
             )
         return
-    if isinstance(value, Sequence) and not isinstance(value, str | bytes | bytearray):
-        for index, child in enumerate(value):
-            _walk_structure(
-                child,
-                prefix=f"{prefix}[{index}]",
-                paths=paths,
-                value_types=value_types,
-                safe_values=safe_values,
-            )
-
-
-def _find_slug_paths(payload: Mapping[str, Any], slugs: set[str]) -> tuple[str, ...]:
-    paths: list[str] = []
-
-    def walk(value: object, *, prefix: str) -> None:
-        if isinstance(value, str) and value in slugs:
-            paths.append(prefix)
-            return
-        if isinstance(value, Mapping):
-            for key, child in value.items():
-                walk(child, prefix=f"{prefix}.{key}" if prefix else str(key))
-            return
-        if isinstance(value, Sequence) and not isinstance(value, str | bytes | bytearray):
-            for index, child in enumerate(value):
-                walk(child, prefix=f"{prefix}[{index}]")
-
-    walk(payload, prefix="")
-    return tuple(paths)
+    if isinstance(value, Sequence) and not isinstance(value, bytes | bytearray) and value:
+        _walk_structure(
+            value[0],
+            prefix=f"{prefix}[0]",
+            paths=paths,
+            value_types=value_types,
+            safe_values=safe_values,
+        )
 
 
 def diagnose_frame_payload(payload: Mapping[str, Any], slugs: Sequence[str]) -> FrameDiagnostic:
@@ -603,13 +609,19 @@ def diagnose_frame_payload(payload: Mapping[str, Any], slugs: Sequence[str]) -> 
             value_types=value_types,
             safe_values=safe_values,
         )
+    slug_set = set(slugs)
+    slug_bearing_keys = tuple(
+        path
+        for path, stored in safe_values.items()
+        if value_types.get(path) == "str" and stored in slug_set
+    )
     return FrameDiagnostic(
         frame_class=_classify_frame(payload),
         keys=tuple(sorted(str(key) for key in payload)),
         structure_paths=tuple(sorted(structure_paths)),
         value_types=value_types,
         safe_values=safe_values,
-        slug_bearing_keys=_find_slug_paths(payload, set(slugs)),
+        slug_bearing_keys=slug_bearing_keys,
     )
 
 
