@@ -77,7 +77,7 @@ import argparse
 import hashlib
 import json
 import sys
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Iterator, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Final
@@ -157,6 +157,89 @@ def _tail_probs(
     return total, upper, lower
 
 
+def _look_step(
+    t: float,
+    prev_t: float,
+    grid: np.ndarray | None,
+    dens: np.ndarray | None,
+    target: float,
+    npts: int,
+    halfwidth_sd: float,
+) -> tuple[float, float, np.ndarray | None, np.ndarray | None, float]:
+    """Advance the joint-density recursion by one look.
+
+    Returns Brownian-scale `(b_eff, b_fut)`, the truncated `(grid, dens)` to
+    carry forward, and `t` as the next `prev_t`. A tie (`dt == 0`) yields a
+    degenerate CONTINUE-forced boundary and leaves the density unchanged.
+    """
+    dt = t - prev_t
+    if dt < 0.0:
+        raise ValueError("t_history must be non-decreasing (a strict decrease is a wiring defect)")
+    if dt == 0.0:
+        return float("inf"), float("-inf"), grid, dens, t
+
+    hw = max(6.0, halfwidth_sd * np.sqrt(t))
+    newgrid = np.linspace(-hw, hw, npts)
+    if grid is None or dens is None:
+        newdens = norm.pdf(newgrid, 0.0, np.sqrt(t))
+    else:
+        newdens = _convolve_density(grid, dens, newgrid, dt)
+
+    _total, upper, lower = _tail_probs(newgrid, newdens)
+
+    def cross_eff(
+        b: float, upper: Callable[[float], float] = upper, target: float = target
+    ) -> float:
+        return upper(b) - target
+
+    def cross_fut(
+        b: float, lower: Callable[[float], float] = lower, target: float = target
+    ) -> float:
+        return lower(b) - target
+
+    b_eff = brentq(cross_eff, newgrid[0], newgrid[-1], xtol=BRENTQ_XTOL)
+    b_fut = brentq(cross_fut, newgrid[0], newgrid[-1], xtol=BRENTQ_XTOL)
+    mask = (newgrid > b_fut) & (newgrid < b_eff)
+    return b_eff, b_fut, newgrid, newdens * mask, t
+
+
+def _iter_boundary_looks(
+    t_history: Sequence[float],
+    alpha: float,
+    *,
+    is_terminal: bool,
+    npts: int = GRID_NPTS,
+    halfwidth_sd: float = GRID_HALFWIDTH_SD,
+) -> Iterator[tuple[float, float]]:
+    """Yield Z-scale `(b_eff, b_fut)` at each look, carrying density forward.
+
+    `is_terminal=True` retargets only the LAST look to remaining alpha.
+    Arbitrary live `t_history` still starts from t=0 on every call; equal-t
+    table builders consume this generator once instead of restarting.
+    """
+    if not t_history:
+        raise ValueError("t_history must be non-empty")
+    target_cum = [one_sided_spend(t, alpha) for t in t_history]
+    incr = np.diff(np.concatenate(([0.0], target_cum)))
+
+    grid: np.ndarray | None = None
+    dens: np.ndarray | None = None
+    prev_t = 0.0
+    n_looks = len(t_history)
+    for idx, t in enumerate(t_history):
+        is_last = idx == n_looks - 1
+        if is_terminal and is_last:
+            prev_natural_cum = target_cum[idx - 1] if idx > 0 else 0.0
+            target = alpha - prev_natural_cum
+        else:
+            target = incr[idx]
+        b_eff, b_fut, grid, dens, prev_t = _look_step(
+            t, prev_t, grid, dens, target, npts, halfwidth_sd
+        )
+        z_scale = np.sqrt(t)
+        yield b_eff / z_scale, b_fut / z_scale
+
+
 def boundary_for(
     t_history: Sequence[float],
     alpha: float = DEFAULT_ALPHA,
@@ -177,62 +260,14 @@ def boundary_for(
     (`t_k == t_{k-1}`) is a valid zero-increment look with a degenerate
     CONTINUE-forced boundary; only a strict decrease raises.
     """
-    if not t_history:
+    result: tuple[float, float] | None = None
+    for result in _iter_boundary_looks(
+        t_history, alpha, is_terminal=is_terminal, npts=npts, halfwidth_sd=halfwidth_sd
+    ):
+        pass
+    if result is None:
         raise ValueError("t_history must be non-empty")
-    target_cum = [one_sided_spend(t, alpha) for t in t_history]
-    incr = np.diff(np.concatenate(([0.0], target_cum)))
-
-    grid = None
-    dens = None
-    prev_t = 0.0
-    b_eff = b_fut = 0.0
-    for idx, t in enumerate(t_history):
-        dt = t - prev_t
-        if dt < 0.0:
-            raise ValueError(
-                "t_history must be non-decreasing (a strict decrease is a wiring defect)"
-            )
-
-        if dt == 0.0:
-            # Tie guard: zero new information -- valid look, zero increment,
-            # degenerate CONTINUE-forced boundary (nothing can cross); grid
-            # and dens carry over unchanged (nothing to convolve at dt=0).
-            b_eff, b_fut = float("inf"), float("-inf")
-            prev_t = t
-            continue
-
-        hw = max(6.0, halfwidth_sd * np.sqrt(t))
-        newgrid = np.linspace(-hw, hw, npts)
-        if idx == 0:
-            newdens = norm.pdf(newgrid, 0.0, np.sqrt(t))
-        else:
-            newdens = _convolve_density(grid, dens, newgrid, dt)
-
-        _total, upper, lower = _tail_probs(newgrid, newdens)
-        is_last = idx == len(t_history) - 1
-
-        if is_terminal and is_last:
-            prev_natural_cum = target_cum[idx - 1] if idx > 0 else 0.0
-            target = alpha - prev_natural_cum
-        else:
-            target = incr[idx]
-
-        def cross_eff(b: float, upper=upper, target=target) -> float:
-            return upper(b) - target
-
-        def cross_fut(b: float, lower=lower, target=target) -> float:
-            return lower(b) - target
-
-        b_eff = brentq(cross_eff, newgrid[0], newgrid[-1], xtol=BRENTQ_XTOL)
-        b_fut = brentq(cross_fut, newgrid[0], newgrid[-1], xtol=BRENTQ_XTOL)
-
-        mask = (newgrid > b_fut) & (newgrid < b_eff)
-        dens = newdens * mask
-        grid = newgrid
-        prev_t = t
-
-    z_scale = np.sqrt(t_history[-1])
-    return b_eff / z_scale, b_fut / z_scale
+    return result
 
 
 @dataclass(frozen=True, slots=True)
@@ -263,14 +298,16 @@ class LookRow:
 def build_reference_table(
     alpha: float, n_max: int, look_step: int, i_max: float, *, truncate_at: int | None = None
 ) -> list[LookRow]:
-    """Regression-fixture table: `boundary_for` evaluated at the canonical
-    equally spaced t_k = n_k/n_max grid (n_k = look_step, 2*look_step, ...).
-    The LAST row in the (possibly truncated) table is always the terminal
-    look: it spends exactly the remaining alpha at its t_k, whether that is
-    the natural end of the 16-look schedule or an early stop via
-    `truncate_at` (binding ruling, `ca94177`) -- `alpha_spent_eff` and
-    `alpha_spent_fut` equal `alpha` there by construction, not merely by
-    approximation."""
+    """Regression-fixture table: one forward walk of the joint-density
+    recursion over the canonical equally spaced t_k = n_k/n_max grid
+    (n_k = look_step, 2*look_step, ...). Equivalent to `boundary_for` on
+    each growing prefix (with `is_terminal` only on the last look) but
+    carrying `(grid, dens, prev_t)` from look k to look k+1. The LAST row
+    in the (possibly truncated) table is always the terminal look: it spends
+    exactly the remaining alpha at its t_k, whether that is the natural end
+    of the 16-look schedule or an early stop via `truncate_at` (binding
+    ruling, `ca94177`) -- `alpha_spent_eff` and `alpha_spent_fut` equal
+    `alpha` there by construction, not merely by approximation."""
     if n_max % look_step != 0:
         raise ValueError("n_max must be a multiple of look_step")
     n_ks = list(range(look_step, n_max + 1, look_step))
@@ -284,10 +321,11 @@ def build_reference_table(
     cum_eff = 0.0
     cum_fut = 0.0
     prev_cum_target = 0.0
-    for idx, (n_k, t) in enumerate(zip(n_ks, ts, strict=True)):
-        history = ts[: idx + 1]
+    walked = _iter_boundary_looks(tuple(ts), alpha, is_terminal=True)
+    for idx, ((n_k, t), (b_eff, b_fut)) in enumerate(
+        zip(zip(n_ks, ts, strict=True), walked, strict=True)
+    ):
         is_terminal = idx == len(n_ks) - 1
-        b_eff, b_fut = boundary_for(history, alpha, is_terminal=is_terminal)
         if is_terminal:
             # Solved to spend exactly the remaining alpha (see boundary_for
             # / module docstring): cumulative equals `alpha` by construction,

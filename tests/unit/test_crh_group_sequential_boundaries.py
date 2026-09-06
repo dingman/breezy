@@ -12,9 +12,11 @@ implementation's own quadrature.
 
 from __future__ import annotations
 
+import json
 import sys
 from itertools import pairwise
 from pathlib import Path
+from typing import Any
 
 import numpy as np
 import pytest
@@ -24,6 +26,31 @@ if str(_SCRIPTS_ANALYSIS_DIR) not in sys.path:
     sys.path.insert(0, str(_SCRIPTS_ANALYSIS_DIR))
 
 import crh_group_sequential_boundaries as gs
+
+_REPO_ROOT = Path(__file__).resolve().parents[2]
+_ARTEFACT_PATH = _REPO_ROOT / "deploy" / "families" / "gs_boundary_pm_us_crh_v2.json"
+
+
+@pytest.fixture(scope="module")
+def default_output() -> dict[str, Any]:
+    return gs.build_output(0.025, 160, 10)
+
+
+@pytest.fixture(scope="module")
+def default_reference_table(default_output: dict[str, Any]) -> list[gs.LookRow]:
+    rows_raw = default_output["reference_table"]
+    return [
+        gs.LookRow(
+            look_k=int(row["look_k"]),
+            n_k=int(row["n_k"]),
+            t_k=float(row["t_k"]),
+            b_eff=float(row["b_eff"]),
+            b_fut=float(row["b_fut"]),
+            alpha_spent_eff=float(row["alpha_spent_eff"]),
+            alpha_spent_fut=float(row["alpha_spent_fut"]),
+        )
+        for row in rows_raw
+    ]
 
 
 def test_one_sided_spend_hits_alpha_exactly_at_t_equals_one():
@@ -39,40 +66,50 @@ def test_i_max_pinned_to_n_max_over_four():
     assert gs.i_max_for(80) == pytest.approx(20.0)
 
 
-def test_reference_table_has_sixteen_rows_for_default_schedule():
-    rows = gs.build_reference_table(0.025, 160, 10, gs.i_max_for(160))
+def test_reference_table_has_sixteen_rows_for_default_schedule(
+    default_reference_table: list[gs.LookRow],
+) -> None:
+    rows = default_reference_table
     assert len(rows) == 16
     assert [r.n_k for r in rows] == list(range(10, 161, 10))
     assert rows[0].t_k == pytest.approx(1 / 16)
     assert rows[-1].t_k == pytest.approx(1.0)
 
 
-def test_efficacy_boundary_is_monotonically_decreasing():
-    rows = gs.build_reference_table(0.025, 160, 10, gs.i_max_for(160))
+def test_efficacy_boundary_is_monotonically_decreasing(
+    default_reference_table: list[gs.LookRow],
+) -> None:
+    rows = default_reference_table
     b_eff = [r.b_eff for r in rows]
     assert all(a > b for a, b in pairwise(b_eff))
 
 
-def test_futility_boundary_mirrors_efficacy_by_symmetry():
-    rows = gs.build_reference_table(0.025, 160, 10, gs.i_max_for(160))
+def test_futility_boundary_mirrors_efficacy_by_symmetry(
+    default_reference_table: list[gs.LookRow],
+) -> None:
+    rows = default_reference_table
     for r in rows:
         assert r.b_fut == pytest.approx(-r.b_eff, rel=5e-3, abs=0.02)
 
 
-def test_terminal_look_spends_exactly_the_remaining_alpha_for_default_schedule():
+def test_terminal_look_spends_exactly_the_remaining_alpha_for_default_schedule(
+    default_reference_table: list[gs.LookRow],
+) -> None:
     """Binding ruling (commit ca94177, PREREG v2 SS4 coordinator clarification):
     the terminal look spends EXACTLY the remaining alpha, so cumulative alpha
     at the terminal look is 0.025 to 1e-6 -- never forced to z_half."""
-    rows = gs.build_reference_table(0.025, 160, 10, gs.i_max_for(160))
+    rows = default_reference_table
     assert rows[-1].alpha_spent_eff == pytest.approx(0.025, abs=1e-6)
     assert rows[-1].alpha_spent_fut == pytest.approx(0.025, abs=1e-6)
 
 
-def test_terminal_boundary_lands_strictly_above_nominal_z_for_k16():
+def test_terminal_boundary_lands_strictly_above_nominal_z_for_k16(
+    default_reference_table: list[gs.LookRow],
+) -> None:
     """ "The terminal boundary is whatever the Lan-DeMets recursion yields from
     that remainder ... slightly above z" for K=16 equal looks (ruling text);
     it equals z_half only in the single-look limit (K=1)."""
-    rows = gs.build_reference_table(0.025, 160, 10, gs.i_max_for(160))
+    rows = default_reference_table
     assert rows[-1].b_eff > gs.Z_ALPHA_ONE_SIDED
     assert rows[-1].b_fut < -gs.Z_ALPHA_ONE_SIDED
 
@@ -115,8 +152,10 @@ def test_boundary_for_accepts_a_tie_in_information_fraction_as_zero_increment():
         gs.boundary_for([0.5, 0.4], 0.025, is_terminal=False)
 
 
-def test_boundary_for_on_equal_t_grid_reproduces_reference_table_to_1e_minus_6():
-    rows = gs.build_reference_table(0.025, 160, 10, gs.i_max_for(160))
+def test_boundary_for_on_equal_t_grid_reproduces_reference_table_to_1e_minus_6(
+    default_reference_table: list[gs.LookRow],
+) -> None:
+    rows = default_reference_table
     history: list[float] = []
     for idx, row in enumerate(rows):
         history.append(row.t_k)
@@ -126,10 +165,12 @@ def test_boundary_for_on_equal_t_grid_reproduces_reference_table_to_1e_minus_6()
         assert b_fut == pytest.approx(row.b_fut, abs=1e-6)
 
 
-def test_alpha_spent_is_monotonically_nondecreasing_and_near_alpha():
+def test_alpha_spent_is_monotonically_nondecreasing_and_near_alpha(
+    default_reference_table: list[gs.LookRow],
+) -> None:
     """Terminal look now solves for exactly the remaining alpha (ruling,
     ca94177), so total spent is 0.025 to 1e-6 exactly, not merely close."""
-    rows = gs.build_reference_table(0.025, 160, 10, gs.i_max_for(160))
+    rows = default_reference_table
     spent = [r.alpha_spent_eff for r in rows]
     assert all(a <= b + 1e-9 for a, b in pairwise(spent))
     assert spent[-1] == pytest.approx(0.025, abs=1e-6)
@@ -144,6 +185,36 @@ def test_k2_reference_matches_literature_approximately():
 def test_n_max_must_be_multiple_of_look_step():
     with pytest.raises(ValueError):
         gs.build_reference_table(0.025, 155, 10, gs.i_max_for(155))
+
+
+def test_build_reference_table_convolves_at_most_once_per_look_gap(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """K=16 equal-t table must be one forward walk (K-1 convolutions), not
+    `boundary_for(history)` restarted on each growing prefix."""
+    calls = {"n": 0}
+    real = gs._convolve_density
+
+    def spy(*args: Any, **kwargs: Any) -> Any:
+        calls["n"] += 1
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(gs, "_convolve_density", spy)
+    gs.build_reference_table(0.025, 160, 10, gs.i_max_for(160))
+    assert calls["n"] <= 15
+
+
+def test_incremental_reference_table_matches_committed_artefact_with_zero_delta(
+    default_reference_table: list[gs.LookRow],
+) -> None:
+    """Behaviour-preservation: the forward walk must reproduce every committed
+    artefact `b_eff`/`b_fut` exactly -- not merely within the 1e-6 pin."""
+    recorded = json.loads(_ARTEFACT_PATH.read_text())["reference_table"]
+    rows = default_reference_table
+    max_delta = 0.0
+    for got, rec in zip(rows, recorded, strict=True):
+        max_delta = max(max_delta, abs(got.b_eff - rec["b_eff"]), abs(got.b_fut - rec["b_fut"]))
+    assert max_delta == 0.0
 
 
 def test_truncation_evaluates_a_valid_test_at_the_actual_info_fraction():
@@ -177,10 +248,12 @@ def test_inputs_manifest_sha256_is_deterministic_and_input_sensitive():
     assert gs.sha256_of_inputs(m1) != gs.sha256_of_inputs(m3)
 
 
-def test_build_output_shape_and_reproducible_sha():
-    out1 = gs.build_output(0.025, 160, 10)
-    out2 = gs.build_output(0.025, 160, 10)
-    assert out1["inputs_sha256"] == out2["inputs_sha256"]
+def test_build_output_shape_and_reproducible_sha(default_output: dict[str, Any]) -> None:
+    out1 = default_output
+    out2_sha = gs.sha256_of_inputs(
+        gs.inputs_manifest(0.025, gs.SPENDING_FUNCTION_ID, 160, 40.0, 10)
+    )
+    assert out1["inputs_sha256"] == out2_sha
     assert len(out1["reference_table"]) == 16
     assert out1["i_max"] == pytest.approx(40.0)
     row_keys = set(out1["reference_table"][0].keys())
@@ -195,23 +268,27 @@ def test_build_output_shape_and_reproducible_sha():
     }
 
 
-def test_build_output_usage_field_labels_reference_table_as_fixture_only():
+def test_build_output_usage_field_labels_reference_table_as_fixture_only(
+    default_output: dict[str, Any],
+) -> None:
     """R1 (domain review 2026-09-04): a consumer must not index `reference_table`
     by n_k instead of computing the realized t_k = min(1, I_k/I_max) and
     calling `boundary_for` -- the payload must self-label as a regression
     fixture, not a live-lookup table."""
-    out = gs.build_output(0.025, 160, 10)
+    out = default_output
     assert "usage" in out
     assert "regression_fixture_only" in out["usage"]
 
 
-def test_build_output_solver_fingerprint_present_and_not_authoritative():
+def test_build_output_solver_fingerprint_present_and_not_authoritative(
+    default_output: dict[str, Any],
+) -> None:
     """H2 (domain review 2026-09-04): `inputs_sha256` correctly excludes the
     numerical-grid constants (spec pins design inputs only), but a silent
     change to GRID_NPTS / GRID_HALFWIDTH_SD / brentq xtol moves b_eff(16) by
     ~1.2e-3 while the sha stays identical. `solver_fingerprint` is a second,
     explicitly diagnostic field that DOES change with those constants."""
-    out = gs.build_output(0.025, 160, 10)
+    out = default_output
     assert "solver_fingerprint" in out
     fp = out["solver_fingerprint"]
     assert isinstance(fp, str)
@@ -219,20 +296,24 @@ def test_build_output_solver_fingerprint_present_and_not_authoritative():
     assert all(c in "0123456789abcdef" for c in fp)
 
 
-def test_solver_fingerprint_changes_with_grid_constant_but_inputs_sha_does_not(monkeypatch):
-    out_before = gs.build_output(0.025, 160, 10)
+def test_solver_fingerprint_changes_with_grid_constant_but_inputs_sha_does_not(
+    monkeypatch: pytest.MonkeyPatch, default_output: dict[str, Any]
+) -> None:
+    out_before = default_output
     monkeypatch.setattr(gs, "GRID_NPTS", gs.GRID_NPTS + 1)
     out_after = gs.build_output(0.025, 160, 10)
     assert out_after["solver_fingerprint"] != out_before["solver_fingerprint"]
     assert out_after["inputs_sha256"] == out_before["inputs_sha256"]
 
 
-def test_simulation_fixed_pi_type_i_within_mc_bound():
+def test_simulation_fixed_pi_type_i_within_mc_bound(
+    default_reference_table: list[gs.LookRow],
+) -> None:
     """Bound is the same 3*MC-SE margin the drift test uses (H3 hardening,
     domain review 2026-09-04) -- informational, not the adopted statistic,
     but tightened from the previously loose alpha+0.015 bound; it still pins
     Type I close to the nominal 0.025, not an arbitrary pass."""
-    rows = gs.build_reference_table(0.025, 160, 10, gs.i_max_for(160))
+    rows = default_reference_table
     n_reps = 20_000
     result = gs.simulate_fixed_pi(rows, pi=0.41, delta=0.15, n_reps=n_reps, seed=20260904)
     mc_se = np.sqrt(0.025 * 0.975 / n_reps)
@@ -241,12 +322,14 @@ def test_simulation_fixed_pi_type_i_within_mc_bound():
     assert result["edge_p_eq_pi_plus_delta"]["p_efficacy"] > result["leak_p_eq_pi"]["p_efficacy"]
 
 
-def test_simulation_drift_score_statistic_type_i_within_mc_bound():
+def test_simulation_drift_score_statistic_type_i_within_mc_bound(
+    default_reference_table: list[gs.LookRow],
+) -> None:
     """The strategy-lead-ruled valid statistic (S_k, centred score on
     realized information) must control Type I under the drifting-ask DGP;
     the rejected plug-in Z_k form is reported for contrast only, with no
     such guarantee asserted."""
-    rows = gs.build_reference_table(0.025, 160, 10, gs.i_max_for(160))
+    rows = default_reference_table
     n_reps = 20_000
     result = gs.simulate_drift(
         rows,

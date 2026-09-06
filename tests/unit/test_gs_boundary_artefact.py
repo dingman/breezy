@@ -289,3 +289,39 @@ def test_boundary_reference_rows_are_immutable_data(artefact: BoundaryArtefact) 
     # calling boundary_for must not mutate the stored reference rows
     artefact.boundary_for((0.0625,))
     assert artefact.reference_rows == rows_copy
+
+
+def test_load_boundary_artefact_convolves_at_most_once_per_look_gap(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """K=16 equal-t load replay must be one forward walk (K-1 convolutions),
+    not a triangular restart of `_solve_boundary` on each growing prefix."""
+    import breezy.persistence.gs_boundary_artefact as mod
+
+    calls = {"n": 0}
+    real = mod._convolve_density
+
+    def spy(*args: Any, **kwargs: Any) -> Any:
+        calls["n"] += 1
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(mod, "_convolve_density", spy)
+    load_boundary_artefact(_ARTEFACT_PATH, expected_sha256=_PINNED_SHA)
+    assert calls["n"] <= 15
+
+
+def test_incremental_replay_matches_committed_artefact_rows_with_zero_delta() -> None:
+    """Behaviour-preservation: one forward walk of the loader solver must
+    reproduce every committed `b_eff`/`b_fut` exactly -- not merely within
+    the 1e-6 (or extreme-tail 5e-2) load-time pin."""
+    import breezy.persistence.gs_boundary_artefact as mod
+
+    recorded = _payload()["reference_table"]
+    t_history = tuple(float(row["t_k"]) for row in recorded)
+    walked = list(mod._iter_boundary_looks(t_history, ALPHA_ONE_SIDED, is_terminal=True))
+    max_delta = 0.0
+    for (b_eff, b_fut), row in zip(walked, recorded, strict=True):
+        max_delta = max(
+            max_delta, abs(b_eff - float(row["b_eff"])), abs(b_fut - float(row["b_fut"]))
+        )
+    assert max_delta == 0.0
