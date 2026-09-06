@@ -1135,7 +1135,8 @@ def test_classify_ambiguous_status_body_off_the_4xx_range_reports_rpc_code_and_l
     )
     assert outcome.kind == KIND_AMBIGUOUS
     assert outcome.detail == (
-        f"status=503 body_kind=status-no-order-id rpc_code=3 body_len={len(body)}"
+        f"status=503 body_kind=status-no-order-id rpc_code=3 "
+        f"body_len={len(body)} state=absent cum=absent"
     )
 
 
@@ -1146,7 +1147,8 @@ def test_classify_ambiguous_unparseable_body_reports_that_shape() -> None:
     )
     assert outcome.kind == KIND_AMBIGUOUS
     assert outcome.detail == (
-        f"status=200 body_kind=unparseable rpc_code=none body_len={len(response.body)}"
+        f"status=200 body_kind=unparseable rpc_code=none "
+        f"body_len={len(response.body)} state=absent cum=absent"
     )
 
 
@@ -1171,7 +1173,8 @@ def test_every_classified_kind_sets_body_kind_and_body_len() -> None:
     unparseable_outcome = classify_create_order_outcome(unparseable, **classify_kw)
     assert unparseable_outcome.kind == KIND_AMBIGUOUS
     assert unparseable_outcome.detail == (
-        f"status=200 body_kind=unparseable rpc_code=none body_len={len(unparseable.body)}"
+        f"status=200 body_kind=unparseable rpc_code=none "
+        f"body_len={len(unparseable.body)} state=absent cum=absent"
     )
 
     reject_body = _status_reject_body()
@@ -1179,7 +1182,8 @@ def test_every_classified_kind_sets_body_kind_and_body_len() -> None:
     reject_outcome = classify_create_order_outcome(reject_response, **classify_kw)
     assert reject_outcome.kind == KIND_REJECT
     assert reject_outcome.detail == (
-        f"status=400 body_kind=status-no-order-id rpc_code=3 body_len={len(reject_body)}"
+        f"status=400 body_kind=status-no-order-id rpc_code=3 "
+        f"body_len={len(reject_body)} state=absent cum=absent"
     )
 
     empty_exec_body = json.dumps({"id": "ord-amb", "executions": []}).encode()
@@ -1187,7 +1191,8 @@ def test_every_classified_kind_sets_body_kind_and_body_len() -> None:
     empty_exec_outcome = classify_create_order_outcome(empty_exec_response, **classify_kw)
     assert empty_exec_outcome.kind == KIND_AMBIGUOUS
     assert empty_exec_outcome.detail == (
-        f"status=200 body_kind=empty-executions rpc_code=none body_len={len(empty_exec_body)}"
+        f"status=200 body_kind=empty-executions rpc_code=none "
+        f"body_len={len(empty_exec_body)} state=absent cum=absent"
     )
 
     durable_body = _durable_accept_body(str(instrument.raw_symbol))
@@ -1195,7 +1200,8 @@ def test_every_classified_kind_sets_body_kind_and_body_len() -> None:
     durable_outcome = classify_create_order_outcome(durable_response, **classify_kw)
     assert durable_outcome.kind == KIND_ACCEPT_FILL
     assert durable_outcome.detail == (
-        f"status=200 body_kind=executions-present rpc_code=none body_len={len(durable_body)}"
+        f"status=200 body_kind=executions-present rpc_code=none "
+        f"body_len={len(durable_body)} state=absent cum=absent"
     )
 
     unexpected_body = json.dumps({"not": "an-order"}).encode()
@@ -1203,7 +1209,8 @@ def test_every_classified_kind_sets_body_kind_and_body_len() -> None:
     unexpected_outcome = classify_create_order_outcome(unexpected_response, **classify_kw)
     assert unexpected_outcome.kind == KIND_AMBIGUOUS
     assert unexpected_outcome.detail == (
-        f"status=200 body_kind=unexpected-shape rpc_code=none body_len={len(unexpected_body)}"
+        f"status=200 body_kind=unexpected-shape rpc_code=none "
+        f"body_len={len(unexpected_body)} state=absent cum=absent"
     )
 
     zero_body = json.dumps(
@@ -1218,8 +1225,74 @@ def test_every_classified_kind_sets_body_kind_and_body_len() -> None:
     zero_outcome = classify_create_order_outcome(zero_response, **classify_kw)
     assert zero_outcome.kind == KIND_ZERO_FILL
     assert zero_outcome.detail == (
-        f"status=200 body_kind=empty-executions rpc_code=none body_len={len(zero_body)}"
+        f"status=200 body_kind=empty-executions rpc_code=none "
+        f"body_len={len(zero_body)} state=ORDER_STATE_CANCELED cum=0"
     )
+
+
+@pytest.mark.parametrize(
+    ("body", "expected_state", "expected_cum"),
+    [
+        ({"id": "ord-amb", "executions": []}, "absent", "absent"),
+        (
+            {
+                "id": "ord-amb",
+                "executions": [],
+                "state": "ORDER_STATE_CANCELED",
+                "cumQuantity": "0",
+            },
+            "ORDER_STATE_CANCELED",
+            "0",
+        ),
+        (
+            {"id": "ord-amb", "executions": [], "order": {"state": "ORDER_STATE_NEW"}},
+            "ORDER_STATE_NEW",
+            "absent",
+        ),
+        (
+            {"id": "ord-amb", "executions": [], "cumQuantity": "not-a-number"},
+            "absent",
+            "unparseable",
+        ),
+        (
+            {"id": "ord-amb", "executions": [], "state": "<script>"},
+            "other",
+            "absent",
+        ),
+        (
+            {"id": "ord-amb", "executions": [], "cumQuantity": "3"},
+            "absent",
+            "nonzero",
+        ),
+    ],
+    ids=[
+        "empty-exec-absent-absent",
+        "canceled-zero",
+        "nested-order-state-new",
+        "cum-unparseable",
+        "state-script-redacted-to-other",
+        "cum-nonzero",
+    ],
+)
+def test_body_detail_pins_state_and_cum_closed_set_tokens(
+    body: dict[str, Any], expected_state: str, expected_cum: str
+) -> None:
+    """GL-1a follow-up: redacted detail carries closed-set ``state=`` and
+    ``cum=`` tokens so the next live order can settle the ZERO_FILL
+    conjuncts (terminal state / cumQuantity) without echoing body content.
+    """
+    encoded = json.dumps(body).encode()
+    outcome = classify_create_order_outcome(
+        VenueResponse(status=200, headers={}, body=encoded),
+        instrument=build_instrument(),
+        account_id=ACCOUNT_ID,
+        ts_init=TS_INIT,
+    )
+    assert outcome.detail == (
+        f"status=200 body_kind=empty-executions rpc_code=none "
+        f"body_len={len(encoded)} state={expected_state} cum={expected_cum}"
+    )
+    assert "<script>" not in outcome.detail
 
 
 @pytest.mark.parametrize(
@@ -1268,7 +1341,8 @@ def test_documented_empty_executions_without_terminal_state_stays_ambiguous_per_
     )
     assert outcome.kind == KIND_AMBIGUOUS
     assert outcome.detail == (
-        f"status=200 body_kind=empty-executions rpc_code=none body_len={len(encoded)}"
+        f"status=200 body_kind=empty-executions rpc_code=none "
+        f"body_len={len(encoded)} state=absent cum=absent"
     )
 
 

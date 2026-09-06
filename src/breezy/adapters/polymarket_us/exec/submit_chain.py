@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 from collections.abc import Mapping
 from dataclasses import dataclass
 from decimal import Decimal, InvalidOperation
@@ -576,6 +577,50 @@ def venue_order_id(order_id: str) -> VenueOrderId:
 _AMBIGUOUS_DETAIL_NO_RESPONSE: Final[str] = (
     "status=none body_kind=none rpc_code=none body_len=0"
 )
+_ORDER_STATE_TOKEN: Final[re.Pattern[str]] = re.compile(r"^ORDER_STATE_[A-Z_]+$")
+
+
+def _state_detail_token(payload: Mapping[str, Any] | None) -> str:
+    """Closed-set ``state=`` token for the redacted create-order detail.
+
+    Uses the same top-level ``state``/``status`` then nested ``order`` lookup
+    as :func:`_terminal_state`. Emits the enum value only when it is a
+    ``str`` matching ``ORDER_STATE_[A-Z_]+``; any other present string is
+    ``other`` (never echoed); absence is ``absent``.
+    """
+    if not isinstance(payload, Mapping):
+        return "absent"
+    raw = _terminal_state(payload)
+    if raw is None:
+        return "absent"
+    if _ORDER_STATE_TOKEN.fullmatch(raw) is not None:
+        return raw
+    return "other"
+
+
+def _cum_detail_token(payload: Mapping[str, Any] | None) -> str:
+    """Closed-set ``cum=`` token for the redacted create-order detail.
+
+    Looks up ``cumQuantity`` top-level then nested ``order``, matching
+    :func:`_cum_quantity`. Emits ``absent``, ``0``, ``nonzero``, or
+    ``unparseable`` -- never the raw value.
+    """
+    if not isinstance(payload, Mapping):
+        return "absent"
+    raw = payload.get("cumQuantity")
+    if raw is None:
+        order = payload.get("order")
+        if isinstance(order, Mapping):
+            raw = order.get("cumQuantity")
+    if raw is None:
+        return "absent"
+    try:
+        qty = Decimal(str(raw))
+    except (InvalidOperation, ValueError):
+        return "unparseable"
+    if qty == ZERO:
+        return "0"
+    return "nonzero"
 
 
 def _body_detail(
@@ -587,7 +632,8 @@ def _body_detail(
 
     Reports shape and length only -- never the body content -- so the venue's
     answer is recoverable from the log without risking a leaked secret or
-    account detail embedded in an adversarial or malformed body.
+    account detail embedded in an adversarial or malformed body. Closed-set
+    tokens only: status, body_kind, rpc_code, body_len, state, cum.
     """
     body_len = len(response.body)
     rpc_code: int | None = None
@@ -610,7 +656,8 @@ def _body_detail(
     rpc_code_str = "none" if rpc_code is None else str(rpc_code)
     return (
         f"status={response.status} body_kind={body_kind} "
-        f"rpc_code={rpc_code_str} body_len={body_len}"
+        f"rpc_code={rpc_code_str} body_len={body_len} "
+        f"state={_state_detail_token(payload)} cum={_cum_detail_token(payload)}"
     )
 
 
