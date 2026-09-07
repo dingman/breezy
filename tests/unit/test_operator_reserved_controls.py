@@ -665,7 +665,10 @@ def test_the_mechanism_has_no_production_call_site_yet() -> None:
     through the same two accessor functions, before any ledger booking
     exists. WIDENED, not relaxed (L-12) -- a THIRD importer arriving here
     undeclared is still the accidental-wiring signal this test exists to
-    catch.
+    catch. Third, declared 2026-09-07: the operator's value-free presence /
+    file validator ``scripts/operator/print_operator_controls.py`` imports the
+    inventory tuple to derive the control names at runtime; it reads, never
+    assigns (layers A-D and ``find_environ_mutations`` still police it).
     """
     from pathlib import Path
 
@@ -679,6 +682,7 @@ def test_the_mechanism_has_no_production_call_site_yet() -> None:
         and path.name != "operator_controls.py"
     )
     assert importers == [
+        "scripts/operator/print_operator_controls.py",
         "src/breezy/adapters/polymarket_us/factories.py",
         "src/breezy/runtime/order_enablement.py",
     ]
