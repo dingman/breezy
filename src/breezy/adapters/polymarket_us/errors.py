@@ -176,6 +176,23 @@ class EmptyBookSideError(VenuePayloadError):
         self.side: str = side
 
 
+class EmptyClimateListingError(VenuePayloadError):
+    """Market discovery returned zero configured-city weather markets.
+
+    Its own class purely so the CALL SITE (``PolymarketUSDataClient._connect``,
+    GL-12) can tell this apart from every other :class:`VenuePayloadError` --
+    duplicate slugs, stage-3 cohort failures, bounds violations -- and retry
+    ONLY this one. Those other payload errors stay fatal on the first
+    occurrence; an empty listing during the venue's own daily discovery lag
+    (measured ~09:45-10:30Z) is not.
+
+    A ``VenuePayloadError`` subclass, not a sibling, for the same reason
+    :class:`EmptyBookSideError` is: every existing ``except VenuePayloadError``
+    and ``pytest.raises(VenuePayloadError, match="discovery returned zero")``
+    keeps holding unchanged.
+    """
+
+
 class InstrumentDefinitionError(VenuePayloadError):
     """An instrument definition payload cannot be turned into a valid instrument.
 

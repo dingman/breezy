@@ -276,6 +276,17 @@ class PolymarketUSDataClientConfig(LiveDataClientConfig, frozen=True):
     ws_heartbeat_secs: int = 20
     ws_idle_timeout_secs: int = 60
 
+    #: Wall-clock budget, in seconds, to retry an initial connect's
+    #: ``EmptyClimateListingError`` before giving up (GL-12). Default 0 --
+    #: NOT in :data:`POSITIVE_FIELDS`, so zero is a legal, deliberate value:
+    #: it is the live trade node's fail-fast default (today's behaviour,
+    #: unchanged). The quote-tape recorder overrides this in
+    #: ``breezy.runtime.node_config.build_quote_tape_node_config`` to survive
+    #: the venue's own daily discovery lag. Never derived from
+    #: ``recorder_instance_id`` or any other shared flag (L-6): a dedicated
+    #: field with its own default.
+    empty_discovery_retry_secs: float = 0.0
+
     #: Escape from the venue-domain origin allowlist. NOT a secret, and
     #: deliberately a FIELD rather than an environment read performed here.
     #:
@@ -325,6 +336,15 @@ class PolymarketUSDataClientConfig(LiveDataClientConfig, frozen=True):
             value = getattr(self, name)
             if not isinstance(value, int) or isinstance(value, bool) or value <= 0:
                 raise SettingsError(f"{name} must be a positive integer, was {value!r}")
+        if (
+            not isinstance(self.empty_discovery_retry_secs, int | float)
+            or isinstance(self.empty_discovery_retry_secs, bool)
+            or self.empty_discovery_retry_secs < 0
+        ):
+            raise SettingsError(
+                "empty_discovery_retry_secs must be zero or positive, was "
+                f"{self.empty_discovery_retry_secs!r}"
+            )
         try:
             SigningVariant(self.signing_variant)
         except ValueError as exc:

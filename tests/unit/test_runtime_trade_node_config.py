@@ -182,6 +182,24 @@ class TestTradeNodeConfig:
 
         assert set(config.data_clients) == {POLYMARKET_US_CLIENT_NAME}
 
+    def test_stays_at_the_native_connect_timeout_and_the_fail_fast_retry_default(
+        self,
+    ) -> None:
+        """GL-12 is a quote-tape-only widening. The live trade node must
+
+        keep both the native ``timeout_connection`` default (60s) and
+        ``empty_discovery_retry_secs`` at 0 -- an empty listing on THIS
+        process latches a fatal fault on the first failure, exactly as
+        before. Only ``build_quote_tape_node_config`` overrides either.
+        """
+        config = build_trade_node_config(
+            make_trade_settings(), make_data_client_config(), make_exec_client_config()
+        )
+
+        assert config.timeout_connection == 60.0
+        wired = config.data_clients[POLYMARKET_US_CLIENT_NAME]
+        assert wired.empty_discovery_retry_secs == 0.0
+
     def test_the_trade_node_config_registers_exactly_one_exec_client(self) -> None:
         """EXEC SPINE W. R-4's client had ZERO construction sites before this;
         the key equals `POLYMARKET_US_CLIENT_NAME` because the derived

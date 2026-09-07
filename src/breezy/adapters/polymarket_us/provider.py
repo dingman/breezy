@@ -43,7 +43,7 @@ from nautilus_trader.config import InstrumentProviderConfig
 from nautilus_trader.model.identifiers import InstrumentId, Venue
 
 from breezy.adapters.polymarket_us.config import PolymarketUSMarketDiscoveryConfig
-from breezy.adapters.polymarket_us.errors import VenuePayloadError
+from breezy.adapters.polymarket_us.errors import EmptyClimateListingError, VenuePayloadError
 from breezy.adapters.polymarket_us.http import PolymarketUSHttpClient, SupportsVenueLog
 from breezy.adapters.polymarket_us.parsing import parse_binary_option
 from breezy.adapters.polymarket_us.symbology import (
@@ -329,7 +329,7 @@ class PolymarketUSInstrumentProvider(InstrumentProvider):
                 "markets this cycle; refusing to treat this as a quiet market"
             )
             self._discovery_log.error(message)
-            raise VenuePayloadError(message)
+            raise EmptyClimateListingError(message)
 
         slugs = tuple(market.slug for market in discovered)
         if len(set(slugs)) != len(slugs):
