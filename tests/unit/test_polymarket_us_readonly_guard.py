@@ -2119,6 +2119,11 @@ def test_c10_submit_intent_and_operator_controls_reference_pins() -> None:
         # positive through the same two accessor functions ``factories.py``
         # already imports the ledger from.
         "src/breezy/runtime/order_enablement.py",
+        # WIDENED (L-12), not relaxed, 2026-09-07: the operator's value-free
+        # presence / file validator imports the inventory tuple to derive the
+        # control names at runtime. It reads, never assigns; layers A-D of the
+        # assignment scan and ``find_environ_mutations`` still police it.
+        "scripts/operator/print_operator_controls.py",
     }
 
 
