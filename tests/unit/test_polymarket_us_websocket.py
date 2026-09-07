@@ -34,6 +34,7 @@ import pytest
 from nacl.signing import SigningKey, VerifyKey
 from nautilus_trader.common.component import LiveClock, Logger, TestClock
 from nautilus_trader.core.nautilus_pyo3 import WebSocketConfig
+from nautilus_trader.live.retry import get_exponential_backoff
 
 from breezy.adapters.polymarket_us.credentials import PolymarketUSCredentials
 from breezy.adapters.polymarket_us.errors import VenueTransportError
@@ -421,6 +422,206 @@ async def test_pushed_frames_reach_the_handler() -> None:
             await ws.close()
 
     assert json.loads(received[0])["marketSlug"] == "tc-temp-nychigh-2026-08-25-lt79f"
+
+
+
+# --------------------------------------------------------------------------
+# GL-5: session-scoped reconnect backoff (reconnect-storm client backoff)
+#
+# Defect (approved plan, L-1 verdict / L-23): `_reconnect_with_backoff`
+# builds a FRESH `RetryManager` per drop, and `RetryManager.run` only sleeps
+# after a `VenueTransportError` -- a handshake that SUCCEEDS and then
+# immediately closes returns `True` with ZERO delay. `_supervise` then polls
+# again at `supervisor_poll_secs` and starts another manager, so a
+# success-then-drop flap reconnects at raw poll cadence (~1 Hz in
+# production), never at any backoff delay, no matter how large
+# `reconnect_delay_initial_ms` is configured. 09-05: ~1673 reconnect log
+# lines / ~280 pool-level 5s gaps on one instance.
+#
+# Per review A2, the assertion below is on ELAPSED TIME, not attempt count:
+# a 1 Hz reconnect storm already produces exactly N+1 attempts for N drops,
+# so attempt count alone cannot distinguish "storming" from "backing off".
+# --------------------------------------------------------------------------
+
+
+@pytest.mark.allow_socket
+@pytest.mark.asyncio
+async def test_successful_flaps_backoff_instead_of_reconnecting_every_poll(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Deterministic delays (review B1): remove the additive jitter term so
+    # the elapsed-time assertion is exact, not a probabilistic band.
+    monkeypatch.setattr("random.randint", lambda _a, _b: 0)
+
+    delay_initial_ms = 20
+    delay_max_ms = 80
+    backoff_factor = 2
+    num_flaps = 3  # > reconnect_max_attempts, to prove flaps don't consume it
+
+    async with LoopbackWebSocketServer() as server:
+        signer, _ = _new_signer()
+        ws = _make_ws(
+            ws_url=server.url,
+            signer=signer,
+            reconnect_max_attempts=2,
+            reconnect_delay_initial_ms=delay_initial_ms,
+            reconnect_delay_max_ms=delay_max_ms,
+            reconnect_backoff_factor=backoff_factor,
+            supervisor_poll_secs=0.02,
+        )
+        try:
+            await ws.connect()
+            await _wait_until(lambda: len(server.handshakes) == 1)
+
+            async def _wait_for_more_handshakes(previous_count: int) -> None:
+                await _wait_until(lambda: len(server.handshakes) > previous_count)
+
+            loop = asyncio.get_running_loop()
+            start = loop.time()
+            seen = 1
+            # The server ACCEPTS every handshake (never REFUSE_HANDSHAKE) --
+            # these are SUCCESSFUL flaps, immediately dropped from this side,
+            # not handshake refusals.
+            for _ in range(num_flaps):
+                server.drop_connections()
+                await asyncio.wait_for(_wait_for_more_handshakes(seen), timeout=5.0)
+                seen = len(server.handshakes)
+            elapsed = loop.time() - start
+        finally:
+            await ws.close()
+
+        assert seen == 1 + num_flaps, "not one reconnect per successful-then-dropped flap"
+
+        expected_min_secs = (
+            sum(
+                get_exponential_backoff(
+                    num_attempts=attempt,
+                    delay_initial_ms=delay_initial_ms,
+                    delay_max_ms=delay_max_ms,
+                    backoff_factor=backoff_factor,
+                    jitter=False,
+                )
+                for attempt in range(1, num_flaps + 1)
+            )
+            / 1000
+        )
+        assert elapsed >= expected_min_secs, (
+            f"expected >= {expected_min_secs * 1000:.0f}ms of spaced exponential backoff "
+            f"across {num_flaps} successful flaps, observed {elapsed * 1000:.1f}ms -- a "
+            "successful-then-immediately-closed handshake is reconnecting at raw poll "
+            "cadence again, not backing off"
+        )
+        assert ws.is_fatally_degraded is False, (
+            "successful flaps must never consume reconnect_max_attempts -- only a "
+            "handshake REFUSAL may end in `is_fatally_degraded`"
+        )
+
+
+@pytest.mark.allow_socket
+@pytest.mark.asyncio
+async def test_backoff_resets_after_idle_timeout_of_stable_connection(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr("random.randint", lambda _a, _b: 0)
+
+    delay_initial_ms = 50
+    delay_max_ms = 1_000
+    backoff_factor = 2
+    poll_secs = 0.005
+    stable_reset_secs = 0.03
+
+    async with LoopbackWebSocketServer() as server:
+        signer, _ = _new_signer()
+        ws = _make_ws(
+            ws_url=server.url,
+            signer=signer,
+            reconnect_max_attempts=50,
+            reconnect_delay_initial_ms=delay_initial_ms,
+            reconnect_delay_max_ms=delay_max_ms,
+            reconnect_backoff_factor=backoff_factor,
+            supervisor_poll_secs=poll_secs,
+            stable_reset_secs=stable_reset_secs,
+        )
+        try:
+            await ws.connect()
+            await _wait_until(lambda: len(server.handshakes) == 1)
+
+            # First flap: `_consecutive_drops` goes 0 -> 1, delay ~= delay_initial_ms.
+            server.drop_connections()
+            await asyncio.wait_for(
+                _wait_until(lambda: len(server.handshakes) == 2), timeout=5.0
+            )
+
+            # Stay connected well past `stable_reset_secs` so the counter resets.
+            await asyncio.sleep(stable_reset_secs + 5 * poll_secs)
+
+            # Second flap: a RESET counter reconnects at attempt=1 again
+            # (~delay_initial_ms); an UNRESET counter would be at attempt=2
+            # (~delay_initial_ms * backoff_factor). A build with no backoff at
+            # all reconnects near-instantly (~0ms) -- the lower bound below is
+            # what makes this RED against that baseline, not just against a
+            # missing reset.
+            loop = asyncio.get_running_loop()
+            start = loop.time()
+            server.drop_connections()
+            await asyncio.wait_for(
+                _wait_until(lambda: len(server.handshakes) == 3), timeout=5.0
+            )
+            elapsed = loop.time() - start
+        finally:
+            await ws.close()
+
+        reset_delay_secs = delay_initial_ms / 1000
+        unreset_delay_secs = (delay_initial_ms * backoff_factor) / 1000
+        assert elapsed >= reset_delay_secs * 0.5, (
+            f"expected a real backoff delay (~{delay_initial_ms}ms) before the second "
+            f"flap's reconnect, observed {elapsed * 1000:.1f}ms -- no session backoff "
+            "is being applied at all"
+        )
+        assert elapsed < unreset_delay_secs * 0.75, (
+            f"expected the reset attempt=1 delay (~{delay_initial_ms}ms), observed "
+            f"{elapsed * 1000:.1f}ms -- consecutive_drops did not reset after "
+            "`stable_reset_secs` of continuous connection"
+        )
+
+
+@pytest.mark.allow_socket
+@pytest.mark.asyncio
+async def test_close_during_new_backoff_sleep_leaves_no_pending_task() -> None:
+    """Cancellation of the NEW pre-attempt sleep added for GL-5 (review A4).
+
+    This sleep is a plain ``asyncio.sleep`` inside ``_supervise`` itself, run
+    BEFORE ``_reconnect_with_backoff`` (and therefore before any
+    ``RetryManager`` exists to cancel) -- so it is interrupted by ``close()``
+    cancelling the SUPERVISOR TASK, not by ``RetryManager.cancel()``. The
+    long delay below (far past this test's timeout budget if never
+    cancelled) proves the wait actually happened inside that sleep: the
+    assertion that ``connection_attempts`` stayed at 1 shows no reconnect
+    handshake was ever attempted before ``close()`` ran.
+    """
+    async with LoopbackWebSocketServer() as server:
+        baseline = len(asyncio.all_tasks())
+        signer, _ = _new_signer()
+        ws = _make_ws(
+            ws_url=server.url,
+            signer=signer,
+            reconnect_max_attempts=50,
+            reconnect_delay_initial_ms=5_000,
+            reconnect_delay_max_ms=5_000,
+        )
+        await ws.connect()
+        await _wait_until(lambda: len(server.handshakes) == 1)
+
+        server.drop_connections()
+        await _wait_until(lambda: ws._consecutive_drops >= 1)
+        # Still inside the new pre-attempt sleep: no reconnect handshake yet.
+        assert server.connection_attempts == 1
+
+        await asyncio.wait_for(ws.close(), timeout=5.0)
+
+        await asyncio.sleep(0.05)
+        assert len(asyncio.all_tasks()) <= baseline
+        assert ws.is_connected is False
 
 
 @pytest.mark.allow_socket

@@ -104,6 +104,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import random
 import traceback
 import uuid
 from collections.abc import Callable, Mapping, Sequence
@@ -117,7 +118,7 @@ from nautilus_trader.core.nautilus_pyo3 import (
     WebSocketConfig,
 )
 from nautilus_trader.live.cancellation import cancel_tasks_with_timeout
-from nautilus_trader.live.retry import RetryManager
+from nautilus_trader.live.retry import RetryManager, get_exponential_backoff
 
 from breezy.adapters.polymarket_us.errors import VenueTransportError
 from breezy.adapters.polymarket_us.signing import Ed25519RequestSigner
@@ -142,6 +143,16 @@ WS_PATH: Final[str] = "/v1/ws/markets"
 SUBSCRIPTION_TYPE_MARKET_DATA: Final[str] = "SUBSCRIPTION_TYPE_MARKET_DATA"
 
 _MS_PER_SECOND: Final[int] = 1_000
+
+#: Matches `WebSocketConfig.reconnect_jitter_ms`'s own native default
+#: (`core/nautilus_pyo3.pyi:5540`). Applied as a SEPARATE additive jitter term
+#: on top of `get_exponential_backoff(..., jitter=False)` -- see
+#: `PolymarketUSMarketsWebSocket._next_backoff_delay_ms` for why the native
+#: `jitter=True` path cannot supply this alone: it collapses to a single,
+#: non-random value (`randint(delay_initial_ms, delay_initial_ms)`) on
+#: exactly the attempt that matters most for thundering-herd avoidance -- the
+#: FIRST drop of several shards falling together.
+_RECONNECT_JITTER_MS: Final[int] = 100
 
 #: Empirically measured against the LIVE Polymarket.us venue on 2026-08-30,
 #: confirmed by TWO INDEPENDENT probes (module docstring, "Note on the
@@ -293,6 +304,12 @@ class PolymarketUSMarketsWebSocket:
         is opt-in on a bare connection and defaults ON only at
         :class:`PolymarketUSMarketsWebSocketPool`, the actual production path
         (module docstring, "Note on the per-connection subscription cap").
+    stable_reset_secs : float, default 60.0
+        How long the socket must stay continuously connected (TRANSPORT
+        liveness -- ``WebSocketClient.is_closed()`` only, never frame
+        arrival) before the session-scoped reconnect-backoff counter resets
+        to zero. NOT an operator-configurable field: it tunes how quickly a
+        recovered connection forgets a prior storm, not risk or exposure.
     """
 
     __slots__ = (
@@ -302,6 +319,7 @@ class PolymarketUSMarketsWebSocket:
         "_confirmation_task",
         "_confirmation_window_secs",
         "_connection_label",
+        "_consecutive_drops",
         "_delay_initial_ms",
         "_delay_max_ms",
         "_fatally_degraded",
@@ -317,6 +335,8 @@ class PolymarketUSMarketsWebSocket:
         "_retry_manager",
         "_signer",
         "_silent_subscriptions",
+        "_stable_reset_secs",
+        "_stable_since",
         "_subscription_errors",
         "_subscriptions",
         "_supervisor",
@@ -342,6 +362,7 @@ class PolymarketUSMarketsWebSocket:
         request_id_factory: Callable[[], str] | None = None,
         connection_label: str = "single",
         confirmation_window_secs: float | None = None,
+        stable_reset_secs: float = 60.0,
     ) -> None:
         if heartbeat_secs <= 0:
             raise ValueError("heartbeat_secs must be positive")
@@ -353,6 +374,8 @@ class PolymarketUSMarketsWebSocket:
             raise ValueError("reconnect_max_attempts must not be negative")
         if confirmation_window_secs is not None and confirmation_window_secs <= 0:
             raise ValueError("confirmation_window_secs must be positive")
+        if stable_reset_secs <= 0:
+            raise ValueError("stable_reset_secs must be positive")
 
         self._ws_url: str = ws_url.rstrip("/")
         self._signer: Ed25519RequestSigner | None = signer
@@ -371,6 +394,7 @@ class PolymarketUSMarketsWebSocket:
         )
         self._connection_label: str = connection_label
         self._confirmation_window_secs: float | None = confirmation_window_secs
+        self._stable_reset_secs: float = stable_reset_secs
 
         self._client: WebSocketClient | None = None
         #: slug -> requestId. One subscribe call covers many slugs under one id.
@@ -379,6 +403,18 @@ class PolymarketUSMarketsWebSocket:
         self._confirmation_task: asyncio.Task[None] | None = None
         self._tasks: set[asyncio.Task[Any] | asyncio.Future[Any]] = set()
         self._retry_manager: RetryManager[bool] | None = None
+        #: Session-scoped: how many consecutive TRANSPORT drops have happened
+        #: since the last time the socket was stable for `_stable_reset_secs`
+        #: (`_note_stable_connection`). Two scalars, not a timestamp deque
+        #: (L-29) -- this is the count `_next_backoff_delay_ms` feeds to
+        #: `get_exponential_backoff`, and it is NOT the same thing as
+        #: `RetryManager.retries`, which only counts handshake REFUSALS
+        #: within one `_reconnect_with_backoff` call and resets on every new
+        #: `RetryManager` instance regardless of how the last one ended.
+        self._consecutive_drops: int = 0
+        #: `_loop.time()` the socket was first observed connected since the
+        #: last drop, or `None` while disconnected. Never a deque of samples.
+        self._stable_since: float | None = None
         self._closing: bool = False
         #: FATAL degradation only (:attr:`is_fatally_degraded`). A silent
         #: subscription must never be recorded here -- it has its own,
@@ -715,6 +751,24 @@ class PolymarketUSMarketsWebSocket:
         Cancellation is deliberately NOT degradation and is re-raised
         untouched -- ``close()`` sets ``_closing`` before it cancels, and a
         cancelled supervisor is a shutdown, not a feed failure.
+
+        GL-5 (session-scoped backoff): a handshake that SUCCEEDS and then
+        immediately closes previously reconnected at this method's raw poll
+        cadence (``_poll_secs``, ~1s in production) rather than at any
+        backoff delay, because ``_reconnect_with_backoff`` builds a FRESH
+        ``RetryManager`` per drop and that manager only sleeps after a
+        ``VenueTransportError`` -- a successful-then-dropped handshake incurs
+        zero delay from it. This method now tracks its OWN
+        ``_consecutive_drops`` across calls, sleeps
+        ``_next_backoff_delay_ms()`` before every reconnect attempt (jittered
+        so several shards dropping together do not thundering-herd the
+        venue), and resets that counter only once ``_note_stable_connection``
+        has observed the socket continuously connected for
+        ``_stable_reset_secs``. A cancellation of this pre-attempt sleep
+        (``close()`` cancelling this supervisor task) propagates through the
+        bare ``except asyncio.CancelledError: raise`` below exactly like any
+        other cancellation here -- it is a plain ``asyncio.sleep``, not
+        something ``RetryManager.cancel()`` needs to reach.
         """
         try:
             while not self._closing:
@@ -722,11 +776,19 @@ class PolymarketUSMarketsWebSocket:
                 client = self._client
                 if self._closing or client is None:
                     continue
-                if client.is_reconnecting() or not client.is_closed():
+                if client.is_reconnecting():
                     continue
+                if not client.is_closed():
+                    self._note_stable_connection()
+                    continue
+                self._stable_since = None
+                self._consecutive_drops += 1
+                delay_ms = self._next_backoff_delay_ms()
                 self._log.warning(
-                    "Polymarket.us markets websocket closed; reconnecting with fresh signature"
+                    "Polymarket.us markets websocket closed; reconnecting with fresh "
+                    f"signature (attempt={self._consecutive_drops}, delay_ms={delay_ms})"
                 )
+                await asyncio.sleep(delay_ms / _MS_PER_SECOND)
                 if not await self._reconnect_with_backoff():
                     self._fatally_degraded = True
                     self._log.error(
@@ -751,6 +813,50 @@ class PolymarketUSMarketsWebSocket:
                 f"{_traceback_frames(exc)}"
             )
 
+    def _note_stable_connection(self) -> None:
+        """Reset ``_consecutive_drops`` once the socket has stayed up long enough.
+
+        TRANSPORT liveness only: this reads ``WebSocketClient.is_closed()``
+        (via the caller, ``_supervise``), never frame arrival. A
+        heartbeat-alive, frame-dead shard is a DIFFERENT, already-covered
+        fault (:attr:`is_degraded` / :attr:`silent_subscriptions`) and is
+        deliberately NOT reset by this method -- a frame-based reset is out
+        of scope for GL-5.
+        """
+        now = self._loop.time()
+        if self._stable_since is None:
+            self._stable_since = now
+            return
+        if self._consecutive_drops and now - self._stable_since >= self._stable_reset_secs:
+            self._consecutive_drops = 0
+
+    def _next_backoff_delay_ms(self) -> int:
+        """Session-scoped exponential delay for the NEXT reconnect attempt.
+
+        Uses ``self._consecutive_drops`` (see ``_supervise``), not
+        ``RetryManager.retries``: those two counters answer different
+        questions and must not be conflated. ``backoff_factor`` deliberately
+        reuses ``RetryManager``'s own factor (``self._backoff_factor``,
+        default 2) rather than the native WS client's default 1.5, so the two
+        backoff curves already live on this connection share one shape.
+
+        ``jitter=False`` here plus a separate additive
+        ``random.randint(0, _RECONNECT_JITTER_MS)`` term, rather than
+        ``get_exponential_backoff(..., jitter=True)`` alone: that native
+        jitter is ``randint(delay_initial_ms, delay)``, which collapses to a
+        single value on attempt 1 (``delay == delay_initial_ms``) -- exactly
+        the attempt where several shards dropping together most need to be
+        spread apart.
+        """
+        delay_ms = get_exponential_backoff(
+            num_attempts=self._consecutive_drops,
+            delay_initial_ms=self._delay_initial_ms,
+            delay_max_ms=self._delay_max_ms,
+            backoff_factor=self._backoff_factor,
+            jitter=False,
+        )
+        return delay_ms + random.randint(0, _RECONNECT_JITTER_MS)
+
     async def _reconnect_with_backoff(self) -> bool:
         retry_manager: RetryManager[bool] = RetryManager(
             max_retries=self._reconnect_max_attempts,
@@ -771,10 +877,38 @@ class PolymarketUSMarketsWebSocket:
         return result is True
 
     async def _reconnect_once(self) -> bool:
+        await self._disconnect_leftover_client()
         await self._open()
         await self._replay_subscriptions()
         self._log.info("Polymarket.us markets websocket reconnected and re-subscribed")
         return True
+
+    async def _disconnect_leftover_client(self) -> None:
+        """Drop the previous attempt's client before ``_open`` replaces it.
+
+        ``_open`` only ASSIGNS ``self._client``; it never tears down whatever
+        was there before. Left alone, a storm of reconnect attempts holds two
+        Rust client objects alive at once for the duration of every
+        ``WebSocketClient.connect`` await -- the dying one and the pending
+        one -- instead of releasing the dying one first. Mirrors ``close``'s
+        own guard (``:524``): calling ``disconnect()`` on an
+        already-``is_closed()`` client is not exercised there either, so this
+        skips it the same way rather than assume it is safe to call twice.
+        """
+        client = self._client
+        if client is None:
+            return
+        self._client = None
+        if client.is_closed():
+            return
+        try:
+            await client.disconnect()
+        except (WebSocketClientError, OSError) as exc:
+            # Type name only. See the module note on transport exception text.
+            self._log.warning(
+                "Polymarket.us markets websocket: leftover client disconnect failed: "
+                f"{type(exc).__name__}"
+            )
 
     # -- confirmation -------------------------------------------------------
 
