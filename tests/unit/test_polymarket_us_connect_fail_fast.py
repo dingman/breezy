@@ -43,21 +43,27 @@ SAME native ``shutdown_system`` request, from `_connect()` itself.
 from __future__ import annotations
 
 import asyncio
-from collections.abc import Iterator, Mapping, Sequence
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from typing import Any
 
 import pytest
-from nautilus_trader.common.component import LiveClock, MessageBus
+from nautilus_trader.common.component import (
+    LiveClock,
+    MessageBus,
+    flush_logger,
+    init_logging,
+    is_logging_initialized,
+)
 from nautilus_trader.common.messages import ShutdownSystem
 from nautilus_trader.data.engine import DataEngine
 from nautilus_trader.test_kit.stubs.component import TestComponentStubs
 
 from breezy.adapters.polymarket_us import feed_fault
 from breezy.adapters.polymarket_us.config import PolymarketUSDataClientConfig
-from breezy.adapters.polymarket_us.data import build_data_client
-from breezy.adapters.polymarket_us.errors import VenueTransportError
+from breezy.adapters.polymarket_us.data import DISCOVERY_RELOAD_FLOOR_SECS, build_data_client
+from breezy.adapters.polymarket_us.errors import VenuePayloadError, VenueTransportError
 from tests.unit.test_polymarket_us_data import SLUG, make_instrument
-from tests.unit.test_polymarket_us_quote_tape_gap import FakeProvider
+from tests.unit.test_polymarket_us_quote_tape_gap import ControllableFeed, FakeProvider
 
 SHUTDOWN_TOPIC = "commands.system.shutdown"
 
@@ -155,6 +161,150 @@ def build_client_with_failing_feed(loop: asyncio.AbstractEventLoop) -> tuple[Any
     return client, feeds[0]
 
 
+class _OffsetClock(LiveClock):  # type: ignore[misc]  # LiveClock is a compiled Cython class erasing to Any
+    """A real ``LiveClock`` whose ``timestamp_ns`` can be advanced by hand.
+
+    ``Component._clock`` is ``cdef readonly`` (verified: reassigning it on an
+    already-built client raises ``AttributeError: ... not writable``, exactly
+    like ``Component._log`` below), so the offset clock is built and handed
+    to :func:`_build_client` BEFORE construction, never swapped in after.
+    """
+
+    def __init__(self) -> None:
+        super().__init__()
+        self._offset_ns = 0
+
+    def timestamp_ns(self) -> int:
+        return int(super().timestamp_ns()) + self._offset_ns
+
+    def advance_secs(self, secs: float) -> None:
+        self._offset_ns += int(secs * 1_000_000_000)
+
+
+class _InitializeStubProvider(FakeProvider):
+    """Raises from ``initialize()`` a fixed number of times, then loads.
+
+    An empty ``FakeProvider`` instrument list does NOT raise
+    (``tests/unit/test_polymarket_us_quote_tape_gap.py``), so empty listing
+    must be stubbed on ``initialize()`` itself.
+    """
+
+    def __init__(
+        self,
+        instruments: Sequence[Any],
+        *,
+        error: BaseException | None = None,
+        empty_times: int = 0,
+    ) -> None:
+        super().__init__(instruments)
+        self.initialize_calls = 0
+        self._error = error
+        self._empty_times = empty_times
+
+    async def initialize(self, reload: bool = False) -> None:
+        from breezy.adapters.polymarket_us.errors import EmptyClimateListingError
+
+        self.initialize_calls += 1
+        if self._error is not None:
+            raise self._error
+        if self.initialize_calls <= self._empty_times:
+            raise EmptyClimateListingError(
+                "Polymarket.us market discovery returned zero configured-city weather "
+                "markets this cycle; refusing to treat this as a quiet market"
+            )
+        await super().initialize(reload=reload)
+
+
+def _build_client(
+    loop: asyncio.AbstractEventLoop,
+    provider: FakeProvider,
+    *,
+    empty_discovery_retry_secs: float = 0.0,
+    feed_factory: Any | None = None,
+    clock: LiveClock | None = None,
+) -> Any:
+    clock = clock if clock is not None else LiveClock()
+    msgbus: MessageBus = TestComponentStubs.msgbus()
+    cache = TestComponentStubs.cache()
+    engine = DataEngine(msgbus=msgbus, cache=cache, clock=clock)
+    feeds: list[Any] = []
+
+    def default_feed_factory(handler: Any) -> ControllableFeed:
+        feed = ControllableFeed(handler)
+        feeds.append(feed)
+        return feed
+
+    client = build_data_client(
+        loop=loop,
+        name="POLYMARKET_US",
+        config=PolymarketUSDataClientConfig(
+            allow_foreign_origin=True,
+            api_base_url="https://api.example.invalid",
+            gateway_base_url="https://gateway.example.invalid",
+            ws_url="wss://api.example.invalid",
+            market_slugs=(SLUG,),
+            instrument_reload_interval_mins=5,
+            user_agent="breezy-test/1.0 (+mailto:ops@example.invalid)",
+            empty_discovery_retry_secs=empty_discovery_retry_secs,
+        ),
+        msgbus=msgbus,
+        cache=cache,
+        clock=clock,
+        instrument_provider=provider,
+        feed_factory=feed_factory or default_feed_factory,
+        quote_parser=lambda payload, *, instrument, ts_init: None,
+    )
+    engine.register_client(client)
+    return client
+
+
+def _patch_retry_sleep(
+    monkeypatch: pytest.MonkeyPatch,
+    clock: _OffsetClock,
+) -> list[float]:
+    sleeps: list[float] = []
+    real_sleep = asyncio.sleep
+
+    async def fake_sleep(delay: float, *args: object, **kwargs: object) -> None:
+        if delay == DISCOVERY_RELOAD_FLOOR_SECS:
+            sleeps.append(float(delay))
+            clock.advance_secs(delay)
+            return
+        await real_sleep(delay)
+
+    monkeypatch.setattr(
+        "breezy.adapters.polymarket_us.data.asyncio.sleep", fake_sleep
+    )
+    return sleeps
+
+
+def _capture_client_logs(
+    capfd: pytest.CaptureFixture[str],
+) -> Callable[[], list[str]]:
+    """Read back what the client's NATIVE Nautilus logger wrote (L-30).
+
+    ``Component._log`` is a ``cdef readonly Logger`` and ``Logger.info`` is
+    ``cpdef`` -- both reassignment attempts raise ``AttributeError: ...
+    read-only`` / ``not writable`` (verified directly against the installed
+    ``nautilus-trader==1.231.0``), so a log line cannot be intercepted by
+    monkeypatching the client. The Rust logging subsystem can only be
+    initialized ONCE per process (subsequent calls raise ``RuntimeError``),
+    hence the guard: this lets the real logger write to stdout, which
+    ``capfd`` reads back at the file-descriptor level (the Rust side does not
+    go through Python's ``sys.stdout``, so ``capsys`` would not see it).
+    """
+    if not is_logging_initialized():
+        init_logging()
+    capfd.readouterr()  # discard component-construction READY noise
+
+    def _read() -> list[str]:
+        flush_logger()
+        out, _err = capfd.readouterr()
+        return out.splitlines()
+
+    return _read
+
+
 def test_a_connect_failure_latches_a_fatal_fault_for_the_exit_status(
     loop: asyncio.AbstractEventLoop,
 ) -> None:
@@ -197,3 +347,103 @@ def test_a_connect_failure_requests_a_native_system_shutdown(
     command = published[0]
     assert isinstance(command, ShutdownSystem)
     assert command.component_id == client.id
+
+
+def test_initial_empty_listing_is_retried_then_connects(
+    loop: asyncio.AbstractEventLoop,
+    monkeypatch: pytest.MonkeyPatch,
+    capfd: pytest.CaptureFixture[str],
+) -> None:
+    """Empty listing is retried twice, then initialize succeeds and connect completes."""
+    clock = _OffsetClock()
+    provider = _InitializeStubProvider([make_instrument(SLUG)], empty_times=2)
+    client = _build_client(loop, provider, empty_discovery_retry_secs=600.0, clock=clock)
+    sleeps = _patch_retry_sleep(monkeypatch, clock)
+    read_logs = _capture_client_logs(capfd)
+
+    loop.run_until_complete(client._connect())
+    try:
+        assert provider.initialize_calls == 3
+        assert sleeps == [DISCOVERY_RELOAD_FLOOR_SECS, DISCOVERY_RELOAD_FLOOR_SECS]
+        assert feed_fault.fatal_feed_fault() is None
+        assert client.is_safe_mode is False
+        logged = read_logs()
+        assert any(
+            "empty-discovery retry" in line
+            and "remaining=" in line
+            and "next=" in line
+            for line in logged
+        ), logged
+    finally:
+        loop.run_until_complete(client._disconnect())
+
+
+def test_initial_empty_listing_exhaustion_latches_and_shuts_down(
+    loop: asyncio.AbstractEventLoop,
+    monkeypatch: pytest.MonkeyPatch,
+    capfd: pytest.CaptureFixture[str],
+) -> None:
+    """Budget exhaustion latches and shuts down; ``_connect`` does not raise."""
+    clock = _OffsetClock()
+    provider = _InitializeStubProvider([make_instrument(SLUG)], empty_times=100)
+    client = _build_client(loop, provider, empty_discovery_retry_secs=90.0, clock=clock)
+    sleeps = _patch_retry_sleep(monkeypatch, clock)
+    published: list[Any] = []
+    client._msgbus.subscribe(SHUTDOWN_TOPIC, published.append)
+    read_logs = _capture_client_logs(capfd)
+
+    loop.run_until_complete(client._connect())
+
+    assert provider.initialize_calls >= 2
+    assert DISCOVERY_RELOAD_FLOOR_SECS in sleeps
+    assert feed_fault.fatal_feed_fault() is not None
+    assert client.is_safe_mode is True
+    assert len(published) == 1
+    assert isinstance(published[0], ShutdownSystem)
+    logged = read_logs()
+    assert any("empty-discovery retry" in line for line in logged), logged
+
+
+def test_empty_discovery_retry_secs_zero_latches_on_the_first_empty_listing(
+    loop: asyncio.AbstractEventLoop,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Trade-node default: no retry, latch on the first empty listing."""
+    clock = _OffsetClock()
+    provider = _InitializeStubProvider([make_instrument(SLUG)], empty_times=100)
+    client = _build_client(loop, provider, empty_discovery_retry_secs=0.0, clock=clock)
+    sleeps = _patch_retry_sleep(monkeypatch, clock)
+    published: list[Any] = []
+    client._msgbus.subscribe(SHUTDOWN_TOPIC, published.append)
+
+    loop.run_until_complete(client._connect())
+
+    assert provider.initialize_calls == 1
+    assert sleeps == []
+    assert feed_fault.fatal_feed_fault() is not None
+    assert client.is_safe_mode is True
+    assert len(published) == 1
+
+
+def test_non_empty_payload_error_is_not_retried(
+    loop: asyncio.AbstractEventLoop,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Duplicate-slug payload errors fail immediately; empty-listing retry does not apply."""
+    clock = _OffsetClock()
+    provider = _InitializeStubProvider(
+        [make_instrument(SLUG)],
+        error=VenuePayloadError("duplicate slugs"),
+    )
+    client = _build_client(loop, provider, empty_discovery_retry_secs=600.0, clock=clock)
+    sleeps = _patch_retry_sleep(monkeypatch, clock)
+    published: list[Any] = []
+    client._msgbus.subscribe(SHUTDOWN_TOPIC, published.append)
+
+    loop.run_until_complete(client._connect())
+
+    assert provider.initialize_calls == 1
+    assert sleeps == []
+    assert feed_fault.fatal_feed_fault() is not None
+    assert client.is_safe_mode is True
+    assert len(published) == 1

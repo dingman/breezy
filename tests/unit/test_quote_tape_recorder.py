@@ -392,6 +392,26 @@ class TestQuoteTapeNodeConfig:
                 make_data_client_config(),
             )
 
+    def test_the_native_connect_timeout_covers_the_whole_empty_discovery_retry_budget(
+        self, tmp_path: Path
+    ) -> None:
+        """GL-12. Asserting the INEQUALITY, not the literal 3720 (review B1):
+
+        the exact margin is an implementation choice, but the kernel's own
+        ``_await_engines_connected`` timeout (``system/kernel.py:1298-1313``)
+        MUST outlast the empty-discovery retry budget wired onto the data
+        client, or a still-retrying ``_connect`` would be timed out from
+        under it into a half-started node (`system/kernel.py:1024-1025`
+        returns without ever raising or stopping).
+        """
+        config = build_quote_tape_node_config(
+            make_tape_settings(tmp_path), make_data_client_config()
+        )
+
+        wired = config.data_clients[POLYMARKET_US_CLIENT_NAME]
+        assert wired.empty_discovery_retry_secs == 3600.0
+        assert config.timeout_connection >= wired.empty_discovery_retry_secs + 120
+
 
 # ---------------------------------------------------------------------------
 # The load-bearing test: quotes reach disk and read back

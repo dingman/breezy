@@ -322,6 +322,32 @@ QUOTE_TAPE_FLUSH_INTERVAL_MS: int = 10_000
 #: writer, not the in-memory cache.
 QUOTE_TAPE_CACHE_CAPACITY: int = 1
 
+#: GL-12: seconds the quote-tape recorder retries an initial connect's
+#: ``EmptyClimateListingError`` before giving up. The venue's own daily
+#: discovery job lands the next day's climate cohort at **D-1 ~09:45Z,
+#: drifting to ~10:30Z** by the end of an observed cohort
+#: (``docs/evidence/venue/polymarket_us/
+#: LISTING_GAP_INCIDENT_2026-09-02T0845Z.md:32-36``). A 09:00Z
+#: ``try-restart`` that lands before that lag resolves must not latch a
+#: fatal fault the venue was always going to resolve within the hour --
+#: but it also must not retry forever: 3600s covers the observed 10:30Z
+#: lead with headroom, and `Restart=always` (`StartLimitBurst=20`,
+#: `RestartSec=30`) still recovers a listing that slips even later than
+#: that. The live trade node stays at the field default (0, fail-fast
+#: immediately) -- only this ONE process's config is widened.
+QUOTE_TAPE_EMPTY_DISCOVERY_RETRY_SECS: float = 3600.0
+
+#: GL-12: native `timeout_connection` (`system/config.py:85,127`, default
+#: 60.0) for the quote-tape node ONLY. Must exceed
+#: :data:`QUOTE_TAPE_EMPTY_DISCOVERY_RETRY_SECS` -- otherwise
+#: `NautilusKernel._await_engines_connected` (`system/kernel.py:1298-1313`)
+#: WARN-times-out and `start_async` (`:1024-1025`) returns without ever
+#: raising or stopping, while `_connect` is still legitimately retrying in
+#: the background: a half-started node, native-config option (C) rejected
+#: in the GL-12 plan. +120s margin over the retry budget covers the final
+#: attempt's own request latency.
+QUOTE_TAPE_TIMEOUT_CONNECTION_SECS: float = QUOTE_TAPE_EMPTY_DISCOVERY_RETRY_SECS + 120.0
+
 #: Mode the tape root is created with. Matches
 #: ``breezy.runtime.health.SNAPSHOT_DIR_MODE`` and the station-catalog
 #: convention. The tape is not a secret, but it is strategy-inferable: which
@@ -486,7 +512,12 @@ def build_quote_tape_node_config(
     # supported copy-with-change for a frozen Struct and it re-runs
     # `__post_init__`, so the config's own validation is not bypassed here.
     data_client_config = msgspec_replace(
-        data_client_config, recorder_instance_id=instance_id.value
+        data_client_config,
+        recorder_instance_id=instance_id.value,
+        # GL-12: quote-tape ONLY. See
+        # :data:`QUOTE_TAPE_EMPTY_DISCOVERY_RETRY_SECS` for why; the live
+        # trade node keeps the field default (0, fail-fast immediately).
+        empty_discovery_retry_secs=QUOTE_TAPE_EMPTY_DISCOVERY_RETRY_SECS,
     )
 
     # `msgspec.Struct` config classes are untyped to mypy (compiled Nautilus
@@ -520,6 +551,12 @@ def build_quote_tape_node_config(
             rotation_time=QUOTE_TAPE_ROTATION_TIME,
             rotation_timezone=QUOTE_TAPE_ROTATION_TIMEZONE,
         ),
+        # GL-12: kernel._check_engines_connected yields with sleep(0) while
+        # waiting (native, not a hang) -- this only widens how long that
+        # native wait is allowed to run so the whole empty-discovery retry
+        # budget fits inside it. See
+        # :data:`QUOTE_TAPE_TIMEOUT_CONNECTION_SECS`.
+        timeout_connection=QUOTE_TAPE_TIMEOUT_CONNECTION_SECS,
     )
     return cast(TradingNodeConfig, config)
 

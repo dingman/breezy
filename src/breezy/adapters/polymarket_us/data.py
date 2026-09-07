@@ -75,7 +75,11 @@ from nautilus_trader.model.identifiers import ClientId, InstrumentId, Venue
 from nautilus_trader.model.instruments import BinaryOption, Instrument
 
 from breezy.adapters.polymarket_us.config import PolymarketUSDataClientConfig
-from breezy.adapters.polymarket_us.errors import EmptyBookSideError, PolymarketUSError
+from breezy.adapters.polymarket_us.errors import (
+    EmptyBookSideError,
+    EmptyClimateListingError,
+    PolymarketUSError,
+)
 from breezy.adapters.polymarket_us.feed_fault import record_fatal_feed_fault
 from breezy.adapters.polymarket_us.parsing import (
     EXPIRED_MARKET_STATES,
@@ -933,15 +937,70 @@ class PolymarketUSDataClient(LiveMarketDataClient):
 
     # -- lifecycle --------------------------------------------------------
 
+    async def _initialize_instruments_for_connect(self) -> None:
+        """Initialize instruments, retrying ONLY an empty climate listing.
+
+        GL-12: the venue's own daily discovery lag (measured ~09:45-10:30Z,
+        see ``docs/evidence/venue/polymarket_us/
+        LISTING_GAP_INCIDENT_2026-09-02T0845Z.md:32-36``) can make the very
+        first ``initialize()`` after a 09:00Z rotate see zero configured-city
+        markets. Retrying at the discovery quota floor
+        (:data:`DISCOVERY_RELOAD_FLOOR_SECS`) rides out that lag instead of
+        latching a fatal fault the venue was always going to resolve on its
+        own within the hour.
+
+        Wall-clock via ``self._clock``, not an attempt counter: the budget is
+        ``self._venue_config.empty_discovery_retry_secs`` seconds of REAL
+        time, so it means the same thing regardless of how many attempts the
+        venue's own response latency allows within it.
+
+        Any OTHER exception -- a non-empty :class:`VenuePayloadError`
+        (duplicate slugs, stage-3 cohort failure), a transport error, a
+        reconcile failure -- is never retried here; it propagates immediately
+        to :meth:`_connect`'s own fatal-fault wrap on the FIRST failure
+        (L-6: promoting a shared flag to a kill switch inherits every
+        producer, so only this one dedicated exception type is retried).
+        """
+        deadline_secs = self._venue_config.empty_discovery_retry_secs
+        started_ns = self._clock.timestamp_ns()
+        attempt = 0
+        while True:
+            attempt += 1
+            try:
+                await self._instrument_provider.initialize()
+                return
+            except EmptyClimateListingError:
+                elapsed_secs = (self._clock.timestamp_ns() - started_ns) / 1_000_000_000.0
+                remaining_secs = deadline_secs - elapsed_secs
+                if remaining_secs <= 0:
+                    raise
+                self._log.info(
+                    f"empty-discovery retry {attempt} remaining={remaining_secs:.0f}s "
+                    f"next={DISCOVERY_RELOAD_FLOOR_SECS:.0f}s"
+                )
+                await asyncio.sleep(DISCOVERY_RELOAD_FLOOR_SECS)
+
     async def _connect(self) -> None:
         self._safe_mode = False
-        self._log.info("Initializing instruments...")
-        await self._instrument_provider.initialize()
-        self._send_all_instruments_to_data_engine()
-        await self._alert_on_missing_cache_after_push(self._provider_active_slugs())
-
         try:
+            self._log.info("Initializing instruments...")
+            await self._initialize_instruments_for_connect()
+            self._send_all_instruments_to_data_engine()
+            await self._alert_on_missing_cache_after_push(self._provider_active_slugs())
+
             await self._feed.connect()
+
+            await self._reconcile_discovered_subscriptions(cycle="initial")
+
+            self._update_instruments_task = self.create_task(
+                self._update_instruments(),
+                log_msg="update_instruments",
+            )
+
+            self._feed_watchdog = self._loop.create_task(
+                self._watch_feed(),
+                name="polymarket-us-feed-watchdog",
+            )
         except Exception as exc:  # noqa: BLE001 - any connect failure is fatal here
             # Nautilus's own `LiveDataClient.connect()` wrapper
             # (`live/data_client.py:222-234`) runs `_connect` in a task whose
@@ -955,23 +1014,19 @@ class PolymarketUSDataClient(LiveMarketDataClient):
             # the SAME fatal-fault latch and native shutdown request the
             # feed-loss watchdog already uses below, from the one place a
             # connect failure is actually observed.
+            #
+            # GL-12: widened from wrapping only `_feed.connect()` to the
+            # WHOLE body above -- an unwrapped `initialize()` (empty-listing
+            # exhaustion or any other discovery failure) swallowed the exact
+            # same way, into the exact same zombie.
             self._safe_mode = True
             self._set_connected(False)
-            reason = f"Polymarket.us markets feed failed to connect: {exc}"
+            reason = (
+                "Polymarket.us markets client failed to connect (feed "
+                f"connect, instrument initialize, or discovery): {exc}"
+            )
             self._request_fatal_shutdown(reason)
             return
-
-        await self._reconcile_discovered_subscriptions(cycle="initial")
-
-        self._update_instruments_task = self.create_task(
-            self._update_instruments(),
-            log_msg="update_instruments",
-        )
-
-        self._feed_watchdog = self._loop.create_task(
-            self._watch_feed(),
-            name="polymarket-us-feed-watchdog",
-        )
 
     async def _disconnect(self) -> None:
         await self._cancel_update_instruments()
