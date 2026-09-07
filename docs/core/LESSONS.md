@@ -1272,3 +1272,17 @@ Before a plan is dispatched for a backlog row that changes a classification, ret
 
 ### How to apply
 The search is mechanical: the input shape (status, id present, executions empty, terminal vs not) plus the proposed new outcome word. Hits in a build brief, a coordinator decision, or a parametrized test named for that shape are in scope. A HIGH-confidence plan that never names the prior ruling has not searched. Related: L-10 (brief vocabulary becomes fact), L-12 (pinned tests are contracts), L-18 (an outcome claim is a mechanism claim).
+
+## L-33 — A characterisation item has no RED; demand mutation evidence instead (2026-09-07)
+
+### What happened
+Backlog row GL-9 asked for "a synthetic 200+fill body through the live chain in a test". The plan listed a RED expectation for every new test. Two independent reviews showed the headline test already existed and passed (`tests/contract/test_live_fill_scoring_chain_contract.py:207-324`), that a proposed schema-equality assertion was a tautology (the writer and reader share the schema object), and that nothing in a no-`src/`-change item can go red at all. A build accepted on that plan would have reported a fabricated RED→GREEN.
+
+### Why this is binding
+RED→GREEN is the repo's change artifact (§5). For an item whose only deliverable is new assertions on unchanged code, "RED" cannot mean "fails before the change" — there is no change. Without a substitute, the implementer either invents a failure or ships assertions that cannot fail (L-24). Both look identical to a real increment in the return.
+
+### The rule
+Before dispatch, classify every backlog item as CHANGE (source delta; RED = the new test fails before the delta) or CHARACTERISATION (no source delta; RED = each new assertion is shown to FAIL when its expected value is deliberately perturbed, then restored). A characterisation plan that lists RED expectations, or a review that does not ask which assertions are genuinely new against the existing tests, is incomplete. An assertion that cannot be perturbed into failure (schema written and read with the same object; a fixture equal by construction, L-24) is not coverage and is refused.
+
+### How to apply
+The return for a characterisation item carries `MUTATION_RED_EVIDENCE`: one perturbation per new assertion with its failing id, then the restored GREEN line. Reviewers diff the new assertions against the existing module first ("already covered at `path:line`" closes the row without code). Related: L-24 (fixtures that always satisfy the invariant), L-30 (absence proves nothing), L-32 (a pin can pre-empt an open ruling — a characterisation pin of behaviour under ruling is refused).

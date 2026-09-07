@@ -58,12 +58,11 @@ Merged analysis, evidence and unlock observables: `docs/evidence/GO_LIVE_BLOCKER
 | ID | Own | Sev | Blocker (evidence in the doc) | Size |
 |---|---|---|---|---|
 | GL-1 | B | CRIT | GL-1a shipped (`9ad11ff`): every create-order outcome carries redacted `body_kind`/`body_len`/`state=`/`cum=` tokens and `_submit_order` logs them for every kind (L-30). RULING REQUESTED: amend R-7 item 5 or resolve zero-fills via a GET /v1/order/{id} state read designed with GL-4 (L-32) | M |
-| GL-4 | B | HIGH | One AMBIGUOUS burns the rest of the day: latch OPEN until operator (`client.py:1747-1758`), `_has_durable_fill_record` stub (`:730-733`). Auto-retire after a no-order probe | M |
+| GL-4 | B | HIGH | One AMBIGUOUS burns the rest of the day (`client.py:1747-1758`). **RULING REQUESTED 09-07:** an automated no-id retire after a sealed dual-GET probe amends R-7 item 5 ("exit is the clear tool") and R-4 invariant 1 (`_trading_refusals` append-only); two plan reviews scored risk <6 (clock-skew / index-lag false ABSENT ⇒ unbooked fill). Rule the amendment before any build (L-32) | M |
 | GL-5 | B | CRIT | WS reconnect storm: 09-05 189/241/281 five-second gaps per station window, 1673 reconnects → every afternoon uncovered under §9 any-overlap (`data.py:1685,1812`, `websocket.py`). 09-06 instance clean so far | L |
 | GL-6 | O | MED | Operator action remaining: `systemctl --user daemon-reload && systemctl --user restart breezy-pm-crh-v2-tally.timer`. The 17:15Z tick is inert until that reload runs | S |
 | GL-7 | O | SKIP | Operator 09-06: skip. Supervisor 2231261 + node stay in the uncapped `tmux-spawn-d35977dd` scope; SV-1 fix `c84317e` inactive until a relaunch | — |
 | GL-8 | B | MED | Instrument set frozen at 16:50 compose (`composition.py:116-150`), discovery reload clamped 21600 s: late-listed HIGH rungs never subscribed | M |
-| GL-9 | B | MED | Fill→ScoredTrial chain never run on real data (`record_fill` branch unexecuted, store has no parquet). Synthetic 200+fill body through the live chain in a test, then confirm on first fill | M |
 | GL-10 | O/B | DEFER | Operator 09-06: deprioritised. Alerts stay log-only (no `BREEZY_ALERT_WEBHOOK_URL`) | — |
 | GL-11 | B | LOW | Recorder OOM 09-04 (14.4 GB) / SIGKILL 09-05 at MemoryHigh predate the deque fix; 09-06 peak 914 MB. Watch | — |
 | GL-12 | B | CRIT | Recorder is a zombie since the 09:00Z rotate: `try-restart` lands in the recurrent 02:00 PT empty-climate-listing hole, the initial `initialize()` raise is outside the 09-04 fail-fast wrap (`6fcadae` wraps only `_feed.connect()`), and Nautilus stays RUNNING after the 60 s engine timeout, so systemd never restarts it (13 h / 0 quotes on 09-06; 09-06 afternoons uncovered). Fix ranked: (1) retry empty discovery on initial `_connect` with backoff, (2) widen the fail-fast wrap to all of `_connect` + exit 1, (3) move the rotate tick past ~09:45Z listing; operator restore now: `systemctl --user try-restart breezy-quote-tape.service` | M |
@@ -124,7 +123,7 @@ EXEC SPINE: write path verified 09-04 (`docs/plans/OP_SEQ_BOT_POSITIVE_CONTROL_2
 
 Polymarket.us docs re-check `docs/evidence/venue/polymarket_us/DOCS_RECHECK_2026-09-03.md`.
 
-Durable rules `docs/core/LESSONS.md` (L-1..L-13, all binding) · evidence
+Durable rules `docs/core/LESSONS.md` (L-1..L-33, all binding) · evidence
 `docs/evidence/` · live plan `docs/plans/EXEC_SPINE_2026-09-01.md` · runbook
 `docs/core/RUNBOOK_NWS_COLLECTION.md` · strategy authoring
 `docs/specs/STRATEGY_QUICKSTART.md` · pre-shrink history `docs/core/archive/`
