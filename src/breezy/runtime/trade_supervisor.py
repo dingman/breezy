@@ -10,8 +10,8 @@ Values-free, matching ``app/trade.py``: the seven operator-reserved values
 are never read, parsed, or logged by this module -- they travel ONLY inside
 ``env=`` when spawning the child, forwarded from the supervisor's own
 process environment as-is. Nothing under ``deploy/`` is touched; no systemd
-unit targets ``breezy-trade``; no value is ever written to argv, a file, or
-a log record.
+unit targets ``breezy-trade``; no value is ever written to argv, a file this
+process reads, or a log record.
 
 Null hypothesis checked before writing this: Nautilus Trader has no native
 scheduled-restart facility (``kernel.py`` carries no ``restart``/

@@ -136,11 +136,25 @@ The permit lives **10 hours** (`PERMIT_TTL_NS`, retargeted 2026-09-04 from 15 mi
 the four decision windows is 17:00 UTC → 01:00 UTC next day, plus 1 h slack each side). Launch the
 node once per trading day **before 17:00 UTC**; it is never re-minted in-process.
 
-Never place any of the values in a file: not a `.env`, not a systemd unit, not a shell rc file, not
-a commit, not a launcher script. `src/` and `scripts/` are structurally incapable of writing them, and
-the repo assigns no value to any of them anywhere. Accepted residual exposure of shell exports (the
-same class already accepted for the enablement variable): the values are readable from
-`/proc/<pid>/environ` by same-UID processes and may persist in shell history outside the repo.
+Never place any of the values in a file — except the two caps, which the operator MAY keep in the
+gitignored `/operator.env` at the repo root (never committed, never written by the build side, never
+read by repo Python). Enablement and the other session values stay out of that file and out of every
+other file: not a `.env`, not a systemd unit, not a shell rc file, not a commit, not a launcher
+script. `src/` and `scripts/` are structurally incapable of writing any of them, and the repo assigns
+no value to any of them anywhere.
+
+Operator flow (from the repo root; the build side never runs step 3):
+
+1. `cp operator.env.example operator.env` and fill in the two values; `chmod 600 operator.env`
+2. `.venv/bin/python scripts/operator/print_operator_controls.py --check-file operator.env`
+3. In the host-lifetime launch shell that carries the other exports: `set -a; . ./operator.env; set +a`,
+   confirm with `.venv/bin/python scripts/operator/print_operator_controls.py`, then launch the
+   supervisor exactly as §7 already says.
+
+Accepted residual exposure of shell exports (the same class already accepted for the enablement
+variable): the values are readable from `/proc/<pid>/environ` by same-UID processes and may persist
+in shell history outside the repo. New class for the two caps at rest in `/operator.env`: readable by
+any same-UID process, survives the shell, and enters backups.
 
 Absence fails closed: both caps are re-read on **every** authorization
 (`operator_controls.py:147-166`, `:333-337`) and raise on absence, blankness, malformation or
@@ -161,8 +175,9 @@ enablement variable, the maximum daily budget, the maximum per position, the per
 ceiling, the session notional ceiling, the session order count, and the operator identity — plus, when
 requesting the order path (step 8), the CRH enablement flag `BREEZY_ORDERS_ENABLED=1` (build-side, not
 operator-reserved — see `settings.py`'s `ORDERS_ENABLED_VAR`), `BREEZY_CURRENT_RUNG_HOLD=1` and
-`BREEZY_LIVE_OBSERVATIONS=1`. All of it goes only into the launching shell's own environment — never a
-file (§6).
+`BREEZY_LIVE_OBSERVATIONS=1`. Enablement and the other session values go only into the launching shell's own environment.
+The two caps may be sourced into that shell from the gitignored `/operator.env` per §6; repo
+Python never loads the file.
 
 The live-trading permit's TTL is 10 hours (`safety.py:157`, the union of the four decision windows plus
 slack), and `OrderSubmissionPermit.issue` (`runtime/order_enablement.py`) checks it once at startup,

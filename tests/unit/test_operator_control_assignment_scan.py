@@ -615,7 +615,7 @@ def test_only_the_definition_module_names_an_operator_reserved_control() -> None
     script, a JSON fixture, or a docstring code sample. Any of them naming a
     control lands here as a failing diff a reviewer has to look at.
     """
-    assert files_naming_a_control() == {DEFINITION_MODULE}
+    assert files_naming_a_control() == {DEFINITION_MODULE, "operator.env.example"}
 
 
 def test_the_census_fires_on_a_control_name_planted_in_a_config_file(

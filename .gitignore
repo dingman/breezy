@@ -3,6 +3,8 @@ __pycache__/
 *.py[cod]
 .env
 .env.*
+# Operator-owned file for the two reserved caps. Never commit it.
+/operator.env
 .polymarket-us-credentials.json
 *.pem
 *.key

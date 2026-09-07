@@ -18,9 +18,10 @@ OPEN items only. Rationale L-5; pre-shrink copy in `docs/core/archive/`.
 ## Operator control contract (set 2026-08-30) — BINDING
 
 Two reserved controls: **maximum daily budget** and **maximum per POSITION**
-(not per market). Values supplied 09-04 and live only in the launch shell,
-never on disk; present by NAME in the running supervisor/node environment
-(verified 09-06) and enforced per grant by `DailySpendLedger.authorize_order_cost`
+(not per market). Values supplied 09-04; the two caps may live ONLY in the
+operator's gitignored `operator.env` at the repo root (never committed, never
+written by the build side), still present by NAME in the running supervisor/node
+env (verified 09-06). Enforced per grant by `DailySpendLedger.authorize_order_cost`
 (`operator_controls.py:299-373`). Everything else is build-side.
 
 ## Standing verdicts that gate future work

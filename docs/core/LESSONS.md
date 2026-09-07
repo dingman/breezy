@@ -1138,15 +1138,18 @@ recorder, a daily relaunch — is started in its own session (`setsid` /
 never the coordinator's (a systemd unit where the runbook allows one; the
 detached in-memory supervisor of `docs/plans/TRADE_NODE_DAILY_RELAUNCH_2026-09-04.md`
 where it does not). A session-bound cron or `/loop` may *check* the process; it
-must never be the only thing that *starts* it.
+must never be the only thing that *starts* it. Five of the seven enablement
+values stay memory/shell-only; the two caps may live in the operator's
+gitignored `operator.env` at the repo root (never committed, never written by
+the build side).
 
 **How to apply.** Every session opens by checking `pgrep -f 'breezy-trade$'`
 (anchored — the supervisor's argv shares the prefix) and the newest trade log
 for `Received SIGTERM`; a SIGTERM that coincides with a session boundary is
-this lesson, not a venue event. When recovering, the seven enablement values
-are recovered in memory from the operator's own prior launch and never
-written to disk ([[L-22]] on unforgeable exclusion applies to the relaunch
-path too). Related: [[L-5]], [[L-23]].
+this lesson, not a venue event. When recovering, five of the seven enablement
+values stay memory/shell-only; the two caps may live in the operator's
+gitignored `operator.env`. [[L-22]] on unforgeable exclusion applies to the
+relaunch path too. Related: [[L-5]], [[L-23]].
 
 ## L-27 — A test that configures a process-global logger can write into the production audit log (2026-09-05)
 

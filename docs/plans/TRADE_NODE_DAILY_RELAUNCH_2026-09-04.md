@@ -2,12 +2,14 @@
 
 GOAL STATE: for every trading day D (UTC), exactly one `breezy-trade` process holds `<store>.intent.lock` and a
 permit covering [17:00 UTC D, 01:00 UTC D+1] runs continuously from ≤16:50 UTC D to ≥02:00 UTC D+1; no second
-`breezy-trade` ever runs concurrently; none of the seven values is ever written to any file, unit, rc, or repo
-path; no systemd unit targets `breezy-trade`; no OPEN submit-intent survives a crash undetected [B1]; supervisor
-death never silently loses more than one day [B2]; every process runs with `RLIMIT_CORE=0` and never
-`repr()`/`str()`s an environ on any exception path [R9]; readiness gating never depends on an unpinned Nautilus
-log string [E1]. Falsifiable by: 0 or >1 concurrent flock holders; node not ready by 17:00 UTC; a value on disk;
-a trade-node unit file; an OPEN intent with no alert; a core dump; an env dump in any log.
+`breezy-trade` ever runs concurrently; five of the seven values stay memory/shell-only; the two caps may live
+only in the operator's gitignored root `operator.env` (never committed, never written by the build side); none
+of the seven is written to a unit, rc, or any other repo path; no systemd unit targets `breezy-trade`; no OPEN
+submit-intent survives a crash undetected [B1]; supervisor death never silently loses more than one day [B2];
+every process runs with `RLIMIT_CORE=0` and never `repr()`/`str()`s an environ on any exception path [R9];
+readiness gating never depends on an unpinned Nautilus log string [E1]. Falsifiable by: 0 or >1 concurrent
+flock holders; node not ready by 17:00 UTC; a non-cap value on disk; a committed `operator.env`; a trade-node
+unit file; an OPEN intent with no alert; a core dump; an env dump in any log.
 
 ## 2. Options considered
 
@@ -42,10 +44,11 @@ Peer ruling: a supervisor holding values only in memory, forwarding via child `e
 persistence (:183-184). **Coordinator decision (2026-09-04, build side):** the supervisor is a values-free,
 tested repo module (`src/breezy/runtime/trade_supervisor.py`, console entry `breezy-trade-supervisor`) in
 exactly the same category as `app/trade.py` — it reads the seven values only from its own environment,
-which the launching shell exports inline per runbook §6; nothing under `deploy/`, no unit, no file ever
-carries a value, NO values in argv. The runbook's "launcher script" ban is applied by its stated reason
-(a file carrying the enablement values), which a values-free module does not violate; an untracked,
-untested in-memory body would make the build-stage test obligations below impossible to honour.
+which the launching shell exports inline per runbook §6; nothing under `deploy/`, no unit, no file this
+process reads carries a value (the two caps may live in the operator's gitignored `operator.env`, which
+the supervisor never opens), NO values in argv. The runbook's "launcher script" ban is applied by its
+stated reason (a file carrying the enablement values), which a values-free module does not violate; an
+untracked, untested in-memory body would make the build-stage test obligations below impossible to honour.
 
 **Env vs argv:** values travel via `env=` only, matching `config_from_env`/`exec_config_from_env` (runbook:179).
 Supervisor argv carries a distinct token, `breezy-trade-supervisor-daily`, never substring-shared with the
@@ -142,7 +145,8 @@ SIGTERM the supervisor (never SIGKILL), then SIGTERM the tracked node — no fil
 ## 5. Security
 
 `/proc/<pid>/environ` exposure is the same CLASS as R3 but LONGER RESIDENCY — disclosed, not parity [R5]. No new
-file holds values; supervisor source lives outside the repo tree or in-memory only. No new systemd unit.
+file this process reads holds values; the two caps may live in the operator's gitignored `operator.env`.
+Supervisor source lives outside the repo tree or in-memory only. No new systemd unit.
 `RLIMIT_CORE=0` on both processes; no env `repr()`/`str()` on any exception path [R9]. Swap residency accepted,
 not mitigated. **[Security LOW]** the supervisor's own alert `detail` payload is always a fixed enum string
 (e.g. `permit_refused`, `intent_open`, `lock_held`) — never exception text or any value-bearing string, matching

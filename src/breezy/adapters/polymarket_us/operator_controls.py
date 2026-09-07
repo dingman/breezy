@@ -23,7 +23,9 @@ THE ARRIVAL PATH, AND THE ONE RULE
 ----------------------------------
 
 The operator exports both variables in the shell that launches
-``breezy-trade``. **No value for either control is assigned anywhere in this
+``breezy-trade``. The operator MAY keep the two values in the gitignored root
+``operator.env`` and source it from THEIR shell; repo Python still never loads
+or assigns it. **No value for either control is assigned anywhere in this
 repository** -- not in ``src/``, ``scripts/``, ``tests/``, a fixture, a
 ``conftest``, a committed ``.env``, a systemd unit, a default argument, or an
 ``os.environ.get(NAME, <fallback>)``. That is not a convention: it is scanned

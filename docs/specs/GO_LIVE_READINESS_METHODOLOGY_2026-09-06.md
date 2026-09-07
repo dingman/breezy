@@ -31,7 +31,7 @@ Entered only when every criterion is true; evidence is a named artefact, never a
 |---|---|---|
 | **L0 Build-complete** | PREREG registered (manifest `status: REGISTERED`); no-egress gate green at HEAD; operator-control census and NO-SEND guards green; `allow_short=False`. | → L1 when the node runs |
 | **L1 Shadow** | Node runs, strategy observes and latches, **no** permit line in the node log, enablement absent. Shadow rows never feed a verdict. | → L2 when a permit is minted |
-| **L2 Live-small, armed** | Permit line in the node log for this boot with unexpired TTL; both reserved caps present **by name** in the launch environment (values never on disk); submit path reachable. **← TODAY** | → L2.1 on first admitted trial; ↓ L1 only if the operator disables |
+| **L2 Live-small, armed** | Permit line in the node log for this boot with unexpired TTL; both reserved caps present **by name** in the launch environment (values never on disk except the two caps in the operator's gitignored `operator.env`); submit path reachable. **← TODAY** | → L2.1 on first admitted trial; ↓ L1 only if the operator disables |
 | **L2.1 Live-small, accruing** | ≥ 1 durable fill record **and** v2 tally `n ≥ 1` (a fill that cannot be scored does not count). | → L3 or any KILL |
 | **L3 Live-evidenced** | v2 look prints **SURVIVE**: `S_k ≥ b_k^eff` and ΣPnL > 0 and no `cell_dead` and structural-dead not fired. SURVIVE closes the family's test. | → L4 by operator decision |
 | **L4 Scaled** | Operator raises the two reserved knobs after L3. The terminal BCa bound and the G-02 ROI standing verdict are reported **as evidence for** that decision; the build side sets no precondition. | Circuit breakers as L2, against the new caps |
