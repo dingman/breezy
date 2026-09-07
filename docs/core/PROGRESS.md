@@ -72,6 +72,9 @@ Merged analysis, evidence and unlock observables: `docs/evidence/GO_LIVE_BLOCKER
 
 Verified NOT blockers 09-06: exec client connected + reconciled, balances 97.91, permit issued, caps/enablement present, OP-SEQ control CLOSED (GTC only), obs feed live, 24 rungs subscribed, rotation 09:00Z outside every window.
 
+### LADDER_EV (opened 2026-09-07)
+- [MED] LADDER_EV whole-ladder EV scanner: design v2 peer-reviewed, `docs/strategies/breezy_strategy_ladder_ev_2026-09-07.md`. DEGRADED-only; shadow while CRH live; census 09-07 train 7/15 covered days ⇒ §12 kill INSUFFICIENT DATA. Stage 1 pure modules landed (42 tests, 2 reviews). Next: stage 2 strategy.py + 6-rung freeze + kill script.
+
 ### Clock-speed track (opened 2026-09-04)
 - **[HIGH] Kalshi sibling family on NEW stations** — plan `docs/plans/KALSHI_CRH_EXPANSION_PLAN_2026-09-04.md` Rev 3; PREREG draft `docs/specs/PREREG_v1_kalshi_current_rung_hold_DRAFT_2026-09-04.md`. Open: S4 registry (`wip/kalshi-s4-registry`), S5–S7 read path, S8 CLI-final-vs-TWC reconciliation (n≥90), S9 rev2 cells. **Operator-only:** Kalshi account/KYC/funding/API key (S11); fee schedule. Not prioritised until Polymarket.us fills (operator 09-04).
 - **PREREG v2 REGISTERED 2026-09-05** (`4975fba`; spec BINDING §13, manifest `pm_us_crh_v2` d0=2026-09-05, v2 tally 15:30Z, n=0). C1–C4 and exclusions ACKNOWLEDGED (`grok_admission_exclusions_ack_2026-09-05.md`). Rejected by ruling: SPRT α=0.05, plug-in-π Z, freeze-π, shadow/paper/archive/Kalshi rows in live n, retroactive scoring, `venue` stratum, qty>1, NYC, pooling venues.

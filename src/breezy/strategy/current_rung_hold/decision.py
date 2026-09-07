@@ -110,6 +110,7 @@ __all__ = [
     "Refuse",
     "Take",
     "evaluate_decision",
+    "is_legal_cell",
 ]
 
 #: The closed set of refusal reasons this module can emit. Widening this set
@@ -244,6 +245,9 @@ def _is_legal_cell(width_code: int, m_code: int) -> bool:
     populated (L-22: unforgeable, not offered).
     """
     return (width_code == 0 and m_code == 0) or width_code == 1
+
+
+is_legal_cell = _is_legal_cell
 
 
 def _fee(ask: Decimal, fee_coefficient: Decimal) -> Decimal:
