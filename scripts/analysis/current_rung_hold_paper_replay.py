@@ -83,6 +83,7 @@ from breezy.strategy.current_rung_hold.backtest_only import (
 from breezy.strategy.current_rung_hold.config import CurrentRungHoldConfig
 from breezy.strategy.current_rung_hold.strategy import _local_hour
 from breezy.strategy.current_rung_hold.trial_day_latch import (
+    DEFAULT_TRIAL_KEY_PREFIX,
     TrialDayLatch,
     open_trial_day_latch,
 )
@@ -293,13 +294,17 @@ def read_asos_rows(csv_path: Path) -> list[dict[str, str]]:
 
 
 @contextmanager
-def _latch_context(store_path: Path) -> Iterator[TrialDayLatch]:
+def _latch_context(
+    store_path: Path, *, key_prefix: str = DEFAULT_TRIAL_KEY_PREFIX,
+) -> Iterator[TrialDayLatch]:
     with open_submit_intent_latch(SqliteStateStore(store_path), store_path) as intent_latch:
-        yield open_trial_day_latch(intent_latch)
+        yield open_trial_day_latch(intent_latch, key_prefix=key_prefix)
 
 
-def _latch_factory(store_path: Path) -> Callable[[], AbstractContextManager[TrialDayLatch]]:
-    return lambda: _latch_context(store_path)
+def _latch_factory(
+    store_path: Path, *, key_prefix: str = DEFAULT_TRIAL_KEY_PREFIX,
+) -> Callable[[], AbstractContextManager[TrialDayLatch]]:
+    return lambda: _latch_context(store_path, key_prefix=key_prefix)
 
 
 def _entry_context_for(
@@ -339,6 +344,7 @@ def _entry_contexts_from_latch(
     climate_day: str,
     latch_store_path: Path,
     scheduled_release_at_ns: int,
+    latch_key_prefix: str = DEFAULT_TRIAL_KEY_PREFIX,
 ) -> dict[str, ReplayEntryContext]:
     """D1: `entry_ask` for the ONE latched instrument, sourced from the
     strategy's own trial-day latch record -- never the tape's first quote.
@@ -356,7 +362,7 @@ def _entry_contexts_from_latch(
     filled_ids = _filled_instrument_ids(engine)
     if not filled_ids:
         return {}
-    with _latch_context(latch_store_path) as latch:
+    with _latch_context(latch_store_path, key_prefix=latch_key_prefix) as latch:
         record = latch.record(station, climate_day)
     valid = record is not None and record.reason == "taken"
     unexplained = sorted({
@@ -470,6 +476,8 @@ def run_one_precision_arm(
     precision_mode: PrecisionMode,
     latch_store_path: Path,
     settlement_by_key: SettlementByKey,
+    strategy_cls: type[CurrentRungHoldBacktestStrategy] | type = CurrentRungHoldBacktestStrategy,
+    latch_key_prefix: str = DEFAULT_TRIAL_KEY_PREFIX,
 ) -> PrecisionArmResult:
     """Run one (lag, precision) arm of the replay; return its `FilledTrial`s
     AND the strategy's own refusal counts (`PrecisionArmResult`).
@@ -556,8 +564,11 @@ def run_one_precision_arm(
         instrument_ids=tuple(i.id for i in instruments), stations=(station,),
     )
 
-    strategy = CurrentRungHoldBacktestStrategy(
-        cfg, trial_day_latch_factory=_latch_factory(latch_store_path),
+    strategy = strategy_cls(
+        cfg,
+        trial_day_latch_factory=_latch_factory(
+            latch_store_path, key_prefix=latch_key_prefix,
+        ),
     )
 
     with backtest(config, strategies=(strategy,), allow_idle_strategies=True) as engine:
@@ -574,6 +585,7 @@ def run_one_precision_arm(
             climate_day=climate_day,
             latch_store_path=latch_store_path,
             scheduled_release_at_ns=max(ts_values) + SEVEN_DAYS_NS,
+            latch_key_prefix=latch_key_prefix,
         )
         trials = filled_trials_from_engine(engine, entry_contexts)
     return PrecisionArmResult(

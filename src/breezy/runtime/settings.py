@@ -103,6 +103,11 @@ LIVE_OBSERVATIONS_VAR = "BREEZY_LIVE_OBSERVATIONS"
 #: and burn the one trial. The tape recorder never reads this variable.
 CURRENT_RUNG_HOLD_VAR = "BREEZY_CURRENT_RUNG_HOLD"
 
+#: Phase 0 shadow ``continuous_rung_hold`` family. OFF unless set to exactly
+#: ``"1"``. Composed beside v2; never receives the order-submission permit
+#: (Phase 0: permit is ``None`` by construction).
+CONTINUOUS_RUNG_HOLD_VAR = "BREEZY_CONTINUOUS_RUNG_HOLD"
+
 #: Trade-role catalog root used as the pre-build discovery source when
 #: :data:`CURRENT_RUNG_HOLD_VAR` is on. Distinct from
 #: :data:`QUOTE_TAPE_CATALOG_VAR`, which remains the recorder's single-reader
@@ -303,6 +308,10 @@ def _parse_live_observations(env: Mapping[str, str]) -> bool:
 
 def _parse_current_rung_hold(env: Mapping[str, str]) -> bool:
     return env.get(CURRENT_RUNG_HOLD_VAR) == "1"
+
+
+def _parse_continuous_rung_hold(env: Mapping[str, str]) -> bool:
+    return env.get(CONTINUOUS_RUNG_HOLD_VAR) == "1"
 
 
 def _parse_orders_enabled(env: Mapping[str, str]) -> bool:
@@ -736,7 +745,10 @@ class BreezyTradeSettings:
     #: :data:`CURRENT_RUNG_HOLD_VAR`. ``orders_enabled`` is not a field here
     #: and cannot be reached from this object.
     current_rung_hold: bool = False
-    #: Pre-build discovery catalog, set only when ``current_rung_hold`` is on.
+    #: Phase 0 shadow continuous-rung-hold family. Default OFF; see
+    #: :data:`CONTINUOUS_RUNG_HOLD_VAR`.
+    continuous_rung_hold: bool = False
+    #: Pre-build discovery catalog, set when either rung-hold family is on.
     #: See :data:`TRADE_CATALOG_ROOT_VAR`.
     catalog_root: Path | None = None
     #: CRH enablement step 8: a REQUEST that the order path be reachable.
@@ -773,28 +785,42 @@ def load_trade_settings(env: Mapping[str, str] | None = None) -> BreezyTradeSett
 
     live_observations = _parse_live_observations(active_env)
     current_rung_hold = _parse_current_rung_hold(active_env)
-    if current_rung_hold and not live_observations:
+    continuous_rung_hold = _parse_continuous_rung_hold(active_env)
+    rung_hold_family = current_rung_hold or continuous_rung_hold
+    if rung_hold_family and not live_observations:
+        which = CURRENT_RUNG_HOLD_VAR if current_rung_hold else CONTINUOUS_RUNG_HOLD_VAR
         raise SettingsError(
-            f"{CURRENT_RUNG_HOLD_VAR}=1 requires {LIVE_OBSERVATIONS_VAR}=1: "
+            f"{which}=1 requires {LIVE_OBSERVATIONS_VAR}=1: "
             "the strategy prices against StationObservation, so enabling it "
             "without the publisher would latch observation_unavailable on "
             "every station-day and burn the one trial"
         )
     orders_enabled_requested = _parse_orders_enabled(active_env)
     if orders_enabled_requested and not (current_rung_hold and live_observations):
+        # current_rung_hold specifically -- NOT rung_hold_family -- to match
+        # OrderSubmissionPermit.issue()'s own gate exactly (order_enablement.py:
+        # "current_rung_hold and live_observations must both be enabled").
+        # continuous_rung_hold (v3, Phase 0) never holds the permit
+        # (composition.py::phase0_family_permits), so accepting it here
+        # would let this validation pass and then fail closed downstream --
+        # a settings-load-time SettingsError (exit 2), not issue()'s FATAL
+        # OrderSubmissionRefused (exit 1).
         raise SettingsError(
             f"{ORDERS_ENABLED_VAR}=1 requires {CURRENT_RUNG_HOLD_VAR}=1 and "
-            f"{LIVE_OBSERVATIONS_VAR}=1: a request for the order path to be "
-            "reachable is meaningless without the strategy and its price "
-            "source both enabled"
+            f"{LIVE_OBSERVATIONS_VAR}=1: Phase 0 forbids "
+            f"{CONTINUOUS_RUNG_HOLD_VAR}=1 (v3) from ever holding the "
+            "order-submission permit, so a request for the order path to be "
+            "reachable is meaningless without current_rung_hold and its "
+            "price source both enabled"
         )
-    catalog_root = _parse_trade_catalog_root(active_env) if current_rung_hold else None
+    catalog_root = _parse_trade_catalog_root(active_env) if rung_hold_family else None
 
     return BreezyTradeSettings(
         trader_id=raw.strip(),
         log_level=_parse_log_level(active_env),
         live_observations=live_observations,
         current_rung_hold=current_rung_hold,
+        continuous_rung_hold=continuous_rung_hold,
         catalog_root=catalog_root,
         orders_enabled_requested=orders_enabled_requested,
     )

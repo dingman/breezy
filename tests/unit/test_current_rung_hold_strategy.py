@@ -21,6 +21,7 @@ from __future__ import annotations
 import ast
 import datetime as dt
 import inspect
+import itertools
 import textwrap
 from collections.abc import Callable, Iterator
 from contextlib import AbstractContextManager, contextmanager
@@ -467,6 +468,59 @@ class TestObservationRefusals:
         assert later_record is not None
         # LAX/SON/12/open_upper p_hold_lower=0.7918; ask=0.40 clears break-even.
         assert later_record.reason == "taken"
+
+    def test_observation_ambiguous_returns_before_consume_and_gate_order(
+        self,
+    ) -> None:
+        """ARCH (a): pin the consume-site ORDERING at strategy.py.
+
+        ``observation_ambiguous`` must return BEFORE ``consume``. The WAIT
+        gates (latch-first, window, executable, running-max, current-rung)
+        must run in that order before evaluate/ambiguous. If this handling
+        cannot be hoisted into ``tick_eval`` without changing this order,
+        it stays in the v2 strategy.
+        """
+        source = inspect.getsource(CurrentRungHoldStrategy.on_quote_tick)
+        mark_at = source.find("_report_open_position_mark")
+        consumed_at = source.find("is_consumed")
+        window_at = source.find("_OUTSIDE_DECISION_WINDOW")
+        exec_at = source.find("_DIAG_NOT_EXECUTABLE")
+        max_at = source.find("_DIAG_NO_RUNNING_MAX_YET")
+        rung_at = source.find("_DIAG_RUNG_NOT_CURRENT")
+        ambiguous_at = source.find("OBSERVATION_AMBIGUOUS")
+        consume_at = source.find("self._latch.consume")
+        positions = {
+            "mark": mark_at,
+            "is_consumed": consumed_at,
+            "window": window_at,
+            "not_executable": exec_at,
+            "no_running_max": max_at,
+            "rung_not_current": rung_at,
+            "observation_ambiguous": ambiguous_at,
+            "consume": consume_at,
+        }
+        missing = [name for name, pos in positions.items() if pos == -1]
+        assert missing == [], f"gate markers missing from on_quote_tick: {missing}"
+        ordered = [
+            "mark",
+            "is_consumed",
+            "window",
+            "not_executable",
+            "no_running_max",
+            "rung_not_current",
+            "observation_ambiguous",
+            "consume",
+        ]
+        for earlier, later in itertools.pairwise(ordered):
+            assert positions[earlier] < positions[later], (
+                f"{earlier} must precede {later} in on_quote_tick "
+                f"({positions[earlier]} >= {positions[later]})"
+            )
+        between = source[ambiguous_at:consume_at]
+        assert "return" in between, (
+            "observation_ambiguous must return before consume "
+            "(return-before-consume at the strategy consume site)"
+        )
 
 
 class TestFeeScheduleGuard:

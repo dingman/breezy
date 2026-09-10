@@ -272,6 +272,7 @@ class _FakeSettings:
     orders_enabled_requested = True
     current_rung_hold = True
     live_observations = True
+    continuous_rung_hold = False
 
 
 def _durable_accept_body(*, commission: str = "0.03", last_px: str = "0.37") -> bytes:

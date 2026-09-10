@@ -31,11 +31,14 @@ from breezy.domain.weather_bucket_facts import (
 )
 from breezy.strategy.current_rung_hold.composition import (
     NoTradableInstrumentsError,
+    build_continuous_rung_hold_strategies,
     build_current_rung_hold_strategies,
+    phase0_family_permits,
     resolve_station_instrument_ids,
     strategy_component_id,
 )
 from breezy.strategy.current_rung_hold.config import SUPPORTED_STATIONS
+from breezy.strategy.current_rung_hold.continuous_strategy import ContinuousRungHoldStrategy
 from breezy.strategy.current_rung_hold.strategy import CurrentRungHoldStrategy
 from breezy.strategy.weather_common.refusals import RefusalCounter
 
@@ -489,3 +492,75 @@ class TestInstallRefusalWatch:
             ("position_events", "position_alerter"),
         }
         assert len(_ALERTER_BINDINGS) == 3
+
+
+def test_continuous_builder_uses_distinct_strategy_id(tmp_path: Path) -> None:
+    _write(
+        tmp_path,
+        [
+            _binary(
+                "tc-temp-sfohigh-2026-09-04-gte70lt71f",
+                info=_known(station="SFO", day=_DAY),
+            ),
+        ],
+    )
+    v2 = build_current_rung_hold_strategies(
+        catalog_root=tmp_path,
+        today_by_station=_TODAY,
+        trial_day_latch_factory=_unused_latch_factory,
+    )
+    v3 = build_continuous_rung_hold_strategies(
+        catalog_root=tmp_path,
+        today_by_station=_TODAY,
+        trial_day_latch_factory=_unused_latch_factory,
+        order_submission_permit=None,
+    )
+    assert len(v2) == 1 and len(v3) == 1
+    assert isinstance(v2[0], CurrentRungHoldStrategy)
+    assert isinstance(v3[0], ContinuousRungHoldStrategy)
+    assert str(v2[0].id) == "CurrentRungHoldStrategy-SFO"
+    assert str(v3[0].id) == "ContinuousRungHoldStrategy-SFO"
+    assert v3[0]._order_submission_permit is None
+
+
+def test_continuous_builder_refuses_a_non_none_permit(tmp_path: Path) -> None:
+    """Phase 0 seal: `build_continuous_rung_hold_strategies` refuses a
+    non-None `order_submission_permit`, naming Phase 0 in the error."""
+    from breezy.strategy.current_rung_hold.continuous_strategy import (
+        Phase0PermitForbiddenError,
+    )
+
+    _write(
+        tmp_path,
+        [
+            _binary(
+                "tc-temp-sfohigh-2026-09-04-gte70lt71f",
+                info=_known(station="SFO", day=_DAY),
+            ),
+        ],
+    )
+    with pytest.raises(Phase0PermitForbiddenError, match="Phase 0"):
+        build_continuous_rung_hold_strategies(
+            catalog_root=tmp_path,
+            today_by_station=_TODAY,
+            trial_day_latch_factory=_unused_latch_factory,
+            order_submission_permit=object(),  # type: ignore[arg-type]
+        )
+
+
+def test_no_flag_combination_mints_two_sending_families() -> None:
+    fake_permit = object()
+    for current in (False, True):
+        for cont in (False, True):
+            for permit in (None, fake_permit):
+                v2, v3 = phase0_family_permits(
+                    current_rung_hold=current,
+                    continuous_rung_hold=cont,
+                    permit=permit,  # type: ignore[arg-type]
+                )
+                assert v3 is None
+                if current and permit is not None:
+                    assert v2 is permit
+                else:
+                    assert v2 is None
+                assert not (v2 is not None and v3 is not None)

@@ -169,6 +169,115 @@ def _rows(n: int, **kwargs: Any) -> tuple[ScoredTrial, ...]:
 # --- obligation (a): held/pnl-sign assertion --------------------------------
 
 
+def test_v3_row_does_not_refuse_v2_tally_batch(
+    tmp_path: Path,
+    tally_mod: ModuleType,
+    real_artefact: BoundaryArtefact,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Prefix-filter before assert_family_only: v2 rows tally; drops are loud."""
+    v2_rows = _rows(2, prefix=_PM_PREFIX)
+    v3_row = _row(99, prefix="continuous_rung_hold/trial/")
+    mixed = (*v2_rows, v3_row)
+    manifest = _manifest(tmp_path)
+    with caplog.at_level("WARNING"):
+        kept = tally_mod.filter_rows_to_manifest_prefix(
+            mixed, manifest, store_declared_single_family=False,
+        )
+    assert kept == v2_rows
+    assert "dropped 1 non-manifest row" in caplog.text
+    assert "continuous_rung_hold/trial/" in caplog.text
+    tally = tally_mod.build_family_tally_v2(
+        kept, manifest=manifest, artefact=real_artefact,
+    )
+    assert tally.n_scored == 2
+    with pytest.raises(tally_mod.FamilyStoreContaminationError) as excinfo:
+        tally_mod.build_family_tally_v2(
+            mixed, manifest=manifest, artefact=real_artefact,
+        )
+    assert "1 non-manifest" in str(excinfo.value)
+
+
+def test_malformed_v3_row_never_reaches_the_integrity_guards_still_raises_contamination(
+    tmp_path: Path, tally_mod: ModuleType, real_artefact: BoundaryArtefact
+) -> None:
+    """Order fix: the prefix filter must run BEFORE
+    `_assert_held_matches_pnl_sign`. A v3 row that violates the held/pnl-sign
+    guard must never be scored -- it must be dropped by the filter first, so
+    the whole tally still refuses with `FamilyStoreContaminationError` (the
+    correct diagnosis: contamination, not a v2 data-integrity failure) rather
+    than a bare `ScoredTrialDataIntegrityError` from the guard tripping on a
+    foreign row it should never have seen."""
+    v2_rows = _rows(2, prefix=_PM_PREFIX)
+    malformed_v3_row = dataclasses.replace(
+        _row(99, prefix="continuous_rung_hold/trial/"), pnl=Decimal("-0.50")
+    )
+    mixed = (*v2_rows, malformed_v3_row)
+    manifest = _manifest(tmp_path)
+    with pytest.raises(tally_mod.FamilyStoreContaminationError) as excinfo:
+        tally_mod.build_family_tally_v2(mixed, manifest=manifest, artefact=real_artefact)
+    assert "1 non-manifest" in str(excinfo.value)
+
+
+def test_a_well_formed_v3_parquet_sharing_the_store_dir_does_not_alter_the_v2_tally(
+    tmp_path: Path, tally_mod: ModuleType, real_artefact: BoundaryArtefact
+) -> None:
+    """Obligation (c)'s raw-store collision scan must be prefix-aware: a
+    `(trial_id, score_seq)` collision entirely within a foreign (v3)
+    parquet file, sharing the same `--store-dir` as v2 (the reviewer-noted
+    default: score_live_trials.py:131's single scorer dir), must not abort
+    v2's tally, and v2's `n_scored`/verdict must be identical to a store
+    holding only the v2 rows."""
+    from breezy.persistence.scored_trial_store import read_scored_trials, write_scored_trials
+
+    manifest = _manifest(tmp_path)
+    v2_rows = _rows(5, prefix=_PM_PREFIX)
+
+    def _fill_order_lines(rows: tuple[ScoredTrial, ...]) -> str:
+        return "\n".join(
+            json.dumps({"trial_id": r.trial_id, "score_seq": r.score_seq, "filled_at_ns": i})
+            for i, r in enumerate(rows)
+        )
+
+    clean_store = tmp_path / "clean_store"
+    write_scored_trials(clean_store, v2_rows, now_ns=1)
+    (clean_store / "provenance.json").write_text(json.dumps({"provenance": "live"}))
+    (clean_store / "fill_order.jsonl").write_text(_fill_order_lines(v2_rows))
+    baseline = tally_mod.build_family_tally_v2(
+        tally_mod.filter_rows_to_manifest_prefix(
+            read_scored_trials(clean_store), manifest, store_declared_single_family=False
+        ),
+        manifest=manifest,
+        artefact=real_artefact,
+        store_dir=clean_store,
+    )
+
+    mixed_store = tmp_path / "mixed_store"
+    write_scored_trials(mixed_store, v2_rows, now_ns=1)
+    (mixed_store / "provenance.json").write_text(json.dumps({"provenance": "live"}))
+    (mixed_store / "fill_order.jsonl").write_text(_fill_order_lines(v2_rows))
+    same_v3_trial_id = "continuous_rung_hold/trial/MIA/2026-09-11/collide"
+    v3_row_a = dataclasses.replace(
+        _row(0, prefix="continuous_rung_hold/trial/"), trial_id=same_v3_trial_id, score_seq=0
+    )
+    v3_row_b = dataclasses.replace(
+        _row(1, prefix="continuous_rung_hold/trial/"), trial_id=same_v3_trial_id, score_seq=0
+    )
+    write_scored_trials(mixed_store, (v3_row_a,), now_ns=2)
+    write_scored_trials(mixed_store, (v3_row_b,), now_ns=3)
+
+    kept_v2_rows = tally_mod.filter_rows_to_manifest_prefix(
+        read_scored_trials(mixed_store), manifest, store_declared_single_family=False
+    )
+    assert kept_v2_rows == v2_rows
+    tally = tally_mod.build_family_tally_v2(
+        kept_v2_rows, manifest=manifest, artefact=real_artefact, store_dir=mixed_store,
+    )
+    assert tally.n_scored == baseline.n_scored
+    assert tally.verdict == baseline.verdict
+    assert tally.looks == baseline.looks
+
+
 def test_held_pnl_sign_mismatch_is_refused(tmp_path: Path, tally_mod: ModuleType) -> None:
     good = _rows(9)
     bad = _row(9, held=True)

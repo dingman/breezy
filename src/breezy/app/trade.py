@@ -23,6 +23,7 @@ from pathlib import Path
 from typing import Final, TextIO
 
 from nautilus_trader.live.node import TradingNode
+from nautilus_trader.trading.strategy import Strategy
 
 from breezy.adapters.polymarket_us.factories import exec_config_from_env
 from breezy.domain.climate_day import climate_day_for_instant
@@ -39,11 +40,14 @@ from breezy.runtime.submit_intent import (
 )
 from breezy.runtime.trade_cli import EXIT_CONFIG_ERROR, EXIT_RUNTIME_ERROR, NodeFactory, _report
 from breezy.strategy.current_rung_hold.composition import (
+    build_continuous_rung_hold_strategies,
     build_current_rung_hold_strategies,
     install_current_rung_hold_refusal_watch,
     make_trial_day_latch_factory,
+    phase0_family_permits,
 )
 from breezy.strategy.current_rung_hold.config import SUPPORTED_STATIONS
+from breezy.strategy.current_rung_hold.trial_day_latch import CONTINUOUS_TRIAL_KEY_PREFIX
 
 _VENUE = "polymarket_us"
 
@@ -146,7 +150,7 @@ def run(
         _report(out, "configuration error", exc, expected=True)
         return EXIT_CONFIG_ERROR
 
-    if not settings.current_rung_hold:
+    if not settings.current_rung_hold and not settings.continuous_rung_hold:
         return trade_cli.run(
             env=env,
             node_factory=node_factory,
@@ -167,7 +171,7 @@ def run(
         _report(
             out,
             "configuration error",
-            SettingsError("current_rung_hold is on but catalog_root is unset"),
+            SettingsError("a rung-hold family is on but catalog_root is unset"),
             expected=True,
         )
         return EXIT_CONFIG_ERROR
@@ -177,20 +181,42 @@ def run(
         with ExitStack() as stack:
             store = stack.enter_context(SqliteStateStore(store_path))
             latch = stack.enter_context(open_submit_intent_latch(store, store_path))
-            factory = make_trial_day_latch_factory(latch)
-            strategies = build_current_rung_hold_strategies(
-                catalog_root=catalog_root,
-                today_by_station=today_by_station,
-                trial_day_latch_factory=factory,
-                order_submission_permit=order_submission_permit,
+            v2_permit, v3_permit = phase0_family_permits(
+                current_rung_hold=settings.current_rung_hold,
+                continuous_rung_hold=settings.continuous_rung_hold,
+                permit=order_submission_permit,
             )
+            strategies: list[Strategy] = []
+            if settings.current_rung_hold:
+                factory = make_trial_day_latch_factory(latch)
+                strategies.extend(
+                    build_current_rung_hold_strategies(
+                        catalog_root=catalog_root,
+                        today_by_station=today_by_station,
+                        trial_day_latch_factory=factory,
+                        order_submission_permit=v2_permit,
+                    )
+                )
+            if settings.continuous_rung_hold:
+                cont_factory = make_trial_day_latch_factory(
+                    latch, key_prefix=CONTINUOUS_TRIAL_KEY_PREFIX,
+                )
+                strategies.extend(
+                    build_continuous_rung_hold_strategies(
+                        catalog_root=catalog_root,
+                        today_by_station=today_by_station,
+                        trial_day_latch_factory=cont_factory,
+                        order_submission_permit=v3_permit,
+                    )
+                )
+            composed = tuple(strategies)
             return trade_cli.run(
                 env=env,
                 node_factory=node_factory,
                 stderr=out,
-                strategies=strategies,
+                strategies=composed,
                 submit_intent_latch=latch,
-                after_build=lambda node: install_current_rung_hold_refusal_watch(node, strategies),
+                after_build=lambda node: install_current_rung_hold_refusal_watch(node, composed),
                 live_trading_permit=live_trading_permit,
                 settings=settings,
                 exec_client_config=exec_client_config,

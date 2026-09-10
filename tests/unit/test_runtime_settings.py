@@ -19,6 +19,7 @@ from breezy.adapters.polymarket_us.operator_controls import (
 )
 from breezy.registry.sites import default_registry
 from breezy.runtime.settings import (
+    CONTINUOUS_RUNG_HOLD_VAR,
     CURRENT_RUNG_HOLD_VAR,
     LIVE_OBSERVATIONS_VAR,
     ORDERS_ENABLED_VAR,
@@ -754,6 +755,27 @@ def test_current_rung_hold_without_live_observations_is_a_settings_error() -> No
     assert LIVE_OBSERVATIONS_VAR in message
 
 
+def test_continuous_rung_hold_flag_is_exact_one() -> None:
+    absent = load_trade_settings(_TRADE_ONLY_ENV).continuous_rung_hold
+    one = load_trade_settings(
+        {
+            **_TRADE_ONLY_ENV,
+            CONTINUOUS_RUNG_HOLD_VAR: "1",
+            LIVE_OBSERVATIONS_VAR: "1",
+            TRADE_CATALOG_ROOT_VAR: "/tmp/breezy-trade-catalog",
+        }
+    ).continuous_rung_hold
+    assert (absent, one) == (False, True)
+
+
+def test_continuous_rung_hold_without_live_observations_is_a_settings_error() -> None:
+    with pytest.raises(SettingsError) as excinfo:
+        load_trade_settings({**_TRADE_ONLY_ENV, CONTINUOUS_RUNG_HOLD_VAR: "1"})
+    message = str(excinfo.value)
+    assert CONTINUOUS_RUNG_HOLD_VAR in message
+    assert LIVE_OBSERVATIONS_VAR in message
+
+
 # ---------------------------------------------------------------------------
 # A1 -- BREEZY_ORDERS_ENABLED (single parse; converged review item 7)
 # ---------------------------------------------------------------------------
@@ -826,6 +848,71 @@ def test_orders_enabled_with_both_siblings_set_is_accepted() -> None:
     assert settings.orders_enabled_requested is True
     assert settings.current_rung_hold is True
     assert settings.live_observations is True
+
+
+# ---------------------------------------------------------------------------
+# Phase 0 seal: BREEZY_ORDERS_ENABLED=1 must fail closed at settings-load
+# time for continuous_rung_hold (v3) -- order_enablement.py's own
+# RungHoldNotReadyError gate requires current_rung_hold specifically
+# (`issue()`'s `settings.current_rung_hold is not True` check), so a
+# settings-level acceptance of continuous_rung_hold as an equally-valid
+# sibling was a genuine gap: the request would parse here, then be refused
+# downstream by `issue()` -- a FATAL exit 1 (`app/trade.py::main`'s
+# `OrderSubmissionRefused` branch) instead of a settings-load exit 2.
+# ---------------------------------------------------------------------------
+
+_CONT_SIBLINGS_ENV = {
+    **_TRADE_ONLY_ENV,
+    CONTINUOUS_RUNG_HOLD_VAR: "1",
+    LIVE_OBSERVATIONS_VAR: "1",
+    TRADE_CATALOG_ROOT_VAR: "/tmp/breezy-trade-catalog",
+}
+
+
+def test_orders_enabled_with_continuous_rung_hold_only_is_a_settings_error() -> None:
+    with pytest.raises(SettingsError) as excinfo:
+        load_trade_settings({**_CONT_SIBLINGS_ENV, ORDERS_ENABLED_VAR: "1"})
+    message = str(excinfo.value)
+    assert ORDERS_ENABLED_VAR in message
+    assert CURRENT_RUNG_HOLD_VAR in message
+
+
+@pytest.mark.parametrize(
+    ("current", "continuous", "expect_ok"),
+    [
+        (False, False, False),
+        (True, False, True),
+        (False, True, False),
+        (True, True, True),
+    ],
+)
+def test_orders_enabled_family_precondition_matches_the_issue_gate(
+    current: bool, continuous: bool, expect_ok: bool
+) -> None:
+    """The settings-load-time family precondition for
+    ``BREEZY_ORDERS_ENABLED=1`` must accept exactly the (current,
+    continuous) combinations ``OrderSubmissionPermit.issue()`` itself would
+    accept -- i.e. ``current_rung_hold is True``, regardless of
+    ``continuous_rung_hold``. ``issue()`` itself is unchanged."""
+    env: dict[str, str] = {
+        **_TRADE_ONLY_ENV,
+        LIVE_OBSERVATIONS_VAR: "1",
+        ORDERS_ENABLED_VAR: "1",
+        TRADE_CATALOG_ROOT_VAR: "/tmp/breezy-trade-catalog",
+    }
+    if current:
+        env[CURRENT_RUNG_HOLD_VAR] = "1"
+    if continuous:
+        env[CONTINUOUS_RUNG_HOLD_VAR] = "1"
+
+    if expect_ok:
+        settings = load_trade_settings(env)
+        assert settings.orders_enabled_requested is True
+        assert settings.current_rung_hold is current
+        assert settings.continuous_rung_hold is continuous
+    else:
+        with pytest.raises(SettingsError):
+            load_trade_settings(env)
 
 
 # ---------------------------------------------------------------------------

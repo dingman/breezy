@@ -120,10 +120,14 @@ from breezy.runtime.order_enablement import OrderSubmissionPermit
 from breezy.strategy.current_rung_hold.config import CurrentRungHoldConfig
 from breezy.strategy.current_rung_hold.decision import (
     Decision,
-    DecisionInputs,
     Refuse,
     Take,
     evaluate_decision,
+)
+from breezy.strategy.current_rung_hold.tick_eval import (
+    build_eligible_inputs,
+    instrument_rung_is_current,
+    width_and_m,
 )
 from breezy.strategy.current_rung_hold.trial_day_latch import TrialDayLatch
 from breezy.strategy.weather_common.refusals import (
@@ -142,15 +146,13 @@ if TYPE_CHECKING:  # pragma: no cover - typing only
 __all__ = [
     "CurrentRungHoldStrategy",
     "MissingTrialDayLatchError",
+    "evaluate_decision",
     "season_for",
 ]
 
 _NS_PER_SECOND: Final[int] = 1_000_000_000
 _WINDOW_START_HOUR_LST: Final[int] = 12
 _WINDOW_END_HOUR_LST: Final[int] = 17  # exclusive
-_WIDTH_INTERIOR: Final[int] = 0
-_WIDTH_OPEN_UPPER: Final[int] = 1
-_WIDTH_OPEN_LOWER: Final[int] = 2
 #: Counted (``decision.REFUSAL_REASONS`` / ``risk.COUNTED_REFUSAL_REASONS``),
 #: never emitted by ``evaluate_decision`` -- the window check runs here,
 #: before a quote ever reaches that function.
@@ -494,9 +496,7 @@ class CurrentRungHoldStrategy(Strategy):
         # `RunningMax.spans` on THIS instrument's tick and be counted
         # `observation_ambiguous`, never silently skipped as "not yet this
         # instrument's decision instant".
-        if not (
-            facts.contains(running_max.lower_f) or facts.contains(running_max.upper_f)
-        ):
+        if not instrument_rung_is_current(facts, running_max):
             self.diagnostics.record(_DIAG_RUNG_NOT_CURRENT)
             self._report_alerter(
                 self.diagnostics_alerter,
@@ -504,43 +504,33 @@ class CurrentRungHoldStrategy(Strategy):
             )
             return  # this instrument's rung cannot be the current one
 
-        if facts.upper_f is None:
-            width_code, m_code = _WIDTH_OPEN_UPPER, 0
-        elif facts.lower_f is None:
-            width_code, m_code = _WIDTH_OPEN_LOWER, 0
-        else:
-            width_code, m_code = _WIDTH_INTERIOR, running_max.lower_f - facts.lower_f
-
+        width_code, m_code = width_and_m(facts, running_max)
         instrument = self.cache.instrument(tick.instrument_id)
         fee_coefficient = self._guarded_fee_coefficient(instrument)
-
+        # Barrier F1: absent/unresolved fee → same counted refusal
+        # evaluate_decision emits for a mismatched coefficient. The
+        # evaluate_decision CALL stays on this module so the study-replay
+        # spy (strategy.evaluate_decision) still observes v2.
+        built = build_eligible_inputs(
+            station=station,
+            climate_day=climate_day,
+            now_ns=now_ns,
+            ladder=self._ladders[(station, climate_day_key)],
+            fee_coefficient=fee_coefficient,
+            ask=ask,
+            size=size,
+            running_max=running_max,
+            staleness_ns=accumulator.staleness_ns(now_ns),
+            config=self._config,
+            hour_lst=hour_lst,
+            width_code=width_code,
+            m_code=m_code,
+        )
         decision: Decision
-        if fee_coefficient is None:
-            # Barrier F1 (`tests/unit/test_polymarket_us_fee_guard.py`): an
-            # absent/unresolved fee schedule is routed to the SAME counted,
-            # latched refusal `evaluate_decision` emits for a KNOWN-but-
-            # mismatched coefficient (`decision.py`'s rule order step 2),
-            # never a raise and never a silent default.
-            decision = Refuse("fee_schedule_mismatch")
+        if isinstance(built, Refuse):
+            decision = built
         else:
-            inputs = DecisionInputs(
-                station=station,
-                climate_day=climate_day,
-                now_ns=now_ns,
-                ladder=self._ladders[(station, climate_day_key)],
-                fee_coefficient=fee_coefficient,
-                ask=ask,
-                size=size,
-                running_max=running_max,
-                staleness_ns=accumulator.staleness_ns(now_ns),
-                config=self._config,
-                season=season_for(climate_day),
-                hour_lst=hour_lst,
-                width_code=width_code,
-                m_code=m_code,
-                latch_consumed=False,
-            )
-            decision = evaluate_decision(inputs)
+            decision = evaluate_decision(built)
         if isinstance(decision, Refuse) and decision.reason == OBSERVATION_AMBIGUOUS:
             self.refusals.record(decision.reason)
             self._report_alerter(
@@ -595,7 +585,7 @@ class CurrentRungHoldStrategy(Strategy):
         )
         if result is None:
             return None
-        return tuple(result)
+        return tuple(result)  # type: ignore[arg-type]
 
     # ------------------------------------------------------------------
     # Log-only fill / position handlers

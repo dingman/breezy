@@ -20,10 +20,17 @@ public method here asserts the SAME flock is still held, mirroring
 ``SubmitIntentLatch``'s own ``_require_held`` (L-22: exclusion is
 unforgeable, not offered).
 
-Keys live in the namespace ``current_rung_hold/trial/{station}/{climate_day}``,
-disjoint from ``breezy.runtime.submit_intent.CURRENT_INTENT_KEY`` and its
+Keys live in the namespace ``{key_prefix}{station}/{climate_day}``. The
+default ``key_prefix`` is ``current_rung_hold/trial/`` -- byte-identical to
+the v2 live family. A sibling family (continuous-rung-hold) passes
+``continuous_rung_hold/trial/``. Both are disjoint from
+``breezy.runtime.submit_intent.CURRENT_INTENT_KEY`` and its
 ``exec/polymarket_us/intent/...`` history keys, so both latches share one
 SQLite file without key collision.
+
+IN_FLIGHT is a **separate clearable key** in this same primitive (L-22),
+keyed ``(station, climate_day)``, under ``{family}/inflight/{station}/{day}``
+derived from the trial prefix. v2 never writes it.
 
 Ordering rule (binding, peer review "Ordering rule (security, binding)")
 --------------------------------------------------------------------------
@@ -56,6 +63,15 @@ from breezy.runtime.submit_intent import (
     _HeldSubmitIntentLock,
 )
 from breezy.strategy.current_rung_hold.decision import REFUSAL_REASONS
+
+#: Default trial-key prefix -- byte-identical to the v2 live family.
+DEFAULT_TRIAL_KEY_PREFIX: Final[str] = "current_rung_hold/trial/"
+#: v3 continuous-rung-hold family prefix. Disjoint from the v2 default.
+CONTINUOUS_TRIAL_KEY_PREFIX: Final[str] = "continuous_rung_hold/trial/"
+_TRIAL_SUFFIX: Final[str] = "trial/"
+_INFLIGHT_SUFFIX: Final[str] = "inflight/"
+_INFLIGHT_OPEN: Final[bytes] = b'{"v":1,"state":"open"}'
+_INFLIGHT_CLEARED: Final[bytes] = b'{"v":1,"state":"cleared"}'
 
 #: The closed set of trial-day outcomes: every `decision.py` refusal reason
 #: (`REFUSAL_REASONS`) the caller might record verbatim, plus `"taken"` for
@@ -110,8 +126,16 @@ class TrialDayRecordCorrupt(TrialDayLatchError):
         super().__init__("trial day record is corrupt")
 
 
-def _key(station: str, climate_day: str) -> str:
-    return f"current_rung_hold/trial/{station}/{climate_day}"
+def _inflight_prefix(trial_prefix: str) -> str:
+    if not trial_prefix.endswith(_TRIAL_SUFFIX):
+        raise ValueError(
+            f"trial key prefix must end with {_TRIAL_SUFFIX!r}, was {trial_prefix!r}"
+        )
+    return trial_prefix[: -len(_TRIAL_SUFFIX)] + _INFLIGHT_SUFFIX
+
+
+def _key(station: str, climate_day: str, *, key_prefix: str = DEFAULT_TRIAL_KEY_PREFIX) -> str:
+    return f"{key_prefix}{station}/{climate_day}"
 
 
 @dataclass(frozen=True, slots=True)
@@ -186,18 +210,32 @@ class TrialDayLatch:
     flock is still held.
     """
 
-    def __init__(self, store: StateStore, lock: _HeldSubmitIntentLock) -> None:
+    def __init__(
+        self,
+        store: StateStore,
+        lock: _HeldSubmitIntentLock,
+        *,
+        key_prefix: str = DEFAULT_TRIAL_KEY_PREFIX,
+    ) -> None:
         self._store = store
         self._lock = lock
+        self._key_prefix = key_prefix
+        self._inflight_prefix = _inflight_prefix(key_prefix)
 
     def _require_held(self) -> None:
         if not self._lock.held:
             raise SubmitIntentLockNotHeld()
 
+    def _trial_key(self, station: str, climate_day: str) -> str:
+        return _key(station, climate_day, key_prefix=self._key_prefix)
+
+    def _inflight_key(self, station: str, climate_day: str) -> str:
+        return f"{self._inflight_prefix}{station}/{climate_day}"
+
     def record(self, station: str, climate_day: str) -> TrialDayRecord | None:
         """Return the durable record for this station-day, or ``None``."""
         self._require_held()
-        raw = self._store.get(_key(station, climate_day))
+        raw = self._store.get(self._trial_key(station, climate_day))
         if raw is None:
             return None
         return TrialDayRecord.from_bytes(raw)
@@ -236,10 +274,30 @@ class TrialDayLatch:
             ask=ask,
             reason=reason,
         )
-        self._store.set(_key(station, climate_day), record.to_bytes())
+        self._store.set(self._trial_key(station, climate_day), record.to_bytes())
+
+    def is_inflight(self, station: str, climate_day: str) -> bool:
+        """``True`` while this station-day has a durable IN_FLIGHT marker."""
+        self._require_held()
+        raw = self._store.get(self._inflight_key(station, climate_day))
+        return raw == _INFLIGHT_OPEN
+
+    def set_inflight(self, station: str, climate_day: str) -> None:
+        """COMMIT the IN_FLIGHT marker for this station-day. Must precede ``arm()``."""
+        self._require_held()
+        self._store.set(self._inflight_key(station, climate_day), _INFLIGHT_OPEN)
+
+    def clear_inflight(self, station: str, climate_day: str) -> None:
+        """Clear the IN_FLIGHT marker (StateStore has no delete -- write cleared)."""
+        self._require_held()
+        self._store.set(self._inflight_key(station, climate_day), _INFLIGHT_CLEARED)
 
 
-def open_trial_day_latch(intent_latch: SubmitIntentLatch) -> TrialDayLatch:
+def open_trial_day_latch(
+    intent_latch: SubmitIntentLatch,
+    *,
+    key_prefix: str = DEFAULT_TRIAL_KEY_PREFIX,
+) -> TrialDayLatch:
     """Bind a :class:`TrialDayLatch` to an already-opened ``SubmitIntentLatch``.
 
     This is NOT a second opener: ``intent_latch.shared_state_binding()`` is
@@ -247,6 +305,9 @@ def open_trial_day_latch(intent_latch: SubmitIntentLatch) -> TrialDayLatch:
     ``SubmitIntentLockNotHeld`` the moment the intent latch's own factory
     ``with`` has exited -- so a caller cannot construct a working
     ``TrialDayLatch`` from a latch it does not currently, genuinely hold.
+
+    ``key_prefix`` defaults to the v2 live prefix so existing callers stay
+    byte-identical.
     """
     store, lock = intent_latch.shared_state_binding()
-    return TrialDayLatch(store, lock)
+    return TrialDayLatch(store, lock, key_prefix=key_prefix)

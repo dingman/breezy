@@ -1072,3 +1072,21 @@ def test_no_inline_wilson_or_bootstrap_arithmetic(driver: ModuleType) -> None:
     # No hand-rolled normal-approximation constant (the exact anticonservative
     # shape EXEC_SPINE R-9 refuses by name).
     assert "1.96" not in source
+
+
+def test_paper_latch_is_throwaway_not_exec_state_db(driver: ModuleType) -> None:
+    source = (_SCRIPTS_ANALYSIS_DIR / "current_rung_hold_paper_replay.py").read_text()
+    assert "POLYMARKET_US_EXEC_STATE_DB" not in source
+    assert "latch_" in source
+    assert "work_catalog" in source
+    # The live exec-state DB path resolver is never imported.
+    tree = ast.parse(source)
+    imported: set[str] = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.ImportFrom) and node.module is not None:
+            imported.add(node.module)
+    assert "breezy.runtime.exec_state_db_path" not in imported
+    assert hasattr(driver, "run_one_precision_arm")
+    names = driver.run_one_precision_arm.__code__.co_varnames
+    assert "strategy_cls" in names
+    assert "latch_key_prefix" in names

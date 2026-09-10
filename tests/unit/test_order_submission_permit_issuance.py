@@ -78,6 +78,7 @@ class _FakeSettings:
     orders_enabled_requested: bool = True
     current_rung_hold: bool = True
     live_observations: bool = True
+    continuous_rung_hold: bool = False
 
 
 @contextmanager
@@ -182,6 +183,22 @@ def test_operator_caps_absent_refuses(
     with pytest.raises(OperatorCapsNotConfiguredError):
         _ISSUE(
             settings=_FakeSettings(),
+            live_trading_permit=live_permit,
+            clock=clock,
+        )
+
+
+def test_issue_still_refuses_when_only_continuous_is_on(
+    monkeypatch: pytest.MonkeyPatch,
+    write_canonical_verified: None,  # noqa: F811
+) -> None:
+    """Phase 0: issue() is unchanged in what it refuses — cont without v2 is not enough."""
+    enable_operator_gate(monkeypatch)
+    clock = clock_at()
+    live_permit = issue_live_trading_permit(clock=clock)
+    with _caps(), pytest.raises(RungHoldNotReadyError):
+        _ISSUE(
+            settings=_FakeSettings(current_rung_hold=False, continuous_rung_hold=True),
             live_trading_permit=live_permit,
             clock=clock,
         )

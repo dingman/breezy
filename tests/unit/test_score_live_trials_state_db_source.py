@@ -1294,3 +1294,26 @@ def test_append_unresolved_takes_is_idempotent_on_trial_and_intent_state(
         encoding="utf-8"
     ).splitlines()
     assert len(lines) == 1
+
+
+def test_v3_zero_keys_is_n0_not_store_failure(tmp_path: Path) -> None:
+    store_path = tmp_path / "state.sqlite"
+    store = SqliteStateStore(store_path)
+    store.set("unrelated/key", b"x")
+    store.close()
+    trials, exclusions, fees = read_filled_trials_state_db(
+        store_path,
+        **_reader_kwargs(family_prefix="continuous_rung_hold/trial/"),
+    )
+    assert trials == ()
+    assert exclusions == ()
+    assert fees == {}
+
+
+def test_v2_zero_keys_is_still_store_failure(tmp_path: Path) -> None:
+    store_path = tmp_path / "state.sqlite"
+    store = SqliteStateStore(store_path)
+    store.set("unrelated/key", b"x")
+    store.close()
+    with pytest.raises(StorePositiveControlFailedError):
+        read_filled_trials_state_db(store_path, **_reader_kwargs())

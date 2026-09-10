@@ -64,6 +64,7 @@ class _FakeSettings:
     orders_enabled_requested: bool = True
     current_rung_hold: bool = True
     live_observations: bool = True
+    continuous_rung_hold: bool = False
 
 
 def test_main_logs_live_trading_permit_issued_when_both_permits_are_minted(

@@ -10,6 +10,7 @@ Every test below constructs a ``TrialDayLatch`` only through
 
 from __future__ import annotations
 
+import sqlite3
 from decimal import Decimal
 from pathlib import Path
 
@@ -23,6 +24,8 @@ from breezy.runtime.submit_intent import (
 )
 from breezy.strategy.current_rung_hold.decision import REFUSAL_REASONS
 from breezy.strategy.current_rung_hold.trial_day_latch import (
+    CONTINUOUS_TRIAL_KEY_PREFIX,
+    DEFAULT_TRIAL_KEY_PREFIX,
     TrialDayAlreadyConsumed,
     TrialDayInvalidReason,
     TrialDayLatch,
@@ -271,3 +274,97 @@ class TestLockReleaseMakesEveryMethodRaise:
                 ask=Decimal("0.10"),
                 reason="taken",
             )
+        with pytest.raises(SubmitIntentLockNotHeld):
+            trial_latch.is_inflight(STATION, CLIMATE_DAY)
+        with pytest.raises(SubmitIntentLockNotHeld):
+            trial_latch.set_inflight(STATION, CLIMATE_DAY)
+        with pytest.raises(SubmitIntentLockNotHeld):
+            trial_latch.clear_inflight(STATION, CLIMATE_DAY)
+
+
+def _committed_keys(store_path: Path) -> set[str]:
+    conn = sqlite3.connect(store_path)
+    try:
+        return {row[0] for row in conn.execute("SELECT key FROM state")}
+    finally:
+        conn.close()
+
+
+class TestKeyPrefix:
+    def test_v2_prefix_default_unchanged(self, store_path: Path) -> None:
+        """Default constructor prefix is byte-identical to today's v2 key."""
+        assert DEFAULT_TRIAL_KEY_PREFIX == "current_rung_hold/trial/"
+        with open_submit_intent_latch(SqliteStateStore(store_path), store_path) as intent_latch:
+            trial_latch = open_trial_day_latch(intent_latch)
+            trial_latch.consume(
+                STATION,
+                CLIMATE_DAY,
+                latched_at_ns=NOW_NS,
+                instrument_id=INSTRUMENT_ID,
+                ask=Decimal("0.37"),
+                reason="taken",
+            )
+        keys = _committed_keys(store_path)
+        assert f"current_rung_hold/trial/{STATION}/{CLIMATE_DAY}" in keys
+        assert not any(k.startswith("continuous_rung_hold/") for k in keys)
+
+    def test_cont_prefix_does_not_collide(self, store_path: Path) -> None:
+        """v3 prefix is a sibling namespace on the same store/flock."""
+        assert CONTINUOUS_TRIAL_KEY_PREFIX == "continuous_rung_hold/trial/"
+        assert CONTINUOUS_TRIAL_KEY_PREFIX != DEFAULT_TRIAL_KEY_PREFIX
+        with open_submit_intent_latch(SqliteStateStore(store_path), store_path) as intent_latch:
+            v2 = open_trial_day_latch(intent_latch)
+            v3 = open_trial_day_latch(intent_latch, key_prefix=CONTINUOUS_TRIAL_KEY_PREFIX)
+            v2.consume(
+                STATION,
+                CLIMATE_DAY,
+                latched_at_ns=NOW_NS,
+                instrument_id=INSTRUMENT_ID,
+                ask=Decimal("0.37"),
+                reason="taken",
+            )
+            assert v3.is_consumed(STATION, CLIMATE_DAY) is False
+            v3.consume(
+                STATION,
+                CLIMATE_DAY,
+                latched_at_ns=NOW_NS,
+                instrument_id=INSTRUMENT_ID,
+                ask=Decimal("0.41"),
+                reason="taken",
+            )
+            assert v2.is_consumed(STATION, CLIMATE_DAY) is True
+            assert v3.is_consumed(STATION, CLIMATE_DAY) is True
+            assert v2.record(STATION, CLIMATE_DAY) is not None
+            assert v2.record(STATION, CLIMATE_DAY).ask == Decimal("0.37")
+            assert v3.record(STATION, CLIMATE_DAY) is not None
+            assert v3.record(STATION, CLIMATE_DAY).ask == Decimal("0.41")
+        keys = _committed_keys(store_path)
+        assert f"current_rung_hold/trial/{STATION}/{CLIMATE_DAY}" in keys
+        assert f"continuous_rung_hold/trial/{STATION}/{CLIMATE_DAY}" in keys
+
+
+class TestInFlightPrimitive:
+    def test_inflight_get_set_clear_is_keyed_station_day(self, store_path: Path) -> None:
+        with open_submit_intent_latch(SqliteStateStore(store_path), store_path) as intent_latch:
+            latch = open_trial_day_latch(
+                intent_latch, key_prefix=CONTINUOUS_TRIAL_KEY_PREFIX,
+            )
+            assert latch.is_inflight(STATION, CLIMATE_DAY) is False
+            latch.set_inflight(STATION, CLIMATE_DAY)
+            assert latch.is_inflight(STATION, CLIMATE_DAY) is True
+            assert latch.is_inflight(STATION, OTHER_CLIMATE_DAY) is False
+            assert latch.is_consumed(STATION, CLIMATE_DAY) is False
+            latch.clear_inflight(STATION, CLIMATE_DAY)
+            assert latch.is_inflight(STATION, CLIMATE_DAY) is False
+        keys = _committed_keys(store_path)
+        inflight_key = f"continuous_rung_hold/inflight/{STATION}/{CLIMATE_DAY}"
+        assert inflight_key in keys
+        assert f"continuous_rung_hold/trial/{STATION}/{CLIMATE_DAY}" not in keys
+
+    def test_v2_default_prefix_never_writes_cont_inflight(self, store_path: Path) -> None:
+        with open_submit_intent_latch(SqliteStateStore(store_path), store_path) as intent_latch:
+            latch = open_trial_day_latch(intent_latch)
+            latch.set_inflight(STATION, CLIMATE_DAY)
+        keys = _committed_keys(store_path)
+        assert f"current_rung_hold/inflight/{STATION}/{CLIMATE_DAY}" in keys
+        assert not any(k.startswith("continuous_rung_hold/") for k in keys)

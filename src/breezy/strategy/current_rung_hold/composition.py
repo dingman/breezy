@@ -38,15 +38,26 @@ from breezy.runtime.order_enablement import OrderSubmissionPermit
 from breezy.runtime.settings import SettingsError
 from breezy.runtime.submit_intent import SubmitIntentLatch
 from breezy.strategy.current_rung_hold.config import SUPPORTED_STATIONS, CurrentRungHoldConfig
+from breezy.strategy.current_rung_hold.continuous_strategy import (
+    ContinuousRungHoldStrategy,
+    Phase0PermitForbiddenError,
+)
+from breezy.strategy.current_rung_hold.offer_tape import OfferTape
 from breezy.strategy.current_rung_hold.strategy import CurrentRungHoldStrategy
-from breezy.strategy.current_rung_hold.trial_day_latch import TrialDayLatch, open_trial_day_latch
+from breezy.strategy.current_rung_hold.trial_day_latch import (
+    DEFAULT_TRIAL_KEY_PREFIX,
+    TrialDayLatch,
+    open_trial_day_latch,
+)
 from breezy.strategy.weather_common.refusals import RefusalAlerter
 
 __all__ = [
     "NoTradableInstrumentsError",
+    "build_continuous_rung_hold_strategies",
     "build_current_rung_hold_strategies",
     "install_current_rung_hold_refusal_watch",
     "make_trial_day_latch_factory",
+    "phase0_family_permits",
     "resolve_station_instrument_ids",
     "strategy_component_id",
 ]
@@ -54,6 +65,7 @@ __all__ = [
 logger = logging.getLogger(__name__)
 
 _COMPONENT_ID_PREFIX: Final[str] = "CurrentRungHoldStrategy"
+_CONTINUOUS_COMPONENT_ID_PREFIX: Final[str] = "ContinuousRungHoldStrategy"
 
 #: Review finding 1: a WAIT-state diagnostic is not a refusal -- passed to
 #: `RefusalAlerter`'s injectable vocabulary so its event name/detail never
@@ -132,19 +144,41 @@ def strategy_component_id(station: str) -> str:
 
 def make_trial_day_latch_factory(
     intent_latch: SubmitIntentLatch,
+    *,
+    key_prefix: str = DEFAULT_TRIAL_KEY_PREFIX,
 ) -> Callable[[], AbstractContextManager[TrialDayLatch]]:
     """Return a factory that binds a ``TrialDayLatch`` to *intent_latch*.
 
     The factory's context manager does NOT close the intent latch: the
     composition root owns that flock for the process lifetime. Each strategy
     ``on_start`` enters this factory; ``on_stop`` exits it.
+
+    ``key_prefix`` defaults to the v2 live prefix so existing callers stay
+    byte-identical.
     """
 
     @contextmanager
     def _factory() -> Iterator[TrialDayLatch]:
-        yield open_trial_day_latch(intent_latch)
+        yield open_trial_day_latch(intent_latch, key_prefix=key_prefix)
 
     return _factory
+
+
+def phase0_family_permits(
+    *,
+    current_rung_hold: bool,
+    continuous_rung_hold: bool,
+    permit: OrderSubmissionPermit | None,
+) -> tuple[OrderSubmissionPermit | None, OrderSubmissionPermit | None]:
+    """Phase 0 permit assignment: v2 may hold the permit; v3 is always None.
+
+    ``continuous_rung_hold`` selects composition, never the permit. No flag
+    combination returns two non-None permits.
+    """
+    v2_permit = permit if current_rung_hold else None
+    # Phase 0: v3 never holds a permit.
+    v3_permit: OrderSubmissionPermit | None = None
+    return v2_permit, v3_permit
 
 
 def _facts_from_instrument(instrument: object) -> tuple[str, dt.date, Measure] | None:
@@ -307,8 +341,63 @@ def build_current_rung_hold_strategies(
     return tuple(strategies)
 
 
+def build_continuous_rung_hold_strategies(
+    *,
+    catalog_root: Path,
+    today_by_station: Mapping[str, dt.date],
+    trial_day_latch_factory: Callable[[], AbstractContextManager[TrialDayLatch]],
+    order_submission_permit: OrderSubmissionPermit | None = None,
+    offer_tape_path: Path | None = None,
+) -> tuple[ContinuousRungHoldStrategy, ...]:
+    """One continuous-rung-hold strategy per supported station with instruments.
+
+    Distinct ``strategy_id`` prefix so ``Trader.add_strategy`` uniqueness
+    checks pass beside v2. Phase 0 callers pass ``order_submission_permit=None``;
+    a non-None permit is refused here, before any instrument resolution or
+    strategy construction.
+    """
+    if order_submission_permit is not None:
+        raise Phase0PermitForbiddenError(
+            "build_continuous_rung_hold_strategies: Phase 0 forbids a non-None "
+            "order_submission_permit"
+        )
+    resolved = resolve_station_instrument_ids(catalog_root, today_by_station)
+    if all(len(ids) == 0 for ids in resolved.values()):
+        raise NoTradableInstrumentsError(_zero_instruments_message(resolved, today_by_station))
+
+    # ONE OfferTape instance (its bounded deque, DEFAULT_OFFER_TAPE_MAXLEN=8192
+    # slots) is shared by every per-station strategy below -- not one tape per
+    # station.
+    tape = OfferTape(offer_tape_path)
+    strategies: list[ContinuousRungHoldStrategy] = []
+    for station in SUPPORTED_STATIONS:
+        instrument_ids = resolved[station]
+        if not instrument_ids:
+            logger.warning(
+                "continuous_rung_hold: skipping %s; resolved 0 instruments for %s",
+                station,
+                today_by_station[station].isoformat(),
+            )
+            continue
+        config = CurrentRungHoldConfig(
+            instrument_ids=instrument_ids,
+            stations=(station,),
+            strategy_id=_CONTINUOUS_COMPONENT_ID_PREFIX,
+            order_id_tag=station,
+        )
+        strategies.append(
+            ContinuousRungHoldStrategy(
+                config,
+                trial_day_latch_factory=trial_day_latch_factory,
+                order_submission_permit=order_submission_permit,
+                offer_tape=tape,
+            )
+        )
+    return tuple(strategies)
+
+
 def install_current_rung_hold_refusal_watch(
-    node: object, strategies: Sequence[CurrentRungHoldStrategy]
+    node: object, strategies: Sequence[CurrentRungHoldStrategy | ContinuousRungHoldStrategy]
 ) -> None:
     """Wire per-station refusal AND diagnostics counts through the existing
     alert sink.

@@ -68,6 +68,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import logging
 import re
 import sys
 from collections import defaultdict
@@ -113,12 +114,14 @@ __all__ = [
     "CoverageRow",
     "ExcludedFill",
     "FamilyBarrierRefusal",
+    "FamilyStoreContaminationError",
     "FamilyTallyV2",
     "LookRecord",
     "ProvenanceRefusal",
     "ScoredTrialDataIntegrityError",
     "build_family_tally_v2",
     "coverage_rows",
+    "filter_rows_to_manifest_prefix",
     "main",
     "read_excluded_fills",
     "render_markdown_v2",
@@ -151,8 +154,15 @@ STRATUM_TABLE_HEADER = (
 STRATUM_TABLE_DIVIDER = "|---|---:|---:|---:|---:|---:|---:|---|"
 
 
+logger = logging.getLogger(__name__)
+
+
 class ScoredTrialDataIntegrityError(Exception):
     """An independent-reviewer fail-closed guard refused the whole tally."""
+
+
+class FamilyStoreContaminationError(ScoredTrialDataIntegrityError):
+    """A store declared single-family contains rows outside the manifest prefix."""
 
 
 class ProvenanceRefusal(ScoredTrialDataIntegrityError):
@@ -300,7 +310,9 @@ def _assert_no_partial_or_multi_fill(rows: Sequence[object]) -> None:
         )
 
 
-def _assert_no_raw_score_seq_collisions(store_dir: Path) -> None:
+def _assert_no_raw_score_seq_collisions(
+    store_dir: Path, *, trial_id_prefix: str | None = None
+) -> None:
     """Obligation (c): refuse a `(trial_id, score_seq)` collision found in
     the RAW parquet corpus, before `read_scored_trials`'s own max-score_seq
     dedup would silently resolve an exact-score_seq tie by file-iteration
@@ -311,6 +323,11 @@ def _assert_no_raw_score_seq_collisions(store_dir: Path) -> None:
     the `scored_trials_*.parquet` glob and reusing the PUBLIC
     `SCORED_TRIAL_SCHEMA` export -- rather than modifying
     `scored_trial_store.py` (binding, out of scope).
+
+    `trial_id_prefix`, if given, scopes the scan to rows in that family: a
+    `--store-dir` may be shared across families (the reviewer-noted default,
+    `score_live_trials.py:131`'s single scorer dir), so a collision entirely
+    within a FOREIGN family's rows must never abort this family's tally.
     """
     if not store_dir.exists():
         return
@@ -319,6 +336,8 @@ def _assert_no_raw_score_seq_collisions(store_dir: Path) -> None:
     for path in sorted(store_dir.glob("scored_trials_*.parquet")):
         table = pq.read_table(path, schema=SCORED_TRIAL_SCHEMA)
         for row in table.to_pylist():
+            if trial_id_prefix is not None and not row["trial_id"].startswith(trial_id_prefix):
+                continue
             key = (row["trial_id"], row["score_seq"])
             prior = seen.get(key)
             if prior is not None and prior != path:
@@ -452,6 +471,41 @@ def _roi_bound_line_v2(rows: Sequence[ScoredTrial]) -> str:
     return base
 
 
+def filter_rows_to_manifest_prefix(
+    rows: Sequence[ScoredTrial],
+    manifest: FamilyManifest,
+    *,
+    store_declared_single_family: bool = True,
+) -> tuple[ScoredTrial, ...]:
+    """Keep rows whose trial_id starts with ``manifest.trial_id_prefix``.
+
+    Every dropped row is counted and logged. A store declared single-family
+    that still contains non-manifest rows is REFUSED (not silently dropped).
+    Callers that have already isolated the batch (kept rows only) pass
+    ``store_declared_single_family=False``.
+    """
+    kept: list[ScoredTrial] = []
+    dropped: list[str] = []
+    for row in rows:
+        if row.trial_id.startswith(manifest.trial_id_prefix):
+            kept.append(row)
+        else:
+            dropped.append(row.trial_id)
+    if dropped:
+        logger.warning(
+            "family_tally_v2: dropped %d non-manifest row(s) (prefix %r): %s",
+            len(dropped),
+            manifest.trial_id_prefix,
+            dropped,
+        )
+        if store_declared_single_family:
+            raise FamilyStoreContaminationError(
+                f"store declared single-family contains {len(dropped)} non-manifest "
+                f"row(s); refusing rather than silently dropping"
+            )
+    return tuple(kept)
+
+
 def build_family_tally_v2(
     rows: Sequence[ScoredTrial],
     *,
@@ -472,11 +526,18 @@ def build_family_tally_v2(
     and the natural `I_MAX`/`n_max` triggers are otherwise auto-detected
     from the data at each scheduled look.
     """
+    # Prefix-filter FIRST, before any integrity/collision/empty-store guard:
+    # a foreign (e.g. v3) row must be counted, logged, and refused (or
+    # dropped -- store_declared_single_family callers) here, never allowed to
+    # trip a v2-scoped guard below on a row that was never v2's to begin
+    # with. Also runs BEFORE assert_family_only so a v3 row cannot trip the
+    # v2 family barrier either.
+    rows = filter_rows_to_manifest_prefix(rows, manifest, store_declared_single_family=True)
     _assert_held_matches_pnl_sign(rows)
     _assert_no_partial_or_multi_fill(rows)
     store_empty_no_sidecar = False
     if store_dir is not None:
-        _assert_no_raw_score_seq_collisions(store_dir)
+        _assert_no_raw_score_seq_collisions(store_dir, trial_id_prefix=manifest.trial_id_prefix)
         sidecar_exists = (store_dir / _PROVENANCE_SIDECAR_NAME).exists()
         if not rows and not sidecar_exists:
             # R2(b): an empty store with no sidecar yet is not a refusal --
@@ -1015,6 +1076,13 @@ def main(argv: Sequence[str] | None = None) -> int:
         return 2
 
     manifest = load_family_manifest(manifest_path, allow_draft=True)
+    if args.family == _PM_US_CRH_V2_FAMILY_ID and manifest.trial_id_prefix != _LIVE_TRIAL_ID_PREFIX:
+        print(
+            "family_tally_v2: pm_us_crh_v2 manifest prefix drifted from "
+            f"{_LIVE_TRIAL_ID_PREFIX!r}",
+            file=sys.stderr,
+        )
+        return 2
     if args.family == _PM_US_CRH_V2_FAMILY_ID and (
         args.covered_listed_station_days is None
         or args.fill_source is None
@@ -1041,7 +1109,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         if args.fill_source is None
         else count_filled_takes(
             args.fill_source,
-            family_prefix=_LIVE_TRIAL_ID_PREFIX,
+            family_prefix=manifest.trial_id_prefix,
             since_climate_day=args.fill_since_climate_day,
         )
     )

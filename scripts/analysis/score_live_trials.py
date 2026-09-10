@@ -565,6 +565,10 @@ def read_filled_trials_state_db(
             has_census_latch = True
             break
     if not has_census_latch:
+        # v3 Phase 0: a store with zero prefix keys is n=0, not a store failure.
+        # v2 branch is unchanged (positive control still refuses).
+        if family_prefix.startswith("continuous_rung_hold/"):
+            return (), (), {}
         raise StorePositiveControlFailedError("store_positive_control_failed")
 
     # instrument_id -> every TAKEN latch across ALL cities sharing this

@@ -130,6 +130,10 @@ class SettingsLike(Protocol):
     keeps the dependency duck-typed, so a small fake settings object is
     sufficient in a test, and this module never re-parses anything the
     settings loader already owns.
+
+    Phase 0: ``continuous_rung_hold`` is a composition flag on
+    ``BreezyTradeSettings``, not an ``issue()`` precondition. v3's permit is
+    None by construction.
     """
 
     orders_enabled_requested: bool

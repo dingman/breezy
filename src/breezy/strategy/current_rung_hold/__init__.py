@@ -33,6 +33,8 @@ from breezy.strategy.current_rung_hold.strategy import (
     season_for,
 )
 from breezy.strategy.current_rung_hold.trial_day_latch import (
+    CONTINUOUS_TRIAL_KEY_PREFIX,
+    DEFAULT_TRIAL_KEY_PREFIX,
     TrialDayAlreadyConsumed,
     TrialDayInvalidReason,
     TrialDayLatch,
@@ -43,6 +45,8 @@ from breezy.strategy.current_rung_hold.trial_day_latch import (
 )
 
 __all__ = [
+    "CONTINUOUS_TRIAL_KEY_PREFIX",
+    "DEFAULT_TRIAL_KEY_PREFIX",
     "REFUSAL_REASONS",
     "AllowShortNotPermittedError",
     "ArchiveTablePinMismatchError",
