@@ -1,0 +1,165 @@
+[Unit]
+# Reboot-durable supervision for the DAILY TRADE-NODE SUPERVISOR
+# (`breezy-trade-supervisor`, pyproject.toml:271 ->
+# `breezy.runtime.trade_supervisor:main`) -- NOT for the trade node itself.
+#
+# What it supervises, and its schedule (trade_supervisor_core.py:31-34):
+#   16:40Z STOP_PRIOR   -- SIGTERM yesterday's tracked `breezy-trade`
+#   16:50Z LAUNCH       -- spawn today's node ([R6/B1] launch decision), with
+#                          bounded relaunch (<=2 attempts, >=3 min apart,
+#                          window closes 17:00Z = RELAUNCH_CUTOFF_UTC)
+#   17:05Z SELF_CHECK   -- readiness, catch-up window closes 17:10Z
+# One node process per trading day; the live-trading permit's TTL is 10 h, so
+# the node must be launched before 17:00Z or the day is lost.
+#
+# WHY THIS UNIT EXISTS. The supervisor previously ran inside a tmux scope with
+# no unit, no timer and no cron entry. The 2026-09-08T01:07:50Z host reboot
+# killed it silently: no `breezy-trade-2026-09-08*.log` was ever created and
+# nothing would have launched at that day's 16:50Z window. Supervision that
+# does not survive a reboot is not supervision.
+#
+# WHY THIS DOES NOT VIOLATE THE "no systemd unit" RULE.
+# `docs/plans/R8_OPERATOR_RUNBOOK.md:198-200` and
+# `docs/plans/TRADE_NODE_DAILY_RELAUNCH_2026-09-04.md:126-127` ban a unit for
+# the TRADE NODE, and the ban's stated reason is that a unit file would put the
+# live-trading ENABLEMENT VALUE in a file. This unit assigns NO value to any
+# operator-reserved or session control. It names none of them, defaults none of
+# them, and `Environment=` appears nowhere below. The two durable caps reach it
+# only by REFERENCE to the operator's own gitignored `operator.env`, which
+# runbook §6 already permits to hold exactly those two values at rest. The
+# per-process session values (enablement, per-order notional, session notional,
+# session order count, operator identity) stay OUT of every file and reach this
+# unit ONLY through the operator's `systemctl --user import-environment`, which
+# holds them in the user manager's memory -- never on disk. See the
+# "Trade-supervisor relaunch" section of the runbook.
+#
+# FAIL-CLOSED AFTER REBOOT, BY DESIGN. `import-environment` does not survive a
+# reboot: the user manager comes back with a clean environment. So after a
+# reboot this unit restores SUPERVISION automatically, but the node it launches
+# has no enablement and refuses every order at permit issue. Restoring ORDER
+# CAPABILITY remains the operator's deliberate act. That is the intended
+# asymmetry -- never again a silent loss of supervision, and never an automatic
+# resumption of live trading.
+Description=Breezy daily trade-node supervisor (user scope)
+Documentation=file:///home/jon/breezy/docs/plans/R8_OPERATOR_RUNBOOK.md
+Documentation=file:///home/jon/breezy/docs/plans/TRADE_NODE_DAILY_RELAUNCH_2026-09-04.md
+Documentation=file:///home/jon/breezy/deploy/systemd/README.md
+After=network-online.target
+Wants=network-online.target
+# The supervisor's own env is FIXED FOR ITS LIFETIME, so a restart cannot fix a
+# bad env ([E4], relaunch plan :94). Restarts here are therefore for crashes and
+# reboots, not for misconfiguration -- a tight burst is the right shape. 5 per
+# hour at RestartSec=60 tolerates a transient fault without ever hammering, and
+# fails the unit loudly if the supervisor cannot stay up.
+StartLimitBurst=5
+StartLimitIntervalSec=3600
+
+[Service]
+Type=simple
+WorkingDirectory=/home/jon/breezy
+
+# Strategy-inferable output (which stations, which windows). Mirrors
+# breezy-quote-tape.service and breezy-nws-ingest.service.
+UMask=0077
+
+# NO MemoryHigh=/MemoryMax= -- DELIBERATE, and the one place this unit
+# diverges from breezy-quote-tape.service on purpose. A cgroup memory ceiling
+# on this unit would apply to the spawned `breezy-trade` node as well, and a
+# cgroup OOM kill is SIGKILL: it would tear down a node that may be holding a
+# live position, mid-flight, with no clean shutdown path. The recorder can
+# afford that trade (its worst case is a lost tape segment); a node with money
+# at risk cannot. The tradeoff is stated rather than imposed: this unit is
+# instead left to the host-wide OOM killer, and the operator watches
+# `systemd-cgtop --user` / `systemctl --user status` for growth. See the
+# runbook section for the standing note.
+
+# ---- Environment: REFERENCES ONLY. No value is assigned anywhere below. ----
+#
+# Node/exec identity and paths. Value-free with respect to every reserved
+# control; supplies BREEZY_TRADE_CATALOG_ROOT, BREEZY_TRADE_TRADER_ID,
+# BREEZY_USER_AGENT, POLYMARKET_US_ACCOUNT_NUMBER and
+# POLYMARKET_US_EXEC_STATE_DB. The last of these is REQUIRED by the supervisor
+# itself: `main` resolves it through `resolve_store_path(os.environ)` and exits
+# 2 (config error) when it is absent (trade_supervisor.py:1019).
+EnvironmentFile=-%h/.config/breezy/breezy-trade.env
+#
+# Venue credentials and endpoints for the node the supervisor spawns (the
+# supervisor forwards its own `os.environ` as the child's `env=`, never argv --
+# trade_supervisor.py:808,874). Same file breezy-quote-tape.service references.
+EnvironmentFile=-%h/.config/breezy/polymarket.env
+#
+# The two OPERATOR-RESERVED durable caps -- the maximum daily budget and the
+# maximum per position -- BY REFERENCE ONLY, per runbook §6 (`operator.env`,
+# mode 0600, gitignored at `/operator.env`). This unit does not read, echo,
+# default, or otherwise know their values, and the build side never writes that
+# file. The leading `-` keeps supervision alive if the file is absent: absence
+# fails closed at authorization anyway (operator_controls.py:147-166,:333-337
+# raise on absence, naming the control and never its value), so a missing file
+# refuses orders rather than silently permitting them, while a hard unit failure
+# would instead lose the supervision this unit exists to guarantee.
+EnvironmentFile=-%h/breezy/operator.env
+#
+# The per-process SESSION values -- the live-trading enablement variable
+# (safety.py:133), the per-order notional ceiling, the session notional, the
+# session order count and the operator identity, plus the build-side request
+# flags BREEZY_ORDERS_ENABLED / BREEZY_CURRENT_RUNG_HOLD /
+# BREEZY_LIVE_OBSERVATIONS -- are DELIBERATELY ABSENT from this file. They must
+# never be written to disk. The operator injects them into the user manager's
+# in-memory environment with `systemctl --user import-environment` before
+# `start`; see the runbook. Optional: BREEZY_ALERT_WEBHOOK_URL
+# (health.py:114) routes supervisor alerts to a webhook when set.
+
+# Byte-identical to the hand-launch. The console script REQUIRES the distinct
+# first positional token `breezy-trade-supervisor-daily`
+# (SUPERVISOR_ARGV_TOKEN, trade_supervisor_core.py:52; enforced
+# trade_supervisor.py:961-968 -- a wrong or missing token exits 2), so that
+# `pgrep -f 'breezy-trade-supervisor-daily$'` finds exactly this process
+# without substring-matching the node's own `breezy-trade` argv [R8].
+ExecStart=/home/jon/breezy/.venv/bin/breezy-trade-supervisor breezy-trade-supervisor-daily
+
+Restart=always
+# Exit 2 is a CONFIGURATION error -- a missing POLYMARKET_US_EXEC_STATE_DB, a
+# lock error, or a second supervisor refused by the [R7a] exclusive flock. The
+# supervisor's env is fixed for its lifetime, so restarting cannot change any
+# of those outcomes; restarting would only hot-loop and hide the fault behind a
+# "restarting" status. Fail loudly instead and leave it to `systemctl status`.
+RestartPreventExitStatus=2
+RestartSec=60
+
+# THE MOST IMPORTANT LINE IN THIS FILE.
+# systemd's default KillMode=control-group SIGTERMs (then SIGKILLs) EVERY
+# process in the unit's cgroup. The spawned `breezy-trade` node is in this
+# cgroup -- `spawn_node` uses start_new_session=True (its own SID/PGID,
+# trade_supervisor.py:489-516), which detaches it from the terminal but NOT
+# from the cgroup. Under the default, `systemctl --user restart` or a
+# supervisor crash-restart would take down a node that may be holding a live
+# position. KillMode=process signals ONLY the supervisor. A node that outlives
+# its supervisor is an anticipated, tested state, not an orphan: [B2]
+# supervisor-death adoption re-adopts the PID-verified flock holder at the next
+# 16:40Z cycle (relaunch plan :67-68, :134). Stopping the node is the
+# supervisor's STOP_PRIOR job or the operator's explicit SIGTERM -- never
+# systemd's cgroup sweep.
+KillMode=process
+# SIGTERM is what both processes handle cleanly; NEVER SIGKILL either one.
+KillSignal=SIGTERM
+# The supervisor's loop sleeps in <=60 s chunks and ends cleanly on SIGINT/
+# SIGTERM; 120 s is ample headroom so systemd never escalates to SIGKILL.
+TimeoutStopSec=120
+
+# journald -- reboot-durable, rotated, queryable per-unit. This is the
+# supervisor's DECISION journal only. It does NOT replace the two log files the
+# supervisor writes itself and which remain the authoritative evidence:
+#   ~/.local/share/breezy/logs/breezy-trade-supervisor.log
+#   ~/.local/share/breezy/logs/breezy-trade-<YYYYMMDD>T<HHMMSS>Z.log  (the node)
+# Only the NODE log carries the boot-time permit line that proves order
+# capability (trade_supervisor.py:449-455; relaunch plan :126).
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=breezy-trade-supervisor
+
+# NO SuccessExitStatus. The exit contract must reach `systemctl status`:
+#   0 = clean loop end, 1 = runtime error, 2 = configuration error
+#       (trade_supervisor_core.py:80-82).
+
+[Install]
+WantedBy=default.target

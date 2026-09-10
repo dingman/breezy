@@ -259,3 +259,173 @@ SURVIVE/UNDERPOWERED gate above.
 
 The stop gate itself is unchanged: positive ROI from **real, very small, marketable orders**, with the
 confidence-interval lower bound above break-even. A backtest number cannot satisfy it.
+
+## 10. Trade-supervisor relaunch — the systemd user unit (added 2026-09-08)
+
+### Why this section exists
+
+The daily supervisor (`breezy-trade-supervisor`, §7's launcher for the node) ran inside a tmux scope
+with **no unit, no timer, no cron entry**. The `2026-09-08T01:07:50Z` host reboot killed it silently:
+no `breezy-trade-2026-09-08*.log` was ever created, and nothing would have launched at that day's
+16:50Z window. Supervision that does not survive a reboot is not supervision.
+
+`deploy/systemd/breezy-trade-supervisor.service` fixes exactly that, and **only** that.
+
+### This does not reopen the §7 "no systemd unit" rule
+
+§7 bans a unit for **the trade node**, and the ban's stated reason is that a unit file would put the
+live-trading **enablement value** in a file. This unit is for the **supervisor**, and it **assigns no
+value to any operator-reserved or session control** — there is no `Environment=` line in it at all.
+
+- The **two durable caps** reach it only by *reference* to your gitignored `/operator.env`, which §6
+  already permits to hold exactly those two values at rest. The unit never reads or echoes them.
+- The **per-process session values** — the live-trading enablement variable, the per-order notional
+  ceiling, the session notional, the session order count, the operator identity, plus
+  `BREEZY_ORDERS_ENABLED` / `BREEZY_CURRENT_RUNG_HOLD` / `BREEZY_LIVE_OBSERVATIONS` — stay out of every
+  file, exactly as §6 requires. They reach the unit through `systemctl --user import-environment`,
+  which holds them in the **user manager's memory**. Same accepted `/proc/<pid>/environ` exposure class
+  as the shell exports; nothing new on disk.
+
+**Fail-closed after reboot, by design.** `import-environment` does *not* survive a reboot — the user
+manager comes back with a clean environment. So a reboot restores **supervision** automatically, but
+the node the supervisor launches will have no enablement and will refuse every order at permit issue.
+Restoring **order capability** stays your deliberate act, every time. Never again a silent loss of
+supervision; never an automatic resumption of live trading.
+
+### Standing note: no memory cap, deliberately
+
+Unlike `breezy-quote-tape.service`, this unit sets **no `MemoryHigh=` / `MemoryMax=`**. A cgroup ceiling
+here would also cover the spawned `breezy-trade` node, and a cgroup OOM kill is **SIGKILL** — it would
+tear down a node possibly holding a live position, with no clean shutdown. The recorder can afford that
+trade; a node with money at risk cannot. The cost of the choice: this unit is left to the host-wide OOM
+killer. Watch it with `systemd-cgtop --user` and the `Memory:` line of `systemctl --user status`.
+
+`KillMode=process` is set for the same reason: systemd's default `control-group` would SIGTERM/SIGKILL
+**every** process in the cgroup on restart, including the node (its `start_new_session=True` detaches it
+from the terminal, not from the cgroup). A node that outlives its supervisor is an anticipated state —
+[B2] supervisor-death adoption re-adopts the PID-verified flock holder at the next 16:40Z cycle.
+
+### (a) Install and enable
+
+Linger — required for a user unit to run without an active login and to come back after reboot.
+**Verify first; on this host it is already `yes`:**
+
+```
+loginctl show-user "$USER" --property=Linger
+# expect: Linger=yes ; if it prints Linger=no, run:
+loginctl enable-linger "$USER"
+```
+
+Link the unit (the repo file stays the source of truth, matching every other Breezy unit) and verify:
+
+```
+ln -s /home/jon/breezy/deploy/systemd/breezy-trade-supervisor.service ~/.config/systemd/user/
+systemctl --user daemon-reload
+systemd-analyze --user verify ~/.config/systemd/user/breezy-trade-supervisor.service
+```
+
+`verify` prints **nothing** when the unit is clean — treat any output as a failure (it exits 0 either
+way, so read the output, not the status). `daemon-reload` starts nothing.
+
+Now put the session values into the user manager's memory, **from the shell that carries your §6/§7
+exports** — this runbook proposes no values and does not spell the enablement variable's name:
+
+```
+set -a; . /home/jon/breezy/operator.env; set +a          # the two caps only, per §6
+# ...your existing §7 exports for the session values in this same shell...
+systemctl --user import-environment \
+    <the live-trading enablement variable> \
+    <the per-order notional ceiling> \
+    <the session notional> \
+    <the session order count> \
+    <the operator identity> \
+    BREEZY_ORDERS_ENABLED BREEZY_CURRENT_RUNG_HOLD BREEZY_LIVE_OBSERVATIONS
+```
+
+Confirm the caps resolved before starting anything:
+
+```
+.venv/bin/python scripts/operator/print_operator_controls.py
+```
+
+Then, and only then, enable and start. **Do this before 17:00Z** on a day you intend to trade — the
+permit TTL is 10 h and the launch window closes at `RELAUNCH_CUTOFF_UTC = 17:00Z`:
+
+```
+systemctl --user enable --now breezy-trade-supervisor.service
+```
+
+`enable` alone (without `--now`) arms it for the next boot without starting it today — use that if you
+are installing outside a trading window.
+
+**After every reboot**, re-run the `import-environment` block above and then
+`systemctl --user restart breezy-trade-supervisor.service`. Until you do, the unit is up and supervising,
+but the node it launches has no order capability. That is intended, not a fault.
+
+**To stop:** `systemctl --user stop breezy-trade-supervisor.service` (SIGTERM to the supervisor only —
+`KillMode=process` leaves a running node alone). SIGTERM the node separately if you want it down too.
+**Never SIGKILL either process.**
+
+### (b) Verify it actually worked
+
+1. **The unit is up and armed for the next boot.**
+
+```
+systemctl --user is-enabled breezy-trade-supervisor.service   # expect: enabled
+systemctl --user status  breezy-trade-supervisor.service --no-pager
+pgrep -af 'breezy-trade-supervisor-daily$'                    # expect: exactly one match
+```
+
+2. **The supervisor made its launch decision.** Its own log — not the journal — is the record:
+
+```
+journalctl --user -u breezy-trade-supervisor.service --since today --no-pager
+tail -n 50 ~/.local/share/breezy/logs/breezy-trade-supervisor.log
+```
+
+Look for `supervisor_started` at start-up, and after 16:50Z a launch decision line.
+
+3. **The node actually booted with ORDER CAPABILITY — the only proof that counts.**
+
+Only the **boot-time permit line in the node's own log** proves order capability. Its absence from an
+*incremental* log delta is a known false negative (the 2026-09-06 17:05Z `NO_PERMIT` alert was wrong for
+exactly this reason: the line had already drained out of the delta window). **So read the node log file
+itself, from the top — never a tail, never a delta, never the journal:**
+
+```
+# NOTE the [0-9] guard: a bare breezy-trade-*.log glob also matches the
+# SUPERVISOR's own breezy-trade-supervisor.log, which never carries a permit line.
+NODE_LOG=$(ls -1t ~/.local/share/breezy/logs/breezy-trade-[0-9]*T*Z.log | head -n1)
+echo "checking: $NODE_LOG"
+grep -c 'live-trading permit issued issued_at_ns=' "$NODE_LOG"
+```
+
+- count **≥1** → the node booted **with** order capability. This is the success line.
+- count **0** → check for the refusal, which is equally explicit:
+
+```
+grep -n 'order submission permit not issued' "$NODE_LOG"
+grep -n 'trading node failed'                "$NODE_LOG"
+```
+
+A `permit not issued` line means a §6 precondition was missing from the imported environment — the most
+likely cause after a reboot is that `import-environment` was not re-run. Correct it and restart the unit;
+the node exits 1 on that refusal and is **never** relaunched automatically ([E4]: the supervisor's env is
+fixed for its lifetime, so a relaunch could not change the outcome).
+
+4. **The node is alive and separately sessioned:**
+
+```
+pgrep -af 'breezy-trade$'
+ps -o sid,pgid,pid,cmd -p "$(pgrep -f 'breezy-trade-supervisor-daily$')" "$(pgrep -f 'breezy-trade$')"
+```
+
+Each should show its own SID/PGID.
+
+### Reboot drill (do this once, outside a trading window)
+
+`systemctl --user is-enabled` returning `enabled` plus `Linger=yes` is the paper proof. The real proof is
+a reboot: after the host comes back, `systemctl --user status breezy-trade-supervisor.service` should show
+the unit **active (running)** with **no login session**, and
+`~/.local/share/breezy/logs/breezy-trade-supervisor.log` should carry a fresh `supervisor_started` line.
+Order capability will correctly be absent until you re-import the session values.

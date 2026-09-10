@@ -1286,3 +1286,31 @@ Before dispatch, classify every backlog item as CHANGE (source delta; RED = the 
 
 ### How to apply
 The return for a characterisation item carries `MUTATION_RED_EVIDENCE`: one perturbation per new assertion with its failing id, then the restored GREEN line. Reviewers diff the new assertions against the existing module first ("already covered at `path:line`" closes the row without code). Related: L-24 (fixtures that always satisfy the invariant), L-30 (absence proves nothing), L-32 (a pin can pre-empt an open ruling — a characterisation pin of behaviour under ruling is refused).
+
+## L-34 — The trial's TRIGGER is pinned; a re-look is a second snapshot (2026-09-09)
+
+### What happened
+Asked to close the gap "the strategy does not continuously evaluate for edge", a design proposal recommended adding a native `Clock.set_timer` that re-runs the SAME evaluation on unlatched stations, alongside the existing quote-tick path, and classified it PREREG-COMPATIBLE on the reasoning that "the trigger is not pinned". Adversarial review refuted it. v1 §2:41-44 defines the trial as "the FIRST executable snapshot ... to which the taken test is applied once". `Cache.quote_tick()` returns the LAST tick (`cache.pyx:3204-3234`), so a timer applies the taken test to a different snapshot than the first executable one, changing which `ask`/`instrument_id` is written to the latch — i.e. which row can enter `n`. The clock-speed ruling (`docs/evidence/grok_clock_speed_ruling_2026-09-04.md:29`) rejects ">1 snapshot/station-day"; one latch does not save it, because the rejected lever is extra snapshots as a throughput trick. The blueprint's "LiveClock timers DECLINED" is a separate implementation hazard (timer raises are swallowed), not the class pin.
+
+### Why this is binding
+"Pure addition" reasoning is seductive: a timer adds no new decision rule, changes no threshold, and leaves the latch arithmetic identical, so it reads as observability-grade. It is not. In a first-snapshot family the TRIGGER selects the estimand. Changing when you look changes what you measure, silently, on a live family whose n cannot be re-run.
+
+### The rule
+For any pre-registered family, treat the evaluation trigger as part of the frozen decision rule until the spec says otherwise. Before classifying a change as PREREG-COMPATIBLE, ask: could this cause a DIFFERENT observation to become the trial? If yes it is class (C) regardless of how additive the code looks. "The spec does not mention X" is not evidence that X is unpinned — quote the clause that defines the estimand and reason from it.
+
+### How to apply
+The mechanical check is the selector: name the exact datum the registered rule selects (here, the first executable snapshot), then name the datum the proposed path would feed the same test (here, the cached last tick). If they can differ on any afternoon, the change is (C). Related: L-18 (an outcome claim is a mechanism claim), L-32 (search the prior ruling before planning), L-16 (timer raises are swallowed).
+
+## L-35 — QuoteTicks cannot observe an empty bid; measure depth from Depth10 (2026-09-09)
+
+### What happened
+The standing assumption "the weather-market bid side is empty" (median TOB bid 0.3 contracts) was traced to a SIX-MINUTE capture on 2026-08-30 (n=675), and is a pooled-median artifact — two slugs in that same sample had bid medians of 143 and 1431. Re-measured over the full tape (1,842,152 QuoteTicks), the D0+ executable-ask universe shows bid p50 55.0 with a >=1-lot top-of-book bid 93.6% of the time. But the re-measurement carries its own trap, found only by attacking it: `parse_quote_tick` -> `_require_best_level` REFUSES a one-sided book (`parsing.py:646-649,698-709`), so the QuoteTick empty-bid rate is structurally ZERO. Depth10 shows 12% of frames with no TOB bid, and 2026-09-07 — 79-87% one-sided — produced 30 depth directories and ZERO quote directories, so the emptiest captured day is absent from the quote tape entirely.
+
+### Why this is binding
+Both the original claim and its refutation were measurements of a filtered population presented as facts about the venue. The 0.3 figure justified having no exit path at all; the 55.0 figure would justify building one. A dataset that cannot represent the condition you are testing for will always report that the condition does not occur.
+
+### The rule
+Never answer "is there a bid" from the quote tape — that tape is defined to exclude one-sided books. Depth questions are answered from `order_book_depths` with a level walk, never from top-of-book, and never from a tick-weighted pooled median without also reporting a per-instrument and per-station-day weighting. State the capture window of any depth statistic; a sample spanning minutes is not a venue fact.
+
+### How to apply
+Where bids ARE genuinely thin is the case that matters most: D0+ near-certain contracts (ask >= 0.95) have spread p50 0.43 and only 42% of frames can fill 25 lots — exiting a WINNER is hazardous on both spread and depth, which is the opposite of the "thin everywhere" story. Any exit design needs a depth walk, a spread budget, and an explicit one-sided-book policy. Related: L-23 (a missing day is not an absent market), L-8 (recorder write time is not venue list time), L-18.
