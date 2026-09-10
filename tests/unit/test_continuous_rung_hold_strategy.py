@@ -6,6 +6,7 @@ from collections.abc import Callable, Iterator
 from contextlib import AbstractContextManager, contextmanager
 from decimal import Decimal
 from pathlib import Path
+from typing import Any
 
 import pytest
 from nautilus_trader.common.component import TestClock
@@ -412,3 +413,53 @@ def test_a_two_sided_frame_delivered_as_both_quote_and_depth_evaluates_once(
 
     assert len(strategy.offer_tape) == 1
     assert strategy.offer_tape.records()[0].reason == "edge_below_break_even"
+
+
+def _order_denied(strategy: ContinuousRungHoldStrategy, *, reason: str) -> Any:
+    from nautilus_trader.core.uuid import UUID4
+    from nautilus_trader.model.events import OrderDenied
+    from nautilus_trader.model.identifiers import ClientOrderId
+
+    return OrderDenied(
+        trader_id=strategy.trader_id,
+        strategy_id=strategy.id,
+        instrument_id=INTERIOR_ID,
+        client_order_id=ClientOrderId("O-RACE-TEST-1"),
+        reason=reason,
+        event_id=UUID4(),
+        ts_init=WINDOW_OPEN_NS,
+    )
+
+
+def test_on_order_denied_with_the_wait_reason_clears_inflight(
+    store_path: Path, interior_instrument: BinaryOption,
+) -> None:
+    """SAFETY C1 (plan rev 6.1): a WAIT-class deny (the pre-arm re-check
+    inside ``_submit_order``) frees the station-day to re-hunt on a later
+    tick -- it is not a refusal and must not leave IN_FLIGHT stuck."""
+    from breezy.adapters.polymarket_us.exec import submit_chain
+
+    strategy = _register_and_start(store_path=store_path, instruments=(interior_instrument,))
+    assert strategy._latch is not None
+    strategy._latch.set_inflight(STATION, CLIMATE_DAY.isoformat())
+    assert strategy._latch.is_inflight(STATION, CLIMATE_DAY.isoformat()) is True
+
+    strategy.on_order_denied(
+        _order_denied(strategy, reason=submit_chain.OPEN_INTENT_WAIT_REASON),
+    )
+
+    assert strategy._latch.is_inflight(STATION, CLIMATE_DAY.isoformat()) is False
+
+
+def test_on_order_denied_with_any_other_reason_leaves_inflight_set(
+    store_path: Path, interior_instrument: BinaryOption,
+) -> None:
+    """A standing refusal (not the WAIT sentinel) is NOT cleared here -- a
+    narrower match would risk silently waving off a real refusal."""
+    strategy = _register_and_start(store_path=store_path, instruments=(interior_instrument,))
+    assert strategy._latch is not None
+    strategy._latch.set_inflight(STATION, CLIMATE_DAY.isoformat())
+
+    strategy.on_order_denied(_order_denied(strategy, reason="some other denial reason"))
+
+    assert strategy._latch.is_inflight(STATION, CLIMATE_DAY.isoformat()) is True

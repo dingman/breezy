@@ -517,6 +517,9 @@ CAGE_RULE_PINS: tuple[RulePin, ...] = (
                 "self._ledger.true_up_booking",
                 "self._latch.arm",
                 "self._latch.retire",
+                # SAFETY C1 (plan rev 6.1): the pre-spend re-check, read-only
+                # against the durable singleton -- adds no send path.
+                "self._latch.is_latched",
                 "self._write_signer.sign_headers",
                 "self._order_sender.post_order",
                 "submit_chain.latched_refusal_reason",

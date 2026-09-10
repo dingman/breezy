@@ -54,6 +54,15 @@ RECONCILE_NOT_RUN_REASON: Final[str] = (
 LATCH_ARM_REFUSED_REASON: Final[str] = (
     "submit-intent latch refused to arm; this client refuses to submit"
 )
+#: SAFETY C1 (plan rev 6.1): the authoritative pre-spend re-check inside
+#: ``_submit_order``, evaluated on the same event-loop thread as ``arm()``
+#: with no ``await`` between them. A WAIT is not a refusal: it spends no
+#: permit, releases no booking (none was authorized yet), and does not latch
+#: ``_trading_refusals``. The strategy clears IN_FLIGHT for this station on
+#: seeing this exact reason (see ``ContinuousRungHoldStrategy.on_order_denied``).
+OPEN_INTENT_WAIT_REASON: Final[str] = (
+    "submit intent is already OPEN for this account; wait for it to resolve"
+)
 STORE_RAISED_REASON: Final[str] = (
     "the durable store raised before the post; this client refuses to submit"
 )

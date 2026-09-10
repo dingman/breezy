@@ -483,7 +483,12 @@ async def test_a_latch_left_open_by_a_prior_crash_refuses_every_submit_until_cle
     assert sender.calls == []
     denials = [e for e in rig.order_events if isinstance(e, OrderDenied)]
     assert len(denials) == 1
-    assert "latch" in denials[0].reason.lower()
+    # SAFETY C1 (plan rev 6.1): the pre-spend re-check now denies a
+    # still-OPEN singleton with the WAIT reason -- BEFORE ever reaching
+    # `arm()` -- rather than letting `arm()` itself raise. The safety
+    # property this test names ("refuses every submit until cleared") is
+    # unchanged: still zero posts, still exactly one denial.
+    assert "open" in denials[0].reason.lower() or "latch" in denials[0].reason.lower()
 
 
 def _find_write_transport_canonical_setattr_sites() -> list[str]:
@@ -733,6 +738,12 @@ async def test_a_raising_state_store_before_the_post_means_no_post_occurs(
 
         def current(self) -> None:
             return None
+
+        def is_latched(self) -> bool:
+            # SAFETY C1 (plan rev 6.1): the new pre-spend re-check calls this
+            # before `arm()`. `False` lets the test still reach the raising
+            # `arm()` below, which is this test's whole point.
+            return False
 
         def reconcile_at_startup(self, **_kwargs: object) -> None:
             return None

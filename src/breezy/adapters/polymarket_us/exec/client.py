@@ -1586,6 +1586,18 @@ class PolymarketUSExecutionClient(LiveExecutionClient):
             return self._deny(order, unmappable, now_ns)
         if submit_chain.permit_is_missing(self._permit):
             return self._deny(order, submit_chain.PERMIT_ABSENT_REASON, now_ns)
+        # SAFETY C1 (plan rev 6.1): the authoritative re-check, immediately
+        # before the permit spend below and with NO `await` between here and
+        # `self._latch.arm(...)`. Two `_submit_order` tasks created in one
+        # synchronous burst (`submit_order` wraps every command in its own
+        # task, `live/execution_client.py:277-282`) cannot interleave between
+        # this line and `arm()`: whichever task's `SubmitOrder` was scheduled
+        # first runs this whole prefix -- including `arm()` -- with no
+        # suspension point, so the second task observes `is_latched() is
+        # True` here, before it has spent anything. This is a WAIT, not a
+        # refusal: no money, no permit, no `_trading_refusals` entry.
+        if self._latch is not None and self._latch.is_latched():
+            return self._deny(order, submit_chain.OPEN_INTENT_WAIT_REASON, now_ns)
         try:
             assert_live_order_submission_permitted(
                 credentials=self._credentials,

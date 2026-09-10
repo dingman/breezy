@@ -22,10 +22,12 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Final, Literal
 
 from nautilus_trader.model.enums import OrderSide, TimeInForce
+from nautilus_trader.model.events import OrderDenied
 from nautilus_trader.model.identifiers import InstrumentId
 from nautilus_trader.trading.strategy import Strategy
 
 from breezy.adapters.polymarket_us.errors import FeeScheduleUnknownError
+from breezy.adapters.polymarket_us.exec import submit_chain
 from breezy.adapters.polymarket_us.parsing import assert_fee_schedule_known
 from breezy.domain.station_observation import StationObservation
 from breezy.domain.weather_bucket_facts import (
@@ -436,6 +438,28 @@ class ContinuousRungHoldStrategy(Strategy):
         self._maybe_submit(iid, decision)
         if self._order_submission_permit is None:
             self._latch.clear_inflight(station, climate_day_key)
+
+    def on_order_denied(self, event: OrderDenied) -> None:
+        """SAFETY C1 (plan rev 6.1): clear IN_FLIGHT for a WAIT-class deny.
+
+        ``_submit_order``'s pre-arm re-check denies a synchronous-burst
+        sibling with ``submit_chain.OPEN_INTENT_WAIT_REASON`` -- money and
+        the durable submit-intent latch untouched, so the station-day is
+        free to re-hunt on a later tick. Every OTHER denial reason is a
+        standing refusal this strategy does not yet resolve automatically
+        (Phase 0's own auto-clear, above, only ever ran with
+        ``order_submission_permit is None``), so IN_FLIGHT is left set for
+        anything but the exact WAIT sentinel -- a narrower reason match
+        would risk silently clearing a real refusal too.
+        """
+        super().on_order_denied(event)
+        if event.reason != submit_chain.OPEN_INTENT_WAIT_REASON:
+            return
+        facts = self._facts.get(str(event.instrument_id))
+        if facts is None:
+            return
+        assert self._latch is not None
+        self._latch.clear_inflight(facts.settlement_station, facts.climate_day.isoformat())
 
     def _report_alerter(
         self,

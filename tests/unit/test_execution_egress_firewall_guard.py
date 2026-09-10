@@ -1826,6 +1826,9 @@ EXEC_ORDER_COROUTINE_PERMITTED_CALLEES = frozenset(
         "self._ledger.true_up_booking",
         "self._latch.arm",
         "self._latch.retire",
+        # SAFETY C1 (plan rev 6.1): the authoritative pre-spend re-check.
+        # Read-only against the durable singleton; adds no send path.
+        "self._latch.is_latched",
         "self._write_signer.sign_headers",
         "self._order_sender.post_order",
         "submit_chain.latched_refusal_reason",
@@ -2571,6 +2574,7 @@ def test_the_order_coroutine_callee_allowlist_reaches_no_venue() -> None:
             "self._ledger.true_up_booking",
             "self._latch.arm",
             "self._latch.retire",
+            "self._latch.is_latched",
             "self._write_signer.sign_headers",
             "self._order_sender.post_order",
             "submit_chain.latched_refusal_reason",
@@ -2711,11 +2715,26 @@ def test_x1_the_live_scan_actually_reaches_a_test_that_imports_the_exec_package(
     # through the shipped `_build_accept_fill_rig` (`test_polymarket_us_exec_
     # client.py`), whose `post_order` is the injected `_FakeOrderSender`, so
     # this suite never opens a socket either.
+    #
+    # Old -> new (this row, SAFETY C1, plan rev 6.1): added
+    # `tests/unit/test_current_rung_hold_pre_arm_race.py`, which drives a
+    # real `PolymarketUSExecutionClient` through two synchronous
+    # `_submit_order` tasks to prove the pre-arm race fix spends exactly one
+    # permit slot. WIDENED, not relaxed (L-12): the comparison is still
+    # `==`; the module carries no `SOCKET_RESTORING_MARKERS` -- its sender is
+    # a local `_SlowSender` double (one `asyncio.sleep(0)`, no socket), same
+    # shape as every sibling exec suite. `test_continuous_rung_hold_strategy.
+    # py` also now imports `exec.submit_chain` (a local import inside its new
+    # `on_order_denied` WAIT-reason test) to reuse the ONE
+    # `OPEN_INTENT_WAIT_REASON` literal rather than a second, drifting copy
+    # -- a pure string constant, no client, no socket.
     assert exec_importing_test_modules() == {
         "tests/contract/test_exec_client_reconciliation_contract.py",
         "tests/contract/test_exec_client_wiring_contract.py",
         "tests/contract/test_live_fill_scoring_chain_contract.py",
+        "tests/unit/test_continuous_rung_hold_strategy.py",
         "tests/unit/test_current_rung_hold_order_submission_wiring.py",
+        "tests/unit/test_current_rung_hold_pre_arm_race.py",
         "tests/unit/test_exec_refusal_health_surface.py",
         "tests/unit/test_polymarket_us_exec_client.py",
         "tests/unit/test_polymarket_us_exec_endpoints.py",
