@@ -65,7 +65,10 @@ Merged analysis, evidence and unlock observables: `docs/evidence/GO_LIVE_BLOCKER
 Verified NOT blockers 09-06: exec client connected + reconciled, balances 97.91, permit issued, caps/enablement present, OP-SEQ control CLOSED (GTC only), obs feed live, 24 rungs subscribed, rotation 09:00Z outside every window.
 
 ### V3 continuous rung hold — `pm_us_crh_cont` (opened 2026-09-10, operator direction)
-- [HIGH] Continuous edge-hunting as a NEW pre-registered family (v2's trigger is frozen, L-34). Plan rev 2 peer-reviewed on three seams: **Phase 0 shadow APPROVED with conditions (building)**; Phase 1 live REQUEST_CHANGES — permit-slot restore must be once-per-`venue_order_id` and `remaining ≤ issued`; late-fill-after-strict-ZERO_FILL needs a re-latch + un-restore rule; TRIAL-on-fill needs `consume_if_absent` (two writers); one family dollar halt, not two; startup join/ordering spike in flight. Worst case both reviewers converged on: 2× per-position cap on one station via AMBIGUOUS-then-late-fill. m=1 stays illegal (a third family if ever). Evidence `docs/evidence/gate_attribution_replay_2026-09-10.md`.
+- [HIGH] NEW family (L-34). **Phase 0 shadow LANDED `cb133fb`** (permit None by construction, own prefix, tally guards after prefix filter). **Plan rev 6.1 APPROVED** (3 seams): Phase 1 = automated AMBIGUOUS resolution via the by-id GET in a firewall-scanned client coroutine off `_connect` — strict ZERO_FILL is unreachable (create response is `{id, executions}`), fail-closed on read-failure/PENDING/not-found, positions gate on zero AND fill, pre-spend OPEN re-check in `_submit_order`, `consume_if_absent` TRIAL-on-fill, `duplicate_fill` residual + family halt, one permit holder. Next: **Phase 0b** hunt on Depth10 asks (L-35; building) → Phase 1 → PREREG v3 registration before first fill (`docs/specs/PREREG_v3_continuous_rung_hold_DRAFT_2026-09-10.md`).
+
+### Tape durability (opened 2026-09-10)
+- [HIGH] `data/` tape cannot replay a per-tick hunt for 09-01..09-10 (only SFO 09-01 clean): ingest converts whole instances next day at 12:15Z and one truncated file strands the instance (09-07 MDW/SFO stranded in `live/c230f4fc`); 09-02/09-06/09-09pm lost. **In review:** per-file ingest (EOS-closed only, definitions first, `failed` exit code) + 15-min timer; then recover 09-07, install timer.
 
 ### LADDER_EV (opened 2026-09-07)
 - [MED] LADDER_EV whole-ladder EV scanner: design v2 peer-reviewed, `docs/strategies/breezy_strategy_ladder_ev_2026-09-07.md`. DEGRADED-only; shadow while CRH live; census 09-07 train 7/15 covered days ⇒ §12 kill INSUFFICIENT DATA. Stage 1 pure modules landed (42 tests, 2 reviews). Next: stage 2 strategy.py + 6-rung freeze + kill script.
@@ -73,7 +76,6 @@ Verified NOT blockers 09-06: exec client connected + reconciled, balances 97.91,
 ### Clock-speed track (opened 2026-09-04)
 - **[HIGH] Kalshi sibling family on NEW stations** — plan `docs/plans/KALSHI_CRH_EXPANSION_PLAN_2026-09-04.md` Rev 3; PREREG draft `docs/specs/PREREG_v1_kalshi_current_rung_hold_DRAFT_2026-09-04.md`. Open: S4 registry (`wip/kalshi-s4-registry`), S5–S7 read path, S8 CLI-final-vs-TWC reconciliation (n≥90), S9 rev2 cells. **Operator-only:** Kalshi account/KYC/funding/API key (S11); fee schedule. Not prioritised until Polymarket.us fills (operator 09-04).
 - **PREREG v2 REGISTERED 2026-09-05** (`4975fba`; spec BINDING §13, manifest `pm_us_crh_v2` d0=2026-09-05, v2 tally 15:30Z, n=0). C1–C4 and exclusions ACKNOWLEDGED (`grok_admission_exclusions_ack_2026-09-05.md`). Rejected by ruling: SPRT α=0.05, plug-in-π Z, freeze-π, shadow/paper/archive/Kalshi rows in live n, retroactive scoring, `venue` stratum, qty>1, NYC, pooling venues.
-- [LOW] Recorder salvage de-dup relies on per-instance non-overlap (asserted).
 
 ## Carried forward — open, not selected for this batch
 
