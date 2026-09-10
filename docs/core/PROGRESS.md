@@ -57,9 +57,8 @@ Merged analysis, evidence and unlock observables: `docs/evidence/GO_LIVE_BLOCKER
 
 | ID | Own | Sev | Blocker (evidence in the doc) | Size |
 |---|---|---|---|---|
-| GL-1 | B | CRIT | GL-1a shipped (`9ad11ff`): every create-order outcome carries redacted `body_kind`/`body_len`/`state=`/`cum=` tokens and `_submit_order` logs them for every kind (L-30). RULING REQUESTED: amend R-7 item 5 or resolve zero-fills via a GET /v1/order/{id} state read designed with GL-4 (L-32) | M |
-| GL-4 | B | HIGH | One AMBIGUOUS burns the rest of the day (`client.py:1747-1758`). **RULING REQUESTED 09-07:** an automated no-id retire after a sealed dual-GET probe amends R-7 item 5 ("exit is the clear tool") and R-4 invariant 1 (`_trading_refusals` append-only); two plan reviews scored risk <6 (clock-skew / index-lag false ABSENT ⇒ unbooked fill). Rule the amendment before any build (L-32) | M |
 | GL-7 | O | CRIT | **Supervisor DEAD since the 09-08 01:07:50Z reboot** — tmux scope, no unit/cron/session survived; no `breezy-trade-20260908*.log` and nothing launches at 16:50Z. 09-07 also lost (`resolved 0 instruments`, all 4 stations). Unit + runbook authored 09-08; operator must install and `enable --now` | S |
+| GL-4P | B | LOW | On the next create-order AMBIGUOUS, persist a positions snapshot beside the GL-1a tokens. Log-only: no retire, no `_trading_refusals` mutation, no booking release. Ruling `docs/evidence/gl1_gl4_order_state_ruling_2026-09-10.md` | S |
 
 **KILL clock:** D0=09-05, counter **0/15** (`covered_listed_station_days_2026-09-08.json`, written 14:15Z, fetch_start 09-05; 09-05/06/07 all uncovered). Coverage is **recorder-only by ruling** — node downtime never breaks it. At 4 covered/day from a clean 09-08 the 15th lands 09-11, declared by the 17:15Z tally **2026-09-12** (09-13 if 09-08 is lost); the prior "~09-09/09-10" was stale. Zero-fill/retired-AMBIGUOUS takes are not trials. GL-2, GL-3, GL-5, GL-9 and GL-12 landed; GL-1/GL-4 remain under ruling but are NOT the current blocker — `exec/polymarket_us/intent/current` reads `RETIRED`/`OPERATOR_CLEARED`, so the account-wide lockout is cleared.
 
