@@ -106,11 +106,15 @@ lowered, no post-hoc screen.
 Ordering rule: PREREG committed, then enablement, then the node. A PREREG written after a fill is not
 a pre-registration.
 
-## 6. Enablement — the operator's shell only (amended 2026-09-04, step-8 peer review)
+## 6. Enablement — the two operator caps (amended 2026-09-10)
 
-In the shell that will launch the node, and nowhere else, export **seven** values, in two classes.
+Operator ruling 2026-09-10: the only operator-controlled variables are the two durable caps.
+Every other value the live path currently demands is BUILD-SIDE and is supplied by the
+trade-supervisor unit (or derived in code at permit mint) on every launch, including after a reboot.
 
-**Durable role caps** — re-read on every authorization, never cached:
+**Durable role caps** — re-read on every authorization, never cached; the operator MAY keep them in
+the gitignored `/operator.env` at the repo root (never committed, never written by the build side,
+never read by repo Python):
 1. the **maximum daily budget** — a UTC-calendar-day USD notional ceiling, enforced by the
    in-process `DailySpendLedger` (it is process-local: one process per trading day; the ledger
    re-keys at 00:00 UTC mid-session, and the durable trial-day latch — ≤1 order per station-day,
@@ -119,42 +123,32 @@ In the shell that will launch the node, and nowhere else, export **seven** value
    not a contract count, and **pre-fee**. With quantity 1 and asks strictly below 0.95, a
    whole-dollar cap admits the entire band; a cap below $0.95 refuses its top.
 
-**Per-process session values** — read once at start by `issue_live_trading_permit`
-(`safety.py:583-592`); they reset on every restart:
-3. the **live-trading enablement variable** (`safety.py:133`; exactly `"1"` — no default, no coercion);
-4. the **order-submission request flag** `BREEZY_ORDERS_ENABLED=1` (not a reserved control; refused
-   unless `BREEZY_CURRENT_RUNG_HOLD=1` and `BREEZY_LIVE_OBSERVATIONS=1` are also set; it is a
-   REQUEST that the permit constructor validates — a bool is never the gate);
-5. the **per-order notional ceiling** — whole-USD granularity (`safety.py:560-566`); must be ≥ the
-   per-position cap or every order is refused;
-6. the **session notional** — floor: station count × $1;
-7. the **session order count** — floor: the number of configured stations (four); anything lower
-   silently truncates the day;
-8. the **operator identity** string (logged never by value; permit `repr` is suppressed).
+Unknown keys in `operator.env` are still rejected. Absence of either cap still fails closed at
+permit issue and at every authorization.
+
+**Build-side session values** — not operator knobs. The trade-supervisor unit assigns the
+enablement flags and operator identity (`Environment=` lines; `%u` expands to the unit user).
+The three numeric session ceilings (per-order notional, session notional, session order count)
+are derived at `issue_live_trading_permit` from the two caps when those env vars are absent:
+per-order := position cost; session notional := daily budget; session order count :=
+floor(daily / position), minimum 1. An explicit session env var still wins if present.
+Enablement still requires exactly `"1"`. `src/` and `scripts/` remain structurally incapable of
+writing any of these (AST barrier).
 
 The permit lives **10 hours** (`PERMIT_TTL_NS`, retargeted 2026-09-04 from 15 minutes: the union of
 the four decision windows is 17:00 UTC → 01:00 UTC next day, plus 1 h slack each side). Launch the
 node once per trading day **before 17:00 UTC**; it is never re-minted in-process.
 
-Never place any of the values in a file — except the two caps, which the operator MAY keep in the
-gitignored `/operator.env` at the repo root (never committed, never written by the build side, never
-read by repo Python). Enablement and the other session values stay out of that file and out of every
-other file: not a `.env`, not a systemd unit, not a shell rc file, not a commit, not a launcher
-script. `src/` and `scripts/` are structurally incapable of writing any of them, and the repo assigns
-no value to any of them anywhere.
-
-Operator flow (from the repo root; the build side never runs step 3):
+Operator flow (from the repo root):
 
 1. `cp operator.env.example operator.env` and fill in the two values; `chmod 600 operator.env`
 2. `.venv/bin/python scripts/operator/print_operator_controls.py --check-file operator.env`
-3. In the host-lifetime launch shell that carries the other exports: `set -a; . ./operator.env; set +a`,
-   confirm with `.venv/bin/python scripts/operator/print_operator_controls.py`, then launch the
-   supervisor exactly as §7 already says.
+3. Restart the supervisor as §10(a) says. The unit references `operator.env`; the build-side
+   constants travel with the unit; the three numeric ceilings derive at permit mint.
 
-Accepted residual exposure of shell exports (the same class already accepted for the enablement
-variable): the values are readable from `/proc/<pid>/environ` by same-UID processes and may persist
-in shell history outside the repo. New class for the two caps at rest in `/operator.env`: readable by
-any same-UID process, survives the shell, and enters backups.
+Accepted residual: the two caps at rest in `/operator.env` are readable by any same-UID process,
+survive the shell, and enter backups. The build-side `Environment=` values are world-readable via
+`systemctl cat` and `/proc/<pid>/environ` (same class as any other non-secret unit env).
 
 Absence fails closed: both caps are re-read on **every** authorization
 (`operator_controls.py:147-166`, `:333-337`) and raise on absence, blankness, malformation or
@@ -169,34 +163,34 @@ contract"); the build side neither suggests nor defaults them.
 
 ## 7. First run
 
-The launch shell exports **seven** values before the node starts (converged peer review item 5;
-`safety.py:583-592` names five of the seven, `operator_controls.py` the other two): the live-trading
-enablement variable, the maximum daily budget, the maximum per position, the per-order notional
-ceiling, the session notional ceiling, the session order count, and the operator identity — plus, when
-requesting the order path (step 8), the CRH enablement flag `BREEZY_ORDERS_ENABLED=1` (build-side, not
-operator-reserved — see `settings.py`'s `ORDERS_ENABLED_VAR`), `BREEZY_CURRENT_RUNG_HOLD=1` and
-`BREEZY_LIVE_OBSERVATIONS=1`. Enablement and the other session values go only into the launching shell's own environment.
-The two caps may be sourced into that shell from the gitignored `/operator.env` per §6; repo
-Python never loads the file.
+**Superseded 2026-09-10.** The 2026-09-04 rule that the launch shell exports seven values (enablement,
+the two caps, the three numeric session ceilings, and the operator identity), and that enablement
+must never appear in a file, is revoked. Reason: the operator ruled that the only operator-controlled
+variables are the two durable caps; every other live-path value is build-side and must be supplied
+by the build on every launch, including after a reboot. GO_LIVE_PLAN §5's "No agent, and no
+automation in this repo, may set D4" and safety.py's former "No default, never inferred" for the
+three numerics encoded that old policy.
+
+What remains binding: the two caps are never written by the build; unknown keys in `operator.env`
+are still rejected; the permit still fails closed when the caps are absent; the boot-time permit
+line stays the only proof of order capability. Enablement still requires exactly `"1"`.
 
 The live-trading permit's TTL is 10 hours (`safety.py:157`, the union of the four decision windows plus
 slack), and `OrderSubmissionPermit.issue` (`runtime/order_enablement.py`) checks it once at startup,
-beside the live-trading permit, and never re-mints. **One process per trading day**, started from that
-shell **before 17:00 UTC** (the latest decision window's close) so the permit is valid for the whole
+beside the live-trading permit, and never re-mints. **One process per trading day**, started
+**before 17:00 UTC** (the latest decision window's close) so the permit is valid for the whole
 session; the durable trial-day latch is the real cross-restart bound regardless (at most one order per
 station-day, converged review item 3) — an unplanned restart makes that day's selector
 uptime-conditional, disclosed rather than hidden, and the daily budget re-keys at 00:00 UTC mid-session.
 
-Start the node from that same shell:
-```
-.venv/bin/breezy-trade
-```
-(`pyproject.toml:251`: `breezy-trade = "breezy.app.trade:main"`). It takes no arguments; all configuration is read from the environment by `config_from_env` / `exec_config_from_env`. A refusal from
+The production launcher is the user unit in §10. A hand launch (`.venv/bin/breezy-trade`) still
+reads the same environment; it takes no arguments; all configuration is read from the environment by
+`config_from_env` / `exec_config_from_env`. A refusal from
 `OrderSubmissionPermit.issue` (any of its five preconditions unmet, when the order path was requested)
 is fatal at startup, logged with the refusal class name only, exit code 1 — restart with the missing
 precondition corrected.
-There is **no systemd unit for the trade node**, and there must not be one: a unit file would put the
-enablement value in a file. `deploy/systemd/` carries the tape, ingest, and study units only.
+There is **no systemd unit for the trade node itself** — only for the supervisor that spawns it.
+`deploy/systemd/` carries the tape, ingest, study, and supervisor units.
 
 A healthy first afternoon, per station:
 - entry evaluations only inside [12:00,17:00) LST; nothing outside the window;
@@ -216,7 +210,7 @@ state store — the shared `SqliteStateStore` under the runtime state dir, holdi
 
 Wrong observations: more than one order per station-day → stop the node, the latch is not doing its
 job. Any SELL, any modify, any second contract → stop the node immediately. A refusal naming a
-missing operator control → the export did not reach the process.
+missing operator control → the two caps in `operator.env` did not reach the process.
 
 ## 8. Crash and recovery
 
@@ -271,26 +265,17 @@ no `breezy-trade-2026-09-08*.log` was ever created, and nothing would have launc
 
 `deploy/systemd/breezy-trade-supervisor.service` fixes exactly that, and **only** that.
 
-### This does not reopen the §7 "no systemd unit" rule
+### This does not reopen a unit for the trade node itself
 
-§7 bans a unit for **the trade node**, and the ban's stated reason is that a unit file would put the
-live-trading **enablement value** in a file. This unit is for the **supervisor**, and it **assigns no
-value to any operator-reserved or session control** — there is no `Environment=` line in it at all.
+§7 still bans a unit for **the trade node**. This unit is for the **supervisor**. Operator ruling
+2026-09-10: a reboot of this unit RESUMES supervision **and** order capability.
 
 - The **two durable caps** reach it only by *reference* to your gitignored `/operator.env`, which §6
-  already permits to hold exactly those two values at rest. The unit never reads or echoes them.
-- The **per-process session values** — the live-trading enablement variable, the per-order notional
-  ceiling, the session notional, the session order count, the operator identity, plus
-  `BREEZY_ORDERS_ENABLED` / `BREEZY_CURRENT_RUNG_HOLD` / `BREEZY_LIVE_OBSERVATIONS` — stay out of every
-  file, exactly as §6 requires. They reach the unit through `systemctl --user import-environment`,
-  which holds them in the **user manager's memory**. Same accepted `/proc/<pid>/environ` exposure class
-  as the shell exports; nothing new on disk.
-
-**Fail-closed after reboot, by design.** `import-environment` does *not* survive a reboot — the user
-manager comes back with a clean environment. So a reboot restores **supervision** automatically, but
-the node the supervisor launches will have no enablement and will refuse every order at permit issue.
-Restoring **order capability** stays your deliberate act, every time. Never again a silent loss of
-supervision; never an automatic resumption of live trading.
+  already permits to hold exactly those two values at rest. The unit never reads or echoes them,
+  and the build never writes them.
+- The **build-side session constants** (enablement flags and operator identity) are `Environment=`
+  lines in the unit. The three numeric session ceilings are derived at permit mint from the two
+  caps when absent. There is no `import-environment` step.
 
 ### Standing note: no memory cap, deliberately
 
@@ -327,29 +312,15 @@ systemd-analyze --user verify ~/.config/systemd/user/breezy-trade-supervisor.ser
 `verify` prints **nothing** when the unit is clean — treat any output as a failure (it exits 0 either
 way, so read the output, not the status). `daemon-reload` starts nothing.
 
-Now put the session values into the user manager's memory, **from the shell that carries your §6/§7
-exports** — this runbook proposes no values and does not spell the enablement variable's name:
+Ensure `operator.env` holds the two caps, then:
 
 ```
-set -a; . /home/jon/breezy/operator.env; set +a          # the two caps only, per §6
-# ...your existing §7 exports for the session values in this same shell...
-systemctl --user import-environment \
-    <the live-trading enablement variable> \
-    <the per-order notional ceiling> \
-    <the session notional> \
-    <the session order count> \
-    <the operator identity> \
-    BREEZY_ORDERS_ENABLED BREEZY_CURRENT_RUNG_HOLD BREEZY_LIVE_OBSERVATIONS
+systemctl --user restart breezy-trade-supervisor.service
 ```
 
-Confirm the caps resolved before starting anything:
-
-```
-.venv/bin/python scripts/operator/print_operator_controls.py
-```
-
-Then, and only then, enable and start. **Do this before 17:00Z** on a day you intend to trade — the
-permit TTL is 10 h and the launch window closes at `RELAUNCH_CUTOFF_UTC = 17:00Z`:
+That is the whole operator procedure. The unit already carries the build-side constants; the three
+numeric ceilings derive at permit mint. First install (before 17:00Z on a day you intend to trade —
+the permit TTL is 10 h and the launch window closes at `RELAUNCH_CUTOFF_UTC = 17:00Z`):
 
 ```
 systemctl --user enable --now breezy-trade-supervisor.service
@@ -358,9 +329,8 @@ systemctl --user enable --now breezy-trade-supervisor.service
 `enable` alone (without `--now`) arms it for the next boot without starting it today — use that if you
 are installing outside a trading window.
 
-**After every reboot**, re-run the `import-environment` block above and then
-`systemctl --user restart breezy-trade-supervisor.service`. Until you do, the unit is up and supervising,
-but the node it launches has no order capability. That is intended, not a fault.
+**After every reboot** the unit comes back on its own (Linger=yes) and resumes order capability.
+Restart it only if you changed `operator.env` or the unit file.
 
 **To stop:** `systemctl --user stop breezy-trade-supervisor.service` (SIGTERM to the supervisor only —
 `KillMode=process` leaves a running node alone). SIGTERM the node separately if you want it down too.
@@ -408,10 +378,10 @@ grep -n 'order submission permit not issued' "$NODE_LOG"
 grep -n 'trading node failed'                "$NODE_LOG"
 ```
 
-A `permit not issued` line means a §6 precondition was missing from the imported environment — the most
-likely cause after a reboot is that `import-environment` was not re-run. Correct it and restart the unit;
-the node exits 1 on that refusal and is **never** relaunched automatically ([E4]: the supervisor's env is
-fixed for its lifetime, so a relaunch could not change the outcome).
+A `permit not issued` line means a §6 precondition was missing — most often one of the two caps is
+absent from `operator.env`. Correct the file and restart the unit; the node exits 1 on that refusal
+and is **never** relaunched automatically ([E4]: the supervisor's env is fixed for its lifetime, so a
+relaunch could not change the outcome).
 
 4. **The node is alive and separately sessioned:**
 
@@ -428,4 +398,4 @@ Each should show its own SID/PGID.
 a reboot: after the host comes back, `systemctl --user status breezy-trade-supervisor.service` should show
 the unit **active (running)** with **no login session**, and
 `~/.local/share/breezy/logs/breezy-trade-supervisor.log` should carry a fresh `supervisor_started` line.
-Order capability will correctly be absent until you re-import the session values.
+Order capability resumes with the unit — confirm it with the boot-time permit line in §10(b).

@@ -56,6 +56,7 @@ import dataclasses
 import logging
 import pickle
 from collections.abc import Iterator
+from contextlib import contextmanager
 from decimal import Decimal
 from pathlib import Path
 
@@ -63,6 +64,10 @@ import pytest
 from nautilus_trader.common.component import TestClock
 
 from breezy.adapters.polymarket_us.credentials import PolymarketUSCredentials
+from breezy.adapters.polymarket_us.operator_controls import (
+    MAX_DAILY_BUDGET_USD_ENV_VAR,
+    MAX_POSITION_COST_USD_ENV_VAR,
+)
 from breezy.adapters.polymarket_us.safety import (
     MAX_ORDER_NOTIONAL_USD_ENV_VAR,
     OPERATOR_ID_ENV_VAR,
@@ -78,6 +83,7 @@ from breezy.adapters.polymarket_us.safety import (
     live_trading_budget_remaining,
 )
 from breezy.adapters.polymarket_us.secure import RedactedSecureString
+from tests.unit.operator_control_env import operator_control_env, operator_control_unset
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 
@@ -151,6 +157,26 @@ def clock_at(now_ns: int = NOW_NS) -> TestClock:
 def issued(monkeypatch: pytest.MonkeyPatch, **kwargs: str) -> LiveTradingPermit:
     enable_operator_gate(monkeypatch, **kwargs)
     return issue_live_trading_permit(clock=clock_at())
+
+
+@contextmanager
+def _operator_caps(*, daily: str, position: str) -> Iterator[None]:
+    """Drive the two reserved caps through the one whitelisted seam."""
+    with (
+        operator_control_env(MAX_DAILY_BUDGET_USD_ENV_VAR, daily),
+        operator_control_env(MAX_POSITION_COST_USD_ENV_VAR, position),
+    ):
+        yield
+
+
+@contextmanager
+def _operator_caps_unset() -> Iterator[None]:
+    """Absence of both reserved caps, even if the operator's shell exported them."""
+    with (
+        operator_control_unset(MAX_DAILY_BUDGET_USD_ENV_VAR),
+        operator_control_unset(MAX_POSITION_COST_USD_ENV_VAR),
+    ):
+        yield
 
 
 # ==========================================================================
@@ -274,19 +300,29 @@ def test_only_the_exact_string_one_enables_trading(
 def test_the_issuer_refuses_when_no_spend_ceiling_was_supplied(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """No default ceiling exists. Absence means no trading, never a guess."""
+    """Operator ruling 2026-09-10: the per-order ceiling is no longer an
+    operator-set value. When it is absent it derives from the per-position
+    cap; when that cap is also absent, refuse. There is still no invented
+    default.
+    """
     enable_operator_gate(monkeypatch)
     monkeypatch.delenv(MAX_ORDER_NOTIONAL_USD_ENV_VAR)
 
-    with pytest.raises(LiveTradingPermissionError, match=MAX_ORDER_NOTIONAL_USD_ENV_VAR):
+    with _operator_caps_unset(), pytest.raises(LiveTradingPermissionError) as excinfo:
         issue_live_trading_permit(clock=clock_at())
+    assert MAX_POSITION_COST_USD_ENV_VAR in str(excinfo.value)
 
 
-@pytest.mark.parametrize("value", ["0", "-1", "nan", "NaN", "Infinity", "abc", "", "1e400"])
+@pytest.mark.parametrize("value", ["0", "-1", "nan", "NaN", "Infinity", "abc", "1e400"])
 def test_a_malformed_or_non_positive_ceiling_is_refused(
     monkeypatch: pytest.MonkeyPatch,
     value: str,
 ) -> None:
+    """Explicit beats derived: a present malformed ceiling is refused even
+    though the two caps (operator ruling 2026-09-10) could have supplied a
+    well-formed substitute. Blank is absence, not malformation, and is
+    covered by the derivation tests.
+    """
     enable_operator_gate(monkeypatch, ceiling=value)
 
     with pytest.raises(LiveTradingPermissionError, match=MAX_ORDER_NOTIONAL_USD_ENV_VAR):
@@ -1157,32 +1193,140 @@ def test_the_module_contains_no_init_bypassing_construction_helper() -> None:
 def test_the_issuer_refuses_without_a_session_notional_budget(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    """Operator ruling 2026-09-10: session notional derives from the daily
+    budget when absent. Refuse only when that cap is absent too.
+    """
     enable_operator_gate(monkeypatch)
     monkeypatch.delenv(SESSION_NOTIONAL_USD_ENV_VAR)
 
-    with pytest.raises(LiveTradingPermissionError, match=SESSION_NOTIONAL_USD_ENV_VAR):
+    with _operator_caps_unset(), pytest.raises(LiveTradingPermissionError) as excinfo:
         issue_live_trading_permit(clock=clock_at())
+    assert MAX_DAILY_BUDGET_USD_ENV_VAR in str(excinfo.value)
 
 
 def test_the_issuer_refuses_without_a_session_order_count_budget(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    """Operator ruling 2026-09-10: session order count derives from
+    floor(daily budget / position cost). Refuse when the caps that feed
+    that ratio are absent.
+    """
     enable_operator_gate(monkeypatch)
     monkeypatch.delenv(SESSION_ORDER_COUNT_ENV_VAR)
 
-    with pytest.raises(LiveTradingPermissionError, match=SESSION_ORDER_COUNT_ENV_VAR):
+    with _operator_caps_unset(), pytest.raises(LiveTradingPermissionError) as excinfo:
         issue_live_trading_permit(clock=clock_at())
+    message = str(excinfo.value)
+    assert MAX_DAILY_BUDGET_USD_ENV_VAR in message or MAX_POSITION_COST_USD_ENV_VAR in message
 
 
-@pytest.mark.parametrize("value", ["0", "-1", "abc", "", "1.5", "1e3"])
+@pytest.mark.parametrize("value", ["0", "-1", "abc", "1.5", "1e3"])
 def test_a_malformed_order_count_budget_is_refused(
     monkeypatch: pytest.MonkeyPatch,
     value: str,
 ) -> None:
+    """Operator ruling 2026-09-10: a present malformed count is not rescued
+    by derivation. Blank is absence and is covered by the derivation tests.
+    """
     enable_operator_gate(monkeypatch, order_count=value)
 
     with pytest.raises(LiveTradingPermissionError, match=SESSION_ORDER_COUNT_ENV_VAR):
         issue_live_trading_permit(clock=clock_at())
+
+
+def test_absent_session_ceilings_derive_from_the_two_operator_caps(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Operator ruling 2026-09-10: per-order := position cost, session
+    notional := daily budget, session order count := floor(daily / position).
+    """
+    enable_operator_gate(monkeypatch)
+    monkeypatch.delenv(MAX_ORDER_NOTIONAL_USD_ENV_VAR)
+    monkeypatch.delenv(SESSION_NOTIONAL_USD_ENV_VAR)
+    monkeypatch.delenv(SESSION_ORDER_COUNT_ENV_VAR)
+
+    with _operator_caps(daily="10.00", position="2.00"):
+        permit = issue_live_trading_permit(clock=clock_at())
+
+    assert permit.max_order_notional_usd == Decimal("2.00")
+    assert permit.budget_notional_usd == Decimal("10.00")
+    assert permit.budget_order_count == 5
+
+
+@pytest.mark.parametrize(
+    ("daily", "position", "expected_count"),
+    [
+        ("10.00", "3.00", 3),  # floor(10/3) = 3
+        ("1.00", "2.00", 1),  # floor(0.5) = 0 → minimum 1
+        ("10.50", "2.00", 5),  # floor(5.25) = 5; cent-preserving money
+        ("1.00", "0.03", 33),  # floor(33.333...) = 33
+        ("1.99", "1.00", 1),  # floor(1.99) = 1
+        ("2.50", "2.50", 1),  # equal caps → one order
+    ],
+)
+def test_derived_session_order_count_is_floor_of_daily_over_position_minimum_one(
+    monkeypatch: pytest.MonkeyPatch,
+    daily: str,
+    position: str,
+    expected_count: int,
+) -> None:
+    """Operator ruling 2026-09-10: Decimal floor division to the cent,
+    never float, with a floor of one so a daily budget smaller than one
+    position still permits a single order.
+    """
+    enable_operator_gate(monkeypatch)
+    monkeypatch.delenv(MAX_ORDER_NOTIONAL_USD_ENV_VAR)
+    monkeypatch.delenv(SESSION_NOTIONAL_USD_ENV_VAR)
+    monkeypatch.delenv(SESSION_ORDER_COUNT_ENV_VAR)
+
+    with _operator_caps(daily=daily, position=position):
+        permit = issue_live_trading_permit(clock=clock_at())
+
+    assert permit.max_order_notional_usd == Decimal(position)
+    assert permit.budget_notional_usd == Decimal(daily)
+    assert permit.budget_order_count == expected_count
+
+
+def test_explicit_session_ceilings_beat_derived_caps(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Operator ruling 2026-09-10: if the session env vars ARE present they
+    take precedence, so an operator-supplied shell is unchanged.
+    """
+    enable_operator_gate(
+        monkeypatch,
+        ceiling="7.00",
+        session_notional="20.00",
+        order_count="2",
+    )
+    with _operator_caps(daily="10.00", position="2.00"):
+        permit = issue_live_trading_permit(clock=clock_at())
+
+    assert permit.max_order_notional_usd == Decimal("7.00")
+    assert permit.budget_notional_usd == Decimal("20.00")
+    assert permit.budget_order_count == 2
+
+
+def test_each_absent_session_ceiling_derives_independently(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Operator ruling 2026-09-10: only the missing var is derived; the
+    others keep their explicit values.
+    """
+    enable_operator_gate(
+        monkeypatch,
+        ceiling="9.00",
+        session_notional="80.00",
+        order_count="11",
+    )
+    monkeypatch.delenv(MAX_ORDER_NOTIONAL_USD_ENV_VAR)
+
+    with _operator_caps(daily="10.00", position="2.50"):
+        permit = issue_live_trading_permit(clock=clock_at())
+
+    assert permit.max_order_notional_usd == Decimal("2.50")
+    assert permit.budget_notional_usd == Decimal("80.00")
+    assert permit.budget_order_count == 11
 
 
 def test_the_notional_budget_is_spent_down_across_authorizations(

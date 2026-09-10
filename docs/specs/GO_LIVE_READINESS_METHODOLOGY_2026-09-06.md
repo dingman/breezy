@@ -136,7 +136,7 @@ Days to n = 60 by rate: 0.5 → 120; 0.9 → 67; 1.5 → 40; 3.0 → 20. (PROGRE
 | **False KILL from our own faults** | subscription freeze (A9) or recorder zombie (A1) suppresses takes on covered days | A9/A1 are hard gates; a KILL reached under an A1/A9 FAIL streak is **reported with the caveat but is never suspended or discounted** |
 | Shadow ≠ live | paper replay takes cited as progress | provenance sidecar refuses non-live stores |
 | PREREG drift | "just lower n" | new family, n resets; unilateral amendment banned |
-| Operator knobs leaking | a default cap in code or docs | census test; values only in the launch shell |
+| Operator knobs leaking | a default for either of the two reserved caps in code or docs | census test; the two caps live only in gitignored `operator.env` (ruling 2026-09-10) |
 | Ownership drift | rulings parked on the operator | rulings are B (PREREG §13); O = caps, enablement, live processes, sinks |
 | Host limits | OOM/SIGKILL history; swap 100 %; uncapped scope | A14 daily; GL-7 recorded as operator-accepted risk, permanently visible |
 | Self-check vs permit | SV-1 FAIL read as "shadow mode" | node log is the permit oracle (L-23, L-30) |

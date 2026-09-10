@@ -48,6 +48,10 @@ from breezy.adapters.polymarket_us.factories import (
     PolymarketUSLiveDataClientFactory,
     PolymarketUSLiveExecClientFactory,
 )
+from breezy.adapters.polymarket_us.operator_controls import (
+    MAX_DAILY_BUDGET_USD_ENV_VAR,
+    MAX_POSITION_COST_USD_ENV_VAR,
+)
 from breezy.adapters.polymarket_us.safety import MAX_ORDER_NOTIONAL_USD_ENV_VAR
 from breezy.runtime import trade_cli
 from breezy.runtime.backtest_order_guard import ORDER_EVENT_TOPIC, NakedShortRefusedError
@@ -58,6 +62,7 @@ from breezy.runtime.trade_cli import (
     EXIT_RUNTIME_ERROR,
     run,
 )
+from tests.unit.operator_control_env import operator_control_env, operator_control_unset
 
 #: A synthetic instrument for RED-13's directly-constructed refusable event.
 _GUARD_TEST_INSTRUMENT = InstrumentId(
@@ -717,13 +722,10 @@ def test_a_host_provisioned_only_for_weather_ingest_cannot_start_the_trader() ->
 def test_a_missing_operator_order_ceiling_is_a_configuration_error(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """A host with no per-order ceiling starts NOTHING, and is told why.
-
-    `build_trade_node_config` configures the native per-order notional cap
-    from `BREEZY_MAX_ORDER_NOTIONAL_USD` and refuses when that operator
-    control is absent -- the process must never come up uncapped. Absence is
-    an operator provisioning fault: exit 2 and one readable line naming the
-    control, not a traceback reported as an engineering crash.
+    """Operator ruling 2026-09-10: a missing per-order session ceiling
+    derives from the per-position cap. When that cap is also absent the
+    process still starts NOTHING -- never uncapped -- and the refusal
+    names the missing cap, not a traceback.
 
     This routes correctly with no change to `_CONFIG_ERRORS`:
     `LiveTradingPermissionError` subclasses `PermissionError`, which
@@ -734,11 +736,35 @@ def test_a_missing_operator_order_ceiling_is_a_configuration_error(
     monkeypatch.delenv(MAX_ORDER_NOTIONAL_USD_ENV_VAR, raising=False)
     err = io.StringIO()
 
-    code = run(env=TRADE_ENV, node_factory=RecordingNode, stderr=err)
+    with (
+        operator_control_unset(MAX_DAILY_BUDGET_USD_ENV_VAR),
+        operator_control_unset(MAX_POSITION_COST_USD_ENV_VAR),
+    ):
+        code = run(env=TRADE_ENV, node_factory=RecordingNode, stderr=err)
 
     assert code == EXIT_CONFIG_ERROR
-    assert MAX_ORDER_NOTIONAL_USD_ENV_VAR in err.getvalue()
+    assert MAX_POSITION_COST_USD_ENV_VAR in err.getvalue()
     assert RecordingNode.instances == [], "no node is built without a ceiling"
+
+
+def test_a_missing_per_order_ceiling_derives_from_the_position_cap(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Operator ruling 2026-09-10: with the two caps present, absence of
+    the per-order session var is not a configuration error -- the native
+    cap is derived and the node is built.
+    """
+    monkeypatch.delenv(MAX_ORDER_NOTIONAL_USD_ENV_VAR, raising=False)
+    err = io.StringIO()
+
+    with (
+        operator_control_env(MAX_DAILY_BUDGET_USD_ENV_VAR, "100.00"),
+        operator_control_env(MAX_POSITION_COST_USD_ENV_VAR, "25.00"),
+    ):
+        code = run(env=TRADE_ENV, node_factory=RecordingNode, stderr=err)
+
+    assert code == EXIT_OK
+    assert RecordingNode.instances, "node is built from the derived ceiling"
 
 
 def test_a_malformed_trader_id_is_a_configuration_error_not_a_crash() -> None:

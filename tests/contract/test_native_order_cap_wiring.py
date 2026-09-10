@@ -56,6 +56,10 @@ from breezy.adapters.polymarket_us.config import (
     PolymarketUSDataClientConfig,
     PolymarketUSExecClientConfig,
 )
+from breezy.adapters.polymarket_us.operator_controls import (
+    MAX_DAILY_BUDGET_USD_ENV_VAR,
+    MAX_POSITION_COST_USD_ENV_VAR,
+)
 from breezy.adapters.polymarket_us.parsing import parse_binary_option
 from breezy.adapters.polymarket_us.safety import (
     MAX_ORDER_NOTIONAL_USD_ENV_VAR,
@@ -65,6 +69,7 @@ from breezy.adapters.polymarket_us.symbology import slug_to_instrument_id
 from breezy.runtime.node_config import build_trade_node_config
 from breezy.runtime.settings import BreezyTradeSettings
 from tests.unit.conftest import RAW_CAPTURE_DIR, iter_captured_market_payloads
+from tests.unit.operator_control_env import operator_control_env, operator_control_unset
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
     from nautilus_trader.model.instruments import BinaryOption
@@ -333,13 +338,42 @@ def test_pre_trade_risk_checks_are_never_bypassed() -> None:
 def test_an_unset_operator_control_refuses_instead_of_running_uncapped(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """No ceiling -> no trading process. Never a default, never uncapped."""
+    """Operator ruling 2026-09-10: the per-order ceiling derives from the
+    per-position cap when absent. When that cap is also absent, refuse --
+    never a default, never uncapped.
+    """
     monkeypatch.delenv(MAX_ORDER_NOTIONAL_USD_ENV_VAR, raising=False)
 
-    with pytest.raises(LiveTradingPermissionError) as excinfo:
+    with (
+        operator_control_unset(MAX_DAILY_BUDGET_USD_ENV_VAR),
+        operator_control_unset(MAX_POSITION_COST_USD_ENV_VAR),
+        pytest.raises(LiveTradingPermissionError) as excinfo,
+    ):
         build_trade_node_config(_trade_settings(), _data_client_config(), _exec_client_config())
 
-    assert MAX_ORDER_NOTIONAL_USD_ENV_VAR in str(excinfo.value)
+    assert MAX_POSITION_COST_USD_ENV_VAR in str(excinfo.value)
+
+
+def test_an_unset_per_order_ceiling_derives_from_the_position_cap(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Operator ruling 2026-09-10: native whole-USD cap uses the derived
+    per-order ceiling (the position cost) when the session env var is absent.
+    """
+    monkeypatch.delenv(MAX_ORDER_NOTIONAL_USD_ENV_VAR, raising=False)
+
+    with (
+        operator_control_env(MAX_DAILY_BUDGET_USD_ENV_VAR, "100.00"),
+        operator_control_env(MAX_POSITION_COST_USD_ENV_VAR, "25.00"),
+    ):
+        config = build_trade_node_config(
+            _trade_settings(),
+            _data_client_config("tc-temp-laxhigh-2026-09-10-86-or-above"),
+            _exec_client_config("tc-temp-laxhigh-2026-09-10-86-or-above"),
+        )
+
+    assert config.risk_engine is not None
+    assert set(config.risk_engine.max_notional_per_order.values()) == {25}
 
 
 @pytest.mark.parametrize("raw", ["", "   "])
@@ -347,12 +381,19 @@ def test_a_blank_operator_control_is_absence_not_a_zero_ceiling(
     monkeypatch: pytest.MonkeyPatch,
     raw: str,
 ) -> None:
+    """Operator ruling 2026-09-10: blank is absence, so the position cap
+    is consulted; when that cap is also absent, refuse.
+    """
     monkeypatch.setenv(MAX_ORDER_NOTIONAL_USD_ENV_VAR, raw)
 
-    with pytest.raises(LiveTradingPermissionError) as excinfo:
+    with (
+        operator_control_unset(MAX_DAILY_BUDGET_USD_ENV_VAR),
+        operator_control_unset(MAX_POSITION_COST_USD_ENV_VAR),
+        pytest.raises(LiveTradingPermissionError) as excinfo,
+    ):
         build_trade_node_config(_trade_settings(), _data_client_config(), _exec_client_config())
 
-    assert MAX_ORDER_NOTIONAL_USD_ENV_VAR in str(excinfo.value)
+    assert MAX_POSITION_COST_USD_ENV_VAR in str(excinfo.value)
 
 
 def test_a_sub_dollar_ceiling_refuses_rather_than_disabling_the_check(
@@ -372,12 +413,16 @@ def test_a_sub_dollar_ceiling_refuses_rather_than_disabling_the_check(
     assert MAX_ORDER_NOTIONAL_USD_ENV_VAR in str(excinfo.value)
 
 
-@pytest.mark.parametrize("raw", ["", "   ", "0.50", "not-money", "12.345"])
+@pytest.mark.parametrize("raw", ["0.50", "not-money", "12.345"])
 def test_the_refusal_names_the_control_never_the_value(
     monkeypatch: pytest.MonkeyPatch,
     raw: str,
 ) -> None:
-    """A refusal that echoes the ceiling leaks it into logs and tickets."""
+    """A refusal that echoes the ceiling leaks it into logs and tickets.
+
+    Operator ruling 2026-09-10: only a PRESENT malformed value is a refusal
+    of this control; blank is absence and derives (or refuses on the caps).
+    """
     monkeypatch.setenv(MAX_ORDER_NOTIONAL_USD_ENV_VAR, raw)
 
     with pytest.raises(LiveTradingPermissionError) as excinfo:
@@ -385,8 +430,7 @@ def test_the_refusal_names_the_control_never_the_value(
 
     message = str(excinfo.value)
     assert MAX_ORDER_NOTIONAL_USD_ENV_VAR in message
-    if raw.strip():
-        assert raw.strip() not in message
+    assert raw.strip() not in message
 
 
 # ---------------------------------------------------------------------------

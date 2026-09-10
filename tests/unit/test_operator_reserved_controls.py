@@ -669,6 +669,10 @@ def test_the_mechanism_has_no_production_call_site_yet() -> None:
     file validator ``scripts/operator/print_operator_controls.py`` imports the
     inventory tuple to derive the control names at runtime; it reads, never
     assigns (layers A-D and ``find_environ_mutations`` still police it).
+    Fourth, declared 2026-09-10 (operator ruling of that date):
+    ``safety.issue_live_trading_permit`` reads the same two accessors to
+    derive the three session ceilings when those env vars are absent. It
+    never writes them.
     """
     from pathlib import Path
 
@@ -684,5 +688,6 @@ def test_the_mechanism_has_no_production_call_site_yet() -> None:
     assert importers == [
         "scripts/operator/print_operator_controls.py",
         "src/breezy/adapters/polymarket_us/factories.py",
+        "src/breezy/adapters/polymarket_us/safety.py",
         "src/breezy/runtime/order_enablement.py",
     ]

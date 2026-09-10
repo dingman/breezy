@@ -596,11 +596,12 @@ def build_trade_risk_engine_config(
     which is the authority on that ordering constraint.
 
     The VALUE is the operator's, never Breezy's: it comes from
-    :func:`~breezy.adapters.polymarket_us.safety.operator_max_order_notional_whole_usd`,
-    which fails closed when the control is absent. There is deliberately no
-    default, no fallback and no literal on this path. The two OPERATOR-RESERVED
-    controls -- max daily budget and max per position -- are NOT here, are not
-    derivable from what is here, and are never assigned by this repo.
+    :func:`~breezy.adapters.polymarket_us.safety.operator_max_order_notional_whole_usd`.
+    Operator ruling 2026-09-10: when the per-order session var is absent that
+    reader derives from the per-position cap; it fails closed only when the
+    caps needed for derivation are absent. There is deliberately no invented
+    literal on this path. The two OPERATOR-RESERVED controls -- max daily
+    budget and max per position -- are never assigned by this repo.
     """
     # Deferred to call time to break the package import cycle documented at
     # the TYPE_CHECKING block at the top of this module.
@@ -730,10 +731,13 @@ def build_trade_node_config(
     :func:`build_trade_risk_engine_config` -- read its docstring for the shape
     the cap takes and for the two residuals it does not close. The per-order
     notional ceiling is the operator's existing
-    ``BREEZY_MAX_ORDER_NOTIONAL_USD``, which is a per-ORDER control and is not
-    one of the two reserved ones. Building this config therefore RAISES
-    ``LiveTradingPermissionError`` when that control is unset: the trading
-    process refuses to start rather than starting uncapped. The two read-only
+    ``BREEZY_MAX_ORDER_NOTIONAL_USD``, which is a per-ORDER session control
+    and is not one of the two reserved ones. Operator ruling 2026-09-10:
+    when that session var is unset the native cap is derived from the
+    per-position cap; building this config RAISES
+    ``LiveTradingPermissionError`` only when the caps needed for that
+    derivation are also absent, so the trading process still refuses to
+    start uncapped. The two read-only
     roles above are unaffected -- they have no execution surface and no risk
     engine traffic, so requiring a trading ceiling from them would only make a
     weather host fail for a value it can never use.

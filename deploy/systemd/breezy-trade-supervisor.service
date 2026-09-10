@@ -18,28 +18,27 @@
 # nothing would have launched at that day's 16:50Z window. Supervision that
 # does not survive a reboot is not supervision.
 #
-# WHY THIS DOES NOT VIOLATE THE "no systemd unit" RULE.
-# `docs/plans/R8_OPERATOR_RUNBOOK.md:198-200` and
-# `docs/plans/TRADE_NODE_DAILY_RELAUNCH_2026-09-04.md:126-127` ban a unit for
-# the TRADE NODE, and the ban's stated reason is that a unit file would put the
-# live-trading ENABLEMENT VALUE in a file. This unit assigns NO value to any
-# operator-reserved or session control. It names none of them, defaults none of
-# them, and `Environment=` appears nowhere below. The two durable caps reach it
-# only by REFERENCE to the operator's own gitignored `operator.env`, which
-# runbook §6 already permits to hold exactly those two values at rest. The
-# per-process session values (enablement, per-order notional, session notional,
-# session order count, operator identity) stay OUT of every file and reach this
-# unit ONLY through the operator's `systemctl --user import-environment`, which
-# holds them in the user manager's memory -- never on disk. See the
-# "Trade-supervisor relaunch" section of the runbook.
+# OPERATOR RULING 2026-09-10. The only operator-controlled variables are the
+# two durable caps (maximum daily budget, maximum per position), held by
+# REFERENCE in the gitignored `operator.env`. Every other value the live path
+# demands is BUILD-SIDE and is supplied by this unit on every launch,
+# including after a reboot. A reboot therefore RESUMES supervision AND order
+# capability: the unit comes back, forwards its environment to the spawned
+# node (`trade_supervisor.py` `spawn_node` `env=dict(env)` at :512, and the
+# two spawn call sites at :808 and :874 pass `env=os.environ`), and the
+# permit-mint site derives the three numeric session ceilings from the two
+# caps when those env vars are absent. The boot-time permit line in the node
+# log remains the only proof of order capability.
 #
-# FAIL-CLOSED AFTER REBOOT, BY DESIGN. `import-environment` does not survive a
-# reboot: the user manager comes back with a clean environment. So after a
-# reboot this unit restores SUPERVISION automatically, but the node it launches
-# has no enablement and refuses every order at permit issue. Restoring ORDER
-# CAPABILITY remains the operator's deliberate act. That is the intended
-# asymmetry -- never again a silent loss of supervision, and never an automatic
-# resumption of live trading.
+# This unit still assigns NO value to either operator-reserved cap. Those
+# reach it only by REFERENCE to the operator's own `operator.env`. The
+# session enablement flags and operator identity below are build-side
+# constants, not operator knobs.
+#
+# `%u` in Environment= is a valid systemd 259 specifier (systemd.exec(5):
+# "Specifier expansion is performed"; systemd.unit(5): `%u` = the user name
+# of the service-manager instance). For this user unit that is a non-empty
+# string after strip, which is what safety.py requires of the operator id.
 Description=Breezy daily trade-node supervisor (user scope)
 Documentation=file:///home/jon/breezy/docs/plans/R8_OPERATOR_RUNBOOK.md
 Documentation=file:///home/jon/breezy/docs/plans/TRADE_NODE_DAILY_RELAUNCH_2026-09-04.md
@@ -73,7 +72,8 @@ UMask=0077
 # `systemd-cgtop --user` / `systemctl --user status` for growth. See the
 # runbook section for the standing note.
 
-# ---- Environment: REFERENCES ONLY. No value is assigned anywhere below. ----
+# ---- Environment. Operator-reserved caps: REFERENCES ONLY. Build-side
+# session constants: assigned below per operator ruling 2026-09-10. ----
 #
 # Node/exec identity and paths. Value-free with respect to every reserved
 # control; supplies BREEZY_TRADE_CATALOG_ROOT, BREEZY_TRADE_TRADER_ID,
@@ -99,15 +99,16 @@ EnvironmentFile=-%h/.config/breezy/polymarket.env
 # would instead lose the supervision this unit exists to guarantee.
 EnvironmentFile=-%h/breezy/operator.env
 #
-# The per-process SESSION values -- the live-trading enablement variable
-# (safety.py:133), the per-order notional ceiling, the session notional, the
-# session order count and the operator identity, plus the build-side request
-# flags BREEZY_ORDERS_ENABLED / BREEZY_CURRENT_RUNG_HOLD /
-# BREEZY_LIVE_OBSERVATIONS -- are DELIBERATELY ABSENT from this file. They must
-# never be written to disk. The operator injects them into the user manager's
-# in-memory environment with `systemctl --user import-environment` before
-# `start`; see the runbook. Optional: BREEZY_ALERT_WEBHOOK_URL
-# (health.py:114) routes supervisor alerts to a webhook when set.
+# BUILD-SIDE session constants (operator ruling 2026-09-10). These are not
+# operator knobs. The three numeric session ceilings are NOT here -- they
+# derive in code at permit mint from the two caps. Optional:
+# BREEZY_ALERT_WEBHOOK_URL (health.py:114) routes supervisor alerts to a
+# webhook when set.
+Environment=BREEZY_TRADING_ENABLED=1
+Environment=BREEZY_ORDERS_ENABLED=1
+Environment=BREEZY_CURRENT_RUNG_HOLD=1
+Environment=BREEZY_LIVE_OBSERVATIONS=1
+Environment=BREEZY_TRADING_OPERATOR_ID=%u
 
 # Byte-identical to the hand-launch. The console script REQUIRES the distinct
 # first positional token `breezy-trade-supervisor-daily`

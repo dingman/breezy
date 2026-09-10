@@ -119,30 +119,39 @@ import secrets
 import threading
 from collections.abc import Callable
 from dataclasses import dataclass, field
-from decimal import Decimal, InvalidOperation
+from decimal import ROUND_DOWN, Decimal, InvalidOperation
 from hashlib import sha256
 from typing import Final, Protocol, runtime_checkable
 
 from breezy.adapters.polymarket_us.credentials import PolymarketUSCredentials
 
-#: Operator gate D4. No default, no coercion, no inference: the value must be
-#: exactly ``"1"``. ``docs/plans/archive/GO_LIVE_PLAN.md`` §5: "No agent, and no
-#: automation in this repo, may set D4." That rule is enforced by the AST
-#: barrier ``test_no_shipped_code_can_set_the_operator_trading_gate``, which
-#: bans every environment write from ``src/`` and ``scripts/`` outright.
+#: Live-trading enablement. Must be exactly ``"1"`` -- no coercion, no
+#: truthiness. Operator ruling 2026-09-10: this is a BUILD-SIDE constant,
+#: supplied by the trade-supervisor unit, not an operator-reserved control.
+#: ``src/`` and ``scripts/`` still cannot write it: the AST barrier
+#: ``test_no_shipped_code_can_set_the_operator_trading_gate`` bans every
+#: environment write from those trees. GO_LIVE_PLAN §5's "No agent, and no
+#: automation in this repo, may set D4" is the superseded policy for this
+#: value; the two operator-reserved caps remain unwritable.
 TRADING_ENABLED_ENV_VAR: Final = "BREEZY_TRADING_ENABLED"
 
-#: Operator gate D3/D5 -- the per-order spend ceiling, in USD. No default. A
-#: missing ceiling means no trading; it is never guessed and never inferred.
+#: Per-order spend ceiling, in USD. Operator ruling 2026-09-10: when this
+#: variable is absent from the environment it is DERIVED from the operator's
+#: per-position cap; when present it takes precedence. Never written.
 MAX_ORDER_NOTIONAL_USD_ENV_VAR: Final = "BREEZY_MAX_ORDER_NOTIONAL_USD"
 
-#: Operator gate D5 -- the aggregate notional one permit may ever authorise.
-#: This is what stops a single permit authorising unbounded orders at the full
-#: per-order ceiling for its whole TTL (§8.2 item 4). No default.
+#: Aggregate notional one permit may ever authorise. Operator ruling
+#: 2026-09-10: derived from the operator's daily budget when absent; explicit
+#: wins when present. NOTE (security review 2026-09-10): the permit's three
+#: numeric fields are audit/authenticity metadata. The ENFORCEMENT path is
+#: ``DailySpendLedger.authorize_order_cost`` (``operator_controls.py``), which
+#: re-reads the raw operator caps on every submit -- so a derived per-order
+#: ceiling above the daily budget (min-1 clamp case) is refused there.
 SESSION_NOTIONAL_USD_ENV_VAR: Final = "BREEZY_MAX_SESSION_NOTIONAL_USD"
 
-#: Operator gate D5 -- the number of orders one permit may ever authorise.
-#: No default.
+#: Number of orders one permit may ever authorise. Operator ruling
+#: 2026-09-10: derived as floor(daily budget / position cost), minimum 1,
+#: when absent; explicit wins when present.
 SESSION_ORDER_COUNT_ENV_VAR: Final = "BREEZY_MAX_SESSION_ORDER_COUNT"
 
 #: The accountable human. Recorded on the permit so a journal entry names one.
@@ -506,6 +515,16 @@ def _require_operator_value(name: str) -> str:
     return value
 
 
+def _env_is_explicit(name: str) -> bool:
+    """True when ``name`` is present and non-blank in the process environment.
+
+    Blank is absence (same semantics as :func:`_require_operator_value`), so a
+    whitespace-only value does not count as an explicit session ceiling.
+    """
+    value = os.environ.get(name)
+    return value is not None and bool(value.strip())
+
+
 def _read_operator_money(name: str) -> Decimal:
     """Read one operator-supplied USD ceiling. No default, no inference."""
     raw = _require_operator_value(name)
@@ -530,13 +549,74 @@ def _read_operator_count(name: str) -> int:
     return count
 
 
+def _derived_per_order_ceiling() -> Decimal:
+    """Per-order ceiling := the operator's per-position cap.
+
+    Deferred import: ``operator_controls`` already imports this module's
+    money reader, so a module-level import would cycle.
+    """
+    from breezy.adapters.polymarket_us.operator_controls import (
+        operator_max_position_cost_usd,
+    )
+
+    return operator_max_position_cost_usd()
+
+
+def _derived_session_notional() -> Decimal:
+    """Session notional := the operator's daily budget."""
+    from breezy.adapters.polymarket_us.operator_controls import (
+        operator_max_daily_budget_usd,
+    )
+
+    return operator_max_daily_budget_usd()
+
+
+def _derived_session_order_count() -> int:
+    """Session order count := floor(daily budget / position cost), minimum 1.
+
+    Decimal division, rounded toward zero to a whole number -- the same
+    ASCII/cent discipline as :data:`_MONEY_RE` / :data:`_COUNT_RE`. A daily
+    budget smaller than one position still permits a single order.
+    """
+    from breezy.adapters.polymarket_us.operator_controls import (
+        operator_max_daily_budget_usd,
+        operator_max_position_cost_usd,
+    )
+
+    daily = operator_max_daily_budget_usd()
+    position = operator_max_position_cost_usd()
+    floored = int((daily / position).to_integral_value(rounding=ROUND_DOWN))
+    return max(1, floored)
+
+
+def _session_money(name: str, *, derive: Callable[[], Decimal]) -> Decimal:
+    """Explicit session money wins; otherwise derive from the operator caps.
+
+    Presence is the same test :func:`_require_operator_value` uses: unset or
+    blank means derive. A present malformed value is still refused -- it is
+    not rescued by derivation. This function never writes the environment.
+    """
+    if _env_is_explicit(name):
+        return _read_operator_money(name)
+    return derive()
+
+
+def _session_count(name: str, *, derive: Callable[[], int]) -> int:
+    """Explicit session count wins; otherwise derive from the operator caps."""
+    if _env_is_explicit(name):
+        return _read_operator_count(name)
+    return derive()
+
+
 def operator_max_order_notional_whole_usd() -> int:
     """The operator's per-order notional ceiling, floored to whole USD.
 
     The SAME control the permit issuer reads
-    (:data:`MAX_ORDER_NOTIONAL_USD_ENV_VAR`), read through the SAME mechanism,
-    so there is exactly one reader and one refusal policy for it. Absence,
-    blankness and malformation all raise here; nothing defaults.
+    (:data:`MAX_ORDER_NOTIONAL_USD_ENV_VAR`), through the SAME
+    explicit-or-derived path, so there is exactly one reader and one
+    refusal policy for it. A present malformed value raises here;
+    absence derives from the per-position cap (operator ruling 2026-09-10)
+    and raises only if that cap is itself absent.
 
     Why whole USD, and why this lives with the control rather than at the call
     site: ``RiskEngineConfig.max_notional_per_order`` is typed
@@ -556,12 +636,15 @@ def operator_max_order_notional_whole_usd() -> int:
         The floored ceiling in whole USD, always >= 1.
 
     Raises:
-        LiveTradingPermissionError: if the control is unset, blank, malformed,
-            non-positive, or cannot be expressed as a whole-USD cap. The
-            message names the control and never echoes its value.
+        LiveTradingPermissionError: if a present control is blank-as-explicit
+            malformation, non-positive, or cannot be expressed as a whole-USD
+            cap, or if derivation is needed and the per-position cap is
+            absent. The message names the control and never echoes its value.
     """
-    ceiling = _read_operator_money(MAX_ORDER_NOTIONAL_USD_ENV_VAR)
-    whole = int(ceiling)  # Truncation toward zero; `_read_operator_money` is > 0.
+    ceiling = _session_money(
+        MAX_ORDER_NOTIONAL_USD_ENV_VAR, derive=_derived_per_order_ceiling
+    )
+    whole = int(ceiling)  # Truncation toward zero; the money reader is > 0.
     if whole < 1:
         raise LiveTradingPermissionError(
             f"{MAX_ORDER_NOTIONAL_USD_ENV_VAR} is below one whole USD and cannot "
@@ -575,16 +658,22 @@ def operator_max_order_notional_whole_usd() -> int:
 def issue_live_trading_permit(*, clock: SupportsTimestampNs) -> LiveTradingPermit:
     """Mint the ONE kind of authority the chokepoint accepts.
 
-    Every field is derived from operator-supplied environment. There is
-    deliberately no ``env`` parameter and no ceiling parameter: either would
-    reintroduce the original defect one level up, letting a caller hand the
-    issuer its own authority.
+    There is deliberately no ``env`` parameter and no ceiling parameter:
+    either would reintroduce the original defect one level up, letting a
+    caller hand the issuer its own authority.
+
+    Operator ruling 2026-09-10: the two reserved caps are the only
+    operator-controlled values. The three session ceilings, when absent
+    from the environment, are derived from those caps at this mint site
+    (per-order := position cost, session notional := daily budget, session
+    order count := floor(daily / position), minimum 1). Explicit session
+    env vars still win. This function never writes an environment variable.
 
     Raises:
-        LiveTradingPermissionError: if the operator gate is absent, if any
-            ceiling is missing or malformed, if no operator identity is
-            recorded, or if the injected clock is unusable. Absence is always
-            a refusal, never a default.
+        LiveTradingPermissionError: if the enablement gate is not exactly
+            ``"1"``, if a present session ceiling is malformed, if the caps
+            needed for a derivation are absent, if no operator identity is
+            recorded, or if the injected clock is unusable.
     """
     if os.environ.get(TRADING_ENABLED_ENV_VAR) != "1":
         raise LiveTradingPermissionError(
@@ -592,9 +681,15 @@ def issue_live_trading_permit(*, clock: SupportsTimestampNs) -> LiveTradingPermi
             f"there is no default and no truthiness coercion"
         )
 
-    ceiling = _read_operator_money(MAX_ORDER_NOTIONAL_USD_ENV_VAR)
-    budget_notional = _read_operator_money(SESSION_NOTIONAL_USD_ENV_VAR)
-    budget_orders = _read_operator_count(SESSION_ORDER_COUNT_ENV_VAR)
+    ceiling = _session_money(
+        MAX_ORDER_NOTIONAL_USD_ENV_VAR, derive=_derived_per_order_ceiling
+    )
+    budget_notional = _session_money(
+        SESSION_NOTIONAL_USD_ENV_VAR, derive=_derived_session_notional
+    )
+    budget_orders = _session_count(
+        SESSION_ORDER_COUNT_ENV_VAR, derive=_derived_session_order_count
+    )
     operator_id = _require_operator_value(OPERATOR_ID_ENV_VAR).strip()
     issued_at_ns = _read_clock(clock)
 
