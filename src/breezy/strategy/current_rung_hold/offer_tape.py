@@ -42,6 +42,7 @@ class OfferTapeRecord:
     minutes_since_window_open: int
     prior_eligible_snaps: int
     illegal_cell: bool
+    source: str
 
 
 class OfferTape:

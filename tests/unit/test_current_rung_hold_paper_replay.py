@@ -66,6 +66,7 @@ from breezy.strategy.current_rung_hold.config import (
     STALE_OBSERVATION_MINUTES,
     CurrentRungHoldConfig,
 )
+from breezy.strategy.current_rung_hold.continuous_strategy import ContinuousRungHoldStrategy
 from breezy.strategy.current_rung_hold.trial_day_latch import (
     TrialDayLatch,
     open_trial_day_latch,
@@ -149,8 +150,18 @@ def _pad(
     return orders, counts
 
 
-def _depth(*, ask: str, size: int, ts_event: int) -> OrderBookDepth10:
-    bid_orders, bid_counts = _pad(OrderSide.BUY, (("0.01", 10),))
+def _depth(
+    *,
+    ask: str,
+    size: int,
+    ts_event: int,
+    bids: tuple[tuple[str, int], ...] = (("0.01", 10),),
+) -> OrderBookDepth10:
+    """Two-sided by default (real bid + real ask), matching every existing
+    caller. Pass ``bids=()`` for a genuinely one-sided book -- the size-0
+    Arrow pad only, no real bid level -- which is what a real one-sided
+    frame looks like (`parse_book_levels` never fabricates a bid)."""
+    bid_orders, bid_counts = _pad(OrderSide.BUY, bids)
     ask_orders, ask_counts = _pad(OrderSide.SELL, ((ask, size),) if size > 0 else ())
     return OrderBookDepth10(
         instrument_id=INSTRUMENT_ID,
@@ -333,6 +344,71 @@ def test_an_ioc_at_displayed_size_one_fills_exactly_one_contract_at_the_displaye
     assert trial.qty == Decimal(1)
     expected_id = f"paper_replay/current_rung_hold/trial/{STATION}/{CLIMATE_DAY.isoformat()}"
     assert trial.trial_id == expected_id
+
+
+# ---------------------------------------------------------------------------
+# Phase 0b: a replayed one-sided window reaches `on_order_book_depth` through
+# a REAL BacktestEngine (`backtest_harness.py` feeds `OrderBookDepth10` the
+# same way it feeds `QuoteTick`) -- proving the subscription and delivery
+# path, not just the direct unit call already covered in
+# `test_continuous_rung_hold_strategy.py`.
+# ---------------------------------------------------------------------------
+def test_a_one_sided_depth_only_replay_delivers_on_order_book_depth_to_continuous_strategy(
+    tmp_path: Path,
+) -> None:
+    instrument = _instrument()
+    # One-sided: bids all size-0 pad, ask populated -- no `QuoteTick` would
+    # even be produced for a real frame like this (`parse_quote_tick`
+    # requires both sides); `_assert_every_quote_instrument_has_depth` only
+    # requires the reverse pairing, so a depth-only instrument is accepted.
+    depth = _depth(ask="0.40", size=10, ts_event=WINDOW_OPEN_NS, bids=())
+    # Fidelity guard on the fixture itself: a genuinely one-sided book has NO
+    # real (size > 0) bid level. `_depth`'s own default (used by every other
+    # caller in this file) pads bids with a REAL level, so asserting this
+    # here -- rather than trusting the docstring above -- is what actually
+    # proves this fixture, not just its comment, is one-sided.
+    assert not any(level.size > 0 for level in depth.bids)
+    from breezy.domain.station_observation import StationObservation
+
+    observation_ns = WINDOW_OPEN_NS - 5 * NS_PER_MIN
+    observation = StationObservation(
+        station=ICAO,
+        observed_at_ns=observation_ns,
+        received_at_ns=observation_ns + NS_PER_MIN,
+        temp_c_tenths=300,
+        precision_c_tenths=5,
+        is_metar=True,
+        source_channel="iem_asos_metar",
+        assumed_publication_lag_ns=1,
+    )
+    config = build_paper_replay_config(
+        instruments=[instrument],
+        market_data=[depth],
+        weather_data=as_backtest_data([observation]),
+        starting_balances=(Money(10_000, USD),),
+        capture_window_ns=(WINDOW_OPEN_NS, WINDOW_OPEN_NS),
+        instruments_without_close=frozenset({instrument.id}),
+    )
+    cfg = CurrentRungHoldConfig(instrument_ids=(instrument.id,), stations=(STATION,))
+    strategy = ContinuousRungHoldStrategy(
+        cfg, trial_day_latch_factory=_latch_factory(tmp_path / "state.db"),
+    )
+    delivered: list[OrderBookDepth10] = []
+    original_handler = strategy.on_order_book_depth
+
+    def _spy(depth_arg: OrderBookDepth10) -> None:
+        delivered.append(depth_arg)
+        original_handler(depth_arg)
+
+    strategy.on_order_book_depth = _spy  # type: ignore[method-assign]
+
+    with backtest(config, strategies=(strategy,), allow_idle_strategies=True):
+        pass
+
+    assert len(delivered) == 1
+    assert delivered[0].instrument_id == instrument.id
+    assert len(strategy.offer_tape) == 1
+    assert strategy.offer_tape.records()[0].source == "depth"
 
 
 # ---------------------------------------------------------------------------

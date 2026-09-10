@@ -68,7 +68,12 @@ from nautilus_trader.common.component import LiveClock, MessageBus
 from nautilus_trader.common.enums import LogColor
 from nautilus_trader.common.providers import InstrumentProvider
 from nautilus_trader.core.data import Data
-from nautilus_trader.data.messages import SubscribeQuoteTicks, UnsubscribeQuoteTicks
+from nautilus_trader.data.messages import (
+    SubscribeOrderBook,
+    SubscribeQuoteTicks,
+    UnsubscribeOrderBook,
+    UnsubscribeQuoteTicks,
+)
 from nautilus_trader.live.data_client import LiveMarketDataClient
 from nautilus_trader.model.data import CustomData, DataType, QuoteTick
 from nautilus_trader.model.identifiers import ClientId, InstrumentId, Venue
@@ -742,6 +747,11 @@ class PolymarketUSDataClient(LiveMarketDataClient):
         self._one_sided_book_refusals: int = 0
         self._expired_without_terminal_settlement: int = 0
         self._missing_cache_alerts: int = 0
+        # Reference counts for the SHARED feed subscription (Phase 0b): a slug
+        # is torn down on the feed only when NEITHER quote nor depth interest
+        # remains. One socket serves both subscription kinds.
+        self._quote_subscribed_slugs: set[str] = set()
+        self._depth_subscribed_slugs: set[str] = set()
 
     # -- state ------------------------------------------------------------
 
@@ -1187,9 +1197,22 @@ class PolymarketUSDataClient(LiveMarketDataClient):
                 f"Polymarket.us discovery cycle {cycle}: unsubscribing {slug} ({reason})"
             )
             await self._feed.unsubscribe(request_id)
+            # Discovery no longer wants `slug`: release ITS quote interest.
+            # Mirrors `_unsubscribe_quote_ticks`'s discard-after-teardown; a
+            # concurrent depth subscriber's OWN entry in
+            # `_depth_subscribed_slugs` is untouched -- this call always
+            # tears the feed down unconditionally, matching the recorder's
+            # existing (unchanged) discovery semantics.
+            self._quote_subscribed_slugs.discard(slug)
         for slug in plan.subscribe:
             self._log.info(f"Polymarket.us discovery cycle {cycle}: subscribing {slug} (new)")
             await self._feed.subscribe_market_data([slug])
+            # Discovery-desired slugs are the recorder's whole coverage and
+            # MUST count as quote interest: otherwise an unrelated depth
+            # subscribe+unsubscribe for the same slug would find no
+            # interest left and tear down the shared feed subscription out
+            # from under the recorder (2026-09-10 review finding).
+            self._quote_subscribed_slugs.add(slug)
         self._log.info(
             "Polymarket.us discovery cycle "
             f"{cycle}: subscribed={plan.subscribe!r} unsubscribed={plan.unsubscribe!r} "
@@ -1307,16 +1330,17 @@ class PolymarketUSDataClient(LiveMarketDataClient):
         except PolymarketUSError as exc:
             self._log.error(f"Refusing quote subscription for {instrument_id}: {exc}")
             return
-        if slug in self._feed.subscriptions:
-            self._log.debug(f"Already subscribed to {slug}")
-            return
         if self._cache.instrument(instrument_id) is None:
             self._log.error(
                 f"Refusing quote subscription for {instrument_id}: cache.instrument is "
                 "None, so streaming persistence would silently drop the first quote"
             )
             return
-        await self._feed.subscribe_market_data([slug])
+        # Added only AFTER the feed confirms the subscribe: a raised
+        # VenueTransportError must never leave a phantom entry that a later
+        # depth unsubscribe would treat as real, surviving quote interest.
+        await self._subscribe_feed_slug(slug)
+        self._quote_subscribed_slugs.add(slug)
 
     async def _unsubscribe_quote_ticks(self, command: UnsubscribeQuoteTicks) -> None:
         instrument_id = command.instrument_id
@@ -1324,6 +1348,57 @@ class PolymarketUSDataClient(LiveMarketDataClient):
             slug = instrument_id_to_slug(instrument_id)
         except PolymarketUSError as exc:
             self._log.error(f"Refusing quote unsubscription for {instrument_id}: {exc}")
+            return
+        self._quote_subscribed_slugs.discard(slug)
+        await self._unsubscribe_feed_slug(slug, other_interest=self._depth_subscribed_slugs)
+
+    async def _subscribe_order_book_depth(self, command: SubscribeOrderBook) -> None:
+        """Share `_subscribe_quote_ticks`'s feed subscription, reference-counted.
+
+        The venue sends depth on the SAME market-data frame as the quote
+        (``_publish_market_data``); this method only has to make sure the feed
+        socket is subscribed to the slug at all -- Nautilus's own
+        ``Actor.subscribe_order_book_depth`` already registers the msgbus
+        handler before this coroutine is even scheduled (finding
+        2026-09-10), so no separate depth-only transport is needed.
+        """
+        instrument_id = command.instrument_id
+        try:
+            slug = instrument_id_to_slug(instrument_id)
+        except PolymarketUSError as exc:
+            self._log.error(f"Refusing depth subscription for {instrument_id}: {exc}")
+            return
+        if self._cache.instrument(instrument_id) is None:
+            self._log.error(
+                f"Refusing depth subscription for {instrument_id}: cache.instrument is "
+                "None, so a Depth10 record would carry no precision to parse against"
+            )
+            return
+        # Same add-after-await discipline as `_subscribe_quote_ticks`.
+        await self._subscribe_feed_slug(slug)
+        self._depth_subscribed_slugs.add(slug)
+
+    async def _unsubscribe_order_book_depth(self, command: UnsubscribeOrderBook) -> None:
+        instrument_id = command.instrument_id
+        try:
+            slug = instrument_id_to_slug(instrument_id)
+        except PolymarketUSError as exc:
+            self._log.error(f"Refusing depth unsubscription for {instrument_id}: {exc}")
+            return
+        self._depth_subscribed_slugs.discard(slug)
+        await self._unsubscribe_feed_slug(slug, other_interest=self._quote_subscribed_slugs)
+
+    async def _subscribe_feed_slug(self, slug: str) -> None:
+        """Subscribe the feed to `slug` once, shared by quotes and depth."""
+        if slug in self._feed.subscriptions:
+            self._log.debug(f"Already subscribed to {slug}")
+            return
+        await self._feed.subscribe_market_data([slug])
+
+    async def _unsubscribe_feed_slug(self, slug: str, *, other_interest: set[str]) -> None:
+        """Tear down the feed subscription only when no OTHER kind still wants `slug`."""
+        if slug in other_interest:
+            self._log.debug(f"{slug} still subscribed for another data type; feed sub kept")
             return
         request_id = self._feed.subscriptions.get(slug)
         if request_id is None:

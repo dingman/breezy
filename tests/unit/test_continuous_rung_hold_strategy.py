@@ -9,11 +9,15 @@ from pathlib import Path
 
 import pytest
 from nautilus_trader.common.component import TestClock
+from nautilus_trader.model.data import BookOrder, OrderBookDepth10
+from nautilus_trader.model.enums import OrderSide
 from nautilus_trader.model.identifiers import TraderId
 from nautilus_trader.model.instruments import BinaryOption
+from nautilus_trader.model.objects import Price, Quantity
 from nautilus_trader.portfolio import Portfolio
 from nautilus_trader.test_kit.stubs.component import TestComponentStubs
 
+from breezy.adapters.polymarket_us.parsing import DEPTH10_LEVELS
 from breezy.domain.station_observation import StationObservation
 from breezy.runtime.sqlite_store import SqliteStateStore
 from breezy.runtime.submit_intent import open_submit_intent_latch
@@ -64,7 +68,7 @@ def _cont_latch_factory(
     return lambda: _open_cont_latch(store_path)
 
 
-def _register_and_start(
+def _register(
     *,
     store_path: Path,
     instruments: tuple[BinaryOption, ...],
@@ -93,8 +97,57 @@ def _register_and_start(
         cache=cache,
         clock=used_clock,
     )
+    return strategy
+
+
+def _register_and_start(
+    *,
+    store_path: Path,
+    instruments: tuple[BinaryOption, ...],
+    clock: TestClock | None = None,
+    offer_tape: OfferTape | None = None,
+) -> ContinuousRungHoldStrategy:
+    strategy = _register(
+        store_path=store_path, instruments=instruments, clock=clock, offer_tape=offer_tape,
+    )
     strategy.start()
     return strategy
+
+
+def _pad(
+    side: OrderSide, levels: tuple[tuple[str, int], ...],
+) -> tuple[list[BookOrder], list[int]]:
+    """Ten-level Depth10 side, padded with the size-0 Arrow filler (matches
+    `parse_order_book_depth10`'s own padding at the instrument's precision)."""
+    filler = BookOrder(side, Price(0, 2), Quantity(0, 0), 0)
+    orders = [BookOrder(side, Price.from_str(px), Quantity(size, 0), 0) for px, size in levels]
+    counts = [1] * len(orders)
+    while len(orders) < DEPTH10_LEVELS:
+        orders.append(filler)
+        counts.append(0)
+    return orders, counts
+
+
+def _depth(
+    instrument_id: object,
+    *,
+    bids: tuple[tuple[str, int], ...],
+    asks: tuple[tuple[str, int], ...],
+    ts_event: int,
+) -> OrderBookDepth10:
+    bid_orders, bid_counts = _pad(OrderSide.BUY, bids)
+    ask_orders, ask_counts = _pad(OrderSide.SELL, asks)
+    return OrderBookDepth10(
+        instrument_id=instrument_id,
+        bids=bid_orders,
+        asks=ask_orders,
+        bid_counts=bid_counts,
+        ask_counts=ask_counts,
+        flags=0,
+        sequence=0,
+        ts_event=ts_event,
+        ts_init=ts_event,
+    )
 
 
 def test_refuse_does_not_write_trial(
@@ -285,3 +338,77 @@ def test_an_unwritable_offer_tape_jsonl_path_never_raises_from_hunt_tick(
         assert not (unwritable_dir / "offer.jsonl").exists()
     finally:
         unwritable_dir.chmod(0o700)
+
+
+# ---------------------------------------------------------------------------
+# Phase 0b: hunt on Depth10 asks (shadow, permit None)
+# ---------------------------------------------------------------------------
+
+
+def test_on_start_subscribes_order_book_depth_for_each_resolved_instrument(
+    store_path: Path, interior_instrument: BinaryOption,
+) -> None:
+    strategy = _register(store_path=store_path, instruments=(interior_instrument,))
+    subscribed: list[object] = []
+    strategy.subscribe_order_book_depth = subscribed.append  # type: ignore[method-assign]
+
+    strategy.on_start()
+
+    assert subscribed == [interior_instrument.id]
+
+
+def test_on_stop_unsubscribes_order_book_depth(
+    store_path: Path, interior_instrument: BinaryOption,
+) -> None:
+    strategy = _register_and_start(store_path=store_path, instruments=(interior_instrument,))
+    unsubscribed: list[object] = []
+    strategy.unsubscribe_order_book_depth = unsubscribed.append  # type: ignore[method-assign]
+
+    strategy.stop()
+
+    assert unsubscribed == [interior_instrument.id]
+
+
+def test_a_one_sided_depth10_ask_drives_the_same_decision_as_the_equivalent_quote_tick(
+    store_path: Path, interior_instrument: BinaryOption,
+) -> None:
+    """A recorded one-sided window (bids all size-0 pad, asks populated) still
+    reaches the SAME hunt path a two-sided QuoteTick would, via
+    `on_order_book_depth` -> `best_order(depth.asks)`."""
+    strategy = _register_and_start(store_path=store_path, instruments=(interior_instrument,))
+    strategy.on_data(_observation(temp_c_tenths=300, observed_at_ns=WINDOW_OPEN_NS - 1))
+    depth = _depth(INTERIOR_ID, bids=(), asks=(("0.40", 10),), ts_event=WINDOW_OPEN_NS)
+
+    strategy.on_order_book_depth(depth)
+
+    # Phase 0 (`order_submission_permit=None`) clears IN_FLIGHT synchronously
+    # inside `_hunt_tick` itself (see `test_a_take_decision_with_permit_none_
+    # never_calls_submit_order`), so the durable proof of "same decision
+    # path as a QuoteTick" is the offer-tape record, not a post-hoc
+    # `is_inflight` read.
+    assert len(strategy.offer_tape) == 1
+    record = strategy.offer_tape.records()[0]
+    assert record.reason == "taken"
+    assert record.source == "depth"
+
+
+def test_a_two_sided_frame_delivered_as_both_quote_and_depth_evaluates_once(
+    store_path: Path, interior_instrument: BinaryOption,
+) -> None:
+    """The SAME WS frame yields a QuoteTick and a Depth10 with identical
+    (instrument_id, ts_event, ask, size) -- whichever arrives second must be
+    a no-op, not a second offer-tape entry. `ask=0.80` is a REFUSE decision
+    (`edge_below_break_even`), which does not set inflight, so only de-dupe
+    -- not the inflight guard -- can be responsible for a single record."""
+    strategy = _register_and_start(store_path=store_path, instruments=(interior_instrument,))
+    strategy.on_data(_observation(temp_c_tenths=300, observed_at_ns=WINDOW_OPEN_NS - 1))
+    quote = _quote(INTERIOR_ID, ask="0.80", ts_event=WINDOW_OPEN_NS)
+    depth = _depth(
+        INTERIOR_ID, bids=(("0.01", 10),), asks=(("0.80", 10),), ts_event=WINDOW_OPEN_NS,
+    )
+
+    strategy.on_quote_tick(quote)
+    strategy.on_order_book_depth(depth)
+
+    assert len(strategy.offer_tape) == 1
+    assert strategy.offer_tape.records()[0].reason == "edge_below_break_even"

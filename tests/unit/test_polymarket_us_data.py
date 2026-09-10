@@ -38,9 +38,15 @@ from nautilus_trader.common.providers import InstrumentProvider
 from nautilus_trader.config import InstrumentProviderConfig
 from nautilus_trader.core.uuid import UUID4
 from nautilus_trader.data.engine import DataEngine
-from nautilus_trader.data.messages import SubscribeQuoteTicks, UnsubscribeQuoteTicks
+from nautilus_trader.data.messages import (
+    SubscribeOrderBook,
+    SubscribeQuoteTicks,
+    UnsubscribeOrderBook,
+    UnsubscribeQuoteTicks,
+)
 from nautilus_trader.model.currencies import USD
-from nautilus_trader.model.enums import AssetClass
+from nautilus_trader.model.data import OrderBookDepth10
+from nautilus_trader.model.enums import AssetClass, BookType
 from nautilus_trader.model.identifiers import ClientId, InstrumentId, Symbol, Venue
 from nautilus_trader.model.instruments import BinaryOption, Instrument
 from nautilus_trader.model.objects import Price, Quantity
@@ -58,7 +64,10 @@ from breezy.adapters.polymarket_us.data import (
     frame_class_counts,
     should_warn_at_count,
 )
-from breezy.adapters.polymarket_us.websocket import SilentSubscriptionWarning
+from breezy.adapters.polymarket_us.websocket import (
+    SilentSubscriptionWarning,
+    VenueTransportError,
+)
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 
@@ -212,6 +221,21 @@ class FakeMarketsFeed:
         self.handler(raw)
 
 
+class _RaisingSubscribeFeed(FakeMarketsFeed):
+    """A `FakeMarketsFeed` whose `subscribe_market_data` raises exactly once,
+    on demand (`raise_on_next_subscribe`), then behaves normally."""
+
+    def __init__(self, handler: Any) -> None:
+        super().__init__(handler)
+        self.raise_on_next_subscribe = False
+
+    async def subscribe_market_data(self, market_slugs: Sequence[str]) -> None:
+        if self.raise_on_next_subscribe:
+            self.raise_on_next_subscribe = False
+            raise VenueTransportError("simulated subscribe failure")
+        await super().subscribe_market_data(market_slugs)
+
+
 def fake_quote_parser(
     payload: Mapping[str, Any],
     *,
@@ -279,6 +303,7 @@ def build_harness(
     quote_parser: Any = fake_quote_parser,
     config: PolymarketUSDataClientConfig | None = None,
     name: str = CLIENT_NAME,
+    feed_cls: type[FakeMarketsFeed] = FakeMarketsFeed,
 ) -> Harness:
     clock = LiveClock()
     msgbus: MessageBus = TestComponentStubs.msgbus()
@@ -290,7 +315,7 @@ def build_harness(
     feeds: list[FakeMarketsFeed] = []
 
     def feed_factory(handler: Any) -> FakeMarketsFeed:
-        feed = FakeMarketsFeed(handler)
+        feed = feed_cls(handler)
         feeds.append(feed)
         return feed
 
@@ -331,6 +356,29 @@ def unsubscribe_command(instrument_id: InstrumentId) -> UnsubscribeQuoteTicks:
         command_id=UUID4(),
         ts_init=0,
         params=None,
+    )
+
+
+def depth_subscribe_command(instrument_id: InstrumentId) -> SubscribeOrderBook:
+    return SubscribeOrderBook(
+        instrument_id,
+        OrderBookDepth10,
+        BookType.L2_MBP,
+        ClientId(CLIENT_NAME),
+        POLYMARKET_US_VENUE,
+        UUID4(),
+        0,
+    )
+
+
+def depth_unsubscribe_command(instrument_id: InstrumentId) -> UnsubscribeOrderBook:
+    return UnsubscribeOrderBook(
+        instrument_id,
+        OrderBookDepth10,
+        ClientId(CLIENT_NAME),
+        POLYMARKET_US_VENUE,
+        UUID4(),
+        0,
     )
 
 
@@ -467,6 +515,138 @@ async def test_subscribe_refuses_an_instrument_id_from_another_venue() -> None:
 
     assert harness.feed.events == ["connect", f"subscribe:{SLUG}"]
     await harness.client._disconnect()
+
+
+# ---------------------------------------------------------------------------
+# Phase 0b: depth subscription shares the quote feed subscription, reference
+# counted -- one socket, no NotImplementedError.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_depth_sub_on_a_quote_subscribed_instrument_issues_no_new_subscribe() -> None:
+    harness = build_harness()
+    await harness.client._connect()
+    instrument_id = InstrumentId(Symbol(SLUG), POLYMARKET_US_VENUE)
+    await harness.client._subscribe_quote_ticks(subscribe_command(instrument_id))
+
+    await harness.client._subscribe_order_book_depth(depth_subscribe_command(instrument_id))
+
+    assert harness.feed.events.count(f"subscribe:{SLUG}") == 1
+    await harness.client._disconnect()
+
+
+@pytest.mark.asyncio
+async def test_unsubscribing_quotes_while_depth_remains_keeps_the_feed_sub() -> None:
+    harness = build_harness()
+    await harness.client._connect()
+    instrument_id = InstrumentId(Symbol(SLUG), POLYMARKET_US_VENUE)
+    await harness.client._subscribe_quote_ticks(subscribe_command(instrument_id))
+    await harness.client._subscribe_order_book_depth(depth_subscribe_command(instrument_id))
+
+    await harness.client._unsubscribe_quote_ticks(unsubscribe_command(instrument_id))
+
+    assert SLUG in harness.feed.subscriptions
+    assert not any(event.startswith("unsubscribe:") for event in harness.feed.events)
+    await harness.client._disconnect()
+
+
+@pytest.mark.asyncio
+async def test_unsubscribing_depth_while_quotes_remain_keeps_the_feed_sub() -> None:
+    harness = build_harness()
+    await harness.client._connect()
+    instrument_id = InstrumentId(Symbol(SLUG), POLYMARKET_US_VENUE)
+    await harness.client._subscribe_quote_ticks(subscribe_command(instrument_id))
+    await harness.client._subscribe_order_book_depth(depth_subscribe_command(instrument_id))
+
+    await harness.client._unsubscribe_order_book_depth(depth_unsubscribe_command(instrument_id))
+
+    assert SLUG in harness.feed.subscriptions
+    assert not any(event.startswith("unsubscribe:") for event in harness.feed.events)
+    await harness.client._disconnect()
+
+
+@pytest.mark.asyncio
+async def test_unsubscribing_both_types_releases_the_feed_subscription() -> None:
+    harness = build_harness()
+    await harness.client._connect()
+    instrument_id = InstrumentId(Symbol(SLUG), POLYMARKET_US_VENUE)
+    await harness.client._subscribe_quote_ticks(subscribe_command(instrument_id))
+    await harness.client._subscribe_order_book_depth(depth_subscribe_command(instrument_id))
+
+    await harness.client._unsubscribe_quote_ticks(unsubscribe_command(instrument_id))
+    await harness.client._unsubscribe_order_book_depth(depth_unsubscribe_command(instrument_id))
+
+    assert SLUG not in harness.feed.subscriptions
+    await harness.client._disconnect()
+
+
+@pytest.mark.asyncio
+async def test_depth_subscribe_task_completes_without_the_base_not_implemented_error() -> None:
+    """The base ``_subscribe_order_book_depth`` raises `NotImplementedError`,
+    which `_on_task_completed` would only log (never re-raise) -- so this
+    proves the override is live by inspecting the SCHEDULED task itself,
+    not just that the direct coroutine call doesn't raise."""
+    harness = build_harness()
+    await harness.client._connect()
+    instrument_id = InstrumentId(Symbol(SLUG), POLYMARKET_US_VENUE)
+
+    harness.client.subscribe_order_book_depth(depth_subscribe_command(instrument_id))
+    (task,) = tuple(
+        task
+        for task in harness.client._tasks
+        if task.get_name() == f"subscribe: order_book_depth {instrument_id}"
+    )
+    await task
+
+    assert task.exception() is None
+    await harness.client._disconnect()
+
+
+@pytest.mark.asyncio
+async def test_discovery_interest_survives_a_depth_only_subscribe_unsubscribe_pair() -> None:
+    """A discovery-driven quote slug (the recorder's whole coverage) must not
+    be torn down by an UNRELATED depth subscribe/unsubscribe pair -- discovery
+    interest counts as quote interest for the shared feed refcount."""
+    harness = build_harness()
+    await harness.client._connect()
+    assert SLUG in harness.feed.subscriptions
+    instrument_id = InstrumentId(Symbol(SLUG), POLYMARKET_US_VENUE)
+
+    await harness.client._subscribe_order_book_depth(depth_subscribe_command(instrument_id))
+    await harness.client._unsubscribe_order_book_depth(depth_unsubscribe_command(instrument_id))
+
+    assert SLUG in harness.feed.subscriptions
+
+    # Discovery itself now decides SLUG is out of scope -> a REAL teardown.
+    harness.client._instrument_provider._preloaded.clear()  # type: ignore[attr-defined]
+    await harness.client._reconcile_discovered_subscriptions(cycle="reload")
+
+    assert SLUG not in harness.feed.subscriptions
+    await harness.client._disconnect()
+
+
+@pytest.mark.asyncio
+async def test_a_failed_quote_subscribe_leaves_no_phantom_interest() -> None:
+    harness = build_harness(feed_cls=_RaisingSubscribeFeed)
+    other_instrument = make_instrument(OTHER_SLUG)
+    harness.client._cache.add_instrument(other_instrument)
+    instrument_id = other_instrument.id
+    assert isinstance(harness.feed, _RaisingSubscribeFeed)
+    harness.feed.raise_on_next_subscribe = True
+
+    with pytest.raises(VenueTransportError):
+        await harness.client._subscribe_quote_ticks(subscribe_command(instrument_id))
+
+    assert OTHER_SLUG not in harness.client._quote_subscribed_slugs
+    assert OTHER_SLUG not in harness.feed.subscriptions
+
+    # A later depth subscribe + unsubscribe must tear the feed sub down
+    # cleanly -- no phantom quote interest must survive the failed subscribe.
+    await harness.client._subscribe_order_book_depth(depth_subscribe_command(instrument_id))
+    await harness.client._unsubscribe_order_book_depth(depth_unsubscribe_command(instrument_id))
+
+    assert OTHER_SLUG not in harness.feed.subscriptions
 
 
 # ---------------------------------------------------------------------------

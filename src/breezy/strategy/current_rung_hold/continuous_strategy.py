@@ -16,6 +16,7 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from contextlib import AbstractContextManager, ExitStack
+from dataclasses import dataclass
 from decimal import Decimal
 from pathlib import Path
 from typing import TYPE_CHECKING, Final, Literal
@@ -58,19 +59,46 @@ from breezy.strategy.current_rung_hold.tick_eval import (
     width_and_m,
 )
 from breezy.strategy.current_rung_hold.trial_day_latch import TrialDayLatch
+from breezy.strategy.depth10 import best_order
 from breezy.strategy.weather_common.refusals import RefusalAlerter, RefusalCounter
 from breezy.strategy.weather_common.running_extreme import RunningExtremeAccumulator
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
     from nautilus_trader.core.data import Data
-    from nautilus_trader.model.data import QuoteTick
+    from nautilus_trader.model.data import OrderBookDepth10, QuoteTick
     from nautilus_trader.model.instruments import Instrument
 
 __all__ = ["ContinuousRungHoldStrategy", "Phase0PermitForbiddenError"]
 
 _NS_PER_MINUTE: Final[int] = 60_000_000_000
 _CLASS_NAME: Final[str] = "ContinuousRungHoldStrategy"
-Trigger = Literal["quote_tick", "on_data"]
+Trigger = Literal["quote_tick", "on_data", "depth"]
+Source = Literal["quote", "depth"]
+
+
+@dataclass(frozen=True, slots=True)
+class _AskSnapshot:
+    """The minimal ask-side view `_hunt_tick` needs, from either a `QuoteTick`
+    or a `OrderBookDepth10` ask level (Phase 0b). `tick_eval.py` stays typed
+    on primitives only -- this is the one construction seam that lets
+    `_hunt_tick` treat the two sources identically.
+    """
+
+    instrument_id: InstrumentId
+    ask: Decimal
+    size: int
+    ts_event: int
+    source: Source
+
+
+def _snapshot_from_quote(tick: QuoteTick) -> _AskSnapshot:
+    return _AskSnapshot(
+        instrument_id=tick.instrument_id,
+        ask=tick.ask_price.as_decimal(),
+        size=int(tick.ask_size),
+        ts_event=tick.ts_event,
+        source="quote",
+    )
 
 
 class Phase0PermitForbiddenError(RuntimeError):
@@ -121,6 +149,13 @@ class ContinuousRungHoldStrategy(Strategy):
         self._eligible_snap_counts: dict[tuple[str, str], int] = {}
         self._fee_halt = False
         self.offer_tape = offer_tape if offer_tape is not None else OfferTape(offer_tape_path)
+        # De-dupe key for the LAST ask evaluated per instrument, so a WS frame
+        # that yields BOTH a QuoteTick and an OrderBookDepth10 (identical
+        # ts_event -- same frame) is hunted once. One entry per instrument,
+        # not a growing set: `on_data` retries deliberately re-evaluate the
+        # SAME cached quote on a later weather update, so only the two live
+        # push triggers ("quote_tick", "depth") ever consult or update this.
+        self._last_ask_seen: dict[str, tuple[int, Decimal, int]] = {}
 
     def on_start(self) -> None:
         if self._latch_factory is None:
@@ -167,6 +202,7 @@ class ContinuousRungHoldStrategy(Strategy):
             key = (facts.settlement_station, facts.climate_day.isoformat())
             self._ladders.setdefault(key, []).append((facts.lower_f, facts.upper_f))
             self.subscribe_quote_ticks(instrument_id)
+            self.subscribe_order_book_depth(instrument_id)
             self.log.info(f"{_CLASS_NAME} subscribed {instrument_id}")
 
         if self._config.instrument_ids and not resolved_any:
@@ -181,6 +217,8 @@ class ContinuousRungHoldStrategy(Strategy):
     def on_stop(self) -> None:
         self.log.info(self._diagnostics_snapshot_message())
         self.log.info(self._illegal_cell_snapshot_message())
+        for iid in self._facts:
+            self.unsubscribe_order_book_depth(InstrumentId.from_str(iid))
         exit_stack, self._exit_stack = self._exit_stack, None
         self._latch = None
         if exit_stack is not None:
@@ -223,24 +261,55 @@ class ContinuousRungHoldStrategy(Strategy):
             age = data.received_at_ns - last.ts_event
             if age > stale_bound_ns:
                 continue
-            self._hunt_tick(last, trigger="on_data", quote_age_ns=age)
+            self._hunt_tick(_snapshot_from_quote(last), trigger="on_data", quote_age_ns=age)
 
     def on_quote_tick(self, tick: QuoteTick) -> None:
-        self._hunt_tick(tick, trigger="quote_tick", quote_age_ns=None)
+        self._hunt_tick(_snapshot_from_quote(tick), trigger="quote_tick", quote_age_ns=None)
+
+    def on_order_book_depth(self, depth: OrderBookDepth10) -> None:
+        """Hunt on the venue's own Depth10 ask when quotes go dark (L-35).
+
+        A one-sided book (no bid) never produces a `QuoteTick`
+        (`parse_quote_tick` requires both sides) but still carries a real,
+        executable ask -- `best_order` skips the size-0 Arrow pad.
+        """
+        ask = best_order(depth.asks)
+        if ask is None:
+            return
+        snapshot = _AskSnapshot(
+            instrument_id=depth.instrument_id,
+            ask=ask.price.as_decimal(),
+            size=int(ask.size),
+            ts_event=depth.ts_event,
+            source="depth",
+        )
+        self._hunt_tick(snapshot, trigger="depth", quote_age_ns=None)
 
     def _hunt_tick(
         self,
-        tick: QuoteTick,
+        snapshot: _AskSnapshot,
         *,
         trigger: Trigger,
         quote_age_ns: int | None,
     ) -> None:
         if self._fee_halt:
             return
-        iid = str(tick.instrument_id)
+        iid = str(snapshot.instrument_id)
         facts = self._facts.get(iid)
         if facts is None:
             return
+
+        # De-dupe the two LIVE push triggers only (`quote_tick`, `depth`): a
+        # single WS frame can yield both a QuoteTick and an OrderBookDepth10
+        # with an identical (ts_event, ask, size). `on_data` deliberately
+        # re-evaluates the SAME cached quote on a later weather update and
+        # must never be short-circuited by this.
+        if trigger in ("quote_tick", "depth"):
+            dedupe_key = (snapshot.ts_event, snapshot.ask, snapshot.size)
+            if self._last_ask_seen.get(iid) == dedupe_key:
+                return
+            self._last_ask_seen[iid] = dedupe_key
+
         station = facts.settlement_station
         climate_day = facts.climate_day
         climate_day_key = climate_day.isoformat()
@@ -252,7 +321,7 @@ class ContinuousRungHoldStrategy(Strategy):
         if self._latch.is_inflight(station, climate_day_key):
             return
 
-        now_ns = tick.ts_event
+        now_ns = snapshot.ts_event
         offset = self._std_utc_offset_hours_by_station[station]
         hour_lst = _local_hour(now_ns, offset)
         if not (_WINDOW_START_HOUR_LST <= hour_lst < _WINDOW_END_HOUR_LST):
@@ -263,8 +332,8 @@ class ContinuousRungHoldStrategy(Strategy):
             )
             return
 
-        ask = tick.ask_price.as_decimal()
-        size = int(tick.ask_size)
+        ask = snapshot.ask
+        size = snapshot.size
         raw_executable = (
             self._config.executable_ask_lower < ask < self._config.executable_ask_upper
             and size >= self._config.minimum_displayed_size
@@ -295,7 +364,7 @@ class ContinuousRungHoldStrategy(Strategy):
             return
 
         width_code, m_code = width_and_m(facts, running_max)
-        instrument = self.cache.instrument(tick.instrument_id)
+        instrument = self.cache.instrument(snapshot.instrument_id)
         fee_coefficient = self._guarded_fee_coefficient(instrument)
         decision: Decision = evaluate_eligible_snapshot(
             station=station,
@@ -333,6 +402,7 @@ class ContinuousRungHoldStrategy(Strategy):
                 minutes_since_window_open=max(0, hour_lst - _WINDOW_START_HOUR_LST) * 60,
                 prior_eligible_snaps=prior,
                 illegal_cell=illegal,
+                source=snapshot.source,
             )
         )
         self._eligible_snap_counts[station_day] = prior + 1
