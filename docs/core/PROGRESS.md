@@ -64,6 +64,9 @@ Merged analysis, evidence and unlock observables: `docs/evidence/GO_LIVE_BLOCKER
 
 Verified NOT blockers 09-06: exec client connected + reconciled, balances 97.91, permit issued, caps/enablement present, OP-SEQ control CLOSED (GTC only), obs feed live, 24 rungs subscribed, rotation 09:00Z outside every window.
 
+### V3 continuous rung hold — `pm_us_crh_cont` (opened 2026-09-10, operator direction)
+- [HIGH] Continuous edge-hunting as a NEW pre-registered family (v2's trigger is frozen, L-34). Plan rev 2 peer-reviewed on three seams: **Phase 0 shadow APPROVED with conditions (building)**; Phase 1 live REQUEST_CHANGES — permit-slot restore must be once-per-`venue_order_id` and `remaining ≤ issued`; late-fill-after-strict-ZERO_FILL needs a re-latch + un-restore rule; TRIAL-on-fill needs `consume_if_absent` (two writers); one family dollar halt, not two; startup join/ordering spike in flight. Worst case both reviewers converged on: 2× per-position cap on one station via AMBIGUOUS-then-late-fill. m=1 stays illegal (a third family if ever). Evidence `docs/evidence/gate_attribution_replay_2026-09-10.md`.
+
 ### LADDER_EV (opened 2026-09-07)
 - [MED] LADDER_EV whole-ladder EV scanner: design v2 peer-reviewed, `docs/strategies/breezy_strategy_ladder_ev_2026-09-07.md`. DEGRADED-only; shadow while CRH live; census 09-07 train 7/15 covered days ⇒ §12 kill INSUFFICIENT DATA. Stage 1 pure modules landed (42 tests, 2 reviews). Next: stage 2 strategy.py + 6-rung freeze + kill script.
 
