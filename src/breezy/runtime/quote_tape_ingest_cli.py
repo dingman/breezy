@@ -116,33 +116,44 @@ instance to go quiet (up to a day) before landing; (2) a single crashed
 (SIGKILL/OOM/reboot) file permanently blocked every sibling file, of every
 type, in that instance, even years later.
 
-Only an end-of-stream-marked file is converted per file. An INTACT-but-
+An end-of-stream-marked file is always trusted as closed. An INTACT-but-
 unmarked file (a clean read that stops exactly on a message boundary but
 never wrote the terminator) is byte-identical to a live writer paused
 mid-stream -- there is no way to distinguish the two from the bytes alone
--- so it is left unmarked (``skipped-unclosed``) rather than risk a
-PERMANENT per-file marker over a file that will receive more rows later.
-It still lands once the whole INSTANCE is confirmed dead, via the
-pre-existing, unchanged whole-instance path (:func:`ingest_instance` ->
-``convert_stream_to_data``) -- but that path does NOT re-apply this same
-EOS caution; it has none. ``convert_stream_to_data`` reads every file it is
-handed with a plain ``read_all()`` and has no concept of the end-of-stream
-marker at all. The ONLY thing standing between that native call and a
-no-EOS file is :func:`run_ingest` never handing it one while the file could
-still receive more rows -- i.e. while its OWN instance might still be
-live. Pinned precisely: a no-EOS, message-boundary-clean file is safe for
-the whole-instance path to convert (and permanently mark) if and only if
-its instance is DEAD, meaning EITHER it is not the most-recently-started
-instance while the recorder unit is active (:func:`_open_files_for_instance`
-rule (b) then flags that instance's newest file per type as open,
-regardless of that file's own mtime, keeping it out of this path entirely),
-OR the recorder unit is confirmed inactive (rule (b) never applies to any
-instance, so only staleness (rule (a)) gates it). A crashed-and-abandoned
-instance (SIGKILL/OOM/reboot followed by the recorder restarting into a
-NEW instance UUID) is the case this legitimately serves: the writer
-process for the old UUID is provably gone, so its last, unmarked file is
-exactly as safe to trust as one the OLD whole-instance path always
-accepted, before this per-file path existed.
+-- so the EOS marker is trusted as the sole proof of closure ONLY while a
+writer for that file COULD still exist. Whether one could is exactly the
+instance-wide liveness predicate rule (b) already uses for the
+whole-instance path: ``instance_is_dead = NOT (this is the most-recently-
+started instance AND the recorder unit is active)``. :func:`run_ingest`
+computes it once per instance and threads it into both
+:func:`_ingest_instance_per_file` and
+:func:`_convert_one_tick_type_per_file`.
+
+* ``instance_is_dead`` is ``False`` (the instance might still be live): a
+  no-EOS file is left unmarked (``skipped-unclosed``) and retried next run
+  -- the PERMANENT per-file marker is never risked over a file that may yet
+  receive more rows.
+* ``instance_is_dead`` is ``True``: a no-EOS file converts and is marked
+  exactly like an EOS-closed one. This closes a real production stranding:
+  a reboot-killed instance can have MOST of its rotated files lacking an
+  EOS marker (the writer only appends it on an orderly ``close()``, never
+  on a SIGKILL/OOM/reboot) while ALSO carrying an unrelated truncated file
+  for a different type -- so it never reaches the whole-instance dead path
+  (that path refuses outright on ANY truncation, anywhere) and, before
+  this fix, never satisfied the per-file path's EOS bar either. Between
+  the two paths, every no-EOS file in an already-dead instance was
+  stranded forever. A crashed-and-abandoned instance (SIGKILL/OOM/reboot
+  followed by the recorder restarting into a NEW instance UUID) is
+  precisely this case: the writer process for the OLD UUID is provably
+  gone the moment a newer instance exists, so its last, unmarked file is
+  exactly as safe to trust as one the whole-instance path has always
+  accepted, truncation elsewhere or not.
+
+Independent of ``instance_is_dead``: :func:`_open_files_for_instance`'s
+own two rules (recent mtime, OR newest-instance-and-active) still exclude a
+group's single newest file from BOTH paths entirely, dead instance or not
+-- that check protects the one file a writer could still be appending to
+right now, which an instance-wide dead/live label cannot see file-by-file.
 
 Ordering guarantee: instrument-definition types (:func:`_is_instrument_
 definition`) are always converted before every other ("tick") type within
@@ -873,17 +884,21 @@ def _convert_one_tick_type_per_file(
     open_files: frozenset[Path],
     reports_by_path: dict[Path, Any],
     *,
+    instance_is_dead: bool,
     dry_run: bool,
 ) -> tuple[TypeConversionResult, bool, bool]:
     """Convert one non-definition type's not-yet-marked files, per file.
 
-    Returns ``(result, converted_something_new, saw_an_open_file)``. Only a
-    file carrying the Arrow end-of-stream marker is trusted as genuinely
-    closed (see the module docstring's "Per-file conversion" ordering note):
-    a message-boundary-clean read with no marker is indistinguishable from a
-    live writer paused mid-stream, so it is left unmarked -- ``skipped-
-    unclosed`` -- and retried, falling back to the existing whole-instance
-    dead-instance path once the INSTANCE itself is confirmed dead.
+    Returns ``(result, converted_something_new, saw_an_open_file)``. A file
+    carrying the Arrow end-of-stream marker is always trusted as closed. A
+    file that reads cleanly to a message boundary WITHOUT one is only
+    trusted when ``instance_is_dead`` -- the EOS caution exists purely to
+    guard against a writer that could still append to THIS file; once no
+    such writer can exist (see the module docstring's "Per-file conversion"
+    section), the missing marker says nothing more than "the writer never
+    got to call ``close()``", exactly like the pre-existing whole-instance
+    dead-instance path has always accepted. In a LIVE instance a no-EOS file
+    is left unmarked (``skipped-unclosed``) and retried next run instead.
     """
     cls_open, cls_closed = _cls_open_and_closed_files(instance_dir, data_cls, open_files)
     counts: dict[str, int] = {}
@@ -917,11 +932,12 @@ def _convert_one_tick_type_per_file(
                 any_new_conversion = True
             counts["converted-nothing-new"] = counts.get("converted-nothing-new", 0) + 1
             continue
-        if not report.end_of_stream_marker:
-            # INTACT but unclosed: a clean EOF at a message boundary is
-            # byte-identical to a live writer paused mid-stream. Never
-            # converted here -- left for the whole-instance dead-instance
-            # path once the instance itself is confirmed dead (unchanged).
+        if not report.end_of_stream_marker and not instance_is_dead:
+            # INTACT but unclosed, and the instance MIGHT still be live: a
+            # clean EOF at a message boundary is byte-identical to a live
+            # writer paused mid-stream. Left unmarked, retried next run --
+            # `instance_is_dead` below is what proves no such writer can
+            # exist and lets the same file convert.
             counts["skipped-unclosed"] = counts.get("skipped-unclosed", 0) + 1
             continue
         if dry_run:
@@ -995,6 +1011,7 @@ def _ingest_instance_per_file(
     open_files: frozenset[Path],
     preflight_report: PreflightReport,
     *,
+    instance_is_dead: bool,
     convert_fn: ConvertFn,
     dry_run: bool,
 ) -> InstanceIngestResult:
@@ -1009,7 +1026,9 @@ def _ingest_instance_per_file(
     without blocking anything else; an intact, END-OF-STREAM-CLOSED file is
     converted and marked with a per-file marker, never the blanket per-type
     marker (see :data:`FILE_MARKER_PREFIX`). An INTACT file lacking the EOS
-    marker is never converted here (see :func:`_convert_one_tick_type_per_file`).
+    marker is convertible too, but ONLY when ``instance_is_dead`` (see
+    :func:`_convert_one_tick_type_per_file`) -- otherwise it is left
+    unmarked and retried.
 
     Ordering guarantee: instrument-definition types are always attempted
     FIRST, entirely before any non-definition ("tick") type, and every tick
@@ -1073,7 +1092,7 @@ def _ingest_instance_per_file(
             continue
         result, converted, is_open = _convert_one_tick_type_per_file(
             catalog, instance_dir, instance_id, data_cls, open_files, reports_by_path,
-            dry_run=dry_run,
+            instance_is_dead=instance_is_dead, dry_run=dry_run,
         )
         results_by_cls[data_cls] = result
         any_new_conversion = any_new_conversion or converted
@@ -1138,6 +1157,13 @@ def run_ingest(
     results: list[InstanceIngestResult] = []
     for instance_id in instance_ids:
         instance_dir = _instance_dir(catalog_root, instance_id, subdirectory)
+        # The instance-wide liveness predicate rule (b) alone applies (see
+        # the module docstring): the newest-started instance while the
+        # recorder is active is the only instance a writer can still exist
+        # for. Independent of `open_files` below, which ALSO honors rule
+        # (a) (per-file recency) to protect a genuinely fresh file even in
+        # an otherwise-dead instance.
+        instance_is_dead = not (instance_id == newest_instance_id and service_active)
         open_files = _open_files_for_instance(
             catalog_root,
             instance_id,
@@ -1212,6 +1238,7 @@ def run_ingest(
                 data_types,
                 open_files,
                 preflight_report,
+                instance_is_dead=instance_is_dead,
                 convert_fn=convert_fn,
                 dry_run=dry_run,
             )

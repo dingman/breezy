@@ -39,7 +39,7 @@ from typing import Any
 import pyarrow as pa
 import pytest
 from nautilus_trader.model.currencies import USD
-from nautilus_trader.model.data import MarkPriceUpdate, QuoteTick, TradeTick
+from nautilus_trader.model.data import InstrumentClose, MarkPriceUpdate, QuoteTick, TradeTick
 from nautilus_trader.model.enums import AggressorSide, AssetClass
 from nautilus_trader.model.identifiers import InstrumentId, Symbol, TradeId, Venue
 from nautilus_trader.model.instruments import BinaryOption
@@ -1325,30 +1325,38 @@ class TestANoneOrEmptyPostTransformTableIsAHardFailure:
         assert results[0].outcome == "failed"
 
 
-class TestAnUnclosedIntactFileIsNeverConvertedPerFile:
-    """Review item 2: a message-boundary-clean read with no end-of-stream
-    marker is byte-identical to a live writer paused mid-stream -- the
-    per-file path must not risk a PERMANENT marker over it.
+class TestAnUnclosedIntactFileWhileLiveIsNeverConvertedPerFile:
+    """Review item 2 (round 2 semantics pin): a message-boundary-clean read
+    with no end-of-stream marker is byte-identical to a live writer paused
+    mid-stream -- untrustworthy ONLY while a writer for it could still
+    exist, i.e. while its instance is not yet confirmed ``instance_is_dead``
+    (see the module docstring's "Per-file conversion" section). This class
+    pins the LIVE half; :class:`TestANoEosFileInADeadInstanceIsConverted`
+    pins the DEAD half that GL-14/BL-24's original per-file path got wrong.
     """
 
-    def test_without_eos_the_file_is_left_unmarked(self, tmp_path: Path) -> None:
+    def test_without_eos_the_file_is_left_unmarked_while_the_instance_is_live(
+        self, tmp_path: Path
+    ) -> None:
         instance_dir = tmp_path / "live" / INSTANCE
         unclosed_path = instance_dir / "quote_tick_0.feather"
-        open_path = instance_dir / "trade_tick_0.feather"
+        open_path = instance_dir / "quote_tick_1.feather"
         _write_typed_ipc_stream(
             unclosed_path, [_quote_tick(i) for i in range(10)], QuoteTick, close=False
         )
         _write_typed_ipc_stream(
-            open_path, [_trade_tick(i) for i in range(3)], TradeTick, close=False
+            open_path, [_quote_tick(100 + i) for i in range(3)], QuoteTick, close=False
         )
         stamp = time.time() - (DEFAULT_LIVE_GRACE_MINUTES + 5) * 60
         os.utime(unclosed_path, (stamp, stamp))
-        # `open_path` stays at "now" -- keeps the instance in the per-file path.
+        # `open_path` stays at "now", AND the recorder is reported active for
+        # this, the only (hence newest-started) instance -- genuinely LIVE,
+        # not merely "this one file looks fresh".
 
         results = run_ingest(
             tmp_path,
-            data_types=(QuoteTick, TradeTick),
-            service_active_probe=_never_active,
+            data_types=(QuoteTick,),
+            service_active_probe=lambda: True,
         )
 
         catalog = ParquetDataCatalog(str(tmp_path))
@@ -1668,3 +1676,89 @@ class TestAMissingPreflightReportIsNeverSilent:
         assert "unreported=1" in outcomes[QuoteTick]
         messages = " ".join(record.getMessage() for record in caplog.records)
         assert "no preflight report" in messages
+
+
+class TestANoEosFileInADeadInstanceIsConverted:
+    """Round-3 stranded-instance fix: a reboot-killed instance can have MOST
+    of its rotated files lacking an EOS marker while ALSO carrying an
+    unrelated truncated file for a different type -- neither the missing
+    EOS marker nor the truncated sibling may strand a file that is
+    genuinely safe to trust once the instance itself is confirmed dead.
+    """
+
+    def test_dead_instance_converts_no_eos_quotes_despite_a_truncated_sibling(
+        self, tmp_path: Path
+    ) -> None:
+        instance_dir = tmp_path / "live" / INSTANCE
+        quote_path = instance_dir / "quote_tick_0.feather"
+        trade_path = instance_dir / "trade_tick_0.feather"
+        _write_typed_ipc_stream(
+            quote_path, [_quote_tick(i) for i in range(10)], QuoteTick, close=False
+        )
+        _write_typed_ipc_stream(
+            trade_path, [_trade_tick(i) for i in range(20)], TradeTick, close=False
+        )
+        _truncate_tail(trade_path)
+        stamp = time.time() - (DEFAULT_LIVE_GRACE_MINUTES + 5) * 60
+        for path in (quote_path, trade_path):
+            os.utime(path, (stamp, stamp))
+
+        results = run_ingest(
+            tmp_path,
+            data_types=(QuoteTick, TradeTick),
+            service_active_probe=_never_active,
+        )
+
+        catalog = ParquetDataCatalog(str(tmp_path))
+        # the no-EOS QuoteTick file converted despite lacking EOS -- the
+        # instance itself is confirmed dead (recorder inactive).
+        assert len(catalog.query(data_cls=QuoteTick)) == 10
+        assert (instance_dir / f"{FILE_MARKER_PREFIX}{quote_path.name}").is_file()
+
+        # the truncated TradeTick sibling was salvaged, not silently dropped
+        # and not left blocking QuoteTick.
+        recovered = catalog.query(data_cls=TradeTick)
+        assert 0 < len(recovered) < 20
+        assert (instance_dir / f".salvaged-{trade_path.name}").is_file()
+
+        # the instance is still reported quarantined -- TradeTick remains
+        # truncated -- even though the QuoteTick rows landed underneath.
+        assert results[0].outcome == "skipped-truncated"
+
+    def test_dead_instance_empty_sibling_files_never_block_and_are_marked(
+        self, tmp_path: Path
+    ) -> None:
+        """Confirms item 4 of the round-3 review: 0-byte EMPTY_FILE entries
+        (the writer's placeholder for a type that never captured anything
+        this run) never block tick conversion, and land in their own
+        ``converted-nothing-new`` bucket, per file, regardless of the
+        instance being dead or the truncated sibling elsewhere.
+        """
+        instance_dir = tmp_path / "live" / INSTANCE
+        quote_path = instance_dir / "quote_tick_0.feather"
+        trade_path = instance_dir / "trade_tick_0.feather"
+        empty_path = instance_dir / "instrument_close_0.feather"
+        _write_typed_ipc_stream(
+            quote_path, [_quote_tick(i) for i in range(10)], QuoteTick, close=False
+        )
+        _write_typed_ipc_stream(
+            trade_path, [_trade_tick(i) for i in range(20)], TradeTick, close=False
+        )
+        _truncate_tail(trade_path)
+        empty_path.parent.mkdir(parents=True, exist_ok=True)
+        empty_path.touch()
+        stamp = time.time() - (DEFAULT_LIVE_GRACE_MINUTES + 5) * 60
+        for path in (quote_path, trade_path, empty_path):
+            os.utime(path, (stamp, stamp))
+
+        results = run_ingest(
+            tmp_path,
+            data_types=(QuoteTick, TradeTick, InstrumentClose),
+            service_active_probe=_never_active,
+        )
+
+        catalog = ParquetDataCatalog(str(tmp_path))
+        assert len(catalog.query(data_cls=QuoteTick)) == 10
+        outcomes = {r.data_cls: r.outcome for r in results[0].type_results}
+        assert "converted-nothing-new=1" in outcomes[InstrumentClose]
+        assert (instance_dir / f"{FILE_MARKER_PREFIX}{empty_path.name}").is_file()
