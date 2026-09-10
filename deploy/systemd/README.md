@@ -224,9 +224,13 @@ nohup "$S/tape_supervisor_k1.sh" >/dev/null 2>&1 &
 nohup "$S/k1_daily.sh"           >/dev/null 2>&1 &
 ```
 
-If `breezy-quote-tape.service` has entered `failed` after exhausting its start
-limit, clear it with `systemctl --user reset-failed breezy-quote-tape.service`
-before trying again.
+If `breezy-quote-tape.service` has entered `failed` because of an exit-2
+configuration error (`RestartPreventExitStatus=2` refuses to hot-loop that
+class), clear it with `systemctl --user reset-failed breezy-quote-tape.service`
+after fixing the env, then `start` again. A runtime / market-data fault
+(exit 1) must **not** land here any more: that class retries indefinitely
+with backoff, and `StartLimitIntervalSec=0` is what makes 09-09's
+"Start request repeated too quickly" abandon-permanently outcome impossible.
 
 ## 6. Design notes (why these values)
 
@@ -236,13 +240,28 @@ before trying again.
   (`node_config.py:292`), so the stop must be allowed to flush and close; 120 s
   is deliberate headroom over systemd's 90 s default, because the timeout
   expiring means SIGKILL and SIGKILL means the silent-zero-rows failure.
-- **`RestartSec=30`** matches the supervisors' 30 s poll — the cutover changes
-  the supervisor, not the recovery latency.
-- **`StartLimitBurst=20` / `StartLimitIntervalSec=3600`** *diverges* from the NWS
-  unit's 3/300 s. At `RestartSec=30`, 3-in-300 s is exhausted by a ~2-minute
-  network outage and would abandon capture permanently. 20/hour still fails
-  closed on a persistent exit-2 misconfiguration (~10 min) and still bounds a hot
-  loop. This is the one place data-irreplaceability outranks convention-mirroring.
+- **`RestartSec=30` + `RestartSteps=4` + `RestartMaxDelaySec=480`.** The first
+  retry stays 30 s (the supervisors' poll this unit replaced), so a blip is
+  still recovered at the old latency. Then exponential backoff with ratio 2
+  (`(480/30)^(1/4) = 2`): 30s, 60s, 120s, 240s, 480s, 480s, … A multi-hour
+  venue outage therefore retries forever at 8 min, not 120 times an hour.
+  `RestartSteps` / `RestartMaxDelaySec` landed in systemd 254; this host is
+  259 (259.5-0ubuntu3.4), so the directives load.
+- **`RestartPreventExitStatus=2` / `StartLimitIntervalSec=0`.** Discriminate
+  failure class by exit code, not by attempt count. The recorder's contract
+  (`quote_tape_cli.py:52-61, :107-109, :145-174, :270-272`) matches the
+  sibling `breezy-trade-supervisor.service`: 0 clean, 1 runtime / FATAL
+  market-data fault, 2 configuration/environment. Exit 2 fails closed
+  immediately — restarting cannot change the env. Exit 1 retries indefinitely.
+  The previous `StartLimitBurst=20` / `StartLimitIntervalSec=3600` *looked*
+  like an hour of resilience; at `RestartSec=30` it was 20 × 30s = **600 s of
+  wall clock**, and on 2026-09-09 that is exactly what parked capture for
+  6.7 hours after a venue websocket drop (status=1/FAILURE at 16:00:17Z,
+  "Start request repeated too quickly" at 17:28:05Z, manual `reset-failed` +
+  `start` at 00:09Z on 09-10). The NWS unit's 3/300 s is even tighter
+  (~15 s at `RestartSec=5`); that is defensible there because NWS climate
+  records are re-fetchable. Polymarket.us price history is not. This is the
+  one place data-irreplaceability outranks convention-mirroring.
 - **`MemoryHigh=2G` / `MemoryMax=3G`** (added 2026-09-04, after the recorder
   was OOM-killed at ~1.1 GB RSS with no per-cgroup ceiling set at all). Sized
   from the measured post-incident steady state, MemoryCurrent ~= 1.10 GB /
@@ -347,9 +366,13 @@ when the timer will fire, never which version of the service it will fire.
   `EnvironmentFile`. Measured with a transient unit before cutover, then
   confirmed in the running unit: `POLYMARKET_US_USER_AGENT` arrives as
   `breezy/1.0 (+mailto:...)` with no literal quotes, `MARKET_SLUGS` empty.
-- **Deliberate divergence from `breezy-nws-ingest.service`:**
-  `StartLimitBurst=20`/`StartLimitIntervalSec=3600` instead of 3/300 s, so a
-  short network outage cannot permanently abandon capture (§6).
+- **Deliberate divergence from `breezy-nws-ingest.service`:** originally
+  `StartLimitBurst=20`/`StartLimitIntervalSec=3600` instead of 3/300 s.
+  **Superseded 2026-09-10 after the 09-09 capture loss:** that 20/hour
+  window was only ~10 minutes of wall clock at `RestartSec=30` and
+  permanently abandoned the tape. Current policy is
+  `RestartPreventExitStatus=2` + `StartLimitIntervalSec=0` + backoff
+  (`RestartSteps=4`/`RestartMaxDelaySec=480`); see §6.
 - **Carried forward as a real defect (not a cutover concern):** the retired
   supervisors polled `pgrep -f "bin/breezy-quote-tape"`, which also matches
   `breezy-quote-tape-preflight` — a preflight running during an outage read as
@@ -464,11 +487,12 @@ genuinely quiet and convert it, landing it in the catalog before
 `breezy-mb-daily` reads at 13:30.
 
 A daily `try-restart` does not interact badly with the recorder's own
-`Restart=always` / `StartLimitBurst=20` / `StartLimitIntervalSec=3600`
-(1 hour): systemd counts both automatic and manual restarts against the same
-budget, but one restart per day is nowhere near the 20-per-hour ceiling, so
-no adjustment to `breezy-quote-tape.service` is needed or made — only the
-new rotate unit was added.
+`Restart=always` / `RestartPreventExitStatus=2` / `StartLimitIntervalSec=0`:
+systemd counts both automatic and manual restarts against the same start-limit
+budget, but that budget is disabled (interval 0), so one scheduled rotate
+per day cannot park capture the way the old 20-per-hour ceiling did on
+09-09. No further adjustment to `breezy-quote-tape.service` is needed for
+the rotate unit.
 
 Validation performed (no unit activated):
 
