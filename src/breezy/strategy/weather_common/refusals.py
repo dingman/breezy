@@ -57,8 +57,10 @@ from typing import Final
 from breezy.runtime.health import (
     AlertCondition,
     AlertConditionKey,
+    AlertPayload,
     AlertSink,
     AlertState,
+    emit_alert,
     resolve_alert_sink,
 )
 from breezy.strategy.weather_common.running_extreme import RunningMax
@@ -137,15 +139,18 @@ class RefusalCounter:
         return sum(self.counts.values())
 
 
-def _refusal_event(reason: str) -> str:
-    """`AlertPayload.event` for a refusal reason with no dedicated constant.
+def _refusal_event(reason: str, *, suffix: str) -> str:
+    """`AlertPayload.event` for a reason with no dedicated constant.
 
     Matches the shape `SHORTS_DISABLED_EVENT` already has --
     `"shorts_disabled".upper() + "_REFUSALS" == SHORTS_DISABLED_EVENT` -- so
-    every reason gets an event name in one consistent vocabulary rather than
-    `SHORTS_DISABLED` alone being special-cased into a hand-picked constant.
+    every reason gets an event name in one consistent vocabulary. `suffix`
+    generalises that shape past refusals: a caller reporting a non-refusal
+    condition through this same class (e.g. a WAIT-state diagnostic) gets
+    its own event family (``..._WAIT``) instead of being forced into
+    ``..._REFUSALS`` regardless of what actually happened.
     """
-    return f"{reason.upper()}_REFUSALS"
+    return f"{reason.upper()}_{suffix}"
 
 
 class RefusalAlerter:
@@ -156,6 +161,15 @@ class RefusalAlerter:
     -- and the sink still sees one payload per transition plus the standard 24h
     re-notify while the condition stands. `sink` and `state` are injectable for
     tests; the defaults are the same ones the ingest actor resolves.
+
+    `event_suffix`/`noun`/`verb`/`detail_note` are the alert VOCABULARY --
+    they default to today's "REFUSALS"/"order(s)"/"refused"/"" so every
+    EXISTING caller's event names and detail wording stay byte-identical.
+    A caller reporting a condition that is NOT a refusal (e.g.
+    `current_rung_hold`'s pre-decision WAIT-state diagnostics) passes its
+    own vocabulary instead, through this same mechanism -- never a second,
+    parallel alert path. `SHORTS_DISABLED`'s dedicated event/wording is
+    unaffected by any of these: see `_condition_for`.
 
     Single-threaded, for the same reason `AlertState` is: `report` is a
     read-modify-write over that state and must run on the thread that owns it
@@ -169,11 +183,31 @@ class RefusalAlerter:
         site: str,
         sink: AlertSink | None = None,
         state: AlertState | None = None,
+        event_suffix: str = "REFUSALS",
+        noun: str = "order(s)",
+        verb: str = "refused",
+        detail_note: str = "",
     ) -> None:
         self._counter = counter
         self._site = site
         self._sink = resolve_alert_sink() if sink is None else sink
         self._state = AlertState() if state is None else state
+        self._event_suffix = event_suffix
+        self._noun = noun
+        self._verb = verb
+        self._detail_note = detail_note
+
+    def report_payloads(self, *, now_ns: int) -> tuple[AlertPayload, ...]:
+        """Evaluate this cycle's conditions and dispatch them.
+
+        Returns the payloads DECIDED this cycle -- never what the sink
+        managed to deliver. ``report`` is ``len`` of this, kept for every
+        existing caller that only needs the count.
+        """
+        payloads = self._state.evaluate(self._conditions(), now_ns=now_ns)
+        for payload in payloads:
+            emit_alert(self._sink, payload)
+        return payloads
 
     def report(self, *, now_ns: int) -> int:
         """Evaluate this cycle's refusal conditions and dispatch them.
@@ -181,7 +215,7 @@ class RefusalAlerter:
         Returns the number of payloads DECIDED this cycle, exactly as
         `AlertState.dispatch` does -- never what the sink managed to deliver.
         """
-        return self._state.dispatch(self._sink, self._conditions(), now_ns=now_ns)
+        return len(self.report_payloads(now_ns=now_ns))
 
     def _conditions(self) -> tuple[AlertCondition, ...]:
         """One `AlertCondition` per refusal reason ever recorded, this process.
@@ -202,7 +236,11 @@ class RefusalAlerter:
 
     def _condition_for(self, reason: str) -> AlertCondition:
         refused = self._counter.count(reason)
-        event = SHORTS_DISABLED_EVENT if reason == SHORTS_DISABLED else _refusal_event(reason)
+        event = (
+            SHORTS_DISABLED_EVENT
+            if reason == SHORTS_DISABLED
+            else _refusal_event(reason, suffix=self._event_suffix)
+        )
         detail = (
             (
                 f"{refused} order(s) refused as {SHORTS_DISABLED}; a strategy whose "
@@ -210,7 +248,7 @@ class RefusalAlerter:
                 f"no trades are not evidence of an efficient market"
             )
             if reason == SHORTS_DISABLED
-            else f"{refused} order(s) refused as {reason}"
+            else f"{refused} {self._noun} {self._verb} as {reason}{self._detail_note}"
         )
         return AlertCondition(
             key=AlertConditionKey(kind=event, site=self._site),

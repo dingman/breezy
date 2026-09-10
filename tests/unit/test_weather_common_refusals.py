@@ -187,6 +187,76 @@ def test_zero_refusals_of_any_kind_does_not_alert() -> None:
 
 
 # ---------------------------------------------------------------------------
+# RefusalAlerter -- injectable vocabulary (current_rung_hold WAIT-state
+# diagnostics reuse this SAME class/mechanism over a counter that is NOT a
+# refusal, so the event name and detail wording must not assert an order was
+# refused when none was ever formed).
+# ---------------------------------------------------------------------------
+
+
+def test_the_default_vocabulary_is_byte_identical_to_the_original_refusal_wording() -> None:
+    """Every existing caller (five sibling strategies) constructs
+    `RefusalAlerter` with no vocabulary arguments -- this pins that their
+    event name and detail text are UNCHANGED by the vocabulary parameters'
+    addition.
+    """
+    counter = RefusalCounter()
+    sink = _RecordingSink()
+    alerter = RefusalAlerter(counter, site=SITE, sink=sink)
+
+    counter.record("stale_observation")
+    alerter.report(now_ns=1_000)
+
+    payload = sink.payloads[0]
+    assert payload.event == "STALE_OBSERVATION_REFUSALS"
+    assert payload.detail == "1 order(s) refused as stale_observation"
+
+
+def test_a_custom_vocabulary_changes_the_event_and_detail_not_the_count() -> None:
+    counter = RefusalCounter()
+    sink = _RecordingSink()
+    alerter = RefusalAlerter(
+        counter,
+        site=SITE,
+        sink=sink,
+        event_suffix="WAIT",
+        noun="tick(s)",
+        verb="observed",
+        detail_note=" (pre-decision WAIT, not a refusal)",
+    )
+
+    counter.record("in_window_not_executable")
+    emitted = alerter.report(now_ns=1_000)
+
+    assert emitted == 1
+    payload = sink.payloads[0]
+    assert payload.event == "IN_WINDOW_NOT_EXECUTABLE_WAIT"
+    assert payload.detail == (
+        "1 tick(s) observed as in_window_not_executable (pre-decision WAIT, not a refusal)"
+    )
+    assert "refused" not in payload.detail
+
+
+def test_a_custom_vocabulary_does_not_touch_the_shorts_disabled_special_case() -> None:
+    """`SHORTS_DISABLED`'s dedicated event/wording is a structural-disablement
+    finding, not a generic refusal -- a caller injecting its own vocabulary
+    for OTHER reasons must not accidentally reword this one.
+    """
+    counter = RefusalCounter()
+    sink = _RecordingSink()
+    alerter = RefusalAlerter(
+        counter, site=SITE, sink=sink, event_suffix="WAIT", noun="tick(s)", verb="observed",
+    )
+
+    counter.record(SHORTS_DISABLED)
+    alerter.report(now_ns=1_000)
+
+    payload = sink.payloads[0]
+    assert payload.event == SHORTS_DISABLED_EVENT
+    assert "no trades" in payload.detail
+
+
+# ---------------------------------------------------------------------------
 # BL-24 Seam B section 5 / amendment A4: the decision-layer observation refusal
 # ---------------------------------------------------------------------------
 

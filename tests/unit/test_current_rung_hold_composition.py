@@ -37,6 +37,7 @@ from breezy.strategy.current_rung_hold.composition import (
 )
 from breezy.strategy.current_rung_hold.config import SUPPORTED_STATIONS
 from breezy.strategy.current_rung_hold.strategy import CurrentRungHoldStrategy
+from breezy.strategy.weather_common.refusals import RefusalCounter
 
 _POLYMARKET_VENUE = Venue("POLYMARKET_US")
 _DAY = dt.date(2026, 9, 4)
@@ -290,21 +291,36 @@ def test_on_start_subscribes_each_instrument_exactly_once_despite_re_emitted_def
     assert subscribed == [instrument.id]
 
 
-class _FakeRefusals:
-    def __init__(self) -> None:
-        self.counts: dict[str, int] = {}
-
-
 class _FakeStrategy:
     """Duck-typed stand-in: `install_current_rung_hold_refusal_watch` only
-    reads `.refusals`/`.id` and sets `.refusal_alerter` -- it never
-    constructs a real `CurrentRungHoldStrategy`.
+    reads `.refusals`/`.diagnostics`/`.position_events`/`.id` and sets
+    `.refusal_alerter`/`.diagnostics_alerter`/`.position_alerter` -- it
+    never constructs a real `CurrentRungHoldStrategy`. The counters are
+    the REAL `RefusalCounter` (a trivial dict-of-ints value type, no
+    Nautilus coupling) so a test can drive `.record()` and exercise the
+    real `RefusalAlerter`s this function wires, without a real strategy.
     """
 
     def __init__(self, strategy_id: str) -> None:
         self.id = strategy_id
-        self.refusals = _FakeRefusals()
+        self.refusals = RefusalCounter()
         self.refusal_alerter: object | None = None
+        self.diagnostics = RefusalCounter()
+        self.diagnostics_alerter: object | None = None
+        self.position_events = RefusalCounter()
+        self.position_alerter: object | None = None
+
+
+class _RecordingSink:
+    """An `AlertSink` that keeps what it was handed (see
+    `test_weather_common_refusals.py`'s identical helper).
+    """
+
+    def __init__(self) -> None:
+        self.payloads: list[object] = []
+
+    def emit(self, payload: object) -> None:
+        self.payloads.append(payload)
 
 
 class TestInstallRefusalWatch:
@@ -322,6 +338,10 @@ class TestInstallRefusalWatch:
         install_current_rung_hold_refusal_watch(object(), [strategy])  # type: ignore[list-item]
 
         assert strategy.refusal_alerter is not None
+        # Diagnostics get the SAME per-tick wiring, over a separate alerter
+        # bound to `.diagnostics`, never `.refusals`.
+        assert strategy.diagnostics_alerter is not None
+        assert strategy.diagnostics_alerter is not strategy.refusal_alerter
 
     def test_a_missing_msgbus_logs_a_warning_instead_of_failing_silently(
         self, caplog: pytest.LogCaptureFixture,
@@ -345,3 +365,127 @@ class TestInstallRefusalWatch:
         )
         # The primary path still wires despite the missing msgbus.
         assert strategy.refusal_alerter is not None
+
+    def test_the_diagnostics_alerter_uses_wait_vocabulary_not_refusal_vocabulary(
+        self, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Review finding 1: a WAIT-state diagnostic must never be reported
+        in genuine-refusal vocabulary (the previous hardcoded `..._REFUSALS`
+        event / "order(s) refused as ..." detail) -- exercises the REAL
+        production wiring (not a hand-built `RefusalAlerter`), so a drift
+        between this test and `install_current_rung_hold_refusal_watch`'s
+        actual vocabulary would fail here.
+        """
+        from breezy.strategy.current_rung_hold import composition as composition_module
+
+        sink = _RecordingSink()
+        monkeypatch.setattr(composition_module, "resolve_alert_sink", lambda: sink)
+
+        strategy = _FakeStrategy("CurrentRungHoldStrategy-LAX")
+        composition_module.install_current_rung_hold_refusal_watch(
+            object(), [strategy],  # type: ignore[list-item]
+        )
+        assert strategy.diagnostics_alerter is not None
+
+        strategy.diagnostics.record("in_window_not_executable")
+        strategy.diagnostics_alerter.report(now_ns=1_000)  # type: ignore[attr-defined]
+
+        assert len(sink.payloads) == 1
+        payload = sink.payloads[0]
+        assert payload.event == "IN_WINDOW_NOT_EXECUTABLE_WAIT"  # type: ignore[attr-defined]
+        assert "refused" not in payload.detail  # type: ignore[attr-defined]
+
+    def test_the_diagnostics_alerter_renotifies_sooner_than_the_refusal_default(
+        self, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Review finding 2: `AlertState`'s 24h default re-notify is longer
+        than the whole `[12:00,17:00)` LST decision window, so a diagnostic
+        firing once at the start of an afternoon would otherwise never show
+        its count growing again before the process next restarts. The
+        diagnostics alerter must re-notify materially sooner than the
+        refusal alerters' UNCHANGED 24h default -- proved by advancing past
+        the diagnostics cadence but staying well under 24h.
+        """
+        from breezy.strategy.current_rung_hold import composition as composition_module
+
+        sink = _RecordingSink()
+        monkeypatch.setattr(composition_module, "resolve_alert_sink", lambda: sink)
+
+        strategy = _FakeStrategy("CurrentRungHoldStrategy-LAX")
+        composition_module.install_current_rung_hold_refusal_watch(
+            object(), [strategy],  # type: ignore[list-item]
+        )
+        assert strategy.refusal_alerter is not None
+        assert strategy.diagnostics_alerter is not None
+
+        strategy.refusals.record("outside_decision_window")
+        strategy.diagnostics.record("in_window_not_executable")
+        strategy.refusal_alerter.report(now_ns=0)  # type: ignore[attr-defined]
+        strategy.diagnostics_alerter.report(now_ns=0)  # type: ignore[attr-defined]
+        assert len(sink.payloads) == 2  # both false->true transitions fire
+        sink.payloads.clear()
+
+        # 20 minutes later: inside a covered afternoon's decision window,
+        # well under the refusal path's 24h re-notify, but past a
+        # materially shorter diagnostics-only cadence.
+        twenty_minutes_ns = 20 * 60 * 1_000_000_000
+        strategy.refusals.record("outside_decision_window")
+        strategy.diagnostics.record("in_window_not_executable")
+        strategy.refusal_alerter.report(now_ns=twenty_minutes_ns)  # type: ignore[attr-defined]
+        strategy.diagnostics_alerter.report(now_ns=twenty_minutes_ns)  # type: ignore[attr-defined]
+
+        assert len(sink.payloads) == 1
+        assert sink.payloads[0].event == "IN_WINDOW_NOT_EXECUTABLE_WAIT"  # type: ignore[attr-defined]
+
+    def test_a_strategy_is_wired_with_a_position_alerter(
+        self,
+    ) -> None:
+        from breezy.strategy.current_rung_hold.composition import (
+            install_current_rung_hold_refusal_watch,
+        )
+
+        strategy = _FakeStrategy("CurrentRungHoldStrategy-LAX")
+        install_current_rung_hold_refusal_watch(object(), [strategy])  # type: ignore[list-item]
+
+        assert strategy.position_alerter is not None
+        assert strategy.position_alerter is not strategy.refusal_alerter
+        assert strategy.position_alerter is not strategy.diagnostics_alerter
+
+    def test_the_position_alerter_uses_log_only_vocabulary_not_refusal_vocabulary(
+        self, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        from breezy.strategy.current_rung_hold import composition as composition_module
+
+        sink = _RecordingSink()
+        monkeypatch.setattr(composition_module, "resolve_alert_sink", lambda: sink)
+
+        strategy = _FakeStrategy("CurrentRungHoldStrategy-LAX")
+        composition_module.install_current_rung_hold_refusal_watch(
+            object(), [strategy],  # type: ignore[list-item]
+        )
+        assert strategy.position_alerter is not None
+
+        strategy.position_events.record("position_opened")
+        strategy.position_alerter.report(now_ns=1_000)  # type: ignore[attr-defined]
+
+        assert len(sink.payloads) == 1
+        payload = sink.payloads[0]
+        assert payload.event == "POSITION_OPENED_POSITION"  # type: ignore[attr-defined]
+        assert "refused" not in payload.detail  # type: ignore[attr-defined]
+        assert "never an order" in payload.detail  # type: ignore[attr-defined]
+
+    def test_the_three_alerters_are_wired_from_one_binding_table(
+        self,
+    ) -> None:
+        """Intra-module: refusal / diagnostics / position share one binding
+        table rather than three copy-pasted comprehensions.
+        """
+        from breezy.strategy.current_rung_hold.composition import _ALERTER_BINDINGS
+
+        pairs = {(binding.counter_attr, binding.alerter_attr) for binding in _ALERTER_BINDINGS}
+        assert pairs == {
+            ("refusals", "refusal_alerter"),
+            ("diagnostics", "diagnostics_alerter"),
+            ("position_events", "position_alerter"),
+        }
+        assert len(_ALERTER_BINDINGS) == 3

@@ -20,7 +20,7 @@ import time
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from contextlib import AbstractContextManager, contextmanager
 from pathlib import Path
-from typing import Final
+from typing import Final, NamedTuple
 
 from nautilus_trader.model.identifiers import InstrumentId
 from nautilus_trader.persistence.catalog.parquet import ParquetDataCatalog
@@ -33,7 +33,7 @@ from breezy.domain.weather_bucket_facts import (
     read_weather_bucket_facts,
 )
 from breezy.runtime.component_health_watch import COMPONENT_STATE_TOPIC
-from breezy.runtime.health import resolve_alert_sink
+from breezy.runtime.health import AlertState, resolve_alert_sink
 from breezy.runtime.order_enablement import OrderSubmissionPermit
 from breezy.runtime.settings import SettingsError
 from breezy.runtime.submit_intent import SubmitIntentLatch
@@ -54,6 +54,67 @@ __all__ = [
 logger = logging.getLogger(__name__)
 
 _COMPONENT_ID_PREFIX: Final[str] = "CurrentRungHoldStrategy"
+
+#: Review finding 1: a WAIT-state diagnostic is not a refusal -- passed to
+#: `RefusalAlerter`'s injectable vocabulary so its event name/detail never
+#: assert an order was refused when none was ever formed. Never applied to
+#: `strategy.refusals`' alerter, which keeps the unmodified refusal default.
+_DIAGNOSTICS_VOCABULARY: Final[dict[str, str]] = {
+    "event_suffix": "WAIT",
+    "noun": "tick(s)",
+    "verb": "observed",
+    "detail_note": " (pre-decision WAIT, not a refusal)",
+}
+
+#: Review finding 2: `AlertState.DEFAULT_RENOTIFY_AFTER_NS` (24h) is longer
+#: than the whole `[12:00,17:00)` LST decision window (~5h), so a diagnostic
+#: alerted through the unmodified default would fire ONCE per process
+#: lifetime -- never showing its count grow across a covered afternoon. The
+#: refusal alerters keep the 24h default unchanged; diagnostics AND
+#: position alerters share this shorter, intra-session cadence.
+_DIAGNOSTICS_RENOTIFY_AFTER_NS: Final[int] = 15 * 60 * 1_000_000_000  # 15 minutes
+
+#: O-1 log-only position observability. Never applied to `strategy.refusals`
+#: or `strategy.diagnostics`. Event names land in the `..._POSITION` family
+#: so a fill cannot be misread as a refusal.
+_POSITION_VOCABULARY: Final[dict[str, str]] = {
+    "event_suffix": "POSITION",
+    "noun": "event(s)",
+    "verb": "observed",
+    "detail_note": " (log-only, never an order)",
+}
+
+
+class _AlerterBinding(NamedTuple):
+    """One (counter, alerter-attr, vocabulary, renotify) row.
+
+    Intra-module only: the three current_rung_hold alerters share this
+    table so composition wiring and the strategy reporter stay in lockstep.
+    Sibling strategy files keep their own copy-paste; that is a different
+    axis and is left alone.
+    """
+
+    counter_attr: str
+    alerter_attr: str
+    vocabulary: dict[str, str]
+    renotify_after_ns: int | None
+
+
+_ALERTER_BINDINGS: Final[tuple[_AlerterBinding, ...]] = (
+    _AlerterBinding("refusals", "refusal_alerter", {}, None),
+    _AlerterBinding(
+        "diagnostics",
+        "diagnostics_alerter",
+        _DIAGNOSTICS_VOCABULARY,
+        _DIAGNOSTICS_RENOTIFY_AFTER_NS,
+    ),
+    _AlerterBinding(
+        "position_events",
+        "position_alerter",
+        _POSITION_VOCABULARY,
+        _DIAGNOSTICS_RENOTIFY_AFTER_NS,
+    ),
+)
 
 
 class NoTradableInstrumentsError(SettingsError):
@@ -249,7 +310,8 @@ def build_current_rung_hold_strategies(
 def install_current_rung_hold_refusal_watch(
     node: object, strategies: Sequence[CurrentRungHoldStrategy]
 ) -> None:
-    """Wire per-station refusal counts through the existing alert sink.
+    """Wire per-station refusal AND diagnostics counts through the existing
+    alert sink.
 
     PRIMARY path: attaches one ``RefusalAlerter`` per strategy to
     ``strategy.refusal_alerter``, so ``on_quote_tick`` reports its own
@@ -260,26 +322,49 @@ def install_current_rung_hold_refusal_watch(
     only on a degrade transition, so per-station refusal counters never
     reached an operator during a normal live run.
 
-    SECONDARY path (kept): the same alerters are re-evaluated on
-    ``COMPONENT_STATE_TOPIC`` too, catching a station that degrades without
-    ever seeing a fresh quote. A missing ``msgbus`` used to make this whole
-    function return silently; it now logs a WARNING and still wires the
-    primary (per-tick) path, since that path needs no ``msgbus`` at all.
+    A SECOND ``RefusalAlerter`` per strategy, bound to
+    ``strategy.diagnostics`` instead of ``strategy.refusals``, is wired onto
+    ``strategy.diagnostics_alerter`` the same way -- the three WAIT-state
+    diagnostics (``in_window_not_executable`` / ``in_window_no_running_max_yet``
+    / ``in_window_rung_not_current``) were previously a write-only counter:
+    incremented, never surfaced. Same mechanism, separate instance, so a
+    diagnostic's count-change never raises a refusal alert condition.
+
+    A THIRD ``RefusalAlerter`` per strategy, bound to
+    ``strategy.position_events``, is wired onto ``strategy.position_alerter``
+    the same way -- fill / position-open / ask-mark observations (O-1) are
+    log-only and must never raise a refusal or WAIT condition.
+
+    SECONDARY path (kept): every alerter -- refusal, diagnostics, and
+    position alike -- is re-evaluated on ``COMPONENT_STATE_TOPIC`` too,
+    catching a station that degrades without ever seeing a fresh quote. A
+    missing ``msgbus`` used to make this whole function return silently; it
+    now logs a WARNING and still wires the primary (per-tick) path, since
+    that path needs no ``msgbus`` at all.
     """
     sink = resolve_alert_sink()
-    alerters = tuple(
-        RefusalAlerter(strategy.refusals, site=str(strategy.id), sink=sink)
-        for strategy in strategies
-    )
-    if not alerters:
+    wired: list[RefusalAlerter] = []
+    for binding in _ALERTER_BINDINGS:
+        for strategy in strategies:
+            alerter = RefusalAlerter(
+                getattr(strategy, binding.counter_attr),
+                site=str(strategy.id),
+                sink=sink,
+                state=(
+                    AlertState(renotify_after_ns=binding.renotify_after_ns)
+                    if binding.renotify_after_ns is not None
+                    else None
+                ),
+                **binding.vocabulary,
+            )
+            setattr(strategy, binding.alerter_attr, alerter)
+            wired.append(alerter)
+    if not wired:
         return
-
-    for strategy, alerter in zip(strategies, alerters, strict=True):
-        strategy.refusal_alerter = alerter
 
     def _on_event(_event: object) -> None:
         now_ns = time.time_ns()
-        for alerter in alerters:
+        for alerter in wired:
             try:
                 alerter.report(now_ns=now_ns)
             except Exception:
