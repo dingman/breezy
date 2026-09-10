@@ -273,6 +273,13 @@ def pytest_configure(config: pytest.Config) -> None:
         f"{_REAL_MONEY_ENV_VAR}=1 plus operator approval; deselected by default",
     )
     _install_pyo3_network_client_block()
+    # Pin Nautilus's process-global Rust logger BEFORE any test can construct a
+    # BacktestEngine. The first init wins and cannot be repeated
+    # ($NT/common/component.pyx:1253-1367); a later capfd redirect does not
+    # intercept it. See tests.support.nautilus_log_capture.
+    from tests.support.nautilus_log_capture import install_session_logging
+
+    install_session_logging()
 
 
 class _CanaryOutcomeLike(Protocol):

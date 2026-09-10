@@ -50,9 +50,6 @@ import pytest
 from nautilus_trader.common.component import (
     LiveClock,
     MessageBus,
-    flush_logger,
-    init_logging,
-    is_logging_initialized,
 )
 from nautilus_trader.common.messages import ShutdownSystem
 from nautilus_trader.data.engine import DataEngine
@@ -62,6 +59,7 @@ from breezy.adapters.polymarket_us import feed_fault
 from breezy.adapters.polymarket_us.config import PolymarketUSDataClientConfig
 from breezy.adapters.polymarket_us.data import DISCOVERY_RELOAD_FLOOR_SECS, build_data_client
 from breezy.adapters.polymarket_us.errors import VenuePayloadError, VenueTransportError
+from tests.support.nautilus_log_capture import capture_nautilus_logs
 from tests.unit.test_polymarket_us_data import SLUG, make_instrument
 from tests.unit.test_polymarket_us_quote_tape_gap import ControllableFeed, FakeProvider
 
@@ -278,31 +276,20 @@ def _patch_retry_sleep(
     return sleeps
 
 
-def _capture_client_logs(
-    capfd: pytest.CaptureFixture[str],
-) -> Callable[[], list[str]]:
+def _capture_client_logs() -> Callable[[], list[str]]:
     """Read back what the client's NATIVE Nautilus logger wrote (L-30).
 
     ``Component._log`` is a ``cdef readonly Logger`` and ``Logger.info`` is
     ``cpdef`` -- both reassignment attempts raise ``AttributeError: ...
     read-only`` / ``not writable`` (verified directly against the installed
     ``nautilus-trader==1.231.0``), so a log line cannot be intercepted by
-    monkeypatching the client. The Rust logging subsystem can only be
-    initialized ONCE per process (subsequent calls raise ``RuntimeError``),
-    hence the guard: this lets the real logger write to stdout, which
-    ``capfd`` reads back at the file-descriptor level (the Rust side does not
-    go through Python's ``sys.stdout``, so ``capsys`` would not see it).
+    monkeypatching the client. The Rust logger is process-global, initialized
+    once, and clones its stdout handle at init -- ``capfd`` therefore cannot
+    see later writes. Capture is the session file log installed by
+    ``tests.support.nautilus_log_capture``; an empty read is an error, not a
+    vacuous ``any([])``.
     """
-    if not is_logging_initialized():
-        init_logging()
-    capfd.readouterr()  # discard component-construction READY noise
-
-    def _read() -> list[str]:
-        flush_logger()
-        out, _err = capfd.readouterr()
-        return out.splitlines()
-
-    return _read
+    return capture_nautilus_logs()
 
 
 def test_a_connect_failure_latches_a_fatal_fault_for_the_exit_status(
@@ -349,17 +336,23 @@ def test_a_connect_failure_requests_a_native_system_shutdown(
     assert command.component_id == client.id
 
 
+def test_capture_client_logs_fails_loudly_on_empty_capture() -> None:
+    """A dead capture must not satisfy ``any(...)`` over ``[]``."""
+    read_logs = _capture_client_logs()
+    with pytest.raises(AssertionError, match="vacuous capture"):
+        read_logs()
+
+
 def test_initial_empty_listing_is_retried_then_connects(
     loop: asyncio.AbstractEventLoop,
     monkeypatch: pytest.MonkeyPatch,
-    capfd: pytest.CaptureFixture[str],
 ) -> None:
     """Empty listing is retried twice, then initialize succeeds and connect completes."""
     clock = _OffsetClock()
     provider = _InitializeStubProvider([make_instrument(SLUG)], empty_times=2)
     client = _build_client(loop, provider, empty_discovery_retry_secs=600.0, clock=clock)
     sleeps = _patch_retry_sleep(monkeypatch, clock)
-    read_logs = _capture_client_logs(capfd)
+    read_logs = _capture_client_logs()
 
     loop.run_until_complete(client._connect())
     try:
@@ -381,7 +374,6 @@ def test_initial_empty_listing_is_retried_then_connects(
 def test_initial_empty_listing_exhaustion_latches_and_shuts_down(
     loop: asyncio.AbstractEventLoop,
     monkeypatch: pytest.MonkeyPatch,
-    capfd: pytest.CaptureFixture[str],
 ) -> None:
     """Budget exhaustion latches and shuts down; ``_connect`` does not raise."""
     clock = _OffsetClock()
@@ -390,7 +382,7 @@ def test_initial_empty_listing_exhaustion_latches_and_shuts_down(
     sleeps = _patch_retry_sleep(monkeypatch, clock)
     published: list[Any] = []
     client._msgbus.subscribe(SHUTDOWN_TOPIC, published.append)
-    read_logs = _capture_client_logs(capfd)
+    read_logs = _capture_client_logs()
 
     loop.run_until_complete(client._connect())
 
