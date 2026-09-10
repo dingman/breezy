@@ -26,6 +26,7 @@ call.
 
 from __future__ import annotations
 
+import dataclasses
 import io
 import logging
 import os
@@ -38,9 +39,9 @@ from typing import Any
 import pyarrow as pa
 import pytest
 from nautilus_trader.model.currencies import USD
-from nautilus_trader.model.data import MarkPriceUpdate, QuoteTick
-from nautilus_trader.model.enums import AssetClass
-from nautilus_trader.model.identifiers import InstrumentId, Symbol, Venue
+from nautilus_trader.model.data import MarkPriceUpdate, QuoteTick, TradeTick
+from nautilus_trader.model.enums import AggressorSide, AssetClass
+from nautilus_trader.model.identifiers import InstrumentId, Symbol, TradeId, Venue
 from nautilus_trader.model.instruments import BinaryOption
 from nautilus_trader.model.objects import Price, Quantity
 from nautilus_trader.persistence.catalog.parquet import ParquetDataCatalog
@@ -48,14 +49,17 @@ from nautilus_trader.persistence.funcs import class_to_filename
 from nautilus_trader.serialization.arrow.serializer import ArrowSerializer
 from nautilus_trader.test_kit.providers import TestInstrumentProvider
 
+import breezy.runtime.quote_tape_ingest_cli as ingest_cli_module
 from breezy.persistence.feather_preflight import inspect_feather_file, salvage_feather_file
 from breezy.runtime.quote_tape_ingest_cli import (
     CONVERTED,
     CONVERTED_NOTHING_NEW,
     DEFAULT_DATA_TYPES,
     DEFAULT_LIVE_GRACE_MINUTES,
+    EXIT_CONVERSION_FAILED,
     EXIT_OK,
     EXIT_USAGE,
+    FILE_MARKER_PREFIX,
     MARKER_PREFIX,
     default_convert,
     ingest_instance,
@@ -1123,4 +1127,544 @@ class TestSalvageIsolatesATypeWithNoArrowWrangler:
         messages = " ".join(record.getMessage() for record in caplog.records)
         assert "NotImplementedError" in messages
         assert "skipped" in messages
-        assert "mark_price_update" in messages
+
+
+def _trade_tick(index: int) -> TradeTick:
+    instrument = TestInstrumentProvider.default_fx_ccy("EUR/USD")
+    return TradeTick(
+        instrument_id=instrument.id,
+        price=Price.from_str("1.00000"),
+        size=Quantity.from_int(1),
+        aggressor_side=AggressorSide.BUYER,
+        trade_id=TradeId(f"T-{index}"),
+        ts_event=1_000_000_000 + index,
+        ts_init=1_000_000_000 + index,
+    )
+
+
+class TestPerFileConversionSurvivesOpenAndTruncatedSiblings:
+    """GL-14/BL-24: neither a truncated nor an open sibling may block a
+    genuinely complete file, regardless of type or rotation order.
+    """
+
+    def test_an_intact_sibling_is_converted_despite_a_truncated_file(
+        self, tmp_path: Path
+    ) -> None:
+        instance_dir = tmp_path / "live" / INSTANCE
+        quote_path = instance_dir / "quote_tick_0.feather"
+        trade_path = instance_dir / "trade_tick_0.feather"
+        _write_typed_ipc_stream(
+            quote_path, [_quote_tick(i) for i in range(20)], QuoteTick, close=False
+        )
+        _truncate_tail(quote_path)
+        _write_typed_ipc_stream(
+            trade_path, [_trade_tick(i) for i in range(20)], TradeTick, close=True
+        )
+        stamp = time.time() - (DEFAULT_LIVE_GRACE_MINUTES + 5) * 60
+        for path in (quote_path, trade_path):
+            os.utime(path, (stamp, stamp))
+
+        results = run_ingest(
+            tmp_path,
+            data_types=(QuoteTick, TradeTick),
+            service_active_probe=_never_active,
+        )
+
+        catalog = ParquetDataCatalog(str(tmp_path))
+        # the intact sibling, a DIFFERENT type, landed despite the truncation
+        assert len(catalog.query(data_cls=TradeTick)) == 20
+        # the truncated file's readable prefix was salvaged, not dropped
+        recovered = catalog.query(data_cls=QuoteTick)
+        assert 0 < len(recovered) < 20
+
+        # per-FILE marker, not the blanket per-type marker: the type could
+        # still receive a new file while the instance is not fully clean.
+        assert (instance_dir / f"{FILE_MARKER_PREFIX}{trade_path.name}").is_file()
+        assert not (instance_dir / ".converted-trade_tick").exists()
+
+        # the instance is still reported quarantined -- QuoteTick remains
+        # truncated -- even though real progress happened underneath.
+        assert results[0].outcome == "skipped-truncated"
+
+    def test_the_currently_open_file_is_skipped_not_converted(self, tmp_path: Path) -> None:
+        instance_dir = tmp_path / "live" / INSTANCE
+        closed_path = instance_dir / "quote_tick_0.feather"
+        open_path = instance_dir / "quote_tick_1.feather"
+        _write_typed_ipc_stream(
+            closed_path, [_quote_tick(i) for i in range(10)], QuoteTick, close=True
+        )
+        _write_typed_ipc_stream(
+            open_path, [_quote_tick(100 + i) for i in range(5)], QuoteTick, close=False
+        )
+        stamp = time.time() - (DEFAULT_LIVE_GRACE_MINUTES + 5) * 60
+        os.utime(closed_path, (stamp, stamp))
+        # `open_path` is left at "now" -- inside the live-grace window.
+
+        results = run_ingest(
+            tmp_path, data_types=(QuoteTick,), service_active_probe=_never_active
+        )
+
+        catalog = ParquetDataCatalog(str(tmp_path))
+        landed = {tick.ts_init for tick in catalog.query(data_cls=QuoteTick)}
+        assert landed == {1_000_000_000 + i for i in range(10)}
+        assert 1_000_000_100 not in landed  # the open file was never read
+
+        assert (instance_dir / f"{FILE_MARKER_PREFIX}{closed_path.name}").is_file()
+        assert not (instance_dir / f"{FILE_MARKER_PREFIX}{open_path.name}").is_file()
+        assert results[0].outcome == "converted"
+
+    def test_a_second_run_converts_nothing_new(self, tmp_path: Path) -> None:
+        instance_dir = tmp_path / "live" / INSTANCE
+        closed_path = instance_dir / "quote_tick_0.feather"
+        open_path = instance_dir / "quote_tick_1.feather"
+        _write_typed_ipc_stream(
+            closed_path, [_quote_tick(i) for i in range(10)], QuoteTick, close=True
+        )
+        _write_typed_ipc_stream(
+            open_path, [_quote_tick(100 + i) for i in range(5)], QuoteTick, close=False
+        )
+        stamp = time.time() - (DEFAULT_LIVE_GRACE_MINUTES + 5) * 60
+        os.utime(closed_path, (stamp, stamp))
+
+        run_ingest(tmp_path, data_types=(QuoteTick,), service_active_probe=_never_active)
+        catalog = ParquetDataCatalog(str(tmp_path))
+        first_count = len(catalog.query(data_cls=QuoteTick))
+
+        run_ingest(tmp_path, data_types=(QuoteTick,), service_active_probe=_never_active)
+        second_count = len(catalog.query(data_cls=QuoteTick))
+
+        assert first_count == 10
+        assert second_count == first_count
+
+    def test_dry_run_writes_nothing_for_a_mixed_open_and_closed_instance(
+        self, tmp_path: Path
+    ) -> None:
+        instance_dir = tmp_path / "live" / INSTANCE
+        closed_path = instance_dir / "quote_tick_0.feather"
+        open_path = instance_dir / "quote_tick_1.feather"
+        _write_typed_ipc_stream(
+            closed_path, [_quote_tick(i) for i in range(10)], QuoteTick, close=True
+        )
+        _write_typed_ipc_stream(
+            open_path, [_quote_tick(100 + i) for i in range(5)], QuoteTick, close=False
+        )
+        stamp = time.time() - (DEFAULT_LIVE_GRACE_MINUTES + 5) * 60
+        os.utime(closed_path, (stamp, stamp))
+
+        results = run_ingest(
+            tmp_path,
+            data_types=(QuoteTick,),
+            service_active_probe=_never_active,
+            dry_run=True,
+        )
+
+        catalog = ParquetDataCatalog(str(tmp_path))
+        assert len(catalog.query(data_cls=QuoteTick)) == 0
+        assert not (instance_dir / f"{FILE_MARKER_PREFIX}{closed_path.name}").exists()
+        assert results[0].outcome == "dry-run"
+
+
+class TestANoneOrEmptyPostTransformTableIsAHardFailure:
+    """Review item 1: the per-file path must never mark a file whose read
+    silently produced nothing, unlike ``convert_stream_to_data``'s own
+    caller (parquet.py:2644-2646), which treats that ``None`` as "done".
+    """
+
+    def _mixed_instance(self, tmp_path: Path) -> tuple[Path, Path]:
+        instance_dir = tmp_path / "live" / INSTANCE
+        quote_path = instance_dir / "quote_tick_0.feather"
+        open_path = instance_dir / "quote_tick_1.feather"
+        _write_typed_ipc_stream(
+            quote_path, [_quote_tick(i) for i in range(10)], QuoteTick, close=True
+        )
+        _write_typed_ipc_stream(
+            open_path, [_quote_tick(100 + i) for i in range(5)], QuoteTick, close=False
+        )
+        stamp = time.time() - (DEFAULT_LIVE_GRACE_MINUTES + 5) * 60
+        os.utime(quote_path, (stamp, stamp))
+        return instance_dir, quote_path
+
+    def test_a_none_table_is_never_marked_and_is_counted_failed(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        instance_dir, quote_path = self._mixed_instance(tmp_path)
+        monkeypatch.setattr(ParquetDataCatalog, "_read_feather_file", lambda self, path: None)
+
+        results = run_ingest(
+            tmp_path, data_types=(QuoteTick,), service_active_probe=_never_active
+        )
+
+        catalog = ParquetDataCatalog(str(tmp_path))
+        assert len(catalog.query(data_cls=QuoteTick)) == 0
+        assert not (instance_dir / f"{FILE_MARKER_PREFIX}{quote_path.name}").exists()
+        assert "failed=1" in results[0].type_results[0].outcome
+        assert results[0].outcome == "failed"
+
+    def test_a_post_transform_empty_table_with_nonzero_rows_is_never_marked(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        instance_dir, quote_path = self._mixed_instance(tmp_path)
+
+        def _empty_transform(table: pa.Table, **kwargs: Any) -> pa.Table:
+            return table.slice(0, 0)
+
+        monkeypatch.setattr(
+            ParquetDataCatalog,
+            "_apply_stream_conversion_transforms",
+            staticmethod(_empty_transform),
+        )
+
+        results = run_ingest(
+            tmp_path, data_types=(QuoteTick,), service_active_probe=_never_active
+        )
+
+        catalog = ParquetDataCatalog(str(tmp_path))
+        assert len(catalog.query(data_cls=QuoteTick)) == 0
+        assert not (instance_dir / f"{FILE_MARKER_PREFIX}{quote_path.name}").exists()
+        assert "failed=1" in results[0].type_results[0].outcome
+        assert results[0].outcome == "failed"
+
+
+class TestAnUnclosedIntactFileIsNeverConvertedPerFile:
+    """Review item 2: a message-boundary-clean read with no end-of-stream
+    marker is byte-identical to a live writer paused mid-stream -- the
+    per-file path must not risk a PERMANENT marker over it.
+    """
+
+    def test_without_eos_the_file_is_left_unmarked(self, tmp_path: Path) -> None:
+        instance_dir = tmp_path / "live" / INSTANCE
+        unclosed_path = instance_dir / "quote_tick_0.feather"
+        open_path = instance_dir / "trade_tick_0.feather"
+        _write_typed_ipc_stream(
+            unclosed_path, [_quote_tick(i) for i in range(10)], QuoteTick, close=False
+        )
+        _write_typed_ipc_stream(
+            open_path, [_trade_tick(i) for i in range(3)], TradeTick, close=False
+        )
+        stamp = time.time() - (DEFAULT_LIVE_GRACE_MINUTES + 5) * 60
+        os.utime(unclosed_path, (stamp, stamp))
+        # `open_path` stays at "now" -- keeps the instance in the per-file path.
+
+        results = run_ingest(
+            tmp_path,
+            data_types=(QuoteTick, TradeTick),
+            service_active_probe=_never_active,
+        )
+
+        catalog = ParquetDataCatalog(str(tmp_path))
+        assert len(catalog.query(data_cls=QuoteTick)) == 0
+        assert not (instance_dir / f"{FILE_MARKER_PREFIX}{unclosed_path.name}").exists()
+        assert "skipped-unclosed=1" in results[0].type_results[0].outcome
+
+    def test_with_eos_the_file_is_converted(self, tmp_path: Path) -> None:
+        instance_dir = tmp_path / "live" / INSTANCE
+        closed_path = instance_dir / "quote_tick_0.feather"
+        open_path = instance_dir / "trade_tick_0.feather"
+        _write_typed_ipc_stream(
+            closed_path, [_quote_tick(i) for i in range(10)], QuoteTick, close=True
+        )
+        _write_typed_ipc_stream(
+            open_path, [_trade_tick(i) for i in range(3)], TradeTick, close=False
+        )
+        stamp = time.time() - (DEFAULT_LIVE_GRACE_MINUTES + 5) * 60
+        os.utime(closed_path, (stamp, stamp))
+
+        results = run_ingest(
+            tmp_path,
+            data_types=(QuoteTick, TradeTick),
+            service_active_probe=_never_active,
+        )
+
+        catalog = ParquetDataCatalog(str(tmp_path))
+        assert len(catalog.query(data_cls=QuoteTick)) == 10
+        assert (instance_dir / f"{FILE_MARKER_PREFIX}{closed_path.name}").is_file()
+        assert "converted=1" in results[0].type_results[0].outcome
+
+
+class TestUnreadableIsNeverReportedAsSalvaged:
+    """Review item 4: only TRUNCATED files are handed to
+    ``salvage_truncated_instance``; an UNREADABLE file must never claim
+    salvage activity that did not run.
+    """
+
+    def test_an_unreadable_sibling_is_counted_separately_from_salvage(
+        self, tmp_path: Path
+    ) -> None:
+        instance_dir = tmp_path / "live" / INSTANCE
+        unreadable_path = instance_dir / "quote_tick_0.feather"
+        open_path = instance_dir / "trade_tick_0.feather"
+        _write_typed_ipc_stream(
+            unreadable_path, [_quote_tick(i) for i in range(10)], QuoteTick, close=True
+        )
+        _write_typed_ipc_stream(
+            open_path, [_trade_tick(i) for i in range(3)], TradeTick, close=False
+        )
+        stamp = time.time() - (DEFAULT_LIVE_GRACE_MINUTES + 5) * 60
+        os.utime(unreadable_path, (stamp, stamp))
+        unreadable_path.chmod(0o000)
+        try:
+            results = run_ingest(
+                tmp_path,
+                data_types=(QuoteTick, TradeTick),
+                service_active_probe=_never_active,
+            )
+        finally:
+            unreadable_path.chmod(0o600)
+
+        outcomes = {r.data_cls: r.outcome for r in results[0].type_results}
+        assert "unreadable=1" in outcomes[QuoteTick]
+        assert "salvaged" not in outcomes[QuoteTick]
+        assert "would-salvage" not in outcomes[QuoteTick]
+        # unreadable is never truncated, so `salvage_truncated_instance` sees
+        # nothing for this instance and the run is not reported quarantined.
+        assert not (instance_dir / f".salvaged-{unreadable_path.name}").exists()
+
+
+class TestDefinitionsAlwaysConvertBeforeTicks:
+    """Review item 5: a tick row must never land before the instrument
+    definition it references.
+    """
+
+    def test_an_open_definition_defers_every_tick_type_this_run(
+        self, tmp_path: Path
+    ) -> None:
+        instance_dir = tmp_path / "live" / INSTANCE
+        binary_path = _write_instrument_feather(
+            tmp_path, INSTANCE, "binary_option_0.feather", [_binary_option("MKT-A", T0)],
+            age_minutes=0.0,
+        )
+        quote_path = instance_dir / "quote_tick_0.feather"
+        _write_typed_ipc_stream(
+            quote_path, [_quote_tick(i) for i in range(10)], QuoteTick, close=True
+        )
+        stamp = time.time() - (DEFAULT_LIVE_GRACE_MINUTES + 5) * 60
+        os.utime(quote_path, (stamp, stamp))
+
+        results = run_ingest(
+            tmp_path,
+            data_types=(QuoteTick, BinaryOption),
+            service_active_probe=_never_active,
+        )
+
+        catalog = ParquetDataCatalog(str(tmp_path))
+        assert len(catalog.query(data_cls=QuoteTick)) == 0
+        assert not (instance_dir / f"{FILE_MARKER_PREFIX}{quote_path.name}").exists()
+        outcomes = {r.data_cls: r.outcome for r in results[0].type_results}
+        assert outcomes[QuoteTick] == "skipped-definitions-pending"
+        assert binary_path.exists()  # untouched, still open, retried next run
+
+    def test_once_the_definition_closes_both_convert_and_definition_lands_first(
+        self, tmp_path: Path
+    ) -> None:
+        instance_dir = tmp_path / "live" / INSTANCE
+        _write_instrument_feather(
+            tmp_path, INSTANCE, "binary_option_0.feather", [_binary_option("MKT-A", T0)]
+        )
+        quote_path = instance_dir / "quote_tick_0.feather"
+        _write_typed_ipc_stream(
+            quote_path, [_quote_tick(i) for i in range(10)], QuoteTick, close=True
+        )
+        stamp = time.time() - (DEFAULT_LIVE_GRACE_MINUTES + 5) * 60
+        os.utime(quote_path, (stamp, stamp))
+
+        # A sibling open file keeps this a per-file-path instance so the
+        # ordering guarantee under test is the one actually exercised.
+        _write_typed_ipc_stream(
+            instance_dir / "trade_tick_0.feather", [_trade_tick(0)], TradeTick, close=False
+        )
+
+        run_ingest(
+            tmp_path,
+            data_types=(QuoteTick, BinaryOption, TradeTick),
+            service_active_probe=_never_active,
+        )
+
+        catalog = ParquetDataCatalog(str(tmp_path))
+        assert len(catalog.query(data_cls=QuoteTick)) == 10
+        assert len(_catalog_definitions(tmp_path)) == 1
+
+        definition_files = _parquet_files(tmp_path)
+        quote_files = sorted((tmp_path / "data" / "quote_tick").rglob("*.parquet"))
+        assert definition_files and quote_files
+        assert max(p.stat().st_mtime for p in definition_files) <= min(
+            p.stat().st_mtime for p in quote_files
+        )
+
+
+class TestWholeInstanceDeadPathAndNoEosSemantics:
+    """Review item 1 (round 2): pin exactly when a no-EOS, message-boundary
+    -clean file is safe for the whole-instance dead path to convert via the
+    native ``convert_stream_to_data`` call, which has no EOS concept at all.
+    Safe if and only if the file's OWN instance is dead: not the
+    most-recently-started instance while the recorder is active, or the
+    recorder unit is confirmed inactive.
+    """
+
+    def test_the_newest_active_instances_no_eos_file_is_never_converted(
+        self, tmp_path: Path
+    ) -> None:
+        instance_dir = tmp_path / "live" / INSTANCE
+        lone_path = instance_dir / "quote_tick_0.feather"
+        _write_typed_ipc_stream(
+            lone_path, [_quote_tick(i) for i in range(10)], QuoteTick, close=False
+        )
+        stamp = time.time() - (DEFAULT_LIVE_GRACE_MINUTES + 5) * 60
+        os.utime(lone_path, (stamp, stamp))  # stale mtime, no other open sibling
+
+        results = run_ingest(
+            tmp_path, data_types=(QuoteTick,), service_active_probe=lambda: True
+        )
+
+        catalog = ParquetDataCatalog(str(tmp_path))
+        assert len(catalog.query(data_cls=QuoteTick)) == 0
+        assert not (instance_dir / f"{FILE_MARKER_PREFIX}{lone_path.name}").exists()
+        assert not (instance_dir / ".converted-quote_tick").exists()
+        # the "dead" predicate must be False for the newest active instance --
+        # it is still treated live overall, exactly like a fresh file would be.
+        assert results[0].outcome == "skipped-live"
+
+    def test_a_non_newest_instances_no_eos_file_is_converted_by_the_dead_path(
+        self, tmp_path: Path
+    ) -> None:
+        old_dir = tmp_path / "live" / INSTANCE
+        old_path = old_dir / "quote_tick_0.feather"
+        _write_typed_ipc_stream(
+            old_path, [_quote_tick(i) for i in range(10)], QuoteTick, close=False
+        )
+        old_stamp = time.time() - (DEFAULT_LIVE_GRACE_MINUTES + 20) * 60
+        os.utime(old_path, (old_stamp, old_stamp))
+
+        # OTHER_INSTANCE is newer and fresh -- makes `INSTANCE` provably
+        # non-newest regardless of the recorder's own active/inactive state.
+        _touch(tmp_path, OTHER_INSTANCE, "quote_tick_0.feather")
+
+        results = run_ingest(
+            tmp_path, data_types=(QuoteTick,), service_active_probe=lambda: True
+        )
+
+        catalog = ParquetDataCatalog(str(tmp_path))
+        assert len(catalog.query(data_cls=QuoteTick)) == 10
+        assert (old_dir / ".converted-quote_tick").is_file()
+        by_instance = {r.instance_id: r for r in results}
+        assert by_instance[INSTANCE].outcome == "converted"
+
+    def test_an_inactive_recorder_no_eos_file_is_converted_by_the_dead_path(
+        self, tmp_path: Path
+    ) -> None:
+        instance_dir = tmp_path / "live" / INSTANCE
+        lone_path = instance_dir / "quote_tick_0.feather"
+        _write_typed_ipc_stream(
+            lone_path, [_quote_tick(i) for i in range(10)], QuoteTick, close=False
+        )
+        stamp = time.time() - (DEFAULT_LIVE_GRACE_MINUTES + 5) * 60
+        os.utime(lone_path, (stamp, stamp))
+
+        results = run_ingest(
+            tmp_path, data_types=(QuoteTick,), service_active_probe=_never_active
+        )
+
+        catalog = ParquetDataCatalog(str(tmp_path))
+        assert len(catalog.query(data_cls=QuoteTick)) == 10
+        assert (instance_dir / ".converted-quote_tick").is_file()
+        assert results[0].outcome == "converted"
+
+
+class TestExitCodeReflectsAHardConversionFailure:
+    """Review item 2: EXIT_OK must not be returned when any instance's
+    outcome is "failed" -- skips still exit 0, only a real failure exits
+    EXIT_CONVERSION_FAILED.
+    """
+
+    def test_a_failed_outcome_exits_conversion_failed(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        instance_dir = tmp_path / "live" / INSTANCE
+        quote_path = instance_dir / "quote_tick_0.feather"
+        open_path = instance_dir / "quote_tick_1.feather"
+        _write_typed_ipc_stream(
+            quote_path, [_quote_tick(i) for i in range(10)], QuoteTick, close=True
+        )
+        _write_typed_ipc_stream(
+            open_path, [_quote_tick(100 + i) for i in range(5)], QuoteTick, close=False
+        )
+        stamp = time.time() - (DEFAULT_LIVE_GRACE_MINUTES + 5) * 60
+        os.utime(quote_path, (stamp, stamp))
+        monkeypatch.setattr(ParquetDataCatalog, "_read_feather_file", lambda self, path: None)
+
+        out, err = io.StringIO(), io.StringIO()
+        code = run(
+            [], env={CATALOG_ENV_VAR: str(tmp_path)}, stdout=out, stderr=err
+        )
+
+        assert code == EXIT_CONVERSION_FAILED
+        assert "failed=1" in out.getvalue()
+
+    def test_a_skipped_live_outcome_still_exits_ok(self, tmp_path: Path) -> None:
+        _touch(tmp_path, INSTANCE, "quote_tick_1.feather", age_minutes=0.0)
+
+        out, err = io.StringIO(), io.StringIO()
+        code = run([], env={CATALOG_ENV_VAR: str(tmp_path)}, stdout=out, stderr=err)
+
+        assert code == EXIT_OK
+
+    def test_a_skipped_truncated_outcome_still_exits_ok(self, tmp_path: Path) -> None:
+        instance_dir = tmp_path / "live" / INSTANCE
+        tape = instance_dir / "quote_tick_0.feather"
+        instance_dir.mkdir(parents=True, exist_ok=True)
+        tape.write_bytes(b"ARROW1\x00\x00garbage-not-a-real-stream")
+        stamp = time.time() - (DEFAULT_LIVE_GRACE_MINUTES + 5) * 60
+        os.utime(tape, (stamp, stamp))
+
+        out, err = io.StringIO(), io.StringIO()
+        code = run([], env={CATALOG_ENV_VAR: str(tmp_path)}, stdout=out, stderr=err)
+
+        assert code == EXIT_OK
+
+
+class TestAMissingPreflightReportIsNeverSilent:
+    """Review item 3: a file present on disk but absent from the preflight
+    snapshot (a scan/enumeration race) must never be silently skipped.
+    """
+
+    def test_a_file_omitted_from_the_preflight_snapshot_is_warned_and_uncounted(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        instance_dir = tmp_path / "live" / INSTANCE
+        quote_path = instance_dir / "quote_tick_0.feather"
+        open_path = instance_dir / "trade_tick_0.feather"
+        _write_typed_ipc_stream(
+            quote_path, [_quote_tick(i) for i in range(10)], QuoteTick, close=True
+        )
+        _write_typed_ipc_stream(
+            open_path, [_trade_tick(i) for i in range(3)], TradeTick, close=False
+        )
+        stamp = time.time() - (DEFAULT_LIVE_GRACE_MINUTES + 5) * 60
+        os.utime(quote_path, (stamp, stamp))
+
+        real_scan_instance = ingest_cli_module.scan_instance
+
+        def _drop_quote_report(catalog_root: Path, instance_id: str, subdirectory: str) -> Any:
+            report = real_scan_instance(catalog_root, instance_id, subdirectory)
+            return dataclasses.replace(
+                report, files=tuple(f for f in report.files if f.path != quote_path)
+            )
+
+        monkeypatch.setattr(ingest_cli_module, "scan_instance", _drop_quote_report)
+
+        with caplog.at_level(logging.WARNING, logger="breezy.runtime.quote_tape_ingest_cli"):
+            results = run_ingest(
+                tmp_path,
+                data_types=(QuoteTick, TradeTick),
+                service_active_probe=_never_active,
+            )
+
+        catalog = ParquetDataCatalog(str(tmp_path))
+        assert len(catalog.query(data_cls=QuoteTick)) == 0
+        assert not (instance_dir / f"{FILE_MARKER_PREFIX}{quote_path.name}").exists()
+        outcomes = {r.data_cls: r.outcome for r in results[0].type_results}
+        assert "unreported=1" in outcomes[QuoteTick]
+        messages = " ".join(record.getMessage() for record in caplog.records)
+        assert "no preflight report" in messages

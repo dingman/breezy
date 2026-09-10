@@ -10,6 +10,7 @@ review item 9: "The hour-clash test parses `OnCalendar=` lines of every
 from __future__ import annotations
 
 import re
+from collections.abc import Sequence
 from pathlib import Path
 
 _REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -19,6 +20,49 @@ _TIMERS_DIR = _REPO_ROOT / "deploy" / "systemd"
 #: tolerates a comma-separated hour list (`00,06,12,18:15:00`) by capturing
 #: the whole hour field and splitting it separately.
 _ON_CALENDAR_RE = re.compile(r"^OnCalendar=.*\s([\d,]+):(\d{2}):\d{2}\s+UTC\s*$")
+
+#: A sub-hourly step timer (`OnCalendar=*:0/15`, GL-14/BL-24's frequent
+#: ingest timer).
+_PERIODIC_RE = re.compile(r"^OnCalendar=\*:0/\d+\s*$")
+
+_UNIT_RE = re.compile(r"^Unit=(.+)$")
+
+
+def _timer_unit(timer_path: Path) -> str | None:
+    """The `Unit=` target this timer fires, or `None` if the file has none
+    (systemd would then default it to the timer's own basename).
+    """
+    for line in timer_path.read_text().splitlines():
+        match = _UNIT_RE.match(line.strip())
+        if match is not None:
+            return match.group(1).strip()
+    return None
+
+
+def _is_periodic(timer_path: Path, all_timers: Sequence[Path]) -> bool:
+    """Exempt from the HH:MM one-shot-per-day collision model below ONLY
+    when this is a sub-hourly step timer (`OnCalendar=*:0/N`) that shares
+    its `Unit=` target with ANOTHER timer already in the set -- i.e. it
+    augments an existing timer's coverage of the SAME service, the way
+    GL-14/BL-24's frequent ingest timer re-triggers the pre-existing
+    6-hourly ingest timer's service, rather than contending with a
+    DIFFERENT service for a resource at some shared clock tick.
+
+    A periodic timer with no such sibling is NOT exempt: it stays in the
+    scan below, where its `OnCalendar=*:0/N` syntax cannot be matched by
+    `_ON_CALENDAR_RE` and correctly fails the "has no parseable OnCalendar="
+    assertion -- a periodic timer introduced without an existing owner of
+    its target service must be reviewed, not silently waved through.
+    """
+    lines = timer_path.read_text().splitlines()
+    if not any(_PERIODIC_RE.match(line.strip()) for line in lines):
+        return False
+    unit = _timer_unit(timer_path)
+    if unit is None:
+        return False
+    return any(
+        other != timer_path and _timer_unit(other) == unit for other in all_timers
+    )
 
 
 def _clock_ticks(timer_path: Path) -> tuple[tuple[str, str], ...]:
@@ -46,6 +90,8 @@ def test_no_two_timers_share_an_hour_minute_tick() -> None:
     owner_by_tick: dict[tuple[str, str], str] = {}
     collisions: list[str] = []
     for timer_path in timer_files:
+        if _is_periodic(timer_path, timer_files):
+            continue
         ticks = _clock_ticks(timer_path)
         assert ticks, f"{timer_path.name} has no parseable OnCalendar= line"
         for tick in ticks:
@@ -84,6 +130,25 @@ def test_1415_utc_is_owned_by_exactly_one_timer() -> None:
         if ("14", "15") in _clock_ticks(timer_path)
     ]
     assert owners == ["breezy-score-live-trials.timer"]
+
+
+def test_a_periodic_timer_is_exempt_only_when_it_shares_a_unit_with_a_sibling(
+    tmp_path: Path,
+) -> None:
+    """Review item 6: a periodic timer must not get a blanket exemption --
+    only sharing its `Unit=` target with another timer already in the set
+    earns one; an orphaned periodic timer stays in the collision scan.
+    """
+    shared_periodic = tmp_path / "shared.timer"
+    shared_periodic.write_text("[Timer]\nUnit=some.service\nOnCalendar=*:0/15\n")
+    sibling = tmp_path / "sibling.timer"
+    sibling.write_text("[Timer]\nUnit=some.service\nOnCalendar=*-*-* 00:15:00 UTC\n")
+    orphan_periodic = tmp_path / "orphan.timer"
+    orphan_periodic.write_text("[Timer]\nUnit=lonely.service\nOnCalendar=*:0/15\n")
+
+    all_timers = (shared_periodic, sibling, orphan_periodic)
+    assert _is_periodic(shared_periodic, all_timers) is True
+    assert _is_periodic(orphan_periodic, all_timers) is False
 
 
 def test_1715_utc_is_owned_by_exactly_one_timer() -> None:

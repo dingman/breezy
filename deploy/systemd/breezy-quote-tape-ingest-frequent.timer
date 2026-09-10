@@ -1,0 +1,32 @@
+[Unit]
+Description=Frequent trigger for the Breezy quote-tape catalog ingest (GL-14/BL-24)
+Documentation=file:///home/jon/breezy/deploy/systemd/README.md
+Documentation=file:///home/jon/breezy/src/breezy/runtime/quote_tape_ingest_cli.py
+
+[Timer]
+# Deliberately the SAME service the 6-hourly breezy-quote-tape-ingest.timer
+# already triggers -- two timers may point at one oneshot service, and the
+# service itself needs no change: run_ingest() is idempotent per file (see
+# the module docstring's "Per-file conversion (GL-14/BL-24)" section), so a
+# run that finds nothing new to do costs only a preflight scan of
+# already-marked instances.
+Unit=breezy-quote-tape-ingest.service
+
+# Every 15 minutes. Now that intact, already-rotated files convert without
+# waiting for the WHOLE instance to go quiet (BL-24), a short interval turns
+# "reaches data/ up to a day late" into "reaches data/ within one rotation
+# cycle" -- the six-hourly timer alone is what left an active instance's
+# closed files sitting unconverted for hours. Installed and enabled build-side
+# (operator controls are the two budget caps only); see deploy/systemd/README.md.
+OnCalendar=*:0/15
+
+# A run missed because the host was down fires as soon as the timer is next
+# active, instead of silently waiting for the next tick.
+Persistent=true
+
+# The operation is a local disk read/write with no venue rate limit to
+# respect.
+AccuracySec=30sec
+
+[Install]
+WantedBy=timers.target

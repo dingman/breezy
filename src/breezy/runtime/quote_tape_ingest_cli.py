@@ -89,37 +89,102 @@ signals or restarts the recorder.
 
 Truncation refusal
 ------------------
-Before converting, every instance not classified live AND not already
-fully converted is run through the BL-23 preflight
-(:func:`breezy.persistence.feather_preflight.scan_instance`). Fully
-converted means every requested ``data_types`` entry AND every feather
-physically present under the instance has a ``.converted-<type>``
-marker (present types are derived from the recorder's
+Before converting, every instance not already fully converted is run
+through the BL-23 preflight (:func:`breezy.persistence.feather_preflight.
+scan_instance`). Fully converted means every requested ``data_types`` entry
+AND every feather physically present under the instance has a
+``.converted-<type>`` marker (present types are derived from the recorder's
 ``<class_to_filename>_<n>.feather`` names). A narrower ``data_types``
-argument therefore cannot hide an unmarked sibling file. Converted
-bytes are frozen and truncated instances never receive those markers, so
-skipping the scan does not change liveness or truncation semantics -- it
-avoids re-streaming gigabytes of already-landed feather on every timer
-tick. Any truncated or unreadable file anywhere under the instance
-refuses the WHOLE instance, logged with a reason -- never a silent
-partial conversion of whatever else happened to be intact.
+argument therefore cannot hide an unmarked sibling file. Converted bytes are
+frozen and truncated instances never receive those markers, so skipping the
+scan does not change liveness or truncation semantics -- it avoids
+re-streaming gigabytes of already-landed feather on every timer tick.
+
+Per-file conversion (GL-14/BL-24)
+----------------------------------
+Whenever an instance has at least one still-open file (:func:`_open_files_
+for_instance`, scoped to the single newest file of one data type -- rotation
+always closes the previous file before opening the next) OR at least one
+truncated/unreadable file anywhere, the whole-instance fast path above is
+bypassed for :func:`_ingest_instance_per_file`: every OTHER file -- complete,
+in a different type, or simply older in the same type's rotation -- is
+still converted or salvaged, regardless of that one file's state. Only the
+open file itself is left untouched, retried on the next run. This closes two
+defects the old whole-instance refusal caused: (1) an actively-recording
+instance's already-rotated, already-closed files waited for the WHOLE
+instance to go quiet (up to a day) before landing; (2) a single crashed
+(SIGKILL/OOM/reboot) file permanently blocked every sibling file, of every
+type, in that instance, even years later.
+
+Only an end-of-stream-marked file is converted per file. An INTACT-but-
+unmarked file (a clean read that stops exactly on a message boundary but
+never wrote the terminator) is byte-identical to a live writer paused
+mid-stream -- there is no way to distinguish the two from the bytes alone
+-- so it is left unmarked (``skipped-unclosed``) rather than risk a
+PERMANENT per-file marker over a file that will receive more rows later.
+It still lands once the whole INSTANCE is confirmed dead, via the
+pre-existing, unchanged whole-instance path (:func:`ingest_instance` ->
+``convert_stream_to_data``) -- but that path does NOT re-apply this same
+EOS caution; it has none. ``convert_stream_to_data`` reads every file it is
+handed with a plain ``read_all()`` and has no concept of the end-of-stream
+marker at all. The ONLY thing standing between that native call and a
+no-EOS file is :func:`run_ingest` never handing it one while the file could
+still receive more rows -- i.e. while its OWN instance might still be
+live. Pinned precisely: a no-EOS, message-boundary-clean file is safe for
+the whole-instance path to convert (and permanently mark) if and only if
+its instance is DEAD, meaning EITHER it is not the most-recently-started
+instance while the recorder unit is active (:func:`_open_files_for_instance`
+rule (b) then flags that instance's newest file per type as open,
+regardless of that file's own mtime, keeping it out of this path entirely),
+OR the recorder unit is confirmed inactive (rule (b) never applies to any
+instance, so only staleness (rule (a)) gates it). A crashed-and-abandoned
+instance (SIGKILL/OOM/reboot followed by the recorder restarting into a
+NEW instance UUID) is the case this legitimately serves: the writer
+process for the old UUID is provably gone, so its last, unmarked file is
+exactly as safe to trust as one the OLD whole-instance path always
+accepted, before this per-file path existed.
+
+Ordering guarantee: instrument-definition types (:func:`_is_instrument_
+definition`) are always converted before every other ("tick") type within
+one call to :func:`_ingest_instance_per_file`, and a tick type is deferred
+whole (``skipped-definitions-pending``) for the run if ANY definition type
+still has an open file -- never partially, never ahead of its definition.
+A tick row can therefore never land in the catalog before the instrument
+definition it references.
+
+A ``None`` table from the native feather reader (ArrowInvalid/OSError,
+already-truncated bytes that slipped past preflight, or a post-transform
+table that comes back empty despite a nonzero preflight row count) is a
+HARD per-file failure here -- logged at ``ERROR``, never marked, counted
+under ``failed`` -- unlike ``convert_stream_to_data``'s own native caller,
+which treats the same ``None`` as "nothing to do" and silently marks the
+whole type converted. An instance with any such failure reports outcome
+``"failed"``.
 
 Idempotency
 -----------
 A per-(instance, data type) marker file,
 ``<catalog>/live/<instance>/.converted-<data_type>``, is written only after
-that type's conversion succeeds. A second run against an unchanged tape
-therefore calls ``convert_stream_to_data`` zero additional times and adds
-zero rows.
+NATIVE, whole-type conversion succeeds (the original, unchanged fast path).
+The per-file conversion path above writes a separate per-FILE marker instead
+(``.converted-file-<relative-path>``, see :data:`FILE_MARKER_PREFIX`):
+writing the blanket per-type marker is only ever safe once a type's group is
+known dead (no open file), because a still-active instance can always
+receive one more rotated file for a type already touched this run. Either
+marker makes a second run against an unchanged tape call the native
+conversion (or ``_convert_feather_table_to_parquet``) zero additional times
+and add zero rows.
 
 Exit contract
 --------------
 ===========================  ====  ==========================================
 Outcome                      Code  Example
 ===========================  ====  ==========================================
-Ran (even if every instance     0  nothing to do is not a failure
-was skipped)
+Ran, nothing failed             0  every instance skipped-live/-truncated,
+(skips are not a failure)       every instance already converted, or fine
 Usage / configuration error     2  no catalog root, path is not a directory
+At least one hard per-file      3  a ``None`` table or empty-after-transform
+conversion failure                read (see "Per-file conversion" above)
 ===========================  ====  ==========================================
 """
 
@@ -142,14 +207,19 @@ from nautilus_trader.persistence.funcs import class_to_filename
 
 from breezy.persistence.feather_preflight import (
     DEFAULT_SUBDIRECTORY,
+    FeatherStatus,
     PreflightError,
+    PreflightReport,
     iter_feather_files,
     list_instance_ids,
     scan_instance,
 )
 from breezy.runtime.node_config import QUOTE_TAPE_INCLUDE_TYPES
 from breezy.runtime.quote_tape_preflight_cli import CATALOG_ENV_VAR
-from breezy.runtime.quote_tape_salvage import salvage_truncated_instance
+from breezy.runtime.quote_tape_salvage import (
+    _file_belongs_to_data_cls,
+    salvage_truncated_instance,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -157,6 +227,11 @@ PROGRAM = "breezy-quote-tape-ingest"
 
 EXIT_OK = 0
 EXIT_USAGE = 2
+#: At least one instance's outcome was "failed" (a hard per-file conversion
+#: failure -- see the module docstring's "Per-file conversion" section).
+#: Distinct from EXIT_OK's "ran, even if every instance was skipped": a skip
+#: is an ordinary, expected outcome, never a failure.
+EXIT_CONVERSION_FAILED = 3
 
 #: A file touched more recently than this may be mid-write. Configurable via
 #: ``--live-grace-minutes`` because the right value depends on how bursty a
@@ -170,6 +245,20 @@ DEFAULT_SERVICE_UNIT = "breezy-quote-tape.service"
 #: Prefix for the per-(instance, data type) idempotency marker. Dotfile, so it
 #: never collides with a ``*.feather`` glob and is invisible to `ls`.
 MARKER_PREFIX = ".converted-"
+
+#: Prefix for the per-FILE idempotency marker (GL-14: per-file ingest).
+#: The blanket ``.converted-<type>`` marker above is safe ONLY when it is
+#: written after every physically-present file for that type is known to be
+#: intact and dead (the instance will never receive another file for that
+#: type) -- exactly the pre-existing "whole instance is not live" guarantee.
+#: Once conversion also runs against a STILL-ACTIVE instance (BL-24: convert
+#: rotated-out files without waiting for the whole instance to die), that
+#: guarantee no longer holds: a type can still receive a brand-new file after
+#: an earlier one was converted. A per-file marker never has that hazard --
+#: ``StreamingFeatherWriter`` rotation flushes and closes a file before ever
+#: creating the next one, so a marked file's bytes are frozen forever the
+#: moment it is marked.
+FILE_MARKER_PREFIX = ".converted-file-"
 
 #: The exact set the recorder persists (`breezy.runtime.node_config`), reused
 #: rather than re-declared: a duplicate list here would silently drift from
@@ -248,6 +337,26 @@ def _instance_is_fully_converted(instance_dir: Path, data_types: Sequence[type])
 
 def _mark_converted(instance_dir: Path, data_cls: type) -> None:
     _marker_path(instance_dir, data_cls).touch()
+
+
+def _file_marker_path(instance_dir: Path, path: Path) -> Path:
+    """A dotfile keyed to the file's path relative to the instance directory.
+
+    The full relative path (not the bare filename) is encoded so that two
+    different types' per-instrument subdirectories can never collide on a
+    shared filename.
+    """
+    rel = path.resolve().relative_to(instance_dir.resolve())
+    safe = str(rel).replace("/", "__")
+    return instance_dir / f"{FILE_MARKER_PREFIX}{safe}"
+
+
+def _is_file_marked_converted(instance_dir: Path, path: Path) -> bool:
+    return _file_marker_path(instance_dir, path).is_file()
+
+
+def _mark_file_converted(instance_dir: Path, path: Path) -> None:
+    _file_marker_path(instance_dir, path).touch()
 
 
 def _is_instrument_definition(data_cls: type) -> bool:
@@ -501,6 +610,28 @@ def _instance_write_window(instance_dir: Path) -> tuple[int, int]:
     return (min(mtimes), max(mtimes))
 
 
+def _newest_started_instance_id(
+    catalog_root: Path, instance_ids: Sequence[str], subdirectory: str
+) -> str | None:
+    """The instance whose earliest file mtime is the latest, or ``None``.
+
+    Shared by :func:`classify_liveness` (whole-instance verdict) and
+    :func:`_open_files_for_instance` (per-file verdict) -- both apply the
+    SAME rule (b): "the most recently started instance, while the recorder
+    is active", just scoped differently.
+    """
+    windows = {
+        instance_id: _instance_write_window(
+            _instance_dir(catalog_root, instance_id, subdirectory)
+        )
+        for instance_id in instance_ids
+    }
+    started = {
+        instance_id: start for instance_id, (start, _end) in windows.items() if start > 0
+    }
+    return max(started, key=lambda instance_id: started[instance_id], default=None)
+
+
 def classify_liveness(
     catalog_root: Path,
     instance_ids: Sequence[str],
@@ -517,10 +648,7 @@ def classify_liveness(
         )
         for instance_id in instance_ids
     }
-    started = {
-        instance_id: start for instance_id, (start, _end) in windows.items() if start > 0
-    }
-    newest_id = max(started, key=lambda instance_id: started[instance_id], default=None)
+    newest_id = _newest_started_instance_id(catalog_root, instance_ids, subdirectory)
 
     verdicts: dict[str, LiveDetection] = {}
     for instance_id in instance_ids:
@@ -542,6 +670,50 @@ def classify_liveness(
     return verdicts
 
 
+def _open_files_for_instance(
+    catalog_root: Path,
+    instance_id: str,
+    subdirectory: str,
+    data_types: Sequence[type],
+    *,
+    now_ns: int,
+    grace_ns: int,
+    newest_instance_id: str | None,
+    service_active: bool,
+) -> frozenset[Path]:
+    """The one feather file per data type that may still be mid-write.
+
+    Scoped to one (instance, data type) GROUP rather than the whole
+    instance -- see the module docstring's BL-24 note. ``StreamingFeatherWriter``
+    rotation (``persistence/writer.py``) always flushes and closes the
+    PREVIOUS file before opening a new one for the same table, so within one
+    group only the newest-mtime file can ever be genuinely open or crashed
+    mid-write; every older file in the same group is closed by construction
+    and safe to convert regardless of the instance's own liveness.
+
+    Applies the SAME two rules :func:`classify_liveness` applies to a whole
+    instance, scoped to the file: (a) the group's newest file was written
+    within the live-grace window, or (b) this is the most-recently-started
+    instance and the recorder service is currently active.
+    """
+    instance_dir = _instance_dir(catalog_root, instance_id, subdirectory)
+    known_types = tuple(dict.fromkeys((*data_types, *DEFAULT_DATA_TYPES)))
+    groups: dict[type, list[Path]] = {}
+    for path in iter_feather_files(instance_dir):
+        matched = _data_cls_for_feather(instance_dir, path, known_types)
+        if matched is not None:
+            groups.setdefault(matched, []).append(path)
+
+    is_current_and_active = instance_id == newest_instance_id and service_active
+    open_files: set[Path] = set()
+    for paths in groups.values():
+        newest_path = max(paths, key=lambda p: p.stat().st_mtime_ns)
+        recently_written = (now_ns - newest_path.stat().st_mtime_ns) < grace_ns
+        if recently_written or is_current_and_active:
+            open_files.add(newest_path)
+    return frozenset(open_files)
+
+
 @dataclass(frozen=True)
 class TypeConversionResult:
     """The outcome for one data type within one instance."""
@@ -559,7 +731,7 @@ class InstanceIngestResult:
     """The outcome for one run instance."""
 
     instance_id: str
-    outcome: str  # "converted" | "skipped-live" | "skipped-truncated" | "dry-run"
+    outcome: str  # "converted" | "skipped-live" | "skipped-truncated" | "dry-run" | "failed"
     reason: str = ""
     type_results: tuple[TypeConversionResult, ...] = field(default_factory=tuple)
 
@@ -571,7 +743,12 @@ class InstanceIngestResult:
             f"{class_to_filename(result.data_cls)}={result.outcome}"
             for result in self.type_results
         ]
-        prefix = "would ingest" if self.outcome == "dry-run" else "ingested"
+        if self.outcome == "dry-run":
+            prefix = "would ingest"
+        elif self.outcome == "failed":
+            prefix = "attempted"
+        else:
+            prefix = "ingested"
         return f"instance {self.instance_id}: {prefix} " + " ".join(parts)
 
 
@@ -635,6 +812,309 @@ def _dry_run_preview(
     )
 
 
+def _outcome_has_failure(outcome: str) -> bool:
+    """True if a :class:`TypeConversionResult` outcome string records a
+    failure -- either the bare ``"failed"`` a definition type's ``ValueError``
+    produces, or a ``failed=<n>`` token within a tick type's space-joined
+    per-file count summary.
+    """
+    tokens = outcome.split()
+    return "failed" in tokens or any(token.startswith("failed=") for token in tokens)
+
+
+def _cls_open_and_closed_files(
+    instance_dir: Path, data_cls: type, open_files: frozenset[Path]
+) -> tuple[list[Path], list[Path]]:
+    cls_files = [
+        path
+        for path in iter_feather_files(instance_dir)
+        if _file_belongs_to_data_cls(instance_dir, path, data_cls)
+    ]
+    cls_open = [path for path in cls_files if path in open_files]
+    cls_closed = [path for path in cls_files if path not in open_files]
+    return cls_open, cls_closed
+
+
+def _convert_one_definition_type(
+    catalog: ParquetDataCatalog,
+    instance_dir: Path,
+    instance_id: str,
+    subdirectory: str,
+    data_cls: type,
+    open_files: frozenset[Path],
+    *,
+    convert_fn: ConvertFn,
+    dry_run: bool,
+) -> tuple[TypeConversionResult, bool, bool]:
+    """Convert one instrument-definition type. Returns ``(result, converted, open)``."""
+    cls_open, cls_closed = _cls_open_and_closed_files(instance_dir, data_cls, open_files)
+    if cls_open:
+        return TypeConversionResult(data_cls, "skipped-open"), False, True
+    if not cls_closed:
+        return TypeConversionResult(data_cls, "skipped-already-converted"), False, False
+    if dry_run:
+        return TypeConversionResult(data_cls, "would-convert"), False, False
+    try:
+        outcome = convert_fn(catalog, instance_id, data_cls, subdirectory)
+    except ValueError as exc:
+        logger.error(
+            "instance %s: conversion of %s failed: %s", instance_id, data_cls.__name__, exc
+        )
+        return TypeConversionResult(data_cls, "failed", str(exc)), False, False
+    _mark_converted(instance_dir, data_cls)
+    return TypeConversionResult(data_cls, outcome or CONVERTED), True, False
+
+
+def _convert_one_tick_type_per_file(
+    catalog: ParquetDataCatalog,
+    instance_dir: Path,
+    instance_id: str,
+    data_cls: type,
+    open_files: frozenset[Path],
+    reports_by_path: dict[Path, Any],
+    *,
+    dry_run: bool,
+) -> tuple[TypeConversionResult, bool, bool]:
+    """Convert one non-definition type's not-yet-marked files, per file.
+
+    Returns ``(result, converted_something_new, saw_an_open_file)``. Only a
+    file carrying the Arrow end-of-stream marker is trusted as genuinely
+    closed (see the module docstring's "Per-file conversion" ordering note):
+    a message-boundary-clean read with no marker is indistinguishable from a
+    live writer paused mid-stream, so it is left unmarked -- ``skipped-
+    unclosed`` -- and retried, falling back to the existing whole-instance
+    dead-instance path once the INSTANCE itself is confirmed dead.
+    """
+    cls_open, cls_closed = _cls_open_and_closed_files(instance_dir, data_cls, open_files)
+    counts: dict[str, int] = {}
+    any_new_conversion = False
+
+    for path in cls_closed:
+        if _is_file_marked_converted(instance_dir, path):
+            counts["skipped-already-converted"] = counts.get("skipped-already-converted", 0) + 1
+            continue
+        report = reports_by_path.get(path)
+        if report is None:
+            logger.warning(
+                "instance %s: %s file %s has no preflight report -- skipped "
+                "this run, retried next",
+                instance_id,
+                data_cls.__name__,
+                path,
+            )
+            counts["unreported"] = counts.get("unreported", 0) + 1
+            continue
+        if report.status is FeatherStatus.UNREADABLE:
+            counts["unreadable"] = counts.get("unreadable", 0) + 1
+            continue
+        if report.is_truncated:
+            key = "would-salvage" if dry_run else "salvaged"
+            counts[key] = counts.get(key, 0) + 1
+            continue
+        if report.is_empty:
+            if not dry_run:
+                _mark_file_converted(instance_dir, path)
+                any_new_conversion = True
+            counts["converted-nothing-new"] = counts.get("converted-nothing-new", 0) + 1
+            continue
+        if not report.end_of_stream_marker:
+            # INTACT but unclosed: a clean EOF at a message boundary is
+            # byte-identical to a live writer paused mid-stream. Never
+            # converted here -- left for the whole-instance dead-instance
+            # path once the instance itself is confirmed dead (unchanged).
+            counts["skipped-unclosed"] = counts.get("skipped-unclosed", 0) + 1
+            continue
+        if dry_run:
+            counts["would-convert"] = counts.get("would-convert", 0) + 1
+            continue
+        table = catalog._read_feather_file(str(path))
+        if table is None:
+            logger.error(
+                "instance %s: conversion of %s file %s failed -- feather "
+                "read returned no table (ArrowInvalid/OSError); left "
+                "unmarked for a later retry",
+                instance_id,
+                data_cls.__name__,
+                path,
+            )
+            counts["failed"] = counts.get("failed", 0) + 1
+            continue
+        transformed = catalog._apply_stream_conversion_transforms(
+            table, convert_bar_type_to_external=True
+        )
+        if len(transformed) == 0 and report.rows > 0:
+            logger.error(
+                "instance %s: conversion of %s file %s failed -- preflight "
+                "saw %d row(s) but the post-transform table is empty; "
+                "refusing a silent zero-row write",
+                instance_id,
+                data_cls.__name__,
+                path,
+                report.rows,
+            )
+            counts["failed"] = counts.get("failed", 0) + 1
+            continue
+        try:
+            catalog._convert_feather_table_to_parquet(
+                feather_table=table,
+                feather_path=str(path),
+                data_cls=data_cls,
+                used_catalog=catalog,
+            )
+            _mark_file_converted(instance_dir, path)
+            counts["converted"] = counts.get("converted", 0) + 1
+            any_new_conversion = True
+        except ValueError as exc:
+            logger.error(
+                "instance %s: conversion of %s file %s failed: %s",
+                instance_id,
+                data_cls.__name__,
+                path,
+                exc,
+            )
+            counts["failed"] = counts.get("failed", 0) + 1
+
+    any_open_seen = bool(cls_open)
+    if cls_open:
+        counts["skipped-open"] = len(cls_open)
+
+    summary = " ".join(f"{key}={value}" for key, value in counts.items() if value)
+    return (
+        TypeConversionResult(data_cls, summary or "skipped-already-converted"),
+        any_new_conversion,
+        any_open_seen,
+    )
+
+
+def _ingest_instance_per_file(
+    catalog: ParquetDataCatalog,
+    catalog_root: Path,
+    instance_id: str,
+    subdirectory: str,
+    data_types: Sequence[type],
+    open_files: frozenset[Path],
+    preflight_report: PreflightReport,
+    *,
+    convert_fn: ConvertFn,
+    dry_run: bool,
+) -> InstanceIngestResult:
+    """Convert every complete, non-open feather file, per file (GL-14/BL-24).
+
+    Reached only when :func:`run_ingest` cannot take the whole-instance fast
+    path: at least one file is currently open (the instance is still being
+    written to) or at least one file elsewhere in the instance is truncated
+    or unreadable. Neither condition may block a SIBLING file that is
+    genuinely complete: an open file is retried next run untouched; a
+    truncated file is salvaged (unchanged, file-level, already idempotent)
+    without blocking anything else; an intact, END-OF-STREAM-CLOSED file is
+    converted and marked with a per-file marker, never the blanket per-type
+    marker (see :data:`FILE_MARKER_PREFIX`). An INTACT file lacking the EOS
+    marker is never converted here (see :func:`_convert_one_tick_type_per_file`).
+
+    Ordering guarantee: instrument-definition types are always attempted
+    FIRST, entirely before any non-definition ("tick") type, and every tick
+    type is deferred (``skipped-definitions-pending``) for the whole run if
+    ANY definition type still has an open file. This prevents a tick row
+    from landing in the catalog before the instrument definition it
+    references -- both the write order within this function and, therefore,
+    the resulting parquet file mtimes.
+    """
+    instance_dir = _instance_dir(catalog_root, instance_id, subdirectory)
+    reports_by_path = {report.path: report for report in preflight_report.files}
+    truncated_to_salvage = tuple(
+        report for report in preflight_report.truncated if report.path not in open_files
+    )
+    unresolved_unreadable = tuple(
+        report for report in preflight_report.unreadable if report.path not in open_files
+    )
+    if not dry_run and truncated_to_salvage:
+        salvage_truncated_instance(
+            catalog, instance_dir, instance_id, data_types, truncated_to_salvage
+        )
+    has_unresolved_truncation = bool(truncated_to_salvage) or bool(unresolved_unreadable)
+
+    results_by_cls: dict[type, TypeConversionResult] = {}
+    any_new_conversion = False
+    any_open_seen = False
+    definitions_have_open_file = False
+
+    definition_types = [c for c in data_types if _is_instrument_definition(c)]
+    tick_types = [c for c in data_types if not _is_instrument_definition(c)]
+
+    for data_cls in definition_types:
+        if _is_marked_converted(instance_dir, data_cls):
+            results_by_cls[data_cls] = TypeConversionResult(data_cls, "skipped-already-converted")
+            continue
+        result, converted, is_open = _convert_one_definition_type(
+            catalog,
+            instance_dir,
+            instance_id,
+            subdirectory,
+            data_cls,
+            open_files,
+            convert_fn=convert_fn,
+            dry_run=dry_run,
+        )
+        results_by_cls[data_cls] = result
+        any_new_conversion = any_new_conversion or converted
+        if is_open:
+            any_open_seen = True
+            definitions_have_open_file = True
+
+    for data_cls in tick_types:
+        if _is_marked_converted(instance_dir, data_cls):
+            results_by_cls[data_cls] = TypeConversionResult(data_cls, "skipped-already-converted")
+            continue
+        if definitions_have_open_file:
+            results_by_cls[data_cls] = TypeConversionResult(
+                data_cls, "skipped-definitions-pending"
+            )
+            any_open_seen = True
+            continue
+        result, converted, is_open = _convert_one_tick_type_per_file(
+            catalog, instance_dir, instance_id, data_cls, open_files, reports_by_path,
+            dry_run=dry_run,
+        )
+        results_by_cls[data_cls] = result
+        any_new_conversion = any_new_conversion or converted
+        any_open_seen = any_open_seen or is_open
+
+    type_results = tuple(results_by_cls[data_cls] for data_cls in data_types)
+    any_failure = any(_outcome_has_failure(result.outcome) for result in type_results)
+
+    if has_unresolved_truncation:
+        outcome = "skipped-truncated"
+        reason = (
+            f"{len(truncated_to_salvage)} truncated, {len(unresolved_unreadable)} "
+            f"unreadable file(s); run breezy-quote-tape-preflight for detail"
+        )
+    elif dry_run:
+        outcome = "dry-run"
+        reason = ""
+    elif any_failure:
+        outcome = "failed"
+        reason = "at least one file failed conversion; see type_results for detail"
+    elif any_new_conversion:
+        outcome = "converted"
+        reason = ""
+    elif any_open_seen:
+        outcome = "skipped-live"
+        reason = (
+            "a file was written within the live-grace window or is the "
+            "active instance's current file"
+        )
+    else:
+        outcome = "converted"
+        reason = ""
+
+    return InstanceIngestResult(
+        instance_id=instance_id,
+        outcome=outcome,
+        reason=reason,
+        type_results=type_results,
+    )
+
+
 def run_ingest(
     catalog_root: Path,
     *,
@@ -651,27 +1131,25 @@ def run_ingest(
     grace_ns = int(grace_minutes * 60 * 1_000_000_000)
 
     instance_ids = list_instance_ids(catalog_root, subdirectory)
-    liveness = classify_liveness(
-        catalog_root,
-        instance_ids,
-        subdirectory,
-        now_ns=now,
-        grace_ns=grace_ns,
-        service_active=service_active_probe(),
-    )
+    newest_instance_id = _newest_started_instance_id(catalog_root, instance_ids, subdirectory)
+    service_active = service_active_probe()
 
     catalog = ParquetDataCatalog(str(catalog_root))
     results: list[InstanceIngestResult] = []
     for instance_id in instance_ids:
-        detection = liveness[instance_id]
-        if detection.is_live:
-            results.append(
-                InstanceIngestResult(instance_id, "skipped-live", detection.reason)
-            )
-            continue
-
         instance_dir = _instance_dir(catalog_root, instance_id, subdirectory)
-        if _instance_is_fully_converted(instance_dir, data_types):
+        open_files = _open_files_for_instance(
+            catalog_root,
+            instance_id,
+            subdirectory,
+            data_types,
+            now_ns=now,
+            grace_ns=grace_ns,
+            newest_instance_id=newest_instance_id,
+            service_active=service_active,
+        )
+
+        if not open_files and _instance_is_fully_converted(instance_dir, data_types):
             # Converted bytes are frozen; truncated instances never earn these
             # markers. Skip the BL-23 rescan so periodic ingest does not
             # re-stream every already-converted feather file. Requires a
@@ -700,38 +1178,42 @@ def run_ingest(
             results.append(InstanceIngestResult(instance_id, "skipped-truncated", str(exc)))
             continue
 
-        if preflight_report.has_truncation:
-            reason = (
-                f"{len(preflight_report.truncated)} truncated, "
-                f"{len(preflight_report.unreadable)} unreadable file(s); "
-                f"run breezy-quote-tape-preflight for detail"
-            )
-            logger.error("instance %s: refusing to convert -- %s", instance_id, reason)
-            if not dry_run and preflight_report.truncated:
-                salvage_truncated_instance(
-                    catalog,
-                    instance_dir,
-                    instance_id,
-                    data_types,
-                    preflight_report.truncated,
+        if not open_files and not preflight_report.has_truncation:
+            # The ordinary, unchanged path: a dead instance with nothing
+            # truncated anywhere converts via the single native call, per
+            # type, exactly as before this change.
+            if dry_run:
+                results.append(
+                    _dry_run_preview(catalog_root, instance_id, subdirectory, data_types)
                 )
-            results.append(InstanceIngestResult(instance_id, "skipped-truncated", reason))
+            else:
+                results.append(
+                    ingest_instance(
+                        catalog,
+                        catalog_root,
+                        instance_id,
+                        subdirectory,
+                        data_types,
+                        convert_fn=convert_fn,
+                    )
+                )
             continue
 
-        if dry_run:
-            results.append(
-                _dry_run_preview(catalog_root, instance_id, subdirectory, data_types)
-            )
-            continue
-
+        # GL-14/BL-24: at least one file is still open, or truncation exists
+        # somewhere in the instance. Neither may block a sibling file that is
+        # genuinely complete -- convert per file instead of refusing the
+        # whole instance.
         results.append(
-            ingest_instance(
+            _ingest_instance_per_file(
                 catalog,
                 catalog_root,
                 instance_id,
                 subdirectory,
                 data_types,
+                open_files,
+                preflight_report,
                 convert_fn=convert_fn,
+                dry_run=dry_run,
             )
         )
     return tuple(results)
@@ -830,6 +1312,8 @@ def run(
     print(f"{PROGRAM}: catalog={root} subdirectory={namespace.subdirectory}{mode}", file=out)
     for result in results:
         print(result.summary_line(), file=out)
+    if any(result.outcome == "failed" for result in results):
+        return EXIT_CONVERSION_FAILED
     return EXIT_OK
 
 
