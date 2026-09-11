@@ -43,7 +43,7 @@ Under H0, `held_i | ask_i ~ Bern(BE_i)` with `BE_i = entry_ask_i + fee_i` per ro
 - `t_k = min(1, I_k / I_max)` where `I_max = 40` (fixed constant)
 - Look schedule: every 10 filled Takes (`n_k = 10, 20, …, 160`)
 - Boundary solver: LD-OBF, two one-sided α=0.025, information fraction `t`
-- Efficacy stop: `S_k ≥ b_k^eff` AND `total_pnl > 0` AND no cell_dead → **SURVIVE** (where `total_pnl = scored_pnl + residual`, §5)
+- Efficacy stop: `S_k ≥ b_k^eff` AND `total_pnl > 0` AND no cell_dead → **SURVIVE** (where `total_pnl = scored_pnl − residual`, residual an unsigned loss magnitude, §5)
 - Futility stop: `S_k ≤ b_k^fut` OR cell_dead OR (`b_k^fut < S_k < b_k^eff` at terminal look) → **KILL**
 - Truncation at D0+165 or `total_pnl ≤ −60` (contract-unit halt, §5, v1/v2 registered in contract-units per §7)
 
@@ -79,7 +79,7 @@ Under H0, `held_i | ask_i ~ Bern(BE_i)` with `BE_i = entry_ask_i + fee_i` per ro
 
 ## 5. Residual Classification & Contract-Unit Halt (Phase 1 — new)
 
-**Definition: `total_pnl` (efficacy gate § 3, halt sum § 5).** Identical computation, passed to `look_verdict` / `terminal_look` (src/breezy/settlement/current_rung_hold_v2.py) as `total_pnl = scored_pnl + residual`, in contract-units (not dollars). This is the quantity monitored for SURVIVE (`total_pnl > 0`), KILL (`total_pnl ≤ −60`), and futility boundaries. v1/v2 register in contract-units per §7.
+**Definition: `total_pnl` (efficacy gate § 3, halt sum § 5).** Identical computation, passed to `look_verdict` / `terminal_look` (src/breezy/settlement/current_rung_hold_v2.py) as `total_pnl = scored_pnl − residual`, in contract-units (not dollars); `residual` is an UNSIGNED loss magnitude (§5), so it can only move `total_pnl` toward KILL, never toward SURVIVE (`scripts/analysis/family_tally_v2.py::v3_residual_from_fill_source` negates the magnitude before it is added). This is the quantity monitored for SURVIVE (`total_pnl > 0`), KILL (`total_pnl ≤ −60`), and futility boundaries. v1/v2 register in contract-units per §7.
 
 **Residual is THREE mutually exclusive per-fill buckets; classification is FIRST-MATCH-WINS:**
 
@@ -87,7 +87,7 @@ Under H0, `held_i | ask_i ~ Bern(BE_i)` with `BE_i = entry_ask_i + fee_i` per ro
 2. **`q≠1`** — partial or multi-fill; only full-contract fills score.
 3. **`fee_unreconciled`** — fill's execution legs do not sum to recorded fee. Includes resolver GET-FILLED (no legs, `fee_reconciled=False` by construction).
 
-Every unscored fill contributes to EXACTLY ONE bucket. Residual = sum of `qty × (fill_px + fee)` over all buckets.
+Every unscored fill contributes to EXACTLY ONE bucket. Residual = sum of `qty × (fill_px + fee)` over all buckets — an UNSIGNED magnitude, always ≥ 0, SUBTRACTED from `scored_pnl`.
 
 **Family halt on duplicate fill (fail-closed):**
 - On-fill: write `continuous_rung_hold/family_halt/duplicate_fill` (same flock as latch).
@@ -95,7 +95,7 @@ Every unscored fill contributes to EXACTLY ONE bucket. Residual = sum of `qty ×
 - Recon-replay idempotent: same-`venue_order_id` fill never creates bucket or halt.
 
 **Contract-unit halt (LOSS_STOP):**
-- **KILL if `total_pnl ≤ −60` (contract-units)** where `total_pnl = scored_pnl + residual`.
+- **KILL if `total_pnl ≤ −60` (contract-units)** where `total_pnl = scored_pnl − residual`.
 - This halt is NOT inside the operator's daily-budget cap (named only in env; never valued in code).
 - Re-arm floor: `_REARM_MIN_DELAY_SECS = 120` (documented conservative floor, build-side constant, unverified until first `PositionReportingLag` record in live fills).
 - Re-arm gate: evidence-based (fresh eof-complete positions read showing no LONG on instrument).
@@ -181,7 +181,7 @@ Window `[12:00, 17:00)` LST, 30 min afternoon-covered threshold, ≥15 covered l
 | `_retire_unlocked` raise on non-OPEN singleton | runtime/submit_intent.py | Phase 1: line 441–450 (already exists) |
 | Duplicate-fill bucket + family halt | strategy.on_order_filled, trial_day_latch.py | Phase 1: `record_duplicate_fill`, halt key write |
 | `PositionReportingLag` record type & emission | resolver path | Phase 0b: record type; Phase 1: emission plumbing (values require live fill) |
-| Dollar halt KILL condition | family tally | Phase 1: check scored_pnl + residual ≤ −60 |
+| Dollar halt KILL condition | family tally | Phase 1: check scored_pnl − residual ≤ −60 |
 
 ---
 
@@ -198,7 +198,7 @@ Window `[12:00, 17:00)` LST, 30 min afternoon-covered threshold, ≥15 covered l
 7. `is_consumed` freezes the attempt counter.
 8. Guard pins: order-path allowlist grows by exactly two names; await exemption still `_submit_order`-only.
 9. Residual classification mutually exclusive: GET-FILLED duplicate contributes to `duplicate_fill` only; counted once; never in fee-unreconciled or `q≠1` buckets.
-10. Dollar halt fires when `scored_pnl + residual ≤ −60`; family stops arming.
+10. Dollar halt fires when `scored_pnl − residual ≤ −60`; family stops arming.
 11. Re-arm gate is evidence-based (eof-complete positions read); attempt counter blocks re-arm after fill.
 
 ---
@@ -244,7 +244,7 @@ Window `[12:00, 17:00)` LST, 30 min afternoon-covered threshold, ≥15 covered l
 - AMBIGUOUS with-id retirement (+ clear_submit_intent no-id path unchanged).
 - Pre-arm race SAFETY-C1 authoritative check (two new guard pins).
 - Duplicate-fill residual bucket + family halt (MARKET C1).
-- Dollar halt KILL if residual ≤ −60 (not inside daily budget cap).
+- Dollar halt KILL if scored_pnl − residual ≤ −60 (not inside daily budget cap).
 - Re-arm evidence gate + attempt freeze by `is_consumed`.
 - Residual mutually exclusive per-fill classification.
 
