@@ -57,7 +57,6 @@ Merged analysis, evidence and unlock observables: `docs/evidence/GO_LIVE_BLOCKER
 
 | ID | Own | Sev | Blocker (evidence in the doc) | Size |
 |---|---|---|---|---|
-| GL-7 | O | OPEN | Supervisor unit INSTALLED + ENABLED 09-10 02:57Z (pid 3338424, reboot-durable, `supervisor_started stop_prior=16:40Z launch=16:50Z`). Remaining and operator-only: `import-environment` of the session values, then `systemctl --user restart breezy-trade-supervisor` — the unit was started BEFORE the import, so its env carries none. Until then the 16:50Z node has no order capability. Runbook §10 | S |
 | GL-4P | B | LOW | On the next create-order AMBIGUOUS, persist a positions snapshot beside the GL-1a tokens. Log-only: no retire, no `_trading_refusals` mutation, no booking release. Ruling `docs/evidence/gl1_gl4_order_state_ruling_2026-09-10.md` | S |
 
 **KILL clock:** D0=09-05, counter **0/15** (`covered_listed_station_days_2026-09-08.json`, written 14:15Z, fetch_start 09-05; 09-05/06/07 all uncovered). Coverage is **recorder-only by ruling** — node downtime never breaks it. At 4 covered/day from a clean 09-08 the 15th lands 09-11, declared by the 17:15Z tally **2026-09-12** (09-13 if 09-08 is lost); the prior "~09-09/09-10" was stale. Zero-fill/retired-AMBIGUOUS takes are not trials. GL-2, GL-3, GL-5, GL-9 and GL-12 landed; GL-1/GL-4 remain under ruling but are NOT the current blocker — `exec/polymarket_us/intent/current` reads `RETIRED`/`OPERATOR_CLEARED`, so the account-wide lockout is cleared.
