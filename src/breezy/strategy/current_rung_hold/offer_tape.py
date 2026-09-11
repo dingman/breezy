@@ -12,7 +12,7 @@ import json
 import logging
 from collections import deque
 from collections.abc import Mapping
-from dataclasses import asdict, dataclass
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Final
 
@@ -43,6 +43,36 @@ class OfferTapeRecord:
     prior_eligible_snaps: int
     illegal_cell: bool
     source: str
+
+    def to_dict(self) -> dict[str, object]:
+        """Field-by-field serialization -- never ``dataclasses.asdict``.
+
+        ``asdict`` deep-copies every field value and is banned repo-wide
+        under a closed allowlist (``test_polymarket_us_credential_
+        serialization.py``): an unreviewed call site can leak or re-pickle
+        credential material regardless of what its argument is named. This
+        record carries no credential-bearing field, but the fix is to never
+        need the allowlist at all -- explicit, named fields, reviewable at a
+        glance.
+        """
+        return {
+            "station": self.station,
+            "climate_day": self.climate_day,
+            "instrument_id": self.instrument_id,
+            "ask": self.ask,
+            "size": self.size,
+            "reason": self.reason,
+            "ts_event": self.ts_event,
+            "hour_lst": self.hour_lst,
+            "width_code": self.width_code,
+            "m_code": self.m_code,
+            "trigger": self.trigger,
+            "quote_age_ns": self.quote_age_ns,
+            "minutes_since_window_open": self.minutes_since_window_open,
+            "prior_eligible_snaps": self.prior_eligible_snaps,
+            "illegal_cell": self.illegal_cell,
+            "source": self.source,
+        }
 
 
 class OfferTape:
@@ -84,7 +114,7 @@ class OfferTape:
         self._buf.append(record)
         if self._path is None:
             return
-        line = json.dumps(asdict(record), sort_keys=True)
+        line = json.dumps(record.to_dict(), sort_keys=True)
         try:
             with self._path.open("a", encoding="utf-8") as handle:
                 handle.write(line)
@@ -93,4 +123,4 @@ class OfferTape:
             logger.exception("OfferTape: failed to append to %s", self._path)
 
     def as_dicts(self) -> tuple[Mapping[str, object], ...]:
-        return tuple(asdict(record) for record in self._buf)
+        return tuple(record.to_dict() for record in self._buf)

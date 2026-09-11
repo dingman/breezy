@@ -1885,6 +1885,15 @@ _B11_ISSUE_SITES: frozenset[tuple[str, str]] = frozenset(
             "tests/unit/test_order_submission_permit_issuance.py",
             "test_current_rung_hold_not_ready_refuses",
         ),
+        # WIDENED (L-12), Phase 0: exercises `issue`'s existing refusal
+        # matrix (continuous_rung_hold on, current_rung_hold off ->
+        # RungHoldNotReadyError) through the SAME `_ISSUE` alias -- not a
+        # new production caller. Production callers remain exactly one,
+        # `app/trade.py::main`.
+        (
+            "tests/unit/test_order_submission_permit_issuance.py",
+            "test_issue_still_refuses_when_only_continuous_is_on",
+        ),
         (
             "tests/unit/test_order_submission_permit_issuance.py",
             "test_live_observations_not_ready_refuses",
@@ -2102,6 +2111,17 @@ def test_c10_submit_intent_and_operator_controls_reference_pins() -> None:
     ``SqliteStateStore`` connection in ``probe_open_intent`` (the pre-launch
     OPEN-intent probe). It never opens ``open_submit_intent_latch`` and
     never holds the process lock -- a distinct, non-latch-owning reader.
+
+    WIDENED again (enablement-derivation commit 4a94d8a, 2026-09-10):
+    ``adapters.polymarket_us.safety`` gains three LOCAL, function-scoped
+    imports of ``operator_controls`` (``_derived_per_order_ceiling``,
+    ``_derived_session_notional``, ``_derived_session_order_count``) that
+    read ``operator_max_position_cost_usd``/``operator_max_daily_budget_
+    usd`` -- pure reads, never a value assignment. Deferred rather than
+    module-level because ``operator_controls`` already imports FROM this
+    module's money reader, so a top-level import would cycle; both modules
+    live in the same package, so this is an intra-package cycle break, not
+    a layering violation.
     """
     assert _modules_importing("submit_intent") == {
         "src/breezy/runtime/node_config.py",
@@ -2124,6 +2144,13 @@ def test_c10_submit_intent_and_operator_controls_reference_pins() -> None:
         # control names at runtime. It reads, never assigns; layers A-D of the
         # assignment scan and ``find_environ_mutations`` still police it.
         "scripts/operator/print_operator_controls.py",
+        # WIDENED (L-12), not relaxed, enablement-derivation commit 4a94d8a
+        # (2026-09-10): three LOCAL, function-scoped imports (never
+        # module-level -- see the docstring above) that read the two
+        # operator accessor functions to derive the per-order ceiling,
+        # session notional and session order count when no explicit
+        # session override is set. Reads only; never assigns a control.
+        "src/breezy/adapters/polymarket_us/safety.py",
     }
 
 
