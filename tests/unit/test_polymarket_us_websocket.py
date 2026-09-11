@@ -1482,3 +1482,47 @@ async def test_a_dead_supervisor_records_where_it_died_without_venue_text() -> N
     assert "websocket.py" in logged, (
         f"the supervisor frame must be recoverable from the log: {logged!r}"
     )
+
+
+@pytest.mark.asyncio
+async def test_supervisor_reconnect_warning_names_the_connection_label(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Overnight 2026-09-10/11 the pool's shards all logged the identical
+    "markets websocket closed; reconnecting with fresh signature" WARN with no
+    per-shard identity, so the journal could not say WHICH of the pooled
+    connections (``PolymarketUSMarketsWebSocketPool`` shards) was flapping.
+    ``_connection_label`` already exists and is used on the venue-reject and
+    generic-exception paths -- this was the one gap, on the routine
+    closed-and-reconnecting path that fired hundreds of times that night.
+    """
+    recorder = _RecordingPoolLogger()
+    signer, _ = _new_signer()
+    ws = _make_ws(
+        ws_url="wss://api.example.invalid",
+        signer=signer,
+        logger=recorder,
+        connection_label="shard-3",
+    )
+
+    class ClosedClient:
+        def is_reconnecting(self) -> bool:
+            return False
+
+        def is_closed(self) -> bool:
+            return True
+
+    ws._client = ClosedClient()  # type: ignore[assignment]
+
+    async def _fake_reconnect(self: PolymarketUSMarketsWebSocket) -> bool:
+        self._closing = True
+        return True
+
+    monkeypatch.setattr(
+        PolymarketUSMarketsWebSocket, "_reconnect_with_backoff", _fake_reconnect
+    )
+
+    await ws._supervise()
+
+    logged = "\n".join(recorder.messages)
+    assert "shard-3" in logged, f"the WARN must name which connection closed: {logged!r}"

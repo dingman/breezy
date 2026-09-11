@@ -219,6 +219,23 @@ def test_non_positive_policy_numbers_are_rejected(field: str) -> None:
         make_config(**{field: 0})
 
 
+def test_ws_idle_timeout_default_never_fires_before_dead_peer_detection() -> None:
+    """Nautilus 1.231 ``WebSocketConfig.idle_timeout_ms`` breaks the read task
+    on ANY quiet window with no Text/Binary frame -- Ping/Pong deliberately do
+    NOT refresh it. Dead-peer detection is the separate ``heartbeat_timeout``
+    (default 3x heartbeat, resets on any frame including pong). The prior
+    default of 60s was well inside a quiet-but-alive shard's normal book-change
+    gap and produced 224 self-inflicted recorder closes and 306 trade-node
+    closes overnight 2026-09-10/11, all in the otherwise-idle window, each one
+    opening a ~5s quote-tape gap. The default must stay strictly above 3x the
+    heartbeat so the idle timer can never fire before the native dead-peer
+    check would have caught a genuinely dead transport.
+    """
+    config = make_config()
+    assert config.ws_idle_timeout_secs == 600
+    assert config.ws_idle_timeout_secs > 3 * config.ws_heartbeat_secs
+
+
 def test_config_carries_no_secret_bearing_field() -> None:
     """The shipped ban must hold for this type; it also runs at import time."""
     assert_config_type_excludes_secrets(PolymarketUSDataClientConfig)

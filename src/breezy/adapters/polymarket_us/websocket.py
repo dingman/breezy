@@ -785,8 +785,9 @@ class PolymarketUSMarketsWebSocket:
                 self._consecutive_drops += 1
                 delay_ms = self._next_backoff_delay_ms()
                 self._log.warning(
-                    "Polymarket.us markets websocket closed; reconnecting with fresh "
-                    f"signature (attempt={self._consecutive_drops}, delay_ms={delay_ms})"
+                    f"Polymarket.us markets websocket ({self._connection_label}) closed; "
+                    "reconnecting with fresh signature "
+                    f"(attempt={self._consecutive_drops}, delay_ms={delay_ms})"
                 )
                 await asyncio.sleep(delay_ms / _MS_PER_SECOND)
                 if not await self._reconnect_with_backoff():

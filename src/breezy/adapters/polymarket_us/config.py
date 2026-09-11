@@ -275,7 +275,20 @@ class PolymarketUSDataClientConfig(LiveDataClientConfig, frozen=True):
     discovery_requests_per_minute: int = 6
     book_requests_per_minute: int = 12
     ws_heartbeat_secs: int = 20
-    ws_idle_timeout_secs: int = 60
+
+    #: Nautilus 1.231 breaks the read task on ANY window with no inbound
+    #: Text/Binary frame -- Ping/Pong deliberately do NOT refresh this timer
+    #: (``WebSocketConfig.idle_timeout_ms``). Dead-peer detection is the
+    #: SEPARATE ``heartbeat_timeout`` (native default 3x heartbeat, reset by
+    #: any frame including pong), so a genuinely dead transport is still
+    #: caught in <= 3 * ``ws_heartbeat_secs`` regardless of this value.
+    #: The prior default (60s) sat inside a quiet-but-alive shard's normal
+    #: book-change gap and produced 224 self-inflicted recorder closes and
+    #: 306 trade-node closes overnight 2026-09-10/11 -- entirely in the
+    #: otherwise-idle window, each one opening a ~5s quote-tape gap. 600s
+    #: keeps the idle timer from ever firing before native dead-peer
+    #: detection would have caught the same failure.
+    ws_idle_timeout_secs: int = 600
 
     #: Wall-clock budget, in seconds, to retry an initial connect's
     #: ``EmptyClimateListingError`` before giving up (GL-12). Default 0 --
