@@ -1706,6 +1706,14 @@ EXEC_PERMITTED_COROUTINE_NAMES = frozenset(
         "_publish_account_state",
         "_wait_for_instruments",
         "_confirm_account_registered",
+        # Resolution A (plan rev 6.1): the AMBIGUOUS-class resolver, started
+        # from `_connect`. Scanned separately and more narrowly by
+        # `EXEC_RESOLVER_COROUTINES`/`EXEC_RESOLVER_PERMITTED_CALLEES` below.
+        "_resolve_ambiguous_intents",
+        # Review fix 1 (Slice 2): mirrors data.py's `_cancel_update_instruments`
+        # exactly -- awaits the resolver task's cancellation deterministically
+        # from `_disconnect`, touching no network primitive of its own.
+        "_cancel_resolver_task",
         # The injected read protocol's own call signature.
         "__call__",
     }
@@ -1829,6 +1837,10 @@ EXEC_ORDER_COROUTINE_PERMITTED_CALLEES = frozenset(
         # SAFETY C1 (plan rev 6.1): the authoritative pre-spend re-check.
         # Read-only against the durable singleton; adds no send path.
         "self._latch.is_latched",
+        # Resolution A/E (plan rev 6.1): note the AMBIGUOUS resolver
+        # context. Inert sync callee -- writes only to the already-open
+        # local store and a process-local dict; reaches no network.
+        "self._note_ambiguous_open",
         "self._write_signer.sign_headers",
         "self._order_sender.post_order",
         "submit_chain.latched_refusal_reason",
@@ -1884,6 +1896,83 @@ EXEC_ORDER_COROUTINE_PERMITTED_CALLEES = frozenset(
 #: ``test_native_query_order_never_reaches_the_send_seam``), never because
 #: the coroutine is missing or raises.
 EXEC_DECLARED_UNIMPLEMENTED_COROUTINES = frozenset({"_query_order"})
+
+#: Resolution A (plan rev 6.1), SAFETY M3 pin 2: the hole `find_exec_send_
+#: path_violations` left. That scanner only inspects a function whose NAME
+#: is in `ORDER_LIFECYCLE_COROUTINES` -- `_resolve_ambiguous_intents` is not
+#: an order-lifecycle coroutine (it never sends an order; it reads two GET
+#: endpoints and retires/trues-up on evidence), so it was invisible to E0-
+#: NOSEND entirely. This is the compensating strengthening: its OWN scanned
+#: set, checked against its OWN allowlist by `find_exec_resolver_violations`
+#: below.
+#:
+#: `_resolve_terminal_zero` and `_resolve_accept_fill` are PLAIN sync
+#: helpers `_resolve_ambiguous_intents` calls to take action once evidence
+#: is in hand -- scanned here too (by name, sync or async, exactly like
+#: `find_exec_send_path_violations` already does), because a dangerous call
+#: laundered through an unscanned helper would defeat the whole point of an
+#: allowlist.
+EXEC_RESOLVER_COROUTINES = frozenset(
+    {"_resolve_ambiguous_intents", "_resolve_terminal_zero", "_resolve_accept_fill"}
+)
+
+#: Unlike `EXEC_ORDER_COROUTINE_PERMITTED_CALLEES`, this allowlist permits
+#: `await` (the resolver's whole job is I/O) -- the invariant it enforces is
+#: narrower and sharper: `self._order_sender.post_order` -- the ONE
+#: sanctioned egress call in the entire `exec/` package -- is EXCLUDED, by
+#: construction, from this set. A resolver that could reach it would defeat
+#: L-36's whole point (a with-id AMBIGUOUS is resolved by a GET, never by a
+#: second POST).
+EXEC_RESOLVER_PERMITTED_CALLEES = frozenset(
+    {
+        "asyncio.sleep",
+        "self._resolver_poll_interval_secs",
+        "self._latch.current",
+        "self._store_get",
+        "AmbiguousResolverContext.from_bytes",
+        "self._log.error",
+        "self._log.warning",
+        # Partial-fill review: every `continue` now logs (at least DEBUG);
+        # PARTIALLY_FILLED's own live-state branch logs at INFO.
+        "self._log.debug",
+        "self._log.info",
+        "self._cache.instrument",
+        "InstrumentId.from_str",
+        "self._private_read",
+        "submit_chain.order_by_id_path",
+        "order_payload.get",
+        "isinstance",
+        "type",
+        "parse_order_status_report",
+        "UUID4",
+        "report.filled_qty.as_decimal",
+        "self._declared_positions",
+        "instrument_id_to_slug",
+        "_resolver_long_position_state",
+        "self._clock.timestamp_ns",
+        "self._resolve_terminal_zero",
+        "self._ambiguous_bookings.pop",
+        "self._retire",
+        "self._ledger.true_up_booking",
+        "self.generate_order_canceled",
+        "StrategyId",
+        "ClientOrderId",
+        "submit_chain.venue_order_id",
+        # Slice 3 (plan rev 6.1): the GET-confirmed-FILLED branch. Still no
+        # `self._order_sender.post_order` -- a synthesized native fill event
+        # is published, never a second order sent.
+        "self._resolve_accept_fill",
+        "DurableFillRecord",
+        "self.record_fill",
+        "record.to_bytes",
+        "fill_record_bytes.decode",
+        "self._refuse",
+        "self.generate_order_filled",
+        "_synthetic_get_fill_trade_id",
+        "instrument.make_price",
+        "Money",
+    }
+)
 
 
 def _dotted_import_strings(tree: ast.AST) -> set[str]:
@@ -2014,6 +2103,44 @@ def find_exec_send_path_violations(path: str, source: str) -> list[Violation]:
     return violations
 
 
+def find_exec_resolver_violations(path: str, source: str) -> list[Violation]:
+    """Resolution A (plan rev 6.1), SAFETY M3 pin 2: the resolver's own
+    E0-NOSEND-shaped rule.
+
+    Unlike :func:`find_exec_send_path_violations`, ``await``/``async for``/
+    ``async with`` are NOT banned here -- the resolver's whole job is I/O.
+    The invariant is narrower and sharper: no call except the ones in
+    :data:`EXEC_RESOLVER_PERMITTED_CALLEES`, which excludes
+    ``self._order_sender.post_order`` BY CONSTRUCTION. A resolver that could
+    reach it would defeat the entire point of resolving AMBIGUOUS by GET.
+    """
+    if not path.startswith(EXEC_PACKAGE_PATH_PREFIX):
+        return []
+    tree = ast.parse(source, filename=path)
+    violations: list[Violation] = []
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.AsyncFunctionDef | ast.FunctionDef):
+            continue
+        if node.name not in EXEC_RESOLVER_COROUTINES:
+            continue
+        for inner in ast.walk(node):
+            if not isinstance(inner, ast.Call):
+                continue
+            callee = _dotted_callee(inner.func)
+            if callee not in EXEC_RESOLVER_PERMITTED_CALLEES:
+                violations.append(
+                    Violation(
+                        path,
+                        inner.lineno,
+                        "E0-NOSEND-RESOLVER",
+                        f"{node.name}() calls "
+                        f"{callee or ast.dump(inner.func)[:48]}, which is not one of "
+                        "the resolver's permitted callees",
+                    )
+                )
+    return violations
+
+
 def find_exec_inertness_violations(path: str, source: str) -> list[Violation]:
     """E0-INERT: a module under ``exec/`` may not import a network client, and
     may not define a coroutine unless it is an async-lifecycle module.
@@ -2084,6 +2211,7 @@ def find_exec_inertness_violations(path: str, source: str) -> list[Violation]:
 
     violations.extend(find_exec_transport_violations(path, source))
     violations.extend(find_exec_send_path_violations(path, source))
+    violations.extend(find_exec_resolver_violations(path, source))
     return violations
 
 
@@ -2575,6 +2703,10 @@ def test_the_order_coroutine_callee_allowlist_reaches_no_venue() -> None:
             "self._latch.arm",
             "self._latch.retire",
             "self._latch.is_latched",
+        # Resolution A/E (plan rev 6.1): note the AMBIGUOUS resolver
+        # context. Inert sync callee -- writes only to the already-open
+        # local store and a process-local dict; reaches no network.
+        "self._note_ambiguous_open",
             "self._write_signer.sign_headers",
             "self._order_sender.post_order",
             "submit_chain.latched_refusal_reason",
@@ -2728,11 +2860,19 @@ def test_x1_the_live_scan_actually_reaches_a_test_that_imports_the_exec_package(
     # `on_order_denied` WAIT-reason test) to reuse the ONE
     # `OPEN_INTENT_WAIT_REASON` literal rather than a second, drifting copy
     # -- a pure string constant, no client, no socket.
+    #
+    # Old -> new (this row, Resolution A/C/D, plan rev 6.1): added
+    # `tests/unit/test_current_rung_hold_ambiguous_resolver.py`, which drives
+    # the REAL `_resolve_ambiguous_intents` coroutine through
+    # `_build_race_client` (the SAME `PolymarketUSExecutionClient` +
+    # `_SlowSender` double as SAFETY C1's suite) -- no socket, no new sender
+    # shape.
     assert exec_importing_test_modules() == {
         "tests/contract/test_exec_client_reconciliation_contract.py",
         "tests/contract/test_exec_client_wiring_contract.py",
         "tests/contract/test_live_fill_scoring_chain_contract.py",
         "tests/unit/test_continuous_rung_hold_strategy.py",
+        "tests/unit/test_current_rung_hold_ambiguous_resolver.py",
         "tests/unit/test_current_rung_hold_order_submission_wiring.py",
         "tests/unit/test_current_rung_hold_pre_arm_race.py",
         "tests/unit/test_exec_refusal_health_surface.py",
@@ -2870,3 +3010,89 @@ def test_e2_mro_closure_is_additive_not_a_replacement() -> None:
     )
     rules = {v.rule for v in _scan_source("src/breezy/whatever.py", source)}
     assert "E2" in rules
+
+
+# ==========================================================================
+# Resolution A (plan rev 6.1) -- the resolver's own E0-NOSEND-shaped rule
+# ==========================================================================
+
+
+def test_resolver_coroutines_are_disjoint_from_order_lifecycle_coroutines() -> None:
+    """SAFETY M3 pin: the resolver is scanned by its OWN rule, never
+    ``ORDER_LIFECYCLE_COROUTINES``'s -- a name in both sets would let the
+    resolver inherit the await-ban (it needs to await) or let an order
+    coroutine borrow the resolver's wider allowlist. Neither is intended."""
+    assert EXEC_RESOLVER_COROUTINES & ORDER_LIFECYCLE_COROUTINES == set()
+
+
+def test_resolver_scan_detects_a_planted_post_order_call() -> None:
+    """Non-vacuity, the pin the coordinator's brief names by name: a planted
+    ``self._order_sender.post_order`` call inside a synthetic resolver
+    coroutine must be caught -- proving the ONE sanctioned egress call in
+    the whole ``exec/`` package is excluded from this allowlist by
+    construction, not by omission."""
+    source = (
+        '"""Docstring."""\n'
+        "\n"
+        "\n"
+        "async def _resolve_ambiguous_intents(self):\n"
+        "    await self._order_sender.post_order(self._api_base_url, headers={}, body=b'{}')\n"
+    )
+    violations = find_exec_resolver_violations(
+        "src/breezy/adapters/polymarket_us/exec/client.py",
+        source,
+    )
+    assert [v.rule for v in violations] == ["E0-NOSEND-RESOLVER"]
+    assert "post_order" in violations[0].detail
+
+
+def test_resolver_scan_permits_a_bounded_get_and_nothing_else() -> None:
+    """Control: the exact I/O shape the resolver ships (a GET, a log line)
+    is legal, or the rule would forbid the very thing it exists to permit."""
+    source = (
+        '"""Docstring."""\n'
+        "\n"
+        "\n"
+        "async def _resolve_ambiguous_intents(self):\n"
+        "    await asyncio.sleep(self._resolver_poll_interval_secs())\n"
+        "    current = self._latch.current()\n"
+        "    self._log.warning('polling')\n"
+    )
+    assert (
+        find_exec_resolver_violations(
+            "src/breezy/adapters/polymarket_us/exec/client.py",
+            source,
+        )
+        == []
+    )
+
+
+def test_resolver_scan_reaches_the_shipped_coroutines_non_vacuously() -> None:
+    """Non-vacuity of the live scan: the shipped tree actually defines both
+    scanned resolver functions, so the rule above is not testing an empty set."""
+    for path, source in iter_python_sources(EGRESS_SCAN_ROOTS):
+        if path != "src/breezy/adapters/polymarket_us/exec/client.py":
+            continue
+        defined = {
+            node.name
+            for node in ast.walk(ast.parse(source, filename=path))
+            if isinstance(node, ast.AsyncFunctionDef | ast.FunctionDef)
+        }
+        assert EXEC_RESOLVER_COROUTINES <= defined
+        return
+    raise AssertionError("client.py was not reached by the scan roots")
+
+
+def test_the_shipped_resolver_reaches_no_violation() -> None:
+    """The live barrier, scoped: the actually-shipped
+    ``_resolve_ambiguous_intents``/``_resolve_terminal_zero`` clear their
+    own rule. Already covered by the whole-suite
+    ``test_e0_inert_no_shipped_exec_module_can_reach_the_network``, pinned
+    again here under the resolver's own name so a future narrowing of that
+    umbrella test cannot silently stop covering this rule."""
+    for path, source in iter_python_sources(EGRESS_SCAN_ROOTS):
+        if path != "src/breezy/adapters/polymarket_us/exec/client.py":
+            continue
+        assert find_exec_resolver_violations(path, source) == []
+        return
+    raise AssertionError("client.py was not reached by the scan roots")

@@ -328,6 +328,8 @@ CAGE_RULE_PINS: tuple[RulePin, ...] = (
                 "_publish_account_state",
                 "_wait_for_instruments",
                 "_confirm_account_registered",
+                "_resolve_ambiguous_intents",
+                "_cancel_resolver_task",
                 "__call__",
             }
         ),
@@ -520,6 +522,10 @@ CAGE_RULE_PINS: tuple[RulePin, ...] = (
                 # SAFETY C1 (plan rev 6.1): the pre-spend re-check, read-only
                 # against the durable singleton -- adds no send path.
                 "self._latch.is_latched",
+                # Resolution A/E (plan rev 6.1): note the AMBIGUOUS resolver
+                # context. Inert sync callee -- writes only to the already-open
+                # local store and a process-local dict; reaches no network.
+                "self._note_ambiguous_open",
                 "self._write_signer.sign_headers",
                 "self._order_sender.post_order",
                 "submit_chain.latched_refusal_reason",

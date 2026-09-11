@@ -245,10 +245,19 @@ from nautilus_trader.model.enums import (
     LiquiditySide,
     OmsType,
     OrderSide,
+    OrderStatus,
     OrderType,
     PositionSide,
 )
-from nautilus_trader.model.identifiers import AccountId, ClientOrderId, VenueOrderId
+from nautilus_trader.model.identifiers import (
+    AccountId,
+    ClientOrderId,
+    InstrumentId,
+    StrategyId,
+    TradeId,
+    VenueOrderId,
+)
+from nautilus_trader.model.objects import Money
 
 import breezy.adapters.polymarket_us.write_transport as write_transport  # noqa: PLR0402
 from breezy.adapters.polymarket_us.errors import (
@@ -283,8 +292,9 @@ from breezy.adapters.polymarket_us.safety import (
     LiveTradingPermissionError,
     assert_live_order_submission_permitted,
 )
-from breezy.adapters.polymarket_us.symbology import slug_to_instrument_id
+from breezy.adapters.polymarket_us.symbology import instrument_id_to_slug, slug_to_instrument_id
 from breezy.ingest.gate import assert_state_store_durable
+from breezy.runtime.submit_intent import SubmitIntentCorrupt, SubmitIntentState
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
     from nautilus_trader.cache.cache import Cache
@@ -308,16 +318,18 @@ if TYPE_CHECKING:  # pragma: no cover - typing only
         FillReport,
         OrderStatusReport,
     )
-    from nautilus_trader.model.identifiers import ClientId, InstrumentId, Venue
+    from nautilus_trader.model.identifiers import ClientId, Venue
     from nautilus_trader.model.instruments import Instrument
-    from nautilus_trader.model.objects import Money, Price, Quantity
+    from nautilus_trader.model.objects import Price, Quantity
 
     from breezy.ingest.gate import ClosableStateStore, StateStoreOpener
 
 __all__ = [
     "FILL_INDEX_KEY_PREFIX",
     "FILL_KEY_PREFIX",
+    "RESOLVER_CONTEXT_KEY_PREFIX",
     "VENUE_ORDER_ID_KEY_PREFIX",
+    "AmbiguousResolverContext",
     "DurableFillRecord",
     "PolymarketUSExecutionClient",
     "PrivateRead",
@@ -339,6 +351,17 @@ FILL_KEY_PREFIX: Final[str] = f"{STATE_KEY_NAMESPACE}fill/"
 #: Instrument -> the venue order ids whose fill records belong to it. Needed
 #: because the store has no prefix scan; see the module docstring.
 FILL_INDEX_KEY_PREFIX: Final[str] = f"{STATE_KEY_NAMESPACE}fill_index/"
+
+#: Resolution A/E (plan rev 6.1): intent_id -> the durable resolver context
+#: for one with-id AMBIGUOUS create-order outcome. Written by
+#: `_note_ambiguous_open` BEFORE `_resolve_ambiguous_intents` can ever
+#: observe it. Each `intent_id` is a fresh UUID4 hex (`SubmitIntentLatch.
+#: arm`), so an old key is never overwritten or collided with.
+RESOLVER_CONTEXT_KEY_PREFIX: Final[str] = f"{STATE_KEY_NAMESPACE}resolver/"
+
+#: How often `_resolve_ambiguous_intents` checks for a durable resolver
+#: context on the currently-OPEN submit intent. Build-side; revisable.
+_RESOLVER_POLL_INTERVAL_SECS: Final[float] = 5.0
 
 #: The only order side Breezy OPENS with. ``allow_short=False`` is permanent
 #: (``strategy/weather_common/risk.py:139``).
@@ -538,6 +561,133 @@ class DurableFillRecord:
             ) from None
 
 
+@dataclass(frozen=True, slots=True)
+class AmbiguousResolverContext:
+    """Resolution A/E (plan rev 6.1): durable evidence for one with-id
+    AMBIGUOUS create-order outcome, written by ``_note_ambiguous_open``
+    BEFORE ``_resolve_ambiguous_intents`` can ever observe it.
+
+    ``booking_id`` is process-local context ONLY -- the ledger it names dies
+    with the process (restart re-entry never re-derives a booking from this
+    field; it retires and clears with no true-up and no restore, since the
+    reminted budget already starts whole).
+    """
+
+    intent_id: str
+    venue_order_id: str
+    instrument_id: str
+    client_order_id: str
+    strategy_id: str
+    notional_usd: Decimal
+    booking_id: int
+    created_ns: int
+
+    def to_bytes(self) -> bytes:
+        return json.dumps(
+            {
+                "intentId": self.intent_id,
+                "venueOrderId": self.venue_order_id,
+                "instrumentId": self.instrument_id,
+                "clientOrderId": self.client_order_id,
+                "strategyId": self.strategy_id,
+                "notionalUsd": str(self.notional_usd),
+                "bookingId": self.booking_id,
+                "createdNs": self.created_ns,
+            },
+            sort_keys=True,
+        ).encode("utf-8")
+
+    @classmethod
+    def from_bytes(cls, raw: bytes) -> Self:
+        try:
+            payload = json.loads(raw)
+        except ValueError as exc:
+            raise ExecutionReportMappingError(
+                f"a durable resolver context is not valid JSON ({len(raw)} bytes): {exc}"
+            ) from None
+        if not isinstance(payload, dict):
+            raise ExecutionReportMappingError(
+                f"a durable resolver context decoded to a {type(payload).__name__}, "
+                "not an object"
+            )
+        try:
+            return cls(
+                intent_id=str(payload["intentId"]),
+                venue_order_id=str(payload["venueOrderId"]),
+                instrument_id=str(payload["instrumentId"]),
+                client_order_id=str(payload["clientOrderId"]),
+                strategy_id=str(payload["strategyId"]),
+                notional_usd=_to_decimal(
+                    payload["notionalUsd"],
+                    field="notionalUsd",
+                    error=ExecutionReportMappingError,
+                ),
+                booking_id=int(payload["bookingId"]),
+                created_ns=int(payload["createdNs"]),
+            )
+        except (KeyError, TypeError, ValueError, InvalidOperation) as exc:
+            raise ExecutionReportMappingError(
+                f"a durable resolver context is malformed: {type(exc).__name__}: {exc}"
+            ) from None
+
+
+#: Resolution C/D (plan rev 6.1), widened by the partial-fill review: the
+#: native statuses a GET-resolved ``OrderStatusReport`` can carry when it is
+#: TERMINAL -- the exact analogue of
+#: ``submit_chain._IOC_ZERO_FILL_TERMINAL_STATES``, on the native enum this
+#: report uses instead of the raw venue string. This same set now covers
+#: BOTH terminal outcomes: with ``filled_qty == 0`` it is Resolution D
+#: (terminal-zero, ``_resolve_terminal_zero``); with ``filled_qty > 0`` it is
+#: a TERMINAL-FILL -- the normal IOC partial-fill shape once
+#: ``minimumTradeQty`` dropped to 0.01 (a CANCELED/EXPIRED order can still
+#: carry real filled shares) -- resolved by ``_resolve_accept_fill`` exactly
+#: like a full FILLED.
+_RESOLVER_TERMINAL_STATUSES: Final[frozenset[OrderStatus]] = frozenset(
+    {OrderStatus.CANCELED, OrderStatus.REJECTED, OrderStatus.EXPIRED}
+)
+#: A GET-resolved report carrying a COMPLETE fill. ``PARTIALLY_FILLED`` is
+#: deliberately EXCLUDED: it is a LIVE state -- the order can still receive
+#: more fills or reach a terminal status later -- and must NEVER resolve the
+#: intent. Only a genuinely terminal status ends it: ``FILLED`` here, or one
+#: of ``_RESOLVER_TERMINAL_STATUSES`` with ``filled_qty > 0`` (the
+#: terminal-fill case above).
+_RESOLVER_FILL_STATUSES: Final[frozenset[OrderStatus]] = frozenset({OrderStatus.FILLED})
+
+
+def _resolver_long_position_state(positions: Mapping[str, Any], slug: str) -> bool | None:
+    """Resolution C: ``True`` -- a LONG is present at ``slug``. ``False`` --
+    confirmed no LONG (the slug is absent, which IS a confirmed zero
+    position). ``None`` -- undetermined (malformed ``netPosition``); the
+    caller MUST treat this exactly like a read failure: take no action,
+    stay AMBIGUOUS, try again next pass. Never ``_refuse``s.
+    """
+    payload = positions.get(slug)
+    if payload is None:
+        return False
+    if not isinstance(payload, Mapping):
+        return None
+    net_raw = payload.get("netPosition")
+    if net_raw is None:
+        return None
+    try:
+        net = _to_decimal(net_raw, field="netPosition", error=ExecutionReportMappingError)
+    except ExecutionReportMappingError:
+        return None
+    return net > 0
+
+
+def _synthetic_get_fill_trade_id(venue_order_id: str) -> TradeId:
+    """Slice 3: a pure, deterministic function of ``venue_order_id`` alone.
+
+    The venue never issues a per-execution trade id for a GET-confirmed
+    fill (the Order schema has no execution legs) -- this is Breezy's OWN
+    synthetic id, prefixed ``GET-`` so it is VISIBLY distinguishable from a
+    venue-issued trade id anywhere it is logged or compared. Same input,
+    same output, always: no clock, no counter, no randomness.
+    """
+    return TradeId(f"GET-{venue_order_id}")
+
+
 class PolymarketUSExecutionClient(LiveExecutionClient):
     """Reconciles the Polymarket.us account, and refuses every order.
 
@@ -652,6 +802,20 @@ class PolymarketUSExecutionClient(LiveExecutionClient):
         self._api_base_url = api_base_url
         self._retirement_reasons = retirement_reasons
         self._intent_reconciled: bool = False
+        # Resolution A/E (plan rev 6.1): the live `SpendBooking` for a
+        # with-id AMBIGUOUS intent, held ONLY for same-process true-up.
+        # Restart re-entry finds this dict empty (the ledger died too) and
+        # correctly skips true-up/release -- the reminted budget already
+        # starts whole.
+        self._ambiguous_bookings: dict[str, Any] = {}
+        # SAFETY H2: set ONLY by a terminal GET the resolver itself makes in
+        # THIS run. A durable record can schedule a GET; it can never
+        # authorize a retirement on its own.
+        self._resolved_by_get_ts_ns: dict[str, int] = {}
+        self._resolver_task: asyncio.Task[None] | None = None
+        #: Review fix 3 (Slice 2): a corrupt singleton is logged at ERROR
+        #: ONCE, not every poll interval for the process lifetime.
+        self._resolver_corrupt_logged = False
 
     # -- observable state ---------------------------------------------------
 
@@ -735,6 +899,15 @@ class PolymarketUSExecutionClient(LiveExecutionClient):
         try:
             self._set_account_id(self._issued_account_id)
             self._open_state_store()
+            # Resolution A (plan rev 6.1): started here, unconditionally,
+            # for the client's lifetime -- a named, firewall-scanned
+            # coroutine (`EXEC_RESOLVER_COROUTINES`), never awaited inline.
+            # It is a no-op every pass until an AMBIGUOUS outcome writes a
+            # durable resolver context via `_note_ambiguous_open`.
+            self._resolver_task = self.create_task(
+                self._resolve_ambiguous_intents(),
+                log_msg="resolve_ambiguous_intents",
+            )
             await self._wait_for_instruments()
             await self._publish_account_state()
             await self._confirm_account_registered()
@@ -774,6 +947,364 @@ class PolymarketUSExecutionClient(LiveExecutionClient):
         )
         self._intent_reconciled = True
 
+    def _resolver_poll_interval_secs(self) -> float:
+        """Overridable seam: tests shrink this to iterate the loop fast."""
+        return _RESOLVER_POLL_INTERVAL_SECS
+
+    async def _resolve_ambiguous_intents(self) -> None:
+        """Resolution A (plan rev 6.1): named, firewall-scanned client
+        coroutine for the with-id AMBIGUOUS class (L-36). Started from
+        ``_connect`` after ``_open_state_store``; runs for the client's
+        lifetime.
+
+        Each pass is a no-op unless the account-wide submit intent is OPEN
+        with a durable resolver context (written by ``_note_ambiguous_open``
+        -- a no-id AMBIGUOUS never gets one, and stays operator-only). GET
+        exception, 5xx, malformed body, PENDING/non-terminal status, or
+        not-found all leave the pass with NOTHING done: the intent stays
+        AMBIGUOUS and the NEXT pass tries again -- exhaustion of one pass's
+        evidence gathering is never terminal.
+
+        Bypasses ``generate_order_status_report`` deliberately (ARCH M1):
+        that method collapses four distinct failure shapes into ``None``,
+        and fail-open is the one outcome this design forbids. This
+        coroutine calls ``_private_read`` + ``submit_chain.order_by_id_path``
+        + ``parse_order_status_report`` directly, so a read failure and an
+        unmappable body are each observed for what they are.
+
+        Crash safety: a crash between ``_retire`` and ``generate_order_
+        filled`` (or ``generate_order_canceled``) loses only the in-process
+        native event -- acceptable because this client's Nautilus ``Cache``
+        is ``database=None`` (no native event persists across a restart
+        regardless), and the durable fill record ``record_fill`` wrote
+        BEFORE ``_retire`` is the source of truth: a later increment's
+        never-arm ``on_start`` walk replays it into TRIAL state (next
+        slice), so nothing this record represents is actually lost.
+
+        The LONG gate (``_resolver_long_position_state``) is slug-level
+        ``netPosition > 0`` corroboration ONLY, never magnitude-matched
+        against the GET's own ``filled_qty`` -- the order-specific GET
+        report is the sole authority for the quantity and price a fill is
+        synthesized from; the positions read exists only to confirm a LONG
+        exists at all before acting.
+        """
+        while True:
+            await asyncio.sleep(self._resolver_poll_interval_secs())
+            if self._latch is None:
+                self._log.debug("resolver: no latch bound; skipping this pass")
+                continue
+            try:
+                current = self._latch.current()
+            except SubmitIntentCorrupt:
+                # Fail closed like `is_latched()` does: a corrupt singleton
+                # is treated as OPEN-unknown -- never retire, never act, but
+                # the task itself must survive. Polling continues rather
+                # than stopping: an operator's `breezy-clear-submit-intent`
+                # rewrites the record out from under this, and the very
+                # next pass would then observe a valid one again. Logged
+                # ONCE so a persistent corruption does not spam every poll
+                # interval for the process lifetime.
+                if not self._resolver_corrupt_logged:
+                    self._resolver_corrupt_logged = True
+                    self._log.error(
+                        "resolver: the submit-intent singleton is corrupt; "
+                        "treating it as OPEN-unknown and continuing to poll "
+                        "(fail closed, never retiring on unreadable state)"
+                    )
+                continue
+            if current is None or current.state is not SubmitIntentState.OPEN:
+                self._log.debug("resolver: no OPEN intent; nothing to resolve this pass")
+                continue
+            raw_context = self._store_get(f"{RESOLVER_CONTEXT_KEY_PREFIX}{current.intent_id}")
+            if raw_context is None:
+                # No-id AMBIGUOUS, or nothing to resolve yet.
+                self._log.debug(
+                    f"resolver: no durable resolver context for intent "
+                    f"{current.intent_id}; nothing to resolve this pass"
+                )
+                continue
+            try:
+                context = AmbiguousResolverContext.from_bytes(raw_context)
+            except ExecutionReportMappingError as exc:
+                self._log.error(
+                    f"resolver context for intent {current.intent_id} is "
+                    f"malformed ({exc}); this intent stays AMBIGUOUS"
+                )
+                continue
+            if context.intent_id != current.intent_id:
+                self._log.error(
+                    f"resolver context key {current.intent_id} carries a "
+                    f"foreign intent_id {context.intent_id}; refusing to act on it"
+                )
+                continue
+            instrument = self._cache.instrument(InstrumentId.from_str(context.instrument_id))
+            if instrument is None:
+                self._log.warning(
+                    f"resolver: instrument {context.instrument_id} not in the "
+                    "cache; retrying next pass"
+                )
+                continue
+            try:
+                order_payload = await self._private_read(
+                    submit_chain.order_by_id_path(context.venue_order_id)
+                )
+            except Exception as exc:  # noqa: BLE001 - GET failure stays AMBIGUOUS
+                self._log.warning(
+                    f"resolver GET failed for venue order {context.venue_order_id} "
+                    f"({type(exc).__name__}: {exc}); stays AMBIGUOUS"
+                )
+                continue
+            order_body: Mapping[str, Any]
+            nested = order_payload.get("order") if isinstance(order_payload, Mapping) else None
+            if isinstance(nested, Mapping):
+                order_body = nested
+            elif isinstance(order_payload, Mapping):
+                order_body = order_payload
+            else:
+                self._log.warning(
+                    f"resolver GET for venue order {context.venue_order_id} "
+                    "returned an unmappable body shape; stays AMBIGUOUS"
+                )
+                continue
+            try:
+                report = parse_order_status_report(
+                    order_body,
+                    instrument=instrument,
+                    account_id=self._issued_account_id,
+                    report_id=UUID4(),
+                    ts_init=self._clock.timestamp_ns(),
+                )
+            except Exception as exc:  # noqa: BLE001 - malformed stays AMBIGUOUS
+                self._log.warning(
+                    f"resolver GET body for venue order {context.venue_order_id} "
+                    f"did not map ({type(exc).__name__}: {exc}); stays AMBIGUOUS"
+                )
+                continue
+
+            if report.order_status is OrderStatus.PARTIALLY_FILLED:
+                # A LIVE state: the order can still receive more fills or
+                # reach a terminal status later. Never resolves the intent --
+                # logged at INFO (not a problem, just progress) and polled
+                # again; a LATER pass that observes a genuinely terminal
+                # status is the one that acts.
+                self._log.info(
+                    f"resolver: venue order {context.venue_order_id} is "
+                    f"PARTIALLY_FILLED (cum={report.filled_qty}); a live "
+                    "state, never resolves -- stays AMBIGUOUS, keep polling"
+                )
+                continue
+
+            filled_qty_is_zero = report.filled_qty.as_decimal() == submit_chain.ZERO
+            is_terminal = report.order_status in _RESOLVER_TERMINAL_STATUSES
+            is_terminal_zero = is_terminal and filled_qty_is_zero
+            # A terminal status (CANCELED/REJECTED/EXPIRED) with filled_qty >
+            # 0 is the normal IOC partial-fill shape (minimumTradeQty 0.01):
+            # a TERMINAL-FILL, resolved by `_resolve_accept_fill` exactly
+            # like a full FILLED.
+            is_terminal_fill = is_terminal and not filled_qty_is_zero
+            is_full_fill = (
+                report.order_status in _RESOLVER_FILL_STATUSES and not filled_qty_is_zero
+            )
+            is_fill = is_terminal_fill or is_full_fill
+            if not is_terminal_zero and not is_fill:
+                self._log.warning(
+                    f"resolver: venue order {context.venue_order_id} is "
+                    f"neither terminal nor a fill (status={report.order_status}, "
+                    f"filled_qty={report.filled_qty}); stays AMBIGUOUS, keep polling"
+                )
+                continue
+
+            try:
+                positions_payload = await self._private_read(PORTFOLIO_POSITIONS_PATH)
+                positions = self._declared_positions(positions_payload)
+            except Exception as exc:  # noqa: BLE001 - transient; never `_refuse`
+                self._log.warning(
+                    f"resolver positions read failed ({type(exc).__name__}: {exc}); "
+                    "stays AMBIGUOUS"
+                )
+                continue
+
+            slug = instrument_id_to_slug(instrument.id)
+            long_state = _resolver_long_position_state(positions, slug)
+            if long_state is None:
+                self._log.warning(
+                    f"resolver could not determine {slug}'s position from an "
+                    "eof-complete read; stays AMBIGUOUS"
+                )
+                continue
+
+            now_ns = self._clock.timestamp_ns()
+            # SAFETY H2: set ONLY here, by a terminal GET made in THIS run.
+            # A durable record can schedule a GET; it can never by itself
+            # authorize a retirement.
+            self._resolved_by_get_ts_ns[current.intent_id] = now_ns
+
+            if is_terminal_zero and long_state is False:
+                self._resolve_terminal_zero(context, now_ns)
+            elif is_fill and long_state is True:
+                self._resolve_accept_fill(context, report, instrument, now_ns)
+            else:
+                self._log.warning(
+                    "resolver: GET evidence and the positions read disagree "
+                    f"for venue order {context.venue_order_id} "
+                    f"(status={report.order_status}, long_present={long_state}); "
+                    "stays AMBIGUOUS pending a consistent read"
+                )
+
+    def _resolve_terminal_zero(
+        self, context: AmbiguousResolverContext, now_ns: int,
+    ) -> None:
+        """Resolution D: GET-confirmed terminal, zero-filled, no LONG.
+
+        Mirrors the CREATE-time ``KIND_ZERO_FILL`` branch exactly (same
+        ledger op, same native event), on evidence from a GET instead of
+        the create response. ARCH M2: ``retire`` is NOT idempotent
+        (``SubmitIntentMismatch`` on a non-OPEN or foreign singleton), so
+        ``current()`` is read and checked FIRST -- a re-entry against an
+        already-retired singleton cleans up and returns without calling
+        ``retire`` a second time.
+
+        Review fix 2 (Slice 2): SAFETY H2 is made load-bearing HERE, not
+        only structural at the call site -- this method itself refuses to
+        retire unless ``context.intent_id`` was stamped into
+        ``self._resolved_by_get_ts_ns`` by a terminal GET made in THIS run.
+        A durable resolver context can schedule a GET; it can never by
+        itself authorize a retirement.
+        """
+        if context.intent_id not in self._resolved_by_get_ts_ns:
+            self._log.error(
+                f"resolver: refusing to retire intent {context.intent_id} -- "
+                "no terminal GET was recorded for it in this run; SAFETY H2 "
+                "fail-closed"
+            )
+            return
+        current = self._latch.current()
+        if (
+            current is None
+            or current.state is not SubmitIntentState.OPEN
+            or current.intent_id != context.intent_id
+        ):
+            self._ambiguous_bookings.pop(context.intent_id, None)
+            return
+        self._retire(context.intent_id, "STATUS_REPORT_ZERO_FILL_TERMINAL", now_ns)
+        booking = self._ambiguous_bookings.pop(context.intent_id, None)
+        if booking is not None:
+            # Same-process only (Resolution E): on restart the ledger died
+            # with the process and this dict is empty -- the reminted
+            # budget already starts whole, so there is nothing to true up.
+            self._ledger.true_up_booking(booking, filled_cost_usd=submit_chain.ZERO, now_ns=now_ns)
+        self.generate_order_canceled(
+            strategy_id=StrategyId(context.strategy_id),
+            instrument_id=InstrumentId.from_str(context.instrument_id),
+            client_order_id=ClientOrderId(context.client_order_id),
+            venue_order_id=submit_chain.venue_order_id(context.venue_order_id),
+            ts_event=now_ns,
+        )
+
+    def _resolve_accept_fill(
+        self,
+        context: AmbiguousResolverContext,
+        report: Any,
+        instrument: Any,
+        now_ns: int,
+    ) -> None:
+        """Slice 3 (plan rev 6.1): GET-confirmed FILLED/PARTIALLY_FILLED with
+        a LONG present on an eof-complete positions read.
+
+        The venue's Order schema carries no execution legs, so the fill is
+        SYNTHESIZED from ``cumQuantity``/``avgPx`` -- the same two fields the
+        CREATE path's own I1a totals are built from. ``trade_id`` is a pure,
+        deterministic, VISIBLY SYNTHETIC function of ``venue_order_id``
+        (:func:`_synthetic_get_fill_trade_id`) so nothing downstream can ever
+        mistake it for a venue-issued trade id. ``commission`` is
+        ``Money(0, USD)`` and ``fee_reconciled`` is ``False`` -- the fee is
+        genuinely unknown from an Order-only GET, recorded DURABLY as such on
+        the fill record itself. This deliberately never calls ``_refuse``
+        (unlike the CREATE path's own ``_FEE_UNRECONCILED``): I2's residual-
+        bucket mechanism reads the durable ``fee_reconciled`` flag, and
+        latching ``_trading_refusals`` here would halt trading over a fee
+        gap this design already expects and durably records.
+
+        Ordering mirrors the CREATE-time ``KIND_ACCEPT_FILL`` branch exactly
+        for the same crash-safety reason: ``record_fill`` (durable) happens
+        BEFORE ``retire`` (singleton state) happens BEFORE
+        ``generate_order_filled`` (the native event) -- a crash at any point
+        still leaves the durable evidence a restart can read.
+
+        SAFETY H2 and ARCH M2 apply identically to :meth:`_resolve_terminal_
+        zero`: refuses to act absent a this-run GET timestamp, and reads
+        ``current()`` first so a re-entry against an already-retired
+        singleton cleans up and returns without a second ``retire`` call.
+        """
+        if context.intent_id not in self._resolved_by_get_ts_ns:
+            self._log.error(
+                f"resolver: refusing to record a fill for intent "
+                f"{context.intent_id} -- no terminal GET was recorded for "
+                "it in this run; SAFETY H2 fail-closed"
+            )
+            return
+        current = self._latch.current()
+        if (
+            current is None
+            or current.state is not SubmitIntentState.OPEN
+            or current.intent_id != context.intent_id
+        ):
+            self._ambiguous_bookings.pop(context.intent_id, None)
+            return
+        avg_px = report.avg_px
+        if avg_px is None or avg_px <= 0:
+            self._log.error(
+                f"resolver: GET confirms a FILL for venue order "
+                f"{context.venue_order_id} with no usable avg_px "
+                f"({avg_px!r}); a fill cannot be synthesized from this "
+                "evidence -- stays AMBIGUOUS"
+            )
+            return
+        cumulative_qty = report.filled_qty.as_decimal()
+        cumulative_cost = cumulative_qty * avg_px
+        record = DurableFillRecord(
+            venue_order_id=context.venue_order_id,
+            client_order_id=context.client_order_id,
+            instrument_id=context.instrument_id,
+            order_side=LONG_ONLY_SIDE,
+            cumulative_qty=cumulative_qty,
+            cumulative_cost=cumulative_cost,
+            cumulative_fee=submit_chain.ZERO,
+            fee_reconciled=False,
+            ts_event=now_ns,
+            venue_fee_raw=None,
+        )
+        try:
+            self.record_fill(record)
+        except Exception as exc:  # noqa: BLE001 - see the CREATE path's identical guard
+            fill_record_bytes = record.to_bytes()
+            detail = fill_record_bytes.decode()
+            self._log.error(
+                f"{_FILL_WRITE_FAILED}: {exc.__class__.__name__}: {exc}; record={detail}"
+            )
+            self._refuse(_FILL_WRITE_FAILED)
+            return
+        booking = self._ambiguous_bookings.pop(context.intent_id, None)
+        if booking is not None:
+            self._ledger.true_up_booking(booking, filled_cost_usd=cumulative_cost, now_ns=now_ns)
+        self._retire(context.intent_id, "STATUS_REPORT_ACCEPT_FILL_TERMINAL", now_ns)
+        self.generate_order_filled(
+            strategy_id=StrategyId(context.strategy_id),
+            instrument_id=InstrumentId.from_str(context.instrument_id),
+            client_order_id=ClientOrderId(context.client_order_id),
+            venue_order_id=submit_chain.venue_order_id(context.venue_order_id),
+            venue_position_id=None,
+            trade_id=_synthetic_get_fill_trade_id(context.venue_order_id),
+            order_side=OrderSide.BUY,
+            order_type=OrderType.LIMIT,
+            last_qty=report.filled_qty,
+            last_px=instrument.make_price(avg_px),
+            quote_currency=USD,
+            commission=Money(0, USD),
+            liquidity_side=LiquiditySide.TAKER,
+            ts_event=now_ns,
+        )
+
     async def _disconnect(self) -> None:
         """Close the durable store. A failing close does not fail the shutdown.
 
@@ -786,6 +1317,7 @@ class PolymarketUSExecutionClient(LiveExecutionClient):
         root's, never opened by this client; only the reconciled flag resets.
         """
         self._intent_reconciled = False
+        await self._cancel_resolver_task()
         store = self._store
         self._store = None
         if store is None:
@@ -797,6 +1329,23 @@ class PolymarketUSExecutionClient(LiveExecutionClient):
                 f"The durable execution store did not close cleanly "
                 f"({type(exc).__name__}: {exc}); its handle is now unreachable"
             )
+
+    async def _cancel_resolver_task(self) -> None:
+        """Mirrors ``data.py``'s ``_cancel_update_instruments`` exactly: the
+        reference is dropped first, then ``cancel()`` is followed by an
+        ``await`` so the cancellation is actually delivered before this
+        returns -- never fire-and-forget. Deterministic shutdown ordering
+        depends on this: the store is closed only AFTER the resolver task
+        has genuinely stopped touching it."""
+        task = self._resolver_task
+        self._resolver_task = None
+        if task is None or task.done():
+            return
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
 
     def _open_state_store(self) -> None:
         """Construct the store on THIS thread and prove it actually persists.
@@ -1566,6 +2115,36 @@ class PolymarketUSExecutionClient(LiveExecutionClient):
             ts_event=now_ns,
         )
 
+    def _note_ambiguous_open(
+        self,
+        *,
+        intent_id: str,
+        venue_order_id: str,
+        order: Any,
+        notional_usd: Decimal,
+        booking: Any,
+        now_ns: int,
+    ) -> None:
+        """Resolution A/E: record durable resolver context for a with-id
+        AMBIGUOUS outcome, and hold the live ``SpendBooking`` for
+        same-process true-up. Inert sync callee, named in the E0-NOSEND
+        allowlist like :meth:`_deny`/:meth:`_retire` -- writes only to the
+        already-open local store and a process-local dict; reaches no
+        network.
+        """
+        context = AmbiguousResolverContext(
+            intent_id=intent_id,
+            venue_order_id=venue_order_id,
+            instrument_id=str(order.instrument_id),
+            client_order_id=str(order.client_order_id.value),
+            strategy_id=str(order.strategy_id.value),
+            notional_usd=notional_usd,
+            booking_id=booking.booking_id,
+            created_ns=now_ns,
+        )
+        self._store_set(f"{RESOLVER_CONTEXT_KEY_PREFIX}{intent_id}", context.to_bytes())
+        self._ambiguous_bookings[intent_id] = booking
+
     async def _submit_order(self, command: SubmitOrder) -> None:
         """Authorize, arm, POST, retire. Deny before any venue contact."""
         order = command.order
@@ -1802,6 +2381,18 @@ class PolymarketUSExecutionClient(LiveExecutionClient):
             )
         if outcome.generate_submitted:
             self._generate_submitted(order, now_ns)
+        if outcome.venue_order_id is not None:
+            # L-36 / Resolution A2: with-id only. A no-id AMBIGUOUS has
+            # nothing a GET could ever resolve and stays operator-only
+            # (`clear_submit_intent`, untouched).
+            self._note_ambiguous_open(
+                intent_id=intent.intent_id,
+                venue_order_id=outcome.venue_order_id,
+                order=order,
+                notional_usd=submit_chain.order_notional_usd(order),
+                booking=booking,
+                now_ns=now_ns,
+            )
 
     async def _cancel_order(self, command: CancelOrder) -> None:
         """Refuse. There is nothing to cancel: nothing can be sent."""

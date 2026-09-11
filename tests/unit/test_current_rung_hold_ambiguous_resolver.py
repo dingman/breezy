@@ -1,0 +1,779 @@
+"""Resolution A/C/D (plan rev 6.1): ``_resolve_ambiguous_intents`` end to end.
+
+A with-id AMBIGUOUS create-order outcome (L-36: the strict ZERO_FILL shape is
+unreachable; a no-fill IOC comes back AMBIGUOUS with a venue id) leaves the
+account-wide submit intent OPEN with a durable resolver context. This module
+drives the REAL resolver coroutine -- one bounded pass at a time, via the
+overridable ``_resolver_poll_interval_secs`` seam -- through:
+
+* a GET that never returns terminal evidence (stays OPEN, no action);
+* a GET-confirmed terminal-zero + an eof-complete positions read showing no
+  LONG (retires, trues the booking up to ZERO, cancels natively, IN_FLIGHT-
+  clearing via the strategy's own ``on_order_denied``-sibling handler is out
+  of THIS module's scope -- see the build report);
+* the SAFETY H2 mutation shape: a resolver that never calls the GET must
+  never retire (proven by never wiring a terminal response into the stub).
+
+Fixtures reused, never redefined: ``_build_race_client`` / ``_SlowSender`` /
+``_submit_command`` (``test_current_rung_hold_pre_arm_race.py``);
+``credentials`` / ``enable_operator_gate``
+(``test_polymarket_us_permit_issuance.py``); ``build_instrument``
+(``polymarket_us_exec_shapes.py``).
+"""
+
+from __future__ import annotations
+
+import asyncio
+import json
+from decimal import Decimal
+from pathlib import Path
+from typing import Any
+
+import pytest
+from nautilus_trader.common.component import LiveClock
+from nautilus_trader.common.factories import OrderFactory
+
+from breezy.adapters.polymarket_us.exec.client import (
+    AmbiguousResolverContext,
+    PolymarketUSExecutionClient,
+    _synthetic_get_fill_trade_id,
+)
+from breezy.adapters.polymarket_us.operator_controls import (
+    MAX_DAILY_BUDGET_USD_ENV_VAR,
+    MAX_POSITION_COST_USD_ENV_VAR,
+)
+from breezy.adapters.polymarket_us.safety import live_trading_budget_remaining
+from breezy.adapters.polymarket_us.symbology import instrument_id_to_slug
+from breezy.adapters.polymarket_us.transport import VenueResponse
+from breezy.runtime.submit_intent import CURRENT_INTENT_KEY, SubmitIntentCorrupt, SubmitIntentState
+from tests.unit.operator_control_env import operator_control_env
+from tests.unit.polymarket_us_exec_shapes import TS_EVENT_TEXT, build_instrument
+from tests.unit.test_current_rung_hold_pre_arm_race import (
+    STRATEGY_ID,
+    TRADER_ID,
+    _build_race_client,
+    _SlowSender,
+    _submit_command,
+)
+from tests.unit.test_polymarket_us_permit_issuance import enable_operator_gate
+from tests.unit.test_polymarket_us_submit_order_chain import (
+    write_canonical_verified,  # noqa: F401 -- reused as a fixture
+)
+
+
+def _ambiguous_create_body(order_id: str) -> bytes:
+    """L-36: 200 + id + executions == [] with no terminal state/cumQuantity."""
+    return json.dumps({"id": order_id, "executions": []}).encode("utf-8")
+
+
+def _order_get_body(
+    order_id: str,
+    *,
+    slug: str,
+    state: str,
+    cum_quantity: float,
+    avg_px: str | None = None,
+) -> dict[str, Any]:
+    order: dict[str, Any] = {
+        "id": order_id,
+        "marketSlug": slug,
+        "side": "ORDER_SIDE_BUY",
+        "type": "ORDER_TYPE_LIMIT",
+        "price": {"value": "0.40", "currency": "USD"},
+        "quantity": 1,
+        "cumQuantity": cum_quantity,
+        "leavesQuantity": 1 - cum_quantity,
+        "tif": "TIME_IN_FORCE_IMMEDIATE_OR_CANCEL",
+        "state": state,
+        "createTime": TS_EVENT_TEXT,
+    }
+    if avg_px is not None:
+        order["avgPx"] = {"value": avg_px, "currency": "USD"}
+    return {
+        "order": order
+    }
+
+
+async def _arm_one_ambiguous_intent(
+    tmp_path: Path,
+) -> tuple[PolymarketUSExecutionClient, str, str, Any, list[Any]]:
+    """Drive ``_submit_order`` to the with-id AMBIGUOUS branch once.
+
+    Returns the client, the venue_order_id, the market slug the resolver
+    will need to query positions under, the latch context manager the
+    caller MUST keep referenced (dropping it GCs the generator, which
+    releases the flock immediately -- ``SubmitIntentLockNotHeld`` on the
+    very next latch call), and the ``ExecEngine.process`` event sink every
+    native event (``OrderSubmitted``, ``OrderFilled``, ``OrderCanceled``, ...)
+    this client publishes lands in.
+    """
+    sender = _SlowSender()
+    order_id = "ord-amb-1"
+    sender.response = VenueResponse(status=200, headers={}, body=_ambiguous_create_body(order_id))
+    client, order_events, _permit, latch_cm = await _build_race_client(tmp_path, sender=sender)
+    factory = OrderFactory(trader_id=TRADER_ID, strategy_id=STRATEGY_ID, clock=LiveClock())
+    command = _submit_command(client, factory, "a")
+    await client._submit_order(command)
+
+    assert client._latch is not None
+    assert client._latch.is_latched() is True, "the with-id AMBIGUOUS outcome must leave OPEN"
+    instrument = build_instrument()
+    slug = instrument_id_to_slug(instrument.id)
+    return client, order_id, slug, latch_cm, order_events
+
+
+async def _run_resolver_passes(client: PolymarketUSExecutionClient, count: int) -> None:
+    """Drive ``count`` bounded passes of the real resolver coroutine.
+
+    ``_resolver_poll_interval_secs`` is monkeypatched to ``0.0`` so each
+    pass's ``asyncio.sleep`` yields to the loop without a real delay; the
+    task is cancelled (never left pending) once enough passes have run.
+    """
+    client._resolver_poll_interval_secs = lambda: 0.0  # type: ignore[method-assign]
+    task = asyncio.get_event_loop().create_task(client._resolve_ambiguous_intents())
+    try:
+        for _ in range(count * 50 + 5):
+            await asyncio.sleep(0)
+    finally:
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+async def test_a_get_that_never_returns_terminal_evidence_leaves_the_intent_open(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    write_canonical_verified: None,  # noqa: F811
+) -> None:
+    """SAFETY H2's own AC: restart with OPEN + a durable resolver context and
+    a ``_private_read`` that never returns terminal -> stays OPEN, no
+    restore, no ``OrderCanceled``, IN_FLIGHT untouched (IN_FLIGHT is a
+    strategy-side concern outside this module's scope; the client-visible
+    half is asserted here: the singleton, the events, the booking)."""
+    enable_operator_gate(monkeypatch, order_count="2")
+    with operator_control_env(MAX_DAILY_BUDGET_USD_ENV_VAR, "1000.00"), operator_control_env(
+        MAX_POSITION_COST_USD_ENV_VAR, "10.00",
+    ):
+        client, order_id, slug, _latch_cm, _order_events = await _arm_one_ambiguous_intent(tmp_path)
+        # PENDING, not terminal: never wires a terminal response in.
+        client._private_read._payloads[  # type: ignore[attr-defined]
+            f"/v1/order/{order_id}"
+        ] = _order_get_body(order_id, slug=slug, state="ORDER_STATE_NEW", cum_quantity=0)
+
+        await _run_resolver_passes(client, count=3)
+
+        assert client._latch is not None
+        current = client._latch.current()
+        assert current is not None
+        assert current.state is SubmitIntentState.OPEN
+        _, remaining = live_trading_budget_remaining(client._permit)
+        assert remaining == 1, "no restore on a non-terminal GET"
+        assert current.intent_id in client._ambiguous_bookings
+        await client._disconnect()
+
+
+@pytest.mark.asyncio
+async def test_a_get_confirmed_terminal_zero_with_no_long_retires_and_trues_up_to_zero(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    write_canonical_verified: None,  # noqa: F811
+) -> None:
+    """Resolution D: terminal + filled_qty==0 + eof-complete positions with
+    no LONG -> retires (STATUS_REPORT_ZERO_FILL_TERMINAL), trues the booking
+    up to ZERO, and cancels natively."""
+    enable_operator_gate(monkeypatch, order_count="2")
+    with operator_control_env(MAX_DAILY_BUDGET_USD_ENV_VAR, "1000.00"), operator_control_env(
+        MAX_POSITION_COST_USD_ENV_VAR, "10.00",
+    ):
+        client, order_id, slug, _latch_cm, _order_events = await _arm_one_ambiguous_intent(tmp_path)
+        client._private_read._payloads[  # type: ignore[attr-defined]
+            f"/v1/order/{order_id}"
+        ] = _order_get_body(order_id, slug=slug, state="ORDER_STATE_CANCELED", cum_quantity=0)
+        # eof-complete, no LONG anywhere.
+        client._private_read._payloads["/v1/portfolio/positions"] = {  # type: ignore[attr-defined]
+            "positions": {},
+            "eof": True,
+        }
+
+        await _run_resolver_passes(client, count=1)
+
+        assert client._latch is not None
+        current = client._latch.current()
+        assert current is not None
+        assert current.state is SubmitIntentState.RETIRED
+        assert current.retirement_reason is not None
+        assert current.retirement_reason.value == "STATUS_REPORT_ZERO_FILL_TERMINAL"
+        _, remaining = live_trading_budget_remaining(client._permit)
+        # true_up_booking(ZERO) frees the NOTIONAL reservation, never the
+        # ORDER-COUNT slot (Resolution's permit-restore is a separate,
+        # not-yet-built mechanism -- see the build report).
+        assert remaining == 1
+        assert current.intent_id not in client._ambiguous_bookings
+        await client._disconnect()
+
+
+def _order_filled_events(order_events: list[Any]) -> list[Any]:
+    return [event for event in order_events if type(event).__name__ == "OrderFilled"]
+
+
+@pytest.mark.asyncio
+async def test_a_get_confirmed_fill_with_a_long_present_records_a_synthesized_fill_and_retires(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    write_canonical_verified: None,  # noqa: F811
+) -> None:
+    """Slice 3, RED test 1 (plan rev 6.1): FILLED + a LONG present on an
+    eof-complete positions read -> exactly one durable fill record, exactly
+    one native ``OrderFilled`` carrying the synthetic ``GET-`` trade id,
+    retires ``STATUS_REPORT_ACCEPT_FILL_TERMINAL``, and the booking is trued
+    up to the synthesized cumulative cost.
+
+    Superseded review fix 4 (was: ``..._is_inert_pending_slice_3``, pinning
+    the deliberately inert placeholder) -- UPDATED, not deleted, now that
+    slice 3 ships the real resolution."""
+    enable_operator_gate(monkeypatch, order_count="2")
+    with operator_control_env(MAX_DAILY_BUDGET_USD_ENV_VAR, "1000.00"), operator_control_env(
+        MAX_POSITION_COST_USD_ENV_VAR, "10.00",
+    ):
+        client, order_id, slug, _latch_cm, order_events = await _arm_one_ambiguous_intent(
+            tmp_path,
+        )
+        client._private_read._payloads[  # type: ignore[attr-defined]
+            f"/v1/order/{order_id}"
+        ] = _order_get_body(
+            order_id, slug=slug, state="ORDER_STATE_FILLED", cum_quantity=1, avg_px="0.40",
+        )
+        # eof-complete, a LONG present at this instrument's slug.
+        client._private_read._payloads["/v1/portfolio/positions"] = {  # type: ignore[attr-defined]
+            "positions": {slug: {"netPosition": "1"}},
+            "eof": True,
+        }
+        instrument = build_instrument()
+        refusals_before = client.trading_refusals
+
+        await _run_resolver_passes(client, count=1)
+
+        assert client._latch is not None
+        current = client._latch.current()
+        assert current is not None
+        assert current.state is SubmitIntentState.RETIRED
+        assert current.retirement_reason is not None
+        assert current.retirement_reason.value == "STATUS_REPORT_ACCEPT_FILL_TERMINAL"
+        assert current.intent_id not in client._ambiguous_bookings, "booking must be popped"
+
+        records = client.fill_records_for(instrument.id)
+        assert len(records) == 1, "exactly one durable fill record"
+        record = records[0]
+        assert record.venue_order_id == order_id
+        assert record.cumulative_qty == Decimal(1)
+        assert record.cumulative_cost == Decimal("0.40")
+        assert record.fee_reconciled is False
+
+        filled = _order_filled_events(order_events)
+        assert len(filled) == 1, "exactly one native OrderFilled"
+        assert filled[0].trade_id.value == f"GET-{order_id}"
+        assert filled[0].last_qty.as_decimal() == Decimal(1)
+        assert filled[0].last_px.as_decimal() == Decimal("0.40")
+
+        _, remaining = live_trading_budget_remaining(client._permit)
+        assert remaining == 1  # true-up to the SAME cost as booked -- no change
+        assert client.trading_refusals == refusals_before, (
+            "fee_reconciled=False must be a durable flag on the record, "
+            "never a NEW latched trading refusal (the initial AMBIGUOUS "
+            "submit's own refusal, captured before the resolver ran, is "
+            "unrelated and expected to still be present)"
+        )
+        await client._disconnect()
+
+
+class _FakeFilledQty:
+    def as_decimal(self) -> Decimal:
+        return Decimal(1)
+
+
+class _FakeAcceptFillReport:
+    """Duck-typed stand-in: ``_resolve_accept_fill`` only reads ``avg_px``
+    and ``filled_qty.as_decimal()`` off its ``report`` argument."""
+
+    avg_px = Decimal("0.40")
+    filled_qty = _FakeFilledQty()
+
+
+@pytest.mark.asyncio
+async def test_resolve_accept_fill_restart_reentry_against_an_already_retired_singleton_is_a_noop(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    write_canonical_verified: None,  # noqa: F811
+) -> None:
+    """Slice 3, RED test 2: a restart re-entry that finds the singleton
+    ALREADY RETIRED must call ``_retire`` ZERO times (``retire`` is NOT
+    idempotent -- ``SubmitIntentMismatch`` on a non-OPEN singleton) and must
+    still complete its cleanup without raising."""
+    enable_operator_gate(monkeypatch, order_count="2")
+    with operator_control_env(MAX_DAILY_BUDGET_USD_ENV_VAR, "1000.00"), operator_control_env(
+        MAX_POSITION_COST_USD_ENV_VAR, "10.00",
+    ):
+        client, order_id, slug, _latch_cm, _order_events = await _arm_one_ambiguous_intent(
+            tmp_path,
+        )
+        assert client._latch is not None
+        armed = client._latch.current()
+        assert armed is not None
+        instrument = build_instrument()
+
+        # Retire the intent for real, through the normal first-run path.
+        client._private_read._payloads[  # type: ignore[attr-defined]
+            f"/v1/order/{order_id}"
+        ] = _order_get_body(
+            order_id, slug=slug, state="ORDER_STATE_FILLED", cum_quantity=1, avg_px="0.40",
+        )
+        client._private_read._payloads["/v1/portfolio/positions"] = {  # type: ignore[attr-defined]
+            "positions": {slug: {"netPosition": "1"}},
+            "eof": True,
+        }
+        await _run_resolver_passes(client, count=1)
+        retired = client._latch.current()
+        assert retired is not None
+        assert retired.state is SubmitIntentState.RETIRED
+
+        # Simulate a FRESH resolver run's re-entry: a durable context for the
+        # SAME (now-retired) intent, resolved by a fresh GET in THIS run.
+        context = AmbiguousResolverContext(
+            intent_id=armed.intent_id,
+            venue_order_id=order_id,
+            instrument_id=instrument.id.value,
+            client_order_id="O-does-not-matter",
+            strategy_id=STRATEGY_ID.value,
+            notional_usd=Decimal("0.40"),
+            booking_id=1,
+            created_ns=client._clock.timestamp_ns(),
+        )
+        client._resolved_by_get_ts_ns[armed.intent_id] = client._clock.timestamp_ns()
+
+        retire_calls: list[Any] = []
+        original_retire = client._retire
+
+        def _spy_retire(*args: Any, **kwargs: Any) -> None:
+            retire_calls.append((args, kwargs))
+            original_retire(*args, **kwargs)
+
+        client._retire = _spy_retire  # type: ignore[method-assign]
+
+        client._resolve_accept_fill(
+            context, _FakeAcceptFillReport(), instrument, client._clock.timestamp_ns(),
+        )
+
+        assert retire_calls == [], (
+            "retire must never be called against an already-retired singleton"
+        )
+        # Cleanup completed without raising: the singleton is untouched.
+        current = client._latch.current()
+        assert current is not None
+        assert current.state is SubmitIntentState.RETIRED
+        assert current.intent_id == armed.intent_id
+        await client._disconnect()
+
+
+@pytest.mark.asyncio
+async def test_a_get_confirmed_fill_with_no_long_present_never_authorizes_a_fill(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    write_canonical_verified: None,  # noqa: F811
+) -> None:
+    """Slice 3, RED test 3: ``status==FILLED`` ALONE must never authorize a
+    fill -- the LONG cross-check is load-bearing. Pins the positive case
+    (FILLED but NO LONG present -> the disagreement branch, stays AMBIGUOUS,
+    nothing recorded); this test is also the mutation shape the coordinator
+    asked for -- deleting ``and long_state is True`` from the dispatch would
+    flip this from AMBIGUOUS-no-op to a wrongly-authorized fill, and this
+    test would go RED."""
+    enable_operator_gate(monkeypatch, order_count="2")
+    with operator_control_env(MAX_DAILY_BUDGET_USD_ENV_VAR, "1000.00"), operator_control_env(
+        MAX_POSITION_COST_USD_ENV_VAR, "10.00",
+    ):
+        client, order_id, slug, _latch_cm, order_events = await _arm_one_ambiguous_intent(
+            tmp_path,
+        )
+        client._private_read._payloads[  # type: ignore[attr-defined]
+            f"/v1/order/{order_id}"
+        ] = _order_get_body(
+            order_id, slug=slug, state="ORDER_STATE_FILLED", cum_quantity=1, avg_px="0.40",
+        )
+        # eof-complete, but NO LONG anywhere -- disagrees with the FILLED
+        # status.
+        client._private_read._payloads["/v1/portfolio/positions"] = {  # type: ignore[attr-defined]
+            "positions": {},
+            "eof": True,
+        }
+        instrument = build_instrument()
+
+        await _run_resolver_passes(client, count=1)
+
+        assert client._latch is not None
+        current = client._latch.current()
+        assert current is not None
+        assert current.state is SubmitIntentState.OPEN, (
+            "FILLED alone, without a confirmed LONG, must never authorize a fill"
+        )
+        assert current.intent_id in client._ambiguous_bookings
+        assert client.fill_records_for(instrument.id) == ()
+        assert _order_filled_events(order_events) == []
+        await client._disconnect()
+
+
+@pytest.mark.asyncio
+async def test_resolve_terminal_zero_itself_refuses_to_retire_without_a_this_run_get(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    write_canonical_verified: None,  # noqa: F811
+) -> None:
+    """Review fix 2: SAFETY H2 must be load-bearing INSIDE
+    ``_resolve_terminal_zero`` itself, not only structural via the caller's
+    branch shape. Calls it directly with a context whose ``intent_id`` was
+    NEVER stamped into ``_resolved_by_get_ts_ns`` -- if the guard were
+    missing, this would retire on the durable context alone."""
+    enable_operator_gate(monkeypatch, order_count="2")
+    with operator_control_env(MAX_DAILY_BUDGET_USD_ENV_VAR, "1000.00"), operator_control_env(
+        MAX_POSITION_COST_USD_ENV_VAR, "10.00",
+    ):
+        client, order_id, _slug, _latch_cm, _order_events = await _arm_one_ambiguous_intent(
+            tmp_path,
+        )
+        assert client._latch is not None
+        armed = client._latch.current()
+        assert armed is not None
+        instrument = build_instrument()
+
+        context = AmbiguousResolverContext(
+            intent_id=armed.intent_id,
+            venue_order_id=order_id,
+            instrument_id=instrument.id.value,
+            client_order_id="O-does-not-matter",
+            strategy_id=STRATEGY_ID.value,
+            notional_usd=client._ambiguous_bookings[armed.intent_id].cost,
+            booking_id=client._ambiguous_bookings[armed.intent_id].booking_id,
+            created_ns=client._clock.timestamp_ns(),
+        )
+        assert armed.intent_id not in client._resolved_by_get_ts_ns
+
+        client._resolve_terminal_zero(context, client._clock.timestamp_ns())
+
+        current = client._latch.current()
+        assert current is not None
+        assert current.state is SubmitIntentState.OPEN, (
+            "the guard inside _resolve_terminal_zero itself must refuse to "
+            "retire absent a this-run GET timestamp"
+        )
+        assert armed.intent_id in client._ambiguous_bookings, "booking must not be popped either"
+        await client._disconnect()
+
+
+@pytest.mark.asyncio
+async def test_the_get_call_is_load_bearing_deleting_it_would_go_red(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    write_canonical_verified: None,  # noqa: F811
+) -> None:
+    """SAFETY H2 mutation shape: the ONLY evidence that can ever retire this
+    intent is a terminal GET made by THIS resolver in THIS run. Proven here
+    by making the injected read raise for the order-by-id path specifically
+    -- if the retire logic did not genuinely depend on that call's outcome
+    (e.g. a hypothetical shortcut that retires on durable-context presence
+    alone), this test would go GREEN despite the GET always failing; instead
+    it stays OPEN, which is the behaviour this test pins."""
+    enable_operator_gate(monkeypatch, order_count="2")
+    with operator_control_env(MAX_DAILY_BUDGET_USD_ENV_VAR, "1000.00"), operator_control_env(
+        MAX_POSITION_COST_USD_ENV_VAR, "10.00",
+    ):
+        client, order_id, _slug, _latch_cm, _order_events = await _arm_one_ambiguous_intent(
+            tmp_path,
+        )
+        # No payload is ever registered for this path: `_PrivateReadStub.
+        # __call__` does `self._payloads[path]`, so every attempt raises a
+        # plain `KeyError` -- the GET "always fails" shape.
+        assert f"/v1/order/{order_id}" not in client._private_read._payloads  # type: ignore[attr-defined]
+
+        await _run_resolver_passes(client, count=5)
+
+        assert client._latch is not None
+        current = client._latch.current()
+        assert current is not None
+        assert current.state is SubmitIntentState.OPEN
+        # The load-bearing assertion: NO terminal GET was ever recorded for
+        # this intent, because every attempt raised.
+        assert client._resolved_by_get_ts_ns.get(current.intent_id) is None
+        await client._disconnect()
+
+
+@pytest.mark.asyncio
+async def test_a_corrupt_singleton_never_kills_the_resolver_task(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    write_canonical_verified: None,  # noqa: F811
+) -> None:
+    """Review fix 3: a ``SubmitIntentCorrupt`` from the bare
+    ``self._latch.current()`` call must not propagate out of the coroutine
+    and silently kill the resolver task for the process lifetime. Caught the
+    way ``is_latched()`` does: fail closed (OPEN-unknown, never retire,
+    never act), logged at ERROR ONCE, and polling continues."""
+    enable_operator_gate(monkeypatch, order_count="2")
+    with operator_control_env(MAX_DAILY_BUDGET_USD_ENV_VAR, "1000.00"), operator_control_env(
+        MAX_POSITION_COST_USD_ENV_VAR, "10.00",
+    ):
+        client, _order_id, _slug, _latch_cm, _order_events = await _arm_one_ambiguous_intent(
+            tmp_path,
+        )
+        assert client._latch is not None
+        client._store_set(CURRENT_INTENT_KEY, b"not valid json")
+        with pytest.raises(SubmitIntentCorrupt):
+            client._latch.current()  # sanity: this really is the corrupt shape
+
+        client._resolver_poll_interval_secs = lambda: 0.0  # type: ignore[method-assign]
+        task = asyncio.get_event_loop().create_task(client._resolve_ambiguous_intents())
+        try:
+            for _ in range(3 * 50 + 5):
+                await asyncio.sleep(0)
+            assert not task.done(), "a corrupt singleton must never kill the resolver task"
+        finally:
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+
+        assert client._resolver_corrupt_logged is True
+        await client._disconnect()
+
+
+@pytest.mark.asyncio
+async def test_disconnect_awaits_the_resolver_tasks_cancellation_before_returning(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    write_canonical_verified: None,  # noqa: F811
+) -> None:
+    """Review fix 1: ``_disconnect`` must mirror ``data.py``'s
+    ``_cancel_update_instruments`` exactly -- ``task.cancel()`` THEN
+    ``await task`` inside ``try``/``except asyncio.CancelledError`` -- so
+    shutdown ordering vs the store close is deterministic. A fire-and-forget
+    ``.cancel()`` with no following ``await`` never gives the event loop a
+    chance to actually deliver the cancellation before ``_disconnect``
+    returns, so the resolver task is provably still ``not done()`` right
+    after -- that is the RED this test pins closed."""
+    enable_operator_gate(monkeypatch, order_count="2")
+    with operator_control_env(MAX_DAILY_BUDGET_USD_ENV_VAR, "1000.00"), operator_control_env(
+        MAX_POSITION_COST_USD_ENV_VAR, "10.00",
+    ):
+        sender = _SlowSender()
+        client, _order_events, _permit, _latch_cm = await _build_race_client(
+            tmp_path, sender=sender,
+        )
+        task = client._resolver_task
+        assert task is not None
+        assert not task.done()
+
+        await client._disconnect()
+
+        assert task.done(), (
+            "_disconnect must await the resolver task's cancellation before "
+            "returning, not fire-and-forget it"
+        )
+        assert client._resolver_task is None
+        assert client._store is None
+
+
+def test_synthetic_get_fill_trade_id_is_a_pure_function_of_venue_order_id() -> None:
+    """Slice 3, RED test 4: same input, same output, always -- no clock, no
+    counter, no randomness -- and visibly distinguishable from a venue-issued
+    trade id via its ``GET-`` prefix."""
+    first = _synthetic_get_fill_trade_id("ord-amb-1")
+    second = _synthetic_get_fill_trade_id("ord-amb-1")
+    assert first == second
+    assert first.value == "GET-ord-amb-1"
+
+    other = _synthetic_get_fill_trade_id("ord-amb-2")
+    assert other != first
+    assert other.value == "GET-ord-amb-2"
+
+
+@pytest.mark.asyncio
+async def test_a_terminal_canceled_with_a_partial_fill_and_a_long_resolves_as_a_terminal_fill(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    write_canonical_verified: None,  # noqa: F811
+) -> None:
+    """Partial-fill review, RED test 1 (HIGH): CANCELED with filled_qty > 0
+    is the normal IOC partial-fill shape (minimumTradeQty 0.01), NOT a
+    terminal-zero. It must resolve as a TERMINAL-FILL via
+    ``_resolve_accept_fill`` -- same LONG gate, same synthesized TradeId,
+    ``fee_reconciled=False`` -- never a silent, forever-AMBIGUOUS wedge."""
+    enable_operator_gate(monkeypatch, order_count="2")
+    with operator_control_env(MAX_DAILY_BUDGET_USD_ENV_VAR, "1000.00"), operator_control_env(
+        MAX_POSITION_COST_USD_ENV_VAR, "10.00",
+    ):
+        client, order_id, slug, _latch_cm, order_events = await _arm_one_ambiguous_intent(
+            tmp_path,
+        )
+        client._private_read._payloads[  # type: ignore[attr-defined]
+            f"/v1/order/{order_id}"
+        ] = _order_get_body(
+            order_id, slug=slug, state="ORDER_STATE_CANCELED", cum_quantity=0.5, avg_px="0.40",
+        )
+        client._private_read._payloads["/v1/portfolio/positions"] = {  # type: ignore[attr-defined]
+            "positions": {slug: {"netPosition": "0.5"}},
+            "eof": True,
+        }
+        instrument = build_instrument()
+
+        await _run_resolver_passes(client, count=1)
+
+        assert client._latch is not None
+        current = client._latch.current()
+        assert current is not None
+        assert current.state is SubmitIntentState.RETIRED
+        assert current.retirement_reason is not None
+        assert current.retirement_reason.value == "STATUS_REPORT_ACCEPT_FILL_TERMINAL"
+        assert current.intent_id not in client._ambiguous_bookings
+
+        records = client.fill_records_for(instrument.id)
+        assert len(records) == 1, "exactly one durable fill record for the partial"
+        record = records[0]
+        assert record.cumulative_qty == Decimal("0.5")
+        assert record.cumulative_cost == Decimal("0.20")
+        assert record.fee_reconciled is False
+
+        filled = _order_filled_events(order_events)
+        assert len(filled) == 1
+        assert filled[0].trade_id.value == f"GET-{order_id}"
+        assert filled[0].last_qty.as_decimal() == Decimal("0.5")
+
+        _, remaining = live_trading_budget_remaining(client._permit)
+        assert remaining == 1  # true-up releases 0.20 of the 0.40 booked
+        await client._disconnect()
+
+
+@pytest.mark.asyncio
+async def test_a_terminal_canceled_with_zero_fill_still_resolves_as_terminal_zero(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    write_canonical_verified: None,  # noqa: F811
+) -> None:
+    """Partial-fill review, RED test 1 companion: the SAME terminal status
+    with filled_qty == 0 must still resolve as terminal-ZERO, unchanged --
+    proving the widened terminal-status set did not blur the two branches
+    together."""
+    enable_operator_gate(monkeypatch, order_count="2")
+    with operator_control_env(MAX_DAILY_BUDGET_USD_ENV_VAR, "1000.00"), operator_control_env(
+        MAX_POSITION_COST_USD_ENV_VAR, "10.00",
+    ):
+        client, order_id, slug, _latch_cm, _order_events = await _arm_one_ambiguous_intent(
+            tmp_path,
+        )
+        client._private_read._payloads[  # type: ignore[attr-defined]
+            f"/v1/order/{order_id}"
+        ] = _order_get_body(order_id, slug=slug, state="ORDER_STATE_CANCELED", cum_quantity=0)
+        client._private_read._payloads["/v1/portfolio/positions"] = {  # type: ignore[attr-defined]
+            "positions": {},
+            "eof": True,
+        }
+
+        await _run_resolver_passes(client, count=1)
+
+        assert client._latch is not None
+        current = client._latch.current()
+        assert current is not None
+        assert current.state is SubmitIntentState.RETIRED
+        assert current.retirement_reason is not None
+        assert current.retirement_reason.value == "STATUS_REPORT_ZERO_FILL_TERMINAL"
+        await client._disconnect()
+
+
+@pytest.mark.asyncio
+async def test_partially_filled_never_resolves_and_a_later_terminal_poll_does(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    write_canonical_verified: None,  # noqa: F811
+) -> None:
+    """Partial-fill review, RED test 2 (HIGH): PARTIALLY_FILLED is a LIVE
+    state and must never resolve the intent -- no record, no retire, the
+    loop keeps polling. A LATER poll that returns a genuinely terminal
+    status (CANCELED, cum > 0) is the one that resolves it."""
+    enable_operator_gate(monkeypatch, order_count="2")
+    with operator_control_env(MAX_DAILY_BUDGET_USD_ENV_VAR, "1000.00"), operator_control_env(
+        MAX_POSITION_COST_USD_ENV_VAR, "10.00",
+    ):
+        client, order_id, slug, _latch_cm, order_events = await _arm_one_ambiguous_intent(
+            tmp_path,
+        )
+        client._private_read._payloads[  # type: ignore[attr-defined]
+            f"/v1/order/{order_id}"
+        ] = _order_get_body(
+            order_id, slug=slug, state="ORDER_STATE_PARTIALLY_FILLED", cum_quantity=0.5,
+            avg_px="0.40",
+        )
+        client._private_read._payloads["/v1/portfolio/positions"] = {  # type: ignore[attr-defined]
+            "positions": {slug: {"netPosition": "0.5"}},
+            "eof": True,
+        }
+        instrument = build_instrument()
+
+        await _run_resolver_passes(client, count=1)
+
+        assert client._latch is not None
+        current = client._latch.current()
+        assert current is not None
+        assert current.state is SubmitIntentState.OPEN, "PARTIALLY_FILLED must never resolve"
+        assert current.intent_id in client._ambiguous_bookings
+        assert client.fill_records_for(instrument.id) == ()
+        assert _order_filled_events(order_events) == []
+
+        # A later poll: the order reached a genuinely terminal status.
+        client._private_read._payloads[  # type: ignore[attr-defined]
+            f"/v1/order/{order_id}"
+        ] = _order_get_body(
+            order_id, slug=slug, state="ORDER_STATE_CANCELED", cum_quantity=0.5, avg_px="0.40",
+        )
+        await _run_resolver_passes(client, count=1)
+
+        current = client._latch.current()
+        assert current is not None
+        assert current.state is SubmitIntentState.RETIRED
+        assert current.retirement_reason is not None
+        assert current.retirement_reason.value == "STATUS_REPORT_ACCEPT_FILL_TERMINAL"
+        assert len(client.fill_records_for(instrument.id)) == 1
+        await client._disconnect()
+
+
+@pytest.mark.asyncio
+async def test_a_non_positive_avg_px_never_authorizes_a_synthesized_fill(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    write_canonical_verified: None,  # noqa: F811
+) -> None:
+    """Partial-fill review, RED test 3 (MEDIUM): ``avg_px <= 0`` must stay
+    AMBIGUOUS exactly like ``avg_px is None`` -- never ``instrument.
+    make_price(0)``, which would synthesize a fill at a nonsensical zero
+    price."""
+    enable_operator_gate(monkeypatch, order_count="2")
+    with operator_control_env(MAX_DAILY_BUDGET_USD_ENV_VAR, "1000.00"), operator_control_env(
+        MAX_POSITION_COST_USD_ENV_VAR, "10.00",
+    ):
+        client, order_id, slug, _latch_cm, order_events = await _arm_one_ambiguous_intent(
+            tmp_path,
+        )
+        client._private_read._payloads[  # type: ignore[attr-defined]
+            f"/v1/order/{order_id}"
+        ] = _order_get_body(
+            order_id, slug=slug, state="ORDER_STATE_FILLED", cum_quantity=1, avg_px="0.00",
+        )
+        client._private_read._payloads["/v1/portfolio/positions"] = {  # type: ignore[attr-defined]
+            "positions": {slug: {"netPosition": "1"}},
+            "eof": True,
+        }
+        instrument = build_instrument()
+
+        await _run_resolver_passes(client, count=1)
+
+        assert client._latch is not None
+        current = client._latch.current()
+        assert current is not None
+        assert current.state is SubmitIntentState.OPEN, "avg_px <= 0 must never authorize a fill"
+        assert client.fill_records_for(instrument.id) == ()
+        assert _order_filled_events(order_events) == []
+        await client._disconnect()

@@ -29,6 +29,7 @@ from breezy.strategy.current_rung_hold.trial_day_latch import (
     TrialDayAlreadyConsumed,
     TrialDayInvalidReason,
     TrialDayLatch,
+    TrialDayLatchError,
     TrialDayRecord,
     open_trial_day_latch,
 )
@@ -368,3 +369,56 @@ class TestInFlightPrimitive:
         keys = _committed_keys(store_path)
         assert f"current_rung_hold/inflight/{STATION}/{CLIMATE_DAY}" in keys
         assert not any(k.startswith("continuous_rung_hold/") for k in keys)
+
+
+class TestIsIntentOpen:
+    """Resolution B (plan rev 6.1): the cheap, read-only pre-filter
+    ``_hunt_tick`` checks before ``set_inflight``/``_maybe_submit``."""
+
+    def test_false_on_a_fresh_never_armed_latch(self, store_path: Path) -> None:
+        with open_submit_intent_latch(SqliteStateStore(store_path), store_path) as intent_latch:
+            latch = open_trial_day_latch(intent_latch)
+            assert latch.is_intent_open() is False
+
+    def test_true_once_the_bound_intent_latch_is_armed(self, store_path: Path) -> None:
+        with open_submit_intent_latch(SqliteStateStore(store_path), store_path) as intent_latch:
+            latch = open_trial_day_latch(intent_latch)
+            intent_latch.arm("a" * 64, now_ns=1)
+            assert latch.is_intent_open() is True
+
+    def test_false_again_once_retired(self, store_path: Path) -> None:
+        from breezy.runtime.submit_intent import RetirementReason
+
+        with open_submit_intent_latch(SqliteStateStore(store_path), store_path) as intent_latch:
+            latch = open_trial_day_latch(intent_latch)
+            intent = intent_latch.arm("a" * 64, now_ns=1)
+            assert latch.is_intent_open() is True
+            intent_latch.retire(
+                intent.intent_id, RetirementReason.DEFINITIVE_REJECT, now_ns=2,
+            )
+            assert latch.is_intent_open() is False
+
+    def test_a_stale_crash_left_open_singleton_is_visible_to_a_fresh_process(
+        self, store_path: Path,
+    ) -> None:
+        """A latch armed and left OPEN (the flock released without a
+        retire -- exactly a crash) is still OPEN to the NEXT process that
+        opens the same store, which is the whole point: the pre-filter must
+        see a stale OPEN singleton, not only a same-process sibling."""
+        with open_submit_intent_latch(SqliteStateStore(store_path), store_path) as intent_latch:
+            intent_latch.arm("a" * 64, now_ns=1)
+        with open_submit_intent_latch(SqliteStateStore(store_path), store_path) as intent_latch:
+            latch = open_trial_day_latch(intent_latch)
+            assert latch.is_intent_open() is True
+
+    def test_a_trial_day_latch_built_without_an_intent_latch_refuses_to_answer(
+        self, store_path: Path,
+    ) -> None:
+        """A ``TrialDayLatch`` constructed directly (existing test doubles,
+        never through ``open_trial_day_latch``) has no ``intent_latch`` to
+        delegate to and must fail closed, not silently report ``False``."""
+        with open_submit_intent_latch(SqliteStateStore(store_path), store_path) as intent_latch:
+            store, lock = intent_latch.shared_state_binding()
+            bare = TrialDayLatch(store, lock)
+            with pytest.raises(TrialDayLatchError):
+                bare.is_intent_open()

@@ -74,6 +74,10 @@ __all__ = ["ContinuousRungHoldStrategy", "Phase0PermitForbiddenError"]
 
 _NS_PER_MINUTE: Final[int] = 60_000_000_000
 _CLASS_NAME: Final[str] = "ContinuousRungHoldStrategy"
+#: Resolution B (plan rev 6.1): the account-wide OPEN-intent WAIT diagnostic.
+#: Not a refusal -- reported through `diagnostics`/`diagnostics_alerter`
+#: (the existing WAIT vocabulary), never `refusals`/`refusal_alerter`.
+_DIAG_OPEN_INTENT_WAIT: Final[str] = "open_intent_wait"
 Trigger = Literal["quote_tick", "on_data", "depth"]
 Source = Literal["quote", "depth"]
 
@@ -321,6 +325,23 @@ class ContinuousRungHoldStrategy(Strategy):
         if self._latch.is_consumed(station, climate_day_key):
             return
         if self._latch.is_inflight(station, climate_day_key):
+            return
+        # Resolution B (plan rev 6.1): the cheap, read-only pre-filter.
+        # While the account-wide submit-intent singleton is OPEN -- a
+        # genuine in-flight sibling order OR a stale/crash-left singleton no
+        # resolver has cleared yet -- every station's tick is a WAIT here,
+        # never a task hop into `submit_order` that SAFETY C1's own
+        # re-check would only deny later. This is what keeps a stale OPEN
+        # singleton from producing a hunt -> WAIT-deny -> clear-inflight ->
+        # hunt loop: with this filter in place, `_submit_order`'s WAIT path
+        # (and `on_order_denied`'s clear) is reached ONLY by the genuine
+        # same-burst race it exists for.
+        if self._latch.is_intent_open():
+            self.diagnostics.record(_DIAG_OPEN_INTENT_WAIT)
+            self._report_alerter(
+                self.diagnostics_alerter,
+                "continuous_rung_hold diagnostics report failed",
+            )
             return
 
         now_ns = snapshot.ts_event

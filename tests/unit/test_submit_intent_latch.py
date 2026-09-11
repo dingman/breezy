@@ -792,3 +792,36 @@ class TestStaticIsolation:
             assert not any(name == prefix or name.startswith(prefix + ".") for prefix in forbidden)
         assert "breezy.ingest.gate" not in imported
         assert SubmitIntentLatch is not None
+
+
+def test_status_report_zero_fill_terminal_retires_and_round_trips(
+    store_path: Path,
+) -> None:
+    """Resolution A2/D (plan rev 6.1): the resolver's own retirement reason,
+    distinct from ACCEPTED_ZERO_FILL_TERMINAL (set from the CREATE response,
+    unreachable per L-36). Must retire cleanly and round-trip through
+    to_bytes/from_bytes like every other member."""
+    with open_submit_intent_latch(SqliteStateStore(store_path), store_path) as latch:
+        intent = latch.arm("a" * 64, now_ns=NOW_NS)
+        retired = latch.retire(
+            intent.intent_id, RetirementReason.STATUS_REPORT_ZERO_FILL_TERMINAL, now_ns=NOW_NS + 1,
+        )
+        assert retired.retirement_reason is RetirementReason.STATUS_REPORT_ZERO_FILL_TERMINAL
+        round_tripped = SubmitIntent.from_bytes(retired.to_bytes())
+        assert round_tripped.retirement_reason is RetirementReason.STATUS_REPORT_ZERO_FILL_TERMINAL
+
+
+def test_status_report_accept_fill_terminal_retires_and_round_trips(
+    store_path: Path,
+) -> None:
+    """Slice 3 (plan rev 6.1): the resolver's GET-confirmed-FILLED retirement
+    reason, distinct from ACCEPTED_WITH_DURABLE_FILL (set from real per-leg
+    execution evidence in the CREATE response). Must retire cleanly and
+    round-trip through to_bytes/from_bytes like every other member."""
+    with open_submit_intent_latch(SqliteStateStore(store_path), store_path) as latch:
+        intent = latch.arm("a" * 64, now_ns=NOW_NS)
+        reason = RetirementReason.STATUS_REPORT_ACCEPT_FILL_TERMINAL
+        retired = latch.retire(intent.intent_id, reason, now_ns=NOW_NS + 1)
+        assert retired.retirement_reason is reason
+        round_tripped = SubmitIntent.from_bytes(retired.to_bytes())
+        assert round_tripped.retirement_reason is reason

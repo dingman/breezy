@@ -216,15 +216,43 @@ class TrialDayLatch:
         lock: _HeldSubmitIntentLock,
         *,
         key_prefix: str = DEFAULT_TRIAL_KEY_PREFIX,
+        intent_latch: SubmitIntentLatch | None = None,
     ) -> None:
         self._store = store
         self._lock = lock
         self._key_prefix = key_prefix
         self._inflight_prefix = _inflight_prefix(key_prefix)
+        #: Resolution B (plan rev 6.1): bound at construction by
+        #: :func:`open_trial_day_latch`, never opened here. ``None`` for a
+        #: ``TrialDayLatch`` built directly (existing test doubles) -- such
+        #: an instance simply cannot call :meth:`is_intent_open`.
+        self._intent_latch = intent_latch
 
     def _require_held(self) -> None:
         if not self._lock.held:
             raise SubmitIntentLockNotHeld()
+
+    def is_intent_open(self) -> bool:
+        """Resolution B (plan rev 6.1): ``True`` while the account-wide
+        submit-intent singleton is OPEN.
+
+        A read-only pre-filter over the SAME store and flock ``arm()``/
+        ``retire()`` already share -- delegates to
+        ``SubmitIntentLatch.is_latched()`` on the ``intent_latch`` bound at
+        construction. This is the cheap check ``_hunt_tick`` uses BEFORE
+        ``set_inflight``/``_maybe_submit``: while OPEN (whether from a
+        genuine in-flight sibling order or a stale/crash-left singleton no
+        resolver has cleared yet), every station's tick is a WAIT, never a
+        task hop that would only be denied later inside ``_submit_order``.
+        """
+        self._require_held()
+        if self._intent_latch is None:
+            raise TrialDayLatchError(
+                "is_intent_open() requires a TrialDayLatch bound to an "
+                "intent_latch at construction; see open_trial_day_latch"
+            )
+        return self._intent_latch.is_latched()
+
 
     def _trial_key(self, station: str, climate_day: str) -> str:
         return _key(station, climate_day, key_prefix=self._key_prefix)
@@ -310,4 +338,4 @@ def open_trial_day_latch(
     byte-identical.
     """
     store, lock = intent_latch.shared_state_binding()
-    return TrialDayLatch(store, lock, key_prefix=key_prefix)
+    return TrialDayLatch(store, lock, key_prefix=key_prefix, intent_latch=intent_latch)

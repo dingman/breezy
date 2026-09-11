@@ -33,7 +33,9 @@ from breezy.strategy.current_rung_hold.trial_day_latch import (
     TrialDayLatch,
     open_trial_day_latch,
 )
+from breezy.strategy.weather_common.refusals import RefusalAlerter
 from tests.unit.test_current_rung_hold_strategy import (
+    _WAIT_VOCABULARY,
     CLIMATE_DAY,
     ICAO,
     INTERIOR_ID,
@@ -43,6 +45,7 @@ from tests.unit.test_current_rung_hold_strategy import (
     _instrument,
     _observation,
     _quote,
+    _RecordingSink,
     _SpyClock,
 )
 
@@ -463,3 +466,74 @@ def test_on_order_denied_with_any_other_reason_leaves_inflight_set(
     strategy.on_order_denied(_order_denied(strategy, reason="some other denial reason"))
 
     assert strategy._latch.is_inflight(STATION, CLIMATE_DAY.isoformat()) is True
+
+
+def _arm_and_release_stale_intent(store_path: Path) -> None:
+    """Simulate a crash-left OPEN singleton: arm it, then release the flock
+    without retiring -- exactly the durable shape a crash leaves, and
+    exactly what `_register_and_start`'s own factory will re-open next."""
+    with open_submit_intent_latch(SqliteStateStore(store_path), store_path) as latch:
+        latch.arm("a" * 64, now_ns=1)
+
+
+def test_hunt_tick_waits_while_the_account_wide_intent_is_open(
+    store_path: Path, interior_instrument: BinaryOption,
+) -> None:
+    """Resolution B (plan rev 6.1): a stale/crash-left OPEN singleton is seen
+    by `_hunt_tick` BEFORE `set_inflight`/`_maybe_submit` -- no task hop, no
+    offer-tape entry, no IN_FLIGHT ever set, counted as a WAIT diagnostic."""
+    _arm_and_release_stale_intent(store_path)
+    strategy = _register_and_start(store_path=store_path, instruments=(interior_instrument,))
+    calls: list[str] = []
+    orig_maybe = strategy._maybe_submit
+
+    def spy_maybe(*args: object, **kwargs: object) -> None:
+        calls.append("maybe_submit")
+        return orig_maybe(*args, **kwargs)  # type: ignore[return-value]
+
+    strategy._maybe_submit = spy_maybe  # type: ignore[method-assign]
+
+    strategy.on_data(_observation(temp_c_tenths=300, observed_at_ns=WINDOW_OPEN_NS - 1))
+    strategy.on_quote_tick(_quote(INTERIOR_ID, ask="0.40", ts_event=WINDOW_OPEN_NS))
+
+    assert calls == []
+    assert strategy._latch is not None
+    assert strategy._latch.is_inflight(STATION, CLIMATE_DAY.isoformat()) is False
+    assert strategy._latch.is_consumed(STATION, CLIMATE_DAY.isoformat()) is False
+    assert strategy.diagnostics.count("open_intent_wait") == 1
+    assert len(strategy.offer_tape) == 0
+
+
+def test_repeated_ticks_while_open_never_loop_and_the_alert_is_throttled(
+    store_path: Path, interior_instrument: BinaryOption,
+) -> None:
+    """No hunt -> WAIT-deny -> clear -> hunt loop: with the Resolution B
+    pre-filter in place, repeated ticks while the singleton stays OPEN never
+    reach `_maybe_submit`/IN_FLIGHT at all, and the diagnostics alert
+    renotifies on the existing `AlertState` cadence, not on every tick."""
+    _arm_and_release_stale_intent(store_path)
+    strategy = _register_and_start(store_path=store_path, instruments=(interior_instrument,))
+    calls: list[str] = []
+    orig_maybe = strategy._maybe_submit
+
+    def spy_maybe(*args: object, **kwargs: object) -> None:
+        calls.append("maybe_submit")
+        return orig_maybe(*args, **kwargs)  # type: ignore[return-value]
+
+    strategy._maybe_submit = spy_maybe  # type: ignore[method-assign]
+    sink = _RecordingSink()
+    strategy.diagnostics_alerter = RefusalAlerter(
+        strategy.diagnostics, site=str(strategy.id), sink=sink, **_WAIT_VOCABULARY,
+    )
+    strategy.on_data(_observation(temp_c_tenths=300, observed_at_ns=WINDOW_OPEN_NS - 1))
+
+    strategy.on_quote_tick(_quote(INTERIOR_ID, ask="0.40", ts_event=WINDOW_OPEN_NS))
+    strategy.on_quote_tick(
+        _quote(INTERIOR_ID, ask="0.40", ts_event=WINDOW_OPEN_NS + NS_PER_MIN),
+    )
+
+    assert calls == []
+    assert strategy.diagnostics.count("open_intent_wait") == 2
+    assert len(sink.payloads) == 1
+    assert strategy._latch is not None
+    assert strategy._latch.is_inflight(STATION, CLIMATE_DAY.isoformat()) is False

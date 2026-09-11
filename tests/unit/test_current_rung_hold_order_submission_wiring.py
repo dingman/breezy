@@ -111,13 +111,22 @@ async def _drain_pending_tasks() -> None:
     ``_submit_order`` as an ``asyncio.Task`` rather than awaiting it inline
     -- exactly the real live shape. A few drain passes let that task (and
     whatever it awaits) actually run before assertions.
+
+    Resolution A (plan rev 6.1): ``_connect`` now ALSO starts
+    ``_resolve_ambiguous_intents`` -- a genuinely long-lived background poll
+    that never completes on its own. ``asyncio.gather(*pending)`` waits for
+    EVERY listed task to finish, so gathering it alongside the submit task
+    would deadlock this helper forever. Yielding via ``asyncio.sleep(0)``
+    instead still lets every READY task make progress each pass (the fake
+    sender has no real delay, so the submit task finishes in a handful of
+    iterations) without ever blocking on a task that is not meant to finish.
     """
     current = asyncio.current_task()
     for _ in range(20):
         pending = [t for t in asyncio.all_tasks() if t is not current and not t.done()]
         if not pending:
             return
-        await asyncio.gather(*pending)
+        await asyncio.sleep(0)
 
 
 class _CapsAndGate:

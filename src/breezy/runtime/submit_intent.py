@@ -76,6 +76,21 @@ class RetirementReason(str, Enum):
     ACCEPTED_ZERO_FILL_TERMINAL = "ACCEPTED_ZERO_FILL_TERMINAL"
     STARTUP_FILL_RECORD_MATCH = "STARTUP_FILL_RECORD_MATCH"
     OPERATOR_CLEARED = "OPERATOR_CLEARED"
+    #: L-36 / plan rev 6.1, Resolution A2/D: a with-id AMBIGUOUS create-order
+    #: outcome resolved by the resolver's own bounded GET (never the create
+    #: response) to a terminal state with filled_qty==0, confirmed by an
+    #: eof-complete positions read showing no LONG. Distinct from
+    #: ACCEPTED_ZERO_FILL_TERMINAL, which is set from the CREATE response
+    #: itself and (per L-36) is unreachable in practice.
+    STATUS_REPORT_ZERO_FILL_TERMINAL = "STATUS_REPORT_ZERO_FILL_TERMINAL"
+    #: Resolution A2/E (plan rev 6.1, slice 3): a with-id AMBIGUOUS
+    #: create-order outcome resolved by the resolver's own bounded GET to a
+    #: terminal FILLED/PARTIALLY_FILLED state with a confirmed LONG present
+    #: on an eof-complete positions read. The venue's Order schema carries no
+    #: execution legs, so the fill is SYNTHESIZED from ``cumQuantity``/
+    #: ``avgPx`` -- distinct from ACCEPTED_WITH_DURABLE_FILL, which is set
+    #: from real per-leg execution evidence in the CREATE response.
+    STATUS_REPORT_ACCEPT_FILL_TERMINAL = "STATUS_REPORT_ACCEPT_FILL_TERMINAL"
 
 
 class SubmitIntentError(Exception):

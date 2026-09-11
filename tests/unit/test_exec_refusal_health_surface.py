@@ -79,13 +79,16 @@ _submit_order#3                     EXCEPTIONAL   fail-closed: the durable fill 
                                                    built or written; evidence write is untrusted
 _submit_order#4                     EXCEPTIONAL   fail-closed attestation: the fill IS durable and
                                                    published, but its fee could not be reconciled
+_resolve_accept_fill#1              EXCEPTIONAL   fail-closed: the resolver's own synthesized-fill
+                                                   durable record could not be built or written
 ==================================  ============  ================================================
 
-Seven ROUTINE, twenty-two EXCEPTIONAL (I1b added ``_submit_order#3``/``#4``:
-old 27 -> new 29). Every one of the seven is reachable on
-an account in perfectly good order, which is the whole argument for INDICATOR
-over kill switch -- and one of them, ``_map_position#3``, is the non-long
-position refusal Revision 0's hand count missed entirely.
+Seven ROUTINE, twenty-three EXCEPTIONAL (slice 3 added
+``_resolve_accept_fill#1``: old 29 -> new 30; I1b earlier added
+``_submit_order#3``/``#4``: old 27 -> new 29). Every one of the seven is
+reachable on an account in perfectly good order, which is the whole argument
+for INDICATOR over kill switch -- and one of them, ``_map_position#3``, is
+the non-long position refusal Revision 0's hand count missed entirely.
 
 NO ORDER PATH, NO EGRESS
 -------------------------
@@ -174,6 +177,10 @@ REFUSAL_PRODUCERS: Final[frozenset[str]] = frozenset(
         # still publish the fill (see the triage table above).
         "_submit_order#3",
         "_submit_order#4",
+        # Slice 3 (plan rev 6.1): the resolver's own GET-confirmed-FILLED
+        # branch mirrors `_submit_order#3`'s identical fail-closed guard
+        # around its own `record_fill` call: old 29 -> new 30.
+        "_resolve_accept_fill#1",
     }
 )
 
@@ -251,7 +258,7 @@ def test_the_refusal_producer_set_is_exactly_pinned() -> None:
         "added": sorted(scanned - REFUSAL_PRODUCERS),
         "removed": sorted(REFUSAL_PRODUCERS - scanned),
     }
-    assert len(scanned) == 29  # I1b: old 27 -> new 29
+    assert len(scanned) == 30  # slice 3: old 29 -> new 30 (I1b: old 27 -> new 29)
 
 
 def test_planting_a_twenty_sixth_refusal_breaks_the_pin() -> None:
@@ -266,7 +273,7 @@ def test_planting_a_twenty_sixth_refusal_breaks_the_pin() -> None:
     assert planted != source, "the plant site moved; update this test's anchor"
     scanned = _refusal_producers(planted)
     assert scanned != set(REFUSAL_PRODUCERS)
-    assert len(scanned) == 30  # I1b: old 28 -> new 30 (planting one more breaks the pin)
+    assert len(scanned) == 31  # slice 3: old 30 -> new 31 (planting one more breaks the pin)
 
 
 def test_removing_a_refusal_breaks_the_pin() -> None:
@@ -299,8 +306,9 @@ def test_every_pinned_refusal_producer_is_triaged_here() -> None:
         "stale_rows": sorted(set(triaged) - REFUSAL_PRODUCERS),
     }
     counts = Counter(triaged.values())
-    # I1b: old {"EXCEPTIONAL": 20, "ROUTINE": 7} -> new {"EXCEPTIONAL": 22, "ROUTINE": 7}
-    assert counts == {"EXCEPTIONAL": 22, "ROUTINE": 7}, counts
+    # slice 3: old {"EXCEPTIONAL": 22, "ROUTINE": 7} -> new {"EXCEPTIONAL": 23, "ROUTINE": 7}
+    # (I1b: old {"EXCEPTIONAL": 20, "ROUTINE": 7} -> new {"EXCEPTIONAL": 22, "ROUTINE": 7})
+    assert counts == {"EXCEPTIONAL": 23, "ROUTINE": 7}, counts
 
 
 # ---------------------------------------------------------------------------

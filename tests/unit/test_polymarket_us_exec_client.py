@@ -620,7 +620,11 @@ def test_refuse_producer_count_stays_pinned_at_twenty_seven() -> None:
     """PIN: widened old(27) -> new(29) for I1b's exactly TWO new producers,
     `self._refuse(_FILL_WRITE_FAILED)` and `self._refuse(_FEE_UNRECONCILED)`
     in `_submit_order`'s `KIND_ACCEPT_FILL` branch
-    (LIVE_FILL_SCORING_CHAIN_2026-09-05). Never relaxed, only widened (L-12).
+    (LIVE_FILL_SCORING_CHAIN_2026-09-05). Widened AGAIN old(29) -> new(30) by
+    slice 3 (plan rev 6.1): `_resolve_accept_fill`'s own
+    `self._refuse(_FILL_WRITE_FAILED)`, mirroring `_submit_order`'s identical
+    fail-closed guard around its own `record_fill` call. Never relaxed, only
+    widened (L-12).
 
     The authoritative, triaged inventory is
     `tests/unit/test_exec_refusal_health_surface.py::REFUSAL_PRODUCERS`; this
@@ -642,7 +646,7 @@ def test_refuse_producer_count_stays_pinned_at_twenty_seven() -> None:
         and isinstance(node.func.value, ast.Name)
         and node.func.value.id == "self"
     )
-    assert count == 29
+    assert count == 30
 
 
 @pytest.mark.asyncio
