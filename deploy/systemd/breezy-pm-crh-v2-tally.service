@@ -22,6 +22,18 @@ Documentation=file:///home/jon/breezy/docs/plans/FAMILY_TALLY_V2_BLUEPRINT_2026-
 [Service]
 Type=oneshot
 WorkingDirectory=/home/jon/breezy
+
+# Own cgroup memory ceiling. 2026-09-11 incident: breezy-k1-daily.service (a
+# sibling nightly-analysis unit) reached a 17.6 GB memory peak in under 2
+# minutes with NO MemoryHigh=/MemoryMax= configured at all, pushing the 31 GB
+# host into swap while breezy-trade-supervisor.service (the live trading
+# node, deliberately left UNcapped on purpose -- see its own :64 comment)
+# was running at ~625 MB. This unit's own footprint is a local parquet/
+# sqlite read, not a tape scan, so MemoryHigh=1G/MemoryMax=2G is deliberately
+# far below the host: a runaway run's OOM lands on the study, never the
+# node.
+MemoryHigh=1G
+MemoryMax=2G
 UMask=0077
 
 # No EnvironmentFile, deliberately: this unit holds no venue credential --

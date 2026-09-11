@@ -20,6 +20,23 @@ After=network-online.target
 [Service]
 Type=oneshot
 WorkingDirectory=/home/jon/breezy
+
+# Own cgroup memory ceiling. Same 2026-09-11 K1 incident
+# (breezy-k1-daily.service hit a 17.6 GB peak in under 2 minutes with no
+# ceiling at all, pushing the 31 GB host into swap while
+# breezy-trade-supervisor.service -- the live trading node, deliberately
+# left UNcapped, see its own :64 comment -- ran at ~625 MB) prompted capping
+# every nightly-analysis unit. Measured via `journalctl --user -u
+# breezy-quote-tape-ingest.service --since 2026-09-08 --no-pager -o cat |
+# grep -aoE '[0-9.]+[MG] memory peak'`: the last three completed runs were
+# 468.6M, 468.1M, and one 5G outlier (the 09-07 recovery pass, converting a
+# larger-than-usual backlog) over ~1 min wall clock each. MemoryHigh=4G/
+# MemoryMax=6G clears that outlier with headroom while staying far below the
+# 31 GB host (node + recorder + tooling together measure well under 4G), so
+# a genuine runaway still gets OOM-killed in its OWN cgroup, never the
+# host-wide OOM killer.
+MemoryHigh=4G
+MemoryMax=6G
 UMask=0077
 
 # No EnvironmentFile: this process holds no venue credential and opens no

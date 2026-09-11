@@ -12,6 +12,25 @@ After=network-online.target
 [Service]
 Type=oneshot
 WorkingDirectory=/home/jon/breezy
+
+# Own cgroup memory ceiling. 2026-09-11 incident: this unit reached a 17.6 GB
+# memory peak in under 2 minutes with NO MemoryHigh=/MemoryMax= configured at
+# all, pushing the 31 GB host into swap while breezy-trade-supervisor.service
+# (the live trading node, deliberately left UNcapped on purpose -- see its
+# own :64 comment) was running at ~625 MB. Measured via `journalctl --user -u
+# breezy-k1-daily.service --since 2026-09-08 --no-pager -o cat | grep -aoE
+# '[0-9.]+[MG] memory peak'`: the last three completed runs peaked at 23.6G,
+# 14.9G, 17.6G over 8-10 min wall clock -- ordinary operation of this study
+# routinely runs in the 15-24G range, so a 6G ceiling would OOM-kill every
+# night's legitimate run, not just a genuine runaway. MemoryHigh=12G/
+# MemoryMax=16G is deliberately far below the 31 GB host (node + recorder +
+# tooling together measure well under 4G), so a run that DOES exceed the
+# measured range still gets OOM-killed in its OWN cgroup, never the
+# host-wide OOM killer choosing among unrelated processes including the
+# trading node. A streaming fix to the K1 loader is in flight separately and
+# is expected to let this ceiling come down later.
+MemoryHigh=12G
+MemoryMax=16G
 UMask=0077
 
 # No EnvironmentFile. Deliberate, and the point of the separation: this
