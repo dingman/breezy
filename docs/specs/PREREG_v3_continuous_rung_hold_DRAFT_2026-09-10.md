@@ -1,6 +1,6 @@
-# PREREG v3 — continuous_rung_hold (Polymarket.us) — Phase 1 + Phase 0b continuous hunt
+# PREREG v3 — continuous_rung_hold (Polymarket.us) — Phase 1 + Phase 0b continuous hunt (BINDING, registered 2026-09-11)
 
-**Status: DRAFT_NOT_REGISTERED (d0 to be pinned at registration BEFORE first v3 fill)**
+**Status: BINDING (registered 2026-09-11 UTC; D0 = 2026-09-12 climate_day per §1)**
 
 This spec registers **Phase 1** (continuous hunt with bounded AMBIGUOUS-intent resolution) and **Phase 0b** (extended hunt triggers) as a CLASS (C) new family — v2's trigger selection is frozen; v3 is a different selector. Reuse v2's sequential monitoring rule, `I_max=40`, `n_max=160`, LD-OBF α=0.025 per side, and all strata unchanged from v2 rev b. No change to `allow_short` (stays `False`), Nautilus, or v1's byte-identical code.
 
@@ -14,9 +14,9 @@ This spec registers **Phase 1** (continuous hunt with bounded AMBIGUOUS-intent r
 | `venue` | `polymarket_us` |
 | `trial_id_prefix` | `continuous_rung_hold/trial/` |
 | `stations` | LAX, MDW, MIA, SFO |
-| `status` | DRAFT_NOT_REGISTERED |
-| `d0_climate_day` | **To be pinned at registration, BEFORE first fill** |
-| `boundary_artefact_path` | `deploy/families/gs_boundary_pm_us_crh_cont.json` |
+| `status` | REGISTERED (2026-09-11 UTC) |
+| `d0_climate_day` | **2026-09-12** (pinned at registration 2026-09-11, before first fill) |
+| `boundary_artefact_path` | `deploy/families/gs_boundary_pm_us_crh_v2.json` (reused verbatim, §16) |
 
 ---
 
@@ -140,7 +140,7 @@ No other operator variable. Enablement flags, PREREG status, session ceilings, o
 
 ## 8. Boundary Artefact (unchanged from v2)
 
-`deploy/families/gs_boundary_pm_us_crh_cont.json` must pin:
+`deploy/families/gs_boundary_pm_us_crh_v2.json` (reused verbatim — identical design, see §16; inputs sha `471fd8a7…c150e0c`) pins:
 - Inputs: two one-sided α=0.025, LD-OBF spending of `t`, look schedule `n_k = 10..160` step 10, `I_max=40`.
 - Solver: `b^eff(t)`, `b^fut(t)` functions, not fixed 16 z-values.
 - Regression fixture: equal-`t` 16-row table only (test fixture, not operative).
@@ -250,20 +250,23 @@ Window `[12:00, 17:00)` LST, 30 min afternoon-covered threshold, ≥15 covered l
 
 ---
 
-## 16. Registration record (to be completed at registration)
+## 16. Registration record (2026-09-11)
 
-Per operator delegation (strategy-lead ruling via `docs/evidence/` decision artifacts; domain-reviewer
-approval contingent on Phase 1 order enablement and AMBIGUOUS resolution).
+Registered 2026-09-11 UTC per operator delegation (strategy-lead ruling via `docs/evidence/`
+decision artifacts; domain-reviewer approval contingent on Phase 1 order enablement and AMBIGUOUS
+resolution).
 
-- **D0 = (TO BE SET AT REGISTRATION)** (UTC climate_day). `deploy/families/pm_us_crh_cont.json` carries
-  `status: "REGISTERED"` and `d0_climate_day: "<YYYYMMDD>"` (first UTC day strictly after registration
-  commit timestamp).
-- **Registration commit = (TO BE SET AT REGISTRATION).** The commit hash that first lands the family
-  configuration file.
-- **Boundary artefact reused.** `deploy/families/gs_boundary_pm_us_crh_v2.json` is authoritative;
-  design constants identical to v2 (LD-OBF, α=0.025, n_max=160, i_max=40, look_step=10).
-  `inputs_sha256 = 471fd8a7ea781365d0e892cde87a65b5408126c07d8bb28e515b4c493c150e0c` pinned at
-  registration (see `scripts/analysis/crh_group_sequential_boundaries.py` `inputs_manifest`).
+- **D0 = 2026-09-12** (UTC climate_day; first UTC day strictly after this registration commit,
+  never retroactive). `deploy/families/pm_us_crh_cont.json` carries `status: "REGISTERED"` and
+  `d0_climate_day: "2026-09-12"`.
+- **Registration commit.** registration commit: <sha to be filled by coordinator at commit>
+- **Boundary artefact reused verbatim.** `deploy/families/gs_boundary_pm_us_crh_v2.json` is
+  authoritative -- this family does NOT build its own artefact; the identical sequential design
+  (LD-OBF, α=0.025, n_max=160, i_max=40, look_step=10) means the artefact's `inputs_sha256`
+  covers this family's inputs exactly as it covers v2's (`scripts/analysis/
+  crh_group_sequential_boundaries.py` `inputs_manifest` -- alpha/spending_function_id/n_max/
+  i_max/look_step only, no data).
+  `boundary_inputs_sha256 = 471fd8a7ea781365d0e892cde87a65b5408126c07d8bb28e515b4c493c150e0c`.
 - **Fill-time look ordering.** `ScoredTrial` carries no fill timestamp; `score_live_trials.py`
   appends `(trial_id, score_seq) -> filled_at_ns` sidecar; `family_tally_v2.py` replays in real
   fill-time order.
@@ -280,4 +283,4 @@ approval contingent on Phase 1 order enablement and AMBIGUOUS resolution).
 
 ---
 
-**Generated: 2026-09-10 | Commit: (pending d0 pin) | Files scanned: 5 inputs | Status: DRAFT_NOT_REGISTERED**
+**Generated: 2026-09-10 | Registered: 2026-09-11 (D0 = 2026-09-12) | Files scanned: 5 inputs | Status: BINDING**

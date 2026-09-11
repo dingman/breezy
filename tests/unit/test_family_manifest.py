@@ -146,7 +146,10 @@ def test_unpinned_sha_loads_with_allow_draft(tmp_path: Path) -> None:
     assert manifest.boundary_inputs_sha256 == "0" * 64
 
 
-def test_the_two_committed_family_manifests_load_with_allow_draft() -> None:
+def test_the_three_committed_family_manifests_load_with_allow_draft() -> None:
+    """Extended from two to three at `pm_us_crh_cont`'s registration
+    (2026-09-11): a third committed family manifest now exists alongside
+    `pm_us_crh_v2` and `kalshi_crh_v1`."""
     repo_root = Path(__file__).resolve().parents[2]
     pm = load_family_manifest(
         repo_root / "deploy/families/pm_us_crh_v2.json", allow_draft=True
@@ -154,9 +157,34 @@ def test_the_two_committed_family_manifests_load_with_allow_draft() -> None:
     kalshi = load_family_manifest(
         repo_root / "deploy/families/kalshi_crh_v1.json", allow_draft=True
     )
+    cont = load_family_manifest(
+        repo_root / "deploy/families/pm_us_crh_cont.json", allow_draft=True
+    )
     assert pm.family_id == "pm_us_crh_v2"
     assert pm.venue == "polymarket_us"
     assert kalshi.family_id == "kalshi_crh_v1"
     assert kalshi.venue == "kalshi"
     assert kalshi.trial_id_prefix == "kalshi:current_rung_hold/trial/"
-    assert pm.stations and kalshi.stations
+    assert cont.family_id == "pm_us_crh_cont"
+    assert cont.venue == "polymarket_us"
+    assert cont.trial_id_prefix == "continuous_rung_hold/trial/"
+    assert pm.stations and kalshi.stations and cont.stations
+
+
+def test_the_registered_cont_manifest_loads_without_allow_draft() -> None:
+    """PREREG v3 registration (2026-09-11): `pm_us_crh_cont` flips to
+    REGISTERED with D0 = 2026-09-12 (first UTC day strictly after the
+    registration commit) and reuses v2's boundary artefact verbatim -- the
+    manifest loads with NO `allow_draft` at all, and its
+    `boundary_inputs_sha256` equals the reused artefact's own
+    `inputs_sha256` exactly. Stations are v2's four, excluding NYC."""
+    repo_root = Path(__file__).resolve().parents[2]
+    artefact_payload = json.loads(
+        (repo_root / "deploy/families/gs_boundary_pm_us_crh_v2.json").read_text()
+    )
+    cont = load_family_manifest(repo_root / "deploy/families/pm_us_crh_cont.json")
+    assert cont.status == "REGISTERED"
+    assert cont.d0_climate_day == "2026-09-12"
+    assert cont.boundary_inputs_sha256 == artefact_payload["inputs_sha256"]
+    assert cont.trial_id_prefix == "continuous_rung_hold/trial/"
+    assert cont.stations == ("LAX", "MDW", "MIA", "SFO")

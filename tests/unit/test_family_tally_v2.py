@@ -35,6 +35,11 @@ _REPO_ROOT = Path(__file__).resolve().parents[2]
 _SCRIPTS_ANALYSIS_DIR = _REPO_ROOT / "scripts" / "analysis"
 _REAL_ARTEFACT_PATH = _REPO_ROOT / "deploy" / "families" / "gs_boundary_pm_us_crh_v2.json"
 _REAL_ARTEFACT_SHA = "471fd8a7ea781365d0e892cde87a65b5408126c07d8bb28e515b4c493c150e0c"
+# pm_us_crh_cont (registered 2026-09-11) REUSES the v2 boundary artefact
+# verbatim -- same file, same sha -- so the cont manifest is covered by the
+# identical consistency check below, never a second artefact.
+_CONT_MANIFEST_PATH = _REPO_ROOT / "deploy" / "families" / "pm_us_crh_cont.json"
+_CONT_ARTEFACT_SHA = _REAL_ARTEFACT_SHA
 
 _FEE_THETA = Decimal("0.06")
 _PM_PREFIX = "current_rung_hold/trial/"
@@ -410,6 +415,21 @@ def test_the_real_committed_pm_us_manifest_is_registered_and_correctly_pinned() 
     assert manifest.status == "REGISTERED"
     assert manifest.d0_climate_day == "2026-09-05"
     assert manifest.boundary_inputs_sha256 == _REAL_ARTEFACT_SHA
+
+
+def test_the_real_committed_cont_manifest_is_registered_and_correctly_pinned() -> None:
+    """PREREG v3 registration (2026-09-11): `pm_us_crh_cont` flips to
+    REGISTERED with D0 = 2026-09-12 (first UTC day strictly after the
+    registration commit). It REUSES v2's boundary artefact verbatim --
+    same identical sequential design (LD-OBF, alpha=0.025, n_max=160,
+    i_max=40, look_step=10) -- so `boundary_inputs_sha256` matches the
+    SAME committed artefact `pm_us_crh_v2` pins, by the same consistency
+    check."""
+    manifest = load_family_manifest(_CONT_MANIFEST_PATH)  # no allow_draft
+    assert manifest.status == "REGISTERED"
+    assert manifest.d0_climate_day == "2026-09-12"
+    assert manifest.boundary_artefact_path == _REAL_ARTEFACT_PATH.relative_to(_REPO_ROOT)
+    assert manifest.boundary_inputs_sha256 == _CONT_ARTEFACT_SHA
 
 
 def test_cli_renders_continue_verdict_vocabulary_for_the_real_registered_family_at_n_zero(
