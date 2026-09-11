@@ -81,8 +81,11 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 from nautilus_trader.model.data import OrderBookDepth10, QuoteTick
 from nautilus_trader.model.instruments import BinaryOption
+from nautilus_trader.model.objects import Price, Quantity
 from nautilus_trader.persistence.catalog.parquet import ParquetDataCatalog
 from nautilus_trader.serialization.arrow.serializer import ArrowSerializer
+
+from breezy.adapters.polymarket_us.parsing import DEPTH10_LEVELS
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
@@ -584,6 +587,163 @@ def _load_stream(tape_root: Path, folder: str, data_cls: type) -> tuple[TapePref
     return preflight, parsed_objects
 
 
+def _decode_raw_fixed_point(value: bytes) -> int:
+    """The undecoded raw integer behind one `fixed_size_binary[16]` cell.
+
+    A plain byte->int conversion, NOT a scale factor: the scale (10**9 vs
+    10**16 depending on build) is Nautilus' internal concern and is never
+    re-derived here -- see `_load_depth_ask_observations`.
+    """
+    return int.from_bytes(value, "little", signed=True)
+
+
+def _depth_table_identity(table: pa.Table) -> tuple[str, int, int]:
+    """`(instrument_id, price_precision, size_precision)` for one depth file.
+
+    One depth batch can only ever hold ONE instrument at one precision --
+    `ArrowSerializer.serialize_batch` itself raises ``Mixed metadata`` the
+    moment two are combined -- so these are read ONCE per file from the
+    schema metadata, never per row.
+    """
+    metadata = table.schema.metadata or {}
+    return (
+        metadata[b"instrument_id"].decode(),
+        int(metadata[b"price_precision"]),
+        int(metadata[b"size_precision"]),
+    )
+
+
+def _best_populated_ask_raw(
+    ask_price_cols: list[list[bytes]], ask_size_cols: list[list[bytes]], row: int
+) -> tuple[int, int] | None:
+    """The (price, size) RAW pair `_asks_from_depth` would have chosen.
+
+    Mirrors its ``min`` over populated levels exactly, but compares the
+    undecoded fixed-point integers (a monotonic stand-in for price at one
+    file's fixed precision), so no `Price`/`Quantity` is constructed for a
+    level that does not win.
+    """
+    populated = [
+        (
+            _decode_raw_fixed_point(ask_price_cols[level][row]),
+            _decode_raw_fixed_point(ask_size_cols[level][row]),
+        )
+        for level in range(DEPTH10_LEVELS)
+    ]
+    populated = [(price, size) for price, size in populated if price > 0 and size > 0]
+    if not populated:
+        return None
+    return min(populated, key=lambda level: level[0])
+
+
+def _load_depth_ask_observations(tape_root: Path) -> tuple[TapePreflight, list[AskObservation]]:
+    """Stream `order_book_depths` straight to best-ask observations.
+
+    `OrderBookDepth10` Python objects are never built for this stream. The
+    live tape is 1,787 feather files / 21 GB, and materializing every row's
+    twenty `BookOrder` levels for the WHOLE tape via `_load_stream` +
+    `_asks_from_depth` is what drove K1's measured 14.9-23.6 GB peak.
+
+    `ArrowSerializer.deserialize` cannot be handed a column-projected table
+    to cut that cost: it validates columns by POSITION and raises
+    (``ValueError: Invalid column type ... at index N``) the instant one is
+    dropped. So the raw Arrow columns are read directly with `pyarrow`, and
+    only the WINNING ask level per row is decoded -- via `Price.from_raw` /
+    `Quantity.from_raw`, Nautilus' own native fixed-point constructors, never
+    a hand-rolled scale factor (see `_decode_raw_fixed_point`). Only one
+    file's table is ever resident: it is read, reduced to observations, and
+    dropped before the next file is opened.
+
+    Preflight accounting (`raw_rows`, `deduplicated_rows`,
+    `rows_per_instrument`, the ts bounds) is computed identically to
+    `_load_stream` -- over EVERY deduplicated row, whether or not that row
+    carried a genuine ask -- so the reported preflight is unchanged by this
+    optimization; only how the ask itself is extracted changed.
+    """
+    files = _tape_files(tape_root, "order_book_depths")
+    now_ns = int(dt.datetime.now(dt.UTC).timestamp() * _NS_PER_SECOND)
+    failures: list[tuple[str, str, str]] = []
+    files_parsed = 0
+    raw_rows = 0
+    seen: set[tuple[str, int, int]] = set()
+    rows_per_instrument: dict[str, int] = defaultdict(int)
+    ts_min: int | None = None
+    ts_max: int | None = None
+    observations: list[AskObservation] = []
+
+    for path in files:
+        try:
+            table = _read_arrow_table(path)
+            instrument_id, price_precision, size_precision = _depth_table_identity(table)
+            ts_events = table.column("ts_event").to_pylist()
+            ts_inits = table.column("ts_init").to_pylist()
+            ask_price_cols = [
+                table.column(f"ask_price_{level}").to_pylist() for level in range(DEPTH10_LEVELS)
+            ]
+            ask_size_cols = [
+                table.column(f"ask_size_{level}").to_pylist() for level in range(DEPTH10_LEVELS)
+            ]
+            row_count = table.num_rows
+        except Exception as exc:  # noqa: BLE001 -- the count IS the finding
+            mtime_ns = int(path.stat().st_mtime * _NS_PER_SECOND)
+            failures.append(
+                (
+                    str(path),
+                    f"{type(exc).__name__}: {exc}",
+                    classify_parse_failure(file_mtime_ns=mtime_ns, now_ns=now_ns),
+                )
+            )
+            continue
+
+        files_parsed += 1
+        raw_rows += row_count
+        for row in range(row_count):
+            ts_event = int(ts_events[row])
+            ts_init = int(ts_inits[row])
+            key = (instrument_id, ts_event, ts_init)
+            if key in seen:
+                continue
+            seen.add(key)
+            rows_per_instrument[instrument_id] += 1
+            ts_min = ts_event if ts_min is None else min(ts_min, ts_event)
+            ts_max = ts_event if ts_max is None else max(ts_max, ts_event)
+
+            best = _best_populated_ask_raw(ask_price_cols, ask_size_cols, row)
+            if best is None:
+                continue
+            raw_price, raw_size = best
+            observations.append(
+                AskObservation(
+                    instrument_id=instrument_id,
+                    ts_event_ns=ts_event,
+                    ts_init_ns=ts_init,
+                    ask_price=Decimal(str(Price.from_raw(raw_price, price_precision))),
+                    ask_size=Decimal(str(Quantity.from_raw(raw_size, size_precision))),
+                    source="order_book_depths",
+                )
+            )
+
+        # Explicit, not cosmetic: the next loop iteration reassigns `table`
+        # regardless, but this is the line the equivalence test's `weakref`
+        # pins -- one file's table must be gone before the next is read.
+        del table, ts_events, ts_inits, ask_price_cols, ask_size_cols
+
+    preflight = TapePreflight(
+        data_class=OrderBookDepth10.__name__,
+        files_found=len(files),
+        files_parsed=files_parsed,
+        files_failed=len(failures),
+        failures=tuple(failures),
+        raw_rows=raw_rows,
+        deduplicated_rows=len(seen),
+        instruments=len(rows_per_instrument),
+        rows_per_instrument=dict(rows_per_instrument),
+        ts_event_min_ns=ts_min,
+        ts_event_max_ns=ts_max,
+    )
+    return preflight, observations
+
+
 # ---------------------------------------------------------------------------
 # Population assembly
 # ---------------------------------------------------------------------------
@@ -711,7 +871,7 @@ def build_population(
     instrument_preflight, instrument_objects = _load_stream(
         tape_root, "binary_option", BinaryOption
     )
-    depth_preflight, depth_objects = _load_stream(tape_root, "order_book_depths", OrderBookDepth10)
+    depth_preflight, depth_ask_observations = _load_depth_ask_observations(tape_root)
     quote_preflight, quote_objects = _load_stream(tape_root, "quote_tick", QuoteTick)
 
     facts_by_id: dict[str, InstrumentFacts] = {}
@@ -721,7 +881,7 @@ def build_population(
             facts_by_id[facts.instrument_id] = facts
 
     observations: dict[str, list[AskObservation]] = defaultdict(list)
-    for observation in _asks_from_depth(depth_objects) + _asks_from_quotes(quote_objects):
+    for observation in depth_ask_observations + _asks_from_quotes(quote_objects):
         observations[observation.instrument_id].append(observation)
 
     offsets = _station_offsets()

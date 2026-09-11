@@ -429,3 +429,269 @@ def test_min_n_to_refute_exceeds_the_discrimination_sample_at_one_cent() -> None
     assert min_n_to_refute(
         threshold=Decimal("0.01"), theta=Decimal("0.06")
     ) > required_n_to_discriminate(p_alt=0.03, p_null=0.01)
+
+
+# ---------------------------------------------------------------------------
+# Streaming depth loader -- must match the materializing loader exactly, and
+# must never hold more than one file's rows in memory at once (the live tape
+# is 1,787 feather files / 21 GB; materializing every OrderBookDepth10 for
+# the WHOLE tape at once is what drove K1's measured 14.9-23.6 GB peak).
+# ---------------------------------------------------------------------------
+
+import weakref
+
+import k1_cheap_open_settlement as k1
+import pyarrow as pa
+import pyarrow.parquet as pq
+from nautilus_trader.model.data import BookOrder, OrderBookDepth10
+from nautilus_trader.model.enums import OrderSide
+from nautilus_trader.model.identifiers import InstrumentId
+from nautilus_trader.model.objects import Price, Quantity
+from nautilus_trader.serialization.arrow.serializer import ArrowSerializer
+
+
+def _depth_side(
+    levels: list[tuple[str, str]],
+    side: OrderSide,
+    price_precision: int,
+    size_precision: int,
+) -> tuple[list[BookOrder], list[int]]:
+    orders = [
+        BookOrder(
+            side,
+            Price(float(price), price_precision),
+            Quantity(float(size), size_precision),
+            0,
+        )
+        for price, size in levels
+    ]
+    counts = [1] * len(orders)
+    filler = BookOrder(side, Price(0, price_precision), Quantity(0, size_precision), 0)
+    while len(orders) < 10:
+        orders.append(filler)
+        counts.append(0)
+    return orders, counts
+
+
+def _make_depth(
+    *,
+    instrument_id: InstrumentId,
+    ask_levels: list[tuple[str, str]],
+    bid_levels: list[tuple[str, str]],
+    ts_event: int,
+    ts_init: int,
+    sequence: int,
+    price_precision: int = 2,
+    size_precision: int = 2,
+) -> OrderBookDepth10:
+    bids, bid_counts = _depth_side(bid_levels, OrderSide.BUY, price_precision, size_precision)
+    asks, ask_counts = _depth_side(ask_levels, OrderSide.SELL, price_precision, size_precision)
+    return OrderBookDepth10(
+        instrument_id=instrument_id,
+        bids=bids,
+        asks=asks,
+        bid_counts=bid_counts,
+        ask_counts=ask_counts,
+        flags=0,
+        sequence=sequence,
+        ts_event=ts_event,
+        ts_init=ts_init,
+    )
+
+
+def _write_feather(path: Path, depths: list[OrderBookDepth10]) -> None:
+    table = ArrowSerializer.serialize_batch(depths, data_cls=OrderBookDepth10)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with pa.OSFile(str(path), "wb") as sink:
+        writer = pa.ipc.new_stream(sink, table.schema)
+        writer.write_table(table)
+        writer.close()
+
+
+def _write_parquet(path: Path, depths: list[OrderBookDepth10]) -> None:
+    table = ArrowSerializer.serialize_batch(depths, data_cls=OrderBookDepth10)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    pq.write_table(table, path)
+
+
+def _mini_depth_tape(tape_root: Path) -> tuple[InstrumentId, InstrumentId, InstrumentId]:
+    """Three depth files, three instruments, BOTH tape subtrees and layouts.
+
+    `instrument_c` deliberately carries a DIFFERENT price precision AND a
+    different size precision from `instrument_a`/`instrument_b` --
+    `minimumTradeQty` changed 1 -> 0.01 on 06-14, so the real tape mixes
+    `size_precision=0` and `size_precision=2` files, and price/size precision
+    are not the same value within a file either.
+    """
+    instrument_a = InstrumentId.from_str(
+        "tc-temp-nychigh-2026-08-31-gte82lt83f.POLYMARKET_US"
+    )
+    instrument_b = InstrumentId.from_str(
+        "tc-temp-laxhigh-2026-08-31-gte90f.POLYMARKET_US"
+    )
+    instrument_c = InstrumentId.from_str(
+        "tc-temp-mdwhigh-2026-08-31-gte93lt94f.POLYMARKET_US"
+    )
+
+    # `data/` parquet -- best ask is level 1, not level 0: pins the "min over
+    # populated levels" rule, not "trust level 0".
+    depth_a = _make_depth(
+        instrument_id=instrument_a,
+        ask_levels=[("0.05", "5"), ("0.03", "20")],
+        bid_levels=[("0.01", "10")],
+        ts_event=100,
+        ts_init=101,
+        sequence=0,
+    )
+    _write_parquet(
+        tape_root / "data" / "order_book_depths" / "instrument_a" / "part-0.parquet",
+        [depth_a],
+    )
+
+    # `live/<run>/` feather -- one row with NO offered ask at all (must still
+    # be counted in the preflight, but must yield no observation), one with a
+    # genuine ask.
+    depth_b_no_ask = _make_depth(
+        instrument_id=instrument_b,
+        ask_levels=[],
+        bid_levels=[("0.20", "10")],
+        ts_event=200,
+        ts_init=201,
+        sequence=0,
+    )
+    depth_b_genuine = _make_depth(
+        instrument_id=instrument_b,
+        ask_levels=[("0.02", "40")],
+        bid_levels=[("0.20", "10")],
+        ts_event=300,
+        ts_init=301,
+        sequence=1,
+    )
+    _write_feather(
+        tape_root
+        / "live"
+        / "run-1"
+        / "order_book_depths"
+        / "instrument_b"
+        / "instrument_b_1.feather",
+        [depth_b_no_ask, depth_b_genuine],
+    )
+
+    # `live/<run>/` feather, no per-instrument subfolder (the OTHER layout
+    # `_tape_files` globs) -- price_precision=3, size_precision=0, and the
+    # best (lowest) ask sits at level 1, not level 0.
+    depth_c = _make_depth(
+        instrument_id=instrument_c,
+        ask_levels=[("0.500", "12"), ("0.125", "7")],
+        bid_levels=[("0.100", "5")],
+        ts_event=400,
+        ts_init=401,
+        sequence=0,
+        price_precision=3,
+        size_precision=0,
+    )
+    _write_feather(
+        tape_root / "live" / "run-2" / "order_book_depths" / "instrument_c_1.feather",
+        [depth_c],
+    )
+    return instrument_a, instrument_b, instrument_c
+
+
+def _observation_key(observation: AskObservation) -> tuple[str, int, int, Decimal, Decimal]:
+    return (
+        observation.instrument_id,
+        observation.ts_event_ns,
+        observation.ts_init_ns,
+        observation.ask_price,
+        observation.ask_size,
+    )
+
+
+def test_streaming_depth_loader_matches_the_materializing_loader(tmp_path: Path) -> None:
+    """The new streaming path must yield exactly the same observations.
+
+    Compared against the OLD path -- `_load_stream` + `_asks_from_depth` --
+    kept reachable under its private name for exactly this comparison.
+    """
+    _mini_depth_tape(tmp_path)
+
+    old_preflight, depth_objects = k1._load_stream(
+        tmp_path, "order_book_depths", OrderBookDepth10
+    )
+    expected = k1._asks_from_depth(depth_objects)
+
+    new_preflight, streamed = k1._load_depth_ask_observations(tmp_path)
+
+    assert {_observation_key(o) for o in streamed} == {_observation_key(o) for o in expected}
+    assert len(streamed) == len(expected) == 3
+
+    # The preflight is what K1 tells the reader was on disk -- only the ASK
+    # extraction changed, so this accounting must be byte-for-byte identical.
+    assert new_preflight.files_found == old_preflight.files_found == 3
+    assert new_preflight.files_parsed == old_preflight.files_parsed == 3
+    assert new_preflight.files_failed == old_preflight.files_failed == 0
+    assert new_preflight.raw_rows == old_preflight.raw_rows == 4
+    assert new_preflight.deduplicated_rows == old_preflight.deduplicated_rows == 4
+    assert new_preflight.instruments == old_preflight.instruments == 3
+    assert new_preflight.rows_per_instrument == old_preflight.rows_per_instrument
+    assert new_preflight.ts_event_min_ns == old_preflight.ts_event_min_ns == 100
+    assert new_preflight.ts_event_max_ns == old_preflight.ts_event_max_ns == 400
+
+    # Explicit, per-instrument Decimal check on the mixed-precision file
+    # (price_precision=3, size_precision=0): the streaming path must decode
+    # the SAME winning (out-of-order) level as the materializing path, at
+    # the file's OWN precision, not a precision borrowed from another file.
+    instrument_c = "tc-temp-mdwhigh-2026-08-31-gte93lt94f.POLYMARKET_US"
+    streamed_c = next(o for o in streamed if o.instrument_id == instrument_c)
+    expected_c = next(o for o in expected if o.instrument_id == instrument_c)
+    assert streamed_c.ask_price == expected_c.ask_price == Decimal("0.125")
+    assert streamed_c.ask_size == expected_c.ask_size == Decimal(7)
+    assert str(streamed_c.ask_price) == str(expected_c.ask_price)
+    assert str(streamed_c.ask_size) == str(expected_c.ask_size)
+
+
+def test_streaming_depth_loader_reports_a_corrupt_file_the_same_way(tmp_path: Path) -> None:
+    """A truncated/corrupt file must still be counted as a failure, not raise."""
+    _mini_depth_tape(tmp_path)
+    corrupt = tmp_path / "live" / "run-1" / "order_book_depths" / "corrupt" / "bad.feather"
+    corrupt.parent.mkdir(parents=True, exist_ok=True)
+    corrupt.write_bytes(b"not an arrow stream")
+
+    old_preflight, _ = k1._load_stream(tmp_path, "order_book_depths", OrderBookDepth10)
+    new_preflight, _ = k1._load_depth_ask_observations(tmp_path)
+
+    assert new_preflight.files_found == old_preflight.files_found == 4
+    assert new_preflight.files_failed == old_preflight.files_failed == 1
+    assert new_preflight.files_parsed == old_preflight.files_parsed == 3
+
+
+def test_depth_loader_never_holds_more_than_one_files_table_at_once(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The streaming loader must drop file N's table before opening file N+1.
+
+    Proven with `weakref`: by the time a NEW file's table is read, every
+    earlier file's table must already be unreachable -- if the loader were
+    still accumulating a tape-wide list (the original bug), the earlier
+    table would still be alive here.
+    """
+    _mini_depth_tape(tmp_path)
+    original_read = k1._read_arrow_table
+    live_refs: list[weakref.ReferenceType] = []
+
+    def _tracking_read(path: Path) -> pa.Table:
+        table = original_read(path)
+        assert all(ref() is None for ref in live_refs), (
+            "a previous file's Arrow table is still alive while the next "
+            "file is being read -- the loader is holding more than one "
+            "file's rows at once"
+        )
+        live_refs.append(weakref.ref(table))
+        return table
+
+    monkeypatch.setattr(k1, "_read_arrow_table", _tracking_read)
+
+    _, observations = k1._load_depth_ask_observations(tmp_path)
+
+    assert len(live_refs) == 3
+    assert len(observations) == 3
