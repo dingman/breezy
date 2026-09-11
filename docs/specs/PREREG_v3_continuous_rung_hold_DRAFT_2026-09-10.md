@@ -250,4 +250,34 @@ Window `[12:00, 17:00)` LST, 30 min afternoon-covered threshold, ≥15 covered l
 
 ---
 
+## 16. Registration record (to be completed at registration)
+
+Per operator delegation (strategy-lead ruling via `docs/evidence/` decision artifacts; domain-reviewer
+approval contingent on Phase 1 order enablement and AMBIGUOUS resolution).
+
+- **D0 = (TO BE SET AT REGISTRATION)** (UTC climate_day). `deploy/families/pm_us_crh_cont.json` carries
+  `status: "REGISTERED"` and `d0_climate_day: "<YYYYMMDD>"` (first UTC day strictly after registration
+  commit timestamp).
+- **Registration commit = (TO BE SET AT REGISTRATION).** The commit hash that first lands the family
+  configuration file.
+- **Boundary artefact reused.** `deploy/families/gs_boundary_pm_us_crh_v2.json` is authoritative;
+  design constants identical to v2 (LD-OBF, α=0.025, n_max=160, i_max=40, look_step=10).
+  `inputs_sha256 = 471fd8a7ea781365d0e892cde87a65b5408126c07d8bb28e515b4c493c150e0c` pinned at
+  registration (see `scripts/analysis/crh_group_sequential_boundaries.py` `inputs_manifest`).
+- **Fill-time look ordering.** `ScoredTrial` carries no fill timestamp; `score_live_trials.py`
+  appends `(trial_id, score_seq) -> filled_at_ns` sidecar; `family_tally_v2.py` replays in real
+  fill-time order.
+- **Provenance sidecar.** `score_live_trials.py` writes `<store_dir>/provenance.json = {"provenance":
+  "live"}`; tallies refuse stores lacking it or declaring anything else (except empty stores before
+  first fill).
+- **`q != 1` exclusion.** Fills with `qty != 1` excluded before scoring.
+- **`held == (pnl > 0)` guard.** Scored rows where `held` disagrees with `pnl` sign refuse tally.
+- **Empty-store rule.** Stores with no rows and no provenance report `n=0`/CONTINUE; stores with
+  rows and no/mismatched provenance refuse fail-closed.
+- **Phase 1 additions.** AMBIGUOUS with-id retirement via bounded GET resolver
+  (`_resolve_ambiguous_intents`, exec/client.py:1068-1267); no-id AMBIGUOUS operator-only
+  (`breezy-clear-submit-intent`). Duplicate-fill halt stops arming family-wide.
+
+---
+
 **Generated: 2026-09-10 | Commit: (pending d0 pin) | Files scanned: 5 inputs | Status: DRAFT_NOT_REGISTERED**
