@@ -259,7 +259,7 @@ resolution).
 - **D0 = 2026-09-12** (UTC climate_day; first UTC day strictly after this registration commit,
   never retroactive). `deploy/families/pm_us_crh_cont.json` carries `status: "REGISTERED"` and
   `d0_climate_day: "2026-09-12"`.
-- **Registration commit.** registration commit: <sha to be filled by coordinator at commit>
+- **Registration commit.** registration commit: `e0ed594` (feat(families): register pm_us_crh_cont, 2026-09-11 UTC)
 - **Boundary artefact reused verbatim.** `deploy/families/gs_boundary_pm_us_crh_v2.json` is
   authoritative -- this family does NOT build its own artefact; the identical sequential design
   (LD-OBF, α=0.025, n_max=160, i_max=40, look_step=10) means the artefact's `inputs_sha256`
