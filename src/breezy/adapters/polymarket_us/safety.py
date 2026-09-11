@@ -761,6 +761,109 @@ def live_trading_budget_remaining(permit: LiveTradingPermit) -> tuple[Decimal, i
     return budget.remaining_notional_usd, budget.remaining_order_count
 
 
+#: D1 (plan rev 6.1): the notional/count delta actually APPLIED by
+#: :func:`restore_live_trading_budget` for one ``(permit_id, venue_order_id)``
+#: pair. Doubles as the once-per-``venue_order_id`` idempotency guard (a
+#: second ``restore`` for a key already here is a no-op) and as the exact
+#: undo record :func:`unrestore_live_trading_budget` reverses -- reversing
+#: the RECORDED delta, not the caller's requested amount, is what makes
+#: unrestore return to precisely the pre-restore value even when the
+#: original restore was itself clamped. Process-local, like
+#: ``_PERMIT_BUDGETS``: restart never restores or unrestores anything
+#: (Resolution E -- the reminted budget already starts whole).
+_RESTORED_BUDGET_DELTAS: Final[dict[tuple[bytes, str], tuple[Decimal, int]]] = {}
+
+
+def restore_live_trading_budget(
+    *, permit: LiveTradingPermit, venue_order_id: str, order_notional_usd: Decimal
+) -> bool:
+    """Give back the one order-count slot and notional a GET-confirmed
+    terminal-zero proved this ``venue_order_id`` never actually spent
+    (Resolution D/D1, plan rev 6.1).
+
+    Idempotent per ``venue_order_id``: a second call for the same id is a
+    no-op. Both the notional and the count are clamped so a restore can
+    never push either past what the permit was ISSUED with --
+    ``min(remaining + given_back, permit.budget_*)``. Never writes an
+    environment variable and never reads an operator cap; the only inputs
+    are the permit's own issued budget (the clamp ceiling) and the amount
+    the caller asks back.
+
+    Returns:
+        ``True`` iff this call actually applied a restore (the first for
+        this ``venue_order_id``); ``False`` on an idempotent no-op.
+
+    Raises:
+        LiveTradingPermissionError: if ``permit`` was not issued by
+            :func:`issue_live_trading_permit`, or its budget is unknown to
+            this process -- mirrors :func:`live_trading_budget_remaining`.
+    """
+    if not _verify_authenticity(_payload_of(permit), permit.authenticity):
+        raise LiveTradingPermissionError(
+            "live-trading permit was not issued by issue_live_trading_permit"
+        )
+    with _REGISTRY_LOCK:
+        budget = _PERMIT_BUDGETS.get(permit.permit_id)
+        if budget is None:
+            raise LiveTradingPermissionError("permit budget is unknown to this process")
+        key = (permit.permit_id, venue_order_id)
+        if key in _RESTORED_BUDGET_DELTAS:
+            return False
+        new_notional = min(
+            budget.remaining_notional_usd + order_notional_usd, permit.budget_notional_usd,
+        )
+        new_count = min(budget.remaining_order_count + 1, permit.budget_order_count)
+        applied_notional_delta = new_notional - budget.remaining_notional_usd
+        applied_count_delta = new_count - budget.remaining_order_count
+        budget.remaining_notional_usd = new_notional
+        budget.remaining_order_count = new_count
+        _RESTORED_BUDGET_DELTAS[key] = (applied_notional_delta, applied_count_delta)
+    return True
+
+
+def unrestore_live_trading_budget(
+    *, permit: LiveTradingPermit, venue_order_id: str, order_notional_usd: Decimal
+) -> bool:
+    """Undo exactly what :func:`restore_live_trading_budget` applied for
+    ``venue_order_id`` (Resolution D2) -- for the rare race where a
+    GET-confirmed fill surfaces for an id whose budget was already restored
+    on an earlier, superseded terminal-zero determination.
+
+    ``order_notional_usd`` is accepted for signature symmetry with
+    :func:`restore_live_trading_budget`, but is NOT what gets reversed: the
+    exact, already-CLAMPED delta recorded at restore time is, so the budget
+    returns to precisely its pre-restore value regardless of what is passed
+    here.
+
+    Returns:
+        ``True`` iff a restore record for this ``venue_order_id`` existed
+        and was reversed; ``False`` on a no-op (never restored, or already
+        unrestored).
+
+    Raises:
+        LiveTradingPermissionError: if ``permit`` was not issued by
+            :func:`issue_live_trading_permit`, or its budget is unknown to
+            this process.
+    """
+    del order_notional_usd  # signature symmetry only -- see the docstring
+    if not _verify_authenticity(_payload_of(permit), permit.authenticity):
+        raise LiveTradingPermissionError(
+            "live-trading permit was not issued by issue_live_trading_permit"
+        )
+    with _REGISTRY_LOCK:
+        budget = _PERMIT_BUDGETS.get(permit.permit_id)
+        if budget is None:
+            raise LiveTradingPermissionError("permit budget is unknown to this process")
+        key = (permit.permit_id, venue_order_id)
+        delta = _RESTORED_BUDGET_DELTAS.pop(key, None)
+        if delta is None:
+            return False
+        notional_delta, count_delta = delta
+        budget.remaining_notional_usd -= notional_delta
+        budget.remaining_order_count -= count_delta
+    return True
+
+
 # ---------------------------------------------------------------------------
 # The chokepoint
 # ---------------------------------------------------------------------------

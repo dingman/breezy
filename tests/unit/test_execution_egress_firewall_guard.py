@@ -1714,6 +1714,10 @@ EXEC_PERMITTED_COROUTINE_NAMES = frozenset(
         # exactly -- awaits the resolver task's cancellation deterministically
         # from `_disconnect`, touching no network primitive of its own.
         "_cancel_resolver_task",
+        # C1 (plan rev 6.1): the startup/re-arm position-evidence refresh,
+        # run last inside `_connect`. Never reaches `_order_sender.post_order`
+        # -- one GET plus a local store write.
+        "_refresh_startup_position_evidence",
         # The injected read protocol's own call signature.
         "__call__",
     }
@@ -1837,6 +1841,10 @@ EXEC_ORDER_COROUTINE_PERMITTED_CALLEES = frozenset(
         # SAFETY C1 (plan rev 6.1): the authoritative pre-spend re-check.
         # Read-only against the durable singleton; adds no send path.
         "self._latch.is_latched",
+        # Item 4 (slice 4 review): the family-halt chokepoint veto -- the
+        # SAME class of re-check as SAFETY C1 immediately above, and reached
+        # the identical way: a plain synchronous callable, no send path.
+        "self._submit_veto",
         # Resolution A/E (plan rev 6.1): note the AMBIGUOUS resolver
         # context. Inert sync callee -- writes only to the already-open
         # local store and a process-local dict; reaches no network.
@@ -1976,6 +1984,20 @@ EXEC_RESOLVER_PERMITTED_CALLEES = frozenset(
         "_synthetic_get_fill_trade_id",
         "instrument.make_price",
         "Money",
+        # D1/D2/C1 (plan rev 6.1): terminal-zero's permit-restore and the
+        # startup-evidence rewrite it triggers, plus terminal-fill's
+        # defence-in-depth unrestore. None of the three reaches
+        # `self._order_sender.post_order` -- a local ledger update, a local
+        # store write, and a local store read/write respectively.
+        "restore_live_trading_budget",
+        "self._mark_budget_restored",
+        "self._write_startup_position_evidence",
+        "self._budget_was_restored",
+        "unrestore_live_trading_budget",
+        # Item 1 (slice 4 review): a resolver-action failure is caught and
+        # counted, never left to kill the polling task. Inert -- increments
+        # a process-local counter and logs; reaches no network.
+        "self._note_resolver_error",
     }
 )
 
@@ -2663,6 +2685,88 @@ def test_e0_nosend_detects_a_call_on_the_result_of_a_call() -> None:
     assert [v.rule for v in violations][:1] == ["E0-NOSEND"]
 
 
+def test_submit_veto_sits_after_is_latched_and_before_the_permit_spend_no_await_between() -> None:
+    """Item 4 (slice 4 review): the family-halt veto is the SAME class of
+    authoritative re-check as SAFETY C1's ``is_latched()`` -- it must run
+    AFTER that re-check, BEFORE ``assert_live_order_submission_permitted``
+    (the permit spend), with NO ``await`` anywhere between the three, or an
+    already-created ``_submit_order`` task could interleave between the
+    veto's read and the spend exactly the way SAFETY C1 closed for
+    ``is_latched()``.
+    """
+    source = (REPO_ROOT / "src/breezy/adapters/polymarket_us/exec/client.py").read_text()
+    tree = ast.parse(source)
+    submit_order = next(
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.AsyncFunctionDef) and node.name == "_submit_order"
+    )
+    is_latched_lines = [
+        n.lineno
+        for n in ast.walk(submit_order)
+        if isinstance(n, ast.Call) and _dotted_callee(n.func) == "self._latch.is_latched"
+    ]
+    veto_lines = [
+        n.lineno
+        for n in ast.walk(submit_order)
+        if isinstance(n, ast.Call) and _dotted_callee(n.func) == "self._submit_veto"
+    ]
+    permit_spend_lines = [
+        n.lineno
+        for n in ast.walk(submit_order)
+        if isinstance(n, ast.Call)
+        and _dotted_callee(n.func) == "assert_live_order_submission_permitted"
+    ]
+    assert is_latched_lines and veto_lines and permit_spend_lines, (
+        "all three must be present in the shipped _submit_order for this pin "
+        "to prove anything"
+    )
+    assert max(is_latched_lines) < min(veto_lines) < min(permit_spend_lines)
+
+    await_lines = [n.lineno for n in ast.walk(submit_order) if isinstance(n, ast.Await)]
+    between = [ln for ln in await_lines if max(is_latched_lines) < ln < min(permit_spend_lines)]
+    assert between == [], (
+        f"an await sits between is_latched()/the veto and the permit spend: lines {between}"
+    )
+
+
+def test_a_planted_await_between_the_veto_and_the_permit_spend_breaks_the_pin() -> None:
+    """Non-vacuity: the ordering pin above must actually detect an await
+    planted in the exact span it claims to police."""
+    source = (
+        '"""Docstring."""\n\n\n'
+        "async def _submit_order(self, command):\n"
+        "    if self._latch is not None and self._latch.is_latched():\n"
+        "        return self._deny(order, 'x', now_ns)\n"
+        "    if self._submit_veto is not None:\n"
+        "        veto_reason = self._submit_veto()\n"
+        "        if veto_reason is not None:\n"
+        "            return self._deny(order, veto_reason, now_ns)\n"
+        "    await asyncio.sleep(0)\n"
+        "    assert_live_order_submission_permitted(permit=self._permit)\n"
+    )
+    tree = ast.parse(source)
+    submit_order = next(
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.AsyncFunctionDef) and node.name == "_submit_order"
+    )
+    is_latched_lines = [
+        n.lineno
+        for n in ast.walk(submit_order)
+        if isinstance(n, ast.Call) and _dotted_callee(n.func) == "self._latch.is_latched"
+    ]
+    permit_spend_lines = [
+        n.lineno
+        for n in ast.walk(submit_order)
+        if isinstance(n, ast.Call)
+        and _dotted_callee(n.func) == "assert_live_order_submission_permitted"
+    ]
+    await_lines = [n.lineno for n in ast.walk(submit_order) if isinstance(n, ast.Await)]
+    between = [ln for ln in await_lines if max(is_latched_lines) < ln < min(permit_spend_lines)]
+    assert between != [], "the planted await must be visible to the same check"
+
+
 def test_the_order_coroutine_callee_allowlist_reaches_no_venue() -> None:
     """The allowlist is the rule's whole surface, so it is read here too.
 
@@ -2708,6 +2812,8 @@ def test_the_order_coroutine_callee_allowlist_reaches_no_venue() -> None:
             "self._latch.arm",
             "self._latch.retire",
             "self._latch.is_latched",
+            # Item 4 (slice 4 review): the family-halt chokepoint veto.
+            "self._submit_veto",
         # Resolution A/E (plan rev 6.1): note the AMBIGUOUS resolver
         # context. Inert sync callee -- writes only to the already-open
         # local store and a process-local dict; reaches no network.
@@ -2872,15 +2978,53 @@ def test_x1_the_live_scan_actually_reaches_a_test_that_imports_the_exec_package(
     # `_build_race_client` (the SAME `PolymarketUSExecutionClient` +
     # `_SlowSender` double as SAFETY C1's suite) -- no socket, no new sender
     # shape.
+    #
+    # Old -> new (this row, plan rev 6.1 slice 4 -- fill/trial wiring): added
+    # `tests/unit/test_continuous_rung_hold_fill_wiring.py` and
+    # `tests/unit/test_current_rung_hold_trial_day_latch.py`, both of which
+    # import `DurableFillRecord`/`FILL_KEY_PREFIX`/`FILL_INDEX_KEY_PREFIX`
+    # from `exec.client` to build fill-record fixtures for the never-arm
+    # fill-primary walk and the trial-day latch's durable-fill reads,
+    # respectively. WIDENED, not relaxed (L-6/L-12): the comparison is still
+    # `==`; neither module carries `SOCKET_RESTORING_MARKERS`, and neither
+    # constructs a client or opens a socket -- `DurableFillRecord` is a plain
+    # data record and the two prefix constants are plain strings, built and
+    # used directly from literal fields, exactly like the fill-tally-spine
+    # siblings already in this set.
+    #
+    # Old -> new (this row, plan rev 6.1 C1/C2, durable startup position
+    # evidence): added `tests/unit/test_polymarket_us_startup_evidence.py`,
+    # which imports `StartupPositionEvidence`/`StartupPositionSnapshot`/
+    # `STARTUP_EVIDENCE_KEY`/`FILL_INDEX_KEY_PREFIX` from `exec.client` and
+    # drives the REAL client through `_connect` (via the shipped `_build_rig`
+    # from `test_polymarket_us_exec_client.py`) to prove
+    # `_refresh_startup_position_evidence` writes the never-arm gate's durable
+    # evidence record. WIDENED, not relaxed (L-6/L-12): the comparison is
+    # still `==`; the module carries no `SOCKET_RESTORING_MARKERS` -- same
+    # `_build_rig` transport double as its sibling `test_polymarket_us_exec_
+    # client.py`, so it never opens a socket either.
+    #
+    # Old -> new (this row, scoring seam, residual tests): added
+    # `tests/unit/test_family_tally_v2.py`, which imports `DurableFillRecord`/
+    # `FILL_KEY_PREFIX` from `exec.client` to seed durable fill records
+    # directly into a store for its residual-classification fixtures.
+    # WIDENED, not relaxed (L-6/L-12): the comparison is still `==`; the
+    # module carries no `SOCKET_RESTORING_MARKERS` and constructs no client
+    # -- `DurableFillRecord` is a plain data record and `FILL_KEY_PREFIX` is
+    # a plain string, exactly like the fill-tally-spine siblings already in
+    # this set.
     assert exec_importing_test_modules() == {
         "tests/contract/test_exec_client_reconciliation_contract.py",
         "tests/contract/test_exec_client_wiring_contract.py",
         "tests/contract/test_live_fill_scoring_chain_contract.py",
+        "tests/unit/test_continuous_rung_hold_fill_wiring.py",
         "tests/unit/test_continuous_rung_hold_strategy.py",
         "tests/unit/test_current_rung_hold_ambiguous_resolver.py",
         "tests/unit/test_current_rung_hold_order_submission_wiring.py",
         "tests/unit/test_current_rung_hold_pre_arm_race.py",
+        "tests/unit/test_current_rung_hold_trial_day_latch.py",
         "tests/unit/test_exec_refusal_health_surface.py",
+        "tests/unit/test_family_tally_v2.py",
         "tests/unit/test_polymarket_us_exec_client.py",
         "tests/unit/test_polymarket_us_exec_endpoints.py",
         "tests/unit/test_polymarket_us_exec_positions.py",
@@ -2890,6 +3034,7 @@ def test_x1_the_live_scan_actually_reaches_a_test_that_imports_the_exec_package(
         "tests/unit/test_live_family_tally_fill_source_cli.py",
         "tests/unit/test_polymarket_us_exec_snapshot_drift.py",
         "tests/unit/test_polymarket_us_factories.py",
+        "tests/unit/test_polymarket_us_startup_evidence.py",
         "tests/unit/test_polymarket_us_submit_order_chain.py",
         "tests/unit/test_polymarket_us_write_sequence.py",
         "tests/unit/test_score_live_trials_state_db_source.py",

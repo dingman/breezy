@@ -193,3 +193,26 @@ def test_since_climate_day_excludes_earlier_trials(ftc_mod: ModuleType, tmp_path
         db_path, family_prefix=_LIVE_PREFIX, since_climate_day="2026-08-05"
     )
     assert result == 1
+
+
+def test_a_duplicate_fill_on_one_instrument_does_not_double_count_the_trial(
+    ftc_mod: ModuleType, tmp_path: Path,
+) -> None:
+    """Slice 4 item B1/B2 (plan rev 6.1): a SECOND genuine fill on an
+    already-consumed station-day (a v3 duplicate) still lands on the SAME
+    `instrument_id` -- this reader counts distinct TAKEN trials, not fills,
+    so a duplicate must never inflate `filled_takes`."""
+    db_path = tmp_path / "exec_state.sqlite"
+    _CONT_PREFIX = "continuous_rung_hold/trial/"
+    _make_state_db(
+        db_path,
+        {
+            f"{_CONT_PREFIX}LAX/2026-09-04": _trial_row(
+                "LAX-2026-09-04-lt79f", venue_order_id="order-1",
+            ),
+            "exec/polymarket_us/fill/order-1": _fill_row("order-1", "LAX-2026-09-04-lt79f"),
+            "exec/polymarket_us/fill/order-2": _fill_row("order-2", "LAX-2026-09-04-lt79f"),
+        },
+    )
+    result = ftc_mod.count_filled_takes(db_path, family_prefix=_CONT_PREFIX)
+    assert result == 1

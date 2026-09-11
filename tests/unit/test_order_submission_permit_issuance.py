@@ -188,32 +188,35 @@ def test_operator_caps_absent_refuses(
         )
 
 
-def test_issue_still_refuses_when_only_continuous_is_on(
+def test_issue_accepts_continuous_without_current(
     monkeypatch: pytest.MonkeyPatch,
     write_canonical_verified: None,  # noqa: F811
 ) -> None:
-    """Phase 0: issue() is unchanged in what it refuses — cont without v2 is not enough."""
+    """Phase 1: continuous_rung_hold alone (plus live_observations) is now
+    enough -- issue() no longer requires current_rung_hold specifically."""
     enable_operator_gate(monkeypatch)
     clock = clock_at()
     live_permit = issue_live_trading_permit(clock=clock)
-    with _caps(), pytest.raises(RungHoldNotReadyError):
-        _ISSUE(
+    with _caps():
+        permit = _ISSUE(
             settings=_FakeSettings(current_rung_hold=False, continuous_rung_hold=True),
             live_trading_permit=live_permit,
             clock=clock,
         )
+    assert isinstance(permit, OrderSubmissionPermit)
 
 
-def test_current_rung_hold_not_ready_refuses(
+def test_neither_family_on_refuses(
     monkeypatch: pytest.MonkeyPatch,
     write_canonical_verified: None,  # noqa: F811
 ) -> None:
+    """Neither current_rung_hold nor continuous_rung_hold on is still refused."""
     enable_operator_gate(monkeypatch)
     clock = clock_at()
     live_permit = issue_live_trading_permit(clock=clock)
     with _caps(), pytest.raises(RungHoldNotReadyError):
         _ISSUE(
-            settings=_FakeSettings(current_rung_hold=False),
+            settings=_FakeSettings(current_rung_hold=False, continuous_rung_hold=False),
             live_trading_permit=live_permit,
             clock=clock,
         )

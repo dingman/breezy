@@ -108,6 +108,16 @@ CURRENT_RUNG_HOLD_VAR = "BREEZY_CURRENT_RUNG_HOLD"
 #: (Phase 0: permit is ``None`` by construction).
 CONTINUOUS_RUNG_HOLD_VAR = "BREEZY_CONTINUOUS_RUNG_HOLD"
 
+#: Phase 1: :data:`CURRENT_RUNG_HOLD_VAR` and :data:`CONTINUOUS_RUNG_HOLD_VAR`
+#: set together is refused at load time (``SettingsError``, exit 2) -- Phase 1
+#: sends orders from exactly one family -- UNLESS this build-side escape
+#: hatch is set to exactly ``"1"``, which restores the Phase 0 shadow
+#: composition (both families built; only v2 may ever hold the permit; see
+#: ``strategy.current_rung_hold.composition.phase0_family_permits``). This is
+#: a BUILD-SIDE flag, never an operator-reserved control, so its name may
+#: appear in tracked files; it does not gate order submission by itself.
+CRH_CONT_PHASE0_SHADOW_VAR = "BREEZY_CRH_CONT_PHASE0_SHADOW"
+
 #: Trade-role catalog root used as the pre-build discovery source when
 #: :data:`CURRENT_RUNG_HOLD_VAR` is on. Distinct from
 #: :data:`QUOTE_TAPE_CATALOG_VAR`, which remains the recorder's single-reader
@@ -312,6 +322,10 @@ def _parse_current_rung_hold(env: Mapping[str, str]) -> bool:
 
 def _parse_continuous_rung_hold(env: Mapping[str, str]) -> bool:
     return env.get(CONTINUOUS_RUNG_HOLD_VAR) == "1"
+
+
+def _parse_crh_cont_phase0_shadow(env: Mapping[str, str]) -> bool:
+    return env.get(CRH_CONT_PHASE0_SHADOW_VAR) == "1"
 
 
 def _parse_orders_enabled(env: Mapping[str, str]) -> bool:
@@ -746,8 +760,16 @@ class BreezyTradeSettings:
     #: and cannot be reached from this object.
     current_rung_hold: bool = False
     #: Phase 0 shadow continuous-rung-hold family. Default OFF; see
-    #: :data:`CONTINUOUS_RUNG_HOLD_VAR`.
+    #: :data:`CONTINUOUS_RUNG_HOLD_VAR`. Phase 1: may hold the
+    #: order-submission permit on its own (see
+    #: :data:`CRH_CONT_PHASE0_SHADOW_VAR` for the exception that keeps both
+    #: families composed together, in which case only ``current_rung_hold``
+    #: may ever hold the permit).
     continuous_rung_hold: bool = False
+    #: Build-side Phase 0 shadow escape hatch; see
+    #: :data:`CRH_CONT_PHASE0_SHADOW_VAR`. Default OFF -- Phase 1 sends
+    #: orders from exactly one family.
+    phase0_shadow: bool = False
     #: Pre-build discovery catalog, set when either rung-hold family is on.
     #: See :data:`TRADE_CATALOG_ROOT_VAR`.
     catalog_root: Path | None = None
@@ -758,8 +780,10 @@ class BreezyTradeSettings:
     #: ``runtime.order_enablement.issue_order_submission_permit`` reads off
     #: this already-loaded settings object (never re-parsing the env) before
     #: minting the sealed, unforgeable ``OrderSubmissionPermit`` that the
-    #: strategy actually gates on. Requires ``current_rung_hold`` and
-    #: ``live_observations`` to both be True; refused otherwise at load time.
+    #: strategy actually gates on. Requires ``live_observations`` True and,
+    #: as of Phase 1, EITHER ``current_rung_hold`` OR ``continuous_rung_hold``
+    #: True (previously ``current_rung_hold`` specifically); refused
+    #: otherwise at load time.
     orders_enabled_requested: bool = False
 
 
@@ -786,6 +810,7 @@ def load_trade_settings(env: Mapping[str, str] | None = None) -> BreezyTradeSett
     live_observations = _parse_live_observations(active_env)
     current_rung_hold = _parse_current_rung_hold(active_env)
     continuous_rung_hold = _parse_continuous_rung_hold(active_env)
+    phase0_shadow = _parse_crh_cont_phase0_shadow(active_env)
     rung_hold_family = current_rung_hold or continuous_rung_hold
     if rung_hold_family and not live_observations:
         which = CURRENT_RUNG_HOLD_VAR if current_rung_hold else CONTINUOUS_RUNG_HOLD_VAR
@@ -795,23 +820,30 @@ def load_trade_settings(env: Mapping[str, str] | None = None) -> BreezyTradeSett
             "without the publisher would latch observation_unavailable on "
             "every station-day and burn the one trial"
         )
-    orders_enabled_requested = _parse_orders_enabled(active_env)
-    if orders_enabled_requested and not (current_rung_hold and live_observations):
-        # current_rung_hold specifically -- NOT rung_hold_family -- to match
-        # OrderSubmissionPermit.issue()'s own gate exactly (order_enablement.py:
-        # "current_rung_hold and live_observations must both be enabled").
-        # continuous_rung_hold (v3, Phase 0) never holds the permit
-        # (composition.py::phase0_family_permits), so accepting it here
-        # would let this validation pass and then fail closed downstream --
-        # a settings-load-time SettingsError (exit 2), not issue()'s FATAL
-        # OrderSubmissionRefused (exit 1).
+    if current_rung_hold and continuous_rung_hold and not phase0_shadow:
+        # Phase 1 sends orders from exactly one family. Both flags together
+        # is refused at load time unless the build-side shadow escape hatch
+        # is set, which restores the Phase 0 composition (both families
+        # built; only current_rung_hold may ever hold the permit -- see
+        # composition.py::phase0_family_permits).
         raise SettingsError(
-            f"{ORDERS_ENABLED_VAR}=1 requires {CURRENT_RUNG_HOLD_VAR}=1 and "
-            f"{LIVE_OBSERVATIONS_VAR}=1: Phase 0 forbids "
-            f"{CONTINUOUS_RUNG_HOLD_VAR}=1 (v3) from ever holding the "
-            "order-submission permit, so a request for the order path to be "
-            "reachable is meaningless without current_rung_hold and its "
-            "price source both enabled"
+            f"{CURRENT_RUNG_HOLD_VAR}=1 and {CONTINUOUS_RUNG_HOLD_VAR}=1 "
+            f"together requires {CRH_CONT_PHASE0_SHADOW_VAR}=1 (Phase 0 "
+            "shadow); Phase 1 sends orders from exactly one family"
+        )
+    orders_enabled_requested = _parse_orders_enabled(active_env)
+    if orders_enabled_requested and not (rung_hold_family and live_observations):
+        # Phase 1: EITHER family alone, plus live_observations, is enough to
+        # match OrderSubmissionPermit.issue()'s own gate (order_enablement.py:
+        # "current_rung_hold or continuous_rung_hold, and live_observations,
+        # must be enabled"). Neither family on is still refused here at
+        # settings-load time (SettingsError, exit 2) rather than falling
+        # through to issue()'s FATAL OrderSubmissionRefused (exit 1).
+        raise SettingsError(
+            f"{ORDERS_ENABLED_VAR}=1 requires {LIVE_OBSERVATIONS_VAR}=1 and "
+            f"one of {CURRENT_RUNG_HOLD_VAR}=1 or {CONTINUOUS_RUNG_HOLD_VAR}=1: "
+            "a request for the order path to be reachable is meaningless "
+            "without a rung-hold family and its price source both enabled"
         )
     catalog_root = _parse_trade_catalog_root(active_env) if rung_hold_family else None
 
@@ -821,6 +853,7 @@ def load_trade_settings(env: Mapping[str, str] | None = None) -> BreezyTradeSett
         live_observations=live_observations,
         current_rung_hold=current_rung_hold,
         continuous_rung_hold=continuous_rung_hold,
+        phase0_shadow=phase0_shadow,
         catalog_root=catalog_root,
         orders_enabled_requested=orders_enabled_requested,
     )

@@ -10,12 +10,19 @@ Every test below constructs a ``TrialDayLatch`` only through
 
 from __future__ import annotations
 
+import json
 import sqlite3
 from decimal import Decimal
 from pathlib import Path
 
 import pytest
 
+from breezy.adapters.polymarket_us.errors import ExecutionReportMappingError
+from breezy.adapters.polymarket_us.exec.client import (
+    FILL_INDEX_KEY_PREFIX,
+    FILL_KEY_PREFIX,
+    DurableFillRecord,
+)
 from breezy.runtime.sqlite_store import SqliteStateStore
 from breezy.runtime.submit_intent import (
     SubmitIntentLockHeld,
@@ -26,12 +33,17 @@ from breezy.strategy.current_rung_hold.decision import REFUSAL_REASONS
 from breezy.strategy.current_rung_hold.trial_day_latch import (
     CONTINUOUS_TRIAL_KEY_PREFIX,
     DEFAULT_TRIAL_KEY_PREFIX,
+    FAMILY_HALT_KEY,
+    STARTUP_EVIDENCE_KEY,
     TrialDayAlreadyConsumed,
     TrialDayInvalidReason,
     TrialDayLatch,
     TrialDayLatchError,
     TrialDayRecord,
+    TrialDayRecordCorrupt,
     open_trial_day_latch,
+    startup_evidence_permits_arm,
+    startup_evidence_position_for,
 )
 
 NOW_NS = 1_700_000_000_000_000_000
@@ -557,3 +569,248 @@ class TestIsIntentOpen:
             bare = TrialDayLatch(store, lock)
             with pytest.raises(TrialDayLatchError):
                 bare.is_intent_open()
+
+
+class TestDuplicateFillAndFamilyHalt:
+    """Slice 4 item B1 (plan rev 6.1)."""
+
+    def test_a_duplicate_fill_writes_a_bucket_and_sets_the_family_halt(
+        self, store_path: Path,
+    ) -> None:
+        with open_submit_intent_latch(SqliteStateStore(store_path), store_path) as intent_latch:
+            latch = open_trial_day_latch(intent_latch, key_prefix=CONTINUOUS_TRIAL_KEY_PREFIX)
+            assert latch.is_family_halted() is False
+            latch.record_duplicate_fill(
+                STATION,
+                CLIMATE_DAY,
+                venue_order_id="ord-dup-1",
+                qty=Decimal(1),
+                fill_px=Decimal("0.40"),
+                fee=Decimal("0.01"),
+                ts_ns=NOW_NS,
+            )
+            assert latch.is_family_halted() is True
+        keys = _committed_keys(store_path)
+        assert "continuous_rung_hold/duplicate_fill/ord-dup-1" in keys
+        assert FAMILY_HALT_KEY in keys
+
+    def test_recording_the_same_duplicate_id_twice_writes_neither_bucket_twice(
+        self, store_path: Path,
+    ) -> None:
+        with open_submit_intent_latch(SqliteStateStore(store_path), store_path) as intent_latch:
+            latch = open_trial_day_latch(intent_latch, key_prefix=CONTINUOUS_TRIAL_KEY_PREFIX)
+            latch.record_duplicate_fill(
+                STATION, CLIMATE_DAY, venue_order_id="ord-dup-1",
+                qty=Decimal(1), fill_px=Decimal("0.40"), fee=Decimal("0.01"), ts_ns=NOW_NS,
+            )
+            # Second call, different numbers -- must not overwrite the first.
+            latch.record_duplicate_fill(
+                STATION, CLIMATE_DAY, venue_order_id="ord-dup-1",
+                qty=Decimal(9), fill_px=Decimal("0.99"), fee=Decimal("0.99"), ts_ns=NOW_NS + 1,
+            )
+        conn_keys = _committed_keys(store_path)
+        dup_keys = [k for k in conn_keys if k.startswith("continuous_rung_hold/duplicate_fill/")]
+        assert len(dup_keys) == 1
+
+    def test_family_halt_is_false_on_a_fresh_latch(self, store_path: Path) -> None:
+        with open_submit_intent_latch(SqliteStateStore(store_path), store_path) as intent_latch:
+            latch = open_trial_day_latch(intent_latch, key_prefix=CONTINUOUS_TRIAL_KEY_PREFIX)
+            assert latch.is_family_halted() is False
+
+
+def test_startup_evidence_key_matches_the_exec_clients_own_constant() -> None:
+    """Three-seam Slice 4 review item 6 [LOW]: this module's own literal
+    must never drift from the exec client's -- two independent literals by
+    design (strategy may import adapters; adapters must never import
+    runtime/strategy), pinned equal here rather than imported."""
+    from breezy.adapters.polymarket_us.exec.client import (
+        STARTUP_EVIDENCE_KEY as CLIENT_STARTUP_EVIDENCE_KEY,
+    )
+
+    assert STARTUP_EVIDENCE_KEY == CLIENT_STARTUP_EVIDENCE_KEY
+
+
+class TestStartupEvidence:
+    """Slice 4 item A2 (plan rev 6.1)."""
+
+    def test_absent_key_reads_as_none(self, store_path: Path) -> None:
+        with open_submit_intent_latch(SqliteStateStore(store_path), store_path) as intent_latch:
+            latch = open_trial_day_latch(intent_latch)
+            assert latch.read_startup_evidence() is None
+
+    def test_a_complete_record_round_trips(self, store_path: Path) -> None:
+        payload = {
+            "v": 1,
+            "ts_ns": NOW_NS,
+            "eof_complete": True,
+            "position_read_refused": False,
+            "fill_walk_complete": True,
+            "positions": [{"slug": "tc-temp-laxhigh-2026-09-04-gte86lt87f", "net_position": "0"}],
+        }
+        with open_submit_intent_latch(SqliteStateStore(store_path), store_path) as intent_latch:
+            store, _ = intent_latch.shared_state_binding()
+            store.set(STARTUP_EVIDENCE_KEY, json.dumps(payload).encode("utf-8"))
+            latch = open_trial_day_latch(intent_latch)
+            assert latch.read_startup_evidence() == payload
+
+    def test_malformed_json_reads_as_none_not_a_raise(self, store_path: Path) -> None:
+        with open_submit_intent_latch(SqliteStateStore(store_path), store_path) as intent_latch:
+            store, _ = intent_latch.shared_state_binding()
+            store.set(STARTUP_EVIDENCE_KEY, b"not json")
+            latch = open_trial_day_latch(intent_latch)
+            assert latch.read_startup_evidence() is None
+
+    @pytest.mark.parametrize(
+        "evidence",
+        [
+            None,
+            {
+                "v": 1, "position_read_refused": True,
+                "eof_complete": True, "fill_walk_complete": True,
+            },
+            {
+                "v": 1, "position_read_refused": False,
+                "eof_complete": False, "fill_walk_complete": True,
+            },
+            {
+                "v": 1, "position_read_refused": False,
+                "eof_complete": True, "fill_walk_complete": False,
+            },
+            {
+                "v": 2, "position_read_refused": False,
+                "eof_complete": True, "fill_walk_complete": True,
+            },
+        ],
+    )
+    def test_permits_arm_is_false_for_every_failure_mode(self, evidence: object) -> None:
+        assert startup_evidence_permits_arm(evidence) is False  # type: ignore[arg-type]
+
+    def test_permits_arm_is_true_for_a_complete_record(self) -> None:
+        assert startup_evidence_permits_arm(
+            {
+                "v": 1, "position_read_refused": False,
+                "eof_complete": True, "fill_walk_complete": True,
+            },
+        ) is True
+
+    def test_position_for_an_absent_slug_is_unknown_not_flat(self) -> None:
+        """Slice 4 review item 5: the client seam now emits every slug from
+        the page, so a slug simply absent from the list is a READ GAP, never
+        evidence of "no position" -- `None` (UNKNOWN), not `Decimal(0)`."""
+        evidence: dict[str, object] = {"positions": [{"slug": "other", "net_position": "1"}]}
+        assert startup_evidence_position_for(evidence, "mine") is None
+
+    def test_position_for_a_null_net_position_is_unknown_not_flat(self) -> None:
+        """Slice 4 review item 5: the client emits `"net_position": null`
+        for a row it could not itself read -- `None` (UNKNOWN), never
+        coerced to flat."""
+        evidence: dict[str, object] = {"positions": [{"slug": "mine", "net_position": None}]}
+        assert startup_evidence_position_for(evidence, "mine") is None
+
+    def test_position_for_known_slug_is_its_net_position(self) -> None:
+        evidence: dict[str, object] = {"positions": [{"slug": "mine", "net_position": "3.5"}]}
+        assert startup_evidence_position_for(evidence, "mine") == Decimal("3.5")
+
+    def test_position_for_none_evidence_is_none(self) -> None:
+        assert startup_evidence_position_for(None, "mine") is None
+
+
+def _fill_record(
+    *, venue_order_id: str, instrument_id: str, qty: str, cost: str, ts_event: int = NOW_NS,
+) -> DurableFillRecord:
+    return DurableFillRecord(
+        venue_order_id=venue_order_id,
+        client_order_id=f"C-{venue_order_id}",
+        instrument_id=instrument_id,
+        order_side="BUY",
+        cumulative_qty=Decimal(qty),
+        cumulative_cost=Decimal(cost),
+        cumulative_fee=Decimal(0),
+        fee_reconciled=True,
+        ts_event=ts_event,
+    )
+
+
+def _write_fill(store: SqliteStateStore, record: DurableFillRecord) -> None:
+    index_key = f"{FILL_INDEX_KEY_PREFIX}{record.instrument_id}"
+    existing = store.get(index_key)
+    ids: list[str] = json.loads(existing.decode("utf-8")) if existing is not None else []
+    ids.append(record.venue_order_id)
+    store.set(index_key, json.dumps(ids).encode("utf-8"))
+    store.set(f"{FILL_KEY_PREFIX}{record.venue_order_id}", record.to_bytes())
+
+
+class TestIterFillRecords:
+    """Slice 4 item A2 (plan rev 6.1): the never-arm fill-primary walk's reader."""
+
+    def test_no_index_for_an_instrument_yields_no_records(self, store_path: Path) -> None:
+        with open_submit_intent_latch(SqliteStateStore(store_path), store_path) as intent_latch:
+            latch = open_trial_day_latch(intent_latch)
+            assert latch.iter_fill_records([INSTRUMENT_ID]) == ()
+
+    def test_one_indexed_fill_is_returned(self, store_path: Path) -> None:
+        store = SqliteStateStore(store_path)
+        with open_submit_intent_latch(store, store_path) as intent_latch:
+            record = _fill_record(
+                venue_order_id="ord-1", instrument_id=INSTRUMENT_ID, qty="1", cost="0.40",
+            )
+            _write_fill(store, record)
+            latch = open_trial_day_latch(intent_latch)
+            got = latch.iter_fill_records([INSTRUMENT_ID])
+            assert got == (record,)
+
+    def test_a_malformed_index_raises_corrupt(self, store_path: Path) -> None:
+        store = SqliteStateStore(store_path)
+        with open_submit_intent_latch(store, store_path) as intent_latch:
+            store.set(f"{FILL_INDEX_KEY_PREFIX}{INSTRUMENT_ID}", b"not json")
+            latch = open_trial_day_latch(intent_latch)
+            with pytest.raises(TrialDayRecordCorrupt):
+                latch.iter_fill_records([INSTRUMENT_ID])
+
+    def test_an_indexed_but_missing_record_raises_corrupt(self, store_path: Path) -> None:
+        store = SqliteStateStore(store_path)
+        with open_submit_intent_latch(store, store_path) as intent_latch:
+            store.set(
+                f"{FILL_INDEX_KEY_PREFIX}{INSTRUMENT_ID}",
+                json.dumps(["ord-ghost"]).encode("utf-8"),
+            )
+            latch = open_trial_day_latch(intent_latch)
+            with pytest.raises(TrialDayRecordCorrupt):
+                latch.iter_fill_records([INSTRUMENT_ID])
+
+    def test_a_malformed_record_body_raises_mapping_error(self, store_path: Path) -> None:
+        store = SqliteStateStore(store_path)
+        with open_submit_intent_latch(store, store_path) as intent_latch:
+            store.set(
+                f"{FILL_INDEX_KEY_PREFIX}{INSTRUMENT_ID}",
+                json.dumps(["ord-bad"]).encode("utf-8"),
+            )
+            store.set(f"{FILL_KEY_PREFIX}ord-bad", b"not json")
+            latch = open_trial_day_latch(intent_latch)
+            with pytest.raises(ExecutionReportMappingError):
+                latch.iter_fill_records([INSTRUMENT_ID])
+
+
+class TestAttemptCounter:
+    """Slice 4 item E1 (plan rev 6.1, Resolution F)."""
+
+    def test_fresh_station_day_is_zero_none(self, store_path: Path) -> None:
+        with open_submit_intent_latch(SqliteStateStore(store_path), store_path) as intent_latch:
+            latch = open_trial_day_latch(intent_latch, key_prefix=CONTINUOUS_TRIAL_KEY_PREFIX)
+            assert latch.attempt_state(STATION, CLIMATE_DAY) == (0, None)
+
+    def test_record_attempt_increments_and_persists(self, store_path: Path) -> None:
+        with open_submit_intent_latch(SqliteStateStore(store_path), store_path) as intent_latch:
+            latch = open_trial_day_latch(intent_latch, key_prefix=CONTINUOUS_TRIAL_KEY_PREFIX)
+            assert latch.record_attempt(STATION, CLIMATE_DAY, ts_ns=NOW_NS) == 1
+            assert latch.attempt_state(STATION, CLIMATE_DAY) == (1, NOW_NS)
+            assert latch.record_attempt(STATION, CLIMATE_DAY, ts_ns=NOW_NS + 1) == 2
+            assert latch.attempt_state(STATION, CLIMATE_DAY) == (2, NOW_NS + 1)
+
+    def test_a_malformed_attempt_record_raises_corrupt(self, store_path: Path) -> None:
+        store = SqliteStateStore(store_path)
+        with open_submit_intent_latch(store, store_path) as intent_latch:
+            store.set(f"continuous_rung_hold/attempts/{STATION}/{CLIMATE_DAY}", b"not json")
+            latch = open_trial_day_latch(intent_latch, key_prefix=CONTINUOUS_TRIAL_KEY_PREFIX)
+            with pytest.raises(TrialDayRecordCorrupt):
+                latch.attempt_state(STATION, CLIMATE_DAY)

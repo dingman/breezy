@@ -84,6 +84,12 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from fill_time_count import count_filled_takes
 from mb_current_rung_edge_study import ASK_BANDS, classify_ask_band  # v1, read-only reuse
+from score_live_trials import (
+    FillSourceUnreadableError,
+    StorePositiveControlFailedError,
+    compute_residual,
+    read_filled_trials_state_db,
+)
 from structural_dead_stop import StructuralDeadVerdict, structural_dead
 
 from breezy.persistence.family_manifest import FamilyManifest, load_family_manifest
@@ -139,6 +145,13 @@ _PROVENANCE_SIDECAR_NAME: Final[str] = "provenance.json"
 #: rows (`fill_time_count.py` startswith this prefix). Restated, not derived
 #: from `len(scored)`.
 _LIVE_TRIAL_ID_PREFIX: Final[str] = "current_rung_hold/trial/"
+
+#: Three-seam Slice 4 review item 4: the v3 continuous-rung-hold family's
+#: trial-id prefix. `main()` derives `residual` from the SAME `--fill-source`
+#: store only when a manifest carries this prefix; v2 never does (`residual`
+#: stays `Decimal(0)` for v2, pinned by `test_residual_defaults_to_zero_...`
+#: in `test_family_tally_v2.py`).
+_CONTINUOUS_TRIAL_ID_PREFIX: Final[str] = "continuous_rung_hold/trial/"
 
 #: The only family whose CLI requires the three structural-dead population
 #: args (L-28). The wrapper keeps its own ``$PM_FAMILY`` copy.
@@ -515,6 +528,7 @@ def build_family_tally_v2(
     covered_listed_station_days: int | None = None,
     filled_takes: int | None = None,
     truncation: TruncationReason | None = None,
+    residual: Decimal = Decimal(0),
 ) -> FamilyTallyV2:
     """Build the pooled sequential trail, strata, and terminal-only BCa line.
 
@@ -525,6 +539,14 @@ def build_family_tally_v2(
     reason -- used for an explicit `--truncate` CLI override; `LOSS_STOP`
     and the natural `I_MAX`/`n_max` triggers are otherwise auto-detected
     from the data at each scheduled look.
+
+    `residual` (Slice 4 item B2, plan rev 6.1): the caller's own
+    `score_live_trials.compute_residual` dollar sum over unscored fills
+    (`duplicate_fill`/`q != 1`/fee-unreconciled) -- defaults to `Decimal(0)`,
+    so every existing caller/pinned test that never passes it is
+    byte-identical. The `LOSS_STOP` gate fires on `total_pnl + residual`,
+    never `total_pnl` alone, so a family with real, unscored dollar losses
+    cannot look SURVIVE just because the losing fills never entered `rows`.
     """
     # Prefix-filter FIRST, before any integrity/collision/empty-store guard:
     # a foreign (e.g. v3) row must be counted, logged, and refused (or
@@ -602,7 +624,7 @@ def build_family_tally_v2(
         t = information_fraction(state.information, i_max=artefact.i_max)
         t_history.append(t)
 
-        reached_loss_stop = total_pnl <= LOSS_STOP_PNL
+        reached_loss_stop = (total_pnl + residual) <= LOSS_STOP_PNL
         reached_i_max = state.information >= artefact.i_max
         reached_n_max = (
             look_n >= n_max
@@ -1026,6 +1048,53 @@ def render_markdown_v2(tally: FamilyTallyV2, *, source_paths: Sequence[Path], as
     return "\n".join(lines)
 
 
+def v3_residual_from_fill_source(
+    manifest: FamilyManifest,
+    fill_source: Path,
+    *,
+    since_climate_day: str,
+) -> Decimal:
+    """Three-seam Slice 4 review item 4: the v3 continuous-rung-hold
+    family's residual dollar sum, derived from the SAME `--fill-source`
+    store `count_filled_takes` already reads, via
+    `score_live_trials.read_filled_trials_state_db`'s exclusions
+    (`duplicate_fill`/`q != 1`/fee-unreconciled) and
+    `score_live_trials.compute_residual`.
+
+    Runs the reader ONCE PER MANIFEST STATION, mirroring
+    `read_filled_trials_state_db`'s own documented cross-city-store
+    contract (one shared store, one invocation per city/station), and sums
+    across stations. A station whose read fails closed
+    (`FillSourceUnreadableError`/`StorePositiveControlFailedError`)
+    contributes nothing rather than aborting the whole tally -- the SAME
+    fail-open-on-absence posture `count_filled_takes` already has for
+    `filled_takes`.
+
+    v2 never calls this -- see `main()`'s prefix guard; v2's residual stays
+    `Decimal(0)`.
+    """
+    total = Decimal(0)
+    for station in manifest.stations:
+        try:
+            _trials, exclusions, _fee_map = read_filled_trials_state_db(
+                fill_source,
+                family_prefix=manifest.trial_id_prefix,
+                city=station,
+                cli_location=station,
+                since_climate_day=since_climate_day,
+                stations=tuple(manifest.stations),
+            )
+        except (FillSourceUnreadableError, StorePositiveControlFailedError):
+            continue
+        # `compute_residual` returns an UNSIGNED dollar magnitude (money at
+        # risk in an unscored fill); `build_family_tally_v2`'s `residual` is
+        # a SIGNED contribution added to `total_pnl`, so it is negated here
+        # -- an unscored fill can only ever push the stop-rule TOWARD KILL,
+        # never away from it.
+        total -= compute_residual(exclusions)
+    return total
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--family", required=True, help="family id -- deploy/families/<id>.json")
@@ -1113,6 +1182,17 @@ def main(argv: Sequence[str] | None = None) -> int:
             since_climate_day=args.fill_since_climate_day,
         )
     )
+    # Three-seam Slice 4 review item 4: v3 only -- v2's `residual` stays 0.
+    residual = (
+        v3_residual_from_fill_source(
+            manifest,
+            args.fill_source,
+            since_climate_day=args.fill_since_climate_day or manifest.d0_climate_day,
+        )
+        if args.fill_source is not None
+        and manifest.trial_id_prefix.startswith(_CONTINUOUS_TRIAL_ID_PREFIX)
+        else Decimal(0)
+    )
 
     try:
         tally = build_family_tally_v2(
@@ -1123,6 +1203,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             covered_listed_station_days=args.covered_listed_station_days,
             filled_takes=filled_takes,
             truncation=truncation,
+            residual=residual,
         )
     except ProvenanceRefusal as exc:
         print(f"family_tally_v2: {exc}", file=sys.stderr)

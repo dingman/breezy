@@ -330,6 +330,9 @@ CAGE_RULE_PINS: tuple[RulePin, ...] = (
                 "_confirm_account_registered",
                 "_resolve_ambiguous_intents",
                 "_cancel_resolver_task",
+                # C1 (plan rev 6.1): the startup/re-arm position-evidence
+                # refresh, run last inside `_connect`. Old(20) -> new(21).
+                "_refresh_startup_position_evidence",
                 "__call__",
             }
         ),
@@ -522,6 +525,9 @@ CAGE_RULE_PINS: tuple[RulePin, ...] = (
                 # SAFETY C1 (plan rev 6.1): the pre-spend re-check, read-only
                 # against the durable singleton -- adds no send path.
                 "self._latch.is_latched",
+                # Item 4 (slice 4 review): the family-halt chokepoint veto,
+                # the SAME class of re-check as SAFETY C1 immediately above.
+                "self._submit_veto",
                 # Resolution A/E (plan rev 6.1): note the AMBIGUOUS resolver
                 # context. Inert sync callee -- writes only to the already-open
                 # local store and a process-local dict; reaches no network.

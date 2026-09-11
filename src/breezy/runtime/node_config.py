@@ -53,6 +53,7 @@ from __future__ import annotations
 import os
 import re
 import stat
+from collections.abc import Callable
 from datetime import time as datetime_time
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, cast
@@ -628,6 +629,7 @@ def build_trade_node_config(
     *,
     submit_intent_latch: object | None = None,
     live_trading_permit: object | None = None,
+    submit_veto: Callable[[], str | None] | None = None,
 ) -> TradingNodeConfig:
     """Return the `TradingNodeConfig` for the **trading** process (EXEC SPINE W).
 
@@ -782,6 +784,16 @@ def build_trade_node_config(
             "submit_intent_latch must be a real breezy.runtime.submit_intent."
             f"SubmitIntentLatch (or None); got {type(submit_intent_latch).__name__!r}"
         )
+    # Item 4 (slice 4 review): the family-halt chokepoint veto. Unlike
+    # `submit_intent_latch`, `PolymarketUSExecClientConfig.submit_veto` is
+    # typed as the real `Callable[[], str | None]` -- a plain callable needs
+    # no `runtime`-only type to validate against, so it carries no `object`
+    # widening and no isinstance check against a real class. `callable()` is
+    # still the strongest refusal available at config-build time.
+    if submit_veto is not None and not callable(submit_veto):
+        raise NodeConfigError(
+            f"submit_veto must be a callable (or None); got {type(submit_veto).__name__!r}"
+        )
 
     exec_client_config = msgspec_replace(
         exec_client_config,
@@ -789,6 +801,7 @@ def build_trade_node_config(
         submit_intent_latch=submit_intent_latch,
         live_trading_permit=live_trading_permit,
         retirement_reasons=RetirementReason,
+        submit_veto=submit_veto,
     )
 
     # `msgspec.Struct` config classes are untyped to mypy (compiled Nautilus

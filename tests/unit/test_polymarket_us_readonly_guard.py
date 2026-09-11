@@ -1877,22 +1877,37 @@ _B11_ISSUE_SITES: frozenset[tuple[str, str]] = frozenset(
             "tests/unit/test_current_rung_hold_order_submission_wiring.py",
             "_build_wiring_rig",
         ),
+        # WIDENED (L-12), F4 (plan rev 6.1 Phase 1): `_mint_real_permit` calls
+        # `OrderSubmissionPermit.issue` DIRECTLY (no local alias -- the same
+        # attribute-call shape `app/trade.py::main` itself uses) to mint a
+        # genuine permit for `phase1_family_permits`'s all-combos test. Not a
+        # new production caller; production callers remain exactly one.
+        (
+            "tests/unit/test_current_rung_hold_composition.py",
+            "_mint_real_permit",
+        ),
         (
             "tests/unit/test_order_submission_permit_issuance.py",
             "test_all_preconditions_satisfied_issues_a_permit",
         ),
+        # WIDENED (L-12), Phase 1: `test_current_rung_hold_not_ready_refuses`
+        # (Phase 0 wording) was renamed `test_neither_family_on_refuses` when
+        # `issue()` was widened to accept continuous_rung_hold alone (F2,
+        # plan rev 6.1) -- same `_ISSUE` alias, same RungHoldNotReadyError
+        # refusal, now asserting BOTH families off rather than current off.
         (
             "tests/unit/test_order_submission_permit_issuance.py",
-            "test_current_rung_hold_not_ready_refuses",
+            "test_neither_family_on_refuses",
         ),
-        # WIDENED (L-12), Phase 0: exercises `issue`'s existing refusal
-        # matrix (continuous_rung_hold on, current_rung_hold off ->
-        # RungHoldNotReadyError) through the SAME `_ISSUE` alias -- not a
-        # new production caller. Production callers remain exactly one,
+        # WIDENED (L-12), Phase 1: replaces the retired
+        # `test_issue_still_refuses_when_only_continuous_is_on` -- `issue()`
+        # now ACCEPTS continuous_rung_hold alone (F2), so this exercises the
+        # acceptance path through the SAME `_ISSUE` alias. Not a new
+        # production caller; production callers remain exactly one,
         # `app/trade.py::main`.
         (
             "tests/unit/test_order_submission_permit_issuance.py",
-            "test_issue_still_refuses_when_only_continuous_is_on",
+            "test_issue_accepts_continuous_without_current",
         ),
         (
             "tests/unit/test_order_submission_permit_issuance.py",

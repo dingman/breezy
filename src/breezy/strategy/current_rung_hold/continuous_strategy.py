@@ -22,13 +22,19 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Final, Literal
 
 from nautilus_trader.model.enums import OrderSide, TimeInForce
-from nautilus_trader.model.events import OrderDenied
+from nautilus_trader.model.events import OrderDenied, OrderFilled
 from nautilus_trader.model.identifiers import InstrumentId
 from nautilus_trader.trading.strategy import Strategy
 
-from breezy.adapters.polymarket_us.errors import FeeScheduleUnknownError
+from breezy.adapters.polymarket_us.errors import (
+    ExecutionReportMappingError,
+    FeeScheduleUnknownError,
+    VenuePayloadError,
+)
 from breezy.adapters.polymarket_us.exec import submit_chain
+from breezy.adapters.polymarket_us.exec.client import DurableFillRecord
 from breezy.adapters.polymarket_us.parsing import assert_fee_schedule_known
+from breezy.adapters.polymarket_us.symbology import instrument_id_to_slug, parse_weather_slug
 from breezy.domain.station_observation import StationObservation
 from breezy.domain.weather_bucket_facts import (
     Measure,
@@ -60,7 +66,14 @@ from breezy.strategy.current_rung_hold.tick_eval import (
     instrument_rung_is_current,
     width_and_m,
 )
-from breezy.strategy.current_rung_hold.trial_day_latch import TrialDayLatch
+from breezy.strategy.current_rung_hold.trial_day_latch import (
+    TAKEN_FROM_FILL_WALK_REASON,
+    TrialDayLatch,
+    TrialDayRecord,
+    TrialDayRecordCorrupt,
+    startup_evidence_permits_arm,
+    startup_evidence_position_for,
+)
 from breezy.strategy.depth10 import best_order
 from breezy.strategy.weather_common.refusals import RefusalAlerter, RefusalCounter
 from breezy.strategy.weather_common.running_extreme import RunningExtremeAccumulator
@@ -78,6 +91,39 @@ _CLASS_NAME: Final[str] = "ContinuousRungHoldStrategy"
 #: Not a refusal -- reported through `diagnostics`/`diagnostics_alerter`
 #: (the existing WAIT vocabulary), never `refusals`/`refusal_alerter`.
 _DIAG_OPEN_INTENT_WAIT: Final[str] = "open_intent_wait"
+#: Slice 4 item B1 (plan rev 6.1): the family-wide duplicate-fill halt WAIT.
+_DIAG_FAMILY_HALT: Final[str] = "family_halt_duplicate_fill"
+#: Slice 4 item E1 (plan rev 6.1, Resolution F): a re-arm gate WAIT.
+_DIAG_REARM_WAIT: Final[str] = "rearm_wait"
+#: Slice 4 items A1/A2 (plan rev 6.1): log-only position/fill events, never
+#: a refusal and never a WAIT diagnostic -- reported through
+#: `self.position_events`/`self.position_alerter`.
+_POSITION_UNJOINABLE_FILL: Final[str] = "unjoinable_fill_halt"
+_POSITION_STARTUP_EVIDENCE_MISSING: Final[str] = "startup_evidence_missing"
+_POSITION_FILL_WALK_UNREADABLE: Final[str] = "fill_walk_unreadable"
+_POSITION_UNRECONCILED_LONG: Final[str] = "unreconciled_long_no_fill"
+_POSITION_FAMILY_HALT_AT_START: Final[str] = "family_halt_at_start"
+#: Three-seam Slice 4 review item 1: a corrupt/unreadable latch read or
+#: write inside `on_order_filled` -- fail closed, process-local, never raise.
+_POSITION_FILL_JOIN_ERROR: Final[str] = "fill_join_error"
+#: Review item 2: a legacy (pre-Slice-4) record with no `venue_order_id`
+#: cannot prove a SECOND fill is genuinely a duplicate vs. its own replay --
+#: logged, never halted.
+_LEGACY_RECORD_NO_VENUE_ORDER_ID_WARNING: Final[str] = (
+    "on_order_filled: {station}/{climate_day} already consumed by a legacy "
+    "record with no venue_order_id; cannot determine duplicate-vs-replay, "
+    "not halting the family"
+)
+
+#: Resolution F (plan rev 6.1): a documented conservative floor, not a
+#: measurement -- see `v3plan_rev6.md`'s Resolution F and L-36/PREREG, which
+#: declare it UNVERIFIED until the first `PositionReportingLag` record.
+_REARM_MIN_DELAY_SECS: Final[int] = 120
+_REARM_MIN_DELAY_NS: Final[int] = _REARM_MIN_DELAY_SECS * 1_000_000_000
+#: Resolution F: a genuine fill freezes this counter (`is_consumed` short-
+#: circuits `_hunt_tick` before the re-arm gate is ever consulted again).
+_MAX_STATION_DAY_ATTEMPTS: Final[int] = 3
+
 Trigger = Literal["quote_tick", "on_data", "depth"]
 Source = Literal["quote", "depth"]
 
@@ -129,8 +175,20 @@ class ContinuousRungHoldStrategy(Strategy):
         order_submission_permit: OrderSubmissionPermit | None = None,
         offer_tape: OfferTape | None = None,
         offer_tape_path: Path | None = None,
+        position_evidence_reader: Callable[[], dict[str, object] | None] | None = None,
+        phase0_permit_guard: bool = True,
     ) -> None:
-        if order_submission_permit is not None:
+        """``phase0_permit_guard=True`` (default) keeps Phase 0's seal: a
+        non-None ``order_submission_permit`` raises
+        :class:`Phase0PermitForbiddenError`. ``phase0_permit_guard=False`` is
+        the Phase 1, continuous-only (no-shadow) opt-in a composition root
+        may pass to construct this strategy WITH a real, sealed permit --
+        ``_maybe_submit`` then genuinely calls ``submit_order``. This
+        strategy never flips that default itself; only a caller (a
+        composition root, or a test exercising the gated Phase 1 code paths
+        directly) may.
+        """
+        if phase0_permit_guard and order_submission_permit is not None:
             raise Phase0PermitForbiddenError(
                 "ContinuousRungHoldStrategy: Phase 0 forbids a non-None "
                 "order_submission_permit"
@@ -140,6 +198,13 @@ class ContinuousRungHoldStrategy(Strategy):
         self._latch_factory = trial_day_latch_factory
         self._order_submission_permit = order_submission_permit
         self._latch: TrialDayLatch | None = None
+        #: Slice 4 items A2/E1 (plan rev 6.1): injected override for the
+        #: never-arm walk's and the re-arm gate's evidence source -- tests
+        #: inject a fake here; production leaves this `None` so `on_start`
+        #: binds it to the just-opened latch's own `read_startup_evidence`.
+        self._position_evidence_reader_override = position_evidence_reader
+        self._position_evidence_reader: Callable[[], dict[str, object] | None] | None = None
+        self._unjoinable_fill_instruments: set[str] = set()
         self._exit_stack: ExitStack | None = None
         self._facts: dict[str, WeatherBucketFacts] = {}
         self._ladders: dict[tuple[str, str], list[tuple[int | None, int | None]]] = {}
@@ -162,6 +227,13 @@ class ContinuousRungHoldStrategy(Strategy):
         # SAME cached quote on a later weather update, so only the two live
         # push triggers ("quote_tick", "depth") ever consult or update this.
         self._last_ask_seen: dict[str, tuple[int, Decimal, int]] = {}
+        #: Review item 3 (three-seam Slice 4 review): the ask a Take
+        #: decision was actually made against, keyed by the station-day it
+        #: will (eventually) consume -- `on_order_filled` reads (and pops)
+        #: this so the durable `TrialDayRecord.ask` is the DECISION price,
+        #: never the fill price, keeping the scorer's L-25 `fill_below_ask`
+        #: guard load-bearing. Popped on read so this never grows unbounded.
+        self._decision_ask_by_station_day: dict[tuple[str, str], Decimal] = {}
 
     def on_start(self) -> None:
         if self._latch_factory is None:
@@ -172,6 +244,11 @@ class ContinuousRungHoldStrategy(Strategy):
         exit_stack = ExitStack()
         self._latch = exit_stack.enter_context(self._latch_factory())
         self._exit_stack = exit_stack
+        self._position_evidence_reader = (
+            self._position_evidence_reader_override
+            if self._position_evidence_reader_override is not None
+            else self._latch.read_startup_evidence
+        )
 
         registry = default_registry()
         self._std_utc_offset_hours_by_station = {
@@ -216,9 +293,164 @@ class ContinuousRungHoldStrategy(Strategy):
             self.stop()
             return
 
+        # Phase 0 (`order_submission_permit is None`, enforced at
+        # construction -- `Phase0PermitForbiddenError`) never arms anything
+        # regardless: there is no order-submission capability to gate, so
+        # the never-arm walk would only halt every shadow-mode deployment
+        # for no safety gain. This becomes live the moment a Phase 1
+        # composition threads a real permit through.
+        if self._order_submission_permit is not None and not self._run_never_arm_walk():
+            self.stop()
+            return
+
         self.subscribe_data(
             station_observation_data_type(), client_id=NWS_BACKTEST_CLIENT_ID,
         )
+
+    def _run_never_arm_walk(self) -> bool:
+        """Slice 4 item A2 (plan rev 6.1): fail-closed startup gate.
+
+        Returns ``False`` (never arm anything -- `on_start` stops the
+        strategy) unless: the family halt is clear, the exec client's
+        startup evidence proves a complete non-refused positions read, the
+        durable fill-primary walk is fully readable, and no venue LONG on a
+        configured instrument lacks a durable fill on record.
+        """
+        assert self._latch is not None
+        if self._latch.is_family_halted():
+            self.log.error("continuous_rung_hold: family halt is set; never arming")
+            self.position_events.record(_POSITION_FAMILY_HALT_AT_START)
+            self._report_alerter(
+                self.position_alerter, "continuous_rung_hold position report failed",
+            )
+            return False
+
+        evidence = (
+            self._position_evidence_reader() if self._position_evidence_reader else None
+        )
+        if not startup_evidence_permits_arm(evidence):
+            self.log.error(
+                "continuous_rung_hold: startup position evidence is absent, "
+                "position_read_refused, not eof_complete, or not "
+                "fill_walk_complete; halting before any subscription",
+            )
+            self.position_events.record(_POSITION_STARTUP_EVIDENCE_MISSING)
+            self._report_alerter(
+                self.position_alerter, "continuous_rung_hold position report failed",
+            )
+            return False
+
+        candidate_ids = self._candidate_instrument_ids()
+        try:
+            fills = self._latch.iter_fill_records(candidate_ids)
+        except (TrialDayRecordCorrupt, ExecutionReportMappingError) as exc:
+            self.log.error(
+                f"continuous_rung_hold: durable fill walk unreadable ({exc}); halting",
+            )
+            self.position_events.record(_POSITION_FILL_WALK_UNREADABLE)
+            self._report_alerter(
+                self.position_alerter, "continuous_rung_hold position report failed",
+            )
+            return False
+
+        for fill_record in fills:
+            self._consume_trial_from_fill_record(fill_record)
+
+        for iid, facts in self._facts.items():
+            station = facts.settlement_station
+            climate_day_key = facts.climate_day.isoformat()
+            if self._latch.is_consumed(station, climate_day_key):
+                continue
+            slug = InstrumentId.from_str(iid).symbol.value
+            net_position = startup_evidence_position_for(evidence, slug)
+            # Review item 5 (three-seam Slice 4 review): an ABSENT slug or a
+            # null `net_position` is UNKNOWN, never flat -- fail closed the
+            # same as a genuine LONG, not the inverse.
+            if net_position is None or net_position > 0:
+                self.log.error(
+                    f"continuous_rung_hold: venue position for {iid} is a "
+                    "LONG or UNKNOWN (no durable fill on record); halting",
+                )
+                self.position_events.record(_POSITION_UNRECONCILED_LONG)
+                self._report_alerter(
+                    self.position_alerter, "continuous_rung_hold position report failed",
+                )
+                return False
+        return True
+
+    def _candidate_instrument_ids(self) -> frozenset[str]:
+        """The union `on_order_filled`'s slug-fallback join, and the never-
+        arm fill walk, both search: on-start-resolved "catalog" instruments
+        (`self._facts`), configured instrument ids, and whatever the cache
+        currently holds -- a fill can arrive for an instrument that resolved
+        into the cache AFTER `on_start` populated `self._facts`.
+        """
+        ids = set(self._facts) | {str(i) for i in self._config.instrument_ids}
+        ids |= {str(i) for i in self.cache.instrument_ids()}
+        return frozenset(ids)
+
+    def _consume_trial_from_fill_record(self, fill_record: DurableFillRecord) -> None:
+        assert self._latch is not None
+        joined = self._join_fill_to_station_day(
+            InstrumentId.from_str(fill_record.instrument_id),
+        )
+        if joined is None:
+            return
+        station, climate_day_key = joined
+        if self._latch.is_consumed(station, climate_day_key):
+            return
+        avg_px = (
+            fill_record.cumulative_cost / fill_record.cumulative_qty
+            if fill_record.cumulative_qty
+            else Decimal(0)
+        )
+        self._latch.consume_if_absent(
+            station,
+            climate_day_key,
+            TrialDayRecord(
+                latched_at_ns=fill_record.ts_event,
+                instrument_id=fill_record.instrument_id,
+                ask=avg_px,
+                # Review item 3 (three-seam Slice 4 review): no decision-time
+                # ask exists for a fill-walk-consumed trial -- a DISTINCT
+                # reason, so the scorer's L-25 guard skips it BY REASON.
+                reason=TAKEN_FROM_FILL_WALK_REASON,
+                venue_order_id=fill_record.venue_order_id,
+            ),
+        )
+
+    def _join_fill_to_station_day(
+        self, instrument_id: InstrumentId,
+    ) -> tuple[str, str] | None:
+        """Slice 4 item A1 (plan rev 6.1): ``(station, climate_day)`` for a
+        fill -- ``self._facts`` first, then a slug fallback.
+
+        The fallback is needed because a fill can arrive for an instrument
+        that resolved into the cache AFTER `on_start` populated
+        `self._facts`. HIGH-measure and station-in-config only, same scope
+        `on_start` enforces for the primary join -- this is what makes NYC
+        (never one of the four supported stations,
+        `strategy.py::_ICAO_BY_STATION`) and any other out-of-scope city
+        unjoinable here too. Returns ``None`` on ANY failure -- never a
+        partial guess (fail closed).
+        """
+        iid = str(instrument_id)
+        facts = self._facts.get(iid)
+        if facts is not None:
+            return facts.settlement_station, facts.climate_day.isoformat()
+        if iid not in self._candidate_instrument_ids():
+            return None
+        try:
+            slug = instrument_id_to_slug(instrument_id)
+        except VenuePayloadError:
+            return None
+        parsed = parse_weather_slug(slug)
+        if parsed is None or parsed.measure != "high":
+            return None
+        station = parsed.city.upper()
+        if station not in self._config.stations:
+            return None
+        return station, parsed.climate_date
 
     def on_stop(self) -> None:
         self.log.info(self._diagnostics_snapshot_message())
@@ -298,9 +530,25 @@ class ContinuousRungHoldStrategy(Strategy):
         trigger: Trigger,
         quote_age_ns: int | None,
     ) -> None:
+        assert self._latch is not None
+        if self._latch.is_family_halted():
+            # Slice 4 item B1 (plan rev 6.1): checked FIRST, before any
+            # other decision -- no station arms anywhere for the rest of
+            # the family's life once a duplicate genuine fill has occurred.
+            self.diagnostics.record(_DIAG_FAMILY_HALT)
+            self._report_alerter(
+                self.diagnostics_alerter,
+                "continuous_rung_hold diagnostics report failed",
+            )
+            return
         if self._fee_halt:
             return
         iid = str(snapshot.instrument_id)
+        if iid in self._unjoinable_fill_instruments:
+            # Review item 1 (three-seam Slice 4 review): a process-local
+            # halt for THIS instrument -- an unjoinable or corrupt-record
+            # fill already fired here; never hunt it again this process.
+            return
         facts = self._facts.get(iid)
         if facts is None:
             return
@@ -326,6 +574,24 @@ class ContinuousRungHoldStrategy(Strategy):
             return
         if self._latch.is_inflight(station, climate_day_key):
             return
+        # Phase 0 never arms (see `on_start`'s matching guard) -- the re-arm
+        # gate and its attempt counter are Phase-1-only groundwork.
+        if self._order_submission_permit is not None:
+            attempts, last_attempt_ns = self._latch.attempt_state(station, climate_day_key)
+            if attempts > 0 and not self._rearm_permitted(
+                station,
+                climate_day_key,
+                iid,
+                attempts=attempts,
+                last_attempt_ns=last_attempt_ns,
+                now_ns=snapshot.ts_event,
+            ):
+                self.diagnostics.record(_DIAG_REARM_WAIT)
+                self._report_alerter(
+                    self.diagnostics_alerter,
+                    "continuous_rung_hold diagnostics report failed",
+                )
+                return
         # Resolution B (plan rev 6.1): the cheap, read-only pre-filter.
         # While the account-wide submit-intent singleton is OPEN -- a
         # genuine in-flight sibling order OR a stale/crash-left singleton no
@@ -455,10 +721,49 @@ class ContinuousRungHoldStrategy(Strategy):
             )
             return
 
+        # Review item 3 (three-seam Slice 4 review): the DECISION-time ask,
+        # captured here so `on_order_filled` records the durable TRIAL
+        # against the ask actually evaluated, never the (later, different)
+        # fill price -- otherwise the scorer's L-25 `fill_below_ask` guard
+        # is inert by construction.
+        self._decision_ask_by_station_day[(station, climate_day_key)] = ask
         self._latch.set_inflight(station, climate_day_key)
+        if self._order_submission_permit is not None:
+            self._latch.record_attempt(station, climate_day_key, ts_ns=snapshot.ts_event)
         self._maybe_submit(iid, decision)
         if self._order_submission_permit is None:
             self._latch.clear_inflight(station, climate_day_key)
+
+    def _rearm_permitted(
+        self,
+        station: str,
+        climate_day: str,
+        instrument_id: str,
+        *,
+        attempts: int,
+        last_attempt_ns: int | None,
+        now_ns: int,
+    ) -> bool:
+        """Slice 4 item E1 (plan rev 6.1, Resolution F): the evidence-based
+        re-arm gate for a station-day that has already been attempted at
+        least once and IN_FLIGHT has since cleared.
+
+        Requires attempts under the cap, the conservative delay floor
+        elapsed, AND a FRESH (read live, right here -- never cached) eof-
+        complete positions read showing no LONG on this instrument.
+        """
+        if attempts >= _MAX_STATION_DAY_ATTEMPTS:
+            return False
+        if last_attempt_ns is not None and now_ns < last_attempt_ns + _REARM_MIN_DELAY_NS:
+            return False
+        evidence = (
+            self._position_evidence_reader() if self._position_evidence_reader else None
+        )
+        if not startup_evidence_permits_arm(evidence):
+            return False
+        slug = InstrumentId.from_str(instrument_id).symbol.value
+        net_position = startup_evidence_position_for(evidence, slug)
+        return net_position is not None and net_position <= 0
 
     def on_order_denied(self, event: OrderDenied) -> None:
         """SAFETY C1 (plan rev 6.1): clear IN_FLIGHT for a WAIT-class deny.
@@ -481,6 +786,117 @@ class ContinuousRungHoldStrategy(Strategy):
             return
         assert self._latch is not None
         self._latch.clear_inflight(facts.settlement_station, facts.climate_day.isoformat())
+
+    def on_order_filled(self, event: OrderFilled) -> None:
+        """Slice 4 item A1 (plan rev 6.1): join a genuine fill to its
+        station-day and durably consume the TRIAL, exactly once,
+        idempotently -- the sole writer of a TRIAL for this family (never a
+        Take decision by itself, unlike v2's `on_quote_tick`).
+
+        A second GENUINE fill on an already-consumed station-day (different
+        `venue_order_id`) is item B1's duplicate-fill halt, not a raise. A
+        REPLAYED fill for the SAME `venue_order_id` is idempotent: this
+        method's own `consume_if_absent` call already makes that a no-op.
+
+        Three-seam Slice 4 review item 1: every latch read/write below runs
+        under ONE try/except -- `Strategy.handle_event` (installed Nautilus)
+        re-raises a handler exception, which would kill the strategy right
+        after a real fill. A corrupt existing record or an unreadable join
+        is therefore fail-closed (ERROR + alert + a process-local halt for
+        THIS instrument, via `self._unjoinable_fill_instruments`, checked by
+        `_hunt_tick`), never a raise.
+        """
+        super().on_order_filled(event)
+        if event.last_qty.as_decimal() <= 0:
+            return
+        assert self._latch is not None
+        joined = self._join_fill_to_station_day(event.instrument_id)
+        if joined is None:
+            self.log.error(
+                f"on_order_filled: fill for {event.instrument_id} could not "
+                "be joined to a station-day (no facts, no valid slug match); "
+                "no TRIAL recorded, halting this instrument",
+            )
+            self._unjoinable_fill_instruments.add(str(event.instrument_id))
+            self.position_events.record(_POSITION_UNJOINABLE_FILL)
+            self._report_alerter(
+                self.position_alerter, "continuous_rung_hold position report failed",
+            )
+            return
+        station, climate_day_key = joined
+        try:
+            self._consume_or_flag_duplicate(station, climate_day_key, event=event)
+        except (TrialDayRecordCorrupt, ExecutionReportMappingError) as exc:
+            iid = str(event.instrument_id)
+            self.log.error(
+                f"on_order_filled: a latch read/write for {iid} raised "
+                f"{type(exc).__name__}: {exc}; halting this instrument "
+                "(fail closed, no TRIAL, not re-raised)",
+            )
+            self._unjoinable_fill_instruments.add(iid)
+            self.position_events.record(_POSITION_FILL_JOIN_ERROR)
+            self._report_alerter(
+                self.position_alerter, "continuous_rung_hold position report failed",
+            )
+
+    def _consume_or_flag_duplicate(
+        self, station: str, climate_day_key: str, *, event: OrderFilled,
+    ) -> None:
+        """The latch read/write body of `on_order_filled`, isolated so its
+        caller can wrap it in exactly one try/except (review item 1).
+
+        Review item 3: the durable `ask` is the DECISION-time ask
+        `_hunt_tick` captured for this station-day, never the fill price --
+        falls back to the fill price only when no decision ask was tracked
+        (e.g. a restart between decision and fill), which cannot happen for
+        the fill-walk path (that path never goes through `_hunt_tick` and
+        writes `TAKEN_FROM_FILL_WALK_REASON` instead of calling this).
+        """
+        assert self._latch is not None
+        venue_order_id = str(event.venue_order_id)
+        decision_ask = self._decision_ask_by_station_day.pop((station, climate_day_key), None)
+        ask = decision_ask if decision_ask is not None else event.last_px.as_decimal()
+        record = TrialDayRecord(
+            latched_at_ns=event.ts_event,
+            instrument_id=str(event.instrument_id),
+            ask=ask,
+            reason="taken",
+            venue_order_id=venue_order_id,
+        )
+        wrote = self._latch.consume_if_absent(station, climate_day_key, record)
+        if wrote:
+            return
+        existing = self._latch.record(station, climate_day_key)
+        if existing is None:
+            return
+        if existing.venue_order_id is None:
+            # Review item 2: a legacy (pre-Slice-4) record decodes its
+            # optional `venueOrderId` as `None` -- that is NOT evidence of a
+            # duplicate (it is evidence of nothing at all about identity),
+            # so this must never fire the family halt.
+            self.log.warning(
+                _LEGACY_RECORD_NO_VENUE_ORDER_ID_WARNING.format(
+                    station=station, climate_day=climate_day_key,
+                ),
+            )
+            return
+        if existing.venue_order_id == venue_order_id:
+            return  # a replayed fill for the SAME order -- idempotent no-op
+        fee = Decimal(0) if event.commission is None else event.commission.as_decimal()
+        self._latch.record_duplicate_fill(
+            station,
+            climate_day_key,
+            venue_order_id=venue_order_id,
+            qty=event.last_qty.as_decimal(),
+            fill_px=event.last_px.as_decimal(),
+            fee=fee,
+            ts_ns=event.ts_event,
+        )
+        self.diagnostics.record(_DIAG_FAMILY_HALT)
+        self._report_alerter(
+            self.diagnostics_alerter,
+            "continuous_rung_hold diagnostics report failed",
+        )
 
     def _report_alerter(
         self,

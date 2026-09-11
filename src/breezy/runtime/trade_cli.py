@@ -423,6 +423,7 @@ def run(
     live_trading_permit: object | None = None,
     settings: BreezyTradeSettings | None = None,
     exec_client_config: PolymarketUSExecClientConfig | None = None,
+    submit_veto: Callable[[], str | None] | None = None,
 ) -> int:
     """Load settings, build the node config, run the node, return an exit code.
 
@@ -463,6 +464,7 @@ def run(
                 exec_client_config,
                 submit_intent_latch=submit_intent_latch,
                 live_trading_permit=live_trading_permit,
+                submit_veto=submit_veto,
             )
         except _CONFIG_ERRORS as exc:
             _report(out, "configuration error", exc, expected=True)

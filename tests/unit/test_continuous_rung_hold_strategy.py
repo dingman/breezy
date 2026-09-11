@@ -78,6 +78,7 @@ def _register(
     instruments: tuple[BinaryOption, ...],
     clock: TestClock | None = None,
     offer_tape: OfferTape | None = None,
+    position_evidence_reader: Any | None = None,
 ) -> ContinuousRungHoldStrategy:
     cfg = CurrentRungHoldConfig(
         instrument_ids=tuple(instrument.id for instrument in instruments),
@@ -86,6 +87,7 @@ def _register(
         cfg,
         trial_day_latch_factory=_cont_latch_factory(store_path),
         offer_tape=offer_tape,
+        position_evidence_reader=position_evidence_reader,
     )
     used_clock = TestClock() if clock is None else clock
     used_clock.set_time(WINDOW_OPEN_NS)
@@ -110,12 +112,32 @@ def _register_and_start(
     instruments: tuple[BinaryOption, ...],
     clock: TestClock | None = None,
     offer_tape: OfferTape | None = None,
+    position_evidence_reader: Any | None = None,
 ) -> ContinuousRungHoldStrategy:
     strategy = _register(
-        store_path=store_path, instruments=instruments, clock=clock, offer_tape=offer_tape,
+        store_path=store_path,
+        instruments=instruments,
+        clock=clock,
+        offer_tape=offer_tape,
+        position_evidence_reader=position_evidence_reader,
     )
     strategy.start()
     return strategy
+
+
+#: A `position_evidence_reader` that always permits arming, flat on the
+#: shared `INTERIOR_ID` fixture slug -- the "green" default most fill-
+#: wiring/re-arm tests want, so `on_start`'s never-arm walk does not itself
+#: halt the strategy. Slice 4 review item 5: an ABSENT slug is UNKNOWN, not
+#: flat, so this must EXPLICITLY list `INTERIOR_ID`'s own slug at "0" --
+#: an empty `positions` list would make every instrument UNKNOWN and halt.
+_PERMISSIVE_EVIDENCE: dict[str, object] = {
+    "v": 1,
+    "eof_complete": True,
+    "position_read_refused": False,
+    "fill_walk_complete": True,
+    "positions": [{"slug": str(INTERIOR_ID.symbol.value), "net_position": "0"}],
+}
 
 
 def _pad(

@@ -53,10 +53,16 @@ from __future__ import annotations
 
 import json
 import threading
+from collections.abc import Iterable
 from dataclasses import dataclass
 from decimal import Decimal, InvalidOperation
 from typing import Final
 
+from breezy.adapters.polymarket_us.exec.client import (
+    FILL_INDEX_KEY_PREFIX,
+    FILL_KEY_PREFIX,
+    DurableFillRecord,
+)
 from breezy.runtime.submit_intent import (
     StateStore,
     SubmitIntentLatch,
@@ -64,6 +70,25 @@ from breezy.runtime.submit_intent import (
     _HeldSubmitIntentLock,
 )
 from breezy.strategy.current_rung_hold.decision import REFUSAL_REASONS
+
+__all__ = [
+    "ATTEMPT_COUNTER_KEY_PREFIX",
+    "CONTINUOUS_TRIAL_KEY_PREFIX",
+    "DEFAULT_TRIAL_KEY_PREFIX",
+    "DUPLICATE_FILL_KEY_PREFIX",
+    "FAMILY_HALT_KEY",
+    "STARTUP_EVIDENCE_KEY",
+    "TAKEN_FROM_FILL_WALK_REASON",
+    "TrialDayAlreadyConsumed",
+    "TrialDayInvalidReason",
+    "TrialDayLatch",
+    "TrialDayLatchError",
+    "TrialDayRecord",
+    "TrialDayRecordCorrupt",
+    "open_trial_day_latch",
+    "startup_evidence_permits_arm",
+    "startup_evidence_position_for",
+]
 
 #: Default trial-key prefix -- byte-identical to the v2 live family.
 DEFAULT_TRIAL_KEY_PREFIX: Final[str] = "current_rung_hold/trial/"
@@ -88,8 +113,32 @@ _INFLIGHT_CLEARED: Final[bytes] = b'{"v":1,"state":"cleared"}'
 #: trial. Recording the real reason string instead is the more honest
 #: mapping, not a narrower one -- every `not_taken` caller this latch ever
 #: had is still representable, now with the actual reason preserved.
-_REASONS: Final[frozenset[str]] = frozenset(REFUSAL_REASONS | {"taken"})
+#: Review item 3 (three-seam Slice 4 review): the never-arm fill walk
+#: (`ContinuousRungHoldStrategy._consume_trial_from_fill_record`) has no
+#: decision-time ask to record -- distinct from `"taken"` so the scorer's
+#: L-25 `fill_below_ask` guard (`score_live_trials.py::_admit_fill`) can
+#: skip it BY REASON, never by an ask value that would make the guard inert.
+TAKEN_FROM_FILL_WALK_REASON: Final[str] = "taken_from_fill_walk"
+_REASONS: Final[frozenset[str]] = frozenset(
+    REFUSAL_REASONS | {"taken", TAKEN_FROM_FILL_WALK_REASON}
+)
 _SCHEMA_VERSION: Final[int] = 1
+
+#: Slice 4 item B1 (plan rev 6.1): v3-only, family-wide keys -- literal
+#: strings, NOT derived from a `TrialDayLatch`'s own `_key_prefix` (v2 never
+#: writes either of these; there is exactly one continuous-rung-hold family).
+DUPLICATE_FILL_KEY_PREFIX: Final[str] = "continuous_rung_hold/duplicate_fill/"
+FAMILY_HALT_KEY: Final[str] = "continuous_rung_hold/halt"
+
+#: Slice 4 item A2 (plan rev 6.1): the exec client's durable startup/re-arm
+#: evidence key -- written at the end of every connect and after each
+#: resolver terminal-zero (client.py, another agent's seam; not written
+#: here). Read-only from this module.
+STARTUP_EVIDENCE_KEY: Final[str] = "exec/polymarket_us/startup_evidence"
+
+#: Slice 4 item E1 (plan rev 6.1, Resolution F): per-station-day re-arm
+#: attempt counter, v3-only.
+ATTEMPT_COUNTER_KEY_PREFIX: Final[str] = "continuous_rung_hold/attempts/"
 
 
 class TrialDayLatchError(Exception):
@@ -384,6 +433,212 @@ class TrialDayLatch:
         """Clear the IN_FLIGHT marker (StateStore has no delete -- write cleared)."""
         self._require_held()
         self._store.set(self._inflight_key(station, climate_day), _INFLIGHT_CLEARED)
+
+    # -- Slice 4 item B1 (plan rev 6.1): duplicate-fill residual + family halt --
+
+    def record_duplicate_fill(
+        self,
+        station: str,
+        climate_day: str,
+        *,
+        venue_order_id: str,
+        qty: Decimal,
+        fill_px: Decimal,
+        fee: Decimal,
+        ts_ns: int,
+    ) -> None:
+        """Durably record a second genuine fill on an already-consumed
+        station-day, and set the family-wide halt.
+
+        Idempotent per ``venue_order_id``: a replayed call for the SAME
+        duplicate fill (or the SAME id racing two writers) writes neither
+        bucket a second time -- first writer wins, matching
+        :meth:`consume_if_absent`'s own read-check-write discipline under
+        this SAME flock.
+        """
+        self._require_held()
+        bucket_key = f"{DUPLICATE_FILL_KEY_PREFIX}{venue_order_id}"
+        if self._store.get(bucket_key) is None:
+            payload = {
+                "v": 1,
+                "qty": str(qty),
+                "fillPx": str(fill_px),
+                "fee": str(fee),
+                "tsNs": ts_ns,
+                "station": station,
+                "climateDay": climate_day,
+            }
+            self._store.set(bucket_key, json.dumps(payload, sort_keys=True).encode("utf-8"))
+        if self._store.get(FAMILY_HALT_KEY) is None:
+            halt_payload = {
+                "v": 1,
+                "reason": "duplicate_fill",
+                "tsNs": ts_ns,
+                "venueOrderId": venue_order_id,
+            }
+            self._store.set(
+                FAMILY_HALT_KEY, json.dumps(halt_payload, sort_keys=True).encode("utf-8"),
+            )
+
+    def is_family_halted(self) -> bool:
+        """``True`` once :meth:`record_duplicate_fill` has ever fired for
+        THIS family. Durable -- survives restart, unlike ``_trading_refusals``."""
+        self._require_held()
+        return self._store.get(FAMILY_HALT_KEY) is not None
+
+    # -- Slice 4 item A2 (plan rev 6.1): never-arm startup evidence + fill walk --
+
+    def read_startup_evidence(self) -> dict[str, object] | None:
+        """The exec client's durable startup/re-arm evidence, read FRESH on
+        every call -- never cached on this object.
+
+        ``None`` for an absent OR malformed record: callers (the on-start
+        never-arm walk, the re-arm gate) both fail closed on ``None``, so a
+        corrupt record is indistinguishable here from "never written".
+        """
+        self._require_held()
+        raw = self._store.get(STARTUP_EVIDENCE_KEY)
+        if raw is None:
+            return None
+        try:
+            decoded: object = json.loads(raw.decode("utf-8"))
+        except ValueError:
+            return None
+        if not isinstance(decoded, dict):
+            return None
+        return decoded
+
+    def iter_fill_records(self, instrument_ids: Iterable[str]) -> tuple[DurableFillRecord, ...]:
+        """Every durable fill record reachable from ``instrument_ids``'s fill
+        indices.
+
+        The store has no prefix scan (see ``client.py::record_fill``'s own
+        docstring), so this walks the SAME per-instrument
+        ``FILL_INDEX_KEY_PREFIX`` index the exec client already maintains,
+        rather than attempting one over ``FILL_KEY_PREFIX`` directly.
+
+        Read-only. A missing index for one instrument is simply "no fills
+        for it" (skipped); a PRESENT but malformed index or record RAISES --
+        the on-start walk that calls this fails closed rather than silently
+        under-counting a real fill.
+        """
+        self._require_held()
+        records: list[DurableFillRecord] = []
+        seen: set[str] = set()
+        for instrument_id in instrument_ids:
+            raw_index = self._store.get(f"{FILL_INDEX_KEY_PREFIX}{instrument_id}")
+            if raw_index is None:
+                continue
+            try:
+                decoded_index: object = json.loads(raw_index.decode("utf-8"))
+            except ValueError:
+                raise TrialDayRecordCorrupt() from None
+            if not isinstance(decoded_index, list):
+                raise TrialDayRecordCorrupt()
+            for venue_order_id in decoded_index:
+                if not isinstance(venue_order_id, str) or venue_order_id in seen:
+                    continue
+                seen.add(venue_order_id)
+                raw = self._store.get(f"{FILL_KEY_PREFIX}{venue_order_id}")
+                if raw is None:
+                    raise TrialDayRecordCorrupt()
+                records.append(DurableFillRecord.from_bytes(raw))
+        return tuple(records)
+
+    # -- Slice 4 item E1 (plan rev 6.1, Resolution F): re-arm attempt counter --
+
+    def _attempt_key(self, station: str, climate_day: str) -> str:
+        return f"{ATTEMPT_COUNTER_KEY_PREFIX}{station}/{climate_day}"
+
+    def attempt_state(self, station: str, climate_day: str) -> tuple[int, int | None]:
+        """``(attempt_count, last_attempt_ts_ns)`` for this station-day's
+        re-arm counter -- ``(0, None)`` before the first attempt.
+
+        A genuine fill freezes this counter by construction: once
+        ``is_consumed`` is ``True`` for this station-day, `_hunt_tick`
+        returns before this is ever consulted again.
+        """
+        self._require_held()
+        raw = self._store.get(self._attempt_key(station, climate_day))
+        if raw is None:
+            return 0, None
+        try:
+            payload: object = json.loads(raw.decode("utf-8"))
+        except ValueError:
+            raise TrialDayRecordCorrupt() from None
+        if not isinstance(payload, dict):
+            raise TrialDayRecordCorrupt()
+        count = payload.get("count")
+        last_ns = payload.get("lastAttemptNs")
+        if isinstance(count, bool) or not isinstance(count, int):
+            raise TrialDayRecordCorrupt()
+        if last_ns is not None and (isinstance(last_ns, bool) or not isinstance(last_ns, int)):
+            raise TrialDayRecordCorrupt()
+        return count, last_ns
+
+    def record_attempt(self, station: str, climate_day: str, *, ts_ns: int) -> int:
+        """Durably increment this station-day's re-arm attempt counter.
+
+        Returns the new count. Called once per genuine arm attempt (at
+        `set_inflight` time), never on a re-arm-gate REFUSAL.
+        """
+        self._require_held()
+        count, _ = self.attempt_state(station, climate_day)
+        new_count = count + 1
+        payload = {"v": 1, "count": new_count, "lastAttemptNs": ts_ns}
+        self._store.set(
+            self._attempt_key(station, climate_day),
+            json.dumps(payload, sort_keys=True).encode("utf-8"),
+        )
+        return new_count
+
+
+def startup_evidence_permits_arm(evidence: dict[str, object] | None) -> bool:
+    """``True`` only when ``evidence`` proves a complete, non-refused
+    startup positions read (Slice 4 item A2, plan rev 6.1). Any missing or
+    wrong-typed field is a refusal to arm -- fail closed, not a partial read.
+    """
+    if evidence is None:
+        return False
+    if evidence.get("v") != 1:
+        return False
+    if evidence.get("position_read_refused") is not False:
+        return False
+    if evidence.get("eof_complete") is not True:
+        return False
+    return evidence.get("fill_walk_complete") is True
+
+
+def startup_evidence_position_for(
+    evidence: dict[str, object] | None, slug: str,
+) -> Decimal | None:
+    """The net position for ``slug`` out of ``evidence["positions"]``.
+
+    ``None`` (UNKNOWN, never flat -- three-seam Slice 4 review item 5) when:
+    ``evidence`` itself is absent/unreadable; the ``positions`` field is
+    malformed; ``slug`` is ABSENT from the list (the client seam now emits
+    every slug from the page, so an absence is a read gap, not evidence of
+    "no position"); or the row's own ``net_position`` is JSON ``null`` (the
+    client's explicit "this row was unreadable" signal) or any other
+    non-numeric-string value. Callers (the never-arm walk, the re-arm gate)
+    both fail closed on ``None``.
+    """
+    if evidence is None:
+        return None
+    positions = evidence.get("positions")
+    if not isinstance(positions, list):
+        return None
+    for row in positions:
+        if not isinstance(row, dict) or row.get("slug") != slug:
+            continue
+        raw = row.get("net_position")
+        if raw is None or not isinstance(raw, str):
+            return None
+        try:
+            return Decimal(raw)
+        except InvalidOperation:
+            return None
+    return None
 
 
 def open_trial_day_latch(

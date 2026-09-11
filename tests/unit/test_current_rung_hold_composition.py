@@ -5,6 +5,7 @@ from __future__ import annotations
 import datetime as dt
 from collections.abc import Iterator
 from contextlib import contextmanager
+from dataclasses import dataclass
 from decimal import Decimal
 from pathlib import Path
 
@@ -19,6 +20,11 @@ from nautilus_trader.persistence.catalog.parquet import ParquetDataCatalog
 from nautilus_trader.portfolio import Portfolio
 from nautilus_trader.test_kit.stubs.component import TestComponentStubs
 
+from breezy.adapters.polymarket_us.operator_controls import (
+    MAX_DAILY_BUDGET_USD_ENV_VAR,
+    MAX_POSITION_COST_USD_ENV_VAR,
+)
+from breezy.adapters.polymarket_us.safety import issue_live_trading_permit
 from breezy.domain.weather_bucket_facts import (
     CLIMATE_DAY_KEY,
     MEASURE_KEY,
@@ -29,18 +35,33 @@ from breezy.domain.weather_bucket_facts import (
     WEATHER_FACTS_STATUS_KNOWN,
     WEATHER_FACTS_STATUS_UNKNOWN,
 )
+from breezy.runtime.order_enablement import OrderSubmissionPermit
+from breezy.runtime.settings import SettingsError
+from breezy.runtime.sqlite_store import SqliteStateStore
+from breezy.runtime.submit_intent import open_submit_intent_latch
 from breezy.strategy.current_rung_hold.composition import (
     NoTradableInstrumentsError,
     build_continuous_rung_hold_strategies,
     build_current_rung_hold_strategies,
+    family_halt_submit_veto,
     phase0_family_permits,
+    phase1_family_permits,
     resolve_station_instrument_ids,
     strategy_component_id,
 )
 from breezy.strategy.current_rung_hold.config import SUPPORTED_STATIONS
 from breezy.strategy.current_rung_hold.continuous_strategy import ContinuousRungHoldStrategy
 from breezy.strategy.current_rung_hold.strategy import CurrentRungHoldStrategy
+from breezy.strategy.current_rung_hold.trial_day_latch import (
+    CONTINUOUS_TRIAL_KEY_PREFIX,
+    open_trial_day_latch,
+)
 from breezy.strategy.weather_common.refusals import RefusalCounter
+from tests.unit.operator_control_env import operator_control_env
+from tests.unit.test_polymarket_us_permit_issuance import clock_at, enable_operator_gate
+from tests.unit.test_polymarket_us_submit_order_chain import (
+    write_canonical_verified,  # noqa: F401 -- reused fixture, see test below
+)
 
 _POLYMARKET_VENUE = Venue("POLYMARKET_US")
 _DAY = dt.date(2026, 9, 4)
@@ -564,3 +585,215 @@ def test_no_flag_combination_mints_two_sending_families() -> None:
                 else:
                     assert v2 is None
                 assert not (v2 is not None and v3 is not None)
+
+
+# ---------------------------------------------------------------------------
+# F3/F4 (plan rev 6.1, Phase 1): phase1_family_permits gives the single
+# sending family's permit to whichever family is on -- v3 (continuous_rung_
+# hold) MAY hold it here, unlike phase0_family_permits (kept, unchanged,
+# above). Both families on together is refused (SettingsError) unless the
+# Phase 0 shadow flag is threaded in, matching phase0_family_permits exactly.
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True, slots=True)
+class _PermitRoutingSettings:
+    """The narrow ``SettingsLike`` surface ``OrderSubmissionPermit.issue``
+    needs, with ``current_rung_hold``/``continuous_rung_hold`` varied per
+    combo under test."""
+
+    current_rung_hold: bool
+    continuous_rung_hold: bool
+    orders_enabled_requested: bool = True
+    live_observations: bool = True
+
+
+def _mint_real_permit(
+    monkeypatch: pytest.MonkeyPatch, *, current: bool, continuous: bool
+) -> OrderSubmissionPermit:
+    """Mint a genuine, sealed ``OrderSubmissionPermit`` for the given family
+    combo -- F4 requires a real permit object, not a fake, so
+    ``phase1_family_permits`` is exercised against the same construction
+    path production uses."""
+    enable_operator_gate(monkeypatch)
+    clock = clock_at()
+    live_permit = issue_live_trading_permit(clock=clock)
+    settings = _PermitRoutingSettings(current_rung_hold=current, continuous_rung_hold=continuous)
+    with (
+        operator_control_env(MAX_DAILY_BUDGET_USD_ENV_VAR, "1000.00"),
+        operator_control_env(MAX_POSITION_COST_USD_ENV_VAR, "10.00"),
+    ):
+        return OrderSubmissionPermit.issue(
+            settings=settings, live_trading_permit=live_permit, clock=clock,
+        )
+
+
+@pytest.mark.parametrize("shadow", (False, True))
+@pytest.mark.parametrize("continuous", (False, True))
+@pytest.mark.parametrize("current", (False, True))
+def test_phase1_family_permits_all_combos_with_a_real_permit(
+    current: bool,
+    continuous: bool,
+    shadow: bool,
+    monkeypatch: pytest.MonkeyPatch,
+    write_canonical_verified: None,  # noqa: F811
+) -> None:
+    if not (current or continuous):
+        # No family on: no permit is ever minted in production for this
+        # combo (issue() itself refuses it); the routing function alone must
+        # still resolve to no holder for a None permit.
+        v2, v3 = phase1_family_permits(
+            current_rung_hold=current,
+            continuous_rung_hold=continuous,
+            permit=None,
+            phase0_shadow=shadow,
+        )
+        assert v2 is None
+        assert v3 is None
+        return
+
+    permit = _mint_real_permit(monkeypatch, current=current, continuous=continuous)
+
+    if current and continuous and not shadow:
+        with pytest.raises(SettingsError):
+            phase1_family_permits(
+                current_rung_hold=current,
+                continuous_rung_hold=continuous,
+                permit=permit,
+                phase0_shadow=shadow,
+            )
+        return
+
+    v2, v3 = phase1_family_permits(
+        current_rung_hold=current,
+        continuous_rung_hold=continuous,
+        permit=permit,
+        phase0_shadow=shadow,
+    )
+    holders = [p for p in (v2, v3) if p is not None]
+    assert len(holders) <= 1, "at most one family may hold the permit"
+    if shadow:
+        assert v3 is None
+        assert v2 is (permit if current else None)
+    elif continuous:
+        assert v3 is permit
+        assert v2 is None
+    else:
+        assert v2 is permit
+        assert v3 is None
+
+
+def test_continuous_only_phase1_builds_strategies_holding_the_real_permit(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    write_canonical_verified: None,  # noqa: F811
+) -> None:
+    """End-to-end F3 wiring: continuous-only, no shadow -- the single
+    sending family's permit is routed to v3, `build_continuous_rung_hold_
+    strategies` is called with `phase0_permit_guard=(v3 is None)` exactly as
+    `app/trade.py::run` does, and every constructed station strategy holds
+    the SAME real permit object. v2 is never composed for this combo (there
+    is no `current_rung_hold` flag on, so `app/trade.py::run` never calls
+    `build_current_rung_hold_strategies` at all -- asserted here by never
+    calling it)."""
+    _write(
+        tmp_path,
+        [
+            _binary("tc-temp-sfohigh-2026-09-04-gte70lt71f", info=_known(station="SFO", day=_DAY)),
+            _binary("tc-temp-laxhigh-2026-09-04-gte70lt71f", info=_known(station="LAX", day=_DAY)),
+        ],
+    )
+    permit = _mint_real_permit(monkeypatch, current=False, continuous=True)
+
+    v2, v3 = phase1_family_permits(
+        current_rung_hold=False,
+        continuous_rung_hold=True,
+        permit=permit,
+        phase0_shadow=False,
+    )
+    assert v2 is None
+    assert v3 is permit
+
+    strategies = build_continuous_rung_hold_strategies(
+        catalog_root=tmp_path,
+        today_by_station=_TODAY,
+        trial_day_latch_factory=_unused_latch_factory,
+        order_submission_permit=v3,
+        phase0_permit_guard=v3 is None,
+    )
+    assert len(strategies) == 2
+    for strategy in strategies:
+        assert isinstance(strategy, ContinuousRungHoldStrategy)
+        assert strategy._order_submission_permit is permit
+
+
+# ---------------------------------------------------------------------------
+# Item 4 (slice 4 review, plan rev 6.1): family_halt_submit_veto -- a unit
+# test on the veto callable in isolation (constructed here from a bare
+# TrialDayLatch, no exec client involved). The end-to-end plumbing this
+# callable feeds -- PolymarketUSExecClientConfig.submit_veto ->
+# factories.py -> node_config.build_trade_node_config -> trade_cli.run ->
+# app/trade.py::run's `family_halt_submit_veto(family_halt_latch)` at the
+# v3 composition call site -- is now COMPLETE; the live end-to-end proof
+# (composing + submitting through a real exec client denies WAIT-class
+# with zero permit slots spent while the halt key is set) is
+# tests/unit/test_current_rung_hold_ambiguous_resolver.py::
+# test_a_family_halt_veto_denies_wait_class_and_spends_zero_permit_slots.
+# ---------------------------------------------------------------------------
+
+
+def test_family_halt_submit_veto_is_none_until_the_halt_key_is_set(tmp_path: Path) -> None:
+    """The veto is a synchronous, read-only ``is_family_halted()`` under the
+    SAME flock the given ``TrialDayLatch`` already holds -- no fresh open,
+    no I/O beyond that read."""
+    store_path = tmp_path / "state.db"
+    with open_submit_intent_latch(SqliteStateStore(store_path), store_path) as intent_latch:
+        trial_day_latch = open_trial_day_latch(
+            intent_latch, key_prefix=CONTINUOUS_TRIAL_KEY_PREFIX,
+        )
+        veto = family_halt_submit_veto(trial_day_latch)
+
+        assert veto() is None
+
+        trial_day_latch.record_duplicate_fill(
+            "SFO",
+            "2026-09-04",
+            venue_order_id="venue-order-1",
+            qty=Decimal(1),
+            fill_px=Decimal("0.50"),
+            fee=Decimal("0.01"),
+            ts_ns=1,
+        )
+
+        assert veto() == "family_halt"
+        # Idempotent: a second call re-reads the SAME durable key, not a
+        # cached value on the veto closure itself.
+        assert veto() == "family_halt"
+
+
+def test_family_halt_submit_veto_reads_a_family_wide_key_not_a_station_scoped_one(
+    tmp_path: Path,
+) -> None:
+    """The halt is FAMILY-wide (`FAMILY_HALT_KEY`, one singleton per store),
+    so a veto built from ANY station's `TrialDayLatch` binding observes a
+    halt set via any other station's fill -- same store, same key, same
+    flock."""
+    store_path = tmp_path / "state.db"
+    with open_submit_intent_latch(SqliteStateStore(store_path), store_path) as intent_latch:
+        sfo_latch = open_trial_day_latch(intent_latch, key_prefix=CONTINUOUS_TRIAL_KEY_PREFIX)
+        lax_latch = open_trial_day_latch(intent_latch, key_prefix=CONTINUOUS_TRIAL_KEY_PREFIX)
+        veto_for_lax = family_halt_submit_veto(lax_latch)
+
+        assert veto_for_lax() is None
+
+        sfo_latch.record_duplicate_fill(
+            "SFO",
+            "2026-09-04",
+            venue_order_id="venue-order-2",
+            qty=Decimal(1),
+            fill_px=Decimal("0.50"),
+            fee=Decimal("0.01"),
+            ts_ns=1,
+        )
+
+        assert veto_for_lax() == "family_halt"

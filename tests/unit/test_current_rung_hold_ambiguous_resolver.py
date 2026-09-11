@@ -32,10 +32,12 @@ from typing import Any
 import pytest
 from nautilus_trader.common.component import LiveClock
 from nautilus_trader.common.factories import OrderFactory
+from nautilus_trader.model.events import OrderDenied
 
 from breezy.adapters.polymarket_us.exec.client import (
     AmbiguousResolverContext,
     PolymarketUSExecutionClient,
+    StartupPositionSnapshot,
     _synthetic_get_fill_trade_id,
 )
 from breezy.adapters.polymarket_us.operator_controls import (
@@ -45,7 +47,17 @@ from breezy.adapters.polymarket_us.operator_controls import (
 from breezy.adapters.polymarket_us.safety import live_trading_budget_remaining
 from breezy.adapters.polymarket_us.symbology import instrument_id_to_slug
 from breezy.adapters.polymarket_us.transport import VenueResponse
-from breezy.runtime.submit_intent import CURRENT_INTENT_KEY, SubmitIntentCorrupt, SubmitIntentState
+from breezy.runtime.submit_intent import (
+    CURRENT_INTENT_KEY,
+    SubmitIntentCorrupt,
+    SubmitIntentMismatch,
+    SubmitIntentState,
+)
+from breezy.strategy.current_rung_hold.composition import family_halt_submit_veto
+from breezy.strategy.current_rung_hold.trial_day_latch import (
+    CONTINUOUS_TRIAL_KEY_PREFIX,
+    open_trial_day_latch,
+)
 from tests.unit.operator_control_env import operator_control_env
 from tests.unit.polymarket_us_exec_shapes import TS_EVENT_TEXT, build_instrument
 from tests.unit.test_current_rung_hold_pre_arm_race import (
@@ -139,6 +151,33 @@ async def _run_resolver_passes(client: PolymarketUSExecutionClient, count: int) 
         await asyncio.gather(task, return_exceptions=True)
 
 
+async def _run_exactly_one_pass(client: PolymarketUSExecutionClient) -> None:
+    """Like :func:`_run_resolver_passes`, but for a test that needs the
+    pass COUNT itself to be exact (item 1, slice 4 review) rather than "at
+    least one and it settled": a zero poll interval on every iteration lets
+    an intent that never resolves run an UNBOUNDED number of passes inside
+    any finite yield budget, since each one completes with no real await.
+    The first ``_resolver_poll_interval_secs`` call (before pass 1) returns
+    ``0.0``; every call after that returns an hour, parking the loop inside
+    an ``asyncio.sleep`` that never completes in this test -- so exactly
+    ONE pass has run by the time the yield budget below is spent.
+    """
+    calls = {"count": 0}
+
+    def _poll_interval() -> float:
+        calls["count"] += 1
+        return 0.0 if calls["count"] == 1 else 3600.0
+
+    client._resolver_poll_interval_secs = _poll_interval  # type: ignore[method-assign]
+    task = asyncio.get_event_loop().create_task(client._resolve_ambiguous_intents())
+    try:
+        for _ in range(200):
+            await asyncio.sleep(0)
+    finally:
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+
+
 @pytest.mark.asyncio
 async def test_a_get_that_never_returns_terminal_evidence_leaves_the_intent_open(
     tmp_path: Path,
@@ -203,12 +242,59 @@ async def test_a_get_confirmed_terminal_zero_with_no_long_retires_and_trues_up_t
         assert current.state is SubmitIntentState.RETIRED
         assert current.retirement_reason is not None
         assert current.retirement_reason.value == "STATUS_REPORT_ZERO_FILL_TERMINAL"
-        _, remaining = live_trading_budget_remaining(client._permit)
-        # true_up_booking(ZERO) frees the NOTIONAL reservation, never the
-        # ORDER-COUNT slot (Resolution's permit-restore is a separate,
-        # not-yet-built mechanism -- see the build report).
-        assert remaining == 1
+        # D1/D2 (plan rev 6.1): true_up_booking(ZERO) frees the LEDGER's
+        # notional reservation; restore_live_trading_budget (called right
+        # after retire, in _resolve_terminal_zero) is the SEPARATE mechanism
+        # that gives back the PERMIT's own order-count slot and notional --
+        # this no-fill IOC never actually spent either, so both return to
+        # their full issued budget.
+        remaining_notional, remaining_count = live_trading_budget_remaining(client._permit)
+        assert remaining_count == 2
+        assert remaining_notional == Decimal("1000.00")
         assert current.intent_id not in client._ambiguous_bookings
+        await client._disconnect()
+
+
+@pytest.mark.asyncio
+async def test_a_terminal_zero_resolution_rewrites_the_startup_position_evidence(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    write_canonical_verified: None,  # noqa: F811
+) -> None:
+    """C1 (plan rev 6.1): the strategy's re-arm gate must read FRESH
+    evidence, never a boot-time snapshot -- a terminal-zero resolution
+    rewrites the SAME durable key from the SAME eof-complete page it just
+    used to confirm there is no LONG, distinct from whatever `_connect`
+    wrote at startup."""
+    enable_operator_gate(monkeypatch, order_count="2")
+    with operator_control_env(MAX_DAILY_BUDGET_USD_ENV_VAR, "1000.00"), operator_control_env(
+        MAX_POSITION_COST_USD_ENV_VAR, "10.00",
+    ):
+        client, order_id, slug, _latch_cm, _order_events = await _arm_one_ambiguous_intent(tmp_path)
+        at_connect = client.read_startup_position_evidence()
+        assert at_connect is not None
+        assert at_connect.positions == (), "the fixture connects against an empty book"
+
+        client._private_read._payloads[  # type: ignore[attr-defined]
+            f"/v1/order/{order_id}"
+        ] = _order_get_body(order_id, slug=slug, state="ORDER_STATE_CANCELED", cum_quantity=0)
+        # A DIFFERENT slug carries a position -- proves the rewrite reflects
+        # THIS pass's fresh read, not a stale copy of what `_connect` wrote.
+        client._private_read._payloads["/v1/portfolio/positions"] = {  # type: ignore[attr-defined]
+            "positions": {"a-different-market": {"netPosition": "5"}},
+            "eof": True,
+        }
+
+        await _run_resolver_passes(client, count=1)
+
+        evidence = client.read_startup_position_evidence()
+        assert evidence is not None
+        assert evidence.eof_complete is True
+        assert evidence.position_read_refused is False
+        assert evidence.positions == (
+            StartupPositionSnapshot(slug="a-different-market", net_position="5"),
+        )
+        assert evidence.ts_ns >= at_connect.ts_ns
         await client._disconnect()
 
 
@@ -776,4 +862,125 @@ async def test_a_non_positive_avg_px_never_authorizes_a_synthesized_fill(
         assert current.state is SubmitIntentState.OPEN, "avg_px <= 0 must never authorize a fill"
         assert client.fill_records_for(instrument.id) == ()
         assert _order_filled_events(order_events) == []
+        await client._disconnect()
+
+
+@pytest.mark.asyncio
+async def test_a_retire_raise_does_not_kill_the_resolver_task_and_counts_the_error(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    write_canonical_verified: None,  # noqa: F811
+) -> None:
+    """Item 1 (slice 4 review, HIGH): `_retire` raising `SubmitIntentMismatch`
+    (ARCH M2) -- or `restore_live_trading_budget` raising
+    `LiveTradingPermissionError` -- must never kill
+    `_resolve_ambiguous_intents` for the process lifetime. The exception is
+    caught, `resolver_error_count` increments, the intent stays OPEN, and
+    the VERY NEXT poll still runs against the real `_retire` again."""
+    enable_operator_gate(monkeypatch, order_count="2")
+    with operator_control_env(MAX_DAILY_BUDGET_USD_ENV_VAR, "1000.00"), operator_control_env(
+        MAX_POSITION_COST_USD_ENV_VAR, "10.00",
+    ):
+        client, order_id, slug, _latch_cm, _order_events = await _arm_one_ambiguous_intent(tmp_path)
+        client._private_read._payloads[  # type: ignore[attr-defined]
+            f"/v1/order/{order_id}"
+        ] = _order_get_body(order_id, slug=slug, state="ORDER_STATE_CANCELED", cum_quantity=0)
+        client._private_read._payloads["/v1/portfolio/positions"] = {  # type: ignore[attr-defined]
+            "positions": {},
+            "eof": True,
+        }
+        assert client._latch is not None
+        armed = client._latch.current()
+        assert armed is not None
+
+        original_retire = client._retire
+        should_raise = {"value": True}
+
+        def _maybe_raise(*args: Any, **kwargs: Any) -> None:
+            if should_raise["value"]:
+                raise SubmitIntentMismatch(armed.intent_id, None, None)
+            return original_retire(*args, **kwargs)
+
+        client._retire = _maybe_raise  # type: ignore[method-assign]
+
+        await _run_exactly_one_pass(client)
+
+        current = client._latch.current()
+        assert current is not None
+        assert current.state is SubmitIntentState.OPEN, "never retired on the raising pass"
+        assert client.resolver_error_count == 1
+
+        # The NEXT pass must still run -- flip back to the real `_retire`
+        # and confirm the SAME intent resolves normally on a LATER pass.
+        should_raise["value"] = False
+        await _run_exactly_one_pass(client)
+
+        current = client._latch.current()
+        assert current is not None
+        assert current.state is SubmitIntentState.RETIRED, "a later poll must still resolve it"
+        assert client.resolver_error_count == 1, "the counter does not grow once the raise stops"
+        await client._disconnect()
+
+
+@pytest.mark.asyncio
+async def test_a_family_halt_veto_denies_wait_class_and_spends_zero_permit_slots(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    write_canonical_verified: None,  # noqa: F811
+) -> None:
+    """Item 4 (slice 4 review, HIGH): the family-halt chokepoint veto, proven
+    end to end -- a REAL `TrialDayLatch` (sharing the client's OWN
+    submit-intent latch store/flock) whose `record_duplicate_fill` sets the
+    durable family-halt key, wrapped by the real `family_halt_submit_veto`
+    (composition.py), consulted by the real `_submit_order` immediately
+    before the permit spend. A non-None reason denies WAIT-class: zero
+    permit slots spent, the reason carried verbatim, and the intent latch
+    never arms.
+
+    `client._submit_veto` is assigned post-construction here (never a
+    production wiring path) because `_build_race_client`
+    (`test_current_rung_hold_pre_arm_race.py`) is out of this seam's file
+    list; the constructor kwarg, config field and factory/CLI/composition
+    plumbing that reach this exact attribute in production are proven
+    separately (mypy + `lint-imports` on `exec/client.py`, `config.py`,
+    `factories.py`, `runtime/node_config.py`, `runtime/trade_cli.py`,
+    `app/trade.py`).
+    """
+    enable_operator_gate(monkeypatch, order_count="2")
+    with operator_control_env(MAX_DAILY_BUDGET_USD_ENV_VAR, "1000.00"), operator_control_env(
+        MAX_POSITION_COST_USD_ENV_VAR, "10.00",
+    ):
+        sender = _SlowSender()
+        client, order_events, permit, _latch_cm = await _build_race_client(
+            tmp_path, sender=sender,
+        )
+        assert client._latch is not None
+        trial_day_latch = open_trial_day_latch(
+            client._latch, key_prefix=CONTINUOUS_TRIAL_KEY_PREFIX,
+        )
+        client._submit_veto = family_halt_submit_veto(  # type: ignore[method-assign]
+            trial_day_latch,
+        )
+        trial_day_latch.record_duplicate_fill(
+            "SFO",
+            "2026-09-04",
+            venue_order_id="venue-order-halt-1",
+            qty=Decimal(1),
+            fill_px=Decimal("0.50"),
+            fee=Decimal("0.01"),
+            ts_ns=1,
+        )
+        _, remaining_before = live_trading_budget_remaining(permit)
+        factory = OrderFactory(trader_id=TRADER_ID, strategy_id=STRATEGY_ID, clock=LiveClock())
+        command = _submit_command(client, factory, "a")
+
+        await client._submit_order(command)
+
+        denials = [e for e in order_events if isinstance(e, OrderDenied)]
+        assert len(denials) == 1
+        assert denials[0].reason == "family_halt"
+        _, remaining_after = live_trading_budget_remaining(permit)
+        assert remaining_after == remaining_before, "a WAIT deny must spend nothing"
+        assert client._latch.is_latched() is False, "a WAIT deny must never arm"
+        assert sender.calls == [], "the veto must deny before any venue contact"
         await client._disconnect()

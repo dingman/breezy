@@ -131,13 +131,17 @@ class SettingsLike(Protocol):
     sufficient in a test, and this module never re-parses anything the
     settings loader already owns.
 
-    Phase 0: ``continuous_rung_hold`` is a composition flag on
-    ``BreezyTradeSettings``, not an ``issue()`` precondition. v3's permit is
-    None by construction.
+    Phase 1: EITHER ``current_rung_hold`` OR ``continuous_rung_hold`` alone
+    satisfies the rung-hold precondition below -- exactly one sending family
+    is enforced at settings-load time (``runtime.settings.load_trade_settings``)
+    and in permit routing (``strategy.current_rung_hold.composition.
+    phase1_family_permits``), not here. ``issue()`` itself stays agnostic to
+    which family asked.
     """
 
     orders_enabled_requested: bool
     current_rung_hold: bool
+    continuous_rung_hold: bool
     live_observations: bool
 
 
@@ -217,9 +221,13 @@ class OrderSubmissionPermit:
                 "both operator-reserved caps must be present and positive"
             ) from exc
 
-        if settings.current_rung_hold is not True or settings.live_observations is not True:
+        rung_hold_family = (
+            settings.current_rung_hold is True or settings.continuous_rung_hold is True
+        )
+        if not rung_hold_family or settings.live_observations is not True:
             raise RungHoldNotReadyError(
-                "current_rung_hold and live_observations must both be enabled"
+                "live_observations and one of current_rung_hold or "
+                "continuous_rung_hold must be enabled"
             )
 
         # The construction call names the class directly, not ``cls``: the

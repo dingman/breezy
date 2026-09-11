@@ -55,9 +55,11 @@ __all__ = [
     "NoTradableInstrumentsError",
     "build_continuous_rung_hold_strategies",
     "build_current_rung_hold_strategies",
+    "family_halt_submit_veto",
     "install_current_rung_hold_refusal_watch",
     "make_trial_day_latch_factory",
     "phase0_family_permits",
+    "phase1_family_permits",
     "resolve_station_instrument_ids",
     "strategy_component_id",
 ]
@@ -164,6 +166,42 @@ def make_trial_day_latch_factory(
     return _factory
 
 
+def family_halt_submit_veto(trial_day_latch: TrialDayLatch) -> Callable[[], str | None]:
+    """Item 4 (slice 4 review, plan rev 6.1): the exec client's synchronous
+    submit-time family-halt veto.
+
+    Returns a zero-argument callable matching the exec client's injected
+    ``submit_veto: Callable[[], str | None]`` kwarg
+    (``adapters/polymarket_us/exec/client.py`` -- consulted in
+    ``_submit_order`` immediately before the permit spend, the SAME
+    no-``await`` chokepoint shape as SAFETY C1's ``is_latched()`` re-check,
+    so a non-None reason denies with zero money moved and no
+    ``_trading_refusals`` entry). Every call is a synchronous, read-only
+    ``TrialDayLatch.is_family_halted()`` under the SAME flock
+    ``trial_day_latch`` already holds -- never a fresh open, never an await.
+
+    INTEGRATION COMPLETE: ``PolymarketUSExecClientConfig.submit_veto``
+    (``adapters/polymarket_us/config.py``) carries this callable through
+    ``adapters/polymarket_us/factories.py`` (``config.submit_veto``) and
+    ``runtime.node_config.build_trade_node_config`` (a ``submit_veto``
+    parameter, forwarded the same way ``submit_intent_latch`` already was)
+    into ``runtime.trade_cli.run``, which accepts its own ``submit_veto``
+    parameter and threads it to the exec client config. ``app/trade.py::run``
+    is the one caller that builds the callable -- via
+    ``family_halt_submit_veto(family_halt_latch)`` at its v3 composition call
+    site, where ``family_halt_latch`` is a ``TrialDayLatch`` opened directly
+    against the process's already-opened intent latch -- and passes it to
+    ``trade_cli.run(submit_veto=submit_veto, ...)``. Live end-to-end proof:
+    ``tests/unit/test_current_rung_hold_ambiguous_resolver.py::
+    test_a_family_halt_veto_denies_wait_class_and_spends_zero_permit_slots``.
+    """
+
+    def _veto() -> str | None:
+        return "family_halt" if trial_day_latch.is_family_halted() else None
+
+    return _veto
+
+
 def phase0_family_permits(
     *,
     current_rung_hold: bool,
@@ -179,6 +217,43 @@ def phase0_family_permits(
     # Phase 0: v3 never holds a permit.
     v3_permit: OrderSubmissionPermit | None = None
     return v2_permit, v3_permit
+
+
+def phase1_family_permits(
+    *,
+    current_rung_hold: bool,
+    continuous_rung_hold: bool,
+    permit: OrderSubmissionPermit | None,
+    phase0_shadow: bool = False,
+) -> tuple[OrderSubmissionPermit | None, OrderSubmissionPermit | None]:
+    """Phase 1 permit assignment: exactly one sending family per run.
+
+    Unlike :func:`phase0_family_permits` (kept, unchanged, for the Phase 0
+    shadow composition), v3 (``continuous_rung_hold``) MAY hold the permit
+    here -- whichever single family is on receives it. Both families on
+    together is refused (``SettingsError``) UNLESS ``phase0_shadow`` is
+    True, mirroring ``runtime.settings.load_trade_settings``'s own
+    load-time exclusivity check as defense in depth -- a caller that
+    bypasses settings validation (a test, a future call site) still cannot
+    mint two sending families through this function. Under
+    ``phase0_shadow``, behaviour matches ``phase0_family_permits`` exactly:
+    v2 may hold the permit, v3 never does. Neither family on returns
+    ``(None, None)``.
+    """
+    if current_rung_hold and continuous_rung_hold and not phase0_shadow:
+        raise SettingsError(
+            "phase1_family_permits: current_rung_hold and continuous_rung_hold "
+            "together requires phase0_shadow=True; Phase 1 sends orders from "
+            "exactly one family"
+        )
+    if phase0_shadow:
+        v2_permit = permit if current_rung_hold else None
+        return v2_permit, None
+    if continuous_rung_hold:
+        return None, permit
+    if current_rung_hold:
+        return permit, None
+    return None, None
 
 
 def _facts_from_instrument(instrument: object) -> tuple[str, dt.date, Measure] | None:
@@ -348,15 +423,23 @@ def build_continuous_rung_hold_strategies(
     trial_day_latch_factory: Callable[[], AbstractContextManager[TrialDayLatch]],
     order_submission_permit: OrderSubmissionPermit | None = None,
     offer_tape_path: Path | None = None,
+    phase0_permit_guard: bool = True,
 ) -> tuple[ContinuousRungHoldStrategy, ...]:
     """One continuous-rung-hold strategy per supported station with instruments.
 
     Distinct ``strategy_id`` prefix so ``Trader.add_strategy`` uniqueness
-    checks pass beside v2. Phase 0 callers pass ``order_submission_permit=None``;
-    a non-None permit is refused here, before any instrument resolution or
-    strategy construction.
+    checks pass beside v2. ``phase0_permit_guard`` mirrors
+    ``ContinuousRungHoldStrategy.__init__``'s own parameter exactly (and is
+    forwarded to it, unchanged, for every station): ``True`` (default) keeps
+    the Phase 0 seal -- a non-None ``order_submission_permit`` is refused
+    HERE, before any instrument resolution or strategy construction, rather
+    than only inside the first station's constructor. ``False`` is the
+    Phase 1, continuous-only (no-shadow) opt-in a composition root passes
+    when ``phase1_family_permits`` has genuinely routed the single sending
+    family's permit to v3 -- see ``app/trade.py::run``, the only caller that
+    ever passes ``False``.
     """
-    if order_submission_permit is not None:
+    if phase0_permit_guard and order_submission_permit is not None:
         raise Phase0PermitForbiddenError(
             "build_continuous_rung_hold_strategies: Phase 0 forbids a non-None "
             "order_submission_permit"
@@ -391,6 +474,7 @@ def build_continuous_rung_hold_strategies(
                 trial_day_latch_factory=trial_day_latch_factory,
                 order_submission_permit=order_submission_permit,
                 offer_tape=tape,
+                phase0_permit_guard=phase0_permit_guard,
             )
         )
     return tuple(strategies)

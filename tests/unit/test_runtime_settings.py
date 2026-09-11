@@ -20,6 +20,7 @@ from breezy.adapters.polymarket_us.operator_controls import (
 from breezy.registry.sites import default_registry
 from breezy.runtime.settings import (
     CONTINUOUS_RUNG_HOLD_VAR,
+    CRH_CONT_PHASE0_SHADOW_VAR,
     CURRENT_RUNG_HOLD_VAR,
     LIVE_OBSERVATIONS_VAR,
     ORDERS_ENABLED_VAR,
@@ -777,6 +778,53 @@ def test_continuous_rung_hold_without_live_observations_is_a_settings_error() ->
 
 
 # ---------------------------------------------------------------------------
+# Phase 1 -- exactly one sending family; BREEZY_CRH_CONT_PHASE0_SHADOW is the
+# build-side escape hatch that restores the Phase 0 composition (both
+# families built together; only current_rung_hold may ever hold the permit).
+# ---------------------------------------------------------------------------
+
+_BOTH_FAMILIES_ENV = {
+    **_TRADE_ONLY_ENV,
+    CURRENT_RUNG_HOLD_VAR: "1",
+    CONTINUOUS_RUNG_HOLD_VAR: "1",
+    LIVE_OBSERVATIONS_VAR: "1",
+    TRADE_CATALOG_ROOT_VAR: "/tmp/breezy-trade-catalog",
+}
+
+
+def test_phase0_shadow_flag_is_exact_one() -> None:
+    absent = load_trade_settings(_TRADE_ONLY_ENV).phase0_shadow
+    zero = load_trade_settings(
+        {**_TRADE_ONLY_ENV, CRH_CONT_PHASE0_SHADOW_VAR: "0"}
+    ).phase0_shadow
+    true_word = load_trade_settings(
+        {**_TRADE_ONLY_ENV, CRH_CONT_PHASE0_SHADOW_VAR: "true"}
+    ).phase0_shadow
+    one = load_trade_settings(
+        {**_TRADE_ONLY_ENV, CRH_CONT_PHASE0_SHADOW_VAR: "1"}
+    ).phase0_shadow
+    assert (absent, zero, true_word, one) == (False, False, False, True)
+
+
+def test_current_and_continuous_together_without_shadow_is_a_settings_error() -> None:
+    """Phase 1 sends orders from exactly one family: both flags together is
+    refused at load time (exit 2) unless the shadow escape hatch is set."""
+    with pytest.raises(SettingsError) as excinfo:
+        load_trade_settings(_BOTH_FAMILIES_ENV)
+    message = str(excinfo.value)
+    assert CURRENT_RUNG_HOLD_VAR in message
+    assert CONTINUOUS_RUNG_HOLD_VAR in message
+    assert CRH_CONT_PHASE0_SHADOW_VAR in message
+
+
+def test_current_and_continuous_together_with_shadow_flag_is_accepted() -> None:
+    settings = load_trade_settings({**_BOTH_FAMILIES_ENV, CRH_CONT_PHASE0_SHADOW_VAR: "1"})
+    assert settings.current_rung_hold is True
+    assert settings.continuous_rung_hold is True
+    assert settings.phase0_shadow is True
+
+
+# ---------------------------------------------------------------------------
 # A1 -- BREEZY_ORDERS_ENABLED (single parse; converged review item 7)
 # ---------------------------------------------------------------------------
 
@@ -851,14 +899,13 @@ def test_orders_enabled_with_both_siblings_set_is_accepted() -> None:
 
 
 # ---------------------------------------------------------------------------
-# Phase 0 seal: BREEZY_ORDERS_ENABLED=1 must fail closed at settings-load
-# time for continuous_rung_hold (v3) -- order_enablement.py's own
-# RungHoldNotReadyError gate requires current_rung_hold specifically
-# (`issue()`'s `settings.current_rung_hold is not True` check), so a
-# settings-level acceptance of continuous_rung_hold as an equally-valid
-# sibling was a genuine gap: the request would parse here, then be refused
-# downstream by `issue()` -- a FATAL exit 1 (`app/trade.py::main`'s
-# `OrderSubmissionRefused` branch) instead of a settings-load exit 2.
+# Phase 1: BREEZY_ORDERS_ENABLED=1 accepts EITHER family alone (plus
+# live_observations) -- order_enablement.issue() was widened to match
+# (settings.current_rung_hold OR settings.continuous_rung_hold), so
+# continuous_rung_hold-only is no longer refused here at settings-load time.
+# Both families together still requires the Phase 0 shadow escape hatch
+# (tested above); that combination is accepted here for BREEZY_ORDERS_ENABLED
+# purposes exactly when the shadow flag is set.
 # ---------------------------------------------------------------------------
 
 _CONT_SIBLINGS_ENV = {
@@ -869,31 +916,32 @@ _CONT_SIBLINGS_ENV = {
 }
 
 
-def test_orders_enabled_with_continuous_rung_hold_only_is_a_settings_error() -> None:
-    with pytest.raises(SettingsError) as excinfo:
-        load_trade_settings({**_CONT_SIBLINGS_ENV, ORDERS_ENABLED_VAR: "1"})
-    message = str(excinfo.value)
-    assert ORDERS_ENABLED_VAR in message
-    assert CURRENT_RUNG_HOLD_VAR in message
+def test_orders_enabled_with_continuous_rung_hold_only_is_accepted() -> None:
+    settings = load_trade_settings({**_CONT_SIBLINGS_ENV, ORDERS_ENABLED_VAR: "1"})
+    assert settings.orders_enabled_requested is True
+    assert settings.current_rung_hold is False
+    assert settings.continuous_rung_hold is True
 
 
 @pytest.mark.parametrize(
-    ("current", "continuous", "expect_ok"),
+    ("current", "continuous", "shadow", "expect_ok"),
     [
-        (False, False, False),
-        (True, False, True),
-        (False, True, False),
-        (True, True, True),
+        (False, False, False, False),
+        (True, False, False, True),
+        (False, True, False, True),
+        (True, True, False, False),
+        (True, True, True, True),
     ],
 )
 def test_orders_enabled_family_precondition_matches_the_issue_gate(
-    current: bool, continuous: bool, expect_ok: bool
+    current: bool, continuous: bool, shadow: bool, expect_ok: bool
 ) -> None:
-    """The settings-load-time family precondition for
-    ``BREEZY_ORDERS_ENABLED=1`` must accept exactly the (current,
-    continuous) combinations ``OrderSubmissionPermit.issue()`` itself would
-    accept -- i.e. ``current_rung_hold is True``, regardless of
-    ``continuous_rung_hold``. ``issue()`` itself is unchanged."""
+    """Phase 1: the settings-load-time family precondition for
+    ``BREEZY_ORDERS_ENABLED=1`` accepts exactly the (current, continuous,
+    shadow) combinations ``phase1_family_permits``/``OrderSubmissionPermit.
+    issue()`` themselves would accept -- EITHER family alone, or both
+    together only under the shadow escape hatch. Neither family on is
+    always refused."""
     env: dict[str, str] = {
         **_TRADE_ONLY_ENV,
         LIVE_OBSERVATIONS_VAR: "1",
@@ -904,6 +952,8 @@ def test_orders_enabled_family_precondition_matches_the_issue_gate(
         env[CURRENT_RUNG_HOLD_VAR] = "1"
     if continuous:
         env[CONTINUOUS_RUNG_HOLD_VAR] = "1"
+    if shadow:
+        env[CRH_CONT_PHASE0_SHADOW_VAR] = "1"
 
     if expect_ok:
         settings = load_trade_settings(env)

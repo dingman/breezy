@@ -231,7 +231,7 @@ from __future__ import annotations
 import asyncio
 import json
 import threading
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from decimal import Decimal, InvalidOperation
 from typing import TYPE_CHECKING, Any, Final, Protocol, Self
@@ -291,6 +291,8 @@ from breezy.adapters.polymarket_us.parsing import _to_decimal
 from breezy.adapters.polymarket_us.safety import (
     LiveTradingPermissionError,
     assert_live_order_submission_permitted,
+    restore_live_trading_budget,
+    unrestore_live_trading_budget,
 )
 from breezy.adapters.polymarket_us.symbology import instrument_id_to_slug, slug_to_instrument_id
 from breezy.ingest.gate import assert_state_store_durable
@@ -324,14 +326,18 @@ if TYPE_CHECKING:  # pragma: no cover - typing only
     from breezy.ingest.gate import ClosableStateStore, StateStoreOpener
 
 __all__ = [
+    "BUDGET_RESTORE_KEY_PREFIX",
     "FILL_INDEX_KEY_PREFIX",
     "FILL_KEY_PREFIX",
     "RESOLVER_CONTEXT_KEY_PREFIX",
+    "STARTUP_EVIDENCE_KEY",
     "VENUE_ORDER_ID_KEY_PREFIX",
     "AmbiguousResolverContext",
     "DurableFillRecord",
     "PolymarketUSExecutionClient",
     "PrivateRead",
+    "StartupPositionEvidence",
+    "StartupPositionSnapshot",
 ]
 
 #: The venue-scoped namespace every durable key here sits under. A second
@@ -357,6 +363,19 @@ FILL_INDEX_KEY_PREFIX: Final[str] = f"{STATE_KEY_NAMESPACE}fill_index/"
 #: observe it. Each `intent_id` is a fresh UUID4 hex (`SubmitIntentLatch.
 #: arm`), so an old key is never overwritten or collided with.
 RESOLVER_CONTEXT_KEY_PREFIX: Final[str] = f"{STATE_KEY_NAMESPACE}resolver/"
+
+#: C1 (plan rev 6.1): the strategy's never-arm/re-arm gate reads this key at
+#: `on_start` and after every resolver terminal-zero resolution
+#: (`read_startup_position_evidence`). Overwritten on EVERY write -- there is
+#: exactly one row, the most recent evidence, never a history.
+STARTUP_EVIDENCE_KEY: Final[str] = f"{STATE_KEY_NAMESPACE}startup_evidence"
+
+#: D1/D2 (plan rev 6.1): durable, per-venue-order-id marker that a permit
+#: slot was restored for it -- written by the CALLER (this client), never by
+#: `safety.py`, which stores nothing of its own. Lets a LATER pass that
+#: observes a genuine fill for the same id `unrestore` exactly what was
+#: given back.
+BUDGET_RESTORE_KEY_PREFIX: Final[str] = f"{STATE_KEY_NAMESPACE}budget_restore/"
 
 #: How often `_resolve_ambiguous_intents` checks for a durable resolver
 #: context on the currently-OPEN submit intent. Build-side; revisable.
@@ -630,6 +649,106 @@ class AmbiguousResolverContext:
             ) from None
 
 
+@dataclass(frozen=True, slots=True)
+class StartupPositionSnapshot:
+    """One venue slug's net position, as recorded in :class:`StartupPositionEvidence`.
+
+    Item 2 (slice 4 review, CRITICAL, shared with the strategy seam):
+    ``net_position`` is ``None`` when the venue's own entry for ``slug`` was
+    missing or malformed -- UNKNOWN, never a synonym for flat. EVERY slug the
+    page named is recorded, dropped or not: the latch treats an ABSENT slug
+    as a confirmed-flat zero, so silently omitting a slug this page could not
+    parse would let a real LONG be armed over.
+    """
+
+    slug: str
+    net_position: str | None
+
+
+@dataclass(frozen=True, slots=True)
+class StartupPositionEvidence:
+    """C1 (plan rev 6.1): durable startup/re-arm evidence for the strategy's
+    never-arm gate, read via
+    :meth:`PolymarketUSExecutionClient.read_startup_position_evidence`.
+
+    Written at the END of ``_connect`` (after reconciliation and this
+    client's own positions read) and rewritten after every resolver
+    terminal-zero resolution, so the gate is never reading a boot-time
+    snapshot. Every flag must be exactly ``True`` -- and
+    ``position_read_refused`` exactly ``False`` -- for the gate to treat the
+    book as known; an EMPTY ``positions`` without ``eof_complete`` is
+    UNKNOWN, never "flat".
+    """
+
+    ts_ns: int
+    eof_complete: bool
+    position_read_refused: bool
+    fill_walk_complete: bool
+    positions: tuple[StartupPositionSnapshot, ...]
+
+    def to_bytes(self) -> bytes:
+        return json.dumps(
+            {
+                "v": 1,
+                "ts_ns": self.ts_ns,
+                "eof_complete": self.eof_complete,
+                "position_read_refused": self.position_read_refused,
+                "fill_walk_complete": self.fill_walk_complete,
+                "positions": [
+                    {"slug": p.slug, "net_position": p.net_position} for p in self.positions
+                ],
+            },
+            sort_keys=True,
+        ).encode("utf-8")
+
+    @classmethod
+    def from_bytes(cls, raw: bytes) -> Self:
+        try:
+            payload = json.loads(raw)
+        except ValueError as exc:
+            raise ExecutionReportMappingError(
+                f"startup position evidence is not valid JSON ({len(raw)} bytes): {exc}"
+            ) from None
+        if not isinstance(payload, dict):
+            raise ExecutionReportMappingError(
+                f"startup position evidence decoded to a {type(payload).__name__}, not an object"
+            )
+        try:
+            if int(payload["v"]) != 1:
+                raise ExecutionReportMappingError(
+                    f"startup position evidence has an unknown schema version {payload['v']!r}"
+                )
+            raw_positions = payload["positions"]
+            if not isinstance(raw_positions, list):
+                raise ExecutionReportMappingError(
+                    "startup position evidence 'positions' is not a list"
+                )
+            snapshots = tuple(
+                StartupPositionSnapshot(
+                    slug=str(entry["slug"]),
+                    net_position=(
+                        None if entry["net_position"] is None else str(entry["net_position"])
+                    ),
+                )
+                for entry in raw_positions
+            )
+            return cls(
+                ts_ns=int(payload["ts_ns"]),
+                eof_complete=_require_bool(payload["eof_complete"], field="eof_complete"),
+                position_read_refused=_require_bool(
+                    payload["position_read_refused"], field="position_read_refused"
+                ),
+                fill_walk_complete=_require_bool(
+                    payload["fill_walk_complete"], field="fill_walk_complete"
+                ),
+                positions=snapshots,
+            )
+        except (KeyError, TypeError, ValueError) as exc:
+            raise ExecutionReportMappingError(
+                f"startup position evidence is malformed: {type(exc).__name__}: {exc}"
+            ) from None
+
+
 #: Resolution C/D (plan rev 6.1), widened by the partial-fill review: the
 #: native statuses a GET-resolved ``OrderStatusReport`` can carry when it is
 #: TERMINAL -- the exact analogue of
@@ -719,6 +838,7 @@ class PolymarketUSExecutionClient(LiveExecutionClient):
         credentials: Any = None,
         api_base_url: str = "",
         retirement_reasons: Any = None,
+        submit_veto: Callable[[], str | None] | None = None,
     ) -> None:
         """Build the client. Every input is checked here, not at first use.
 
@@ -800,6 +920,11 @@ class PolymarketUSExecutionClient(LiveExecutionClient):
         self._credentials = credentials
         self._api_base_url = api_base_url
         self._retirement_reasons = retirement_reasons
+        # Item 4 (slice 4 review): the family-halt chokepoint veto, injected
+        # exactly the way the submit-intent latch is -- a plain callable this
+        # adapters-layer module never imports the type of. `None` -> no veto,
+        # matching every composition root that predates this parameter.
+        self._submit_veto = submit_veto
         self._intent_reconciled: bool = False
         # Resolution A/E (plan rev 6.1): the live `SpendBooking` for a
         # with-id AMBIGUOUS intent, held ONLY for same-process true-up.
@@ -815,6 +940,14 @@ class PolymarketUSExecutionClient(LiveExecutionClient):
         #: Review fix 3 (Slice 2): a corrupt singleton is logged at ERROR
         #: ONCE, not every poll interval for the process lifetime.
         self._resolver_corrupt_logged = False
+        # Item 1 (slice 4 review): a resolver action raising must never kill
+        # the polling task for the process lifetime. The counter increments
+        # on EVERY caught failure (so "no intents" and "resolver dead" are
+        # distinguishable); the log is deduped per intent id so a still-open
+        # intent that fails every poll does not spam the log at the poll
+        # interval.
+        self._resolver_error_count: int = 0
+        self._resolver_errored_intent_ids: set[str] = set()
 
     # -- observable state ---------------------------------------------------
 
@@ -832,6 +965,14 @@ class PolymarketUSExecutionClient(LiveExecutionClient):
         this property reads reason strings, and none of them move.
         """
         return tuple(refusal.reason for refusal in self._trading_refusals)
+
+    @property
+    def resolver_error_count(self) -> int:
+        """Item 1 (slice 4 review): total resolver-action failures caught so
+        far, for the health surface. Distinguishes "no AMBIGUOUS intents to
+        resolve" (stays 0) from "the resolver keeps failing" (climbs) -- the
+        polling task itself never dies either way."""
+        return self._resolver_error_count
 
     @property
     def settled_positions(self) -> tuple[InstrumentId, ...]:
@@ -911,6 +1052,13 @@ class PolymarketUSExecutionClient(LiveExecutionClient):
             await self._publish_account_state()
             await self._confirm_account_registered()
             self._reconcile_submit_intent()
+            # C1 (plan rev 6.1): the strategy's never-arm gate needs FRESH
+            # startup evidence, taken AFTER reconciliation -- last, not
+            # first, so a position opened or closed by whatever reconcile
+            # observed is reflected in it. Never raises: a read failure is
+            # RECORDED as refused, never propagated (see the method's own
+            # docstring for why).
+            await self._refresh_startup_position_evidence()
         except BaseException as exc:
             reason = (
                 f"_connect failed before the client reached a connected "
@@ -1139,9 +1287,23 @@ class PolymarketUSExecutionClient(LiveExecutionClient):
             self._resolved_by_get_ts_ns[current.intent_id] = now_ns
 
             if is_terminal_zero and long_state is False:
-                self._resolve_terminal_zero(context, now_ns)
+                # Item 1 (slice 4 review): `restore_live_trading_budget` can
+                # raise `LiveTradingPermissionError` and `_retire` can raise
+                # `SubmitIntentMismatch` (ARCH M2) -- unlike the GET/positions
+                # reads above, nothing here awaited, so an unwrapped raise
+                # would kill this coroutine for the process lifetime. Caught,
+                # counted, and logged; the NEXT poll still runs.
+                try:
+                    self._resolve_terminal_zero(context, now_ns, positions)
+                except Exception as exc:  # noqa: BLE001 - see the comment above
+                    self._note_resolver_error(context.intent_id, exc)
+                    continue
             elif is_fill and long_state is True:
-                self._resolve_accept_fill(context, report, instrument, now_ns)
+                try:
+                    self._resolve_accept_fill(context, report, instrument, now_ns)
+                except Exception as exc:  # noqa: BLE001 - see the comment above
+                    self._note_resolver_error(context.intent_id, exc)
+                    continue
             else:
                 self._log.warning(
                     "resolver: GET evidence and the positions read disagree "
@@ -1151,7 +1313,10 @@ class PolymarketUSExecutionClient(LiveExecutionClient):
                 )
 
     def _resolve_terminal_zero(
-        self, context: AmbiguousResolverContext, now_ns: int,
+        self,
+        context: AmbiguousResolverContext,
+        now_ns: int,
+        positions: Mapping[str, Any] | None = None,
     ) -> None:
         """Resolution D: GET-confirmed terminal, zero-filled, no LONG.
 
@@ -1169,6 +1334,14 @@ class PolymarketUSExecutionClient(LiveExecutionClient):
         ``self._resolved_by_get_ts_ns`` by a terminal GET made in THIS run.
         A durable resolver context can schedule a GET; it can never by
         itself authorize a retirement.
+
+        D1/D2 (plan rev 6.1): ONLY after ``retire`` succeeds, give back the
+        one permit slot this no-fill IOC never actually spent. ``positions``
+        is the SAME eof-complete page ``_resolve_ambiguous_intents`` already
+        read this pass -- ``None`` only when a test calls this method
+        directly (:func:`test_resolve_terminal_zero_itself_refuses_to_retire_
+        without_a_this_run_get`), in which case the startup-evidence rewrite
+        is skipped rather than fabricated from nothing.
         """
         if context.intent_id not in self._resolved_by_get_ts_ns:
             self._log.error(
@@ -1188,6 +1361,19 @@ class PolymarketUSExecutionClient(LiveExecutionClient):
             # with the process and this dict is empty -- the reminted
             # budget already starts whole, so there is nothing to true up.
             self._ledger.true_up_booking(booking, filled_cost_usd=submit_chain.ZERO, now_ns=now_ns)
+        if self._permit is not None and restore_live_trading_budget(
+            permit=self._permit,
+            venue_order_id=context.venue_order_id,
+            order_notional_usd=context.notional_usd,
+        ):
+            self._mark_budget_restored(context.venue_order_id)
+        if positions is not None:
+            self._write_startup_position_evidence(
+                now_ns=now_ns,
+                eof_complete=True,
+                position_read_refused=False,
+                raw_positions=positions,
+            )
         self.generate_order_canceled(
             strategy_id=StrategyId(context.strategy_id),
             instrument_id=InstrumentId.from_str(context.instrument_id),
@@ -1279,6 +1465,17 @@ class PolymarketUSExecutionClient(LiveExecutionClient):
         if booking is not None:
             self._ledger.true_up_booking(booking, filled_cost_usd=cumulative_cost, now_ns=now_ns)
         self._retire(context.intent_id, "STATUS_REPORT_ACCEPT_FILL_TERMINAL", now_ns)
+        # D2 (plan rev 6.1): a genuine fill surfacing for a venue order this
+        # resolver already restored a permit slot for (a superseded
+        # terminal-zero determination) must give that slot back. Never fires
+        # on the ordinary path -- `_resolve_terminal_zero` retires the
+        # singleton, so a later pass for the same intent never reaches here.
+        if self._permit is not None and self._budget_was_restored(context.venue_order_id):
+            unrestore_live_trading_budget(
+                permit=self._permit,
+                venue_order_id=context.venue_order_id,
+                order_notional_usd=context.notional_usd,
+            )
         self.generate_order_filled(
             strategy_id=StrategyId(context.strategy_id),
             instrument_id=InstrumentId.from_str(context.instrument_id),
@@ -2008,6 +2205,144 @@ class PolymarketUSExecutionClient(LiveExecutionClient):
             )
         return store
 
+    # -----------------------------------------------------------------------
+    # C1/C2/D2 (plan rev 6.1): startup/re-arm position evidence, and the
+    # durable budget-restore marker.
+    # -----------------------------------------------------------------------
+
+    def read_startup_position_evidence(self) -> StartupPositionEvidence | None:
+        """The most recently written :class:`StartupPositionEvidence`, or
+        ``None`` if `_connect` has never completed once in this store."""
+        raw = self._store_get(STARTUP_EVIDENCE_KEY)
+        if raw is None:
+            return None
+        return StartupPositionEvidence.from_bytes(raw)
+
+    def _fill_walk_complete(self) -> bool:
+        """C2: every known instrument's durable fill index is READABLE.
+
+        ``_read_fill_index`` returns ``[]`` for an absent index (success --
+        no fills yet for that instrument) and ``None`` for a corrupt one
+        (failure). There is no store-wide prefix scan
+        (module docstring, ``sqlite_store.py``), so "every durable fill
+        record" is walked the only way reachable: by instrument, over the
+        native cache's own inventory.
+
+        Item 3 (slice 4 review): an EMPTY enumeration is FAIL CLOSED, not
+        vacuously complete. ``_wait_for_instruments`` already ran earlier in
+        ``_connect``, so a genuinely empty instrument set is not a shape a
+        real CRH trading day ever produces -- it is exactly as suspicious as
+        a corrupt index, and treated the same way.
+        """
+        try:
+            instruments = self._cache.instruments(self.venue)
+        except Exception as exc:  # noqa: BLE001 - enumeration failure marks the walk incomplete
+            self._log.warning(
+                f"startup evidence: fill-walk instrument enumeration failed "
+                f"({type(exc).__name__}: {exc})"
+            )
+            return False
+        if not instruments:
+            self._log.warning(
+                "startup evidence: fill-walk found zero instruments in the "
+                "cache; treating the walk as incomplete rather than vacuously "
+                "complete"
+            )
+            return False
+        for instrument in instruments:
+            if self._read_fill_index(f"{FILL_INDEX_KEY_PREFIX}{instrument.id}") is None:
+                return False
+        return True
+
+    def _write_startup_position_evidence(
+        self,
+        *,
+        now_ns: int,
+        eof_complete: bool,
+        position_read_refused: bool,
+        raw_positions: Mapping[str, Any],
+    ) -> None:
+        """Project an eof-complete (or refused) positions page into
+        :class:`StartupPositionEvidence` and overwrite the single durable row.
+
+        Item 2 (slice 4 review, CRITICAL): EVERY slug the page names is
+        recorded -- never dropped -- with ``net_position=None`` when its
+        entry is missing or not a mapping. The never-arm latch treats an
+        ABSENT slug as a confirmed-flat zero, so dropping a slug this page
+        could not parse would let a real LONG be armed over; ``None`` is
+        UNKNOWN and must fail the gate closed instead.
+        """
+        snapshots: list[StartupPositionSnapshot] = []
+        for slug in sorted(raw_positions):
+            payload = raw_positions[slug]
+            net_position: str | None = None
+            if isinstance(payload, Mapping):
+                net_raw = payload.get("netPosition")
+                if net_raw is not None:
+                    net_position = str(net_raw)
+            snapshots.append(StartupPositionSnapshot(slug=slug, net_position=net_position))
+        evidence = StartupPositionEvidence(
+            ts_ns=now_ns,
+            eof_complete=eof_complete,
+            position_read_refused=position_read_refused,
+            fill_walk_complete=self._fill_walk_complete(),
+            positions=tuple(snapshots),
+        )
+        self._store_set(STARTUP_EVIDENCE_KEY, evidence.to_bytes())
+
+    async def _refresh_startup_position_evidence(self) -> None:
+        """C1: fresh positions read at the END of `_connect`.
+
+        Never raises: a read failure or a non-eof-complete page is RECORDED
+        as refused, not swallowed and not propagated -- the strategy's
+        `on_start` gate is the one place that acts on it.
+        """
+        now_ns = self._clock.timestamp_ns()
+        try:
+            payload = await self._private_read(PORTFOLIO_POSITIONS_PATH)
+            declared = self._declared_positions(payload)
+        except Exception as exc:  # noqa: BLE001 - recorded, never propagated; see docstring
+            self._log.warning(
+                f"startup evidence: positions read failed ({type(exc).__name__}: {exc}); "
+                "recording position_read_refused=True"
+            )
+            self._write_startup_position_evidence(
+                now_ns=now_ns, eof_complete=False, position_read_refused=True, raw_positions={},
+            )
+            return
+        self._write_startup_position_evidence(
+            now_ns=now_ns, eof_complete=True, position_read_refused=False, raw_positions=declared,
+        )
+
+    def _mark_budget_restored(self, venue_order_id: str) -> None:
+        """D2: durable evidence that a permit slot was restored for
+        ``venue_order_id`` -- written by the CALLER; `safety.py` stores
+        nothing of its own (D1)."""
+        self._store_set(f"{BUDGET_RESTORE_KEY_PREFIX}{venue_order_id}", b"1")
+
+    def _budget_was_restored(self, venue_order_id: str) -> bool:
+        return self._store_get(f"{BUDGET_RESTORE_KEY_PREFIX}{venue_order_id}") is not None
+
+    def _note_resolver_error(self, intent_id: str, exc: BaseException) -> None:
+        """Item 1 (slice 4 review): record one caught resolver-action
+        failure without ever raising itself -- the caller's ``continue`` is
+        what keeps the polling task alive.
+
+        The counter increments unconditionally; the ERROR log is deduped per
+        ``intent_id`` so a still-OPEN intent that fails on every single poll
+        (e.g. an unknown permit) logs once, not at the poll interval for the
+        rest of the process's life.
+        """
+        self._resolver_error_count += 1
+        if intent_id in self._resolver_errored_intent_ids:
+            return
+        self._resolver_errored_intent_ids.add(intent_id)
+        self._log.error(
+            f"resolver: acting on intent {intent_id} raised "
+            f"{exc.__class__.__name__}: {exc}; this intent stays AMBIGUOUS and "
+            "the resolver keeps polling"
+        )
+
     # -- commission ---------------------------------------------------------
 
     def calculate_commission(
@@ -2168,6 +2503,19 @@ class PolymarketUSExecutionClient(LiveExecutionClient):
         # refusal: no money, no permit, no `_trading_refusals` entry.
         if self._latch is not None and self._latch.is_latched():
             return self._deny(order, submit_chain.OPEN_INTENT_WAIT_REASON, now_ns)
+        # Item 4 (slice 4 review): the family-halt chokepoint veto -- the
+        # SAME class of race as SAFETY C1 above (an already-created
+        # `_submit_order` task is not reachable by the strategy's own
+        # `_hunt_tick` pre-check), fixed the SAME way: an authoritative
+        # synchronous re-check immediately before the permit spend, with NO
+        # `await` between this line and `assert_live_order_submission_
+        # permitted` below. A non-None reason is a WAIT, not a refusal: no
+        # money, no permit, no `_trading_refusals` entry -- the reason
+        # string the veto returned is carried verbatim on the denial.
+        if self._submit_veto is not None:
+            veto_reason = self._submit_veto()
+            if veto_reason is not None:
+                return self._deny(order, veto_reason, now_ns)
         try:
             assert_live_order_submission_permitted(
                 credentials=self._credentials,

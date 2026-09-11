@@ -20,13 +20,16 @@ from typing import Any
 
 import pytest
 
+from breezy.adapters.polymarket_us.exec.client import FILL_KEY_PREFIX, DurableFillRecord
 from breezy.persistence.family_manifest import FamilyManifest, load_family_manifest
 from breezy.persistence.gs_boundary_artefact import (
     BoundaryArtefact,
     SpendingSpec,
     load_boundary_artefact,
 )
+from breezy.runtime.sqlite_store import SqliteStateStore
 from breezy.settlement.trial_scorer import ScoredTrial
+from breezy.strategy.current_rung_hold.trial_day_latch import TrialDayRecord
 
 _REPO_ROOT = Path(__file__).resolve().parents[2]
 _SCRIPTS_ANALYSIS_DIR = _REPO_ROOT / "scripts" / "analysis"
@@ -1319,6 +1322,131 @@ def test_coverage_section_footer_states_artefact_path_and_counts(
     assert "lines read: 2" in report
     assert "distinct venue_order_ids: 2" in report
     assert "dropped as already-scored: 1" in report
+
+
+# --- Slice 4 item B2 (plan rev 6.1): `residual` additive to the LOSS_STOP gate
+
+
+def test_residual_defaults_to_zero_and_preserves_existing_behaviour(
+    tmp_path: Path, tally_mod: ModuleType
+) -> None:
+    manifest = _manifest(tmp_path)
+    artefact = _synthetic_artefact(i_max=1000.0, n_max=100, look_step=1)
+    rows = (_row(0, held=False, ask="0.10"),)
+    tally = tally_mod.build_family_tally_v2(rows, manifest=manifest, artefact=artefact)
+    assert tally.verdict == "CONTINUE"
+
+
+def test_a_residual_that_pushes_total_below_loss_stop_kills(
+    tmp_path: Path, tally_mod: ModuleType
+) -> None:
+    """The stop-rule fires on `scored_pnl + residual`, not `scored_pnl`
+    alone -- a family with real, unscored dollar losses (duplicate_fill/
+    q != 1/fee-unreconciled fills, Slice 4 item B2) cannot look SURVIVE
+    just because those fills never entered `rows`."""
+    manifest = _manifest(tmp_path)
+    artefact = _synthetic_artefact(i_max=1000.0, n_max=100, look_step=1)
+    rows = (_row(0, held=False, ask="0.10"),)
+    tally = tally_mod.build_family_tally_v2(
+        rows, manifest=manifest, artefact=artefact, residual=Decimal(-60),
+    )
+    assert tally.verdict == "KILL"
+
+
+def test_v3_residual_from_fill_source_derives_a_real_duplicate_fill_dollar_sum(
+    tmp_path: Path, tally_mod: ModuleType,
+) -> None:
+    """Three-seam Slice 4 review item 4 [HIGH]: `compute_residual` had zero
+    production callers -- `v3_residual_from_fill_source` wires it to the
+    SAME `--fill-source` store `count_filled_takes` already reads."""
+    cont_prefix = "continuous_rung_hold/trial/"
+    day = "2026-09-05"
+    fill_source = tmp_path / "exec_state.sqlite"
+    store = SqliteStateStore(fill_source)
+    latch = TrialDayRecord(
+        latched_at_ns=1,
+        instrument_id="lax-instr",
+        ask=Decimal("0.40"),
+        reason="taken",
+        venue_order_id="v1",
+    )
+    store.set(f"{cont_prefix}LAX/{day}", latch.to_bytes())
+    primary = DurableFillRecord(
+        venue_order_id="v1", client_order_id="c-v1", instrument_id="lax-instr",
+        order_side="BUY", cumulative_qty=Decimal(1), cumulative_cost=Decimal("0.40"),
+        cumulative_fee=Decimal("0.01"), fee_reconciled=True, ts_event=1,
+    )
+    duplicate = DurableFillRecord(
+        venue_order_id="v2", client_order_id="c-v2", instrument_id="lax-instr",
+        order_side="BUY", cumulative_qty=Decimal(1), cumulative_cost=Decimal("0.45"),
+        cumulative_fee=Decimal("0.02"), fee_reconciled=True, ts_event=2,
+    )
+    store.set(f"{FILL_KEY_PREFIX}v1", primary.to_bytes())
+    store.set(f"{FILL_KEY_PREFIX}v2", duplicate.to_bytes())
+    store.close()
+
+    manifest = _manifest(tmp_path, trial_id_prefix=cont_prefix, stations=["LAX"])
+
+    residual = tally_mod.v3_residual_from_fill_source(
+        manifest, fill_source, since_climate_day=day,
+    )
+
+    # Negated: a SIGNED contribution to `total_pnl`, always <= 0.
+    assert residual == -(Decimal("0.45") + Decimal("0.02"))
+
+
+def test_v2_manifest_never_derives_a_residual(tmp_path: Path, tally_mod: ModuleType) -> None:
+    """Three-seam Slice 4 review item 4: v2 path unchanged -- `main()`'s
+    prefix guard means `residual` stays `Decimal(0)` for a v2 manifest,
+    regardless of what a `--fill-source` store might contain."""
+    manifest = _manifest(tmp_path)  # default v2 trial_id_prefix
+    assert not manifest.trial_id_prefix.startswith("continuous_rung_hold/")
+
+
+def test_v3_duplicate_fill_residual_pushes_the_family_tally_to_kill(
+    tmp_path: Path, tally_mod: ModuleType,
+) -> None:
+    """Three-seam Slice 4 review item 4: the residual `v3_residual_from_
+    fill_source` derives from a real duplicate-fill exclusion actually
+    changes the reported tally's LOSS_STOP arithmetic (assert on the
+    verdict, the reported total)."""
+    cont_prefix = "continuous_rung_hold/trial/"
+    day = "2026-09-05"
+    fill_source = tmp_path / "exec_state.sqlite"
+    store = SqliteStateStore(fill_source)
+    latch = TrialDayRecord(
+        latched_at_ns=1, instrument_id="lax-instr", ask=Decimal("0.40"),
+        reason="taken", venue_order_id="v1",
+    )
+    store.set(f"{cont_prefix}LAX/{day}", latch.to_bytes())
+    primary = DurableFillRecord(
+        venue_order_id="v1", client_order_id="c-v1", instrument_id="lax-instr",
+        order_side="BUY", cumulative_qty=Decimal(1), cumulative_cost=Decimal("0.40"),
+        cumulative_fee=Decimal("0.01"), fee_reconciled=True, ts_event=1,
+    )
+    duplicate = DurableFillRecord(
+        venue_order_id="v2", client_order_id="c-v2", instrument_id="lax-instr",
+        order_side="BUY", cumulative_qty=Decimal(200), cumulative_cost=Decimal(100),
+        cumulative_fee=Decimal(10), fee_reconciled=True, ts_event=2,
+    )
+    store.set(f"{FILL_KEY_PREFIX}v1", primary.to_bytes())
+    store.set(f"{FILL_KEY_PREFIX}v2", duplicate.to_bytes())
+    store.close()
+
+    manifest = _manifest(tmp_path, trial_id_prefix=cont_prefix, stations=["LAX"])
+    residual = tally_mod.v3_residual_from_fill_source(
+        manifest, fill_source, since_climate_day=day,
+    )
+    # -(qty=200 * (fill_px=0.5 + fee=0.05)) = -110 -- crosses LOSS_STOP alone.
+    assert residual == -(Decimal(200) * (Decimal("0.5") + Decimal("0.05")))
+    assert residual < Decimal(-60)
+
+    artefact = _synthetic_artefact(i_max=1000.0, n_max=100, look_step=1)
+    rows = (_row(0, held=True, station="LAX", prefix=cont_prefix),)  # a single WINNING trial
+    tally = tally_mod.build_family_tally_v2(
+        rows, manifest=manifest, artefact=artefact, residual=residual,
+    )
+    assert tally.verdict == "KILL"
 
 
 # --- structural-dead pin (pm_us_crh_v2, additive KILL at n < look_step) ------

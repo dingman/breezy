@@ -17,7 +17,7 @@ import datetime as dt
 import logging
 import os
 import sys
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from contextlib import ExitStack
 from pathlib import Path
 from typing import Final, TextIO
@@ -42,12 +42,17 @@ from breezy.runtime.trade_cli import EXIT_CONFIG_ERROR, EXIT_RUNTIME_ERROR, Node
 from breezy.strategy.current_rung_hold.composition import (
     build_continuous_rung_hold_strategies,
     build_current_rung_hold_strategies,
+    family_halt_submit_veto,
     install_current_rung_hold_refusal_watch,
     make_trial_day_latch_factory,
-    phase0_family_permits,
+    phase1_family_permits,
 )
 from breezy.strategy.current_rung_hold.config import SUPPORTED_STATIONS
-from breezy.strategy.current_rung_hold.trial_day_latch import CONTINUOUS_TRIAL_KEY_PREFIX
+from breezy.strategy.current_rung_hold.continuous_strategy import Phase0PermitForbiddenError
+from breezy.strategy.current_rung_hold.trial_day_latch import (
+    CONTINUOUS_TRIAL_KEY_PREFIX,
+    open_trial_day_latch,
+)
 
 _VENUE = "polymarket_us"
 
@@ -181,12 +186,14 @@ def run(
         with ExitStack() as stack:
             store = stack.enter_context(SqliteStateStore(store_path))
             latch = stack.enter_context(open_submit_intent_latch(store, store_path))
-            v2_permit, v3_permit = phase0_family_permits(
+            v2_permit, v3_permit = phase1_family_permits(
                 current_rung_hold=settings.current_rung_hold,
                 continuous_rung_hold=settings.continuous_rung_hold,
                 permit=order_submission_permit,
+                phase0_shadow=settings.phase0_shadow,
             )
             strategies: list[Strategy] = []
+            submit_veto: Callable[[], str | None] | None = None
             if settings.current_rung_hold:
                 factory = make_trial_day_latch_factory(latch)
                 strategies.extend(
@@ -201,12 +208,34 @@ def run(
                 cont_factory = make_trial_day_latch_factory(
                     latch, key_prefix=CONTINUOUS_TRIAL_KEY_PREFIX,
                 )
+                # Item 4 (slice 4 review): the exec client's `_submit_order`
+                # consults an injected `submit_veto: Callable[[], str |
+                # None]` kwarg (`adapters/polymarket_us/exec/client.py`),
+                # evaluated synchronously immediately before the permit
+                # spend. `family_halt_submit_veto` wraps a `TrialDayLatch`
+                # bound to the SAME shared store/flock `cont_factory` above
+                # binds (`open_trial_day_latch` is a plain constructor over
+                # `latch.shared_state_binding()`, never a second open), so
+                # every veto call is a synchronous, read-only
+                # `is_family_halted()` under the intent latch this process
+                # already holds for its lifetime -- no fresh open, no await.
+                family_halt_latch = open_trial_day_latch(
+                    latch, key_prefix=CONTINUOUS_TRIAL_KEY_PREFIX,
+                )
+                submit_veto = family_halt_submit_veto(family_halt_latch)
                 strategies.extend(
                     build_continuous_rung_hold_strategies(
                         catalog_root=catalog_root,
                         today_by_station=today_by_station,
                         trial_day_latch_factory=cont_factory,
                         order_submission_permit=v3_permit,
+                        # phase1_family_permits routes a non-None v3_permit
+                        # ONLY for the continuous-only, no-shadow case (a
+                        # settings-level guarantee -- see its docstring and
+                        # test_phase1_family_permits_all_combos_with_a_real_
+                        # permit), so lifting the guard is exactly and only
+                        # conditioned on that permit being present.
+                        phase0_permit_guard=v3_permit is None,
                     )
                 )
             composed = tuple(strategies)
@@ -220,8 +249,25 @@ def run(
                 live_trading_permit=live_trading_permit,
                 settings=settings,
                 exec_client_config=exec_client_config,
+                submit_veto=submit_veto,
             )
-    except (SettingsError, OSError, SubmitIntentLockHeld, SubmitIntentLockError) as exc:
+    except (
+        SettingsError,
+        OSError,
+        SubmitIntentLockHeld,
+        SubmitIntentLockError,
+        # Defense in depth, not the intended path: `phase0_permit_guard=
+        # (v3_permit is None)` above makes this unreachable when
+        # `phase1_family_permits`'s own invariant holds (a non-None
+        # `v3_permit` implies continuous-only, no-shadow). Kept as a
+        # fail-closed net for a future mis-wiring -- e.g. a call site that
+        # passes a real permit through `build_continuous_rung_hold_strategies`
+        # without also flipping `phase0_permit_guard`, or a change to
+        # `phase1_family_permits` that stops guaranteeing that pairing --
+        # so such a bug degrades to a clean, logged configuration error
+        # rather than an unhandled crash in a live-trading process.
+        Phase0PermitForbiddenError,
+    ) as exc:
         _report(out, "configuration error", exc, expected=True)
         return EXIT_CONFIG_ERROR
 

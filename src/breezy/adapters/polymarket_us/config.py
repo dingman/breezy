@@ -37,6 +37,7 @@ Breezy policy rather than venue truth.
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from pathlib import Path
 from urllib.parse import urlsplit
 
@@ -540,6 +541,14 @@ class PolymarketUSExecClientConfig(LiveExecClientConfig, frozen=True):
         ``open_submit_intent_latch``.
     instrument_wait_timeout_s, account_registration_timeout_s : float
         Forwarded verbatim to :class:`PolymarketUSExecutionClient`.
+    submit_veto : Callable[[], str | None] | None
+        Item 4 (slice 4 review): the family-halt chokepoint veto, injected
+        the SAME way ``submit_intent_latch`` is -- a plain callable this
+        module needs no strategy/runtime import to type (``Callable`` is
+        stdlib). ``None`` by default: every composition root that predates
+        this parameter is unaffected. The composition root wires the actual
+        closure (e.g. ``lambda: "family_halt" if latch.is_family_halted()
+        else None``); this config only carries it through.
     """
 
     venue: PolymarketUSDataClientConfig | None = None
@@ -551,6 +560,7 @@ class PolymarketUSExecClientConfig(LiveExecClientConfig, frozen=True):
     account_registration_timeout_s: float = 30.0
     live_trading_permit: object | None = None
     retirement_reasons: object | None = None
+    submit_veto: Callable[[], str | None] | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.venue, PolymarketUSDataClientConfig):

@@ -122,7 +122,11 @@ from breezy.settlement.trial_scorer import (
     ScoreRefusal,
     score_trials,
 )
-from breezy.strategy.current_rung_hold.trial_day_latch import TrialDayRecord, TrialDayRecordCorrupt
+from breezy.strategy.current_rung_hold.trial_day_latch import (
+    TAKEN_FROM_FILL_WALK_REASON,
+    TrialDayRecord,
+    TrialDayRecordCorrupt,
+)
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from fill_time_count import _open_readonly  # ONE implementation, reused (I2)
@@ -294,7 +298,12 @@ _MALFORMED_ROW_ERRORS: tuple[type[Exception], ...] = (
 #: venue's cumulative fee could not be reconciled to its legs), and the three
 #: join-integrity reasons the state-DB reader alone can raise --
 #: `"duplicate_fill_for_latch"`, `"no_taken_latch"`, `"ambiguous_latch"`.
-#: Widened, never relaxed (L-12): no member removed or re-spelled.
+#: Widened again (plan rev 6.1, Slice 4 item B2): `"duplicate_fill"` -- the
+#: v3 continuous-rung-hold family's EXPLICIT signal (a genuine SECOND fill on
+#: an already-consumed station-day, `TrialDayLatch.record_duplicate_fill`),
+#: distinct from `"duplicate_fill_for_latch"` (v2's "N fills joined ONE
+#: latch, pick none" heuristic, unchanged). Widened, never relaxed (L-12): no
+#: member removed or re-spelled.
 FillExclusionReason = Literal[
     "partial_fill",
     "multi_fill",
@@ -303,7 +312,20 @@ FillExclusionReason = Literal[
     "duplicate_fill_for_latch",
     "no_taken_latch",
     "ambiguous_latch",
+    "duplicate_fill",
 ]
+
+#: Slice 4 item B2 (plan rev 6.1): the mutually exclusive residual set --
+#: every unscored fill in one of these three buckets contributes
+#: `qty * (fill_px + fee)` to `compute_residual`, first-match-wins,
+#: `"duplicate_fill"` checked before `"partial_fill"`/`"multi_fill"` (q != 1)
+#: before `"fee_unverified"`. `duplicate_fill` is excluded upstream, in
+#: `read_filled_trials_state_db`, before a fill ever reaches `_admit_fill`
+#: -- so a fill can never land in more than one of these three buckets by
+#: construction (PREREG mutual-exclusivity requirement).
+RESIDUAL_EXCLUSION_REASONS: Final[frozenset[FillExclusionReason]] = frozenset(
+    {"duplicate_fill", "partial_fill", "multi_fill", "fee_unverified"}
+)
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
@@ -331,6 +353,12 @@ class FillExclusion:
     detail: str
     venue_order_id: str = ""
     filled_at_ns: int = 0
+    #: Slice 4 item B2 (plan rev 6.1): populated ONLY for a reason in
+    #: `RESIDUAL_EXCLUSION_REASONS` -- `""` (the pre-existing default) for
+    #: every other reason, so every pre-Slice-4 construction site (and every
+    #: pinned test asserting on those) stays byte-identical.
+    fill_px: str = ""
+    fee: str = ""
 
 
 def _validate_qty(trial: FilledTrial) -> ScoreRefusal | None:
@@ -354,16 +382,25 @@ def _admit_fill(
     fee_reconciled: bool = True,
     venue_order_id: str = "",
     tick: Decimal = _TICK,
+    skip_ask_guard: bool = False,
 ) -> FillExclusion | None:
     """Ruling Q1 admission gate, widened by I2 (BLOCK-3/L-25). Assumes
     `trial.qty > 0` (call `_validate_qty` first). Returns `None` when the
     fill is admitted, else the `FillExclusion` to report.
 
     Order: `qty != 1` (ruling Q1) -> `fill_px < entry_ask - tick` (L-25,
-    strict: exactly one tick better is scored) -> `fee_reconciled is False`.
-    `fee_reconciled` and `venue_order_id` default to the JSONL fixture path's
-    behaviour (`True`/`""`); the state-DB path always supplies both real
-    values.
+    strict: exactly one tick better is scored, UNLESS `skip_ask_guard`) ->
+    `fee_reconciled is False`. `fee_reconciled` and `venue_order_id` default
+    to the JSONL fixture path's behaviour (`True`/`""`); the state-DB path
+    always supplies both real values.
+
+    `skip_ask_guard` (three-seam Slice 4 review item 3): `True` only for a
+    v3 trial whose latch `reason` is `TAKEN_FROM_FILL_WALK_REASON` -- the
+    never-arm fill walk has no decision-time ask to compare against (its
+    `entry_ask` is derived from the fill itself, `cumulative_cost /
+    cumulative_qty`), so comparing a fill price to itself would pass the
+    guard VACUOUSLY rather than skip it. The guard is skipped BY REASON,
+    never by an ask value that would make it inert by construction.
     """
     if trial.qty != 1:
         reason: FillExclusionReason = "partial_fill" if trial.qty < 1 else "multi_fill"
@@ -376,8 +413,10 @@ def _admit_fill(
             detail=f"qty {trial.qty} != 1; v1 unit is a 1-contract IOC fill (ruling Q1)",
             venue_order_id=venue_order_id,
             filled_at_ns=trial.filled_at_ns,
+            fill_px=str(trial.fill_px),
+            fee=str(trial.fee),
         )
-    if trial.fill_px < trial.entry_ask - tick:
+    if not skip_ask_guard and trial.fill_px < trial.entry_ask - tick:
         return FillExclusion(
             trial_id=trial.trial_id,
             station=trial.station,
@@ -401,8 +440,29 @@ def _admit_fill(
             detail="the venue's cumulative fee could not be reconciled to its fill-type legs",
             venue_order_id=venue_order_id,
             filled_at_ns=trial.filled_at_ns,
+            fill_px=str(trial.fill_px),
+            fee=str(trial.fee),
         )
     return None
+
+
+def compute_residual(exclusions: Sequence[FillExclusion]) -> Decimal:
+    """Slice 4 item B2 (plan rev 6.1): the residual dollar sum -- every
+    exclusion whose `reason` is in `RESIDUAL_EXCLUSION_REASONS` contributes
+    `qty * (fill_px + fee)`; every other reason (`fill_below_ask`,
+    `duplicate_fill_for_latch`, `no_taken_latch`, `ambiguous_latch`)
+    contributes nothing. An exclusion with an empty `fill_px`/`fee` (every
+    pre-Slice-4 construction site) is skipped, never coerced to `0` -- a
+    missing value is not evidence of a zero dollar cost.
+    """
+    total = Decimal(0)
+    for exclusion in exclusions:
+        if exclusion.reason not in RESIDUAL_EXCLUSION_REASONS:
+            continue
+        if not exclusion.fill_px or not exclusion.fee:
+            continue
+        total += Decimal(exclusion.qty) * (Decimal(exclusion.fill_px) + Decimal(exclusion.fee))
+    return total
 
 
 def read_filled_trials_jsonl(
@@ -483,7 +543,9 @@ def read_filled_trials_state_db(
     cli_location: str,
     since_climate_day: str,
     stations: Sequence[str],
-) -> tuple[tuple[FilledTrial, ...], tuple[FillExclusion, ...], Mapping[str, tuple[bool, str]]]:
+) -> tuple[
+    tuple[FilledTrial, ...], tuple[FillExclusion, ...], Mapping[str, tuple[bool, str, bool]],
+]:
     """Read real fills from the live exec `SqliteStateStore`, joined to each
     trial's `current_rung_hold/trial/{station}/{climate_day}` latch by
     `instrument_id` (I2, `LIVE_FILL_SCORING_CHAIN_2026-09-05.md`).
@@ -538,8 +600,10 @@ def read_filled_trials_state_db(
     never the key's content or the raw bytes.
 
     Returns `(trials, exclusions, fee_reconciled_by_trial_id)`; the third
-    member maps `trial_id -> (fee_reconciled, venue_order_id)` so the caller
-    can pass both into `_admit_fill`. `FilledTrial.scheduled_release_at_ns`
+    member maps `trial_id -> (fee_reconciled, venue_order_id, skip_ask_guard)`
+    (three-seam Slice 4 review item 3: `skip_ask_guard` is `True` only for a
+    `TAKEN_FROM_FILL_WALK_REASON` latch) so the caller can pass all three
+    into `_admit_fill`. `FilledTrial.scheduled_release_at_ns`
     is a placeholder `0` here -- this reader takes no `venue` (the signature
     above is frozen, Stage-0), so the caller resolves the real settlement
     instant via `_with_scheduled_release_at_ns`, the one place `venue` and
@@ -576,7 +640,14 @@ def read_filled_trials_state_db(
     # after `since_climate_day` (ISO-8601 dates sort lexicographically).
     # Each entry also carries the latch's own `station` so a fill can be
     # classified below as this run's city, another city's, or no city's.
-    latches_by_instrument: dict[str, list[tuple[str, str, Decimal, str]]] = {}
+    # Slice 4 item B2 (plan rev 6.1): the tuple's LAST member is the latch's
+    # own `venue_order_id` (`None` for a pre-Slice-4 v2 record, or any
+    # record this family never populates it for) -- read-only, used ONLY by
+    # the v3 (`continuous_rung_hold/`) duplicate-fill split below. The v2
+    # branch never consults it, so a v2 store's behaviour is unaffected.
+    latches_by_instrument: dict[
+        str, list[tuple[str, str, Decimal, str, str | None, str]]
+    ] = {}
     for key, value in rows:
         if not isinstance(key, str) or not key.startswith(family_prefix):
             continue
@@ -595,10 +666,14 @@ def read_filled_trials_state_db(
             raise FillSourceUnreadableError(
                 f"a record under the {family_prefix!r} key prefix could not be decoded"
             ) from exc
-        if record.reason != _TAKEN_REASON:
+        # Three-seam Slice 4 review item 3: a fill-walk-consumed record
+        # (`TAKEN_FROM_FILL_WALK_REASON`) is STILL a genuine filled take --
+        # it must reach scoring, just with the ask guard skipped by reason
+        # (below), never dropped here as if it were a refusal.
+        if record.reason not in (_TAKEN_REASON, TAKEN_FROM_FILL_WALK_REASON):
             continue
         latches_by_instrument.setdefault(record.instrument_id, []).append(
-            (key, climate_day, record.ask, station)
+            (key, climate_day, record.ask, station, record.venue_order_id, record.reason)
         )
 
     fills_by_instrument: dict[str, list[DurableFillRecord]] = {}
@@ -628,7 +703,7 @@ def read_filled_trials_state_db(
 
     trials: list[FilledTrial] = []
     exclusions: list[FillExclusion] = []
-    fee_reconciled_by_trial_id: dict[str, tuple[bool, str]] = {}
+    fee_reconciled_by_trial_id: dict[str, tuple[bool, str, bool]] = {}
 
     for instrument_id, fills in fills_by_instrument.items():
         entries = latches_by_instrument.get(instrument_id, [])
@@ -659,7 +734,8 @@ def read_filled_trials_state_db(
         # "the" trial is exactly what is ambiguous, mirroring
         # `_read_bucket_facts_by_instrument_id`'s first-landed-stands idiom
         # elsewhere in this module.
-        trial_id, climate_day, ask, latch_station = entries[0]
+        trial_id, climate_day, ask, latch_station, latch_venue_order_id, latch_reason = entries[0]
+        skip_ask_guard = latch_reason == TAKEN_FROM_FILL_WALK_REASON
         if len(entries) > 1:
             for fill in fills:
                 exclusions.append(
@@ -686,6 +762,57 @@ def read_filled_trials_state_db(
             # false, permanent `no_taken_latch` under THIS city's run.
             continue
         if len(fills) > 1:
+            # Slice 4 item B2 (plan rev 6.1): the v3 continuous-rung-hold
+            # family has an EXPLICIT signal for which of N fills on one
+            # latch is the genuine trial -- the latch's own recorded
+            # `venue_order_id` (item A1's writer). When exactly one of the
+            # joined fills matches it, that one is admitted normally and
+            # every OTHER fill is `duplicate_fill` residual, never
+            # `duplicate_fill_for_latch`. Anything else (no venue_order_id
+            # on the latch -- a pre-Slice-4 record -- or zero/more-than-one
+            # match) falls back to v2's existing "pick none" behaviour
+            # unchanged, so a v2 store's byte-identical output is preserved.
+            primary_fills = (
+                [f for f in fills if f.venue_order_id == latch_venue_order_id]
+                if family_prefix.startswith("continuous_rung_hold/") and latch_venue_order_id
+                else []
+            )
+            if len(primary_fills) == 1:
+                primary = primary_fills[0]
+                for fill in fills:
+                    if fill is primary:
+                        continue
+                    exclusions.append(
+                        FillExclusion(
+                            trial_id=trial_id,
+                            station=cli_location,
+                            climate_day=climate_day,
+                            qty=str(fill.cumulative_qty),
+                            reason="duplicate_fill",
+                            detail=(
+                                f"a second genuine fill (venue_order_id="
+                                f"{fill.venue_order_id!r}) joined latch {trial_id!r}, "
+                                f"which already recorded venue_order_id="
+                                f"{latch_venue_order_id!r}"
+                            ),
+                            venue_order_id=fill.venue_order_id,
+                            filled_at_ns=fill.ts_event,
+                            fill_px=str(fill.cumulative_cost / fill.cumulative_qty),
+                            fee=str(fill.cumulative_fee / fill.cumulative_qty),
+                        )
+                    )
+                _admit_one_fill(
+                    trials,
+                    fee_reconciled_by_trial_id,
+                    trial_id=trial_id,
+                    climate_day=climate_day,
+                    ask=ask,
+                    cli_location=cli_location,
+                    instrument_id=instrument_id,
+                    fill=primary,
+                    skip_ask_guard=skip_ask_guard,
+                )
+                continue
             for fill in fills:
                 exclusions.append(
                     FillExclusion(
@@ -703,26 +830,60 @@ def read_filled_trials_state_db(
                     )
                 )
             continue
-        fill = fills[0]
-        trials.append(
-            FilledTrial(
-                trial_id=trial_id,
-                station=cli_location,
-                climate_day=climate_day,
-                instrument_id=instrument_id,
-                bucket=None,
-                fill_px=fill.cumulative_cost / fill.cumulative_qty,
-                fee=fill.cumulative_fee / fill.cumulative_qty,
-                qty=fill.cumulative_qty,
-                filled_at_ns=fill.ts_event,
-                entry_ask=ask,
-                scheduled_release_at_ns=0,
-                venue_settlement_tmax_f=None,
-            )
+        _admit_one_fill(
+            trials,
+            fee_reconciled_by_trial_id,
+            trial_id=trial_id,
+            climate_day=climate_day,
+            ask=ask,
+            cli_location=cli_location,
+            instrument_id=instrument_id,
+            fill=fills[0],
+            skip_ask_guard=skip_ask_guard,
         )
-        fee_reconciled_by_trial_id[trial_id] = (fill.fee_reconciled, fill.venue_order_id)
 
     return tuple(trials), tuple(exclusions), fee_reconciled_by_trial_id
+
+
+def _admit_one_fill(
+    trials: list[FilledTrial],
+    fee_reconciled_by_trial_id: dict[str, tuple[bool, str, bool]],
+    *,
+    trial_id: str,
+    climate_day: str,
+    ask: Decimal,
+    cli_location: str,
+    instrument_id: str,
+    fill: DurableFillRecord,
+    skip_ask_guard: bool = False,
+) -> None:
+    """Append `fill` as the one genuine trial for `trial_id` -- shared by
+    the single-fill path and Slice 4 item B2's duplicate-fill split.
+
+    `skip_ask_guard` (three-seam Slice 4 review item 3) threads through to
+    `fee_reconciled_by_trial_id`'s third element, read by the CLI's
+    `_admit_fill` call so a fill-walk-consumed trial's `entry_ask` (derived
+    from the fill itself, never a decision) never trips L-25's guard.
+    """
+    trials.append(
+        FilledTrial(
+            trial_id=trial_id,
+            station=cli_location,
+            climate_day=climate_day,
+            instrument_id=instrument_id,
+            bucket=None,
+            fill_px=fill.cumulative_cost / fill.cumulative_qty,
+            fee=fill.cumulative_fee / fill.cumulative_qty,
+            qty=fill.cumulative_qty,
+            filled_at_ns=fill.ts_event,
+            entry_ask=ask,
+            scheduled_release_at_ns=0,
+            venue_settlement_tmax_f=None,
+        )
+    )
+    fee_reconciled_by_trial_id[trial_id] = (
+        fill.fee_reconciled, fill.venue_order_id, skip_ask_guard,
+    )
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
@@ -1009,7 +1170,7 @@ def score_live_trials(
     and never passed to `score_trial`.
     """
     reader_exclusions: tuple[FillExclusion, ...] = ()
-    fee_reconciled_by_trial_id: Mapping[str, tuple[bool, str]] = {}
+    fee_reconciled_by_trial_id: Mapping[str, tuple[bool, str, bool]] = {}
     unresolved_takes: tuple[UnresolvedTake, ...] = ()
 
     if fills_path is not None:
@@ -1093,8 +1254,15 @@ def score_live_trials(
         if malformed_qty is not None:
             extra_refusals.append(malformed_qty)
             continue
-        fee_reconciled, venue_order_id = fee_reconciled_by_trial_id.get(trial.trial_id, (True, ""))
-        exclusion = _admit_fill(trial, fee_reconciled=fee_reconciled, venue_order_id=venue_order_id)
+        fee_reconciled, venue_order_id, skip_ask_guard = fee_reconciled_by_trial_id.get(
+            trial.trial_id, (True, "", False),
+        )
+        exclusion = _admit_fill(
+            trial,
+            fee_reconciled=fee_reconciled,
+            venue_order_id=venue_order_id,
+            skip_ask_guard=skip_ask_guard,
+        )
         if exclusion is not None:
             excluded_fills.append(exclusion)
             continue

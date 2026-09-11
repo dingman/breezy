@@ -779,5 +779,6 @@ class PolymarketUSLiveExecClientFactory(LiveExecClientFactory):
             credentials=credentials,
             api_base_url=stripped_api_base_url,
             retirement_reasons=config.retirement_reasons,
+            submit_veto=config.submit_veto,
         )
         return client

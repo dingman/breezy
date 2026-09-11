@@ -46,6 +46,7 @@ from score_live_trials import (
     _append_excluded_fills,
     _append_unresolved_takes,
     _with_scheduled_release_at_ns,
+    compute_residual,
     find_unresolved_takes,
     main,
     read_filled_trials_state_db,
@@ -69,7 +70,10 @@ from breezy.registry.settlement_clock import settlement_deadline_ns
 from breezy.registry.sites import default_registry
 from breezy.runtime.sqlite_store import SqliteStateStore
 from breezy.runtime.submit_intent import CURRENT_INTENT_KEY, SubmitIntent, SubmitIntentState
-from breezy.strategy.current_rung_hold.trial_day_latch import TrialDayRecord
+from breezy.strategy.current_rung_hold.trial_day_latch import (
+    TAKEN_FROM_FILL_WALK_REASON,
+    TrialDayRecord,
+)
 
 _BASE_NS = int(dt.datetime(2026, 9, 5, 6, 31, tzinfo=dt.UTC).timestamp() * 1_000_000_000)
 _SHA = hashlib.sha256(b"score-live-trials-state-db-test").hexdigest()
@@ -100,8 +104,8 @@ def _write_manifest(tmp_path: Path, **overrides: Any) -> Path:
     return path
 
 
-def _latch_key(station: str, climate_day: str) -> str:
-    return f"{_FAMILY_PREFIX}{station}/{climate_day}"
+def _latch_key(station: str, climate_day: str, *, family_prefix: str = _FAMILY_PREFIX) -> str:
+    return f"{family_prefix}{station}/{climate_day}"
 
 
 def _seed_latch(
@@ -114,8 +118,9 @@ def _seed_latch(
     reason: str = "taken",
     latched_at_ns: int = _BASE_NS,
     venue_order_id: str | None = None,
+    family_prefix: str = _FAMILY_PREFIX,
 ) -> str:
-    key = _latch_key(station, climate_day)
+    key = _latch_key(station, climate_day, family_prefix=family_prefix)
     record = TrialDayRecord(
         latched_at_ns=latched_at_ns,
         instrument_id=instrument_id,
@@ -287,7 +292,7 @@ def test_one_fill_and_one_taken_latch_yields_one_filled_trial(tmp_path: Path) ->
     assert trial.fill_px == Decimal("0.42")
     assert trial.fee == Decimal("0.01")
     assert trial.qty == Decimal(1)
-    assert fee_map[latch_key] == (True, "v1")
+    assert fee_map[latch_key] == (True, "v1", False)
 
     # correct scheduled_release_at_ns, assert against the promoted helper for
     # a known city/day (LAX, 2026-09-05).
@@ -316,7 +321,7 @@ def test_a_latch_carrying_the_new_venue_order_id_field_still_reads_identically(
     assert exclusions == ()
     assert len(trials) == 1
     assert trials[0].trial_id == latch_key
-    assert fee_map[latch_key] == (True, "v1")
+    assert fee_map[latch_key] == (True, "v1", False)
 
 
 def test_no_taken_latch_is_excluded_with_blank_identity_fields(tmp_path: Path) -> None:
@@ -360,6 +365,133 @@ def test_two_fill_records_on_one_latch_excludes_both_as_duplicate(tmp_path: Path
         assert exclusion.trial_id == latch_key
         assert exclusion.station == _STATION
         assert exclusion.climate_day == _DAY_ISO
+
+
+_V3_FAMILY_PREFIX = "continuous_rung_hold/trial/"
+
+
+def test_v3_second_genuine_fill_is_duplicate_fill_not_duplicate_fill_for_latch(
+    tmp_path: Path,
+) -> None:
+    """Slice 4 item B2 (plan rev 6.1): the v3 family has an explicit signal
+    (the latch's own `venue_order_id`) for WHICH fill is genuine -- the
+    primary fill is admitted normally, only the extra one is residual."""
+    store_path = tmp_path / "state.sqlite"
+    store = SqliteStateStore(store_path)
+    latch_key = _seed_latch(
+        store, ask=Decimal("0.40"), venue_order_id="v1", instrument_id=_INSTRUMENT_ID,
+        family_prefix=_V3_FAMILY_PREFIX,
+    )
+    _seed_fill(store, venue_order_id="v1", cumulative_cost=Decimal("0.42"))
+    _seed_fill(store, venue_order_id="v2", cumulative_cost=Decimal("0.44"))
+    store.close()
+
+    trials, exclusions, fee_map = read_filled_trials_state_db(
+        store_path, **_reader_kwargs(family_prefix=_V3_FAMILY_PREFIX),
+    )
+
+    assert len(trials) == 1
+    assert trials[0].trial_id == latch_key
+    assert fee_map[latch_key] == (True, "v1", False)
+    assert len(exclusions) == 1
+    assert exclusions[0].reason == "duplicate_fill"
+    assert exclusions[0].venue_order_id == "v2"
+    assert exclusions[0].fill_px == str(Decimal("0.44"))
+    assert exclusions[0].fee == str(Decimal("0.01"))
+
+
+def test_v3_with_no_venue_order_id_on_the_latch_falls_back_to_v2_behaviour(
+    tmp_path: Path,
+) -> None:
+    """A pre-Slice-4 v3 latch (no `venue_order_id` recorded) has no
+    signal to pick a primary fill from -- falls back to the existing
+    "pick none" behaviour, never invents a choice."""
+    store_path = tmp_path / "state.sqlite"
+    store = SqliteStateStore(store_path)
+    _seed_latch(
+        store, instrument_id=_INSTRUMENT_ID, venue_order_id=None,
+        family_prefix=_V3_FAMILY_PREFIX,
+    )
+    _seed_fill(store, venue_order_id="v1")
+    _seed_fill(store, venue_order_id="v2")
+    store.close()
+
+    trials, exclusions, _fee_map = read_filled_trials_state_db(
+        store_path, **_reader_kwargs(family_prefix=_V3_FAMILY_PREFIX),
+    )
+
+    assert trials == ()
+    assert len(exclusions) == 2
+    assert all(e.reason == "duplicate_fill_for_latch" for e in exclusions)
+
+
+def test_get_filled_duplicate_counts_once_in_residual(tmp_path: Path) -> None:
+    """PREREG AC 8 / rev 6.1 §PREREG residual: a resolver GET-FILLED fill
+    (`fee_reconciled=False` by construction, since it carries no execution
+    legs) that is ALSO the duplicate appears in residual EXACTLY once, in
+    the `duplicate_fill` bucket only -- never ALSO `fee_unverified`."""
+    store_path = tmp_path / "state.sqlite"
+    store = SqliteStateStore(store_path)
+    _seed_latch(
+        store, instrument_id=_INSTRUMENT_ID, venue_order_id="v1",
+        family_prefix=_V3_FAMILY_PREFIX,
+    )
+    _seed_fill(store, venue_order_id="v1", cumulative_cost=Decimal("0.42"))
+    # The duplicate: a GET-FILLED fill, fee_reconciled=False by construction.
+    _seed_fill(
+        store, venue_order_id="v2", cumulative_cost=Decimal("0.44"), fee_reconciled=False,
+    )
+    store.close()
+
+    trials, exclusions, _fee_map = read_filled_trials_state_db(
+        store_path, **_reader_kwargs(family_prefix=_V3_FAMILY_PREFIX),
+    )
+
+    assert len(trials) == 1
+    duplicate_exclusions = [e for e in exclusions if e.venue_order_id == "v2"]
+    assert len(duplicate_exclusions) == 1
+    assert duplicate_exclusions[0].reason == "duplicate_fill"
+    assert not any(e.reason == "fee_unverified" for e in exclusions)
+
+
+def test_compute_residual_sums_only_the_three_residual_reasons(tmp_path: Path) -> None:
+    exclusions = (
+        FillExclusion(
+            trial_id="t1", station="LAX", climate_day="2026-09-05", qty="2",
+            reason="multi_fill", detail="d", fill_px="0.40", fee="0.01",
+        ),
+        FillExclusion(
+            trial_id="t2", station="LAX", climate_day="2026-09-05", qty="1",
+            reason="fee_unverified", detail="d", fill_px="0.30", fee="0.02",
+        ),
+        FillExclusion(
+            trial_id="t3", station="LAX", climate_day="2026-09-05", qty="1",
+            reason="duplicate_fill", detail="d", fill_px="0.50", fee="0.00",
+        ),
+        # Not a residual reason -- must not contribute, even though this
+        # construction site (below) never even sets fill_px/fee.
+        FillExclusion(
+            trial_id="t4", station="LAX", climate_day="2026-09-05", qty="1",
+            reason="fill_below_ask", detail="d",
+        ),
+    )
+    residual = compute_residual(exclusions)
+    assert residual == Decimal(2) * (Decimal("0.40") + Decimal("0.01")) + (
+        Decimal("0.30") + Decimal("0.02")
+    ) + (Decimal("0.50") + Decimal("0.00"))
+
+
+def test_compute_residual_skips_an_exclusion_with_no_fill_px_or_fee(tmp_path: Path) -> None:
+    """A pre-Slice-4 construction site (`no_taken_latch`,
+    `duplicate_fill_for_latch`, `ambiguous_latch`) never sets `fill_px`/
+    `fee` -- must never be coerced to a zero-dollar contribution."""
+    exclusions = (
+        FillExclusion(
+            trial_id="", station="", climate_day="", qty="1",
+            reason="no_taken_latch", detail="d",
+        ),
+    )
+    assert compute_residual(exclusions) == Decimal(0)
 
 
 def test_an_instrument_matching_more_than_one_taken_latch_is_ambiguous(tmp_path: Path) -> None:
@@ -553,7 +685,7 @@ def test_a_fill_for_another_citys_taken_latch_is_skipped_not_excluded(tmp_path: 
     assert lax_exclusions == ()
     assert len(lax_trials) == 1
     assert lax_trials[0].instrument_id == "lax-instr"
-    assert lax_fee_map == {_latch_key("LAX", _DAY_ISO): (True, "lax-v1")}
+    assert lax_fee_map == {_latch_key("LAX", _DAY_ISO): (True, "lax-v1", False)}
 
     mdw_trials, mdw_exclusions, mdw_fee_map = read_filled_trials_state_db(
         store_path,
@@ -562,7 +694,7 @@ def test_a_fill_for_another_citys_taken_latch_is_skipped_not_excluded(tmp_path: 
     assert mdw_exclusions == ()
     assert len(mdw_trials) == 1
     assert mdw_trials[0].instrument_id == "mdw-instr"
-    assert mdw_fee_map == {_latch_key("MDW", _DAY_ISO): (True, "mdw-v1")}
+    assert mdw_fee_map == {_latch_key("MDW", _DAY_ISO): (True, "mdw-v1", False)}
 
 
 def test_no_taken_latch_anywhere_is_identical_across_every_citys_invocation(
@@ -683,6 +815,49 @@ def test_a_fill_exactly_one_tick_below_the_ask_is_not_excluded_by_the_ask_gate(
     store.close()
 
     _scored, _refused, excluded = score_live_trials(**_driver_kwargs(tmp_path, store_path))
+
+    assert not any(f.reason == "fill_below_ask" for f in excluded)
+
+
+def test_v3_fill_below_the_decision_ask_is_excluded(tmp_path: Path) -> None:
+    """Three-seam Slice 4 review item 3 [HIGH]: a v3 `"taken"` latch's
+    `ask` is now the strategy's DECISION-time ask (item 3's
+    `continuous_strategy.py` fix) -- the L-25 guard must still fire when
+    the fill genuinely undercuts it."""
+    store_path = tmp_path / "state.sqlite"
+    store = SqliteStateStore(store_path)
+    _seed_latch(store, ask=Decimal("0.50"), family_prefix=_V3_FAMILY_PREFIX)
+    _seed_fill(store, venue_order_id="v1", cumulative_cost=Decimal("0.30"))
+    store.close()
+
+    _scored, _refused, excluded = score_live_trials(
+        **_driver_kwargs(tmp_path, store_path, family_prefix=_V3_FAMILY_PREFIX),
+    )
+
+    assert len(excluded) == 1
+    assert excluded[0].reason == "fill_below_ask"
+
+
+def test_v3_fill_walk_consumed_trial_skips_the_ask_guard_by_reason_not_equality(
+    tmp_path: Path,
+) -> None:
+    """Three-seam Slice 4 review item 3: a `TAKEN_FROM_FILL_WALK_REASON`
+    latch's `ask` is NOT a decision -- the guard must be skipped BY REASON.
+    Proven here by deliberately seeding an `ask` that WOULD trip the guard
+    under a naive equality/comparison, showing the skip is reason-driven,
+    not an accident of `fill_px == entry_ask`."""
+    store_path = tmp_path / "state.sqlite"
+    store = SqliteStateStore(store_path)
+    _seed_latch(
+        store, ask=Decimal("0.90"), reason=TAKEN_FROM_FILL_WALK_REASON,
+        family_prefix=_V3_FAMILY_PREFIX,
+    )
+    _seed_fill(store, venue_order_id="v1", cumulative_cost=Decimal("0.30"))
+    store.close()
+
+    _scored, _refused, excluded = score_live_trials(
+        **_driver_kwargs(tmp_path, store_path, family_prefix=_V3_FAMILY_PREFIX),
+    )
 
     assert not any(f.reason == "fill_below_ask" for f in excluded)
 
