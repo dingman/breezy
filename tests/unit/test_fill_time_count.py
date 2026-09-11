@@ -53,12 +53,15 @@ def _make_state_db(path: Path, rows: dict[str, bytes]) -> None:
         store.close()
 
 
-def _trial_row(instrument_id: str, *, reason: str = "taken") -> bytes:
+def _trial_row(
+    instrument_id: str, *, reason: str = "taken", venue_order_id: str | None = None,
+) -> bytes:
     return TrialDayRecord(
         latched_at_ns=1,
         instrument_id=instrument_id,
         ask=Decimal("0.40"),
         reason=reason,
+        venue_order_id=venue_order_id,
     ).to_bytes()
 
 
@@ -104,6 +107,27 @@ def test_two_fills_one_settled_one_not_counts_two(ftc_mod: ModuleType, tmp_path:
     )
     result = ftc_mod.count_filled_takes(db_path, family_prefix=_LIVE_PREFIX)
     assert result == 2
+
+
+def test_a_trial_row_carrying_the_new_venue_order_id_field_still_decodes(
+    ftc_mod: ModuleType, tmp_path: Path
+) -> None:
+    """Slice 4 schema-compat (finding_trialrecord_compat.md): the new
+    TRAILING optional ``venueOrderId`` field on ``TrialDayRecord`` does not
+    break the raw-sqlite prefix-filter-then-decode reader this script uses
+    -- a row written WITH the field decodes exactly like one without it."""
+    db_path = tmp_path / "exec_state.sqlite"
+    _make_state_db(
+        db_path,
+        {
+            f"{_LIVE_PREFIX}LAX/2026-08-01": _trial_row(
+                "LAX-2026-08-01-lt79f", venue_order_id="ord-amb-1",
+            ),
+            "exec/polymarket_us/fill/order-1": _fill_row("order-1", "LAX-2026-08-01-lt79f"),
+        },
+    )
+    result = ftc_mod.count_filled_takes(db_path, family_prefix=_LIVE_PREFIX)
+    assert result == 1
 
 
 def test_a_taken_trial_with_no_matching_fill_is_not_counted(

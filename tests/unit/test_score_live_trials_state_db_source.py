@@ -113,10 +113,15 @@ def _seed_latch(
     ask: Decimal = Decimal("0.40"),
     reason: str = "taken",
     latched_at_ns: int = _BASE_NS,
+    venue_order_id: str | None = None,
 ) -> str:
     key = _latch_key(station, climate_day)
     record = TrialDayRecord(
-        latched_at_ns=latched_at_ns, instrument_id=instrument_id, ask=ask, reason=reason
+        latched_at_ns=latched_at_ns,
+        instrument_id=instrument_id,
+        ask=ask,
+        reason=reason,
+        venue_order_id=venue_order_id,
     )
     store.set(key, record.to_bytes())
     return key
@@ -289,6 +294,29 @@ def test_one_fill_and_one_taken_latch_yields_one_filled_trial(tmp_path: Path) ->
     resolved = _with_scheduled_release_at_ns(trial, venue=_VENUE, city=_CITY)
     expected_deadline = default_registry().settlement_deadline(_VENUE, _CITY)
     assert resolved.scheduled_release_at_ns == settlement_deadline_ns(expected_deadline, _DAY)
+
+
+def test_a_latch_carrying_the_new_venue_order_id_field_still_reads_identically(
+    tmp_path: Path,
+) -> None:
+    """Slice 4 schema-compat (finding_trialrecord_compat.md): the new
+    TRAILING optional ``venueOrderId`` field on ``TrialDayRecord`` does not
+    disturb this reader -- a latch written WITH the field yields the exact
+    same filled trial as one without it."""
+    store_path = tmp_path / "state.sqlite"
+    store = SqliteStateStore(store_path)
+    latch_key = _seed_latch(store, ask=Decimal("0.40"), venue_order_id="v1")
+    _seed_fill(
+        store, venue_order_id="v1", cumulative_cost=Decimal("0.42"), cumulative_fee=Decimal("0.01")
+    )
+    store.close()
+
+    trials, exclusions, fee_map = read_filled_trials_state_db(store_path, **_reader_kwargs())
+
+    assert exclusions == ()
+    assert len(trials) == 1
+    assert trials[0].trial_id == latch_key
+    assert fee_map[latch_key] == (True, "v1")
 
 
 def test_no_taken_latch_is_excluded_with_blank_identity_fields(tmp_path: Path) -> None:

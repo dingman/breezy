@@ -54,9 +54,13 @@ def _make_state_db(path: Path, rows: dict[str, bytes]) -> None:
         store.close()
 
 
-def _trial_row(instrument_id: str) -> bytes:
+def _trial_row(instrument_id: str, *, venue_order_id: str | None = None) -> bytes:
     return TrialDayRecord(
-        latched_at_ns=1, instrument_id=instrument_id, ask=Decimal("0.40"), reason="taken"
+        latched_at_ns=1,
+        instrument_id=instrument_id,
+        ask=Decimal("0.40"),
+        reason="taken",
+        venue_order_id=venue_order_id,
     ).to_bytes()
 
 
@@ -84,6 +88,38 @@ def test_with_fill_source_the_structural_dead_line_is_evaluable_not_skipped(
         fill_db,
         {
             f"{_LIVE_PREFIX}LAX/2026-08-01": _trial_row("LAX-2026-08-01-lt79f"),
+            "exec/polymarket_us/fill/order-1": _fill_row("order-1", "LAX-2026-08-01-lt79f"),
+        },
+    )
+    exit_code = tally_mod.main(
+        [
+            str(store_dir),
+            "--covered-listed-station-days",
+            "15",
+            "--fill-source",
+            str(fill_db),
+        ]
+    )
+    out = capsys.readouterr().out
+    assert exit_code == 0
+    assert "SKIPPED" not in out
+
+
+def test_a_trial_row_carrying_the_new_venue_order_id_field_still_evaluates(
+    tally_mod: ModuleType, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Slice 4 schema-compat (finding_trialrecord_compat.md): the new
+    TRAILING optional ``venueOrderId`` field on ``TrialDayRecord`` does not
+    disturb this CLI's raw-sqlite reader."""
+    store_dir = tmp_path / "store"
+    store_dir.mkdir()
+    fill_db = tmp_path / "exec_state.sqlite"
+    _make_state_db(
+        fill_db,
+        {
+            f"{_LIVE_PREFIX}LAX/2026-08-01": _trial_row(
+                "LAX-2026-08-01-lt79f", venue_order_id="order-1",
+            ),
             "exec/polymarket_us/fill/order-1": _fill_row("order-1", "LAX-2026-08-01-lt79f"),
         },
     )

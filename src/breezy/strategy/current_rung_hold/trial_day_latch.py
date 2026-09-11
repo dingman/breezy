@@ -52,6 +52,7 @@ state this ordering makes unreachable: nothing may call ``arm()`` before its
 from __future__ import annotations
 
 import json
+import threading
 from dataclasses import dataclass
 from decimal import Decimal, InvalidOperation
 from typing import Final
@@ -150,6 +151,14 @@ class TrialDayRecord:
     instrument_id: str
     ask: Decimal
     reason: str
+    #: Slice 4 item A (plan rev 6.1): the venue order id whose durable fill
+    #: consumed this station-day's trial, when known. TRAILING and OPTIONAL
+    #: per the binding schema-compat rule (finding_trialrecord_compat.md):
+    #: no ``_SCHEMA_VERSION`` bump (the exact-pin gate would corrupt every
+    #: existing v1 row), read via ``payload.get`` so a pre-slice-4 record
+    #: missing the key decodes as ``None`` -- mirrors
+    #: ``DurableFillRecord.venue_fee_raw`` (client.py) exactly.
+    venue_order_id: str | None = None
 
     def to_bytes(self) -> bytes:
         payload = {
@@ -158,6 +167,7 @@ class TrialDayRecord:
             "instrument_id": self.instrument_id,
             "ask": str(self.ask),
             "reason": self.reason,
+            "venueOrderId": self.venue_order_id,
         }
         return json.dumps(payload, sort_keys=True).encode("utf-8")
 
@@ -190,11 +200,17 @@ class TrialDayRecord:
             ask = Decimal(ask_raw)
         except InvalidOperation:
             raise TrialDayRecordCorrupt() from None
+        # Optional-on-read (missing key -> None, same as JSON null); a
+        # PRESENT non-string value is still a mapping error.
+        venue_order_id_raw = payload.get("venueOrderId")
+        if venue_order_id_raw is not None and not isinstance(venue_order_id_raw, str):
+            raise TrialDayRecordCorrupt()
         return cls(
             latched_at_ns=latched_at_ns,
             instrument_id=instrument_id,
             ask=ask,
             reason=reason,
+            venue_order_id=venue_order_id_raw,
         )
 
 
@@ -227,6 +243,13 @@ class TrialDayLatch:
         #: ``TrialDayLatch`` built directly (existing test doubles) -- such
         #: an instance simply cannot call :meth:`is_intent_open`.
         self._intent_latch = intent_latch
+        #: Slice 4 item A: the thread that constructed THIS instance,
+        #: recorded here regardless of ``intent_latch`` -- mirrors
+        #: ``SubmitIntentLatch.opening_thread_ident``. ``consume_if_absent``
+        #: asserts against it: a read-then-write-if-absent is not atomic
+        #: across threads even under the flock (the flock is process-wide,
+        #: not a Python-level mutex against a second thread in THIS process).
+        self._opening_thread_ident = threading.get_ident()
 
     def _require_held(self) -> None:
         if not self._lock.held:
@@ -303,6 +326,48 @@ class TrialDayLatch:
             reason=reason,
         )
         self._store.set(self._trial_key(station, climate_day), record.to_bytes())
+
+    def consume_if_absent(
+        self,
+        station: str,
+        climate_day: str,
+        record: TrialDayRecord,
+    ) -> bool:
+        """Slice 4 item A: durably record TRIAL for a fill, idempotently.
+
+        Returns ``True`` iff THIS call wrote the record, ``False`` if one
+        already existed -- unlike :meth:`consume`, this NEVER raises on an
+        already-consumed station-day. That is the whole point: a
+        recon-replayed duplicate ``OrderFilled`` for a station-day whose
+        trial is already consumed must be a silent no-op here (Resolution
+        B's duplicate-fill handling decides what to do with the SECOND
+        fill; this method's only job is "don't crash, don't overwrite, and
+        never claim TWO writers both wrote it").
+
+        Two writers racing this SAME station-day (e.g. a live
+        ``on_order_filled`` and the on_start durable-fill walk observing
+        the same underlying fill) leave exactly ONE record: whichever
+        holds the flock first at the read-check-write below wins, and the
+        loser's own ``is_consumed`` check then observes it and returns
+        ``False`` -- never a second write, never a raise.
+
+        Asserts the flock is held and that this is the SAME thread that
+        opened this ``TrialDayLatch`` -- a read-then-write-if-absent is not
+        atomic against a second thread in this SAME process (the flock is
+        process-wide, not a Python-level mutex).
+        """
+        self._require_held()
+        assert threading.get_ident() == self._opening_thread_ident, (
+            "consume_if_absent must run on the thread that opened this "
+            "TrialDayLatch; a second thread racing the read-check-write "
+            "below is not made safe by the process-wide flock alone"
+        )
+        if record.reason not in _REASONS:
+            raise TrialDayInvalidReason(record.reason)
+        if self.is_consumed(station, climate_day):
+            return False
+        self._store.set(self._trial_key(station, climate_day), record.to_bytes())
+        return True
 
     def is_inflight(self, station: str, climate_day: str) -> bool:
         """``True`` while this station-day has a durable IN_FLIGHT marker."""

@@ -193,6 +193,141 @@ class TestConsumeAndRecord:
             assert trial_latch.is_consumed(STATION, OTHER_CLIMATE_DAY) is True
 
 
+class TestConsumeIfAbsent:
+    """Slice 4 item A: TRIAL-on-fill's idempotent, never-raising writer."""
+
+    def test_writes_and_returns_true_when_absent(self, store_path: Path) -> None:
+        with open_submit_intent_latch(SqliteStateStore(store_path), store_path) as intent_latch:
+            trial_latch = open_trial_day_latch(intent_latch)
+            record = TrialDayRecord(
+                latched_at_ns=NOW_NS,
+                instrument_id=INSTRUMENT_ID,
+                ask=Decimal("0.37"),
+                reason="taken",
+                venue_order_id="ord-1",
+            )
+            wrote = trial_latch.consume_if_absent(STATION, CLIMATE_DAY, record)
+            assert wrote is True
+            assert trial_latch.record(STATION, CLIMATE_DAY) == record
+
+    def test_a_recon_replayed_duplicate_fill_never_raises_and_returns_false(
+        self, store_path: Path
+    ) -> None:
+        """RED: a duplicate ``OrderFilled`` for an already-consumed
+        station-day (reconciliation replay, the venue's own retry, etc.)
+        must be a silent no-op -- never `TrialDayAlreadyConsumed`."""
+        with open_submit_intent_latch(SqliteStateStore(store_path), store_path) as intent_latch:
+            trial_latch = open_trial_day_latch(intent_latch)
+            first = TrialDayRecord(
+                latched_at_ns=NOW_NS,
+                instrument_id=INSTRUMENT_ID,
+                ask=Decimal("0.37"),
+                reason="taken",
+                venue_order_id="ord-1",
+            )
+            assert trial_latch.consume_if_absent(STATION, CLIMATE_DAY, first) is True
+
+            replayed = TrialDayRecord(
+                latched_at_ns=NOW_NS + 1,
+                instrument_id=INSTRUMENT_ID,
+                ask=Decimal("0.40"),
+                reason="taken",
+                venue_order_id="ord-1",
+            )
+            wrote_again = trial_latch.consume_if_absent(STATION, CLIMATE_DAY, replayed)
+            assert wrote_again is False
+            # The FIRST record survives untouched -- the replay never overwrote it.
+            assert trial_latch.record(STATION, CLIMATE_DAY) == first
+
+    def test_two_writers_racing_the_same_station_day_leave_exactly_one_record(
+        self, store_path: Path
+    ) -> None:
+        """RED: two DISTINCT writers (e.g. ``on_order_filled`` and the
+        on_start durable-fill walk) racing the SAME station-day -- modeled
+        here as two sequential calls on the one thread that owns the latch,
+        since the flock is process-wide and this latch is single-thread-
+        affine by design (see the thread-affinity assert below)."""
+        with open_submit_intent_latch(SqliteStateStore(store_path), store_path) as intent_latch:
+            trial_latch = open_trial_day_latch(intent_latch)
+            writer_a = TrialDayRecord(
+                latched_at_ns=NOW_NS,
+                instrument_id=INSTRUMENT_ID,
+                ask=Decimal("0.37"),
+                reason="taken",
+                venue_order_id="ord-a",
+            )
+            writer_b = TrialDayRecord(
+                latched_at_ns=NOW_NS + 5,
+                instrument_id=INSTRUMENT_ID,
+                ask=Decimal("0.41"),
+                reason="taken",
+                venue_order_id="ord-b",
+            )
+            results = (
+                trial_latch.consume_if_absent(STATION, CLIMATE_DAY, writer_a),
+                trial_latch.consume_if_absent(STATION, CLIMATE_DAY, writer_b),
+            )
+            assert sorted(results) == [False, True], "exactly one writer wrote"
+            survivor = trial_latch.record(STATION, CLIMATE_DAY)
+            assert survivor in (writer_a, writer_b)
+
+    def test_an_invalid_reason_still_raises(self, store_path: Path) -> None:
+        with open_submit_intent_latch(SqliteStateStore(store_path), store_path) as intent_latch:
+            trial_latch = open_trial_day_latch(intent_latch)
+            record = TrialDayRecord(
+                latched_at_ns=NOW_NS,
+                instrument_id=INSTRUMENT_ID,
+                ask=Decimal("0.37"),
+                reason="bogus",
+            )
+            with pytest.raises(TrialDayInvalidReason):
+                trial_latch.consume_if_absent(STATION, CLIMATE_DAY, record)
+            assert trial_latch.record(STATION, CLIMATE_DAY) is None
+
+    def test_requires_the_held_flock(self, store_path: Path) -> None:
+        with open_submit_intent_latch(SqliteStateStore(store_path), store_path) as intent_latch:
+            trial_latch = open_trial_day_latch(intent_latch)
+        record = TrialDayRecord(
+            latched_at_ns=NOW_NS,
+            instrument_id=INSTRUMENT_ID,
+            ask=Decimal("0.37"),
+            reason="taken",
+        )
+        with pytest.raises(SubmitIntentLockNotHeld):
+            trial_latch.consume_if_absent(STATION, CLIMATE_DAY, record)
+
+    def test_a_foreign_thread_calling_consume_if_absent_is_refused(
+        self, store_path: Path
+    ) -> None:
+        """The thread-affinity assert is load-bearing: a second thread
+        racing this same call is NOT made safe by the process-wide flock
+        alone."""
+        import threading
+
+        with open_submit_intent_latch(SqliteStateStore(store_path), store_path) as intent_latch:
+            trial_latch = open_trial_day_latch(intent_latch)
+            record = TrialDayRecord(
+                latched_at_ns=NOW_NS,
+                instrument_id=INSTRUMENT_ID,
+                ask=Decimal("0.37"),
+                reason="taken",
+            )
+            errors: list[BaseException] = []
+
+            def _call_from_another_thread() -> None:
+                try:
+                    trial_latch.consume_if_absent(STATION, CLIMATE_DAY, record)
+                except BaseException as exc:  # noqa: BLE001 - captured for the assertion below
+                    errors.append(exc)
+
+            thread = threading.Thread(target=_call_from_another_thread)
+            thread.start()
+            thread.join()
+            assert len(errors) == 1
+            assert isinstance(errors[0], AssertionError)
+            assert trial_latch.record(STATION, CLIMATE_DAY) is None
+
+
 class TestSurvivesRestart:
     def test_consume_close_reopen_still_consumed(self, store_path: Path) -> None:
         store = SqliteStateStore(store_path)
