@@ -294,7 +294,6 @@ from breezy.adapters.polymarket_us.safety import (
 )
 from breezy.adapters.polymarket_us.symbology import instrument_id_to_slug, slug_to_instrument_id
 from breezy.ingest.gate import assert_state_store_durable
-from breezy.runtime.submit_intent import SubmitIntentCorrupt, SubmitIntentState
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
     from nautilus_trader.cache.cache import Cache
@@ -994,8 +993,8 @@ class PolymarketUSExecutionClient(LiveExecutionClient):
                 self._log.debug("resolver: no latch bound; skipping this pass")
                 continue
             try:
-                current = self._latch.current()
-            except SubmitIntentCorrupt:
+                current = self._latch.current_open()
+            except self._latch.CorruptError:
                 # Fail closed like `is_latched()` does: a corrupt singleton
                 # is treated as OPEN-unknown -- never retire, never act, but
                 # the task itself must survive. Polling continues rather
@@ -1012,7 +1011,7 @@ class PolymarketUSExecutionClient(LiveExecutionClient):
                         "(fail closed, never retiring on unreadable state)"
                     )
                 continue
-            if current is None or current.state is not SubmitIntentState.OPEN:
+            if current is None:
                 self._log.debug("resolver: no OPEN intent; nothing to resolve this pass")
                 continue
             raw_context = self._store_get(f"{RESOLVER_CONTEXT_KEY_PREFIX}{current.intent_id}")
@@ -1178,12 +1177,8 @@ class PolymarketUSExecutionClient(LiveExecutionClient):
                 "fail-closed"
             )
             return
-        current = self._latch.current()
-        if (
-            current is None
-            or current.state is not SubmitIntentState.OPEN
-            or current.intent_id != context.intent_id
-        ):
+        current = self._latch.current_open()
+        if current is None or current.intent_id != context.intent_id:
             self._ambiguous_bookings.pop(context.intent_id, None)
             return
         self._retire(context.intent_id, "STATUS_REPORT_ZERO_FILL_TERMINAL", now_ns)
@@ -1243,12 +1238,8 @@ class PolymarketUSExecutionClient(LiveExecutionClient):
                 "it in this run; SAFETY H2 fail-closed"
             )
             return
-        current = self._latch.current()
-        if (
-            current is None
-            or current.state is not SubmitIntentState.OPEN
-            or current.intent_id != context.intent_id
-        ):
+        current = self._latch.current_open()
+        if current is None or current.intent_id != context.intent_id:
             self._ambiguous_bookings.pop(context.intent_id, None)
             return
         avg_px = report.avg_px

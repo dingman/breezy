@@ -318,6 +318,14 @@ class SubmitIntentLatch:
     is still held.
     """
 
+    #: This latch's own corrupt-singleton exception, exposed as a class
+    #: attribute so an INJECTED consumer (an adapter, which the layers
+    #: contract forbids from importing ``breezy.runtime`` at all -- see
+    #: ``adapters/polymarket_us/exec/client.py``'s module docstring) can
+    #: catch it via ``except self._latch.CorruptError`` without ever
+    #: importing this module.
+    CorruptError = SubmitIntentCorrupt
+
     def __init__(self, store: StateStore, lock: _HeldSubmitIntentLock) -> None:
         self._store = store
         self._lock = lock
@@ -345,6 +353,24 @@ class SubmitIntentLatch:
         if raw is None:
             return None
         return SubmitIntent.from_bytes(raw)
+
+    def current_open(self) -> SubmitIntent | None:
+        """The current armed intent, iff it is OPEN -- ``None`` otherwise.
+
+        The read-only surface an INJECTED consumer needs (the OPEN-only
+        processing check, the foreign-intent guard via ``.intent_id``)
+        without ever importing :class:`SubmitIntentState` -- an adapter
+        importing anything from ``breezy.runtime`` breaks the layers
+        contract (``breezy.adapters`` sits below it). Raises
+        :class:`SubmitIntentCorrupt` (``self.CorruptError``) exactly like
+        :meth:`current`/:meth:`is_latched` do on an undecodable singleton --
+        never silently treats corruption as OPEN or as absent.
+        """
+        self._require_held()
+        current = self.current()
+        if current is None or current.state is not SubmitIntentState.OPEN:
+            return None
+        return current
 
     def is_latched(self) -> bool:
         """True when a new ``arm`` must be refused.

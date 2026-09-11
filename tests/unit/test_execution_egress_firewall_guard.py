@@ -1927,7 +1927,12 @@ EXEC_RESOLVER_PERMITTED_CALLEES = frozenset(
     {
         "asyncio.sleep",
         "self._resolver_poll_interval_secs",
-        "self._latch.current",
+        # Layers-contract review: `current()` + a bare `SubmitIntentState`
+        # comparison would need `breezy.runtime.submit_intent` imported --
+        # forbidden (`breezy.adapters` sits below `breezy.runtime`). Replaced
+        # by the latch's own `current_open()`, which returns the intent iff
+        # OPEN and needs no import from this module at all.
+        "self._latch.current_open",
         "self._store_get",
         "AmbiguousResolverContext.from_bytes",
         "self._log.error",
@@ -3055,7 +3060,7 @@ def test_resolver_scan_permits_a_bounded_get_and_nothing_else() -> None:
         "\n"
         "async def _resolve_ambiguous_intents(self):\n"
         "    await asyncio.sleep(self._resolver_poll_interval_secs())\n"
-        "    current = self._latch.current()\n"
+        "    current = self._latch.current_open()\n"
         "    self._log.warning('polling')\n"
     )
     assert (
