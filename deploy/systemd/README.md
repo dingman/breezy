@@ -878,3 +878,49 @@ names no host anywhere in that output.
 this process holds no venue credential). The template unit's OWN
 `EnvironmentFile=-%h/.config/breezy/alerts.env` carries the URL for every
 parent unit that triggers it.
+
+## `breezy-liveness-watchdog` — 5-minute supervisor/node probe (SP-6 A12, 2026-09-12)
+
+**Status: same as everything else in this file.** INERT until an operator
+runs `daemon-reload` AND `enable` on the TIMER (never the service
+directly) OUTSIDE the protected window `[16:45Z, 01:15Z)`.
+
+**What it is.** A read-only `Type=oneshot` probe
+(`src/breezy/runtime/liveness_probe_cli.py`), triggered every 5 minutes by
+`breezy-liveness-watchdog.timer`. It checks whether
+`breezy-trade-supervisor` and the trade node are running (via the SAME
+anchored `pgrep -f` mechanism the supervisor already uses on itself,
+`breezy.runtime.process_probe`), and alerts through the resolved sink on a
+CONFIRMED absence. It sends no signal, starts nothing, stops nothing, and
+runs no `systemctl` verb.
+
+**Why both this and the supervisor's own A11 fast path.** With
+`node_expected_alive` (the one shared alive-window predicate) as the
+gate, THIS unit alone already covers both processes with no day-state
+coupling. A11 (inside `trade_supervisor.py` itself) exists beside it for
+LATENCY (~120s vs up to 5 min here) and independence from this timer's
+own health -- not because this watchdog leaves a gap.
+
+**A probe failure is not an absence.** A transient `pgrep` fork failure
+(this host has documented OOM/swap history) is reported as
+`LIVENESS_PROBE_FAILED` (WARN), never promoted to a CRITICAL absence.
+
+**N6, accepted residual, stated not hidden.** This unit's
+`EnvironmentFile=-...alerts.env` means a process holding the webhook URL
+in its environ now exists every 5 minutes, not only on a parent unit's
+failure as with `breezy-alert@.service`. `/proc/<pid>/environ` is already
+readable by same-UID processes for the supervisor and the recorder; this
+does not widen that exposure in kind, only in frequency.
+
+**Install:**
+
+```bash
+ln -s /home/jon/breezy/deploy/systemd/breezy-liveness-watchdog.service ~/.config/systemd/user/
+ln -s /home/jon/breezy/deploy/systemd/breezy-liveness-watchdog.timer   ~/.config/systemd/user/
+systemctl --user daemon-reload
+systemctl --user enable --now breezy-liveness-watchdog.timer
+systemd-analyze --user verify ~/.config/systemd/user/breezy-liveness-watchdog.service \
+                              ~/.config/systemd/user/breezy-liveness-watchdog.timer
+```
+
+Read-only confirmation: `systemctl --user list-timers | grep liveness`.

@@ -1,0 +1,23 @@
+[Unit]
+Description=Periodic trigger for the Breezy liveness watchdog (SP-6 A12)
+Documentation=file:///home/jon/breezy/deploy/systemd/README.md
+Documentation=file:///home/jon/breezy/src/breezy/runtime/liveness_probe_cli.py
+
+[Timer]
+Unit=breezy-liveness-watchdog.service
+
+# Every 5 minutes. With node_expected_alive as the shared alive-window
+# predicate, this alone covers BOTH the supervisor and the trade node
+# with no day-state coupling (N12) -- the supervisor's own A11 fast path
+# exists beside this for latency (~120s vs up to 5 min) and independence
+# from this timer's own health, not because this leaves a gap.
+OnCalendar=*:0/5
+
+# A run missed because the host was down fires as soon as the timer is
+# next active, instead of silently waiting out the remainder of the tick.
+Persistent=true
+
+AccuracySec=30sec
+
+[Install]
+WantedBy=timers.target

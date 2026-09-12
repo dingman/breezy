@@ -1,0 +1,50 @@
+[Unit]
+# SP-6 A12. A read-only probe: reads /proc (pgrep, /proc/locks-equivalent
+# process lookups) for the supervisor and the trade node, and alerts
+# through the existing sink on a confirmed absence. Sends NO signal to
+# either process, starts nothing, and stops nothing -- see
+# src/breezy/runtime/liveness_probe_cli.py for the two-probe design that
+# tells a genuine absence from a transient pgrep hiccup (B4).
+#
+# INERT until an operator daemon-reload + enable OUTSIDE the protected
+# window [16:45Z, 01:15Z) (see deploy/systemd/README.md). The build never
+# runs any systemctl verb.
+Description=Breezy supervisor/node liveness watchdog (read-only probe)
+Documentation=file:///home/jon/breezy/deploy/systemd/README.md
+Documentation=file:///home/jon/breezy/src/breezy/runtime/liveness_probe_cli.py
+
+[Service]
+Type=oneshot
+UMask=0077
+WorkingDirectory=/home/jon/breezy
+
+# Optional and absent by default (leading `-`): the operator's webhook
+# destination. Absent -> resolve_alert_sink() falls back to
+# LoggingAlertSink; the probe itself is unaffected either way.
+#
+# N6 (accepted residual, stated not hidden): this means a process
+# HOLDING the URL in its environ now exists every 5 minutes (this
+# unit's own cadence), not only on a parent unit's failure as with
+# breezy-alert@.service. `/proc/<pid>/environ` is readable by same-UID
+# processes regardless; nothing here widens that beyond what is already
+# true of breezy-trade-supervisor.service and breezy-quote-tape.service.
+EnvironmentFile=-%h/.config/breezy/alerts.env
+
+# A single plain command -- no shell, no `$(...)`, no `%`-date-format
+# specifier beyond systemd's own `%h` (resolved by systemd itself, never
+# by a shell). The console script takes no arguments.
+ExecStart=%h/breezy/.venv/bin/python -m breezy.runtime.liveness_probe_cli
+
+TimeoutStartSec=60
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=breezy-liveness-watchdog
+
+# NO SuccessExitStatus. Exit contract (liveness_probe_cli.py): 0 = both
+# processes accounted for (present, or absent within an expected window);
+# 1 = a confirmed absence was reported; 2 = an internal error (never a
+# crash -- the probe catches its own exceptions).
+
+# NOTE: no [Install] section here -- see breezy-liveness-watchdog.timer,
+# which IS enabled (the timer, never this service directly).
