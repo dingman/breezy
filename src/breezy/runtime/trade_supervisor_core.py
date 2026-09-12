@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import datetime as dt
 import re
+from collections.abc import Mapping
 from dataclasses import dataclass, replace
 from enum import Enum
 from typing import Final
@@ -71,6 +72,32 @@ PERMIT_NOT_ISSUED_MARKER: Final[str] = "order submission permit not issued"
 TRADING_NODE_FAILED_MARKER: Final[str] = "trading node failed"
 STRATEGY_SUBSCRIBED_MARKER: Final[str] = "CurrentRungHoldStrategy subscribed"
 
+#: [2026-09-12] Pinned the same way, against
+#: ``strategy/current_rung_hold/continuous_strategy.py``'s own class name --
+#: see ``tests/unit/test_trade_supervisor_cont_self_check.py``. A boot-time
+#: raise of this error (Phase 0 mis-wiring) reaches the node's log via
+#: ``app/trade.py``'s ``_report(..., exc_info=True)``, same path as
+#: ``TRADING_NODE_FAILED_MARKER`` above.
+PHASE0_PERMIT_FORBIDDEN_MARKER: Final[str] = "Phase0PermitForbiddenError"
+
+#: [2026-09-12] The two ``SqliteStateStore`` keys the continuous family's
+#: self-check reads directly -- literal duplicates of
+#: ``strategy/current_rung_hold/trial_day_latch.py``'s own
+#: ``STARTUP_EVIDENCE_KEY``/``FAMILY_HALT_KEY``, never imported from there:
+#: the layers contract (``pyproject.toml``) forbids ``runtime`` reaching up
+#: into ``strategy``. Pinned against the real source the same way as the
+#: markers above.
+CONTINUOUS_STARTUP_EVIDENCE_KEY: Final[str] = "exec/polymarket_us/startup_evidence"
+CONTINUOUS_FAMILY_HALT_KEY: Final[str] = "continuous_rung_hold/halt"
+#: [2026-09-12 cross-seam fix] The store has no delete, so
+#: ``breezy-clear-family-halt`` (``trial_day_latch.TrialDayLatch.clear_family_halt``)
+#: overwrites ``CONTINUOUS_FAMILY_HALT_KEY`` with this exact sentinel rather
+#: than leaving an absent key. Literal duplicate of that module's own
+#: private ``_HALT_CLEARED_MARKER`` -- pinned byte-for-byte against it in
+#: ``tests/unit/test_trade_supervisor_cont_self_check.py`` (tests may import
+#: both layers; production code here still never imports ``strategy``).
+CONTINUOUS_FAMILY_HALT_CLEARED_MARKER: Final[bytes] = b'{"v":1,"state":"cleared"}'
+
 EXIT_OK: Final[int] = 0
 EXIT_RUNTIME_ERROR: Final[int] = 1
 EXIT_CONFIG_ERROR: Final[int] = 2
@@ -93,6 +120,15 @@ class AlertDetail(str, Enum):
     SELF_CHECK_FAIL_SHADOW_MODE_NO_PERMIT = "self_check_fail_shadow_mode_no_permit"
     SELF_CHECK_FAIL_MULTIPLE_FLOCK_HOLDERS = "self_check_fail_multiple_flock_holders"
     SELF_CHECK_FAIL_CHILD_EXITED = "self_check_fail_child_exited"
+    #: [2026-09-12] Continuous-family-only self-check extensions -- each
+    #: names exactly one of the three checks in ``ContinuousFamilyCheck``.
+    SELF_CHECK_FAIL_CONTINUOUS_PHASE0_FORBIDDEN = (
+        "self_check_fail_continuous_phase0_forbidden"
+    )
+    SELF_CHECK_FAIL_CONTINUOUS_STARTUP_EVIDENCE_INVALID = (
+        "self_check_fail_continuous_startup_evidence_invalid"
+    )
+    SELF_CHECK_FAIL_CONTINUOUS_FAMILY_HALTED = "self_check_fail_continuous_family_halted"
     PHASE_EXCEPTION_CONTAINED = "phase_exception_contained"
 
 
@@ -140,6 +176,12 @@ class SelfCheckResult(str, Enum):
     FAIL_SHADOW_MODE_NO_PERMIT = "FAIL_SHADOW_MODE_NO_PERMIT"
     FAIL_MULTIPLE_FLOCK_HOLDERS = "FAIL_MULTIPLE_FLOCK_HOLDERS"
     FAIL_CHILD_EXITED = "FAIL_CHILD_EXITED"
+    #: [2026-09-12] Continuous-family-only -- see ``ContinuousFamilyCheck``.
+    #: Never reached when ``continuous_check`` is ``None`` (flag absent),
+    #: which keeps v2 callers byte-identical.
+    FAIL_CONTINUOUS_PHASE0_FORBIDDEN = "FAIL_CONTINUOUS_PHASE0_FORBIDDEN"
+    FAIL_CONTINUOUS_STARTUP_EVIDENCE_INVALID = "FAIL_CONTINUOUS_STARTUP_EVIDENCE_INVALID"
+    FAIL_CONTINUOUS_FAMILY_HALTED = "FAIL_CONTINUOUS_FAMILY_HALTED"
 
 
 #: Every FAIL member maps to a fixed alert detail; PASS emits no alert.
@@ -150,7 +192,103 @@ SELF_CHECK_ALERT_DETAIL: Final[dict[SelfCheckResult, AlertDetail]] = {
         AlertDetail.SELF_CHECK_FAIL_MULTIPLE_FLOCK_HOLDERS
     ),
     SelfCheckResult.FAIL_CHILD_EXITED: AlertDetail.SELF_CHECK_FAIL_CHILD_EXITED,
+    SelfCheckResult.FAIL_CONTINUOUS_PHASE0_FORBIDDEN: (
+        AlertDetail.SELF_CHECK_FAIL_CONTINUOUS_PHASE0_FORBIDDEN
+    ),
+    SelfCheckResult.FAIL_CONTINUOUS_STARTUP_EVIDENCE_INVALID: (
+        AlertDetail.SELF_CHECK_FAIL_CONTINUOUS_STARTUP_EVIDENCE_INVALID
+    ),
+    SelfCheckResult.FAIL_CONTINUOUS_FAMILY_HALTED: (
+        AlertDetail.SELF_CHECK_FAIL_CONTINUOUS_FAMILY_HALTED
+    ),
 }
+
+
+@dataclass(frozen=True, slots=True)
+class ContinuousFamilyCheck:
+    """[2026-09-12] The three additional named checks the 17:05 UTC
+    self-check runs ONLY when the continuous family
+    (``BREEZY_CONTINUOUS_RUNG_HOLD=1``) is active for this process. Each is
+    reported by name -- never folded into one opaque boolean -- both in the
+    self-check log line and, on failure, as a distinct
+    :class:`SelfCheckResult`/``AlertDetail`` pair.
+    """
+
+    #: (a) no :data:`PHASE0_PERMIT_FORBIDDEN_MARKER` in the node's log.
+    phase0_clean: bool
+    #: (b) see :func:`continuous_startup_evidence_valid`.
+    startup_evidence_valid: bool
+    #: (c) the family-halt key is absent.
+    family_not_halted: bool
+
+    @property
+    def passed(self) -> bool:
+        return self.phase0_clean and self.startup_evidence_valid and self.family_not_halted
+
+
+def continuous_startup_evidence_valid(
+    evidence: Mapping[str, object] | None, *, launch_ns: int
+) -> bool:
+    """(b): the durable startup-evidence record exists, was written at or
+    after ``launch_ns`` (today's 16:50 UTC launch), and declares
+    ``eof_complete=True`` and ``position_read_refused=False``.
+
+    Fails closed on absence or any malformed/unexpected field -- a
+    corrupt or stale record is indistinguishable here from "never written
+    this launch", matching :func:`TrialDayLatch.read_startup_evidence`'s own
+    fail-closed stance on the write side.
+    """
+    if evidence is None:
+        return False
+    ts_ns = evidence.get("ts_ns")
+    if not isinstance(ts_ns, int) or isinstance(ts_ns, bool):
+        return False
+    if ts_ns < launch_ns:
+        return False
+    if evidence.get("eof_complete") is not True:
+        return False
+    return evidence.get("position_read_refused") is False
+
+
+def continuous_family_is_halted(raw_halt_value: bytes | None) -> bool:
+    """(c): mirrors ``TrialDayLatch.is_family_halted()`` exactly. The store
+    has no delete, so a legitimate ``breezy-clear-family-halt`` run leaves
+    :data:`CONTINUOUS_FAMILY_HALT_CLEARED_MARKER` in place rather than an
+    absent key -- key-present therefore does NOT mean halted on its own.
+
+    Absent key or exactly the cleared sentinel -> not halted. Any other
+    stored value -- including corrupt or unrecognised bytes -- IS halted,
+    fail-closed, matching the strategy layer's own stance rather than
+    laundering an unknown value into a false PASS.
+    """
+    return raw_halt_value is not None and raw_halt_value != CONTINUOUS_FAMILY_HALT_CLEARED_MARKER
+
+
+def continuous_family_check(
+    *,
+    log_text: str,
+    startup_evidence: Mapping[str, object] | None,
+    family_halted: bool,
+    launch_ns: int,
+) -> ContinuousFamilyCheck:
+    """Pure projection of already-fetched I/O (a log-reader delta, the
+    startup-evidence record, and the family-halt flag) onto the three named
+    checks. No I/O of its own -- the shell resolves every input first."""
+    return ContinuousFamilyCheck(
+        phase0_clean=PHASE0_PERMIT_FORBIDDEN_MARKER not in log_text,
+        startup_evidence_valid=continuous_startup_evidence_valid(
+            startup_evidence, launch_ns=launch_ns
+        ),
+        family_not_halted=not family_halted,
+    )
+
+
+def launch_time_ns(day: dt.date) -> int:
+    """Today's 16:50 UTC launch instant, in epoch nanoseconds -- the floor
+    a continuous-family startup-evidence record's ``ts_ns`` must meet or
+    exceed to count as "written after today's launch". Mirrors ``_at``'s own
+    ``datetime.combine(day, time_, tzinfo=dt.UTC)`` construction."""
+    return int(_at(day, LAUNCH_UTC).timestamp() * 1e9)
 
 
 def decide_stop_prior_action(
@@ -270,6 +408,7 @@ def self_check(
     permit_expiry_valid: bool,
     strategy_subscribed: bool,
     log_available: bool = True,
+    continuous_check: ContinuousFamilyCheck | None = None,
 ) -> SelfCheckResult:
     """[B4/E3/D2] The 17:05 UTC self-check. Exactly one PASS/FAIL result.
 
@@ -282,6 +421,18 @@ def self_check(
     are unreadable without a log) and PASSes on flock+liveness evidence
     alone, as ``PASS_ADOPTED_LOG_UNKNOWN`` -- never silently folded into a
     plain ``PASS`` it did not actually verify.
+
+    [2026-09-12] ``continuous_check`` is ``None`` by default -- every
+    existing caller (v2, or any caller that never set
+    ``BREEZY_CONTINUOUS_RUNG_HOLD=1``) sees byte-identical behaviour, because
+    the block below is skipped entirely. When the continuous family is
+    active the caller resolves a :class:`ContinuousFamilyCheck` first (log
+    scan + a read-only store read) and passes it here; each of its three
+    named checks that fails maps to its OWN ``SelfCheckResult``, evaluated
+    only once every earlier (structural) check has already passed -- a
+    continuous-family failure is reported on top of a healthy node, never
+    instead of a genuine ``FAIL_CHILD_EXITED``/``FAIL_NODE_NOT_READY``/
+    ``FAIL_SHADOW_MODE_NO_PERMIT``.
     """
     if not child_alive:
         return SelfCheckResult.FAIL_CHILD_EXITED
@@ -295,6 +446,13 @@ def self_check(
         return SelfCheckResult.FAIL_NODE_NOT_READY
     if not (permit_issued and permit_expiry_valid):
         return SelfCheckResult.FAIL_SHADOW_MODE_NO_PERMIT
+    if continuous_check is not None:
+        if not continuous_check.phase0_clean:
+            return SelfCheckResult.FAIL_CONTINUOUS_PHASE0_FORBIDDEN
+        if not continuous_check.startup_evidence_valid:
+            return SelfCheckResult.FAIL_CONTINUOUS_STARTUP_EVIDENCE_INVALID
+        if not continuous_check.family_not_halted:
+            return SelfCheckResult.FAIL_CONTINUOUS_FAMILY_HALTED
     return SelfCheckResult.PASS
 
 

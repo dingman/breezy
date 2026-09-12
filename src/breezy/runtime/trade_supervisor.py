@@ -26,6 +26,7 @@ from __future__ import annotations
 import datetime as dt
 import errno
 import fcntl
+import json
 import logging
 import os
 import resource
@@ -41,6 +42,7 @@ from typing import Final, TextIO
 
 from breezy.runtime.exec_state_db_path import ExecStateDbNotConfiguredError, resolve_store_path
 from breezy.runtime.health import AlertPayload, AlertSink, emit_alert, resolve_alert_sink
+from breezy.runtime.settings import CONTINUOUS_RUNG_HOLD_VAR
 from breezy.runtime.sqlite_store import SqliteStateStore
 from breezy.runtime.submit_intent import (
     CURRENT_INTENT_KEY,
@@ -49,6 +51,8 @@ from breezy.runtime.submit_intent import (
     SubmitIntentState,
 )
 from breezy.runtime.trade_supervisor_core import (
+    CONTINUOUS_FAMILY_HALT_KEY,
+    CONTINUOUS_STARTUP_EVIDENCE_KEY,
     LAUNCH_UTC,
     MAX_RELAUNCH_ATTEMPTS,
     MIN_RELAUNCH_GAP,
@@ -61,6 +65,7 @@ from breezy.runtime.trade_supervisor_core import (
     STRATEGY_SUBSCRIBED_MARKER,
     SUPERVISOR_ARGV_TOKEN,
     AlertDetail,
+    ContinuousFamilyCheck,
     DaySchedulerState,
     LaunchAction,
     Phase,
@@ -68,10 +73,13 @@ from breezy.runtime.trade_supervisor_core import (
     StopPriorAction,
     assert_no_live_node_before_intent_probe,
     classify_exit1_cause,
+    continuous_family_check,
+    continuous_family_is_halted,
     decide_launch_action,
     decide_relaunch,
     decide_stop_prior_action,
     initial_scheduler_state,
+    launch_time_ns,
     mark_phase_fired,
     next_due,
     parse_permit_expiry_ns,
@@ -317,6 +325,68 @@ def probe_open_intent(store_path: Path, *, node_pid: int | None) -> bool:
         except SubmitIntentCorrupt:
             return True
         return record.state is SubmitIntentState.OPEN
+
+
+# ---------------------------------------------------------------------------
+# [2026-09-12] Continuous-family self-check reads -- BREEZY_CONTINUOUS_RUNG_HOLD
+# only. Deliberately NOT routed through probe_open_intent/
+# assert_no_live_node_before_intent_probe: that guard is a business
+# invariant scoped to the pre-launch OPEN-intent probe specifically (its own
+# docstring: "[E5 scope] The probe is pre-launch ONLY"), not a technical
+# limitation of SqliteStateStore -- the self-check runs at 17:05 UTC, WHILE
+# the node is live, by design. Reading here is still safe: SqliteStateStore
+# opens WAL (`PRAGMA journal_mode=WAL`), which serves concurrent readers
+# against the node's own writer connection with no coordination needed, and
+# this helper only ever calls `.get()`, on a brand-new independent
+# connection -- never `.set()`, never sharing a connection or flock with the
+# node's own store handle.
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True, slots=True)
+class ContinuousFamilyStoreState:
+    startup_evidence: Mapping[str, object] | None
+    family_halted: bool
+
+
+def _decode_startup_evidence(raw: bytes | None) -> Mapping[str, object] | None:
+    """Fail-closed JSON decode of the startup-evidence record, matching
+    ``TrialDayLatch.read_startup_evidence``'s own stance: absent or
+    malformed is indistinguishable here from "never written". Duplicated
+    rather than imported -- ``runtime`` never imports ``strategy`` (layers
+    contract, ``pyproject.toml``)."""
+    if raw is None:
+        return None
+    try:
+        decoded: object = json.loads(raw.decode("utf-8"))
+    except ValueError:
+        return None
+    if not isinstance(decoded, dict):
+        return None
+    return decoded
+
+
+def read_continuous_family_store_state(store_path: Path) -> ContinuousFamilyStoreState:
+    """Read-only via a fresh, independent ``SqliteStateStore`` connection --
+    see the module note above for why this is safe while the node is live.
+
+    [2026-09-12 cross-seam fix] ``family_halted`` is NOT mere key presence:
+    the store has no delete, so a legitimate ``breezy-clear-family-halt``
+    run leaves the cleared sentinel in place rather than an absent key --
+    see :func:`continuous_family_is_halted`.
+    """
+    with SqliteStateStore(store_path) as store:
+        evidence = _decode_startup_evidence(store.get(CONTINUOUS_STARTUP_EVIDENCE_KEY))
+        family_halted = continuous_family_is_halted(store.get(CONTINUOUS_FAMILY_HALT_KEY))
+    return ContinuousFamilyStoreState(startup_evidence=evidence, family_halted=family_halted)
+
+
+def continuous_rung_hold_env_active() -> bool:
+    """``True`` iff ``BREEZY_CONTINUOUS_RUNG_HOLD`` is set to exactly
+    ``"1"`` -- the ONLY environment value this module ever reads for the
+    continuous-family self-check. Never the operator-reserved caps, and
+    never logged by value (only the derived booleans below are)."""
+    return os.environ.get(CONTINUOUS_RUNG_HOLD_VAR) == "1"
 
 
 # ---------------------------------------------------------------------------
@@ -639,6 +709,13 @@ class SupervisorPorts:
     alert_sink: AlertSink
     sigterm_poll_sleep: Callable[[float], None] = field(default=_time.sleep)
     find_adopted_log: Callable[[Path, int], Path | None] = field(default=find_adopted_node_log)
+    #: [2026-09-12] Defaults preserve v2 behaviour for every test/caller that
+    #: never sets these: a constant ``False`` means the continuous-family
+    #: self-check block is never entered (see ``_do_self_check``).
+    continuous_family_active: Callable[[], bool] = field(default=lambda: False)
+    read_continuous_family_store_state: Callable[[Path], ContinuousFamilyStoreState] = field(
+        default=lambda _p: ContinuousFamilyStoreState(startup_evidence=None, family_halted=False)
+    )
 
 
 def default_ports(*, alert_sink: AlertSink | None = None) -> SupervisorPorts:
@@ -655,6 +732,8 @@ def default_ports(*, alert_sink: AlertSink | None = None) -> SupervisorPorts:
         read_log_new=log_reader.read_new,
         alert_sink=alert_sink if alert_sink is not None else resolve_alert_sink(),
         find_adopted_log=find_adopted_node_log,
+        continuous_family_active=continuous_rung_hold_env_active,
+        read_continuous_family_store_state=read_continuous_family_store_state,
     )
 
 
@@ -948,6 +1027,17 @@ def _do_self_check(
         permit_issued = permit_issued_live
         expiry_valid = permit_expiry_valid(log_text, now_ns=now_ns)
 
+    continuous_check: ContinuousFamilyCheck | None = None
+    if ports.continuous_family_active():
+        store_state = ports.read_continuous_family_store_state(store_path)
+        launch_day = state.day if state is not None else now.date()
+        continuous_check = continuous_family_check(
+            log_text=log_text,
+            startup_evidence=store_state.startup_evidence,
+            family_halted=store_state.family_halted,
+            launch_ns=launch_time_ns(launch_day),
+        )
+
     result = self_check(
         child_alive=child_alive,
         flock_holder_count=holder_count,
@@ -956,8 +1046,18 @@ def _do_self_check(
         permit_expiry_valid=expiry_valid,
         strategy_subscribed=strategy_subscribed,
         log_available=node_log is not None,
+        continuous_check=continuous_check,
     )
-    log_decision("self_check", result=result.value)
+    if continuous_check is not None:
+        log_decision(
+            "self_check",
+            result=result.value,
+            continuous_phase0_clean=continuous_check.phase0_clean,
+            continuous_startup_evidence_valid=continuous_check.startup_evidence_valid,
+            continuous_family_not_halted=continuous_check.family_not_halted,
+        )
+    else:
+        log_decision("self_check", result=result.value)
     if result not in _SELF_CHECK_PASS_RESULTS:
         alert(
             ports.alert_sink,
