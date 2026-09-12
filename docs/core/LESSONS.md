@@ -1342,3 +1342,17 @@ Every venue-shape guard on a money surface MUST (1) emit the full names-only key
 
 ### How to apply
 Fixes: commits 8d56a26, ba2c5ee. Guards emit names-only key trees, allowlists are declared-and-logged per surface, resolver has backoff+age ceiling. Before accepting "shape drift handled", require: (a) the refusal names every field it saw, (b) the create path surfaces it visibly, (c) a test pins the new field as accepted post-fix. Related: L-17 (optional fields), L-22 (unforgeable primitives), L-36 (AMBIGUOUS semantics).
+
+## L-38 — A stop rule whose counter cannot increment is a missing stop, not a running clock (2026-09-12)
+
+### What happened
+PROGRESS.md carried date arithmetic for the structural-dead KILL ("the 15th lands 09-11 / 09-12") while the counter artefact (`derived/covered_listed_station_days_<date>.json`) had read `count: 0` for every station-day since D0. The zero was not an outage: the any-overlap rule (`structural_dead_stop.py:163-216`) combined with feed-wide gap fan-out (one reconnect → a gap row per subscribed instrument) meant no afternoon could ever qualify, and dead recorder processes left gap rows that never resolve. The family traded for eight days with its registered safety stop structurally unable to fire; only the calendar stop and the −60 contract-unit halt bounded it. Separately, the v3 tally wrapper passes the structural-dead population only for v2 (`family-tally-v2-run.sh:73,85`) and the installed timer invokes only `pm_us_crh_v2` (`breezy-pm-crh-v2-tally.service:46`), so the registered v3 family had no nightly tally at all: no look, no KILL, no SURVIVE could ever be declared for it.
+
+### Why this is binding
+A safety stop is only a stop if it can fire. A counter that reads zero for a week is either evidence of a dead market or evidence of a dead counter, and the two demand opposite actions; treating it as "the clock is running" hides that the family has no active stop. Backlog arithmetic built on the counter inherits the defect silently (L-5, L-32).
+
+### The rule
+Before citing any stop rule as active, read its counter artefact AND show that the counter can increment under normal operation (one positive control: a day that should count, counts). A stop that structurally cannot fire is reported as MISSING, in the same severity class as a missing permit, and the family's effective stops are restated without it. Never write time-to-KILL arithmetic from a counter that has never moved.
+
+### How to apply
+At every readiness readout: (1) the counter's last value and the date it last changed; (2) the mechanism that would make it change tomorrow; (3) whether every registered family's tally actually receives the counter (the wrapper's argument gate, not the module's ability). If any of the three is unknown, the stop is MISSING. Related: L-5, L-8, L-20, L-32, L-35. Evidence: `docs/evidence/READINESS_AUDIT_2026-09-12.md`, `docs/plans/COVERAGE_KILL_CLOCK_2026-09-12.md`.
