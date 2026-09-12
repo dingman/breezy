@@ -47,6 +47,7 @@ from breezy.adapters.polymarket_us.websocket import (
     WS_PATH,
     PolymarketUSMarketsWebSocket,
     PolymarketUSMarketsWebSocketPool,
+    ShardStatus,
     build_subscribe_envelope,
     build_unsubscribe_envelope,
 )
@@ -891,6 +892,43 @@ async def test_pool_aggregates_silent_subscriptions_across_shards() -> None:
 def test_pool_enables_positive_confirmation_by_default() -> None:
     """The pool is the production path -- unlike the bare class, it must default ON."""
     assert DEFAULT_SUBSCRIPTION_CONFIRMATION_SECS > 0
+
+
+@pytest.mark.allow_socket
+@pytest.mark.asyncio
+async def test_shard_status_exposes_per_shard_connectivity_and_slugs() -> None:
+    """The read-only surface `PolymarketUSDataClient` needs for shard-scoped gaps.
+
+    `is_connected` rolls every shard up with `all()` -- exactly the rollup
+    that over-counts one shard's reconnect as the whole feed going down. This
+    is the per-shard alternative: one `ShardStatus` per open connection,
+    carrying enough (label, liveness, its own slugs) for the caller to scope
+    accounting to the shard that actually dropped.
+    """
+    slugs = _weather_slugs(MAX_SUBSCRIPTIONS_PER_CONNECTION + 1)
+    async with LoopbackWebSocketServer() as server:
+        signer, _ = _new_signer()
+        pool = _make_pool(ws_url=server.url, signer=signer)
+        try:
+            await pool.connect()
+            await pool.subscribe_market_data(slugs)
+            await _wait_until(lambda: len(server.handshakes) == 2)
+
+            status = pool.shard_status
+            assert isinstance(status, tuple)
+            assert len(status) == 2
+            assert all(isinstance(entry, ShardStatus) for entry in status)
+            assert [entry.label for entry in status] == ["shard-0", "shard-1"]
+            assert all(entry.connected for entry in status)
+
+            all_slugs: set[str] = set()
+            for entry in status:
+                all_slugs.update(entry.subscribed_slugs)
+            assert all_slugs == set(slugs)
+            assert len(status[0].subscribed_slugs) == MAX_SUBSCRIPTIONS_PER_CONNECTION
+            assert len(status[1].subscribed_slugs) == 1
+        finally:
+            await pool.close()
 
 
 # --------------------------------------------------------------------------

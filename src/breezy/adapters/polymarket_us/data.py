@@ -731,11 +731,23 @@ class PolymarketUSDataClient(LiveMarketDataClient):
         self._quotes_published: int = 0
         self._frame_diagnostics: deque[FrameDiagnostic] = deque(maxlen=FRAME_DIAGNOSTICS_CAPACITY)
         # Tape-gap accounting. `None` for "never sampled yet", so the very
-        # first sample cannot be mistaken for a transition.
+        # first sample cannot be mistaken for a transition. When the feed
+        # exposes per-shard connectivity (`shard_status`, e.g. a
+        # `PolymarketUSMarketsWebSocketPool`), `_feed_was_connected` tracks
+        # the AGGREGATE "at least one shard up" state rather than the pool's
+        # own `is_connected` (which rolls up with `all()`), so the feed-wide
+        # gap below opens only once EVERY shard is down. See
+        # `_sample_tape_gaps`.
         self._feed_was_connected: bool | None = None
         self._gap_opened_ns: int | None = None
         self._tape_gaps: int = 0
         self._tape_gap_seconds_total: float = 0.0
+        # Shard-scoped tape-gap accounting -- unused, and empty, for any feed
+        # without `shard_status`. Keyed by shard label.
+        self._shard_was_connected: dict[str, bool] = {}
+        self._shard_gap_opened_ns: dict[str, int] = {}
+        self._shard_gap_seq: dict[str, int] = {}
+        self._shard_gap_slugs: dict[str, tuple[str, ...]] = {}
         self._trades_published: int = 0
         self._depth_levels_truncated: int = 0
         self._clock_offset_samples: int = 0
@@ -898,6 +910,12 @@ class PolymarketUSDataClient(LiveMarketDataClient):
     @property
     def tape_gaps(self) -> int:
         """Observed interruptions of the quote feed. **A LOWER BOUND.**
+
+        On a sharded feed (:attr:`MarketsFeed.shard_status` present) this is
+        a SHARED counter: it increments for a shard-scoped gap (one shard
+        down, its instruments only) exactly as it does for a feed-wide gap
+        (every shard down). It stays feed-wide-only, as before, for any feed
+        without shard information.
 
         Quotes that occur while the socket is down are lost permanently --
         Polymarket.us weather markets cannot be backfilled. The socket's
@@ -1807,17 +1825,8 @@ class PolymarketUSDataClient(LiveMarketDataClient):
         05:00Z the first of ~60 thin overnight weather markets to go quiet for
         60s would have ended the whole eight-hour capture in its first minute.
         """
-        connected = self._feed.is_connected
-        previous = self._feed_was_connected
-        self._feed_was_connected = connected
         now_ns = self._clock.timestamp_ns()
-
-        if previous is not False and not connected:
-            # Falling edge -- including the first sample if it finds the feed
-            # already down, because that is still an interval with no quotes.
-            self._open_tape_gap(now_ns)
-        elif previous is False and connected:
-            self._close_tape_gap(now_ns)
+        self._sample_tape_gaps(now_ns)
 
         self._report_new_silent_subscriptions()
 
@@ -1939,6 +1948,139 @@ class PolymarketUSDataClient(LiveMarketDataClient):
             return False
         return True
 
+    def _sample_tape_gaps(self, now_ns: int) -> None:
+        """Falling/rising edge detection for the tape-gap counters.
+
+        Shard-scoped when the feed exposes per-shard connectivity (a pool's
+        ``shard_status``): one shard's reconnect opens a gap for ONLY that
+        shard's instruments, and the feed-wide gap below opens only once
+        EVERY shard is down.
+        Before this, ``sample_feed_health`` read the pool's own
+        ``is_connected`` -- an ``all()`` rollup -- so one shard's idle-timer
+        reconnect (routine, overnight) declared the WHOLE feed down and
+        over-counted loss for every other shard's instruments.
+
+        A feed with no shard information (any :class:`MarketsFeed` double
+        lacking ``shard_status``, including every existing test double and
+        a bare, unsharded :class:`PolymarketUSMarketsWebSocket`) falls
+        straight through to the original single-rollup behaviour below,
+        unchanged.
+        """
+        shard_status = self._feed_shard_status()
+        if shard_status is None:
+            connected = self._feed.is_connected
+            previous = self._feed_was_connected
+            self._feed_was_connected = connected
+            if previous is not False and not connected:
+                # Falling edge -- including the first sample if it finds the
+                # feed already down, because that is still an interval with
+                # no quotes.
+                self._open_tape_gap(now_ns)
+            elif previous is False and connected:
+                self._close_tape_gap(now_ns)
+            return
+
+        all_down = all(not status.connected for status in shard_status)
+        aggregate_connected = not all_down
+        previous_aggregate = self._feed_was_connected
+        self._feed_was_connected = aggregate_connected
+
+        if previous_aggregate is not False and not aggregate_connected:
+            # Falling into a FULL outage: every shard's own gap is subsumed
+            # by the feed-wide one opened below, so close them first rather
+            # than double-count the same downtime under two counters.
+            for status in shard_status:
+                self._shard_was_connected[status.label] = status.connected
+                self._close_shard_gap(status.label, now_ns)
+            self._open_tape_gap(now_ns)
+            return
+
+        if previous_aggregate is False and aggregate_connected:
+            # Recovering from a FULL outage. Any shard still down lost its
+            # individual gap to the subsumption above, so it needs a FRESH
+            # one starting now -- its true start was earlier, which is this
+            # module's documented lower-bound tolerance (`tape_gaps`), not a
+            # new one.
+            self._close_tape_gap(now_ns)
+            for status in shard_status:
+                self._shard_was_connected[status.label] = status.connected
+                if not status.connected:
+                    self._open_shard_gap(status.label, status.subscribed_slugs, now_ns)
+            return
+
+        if all_down:
+            # Still fully down; the feed-wide gap already covers it.
+            return
+
+        for status in shard_status:
+            self._sample_one_shard(status.label, status.connected, status.subscribed_slugs, now_ns)
+
+    def _feed_shard_status(self) -> tuple[Any, ...] | None:
+        """Duck-typed, OPTIONAL capability: per-shard connectivity, if the feed has it.
+
+        Deliberately NOT part of the :class:`MarketsFeed` Protocol -- making it
+        a required member would force every existing feed (the bare,
+        unsharded production path included) to grow shard plumbing it has no
+        use for. Structurally satisfied by
+        :attr:`~breezy.adapters.polymarket_us.websocket.PolymarketUSMarketsWebSocketPool.shard_status`.
+        """
+        status = getattr(self._feed, "shard_status", None)
+        return None if status is None else tuple(status)
+
+    def _sample_one_shard(
+        self, label: str, connected: bool, subscribed_slugs: Sequence[str], now_ns: int
+    ) -> None:
+        previous = self._shard_was_connected.get(label)
+        self._shard_was_connected[label] = connected
+        if previous is not False and not connected:
+            self._open_shard_gap(label, subscribed_slugs, now_ns)
+        elif previous is False and connected:
+            self._close_shard_gap(label, now_ns)
+
+    def _open_shard_gap(self, label: str, subscribed_slugs: Sequence[str], now_ns: int) -> None:
+        if label in self._shard_gap_opened_ns:
+            return
+        self._shard_gap_opened_ns[label] = now_ns
+        self._shard_gap_slugs[label] = tuple(subscribed_slugs)
+        self._tape_gaps += 1
+        seq = self._tape_gaps
+        self._shard_gap_seq[label] = seq
+        self._log.error(
+            f"Quote tape gap #{seq} OPENED ({label}, {len(subscribed_slugs)} "
+            "instrument(s)): this shard is down. Quotes on it from now until "
+            "it returns are permanently lost -- the rest of the feed keeps "
+            "recording.",
+        )
+        self._publish_gap_records(
+            started_ns=now_ns,
+            ended_ns=0,
+            resolved=False,
+            ts_init=now_ns,
+            slugs=subscribed_slugs,
+            gap_seq=seq,
+        )
+
+    def _close_shard_gap(self, label: str, now_ns: int) -> None:
+        opened_ns = self._shard_gap_opened_ns.pop(label, None)
+        if opened_ns is None:
+            return
+        seq = self._shard_gap_seq.pop(label, self._tape_gaps)
+        slugs = self._shard_gap_slugs.pop(label, ())
+        seconds = max(0.0, (now_ns - opened_ns) / 1_000_000_000)
+        self._log.info(
+            f"Quote tape gap #{seq} CLOSED after ~{seconds:.1f}s ({label}). "
+            "That shard's tape resumes here; it is NOT continuous across "
+            "this point.",
+        )
+        self._publish_gap_records(
+            started_ns=opened_ns,
+            ended_ns=now_ns,
+            resolved=True,
+            ts_init=now_ns,
+            slugs=slugs,
+            gap_seq=seq,
+        )
+
     def _open_tape_gap(self, now_ns: int) -> None:
         if self._gap_opened_ns is not None:
             return
@@ -1969,25 +2111,39 @@ class PolymarketUSDataClient(LiveMarketDataClient):
         )
 
     def _publish_gap_records(
-        self, *, started_ns: int, ended_ns: int, resolved: bool, ts_init: int
+        self,
+        *,
+        started_ns: int,
+        ended_ns: int,
+        resolved: bool,
+        ts_init: int,
+        slugs: Sequence[str] | None = None,
+        gap_seq: int | None = None,
     ) -> None:
         """Write the outage to the TAPE, not only to the log.
 
         A log line is invisible to a study reading parquet. One record per
-        subscribed instrument, because a socket outage affects every market on
-        that socket and a per-instrument key is what lets a join exclude or
-        flag the contaminated interval.
+        AFFECTED instrument: ``slugs=None`` (the feed-wide gap) means every
+        subscribed instrument, exactly as before; a shard-scoped gap passes
+        only that shard's slugs, so an unaffected shard's instruments never
+        get a spurious gap row for another shard's outage. ``gap_seq``
+        defaults to :attr:`_tape_gaps`, matching the pre-existing feed-wide
+        call sites unchanged; shard-scoped callers pass the sequence number
+        assigned when THEIR gap opened, so ``resolved=True`` on close reuses
+        the same ``gap_seq`` as the ``resolved=False`` row opened it with (the
+        join contract -- see ``QuoteTapeGap``'s docstring).
 
         Emitted on BOTH edges: the ``resolved=False`` record on open means an
         outage in progress when the process dies is still on disk, which is the
         gap most likely to be missed and the one that contaminates everything
         after it.
         """
-        for instrument_id in self._subscribed_instrument_ids():
+        seq = self._tape_gaps if gap_seq is None else gap_seq
+        for instrument_id in self._subscribed_instrument_ids(slugs):
             self._publish_custom(
                 QuoteTapeGap(
                     instrument_id=instrument_id,
-                    gap_seq=self._tape_gaps,
+                    gap_seq=seq,
                     started_ns=started_ns,
                     ended_ns=ended_ns,
                     resolved=resolved,
@@ -1997,10 +2153,16 @@ class PolymarketUSDataClient(LiveMarketDataClient):
                 )
             )
 
-    def _subscribed_instrument_ids(self) -> list[InstrumentId]:
-        """Instruments this client is recording, resolved from latest discovery."""
+    def _subscribed_instrument_ids(self, slugs: Sequence[str] | None = None) -> list[InstrumentId]:
+        """Instruments this client is recording, resolved from latest discovery.
+
+        ``slugs=None`` resolves every actively-discovered slug, unchanged from
+        before; an explicit sequence (a shard's own subscriptions) resolves
+        only those.
+        """
+        source = self._provider_active_slugs() if slugs is None else slugs
         resolved: list[InstrumentId] = []
-        for slug in self._provider_active_slugs():
+        for slug in source:
             try:
                 resolved.append(slug_to_instrument_id(slug))
             except PolymarketUSError:  # pragma: no cover - config is validated upstream

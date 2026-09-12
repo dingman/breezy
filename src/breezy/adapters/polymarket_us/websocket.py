@@ -130,6 +130,7 @@ __all__ = [
     "WS_PATH",
     "PolymarketUSMarketsWebSocket",
     "PolymarketUSMarketsWebSocketPool",
+    "ShardStatus",
     "SilentSubscriptionWarning",
     "WebSocketErrorFrame",
     "build_subscribe_envelope",
@@ -432,6 +433,11 @@ class PolymarketUSMarketsWebSocket:
     @property
     def requires_auth(self) -> bool:
         return self._signer is not None
+
+    @property
+    def connection_label(self) -> str:
+        """This connection's label (``"single"`` bare, ``"shard-N"`` under the pool)."""
+        return self._connection_label
 
     @property
     def is_connected(self) -> bool:
@@ -1025,6 +1031,24 @@ def _reraise_if_cancelled() -> None:
         raise asyncio.CancelledError
 
 
+@dataclass(frozen=True, slots=True)
+class ShardStatus:
+    """One shard's connectivity, as of the moment it was read.
+
+    The OPTIONAL, duck-typed capability
+    :class:`~breezy.adapters.polymarket_us.data.PolymarketUSDataClient`'s
+    watchdog uses to scope tape-gap accounting to the shard that actually
+    dropped, instead of to :attr:`PolymarketUSMarketsWebSocketPool.is_connected`
+    -- which rolls every shard up with ``all()``, so one shard's idle-timer
+    reconnect would otherwise be counted as the WHOLE feed going down and
+    over-count loss for every other shard's instruments.
+    """
+
+    label: str
+    connected: bool
+    subscribed_slugs: tuple[str, ...]
+
+
 class PolymarketUSMarketsWebSocketPool:
     """Shard market-data subscriptions across connections to respect the venue cap.
 
@@ -1209,6 +1233,18 @@ class PolymarketUSMarketsWebSocketPool:
     @property
     def shard_count(self) -> int:
         return len(self._shards)
+
+    @property
+    def shard_status(self) -> tuple[ShardStatus, ...]:
+        """Per-shard connectivity, read-only. See :class:`ShardStatus`."""
+        return tuple(
+            ShardStatus(
+                label=shard.connection_label,
+                connected=shard.is_connected,
+                subscribed_slugs=tuple(shard.subscriptions),
+            )
+            for shard in self._shards
+        )
 
     # -- lifecycle ------------------------------------------------------------
 
