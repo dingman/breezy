@@ -41,6 +41,7 @@ from breezy.runtime.sqlite_store import SqliteStateStore
 from breezy.runtime.submit_intent import open_submit_intent_latch
 from breezy.strategy.current_rung_hold.continuous_strategy import ContinuousRungHoldStrategy
 from breezy.strategy.current_rung_hold.trial_day_latch import (
+    DUPLICATE_FILL_KEY_PREFIX,
     FAMILY_HALT_KEY,
     TrialDayLatch,
     open_trial_day_latch,
@@ -135,6 +136,13 @@ def test_a_genuine_fill_consumes_the_trial_via_the_facts_join(
 def test_a_replayed_fill_with_the_same_venue_order_id_is_idempotent(
     store_path: Path, interior_instrument: BinaryOption,
 ) -> None:
+    """(C-a) Also characterises `continuous_strategy.py`'s replay
+    idempotence at `_consume_or_flag_duplicate`'s own equality check
+    (`existing.venue_order_id == venue_order_id`): a replayed fill writes
+    NO duplicate-fill bucket and sets NO family halt. This is a SYNTHETIC
+    `on_order_filled` call, not an engine-driven reconciliation of a
+    CLAIMED instrument, and does NOT settle ruling R2-B (Rev 2 REVISE-7);
+    that engine-driven evidence is C-b, deferred with B1/B2."""
     strategy = _register_and_start(
         store_path=store_path,
         instruments=(interior_instrument,),
@@ -147,6 +155,8 @@ def test_a_replayed_fill_with_the_same_venue_order_id_is_idempotent(
     assert strategy._latch.is_family_halted() is False
     record = strategy._latch.record(STATION, CLIMATE_DAY.isoformat())
     assert record is not None and record.venue_order_id == "ord-1"
+    assert strategy._latch._store.get(f"{DUPLICATE_FILL_KEY_PREFIX}ord-1") is None
+    assert strategy._latch._store.get(FAMILY_HALT_KEY) is None
 
 
 def test_a_second_genuine_fill_with_a_different_id_halts_the_family(
