@@ -96,7 +96,10 @@ from breezy.adapters.polymarket_us.feed_fault import (
 )
 from breezy.runtime.account_presence_halt import install_account_presence_halt
 from breezy.runtime.backtest_order_guard import install_live_order_guard
-from breezy.runtime.component_health_watch import install_component_degraded_alert
+from breezy.runtime.component_health_watch import (
+    install_component_degraded_alert,
+    install_stale_intent_alert,
+)
 from breezy.runtime.logging_bridge import install as install_logging_bridge
 from breezy.runtime.logging_bridge import uninstall as uninstall_logging_bridge
 from breezy.runtime.node_config import NodeConfigError, build_trade_node_config
@@ -293,6 +296,29 @@ def _exec_client_refusal_reader(node: Node) -> Callable[[], tuple[str, ...]]:
     return _read
 
 
+def _exec_client_stale_intent_reader(node: Node) -> Callable[[], tuple[Mapping[str, str], ...]]:
+    """Build the ``stale_alerts`` reader the stale-intent watch requires.
+
+    Same lookup and same lazy-resolution reasoning as
+    :func:`_exec_client_refusal_reader` immediately above: the client is
+    looked up at poll time, never pinned into a closure at wiring time.
+
+    ``getattr(..., ())`` rather than a direct attribute read, deliberately:
+    the exec client on THIS node carries ``stale_ambiguous_intent_alerts``,
+    but this reader must not assume every registered exec client does --
+    a client without the attribute, like a missing client, yields ``()``
+    rather than raising inside a message-bus handler.
+    """
+
+    def _read() -> tuple[Mapping[str, str], ...]:
+        client = node.kernel.exec_engine._clients.get(ClientId(POLYMARKET_US_CLIENT_NAME))
+        if client is None:
+            return ()
+        return tuple(getattr(client, "stale_ambiguous_intent_alerts", ()))
+
+    return _read
+
+
 def _run_node(
     config: TradingNodeConfig,
     node_factory: NodeFactory,
@@ -380,6 +406,10 @@ def _run_node(
             node.kernel.msgbus,
             component_id=POLYMARKET_US_CLIENT_NAME,
             reasons=_exec_client_refusal_reader(node),
+        )
+        install_stale_intent_alert(
+            node.kernel.msgbus,
+            stale_alerts=_exec_client_stale_intent_reader(node),
         )
         install_account_presence_halt(
             node.kernel.msgbus,

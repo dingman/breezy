@@ -80,7 +80,7 @@ from nautilus_trader.common.messages import ComponentStateChanged
 from breezy.runtime.health import AlertPayload, emit_alert, resolve_alert_sink
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
-    from collections.abc import Callable, Sequence
+    from collections.abc import Callable, Mapping, Sequence
 
     from nautilus_trader.common.component import MessageBus
 
@@ -119,6 +119,115 @@ def _detail(component_id: str, reasons: Sequence[str]) -> str:
     if not reasons:
         return f"{component_id} DEGRADED; no refusal reason recorded"
     return f"{component_id} DEGRADED after {len(reasons)} refusal(s): " + "; ".join(reasons)
+
+
+#: The ``AlertPayload.event`` for a still-OPEN, still-unresolved AMBIGUOUS
+#: intent whose age has crossed an execution client's staleness threshold.
+#: See the ``stale_ambiguous_intent_alerts`` health property (2026-09-11
+#: incident addendum, item 3): that property only RECORDS the condition --
+#: this module is the one place with both an ``AlertSink`` and permission to
+#: import it that can actually dispatch the alert.
+STALE_INTENT_ALERT_EVENT: Final[str] = "open_intent_stale"
+
+#: CRITICAL, matching the client's own pre-built detail mapping: an OPEN
+#: intent an operator cannot see the outcome of is exactly the kind of thing
+#: that must not wait for next week's log review.
+STALE_INTENT_ALERT_SEVERITY: Final[str] = "CRITICAL"
+
+#: Same convention as ``DEGRADED_ALERT_SITE``: the condition is process-wide,
+#: not per-market, so the intent's identity travels in ``detail`` instead.
+STALE_INTENT_ALERT_SITE: Final[str] = "global"
+
+
+def _stale_intent_detail(alert: Mapping[str, str]) -> str:
+    intent_id = alert.get("intent_id", "<unknown>")
+    venue_order_id = alert.get("venue_order_id", "<unknown>")
+    age_minutes = alert.get("age_minutes", "<unknown>")
+    last_failure_kind = alert.get("last_failure_kind", "<unknown>")
+    return (
+        f"intent {intent_id} (venue order {venue_order_id}) has been OPEN "
+        f"AMBIGUOUS and unresolved for {age_minutes} minute(s); last "
+        f"resolver failure: {last_failure_kind}"
+    )
+
+
+def install_stale_intent_alert(
+    msgbus: MessageBus,
+    *,
+    stale_alerts: Callable[[], Sequence[Mapping[str, str]]],
+    sink: AlertSink | None = None,
+) -> Callable[[object], None]:
+    """Subscribe one operator alert per intent id that goes stale.
+
+    Wired onto the SAME ``COMPONENT_STATE_TOPIC`` heartbeat
+    ``install_component_degraded_alert`` subscribes -- exactly the "secondary
+    path" idiom ``current_rung_hold.composition.
+    install_current_rung_hold_refusal_watch`` already uses to re-check a
+    non-event-driven surface on every state change in the run, rather than
+    adding a second timer.
+
+    Parameters
+    ----------
+    msgbus
+        A LIVE node's ``node.kernel.msgbus``, after ``build()``.
+    stale_alerts
+        Reads the execution client's ``stale_ambiguous_intent_alerts``
+        health property at the moment of the poll. A callable, exactly like
+        ``install_component_degraded_alert``'s ``reasons``, so this module
+        never pins the client object into its own closure and never names
+        the venue it came from.
+    sink
+        Defaults to :func:`~breezy.runtime.health.resolve_alert_sink`.
+
+    Returns
+    -------
+    The subscribed handler, so a caller (and a test) can hold it.
+
+    Notes
+    -----
+    Dedupe is by ``intent_id``, never by call count: an id already alerted
+    on is skipped on every later poll, and an id that drops out of the
+    surface (the exec client's ``_retire`` clears its own bookkeeping the
+    moment the intent retires) is forgotten here too, so a LATER intent
+    that happens to reach the same age alerts again -- exactly the
+    semantics the property's own docstring documents.
+    """
+    active_sink = resolve_alert_sink() if sink is None else sink
+    alerted_intent_ids: set[str] = set()
+
+    def _on_component_state(event: object) -> None:
+        # Every event on the shared topic is just a poll trigger; the stale-
+        # intent surface, unlike the DEGRADED transition, carries no signal
+        # of its own to inspect on the event itself.
+        del event
+        try:
+            current = tuple(stale_alerts())
+        # Broad, deliberately: a broken reader must not crash the component
+        # publishing the triggering event (CONTAINMENT, module docstring).
+        except Exception:
+            logger.exception("failed to read stale_ambiguous_intent_alerts")
+            return
+
+        current_ids = {alert.get("intent_id", "") for alert in current}
+        alerted_intent_ids.intersection_update(current_ids)
+
+        for alert in current:
+            intent_id = alert.get("intent_id", "")
+            if intent_id in alerted_intent_ids:
+                continue
+            alerted_intent_ids.add(intent_id)
+            emit_alert(
+                active_sink,
+                AlertPayload(
+                    severity=STALE_INTENT_ALERT_SEVERITY,
+                    event=STALE_INTENT_ALERT_EVENT,
+                    site=STALE_INTENT_ALERT_SITE,
+                    detail=_stale_intent_detail(alert),
+                ),
+            )
+
+    msgbus.subscribe(topic=COMPONENT_STATE_TOPIC, handler=_on_component_state)
+    return _on_component_state
 
 
 def install_component_degraded_alert(

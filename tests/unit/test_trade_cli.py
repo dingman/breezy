@@ -55,6 +55,7 @@ from breezy.adapters.polymarket_us.operator_controls import (
 from breezy.adapters.polymarket_us.safety import MAX_ORDER_NOTIONAL_USD_ENV_VAR
 from breezy.runtime import trade_cli
 from breezy.runtime.backtest_order_guard import ORDER_EVENT_TOPIC, NakedShortRefusedError
+from breezy.runtime.component_health_watch import COMPONENT_STATE_TOPIC
 from breezy.runtime.settings import LIVE_OBSERVATIONS_VAR, TRADE_TRADER_ID_VAR
 from breezy.runtime.trade_cli import (
     EXIT_CONFIG_ERROR,
@@ -320,6 +321,24 @@ def test_exactly_one_execution_client_factory_is_registered_under_the_routing_na
     assert set(node.config.exec_clients) == {POLYMARKET_US_CLIENT_NAME}
     assert node.config.strategies == []
     assert node.config.exec_algorithms == []
+
+
+def test_the_stale_intent_watch_is_installed_beside_the_degraded_alert() -> None:
+    """2026-09-11 incident addendum, item 3: `install_stale_intent_alert`
+    rides the SAME `COMPONENT_STATE_TOPIC` heartbeat
+    `install_component_degraded_alert` already subscribes -- one wiring
+    idiom, not a second timer. Exactly two subscribers on that topic:
+    nothing else in `_run_node` uses it (the order guard and the account
+    presence halt both subscribe `ORDER_EVENT_TOPIC` instead)."""
+    run(env=TRADE_ENV, node_factory=RecordingNode, stderr=io.StringIO())
+    node = RecordingNode.instances[0]
+
+    component_state_subscribers = [
+        handler
+        for topic, handler in node.kernel.msgbus.subscriptions
+        if topic == COMPONENT_STATE_TOPIC
+    ]
+    assert len(component_state_subscribers) == 2, node.kernel.msgbus.subscriptions
 
 
 def test_the_entrypoint_source_registers_no_strategy_or_exec_algorithm_or_raw_submit() -> None:
