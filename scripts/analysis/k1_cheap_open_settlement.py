@@ -71,7 +71,7 @@ import datetime as dt
 import math
 import sys
 from collections import defaultdict
-from collections.abc import Iterable, Sequence
+from collections.abc import Callable, Iterable, Sequence
 from dataclasses import dataclass
 from decimal import Decimal
 from pathlib import Path
@@ -597,13 +597,14 @@ def _decode_raw_fixed_point(value: bytes) -> int:
     return int.from_bytes(value, "little", signed=True)
 
 
-def _depth_table_identity(table: pa.Table) -> tuple[str, int, int]:
-    """`(instrument_id, price_precision, size_precision)` for one depth file.
+def _table_identity(table: pa.Table) -> tuple[str, int, int]:
+    """`(instrument_id, price_precision, size_precision)` for one tape file.
 
-    One depth batch can only ever hold ONE instrument at one precision --
-    `ArrowSerializer.serialize_batch` itself raises ``Mixed metadata`` the
-    moment two are combined -- so these are read ONCE per file from the
-    schema metadata, never per row.
+    Shared by both `_stream_depth_ask_observations` and
+    `_stream_quote_ask_observations`: one batch of either kind can only ever
+    hold ONE instrument at one precision -- `ArrowSerializer.serialize_batch`
+    itself raises ``Mixed metadata`` the moment two are combined -- so these
+    are read ONCE per file from the schema metadata, never per row.
     """
     metadata = table.schema.metadata or {}
     return (
@@ -636,7 +637,9 @@ def _best_populated_ask_raw(
     return min(populated, key=lambda level: level[0])
 
 
-def _load_depth_ask_observations(tape_root: Path) -> tuple[TapePreflight, list[AskObservation]]:
+def _stream_depth_ask_observations(
+    tape_root: Path, on_observation: Callable[[AskObservation], None]
+) -> TapePreflight:
     """Stream `order_book_depths` straight to best-ask observations.
 
     `OrderBookDepth10` Python objects are never built for this stream. The
@@ -654,6 +657,13 @@ def _load_depth_ask_observations(tape_root: Path) -> tuple[TapePreflight, list[A
     file's table is ever resident: it is read, reduced to observations, and
     dropped before the next file is opened.
 
+    Every genuine-or-not observation is handed to `on_observation` as it is
+    produced, rather than collected into a list here -- the CALLER decides
+    whether to materialize (`_load_depth_ask_observations`, kept for
+    equivalence tests) or fold it straight into O(instruments) accumulator
+    state (`build_population`). This function itself never holds more than
+    one row's observation at a time.
+
     Preflight accounting (`raw_rows`, `deduplicated_rows`,
     `rows_per_instrument`, the ts bounds) is computed identically to
     `_load_stream` -- over EVERY deduplicated row, whether or not that row
@@ -669,12 +679,11 @@ def _load_depth_ask_observations(tape_root: Path) -> tuple[TapePreflight, list[A
     rows_per_instrument: dict[str, int] = defaultdict(int)
     ts_min: int | None = None
     ts_max: int | None = None
-    observations: list[AskObservation] = []
 
     for path in files:
         try:
             table = _read_arrow_table(path)
-            instrument_id, price_precision, size_precision = _depth_table_identity(table)
+            instrument_id, price_precision, size_precision = _table_identity(table)
             ts_events = table.column("ts_event").to_pylist()
             ts_inits = table.column("ts_init").to_pylist()
             ask_price_cols = [
@@ -712,7 +721,7 @@ def _load_depth_ask_observations(tape_root: Path) -> tuple[TapePreflight, list[A
             if best is None:
                 continue
             raw_price, raw_size = best
-            observations.append(
+            on_observation(
                 AskObservation(
                     instrument_id=instrument_id,
                     ts_event_ns=ts_event,
@@ -728,7 +737,7 @@ def _load_depth_ask_observations(tape_root: Path) -> tuple[TapePreflight, list[A
         # pins -- one file's table must be gone before the next is read.
         del table, ts_events, ts_inits, ask_price_cols, ask_size_cols
 
-    preflight = TapePreflight(
+    return TapePreflight(
         data_class=OrderBookDepth10.__name__,
         files_found=len(files),
         files_parsed=files_parsed,
@@ -741,6 +750,120 @@ def _load_depth_ask_observations(tape_root: Path) -> tuple[TapePreflight, list[A
         ts_event_min_ns=ts_min,
         ts_event_max_ns=ts_max,
     )
+
+
+def _load_depth_ask_observations(tape_root: Path) -> tuple[TapePreflight, list[AskObservation]]:
+    """Materializing wrapper over `_stream_depth_ask_observations`.
+
+    Kept reachable under this name for the equivalence tests that compare it
+    against `_load_stream` + `_asks_from_depth`. `build_population` itself no
+    longer calls this -- it uses the streaming core directly with an
+    accumulator callback, so the tape-wide list this returns is never built
+    on the hot path.
+    """
+    observations: list[AskObservation] = []
+    preflight = _stream_depth_ask_observations(tape_root, observations.append)
+    return preflight, observations
+
+
+def _stream_quote_ask_observations(
+    tape_root: Path, on_observation: Callable[[AskObservation], None]
+) -> TapePreflight:
+    """Stream `quote_tick` straight to ask observations, mirroring depth.
+
+    `QuoteTick` has exactly one ask level (no `_best_populated_ask_raw` scan
+    needed), but is otherwise the same shape as
+    `_stream_depth_ask_observations`: a flat Arrow schema
+    (`ask_price`/`ask_size`/`ts_event`/`ts_init` plus `instrument_id`/
+    `price_precision`/`size_precision` in the file's schema metadata --
+    verified identical to the depth file's own metadata shape), decoded via
+    `Price.from_raw`/`Quantity.from_raw` at the file's own precision, one
+    file's table resident at a time. Every row produces an observation
+    UNCONDITIONALLY -- including a zero-price/zero-size ask -- matching
+    `_asks_from_quotes`, which does not filter; genuineness is judged later.
+    """
+    files = _tape_files(tape_root, "quote_tick")
+    now_ns = int(dt.datetime.now(dt.UTC).timestamp() * _NS_PER_SECOND)
+    failures: list[tuple[str, str, str]] = []
+    files_parsed = 0
+    raw_rows = 0
+    seen: set[tuple[str, int, int]] = set()
+    rows_per_instrument: dict[str, int] = defaultdict(int)
+    ts_min: int | None = None
+    ts_max: int | None = None
+
+    for path in files:
+        try:
+            table = _read_arrow_table(path)
+            instrument_id, price_precision, size_precision = _table_identity(table)
+            ts_events = table.column("ts_event").to_pylist()
+            ts_inits = table.column("ts_init").to_pylist()
+            ask_prices = table.column("ask_price").to_pylist()
+            ask_sizes = table.column("ask_size").to_pylist()
+            row_count = table.num_rows
+        except Exception as exc:  # noqa: BLE001 -- the count IS the finding
+            mtime_ns = int(path.stat().st_mtime * _NS_PER_SECOND)
+            failures.append(
+                (
+                    str(path),
+                    f"{type(exc).__name__}: {exc}",
+                    classify_parse_failure(file_mtime_ns=mtime_ns, now_ns=now_ns),
+                )
+            )
+            continue
+
+        files_parsed += 1
+        raw_rows += row_count
+        for row in range(row_count):
+            ts_event = int(ts_events[row])
+            ts_init = int(ts_inits[row])
+            key = (instrument_id, ts_event, ts_init)
+            if key in seen:
+                continue
+            seen.add(key)
+            rows_per_instrument[instrument_id] += 1
+            ts_min = ts_event if ts_min is None else min(ts_min, ts_event)
+            ts_max = ts_event if ts_max is None else max(ts_max, ts_event)
+
+            raw_price = _decode_raw_fixed_point(ask_prices[row])
+            raw_size = _decode_raw_fixed_point(ask_sizes[row])
+            on_observation(
+                AskObservation(
+                    instrument_id=instrument_id,
+                    ts_event_ns=ts_event,
+                    ts_init_ns=ts_init,
+                    ask_price=Decimal(str(Price.from_raw(raw_price, price_precision))),
+                    ask_size=Decimal(str(Quantity.from_raw(raw_size, size_precision))),
+                    source="quote_tick",
+                )
+            )
+
+        del table, ts_events, ts_inits, ask_prices, ask_sizes
+
+    return TapePreflight(
+        data_class=QuoteTick.__name__,
+        files_found=len(files),
+        files_parsed=files_parsed,
+        files_failed=len(failures),
+        failures=tuple(failures),
+        raw_rows=raw_rows,
+        deduplicated_rows=len(seen),
+        instruments=len(rows_per_instrument),
+        rows_per_instrument=dict(rows_per_instrument),
+        ts_event_min_ns=ts_min,
+        ts_event_max_ns=ts_max,
+    )
+
+
+def _load_quote_ask_observations(tape_root: Path) -> tuple[TapePreflight, list[AskObservation]]:
+    """Materializing wrapper over `_stream_quote_ask_observations`.
+
+    Kept reachable under this name for the equivalence tests that compare it
+    against `_load_stream` + `_asks_from_quotes`. `build_population` itself no
+    longer calls this either -- see `_load_depth_ask_observations`.
+    """
+    observations: list[AskObservation] = []
+    preflight = _stream_quote_ask_observations(tape_root, observations.append)
     return preflight, observations
 
 
@@ -863,28 +986,23 @@ class ExclusionLedger:
     settlement_tmax_missing: int
 
 
-def build_population(
+def _assemble_population(
     *,
-    tape_root: Path,
+    facts_by_id: dict[str, InstrumentFacts],
+    offsets: dict[str, tuple[str, float]],
+    observed_instrument_ids: Iterable[str],
+    entry_by_instrument: dict[str, AskObservation],
+    first_observation_by_day: dict[tuple[str, dt.date], int],
     settlement_base: Path,
-) -> tuple[list[TapePreflight], list[PopulationMember], ExclusionLedger, dict[str, Any]]:
-    instrument_preflight, instrument_objects = _load_stream(
-        tape_root, "binary_option", BinaryOption
-    )
-    depth_preflight, depth_ask_observations = _load_depth_ask_observations(tape_root)
-    quote_preflight, quote_objects = _load_stream(tape_root, "quote_tick", QuoteTick)
+) -> tuple[list[PopulationMember], ExclusionLedger, dict[str, Any]]:
+    """The settlement join and exclusion accounting, shared by BOTH
+    `build_population` and `_build_population_materialized`.
 
-    facts_by_id: dict[str, InstrumentFacts] = {}
-    for instrument in instrument_objects:
-        facts = _instrument_facts(instrument)
-        if facts is not None:
-            facts_by_id[facts.instrument_id] = facts
-
-    observations: dict[str, list[AskObservation]] = defaultdict(list)
-    for observation in depth_ask_observations + _asks_from_quotes(quote_objects):
-        observations[observation.instrument_id].append(observation)
-
-    offsets = _station_offsets()
+    Takes only the reduced, per-instrument state (facts, the winning D+1
+    entry, the per-day earliest-observation floor) -- never the raw
+    observation stream itself -- so this function's own cost is O(instruments)
+    regardless of which caller fed it.
+    """
     settlement_cache: dict[tuple[str, dt.date], Any] = {}
 
     def settlement(station: str, climate_day: dt.date) -> Any:
@@ -902,16 +1020,13 @@ def build_population(
                 )
         return settlement_cache[key]
 
-    no_instrument = unknown_station = no_ask = no_pre_day = 0
+    no_instrument = unknown_station = no_pre_day = 0
     no_settlement = not_final = tmax_missing = 0
     population: list[PopulationMember] = []
     pre_day_entries: list[tuple[InstrumentFacts, AskObservation]] = []
-    #: Earliest observation of ANY rung of a station-day, pre-day or not. This
-    #: is what says whether the recorder was even running before local
-    #: midnight -- the precondition for a D+1 book to exist at all.
-    first_observation_by_day: dict[tuple[str, dt.date], int] = {}
+    unique_observed = set(observed_instrument_ids)
 
-    for instrument_id in sorted(observations):
+    for instrument_id in sorted(unique_observed):
         facts = facts_by_id.get(instrument_id)
         if facts is None:
             no_instrument += 1
@@ -919,25 +1034,7 @@ def build_population(
         if facts.station not in offsets:
             unknown_station += 1
             continue
-        _, offset = offsets[facts.station]
-        day_key = (facts.station, facts.climate_day)
-        for obs in observations[instrument_id]:
-            previous = first_observation_by_day.get(day_key)
-            if previous is None or obs.ts_event_ns < previous:
-                first_observation_by_day[day_key] = obs.ts_event_ns
-        pre_day = [
-            obs
-            for obs in observations[instrument_id]
-            if is_pre_climate_day(
-                obs.ts_event_ns,
-                climate_day=facts.climate_day,
-                std_utc_offset_hours=offset,
-            )
-        ]
-        if not observations[instrument_id]:
-            no_ask += 1
-            continue
-        entry = first_genuine_ask(pre_day)
+        entry = entry_by_instrument.get(instrument_id)
         if entry is None:
             no_pre_day += 1
             continue
@@ -967,7 +1064,14 @@ def build_population(
     ledger = ExclusionLedger(
         no_instrument_record=no_instrument,
         unknown_station=unknown_station,
-        no_ask_at_all=no_ask,
+        # Structurally unreachable: every id in `observed_instrument_ids` came
+        # from at least one real observation (both callers only add an id
+        # when an observation was actually produced for it), so there is no
+        # id left that could ever have "no ask at all". Kept as a named,
+        # always-zero field rather than removed, matching the pre-refactor
+        # behaviour exactly (the OLD per-instrument-list check this replaces
+        # was equally unreachable for the same reason).
+        no_ask_at_all=0,
         no_pre_climate_day_ask=no_pre_day,
         no_settlement_record=no_settlement,
         settlement_not_final=not_final,
@@ -994,16 +1098,155 @@ def build_population(
     context = {
         "pre_day_entries": pre_day_entries,
         "instrument_count": len(facts_by_id),
-        "observed_instrument_count": len(observations),
+        "observed_instrument_count": len(unique_observed),
         "settlement_status": settlement_status,
         "first_observation_by_day": first_observation_by_day,
     }
-    return (
-        [instrument_preflight, depth_preflight, quote_preflight],
-        population,
-        ledger,
-        context,
+    return population, ledger, context
+
+
+def _build_population_materialized(
+    *,
+    tape_root: Path,
+    settlement_base: Path,
+) -> tuple[list[TapePreflight], list[PopulationMember], ExclusionLedger, dict[str, Any]]:
+    """The ORIGINAL `build_population` body -- kept as the equivalence
+    reference for its streaming replacement below.
+
+    Every `AskObservation` for the whole tape is held in `observations` at
+    once here (`depth_ask_observations + _asks_from_quotes(quote_objects)`,
+    ~9.99M objects on the live tape): this is exactly the memory shape
+    `build_population` no longer has. Not used by `main` any more.
+    """
+    instrument_preflight, instrument_objects = _load_stream(
+        tape_root, "binary_option", BinaryOption
     )
+    depth_preflight, depth_ask_observations = _load_depth_ask_observations(tape_root)
+    quote_preflight, quote_objects = _load_stream(tape_root, "quote_tick", QuoteTick)
+
+    facts_by_id: dict[str, InstrumentFacts] = {}
+    for instrument in instrument_objects:
+        facts = _instrument_facts(instrument)
+        if facts is not None:
+            facts_by_id[facts.instrument_id] = facts
+
+    observations: dict[str, list[AskObservation]] = defaultdict(list)
+    for observation in depth_ask_observations + _asks_from_quotes(quote_objects):
+        observations[observation.instrument_id].append(observation)
+
+    offsets = _station_offsets()
+    #: Earliest observation of ANY rung of a station-day, pre-day or not. This
+    #: is what says whether the recorder was even running before local
+    #: midnight -- the precondition for a D+1 book to exist at all.
+    first_observation_by_day: dict[tuple[str, dt.date], int] = {}
+    entry_by_instrument: dict[str, AskObservation] = {}
+
+    for instrument_id, obs_list in observations.items():
+        facts = facts_by_id.get(instrument_id)
+        if facts is None or facts.station not in offsets:
+            continue
+        _, offset = offsets[facts.station]
+        day_key = (facts.station, facts.climate_day)
+        for obs in obs_list:
+            previous = first_observation_by_day.get(day_key)
+            if previous is None or obs.ts_event_ns < previous:
+                first_observation_by_day[day_key] = obs.ts_event_ns
+        pre_day = [
+            obs
+            for obs in obs_list
+            if is_pre_climate_day(
+                obs.ts_event_ns,
+                climate_day=facts.climate_day,
+                std_utc_offset_hours=offset,
+            )
+        ]
+        entry = first_genuine_ask(pre_day)
+        if entry is not None:
+            entry_by_instrument[instrument_id] = entry
+
+    population, ledger, context = _assemble_population(
+        facts_by_id=facts_by_id,
+        offsets=offsets,
+        observed_instrument_ids=observations.keys(),
+        entry_by_instrument=entry_by_instrument,
+        first_observation_by_day=first_observation_by_day,
+        settlement_base=settlement_base,
+    )
+    return [instrument_preflight, depth_preflight, quote_preflight], population, ledger, context
+
+
+def build_population(
+    *,
+    tape_root: Path,
+    settlement_base: Path,
+) -> tuple[list[TapePreflight], list[PopulationMember], ExclusionLedger, dict[str, Any]]:
+    """Stream `order_book_depths` AND `quote_tick` into O(instruments) state.
+
+    `binary_option` (4,522 rows, cheap) is loaded FIRST so `facts_by_id` and
+    `_station_offsets()` are known before either large stream opens a single
+    file -- every row from both streams is folded directly into per-instrument
+    running state (`entry_by_instrument`, `first_observation_by_day`) as it is
+    read, never collected into a tape-wide list
+    (`_build_population_materialized`, this function's equivalence reference).
+
+    Depth is streamed to completion BEFORE quote_tick starts, mirroring
+    `_build_population_materialized`'s concatenation order
+    (`depth_ask_observations + _asks_from_quotes(quote_objects)`): a tie on
+    `(ts_event_ns, ts_init_ns)` between the two sources therefore resolves
+    identically in both implementations.
+    """
+    instrument_preflight, instrument_objects = _load_stream(
+        tape_root, "binary_option", BinaryOption
+    )
+    facts_by_id: dict[str, InstrumentFacts] = {}
+    for instrument in instrument_objects:
+        facts = _instrument_facts(instrument)
+        if facts is not None:
+            facts_by_id[facts.instrument_id] = facts
+    offsets = _station_offsets()
+
+    observed_instrument_ids: set[str] = set()
+    first_observation_by_day: dict[tuple[str, dt.date], int] = {}
+    entry_by_instrument: dict[str, AskObservation] = {}
+
+    def record(observation: AskObservation) -> None:
+        observed_instrument_ids.add(observation.instrument_id)
+        facts = facts_by_id.get(observation.instrument_id)
+        if facts is None or facts.station not in offsets:
+            return
+        _, offset = offsets[facts.station]
+        day_key = (facts.station, facts.climate_day)
+        previous_day_min = first_observation_by_day.get(day_key)
+        if previous_day_min is None or observation.ts_event_ns < previous_day_min:
+            first_observation_by_day[day_key] = observation.ts_event_ns
+        if not is_pre_climate_day(
+            observation.ts_event_ns,
+            climate_day=facts.climate_day,
+            std_utc_offset_hours=offset,
+        ):
+            return
+        if not is_genuine_ask(observation):
+            return
+        current_best = entry_by_instrument.get(observation.instrument_id)
+        candidate_key = (observation.ts_event_ns, observation.ts_init_ns)
+        if current_best is None or candidate_key < (
+            current_best.ts_event_ns,
+            current_best.ts_init_ns,
+        ):
+            entry_by_instrument[observation.instrument_id] = observation
+
+    depth_preflight = _stream_depth_ask_observations(tape_root, record)
+    quote_preflight = _stream_quote_ask_observations(tape_root, record)
+
+    population, ledger, context = _assemble_population(
+        facts_by_id=facts_by_id,
+        offsets=offsets,
+        observed_instrument_ids=observed_instrument_ids,
+        entry_by_instrument=entry_by_instrument,
+        first_observation_by_day=first_observation_by_day,
+        settlement_base=settlement_base,
+    )
+    return [instrument_preflight, depth_preflight, quote_preflight], population, ledger, context
 
 
 # ---------------------------------------------------------------------------

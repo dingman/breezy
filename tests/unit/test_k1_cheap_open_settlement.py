@@ -695,3 +695,660 @@ def test_depth_loader_never_holds_more_than_one_files_table_at_once(
 
     assert len(live_refs) == 3
     assert len(observations) == 3
+
+
+# ---------------------------------------------------------------------------
+# quote_tick streaming loader vs the OLD materializing loader
+#
+# Mirrors the depth section immediately above: `_load_quote_ask_observations`
+# must match `_load_stream(..., QuoteTick)` + `_asks_from_quotes` field for
+# field, including the preflight accounting, and must report a corrupt file
+# the same way.
+# ---------------------------------------------------------------------------
+
+
+def _mini_quote_tape(tape_root: Path) -> tuple[InstrumentId, InstrumentId, InstrumentId]:
+    """Three quote_tick files, three instruments, BOTH tape subtrees.
+
+    `instrument_c` again carries a different price/size precision from
+    `instrument_a`/`instrument_b`, matching the real tape's mixed-precision
+    shape after `minimumTradeQty` changed 1 -> 0.01 on 06-14.
+    """
+    instrument_a = InstrumentId.from_str(
+        "tc-temp-nychigh-2026-08-31-gte82lt83f.POLYMARKET_US"
+    )
+    instrument_b = InstrumentId.from_str(
+        "tc-temp-laxhigh-2026-08-31-gte90f.POLYMARKET_US"
+    )
+    instrument_c = InstrumentId.from_str(
+        "tc-temp-mdwhigh-2026-08-31-gte93lt94f.POLYMARKET_US"
+    )
+
+    # `data/` parquet -- one genuine ask.
+    quote_a = QuoteTick(
+        instrument_id=instrument_a,
+        bid_price=Price(0, 2),
+        ask_price=Price(0.05, 2),
+        bid_size=Quantity(0, 2),
+        ask_size=Quantity(5, 2),
+        ts_event=100,
+        ts_init=101,
+    )
+    _write_quote_parquet(
+        tape_root / "data" / "quote_tick" / "instrument_a" / "part-0.parquet", [quote_a]
+    )
+
+    # `live/<run>/` feather -- one ZERO ask (not genuine, but still a row the
+    # preflight must count), one genuine ask.
+    quote_b_zero = QuoteTick(
+        instrument_id=instrument_b,
+        bid_price=Price(0, 2),
+        ask_price=Price(0, 2),
+        bid_size=Quantity(0, 2),
+        ask_size=Quantity(0, 2),
+        ts_event=200,
+        ts_init=201,
+    )
+    quote_b_genuine = QuoteTick(
+        instrument_id=instrument_b,
+        bid_price=Price(0, 2),
+        ask_price=Price(0.02, 2),
+        bid_size=Quantity(0, 2),
+        ask_size=Quantity(40, 2),
+        ts_event=300,
+        ts_init=301,
+    )
+    _write_quote_feather(
+        tape_root
+        / "live"
+        / "run-1"
+        / "quote_tick"
+        / "instrument_b"
+        / "instrument_b_1.feather",
+        [quote_b_zero, quote_b_genuine],
+    )
+
+    # `live/<run>/` feather, no per-instrument subfolder (the OTHER layout
+    # `_tape_files` globs) -- price_precision=3, size_precision=0.
+    quote_c = QuoteTick(
+        instrument_id=instrument_c,
+        bid_price=Price(0, 3),
+        ask_price=Price(0.125, 3),
+        bid_size=Quantity(0, 0),
+        ask_size=Quantity(7, 0),
+        ts_event=400,
+        ts_init=401,
+    )
+    _write_quote_feather(
+        tape_root / "live" / "run-2" / "quote_tick" / "instrument_c_1.feather", [quote_c]
+    )
+    return instrument_a, instrument_b, instrument_c
+
+
+def test_streaming_quote_loader_matches_the_materializing_loader(tmp_path: Path) -> None:
+    """The new streaming quote path must yield exactly the same observations.
+
+    Compared against the OLD path -- `_load_stream` + `_asks_from_quotes` --
+    kept reachable under its private name for exactly this comparison.
+    """
+    _mini_quote_tape(tmp_path)
+
+    old_preflight, quote_objects = k1._load_stream(tmp_path, "quote_tick", QuoteTick)
+    expected = k1._asks_from_quotes(quote_objects)
+
+    new_preflight, streamed = k1._load_quote_ask_observations(tmp_path)
+
+    assert {_observation_key(o) for o in streamed} == {_observation_key(o) for o in expected}
+    # Unlike depth, `_asks_from_quotes` never filters -- even the zero-ask row
+    # produces an observation -- so all 4 rows are present, not 3.
+    assert len(streamed) == len(expected) == 4
+
+    assert new_preflight.files_found == old_preflight.files_found == 3
+    assert new_preflight.files_parsed == old_preflight.files_parsed == 3
+    assert new_preflight.files_failed == old_preflight.files_failed == 0
+    assert new_preflight.raw_rows == old_preflight.raw_rows == 4
+    assert new_preflight.deduplicated_rows == old_preflight.deduplicated_rows == 4
+    assert new_preflight.instruments == old_preflight.instruments == 3
+    assert new_preflight.rows_per_instrument == old_preflight.rows_per_instrument
+    assert new_preflight.ts_event_min_ns == old_preflight.ts_event_min_ns == 100
+    assert new_preflight.ts_event_max_ns == old_preflight.ts_event_max_ns == 400
+
+    # Explicit, per-instrument Decimal check on the mixed-precision file
+    # (price_precision=3, size_precision=0): the streaming path must decode
+    # the SAME value the materializing path does, at the file's OWN
+    # precision, not a precision borrowed from another file.
+    instrument_c = "tc-temp-mdwhigh-2026-08-31-gte93lt94f.POLYMARKET_US"
+    streamed_c = next(o for o in streamed if o.instrument_id == instrument_c)
+    expected_c = next(o for o in expected if o.instrument_id == instrument_c)
+    assert streamed_c.ask_price == expected_c.ask_price == Decimal("0.125")
+    assert streamed_c.ask_size == expected_c.ask_size == Decimal(7)
+    assert str(streamed_c.ask_price) == str(expected_c.ask_price)
+    assert str(streamed_c.ask_size) == str(expected_c.ask_size)
+
+
+def test_streaming_quote_loader_reports_a_corrupt_file_the_same_way(tmp_path: Path) -> None:
+    """A truncated/corrupt quote_tick file must still be counted as a
+    failure, not raise -- the quote analogue of the depth corrupt-file test.
+    """
+    _mini_quote_tape(tmp_path)
+    corrupt = tmp_path / "live" / "run-1" / "quote_tick" / "corrupt" / "bad.feather"
+    corrupt.parent.mkdir(parents=True, exist_ok=True)
+    corrupt.write_bytes(b"not an arrow stream")
+
+    old_preflight, _ = k1._load_stream(tmp_path, "quote_tick", QuoteTick)
+    new_preflight, _ = k1._load_quote_ask_observations(tmp_path)
+
+    assert new_preflight.files_found == old_preflight.files_found == 4
+    assert new_preflight.files_failed == old_preflight.files_failed == 1
+    assert new_preflight.files_parsed == old_preflight.files_parsed == 3
+
+
+# ---------------------------------------------------------------------------
+# build_population: streaming accumulators vs the OLD materializing path
+#
+# `_build_population_materialized` is the pre-existing `build_population`
+# body, kept reachable under a private name for exactly this comparison --
+# it still loads `quote_tick` via `_load_stream` + `_asks_from_quotes` and
+# holds every `AskObservation` in a per-instrument list. `build_population`
+# is the new streaming entry point: it loads `binary_option` first, then
+# streams BOTH `order_book_depths` and `quote_tick` straight into
+# per-instrument accumulators, never a per-row list.
+# ---------------------------------------------------------------------------
+
+import hashlib
+from dataclasses import dataclass as _dataclass
+
+from nautilus_trader.model.currencies import USD
+from nautilus_trader.model.data import QuoteTick
+from nautilus_trader.model.enums import AssetClass
+from nautilus_trader.model.instruments import BinaryOption
+
+from breezy.adapters.polymarket_us.parsing import FEE_COEFFICIENT_KEY
+from breezy.domain.nws_climate_day import CLIMATE_DAY_SCHEMA_VERSION, NwsClimateDay
+from breezy.domain.weather_bucket_facts import (
+    CLIMATE_DAY_KEY,
+    SETTLEMENT_STATION_KEY,
+    STRIKE_LOWER_F_KEY,
+    STRIKE_UPPER_F_KEY,
+)
+from breezy.persistence.catalog import open_station_catalog, write_records
+
+_POP_CLIMATE_DAY = dt.date(2026, 9, 5)
+_POP_SETTLEMENT_TS_NS = int(
+    dt.datetime(2026, 9, 6, 12, 0, tzinfo=dt.UTC).timestamp() * 1_000_000_000
+)
+_POP_SHA = hashlib.sha256(b"K1 build_population fixture").hexdigest()
+
+
+def _pop_binary_option(
+    *,
+    instrument_id: InstrumentId,
+    station: str,
+    lower_f: int | None,
+    upper_f: int | None,
+    theta: str,
+) -> BinaryOption:
+    increment = Price.from_str("0.01")
+    size_increment = Quantity.from_str("1")
+    return BinaryOption(
+        instrument_id=instrument_id,
+        raw_symbol=instrument_id.symbol,
+        outcome="Yes",
+        description="K1 build_population fixture rung",
+        asset_class=AssetClass.ALTERNATIVE,
+        currency=USD,
+        price_precision=increment.precision,
+        price_increment=increment,
+        size_precision=size_increment.precision,
+        size_increment=size_increment,
+        activation_ns=0,
+        expiration_ns=200 * 3_600_000_000_000,
+        max_quantity=None,
+        min_quantity=Quantity.from_int(1),
+        maker_fee=Decimal("0.06"),
+        taker_fee=Decimal("0.06"),
+        ts_event=0,
+        ts_init=0,
+        info={
+            SETTLEMENT_STATION_KEY: station,
+            CLIMATE_DAY_KEY: _POP_CLIMATE_DAY.isoformat(),
+            STRIKE_LOWER_F_KEY: lower_f,
+            STRIKE_UPPER_F_KEY: upper_f,
+            FEE_COEFFICIENT_KEY: theta,
+        },
+    )
+
+
+def _write_binary_options(tape_root: Path, options: list[BinaryOption]) -> None:
+    table = ArrowSerializer.serialize_batch(options, data_cls=BinaryOption)
+    path = tape_root / "data" / "binary_option" / "part-0.parquet"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    pq.write_table(table, path)
+
+
+def _write_quote_parquet(path: Path, quotes: list[QuoteTick]) -> None:
+    table = ArrowSerializer.serialize_batch(quotes, data_cls=QuoteTick)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    pq.write_table(table, path)
+
+
+def _write_quote_feather(path: Path, quotes: list[QuoteTick]) -> None:
+    table = ArrowSerializer.serialize_batch(quotes, data_cls=QuoteTick)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with pa.OSFile(str(path), "wb") as sink:
+        writer = pa.ipc.new_stream(sink, table.schema)
+        writer.write_table(table)
+        writer.close()
+
+
+def _quote(
+    *,
+    instrument_id: InstrumentId,
+    ask_price: str,
+    ask_size: str,
+    ts_event: int,
+    ts_init: int,
+    price_precision: int,
+    size_precision: int,
+) -> QuoteTick:
+    return QuoteTick(
+        instrument_id=instrument_id,
+        bid_price=Price(0, price_precision),
+        ask_price=Price(float(ask_price), price_precision),
+        bid_size=Quantity(0, size_precision),
+        ask_size=Quantity(float(ask_size), size_precision),
+        ts_event=ts_event,
+        ts_init=ts_init,
+    )
+
+
+def _settle(
+    settlement_base: Path,
+    *,
+    city: str,
+    station: str,
+    tmax_f: int,
+) -> None:
+    catalog = open_station_catalog(settlement_base, k1.VENUE, city)
+    write_records(
+        catalog,
+        [
+            NwsClimateDay(
+                station=station,
+                climate_day=_POP_CLIMATE_DAY,
+                tmax_f=tmax_f,
+                tmin_f=tmax_f - 20,
+                tavg_f=tmax_f - 10,
+                tmax_flag=None,
+                tmin_flag=None,
+                tavg_flag=None,
+                is_final=True,
+                correction_flag=False,
+                revision_seq=1,
+                is_superseded=False,
+                issuing_office="KTEST",
+                issuance_time_ns=_POP_SETTLEMENT_TS_NS,
+                retrieved_at_ns=_POP_SETTLEMENT_TS_NS,
+                parser_version="pyiem==1.27.0",
+                registry_version="1.0.0",
+                raw_sha256=_POP_SHA,
+                source_channel=f"api.weather.gov/products/types/CLI/locations/{station}",
+                schema_version=CLIMATE_DAY_SCHEMA_VERSION,
+                ts_event=_POP_SETTLEMENT_TS_NS,
+            )
+        ],
+    )
+
+
+@_dataclass(frozen=True, slots=True)
+class _PopFixture:
+    instrument_a: InstrumentId
+    instrument_b: InstrumentId
+    instrument_c: InstrumentId
+    boundary_nyc: int
+    boundary_sfo: int
+    boundary_mdw: int
+
+
+def _mini_full_tape(tape_root: Path) -> _PopFixture:
+    """Depth + quote_tick + binary_option for 3 instruments on 3 stations.
+
+    Deliberately exercises: mixed precisions across every file, out-of-order
+    depth levels (instrument C), an empty-ask depth row (instrument A), a
+    quote earlier than any depth ask and one later (instrument C), an EXACT
+    tie on `(ts_event, ts_init)` between a depth ask and a quote ask, both
+    genuine and pre-day, at DIFFERENT prices (instrument A), and a pre-day
+    vs on-day split on every instrument so `first_genuine_ask`'s boundary
+    check actually matters.
+    """
+    instrument_a = InstrumentId.from_str("k1a-84.POLYMARKET_US")
+    instrument_b = InstrumentId.from_str("k1b-70.POLYMARKET_US")
+    instrument_c = InstrumentId.from_str("k1c-90.POLYMARKET_US")
+
+    boundary_nyc = k1.climate_day_start_ns(_POP_CLIMATE_DAY, -5.0)
+    boundary_sfo = k1.climate_day_start_ns(_POP_CLIMATE_DAY, -8.0)
+    boundary_mdw = k1.climate_day_start_ns(_POP_CLIMATE_DAY, -6.0)
+
+    _write_binary_options(
+        tape_root,
+        [
+            _pop_binary_option(
+                instrument_id=instrument_a, station="NYC", lower_f=80, upper_f=85, theta="0.06"
+            ),
+            _pop_binary_option(
+                instrument_id=instrument_b, station="SFO", lower_f=None, upper_f=70, theta="0.06"
+            ),
+            _pop_binary_option(
+                instrument_id=instrument_c, station="MDW", lower_f=90, upper_f=None, theta="0.06"
+            ),
+        ],
+    )
+
+    # Instrument A: depth AND a single tied quote. d1 is the earliest genuine
+    # pre-day ask (wins despite being MORE expensive than d2); d2 is a later,
+    # cheaper pre-day ask (must NOT win -- earliest wins, not cheapest); d3 is
+    # on-day (excluded by the boundary); d4 has no populated ask level at
+    # all; q_tie sits at the EXACT SAME (ts_event, ts_init) as d1, genuine and
+    # pre-day, at a cheaper price -- depth streams first and the accumulator's
+    # strict `<` keeps the first-seen entry on an exact tie, so d1 (0.10) must
+    # still win, matching `first_genuine_ask`'s `min()` over the OLD path's
+    # depth-then-quote concatenation order.
+    depth_a = [
+        _make_depth(
+            instrument_id=instrument_a,
+            ask_levels=[("0.10", "3")],
+            bid_levels=[("0.01", "1")],
+            ts_event=boundary_nyc - 5000,
+            ts_init=boundary_nyc - 4999,
+            sequence=0,
+        ),
+        _make_depth(
+            instrument_id=instrument_a,
+            ask_levels=[("0.05", "5")],
+            bid_levels=[("0.01", "1")],
+            ts_event=boundary_nyc - 1000,
+            ts_init=boundary_nyc - 999,
+            sequence=1,
+        ),
+        _make_depth(
+            instrument_id=instrument_a,
+            ask_levels=[("0.01", "9")],
+            bid_levels=[("0.01", "1")],
+            ts_event=boundary_nyc + 1000,
+            ts_init=boundary_nyc + 1001,
+            sequence=2,
+        ),
+        _make_depth(
+            instrument_id=instrument_a,
+            ask_levels=[],
+            bid_levels=[("0.20", "1")],
+            ts_event=boundary_nyc - 2000,
+            ts_init=boundary_nyc - 1999,
+            sequence=3,
+        ),
+    ]
+    _write_parquet(
+        tape_root / "data" / "order_book_depths" / "instrument_a" / "part-0.parquet", depth_a
+    )
+
+    quotes_a = [
+        _quote(
+            instrument_id=instrument_a,
+            ask_price="0.02",
+            ask_size="9",
+            ts_event=boundary_nyc - 5000,
+            ts_init=boundary_nyc - 4999,
+            price_precision=2,
+            size_precision=2,
+        ),
+    ]
+    _write_quote_parquet(
+        tape_root / "data" / "quote_tick" / "instrument_a" / "part-0.parquet", quotes_a
+    )
+
+    # Instrument B: quote_tick only, at a DIFFERENT precision (3, 0) from
+    # instrument A's (2, 2). q1 is earliest genuine (wins); q2 is later and
+    # cheaper (must not win); q3 is on-day (excluded); q4 is a genuine-looking
+    # timestamp but a ZERO ask (not genuine, must not win).
+    quotes_b = [
+        _quote(
+            instrument_id=instrument_b,
+            ask_price="0.125",
+            ask_size="7",
+            ts_event=boundary_sfo - 4000,
+            ts_init=boundary_sfo - 3999,
+            price_precision=3,
+            size_precision=0,
+        ),
+        _quote(
+            instrument_id=instrument_b,
+            ask_price="0.001",
+            ask_size="2",
+            ts_event=boundary_sfo - 500,
+            ts_init=boundary_sfo - 499,
+            price_precision=3,
+            size_precision=0,
+        ),
+        _quote(
+            instrument_id=instrument_b,
+            ask_price="0.001",
+            ask_size="2",
+            ts_event=boundary_sfo + 10,
+            ts_init=boundary_sfo + 11,
+            price_precision=3,
+            size_precision=0,
+        ),
+        _quote(
+            instrument_id=instrument_b,
+            ask_price="0.000",
+            ask_size="0",
+            ts_event=boundary_sfo - 3000,
+            ts_init=boundary_sfo - 2999,
+            price_precision=3,
+            size_precision=0,
+        ),
+    ]
+    _write_quote_parquet(
+        tape_root / "data" / "quote_tick" / "instrument_b" / "part-0.parquet", quotes_b
+    )
+
+    # Instrument C: BOTH depth (out-of-order levels, best ask at level 1) and
+    # quote_tick (different precision again, 2/2). q1 is earlier than any
+    # depth ask on this instrument and wins; d2 is on-day (excluded); q2 is
+    # later than d1 but still pre-day, and must not win.
+    depth_c = [
+        _make_depth(
+            instrument_id=instrument_c,
+            ask_levels=[("0.500", "12"), ("0.125", "7")],
+            bid_levels=[("0.100", "5")],
+            ts_event=boundary_mdw - 2000,
+            ts_init=boundary_mdw - 1999,
+            sequence=0,
+            price_precision=3,
+            size_precision=0,
+        ),
+        _make_depth(
+            instrument_id=instrument_c,
+            ask_levels=[("0.010", "9")],
+            bid_levels=[("0.100", "5")],
+            ts_event=boundary_mdw + 500,
+            ts_init=boundary_mdw + 501,
+            sequence=1,
+            price_precision=3,
+            size_precision=0,
+        ),
+    ]
+    _write_feather(
+        tape_root
+        / "live"
+        / "run-1"
+        / "order_book_depths"
+        / "instrument_c"
+        / "instrument_c_1.feather",
+        depth_c,
+    )
+    quotes_c = [
+        _quote(
+            instrument_id=instrument_c,
+            ask_price="0.09",
+            ask_size="1",
+            ts_event=boundary_mdw - 4000,
+            ts_init=boundary_mdw - 3999,
+            price_precision=2,
+            size_precision=2,
+        ),
+        _quote(
+            instrument_id=instrument_c,
+            ask_price="0.30",
+            ask_size="2",
+            ts_event=boundary_mdw - 1000,
+            ts_init=boundary_mdw - 999,
+            price_precision=2,
+            size_precision=2,
+        ),
+    ]
+    _write_quote_parquet(
+        tape_root / "data" / "quote_tick" / "instrument_c" / "part-0.parquet", quotes_c
+    )
+
+    return _PopFixture(
+        instrument_a=instrument_a,
+        instrument_b=instrument_b,
+        instrument_c=instrument_c,
+        boundary_nyc=boundary_nyc,
+        boundary_sfo=boundary_sfo,
+        boundary_mdw=boundary_mdw,
+    )
+
+
+def _member_key(member: k1.PopulationMember) -> tuple[object, ...]:
+    return (
+        member.facts.instrument_id,
+        member.facts.station,
+        member.facts.climate_day,
+        member.facts.lower_f,
+        member.facts.upper_f,
+        member.facts.theta,
+        member.entry.instrument_id,
+        member.entry.ts_event_ns,
+        member.entry.ts_init_ns,
+        member.entry.ask_price,
+        member.entry.ask_size,
+        member.entry.source,
+        member.tmax_f,
+        member.settled_yes,
+    )
+
+
+def test_build_population_streaming_matches_the_materialized_reference(tmp_path: Path) -> None:
+    """The new streaming `build_population` must match the OLD materializing
+    path -- `_build_population_materialized` -- on every field, including
+    the earliest-genuine-ask tie-break across depth AND quote_tick sources.
+    """
+    tape_root = tmp_path / "tape"
+    settlement_base = tmp_path / "settlement"
+    fixture = _mini_full_tape(tape_root)
+    _settle(settlement_base, city="NYC", station="NYC", tmax_f=84)
+    _settle(settlement_base, city="SFO", station="SFO", tmax_f=65)
+    _settle(settlement_base, city="MDW", station="MDW", tmax_f=92)
+
+    old_preflights, old_population, old_ledger, old_context = k1._build_population_materialized(
+        tape_root=tape_root, settlement_base=settlement_base
+    )
+    new_preflights, new_population, new_ledger, new_context = k1.build_population(
+        tape_root=tape_root, settlement_base=settlement_base
+    )
+
+    assert new_preflights == old_preflights
+    assert new_ledger == old_ledger
+    assert len(old_population) == len(new_population) == 3
+    assert old_population == new_population
+    assert {_member_key(m) for m in old_population} == {_member_key(m) for m in new_population}
+
+    assert old_context["instrument_count"] == new_context["instrument_count"] == 3
+    assert old_context["observed_instrument_count"] == new_context["observed_instrument_count"] == 3
+    assert old_context["settlement_status"] == new_context["settlement_status"]
+    assert old_context["first_observation_by_day"] == new_context["first_observation_by_day"]
+    assert {(f.instrument_id, e) for f, e in old_context["pre_day_entries"]} == {
+        (f.instrument_id, e) for f, e in new_context["pre_day_entries"]
+    }
+
+    # Concrete, hand-derived expectations -- not just old == new, in case
+    # both implementations happened to share the same mistake.
+    by_id = {m.facts.instrument_id: m for m in new_population}
+    entry_a = by_id[str(fixture.instrument_a)].entry
+    # The tie-break case: a depth ask (0.10) and a quote ask (0.02) share the
+    # EXACT SAME (ts_event, ts_init). Depth streams first, so it must win --
+    # both here (the streaming path) and in the OLD materialized path, where
+    # `first_genuine_ask`'s `min()` keeps the first-seen entry of the
+    # depth-then-quote concatenation on an exact key tie.
+    assert entry_a.ask_price == Decimal("0.10")
+    assert entry_a.ts_event_ns == fixture.boundary_nyc - 5000
+    assert entry_a.source == "order_book_depths"
+    old_entry_a = next(
+        m.entry for m in old_population if m.facts.instrument_id == str(fixture.instrument_a)
+    )
+    assert old_entry_a.ask_price == entry_a.ask_price == Decimal("0.10")
+    assert old_entry_a.source == entry_a.source == "order_book_depths"
+
+    entry_b = by_id[str(fixture.instrument_b)].entry
+    assert entry_b.ask_price == Decimal("0.125")
+    assert entry_b.ts_event_ns == fixture.boundary_sfo - 4000
+
+    entry_c = by_id[str(fixture.instrument_c)].entry
+    assert entry_c.ask_price == Decimal("0.09")
+    assert entry_c.ts_event_ns == fixture.boundary_mdw - 4000
+    assert entry_c.source == "quote_tick"
+
+    assert by_id[str(fixture.instrument_a)].settled_yes is True
+    assert by_id[str(fixture.instrument_b)].settled_yes is True
+    assert by_id[str(fixture.instrument_c)].settled_yes is True
+
+
+def test_build_population_never_retains_a_per_row_observation_list(tmp_path: Path) -> None:
+    """The streaming path must never hold more than O(instruments) live
+    `AskObservation` instances at once.
+
+    `AskObservation` is `@dataclass(frozen=True, slots=True)`, which has no
+    `__weakref__` slot, so a plain instance cannot be weak-referenced -- a
+    subclass that ADDS the slot is used instead, purely to get a live count
+    without keeping a strong reference of its own. The fixture creates 12
+    `AskObservation`-producing rows across only 3 instruments; a per-row
+    list (the old bug) would let the live count climb toward 12, while the
+    accumulator design should never exceed a small constant near 3.
+    """
+    tape_root = tmp_path / "tape"
+    settlement_base = tmp_path / "settlement"
+    _mini_full_tape(tape_root)
+    _settle(settlement_base, city="NYC", station="NYC", tmax_f=84)
+    _settle(settlement_base, city="SFO", station="SFO", tmax_f=65)
+    _settle(settlement_base, city="MDW", station="MDW", tmax_f=92)
+
+    live_refs: list[weakref.ReferenceType] = []
+    peak_live = 0
+    original_cls = k1.AskObservation
+
+    class _TrackedAskObservation(original_cls):  # type: ignore[misc, valid-type]
+        # `AskObservation` defines no `__post_init__`, so dataclass's generated
+        # `__init__` never calls one even on a subclass that adds it -- track
+        # via `__init__` itself instead, which always runs.
+        __slots__ = ("__weakref__",)
+
+        def __init__(self, *args: object, **kwargs: object) -> None:
+            nonlocal peak_live
+            super().__init__(*args, **kwargs)
+            live_refs.append(weakref.ref(self))
+            live = sum(1 for ref in live_refs if ref() is not None)
+            peak_live = max(peak_live, live)
+
+    k1.AskObservation = _TrackedAskObservation
+    try:
+        k1.build_population(tape_root=tape_root, settlement_base=settlement_base)
+    finally:
+        k1.AskObservation = original_cls
+
+    assert len(live_refs) == 12, "fixture must produce exactly 12 AskObservation rows"
+    assert peak_live <= 5, (
+        f"peak live AskObservation count was {peak_live}, expected <= 5 -- "
+        "a per-row list is being retained somewhere in the streaming path"
+    )
