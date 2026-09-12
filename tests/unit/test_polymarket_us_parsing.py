@@ -846,3 +846,36 @@ def test_the_status_key_doc_comment_describes_the_status_and_not_the_coefficient
     assert "resolution state" in status or "fee-schedule" in status
     assert "theta" in coefficient
     assert "theta" not in status, "the status key's comment must not describe theta"
+
+
+# ---------------------------------------------------------------------------
+# I7 (HIGH, security-reviewer BLOCK, SEC-H1 sibling) -- `_parse_amount`'s
+# currency mismatch is bounded, never a raw value echo
+# ---------------------------------------------------------------------------
+
+
+def test_a_long_currency_value_is_bounded_not_echoed_whole() -> None:
+    """I7: `_parse_amount` raised with a raw, unbounded `{currency!r}` --
+    reachable from `parse_fill_report` via `commissionNotionalCollected`,
+    caught by `fill_generation`'s except, and (SP-2 I3) written DURABLY to
+    the resolver context. Bounded the same way `_name_value` bounds every
+    other venue-controlled value in this codebase."""
+    long_currency = "X" * 200
+    with pytest.raises(VenuePayloadError) as excinfo:
+        parsing._parse_amount({"value": "1", "currency": long_currency}, field="testField")
+    message = str(excinfo.value)
+    assert long_currency not in message
+    assert "(truncated from 200 characters)" in message
+
+
+def test_a_non_string_currency_value_is_named_by_type_only() -> None:
+    """I7: a nested-mapping `currency` must render by TYPE NAME only, never
+    dump the sub-payload it carries."""
+    with pytest.raises(VenuePayloadError) as excinfo:
+        parsing._parse_amount(
+            {"value": "1", "currency": {"nested": "SECRET_VALUE"}}, field="testField"
+        )
+    message = str(excinfo.value)
+    assert "SECRET_VALUE" not in message
+    assert "nested" not in message
+    assert "dict" in message

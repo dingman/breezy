@@ -156,6 +156,7 @@ from breezy.adapters.polymarket_us.parsing import (
     _assert_representable,
     _build_price,
     _build_quantity,
+    _name_value,
     _parse_amount,
     _to_decimal,
     parse_rfc3339_nanos,
@@ -566,22 +567,6 @@ def _require(payload: Mapping[str, Any], key: str, *, context: str) -> Any:
     "absent is never a default" rule to drift out of.
     """
     return _require_field(payload, key, error=ExecutionReportMappingError, context=context)
-
-
-def _name_value(value: object, *, limit: int = 64) -> str:
-    """Describe a venue-supplied value for diagnosis, without echoing it whole.
-
-    An unrecognised enum member has to be NAMED or the refusal is undebuggable,
-    but the string is venue-controlled and unbounded, and a non-string could be
-    an entire nested payload. So: a short string is quoted verbatim, a long one
-    is truncated with its true length stated, and a non-string is named by TYPE
-    only.
-    """
-    if not isinstance(value, str):
-        return type(value).__name__
-    if len(value) <= limit:
-        return repr(value)
-    return f"{value[:limit]!r} (truncated from {len(value)} characters)"
 
 
 def _require_text(payload: Mapping[str, Any], key: str, *, context: str) -> str:
