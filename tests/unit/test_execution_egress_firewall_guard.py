@@ -3013,10 +3013,24 @@ def test_x1_the_live_scan_actually_reaches_a_test_that_imports_the_exec_package(
     # -- `DurableFillRecord` is a plain data record and `FILL_KEY_PREFIX` is
     # a plain string, exactly like the fill-tally-spine siblings already in
     # this set.
+    #
+    # Old -> new (this row, SP-4 increment B, v3 continuous-rung-hold
+    # backtest-only subclass): added
+    # `tests/unit/test_continuous_rung_hold_backtest_only.py`, whose AM-1
+    # `test_a_wait_class_deny_lets_a_later_frame_produce_a_SECOND_attempt`
+    # imports `submit_chain.OPEN_INTENT_WAIT_REASON` -- the SAME reused
+    # sentinel constant `test_continuous_rung_hold_strategy.py` already
+    # imports for its own WAIT-reason test (this row's precedent, above).
+    # WIDENED, not relaxed (L-6/L-12): the comparison is still `==`; the
+    # module carries no `SOCKET_RESTORING_MARKERS` and constructs no
+    # client -- it drives `ContinuousRungHoldBacktestStrategy` through the
+    # SAME registered-strategy-direct-handler-call harness every sibling
+    # continuous-strategy suite uses, never a socket.
     assert exec_importing_test_modules() == {
         "tests/contract/test_exec_client_reconciliation_contract.py",
         "tests/contract/test_exec_client_wiring_contract.py",
         "tests/contract/test_live_fill_scoring_chain_contract.py",
+        "tests/unit/test_continuous_rung_hold_backtest_only.py",
         "tests/unit/test_continuous_rung_hold_fill_wiring.py",
         "tests/unit/test_continuous_rung_hold_strategy.py",
         "tests/unit/test_current_rung_hold_ambiguous_resolver.py",
