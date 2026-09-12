@@ -1454,20 +1454,26 @@ def _raw_record(
     cumulative_cost: str = "0.37",
     cumulative_fee: str = "0.00",
     fee_reconciled: bool = True,
+    **extra: Any,
 ) -> bytes:
-    return json.dumps(
-        {
-            "venueOrderId": "V-1",
-            "clientOrderId": "O-19700101-000000-001-001-1",
-            "instrumentId": "some-instrument",
-            "orderSide": "BUY",
-            "cumulativeQty": cumulative_qty,
-            "cumulativeCost": cumulative_cost,
-            "cumulativeFee": cumulative_fee,
-            "feeReconciled": fee_reconciled,
-            "tsEvent": TS_INIT,
-        },
-    ).encode("utf-8")
+    """A legacy-shaped record: neither ``tradeId`` nor ``orderQty`` is a key
+    here by default (B0, S-M1) -- exactly the shape of every record written
+    before this change, ``venueFeeRaw`` included. ``**extra`` lets a caller
+    add or override a key (e.g. a malformed ``orderQty``/``tradeId``) without
+    a second fixture."""
+    payload: dict[str, Any] = {
+        "venueOrderId": "V-1",
+        "clientOrderId": "O-19700101-000000-001-001-1",
+        "instrumentId": "some-instrument",
+        "orderSide": "BUY",
+        "cumulativeQty": cumulative_qty,
+        "cumulativeCost": cumulative_cost,
+        "cumulativeFee": cumulative_fee,
+        "feeReconciled": fee_reconciled,
+        "tsEvent": TS_INIT,
+    }
+    payload.update(extra)
+    return json.dumps(payload).encode("utf-8")
 
 
 @pytest.mark.parametrize(
@@ -2263,6 +2269,35 @@ async def test_the_durable_record_decodes_with_the_venue_fee_and_the_reconciled_
     assert record.fee_reconciled is True
 
 
+# (b2) B0-c: the create-path record carries the venue's own tradeId and the
+# ORIGINAL order size -- never the filled size (create-path size is always
+# exactly 1, Units correction).
+@pytest.mark.asyncio
+async def test_an_accept_fill_persists_the_venue_trade_id_and_the_original_order_qty(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    write_canonical_verified: None,  # noqa: F811
+) -> None:
+    sender = _FakeOrderSender()
+    rig = _build_accept_fill_rig(tmp_path, monkeypatch=monkeypatch, sender=sender)
+    slug = _slug(rig.instrument)
+    sender.response = VenueResponse(
+        status=200,
+        headers={},
+        body=_accept_fill_body(slug, order_id="ord-i1b-tradeid"),
+    )
+
+    with _accept_fill_caps():
+        await rig.client._connect()
+        await rig.client._submit_order(rig.limit_buy())
+        await rig.client._disconnect()
+
+    record = _reopened_fill_record(rig.store_path, "ord-i1b-tradeid")
+    assert record is not None
+    assert record.trade_id == "trd-902"  # `build_execution`'s default tradeId
+    assert record.order_qty == Decimal(1)
+
+
 # (c) FAILURE PATH -- `record_fill` raises.
 @pytest.mark.asyncio
 async def test_a_raising_record_fill_refuses_but_still_publishes_both_events(
@@ -2408,6 +2443,10 @@ def test_durable_fill_record_round_trips_the_fee_and_reconciled_flag() -> None:
     assert decoded["cumulativeFee"] == "0.12"
     assert decoded["feeReconciled"] is False
     assert decoded["venueFeeRaw"] == "0.004"
+    # B0: two new optional-on-read keys, `None` here since this record does
+    # not pass `trade_id`/`order_qty` -- the SET must still carry both.
+    assert decoded["tradeId"] is None
+    assert decoded["orderQty"] is None
     assert set(decoded) == {
         "venueOrderId",
         "clientOrderId",
@@ -2419,12 +2458,66 @@ def test_durable_fill_record_round_trips_the_fee_and_reconciled_flag() -> None:
         "feeReconciled",
         "tsEvent",
         "venueFeeRaw",
+        "tradeId",
+        "orderQty",
     }
 
     assert DurableFillRecord.from_bytes(raw) == record
 
     missing = DurableFillRecord.from_bytes(_raw_record())
     assert missing.venue_fee_raw is None
+    assert missing.trade_id is None
+    assert missing.order_qty is None
+
+
+# (f2) B0: `trade_id`/`order_qty` round-trip on their own, non-`None`.
+def test_a_durable_record_round_trips_the_trade_id_and_order_qty() -> None:
+    record = DurableFillRecord(
+        venue_order_id="V-ROUNDTRIP-2",
+        client_order_id="O-19700101-000000-001-001-2",
+        instrument_id="some-instrument",
+        order_side="BUY",
+        cumulative_qty=Decimal(4),
+        cumulative_cost=Decimal("1.48"),
+        cumulative_fee=Decimal("0.12"),
+        fee_reconciled=True,
+        ts_event=TS_INIT,
+        trade_id="trd-902",
+        order_qty=Decimal(1),
+    )
+
+    raw = record.to_bytes()
+    decoded = json.loads(raw)
+    assert decoded["tradeId"] == "trd-902"
+    assert decoded["orderQty"] == "1"
+    assert DurableFillRecord.from_bytes(raw) == record
+
+
+# (f3) B0/S-M1: a legacy record (no `tradeId`/`orderQty` key at all) decodes
+# both fields to `None` -- never inferred from `cumulative_qty`, never
+# defaulted to `Decimal(1)`. This is the same shape as every record on disk
+# before this change (functionally identical to the live store's
+# pre-existing `.../fill/CEBPX0EVTTMX` record -- reading the live state
+# store directly is out of scope for this test, so `_raw_record()`'s
+# already-legacy shape, the same fixture `venue_fee_raw is None` uses two
+# lines above, stands in for it). Reconstructing the `GET-<venue_order_id>`
+# fallback from a `None` `trade_id` is a B1 consumer-side rule (Units,
+# S-M1) -- BLOCKED-BY-R-1, not implemented by this change.
+def test_a_legacy_record_without_a_trade_id_decodes_and_falls_back_to_the_get_form() -> None:
+    legacy = DurableFillRecord.from_bytes(_raw_record())
+    assert legacy.trade_id is None
+    assert legacy.order_qty is None
+
+
+@pytest.mark.parametrize("bad_order_qty", ["NaN", "Infinity", "-Infinity"])
+def test_a_non_finite_order_qty_is_refused(bad_order_qty: str) -> None:
+    with pytest.raises(ExecutionReportMappingError, match="orderQty"):
+        DurableFillRecord.from_bytes(_raw_record(orderQty=bad_order_qty))
+
+
+def test_a_non_string_trade_id_is_refused() -> None:
+    with pytest.raises(ExecutionReportMappingError, match="tradeId"):
+        DurableFillRecord.from_bytes(_raw_record(tradeId=123))
 
 
 # (g) `None` totals on an accept-fill outcome -- the same failure path as (c).

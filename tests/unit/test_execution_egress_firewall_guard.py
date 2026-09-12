@@ -1959,6 +1959,11 @@ EXEC_RESOLVER_PERMITTED_CALLEES = frozenset(
         "parse_order_status_report",
         "UUID4",
         "report.filled_qty.as_decimal",
+        # B0-d: the resolver's own DurableFillRecord carries `order_qty` from
+        # the venue's echoed ORIGINAL order size -- a different entry from
+        # `report.filled_qty.as_decimal` above (the CUMULATIVE filled size).
+        # Inert attribute-method call on the already-parsed report; no I/O.
+        "report.quantity.as_decimal",
         "self._declared_positions",
         "instrument_id_to_slug",
         "_resolver_long_position_state",

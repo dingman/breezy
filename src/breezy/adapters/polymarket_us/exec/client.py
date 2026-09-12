@@ -474,6 +474,37 @@ def _optional_venue_fee_raw(raw: object) -> str | None:
     return raw
 
 
+def _optional_trade_id(raw: object) -> str | None:
+    """``tradeId`` is optional-on-read; a present value must be a string.
+
+    ``None`` on a legacy record written before this field existed, or on an
+    absent/null key. A present non-``str`` value is a mapping error, exactly
+    like :func:`_optional_venue_fee_raw`.
+    """
+    if raw is None:
+        return None
+    if not isinstance(raw, str):
+        raise ExecutionReportMappingError(
+            f"a durable fill record is malformed: tradeId must be a string "
+            f"or null, got {type(raw).__name__}"
+        )
+    return raw
+
+
+def _optional_order_qty(raw: object) -> Decimal | None:
+    """``orderQty`` is optional-on-read; a present value must be a finite
+    decimal (S-M1).
+
+    ``None`` on a legacy record written before this field existed, or on an
+    absent/null key -- NEVER inferred from ``cumulative_qty`` and never
+    defaulted to ``Decimal(1)``. A present non-finite value (``"NaN"``,
+    ``"Infinity"``) is refused by :func:`_to_decimal`'s ``is_finite()`` guard.
+    """
+    if raw is None:
+        return None
+    return _to_decimal(raw, field="orderQty", error=ExecutionReportMappingError)
+
+
 @dataclass(frozen=True, kw_only=True)
 class DurableFillRecord:
     """What Breezy actually paid, on disk, CUMULATIVE per venue order.
@@ -511,6 +542,15 @@ class DurableFillRecord:
     fee_reconciled: bool
     ts_event: int
     venue_fee_raw: str | None = None
+    #: B0: an opaque venue-or-synthetic match id (create: the venue's own
+    #: ``Execution.tradeId``; resolver: the self-labelling ``GET-<venue_order_id>``
+    #: synthetic form) -- two provenances under one field, never a
+    #: ``tradeIdSource``. ``None`` on a legacy record (S-M1).
+    trade_id: str | None = None
+    #: B0: the ORIGINAL order size in contracts -- NOT the filled size.
+    #: ``None`` on a legacy record; never inferred from ``cumulative_qty``,
+    #: never defaulted to ``Decimal(1)`` (S-M1).
+    order_qty: Decimal | None = None
 
     def to_bytes(self) -> bytes:
         return json.dumps(
@@ -525,6 +565,8 @@ class DurableFillRecord:
                 "feeReconciled": self.fee_reconciled,
                 "tsEvent": self.ts_event,
                 "venueFeeRaw": self.venue_fee_raw,
+                "tradeId": self.trade_id,
+                "orderQty": None if self.order_qty is None else str(self.order_qty),
             },
             sort_keys=True,
         ).encode("utf-8")
@@ -533,11 +575,12 @@ class DurableFillRecord:
     def from_bytes(cls, raw: bytes) -> Self:
         """Decode a record, refusing anything that is not exactly one.
 
-        Every field is required except ``venueFeeRaw``, which is optional-on-read
-        so pre-GL-2 records still decode (``None``). A present non-string
-        ``venueFeeRaw`` is refused. A partially-decodable record is refused
-        rather than defaulted: a fill record missing its price is not a fill
-        record with a zero price.
+        Every field is required except ``venueFeeRaw``, ``tradeId`` and
+        ``orderQty``, which are optional-on-read so pre-GL-2/pre-B0 records
+        still decode (``None``). A present non-string ``venueFeeRaw``/
+        ``tradeId``, or a present non-finite ``orderQty``, is refused. A
+        partially-decodable record is refused rather than defaulted: a fill
+        record missing its price is not a fill record with a zero price.
         """
         try:
             payload = json.loads(raw)
@@ -580,6 +623,8 @@ class DurableFillRecord:
                 fee_reconciled=_require_bool(payload["feeReconciled"], field="feeReconciled"),
                 ts_event=int(payload["tsEvent"]),
                 venue_fee_raw=_optional_venue_fee_raw(payload.get("venueFeeRaw")),
+                trade_id=_optional_trade_id(payload.get("tradeId")),
+                order_qty=_optional_order_qty(payload.get("orderQty")),
             )
         except (KeyError, TypeError, ValueError, InvalidOperation) as exc:
             raise ExecutionReportMappingError(
@@ -1637,6 +1682,8 @@ class PolymarketUSExecutionClient(LiveExecutionClient):
             fee_reconciled=False,
             ts_event=now_ns,
             venue_fee_raw=None,
+            trade_id=_synthetic_get_fill_trade_id(context.venue_order_id).value,
+            order_qty=report.quantity.as_decimal(),
         )
         try:
             self.record_fill(record)
@@ -2832,6 +2879,8 @@ class PolymarketUSExecutionClient(LiveExecutionClient):
                     fee_reconciled=outcome.fee_reconciled,
                     ts_event=fill.ts_event,
                     venue_fee_raw=fill.commission_raw,
+                    trade_id=fill.trade_id.value,
+                    order_qty=submit_chain.order_quantity_decimal(order),
                 )
                 self.record_fill(record)
             except Exception as exc:  # noqa: BLE001 - deliberately broad: this
