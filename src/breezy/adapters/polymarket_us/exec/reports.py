@@ -1122,6 +1122,12 @@ def parse_fill_report(
     fill, and the order-level average belongs on the order report.
 
     A MAKER fill is REFUSED -- see :func:`_assert_taker_fill`.
+
+    The execution-type refusal below names the offending value through this
+    module's value-safe renderer (:func:`_name_value`), not raw ``!r``,
+    because this message is DURABLE: SP-2's I3 persists it into the resolver
+    context store, and ``_require`` permits ``type`` to be any JSON value, so
+    an unbounded or nested one must never be echoed whole (SEC-H1).
     """
     context = "fill report"
     execution = _known_keys_with_full_tree(
@@ -1131,9 +1137,9 @@ def parse_fill_report(
     execution_type = _require(execution, "type", context=context)
     if execution_type not in _FILL_EXECUTION_TYPES:
         raise ExecutionReportMappingError(
-            f"{context} carries execution type {execution_type!r}, which is not one of "
-            f"({', '.join(sorted(_FILL_EXECUTION_TYPES))}); refusing to report a trade "
-            "the venue did not report"
+            f"{context} carries execution type {_name_value(execution_type)}, which is not "
+            f"one of ({', '.join(sorted(_FILL_EXECUTION_TYPES))}); refusing to report a "
+            "trade the venue did not report"
         )
 
     order_context = f"{context}.order"
