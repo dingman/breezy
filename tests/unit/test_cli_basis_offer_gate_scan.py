@@ -608,3 +608,304 @@ def test_contaminated_stations_is_exactly_nyc() -> None:
     # not a real station effect. NYC must still be scanned and reported, but
     # never counted into `n`/`k` for the kill rule.
     assert CONTAMINATED_STATIONS == frozenset({"NYC"})
+
+
+# ---------------------------------------------------------------------------
+# Streaming depth/quote readers vs the OLD materializing path (RED first)
+#
+# `_stream_depth_rows`/`_stream_quote_rows` read the raw Arrow columns
+# directly and must reproduce EXACTLY the same per-instrument
+# `(ts_event_ns, levels)` series the OLD materializing path builds --
+# `_materialized_depth_by_instrument`/`_materialized_quote_by_instrument`,
+# kept reachable under those names for precisely this comparison, mirroring
+# `tests/unit/test_k1_cheap_open_settlement.py`'s own streaming section.
+# ---------------------------------------------------------------------------
+
+from collections import defaultdict
+
+import cli_basis_offer_gate_scan as offer_gate_scan
+import pyarrow as pa
+from nautilus_trader.model.data import BookOrder, OrderBookDepth10, QuoteTick
+from nautilus_trader.model.enums import OrderSide
+from nautilus_trader.model.identifiers import InstrumentId
+from nautilus_trader.model.objects import Price, Quantity
+from nautilus_trader.serialization.arrow.serializer import ArrowSerializer
+
+_INSTRUMENT_A = InstrumentId.from_str("tc-temp-nychigh-2026-08-31-gte82lt83f.POLYMARKET_US")
+_INSTRUMENT_B = InstrumentId.from_str("tc-temp-mdwhigh-2026-08-31-gte93lt94f.POLYMARKET_US")
+
+
+def _depth_side(
+    levels: list[tuple[str, str]], side: OrderSide, price_precision: int, size_precision: int
+) -> tuple[list[BookOrder], list[int]]:
+    orders = [
+        BookOrder(
+            side, Price(float(price), price_precision), Quantity(float(size), size_precision), 0
+        )
+        for price, size in levels
+    ]
+    counts = [1] * len(orders)
+    filler = BookOrder(side, Price(0, price_precision), Quantity(0, size_precision), 0)
+    while len(orders) < 10:
+        orders.append(filler)
+        counts.append(0)
+    return orders, counts
+
+
+def _make_depth(
+    *,
+    instrument_id: InstrumentId,
+    ask_levels: list[tuple[str, str]],
+    bid_levels: list[tuple[str, str]],
+    ts_event: int,
+    ts_init: int,
+    sequence: int,
+    price_precision: int = 2,
+    size_precision: int = 2,
+) -> OrderBookDepth10:
+    bids, bid_counts = _depth_side(bid_levels, OrderSide.BUY, price_precision, size_precision)
+    asks, ask_counts = _depth_side(ask_levels, OrderSide.SELL, price_precision, size_precision)
+    return OrderBookDepth10(
+        instrument_id=instrument_id,
+        bids=bids,
+        asks=asks,
+        bid_counts=bid_counts,
+        ask_counts=ask_counts,
+        flags=0,
+        sequence=sequence,
+        ts_event=ts_event,
+        ts_init=ts_init,
+    )
+
+
+def _write_offer_gate_stream(path: Path, objects: list[Any]) -> None:
+    data_cls = type(objects[0])
+    table = ArrowSerializer.serialize_batch(objects, data_cls=data_cls)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with pa.OSFile(str(path), "wb") as sink:
+        writer = pa.ipc.new_stream(sink, table.schema)
+        writer.write_table(table)
+        writer.close()
+
+
+def _mini_offer_gate_depth_tape(tape_root: Path) -> tuple[Path, Path]:
+    """Two CLEAN instance dirs exercising BOTH `_instance_files` layouts,
+    mixed precisions, an out-of-order best level, and an empty-ask row.
+    """
+    instance_1 = tape_root / "live" / "instance-1"
+    instance_2 = tape_root / "live" / "instance-2"
+
+    # Nested per-instrument layout (`{folder}/{instrument}/*.feather`).
+    # Level 0 (0.05) is NOT the best ask -- level 1 (0.02) is -- pinning
+    # that the streaming path decodes ALL levels, not just level 0.
+    depth_a_priced = _make_depth(
+        instrument_id=_INSTRUMENT_A,
+        ask_levels=[("0.05", "5"), ("0.02", "20")],
+        bid_levels=[("0.01", "10")],
+        ts_event=1_000,
+        ts_init=1_001,
+        sequence=0,
+    )
+    # An entirely empty ask side -- every level padded with price/size 0.
+    depth_a_empty = _make_depth(
+        instrument_id=_INSTRUMENT_A,
+        ask_levels=[],
+        bid_levels=[("0.01", "10")],
+        ts_event=2_000,
+        ts_init=2_001,
+        sequence=1,
+    )
+    _write_offer_gate_stream(
+        instance_1 / "order_book_depths" / "instrument_a" / "part-0.feather",
+        [depth_a_priced, depth_a_empty],
+    )
+
+    # Flat layout (`{folder}/*.feather`, no per-instrument subfolder), and a
+    # DIFFERENT precision (price_precision=3, size_precision=0) -- the real
+    # tape mixes precisions after `minimumTradeQty` changed 1 -> 0.01.
+    # Level 0 (0.500) again is not the winner -- level 1 (0.125) is.
+    depth_b = _make_depth(
+        instrument_id=_INSTRUMENT_B,
+        ask_levels=[("0.500", "12"), ("0.125", "7")],
+        bid_levels=[("0.100", "5")],
+        ts_event=3_000,
+        ts_init=3_001,
+        sequence=0,
+        price_precision=3,
+        size_precision=0,
+    )
+    _write_offer_gate_stream(instance_2 / "order_book_depths" / "part-0.feather", [depth_b])
+
+    return instance_1, instance_2
+
+
+def _mini_offer_gate_quote_tape(tape_root: Path) -> tuple[Path, Path]:
+    """Quote-side tape sharing an EXACT `(ts_event, ts_init)` tie with the
+    depth tape's `instrument_a` first row -- depth and quote are read via
+    SEPARATE streaming calls (separate dedup sets, matching `_load_stream`'s
+    own per-call scoping), so both must survive and reach
+    `_evaluate_instrument` in depth-then-quote order.
+    """
+    instance_1 = tape_root / "live" / "instance-1"
+    instance_2 = tape_root / "live" / "instance-2"
+
+    quote_a_tied = QuoteTick(
+        instrument_id=_INSTRUMENT_A,
+        bid_price=Price(0, 2),
+        ask_price=Price(0.10, 2),
+        bid_size=Quantity(0, 2),
+        ask_size=Quantity(30, 2),
+        ts_event=1_000,
+        ts_init=1_001,
+    )
+    _write_offer_gate_stream(
+        instance_1 / "quote_tick" / "instrument_a" / "part-0.feather", [quote_a_tied]
+    )
+
+    # Flat layout, mixed precision, plus a genuinely zero ask (not genuine,
+    # but the row must still be emitted -- genuineness is judged later).
+    quote_b_zero = QuoteTick(
+        instrument_id=_INSTRUMENT_B,
+        bid_price=Price(0, 3),
+        ask_price=Price(0, 3),
+        bid_size=Quantity(0, 0),
+        ask_size=Quantity(0, 0),
+        ts_event=3_500,
+        ts_init=3_501,
+    )
+    quote_b_genuine = QuoteTick(
+        instrument_id=_INSTRUMENT_B,
+        bid_price=Price(0, 3),
+        ask_price=Price(0.125, 3),
+        bid_size=Quantity(0, 0),
+        ask_size=Quantity(7, 0),
+        ts_event=4_000,
+        ts_init=4_001,
+    )
+    _write_offer_gate_stream(
+        instance_2 / "quote_tick" / "part-0.feather", [quote_b_zero, quote_b_genuine]
+    )
+    return instance_1, instance_2
+
+
+def test_streaming_depth_rows_match_the_materialized_reference(tmp_path: Path) -> None:
+    instance_1, instance_2 = _mini_offer_gate_depth_tape(tmp_path)
+    dirs = [instance_1, instance_2]
+
+    materialized = offer_gate_scan._materialized_depth_by_instrument(dirs)
+
+    streamed: dict[str, list[tuple[int, tuple[AskLevel, ...]]]] = defaultdict(list)
+    offer_gate_scan._stream_depth_rows(
+        dirs, lambda iid, ts, levels: streamed[iid].append((ts, levels))
+    )
+
+    assert dict(streamed) == dict(materialized)
+
+    instrument_a = str(_INSTRUMENT_A)
+    a_rows = dict(streamed[instrument_a])
+    # Out-of-order levels: level 0 is 0.05, level 1 is 0.02 -- BOTH must
+    # survive, in `depth.asks` order, not just the winning one.
+    assert a_rows[1_000][0] == AskLevel(price=Decimal("0.05"), size=Decimal(5))
+    assert a_rows[1_000][1] == AskLevel(price=Decimal("0.02"), size=Decimal(20))
+    # The empty-ask row decodes to all-zero levels, never dropped.
+    assert all(level.price == 0 and level.size == 0 for level in a_rows[2_000])
+
+    instrument_b = str(_INSTRUMENT_B)
+    b_rows = dict(streamed[instrument_b])
+    # Mixed precision (price_precision=3, size_precision=0), out-of-order
+    # levels: the streaming path must decode at the FILE's own precision.
+    assert b_rows[3_000][0] == AskLevel(price=Decimal("0.500"), size=Decimal(12))
+    assert b_rows[3_000][1] == AskLevel(price=Decimal("0.125"), size=Decimal(7))
+
+
+def test_streaming_quote_rows_match_the_materialized_reference(tmp_path: Path) -> None:
+    _mini_offer_gate_depth_tape(tmp_path)
+    instance_1, instance_2 = _mini_offer_gate_quote_tape(tmp_path)
+    dirs = [instance_1, instance_2]
+
+    materialized = offer_gate_scan._materialized_quote_by_instrument(dirs)
+
+    streamed: dict[str, list[tuple[int, tuple[AskLevel, ...]]]] = defaultdict(list)
+    offer_gate_scan._stream_quote_rows(
+        dirs, lambda iid, ts, levels: streamed[iid].append((ts, levels))
+    )
+
+    assert dict(streamed) == dict(materialized)
+
+    instrument_b = str(_INSTRUMENT_B)
+    b_rows = dict(streamed[instrument_b])
+    # A zero ask is not genuine but must still be emitted unconditionally.
+    assert b_rows[3_500] == (AskLevel(price=Decimal(0), size=Decimal(0)),)
+    assert b_rows[4_000] == (AskLevel(price=Decimal("0.125"), size=Decimal(7)),)
+
+
+def test_depth_and_quote_exact_tie_both_survive_in_depth_first_order(tmp_path: Path) -> None:
+    """A depth row and a quote row sharing the EXACT SAME
+    `(instrument_id, ts_event, ts_init)` are deduplicated on SEPARATE
+    `seen` sets (one per data class, matching `_load_stream`'s per-call
+    scoping) -- neither is dropped, and `_evaluate_instrument` must see
+    depth before quote at the tie, matching the materialized append order.
+    """
+    instance_1, instance_2 = _mini_offer_gate_depth_tape(tmp_path)
+    _mini_offer_gate_quote_tape(tmp_path)
+    dirs = [instance_1, instance_2]
+
+    depth_by_instrument: dict[str, list[tuple[int, tuple[AskLevel, ...]]]] = defaultdict(list)
+    offer_gate_scan._stream_depth_rows(
+        dirs, lambda iid, ts, levels: depth_by_instrument[iid].append((ts, levels))
+    )
+    quote_by_instrument: dict[str, list[tuple[int, tuple[AskLevel, ...]]]] = defaultdict(list)
+    offer_gate_scan._stream_quote_rows(
+        dirs, lambda iid, ts, levels: quote_by_instrument[iid].append((ts, levels))
+    )
+
+    instrument_a = str(_INSTRUMENT_A)
+    depth_ts = [ts for ts, _ in depth_by_instrument[instrument_a]]
+    quote_ts = [ts for ts, _ in quote_by_instrument[instrument_a]]
+    assert 1_000 in depth_ts
+    assert 1_000 in quote_ts
+
+    observations: list[tuple[int, tuple[AskLevel, ...]]] = []
+    observations.extend(depth_by_instrument[instrument_a])
+    observations.extend(quote_by_instrument[instrument_a])
+    tied = [levels for ts, levels in observations if ts == 1_000]
+    # Depth first: its best level (0.02) precedes the quote's ask (0.10).
+    assert tied[0][1].price == Decimal("0.02")
+    assert tied[1][0].price == Decimal("0.10")
+
+
+def test_streaming_never_materializes_a_depth_or_quote_object(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Residency bound: the streaming path must never construct a full
+    `OrderBookDepth10`/`QuoteTick` object. `_load_stream` (via
+    `ArrowSerializer.deserialize`) is the ONLY place either object is ever
+    materialized in this module, so guarding it against those two data
+    classes and confirming the streaming readers still complete correctly
+    proves zero such objects are retained -- not merely a small count.
+    """
+    _mini_offer_gate_depth_tape(tmp_path)
+    _mini_offer_gate_quote_tape(tmp_path)
+    dirs = [tmp_path / "live" / "instance-1", tmp_path / "live" / "instance-2"]
+
+    original_load_stream = offer_gate_scan._load_stream
+
+    def _guarded_load_stream(instance_dirs: Any, folder: str, data_cls: type) -> Any:
+        if data_cls in (OrderBookDepth10, QuoteTick):
+            raise AssertionError(f"{data_cls.__name__} was materialized by the streaming path")
+        return original_load_stream(instance_dirs, folder, data_cls)
+
+    monkeypatch.setattr(offer_gate_scan, "_load_stream", _guarded_load_stream)
+
+    depth_by_instrument: dict[str, list[tuple[int, tuple[AskLevel, ...]]]] = defaultdict(list)
+    offer_gate_scan._stream_depth_rows(
+        dirs, lambda iid, ts, levels: depth_by_instrument[iid].append((ts, levels))
+    )
+    quote_by_instrument: dict[str, list[tuple[int, tuple[AskLevel, ...]]]] = defaultdict(list)
+    offer_gate_scan._stream_quote_rows(
+        dirs, lambda iid, ts, levels: quote_by_instrument[iid].append((ts, levels))
+    )
+
+    assert len(depth_by_instrument[str(_INSTRUMENT_A)]) == 2
+    assert len(depth_by_instrument[str(_INSTRUMENT_B)]) == 1
+    assert len(quote_by_instrument[str(_INSTRUMENT_B)]) == 2

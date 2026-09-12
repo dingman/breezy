@@ -77,8 +77,6 @@ from decimal import Decimal
 from pathlib import Path
 from typing import Any, Final
 
-import pyarrow as pa
-import pyarrow.parquet as pq
 from nautilus_trader.model.data import OrderBookDepth10, QuoteTick
 from nautilus_trader.model.instruments import BinaryOption
 from nautilus_trader.model.objects import Price, Quantity
@@ -101,6 +99,9 @@ from settlement_truth_dataset import (
     SETTLEMENT_PREDICATE_STATEMENT,
 )
 from settlement_truth_dataset import settles_yes as _settles_yes
+from tape_arrow_columns import decode_raw_fixed_point as _decode_raw_fixed_point
+from tape_arrow_columns import read_arrow_table as _read_arrow_table
+from tape_arrow_columns import table_identity as _table_identity
 
 from breezy.adapters.polymarket_us.parsing import FEE_COEFFICIENT_KEY
 from breezy.domain.weather_bucket_facts import (
@@ -502,20 +503,6 @@ def classify_parse_failure(*, file_mtime_ns: int, now_ns: int) -> str:
     return "MID_WRITE_SUSPECTED" if now_ns - file_mtime_ns < MID_WRITE_WINDOW_NS else "CORRUPT"
 
 
-def _read_arrow_table(path: Path) -> pa.Table:
-    """Open one tape file, whichever subtree it came from.
-
-    ``data/`` holds catalog Parquet; ``live/<run-id>/`` holds the streaming
-    Feather the recorder writes. Both are read here DIRECTLY rather than
-    through ``ParquetDataCatalog``, so a truncated file raises instead of
-    silently contributing zero rows.
-    """
-    if path.suffix == ".parquet":
-        return pq.read_table(path)
-    with pa.ipc.open_stream(pa.memory_map(str(path))) as reader:
-        return reader.read_all()
-
-
 def _tape_files(tape_root: Path, folder: str) -> list[Path]:
     """Every file for one data class across BOTH tape subtrees.
 
@@ -585,33 +572,6 @@ def _load_stream(tape_root: Path, folder: str, data_cls: type) -> tuple[TapePref
         ts_event_max_ns=ts_max,
     )
     return preflight, parsed_objects
-
-
-def _decode_raw_fixed_point(value: bytes) -> int:
-    """The undecoded raw integer behind one `fixed_size_binary[16]` cell.
-
-    A plain byte->int conversion, NOT a scale factor: the scale (10**9 vs
-    10**16 depending on build) is Nautilus' internal concern and is never
-    re-derived here -- see `_load_depth_ask_observations`.
-    """
-    return int.from_bytes(value, "little", signed=True)
-
-
-def _table_identity(table: pa.Table) -> tuple[str, int, int]:
-    """`(instrument_id, price_precision, size_precision)` for one tape file.
-
-    Shared by both `_stream_depth_ask_observations` and
-    `_stream_quote_ask_observations`: one batch of either kind can only ever
-    hold ONE instrument at one precision -- `ArrowSerializer.serialize_batch`
-    itself raises ``Mixed metadata`` the moment two are combined -- so these
-    are read ONCE per file from the schema metadata, never per row.
-    """
-    metadata = table.schema.metadata or {}
-    return (
-        metadata[b"instrument_id"].decode(),
-        int(metadata[b"price_precision"]),
-        int(metadata[b"size_precision"]),
-    )
 
 
 def _best_populated_ask_raw(

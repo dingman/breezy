@@ -131,15 +131,15 @@ import argparse
 import datetime as dt
 import sys
 from collections import Counter, defaultdict
-from collections.abc import Iterable, Mapping, Sequence
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from decimal import Decimal
 from pathlib import Path
 from typing import Any, Final, Literal
 
-import pyarrow as pa
 from nautilus_trader.model.data import OrderBookDepth10, QuoteTick
 from nautilus_trader.model.instruments import BinaryOption
+from nautilus_trader.model.objects import Price, Quantity
 from nautilus_trader.serialization.arrow.serializer import ArrowSerializer
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -160,8 +160,13 @@ from settlement_alignment_study import (
     metar_temperatures,
     parse_asos_rows,
 )
+from tape_arrow_columns import (
+    decode_raw_fixed_point,
+    read_arrow_table,
+    table_identity,
+)
 
-from breezy.adapters.polymarket_us.parsing import FEE_COEFFICIENT_KEY
+from breezy.adapters.polymarket_us.parsing import DEPTH10_LEVELS, FEE_COEFFICIENT_KEY
 from breezy.adapters.polymarket_us.symbology import parse_weather_slug
 from breezy.adapters.polymarket_us.tape_records import DepthTruncation
 from breezy.domain.weather_bucket_facts import (
@@ -584,15 +589,6 @@ def _instrument_facts(instrument: BinaryOption) -> InstrumentFacts | None:
 # ---------------------------------------------------------------------------
 
 
-def _read_arrow_table(path: Path) -> pa.Table:
-    if path.suffix == ".parquet":
-        import pyarrow.parquet as pq
-
-        return pq.read_table(path)
-    with pa.ipc.open_stream(pa.memory_map(str(path))) as reader:
-        return reader.read_all()
-
-
 def _instance_files(instance_dir: Path, folder: str) -> list[Path]:
     """Every feather file for one data class, in EITHER tape layout.
 
@@ -618,7 +614,7 @@ def _load_stream(instance_dirs: Sequence[Path], folder: str, data_cls: type) -> 
     for instance_dir in instance_dirs:
         for path in _instance_files(instance_dir, folder):
             try:
-                table = _read_arrow_table(path)
+                table = read_arrow_table(path)
                 parsed = ArrowSerializer.deserialize(data_cls, table)
             except Exception as exc:  # noqa: BLE001 -- a CLEAN instance should never fail here
                 # Loud, not silent: a CLEAN-classified instance failing to
@@ -635,6 +631,207 @@ def _load_stream(instance_dirs: Sequence[Path], folder: str, data_cls: type) -> 
                 seen.add(key)
                 objects.append(obj)
     return objects
+
+
+# ---------------------------------------------------------------------------
+# Streaming depth/quote readers -- column-projected, never a full
+# `OrderBookDepth10`/`QuoteTick` object (see `_stream_depth_rows` docstring).
+#
+# Unlike `k1_cheap_open_settlement._stream_depth_ask_observations`, which
+# folds every row to a SINGLE O(instruments) "best ask seen" reduction, this
+# scan's own consumption (`_evaluate_instrument` below) is a genuine per-row
+# TIME SERIES per instrument: a station-day can hold several
+# headroom-qualifying instants, and `notional_at_qualifying_levels` needs
+# EVERY ask level at a qualifying instant, not just the best one. So the row
+# is folded to the minimal per-row payload `(ts_event_ns, levels)` per
+# instrument, rather than reduced further -- a genuine memory win over
+# materializing full Nautilus objects (each `OrderBookDepth10` row carries
+# twenty `BookOrder` Python objects for both sides; this keeps only the ask
+# side's ten `(price, size)` pairs as plain `Decimal`s), but not the
+# O(instruments) reduction K1 achieves for a different consumption shape.
+# ---------------------------------------------------------------------------
+
+
+def _decode_ask_levels_from_depth_row(
+    ask_price_cols: list[list[bytes]],
+    ask_size_cols: list[list[bytes]],
+    row: int,
+    *,
+    price_precision: int,
+    size_precision: int,
+) -> tuple[AskLevel, ...]:
+    """All ten ask levels for one depth row, in `depth.asks` order.
+
+    Mirrors `_depth_ask_levels` over a full `OrderBookDepth10`, but decodes
+    straight from the raw fixed-point columns via `Price.from_raw` /
+    `Quantity.from_raw` -- Nautilus' own native constructors, never a
+    hand-rolled scale factor. Zero-padded levels are decoded too (as
+    `AskLevel(price=0, size=0)`), matching `depth.asks` unfiltered --
+    genuineness is judged later by `genuine_ask_levels`, exactly as before.
+    """
+    return tuple(
+        AskLevel(
+            price=Decimal(
+                str(
+                    Price.from_raw(
+                        decode_raw_fixed_point(ask_price_cols[level][row]), price_precision
+                    )
+                )
+            ),
+            size=Decimal(
+                str(
+                    Quantity.from_raw(
+                        decode_raw_fixed_point(ask_size_cols[level][row]), size_precision
+                    )
+                )
+            ),
+        )
+        for level in range(DEPTH10_LEVELS)
+    )
+
+
+def _stream_depth_rows(
+    instance_dirs: Sequence[Path],
+    on_row: Callable[[str, int, tuple[AskLevel, ...]], None],
+) -> None:
+    """Stream `order_book_depths` straight to per-row ask-level tuples.
+
+    No `OrderBookDepth10` Python object is ever built. `ArrowSerializer.
+    deserialize` cannot be handed a column-projected table -- it validates
+    columns by POSITION and raises the instant one is dropped -- so the raw
+    Arrow columns are read directly and every ask level is decoded per row.
+    Only one file's table is ever resident: it is read, folded into `on_row`
+    row by row, and dropped before the next file is opened. Deduplication
+    is the SAME `(instrument_id, ts_event, ts_init)` key `_load_stream`
+    uses, shared across every `instance_dir` in the SAME iteration order, so
+    a genuine duplicate row is dropped identically and surviving rows reach
+    `on_row` in the same relative order the materialized path would have
+    produced them in (needed for exact-tie resolution downstream).
+    """
+    seen: set[tuple[str, int, int]] = set()
+    for instance_dir in instance_dirs:
+        for path in _instance_files(instance_dir, "order_book_depths"):
+            try:
+                table = read_arrow_table(path)
+                instrument_id, price_precision, size_precision = table_identity(table)
+                ts_events = table.column("ts_event").to_pylist()
+                ts_inits = table.column("ts_init").to_pylist()
+                ask_price_cols = [
+                    table.column(f"ask_price_{level}").to_pylist()
+                    for level in range(DEPTH10_LEVELS)
+                ]
+                ask_size_cols = [
+                    table.column(f"ask_size_{level}").to_pylist()
+                    for level in range(DEPTH10_LEVELS)
+                ]
+                row_count = table.num_rows
+            except Exception as exc:  # noqa: BLE001 -- matches `_load_stream`
+                print(f"[offer-gate] unexpected parse failure on {path}: {exc}", file=sys.stderr)
+                continue
+
+            for row in range(row_count):
+                ts_event = int(ts_events[row])
+                ts_init = int(ts_inits[row])
+                key = (instrument_id, ts_event, ts_init)
+                if key in seen:
+                    continue
+                seen.add(key)
+                levels = _decode_ask_levels_from_depth_row(
+                    ask_price_cols,
+                    ask_size_cols,
+                    row,
+                    price_precision=price_precision,
+                    size_precision=size_precision,
+                )
+                on_row(instrument_id, ts_event, levels)
+
+            # One file's table (and its projected column lists) must be gone
+            # before the next is read -- never a tape-wide accumulation.
+            del table, ts_events, ts_inits, ask_price_cols, ask_size_cols
+
+
+def _stream_quote_rows(
+    instance_dirs: Sequence[Path],
+    on_row: Callable[[str, int, tuple[AskLevel, ...]], None],
+) -> None:
+    """Stream `quote_tick` straight to per-row ask-level tuples.
+
+    `QuoteTick` has exactly one ask level, so `on_row` always receives a
+    one-element tuple -- otherwise identical to `_stream_depth_rows`. Every
+    row produces a callback UNCONDITIONALLY, including a zero-price/
+    zero-size ask, matching `_asks_from_quotes`-equivalent behaviour: this
+    scan's own `genuine_ask_levels` judges genuineness later, never here.
+    """
+    seen: set[tuple[str, int, int]] = set()
+    for instance_dir in instance_dirs:
+        for path in _instance_files(instance_dir, "quote_tick"):
+            try:
+                table = read_arrow_table(path)
+                instrument_id, price_precision, size_precision = table_identity(table)
+                ts_events = table.column("ts_event").to_pylist()
+                ts_inits = table.column("ts_init").to_pylist()
+                ask_prices = table.column("ask_price").to_pylist()
+                ask_sizes = table.column("ask_size").to_pylist()
+                row_count = table.num_rows
+            except Exception as exc:  # noqa: BLE001 -- matches `_load_stream`
+                print(f"[offer-gate] unexpected parse failure on {path}: {exc}", file=sys.stderr)
+                continue
+
+            for row in range(row_count):
+                ts_event = int(ts_events[row])
+                ts_init = int(ts_inits[row])
+                key = (instrument_id, ts_event, ts_init)
+                if key in seen:
+                    continue
+                seen.add(key)
+                level = AskLevel(
+                    price=Decimal(
+                        str(
+                            Price.from_raw(
+                                decode_raw_fixed_point(ask_prices[row]), price_precision
+                            )
+                        )
+                    ),
+                    size=Decimal(
+                        str(
+                            Quantity.from_raw(
+                                decode_raw_fixed_point(ask_sizes[row]), size_precision
+                            )
+                        )
+                    ),
+                )
+                on_row(instrument_id, ts_event, (level,))
+
+            del table, ts_events, ts_inits, ask_prices, ask_sizes
+
+
+def _materialized_depth_by_instrument(
+    clean_dirs: Sequence[Path],
+) -> dict[str, list[tuple[int, tuple[AskLevel, ...]]]]:
+    """The OLD path: materialize every `OrderBookDepth10`, then group by
+    instrument. Kept reachable under this name ONLY for the equivalence test
+    against `_stream_depth_rows` -- `build_scan` no longer calls this.
+    """
+    depths = _load_stream(clean_dirs, "order_book_depths", OrderBookDepth10)
+    result: dict[str, list[tuple[int, tuple[AskLevel, ...]]]] = defaultdict(list)
+    for depth in depths:
+        result[str(depth.instrument_id)].append((int(depth.ts_event), _depth_ask_levels(depth)))
+    return result
+
+
+def _materialized_quote_by_instrument(
+    clean_dirs: Sequence[Path],
+) -> dict[str, list[tuple[int, tuple[AskLevel, ...]]]]:
+    """The OLD path: materialize every `QuoteTick`, then group by
+    instrument. Kept reachable under this name ONLY for the equivalence test
+    against `_stream_quote_rows` -- `build_scan` no longer calls this.
+    """
+    quotes = _load_stream(clean_dirs, "quote_tick", QuoteTick)
+    result: dict[str, list[tuple[int, tuple[AskLevel, ...]]]] = defaultdict(list)
+    for quote in quotes:
+        level = (AskLevel(price=Decimal(str(quote.ask_price)), size=Decimal(str(quote.ask_size))),)
+        result[str(quote.instrument_id)].append((int(quote.ts_event), level))
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -717,14 +914,22 @@ def _depth_ask_levels(depth: OrderBookDepth10) -> tuple[AskLevel, ...]:
 def _evaluate_instrument(
     *,
     facts: InstrumentFacts,
-    depth_by_instrument: Mapping[str, list[OrderBookDepth10]],
-    quote_by_instrument: Mapping[str, list[QuoteTick]],
+    depth_by_instrument: Mapping[str, list[tuple[int, tuple[AskLevel, ...]]]],
+    quote_by_instrument: Mapping[str, list[tuple[int, tuple[AskLevel, ...]]]],
     running_days: Mapping[dt.date, RunningMaxDay],
     covered_hours: Mapping[dt.date, frozenset[int]],
     offset_hours: float,
 ) -> tuple[list[QualifyingInstant], int]:
     """Every qualifying instant for one open-tail instrument, plus a count of
     instants where the boundary held (admissible) whether or not it qualified.
+
+    `depth_by_instrument`/`quote_by_instrument` already hold `(ts_event_ns,
+    levels)` pairs -- streamed straight off the raw Arrow columns by
+    `_stream_depth_rows`/`_stream_quote_rows`, never a materialized
+    `OrderBookDepth10`/`QuoteTick` -- so this function only concatenates the
+    two per-instrument series, depth first then quote, matching the
+    materialized path's append order (and therefore its tie-break behaviour
+    on an exact `(ts_event_ns, ts_init_ns)`-adjacent collision downstream).
     """
     running_day = running_days.get(facts.climate_day)
     covered = covered_hours.get(facts.climate_day, frozenset())
@@ -732,19 +937,8 @@ def _evaluate_instrument(
     boundary_hits = 0
 
     observations: list[tuple[int, tuple[AskLevel, ...]]] = []
-    for depth in depth_by_instrument.get(facts.instrument_id, ()):
-        observations.append((int(depth.ts_event), _depth_ask_levels(depth)))
-    for quote in quote_by_instrument.get(facts.instrument_id, ()):
-        observations.append(
-            (
-                int(quote.ts_event),
-                (
-                    AskLevel(
-                        price=Decimal(str(quote.ask_price)), size=Decimal(str(quote.ask_size))
-                    ),
-                ),
-            )
-        )
+    observations.extend(depth_by_instrument.get(facts.instrument_id, ()))
+    observations.extend(quote_by_instrument.get(facts.instrument_id, ()))
 
     if running_day is None:
         return qualifying, boundary_hits
@@ -905,8 +1099,6 @@ def build_scan(
         for facts in (_instrument_facts(instrument) for instrument in corrupt_binary_options)
         if facts is not None
     }
-    depths = _load_stream(clean_dirs, "order_book_depths", OrderBookDepth10)
-    quotes = _load_stream(clean_dirs, "quote_tick", QuoteTick)
     truncations = _load_stream(clean_dirs, "custom_depth_truncation", DepthTruncation)
 
     facts_by_id: dict[str, InstrumentFacts] = {}
@@ -918,12 +1110,24 @@ def build_scan(
             continue
         facts_by_id[facts.instrument_id] = facts
 
-    depth_by_instrument: dict[str, list[OrderBookDepth10]] = defaultdict(list)
-    for depth in depths:
-        depth_by_instrument[str(depth.instrument_id)].append(depth)
-    quote_by_instrument: dict[str, list[QuoteTick]] = defaultdict(list)
-    for quote in quotes:
-        quote_by_instrument[str(quote.instrument_id)].append(quote)
+    # Streamed directly off the raw Arrow columns, never a materialized
+    # `OrderBookDepth10`/`QuoteTick` -- see `_stream_depth_rows`'s docstring
+    # for why this scan folds to a per-instrument TIME SERIES rather than a
+    # single O(instruments) reduction the way K1 does.
+    depth_by_instrument: dict[str, list[tuple[int, tuple[AskLevel, ...]]]] = defaultdict(list)
+    _stream_depth_rows(
+        clean_dirs,
+        lambda instrument_id, ts_event_ns, levels: depth_by_instrument[instrument_id].append(
+            (ts_event_ns, levels)
+        ),
+    )
+    quote_by_instrument: dict[str, list[tuple[int, tuple[AskLevel, ...]]]] = defaultdict(list)
+    _stream_quote_rows(
+        clean_dirs,
+        lambda instrument_id, ts_event_ns, levels: quote_by_instrument[instrument_id].append(
+            (ts_event_ns, levels)
+        ),
+    )
     truncated_ask_snapshots = sum(
         1 for t in truncations if t.ask_levels_seen and t.levels_dropped > 0
     )
