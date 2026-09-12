@@ -40,9 +40,11 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Final, TextIO
 
+from breezy.runtime.alert_detail import assert_payload_detail_is_safe
 from breezy.runtime.exec_state_db_path import ExecStateDbNotConfiguredError, resolve_store_path
 from breezy.runtime.health import AlertPayload, AlertSink, emit_alert, resolve_alert_sink
 from breezy.runtime.process_probe import find_pid_by_argv as _find_pid_by_argv
+from breezy.runtime.process_probe import pid_cmdline_matches
 from breezy.runtime.settings import CONTINUOUS_RUNG_HOLD_VAR
 from breezy.runtime.sqlite_store import SqliteStateStore
 from breezy.runtime.submit_intent import (
@@ -69,6 +71,7 @@ from breezy.runtime.trade_supervisor_core import (
     ContinuousFamilyCheck,
     DaySchedulerState,
     LaunchAction,
+    NodeLivenessState,
     Phase,
     SelfCheckResult,
     StopPriorAction,
@@ -77,6 +80,7 @@ from breezy.runtime.trade_supervisor_core import (
     continuous_family_check,
     continuous_family_is_halted,
     decide_launch_action,
+    decide_node_liveness,
     decide_relaunch,
     decide_stop_prior_action,
     initial_scheduler_state,
@@ -1146,6 +1150,59 @@ def _default_clock() -> dt.datetime:
     return dt.datetime.now(dt.UTC)
 
 
+def _do_node_liveness(
+    *,
+    ports: SupervisorPorts,
+    now: dt.datetime,
+    liveness: NodeLivenessState,
+    tracked_pid: int | None,
+    store_path: Path,
+) -> NodeLivenessState:
+    """SP-6 A11: the supervisor's own fast-path node-liveness check, run
+    on every quiet (``Phase.NONE``) pass -- ~120 s worst-case detection
+    latency, independent of the separate `*:0/5` watchdog timer's own
+    health (N12).
+
+    **Fork-rate fix (AM-13/SEC2-M1).** When a pid is already tracked, the
+    FIRST check is :func:`pid_cmdline_matches` -- a pure
+    ``/proc/<pid>/cmdline`` read, no fork -- and a match ends the check
+    right there having forked nothing. Only when that read says the
+    tracked pid is gone (or none was ever tracked) does this fall back to
+    ``ports.find_node_pid()`` (the anchored ``pgrep`` fork).
+
+    **Absence requires two INDEPENDENT mechanisms to agree (B4).** A
+    negative pid check alone is cross-checked against
+    ``ports.resolve_intent_lock_holder`` -- a pure ``/proc/locks`` read,
+    a completely different mechanism (flock holder, not process table) --
+    before the process counts as absent at all. Both mechanisms fail
+    CLOSED to "absent" on an unreadable ``/proc``, which is exactly why
+    :func:`decide_node_liveness` additionally requires two consecutive
+    passes before ever alerting.
+    """
+    node_present = tracked_pid is not None and pid_cmdline_matches(
+        tracked_pid, NODE_ARGV_ANCHOR
+    ) is True
+    if not node_present:
+        node_present = ports.find_node_pid() is not None
+    if not node_present:
+        holder = ports.resolve_intent_lock_holder(intent_lock_path(store_path))
+        node_present = holder is not None
+
+    new_liveness, should_alert = decide_node_liveness(
+        now_utc=now, node_present=node_present, state=liveness
+    )
+    if should_alert:
+        assert_payload_detail_is_safe(AlertDetail.TRADE_NODE_ABSENT.value)  # AM-10
+        alert(
+            ports.alert_sink,
+            event="TRADE_NODE_ABSENT",
+            severity="CRITICAL",
+            detail=AlertDetail.TRADE_NODE_ABSENT,
+        )
+        log_decision("node_absent_alert")
+    return new_liveness
+
+
 def _run_forever(
     *,
     store_path: Path,
@@ -1179,6 +1236,7 @@ def _run_forever(
     state = initial_scheduler_state(clock().date())
     tracked_pid: int | None = None
     node_log: Path | None = None
+    liveness = NodeLivenessState()
     iterations = 0
 
     try:
@@ -1188,6 +1246,21 @@ def _run_forever(
             phase, _fire_at = next_due(now, state)
 
             if phase is Phase.NONE:
+                # SP-6 A11: the fast-path liveness check runs on every
+                # quiet pass, BEFORE the sleep -- wrapped in its own
+                # try/except so a probe failure can never end the
+                # supervisor, matching the phase-exception containment
+                # below. No new thread, timer, port, or signal.
+                try:
+                    liveness = _do_node_liveness(
+                        ports=active_ports,
+                        now=now,
+                        liveness=liveness,
+                        tracked_pid=tracked_pid,
+                        store_path=store_path,
+                    )
+                except Exception:
+                    logger.exception("node liveness check failed")
                 sleep(_SCHEDULE_POLL_INTERVAL_S)
                 continue
 
