@@ -384,9 +384,7 @@ class ContinuousRungHoldStrategy(Strategy):
             self._report_alerter(
                 self.position_alerter, "continuous_rung_hold position report failed",
             )
-            self.last_startup_evidence_summary = _startup_evidence_summary(
-                None, now_ns=now_ns, decisions={},
-            )
+            self._record_startup_evidence_summary(None, now_ns=now_ns, decisions={})
             return False
 
         evidence = (
@@ -402,9 +400,7 @@ class ContinuousRungHoldStrategy(Strategy):
             self._report_alerter(
                 self.position_alerter, "continuous_rung_hold position report failed",
             )
-            self.last_startup_evidence_summary = _startup_evidence_summary(
-                evidence, now_ns=now_ns, decisions={},
-            )
+            self._record_startup_evidence_summary(evidence, now_ns=now_ns, decisions={})
             return False
 
         candidate_ids = self._candidate_instrument_ids()
@@ -418,9 +414,7 @@ class ContinuousRungHoldStrategy(Strategy):
             self._report_alerter(
                 self.position_alerter, "continuous_rung_hold position report failed",
             )
-            self.last_startup_evidence_summary = _startup_evidence_summary(
-                evidence, now_ns=now_ns, decisions={},
-            )
+            self._record_startup_evidence_summary(evidence, now_ns=now_ns, decisions={})
             return False
 
         for fill_record in fills:
@@ -470,14 +464,41 @@ class ContinuousRungHoldStrategy(Strategy):
                 self._report_alerter(
                     self.position_alerter, "continuous_rung_hold position report failed",
                 )
-                self.last_startup_evidence_summary = _startup_evidence_summary(
+                self._record_startup_evidence_summary(
                     evidence, now_ns=now_ns, decisions=decisions,
                 )
                 return False
-        self.last_startup_evidence_summary = _startup_evidence_summary(
-            evidence, now_ns=now_ns, decisions=decisions,
-        )
+        self._record_startup_evidence_summary(evidence, now_ns=now_ns, decisions=decisions)
         return True
+
+    def _record_startup_evidence_summary(
+        self,
+        evidence: dict[str, object] | None,
+        *,
+        now_ns: int,
+        decisions: Mapping[str, str],
+    ) -> None:
+        """AC-13/N2 (R-8, C5): computes the ONE summary line for this
+        return path, stores it on `self.last_startup_evidence_summary`
+        (asserted by presence, L-27), and emits it via the seam below --
+        exactly once per `_run_never_arm_walk` return.
+        """
+        summary = _startup_evidence_summary(evidence, now_ns=now_ns, decisions=decisions)
+        self.last_startup_evidence_summary = summary
+        self._emit_startup_evidence_summary(summary)
+
+    def _emit_startup_evidence_summary(self, summary: str) -> None:
+        """C5 (code-reviewer HIGH on 8ae97be): the ONE INFO line AC-13
+        requires on every `_run_never_arm_walk` return, so a live boot's
+        `journalctl`/node-log inspection has something to find. A
+        Breezy-owned seam (never a Nautilus internal, never log capture,
+        L-27) so a test can override this method to record calls instead
+        of asserting on captured log output. Production body is exactly
+        one `self.log.info` call -- page facts only (eof_complete,
+        position_read_refused, fill_walk_complete, page slug count,
+        evidence age, per-candidate decision); never a URL or secret.
+        """
+        self.log.info(summary)
 
     def _candidate_instrument_ids(self) -> frozenset[str]:
         """The union `on_order_filled`'s slug-fallback join, and the never-

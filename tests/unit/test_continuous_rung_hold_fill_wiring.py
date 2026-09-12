@@ -973,6 +973,36 @@ def test_every_never_arm_walk_exit_path_records_a_startup_evidence_summary(
     assert strategy.last_startup_evidence_summary is not None
 
 
+@pytest.mark.parametrize(
+    "make_strategy",
+    [
+        pytest.param(_s2_family_halt, id="family_halt"),
+        pytest.param(_s2_evidence_missing, id="evidence_missing"),
+        pytest.param(_s2_fill_walk_unreadable, id="fill_walk_unreadable"),
+        pytest.param(_s2_per_slug_halt, id="per_slug_halt"),
+        pytest.param(_s2_success, id="success"),
+    ],
+)
+def test_every_never_arm_walk_exit_path_emits_the_startup_evidence_summary_at_info(
+    store_path: Path,
+    interior_instrument: BinaryOption,
+    make_strategy: Callable[[Path, BinaryOption], ContinuousRungHoldStrategy],
+) -> None:
+    """C5 (code-reviewer HIGH on 8ae97be): AC-13/N2 requires the summary to
+    be EMITTED at INFO on every one of the FIVE return paths, not merely
+    stored -- `self.last_startup_evidence_summary` alone leaves nothing in
+    `journalctl`/the node log for first-boot verification. A Breezy-owned
+    seam, `_emit_startup_evidence_summary`, is overridden here to record
+    calls (never Nautilus internals, never log capture, L-27). Exactly ONE
+    emission per walk invocation on every path, and its content matches
+    the stored summary exactly."""
+    strategy = make_strategy(store_path, interior_instrument)
+    emitted: list[str] = []
+    strategy._emit_startup_evidence_summary = emitted.append  # type: ignore[method-assign,assignment]
+    strategy._run_never_arm_walk()
+    assert emitted == [strategy.last_startup_evidence_summary]
+
+
 def test_family_halt_key_literal(store_path: Path) -> None:
     assert FAMILY_HALT_KEY == "continuous_rung_hold/halt"
 
