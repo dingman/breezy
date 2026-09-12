@@ -130,6 +130,18 @@ class AlertDetail(str, Enum):
     )
     SELF_CHECK_FAIL_CONTINUOUS_FAMILY_HALTED = "self_check_fail_continuous_family_halted"
     PHASE_EXCEPTION_CONTAINED = "phase_exception_contained"
+    #: SP-6 A11 -- the supervisor's own fast-path liveness check
+    #: (~120 s detection, two consecutive confirmations by both an
+    #: independent pid probe and an independent lock-holder check).
+    TRADE_NODE_ABSENT = "trade_node_absent"
+    #: SP-6 A12 -- the standalone `*:0/5` watchdog's positive probe.
+    #: Distinct from TRADE_NODE_ABSENT (a different mechanism, a
+    #: different latency) even though both name the same real condition.
+    SUPERVISOR_ABSENT = "supervisor_absent"
+    #: SP-6 A12/B4 -- a `pgrep` probe FAILURE (fork error, timeout) is
+    #: reported as this WARN, never promoted to a CRITICAL absence: a
+    #: probe failure is not evidence the process is gone.
+    LIVENESS_PROBE_FAILED = "liveness_probe_failed"
 
 
 class StopPriorAction(str, Enum):
@@ -540,6 +552,86 @@ class DaySchedulerState:
 
 def initial_scheduler_state(day: dt.date) -> DaySchedulerState:
     return DaySchedulerState(day=day)
+
+
+# ---------------------------------------------------------------------------
+# SP-6 B1/AM-12/AM-14: the ONE alive-window predicate shared by A11 and A12.
+#
+# The node's REAL alive interval is [LAUNCH_UTC day N, STOP_PRIOR_UTC day
+# N+1) -- it wraps midnight. Expressed directly, a caller would need date
+# arithmetic to test it, and rev2 got exactly that arithmetic wrong (a
+# 16h55m double-blind). Expressing it instead as the COMPLEMENT of a
+# NON-wrapping exclusion needs no date arithmetic at all: any instant is
+# either inside the exclusion (not alive-expected) or outside it
+# (alive-expected), full stop -- including 02:00Z, which is outside the
+# exclusion and therefore alive-expected, unambiguously.
+#
+# AM-14 (coordinator, post round-3): the exclusion's END is
+# RELAUNCH_CUTOFF_UTC (17:00), not LAUNCH_UTC + a settle margin.
+# `_do_launch` retries a failed spawn on the MIN_RELAUNCH_GAP/
+# MAX_RELAUNCH_ATTEMPTS budget up to RELAUNCH_CUTOFF_UTC, so a
+# legitimately-absent node at ~16:57 (still inside that retry budget)
+# would draw a false CRITICAL under an earlier LAUNCH_UTC+5min boundary.
+# The residual between RELAUNCH_CUTOFF_UTC and the node actually being
+# ready is covered by the existing 17:05Z self-check, not by this
+# predicate. No time literal appears in the body -- only the two
+# schedule constants, so a future schedule change moves both A11 and A12
+# together automatically.
+# ---------------------------------------------------------------------------
+
+
+def node_expected_alive(now_utc: dt.datetime) -> bool:
+    """``True`` unless ``now_utc`` falls inside the non-wrapping exclusion
+    ``[STOP_PRIOR_UTC, RELAUNCH_CUTOFF_UTC)`` -- the one window in which
+    the node is legitimately not yet running (stopped for the day, or
+    still inside the launch/relaunch budget). Every other instant,
+    including 02:00Z, is alive-expected."""
+    t = now_utc.time()
+    return not (STOP_PRIOR_UTC <= t < RELAUNCH_CUTOFF_UTC)
+
+
+@dataclass(frozen=True, slots=True)
+class NodeLivenessState:
+    """A11's pure latch: how many CONSECUTIVE quiet-phase passes have
+    found the node absent, and whether a CRITICAL has already fired for
+    the current absence (so a standing absence alerts ONCE, not every
+    pass)."""
+
+    consecutive_absent: int = 0
+    alerted: bool = False
+
+
+def decide_node_liveness(
+    *,
+    now_utc: dt.datetime,
+    node_present: bool,
+    state: NodeLivenessState,
+    confirm_after: int = 2,
+) -> tuple[NodeLivenessState, bool]:
+    """Pure decision core for A11. No I/O, no clock, no logging -- matches
+    :func:`decide_stop_prior_action`'s contract exactly.
+
+    ``node_present`` is present ⇒ re-arm (``NodeLivenessState()``, never
+    alerts). Absent while :func:`node_expected_alive` is ``False`` (the
+    stop/relaunch-budget window) ⇒ also re-arms without alerting -- an
+    absence there is expected, not evidence of anything. Otherwise the
+    absence streak increments, and the second return value is ``True``
+    exactly once per standing absence: when ``consecutive_absent`` first
+    reaches ``confirm_after`` and no CRITICAL has fired for this absence
+    yet. No :class:`DaySchedulerState` coupling (B2) -- this state is
+    independent of the daily phase schedule entirely.
+    """
+    if node_present:
+        return NodeLivenessState(), False
+    if not node_expected_alive(now_utc):
+        return NodeLivenessState(), False
+    consecutive_absent = state.consecutive_absent + 1
+    should_alert = consecutive_absent == confirm_after and not state.alerted
+    new_state = NodeLivenessState(
+        consecutive_absent=consecutive_absent,
+        alerted=state.alerted or should_alert,
+    )
+    return new_state, should_alert
 
 
 def _for_day(state: DaySchedulerState, day: dt.date) -> DaySchedulerState:

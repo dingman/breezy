@@ -42,6 +42,7 @@ from typing import Final, TextIO
 
 from breezy.runtime.exec_state_db_path import ExecStateDbNotConfiguredError, resolve_store_path
 from breezy.runtime.health import AlertPayload, AlertSink, emit_alert, resolve_alert_sink
+from breezy.runtime.process_probe import find_pid_by_argv as _find_pid_by_argv
 from breezy.runtime.settings import CONTINUOUS_RUNG_HOLD_VAR
 from breezy.runtime.sqlite_store import SqliteStateStore
 from breezy.runtime.submit_intent import (
@@ -395,24 +396,12 @@ def continuous_rung_hold_env_active() -> bool:
 # ---------------------------------------------------------------------------
 
 
-def find_pid_by_argv(anchor_pattern: str) -> int | None:
-    """``pgrep -f <anchor_pattern>``, anchored (trailing ``$``) by the
-    caller. Returns the first matching PID, or ``None``."""
-    try:
-        result = subprocess.run(
-            ["pgrep", "-f", anchor_pattern],
-            capture_output=True,
-            text=True,
-            timeout=5,
-            check=False,
-        )
-    except (OSError, subprocess.TimeoutExpired):
-        return None
-    for line in result.stdout.splitlines():
-        line = line.strip()
-        if line.isdigit():
-            return int(line)
-    return None
+# SP-6 AM-11: `find_pid_by_argv` MOVED to `runtime/process_probe.py`
+# (which also gains the three-state `probe_pid_by_argv` B4 introduces),
+# re-imported and re-exported here so `default_ports` below, any SP-1
+# edit, and any external caller of `trade_supervisor.find_pid_by_argv`
+# are byte-for-byte unaffected by the move.
+find_pid_by_argv = _find_pid_by_argv
 
 
 def terminate(pid: int) -> None:
