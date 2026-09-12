@@ -25,6 +25,20 @@ _ON_CALENDAR_RE = re.compile(r"^OnCalendar=.*\s([\d,]+):(\d{2}):\d{2}\s+UTC\s*$"
 #: ingest timer).
 _PERIODIC_RE = re.compile(r"^OnCalendar=\*:0/\d+\s*$")
 
+#: SP-6 A12, reviewed exception to the sibling-Unit rule below (review item
+#: 6): the collision model this test enforces exists to stop two DAILY
+#: jobs from contending for a scarce resource at the SAME clock instant
+#: (spawning a subprocess, hitting the venue API, writing the same state
+#: store). `breezy-liveness-watchdog.timer` is a `Type=oneshot` read-only
+#: `/proc` probe that runs in well under a second, 288 times a day, and
+#: sends no signal and starts nothing -- it carries none of the
+#: resource-contention risk the model guards against, so it is exempted by
+#: NAME rather than by a blanket "any periodic timer is exempt" rule that
+#: would silently wave through a future, genuinely contentious one.
+_REVIEWED_STANDALONE_PERIODIC_TIMERS: frozenset[str] = frozenset(
+    {"breezy-liveness-watchdog.timer"}
+)
+
 _UNIT_RE = re.compile(r"^Unit=(.+)$")
 
 
@@ -57,6 +71,8 @@ def _is_periodic(timer_path: Path, all_timers: Sequence[Path]) -> bool:
     lines = timer_path.read_text().splitlines()
     if not any(_PERIODIC_RE.match(line.strip()) for line in lines):
         return False
+    if timer_path.name in _REVIEWED_STANDALONE_PERIODIC_TIMERS:
+        return True
     unit = _timer_unit(timer_path)
     if unit is None:
         return False
@@ -161,3 +177,13 @@ def test_1715_utc_is_owned_by_exactly_one_timer() -> None:
         if ("17", "15") in _clock_ticks(timer_path)
     ]
     assert owners == ["breezy-pm-crh-v2-tally.timer"]
+
+
+def test_the_liveness_watchdog_timer_is_a_reviewed_standalone_periodic_exemption() -> None:
+    """SP-6 A12: pins the NAMED exemption above -- a future standalone
+    periodic timer that is NOT this one must still fail the general
+    collision test's "no parseable OnCalendar=" assertion until it, too,
+    is explicitly reviewed."""
+    watchdog = _TIMERS_DIR / "breezy-liveness-watchdog.timer"
+    assert watchdog.name in _REVIEWED_STANDALONE_PERIODIC_TIMERS
+    assert _is_periodic(watchdog, _all_timer_files()) is True
