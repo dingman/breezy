@@ -389,11 +389,17 @@ class ContinuousRungHoldStrategy(Strategy):
                 net_position = startup_evidence_position_for(evidence, slug)
                 slug_ok = net_position is not None and net_position <= 0
             else:
+                # Option B (T3, N-T3): a LATER, independent read -- Nautilus's
+                # OWN reconciled portfolio -- must also agree the instrument
+                # is flat. Not a second source (same venue endpoint, R9): an
+                # AND on the arming side that can only ever refuse an arm the
+                # evidence read alone would have granted, never grant one it
+                # alone would have refused (AC-11).
                 slug_ok = startup_evidence_confirms_absent_flat(
                     evidence, slug,
                     now_ns=now_ns,
                     max_age_ns=_STARTUP_EVIDENCE_MAX_AGE_NS,
-                )
+                ) and self.portfolio.net_position(InstrumentId.from_str(iid)) <= 0
             if not slug_ok:
                 self.log.error(
                     f"continuous_rung_hold: venue position for {iid} is a "
@@ -801,11 +807,13 @@ class ContinuousRungHoldStrategy(Strategy):
         if startup_evidence_lists_slug(evidence, slug):
             net_position = startup_evidence_position_for(evidence, slug)
             return net_position is not None and net_position <= 0
+        # Option B (HB7-3): same later, independent Nautilus cross-check as
+        # site 1 -- an AND on the arming side only (AC-11/AC-12).
         return startup_evidence_confirms_absent_flat(
             evidence, slug,
             now_ns=self.clock.timestamp_ns(),
             max_age_ns=_STARTUP_EVIDENCE_MAX_AGE_NS,
-        )
+        ) and self.portfolio.net_position(InstrumentId.from_str(instrument_id)) <= 0
 
     def on_order_denied(self, event: OrderDenied) -> None:
         """SAFETY C1 (plan rev 6.1): clear IN_FLIGHT for a WAIT-class deny.

@@ -17,7 +17,7 @@ from pathlib import Path
 import pytest
 from nautilus_trader.core.uuid import UUID4
 from nautilus_trader.model.currencies import USD
-from nautilus_trader.model.enums import LiquiditySide, OrderSide
+from nautilus_trader.model.enums import LiquiditySide, OmsType, OrderSide
 from nautilus_trader.model.events import OrderFilled
 from nautilus_trader.model.identifiers import (
     AccountId,
@@ -31,6 +31,7 @@ from nautilus_trader.model.identifiers import (
 )
 from nautilus_trader.model.instruments import BinaryOption
 from nautilus_trader.model.objects import Money, Price, Quantity
+from nautilus_trader.model.position import Position
 
 from breezy.adapters.polymarket_us.exec.client import (
     FILL_INDEX_KEY_PREFIX,
@@ -611,6 +612,29 @@ def test_rearm_denied_when_a_lagging_ts_event_would_have_extended_the_ceiling(
     assert permitted is False
 
 
+def test_rearm_denied_when_the_reconciled_portfolio_is_long(
+    store_path: Path, interior_instrument: BinaryOption,
+) -> None:
+    """Option B (HB7-3): the same Nautilus cross-check as the never-arm
+    walk (T3), applied to the re-arm gate."""
+    evidence = {**_PERMISSIVE_EVIDENCE, "positions": [], "ts_ns": WINDOW_OPEN_NS}
+    strategy = _register_and_start(
+        store_path=store_path,
+        instruments=(interior_instrument,),
+        position_evidence_reader=lambda: evidence,
+    )
+    fill = _fill(strategy, instrument_id=INTERIOR_ID, venue_order_id="ord-reconciled-long-2")
+    position = Position(interior_instrument, fill)
+    strategy.cache.add_position(position, OmsType.NETTING)
+    strategy.portfolio.initialize_positions()
+
+    permitted = strategy._rearm_permitted(
+        STATION, CLIMATE_DAY.isoformat(), str(INTERIOR_ID),
+        attempts=1, last_attempt_ns=0, now_ns=10 * 365 * 24 * 3600 * 1_000_000_000,
+    )
+    assert permitted is False
+
+
 def test_on_start_with_a_permit_arms_and_subscribes_when_the_page_omits_the_slug(
     store_path: Path, interior_instrument: BinaryOption,
 ) -> None:
@@ -656,6 +680,58 @@ def test_never_arm_walk_halts_when_an_omitting_page_is_stale(
     )
     assert strategy._run_never_arm_walk() is False
     assert strategy.position_events.count("unreconciled_long_no_fill") == 1
+
+
+def test_never_arm_walk_halts_when_the_reconciled_portfolio_is_long(
+    store_path: Path, interior_instrument: BinaryOption,
+) -> None:
+    """Option B (T3, N-T3): a candidate slug ABSENT from a fresh, complete
+    page must still halt if Nautilus's OWN reconciled portfolio shows a
+    LONG on the instrument -- B is an AND on the arming side (AC-7/AC-11),
+    never a substitute for the absence-confirms-flat read. Seeds a REAL
+    reconciled position the same way sibling weather tests do:
+    `Position(instrument, fill)` -> `cache.add_position(..., NETTING)` ->
+    `portfolio.initialize_positions()` (reads `cache.positions_open()`)."""
+    evidence = {**_PERMISSIVE_EVIDENCE, "positions": [], "ts_ns": WINDOW_OPEN_NS}
+    strategy = _register_and_start(
+        store_path=store_path,
+        instruments=(interior_instrument,),
+        position_evidence_reader=lambda: evidence,
+    )
+    fill = _fill(strategy, instrument_id=INTERIOR_ID, venue_order_id="ord-reconciled-long")
+    position = Position(interior_instrument, fill)
+    strategy.cache.add_position(position, OmsType.NETTING)
+    strategy.portfolio.initialize_positions()
+
+    assert strategy._run_never_arm_walk() is False
+    assert strategy.position_events.count("unreconciled_long_no_fill") == 1
+
+
+def test_a_present_zero_row_arms_even_when_the_reconciled_portfolio_is_long(
+    store_path: Path, interior_instrument: BinaryOption,
+) -> None:
+    """CHARACTERISATION (P1c, HB1 pin, L-33): Option B is scoped to the
+    ABSENCE branch only -- a PRESENT row at "0" arms exactly as it does
+    today (byte-equivalent to `net is not None and net <= 0`), even when
+    Nautilus's reconciled portfolio disagrees. No input that arms today
+    newly halts (AC-9(i)). No RED at any named git state; see the HF-1
+    return's MUTATION_RED_EVIDENCE (HB1's own mistake -- applying B to the
+    present branch too -- makes this pin fail, then is reverted)."""
+    evidence = {
+        **_PERMISSIVE_EVIDENCE,
+        "positions": [{"slug": str(INTERIOR_ID.symbol.value), "net_position": "0"}],
+    }
+    strategy = _register_and_start(
+        store_path=store_path,
+        instruments=(interior_instrument,),
+        position_evidence_reader=lambda: evidence,
+    )
+    fill = _fill(strategy, instrument_id=INTERIOR_ID, venue_order_id="ord-present-zero-anomaly")
+    position = Position(interior_instrument, fill)
+    strategy.cache.add_position(position, OmsType.NETTING)
+    strategy.portfolio.initialize_positions()
+
+    assert strategy._run_never_arm_walk() is True
 
 
 def test_never_arm_walk_unreadable_fill_index_halts(
