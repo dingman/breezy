@@ -626,17 +626,16 @@ def test_refuse_producer_count_stays_pinned_at_twenty_seven() -> None:
     (LIVE_FILL_SCORING_CHAIN_2026-09-05). Widened AGAIN old(29) -> new(30) by
     slice 3 (plan rev 6.1): `_resolve_accept_fill`'s own
     `self._refuse(_FILL_WRITE_FAILED)`, mirroring `_submit_order`'s identical
-    fail-closed guard around its own `record_fill` call. Never relaxed, only
-    widened (L-12).
+    fail-closed guard around its own `record_fill` call. Widened AGAIN
+    old(30) -> new(33) by A1 (SP-3): three new fail-closed venue-id
+    map-write refusals (`_submit_order`'s new site plus one each in
+    `_resolve_accept_fill` and `_resolve_terminal_zero`). Never relaxed,
+    only widened (L-12).
 
     The authoritative, triaged inventory is
-    `tests/unit/test_exec_refusal_health_surface.py::REFUSAL_PRODUCERS`; this
-    is the cheap local pin that catches a moved count without importing that
-    module's internals. **That module is outside this increment's edit
-    surface and now needs its own triage update** (its exact-set pin and
-    `test_planting_a_twenty_sixth_refusal_breaks_the_pin`'s magic numbers)
-    to add `_submit_order#3`/`_submit_order#4` -- reported, not silently
-    left red.
+    `tests/unit/test_exec_refusal_health_surface.py::REFUSAL_PRODUCERS`,
+    updated in the SAME commit as this pin; this is the cheap local pin
+    that catches a moved count without importing that module's internals.
     """
     source = Path(client_module.__file__).read_text(encoding="utf-8")
     tree = ast.parse(source)
@@ -649,7 +648,7 @@ def test_refuse_producer_count_stays_pinned_at_twenty_seven() -> None:
         and isinstance(node.func.value, ast.Name)
         and node.func.value.id == "self"
     )
-    assert count == 30
+    assert count == 33
 
 
 @pytest.mark.asyncio
@@ -2421,6 +2420,151 @@ async def test_a_reject_writes_no_durable_record(
         await rig.client._submit_order(rig.limit_buy())
         assert rig.client.fill_records_for(rig.instrument.id) == ()
         await rig.client._disconnect()
+
+
+# ---------------------------------------------------------------------------
+# A1: the venue order id -> client order id map, written at the one point
+# ALL FOUR create-order outcome kinds pass through.
+# ---------------------------------------------------------------------------
+
+
+def _ambiguous_with_id_body(order_id: str) -> bytes:
+    """L-36: 200 + id + `executions == []` with no terminal state/cumQuantity
+    -- falls through to `KIND_AMBIGUOUS` with `venue_order_id=order_id`."""
+    return json.dumps({"id": order_id, "executions": []}).encode("utf-8")
+
+
+@pytest.mark.asyncio
+async def test_an_accept_fill_records_the_venue_id_map(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    write_canonical_verified: None,  # noqa: F811
+) -> None:
+    sender = _FakeOrderSender()
+    rig = _build_accept_fill_rig(tmp_path, monkeypatch=monkeypatch, sender=sender)
+    slug = _slug(rig.instrument)
+    sender.response = VenueResponse(
+        status=200, headers={}, body=_accept_fill_body(slug, order_id="ord-a1-accept"),
+    )
+    order = rig.limit_buy()
+
+    with _accept_fill_caps():
+        await rig.client._connect()
+        await rig.client._submit_order(order)
+        assert (
+            rig.client.client_order_id_for(VenueOrderId("ord-a1-accept"))
+            == order.order.client_order_id
+        )
+        await rig.client._disconnect()
+
+
+@pytest.mark.asyncio
+async def test_a_zero_fill_records_the_venue_id_map(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    write_canonical_verified: None,  # noqa: F811
+) -> None:
+    """Rev 2 acceptance #1, load-bearing: `KIND_ZERO_FILL` `return`s BEFORE
+    the old AMBIGUOUS-fallthrough anchor, so a written row here proves the
+    call site is genuinely pre-dispatch, not a re-citation of a line number."""
+    sender = _FakeOrderSender()
+    rig = _build_accept_fill_rig(tmp_path, monkeypatch=monkeypatch, sender=sender)
+    sender.response = VenueResponse(
+        status=200, headers={}, body=_zero_fill_body(order_id="ord-a1-zero"),
+    )
+    order = rig.limit_buy()
+
+    with _accept_fill_caps():
+        await rig.client._connect()
+        await rig.client._submit_order(order)
+        assert (
+            rig.client.client_order_id_for(VenueOrderId("ord-a1-zero"))
+            == order.order.client_order_id
+        )
+        await rig.client._disconnect()
+
+
+@pytest.mark.asyncio
+async def test_an_ambiguous_with_id_records_the_venue_id_map(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    write_canonical_verified: None,  # noqa: F811
+) -> None:
+    sender = _FakeOrderSender()
+    rig = _build_accept_fill_rig(tmp_path, monkeypatch=monkeypatch, sender=sender)
+    sender.response = VenueResponse(
+        status=200, headers={}, body=_ambiguous_with_id_body("ord-a1-ambiguous"),
+    )
+    order = rig.limit_buy()
+
+    with _accept_fill_caps():
+        await rig.client._connect()
+        await rig.client._submit_order(order)
+        assert (
+            rig.client.client_order_id_for(VenueOrderId("ord-a1-ambiguous"))
+            == order.order.client_order_id
+        )
+        await rig.client._disconnect()
+
+
+@pytest.mark.asyncio
+async def test_a_reject_records_no_venue_id_map_and_latches_no_refusal(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    write_canonical_verified: None,  # noqa: F811
+) -> None:
+    """(AM-4, CX-B1) CHARACTERISATION, not CHANGE: a REJECT carries
+    `venue_order_id=None` (`submit_chain.py:800-819`), so it writes no map
+    row and latches no refusal -- true at HEAD too, and this is the only
+    guard on that shape (Rev 2's inverse acceptance clause was an error).
+    MUTATION_RED_EVIDENCE (pair 2): removing the `if outcome.venue_order_id
+    is not None:` guard on the A1 block, taken AFTER A1 lands, makes the
+    refusal half of this assertion go RED -- see the commit body."""
+    sender = _FakeOrderSender()
+    rig = _build_accept_fill_rig(tmp_path, monkeypatch=monkeypatch, sender=sender)
+    sender.response = VenueResponse(status=400, headers={}, body=_reject_body())
+
+    with _accept_fill_caps():
+        await rig.client._connect()
+        await rig.client._submit_order(rig.limit_buy())
+        assert len(rig.client.trading_refusals) == 0
+        assert rig.client.is_degraded is False
+        await rig.client._disconnect()
+
+
+@pytest.mark.asyncio
+async def test_a_venue_id_map_write_failure_refuses_and_still_dispatches_the_outcome(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    write_canonical_verified: None,  # noqa: F811
+) -> None:
+    """A-B2: a map-write failure refuses and FALLS THROUGH -- never a
+    `return` -- so the ACCEPT_FILL dispatch (`record_fill`/retire/publish)
+    still runs to completion."""
+    sender = _FakeOrderSender()
+    rig = _build_accept_fill_rig(tmp_path, monkeypatch=monkeypatch, sender=sender)
+    slug = _slug(rig.instrument)
+    sender.response = VenueResponse(
+        status=200, headers={}, body=_accept_fill_body(slug, order_id="ord-a1-boom"),
+    )
+
+    def _boom(venue_order_id: VenueOrderId, client_order_id: ClientOrderId) -> None:
+        raise RuntimeError("simulated venue-id map write failure")
+
+    monkeypatch.setattr(rig.client, "record_venue_order_id", _boom)
+
+    with _accept_fill_caps():
+        rig.client.start()  # drive the native FSM to RUNNING, as `_refuse` requires
+        await rig.client._connect()
+        await rig.client._submit_order(rig.limit_buy())  # must not raise
+        assert rig.client.is_degraded is True
+        await rig.client._disconnect()
+
+    refusals = rig.client.trading_refusals
+    assert refusals.count(client_module._VENUE_ID_MAP_WRITE_FAILED) == 1, refusals
+    assert _reopened_fill_record(rig.store_path, "ord-a1-boom") is not None
+    filled = [e for e in rig.order_events if isinstance(e, OrderFilled)]
+    assert len(filled) == 1
 
 
 # (f) `to_bytes`/`from_bytes` round-trip with the new fields.

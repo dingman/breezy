@@ -17,7 +17,7 @@ layer that turns that transition into exactly one alert through the existing
 ``AlertSink`` seam.
 
 **DEGRADED is a health INDICATOR, not a kill switch, and R-6c does not wire
-it to process exit.** The triage table below is why: seven of the twenty-five
+it to process exit.** The triage table below is why: seven of the thirty-three
 refusal producers are ROUTINE -- they are true of a correctly-built Breezy
 running against a healthy venue on an account the operator has ALSO traded by
 hand. Stopping the process on any of them would turn an ordinary foreign
@@ -29,7 +29,7 @@ later increment wired DEGRADED to exit".
 
 THE TRIAGE (L-6), DERIVED FROM THE SCAN AND NOT INHERITED
 ----------------------------------------------------------
-Revision 0 of the plan hand-enumerated these producers and listed 21 of 25 --
+Revision 0 of the plan hand-enumerated these producers and listed 21 of 33 --
 the misses included the non-long-position refusal, arguably the most
 safety-relevant reason in the file. So the table below is keyed by the ids
 :data:`REFUSAL_PRODUCERS` pins, ``test_every_pinned_refusal_producer_is_
@@ -74,17 +74,26 @@ calculate_commission#1              ROUTINE       a MAKER fill; Breezy is taker-
 calculate_commission#2              EXCEPTIONAL   the fee schedule is UNKNOWN for this instrument
 calculate_commission#3              EXCEPTIONAL   a reconciliation fill could not be priced
 _submit_order#1                     EXCEPTIONAL   create-order POST raised; outcome is AMBIGUOUS
-_submit_order#2                     EXCEPTIONAL   create-order outcome is AMBIGUOUS after a response
+_submit_order#2                     EXCEPTIONAL   fail-closed: the venue-id -> client-order-id map
+                                                   write raised; a restart cannot attribute it
 _submit_order#3                     EXCEPTIONAL   fail-closed: the durable fill record could not be
                                                    built or written; evidence write is untrusted
 _submit_order#4                     EXCEPTIONAL   fail-closed attestation: the fill IS durable and
                                                    published, but its fee could not be reconciled
+_submit_order#5                     EXCEPTIONAL   create-order outcome is AMBIGUOUS after a response
 _resolve_accept_fill#1              EXCEPTIONAL   fail-closed: the resolver's own synthesized-fill
                                                    durable record could not be built or written
+_resolve_accept_fill#2              EXCEPTIONAL   fail-closed: the venue-id map write raised on a
+                                                   GET-confirmed fill; the fill itself is durable
+_resolve_terminal_zero#1            EXCEPTIONAL   fail-closed: the venue-id map write raised on a
+                                                   GET-confirmed terminal zero; the retire proceeds
 ==================================  ============  ================================================
 
-Seven ROUTINE, twenty-three EXCEPTIONAL (slice 3 added
-``_resolve_accept_fill#1``: old 29 -> new 30; I1b earlier added
+Seven ROUTINE, twenty-six EXCEPTIONAL (A1 added three fail-closed venue-id
+map-write refusals: old 30 -> new 33 -- ``_submit_order#2`` (NEW; the
+pre-existing rows shift: old ``#2``/``#3``/``#4`` -> new ``#3``/``#4``/``#5``),
+``_resolve_accept_fill#2`` and ``_resolve_terminal_zero#1``. slice 3 earlier
+added ``_resolve_accept_fill#1``: old 29 -> new 30; I1b earlier added
 ``_submit_order#3``/``#4``: old 27 -> new 29). Every one of the seven is
 reachable on an account in perfectly good order, which is the whole argument
 for INDICATOR over kill switch -- and one of them, ``_map_position#3``, is
@@ -171,7 +180,6 @@ REFUSAL_PRODUCERS: Final[frozenset[str]] = frozenset(
         "calculate_commission#2",
         "calculate_commission#3",
         "_submit_order#1",
-        "_submit_order#2",
         # I1b (record_fill first in the accept-fill branch): old 27 -> new 29;
         # both new producers are fail-closed evidence/attestation refusals that
         # still publish the fill (see the triage table above).
@@ -181,6 +189,20 @@ REFUSAL_PRODUCERS: Final[frozenset[str]] = frozenset(
         # branch mirrors `_submit_order#3`'s identical fail-closed guard
         # around its own `record_fill` call: old 29 -> new 30.
         "_resolve_accept_fill#1",
+        # A1 (SP-3): three new fail-closed venue-id map-write refusals; old
+        # 30 -> new 33. Ordinals are POSITIONAL (B-1/CX-N1): the new
+        # `_submit_order` site is semantically inserted right after `#1` and
+        # before the old `#2`, so every pre-existing `_submit_order` id at or
+        # after the insertion point shifts by one -- old `#2`/`#3`/`#4`
+        # become new `#3`/`#4`/`#5`. The id-set diff below therefore reports
+        # the TAIL id (`_submit_order#5`) as "added", not the semantically
+        # new one (`#2`) -- exactly the mechanism that produced the
+        # pre-existing HEAD triage-table rotation this commit also corrects
+        # (see the triage table above and its docstring note).
+        "_submit_order#2",
+        "_submit_order#5",
+        "_resolve_accept_fill#2",
+        "_resolve_terminal_zero#1",
     }
 )
 
@@ -258,7 +280,7 @@ def test_the_refusal_producer_set_is_exactly_pinned() -> None:
         "added": sorted(scanned - REFUSAL_PRODUCERS),
         "removed": sorted(REFUSAL_PRODUCERS - scanned),
     }
-    assert len(scanned) == 30  # slice 3: old 29 -> new 30 (I1b: old 27 -> new 29)
+    assert len(scanned) == 33  # A1: old 30 -> new 33 (slice 3: old 29 -> new 30)
 
 
 def test_planting_a_twenty_sixth_refusal_breaks_the_pin() -> None:
@@ -273,7 +295,7 @@ def test_planting_a_twenty_sixth_refusal_breaks_the_pin() -> None:
     assert planted != source, "the plant site moved; update this test's anchor"
     scanned = _refusal_producers(planted)
     assert scanned != set(REFUSAL_PRODUCERS)
-    assert len(scanned) == 31  # slice 3: old 30 -> new 31 (planting one more breaks the pin)
+    assert len(scanned) == 34  # A1: old 33 -> new 34 (planting one more breaks the pin)
 
 
 def test_removing_a_refusal_breaks_the_pin() -> None:
@@ -306,9 +328,10 @@ def test_every_pinned_refusal_producer_is_triaged_here() -> None:
         "stale_rows": sorted(set(triaged) - REFUSAL_PRODUCERS),
     }
     counts = Counter(triaged.values())
-    # slice 3: old {"EXCEPTIONAL": 22, "ROUTINE": 7} -> new {"EXCEPTIONAL": 23, "ROUTINE": 7}
-    # (I1b: old {"EXCEPTIONAL": 20, "ROUTINE": 7} -> new {"EXCEPTIONAL": 22, "ROUTINE": 7})
-    assert counts == {"EXCEPTIONAL": 23, "ROUTINE": 7}, counts
+    # A1 (AM-3): old {"EXCEPTIONAL": 23, "ROUTINE": 7} -> new {"EXCEPTIONAL": 26, "ROUTINE": 7}
+    # (slice 3: old {"EXCEPTIONAL": 22, "ROUTINE": 7} -> new {"EXCEPTIONAL": 23, "ROUTINE": 7};
+    # I1b: old {"EXCEPTIONAL": 20, "ROUTINE": 7} -> new {"EXCEPTIONAL": 22, "ROUTINE": 7})
+    assert counts == {"EXCEPTIONAL": 26, "ROUTINE": 7}, counts
 
 
 # ---------------------------------------------------------------------------

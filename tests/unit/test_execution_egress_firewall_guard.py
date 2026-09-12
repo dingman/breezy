@@ -1877,6 +1877,10 @@ EXEC_ORDER_COROUTINE_PERMITTED_CALLEES = frozenset(
         "PolymarketUSError",
         "record.to_bytes",
         "fill_record_bytes.decode",
+        # A1: writes one key (the venue id -> client order id map) to the
+        # already-open local store; no path, no payload, no socket; no
+        # `await`. Mirrors `self._note_ambiguous_open`'s exemption above.
+        "self.record_venue_order_id",
     }
 )
 
@@ -1984,6 +1988,10 @@ EXEC_RESOLVER_PERMITTED_CALLEES = frozenset(
         "self.record_fill",
         "record.to_bytes",
         "fill_record_bytes.decode",
+        # A1: same exemption as the order-coroutine allowlist above -- one
+        # key to the already-open local store, no path, no payload, no
+        # socket, no `await`. Used by both resolver terminals.
+        "self.record_venue_order_id",
         "self._refuse",
         "self.generate_order_filled",
         "_synthetic_get_fill_trade_id",
@@ -2848,6 +2856,9 @@ def test_the_order_coroutine_callee_allowlist_reaches_no_venue() -> None:
             "PolymarketUSError",
             "record.to_bytes",
             "fill_record_bytes.decode",
+            # A1: writes one key to the already-open local store; no path,
+            # no payload, no socket; no `await`.
+            "self.record_venue_order_id",
         }
     )
     for callee in EXEC_ORDER_COROUTINE_PERMITTED_CALLEES:

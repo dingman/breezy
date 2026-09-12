@@ -421,6 +421,17 @@ _FEE_UNRECONCILED: Final[str] = (
     "this client refuses further submits until an operator investigates"
 )
 
+#: A1 -- the venue order id -> client order id map write raised. ONE fixed
+#: reason so `_refuse` dedupes on it (`_refuse` keys on the reason string,
+#: not a per-exception message); the exception detail goes in the ERROR log
+#: line instead, never here -- and that log line is emitted by the A1 block
+#: itself, before `_refuse`, so it is never deduped even when the reason
+#: repeats (Trade-off 3/13).
+_VENUE_ID_MAP_WRITE_FAILED: Final[str] = (
+    "the venue order id -> client order id map write raised; this client "
+    "refuses further submits until an operator investigates"
+)
+
 
 class PrivateRead(Protocol):
     """The injected authenticated read: one GET-shaped call, and nothing else.
@@ -1586,6 +1597,23 @@ class PolymarketUSExecutionClient(LiveExecutionClient):
         if current is None or current.intent_id != context.intent_id:
             self._ambiguous_bookings.pop(context.intent_id, None)
             return
+        # A1-c: backfill for a context written before this change, which
+        # only the resolver will ever see again -- idempotent (same key,
+        # same bytes). OUTSIDE the guard above: `context.venue_order_id`
+        # is a plain str here, always present. No `return` (A-B2): the
+        # retire, true-up and native cancel below must still run.
+        try:
+            self.record_venue_order_id(
+                submit_chain.venue_order_id(context.venue_order_id),
+                ClientOrderId(context.client_order_id),
+            )
+        except Exception as exc:  # noqa: BLE001
+            self._log.error(
+                f"{_VENUE_ID_MAP_WRITE_FAILED}: {exc.__class__.__name__}: {exc}; "
+                f"venue_order_id={context.venue_order_id} "
+                f"client_order_id={context.client_order_id}"
+            )
+            self._refuse(_VENUE_ID_MAP_WRITE_FAILED)
         self._retire(context.intent_id, "STATUS_REPORT_ZERO_FILL_TERMINAL", now_ns)
         booking = self._ambiguous_bookings.pop(context.intent_id, None)
         if booking is not None:
@@ -1698,6 +1726,26 @@ class PolymarketUSExecutionClient(LiveExecutionClient):
         booking = self._ambiguous_bookings.pop(context.intent_id, None)
         if booking is not None:
             self._ledger.true_up_booking(booking, filled_cost_usd=cumulative_cost, now_ns=now_ns)
+        # A1-b (B-2): anchored to the indentation of the statement this
+        # block PRECEDES (`_retire`, 8-space function-body indent), NOT the
+        # `true_up_booking` line above -- `_ambiguous_bookings` is
+        # same-process only and EMPTY after a restart, so a block inside
+        # `if booking is not None:` would silently skip the write on
+        # exactly the post-restart reconciliation path this exists to
+        # serve. No `return` (A-B2): `_retire` and `generate_order_filled`
+        # below must still run.
+        try:
+            self.record_venue_order_id(
+                submit_chain.venue_order_id(context.venue_order_id),
+                ClientOrderId(context.client_order_id),
+            )
+        except Exception as exc:  # noqa: BLE001
+            self._log.error(
+                f"{_VENUE_ID_MAP_WRITE_FAILED}: {exc.__class__.__name__}: {exc}; "
+                f"venue_order_id={context.venue_order_id} "
+                f"client_order_id={context.client_order_id}"
+            )
+            self._refuse(_VENUE_ID_MAP_WRITE_FAILED)
         self._retire(context.intent_id, "STATUS_REPORT_ACCEPT_FILL_TERMINAL", now_ns)
         # D2 (plan rev 6.1): a genuine fill surfacing for a venue order this
         # resolver already restored a permit slot for (a superseded
@@ -2840,6 +2888,25 @@ class PolymarketUSExecutionClient(LiveExecutionClient):
             # coroutine, not `_log.info`. WARNING is the closest permitted
             # level for a non-AMBIGUOUS classified line.
             self._log.warning(classified_line)
+        if outcome.venue_order_id is not None:
+            # A1: the ONE point all four outcome kinds pass through --
+            # ACCEPT_FILL, ZERO_FILL and a with-id AMBIGUOUS all carry a
+            # venue id here; a REJECT and a no-id AMBIGUOUS do not (AC-2).
+            # Corroborating evidence written AFTER the venue was POSTed:
+            # must refuse and FALL THROUGH on failure, never crash or
+            # short-circuit the dispatch below (A-B2 -- no `return`).
+            try:
+                self.record_venue_order_id(
+                    submit_chain.venue_order_id(outcome.venue_order_id),
+                    order.client_order_id,
+                )
+            except Exception as exc:  # noqa: BLE001
+                self._log.error(
+                    f"{_VENUE_ID_MAP_WRITE_FAILED}: {exc.__class__.__name__}: {exc}; "
+                    f"venue_order_id={outcome.venue_order_id} "
+                    f"client_order_id={order.client_order_id.value}"
+                )
+                self._refuse(_VENUE_ID_MAP_WRITE_FAILED)
         retire_name = outcome.retirement_name
         if (
             outcome.kind == submit_chain.KIND_ACCEPT_FILL
