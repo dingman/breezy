@@ -496,20 +496,23 @@ def test_never_arm_walk_halts_on_a_venue_long_with_no_durable_fill(
     assert strategy.position_events.count("unreconciled_long_no_fill") == 1
 
 
-def test_never_arm_walk_halts_when_the_slug_is_absent_from_positions(
+def test_never_arm_walk_arms_when_an_eof_complete_page_omits_the_slug(
     store_path: Path, interior_instrument: BinaryOption,
 ) -> None:
-    """Three-seam Slice 4 review item 5 [CRITICAL]: the client now emits
-    every slug from the page, so an ABSENT slug is a read gap (UNKNOWN),
-    never flat -- the never-arm walk must fail closed, not pass through."""
+    """R-8 (2026-09-12): SUPERSEDES three-seam Slice 4 review item 5. The
+    producer (`PolymarketUSExecutionClient._write_startup_position_evidence`)
+    emits only slugs the venue's `eof: true` page names, so a never-traded
+    market is ABSENT by construction -- item 5's PASS state was unreachable
+    for any first trade. An absent slug on a fresh, eof-complete,
+    non-refused, fill-walk-complete page is confirmed FLAT, not UNKNOWN."""
     evidence = {**_PERMISSIVE_EVIDENCE, "positions": []}
     strategy = _register_and_start(
         store_path=store_path,
         instruments=(interior_instrument,),
         position_evidence_reader=lambda: evidence,
     )
-    assert strategy._run_never_arm_walk() is False
-    assert strategy.position_events.count("unreconciled_long_no_fill") == 1
+    assert strategy._run_never_arm_walk() is True
+    assert strategy.position_events.count("unreconciled_long_no_fill") == 0
 
 
 def test_never_arm_walk_halts_when_net_position_is_null(
@@ -530,11 +533,14 @@ def test_never_arm_walk_halts_when_net_position_is_null(
     assert strategy.position_events.count("unreconciled_long_no_fill") == 1
 
 
-def test_rearm_denied_when_the_slug_is_absent_from_positions(
+def test_rearm_permitted_when_an_eof_complete_page_omits_the_slug(
     store_path: Path, interior_instrument: BinaryOption,
 ) -> None:
-    """Three-seam Slice 4 review item 5: the re-arm gate fails closed the
-    same way the never-arm walk does -- absent slug -> no re-arm."""
+    """R-8 (2026-09-12): the re-arm gate applies the SAME rule as the
+    never-arm walk (site 1), through the same helper and the same
+    freshness ceiling -- an absent slug on a fresh eof-complete page is
+    confirmed FLAT, not UNKNOWN. Supersedes three-seam Slice 4 review
+    item 5 for the re-arm gate (HB7)."""
     evidence = {**_PERMISSIVE_EVIDENCE, "positions": []}
     strategy = _register_and_start(
         store_path=store_path,
@@ -545,7 +551,34 @@ def test_rearm_denied_when_the_slug_is_absent_from_positions(
         STATION, CLIMATE_DAY.isoformat(), str(INTERIOR_ID),
         attempts=1, last_attempt_ns=0, now_ns=10 * 365 * 24 * 3600 * 1_000_000_000,
     )
-    assert permitted is False
+    assert permitted is True
+
+
+def test_on_start_with_a_permit_arms_and_subscribes_when_the_page_omits_the_slug(
+    store_path: Path, interior_instrument: BinaryOption,
+) -> None:
+    """N5: drives the incident's actual entry path end to end -- `on_start`
+    with a real (non-None) `order_submission_permit`, `phase0_permit_guard=
+    False` (existing idiom, `test_phase0_permit_guard_false_...` below), and
+    an eof-complete page that omits every candidate slug. Before R-8 this
+    halted every family on its first live boot (2026-09-12 16:50:33Z, all
+    four families, 294 microseconds after subscribing); after R-8 the walk
+    arms and `on_start` reaches `subscribe_data` without stopping."""
+    from breezy.strategy.current_rung_hold.config import CurrentRungHoldConfig
+
+    evidence = {**_PERMISSIVE_EVIDENCE, "positions": []}
+    cfg = CurrentRungHoldConfig(instrument_ids=(interior_instrument.id,))
+    strategy = ContinuousRungHoldStrategy(
+        cfg,
+        trial_day_latch_factory=lambda: _cont_latch_context_for(store_path),
+        order_submission_permit=object(),  # type: ignore[arg-type]
+        phase0_permit_guard=False,
+        position_evidence_reader=lambda: evidence,
+    )
+    _register_bare(strategy, instruments=(interior_instrument,))
+    strategy.start()
+    assert strategy.is_running
+    assert strategy.position_events.total() == 0
 
 
 def test_never_arm_walk_unreadable_fill_index_halts(

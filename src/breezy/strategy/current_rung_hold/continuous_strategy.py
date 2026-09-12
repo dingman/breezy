@@ -71,6 +71,8 @@ from breezy.strategy.current_rung_hold.trial_day_latch import (
     TrialDayLatch,
     TrialDayRecord,
     TrialDayRecordCorrupt,
+    startup_evidence_confirms_absent_flat,
+    startup_evidence_lists_slug,
     startup_evidence_permits_arm,
     startup_evidence_position_for,
 )
@@ -362,11 +364,21 @@ class ContinuousRungHoldStrategy(Strategy):
             if self._latch.is_consumed(station, climate_day_key):
                 continue
             slug = InstrumentId.from_str(iid).symbol.value
-            net_position = startup_evidence_position_for(evidence, slug)
-            # Review item 5 (three-seam Slice 4 review): an ABSENT slug or a
-            # null `net_position` is UNKNOWN, never flat -- fail closed the
-            # same as a genuine LONG, not the inverse.
-            if net_position is None or net_position > 0:
+            # R-8 (2026-09-12, docs/core/PROGRESS.md): a slug LISTED on the
+            # page is decided exactly as before (present branch, byte-
+            # equivalent). A slug ABSENT from an eof-complete, fresh page
+            # is confirmed FLAT, not UNKNOWN -- the producer emits only
+            # slugs the venue's page names, so a never-traded candidate
+            # market is absent by construction (supersedes three-seam
+            # Slice 4 review item 5, whose PASS state was unreachable for
+            # any first trade). Applies at BOTH `_run_never_arm_walk`
+            # (here) and `_rearm_permitted`.
+            if startup_evidence_lists_slug(evidence, slug):
+                net_position = startup_evidence_position_for(evidence, slug)
+                slug_ok = net_position is not None and net_position <= 0
+            else:
+                slug_ok = startup_evidence_confirms_absent_flat(evidence, slug)
+            if not slug_ok:
                 self.log.error(
                     f"continuous_rung_hold: venue position for {iid} is a "
                     "LONG or UNKNOWN (no durable fill on record); halting",
@@ -762,8 +774,12 @@ class ContinuousRungHoldStrategy(Strategy):
         if not startup_evidence_permits_arm(evidence):
             return False
         slug = InstrumentId.from_str(instrument_id).symbol.value
-        net_position = startup_evidence_position_for(evidence, slug)
-        return net_position is not None and net_position <= 0
+        # R-8 (2026-09-12): the same rule as `_run_never_arm_walk` (site 1),
+        # through the same helpers and the same freshness ceiling.
+        if startup_evidence_lists_slug(evidence, slug):
+            net_position = startup_evidence_position_for(evidence, slug)
+            return net_position is not None and net_position <= 0
+        return startup_evidence_confirms_absent_flat(evidence, slug)
 
     def on_order_denied(self, event: OrderDenied) -> None:
         """SAFETY C1 (plan rev 6.1): clear IN_FLIGHT for a WAIT-class deny.
