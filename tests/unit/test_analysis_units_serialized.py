@@ -878,20 +878,30 @@ def test_no_study_wrapper_enables_posix_mode(wrapper_filename: str) -> None:
     `unset POSIXLY_CORRECT` is present exactly once."""
     lines = (_DEPLOY_DIR / wrapper_filename).read_text().splitlines()
     for line in lines:
-        stripped = line.strip()
-        if stripped.startswith("#"):
-            continue
-        assert "set -o posix" not in stripped, (
-            f"{wrapper_filename} enables POSIX mode: {line!r}"
-        )
+        code_part = line.strip().split("#", 1)[0]  # P1-c: strip inline comments too
+        assert "set -o posix" not in code_part, f"{wrapper_filename} enables POSIX mode: {line!r}"
     assert lines.count(_PREAMBLE_MARKER) == 1
 
 
 ##############################################################################
-# AM-22 -- every subprocess.* call in THIS module takes env= from the fixture
+# AM-22 -- every subprocess call in THIS module takes env= from the fixture,
+# hardened by SP-1 P1 (round-2 python-reviewer items 3-4) against:
+#   (i)  an import-binding bypass -- `import subprocess as sp; sp.run(...)`
+#        or `from subprocess import run as _run; _run(...)` -- the original
+#        check keyed on the LITERAL name "subprocess" and only recognised
+#        `run`/`Popen`/`check_call`/`call`, missing `check_output` too;
+#   (ii) post-construction mutation blindness -- `env = build_wrapper_env(
+#        ...); env["X"] = "y"; subprocess.run(..., env=env)` passed the old
+#        check because it only inspected the LAST `Assign` to a bare `Name`,
+#        never a `Subscript` target, an `AugAssign`, or an
+#        `.update(`/`.setdefault(`/`.pop(` call in between.
 ##############################################################################
 
 _ALLOWED_ENV_BUILDERS: Final[frozenset[str]] = frozenset({"build_wrapper_env"})
+_RECOGNIZED_SUBPROCESS_FUNCS: Final[frozenset[str]] = frozenset(
+    {"run", "Popen", "call", "check_call", "check_output"}
+)
+_ENV_MUTATING_METHODS: Final[frozenset[str]] = frozenset({"update", "setdefault", "pop"})
 
 
 def _env_keyword_source(call: ast.Call) -> ast.expr | None:
@@ -901,14 +911,46 @@ def _env_keyword_source(call: ast.Call) -> ast.expr | None:
     return None
 
 
-def _is_subprocess_call(call: ast.Call) -> bool:
+@dataclass(frozen=True)
+class _SubprocessBindings:
+    """The local names THIS module's own import statements actually bind to
+    the `subprocess` module, and to specific `subprocess` functions imported
+    by name -- resolved from `Import`/`ImportFrom` nodes (incl. `asname`),
+    never from the literal string `"subprocess"`."""
+
+    module_names: frozenset[str]
+    function_names: dict[str, str]  # local name -> real subprocess function name
+
+
+def _resolve_subprocess_bindings(module: ast.Module) -> _SubprocessBindings:
+    module_names: set[str] = set()
+    function_names: dict[str, str] = {}
+    for node in ast.walk(module):
+        if isinstance(node, ast.Import):
+            for alias in node.names:
+                if alias.name == "subprocess":
+                    module_names.add(alias.asname or alias.name)
+        elif isinstance(node, ast.ImportFrom) and node.module == "subprocess":
+            for alias in node.names:
+                if alias.name in _RECOGNIZED_SUBPROCESS_FUNCS:
+                    function_names[alias.asname or alias.name] = alias.name
+    return _SubprocessBindings(module_names=frozenset(module_names), function_names=function_names)
+
+
+def _subprocess_call_or_none(call: ast.Call, bindings: _SubprocessBindings) -> str | None:
+    """The REAL subprocess function name `call` invokes, resolved through
+    `bindings` -- e.g. `sp.run(...)` -> `"run"` when `sp` is bound by
+    `import subprocess as sp`; `_run(...)` -> `"run"` when `_run` is bound
+    by `from subprocess import run as _run`. `None` if `call` is not a
+    recognised subprocess spawn at all."""
     func = call.func
-    return (
-        isinstance(func, ast.Attribute)
-        and func.attr in ("run", "Popen", "check_call", "call")
-        and isinstance(func.value, ast.Name)
-        and func.value.id == "subprocess"
-    )
+    if isinstance(func, ast.Attribute) and isinstance(func.value, ast.Name):
+        if func.value.id in bindings.module_names and func.attr in _RECOGNIZED_SUBPROCESS_FUNCS:
+            return func.attr
+        return None
+    if isinstance(func, ast.Name):
+        return bindings.function_names.get(func.id)
+    return None
 
 
 def _enclosing_function(module: ast.Module, target: ast.AST) -> ast.FunctionDef | None:
@@ -931,6 +973,38 @@ def _is_call_to_allowed_builder(value: ast.expr) -> bool:
     )
 
 
+def _is_name(node: ast.expr, name: str) -> bool:
+    return isinstance(node, ast.Name) and node.id == name
+
+
+def _last_qualifying_assignment(
+    module: ast.Module, call: ast.Call, env_source: ast.expr
+) -> ast.Assign | None:
+    """The LAST `Assign` in `call`'s enclosing function, at or before
+    `call`'s own line, whose target is the bare `Name` `env_source` and
+    whose value is a call to an allowed builder -- e.g. `env =
+    build_wrapper_env(...)`. `None` if `env_source` is not a bare `Name`,
+    the enclosing function cannot be found, or no such assignment exists."""
+    if not isinstance(env_source, ast.Name):
+        return None
+    enclosing = _enclosing_function(module, call)
+    if enclosing is None:
+        return None
+    best: ast.Assign | None = None
+    for node in ast.walk(enclosing):
+        if not (isinstance(node, ast.Assign) and node.lineno <= call.lineno):
+            continue
+        for target in node.targets:
+            if (
+                isinstance(target, ast.Name)
+                and target.id == env_source.id
+                and _is_call_to_allowed_builder(node.value)
+                and (best is None or node.lineno > best.lineno)
+            ):
+                best = node
+    return best
+
+
 def _env_arg_traces_to_allowed_builder(
     module: ast.Module, call: ast.Call, env_source: ast.expr
 ) -> bool:
@@ -941,37 +1015,76 @@ def _env_arg_traces_to_allowed_builder(
     literal (AM-22)."""
     if _is_call_to_allowed_builder(env_source):
         return True
-    if not isinstance(env_source, ast.Name):
+    return _last_qualifying_assignment(module, call, env_source) is not None
+
+
+def _env_mutated_between_construction_and_call(
+    module: ast.Module, call: ast.Call, env_source: ast.expr
+) -> bool:
+    """True if anything touches the `env_source` NAME between its qualifying
+    `build_wrapper_env` assignment and this `call` -- a `Subscript` assign
+    (`env["X"] = ...`), a second `Assign`/`AugAssign` to the same name, or
+    an `.update(`/`.setdefault(`/`.pop(` call -- so a compliant
+    CONSTRUCTION cannot be laundered by a post-construction edit (P1-a).
+    `env=build_wrapper_env(...)` inline has nothing to mutate between."""
+    if _is_call_to_allowed_builder(env_source):
         return False
+    qualifying = _last_qualifying_assignment(module, call, env_source)
+    if qualifying is None or not isinstance(env_source, ast.Name):
+        return False  # already flagged as non-compliant by the trace check
     enclosing = _enclosing_function(module, call)
-    if enclosing is None:
-        return False
-    last_assignment: ast.expr | None = None
+    assert enclosing is not None
+    name = env_source.id
     for node in ast.walk(enclosing):
+        lineno = getattr(node, "lineno", None)
+        if lineno is None or not (qualifying.lineno < lineno <= call.lineno):
+            continue
         if isinstance(node, ast.Assign):
             for target in node.targets:
-                if isinstance(target, ast.Name) and target.id == env_source.id:
-                    last_assignment = node.value
-    return last_assignment is not None and _is_call_to_allowed_builder(last_assignment)
+                if isinstance(target, ast.Subscript) and _is_name(target.value, name):
+                    return True
+                if isinstance(target, ast.Name) and target.id == name:
+                    return True
+            continue
+        is_augassign_mutation = isinstance(node, ast.AugAssign) and _is_name(node.target, name)
+        is_mutating_method_call = (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and _is_name(node.func.value, name)
+            and node.func.attr in _ENV_MUTATING_METHODS
+        )
+        if is_augassign_mutation or is_mutating_method_call:
+            return True
+    return False
 
 
 def test_every_subprocess_call_takes_env_from_the_wrapper_env_fixture() -> None:
-    """AM-22: never `os.environ`, `os.environ.copy()`, or a dict literal --
-    so the fail-closed fixture check cannot be bypassed by a hand-rolled
-    spawn."""
+    """AM-22 (hardened, P1-a): every subprocess spawn -- resolved through
+    this module's ACTUAL import bindings, never the literal string
+    "subprocess", and covering `run`/`Popen`/`call`/`check_call`/
+    `check_output` -- takes its `env=` from an UNMUTATED
+    `build_wrapper_env(...)` result. Never `os.environ`, `os.environ.copy()`,
+    a dict literal, nor a `build_wrapper_env(...)` result edited afterward."""
     module = _ast_module(Path(__file__))
+    bindings = _resolve_subprocess_bindings(module)
     subprocess_calls = [
-        node for node in ast.walk(module)
-        if isinstance(node, ast.Call) and _is_subprocess_call(node)
+        node
+        for node in ast.walk(module)
+        if isinstance(node, ast.Call) and _subprocess_call_or_none(node, bindings) is not None
     ]
-    assert subprocess_calls, "expected at least one subprocess.* call in this module"
+    assert subprocess_calls, "expected at least one subprocess call in this module"
     for call in subprocess_calls:
         env_source = _env_keyword_source(call)
-        assert env_source is not None, "a subprocess.* call is missing env="
+        assert env_source is not None, "a subprocess call is missing env="
         assert _env_arg_traces_to_allowed_builder(module, call, env_source), (
             f"env= ({ast.dump(env_source)}) does not trace back to a call to "
             f"one of {sorted(_ALLOWED_ENV_BUILDERS)} -- never os.environ, "
             "os.environ.copy(), or a dict literal"
+        )
+        assert not _env_mutated_between_construction_and_call(module, call, env_source), (
+            f"env= at line {call.lineno} is mutated after its build_wrapper_env(...) "
+            "construction and before this spawn -- a post-construction edit can "
+            "reintroduce an unsafe key"
         )
 
 
@@ -990,7 +1103,40 @@ def test_no_wrapper_test_wrote_into_the_real_breezy_state_directory() -> None:
     clean, non-flaky assertion -- this guard never touches directory
     equality on `~/.local/share/breezy/`, which the live node, recorder and
     supervisor write to continuously (X-L27's reason for existing).
+
+    P1-b (L-24 anti-vacuity, literal-set-first): with `XDG_RUNTIME_DIR` and
+    `HOME` both absent from the RUNNER's own environment, `_SESSION_START_STATE`
+    would resolve to `()` and the loop below would iterate ZERO times --
+    passing vacuously without ever having scanned anything. The three
+    assertions below fail loudly on that condition instead, mirroring this
+    module's own `_HEAVY_TIMERS`-style literal-expected-set pattern.
     """
+    assert _REAL_XDG_RUNTIME_DIR, (
+        "XDG_RUNTIME_DIR was empty/absent at import -- the guard's five-path "
+        "scope would be silently narrowed"
+    )
+    assert _REAL_HOME, (
+        "HOME was empty/absent at import -- the guard's five-path scope "
+        "would be silently narrowed"
+    )
+    expected_scope_shapes = (
+        Path(_REAL_XDG_RUNTIME_DIR) / _LOCK_FILENAME,
+        Path(_REAL_HOME) / ".local" / "share" / "breezy" / _LOCK_FILENAME,
+        Path(_REAL_HOME) / ".local" / "share" / "breezy" / "k1",
+        Path(_REAL_HOME) / ".local" / "share" / "breezy" / "derived",
+        Path(_REAL_HOME) / ".local" / "share" / "breezy" / "offer_gate",
+    )
+    assert len(_SESSION_START_STATE) == 5, (
+        f"expected exactly 5 real-path scope entries, got "
+        f"{len(_SESSION_START_STATE)}: {[str(s.path) for s in _SESSION_START_STATE]} -- "
+        "an empty scope iterates zero times below and passes vacuously (L-24)"
+    )
+    assert tuple(state.path for state in _SESSION_START_STATE) == expected_scope_shapes, (
+        f"the resolved scope does not match the expected five path shapes: "
+        f"{[str(s.path) for s in _SESSION_START_STATE]} != "
+        f"{[str(p) for p in expected_scope_shapes]}"
+    )
+
     run_token_marker = "sp1-leakguard-"  # every token this module mints starts with this
     for state in _SESSION_START_STATE:
         if state.path.name == "breezy-studies.lock":
