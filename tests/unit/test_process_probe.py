@@ -61,7 +61,7 @@ def test_no_match_is_absent() -> None:
     assert result == PidProbe(ProbeOutcome.ABSENT, None)
 
 
-def test_a_match_is_found_with_the_pid() -> None:
+def test_a_match_is_found_with_the_pid(never_signals: None) -> None:
     runner = _fake_runner(stdout="12345\n")
 
     result = probe_pid_by_argv("breezy-trade$", runner=runner)
@@ -107,7 +107,9 @@ def _write_cmdline(proc_root: Path, pid: int, *args: str) -> None:
     (pid_dir / "cmdline").write_bytes(("\x00".join(args) + "\x00").encode())
 
 
-def test_pid_cmdline_matches_confirms_a_live_anchor(tmp_path: Path) -> None:
+def test_pid_cmdline_matches_confirms_a_live_anchor(
+    tmp_path: Path, never_signals: None
+) -> None:
     _write_cmdline(tmp_path, 111, "/home/jon/breezy/.venv/bin/breezy-trade")
 
     assert pid_cmdline_matches(111, "breezy-trade$", proc_root=tmp_path) is True
@@ -123,7 +125,9 @@ def test_pid_cmdline_matches_is_none_when_proc_is_unreadable(tmp_path: Path) -> 
     assert pid_cmdline_matches(999999, "breezy-trade$", proc_root=tmp_path) is None
 
 
-def test_pid_cmdline_matches_never_forks(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_pid_cmdline_matches_never_forks(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, never_signals: None
+) -> None:
     _write_cmdline(tmp_path, 333, "breezy-trade")
 
     def _bomb(*args: Any, **kwargs: Any) -> None:

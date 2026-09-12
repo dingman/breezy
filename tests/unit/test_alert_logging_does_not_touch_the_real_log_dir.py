@@ -145,3 +145,23 @@ def test_the_guard_context_is_green_for_a_plain_concurrent_append(
         (log_dir / "breezy-trade-supervisor.log").open("a") as fh,
     ):
         fh.write("2026-09-12T00:05:00Z self_check result=PASS pid=895135\n")
+
+
+def test_a_sentinel_in_a_new_node_shaped_file_is_still_caught(tmp_path: Path) -> None:
+    """Coordinator review NB1: a NEW file exempted by NAME from
+    ``find_unexpected_new_files`` (the node-log timestamp shape) must
+    still have its CONTENT sentinel-scanned -- exempting the shape must
+    never also exempt a leak written into it."""
+    log_dir = tmp_path / "logs"
+    log_dir.mkdir()
+    before = _log_dir_snapshot(log_dir)
+
+    node_shaped = log_dir / "breezy-trade-20260912T165000Z.log"
+    node_shaped.write_text(f"boot line referencing {_SENTINEL}\n")
+
+    # The name-based check still correctly treats this as legitimate.
+    assert find_unexpected_new_files(log_dir, before) == []
+
+    # But the content-based check must NOT be blind to it.
+    leaks = find_test_sentinel_leaks(log_dir, before)
+    assert leaks == {"breezy-trade-20260912T165000Z.log": _SENTINEL}

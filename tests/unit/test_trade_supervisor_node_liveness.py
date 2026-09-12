@@ -204,7 +204,7 @@ def test_a_standing_absence_alerts_once_not_every_pass(tmp_path: Path) -> None:
 
 
 def test_a_probe_exception_never_ends_the_supervisor(
-    tmp_path: Path, caplog: pytest.LogCaptureFixture
+    tmp_path: Path, caplog: pytest.LogCaptureFixture, never_signals: None
 ) -> None:
     def bombing_finder() -> int | None:
         raise RuntimeError("simulated /proc read failure")
@@ -260,7 +260,7 @@ def test_absence_requires_both_the_pid_probe_and_the_lock_probe_to_agree(tmp_pat
 
 
 def test_a_tracked_pid_that_still_matches_its_cmdline_never_forks_pgrep(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, never_signals: None
 ) -> None:
     monkeypatch.setattr(
         "breezy.runtime.trade_supervisor.pid_cmdline_matches",
@@ -285,7 +285,7 @@ def test_a_tracked_pid_that_still_matches_its_cmdline_never_forks_pgrep(
 
 
 def test_a_tracked_pid_whose_cmdline_no_longer_matches_falls_back_to_pgrep(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, never_signals: None
 ) -> None:
     monkeypatch.setattr(
         "breezy.runtime.trade_supervisor.pid_cmdline_matches",
@@ -311,7 +311,7 @@ def test_a_tracked_pid_whose_cmdline_no_longer_matches_falls_back_to_pgrep(
 
 
 def test_a_reused_pid_is_not_mistaken_for_the_node(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, never_signals: None
 ) -> None:
     # The tracked pid was reused by an unrelated process -- its cmdline no
     # longer matches the node's anchor -- and the real node is genuinely

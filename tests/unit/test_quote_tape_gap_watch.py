@@ -12,6 +12,8 @@ hand-typed or lifted from any plan text.
 
 from __future__ import annotations
 
+import fnmatch
+
 import pytest
 from nautilus_trader.cache.cache import Cache
 from nautilus_trader.common.component import LiveClock, MessageBus
@@ -101,7 +103,9 @@ class FakeClock:
 # ---------------------------------------------------------------------------
 
 
-def test_a_record_published_exactly_as_data_py_does_is_delivered_to_the_subscriber() -> None:
+def test_a_record_published_exactly_as_data_py_does_is_delivered_to_the_subscriber(
+    never_signals: None,
+) -> None:
     msgbus = _new_bus()
     engine = _new_engine(msgbus)
     record = _gap()
@@ -115,10 +119,13 @@ def test_a_record_published_exactly_as_data_py_does_is_delivered_to_the_subscrib
 
     # Never lifted from a plan: derive the real topic from Nautilus's own
     # TopicCache class (the same one the engine used internally to publish
-    # the record above) and check it against the wildcard this module
-    # subscribes on.
+    # the record above) and fnmatch it against the ACTUAL wildcard constant
+    # the subscription uses (coordinator NB2) -- a `startswith` check would
+    # pass even if `QUOTE_TAPE_GAP_TOPIC` diverged from a real glob (e.g. a
+    # typo dropping the trailing `*`), since the literal prefix alone would
+    # still match.
     real_topic = TopicCache().get_custom_data_topic(DataType(type(record)), record.instrument_id)
-    assert real_topic.startswith("data.QuoteTapeGap")
+    assert fnmatch.fnmatch(real_topic, QUOTE_TAPE_GAP_TOPIC)
 
 
 # ---------------------------------------------------------------------------
@@ -213,7 +220,7 @@ def test_a_gap_still_open_after_the_renotify_window_alerts_again() -> None:
     assert len(sink.payloads) == 2
 
 
-def test_a_shard_scoped_gap_reaches_the_sink() -> None:
+def test_a_shard_scoped_gap_reaches_the_sink(never_signals: None) -> None:
     msgbus = _new_bus()
     sink = _RecordingSink()
     install_quote_tape_gap_watch(msgbus, sink=sink)

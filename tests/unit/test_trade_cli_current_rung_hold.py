@@ -473,3 +473,60 @@ def test_tape_recorder_settings_never_read_the_current_rung_hold_flag(
     )
     assert not hasattr(settings, "current_rung_hold")
     assert "current_rung_hold" not in getattr(settings, "__dataclass_fields__", {})
+
+
+# ---------------------------------------------------------------------------
+# SP-6 A5 (architect confirmation, rows 9/10): exactly ONE AlertSink is
+# resolved per node process and the SAME instance reaches every downstream
+# emit site -- app.trade.run's own resolve, trade_cli.run's (never reached,
+# since run() always passes its own down), and
+# install_current_rung_hold_refusal_watch's sink=.
+# ---------------------------------------------------------------------------
+
+
+def test_exactly_one_alert_sink_is_resolved_and_shared_across_every_site(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import breezy.app.trade as app_trade
+    import breezy.runtime.trade_cli as trade_cli_module
+    from breezy.runtime.health import LoggingAlertSink
+    from breezy.strategy.current_rung_hold import composition as crh_composition
+
+    calls: list[str] = []
+    shared_sink = LoggingAlertSink()
+
+    def _counting_resolve(*args: object, **kwargs: object) -> LoggingAlertSink:
+        calls.append("resolve")
+        return shared_sink
+
+    monkeypatch.setattr(app_trade, "resolve_alert_sink", _counting_resolve)
+    monkeypatch.setattr(trade_cli_module, "resolve_alert_sink", _counting_resolve)
+
+    seen_sinks: list[object] = []
+    real_install = crh_composition.install_current_rung_hold_refusal_watch
+
+    def _recording_install(node: object, strategies: object, *, sink: object = None) -> object:
+        seen_sinks.append(sink)
+        return real_install(node, strategies, sink=sink)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(
+        app_trade, "install_current_rung_hold_refusal_watch", _recording_install
+    )
+
+    catalog_root = tmp_path / "catalog"
+    catalog_root.mkdir()
+    _write_today_catalog(catalog_root)
+    env = _trade_env(
+        tmp_path,
+        **{
+            CURRENT_RUNG_HOLD_VAR: "1",
+            LIVE_OBSERVATIONS_VAR: "1",
+            TRADE_CATALOG_ROOT_VAR: str(catalog_root),
+        },
+    )
+
+    code = run(env=env, node_factory=RecordingNode, stderr=io.StringIO())
+
+    assert code == EXIT_OK
+    assert calls == ["resolve"]
+    assert seen_sinks == [shared_sink]

@@ -29,7 +29,9 @@ from __future__ import annotations
 
 import os
 import re
+import signal
 import socket
+import subprocess
 import sys
 import tempfile
 import types
@@ -617,23 +619,33 @@ def find_test_sentinel_leaks(
     *,
     sentinels: Sequence[str] = _TEST_SENTINEL_SUBSTRINGS,
 ) -> dict[str, str]:
-    """Pure, injectable core of the L-27 guard. For every file present at
-    ``before``, decode the bytes appended since its recorded offset and
-    report the first ``sentinels`` match found in it. A file that no
-    longer exists is skipped -- an absence is never fabricated into a
-    leak."""
+    """Pure, injectable core of the L-27 guard. For every file CURRENTLY
+    present in ``log_dir``, decode the bytes appended since its recorded
+    offset in ``before`` (0 for a file that did not exist at ``before`` --
+    i.e. its ENTIRE content is scanned) and report the first ``sentinels``
+    match found.
+
+    A NEW file is scanned here even when
+    :func:`find_unexpected_new_files` exempts its NAME (the
+    ``breezy-trade-<stamp>.log`` node-log shape) from the "unexpected new
+    file" check -- exempting a legitimate NAME must never also exempt its
+    CONTENT: a test that leaks a sentinel into a file shaped exactly like
+    a fresh node log would otherwise be invisible to both checks at once.
+    """
     leaks: dict[str, str] = {}
-    for name, offset in before.items():
-        path = log_dir / name
-        if not path.exists():
+    if not log_dir.is_dir():
+        return leaks
+    for entry in log_dir.iterdir():
+        if not entry.is_file():
             continue
-        appended = _appended_bytes(path, offset)
+        offset = before.get(entry.name, 0)
+        appended = _appended_bytes(entry, offset)
         if not appended:
             continue
         text = appended.decode("utf-8", errors="replace")
         for sentinel in sentinels:
             if sentinel in text:
-                leaks[name] = sentinel
+                leaks[entry.name] = sentinel
                 break
     return leaks
 
@@ -689,3 +701,48 @@ def _real_log_dir_untouched() -> Iterator[None]:
     """
     with _log_dir_untouched_guard(_REAL_LOG_DIR):
         yield
+
+
+# ---------------------------------------------------------------------------
+# NEVER-SIGNALS guard (SP-6, security review MEDIUM / architect NB3-NB4):
+# a BEHAVIOURAL recording double, not just a static token scan. Requested
+# by A11/A12/process_probe.py/quote_tape_gap_watch.py tests that exercise
+# the REAL absence/liveness/gap-watch paths -- every signal-sending
+# primitive Python exposes is bombed so any of those paths reaching for
+# one fails the test immediately, rather than relying solely on grepping
+# module source for the string "os.kill".
+# ---------------------------------------------------------------------------
+
+
+def _signal_bomb(name: str) -> Any:
+    def _bomb(*args: object, **kwargs: object) -> None:
+        raise AssertionError(f"{name} must never be called (args={args!r} kwargs={kwargs!r})")
+
+    return _bomb
+
+
+@pytest.fixture
+def never_signals(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Bombs every process-signalling primitive this repo's NEVER-SIGNALS
+    invariant (A11/A12/process_probe.py) forbids: ``os.kill``,
+    ``os.killpg``, ``signal.raise_signal``, ``signal.pthread_kill``, and
+    ``subprocess.Popen.send_signal``/``.terminate``/``.kill``. A test that
+    requests this fixture and then exercises a path which reaches any of
+    these fails immediately and loudly, rather than silently succeeding
+    because the path happened not to be reached.
+
+    Deliberately NOT autouse: legitimate SIGTERM-sending code
+    (``trade_supervisor.terminate``, real process lifecycle management)
+    lives elsewhere and is tested elsewhere with real signals -- this
+    fixture is requested only by tests whose own code path must be
+    signal-free by construction.
+    """
+    monkeypatch.setattr(os, "kill", _signal_bomb("os.kill"))
+    monkeypatch.setattr(os, "killpg", _signal_bomb("os.killpg"))
+    monkeypatch.setattr(signal, "raise_signal", _signal_bomb("signal.raise_signal"))
+    monkeypatch.setattr(signal, "pthread_kill", _signal_bomb("signal.pthread_kill"))
+    monkeypatch.setattr(
+        subprocess.Popen, "send_signal", _signal_bomb("subprocess.Popen.send_signal")
+    )
+    monkeypatch.setattr(subprocess.Popen, "terminate", _signal_bomb("subprocess.Popen.terminate"))
+    monkeypatch.setattr(subprocess.Popen, "kill", _signal_bomb("subprocess.Popen.kill"))

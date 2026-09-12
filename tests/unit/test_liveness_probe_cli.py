@@ -96,7 +96,7 @@ def test_a_probe_failure_is_reported_as_probe_failed_not_absence() -> None:
     assert sink.received[0].severity == "WARN"
 
 
-def test_node_absence_at_0200z_alerts() -> None:
+def test_node_absence_at_0200z_alerts(never_signals: None) -> None:
     probe, _ = _make_probe(
         {SUPERVISOR_ARGV_ANCHOR: [_FOUND], NODE_ARGV_ANCHOR: [_ABSENT, _ABSENT]}
     )
@@ -126,7 +126,7 @@ def test_node_absence_at_1641z_is_silent() -> None:
     assert sink.received == []
 
 
-def test_supervisor_absence_alerts_at_any_hour() -> None:
+def test_supervisor_absence_alerts_at_any_hour(never_signals: None) -> None:
     probe, _ = _make_probe(
         {SUPERVISOR_ARGV_ANCHOR: [_ABSENT, _ABSENT], NODE_ARGV_ANCHOR: [_FOUND]}
     )
@@ -141,7 +141,9 @@ def test_supervisor_absence_alerts_at_any_hour() -> None:
     assert sink.received[0].event == "SUPERVISOR_ABSENT"
 
 
-def test_never_signals_any_process(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_never_signals_any_process(
+    monkeypatch: pytest.MonkeyPatch, never_signals: None
+) -> None:
     """CX-N2: (a) the injected probe port is the ONLY process lookup
     reached -- a bomb over the REAL (forking) probe fails the test if it
     is ever called; (b) a token scan confirms no signal-sending call
