@@ -28,11 +28,15 @@ real network I/O from a job that merely overrode ``-m``.
 from __future__ import annotations
 
 import os
+import re
 import socket
 import sys
+import tempfile
 import types
 from collections.abc import Iterator, Mapping, Sequence
-from typing import Any, Protocol, cast
+from contextlib import contextmanager
+from pathlib import Path
+from typing import Any, Final, Protocol, cast
 
 import pytest
 
@@ -530,3 +534,158 @@ def _block_network_sockets(
     monkeypatch.setattr(socket.socket, "connect", _blocked_connect)
     monkeypatch.setattr(socket.socket, "connect_ex", _blocked_connect_ex)
     yield
+
+
+# ---------------------------------------------------------------------------
+# L-27 (SP-6 B3): session-wide guard against a test writing into the REAL
+# ``~/.local/share/breezy/logs/`` directory.
+#
+# ``breezy.runtime.trade_supervisor`` writes there in production
+# (``node_log_path``, ``supervisor_log_path``). A gate run for this repo
+# happens on a host where the LIVE trade node and supervisor are usually
+# running and appending to those exact files throughout the run -- so a
+# naive "byte-identical before/after" or size/mtime check is guaranteed RED
+# here, not a guard at all. This fixture instead:
+#   1. snapshots each pre-existing file's byte offset at session start;
+#   2. at session end, reads ONLY the bytes appended since that offset and
+#      checks them for a small set of substrings that can only appear in
+#      TEST-written content, never in real supervisor/node output;
+#   3. separately flags any brand-new file whose name does not match the
+#      trade node's own timestamped log naming convention -- the live node
+#      legitimately mints a new ``breezy-trade-<stamp>.log`` on every
+#      relaunch, so that exact shape is tolerated; anything else is a leak.
+#
+# ``_REAL_HOME``/``_REAL_LOG_DIR`` are captured at import time, before any
+# fixture in any module has a chance to monkeypatch ``Path.home`` -- the
+# same read-only-reference idiom ``tests/unit/test_trade_supervisor.py``
+# already uses for its own (narrower, single-file) guard.
+# ---------------------------------------------------------------------------
+
+_REAL_HOME: Final[Path] = Path.home()
+_REAL_LOG_DIR: Final[Path] = _REAL_HOME / ".local" / "share" / "breezy" / "logs"
+
+#: Substrings that can only appear in content a TEST wrote, never in real
+#: supervisor/trade-node output: every ``tmp_path`` in this run lives under
+#: the interpreter's temp root, and ``example.invalid`` (RFC 2606 reserved)
+#: is this suite's conventional fake webhook host. Kept narrow and explicit
+#: -- a broad heuristic risks failing an unrelated developer's real gate
+#: run, which would be worse than missing an exotic leak.
+_TEST_SENTINEL_SUBSTRINGS: Final[tuple[str, ...]] = (
+    str(Path(tempfile.gettempdir())),
+    "example.invalid",
+)
+
+#: The trade node's OWN naming convention for a freshly-launched log file
+#: (``breezy.runtime.trade_supervisor.node_log_path``). A new file of
+#: exactly this shape is expected production behaviour on every relaunch,
+#: not a leak.
+_NODE_LOG_FILENAME_RE: Final[re.Pattern[str]] = re.compile(
+    r"^breezy-trade-\d{8}T\d{6}Z\.log$"
+)
+
+
+def _log_dir_snapshot(log_dir: Path) -> dict[str, int]:
+    """Per-file byte offset (``st_size``) for every file that exists in
+    ``log_dir`` right now. A missing directory snapshots as empty -- there
+    is nothing yet to guard, and nothing yet is not itself a violation."""
+    if not log_dir.is_dir():
+        return {}
+    return {entry.name: entry.stat().st_size for entry in log_dir.iterdir() if entry.is_file()}
+
+
+def _appended_bytes(path: Path, offset: int) -> bytes:
+    """Bytes written to ``path`` since ``offset``. A file smaller now than
+    ``offset`` has been rotated or truncated; rather than raise or silently
+    miss content, re-baseline by reading the whole current file (AM-17) --
+    a shrink alone is never itself treated as a leak."""
+    try:
+        current_size = path.stat().st_size
+    except OSError:
+        return b""
+    read_from = offset if current_size >= offset else 0
+    try:
+        with path.open("rb") as fh:
+            fh.seek(read_from)
+            return fh.read()
+    except OSError:
+        return b""
+
+
+def find_test_sentinel_leaks(
+    log_dir: Path,
+    before: Mapping[str, int],
+    *,
+    sentinels: Sequence[str] = _TEST_SENTINEL_SUBSTRINGS,
+) -> dict[str, str]:
+    """Pure, injectable core of the L-27 guard. For every file present at
+    ``before``, decode the bytes appended since its recorded offset and
+    report the first ``sentinels`` match found in it. A file that no
+    longer exists is skipped -- an absence is never fabricated into a
+    leak."""
+    leaks: dict[str, str] = {}
+    for name, offset in before.items():
+        path = log_dir / name
+        if not path.exists():
+            continue
+        appended = _appended_bytes(path, offset)
+        if not appended:
+            continue
+        text = appended.decode("utf-8", errors="replace")
+        for sentinel in sentinels:
+            if sentinel in text:
+                leaks[name] = sentinel
+                break
+    return leaks
+
+
+def find_unexpected_new_files(log_dir: Path, before: Mapping[str, int]) -> list[str]:
+    """Filenames present in ``log_dir`` now that were absent from
+    ``before`` AND do not match the trade node's own timestamped log
+    naming convention. Scoped this way (not "any new file") because the
+    live node mints a legitimate new ``breezy-trade-<stamp>.log`` on every
+    relaunch -- flagging that shape would make this guard permanently RED
+    on a host running the real supervisor."""
+    if not log_dir.is_dir():
+        return []
+    return sorted(
+        entry.name
+        for entry in log_dir.iterdir()
+        if entry.is_file()
+        and entry.name not in before
+        and not _NODE_LOG_FILENAME_RE.match(entry.name)
+    )
+
+
+@contextmanager
+def _log_dir_untouched_guard(log_dir: Path) -> Iterator[None]:
+    """Context-manager core the session fixture below wires to the REAL
+    log dir. Kept separate and directly importable so its behaviour is
+    unit-tested against a ``tmp_path`` stand-in without ever touching
+    ``~/.local/share/breezy/``."""
+    before = _log_dir_snapshot(log_dir)
+    yield
+    leaks = find_test_sentinel_leaks(log_dir, before)
+    new_files = find_unexpected_new_files(log_dir, before)
+    assert not leaks, (
+        f"a test in this session wrote sentinel content into the REAL log "
+        f"dir {log_dir}: {leaks}"
+    )
+    assert not new_files, (
+        f"a test in this session created an unexpected new file under the "
+        f"REAL log dir {log_dir}: {new_files}"
+    )
+
+
+@pytest.fixture(scope="session", autouse=True)
+def _real_log_dir_untouched() -> Iterator[None]:
+    """Session-scoped L-27 guard (B3): across the WHOLE gate run, no
+    unexpected new file appears under the real
+    ``~/.local/share/breezy/logs/`` and the bytes appended to any
+    pre-existing file never contain a test sentinel -- green even while
+    the live trade node and supervisor append to those same files
+    throughout a multi-minute run, because a real writer's appended bytes
+    never match ``_TEST_SENTINEL_SUBSTRINGS`` and its new files (if any)
+    always match the node's own naming convention.
+    """
+    with _log_dir_untouched_guard(_REAL_LOG_DIR):
+        yield

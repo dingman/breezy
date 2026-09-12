@@ -89,6 +89,7 @@ from breezy.runtime.trade_supervisor_core import (
     record_strategy_subscribed_seen,
     self_check,
 )
+from tests.conftest import find_test_sentinel_leaks
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 
@@ -111,12 +112,13 @@ _REAL_HOME = Path.home()
 _REAL_SUPERVISOR_LOG_DIR = _REAL_HOME / ".local" / "share" / "breezy" / "logs"
 
 
-def _stat_or_none(path: Path) -> tuple[int, float] | None:
+def _single_file_offset(path: Path) -> dict[str, int]:
+    """Snapshot shape expected by ``tests.conftest.find_test_sentinel_leaks``,
+    scoped to exactly the one file this module's guard cares about."""
     try:
-        stat_result = path.stat()
+        return {path.name: path.stat().st_size}
     except FileNotFoundError:
-        return None
-    return (stat_result.st_size, stat_result.st_mtime)
+        return {}
 
 
 @pytest.fixture(autouse=True)
@@ -137,19 +139,27 @@ def _isolate_home_and_reset_supervisor_logger(monkeypatch, tmp_path):
 
 @pytest.fixture(scope="module", autouse=True)
 def _guard_real_supervisor_log_untouched():
-    """Module-scoped finalizer: snapshot the REAL supervisor log's
-    size/mtime (via the never-monkeypatched ``_REAL_HOME`` above) before
-    the first test in this module runs, and assert it is byte-for-byte
-    unchanged after the last one. Read-only ``stat`` calls only -- this
-    never opens, truncates, or edits that file.
+    """Module-scoped finalizer (SP-6 AM-16): offset-based, matching the
+    session-wide L-27 guard in ``tests/conftest.py`` rather than the
+    size/mtime-equality check this replaces -- that check was guaranteed
+    RED whenever the REAL supervisor is running concurrently and appending
+    its own lines to this exact file (measured: B3; a size/mtime pair
+    changes on every legitimate concurrent append). Snapshot the REAL
+    supervisor log's byte offset (via the never-monkeypatched
+    ``_REAL_HOME`` above) before the first test in this module runs; at
+    teardown, read ONLY the bytes appended since then and assert they
+    contain no TEST sentinel (``tests.conftest.find_test_sentinel_leaks``).
+    A concurrent real writer is green by construction; a test write --
+    which could only originate from a fake-HOME leak -- is caught. Never
+    opens the file for writing.
     """
-    before = _stat_or_none(supervisor_log_path(_REAL_SUPERVISOR_LOG_DIR))
+    log_path = supervisor_log_path(_REAL_SUPERVISOR_LOG_DIR)
+    before = _single_file_offset(log_path)
     yield
-    after = _stat_or_none(supervisor_log_path(_REAL_SUPERVISOR_LOG_DIR))
-    assert after == before, (
-        "a test in tests/unit/test_trade_supervisor.py modified the REAL "
-        f"supervisor log at {supervisor_log_path(_REAL_SUPERVISOR_LOG_DIR)} "
-        f"-- (size, mtime) changed from {before} to {after}"
+    leaks = find_test_sentinel_leaks(_REAL_SUPERVISOR_LOG_DIR, before)
+    assert not leaks, (
+        "a test in tests/unit/test_trade_supervisor.py wrote sentinel "
+        f"content into the REAL supervisor log at {log_path}: {leaks}"
     )
 
 
