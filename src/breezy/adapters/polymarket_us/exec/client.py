@@ -607,6 +607,17 @@ class AmbiguousResolverContext:
     notional_usd: Decimal
     booking_id: int
     created_ns: int
+    # SP-2 I3 (L-37 (2)/(3)): names-only, already capped by the producer
+    # (`submit_chain._capped_diagnostic` / `_detail_tree_token`) -- this
+    # class never truncates. Trailing-optional so an OLD blob (written
+    # before this change) still decodes with both `None` (AR-N6); no
+    # schema version, no migration. AC-19's disqualification rule: a
+    # captured row carrying an AUTHENTIC truncation marker, `<depth-capped>`,
+    # `+N more`, or a `\xNN` escape is incomplete evidence and must not be
+    # used to declare `_EXECUTION_DRIFT_ALLOWED_KEYS` (I4/R-6) -- re-capture,
+    # or raise the cap in a follow-up, never remove it.
+    create_detail: str | None = None
+    fill_parse_error: str | None = None
 
     def to_bytes(self) -> bytes:
         return json.dumps(
@@ -619,6 +630,8 @@ class AmbiguousResolverContext:
                 "notionalUsd": str(self.notional_usd),
                 "bookingId": self.booking_id,
                 "createdNs": self.created_ns,
+                "createDetail": self.create_detail,
+                "fillParseError": self.fill_parse_error,
             },
             sort_keys=True,
         ).encode("utf-8")
@@ -636,6 +649,13 @@ class AmbiguousResolverContext:
                 f"a durable resolver context decoded to a {type(payload).__name__}, "
                 "not an object"
             )
+        # Trailing-optional fields are read OUTSIDE the strict `try` below,
+        # via `.get(...)`, so an old blob that never carried them still
+        # decodes -- `KeyError` there is precisely what must NOT happen.
+        raw_create_detail = payload.get("createDetail")
+        create_detail = None if raw_create_detail is None else str(raw_create_detail)
+        raw_fill_parse_error = payload.get("fillParseError")
+        fill_parse_error = None if raw_fill_parse_error is None else str(raw_fill_parse_error)
         try:
             return cls(
                 intent_id=str(payload["intentId"]),
@@ -650,6 +670,8 @@ class AmbiguousResolverContext:
                 ),
                 booking_id=int(payload["bookingId"]),
                 created_ns=int(payload["createdNs"]),
+                create_detail=create_detail,
+                fill_parse_error=fill_parse_error,
             )
         except (KeyError, TypeError, ValueError, InvalidOperation) as exc:
             raise ExecutionReportMappingError(
@@ -2623,6 +2645,8 @@ class PolymarketUSExecutionClient(LiveExecutionClient):
         notional_usd: Decimal,
         booking: Any,
         now_ns: int,
+        create_detail: str | None = None,
+        fill_parse_error: str | None = None,
     ) -> None:
         """Resolution A/E: record durable resolver context for a with-id
         AMBIGUOUS outcome, and hold the live ``SpendBooking`` for
@@ -2630,6 +2654,11 @@ class PolymarketUSExecutionClient(LiveExecutionClient):
         allowlist like :meth:`_deny`/:meth:`_retire` -- writes only to the
         already-open local store and a process-local dict; reaches no
         network.
+
+        SP-2 I3: ``create_detail`` / ``fill_parse_error`` are attribute
+        reads from the caller's already-classified ``outcome`` -- both
+        already capped and names-only by the time they reach here. This
+        method does NOT truncate them again (S-L1).
         """
         context = AmbiguousResolverContext(
             intent_id=intent_id,
@@ -2640,6 +2669,8 @@ class PolymarketUSExecutionClient(LiveExecutionClient):
             notional_usd=notional_usd,
             booking_id=booking.booking_id,
             created_ns=now_ns,
+            create_detail=create_detail,
+            fill_parse_error=fill_parse_error,
         )
         self._store_set(f"{RESOLVER_CONTEXT_KEY_PREFIX}{intent_id}", context.to_bytes())
         self._ambiguous_bookings[intent_id] = booking
@@ -2917,6 +2948,8 @@ class PolymarketUSExecutionClient(LiveExecutionClient):
                 notional_usd=submit_chain.order_notional_usd(order),
                 booking=booking,
                 now_ns=now_ns,
+                create_detail=outcome.detail,
+                fill_parse_error=outcome.fill_parse_error,
             )
 
     async def _cancel_order(self, command: CancelOrder) -> None:

@@ -44,6 +44,7 @@ from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from decimal import Decimal
 from pathlib import Path
+from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any, Final
 
 import pytest
@@ -96,7 +97,9 @@ from breezy.adapters.polymarket_us.exec import submit_chain
 from breezy.adapters.polymarket_us.exec.client import (
     FILL_INDEX_KEY_PREFIX,
     FILL_KEY_PREFIX,
+    RESOLVER_CONTEXT_KEY_PREFIX,
     VENUE_ORDER_ID_KEY_PREFIX,
+    AmbiguousResolverContext,
     DurableFillRecord,
     PolymarketUSExecutionClient,
     PrivateRead,
@@ -2468,3 +2471,101 @@ async def test_none_order_level_totals_on_an_accept_fill_take_the_write_failure_
 
     filled = [e for e in rig.order_events if isinstance(e, OrderFilled)]
     assert len(filled) == 1
+
+
+# ---------------------------------------------------------------------------
+# SP-2 I3 -- durable capture: `AmbiguousResolverContext` gains two
+# trailing-optional fields, written by `_note_ambiguous_open`
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_an_ambiguous_create_outcome_persists_the_body_key_tree_in_the_resolver_context(
+    tmp_path: Path,
+) -> None:
+    """I3: `outcome.detail` / `outcome.fill_parse_error` -- both already
+    capped, names-only, no value -- are persisted onto the durable
+    resolver context, so a drifted key survives past the log line and
+    feeds R-6."""
+    store_path = tmp_path / "exec_state.db"
+    rig = _build_rig(tmp_path, store_opener=lambda: SqliteStateStore(store_path))
+    await rig.client._connect()
+
+    order = rig.submit_command().order
+    booking = SimpleNamespace(booking_id=1)
+    create_detail = (
+        "status=200 body_kind=executions-present rpc_code=none body_len=1 "
+        "state=absent cum=absent tree={'driftedTopLevelKey'}"
+    )
+    fill_parse_error = (
+        "fill report mapped but no filled cost is derivable: "
+        "order.avgPx=absent order.cumQuantity=absent lastPx=absent "
+        "lastShares=absent; full body key tree: {'driftedLegKey'}"
+    )
+
+    rig.client._note_ambiguous_open(
+        intent_id="intent-i3",
+        venue_order_id="venue-i3",
+        order=order,
+        notional_usd=Decimal("1.00"),
+        booking=booking,
+        now_ns=TS_INIT,
+        create_detail=create_detail,
+        fill_parse_error=fill_parse_error,
+    )
+
+    await rig.client._disconnect()
+
+    with SqliteStateStore(store_path) as reopened:
+        raw = reopened.get(f"{RESOLVER_CONTEXT_KEY_PREFIX}intent-i3")
+
+    assert raw is not None
+    context = AmbiguousResolverContext.from_bytes(raw)
+    assert context.create_detail == create_detail
+    assert context.fill_parse_error == fill_parse_error
+    assert "driftedTopLevelKey" in (context.create_detail or "")
+    assert "driftedLegKey" in (context.fill_parse_error or "")
+
+
+def test_a_resolver_context_written_before_this_change_still_decodes() -> None:
+    """AC-13 / AR-N6: a resolver-context blob written before SP-2 (no
+    `createDetail`/`fillParseError` keys at all) still decodes, both
+    fields `None` -- trailing-optional, no schema version, no migration.
+    A NEW row with no detail explicitly serialises `"createDetail": null`
+    / `"fillParseError": null` and decodes back to `None`."""
+    old_blob = json.dumps(
+        {
+            "intentId": "intent-old",
+            "venueOrderId": "venue-old",
+            "instrumentId": "instrument-old",
+            "clientOrderId": "client-old",
+            "strategyId": "strategy-old",
+            "notionalUsd": "1.00",
+            "bookingId": 7,
+            "createdNs": TS_INIT,
+        },
+        sort_keys=True,
+    ).encode("utf-8")
+
+    old_context = AmbiguousResolverContext.from_bytes(old_blob)
+    assert old_context.create_detail is None
+    assert old_context.fill_parse_error is None
+
+    new_context = AmbiguousResolverContext(
+        intent_id="intent-new",
+        venue_order_id="venue-new",
+        instrument_id="instrument-new",
+        client_order_id="client-new",
+        strategy_id="strategy-new",
+        notional_usd=Decimal("2.00"),
+        booking_id=8,
+        created_ns=TS_INIT,
+    )
+    new_bytes = new_context.to_bytes()
+    decoded = json.loads(new_bytes)
+    assert decoded["createDetail"] is None
+    assert decoded["fillParseError"] is None
+
+    round_tripped = AmbiguousResolverContext.from_bytes(new_bytes)
+    assert round_tripped.create_detail is None
+    assert round_tripped.fill_parse_error is None
