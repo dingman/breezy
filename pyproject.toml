@@ -279,6 +279,16 @@ breezy-clear-family-halt = "breezy.strategy.current_rung_hold.clear_family_halt_
 # `pgrep -f` can find it without substring-matching the node's own argv.
 # See `breezy.runtime.trade_supervisor`.
 breezy-trade-supervisor = "breezy.runtime.trade_supervisor:main"
+# An EIGHTH process (SP-6 A4): an on-demand, single-shot proof that the
+# CURRENTLY configured alert sink actually emits. N10: this entry point
+# does not exist in `.venv/bin` until an operator runs `uv pip install
+# -e .` -- which rewrites the venv the supervisor spawns the node from,
+# so it is scheduled with a `daemon-reload` in the same maintenance
+# window, never a build step. Acceptance evidence uses
+# `python -m breezy.runtime.alert_test_cli` instead. See
+# `breezy.runtime.alert_test_cli` for the exit contract (2 =
+# `--require-webhook` given but no destination configured).
+breezy-alert-test = "breezy.runtime.alert_test_cli:main"
 
 [build-system]
 requires = ["uv_build>=0.12.5,<0.13.0"]
