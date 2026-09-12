@@ -1328,3 +1328,17 @@ R-7 item 5 and L-32 pin the interpretation of the **create-order response body**
 
 ### How to apply
 The Nautilus in-flight poller stays disabled (`runtime/node_config.py:689-712`: retry exhaustion resolves FAILED, a false terminal on a venue with no client-order-id); the resolver is a firewall-scanned client coroutine off `_connect`, bounded, positions-gated on both zero and fill. Before citing any venue response shape as a design input, find a captured body or the schema line — a fixture is not evidence (L-17 is about optional fields; this is about provenance). Related: L-32, R-7 item 5, L-34.
+
+## L-37 — A swallowed venue-shape error on the create path is a silent-fill hazard (2026-09-11/12)
+
+### What happened
+The second live order (SFO, IOC BUY @0.22, 2026-09-11 20:20:29Z, venue id CEBPX0EVTTMX) FILLED, but `parse_fill_report` refused it because the venue added four new fields (action, lastTransactTime, manualOrderIndicator, outcomeSide). The error was caught and **silently swallowed** by `fill_generation` without logging; the fill never reached the order state, intent stayed OPEN, and every subsequent order was denied account-wide. The GET-based resolver retried 3,615 times over 5 hours on the same field drift with no backoff.
+
+### Why this is binding
+A mapping error on the create-order path is NOT observability. It hides a FILL under a shape mismatch until a relaunch discovers it — meanwhile the account is locked. A venue that adds fields is routine; silent failures are the gap.
+
+### The rule
+Every venue-shape guard on a money surface MUST (1) emit the full names-only key tree on refusal (not just "shape mismatch"), (2) surface the error into the AMBIGUOUS diagnostic if it swallows on the create path, (3) declare additive field drift PER SURFACE with captured evidence — never by relaxing the guard. Any unbounded retry on a venue read needs backoff and an age alert (L-36 resolver: 5 → 300 s backoff; `open_intent_stale` CRITICAL).
+
+### How to apply
+Fixes: commits 8d56a26, ba2c5ee. Guards emit names-only key trees, allowlists are declared-and-logged per surface, resolver has backoff+age ceiling. Before accepting "shape drift handled", require: (a) the refusal names every field it saw, (b) the create path surfaces it visibly, (c) a test pins the new field as accepted post-fix. Related: L-17 (optional fields), L-22 (unforgeable primitives), L-36 (AMBIGUOUS semantics).
