@@ -754,3 +754,87 @@ def test_a_fill_two_ticks_below_the_ask_is_excluded_fill_below_ask(tmp_path: Pat
     assert len(lines) == 1
     assert lines[0]["reason"] == "fill_below_ask"
     assert lines[0]["trial_id"] == trial_id
+
+
+# ---------------------------------------------------------------------------
+# SP-2 I5(a) -- a sub-cent venue fee is a RECONCILED fee, end to end
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_a_sub_cent_venue_fee_is_reconciled_end_to_end(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    write_canonical_verified: None,  # noqa: F811
+) -> None:
+    """AC-15: a sub-cent venue commission books as bankers-zero on the
+    native `Money` (GL-2, already native-insufficient/already-extended)
+    but is still a RECONCILED fee -- both at the durable-record seam and,
+    end to end, on the scored parquet row, whose `fee` is the LITERAL
+    sub-cent `Decimal` (`row.fee` IS `cumulative_fee / cumulative_qty`
+    computed by the scorer itself; asserting that expression back would be
+    an L-24 tautology).
+
+    MUTATION_RED_EVIDENCE (in-process only, P1/P2 -- Rev 2's on-disk flip
+    of `_cumulative_fee_and_reconciliation` is NOT used):
+      P1 `monkeypatch.setattr(submit_chain, "_cumulative_fee_and_reconciliation",
+          lambda payload, execution, *, cumulative_qty: (Decimal("0.004"), False))`
+          -> every `fee_reconciled is True` assertion here goes RED.
+      P2 `... (Decimal("0.00"), True)`
+          -> the `fee == Decimal("0.004")` / `cumulative_fee` assertions go RED.
+    Both revert automatically (fixture-scoped `monkeypatch`); this test's own
+    body carries no perturbation, so it is unconditionally GREEN.
+    """
+    sender = _FakeOrderSender()
+    rig = _build_accept_fill_rig(tmp_path, monkeypatch=monkeypatch, sender=sender)
+    slug = _slug(rig.instrument)
+    order_id = "ord-i5a-subcent"
+    sender.response = VenueResponse(
+        status=200,
+        headers={},
+        body=_accept_fill_body(slug, order_id=order_id, last_px="0.37", commission="0.004"),
+    )
+
+    with _accept_fill_caps():
+        await rig.client._connect()
+        await rig.client._submit_order(rig.limit_buy())
+        await rig.client._disconnect()
+
+    record = _reopened_fill_record(rig.store_path, order_id)
+    assert record is not None
+    assert isinstance(record, DurableFillRecord)
+    assert record.fee_reconciled is True
+    assert record.cumulative_fee == Decimal("0.004")
+    assert record.venue_fee_raw == "0.004"
+
+    instrument_id = str(rig.instrument.id)
+    entry_ask = Decimal("0.35")
+    store = SqliteStateStore(rig.store_path)
+    latch_key = _seed_latch(store, instrument_id=instrument_id, ask=entry_ask)
+    store.close()
+
+    catalog_base = tmp_path / "catalog"
+    _seed_weather_instrument_and_final(catalog_base, instrument=rig.instrument)
+
+    manifest_path = _write_manifest(tmp_path)
+    derived_dir = tmp_path / "derived"
+    proc_root = _seed_fake_node(tmp_path, store_path=rig.store_path)
+    argv = [
+        "--city",
+        _CITY,
+        "--family-manifest",
+        str(manifest_path),
+        "--derived-dir",
+        str(derived_dir),
+        "--fill-source",
+        str(rig.store_path),
+        "--catalog-base",
+        str(catalog_base),
+    ]
+    assert main(argv, proc_root=proc_root) == 0
+
+    scored = read_scored_trials(derived_dir)
+    assert len(scored) == 1
+    row = scored[0]
+    assert row.trial_id == latch_key
+    assert row.fee == Decimal("0.004")

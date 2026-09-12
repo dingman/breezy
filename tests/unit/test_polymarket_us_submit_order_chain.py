@@ -999,6 +999,11 @@ async def test_a_sub_cent_venue_fee_is_booked_as_bankers_zero_with_raw_audit(
     assert len(records) == 1
     assert records[0].venue_fee_raw == "0.004"
     assert records[0].cumulative_fee == Decimal("0.004")
+    # I5(b), AR-N8: `_durable_accept_body` leaves `commissionNotionalTotal
+    # Collected` absent, so `_cumulative_fee_and_reconciliation` takes the
+    # absent-total branch (`:630`) and reconciles the fee, even though the
+    # fee itself books as bankers-zero on the native `Money`.
+    assert records[0].fee_reconciled is True
 
 
 @pytest.mark.asyncio
