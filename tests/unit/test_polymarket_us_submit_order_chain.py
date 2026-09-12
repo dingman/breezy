@@ -2169,6 +2169,12 @@ def test_the_body_key_tree_token_is_capped_and_declares_its_truncation() -> None
     assert token.endswith(marker)
     pre_marker = token[: -len(marker)]
     assert pre_marker.endswith("}")
+    # I8(b): the 2048-char slice lands well past several already
+    # per-key-truncated names (each raw key here is >64 chars), so the
+    # sliced tree itself still carries at least one INNER, per-key
+    # truncation marker -- a SECOND, authentic truncation, distinct from
+    # the outer tree-level one just asserted above (AM-6).
+    assert "(truncated from" in pre_marker
 
 
 def test_body_detail_tree_token_appears_only_on_executions_present() -> None:

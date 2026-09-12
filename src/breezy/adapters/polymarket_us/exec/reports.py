@@ -527,7 +527,7 @@ def _key_tree(payload: Mapping[str, Any], *, depth: int = 0) -> str:
     for key in sorted(payload, key=str):
         name = _safe_key_name(key)
         value = payload[key]
-        if key in _KEY_TREE_OPAQUE_KEYS:
+        if isinstance(value, (Mapping, list)) and key in _KEY_TREE_OPAQUE_KEYS:
             parts.append(f"{name}: {{{_OPAQUE}}}")
         elif isinstance(value, Mapping):
             if depth >= _KEY_TREE_MAX_DEPTH:

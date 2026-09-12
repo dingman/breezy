@@ -1289,3 +1289,20 @@ def test_a_non_hashable_execution_type_is_refused_not_a_crash(
             ts_init=TS_INIT,
         )
     assert "dict" in str(excinfo.value)
+
+
+# ---------------------------------------------------------------------------
+# I8 (nits) -- opaque-key value guard + inner truncation marker assertion
+# ---------------------------------------------------------------------------
+
+
+def test_a_scalar_team_value_is_not_rendered_opaque() -> None:
+    """I8(a): the opaque branch dropped the plan's value-type guard -- a
+    SCALAR `team` (never a free-form map in life, but the sanitiser must not
+    assume it) is not `<opaque>`; it falls to the plain scalar branch, same
+    as any other key with a scalar value. Only a `team` whose value is
+    actually a `Mapping` or `list` (the one declared free-form-map shape)
+    is opaque."""
+    tree = _key_tree({"team": "not-a-map"})
+    assert "<opaque>" not in tree
+    assert ascii("team") in tree
