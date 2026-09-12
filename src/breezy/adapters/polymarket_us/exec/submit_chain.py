@@ -847,6 +847,25 @@ def _cum_detail_token(payload: Mapping[str, Any] | None) -> str:
     return "nonzero"
 
 
+def _detail_tree_token(payload: Mapping[str, Any]) -> str:
+    """The ``executions-present``-only `` tree={...}`` suffix for
+    :func:`_body_detail`, capped at ``_DETAIL_TREE_MAX_CHARS`` (SP-2 I2).
+
+    Names-only, per :func:`_safe_key_tree` -- the tree is an OPEN set of
+    NAMES (sanitised per SP-2 I0), never a value. The truncation marker is
+    emitted OUTSIDE the closing brace (RV3-A13): a tree this long already
+    contains its own per-key truncation markers (from
+    ``reports._safe_key_name``), so the 2048-char slice can land mid-key,
+    producing a SECOND, equally authentic truncation immediately before
+    this one -- both are outside the structure they truncate, and neither
+    is forged (AM-6).
+    """
+    tree = _safe_key_tree(payload)
+    if len(tree) <= _DETAIL_TREE_MAX_CHARS:
+        return f" tree={{{tree}}}"
+    return f" tree={{{tree[:_DETAIL_TREE_MAX_CHARS]}}} (truncated from {len(tree)} characters)"
+
+
 def _body_detail(
     response: VenueResponse,
     payload: Mapping[str, Any] | None,
@@ -857,10 +876,14 @@ def _body_detail(
     Reports shape and length only -- never the body content -- so the venue's
     answer is recoverable from the log without risking a leaked secret or
     account detail embedded in an adversarial or malformed body. Closed-set
-    tokens only: status, body_kind, rpc_code, body_len, state, cum.
+    tokens only: status, body_kind, rpc_code, body_len, state, cum -- plus
+    (SP-2 I2) an OPEN set of sanitised NAMES, never a value, in the ``tree=``
+    suffix that appears ONLY on ``executions-present`` (so a SUCCESSFUL fill
+    is captured too, not only an ambiguous one -- T3).
     """
     body_len = len(response.body)
     rpc_code: int | None = None
+    tree_token = ""
     if payload is None:
         body_kind = "unparseable"
     elif isinstance(payload, Mapping) and _is_google_rpc_status(payload) and order_id is None:
@@ -873,6 +896,7 @@ def _body_detail(
             body_kind = "empty-executions"
         elif isinstance(executions, list) and executions:
             body_kind = "executions-present"
+            tree_token = _detail_tree_token(payload)
         else:
             body_kind = "unexpected-shape"
     else:
@@ -882,6 +906,7 @@ def _body_detail(
         f"status={response.status} body_kind={body_kind} "
         f"rpc_code={rpc_code_str} body_len={body_len} "
         f"state={_state_detail_token(payload)} cum={_cum_detail_token(payload)}"
+        f"{tree_token}"
     )
 
 

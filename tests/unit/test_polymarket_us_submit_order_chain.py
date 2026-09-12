@@ -1470,9 +1470,13 @@ def test_every_classified_kind_sets_body_kind_and_body_len() -> None:
     durable_response = VenueResponse(status=200, headers={}, body=durable_body)
     durable_outcome = classify_create_order_outcome(durable_response, **classify_kw)
     assert durable_outcome.kind == KIND_ACCEPT_FILL
+    # SP-2 I2: `executions-present` now also carries a names-only,
+    # sanitised body key tree (T3 -- a SUCCESSFUL fill is captured too).
+    durable_payload = json.loads(durable_body)
     assert durable_outcome.detail == (
         f"status=200 body_kind=executions-present rpc_code=none "
         f"body_len={len(durable_body)} state=absent cum=absent"
+        f"{submit_chain._detail_tree_token(durable_payload)}"
     )
 
     unexpected_body = json.dumps({"not": "an-order"}).encode()
@@ -2106,3 +2110,123 @@ def test_a_fill_parse_error_is_capped_at_birth() -> None:
     assert result is None
     assert len(errors) == 1
     assert len(errors[0]) <= submit_chain._DETAIL_TREE_MAX_CHARS + 60
+
+
+# ---------------------------------------------------------------------------
+# SP-2 I2 -- `_body_detail` emits a capped body key tree on
+# `executions-present` only (H2)
+# ---------------------------------------------------------------------------
+
+
+def test_an_executions_present_body_with_no_selectable_leg_still_reports_the_body_key_tree() -> (
+    None
+):
+    """H2: even when NO leg is selectable (a cancel acknowledgement, say),
+    the body's own key tree is visible in `detail` -- key NAME present,
+    VALUE absent."""
+    slug = str(build_instrument().raw_symbol)
+    order = build_order(slug)
+    non_fill_execution = build_execution(order)
+    non_fill_execution["type"] = "EXECUTION_TYPE_CANCELED"
+    non_fill_execution["unicornDriftField"] = "SECRET_VALUE_77"
+    body = json.dumps({"id": order["id"], "executions": [non_fill_execution]}).encode("utf-8")
+    response = VenueResponse(status=200, headers={}, body=body)
+
+    outcome = classify_create_order_outcome(
+        response,
+        instrument=build_instrument(),
+        account_id=ACCOUNT_ID,
+        ts_init=TS_INIT,
+    )
+
+    assert outcome.kind == KIND_AMBIGUOUS
+    assert outcome.detail is not None
+    assert "tree=" in outcome.detail
+    assert "unicornDriftField" in outcome.detail
+    assert "SECRET_VALUE_77" not in outcome.detail
+
+
+def test_the_body_key_tree_token_is_capped_and_declares_its_truncation() -> None:
+    """AC-9 + RV3-A13 (AM-6): the tree token is capped once, at
+    `_DETAIL_TREE_MAX_CHARS`, with the marker OUTSIDE the closing brace --
+    even when the 2048-char slice lands mid-key inside an already
+    per-key-truncated name, producing TWO authentic, non-forged
+    truncations (both disqualifying under AC-19, never forgery)."""
+    huge_payload: dict[str, Any] = {f"driftField{i}" + "y" * 100: "value" for i in range(60)}
+
+    token = submit_chain._detail_tree_token(huge_payload)
+    full_tree = submit_chain._safe_key_tree(huge_payload)
+    assert len(full_tree) > submit_chain._DETAIL_TREE_MAX_CHARS
+
+    marker = f" (truncated from {len(full_tree)} characters)"
+    assert token.startswith(" tree={")
+    assert token.endswith(marker)
+    pre_marker = token[: -len(marker)]
+    assert pre_marker.endswith("}")
+
+
+def test_body_detail_tree_token_appears_only_on_executions_present() -> None:
+    """AC-11: `tree=` appears ONLY on `executions-present`; every other
+    body_kind's detail carries no tree token at all."""
+    instrument = build_instrument()
+    classify_kw = {
+        "instrument": instrument,
+        "account_id": ACCOUNT_ID,
+        "ts_init": TS_INIT,
+    }
+
+    unparseable = VenueResponse(status=200, headers={}, body=b"not json")
+    unparseable_detail = classify_create_order_outcome(unparseable, **classify_kw).detail
+    assert unparseable_detail is not None
+    assert "tree=" not in unparseable_detail
+
+    reject_response = VenueResponse(status=400, headers={}, body=_status_reject_body())
+    reject_detail = classify_create_order_outcome(reject_response, **classify_kw).detail
+    assert reject_detail is not None
+    assert "tree=" not in reject_detail
+
+    empty_exec_body = json.dumps({"id": "ord-amb", "executions": []}).encode()
+    empty_exec_response = VenueResponse(status=200, headers={}, body=empty_exec_body)
+    empty_exec_detail = classify_create_order_outcome(empty_exec_response, **classify_kw).detail
+    assert empty_exec_detail is not None
+    assert "tree=" not in empty_exec_detail
+
+    unexpected_body = json.dumps({"not": "an-order"}).encode()
+    unexpected_response = VenueResponse(status=200, headers={}, body=unexpected_body)
+    unexpected_detail = classify_create_order_outcome(unexpected_response, **classify_kw).detail
+    assert unexpected_detail is not None
+    assert "tree=" not in unexpected_detail
+
+    durable_body = _durable_accept_body(str(instrument.raw_symbol))
+    durable_response = VenueResponse(status=200, headers={}, body=durable_body)
+    durable_detail = classify_create_order_outcome(durable_response, **classify_kw).detail
+    assert durable_detail is not None
+    assert "tree=" in durable_detail
+
+
+def test_a_recursion_error_in_the_key_tree_is_contained_in_the_detail(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """AR-N2: `_safe_key_tree` is belt-and-braces containment for this
+    module's own two call sites -- proven by perturbing `_key_tree` to
+    raise, never by pretending the depth bound itself fails."""
+
+    def _raises(payload: Mapping[str, Any], **_: Any) -> str:
+        raise RecursionError("forced for the test")
+
+    monkeypatch.setattr(submit_chain, "_key_tree", _raises)
+
+    slug = str(build_instrument().raw_symbol)
+    durable_body = _durable_accept_body(slug)
+    durable_response = VenueResponse(status=200, headers={}, body=durable_body)
+
+    outcome = classify_create_order_outcome(
+        durable_response,
+        instrument=build_instrument(),
+        account_id=ACCOUNT_ID,
+        ts_init=TS_INIT,
+    )
+
+    assert outcome.kind == KIND_ACCEPT_FILL
+    assert outcome.detail is not None
+    assert "<tree unavailable: nesting exceeded>" in outcome.detail
