@@ -125,6 +125,17 @@ _REARM_MIN_DELAY_NS: Final[int] = _REARM_MIN_DELAY_SECS * 1_000_000_000
 #: Resolution F: a genuine fill freezes this counter (`is_consumed` short-
 #: circuits `_hunt_tick` before the re-arm gate is ever consulted again).
 _MAX_STATION_DAY_ATTEMPTS: Final[int] = 3
+#: R-8 (2026-09-12, N-ceiling): how long an eof-complete page's absence of
+#: a candidate slug may be read as FLAT before it degrades to UNKNOWN. A
+#: coordinator ceiling, not a measurement -- justified against the native
+#: boot path: `reconciliation_startup_delay_secs` default 10.0
+#: (`live/config.py:199`) + `timeout_reconciliation` default 30.0
+#: (`system/config.py:128`) => worst-case write->read gap is ~40s plus
+#: engine-connect/portfolio-init awaits. 600s is ~15x worst case and far
+#: below any previous-process record (hours). Build-side (PREREG v3 §7
+#: pins exactly two operator controls; this is not one of them).
+_STARTUP_EVIDENCE_MAX_AGE_SECS: Final[int] = 600
+_STARTUP_EVIDENCE_MAX_AGE_NS: Final[int] = _STARTUP_EVIDENCE_MAX_AGE_SECS * 1_000_000_000
 
 Trigger = Literal["quote_tick", "on_data", "depth"]
 Source = Literal["quote", "depth"]
@@ -358,6 +369,7 @@ class ContinuousRungHoldStrategy(Strategy):
         for fill_record in fills:
             self._consume_trial_from_fill_record(fill_record)
 
+        now_ns = self.clock.timestamp_ns()
         for iid, facts in self._facts.items():
             station = facts.settlement_station
             climate_day_key = facts.climate_day.isoformat()
@@ -377,7 +389,11 @@ class ContinuousRungHoldStrategy(Strategy):
                 net_position = startup_evidence_position_for(evidence, slug)
                 slug_ok = net_position is not None and net_position <= 0
             else:
-                slug_ok = startup_evidence_confirms_absent_flat(evidence, slug)
+                slug_ok = startup_evidence_confirms_absent_flat(
+                    evidence, slug,
+                    now_ns=now_ns,
+                    max_age_ns=_STARTUP_EVIDENCE_MAX_AGE_NS,
+                )
             if not slug_ok:
                 self.log.error(
                     f"continuous_rung_hold: venue position for {iid} is a "
@@ -775,11 +791,21 @@ class ContinuousRungHoldStrategy(Strategy):
             return False
         slug = InstrumentId.from_str(instrument_id).symbol.value
         # R-8 (2026-09-12): the same rule as `_run_never_arm_walk` (site 1),
-        # through the same helpers and the same freshness ceiling.
+        # through the same helpers and the same freshness ceiling. R3-B1:
+        # freshness reads the WALL clock INSIDE this method -- NOT the
+        # `now_ns` parameter above, which is venue EVENT time
+        # (`_hunt_tick:587`, `snapshot.ts_event`) and keeps its only
+        # existing use, the delay-floor comparison above. Reusing `now_ns`
+        # here would understate the age under feed lag and silently extend
+        # the ceiling (a fail-OPEN, HB7-4).
         if startup_evidence_lists_slug(evidence, slug):
             net_position = startup_evidence_position_for(evidence, slug)
             return net_position is not None and net_position <= 0
-        return startup_evidence_confirms_absent_flat(evidence, slug)
+        return startup_evidence_confirms_absent_flat(
+            evidence, slug,
+            now_ns=self.clock.timestamp_ns(),
+            max_age_ns=_STARTUP_EVIDENCE_MAX_AGE_NS,
+        )
 
     def on_order_denied(self, event: OrderDenied) -> None:
         """SAFETY C1 (plan rev 6.1): clear IN_FLIGHT for a WAIT-class deny.

@@ -756,7 +756,13 @@ def startup_evidence_lists_slug(evidence: dict[str, object] | None, slug: str) -
     return False
 
 
-def startup_evidence_confirms_absent_flat(evidence: dict[str, object] | None, slug: str) -> bool:
+def startup_evidence_confirms_absent_flat(
+    evidence: dict[str, object] | None,
+    slug: str,
+    *,
+    now_ns: int,
+    max_age_ns: int,
+) -> bool:
     """R-8 (2026-09-12, ``docs/core/PROGRESS.md``): ``True`` only when a
     candidate ``slug`` ABSENT from the startup positions page is confirmed
     FLAT rather than UNKNOWN.
@@ -775,8 +781,18 @@ def startup_evidence_confirms_absent_flat(evidence: dict[str, object] | None, sl
     ``positions`` field is a list; NO element of it is a non-mapping row
     (the absent-branch scan must be exhaustive for an absence to mean
     anything -- a present-branch match is allowed to skip garbage rows,
-    but the absent branch may not, E13); and ``slug`` is genuinely absent,
-    not merely unmatched because of a malformed row.
+    but the absent branch may not, E13); ``slug`` is genuinely absent, not
+    merely unmatched because of a malformed row; and the record is FRESH.
+
+    **Unit contract (R2-B1, L-2):** ``now_ns`` and the record's ``ts_ns``
+    are BOTH wall-clock epoch nanoseconds. ``ts_ns`` is written by the exec
+    client's own ``self._clock.timestamp_ns()`` (``exec/client.py:2465``).
+    A caller that passes venue EVENT time here is a defect -- the
+    subtraction would understate the age under feed lag and silently
+    extend the ceiling (a fail-OPEN). ``now_ns`` and ``max_age_ns`` are
+    required keyword-only with NO defaults (L-28): this helper is
+    clock-free and measures nothing about its own caller's timing
+    discipline by having one.
     """
     if not startup_evidence_permits_arm(evidence):
         return False
@@ -787,7 +803,13 @@ def startup_evidence_confirms_absent_flat(evidence: dict[str, object] | None, sl
     for row in positions:
         if not isinstance(row, dict):
             return False
-    return not startup_evidence_lists_slug(evidence, slug)
+    if startup_evidence_lists_slug(evidence, slug):
+        return False
+    ts = evidence.get("ts_ns")
+    if not isinstance(ts, int) or isinstance(ts, bool):
+        return False
+    age_ns = now_ns - ts
+    return 0 <= age_ns <= max_age_ns
 
 
 def open_trial_day_latch(

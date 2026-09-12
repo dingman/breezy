@@ -505,7 +505,7 @@ def test_never_arm_walk_arms_when_an_eof_complete_page_omits_the_slug(
     market is ABSENT by construction -- item 5's PASS state was unreachable
     for any first trade. An absent slug on a fresh, eof-complete,
     non-refused, fill-walk-complete page is confirmed FLAT, not UNKNOWN."""
-    evidence = {**_PERMISSIVE_EVIDENCE, "positions": []}
+    evidence = {**_PERMISSIVE_EVIDENCE, "positions": [], "ts_ns": WINDOW_OPEN_NS}
     strategy = _register_and_start(
         store_path=store_path,
         instruments=(interior_instrument,),
@@ -541,7 +541,7 @@ def test_rearm_permitted_when_an_eof_complete_page_omits_the_slug(
     freshness ceiling -- an absent slug on a fresh eof-complete page is
     confirmed FLAT, not UNKNOWN. Supersedes three-seam Slice 4 review
     item 5 for the re-arm gate (HB7)."""
-    evidence = {**_PERMISSIVE_EVIDENCE, "positions": []}
+    evidence = {**_PERMISSIVE_EVIDENCE, "positions": [], "ts_ns": WINDOW_OPEN_NS}
     strategy = _register_and_start(
         store_path=store_path,
         instruments=(interior_instrument,),
@@ -552,6 +552,63 @@ def test_rearm_permitted_when_an_eof_complete_page_omits_the_slug(
         attempts=1, last_attempt_ns=0, now_ns=10 * 365 * 24 * 3600 * 1_000_000_000,
     )
     assert permitted is True
+
+
+def test_rearm_denied_when_an_omitting_page_is_stale(
+    store_path: Path, interior_instrument: BinaryOption,
+) -> None:
+    """R2-B1/AC-6 (C2, HB7-2): the same freshness bound as the never-arm
+    walk, applied to the re-arm gate."""
+    evidence = {
+        **_PERMISSIVE_EVIDENCE,
+        "positions": [],
+        "ts_ns": WINDOW_OPEN_NS - 601 * 1_000_000_000,
+    }
+    strategy = _register_and_start(
+        store_path=store_path,
+        instruments=(interior_instrument,),
+        position_evidence_reader=lambda: evidence,
+    )
+    permitted = strategy._rearm_permitted(
+        STATION, CLIMATE_DAY.isoformat(), str(INTERIOR_ID),
+        attempts=1, last_attempt_ns=0, now_ns=10 * 365 * 24 * 3600 * 1_000_000_000,
+    )
+    assert permitted is False
+
+
+def test_rearm_denied_when_a_lagging_ts_event_would_have_extended_the_ceiling(
+    store_path: Path, interior_instrument: BinaryOption,
+) -> None:
+    """R2-B1/R3-B1 (HB7-4): the freshness clause must read the WALL clock
+    (`self.clock.timestamp_ns()`) INSIDE `_rearm_permitted`, never the
+    venue EVENT time passed in as `now_ns` (which keeps its only existing
+    use, the delay-floor comparison). A lagging `ts_event` must NOT be
+    able to extend the 600s ceiling: evidence is 900s stale by wall
+    clock, but only 300s stale by the (wrongly lagging) event-time
+    `now_ns` -- an event-time subtraction would wrongly PERMIT; the
+    wall-clock read must DENY. Signature unchanged (R3-B1): same
+    six-argument shape the floor tests use."""
+    from nautilus_trader.common.component import TestClock
+
+    wall = WINDOW_OPEN_NS  # `_register(clock=...)` sets the clock to this.
+    clock = TestClock()
+    evidence = {
+        **_PERMISSIVE_EVIDENCE,
+        "positions": [],
+        "ts_ns": wall - 900 * 1_000_000_000,
+    }
+    strategy = _register_and_start(
+        store_path=store_path,
+        instruments=(interior_instrument,),
+        clock=clock,
+        position_evidence_reader=lambda: evidence,
+    )
+    lagging_event_time_now_ns = wall - 600 * 1_000_000_000
+    permitted = strategy._rearm_permitted(
+        STATION, CLIMATE_DAY.isoformat(), str(INTERIOR_ID),
+        attempts=1, last_attempt_ns=0, now_ns=lagging_event_time_now_ns,
+    )
+    assert permitted is False
 
 
 def test_on_start_with_a_permit_arms_and_subscribes_when_the_page_omits_the_slug(
@@ -566,7 +623,7 @@ def test_on_start_with_a_permit_arms_and_subscribes_when_the_page_omits_the_slug
     arms and `on_start` reaches `subscribe_data` without stopping."""
     from breezy.strategy.current_rung_hold.config import CurrentRungHoldConfig
 
-    evidence = {**_PERMISSIVE_EVIDENCE, "positions": []}
+    evidence = {**_PERMISSIVE_EVIDENCE, "positions": [], "ts_ns": WINDOW_OPEN_NS}
     cfg = CurrentRungHoldConfig(instrument_ids=(interior_instrument.id,))
     strategy = ContinuousRungHoldStrategy(
         cfg,
@@ -579,6 +636,26 @@ def test_on_start_with_a_permit_arms_and_subscribes_when_the_page_omits_the_slug
     strategy.start()
     assert strategy.is_running
     assert strategy.position_events.total() == 0
+
+
+def test_never_arm_walk_halts_when_an_omitting_page_is_stale(
+    store_path: Path, interior_instrument: BinaryOption,
+) -> None:
+    """R2-B1/AC-6 (C2): an eof-complete page omitting the candidate slug,
+    but written more than the freshness ceiling ago, must NOT be read as
+    flat -- absence only carries meaning while the record is fresh."""
+    evidence = {
+        **_PERMISSIVE_EVIDENCE,
+        "positions": [],
+        "ts_ns": WINDOW_OPEN_NS - 601 * 1_000_000_000,
+    }
+    strategy = _register_and_start(
+        store_path=store_path,
+        instruments=(interior_instrument,),
+        position_evidence_reader=lambda: evidence,
+    )
+    assert strategy._run_never_arm_walk() is False
+    assert strategy.position_events.count("unreconciled_long_no_fill") == 1
 
 
 def test_never_arm_walk_unreadable_fill_index_halts(

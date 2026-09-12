@@ -759,44 +759,64 @@ class TestStartupEvidenceAbsentIsFlat:
 
     # -- H1-H5: confirms_absent_flat gates on startup_evidence_permits_arm --
 
+    _MAX_AGE_NS = 600_000_000_000
+
     def test_confirms_absent_flat_true_when_absent_and_complete(self) -> None:  # H1
         evidence = self._complete_evidence()
-        assert startup_evidence_confirms_absent_flat(evidence, "mine") is True
+        assert startup_evidence_confirms_absent_flat(
+            evidence, "mine", now_ns=NOW_NS, max_age_ns=self._MAX_AGE_NS,
+        ) is True
 
     def test_confirms_absent_flat_false_when_not_eof_complete(self) -> None:  # H2
         evidence = self._complete_evidence(eof_complete=False)
-        assert startup_evidence_confirms_absent_flat(evidence, "mine") is False
+        assert startup_evidence_confirms_absent_flat(
+            evidence, "mine", now_ns=NOW_NS, max_age_ns=self._MAX_AGE_NS,
+        ) is False
 
     def test_confirms_absent_flat_false_when_position_read_refused(self) -> None:  # H3
         evidence = self._complete_evidence(position_read_refused=True)
-        assert startup_evidence_confirms_absent_flat(evidence, "mine") is False
+        assert startup_evidence_confirms_absent_flat(
+            evidence, "mine", now_ns=NOW_NS, max_age_ns=self._MAX_AGE_NS,
+        ) is False
 
     def test_confirms_absent_flat_false_when_schema_version_is_not_one(self) -> None:  # H4
         evidence = self._complete_evidence(v=2)
-        assert startup_evidence_confirms_absent_flat(evidence, "mine") is False
+        assert startup_evidence_confirms_absent_flat(
+            evidence, "mine", now_ns=NOW_NS, max_age_ns=self._MAX_AGE_NS,
+        ) is False
 
     def test_confirms_absent_flat_false_when_fill_walk_incomplete(self) -> None:  # H5
         evidence = self._complete_evidence(fill_walk_complete=False)
-        assert startup_evidence_confirms_absent_flat(evidence, "mine") is False
+        assert startup_evidence_confirms_absent_flat(
+            evidence, "mine", now_ns=NOW_NS, max_age_ns=self._MAX_AGE_NS,
+        ) is False
 
     # -- H9-H12: absent-branch exhaustiveness (HB4/E13) --
 
     def test_confirms_absent_flat_false_when_positions_key_is_missing(self) -> None:  # H9
         evidence = self._complete_evidence()
         del evidence["positions"]
-        assert startup_evidence_confirms_absent_flat(evidence, "mine") is False
+        assert startup_evidence_confirms_absent_flat(
+            evidence, "mine", now_ns=NOW_NS, max_age_ns=self._MAX_AGE_NS,
+        ) is False
 
     def test_confirms_absent_flat_false_when_positions_is_not_a_list(self) -> None:  # H10
         evidence = self._complete_evidence(positions="garbage")
-        assert startup_evidence_confirms_absent_flat(evidence, "mine") is False
+        assert startup_evidence_confirms_absent_flat(
+            evidence, "mine", now_ns=NOW_NS, max_age_ns=self._MAX_AGE_NS,
+        ) is False
 
     def test_confirms_absent_flat_false_on_any_non_mapping_row(self) -> None:  # H11
         evidence = self._complete_evidence(positions=["garbage"])
-        assert startup_evidence_confirms_absent_flat(evidence, "mine") is False
+        assert startup_evidence_confirms_absent_flat(
+            evidence, "mine", now_ns=NOW_NS, max_age_ns=self._MAX_AGE_NS,
+        ) is False
 
     def test_confirms_absent_flat_false_when_slug_is_listed(self) -> None:  # H12
         evidence = self._complete_evidence(positions=[{"slug": "mine", "net_position": "0"}])
-        assert startup_evidence_confirms_absent_flat(evidence, "mine") is False
+        assert startup_evidence_confirms_absent_flat(
+            evidence, "mine", now_ns=NOW_NS, max_age_ns=self._MAX_AGE_NS,
+        ) is False
 
     # -- H14 (HB3): round-trips the REAL producer object, not a hand-built dict --
 
@@ -809,7 +829,32 @@ class TestStartupEvidenceAbsentIsFlat:
                 fill_walk_complete=True, positions=(),
             ).to_bytes(),
         )
-        assert startup_evidence_confirms_absent_flat(evidence, "never-traded-slug") is True
+        assert startup_evidence_confirms_absent_flat(
+            evidence, "never-traded-slug", now_ns=NOW_NS, max_age_ns=self._MAX_AGE_NS,
+        ) is True
+
+    # -- H6-H8 (C2, R2-B1/L-2): freshness clause, wall-clock units --
+
+    def test_confirms_absent_flat_false_when_evidence_is_stale(self) -> None:  # H6
+        evidence = self._complete_evidence(ts_ns=NOW_NS)
+        assert startup_evidence_confirms_absent_flat(
+            evidence, "mine", now_ns=NOW_NS + self._MAX_AGE_NS + 1, max_age_ns=self._MAX_AGE_NS,
+        ) is False
+
+    def test_confirms_absent_flat_false_when_ts_ns_is_in_the_future(self) -> None:  # H7
+        evidence = self._complete_evidence(ts_ns=NOW_NS + 1)
+        assert startup_evidence_confirms_absent_flat(
+            evidence, "mine", now_ns=NOW_NS, max_age_ns=self._MAX_AGE_NS,
+        ) is False
+
+    @pytest.mark.parametrize("bad_ts", [None, True, "1700000000000000000"])
+    def test_confirms_absent_flat_false_when_ts_ns_is_malformed(
+        self, bad_ts: object,
+    ) -> None:  # H8
+        evidence = self._complete_evidence(ts_ns=bad_ts)
+        assert startup_evidence_confirms_absent_flat(
+            evidence, "mine", now_ns=NOW_NS, max_age_ns=self._MAX_AGE_NS,
+        ) is False
 
 
 def _fill_record(
