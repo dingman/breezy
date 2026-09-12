@@ -2277,3 +2277,36 @@ def test_a_body_too_deep_to_parse_classifies_as_unparseable_instead_of_raising()
     assert outcome.kind == KIND_AMBIGUOUS
     assert outcome.detail is not None
     assert "body_kind=unparseable" in outcome.detail
+
+
+# ---------------------------------------------------------------------------
+# I6 (CRITICAL, security-reviewer BLOCK) -- a non-hashable execution type
+# is not a fill leg, never a crash
+# ---------------------------------------------------------------------------
+
+
+def test_a_non_hashable_execution_type_is_not_a_fill_leg_never_a_crash() -> None:
+    """I6: `_fill_type_executions`'s `item.get("type") in _FILL_EXECUTION_TYPES`
+    membership test raises `TypeError: unhashable type` unguarded when a
+    venue row's `type` is a dict/list, escaping `classify_create_order_
+    outcome` -> `_submit_order` with no refusal and no log -- the L-37/
+    AR-N1 class I2b exists to close. A row like this is not a fill leg (its
+    type is not a fill type by construction); it classifies like any other
+    no-selectable-leg executions-present body, never crashes."""
+    slug = str(build_instrument().raw_symbol)
+    order = build_order(slug)
+    weird_execution = build_execution(order)
+    weird_execution["type"] = {"nested": 1}
+    body = json.dumps({"id": order["id"], "executions": [weird_execution]}).encode("utf-8")
+    response = VenueResponse(status=200, headers={}, body=body)
+
+    outcome = classify_create_order_outcome(
+        response,
+        instrument=build_instrument(),
+        account_id=ACCOUNT_ID,
+        ts_init=TS_INIT,
+    )
+
+    assert outcome.kind == KIND_AMBIGUOUS
+    assert outcome.detail is not None
+    assert "tree=" in outcome.detail

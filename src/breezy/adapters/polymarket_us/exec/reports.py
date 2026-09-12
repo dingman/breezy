@@ -1135,7 +1135,13 @@ def parse_fill_report(
     )
 
     execution_type = _require(execution, "type", context=context)
-    if execution_type not in _FILL_EXECUTION_TYPES:
+    # I6 (CRITICAL, same class as `submit_chain._fill_type_executions`):
+    # `execution_type` is a bare venue-controlled JSON value, so a direct
+    # caller of this function (not only the create-path pre-filter, which
+    # normally screens `type` first) could hand it a dict/list. `isinstance`
+    # is checked FIRST so the frozenset membership test never sees an
+    # unhashable value.
+    if not (isinstance(execution_type, str) and execution_type in _FILL_EXECUTION_TYPES):
         raise ExecutionReportMappingError(
             f"{context} carries execution type {_name_value(execution_type)}, which is not "
             f"one of ({', '.join(sorted(_FILL_EXECUTION_TYPES))}); refusing to report a "

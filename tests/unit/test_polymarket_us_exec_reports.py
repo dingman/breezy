@@ -1268,3 +1268,24 @@ def test_the_create_path_cannot_reach_the_execution_type_refusal(
             report_id=REPORT_ID,
             ts_init=TS_INIT,
         )
+
+
+def test_a_non_hashable_execution_type_is_refused_not_a_crash(
+    execution: dict[str, Any], instrument: BinaryOption
+) -> None:
+    """I6 enumeration: `parse_fill_report`'s own execution-type refusal
+    (`execution_type not in _FILL_EXECUTION_TYPES`) is the SAME hazard class
+    as `_fill_type_executions`'s pre-filter -- a dict/list `type` raises
+    `TypeError: unhashable type` on the frozenset membership test, uncaught,
+    for any DIRECT caller of `parse_fill_report` (this module's own public
+    surface, not only the create-path pre-filter that normally screens
+    `type` first). Refused, never a crash."""
+    with pytest.raises(ExecutionReportMappingError) as excinfo:
+        parse_fill_report(
+            {**execution, "type": {"nested": 1}},
+            instrument=instrument,
+            account_id=ACCOUNT_ID,
+            report_id=REPORT_ID,
+            ts_init=TS_INIT,
+        )
+    assert "dict" in str(excinfo.value)

@@ -465,6 +465,15 @@ def _fill_type_executions(payload: Mapping[str, Any]) -> tuple[Mapping[str, Any]
 
     A CANCELED/REJECTED/EXPIRED/NEW/REPLACE/DONE_FOR_DAY row -- or one with no
     ``type`` at all -- is excluded here, so its commission is never summed.
+
+    I6 (CRITICAL): ``type`` is a bare venue-controlled JSON value, so it may
+    be a dict or list -- ``x in <frozenset>`` raises ``TypeError: unhashable
+    type`` on either, uncaught, escaping ``classify_create_order_outcome``
+    and ``_submit_order`` with no refusal and no log (the L-37/AR-N1 class
+    I2b exists to close). ``isinstance(..., str)`` is checked FIRST, short-
+    circuiting the membership test before it ever sees an unhashable value:
+    a non-string ``type`` is simply not a fill-type row, exactly like a
+    string that is not one of the two fill types.
     """
     executions = payload.get("executions")
     if not isinstance(executions, list):
@@ -472,7 +481,9 @@ def _fill_type_executions(payload: Mapping[str, Any]) -> tuple[Mapping[str, Any]
     return tuple(
         item
         for item in executions
-        if isinstance(item, Mapping) and item.get("type") in _FILL_EXECUTION_TYPES
+        if isinstance(item, Mapping)
+        and isinstance((execution_type := item.get("type")), str)
+        and execution_type in _FILL_EXECUTION_TYPES
     )
 
 
