@@ -1064,7 +1064,10 @@ def main(argv: Sequence[str] | None = None) -> int:
         # vocabulary from `strategy_refusals` above, never conflated.
         print(f"strategy diagnostics: {dict(sorted(result.strategy_diagnostics.items()))}")
         # New stdout line, printed ONLY for the continuous arm -- the v2
-        # golden transcript stays byte-identical (increment C spec).
+        # golden transcript stays byte-identical except the plan-mandated
+        # `live_store_guard` line (increment E's `GuardReport.render()`,
+        # which `main` prints unconditionally for every arm; increment C
+        # spec only ever covered this "strategy position events" line).
         if strategy_cls is ContinuousRungHoldBacktestStrategy:
             print(
                 "strategy position events: "

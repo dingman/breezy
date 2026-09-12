@@ -1144,7 +1144,7 @@ def test_a_depth_only_window_is_covered_for_the_continuous_arm(driver: ModuleTyp
     )  # must not raise
 
 
-def test_a_quote_only_instrument_with_no_in_window_depth_is_refused_for_the_continuous_arm(
+def test_a_quote_only_window_with_no_in_window_depth_is_refused_for_the_continuous_arm(
     driver: ModuleType,
 ) -> None:
     """L-24 NEGATIVE: an in-window QuoteTick with NO in-window executable
@@ -1394,7 +1394,9 @@ def test_the_default_strategy_is_still_the_v2_backtest_subclass(
     """Rev 2 + AM-14: no `--strategy` flag resolves the SAME v2 subclass and
     latch prefix as before this increment, and the new "strategy position
     events" stdout line (printed ONLY for the continuous arm) never
-    appears -- the v2 golden transcript stays byte-identical."""
+    appears -- the v2 golden transcript stays byte-identical except the
+    plan-mandated `live_store_guard` line (increment E's
+    `GuardReport.render()`, printed unconditionally for every arm)."""
     capsys.readouterr()
     captured = _run_main_with_stubbed_capture(
         driver, tmp_path, strategy=None, monkeypatch=monkeypatch,

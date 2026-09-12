@@ -301,7 +301,10 @@ class ContinuousRungHoldStrategy(Strategy):
         Base body: ``bool(self._order_submission_permit is not None)`` --
         identical to the raw predicate every one of the five call sites read
         directly before this extraction (L-2 unit line: EQUAL for every
-        non-subclass instance; evaluation order preserved at :302).
+        non-subclass instance; evaluation order preserved at every site --
+        `on_start`, `_hunt_tick`'s re-arm gate, the attempt-record and
+        in-flight-clear sites, and `_maybe_submit` -- never at a line
+        number, which shifts as the module changes).
         Increment B's ``ContinuousRungHoldBacktestStrategy`` overrides this
         to gate on a private backtest-only flag instead, while never holding
         a real ``OrderSubmissionPermit`` (PERMIT ISOLATION).
@@ -711,6 +714,10 @@ class ContinuousRungHoldStrategy(Strategy):
             return
         # Phase 0 never arms (see `on_start`'s matching guard) -- the re-arm
         # gate and its attempt counter are Phase-1-only groundwork.
+        # defence in depth -- attempts > 0 implies armed (guard at the
+        # attempt increment); removal is behaviourally inert, pinned by
+        # test_an_unarmed_strategy_never_records_an_attempt_across_many_
+        # eligible_depth_frames.
         if self._submission_armed():
             attempts, last_attempt_ns = self._latch.attempt_state(station, climate_day_key)
             if attempts > 0 and not self._rearm_permitted(

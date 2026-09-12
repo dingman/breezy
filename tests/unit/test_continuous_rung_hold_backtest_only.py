@@ -378,12 +378,8 @@ def test_a_wait_class_deny_lets_a_later_frame_produce_a_SECOND_attempt(
 
 @pytest.mark.xfail(
     reason=(
-        "AM-8 (F0 row 6, R11): SimulatedExchange.process-vs-next-depth-frame "
-        "ordering was not measured in this implementation pass (no real "
-        "BacktestEngine harness was built here to observe it) -- marked "
-        "UNSETTLED per the plan's own escape hatch rather than asserted on "
-        "unmeasured ground. The at-most-one INVARIANT test above already "
-        "covers the safety property regardless of the interleave order."
+        "F0 row 6: fill-before-next-frame interleave NOT measured in this "
+        "pass; coordinator gates increment F on measuring it"
     ),
     strict=True,
 )
