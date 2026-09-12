@@ -66,7 +66,7 @@ from __future__ import annotations
 import logging
 import sys
 from collections.abc import Callable, Mapping
-from typing import Protocol, TextIO
+from typing import Any, Protocol, TextIO
 
 from nautilus_trader.config import TradingNodeConfig
 from nautilus_trader.live.node import TradingNode
@@ -81,6 +81,8 @@ from breezy.adapters.polymarket_us.feed_fault import (
     fatal_feed_fault,
 )
 from breezy.persistence.catalog import CatalogPathError
+from breezy.runtime.composition import _close_alert_sink
+from breezy.runtime.health import AlertSink, resolve_alert_sink
 from breezy.runtime.logging_bridge import install as install_logging_bridge
 from breezy.runtime.logging_bridge import uninstall as uninstall_logging_bridge
 from breezy.runtime.node_config import (
@@ -96,6 +98,7 @@ from breezy.runtime.quote_tape_disk_monitor import (
 from breezy.runtime.quote_tape_disk_monitor import (
     disk_usage_probe as default_disk_usage_probe,
 )
+from breezy.runtime.quote_tape_gap_watch import install_quote_tape_gap_watch
 from breezy.runtime.settings import (
     PolymarketUSQuoteTapeSettings,
     SettingsError,
@@ -121,7 +124,15 @@ _CONFIG_ERRORS: tuple[type[BaseException], ...] = (
 
 
 class Node(Protocol):
-    """The `TradingNode` surface this module drives."""
+    """The `TradingNode` surface this module drives.
+
+    SP-6 A6 adds ``kernel``, read only AFTER ``build()`` to install the
+    quote-tape gap watch onto its ``msgbus`` -- the same untyped (``Any``)
+    idiom ``trade_cli.Node`` uses for the same reason: ``NautilusKernel``
+    ships no stub a hand-written Protocol could conform to.
+    """
+
+    kernel: Any
 
     def add_data_client_factory(self, name: str, factory: type) -> None: ...
 
@@ -174,13 +185,25 @@ def _exit_code_for_completed_run(stderr: TextIO) -> int:
     return EXIT_RUNTIME_ERROR
 
 
-def _run_node(config: TradingNodeConfig, node_factory: NodeFactory, stderr: TextIO) -> int:
+def _run_node(
+    config: TradingNodeConfig,
+    node_factory: NodeFactory,
+    stderr: TextIO,
+    *,
+    alert_sink: AlertSink,
+) -> int:
     """Build, run and ALWAYS dispose the node. Never raises.
 
     ``add_data_client_factory`` takes the registration NAME and the factory
     CLASS (``live/node.py:230``), and that name must equal the key used in
     ``TradingNodeConfig.data_clients`` -- otherwise the builder resolves
     nothing and the process runs happily, recording an empty tape.
+
+    SP-6 A6: after ``build()``, ``install_quote_tape_gap_watch`` subscribes
+    onto ``node.kernel.msgbus`` -- read only after ``build()``, the same
+    idiom ``trade_cli._run_node`` uses for its own post-build installs.
+    This recorder has no exec client and no strategy, so this is the
+    ONLY new subscription this module adds.
     """
     node: Node | None = None
     try:
@@ -189,6 +212,7 @@ def _run_node(config: TradingNodeConfig, node_factory: NodeFactory, stderr: Text
             POLYMARKET_US_CLIENT_NAME, PolymarketUSLiveDataClientFactory
         )
         node.build()
+        install_quote_tape_gap_watch(node.kernel.msgbus, sink=alert_sink)
         node.run()
         return _exit_code_for_completed_run(stderr)
     except KeyboardInterrupt:
@@ -244,12 +268,19 @@ def run(
     already owns the section 7 environment contract; they are deliberately not
     re-read here, because a second reader is a second competing policy for the
     same variables.
+
+    SP-6 A5/A6/A7: ONE :class:`~breezy.runtime.health.AlertSink` is
+    resolved here and threaded into both the disk monitor (A7) and
+    :func:`_run_node`'s gap watch (A6) -- "one sink per node process": the
+    resolver closes it, in the inner ``finally``, before
+    :func:`~breezy.runtime.logging_bridge.uninstall`.
     """
     out = sys.stderr if stderr is None else stderr
     install_logging_bridge()
     # THIS run's fault, never an inherited one. The latch is process-scoped
     # and a stale value would fail a healthy capture window.
     clear_fatal_feed_fault()
+    alert_sink = resolve_alert_sink(env)
     try:
         try:
             settings = load_quote_tape_settings(env)
@@ -274,13 +305,15 @@ def run(
         monitor = QuoteTapeDiskMonitor(
             _monitor_config(settings),
             disk_usage_probe=disk_usage_probe,
+            alert_sink=alert_sink,
         )
         monitor.start()
         try:
-            return _run_node(config, node_factory, out)
+            return _run_node(config, node_factory, out, alert_sink=alert_sink)
         finally:
             monitor.stop()
     finally:
+        _close_alert_sink(alert_sink)
         uninstall_logging_bridge()
 
 

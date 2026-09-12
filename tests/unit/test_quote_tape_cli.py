@@ -67,6 +67,22 @@ def _complete_env(tmp_path: Path) -> dict[str, str]:
     }
 
 
+class _FakeMsgbus:
+    """Stands in for ``node.kernel.msgbus`` -- just enough for
+    ``install_quote_tape_gap_watch``'s single ``subscribe`` call (SP-6 A6)."""
+
+    def __init__(self) -> None:
+        self.subscriptions: list[tuple[str, Any]] = []
+
+    def subscribe(self, *, topic: str, handler: Any) -> None:
+        self.subscriptions.append((topic, handler))
+
+
+class _FakeKernel:
+    def __init__(self) -> None:
+        self.msgbus = _FakeMsgbus()
+
+
 class RecordingNode:
     """Stands in for ``TradingNode``; records the wiring calls made on it."""
 
@@ -77,6 +93,7 @@ class RecordingNode:
         self.data_client_factories: list[tuple[str, type]] = []
         self.exec_client_factories: list[tuple[str, type]] = []
         self.calls: list[str] = []
+        self.kernel = _FakeKernel()
         RecordingNode.instances.append(self)
 
     def add_data_client_factory(self, name: str, factory: type) -> None:
@@ -138,6 +155,20 @@ def test_exactly_one_data_client_factory_is_registered_under_the_routing_name(
     assert node.data_client_factories == [
         (POLYMARKET_US_CLIENT_NAME, PolymarketUSLiveDataClientFactory)
     ]
+
+
+def test_the_gap_watch_is_installed_on_the_kernel_msgbus_after_build(
+    complete_env: dict[str, str],
+) -> None:
+    """SP-6 A6: `install_quote_tape_gap_watch` subscribes exactly once,
+    onto `node.kernel.msgbus`, and only reachable AFTER `build()`."""
+    run(env=complete_env, node_factory=RecordingNode, stderr=io.StringIO())
+    node = RecordingNode.instances[0]
+
+    from breezy.runtime.quote_tape_gap_watch import QUOTE_TAPE_GAP_TOPIC
+
+    topics = [topic for topic, _handler in node.kernel.msgbus.subscriptions]
+    assert topics == [QUOTE_TAPE_GAP_TOPIC]
     assert set(node.config.data_clients) == {POLYMARKET_US_CLIENT_NAME}
 
 

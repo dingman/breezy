@@ -106,6 +106,7 @@ from breezy.runtime.logging_bridge import install as install_logging_bridge
 from breezy.runtime.logging_bridge import uninstall as uninstall_logging_bridge
 from breezy.runtime.node_config import NodeConfigError, build_trade_node_config
 from breezy.runtime.observation_composition import build_live_observation_actors
+from breezy.runtime.quote_tape_gap_watch import install_quote_tape_gap_watch
 from breezy.runtime.settings import (
     SettingsError,
     load_trade_settings,
@@ -414,6 +415,10 @@ def _run_node(
         install_stale_intent_alert(
             node.kernel.msgbus,
             stale_alerts=_exec_client_stale_intent_reader(node),
+            sink=alert_sink,
+        )
+        install_quote_tape_gap_watch(
+            node.kernel.msgbus,
             sink=alert_sink,
         )
         install_account_presence_halt(

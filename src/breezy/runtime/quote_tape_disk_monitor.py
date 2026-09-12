@@ -8,8 +8,22 @@ import threading
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
+from typing import TYPE_CHECKING
+
+from breezy.runtime.alert_detail import assert_payload_detail_is_safe
+from breezy.runtime.health import AlertPayload, emit_alert
+
+if TYPE_CHECKING:  # pragma: no cover - typing only
+    from breezy.runtime.health import AlertSink
 
 logger = logging.getLogger(__name__)
+
+#: SP-6 A7. WARN, not CRITICAL: a disk-headroom or tape-size condition
+#: degrades the RECORDING, not a trade decision -- this recorder has no
+#: execution client. ``_log_recovered`` never alerts (recovery is
+#: observable in the log stream; it is not an operator page).
+QUOTE_TAPE_DISK_ALERT_SEVERITY = "WARN"
+QUOTE_TAPE_DISK_ALERT_SITE = "global"
 
 
 @dataclass(frozen=True, slots=True)
@@ -56,9 +70,11 @@ class QuoteTapeDiskMonitor:
         config: QuoteTapeDiskMonitorConfig,
         *,
         disk_usage_probe: DiskUsageProbe = disk_usage_probe,
+        alert_sink: AlertSink | None = None,
     ) -> None:
         self._config = config
         self._disk_usage_probe = disk_usage_probe
+        self._alert_sink = alert_sink
         self._active_events: set[str] = set()
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
@@ -97,6 +113,7 @@ class QuoteTapeDiskMonitor:
                 logging.ERROR,
                 "quote_tape_disk_monitor event=disk_monitor_probe_failed error=%r",
                 exc,
+                detail=f"disk monitor probe failed: {type(exc).__name__}",
             )
         self._log_recovered(active_events)
         self._active_events = active_events
@@ -118,6 +135,10 @@ class QuoteTapeDiskMonitor:
                 usage.total,
                 usage.used,
                 self._config.catalog_root,
+                detail=(
+                    f"free space at or below error threshold "
+                    f"(free_bytes={usage.free} threshold_bytes={self._config.min_free_bytes_error})"
+                ),
             )
         elif usage.free <= self._config.min_free_bytes_warning:
             self._log_event(
@@ -150,6 +171,11 @@ class QuoteTapeDiskMonitor:
                 tape_file.size_bytes,
                 self._config.max_file_bytes_error,
                 self._config.catalog_root,
+                detail=(
+                    f"tape file size at or above error threshold "
+                    f"(size_bytes={tape_file.size_bytes} "
+                    f"threshold_bytes={self._config.max_file_bytes_error})"
+                ),
             )
         elif tape_file.size_bytes >= self._config.max_file_bytes_warning:
             self._log_event(
@@ -191,10 +217,25 @@ class QuoteTapeDiskMonitor:
         level: int,
         message: str,
         *args: object,
+        detail: str | None = None,
     ) -> None:
         active_events.add(event)
         if event not in self._active_events:
             logger.log(level, message, *args)
+            # SP-6 A7: alert only on the RISING edge of an ERROR-class
+            # event, and only from a caller-built `detail` -- NEVER from
+            # `message % args`, which can carry a filesystem path.
+            if level >= logging.ERROR and self._alert_sink is not None and detail is not None:
+                assert_payload_detail_is_safe(detail)
+                emit_alert(
+                    self._alert_sink,
+                    AlertPayload(
+                        severity=QUOTE_TAPE_DISK_ALERT_SEVERITY,
+                        event=event,
+                        site=QUOTE_TAPE_DISK_ALERT_SITE,
+                        detail=detail,
+                    ),
+                )
 
     def _log_recovered(self, active_events: set[str]) -> None:
         for event in self._active_events - active_events:
