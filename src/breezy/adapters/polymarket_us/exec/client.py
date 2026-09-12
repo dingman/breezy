@@ -2066,12 +2066,19 @@ class PolymarketUSExecutionClient(LiveExecutionClient):
     ) -> list[OrderStatusReport]:
         """Empty, and empty for a stated reason.
 
-        The venue's open-order read surface is not declared by R-3's endpoint
-        table, and barrier V2 refuses its path literal inside any
-        venue-touching module with no allowlist. Breezy DOES submit orders
-        (R-7's ``_submit_order``, one per station-day) -- what remains
-        unimplemented is reading THEM BACK by status: this method returns an
-        empty list unconditionally, not because nothing was ever submitted.
+        Returns ``[]`` today. This generator and :meth:`generate_fill_reports`
+        below MUST land together: native reconciliation iterates
+        ``mass_status.order_reports`` and looks its matching fills up BY the
+        venue order id each order report names
+        (``live/execution_engine.py:1880-1881``) -- shipping one without the
+        other reconciles nothing. Gated on ruling **R-1**:
+        :class:`~nautilus_trader.execution.reports.FillReport`'s
+        ``commission`` is a required ``Money`` (``execution/reports.py:667-684``),
+        and the intended source, once R-1 rules, is the ONE durable fill
+        record this session's B0 already writes to disk and the store --
+        never a fresh read of the venue's open-order surface, which R-3's
+        endpoint table does not declare. This docstring makes no promise
+        that B1 will be implemented.
         """
         return []
 
@@ -2081,11 +2088,17 @@ class PolymarketUSExecutionClient(LiveExecutionClient):
     ) -> list[FillReport]:
         """Empty, and empty for a stated reason.
 
-        Fills would come from the portfolio activities surface, which is the
-        evidence source the submit-intent latch needs and the cash source
-        settlement needs. It is read-only and lands with the increment that
-        has something to reconcile against; here there are no fills, because
-        there are no orders.
+        Returns ``[]`` today. Must land TOGETHER with
+        :meth:`generate_order_status_reports` above: reconciliation looks a
+        fill up BY the venue order id an order report names
+        (``live/execution_engine.py:1880-1881``), so shipping this one alone
+        reconciles nothing. Gated on ruling **R-1**:
+        :class:`~nautilus_trader.execution.reports.FillReport`'s
+        ``commission`` is a required ``Money`` (``execution/reports.py:667-684``);
+        the intended source, once R-1 rules, is the durable fill record this
+        session's B0 already writes to disk and the store, never a fresh
+        venue read. This docstring makes no promise that B1 will be
+        implemented.
         """
         return []
 
