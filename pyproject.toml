@@ -261,6 +261,16 @@ breezy-quote-tape-ingest = "breezy.runtime.quote_tape_ingest_cli:main"
 # Never a flag on breezy-trade, never on a timer, never at startup. See
 # `breezy.runtime.clear_submit_intent_cli`.
 breezy-clear-submit-intent = "breezy.runtime.clear_submit_intent_cli:main"
+# Mirrors `breezy-clear-submit-intent`'s structure and safety exactly: the
+# operator clear tool for the `pm_us_crh_cont` family-wide halt
+# (`continuous_rung_hold/halt`, see `TrialDayLatch.record_duplicate_fill` /
+# `is_family_halted`). There is no automated clear by design -- clearing is
+# a build-side decision made with evidence. See
+# Lives in the `strategy` layer, not `runtime`, because it touches
+# `TrialDayLatch` (`breezy.strategy.current_rung_hold.trial_day_latch`) --
+# `runtime` may never import `strategy` (see the layers contract below).
+# `breezy.strategy.current_rung_hold.clear_family_halt_cli`.
+breezy-clear-family-halt = "breezy.strategy.current_rung_hold.clear_family_halt_cli:main"
 # A SEVENTH process: the detached daily launcher for `breezy-trade`
 # (TRADE_NODE_DAILY_RELAUNCH_2026-09-04.md). Values-free -- the seven
 # operator-reserved values travel only through its own forwarded `env=`,

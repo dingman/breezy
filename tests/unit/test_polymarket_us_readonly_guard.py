@@ -2137,12 +2137,22 @@ def test_c10_submit_intent_and_operator_controls_reference_pins() -> None:
     module's money reader, so a top-level import would cycle; both modules
     live in the same package, so this is an intra-package cycle break, not
     a layering violation.
+
+    WIDENED again (``breezy-clear-family-halt``, 2026-09-12): a second
+    operator clear tool, mirroring ``clear_submit_intent_cli.py``'s
+    structure exactly -- it acquires the SAME ``open_submit_intent_latch``
+    flock before touching ``TrialDayLatch``'s family-halt key, so the node
+    holding the lock refuses it too. It lives in the ``strategy`` layer
+    (``current_rung_hold/clear_family_halt_cli.py``), not ``runtime``, since
+    the layers contract forbids ``runtime`` importing ``strategy`` and this
+    tool needs ``TrialDayLatch``.
     """
     assert _modules_importing("submit_intent") == {
         "src/breezy/runtime/node_config.py",
         "src/breezy/runtime/clear_submit_intent_cli.py",
         "src/breezy/strategy/current_rung_hold/trial_day_latch.py",
         "src/breezy/strategy/current_rung_hold/composition.py",
+        "src/breezy/strategy/current_rung_hold/clear_family_halt_cli.py",
         "scripts/analysis/current_rung_hold_paper_replay.py",
         "src/breezy/app/trade.py",
         "src/breezy/runtime/trade_supervisor.py",

@@ -77,6 +77,7 @@ __all__ = [
     "DEFAULT_TRIAL_KEY_PREFIX",
     "DUPLICATE_FILL_KEY_PREFIX",
     "FAMILY_HALT_KEY",
+    "HALT_CLEARED_KEY_PREFIX",
     "STARTUP_EVIDENCE_KEY",
     "TAKEN_FROM_FILL_WALK_REASON",
     "TrialDayAlreadyConsumed",
@@ -129,6 +130,35 @@ _SCHEMA_VERSION: Final[int] = 1
 #: writes either of these; there is exactly one continuous-rung-hold family).
 DUPLICATE_FILL_KEY_PREFIX: Final[str] = "continuous_rung_hold/duplicate_fill/"
 FAMILY_HALT_KEY: Final[str] = "continuous_rung_hold/halt"
+#: Audit trail for `breezy-clear-family-halt` (build-side clear only -- there
+#: is no automated clear). One record per clear, keyed by the clearing
+#: ts_ns so a family can be halted, cleared, and re-halted across restarts
+#: without ever overwriting a prior audit entry.
+HALT_CLEARED_KEY_PREFIX: Final[str] = "continuous_rung_hold/halt_cleared/"
+#: Sentinel written over `FAMILY_HALT_KEY` by `clear_family_halt` -- the
+#: store has no delete (`StateStore.set`/`get` only), so "cleared" is a
+#: distinguishable value rather than an absent key, mirroring
+#: `_INFLIGHT_CLEARED` above.
+_HALT_CLEARED_MARKER: Final[bytes] = b'{"v":1,"state":"cleared"}'
+
+
+def _decode_halt_payload(raw: bytes) -> dict[str, object]:
+    """Best-effort decode of a halt record for the clear audit trail.
+
+    Never raises: garbage bytes, invalid UTF-8, an empty value, or a
+    non-dict/legacy-schema JSON body all fall back to a raw-bytes
+    representation rather than blocking `clear_family_halt` -- a corrupt or
+    unrecognised halt record is exactly the case the operator most needs to
+    be able to clear, with the original bytes preserved (hex-encoded) in the
+    audit record for later inspection.
+    """
+    try:
+        decoded: object = json.loads(raw.decode("utf-8"))
+    except (UnicodeDecodeError, ValueError):
+        return {"corrupt": True, "rawHex": raw.hex()}
+    if not isinstance(decoded, dict):
+        return {"corrupt": True, "rawHex": raw.hex()}
+    return decoded
 
 #: Slice 4 item A2 (plan rev 6.1): the exec client's durable startup/re-arm
 #: evidence key -- written at the end of every connect and after each
@@ -469,7 +499,7 @@ class TrialDayLatch:
                 "climateDay": climate_day,
             }
             self._store.set(bucket_key, json.dumps(payload, sort_keys=True).encode("utf-8"))
-        if self._store.get(FAMILY_HALT_KEY) is None:
+        if not self.is_family_halted():
             halt_payload = {
                 "v": 1,
                 "reason": "duplicate_fill",
@@ -482,9 +512,67 @@ class TrialDayLatch:
 
     def is_family_halted(self) -> bool:
         """``True`` once :meth:`record_duplicate_fill` has ever fired for
-        THIS family. Durable -- survives restart, unlike ``_trading_refusals``."""
+        THIS family and no ``breezy-clear-family-halt`` run has cleared it
+        since. Durable -- survives restart, unlike ``_trading_refusals``.
+
+        Checks against ``_HALT_CLEARED_MARKER`` rather than mere key
+        presence: the store has no delete, so :meth:`clear_family_halt`
+        leaves a distinguishable "cleared" value in place rather than an
+        absent key (see that method and ``_INFLIGHT_CLEARED`` above for the
+        same pattern).
+        """
         self._require_held()
-        return self._store.get(FAMILY_HALT_KEY) is not None
+        raw = self._store.get(FAMILY_HALT_KEY)
+        return raw is not None and raw != _HALT_CLEARED_MARKER
+
+    def clear_family_halt(
+        self,
+        *,
+        reason: str,
+        evidence_sha256: str,
+        ts_ns: int,
+    ) -> dict[str, object]:
+        """Durably clear the family-wide halt. Build-side only -- there is
+        no automated clear; this is the sole writer, invoked exclusively by
+        the ``breezy-clear-family-halt`` operator CLI.
+
+        Writes an audit record under ``HALT_CLEARED_KEY_PREFIX + ts_ns``
+        containing the prior halt payload, ``reason``, ``evidence_sha256``
+        and ``ts_ns`` BEFORE overwriting ``FAMILY_HALT_KEY`` with the
+        cleared sentinel -- so a crash between the two writes leaves the
+        halt still active (fail closed) with an orphaned audit record,
+        never a cleared halt with no audit trail.
+
+        Raises :class:`TrialDayLatchError` if the halt is not currently set
+        (re-checked here under the SAME flock rather than trusting an
+        earlier caller read, matching :meth:`consume_if_absent`'s own
+        discipline). A halt payload that is garbage bytes, empty, or an
+        unrecognised/legacy schema is still clearable -- :meth:`is_family_halted`
+        fails CLOSED on any such value (a corrupt or legacy record is exactly
+        the case an operator most needs to be able to clear WITH evidence),
+        so this method never raises on undecodable content; it records the
+        raw bytes (hex-encoded) in the audit trail instead of the parsed
+        payload. Returns the prior halt payload actually written to the
+        audit record (either the decoded dict, or the raw-bytes fallback).
+        """
+        self._require_held()
+        raw = self._store.get(FAMILY_HALT_KEY)
+        if raw is None or raw == _HALT_CLEARED_MARKER:
+            raise TrialDayLatchError("no family halt is currently set; nothing to clear")
+        prior_payload = _decode_halt_payload(raw)
+        audit_payload = {
+            "v": 1,
+            "priorHalt": prior_payload,
+            "reason": reason,
+            "evidenceSha256": evidence_sha256,
+            "tsNs": ts_ns,
+        }
+        self._store.set(
+            f"{HALT_CLEARED_KEY_PREFIX}{ts_ns}",
+            json.dumps(audit_payload, sort_keys=True).encode("utf-8"),
+        )
+        self._store.set(FAMILY_HALT_KEY, _HALT_CLEARED_MARKER)
+        return prior_payload
 
     # -- Slice 4 item A2 (plan rev 6.1): never-arm startup evidence + fill walk --
 
