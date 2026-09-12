@@ -129,6 +129,45 @@ def _register_backtest_and_start(
 # ---------------------------------------------------------------------------
 
 
+def _imports_the_subclass(path: Path) -> bool:
+    try:
+        tree = ast.parse(path.read_text(), filename=str(path))
+    except SyntaxError:
+        return False
+    for node in ast.walk(tree):
+        if (
+            isinstance(node, ast.ImportFrom)
+            and node.module == _TARGET_MODULE
+            and any(alias.name == _TARGET_NAME for alias in node.names)
+        ):
+            return True
+        if isinstance(node, ast.Import) and any(
+            alias.name == _TARGET_MODULE for alias in node.names
+        ):
+            return True
+    return False
+
+
+def test_the_continuous_backtest_only_subclass_has_exactly_one_importer() -> None:
+    """Landed once increment C wires the driver -- see B's commit message:
+    this assertion requires the driver to already import this class, which
+    is C's job, not B's."""
+    importers = []
+    for root_dir in ("src", "scripts"):
+        base = _REPO_ROOT / root_dir
+        if not base.exists():
+            continue
+        for path in base.rglob("*.py"):
+            if path == _TARGET_FILE:
+                continue
+            if _imports_the_subclass(path):
+                importers.append(str(path.relative_to(_REPO_ROOT)))
+    assert importers == [_EXPECTED_IMPORTER], (
+        f"{_TARGET_NAME} must have exactly one non-test importer "
+        f"({_EXPECTED_IMPORTER!r}); found {importers!r}"
+    )
+
+
 def test_the_subclass_defines_exactly_three_methods() -> None:
     """The subclass's OWN `ClassDef` body defines EXACTLY
     `{__init__, on_start, _submission_armed}` -- the falsifier for "none of

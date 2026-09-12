@@ -31,12 +31,12 @@ from typing import TYPE_CHECKING, Final, cast
 
 from nautilus_trader.model.currencies import USD
 from nautilus_trader.model.enums import OrderStatus
+from nautilus_trader.model.identifiers import InstrumentId
 from nautilus_trader.model.objects import Money
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
     from nautilus_trader.backtest.engine import BacktestEngine
     from nautilus_trader.core.data import Data
-    from nautilus_trader.model.identifiers import InstrumentId
 
     from breezy.domain.nws_climate_day import NwsClimateDay
 
@@ -81,8 +81,12 @@ from breezy.strategy.current_rung_hold.backtest_only import (
     CurrentRungHoldBacktestStrategy,
 )
 from breezy.strategy.current_rung_hold.config import CurrentRungHoldConfig
+from breezy.strategy.current_rung_hold.continuous_backtest_only import (
+    ContinuousRungHoldBacktestStrategy,
+)
 from breezy.strategy.current_rung_hold.strategy import _local_hour
 from breezy.strategy.current_rung_hold.trial_day_latch import (
+    CONTINUOUS_TRIAL_KEY_PREFIX,
     DEFAULT_TRIAL_KEY_PREFIX,
     TrialDayLatch,
     open_trial_day_latch,
@@ -460,11 +464,79 @@ class PrecisionArmResult:
     DIFFERENT vocabulary again from `strategy_refusals` (see
     `strategy.py`'s `_DIAG_*` module docstring: never a refusal reason,
     never added to `RefusalAlerter`).
+
+    `strategy_position_events` is the strategy's `self.position_events`
+    snapshot (SP-4 increment C, AM-4): a THIRD, again different vocabulary
+    (`startup_evidence_missing`, `unreconciled_long_no_fill`,
+    `family_halt_at_start`, `fill_walk_unreadable`, `unjoinable_fill_halt`,
+    `fill_join_error`) -- never a refusal, never a WAIT diagnostic. Both
+    `CurrentRungHoldStrategy` and `ContinuousRungHoldStrategy` carry this
+    attribute, so it is populated UNCONDITIONALLY, never behind a
+    `hasattr`/`isinstance` branch (AM-4 -- the old "v2 lacks
+    `position_events`" premise was WITHDRAWN AS FALSE).
     """
 
     trials: tuple[FilledTrial, ...]
     strategy_refusals: Mapping[str, int] = field(default_factory=dict)
     strategy_diagnostics: Mapping[str, int] = field(default_factory=dict)
+    strategy_position_events: Mapping[str, int] = field(default_factory=dict)
+
+
+class ReplayEvidenceUnboundError(RuntimeError):
+    """`_FlatStartupEvidence` was called before `bind()`."""
+
+
+class _FlatStartupEvidence:
+    """SP-4 increment C (AM-6): a `position_evidence_reader` for
+    `ContinuousRungHoldBacktestStrategy` that supplies a COMPLETE, flat
+    (`net_position="0"`) startup-evidence dict for every slug in the BOUND
+    strategy's OWN `_facts`, read at CALL time -- never derived from a
+    snapshot instrument list, so it can never diverge from what `on_start`
+    actually resolved.
+
+    Constructed UNBOUND and passed to the strategy's constructor (the
+    strategy object does not exist yet); the driver calls :meth:`bind`
+    immediately after construction, before the engine ever calls
+    `on_start`. Calling this before `bind()` raises
+    :class:`ReplayEvidenceUnboundError` rather than emitting an empty
+    `positions` list, which would read as UNKNOWN for every slug and
+    silently halt the never-arm walk -- a plan failure disguised as a
+    mechanism result (L-24).
+
+    The positions this supplies are SYNTHETIC (L-24): this is a mechanism
+    test, never a live position read.
+    """
+
+    def __init__(self) -> None:
+        self._strategy: ContinuousRungHoldBacktestStrategy | None = None
+        self.emitted_slugs: frozenset[str] = frozenset()
+        #: `False` until this reader is actually invoked. A family halt (or
+        #: any other check `_run_never_arm_walk` runs BEFORE consulting
+        #: evidence) can legitimately short-circuit before this is ever
+        #: called -- the driver's coupling assertion below only compares
+        #: `emitted_slugs` once it knows a comparison is meaningful.
+        self.called: bool = False
+
+    def bind(self, strategy: ContinuousRungHoldBacktestStrategy) -> None:
+        self._strategy = strategy
+
+    def __call__(self) -> dict[str, object]:
+        if self._strategy is None:
+            raise ReplayEvidenceUnboundError(
+                "_FlatStartupEvidence was called before bind() -- the "
+                "driver must bind it to the just-constructed strategy "
+                "before the engine ever calls on_start().",
+            )
+        self.called = True
+        slugs = {InstrumentId.from_str(iid).symbol.value for iid in self._strategy._facts}
+        self.emitted_slugs = frozenset(slugs)
+        return {
+            "v": 1,
+            "position_read_refused": False,
+            "eof_complete": True,
+            "fill_walk_complete": True,
+            "positions": [{"slug": slug, "net_position": "0"} for slug in sorted(slugs)],
+        }
 
 
 def run_one_precision_arm(
@@ -476,7 +548,9 @@ def run_one_precision_arm(
     precision_mode: PrecisionMode,
     latch_store_path: Path,
     settlement_by_key: SettlementByKey,
-    strategy_cls: type[CurrentRungHoldBacktestStrategy] | type = CurrentRungHoldBacktestStrategy,
+    strategy_cls: type[
+        CurrentRungHoldBacktestStrategy | ContinuousRungHoldBacktestStrategy
+    ] = CurrentRungHoldBacktestStrategy,
     latch_key_prefix: str = DEFAULT_TRIAL_KEY_PREFIX,
 ) -> PrecisionArmResult:
     """Run one (lag, precision) arm of the replay; return its `FilledTrial`s
@@ -516,7 +590,12 @@ def run_one_precision_arm(
         market_data.extend(ti.depths)
         market_data.extend(ti.quotes)
     if not market_data:
-        return PrecisionArmResult(trials=(), strategy_refusals={}, strategy_diagnostics={})
+        return PrecisionArmResult(
+            trials=(),
+            strategy_refusals={},
+            strategy_diagnostics={},
+            strategy_position_events={},
+        )
     ts_values = [record.ts_init for record in market_data]
     capture_window_ns = (min(ts_values), max(ts_values))
 
@@ -564,12 +643,32 @@ def run_one_precision_arm(
         instrument_ids=tuple(i.id for i in instruments), stations=(station,),
     )
 
-    strategy = strategy_cls(
-        cfg,
-        trial_day_latch_factory=_latch_factory(
-            latch_store_path, key_prefix=latch_key_prefix,
-        ),
-    )
+    evidence: _FlatStartupEvidence | None = None
+    strategy: CurrentRungHoldBacktestStrategy | ContinuousRungHoldBacktestStrategy
+    if strategy_cls is ContinuousRungHoldBacktestStrategy:
+        # AM-6: constructed UNBOUND, bound to the strategy AFTER
+        # construction -- the reader reads `strategy._facts` at CALL time,
+        # never a snapshot instrument list. Explicit `is` branch, never
+        # `getattr`/dynamic-import duck-typing (L-12/AM-5). Calls the
+        # CONCRETE class directly (not through `strategy_cls`) so mypy can
+        # see the `position_evidence_reader` kwarg -- narrowing a `type[A |
+        # B]`-typed variable via `is` does not narrow its call signature.
+        evidence = _FlatStartupEvidence()
+        strategy = ContinuousRungHoldBacktestStrategy(
+            cfg,
+            trial_day_latch_factory=_latch_factory(
+                latch_store_path, key_prefix=latch_key_prefix,
+            ),
+            position_evidence_reader=evidence,
+        )
+        evidence.bind(strategy)
+    else:
+        strategy = strategy_cls(
+            cfg,
+            trial_day_latch_factory=_latch_factory(
+                latch_store_path, key_prefix=latch_key_prefix,
+            ),
+        )
 
     with backtest(config, strategies=(strategy,), allow_idle_strategies=True) as engine:
         # D1: `entry_ask` comes from the strategy's own trial-day latch
@@ -588,10 +687,26 @@ def run_one_precision_arm(
             latch_key_prefix=latch_key_prefix,
         )
         trials = filled_trials_from_engine(engine, entry_contexts)
+    if evidence is not None and evidence.called:
+        # AM-20/NB-6 (driver-side half): the evidence reader's own record of
+        # what it last emitted must equal the strategy's own `_facts` slug
+        # set -- a plan failure disguised as a mechanism result (an empty
+        # `positions` list reading as UNKNOWN for every slug) diverges here,
+        # never silently. Skipped when the reader was never consulted at
+        # all (e.g. a family halt short-circuits `_run_never_arm_walk`
+        # BEFORE it reads evidence) -- there is nothing to compare.
+        facts_slugs = frozenset(
+            InstrumentId.from_str(iid).symbol.value for iid in strategy._facts
+        )
+        assert evidence.emitted_slugs == facts_slugs, (
+            f"evidence emitted {sorted(evidence.emitted_slugs)!r} but "
+            f"strategy._facts holds {sorted(facts_slugs)!r}"
+        )
     return PrecisionArmResult(
         trials=trials,
         strategy_refusals=dict(strategy.refusals.counts),
         strategy_diagnostics=dict(strategy.diagnostics.counts),
+        strategy_position_events=dict(strategy.position_events.counts),
     )
 
 
@@ -674,7 +789,30 @@ def main(argv: Sequence[str] | None = None) -> int:
         help="REQUIRED, no default -- see PaperReplayInputs.lag_minutes.",
     )
     parser.add_argument("--output-dir", default=DEFAULT_PAPER_STORE, type=Path)
+    parser.add_argument(
+        "--strategy",
+        choices=("current_rung_hold", "continuous_rung_hold"),
+        default="current_rung_hold",
+        type=str,
+        help=(
+            "Which BACKTEST-ONLY strategy subclass to replay. Default "
+            "'current_rung_hold' keeps the v2 golden transcript byte-"
+            "identical; 'continuous_rung_hold' selects "
+            "ContinuousRungHoldBacktestStrategy (SP-4)."
+        ),
+    )
     args = parser.parse_args(argv)
+
+    # Explicit `if`, never `getattr`/dynamic-import duck-typing (L-12/AM-5;
+    # test_the_dynamic_import_call_site_count_is_unchanged pins the count).
+    if args.strategy == "continuous_rung_hold":
+        strategy_cls: type[
+            CurrentRungHoldBacktestStrategy | ContinuousRungHoldBacktestStrategy
+        ] = ContinuousRungHoldBacktestStrategy
+        latch_key_prefix = CONTINUOUS_TRIAL_KEY_PREFIX
+    else:
+        strategy_cls = CurrentRungHoldBacktestStrategy
+        latch_key_prefix = DEFAULT_TRIAL_KEY_PREFIX
 
     assert_paper_write_path_is_not_live(args.output_dir)
     climate_day = dt.date.fromisoformat(args.climate_day)
@@ -730,6 +868,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             precision_mode=precision_mode,
             latch_store_path=args.work_catalog / f"latch_{precision_mode}.db",
             settlement_by_key=settlement,
+            strategy_cls=strategy_cls,
+            latch_key_prefix=latch_key_prefix,
         )
         all_trials.extend(result.trials)
         # (a) reporting gap: the strategy's own refusal counts, sorted for a
@@ -738,6 +878,13 @@ def main(argv: Sequence[str] | None = None) -> int:
         # WAIT-state diagnostics (`strategy.py`'s `_DIAG_*`) -- a DIFFERENT
         # vocabulary from `strategy_refusals` above, never conflated.
         print(f"strategy diagnostics: {dict(sorted(result.strategy_diagnostics.items()))}")
+        # New stdout line, printed ONLY for the continuous arm -- the v2
+        # golden transcript stays byte-identical (increment C spec).
+        if strategy_cls is ContinuousRungHoldBacktestStrategy:
+            print(
+                "strategy position events: "
+                f"{dict(sorted(result.strategy_position_events.items()))}",
+            )
         _print_roi_and_wilson(result.trials, settlement, now_ns)
 
     scored, _refused = score_trials(

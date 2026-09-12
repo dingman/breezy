@@ -1166,3 +1166,349 @@ def test_paper_latch_is_throwaway_not_exec_state_db(driver: ModuleType) -> None:
     names = driver.run_one_precision_arm.__code__.co_varnames
     assert "strategy_cls" in names
     assert "latch_key_prefix" in names
+
+
+# ---------------------------------------------------------------------------
+# SP-4 increment C: `--strategy`, v3 evidence injection, position-event
+# reporting, and the v3 latch key prefix coupling.
+# ---------------------------------------------------------------------------
+
+
+def _minimal_argv(tmp_path: Path, *, strategy: str | None) -> list[str]:
+    argv = [
+        "--climate-day", CLIMATE_DAY.isoformat(),
+        "--station", STATION,
+        "--tape-instance-id", "x",
+        "--quote-catalog", str(tmp_path / "capture"),
+        "--work-catalog", str(tmp_path / "work"),
+        "--asos-cache-csv", str(tmp_path / "z.csv"),
+        "--weather-catalog-root", str(tmp_path / "w"),
+        "--lag-minutes", "30",
+        "--output-dir", str(tmp_path / "out"),
+    ]
+    if strategy is not None:
+        argv += ["--strategy", strategy]
+    return argv
+
+
+def _run_main_with_stubbed_capture(
+    driver: ModuleType,
+    tmp_path: Path,
+    *,
+    strategy: str | None,
+    monkeypatch: pytest.MonkeyPatch,
+) -> dict[str, object]:
+    """Stub the driver's OWN capture/settlement seams (never Nautilus, never
+    the strategy under test) so `main` reaches `run_one_precision_arm`
+    without a real recorded catalog on disk -- the dispatch logic under
+    test lives entirely between argument parsing and that call."""
+    captured: dict[str, object] = {}
+    tape_instrument = _tape_instrument_no_close(driver, ask="0.40", size=10)
+
+    def _spy_run_one_precision_arm(**kwargs: object) -> object:
+        captured["strategy_cls"] = kwargs["strategy_cls"]
+        captured["latch_key_prefix"] = kwargs["latch_key_prefix"]
+        return driver.PrecisionArmResult(trials=())
+
+    monkeypatch.setattr(driver, "run_one_precision_arm", _spy_run_one_precision_arm)
+    monkeypatch.setattr(driver, "_convert_live_capture", lambda **kw: object())
+    monkeypatch.setattr(
+        driver,
+        "_select_capture_instruments",
+        lambda catalog, *, climate_day: [tape_instrument],
+    )
+    monkeypatch.setattr(driver, "climate_day_records_to_settlement", lambda *a, **kw: {})
+    monkeypatch.setattr(driver, "read_asos_rows", lambda path: _OBSERVATION_ROWS)
+
+    rc = driver.main(_minimal_argv(tmp_path, strategy=strategy))
+    assert rc == 0
+    return captured
+
+
+def test_the_strategy_flag_selects_the_continuous_backtest_subclass(
+    driver: ModuleType, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured = _run_main_with_stubbed_capture(
+        driver, tmp_path, strategy="continuous_rung_hold", monkeypatch=monkeypatch,
+    )
+    assert captured["strategy_cls"] is driver.ContinuousRungHoldBacktestStrategy
+    assert captured["latch_key_prefix"] == driver.CONTINUOUS_TRIAL_KEY_PREFIX
+
+
+def test_the_default_strategy_is_still_the_v2_backtest_subclass(
+    driver: ModuleType,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Rev 2 + AM-14: no `--strategy` flag resolves the SAME v2 subclass and
+    latch prefix as before this increment, and the new "strategy position
+    events" stdout line (printed ONLY for the continuous arm) never
+    appears -- the v2 golden transcript stays byte-identical."""
+    capsys.readouterr()
+    captured = _run_main_with_stubbed_capture(
+        driver, tmp_path, strategy=None, monkeypatch=monkeypatch,
+    )
+    assert captured["strategy_cls"] is driver.CurrentRungHoldBacktestStrategy
+    assert captured["latch_key_prefix"] == driver.DEFAULT_TRIAL_KEY_PREFIX
+    out = capsys.readouterr().out
+    assert "strategy position events" not in out
+
+
+def test_the_continuous_arm_injects_flat_position_evidence_for_every_candidate_slug(
+    driver: ModuleType, tmp_path: Path,
+) -> None:
+    """AM-6: the driver injects a `_FlatStartupEvidence` reader bound to the
+    just-constructed strategy -- an in-window tape with a synthesizable
+    close fills through the SAME armed branch the live node takes, never
+    halting on `startup_evidence_missing`."""
+    tape_instrument = _tape_instrument_no_close(driver, ask="0.40", size=10)
+    settlement_by_key = {(STATION, CLIMATE_DAY.isoformat()): _final_climate_day(tmax_f=87)}
+
+    result = driver.run_one_precision_arm(
+        tape_instruments=[tape_instrument],
+        observation_rows=_OBSERVATION_ROWS,
+        station=STATION,
+        lag_minutes=1,
+        precision_mode="nws_integer_c",
+        latch_store_path=tmp_path / "state.db",
+        settlement_by_key=settlement_by_key,
+        strategy_cls=driver.ContinuousRungHoldBacktestStrategy,
+        latch_key_prefix=driver.CONTINUOUS_TRIAL_KEY_PREFIX,
+    )
+    assert len(result.trials) == 1
+    assert "startup_evidence_missing" not in result.strategy_position_events
+
+
+def test_the_early_return_result_also_carries_an_empty_position_event_map(
+    driver: ModuleType, tmp_path: Path,
+) -> None:
+    """NB-3 (L-4): the `:519`-shaped early return (no market data at all)
+    explicitly carries an empty `strategy_position_events`, never relying
+    on the dataclass `default_factory` alone."""
+    result = driver.run_one_precision_arm(
+        tape_instruments=[],
+        observation_rows=_OBSERVATION_ROWS,
+        station=STATION,
+        lag_minutes=30,
+        precision_mode="nws_integer_c",
+        latch_store_path=tmp_path / "state.db",
+        settlement_by_key={},
+        strategy_cls=driver.ContinuousRungHoldBacktestStrategy,
+        latch_key_prefix=driver.CONTINUOUS_TRIAL_KEY_PREFIX,
+    )
+    assert result.trials == ()
+    assert result.strategy_position_events == {}
+
+
+def test_the_result_carries_the_position_event_counts(
+    driver: ModuleType, tmp_path: Path,
+) -> None:
+    """AM-4: `strategy.position_events.counts` rides along unconditionally
+    (populated from a REAL, non-empty count here), the same reporting-gap
+    fix `strategy_refusals`/`strategy_diagnostics` already got."""
+    latch_store_path = tmp_path / "state.db"
+    with driver._latch_context(
+        latch_store_path, key_prefix=driver.CONTINUOUS_TRIAL_KEY_PREFIX,
+    ) as latch:
+        latch.record_duplicate_fill(
+            STATION,
+            CLIMATE_DAY.isoformat(),
+            venue_order_id="pre-seeded",
+            qty=Decimal(1),
+            fill_px=Decimal("0.40"),
+            fee=Decimal(0),
+            ts_ns=WINDOW_OPEN_NS,
+        )
+    tape_instrument = _tape_instrument_no_close(driver, ask="0.40", size=10)
+    settlement_by_key = {(STATION, CLIMATE_DAY.isoformat()): _final_climate_day(tmax_f=87)}
+
+    result = driver.run_one_precision_arm(
+        tape_instruments=[tape_instrument],
+        observation_rows=_OBSERVATION_ROWS,
+        station=STATION,
+        lag_minutes=30,
+        precision_mode="nws_integer_c",
+        latch_store_path=latch_store_path,
+        settlement_by_key=settlement_by_key,
+        strategy_cls=driver.ContinuousRungHoldBacktestStrategy,
+        latch_key_prefix=driver.CONTINUOUS_TRIAL_KEY_PREFIX,
+    )
+    assert result.trials == ()
+    assert result.strategy_position_events == {"family_halt_at_start": 1}
+
+
+def test_a_reader_that_drops_a_facts_slug_fails_the_run_loudly(
+    driver: ModuleType, tmp_path: Path,
+) -> None:
+    """L-24 NEGATIVE: a `position_evidence_reader` that omits a candidate's
+    own slug halts the walk (`unreconciled_long_no_fill`) -- the driver
+    never masks that with its own flat-evidence injection when a caller
+    supplies a different reader directly."""
+    tape_instrument = _tape_instrument_no_close(driver, ask="0.40", size=10)
+    cfg = CurrentRungHoldConfig(
+        instrument_ids=(tape_instrument.instrument.id,), stations=(STATION,),
+    )
+    strategy = driver.ContinuousRungHoldBacktestStrategy(
+        cfg,
+        trial_day_latch_factory=driver._latch_factory(
+            tmp_path / "direct_state.db", key_prefix=driver.CONTINUOUS_TRIAL_KEY_PREFIX,
+        ),
+        position_evidence_reader=lambda: {
+            "v": 1,
+            "position_read_refused": False,
+            "eof_complete": True,
+            "fill_walk_complete": True,
+            "positions": [],
+        },
+    )
+    stopped: list[bool] = []
+    strategy.stop = lambda: stopped.append(True)  # type: ignore[method-assign]
+    from nautilus_trader.common.component import TestClock
+    from nautilus_trader.model.identifiers import TraderId
+    from nautilus_trader.portfolio import Portfolio
+    from nautilus_trader.test_kit.stubs.component import TestComponentStubs
+
+    clock = TestClock()
+    clock.set_time(WINDOW_OPEN_NS)
+    msgbus = TestComponentStubs.msgbus()
+    cache = TestComponentStubs.cache()
+    cache.add_instrument(tape_instrument.instrument)
+    portfolio = Portfolio(msgbus=msgbus, cache=cache, clock=clock)
+    strategy.register(
+        trader_id=TraderId("BACKTEST-001"), portfolio=portfolio,
+        msgbus=msgbus, cache=cache, clock=clock,
+    )
+    strategy.on_start()
+    assert stopped == [True]
+    assert strategy.position_events.count("unreconciled_long_no_fill") == 1
+
+
+def test_an_unbound_evidence_reader_raises_rather_than_emitting_empty_positions(
+    driver: ModuleType,
+) -> None:
+    """L-24 NEGATIVE: calling `_FlatStartupEvidence` before `bind()` raises
+    `ReplayEvidenceUnboundError` -- it must never silently emit an empty
+    `positions` list, which would read as UNKNOWN for every slug."""
+    evidence = driver._FlatStartupEvidence()
+    with pytest.raises(driver.ReplayEvidenceUnboundError):
+        evidence()
+
+
+def test_the_continuous_arm_uses_the_continuous_latch_key_prefix(
+    driver: ModuleType, tmp_path: Path,
+) -> None:
+    """C-add-1: the continuous arm writes under `CONTINUOUS_TRIAL_KEY_PREFIX`,
+    never the v2 default -- a v2-prefixed arm would write and read a prefix
+    the live v3 family never uses (L-8: a silent zero-trial run indistinguishable
+    from "no fills")."""
+    tape_instrument = _tape_instrument_no_close(driver, ask="0.40", size=10)
+    settlement_by_key = {(STATION, CLIMATE_DAY.isoformat()): _final_climate_day(tmax_f=87)}
+    latch_store_path = tmp_path / "state.db"
+
+    result = driver.run_one_precision_arm(
+        tape_instruments=[tape_instrument],
+        observation_rows=_OBSERVATION_ROWS,
+        station=STATION,
+        lag_minutes=1,
+        precision_mode="nws_integer_c",
+        latch_store_path=latch_store_path,
+        settlement_by_key=settlement_by_key,
+        strategy_cls=driver.ContinuousRungHoldBacktestStrategy,
+        latch_key_prefix=driver.CONTINUOUS_TRIAL_KEY_PREFIX,
+    )
+    assert len(result.trials) == 1
+    with driver._latch_context(
+        latch_store_path, key_prefix=driver.CONTINUOUS_TRIAL_KEY_PREFIX,
+    ) as latch:
+        record = latch.record(STATION, CLIMATE_DAY.isoformat())
+    assert record is not None
+    assert record.reason == "taken"
+
+
+def test_the_write_prefix_and_the_entry_context_read_prefix_are_the_same(
+    driver: ModuleType, tmp_path: Path,
+) -> None:
+    """AM-20/NB-6: `run_one_precision_arm` threads ONE `latch_key_prefix`
+    into both the write side (the strategy's own latch factory) and the
+    read side (`_entry_contexts_from_latch`) -- a mismatch would present as
+    a silent zero-trial "market" result (L-8). Proven end-to-end: the SAME
+    call that fills also successfully reads its own trial back out."""
+    tape_instrument = _tape_instrument_no_close(driver, ask="0.40", size=10)
+    settlement_by_key = {(STATION, CLIMATE_DAY.isoformat()): _final_climate_day(tmax_f=87)}
+
+    result = driver.run_one_precision_arm(
+        tape_instruments=[tape_instrument],
+        observation_rows=_OBSERVATION_ROWS,
+        station=STATION,
+        lag_minutes=1,
+        precision_mode="nws_integer_c",
+        latch_store_path=tmp_path / "state.db",
+        settlement_by_key=settlement_by_key,
+        strategy_cls=driver.ContinuousRungHoldBacktestStrategy,
+        latch_key_prefix=driver.CONTINUOUS_TRIAL_KEY_PREFIX,
+    )
+    # A prefix mismatch between the write side and `_entry_contexts_from_
+    # latch`'s read side would make `_filled_instrument_ids` non-empty but
+    # the latch record lookup miss, raising `EntryAskFromLatchMissingError`
+    # rather than silently returning zero -- so reaching a real trial here
+    # IS the coupling proof, not a weaker structural assertion.
+    assert len(result.trials) == 1
+    assert result.trials[0].fill_px == Decimal("0.40")
+
+
+def test_the_continuous_arm_calls_is_intent_open_and_reads_false(
+    driver: ModuleType, tmp_path: Path,
+) -> None:
+    """AM-17: the driver's own latch factory always binds a real
+    `SubmitIntentLatch` (`open_trial_day_latch`, never a bare
+    `TrialDayLatch`), so the continuous arm's inherited `_hunt_tick`
+    reaches `is_intent_open()` and reads `False` rather than raising
+    `TrialDayLatchError` -- proven end-to-end by the same fill this arm
+    already produces."""
+    tape_instrument = _tape_instrument_no_close(driver, ask="0.40", size=10)
+    settlement_by_key = {(STATION, CLIMATE_DAY.isoformat()): _final_climate_day(tmax_f=87)}
+
+    result = driver.run_one_precision_arm(
+        tape_instruments=[tape_instrument],
+        observation_rows=_OBSERVATION_ROWS,
+        station=STATION,
+        lag_minutes=1,
+        precision_mode="nws_integer_c",
+        latch_store_path=tmp_path / "state.db",
+        settlement_by_key=settlement_by_key,
+        strategy_cls=driver.ContinuousRungHoldBacktestStrategy,
+        latch_key_prefix=driver.CONTINUOUS_TRIAL_KEY_PREFIX,
+    )
+    assert len(result.trials) == 1
+
+
+def test_the_continuous_arm_selects_capture_instruments_exactly_once(
+    driver: ModuleType, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """C-add-2/L-31: `main` calls `_select_capture_instruments` exactly
+    once per invocation, regardless of how many precision arms it runs
+    inside the PRECISION_ARMS loop -- the per-definition-row reselect
+    defect measured elsewhere (`test_whole_tape_paper_replay.py:948`) has
+    no analogue on this NEW v3 path."""
+    calls: list[int] = []
+    tape_instrument = _tape_instrument_no_close(driver, ask="0.40", size=10)
+
+    def _counting_select(catalog: object, *, climate_day: dt.date) -> list[object]:
+        calls.append(1)
+        return [tape_instrument]
+
+    monkeypatch.setattr(driver, "_select_capture_instruments", _counting_select)
+    monkeypatch.setattr(driver, "_convert_live_capture", lambda **kw: object())
+    monkeypatch.setattr(driver, "climate_day_records_to_settlement", lambda *a, **kw: {})
+    monkeypatch.setattr(driver, "read_asos_rows", lambda path: _OBSERVATION_ROWS)
+    monkeypatch.setattr(
+        driver,
+        "run_one_precision_arm",
+        lambda **kw: driver.PrecisionArmResult(trials=()),
+    )
+    assert len(driver.PRECISION_ARMS) >= 2  # the loop this counts across
+
+    rc = driver.main(_minimal_argv(tmp_path, strategy="continuous_rung_hold"))
+    assert rc == 0
+    assert len(calls) == 1
