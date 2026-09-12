@@ -12,6 +12,7 @@ from __future__ import annotations
 import ast
 import datetime as dt
 import importlib.util
+import re
 import sys
 from collections.abc import Callable, Iterator
 from contextlib import AbstractContextManager, contextmanager
@@ -1275,17 +1276,42 @@ def test_no_inline_wilson_or_bootstrap_arithmetic(driver: ModuleType) -> None:
 
 
 def test_paper_latch_is_throwaway_not_exec_state_db(driver: ModuleType) -> None:
+    """SP-4 increment E, L-5 drift correction: this pin's ORIGINAL premise
+    ("the exec-state-db resolver is never imported") is exactly what E-1
+    deliberately changes -- `assert_replay_latch_store_is_not_live`
+    composes the SHIPPED `node_store_path_check` oracle rather than
+    re-deriving it (L-11: the native exists and is USED). The invariant
+    this test actually protects survives unchanged: the driver's OWN
+    throwaway paper latch never reads `POLYMARKET_US_EXEC_STATE_DB` to
+    source or redirect its own storage path -- `resolve_store_path`/
+    `node_store_path_check` are consulted ONLY inside the read-only guard,
+    value-free, never to build a `_latch_factory`/`_latch_context` call."""
     source = (_SCRIPTS_ANALYSIS_DIR / "current_rung_hold_paper_replay.py").read_text()
     assert "POLYMARKET_US_EXEC_STATE_DB" not in source
     assert "latch_" in source
     assert "work_catalog" in source
-    # The live exec-state DB path resolver is never imported.
     tree = ast.parse(source)
     imported: set[str] = set()
     for node in ast.walk(tree):
         if isinstance(node, ast.ImportFrom) and node.module is not None:
             imported.add(node.module)
-    assert "breezy.runtime.exec_state_db_path" not in imported
+    # E-1 (ADOPTED): the shipped oracle IS imported and USED here, never
+    # re-implemented -- test_exec_state_db_path.py's own 15 tests (byte-
+    # unchanged) remain the authoritative pin on the oracle itself.
+    assert "breezy.runtime.exec_state_db_path" in imported
+    assert hasattr(driver, "node_store_path_check")
+    assert hasattr(driver, "resolve_store_path")
+    guard_def = next(
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.FunctionDef)
+        and node.name == "assert_replay_latch_store_is_not_live"
+    )
+    guard_source = ast.get_source_segment(source, guard_def)
+    assert guard_source is not None
+    non_guard_source = source.replace(guard_source, "")
+    assert "resolve_store_path(" not in non_guard_source
+    assert "node_store_path_check(" not in non_guard_source
     assert hasattr(driver, "run_one_precision_arm")
     names = driver.run_one_precision_arm.__code__.co_varnames
     assert "strategy_cls" in names
@@ -1636,3 +1662,184 @@ def test_the_continuous_arm_selects_capture_instruments_exactly_once(
     rc = driver.main(_minimal_argv(tmp_path, strategy="continuous_rung_hold"))
     assert rc == 0
     assert len(calls) == 1
+
+
+# ---------------------------------------------------------------------------
+# SP-4 increment E: the four-layer live-store guard
+# (`assert_replay_latch_store_is_not_live`), composing the shipped
+# `node_store_path_check` oracle (E-1) rather than re-deriving it.
+# ---------------------------------------------------------------------------
+
+
+def test_the_guard_refuses_a_path_the_running_node_owns_even_with_the_env_var_unset(
+    driver: ModuleType, tmp_path: Path,
+) -> None:
+    """PRIMARY LAYER (E-1): layer 1 refuses on the node's OWN `/proc`
+    environ alone -- it must fire even when layer 2's env var is UNSET in
+    THIS process, which is exactly why layer 1 leads."""
+    from tests.unit.test_exec_state_db_path import _write_process
+
+    proc_root = tmp_path / "proc"
+    candidate = tmp_path / "work" / "latch_nws_integer_c.db"
+    _write_process(
+        proc_root,
+        111,
+        [str(tmp_path / ".venv" / "bin" / "breezy-trade")],
+        {"POLYMARKET_US_EXEC_STATE_DB": str(candidate)},
+    )
+    with pytest.raises(driver.ReplayLatchStoreIsLiveError, match=re.escape(str(candidate))):
+        driver.assert_replay_latch_store_is_not_live(
+            [candidate], environ={}, proc_root=proc_root,
+        )
+
+
+def test_a_discovery_failed_oracle_is_reported_not_silently_treated_as_clean(
+    driver: ModuleType, tmp_path: Path,
+) -> None:
+    """E-1 degradation stance: an unreadable `/proc` never blocks the run
+    (refusing every replay on a `/proc` read failure would block real work
+    for no safety gain) but the report must carry the degradation, never
+    silently read as clean."""
+    unreadable_proc_root = tmp_path / "does-not-exist"
+    candidate = tmp_path / "work"
+    report = driver.assert_replay_latch_store_is_not_live(
+        [candidate], environ={}, proc_root=unreadable_proc_root,
+    )
+    assert report.oracle == "DISCOVERY_FAILED"
+    assert "DISCOVERY_FAILED" in report.render()
+
+
+def test_a_work_catalog_equal_to_the_resolved_exec_state_db_is_refused(
+    driver: ModuleType, tmp_path: Path,
+) -> None:
+    """AM-3 layer 2/3: an exact-match candidate is refused via the env-
+    resolved path, even with no running node found (`NO_NODE`, not a pass
+    signal by itself, but layer 3 still fires)."""
+    from breezy.adapters.polymarket_us.factories import EXEC_STATE_DB_ENV_VAR
+
+    live_db = tmp_path / "state" / "exec.sqlite3"
+    empty_proc_root = tmp_path / "proc"
+    empty_proc_root.mkdir()
+    with pytest.raises(driver.ReplayLatchStoreIsLiveError, match=re.escape(str(live_db))):
+        driver.assert_replay_latch_store_is_not_live(
+            [live_db],
+            environ={EXEC_STATE_DB_ENV_VAR: str(live_db)},
+            proc_root=empty_proc_root,
+        )
+
+
+def test_a_work_catalog_equal_to_the_exec_state_db_parent_dir_is_refused(
+    driver: ModuleType, tmp_path: Path,
+) -> None:
+    """AM-3 layer 3: the latch DB and its `-wal`/`-shm`/flock sidecars
+    share the store's DIRECTORY -- the real collision surface the exact-
+    match oracle (layer 1) cannot express."""
+    from breezy.adapters.polymarket_us.factories import EXEC_STATE_DB_ENV_VAR
+
+    live_db = tmp_path / "state" / "exec.sqlite3"
+    candidate_dir = tmp_path / "state"
+    empty_proc_root = tmp_path / "proc"
+    empty_proc_root.mkdir()
+    with pytest.raises(
+        driver.ReplayLatchStoreIsLiveError, match=re.escape(str(candidate_dir)),
+    ):
+        driver.assert_replay_latch_store_is_not_live(
+            [candidate_dir],
+            environ={EXEC_STATE_DB_ENV_VAR: str(live_db)},
+            proc_root=empty_proc_root,
+        )
+
+
+def test_a_latch_store_path_under_the_live_state_root_is_refused(
+    driver: ModuleType, tmp_path: Path,
+) -> None:
+    """L-24 NEGATIVE, layer 4 (markers, always in addition): a candidate
+    path substring-matching the live state-store root marker is refused
+    even with the env var unset and no running node found."""
+    candidate = tmp_path / "home" / "jon" / ".local" / "share" / "breezy" / "state" / "latch.db"
+    empty_proc_root = tmp_path / "proc"
+    empty_proc_root.mkdir()
+    with pytest.raises(driver.ReplayLatchStoreIsLiveError, match=re.escape(str(candidate))):
+        driver.assert_replay_latch_store_is_not_live(
+            [candidate], environ={}, proc_root=empty_proc_root,
+        )
+
+
+def test_every_derived_per_arm_latch_path_is_checked_not_only_the_work_catalog(
+    driver: ModuleType, tmp_path: Path,
+) -> None:
+    """CX-B3/CX-N4: the guard takes a SET of candidates, and EVERY layer
+    applies to EVERY candidate -- a CLEAN `work_catalog` must not mask a
+    live marker hit on one of its OWN derived per-arm latch paths."""
+    clean_work_catalog = tmp_path / "work"
+    live_latch_path = (
+        tmp_path / "home" / ".local" / "share" / "breezy" / "state" / "latch_archive_metar.db"
+    )
+    empty_proc_root = tmp_path / "proc"
+    empty_proc_root.mkdir()
+    with pytest.raises(
+        driver.ReplayLatchStoreIsLiveError, match=re.escape(str(live_latch_path)),
+    ):
+        driver.assert_replay_latch_store_is_not_live(
+            [clean_work_catalog, live_latch_path], environ={}, proc_root=empty_proc_root,
+        )
+
+
+def test_a_clean_tmp_work_catalog_passes_and_no_engine_is_constructed_on_refusal(
+    driver: ModuleType, tmp_path: Path,
+) -> None:
+    """L-24: a genuinely clean candidate set passes cleanly and reports
+    every layer that ran."""
+    clean_work_catalog = tmp_path / "work"
+    clean_latch = tmp_path / "work" / "latch_nws_integer_c.db"
+    empty_proc_root = tmp_path / "proc"
+    empty_proc_root.mkdir()
+    report = driver.assert_replay_latch_store_is_not_live(
+        [clean_work_catalog, clean_latch], environ={}, proc_root=empty_proc_root,
+    )
+    assert report.oracle == "NO_NODE"
+    assert report.env_set is False
+    assert report.candidates_checked == 2
+    assert report.markers_checked >= 3
+    assert "live_store_guard=oracle:NO_NODE env:unset markers:" in report.render()
+
+
+def test_the_guard_runs_before_convert_live_capture_writes_the_work_catalog(
+    driver: ModuleType, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """CX-B3, ordering: `_convert_live_capture` WRITES (and `mkdir`s)
+    `args.work_catalog` -- the guard must run BEFORE that call, and BEFORE
+    any engine/strategy is ever constructed (`run_one_precision_arm` must
+    never be reached on a refusal)."""
+    from tests.unit.test_exec_state_db_path import _write_process
+
+    tape_instrument = _tape_instrument_depth_and_quote_in_window(driver, ask="0.40", size=10)
+    work_catalog = tmp_path / "work"
+    proc_root = tmp_path / "proc"
+    _write_process(
+        proc_root,
+        111,
+        [str(tmp_path / ".venv" / "bin" / "breezy-trade")],
+        {"POLYMARKET_US_EXEC_STATE_DB": str(work_catalog)},
+    )
+
+    def _fail_if_called(*args: object, **kwargs: object) -> object:
+        raise AssertionError("must never be reached once the guard refuses")
+
+    real_guard = driver.assert_replay_latch_store_is_not_live
+    monkeypatch.setattr(driver, "_convert_live_capture", _fail_if_called)
+    monkeypatch.setattr(driver, "run_one_precision_arm", _fail_if_called)
+    monkeypatch.setattr(
+        driver,
+        "_select_capture_instruments",
+        lambda catalog, *, climate_day: [tape_instrument],
+    )
+    monkeypatch.setattr(
+        driver,
+        "assert_replay_latch_store_is_not_live",
+        lambda candidates, **kw: real_guard(candidates, environ={}, proc_root=proc_root),
+    )
+
+    with pytest.raises(driver.ReplayLatchStoreIsLiveError):
+        driver.main(_minimal_argv(tmp_path, strategy=None))
+    assert not work_catalog.exists()  # _convert_live_capture's own mkdir never ran

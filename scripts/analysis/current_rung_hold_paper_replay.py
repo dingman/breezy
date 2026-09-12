@@ -21,6 +21,7 @@ from __future__ import annotations
 import argparse
 import csv
 import datetime as dt
+import os
 import sys
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from contextlib import AbstractContextManager, contextmanager
@@ -58,6 +59,12 @@ from breezy.persistence.scored_trial_store import write_scored_trials
 from breezy.registry.sites import default_registry
 from breezy.runtime.backtest_feed import as_backtest_data
 from breezy.runtime.backtest_harness import DEFAULT_BACKTEST_TRADER_ID, backtest
+from breezy.runtime.exec_state_db_path import (
+    ExecStateDbNotConfiguredError,
+    NodeStorePathCheckResult,
+    node_store_path_check,
+    resolve_store_path,
+)
 from breezy.runtime.paper_replay import (
     EXPIRATION_LEG_PREFIX,
     PAPER_TRIAL_ID_PREFIX,
@@ -315,6 +322,135 @@ def assert_paper_write_path_is_not_live(output_dir: Path) -> None:
             f"--output-dir {output_dir} resolves under the live scored_trials "
             "directory; the paper writer refuses to write there (L-22).",
         )
+
+
+class ReplayLatchStoreIsLiveError(ValueError):
+    """A replay candidate path resolves to (or under) the RUNNING node's own
+    exec-state store. Names ONLY the offending replay path -- mirroring
+    `node_store_path_check`'s own no-leak discipline -- never the live
+    path itself."""
+
+
+#: SP-4 increment E (E-1, AM-13): MERGED with `_LIVE_STORE_MARKERS` (no
+#: separate `_LIVE_LATCH_MARKERS`), extended with the live state-store
+#: root component -- read from this repo's OWN binding prohibition ("never
+#: open anything under `~/.local/share/breezy/state`") and the naming
+#: convention `deploy/systemd/breezy-trade-supervisor.service` uses for
+#: every OTHER path it documents (`~/.local/share/breezy/logs/...`); the
+#: unit file itself never inlines the exec-state DB path (it is supplied
+#: by a gitignored `EnvironmentFile=`, never read here -- L-24: this
+#: module never reads operator/venue credentials). This is layer 4 --
+#: additive on top of layers 1-3's path-derived teeth, so an imprecise
+#: marker only ever makes the guard MORE conservative, never less
+#: (L-12 widen-never-relax).
+_LIVE_STATE_STORE_ROOT_MARKER: Final[str] = "local/share/breezy/state"
+_GUARD_MARKERS: Final[tuple[str, ...]] = (*_LIVE_STORE_MARKERS, _LIVE_STATE_STORE_ROOT_MARKER)
+
+
+@dataclass(frozen=True, slots=True)
+class GuardReport:
+    """`assert_replay_latch_store_is_not_live`'s report -- printed by `main`
+    so a DEGRADED run (layer 1 unavailable, layer 2 unset) is never
+    mistaken for a passed one."""
+
+    oracle: str
+    env_set: bool
+    markers_checked: int
+    candidates_checked: int
+
+    def render(self) -> str:
+        return (
+            f"live_store_guard=oracle:{self.oracle} "
+            f"env:{'set' if self.env_set else 'unset'} "
+            f"markers:{self.markers_checked} candidates:{self.candidates_checked}"
+        )
+
+
+def assert_replay_latch_store_is_not_live(
+    candidates: Sequence[Path],
+    *,
+    environ: Mapping[str, str] | None = None,
+    proc_root: Path = Path("/proc"),
+) -> GuardReport:
+    """SP-4 increment E: FOUR ordered layers over EVERY candidate path,
+    composing the SHIPPED `node_store_path_check` oracle rather than
+    re-deriving it (L-11 -- the native exists and is USED). Never opens,
+    connects to, or reads any DB. Raises `ReplayLatchStoreIsLiveError`
+    naming ONLY the offending replay candidate, never the live path.
+
+    Layer 1 (PRIMARY): the running `breezy-trade` node's OWN `/proc`
+    environ, via `node_store_path_check` -- `MATCH` refuses immediately.
+    `MISMATCH`/`NO_NODE` are recorded, never treated as a pass signal (the
+    oracle compares exact paths only and cannot see directories);
+    `DISCOVERY_FAILED` is recorded as a degraded run, never silently read
+    as clean (see the module-level docstring on this function's own
+    degradation stance, below).
+    Layer 2: env resolution (`resolve_store_path`); unset in THIS process
+    is expected -- the node's own environ, read by layer 1, is what
+    matters here.
+    Layer 3: when layer 2 yields a path, refuse a candidate equal to it,
+    equal to its parent, or descending from that parent -- the latch DB
+    and its `-wal`/`-shm`/flock sidecars share the store's directory, the
+    real collision surface the exact-match oracle cannot express.
+    Layer 4 (always, in addition): the MERGED `_GUARD_MARKERS`.
+
+    Degradation stance: if layer 1 returns `DISCOVERY_FAILED` for every
+    candidate AND layer 2 is unset, only layer 4 has genuinely run. The
+    run is ALLOWED TO PROCEED -- refusing every replay on an unreadable
+    `/proc` would block real work for no safety gain while layer 4 still
+    fires -- but `GuardReport.render()` makes the degradation visible; the
+    artefact must carry it.
+    """
+    oracle_results: list[NodeStorePathCheckResult] = [
+        node_store_path_check(candidate, proc_root=proc_root) for candidate in candidates
+    ]
+    for candidate, result in zip(candidates, oracle_results, strict=True):
+        if result == "MATCH":
+            raise ReplayLatchStoreIsLiveError(
+                f"{candidate} is the RUNNING breezy-trade node's own exec "
+                "state store (node_store_path_check: MATCH); refusing.",
+            )
+    if "DISCOVERY_FAILED" in oracle_results:
+        oracle_summary = "DISCOVERY_FAILED"
+    elif "MISMATCH" in oracle_results:
+        oracle_summary = "MISMATCH"
+    else:
+        oracle_summary = "NO_NODE"
+
+    source = os.environ if environ is None else environ
+    try:
+        live_path: Path | None = resolve_store_path(source)
+        env_set = True
+    except ExecStateDbNotConfiguredError:
+        live_path = None
+        env_set = False
+
+    if live_path is not None:
+        live_real = Path(os.path.realpath(live_path))
+        live_parent = live_real.parent
+        for candidate in candidates:
+            candidate_real = Path(os.path.realpath(candidate))
+            if candidate_real == live_real or candidate_real == live_parent or (
+                live_parent in candidate_real.parents
+            ):
+                raise ReplayLatchStoreIsLiveError(
+                    f"{candidate} resolves to, or under, the exec state "
+                    "store's own directory; refusing.",
+                )
+
+    for candidate in candidates:
+        candidate_str = str(candidate.resolve())
+        if any(marker in candidate_str for marker in _GUARD_MARKERS):
+            raise ReplayLatchStoreIsLiveError(
+                f"{candidate} matches a live-store marker; refusing.",
+            )
+
+    return GuardReport(
+        oracle=oracle_summary,
+        env_set=env_set,
+        markers_checked=len(_GUARD_MARKERS),
+        candidates_checked=len(candidates),
+    )
 
 
 def read_asos_rows(csv_path: Path) -> list[dict[str, str]]:
@@ -842,6 +978,21 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     assert_paper_write_path_is_not_live(args.output_dir)
     climate_day = dt.date.fromisoformat(args.climate_day)
+
+    # SP-4 increment E (CX-B3): runs immediately after the check above and
+    # BEFORE `_convert_live_capture`, which WRITES (and `mkdir`s)
+    # `args.work_catalog` -- necessary, not merely preferable
+    # (`run_weather_strategy_backtests.py:1270`). The candidate set is
+    # built by ITERATING `PRECISION_ARMS`, never a hand-typed mode list, so
+    # a future third arm cannot silently escape layer 1's exact-match
+    # oracle (N-3).
+    guard_candidates = [
+        args.work_catalog,
+        *(args.work_catalog / f"latch_{mode}.db" for mode in PRECISION_ARMS),
+    ]
+    assert len(guard_candidates) == len(PRECISION_ARMS) + 1
+    guard_report = assert_replay_latch_store_is_not_live(guard_candidates)
+    print(guard_report.render())
 
     catalog = _convert_live_capture(
         quote_catalog=args.quote_catalog,
