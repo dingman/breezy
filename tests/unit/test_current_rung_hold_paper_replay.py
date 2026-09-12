@@ -541,6 +541,24 @@ def _tape_instrument_no_close(driver: ModuleType, *, ask: str, size: int) -> obj
     )
 
 
+def _tape_instrument_depth_and_quote_in_window(
+    driver: ModuleType, *, ask: str, size: int,
+) -> object:
+    """SP-4 increment D: BOTH the QuoteTick and the OrderBookDepth10 land
+    IN the decision window -- for dispatch-level tests that stub `run_one_
+    precision_arm` (never a real engine), where `_tape_instrument_no_
+    close`'s depth-1000ns-before-the-quote tie-break (needed only for a
+    REAL engine's depth-before-quote fill ordering) would otherwise trip
+    the NEW depth-basis coverage gate the continuous arm now runs under."""
+    instrument = _instrument()
+    facts = read_weather_bucket_facts(instrument.info)
+    quote = _quote(ask=ask, size=size, ts_event=WINDOW_OPEN_NS)
+    depth = _depth(ask=ask, size=size, ts_event=WINDOW_OPEN_NS)
+    return driver.TapeInstrument(
+        instrument=instrument, facts=facts, depths=[depth], quotes=[quote], closes=[],
+    )
+
+
 _OBSERVATION_ROWS = [{"station": ICAO, "valid": "2026-09-04 19:55", "metar": "KLAX T03000167"}]
 
 #: WINDOW_OPEN_NS is exactly 12:00 LST (see the module comment above); shift
@@ -1072,6 +1090,112 @@ def test_assert_decision_window_has_coverage_refuses_a_tape_with_no_quotes_at_al
 
 
 # ---------------------------------------------------------------------------
+# SP-4 increment D: the depth-basis coverage gate for the continuous arm.
+# ---------------------------------------------------------------------------
+
+
+def test_the_v2_arm_coverage_gate_is_unchanged(driver: ModuleType) -> None:
+    """CHARACTERISATION: an explicit `source="quote"` (the default every
+    existing caller already uses, L-28) is byte-identical to the three
+    pins above -- passes on an in-window quote, refuses an out-of-window
+    tape, refuses a tape with none at all."""
+    in_window = _tape_instrument_no_close(driver, ask="0.40", size=10)
+    driver.assert_decision_window_has_coverage(
+        [in_window],
+        station=STATION,
+        std_utc_offset_hours=LAX_STD_UTC_OFFSET_HOURS,
+        source="quote",
+    )  # must not raise
+
+    outside = _tape_instrument_outside_window(driver, ask="0.40", size=10)
+    with pytest.raises(driver.NoDecisionWindowCoverageError, match=r"08:00"):
+        driver.assert_decision_window_has_coverage(
+            [outside],
+            station=STATION,
+            std_utc_offset_hours=LAX_STD_UTC_OFFSET_HOURS,
+            source="quote",
+        )
+
+
+def test_a_depth_only_window_is_covered_for_the_continuous_arm(driver: ModuleType) -> None:
+    """A tape with ZERO `QuoteTick`s but ONE in-window, executable Depth10
+    ask is COVERED under `source="depth"` -- the continuous arm hunts on
+    depth too (L-35), so the v2 QuoteTick-only basis would wrongly refuse
+    a tape it can actually trade."""
+    instrument = _instrument()
+    facts = read_weather_bucket_facts(instrument.info)
+    depth = _depth(ask="0.40", size=10, ts_event=WINDOW_OPEN_NS)
+    depth_only = driver.TapeInstrument(
+        instrument=instrument, facts=facts, depths=[depth], quotes=[], closes=[],
+    )
+    with pytest.raises(driver.NoDecisionWindowCoverageError):
+        driver.assert_decision_window_has_coverage(
+            [depth_only],
+            station=STATION,
+            std_utc_offset_hours=LAX_STD_UTC_OFFSET_HOURS,
+            source="quote",
+        )
+    driver.assert_decision_window_has_coverage(
+        [depth_only],
+        station=STATION,
+        std_utc_offset_hours=LAX_STD_UTC_OFFSET_HOURS,
+        source="depth",
+    )  # must not raise
+
+
+def test_a_quote_only_instrument_with_no_in_window_depth_is_refused_for_the_continuous_arm(
+    driver: ModuleType,
+) -> None:
+    """L-24 NEGATIVE: an in-window QuoteTick with NO in-window executable
+    depth is REFUSED under `source="depth"` -- the depth basis must never
+    silently fall back to the quote population."""
+    instrument = _instrument()
+    facts = read_weather_bucket_facts(instrument.info)
+    quote = _quote(ask="0.40", size=10, ts_event=WINDOW_OPEN_NS)
+    outside_depth = _depth(ask="0.40", size=10, ts_event=_OUTSIDE_WINDOW_NS)
+    quote_only = driver.TapeInstrument(
+        instrument=instrument, facts=facts, depths=[outside_depth], quotes=[quote], closes=[],
+    )
+    driver.assert_decision_window_has_coverage(
+        [quote_only],
+        station=STATION,
+        std_utc_offset_hours=LAX_STD_UTC_OFFSET_HOURS,
+        source="quote",
+    )  # must not raise
+    with pytest.raises(driver.NoDecisionWindowCoverageError, match="executable Depth10 asks"):
+        driver.assert_decision_window_has_coverage(
+            [quote_only],
+            station=STATION,
+            std_utc_offset_hours=LAX_STD_UTC_OFFSET_HOURS,
+            source="depth",
+        )
+
+
+def test_a_depth_window_of_only_size_zero_pad_asks_is_refused_for_the_continuous_arm(
+    driver: ModuleType,
+) -> None:
+    """L-35 NEGATIVE, citing the shipped helper precedent
+    `test_depth10_quote.py::test_best_order_skips_the_size_zero_pad`
+    (`:196`): a Depth10 snapshot in-window whose ask side is ENTIRELY the
+    size-0 Arrow pad (`size=0`) has no executable ask, so it must not count
+    as coverage under `source="depth"`."""
+    instrument = _instrument()
+    facts = read_weather_bucket_facts(instrument.info)
+    pad_only_depth = _depth(ask="0.40", size=0, ts_event=WINDOW_OPEN_NS)
+    assert not any(level.size > 0 for level in pad_only_depth.asks)
+    padded = driver.TapeInstrument(
+        instrument=instrument, facts=facts, depths=[pad_only_depth], quotes=[], closes=[],
+    )
+    with pytest.raises(driver.NoDecisionWindowCoverageError, match="executable Depth10 asks"):
+        driver.assert_decision_window_has_coverage(
+            [padded],
+            station=STATION,
+            std_utc_offset_hours=LAX_STD_UTC_OFFSET_HOURS,
+            source="depth",
+        )
+
+
+# ---------------------------------------------------------------------------
 # (3) run-header visibility -- per-instrument quote/depth counts and LST span
 # ---------------------------------------------------------------------------
 def test_print_tape_instrument_header_reports_counts_and_lst_span(
@@ -1203,7 +1327,7 @@ def _run_main_with_stubbed_capture(
     without a real recorded catalog on disk -- the dispatch logic under
     test lives entirely between argument parsing and that call."""
     captured: dict[str, object] = {}
-    tape_instrument = _tape_instrument_no_close(driver, ask="0.40", size=10)
+    tape_instrument = _tape_instrument_depth_and_quote_in_window(driver, ask="0.40", size=10)
 
     def _spy_run_one_precision_arm(**kwargs: object) -> object:
         captured["strategy_cls"] = kwargs["strategy_cls"]
@@ -1492,7 +1616,7 @@ def test_the_continuous_arm_selects_capture_instruments_exactly_once(
     defect measured elsewhere (`test_whole_tape_paper_replay.py:948`) has
     no analogue on this NEW v3 path."""
     calls: list[int] = []
-    tape_instrument = _tape_instrument_no_close(driver, ask="0.40", size=10)
+    tape_instrument = _tape_instrument_depth_and_quote_in_window(driver, ask="0.40", size=10)
 
     def _counting_select(catalog: object, *, climate_day: dt.date) -> list[object]:
         calls.append(1)

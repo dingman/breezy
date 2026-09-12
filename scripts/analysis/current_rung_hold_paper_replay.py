@@ -27,7 +27,7 @@ from contextlib import AbstractContextManager, contextmanager
 from dataclasses import dataclass, field
 from decimal import Decimal
 from pathlib import Path
-from typing import TYPE_CHECKING, Final, cast
+from typing import TYPE_CHECKING, Final, Literal, cast
 
 from nautilus_trader.model.currencies import USD
 from nautilus_trader.model.enums import OrderStatus
@@ -91,6 +91,7 @@ from breezy.strategy.current_rung_hold.trial_day_latch import (
     TrialDayLatch,
     open_trial_day_latch,
 )
+from breezy.strategy.depth10 import best_order
 
 __all__ = [
     "PROVENANCE_HEADER_TEMPLATE",
@@ -232,31 +233,56 @@ def _lst_instant(now_ns: int, std_utc_offset_hours: float) -> dt.datetime:
 
 
 def assert_decision_window_has_coverage(
-    tape_instruments: Sequence[TapeInstrument], *, station: str, std_utc_offset_hours: float,
+    tape_instruments: Sequence[TapeInstrument],
+    *,
+    station: str,
+    std_utc_offset_hours: float,
+    source: Literal["quote", "depth"] = "quote",
 ) -> None:
-    """(b) A tape with zero `QuoteTick`s inside `[12:00,17:00)` LST is
-    refused loudly, never run to a silent zero-fill (module docstring;
-    L-23 shape). Counts EXACTLY what `CurrentRungHoldStrategy.on_quote_tick`
-    itself gates on: `_local_hour(tick.ts_event, std_utc_offset_hours)` in
-    `[_WINDOW_START_HOUR_LST, _WINDOW_END_HOUR_LST)` -- the same derivation,
-    imported, never re-derived.
+    """(b) A tape with zero in-window market data is refused loudly, never
+    run to a silent zero-fill (module docstring; L-23 shape).
+
+    `"quote"` (the default -- L-28: the default IS the population, so
+    every existing caller's behaviour is byte-unchanged) counts EXACTLY
+    what `CurrentRungHoldStrategy.on_quote_tick` itself gates on:
+    `_local_hour(tick.ts_event, std_utc_offset_hours)` in
+    `[_WINDOW_START_HOUR_LST, _WINDOW_END_HOUR_LST)` -- the same
+    derivation, imported, never re-derived.
+
+    `"depth"` (SP-4 increment D) counts the SAME predicate
+    `ContinuousRungHoldStrategy.on_order_book_depth` gates on -- a level
+    walk via `best_order(depth.asks) is not None`
+    (`breezy.strategy.depth10.best_order`, imported, never re-derived,
+    L-35) -- a genuinely EXECUTABLE Depth10 ask, never merely a recorded
+    depth snapshot (a one-sided book with only the size-0 Arrow pad on the
+    ask side must not count as coverage).
     """
-    quote_ts = [quote.ts_event for ti in tape_instruments for quote in ti.quotes]
-    if not quote_ts:
+    if source == "depth":
+        label = "executable Depth10 asks"
+        event_ts = [
+            depth.ts_event
+            for ti in tape_instruments
+            for depth in ti.depths
+            if best_order(depth.asks) is not None
+        ]
+    else:
+        label = "QuoteTicks"
+        event_ts = [quote.ts_event for ti in tape_instruments for quote in ti.quotes]
+    if not event_ts:
         raise NoDecisionWindowCoverageError(
-            f"{station}: tape carries zero QuoteTicks; cannot cover the "
+            f"{station}: tape carries zero {label}; cannot cover the "
             f"[{_WINDOW_START_HOUR_LST:02d}:00,{_WINDOW_END_HOUR_LST:02d}:00) LST decision window."
         )
     covered = any(
         _WINDOW_START_HOUR_LST <= _local_hour(ts, std_utc_offset_hours) < _WINDOW_END_HOUR_LST
-        for ts in quote_ts
+        for ts in event_ts
     )
     if covered:
         return
-    lo = _lst_instant(min(quote_ts), std_utc_offset_hours)
-    hi = _lst_instant(max(quote_ts), std_utc_offset_hours)
+    lo = _lst_instant(min(event_ts), std_utc_offset_hours)
+    hi = _lst_instant(max(event_ts), std_utc_offset_hours)
     raise NoDecisionWindowCoverageError(
-        f"{station}: tape's QuoteTicks span {lo.isoformat()} to {hi.isoformat()} LST, "
+        f"{station}: tape's {label} span {lo.isoformat()} to {hi.isoformat()} LST, "
         f"entirely outside the [{_WINDOW_START_HOUR_LST:02d}:00,{_WINDOW_END_HOUR_LST:02d}:00) "
         "LST decision window; refusing rather than a silent zero-fill run (L-23 shape)."
     )
@@ -834,10 +860,18 @@ def main(argv: Sequence[str] | None = None) -> int:
     # an uncovered tape's own counts/span must be visible even (especially)
     # when this run goes on to refuse it.
     print_tape_instrument_header(tape_instruments, std_utc_offset_hours)
-    # (b) L-23 shape: a tape with zero QuoteTicks inside the decision window
-    # is refused loudly here, never run to a silent `scored=0 refused=0`.
+    # (b) L-23 shape: a tape with zero in-window market data is refused
+    # loudly here, never run to a silent `scored=0 refused=0`. Increment D:
+    # the continuous arm hunts on Depth10 asks too, so its coverage basis
+    # is the SAME executable-ask predicate, never the v2 QuoteTick-only one.
+    coverage_source: Literal["quote", "depth"] = (
+        "depth" if strategy_cls is ContinuousRungHoldBacktestStrategy else "quote"
+    )
     assert_decision_window_has_coverage(
-        tape_instruments, station=args.station, std_utc_offset_hours=std_utc_offset_hours,
+        tape_instruments,
+        station=args.station,
+        std_utc_offset_hours=std_utc_offset_hours,
+        source=coverage_source,
     )
 
     observation_rows = read_asos_rows(args.asos_cache_csv)
