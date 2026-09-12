@@ -255,6 +255,30 @@ _ORDER_KEYS: Final[frozenset[str]] = frozenset(
     }
 )
 
+#: Four fields observed live on ``GET /v1/order/{id}`` at 2026-09-11T20:20:31Z
+#: while resolving the AMBIGUOUS IOC ``CEBPX0EVTTMX``
+#: (``tc-temp-sfohigh-2026-09-11-gte70lt71f``) that the pinned SDK snapshot
+#: (``polymarket_us_0.1.2``, frozen at package release) does not declare.
+#: Declared here, repo-side, as DECLARED-BUT-UNREAD -- same treatment as
+#: :data:`_USER_BALANCE_DRIFT_ALLOWED_KEYS` -- so the resolver's GET-status
+#: read does not refuse an otherwise-healthy terminal/PARTIALLY_FILLED body
+#: over a name it has never needed (NOTE: ``_known_order`` is also reached
+#: from :func:`parse_fill_report`'s nested order, so the create-order /
+#: fill classification is widened by the same four unread names), but not
+#: merged into :data:`_ORDER_KEYS`
+#: itself -- that set must stay exactly what the snapshot declares, or the
+#: drift check in ``test_polymarket_us_exec_snapshot_drift.py`` goes vacuous.
+#: None of these four is read for money or state by :func:`_known_order`,
+#: :func:`parse_order_status_report` or :func:`parse_fill_report`:
+#: ``outcomeSide`` is a known venue concept (BL-6: NO is a side of the same
+#: book) already unread by every mapper here; ``action``,
+#: ``lastTransactTime`` and ``manualOrderIndicator`` are FIX-style order
+#: fields the mapper has never consumed. A field the venue adds beyond
+#: THESE four is still an unknown key and is still refused.
+_ORDER_DRIFT_ALLOWED_KEYS: Final[frozenset[str]] = frozenset(
+    {"action", "lastTransactTime", "manualOrderIndicator", "outcomeSide"}
+)
+
 #: ``Execution`` (``types/orders.py:95-108``).
 _EXECUTION_KEYS: Final[frozenset[str]] = frozenset(
     {
@@ -567,7 +591,9 @@ def _assert_fill_progress_consistent(
 
 
 def _known_order(payload: object, *, context: str) -> Mapping[str, Any]:
-    order = _assert_known_keys(payload, known=_ORDER_KEYS, context=context)
+    order = _assert_known_keys(
+        payload, known=_ORDER_KEYS | _ORDER_DRIFT_ALLOWED_KEYS, context=context
+    )
     metadata = order.get("marketMetadata")
     if metadata is not None:
         _assert_known_keys(

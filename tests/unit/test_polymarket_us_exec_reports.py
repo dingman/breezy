@@ -230,6 +230,60 @@ def test_unknown_order_key_is_refused(
         )
 
 
+def test_the_2026_09_11_drift_fields_are_declared_but_unread(
+    order: dict[str, Any], instrument: BinaryOption
+) -> None:
+    """L-36 resolver evidence, 2026-09-11T20:20:31Z (venue order
+    ``CEBPX0EVTTMX``): the live GET body carries ``action``,
+    ``lastTransactTime``, ``manualOrderIndicator`` and ``outcomeSide`` beyond
+    the pinned snapshot. A terminal state with a full ``cumQuantity`` maps
+    cleanly once those four are declared -- none of them is read by the
+    mapper, so the report is identical to the one built from the plain
+    fixture."""
+    drifted = {
+        **order,
+        "state": "ORDER_STATE_FILLED",
+        "cumQuantity": order["quantity"],
+        "leavesQuantity": 0,
+        "action": "NEW",
+        "lastTransactTime": order["createTime"],
+        "manualOrderIndicator": "MANUAL_ORDER_INDICATOR_AUTOMATIC",
+        "outcomeSide": "YES",
+    }
+
+    report = parse_order_status_report(
+        drifted,
+        instrument=instrument,
+        account_id=ACCOUNT_ID,
+        report_id=REPORT_ID,
+        ts_init=TS_INIT,
+    )
+
+    assert report.order_status == OrderStatus.FILLED
+    assert report.filled_qty == Quantity.from_str("10.00")
+
+
+def test_a_fifth_undeclared_field_alongside_the_drift_set_is_still_refused(
+    order: dict[str, Any], instrument: BinaryOption
+) -> None:
+    """The drift allowance is exactly four fields, not "anything new"."""
+    with pytest.raises(ExecutionReportMappingError, match="settlementInstruction"):
+        parse_order_status_report(
+            {
+                **order,
+                "action": "NEW",
+                "lastTransactTime": order["createTime"],
+                "manualOrderIndicator": "MANUAL_ORDER_INDICATOR_AUTOMATIC",
+                "outcomeSide": "YES",
+                "settlementInstruction": "AUTO",
+            },
+            instrument=instrument,
+            account_id=ACCOUNT_ID,
+            report_id=REPORT_ID,
+            ts_init=TS_INIT,
+        )
+
+
 def test_order_for_another_market_is_refused(
     order: dict[str, Any], instrument: BinaryOption
 ) -> None:

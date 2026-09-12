@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+from dataclasses import replace
 from decimal import Decimal
 from pathlib import Path
 from typing import Any
@@ -35,6 +36,7 @@ from nautilus_trader.common.factories import OrderFactory
 from nautilus_trader.model.events import OrderDenied
 
 from breezy.adapters.polymarket_us.exec.client import (
+    RESOLVER_CONTEXT_KEY_PREFIX,
     AmbiguousResolverContext,
     PolymarketUSExecutionClient,
     StartupPositionSnapshot,
@@ -71,6 +73,14 @@ from tests.unit.test_polymarket_us_permit_issuance import enable_operator_gate
 from tests.unit.test_polymarket_us_submit_order_chain import (
     write_canonical_verified,  # noqa: F401 -- reused as a fixture
 )
+
+#: Captured at IMPORT time, before any test's `monkeypatch.setattr(asyncio,
+#: "sleep", ...)` can run. `_run_n_passes_recording_sleeps` is called TWICE
+#: in one test (item 2, 2026-09-11 addendum): a helper that instead did
+#: `real_sleep = asyncio.sleep` on its second call would capture the FIRST
+#: call's still-installed fake, whose own closed-over pass budget is
+#: already exhausted -- parking forever on an `Event` nothing ever sets.
+_REAL_ASYNCIO_SLEEP = asyncio.sleep
 
 
 def _ambiguous_create_body(order_id: str) -> bytes:
@@ -176,6 +186,148 @@ async def _run_exactly_one_pass(client: PolymarketUSExecutionClient) -> None:
     finally:
         task.cancel()
         await asyncio.gather(task, return_exceptions=True)
+
+
+async def _run_n_passes_recording_sleeps(
+    client: PolymarketUSExecutionClient,
+    *,
+    passes: int,
+    monkeypatch: pytest.MonkeyPatch,
+) -> list[float]:
+    """Drive exactly ``passes`` passes of the real resolver coroutine,
+    recording the ``asyncio.sleep`` DURATION requested before each one --
+    an injected clock/sleep, never wall time (item 2, 2026-09-11 incident
+    addendum).
+
+    ``_resolver_poll_interval_secs`` is left at its real default (5.0s) so
+    the backoff math under test is exercised at production values;
+    ``asyncio.sleep`` itself is monkeypatched so none of it is actually
+    waited. The (``passes`` + 1)-th sleep call parks on an ``Event`` that
+    never fires, which bounds the run to EXACTLY ``passes`` passes -- the
+    same problem, and the same fix, ``_run_exactly_one_pass`` documents: a
+    faked sleep never really suspends, so an unbounded resolver loop would
+    otherwise run far more passes than intended inside any finite yield
+    budget.
+    """
+    sleeps: list[float] = []
+    calls = {"count": 0}
+    never = asyncio.Event()
+
+    async def fake_sleep(seconds: float) -> None:
+        calls["count"] += 1
+        if calls["count"] > passes:
+            await never.wait()
+        sleeps.append(seconds)
+        await _REAL_ASYNCIO_SLEEP(0)
+
+    monkeypatch.setattr(asyncio, "sleep", fake_sleep)
+    task = asyncio.get_event_loop().create_task(client._resolve_ambiguous_intents())
+    try:
+        for _ in range(passes * 20 + 20):
+            await _REAL_ASYNCIO_SLEEP(0)
+    finally:
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+    return sleeps
+
+
+@pytest.mark.asyncio
+async def test_resolver_backoff_doubles_on_consecutive_get_failures_and_resets_on_success(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    write_canonical_verified: None,  # noqa: F811
+) -> None:
+    """Item 2 (2026-09-11 incident addendum): 5s, 5s, 10s, 20s, 40s on four
+    consecutive GET failures, then a mapped (even non-terminal) GET resets
+    the counter and the very next sleep is back at the plain 5s base."""
+    enable_operator_gate(monkeypatch, order_count="2")
+    with operator_control_env(MAX_DAILY_BUDGET_USD_ENV_VAR, "1000.00"), operator_control_env(
+        MAX_POSITION_COST_USD_ENV_VAR, "10.00",
+    ):
+        client, order_id, slug, _latch_cm, _order_events = await _arm_one_ambiguous_intent(tmp_path)
+        path = f"/v1/order/{order_id}"
+        # No payload wired for this path: the stub's `self._payloads[path]`
+        # raises `KeyError`, exactly the "GET failure" shape the backoff
+        # counts (`except Exception` in `_resolve_ambiguous_intents`).
+
+        sleeps = await _run_n_passes_recording_sleeps(client, passes=5, monkeypatch=monkeypatch)
+
+        assert sleeps == [5.0, 5.0, 10.0, 20.0, 40.0]
+        assert client._resolver_consecutive_failures == 5
+
+        client._private_read._payloads[path] = _order_get_body(  # type: ignore[attr-defined]
+            order_id, slug=slug, state="ORDER_STATE_NEW", cum_quantity=0,
+        )
+        sleeps_after_success = await _run_n_passes_recording_sleeps(
+            client, passes=2, monkeypatch=monkeypatch,
+        )
+
+        assert sleeps_after_success[0] == 80.0, (
+            "the sleep BEFORE the recovering pass still backs off"
+        )
+        assert client._resolver_consecutive_failures == 0
+        assert sleeps_after_success[1] == 5.0, "reset: the pass AFTER success is back at the base"
+        await client._disconnect()
+
+
+@pytest.mark.asyncio
+async def test_a_stale_open_intent_alerts_once_and_resets_on_retirement(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    write_canonical_verified: None,  # noqa: F811
+) -> None:
+    """Item 3 (2026-09-11 incident addendum): a still-AMBIGUOUS intent
+    whose durable ``created_ns`` is already >15 minutes old surfaces exactly
+    ONE entry on the ``stale_ambiguous_intent_alerts`` health property,
+    never a second time for the same intent, and the entry clears on
+    retirement so a later intent can surface again."""
+    enable_operator_gate(monkeypatch, order_count="2")
+    with operator_control_env(MAX_DAILY_BUDGET_USD_ENV_VAR, "1000.00"), operator_control_env(
+        MAX_POSITION_COST_USD_ENV_VAR, "10.00",
+    ):
+        client, order_id, slug, _latch_cm, _order_events = await _arm_one_ambiguous_intent(tmp_path)
+
+        current = client._latch.current_open()
+        assert current is not None
+        raw_context = client._store_get(f"{RESOLVER_CONTEXT_KEY_PREFIX}{current.intent_id}")
+        assert raw_context is not None
+        context = AmbiguousResolverContext.from_bytes(raw_context)
+        backdated = replace(
+            context, created_ns=client._clock.timestamp_ns() - (16 * 60 * 1_000_000_000),
+        )
+        client._store_set(
+            f"{RESOLVER_CONTEXT_KEY_PREFIX}{current.intent_id}", backdated.to_bytes(),
+        )
+        # Non-terminal GET: the intent stays OPEN across every pass below.
+        client._private_read._payloads[  # type: ignore[attr-defined]
+            f"/v1/order/{order_id}"
+        ] = _order_get_body(order_id, slug=slug, state="ORDER_STATE_NEW", cum_quantity=0)
+
+        await _run_resolver_passes(client, count=3)
+
+        alerts = client.stale_ambiguous_intent_alerts
+        assert len(alerts) == 1, "never re-surfaced twice while the same intent stays OPEN"
+        assert alerts[0]["severity"] == "CRITICAL"
+        assert alerts[0]["event"] == "open_intent_stale"
+        assert alerts[0]["intent_id"] == current.intent_id
+        assert alerts[0]["venue_order_id"] == order_id
+        assert int(alerts[0]["age_minutes"]) >= 16
+
+        # Retire it (terminal-zero, no LONG), then arm a SECOND ambiguous
+        # intent equally stale -- the dedup must not still be latched.
+        client._private_read._payloads[f"/v1/order/{order_id}"] = _order_get_body(  # type: ignore[attr-defined]
+            order_id, slug=slug, state="ORDER_STATE_CANCELED", cum_quantity=0,
+        )
+        client._private_read._payloads["/v1/portfolio/positions"] = {  # type: ignore[attr-defined]
+            "positions": {}, "eof": True,
+        }
+        await _run_resolver_passes(client, count=1)
+        assert client._latch.current() is not None
+        assert client._latch.current().state is SubmitIntentState.RETIRED
+        assert current.intent_id not in client._resolver_stale_alerted_intent_ids
+        assert client.stale_ambiguous_intent_alerts == ()
+
+        await client._disconnect()
 
 
 @pytest.mark.asyncio

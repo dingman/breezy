@@ -381,6 +381,14 @@ BUDGET_RESTORE_KEY_PREFIX: Final[str] = f"{STATE_KEY_NAMESPACE}budget_restore/"
 #: context on the currently-OPEN submit intent. Build-side; revisable.
 _RESOLVER_POLL_INTERVAL_SECS: Final[float] = 5.0
 
+#: Ceiling on the CONSECUTIVE-failure backoff below -- never wait longer
+#: than this between resolver attempts no matter how many failures in a row.
+_RESOLVER_BACKOFF_CAP_SECS: Final[float] = 300.0
+
+#: Age of a durable resolver context's ``created_ns``, past which an intent
+#: still AMBIGUOUS raises the one-shot stale-intent alert below.
+_STALE_INTENT_ALERT_AFTER_NS: Final[int] = 15 * 60 * 1_000_000_000
+
 #: The only order side Breezy OPENS with. ``allow_short=False`` is permanent
 #: (``strategy/weather_common/risk.py:139``).
 LONG_ONLY_SIDE: Final[str] = "BUY"
@@ -948,6 +956,26 @@ class PolymarketUSExecutionClient(LiveExecutionClient):
         # interval.
         self._resolver_error_count: int = 0
         self._resolver_errored_intent_ids: set[str] = set()
+        # Item 2 (2026-09-11 incident addendum): consecutive resolver
+        # failures (mapping error, GET exception, 5xx) since the last
+        # successful GET -- drives the bounded exponential backoff inlined
+        # in `_resolve_ambiguous_intents` itself (never a helper method: a
+        # new callee there is an E0-NOSEND-RESOLVER violation against
+        # ``tests/unit/test_execution_egress_firewall_guard.py``, which
+        # stays untouched). Reset to 0 by that same coroutine on any
+        # successful GET.
+        self._resolver_consecutive_failures: int = 0
+        self._resolver_last_failure_kind: dict[str, str] = {}
+        # Item 3 (2026-09-11 incident addendum): one-shot stale-intent
+        # bookkeeping for `stale_ambiguous_intent_alerts` above. An intent id
+        # enters `_resolver_stale_alerted_intent_ids` the first time its
+        # durable context's age crosses `_STALE_INTENT_ALERT_AFTER_NS` while
+        # still unresolved (never re-added while it stays the same OPEN
+        # intent); `_retire` drops both entries on retirement. Mutated ONLY
+        # by whole-value reassignment (`x = x | {...}` / dict-unpacking),
+        # never `.add`/`.update`, for the same E0-NOSEND-RESOLVER reason.
+        self._resolver_stale_alerted_intent_ids: frozenset[str] = frozenset()
+        self._resolver_stale_alert_details: dict[str, Mapping[str, str]] = {}
 
     # -- observable state ---------------------------------------------------
 
@@ -1098,6 +1126,31 @@ class PolymarketUSExecutionClient(LiveExecutionClient):
         """Overridable seam: tests shrink this to iterate the loop fast."""
         return _RESOLVER_POLL_INTERVAL_SECS
 
+    @property
+    def stale_ambiguous_intent_alerts(self) -> tuple[Mapping[str, str], ...]:
+        """Item 3 (2026-09-11 incident addendum): the health surface for a
+        still-OPEN, still-unresolved intent whose durable context's age has
+        crossed `_STALE_INTENT_ALERT_AFTER_NS`.
+
+        **Read-only surface, deliberately -- not an emitted alert.** This
+        module cannot call `breezy.runtime.health.emit_alert` (barrier
+        E0-TRANSPORT, `_refuse`'s own docstring) or add a new callee to
+        `_resolve_ambiguous_intents` (E0-NOSEND-RESOLVER,
+        ``tests/unit/test_execution_egress_firewall_guard.py``, which stays
+        untouched). Exactly like `trading_refusals` / `resolver_error_count`
+        above, the resolver only RECORDS the condition here; the runtime
+        layer's health-watch subscriber is the one place with both an
+        `AlertSink` and permission to import it, and is where the CRITICAL
+        `open_intent_stale` `AlertPayload` (intent_id, venue_order_id, age
+        in minutes, last failure kind) is built from this tuple.
+
+        One entry per currently-latched intent id -- `_retire` (the single
+        chokepoint every resolution path runs through) drops the entry the
+        moment the intent retires, so a LATER intent reaching the same age
+        surfaces again.
+        """
+        return tuple(self._resolver_stale_alert_details.values())
+
     async def _resolve_ambiguous_intents(self) -> None:
         """Resolution A (plan rev 6.1): named, firewall-scanned client
         coroutine for the with-id AMBIGUOUS class (L-36). Started from
@@ -1136,7 +1189,25 @@ class PolymarketUSExecutionClient(LiveExecutionClient):
         exists at all before acting.
         """
         while True:
-            await asyncio.sleep(self._resolver_poll_interval_secs())
+            # Item 2 (2026-09-11 incident addendum): bounded exponential
+            # backoff on CONSECUTIVE resolver failures, inlined here rather
+            # than in a helper method -- a new callee in THIS coroutine is
+            # an E0-NOSEND-RESOLVER violation
+            # (``tests/unit/test_execution_egress_firewall_guard.py``,
+            # which stays untouched), and every name below (`asyncio.sleep`,
+            # `self._resolver_poll_interval_secs`) is already permitted.
+            # Base interval unaffected: 0.0 doubled is still 0.0, so tests
+            # that shrink the base to iterate fast see no behaviour change.
+            # 5s, 5s, 10s, 20s, ... capped at `_RESOLVER_BACKOFF_CAP_SECS`.
+            base_interval = self._resolver_poll_interval_secs()
+            if self._resolver_consecutive_failures <= 0:
+                sleep_secs = base_interval
+            else:
+                doubled = base_interval * (2 ** (self._resolver_consecutive_failures - 1))
+                # Deliberately NOT `min(...)`: a builtin call here is a new,
+                # unpermitted callee under E0-NOSEND-RESOLVER (see above).
+                sleep_secs = doubled if doubled < _RESOLVER_BACKOFF_CAP_SECS else _RESOLVER_BACKOFF_CAP_SECS  # noqa: E501, FURB136
+            await asyncio.sleep(sleep_secs)
             if self._latch is None:
                 self._log.debug("resolver: no latch bound; skipping this pass")
                 continue
@@ -1184,6 +1255,37 @@ class PolymarketUSExecutionClient(LiveExecutionClient):
                     f"foreign intent_id {context.intent_id}; refusing to act on it"
                 )
                 continue
+            # Item 3 (2026-09-11 incident addendum), inlined for the same
+            # E0-NOSEND-RESOLVER reason as the backoff above: a one-shot
+            # health-surface entry (`stale_ambiguous_intent_alerts`) the
+            # first time this OPEN intent's age crosses
+            # `_STALE_INTENT_ALERT_AFTER_NS`. Mutated by whole-value
+            # reassignment only (`|`, dict-unpacking) -- never `.add`, which
+            # would itself be a new, unpermitted callee here.
+            stale_age_ns = self._clock.timestamp_ns() - context.created_ns
+            if (
+                stale_age_ns >= _STALE_INTENT_ALERT_AFTER_NS
+                and context.intent_id not in self._resolver_stale_alerted_intent_ids
+            ):
+                self._resolver_stale_alerted_intent_ids = (
+                    self._resolver_stale_alerted_intent_ids | {context.intent_id}
+                )
+                # Deliberately NOT `.get(...)`: a dict-method call here is a
+                # new, unpermitted callee under E0-NOSEND-RESOLVER (see the
+                # backoff comment above).
+                last_failure_kind = self._resolver_last_failure_kind[context.intent_id] if context.intent_id in self._resolver_last_failure_kind else "none"  # noqa: E501, SIM401
+                self._resolver_stale_alert_details = {
+                    **self._resolver_stale_alert_details,
+                    context.intent_id: {
+                        "severity": "CRITICAL",
+                        "event": "open_intent_stale",
+                        "site": "global",
+                        "intent_id": context.intent_id,
+                        "venue_order_id": context.venue_order_id,
+                        "age_minutes": f"{stale_age_ns // 60_000_000_000}",
+                        "last_failure_kind": last_failure_kind,
+                    },
+                }
             instrument = self._cache.instrument(InstrumentId.from_str(context.instrument_id))
             if instrument is None:
                 self._log.warning(
@@ -1196,9 +1298,13 @@ class PolymarketUSExecutionClient(LiveExecutionClient):
                     submit_chain.order_by_id_path(context.venue_order_id)
                 )
             except Exception as exc:  # noqa: BLE001 - GET failure stays AMBIGUOUS
+                self._resolver_consecutive_failures += 1
+                self._resolver_last_failure_kind[context.intent_id] = "get_exception"
                 self._log.warning(
                     f"resolver GET failed for venue order {context.venue_order_id} "
-                    f"({type(exc).__name__}: {exc}); stays AMBIGUOUS"
+                    f"({type(exc).__name__}: {exc}); stays AMBIGUOUS "
+                    f"(backoff: {self._resolver_consecutive_failures} consecutive "
+                    "failure(s))"
                 )
                 continue
             order_body: Mapping[str, Any]
@@ -1222,11 +1328,20 @@ class PolymarketUSExecutionClient(LiveExecutionClient):
                     ts_init=self._clock.timestamp_ns(),
                 )
             except Exception as exc:  # noqa: BLE001 - malformed stays AMBIGUOUS
+                self._resolver_consecutive_failures += 1
+                self._resolver_last_failure_kind[context.intent_id] = "mapping_error"
                 self._log.warning(
                     f"resolver GET body for venue order {context.venue_order_id} "
-                    f"did not map ({type(exc).__name__}: {exc}); stays AMBIGUOUS"
+                    f"did not map ({type(exc).__name__}: {exc}); stays AMBIGUOUS "
+                    f"(backoff: {self._resolver_consecutive_failures} consecutive "
+                    "failure(s))"
                 )
                 continue
+            # A body that MAPPED is a successful GET -- reset the backoff
+            # even when the status below is PENDING/non-terminal: the venue
+            # is reachable and the shape still parses, which is exactly what
+            # the backoff exists to detect the absence of.
+            self._resolver_consecutive_failures = 0
 
             if report.order_status is OrderStatus.PARTIALLY_FILLED:
                 # A LIVE state: the order can still receive more fills or
@@ -2431,6 +2546,14 @@ class PolymarketUSExecutionClient(LiveExecutionClient):
             submit_chain.retirement_member(self._retirement_reasons, retire_name),
             now_ns=now_ns,
         )
+        # Item 3 (2026-09-11 incident addendum): every retirement path runs
+        # through here, so this is the ONE place the stale-intent alert's
+        # bookkeeping clears -- a later intent that reaches the same age
+        # alerts again. A no-op when `intent_id` was never latched.
+        self._resolver_stale_alerted_intent_ids = self._resolver_stale_alerted_intent_ids - {
+            intent_id
+        }
+        self._resolver_stale_alert_details.pop(intent_id, None)
 
     def _generate_submitted(self, order: Any, now_ns: int) -> None:
         """``OrderSubmitted`` -- shared by every D9 leaf that reaches a POST."""
