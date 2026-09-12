@@ -106,9 +106,10 @@ EnvironmentFile=-%h/breezy/operator.env
 # webhook when set.
 Environment=BREEZY_TRADING_ENABLED=1
 Environment=BREEZY_ORDERS_ENABLED=1
-Environment=BREEZY_CURRENT_RUNG_HOLD=1
+Environment=BREEZY_CONTINUOUS_RUNG_HOLD=1
 Environment=BREEZY_LIVE_OBSERVATIONS=1
 Environment=BREEZY_TRADING_OPERATOR_ID=%u
+Environment=BREEZY_CRH_CONT_PHASE0_SHADOW=0
 
 # Byte-identical to the hand-launch. The console script REQUIRES the distinct
 # first positional token `breezy-trade-supervisor-daily`
