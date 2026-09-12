@@ -32,12 +32,15 @@ from nautilus_trader.model.events import OrderDenied, OrderFilled, OrderRejected
 from nautilus_trader.model.identifiers import ClientId, StrategyId, TradeId, TraderId
 from nautilus_trader.model.objects import Money, Price, Quantity
 
-from breezy.adapters.polymarket_us import write_transport
+from breezy.adapters.polymarket_us import parsing, write_transport
+from breezy.adapters.polymarket_us.errors import VenuePayloadError
+from breezy.adapters.polymarket_us.exec import submit_chain
 from breezy.adapters.polymarket_us.exec.client import PolymarketUSExecutionClient
 from breezy.adapters.polymarket_us.exec.endpoints import (
     ACCOUNT_BALANCES_PATH,
     PORTFOLIO_POSITIONS_PATH,
 )
+from breezy.adapters.polymarket_us.exec.reports import parse_fill_report
 from breezy.adapters.polymarket_us.exec.submit_chain import (
     KIND_ACCEPT_FILL,
     KIND_AMBIGUOUS,
@@ -1863,3 +1866,243 @@ def test_i1a_reject_and_zero_fill_outcomes_carry_no_cumulative_totals() -> None:
     assert zero_outcome.cumulative_cost is None
     assert zero_outcome.cumulative_fee is None
     assert zero_outcome.fee_reconciled is False
+
+
+# ---------------------------------------------------------------------------
+# SP-2 I1 -- a swallowed underivable filled cost becomes loud (H1)
+# ---------------------------------------------------------------------------
+
+
+def test_an_underivable_filled_cost_names_every_cost_field_without_a_value() -> None:
+    """AC-8: the message names all four candidate fields with a closed-set
+    token each (absent/present/unparseable) plus the execution's own
+    sanitised key tree -- never a value."""
+    order_present: dict[str, Any] = {
+        "id": "ord-1",
+        "avgPx": {"value": "0.41", "currency": "USD"},
+        "cumQuantity": "1",
+    }
+    execution_present: dict[str, Any] = {
+        "order": order_present,
+        "lastPx": {"value": "0.41", "currency": "USD"},
+        "lastShares": "1",
+        "secretField": "SECRET_VALUE",
+    }
+
+    message = submit_chain._underivable_cost_message(execution_present)
+
+    assert "order.avgPx=present" in message
+    assert "order.cumQuantity=present" in message
+    assert "lastPx=present" in message
+    assert "lastShares=present" in message
+    assert "0.41" not in message
+    assert "SECRET_VALUE" not in message
+    assert "secretField" in message
+
+    order_absent: dict[str, Any] = {"id": "ord-2"}
+    execution_absent: dict[str, Any] = {"order": order_absent}
+
+    absent_message = submit_chain._underivable_cost_message(execution_absent)
+
+    assert "order.avgPx=absent" in absent_message
+    assert "order.cumQuantity=absent" in absent_message
+    assert "lastPx=absent" in absent_message
+    assert "lastShares=absent" in absent_message
+
+    order_bad: dict[str, Any] = {
+        "id": "ord-3",
+        "avgPx": {"value": "not-a-number", "currency": "USD"},
+        "cumQuantity": "nope",
+    }
+    execution_bad: dict[str, Any] = {
+        "order": order_bad,
+        "lastPx": {"value": "still-bad", "currency": "USD"},
+        "lastShares": "nope",
+    }
+
+    bad_message = submit_chain._underivable_cost_message(execution_bad)
+
+    assert "order.avgPx=unparseable" in bad_message
+    assert "order.cumQuantity=unparseable" in bad_message
+    assert "lastPx=unparseable" in bad_message
+    assert "lastShares=unparseable" in bad_message
+
+
+def test_fill_generation_records_an_error_when_the_filled_cost_cannot_be_derived(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """RV2.1-A2/A3: the H1 swallow is loud. In-process perturbation of
+    `_filled_cost_from_execution` -- the branch is otherwise unconstructible
+    in life (T1; see the characterisation test below)."""
+    slug = str(build_instrument().raw_symbol)
+    order = _i1a_order(slug, cum_quantity="1", avg_px="0.41", commission_total=None)
+    execution = _i1a_leg(
+        order,
+        exec_id="exe-1",
+        trade_id="trd-1",
+        last_shares="1",
+        last_px="0.41",
+        commission="0.03",
+    )
+    monkeypatch.setattr(submit_chain, "_filled_cost_from_execution", lambda _e: None)
+    errors: list[str] = []
+
+    result = fill_generation(
+        execution,
+        instrument=build_instrument(),
+        account_id=ACCOUNT_ID,
+        ts_init=TS_INIT,
+        errors=errors,
+    )
+
+    assert result is None
+    assert len(errors) == 1
+    assert "lastPx=" in errors[0]
+    assert "0.41" not in errors[0]
+
+
+def test_a_body_whose_filled_cost_is_underivable_stays_ambiguous_with_a_fill_parse_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Same perturbation, through the classify chain: KIND_AMBIGUOUS with a
+    names-only `fill_parse_error`, never a value."""
+    slug = str(build_instrument().raw_symbol)
+    order = _i1a_order(slug, cum_quantity="1", avg_px="0.41", commission_total=None)
+    leg = _i1a_leg(
+        order,
+        exec_id="exe-1",
+        trade_id="trd-1",
+        last_shares="1",
+        last_px="0.41",
+        commission="0.03",
+    )
+    monkeypatch.setattr(submit_chain, "_filled_cost_from_execution", lambda _e: None)
+
+    outcome = _classify_i1a([leg])
+
+    assert outcome.kind == KIND_AMBIGUOUS
+    assert outcome.fill is None
+    assert outcome.fill_parse_error is not None
+    assert "lastPx=" in outcome.fill_parse_error
+    assert "0.41" not in outcome.fill_parse_error
+
+
+def test_a_leg_that_maps_cleanly_always_yields_a_derivable_filled_cost(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """CHARACTERISATION (T1). Round-1's probe found no real counter-example
+    -- do not try to build a fixture that maps cleanly yet lacks a derivable
+    cost, it does not exist, because `parse_fill_report`'s own amount
+    parsing is strictly stronger than `_filled_cost_from_execution`'s. This
+    in-process perturbation of `parsing._to_decimal` (never
+    `reports._to_decimal`, which this path does not reach -- Codex probe
+    (i)) is the evidentiary anchor: it PROVES the swallow at I1 would be
+    reachable if this coupling ever broke, without weakening
+    `parse_fill_report` on disk (`git diff --stat src/` stays empty: the
+    perturbation is reverted automatically by the `monkeypatch` fixture).
+
+    Order-level ``avgPx``/``cumQuantity`` are ABSENT (unlike the other I1
+    fixtures): `_filled_cost_from_execution` checks those FIRST and would
+    otherwise short-circuit before ever looking at `lastPx`, masking the
+    exact coupling this test exists to pin.
+    """
+    slug = str(build_instrument().raw_symbol)
+    order = _i1a_order(slug, cum_quantity=None, avg_px=None, commission_total=None)
+    execution = {
+        **_i1a_leg(
+            order,
+            exec_id="exe-1",
+            trade_id="trd-1",
+            last_shares="1",
+            last_px="0.41",
+            commission="0.03",
+        ),
+        "lastPx": {"value": {"nested": 1}, "currency": "USD"},
+    }
+
+    # Baseline: today this fixture fails to MAP at all -- it never reaches
+    # the underivable-cost branch, because the mapper's own amount parsing
+    # refuses the nested `value` before `_filled_cost_from_execution` is
+    # ever consulted.
+    errors: list[str] = []
+    baseline = fill_generation(
+        execution,
+        instrument=build_instrument(),
+        account_id=ACCOUNT_ID,
+        ts_init=TS_INIT,
+        errors=errors,
+    )
+    assert baseline is None
+    assert len(errors) == 1
+    assert "no filled cost is derivable" not in errors[0]
+
+    real_to_decimal = parsing._to_decimal
+
+    def _stub_to_decimal(
+        value: object, *, field: str, error: type[VenuePayloadError]
+    ) -> Decimal:
+        if isinstance(value, Mapping):
+            return Decimal("0.41")
+        return real_to_decimal(value, field=field, error=error)
+
+    monkeypatch.setattr(parsing, "_to_decimal", _stub_to_decimal)
+
+    report = parse_fill_report(
+        execution,
+        instrument=build_instrument(),
+        account_id=ACCOUNT_ID,
+        report_id=UUID4(),
+        ts_init=TS_INIT,
+    )
+    assert report is not None  # mapping now succeeds, under the perturbation
+
+    # RED (if this coupling ever breaks live): a leg that maps cleanly, yet
+    # whose cost this module's OWN, independent decimal parsing cannot
+    # derive.
+    filled_cost = submit_chain._filled_cost_from_execution(execution)
+    assert filled_cost is None
+
+
+def test_a_fill_parse_error_is_capped_at_birth() -> None:
+    """AC-9: `_capped_diagnostic` caps a string once, at birth, with the
+    truncation marker OUTSIDE the capped span (RV3-A13); a message within
+    the cap is returned unchanged."""
+    huge = "x" * (submit_chain._DETAIL_TREE_MAX_CHARS + 500)
+
+    capped = submit_chain._capped_diagnostic(huge)
+
+    assert capped.startswith("x" * submit_chain._DETAIL_TREE_MAX_CHARS)
+    assert capped.endswith(f"(truncated from {len(huge)} characters)")
+    assert len(capped) < len(huge)
+
+    small = "a short mapping refusal"
+    assert submit_chain._capped_diagnostic(small) == small
+
+    # End to end: a wide, deeply-drifted execution would otherwise produce
+    # an unbounded mapping-refusal message (its own key tree included); the
+    # sink still receives a capped string.
+    slug = str(build_instrument().raw_symbol)
+    order = _i1a_order(slug, cum_quantity="1", avg_px="0.41", commission_total=None)
+    execution = _i1a_leg(
+        order,
+        exec_id="exe-1",
+        trade_id="trd-1",
+        last_shares="1",
+        last_px="0.41",
+        commission="0.03",
+    )
+    for i in range(2000):
+        execution[f"driftField{i}"] = f"value{i}"
+    errors: list[str] = []
+
+    result = fill_generation(
+        execution,
+        instrument=build_instrument(),
+        account_id=ACCOUNT_ID,
+        ts_init=TS_INIT,
+        errors=errors,
+    )
+
+    assert result is None
+    assert len(errors) == 1
+    assert len(errors[0]) <= submit_chain._DETAIL_TREE_MAX_CHARS + 60

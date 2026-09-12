@@ -24,7 +24,7 @@ from nautilus_trader.model.instruments import BinaryOption, Instrument
 from nautilus_trader.model.objects import Money, Price, Quantity
 
 from breezy.adapters.polymarket_us.errors import ExecutionReportMappingError, VenueTransportError
-from breezy.adapters.polymarket_us.exec.reports import parse_fill_report
+from breezy.adapters.polymarket_us.exec.reports import _key_tree, parse_fill_report
 from breezy.adapters.polymarket_us.transport import VenueResponse
 
 logger = logging.getLogger(__name__)
@@ -630,6 +630,113 @@ def _cumulative_fee_and_reconciliation(
     return leg_fee, qty_reconciled and leg_fee is not None
 
 
+#: Single cap point (SP-2 I1/I2, Rev 2's value, measured-backed RV2.1-A8):
+#: every diagnostic string this module builds for the create path -- the
+#: underivable-cost message, a mapping-refusal message, the body key-tree
+#: token -- is capped ONCE, at birth, through :func:`_capped_diagnostic` /
+#: :func:`_detail_tree_token`. Downstream consumers (the classified log
+#: line, the AMBIGUOUS tail, the durable store) all inherit the same bound
+#: and never re-truncate (S-L1).
+_DETAIL_TREE_MAX_CHARS: Final[int] = 2048
+
+#: Closed-set per-field tokens for :func:`_underivable_cost_message` -- the
+#: vocabulary already used by :func:`_state_detail_token` /
+#: :func:`_cum_detail_token` in this file. Absent and unparseable are
+#: different drift stories and neither ever echoes the value itself.
+_TOKEN_ABSENT: Final[str] = "absent"
+_TOKEN_PRESENT: Final[str] = "present"
+_TOKEN_UNPARSEABLE: Final[str] = "unparseable"
+
+#: `_safe_key_tree`'s fallback when `_key_tree` itself raises -- belt and
+#: braces for SP-2's own two call sites in this module; the depth bound in
+#: `reports._key_tree` is what actually protects against unbounded
+#: recursion (AR-N2), not this fallback.
+_TREE_UNAVAILABLE: Final[str] = "<tree unavailable: nesting exceeded>"
+
+
+def _capped_diagnostic(text: str) -> str:
+    """Cap ONE diagnostic string at ``_DETAIL_TREE_MAX_CHARS``, at birth.
+
+    The truncation marker is emitted OUTSIDE the capped span (RV3-A13,
+    mirroring ``reports._safe_key_name``'s own placement rule): a string
+    within the cap is returned byte-identical, unchanged.
+    """
+    if len(text) <= _DETAIL_TREE_MAX_CHARS:
+        return text
+    return f"{text[:_DETAIL_TREE_MAX_CHARS]} (truncated from {len(text)} characters)"
+
+
+def _safe_key_tree(payload: Mapping[str, Any]) -> str:
+    """``reports._key_tree``, contained for this module's two call sites.
+
+    ``reports._key_tree`` already bounds its own recursion depth (SP-2 I0);
+    this is belt-and-braces, not the sole containment point (AR-N2) --
+    tested by perturbing ``_key_tree`` to raise, never by pretending the
+    bound itself fails.
+    """
+    try:
+        return _key_tree(payload)
+    except RecursionError:
+        return _TREE_UNAVAILABLE
+
+
+def _amount_token(value: object) -> str:
+    """Closed-set token for an ``Amount``-shaped candidate cost field.
+
+    Mirrors :func:`_amount_decimal`'s own parsing exactly, so the token
+    always agrees with whatever that function would have derived --
+    ``absent`` (no value), ``unparseable`` (present but not a valid
+    decimal), or ``present`` (usable). Never the value itself.
+    """
+    if value is None:
+        return _TOKEN_ABSENT
+    if _amount_decimal(value) is None:
+        return _TOKEN_UNPARSEABLE
+    return _TOKEN_PRESENT
+
+
+def _quantity_token(value: object) -> str:
+    """Closed-set token for a bare-quantity candidate cost field.
+
+    Mirrors :func:`_filled_cost_from_execution`'s own ``Decimal(str(value))``
+    parsing of ``lastShares`` / ``cumQuantity`` -- these are plain numeric
+    strings, not ``Amount``-wrapped, so :func:`_amount_token` does not apply.
+    """
+    if value is None:
+        return _TOKEN_ABSENT
+    try:
+        Decimal(str(value))
+    except (InvalidOperation, ValueError, TypeError):
+        return _TOKEN_UNPARSEABLE
+    return _TOKEN_PRESENT
+
+
+def _underivable_cost_message(execution: Mapping[str, Any]) -> str:
+    """Names-only diagnostic for ``_filled_cost_from_execution`` returning
+    ``None``: a closed-set token for each of the four candidate fields it
+    reads, plus the execution's own sanitised key tree (SP-2 I0) so a
+    drifted shape is visible at once -- never a value.
+
+    T1: this branch is UNREACHABLE in life today. ``parse_fill_report``'s
+    own amount parsing (``parsing._to_decimal`` / ``_parse_amount``) is
+    strictly stronger than this function's, so any leg that fails cost
+    derivation fails MAPPING first and never reaches here -- see
+    ``test_a_leg_that_maps_cleanly_always_yields_a_derivable_filled_cost``.
+    Loud, not deleted, in case that coupling ever breaks (L-37 (2)).
+    """
+    order = execution.get("order")
+    order_avg_px = order.get("avgPx") if isinstance(order, Mapping) else None
+    order_cum_quantity = order.get("cumQuantity") if isinstance(order, Mapping) else None
+    return (
+        "fill report mapped but no filled cost is derivable: "
+        f"order.avgPx={_amount_token(order_avg_px)} "
+        f"order.cumQuantity={_quantity_token(order_cum_quantity)} "
+        f"lastPx={_amount_token(execution.get('lastPx'))} "
+        f"lastShares={_quantity_token(execution.get('lastShares'))}; "
+        f"full body key tree: {{{_safe_key_tree(execution)}}}"
+    )
+
+
 def fill_generation(
     execution: Mapping[str, Any],
     *,
@@ -648,6 +755,13 @@ def fill_generation(
     key tree its own diagnostic appends -- never a value), so a caller may
     log it verbatim. Optional, and defaulted to ``None``, so every existing
     caller that does not pass it keeps recording nothing, exactly as before.
+
+    SP-2 I1: the sink also receives a names-only message when the mapped
+    execution's filled cost cannot be DERIVED (previously a silent
+    ``None`` return, no trace of why -- L-37 (2)). Every message the sink
+    receives is capped with an explicit, placement-ruled marker
+    (:func:`_capped_diagnostic`), so ``fill_parse_error`` is bounded for
+    both the log line and the durable store (SP-2 I3).
     """
     try:
         report = parse_fill_report(
@@ -659,10 +773,12 @@ def fill_generation(
         )
     except (ExecutionReportMappingError, TypeError, ValueError) as exc:
         if errors is not None:
-            errors.append(str(exc))
+            errors.append(_capped_diagnostic(str(exc)))
         return None
     filled_cost = _filled_cost_from_execution(execution)
     if filled_cost is None:
+        if errors is not None:
+            errors.append(_capped_diagnostic(_underivable_cost_message(execution)))
         return None
     return FillGeneration(
         venue_order_id=report.venue_order_id,
