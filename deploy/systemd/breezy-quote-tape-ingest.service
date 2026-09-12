@@ -17,6 +17,14 @@ Documentation=file:///home/jon/breezy/src/breezy/runtime/quote_tape_ingest_cli.p
 # live-write-avoidance rule (see the module docstring), never converted.
 After=network-online.target
 
+# SP-6 A9. Fires the failure-alert template on THIS unit's own failure.
+# Deliberately OnFailure= ONLY -- no EnvironmentFile= here (see the
+# existing "No EnvironmentFile" comment in [Service] below): this
+# process holds no venue credential, and the alert template unit carries
+# the webhook URL itself via ITS OWN EnvironmentFile=, so this unit needs
+# nothing added to reach it.
+OnFailure=breezy-alert@%n.service
+
 [Service]
 Type=oneshot
 WorkingDirectory=/home/jon/breezy

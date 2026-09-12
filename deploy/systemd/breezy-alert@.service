@@ -1,0 +1,39 @@
+[Unit]
+# SP-6 A9. A TEMPLATE unit, triggered ONLY by another unit's OnFailure=
+# (breezy-trade-supervisor.service, breezy-quote-tape.service,
+# breezy-quote-tape-ingest.service -- never started or enabled directly).
+# `%i` is the failed unit's name, supplied by systemd's OnFailure=
+# expansion; AM-6 measured `%I` would unescape a `-` back to `/`
+# (`systemd-escape --unescape breezy-quote-tape.service` ->
+# `breezy/quote/tape.service`), which none of the three parent unit
+# names need undone -- `%i` is the correct specifier here, not `%I`.
+Description=Breezy failure alert for %i
+Documentation=file:///home/jon/breezy/deploy/systemd/README.md
+Documentation=file:///home/jon/breezy/deploy/systemd/alert-webhook-run.sh
+
+[Service]
+Type=oneshot
+UMask=0077
+
+# Optional and absent by default (leading `-`): B4-item, the operator's
+# ONE line naming the destination. Absent -> the wrapper script exits 0
+# immediately, posting nothing.
+EnvironmentFile=-%h/.config/breezy/alerts.env
+
+# A single plain command -- no shell, no `$(...)`, no `printf`, no
+# `%`-date-format specifier of any kind in this unit. `%i` is the ONLY
+# specifier here, and is resolved by systemd itself before the command
+# ever runs (see the wrapper script for why the URL never appears on
+# this line or any other argv).
+ExecStart=%h/breezy/deploy/systemd/alert-webhook-run.sh %i
+
+# No rate limiting, accepted: this is a oneshot firing only when a PARENT
+# unit's OnFailure= triggers it -- a StartLimit* cap here would suppress
+# exactly the failure storm worth an operator seeing.
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=breezy-alert
+
+# NO [Install] section. This template is never enabled; it is invoked
+# exclusively by another unit's OnFailure=.

@@ -44,6 +44,10 @@ Wants=network-online.target
 # a blip is still recovered at the old latency.
 StartLimitIntervalSec=0
 
+# SP-6 A9. Fires the failure-alert template on THIS unit's own failure.
+# See deploy/systemd/breezy-alert@.service and alert-webhook-run.sh.
+OnFailure=breezy-alert@%n.service
+
 [Service]
 Type=simple
 WorkingDirectory=/home/jon/breezy
@@ -79,6 +83,12 @@ UMask=0077
 # `polymarket_us.factories.config_from_env`, never by runtime/settings.py
 # (src/breezy/runtime/settings.py:12-16).
 EnvironmentFile=/home/jon/.config/breezy/polymarket.env
+
+# SP-6 A9. Optional and absent by default (leading `-`, unlike the HARD
+# EnvironmentFile= above): the operator's ONE line naming the webhook
+# destination. Absent -> resolve_alert_sink() falls back to
+# LoggingAlertSink; this unit's recording is unaffected either way.
+EnvironmentFile=-/home/jon/.config/breezy/alerts.env
 
 # The one variable the supervisors export on top of that env file
 # (tape_supervisor.sh:18; tape_supervisor_k1.sh:9+28). Required with NO

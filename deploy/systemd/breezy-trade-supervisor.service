@@ -53,6 +53,12 @@ Wants=network-online.target
 StartLimitBurst=5
 StartLimitIntervalSec=3600
 
+# SP-6 A9. Fires the failure-alert template on THIS unit's own failure --
+# never on ordinary supervisor activity, and never on the child node's
+# own log lines (which are not this unit's exit status at all). See
+# deploy/systemd/breezy-alert@.service and alert-webhook-run.sh.
+OnFailure=breezy-alert@%n.service
+
 [Service]
 Type=simple
 WorkingDirectory=/home/jon/breezy
@@ -87,6 +93,13 @@ EnvironmentFile=-%h/.config/breezy/breezy-trade.env
 # supervisor forwards its own `os.environ` as the child's `env=`, never argv --
 # trade_supervisor.py:808,874). Same file breezy-quote-tape.service references.
 EnvironmentFile=-%h/.config/breezy/polymarket.env
+#
+# SP-6 A9/A11/A12. Optional and absent by default (leading `-`): the
+# operator's ONE line naming the webhook destination
+# (BREEZY_ALERT_WEBHOOK_URL). Absent -> resolve_alert_sink() falls back
+# to LoggingAlertSink and A1 records that visibly (INFO); this unit's
+# supervision is unaffected either way.
+EnvironmentFile=-%h/.config/breezy/alerts.env
 #
 # The two OPERATOR-RESERVED durable caps -- the maximum daily budget and the
 # maximum per position -- BY REFERENCE ONLY, per runbook §6 (`operator.env`,

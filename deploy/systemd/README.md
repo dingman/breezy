@@ -810,3 +810,71 @@ comments in the same pass.
 **No v3 tally exists.** `pm_us_crh_cont` (the live v3 strategy) has no
 nightly tally unit of its own -- L-38 stands. Building one is I5, blocked on
 R-4; this item does not touch it.
+
+## `breezy-alert@.service` / `alert-webhook-run.sh` — failure-alert delivery (SP-6 A9, 2026-09-12)
+
+**Status: same as everything else in this file until an operator installs
+it.** All of the following are INERT until an operator runs `daemon-reload`
+(and, for the watchdog timer once it lands, `enable`) OUTSIDE the protected
+window `[16:45Z, 01:15Z)` defined above -- the build never runs any
+`systemctl --user` verb.
+
+**What this closes.** Every CRITICAL/WARN the runtime already emits
+(`breezy.runtime.trade_supervisor`'s self-check, a future liveness probe)
+resolves to `LoggingAlertSink` until an operator configures a destination
+-- reaching only the unit's own journal, which nobody watches in real time.
+`breezy-alert@.service` is a systemd-native TEMPLATE unit, triggered by
+`OnFailure=` on `breezy-trade-supervisor.service`, `breezy-quote-tape.service`,
+and `breezy-quote-tape-ingest.service`: when any of those three enters
+`failed`, systemd starts `breezy-alert@<failed-unit-name>.service`, which
+runs `alert-webhook-run.sh` -- a single plain `ExecStart=` command, no
+shell body, no `$(...)`, no `%`-date-format specifier (the same
+`systemd-analyze --user verify` escape-sequence trap `breezy-offer-gate-daily.service`
+documents). The wrapper posts to the operator's configured webhook (via
+`~/.config/breezy/alerts.env`, see B4 below) ONLY when that file sets
+`BREEZY_ALERT_WEBHOOK_URL`; otherwise it exits 0 having posted nothing.
+
+**The URL never touches argv or a log line.** The wrapper writes
+`url="$BREEZY_ALERT_WEBHOOK_URL"` to `curl`'s OWN stdin (`--config -`), and
+discards curl's stderr -- so neither `ps -eo args` nor the unit's journal
+ever shows the destination. The cost of that stderr discard: a
+misconfigured or unreachable destination would otherwise fail silently
+forever after the one-time install-time test. `curl -sf` plus the
+wrapper's own `pipefail` turn that failure into `breezy-alert@…` entering
+`failed` itself -- visible to `systemctl --user list-units --failed`
+without printing the host anywhere (see operator step below).
+
+**B4-item (operator-only, not a build step).** Choose the destination and
+write ONE line into `~/.config/breezy/alerts.env`:
+`BREEZY_ALERT_WEBHOOK_URL=<https endpoint>`, then `chmod 0600` it. The
+build never writes, echoes, defaults, or suggests a value. Until that file
+exists, every alert resolves to `LoggingAlertSink`, and
+`breezy.runtime.health`'s own sink-selection log line records that fact
+(INFO, both branches).
+
+**Install (same pattern as every other unit in this file):**
+
+```bash
+ln -s /home/jon/breezy/deploy/systemd/breezy-alert@.service ~/.config/systemd/user/
+systemctl --user daemon-reload
+systemd-analyze --user verify ~/.config/systemd/user/breezy-alert@.service \
+                              ~/.config/systemd/user/breezy-trade-supervisor.service \
+                              ~/.config/systemd/user/breezy-quote-tape.service \
+                              ~/.config/systemd/user/breezy-quote-tape-ingest.service
+```
+
+`daemon-reload` starts nothing; the template is invoked only by another
+unit's `OnFailure=`, never enabled or started directly (no `[Install]`
+section). `verify` prints **nothing** when clean (§2's convention).
+
+**Operator read-only confirmation:**
+`systemctl --user list-units --failed` -- the ONLY standing signal that
+the `OnFailure=` webhook path itself has broken; a `breezy-alert@…` unit
+sitting in `failed` means the destination rejected or was unreachable, and
+names no host anywhere in that output.
+
+**`breezy-quote-tape-ingest.service` deliberately gains `OnFailure=` only**
+-- no `EnvironmentFile=` added to it (it already carries none, by design:
+this process holds no venue credential). The template unit's OWN
+`EnvironmentFile=-%h/.config/breezy/alerts.env` carries the URL for every
+parent unit that triggers it.
