@@ -1077,6 +1077,34 @@ class PolymarketUSExecutionClient(LiveExecutionClient):
                 log_msg="resolve_ambiguous_intents",
             )
             await self._wait_for_instruments()
+            # Item 2 (2026-09-12 boot-ordering addendum): ONE synchronous,
+            # bounded resolver pass -- AWAITED here, not merely scheduled --
+            # after instruments are loaded (the pass needs
+            # `self._cache.instrument(...)` to resolve anything) but still
+            # well before this method returns and before Nautilus's own
+            # kernel-level reconciliation ever runs. A boot with nothing to
+            # resolve (no latch bound yet, or no OPEN intent) completes this
+            # with no sleep and no observable delay -- see
+            # `_resolve_ambiguous_intents`'s `first_pass_immediate` docstring.
+            # The periodic task above still runs for the client's lifetime;
+            # this is an ADDITIONAL early pass, not a replacement.
+            #
+            # Review fix (2026-09-12): caught LOCALLY, deliberately narrower
+            # than this method's own `except BaseException` below. The
+            # periodic task's exceptions are only ever logged by Nautilus's
+            # native `_on_task_completed` -- never fatal -- and this
+            # immediate call must fail exactly the same way, not latch a
+            # fatal fault and shut the node down at boot over a transient
+            # read this SAME coroutine's periodic run would retry moments
+            # later. Only `type(exc).__name__` is logged, never `exc` or any
+            # resolver-context value (durable state can carry venue ids).
+            try:
+                await self._resolve_ambiguous_intents(first_pass_immediate=True)
+            except Exception as exc:  # noqa: BLE001 - see comment above
+                self._log.warning(
+                    f"immediate resolver pass failed; periodic resolver "
+                    f"continues ({type(exc).__name__})"
+                )
             await self._publish_account_state()
             await self._confirm_account_registered()
             self._reconcile_submit_intent()
@@ -1151,11 +1179,23 @@ class PolymarketUSExecutionClient(LiveExecutionClient):
         """
         return tuple(self._resolver_stale_alert_details.values())
 
-    async def _resolve_ambiguous_intents(self) -> None:
+    async def _resolve_ambiguous_intents(self, *, first_pass_immediate: bool = False) -> None:
         """Resolution A (plan rev 6.1): named, firewall-scanned client
         coroutine for the with-id AMBIGUOUS class (L-36). Started from
         ``_connect`` after ``_open_state_store``; runs for the client's
         lifetime.
+
+        Item 2 (2026-09-12 boot-ordering addendum): ``first_pass_immediate``
+        makes this call run EXACTLY ONE pass, with NO initial sleep, and
+        then return -- ``_connect`` awaits it directly (bounded to the
+        single GET + retire attempt this docstring already describes) so a
+        durable fill record for an already-OPEN with-id intent exists
+        before ``_connect`` returns, ahead of Nautilus's own kernel-level
+        reconciliation. The default (``False``, used by the periodic
+        background task ``_connect`` also still starts) reproduces today's
+        behaviour exactly: every iteration sleeps first, forever. No new
+        callee is introduced -- the gate below is pure boolean logic, never
+        a call, so it is invisible to ``find_exec_resolver_violations``.
 
         Each pass is a no-op unless the account-wide submit intent is OPEN
         with a durable resolver context (written by ``_note_ambiguous_open``
@@ -1188,26 +1228,36 @@ class PolymarketUSExecutionClient(LiveExecutionClient):
         synthesized from; the positions read exists only to confirm a LONG
         exists at all before acting.
         """
+        first_iteration = True
         while True:
-            # Item 2 (2026-09-11 incident addendum): bounded exponential
-            # backoff on CONSECUTIVE resolver failures, inlined here rather
-            # than in a helper method -- a new callee in THIS coroutine is
-            # an E0-NOSEND-RESOLVER violation
-            # (``tests/unit/test_execution_egress_firewall_guard.py``,
-            # which stays untouched), and every name below (`asyncio.sleep`,
-            # `self._resolver_poll_interval_secs`) is already permitted.
-            # Base interval unaffected: 0.0 doubled is still 0.0, so tests
-            # that shrink the base to iterate fast see no behaviour change.
-            # 5s, 5s, 10s, 20s, ... capped at `_RESOLVER_BACKOFF_CAP_SECS`.
-            base_interval = self._resolver_poll_interval_secs()
-            if self._resolver_consecutive_failures <= 0:
-                sleep_secs = base_interval
-            else:
-                doubled = base_interval * (2 ** (self._resolver_consecutive_failures - 1))
-                # Deliberately NOT `min(...)`: a builtin call here is a new,
-                # unpermitted callee under E0-NOSEND-RESOLVER (see above).
-                sleep_secs = doubled if doubled < _RESOLVER_BACKOFF_CAP_SECS else _RESOLVER_BACKOFF_CAP_SECS  # noqa: E501, FURB136
-            await asyncio.sleep(sleep_secs)
+            # Item 2 (2026-09-12 boot-ordering addendum): a one-shot caller
+            # (`first_pass_immediate=True`) returns here on its SECOND trip
+            # through the loop top -- i.e. after exactly one pass, however
+            # that pass ended (an early `continue` branch below, or falling
+            # off the end of the loop body). Pure booleans, no new callee.
+            if first_pass_immediate and not first_iteration:
+                return
+            if not (first_pass_immediate and first_iteration):
+                # Item 2 (2026-09-11 incident addendum): bounded exponential
+                # backoff on CONSECUTIVE resolver failures, inlined here rather
+                # than in a helper method -- a new callee in THIS coroutine is
+                # an E0-NOSEND-RESOLVER violation
+                # (``tests/unit/test_execution_egress_firewall_guard.py``,
+                # which stays untouched), and every name below (`asyncio.sleep`,
+                # `self._resolver_poll_interval_secs`) is already permitted.
+                # Base interval unaffected: 0.0 doubled is still 0.0, so tests
+                # that shrink the base to iterate fast see no behaviour change.
+                # 5s, 5s, 10s, 20s, ... capped at `_RESOLVER_BACKOFF_CAP_SECS`.
+                base_interval = self._resolver_poll_interval_secs()
+                if self._resolver_consecutive_failures <= 0:
+                    sleep_secs = base_interval
+                else:
+                    doubled = base_interval * (2 ** (self._resolver_consecutive_failures - 1))
+                    # Deliberately NOT `min(...)`: a builtin call here is a new,
+                    # unpermitted callee under E0-NOSEND-RESOLVER (see above).
+                    sleep_secs = doubled if doubled < _RESOLVER_BACKOFF_CAP_SECS else _RESOLVER_BACKOFF_CAP_SECS  # noqa: E501, FURB136
+                await asyncio.sleep(sleep_secs)
+            first_iteration = False
             if self._latch is None:
                 self._log.debug("resolver: no latch bound; skipping this pass")
                 continue

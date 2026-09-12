@@ -59,6 +59,7 @@ from breezy.adapters.polymarket_us.transport import VenueResponse
 from breezy.runtime.sqlite_store import SqliteStateStore
 from breezy.runtime.submit_intent import (
     RetirementReason,
+    SubmitIntentCorrupt,
     SubmitIntentState,
     open_submit_intent_latch,
 )
@@ -730,6 +731,14 @@ async def test_a_raising_state_store_before_the_post_means_no_post_occurs(
         #: `SubmitIntentLatch.opening_thread_ident` records for a real one.
         opening_thread_ident = threading.get_ident()
 
+        #: Item 2 (2026-09-12 boot-ordering addendum): `_connect` now
+        #: AWAITS `_resolve_ambiguous_intents(first_pass_immediate=True)`
+        #: synchronously, so this fake's `.CorruptError`/`.current_open()`
+        #: are genuinely exercised (never raised/reached here -- `current()`
+        #: reports no OPEN intent), not merely a latent gap the periodic
+        #: background task never got scheduled long enough to hit before.
+        CorruptError = SubmitIntentCorrupt
+
         def arm(self, fingerprint: str, *, now_ns: int) -> object:
             raise RuntimeError("state store raised before the post")
 
@@ -737,6 +746,9 @@ async def test_a_raising_state_store_before_the_post_means_no_post_occurs(
             raise AssertionError("retire must not run")
 
         def current(self) -> None:
+            return None
+
+        def current_open(self) -> None:
             return None
 
         def is_latched(self) -> bool:

@@ -1136,3 +1136,213 @@ async def test_a_family_halt_veto_denies_wait_class_and_spends_zero_permit_slots
         assert client._latch.is_latched() is False, "a WAIT deny must never arm"
         assert sender.calls == [], "the veto must deny before any venue contact"
         await client._disconnect()
+
+
+# ---------------------------------------------------------------------------
+# Item 2 (2026-09-12, boot-ordering addendum): `_connect` must run ONE
+# synchronous resolver pass, with NO initial sleep, before it returns -- so a
+# durable fill record for an unresolved with-id intent exists before
+# Nautilus's own kernel-level reconciliation ever runs. Ordering only: the
+# classification rule itself (`fee_reconciled=False`/`cumulative_fee=ZERO`
+# on a GET-confirmed fill) is UNCHANGED and pinned again below.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_first_pass_immediate_resolves_a_get_confirmed_fill_with_no_sleep(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    write_canonical_verified: None,  # noqa: F811
+) -> None:
+    """RED: ``_resolve_ambiguous_intents`` must accept ``first_pass_immediate``
+    and, when set, run exactly one bounded pass -- no ``asyncio.sleep`` at
+    all -- resolving an already-OPEN with-id intent synchronously. Today the
+    coroutine takes no such argument (``TypeError``) and always sleeps first.
+    """
+    enable_operator_gate(monkeypatch, order_count="2")
+    with operator_control_env(MAX_DAILY_BUDGET_USD_ENV_VAR, "1000.00"), operator_control_env(
+        MAX_POSITION_COST_USD_ENV_VAR, "10.00",
+    ):
+        client, order_id, slug, _latch_cm, order_events = await _arm_one_ambiguous_intent(
+            tmp_path,
+        )
+        client._private_read._payloads[  # type: ignore[attr-defined]
+            f"/v1/order/{order_id}"
+        ] = _order_get_body(
+            order_id, slug=slug, state="ORDER_STATE_FILLED", cum_quantity=1, avg_px="0.40",
+        )
+        client._private_read._payloads["/v1/portfolio/positions"] = {  # type: ignore[attr-defined]
+            "positions": {slug: {"netPosition": "1"}},
+            "eof": True,
+        }
+
+        async def boom(_seconds: float) -> None:
+            raise AssertionError("the immediate first pass must never sleep")
+
+        monkeypatch.setattr(asyncio, "sleep", boom)
+
+        await client._resolve_ambiguous_intents(first_pass_immediate=True)
+
+        assert client._latch is not None
+        current = client._latch.current()
+        assert current is not None
+        assert current.state is SubmitIntentState.RETIRED
+        filled = _order_filled_events(order_events)
+        assert len(filled) == 1, "one bounded pass must fully resolve the fill, synchronously"
+        await client._disconnect()
+
+
+@pytest.mark.asyncio
+async def test_connect_awaits_the_immediate_pass_before_the_background_task(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """RED: ``_connect`` must AWAIT one ``first_pass_immediate=True`` call
+    into the resolver before it returns, in addition to (not instead of)
+    starting the periodic background task. Today ``_connect`` calls the
+    coroutine exactly once, via ``create_task``, with no immediate pass.
+    """
+    enable_operator_gate(monkeypatch, order_count="2")
+    calls: list[bool] = []
+
+    async def fake_resolve(self: Any, *, first_pass_immediate: bool = False) -> None:
+        calls.append(first_pass_immediate)
+
+    monkeypatch.setattr(
+        PolymarketUSExecutionClient,
+        "_resolve_ambiguous_intents",
+        fake_resolve,
+        raising=True,
+    )
+    sender = _SlowSender()
+    sender.response = VenueResponse(status=200, headers={}, body=b"{}")
+    with operator_control_env(MAX_DAILY_BUDGET_USD_ENV_VAR, "1000.00"), operator_control_env(
+        MAX_POSITION_COST_USD_ENV_VAR, "10.00",
+    ):
+        client, _order_events, _permit, _latch_cm = await _build_race_client(
+            tmp_path, sender=sender,
+        )
+
+    assert calls[:1] == [True], (
+        "the FIRST resolver call _connect awaits must be the immediate, "
+        "bounded pass, ahead of the periodic background task"
+    )
+    # The background task is merely SCHEDULED by `create_task`, not run
+    # synchronously -- one real yield gives it its turn.
+    await asyncio.sleep(0)
+    assert False in calls, "the periodic background task must still be started"
+    client._resolver_task.cancel()
+    await asyncio.gather(client._resolver_task, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+async def test_connect_immediate_pass_never_sleeps_with_nothing_to_resolve(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """RED (timing-unchanged AC): an ordinary boot with no OPEN intent must
+    reach `_connect`'s immediate pass and return with NO `asyncio.sleep`
+    call at all -- if the immediate pass slept first like the periodic
+    loop does, EVERY `_connect()` in this suite would block for the full
+    poll interval once awaited synchronously here.
+    """
+    enable_operator_gate(monkeypatch, order_count="2")
+
+    async def boom(_seconds: float) -> None:
+        raise AssertionError("_connect's own immediate pass must never sleep")
+
+    sender = _SlowSender()
+    sender.response = VenueResponse(status=200, headers={}, body=b"{}")
+    with operator_control_env(MAX_DAILY_BUDGET_USD_ENV_VAR, "1000.00"), operator_control_env(
+        MAX_POSITION_COST_USD_ENV_VAR, "10.00",
+    ), monkeypatch.context() as m:
+        m.setattr(asyncio, "sleep", boom)
+        client, _order_events, _permit, _latch_cm = await _build_race_client(
+            tmp_path, sender=sender,
+        )
+    assert client._latch is not None
+    assert client._latch.is_latched() is False, "no order was ever submitted; nothing to resolve"
+    client._resolver_task.cancel()
+    await asyncio.gather(client._resolver_task, return_exceptions=True)
+    await client._disconnect()
+
+
+# ---------------------------------------------------------------------------
+# Review fix (2026-09-12): the immediate `first_pass_immediate=True` call
+# must not be able to latch a FATAL fault -- only the periodic task's
+# exceptions are meant to be merely logged (Nautilus's own
+# `_on_task_completed`); an exception the pass does not catch internally
+# (unlike a `CorruptError` from `current_open()`, or a mapped GET failure)
+# must be caught LOCALLY in `_connect`, logged at WARNING with the
+# exception TYPE only, and let `_connect` proceed.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_connect_survives_an_unhandled_exception_in_the_immediate_resolver_pass(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """RED: today the immediate call sits inside `_connect`'s own
+    `except BaseException` -> `record_fatal_exec_fault` + `shutdown_system`,
+    so any exception the pass does not swallow internally would fatally
+    shut the node down at boot. It must instead be caught locally, letting
+    `_connect` complete and the periodic task still start.
+    """
+    calls: list[bool] = []
+
+    async def fake_resolve(self: Any, *, first_pass_immediate: bool = False) -> None:
+        calls.append(first_pass_immediate)
+        if first_pass_immediate:
+            raise RuntimeError("store boom")
+
+    monkeypatch.setattr(
+        PolymarketUSExecutionClient,
+        "_resolve_ambiguous_intents",
+        fake_resolve,
+        raising=True,
+    )
+    fault_calls: list[str] = []
+    monkeypatch.setattr(
+        "breezy.adapters.polymarket_us.exec.client.record_fatal_exec_fault",
+        lambda **kwargs: fault_calls.append(kwargs.get("reason", "")),
+    )
+    enable_operator_gate(monkeypatch, order_count="2")
+    sender = _SlowSender()
+    sender.response = VenueResponse(status=200, headers={}, body=b"{}")
+    with operator_control_env(MAX_DAILY_BUDGET_USD_ENV_VAR, "1000.00"), operator_control_env(
+        MAX_POSITION_COST_USD_ENV_VAR, "10.00",
+    ):
+        # If `_connect` re-raises, this call itself raises -- the test would
+        # fail with the RuntimeError propagating here, which IS the RED
+        # failure shape against today's unwrapped code.
+        client, _order_events, _permit, _latch_cm = await _build_race_client(
+            tmp_path, sender=sender,
+        )
+
+    assert fault_calls == [], "the immediate pass's own exception must never latch a fatal fault"
+    assert calls[:1] == [True], "the immediate pass must still have been attempted first"
+    await asyncio.sleep(0)
+    assert False in calls, "the periodic background task must still be started despite the failure"
+    client._resolver_task.cancel()
+    await asyncio.gather(client._resolver_task, return_exceptions=True)
+    await client._disconnect()
+
+
+def test_connect_immediate_pass_exception_handler_logs_type_only_never_the_value() -> None:
+    """Static pin: ``self._log`` is Nautilus's own Cython logger, not stdlib
+    ``logging`` -- ``caplog`` cannot observe it (see
+    ``test_ambiguous_exception_path_source_logs_the_exception_type_never_its_str``
+    in ``test_polymarket_us_submit_order_chain.py`` for the same,
+    already-established limitation). The source text is the reliable check
+    that the handler logs ``type(exc).__name__`` only, at WARNING, and never
+    the exception's ``str`` or any resolver-context value.
+    """
+    import inspect
+
+    source = inspect.getsource(PolymarketUSExecutionClient._connect)
+    start = source.index("await self._resolve_ambiguous_intents(first_pass_immediate=True)")
+    end = source.index("await self._publish_account_state()")
+    block = source[start:end]
+    assert "except Exception as exc" in block
+    assert "self._log.warning" in block
+    assert "type(exc).__name__" in block
+    assert "{exc}" not in block, "must never log the exception's own str -- it may carry a value"
+    assert "str(exc)" not in block
