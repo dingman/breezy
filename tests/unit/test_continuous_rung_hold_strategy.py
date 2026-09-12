@@ -128,9 +128,14 @@ def _register_and_start(
 #: A `position_evidence_reader` that always permits arming, flat on the
 #: shared `INTERIOR_ID` fixture slug -- the "green" default most fill-
 #: wiring/re-arm tests want, so `on_start`'s never-arm walk does not itself
-#: halt the strategy. Slice 4 review item 5: an ABSENT slug is UNKNOWN, not
-#: flat, so this must EXPLICITLY list `INTERIOR_ID`'s own slug at "0" --
-#: an empty `positions` list would make every instrument UNKNOWN and halt.
+#: halt the strategy. R-8 (2026-09-12, docs/core/PROGRESS.md, supersedes
+#: three-seam Slice 4 review item 5): an eof-complete page ABSENT the slug
+#: now arms too, for a candidate instrument, PROVIDED the record is fresh
+#: (`ts_ns` within the ceiling) and Nautilus's reconciled portfolio agrees
+#: (Option B). This fixture carries no `ts_ns`, so it EXPLICITLY lists
+#: `INTERIOR_ID`'s own slug at "0" (present branch, freshness-independent)
+#: rather than relying on the absent branch -- an empty `positions` list
+#: here would halt on a missing/stale `ts_ns`, not arm.
 _PERMISSIVE_EVIDENCE: dict[str, object] = {
     "v": 1,
     "eof_complete": True,

@@ -9,7 +9,7 @@ Reuses the real-store harness from ``test_continuous_rung_hold_strategy.py``
 from __future__ import annotations
 
 import json
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from decimal import Decimal
 from pathlib import Path
@@ -855,6 +855,122 @@ def test_a_genuine_fill_freezes_the_attempt_counter(
     strategy.on_data(_observation(temp_c_tenths=300, observed_at_ns=WINDOW_OPEN_NS - 1))
     strategy.on_quote_tick(_quote(INTERIOR_ID, ask="0.40", ts_event=WINDOW_OPEN_NS + NS_PER_MIN))
     assert strategy._latch.attempt_state(STATION, CLIMATE_DAY.isoformat()) == before
+
+
+def test_startup_evidence_summary_names_completeness_age_and_each_decision() -> None:
+    """AC-13/N2 (S1): the pure summary renderer names eof_complete,
+    position_read_refused, fill_walk_complete, the page's slug count, the
+    evidence age in seconds, and each candidate's decision. Accepts
+    `evidence=None` (the evidence-missing return path, N2)."""
+    from breezy.strategy.current_rung_hold.continuous_strategy import (
+        _startup_evidence_summary,
+    )
+
+    evidence: dict[str, object] = {
+        "v": 1,
+        "ts_ns": WINDOW_OPEN_NS - 5 * 1_000_000_000,
+        "eof_complete": True,
+        "position_read_refused": False,
+        "fill_walk_complete": True,
+        "positions": [{"slug": "x", "net_position": "0"}],
+    }
+    summary = _startup_evidence_summary(
+        evidence,
+        now_ns=WINDOW_OPEN_NS,
+        decisions={"a.POLYMARKET_US": "absent-flat", "b.POLYMARKET_US": "LONG"},
+    )
+    assert "eof_complete=True" in summary
+    assert "position_read_refused=False" in summary
+    assert "fill_walk_complete=True" in summary
+    assert "page_slug_count=1" in summary
+    assert "age_secs=5.0" in summary
+    assert "absent-flat" in summary
+    assert "LONG" in summary
+
+    none_summary = _startup_evidence_summary(None, now_ns=WINDOW_OPEN_NS, decisions={})
+    assert "absent" in none_summary
+
+
+def _s2_family_halt(
+    store_path: Path, interior_instrument: BinaryOption,
+) -> ContinuousRungHoldStrategy:
+    strategy = _register_and_start(
+        store_path=store_path, instruments=(interior_instrument,),
+        position_evidence_reader=lambda: _PERMISSIVE_EVIDENCE,
+    )
+    assert strategy._latch is not None
+    strategy._latch.record_duplicate_fill(
+        STATION, CLIMATE_DAY.isoformat(), venue_order_id="ord-s2-halt",
+        qty=Decimal(1), fill_px=Decimal("0.4"), fee=Decimal(0), ts_ns=WINDOW_OPEN_NS,
+    )
+    return strategy
+
+
+def _s2_evidence_missing(
+    store_path: Path, interior_instrument: BinaryOption,
+) -> ContinuousRungHoldStrategy:
+    return _register_and_start(
+        store_path=store_path, instruments=(interior_instrument,),
+        position_evidence_reader=lambda: None,
+    )
+
+
+def _s2_fill_walk_unreadable(
+    store_path: Path, interior_instrument: BinaryOption,
+) -> ContinuousRungHoldStrategy:
+    store = SqliteStateStore(store_path)
+    with open_submit_intent_latch(store, store_path):
+        store.set(f"{FILL_INDEX_KEY_PREFIX}{INTERIOR_ID}", b"not json")
+    store.close()
+    return _register_and_start(
+        store_path=store_path, instruments=(interior_instrument,),
+        position_evidence_reader=lambda: _PERMISSIVE_EVIDENCE,
+    )
+
+
+def _s2_per_slug_halt(
+    store_path: Path, interior_instrument: BinaryOption,
+) -> ContinuousRungHoldStrategy:
+    evidence = {
+        **_PERMISSIVE_EVIDENCE,
+        "positions": [{"slug": str(INTERIOR_ID.symbol.value), "net_position": "1"}],
+    }
+    return _register_and_start(
+        store_path=store_path, instruments=(interior_instrument,),
+        position_evidence_reader=lambda: evidence,
+    )
+
+
+def _s2_success(
+    store_path: Path, interior_instrument: BinaryOption,
+) -> ContinuousRungHoldStrategy:
+    return _register_and_start(
+        store_path=store_path, instruments=(interior_instrument,),
+        position_evidence_reader=lambda: _PERMISSIVE_EVIDENCE,
+    )
+
+
+@pytest.mark.parametrize(
+    "make_strategy",
+    [
+        pytest.param(_s2_family_halt, id="family_halt"),
+        pytest.param(_s2_evidence_missing, id="evidence_missing"),
+        pytest.param(_s2_fill_walk_unreadable, id="fill_walk_unreadable"),
+        pytest.param(_s2_per_slug_halt, id="per_slug_halt"),
+        pytest.param(_s2_success, id="success"),
+    ],
+)
+def test_every_never_arm_walk_exit_path_records_a_startup_evidence_summary(
+    store_path: Path,
+    interior_instrument: BinaryOption,
+    make_strategy: Callable[[Path, BinaryOption], ContinuousRungHoldStrategy],
+) -> None:
+    """N2/S2 (L-27): every one of `_run_never_arm_walk`'s FIVE return paths
+    sets `self.last_startup_evidence_summary` to a non-None string --
+    asserted by presence, never via log capture."""
+    strategy = make_strategy(store_path, interior_instrument)
+    strategy._run_never_arm_walk()
+    assert strategy.last_startup_evidence_summary is not None
 
 
 def test_family_halt_key_literal(store_path: Path) -> None:

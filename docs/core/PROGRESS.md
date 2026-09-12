@@ -73,6 +73,7 @@ diagnostic is inert until the v3 tally receives the count (R-4).
 | R-5 | Is PREREG v1's 60/150 tally still evidence (may `breezy-live-tally` stop)? | SP-1 I1 | P1 §8 |
 | R-6 | Evidence sufficiency for declaring `_EXECUTION_DRIFT_ALLOWED_KEYS` (repo precedent: one observed key tree) | SP-2 I4 | P2 §8 |
 | R-7 | `PositionReportingLag`: keep and wire on the create path later (recommended), never on the resolver path (`ts_event` is poll cadence) | SP-7 H-8 | P7 §8 |
+| R-8 | ABSENT slug on a FRESH eof-complete page = FLAT for candidate instruments at BOTH `_run_never_arm_walk` and `_rearm_permitted`; supersedes Slice-4 review item 5 (its PASS state was unreachable). Residuals R9/R14. | closed 09-12 | HF-1 |
 
 **KILL clock (truth as of 09-12):** counter 0/15 for 09-05..09-11 by mechanism; shard-local
 accounting (d3f6c47) live in the recorder since 09-12 09:00Z; first real reading is the 09-13

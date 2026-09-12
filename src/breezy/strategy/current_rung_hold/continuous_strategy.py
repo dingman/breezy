@@ -14,7 +14,7 @@ tick with guards, else skips.
 
 from __future__ import annotations
 
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from contextlib import AbstractContextManager, ExitStack
 from dataclasses import dataclass
 from decimal import Decimal
@@ -166,6 +166,47 @@ def _snapshot_from_quote(tick: QuoteTick) -> _AskSnapshot:
     )
 
 
+def _startup_evidence_summary(
+    evidence: dict[str, object] | None,
+    *,
+    now_ns: int,
+    decisions: Mapping[str, str],
+) -> str:
+    """AC-13/N2 (R-8, 2026-09-12): a pure, unit-tested renderer for the
+    never-arm walk's ONE INFO summary line, emitted on ALL FIVE
+    `_run_never_arm_walk` return paths (L-30: observability by presence of
+    a line, never by the absence of a halt error). Accepts ``evidence is
+    None`` (the evidence-missing return path). ``decisions`` maps each
+    candidate instrument id already evaluated (in this call) to one of
+    ``"present-flat" | "absent-flat" | "LONG" | "UNKNOWN"``; it may be
+    empty when the walk halted before any per-slug decision was made
+    (family halt, evidence-missing, fill-walk-unreadable).
+    """
+    if evidence is None:
+        return (
+            "continuous_rung_hold startup_evidence: evidence=absent "
+            f"decisions={dict(decisions)!r}"
+        )
+    eof_complete = evidence.get("eof_complete")
+    position_read_refused = evidence.get("position_read_refused")
+    fill_walk_complete = evidence.get("fill_walk_complete")
+    positions = evidence.get("positions")
+    page_slug_count = len(positions) if isinstance(positions, list) else None
+    ts = evidence.get("ts_ns")
+    age_secs: float | None = None
+    if isinstance(ts, int) and not isinstance(ts, bool):
+        age_secs = (now_ns - ts) / 1_000_000_000
+    return (
+        "continuous_rung_hold startup_evidence: "
+        f"eof_complete={eof_complete!r} "
+        f"position_read_refused={position_read_refused!r} "
+        f"fill_walk_complete={fill_walk_complete!r} "
+        f"page_slug_count={page_slug_count!r} "
+        f"age_secs={age_secs!r} "
+        f"decisions={dict(decisions)!r}"
+    )
+
+
 class Phase0PermitForbiddenError(RuntimeError):
     """A non-None `order_submission_permit` was given in Phase 0.
 
@@ -229,6 +270,12 @@ class ContinuousRungHoldStrategy(Strategy):
         self.diagnostics_alerter: RefusalAlerter | None = None
         self.position_events = RefusalCounter()
         self.position_alerter: RefusalAlerter | None = None
+        #: AC-13/N2 (R-8, L-30): the rendered `_startup_evidence_summary(...)`
+        #: from the MOST RECENT `_run_never_arm_walk` call, on every one of
+        #: its five return paths. Asserted by presence, never via log
+        #: capture (L-27) -- first-boot verification checks this is a
+        #: non-`None` string, not merely the absence of a halt error.
+        self.last_startup_evidence_summary: str | None = None
         self._illegal_cell_station_days: set[tuple[str, str]] = set()
         self._eligible_snap_counts: dict[tuple[str, str], int] = {}
         self._fee_halt = False
@@ -330,11 +377,15 @@ class ContinuousRungHoldStrategy(Strategy):
         configured instrument lacks a durable fill on record.
         """
         assert self._latch is not None
+        now_ns = self.clock.timestamp_ns()
         if self._latch.is_family_halted():
             self.log.error("continuous_rung_hold: family halt is set; never arming")
             self.position_events.record(_POSITION_FAMILY_HALT_AT_START)
             self._report_alerter(
                 self.position_alerter, "continuous_rung_hold position report failed",
+            )
+            self.last_startup_evidence_summary = _startup_evidence_summary(
+                None, now_ns=now_ns, decisions={},
             )
             return False
 
@@ -351,6 +402,9 @@ class ContinuousRungHoldStrategy(Strategy):
             self._report_alerter(
                 self.position_alerter, "continuous_rung_hold position report failed",
             )
+            self.last_startup_evidence_summary = _startup_evidence_summary(
+                evidence, now_ns=now_ns, decisions={},
+            )
             return False
 
         candidate_ids = self._candidate_instrument_ids()
@@ -364,12 +418,15 @@ class ContinuousRungHoldStrategy(Strategy):
             self._report_alerter(
                 self.position_alerter, "continuous_rung_hold position report failed",
             )
+            self.last_startup_evidence_summary = _startup_evidence_summary(
+                evidence, now_ns=now_ns, decisions={},
+            )
             return False
 
         for fill_record in fills:
             self._consume_trial_from_fill_record(fill_record)
 
-        now_ns = self.clock.timestamp_ns()
+        decisions: dict[str, str] = {}
         for iid, facts in self._facts.items():
             station = facts.settlement_station
             climate_day_key = facts.climate_day.isoformat()
@@ -388,6 +445,9 @@ class ContinuousRungHoldStrategy(Strategy):
             if startup_evidence_lists_slug(evidence, slug):
                 net_position = startup_evidence_position_for(evidence, slug)
                 slug_ok = net_position is not None and net_position <= 0
+                decisions[iid] = "present-flat" if slug_ok else (
+                    "UNKNOWN" if net_position is None else "LONG"
+                )
             else:
                 # Option B (T3, N-T3): a LATER, independent read -- Nautilus's
                 # OWN reconciled portfolio -- must also agree the instrument
@@ -400,6 +460,7 @@ class ContinuousRungHoldStrategy(Strategy):
                     now_ns=now_ns,
                     max_age_ns=_STARTUP_EVIDENCE_MAX_AGE_NS,
                 ) and self.portfolio.net_position(InstrumentId.from_str(iid)) <= 0
+                decisions[iid] = "absent-flat" if slug_ok else "UNKNOWN"
             if not slug_ok:
                 self.log.error(
                     f"continuous_rung_hold: venue position for {iid} is a "
@@ -409,7 +470,13 @@ class ContinuousRungHoldStrategy(Strategy):
                 self._report_alerter(
                     self.position_alerter, "continuous_rung_hold position report failed",
                 )
+                self.last_startup_evidence_summary = _startup_evidence_summary(
+                    evidence, now_ns=now_ns, decisions=decisions,
+                )
                 return False
+        self.last_startup_evidence_summary = _startup_evidence_summary(
+            evidence, now_ns=now_ns, decisions=decisions,
+        )
         return True
 
     def _candidate_instrument_ids(self) -> frozenset[str]:
@@ -783,8 +850,22 @@ class ContinuousRungHoldStrategy(Strategy):
         least once and IN_FLIGHT has since cleared.
 
         Requires attempts under the cap, the conservative delay floor
-        elapsed, AND a FRESH (read live, right here -- never cached) eof-
-        complete positions read showing no LONG on this instrument.
+        elapsed, AND an eof-complete positions read showing no LONG on this
+        instrument (R-8: a slug ABSENT from the page is confirmed FLAT for
+        a candidate instrument, when fresh and Nautilus-reconciled-flat --
+        see :func:`startup_evidence_confirms_absent_flat`).
+
+        This evidence is read FRESH FROM THE STORE -- the durable record
+        the exec client wrote at `_connect` (`exec/client.py:1117`) or at a
+        resolver terminal-zero resolution (`exec/client.py:1536`) -- it is
+        NOT a fresh VENUE read (that is HF-4's scope). ``now_ns`` here is
+        venue EVENT time (`_hunt_tick:587`), used ONLY for the delay-floor
+        comparison below; freshness for the absence branch is computed
+        separately, from `self.clock.timestamp_ns()` (wall time) against
+        the record's own wall-clock `ts_ns` -- R2-B1/L-2, HB7-4. Within the
+        freshness ceiling this record can predate an unmapped fill (R14,
+        a named residual, not fail-closed by this gate alone -- bounded by
+        `is_intent_open()` and the resolver's ACCEPT_FILL terminal).
         """
         if attempts >= _MAX_STATION_DAY_ATTEMPTS:
             return False
