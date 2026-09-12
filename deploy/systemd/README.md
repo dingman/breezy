@@ -150,11 +150,11 @@ echo "recorder=$REC instance=$INST"
 7. **Only then, enable the timer.**
    ```bash
    systemctl --user enable --now breezy-k1-daily.timer
-   systemctl --user list-timers breezy-k1-daily.timer --no-pager   # next run 22:30Z
+   systemctl --user list-timers breezy-k1-daily.timer --no-pager   # next run 01:35Z (MOVED 2026-09-12, was 22:30Z)
    ```
    `--now` starts the *timer*, not the service. To prove the study runs without
-   waiting for 22:30Z: `systemctl --user start breezy-k1-daily.service` and read
-   `~/.local/share/breezy/k1/k1_daily.log`.
+   waiting for 01:35Z (MOVED 2026-09-12, was 22:30Z): `systemctl --user start
+   breezy-k1-daily.service` and read `~/.local/share/breezy/k1/k1_daily.log`.
 
 ### Expected capture gap
 
@@ -348,7 +348,11 @@ when the timer will fire, never which version of the service it will fire.
 - **ACTIVATED AND VERIFIED.** Units symlinked into `~/.config/systemd/user/`,
   `daemon-reload`ed, `systemd-analyze --user verify` silent (= clean).
   `breezy-quote-tape.service` active, `NRestarts=0`; `breezy-k1-daily.timer`
-  enabled, next fire 22:30Z. `Linger=yes`, so both survive reboot and logout.
+  enabled, next fire 22:30Z (ANNOTATED, MOVED 2026-09-12: true as of this
+  2026-09-02 record; `breezy-k1-daily.timer` now fires 01:35Z instead -- see
+  "Protected window and serialization" below; this dated observation is
+  annotated in place, never rewritten). `Linger=yes`, so both survive reboot
+  and logout.
 - **Nothing was lost.** The recorder took **28 s** to shut down cleanly on
   SIGTERM (inside the 120 s `TimeoutStopSec`, which is why that value is not
   the default 90). Preflight on the closed pre-cutover instance
@@ -391,9 +395,13 @@ first; M_B runs **unconditionally** afterward — a failed or cache-starved M_A
 never skips M_B's own daily sample. The schedule sits after the 12:15 UTC
 quote-tape-catalog ingest tick, after every dense station's previous climate
 day has closed (latest, SFO/LAX at UTC-8, closes at 08:00 UTC) and its CLI
-final has normally posted, and staggered a full hour off `breezy-k1-daily`
-(22:30 UTC) / `breezy-offer-gate-daily` (22:45 UTC) — see the timer file's own
-comment for the full reasoning.
+final has normally posted. It was originally staggered a full hour off
+`breezy-k1-daily`/`breezy-offer-gate-daily`.
+
+MOVED 2026-09-12: those two moved from (22:30 UTC) / (22:45 UTC) to `01:35
+UTC` / `02:05 UTC` (see "Protected window and serialization" below);
+`breezy-mb-daily` stayed at `13:30 UTC` -- see the timer file's own comment
+for the full reasoning.
 
 Both studies previously hard-coded `ASOS_FETCH_END` to a literal date with a
 comment instructing a human to hand-edit it forward each day
@@ -533,8 +541,9 @@ naive normal-approximation interval EXEC_SPINE R-9 refuses by name.
 Scheduled a full hour AFTER `breezy-mb-daily` (13:30 UTC) so the tally's read
 of the (unrelated) parquet store never races that unit's work, and a
 distinct hour from every other Breezy timer (`breezy-quote-tape-rotate`
-09:00, `breezy-k1-daily` 22:30, `breezy-offer-gate-daily` 22:45,
-`breezy-quote-tape-ingest` 00,06,12,18:15) — pinned by
+09:00, `breezy-quote-tape-ingest` 00,06,12,18:15, `breezy-k1-daily` 01:35,
+`breezy-offer-gate-daily` 02:05 (MOVED 2026-09-12, was 22:30/22:45)) —
+pinned by
 `tests/unit/test_deploy_timer_hours.py`, which parses every
 `deploy/systemd/*.timer`'s `OnCalendar=` line as text (no `systemd-analyze`
 shelling in the test suite; that check stays a manual step, below). No

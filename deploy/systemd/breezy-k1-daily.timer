@@ -6,12 +6,16 @@ Documentation=file:///home/jon/breezy/deploy/systemd/README.md
 Unit=breezy-k1-daily.service
 
 # The stopgap driver ran once at launch and then `sleep 86400`
-# (k1_daily.sh:33), so its de-facto schedule is its start instant repeating
-# every 24h. `ps` puts that start at 2026-09-01 22:30:21 and this host's clock
-# is UTC (`timedatectl`: Time zone Etc/UTC), so the cadence being preserved is
-# 22:30Z daily. UTC is stated explicitly rather than inherited, so the
-# schedule cannot move if the host timezone is ever changed.
-OnCalendar=*-*-* 22:30:00 UTC
+# (k1_daily.sh:33), so its de-facto schedule WAS its own start instant
+# repeating every 24h, which `ps` put late on 2026-09-01. This host's clock
+# is UTC (`timedatectl`: Time zone Etc/UTC); UTC is stated explicitly rather
+# than inherited, so the schedule cannot move if the host timezone is ever
+# changed.
+# MOVED 2026-09-12: 22:30Z fell inside the protected LST-union window
+# [16:45Z, 01:15Z) (no-start rule [16:35Z, 01:15Z) incl. the 16:40Z
+# STOP_PRIOR hop); see deploy/systemd/README.md "Protected window and
+# serialization".
+OnCalendar=*-*-* 01:35:00 UTC
 
 # The whole reason this replaces a /tmp while-loop: a run missed because the
 # host was down fires as soon as the timer is next active, instead of being

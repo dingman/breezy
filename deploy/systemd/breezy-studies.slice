@@ -1,0 +1,32 @@
+[Unit]
+Description=Breezy nightly analysis studies (shared aggregate ceiling)
+Documentation=file:///home/jon/breezy/deploy/systemd/README.md
+
+# T2 (SP-1.rev4.md): with the host-wide flock in every heavy wrapper
+# (breezy-k1-daily, breezy-mb-daily, breezy-offer-gate-daily), only ONE study
+# ever runs at a time, so this slice's aggregate ceiling is USUALLY
+# redundant with each unit's own per-service MemoryHigh=12G/MemoryMax=16G
+# (tests/unit/test_analysis_units_memory_capped.py). Its non-redundant
+# effect is bounding a study whose lock was somehow bypassed, or a future
+# unit added to this slice before it is wrapped with the lock. The earlier
+# justification -- "MemoryMax=16G avoids OOM-killing a legitimate 15-24G
+# k1 run" -- is FALSE and withdrawn: a 17.6G run is already refused by
+# breezy-k1-daily.service's own per-unit cap, independent of this slice.
+#
+# B4: this slice only binds once it is INSTALLED -- `daemon-reload` alone
+# does NOT create the symlink into ~/.config/systemd/user/; without one,
+# systemd instantiates an implicit, unbounded slice for any unit naming
+# `Slice=breezy-studies.slice`, while `systemctl --user show <service> -p
+# Slice` still reports the configured NAME (false green). Deploy step 1a
+# (build-side, outside this test suite) adds the symlink; the real
+# observable is `systemctl --user show breezy-studies.slice -p MemoryHigh
+# -p MemoryMax` returning non-`infinity` values.
+#
+# N2: `-` is systemd's slice-hierarchy separator, so `breezy-studies.slice`
+# nests under an implicit `breezy.slice`, which is ITSELF unbounded. The
+# effective ceiling for units in THIS slice is the one below, never
+# `breezy.slice`'s.
+
+[Slice]
+MemoryHigh=12G
+MemoryMax=16G

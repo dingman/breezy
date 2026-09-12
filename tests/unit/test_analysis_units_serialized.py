@@ -38,7 +38,13 @@ forgotten override can never silently fall through to the real
 
 from __future__ import annotations
 
+import ast
+import datetime as dt
+import fcntl
 import os
+import re
+import subprocess
+import tomllib
 import uuid
 from dataclasses import dataclass
 from pathlib import Path
@@ -132,20 +138,27 @@ def build_wrapper_env(
     run_token: str,
     *,
     output_dirs: dict[str, Path],
+    xdg_runtime_dir: Path | None = None,
     extra: dict[str, str] | None = None,
 ) -> dict[str, str]:
     """The ONLY way a test in this module may build a subprocess env for a
-    wrapper spawn (AM-22 pins this by AST). `HOME` and `XDG_RUNTIME_DIR` are
-    always fresh directories under `tmp_path`, named with `run_token` so any
-    byte a mis-redirected wrapper writes carries it; every `output_dirs`
-    value must already be a `BREEZY_*_OUTPUT_DIR`-shaped key pointing inside
-    `tmp_path`. Self-validates via :func:`assert_wrapper_env_safe` before
-    returning -- fail-closed by construction, not by caller discipline.
+    wrapper spawn (AM-22 pins this by AST). `HOME` is always a fresh
+    directory under `tmp_path`, named with `run_token` so any byte a
+    mis-redirected wrapper writes carries it; every `output_dirs` value must
+    already be a `BREEZY_*_OUTPUT_DIR`-shaped key pointing inside `tmp_path`.
+    Self-validates via :func:`assert_wrapper_env_safe` before returning --
+    fail-closed by construction, not by caller discipline.
+
+    `xdg_runtime_dir`, if given, is used AS-IS without being created --
+    the lock-infrastructure-failure tests (A-17) deliberately pass a path
+    shaped as a blocking FILE or a mode-0500 directory here; the default
+    (`None`) creates a fresh, ordinary directory under `tmp_path`.
     """
     home = tmp_path / f"{run_token}-home"
-    xdg_runtime_dir = tmp_path / f"{run_token}-xdg-runtime"
     home.mkdir(parents=True, exist_ok=True)
-    xdg_runtime_dir.mkdir(parents=True, exist_ok=True)
+    if xdg_runtime_dir is None:
+        xdg_runtime_dir = tmp_path / f"{run_token}-xdg-runtime"
+        xdg_runtime_dir.mkdir(parents=True, exist_ok=True)
     env: dict[str, str] = {
         "HOME": str(home),
         "XDG_RUNTIME_DIR": str(xdg_runtime_dir),
@@ -315,6 +328,632 @@ def test_the_wrapper_env_fixture_refuses_an_env_without_xdg_runtime_dir(tmp_path
             tmp_path,
             new_run_token(),
             output_dirs={"NOT_A_BREEZY_OUTPUT_DIR": tmp_path / "x"},
+        )
+
+
+##############################################################################
+# I2 -- protected window, shared slice, wrapper flock, ingest deprioritisation
+##############################################################################
+
+_SITES_TOML: Final[Path] = _REPO_ROOT / "src" / "breezy" / "registry" / "sites.toml"
+_MA_STUDY: Final[Path] = _REPO_ROOT / "scripts" / "analysis" / "ma_prelock_winner_ask_study.py"
+_CONTINUOUS_STRATEGY: Final[Path] = (
+    _REPO_ROOT / "src" / "breezy" / "strategy" / "current_rung_hold" / "continuous_strategy.py"
+)
+_STRATEGY_MODULE: Final[str] = "breezy.strategy.current_rung_hold.strategy"
+_WINDOW_START_CONST: Final[str] = "_WINDOW_START_HOUR_LST"
+_WINDOW_END_CONST: Final[str] = "_WINDOW_END_HOUR_LST"
+
+_STUDIES_SLICE: Final[Path] = _DEPLOY_DIR / "breezy-studies.slice"
+_LOCK_FILENAME: Final[str] = "breezy-studies.lock"
+
+#: Literal expected sets (L-24 anti-vacuity): every test below that iterates
+#: one of these asserts it equals the hardcoded expectation FIRST, so a
+#: missing file fails loudly on set membership rather than silently
+#: iterating over zero items.
+_HEAVY_TIMERS: Final[frozenset[str]] = frozenset(
+    {
+        "breezy-k1-daily.timer",
+        "breezy-mb-daily.timer",
+        "breezy-offer-gate-daily.timer",
+    }
+)
+_HEAVY_SERVICES: Final[frozenset[str]] = frozenset(
+    {
+        "breezy-k1-daily.service",
+        "breezy-mb-daily.service",
+        "breezy-offer-gate-daily.service",
+    }
+)
+_WRAPPERS: Final[frozenset[str]] = frozenset(
+    {
+        "k1-daily-run.sh",
+        "mb-daily-run.sh",
+        "offer-gate-daily-run.sh",
+    }
+)
+
+#: Every wrapper writes its own `$OUT`/log via a distinct env var, except
+#: `offer-gate-daily-run.sh`, which takes `$OUT` as `argv[1]` (A-8) -- `None`
+#: marks that case.
+_WRAPPER_OUTPUT_ENV_VAR: Final[dict[str, str | None]] = {
+    "k1-daily-run.sh": "BREEZY_K1_OUTPUT_DIR",
+    "mb-daily-run.sh": "BREEZY_MB_OUTPUT_DIR",
+    "offer-gate-daily-run.sh": None,
+}
+_WRAPPER_LOG_FILENAME: Final[dict[str, str]] = {
+    "k1-daily-run.sh": "k1_daily.log",
+    "mb-daily-run.sh": "mb_daily.log",
+    "offer-gate-daily-run.sh": "offer_gate_daily.log",
+}
+
+_SIZE_MULTIPLIERS: Final[dict[str, int]] = {
+    "": 1,
+    "K": 1024,
+    "M": 1024**2,
+    "G": 1024**3,
+    "T": 1024**4,
+}
+_SIZE_RE: Final[re.Pattern[str]] = re.compile(r"^(\d+(?:\.\d+)?)([KMGT]?)$")
+
+
+def _parse_systemd_size(raw: str) -> float:
+    match = _SIZE_RE.match(raw.strip())
+    assert match is not None, f"unparseable systemd size literal: {raw!r}"
+    number, suffix = match.groups()
+    return float(number) * _SIZE_MULTIPLIERS[suffix]
+
+
+def _directive_value(unit_text: str, directive: str) -> str | None:
+    prefix = f"{directive}="
+    for line in unit_text.splitlines():
+        stripped = line.strip()
+        if stripped.startswith("#"):
+            continue
+        if stripped.startswith(prefix):
+            return stripped[len(prefix) :]
+    return None
+
+
+def _on_calendar_hhmm(timer_text: str) -> list[tuple[int, int]]:
+    """Every literal `HH:MM` an `OnCalendar=... HH:MM:SS UTC` line in
+    `timer_text` fires at. Deliberately text-only, mirroring
+    `tests/unit/test_deploy_timer_hours.py`."""
+    ticks: list[tuple[int, int]] = []
+    pattern = re.compile(r"^OnCalendar=.*\s([\d,]+):(\d{2}):\d{2}\s+UTC\s*$")
+    for line in timer_text.splitlines():
+        match = pattern.match(line.strip())
+        if match is None:
+            continue
+        hours_field, minute = match.groups()
+        for hour in hours_field.split(","):
+            ticks.append((int(hour), int(minute)))
+    return ticks
+
+
+def _std_utc_offsets_from_sites_toml() -> frozenset[float]:
+    """`std_utc_offset_hours` values declared anywhere in
+    `src/breezy/registry/sites.toml` -- never a UTC literal, never an IANA
+    zone (Rev 2 BLOCK-1)."""
+    raw = tomllib.loads(_SITES_TOML.read_text())
+    offsets: set[float] = set()
+
+    def _walk(node: object) -> None:
+        if isinstance(node, dict):
+            value = node.get("std_utc_offset_hours")
+            if isinstance(value, (int, float)):
+                offsets.add(float(value))
+            for child in node.values():
+                _walk(child)
+
+    _walk(raw)
+    return frozenset(offsets)
+
+
+@dataclass(frozen=True)
+class _ProtectedWindow:
+    """`P`, as minutes-of-day since 00:00Z. `end_minute` may be `>= 1440`,
+    meaning the window crosses midnight -- callers use :meth:`contains`
+    rather than comparing the raw fields directly."""
+
+    start_minute: int
+    end_minute: int
+
+    def contains(self, hour: int, minute: int) -> bool:
+        minute_of_day = hour * 60 + minute
+        if self.end_minute >= 1440:
+            wrapped_end = self.end_minute - 1440
+            return minute_of_day >= self.start_minute or minute_of_day < wrapped_end
+        return self.start_minute <= minute_of_day < self.end_minute
+
+    def as_hhmm(self) -> tuple[dt.time, dt.time]:
+        start = self.start_minute % 1440
+        end = self.end_minute % 1440
+        return (dt.time(start // 60, start % 60), dt.time(end // 60, end % 60))
+
+
+def _protected_window() -> _ProtectedWindow:
+    """`P`, derived exactly as `SP-1.rev4.md`'s "Window derivation" section
+    computes it: offsets from `sites.toml`, LST bounds imported from the
+    live gate, union over the per-offset UTC intervals, then +/-15 min."""
+    from breezy.strategy.current_rung_hold.strategy import (
+        _WINDOW_END_HOUR_LST,
+        _WINDOW_START_HOUR_LST,
+    )
+
+    duration_minutes = (_WINDOW_END_HOUR_LST - _WINDOW_START_HOUR_LST) * 60
+    intervals = []
+    for offset in _std_utc_offsets_from_sites_toml():
+        start = round((_WINDOW_START_HOUR_LST * 60) - (offset * 60)) % 1440
+        intervals.append((start, start + duration_minutes))
+    intervals.sort()
+    merged_start, merged_end = intervals[0]
+    for start, end in intervals[1:]:
+        assert start <= merged_end, (
+            f"per-offset windows do not merge into a single contiguous "
+            f"protected window: {intervals}"
+        )
+        merged_end = max(merged_end, end)
+    return _ProtectedWindow(start_minute=merged_start - 15, end_minute=merged_end + 15)
+
+
+def _ast_module(path: Path) -> ast.Module:
+    return ast.parse(path.read_text(), filename=str(path))
+
+
+def _time_call_args(node: ast.expr) -> tuple[int, int] | None:
+    """If `node` is a call shaped like `dt.time(H, M)`, return `(H, M)`."""
+    if not isinstance(node, ast.Call):
+        return None
+    if len(node.args) < 2:
+        return None
+    hour, minute = node.args[0], node.args[1]
+    if (
+        isinstance(hour, ast.Constant)
+        and isinstance(minute, ast.Constant)
+        and isinstance(hour.value, int)
+        and isinstance(minute.value, int)
+    ):
+        return (hour.value, minute.value)
+    return None
+
+
+def _module_level_time_constants(
+    module: ast.Module, names: frozenset[str]
+) -> dict[str, tuple[int, int]]:
+    found: dict[str, tuple[int, int]] = {}
+    for node in module.body:
+        targets: list[ast.expr] = []
+        value: ast.expr | None = None
+        if isinstance(node, ast.Assign):
+            targets = node.targets
+            value = node.value
+        elif isinstance(node, ast.AnnAssign) and node.value is not None:
+            targets = [node.target]
+            value = node.value
+        else:
+            continue
+        for target in targets:
+            if isinstance(target, ast.Name) and target.id in names:
+                parsed = _time_call_args(value) if value is not None else None
+                if parsed is not None:
+                    found[target.id] = parsed
+    return found
+
+
+def test_the_protected_window_is_derived_from_the_declared_std_offsets() -> None:
+    offsets = _std_utc_offsets_from_sites_toml()
+    assert offsets == frozenset({-5.0, -6.0, -8.0})
+
+    window = _protected_window()
+    start, end = window.as_hhmm()
+    assert (start, end) == (dt.time(16, 45), dt.time(1, 15))
+
+    module = _ast_module(_MA_STUDY)
+    constants = _module_level_time_constants(
+        module, frozenset({"AFTERNOON_WINDOW_START", "AFTERNOON_WINDOW_END"})
+    )
+    assert constants.get("AFTERNOON_WINDOW_START") == (12, 0)
+    assert constants.get("AFTERNOON_WINDOW_END") == (17, 0)
+
+
+@pytest.mark.parametrize("timer_name", sorted(_HEAVY_TIMERS))
+def test_no_heavy_unit_timer_fires_inside_the_lst_derived_protected_window(timer_name: str) -> None:
+    assert _HEAVY_TIMERS == {
+        "breezy-k1-daily.timer",
+        "breezy-mb-daily.timer",
+        "breezy-offer-gate-daily.timer",
+    }
+    timer_path = _DEPLOY_DIR / timer_name
+    assert timer_path.is_file(), f"{timer_name} does not exist"
+    window = _protected_window()
+    ticks = _on_calendar_hhmm(timer_path.read_text())
+    assert ticks, f"{timer_name} has no parseable OnCalendar= line"
+    for hour, minute in ticks:
+        assert not window.contains(hour, minute), (
+            f"{timer_name} fires at {hour:02d}:{minute:02d}Z, inside the "
+            f"protected window {window.as_hhmm()}"
+        )
+
+
+def test_the_protected_window_predicate_rejects_a_synthetic_in_window_tick() -> None:
+    """N6c negative control (L-24): the predicate above must be able to
+    DETECT a violation, not just always return False."""
+    window = _protected_window()
+    assert window.contains(20, 0) is True
+    assert window.contains(0, 30) is True
+    assert window.contains(13, 30) is False
+
+
+def test_the_v3_strategy_imports_the_v1_decision_window_and_redeclares_neither() -> None:
+    module = _ast_module(_CONTINUOUS_STRATEGY)
+    imported_no_alias: set[str] = set()
+    for node in ast.walk(module):
+        if isinstance(node, ast.ImportFrom) and node.module == _STRATEGY_MODULE:
+            for alias in node.names:
+                if alias.name in (_WINDOW_START_CONST, _WINDOW_END_CONST) and alias.asname is None:
+                    imported_no_alias.add(alias.name)
+    assert imported_no_alias == {_WINDOW_START_CONST, _WINDOW_END_CONST}, (
+        "continuous_strategy.py must import both window constants by their "
+        "exact name, unaliased -- an aliased re-export would satisfy a "
+        "name-only check while leaving the module-level name free to be "
+        "rebound (R4-N3)"
+    )
+    for node in module.body:
+        targets: list[ast.expr] = []
+        if isinstance(node, ast.Assign):
+            targets = node.targets
+        elif isinstance(node, ast.AnnAssign):
+            targets = [node.target]
+        for target in targets:
+            if isinstance(target, ast.Name):
+                assert target.id not in (_WINDOW_START_CONST, _WINDOW_END_CONST), (
+                    f"{target.id} is re-declared at module level in "
+                    "continuous_strategy.py -- it must only be imported"
+                )
+
+
+@pytest.mark.parametrize("service_name", sorted(_HEAVY_SERVICES))
+def test_every_heavy_study_unit_declares_the_shared_studies_slice(service_name: str) -> None:
+    assert _HEAVY_SERVICES == {
+        "breezy-k1-daily.service",
+        "breezy-mb-daily.service",
+        "breezy-offer-gate-daily.service",
+    }
+    service_path = _DEPLOY_DIR / service_name
+    assert service_path.is_file(), f"{service_name} does not exist"
+    assert "Slice=breezy-studies.slice" in service_path.read_text().splitlines()
+
+
+def test_the_studies_slice_declares_its_own_memory_ceiling() -> None:
+    assert _STUDIES_SLICE.is_file()
+    text = _STUDIES_SLICE.read_text()
+    memory_high = _directive_value(text, "MemoryHigh")
+    memory_max = _directive_value(text, "MemoryMax")
+    assert memory_high is not None
+    assert memory_max is not None
+    assert _parse_systemd_size(memory_high) < _parse_systemd_size(memory_max)
+
+
+def test_the_ingest_unit_is_deprioritised_against_the_studies() -> None:
+    ingest_service = _DEPLOY_DIR / "breezy-quote-tape-ingest.service"
+    text = ingest_service.read_text()
+    assert _directive_value(text, "Nice") == "10"
+    assert _directive_value(text, "IOSchedulingClass") == "best-effort"
+    assert _directive_value(text, "IOSchedulingPriority") == "7"
+    assert _directive_value(text, "MemoryHigh") == "4G"
+    assert _directive_value(text, "MemoryMax") == "6G"
+
+
+def test_the_ingest_unit_comment_matches_the_cli_exit_contract() -> None:
+    text = (_DEPLOY_DIR / "breezy-quote-tape-ingest.service").read_text()
+    assert "exit 3" in text
+    assert "EXIT_CONVERSION_FAILED" in text
+
+
+def test_the_offer_gate_unit_still_passes_the_systemd_home_specifier() -> None:
+    text = (_DEPLOY_DIR / "breezy-offer-gate-daily.service").read_text()
+    exec_start = _directive_value(text, "ExecStart")
+    assert exec_start is not None
+    assert "offer-gate-daily-run.sh" in exec_start
+    assert "%h/.local/share/breezy/offer_gate" in exec_start
+    for path in _DEPLOY_DIR.iterdir():
+        if path.is_file():
+            assert "BREEZY_OFFER_GATE_OUTPUT_DIR" not in path.read_text()
+
+
+##############################################################################
+# I2a/A-20 -- retimed doc claims, scoped grep + positive control + residual
+##############################################################################
+
+_A20_SCOPE: Final[frozenset[str]] = frozenset(
+    {
+        "deploy/systemd/breezy-k1-daily.timer",
+        "deploy/systemd/breezy-offer-gate-daily.timer",
+        "deploy/systemd/README.md",
+    }
+)
+_A20_MOVED_MARKER: Final[str] = "MOVED 2026-09-12"
+_A20_RESIDUAL: Final[frozenset[str]] = frozenset(
+    {
+        "breezy-pm-crh-v2-tally.timer",
+        "breezy-live-tally.timer",
+        "breezy-mb-daily.timer",
+        "breezy-score-live-trials.timer",
+        "breezy-quote-tape-ingest.timer",
+    }
+)
+
+
+def test_no_retimed_unit_or_readme_line_still_asserts_the_old_tick() -> None:
+    for relative in sorted(_A20_SCOPE):
+        path = _REPO_ROOT / relative
+        assert path.is_file(), f"{relative} does not exist"
+        for line in path.read_text().splitlines():
+            if "22:30" in line or "22:45" in line:
+                assert _A20_MOVED_MARKER in line, (
+                    f"{relative} still asserts the old tick without a "
+                    f"{_A20_MOVED_MARKER!r} marker: {line!r}"
+                )
+
+    combined_text = "\n".join((_REPO_ROOT / relative).read_text() for relative in _A20_SCOPE)
+    assert "01:35" in combined_text
+    assert "02:05" in combined_text
+
+    for residual_name in sorted(_A20_RESIDUAL):
+        text = (_DEPLOY_DIR / residual_name).read_text()
+        assert "22:30" in text or "22:45" in text, (
+            f"{residual_name} was expected to still carry its declared-residual "
+            "stale tick reference (A-20) -- a silent edit to a zero-diff-"
+            "protected file would otherwise go undetected"
+        )
+
+
+##############################################################################
+# I2c -- wrapper lock serialization
+##############################################################################
+
+
+def _spawn_wrapper(
+    wrapper_filename: str,
+    tmp_path: Path,
+    *,
+    provide_output_arg: bool = True,
+    xdg_runtime_dir: Path | None = None,
+) -> tuple[subprocess.CompletedProcess[str], Path, Path]:
+    """Spawn one wrapper under a fully isolated, `tmp_path`-scoped env.
+    Returns `(result, out_dir, log_path)`."""
+    token = new_run_token()
+    out_dir = tmp_path / f"{token}-out"
+    env_var = _WRAPPER_OUTPUT_ENV_VAR[wrapper_filename]
+    output_dirs: dict[str, Path] = {(env_var or "BREEZY_OFFER_GATE_OUTPUT_DIR"): out_dir}
+    env = build_wrapper_env(
+        tmp_path, token, output_dirs=output_dirs, xdg_runtime_dir=xdg_runtime_dir
+    )
+    argv = ["bash", str(_DEPLOY_DIR / wrapper_filename)]
+    if env_var is None and provide_output_arg:
+        argv.append(str(out_dir))
+    result = subprocess.run(
+        argv, env=env, capture_output=True, text=True, timeout=30, check=False
+    )
+    log_path = out_dir / _WRAPPER_LOG_FILENAME[wrapper_filename]
+    return result, out_dir, log_path
+
+
+@pytest.mark.parametrize("wrapper_filename", sorted(_WRAPPERS))
+def test_every_heavy_study_wrapper_takes_the_studies_flock_and_skips_when_held(
+    wrapper_filename: str, tmp_path: Path
+) -> None:
+    assert _WRAPPERS == {"k1-daily-run.sh", "mb-daily-run.sh", "offer-gate-daily-run.sh"}
+    token = new_run_token()
+    xdg_runtime_dir = tmp_path / f"{token}-xdg-runtime"
+    xdg_runtime_dir.mkdir(parents=True)
+    lock_path = xdg_runtime_dir / _LOCK_FILENAME
+    lock_fd = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o600)
+    try:
+        fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        result, out_dir, log_path = _spawn_wrapper(
+            wrapper_filename, tmp_path, xdg_runtime_dir=xdg_runtime_dir
+        )
+        assert result.returncode == 0
+        assert log_path.is_file()
+        expected = "SKIPPED -- another study holds the studies lock"
+        assert expected in log_path.read_text()
+        assert expected in result.stdout
+        artefacts = [p for p in out_dir.iterdir() if p != log_path]
+        assert artefacts == [], f"the study ran despite the held lock: {artefacts}"
+    finally:
+        fcntl.flock(lock_fd, fcntl.LOCK_UN)
+        os.close(lock_fd)
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="permission refusals are bypassed as root")
+@pytest.mark.parametrize("wrapper_filename", sorted(_WRAPPERS))
+def test_the_wrapper_skips_when_the_lock_directory_is_missing_or_unwritable(
+    wrapper_filename: str, tmp_path: Path
+) -> None:
+    # Case 1: a FILE occupies the path `mkdir -p "$LOCK_DIR"` must create --
+    # "non-creatable".
+    blocked_runtime_dir = tmp_path / f"{new_run_token()}-blocked"
+    blocked_runtime_dir.write_bytes(b"")
+    result, _out_dir, log_path = _spawn_wrapper(
+        wrapper_filename, tmp_path, xdg_runtime_dir=blocked_runtime_dir
+    )
+    assert result.returncode == 75
+    combined = result.stdout + (log_path.read_text() if log_path.is_file() else "")
+    assert "SKIPPED-INFRA" in combined
+    assert "SKIPPED -- another study holds the studies lock" not in combined
+
+    # Case 2: LOCK_DIR exists but is unwritable (mode 0500) -- `mkdir -p`
+    # succeeds trivially; opening a NEW file inside it fails.
+    restricted_runtime_dir = tmp_path / f"{new_run_token()}-restricted"
+    restricted_runtime_dir.mkdir(parents=True)
+    restricted_runtime_dir.chmod(0o500)
+    try:
+        result2, _out_dir2, log_path2 = _spawn_wrapper(
+            wrapper_filename, tmp_path, xdg_runtime_dir=restricted_runtime_dir
+        )
+        assert result2.returncode == 75
+        combined2 = result2.stdout + (log_path2.read_text() if log_path2.is_file() else "")
+        assert "SKIPPED-INFRA" in combined2
+        assert "SKIPPED -- another study holds the studies lock" not in combined2
+    finally:
+        restricted_runtime_dir.chmod(0o700)
+
+
+def test_the_offer_gate_wrapper_requires_its_output_dir_as_an_argument(tmp_path: Path) -> None:
+    result, _out_dir, _log_path = _spawn_wrapper(
+        "offer-gate-daily-run.sh", tmp_path, provide_output_arg=False
+    )
+    assert result.returncode != 0
+    assert "offer-gate output directory is required" in result.stderr
+
+
+@pytest.mark.parametrize("wrapper_filename", sorted(_WRAPPERS))
+def test_every_study_wrapper_is_executable(wrapper_filename: str) -> None:
+    path = _DEPLOY_DIR / wrapper_filename
+    assert path.is_file(), f"{wrapper_filename} does not exist"
+    assert os.access(path, os.X_OK), f"{wrapper_filename} is not executable"
+
+
+def test_all_three_wrappers_name_the_same_lock_path() -> None:
+    expected_line = f'LOCK="$LOCK_DIR/{_LOCK_FILENAME}"'
+    for wrapper_filename in sorted(_WRAPPERS):
+        text = (_DEPLOY_DIR / wrapper_filename).read_text()
+        assert expected_line in text.splitlines(), (
+            f"{wrapper_filename} does not name the shared lock path identically"
+        )
+
+
+_INTERPRETER_INVOCATION_RE: Final[re.Pattern[str]] = re.compile(
+    r'^\s*(if\s+)?"\$(PY|REPO/\.venv/bin/python)"\s'
+)
+_PREAMBLE_MARKER: Final[str] = "unset POSIXLY_CORRECT"
+
+
+@pytest.mark.parametrize("wrapper_filename", sorted(_WRAPPERS))
+def test_the_lock_preamble_precedes_the_first_interpreter_invocation_in_every_wrapper(
+    wrapper_filename: str,
+) -> None:
+    lines = (_DEPLOY_DIR / wrapper_filename).read_text().splitlines()
+    preamble_index = next(
+        (i for i, line in enumerate(lines) if line.strip() == _PREAMBLE_MARKER), None
+    )
+    assert preamble_index is not None, f"{wrapper_filename} has no lock preamble"
+    invocation_index = next(
+        (i for i, line in enumerate(lines) if _INTERPRETER_INVOCATION_RE.match(line)), None
+    )
+    assert invocation_index is not None, (
+        f"{wrapper_filename} has no recognisable interpreter invocation"
+    )
+    assert preamble_index < invocation_index, (
+        f"{wrapper_filename} invokes the interpreter (line {invocation_index + 1}) "
+        f"before the lock preamble (line {preamble_index + 1})"
+    )
+
+
+@pytest.mark.parametrize("wrapper_filename", sorted(_WRAPPERS))
+def test_no_study_wrapper_enables_posix_mode(wrapper_filename: str) -> None:
+    """C2-B3 + R4-N2: neither door is open -- no ACTUAL `set -o posix`
+    directive (a mention of the literal string inside an explanatory
+    comment, as the preamble's own header carries, does not count), and
+    `unset POSIXLY_CORRECT` is present exactly once."""
+    lines = (_DEPLOY_DIR / wrapper_filename).read_text().splitlines()
+    for line in lines:
+        stripped = line.strip()
+        if stripped.startswith("#"):
+            continue
+        assert "set -o posix" not in stripped, (
+            f"{wrapper_filename} enables POSIX mode: {line!r}"
+        )
+    assert lines.count(_PREAMBLE_MARKER) == 1
+
+
+##############################################################################
+# AM-22 -- every subprocess.* call in THIS module takes env= from the fixture
+##############################################################################
+
+_ALLOWED_ENV_BUILDERS: Final[frozenset[str]] = frozenset({"build_wrapper_env"})
+
+
+def _env_keyword_source(call: ast.Call) -> ast.expr | None:
+    for keyword in call.keywords:
+        if keyword.arg == "env":
+            return keyword.value
+    return None
+
+
+def _is_subprocess_call(call: ast.Call) -> bool:
+    func = call.func
+    return (
+        isinstance(func, ast.Attribute)
+        and func.attr in ("run", "Popen", "check_call", "call")
+        and isinstance(func.value, ast.Name)
+        and func.value.id == "subprocess"
+    )
+
+
+def _enclosing_function(module: ast.Module, target: ast.AST) -> ast.FunctionDef | None:
+    """The innermost `FunctionDef` in `module` containing `target` -- there
+    are no nested `def`s in this module, so a plain containment walk is
+    unambiguous."""
+    for node in ast.walk(module):
+        if isinstance(node, ast.FunctionDef) and any(
+            child is target for child in ast.walk(node)
+        ):
+            return node
+    return None
+
+
+def _is_call_to_allowed_builder(value: ast.expr) -> bool:
+    return (
+        isinstance(value, ast.Call)
+        and isinstance(value.func, ast.Name)
+        and value.func.id in _ALLOWED_ENV_BUILDERS
+    )
+
+
+def _env_arg_traces_to_allowed_builder(
+    module: ast.Module, call: ast.Call, env_source: ast.expr
+) -> bool:
+    """True if `env_source` is either a direct call to an allowed builder,
+    or a bare `Name` whose LAST same-function assignment before this call
+    is such a call -- e.g. `env = build_wrapper_env(...); subprocess.run(
+    ..., env=env)`. Never `os.environ`, `os.environ.copy()`, or a dict
+    literal (AM-22)."""
+    if _is_call_to_allowed_builder(env_source):
+        return True
+    if not isinstance(env_source, ast.Name):
+        return False
+    enclosing = _enclosing_function(module, call)
+    if enclosing is None:
+        return False
+    last_assignment: ast.expr | None = None
+    for node in ast.walk(enclosing):
+        if isinstance(node, ast.Assign):
+            for target in node.targets:
+                if isinstance(target, ast.Name) and target.id == env_source.id:
+                    last_assignment = node.value
+    return last_assignment is not None and _is_call_to_allowed_builder(last_assignment)
+
+
+def test_every_subprocess_call_takes_env_from_the_wrapper_env_fixture() -> None:
+    """AM-22: never `os.environ`, `os.environ.copy()`, or a dict literal --
+    so the fail-closed fixture check cannot be bypassed by a hand-rolled
+    spawn."""
+    module = _ast_module(Path(__file__))
+    subprocess_calls = [
+        node for node in ast.walk(module)
+        if isinstance(node, ast.Call) and _is_subprocess_call(node)
+    ]
+    assert subprocess_calls, "expected at least one subprocess.* call in this module"
+    for call in subprocess_calls:
+        env_source = _env_keyword_source(call)
+        assert env_source is not None, "a subprocess.* call is missing env="
+        assert _env_arg_traces_to_allowed_builder(module, call, env_source), (
+            f"env= ({ast.dump(env_source)}) does not trace back to a call to "
+            f"one of {sorted(_ALLOWED_ENV_BUILDERS)} -- never os.environ, "
+            "os.environ.copy(), or a dict literal"
         )
 
 
