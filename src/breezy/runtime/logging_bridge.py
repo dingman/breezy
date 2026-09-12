@@ -61,7 +61,8 @@ handlers use), never re-raised.
 from __future__ import annotations
 
 import logging
-from typing import Protocol
+import sys
+from typing import Protocol, TextIO
 
 from nautilus_trader.common.component import Logger as NautilusLogger
 
@@ -146,6 +147,63 @@ def install(
     breezy_logger.addHandler(handler)
     breezy_logger.setLevel(logging.DEBUG)
     _installed_handler = handler
+    return handler
+
+
+def is_installed() -> bool:
+    """``True`` once :func:`install` has attached the bridge handler to the
+    ``breezy`` namespace and it has not since been removed by
+    :func:`uninstall`."""
+    breezy_logger = logging.getLogger(BREEZY_LOGGER_NAME)
+    return _installed_handler is not None and _installed_handler in breezy_logger.handlers
+
+
+class _BootWindowStreamHandler(logging.StreamHandler[TextIO]):
+    """Marker subclass so :func:`ensure_stderr_visible` can find its own
+    handler idempotently without matching a caller-installed
+    ``StreamHandler`` (e.g. pytest's own capture handler)."""
+
+
+def ensure_stderr_visible(logger_name: str) -> logging.Handler | None:
+    """Attach a plain ``StreamHandler(sys.stderr)`` at INFO to
+    ``logger_name``, idempotently -- the A1 boot-window mechanism (L-30).
+
+    Before this bridge is installed, the ``breezy`` namespace (and every
+    child logger) has no handler at all, and stdlib's own fallback
+    (``logging.lastResort``) is a ``_StderrHandler`` at **WARNING**: an INFO
+    record logged in that window is silently dropped, not merely
+    unformatted. Calling this at process start on the specific logger a
+    caller needs visible (e.g. ``breezy.runtime.health``) closes that gap
+    without touching the ``breezy`` bridge namespace itself.
+
+    The attached handler carries a filter that returns ``not
+    is_installed()``, evaluated per record -- so once :func:`install`
+    attaches the real bridge to ``breezy``, this handler falls silent and
+    the SAME record instead reaches the bridge through normal logger
+    propagation. Nothing is ever logged twice.
+
+    Returns the handler (existing or newly attached), or ``None`` when the
+    bridge is already installed -- there is nothing left to attach because
+    the boot window has already closed.
+    """
+    if is_installed():
+        return None
+    logger = logging.getLogger(logger_name)
+    for existing in logger.handlers:
+        if isinstance(existing, _BootWindowStreamHandler):
+            return existing
+    handler = _BootWindowStreamHandler(sys.stderr)
+    handler.setLevel(logging.INFO)
+    handler.addFilter(lambda _record: not is_installed())
+    logger.addHandler(handler)
+    # A handler's own level only filters records that already reach it --
+    # stdlib first checks the LOGGER's effective level (walking up to the
+    # root logger, WARNING by default, if every logger in between is
+    # NOTSET) before a record is even constructed. Without this, an INFO
+    # call on a fresh logger name is silently dropped before this handler
+    # ever sees it, defeating the whole point of this function.
+    if logger.level == logging.NOTSET or logger.level > logging.INFO:
+        logger.setLevel(logging.INFO)
     return handler
 
 

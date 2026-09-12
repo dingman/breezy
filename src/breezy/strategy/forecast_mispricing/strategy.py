@@ -79,6 +79,7 @@ from breezy.domain.nws_climate_day import NwsClimateDay
 from breezy.domain.weather_bucket_facts import Measure, read_weather_bucket_facts
 from breezy.ingest.nws_actor import nws_climate_day_data_type
 from breezy.runtime.backtest_feed import NWS_BACKTEST_CLIENT_ID
+from breezy.runtime.health import AlertSink
 from breezy.strategy.depth10 import market_quote_from_depth
 from breezy.strategy.forecast_mispricing.config import ForecastMispricingConfig
 from breezy.strategy.forecast_mispricing.decision import evaluate_instrument
@@ -167,6 +168,12 @@ class ForecastMispricingStrategy(SharedExposureMixin, Strategy):
         # strategy id -- its alert `site` -- is settled.
         self.refusals = RefusalCounter()
         self._refusal_alerter: RefusalAlerter | None = None
+        #: SP-6 A5/AM-2: the ONE sink the node process resolved
+        #: (``app/trade.py::run``), threaded into ``on_start``'s
+        #: ``RefusalAlerter`` below. Unset in any other context
+        #: (a direct/test construction) -- that alerter then resolves
+        #: its own, exactly as before.
+        self.alert_sink: AlertSink | None = None
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -208,7 +215,9 @@ class ForecastMispricingStrategy(SharedExposureMixin, Strategy):
             exposure_view=self._shared_exposure_view,
             native_instrument_ids=self._nt_ids,
         )
-        self._refusal_alerter = RefusalAlerter(self.refusals, site=str(self.id))
+        self._refusal_alerter = RefusalAlerter(
+            self.refusals, site=str(self.id), sink=self.alert_sink
+        )
         self.subscribe_data(nws_climate_day_data_type(), client_id=NWS_BACKTEST_CLIENT_ID)
 
     def _risk_limits(self) -> RiskLimits:

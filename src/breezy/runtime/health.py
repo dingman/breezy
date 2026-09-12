@@ -84,6 +84,12 @@ __all__ = [
 
 logger = logging.getLogger(__name__)
 
+#: This module's own logger name, exposed so a caller (``app/trade.py``'s
+#: boot window, ``runtime/alert_test_cli.py``, ``runtime/liveness_probe_cli.py``)
+#: can pass it to ``logging_bridge.ensure_stderr_visible`` without hardcoding
+#: the dotted path or importing ``logging`` just to call ``getLogger(__name__)``.
+HEALTH_LOGGER_NAME: Final[str] = __name__
+
 #: Bumped whenever `HealthSnapshot.to_dict()`'s shape changes, so an
 #: operator or a future reader of the file on disk can tell an old snapshot
 #: apart from a new one without inferring it from field presence.
@@ -507,7 +513,22 @@ def resolve_alert_sink(env: Mapping[str, str] | None = None) -> AlertSink:
     active_env: Mapping[str, str] = os.environ if env is None else env
     url = active_env.get(ALERT_WEBHOOK_URL_ENV_VAR)
     if not url:
+        # AM-19 (coordinator ruling, supersedes AM-1): INFO, not WARN. The
+        # sink-SELECTION line is informational on both branches; delivery
+        # severity (WARN/CRITICAL) is carried by the alert itself once it
+        # reaches a sink (A11/A12/self-check), not by the resolution step.
+        # Keeping this WARN broke the frozen, byte-unchanged
+        # `tests/unit/test_app_trade_main_permit_logging.py` (H-1 FINAL),
+        # which counts WARNING records from this logger; H-1 inherits a
+        # follow-up to re-key that test on the event rather than the
+        # level. Never names or invents a destination; `url` is never
+        # referenced here.
+        logger.info(
+            "alert sink selected sink=%s destination=unconfigured",
+            LoggingAlertSink.__name__,
+        )
         return LoggingAlertSink()
+    logger.info("alert sink selected sink=%s", WebhookAlertSink.__name__)
     return WebhookAlertSink(url)
 
 
@@ -532,6 +553,21 @@ def emit_alert(sink: AlertSink, payload: AlertPayload) -> None:
             payload.event,
             payload.site,
             payload.severity,
+        )
+    else:
+        # A2: the delivery receipt. Exactly four fields, matching
+        # AlertPayload's own allowlist minus `detail` -- `detail` and the
+        # webhook URL are NEVER logged here, by construction: neither is a
+        # local variable in this branch. This is the observable that
+        # proves an alert actually reached a sink, not merely that emit()
+        # was attempted (today's 17:05Z CRITICAL resolved to
+        # `LoggingAlertSink` -- the absence of this line was the symptom).
+        logger.info(
+            "breezy alert delivered event=%s site=%s severity=%s sink=%s",
+            payload.event,
+            payload.site,
+            payload.severity,
+            type(sink).__name__,
         )
 
 

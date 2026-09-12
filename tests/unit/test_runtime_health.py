@@ -331,6 +331,87 @@ def test_emit_alert_calls_a_healthy_sink_normally() -> None:
 
 
 # --------------------------------------------------------------------------
+# A2: emit_alert logs a delivery receipt -- the observable that proves a
+# CRITICAL actually reached somewhere, not just that it was attempted.
+# --------------------------------------------------------------------------
+
+
+def test_emit_alert_logs_a_delivery_receipt_naming_the_sink_class(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    caplog.set_level("INFO", logger="breezy.runtime.health")
+    sink = _FakeSink()
+    payload = AlertPayload(severity="INFO", event="e", site="global", detail="d")
+
+    emit_alert(sink, payload)
+
+    receipts = [r for r in caplog.records if "alert delivered" in r.message]
+    assert len(receipts) == 1
+    message = receipts[0].message
+    assert "_FakeSink" in message
+    assert "event=e" in message
+    assert "site=global" in message
+    assert "severity=INFO" in message
+
+
+def test_exactly_one_receipt_per_emit(caplog: pytest.LogCaptureFixture) -> None:
+    caplog.set_level("INFO", logger="breezy.runtime.health")
+    sink = _FakeSink()
+    payload = AlertPayload(severity="INFO", event="e", site="global", detail="d")
+
+    emit_alert(sink, payload)
+    emit_alert(sink, payload)
+
+    receipts = [r for r in caplog.records if "alert delivered" in r.message]
+    assert len(receipts) == 2
+
+
+def test_emit_alert_logs_no_receipt_when_the_sink_raises(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    caplog.set_level("INFO", logger="breezy.runtime.health")
+    sink = _FakeSink(raises=RuntimeError("boom"))
+    payload = AlertPayload(severity="CRITICAL", event="e", site="global", detail="d")
+
+    emit_alert(sink, payload)
+
+    errors = [r for r in caplog.records if r.levelname == "ERROR"]
+    receipts = [r for r in caplog.records if "alert delivered" in r.message]
+    assert errors, "the existing failure log must still fire"
+    assert receipts == [], "a failed emit must never fabricate a delivery receipt"
+
+
+def test_emit_alert_receipt_never_contains_the_payload_detail(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    caplog.set_level("INFO", logger="breezy.runtime.health")
+    sink = _FakeSink()
+    sentinel_detail = "sentinel-detail-should-never-appear-in-a-receipt"
+    payload = AlertPayload(severity="INFO", event="e", site="global", detail=sentinel_detail)
+
+    emit_alert(sink, payload)
+
+    for record in caplog.records:
+        assert sentinel_detail not in record.message
+
+
+@respx.mock
+def test_emit_alert_receipt_never_contains_the_webhook_url(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    url = "https://example.invalid/some-secret-token"
+    respx.post(url).mock(return_value=httpx.Response(200))
+    caplog.set_level("INFO", logger="breezy.runtime.health")
+    sink = WebhookAlertSink(url)
+    payload = AlertPayload(severity="INFO", event="e", site="global", detail="d")
+
+    emit_alert(sink, payload)
+
+    for record in caplog.records:
+        assert url not in record.message
+
+
+# --------------------------------------------------------------------------
 # LoggingAlertSink
 # --------------------------------------------------------------------------
 
@@ -378,6 +459,57 @@ def test_resolve_alert_sink_returns_webhook_sink_when_env_var_set() -> None:
     sink = resolve_alert_sink({ALERT_WEBHOOK_URL_ENV_VAR: _WEBHOOK_URL})
 
     assert isinstance(sink, WebhookAlertSink)
+
+
+# --------------------------------------------------------------------------
+# A1: resolve_alert_sink logs WHICH sink was selected -- never the URL
+# --------------------------------------------------------------------------
+
+
+def test_resolve_alert_sink_logs_the_selected_sink_class(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    caplog.set_level("INFO", logger="breezy.runtime.health")
+
+    resolve_alert_sink({ALERT_WEBHOOK_URL_ENV_VAR: _WEBHOOK_URL})
+
+    assert any(
+        record.levelname == "INFO" and "WebhookAlertSink" in record.message
+        for record in caplog.records
+    )
+
+
+def test_resolve_alert_sink_logging_branch_names_the_destination_as_unconfigured(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """AM-19 (coordinator ruling, supersedes AM-1): the unconfigured
+    branch is INFO, matching the webhook branch -- sink SELECTION is
+    informational on both branches; delivery severity is carried by the
+    alert itself, not by this resolution step. (The earlier AM-1 WARN
+    broke the frozen ``test_app_trade_main_permit_logging.py``, which
+    counts WARNING records from this logger.)"""
+    caplog.set_level("INFO", logger="breezy.runtime.health")
+
+    resolve_alert_sink({})
+
+    matches = [
+        record
+        for record in caplog.records
+        if record.levelname == "INFO" and "LoggingAlertSink" in record.message
+    ]
+    assert matches
+    assert "unconfigured" in matches[0].message
+
+
+def test_resolve_alert_sink_never_logs_the_webhook_url(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    caplog.set_level("DEBUG", logger="breezy.runtime.health")
+
+    resolve_alert_sink({ALERT_WEBHOOK_URL_ENV_VAR: _WEBHOOK_URL})
+
+    for record in caplog.records:
+        assert _WEBHOOK_URL not in record.message
 
 
 def test_webhook_alert_sink_rejects_non_https_scheme() -> None:

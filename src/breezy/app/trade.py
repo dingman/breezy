@@ -29,7 +29,15 @@ from breezy.adapters.polymarket_us.factories import exec_config_from_env
 from breezy.domain.climate_day import climate_day_for_instant
 from breezy.registry.sites import default_registry
 from breezy.runtime import trade_cli
-from breezy.runtime.health import AlertPayload, emit_alert, resolve_alert_sink
+from breezy.runtime.composition import _close_alert_sink
+from breezy.runtime.health import (
+    HEALTH_LOGGER_NAME,
+    AlertPayload,
+    AlertSink,
+    emit_alert,
+    resolve_alert_sink,
+)
+from breezy.runtime.logging_bridge import ensure_stderr_visible
 from breezy.runtime.order_enablement import OrderSubmissionPermit, OrderSubmissionRefused
 from breezy.runtime.settings import ORDERS_ENABLED_VAR, SettingsError, load_trade_settings
 from breezy.runtime.sqlite_store import SqliteStateStore
@@ -119,13 +127,21 @@ def _ensure_boot_logging_visible() -> None:
     ``runtime.logging_bridge``/Nautilus's own logging subsystem exist.
     Never touches ``trade_cli.logger``, the ``breezy`` bridge namespace,
     or the root logger.
+
+    SP-6 A1: also calls ``logging_bridge.ensure_stderr_visible`` on
+    ``breezy.runtime.health`` -- the SAME boot-window gap, for the OTHER
+    logger this process's earliest lines go through (A1's sink-selection
+    line, A2's delivery receipt, the permit-refusal alert emitted a few
+    lines into ``main()``, below). Boot-window only: that helper's own
+    filter falls silent the instant ``runtime.logging_bridge.install`` is
+    called, so nothing is ever logged twice once the bridge exists.
     """
-    if any(isinstance(h, logging.StreamHandler) for h in _boot_logger.handlers):
-        return
-    handler = logging.StreamHandler(sys.stderr)
-    handler.setFormatter(logging.Formatter(_BOOT_LOG_FORMAT))
-    _boot_logger.addHandler(handler)
-    _boot_logger.setLevel(logging.INFO)
+    if not any(isinstance(h, logging.StreamHandler) for h in _boot_logger.handlers):
+        handler = logging.StreamHandler(sys.stderr)
+        handler.setFormatter(logging.Formatter(_BOOT_LOG_FORMAT))
+        _boot_logger.addHandler(handler)
+        _boot_logger.setLevel(logging.INFO)
+    ensure_stderr_visible(HEALTH_LOGGER_NAME)
 
 
 def _today_by_station() -> dict[str, dt.date]:
@@ -146,130 +162,152 @@ def run(
     stderr: TextIO | None = None,
     live_trading_permit: object | None = None,
     order_submission_permit: OrderSubmissionPermit | None = None,
+    alert_sink: AlertSink | None = None,
 ) -> int:
-    """Load settings, compose strategies when the flag is on, run the node."""
+    """Load settings, compose strategies when the flag is on, run the node.
+
+    ``alert_sink`` (SP-6 A5/AM-2): a caller (``main()``, the composition
+    root) that has already resolved the process's ONE sink passes it here,
+    threaded to every downstream site (``trade_cli.run``, the
+    ``current_rung_hold`` refusal watch) so the whole node process shares
+    exactly one. A caller that never resolved one (a direct/test call)
+    leaves this ``None``: this function then resolves its own -- and,
+    because it owns that resolution, closes it in a ``finally`` covering
+    every return path, including the config-error early returns.
+    """
     out = sys.stderr if stderr is None else stderr
+    owns_sink = alert_sink is None
+    active_sink: AlertSink = alert_sink if alert_sink is not None else resolve_alert_sink()
     try:
-        settings = load_trade_settings(env)
-    except SettingsError as exc:
-        _report(out, "configuration error", exc, expected=True)
-        return EXIT_CONFIG_ERROR
+        try:
+            settings = load_trade_settings(env)
+        except SettingsError as exc:
+            _report(out, "configuration error", exc, expected=True)
+            return EXIT_CONFIG_ERROR
 
-    if not settings.current_rung_hold and not settings.continuous_rung_hold:
-        return trade_cli.run(
-            env=env,
-            node_factory=node_factory,
-            stderr=out,
-            live_trading_permit=live_trading_permit,
-            settings=settings,
-        )
-
-    try:
-        exec_client_config = exec_config_from_env(env)
-    except SettingsError as exc:
-        _report(out, "configuration error", exc, expected=True)
-        return EXIT_CONFIG_ERROR
-
-    store_path = Path(str(exec_client_config.state_store_path))
-    catalog_root = settings.catalog_root
-    if catalog_root is None:
-        _report(
-            out,
-            "configuration error",
-            SettingsError("a rung-hold family is on but catalog_root is unset"),
-            expected=True,
-        )
-        return EXIT_CONFIG_ERROR
-
-    today_by_station = _today_by_station()
-    try:
-        with ExitStack() as stack:
-            store = stack.enter_context(SqliteStateStore(store_path))
-            latch = stack.enter_context(open_submit_intent_latch(store, store_path))
-            v2_permit, v3_permit = phase1_family_permits(
-                current_rung_hold=settings.current_rung_hold,
-                continuous_rung_hold=settings.continuous_rung_hold,
-                permit=order_submission_permit,
-                phase0_shadow=settings.phase0_shadow,
-            )
-            strategies: list[Strategy] = []
-            submit_veto: Callable[[], str | None] | None = None
-            if settings.current_rung_hold:
-                factory = make_trial_day_latch_factory(latch)
-                strategies.extend(
-                    build_current_rung_hold_strategies(
-                        catalog_root=catalog_root,
-                        today_by_station=today_by_station,
-                        trial_day_latch_factory=factory,
-                        order_submission_permit=v2_permit,
-                    )
-                )
-            if settings.continuous_rung_hold:
-                cont_factory = make_trial_day_latch_factory(
-                    latch, key_prefix=CONTINUOUS_TRIAL_KEY_PREFIX,
-                )
-                # Item 4 (slice 4 review): the exec client's `_submit_order`
-                # consults an injected `submit_veto: Callable[[], str |
-                # None]` kwarg (`adapters/polymarket_us/exec/client.py`),
-                # evaluated synchronously immediately before the permit
-                # spend. `family_halt_submit_veto` wraps a `TrialDayLatch`
-                # bound to the SAME shared store/flock `cont_factory` above
-                # binds (`open_trial_day_latch` is a plain constructor over
-                # `latch.shared_state_binding()`, never a second open), so
-                # every veto call is a synchronous, read-only
-                # `is_family_halted()` under the intent latch this process
-                # already holds for its lifetime -- no fresh open, no await.
-                family_halt_latch = open_trial_day_latch(
-                    latch, key_prefix=CONTINUOUS_TRIAL_KEY_PREFIX,
-                )
-                submit_veto = family_halt_submit_veto(family_halt_latch)
-                strategies.extend(
-                    build_continuous_rung_hold_strategies(
-                        catalog_root=catalog_root,
-                        today_by_station=today_by_station,
-                        trial_day_latch_factory=cont_factory,
-                        order_submission_permit=v3_permit,
-                        # phase1_family_permits routes a non-None v3_permit
-                        # ONLY for the continuous-only, no-shadow case (a
-                        # settings-level guarantee -- see its docstring and
-                        # test_phase1_family_permits_all_combos_with_a_real_
-                        # permit), so lifting the guard is exactly and only
-                        # conditioned on that permit being present.
-                        phase0_permit_guard=v3_permit is None,
-                    )
-                )
-            composed = tuple(strategies)
+        if not settings.current_rung_hold and not settings.continuous_rung_hold:
             return trade_cli.run(
                 env=env,
                 node_factory=node_factory,
                 stderr=out,
-                strategies=composed,
-                submit_intent_latch=latch,
-                after_build=lambda node: install_current_rung_hold_refusal_watch(node, composed),
                 live_trading_permit=live_trading_permit,
                 settings=settings,
-                exec_client_config=exec_client_config,
-                submit_veto=submit_veto,
+                alert_sink=active_sink,
             )
-    except (
-        SettingsError,
-        OSError,
-        SubmitIntentLockHeld,
-        SubmitIntentLockError,
-        # Defense in depth, not the intended path: `phase0_permit_guard=
-        # (v3_permit is None)` above makes this unreachable when
-        # `phase1_family_permits`'s own invariant holds (a non-None
-        # `v3_permit` implies continuous-only, no-shadow). Kept as a
-        # fail-closed net for a future mis-wiring -- e.g. a call site that
-        # passes a real permit through `build_continuous_rung_hold_strategies`
-        # without also flipping `phase0_permit_guard`, or a change to
-        # `phase1_family_permits` that stops guaranteeing that pairing --
-        # so such a bug degrades to a clean, logged configuration error
-        # rather than an unhandled crash in a live-trading process.
-        Phase0PermitForbiddenError,
-    ) as exc:
-        _report(out, "configuration error", exc, expected=True)
-        return EXIT_CONFIG_ERROR
+
+        try:
+            exec_client_config = exec_config_from_env(env)
+        except SettingsError as exc:
+            _report(out, "configuration error", exc, expected=True)
+            return EXIT_CONFIG_ERROR
+
+        store_path = Path(str(exec_client_config.state_store_path))
+        catalog_root = settings.catalog_root
+        if catalog_root is None:
+            _report(
+                out,
+                "configuration error",
+                SettingsError("a rung-hold family is on but catalog_root is unset"),
+                expected=True,
+            )
+            return EXIT_CONFIG_ERROR
+
+        today_by_station = _today_by_station()
+        try:
+            with ExitStack() as stack:
+                store = stack.enter_context(SqliteStateStore(store_path))
+                latch = stack.enter_context(open_submit_intent_latch(store, store_path))
+                v2_permit, v3_permit = phase1_family_permits(
+                    current_rung_hold=settings.current_rung_hold,
+                    continuous_rung_hold=settings.continuous_rung_hold,
+                    permit=order_submission_permit,
+                    phase0_shadow=settings.phase0_shadow,
+                )
+                strategies: list[Strategy] = []
+                submit_veto: Callable[[], str | None] | None = None
+                if settings.current_rung_hold:
+                    factory = make_trial_day_latch_factory(latch)
+                    strategies.extend(
+                        build_current_rung_hold_strategies(
+                            catalog_root=catalog_root,
+                            today_by_station=today_by_station,
+                            trial_day_latch_factory=factory,
+                            order_submission_permit=v2_permit,
+                        )
+                    )
+                if settings.continuous_rung_hold:
+                    cont_factory = make_trial_day_latch_factory(
+                        latch, key_prefix=CONTINUOUS_TRIAL_KEY_PREFIX,
+                    )
+                    # Item 4 (slice 4 review): the exec client's `_submit_order`
+                    # consults an injected `submit_veto: Callable[[], str |
+                    # None]` kwarg (`adapters/polymarket_us/exec/client.py`),
+                    # evaluated synchronously immediately before the permit
+                    # spend. `family_halt_submit_veto` wraps a `TrialDayLatch`
+                    # bound to the SAME shared store/flock `cont_factory` above
+                    # binds (`open_trial_day_latch` is a plain constructor over
+                    # `latch.shared_state_binding()`, never a second open), so
+                    # every veto call is a synchronous, read-only
+                    # `is_family_halted()` under the intent latch this process
+                    # already holds for its lifetime -- no fresh open, no await.
+                    family_halt_latch = open_trial_day_latch(
+                        latch, key_prefix=CONTINUOUS_TRIAL_KEY_PREFIX,
+                    )
+                    submit_veto = family_halt_submit_veto(family_halt_latch)
+                    strategies.extend(
+                        build_continuous_rung_hold_strategies(
+                            catalog_root=catalog_root,
+                            today_by_station=today_by_station,
+                            trial_day_latch_factory=cont_factory,
+                            order_submission_permit=v3_permit,
+                            # phase1_family_permits routes a non-None v3_permit
+                            # ONLY for the continuous-only, no-shadow case (a
+                            # settings-level guarantee -- see its docstring and
+                            # test_phase1_family_permits_all_combos_with_a_real_
+                            # permit), so lifting the guard is exactly and only
+                            # conditioned on that permit being present.
+                            phase0_permit_guard=v3_permit is None,
+                        )
+                    )
+                composed = tuple(strategies)
+                return trade_cli.run(
+                    env=env,
+                    node_factory=node_factory,
+                    stderr=out,
+                    strategies=composed,
+                    submit_intent_latch=latch,
+                    after_build=lambda node: install_current_rung_hold_refusal_watch(
+                        node, composed, sink=active_sink
+                    ),
+                    live_trading_permit=live_trading_permit,
+                    settings=settings,
+                    exec_client_config=exec_client_config,
+                    submit_veto=submit_veto,
+                    alert_sink=active_sink,
+                )
+        except (
+            SettingsError,
+            OSError,
+            SubmitIntentLockHeld,
+            SubmitIntentLockError,
+            # Defense in depth, not the intended path: `phase0_permit_guard=
+            # (v3_permit is None)` above makes this unreachable when
+            # `phase1_family_permits`'s own invariant holds (a non-None
+            # `v3_permit` implies continuous-only, no-shadow). Kept as a
+            # fail-closed net for a future mis-wiring -- e.g. a call site that
+            # passes a real permit through `build_continuous_rung_hold_strategies`
+            # without also flipping `phase0_permit_guard`, or a change to
+            # `phase1_family_permits` that stops guaranteeing that pairing --
+            # so such a bug degrades to a clean, logged configuration error
+            # rather than an unhandled crash in a live-trading process.
+            Phase0PermitForbiddenError,
+        ) as exc:
+            _report(out, "configuration error", exc, expected=True)
+            return EXIT_CONFIG_ERROR
+    finally:
+        if owns_sink:
+            _close_alert_sink(active_sink)
+
 
 
 def main() -> int:
@@ -303,6 +341,14 @@ def main() -> int:
     request that cannot be honoured must stop the process loudly rather
     than silently run in shadow mode with the operator's intent unmet. The
     log line names the refusal class only, never a value (L-22 shape).
+
+    SP-6 A5 (4->1): resolves the ONE ``AlertSink`` for this entire node
+    process here, before anything that could emit through it -- including
+    the permit-refusal alert a few lines below -- and closes it in a
+    ``finally`` covering every return path (both ``EXIT_RUNTIME_ERROR``
+    early returns and the final ``return run(...)``). Every downstream
+    site (``trade_cli.run``'s two installs, the ``current_rung_hold``
+    refusal watch) receives this SAME sink via ``run(alert_sink=...)``.
     """
     from nautilus_trader.common.component import LiveClock
 
@@ -313,83 +359,88 @@ def main() -> int:
 
     _ensure_boot_logging_visible()
 
-    permit = None
+    alert_sink = resolve_alert_sink()
     try:
-        permit = issue_live_trading_permit(clock=LiveClock())
-    except LiveTradingPermissionError as exc:
-        _boot_logger.info("live-trading permit not issued: %s", exc)
-        emit_alert(
-            resolve_alert_sink(),
-            AlertPayload(
-                severity=LIVE_TRADING_PERMIT_REFUSED_SEVERITY,
-                event=LIVE_TRADING_PERMIT_REFUSED_EVENT,
-                site=LIVE_TRADING_PERMIT_REFUSED_SITE,
-                detail=LIVE_TRADING_PERMIT_REFUSED_DETAIL,
-            ),
-        )
+        permit = None
+        try:
+            permit = issue_live_trading_permit(clock=LiveClock())
+        except LiveTradingPermissionError as exc:
+            _boot_logger.info("live-trading permit not issued: %s", exc)
+            emit_alert(
+                alert_sink,
+                AlertPayload(
+                    severity=LIVE_TRADING_PERMIT_REFUSED_SEVERITY,
+                    event=LIVE_TRADING_PERMIT_REFUSED_EVENT,
+                    site=LIVE_TRADING_PERMIT_REFUSED_SITE,
+                    detail=LIVE_TRADING_PERMIT_REFUSED_DETAIL,
+                ),
+            )
 
-    try:
-        settings = load_trade_settings()
-    except SettingsError as exc:
-        settings = None
-        if os.environ.get(ORDERS_ENABLED_VAR) == "1":
-            # The operator requested the order path
-            # (``BREEZY_ORDERS_ENABLED=1``) but settings could not even be
-            # validated -- a request that cannot be honoured must stop the
-            # process loudly (same "requested but unminted" contract as the
-            # ``OrderSubmissionRefused`` branch below), never run a node
-            # that can never submit in silence. Substring matches
-            # ``trade_supervisor_core.PERMIT_NOT_ISSUED_MARKER`` on purpose,
-            # so the daily-relaunch supervisor classifies this exit-1 the
-            # same deterministic way it already classifies a refused permit.
-            _boot_logger.error(
-                "order submission permit not issued: settings load failed (%s)",
+        try:
+            settings = load_trade_settings()
+        except SettingsError as exc:
+            settings = None
+            if os.environ.get(ORDERS_ENABLED_VAR) == "1":
+                # The operator requested the order path
+                # (``BREEZY_ORDERS_ENABLED=1``) but settings could not even be
+                # validated -- a request that cannot be honoured must stop the
+                # process loudly (same "requested but unminted" contract as the
+                # ``OrderSubmissionRefused`` branch below), never run a node
+                # that can never submit in silence. Substring matches
+                # ``trade_supervisor_core.PERMIT_NOT_ISSUED_MARKER`` on purpose,
+                # so the daily-relaunch supervisor classifies this exit-1 the
+                # same deterministic way it already classifies a refused permit.
+                _boot_logger.error(
+                    "order submission permit not issued: settings load failed (%s)",
+                    type(exc).__name__,
+                )
+                return EXIT_RUNTIME_ERROR
+            # Orders were never requested (or the raw request can't be told from
+            # here): ``run`` performs the SAME load and reports the real
+            # configuration error through its existing path, so this is a
+            # breadcrumb, not a duplicate report -- but it must never be silent.
+            _boot_logger.info(
+                "order submission permit not minted: settings load failed (%s)",
                 type(exc).__name__,
             )
-            return EXIT_RUNTIME_ERROR
-        # Orders were never requested (or the raw request can't be told from
-        # here): ``run`` performs the SAME load and reports the real
-        # configuration error through its existing path, so this is a
-        # breadcrumb, not a duplicate report -- but it must never be silent.
-        _boot_logger.info(
-            "order submission permit not minted: settings load failed (%s)",
-            type(exc).__name__,
+
+        order_submission_permit = None
+        if settings is not None and settings.orders_enabled_requested:
+            try:
+                order_submission_permit = OrderSubmissionPermit.issue(
+                    settings=settings,
+                    live_trading_permit=permit,
+                    clock=LiveClock(),
+                )
+            except OrderSubmissionRefused as exc:
+                _boot_logger.info("order submission permit not issued: %s", type(exc).__name__)
+                return EXIT_RUNTIME_ERROR
+            else:
+                # Both permits are minted at this point: ``issue`` above
+                # validated ``permit`` is a genuine, unexpired LiveTradingPermit,
+                # so its two non-``repr=False`` fields (``issued_at_ns``,
+                # ``expires_at_ns``) are the only values this line ever logs --
+                # never ``operator_id`` or any of the five other repr=False
+                # fields (security R2).
+                ttl_s = (permit.expires_at_ns - permit.issued_at_ns) // 1_000_000_000
+                _boot_logger.info(
+                    "live-trading permit issued issued_at_ns=%d expires_at_ns=%d ttl_s=%d",
+                    permit.issued_at_ns,
+                    permit.expires_at_ns,
+                    ttl_s,
+                )
+        elif settings is not None:
+            # ``orders_enabled_requested`` is False: a legitimate shadow-mode
+            # boot, not a failure -- but still a silent skip until now. Uses
+            # "not minted" (never "not issued") so it never collides with
+            # ``trade_supervisor_core.PERMIT_NOT_ISSUED_MARKER``, which must
+            # only match a genuine refusal of an actual request.
+            _boot_logger.info("order submission permit not minted: orders not requested")
+
+        return run(
+            live_trading_permit=permit,
+            order_submission_permit=order_submission_permit,
+            alert_sink=alert_sink,
         )
-
-    order_submission_permit = None
-    if settings is not None and settings.orders_enabled_requested:
-        try:
-            order_submission_permit = OrderSubmissionPermit.issue(
-                settings=settings,
-                live_trading_permit=permit,
-                clock=LiveClock(),
-            )
-        except OrderSubmissionRefused as exc:
-            _boot_logger.info("order submission permit not issued: %s", type(exc).__name__)
-            return EXIT_RUNTIME_ERROR
-        else:
-            # Both permits are minted at this point: ``issue`` above
-            # validated ``permit`` is a genuine, unexpired LiveTradingPermit,
-            # so its two non-``repr=False`` fields (``issued_at_ns``,
-            # ``expires_at_ns``) are the only values this line ever logs --
-            # never ``operator_id`` or any of the five other repr=False
-            # fields (security R2).
-            ttl_s = (permit.expires_at_ns - permit.issued_at_ns) // 1_000_000_000
-            _boot_logger.info(
-                "live-trading permit issued issued_at_ns=%d expires_at_ns=%d ttl_s=%d",
-                permit.issued_at_ns,
-                permit.expires_at_ns,
-                ttl_s,
-            )
-    elif settings is not None:
-        # ``orders_enabled_requested`` is False: a legitimate shadow-mode
-        # boot, not a failure -- but still a silent skip until now. Uses
-        # "not minted" (never "not issued") so it never collides with
-        # ``trade_supervisor_core.PERMIT_NOT_ISSUED_MARKER``, which must
-        # only match a genuine refusal of an actual request.
-        _boot_logger.info("order submission permit not minted: orders not requested")
-
-    return run(
-        live_trading_permit=permit,
-        order_submission_permit=order_submission_permit,
-    )
+    finally:
+        _close_alert_sink(alert_sink)

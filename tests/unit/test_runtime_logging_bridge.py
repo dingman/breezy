@@ -11,6 +11,7 @@ never leaks a handler into the next test.
 
 from __future__ import annotations
 
+import io
 import logging
 
 import pytest
@@ -19,9 +20,13 @@ from breezy.runtime import logging_bridge
 from breezy.runtime.logging_bridge import (
     BREEZY_LOGGER_NAME,
     NautilusLoggingBridgeHandler,
+    ensure_stderr_visible,
     install,
+    is_installed,
     uninstall,
 )
+
+_TEST_LOGGER_NAME = "breezy.unit_test.boot_window"
 
 
 class FakeNautilusLogger:
@@ -54,6 +59,18 @@ def _clean_bridge_state() -> object:
     uninstall()
     yield
     uninstall()
+
+
+@pytest.fixture(autouse=True)
+def _clean_boot_window_handlers() -> object:
+    """``ensure_stderr_visible`` attaches to whatever logger name a caller
+    passes -- unlike the bridge itself, that is not module-global state, so
+    this repeats the same tear-down for the one dedicated test logger name
+    used below."""
+    yield
+    test_logger = logging.getLogger(_TEST_LOGGER_NAME)
+    for handler in list(test_logger.handlers):
+        test_logger.removeHandler(handler)
 
 
 def _breezy_child_logger(name: str = "breezy.unit_test") -> logging.Logger:
@@ -180,3 +197,80 @@ def test_handler_is_attached_to_breezy_logger_not_root() -> None:
     assert handler in breezy_logger.handlers
     assert handler not in root_logger.handlers
     assert list(root_logger.handlers) == handlers_before
+
+
+# --------------------------------------------------------------------------
+# A1 boot-window mechanism: is_installed / ensure_stderr_visible
+# --------------------------------------------------------------------------
+
+
+def test_is_installed_false_before_install() -> None:
+    assert is_installed() is False
+
+
+def test_is_installed_true_after_install() -> None:
+    install(FakeNautilusLogger())
+
+    assert is_installed() is True
+
+
+def test_is_installed_false_after_uninstall() -> None:
+    install(FakeNautilusLogger())
+    uninstall()
+
+    assert is_installed() is False
+
+
+def test_ensure_stderr_visible_attaches_a_handler_when_the_bridge_is_absent() -> None:
+    handler = ensure_stderr_visible(_TEST_LOGGER_NAME)
+
+    assert handler is not None
+    assert handler in logging.getLogger(_TEST_LOGGER_NAME).handlers
+
+
+def test_ensure_stderr_visible_writes_an_info_record_to_the_patched_stream(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    buffer = io.StringIO()
+    monkeypatch.setattr("sys.stderr", buffer)
+
+    ensure_stderr_visible(_TEST_LOGGER_NAME)
+    logging.getLogger(_TEST_LOGGER_NAME).info("boot window record")
+
+    assert "boot window record" in buffer.getvalue()
+
+
+def test_ensure_stderr_visible_is_idempotent_one_record_not_two() -> None:
+    buffer = io.StringIO()
+    handler = ensure_stderr_visible(_TEST_LOGGER_NAME)
+    assert isinstance(handler, logging.StreamHandler)
+    handler.setStream(buffer)
+    ensure_stderr_visible(_TEST_LOGGER_NAME)  # second call: no second handler
+
+    logging.getLogger(_TEST_LOGGER_NAME).info("once only")
+
+    assert buffer.getvalue().count("once only") == 1
+
+
+def test_ensure_stderr_visible_returns_none_once_the_bridge_is_installed() -> None:
+    install(FakeNautilusLogger())
+
+    assert ensure_stderr_visible(_TEST_LOGGER_NAME) is None
+    assert logging.getLogger(_TEST_LOGGER_NAME).handlers == []
+
+
+def test_ensure_stderr_visible_handler_falls_silent_once_the_bridge_is_installed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The filter is evaluated per-record, not baked in at attach time: a
+    handler attached BEFORE the bridge exists must stop emitting the
+    instant the bridge is installed, so nothing is ever logged twice once
+    normal ``breezy`` propagation takes over."""
+    buffer = io.StringIO()
+    monkeypatch.setattr("sys.stderr", buffer)
+    ensure_stderr_visible(_TEST_LOGGER_NAME)
+
+    install(FakeNautilusLogger())
+    logging.getLogger(_TEST_LOGGER_NAME).info("after the bridge exists")
+
+    assert "after the bridge exists" not in buffer.getvalue()

@@ -100,6 +100,8 @@ from breezy.runtime.component_health_watch import (
     install_component_degraded_alert,
     install_stale_intent_alert,
 )
+from breezy.runtime.composition import _close_alert_sink
+from breezy.runtime.health import AlertSink, resolve_alert_sink
 from breezy.runtime.logging_bridge import install as install_logging_bridge
 from breezy.runtime.logging_bridge import uninstall as uninstall_logging_bridge
 from breezy.runtime.node_config import NodeConfigError, build_trade_node_config
@@ -327,6 +329,7 @@ def _run_node(
     actors: Sequence[Actor] = (),
     strategies: Sequence[Strategy] = (),
     after_build: Callable[[Node], None] | None = None,
+    alert_sink: AlertSink | None = None,
 ) -> int:
     """Build, run and ALWAYS dispose the node. Never raises.
 
@@ -406,10 +409,12 @@ def _run_node(
             node.kernel.msgbus,
             component_id=POLYMARKET_US_CLIENT_NAME,
             reasons=_exec_client_refusal_reader(node),
+            sink=alert_sink,
         )
         install_stale_intent_alert(
             node.kernel.msgbus,
             stale_alerts=_exec_client_stale_intent_reader(node),
+            sink=alert_sink,
         )
         install_account_presence_halt(
             node.kernel.msgbus,
@@ -454,6 +459,7 @@ def run(
     settings: BreezyTradeSettings | None = None,
     exec_client_config: PolymarketUSExecClientConfig | None = None,
     submit_veto: Callable[[], str | None] | None = None,
+    alert_sink: AlertSink | None = None,
 ) -> int:
     """Load settings, build the node config, run the node, return an exit code.
 
@@ -474,6 +480,15 @@ def run(
     function. Re-reading either here would be a second, competing read of the
     same environment variables at the same instant; when the caller already
     has a value, it is passed straight through and neither loader runs again.
+
+    ``alert_sink`` (SP-6 A5): threaded through to the node's two
+    ``component_health_watch`` installs. A caller that already resolved a
+    process-wide sink (``breezy.app.trade.run``) passes it here; a caller
+    that never did (this module's own ``main()``, a direct test call)
+    leaves it ``None`` -- this function then resolves its own and, because
+    it owns that resolution, closes it in the ``finally`` below, BEFORE
+    ``uninstall_logging_bridge()`` so a close failure is still forwarded
+    through the (still-installed) bridge.
     """
     out = sys.stderr if stderr is None else stderr
     install_logging_bridge()
@@ -481,6 +496,8 @@ def run(
     # and a stale value would fail a healthy run.
     clear_fatal_feed_fault()
     clear_fatal_exec_fault()
+    owns_sink = alert_sink is None
+    active_sink: AlertSink = alert_sink if alert_sink is not None else resolve_alert_sink()
     try:
         try:
             if settings is None:
@@ -510,8 +527,11 @@ def run(
             actors=actors,
             strategies=strategies,
             after_build=after_build,
+            alert_sink=active_sink,
         )
     finally:
+        if owns_sink:
+            _close_alert_sink(active_sink)
         uninstall_logging_bridge()
 
 

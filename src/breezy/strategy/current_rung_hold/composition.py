@@ -33,7 +33,7 @@ from breezy.domain.weather_bucket_facts import (
     read_weather_bucket_facts,
 )
 from breezy.runtime.component_health_watch import COMPONENT_STATE_TOPIC
-from breezy.runtime.health import AlertState, resolve_alert_sink
+from breezy.runtime.health import AlertSink, AlertState, resolve_alert_sink
 from breezy.runtime.order_enablement import OrderSubmissionPermit
 from breezy.runtime.settings import SettingsError
 from breezy.runtime.submit_intent import SubmitIntentLatch
@@ -481,7 +481,10 @@ def build_continuous_rung_hold_strategies(
 
 
 def install_current_rung_hold_refusal_watch(
-    node: object, strategies: Sequence[CurrentRungHoldStrategy | ContinuousRungHoldStrategy]
+    node: object,
+    strategies: Sequence[CurrentRungHoldStrategy | ContinuousRungHoldStrategy],
+    *,
+    sink: AlertSink | None = None,
 ) -> None:
     """Wire per-station refusal AND diagnostics counts through the existing
     alert sink.
@@ -514,8 +517,14 @@ def install_current_rung_hold_refusal_watch(
     missing ``msgbus`` used to make this whole function return silently; it
     now logs a WARNING and still wires the primary (per-tick) path, since
     that path needs no ``msgbus`` at all.
+
+    ``sink`` (SP-6 A5/AM-2): threads the ONE sink the node process already
+    resolved (``app/trade.py::run``) into every ``RefusalAlerter`` this
+    function wires. Left unset only for a caller that never resolved one
+    (a direct/test call) -- resolves independently in that case, exactly
+    as before.
     """
-    sink = resolve_alert_sink()
+    sink = resolve_alert_sink() if sink is None else sink
     wired: list[RefusalAlerter] = []
     for binding in _ALERTER_BINDINGS:
         for strategy in strategies:
