@@ -564,3 +564,144 @@ def test_repeated_ticks_while_open_never_loop_and_the_alert_is_throttled(
     assert len(sink.payloads) == 1
     assert strategy._latch is not None
     assert strategy._latch.is_inflight(STATION, CLIMATE_DAY.isoformat()) is False
+
+
+# ---------------------------------------------------------------------------
+# SP-4 increment A1 (plan rev 4): characterisation of the ARMED branch at the
+# five `_order_submission_permit` read sites. No source under test changes
+# in this increment -- these assertions exist to PROVE, by mutation, which
+# sites a perturbation of the CURRENT source already breaks an existing test
+# for (COVERAGE_MATRIX: sites :302 and :935) and which do not (:579, :731,
+# :734 -- covered here). AM-7/NB-1: no assertion below reads
+# `_order_submission_permit`/`_submission_armed()` as its own observable --
+# only `submit_order` calls, `diagnostics`/`refusals` counts, and
+# `latch.is_inflight`/`attempt_state`.
+# ---------------------------------------------------------------------------
+
+
+def _register_armed(
+    *,
+    store_path: Path,
+    instruments: tuple[BinaryOption, ...],
+    clock: TestClock | None = None,
+    position_evidence_reader: Any | None = None,
+) -> ContinuousRungHoldStrategy:
+    """ARMED construction (`phase0_permit_guard=False` + a real test-double
+    permit), mirroring `test_continuous_rung_hold_fill_wiring.py::
+    test_phase0_permit_guard_false_accepts_a_real_permit_and_submits_once`.
+    A1 is characterisation-only -- this helper never touches source."""
+    cfg = CurrentRungHoldConfig(
+        instrument_ids=tuple(instrument.id for instrument in instruments),
+    )
+    strategy = ContinuousRungHoldStrategy(
+        cfg,
+        trial_day_latch_factory=_cont_latch_factory(store_path),
+        order_submission_permit=object(),  # type: ignore[arg-type]
+        phase0_permit_guard=False,
+        position_evidence_reader=position_evidence_reader,
+    )
+    used_clock = TestClock() if clock is None else clock
+    used_clock.set_time(WINDOW_OPEN_NS)
+    msgbus = TestComponentStubs.msgbus()
+    cache = TestComponentStubs.cache()
+    for instrument in instruments:
+        cache.add_instrument(instrument)
+    portfolio = Portfolio(msgbus=msgbus, cache=cache, clock=used_clock)
+    strategy.register(
+        trader_id=TraderId("BACKTEST-001"),
+        portfolio=portfolio,
+        msgbus=msgbus,
+        cache=cache,
+        clock=used_clock,
+    )
+    return strategy
+
+
+def _register_armed_and_start(
+    *,
+    store_path: Path,
+    instruments: tuple[BinaryOption, ...],
+    clock: TestClock | None = None,
+    position_evidence_reader: Any | None = None,
+) -> ContinuousRungHoldStrategy:
+    strategy = _register_armed(
+        store_path=store_path,
+        instruments=instruments,
+        clock=clock,
+        position_evidence_reader=position_evidence_reader,
+    )
+    strategy.start()
+    return strategy
+
+
+def test_an_armed_strategy_consults_the_rearm_gate_after_the_first_attempt(
+    store_path: Path, interior_instrument: BinaryOption,
+) -> None:
+    """A1, site :579: once armed and already attempted this station-day up
+    to the cap, `_hunt_tick` must consult `_rearm_permitted` and REFUSE a
+    second `submit_order` -- it must never fall straight through to
+    `_maybe_submit` the way the Phase-0-only (unarmed) branch does."""
+    strategy = _register_armed_and_start(
+        store_path=store_path,
+        instruments=(interior_instrument,),
+        position_evidence_reader=lambda: _PERMISSIVE_EVIDENCE,
+    )
+    assert strategy._latch is not None
+    for _ in range(3):  # _MAX_STATION_DAY_ATTEMPTS
+        strategy._latch.record_attempt(
+            STATION, CLIMATE_DAY.isoformat(), ts_ns=WINDOW_OPEN_NS - NS_PER_MIN,
+        )
+    submitted: list[object] = []
+    strategy.submit_order = submitted.append  # type: ignore[method-assign]
+
+    strategy.on_data(_observation(temp_c_tenths=300, observed_at_ns=WINDOW_OPEN_NS - 1))
+    strategy.on_quote_tick(_quote(INTERIOR_ID, ask="0.40", ts_event=WINDOW_OPEN_NS))
+
+    assert submitted == []
+    assert strategy.diagnostics.count("rearm_wait") == 1
+    assert strategy._latch.is_inflight(STATION, CLIMATE_DAY.isoformat()) is False
+    assert strategy._latch.attempt_state(STATION, CLIMATE_DAY.isoformat())[0] == 3
+
+
+def test_an_armed_strategy_records_an_attempt_and_holds_in_flight(
+    store_path: Path, interior_instrument: BinaryOption,
+) -> None:
+    """A1, site :731: the FIRST armed attempt on a station-day must
+    durably record it (`record_attempt`) and leave IN_FLIGHT set -- the
+    armed branch never auto-clears (that is site :734's job, and only for
+    the UNARMED shadow path, per the next test)."""
+    strategy = _register_armed_and_start(
+        store_path=store_path,
+        instruments=(interior_instrument,),
+        position_evidence_reader=lambda: _PERMISSIVE_EVIDENCE,
+    )
+    assert strategy._latch is not None
+    submitted: list[object] = []
+    strategy.submit_order = submitted.append  # type: ignore[method-assign]
+
+    strategy.on_data(_observation(temp_c_tenths=300, observed_at_ns=WINDOW_OPEN_NS - 1))
+    strategy.on_quote_tick(_quote(INTERIOR_ID, ask="0.40", ts_event=WINDOW_OPEN_NS))
+
+    assert len(submitted) == 1
+    attempts, last_attempt_ns = strategy._latch.attempt_state(STATION, CLIMATE_DAY.isoformat())
+    assert attempts == 1
+    assert last_attempt_ns == WINDOW_OPEN_NS
+    assert strategy._latch.is_inflight(STATION, CLIMATE_DAY.isoformat()) is True
+
+
+def test_an_unarmed_strategy_clears_in_flight_after_maybe_submit(
+    store_path: Path, interior_instrument: BinaryOption,
+) -> None:
+    """A1, site :734: the UNARMED (Phase 0) branch is SHADOW-ONLY and must
+    clear IN_FLIGHT immediately after `_maybe_submit` returns -- the
+    polarity trap NOTE-2 warns a blind swap here silently breaks (a
+    permit-not-None guard would leave shadow-mode IN_FLIGHT stuck for
+    good, since nothing else ever clears it in Phase 0)."""
+    strategy = _register_and_start(store_path=store_path, instruments=(interior_instrument,))
+    assert strategy._order_submission_permit is None
+    assert strategy._latch is not None
+
+    strategy.on_data(_observation(temp_c_tenths=300, observed_at_ns=WINDOW_OPEN_NS - 1))
+    strategy.on_quote_tick(_quote(INTERIOR_ID, ask="0.40", ts_event=WINDOW_OPEN_NS))
+
+    assert strategy._latch.is_inflight(STATION, CLIMATE_DAY.isoformat()) is False
