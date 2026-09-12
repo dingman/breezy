@@ -825,6 +825,24 @@ def test_all_three_wrappers_name_the_same_lock_path() -> None:
         )
 
 
+_EXEC_LOCK_LINE_RE: Final[re.Pattern[str]] = re.compile(r'^exec 9>>"\$LOCK"\s')
+
+
+@pytest.mark.parametrize("wrapper_filename", sorted(_WRAPPERS))
+def test_the_exec_line_carries_no_stderr_redirect(wrapper_filename: str) -> None:
+    """R4-N1, measured: an `exec` with no command applies its redirections
+    to the SHELL for the rest of the run (74 bytes of subsequent shell
+    stderr measurably leaked into the log in SP-1.rev4.md's round-4 block).
+    `2>>"$LOG"` is safe on the `mkdir -p` line above (a simple command's
+    redirect is scoped to it) but must NEVER appear on the `exec` line."""
+    lines = (_DEPLOY_DIR / wrapper_filename).read_text().splitlines()
+    exec_lines = [line for line in lines if _EXEC_LOCK_LINE_RE.match(line.strip())]
+    assert len(exec_lines) == 1, f"{wrapper_filename}: expected exactly one exec-lock line"
+    assert "2>>" not in exec_lines[0], (
+        f"{wrapper_filename}'s exec line redirects the shell's stderr: {exec_lines[0]!r}"
+    )
+
+
 _INTERPRETER_INVOCATION_RE: Final[re.Pattern[str]] = re.compile(
     r'^\s*(if\s+)?"\$(PY|REPO/\.venv/bin/python)"\s'
 )
