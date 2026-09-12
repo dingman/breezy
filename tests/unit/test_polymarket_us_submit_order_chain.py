@@ -10,6 +10,7 @@ from __future__ import annotations
 import ast
 import json
 import logging
+import sys
 import threading
 from collections.abc import Iterator, Mapping
 from contextlib import contextmanager
@@ -2230,3 +2231,44 @@ def test_a_recursion_error_in_the_key_tree_is_contained_in_the_detail(
     assert outcome.kind == KIND_ACCEPT_FILL
     assert outcome.detail is not None
     assert "<tree unavailable: nesting exceeded>" in outcome.detail
+
+
+# ---------------------------------------------------------------------------
+# SP-2 I2b -- a body too deep for the JSON parser classifies as
+# `unparseable` instead of escaping `_submit_order` (AR-N1)
+# ---------------------------------------------------------------------------
+
+
+def test_a_body_too_deep_to_parse_classifies_as_unparseable_instead_of_raising() -> None:
+    """AR-N1: a body whose nesting exhausts the JSON parser classifies like
+    any other unreadable body -- refused, never accepted, and never
+    allowed to escape `_submit_order` (`client.py:2748` is not inside a
+    `try`). AM-7: built by string multiplication, never a recursive
+    builder, so constructing the fixture itself never raises.
+
+    `N = sys.getrecursionlimit() * 20`, not the reference `* 3`: measured
+    on this interpreter (CPython 3.13, C-accelerated `_json.Scanner`),
+    `* 3` (3,000) parses cleanly with no error at all -- the C scanner's
+    own nesting threshold sits above the pure-Python recursion limit.
+    `* 20` (20,000) is confirmed, in isolation, to raise `RecursionError`
+    reliably and near-instantly, comfortably below any C-stack-exhaustion
+    risk. Raising the multiplier rather than asserting a specific limit is
+    explicitly anticipated (SP-2.rev3.md Confidence Self-Assessment,
+    unknown 6).
+    """
+    depth = sys.getrecursionlimit() * 20
+    deep_body = b"[" * depth + b"]" * depth
+
+    assert submit_chain._parse_json_object(deep_body) is None
+
+    response = VenueResponse(status=200, headers={}, body=deep_body)
+    outcome = classify_create_order_outcome(
+        response,
+        instrument=build_instrument(),
+        account_id=ACCOUNT_ID,
+        ts_init=TS_INIT,
+    )
+
+    assert outcome.kind == KIND_AMBIGUOUS
+    assert outcome.detail is not None
+    assert "body_kind=unparseable" in outcome.detail

@@ -330,9 +330,16 @@ def order_by_id_path(order_id: str) -> str:
 
 
 def _parse_json_object(body: bytes) -> dict[str, Any] | None:
+    """Decode ``body`` as a JSON object, or ``None`` if it cannot be read.
+
+    SP-2 I2b (AR-N1): a body whose nesting exhausts the parser is
+    ``unparseable`` like any other unreadable body -- refused, never
+    accepted, and never allowed to escape ``_submit_order``
+    (``client.py:2748`` is not inside a ``try``).
+    """
     try:
         payload = json.loads(body.decode("utf-8"))
-    except (UnicodeDecodeError, json.JSONDecodeError, ValueError):
+    except (UnicodeDecodeError, json.JSONDecodeError, ValueError, RecursionError):
         return None
     if not isinstance(payload, dict):
         return None
