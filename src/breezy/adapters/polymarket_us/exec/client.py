@@ -2837,9 +2837,22 @@ class PolymarketUSExecutionClient(LiveExecutionClient):
         # content) by `submit_chain._body_detail` -- safe to log even
         # though the response it summarises may be adversarial.
         if outcome.detail is not None:
+            # `outcome.fill_parse_error`, when present, is the
+            # `ExecutionReportMappingError` message `fill_generation`
+            # swallowed to reach this fallthrough -- names-only (its own
+            # full key tree, never a value; see `reports.py`'s
+            # `_key_tree`), so it is safe to log verbatim. Absent on every
+            # other AMBIGUOUS cause (no response, a non-mapping body, a
+            # missing order id).
+            fill_parse_error_suffix = (
+                f" fill_parse_error={outcome.fill_parse_error}"
+                if outcome.fill_parse_error is not None
+                else ""
+            )
             self._log.error(
                 "create-order AMBIGUOUS detail: path=classified "
                 f"{outcome.detail} client_order_id={order.client_order_id.value}"
+                f"{fill_parse_error_suffix}"
             )
         if outcome.generate_submitted:
             self._generate_submitted(order, now_ns)

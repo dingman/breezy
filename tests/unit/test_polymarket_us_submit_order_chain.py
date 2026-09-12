@@ -1157,6 +1157,64 @@ def _classify_i1a(executions: list[dict[str, Any]]) -> Any:
     )
 
 
+def test_a_create_body_whose_nested_order_carries_an_undeclared_key_stays_ambiguous_with_the_key_tree() -> None:  # noqa: E501
+    """L-36 09-11 root cause: an executions-present, 200-with-order-id body
+    whose nested ``order`` carries an undeclared key made ``fill_generation``
+    swallow ``ExecutionReportMappingError`` silently, so the outcome fell
+    through to ``KIND_AMBIGUOUS`` with no trace of WHY -- fee-unreconciled,
+    excluded from n. The swallow is now loud: ``fill_parse_error`` on the
+    outcome carries the mapper's own message, key tree included, no values.
+    """
+    slug = str(build_instrument().raw_symbol)
+    order = _i1a_order(slug, cum_quantity="1", avg_px="0.41", commission_total=None)
+    order["mysteryDriftField"] = "SECRET_SHOULD_NOT_LEAK"
+    fill_leg = _i1a_leg(
+        order,
+        exec_id="exe-1",
+        trade_id="trd-1",
+        last_shares="1",
+        last_px="0.41",
+        commission="0.03",
+    )
+
+    outcome = _classify_i1a([fill_leg])
+
+    assert outcome.kind == KIND_AMBIGUOUS
+    assert outcome.fill is None
+    assert outcome.fill_parse_error is not None
+    assert "mysteryDriftField" in outcome.fill_parse_error
+    assert "SECRET_SHOULD_NOT_LEAK" not in outcome.fill_parse_error
+
+
+def test_fill_generation_records_the_parse_error_message_when_errors_sink_supplied() -> None:
+    """``fill_generation`` itself: unchanged ``None`` return, but the sink
+    receives the mapper's message when supplied."""
+    slug = str(build_instrument().raw_symbol)
+    order = _i1a_order(slug, cum_quantity="1", avg_px="0.41", commission_total=None)
+    order["mysteryDriftField"] = "nope"
+    execution = _i1a_leg(
+        order,
+        exec_id="exe-1",
+        trade_id="trd-1",
+        last_shares="1",
+        last_px="0.41",
+        commission="0.03",
+    )
+    errors: list[str] = []
+
+    result = fill_generation(
+        execution,
+        instrument=build_instrument(),
+        account_id=ACCOUNT_ID,
+        ts_init=TS_INIT,
+        errors=errors,
+    )
+
+    assert result is None
+    assert len(errors) == 1
+    assert "mysteryDriftField" in errors[0]
+
+
 def test_i1a_multi_leg_fill_totals_are_order_level() -> None:
     slug = str(build_instrument().raw_symbol)
     order = _i1a_order(slug, cum_quantity="1", avg_px="0.414", commission_total="0.05")

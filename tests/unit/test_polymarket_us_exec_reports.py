@@ -65,6 +65,7 @@ from nautilus_trader.model.enums import (
     OrderSide,
     OrderStatus,
     OrderType,
+    PositionSide,
     TimeInForce,
 )
 from nautilus_trader.model.identifiers import TradeId, VenueOrderId
@@ -284,6 +285,89 @@ def test_a_fifth_undeclared_field_alongside_the_drift_set_is_still_refused(
         )
 
 
+def test_the_2026_09_12_market_metadata_drift_fields_are_declared_but_unread(
+    order: dict[str, Any], instrument: BinaryOption
+) -> None:
+    """L-36 resolver evidence, one layer deeper, 2026-09-12T02:04:06Z (venue
+    order ``CEBPX0EVTTMX``): the live GET body's ``marketMetadata`` carries
+    ``eventId`` and ``subject`` beyond the pinned snapshot. Declaring both
+    maps a terminal order cleanly; neither is read by the mapper."""
+    drifted = {
+        **order,
+        "state": "ORDER_STATE_FILLED",
+        "cumQuantity": order["quantity"],
+        "leavesQuantity": 0,
+        "marketMetadata": {
+            "slug": order["marketSlug"],
+            "eventId": "evt-9182",
+            "subject": "SFO temperature",
+        },
+    }
+
+    report = parse_order_status_report(
+        drifted,
+        instrument=instrument,
+        account_id=ACCOUNT_ID,
+        report_id=REPORT_ID,
+        ts_init=TS_INIT,
+    )
+
+    assert report.order_status == OrderStatus.FILLED
+    assert report.filled_qty == Quantity.from_str("10.00")
+
+
+def test_a_third_undeclared_market_metadata_field_is_still_refused(
+    order: dict[str, Any], instrument: BinaryOption
+) -> None:
+    """The nested drift allowance is exactly two fields, not "anything new"."""
+    with pytest.raises(ExecutionReportMappingError, match="unicornField"):
+        parse_order_status_report(
+            {
+                **order,
+                "marketMetadata": {
+                    "slug": order["marketSlug"],
+                    "eventId": "evt-9182",
+                    "subject": "SFO temperature",
+                    "unicornField": "nope",
+                },
+            },
+            instrument=instrument,
+            account_id=ACCOUNT_ID,
+            report_id=REPORT_ID,
+            ts_init=TS_INIT,
+        )
+
+
+def test_unmapped_body_error_names_every_nested_drift_layer_with_no_values(
+    order: dict[str, Any], instrument: BinaryOption
+) -> None:
+    """Diagnostic: one resolver GET failure must reveal ALL remaining drift
+    at once, not one nesting layer per relaunch round -- and never a value."""
+    bad = {
+        **order,
+        "marketMetadata": {
+            "slug": order["marketSlug"],
+            "unicornField": "SECRET_VALUE_42",
+        },
+        "weirdTopLevelField": "ANOTHER_SECRET_99",
+    }
+
+    with pytest.raises(ExecutionReportMappingError) as excinfo:
+        parse_order_status_report(
+            bad,
+            instrument=instrument,
+            account_id=ACCOUNT_ID,
+            report_id=REPORT_ID,
+            ts_init=TS_INIT,
+        )
+
+    message = str(excinfo.value)
+    assert "weirdTopLevelField" in message
+    assert "unicornField" in message
+    assert "SECRET_VALUE_42" not in message
+    assert "ANOTHER_SECRET_99" not in message
+
+
 def test_order_for_another_market_is_refused(
     order: dict[str, Any], instrument: BinaryOption
 ) -> None:
@@ -382,6 +466,29 @@ def test_unknown_execution_key_is_refused(
             report_id=REPORT_ID,
             ts_init=TS_INIT,
         )
+
+
+def test_unknown_execution_key_error_carries_the_full_key_tree_no_values(
+    execution: dict[str, Any], instrument: BinaryOption
+) -> None:
+    """The execution top-level check reveals its whole shape too -- names
+    only, never a value -- so a fill refusal shows every field at once."""
+    bad = {**execution, "settlementDate": "SECRET_DATE_2026"}
+
+    with pytest.raises(ExecutionReportMappingError) as excinfo:
+        parse_fill_report(
+            bad,
+            instrument=instrument,
+            account_id=ACCOUNT_ID,
+            report_id=REPORT_ID,
+            ts_init=TS_INIT,
+        )
+
+    message = str(excinfo.value)
+    assert "settlementDate" in message
+    assert "lastShares" in message
+    assert "order" in message
+    assert "SECRET_DATE_2026" not in message
 
 
 def _parse_fill_with_commission(
@@ -538,6 +645,73 @@ def test_zero_quantity_fill_is_refused(
 # ---------------------------------------------------------------------------
 # ExecutionMassStatus -- native assembly
 # ---------------------------------------------------------------------------
+
+
+def test_the_2026_09_12_position_drift_fields_are_declared_but_unread(
+    position: dict[str, Any], instrument: BinaryOption, slug: str
+) -> None:
+    """Startup-evidence, 2026-09-12T02:04:03Z: the live position surface
+    carries eleven fields beyond the pinned snapshot for the account's real
+    (net 1) position. Declaring all eleven maps cleanly; ``netPosition`` --
+    not the new ``netPositionDecimal`` -- is still what decides quantity and
+    side."""
+    drifted = {
+        **position,
+        "netPosition": "1",
+        "avgPx": {"value": "0.28", "currency": "USD"},
+        "baseCost": {"value": "0.28", "currency": "USD"},
+        "bodPositionDecimal": "0",
+        "comboLegDetails": [],
+        "costPerShare": {"value": "0.28", "currency": "USD"},
+        "fees": {"value": "0.00", "currency": "USD"},
+        "netPositionDecimal": "1.00",
+        "positionId": "pos-441",
+        "qtyAvailableDecimal": "1.00",
+        "qtyBoughtDecimal": "1.00",
+        "qtySoldDecimal": "0.00",
+    }
+
+    mapped = parse_position_status_report(
+        drifted,
+        market_slug=slug,
+        instrument=instrument,
+        account_id=ACCOUNT_ID,
+        report_id=REPORT_ID,
+        ts_init=TS_INIT,
+    )
+
+    assert mapped.report.position_side == PositionSide.LONG
+    assert mapped.report.quantity == Quantity.from_str("1.00")
+
+
+def test_a_twelfth_undeclared_position_field_is_still_refused(
+    position: dict[str, Any], slug: str, instrument: BinaryOption
+) -> None:
+    """The position drift allowance is exactly eleven fields, not "anything
+    new"."""
+    with pytest.raises(ExecutionReportMappingError, match="mysteryField"):
+        parse_position_status_report(
+            {
+                **position,
+                "avgPx": {"value": "0.28", "currency": "USD"},
+                "baseCost": {"value": "0.28", "currency": "USD"},
+                "bodPositionDecimal": "0",
+                "comboLegDetails": [],
+                "costPerShare": {"value": "0.28", "currency": "USD"},
+                "fees": {"value": "0.00", "currency": "USD"},
+                "netPositionDecimal": "4.00",
+                "positionId": "pos-441",
+                "qtyAvailableDecimal": "4.00",
+                "qtyBoughtDecimal": "4.00",
+                "qtySoldDecimal": "0.00",
+                "mysteryField": "nope",
+            },
+            market_slug=slug,
+            instrument=instrument,
+            account_id=ACCOUNT_ID,
+            report_id=REPORT_ID,
+            ts_init=TS_INIT,
+        )
 
 
 def test_execution_mass_status_carries_every_report(

@@ -157,6 +157,16 @@ class CreateOrderOutcome:
     #: even though the body may be adversarial or carry venue-side account
     #: details.
     detail: str | None = None
+    #: The ``ExecutionReportMappingError`` message :func:`fill_generation`
+    #: caught and swallowed to ``None``, when an ``executions``-present,
+    #: 200-with-order-id body still ended up ``KIND_AMBIGUOUS`` because the
+    #: nested order/execution shape did not map. ``None`` on every kind
+    #: except that fallthrough. Names-only (the mapper's own message,
+    #: including its full key tree per ``reports.py``'s ``_key_tree`` --
+    #: never a value), so it is safe to log verbatim: it is what turns a
+    #: fee-unreconciled, excluded-from-``n`` AMBIGUOUS into a diagnosable one
+    #: instead of a silent ``return None``.
+    fill_parse_error: str | None = None
 
 
 def latched_refusal_reason(first_reason: str) -> str:
@@ -627,7 +637,18 @@ def fill_generation(
     account_id: object,
     ts_init: int,
     payload: Mapping[str, Any] | None = None,
+    errors: list[str] | None = None,
 ) -> FillGeneration | None:
+    """Map ``execution`` to native fill-generation arguments, or ``None``.
+
+    ``errors``, when supplied, receives the caught exception's own ``str()``
+    on a parse refusal -- UNCHANGED behaviour otherwise: this still returns
+    ``None``, never raises, on a mapping failure. The message is names-only
+    (``reports.py``'s ``ExecutionReportMappingError`` -- including the full
+    key tree its own diagnostic appends -- never a value), so a caller may
+    log it verbatim. Optional, and defaulted to ``None``, so every existing
+    caller that does not pass it keeps recording nothing, exactly as before.
+    """
     try:
         report = parse_fill_report(
             dict(execution),
@@ -636,7 +657,9 @@ def fill_generation(
             report_id=UUID4(),
             ts_init=ts_init,
         )
-    except (ExecutionReportMappingError, TypeError, ValueError):
+    except (ExecutionReportMappingError, TypeError, ValueError) as exc:
+        if errors is not None:
+            errors.append(str(exc))
         return None
     filled_cost = _filled_cost_from_execution(execution)
     if filled_cost is None:
@@ -795,6 +818,7 @@ def classify_create_order_outcome(
             detail=detail,
         )
 
+    fill_parse_errors: list[str] = []
     if status == 200 and payload is not None and order_id is not None:
         execution = _durable_execution(payload)
         if execution is not None:
@@ -804,6 +828,7 @@ def classify_create_order_outcome(
                 account_id=account_id,
                 ts_init=ts_init,
                 payload=payload,
+                errors=fill_parse_errors,
             )
             if fill is not None:
                 cumulative_qty, cumulative_cost = _cumulative_qty_and_cost(execution)
@@ -861,6 +886,7 @@ def classify_create_order_outcome(
         fee_reconciled=False,
         generate_submitted=order_id is not None,
         detail=detail,
+        fill_parse_error=fill_parse_errors[0] if fill_parse_errors else None,
     )
 
 

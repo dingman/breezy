@@ -313,10 +313,65 @@ _USER_POSITION_KEYS: Final[frozenset[str]] = frozenset(
     }
 )
 
+#: Eleven fields observed live on the startup position surface at
+#: 2026-09-12T02:04:03Z, for the real position the account now carries (net
+#: 1, from the 09-11 fill): ``avgPx``, ``baseCost``, ``bodPositionDecimal``,
+#: ``comboLegDetails``, ``costPerShare``, ``fees``, ``netPositionDecimal``,
+#: ``positionId``, ``qtyAvailableDecimal``, ``qtyBoughtDecimal`` and
+#: ``qtySoldDecimal`` -- all beyond the pinned SDK snapshot. Declared here,
+#: repo-side, as DECLARED-BUT-UNREAD -- same treatment as
+#: :data:`_ORDER_DRIFT_ALLOWED_KEYS` -- so a healthy position no longer
+#: refuses the whole surface over names the mapper has never needed, but not
+#: merged into :data:`_USER_POSITION_KEYS` itself, or the drift check in
+#: ``test_polymarket_us_exec_snapshot_drift.py`` goes vacuous.
+#: :func:`parse_position_status_report` reads ``netPosition`` (a string, not
+#: ``netPositionDecimal``) for quantity and side -- unchanged by this
+#: declaration; none of these eleven ``*Decimal``/derived names is read
+#: anywhere in this module. A field the venue adds beyond THESE eleven is
+#: still an unknown key and is still refused.
+_USER_POSITION_DRIFT_ALLOWED_KEYS: Final[frozenset[str]] = frozenset(
+    {
+        "avgPx",
+        "baseCost",
+        "bodPositionDecimal",
+        "comboLegDetails",
+        "costPerShare",
+        "fees",
+        "netPositionDecimal",
+        "positionId",
+        "qtyAvailableDecimal",
+        "qtyBoughtDecimal",
+        "qtySoldDecimal",
+    }
+)
+
 #: ``MarketMetadata`` (``types/orders.py:58-67``).
 _MARKET_METADATA_KEYS: Final[frozenset[str]] = frozenset(
     {"eventSlug", "icon", "outcome", "slug", "team", "teamId", "title"}
 )
+
+#: Two fields observed live on ``GET /v1/order/{id}`` at 2026-09-12T02:04:06Z
+#: while resolving venue order ``CEBPX0EVTTMX`` -- one layer deeper than the
+#: 2026-09-11 order-level drift (:data:`_ORDER_DRIFT_ALLOWED_KEYS`):
+#: ``marketMetadata`` itself now carries ``eventId`` and ``subject`` beyond
+#: the pinned SDK snapshot. Declared here, repo-side, as DECLARED-BUT-UNREAD,
+#: same treatment as the order-level drift set, but not merged into
+#: :data:`_MARKET_METADATA_KEYS` itself, or the drift check in
+#: ``test_polymarket_us_exec_snapshot_drift.py`` goes vacuous.
+#:
+#: ``MarketMetadata`` (``types/orders.py:58-67``) is ONE shared TypedDict the
+#: snapshot embeds in both ``Order`` and ``UserPosition`` -- the same object,
+#: not a lookalike -- so this allowlist is applied everywhere the snapshot
+#: nests it: the order (``_known_order``, reached from both
+#: :func:`parse_order_status_report` and :func:`parse_fill_report`'s nested
+#: order) AND the position (:func:`parse_position_status_report`). Only the
+#: order-GET evidence above has actually been observed; applying it to the
+#: position surface too is a same-schema inference, not a second
+#: observation -- a field the venue adds beyond THESE two, on EITHER
+#: surface, is still an unknown key and is still refused. Neither field is
+#: read anywhere in this module -- the only ``marketMetadata`` field ever
+#: read is ``slug`` (the market-identity cross-check in both mappers).
+_MARKET_METADATA_DRIFT_ALLOWED_KEYS: Final[frozenset[str]] = frozenset({"eventId", "subject"})
 
 _ORDER_SIDES: Final[Mapping[str, OrderSide]] = {
     "ORDER_SIDE_BUY": OrderSide.BUY,
@@ -386,6 +441,31 @@ def _assert_known_keys(
         )
     mapping: Mapping[str, Any] = payload
     return mapping
+
+
+def _key_tree(payload: Mapping[str, Any]) -> str:
+    """Names-only structural summary of ``payload``, for a diagnostic message.
+
+    Every level is walked -- a nested mapping is recursed into, a list is
+    summarised as ``key[n]`` with the FIRST element's own key tree appended
+    when that element is itself a mapping -- but no VALUE is ever rendered,
+    at any depth. A diagnostic meant to reveal a whole drifted shape at once
+    must not become a second, log-line leak of the money or PII this module
+    exists to protect.
+    """
+    parts: list[str] = []
+    for key in sorted(payload, key=str):
+        value = payload[key]
+        if isinstance(value, Mapping):
+            parts.append(f"{key}: {{{_key_tree(value)}}}")
+        elif isinstance(value, list):
+            if value and isinstance(value[0], Mapping):
+                parts.append(f"{key}[{len(value)}]: {{{_key_tree(value[0])}}}")
+            else:
+                parts.append(f"{key}[{len(value)}]")
+        else:
+            parts.append(str(key))
+    return ", ".join(parts)
 
 
 def _require(payload: Mapping[str, Any], key: str, *, context: str) -> Any:
@@ -590,14 +670,54 @@ def _assert_fill_progress_consistent(
         )
 
 
+def _known_keys_with_full_tree(
+    payload: object,
+    *,
+    known: frozenset[str],
+    context: str,
+    full_payload: object,
+) -> Mapping[str, Any]:
+    """Like :func:`_assert_known_keys`, but an unknown-key refusal is
+    re-raised with the FULL names-only key tree of ``full_payload`` appended
+    -- see :func:`_key_tree`.
+
+    ``full_payload`` is the WHOLE body being mapped, not necessarily
+    ``payload`` itself: a nested check (e.g. ``marketMetadata``) still needs
+    the OUTER object's tree, not just its own sub-object's, so a single
+    strict-key failure at any nesting depth on a surface reveals every other
+    drifted layer of the SAME body in one log line, rather than one nesting
+    level per relaunch round.
+    """
+    try:
+        return _assert_known_keys(payload, known=known, context=context)
+    except ExecutionReportMappingError as exc:
+        if isinstance(full_payload, Mapping):
+            raise ExecutionReportMappingError(
+                f"{exc}; full body key tree: {{{_key_tree(full_payload)}}}"
+            ) from exc
+        raise
+
+
 def _known_order(payload: object, *, context: str) -> Mapping[str, Any]:
-    order = _assert_known_keys(
-        payload, known=_ORDER_KEYS | _ORDER_DRIFT_ALLOWED_KEYS, context=context
+    """Validate an ``Order`` body, widened by both drift allowlists.
+
+    Both the top-level check and the nested ``marketMetadata`` check route
+    through :func:`_known_keys_with_full_tree`, keyed to the WHOLE order
+    (``payload``) in both cases -- see that function's docstring.
+    """
+    order = _known_keys_with_full_tree(
+        payload,
+        known=_ORDER_KEYS | _ORDER_DRIFT_ALLOWED_KEYS,
+        context=context,
+        full_payload=payload,
     )
     metadata = order.get("marketMetadata")
     if metadata is not None:
-        _assert_known_keys(
-            metadata, known=_MARKET_METADATA_KEYS, context=f"{context}.marketMetadata"
+        _known_keys_with_full_tree(
+            metadata,
+            known=_MARKET_METADATA_KEYS | _MARKET_METADATA_DRIFT_ALLOWED_KEYS,
+            context=f"{context}.marketMetadata",
+            full_payload=payload,
         )
     return order
 
@@ -914,7 +1034,9 @@ def parse_fill_report(
     A MAKER fill is REFUSED -- see :func:`_assert_taker_fill`.
     """
     context = "fill report"
-    execution = _assert_known_keys(payload, known=_EXECUTION_KEYS, context=context)
+    execution = _known_keys_with_full_tree(
+        payload, known=_EXECUTION_KEYS, context=context, full_payload=payload
+    )
 
     execution_type = _require(execution, "type", context=context)
     if execution_type not in _FILL_EXECUTION_TYPES:
@@ -1043,14 +1165,24 @@ def parse_position_status_report(
     ``avg_px_open`` is left ``None`` -- see the module docstring, item 1.
     """
     context = "position status report"
-    position = _assert_known_keys(payload, known=_USER_POSITION_KEYS, context=context)
+    position = _known_keys_with_full_tree(
+        payload,
+        known=_USER_POSITION_KEYS | _USER_POSITION_DRIFT_ALLOWED_KEYS,
+        context=context,
+        full_payload=payload,
+    )
 
     _assert_market_matches(market_slug, instrument=instrument, context=context)
 
     metadata = position.get("marketMetadata")
     if metadata is not None:
         metadata_context = f"{context}.marketMetadata"
-        _assert_known_keys(metadata, known=_MARKET_METADATA_KEYS, context=metadata_context)
+        _known_keys_with_full_tree(
+            metadata,
+            known=_MARKET_METADATA_KEYS | _MARKET_METADATA_DRIFT_ALLOWED_KEYS,
+            context=metadata_context,
+            full_payload=payload,
+        )
         _assert_market_matches(
             metadata.get("slug"), instrument=instrument, context=metadata_context
         )

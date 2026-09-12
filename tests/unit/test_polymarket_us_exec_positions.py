@@ -174,6 +174,29 @@ def test_position_for_another_market_is_refused(
         )
 
 
+def test_position_market_metadata_drift_fields_are_declared_but_unread(
+    position: dict[str, Any], instrument: BinaryOption, slug: str
+) -> None:
+    """``MarketMetadata`` is ONE shared TypedDict (order GET evidence,
+    2026-09-12T02:04:06Z); the same allowlist applies to the position
+    surface's ``marketMetadata`` -- ``eventId``/``subject`` map cleanly."""
+    drifted = {
+        **position,
+        "marketMetadata": {"slug": slug, "eventId": "evt-9182", "subject": "SFO temperature"},
+    }
+
+    mapped = parse_position_status_report(
+        drifted,
+        market_slug=slug,
+        instrument=instrument,
+        account_id=ACCOUNT_ID,
+        report_id=REPORT_ID,
+        ts_init=TS_INIT,
+    )
+
+    assert mapped.report.position_side == PositionSide.LONG
+
+
 def test_unknown_position_key_is_refused(
     position: dict[str, Any], instrument: BinaryOption, slug: str
 ) -> None:
