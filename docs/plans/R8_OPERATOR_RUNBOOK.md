@@ -400,53 +400,30 @@ the unit **active (running)** with **no login session**, and
 `~/.local/share/breezy/logs/breezy-trade-supervisor.log` should carry a fresh `supervisor_started` line.
 Order capability resumes with the unit — confirm it with the boot-time permit line in §10(b).
 
-### (c) Phase 1 cut to pm_us_crh_cont
+### (c) Phase 1 cut to pm_us_crh_cont — COMPLETED (2026-09-12)
 
-Transition from Phase 0b (shadow mode) to Phase 1 (live order submission) when the `pm_us_crh_cont`
-family is registered and ready. The build side provides the Phase 1 systemd unit at
-`deploy/systemd/breezy-trade-supervisor.service.phase1` — the operator's role is only to verify
-preconditions, make the cut, and validate order capability.
+Phase 1 is now deployed (commit 7938032). The tracked unit carries the continuous profile with
+`BREEZY_CONTINUOUS_RUNG_HOLD=1`, `BREEZY_ORDERS_ENABLED=1`, and `BREEZY_CRH_CONT_PHASE0_SHADOW=0`.
 
 #### (i) Preconditions
 
-- **Registration commit landed:** The `pm_us_crh_cont` family registration commit is merged to main and
-  deployed (file `deploy/families/pm_us_crh_cont.json` exists with `status: "REGISTERED"`, not `DRAFT_*`).
-- **Full gate green:** `scripts/ci/run_tests_no_egress.sh` passes all tests.
-- **D0 pinned:** The `d0_climate_day` value in `deploy/families/pm_us_crh_cont.json` is locked (UTC date,
-  strictly after the registration commit timestamp; never retroactive).
-- **Unit file exists and diff test passes:** `deploy/systemd/breezy-trade-supervisor.service.phase1` is
-  present and `systemd-analyze --user verify` reports no issues (run it without arguments to check all
-  units, or target the .phase1 file directly).
+- **Registration landed:** `deploy/families/pm_us_crh_cont.json` has `status: "REGISTERED"`.
+- **Gate green:** `scripts/ci/run_tests_no_egress.sh` passes.
+- **D0 pinned:** `d0_climate_day` is locked.
+- **Unit verified:** `breezy-trade-supervisor.service` carries Phase 1; `systemd-analyze verify` clean.
 
-#### (ii) The cut
+#### (ii) Deployment status
 
-The installed supervisor unit is a symlink into `deploy/systemd/`. Editing the tracked file IS the cut;
-the symlink always points to the source of truth. Execute these commands at the 16:40Z cycle boundary:
+The tracked file now carries Phase 1. To activate, reload and restart (at 16:40Z if possible):
 
 ```
-# Copy the Phase 1 unit over the current installed version
-cp /home/jon/breezy/deploy/systemd/breezy-trade-supervisor.service.phase1 \
-   /home/jon/breezy/deploy/systemd/breezy-trade-supervisor.service
-
-# Reload systemd's unit database
 systemctl --user daemon-reload
-
-# Restart the supervisor to pick up the new unit
 systemctl --user restart breezy-trade-supervisor.service
 ```
 
-Why 16:40Z: The supervisor's schedule (§7, `trade_supervisor_core.py:31-34`) STOPs any prior node at
-16:40Z, then LAUNCHes a new one at 16:50Z with the updated environment. Cutting at the STOP boundary
-ensures the fresh environment is in place before LAUNCH.
-
-The Phase 1 unit carries `Environment=BREEZY_CONTINUOUS_RUNG_HOLD=1` and sets
-`Environment=BREEZY_ORDERS_ENABLED=1` — shadow mode (`BREEZY_CURRENT_RUNG_HOLD`) is dropped. The two
-operator caps reach the supervisor only by reference to `operator.env` (§6), exactly as before. Nothing
-else is asked of the operator.
-
-The unit uses `KillMode=process` (line 140–153 of `breezy-trade-supervisor.service.phase1`), so SIGTERM
-goes only to the supervisor PID; the node is stopped by the supervisor's own STOP_PRIOR job, not by
-systemd's cgroup sweep.
+The unit carries `BREEZY_CONTINUOUS_RUNG_HOLD=1`, `BREEZY_ORDERS_ENABLED=1`, and
+`BREEZY_CRH_CONT_PHASE0_SHADOW=0` (no `BREEZY_CURRENT_RUNG_HOLD`). `KillMode=process` means
+SIGTERM goes only to the supervisor; the node stops via STOP_PRIOR.
 
 #### (iii) Verification — order capability enabled
 
@@ -492,20 +469,15 @@ grep 'Phase1PermitForbiddenError\|phase1.*forbidden\|continuous.*permit.*denied'
 
 #### (iv) Rollback — return to Phase 0b
 
-If Phase 1 verification fails and you must revert:
+If verification fails, restore from before the cut (commit 314a3ba):
 
 ```
-# Restore the Phase 0b unit (currently installed unit before the cut)
-git checkout deploy/systemd/breezy-trade-supervisor.service
-
-# Reload and restart
+git checkout 314a3ba -- deploy/systemd/breezy-trade-supervisor.service
 systemctl --user daemon-reload
 systemctl --user restart breezy-trade-supervisor.service
-
-# Verify Phase 0b is running: grep for BREEZY_CURRENT_RUNG_HOLD=1, absence of BREEZY_CONTINUOUS_RUNG_HOLD
-NODE_PID=$(pgrep -f 'breezy-trade$')
-cat /proc/$NODE_PID/environ | tr '\0' '\n' | grep BREEZY_
 ```
+
+Verify Phase 0b is running: grep for `BREEZY_CURRENT_RUNG_HOLD=1` in `/proc/<pid>/environ`.
 
 #### (v) AMBIGUOUS handling under Phase 1
 
@@ -516,20 +488,12 @@ coroutine and uses GET `/v1/order/{id}` to confirm filled or terminal status.
 - **With-id AMBIGUOUS (automatic):** The resolver polls in the background and retires the intent when
   confirmed. Failure cases (GET 5xx, malformed body, timeout) leave the intent AMBIGUOUS and retry
   next poll cycle. This is never a manual step — the operator does not intervene.
-- **No-id AMBIGUOUS (operator-only):** If an order submit returns AMBIGUOUS without a venue_order_id,
-  the resolver has no GET target. The operator must run the existing procedure:
+- **No-id AMBIGUOUS:** If an order submit returns AMBIGUOUS without a venue_order_id, run
+  `.venv/bin/breezy-clear-submit-intent --yes --resolution no-order-exists --evidence <positions file>`
+  to retire the singleton and unblock arming. This is the sole manual step for no-id cases.
 
-```
-.venv/bin/breezy-clear-submit-intent
-```
-
-This retires the singleton and unblocks arming. It remains the sole manual step for no-id cases.
-
-- **Duplicate fill (family halt):** If a single fill is recorded twice (rare; would indicate venue
-  echoes or a networking quirk), the `continuous_rung_hold/halt` key is set in the store. This
-  automatically stops arming across the entire family — no orders are sent until the key is cleared.
-  Clearing it is a BUILD-SIDE decision requiring evidence (logs showing the duplicate, venue
-  confirmation, etc.), never a routine operator step. Contact the strategy lead before clearing.
+- **Duplicate fill (family halt):** If a single fill is recorded twice, the `continuous_rung_hold/halt`
+  key stops arming. Clear with strategy-lead approval: `.venv/bin/breezy-clear-family-halt --reason "<msg>" --evidence-path <file>`.
 - **Kill switch:** If the node must be stopped immediately, SIGTERM it:
 
 ```
@@ -541,3 +505,66 @@ kill $(pgrep -f 'breezy-trade$')
 The supervisor does not automatically relaunch a killed node (only crashes trigger bounded relaunch).
 A manual restart is needed: `systemctl --user restart breezy-trade-supervisor.service` at the next
 desired window, or before 17:00Z if you want to keep the day's permit active.
+
+#### (v-bis) First-boot verification (v3)
+
+Run these checks against the newest `~/.local/share/breezy/logs/breezy-trade-[0-9]*T*Z.log` and the node's `/proc/<pid>/environ`:
+
+1. **Environment flags:** `BREEZY_CONTINUOUS_RUNG_HOLD=1`, `BREEZY_ORDERS_ENABLED=1`, `BREEZY_LIVE_OBSERVATIONS=1`;
+   absent: `BREEZY_CURRENT_RUNG_HOLD`. Verify: `cat /proc/<pid>/environ | tr '\0' '\n' | grep BREEZY_`.
+2. **Boot-time permit line:** `grep 'live-trading permit issued issued_at_ns=' <NODE_LOG>` — exactly ≥1 line.
+3. **Strategy armed per station:** `grep 'ContinuousRungHoldStrategy.*READY\|RUNNING' <NODE_LOG>` — one per active station.
+4. **No Phase0PermitForbiddenError:** `grep 'Phase0PermitForbiddenError\|phase0.*forbidden' <NODE_LOG>` — expect empty.
+5. **No trading refusals (critical):** `grep 'Trading refused' <NODE_LOG>` — expect empty. A `trading_refusals` entry
+   (order_submission_permit=none) blocks every submit for the session.
+6. **Exactly 4 BREEZY-NWS ERRORs (cosmetic):** `grep 'BREEZY-NWS.*ERROR' <NODE_LOG> | wc -l` — expect 4.
+7. **Startup evidence present:** Query `~/.local/share/breezy/state/exec_polymarket_us.sqlite` with
+   `sqlite3 -mode=ro <DB> "SELECT value FROM state WHERE key='exec/polymarket_us/startup_evidence';"` —
+   expect `eof_complete=true` and `position_read_refused=false` (read-only query only).
+8. **No family halt key (or cleared sentinel):** `sqlite3 -mode=ro <DB> "SELECT value FROM state WHERE key LIKE 'continuous_rung_hold/halt%';"` —
+   expect empty or exactly `halt_cleared` entries. No active halt without evidence and approval.
+
+The 17:05Z supervisor self-check (commit a858b93) automatically verifies items 1, 2, 3 and logs the results.
+
+#### (vi) OPEN intent at launch
+
+If an intent is still in OPEN state at the 16:50Z launch window, the supervisor **refuses** launch with
+`REFUSE_INTENT_OPEN`. A CRITICAL `open_intent_stale` alert fires when an intent is unresolved for >15 minutes.
+The resolver backs off 5→300 s polling; failure cases (GET 5xx, timeout, malformed response) keep it AMBIGUOUS.
+
+**Recovery:**
+- **Node not live:** Use `breezy-clear-submit-intent --yes --resolution <order-id=ID or no-order-exists> --evidence <positions-file>`.
+  Requires venue evidence (positions + fill-record artefact from open-orders read).
+- **Node can relaunch:** Relaunch the node so the resolver retires the AMBIGUOUS intent at startup via `reconcile_at_startup`.
+
+#### (vii) Venue shape drift
+
+When the venue changes its response structure, order-rejection lines log: `did not map` WARN or
+`Trading refused ... could not be mapped`. These lines now carry a names-only `full body key tree` (no values).
+
+**Fix:** Declare the new fields per surface in `src/breezy/adapters/polymarket_us/exec/reports.py` via
+`_*_DRIFT_ALLOWED_KEYS` constants (reference the log timestamp as evidence). Never relax the mapping guard
+(LESSONS L-37); new fields must be explicitly declared in code before orders resume.
+
+#### (viii) Hand relaunch recipe
+
+When a node must be restarted outside the 16:50Z window or after an unclean shutdown:
+
+1. **Copy environment verbatim:** `env=$(cat /proc/<OLD_PID>/environ); echo "$env" | tr '\0' '\n'` (verify, never print).
+2. **Stop the old process:** `kill -TERM <OLD_PID>` and wait for `TradingNode: DISPOSED` in the log (~11 s).
+3. **Spawn the new node:** Mirror `trade_supervisor.spawn_node()`:
+   ```
+   subprocess.Popen(
+     [".venv/bin/breezy-trade"],
+     env=env,
+     cwd=<repo>,
+     stdin=subprocess.DEVNULL,
+     stdout=<new-timestamped-logfile>,
+     stderr=subprocess.STDOUT,
+     start_new_session=True,
+     preexec_fn=lambda: os.setrlimit(os.RLIMIT_CORE, (0, 0)) and os.close(os.fcopen(os.devnull, 'r')),
+     close_fds=True
+   )
+   ```
+   This detaches the node from the terminal and ensures clean shutdown on session end. The supervisor's
+   16:40Z STOP_PRIOR finds running nodes by pgrep; a node that outlives its supervisor is an anticipated state.
