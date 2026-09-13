@@ -385,6 +385,16 @@ _RESOLVER_POLL_INTERVAL_SECS: Final[float] = 5.0
 #: than this between resolver attempts no matter how many failures in a row.
 _RESOLVER_BACKOFF_CAP_SECS: Final[float] = 300.0
 
+#: R-9a (HF-4 rev2, B4 supply side): the startup-evidence record is
+#: refreshed by `_resolve_ambiguous_intents` itself whenever the watermark
+#: (`self._last_evidence_write_ns`) is older than this -- on EVERY pass,
+#: including one with no OPEN intent, which is exactly when the strategy's
+#: re-arm gate (`_REARM_EVIDENCE_MAX_AGE_NS`, `continuous_strategy.py`) is
+#: shopping for fresh evidence. At the 5.0s base poll interval this keeps
+#: the record <= ~65s old whenever the resolver loop is healthy, comfortably
+#: inside the 180s re-arm ceiling.
+_EVIDENCE_REFRESH_AFTER_NS: Final[int] = 60 * 1_000_000_000
+
 #: Age of a durable resolver context's ``created_ns``, past which an intent
 #: still AMBIGUOUS raises the one-shot stale-intent alert below.
 _STALE_INTENT_ALERT_AFTER_NS: Final[int] = 15 * 60 * 1_000_000_000
@@ -1054,6 +1064,14 @@ class PolymarketUSExecutionClient(LiveExecutionClient):
         # never `.add`/`.update`, for the same E0-NOSEND-RESOLVER reason.
         self._resolver_stale_alerted_intent_ids: frozenset[str] = frozenset()
         self._resolver_stale_alert_details: dict[str, Mapping[str, str]] = {}
+        #: R-9a (HF-4 rev2, B4 supply side): the wall-clock timestamp of the
+        #: MOST RECENT startup-evidence write -- the single writer is
+        #: `_write_startup_position_evidence` (assigned at its own end), so
+        #: a terminal-zero resolution's own evidence rewrite resets this
+        #: too and no redundant GET follows a resolution. `0` before the
+        #: first write makes the very first resolver pass refresh
+        #: unconditionally (age is always >= the threshold against `0`).
+        self._last_evidence_write_ns: int = 0
 
     # -- observable state ---------------------------------------------------
 
@@ -1339,6 +1357,38 @@ class PolymarketUSExecutionClient(LiveExecutionClient):
             if self._latch is None:
                 self._log.debug("resolver: no latch bound; skipping this pass")
                 continue
+            # R-9a (HF-4 rev2, B4 supply side): age-gated startup-evidence
+            # refresh, on EVERY pass -- including one with no OPEN intent,
+            # which is exactly when the strategy's re-arm gate is
+            # re-arm-shopping. Placed here (after the latch-None guard,
+            # before `current_open()` below) deliberately: it must run
+            # whether or not an intent is OPEN. The `except` is INERT
+            # (R-9a): it must never touch `_resolver_consecutive_failures`
+            # (that counter belongs to the order-GET path only, below) and
+            # never `_refuse` -- a positions-endpoint blip must not slow
+            # order resolution or halt trading. Every callee here
+            # (`self._clock.timestamp_ns`, `self._private_read`,
+            # `self._declared_positions`, `self._write_startup_position_
+            # evidence`, `self._log.warning`) is already an
+            # EXEC_RESOLVER_PERMITTED_CALLEES member -- zero allowlist
+            # delta (verified by running the guard, unmodified).
+            refresh_now_ns = self._clock.timestamp_ns()
+            if refresh_now_ns - self._last_evidence_write_ns >= _EVIDENCE_REFRESH_AFTER_NS:
+                try:
+                    refresh_payload = await self._private_read(PORTFOLIO_POSITIONS_PATH)
+                    refresh_positions = self._declared_positions(refresh_payload)
+                except Exception as exc:  # noqa: BLE001 - inert; never `_refuse`
+                    self._log.warning(
+                        "resolver: startup-evidence refresh GET failed "
+                        f"({type(exc).__name__}: {exc}); prior record kept"
+                    )
+                else:
+                    self._write_startup_position_evidence(
+                        now_ns=refresh_now_ns,
+                        eof_complete=True,
+                        position_read_refused=False,
+                        raw_positions=refresh_positions,
+                    )
             try:
                 current = self._latch.current_open()
             except self._latch.CorruptError:
@@ -1615,6 +1665,13 @@ class PolymarketUSExecutionClient(LiveExecutionClient):
             )
             self._refuse(_VENUE_ID_MAP_WRITE_FAILED)
         self._retire(context.intent_id, "STATUS_REPORT_ZERO_FILL_TERMINAL", now_ns)
+        # B3 (Decision 3, HF-4 rev2): `_retire` itself does not log -- one
+        # INFO line per retirement, matching the strategy-side `rearm:`
+        # observability seam's own per-transition discipline.
+        self._log.info(
+            f"resolver: retired intent {context.intent_id} "
+            "(STATUS_REPORT_ZERO_FILL_TERMINAL)"
+        )
         booking = self._ambiguous_bookings.pop(context.intent_id, None)
         if booking is not None:
             # Same-process only (Resolution E): on restart the ledger died
@@ -1747,6 +1804,12 @@ class PolymarketUSExecutionClient(LiveExecutionClient):
             )
             self._refuse(_VENUE_ID_MAP_WRITE_FAILED)
         self._retire(context.intent_id, "STATUS_REPORT_ACCEPT_FILL_TERMINAL", now_ns)
+        # B3 (Decision 3, HF-4 rev2): `_retire` itself does not log -- one
+        # INFO line per retirement, matching `_resolve_terminal_zero`'s own.
+        self._log.info(
+            f"resolver: retired intent {context.intent_id} "
+            "(STATUS_REPORT_ACCEPT_FILL_TERMINAL)"
+        )
         # D2 (plan rev 6.1): a genuine fill surfacing for a venue order this
         # resolver already restored a permit slot for (a superseded
         # terminal-zero determination) must give that slot back. Never fires
@@ -2584,6 +2647,10 @@ class PolymarketUSExecutionClient(LiveExecutionClient):
             positions=tuple(snapshots),
         )
         self._store_set(STARTUP_EVIDENCE_KEY, evidence.to_bytes())
+        # R-9a (HF-4 rev2): the single writer of the watermark the resolver's
+        # refresh reads against -- a plain attribute assignment, invisible
+        # to `find_exec_resolver_violations` (walks `ast.Call` only).
+        self._last_evidence_write_ns = now_ns
 
     async def _refresh_startup_position_evidence(self) -> None:
         """C1: fresh positions read at the END of `_connect`.

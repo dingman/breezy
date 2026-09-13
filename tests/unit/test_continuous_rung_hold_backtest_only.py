@@ -9,6 +9,7 @@ pattern `test_current_rung_hold_backtest_only.py` uses for the v2 subclass.
 from __future__ import annotations
 
 import ast
+import itertools
 import time
 from decimal import Decimal
 from pathlib import Path
@@ -39,13 +40,17 @@ from breezy.strategy.current_rung_hold.continuous_backtest_only import (
     ContinuousNotABacktestClockError,
     ContinuousRungHoldBacktestStrategy,
 )
-from breezy.strategy.current_rung_hold.continuous_strategy import _REARM_MIN_DELAY_NS
+from breezy.strategy.current_rung_hold.continuous_strategy import (
+    _MAX_STATION_DAY_ATTEMPTS,
+    _REARM_MIN_DELAY_NS,
+)
 from breezy.strategy.current_rung_hold.offer_tape import OfferTape
 from tests.unit.test_continuous_rung_hold_strategy import (
     _PERMISSIVE_EVIDENCE,
     _cont_latch_factory,
     _depth,
     _order_denied,
+    _order_filled_for_position,
 )
 from tests.unit.test_current_rung_hold_strategy import (
     CLIMATE_DAY,
@@ -320,12 +325,57 @@ def test_the_subclass_never_holds_an_order_submission_permit(
     )
 
 
-def test_one_station_day_submits_at_most_one_order_across_many_eligible_depth_frames(
+def test_one_station_day_submits_at_most_max_station_day_attempts_orders_spaced_by_the_rearm_floor(
     store_path: Path, interior_instrument: BinaryOption,
 ) -> None:
-    """INVARIANT: IN_FLIGHT is never auto-cleared on the armed branch (site
-    :734), so many later eligible frames on the SAME station-day must never
-    produce a second `submit_order` absent a WAIT-class deny."""
+    """R-10 / PREREG Sec5: this replaces the pre-HF-4
+    "at most one order" pin, which encoded the pre-HF-4 UNREACHABILITY of
+    re-arm, not a genuine safety invariant -- HF-4's stale-IN_FLIGHT
+    release makes attempts 2 and 3 reachable by design (Decision 1,
+    HF-4.rev2.md), including for this always-armed backtest harness, whose
+    `submit_order` stub never opens a real submit intent (`is_intent_open()`
+    is trivially False here, so release is floor-only -- see the
+    `ContinuousRungHoldBacktestStrategy` class docstring).
+
+    The restated invariant (HD-9, R-10): at most `_MAX_STATION_DAY_ATTEMPTS`
+    submissions for this station-day, each one at least `_REARM_MIN_DELAY_NS`
+    (event time) after the previous, and never a fourth no matter how many
+    further eligible frames arrive.
+    """
+    strategy = _register_backtest_and_start(
+        store_path=store_path,
+        instruments=(interior_instrument,),
+        position_evidence_reader=lambda: _PERMISSIVE_EVIDENCE,
+    )
+    submitted: list[object] = []
+    submission_ts_events: list[int] = []
+    strategy.submit_order = submitted.append
+    strategy.on_data(_observation(temp_c_tenths=300, observed_at_ns=WINDOW_OPEN_NS - 1))
+    for i in range(16):  # well past the 3rd attempt (~240s) + another 120s
+        depth = _depth(
+            INTERIOR_ID,
+            bids=(),
+            asks=(("0.40", 10),),
+            ts_event=WINDOW_OPEN_NS + i * NS_PER_MIN,
+        )
+        before = len(submitted)
+        strategy.on_order_book_depth(depth)
+        if len(submitted) > before:
+            submission_ts_events.append(depth.ts_event)
+
+    assert len(submitted) == _MAX_STATION_DAY_ATTEMPTS
+    assert len(submission_ts_events) == _MAX_STATION_DAY_ATTEMPTS
+    for earlier, later in itertools.pairwise(submission_ts_events):
+        assert later - earlier >= _REARM_MIN_DELAY_NS
+
+
+def test_a_fill_freezes_the_station_day_against_further_submission(
+    store_path: Path, interior_instrument: BinaryOption,
+) -> None:
+    """R-10 / PREREG Sec5: once a genuine fill lands on this station-day,
+    `is_consumed` freezes it for the rest of this process's life -- no
+    further `_hunt_tick` may ever reach `submit_order` again, no matter how
+    many more eligible frames arrive."""
     strategy = _register_backtest_and_start(
         store_path=store_path,
         instruments=(interior_instrument,),
@@ -334,14 +384,24 @@ def test_one_station_day_submits_at_most_one_order_across_many_eligible_depth_fr
     submitted: list[object] = []
     strategy.submit_order = submitted.append
     strategy.on_data(_observation(temp_c_tenths=300, observed_at_ns=WINDOW_OPEN_NS - 1))
-    for i in range(10):
-        depth = _depth(
-            INTERIOR_ID,
-            bids=(),
-            asks=(("0.40", 10),),
-            ts_event=WINDOW_OPEN_NS + i * NS_PER_MIN,
+    strategy.on_order_book_depth(
+        _depth(INTERIOR_ID, bids=(), asks=(("0.40", 10),), ts_event=WINDOW_OPEN_NS),
+    )
+    assert len(submitted) == 1
+
+    strategy.on_order_filled(_order_filled_for_position(strategy, venue_order_id="V-1"))
+    assert strategy._latch is not None
+    assert strategy._latch.is_consumed(STATION, CLIMATE_DAY.isoformat()) is True
+
+    for i in range(1, 16):
+        strategy.on_order_book_depth(
+            _depth(
+                INTERIOR_ID,
+                bids=(),
+                asks=(("0.40", 10),),
+                ts_event=WINDOW_OPEN_NS + i * NS_PER_MIN,
+            ),
         )
-        strategy.on_order_book_depth(depth)
     assert len(submitted) == 1
 
 

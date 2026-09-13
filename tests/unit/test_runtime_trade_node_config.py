@@ -272,6 +272,34 @@ class TestTradeNodeConfig:
         assert config.exec_engine.open_check_interval_secs is None
         assert config.exec_engine.position_check_interval_secs is None
 
+    def test_the_live_exec_engine_config_never_enables_the_native_position_check(
+        self,
+    ) -> None:
+        """HF-4 AC-15 (Decision 2A, R9): `_check_positions_consistency`
+        (`live/execution_engine.py:799-848`) mutates on a bad venue page --
+        a page omitting a held LONG synthesizes a closing fill and forces
+        the cached position FLAT (`generate_missing_orders` defaults
+        `True`, `live/config.py:183`); the converse synthesizes a phantom.
+        Either flips `portfolio.net_position`, the EXACT AND-arm HF-4's
+        re-arm gate relies on -- enabling this native loop would let one
+        bad venue page manufacture the corroboration the gate exists to
+        require. `position_check_interval_secs` MUST stay `None`, by
+        omission from the `LiveExecEngineConfig(...)` call, never a native
+        default. A durable guard against a future agent "fixing" evidence
+        freshness with 2A instead of HF-4's own resolver-side refresh
+        (`exec/client.py::_EVIDENCE_REFRESH_AFTER_NS`).
+
+        Characterisation over the BUILT config, not the call-site source
+        text (`test_starts_no_continuous_reconciliation_polling` above
+        already covers the same field; this test's mutation evidence is
+        recorded separately in the HF-4 C4 commit message, citing BOTH)."""
+        config = build_trade_node_config(
+            make_trade_settings(), make_data_client_config(), make_exec_client_config()
+        )
+
+        assert config.exec_engine is not None
+        assert config.exec_engine.position_check_interval_secs is None
+
     def test_uses_no_redis_backed_cache_or_message_bus(self) -> None:
         config = build_trade_node_config(
             make_trade_settings(), make_data_client_config(), make_exec_client_config()

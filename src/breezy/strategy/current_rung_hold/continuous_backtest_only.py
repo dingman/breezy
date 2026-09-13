@@ -94,6 +94,14 @@ class ContinuousRungHoldBacktestStrategy(ContinuousRungHoldStrategy):
     ``_submission_armed`` (enforced by
     ``test_the_subclass_defines_exactly_three_methods``, an AST exact-set
     pin over this class's own ``ClassDef`` body).
+
+    R-10 note (HF-4 integration): this harness's ``submit_order`` stub
+    never opens a real account-wide submit intent, so
+    ``TrialDayLatch.is_intent_open()`` is trivially ``False`` here --
+    HF-4's stale-``IN_FLIGHT`` release (``_release_stale_inflight``) is
+    therefore floor-only (the 120s ``_REARM_MIN_DELAY_NS`` gate), never
+    intent-gated the way a live/resolver-slow node is. An accepted
+    divergence from live, inert for IOC-only submissions (F-32).
     """
 
     def __init__(

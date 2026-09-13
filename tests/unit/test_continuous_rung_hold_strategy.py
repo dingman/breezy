@@ -10,18 +10,29 @@ from typing import Any
 
 import pytest
 from nautilus_trader.common.component import TestClock
+from nautilus_trader.core.uuid import UUID4
+from nautilus_trader.model.currencies import USD
 from nautilus_trader.model.data import BookOrder, OrderBookDepth10
-from nautilus_trader.model.enums import OrderSide
-from nautilus_trader.model.identifiers import TraderId
+from nautilus_trader.model.enums import LiquiditySide, OmsType, OrderSide
+from nautilus_trader.model.events import OrderFilled
+from nautilus_trader.model.identifiers import (
+    AccountId,
+    ClientOrderId,
+    PositionId,
+    TradeId,
+    TraderId,
+    VenueOrderId,
+)
 from nautilus_trader.model.instruments import BinaryOption
-from nautilus_trader.model.objects import Price, Quantity
+from nautilus_trader.model.objects import Money, Price, Quantity
+from nautilus_trader.model.position import Position
 from nautilus_trader.portfolio import Portfolio
 from nautilus_trader.test_kit.stubs.component import TestComponentStubs
 
 from breezy.adapters.polymarket_us.parsing import DEPTH10_LEVELS
 from breezy.domain.station_observation import StationObservation
 from breezy.runtime.sqlite_store import SqliteStateStore
-from breezy.runtime.submit_intent import open_submit_intent_latch
+from breezy.runtime.submit_intent import CURRENT_INTENT_KEY, open_submit_intent_latch
 from breezy.strategy.current_rung_hold.config import CurrentRungHoldConfig
 from breezy.strategy.current_rung_hold.continuous_strategy import (
     ContinuousRungHoldStrategy,
@@ -786,3 +797,447 @@ def test_an_unarmed_strategy_never_records_an_attempt_across_many_eligible_depth
     assert submitted == []  # unarmed `_maybe_submit` never calls `submit_order`
     assert strategy._latch.attempt_state(STATION, CLIMATE_DAY.isoformat()) == (0, None)
     assert strategy._latch.is_inflight(STATION, CLIMATE_DAY.isoformat()) is False
+# ---------------------------------------------------------------------------
+# HF-4 (post-take re-arm reachability): C1 -- release a stale IN_FLIGHT
+# marker once the account-wide submit intent has closed, so attempts 2/3
+# become reachable (PREREG v3 SS5). `submit_order` is stubbed to a no-op in
+# every test below -- the real submit-intent flock is therefore never armed
+# by these tests, so `is_intent_open()` stays False throughout unless a
+# test explicitly arms it via `_arm_and_release_stale_intent` (already
+# defined above) or writes a corrupt singleton directly.
+# ---------------------------------------------------------------------------
+
+_S: int = 1_000_000_000  # one second, in nanoseconds
+
+
+def _register_phase1_and_start(
+    *,
+    store_path: Path,
+    instruments: tuple[BinaryOption, ...],
+    clock: TestClock | None = None,
+    position_evidence_reader: Any | None = None,
+) -> ContinuousRungHoldStrategy:
+    """Phase 1 (real, non-None permit) registration -- mirrors `_register`/
+    `_register_and_start` above, plus the `phase0_permit_guard=False` +
+    `order_submission_permit=object()` idiom already used by
+    `test_continuous_rung_hold_fill_wiring.py`'s
+    `test_phase0_permit_guard_false_accepts_a_real_permit_and_submits_once`.
+    `submit_order` is replaced with a no-op: these tests exercise the
+    release/re-arm GATE, never the real order-submission chain.
+    """
+    cfg = CurrentRungHoldConfig(
+        instrument_ids=tuple(instrument.id for instrument in instruments),
+    )
+    strategy = ContinuousRungHoldStrategy(
+        cfg,
+        trial_day_latch_factory=_cont_latch_factory(store_path),
+        order_submission_permit=object(),  # type: ignore[arg-type]
+        phase0_permit_guard=False,
+        position_evidence_reader=position_evidence_reader,
+    )
+    used_clock = TestClock() if clock is None else clock
+    used_clock.set_time(WINDOW_OPEN_NS)
+    msgbus = TestComponentStubs.msgbus()
+    cache = TestComponentStubs.cache()
+    for instrument in instruments:
+        cache.add_instrument(instrument)
+    portfolio = Portfolio(msgbus=msgbus, cache=cache, clock=used_clock)
+    strategy.register(
+        trader_id=TraderId("BACKTEST-001"),
+        portfolio=portfolio,
+        msgbus=msgbus,
+        cache=cache,
+        clock=used_clock,
+    )
+    strategy.start()
+    strategy.submit_order = lambda order: None
+    return strategy
+
+
+def _arm_one_attempt(strategy: ContinuousRungHoldStrategy, *, ts_ns: int) -> None:
+    assert strategy._latch is not None
+    strategy._latch.set_inflight(STATION, CLIMATE_DAY.isoformat())
+    strategy._latch.record_attempt(STATION, CLIMATE_DAY.isoformat(), ts_ns=ts_ns)
+
+
+def _order_filled_for_position(
+    strategy: ContinuousRungHoldStrategy, *, venue_order_id: str,
+) -> OrderFilled:
+    """A minimal `OrderFilled` for seeding a REAL reconciled Nautilus
+    position via `cache.add_position` + `portfolio.initialize_positions()`
+    -- the same idiom `test_continuous_rung_hold_fill_wiring.py`'s own
+    `_fill` helper uses, inlined here to avoid a cross-test-module import
+    cycle (that module imports FROM this one)."""
+    return OrderFilled(
+        trader_id=strategy.trader_id,
+        strategy_id=strategy.id,
+        instrument_id=INTERIOR_ID,
+        client_order_id=ClientOrderId(f"C-{venue_order_id}"),
+        venue_order_id=VenueOrderId(venue_order_id),
+        account_id=AccountId("POLYMARKET_US-001"),
+        trade_id=TradeId(f"T-{venue_order_id}"),
+        position_id=PositionId(f"P-{venue_order_id}"),
+        order_side=OrderSide.BUY,
+        order_type=strategy.order_factory.limit(
+            instrument_id=INTERIOR_ID,
+            order_side=OrderSide.BUY,
+            quantity=Quantity.from_int(1),
+            price=Price.from_str("0.40"),
+        ).order_type,
+        last_qty=Quantity.from_int(1),
+        last_px=Price.from_str("0.40"),
+        currency=USD,
+        commission=Money(0, USD),
+        liquidity_side=LiquiditySide.TAKER,
+        event_id=UUID4(),
+        ts_event=WINDOW_OPEN_NS,
+        ts_init=WINDOW_OPEN_NS,
+    )
+
+
+def test_a_closed_intent_and_an_elapsed_delay_floor_release_a_stale_inflight_marker(
+    store_path: Path, interior_instrument: BinaryOption,
+) -> None:
+    """AC-1: a closed intent + an elapsed 120s delay floor releases the
+    stale IN_FLIGHT marker, and the SAME tick reaches `evaluate_eligible_
+    snapshot` and arms attempt 2."""
+    strategy = _register_phase1_and_start(
+        store_path=store_path,
+        instruments=(interior_instrument,),
+        position_evidence_reader=lambda: _PERMISSIVE_EVIDENCE,
+    )
+    _arm_one_attempt(strategy, ts_ns=WINDOW_OPEN_NS)
+    assert strategy._latch is not None
+    assert strategy._latch.is_intent_open() is False
+
+    strategy.on_data(_observation(temp_c_tenths=300, observed_at_ns=WINDOW_OPEN_NS - 1))
+    strategy.on_quote_tick(
+        _quote(INTERIOR_ID, ask="0.40", ts_event=WINDOW_OPEN_NS + 120 * _S),
+    )
+
+    assert strategy.diagnostics.count("inflight_released") == 1
+    assert strategy._latch.is_inflight(STATION, CLIMATE_DAY.isoformat()) is True
+    assert strategy._latch.attempt_state(STATION, CLIMATE_DAY.isoformat()) == (
+        2, WINDOW_OPEN_NS + 120 * _S,
+    )
+
+
+def test_a_second_attempt_arms_after_a_resolver_terminal_zero_refreshes_evidence(
+    store_path: Path, interior_instrument: BinaryOption,
+) -> None:
+    """AC-1, integration-shaped: a first re-arm-eligible tick against STALE
+    evidence releases IN_FLIGHT but is denied (no attempt 2 yet); a resolver
+    terminal-zero resolution's own evidence rewrite (simulated here by
+    updating the reader's return value, exactly as `_write_startup_position_
+    evidence` would) makes the VERY NEXT tick's read fresh, and attempt 2
+    then arms -- the re-arm gate reads the CURRENT evidence, never a value
+    cached from an earlier tick."""
+    evidence_state: dict[str, object] = {"value": _PERMISSIVE_EVIDENCE}
+    strategy = _register_phase1_and_start(
+        store_path=store_path,
+        instruments=(interior_instrument,),
+        position_evidence_reader=lambda: evidence_state["value"],
+    )
+    # Now stale, absent-slug -- the boot walk above already ran (and
+    # passed) against the fresh permissive evidence.
+    evidence_state["value"] = {
+        **_PERMISSIVE_EVIDENCE, "positions": [], "ts_ns": WINDOW_OPEN_NS - 10_000 * _S,
+    }
+    _arm_one_attempt(strategy, ts_ns=WINDOW_OPEN_NS)
+    strategy.on_data(_observation(temp_c_tenths=300, observed_at_ns=WINDOW_OPEN_NS - 1))
+
+    strategy.on_quote_tick(
+        _quote(INTERIOR_ID, ask="0.40", ts_event=WINDOW_OPEN_NS + 120 * _S),
+    )
+    assert strategy._latch is not None
+    # Released, but denied -- stale evidence -- so attempt 2 did NOT arm.
+    assert strategy._latch.is_inflight(STATION, CLIMATE_DAY.isoformat()) is False
+    assert strategy._latch.attempt_state(STATION, CLIMATE_DAY.isoformat()) == (1, WINDOW_OPEN_NS)
+
+    # The resolver's own rewrite: fresh, absent-slug evidence.
+    evidence_state["value"] = {
+        **_PERMISSIVE_EVIDENCE, "positions": [], "ts_ns": WINDOW_OPEN_NS,
+    }
+    strategy.on_quote_tick(
+        _quote(INTERIOR_ID, ask="0.40", ts_event=WINDOW_OPEN_NS + 121 * _S),
+    )
+
+    assert strategy._latch.is_inflight(STATION, CLIMATE_DAY.isoformat()) is True
+    assert strategy._latch.attempt_state(STATION, CLIMATE_DAY.isoformat()) == (
+        2, WINDOW_OPEN_NS + 121 * _S,
+    )
+
+
+def test_a_third_attempt_arms_and_a_fourth_never_does(
+    store_path: Path, interior_instrument: BinaryOption,
+) -> None:
+    """AC-2, AC-3: with two attempts already burned, a closed intent past
+    the floor releases and arms attempt 3; the NEXT such release finds
+    `attempts == 3` and the re-arm gate denies forever."""
+    strategy = _register_phase1_and_start(
+        store_path=store_path,
+        instruments=(interior_instrument,),
+        position_evidence_reader=lambda: _PERMISSIVE_EVIDENCE,
+    )
+    assert strategy._latch is not None
+    strategy._latch.record_attempt(STATION, CLIMATE_DAY.isoformat(), ts_ns=WINDOW_OPEN_NS)
+    strategy._latch.record_attempt(STATION, CLIMATE_DAY.isoformat(), ts_ns=WINDOW_OPEN_NS)
+    strategy._latch.set_inflight(STATION, CLIMATE_DAY.isoformat())
+    strategy.on_data(_observation(temp_c_tenths=300, observed_at_ns=WINDOW_OPEN_NS - 1))
+
+    strategy.on_quote_tick(
+        _quote(INTERIOR_ID, ask="0.40", ts_event=WINDOW_OPEN_NS + 120 * _S),
+    )
+    assert strategy._latch.attempt_state(STATION, CLIMATE_DAY.isoformat()) == (
+        3, WINDOW_OPEN_NS + 120 * _S,
+    )
+    assert strategy._latch.is_inflight(STATION, CLIMATE_DAY.isoformat()) is True
+
+    strategy.on_quote_tick(
+        _quote(INTERIOR_ID, ask="0.40", ts_event=WINDOW_OPEN_NS + 240 * _S),
+    )
+    # Attempt 4 never arms: released, then denied by the attempt cap.
+    assert strategy._latch.is_inflight(STATION, CLIMATE_DAY.isoformat()) is False
+    assert strategy._latch.attempt_state(STATION, CLIMATE_DAY.isoformat()) == (
+        3, WINDOW_OPEN_NS + 120 * _S,
+    )
+
+
+def test_a_stale_inflight_marker_is_never_released_while_the_intent_is_open(
+    store_path: Path, interior_instrument: BinaryOption,
+) -> None:
+    """AC-4: a crash-left OPEN singleton (`_arm_and_release_stale_intent`,
+    defined above) blocks the release regardless of how far past the delay
+    floor the tick lands."""
+    _arm_and_release_stale_intent(store_path)
+    strategy = _register_phase1_and_start(
+        store_path=store_path,
+        instruments=(interior_instrument,),
+        position_evidence_reader=lambda: _PERMISSIVE_EVIDENCE,
+    )
+    assert strategy._latch is not None
+    assert strategy._latch.is_intent_open() is True
+    _arm_one_attempt(strategy, ts_ns=WINDOW_OPEN_NS)
+    strategy.on_data(_observation(temp_c_tenths=300, observed_at_ns=WINDOW_OPEN_NS - 1))
+
+    strategy.on_quote_tick(
+        _quote(INTERIOR_ID, ask="0.40", ts_event=WINDOW_OPEN_NS + 1_000 * _S),
+    )
+
+    assert strategy.diagnostics.count("inflight_released") == 0
+    assert strategy._latch.is_inflight(STATION, CLIMATE_DAY.isoformat()) is True
+    assert strategy._latch.attempt_state(STATION, CLIMATE_DAY.isoformat()) == (1, WINDOW_OPEN_NS)
+
+
+def test_a_corrupt_intent_singleton_leaves_the_inflight_marker_set(
+    store_path: Path, interior_instrument: BinaryOption,
+) -> None:
+    """AC-5: `is_latched()` treats a corrupt singleton as `True` (fail
+    closed) -- the release must never fire against one."""
+    store = SqliteStateStore(store_path)
+    with open_submit_intent_latch(store, store_path):
+        pass
+    store.set(CURRENT_INTENT_KEY, b"not json")
+    store.close()
+
+    strategy = _register_phase1_and_start(
+        store_path=store_path,
+        instruments=(interior_instrument,),
+        position_evidence_reader=lambda: _PERMISSIVE_EVIDENCE,
+    )
+    assert strategy._latch is not None
+    assert strategy._latch.is_intent_open() is True
+    _arm_one_attempt(strategy, ts_ns=WINDOW_OPEN_NS)
+    strategy.on_data(_observation(temp_c_tenths=300, observed_at_ns=WINDOW_OPEN_NS - 1))
+
+    strategy.on_quote_tick(
+        _quote(INTERIOR_ID, ask="0.40", ts_event=WINDOW_OPEN_NS + 1_000 * _S),
+    )
+
+    assert strategy._latch.is_inflight(STATION, CLIMATE_DAY.isoformat()) is True
+    assert strategy._latch.attempt_state(STATION, CLIMATE_DAY.isoformat()) == (1, WINDOW_OPEN_NS)
+
+
+def test_a_release_inside_the_delay_floor_never_happens(
+    store_path: Path, interior_instrument: BinaryOption,
+) -> None:
+    """AC-6: the same-burst race guard -- a tick inside the 120s floor
+    never releases, even with the intent closed."""
+    strategy = _register_phase1_and_start(
+        store_path=store_path,
+        instruments=(interior_instrument,),
+        position_evidence_reader=lambda: _PERMISSIVE_EVIDENCE,
+    )
+    _arm_one_attempt(strategy, ts_ns=WINDOW_OPEN_NS)
+    strategy.on_data(_observation(temp_c_tenths=300, observed_at_ns=WINDOW_OPEN_NS - 1))
+
+    strategy.on_quote_tick(_quote(INTERIOR_ID, ask="0.40", ts_event=WINDOW_OPEN_NS + 1))
+
+    assert strategy.diagnostics.count("inflight_released") == 0
+    assert strategy._latch is not None
+    assert strategy._latch.is_inflight(STATION, CLIMATE_DAY.isoformat()) is True
+    assert strategy._latch.attempt_state(STATION, CLIMATE_DAY.isoformat()) == (1, WINDOW_OPEN_NS)
+
+
+def test_a_released_marker_still_cannot_arm_on_stale_absent_slug_evidence(
+    store_path: Path, interior_instrument: BinaryOption,
+) -> None:
+    """AC-8: the release never bypasses `_rearm_permitted` -- evidence far
+    outside EITHER the pre-HF-4 600s ceiling or HF-4's own 180s re-arm
+    ceiling still denies. Re-run after C3 (still denied, a fortiori)."""
+    evidence_state: dict[str, object] = {"value": _PERMISSIVE_EVIDENCE}
+    strategy = _register_phase1_and_start(
+        store_path=store_path,
+        instruments=(interior_instrument,),
+        position_evidence_reader=lambda: evidence_state["value"],
+    )
+    # Now stale, absent-slug -- the boot walk above already ran (and
+    # passed) against the fresh permissive evidence.
+    evidence_state["value"] = {
+        **_PERMISSIVE_EVIDENCE, "positions": [], "ts_ns": WINDOW_OPEN_NS - 10_000 * _S,
+    }
+    _arm_one_attempt(strategy, ts_ns=WINDOW_OPEN_NS)
+    strategy.on_data(_observation(temp_c_tenths=300, observed_at_ns=WINDOW_OPEN_NS - 1))
+
+    strategy.on_quote_tick(
+        _quote(INTERIOR_ID, ask="0.40", ts_event=WINDOW_OPEN_NS + 120 * _S),
+    )
+
+    assert strategy._latch is not None
+    assert strategy._latch.is_inflight(STATION, CLIMATE_DAY.isoformat()) is False
+    assert strategy._latch.attempt_state(STATION, CLIMATE_DAY.isoformat()) == (1, WINDOW_OPEN_NS)
+    assert len(strategy.offer_tape) == 0
+
+
+def test_a_released_marker_still_cannot_arm_when_nautilus_reports_a_long(
+    store_path: Path, interior_instrument: BinaryOption,
+) -> None:
+    """AC-8, R9: the release never bypasses the Nautilus cross-check --
+    fresh absent-slug evidence still denies when the reconciled portfolio
+    shows a LONG."""
+    evidence = {**_PERMISSIVE_EVIDENCE, "positions": [], "ts_ns": WINDOW_OPEN_NS}
+    strategy = _register_phase1_and_start(
+        store_path=store_path,
+        instruments=(interior_instrument,),
+        position_evidence_reader=lambda: evidence,
+    )
+    fill = _order_filled_for_position(strategy, venue_order_id="ord-hf4-long")
+    position = Position(interior_instrument, fill)
+    strategy.cache.add_position(position, OmsType.NETTING)
+    strategy.portfolio.initialize_positions()
+    _arm_one_attempt(strategy, ts_ns=WINDOW_OPEN_NS)
+    strategy.on_data(_observation(temp_c_tenths=300, observed_at_ns=WINDOW_OPEN_NS - 1))
+
+    strategy.on_quote_tick(
+        _quote(INTERIOR_ID, ask="0.40", ts_event=WINDOW_OPEN_NS + 120 * _S),
+    )
+
+    assert strategy._latch is not None
+    assert strategy._latch.is_inflight(STATION, CLIMATE_DAY.isoformat()) is False
+    assert strategy._latch.attempt_state(STATION, CLIMATE_DAY.isoformat()) == (1, WINDOW_OPEN_NS)
+    assert len(strategy.offer_tape) == 0
+
+
+def test_the_release_and_the_rearm_decision_each_record_exactly_one_decision_line(
+    store_path: Path, interior_instrument: BinaryOption,
+) -> None:
+    """AC-17 (B3): the release and a successful re-arm each emit exactly
+    ONE `rearm:`-prefixed decision line, recorded on `last_rearm_decision`
+    -- asserted on the recorded value, never via log capture (L-27)."""
+    strategy = _register_phase1_and_start(
+        store_path=store_path,
+        instruments=(interior_instrument,),
+        position_evidence_reader=lambda: _PERMISSIVE_EVIDENCE,
+    )
+    emitted: list[str] = []
+    strategy._emit_rearm_decision = emitted.append  # type: ignore[method-assign,assignment]
+    _arm_one_attempt(strategy, ts_ns=WINDOW_OPEN_NS)
+    strategy.on_data(_observation(temp_c_tenths=300, observed_at_ns=WINDOW_OPEN_NS - 1))
+
+    strategy.on_quote_tick(
+        _quote(INTERIOR_ID, ask="0.40", ts_event=WINDOW_OPEN_NS + 120 * _S),
+    )
+
+    assert len(emitted) == 2
+    assert "rearm:" in emitted[0] and "released" in emitted[0]
+    assert "rearm:" in emitted[1] and "re-armed" in emitted[1]
+    assert strategy.last_rearm_decision == emitted[-1]
+
+
+def test_a_consumed_station_day_never_reaches_the_inflight_release(
+    store_path: Path, interior_instrument: BinaryOption,
+) -> None:
+    """AC-7 (N3, mutation-regression authored with C1): `is_consumed` short-
+    circuits `_hunt_tick` BEFORE the release path is ever consulted -- a
+    genuine fill freezes the station-day regardless of any IN_FLIGHT
+    residue. Mutation evidence (commit message): moving the release above
+    `is_consumed` makes this RED; reverted before commit."""
+    strategy = _register_phase1_and_start(
+        store_path=store_path,
+        instruments=(interior_instrument,),
+        position_evidence_reader=lambda: _PERMISSIVE_EVIDENCE,
+    )
+    assert strategy._latch is not None
+    strategy._latch.consume(
+        STATION, CLIMATE_DAY.isoformat(),
+        latched_at_ns=WINDOW_OPEN_NS, instrument_id=str(INTERIOR_ID),
+        ask=Decimal("0.40"), reason="taken",
+    )
+    # A residual IN_FLIGHT marker that should never be consulted.
+    _arm_one_attempt(strategy, ts_ns=WINDOW_OPEN_NS)
+    strategy.on_data(_observation(temp_c_tenths=300, observed_at_ns=WINDOW_OPEN_NS - 1))
+
+    strategy.on_quote_tick(
+        _quote(INTERIOR_ID, ask="0.40", ts_event=WINDOW_OPEN_NS + 120 * _S),
+    )
+
+    assert strategy.diagnostics.count("inflight_released") == 0
+    assert strategy._latch.is_inflight(STATION, CLIMATE_DAY.isoformat()) is True
+    assert strategy._latch.attempt_state(STATION, CLIMATE_DAY.isoformat()) == (1, WINDOW_OPEN_NS)
+    assert len(strategy.offer_tape) == 0
+
+
+def test_a_standing_pre_arm_refusal_burns_three_attempts_and_then_stops_forever(
+    store_path: Path, interior_instrument: BinaryOption,
+) -> None:
+    """N2, AC-3: a standing pre-`arm()` refusal (the real submit-intent
+    flock is never armed by these tests -- `submit_order` is stubbed) burns
+    exactly three attempts, 120s apart, and then stops FOREVER -- a later
+    tick keeps denying, never re-arming a fourth time."""
+    strategy = _register_phase1_and_start(
+        store_path=store_path,
+        instruments=(interior_instrument,),
+        position_evidence_reader=lambda: _PERMISSIVE_EVIDENCE,
+    )
+    assert strategy._latch is not None
+    strategy.on_data(_observation(temp_c_tenths=300, observed_at_ns=WINDOW_OPEN_NS - 1))
+
+    for i in range(3):
+        strategy.on_quote_tick(
+            _quote(INTERIOR_ID, ask="0.40", ts_event=WINDOW_OPEN_NS + i * 120 * _S),
+        )
+        assert strategy._latch.attempt_state(STATION, CLIMATE_DAY.isoformat()) == (
+            i + 1, WINDOW_OPEN_NS + i * 120 * _S,
+        )
+        assert strategy._latch.is_inflight(STATION, CLIMATE_DAY.isoformat()) is True
+
+    # A fourth re-arm-eligible tick: released, then denied forever by the
+    # attempt cap.
+    strategy.on_quote_tick(
+        _quote(INTERIOR_ID, ask="0.40", ts_event=WINDOW_OPEN_NS + 3 * 120 * _S),
+    )
+    assert strategy._latch.is_inflight(STATION, CLIMATE_DAY.isoformat()) is False
+    assert strategy._latch.attempt_state(STATION, CLIMATE_DAY.isoformat()) == (
+        3, WINDOW_OPEN_NS + 2 * 120 * _S,
+    )
+    assert len(strategy.offer_tape) == 3
+
+    # And a fifth, far later: still denied, still no fourth arm.
+    strategy.on_quote_tick(
+        _quote(INTERIOR_ID, ask="0.40", ts_event=WINDOW_OPEN_NS + 10 * 120 * _S),
+    )
+    assert strategy._latch.is_inflight(STATION, CLIMATE_DAY.isoformat()) is False
+    assert strategy._latch.attempt_state(STATION, CLIMATE_DAY.isoformat()) == (
+        3, WINDOW_OPEN_NS + 2 * 120 * _S,
+    )
+    assert len(strategy.offer_tape) == 3
