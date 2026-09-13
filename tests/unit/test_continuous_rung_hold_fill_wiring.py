@@ -846,6 +846,72 @@ def test_rearm_permitted_once_every_gate_clears(
     assert permitted is True
 
 
+# ---------------------------------------------------------------------------
+# HF-4 (post-take re-arm reachability): C3 -- a 180s re-arm evidence
+# ceiling (B4 ii, site 2 only) and a symmetric Nautilus cross-check on the
+# present-row branch (B5, security HIGH).
+# ---------------------------------------------------------------------------
+
+
+def test_rearm_denied_on_a_present_zero_row_when_the_reconciled_portfolio_is_long(
+    store_path: Path, interior_instrument: BinaryOption,
+) -> None:
+    """B5 (security HIGH, HF-4 rev2), AC-10: the present-row branch at site
+    2 is no longer trusted alone once HF-4 makes attempts 2-3 reachable --
+    a page slug listed at "0" must ALSO clear the Nautilus cross-check,
+    symmetric with the absent branch (`test_rearm_denied_when_the_
+    reconciled_portfolio_is_long` above). No existing green test pins this
+    case (the nine pre-HF-4 `_rearm_permitted` tests are :547, 568, 590,
+    625, 770, 785, 800, 815, 834 -- :625 is the ABSENT branch); the site-1
+    analogue (`test_a_present_zero_row_arms_even_when_the_reconciled_
+    portfolio_is_long`, an HF-1 pin) stays green and untouched -- B5 is
+    deliberately site-2 only."""
+    evidence = {
+        **_PERMISSIVE_EVIDENCE,
+        "positions": [{"slug": str(INTERIOR_ID.symbol.value), "net_position": "0"}],
+    }
+    strategy = _register_and_start(
+        store_path=store_path,
+        instruments=(interior_instrument,),
+        position_evidence_reader=lambda: evidence,
+    )
+    fill = _fill(strategy, instrument_id=INTERIOR_ID, venue_order_id="ord-present-zero-long")
+    position = Position(interior_instrument, fill)
+    strategy.cache.add_position(position, OmsType.NETTING)
+    strategy.portfolio.initialize_positions()
+
+    permitted = strategy._rearm_permitted(
+        STATION, CLIMATE_DAY.isoformat(), str(INTERIOR_ID),
+        attempts=1, last_attempt_ns=0, now_ns=10 * 365 * 24 * 3600 * 1_000_000_000,
+    )
+    assert permitted is False
+
+
+def test_a_three_hundred_second_absent_page_denies_rearm_but_still_arms_the_boot_walk(
+    store_path: Path, interior_instrument: BinaryOption,
+) -> None:
+    """B4(ii)/AC-11 (R-9a): one test proving both halves of the split
+    ceiling in one shot -- an absent-slug page aged 300s is fresh under
+    the boot walk's UNCHANGED 600s ceiling (site 1) but stale under the
+    re-arm gate's own NEW 180s ceiling (site 2)."""
+    evidence = {
+        **_PERMISSIVE_EVIDENCE, "positions": [], "ts_ns": WINDOW_OPEN_NS - 300 * 1_000_000_000,
+    }
+    strategy = _register_and_start(
+        store_path=store_path,
+        instruments=(interior_instrument,),
+        position_evidence_reader=lambda: evidence,
+    )
+
+    assert strategy._run_never_arm_walk() is True
+
+    permitted = strategy._rearm_permitted(
+        STATION, CLIMATE_DAY.isoformat(), str(INTERIOR_ID),
+        attempts=1, last_attempt_ns=0, now_ns=10 * 365 * 24 * 3600 * 1_000_000_000,
+    )
+    assert permitted is False
+
+
 def test_a_genuine_fill_freezes_the_attempt_counter(
     store_path: Path, interior_instrument: BinaryOption,
 ) -> None:

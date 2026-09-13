@@ -139,6 +139,17 @@ _MAX_STATION_DAY_ATTEMPTS: Final[int] = 3
 #: pins exactly two operator controls; this is not one of them).
 _STARTUP_EVIDENCE_MAX_AGE_SECS: Final[int] = 600
 _STARTUP_EVIDENCE_MAX_AGE_NS: Final[int] = _STARTUP_EVIDENCE_MAX_AGE_SECS * 1_000_000_000
+#: R-9a (HF-4 rev2, B4 ii): the RE-ARM ceiling, consumed ONLY at
+#: `_rearm_permitted`'s absent-slug branch -- tighter than the 600s boot
+#: ceiling above because attempts 2-3 can echo the resolver's own
+#: misclassification (R14): a re-arm demands fresher evidence than a first
+#: boot does. Coupled to the resolver's own supply side
+#: (`_EVIDENCE_REFRESH_AFTER_NS = 60s`, `exec/client.py`): 120s (the
+#: `_REARM_MIN_DELAY_NS` floor) < 180s (this ceiling) ⇒ a healthy resolver
+#: loop always clears it; a backed-off or dead loop (backoff cap 300s,
+#: `exec/client.py::_RESOLVER_BACKOFF_CAP_SECS`) is denied, fail-closed.
+_REARM_EVIDENCE_MAX_AGE_SECS: Final[int] = 180
+_REARM_EVIDENCE_MAX_AGE_NS: Final[int] = _REARM_EVIDENCE_MAX_AGE_SECS * 1_000_000_000
 
 Trigger = Literal["quote_tick", "on_data", "depth"]
 Source = Literal["quote", "depth"]
@@ -942,13 +953,26 @@ class ContinuousRungHoldStrategy(Strategy):
         # the ceiling (a fail-OPEN, HB7-4).
         if startup_evidence_lists_slug(evidence, slug):
             net_position = startup_evidence_position_for(evidence, slug)
-            return net_position is not None and net_position <= 0
+            # B5 (Rev 2, security HIGH): symmetric with the absent branch
+            # below -- HF-4 makes attempts 2-3 reachable, so the page alone
+            # is no longer sufficient at site 2. Site 1
+            # (`_run_never_arm_walk`) is deliberately left asymmetric: see
+            # the present-row pin at `test_continuous_rung_hold_fill_
+            # wiring.py:720-744` and HF-4.rev2.md Decision 2(iii)/Risk R-J.
+            return (
+                net_position is not None
+                and net_position <= 0
+                and self.portfolio.net_position(InstrumentId.from_str(instrument_id)) <= 0
+            )
         # Option B (HB7-3): same later, independent Nautilus cross-check as
-        # site 1 -- an AND on the arming side only (AC-11/AC-12).
+        # site 1 -- an AND on the arming side only (AC-11/AC-12). B4(ii)
+        # (R-9a): the RE-ARM ceiling (180s) is tighter than the boot-walk's
+        # 600s -- `_STARTUP_EVIDENCE_MAX_AGE_NS` keeps its only OTHER
+        # consumer, site 1 `_run_never_arm_walk`.
         return startup_evidence_confirms_absent_flat(
             evidence, slug,
             now_ns=self.clock.timestamp_ns(),
-            max_age_ns=_STARTUP_EVIDENCE_MAX_AGE_NS,
+            max_age_ns=_REARM_EVIDENCE_MAX_AGE_NS,
         ) and self.portfolio.net_position(InstrumentId.from_str(instrument_id)) <= 0
 
     def on_order_denied(self, event: OrderDenied) -> None:
