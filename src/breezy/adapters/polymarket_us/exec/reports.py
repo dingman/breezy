@@ -156,6 +156,7 @@ from breezy.adapters.polymarket_us.parsing import (
     _assert_representable,
     _build_price,
     _build_quantity,
+    _name_value,
     _parse_amount,
     _to_decimal,
     parse_rfc3339_nanos,
@@ -443,28 +444,118 @@ def _assert_known_keys(
     return mapping
 
 
-def _key_tree(payload: Mapping[str, Any]) -> str:
+#: Sanitiser knobs for :func:`_key_tree` / :func:`_safe_key_name` (SP-2 I0).
+#: ``_KEY_NAME_MAX_CHARS`` mirrors :func:`_name_value`'s own ``limit: int =
+#: 64``. ``_KEY_TREE_MAX_DEPTH`` is schema-derived: the deepest declared
+#: create-order key path is body -> ``executions[]`` -> ``order`` ->
+#: ``marketMetadata`` -> ``team`` (4 levels; ``team`` is ``<opaque>`` anyway).
+#: ``_KEY_TREE_MAX_LIST_ROWS`` bounds how many list rows are rendered before
+#: ``, +N more`` (N counts list ELEMENTS beyond the cap, not unrendered
+#: mappings -- AR-N4). ``_KEY_TREE_OPAQUE_KEYS`` is matched at ANY depth
+#: (AR-N3, chosen globally): ``MarketMetadata.team: dict[str, object]`` is
+#: the one reachable free-form map in the declared shapes, and narrowing the
+#: match to a specific parent context would add a parameter to this
+#: recursive helper for no measured gain -- global matching can only make
+#: MORE content opaque, never less.
+_KEY_NAME_MAX_CHARS: Final[int] = 64
+_KEY_TREE_MAX_DEPTH: Final[int] = 6
+_KEY_TREE_MAX_LIST_ROWS: Final[int] = 8
+_KEY_TREE_OPAQUE_KEYS: Final[frozenset[str]] = frozenset({"team"})
+_DEPTH_CAPPED: Final[str] = "<depth-capped>"
+_OPAQUE: Final[str] = "<opaque>"
+
+
+def _safe_key_name(key: object) -> str:
+    """Render one venue-supplied mapping KEY for a diagnostic, safely.
+
+    ``ascii()`` output always opens and closes with the SAME quote character.
+    The truncated branch slices at ``_KEY_NAME_MAX_CHARS``, which is strictly
+    less than the index of that closing quote, so a GENUINE truncation always
+    leaves the quoted span UNTERMINATED and puts the marker outside it. A key
+    whose own content spells the marker therefore renders inside a CLOSED
+    quote and is distinguishable -- see the marker placement rule on
+    :func:`_key_tree`.
+
+    The marker reports the RAW key length -- what the venue actually sent --
+    not the length of the escaped rendering, so a 512-character key reads
+    "truncated from 512 characters" and not 514 (CX-N1). Where escaping
+    EXPANDS a short key past the cap the reported raw length is smaller than
+    the emitted prefix; that is intended, and the escapes are the tell. The
+    CAP itself is still measured on the rendered ``name``, because the cap
+    bounds what is EMITTED.
+    """
+    raw = str(key)
+    name = ascii(raw)
+    if len(name) <= _KEY_NAME_MAX_CHARS:
+        return name
+    return f"{name[:_KEY_NAME_MAX_CHARS]} (truncated from {len(raw)} characters)"
+
+
+def _key_tree(payload: Mapping[str, Any], *, depth: int = 0) -> str:
     """Names-only structural summary of ``payload``, for a diagnostic message.
 
-    Every level is walked -- a nested mapping is recursed into, a list is
-    summarised as ``key[n]`` with the FIRST element's own key tree appended
-    when that element is itself a mapping -- but no VALUE is ever rendered,
-    at any depth. A diagnostic meant to reveal a whole drifted shape at once
-    must not become a second, log-line leak of the money or PII this module
-    exists to protect.
+    Sanitised and bounded (SP-2 I0, narrowing the names-only invariant): a
+    venue-controlled mapping KEY is treated as a SCHEMA NAME, not as content.
+    Every key name is rendered through :func:`_safe_key_name` (``ascii()``
+    -escaped, quoted, capped at ``_KEY_NAME_MAX_CHARS``); nesting is bounded
+    at ``_KEY_TREE_MAX_DEPTH`` (``<depth-capped>`` beyond it); a list renders
+    up to ``_KEY_TREE_MAX_LIST_ROWS`` mapping rows -- including a row that is
+    not the list's first element (AR-N4; a list with no mapping element at
+    all keeps the plain ``key[n]`` shape) -- then ``, +N more`` counting list
+    ELEMENTS beyond the cap; and any key in ``_KEY_TREE_OPAQUE_KEYS`` renders
+    ``<opaque>`` at ANY depth (see the module constant's docstring).
+
+    No VALUE is ever rendered, at any depth: a diagnostic meant to reveal a
+    whole drifted shape at once must not become a second, log-line leak of
+    the money or PII this module exists to protect. Member KEYS are rendered
+    deliberately -- they are the evidence the tree exists to carry.
+
+    **Marker placement rule (RV3-A13), one of three renderers sharing it:**
+    every AUTHENTIC truncation marker this function's output carries (via
+    :func:`_safe_key_name`) is emitted OUTSIDE the structure it truncates --
+    after a key's closing quote, leaving that quoted span UNTERMINATED. A
+    marker appearing INSIDE a closed quote is venue CONTENT, never a
+    truncation; the discriminator is structural, not a substring match.
+
+    Depth is keyword-only with a default so the sole call site
+    (:func:`_known_keys_with_full_tree`) needs no edit; the depth bound also
+    protects that caller from unbounded recursion on venue-controlled depth
+    (AR-N2) -- ``_safe_key_tree`` in ``submit_chain`` is additional
+    containment for SP-2's own two call sites there, not the sole one.
     """
     parts: list[str] = []
     for key in sorted(payload, key=str):
+        name = _safe_key_name(key)
         value = payload[key]
-        if isinstance(value, Mapping):
-            parts.append(f"{key}: {{{_key_tree(value)}}}")
-        elif isinstance(value, list):
-            if value and isinstance(value[0], Mapping):
-                parts.append(f"{key}[{len(value)}]: {{{_key_tree(value[0])}}}")
+        if isinstance(value, (Mapping, list)) and key in _KEY_TREE_OPAQUE_KEYS:
+            parts.append(f"{name}: {{{_OPAQUE}}}")
+        elif isinstance(value, Mapping):
+            if depth >= _KEY_TREE_MAX_DEPTH:
+                parts.append(f"{name}: {{{_DEPTH_CAPPED}}}")
             else:
-                parts.append(f"{key}[{len(value)}]")
+                parts.append(f"{name}: {{{_key_tree(value, depth=depth + 1)}}}")
+        elif isinstance(value, list):
+            rows = [
+                element
+                for element in value[:_KEY_TREE_MAX_LIST_ROWS]
+                if isinstance(element, Mapping)
+            ]
+            if not rows:
+                parts.append(f"{name}[{len(value)}]")
+            elif depth >= _KEY_TREE_MAX_DEPTH:
+                parts.append(f"{name}[{len(value)}]: {{{_DEPTH_CAPPED}}}")
+            else:
+                rendered = ", ".join(
+                    f"{{{_key_tree(row, depth=depth + 1)}}}" for row in rows
+                )
+                more = (
+                    f", +{len(value) - _KEY_TREE_MAX_LIST_ROWS} more"
+                    if len(value) > _KEY_TREE_MAX_LIST_ROWS
+                    else ""
+                )
+                parts.append(f"{name}[{len(value)}]: {rendered}{more}")
         else:
-            parts.append(str(key))
+            parts.append(name)
     return ", ".join(parts)
 
 
@@ -476,22 +567,6 @@ def _require(payload: Mapping[str, Any], key: str, *, context: str) -> Any:
     "absent is never a default" rule to drift out of.
     """
     return _require_field(payload, key, error=ExecutionReportMappingError, context=context)
-
-
-def _name_value(value: object, *, limit: int = 64) -> str:
-    """Describe a venue-supplied value for diagnosis, without echoing it whole.
-
-    An unrecognised enum member has to be NAMED or the refusal is undebuggable,
-    but the string is venue-controlled and unbounded, and a non-string could be
-    an entire nested payload. So: a short string is quoted verbatim, a long one
-    is truncated with its true length stated, and a non-string is named by TYPE
-    only.
-    """
-    if not isinstance(value, str):
-        return type(value).__name__
-    if len(value) <= limit:
-        return repr(value)
-    return f"{value[:limit]!r} (truncated from {len(value)} characters)"
 
 
 def _require_text(payload: Mapping[str, Any], key: str, *, context: str) -> str:
@@ -1032,6 +1107,12 @@ def parse_fill_report(
     fill, and the order-level average belongs on the order report.
 
     A MAKER fill is REFUSED -- see :func:`_assert_taker_fill`.
+
+    The execution-type refusal below names the offending value through this
+    module's value-safe renderer (:func:`_name_value`), not raw ``!r``,
+    because this message is DURABLE: SP-2's I3 persists it into the resolver
+    context store, and ``_require`` permits ``type`` to be any JSON value, so
+    an unbounded or nested one must never be echoed whole (SEC-H1).
     """
     context = "fill report"
     execution = _known_keys_with_full_tree(
@@ -1039,11 +1120,17 @@ def parse_fill_report(
     )
 
     execution_type = _require(execution, "type", context=context)
-    if execution_type not in _FILL_EXECUTION_TYPES:
+    # I6 (CRITICAL, same class as `submit_chain._fill_type_executions`):
+    # `execution_type` is a bare venue-controlled JSON value, so a direct
+    # caller of this function (not only the create-path pre-filter, which
+    # normally screens `type` first) could hand it a dict/list. `isinstance`
+    # is checked FIRST so the frozenset membership test never sees an
+    # unhashable value.
+    if not (isinstance(execution_type, str) and execution_type in _FILL_EXECUTION_TYPES):
         raise ExecutionReportMappingError(
-            f"{context} carries execution type {execution_type!r}, which is not one of "
-            f"({', '.join(sorted(_FILL_EXECUTION_TYPES))}); refusing to report a trade "
-            "the venue did not report"
+            f"{context} carries execution type {_name_value(execution_type)}, which is not "
+            f"one of ({', '.join(sorted(_FILL_EXECUTION_TYPES))}); refusing to report a "
+            "trade the venue did not report"
         )
 
     order_context = f"{context}.order"

@@ -1877,6 +1877,10 @@ EXEC_ORDER_COROUTINE_PERMITTED_CALLEES = frozenset(
         "PolymarketUSError",
         "record.to_bytes",
         "fill_record_bytes.decode",
+        # A1: writes one key (the venue id -> client order id map) to the
+        # already-open local store; no path, no payload, no socket; no
+        # `await`. Mirrors `self._note_ambiguous_open`'s exemption above.
+        "self.record_venue_order_id",
     }
 )
 
@@ -1959,6 +1963,11 @@ EXEC_RESOLVER_PERMITTED_CALLEES = frozenset(
         "parse_order_status_report",
         "UUID4",
         "report.filled_qty.as_decimal",
+        # B0-d: the resolver's own DurableFillRecord carries `order_qty` from
+        # the venue's echoed ORIGINAL order size -- a different entry from
+        # `report.filled_qty.as_decimal` above (the CUMULATIVE filled size).
+        # Inert attribute-method call on the already-parsed report; no I/O.
+        "report.quantity.as_decimal",
         "self._declared_positions",
         "instrument_id_to_slug",
         "_resolver_long_position_state",
@@ -1979,6 +1988,10 @@ EXEC_RESOLVER_PERMITTED_CALLEES = frozenset(
         "self.record_fill",
         "record.to_bytes",
         "fill_record_bytes.decode",
+        # A1: same exemption as the order-coroutine allowlist above -- one
+        # key to the already-open local store, no path, no payload, no
+        # socket, no `await`. Used by both resolver terminals.
+        "self.record_venue_order_id",
         "self._refuse",
         "self.generate_order_filled",
         "_synthetic_get_fill_trade_id",
@@ -2843,6 +2856,9 @@ def test_the_order_coroutine_callee_allowlist_reaches_no_venue() -> None:
             "PolymarketUSError",
             "record.to_bytes",
             "fill_record_bytes.decode",
+            # A1: writes one key to the already-open local store; no path,
+            # no payload, no socket; no `await`.
+            "self.record_venue_order_id",
         }
     )
     for callee in EXEC_ORDER_COROUTINE_PERMITTED_CALLEES:

@@ -536,6 +536,29 @@ def parse_rfc3339_nanos(
     return seconds * _NANOS_PER_SECOND + nanos
 
 
+def _name_value(value: object, *, limit: int = 64) -> str:
+    """Describe a venue-supplied value for diagnosis, without echoing it whole.
+
+    An unrecognised enum member has to be NAMED or the refusal is undebuggable,
+    but the string is venue-controlled and unbounded, and a non-string could be
+    an entire nested payload. So: a short string is quoted verbatim, a long one
+    is truncated with its true length stated, and a non-string is named by TYPE
+    only.
+
+    I7 (coordinator ruling, SEC-H1 sibling): moved here from ``exec/reports.py``
+    so ``_parse_amount``'s own currency-mismatch message can use it without
+    ``parsing.py`` importing ``exec/reports.py`` (which imports ``parsing.py``
+    already -- an import cycle). Re-exported from ``exec/reports.py`` via a
+    plain import; its output bytes, and every existing caller's exact-string
+    pin, are unchanged by the move.
+    """
+    if not isinstance(value, str):
+        return type(value).__name__
+    if len(value) <= limit:
+        return repr(value)
+    return f"{value[:limit]!r} (truncated from {len(value)} characters)"
+
+
 def _parse_amount(
     value: object, *, field: str, error: type[VenuePayloadError] = VenuePayloadError
 ) -> Decimal:
@@ -545,7 +568,7 @@ def _parse_amount(
     currency = value.get("currency")
     if currency != QUOTE_CURRENCY_CODE:
         raise error(
-            f"Field {field!r} is denominated in {currency!r}, not "
+            f"Field {field!r} is denominated in {_name_value(currency)}, not "
             f"{QUOTE_CURRENCY_CODE!r}; refusing to treat it as a USD amount"
         )
     return _to_decimal(_require(value, "value", error=error), field=f"{field}.value", error=error)

@@ -421,6 +421,17 @@ _FEE_UNRECONCILED: Final[str] = (
     "this client refuses further submits until an operator investigates"
 )
 
+#: A1 -- the venue order id -> client order id map write raised. ONE fixed
+#: reason so `_refuse` dedupes on it (`_refuse` keys on the reason string,
+#: not a per-exception message); the exception detail goes in the ERROR log
+#: line instead, never here -- and that log line is emitted by the A1 block
+#: itself, before `_refuse`, so it is never deduped even when the reason
+#: repeats (Trade-off 3/13).
+_VENUE_ID_MAP_WRITE_FAILED: Final[str] = (
+    "the venue order id -> client order id map write raised; this client "
+    "refuses further submits until an operator investigates"
+)
+
 
 class PrivateRead(Protocol):
     """The injected authenticated read: one GET-shaped call, and nothing else.
@@ -474,6 +485,37 @@ def _optional_venue_fee_raw(raw: object) -> str | None:
     return raw
 
 
+def _optional_trade_id(raw: object) -> str | None:
+    """``tradeId`` is optional-on-read; a present value must be a string.
+
+    ``None`` on a legacy record written before this field existed, or on an
+    absent/null key. A present non-``str`` value is a mapping error, exactly
+    like :func:`_optional_venue_fee_raw`.
+    """
+    if raw is None:
+        return None
+    if not isinstance(raw, str):
+        raise ExecutionReportMappingError(
+            f"a durable fill record is malformed: tradeId must be a string "
+            f"or null, got {type(raw).__name__}"
+        )
+    return raw
+
+
+def _optional_order_qty(raw: object) -> Decimal | None:
+    """``orderQty`` is optional-on-read; a present value must be a finite
+    decimal (S-M1).
+
+    ``None`` on a legacy record written before this field existed, or on an
+    absent/null key -- NEVER inferred from ``cumulative_qty`` and never
+    defaulted to ``Decimal(1)``. A present non-finite value (``"NaN"``,
+    ``"Infinity"``) is refused by :func:`_to_decimal`'s ``is_finite()`` guard.
+    """
+    if raw is None:
+        return None
+    return _to_decimal(raw, field="orderQty", error=ExecutionReportMappingError)
+
+
 @dataclass(frozen=True, kw_only=True)
 class DurableFillRecord:
     """What Breezy actually paid, on disk, CUMULATIVE per venue order.
@@ -511,6 +553,15 @@ class DurableFillRecord:
     fee_reconciled: bool
     ts_event: int
     venue_fee_raw: str | None = None
+    #: B0: an opaque venue-or-synthetic match id (create: the venue's own
+    #: ``Execution.tradeId``; resolver: the self-labelling ``GET-<venue_order_id>``
+    #: synthetic form) -- two provenances under one field, never a
+    #: ``tradeIdSource``. ``None`` on a legacy record (S-M1).
+    trade_id: str | None = None
+    #: B0: the ORIGINAL order size in contracts -- NOT the filled size.
+    #: ``None`` on a legacy record; never inferred from ``cumulative_qty``,
+    #: never defaulted to ``Decimal(1)`` (S-M1).
+    order_qty: Decimal | None = None
 
     def to_bytes(self) -> bytes:
         return json.dumps(
@@ -525,6 +576,8 @@ class DurableFillRecord:
                 "feeReconciled": self.fee_reconciled,
                 "tsEvent": self.ts_event,
                 "venueFeeRaw": self.venue_fee_raw,
+                "tradeId": self.trade_id,
+                "orderQty": None if self.order_qty is None else str(self.order_qty),
             },
             sort_keys=True,
         ).encode("utf-8")
@@ -533,11 +586,12 @@ class DurableFillRecord:
     def from_bytes(cls, raw: bytes) -> Self:
         """Decode a record, refusing anything that is not exactly one.
 
-        Every field is required except ``venueFeeRaw``, which is optional-on-read
-        so pre-GL-2 records still decode (``None``). A present non-string
-        ``venueFeeRaw`` is refused. A partially-decodable record is refused
-        rather than defaulted: a fill record missing its price is not a fill
-        record with a zero price.
+        Every field is required except ``venueFeeRaw``, ``tradeId`` and
+        ``orderQty``, which are optional-on-read so pre-GL-2/pre-B0 records
+        still decode (``None``). A present non-string ``venueFeeRaw``/
+        ``tradeId``, or a present non-finite ``orderQty``, is refused. A
+        partially-decodable record is refused rather than defaulted: a fill
+        record missing its price is not a fill record with a zero price.
         """
         try:
             payload = json.loads(raw)
@@ -580,6 +634,8 @@ class DurableFillRecord:
                 fee_reconciled=_require_bool(payload["feeReconciled"], field="feeReconciled"),
                 ts_event=int(payload["tsEvent"]),
                 venue_fee_raw=_optional_venue_fee_raw(payload.get("venueFeeRaw")),
+                trade_id=_optional_trade_id(payload.get("tradeId")),
+                order_qty=_optional_order_qty(payload.get("orderQty")),
             )
         except (KeyError, TypeError, ValueError, InvalidOperation) as exc:
             raise ExecutionReportMappingError(
@@ -607,6 +663,17 @@ class AmbiguousResolverContext:
     notional_usd: Decimal
     booking_id: int
     created_ns: int
+    # SP-2 I3 (L-37 (2)/(3)): names-only, already capped by the producer
+    # (`submit_chain._capped_diagnostic` / `_detail_tree_token`) -- this
+    # class never truncates. Trailing-optional so an OLD blob (written
+    # before this change) still decodes with both `None` (AR-N6); no
+    # schema version, no migration. AC-19's disqualification rule: a
+    # captured row carrying an AUTHENTIC truncation marker, `<depth-capped>`,
+    # `+N more`, or a `\xNN` escape is incomplete evidence and must not be
+    # used to declare `_EXECUTION_DRIFT_ALLOWED_KEYS` (I4/R-6) -- re-capture,
+    # or raise the cap in a follow-up, never remove it.
+    create_detail: str | None = None
+    fill_parse_error: str | None = None
 
     def to_bytes(self) -> bytes:
         return json.dumps(
@@ -619,6 +686,8 @@ class AmbiguousResolverContext:
                 "notionalUsd": str(self.notional_usd),
                 "bookingId": self.booking_id,
                 "createdNs": self.created_ns,
+                "createDetail": self.create_detail,
+                "fillParseError": self.fill_parse_error,
             },
             sort_keys=True,
         ).encode("utf-8")
@@ -636,6 +705,13 @@ class AmbiguousResolverContext:
                 f"a durable resolver context decoded to a {type(payload).__name__}, "
                 "not an object"
             )
+        # Trailing-optional fields are read OUTSIDE the strict `try` below,
+        # via `.get(...)`, so an old blob that never carried them still
+        # decodes -- `KeyError` there is precisely what must NOT happen.
+        raw_create_detail = payload.get("createDetail")
+        create_detail = None if raw_create_detail is None else str(raw_create_detail)
+        raw_fill_parse_error = payload.get("fillParseError")
+        fill_parse_error = None if raw_fill_parse_error is None else str(raw_fill_parse_error)
         try:
             return cls(
                 intent_id=str(payload["intentId"]),
@@ -650,6 +726,8 @@ class AmbiguousResolverContext:
                 ),
                 booking_id=int(payload["bookingId"]),
                 created_ns=int(payload["createdNs"]),
+                create_detail=create_detail,
+                fill_parse_error=fill_parse_error,
             )
         except (KeyError, TypeError, ValueError, InvalidOperation) as exc:
             raise ExecutionReportMappingError(
@@ -1519,6 +1597,23 @@ class PolymarketUSExecutionClient(LiveExecutionClient):
         if current is None or current.intent_id != context.intent_id:
             self._ambiguous_bookings.pop(context.intent_id, None)
             return
+        # A1-c: backfill for a context written before this change, which
+        # only the resolver will ever see again -- idempotent (same key,
+        # same bytes). OUTSIDE the guard above: `context.venue_order_id`
+        # is a plain str here, always present. No `return` (A-B2): the
+        # retire, true-up and native cancel below must still run.
+        try:
+            self.record_venue_order_id(
+                submit_chain.venue_order_id(context.venue_order_id),
+                ClientOrderId(context.client_order_id),
+            )
+        except Exception as exc:  # noqa: BLE001
+            self._log.error(
+                f"{_VENUE_ID_MAP_WRITE_FAILED}: {exc.__class__.__name__}: {exc}; "
+                f"venue_order_id={context.venue_order_id} "
+                f"client_order_id={context.client_order_id}"
+            )
+            self._refuse(_VENUE_ID_MAP_WRITE_FAILED)
         self._retire(context.intent_id, "STATUS_REPORT_ZERO_FILL_TERMINAL", now_ns)
         booking = self._ambiguous_bookings.pop(context.intent_id, None)
         if booking is not None:
@@ -1615,6 +1710,8 @@ class PolymarketUSExecutionClient(LiveExecutionClient):
             fee_reconciled=False,
             ts_event=now_ns,
             venue_fee_raw=None,
+            trade_id=_synthetic_get_fill_trade_id(context.venue_order_id).value,
+            order_qty=report.quantity.as_decimal(),
         )
         try:
             self.record_fill(record)
@@ -1629,6 +1726,26 @@ class PolymarketUSExecutionClient(LiveExecutionClient):
         booking = self._ambiguous_bookings.pop(context.intent_id, None)
         if booking is not None:
             self._ledger.true_up_booking(booking, filled_cost_usd=cumulative_cost, now_ns=now_ns)
+        # A1-b (B-2): anchored to the indentation of the statement this
+        # block PRECEDES (`_retire`, 8-space function-body indent), NOT the
+        # `true_up_booking` line above -- `_ambiguous_bookings` is
+        # same-process only and EMPTY after a restart, so a block inside
+        # `if booking is not None:` would silently skip the write on
+        # exactly the post-restart reconciliation path this exists to
+        # serve. No `return` (A-B2): `_retire` and `generate_order_filled`
+        # below must still run.
+        try:
+            self.record_venue_order_id(
+                submit_chain.venue_order_id(context.venue_order_id),
+                ClientOrderId(context.client_order_id),
+            )
+        except Exception as exc:  # noqa: BLE001
+            self._log.error(
+                f"{_VENUE_ID_MAP_WRITE_FAILED}: {exc.__class__.__name__}: {exc}; "
+                f"venue_order_id={context.venue_order_id} "
+                f"client_order_id={context.client_order_id}"
+            )
+            self._refuse(_VENUE_ID_MAP_WRITE_FAILED)
         self._retire(context.intent_id, "STATUS_REPORT_ACCEPT_FILL_TERMINAL", now_ns)
         # D2 (plan rev 6.1): a genuine fill surfacing for a venue order this
         # resolver already restored a permit slot for (a superseded
@@ -1949,12 +2066,19 @@ class PolymarketUSExecutionClient(LiveExecutionClient):
     ) -> list[OrderStatusReport]:
         """Empty, and empty for a stated reason.
 
-        The venue's open-order read surface is not declared by R-3's endpoint
-        table, and barrier V2 refuses its path literal inside any
-        venue-touching module with no allowlist. Breezy DOES submit orders
-        (R-7's ``_submit_order``, one per station-day) -- what remains
-        unimplemented is reading THEM BACK by status: this method returns an
-        empty list unconditionally, not because nothing was ever submitted.
+        Returns ``[]`` today. This generator and :meth:`generate_fill_reports`
+        below MUST land together: native reconciliation iterates
+        ``mass_status.order_reports`` and looks its matching fills up BY the
+        venue order id each order report names
+        (``live/execution_engine.py:1880-1881``) -- shipping one without the
+        other reconciles nothing. Gated on ruling **R-1**:
+        :class:`~nautilus_trader.execution.reports.FillReport`'s
+        ``commission`` is a required ``Money`` (``execution/reports.py:667-684``),
+        and the intended source, once R-1 rules, is the ONE durable fill
+        record this session's B0 already writes to disk and the store --
+        never a fresh read of the venue's open-order surface, which R-3's
+        endpoint table does not declare. This docstring makes no promise
+        that B1 will be implemented.
         """
         return []
 
@@ -1964,11 +2088,17 @@ class PolymarketUSExecutionClient(LiveExecutionClient):
     ) -> list[FillReport]:
         """Empty, and empty for a stated reason.
 
-        Fills would come from the portfolio activities surface, which is the
-        evidence source the submit-intent latch needs and the cash source
-        settlement needs. It is read-only and lands with the increment that
-        has something to reconcile against; here there are no fills, because
-        there are no orders.
+        Returns ``[]`` today. Must land TOGETHER with
+        :meth:`generate_order_status_reports` above: reconciliation looks a
+        fill up BY the venue order id an order report names
+        (``live/execution_engine.py:1880-1881``), so shipping this one alone
+        reconciles nothing. Gated on ruling **R-1**:
+        :class:`~nautilus_trader.execution.reports.FillReport`'s
+        ``commission`` is a required ``Money`` (``execution/reports.py:667-684``);
+        the intended source, once R-1 rules, is the durable fill record this
+        session's B0 already writes to disk and the store, never a fresh
+        venue read. This docstring makes no promise that B1 will be
+        implemented.
         """
         return []
 
@@ -2623,6 +2753,8 @@ class PolymarketUSExecutionClient(LiveExecutionClient):
         notional_usd: Decimal,
         booking: Any,
         now_ns: int,
+        create_detail: str | None = None,
+        fill_parse_error: str | None = None,
     ) -> None:
         """Resolution A/E: record durable resolver context for a with-id
         AMBIGUOUS outcome, and hold the live ``SpendBooking`` for
@@ -2630,6 +2762,11 @@ class PolymarketUSExecutionClient(LiveExecutionClient):
         allowlist like :meth:`_deny`/:meth:`_retire` -- writes only to the
         already-open local store and a process-local dict; reaches no
         network.
+
+        SP-2 I3: ``create_detail`` / ``fill_parse_error`` are attribute
+        reads from the caller's already-classified ``outcome`` -- both
+        already capped and names-only by the time they reach here. This
+        method does NOT truncate them again (S-L1).
         """
         context = AmbiguousResolverContext(
             intent_id=intent_id,
@@ -2640,6 +2777,8 @@ class PolymarketUSExecutionClient(LiveExecutionClient):
             notional_usd=notional_usd,
             booking_id=booking.booking_id,
             created_ns=now_ns,
+            create_detail=create_detail,
+            fill_parse_error=fill_parse_error,
         )
         self._store_set(f"{RESOLVER_CONTEXT_KEY_PREFIX}{intent_id}", context.to_bytes())
         self._ambiguous_bookings[intent_id] = booking
@@ -2762,6 +2901,25 @@ class PolymarketUSExecutionClient(LiveExecutionClient):
             # coroutine, not `_log.info`. WARNING is the closest permitted
             # level for a non-AMBIGUOUS classified line.
             self._log.warning(classified_line)
+        if outcome.venue_order_id is not None:
+            # A1: the ONE point all four outcome kinds pass through --
+            # ACCEPT_FILL, ZERO_FILL and a with-id AMBIGUOUS all carry a
+            # venue id here; a REJECT and a no-id AMBIGUOUS do not (AC-2).
+            # Corroborating evidence written AFTER the venue was POSTed:
+            # must refuse and FALL THROUGH on failure, never crash or
+            # short-circuit the dispatch below (A-B2 -- no `return`).
+            try:
+                self.record_venue_order_id(
+                    submit_chain.venue_order_id(outcome.venue_order_id),
+                    order.client_order_id,
+                )
+            except Exception as exc:  # noqa: BLE001
+                self._log.error(
+                    f"{_VENUE_ID_MAP_WRITE_FAILED}: {exc.__class__.__name__}: {exc}; "
+                    f"venue_order_id={outcome.venue_order_id} "
+                    f"client_order_id={order.client_order_id.value}"
+                )
+                self._refuse(_VENUE_ID_MAP_WRITE_FAILED)
         retire_name = outcome.retirement_name
         if (
             outcome.kind == submit_chain.KIND_ACCEPT_FILL
@@ -2801,6 +2959,8 @@ class PolymarketUSExecutionClient(LiveExecutionClient):
                     fee_reconciled=outcome.fee_reconciled,
                     ts_event=fill.ts_event,
                     venue_fee_raw=fill.commission_raw,
+                    trade_id=fill.trade_id.value,
+                    order_qty=submit_chain.order_quantity_decimal(order),
                 )
                 self.record_fill(record)
             except Exception as exc:  # noqa: BLE001 - deliberately broad: this
@@ -2917,6 +3077,8 @@ class PolymarketUSExecutionClient(LiveExecutionClient):
                 notional_usd=submit_chain.order_notional_usd(order),
                 booking=booking,
                 now_ns=now_ns,
+                create_detail=outcome.detail,
+                fill_parse_error=outcome.fill_parse_error,
             )
 
     async def _cancel_order(self, command: CancelOrder) -> None:

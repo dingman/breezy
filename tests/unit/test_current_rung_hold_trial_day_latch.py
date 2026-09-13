@@ -366,6 +366,67 @@ class TestSurvivesRestart:
             assert record.ask == Decimal("0.37")
         reopened.close()
 
+    def test_a_restart_mid_day_cannot_re_arm_an_already_consumed_station_day(
+        self, store_path: Path,
+    ) -> None:
+        """(C2) The MULTI-station aggregate bound (Rev 2 REVISE-4 / §7 R5).
+
+        `test_consume_close_reopen_still_consumed` above already covers the
+        SINGLE-station half; this narrows to what it does not: with TWO
+        distinct station-days consumed for the same climate day, a restart
+        must leave BOTH consumed and refuse to re-arm EITHER. Aggregate
+        daily exposure is bounded by this DURABLE latch, not by
+        `DailySpendLedger` (`operator_controls.py:259-263`: "a restart
+        forgets the day's spending") -- `_MAX_STATION_DAY_ATTEMPTS`
+        (`continuous_strategy.py:125`) has no time dimension of its own
+        either.
+        """
+        second_station = "SFO"
+        store = SqliteStateStore(store_path)
+        with open_submit_intent_latch(store, store_path) as intent_latch:
+            trial_latch = open_trial_day_latch(intent_latch)
+            trial_latch.consume(
+                STATION,
+                CLIMATE_DAY,
+                latched_at_ns=NOW_NS,
+                instrument_id=INSTRUMENT_ID,
+                ask=Decimal("0.37"),
+                reason="taken",
+            )
+            trial_latch.consume(
+                second_station,
+                CLIMATE_DAY,
+                latched_at_ns=NOW_NS,
+                instrument_id=INSTRUMENT_ID,
+                ask=Decimal("0.42"),
+                reason="taken",
+            )
+        store.close()
+
+        reopened = SqliteStateStore(store_path)
+        with open_submit_intent_latch(reopened, store_path) as restarted_intent_latch:
+            restarted_trial_latch = open_trial_day_latch(restarted_intent_latch)
+            assert restarted_trial_latch.is_consumed(STATION, CLIMATE_DAY) is True
+            assert restarted_trial_latch.is_consumed(second_station, CLIMATE_DAY) is True
+
+            re_arm_record = TrialDayRecord(
+                latched_at_ns=NOW_NS,
+                instrument_id=INSTRUMENT_ID,
+                ask=Decimal("0.99"),
+                reason="taken",
+            )
+            assert (
+                restarted_trial_latch.consume_if_absent(STATION, CLIMATE_DAY, re_arm_record)
+                is False
+            )
+            assert (
+                restarted_trial_latch.consume_if_absent(
+                    second_station, CLIMATE_DAY, re_arm_record,
+                )
+                is False
+            )
+        reopened.close()
+
     def test_consume_then_crash_before_arm_leaves_day_consumed_no_intent_open(
         self, store_path: Path
     ) -> None:

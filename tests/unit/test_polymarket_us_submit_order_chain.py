@@ -10,6 +10,7 @@ from __future__ import annotations
 import ast
 import json
 import logging
+import sys
 import threading
 from collections.abc import Iterator, Mapping
 from contextlib import contextmanager
@@ -32,12 +33,15 @@ from nautilus_trader.model.events import OrderDenied, OrderFilled, OrderRejected
 from nautilus_trader.model.identifiers import ClientId, StrategyId, TradeId, TraderId
 from nautilus_trader.model.objects import Money, Price, Quantity
 
-from breezy.adapters.polymarket_us import write_transport
+from breezy.adapters.polymarket_us import parsing, write_transport
+from breezy.adapters.polymarket_us.errors import VenuePayloadError
+from breezy.adapters.polymarket_us.exec import submit_chain
 from breezy.adapters.polymarket_us.exec.client import PolymarketUSExecutionClient
 from breezy.adapters.polymarket_us.exec.endpoints import (
     ACCOUNT_BALANCES_PATH,
     PORTFOLIO_POSITIONS_PATH,
 )
+from breezy.adapters.polymarket_us.exec.reports import parse_fill_report
 from breezy.adapters.polymarket_us.exec.submit_chain import (
     KIND_ACCEPT_FILL,
     KIND_AMBIGUOUS,
@@ -995,6 +999,11 @@ async def test_a_sub_cent_venue_fee_is_booked_as_bankers_zero_with_raw_audit(
     assert len(records) == 1
     assert records[0].venue_fee_raw == "0.004"
     assert records[0].cumulative_fee == Decimal("0.004")
+    # I5(b), AR-N8: `_durable_accept_body` leaves `commissionNotionalTotal
+    # Collected` absent, so `_cumulative_fee_and_reconciliation` takes the
+    # absent-total branch (`:630`) and reconciles the fee, even though the
+    # fee itself books as bankers-zero on the native `Money`.
+    assert records[0].fee_reconciled is True
 
 
 @pytest.mark.asyncio
@@ -1467,9 +1476,13 @@ def test_every_classified_kind_sets_body_kind_and_body_len() -> None:
     durable_response = VenueResponse(status=200, headers={}, body=durable_body)
     durable_outcome = classify_create_order_outcome(durable_response, **classify_kw)
     assert durable_outcome.kind == KIND_ACCEPT_FILL
+    # SP-2 I2: `executions-present` now also carries a names-only,
+    # sanitised body key tree (T3 -- a SUCCESSFUL fill is captured too).
+    durable_payload = json.loads(durable_body)
     assert durable_outcome.detail == (
         f"status=200 body_kind=executions-present rpc_code=none "
         f"body_len={len(durable_body)} state=absent cum=absent"
+        f"{submit_chain._detail_tree_token(durable_payload)}"
     )
 
     unexpected_body = json.dumps({"not": "an-order"}).encode()
@@ -1863,3 +1876,443 @@ def test_i1a_reject_and_zero_fill_outcomes_carry_no_cumulative_totals() -> None:
     assert zero_outcome.cumulative_cost is None
     assert zero_outcome.cumulative_fee is None
     assert zero_outcome.fee_reconciled is False
+
+
+# ---------------------------------------------------------------------------
+# SP-2 I1 -- a swallowed underivable filled cost becomes loud (H1)
+# ---------------------------------------------------------------------------
+
+
+def test_an_underivable_filled_cost_names_every_cost_field_without_a_value() -> None:
+    """AC-8: the message names all four candidate fields with a closed-set
+    token each (absent/present/unparseable) plus the execution's own
+    sanitised key tree -- never a value."""
+    order_present: dict[str, Any] = {
+        "id": "ord-1",
+        "avgPx": {"value": "0.41", "currency": "USD"},
+        "cumQuantity": "1",
+    }
+    execution_present: dict[str, Any] = {
+        "order": order_present,
+        "lastPx": {"value": "0.41", "currency": "USD"},
+        "lastShares": "1",
+        "secretField": "SECRET_VALUE",
+    }
+
+    message = submit_chain._underivable_cost_message(execution_present)
+
+    assert "order.avgPx=present" in message
+    assert "order.cumQuantity=present" in message
+    assert "lastPx=present" in message
+    assert "lastShares=present" in message
+    assert "0.41" not in message
+    assert "SECRET_VALUE" not in message
+    assert "secretField" in message
+
+    order_absent: dict[str, Any] = {"id": "ord-2"}
+    execution_absent: dict[str, Any] = {"order": order_absent}
+
+    absent_message = submit_chain._underivable_cost_message(execution_absent)
+
+    assert "order.avgPx=absent" in absent_message
+    assert "order.cumQuantity=absent" in absent_message
+    assert "lastPx=absent" in absent_message
+    assert "lastShares=absent" in absent_message
+
+    order_bad: dict[str, Any] = {
+        "id": "ord-3",
+        "avgPx": {"value": "not-a-number", "currency": "USD"},
+        "cumQuantity": "nope",
+    }
+    execution_bad: dict[str, Any] = {
+        "order": order_bad,
+        "lastPx": {"value": "still-bad", "currency": "USD"},
+        "lastShares": "nope",
+    }
+
+    bad_message = submit_chain._underivable_cost_message(execution_bad)
+
+    assert "order.avgPx=unparseable" in bad_message
+    assert "order.cumQuantity=unparseable" in bad_message
+    assert "lastPx=unparseable" in bad_message
+    assert "lastShares=unparseable" in bad_message
+
+
+def test_fill_generation_records_an_error_when_the_filled_cost_cannot_be_derived(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """RV2.1-A2/A3: the H1 swallow is loud. In-process perturbation of
+    `_filled_cost_from_execution` -- the branch is otherwise unconstructible
+    in life (T1; see the characterisation test below)."""
+    slug = str(build_instrument().raw_symbol)
+    order = _i1a_order(slug, cum_quantity="1", avg_px="0.41", commission_total=None)
+    execution = _i1a_leg(
+        order,
+        exec_id="exe-1",
+        trade_id="trd-1",
+        last_shares="1",
+        last_px="0.41",
+        commission="0.03",
+    )
+    monkeypatch.setattr(submit_chain, "_filled_cost_from_execution", lambda _e: None)
+    errors: list[str] = []
+
+    result = fill_generation(
+        execution,
+        instrument=build_instrument(),
+        account_id=ACCOUNT_ID,
+        ts_init=TS_INIT,
+        errors=errors,
+    )
+
+    assert result is None
+    assert len(errors) == 1
+    assert "lastPx=" in errors[0]
+    assert "0.41" not in errors[0]
+
+
+def test_a_body_whose_filled_cost_is_underivable_stays_ambiguous_with_a_fill_parse_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Same perturbation, through the classify chain: KIND_AMBIGUOUS with a
+    names-only `fill_parse_error`, never a value."""
+    slug = str(build_instrument().raw_symbol)
+    order = _i1a_order(slug, cum_quantity="1", avg_px="0.41", commission_total=None)
+    leg = _i1a_leg(
+        order,
+        exec_id="exe-1",
+        trade_id="trd-1",
+        last_shares="1",
+        last_px="0.41",
+        commission="0.03",
+    )
+    monkeypatch.setattr(submit_chain, "_filled_cost_from_execution", lambda _e: None)
+
+    outcome = _classify_i1a([leg])
+
+    assert outcome.kind == KIND_AMBIGUOUS
+    assert outcome.fill is None
+    assert outcome.fill_parse_error is not None
+    assert "lastPx=" in outcome.fill_parse_error
+    assert "0.41" not in outcome.fill_parse_error
+
+
+def test_a_leg_that_maps_cleanly_always_yields_a_derivable_filled_cost(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """CHARACTERISATION (T1). Round-1's probe found no real counter-example
+    -- do not try to build a fixture that maps cleanly yet lacks a derivable
+    cost, it does not exist, because `parse_fill_report`'s own amount
+    parsing is strictly stronger than `_filled_cost_from_execution`'s. This
+    in-process perturbation of `parsing._to_decimal` (never
+    `reports._to_decimal`, which this path does not reach -- Codex probe
+    (i)) is the evidentiary anchor: it PROVES the swallow at I1 would be
+    reachable if this coupling ever broke, without weakening
+    `parse_fill_report` on disk (`git diff --stat src/` stays empty: the
+    perturbation is reverted automatically by the `monkeypatch` fixture).
+
+    Order-level ``avgPx``/``cumQuantity`` are ABSENT (unlike the other I1
+    fixtures): `_filled_cost_from_execution` checks those FIRST and would
+    otherwise short-circuit before ever looking at `lastPx`, masking the
+    exact coupling this test exists to pin.
+    """
+    slug = str(build_instrument().raw_symbol)
+    order = _i1a_order(slug, cum_quantity=None, avg_px=None, commission_total=None)
+    execution = {
+        **_i1a_leg(
+            order,
+            exec_id="exe-1",
+            trade_id="trd-1",
+            last_shares="1",
+            last_px="0.41",
+            commission="0.03",
+        ),
+        "lastPx": {"value": {"nested": 1}, "currency": "USD"},
+    }
+
+    # Baseline: today this fixture fails to MAP at all -- it never reaches
+    # the underivable-cost branch, because the mapper's own amount parsing
+    # refuses the nested `value` before `_filled_cost_from_execution` is
+    # ever consulted.
+    errors: list[str] = []
+    baseline = fill_generation(
+        execution,
+        instrument=build_instrument(),
+        account_id=ACCOUNT_ID,
+        ts_init=TS_INIT,
+        errors=errors,
+    )
+    assert baseline is None
+    assert len(errors) == 1
+    assert "no filled cost is derivable" not in errors[0]
+
+    real_to_decimal = parsing._to_decimal
+
+    def _stub_to_decimal(
+        value: object, *, field: str, error: type[VenuePayloadError]
+    ) -> Decimal:
+        if isinstance(value, Mapping):
+            return Decimal("0.41")
+        return real_to_decimal(value, field=field, error=error)
+
+    monkeypatch.setattr(parsing, "_to_decimal", _stub_to_decimal)
+
+    report = parse_fill_report(
+        execution,
+        instrument=build_instrument(),
+        account_id=ACCOUNT_ID,
+        report_id=UUID4(),
+        ts_init=TS_INIT,
+    )
+    assert report is not None  # mapping now succeeds, under the perturbation
+
+    # RED (if this coupling ever breaks live): a leg that maps cleanly, yet
+    # whose cost this module's OWN, independent decimal parsing cannot
+    # derive.
+    filled_cost = submit_chain._filled_cost_from_execution(execution)
+    assert filled_cost is None
+
+
+def test_a_fill_parse_error_is_capped_at_birth() -> None:
+    """AC-9: `_capped_diagnostic` caps a string once, at birth, with the
+    truncation marker OUTSIDE the capped span (RV3-A13); a message within
+    the cap is returned unchanged."""
+    huge = "x" * (submit_chain._DETAIL_TREE_MAX_CHARS + 500)
+
+    capped = submit_chain._capped_diagnostic(huge)
+
+    assert capped.startswith("x" * submit_chain._DETAIL_TREE_MAX_CHARS)
+    assert capped.endswith(f"(truncated from {len(huge)} characters)")
+    assert len(capped) < len(huge)
+
+    small = "a short mapping refusal"
+    assert submit_chain._capped_diagnostic(small) == small
+
+    # End to end: a wide, deeply-drifted execution would otherwise produce
+    # an unbounded mapping-refusal message (its own key tree included); the
+    # sink still receives a capped string.
+    slug = str(build_instrument().raw_symbol)
+    order = _i1a_order(slug, cum_quantity="1", avg_px="0.41", commission_total=None)
+    execution = _i1a_leg(
+        order,
+        exec_id="exe-1",
+        trade_id="trd-1",
+        last_shares="1",
+        last_px="0.41",
+        commission="0.03",
+    )
+    for i in range(2000):
+        execution[f"driftField{i}"] = f"value{i}"
+    errors: list[str] = []
+
+    result = fill_generation(
+        execution,
+        instrument=build_instrument(),
+        account_id=ACCOUNT_ID,
+        ts_init=TS_INIT,
+        errors=errors,
+    )
+
+    assert result is None
+    assert len(errors) == 1
+    assert len(errors[0]) <= submit_chain._DETAIL_TREE_MAX_CHARS + 60
+
+
+# ---------------------------------------------------------------------------
+# SP-2 I2 -- `_body_detail` emits a capped body key tree on
+# `executions-present` only (H2)
+# ---------------------------------------------------------------------------
+
+
+def test_an_executions_present_body_with_no_selectable_leg_still_reports_the_body_key_tree() -> (
+    None
+):
+    """H2: even when NO leg is selectable (a cancel acknowledgement, say),
+    the body's own key tree is visible in `detail` -- key NAME present,
+    VALUE absent."""
+    slug = str(build_instrument().raw_symbol)
+    order = build_order(slug)
+    non_fill_execution = build_execution(order)
+    non_fill_execution["type"] = "EXECUTION_TYPE_CANCELED"
+    non_fill_execution["unicornDriftField"] = "SECRET_VALUE_77"
+    body = json.dumps({"id": order["id"], "executions": [non_fill_execution]}).encode("utf-8")
+    response = VenueResponse(status=200, headers={}, body=body)
+
+    outcome = classify_create_order_outcome(
+        response,
+        instrument=build_instrument(),
+        account_id=ACCOUNT_ID,
+        ts_init=TS_INIT,
+    )
+
+    assert outcome.kind == KIND_AMBIGUOUS
+    assert outcome.detail is not None
+    assert "tree=" in outcome.detail
+    assert "unicornDriftField" in outcome.detail
+    assert "SECRET_VALUE_77" not in outcome.detail
+
+
+def test_the_body_key_tree_token_is_capped_and_declares_its_truncation() -> None:
+    """AC-9 + RV3-A13 (AM-6): the tree token is capped once, at
+    `_DETAIL_TREE_MAX_CHARS`, with the marker OUTSIDE the closing brace --
+    even when the 2048-char slice lands mid-key inside an already
+    per-key-truncated name, producing TWO authentic, non-forged
+    truncations (both disqualifying under AC-19, never forgery)."""
+    huge_payload: dict[str, Any] = {f"driftField{i}" + "y" * 100: "value" for i in range(60)}
+
+    token = submit_chain._detail_tree_token(huge_payload)
+    full_tree = submit_chain._safe_key_tree(huge_payload)
+    assert len(full_tree) > submit_chain._DETAIL_TREE_MAX_CHARS
+
+    marker = f" (truncated from {len(full_tree)} characters)"
+    assert token.startswith(" tree={")
+    assert token.endswith(marker)
+    pre_marker = token[: -len(marker)]
+    assert pre_marker.endswith("}")
+    # I8(b): the 2048-char slice lands well past several already
+    # per-key-truncated names (each raw key here is >64 chars), so the
+    # sliced tree itself still carries at least one INNER, per-key
+    # truncation marker -- a SECOND, authentic truncation, distinct from
+    # the outer tree-level one just asserted above (AM-6).
+    assert "(truncated from" in pre_marker
+
+
+def test_body_detail_tree_token_appears_only_on_executions_present() -> None:
+    """AC-11: `tree=` appears ONLY on `executions-present`; every other
+    body_kind's detail carries no tree token at all."""
+    instrument = build_instrument()
+    classify_kw = {
+        "instrument": instrument,
+        "account_id": ACCOUNT_ID,
+        "ts_init": TS_INIT,
+    }
+
+    unparseable = VenueResponse(status=200, headers={}, body=b"not json")
+    unparseable_detail = classify_create_order_outcome(unparseable, **classify_kw).detail
+    assert unparseable_detail is not None
+    assert "tree=" not in unparseable_detail
+
+    reject_response = VenueResponse(status=400, headers={}, body=_status_reject_body())
+    reject_detail = classify_create_order_outcome(reject_response, **classify_kw).detail
+    assert reject_detail is not None
+    assert "tree=" not in reject_detail
+
+    empty_exec_body = json.dumps({"id": "ord-amb", "executions": []}).encode()
+    empty_exec_response = VenueResponse(status=200, headers={}, body=empty_exec_body)
+    empty_exec_detail = classify_create_order_outcome(empty_exec_response, **classify_kw).detail
+    assert empty_exec_detail is not None
+    assert "tree=" not in empty_exec_detail
+
+    unexpected_body = json.dumps({"not": "an-order"}).encode()
+    unexpected_response = VenueResponse(status=200, headers={}, body=unexpected_body)
+    unexpected_detail = classify_create_order_outcome(unexpected_response, **classify_kw).detail
+    assert unexpected_detail is not None
+    assert "tree=" not in unexpected_detail
+
+    durable_body = _durable_accept_body(str(instrument.raw_symbol))
+    durable_response = VenueResponse(status=200, headers={}, body=durable_body)
+    durable_detail = classify_create_order_outcome(durable_response, **classify_kw).detail
+    assert durable_detail is not None
+    assert "tree=" in durable_detail
+
+
+def test_a_recursion_error_in_the_key_tree_is_contained_in_the_detail(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """AR-N2: `_safe_key_tree` is belt-and-braces containment for this
+    module's own two call sites -- proven by perturbing `_key_tree` to
+    raise, never by pretending the depth bound itself fails."""
+
+    def _raises(payload: Mapping[str, Any], **_: Any) -> str:
+        raise RecursionError("forced for the test")
+
+    monkeypatch.setattr(submit_chain, "_key_tree", _raises)
+
+    slug = str(build_instrument().raw_symbol)
+    durable_body = _durable_accept_body(slug)
+    durable_response = VenueResponse(status=200, headers={}, body=durable_body)
+
+    outcome = classify_create_order_outcome(
+        durable_response,
+        instrument=build_instrument(),
+        account_id=ACCOUNT_ID,
+        ts_init=TS_INIT,
+    )
+
+    assert outcome.kind == KIND_ACCEPT_FILL
+    assert outcome.detail is not None
+    assert "<tree unavailable: nesting exceeded>" in outcome.detail
+
+
+# ---------------------------------------------------------------------------
+# SP-2 I2b -- a body too deep for the JSON parser classifies as
+# `unparseable` instead of escaping `_submit_order` (AR-N1)
+# ---------------------------------------------------------------------------
+
+
+def test_a_body_too_deep_to_parse_classifies_as_unparseable_instead_of_raising() -> None:
+    """AR-N1: a body whose nesting exhausts the JSON parser classifies like
+    any other unreadable body -- refused, never accepted, and never
+    allowed to escape `_submit_order` (`client.py:2748` is not inside a
+    `try`). AM-7: built by string multiplication, never a recursive
+    builder, so constructing the fixture itself never raises.
+
+    `N = sys.getrecursionlimit() * 20`, not the reference `* 3`: measured
+    on this interpreter (CPython 3.13, C-accelerated `_json.Scanner`),
+    `* 3` (3,000) parses cleanly with no error at all -- the C scanner's
+    own nesting threshold sits above the pure-Python recursion limit.
+    `* 20` (20,000) is confirmed, in isolation, to raise `RecursionError`
+    reliably and near-instantly, comfortably below any C-stack-exhaustion
+    risk. Raising the multiplier rather than asserting a specific limit is
+    explicitly anticipated (SP-2.rev3.md Confidence Self-Assessment,
+    unknown 6).
+    """
+    depth = sys.getrecursionlimit() * 20
+    deep_body = b"[" * depth + b"]" * depth
+
+    assert submit_chain._parse_json_object(deep_body) is None
+
+    response = VenueResponse(status=200, headers={}, body=deep_body)
+    outcome = classify_create_order_outcome(
+        response,
+        instrument=build_instrument(),
+        account_id=ACCOUNT_ID,
+        ts_init=TS_INIT,
+    )
+
+    assert outcome.kind == KIND_AMBIGUOUS
+    assert outcome.detail is not None
+    assert "body_kind=unparseable" in outcome.detail
+
+
+# ---------------------------------------------------------------------------
+# I6 (CRITICAL, security-reviewer BLOCK) -- a non-hashable execution type
+# is not a fill leg, never a crash
+# ---------------------------------------------------------------------------
+
+
+def test_a_non_hashable_execution_type_is_not_a_fill_leg_never_a_crash() -> None:
+    """I6: `_fill_type_executions`'s `item.get("type") in _FILL_EXECUTION_TYPES`
+    membership test raises `TypeError: unhashable type` unguarded when a
+    venue row's `type` is a dict/list, escaping `classify_create_order_
+    outcome` -> `_submit_order` with no refusal and no log -- the L-37/
+    AR-N1 class I2b exists to close. A row like this is not a fill leg (its
+    type is not a fill type by construction); it classifies like any other
+    no-selectable-leg executions-present body, never crashes."""
+    slug = str(build_instrument().raw_symbol)
+    order = build_order(slug)
+    weird_execution = build_execution(order)
+    weird_execution["type"] = {"nested": 1}
+    body = json.dumps({"id": order["id"], "executions": [weird_execution]}).encode("utf-8")
+    response = VenueResponse(status=200, headers={}, body=body)
+
+    outcome = classify_create_order_outcome(
+        response,
+        instrument=build_instrument(),
+        account_id=ACCOUNT_ID,
+        ts_init=TS_INIT,
+    )
+
+    assert outcome.kind == KIND_AMBIGUOUS
+    assert outcome.detail is not None
+    assert "tree=" in outcome.detail

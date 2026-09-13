@@ -5,13 +5,18 @@ artefact)": ``(instrument_id, fill_ts_event, first_eof_read_ts_showing_long,
 delta_ns)``, "emitted by the resolver whenever a GET-FILLED is later
 confirmed on the book."
 
-**Phase 0b ships ONLY this record type.** The emission plumbing belongs on
-the ambiguous-intent resolver (``_resolve_ambiguous_intents``), which the
-same plan places in Phase 1, gated on the live positions read
-(``read_startup_position_evidence``, "Never-arm gate" section) -- neither
-exists in ``src/`` yet (grep confirms zero hits for both names). Wiring this
-record into a resolver that has not been built would be speculative; this
-module has zero producers by design.
+**Phase 0b ships ONLY this record type; it has zero producers by design.**
+Nothing in ``src/`` constructs one yet -- ``continuous_strategy.py`` only
+comments on it (a docstring note naming it, never an instantiation).
+Where the emission plumbing should be wired is an OPEN ruling, not decided
+here: ``docs/core/PROGRESS.md`` R-7 recommends "keep and wire on the
+create path later, never on the resolver path (``ts_event`` is poll
+cadence)". This module adopts neither placement and decides nothing about
+R-7; it defines only the record shape the eventual producer, wherever it
+lands, will emit. Both ``_resolve_ambiguous_intents`` and
+``read_startup_position_evidence`` already exist
+(``adapters/polymarket_us/exec/client.py``) -- their absence is not, and
+was never, what gates this.
 
 **Deliberately NOT under ``adapters/polymarket_us/exec/``.** That package is
 a closed, egress-scanned set (``tests/unit/test_execution_egress_firewall_

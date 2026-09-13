@@ -44,6 +44,7 @@ from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from decimal import Decimal
 from pathlib import Path
+from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any, Final
 
 import pytest
@@ -96,7 +97,9 @@ from breezy.adapters.polymarket_us.exec import submit_chain
 from breezy.adapters.polymarket_us.exec.client import (
     FILL_INDEX_KEY_PREFIX,
     FILL_KEY_PREFIX,
+    RESOLVER_CONTEXT_KEY_PREFIX,
     VENUE_ORDER_ID_KEY_PREFIX,
+    AmbiguousResolverContext,
     DurableFillRecord,
     PolymarketUSExecutionClient,
     PrivateRead,
@@ -623,17 +626,16 @@ def test_refuse_producer_count_stays_pinned_at_twenty_seven() -> None:
     (LIVE_FILL_SCORING_CHAIN_2026-09-05). Widened AGAIN old(29) -> new(30) by
     slice 3 (plan rev 6.1): `_resolve_accept_fill`'s own
     `self._refuse(_FILL_WRITE_FAILED)`, mirroring `_submit_order`'s identical
-    fail-closed guard around its own `record_fill` call. Never relaxed, only
-    widened (L-12).
+    fail-closed guard around its own `record_fill` call. Widened AGAIN
+    old(30) -> new(33) by A1 (SP-3): three new fail-closed venue-id
+    map-write refusals (`_submit_order`'s new site plus one each in
+    `_resolve_accept_fill` and `_resolve_terminal_zero`). Never relaxed,
+    only widened (L-12).
 
     The authoritative, triaged inventory is
-    `tests/unit/test_exec_refusal_health_surface.py::REFUSAL_PRODUCERS`; this
-    is the cheap local pin that catches a moved count without importing that
-    module's internals. **That module is outside this increment's edit
-    surface and now needs its own triage update** (its exact-set pin and
-    `test_planting_a_twenty_sixth_refusal_breaks_the_pin`'s magic numbers)
-    to add `_submit_order#3`/`_submit_order#4` -- reported, not silently
-    left red.
+    `tests/unit/test_exec_refusal_health_surface.py::REFUSAL_PRODUCERS`,
+    updated in the SAME commit as this pin; this is the cheap local pin
+    that catches a moved count without importing that module's internals.
     """
     source = Path(client_module.__file__).read_text(encoding="utf-8")
     tree = ast.parse(source)
@@ -646,7 +648,7 @@ def test_refuse_producer_count_stays_pinned_at_twenty_seven() -> None:
         and isinstance(node.func.value, ast.Name)
         and node.func.value.id == "self"
     )
-    assert count == 30
+    assert count == 33
 
 
 @pytest.mark.asyncio
@@ -1451,20 +1453,26 @@ def _raw_record(
     cumulative_cost: str = "0.37",
     cumulative_fee: str = "0.00",
     fee_reconciled: bool = True,
+    **extra: Any,
 ) -> bytes:
-    return json.dumps(
-        {
-            "venueOrderId": "V-1",
-            "clientOrderId": "O-19700101-000000-001-001-1",
-            "instrumentId": "some-instrument",
-            "orderSide": "BUY",
-            "cumulativeQty": cumulative_qty,
-            "cumulativeCost": cumulative_cost,
-            "cumulativeFee": cumulative_fee,
-            "feeReconciled": fee_reconciled,
-            "tsEvent": TS_INIT,
-        },
-    ).encode("utf-8")
+    """A legacy-shaped record: neither ``tradeId`` nor ``orderQty`` is a key
+    here by default (B0, S-M1) -- exactly the shape of every record written
+    before this change, ``venueFeeRaw`` included. ``**extra`` lets a caller
+    add or override a key (e.g. a malformed ``orderQty``/``tradeId``) without
+    a second fixture."""
+    payload: dict[str, Any] = {
+        "venueOrderId": "V-1",
+        "clientOrderId": "O-19700101-000000-001-001-1",
+        "instrumentId": "some-instrument",
+        "orderSide": "BUY",
+        "cumulativeQty": cumulative_qty,
+        "cumulativeCost": cumulative_cost,
+        "cumulativeFee": cumulative_fee,
+        "feeReconciled": fee_reconciled,
+        "tsEvent": TS_INIT,
+    }
+    payload.update(extra)
+    return json.dumps(payload).encode("utf-8")
 
 
 @pytest.mark.parametrize(
@@ -2260,6 +2268,35 @@ async def test_the_durable_record_decodes_with_the_venue_fee_and_the_reconciled_
     assert record.fee_reconciled is True
 
 
+# (b2) B0-c: the create-path record carries the venue's own tradeId and the
+# ORIGINAL order size -- never the filled size (create-path size is always
+# exactly 1, Units correction).
+@pytest.mark.asyncio
+async def test_an_accept_fill_persists_the_venue_trade_id_and_the_original_order_qty(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    write_canonical_verified: None,  # noqa: F811
+) -> None:
+    sender = _FakeOrderSender()
+    rig = _build_accept_fill_rig(tmp_path, monkeypatch=monkeypatch, sender=sender)
+    slug = _slug(rig.instrument)
+    sender.response = VenueResponse(
+        status=200,
+        headers={},
+        body=_accept_fill_body(slug, order_id="ord-i1b-tradeid"),
+    )
+
+    with _accept_fill_caps():
+        await rig.client._connect()
+        await rig.client._submit_order(rig.limit_buy())
+        await rig.client._disconnect()
+
+    record = _reopened_fill_record(rig.store_path, "ord-i1b-tradeid")
+    assert record is not None
+    assert record.trade_id == "trd-902"  # `build_execution`'s default tradeId
+    assert record.order_qty == Decimal(1)
+
+
 # (c) FAILURE PATH -- `record_fill` raises.
 @pytest.mark.asyncio
 async def test_a_raising_record_fill_refuses_but_still_publishes_both_events(
@@ -2385,6 +2422,151 @@ async def test_a_reject_writes_no_durable_record(
         await rig.client._disconnect()
 
 
+# ---------------------------------------------------------------------------
+# A1: the venue order id -> client order id map, written at the one point
+# ALL FOUR create-order outcome kinds pass through.
+# ---------------------------------------------------------------------------
+
+
+def _ambiguous_with_id_body(order_id: str) -> bytes:
+    """L-36: 200 + id + `executions == []` with no terminal state/cumQuantity
+    -- falls through to `KIND_AMBIGUOUS` with `venue_order_id=order_id`."""
+    return json.dumps({"id": order_id, "executions": []}).encode("utf-8")
+
+
+@pytest.mark.asyncio
+async def test_an_accept_fill_records_the_venue_id_map(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    write_canonical_verified: None,  # noqa: F811
+) -> None:
+    sender = _FakeOrderSender()
+    rig = _build_accept_fill_rig(tmp_path, monkeypatch=monkeypatch, sender=sender)
+    slug = _slug(rig.instrument)
+    sender.response = VenueResponse(
+        status=200, headers={}, body=_accept_fill_body(slug, order_id="ord-a1-accept"),
+    )
+    order = rig.limit_buy()
+
+    with _accept_fill_caps():
+        await rig.client._connect()
+        await rig.client._submit_order(order)
+        assert (
+            rig.client.client_order_id_for(VenueOrderId("ord-a1-accept"))
+            == order.order.client_order_id
+        )
+        await rig.client._disconnect()
+
+
+@pytest.mark.asyncio
+async def test_a_zero_fill_records_the_venue_id_map(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    write_canonical_verified: None,  # noqa: F811
+) -> None:
+    """Rev 2 acceptance #1, load-bearing: `KIND_ZERO_FILL` `return`s BEFORE
+    the old AMBIGUOUS-fallthrough anchor, so a written row here proves the
+    call site is genuinely pre-dispatch, not a re-citation of a line number."""
+    sender = _FakeOrderSender()
+    rig = _build_accept_fill_rig(tmp_path, monkeypatch=monkeypatch, sender=sender)
+    sender.response = VenueResponse(
+        status=200, headers={}, body=_zero_fill_body(order_id="ord-a1-zero"),
+    )
+    order = rig.limit_buy()
+
+    with _accept_fill_caps():
+        await rig.client._connect()
+        await rig.client._submit_order(order)
+        assert (
+            rig.client.client_order_id_for(VenueOrderId("ord-a1-zero"))
+            == order.order.client_order_id
+        )
+        await rig.client._disconnect()
+
+
+@pytest.mark.asyncio
+async def test_an_ambiguous_with_id_records_the_venue_id_map(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    write_canonical_verified: None,  # noqa: F811
+) -> None:
+    sender = _FakeOrderSender()
+    rig = _build_accept_fill_rig(tmp_path, monkeypatch=monkeypatch, sender=sender)
+    sender.response = VenueResponse(
+        status=200, headers={}, body=_ambiguous_with_id_body("ord-a1-ambiguous"),
+    )
+    order = rig.limit_buy()
+
+    with _accept_fill_caps():
+        await rig.client._connect()
+        await rig.client._submit_order(order)
+        assert (
+            rig.client.client_order_id_for(VenueOrderId("ord-a1-ambiguous"))
+            == order.order.client_order_id
+        )
+        await rig.client._disconnect()
+
+
+@pytest.mark.asyncio
+async def test_a_reject_records_no_venue_id_map_and_latches_no_refusal(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    write_canonical_verified: None,  # noqa: F811
+) -> None:
+    """(AM-4, CX-B1) CHARACTERISATION, not CHANGE: a REJECT carries
+    `venue_order_id=None` (`submit_chain.py:800-819`), so it writes no map
+    row and latches no refusal -- true at HEAD too, and this is the only
+    guard on that shape (Rev 2's inverse acceptance clause was an error).
+    MUTATION_RED_EVIDENCE (pair 2): removing the `if outcome.venue_order_id
+    is not None:` guard on the A1 block, taken AFTER A1 lands, makes the
+    refusal half of this assertion go RED -- see the commit body."""
+    sender = _FakeOrderSender()
+    rig = _build_accept_fill_rig(tmp_path, monkeypatch=monkeypatch, sender=sender)
+    sender.response = VenueResponse(status=400, headers={}, body=_reject_body())
+
+    with _accept_fill_caps():
+        await rig.client._connect()
+        await rig.client._submit_order(rig.limit_buy())
+        assert len(rig.client.trading_refusals) == 0
+        assert rig.client.is_degraded is False
+        await rig.client._disconnect()
+
+
+@pytest.mark.asyncio
+async def test_a_venue_id_map_write_failure_refuses_and_still_dispatches_the_outcome(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    write_canonical_verified: None,  # noqa: F811
+) -> None:
+    """A-B2: a map-write failure refuses and FALLS THROUGH -- never a
+    `return` -- so the ACCEPT_FILL dispatch (`record_fill`/retire/publish)
+    still runs to completion."""
+    sender = _FakeOrderSender()
+    rig = _build_accept_fill_rig(tmp_path, monkeypatch=monkeypatch, sender=sender)
+    slug = _slug(rig.instrument)
+    sender.response = VenueResponse(
+        status=200, headers={}, body=_accept_fill_body(slug, order_id="ord-a1-boom"),
+    )
+
+    def _boom(venue_order_id: VenueOrderId, client_order_id: ClientOrderId) -> None:
+        raise RuntimeError("simulated venue-id map write failure")
+
+    monkeypatch.setattr(rig.client, "record_venue_order_id", _boom)
+
+    with _accept_fill_caps():
+        rig.client.start()  # drive the native FSM to RUNNING, as `_refuse` requires
+        await rig.client._connect()
+        await rig.client._submit_order(rig.limit_buy())  # must not raise
+        assert rig.client.is_degraded is True
+        await rig.client._disconnect()
+
+    refusals = rig.client.trading_refusals
+    assert refusals.count(client_module._VENUE_ID_MAP_WRITE_FAILED) == 1, refusals
+    assert _reopened_fill_record(rig.store_path, "ord-a1-boom") is not None
+    filled = [e for e in rig.order_events if isinstance(e, OrderFilled)]
+    assert len(filled) == 1
+
+
 # (f) `to_bytes`/`from_bytes` round-trip with the new fields.
 def test_durable_fill_record_round_trips_the_fee_and_reconciled_flag() -> None:
     record = DurableFillRecord(
@@ -2405,6 +2587,10 @@ def test_durable_fill_record_round_trips_the_fee_and_reconciled_flag() -> None:
     assert decoded["cumulativeFee"] == "0.12"
     assert decoded["feeReconciled"] is False
     assert decoded["venueFeeRaw"] == "0.004"
+    # B0: two new optional-on-read keys, `None` here since this record does
+    # not pass `trade_id`/`order_qty` -- the SET must still carry both.
+    assert decoded["tradeId"] is None
+    assert decoded["orderQty"] is None
     assert set(decoded) == {
         "venueOrderId",
         "clientOrderId",
@@ -2416,12 +2602,66 @@ def test_durable_fill_record_round_trips_the_fee_and_reconciled_flag() -> None:
         "feeReconciled",
         "tsEvent",
         "venueFeeRaw",
+        "tradeId",
+        "orderQty",
     }
 
     assert DurableFillRecord.from_bytes(raw) == record
 
     missing = DurableFillRecord.from_bytes(_raw_record())
     assert missing.venue_fee_raw is None
+    assert missing.trade_id is None
+    assert missing.order_qty is None
+
+
+# (f2) B0: `trade_id`/`order_qty` round-trip on their own, non-`None`.
+def test_a_durable_record_round_trips_the_trade_id_and_order_qty() -> None:
+    record = DurableFillRecord(
+        venue_order_id="V-ROUNDTRIP-2",
+        client_order_id="O-19700101-000000-001-001-2",
+        instrument_id="some-instrument",
+        order_side="BUY",
+        cumulative_qty=Decimal(4),
+        cumulative_cost=Decimal("1.48"),
+        cumulative_fee=Decimal("0.12"),
+        fee_reconciled=True,
+        ts_event=TS_INIT,
+        trade_id="trd-902",
+        order_qty=Decimal(1),
+    )
+
+    raw = record.to_bytes()
+    decoded = json.loads(raw)
+    assert decoded["tradeId"] == "trd-902"
+    assert decoded["orderQty"] == "1"
+    assert DurableFillRecord.from_bytes(raw) == record
+
+
+# (f3) B0/S-M1: a legacy record (no `tradeId`/`orderQty` key at all) decodes
+# both fields to `None` -- never inferred from `cumulative_qty`, never
+# defaulted to `Decimal(1)`. This is the same shape as every record on disk
+# before this change (functionally identical to the live store's
+# pre-existing `.../fill/CEBPX0EVTTMX` record -- reading the live state
+# store directly is out of scope for this test, so `_raw_record()`'s
+# already-legacy shape, the same fixture `venue_fee_raw is None` uses two
+# lines above, stands in for it). Reconstructing the `GET-<venue_order_id>`
+# fallback from a `None` `trade_id` is a B1 consumer-side rule (Units,
+# S-M1) -- BLOCKED-BY-R-1, not implemented by this change.
+def test_a_legacy_record_without_a_trade_id_decodes_and_falls_back_to_the_get_form() -> None:
+    legacy = DurableFillRecord.from_bytes(_raw_record())
+    assert legacy.trade_id is None
+    assert legacy.order_qty is None
+
+
+@pytest.mark.parametrize("bad_order_qty", ["NaN", "Infinity", "-Infinity"])
+def test_a_non_finite_order_qty_is_refused(bad_order_qty: str) -> None:
+    with pytest.raises(ExecutionReportMappingError, match="orderQty"):
+        DurableFillRecord.from_bytes(_raw_record(orderQty=bad_order_qty))
+
+
+def test_a_non_string_trade_id_is_refused() -> None:
+    with pytest.raises(ExecutionReportMappingError, match="tradeId"):
+        DurableFillRecord.from_bytes(_raw_record(tradeId=123))
 
 
 # (g) `None` totals on an accept-fill outcome -- the same failure path as (c).
@@ -2468,3 +2708,101 @@ async def test_none_order_level_totals_on_an_accept_fill_take_the_write_failure_
 
     filled = [e for e in rig.order_events if isinstance(e, OrderFilled)]
     assert len(filled) == 1
+
+
+# ---------------------------------------------------------------------------
+# SP-2 I3 -- durable capture: `AmbiguousResolverContext` gains two
+# trailing-optional fields, written by `_note_ambiguous_open`
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_an_ambiguous_create_outcome_persists_the_body_key_tree_in_the_resolver_context(
+    tmp_path: Path,
+) -> None:
+    """I3: `outcome.detail` / `outcome.fill_parse_error` -- both already
+    capped, names-only, no value -- are persisted onto the durable
+    resolver context, so a drifted key survives past the log line and
+    feeds R-6."""
+    store_path = tmp_path / "exec_state.db"
+    rig = _build_rig(tmp_path, store_opener=lambda: SqliteStateStore(store_path))
+    await rig.client._connect()
+
+    order = rig.submit_command().order
+    booking = SimpleNamespace(booking_id=1)
+    create_detail = (
+        "status=200 body_kind=executions-present rpc_code=none body_len=1 "
+        "state=absent cum=absent tree={'driftedTopLevelKey'}"
+    )
+    fill_parse_error = (
+        "fill report mapped but no filled cost is derivable: "
+        "order.avgPx=absent order.cumQuantity=absent lastPx=absent "
+        "lastShares=absent; full body key tree: {'driftedLegKey'}"
+    )
+
+    rig.client._note_ambiguous_open(
+        intent_id="intent-i3",
+        venue_order_id="venue-i3",
+        order=order,
+        notional_usd=Decimal("1.00"),
+        booking=booking,
+        now_ns=TS_INIT,
+        create_detail=create_detail,
+        fill_parse_error=fill_parse_error,
+    )
+
+    await rig.client._disconnect()
+
+    with SqliteStateStore(store_path) as reopened:
+        raw = reopened.get(f"{RESOLVER_CONTEXT_KEY_PREFIX}intent-i3")
+
+    assert raw is not None
+    context = AmbiguousResolverContext.from_bytes(raw)
+    assert context.create_detail == create_detail
+    assert context.fill_parse_error == fill_parse_error
+    assert "driftedTopLevelKey" in (context.create_detail or "")
+    assert "driftedLegKey" in (context.fill_parse_error or "")
+
+
+def test_a_resolver_context_written_before_this_change_still_decodes() -> None:
+    """AC-13 / AR-N6: a resolver-context blob written before SP-2 (no
+    `createDetail`/`fillParseError` keys at all) still decodes, both
+    fields `None` -- trailing-optional, no schema version, no migration.
+    A NEW row with no detail explicitly serialises `"createDetail": null`
+    / `"fillParseError": null` and decodes back to `None`."""
+    old_blob = json.dumps(
+        {
+            "intentId": "intent-old",
+            "venueOrderId": "venue-old",
+            "instrumentId": "instrument-old",
+            "clientOrderId": "client-old",
+            "strategyId": "strategy-old",
+            "notionalUsd": "1.00",
+            "bookingId": 7,
+            "createdNs": TS_INIT,
+        },
+        sort_keys=True,
+    ).encode("utf-8")
+
+    old_context = AmbiguousResolverContext.from_bytes(old_blob)
+    assert old_context.create_detail is None
+    assert old_context.fill_parse_error is None
+
+    new_context = AmbiguousResolverContext(
+        intent_id="intent-new",
+        venue_order_id="venue-new",
+        instrument_id="instrument-new",
+        client_order_id="client-new",
+        strategy_id="strategy-new",
+        notional_usd=Decimal("2.00"),
+        booking_id=8,
+        created_ns=TS_INIT,
+    )
+    new_bytes = new_context.to_bytes()
+    decoded = json.loads(new_bytes)
+    assert decoded["createDetail"] is None
+    assert decoded["fillParseError"] is None
+
+    round_tripped = AmbiguousResolverContext.from_bytes(new_bytes)
+    assert round_tripped.create_detail is None
+    assert round_tripped.fill_parse_error is None

@@ -82,14 +82,15 @@ always supplied by the caller from the injected Nautilus clock, exactly as
 ``safety`` does it, which is what makes the day boundary testable without
 sleeping.
 
-ZERO PRODUCTION CALL SITES, DELIBERATELY
-----------------------------------------
+CONSTRUCTED AND SPENT AGAINST IN PRODUCTION
+-------------------------------------------
 
-This ships as a library with no caller, the same shape R-4's chokepoint and
-R-6d's refusal classifier landed in. The consumer is the R-7 submit path,
-which does not exist yet; pre-wiring it into ``exec/client.py`` now would put
-an order-path change inside an increment whose whole subject is a policy
-mechanism, and R-4's standing refusal keeps that path closed regardless.
+``factories.py:777`` constructs one ``DailySpendLedger()`` per execution
+client (``spend_ledger=DailySpendLedger(),``), injected as
+``exec/client.py``'s ``self._ledger``. The live R-7 submit path calls it
+directly: :meth:`authorize_order_cost` before every POST,
+:meth:`release_booking` on every denial, :meth:`true_up_booking` after
+every terminal outcome. This is not a library with no caller.
 
 THE FEE FLOOR, AND WHY THIS CAP IS PRE-FEE
 ------------------------------------------

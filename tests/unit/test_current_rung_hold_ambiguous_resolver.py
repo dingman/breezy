@@ -34,8 +34,10 @@ import pytest
 from nautilus_trader.common.component import LiveClock
 from nautilus_trader.common.factories import OrderFactory
 from nautilus_trader.model.events import OrderDenied
+from nautilus_trader.model.identifiers import ClientOrderId, VenueOrderId
 
 from breezy.adapters.polymarket_us.exec.client import (
+    _VENUE_ID_MAP_WRITE_FAILED,
     RESOLVER_CONTEXT_KEY_PREFIX,
     AmbiguousResolverContext,
     PolymarketUSExecutionClient,
@@ -142,6 +144,34 @@ async def _arm_one_ambiguous_intent(
     instrument = build_instrument()
     slug = instrument_id_to_slug(instrument.id)
     return client, order_id, slug, latch_cm, order_events
+
+
+async def _arm_one_ambiguous_intent_isolating_resolver_writes(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> tuple[PolymarketUSExecutionClient, str, str, Any, list[Any]]:
+    """Like :func:`_arm_one_ambiguous_intent`, but suppresses A1-a's
+    submit-path venue-id-map write during arming.
+
+    Without this, every resolver-side venue-id-map test below would be
+    VACUOUS: the very submit that goes with-id AMBIGUOUS already runs
+    through A1-a (the one point ALL FOUR outcome kinds pass through), which
+    writes the row before the resolver ever runs. A test asserting only
+    that the row exists afterward could not tell A1-a's write apart from
+    A1-b/A1-c's -- exactly the vacuity shape A-B3 already found once.
+    """
+    with monkeypatch.context() as isolating:
+        isolating.setattr(
+            PolymarketUSExecutionClient,
+            "record_venue_order_id",
+            lambda self, venue_order_id, client_order_id: None,
+        )
+        result = await _arm_one_ambiguous_intent(tmp_path)
+    client, order_id = result[0], result[1]
+    assert client.client_order_id_for(VenueOrderId(order_id)) is None, (
+        "the submit-path write must be suppressed for this fixture to be non-vacuous"
+    )
+    return result
 
 
 async def _run_resolver_passes(client: PolymarketUSExecutionClient, count: int) -> None:
@@ -506,6 +536,11 @@ async def test_a_get_confirmed_fill_with_a_long_present_records_a_synthesized_fi
         assert record.cumulative_qty == Decimal(1)
         assert record.cumulative_cost == Decimal("0.40")
         assert record.fee_reconciled is False
+        # B0-d/AC-5: the self-labelling GET- synthetic trade id, and the
+        # venue's own echoed ORIGINAL order size (`report.quantity`, a
+        # DIFFERENT field from `cumulative_qty`/`filled_qty` above).
+        assert record.trade_id == f"GET-{order_id}"
+        assert record.order_qty == Decimal(1)
 
         filled = _order_filled_events(order_events)
         assert len(filled) == 1, "exactly one native OrderFilled"
@@ -521,6 +556,205 @@ async def test_a_get_confirmed_fill_with_a_long_present_records_a_synthesized_fi
             "submit's own refusal, captured before the resolver ran, is "
             "unrelated and expected to still be present)"
         )
+        await client._disconnect()
+
+
+@pytest.mark.asyncio
+async def test_a_resolver_retire_records_the_venue_id_map(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    write_canonical_verified: None,  # noqa: F811
+) -> None:
+    """A1-b: the venue id -> client order id map is backfilled on the
+    resolver's accept-fill terminal -- the durable attribution for a
+    context written before this change ever shipped (the submit-path write
+    is suppressed by the fixture below so this test cannot be satisfied by
+    A1-a's own write instead)."""
+    enable_operator_gate(monkeypatch, order_count="2")
+    with operator_control_env(MAX_DAILY_BUDGET_USD_ENV_VAR, "1000.00"), operator_control_env(
+        MAX_POSITION_COST_USD_ENV_VAR, "10.00",
+    ):
+        client, order_id, slug, _latch_cm, _order_events = (
+            await _arm_one_ambiguous_intent_isolating_resolver_writes(tmp_path, monkeypatch)
+        )
+        client._private_read._payloads[  # type: ignore[attr-defined]
+            f"/v1/order/{order_id}"
+        ] = _order_get_body(
+            order_id, slug=slug, state="ORDER_STATE_FILLED", cum_quantity=1, avg_px="0.40",
+        )
+        client._private_read._payloads["/v1/portfolio/positions"] = {  # type: ignore[attr-defined]
+            "positions": {slug: {"netPosition": "1"}},
+            "eof": True,
+        }
+
+        await _run_resolver_passes(client, count=1)
+
+        assert client.client_order_id_for(VenueOrderId(order_id)) is not None
+        await client._disconnect()
+
+
+@pytest.mark.asyncio
+async def test_a_resolver_terminal_zero_retire_records_the_venue_id_map(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    write_canonical_verified: None,  # noqa: F811
+) -> None:
+    """A1-c (AM-10): the SAME backfill on the resolver's OTHER terminal --
+    a separate method with a different post-condition, so one test cannot
+    drive both (AM-10). The submit-path write is suppressed (see the
+    fixture docstring) so this cannot be satisfied by A1-a instead."""
+    enable_operator_gate(monkeypatch, order_count="2")
+    with operator_control_env(MAX_DAILY_BUDGET_USD_ENV_VAR, "1000.00"), operator_control_env(
+        MAX_POSITION_COST_USD_ENV_VAR, "10.00",
+    ):
+        client, order_id, slug, _latch_cm, _order_events = (
+            await _arm_one_ambiguous_intent_isolating_resolver_writes(tmp_path, monkeypatch)
+        )
+        client._private_read._payloads[  # type: ignore[attr-defined]
+            f"/v1/order/{order_id}"
+        ] = _order_get_body(order_id, slug=slug, state="ORDER_STATE_CANCELED", cum_quantity=0)
+        client._private_read._payloads["/v1/portfolio/positions"] = {  # type: ignore[attr-defined]
+            "positions": {},
+            "eof": True,
+        }
+
+        await _run_resolver_passes(client, count=1)
+
+        assert client.client_order_id_for(VenueOrderId(order_id)) is not None
+        await client._disconnect()
+
+
+@pytest.mark.asyncio
+async def test_a_resolver_accept_fill_with_no_same_process_booking_still_records_the_venue_id_map(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    write_canonical_verified: None,  # noqa: F811
+) -> None:
+    """(B-2) The ONLY test that catches a wrong-indent A1-b: every OTHER
+    resolver fixture builds a booking, so a block placed inside `if booking
+    is not None:` would pass every one of them while silently skipping the
+    write on exactly the post-restart reconciliation path A1 exists to
+    serve -- `_ambiguous_bookings` is same-process-only and EMPTY after a
+    restart (`client.py` around `_resolve_accept_fill`'s booking pop).
+    MUTATION pair 5 moves the A1-b block to the wrong indent and shows THIS
+    test, and only this test, go RED."""
+    enable_operator_gate(monkeypatch, order_count="2")
+    with operator_control_env(MAX_DAILY_BUDGET_USD_ENV_VAR, "1000.00"), operator_control_env(
+        MAX_POSITION_COST_USD_ENV_VAR, "10.00",
+    ):
+        client, order_id, slug, _latch_cm, _order_events = (
+            await _arm_one_ambiguous_intent_isolating_resolver_writes(tmp_path, monkeypatch)
+        )
+        assert client._latch is not None
+        armed = client._latch.current()
+        assert armed is not None
+        # Simulate the post-restart shape directly: no same-process booking.
+        client._ambiguous_bookings.pop(armed.intent_id, None)
+        client._private_read._payloads[  # type: ignore[attr-defined]
+            f"/v1/order/{order_id}"
+        ] = _order_get_body(
+            order_id, slug=slug, state="ORDER_STATE_FILLED", cum_quantity=1, avg_px="0.40",
+        )
+        client._private_read._payloads["/v1/portfolio/positions"] = {  # type: ignore[attr-defined]
+            "positions": {slug: {"netPosition": "1"}},
+            "eof": True,
+        }
+
+        await _run_resolver_passes(client, count=1)
+
+        current = client._latch.current()
+        assert current is not None
+        assert current.state is SubmitIntentState.RETIRED, (
+            "the terminal must still complete with no booking present"
+        )
+        assert client.client_order_id_for(VenueOrderId(order_id)) is not None
+        await client._disconnect()
+
+
+@pytest.mark.asyncio
+async def test_a_map_write_failure_still_retires_and_fills_on_the_accept_fill_terminal(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    write_canonical_verified: None,  # noqa: F811
+) -> None:
+    """(A-B2) A `record_venue_order_id` raise must REFUSE and FALL THROUGH,
+    never `return`: `_retire`, the budget true-up/unrestore check and
+    `generate_order_filled` must all still run."""
+    enable_operator_gate(monkeypatch, order_count="2")
+    with operator_control_env(MAX_DAILY_BUDGET_USD_ENV_VAR, "1000.00"), operator_control_env(
+        MAX_POSITION_COST_USD_ENV_VAR, "10.00",
+    ):
+        client, order_id, slug, _latch_cm, order_events = await _arm_one_ambiguous_intent(
+            tmp_path,
+        )
+        client._private_read._payloads[  # type: ignore[attr-defined]
+            f"/v1/order/{order_id}"
+        ] = _order_get_body(
+            order_id, slug=slug, state="ORDER_STATE_FILLED", cum_quantity=1, avg_px="0.40",
+        )
+        client._private_read._payloads["/v1/portfolio/positions"] = {  # type: ignore[attr-defined]
+            "positions": {slug: {"netPosition": "1"}},
+            "eof": True,
+        }
+
+        def _boom(venue_order_id: VenueOrderId, client_order_id: ClientOrderId) -> None:
+            raise RuntimeError("simulated venue-id map write failure")
+
+        monkeypatch.setattr(client, "record_venue_order_id", _boom)
+
+        await _run_resolver_passes(client, count=1)
+
+        current = client._latch.current()
+        assert current is not None
+        assert current.state is SubmitIntentState.RETIRED
+        assert client.trading_refusals[-1] == _VENUE_ID_MAP_WRITE_FAILED
+        filled = _order_filled_events(order_events)
+        assert len(filled) == 1, "generate_order_filled must still run"
+        await client._disconnect()
+
+
+@pytest.mark.asyncio
+async def test_a_map_write_failure_still_retires_and_cancels_on_the_terminal_zero(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    write_canonical_verified: None,  # noqa: F811
+) -> None:
+    """(A-B2) The same guard on the OTHER terminal: `_retire`,
+    `true_up_booking`, `restore_live_trading_budget`,
+    `_write_startup_position_evidence` and `generate_order_canceled` must
+    all still run after a `record_venue_order_id` raise (N2)."""
+    enable_operator_gate(monkeypatch, order_count="2")
+    with operator_control_env(MAX_DAILY_BUDGET_USD_ENV_VAR, "1000.00"), operator_control_env(
+        MAX_POSITION_COST_USD_ENV_VAR, "10.00",
+    ):
+        client, order_id, slug, _latch_cm, order_events = await _arm_one_ambiguous_intent(
+            tmp_path,
+        )
+        client._private_read._payloads[  # type: ignore[attr-defined]
+            f"/v1/order/{order_id}"
+        ] = _order_get_body(order_id, slug=slug, state="ORDER_STATE_CANCELED", cum_quantity=0)
+        client._private_read._payloads["/v1/portfolio/positions"] = {  # type: ignore[attr-defined]
+            "positions": {},
+            "eof": True,
+        }
+
+        def _boom(venue_order_id: VenueOrderId, client_order_id: ClientOrderId) -> None:
+            raise RuntimeError("simulated venue-id map write failure")
+
+        monkeypatch.setattr(client, "record_venue_order_id", _boom)
+
+        await _run_resolver_passes(client, count=1)
+
+        current = client._latch.current()
+        assert current is not None
+        assert current.state is SubmitIntentState.RETIRED
+        assert client.trading_refusals[-1] == _VENUE_ID_MAP_WRITE_FAILED
+        _, remaining_count = live_trading_budget_remaining(client._permit)
+        assert remaining_count == 2, "restore_live_trading_budget must still run"
+        evidence = client.read_startup_position_evidence()
+        assert evidence is not None, "_write_startup_position_evidence must still run"
+        canceled = [e for e in order_events if type(e).__name__ == "OrderCanceled"]
+        assert len(canceled) == 1, "generate_order_canceled must still run"
         await client._disconnect()
 
 

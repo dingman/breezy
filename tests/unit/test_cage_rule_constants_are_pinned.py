@@ -557,6 +557,9 @@ CAGE_RULE_PINS: tuple[RulePin, ...] = (
                 "PolymarketUSError",
                 "record.to_bytes",
                 "fill_record_bytes.decode",
+                # A1: writes one key to the already-open local store; no
+                # path, no payload, no socket; no `await`.
+                "self.record_venue_order_id",
             }
         ),
         widened=frozenset(
@@ -608,6 +611,7 @@ CAGE_RULE_PINS: tuple[RulePin, ...] = (
                 "record.to_bytes",
                 "fill_record_bytes.decode",
                 "self.create_task",
+                "self.record_venue_order_id",
             }
         ),
         narrowed=frozenset({"self._log.error"}),

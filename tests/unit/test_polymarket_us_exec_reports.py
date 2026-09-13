@@ -48,6 +48,7 @@ Siblings: the decode and the balances mapper are in
 
 from __future__ import annotations
 
+import base64
 import decimal
 import logging
 from decimal import Decimal, InvalidOperation
@@ -73,8 +74,20 @@ from nautilus_trader.model.instruments import BinaryOption
 from nautilus_trader.model.objects import Money, Price, Quantity
 
 from breezy.adapters.polymarket_us.errors import ExecutionReportMappingError
+from breezy.adapters.polymarket_us.exec import reports as reports_module
+from breezy.adapters.polymarket_us.exec import submit_chain
 from breezy.adapters.polymarket_us.exec.reports import (
+    _EXECUTION_KEYS,
+    _MARKET_METADATA_DRIFT_ALLOWED_KEYS,
+    _MARKET_METADATA_KEYS,
+    _ORDER_DRIFT_ALLOWED_KEYS,
+    _ORDER_KEYS,
+    _USER_BALANCE_DRIFT_ALLOWED_KEYS,
+    _USER_BALANCE_KEYS,
+    _USER_POSITION_DRIFT_ALLOWED_KEYS,
+    _USER_POSITION_KEYS,
     ORDER_STATE_TO_ORDER_STATUS,
+    _key_tree,
     build_execution_mass_status,
     parse_fill_report,
     parse_order_status_report,
@@ -1008,3 +1021,288 @@ def test_a_malformed_fill_timestamp_stays_inside_the_mapping_taxonomy(
             report_id=REPORT_ID,
             ts_init=TS_INIT,
         )
+
+
+# ---------------------------------------------------------------------------
+# SP-2 I0 -- `_key_tree` / `_safe_key_name` sanitiser (RV2.1-A11)
+# ---------------------------------------------------------------------------
+
+
+def test_a_key_tree_escapes_control_characters_in_a_venue_key_name() -> None:
+    """S-H2: a venue key name can carry raw control characters, non-printable
+    bidi marks, or an ANSI escape; none may reach a log line un-escaped."""
+    bad_key = "line1\nline2\rcolor\x1b[31mtext\u202eevil"
+    tree = _key_tree({bad_key: "value"})
+
+    assert "\n" not in tree
+    assert "\r" not in tree
+    assert "\x1b" not in tree
+    assert "\u202e" not in tree
+    assert ascii(bad_key) in tree
+
+
+def test_a_genuine_key_truncation_leaves_the_quoted_span_unterminated() -> None:
+    """SEC-M1 + CX-N1: a 512-char key truncates with the marker OUTSIDE the
+    quotes, reporting the RAW length (512), not the escaped rendering's
+    length. A short control-character key whose escaped form expands past
+    the cap reports the SMALLER raw length, by design."""
+    from breezy.adapters.polymarket_us.exec.reports import _safe_key_name
+
+    long_key = "k" * 512
+    name = _safe_key_name(long_key)
+
+    assert name.endswith("(truncated from 512 characters)")
+    opening_quote = ascii(long_key)[0]
+    assert name.startswith(opening_quote)
+    # A genuine truncation never closes with the quote it opened -- the
+    # marker text, not a quote character, is the last thing emitted.
+    assert not name.endswith(opening_quote)
+
+    # Escaping EXPANDS a short key past the cap: 20 raw control characters
+    # each escape to 4 chars (``\xNN``) plus the two quote characters, so the
+    # rendered name is 82 chars -- well past `_KEY_NAME_MAX_CHARS` (64) --
+    # while the RAW key is only 20 characters long.
+    short_key = "\x01" * 20
+    name2 = _safe_key_name(short_key)
+    assert name2.endswith(f"(truncated from {len(short_key)} characters)")
+
+
+def test_a_key_whose_content_spells_the_truncation_marker_stays_inside_its_quotes() -> None:
+    """SEC-M1: the exact string a forged marker would use renders as a
+    CLOSED quoted name, distinguishable from a genuine (unterminated)
+    truncation in the previous test."""
+    from breezy.adapters.polymarket_us.exec.reports import _safe_key_name
+
+    forged_key = "x (truncated from 999 characters)"
+    name = _safe_key_name(forged_key)
+
+    assert name == ascii(forged_key)
+    quote = name[0]
+    assert quote in ("'", '"')
+    assert name.endswith(quote)
+
+
+def test_a_key_tree_bounds_its_own_depth_instead_of_recursing() -> None:
+    """S-H1: unbounded venue-controlled nesting must not become unbounded
+    recursion; the bound renders `<depth-capped>` well before any interpreter
+    recursion limit is threatened."""
+    payload: dict[str, Any] = {"leaf": "value"}
+    for _ in range(2000):
+        payload = {"nest": payload}
+
+    tree = _key_tree(payload)
+
+    assert "<depth-capped>" in tree
+
+
+def test_a_key_tree_renders_every_execution_row_not_only_the_first() -> None:
+    """A-B5 / RV2.1-A9: every row up to the cap is rendered, not only leg 0;
+    a list past the cap declares how many more elements it carried."""
+    rows_three = [{"legA": 1}, {"legB": 2}, {"legC": 3}]
+    tree_three = _key_tree({"executions": rows_three})
+    for name in ("legA", "legB", "legC"):
+        assert ascii(name) in tree_three
+    assert "more" not in tree_three
+
+    rows_twelve = [{"k": i} for i in range(12)]
+    tree_twelve = _key_tree({"executions": rows_twelve})
+    assert ", +4 more" in tree_twelve
+
+
+def test_a_list_without_a_leading_mapping_still_renders_the_rows_it_has() -> None:
+    """AR-N4: a list with no mapping element at all keeps the plain
+    `key[n]` shape; a list whose FIRST element is not a mapping but which
+    contains one within the first 8 rows now renders that row -- today's
+    leg-0-only rule would have rendered nothing, hiding a later-row drift."""
+    tree_no_mapping = _key_tree({"items": [1, 2, 3]})
+    assert f"{'items'!a}[3]" in tree_no_mapping
+    assert "{" not in tree_no_mapping
+
+    mixed = [1, {"driftedKey": "value"}, 3]
+    tree_mixed = _key_tree({"items": mixed})
+    assert ascii("driftedKey") in tree_mixed
+
+
+def test_a_free_form_venue_map_is_rendered_opaque_at_every_depth() -> None:
+    """S-M1 + AR-N3: `MarketMetadata.team` is the one reachable free-form
+    map in the declared shapes; matched globally, at any depth, because
+    global matching can only make MORE content opaque, never less."""
+    tree = _key_tree({"team": {"secretField": "SECRET_VALUE"}})
+    assert "<opaque>" in tree
+    assert "secretField" not in tree
+    assert "SECRET_VALUE" not in tree
+
+    nested_tree = _key_tree({"marketMetadata": {"team": {"anotherSecret": "X"}}})
+    assert "<opaque>" in nested_tree
+    assert "anotherSecret" not in nested_tree
+
+
+def test_a_secret_looking_key_is_sanitised_and_bounded_not_redacted() -> None:
+    """Accepted residual risk (narrowed names-only invariant): a venue key
+    that LOOKS like a secret is sanitised and bounded, not redacted to
+    absence -- redact-to-known-set would destroy the tree's only purpose,
+    naming the undeclared key."""
+    secret_like_key = base64.b64encode(b"x" * 32).decode()
+    assert len(secret_like_key) == 44
+
+    tree = _key_tree({secret_like_key: "value"})
+
+    assert ascii(secret_like_key) in tree
+
+
+def test_a_key_tree_of_ten_thousand_keys_stays_bounded() -> None:
+    """DoS shape: 10,000 adversarially long venue keys must still return a
+    boundedly-sized string -- without a per-key cap, this many long keys
+    produce an output over 10x larger."""
+    payload = {f"key{i}" + "x" * 1000: "v" for i in range(10_000)}
+
+    tree = _key_tree(payload)
+
+    assert isinstance(tree, str)
+    assert len(tree) < 10_000 * 150
+
+
+def test_every_declared_allowlist_name_survives_sanitisation_unchanged() -> None:
+    """AC-7 non-lossiness: every declared allowlist name (short, plain
+    ASCII, no special characters) renders identically to `repr()` -- the
+    sanitiser changes nothing for a legitimate, undrifted key."""
+    from breezy.adapters.polymarket_us.exec.reports import _safe_key_name
+
+    all_names = (
+        _EXECUTION_KEYS
+        | _ORDER_KEYS
+        | _MARKET_METADATA_KEYS
+        | _USER_POSITION_KEYS
+        | _USER_BALANCE_KEYS
+        | _ORDER_DRIFT_ALLOWED_KEYS
+        | _MARKET_METADATA_DRIFT_ALLOWED_KEYS
+        | _USER_POSITION_DRIFT_ALLOWED_KEYS
+        | _USER_BALANCE_DRIFT_ALLOWED_KEYS
+    )
+
+    for name in all_names:
+        assert _safe_key_name(name) == repr(name)
+
+
+# ---------------------------------------------------------------------------
+# SP-2 I0b -- the execution-type refusal stops echoing the raw value (SEC-H1)
+# ---------------------------------------------------------------------------
+
+
+def test_a_non_fill_execution_type_is_named_without_echoing_the_whole_value(
+    execution: dict[str, Any], instrument: BinaryOption
+) -> None:
+    """SEC-H1: a >64-char `type` truncates with the marker outside the
+    quotes; a non-string `type` renders by TYPE NAME only (AM-8: a hashable
+    non-string, since a dict `type` raises `TypeError: unhashable` in the
+    pre-filter before `_name_value` is ever reached)."""
+    long_type = "X" * 200
+    with pytest.raises(ExecutionReportMappingError) as excinfo:
+        parse_fill_report(
+            {**execution, "type": long_type},
+            instrument=instrument,
+            account_id=ACCOUNT_ID,
+            report_id=REPORT_ID,
+            ts_init=TS_INIT,
+        )
+    message = str(excinfo.value)
+    assert long_type not in message
+    assert "(truncated from 200 characters)" in message
+
+    with pytest.raises(ExecutionReportMappingError) as excinfo2:
+        parse_fill_report(
+            {**execution, "type": 12345},
+            instrument=instrument,
+            account_id=ACCOUNT_ID,
+            report_id=REPORT_ID,
+            ts_init=TS_INIT,
+        )
+    message2 = str(excinfo2.value)
+    assert "12345" not in message2
+    assert "int" in message2
+
+
+def test_the_create_path_cannot_reach_the_execution_type_refusal(
+    execution: dict[str, Any],
+    instrument: BinaryOption,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """CHARACTERISATION (SEC-H1 coupling, AM-2/AM-3). Keeps "structurally
+    unreachable" honest: `submit_chain._FILL_EXECUTION_TYPES` and this
+    module's own `_FILL_EXECUTION_TYPES` are two INDEPENDENTLY declared
+    frozensets (verification 29); nothing else pins them equal. A RED on the
+    `==` pin below is a finding to REPORT, never fixed by widening either
+    set (AM-2). The in-process perturbation is reverted automatically by the
+    `monkeypatch` fixture at teardown -- `git diff --stat src/` stays empty.
+    """
+    assert submit_chain._FILL_EXECUTION_TYPES <= reports_module._FILL_EXECUTION_TYPES
+    assert submit_chain._FILL_EXECUTION_TYPES == reports_module._FILL_EXECUTION_TYPES
+
+    drifted = {**execution, "type": "EXECUTION_TYPE_NEW"}
+    body = {"id": "ord-7f3a", "executions": [drifted]}
+
+    # Baseline: today's pre-filter excludes the drifted row outright -- it
+    # never reaches `parse_fill_report`, so no refusal is even possible.
+    assert submit_chain._durable_execution(body) is None
+
+    # AM-3: `drifted` already satisfies `_durable_execution`'s OTHER filters
+    # (order.id, lastPx, lastShares, tradeId all present via the shared
+    # `execution` fixture), so once the pre-filter is perturbed to widen,
+    # the row is genuinely SELECTED -- the RED artefact below shows the
+    # assertion, not a vacuous early exit.
+    monkeypatch.setattr(
+        submit_chain,
+        "_FILL_EXECUTION_TYPES",
+        frozenset(submit_chain._FILL_EXECUTION_TYPES | {"EXECUTION_TYPE_NEW"}),
+    )
+    selected = submit_chain._durable_execution(body)
+    assert selected is not None
+
+    # RED (if this coupling ever breaks live): the widened pre-filter
+    # selects a row this module's OWN frozenset still refuses.
+    with pytest.raises(ExecutionReportMappingError, match="EXECUTION_TYPE_NEW"):
+        parse_fill_report(
+            selected,
+            instrument=instrument,
+            account_id=ACCOUNT_ID,
+            report_id=REPORT_ID,
+            ts_init=TS_INIT,
+        )
+
+
+def test_a_non_hashable_execution_type_is_refused_not_a_crash(
+    execution: dict[str, Any], instrument: BinaryOption
+) -> None:
+    """I6 enumeration: `parse_fill_report`'s own execution-type refusal
+    (`execution_type not in _FILL_EXECUTION_TYPES`) is the SAME hazard class
+    as `_fill_type_executions`'s pre-filter -- a dict/list `type` raises
+    `TypeError: unhashable type` on the frozenset membership test, uncaught,
+    for any DIRECT caller of `parse_fill_report` (this module's own public
+    surface, not only the create-path pre-filter that normally screens
+    `type` first). Refused, never a crash."""
+    with pytest.raises(ExecutionReportMappingError) as excinfo:
+        parse_fill_report(
+            {**execution, "type": {"nested": 1}},
+            instrument=instrument,
+            account_id=ACCOUNT_ID,
+            report_id=REPORT_ID,
+            ts_init=TS_INIT,
+        )
+    assert "dict" in str(excinfo.value)
+
+
+# ---------------------------------------------------------------------------
+# I8 (nits) -- opaque-key value guard + inner truncation marker assertion
+# ---------------------------------------------------------------------------
+
+
+def test_a_scalar_team_value_is_not_rendered_opaque() -> None:
+    """I8(a): the opaque branch dropped the plan's value-type guard -- a
+    SCALAR `team` (never a free-form map in life, but the sanitiser must not
+    assume it) is not `<opaque>`; it falls to the plain scalar branch, same
+    as any other key with a scalar value. Only a `team` whose value is
+    actually a `Mapping` or `list` (the one declared free-form-map shape)
+    is opaque."""
+    tree = _key_tree({"team": "not-a-map"})
+    assert "<opaque>" not in tree
+    assert ascii("team") in tree
