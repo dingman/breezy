@@ -12,6 +12,7 @@ from __future__ import annotations
 import ast
 import datetime as dt
 import importlib.util
+import re
 import sys
 from collections.abc import Callable, Iterator
 from contextlib import AbstractContextManager, contextmanager
@@ -536,6 +537,24 @@ def _tape_instrument_no_close(driver: ModuleType, *, ask: str, size: int) -> obj
     depth_ts = WINDOW_OPEN_NS - 1_000
     quote = _quote(ask=ask, size=size, ts_event=WINDOW_OPEN_NS)
     depth = _depth(ask=ask, size=size, ts_event=depth_ts)
+    return driver.TapeInstrument(
+        instrument=instrument, facts=facts, depths=[depth], quotes=[quote], closes=[],
+    )
+
+
+def _tape_instrument_depth_and_quote_in_window(
+    driver: ModuleType, *, ask: str, size: int,
+) -> object:
+    """SP-4 increment D: BOTH the QuoteTick and the OrderBookDepth10 land
+    IN the decision window -- for dispatch-level tests that stub `run_one_
+    precision_arm` (never a real engine), where `_tape_instrument_no_
+    close`'s depth-1000ns-before-the-quote tie-break (needed only for a
+    REAL engine's depth-before-quote fill ordering) would otherwise trip
+    the NEW depth-basis coverage gate the continuous arm now runs under."""
+    instrument = _instrument()
+    facts = read_weather_bucket_facts(instrument.info)
+    quote = _quote(ask=ask, size=size, ts_event=WINDOW_OPEN_NS)
+    depth = _depth(ask=ask, size=size, ts_event=WINDOW_OPEN_NS)
     return driver.TapeInstrument(
         instrument=instrument, facts=facts, depths=[depth], quotes=[quote], closes=[],
     )
@@ -1072,6 +1091,112 @@ def test_assert_decision_window_has_coverage_refuses_a_tape_with_no_quotes_at_al
 
 
 # ---------------------------------------------------------------------------
+# SP-4 increment D: the depth-basis coverage gate for the continuous arm.
+# ---------------------------------------------------------------------------
+
+
+def test_the_v2_arm_coverage_gate_is_unchanged(driver: ModuleType) -> None:
+    """CHARACTERISATION: an explicit `source="quote"` (the default every
+    existing caller already uses, L-28) is byte-identical to the three
+    pins above -- passes on an in-window quote, refuses an out-of-window
+    tape, refuses a tape with none at all."""
+    in_window = _tape_instrument_no_close(driver, ask="0.40", size=10)
+    driver.assert_decision_window_has_coverage(
+        [in_window],
+        station=STATION,
+        std_utc_offset_hours=LAX_STD_UTC_OFFSET_HOURS,
+        source="quote",
+    )  # must not raise
+
+    outside = _tape_instrument_outside_window(driver, ask="0.40", size=10)
+    with pytest.raises(driver.NoDecisionWindowCoverageError, match=r"08:00"):
+        driver.assert_decision_window_has_coverage(
+            [outside],
+            station=STATION,
+            std_utc_offset_hours=LAX_STD_UTC_OFFSET_HOURS,
+            source="quote",
+        )
+
+
+def test_a_depth_only_window_is_covered_for_the_continuous_arm(driver: ModuleType) -> None:
+    """A tape with ZERO `QuoteTick`s but ONE in-window, executable Depth10
+    ask is COVERED under `source="depth"` -- the continuous arm hunts on
+    depth too (L-35), so the v2 QuoteTick-only basis would wrongly refuse
+    a tape it can actually trade."""
+    instrument = _instrument()
+    facts = read_weather_bucket_facts(instrument.info)
+    depth = _depth(ask="0.40", size=10, ts_event=WINDOW_OPEN_NS)
+    depth_only = driver.TapeInstrument(
+        instrument=instrument, facts=facts, depths=[depth], quotes=[], closes=[],
+    )
+    with pytest.raises(driver.NoDecisionWindowCoverageError):
+        driver.assert_decision_window_has_coverage(
+            [depth_only],
+            station=STATION,
+            std_utc_offset_hours=LAX_STD_UTC_OFFSET_HOURS,
+            source="quote",
+        )
+    driver.assert_decision_window_has_coverage(
+        [depth_only],
+        station=STATION,
+        std_utc_offset_hours=LAX_STD_UTC_OFFSET_HOURS,
+        source="depth",
+    )  # must not raise
+
+
+def test_a_quote_only_window_with_no_in_window_depth_is_refused_for_the_continuous_arm(
+    driver: ModuleType,
+) -> None:
+    """L-24 NEGATIVE: an in-window QuoteTick with NO in-window executable
+    depth is REFUSED under `source="depth"` -- the depth basis must never
+    silently fall back to the quote population."""
+    instrument = _instrument()
+    facts = read_weather_bucket_facts(instrument.info)
+    quote = _quote(ask="0.40", size=10, ts_event=WINDOW_OPEN_NS)
+    outside_depth = _depth(ask="0.40", size=10, ts_event=_OUTSIDE_WINDOW_NS)
+    quote_only = driver.TapeInstrument(
+        instrument=instrument, facts=facts, depths=[outside_depth], quotes=[quote], closes=[],
+    )
+    driver.assert_decision_window_has_coverage(
+        [quote_only],
+        station=STATION,
+        std_utc_offset_hours=LAX_STD_UTC_OFFSET_HOURS,
+        source="quote",
+    )  # must not raise
+    with pytest.raises(driver.NoDecisionWindowCoverageError, match="executable Depth10 asks"):
+        driver.assert_decision_window_has_coverage(
+            [quote_only],
+            station=STATION,
+            std_utc_offset_hours=LAX_STD_UTC_OFFSET_HOURS,
+            source="depth",
+        )
+
+
+def test_a_depth_window_of_only_size_zero_pad_asks_is_refused_for_the_continuous_arm(
+    driver: ModuleType,
+) -> None:
+    """L-35 NEGATIVE, citing the shipped helper precedent
+    `test_depth10_quote.py::test_best_order_skips_the_size_zero_pad`
+    (`:196`): a Depth10 snapshot in-window whose ask side is ENTIRELY the
+    size-0 Arrow pad (`size=0`) has no executable ask, so it must not count
+    as coverage under `source="depth"`."""
+    instrument = _instrument()
+    facts = read_weather_bucket_facts(instrument.info)
+    pad_only_depth = _depth(ask="0.40", size=0, ts_event=WINDOW_OPEN_NS)
+    assert not any(level.size > 0 for level in pad_only_depth.asks)
+    padded = driver.TapeInstrument(
+        instrument=instrument, facts=facts, depths=[pad_only_depth], quotes=[], closes=[],
+    )
+    with pytest.raises(driver.NoDecisionWindowCoverageError, match="executable Depth10 asks"):
+        driver.assert_decision_window_has_coverage(
+            [padded],
+            station=STATION,
+            std_utc_offset_hours=LAX_STD_UTC_OFFSET_HOURS,
+            source="depth",
+        )
+
+
+# ---------------------------------------------------------------------------
 # (3) run-header visibility -- per-instrument quote/depth counts and LST span
 # ---------------------------------------------------------------------------
 def test_print_tape_instrument_header_reports_counts_and_lst_span(
@@ -1151,18 +1276,572 @@ def test_no_inline_wilson_or_bootstrap_arithmetic(driver: ModuleType) -> None:
 
 
 def test_paper_latch_is_throwaway_not_exec_state_db(driver: ModuleType) -> None:
+    """SP-4 increment E, L-5 drift correction: this pin's ORIGINAL premise
+    ("the exec-state-db resolver is never imported") is exactly what E-1
+    deliberately changes -- `assert_replay_latch_store_is_not_live`
+    composes the SHIPPED `node_store_path_check` oracle rather than
+    re-deriving it (L-11: the native exists and is USED). The invariant
+    this test actually protects survives unchanged: the driver's OWN
+    throwaway paper latch never reads `POLYMARKET_US_EXEC_STATE_DB` to
+    source or redirect its own storage path -- `resolve_store_path`/
+    `node_store_path_check` are consulted ONLY inside the read-only guard,
+    value-free, never to build a `_latch_factory`/`_latch_context` call."""
     source = (_SCRIPTS_ANALYSIS_DIR / "current_rung_hold_paper_replay.py").read_text()
     assert "POLYMARKET_US_EXEC_STATE_DB" not in source
     assert "latch_" in source
     assert "work_catalog" in source
-    # The live exec-state DB path resolver is never imported.
     tree = ast.parse(source)
     imported: set[str] = set()
     for node in ast.walk(tree):
         if isinstance(node, ast.ImportFrom) and node.module is not None:
             imported.add(node.module)
-    assert "breezy.runtime.exec_state_db_path" not in imported
+    # E-1 (ADOPTED): the shipped oracle IS imported and USED here, never
+    # re-implemented -- test_exec_state_db_path.py's own 15 tests (byte-
+    # unchanged) remain the authoritative pin on the oracle itself.
+    assert "breezy.runtime.exec_state_db_path" in imported
+    assert hasattr(driver, "node_store_path_check")
+    assert hasattr(driver, "resolve_store_path")
+    guard_def = next(
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.FunctionDef)
+        and node.name == "assert_replay_latch_store_is_not_live"
+    )
+    guard_source = ast.get_source_segment(source, guard_def)
+    assert guard_source is not None
+    non_guard_source = source.replace(guard_source, "")
+    assert "resolve_store_path(" not in non_guard_source
+    assert "node_store_path_check(" not in non_guard_source
     assert hasattr(driver, "run_one_precision_arm")
     names = driver.run_one_precision_arm.__code__.co_varnames
     assert "strategy_cls" in names
     assert "latch_key_prefix" in names
+
+
+# ---------------------------------------------------------------------------
+# SP-4 increment C: `--strategy`, v3 evidence injection, position-event
+# reporting, and the v3 latch key prefix coupling.
+# ---------------------------------------------------------------------------
+
+
+def _minimal_argv(tmp_path: Path, *, strategy: str | None) -> list[str]:
+    argv = [
+        "--climate-day", CLIMATE_DAY.isoformat(),
+        "--station", STATION,
+        "--tape-instance-id", "x",
+        "--quote-catalog", str(tmp_path / "capture"),
+        "--work-catalog", str(tmp_path / "work"),
+        "--asos-cache-csv", str(tmp_path / "z.csv"),
+        "--weather-catalog-root", str(tmp_path / "w"),
+        "--lag-minutes", "30",
+        "--output-dir", str(tmp_path / "out"),
+    ]
+    if strategy is not None:
+        argv += ["--strategy", strategy]
+    return argv
+
+
+def _run_main_with_stubbed_capture(
+    driver: ModuleType,
+    tmp_path: Path,
+    *,
+    strategy: str | None,
+    monkeypatch: pytest.MonkeyPatch,
+) -> dict[str, object]:
+    """Stub the driver's OWN capture/settlement seams (never Nautilus, never
+    the strategy under test) so `main` reaches `run_one_precision_arm`
+    without a real recorded catalog on disk -- the dispatch logic under
+    test lives entirely between argument parsing and that call."""
+    captured: dict[str, object] = {}
+    tape_instrument = _tape_instrument_depth_and_quote_in_window(driver, ask="0.40", size=10)
+
+    def _spy_run_one_precision_arm(**kwargs: object) -> object:
+        captured["strategy_cls"] = kwargs["strategy_cls"]
+        captured["latch_key_prefix"] = kwargs["latch_key_prefix"]
+        return driver.PrecisionArmResult(trials=())
+
+    monkeypatch.setattr(driver, "run_one_precision_arm", _spy_run_one_precision_arm)
+    monkeypatch.setattr(driver, "_convert_live_capture", lambda **kw: object())
+    monkeypatch.setattr(
+        driver,
+        "_select_capture_instruments",
+        lambda catalog, *, climate_day: [tape_instrument],
+    )
+    monkeypatch.setattr(driver, "climate_day_records_to_settlement", lambda *a, **kw: {})
+    monkeypatch.setattr(driver, "read_asos_rows", lambda path: _OBSERVATION_ROWS)
+
+    rc = driver.main(_minimal_argv(tmp_path, strategy=strategy))
+    assert rc == 0
+    return captured
+
+
+def test_the_strategy_flag_selects_the_continuous_backtest_subclass(
+    driver: ModuleType, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured = _run_main_with_stubbed_capture(
+        driver, tmp_path, strategy="continuous_rung_hold", monkeypatch=monkeypatch,
+    )
+    assert captured["strategy_cls"] is driver.ContinuousRungHoldBacktestStrategy
+    assert captured["latch_key_prefix"] == driver.CONTINUOUS_TRIAL_KEY_PREFIX
+
+
+def test_the_default_strategy_is_still_the_v2_backtest_subclass(
+    driver: ModuleType,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Rev 2 + AM-14: no `--strategy` flag resolves the SAME v2 subclass and
+    latch prefix as before this increment, and the new "strategy position
+    events" stdout line (printed ONLY for the continuous arm) never
+    appears -- the v2 golden transcript stays byte-identical except the
+    plan-mandated `live_store_guard` line (increment E's
+    `GuardReport.render()`, printed unconditionally for every arm)."""
+    capsys.readouterr()
+    captured = _run_main_with_stubbed_capture(
+        driver, tmp_path, strategy=None, monkeypatch=monkeypatch,
+    )
+    assert captured["strategy_cls"] is driver.CurrentRungHoldBacktestStrategy
+    assert captured["latch_key_prefix"] == driver.DEFAULT_TRIAL_KEY_PREFIX
+    out = capsys.readouterr().out
+    assert "strategy position events" not in out
+
+
+def test_the_continuous_arm_injects_flat_position_evidence_for_every_candidate_slug(
+    driver: ModuleType, tmp_path: Path,
+) -> None:
+    """AM-6: the driver injects a `_FlatStartupEvidence` reader bound to the
+    just-constructed strategy -- an in-window tape with a synthesizable
+    close fills through the SAME armed branch the live node takes, never
+    halting on `startup_evidence_missing`."""
+    tape_instrument = _tape_instrument_no_close(driver, ask="0.40", size=10)
+    settlement_by_key = {(STATION, CLIMATE_DAY.isoformat()): _final_climate_day(tmax_f=87)}
+
+    result = driver.run_one_precision_arm(
+        tape_instruments=[tape_instrument],
+        observation_rows=_OBSERVATION_ROWS,
+        station=STATION,
+        lag_minutes=1,
+        precision_mode="nws_integer_c",
+        latch_store_path=tmp_path / "state.db",
+        settlement_by_key=settlement_by_key,
+        strategy_cls=driver.ContinuousRungHoldBacktestStrategy,
+        latch_key_prefix=driver.CONTINUOUS_TRIAL_KEY_PREFIX,
+    )
+    assert len(result.trials) == 1
+    assert "startup_evidence_missing" not in result.strategy_position_events
+
+
+def test_the_early_return_result_also_carries_an_empty_position_event_map(
+    driver: ModuleType, tmp_path: Path,
+) -> None:
+    """NB-3 (L-4): the `:519`-shaped early return (no market data at all)
+    explicitly carries an empty `strategy_position_events`, never relying
+    on the dataclass `default_factory` alone."""
+    result = driver.run_one_precision_arm(
+        tape_instruments=[],
+        observation_rows=_OBSERVATION_ROWS,
+        station=STATION,
+        lag_minutes=30,
+        precision_mode="nws_integer_c",
+        latch_store_path=tmp_path / "state.db",
+        settlement_by_key={},
+        strategy_cls=driver.ContinuousRungHoldBacktestStrategy,
+        latch_key_prefix=driver.CONTINUOUS_TRIAL_KEY_PREFIX,
+    )
+    assert result.trials == ()
+    assert result.strategy_position_events == {}
+
+
+def test_the_result_carries_the_position_event_counts(
+    driver: ModuleType, tmp_path: Path,
+) -> None:
+    """AM-4: `strategy.position_events.counts` rides along unconditionally
+    (populated from a REAL, non-empty count here), the same reporting-gap
+    fix `strategy_refusals`/`strategy_diagnostics` already got."""
+    latch_store_path = tmp_path / "state.db"
+    with driver._latch_context(
+        latch_store_path, key_prefix=driver.CONTINUOUS_TRIAL_KEY_PREFIX,
+    ) as latch:
+        latch.record_duplicate_fill(
+            STATION,
+            CLIMATE_DAY.isoformat(),
+            venue_order_id="pre-seeded",
+            qty=Decimal(1),
+            fill_px=Decimal("0.40"),
+            fee=Decimal(0),
+            ts_ns=WINDOW_OPEN_NS,
+        )
+    tape_instrument = _tape_instrument_no_close(driver, ask="0.40", size=10)
+    settlement_by_key = {(STATION, CLIMATE_DAY.isoformat()): _final_climate_day(tmax_f=87)}
+
+    result = driver.run_one_precision_arm(
+        tape_instruments=[tape_instrument],
+        observation_rows=_OBSERVATION_ROWS,
+        station=STATION,
+        lag_minutes=30,
+        precision_mode="nws_integer_c",
+        latch_store_path=latch_store_path,
+        settlement_by_key=settlement_by_key,
+        strategy_cls=driver.ContinuousRungHoldBacktestStrategy,
+        latch_key_prefix=driver.CONTINUOUS_TRIAL_KEY_PREFIX,
+    )
+    assert result.trials == ()
+    assert result.strategy_position_events == {"family_halt_at_start": 1}
+
+
+def test_a_reader_that_drops_a_facts_slug_fails_the_run_loudly(
+    driver: ModuleType, tmp_path: Path,
+) -> None:
+    """L-24 NEGATIVE: a `position_evidence_reader` that omits a candidate's
+    own slug halts the walk (`unreconciled_long_no_fill`) -- the driver
+    never masks that with its own flat-evidence injection when a caller
+    supplies a different reader directly."""
+    tape_instrument = _tape_instrument_no_close(driver, ask="0.40", size=10)
+    cfg = CurrentRungHoldConfig(
+        instrument_ids=(tape_instrument.instrument.id,), stations=(STATION,),
+    )
+    strategy = driver.ContinuousRungHoldBacktestStrategy(
+        cfg,
+        trial_day_latch_factory=driver._latch_factory(
+            tmp_path / "direct_state.db", key_prefix=driver.CONTINUOUS_TRIAL_KEY_PREFIX,
+        ),
+        position_evidence_reader=lambda: {
+            "v": 1,
+            "position_read_refused": False,
+            "eof_complete": True,
+            "fill_walk_complete": True,
+            "positions": [],
+        },
+    )
+    stopped: list[bool] = []
+    strategy.stop = lambda: stopped.append(True)  # type: ignore[method-assign]
+    from nautilus_trader.common.component import TestClock
+    from nautilus_trader.model.identifiers import TraderId
+    from nautilus_trader.portfolio import Portfolio
+    from nautilus_trader.test_kit.stubs.component import TestComponentStubs
+
+    clock = TestClock()
+    clock.set_time(WINDOW_OPEN_NS)
+    msgbus = TestComponentStubs.msgbus()
+    cache = TestComponentStubs.cache()
+    cache.add_instrument(tape_instrument.instrument)
+    portfolio = Portfolio(msgbus=msgbus, cache=cache, clock=clock)
+    strategy.register(
+        trader_id=TraderId("BACKTEST-001"), portfolio=portfolio,
+        msgbus=msgbus, cache=cache, clock=clock,
+    )
+    strategy.on_start()
+    assert stopped == [True]
+    assert strategy.position_events.count("unreconciled_long_no_fill") == 1
+
+
+def test_an_unbound_evidence_reader_raises_rather_than_emitting_empty_positions(
+    driver: ModuleType,
+) -> None:
+    """L-24 NEGATIVE: calling `_FlatStartupEvidence` before `bind()` raises
+    `ReplayEvidenceUnboundError` -- it must never silently emit an empty
+    `positions` list, which would read as UNKNOWN for every slug."""
+    evidence = driver._FlatStartupEvidence()
+    with pytest.raises(driver.ReplayEvidenceUnboundError):
+        evidence()
+
+
+def test_the_continuous_arm_uses_the_continuous_latch_key_prefix(
+    driver: ModuleType, tmp_path: Path,
+) -> None:
+    """C-add-1: the continuous arm writes under `CONTINUOUS_TRIAL_KEY_PREFIX`,
+    never the v2 default -- a v2-prefixed arm would write and read a prefix
+    the live v3 family never uses (L-8: a silent zero-trial run indistinguishable
+    from "no fills")."""
+    tape_instrument = _tape_instrument_no_close(driver, ask="0.40", size=10)
+    settlement_by_key = {(STATION, CLIMATE_DAY.isoformat()): _final_climate_day(tmax_f=87)}
+    latch_store_path = tmp_path / "state.db"
+
+    result = driver.run_one_precision_arm(
+        tape_instruments=[tape_instrument],
+        observation_rows=_OBSERVATION_ROWS,
+        station=STATION,
+        lag_minutes=1,
+        precision_mode="nws_integer_c",
+        latch_store_path=latch_store_path,
+        settlement_by_key=settlement_by_key,
+        strategy_cls=driver.ContinuousRungHoldBacktestStrategy,
+        latch_key_prefix=driver.CONTINUOUS_TRIAL_KEY_PREFIX,
+    )
+    assert len(result.trials) == 1
+    with driver._latch_context(
+        latch_store_path, key_prefix=driver.CONTINUOUS_TRIAL_KEY_PREFIX,
+    ) as latch:
+        record = latch.record(STATION, CLIMATE_DAY.isoformat())
+    assert record is not None
+    assert record.reason == "taken"
+
+
+def test_the_write_prefix_and_the_entry_context_read_prefix_are_the_same(
+    driver: ModuleType, tmp_path: Path,
+) -> None:
+    """AM-20/NB-6: `run_one_precision_arm` threads ONE `latch_key_prefix`
+    into both the write side (the strategy's own latch factory) and the
+    read side (`_entry_contexts_from_latch`) -- a mismatch would present as
+    a silent zero-trial "market" result (L-8). Proven end-to-end: the SAME
+    call that fills also successfully reads its own trial back out."""
+    tape_instrument = _tape_instrument_no_close(driver, ask="0.40", size=10)
+    settlement_by_key = {(STATION, CLIMATE_DAY.isoformat()): _final_climate_day(tmax_f=87)}
+
+    result = driver.run_one_precision_arm(
+        tape_instruments=[tape_instrument],
+        observation_rows=_OBSERVATION_ROWS,
+        station=STATION,
+        lag_minutes=1,
+        precision_mode="nws_integer_c",
+        latch_store_path=tmp_path / "state.db",
+        settlement_by_key=settlement_by_key,
+        strategy_cls=driver.ContinuousRungHoldBacktestStrategy,
+        latch_key_prefix=driver.CONTINUOUS_TRIAL_KEY_PREFIX,
+    )
+    # A prefix mismatch between the write side and `_entry_contexts_from_
+    # latch`'s read side would make `_filled_instrument_ids` non-empty but
+    # the latch record lookup miss, raising `EntryAskFromLatchMissingError`
+    # rather than silently returning zero -- so reaching a real trial here
+    # IS the coupling proof, not a weaker structural assertion.
+    assert len(result.trials) == 1
+    assert result.trials[0].fill_px == Decimal("0.40")
+
+
+def test_the_continuous_arm_calls_is_intent_open_and_reads_false(
+    driver: ModuleType, tmp_path: Path,
+) -> None:
+    """AM-17: the driver's own latch factory always binds a real
+    `SubmitIntentLatch` (`open_trial_day_latch`, never a bare
+    `TrialDayLatch`), so the continuous arm's inherited `_hunt_tick`
+    reaches `is_intent_open()` and reads `False` rather than raising
+    `TrialDayLatchError` -- proven end-to-end by the same fill this arm
+    already produces."""
+    tape_instrument = _tape_instrument_no_close(driver, ask="0.40", size=10)
+    settlement_by_key = {(STATION, CLIMATE_DAY.isoformat()): _final_climate_day(tmax_f=87)}
+
+    result = driver.run_one_precision_arm(
+        tape_instruments=[tape_instrument],
+        observation_rows=_OBSERVATION_ROWS,
+        station=STATION,
+        lag_minutes=1,
+        precision_mode="nws_integer_c",
+        latch_store_path=tmp_path / "state.db",
+        settlement_by_key=settlement_by_key,
+        strategy_cls=driver.ContinuousRungHoldBacktestStrategy,
+        latch_key_prefix=driver.CONTINUOUS_TRIAL_KEY_PREFIX,
+    )
+    assert len(result.trials) == 1
+
+
+def test_the_continuous_arm_selects_capture_instruments_exactly_once(
+    driver: ModuleType, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """C-add-2/L-31: `main` calls `_select_capture_instruments` exactly
+    once per invocation, regardless of how many precision arms it runs
+    inside the PRECISION_ARMS loop -- the per-definition-row reselect
+    defect measured elsewhere (`test_whole_tape_paper_replay.py:948`) has
+    no analogue on this NEW v3 path."""
+    calls: list[int] = []
+    tape_instrument = _tape_instrument_depth_and_quote_in_window(driver, ask="0.40", size=10)
+
+    def _counting_select(catalog: object, *, climate_day: dt.date) -> list[object]:
+        calls.append(1)
+        return [tape_instrument]
+
+    monkeypatch.setattr(driver, "_select_capture_instruments", _counting_select)
+    monkeypatch.setattr(driver, "_convert_live_capture", lambda **kw: object())
+    monkeypatch.setattr(driver, "climate_day_records_to_settlement", lambda *a, **kw: {})
+    monkeypatch.setattr(driver, "read_asos_rows", lambda path: _OBSERVATION_ROWS)
+    monkeypatch.setattr(
+        driver,
+        "run_one_precision_arm",
+        lambda **kw: driver.PrecisionArmResult(trials=()),
+    )
+    assert len(driver.PRECISION_ARMS) >= 2  # the loop this counts across
+
+    rc = driver.main(_minimal_argv(tmp_path, strategy="continuous_rung_hold"))
+    assert rc == 0
+    assert len(calls) == 1
+
+
+# ---------------------------------------------------------------------------
+# SP-4 increment E: the four-layer live-store guard
+# (`assert_replay_latch_store_is_not_live`), composing the shipped
+# `node_store_path_check` oracle (E-1) rather than re-deriving it.
+# ---------------------------------------------------------------------------
+
+
+def test_the_guard_refuses_a_path_the_running_node_owns_even_with_the_env_var_unset(
+    driver: ModuleType, tmp_path: Path,
+) -> None:
+    """PRIMARY LAYER (E-1): layer 1 refuses on the node's OWN `/proc`
+    environ alone -- it must fire even when layer 2's env var is UNSET in
+    THIS process, which is exactly why layer 1 leads."""
+    from tests.unit.test_exec_state_db_path import _write_process
+
+    proc_root = tmp_path / "proc"
+    candidate = tmp_path / "work" / "latch_nws_integer_c.db"
+    _write_process(
+        proc_root,
+        111,
+        [str(tmp_path / ".venv" / "bin" / "breezy-trade")],
+        {"POLYMARKET_US_EXEC_STATE_DB": str(candidate)},
+    )
+    with pytest.raises(driver.ReplayLatchStoreIsLiveError, match=re.escape(str(candidate))):
+        driver.assert_replay_latch_store_is_not_live(
+            [candidate], environ={}, proc_root=proc_root,
+        )
+
+
+def test_a_discovery_failed_oracle_is_reported_not_silently_treated_as_clean(
+    driver: ModuleType, tmp_path: Path,
+) -> None:
+    """E-1 degradation stance: an unreadable `/proc` never blocks the run
+    (refusing every replay on a `/proc` read failure would block real work
+    for no safety gain) but the report must carry the degradation, never
+    silently read as clean."""
+    unreadable_proc_root = tmp_path / "does-not-exist"
+    candidate = tmp_path / "work"
+    report = driver.assert_replay_latch_store_is_not_live(
+        [candidate], environ={}, proc_root=unreadable_proc_root,
+    )
+    assert report.oracle == "DISCOVERY_FAILED"
+    assert "DISCOVERY_FAILED" in report.render()
+
+
+def test_a_work_catalog_equal_to_the_resolved_exec_state_db_is_refused(
+    driver: ModuleType, tmp_path: Path,
+) -> None:
+    """AM-3 layer 2/3: an exact-match candidate is refused via the env-
+    resolved path, even with no running node found (`NO_NODE`, not a pass
+    signal by itself, but layer 3 still fires)."""
+    from breezy.adapters.polymarket_us.factories import EXEC_STATE_DB_ENV_VAR
+
+    live_db = tmp_path / "state" / "exec.sqlite3"
+    empty_proc_root = tmp_path / "proc"
+    empty_proc_root.mkdir()
+    with pytest.raises(driver.ReplayLatchStoreIsLiveError, match=re.escape(str(live_db))):
+        driver.assert_replay_latch_store_is_not_live(
+            [live_db],
+            environ={EXEC_STATE_DB_ENV_VAR: str(live_db)},
+            proc_root=empty_proc_root,
+        )
+
+
+def test_a_work_catalog_equal_to_the_exec_state_db_parent_dir_is_refused(
+    driver: ModuleType, tmp_path: Path,
+) -> None:
+    """AM-3 layer 3: the latch DB and its `-wal`/`-shm`/flock sidecars
+    share the store's DIRECTORY -- the real collision surface the exact-
+    match oracle (layer 1) cannot express."""
+    from breezy.adapters.polymarket_us.factories import EXEC_STATE_DB_ENV_VAR
+
+    live_db = tmp_path / "state" / "exec.sqlite3"
+    candidate_dir = tmp_path / "state"
+    empty_proc_root = tmp_path / "proc"
+    empty_proc_root.mkdir()
+    with pytest.raises(
+        driver.ReplayLatchStoreIsLiveError, match=re.escape(str(candidate_dir)),
+    ):
+        driver.assert_replay_latch_store_is_not_live(
+            [candidate_dir],
+            environ={EXEC_STATE_DB_ENV_VAR: str(live_db)},
+            proc_root=empty_proc_root,
+        )
+
+
+def test_a_latch_store_path_under_the_live_state_root_is_refused(
+    driver: ModuleType, tmp_path: Path,
+) -> None:
+    """L-24 NEGATIVE, layer 4 (markers, always in addition): a candidate
+    path substring-matching the live state-store root marker is refused
+    even with the env var unset and no running node found."""
+    candidate = tmp_path / "home" / "jon" / ".local" / "share" / "breezy" / "state" / "latch.db"
+    empty_proc_root = tmp_path / "proc"
+    empty_proc_root.mkdir()
+    with pytest.raises(driver.ReplayLatchStoreIsLiveError, match=re.escape(str(candidate))):
+        driver.assert_replay_latch_store_is_not_live(
+            [candidate], environ={}, proc_root=empty_proc_root,
+        )
+
+
+def test_every_derived_per_arm_latch_path_is_checked_not_only_the_work_catalog(
+    driver: ModuleType, tmp_path: Path,
+) -> None:
+    """CX-B3/CX-N4: the guard takes a SET of candidates, and EVERY layer
+    applies to EVERY candidate -- a CLEAN `work_catalog` must not mask a
+    live marker hit on one of its OWN derived per-arm latch paths."""
+    clean_work_catalog = tmp_path / "work"
+    live_latch_path = (
+        tmp_path / "home" / ".local" / "share" / "breezy" / "state" / "latch_archive_metar.db"
+    )
+    empty_proc_root = tmp_path / "proc"
+    empty_proc_root.mkdir()
+    with pytest.raises(
+        driver.ReplayLatchStoreIsLiveError, match=re.escape(str(live_latch_path)),
+    ):
+        driver.assert_replay_latch_store_is_not_live(
+            [clean_work_catalog, live_latch_path], environ={}, proc_root=empty_proc_root,
+        )
+
+
+def test_a_clean_tmp_work_catalog_passes_and_no_engine_is_constructed_on_refusal(
+    driver: ModuleType, tmp_path: Path,
+) -> None:
+    """L-24: a genuinely clean candidate set passes cleanly and reports
+    every layer that ran."""
+    clean_work_catalog = tmp_path / "work"
+    clean_latch = tmp_path / "work" / "latch_nws_integer_c.db"
+    empty_proc_root = tmp_path / "proc"
+    empty_proc_root.mkdir()
+    report = driver.assert_replay_latch_store_is_not_live(
+        [clean_work_catalog, clean_latch], environ={}, proc_root=empty_proc_root,
+    )
+    assert report.oracle == "NO_NODE"
+    assert report.env_set is False
+    assert report.candidates_checked == 2
+    assert report.markers_checked >= 3
+    assert "live_store_guard=oracle:NO_NODE env:unset markers:" in report.render()
+
+
+def test_the_guard_runs_before_convert_live_capture_writes_the_work_catalog(
+    driver: ModuleType, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """CX-B3, ordering: `_convert_live_capture` WRITES (and `mkdir`s)
+    `args.work_catalog` -- the guard must run BEFORE that call, and BEFORE
+    any engine/strategy is ever constructed (`run_one_precision_arm` must
+    never be reached on a refusal)."""
+    from tests.unit.test_exec_state_db_path import _write_process
+
+    tape_instrument = _tape_instrument_depth_and_quote_in_window(driver, ask="0.40", size=10)
+    work_catalog = tmp_path / "work"
+    proc_root = tmp_path / "proc"
+    _write_process(
+        proc_root,
+        111,
+        [str(tmp_path / ".venv" / "bin" / "breezy-trade")],
+        {"POLYMARKET_US_EXEC_STATE_DB": str(work_catalog)},
+    )
+
+    def _fail_if_called(*args: object, **kwargs: object) -> object:
+        raise AssertionError("must never be reached once the guard refuses")
+
+    real_guard = driver.assert_replay_latch_store_is_not_live
+    monkeypatch.setattr(driver, "_convert_live_capture", _fail_if_called)
+    monkeypatch.setattr(driver, "run_one_precision_arm", _fail_if_called)
+    monkeypatch.setattr(
+        driver,
+        "_select_capture_instruments",
+        lambda catalog, *, climate_day: [tape_instrument],
+    )
+    monkeypatch.setattr(
+        driver,
+        "assert_replay_latch_store_is_not_live",
+        lambda candidates, **kw: real_guard(candidates, environ={}, proc_root=proc_root),
+    )
+
+    with pytest.raises(driver.ReplayLatchStoreIsLiveError):
+        driver.main(_minimal_argv(tmp_path, strategy=None))
+    assert not work_catalog.exists()  # _convert_live_capture's own mkdir never ran

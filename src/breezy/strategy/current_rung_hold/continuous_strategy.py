@@ -45,6 +45,7 @@ from breezy.ingest.iem_observations import station_observation_data_type
 from breezy.registry.sites import default_registry
 from breezy.runtime.backtest_feed import NWS_BACKTEST_CLIENT_ID
 from breezy.runtime.order_enablement import OrderSubmissionPermit
+from breezy.runtime.paper_replay import EXPIRATION_LEG_PREFIX
 from breezy.strategy.current_rung_hold.config import CurrentRungHoldConfig
 from breezy.strategy.current_rung_hold.decision import Decision, Refuse, Take
 from breezy.strategy.current_rung_hold.offer_tape import OfferTape, OfferTapeRecord
@@ -295,6 +296,22 @@ class ContinuousRungHoldStrategy(Strategy):
         #: guard load-bearing. Popped on read so this never grows unbounded.
         self._decision_ask_by_station_day: dict[tuple[str, str], Decimal] = {}
 
+    def _submission_armed(self) -> bool:
+        """Whether this strategy holds a real order-submission capability.
+
+        Base body: ``bool(self._order_submission_permit is not None)`` --
+        identical to the raw predicate every one of the five call sites read
+        directly before this extraction (L-2 unit line: EQUAL for every
+        non-subclass instance; evaluation order preserved at every site --
+        `on_start`, `_hunt_tick`'s re-arm gate, the attempt-record and
+        in-flight-clear sites, and `_maybe_submit` -- never at a line
+        number, which shifts as the module changes).
+        Increment B's ``ContinuousRungHoldBacktestStrategy`` overrides this
+        to gate on a private backtest-only flag instead, while never holding
+        a real ``OrderSubmissionPermit`` (PERMIT ISOLATION).
+        """
+        return self._order_submission_permit is not None
+
     def on_start(self) -> None:
         if self._latch_factory is None:
             raise MissingTrialDayLatchError(
@@ -359,7 +376,7 @@ class ContinuousRungHoldStrategy(Strategy):
         # the never-arm walk would only halt every shadow-mode deployment
         # for no safety gain. This becomes live the moment a Phase 1
         # composition threads a real permit through.
-        if self._order_submission_permit is not None and not self._run_never_arm_walk():
+        if self._submission_armed() and not self._run_never_arm_walk():
             self.stop()
             return
 
@@ -698,7 +715,11 @@ class ContinuousRungHoldStrategy(Strategy):
             return
         # Phase 0 never arms (see `on_start`'s matching guard) -- the re-arm
         # gate and its attempt counter are Phase-1-only groundwork.
-        if self._order_submission_permit is not None:
+        # defence in depth -- attempts > 0 implies armed (guard at the
+        # attempt increment); removal is behaviourally inert, pinned by
+        # test_an_unarmed_strategy_never_records_an_attempt_across_many_
+        # eligible_depth_frames.
+        if self._submission_armed():
             attempts, last_attempt_ns = self._latch.attempt_state(station, climate_day_key)
             if attempts > 0 and not self._rearm_permitted(
                 station,
@@ -850,10 +871,10 @@ class ContinuousRungHoldStrategy(Strategy):
         # is inert by construction.
         self._decision_ask_by_station_day[(station, climate_day_key)] = ask
         self._latch.set_inflight(station, climate_day_key)
-        if self._order_submission_permit is not None:
+        if self._submission_armed():
             self._latch.record_attempt(station, climate_day_key, ts_ns=snapshot.ts_event)
         self._maybe_submit(iid, decision)
-        if self._order_submission_permit is None:
+        if not self._submission_armed():
             self._latch.clear_inflight(station, climate_day_key)
 
     def _rearm_permitted(
@@ -959,6 +980,20 @@ class ContinuousRungHoldStrategy(Strategy):
         `_hunt_tick`), never a raise.
         """
         super().on_order_filled(event)
+        if str(event.client_order_id).startswith(EXPIRATION_LEG_PREFIX):
+            # `check_instrument_expiration`'s own synthetic settlement-close
+            # order (`backtest/engine.pyx:5952`) is not a genuine hunt fill --
+            # counting it here would present the end-of-tape close as a
+            # SECOND fill on an already-consumed station-day, tripping the
+            # duplicate-fill family halt over a harness artefact, never a
+            # market fact (L-8; mirrors `resting_ladder.py`'s own exclusion
+            # of the same leg from its decision log, :290-297). Never joined,
+            # never consumed, never counted as a duplicate.
+            self.log.debug(
+                f"on_order_filled: ignoring the engine's synthetic expiration "
+                f"leg {event.client_order_id}",
+            )
+            return
         if event.last_qty.as_decimal() <= 0:
             return
         assert self._latch is not None
@@ -1084,7 +1119,7 @@ class ContinuousRungHoldStrategy(Strategy):
 
     def _maybe_submit(self, instrument_id: str, decision: Take) -> None:
         if not (
-            self._order_submission_permit is not None
+            self._submission_armed()
             and isinstance(self._config.stale_observation_minutes, int)
         ):
             self.log.info(

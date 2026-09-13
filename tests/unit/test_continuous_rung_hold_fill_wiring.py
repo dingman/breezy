@@ -38,6 +38,7 @@ from breezy.adapters.polymarket_us.exec.client import (
     FILL_KEY_PREFIX,
     DurableFillRecord,
 )
+from breezy.runtime.paper_replay import EXPIRATION_LEG_PREFIX
 from breezy.runtime.sqlite_store import SqliteStateStore
 from breezy.runtime.submit_intent import open_submit_intent_latch
 from breezy.strategy.current_rung_hold.continuous_strategy import ContinuousRungHoldStrategy
@@ -82,12 +83,13 @@ def _fill(
     last_qty: int = 1,
     last_px: str = "0.40",
     ts_event: int = WINDOW_OPEN_NS,
+    client_order_id: str | None = None,
 ) -> OrderFilled:
     return OrderFilled(
         trader_id=strategy.trader_id,
         strategy_id=strategy.id,
         instrument_id=instrument_id,
-        client_order_id=ClientOrderId(f"C-{venue_order_id}"),
+        client_order_id=ClientOrderId(client_order_id or f"C-{venue_order_id}"),
         venue_order_id=VenueOrderId(venue_order_id),
         account_id=AccountId("POLYMARKET_US-001"),
         trade_id=TradeId(f"T-{venue_order_id}"),
@@ -182,6 +184,61 @@ def test_a_second_genuine_fill_with_a_different_id_halts_the_family(
     strategy.on_data(_observation(temp_c_tenths=300, observed_at_ns=WINDOW_OPEN_NS - 1))
     strategy.on_quote_tick(_quote(INTERIOR_ID, ask="0.40", ts_event=WINDOW_OPEN_NS + NS_PER_MIN))
     assert len(strategy.offer_tape) == 0
+
+
+def test_the_engines_synthetic_expiration_leg_fill_never_trips_the_duplicate_halt(
+    store_path: Path, interior_instrument: BinaryOption,
+) -> None:
+    """A genuine fill consumes the TRIAL; the `BacktestEngine`'s own
+    end-of-tape settlement-close fill (`check_instrument_expiration`,
+    `client_order_id` stamped `EXPIRATION-LEG-<uuid4>`) is NOT a second
+    genuine fill and must never reach `_consume_or_flag_duplicate` --
+    counting it would present a harness artefact as a market fact and
+    family-halt every station-day on every backtest run (measured: this
+    was firing on every SP-4 F replay before this fix)."""
+    strategy = _register_and_start(
+        store_path=store_path,
+        instruments=(interior_instrument,),
+        position_evidence_reader=lambda: _PERMISSIVE_EVIDENCE,
+    )
+    strategy.on_order_filled(
+        _fill(strategy, instrument_id=INTERIOR_ID, venue_order_id="ord-1"),
+    )
+    strategy.on_order_filled(
+        _fill(
+            strategy,
+            instrument_id=INTERIOR_ID,
+            venue_order_id="expiration-leg-order",
+            client_order_id=f"{EXPIRATION_LEG_PREFIX}00000000-0000-0000-0000-000000000000",
+        ),
+    )
+    assert strategy._latch is not None
+    assert strategy._latch.is_family_halted() is False
+    assert strategy.diagnostics.count("family_halt_duplicate_fill") == 0
+    record = strategy._latch.record(STATION, CLIMATE_DAY.isoformat())
+    assert record is not None and record.venue_order_id == "ord-1"
+
+
+def test_a_second_genuine_fill_with_a_different_id_STILL_halts_after_the_expiration_leg_fix(
+    store_path: Path, interior_instrument: BinaryOption,
+) -> None:
+    """Regression guard for the fix above (§5 bucket 1, never weakened): a
+    SECOND fill that does NOT carry the expiration-leg prefix is still a
+    genuine duplicate and must still trip the family halt."""
+    strategy = _register_and_start(
+        store_path=store_path,
+        instruments=(interior_instrument,),
+        position_evidence_reader=lambda: _PERMISSIVE_EVIDENCE,
+    )
+    strategy.on_order_filled(
+        _fill(strategy, instrument_id=INTERIOR_ID, venue_order_id="ord-1"),
+    )
+    strategy.on_order_filled(
+        _fill(strategy, instrument_id=INTERIOR_ID, venue_order_id="ord-2"),
+    )
+    assert strategy._latch is not None
+    assert strategy._latch.is_family_halted() is True
+    assert strategy.diagnostics.count("family_halt_duplicate_fill") == 1
 
 
 def test_a_corrupt_existing_trial_record_fails_closed_never_raises(
