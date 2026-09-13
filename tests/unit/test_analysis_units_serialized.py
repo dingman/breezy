@@ -188,9 +188,14 @@ class _RealPathState:
     five-path scope (A-19 mechanism 2)."""
 
     path: Path
-    #: `st_size` at import time, or `None` if the path did not exist yet
-    #: (both real lock paths are measured ABSENT at session start -- see the
-    #: module docstring and SP-1.rev4.md's round-4 measurement block).
+    #: `st_size` at import time, or `None` if the path did not exist yet.
+    #: The real `breezy-studies.lock` MAY be present (offset 0) once the
+    #: first real wrapper run (`exec 9>>"$LOCK"`, no delete-on-exit by
+    #: design) has created it for the lifetime of the tmpfs -- see the
+    #: module docstring and SP-1.rev4.md's round-4 measurement block for the
+    #: absent-at-that-time baseline. The guard below always compares the
+    #: CURRENT state against THIS session-start snapshot, never against a
+    #: fixed absent/present assumption.
     offset: int | None
     #: For a directory-scoped entry (the three `$OUT` dirs): the filenames
     #: present at import time, so a later scan can find NEW entries only.
@@ -1098,11 +1103,18 @@ def test_no_wrapper_test_wrote_into_the_real_breezy_state_directory() -> None:
     subprocess-spawning test to this module MUST be inserted ABOVE this
     test, never below it, or this guard stops covering it.
 
-    Measured baseline (SP-1.rev4.md round-4): both real lock paths are
-    ABSENT today, so "absent at session start ⇒ still absent now" is a
-    clean, non-flaky assertion -- this guard never touches directory
-    equality on `~/.local/share/breezy/`, which the live node, recorder and
-    supervisor write to continuously (X-L27's reason for existing).
+    Measured baseline (SP-1.rev4.md round-4): both real lock paths were
+    ABSENT at that time. Since the first real study run (03:13:31Z
+    2026-09-13, `exec 9>>"$LOCK"` in `deploy/systemd/k1-daily-run.sh`, no
+    delete-on-exit by design), `/run/user/1000/breezy-studies.lock` now
+    legitimately EXISTS at size 0 for the lifetime of the tmpfs -- so the
+    guard below compares each lock path's CURRENT state against its OWN
+    `_SESSION_START_STATE` snapshot (`offset is None` ⇒ still absent;
+    `offset is not None` ⇒ still present at the SAME size) rather than
+    hard-coding "absent then, so absent now." This guard never touches
+    directory equality on `~/.local/share/breezy/`, which the live node,
+    recorder and supervisor write to continuously (X-L27's reason for
+    existing).
 
     P1-b (L-24 anti-vacuity, literal-set-first): with `XDG_RUNTIME_DIR` and
     `HOME` both absent from the RUNNER's own environment, `_SESSION_START_STATE`
@@ -1140,10 +1152,23 @@ def test_no_wrapper_test_wrote_into_the_real_breezy_state_directory() -> None:
     run_token_marker = "sp1-leakguard-"  # every token this module mints starts with this
     for state in _SESSION_START_STATE:
         if state.path.name == "breezy-studies.lock":
-            assert not state.path.is_file(), (
-                f"{state.path} exists now but was ABSENT at session start -- a "
-                "wrapper test flocked the REAL studies lock"
-            )
+            if state.offset is None:
+                assert not state.path.is_file(), (
+                    f"{state.path} exists now but was ABSENT at session start -- a "
+                    "wrapper test flocked the REAL studies lock"
+                )
+            else:
+                assert state.path.is_file(), (
+                    f"{state.path} was PRESENT at session start (size "
+                    f"{state.offset}) but is gone now -- a wrapper test deleted "
+                    "the REAL studies lock"
+                )
+                current_size = state.path.stat().st_size
+                assert current_size == state.offset, (
+                    f"{state.path} was present at session start with size "
+                    f"{state.offset} but is now size {current_size} -- a wrapper "
+                    "test wrote through the REAL studies lock"
+                )
             continue
         if state.offset is not None or state.path.is_file():
             found = any(
