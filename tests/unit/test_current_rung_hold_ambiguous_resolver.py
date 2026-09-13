@@ -44,6 +44,7 @@ from breezy.adapters.polymarket_us.exec.client import (
     StartupPositionSnapshot,
     _synthetic_get_fill_trade_id,
 )
+from breezy.adapters.polymarket_us.exec.endpoints import PORTFOLIO_POSITIONS_PATH
 from breezy.adapters.polymarket_us.operator_controls import (
     MAX_DAILY_BUDGET_USD_ENV_VAR,
     MAX_POSITION_COST_USD_ENV_VAR,
@@ -53,6 +54,8 @@ from breezy.adapters.polymarket_us.symbology import instrument_id_to_slug
 from breezy.adapters.polymarket_us.transport import VenueResponse
 from breezy.runtime.submit_intent import (
     CURRENT_INTENT_KEY,
+    RetirementReason,
+    SubmitIntent,
     SubmitIntentCorrupt,
     SubmitIntentMismatch,
     SubmitIntentState,
@@ -1580,3 +1583,195 @@ def test_connect_immediate_pass_exception_handler_logs_type_only_never_the_value
     assert "type(exc).__name__" in block
     assert "{exc}" not in block, "must never log the exception's own str -- it may carry a value"
     assert "str(exc)" not in block
+
+
+# ---------------------------------------------------------------------------
+# HF-4 (post-take re-arm reachability): C2 -- a 60s age-gated startup-
+# evidence refresh inside `_resolve_ambiguous_intents`, and a retire INFO
+# line in the resolver (B3, Decision 3). Fixtures reused, never redefined:
+# `_arm_one_ambiguous_intent`, `_run_exactly_one_pass`,
+# `_run_n_passes_recording_sleeps`, `_order_get_body`.
+# ---------------------------------------------------------------------------
+
+
+def _retired_intent(current: Any, *, retired_ns: int) -> SubmitIntent:
+    return SubmitIntent(
+        intent_id=current.intent_id,
+        fingerprint=current.fingerprint,
+        created_ns=current.created_ns,
+        state=SubmitIntentState.RETIRED,
+        retired_ns=retired_ns,
+        retirement_reason=RetirementReason.OPERATOR_CLEARED,
+    )
+
+
+@pytest.mark.asyncio
+async def test_a_pass_with_no_open_intent_refreshes_stale_startup_evidence(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    write_canonical_verified: None,  # noqa: F811
+) -> None:
+    """AC-12 (B4 i, R-9a): the refresh runs on EVERY pass, including one
+    with NO OPEN intent -- exactly when the strategy's re-arm gate is
+    shopping for fresh evidence."""
+    enable_operator_gate(monkeypatch, order_count="2")
+    with operator_control_env(MAX_DAILY_BUDGET_USD_ENV_VAR, "1000.00"), operator_control_env(
+        MAX_POSITION_COST_USD_ENV_VAR, "10.00",
+    ):
+        client, _order_id, _slug, _latch_cm, _order_events = await _arm_one_ambiguous_intent(
+            tmp_path,
+        )
+        assert client._latch is not None
+        current = client._latch.current()
+        assert current is not None
+        client._store_set(
+            CURRENT_INTENT_KEY,
+            _retired_intent(current, retired_ns=client._clock.timestamp_ns()).to_bytes(),
+        )
+        assert client._latch.current_open() is None
+
+        before = client.read_startup_position_evidence()
+        assert before is not None
+        client._last_evidence_write_ns = 0  # back-date -- force the refresh
+        # A DIFFERENT slug than `_connect`'s own read -- proves the rewrite
+        # reflects THIS pass's fresh GET, not a stale copy.
+        client._private_read._payloads[PORTFOLIO_POSITIONS_PATH] = {  # type: ignore[attr-defined]
+            "positions": {"a-different-market": {"netPosition": "3"}}, "eof": True,
+        }
+
+        await _run_exactly_one_pass(client)
+
+        after = client.read_startup_position_evidence()
+        assert after is not None
+        assert after.ts_ns > before.ts_ns
+        assert any(row.slug == "a-different-market" for row in after.positions)
+        await client._disconnect()
+
+
+@pytest.mark.asyncio
+async def test_a_fresh_evidence_record_is_not_refetched_within_the_refresh_interval(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    write_canonical_verified: None,  # noqa: F811
+) -> None:
+    """AC-13: at most one positions GET per 60s from the refresh -- a
+    second pass immediately after the first (well inside the 60s window
+    the first pass's OWN write just re-armed) must not re-fetch."""
+    enable_operator_gate(monkeypatch, order_count="2")
+    with operator_control_env(MAX_DAILY_BUDGET_USD_ENV_VAR, "1000.00"), operator_control_env(
+        MAX_POSITION_COST_USD_ENV_VAR, "10.00",
+    ):
+        client, order_id, slug, _latch_cm, _order_events = await _arm_one_ambiguous_intent(
+            tmp_path,
+        )
+        # Non-terminal GET: the order-GET path itself never reads positions,
+        # isolating every positions-path hit to the refresh alone.
+        client._private_read._payloads[  # type: ignore[attr-defined]
+            f"/v1/order/{order_id}"
+        ] = _order_get_body(order_id, slug=slug, state="ORDER_STATE_NEW", cum_quantity=0)
+        client._last_evidence_write_ns = 0  # back-date -- pass 1 must refresh
+
+        original_read = client._private_read
+        positions_hits = {"count": 0}
+
+        async def _counting_read(path: str) -> Any:
+            if path == PORTFOLIO_POSITIONS_PATH:
+                positions_hits["count"] += 1
+            return await original_read(path)
+
+        client._private_read = _counting_read  # type: ignore[assignment]
+
+        await _run_n_passes_recording_sleeps(client, passes=2, monkeypatch=monkeypatch)
+
+        assert positions_hits["count"] == 1
+        await client._disconnect()
+
+
+@pytest.mark.asyncio
+async def test_a_failed_refresh_read_leaves_the_prior_evidence_intact_and_the_resolver_alive(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    write_canonical_verified: None,  # noqa: F811
+) -> None:
+    """AC-14: a failed refresh GET is caught, logged WARNING, leaves the
+    prior record intact, never calls `_refuse`, never touches
+    `_resolver_consecutive_failures` (that counter belongs to the
+    order-GET path only), and never kills the coroutine -- a LATER pass
+    with the endpoint restored still resolves.
+
+    Deviation from the plan's own wording (verified, not assumed): `self.
+    _log` is Nautilus's OWN Cython logger with READ-ONLY attributes --
+    `client._log = <double>` raises `AttributeError: attribute '_log' ...
+    is not writable`, and `client._log.info = <double>` raises the same
+    for the Logger object itself (measured directly against the installed
+    `nautilus_trader.common.component.Logger`). `caplog` cannot observe it
+    either (the established limitation this file's own
+    `test_connect_immediate_pass_exception_handler_logs_type_only_never_
+    the_value` already documents). Both the refresh's own WARNING and the
+    resolver's retire INFO (B3) are therefore pinned by SOURCE TEXT below
+    -- the same reliable check that existing test already uses -- never a
+    runtime double."""
+    enable_operator_gate(monkeypatch, order_count="2")
+    with operator_control_env(MAX_DAILY_BUDGET_USD_ENV_VAR, "1000.00"), operator_control_env(
+        MAX_POSITION_COST_USD_ENV_VAR, "10.00",
+    ):
+        client, order_id, slug, _latch_cm, _order_events = await _arm_one_ambiguous_intent(
+            tmp_path,
+        )
+        prior = client.read_startup_position_evidence()
+        assert prior is not None
+        client._last_evidence_write_ns = 0  # back-date -- force the refresh to fire
+        del client._private_read._payloads[PORTFOLIO_POSITIONS_PATH]  # type: ignore[attr-defined]
+        failures_before = client._resolver_consecutive_failures
+        refused: list[str] = []
+        client._refuse = refused.append  # type: ignore[method-assign]
+        # Non-terminal GET: isolates the refresh's own exception handling
+        # from the order-GET failure path (which DOES touch the counter).
+        client._private_read._payloads[  # type: ignore[attr-defined]
+            f"/v1/order/{order_id}"
+        ] = _order_get_body(order_id, slug=slug, state="ORDER_STATE_NEW", cum_quantity=0)
+
+        await _run_exactly_one_pass(client)
+
+        after = client.read_startup_position_evidence()
+        assert after == prior
+        assert client._resolver_consecutive_failures == failures_before
+        assert refused == []
+
+        # A later pass, with the endpoint restored, still resolves.
+        client._private_read._payloads[PORTFOLIO_POSITIONS_PATH] = {  # type: ignore[attr-defined]
+            "positions": {}, "eof": True,
+        }
+        client._private_read._payloads[  # type: ignore[attr-defined]
+            f"/v1/order/{order_id}"
+        ] = _order_get_body(order_id, slug=slug, state="ORDER_STATE_CANCELED", cum_quantity=0)
+
+        await _run_exactly_one_pass(client)
+
+        assert client._latch is not None
+        current = client._latch.current()
+        assert current is not None
+        assert current.state is SubmitIntentState.RETIRED
+        await client._disconnect()
+
+    import inspect
+
+    refresh_source = inspect.getsource(PolymarketUSExecutionClient._resolve_ambiguous_intents)
+    assert "self._log.warning(" in refresh_source
+    assert "startup-evidence refresh" in refresh_source
+    for method, reason in (
+        (PolymarketUSExecutionClient._resolve_terminal_zero, "STATUS_REPORT_ZERO_FILL_TERMINAL"),
+        (PolymarketUSExecutionClient._resolve_accept_fill, "STATUS_REPORT_ACCEPT_FILL_TERMINAL"),
+    ):
+        source = inspect.getsource(method)
+        retire_call = f'self._retire(context.intent_id, "{reason}", now_ns)'
+        assert retire_call in source
+        assert "retired intent" in source
+        tail = source[source.index(retire_call) + len(retire_call) :]
+        # Immediately after `_retire(...)` -- an optional comment, then the
+        # ONE `self._log.info(...)` call, within the next few lines (never
+        # buried after unrelated logic further down the method).
+        immediate = tail[:250]
+        assert "self._log.info(" in immediate, (
+            f"{method.__name__}: the retire INFO line must immediately follow _retire()"
+        )
