@@ -69,6 +69,7 @@ from breezy.strategy.current_rung_hold.tick_eval import (
 from breezy.strategy.current_rung_hold.trial_day_latch import (
     TAKEN_FROM_FILL_WALK_REASON,
     TrialDayLatch,
+    TrialDayLatchError,
     TrialDayRecord,
     TrialDayRecordCorrupt,
     startup_evidence_confirms_absent_flat,
@@ -97,6 +98,8 @@ _DIAG_OPEN_INTENT_WAIT: Final[str] = "open_intent_wait"
 _DIAG_FAMILY_HALT: Final[str] = "family_halt_duplicate_fill"
 #: Slice 4 item E1 (plan rev 6.1, Resolution F): a re-arm gate WAIT.
 _DIAG_REARM_WAIT: Final[str] = "rearm_wait"
+#: HF-4 Decision 1 (1B): a stale IN_FLIGHT marker was released this tick.
+_DIAG_INFLIGHT_RELEASED: Final[str] = "inflight_released"
 #: Slice 4 items A1/A2 (plan rev 6.1): log-only position/fill events, never
 #: a refusal and never a WAIT diagnostic -- reported through
 #: `self.position_events`/`self.position_alerter`.
@@ -276,6 +279,14 @@ class ContinuousRungHoldStrategy(Strategy):
         #: capture (L-27) -- first-boot verification checks this is a
         #: non-`None` string, not merely the absence of a halt error.
         self.last_startup_evidence_summary: str | None = None
+        #: B3 (Decision 3, HF-4 rev2): mirrors `last_startup_evidence_
+        #: summary` above -- the MOST RECENT rearm decision line (release,
+        #: first-denial-per-reason, or a successful re-arm), asserted by
+        #: presence, never via log capture (L-27).
+        self.last_rearm_decision: str | None = None
+        #: AM-3 (Rev 2.1): dedupe set for `_record_rearm_denial_once`,
+        #: bounded -- see that method's own comment.
+        self._rearm_decision_dedupe: set[tuple[tuple[str, str], str]] = set()
         self._illegal_cell_station_days: set[tuple[str, str]] = set()
         self._eligible_snap_counts: dict[tuple[str, str], int] = {}
         self._fee_halt = False
@@ -694,12 +705,26 @@ class ContinuousRungHoldStrategy(Strategy):
         assert self._latch is not None
         if self._latch.is_consumed(station, climate_day_key):
             return
-        if self._latch.is_inflight(station, climate_day_key):
+        # AM-4 (HF-4 rev2.1): hoisted once per tick, BEFORE the IN_FLIGHT
+        # check below, so the stale-IN_FLIGHT release and the re-arm gate a
+        # few lines down share ONE store read instead of two. Phase 0
+        # (`order_submission_permit is None`) now pays this one extra read
+        # on every tick too, since the release check runs unconditionally --
+        # accepted cost (Decision 1, HF-4.rev2.md): Phase 0 already self-
+        # clears IN_FLIGHT at the end of this method regardless.
+        attempt_state = self._latch.attempt_state(station, climate_day_key)
+        if self._latch.is_inflight(station, climate_day_key) and not self._release_stale_inflight(
+            station,
+            climate_day_key,
+            attempts=attempt_state[0],
+            last_attempt_ns=attempt_state[1],
+            now_ns=snapshot.ts_event,
+        ):
             return
         # Phase 0 never arms (see `on_start`'s matching guard) -- the re-arm
         # gate and its attempt counter are Phase-1-only groundwork.
         if self._order_submission_permit is not None:
-            attempts, last_attempt_ns = self._latch.attempt_state(station, climate_day_key)
+            attempts, last_attempt_ns = attempt_state
             if attempts > 0 and not self._rearm_permitted(
                 station,
                 climate_day_key,
@@ -709,6 +734,7 @@ class ContinuousRungHoldStrategy(Strategy):
                 now_ns=snapshot.ts_event,
             ):
                 self.diagnostics.record(_DIAG_REARM_WAIT)
+                self._record_rearm_denial_once(station_day, attempts)
                 self._report_alerter(
                     self.diagnostics_alerter,
                     "continuous_rung_hold diagnostics report failed",
@@ -852,6 +878,14 @@ class ContinuousRungHoldStrategy(Strategy):
         self._latch.set_inflight(station, climate_day_key)
         if self._order_submission_permit is not None:
             self._latch.record_attempt(station, climate_day_key, ts_ns=snapshot.ts_event)
+            if attempt_state[0] > 0:
+                # B3 (Decision 3, HF-4 rev2): a genuine RE-arm (attempts
+                # already > 0 before this one), never the first attempt --
+                # the boot walk already has its own INFO line for that.
+                self._record_rearm_decision(
+                    f"rearm: {station}/{climate_day_key} re-armed "
+                    f"(attempt={attempt_state[0] + 1})"
+                )
         self._maybe_submit(iid, decision)
         if self._order_submission_permit is None:
             self._latch.clear_inflight(station, climate_day_key)
@@ -938,6 +972,108 @@ class ContinuousRungHoldStrategy(Strategy):
             return
         assert self._latch is not None
         self._latch.clear_inflight(facts.settlement_station, facts.climate_day.isoformat())
+
+    def _release_stale_inflight(
+        self,
+        station: str,
+        climate_day: str,
+        *,
+        attempts: int,
+        last_attempt_ns: int | None,
+        now_ns: int,
+    ) -> bool:
+        """HF-4 Decision 1 (1B): release a stale IN_FLIGHT marker once the
+        account-wide submit intent has CLOSED, so a non-fill outcome
+        (create-path zero-fill, a resolver terminal-zero resolution, a
+        crash before ``arm()``, or a restart against an already-retired
+        intent) makes PREREG v3 §5's attempts 2 and 3 reachable. A genuine
+        fill never reaches here: ``is_consumed`` short-circuits
+        ``_hunt_tick`` before IN_FLIGHT is ever consulted again (AC-7).
+
+        Returns ``True`` iff this call cleared the marker. Keyword-only,
+        no defaults (L-28), matching :meth:`_rearm_permitted`. Every
+        return path logs (L-30).
+        """
+        assert self._latch is not None
+        try:
+            intent_open = self._latch.is_intent_open()
+        except TrialDayLatchError:
+            # Edge case (Decision 1, fail-closed properties): an unbound
+            # intent_latch double raises rather than answers -- treated as
+            # OPEN, never release. A construction defect in a test double,
+            # never a live path (see ``open_trial_day_latch``).
+            self.log.debug(
+                f"rearm: {station}/{climate_day} inflight release skipped -- "
+                "is_intent_open() raised (unbound intent_latch); treating "
+                "as OPEN"
+            )
+            return False
+        if intent_open:
+            self.log.debug(
+                f"rearm: {station}/{climate_day} inflight release skipped -- "
+                "the account-wide submit intent is still OPEN"
+            )
+            return False
+        if last_attempt_ns is None or now_ns < last_attempt_ns + _REARM_MIN_DELAY_NS:
+            # `attempts == 0` with IN_FLIGHT set (Phase-0 residue / a
+            # pre-HF-4 crash) has `last_attempt_ns is None` -- fail closed,
+            # never release (`:857` already self-clears Phase 0). The
+            # same-burst race (`set_inflight` precedes `arm()`) is bounded
+            # by the same delay floor the re-arm gate itself uses.
+            self.log.debug(
+                f"rearm: {station}/{climate_day} inflight release skipped -- "
+                "the same-burst delay floor has not elapsed"
+            )
+            return False
+        self._latch.clear_inflight(station, climate_day)
+        self.diagnostics.record(_DIAG_INFLIGHT_RELEASED)
+        self._report_alerter(
+            self.diagnostics_alerter,
+            "continuous_rung_hold diagnostics report failed",
+        )
+        self._record_rearm_decision(
+            f"rearm: {station}/{climate_day} released a stale IN_FLIGHT "
+            f"marker (attempts={attempts})"
+        )
+        return True
+
+    def _record_rearm_denial_once(self, station_day: tuple[str, str], attempts: int) -> None:
+        """AC-17: one INFO per FIRST denial per ``(station_day, reason)`` --
+        an unconditional per-tick INFO would flood at depth-frame rate.
+        """
+        reason = "attempt_cap" if attempts >= _MAX_STATION_DAY_ATTEMPTS else "not_ready"
+        key = (station_day, reason)
+        if key in self._rearm_decision_dedupe:
+            return
+        # AM-3 (Rev 2.1, architect N1): bounded -- discard rather than grow
+        # unboundedly across a long-running process, citing the unbounded-
+        # diagnostics OOM lesson (`unit-memory-cap-is-containment`). NOT
+        # applied to the pre-existing `_resolver_stale_alerted_intent_ids`
+        # (out of scope, client.py).
+        if len(self._rearm_decision_dedupe) > 4096:
+            self._rearm_decision_dedupe = set()
+        self._rearm_decision_dedupe.add(key)
+        self._record_rearm_decision(
+            f"rearm: {station_day[0]}/{station_day[1]} denied reason={reason} "
+            f"attempts={attempts}"
+        )
+
+    def _record_rearm_decision(self, summary: str) -> None:
+        """B3 (Decision 3, HF-4 rev2): mirrors ``_record_startup_evidence_
+        summary`` (:474-488) -- stores the ONE summary line for this
+        transition on ``self.last_rearm_decision`` (asserted by presence,
+        L-27) and emits it via the overridable seam below. Stable grep
+        token ``rearm:``.
+        """
+        self.last_rearm_decision = summary
+        self._emit_rearm_decision(summary)
+
+    def _emit_rearm_decision(self, summary: str) -> None:
+        """Mirrors ``_emit_startup_evidence_summary`` (:490-501): production
+        body is exactly one ``self.log.info`` call -- overridable so a test
+        can record calls instead of asserting on captured log output (L-27).
+        """
+        self.log.info(summary)
 
     def on_order_filled(self, event: OrderFilled) -> None:
         """Slice 4 item A1 (plan rev 6.1): join a genuine fill to its
