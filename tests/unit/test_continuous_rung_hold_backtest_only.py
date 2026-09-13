@@ -10,18 +10,30 @@ from __future__ import annotations
 
 import ast
 import time
+from decimal import Decimal
 from pathlib import Path
 from typing import Any
 
 import pytest
 from nautilus_trader.common.component import TestClock
+from nautilus_trader.model.currencies import USD
+from nautilus_trader.model.data import OrderBookDepth10
+from nautilus_trader.model.events import OrderFilled
 from nautilus_trader.model.identifiers import TraderId
 from nautilus_trader.model.instruments import BinaryOption
+from nautilus_trader.model.objects import Money
 from nautilus_trader.portfolio import Portfolio
 from nautilus_trader.test_kit.stubs.component import TestComponentStubs
 
 import breezy.strategy.current_rung_hold.continuous_backtest_only as continuous_backtest_only_module
 from breezy.adapters.polymarket_us.exec import submit_chain
+from breezy.runtime.backtest_feed import as_backtest_data
+from breezy.runtime.backtest_harness import backtest
+from breezy.runtime.paper_replay import (
+    ReplayEntryContext,
+    build_paper_replay_config,
+    filled_trials_from_engine,
+)
 from breezy.strategy.current_rung_hold.config import CurrentRungHoldConfig
 from breezy.strategy.current_rung_hold.continuous_backtest_only import (
     ContinuousNotABacktestClockError,
@@ -243,7 +255,7 @@ def test_on_start_still_stops_when_startup_evidence_is_absent(
         position_evidence_reader=lambda: None,
     )
     stopped: list[bool] = []
-    strategy.stop = lambda: stopped.append(True)  # type: ignore[method-assign]
+    strategy.stop = lambda: stopped.append(True)
     strategy.on_start()
     assert stopped == [True]
     assert strategy.position_events.count("startup_evidence_missing") == 1
@@ -262,7 +274,7 @@ def test_on_start_still_stops_when_one_candidate_slug_is_missing_from_evidence(
         position_evidence_reader=lambda: evidence,
     )
     stopped: list[bool] = []
-    strategy.stop = lambda: stopped.append(True)  # type: ignore[method-assign]
+    strategy.stop = lambda: stopped.append(True)
     strategy.on_start()
     assert stopped == [True]
     assert strategy.position_events.count("unreconciled_long_no_fill") == 1
@@ -283,7 +295,7 @@ def test_the_armed_subclass_reaches_submit_order_where_the_parent_only_logs(
         position_evidence_reader=lambda: _PERMISSIVE_EVIDENCE,
     )
     submitted: list[object] = []
-    strategy.submit_order = submitted.append  # type: ignore[method-assign]
+    strategy.submit_order = submitted.append
     strategy.on_data(_observation(temp_c_tenths=300, observed_at_ns=WINDOW_OPEN_NS - 1))
     strategy.on_quote_tick(_quote(INTERIOR_ID, ask="0.40", ts_event=WINDOW_OPEN_NS))
     assert len(submitted) == 1
@@ -320,7 +332,7 @@ def test_one_station_day_submits_at_most_one_order_across_many_eligible_depth_fr
         position_evidence_reader=lambda: _PERMISSIVE_EVIDENCE,
     )
     submitted: list[object] = []
-    strategy.submit_order = submitted.append  # type: ignore[method-assign]
+    strategy.submit_order = submitted.append
     strategy.on_data(_observation(temp_c_tenths=300, observed_at_ns=WINDOW_OPEN_NS - 1))
     for i in range(10):
         depth = _depth(
@@ -348,7 +360,7 @@ def test_a_wait_class_deny_lets_a_later_frame_produce_a_SECOND_attempt(
         position_evidence_reader=lambda: _PERMISSIVE_EVIDENCE,
     )
     submitted: list[object] = []
-    strategy.submit_order = submitted.append  # type: ignore[method-assign]
+    strategy.submit_order = submitted.append
 
     strategy.on_data(_observation(temp_c_tenths=300, observed_at_ns=WINDOW_OPEN_NS - 1))
     strategy.on_quote_tick(_quote(INTERIOR_ID, ask="0.40", ts_event=WINDOW_OPEN_NS))
@@ -376,17 +388,100 @@ def test_a_wait_class_deny_lets_a_later_frame_produce_a_SECOND_attempt(
     assert len(submitted) == 2
 
 
-@pytest.mark.xfail(
-    reason=(
-        "F0 row 6: fill-before-next-frame interleave NOT measured in this "
-        "pass; coordinator gates increment F on measuring it"
-    ),
-    strict=True,
-)
-def test_a_fill_is_delivered_before_the_next_depth_frame_is_handled_is_UNSETTLED() -> None:
-    raise NotImplementedError(
-        "ordering probe requires a real BacktestEngine/SimulatedExchange run; "
-        "not built in this pass (see the xfail reason)",
+def test_a_fill_is_delivered_before_the_next_depth_frame_is_handled(
+    store_path: Path, interior_instrument: BinaryOption, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """F0 row 6 (AM-8), MEASURED through a REAL `BacktestEngine` +
+    `SimulatedExchange` run -- the at-most-one-submission COUNT invariant
+    (`test_one_station_day_submits_at_most_one_order_...` above) is proven
+    at the unit level with a stubbed `submit_order` and never exercises a
+    real fill; this is the ORDER claim AM-8 distinguishes from it, over a
+    REAL matching engine.
+
+    Geometry (all real market data, no stubbing): a pre-window
+    `OrderBookDepth10` populates the exchange's own book without arming a
+    hunt attempt (`outside_decision_window`, no `IN_FLIGHT`); an in-window
+    `QuoteTick` at the window's opening instant drives `_hunt_tick` to
+    submit an IOC that fills SYNCHRONOUSLY inside the engine's processing
+    of that one data point (`BacktestEngine._process_and_settle_venues`
+    drains the exchange's command queue on every `ts_init`, not on a
+    deferred tick); a SECOND `OrderBookDepth10` frame just ONE nanosecond
+    later probes the tightest boundary the engine can express. The
+    strategy's own `IN_FLIGHT` flag (set at `:730`, before the order is
+    even sent) already makes double-submission structurally impossible
+    regardless of this ordering -- what this test measures is whether the
+    fill's OWN delivery is visible (i.e. `on_order_filled` has already run)
+    by the time that immediately-following frame is dispatched, which the
+    measurement below confirms it is.
+
+    Spies on the class methods (the strategy instance is constructed
+    inside `backtest()`, so there is no instance to patch beforehand)."""
+    interior_instrument.info["fee_coefficient"] = "0.06"
+    call_order: list[str] = []
+    original_on_filled = ContinuousRungHoldBacktestStrategy.on_order_filled
+    original_on_depth = ContinuousRungHoldBacktestStrategy.on_order_book_depth
+
+    def _spy_on_filled(self: ContinuousRungHoldBacktestStrategy, event: OrderFilled) -> None:
+        call_order.append("on_order_filled")
+        original_on_filled(self, event)
+
+    def _spy_on_depth(
+        self: ContinuousRungHoldBacktestStrategy, depth: OrderBookDepth10,
+    ) -> None:
+        call_order.append(f"on_order_book_depth:{depth.ts_event}")
+        original_on_depth(self, depth)
+
+    monkeypatch.setattr(ContinuousRungHoldBacktestStrategy, "on_order_filled", _spy_on_filled)
+    monkeypatch.setattr(
+        ContinuousRungHoldBacktestStrategy, "on_order_book_depth", _spy_on_depth,
+    )
+
+    depth_pre_ts = WINDOW_OPEN_NS - 1_000
+    quote_ts = WINDOW_OPEN_NS
+    depth_post_ts = WINDOW_OPEN_NS + 1
+    depth_pre = _depth(
+        INTERIOR_ID, bids=(("0.01", 10),), asks=(("0.40", 10),), ts_event=depth_pre_ts,
+    )
+    quote = _quote(INTERIOR_ID, ask="0.40", ts_event=quote_ts)
+    depth_post = _depth(
+        INTERIOR_ID, bids=(("0.01", 10),), asks=(("0.40", 10),), ts_event=depth_post_ts,
+    )
+    observation = _observation(
+        temp_c_tenths=300, observed_at_ns=WINDOW_OPEN_NS - 5 * NS_PER_MIN,
+    )
+    config = build_paper_replay_config(
+        instruments=[interior_instrument],
+        market_data=[depth_pre, quote, depth_post],
+        weather_data=as_backtest_data([observation]),
+        starting_balances=(Money(10_000, USD),),
+        capture_window_ns=(depth_pre_ts, depth_post_ts),
+        instruments_without_close=frozenset({interior_instrument.id}),
+    )
+    strategy = ContinuousRungHoldBacktestStrategy(
+        CurrentRungHoldConfig(instrument_ids=(interior_instrument.id,)),
+        trial_day_latch_factory=_cont_latch_factory(store_path),
+        position_evidence_reader=lambda: _PERMISSIVE_EVIDENCE,
+    )
+    with backtest(
+        config, strategies=(strategy,), allow_idle_strategies=True, allow_open_positions=True,
+    ) as engine:
+        ctx = ReplayEntryContext(
+            station=STATION,
+            climate_day=CLIMATE_DAY.isoformat(),
+            bucket=None,
+            entry_ask=Decimal("0.40"),
+            scheduled_release_at_ns=WINDOW_OPEN_NS + 7 * 24 * 3_600_000_000_000,
+        )
+        trials = filled_trials_from_engine(engine, {str(interior_instrument.id): ctx})
+
+    assert len(trials) == 1
+    assert call_order == [
+        f"on_order_book_depth:{depth_pre_ts}",
+        "on_order_filled",
+        f"on_order_book_depth:{depth_post_ts}",
+    ], (
+        "MEASURED interleave differs from the expected fill-before-next-"
+        f"frame order -- call_order={call_order!r}"
     )
 
 
