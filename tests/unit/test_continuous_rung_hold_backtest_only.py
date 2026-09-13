@@ -415,7 +415,24 @@ def test_a_fill_is_delivered_before_the_next_depth_frame_is_handled(
     measurement below confirms it is.
 
     Spies on the class methods (the strategy instance is constructed
-    inside `backtest()`, so there is no instance to patch beforehand)."""
+    inside `backtest()`, so there is no instance to patch beforehand).
+
+    Two dead ends measured en route to this geometry, kept here because
+    each is a real engine fact worth not re-discovering (LOW finding #3):
+    (1) a depth frame whose OWN just-arrived ask is the ONLY liquidity in
+    the book NEVER fills when `_hunt_tick` reacts to that SAME frame -- the
+    resulting IOC is CANCELED every time, regardless of whether an earlier,
+    separate, out-of-window depth frame had already announced the identical
+    price/size. Same-tick self-liquidity does not fill. (2) a genuinely
+    one-sided `OrderBookDepth10` (`bids=()`, the pad-only shape every
+    direct-call unit test above uses) also never fills through a REAL
+    `SimulatedExchange`, even when fed as a separate, earlier, book-
+    populating frame -- the direct-call tests never notice because they
+    stub `submit_order` and never reach real matching. Neither is an AM-8
+    ordering finding; both are prerequisites this test's final geometry
+    (two-sided book, quote-triggered fill) had to route around to measure
+    the actual question: whether the fill is visible before the very next
+    frame."""
     interior_instrument.info["fee_coefficient"] = "0.06"
     call_order: list[str] = []
     original_on_filled = ContinuousRungHoldBacktestStrategy.on_order_filled
