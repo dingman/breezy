@@ -87,6 +87,8 @@ __all__ = [
     "TrialDayRecord",
     "TrialDayRecordCorrupt",
     "open_trial_day_latch",
+    "startup_evidence_confirms_absent_flat",
+    "startup_evidence_lists_slug",
     "startup_evidence_permits_arm",
     "startup_evidence_position_for",
 ]
@@ -700,16 +702,19 @@ def startup_evidence_permits_arm(evidence: dict[str, object] | None) -> bool:
 def startup_evidence_position_for(
     evidence: dict[str, object] | None, slug: str,
 ) -> Decimal | None:
-    """The net position for ``slug`` out of ``evidence["positions"]``.
+    """The net position for ``slug`` out of ``evidence["positions"]``, when
+    ``slug`` is LISTED on the page.
 
-    ``None`` (UNKNOWN, never flat -- three-seam Slice 4 review item 5) when:
-    ``evidence`` itself is absent/unreadable; the ``positions`` field is
-    malformed; ``slug`` is ABSENT from the list (the client seam now emits
-    every slug from the page, so an absence is a read gap, not evidence of
-    "no position"); or the row's own ``net_position`` is JSON ``null`` (the
-    client's explicit "this row was unreadable" signal) or any other
-    non-numeric-string value. Callers (the never-arm walk, the re-arm gate)
-    both fail closed on ``None``.
+    ``None`` (UNKNOWN) when: ``evidence`` itself is absent/unreadable; the
+    ``positions`` field is malformed; ``slug`` is absent from the list (see
+    R-8, ``docs/core/PROGRESS.md`` -- for a *candidate* instrument this is
+    now interpreted as confirmed-flat by :func:`startup_evidence_confirms_
+    absent_flat`, not by this raw accessor); or the row's own
+    ``net_position`` is JSON ``null`` (the client's explicit "this row was
+    unreadable" signal) or any other non-numeric-string value. This
+    function remains the raw, byte-unchanged accessor; interpretation of an
+    ABSENT slug now lives in :func:`startup_evidence_lists_slug` and
+    :func:`startup_evidence_confirms_absent_flat`.
     """
     if evidence is None:
         return None
@@ -727,6 +732,84 @@ def startup_evidence_position_for(
         except InvalidOperation:
             return None
     return None
+
+
+def startup_evidence_lists_slug(evidence: dict[str, object] | None, slug: str) -> bool:
+    """``True`` iff ``evidence["positions"]`` (read via ``.get``, HB4)
+    contains a mapping whose ``"slug"`` equals ``slug``. Non-mapping rows
+    are skipped while scanning, mirroring :func:`startup_evidence_position_
+    for` exactly (HB1/E12) -- a garbage row elsewhere in the list must never
+    stop a genuine match from being found on the PRESENT branch.
+
+    ``False`` when ``evidence`` is ``None``, matching its two siblings
+    :func:`startup_evidence_permits_arm` and :func:`startup_evidence_
+    position_for` (N1).
+    """
+    if evidence is None:
+        return False
+    positions = evidence.get("positions")
+    if not isinstance(positions, list):
+        return False
+    for row in positions:
+        if isinstance(row, dict) and row.get("slug") == slug:
+            return True
+    return False
+
+
+def startup_evidence_confirms_absent_flat(
+    evidence: dict[str, object] | None,
+    slug: str,
+    *,
+    now_ns: int,
+    max_age_ns: int,
+) -> bool:
+    """R-8 (2026-09-12, ``docs/core/PROGRESS.md``): ``True`` only when a
+    candidate ``slug`` ABSENT from the startup positions page is confirmed
+    FLAT rather than UNKNOWN.
+
+    The producer (``PolymarketUSExecutionClient._write_startup_position_
+    evidence``, ``exec/client.py:2422-2456``) emits only slugs the venue's
+    ``eof: true`` page names, so a never-traded candidate market is absent
+    BY CONSTRUCTION -- three-seam Slice 4 review item 5's "ABSENT ⇒ UNKNOWN"
+    reading made the PASS state unreachable for any first trade (a gate
+    that cannot open is a stop, not a safety check). This is SUPERSEDED for
+    candidate instruments; item 2's producer docstring ("the never-arm
+    latch treats an ABSENT slug as a confirmed-flat zero",
+    ``exec/client.py:2433-2438``) is the operative contract.
+
+    Requires, in addition to :func:`startup_evidence_permits_arm`: the
+    ``positions`` field is a list; NO element of it is a non-mapping row
+    (the absent-branch scan must be exhaustive for an absence to mean
+    anything -- a present-branch match is allowed to skip garbage rows,
+    but the absent branch may not, E13); ``slug`` is genuinely absent, not
+    merely unmatched because of a malformed row; and the record is FRESH.
+
+    **Unit contract (R2-B1, L-2):** ``now_ns`` and the record's ``ts_ns``
+    are BOTH wall-clock epoch nanoseconds. ``ts_ns`` is written by the exec
+    client's own ``self._clock.timestamp_ns()`` (``exec/client.py:2465``).
+    A caller that passes venue EVENT time here is a defect -- the
+    subtraction would understate the age under feed lag and silently
+    extend the ceiling (a fail-OPEN). ``now_ns`` and ``max_age_ns`` are
+    required keyword-only with NO defaults (L-28): this helper is
+    clock-free and measures nothing about its own caller's timing
+    discipline by having one.
+    """
+    if not startup_evidence_permits_arm(evidence):
+        return False
+    assert evidence is not None  # narrowed by permits_arm above
+    positions = evidence.get("positions")
+    if not isinstance(positions, list):
+        return False
+    for row in positions:
+        if not isinstance(row, dict):
+            return False
+    if startup_evidence_lists_slug(evidence, slug):
+        return False
+    ts = evidence.get("ts_ns")
+    if not isinstance(ts, int) or isinstance(ts, bool):
+        return False
+    age_ns = now_ns - ts
+    return 0 <= age_ns <= max_age_ns
 
 
 def open_trial_day_latch(

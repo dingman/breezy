@@ -9,7 +9,7 @@ Reuses the real-store harness from ``test_continuous_rung_hold_strategy.py``
 from __future__ import annotations
 
 import json
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from decimal import Decimal
 from pathlib import Path
@@ -17,7 +17,7 @@ from pathlib import Path
 import pytest
 from nautilus_trader.core.uuid import UUID4
 from nautilus_trader.model.currencies import USD
-from nautilus_trader.model.enums import LiquiditySide, OrderSide
+from nautilus_trader.model.enums import LiquiditySide, OmsType, OrderSide
 from nautilus_trader.model.events import OrderFilled
 from nautilus_trader.model.identifiers import (
     AccountId,
@@ -31,6 +31,7 @@ from nautilus_trader.model.identifiers import (
 )
 from nautilus_trader.model.instruments import BinaryOption
 from nautilus_trader.model.objects import Money, Price, Quantity
+from nautilus_trader.model.position import Position
 
 from breezy.adapters.polymarket_us.exec.client import (
     FILL_INDEX_KEY_PREFIX,
@@ -496,20 +497,23 @@ def test_never_arm_walk_halts_on_a_venue_long_with_no_durable_fill(
     assert strategy.position_events.count("unreconciled_long_no_fill") == 1
 
 
-def test_never_arm_walk_halts_when_the_slug_is_absent_from_positions(
+def test_never_arm_walk_arms_when_an_eof_complete_page_omits_the_slug(
     store_path: Path, interior_instrument: BinaryOption,
 ) -> None:
-    """Three-seam Slice 4 review item 5 [CRITICAL]: the client now emits
-    every slug from the page, so an ABSENT slug is a read gap (UNKNOWN),
-    never flat -- the never-arm walk must fail closed, not pass through."""
-    evidence = {**_PERMISSIVE_EVIDENCE, "positions": []}
+    """R-8 (2026-09-12): SUPERSEDES three-seam Slice 4 review item 5. The
+    producer (`PolymarketUSExecutionClient._write_startup_position_evidence`)
+    emits only slugs the venue's `eof: true` page names, so a never-traded
+    market is ABSENT by construction -- item 5's PASS state was unreachable
+    for any first trade. An absent slug on a fresh, eof-complete,
+    non-refused, fill-walk-complete page is confirmed FLAT, not UNKNOWN."""
+    evidence = {**_PERMISSIVE_EVIDENCE, "positions": [], "ts_ns": WINDOW_OPEN_NS}
     strategy = _register_and_start(
         store_path=store_path,
         instruments=(interior_instrument,),
         position_evidence_reader=lambda: evidence,
     )
-    assert strategy._run_never_arm_walk() is False
-    assert strategy.position_events.count("unreconciled_long_no_fill") == 1
+    assert strategy._run_never_arm_walk() is True
+    assert strategy.position_events.count("unreconciled_long_no_fill") == 0
 
 
 def test_never_arm_walk_halts_when_net_position_is_null(
@@ -530,12 +534,37 @@ def test_never_arm_walk_halts_when_net_position_is_null(
     assert strategy.position_events.count("unreconciled_long_no_fill") == 1
 
 
-def test_rearm_denied_when_the_slug_is_absent_from_positions(
+def test_rearm_permitted_when_an_eof_complete_page_omits_the_slug(
     store_path: Path, interior_instrument: BinaryOption,
 ) -> None:
-    """Three-seam Slice 4 review item 5: the re-arm gate fails closed the
-    same way the never-arm walk does -- absent slug -> no re-arm."""
-    evidence = {**_PERMISSIVE_EVIDENCE, "positions": []}
+    """R-8 (2026-09-12): the re-arm gate applies the SAME rule as the
+    never-arm walk (site 1), through the same helper and the same
+    freshness ceiling -- an absent slug on a fresh eof-complete page is
+    confirmed FLAT, not UNKNOWN. Supersedes three-seam Slice 4 review
+    item 5 for the re-arm gate (HB7)."""
+    evidence = {**_PERMISSIVE_EVIDENCE, "positions": [], "ts_ns": WINDOW_OPEN_NS}
+    strategy = _register_and_start(
+        store_path=store_path,
+        instruments=(interior_instrument,),
+        position_evidence_reader=lambda: evidence,
+    )
+    permitted = strategy._rearm_permitted(
+        STATION, CLIMATE_DAY.isoformat(), str(INTERIOR_ID),
+        attempts=1, last_attempt_ns=0, now_ns=10 * 365 * 24 * 3600 * 1_000_000_000,
+    )
+    assert permitted is True
+
+
+def test_rearm_denied_when_an_omitting_page_is_stale(
+    store_path: Path, interior_instrument: BinaryOption,
+) -> None:
+    """R2-B1/AC-6 (C2, HB7-2): the same freshness bound as the never-arm
+    walk, applied to the re-arm gate."""
+    evidence = {
+        **_PERMISSIVE_EVIDENCE,
+        "positions": [],
+        "ts_ns": WINDOW_OPEN_NS - 601 * 1_000_000_000,
+    }
     strategy = _register_and_start(
         store_path=store_path,
         instruments=(interior_instrument,),
@@ -546,6 +575,163 @@ def test_rearm_denied_when_the_slug_is_absent_from_positions(
         attempts=1, last_attempt_ns=0, now_ns=10 * 365 * 24 * 3600 * 1_000_000_000,
     )
     assert permitted is False
+
+
+def test_rearm_denied_when_a_lagging_ts_event_would_have_extended_the_ceiling(
+    store_path: Path, interior_instrument: BinaryOption,
+) -> None:
+    """R2-B1/R3-B1 (HB7-4): the freshness clause must read the WALL clock
+    (`self.clock.timestamp_ns()`) INSIDE `_rearm_permitted`, never the
+    venue EVENT time passed in as `now_ns` (which keeps its only existing
+    use, the delay-floor comparison). A lagging `ts_event` must NOT be
+    able to extend the 600s ceiling: evidence is 900s stale by wall
+    clock, but only 300s stale by the (wrongly lagging) event-time
+    `now_ns` -- an event-time subtraction would wrongly PERMIT; the
+    wall-clock read must DENY. Signature unchanged (R3-B1): same
+    six-argument shape the floor tests use."""
+    from nautilus_trader.common.component import TestClock
+
+    wall = WINDOW_OPEN_NS  # `_register(clock=...)` sets the clock to this.
+    clock = TestClock()
+    evidence = {
+        **_PERMISSIVE_EVIDENCE,
+        "positions": [],
+        "ts_ns": wall - 900 * 1_000_000_000,
+    }
+    strategy = _register_and_start(
+        store_path=store_path,
+        instruments=(interior_instrument,),
+        clock=clock,
+        position_evidence_reader=lambda: evidence,
+    )
+    lagging_event_time_now_ns = wall - 600 * 1_000_000_000
+    permitted = strategy._rearm_permitted(
+        STATION, CLIMATE_DAY.isoformat(), str(INTERIOR_ID),
+        attempts=1, last_attempt_ns=0, now_ns=lagging_event_time_now_ns,
+    )
+    assert permitted is False
+
+
+def test_rearm_denied_when_the_reconciled_portfolio_is_long(
+    store_path: Path, interior_instrument: BinaryOption,
+) -> None:
+    """Option B (HB7-3): the same Nautilus cross-check as the never-arm
+    walk (T3), applied to the re-arm gate."""
+    evidence = {**_PERMISSIVE_EVIDENCE, "positions": [], "ts_ns": WINDOW_OPEN_NS}
+    strategy = _register_and_start(
+        store_path=store_path,
+        instruments=(interior_instrument,),
+        position_evidence_reader=lambda: evidence,
+    )
+    fill = _fill(strategy, instrument_id=INTERIOR_ID, venue_order_id="ord-reconciled-long-2")
+    position = Position(interior_instrument, fill)
+    strategy.cache.add_position(position, OmsType.NETTING)
+    strategy.portfolio.initialize_positions()
+
+    permitted = strategy._rearm_permitted(
+        STATION, CLIMATE_DAY.isoformat(), str(INTERIOR_ID),
+        attempts=1, last_attempt_ns=0, now_ns=10 * 365 * 24 * 3600 * 1_000_000_000,
+    )
+    assert permitted is False
+
+
+def test_on_start_with_a_permit_arms_and_subscribes_when_the_page_omits_the_slug(
+    store_path: Path, interior_instrument: BinaryOption,
+) -> None:
+    """N5: drives the incident's actual entry path end to end -- `on_start`
+    with a real (non-None) `order_submission_permit`, `phase0_permit_guard=
+    False` (existing idiom, `test_phase0_permit_guard_false_...` below), and
+    an eof-complete page that omits every candidate slug. Before R-8 this
+    halted every family on its first live boot (2026-09-12 16:50:33Z, all
+    four families, 294 microseconds after subscribing); after R-8 the walk
+    arms and `on_start` reaches `subscribe_data` without stopping."""
+    from breezy.strategy.current_rung_hold.config import CurrentRungHoldConfig
+
+    evidence = {**_PERMISSIVE_EVIDENCE, "positions": [], "ts_ns": WINDOW_OPEN_NS}
+    cfg = CurrentRungHoldConfig(instrument_ids=(interior_instrument.id,))
+    strategy = ContinuousRungHoldStrategy(
+        cfg,
+        trial_day_latch_factory=lambda: _cont_latch_context_for(store_path),
+        order_submission_permit=object(),  # type: ignore[arg-type]
+        phase0_permit_guard=False,
+        position_evidence_reader=lambda: evidence,
+    )
+    _register_bare(strategy, instruments=(interior_instrument,))
+    strategy.start()
+    assert strategy.is_running
+    assert strategy.position_events.total() == 0
+
+
+def test_never_arm_walk_halts_when_an_omitting_page_is_stale(
+    store_path: Path, interior_instrument: BinaryOption,
+) -> None:
+    """R2-B1/AC-6 (C2): an eof-complete page omitting the candidate slug,
+    but written more than the freshness ceiling ago, must NOT be read as
+    flat -- absence only carries meaning while the record is fresh."""
+    evidence = {
+        **_PERMISSIVE_EVIDENCE,
+        "positions": [],
+        "ts_ns": WINDOW_OPEN_NS - 601 * 1_000_000_000,
+    }
+    strategy = _register_and_start(
+        store_path=store_path,
+        instruments=(interior_instrument,),
+        position_evidence_reader=lambda: evidence,
+    )
+    assert strategy._run_never_arm_walk() is False
+    assert strategy.position_events.count("unreconciled_long_no_fill") == 1
+
+
+def test_never_arm_walk_halts_when_the_reconciled_portfolio_is_long(
+    store_path: Path, interior_instrument: BinaryOption,
+) -> None:
+    """Option B (T3, N-T3): a candidate slug ABSENT from a fresh, complete
+    page must still halt if Nautilus's OWN reconciled portfolio shows a
+    LONG on the instrument -- B is an AND on the arming side (AC-7/AC-11),
+    never a substitute for the absence-confirms-flat read. Seeds a REAL
+    reconciled position the same way sibling weather tests do:
+    `Position(instrument, fill)` -> `cache.add_position(..., NETTING)` ->
+    `portfolio.initialize_positions()` (reads `cache.positions_open()`)."""
+    evidence = {**_PERMISSIVE_EVIDENCE, "positions": [], "ts_ns": WINDOW_OPEN_NS}
+    strategy = _register_and_start(
+        store_path=store_path,
+        instruments=(interior_instrument,),
+        position_evidence_reader=lambda: evidence,
+    )
+    fill = _fill(strategy, instrument_id=INTERIOR_ID, venue_order_id="ord-reconciled-long")
+    position = Position(interior_instrument, fill)
+    strategy.cache.add_position(position, OmsType.NETTING)
+    strategy.portfolio.initialize_positions()
+
+    assert strategy._run_never_arm_walk() is False
+    assert strategy.position_events.count("unreconciled_long_no_fill") == 1
+
+
+def test_a_present_zero_row_arms_even_when_the_reconciled_portfolio_is_long(
+    store_path: Path, interior_instrument: BinaryOption,
+) -> None:
+    """CHARACTERISATION (P1c, HB1 pin, L-33): Option B is scoped to the
+    ABSENCE branch only -- a PRESENT row at "0" arms exactly as it does
+    today (byte-equivalent to `net is not None and net <= 0`), even when
+    Nautilus's reconciled portfolio disagrees. No input that arms today
+    newly halts (AC-9(i)). No RED at any named git state; see the HF-1
+    return's MUTATION_RED_EVIDENCE (HB1's own mistake -- applying B to the
+    present branch too -- makes this pin fail, then is reverted)."""
+    evidence = {
+        **_PERMISSIVE_EVIDENCE,
+        "positions": [{"slug": str(INTERIOR_ID.symbol.value), "net_position": "0"}],
+    }
+    strategy = _register_and_start(
+        store_path=store_path,
+        instruments=(interior_instrument,),
+        position_evidence_reader=lambda: evidence,
+    )
+    fill = _fill(strategy, instrument_id=INTERIOR_ID, venue_order_id="ord-present-zero-anomaly")
+    position = Position(interior_instrument, fill)
+    strategy.cache.add_position(position, OmsType.NETTING)
+    strategy.portfolio.initialize_positions()
+
+    assert strategy._run_never_arm_walk() is True
 
 
 def test_never_arm_walk_unreadable_fill_index_halts(
@@ -669,6 +855,152 @@ def test_a_genuine_fill_freezes_the_attempt_counter(
     strategy.on_data(_observation(temp_c_tenths=300, observed_at_ns=WINDOW_OPEN_NS - 1))
     strategy.on_quote_tick(_quote(INTERIOR_ID, ask="0.40", ts_event=WINDOW_OPEN_NS + NS_PER_MIN))
     assert strategy._latch.attempt_state(STATION, CLIMATE_DAY.isoformat()) == before
+
+
+def test_startup_evidence_summary_names_completeness_age_and_each_decision() -> None:
+    """AC-13/N2 (S1): the pure summary renderer names eof_complete,
+    position_read_refused, fill_walk_complete, the page's slug count, the
+    evidence age in seconds, and each candidate's decision. Accepts
+    `evidence=None` (the evidence-missing return path, N2)."""
+    from breezy.strategy.current_rung_hold.continuous_strategy import (
+        _startup_evidence_summary,
+    )
+
+    evidence: dict[str, object] = {
+        "v": 1,
+        "ts_ns": WINDOW_OPEN_NS - 5 * 1_000_000_000,
+        "eof_complete": True,
+        "position_read_refused": False,
+        "fill_walk_complete": True,
+        "positions": [{"slug": "x", "net_position": "0"}],
+    }
+    summary = _startup_evidence_summary(
+        evidence,
+        now_ns=WINDOW_OPEN_NS,
+        decisions={"a.POLYMARKET_US": "absent-flat", "b.POLYMARKET_US": "LONG"},
+    )
+    assert "eof_complete=True" in summary
+    assert "position_read_refused=False" in summary
+    assert "fill_walk_complete=True" in summary
+    assert "page_slug_count=1" in summary
+    assert "age_secs=5.0" in summary
+    assert "absent-flat" in summary
+    assert "LONG" in summary
+
+    none_summary = _startup_evidence_summary(None, now_ns=WINDOW_OPEN_NS, decisions={})
+    assert "absent" in none_summary
+
+
+def _s2_family_halt(
+    store_path: Path, interior_instrument: BinaryOption,
+) -> ContinuousRungHoldStrategy:
+    strategy = _register_and_start(
+        store_path=store_path, instruments=(interior_instrument,),
+        position_evidence_reader=lambda: _PERMISSIVE_EVIDENCE,
+    )
+    assert strategy._latch is not None
+    strategy._latch.record_duplicate_fill(
+        STATION, CLIMATE_DAY.isoformat(), venue_order_id="ord-s2-halt",
+        qty=Decimal(1), fill_px=Decimal("0.4"), fee=Decimal(0), ts_ns=WINDOW_OPEN_NS,
+    )
+    return strategy
+
+
+def _s2_evidence_missing(
+    store_path: Path, interior_instrument: BinaryOption,
+) -> ContinuousRungHoldStrategy:
+    return _register_and_start(
+        store_path=store_path, instruments=(interior_instrument,),
+        position_evidence_reader=lambda: None,
+    )
+
+
+def _s2_fill_walk_unreadable(
+    store_path: Path, interior_instrument: BinaryOption,
+) -> ContinuousRungHoldStrategy:
+    store = SqliteStateStore(store_path)
+    with open_submit_intent_latch(store, store_path):
+        store.set(f"{FILL_INDEX_KEY_PREFIX}{INTERIOR_ID}", b"not json")
+    store.close()
+    return _register_and_start(
+        store_path=store_path, instruments=(interior_instrument,),
+        position_evidence_reader=lambda: _PERMISSIVE_EVIDENCE,
+    )
+
+
+def _s2_per_slug_halt(
+    store_path: Path, interior_instrument: BinaryOption,
+) -> ContinuousRungHoldStrategy:
+    evidence = {
+        **_PERMISSIVE_EVIDENCE,
+        "positions": [{"slug": str(INTERIOR_ID.symbol.value), "net_position": "1"}],
+    }
+    return _register_and_start(
+        store_path=store_path, instruments=(interior_instrument,),
+        position_evidence_reader=lambda: evidence,
+    )
+
+
+def _s2_success(
+    store_path: Path, interior_instrument: BinaryOption,
+) -> ContinuousRungHoldStrategy:
+    return _register_and_start(
+        store_path=store_path, instruments=(interior_instrument,),
+        position_evidence_reader=lambda: _PERMISSIVE_EVIDENCE,
+    )
+
+
+@pytest.mark.parametrize(
+    "make_strategy",
+    [
+        pytest.param(_s2_family_halt, id="family_halt"),
+        pytest.param(_s2_evidence_missing, id="evidence_missing"),
+        pytest.param(_s2_fill_walk_unreadable, id="fill_walk_unreadable"),
+        pytest.param(_s2_per_slug_halt, id="per_slug_halt"),
+        pytest.param(_s2_success, id="success"),
+    ],
+)
+def test_every_never_arm_walk_exit_path_records_a_startup_evidence_summary(
+    store_path: Path,
+    interior_instrument: BinaryOption,
+    make_strategy: Callable[[Path, BinaryOption], ContinuousRungHoldStrategy],
+) -> None:
+    """N2/S2 (L-27): every one of `_run_never_arm_walk`'s FIVE return paths
+    sets `self.last_startup_evidence_summary` to a non-None string --
+    asserted by presence, never via log capture."""
+    strategy = make_strategy(store_path, interior_instrument)
+    strategy._run_never_arm_walk()
+    assert strategy.last_startup_evidence_summary is not None
+
+
+@pytest.mark.parametrize(
+    "make_strategy",
+    [
+        pytest.param(_s2_family_halt, id="family_halt"),
+        pytest.param(_s2_evidence_missing, id="evidence_missing"),
+        pytest.param(_s2_fill_walk_unreadable, id="fill_walk_unreadable"),
+        pytest.param(_s2_per_slug_halt, id="per_slug_halt"),
+        pytest.param(_s2_success, id="success"),
+    ],
+)
+def test_every_never_arm_walk_exit_path_emits_the_startup_evidence_summary_at_info(
+    store_path: Path,
+    interior_instrument: BinaryOption,
+    make_strategy: Callable[[Path, BinaryOption], ContinuousRungHoldStrategy],
+) -> None:
+    """C5 (code-reviewer HIGH on 8ae97be): AC-13/N2 requires the summary to
+    be EMITTED at INFO on every one of the FIVE return paths, not merely
+    stored -- `self.last_startup_evidence_summary` alone leaves nothing in
+    `journalctl`/the node log for first-boot verification. A Breezy-owned
+    seam, `_emit_startup_evidence_summary`, is overridden here to record
+    calls (never Nautilus internals, never log capture, L-27). Exactly ONE
+    emission per walk invocation on every path, and its content matches
+    the stored summary exactly."""
+    strategy = make_strategy(store_path, interior_instrument)
+    emitted: list[str] = []
+    strategy._emit_startup_evidence_summary = emitted.append  # type: ignore[method-assign,assignment]
+    strategy._run_never_arm_walk()
+    assert emitted == [strategy.last_startup_evidence_summary]
 
 
 def test_family_halt_key_literal(store_path: Path) -> None:
