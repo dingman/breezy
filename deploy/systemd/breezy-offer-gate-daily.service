@@ -40,6 +40,10 @@ WorkingDirectory=/home/jon/breezy
 # cgroup, never the host-wide OOM killer.
 MemoryHigh=12G
 MemoryMax=16G
+
+# Shared aggregate ceiling across the nightly studies (see the slice file's
+# own comment for why it is usually redundant with the per-unit cap above).
+Slice=breezy-studies.slice
 UMask=0077
 
 # No EnvironmentFile, deliberately: this scan carries no venue credential and
@@ -53,25 +57,23 @@ UMask=0077
 # multi-line `/bin/bash -c '...'` driver directly here and `systemd-analyze
 # --user verify` printed "Ignoring unknown escape sequences" for it --
 # non-empty output, i.e. a FAIL by this repo's own verification convention
-# (see deploy/systemd/README.md section 2). `%h` is a systemd-NATIVE
-# specifier (the invoking user's home directory, valid in `--user` units),
-# resolved by systemd itself rather than by a shell, so it carries none of
-# that risk. The script creates the output directory itself
-# (`output_path.parent.mkdir(parents=True, exist_ok=True)`), so no `mkdir -p`
-# is needed here either. Today's snapshot overwrites `offer_gate_latest.md`;
-# a dated, committed snapshot belongs under `docs/evidence/` and is written
-# deliberately, not by the timer. The verdict is one `print()` in `main()`,
-# visible via `journalctl --user -u breezy-offer-gate-daily.service`.
+# (see deploy/systemd/README.md section 2). A WRAPPER SCRIPT PATH is still a
+# single plain command in exactly this sense (breezy-k1-daily.service's own
+# ExecStart= is the precedent). `%h` is a systemd-NATIVE specifier (the
+# invoking user's home directory, valid in `--user` units), resolved by
+# systemd itself rather than by a shell, so it carries none of that risk --
+# it is passed to the wrapper as its one required argument.
 #
-# ExecStartPre refreshes recent ASOS ahead of the scan (Item 4, BL-24: the
-# settlement-alignment cache otherwise never advances past whatever
-# incidental fetch last populated it, and the scan starves). Prefixed `-` so
-# an UNEXPECTED crash in the refresh script (as opposed to the per-site
-# shortfalls it already reports and swallows internally) can never block the
-# scan from running on whatever is already cached -- belt-and-suspenders on
-# top of the script's own fail-soft design, never a substitute for it.
-ExecStartPre=-/home/jon/breezy/.venv/bin/python /home/jon/breezy/scripts/analysis/asos_recent_refresh.py
-ExecStart=/home/jon/breezy/.venv/bin/python /home/jon/breezy/scripts/analysis/cli_basis_offer_gate_scan.py --output %h/.local/share/breezy/offer_gate/offer_gate_latest.md
+# SP-1 (2026-09-12): the ExecStartPre= ASOS refresh moved INSIDE
+# offer-gate-daily-run.sh so the whole run -- refresh AND scan -- sits behind
+# the shared studies flock (T3). Trade-off: systemd no longer shows a
+# separate ExecStartPre status line for the refresh step; its outcome is
+# preserved in the wrapper's own $LOG and, per A-17, also on stdout ->
+# journal. The refresh stays fail-soft exactly as before (an UNEXPECTED
+# crash never blocks the scan from running on whatever is already cached --
+# belt-and-suspenders on top of asos_recent_refresh.py's own fail-soft
+# design, never a substitute for it).
+ExecStart=/home/jon/breezy/deploy/systemd/offer-gate-daily-run.sh %h/.local/share/breezy/offer_gate
 
 # Mirrors breezy-k1-daily.service's TimeoutStartSec: for Type=oneshot this
 # bounds the whole run, and this scan reads a comparable (or smaller) slice

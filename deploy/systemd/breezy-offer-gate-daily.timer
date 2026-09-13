@@ -6,13 +6,17 @@ Documentation=file:///home/jon/breezy/scripts/analysis/cli_basis_offer_gate_scan
 [Timer]
 Unit=breezy-offer-gate-daily.service
 
-# Scheduled AFTER breezy-k1-daily.timer (22:30 UTC), per the brief -- this
+# Scheduled AFTER breezy-k1-daily.timer (01:35 UTC), per the brief -- this
 # scan is independent of K1's output and does not need to run after it for
 # correctness, but staggering local disk-bound daily jobs avoids any needless
 # overlap. UTC is stated explicitly (this host's clock is UTC -- see
 # breezy-k1-daily.timer's own comment) so the schedule cannot move if the
 # host timezone is ever changed.
-OnCalendar=*-*-* 22:45:00 UTC
+# MOVED 2026-09-12: 22:45Z fell inside the protected LST-union window
+# [16:45Z, 01:15Z) (no-start rule [16:35Z, 01:15Z) incl. the 16:40Z
+# STOP_PRIOR hop); see deploy/systemd/README.md "Protected window and
+# serialization".
+OnCalendar=*-*-* 02:05:00 UTC
 
 # Mirrors breezy-k1-daily.timer: a run missed because the host was down
 # fires as soon as the timer is next active, instead of being silently

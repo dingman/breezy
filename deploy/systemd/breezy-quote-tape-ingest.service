@@ -39,6 +39,19 @@ MemoryHigh=4G
 MemoryMax=6G
 UMask=0077
 
+# SP-1/I2d (2026-09-12): deprioritised against the shared nightly studies.
+# This unit fires `*:0/15` and still runs INSIDE the protected window P --
+# unlike the three heavy studies, it is deliberately NOT behind the studies
+# flock (T6/L-20: starving conversion would recreate "the catalog you query
+# is not the tape you capture"), so G2 is NOT met by this change -- it still
+# peaks ~4.0 G inside P every 15 minutes. `best-effort`/7 rather than
+# `idle` (A-5): `idle` can be starved indefinitely by the live node's own
+# I/O, which would recreate the same catalog-lag risk this deprioritisation
+# is trying to avoid, not fix it.
+Nice=10
+IOSchedulingClass=best-effort
+IOSchedulingPriority=7
+
 # No EnvironmentFile: this process holds no venue credential and opens no
 # socket, unlike breezy-quote-tape.service. It shares only the ONE variable
 # both the recorder and this process must agree on, so they can never be
@@ -67,7 +80,10 @@ SyslogIdentifier=breezy-quote-tape-ingest
 
 # NO SuccessExitStatus. Exit 0 = ran (even if every instance was skipped as
 # live, truncated, or already converted); exit 2 = usage/configuration error
-# (no catalog root, or the configured path is not a directory). See
+# (no catalog root, or the configured path is not a directory); exit 3 = at
+# least one instance's outcome was "failed" -- a hard per-file or per-type
+# conversion failure, distinct from an ordinary skip (SP-1/I3,
+# EXIT_CONVERSION_FAILED). See
 # src/breezy/runtime/quote_tape_ingest_cli.py's module docstring.
 
 # NOTE: no [Install] section. This unit is started BY the timer, never

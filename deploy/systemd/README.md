@@ -150,11 +150,11 @@ echo "recorder=$REC instance=$INST"
 7. **Only then, enable the timer.**
    ```bash
    systemctl --user enable --now breezy-k1-daily.timer
-   systemctl --user list-timers breezy-k1-daily.timer --no-pager   # next run 22:30Z
+   systemctl --user list-timers breezy-k1-daily.timer --no-pager   # next run 01:35Z (MOVED 2026-09-12, was 22:30Z)
    ```
    `--now` starts the *timer*, not the service. To prove the study runs without
-   waiting for 22:30Z: `systemctl --user start breezy-k1-daily.service` and read
-   `~/.local/share/breezy/k1/k1_daily.log`.
+   waiting for 01:35Z (MOVED 2026-09-12, was 22:30Z): `systemctl --user start
+   breezy-k1-daily.service` and read `~/.local/share/breezy/k1/k1_daily.log`.
 
 ### Expected capture gap
 
@@ -348,7 +348,11 @@ when the timer will fire, never which version of the service it will fire.
 - **ACTIVATED AND VERIFIED.** Units symlinked into `~/.config/systemd/user/`,
   `daemon-reload`ed, `systemd-analyze --user verify` silent (= clean).
   `breezy-quote-tape.service` active, `NRestarts=0`; `breezy-k1-daily.timer`
-  enabled, next fire 22:30Z. `Linger=yes`, so both survive reboot and logout.
+  enabled, next fire 22:30Z (ANNOTATED, MOVED 2026-09-12: true as of this
+  2026-09-02 record; `breezy-k1-daily.timer` now fires 01:35Z instead -- see
+  "Protected window and serialization" below; this dated observation is
+  annotated in place, never rewritten). `Linger=yes`, so both survive reboot
+  and logout.
 - **Nothing was lost.** The recorder took **28 s** to shut down cleanly on
   SIGTERM (inside the 120 s `TimeoutStopSec`, which is why that value is not
   the default 90). Preflight on the closed pre-cutover instance
@@ -391,9 +395,13 @@ first; M_B runs **unconditionally** afterward — a failed or cache-starved M_A
 never skips M_B's own daily sample. The schedule sits after the 12:15 UTC
 quote-tape-catalog ingest tick, after every dense station's previous climate
 day has closed (latest, SFO/LAX at UTC-8, closes at 08:00 UTC) and its CLI
-final has normally posted, and staggered a full hour off `breezy-k1-daily`
-(22:30 UTC) / `breezy-offer-gate-daily` (22:45 UTC) — see the timer file's own
-comment for the full reasoning.
+final has normally posted. It was originally staggered a full hour off
+`breezy-k1-daily`/`breezy-offer-gate-daily`.
+
+MOVED 2026-09-12: those two moved from (22:30 UTC) / (22:45 UTC) to `01:35
+UTC` / `02:05 UTC` (see "Protected window and serialization" below);
+`breezy-mb-daily` stayed at `13:30 UTC` -- see the timer file's own comment
+for the full reasoning.
 
 Both studies previously hard-coded `ASOS_FETCH_END` to a literal date with a
 comment instructing a human to hand-edit it forward each day
@@ -533,8 +541,9 @@ naive normal-approximation interval EXEC_SPINE R-9 refuses by name.
 Scheduled a full hour AFTER `breezy-mb-daily` (13:30 UTC) so the tally's read
 of the (unrelated) parquet store never races that unit's work, and a
 distinct hour from every other Breezy timer (`breezy-quote-tape-rotate`
-09:00, `breezy-k1-daily` 22:30, `breezy-offer-gate-daily` 22:45,
-`breezy-quote-tape-ingest` 00,06,12,18:15) — pinned by
+09:00, `breezy-quote-tape-ingest` 00,06,12,18:15, `breezy-k1-daily` 01:35,
+`breezy-offer-gate-daily` 02:05 (MOVED 2026-09-12, was 22:30/22:45)) —
+pinned by
 `tests/unit/test_deploy_timer_hours.py`, which parses every
 `deploy/systemd/*.timer`'s `OnCalendar=` line as text (no `systemd-analyze`
 shelling in the test suite; that check stays a manual step, below). No
@@ -675,3 +684,129 @@ pattern), `daemon-reload`, then
 `systemctl --user enable --now breezy-pm-crh-v2-tally.timer` — deliberately
 not run here; see the TRAP section above for the post-edit `daemon-reload`
 discipline that applies to any future edit of this unit too.
+
+## Orphan node after a supervisor restart is EXPECTED
+
+SP-1/I4 (2026-09-12), doc-only. A `systemctl --user restart
+breezy-trade-supervisor.service` — including the one this plan's build-side
+steps perform after any unit edit (see the TRAP section above) — does NOT
+kill a `breezy-trade` node the supervisor spawned, even one holding a live
+position. Verbatim journal quote (09-12 01:24:03, repeated 01:37:20):
+
+```
+Found left-over process 3196952 (breezy-trade) in control group … Ignoring
+```
+
+This reads like a defect. It is not. `breezy-trade-supervisor.service:131-144`
+("THE MOST IMPORTANT LINE IN THIS FILE") sets `KillMode=process`: systemd's
+default `KillMode=control-group` would SIGTERM (then SIGKILL) every process
+in the unit's cgroup, including a spawned node that may be holding a live
+position; `KillMode=process` signals ONLY the supervisor process itself. A
+node that outlives its supervisor is an anticipated, tested state, not an
+orphan — see L-26 (`docs/core/LESSONS.md`) and the `[B2]` supervisor-death
+adoption path (`trade_supervisor.py:700-737`), which re-adopts the
+PID-verified flock holder at the next 16:40Z cycle.
+
+**Never `SIGKILL` either process.** The only legitimate ways to stop a
+running node are the supervisor's own 16:40Z `STOP_PRIOR` hop, or an
+explicit operator SIGTERM. An `ExecStopPost=` "reaper" that cleaned up the
+left-over process on unit stop/restart was considered and REJECTED (T5): it
+would SIGTERM a node holding a live position, directly contradicting
+`KillMode=process` and L-26 — the exact failure this design exists to
+prevent.
+
+## Protected window and serialization
+
+SP-1 (2026-09-12): `breezy-k1-daily`, `breezy-mb-daily` and
+`breezy-offer-gate-daily` are the three nightly analysis studies. Two
+independent `systemd --user` timers had no shared lock, so they could (and,
+per the 2026-09-11 incident, did) run concurrently -- each already capped at
+its own `MemoryHigh=12G`/`MemoryMax=16G`
+(`tests/unit/test_analysis_units_memory_capped.py`), but nothing stopped two
+12-16G studies stacking at once, nor stopped either from starting beside the
+live trading node (pid 895135) during its LST-derived decision window.
+
+**The protected window, `P`.** Derived from `src/breezy/registry/sites.toml`'s
+`std_utc_offset_hours` (`{-5.0, -6.0, -8.0}` across the four supported
+stations) union'd with the live decision window
+`breezy.strategy.current_rung_hold.strategy._WINDOW_START_HOUR_LST` /
+`_WINDOW_END_HOUR_LST` = `[12:00, 17:00)` local standard time (never a UTC
+literal, never an IANA zone): `-5 -> 17:00-22:00Z`, `-6 -> 18:00-23:00Z`,
+`-8 -> 20:00-01:00Z`, union = `[17:00Z, 01:00Z)`, +/-15 min slack =
+**`P = [16:45Z, 01:15Z)`**. Including the 16:40Z `STOP_PRIOR` hop, the
+no-start rule is **`[16:35Z, 01:15Z)`**.
+`breezy.strategy.current_rung_hold.continuous_strategy` imports these same
+two constants rather than re-declaring them
+(`tests/unit/test_analysis_units_serialized.py`).
+
+**What moved.**
+
+- `breezy-k1-daily.timer`: `22:30Z -> 01:35Z` (MOVED 2026-09-12).
+- `breezy-offer-gate-daily.timer`: `22:45Z -> 02:05Z` (MOVED 2026-09-12).
+
+Both are now outside `P`, with `Persistent=true` kept on both.
+`breezy-mb-daily.timer` stays at `13:30Z`, already outside `P`.
+
+**Serialization.** `breezy-studies.slice` (new) gives the three heavy
+studies a shared `MemoryHigh=12G`/`MemoryMax=16G` aggregate ceiling --
+usually redundant with each unit's own per-service cap once the flock below
+holds, and mainly defence-in-depth against a bypassed lock or a future unit
+added to the slice before it is wrapped. It only binds once **installed**:
+`daemon-reload` alone does not create the `~/.config/systemd/user/`
+symlink; without it systemd instantiates an implicit, unbounded slice while
+`show <service> -p Slice` still reports the configured name (false green).
+The real observable is `systemctl --user show breezy-studies.slice -p
+MemoryHigh -p MemoryMax`. Each of the three wrappers (`k1-daily-run.sh`,
+`mb-daily-run.sh`, and the new `offer-gate-daily-run.sh`) now takes a
+host-wide, non-blocking `flock` on `breezy-studies.lock` (resolved under
+`$XDG_RUNTIME_DIR`, falling back to `$HOME/.local/share/breezy`) before
+doing any work: contention exits 0 (skip-not-kill -- `Persistent=true`
+never retriggers a healthy skip, and no sibling `OnFailure=` fires), while a
+lock-INFRASTRUCTURE failure (missing/unwritable lock directory) exits **75**
+(`EX_TEMPFAIL`) with its own distinct reason, loud in `journalctl` instead
+of silently skipping forever. `Conflicts=` was considered and rejected: it
+would SIGTERM the RUNNING job, the exact 2026-09-11 shape this design
+avoids.
+
+**Light-job exemption.** `breezy-pm-crh-v2-tally` (17:15Z), `breezy-live-tally`
+(14:30Z) and `breezy-score-live-trials` (14:15Z) stay outside this scheme --
+each is <=1 GB / <=60 s, well under the exemption threshold, and none is
+retimed or wrapped by this item.
+
+**Worst-case-runtime rule.** No heavy study starts within its own worst-case
+observed runtime before `16:35Z`: `breezy-offer-gate-daily` 11.5 min,
+`breezy-mb-daily` 36 min (13:30Z + 36 min = ~14:06Z, clear).
+
+**Reboot-catch-up residual.** `daemon-reload` can trigger an immediate
+`Persistent=true` catch-up run; a reboot can still fire a relocated heavy
+timer inside `P`. Accepted: the flock and slice still apply even then.
+
+**G2 is NOT met by this item.** `breezy-quote-tape-ingest.service` (`*:0/15`)
+still runs INSIDE `P` every 15 minutes and still peaks approximately 4.0 GB
+there -- starving conversion would recreate "the catalog you query is not
+the tape you capture", so it is only deprioritised (`Nice=10`,
+`IOSchedulingClass=best-effort`, `IOSchedulingPriority=7` -- never `idle`,
+which could itself be starved indefinitely by the live node's own I/O), not
+serialized behind the studies lock. Anyone reading Rev 2's G2 ("no >1 GB
+unit starts inside P") as satisfied by this item is reading it wrong.
+
+**`breezy-nws-ingest.service` residual.** This unit is installed on the host
+with no copy in this repo -- a pre-existing, out-of-scope residual, named
+here rather than silently inherited.
+
+**Declared stale cross-references (A-20).** MOVED 2026-09-12 retimed
+exactly `breezy-k1-daily.timer` (was `22:30`, MOVED 2026-09-12) and
+`breezy-offer-gate-daily.timer` (was `22:45`, MOVED 2026-09-12) (plus this
+file), correcting the old values above. Five OTHER files still carry a
+stale comment cross-reference to that same pre-move schedule, and are
+deliberately left unedited because each is protected as an R-5/R-4-gated
+zero-diff file:
+`breezy-pm-crh-v2-tally.timer:13`, `breezy-live-tally.timer:12`,
+`breezy-mb-daily.timer:24-25`, `breezy-score-live-trials.timer:10`, and
+`breezy-quote-tape-ingest.timer:11-12`. Follow-up owner: whoever unblocks
+R-5 (the `breezy-live-tally` narrowing ruling) should sweep these five
+comments in the same pass.
+
+**No v3 tally exists.** `pm_us_crh_cont` (the live v3 strategy) has no
+nightly tally unit of its own -- L-38 stands. Building one is I5, blocked on
+R-4; this item does not touch it.

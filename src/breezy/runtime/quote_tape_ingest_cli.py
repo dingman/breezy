@@ -777,7 +777,9 @@ def ingest_instance(
     A ``ValueError`` from one type (the native non-disjoint-interval refusal,
     e.g. a republished-but-different range) is logged and recorded as THAT
     type's failure only -- it never aborts the remaining types, and never
-    aborts other instances.
+    aborts other instances. The INSTANCE-level outcome is ``"failed"`` if
+    any type failed, matching :func:`_ingest_instance_per_file`'s existing
+    precedent (SP-1/I3).
     """
     instance_dir = _instance_dir(catalog_root, instance_id, subdirectory)
     type_results: list[TypeConversionResult] = []
@@ -800,8 +802,14 @@ def ingest_instance(
             continue
         _mark_converted(instance_dir, data_cls)
         type_results.append(TypeConversionResult(data_cls, outcome or CONVERTED))
+    any_failure = any(_outcome_has_failure(result.outcome) for result in type_results)
     return InstanceIngestResult(
-        instance_id=instance_id, outcome="converted", type_results=tuple(type_results)
+        instance_id=instance_id,
+        outcome="failed" if any_failure else "converted",
+        reason="at least one type failed conversion; see type_results for detail"
+        if any_failure
+        else "",
+        type_results=tuple(type_results),
     )
 
 

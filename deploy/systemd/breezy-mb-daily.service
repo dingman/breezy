@@ -42,6 +42,10 @@ WorkingDirectory=/home/jon/breezy
 # the host-wide OOM killer.
 MemoryHigh=12G
 MemoryMax=16G
+
+# Shared aggregate ceiling across the nightly studies (see the slice file's
+# own comment for why it is usually redundant with the per-unit cap above).
+Slice=breezy-studies.slice
 UMask=0077
 
 # No EnvironmentFile, deliberately: neither study nor the ASOS refresh holds

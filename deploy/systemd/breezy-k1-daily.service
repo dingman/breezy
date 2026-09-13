@@ -31,6 +31,10 @@ WorkingDirectory=/home/jon/breezy
 # is expected to let this ceiling come down later.
 MemoryHigh=12G
 MemoryMax=16G
+
+# Shared aggregate ceiling across the nightly studies (see the slice file's
+# own comment for why it is usually redundant with the per-unit cap above).
+Slice=breezy-studies.slice
 UMask=0077
 
 # No EnvironmentFile. Deliberate, and the point of the separation: this
