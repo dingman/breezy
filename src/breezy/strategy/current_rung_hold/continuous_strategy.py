@@ -45,6 +45,7 @@ from breezy.ingest.iem_observations import station_observation_data_type
 from breezy.registry.sites import default_registry
 from breezy.runtime.backtest_feed import NWS_BACKTEST_CLIENT_ID
 from breezy.runtime.order_enablement import OrderSubmissionPermit
+from breezy.runtime.paper_replay import EXPIRATION_LEG_PREFIX
 from breezy.strategy.current_rung_hold.config import CurrentRungHoldConfig
 from breezy.strategy.current_rung_hold.decision import Decision, Refuse, Take
 from breezy.strategy.current_rung_hold.offer_tape import OfferTape, OfferTapeRecord
@@ -979,6 +980,20 @@ class ContinuousRungHoldStrategy(Strategy):
         `_hunt_tick`), never a raise.
         """
         super().on_order_filled(event)
+        if str(event.client_order_id).startswith(EXPIRATION_LEG_PREFIX):
+            # `check_instrument_expiration`'s own synthetic settlement-close
+            # order (`backtest/engine.pyx:5952`) is not a genuine hunt fill --
+            # counting it here would present the end-of-tape close as a
+            # SECOND fill on an already-consumed station-day, tripping the
+            # duplicate-fill family halt over a harness artefact, never a
+            # market fact (L-8; mirrors `resting_ladder.py`'s own exclusion
+            # of the same leg from its decision log, :290-297). Never joined,
+            # never consumed, never counted as a duplicate.
+            self.log.debug(
+                f"on_order_filled: ignoring the engine's synthetic expiration "
+                f"leg {event.client_order_id}",
+            )
+            return
         if event.last_qty.as_decimal() <= 0:
             return
         assert self._latch is not None
