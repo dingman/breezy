@@ -1679,7 +1679,7 @@ async def test_a_fresh_evidence_record_is_not_refetched_within_the_refresh_inter
                 positions_hits["count"] += 1
             return await original_read(path)
 
-        client._private_read = _counting_read  # type: ignore[assignment]
+        client._private_read = _counting_read
 
         await _run_n_passes_recording_sleeps(client, passes=2, monkeypatch=monkeypatch)
 
@@ -1724,7 +1724,7 @@ async def test_a_failed_refresh_read_leaves_the_prior_evidence_intact_and_the_re
         del client._private_read._payloads[PORTFOLIO_POSITIONS_PATH]  # type: ignore[attr-defined]
         failures_before = client._resolver_consecutive_failures
         refused: list[str] = []
-        client._refuse = refused.append  # type: ignore[method-assign]
+        client._refuse = refused.append  # type: ignore[assignment]
         # Non-terminal GET: isolates the refresh's own exception handling
         # from the order-GET failure path (which DOES touch the counter).
         client._private_read._payloads[  # type: ignore[attr-defined]

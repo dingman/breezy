@@ -630,7 +630,7 @@ def _register_phase1_and_start(
         clock=used_clock,
     )
     strategy.start()
-    strategy.submit_order = lambda order: None  # type: ignore[method-assign]
+    strategy.submit_order = lambda order: None
     return strategy
 
 
