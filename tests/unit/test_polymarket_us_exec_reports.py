@@ -77,6 +77,7 @@ from breezy.adapters.polymarket_us.errors import ExecutionReportMappingError
 from breezy.adapters.polymarket_us.exec import reports as reports_module
 from breezy.adapters.polymarket_us.exec import submit_chain
 from breezy.adapters.polymarket_us.exec.reports import (
+    _EXECUTION_DRIFT_ALLOWED_KEYS,
     _EXECUTION_KEYS,
     _MARKET_METADATA_DRIFT_ALLOWED_KEYS,
     _MARKET_METADATA_KEYS,
@@ -1182,6 +1183,55 @@ def test_every_declared_allowlist_name_survives_sanitisation_unchanged() -> None
 
     for name in all_names:
         assert _safe_key_name(name) == repr(name)
+
+
+# ---------------------------------------------------------------------------
+# SP-2 I4 -- 2026-09-13 MIA execution-drift capture closes R-6
+#
+# Evidence: node log breezy-trade-20260913T165011Z.log line 533, captured
+# 2026-09-13T17:03:46Z for a live MIA BUY 1 @0.70 IOC -- see
+# docs/evidence/venue/polymarket_us/CREATE_ORDER_EXECUTION_DRIFT_2026-09-13_
+# MIA.md for the full sanitised key tree.
+# ---------------------------------------------------------------------------
+
+
+def test_the_execution_drift_allowlist_is_exactly_the_2026_09_13_capture() -> None:
+    """`_EXECUTION_DRIFT_ALLOWED_KEYS` is pinned to exactly the five
+    execution-level fields the 09-13 MIA live capture carried beyond the
+    pinned SDK snapshot (``types/orders.py:95-108``): `commissionSpreadPx`,
+    `legPrices`, `traceId`, `transactTradeDate`, `unsolicitedCancelReason`.
+    A regression that widens or narrows this set without new evidence fails
+    here first."""
+    assert _EXECUTION_DRIFT_ALLOWED_KEYS == frozenset(
+        {
+            "commissionSpreadPx",
+            "legPrices",
+            "traceId",
+            "transactTradeDate",
+            "unsolicitedCancelReason",
+        }
+    )
+
+
+def test_an_execution_key_outside_the_allowlist_is_still_refused(
+    execution: dict[str, Any], instrument: BinaryOption
+) -> None:
+    """A sixth, still-undeclared execution-level key is refused exactly as
+    before -- the drift discipline stays: only the five 09-13-observed names
+    are DECLARED-BUT-UNREAD, not an open door for any future venue field."""
+    drifted = {**execution, "commissionSpreadPx": {"value": "0.00", "currency": "USD"}}
+    drifted["notYetObservedField"] = "unexpected"
+
+    with pytest.raises(ExecutionReportMappingError) as excinfo:
+        parse_fill_report(
+            drifted,
+            instrument=instrument,
+            account_id=ACCOUNT_ID,
+            report_id=REPORT_ID,
+            ts_init=TS_INIT,
+        )
+
+    assert "notYetObservedField" in str(excinfo.value)
 
 
 # ---------------------------------------------------------------------------

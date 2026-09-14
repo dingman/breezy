@@ -297,6 +297,37 @@ _EXECUTION_KEYS: Final[frozenset[str]] = frozenset(
     }
 )
 
+#: Five fields observed live on a create-order 200 response at
+#: 2026-09-13T17:03:46Z (node log ``breezy-trade-20260913T165011Z.log``
+#: line 533, resolver store key
+#: ``exec/polymarket_us/resolver/428709da14e14a8ba2602332753d8534``) for a
+#: real MIA BUY 1 @0.70 IOC fill: ``commissionSpreadPx``, ``legPrices``,
+#: ``traceId``, ``transactTradeDate``, ``unsolicitedCancelReason`` -- none
+#: of which the pinned SDK snapshot (``types/orders.py:95-108``) declares.
+#: Declared here, repo-side, as DECLARED-BUT-UNREAD -- same treatment as
+#: :data:`_ORDER_DRIFT_ALLOWED_KEYS` -- so a real fill no longer falls to
+#: KIND_AMBIGUOUS over names :func:`parse_fill_report` has never needed, but
+#: not merged into :data:`_EXECUTION_KEYS` itself, or the drift check in
+#: ``test_polymarket_us_exec_snapshot_drift.py`` goes vacuous. None of these
+#: five is read for money or state by :func:`parse_fill_report`:
+#: ``commissionSpreadPx`` is a maker-side spread fee Breezy is taker-only and
+#: never prices, ``legPrices``/``traceId``/``transactTradeDate`` are venue
+#: bookkeeping the mapper has never consumed, and
+#: ``unsolicitedCancelReason`` is a cancel-path field that appears (empty)
+#: even on a FILL row. A field the venue adds beyond THESE five is still an
+#: unknown key and is still refused. Evidence:
+#: ``docs/evidence/venue/polymarket_us/CREATE_ORDER_EXECUTION_DRIFT_2026-09-
+#: 13_MIA.md``. Closes ruling R-6.
+_EXECUTION_DRIFT_ALLOWED_KEYS: Final[frozenset[str]] = frozenset(
+    {
+        "commissionSpreadPx",
+        "legPrices",
+        "traceId",
+        "transactTradeDate",
+        "unsolicitedCancelReason",
+    }
+)
+
 #: ``UserPosition`` (``types/portfolio.py:21-34``).
 _USER_POSITION_KEYS: Final[frozenset[str]] = frozenset(
     {
@@ -1116,7 +1147,10 @@ def parse_fill_report(
     """
     context = "fill report"
     execution = _known_keys_with_full_tree(
-        payload, known=_EXECUTION_KEYS, context=context, full_payload=payload
+        payload,
+        known=_EXECUTION_KEYS | _EXECUTION_DRIFT_ALLOWED_KEYS,
+        context=context,
+        full_payload=payload,
     )
 
     execution_type = _require(execution, "type", context=context)
