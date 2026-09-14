@@ -32,12 +32,16 @@ the catalog writes.
 from __future__ import annotations
 
 from collections.abc import Iterable
+from decimal import Decimal
 from typing import Any
 
 import pyarrow as pa
 from nautilus_trader.core.data import Data
 from nautilus_trader.model.identifiers import InstrumentId
 from nautilus_trader.serialization.arrow.serializer import register_arrow
+
+from breezy.adapters.polymarket_us.symbology import leg_of
+from breezy.settlement.exit_guard import settlement_price_for_leg
 
 __all__ = [
     "DepthTruncation",
@@ -370,6 +374,25 @@ class VenueSettlementSnapshot(Data):
     @property
     def ts_init(self) -> int:
         return self._ts_init
+
+    @property
+    def settlement_price_for_own_leg(self) -> Decimal:
+        """The settlement value for the leg ``instrument_id`` denotes (S2b).
+
+        ``settlement_px`` above is ALWAYS the venue's raw ``settlementPx``
+        string, YES-denominated, verbatim -- untouched by this accessor and
+        unaffected by which leg's ``instrument_id`` this snapshot happens to
+        describe. This property applies the leg sign on top of that raw
+        value (NO settles at ``1 - settlementPrice``, plan
+        `NO_SIDE_EDGE_2026-09-14.md` Sec 1/R3-5(iii)) without mutating
+        ``settlement_px`` or its serialised schema, keyed on
+        :func:`~breezy.adapters.polymarket_us.symbology.leg_of` (the
+        composite ``InstrumentId``), never on an outcome string.
+        """
+        return settlement_price_for_leg(
+            leg=leg_of(self.instrument_id),
+            settlement_price=Decimal(self.settlement_px),
+        )
 
     def __repr__(self) -> str:
         return (
