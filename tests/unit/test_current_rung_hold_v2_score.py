@@ -6,6 +6,7 @@
 
 from __future__ import annotations
 
+import itertools
 import math
 from decimal import Decimal
 
@@ -243,3 +244,67 @@ def test_combined_draw_is_a_frozen_dataclass() -> None:
     assert (draw.x, draw.variance, draw.n_constituents) == (1.0, 2.0, 1)
     with pytest.raises(Exception):  # noqa: B017 -- frozen dataclass raises FrozenInstanceError
         draw.x = 5.0  # type: ignore[misc]
+
+
+# ---------------------------------------------------------------------------
+# Increment A validation slice (plan MULTI_POSITION_PER_STATION_2026-09-14,
+# Rev 3 disposition R3-3): closed-form reductions and the non-negativity
+# property, missing from S4a's own test set above.
+# ---------------------------------------------------------------------------
+def test_the_combined_variance_reduces_to_bernoulli_at_k_equals_one() -> None:
+    """k=1, qty=1: `combine_station_day`'s variance/x collapse exactly to
+    `BE*(1-BE)`/`held-BE` -- the single-row Bernoulli terms `score()` itself
+    uses (regression floor, restated in isolation from the full
+    `test_a_single_fill_station_day_is_byte_identical_to_today` fixture)."""
+    row = StratumRow(entry_ask=Decimal("0.35"), fee=Decimal("0.02"), held=True, station="MIA")
+    draw = combine_station_day((row,))
+    be = float(break_even_row(row.entry_ask, row.fee))
+
+    assert draw.n_constituents == 1
+    assert math.isclose(draw.variance, be * (1.0 - be), abs_tol=1e-12)
+    assert math.isclose(draw.x, 1.0 - be, abs_tol=1e-12)
+
+
+def test_the_combined_variance_scales_with_qty_squared() -> None:
+    """k=1, qty=3: variance scales as `qty^2 * BE*(1-BE)` -- the dollar-
+    variance scaling PnL itself needs (R3-3), qty=1's reduction above being
+    the qty=1 special case of this same formula."""
+    row = StratumRow(
+        entry_ask=Decimal("0.35"),
+        fee=Decimal("0.02"),
+        held=True,
+        station="MIA",
+        qty=Decimal(3),
+    )
+    draw = combine_station_day((row,))
+    be = float(break_even_row(row.entry_ask, row.fee))
+
+    assert math.isclose(draw.variance, 9.0 * be * (1.0 - be), abs_tol=1e-12)
+    assert math.isclose(draw.x, 3.0 * (1.0 - be), abs_tol=1e-12)
+
+
+def test_variance_is_non_negative_for_every_admissible_station_day() -> None:
+    """Property (R3-3 admission gate, qty=1): for every admissible
+    station-day (`Sum BE_i <= 1`, `k <= 4`), the covariance-subtracted
+    `Var_H0(X_sd)` must be `>= 0`. Algebraically `Var = S - S**2` where
+    `S = Sum BE_i` (the cross terms collapse `Sum BE_i**2 + 2*Sum_{i<j}
+    BE_i*BE_j` into `S**2` exactly), so this is a property of a perfect
+    square and can never go negative for `S` in `[0, 1]` -- a grid search
+    over BE tuples up to k=4 (step 0.1) is the check; ANY negative Var here
+    is a BLOCKER, reported and never papered over."""
+    be_values = [i / 10 for i in range(11)]
+    checked = 0
+    for k in range(1, 5):
+        for combo in itertools.product(be_values, repeat=k):
+            if sum(combo) > 1.0 + 1e-9:
+                continue
+            rows = tuple(
+                StratumRow(entry_ask=Decimal(str(be)), fee=Decimal(0), held=False, station="MIA")
+                for be in combo
+            )
+            draw = combine_station_day(rows)
+            assert draw.variance >= -1e-9, (
+                f"BLOCKER: negative Var_H0 at BE tuple {combo!r}: {draw.variance!r}"
+            )
+            checked += 1
+    assert checked > 0
