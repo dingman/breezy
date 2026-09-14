@@ -1386,3 +1386,31 @@ When a trial unit can bundle more than one correlated sub-observation (here: sib
 
 ### How to apply
 Before trusting a "trial unit" whose members can co-occur, write down the mutual-exclusivity structure explicitly and derive `Var_H0` from it (never assume independence by default). Before reusing a boundary artefact for a widened statistic, re-validate with a seeded H0 Monte-Carlo checking (a) `Var(S_terminal) ≈ 1` and (b) the realised one-sided crossing rate ≤ alpha + a Monte-Carlo slack — using the artefact's own solved boundary values (`reference_table` interpolation or `boundary_for`), never a re-solve. A failing crossing-rate check blocks only the SCOPE that produced it (here: qty>1 / Increment B), not an already-validated narrower scope (here: qty≡1 / Increment A). Evidence: `docs/evidence/RULING_multi_position_per_station_2026-09-14.md`, `tests/unit/test_multi_position_validation_2026_09_14.py`.
+
+## L-41 — A Monte-Carlo null must reproduce the registered H0 exactly; quote noise plus selection manufactures edge (2026-09-14)
+
+### What happened
+The first S6b re-validation of the LD-OBF boundary under the real YES/NO selection rule (`tests/unit/test_no_side_ldobf_validation_2026_09_14.py`, 3c8b53d) reported crossing rates of 0.03–0.14 at k ≥ 2 concurrent rungs and blamed "winner's curse". Adjudication found the simulation set `ask = p + gauss(0, spread)` and then selected rungs whose calibration bound beat `BE`, so selected legs had `BE < p` in expectation — a real edge under the simulation's own model — while the statistic's variance `q(1−q)` omitted `Var(BE)`. The registered H0 is `BE_i ≡` the true cell probability exactly, which is what the boundary and `combine_station_day` were solved for and what the Increment A validation used.
+
+### Why this is binding
+An inflation number from a misspecified null looks like evidence against a live statistic (here it would have implicated Increment A's multi-rung days) and would have been cited by a PREREG amendment.
+
+### The rule
+A boundary re-validation simulates the REGISTERED null verbatim (quotes exactly at the cell probability; selection driven only by an independent calibration draw). Any deviation from that null (quote noise, table staleness) is a separately labelled sensitivity study, never the H0 run, and its variance term must include every source of randomness the deviation adds.
+
+### How to apply
+Before citing a Monte-Carlo crossing rate: (1) read how `ask`, `BE`, `p_true`, the calibration sample and `held` are generated; (2) check `E[held − BE | selected] = 0` holds by construction; (3) confirm the null matches `_sample_station_day` in `test_multi_position_validation_2026_09_14.py`. Related: L-40, PREREG v3 amendment draft.
+
+## L-42 — A test of a store-reading gate must write its fixture through the real writer path (2026-09-14)
+
+### What happened
+S4's `refuse_if_sibling_leg_traded` and `station_day_admission` read trial-day records keyed by the bare symbol, while every real writer (`consume_if_absent` on fill, the fill-walk join) keys by the dotted `str(InstrumentId)`. The gates were green because their tests wrote fixtures via `_latch.consume(key_instrument_id=<bare>)`, the gate's own convention. Against production data both gates were dead: they always passed. Found by the S3b safety review (f2d33f4), not by any test.
+
+### Why this is binding
+A gate that never finds the record it guards against is a silent bypass of a safety control, and a green suite that shares the gate's own mistake proves nothing.
+
+### The rule
+Any test of a function that READS durable state must create that state through the production WRITER (the strategy's fill handler, the exec client's record writer), never by calling the store or the low-level `consume` with a hand-built key. Key formats are normalised inside the reader, with a round-trip test in both directions.
+
+### How to apply
+When briefing a slice that adds a store reader: require the RED test to write via the real path and name that path. When reviewing: grep the new tests for direct `store.set`/`consume(` calls with literal keys. Related: L-37 (declared drift), L-40.
