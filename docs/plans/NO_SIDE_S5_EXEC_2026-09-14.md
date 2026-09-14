@@ -243,3 +243,50 @@ census commit moving the capture script under `scripts/analysis/` (+E2-7 rename)
 Track B (state/scorer/strategy): `exec/no_side_keys.py` → E3-7 structural test → CLI (+census, E4-3) → E3-8 boot reconcile →
 E3-3 scorer exclusion → `LATCH_GATE_REFUSAL_REASONS` (+E4-6) → E3-2 gate placement + E3-5 pending shadow log → E3-1 never-arm
 cross-check → §5 flip behind the still-True flag (the flip itself is the LAST commit, after (a)–(e)).
+
+---
+
+## Rev 5 (2026-09-14 17:3xZ) — venue capture changes the wire mapping (exit criterion §1(a) partially met)
+
+**Evidence.** `docs/evidence/venue/polymarket_us/NO_SIDE_PREVIEW_20260914T170654Z.json` (price 0.05) and
+`..._170750Z.json` (price 0.97): `/v1/order/preview` with the captured live body and only `outcomeSide=OUTCOME_SIDE_NO`,
+`action=ORDER_ACTION_BUY` → 200; the venue echoes `intent: ORDER_INTENT_BUY_SHORT`, `side: ORDER_SIDE_SELL`,
+`outcomeSide: OUTCOME_SIDE_NO`, price unchanged, PENDING_NEW, cumQuantity 0 (preview never matches). The venue API reference
+snapshot (`docs_snapshots/api-reference_orders_create-order_2026-08-25.md:139-158`) is decisive: *"The `price.value` field
+always represents the long side's price, regardless of which order intent you use... To trade the NO side at any price X, set
+`price.value = 1.00 − X`"* (worked example: buy NO at 0.83 → price.value 0.17). A NO buy is executed as a SELL of YES and
+consumes the YES BID side — corroborating S2's `NO_ask = 1 − YES_bid` sized at YES-bid depth. Two adjudications
+(architecture, market) agree on the mechanics; the architect's alternative reading of the concepts doc is superseded by the
+API reference text. No real order was placed; the "decisive live IOC" is unnecessary given the doc and would itself be the
+first live NO order under the E2-1 protocol.
+
+**Dispositions.**
+- **E5-1 (CRITICAL, supersedes §3 "only the outcomeSide VALUE varies").** The wire price for a NO-leg order is
+  `1 − NO_price` (Decimal); a NO-leg fill's `lastPx`/`avgPx` is the YES price and books on the NO instrument at `1 − lastPx`.
+  Because X3's AST control bans complement arithmetic under `exec/` (kept), the translation lives in a NEW pure module OUTSIDE
+  `exec/`: `src/breezy/adapters/polymarket_us/leg_prices.py` with `wire_price_for_leg(leg, instrument_price) -> Decimal` and
+  `instrument_price_for_leg(leg, wire_price) -> Decimal` (identity for YES, complement for NO; Decimal only; refuse outside
+  [0,1]; round-trip and 0.01-tick exactness RED tests). `build_order_body` calls `wire_price_for_leg(leg_of(instrument.id), price)`;
+  `parse_fill_report`/`parse_order_status_report` call `instrument_price_for_leg` for `last_px`/`avg_px` on a NO-leg order.
+  The per-order cap and Nautilus `max_notional_per_order` see the NO instrument price (= premium) — unchanged and now correct
+  by construction; fee reconciliation uses the NO price (θ·p·(1−p) symmetric).
+- **E5-2 (CRITICAL).** Inbound `side=ORDER_SIDE_SELL` / `intent=ORDER_INTENT_BUY_SHORT` on a NO-leg order must never be
+  forwarded to Nautilus as a SELL. The parsers map the report's `order_side` from the ORDER's leg (create path: the order's
+  instrument; GET path: the resolver context's instrument id), reporting `OrderSide.BUY` on the NO instrument; the venue's
+  `side`/`intent` values are DECLARED under L-37 in a values table outside `exec/` (`leg_prices.py` or the existing
+  reports-drift declaration point) and cross-checked: a NO-leg order whose echo is not (SELL, BUY_SHORT) or a YES-leg order
+  whose echo is not (BUY, BUY_LONG) is refused as drift. `_RECORD_SIGNS`/`DurableFillRecord.order_side` stay BUY for NO.
+- **E5-3 (X3 scope).** The replacement ban `{"_SHORT","BUY_SHORT","SELL_"}` applies to raw text under `exec/` as committed
+  (36c6d99 on Track A is price-agnostic and stands); inbound classification uses the leg predicate and the outside-`exec/`
+  values table, so no banned literal is needed under `exec/`. The X3 ruling draft §3 gains this scope statement.
+- **E5-4.** `_map_position` after a NO fill: still unknown until the first fill (the E2-1 protocol stands). The venue doc's
+  "NO exposure is created through positions in the long side" makes a netted/negative YES-slug position the likely shape;
+  the position-shape ruling decides the mapping to LONG on the NO instrument.
+- **E5-5.** S2 (`MarketQuote.bid_ladder`, `NO_ask = 1 − YES_bid`) and S3 (decision at the NO price) are unchanged; only the
+  adapter's wire translation was missing.
+- **§1(a) status:** preview + book captured; fee field on a preview is 0 at cumQuantity 0 and is NOT evidence of the fee
+  schedule — the fee check moves to the first fill's reconciliation.
+
+### Track A resumes after a confirmation review of E5-1..E5-3
+Order: §2 (done, 36c6d99) → `leg_prices.py` + tests → §3 revised (wire inversion in `build_order_body`) → §4 revised
+(fill/status inversion + side-by-leg + declared values) → §1(a) census commit.
