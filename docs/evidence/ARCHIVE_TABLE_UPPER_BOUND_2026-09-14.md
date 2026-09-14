@@ -12,6 +12,15 @@ Neither `P_HOLD_LOWER`'s values nor `CORPUS_SHA256` changed; `STUDY_GIT_SHA`
 was regenerated against the commit that added `p_hold_upper`. No live path
 (`decision.py` or any strategy code) was touched.
 
+**Follow-up (review FIX-FIRST, same day):** `p_hold_lower`/`p_hold_upper` were
+originally two independent `wilson_interval` calls that only agreed because
+the function is pure. `ArchiveCell` now caches ONE call at construction
+(`__post_init__`) and destructures both bounds from that single pair, making
+`upper >= lower` structural. `STUDY_GIT_SHA` was regenerated a second time
+against this fix's commit; `P_HOLD_LOWER`/`P_HOLD_UPPER` content and
+`CORPUS_SHA256` are byte-identical to the first regeneration (verified by
+diffing the two generated files with the sha/timestamp lines excluded).
+
 ## Generator command
 
 ```
@@ -49,8 +58,9 @@ properties share the same `if self.n < N_MIN: return None` guard.
 ## Shas
 
 - `CORPUS_SHA256` (unchanged): `3b410fb9c0c9208c5afb5cd8de05789077aca93c71fd540ddae0607ad6f04d48`
-- `STUDY_GIT_SHA` (new, the commit that added `ArchiveCell.p_hold_upper`):
-  `c81052c7645a66d371e809cd3f0aecf628b88e1f`
+- `STUDY_GIT_SHA` history:
+  - `c81052c7645a66d371e809cd3f0aecf628b88e1f` (commit that added `ArchiveCell.p_hold_upper`)
+  - `dd77357fc68a352d1b86cb695202bb2ce49273a1` (follow-up fix commit: single cached `wilson_interval` call — current)
 
 ## Diff shape
 
