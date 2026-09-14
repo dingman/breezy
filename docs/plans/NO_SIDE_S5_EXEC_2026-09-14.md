@@ -299,3 +299,15 @@ Order: §2 (done, 36c6d99) → `leg_prices.py` + tests → §3 revised (wire inv
   root is `EXEC_PACKAGE_PATH_PREFIX = "src/breezy/adapters/polymarket_us/exec/"` (guard test :236), so `leg_prices.py` is
   outside it; `intent_fingerprint` (`submit_chain.py:226-238`) hashes `order.price` — the Nautilus (NO-instrument) price, the
   same on the create and GET paths, never the wire price. `_assert_market_matches` compares slug only.
+
+### Rev 5b (safety confirmation) — CONVERGED for Track A resumption
+- **E5-6 (named pin, exit criterion for Track A).** RED test `test_exec_imports_complement_arithmetic_only_from_leg_prices`
+  (AST scan in the E3-7 shape): (i) under `exec/` the only imported names from `leg_prices` are `wire_price_for_leg` and
+  `instrument_price_for_leg`; (ii) they are called ONLY inside `build_order_body`, `parse_fill_report` and
+  `parse_order_status_report`; (iii) `leg_prices.py` itself is the only module under `adapters/polymarket_us/` (outside
+  `exec/`) containing complement arithmetic on a price (reuse `_is_one` + `ast.Sub`). The X3 AST control on `exec/` is
+  unchanged.
+- **Verified:** 36c6d99 matches §2 exactly (its two pre-existing test edits are superset-detection correctness fixes for the
+  `BUY_SHORT ⊃ _SHORT` substring, not weakenings); the per-order cap reads the Nautilus order before `build_order_body`
+  (`client.py:3043` vs `:3055`); no firewall allowlist widening (the call is inside the already-allowlisted
+  `build_order_body`); the two evidence files are redacted.
