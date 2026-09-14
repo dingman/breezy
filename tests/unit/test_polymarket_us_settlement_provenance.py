@@ -374,3 +374,22 @@ class TestNoLegSettlementSign:
         restored = VenueSettlementSnapshot.from_dict(no_snapshot.to_dict())
         assert restored.settlement_px == "0.4900"
         assert restored.settlement_price_for_own_leg == Decimal("0.5100")
+
+    def test_an_out_of_range_raw_settlement_px_is_refused_not_swallowed(
+        self, pair_payload: dict[str, Any]
+    ) -> None:
+        """The accessor must SURFACE `settlement_price_for_leg`'s bounds
+        refusal -- an impossible venue value (captured verbatim in
+        `settlement_px`, which this class never mutates) must not be
+        silently accepted by this property."""
+        yes, _no = parse_binary_option_pair(
+            pair_payload, venue=POLYMARKET_US_VENUE, ts_init=TS_INIT
+        )
+        snapshot = parse_settlement_snapshot(pair_payload, instrument=yes, ts_init=TS_INIT)
+        assert snapshot is not None
+        values = snapshot.to_dict()
+        values["settlement_px"] = "1.2000"
+        broken = VenueSettlementSnapshot.from_dict(values)
+
+        with pytest.raises(ValueError, match="settlement_price"):
+            _ = broken.settlement_price_for_own_leg

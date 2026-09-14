@@ -232,8 +232,23 @@ def settlement_price_for_leg(*, leg: Literal["yes", "no"], settlement_price: Dec
     verbatim venue string, parsed once, here). Never build the report from
     the raw `settlement_px` directly for a NO-leg position.
 
-    Never divides, never rounds -- Decimal in, Decimal out.
+    Never divides, never rounds -- Decimal in, Decimal out. `settlement_price`
+    is bounds-checked BEFORE the leg dispatch and REFUSED (never clamped) if
+    it is not a finite value in `[0, 1]`: a binary settlement is a
+    probability, and an out-of-range or non-finite (NaN/Infinity) Decimal
+    reaching the leg arithmetic below would produce an impossible synthetic
+    close price for the future actor this function is written for.
     """
+    if not settlement_price.is_finite():
+        raise ValueError(
+            f"settlement_price {settlement_price!r} is not finite (NaN/Infinity are "
+            "refused, never treated as a settlement probability)"
+        )
+    if not (Decimal(0) <= settlement_price <= Decimal(1)):
+        raise ValueError(
+            f"settlement_price {settlement_price!r} is outside the binary-settlement "
+            "range [0, 1]; refused rather than clamped"
+        )
     if leg == "no":
         return Decimal(1) - settlement_price
     if leg == "yes":

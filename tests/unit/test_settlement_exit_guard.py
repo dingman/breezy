@@ -343,3 +343,46 @@ def test_a_no_position_that_won_yields_positive_and_a_lost_no_yields_negative_pr
         ]
     )
     assert lost_sample.included[0][1] == Decimal(-1)
+
+
+# ---------------------------------------------------------------------------
+# Follow-up review fix: `settlement_price` must be bounds-checked BEFORE the
+# leg dispatch. A binary settlement is a probability in [0, 1]; anything
+# outside that (or non-finite: NaN/Infinity) must be refused, never clamped
+# -- an out-of-range Decimal flowing into the leg arithmetic would produce an
+# impossible synthetic close price for the actor this function is written
+# for.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("settlement_price", [Decimal(0), Decimal(1)])
+def test_the_boundary_values_zero_and_one_are_accepted(settlement_price: Decimal) -> None:
+    # Must not raise.
+    settlement_price_for_leg(leg="yes", settlement_price=settlement_price)
+    settlement_price_for_leg(leg="no", settlement_price=settlement_price)
+
+
+@pytest.mark.parametrize("settlement_price", [Decimal("-0.0001"), Decimal("1.0001")])
+def test_just_outside_the_boundary_is_refused(settlement_price: Decimal) -> None:
+    with pytest.raises(ValueError, match="settlement_price"):
+        settlement_price_for_leg(leg="yes", settlement_price=settlement_price)
+    with pytest.raises(ValueError, match="settlement_price"):
+        settlement_price_for_leg(leg="no", settlement_price=settlement_price)
+
+
+@pytest.mark.parametrize("settlement_price", [Decimal("1.2"), Decimal("-0.2")])
+def test_grossly_out_of_range_values_are_refused_not_clamped(settlement_price: Decimal) -> None:
+    with pytest.raises(ValueError, match="settlement_price"):
+        settlement_price_for_leg(leg="no", settlement_price=settlement_price)
+
+
+def test_a_nan_settlement_price_is_refused() -> None:
+    with pytest.raises(ValueError, match="settlement_price"):
+        settlement_price_for_leg(leg="yes", settlement_price=Decimal("NaN"))
+
+
+def test_an_infinite_settlement_price_is_refused() -> None:
+    with pytest.raises(ValueError, match="settlement_price"):
+        settlement_price_for_leg(leg="no", settlement_price=Decimal("Infinity"))
+    with pytest.raises(ValueError, match="settlement_price"):
+        settlement_price_for_leg(leg="no", settlement_price=Decimal("-Infinity"))
