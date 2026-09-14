@@ -35,7 +35,11 @@ from breezy.adapters.polymarket_us.exec import submit_chain
 from breezy.adapters.polymarket_us.exec.client import DurableFillRecord
 from breezy.adapters.polymarket_us.operator_controls import utc_day_for_ns
 from breezy.adapters.polymarket_us.parsing import assert_fee_schedule_known
-from breezy.adapters.polymarket_us.symbology import instrument_id_to_slug, parse_weather_slug
+from breezy.adapters.polymarket_us.symbology import (
+    instrument_id_to_slug,
+    parse_weather_slug,
+    sibling_instrument_id,
+)
 from breezy.domain.station_observation import StationObservation
 from breezy.domain.weather_bucket_facts import (
     Measure,
@@ -64,20 +68,25 @@ from breezy.strategy.current_rung_hold.strategy import (
     _local_hour,
 )
 from breezy.strategy.current_rung_hold.tick_eval import (
-    evaluate_eligible_snapshot,
+    BothSides,
+    evaluate_both_sides,
     instrument_rung_is_current,
     width_and_m,
 )
 from breezy.strategy.current_rung_hold.trial_day_latch import (
+    SIBLING_LEG_TRADED_REASON,
+    STATION_DAY_ADMISSION_REASON,
     TAKEN_FROM_FILL_WALK_REASON,
     TrialDayLatch,
     TrialDayLatchError,
     TrialDayRecord,
     TrialDayRecordCorrupt,
+    refuse_if_sibling_leg_traded,
     startup_evidence_confirms_absent_flat,
     startup_evidence_lists_slug,
     startup_evidence_permits_arm,
     startup_evidence_position_for,
+    station_day_admission,
 )
 from breezy.strategy.depth10 import best_order
 from breezy.strategy.weather_common.refusals import RefusalAlerter, RefusalCounter
@@ -88,10 +97,37 @@ if TYPE_CHECKING:  # pragma: no cover - typing only
     from nautilus_trader.model.data import OrderBookDepth10, QuoteTick
     from nautilus_trader.model.instruments import Instrument
 
-__all__ = ["ContinuousRungHoldStrategy", "Phase0PermitForbiddenError"]
+__all__ = [
+    "NO_SIDE_SHADOW_ONLY",
+    "NO_SIDE_SHADOW_REFUSAL_REASONS",
+    "ContinuousRungHoldStrategy",
+    "Phase0PermitForbiddenError",
+]
 
 _NS_PER_MINUTE: Final[int] = 60_000_000_000
 _CLASS_NAME: Final[str] = "ContinuousRungHoldStrategy"
+#: S3b (plan NO_SIDE_EDGE_2026-09-14 S4/S5): the NO leg's Take is evaluated
+#: and gated every tick but NEVER reaches `submit_order` in this slice --
+#: S5 is the ONLY slice permitted to flip this to `False`, and only after
+#: its exit criteria (new RulePin, ruling, NO-side preview capture) land.
+NO_SIDE_SHADOW_ONLY: Final[bool] = True
+#: Closed-set reasons for a `no_refuse:` shadow-gate log line (S3b, S4).
+#: Deliberately disjoint from `decision.REFUSAL_REASONS` -- these are the
+#: LATCH-layer gates run only after the NO leg's own `Take` already cleared
+#: `evaluate_decision`, never a decision-layer refusal (those are silent,
+#: matching the YES path's existing behaviour).
+_NO_REFUSE_INTENT_OPEN: Final[str] = "intent_open"
+_NO_REFUSE_DAY_BUDGET_EXHAUSTED: Final[str] = "day_budget_exhausted"
+_NO_REFUSE_TRIAL_DAY_CONSUMED: Final[str] = "trial_day_consumed"
+NO_SIDE_SHADOW_REFUSAL_REASONS: Final[frozenset[str]] = frozenset(
+    {
+        _NO_REFUSE_INTENT_OPEN,
+        SIBLING_LEG_TRADED_REASON,
+        STATION_DAY_ADMISSION_REASON,
+        _NO_REFUSE_DAY_BUDGET_EXHAUSTED,
+        _NO_REFUSE_TRIAL_DAY_CONSUMED,
+    }
+)
 #: Resolution B (plan rev 6.1): the account-wide OPEN-intent WAIT diagnostic.
 #: Not a refusal -- reported through `diagnostics`/`diagnostics_alerter`
 #: (the existing WAIT vocabulary), never `refusals`/`refusal_alerter`.
@@ -173,6 +209,13 @@ class _AskSnapshot:
     size: int
     ts_event: int
     source: Source
+    #: S3b (plan NO_SIDE_EDGE_2026-09-14 S3): the YES bid side of the SAME
+    #: frame, additive -- every existing construction site gains these two
+    #: fields below; a caller that omits them (there are none left in this
+    #: module) would get `None`, which `evaluate_both_sides` already treats
+    #: as a missing bid (NO refuses `not_executable`).
+    bid: Decimal | None = None
+    bid_size: Decimal | None = None
 
 
 def _snapshot_from_quote(tick: QuoteTick) -> _AskSnapshot:
@@ -182,6 +225,8 @@ def _snapshot_from_quote(tick: QuoteTick) -> _AskSnapshot:
         size=int(tick.ask_size),
         ts_event=tick.ts_event,
         source="quote",
+        bid=tick.bid_price.as_decimal(),
+        bid_size=tick.bid_size.as_decimal(),
     )
 
 
@@ -325,6 +370,21 @@ class ContinuousRungHoldStrategy(Strategy):
         #: never the fill price, keeping the scorer's L-25 `fill_below_ask`
         #: guard load-bearing. Popped on read so this never grows unbounded.
         self._decision_ask_by_station_day: dict[tuple[str, str], Decimal] = {}
+        #: S3b (plan NO_SIDE_EDGE_2026-09-14): mirrors `last_rearm_decision`
+        #: (L-27, asserted by presence, never via log capture) -- the MOST
+        #: RECENT `no_take_shadow:`/`no_refuse:` line, respectively.
+        self.last_no_take_shadow: str | None = None
+        self.last_no_refuse: str | None = None
+        #: Dedupe for `no_take_shadow:` -- at most once per (station,
+        #: climate_day, NO instrument id) per UTC MINUTE, the same bounded
+        #: shape as `_budget_stop_notice` (bounded by the finite set of
+        #: station-days a process ever hunts). Maps the key to the last
+        #: minute bucket (``now_ns // _NS_PER_MINUTE``) it logged in.
+        self._no_shadow_notice: dict[tuple[str, str, str], int] = {}
+        #: Dedupe for `no_refuse:` -- once per (station, climate_day, NO
+        #: instrument id), for the life of the process, mirroring
+        #: `_illegal_cell_station_days`.
+        self._no_refuse_notice: set[tuple[str, str, str]] = set()
 
     def _submission_armed(self) -> bool:
         """Whether this strategy holds a real order-submission capability.
@@ -685,12 +745,15 @@ class ContinuousRungHoldStrategy(Strategy):
         ask = best_order(depth.asks)
         if ask is None:
             return
+        bid = best_order(depth.bids)
         snapshot = _AskSnapshot(
             instrument_id=depth.instrument_id,
             ask=ask.price.as_decimal(),
             size=int(ask.size),
             ts_event=depth.ts_event,
             source="depth",
+            bid=bid.price.as_decimal() if bid is not None else None,
+            bid_size=bid.size.as_decimal() if bid is not None else None,
         )
         self._hunt_tick(snapshot, trigger="depth", quote_age_ns=None)
 
@@ -869,20 +932,38 @@ class ContinuousRungHoldStrategy(Strategy):
         width_code, m_code = width_and_m(facts, running_max)
         instrument = self.cache.instrument(snapshot.instrument_id)
         fee_coefficient = self._guarded_fee_coefficient(instrument)
-        decision: Decision = evaluate_eligible_snapshot(
+        # S3b (plan NO_SIDE_EDGE_2026-09-14 S3/S4): both sides are evaluated
+        # from the SAME frame every tick. `decision` (YES) continues through
+        # the existing arm/submit path below, byte-identical to before this
+        # slice; the NO side is evaluated and gated independently, in
+        # SHADOW ONLY (`NO_SIDE_SHADOW_ONLY`) -- it never affects `decision`,
+        # `self.refusals`/`self.diagnostics`, the offer tape, or IN_FLIGHT.
+        both_sides: BothSides = evaluate_both_sides(
             station=station,
             climate_day=climate_day,
             now_ns=now_ns,
             ladder=self._ladders[(station, climate_day_key)],
             fee_coefficient=fee_coefficient,
             ask=ask,
-            size=size,
+            ask_size=size,
+            bid=snapshot.bid,
+            bid_size=snapshot.bid_size,
             running_max=running_max,
             staleness_ns=accumulator.staleness_ns(now_ns),
             config=self._config,
             hour_lst=hour_lst,
             width_code=width_code,
             m_code=m_code,
+        )
+        decision: Decision = both_sides.yes
+        self._evaluate_no_side_shadow(
+            station=station,
+            climate_day_key=climate_day_key,
+            station_day=station_day,
+            yes_instrument_id=snapshot.instrument_id,
+            no_decision=both_sides.no,
+            now_ns=now_ns,
+            bid_size=snapshot.bid_size,
         )
 
         reason = decision.reason if isinstance(decision, Refuse) else "taken"
@@ -957,6 +1038,154 @@ class ContinuousRungHoldStrategy(Strategy):
         self._maybe_submit(iid, decision)
         if not self._submission_armed():
             self._latch.clear_inflight(station, climate_day_key, key_instrument_id=iid)
+
+    def _evaluate_no_side_shadow(
+        self,
+        *,
+        station: str,
+        climate_day_key: str,
+        station_day: tuple[str, str],
+        yes_instrument_id: InstrumentId,
+        no_decision: Decision,
+        now_ns: int,
+        bid_size: Decimal | None,
+    ) -> None:
+        """S3b (plan NO_SIDE_EDGE_2026-09-14 S3/S4): the NO leg's Take,
+        gated but NEVER armed, consumed, or submitted (`NO_SIDE_SHADOW_ONLY`).
+
+        Runs the S4 gates in the fixed order the plan names, refusing at
+        the FIRST that fires (closed-set reason, `NO_SIDE_SHADOW_REFUSAL_
+        REASONS`) and logging once per instrument-day:
+
+        (a) the account-wide submit-intent latch -- this closes the
+            in-flight sibling race: an OPEN intent (a genuine in-flight
+            order, or a crash-left singleton no resolver has cleared yet)
+            must refuse a NO shadow evaluation exactly like `_hunt_tick`'s
+            own `is_intent_open()` check already refuses the YES arm path.
+            (In THIS call frame that check already ran, synchronously,
+            before `_hunt_tick` ever reached `evaluate_both_sides` -- this
+            is defence in depth against a future reordering, not dead
+            code by intent.)
+        (b) `refuse_if_sibling_leg_traded` for the YES sibling of this NO
+            instrument (a same-slug YES fill forbids the NO leg, S4/§3).
+        (c) `station_day_admission` (R3-7), enumerating BOTH legs of every
+            rung on this station-day -- the caller obligation the S4
+            review named, since `station_day_admission` never scans the
+            store itself.
+        (d) the existing day-budget stop and the per-instrument-day
+            `is_consumed` check, keyed on the NO instrument id.
+
+        `TrialDayLatch` (S1/S4, frozen for this slice) has no public
+        accessor for its store/key-prefix -- `refuse_if_sibling_leg_traded`
+        and `station_day_admission` are pure functions over exactly those,
+        by design (S4's own docstrings: neither needs the flock). Reading
+        the two private fields here is the narrowest bridge that avoids
+        touching `trial_day_latch.py`.
+
+        NOTE on instrument-id FORMAT: `refuse_if_sibling_leg_traded`/
+        `station_day_admission` reconstruct an `InstrumentId` internally
+        via `_leg_instrument_id` (`Symbol(raw)` directly, never
+        `InstrumentId.from_str`), so their `instrument_id`/
+        `existing_instrument_ids` arguments are the BARE symbol string
+        (e.g. ``"lax-86-87^no"``), matching S4's own test fixtures
+        (`NO_INSTRUMENT_ID = str(no_leg_instrument_id(...).symbol)`) --
+        NOT `str(InstrumentId)` (which is dotted with the venue and would
+        raise inside `assert_valid_slug`, or silently mismatch a written
+        key). This differs from every OTHER `key_instrument_id` in this
+        module (`iid = str(snapshot.instrument_id)`, dotted) -- a
+        pre-existing S4/wiring convention gap this slice does not resolve
+        (out of scope: neither side may change without touching
+        `trial_day_latch.py` or every existing dotted-keyed YES test).
+        `is_consumed`/the day-budget/notice keys below are NOT parsed by
+        anything, so they keep this module's own dotted convention.
+        """
+        if not isinstance(no_decision, Take):
+            return
+        assert self._latch is not None
+        no_instrument_id = sibling_instrument_id(yes_instrument_id)
+        no_iid = str(no_instrument_id)
+        no_symbol = str(no_instrument_id.symbol)
+        notice_key = (station_day[0], station_day[1], no_iid)
+
+        def _refuse_once(reason: str) -> None:
+            if notice_key in self._no_refuse_notice:
+                return
+            self._no_refuse_notice.add(notice_key)
+            self._record_no_refuse(f"no_refuse: reason={reason}")
+
+        if self._latch.is_intent_open():
+            _refuse_once(_NO_REFUSE_INTENT_OPEN)
+            return
+
+        store = self._latch._store
+        prefix = self._latch._key_prefix
+
+        sibling_refusal = refuse_if_sibling_leg_traded(
+            store, prefix, station, climate_day_key, no_symbol,
+        )
+        if sibling_refusal is not None:
+            _refuse_once(sibling_refusal.reason)
+            return
+
+        existing_ids: list[str] = []
+        for iid, facts in self._facts.items():
+            if (facts.settlement_station, facts.climate_day.isoformat()) != station_day:
+                continue
+            yes_iid_obj = InstrumentId.from_str(iid)
+            existing_ids.append(str(yes_iid_obj.symbol))
+            existing_ids.append(str(sibling_instrument_id(yes_iid_obj).symbol))
+        admission_refusal = station_day_admission(
+            store,
+            prefix,
+            station,
+            climate_day_key,
+            "no",
+            no_decision.break_even,
+            existing_instrument_ids=tuple(existing_ids),
+        )
+        if admission_refusal is not None:
+            _refuse_once(admission_refusal.reason)
+            return
+
+        utc_day = utc_day_for_ns(now_ns).isoformat()
+        if self._latch.is_day_budget_exhausted(utc_day):
+            _refuse_once(_NO_REFUSE_DAY_BUDGET_EXHAUSTED)
+            return
+        if self._latch.is_consumed(station, climate_day_key, key_instrument_id=no_iid):
+            _refuse_once(_NO_REFUSE_TRIAL_DAY_CONSUMED)
+            return
+
+        minute_bucket = now_ns // _NS_PER_MINUTE
+        if self._no_shadow_notice.get(notice_key) == minute_bucket:
+            return
+        self._no_shadow_notice[notice_key] = minute_bucket
+        self._record_no_take_shadow(
+            f"no_take_shadow: station={station} instrument={no_iid} "
+            f"no_ask={no_decision.limit_price} p_miss_lower={no_decision.p_bound} "
+            f"be={no_decision.break_even} bid_size={bid_size}"
+        )
+
+    def _record_no_take_shadow(self, summary: str) -> None:
+        """Mirrors `_record_rearm_decision` -- stores the ONE summary line
+        on `self.last_no_take_shadow` (asserted by presence, L-27) and
+        emits it via the overridable seam below. Stable grep token
+        `no_take_shadow:`.
+        """
+        self.last_no_take_shadow = summary
+        self._emit_no_take_shadow(summary)
+
+    def _emit_no_take_shadow(self, summary: str) -> None:
+        self.log.info(summary)
+
+    def _record_no_refuse(self, summary: str) -> None:
+        """Mirrors `_record_no_take_shadow` above for the refusal line,
+        stable grep token `no_refuse:`.
+        """
+        self.last_no_refuse = summary
+        self._emit_no_refuse(summary)
+
+    def _emit_no_refuse(self, summary: str) -> None:
+        self.log.info(summary)
 
     def _rearm_permitted(
         self,
