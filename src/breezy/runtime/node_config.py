@@ -56,7 +56,7 @@ import stat
 from collections.abc import Callable
 from datetime import time as datetime_time
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, cast
+from typing import TYPE_CHECKING, Any, Final, cast
 
 import pandas as pd
 from msgspec.structs import replace as msgspec_replace
@@ -562,6 +562,26 @@ def build_quote_tape_node_config(
     return cast(TradingNodeConfig, config)
 
 
+#: Plan A3 (S3, 2026-09-14): a build-side, STATED (never operator-supplied,
+#: never env-derived) native submit-rate ceiling -- `RiskEngineConfig`'s
+#: own field, `max_order_submit_rate: str` (format `"<count>/<HH:MM:SS>"`;
+#: default `"100/00:00:01"`, installed
+#: `nautilus_trader/risk/config.py:29-30`). This is defense-in-depth ONLY:
+#: the account-wide submit-intent latch (`runtime/submit_intent.py`)
+#: already fully serialises every order this process can send (at most one
+#: OPEN intent at a time), so this native cap can never bind behind it in
+#: normal operation. A handful of orders per second is already an order of
+#: magnitude above that serialised rate -- chosen deliberately loose so it
+#: is never the ceiling that actually stops a runaway; the operative bounds
+#: on order flow are, in order: the daily spend ledger, this native
+#: per-order notional cap (see the docstring above), and the submit-intent
+#: latch itself. Never read from an env var -- see the module docstring's
+#: ban on inventing a literal on an operator-reserved path; this literal is
+#: Breezy's, not the operator's, and is not one of the two OPERATOR-RESERVED
+#: controls (max daily budget, max per position).
+TRADE_RISK_MAX_ORDER_SUBMIT_RATE: Final[str] = "5/00:00:01"
+
+
 def build_trade_risk_engine_config(
     market_slugs: tuple[str, ...],
 ) -> LiveRiskEngineConfig:
@@ -619,6 +639,11 @@ def build_trade_risk_engine_config(
         max_notional_per_order={
             str(slug_to_instrument_id(slug)): ceiling_usd for slug in market_slugs
         },
+        # Plan A3 (S3): stated explicitly so it is never silently the
+        # Nautilus default -- see `TRADE_RISK_MAX_ORDER_SUBMIT_RATE`'s own
+        # docstring for why this value, and why it can never bind ahead of
+        # the submit-intent latch.
+        max_order_submit_rate=TRADE_RISK_MAX_ORDER_SUBMIT_RATE,
     )
 
 

@@ -1843,6 +1843,21 @@ class PolymarketUSExecutionClient(LiveExecutionClient):
             cumulative_cost=cumulative_cost,
             cumulative_fee=submit_chain.ZERO,
             fee_reconciled=False,
+            # S3 item 3 (plan 2026-09-14): `ts_event` is the RESOLVER's own
+            # wall-clock discovery time (`now_ns`, this method's own GET
+            # timestamp), never a venue-reported execution time -- the
+            # Order-only GET this path resolves from carries no execution
+            # legs and no fill timestamp at all. This differs from the
+            # CREATE path's `KIND_ACCEPT_FILL` branch, which stamps the
+            # venue's own execution time. Consequence, stated rather than
+            # papered over: the S0 boot-seed
+            # (`_seed_spend_from_durable_fills`) buckets every durable fill
+            # by `ts_event`, so a resolver-path fill DISCOVERED after UTC
+            # midnight is booked into the discovery day's seed, never the
+            # (unknown, possibly earlier) day the fill actually happened on
+            # the venue. Conservative -- the discovery day's ledger and
+            # permit budget see this spend even if the fill itself belongs
+            # to the prior day, never the reverse.
             ts_event=now_ns,
             venue_fee_raw=None,
             trade_id=_synthetic_get_fill_trade_id(context.venue_order_id).value,

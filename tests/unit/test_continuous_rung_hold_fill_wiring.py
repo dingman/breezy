@@ -315,6 +315,60 @@ def test_a_fill_on_a_different_rung_of_the_same_station_day_is_not_a_duplicate(
     assert upper_record is not None and upper_record.venue_order_id == "ord-2"
 
 
+def test_a_second_order_on_the_same_instrument_day_still_halts_the_family(
+    store_path: Path,
+    interior_instrument: BinaryOption,
+) -> None:
+    """S3 item 1 (plan 2026-09-14): pins the halt SCOPE contract post-S1 --
+    a second genuine fill (a second order) on the SAME instrument-day still
+    trips the FAMILY-wide halt. Behaviourally identical to
+    ``test_a_second_fill_on_the_same_instrument_day_is_still_a_duplicate``
+    (S1); this test exists under this name so the halt-scope contract is
+    pinned by a name that states the scope explicitly, per the S3 brief."""
+    strategy = _register_and_start(
+        store_path=store_path,
+        instruments=(interior_instrument,),
+        position_evidence_reader=lambda: _PERMISSIVE_EVIDENCE,
+    )
+    strategy.on_order_filled(
+        _fill(strategy, instrument_id=INTERIOR_ID, venue_order_id="ord-1"),
+    )
+    strategy.on_order_filled(
+        _fill(strategy, instrument_id=INTERIOR_ID, venue_order_id="ord-2"),
+    )
+    assert strategy._latch is not None
+    assert strategy._latch.is_family_halted() is True
+    assert strategy.diagnostics.count("family_halt_duplicate_fill") == 1
+
+
+def test_a_fill_on_a_second_rung_never_sets_the_family_halt(
+    store_path: Path,
+    interior_instrument: BinaryOption,
+    open_upper_instrument: BinaryOption,
+) -> None:
+    """S3 item 1 (plan 2026-09-14): pins the halt SCOPE contract post-S1 --
+    a fill on a SECOND, different rung of the same station-day is an
+    independent trial and never sets the family halt. Behaviourally
+    identical to
+    ``test_a_fill_on_a_different_rung_of_the_same_station_day_is_not_a_duplicate``
+    (S1); this test exists under this name so the halt-scope contract is
+    pinned by a name that states the scope explicitly, per the S3 brief."""
+    strategy = _register_and_start(
+        store_path=store_path,
+        instruments=(interior_instrument, open_upper_instrument),
+        position_evidence_reader=lambda: _PERMISSIVE_EVIDENCE,
+    )
+    strategy.on_order_filled(
+        _fill(strategy, instrument_id=INTERIOR_ID, venue_order_id="ord-1"),
+    )
+    strategy.on_order_filled(
+        _fill(strategy, instrument_id=OPEN_UPPER_ID, venue_order_id="ord-2"),
+    )
+    assert strategy._latch is not None
+    assert strategy._latch.is_family_halted() is False
+    assert strategy.diagnostics.count("family_halt_duplicate_fill") == 0
+
+
 def test_a_fill_clears_the_inflight_marker_for_that_instrument_day(
     store_path: Path,
     interior_instrument: BinaryOption,

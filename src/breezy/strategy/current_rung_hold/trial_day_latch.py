@@ -572,7 +572,18 @@ class TrialDayLatch:
         ts_ns: int,
     ) -> None:
         """Durably record a second genuine fill on an already-consumed
-        station-day, and set the family-wide halt.
+        instrument-day, and set the FAMILY-wide halt.
+
+        Plan S1/S3 (operator ruling 2026-09-14): the TRIAL key this guards
+        is now per ``(station, climate_day, instrument_id)`` -- a second
+        genuine fill on a DIFFERENT rung of the same station-day is a
+        second, independent trial (never a duplicate; see
+        ``consume_if_absent``'s own instrument-day keying). This method
+        only ever fires for a second fill on the SAME already-consumed
+        instrument-day. Its BLAST RADIUS is unchanged by that re-keying:
+        the halt it sets is family-wide (``FAMILY_HALT_KEY`` has no
+        station/instrument component and never has), stopping every
+        station and every rung, not just the offending instrument-day.
 
         Idempotent per ``venue_order_id``: a replayed call for the SAME
         duplicate fill (or the SAME id racing two writers) writes neither

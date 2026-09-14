@@ -331,6 +331,51 @@ def test_pre_trade_risk_checks_are_never_bypassed() -> None:
 
 
 # ---------------------------------------------------------------------------
+# S3 item 2 (plan 2026-09-14): the native submit-rate cap is STATED, never
+# left at the Nautilus default.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.usefixtures("operator_ceiling")
+def test_the_submit_rate_cap_is_stated_not_defaulted() -> None:
+    """The shipped config's `max_order_submit_rate` is Breezy's own stated
+    constant (`TRADE_RISK_MAX_ORDER_SUBMIT_RATE`), never the installed
+    `RiskEngineConfig` default of `"100/00:00:01"`
+    (`nautilus_trader/risk/config.py:29-30`, pinned nautilus-trader==1.231.0
+    above)."""
+    from nautilus_trader.risk.config import RiskEngineConfig
+
+    from breezy.runtime.node_config import TRADE_RISK_MAX_ORDER_SUBMIT_RATE
+
+    config = build_trade_node_config(
+        _trade_settings(), _data_client_config(), _exec_client_config()
+    )
+
+    assert config.risk_engine is not None
+    assert config.risk_engine.max_order_submit_rate == TRADE_RISK_MAX_ORDER_SUBMIT_RATE
+    assert config.risk_engine.max_order_submit_rate != RiskEngineConfig.max_order_submit_rate
+
+
+@pytest.mark.usefixtures("operator_ceiling")
+def test_the_submit_rate_cap_round_trips_through_the_trading_node_config() -> None:
+    """Positive control: the value really reaches the built `TradingNodeConfig`,
+    not just the intermediate `build_trade_risk_engine_config` return."""
+    from breezy.runtime.node_config import (
+        TRADE_RISK_MAX_ORDER_SUBMIT_RATE,
+        build_trade_risk_engine_config,
+    )
+
+    standalone = build_trade_risk_engine_config(())
+    assert standalone.max_order_submit_rate == TRADE_RISK_MAX_ORDER_SUBMIT_RATE
+
+    node_config = build_trade_node_config(
+        _trade_settings(), _data_client_config(), _exec_client_config()
+    )
+    assert node_config.risk_engine is not None
+    assert node_config.risk_engine.max_order_submit_rate == TRADE_RISK_MAX_ORDER_SUBMIT_RATE
+
+
+# ---------------------------------------------------------------------------
 # Absence fails closed
 # ---------------------------------------------------------------------------
 

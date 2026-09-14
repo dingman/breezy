@@ -122,6 +122,7 @@ from breezy.adapters.polymarket_us.operator_controls import (
     MAX_DAILY_BUDGET_USD_ENV_VAR,
     MAX_POSITION_COST_USD_ENV_VAR,
     DailySpendLedger,
+    utc_day_for_ns,
 )
 from breezy.adapters.polymarket_us.parsing import FEE_COEFFICIENT_KEY, parse_binary_option
 from breezy.adapters.polymarket_us.safety import (
@@ -3113,3 +3114,89 @@ async def test_the_seed_runs_after_intent_reconciliation_and_before_position_evi
         "_refresh_startup_position_evidence",
     ], trace
     await rig.client._disconnect()
+
+
+# ---------------------------------------------------------------------------
+# S3 item 3 (plan 2026-09-14): a resolver-path (`_resolve_accept_fill`) fill
+# is stamped with the RESOLVER's own discovery time, never a venue execution
+# time -- so a fill discovered after UTC midnight seeds the DISCOVERY day.
+# ---------------------------------------------------------------------------
+
+
+class _FakeResolverAcceptFillReport:
+    """Duck-typed stand-in for `_resolve_accept_fill`'s `report` argument.
+
+    `filled_qty`/`quantity` are REAL `Quantity` instances (unlike the
+    lighter duck-type in `test_current_rung_hold_ambiguous_resolver.py`):
+    this test's intent is genuinely OPEN, so `_resolve_accept_fill` runs all
+    the way through to `generate_order_filled`, which requires a real
+    `Quantity` for `last_qty`.
+    """
+
+    avg_px = Decimal("0.37")
+    filled_qty = Quantity(1, 0)
+    quantity = Quantity(1, 0)
+
+
+@pytest.mark.asyncio
+async def test_a_resolver_fill_discovered_after_midnight_seeds_the_discovery_day(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    write_canonical_verified: None,  # noqa: F811
+) -> None:
+    """The intent is ARMED (created) at 23:50 UTC on day D -- standing in
+    for a fill that happened on the venue before midnight -- but the
+    resolver's own GET only discovers and resolves it at 00:10 UTC on day
+    D+1. The durable record's `ts_event` must be the DISCOVERY time (D+1),
+    never the creation time (D): `_resolve_accept_fill` has no venue
+    execution timestamp to fall back on at all."""
+    sender = _FakeOrderSender()
+    rig = _build_accept_fill_rig(tmp_path, monkeypatch=monkeypatch, sender=sender)
+    order_id = "ord-s3-midnight"
+    sender.response = VenueResponse(status=200, headers={}, body=_ambiguous_with_id_body(order_id))
+
+    day_d_ns = 1_767_657_000_000_000_000  # 2026-01-05T23:50:00Z
+    day_d_plus_1_ns = 1_767_658_200_000_000_000  # 2026-01-06T00:10:00Z -- +20 min
+
+    with _accept_fill_caps():
+        await rig.client._connect()
+        await rig.client._submit_order(rig.limit_buy())
+
+        assert rig.client._latch is not None
+        current = rig.client._latch.current_open()
+        assert current is not None, "the with-id AMBIGUOUS outcome must leave OPEN"
+
+        instrument = rig.instrument
+        context = AmbiguousResolverContext(
+            intent_id=current.intent_id,
+            venue_order_id=order_id,
+            instrument_id=str(instrument.id),
+            client_order_id="O-does-not-matter",
+            strategy_id=str(STRATEGY_ID.value),
+            notional_usd=Decimal("0.40"),
+            booking_id=1,
+            created_ns=day_d_ns,
+        )
+        rig.client._resolved_by_get_ts_ns[current.intent_id] = day_d_plus_1_ns
+        # Simulate a restart re-entry (`_ambiguous_bookings` is process-local
+        # only and empty after a restart, mirroring
+        # `test_a_resolver_accept_fill_with_no_same_process_booking_still_
+        # records_the_venue_id_map`): this sidesteps `DailySpendLedger.
+        # true_up_booking`'s own same-UTC-day guard, which is orthogonal to
+        # what this test pins (the durable record's `ts_event`).
+        rig.client._ambiguous_bookings.pop(current.intent_id, None)
+
+        rig.client._resolve_accept_fill(
+            context, _FakeResolverAcceptFillReport(), instrument, day_d_plus_1_ns,
+        )
+
+        await rig.client._disconnect()
+
+    records = _reopened_fill_record(rig.store_path, order_id)
+    assert records is not None
+    assert records.ts_event == day_d_plus_1_ns
+    assert utc_day_for_ns(records.ts_event) == utc_day_for_ns(day_d_plus_1_ns)
+    assert utc_day_for_ns(records.ts_event) != utc_day_for_ns(day_d_ns), (
+        "a resolver-path fill discovered after midnight must seed the "
+        "DISCOVERY day, never the (unknown) day the fill actually happened"
+    )
