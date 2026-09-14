@@ -394,14 +394,18 @@ def _assert_live_provenance(store_dir: Path) -> None:
 
 
 def _stratum_row(trial: ScoredTrial) -> StratumRow:
-    """`side` is read via `getattr` -- `ScoredTrial`'s 17-column schema
-    carries no `side` field today (same documented, out-of-scope schema
-    gap as the dormant `qty` guard above; plan NO_SIDE_EDGE_2026-09-14
-    S6a, R3-5 item i), so every real caller today gets the default `"yes"`
-    and this function is byte-identical to before. A record that DOES
-    carry `side="no"` (a future NO-leg adapter, S5) has its `held` field
-    inverted here: the tally's NWS-truth `held` is always
+    """`side`/`rung` are read via `getattr` -- `ScoredTrial`'s 17-column
+    schema carries neither field today (same documented, out-of-scope
+    schema gap as the dormant `qty` guard above; plan
+    NO_SIDE_EDGE_2026-09-14 S6a, R3-5 item i, and the fix-first review of
+    87278dd item 2), so every real caller today gets `side="yes"` and
+    `rung=None` and this function is byte-identical to before. A record
+    that DOES carry `side="no"` (a future NO-leg adapter, S5) has its
+    `held` field inverted here: the tally's NWS-truth `held` is always
     `1{HIGH in r}`-shaped for YES and `1{HIGH not in r}`-shaped for NO.
+    `rung` is the market's own base venue slug (`market_slug`, NOT
+    `instrument_id` -- a YES/NO pair shares one rung slug but has two
+    distinct instrument ids); a future adapter attaches it the same way.
     """
     side = getattr(trial, "side", "yes")
     held = trial.held if side == "yes" else not trial.held
@@ -411,6 +415,7 @@ def _stratum_row(trial: ScoredTrial) -> StratumRow:
         held=held,
         station=trial.station,
         side=side,
+        rung=getattr(trial, "market_slug", None),
     )
 
 

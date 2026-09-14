@@ -42,7 +42,7 @@ from __future__ import annotations
 import enum
 import math
 from collections.abc import Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from decimal import Decimal
 from typing import Final, Literal
 
@@ -102,7 +102,23 @@ class StratumRow:
     (`BE_i = ask_i + fee_i` prices whichever side was actually bought);
     `held` is always the caller-supplied per-side truth (`1{HIGH in r_i}`
     for YES, `1{HIGH not in r_i}` for NO) -- this module performs no
-    further inversion of its own.
+    further inversion of its own. Validated in `__post_init__`: `Literal`
+    is a static-only annotation, never runtime-enforced, and both
+    :func:`_cell_probability` and this module's admission logic treat ANY
+    non-`"yes"` value as NO -- a typo (`"Yes"`) would silently flip a leg's
+    statistic. Frozen+slots dataclasses may still validate (never assign)
+    in `__post_init__` (fix-first review of 87278dd, item 1).
+
+    `rung` (fix-first review of 87278dd, item 2): the market's own base
+    venue slug identifying which rung this fill belongs to -- NOT the
+    Nautilus `instrument_id` (a YES/NO pair on one rung has two distinct
+    instrument ids but the SAME rung slug). `None` by default (dormant,
+    same schema-gap pattern as `qty`/`side`): every real caller today
+    passes `None`, and an all-`None`-rung day (all-YES or otherwise)
+    behaves byte-identically to before this field existed -- each row is
+    still its own distinct rung by construction. Once populated, it lets
+    :func:`combine_station_day` fold same-rung same-side duplicates and
+    refuse a same-rung YES/NO hedge (R3-7).
     """
 
     entry_ask: Decimal
@@ -111,6 +127,15 @@ class StratumRow:
     station: str
     qty: Decimal = Decimal(1)
     side: Literal["yes", "no"] = "yes"
+    rung: str | None = None
+
+    def __post_init__(self) -> None:
+        if self.side not in ("yes", "no"):
+            raise ValueError(
+                f"StratumRow.side must be 'yes' or 'no', got {self.side!r} -- "
+                "Literal['yes', 'no'] is a static-only annotation and is "
+                "never enforced at runtime"
+            )
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
@@ -128,7 +153,20 @@ def score(rows: list[StratumRow] | tuple[StratumRow, ...]) -> ScoreState:
     Raises `ValueError` if `I <= 0` -- undefined, never silently `0.0`
     (rev b Sec 3; the same "a rate over nothing is undefined" discipline
     `RealizedStratum`/`build_realized_stratum` already use for v1).
+
+    Raises `ValueError` if any row's `side != "yes"` (fix-first review of
+    87278dd, item 3): this function's `k = ...held...`/`BE_i(1-BE_i)`
+    arithmetic is side-BLIND -- it never reads `side` and would silently
+    misprice a NO row's information as if it were YES. It stays refused
+    until a side-aware version lands; `combine_station_day` is already
+    side-aware and is the only mixed-side entry point today.
     """
+    if any(row.side != "yes" for row in rows):
+        raise ValueError(
+            "score() is side-blind and refuses any row with side != 'yes' "
+            "until it is made side-aware (fix-first review of 87278dd, item 3); "
+            "use combine_station_day()/score_combined() for mixed-side days"
+        )
     bes = [float(break_even_row(row.entry_ask, row.fee)) for row in rows]
     information = sum(be * (1.0 - be) for be in bes)
     if information <= 0:
@@ -189,20 +227,103 @@ def _cell_probability(be: float, side: Literal["yes", "no"]) -> float:
     return be if side == "yes" else 1.0 - be
 
 
+class _MixedDayMissingRungKeyRefusal(StationDayAdmissionRefusal):
+    """A station-day carries a NO row but at least one row (YES or NO) has
+    no `rung` key -- same-rung folding and opposite-side exclusion cannot
+    be evaluated without it, so the whole day is refused (fix-first review
+    of 87278dd, item 2)."""
+
+
+class _SameRungOppositeSidesRefusal(StationDayAdmissionRefusal):
+    """A station-day carries both a YES and a NO fill on the SAME rung --
+    a same-instrument-day hedge, forbidden regardless of the Sigma-q gate
+    (plan NO_SIDE_EDGE_2026-09-14 SS3, R3-7; fix-first review of 87278dd,
+    item 2)."""
+
+
+def _fold_same_rung_rows(
+    rows: tuple[StratumRow, ...],
+) -> tuple[StratumRow, ...]:
+    """Fold same-rung same-side rows into one qty-summed representative row
+    per rung; refuse a same-rung YES/NO pair. Rows with `rung=None` are
+    left untouched (each its own distinct rung, today's byte-identical
+    behaviour) -- `None`-keyed rows are never grouped with each other.
+    """
+    keyless: list[StratumRow] = []
+    grouped: dict[str, list[StratumRow]] = {}
+    order: list[str] = []
+    for row in rows:
+        if row.rung is None:
+            keyless.append(row)
+            continue
+        if row.rung not in grouped:
+            grouped[row.rung] = []
+            order.append(row.rung)
+        grouped[row.rung].append(row)
+
+    folded: list[StratumRow] = []
+    for rung in order:
+        group = grouped[rung]
+        sides = {member.side for member in group}
+        if len(sides) > 1:
+            raise _SameRungOppositeSidesRefusal(
+                f"station {group[0].station!r}: rung {rung!r} carries both a "
+                "YES and a NO fill -- refusing the whole station-day as a "
+                "same-rung hedge (R3-7 admission gate)"
+            )
+        first = group[0]
+        if any(member.entry_ask != first.entry_ask for member in group):
+            raise StationDayAdmissionRefusal(
+                f"station {first.station!r}: rung {rung!r} same-side fills "
+                "at differing entry_ask cannot be folded -- refusing the "
+                "whole station-day as malformed_input"
+            )
+        if any(member.fee != first.fee for member in group):
+            raise StationDayAdmissionRefusal(
+                f"station {first.station!r}: rung {rung!r} same-side fills "
+                "at differing fee cannot be folded -- refusing the whole "
+                "station-day as malformed_input"
+            )
+        if any(member.held != first.held for member in group):
+            raise StationDayAdmissionRefusal(
+                f"station {first.station!r}: rung {rung!r} same-side fills "
+                "disagree on held -- refusing the whole station-day as "
+                "malformed_input"
+            )
+        total_qty = sum((member.qty for member in group), start=Decimal(0))
+        folded.append(replace(first, qty=total_qty))
+    return tuple(folded) + tuple(keyless)
+
+
 def combine_station_day(rows: Sequence[StratumRow] | tuple[StratumRow, ...]) -> CombinedDraw:
     """Build one station-day's :class:`CombinedDraw` from its constituent
     (mutually exclusive) rung fills, mixed-side aware (R3-3, S4a; plan
-    NO_SIDE_EDGE_2026-09-14 SS3, S6a).
+    NO_SIDE_EDGE_2026-09-14 SS3, S6a) and rung-keyed (fix-first review of
+    87278dd, item 2).
 
-    Raises :class:`StationDayAdmissionRefusal` if `Sum_i q_i > 1` for this
-    station-day -- the admission gate fires here, at draw construction,
-    before any `I`/`S` arithmetic ever sees the row. Raises `ValueError` for
-    an empty ``rows`` -- a combined draw over nothing is undefined, matching
-    :func:`score`'s own "no rows" refusal.
+    Raises :class:`_MixedDayMissingRungKeyRefusal` if any row lacks a
+    `rung` while the day contains a NO row -- fold/opposite-side admission
+    cannot run without it. Raises :class:`_SameRungOppositeSidesRefusal`
+    for a same-rung YES/NO pair. Same-rung same-side duplicates fold into
+    one qty-summed row per rung (`rung=None` rows are exempt from all of
+    the above and stay each their own distinct rung, today's
+    byte-identical behaviour). Raises :class:`StationDayAdmissionRefusal`
+    if `Sum_i q_i > 1` over the resulting DISTINCT rungs -- the admission
+    gate fires here, at draw construction, before any `I`/`S` arithmetic
+    ever sees the row. Raises `ValueError` for an empty ``rows`` -- a
+    combined draw over nothing is undefined, matching :func:`score`'s own
+    "no rows" refusal.
     """
     rows = tuple(rows)
     if not rows:
         raise ValueError("combine_station_day() is undefined for an empty station-day")
+    if any(row.side == "no" for row in rows) and any(row.rung is None for row in rows):
+        raise _MixedDayMissingRungKeyRefusal(
+            f"station {rows[0].station!r}: a NO row is present but at least "
+            "one row carries no rung key -- refusing the whole station-day "
+            "as malformed_input (R3-7 admission gate)"
+        )
+    rows = _fold_same_rung_rows(rows)
     bes = [float(break_even_row(row.entry_ask, row.fee)) for row in rows]
     qtys = [float(row.qty) for row in rows]
     signs = [1.0 if row.side == "yes" else -1.0 for row in rows]
@@ -284,10 +405,22 @@ class StratumV2:
 def build_stratum_v2(
     label: str, rows: list[StratumRow] | tuple[StratumRow, ...]
 ) -> StratumV2 | None:
-    """`None` for an empty stratum -- a rate over nothing is undefined."""
+    """`None` for an empty stratum -- a rate over nothing is undefined.
+
+    Raises `ValueError` if any row's `side != "yes"` (fix-first review of
+    87278dd, item 3) -- `k = sum(row.held ...)`/`pi = mean(BE_i)` is
+    side-blind, same refusal `score()` applies, until this is made
+    side-aware.
+    """
     rows = tuple(rows)
     if not rows:
         return None
+    if any(row.side != "yes" for row in rows):
+        raise ValueError(
+            "build_stratum_v2() is side-blind and refuses any row with "
+            "side != 'yes' until it is made side-aware (fix-first review "
+            "of 87278dd, item 3)"
+        )
     n = len(rows)
     k = sum(1 for row in rows if row.held)
     mean_ask = sum((row.entry_ask for row in rows), start=Decimal(0)) / n

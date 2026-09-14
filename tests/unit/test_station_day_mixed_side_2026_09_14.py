@@ -24,7 +24,9 @@ from breezy.settlement.current_rung_hold_v2 import (
     CombinedDraw,
     StationDayAdmissionRefusal,
     StratumRow,
+    build_stratum_v2,
     combine_station_day,
+    score,
 )
 from breezy.settlement.trial_scorer import ScoredTrial
 
@@ -85,11 +87,14 @@ def _row(
     fee_theta: Decimal = FEE_THETA,
     station: str = "MIA",
     qty: Decimal = Decimal(1),
+    rung: str | None = None,
 ) -> StratumRow:
     ask = Decimal(entry_ask)
     if fee is None:
         fee = fee_theta * ask * (1 - ask)
-    return StratumRow(entry_ask=ask, fee=fee, held=held, station=station, side=side, qty=qty)
+    return StratumRow(
+        entry_ask=ask, fee=fee, held=held, station=station, side=side, qty=qty, rung=rung
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -158,9 +163,10 @@ def test_all_yes_three_row_is_byte_identical_to_pinned_fixture() -> None:
 def test_yes_no_pair_variance_matches_the_sign_aware_closed_form() -> None:
     # YES leg A: ask 0.30, fee 0 -> BE_A = 0.30, q_A = 0.30, s_A = +1
     # NO  leg B: ask 0.85, fee 0 -> BE_B = 0.85, q_B = 1 - 0.85 = 0.15, s_B = -1
-    # q_A + q_B = 0.45 <= 1, admissible.
-    row_a = _row("0.30", True, side="yes", fee=Decimal(0))
-    row_b = _row("0.85", True, side="no", fee=Decimal(0))
+    # q_A + q_B = 0.45 <= 1, admissible. Distinct rungs (R3-7 mixed-day rule
+    # requires a rung key on every row of a day containing a NO row).
+    row_a = _row("0.30", True, side="yes", fee=Decimal(0), rung="R1")
+    row_b = _row("0.85", True, side="no", fee=Decimal(0), rung="R2")
 
     draw = combine_station_day((row_a, row_b))
 
@@ -176,9 +182,9 @@ def test_yes_no_pair_variance_matches_the_sign_aware_closed_form() -> None:
 def test_no_no_pair_variance_matches_the_sign_aware_closed_form() -> None:
     # NO leg A: ask 0.85, fee 0 -> BE_A = 0.85, q_A = 1 - 0.85 = 0.15, s_A = -1
     # NO leg B: ask 0.75, fee 0 -> BE_B = 0.75, q_B = 1 - 0.75 = 0.25, s_B = -1
-    # q_A + q_B = 0.40 <= 1, admissible.
-    row_a = _row("0.85", False, side="no", fee=Decimal(0))
-    row_b = _row("0.75", True, side="no", fee=Decimal(0))
+    # q_A + q_B = 0.40 <= 1, admissible. Distinct rungs.
+    row_a = _row("0.85", False, side="no", fee=Decimal(0), rung="R1")
+    row_b = _row("0.75", True, side="no", fee=Decimal(0), rung="R2")
 
     draw = combine_station_day((row_a, row_b))
 
@@ -202,8 +208,8 @@ def test_no_leg_held_true_means_high_landed_off_the_rung() -> None:
     inverts the YES `held` truth when building a NO `StratumRow`); this test
     pins that `combine_station_day`/`StratumRow` treat `held` literally and
     make no further inversion of their own."""
-    off_rung_no = _row("0.20", True, side="no", fee=Decimal(0))
-    on_rung_no = _row("0.20", False, side="no", fee=Decimal(0))
+    off_rung_no = _row("0.20", True, side="no", fee=Decimal(0), rung="R1")
+    on_rung_no = _row("0.20", False, side="no", fee=Decimal(0), rung="R1")
 
     off_draw = combine_station_day((off_rung_no,))
     on_draw = combine_station_day((on_rung_no,))
@@ -221,8 +227,8 @@ def test_cheap_no_plus_a_yes_elsewhere_is_refused_by_the_q_gate() -> None:
     # NO leg: ask 0.20 -> BE=0.20, q=0.80 (cheap NO -- most of the mass).
     # YES leg on a distinct rung: ask 0.35 -> BE=q=0.35.
     # 0.80 + 0.35 = 1.15 > 1 -- refused.
-    no_row = _row("0.20", True, side="no", fee=Decimal(0), station="MIA")
-    yes_row = _row("0.35", True, side="yes", fee=Decimal(0), station="MIA")
+    no_row = _row("0.20", True, side="no", fee=Decimal(0), station="MIA", rung="R1")
+    yes_row = _row("0.35", True, side="yes", fee=Decimal(0), station="MIA", rung="R2")
 
     with pytest.raises(StationDayAdmissionRefusal):
         combine_station_day((no_row, yes_row))
@@ -267,10 +273,20 @@ def _simulate_mixed_station_day_draw(rng: random.Random) -> CombinedDraw:
         yes_held, no_held = False, True  # HIGH elsewhere -> off both rungs
     rows = (
         StratumRow(
-            entry_ask=yes_ask, fee=Decimal(0), held=yes_held, station="MIA", side="yes"
+            entry_ask=yes_ask,
+            fee=Decimal(0),
+            held=yes_held,
+            station="MIA",
+            side="yes",
+            rung="R_YES",
         ),
         StratumRow(
-            entry_ask=no_ask, fee=Decimal(0), held=no_held, station="MIA", side="no"
+            entry_ask=no_ask,
+            fee=Decimal(0),
+            held=no_held,
+            station="MIA",
+            side="no",
+            rung="R_NO",
         ),
     )
     return combine_station_day(rows)
@@ -293,8 +309,14 @@ def test_mixed_day_h0_simulation_has_zero_mean_and_unit_variance() -> None:
     se_mean = sigma_x / math.sqrt(n_reps)
     assert abs(mean_x) < 3 * se_mean
 
-    mean_standardized_sq = sum(s * s for s in standardized) / n_reps
-    assert math.isclose(mean_standardized_sq, 1.0, rel_tol=0, abs_tol=0.03)
+    # Derived Monte-Carlo SE bound (item 4, follow-up review), not a bare
+    # literal tolerance: 3 * SE of the sample mean of the squared
+    # standardised draws, computed from their own sample standard deviation.
+    squared = [s * s for s in standardized]
+    mean_standardized_sq = sum(squared) / n_reps
+    sigma_sq = math.sqrt(sum((v - mean_standardized_sq) ** 2 for v in squared) / n_reps)
+    se_sq = sigma_sq / math.sqrt(n_reps)
+    assert abs(mean_standardized_sq - 1.0) < 3 * se_sq
 
 
 # ---------------------------------------------------------------------------
@@ -367,3 +389,158 @@ def test_stratum_row_wiring_carries_a_no_side_and_inverts_held() -> None:
     assert on_row.held is False
     assert off_row.side == "no"
     assert off_row.held is True
+
+
+# ---------------------------------------------------------------------------
+# Follow-up review fixes (two independent FIX-FIRST reviews of 87278dd).
+# ---------------------------------------------------------------------------
+
+
+# --- [HIGH] item 1: StratumRow.side is runtime-validated -------------------
+
+
+def test_stratum_row_rejects_a_side_outside_yes_or_no() -> None:
+    with pytest.raises(ValueError):
+        StratumRow(
+            entry_ask=Decimal("0.20"), fee=Decimal("0.01"), held=True, station="MIA", side="Yes"
+        )
+
+
+def test_stratum_row_rejects_a_none_side() -> None:
+    with pytest.raises(ValueError):
+        StratumRow(
+            entry_ask=Decimal("0.20"),
+            fee=Decimal("0.01"),
+            held=True,
+            station="MIA",
+            side=None,  # type: ignore[arg-type]
+        )
+
+
+# --- [HIGH latent] item 2: rung-keyed folding and same-rung admission ------
+
+
+def test_same_rung_same_side_duplicates_fold_qty_and_keep_one_rung_in_the_gate() -> None:
+    """Two YES fills on the SAME rung (same entry_ask) fold into one qty=2
+    row for the Sigma-q gate and the variance/x sums -- NOT two separate
+    rung slots."""
+    row_a = _row("0.30", True, fee=Decimal(0), rung="R1", qty=Decimal(1))
+    row_b = _row("0.30", True, fee=Decimal(0), rung="R1", qty=Decimal(1))
+
+    draw = combine_station_day((row_a, row_b))
+
+    # Folded to qty=2 on a single q=0.30 rung: x = 2*(1-0.30), var = 4*0.30*0.70.
+    assert math.isclose(draw.x, 2 * (1.0 - 0.30), rel_tol=0, abs_tol=1e-12)
+    assert math.isclose(draw.variance, 4 * 0.30 * 0.70, rel_tol=0, abs_tol=1e-12)
+
+
+def test_same_rung_same_side_duplicates_at_differing_ask_are_refused() -> None:
+    row_a = _row("0.30", True, fee=Decimal(0), rung="R1")
+    row_b = _row("0.32", True, fee=Decimal(0), rung="R1")
+
+    with pytest.raises(StationDayAdmissionRefusal):
+        combine_station_day((row_a, row_b))
+
+
+def test_same_rung_opposite_sides_are_refused_before_the_q_gate() -> None:
+    """A YES fill and a NO fill on the SAME rung is a same-instrument-day
+    hedge -- forbidden regardless of whether Sigma-q would otherwise admit
+    it (both asks cheap: 0.10 YES q=0.10, 0.10 NO q=0.90; same rung)."""
+    yes_row = _row("0.10", True, side="yes", fee=Decimal(0), rung="R1")
+    no_row = _row("0.10", True, side="no", fee=Decimal(0), rung="R1")
+
+    with pytest.raises(StationDayAdmissionRefusal):
+        combine_station_day((yes_row, no_row))
+
+
+def test_a_no_row_missing_its_rung_key_refuses_the_whole_day() -> None:
+    """A day containing a NO row where ANY row (YES or NO) lacks a `rung`
+    key is inadmissible -- fold/opposite-side checks cannot run without it."""
+    yes_row = _row("0.30", True, side="yes", fee=Decimal(0), rung=None)
+    no_row = _row("0.20", True, side="no", fee=Decimal(0), rung="R2")
+
+    with pytest.raises(StationDayAdmissionRefusal):
+        combine_station_day((yes_row, no_row))
+
+
+def test_all_yes_fixtures_without_rung_keys_are_unedited_and_still_pass() -> None:
+    """Regression: the three S6a-pinned byte-identity fixtures never set
+    `rung`, and an all-YES day with `rung=None` on every row is exactly
+    today's mutually-exclusive-by-construction behaviour -- re-asserted
+    here directly against the pinned values (no re-derivation)."""
+    assert combine_station_day((_row("0.35", True),)) == CombinedDraw(
+        x=0.63635, variance=0.23140867749999997, n_constituents=1
+    )
+    assert combine_station_day(
+        (_row("0.30", True), _row("0.20", False))
+    ) == CombinedDraw(x=0.4778, variance=0.24950715999999998, n_constituents=2)
+    assert combine_station_day(
+        (
+            _row("0.10", True, fee=Decimal(0)),
+            _row("0.30", False, fee=Decimal(0)),
+            _row("0.50", True, fee=Decimal(0)),
+        )
+    ) == CombinedDraw(x=1.1, variance=0.09000000000000002, n_constituents=3)
+
+
+def test_stratum_row_wiring_carries_a_rung_from_market_slug() -> None:
+    """`_stratum_row` reads `rung` from `getattr(trial, "market_slug",
+    None)` -- a dormant field on today's 17-column `ScoredTrial` (no
+    schema change), same pattern as the existing `qty`/`side` gaps."""
+    tally_mod = _load_family_tally_v2()
+
+    class _WithSlug:
+        def __init__(self) -> None:
+            self.entry_ask = Decimal("0.20")
+            self.fee = Decimal("0.01")
+            self.held = True
+            self.station = "MIA"
+            self.side = "no"
+            self.market_slug = "kxhighmia-26sep14"
+
+    row = tally_mod._stratum_row(_WithSlug())
+    assert row.rung == "kxhighmia-26sep14"
+
+
+def test_stratum_row_wiring_rung_defaults_to_none_for_a_record_with_no_market_slug() -> None:
+    tally_mod = _load_family_tally_v2()
+    trial = _scored_trial(ask="0.20", held=True)
+    assert not hasattr(trial, "market_slug")
+
+    row = tally_mod._stratum_row(trial)
+
+    assert row.rung is None
+
+
+# --- [MEDIUM] item 3: score() / build_stratum_v2 are side-blind ------------
+
+
+def test_score_refuses_any_no_side_row_until_side_aware() -> None:
+    rows = (
+        _row("0.10", True),
+        _row("0.20", True, side="no", rung="R1"),
+    )
+    with pytest.raises(ValueError):
+        score(rows)
+
+
+def test_score_is_unchanged_for_all_yes_rows() -> None:
+    rows = (_row("0.10", True), _row("0.50", False), _row("0.90", True))
+    state = score(rows)
+    assert state.n == 3
+
+
+def test_build_stratum_v2_refuses_any_no_side_row_until_side_aware() -> None:
+    rows = (
+        _row("0.10", True),
+        _row("0.20", True, side="no", rung="R1"),
+    )
+    with pytest.raises(ValueError):
+        build_stratum_v2("station:MIA", rows)
+
+
+def test_build_stratum_v2_is_unchanged_for_all_yes_rows() -> None:
+    rows = (_row("0.10", True), _row("0.50", False), _row("0.90", True))
+    stratum = build_stratum_v2("station:MIA", rows)
+    assert stratum is not None
+    assert stratum.n == 3
