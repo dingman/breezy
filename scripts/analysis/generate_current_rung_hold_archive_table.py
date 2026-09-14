@@ -147,8 +147,19 @@ def _quantize(value: float) -> Decimal:
 
 def build_frozen_table(
     *, archive_cache_dir: Path
-) -> dict[tuple[str, str, int, int, int], Decimal | None]:
-    """Run Part A only and re-key each cell to the frozen table's int-only key."""
+) -> tuple[
+    dict[tuple[str, str, int, int, int], Decimal | None],
+    dict[tuple[str, str, int, int, int], Decimal | None],
+]:
+    """Run Part A only and re-key each cell to the frozen table's int-only key.
+
+    Returns `(lower_table, upper_table)`. Both bounds come from the SAME
+    `ArchiveCell` -- `p_hold_lower`/`p_hold_upper` share one `wilson_interval`
+    call per cell (`mb_current_rung_edge_study.ArchiveCell`), so a `None`
+    (below `N_MIN` or illegal) always co-occurs across the two tables, and a
+    defined cell's upper bound is quantised from the same raw float pair as
+    its lower bound (NO_SIDE_EDGE plan §2, N2-4/R3-9).
+    """
     specs_by_city = {spec.city: spec for spec in load_sites() if spec.city in DENSE_STATIONS}
     days_by_city: dict[str, tuple[RunningMaxDay, ...]] = {}
     finals_by_city: dict[str, dict[dt.date, int]] = {}
@@ -160,20 +171,23 @@ def build_frozen_table(
     archive: dict[ArchiveCellKey, ArchiveCell] = build_archive_table(
         days_by_city, finals_by_city, hours=ARCHIVE_HOURS
     )
-    table: dict[tuple[str, str, int, int, int], Decimal | None] = {}
+    lower_table: dict[tuple[str, str, int, int, int], Decimal | None] = {}
+    upper_table: dict[tuple[str, str, int, int, int], Decimal | None] = {}
     for (city, season, hour, width, m), cell in archive.items():
         width_code = WIDTH_CODES[width]
         m_code = 0 if m is None else m
+        key = (city, season, hour, width_code, m_code)
         p_hold_lower = cell.p_hold_lower
-        table[(city, season, hour, width_code, m_code)] = (
-            None if p_hold_lower is None else _quantize(p_hold_lower)
-        )
-    return table
+        p_hold_upper = cell.p_hold_upper
+        lower_table[key] = None if p_hold_lower is None else _quantize(p_hold_lower)
+        upper_table[key] = None if p_hold_upper is None else _quantize(p_hold_upper)
+    return lower_table, upper_table
 
 
 def render_module(
     *,
-    table: dict[tuple[str, str, int, int, int], Decimal | None],
+    lower_table: dict[tuple[str, str, int, int, int], Decimal | None],
+    upper_table: dict[tuple[str, str, int, int, int], Decimal | None],
     corpus_sha256_hex: str,
     study_sha: str,
     argv: Sequence[str],
@@ -181,9 +195,10 @@ def render_module(
 ) -> str:
     """Render the frozen module's exact source text.
 
-    Deterministic given `table`/`corpus_sha256_hex`/`study_sha`/`argv`: the
-    dict is emitted in sorted-key order and the only line that varies between
-    two runs against an unchanged corpus is the `Generated at (UTC):` line.
+    Deterministic given `lower_table`/`upper_table`/`corpus_sha256_hex`/
+    `study_sha`/`argv`: each dict is emitted in sorted-key order and the only
+    line that varies between two runs against an unchanged corpus is the
+    `Generated at (UTC):` line.
     """
     argv_repr = " ".join(argv) if argv else "(no arguments)"
     header = f'''"""FROZEN Part A archive p_hold table for `current_rung_hold`.
@@ -204,8 +219,13 @@ Key: `(station, season, hour_lst, width_code, m_code)`.
 `width_code`: 0 = interior_2F, 1 = open_upper, 2 = open_lower.
 `m_code`: interior margin (0 or 1, per the memo's geometry correction); fixed
 at 0 on the two open tails, which have no margin axis.
-Value: the Wilson 95%-lower bound on `p_hold`, or `None` below `N_MIN`
-(never `0.0` -- an under-powered cell is undefined, not the worst cell).
+`P_HOLD_LOWER` value: the Wilson 95%-lower bound on `p_hold`, or `None` below
+`N_MIN` (never `0.0` -- an under-powered cell is undefined, not the worst
+cell). `P_HOLD_UPPER` value: the Wilson 95%-upper bound on the SAME cell, from
+the SAME `wilson_interval` call as `P_HOLD_LOWER` (NO_SIDE_EDGE plan §2,
+N2-4/R3-9) -- the calibration input for the NO-side estimand
+`p_miss_lower := 1 - P_HOLD_UPPER[key]`. `None` co-occurs with `P_HOLD_LOWER`'s
+`None` for every key.
 """'''
     lines = [
         header,
@@ -217,24 +237,27 @@ Value: the Wilson 95%-lower bound on `p_hold`, or `None` below `N_MIN`
         "from types import MappingProxyType",
         "from typing import Final",
         "",
-        '__all__ = ["CORPUS_SHA256", "P_HOLD_LOWER", "STUDY_GIT_SHA"]',
+        '__all__ = ["CORPUS_SHA256", "P_HOLD_LOWER", "P_HOLD_UPPER", "STUDY_GIT_SHA"]',
         "",
         f'CORPUS_SHA256: Final[str] = "{corpus_sha256_hex}"',
         f'STUDY_GIT_SHA: Final[str] = "{study_sha}"',
         "",
-        "P_HOLD_LOWER: Final[Mapping[tuple[str, str, int, int, int], Decimal | None]] = (",
-        "    MappingProxyType(",
-        "        {",
     ]
-    for key in sorted(table.keys()):
-        value = table[key]
-        value_repr = "None" if value is None else f'Decimal("{value}")'
-        city, season, hour, width_code, m_code = key
+    for name, table in (("P_HOLD_LOWER", lower_table), ("P_HOLD_UPPER", upper_table)):
         lines.append(
-            f'            ("{city}", "{season}", {hour}, {width_code}, {m_code}): '
-            f"{value_repr},"
+            f"{name}: Final[Mapping[tuple[str, str, int, int, int], Decimal | None]] = ("
         )
-    lines.extend(["        },", "    )", ")", ""])
+        lines.append("    MappingProxyType(")
+        lines.append("        {")
+        for key in sorted(table.keys()):
+            value = table[key]
+            value_repr = "None" if value is None else f'Decimal("{value}")'
+            city, season, hour, width_code, m_code = key
+            lines.append(
+                f'            ("{city}", "{season}", {hour}, {width_code}, {m_code}): '
+                f"{value_repr},"
+            )
+        lines.extend(["        },", "    )", ")", ""])
     return "\n".join(lines)
 
 
@@ -242,35 +265,46 @@ def generate(
     *,
     argv: Sequence[str] | None = None,
     now: dt.datetime | None = None,
-) -> tuple[str, dict[tuple[str, str, int, int, int], Decimal | None], str]:
-    """Build the frozen module source. Returns `(source, table, corpus_sha)`."""
+) -> tuple[
+    str,
+    tuple[
+        dict[tuple[str, str, int, int, int], Decimal | None],
+        dict[tuple[str, str, int, int, int], Decimal | None],
+    ],
+    str,
+]:
+    """Build the frozen module source.
+
+    Returns `(source, (lower_table, upper_table), corpus_sha)`.
+    """
     parsed_argv = list(argv) if argv is not None else list(sys.argv[1:])
     args = _parse_args(parsed_argv)
     archive_cache_dir = Path(args.archive_cache_dir).expanduser()
-    table = build_frozen_table(archive_cache_dir=archive_cache_dir)
+    lower_table, upper_table = build_frozen_table(archive_cache_dir=archive_cache_dir)
     files = _corpus_files(cache_dir=archive_cache_dir, cities=DENSE_STATIONS)
     sha = corpus_sha256(files)
     sha_study = study_git_sha()
     generated_at = now if now is not None else dt.datetime.now(dt.UTC).replace(microsecond=0)
     source = render_module(
-        table=table,
+        lower_table=lower_table,
+        upper_table=upper_table,
         corpus_sha256_hex=sha,
         study_sha=sha_study,
         argv=parsed_argv,
         generated_at=generated_at,
     )
-    return source, table, sha
+    return source, (lower_table, upper_table), sha
 
 
 def main(argv: Sequence[str] | None = None) -> int:
     parsed_argv = list(argv) if argv is not None else list(sys.argv[1:])
     args = _parse_args(parsed_argv)
-    source, table, sha = generate(argv=parsed_argv)
+    source, (lower_table, upper_table), sha = generate(argv=parsed_argv)
     output_path = Path(args.output).expanduser()
     output_path.parent.mkdir(parents=True, exist_ok=True)
     output_path.write_text(source, encoding="utf-8")
-    n_cells = len(table)
-    n_defined = sum(1 for value in table.values() if value is not None)
+    n_cells = len(lower_table)
+    n_defined = sum(1 for value in lower_table.values() if value is not None)
     print(
         f"[generate-current-rung-hold-archive-table] wrote {output_path} "
         f"({n_cells} cells, {n_defined} defined, corpus sha256={sha})",

@@ -355,6 +355,19 @@ class ArchiveCell:
             return None
         return wilson_interval(self.hold_count, self.n)[0]
 
+    @property
+    def p_hold_upper(self) -> float | None:
+        """Wilson 95% UPPER bound on hold, or `None` below `N_MIN`.
+
+        Same `wilson_interval` call (same raw float pair) as `p_hold_lower`,
+        so the two bounds never disagree at a boundary cell -- the NO-side
+        edge estimand `p_miss_lower := 1 - P_HOLD_UPPER[key]` (NO_SIDE_EDGE
+        plan §2, N2-4/R3-9) depends on that consistency.
+        """
+        if self.n < N_MIN:
+            return None
+        return wilson_interval(self.hold_count, self.n)[1]
+
 
 def aggregate_hold_cases(cases: Iterable[HoldCase]) -> dict[ArchiveCellKey, ArchiveCell]:
     counts: dict[ArchiveCellKey, list[int]] = defaultdict(lambda: [0, 0])
