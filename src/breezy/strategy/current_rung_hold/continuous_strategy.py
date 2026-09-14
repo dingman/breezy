@@ -33,7 +33,11 @@ from breezy.adapters.polymarket_us.errors import (
 )
 from breezy.adapters.polymarket_us.exec import submit_chain
 from breezy.adapters.polymarket_us.exec.client import DurableFillRecord
-from breezy.adapters.polymarket_us.exec.no_side_keys import is_no_side_pending
+from breezy.adapters.polymarket_us.exec.no_side_keys import (
+    NO_SIDE_FIRST_LIVE_ORDER_KEY,
+    first_live_order_payload,
+    is_no_side_pending,
+)
 from breezy.adapters.polymarket_us.operator_controls import utc_day_for_ns
 from breezy.adapters.polymarket_us.parsing import assert_fee_schedule_known
 from breezy.adapters.polymarket_us.symbology import (
@@ -76,7 +80,6 @@ from breezy.strategy.current_rung_hold.tick_eval import (
     width_and_m,
 )
 from breezy.strategy.current_rung_hold.trial_day_latch import (
-    NO_SIDE_FIRST_ORDER_PENDING_REASON,
     SIBLING_LEG_TRADED_REASON,
     STATION_DAY_ADMISSION_REASON,
     TAKEN_FROM_FILL_WALK_REASON,
@@ -129,10 +132,6 @@ NO_SIDE_SHADOW_REFUSAL_REASONS: Final[frozenset[str]] = frozenset(
         STATION_DAY_ADMISSION_REASON,
         _NO_REFUSE_DAY_BUDGET_EXHAUSTED,
         _NO_REFUSE_TRIAL_DAY_CONSUMED,
-        # NO-SIDE S5 (E2-1/E3-2): the bounded first-order containment window
-        # refuses ARMING (never the evaluation itself, E3-5) once the flag
-        # flips. Additive widening, never a relaxation (L-12).
-        NO_SIDE_FIRST_ORDER_PENDING_REASON,
     }
 )
 #: Resolution B (plan rev 6.1): the account-wide OPEN-intent WAIT diagnostic.
@@ -1242,12 +1241,34 @@ class ContinuousRungHoldStrategy(Strategy):
 
         # NO-SIDE S5 tail (§5 plan): the flag is False -- arm the NO take
         # exactly like the YES arm block (:1020-1041), keyed on `no_iid`,
-        # UNLESS the bounded first-order protocol (E2-1/E3-2) is pending --
-        # that refusal never touches `decision.py`'s closed set, so it is
-        # a `LATCH_GATE_REFUSAL_REASONS` member, not a `Refuse`.
+        # UNLESS the bounded first-order protocol (E2-1/E3-2) is pending.
+        # E3-2/E3-5 (pinned by test_no_side_first_order_pending_2026_09_14.py):
+        # this is a silent WAIT, never a `no_refuse:` -- `NO_SIDE_FIRST_
+        # ORDER_PENDING_REASON` lives in `LATCH_GATE_REFUSAL_REASONS` for
+        # the client-side denial path, not for a `Refusal`/`_refuse_once`
+        # this method would raise.
         if pending:
-            _refuse_once(NO_SIDE_FIRST_ORDER_PENDING_REASON)
             return
+        # SAFETY (adjudicated placement, strategy-side, mirrors client.py's
+        # SAFETY C1 comment at `_submit_order`): this write and the arm
+        # block below run with NO `await` between the `pending` read above
+        # and here -- `Strategy.on_quote_tick`/`on_data` are plain
+        # synchronous methods, so two stations' ticks handled back-to-back
+        # in one process cannot interleave: whichever call reaches this
+        # line first WRITES the key and COMMITs (`SqliteStateStore.set`
+        # commits before returning) before it ever yields control, so the
+        # second call's OWN `pending = is_no_side_pending(store)` read,
+        # taken at the top of its own invocation of this method, observes
+        # `True` and returns above -- never reaching this line. The key is
+        # NEVER cleared by this method: if `_maybe_submit` below goes on to
+        # refuse (permit exhausted, budget cap, latch already armed by a
+        # true concurrent submit_order path), the key stays SET -- "pending
+        # with no order" fails closed exactly like `client.py`'s own C1
+        # WAIT (no money moved, but no further NO arm is granted either).
+        store.set(
+            NO_SIDE_FIRST_LIVE_ORDER_KEY,
+            first_live_order_payload(no_iid, now_ns),
+        )
         self._decision_ask_by_station_day[(station, climate_day_key)] = no_decision.limit_price
         self._latch.set_inflight(station, climate_day_key, key_instrument_id=no_iid)
         self._latch.record_attempt(

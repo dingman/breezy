@@ -271,7 +271,10 @@ from breezy.adapters.polymarket_us.exec.endpoints import (
     ACCOUNT_BALANCES_PATH,
     PORTFOLIO_POSITIONS_PATH,
 )
-from breezy.adapters.polymarket_us.exec.no_side_keys import NO_SIDE_FIRST_LIVE_ORDER_KEY
+from breezy.adapters.polymarket_us.exec.no_side_keys import (
+    NO_SIDE_FIRST_LIVE_ORDER_KEY,
+    first_live_order_payload,
+)
 from breezy.adapters.polymarket_us.exec.refusals import (
     ClassifiedRefusal,
     PrivateReadRefused,
@@ -1390,14 +1393,13 @@ class PolymarketUSExecutionClient(LiveExecutionClient):
             if raw is None:
                 continue
             record = DurableFillRecord.from_bytes(raw)
-            payload = {
-                "instrumentId": record.instrument_id,
-                "venueOrderId": record.venue_order_id,
-                "tsNs": record.ts_event,
-            }
             self._store_set(
                 NO_SIDE_FIRST_LIVE_ORDER_KEY,
-                json.dumps(payload, sort_keys=True).encode("utf-8"),
+                first_live_order_payload(
+                    record.instrument_id,
+                    record.ts_event,
+                    venue_order_id=record.venue_order_id,
+                ),
             )
             self._log.info(
                 "no_side_first_order_key: written at boot reconcile "
