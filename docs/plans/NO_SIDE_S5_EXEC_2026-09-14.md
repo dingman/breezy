@@ -362,3 +362,16 @@ joint branch before the flip. The E2-1 protocol still governs NO arming; the pos
 Track D (bdf51a0) reviewed APPROVE: inversion applied once, five replaced tests were mechanism-only, YES rows now carry a rung
 key which cannot fold in real data (one trial per instrument-day). Joint gate re-runs after E3-1 (the first run overlapped an
 edit in the same worktree and is discarded, L-43 / one-tree-many-agents).
+
+### Rev 6b — joint gate green; flip ADMITTED, deployment deferred one shadow day (919bca2)
+Joint branch ebd6b93 (base + Track C + Track D + E3-1) gated 9459 passed / 1 failed — the one failure is the known
+worktree-path deploy test. E3-1 reviewed APPROVE. The flip (165d4be, re-applied as 9c9a4cd on the joint branch) was ruled
+**ADMIT with two explicitly accepted risks**: (1) the venue position shape after the first NO fill (assumed LONG on the YES id)
+is unconfirmed — bounded by the E2-1 first-order protocol, which holds NO arming at one order until the CLI marks the shape
+captured; (2) a never-traded NO leg is "flat on absence" of a fill record (E6-3). ebd6b93 merged into the base as 919bca2
+with `NO_SIDE_SHADOW_ONLY = True` intact; the flip commit stays on the joint branch.
+**Timing decision (coordinator):** zero `no_take_shadow:` lines have been observed live so far, so the NO evaluation path has
+never been seen emitting. The 2026-09-15 01:23Z live merge therefore carries the base (C + D + E3-1) shadow-only; the flip
+deploys via a separate post-window merge only after a 09-15 shadow-day observation of at least one `no_take_shadow:` line
+(or a reasoned decision that none was expected). Merge ≠ deploy: the flip becomes live at the first supervisor respawn
+after that merge.
