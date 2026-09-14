@@ -6,154 +6,200 @@ Repo commit at test-authoring time (worktree `breezy-no6b`, branch
 `backlog/no-side-s6b-mc-2026-09-14`): `87278dd` (S6a: `StratumRow.side`,
 mixed-side `combine_station_day`, `_cell_probability`).
 
+**Revision note:** an earlier revision of this artefact (commit `3c8b53d`)
+reported a k-dependent crossing-rate inflation. Independent adjudication
+found that revision's simulation NULL-MISSPECIFIED: it drew an
+independently-noisy ask around a separately-drawn true probability, then
+selected on favourable ask-noise realisations, manufacturing a genuine
+(non-null) edge, and its `Var_H0=q(1-q)` formula omitted `Var(BE)`. This
+revision replaces the main-grid construction with the REGISTERED null
+(`BE_i` IS the true cell probability, exactly -- the same construction
+`_sample_station_day` already uses) and supersedes the earlier k>=2
+inflation conclusion. **Increment A (k=1, qty=1) was never implicated by
+either revision** -- both agree it calibrates correctly.
+
 ## H0 assumption (R3-8, stated verbatim)
 
 Conditional on the cell probability `q_i`, the realised `held_i` is
 independent of the quoted `BE_i` (no adverse selection beyond the calibrated
-price).
+price). The corrected simulation enforces this literally: `BE_i` is never a
+noisy estimate of a separately-drawn truth -- it IS the truth, exactly, by
+construction.
 
-## Simulation design (N2-5: the real selection rule)
+## Simulation design (N2-5: the real selection rule, registered null)
 
-Per concurrent rung `i` on a simulated station-day (`k` in {1,2,3,4}
-mutually-exclusive rungs plus an implicit "none" mass, drawn as a random
-simplex point exactly as `_sample_station_day` draws `BE_i`):
+Per concurrent rung `i` on a simulated station-day (`k` in {1,2,3,4}):
 
-- a true H0 probability `p_i` is drawn (the simplex point);
-- one categorical draw over the `k` rungs plus "none" fixes which rung
-  (if any) actually holds for that station-day -- shared by every leg
-  tested on that day;
-- the quoted ask on each side is `p_i` (YES) / `1 - p_i` (NO) plus
-  `N(0, 0.04)` market-spread noise, clipped to `[0.03, 0.97]`;
-  `BE_i = ask_i + fee(ask_i)`, `fee = 0.06 * ask * (1 - ask)` (same theta as
-  the rest of this test family);
-- a synthetic calibration sample of size `n_cal` in `{90, 300}` is drawn as
-  `Binomial(n_cal, p_i)` (`random.Random.binomialvariate`, exact and O(1) --
-  the earlier per-trial-loop implementation was replaced for speed, see
-  "Performance" below) and converted to Wilson bounds (formula ported from
-  `scripts/analysis/archive_correction_probe.wilson_interval`);
-- the REAL selection rule fires: YES iff `p_lower_proxy > BE_yes`; NO iff
-  `(1 - p_upper_proxy) > BE_no`. YES is checked first per rung, so a rung
-  can contribute at most one leg (same-rung YES+NO is structurally
-  impossible, pinned by
-  `test_same_rung_yes_and_no_are_never_both_admitted`);
-- the R3-7 arm-time admission gate admits legs greedily in rung order,
+- a raw fair-value `p_i` is drawn as a random simplex point (budget 0.85,
+  leaving headroom for the fee markup below);
+- the YES leg's ask is EXACTLY `p_i` (no noise): `ask_yes_i = p_i`,
+  `fee_yes_i = 0.06 * ask * (1-ask)`, `BE_yes_i = ask_yes_i + fee_yes_i`.
+  Per the registered null, `BE_yes_i` IS the true cell probability
+  `pi_i = P(HIGH in r_i)`;
+- the NO leg's ask is chosen by EXACT quadratic inversion
+  (`_ask_for_target_be`) so `BE_no_i == 1 - pi_i` exactly (float
+  precision) -- the plan's own S2 slice already describes the NO leg as
+  DERIVED (`NO_ask = 1 - YES_bid`), never an independent quote;
+- ONE categorical draw over `pi_1..pi_k` (plus a "none" mass) fixes which
+  rung holds for the whole station-day -- `held_yes_i = 1{holder==i}`,
+  `held_no_i = 1{holder!=i}`. Since `BE_yes_i==pi_i` and `BE_no_i==1-pi_i`
+  exactly, `E[held_i - BE_i] = 0` exactly for WHICHEVER side fires -- the
+  registered null holds by construction;
+- a calibration sample of size `n_cal` is drawn as `Binomial(n_cal, pi_i)`
+  (YES) / `Binomial(n_cal, 1-pi_i)` (NO) -- unbiased for the registered
+  truth -- converted to Wilson bounds
+  (`archive_correction_probe.wilson_interval`, reimplemented
+  dependency-free);
+- the REAL selection rule (N2-5) fires: YES iff `p_lower_proxy > BE_yes_i`,
+  NO iff `(1-p_upper_proxy) > BE_no_i`. YES checked first -- same-rung
+  YES+NO is structurally impossible;
+- the R3-7 station-day admission gate admits rungs greedily in rung order,
   refusing (dropping) any leg whose own `q` would push the running
-  distinct-rung `Sum q` over 1 (pinned by
-  `test_admission_gate_refuses_a_take_that_would_breach_distinct_q_sum`).
+  distinct-rung `Sum q` over 1.
 
-A "look" advances only on an ADMITTED trade (>=1 leg station-day), not on
-every simulated station-day -- most simulated days fire no edge at all, so
-many station-days are drawn per look-worth of trades. Boundaries are read
-from the artefact's own `reference_table` by linear interpolation at the
-realised information fraction, exactly as
+A "look" advances only on an ADMITTED trade, never on every simulated
+station-day. Boundaries are read from the artefact's own `reference_table`
+by linear interpolation at the realised information fraction, exactly as
 `test_multi_position_validation_2026_09_14._run_h0_monte_carlo` already
 does; no boundary re-solve.
 
-## (1) Crossing rate per look, k in {1,2,3,4} x n_cal in {90,300}, qty=1
+## (1) Corrected crossing rate per look, k in {1,2,3,4} x n_cal in {90,300}, qty=1
 
 20000 replications/config, `n_max=160`, `look_step=10`, seed
-`20260914_000 + k*10 + n_cal`. `alpha=0.025` (artefact
-`deploy/families/gs_boundary_pm_us_crh_v2.json`, `inputs_sha256` unchanged --
-see "Artefact integrity" below). Cumulative one-sided efficacy-crossing rate
-at each look (rate = crossings-by-this-look / 20000):
+`20260914_000 + k*10 + n_cal`. `alpha=0.025`, MC SE at n_reps=20000 is
+`0.001104`, gate = `alpha + 3*SE = 0.02831`.
 
 | look n | k=1,ncal=90 | k=1,ncal=300 | k=2,ncal=90 | k=2,ncal=300 | k=3,ncal=90 | k=3,ncal=300 | k=4,ncal=90 | k=4,ncal=300 |
 |---|---|---|---|---|---|---|---|---|
 | 10  | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 |
 | 20  | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 |
-| 30  | 0 | 0 | 0 | 0 | 0 | 0.00005 | 0 | 0 |
-| 40  | 0 | 0 | 0 | 0 | 0.0001 | 0.0001 | 0 | 0.00005 |
-| 50  | 0 | 0 | 0.00025 | 0.00025 | 0.0003 | 0.0006 | 0.0002 | 0.00025 |
-| 60  | 0.0001 | 0.0001 | 0.0007 | 0.00105 | 0.00115 | 0.00155 | 0.00065 | 0.0011 |
-| 70  | 0.0002 | 0.00035 | 0.00165 | 0.00255 | 0.00265 | 0.00355 | 0.00215 | 0.003 |
-| 80  | 0.0005 | 0.001 | 0.00345 | 0.0053 | 0.0056 | 0.00745 | 0.0046 | 0.00745 |
-| 90  | 0.00085 | 0.0016 | 0.00585 | 0.00895 | 0.009 | 0.01335 | 0.0084 | 0.01595 |
-| 100 | 0.00105 | 0.0023 | 0.008 | 0.0133 | 0.01405 | 0.0206 | 0.015 | 0.02645 |
-| 110 | 0.00145 | 0.00325 | 0.01055 | 0.0185 | 0.0193 | 0.02975 | 0.02255 | 0.04055 |
-| 120 | 0.00235 | 0.0044 | 0.0139 | 0.0248 | 0.02625 | 0.0414 | 0.03445 | 0.0545 |
-| 130 | 0.0035 | 0.0061 | 0.01775 | 0.03125 | 0.03465 | 0.0564 | 0.04715 | 0.0722 |
-| 140 | 0.0041 | 0.00775 | 0.02145 | 0.03885 | 0.0443 | 0.07175 | 0.06155 | 0.0928 |
-| 150 | 0.00565 | 0.0094 | 0.02565 | 0.04745 | 0.0551 | 0.0868 | 0.077 | 0.11615 |
-| 160 (terminal) | **0.00685** | **0.0121** | **0.03105** | **0.056** | **0.0666** | **0.10445** | **0.0967** | **0.14105** |
+| 30  | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 |
+| 40  | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 |
+| 50  | 0.0001 | 0.00005 | 0 | 0.0001 | 0 | 0 | 0 | 0 |
+| 60  | 0.0003 | 0.00045 | 0.0003 | 0.0003 | 0.00005 | 0 | 0 | 0.00005 |
+| 70  | 0.00065 | 0.001 | 0.0007 | 0.00085 | 0.00025 | 0.0002 | 0 | 0.00005 |
+| 80  | 0.00125 | 0.00185 | 0.00155 | 0.0016 | 0.00045 | 0.0004 | 0 | 0.0001 |
+| 90  | 0.00215 | 0.0029 | 0.0026 | 0.0029 | 0.00085 | 0.0008 | 0 | 0.00015 |
+| 100 | 0.00335 | 0.004 | 0.0036 | 0.00495 | 0.0012 | 0.00155 | 0 | 0.0003 |
+| 110 | 0.005 | 0.0058 | 0.00505 | 0.0067 | 0.0018 | 0.0027 | 0.0002 | 0.0006 |
+| 120 | 0.00715 | 0.00745 | 0.0068 | 0.00895 | 0.003 | 0.0037 | 0.0003 | 0.00075 |
+| 130 | 0.0098 | 0.00945 | 0.0087 | 0.011 | 0.004 | 0.00465 | 0.0005 | 0.001 |
+| 140 | 0.01215 | 0.0117 | 0.01115 | 0.0137 | 0.0051 | 0.0061 | 0.00105 | 0.0015 |
+| 150 | 0.0145 | 0.0146 | 0.01345 | 0.0168 | 0.0067 | 0.008 | 0.00145 | 0.00235 |
+| 160 (terminal) | **0.0173** | **0.0168** | **0.0159** | **0.01985** | **0.0079** | **0.0101** | **0.00195** | **0.0028** |
 
-Monte-Carlo SE at `n_reps=20000`, `alpha=0.025`: `SE = sqrt(alpha*(1-alpha)/20000) = 0.001104`,
-so the gate is `alpha + 3*SE = 0.02831`.
+**All 8 configurations, at every look, stay well under the gate
+(`alpha+3*SE=0.02831`)** -- the largest terminal rate observed is
+`k=2, n_cal=300 = 0.01985`, about 29% below the gate. There is no
+monotonic k-dependent inflation; if anything the rate DECREASES with `k`
+(0.017 at k=1 down to ~0.002-0.003 at k=4), consistent with the admission
+gate making it progressively harder to admit a leg on a rung whose `q` is
+large relative to the remaining budget as `k` grows, not with a
+multiple-comparison inflation. **The registered null is correctly
+calibrated for every `k in {1,2,3,4}` at qty=1** -- the LD-OBF boundary
+needs no correction at k>=2 under this null. This supersedes the prior
+revision's k>=2 inflation finding, which was an artefact of a
+null-misspecified simulation (see "Revision note" above), not a property
+of `combine_station_day` or the boundary.
 
-**k=1**: both `n_cal` well under the gate (0.0069, 0.0121) -- correctly
-calibrated, even somewhat conservative.
+## Per-look Var(S), k in {1,2,3,4}, n_cal=90
 
-**k=2**: `n_cal=90` = 0.03105, marginally over the gate (0.02831); `n_cal=300`
-= 0.056, clearly over. **k=3,4**: far over at both `n_cal` (0.067-0.141).
-The inflation is monotonically increasing in `k` and in `n_cal` -- more
-concurrent rungs tested per station-day, and a tighter (larger-`n_cal`)
-calibration sample sharpening the Wilson bound, both increase the rate at
-which SOME rung's sampling noise clears its own price bar. This is a
-multiple-comparison / winner's-curse effect of the real selection rule
-(admit whichever of `k` simultaneous edge tests fires), not a bug in the
-admission gate or the mutual-exclusion guard -- both are separately pinned
-and hold at every `k` (see structural-guard tests, all pass).
+20000 replications/config, no early stopping (every replication draws to
+`n_max=160` so every look has a value for every replication -- see module
+docstring). `Var_H0(S)` should be ~1 exactly at every look if the
+statistic is correctly calibrated:
 
-**Disposition (evidence for the ruling, not asserted in the gate test at
-k>=2):** the plan's LD-OBF re-validation requirement is **NOT met** for
-`k>=2` at qty=1 under the real selection rule. Increment A's k=1 case (the
-only case that ships today, per R3-2/plan Increment A) is correctly
-calibrated. `k>=2` concurrent-rung admission needs a corrected boundary
-(likely a multiple-comparison adjustment scaled by admitted-leg count) or
-an explicit ruling before it can rely on this artefact -- this mirrors the
-existing `test_under_h0_the_ld_obf_boundary_crossing_rate_is_at_most_alpha`
-mixed-qty finding in `test_multi_position_validation_2026_09_14.py`, now
-shown to recur for mixed-rung-count under the real rule even at qty=1.
+| look n | k=1 | k=2 | k=3 | k=4 |
+|---|---|---|---|---|
+| 10  | 1.0218 | 0.9966 | 1.0049 | 1.0056 |
+| 20  | 0.9995 | 0.9906 | 0.9964 | 1.0090 |
+| 30  | 0.9877 | 0.9946 | 0.9822 | 1.0020 |
+| 40  | 0.9934 | 1.0008 | 0.9866 | 1.0107 |
+| 50  | 1.0010 | 0.9923 | 0.9924 | 1.0086 |
+| 60  | 1.0050 | 0.9869 | 1.0001 | 1.0048 |
+| 70  | 1.0023 | 0.9972 | 0.9922 | 0.9971 |
+| 80  | 1.0010 | 0.9952 | 0.9969 | 1.0010 |
+| 90  | 1.0079 | 0.9994 | 0.9949 | 1.0086 |
+| 100 | 1.0135 | 0.9936 | 0.9979 | 1.0105 |
+| 110 | 1.0154 | 0.9908 | 0.9970 | 1.0154 |
+| 120 | 1.0108 | 0.9892 | 1.0002 | 1.0131 |
+| 130 | 1.0086 | 0.9904 | 0.9946 | 1.0204 |
+| 140 | 1.0083 | 0.9915 | 0.9920 | 1.0184 |
+| 150 | 1.0088 | 0.9885 | 0.9917 | 1.0228 |
+| 160 (terminal) | 1.0083 | 0.9917 | 0.9944 | 1.0153 |
 
-## Var(S_terminal) per configuration
+`Var(S)` stays within `[0.98, 1.02]` at every look for every `k` -- tight
+around the nominal `Var_H0=1`, at every information fraction, not just
+terminally. This confirms the registered-null construction is internally
+consistent with the boundary's own assumption at every look, for all
+`k in {1,2,3,4}`.
 
-`Var_H0(S_terminal)` should be ~1 by the martingale/unit-variance property
-if the statistic were correctly calibrated for the admitted-leg population
-at that `k`. Measured (terminal, 20000 reps):
+## (1b) Sensitivity study -- quote measurement error (NOT an H0 finding)
 
-| config | Var(S_terminal) |
+Kept from the prior revision, explicitly relabelled: independent Gaussian
+ask noise (`spread=0.04`) around a separately-drawn true `p`, with
+selection on the noise. This construction manufactures a real (non-null)
+edge (`E[held-BE] != 0` in general; `Var_H0=q(1-q)` omits `Var(BE)`), so
+its crossing-rate inflation measures QUOTE MEASUREMENT ERROR sensitivity,
+never LD-OBF miscalibration. Smoke-size (120 reps), k in {1,2,3,4},
+`n_cal=90`:
+
+| k | crossing rate (noisy-ask sensitivity, smoke, n_reps=120) |
 |---|---|
-| k=1, n_cal=90  | 1.036 |
-| k=1, n_cal=300 | 1.029 |
-| k=2, n_cal=90  | 1.130 |
-| k=2, n_cal=300 | 1.159 |
-| k=3, n_cal=90  | 1.204 |
-| k=3, n_cal=300 | 1.244 |
-| k=4, n_cal=90  | 1.295 |
-| k=4, n_cal=300 | 1.309 |
+| 1 | 0.0167 |
+| 2 | 0.0333 |
+| 3 | 0.1000 |
+| 4 | 0.0750 |
 
-Var(S) inflates with `k` in lockstep with the crossing-rate inflation above
--- the same underlying effect (selection among `k` simultaneous tests biases
-the admitted population's actual variance above the nominal `Var_H0=1` the
-boundary assumes). Only terminal-look variance was computed (not a
-per-look variance grid); the per-look table above is the primary evidence.
+(Measured directly from `_run_real_rule_monte_carlo(..., null_exact=False)`
+at smoke size; not re-measured at full size in this revision since it is
+explicitly not an H0 finding -- see `xfail` on
+`test_noisy_ask_sensitivity_crossing_rate_report`. Smoke-size Monte-Carlo
+noise is large at `n_reps=120`; the k=3/k=4 ordering should not be read as
+precise, only the qualitative growth vs. `k=1`.) The earlier revision's
+`ask_no` construction ALSO had a genuine implementation bug (computed as
+`1 - quote(1-p)` instead of `quote(1-p)`, tracking `p` instead of `1-p`),
+now fixed; these numbers are from the corrected noisy-ask construction and
+show inflation growing with `k`, consistent with more chances for a
+favourable noise draw among more concurrent rungs -- a real measurement-
+error effect, reported for reference, not gating.
 
-## (2) Exogeneity stress (R3-8) -- reported, not gated
+## (2) R3-8 stress -- calibration-table staleness (ask stays exact)
 
-`corr_rho` shifts the quoted ask toward the realised outcome:
-`ask = p + rho*(held - p) + noise`. Baseline config k=2, n_cal=90 (terminal
-rate 0.03105) as the comparison point, 20000 reps/config:
+The live ask/price stays exactly `pi_i` / `1-pi_i` (never treated as an
+oracle of `held_i`). Instead the CALIBRATION SAMPLE is biased relative to
+the true probability: the table believes `P(hold) = pi_i + delta` (so its
+YES calibration sample is drawn from that biased rate) and, consistently,
+`P(not-hold) = (1-pi_i) - delta` (its NO calibration sample too) -- i.e.
+the table is stale in the direction of believing HOLD is more likely than
+it truly is. `k=2`, `n_cal=90`, 20000 reps/config:
 
-| corr_rho | terminal crossing rate |
+| delta | terminal crossing rate |
 |---|---|
-| 0.00 (baseline) | 0.03105 |
-| 0.02 | 0.00065 |
-| 0.05 | 0.00000 |
+| 0.00 (baseline, main grid k=2/n_cal=90) | 0.0159 |
+| 0.02 | 0.0072 |
+| 0.05 | 0.00795 |
 
-**Finding:** under this module's stress construction, positive correlation
-between the quoted ask and the realised outcome *suppresses* the crossing
-rate rather than inflating it -- the ask moves toward the truth (more
-expensive when it will hold, cheaper when it won't), which is a market that
-is MORE informed than the calibration sample, and it makes the trader's
-apparent edge (and hence the false-positive rate) smaller, not larger. This
-is the opposite of the "adverse selection inflates false positives"
-direction the plan text anticipates, and is recorded as a finding for the
-ruling: this module's `ask -> held` correlation direction models the
-market anticipating the true outcome, not the trader's model being wrong in
-a way that manufactures spurious edge. A stress scenario that manufactures
-inflation would need to correlate `held` with the CALIBRATION sample's
-noise (biased history) instead of the live ask -- out of scope for this
-slice; noted for a follow-up if the ruling wants it. Both `corr_rho` values
-pass the (reported, non-strict-xfail) `<= alpha` check.
+**Finding:** under this bias direction and construction, staleness did
+**not** inflate the crossing rate -- it measured LOWER than the unbiased
+baseline at both `delta` values. This is reported, not asserted (per the
+task): the bias makes the YES condition marginally easier to fire
+(calibration sample overestimates the true `pi_i`, pushing its Wilson
+lower bound up) but makes the NO condition harder to fire (calibration
+sample UNDERSTATES `1-pi_i` less than intended -- `(1-pi_i)-delta` lowers
+the NO sample's mean, which lowers its Wilson UPPER bound, and it is
+`(1-p_upper) > BE_no` that must fire, so a lower sample mean here actually
+makes NO fire MORE easily too, in isolation). The net measured effect
+across both legs, on this rung-budget distribution (typically small
+`pi_i`, so NO's true target `1-pi_i` is often large and its Binomial
+variance is correspondingly SMALL, tightening its Wilson interval and
+making it materially harder for calibration noise -- biased or not -- to
+clear the price bar), came out net-lower rather than net-higher. This does
+not contradict R3-8's underlying concern (a table that is stale in a
+DIFFERENT direction, or a station-day distribution weighted toward larger
+`pi_i`, could plausibly show net inflation instead) -- it is recorded as
+the measured result of this specific construction, for the ruling to
+weigh, not as a general claim that calibration staleness is safe.
 
 ## Structural guards (pass unconditionally, every k)
 
@@ -174,26 +220,21 @@ re-run as part of this slice's gate) -- pinned value
 
 ## Performance / runtime
 
-- Default (gate) test run: smoke size (`n_reps=120`), `~9-11s` wall for the
-  whole module (8 smoke configs + 2 structural guards + Var(S) smoke +
-  2 stress smoke), well under the ~60s target.
-- Full-size run (this artefact's numbers): 8 crossing-rate configs +
-  2 stress configs, `n_reps=20000` each, `n_max=160`, executed once via a
-  standalone script (`BREEZY_FULL_MC` gates the pytest equivalent but the
-  per-look table needed extra instrumentation not wired into the pytest
-  assertion path) -- total wall time **1094.3s (~18m 14s)**, per-config
-  times 50-190s (higher `k` and lower `n_cal` take longer: more simulated
-  station-days are needed per admitted trade when the edge fires less
-  often). ~3.0-3.2M simulated station-days evaluated per config.
-- Binomial calibration sampling uses `random.Random.binomialvariate`
-  (Python 3.12+, exact and O(1) per draw) rather than an O(n_cal)
-  Python-level Bernoulli loop -- an early implementation using the latter
-  measured a false, near-certain crossing rate (~0.5-1.0) that was
-  diagnosed and fixed as a genuine bug in ask construction for the NO leg
-  (`ask_no` was accidentally computed as `1 - quote(1-p)` instead of
-  `quote(1-p)`, tracking `p` instead of `1-p`); the binomial-variate swap
-  was made at the same time and both cut per-config wall time by
-  roughly 5-8x and fixed the mispricing bug.
+- Default (gate) test run: smoke size (`n_reps=120` main grid,
+  `n_reps=400` var-s-terminal smoke, `n_reps=400` per-look-var smoke) --
+  `~30-35s` wall for the whole module, under the ~60s target.
+- Full-size run (this artefact's corrected numbers): 8 main-grid
+  crossing-rate configs + 4 per-look-Var(S) configs + 2 staleness-stress
+  configs, `n_reps=20000` each, `n_max=160`, executed once via a
+  standalone script -- total wall time **2242.99s (~37m 23s)**. Per-config
+  times: main grid 55-302s (k=4 configs take longest -- more simulated
+  station-days needed per admitted trade as the admission gate tightens
+  with more concurrent rungs); per-look Var(S) 57-270s (no early stopping,
+  so every replication runs the full `n_max`); staleness stress 66-86s.
+  ~3.1-3.2M simulated station-days evaluated per crossing-rate config.
+- Same `random.Random.binomialvariate` calibration-sampling optimisation
+  as the prior revision (O(1) exact Binomial draw vs. an O(n_cal)
+  Python-level Bernoulli loop).
 
 ## No `slow`/`nightly` marker exists in this repo
 
@@ -204,5 +245,5 @@ gate. Rather than add a new marker to shared pytest config from this
 worktree, the full-size assertion test
 (`test_real_selection_rule_crossing_rate_full`) is gated by the
 `BREEZY_FULL_MC=1` environment variable (`skipif`) instead, and the
-default-collected smoke test enforces the same qty=1/k=1 calibration claim
-at reduced replication.
+default-collected smoke test enforces the same qty=1 calibration claim,
+for every `k in {1,2,3,4}`, at reduced replication.
