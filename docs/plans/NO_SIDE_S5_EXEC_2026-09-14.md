@@ -107,3 +107,55 @@ the `1 − x` AST control (widened, never removed).
 ## §8 Operator-only
 
 Whether the daily budget and the per-order cap stay as-is once NO roughly doubles the eligible surface, or a new ceiling is supplied.
+
+---
+
+## Rev 2 dispositions (2026-09-14, after adversarial round 1: architect / market-math / safety — all REVISE)
+
+- **E2-1 (CRITICAL, architect; merged with market-math CRITICAL "undecidable first order").** Venue positions are mapped by
+  slug onto the YES instrument only: `_find_instrument` (`client.py:2436-2446`) uses the YES-only bijection, `_map_position`
+  (`:2354-2434`) emits one `PositionStatusReport` per slug, and a non-LONG sign is refused at `:2415-2420`. No code path can ever
+  attribute a NO position to the NO instrument, so the never-arm walk has no evidence to decide the NO side, and a NO position
+  cannot be captured without a NO fill. **Disposition: accepted, restructured as a bounded first-order protocol.**
+  (i) New durable key `exec/polymarket_us/no_side/first_live_order` written atomically under the existing submit flock at the
+  moment the first NO create-path order is submitted (payload: instrument id, venue order id when known, ts). While that key
+  exists and `exec/polymarket_us/no_side/position_shape_captured` is absent, the strategy REFUSES to arm any further NO take
+  account-wide (closed-set reason `no_side_first_order_pending`), so exposure is bounded to one NO premium. This makes "first"
+  decidable across restarts and concurrent stations (RED: two concurrent NO takes → exactly one submits, the other refused).
+  (ii) Exit criterion §1(d): after that first fill, capture the venue position payload for the slug (via the existing position
+  GET path, under the permit) and the SDK snapshot's position type; rule whether the venue reports per-outcome positions (then
+  `_map_position` splits by the outcome field → `no_leg_instrument_id(slug)`) or nets across outcomes on one slug (then a
+  ruling defines the mapping of a non-LONG-signed slug position to a LONG on the NO leg). Only that ruling, recorded as the
+  `position_shape_captured` key by a CLI (never by the node), re-enables NO arming. Until then the never-arm walk treats a NO id
+  as UNKNOWN for arming NO only — it must never block the YES sibling (RED test).
+  (iii) The residual marking (market-math CRITICAL 1): "residual" is derived from the durable first-order key by
+  `score_live_trials._admit_fill`/`FillExclusion` reading that key (the real read path), not from `TrialDayRecord.reason`
+  alone; RED test proves the tally drops that trial from n and the looks. The marking ENDS at the `position_shape_captured`
+  ruling; trials after it are admissible.
+- **E2-2 (HIGH, market-math).** The amendment's "residual classification unchanged" contradicts this. **Accepted**: the
+  amendment gains a clause registering the first-NO-order residual trigger and its durable end condition BEFORE S5 code.
+- **E2-3 (HIGH, market-math).** Day-budget WAIT needs a submit-suppression test. **Accepted**: RED
+  `test_no_order_is_submitted_on_the_no_leg_after_the_day_stop` asserts `_maybe_submit` is never called post-exhaustion.
+- **E2-4 (MEDIUM, market-math ×3).** Accepted as RED tests: `test_a_partial_no_fill_is_excluded_not_tallied_as_qty_one`
+  (existing qty≠1 exclusion is leg-agnostic — prove it); `test_a_no_order_prices_itself_at_the_no_ask_not_the_yes_ask`;
+  §1(a) acceptance adds the venue fee field on the NO preview matching θ·p·(1−p) on the NO price.
+- **E2-5 (MEDIUM, architect).** X3-alone safety is asserted. **Accepted**: the §2 commit carries
+  `test_x3_alone_without_leg_keyed_submit_chain_never_emits_no` (with §3 not yet applied, `_outcome_token` on a NO id returns
+  None and the order is unmappable); §2 and §3 stay separate commits, §2 gated by that test.
+- **E2-6 (MEDIUM, architect).** `_candidate_instrument_ids()` (:610-619) is NO-aware via the cache while the arming loop is
+  not — stated explicitly; the arming loop gains the NO sibling only under E2-1's protocol. §6's parity claim is scoped to the
+  DECISION path; position reconciliation parity is out of scope until E2-1(ii).
+- **E2-7 (MEDIUM, safety).** `test_the_cage_grants_exactly_three_exemptions` (`test_cage_rule_constants_are_pinned.py:1004`)
+  must be RENAMED to `..._four_exemptions` with its docstring attributing the fourth slot to the capture script — a non-additive
+  edit inside §1(a); listed explicitly so the sign-off covers it.
+- **E2-8 (INFO→rule, safety).** The raw-text scan is re-run at COMMIT time, not plan time; `test_an_instrument_whose_info_leg_
+  contradicts_its_id_is_refused` asserts refusal in BOTH directions (id NO/info YES and id YES/info NO). Safety confirmed the
+  X3 widening is the minimal correct change (injection from outside exec/ would split the chokepoint) and that the residual
+  marking cannot gate spend (ledger seed walks fills by instrument id).
+- **Confirmed clean:** §2 pre-flight scan has zero `SELL_`/`BUY_SHORT` hits under exec/ at b81d696; `leg_of` is total and
+  defaults to YES; the draft script reaches only preview and book GET, imports nothing under exec/.
+
+### Exit criteria after Rev 2
+§1(a) preview + book + fee capture; §1(b) X3 sign-off; §1(c) amendment cites S6b AND registers the first-NO-order residual
+trigger (E2-2); §1(d) the first-order protocol keys and CLI exist with RED tests BEFORE the flag flips; §1(e) position-shape
+ruling is a post-first-fill gate that re-enables NO arming.
