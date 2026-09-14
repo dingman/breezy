@@ -2316,3 +2316,121 @@ def test_a_non_hashable_execution_type_is_not_a_fill_leg_never_a_crash() -> None
     assert outcome.kind == KIND_AMBIGUOUS
     assert outcome.detail is not None
     assert "tree=" in outcome.detail
+
+
+# ---------------------------------------------------------------------------
+# SP-2 I4 -- 2026-09-13 MIA execution-drift capture closes R-6
+#
+# Evidence: node log breezy-trade-20260913T165011Z.log line 533, captured
+# 2026-09-13T17:03:46Z for a live MIA BUY 1 @0.70 IOC. The venue's 200
+# create-order response carried two fill-type executions, each with FIVE
+# undeclared keys the SDK snapshot does not have: `commissionSpreadPx`,
+# `legPrices`, `traceId`, `transactTradeDate`, `unsolicitedCancelReason`.
+# Every nested `order`/`marketMetadata` field in the same capture was
+# already covered by the 09-11/09-12 drift allowlists (`_ORDER_DRIFT_
+# ALLOWED_KEYS`, `_MARKET_METADATA_DRIFT_ALLOWED_KEYS`) -- only the
+# execution-level five are new. `_EXECUTION_DRIFT_ALLOWED_KEYS` (GREEN)
+# closes that gap. See docs/evidence/venue/polymarket_us/
+# CREATE_ORDER_EXECUTION_DRIFT_2026-09-13_MIA.md for the full sanitised tree.
+# ---------------------------------------------------------------------------
+
+
+def _i4_captured_order(slug: str) -> dict[str, Any]:
+    """The nested `order` object shaped exactly as the 09-13 MIA capture,
+    with SYNTHETIC coherent values (qty 1, px 0.70). Every key here was
+    already declared or drift-allowed BEFORE this change; nothing below is
+    new to `_known_order`."""
+    return {
+        "id": "ord-i4-mia",
+        "marketSlug": slug,
+        "side": "ORDER_SIDE_BUY",
+        "type": "ORDER_TYPE_LIMIT",
+        "price": {"value": "0.70", "currency": "USD"},
+        "quantity": 1,
+        "cumQuantity": 1,
+        "leavesQuantity": 0,
+        "tif": "TIME_IN_FORCE_IMMEDIATE_OR_CANCEL",
+        "goodTillTime": TS_EVENT_TEXT,
+        "intent": "ORDER_INTENT_BUY_LONG",
+        "state": "ORDER_STATE_FILLED",
+        "avgPx": {"value": "0.70", "currency": "USD"},
+        "cashOrderQty": {"value": "0.70", "currency": "USD"},
+        "createTime": TS_EVENT_TEXT,
+        "insertTime": TS_EVENT_TEXT,
+        "commissionNotionalTotalCollected": {"value": "0.01", "currency": "USD"},
+        "commissionsBasisPoints": "125",
+        "makerCommissionsBasisPoints": "-125",
+        # 09-11 order-level drift (already allowed):
+        "action": "ORDER_ACTION_INSERT",
+        "lastTransactTime": TS_EVENT_TEXT,
+        "manualOrderIndicator": "MANUAL_ORDER_INDICATOR_AUTOMATIC",
+        "outcomeSide": "OUTCOME_SIDE_YES",
+        "marketMetadata": {
+            "slug": slug,
+            "icon": "icon.png",
+            "title": "MIA high temp",
+            "outcome": "YES",
+            "eventSlug": "mia-high-2026-09-13",
+            # 09-12 marketMetadata drift (already allowed):
+            "eventId": "evt-i4-mia",
+            "subject": {"id": "sub-1", "name": "MIA", "subjectType": "CITY"},
+        },
+    }
+
+
+def _i4_captured_execution(
+    order: dict[str, Any], *, exec_id: str, trade_id: str
+) -> dict[str, Any]:
+    """One fill-type execution carrying exactly the 09-13 MIA capture's five
+    undeclared keys, plus every previously-known execution field."""
+    return {
+        "id": exec_id,
+        "order": order,
+        "lastShares": "1",
+        "lastPx": {"value": "0.70", "currency": "USD"},
+        "type": "EXECUTION_TYPE_FILL",
+        "transactTime": TS_EVENT_TEXT,
+        "tradeId": trade_id,
+        "aggressor": True,
+        "commissionNotionalCollected": {"value": "0.01", "currency": "USD"},
+        # The five 09-13 execution-level drift fields (the RED gap):
+        "commissionSpreadPx": {"value": "0.00", "currency": "USD"},
+        "legPrices": [],
+        "traceId": "trace-i4-mia",
+        "transactTradeDate": "2026-09-13",
+        "unsolicitedCancelReason": "",
+    }
+
+
+def test_a_captured_2026_09_13_execution_drift_body_classifies_accept_fill() -> None:
+    """The 09-13 MIA live capture (see module-header evidence): a 200 body
+    whose executions carry `commissionSpreadPx`/`legPrices`/`traceId`/
+    `transactTradeDate`/`unsolicitedCancelReason` must classify
+    KIND_ACCEPT_FILL, not fall to KIND_AMBIGUOUS with a `fill_parse_error`
+    naming those five names."""
+    slug = str(build_instrument().raw_symbol)
+    order = _i4_captured_order(slug)
+    leg_a = _i4_captured_execution(order, exec_id="exe-i4-a", trade_id="trd-i4-a")
+    leg_b = dict(leg_a)
+    leg_b["id"] = "exe-i4-b"
+    body = json.dumps({"id": order["id"], "executions": [leg_a, leg_b]}).encode("utf-8")
+    response = VenueResponse(status=200, headers={}, body=body)
+
+    outcome = classify_create_order_outcome(
+        response,
+        instrument=build_instrument(),
+        account_id=ACCOUNT_ID,
+        ts_init=TS_INIT,
+    )
+
+    assert outcome.kind == KIND_ACCEPT_FILL
+    assert outcome.fill is not None
+    assert outcome.fill_parse_error is None
+    assert outcome.venue_order_id == order["id"]
+    # `_cumulative_fee_and_reconciliation`: the two captured executions are
+    # identical duplicates (same lastShares="1"), so their summed leg
+    # quantity (2) never equals the order-level `cumulative_qty` (1) this
+    # fixture's `avgPx`/`cumQuantity` derive -- `qty_reconciled` is False by
+    # that logic's own quantity identity, independent of this change.
+    # Documented here, not a claim this change alters that logic.
+    assert outcome.fee_reconciled is False
