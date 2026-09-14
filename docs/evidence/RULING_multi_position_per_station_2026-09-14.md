@@ -48,9 +48,10 @@ tally scores one combined draw per station-day (`_combined_draws_for_looks`).
 **Increment B:** carries real qty through sizing/scorer/store. Before
 Increment B relies on this artefact at qty>1, the H0 crossing-rate check
 must be re-run at the real qty distribution and pass; re-solve only then.
-**Open operator-only budget questions:** (1) with qty derived from the
-per-position cap, one order can spend the whole cap instead of a small
-fraction — is the current value still the intended per-order spend? (2) the
+**Operator ruling 2026-09-14 (budget question 1, CLOSED):** "per position is
+intended for per order spend, it is not the per station cap." The per-position
+cap bounds ONE ORDER; a station may carry several such orders across its rungs.
+Increment B S2 sizes each order against it. **Open operator-only question:** (2) the
 daily budget is reachable in one afternoon across multiple stations × N
 rungs — confirm it is still the intended daily ceiling.
 **Hard invariants:** Nautilus immutable (extension-only); `allow_short`
