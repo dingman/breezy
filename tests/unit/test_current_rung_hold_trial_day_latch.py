@@ -24,6 +24,7 @@ from breezy.adapters.polymarket_us.exec.client import (
     FILL_KEY_PREFIX,
     DurableFillRecord,
 )
+from breezy.adapters.polymarket_us.symbology import no_leg_instrument_id
 from breezy.runtime.sqlite_store import SqliteStateStore
 from breezy.runtime.submit_intent import (
     SubmitIntentLockHeld,
@@ -35,7 +36,11 @@ from breezy.strategy.current_rung_hold.trial_day_latch import (
     CONTINUOUS_TRIAL_KEY_PREFIX,
     DEFAULT_TRIAL_KEY_PREFIX,
     FAMILY_HALT_KEY,
+    LATCH_GATE_REFUSAL_REASONS,
+    SIBLING_LEG_TRADED_REASON,
     STARTUP_EVIDENCE_KEY,
+    STATION_DAY_ADMISSION_REASON,
+    Refusal,
     TrialDayAlreadyConsumed,
     TrialDayInvalidReason,
     TrialDayLatch,
@@ -43,10 +48,12 @@ from breezy.strategy.current_rung_hold.trial_day_latch import (
     TrialDayRecord,
     TrialDayRecordCorrupt,
     open_trial_day_latch,
+    refuse_if_sibling_leg_traded,
     startup_evidence_confirms_absent_flat,
     startup_evidence_lists_slug,
     startup_evidence_permits_arm,
     startup_evidence_position_for,
+    station_day_admission,
 )
 
 NOW_NS = 1_700_000_000_000_000_000
@@ -1361,3 +1368,445 @@ class TestKeyInstrumentIdRejectsSlash:
                     reason="taken",
                     key_instrument_id="POLY/LAX",
                 )
+
+
+# ---------------------------------------------------------------------------
+# S4: closed-set reason enumeration for the two latch-level gates below.
+# ---------------------------------------------------------------------------
+
+
+def test_latch_gate_refusal_reasons_is_the_closed_set() -> None:
+    """Pin (plan NO_SIDE_EDGE_2026-09-14 S4, N2-10/R3-7): these two reasons
+    are DISTINCT from ``decision.REFUSAL_REASONS`` (hard invariant --
+    ``decision.py`` stays untouched) because both gates run before a quote
+    ever reaches ``evaluate_decision`` and have no analogue there."""
+    assert LATCH_GATE_REFUSAL_REASONS == frozenset(
+        {SIBLING_LEG_TRADED_REASON, STATION_DAY_ADMISSION_REASON}
+    )
+    assert SIBLING_LEG_TRADED_REASON == "sibling_leg_traded"
+    assert STATION_DAY_ADMISSION_REASON == "station_day_admission"
+
+
+def test_refusal_rejects_a_reason_outside_the_closed_set() -> None:
+    with pytest.raises(ValueError):
+        Refusal("bogus")
+
+
+# ---------------------------------------------------------------------------
+# S4: TrialDayRecord gains an OPTIONAL, trailing ``fee`` field (R3-7) --
+# mirrors ``venue_order_id`` exactly: no ``_SCHEMA_VERSION`` bump (that gate
+# would corrupt every existing v1 row), read via ``payload.get`` so a
+# pre-slice-4 record missing the key decodes as ``None`` ("q unknown").
+# ---------------------------------------------------------------------------
+
+
+class TestTrialDayRecordFee:
+    def test_fee_round_trips_through_to_bytes_and_from_bytes(self) -> None:
+        record = TrialDayRecord(
+            latched_at_ns=NOW_NS,
+            instrument_id=INSTRUMENT_ID,
+            ask=Decimal("0.40"),
+            reason="taken",
+            fee=Decimal("0.01"),
+        )
+        assert TrialDayRecord.from_bytes(record.to_bytes()) == record
+
+    def test_a_record_with_no_fee_key_decodes_fee_as_none(self) -> None:
+        """A pre-slice-4 record byte-for-byte (no ``fee`` key at all)."""
+        payload = json.dumps(
+            {
+                "v": 1,
+                "latched_at_ns": NOW_NS,
+                "instrument_id": INSTRUMENT_ID,
+                "ask": "0.37",
+                "reason": "taken",
+                "venueOrderId": None,
+            },
+            sort_keys=True,
+        ).encode("utf-8")
+        record = TrialDayRecord.from_bytes(payload)
+        assert record.fee is None
+
+    def test_consume_accepts_an_optional_fee_and_persists_it(self, store_path: Path) -> None:
+        with open_submit_intent_latch(SqliteStateStore(store_path), store_path) as intent_latch:
+            latch = open_trial_day_latch(intent_latch)
+            latch.consume(
+                STATION,
+                CLIMATE_DAY,
+                latched_at_ns=NOW_NS,
+                instrument_id=INSTRUMENT_ID,
+                ask=Decimal("0.40"),
+                reason="taken",
+                fee=Decimal("0.0144"),
+            )
+            record = latch.record(STATION, CLIMATE_DAY)
+            assert record is not None
+            assert record.fee == Decimal("0.0144")
+
+    def test_consume_without_fee_still_defaults_to_none_byte_identically(
+        self, store_path: Path
+    ) -> None:
+        """v2's only call shape never passes ``fee`` -- stays byte-identical."""
+        with open_submit_intent_latch(SqliteStateStore(store_path), store_path) as intent_latch:
+            latch = open_trial_day_latch(intent_latch)
+            latch.consume(
+                STATION,
+                CLIMATE_DAY,
+                latched_at_ns=NOW_NS,
+                instrument_id=INSTRUMENT_ID,
+                ask=Decimal("0.37"),
+                reason="taken",
+            )
+            record = latch.record(STATION, CLIMATE_DAY)
+            assert record is not None
+            assert record.fee is None
+
+
+# ---------------------------------------------------------------------------
+# S4 item 1 (N2-10): sibling-leg exclusion.
+# ---------------------------------------------------------------------------
+
+
+NO_INSTRUMENT_ID = str(no_leg_instrument_id("poly-lax-tmax-92-94").symbol)
+
+
+class TestRefuseIfSiblingLegTraded:
+    def test_no_sibling_record_is_not_refused(self, store_path: Path) -> None:
+        store = SqliteStateStore(store_path)
+        with open_submit_intent_latch(store, store_path):
+            got = refuse_if_sibling_leg_traded(
+                store, DEFAULT_TRIAL_KEY_PREFIX, STATION, CLIMATE_DAY, "poly-lax-tmax-92-94",
+            )
+        assert got is None
+
+    def test_a_filled_sibling_record_refuses(self, store_path: Path) -> None:
+        store = SqliteStateStore(store_path)
+        with open_submit_intent_latch(store, store_path) as intent_latch:
+            latch = open_trial_day_latch(intent_latch)
+            latch.consume(
+                STATION,
+                CLIMATE_DAY,
+                latched_at_ns=NOW_NS,
+                instrument_id=NO_INSTRUMENT_ID,
+                ask=Decimal("0.30"),
+                reason="taken",
+                key_instrument_id=NO_INSTRUMENT_ID,
+            )
+            got = refuse_if_sibling_leg_traded(
+                store, DEFAULT_TRIAL_KEY_PREFIX, STATION, CLIMATE_DAY, "poly-lax-tmax-92-94",
+            )
+        assert got == Refusal(SIBLING_LEG_TRADED_REASON)
+
+    def test_a_fill_walk_sibling_record_also_refuses(self, store_path: Path) -> None:
+        store = SqliteStateStore(store_path)
+        with open_submit_intent_latch(store, store_path) as intent_latch:
+            latch = open_trial_day_latch(intent_latch)
+            latch.consume(
+                STATION,
+                CLIMATE_DAY,
+                latched_at_ns=NOW_NS,
+                instrument_id=NO_INSTRUMENT_ID,
+                ask=Decimal("0.30"),
+                reason="taken_from_fill_walk",
+                key_instrument_id=NO_INSTRUMENT_ID,
+            )
+            got = refuse_if_sibling_leg_traded(
+                store, DEFAULT_TRIAL_KEY_PREFIX, STATION, CLIMATE_DAY, "poly-lax-tmax-92-94",
+            )
+        assert got == Refusal(SIBLING_LEG_TRADED_REASON)
+
+    def test_a_merely_refused_sibling_record_does_not_refuse(self, store_path: Path) -> None:
+        """A sibling that was EVALUATED and refused (never filled) is not a
+        TRIAL in the sense this gate cares about -- only ``taken`` and
+        ``taken_from_fill_walk`` count as the sibling having traded."""
+        store = SqliteStateStore(store_path)
+        with open_submit_intent_latch(store, store_path) as intent_latch:
+            latch = open_trial_day_latch(intent_latch)
+            latch.consume(
+                STATION,
+                CLIMATE_DAY,
+                latched_at_ns=NOW_NS,
+                instrument_id=NO_INSTRUMENT_ID,
+                ask=Decimal("0.30"),
+                reason="not_executable",
+                key_instrument_id=NO_INSTRUMENT_ID,
+            )
+            got = refuse_if_sibling_leg_traded(
+                store, DEFAULT_TRIAL_KEY_PREFIX, STATION, CLIMATE_DAY, "poly-lax-tmax-92-94",
+            )
+        assert got is None
+
+    def test_the_no_leg_composite_id_round_trips_through_the_key_and_the_legacy_shim(
+        self, store_path: Path,
+    ) -> None:
+        """The composite ``^no`` id must survive ``_key``'s slash guard and
+        ``record_with_legacy_fallback`` exactly like any other
+        ``key_instrument_id`` string."""
+        store = SqliteStateStore(store_path)
+        with open_submit_intent_latch(store, store_path) as intent_latch:
+            latch = open_trial_day_latch(intent_latch)
+            latch.consume(
+                STATION,
+                CLIMATE_DAY,
+                latched_at_ns=NOW_NS,
+                instrument_id=NO_INSTRUMENT_ID,
+                ask=Decimal("0.30"),
+                reason="taken",
+                key_instrument_id=NO_INSTRUMENT_ID,
+            )
+            record = latch.record_with_legacy_fallback(
+                STATION, CLIMATE_DAY, key_instrument_id=NO_INSTRUMENT_ID,
+            )
+        assert record is not None
+        assert record.instrument_id == NO_INSTRUMENT_ID
+        keys = _committed_keys(store_path)
+        assert f"current_rung_hold/trial/{STATION}/{CLIMATE_DAY}/{NO_INSTRUMENT_ID}" in keys
+
+    def test_mid_day_relaunch_a_fresh_process_still_sees_a_yes_trial_from_the_sibling(
+        self, store_path: Path,
+    ) -> None:
+        """N2-10 relaunch ordering: a YES fill is persisted, the process
+        exits (both latches close), a FRESH process opens a new
+        ``TrialDayLatch`` over the SAME store and the NO leg's sibling
+        check still sees it -- pure store reads, no in-memory state."""
+        with open_submit_intent_latch(SqliteStateStore(store_path), store_path) as intent_latch:
+            latch = open_trial_day_latch(intent_latch)
+            latch.consume(
+                STATION,
+                CLIMATE_DAY,
+                latched_at_ns=NOW_NS,
+                instrument_id="poly-lax-tmax-92-94",
+                ask=Decimal("0.55"),
+                reason="taken",
+                key_instrument_id="poly-lax-tmax-92-94",
+            )
+        # Fresh process: a brand-new store handle and a brand-new latch.
+        fresh_store = SqliteStateStore(store_path)
+        with open_submit_intent_latch(fresh_store, store_path):
+            got = refuse_if_sibling_leg_traded(
+                fresh_store, DEFAULT_TRIAL_KEY_PREFIX, STATION, CLIMATE_DAY, NO_INSTRUMENT_ID,
+            )
+        assert got == Refusal(SIBLING_LEG_TRADED_REASON)
+
+
+# ---------------------------------------------------------------------------
+# S4 item 2 (R3-7): arm-time station-day admission.
+# ---------------------------------------------------------------------------
+
+
+class TestStationDayAdmission:
+    def test_an_empty_day_admits_any_candidate_up_to_one(self, store_path: Path) -> None:
+        store = SqliteStateStore(store_path)
+        with open_submit_intent_latch(store, store_path):
+            got = station_day_admission(
+                store, DEFAULT_TRIAL_KEY_PREFIX, STATION, CLIMATE_DAY, "yes", Decimal("0.90"),
+            )
+        assert got is None
+
+    def test_a_yes_candidate_that_alone_exceeds_one_is_refused(self, store_path: Path) -> None:
+        store = SqliteStateStore(store_path)
+        with open_submit_intent_latch(store, store_path):
+            got = station_day_admission(
+                store, DEFAULT_TRIAL_KEY_PREFIX, STATION, CLIMATE_DAY, "yes", Decimal("1.01"),
+            )
+        assert got == Refusal(STATION_DAY_ADMISSION_REASON)
+
+    def test_an_existing_yes_trial_plus_a_candidate_summing_above_one_is_refused(
+        self, store_path: Path,
+    ) -> None:
+        other_instrument = "POLY-LAX-TMAX-70-71"
+        store = SqliteStateStore(store_path)
+        with open_submit_intent_latch(store, store_path) as intent_latch:
+            latch = open_trial_day_latch(intent_latch)
+            latch.consume(
+                STATION,
+                CLIMATE_DAY,
+                latched_at_ns=NOW_NS,
+                instrument_id=other_instrument,
+                ask=Decimal("0.50"),
+                reason="taken",
+                fee=Decimal("0.01"),
+                key_instrument_id=other_instrument,
+            )
+            got = station_day_admission(
+                store,
+                DEFAULT_TRIAL_KEY_PREFIX,
+                STATION,
+                CLIMATE_DAY,
+                "yes",
+                Decimal("0.55"),
+                existing_instrument_ids=(other_instrument,),
+            )
+        # 0.51 + 0.55 == 1.06 > 1
+        assert got == Refusal(STATION_DAY_ADMISSION_REASON)
+
+    def test_an_existing_yes_trial_plus_a_candidate_summing_to_exactly_one_is_admitted(
+        self, store_path: Path,
+    ) -> None:
+        other_instrument = "POLY-LAX-TMAX-70-71"
+        store = SqliteStateStore(store_path)
+        with open_submit_intent_latch(store, store_path) as intent_latch:
+            latch = open_trial_day_latch(intent_latch)
+            latch.consume(
+                STATION,
+                CLIMATE_DAY,
+                latched_at_ns=NOW_NS,
+                instrument_id=other_instrument,
+                ask=Decimal("0.40"),
+                reason="taken",
+                fee=Decimal("0.00"),
+                key_instrument_id=other_instrument,
+            )
+            got = station_day_admission(
+                store,
+                DEFAULT_TRIAL_KEY_PREFIX,
+                STATION,
+                CLIMATE_DAY,
+                "yes",
+                Decimal("0.60"),
+                existing_instrument_ids=(other_instrument,),
+            )
+        assert got is None
+
+    def test_a_no_leg_candidate_uses_one_minus_be_as_its_cell_probability(
+        self, store_path: Path,
+    ) -> None:
+        """``q = 1 - BE`` for NO -- a cheap NO (``BE=0.10`` -> ``q=0.90``)
+        plus an existing YES leg on another rung (``q=0.15``) sums to
+        ``1.05 > 1`` and is refused."""
+        other_instrument = "POLY-LAX-TMAX-70-71"
+        store = SqliteStateStore(store_path)
+        with open_submit_intent_latch(store, store_path) as intent_latch:
+            latch = open_trial_day_latch(intent_latch)
+            latch.consume(
+                STATION,
+                CLIMATE_DAY,
+                latched_at_ns=NOW_NS,
+                instrument_id=other_instrument,
+                ask=Decimal("0.14"),
+                reason="taken",
+                fee=Decimal("0.01"),
+                key_instrument_id=other_instrument,
+            )
+            got = station_day_admission(
+                store,
+                DEFAULT_TRIAL_KEY_PREFIX,
+                STATION,
+                CLIMATE_DAY,
+                "no",
+                Decimal("0.10"),
+                existing_instrument_ids=(other_instrument,),
+            )
+        assert got == Refusal(STATION_DAY_ADMISSION_REASON)
+
+    def test_an_existing_record_missing_fee_refuses_the_candidate_rather_than_guessing(
+        self, store_path: Path,
+    ) -> None:
+        """A legacy TRIAL record with no ``fee`` (pre-slice-4 write) makes
+        its ``q`` unknown -- R3-7: never guess, refuse."""
+        other_instrument = "POLY-LAX-TMAX-70-71"
+        store = SqliteStateStore(store_path)
+        with open_submit_intent_latch(store, store_path) as intent_latch:
+            latch = open_trial_day_latch(intent_latch)
+            latch.consume(
+                STATION,
+                CLIMATE_DAY,
+                latched_at_ns=NOW_NS,
+                instrument_id=other_instrument,
+                ask=Decimal("0.10"),
+                reason="taken",
+                key_instrument_id=other_instrument,
+                # no fee -- legacy shape
+            )
+            got = station_day_admission(
+                store,
+                DEFAULT_TRIAL_KEY_PREFIX,
+                STATION,
+                CLIMATE_DAY,
+                "yes",
+                Decimal("0.10"),
+                existing_instrument_ids=(other_instrument,),
+            )
+        assert got == Refusal(STATION_DAY_ADMISSION_REASON)
+
+    def test_a_merely_refused_existing_record_does_not_count_toward_the_sum(
+        self, store_path: Path,
+    ) -> None:
+        other_instrument = "POLY-LAX-TMAX-70-71"
+        store = SqliteStateStore(store_path)
+        with open_submit_intent_latch(store, store_path) as intent_latch:
+            latch = open_trial_day_latch(intent_latch)
+            latch.consume(
+                STATION,
+                CLIMATE_DAY,
+                latched_at_ns=NOW_NS,
+                instrument_id=other_instrument,
+                ask=Decimal("0.10"),
+                reason="not_executable",
+                key_instrument_id=other_instrument,
+                # no fee, but reason is not a fill -- must be skipped, not refused
+            )
+            got = station_day_admission(
+                store,
+                DEFAULT_TRIAL_KEY_PREFIX,
+                STATION,
+                CLIMATE_DAY,
+                "yes",
+                Decimal("0.90"),
+                existing_instrument_ids=(other_instrument,),
+            )
+        assert got is None
+
+
+try:
+    from hypothesis import given
+    from hypothesis import strategies as st
+except ImportError:  # pragma: no cover - hypothesis is a declared dev dependency
+    given = None  # type: ignore[assignment]
+    st = None  # type: ignore[assignment]
+
+
+@pytest.mark.skipif(given is None, reason="hypothesis not installed")
+@given(
+    bes=st.lists(
+        st.decimals(min_value="0.01", max_value="0.99", places=2), min_size=1, max_size=4,
+    )
+)
+def test_yes_only_rungs_summing_at_or_below_one_are_never_refused(
+    bes: list[Decimal], tmp_path_factory: pytest.TempPathFactory,
+) -> None:
+    """R3-7: YES-only days cannot breach under the edge rule -- a property
+    test over random per-rung BEs that themselves sum to at most 1 must
+    never see this gate fire, for every prefix count."""
+    total = sum(bes)
+    if total > Decimal(1):
+        return  # a filtered draw; equivalent to hypothesis's `assume`
+    store_path = tmp_path_factory.mktemp("station_day_admission") / "state.db"
+    prefix = DEFAULT_TRIAL_KEY_PREFIX
+    existing: list[str] = []
+    store = SqliteStateStore(store_path)
+    with open_submit_intent_latch(store, store_path) as intent_latch:
+        latch = open_trial_day_latch(intent_latch)
+        for index, be in enumerate(bes[:-1]):
+            instrument_id = f"POLY-LAX-RUNG-{index}"
+            latch.consume(
+                STATION,
+                CLIMATE_DAY,
+                latched_at_ns=NOW_NS,
+                instrument_id=instrument_id,
+                ask=be,
+                reason="taken",
+                fee=Decimal(0),
+                key_instrument_id=instrument_id,
+            )
+            existing.append(instrument_id)
+        got = station_day_admission(
+            store,
+            prefix,
+            STATION,
+            CLIMATE_DAY,
+            "yes",
+            bes[-1],
+            existing_instrument_ids=existing,
+        )
+    assert got is None
