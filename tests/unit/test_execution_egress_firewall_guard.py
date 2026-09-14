@@ -3255,6 +3255,7 @@ def test_x1_the_live_scan_actually_reaches_a_test_that_imports_the_exec_package(
         "tests/unit/test_no_side_boot_reconcile_2026_09_14.py",
         "tests/unit/test_no_side_first_order_pending_2026_09_14.py",
         "tests/unit/test_no_side_keys.py",
+        "tests/unit/test_no_side_s5c_flip_2026_09_14.py",
         "tests/unit/test_polymarket_us_exec_snapshot_drift.py",
         "tests/unit/test_polymarket_us_factories.py",
         "tests/unit/test_no_side_fill_attribution_2026_09_14.py",
