@@ -1,6 +1,6 @@
-# PREREG v3 Amendment — NO-side inclusion (DRAFT, 2026-09-14)
+# PREREG v3 Amendment — NO-side inclusion (REGISTERED, 2026-09-14)
 
-**Status: DRAFT — numbers final, pending ruling sign-off**
+**Status: REGISTERED 2026-09-14 21:4xZ — strategy-lead ruling (coordinator, under the operator's 09-14 "hunt both sides" ruling): S6b adjudicated NULL_CORRECT at c564602 (§6), S6a all-YES reduction byte-identical, market-math review APPROVE on the §3 variance and the NO break-even. Registered BEFORE the first live NO take; the first NO fill is residual per §8 and never feeds a look.**
 
 **Family: `pm_us_crh_cont`** (PREREG v3, registered 2026-09-11). This amendment registers a single additional registered covariate (`side: YES|NO`) and extends the statistic to admit mixed-side station-day draws. Increment 1 is current-rung NO only (NO fills keyed by `(station, climate_day, current_rung_id)`, not by `(station, climate_day)`).
 
@@ -234,4 +234,4 @@ The residual classification for NO-side create-path trials deviates from PREREG 
 
 ---
 
-**Generated: 2026-09-14 | Status: DRAFT (awaiting S6b simulation) | Files referenced: 3 | Reviewed by: [pending]**
+**Generated: 2026-09-14 | Status: REGISTERED 2026-09-14 (S6b cited §6, c564602) | Files referenced: 3 | Reviewed by: prediction-market-reviewer (APPROVE), security-reviewer (APPROVE), python-reviewer (APPROVE-WITH-FIXES, fixed) — blind reviews of `8ebef4b..HEAD` on backlog/no-side-s5-joint-2026-09-14**

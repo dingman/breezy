@@ -321,3 +321,20 @@ residual, pending gate + shadow log), plus the S6b rung-key integration fix (num
 `NO_SIDE_SHADOW_ONLY` remains True. The flip commit (§5 tail: arm, consume with fee, `_maybe_submit` on the NO instrument,
 never-arm walk deciding the NO leg, fill-walk join for NO ids, the E3-1 cross-check under the ruled position shape) is the
 LAST step and is not part of the 2026-09-15 01:23Z live merge.
+
+### Status 2026-09-14 21:4xZ — merge readiness (supersedes the 18:2xZ paragraph on the flip)
+The flip commit 9c9a4cd landed on the joint branch (`NO_SIDE_SHADOW_ONLY = False`, `continuous_strategy.py:125`) and SHIPS IN
+the live merge: a code-explorer trace confirmed the first-order containment (pending key written synchronously before
+`_maybe_submit`, boot-reconcile backstop in `client.py::_reconcile_no_side_first_order_key`, captured key writable only by the
+CLI) bounds exposure to ONE residual NO trial account-wide regardless of merge timing, the YES path is pinned byte-identical
+(`test_yes_worked_example_is_byte_identical_after_the_no_side_refactor`), and nothing in `deploy/` hot-reloads — the node only
+picks the merge up at its 16:50Z respawn. Splitting the flip buys no safety margin.
+Independent review of `8ebef4b..HEAD` (four blind agents): python-reviewer APPROVE-WITH-FIXES (HIGH: unguarded
+`iter_fill_records` in `_run_never_arm_walk` ≈:558 — fixed RED→GREEN before merge; MEDIUM: first-order key written before
+`_maybe_submit` outcome is known — ACCEPTED as the documented fail-closed trade-off, strategy ruling, not an operator item);
+prediction-market-reviewer APPROVE (NO price/fee/BE, exactly-once inversion, cap on the NO premium, settlement, mixed-side
+variance all verified); security-reviewer APPROVE (invariants a–g PASS; one net cage exemption, preview-only). Gate on the
+joint worktree: 9459 passed, 1 failed — `test_scorer_argv_pinned_no_fill_source_family_manifest_present_one_city`, a
+worktree-path artefact (the deploy wrapper pins `/home/jon/breezy/…` while the test derives the literal from the worktree
+root; neither file is in this diff) — re-run on the live tree after merge as the proof. `lint-imports`: 3 kept, 0 broken.
+Operator-only item (§8): no new ceiling supplied — the daily budget and per-order cap stay as-is and are shared by both legs.
