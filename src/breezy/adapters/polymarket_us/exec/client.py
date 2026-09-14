@@ -287,11 +287,13 @@ from breezy.adapters.polymarket_us.exec.reports import (
 )
 from breezy.adapters.polymarket_us.exec_fault import record_fatal_exec_fault
 from breezy.adapters.polymarket_us.fees import polymarket_us_fee
+from breezy.adapters.polymarket_us.operator_controls import utc_day_for_ns
 from breezy.adapters.polymarket_us.parsing import _to_decimal
 from breezy.adapters.polymarket_us.safety import (
     LiveTradingPermissionError,
     assert_live_order_submission_permitted,
     restore_live_trading_budget,
+    seed_permit_budget_from_prior_spend,
     unrestore_live_trading_budget,
 )
 from breezy.adapters.polymarket_us.symbology import instrument_id_to_slug, slug_to_instrument_id
@@ -1204,6 +1206,12 @@ class PolymarketUSExecutionClient(LiveExecutionClient):
             await self._publish_account_state()
             await self._confirm_account_registered()
             self._reconcile_submit_intent()
+            # S0 (plan rev 3, R3-1): boot-seed the daily ledger and the
+            # permit's session budget from today's durable fills, AFTER
+            # intent reconciliation and BEFORE the startup position evidence
+            # read below -- a mid-day relaunch must not re-grant budget a
+            # prior process in this same calendar day already spent.
+            self._seed_spend_from_durable_fills()
             # C1 (plan rev 6.1): the strategy's never-arm gate needs FRESH
             # startup evidence, taken AFTER reconciliation -- last, not
             # first, so a position opened or closed by whatever reconcile
@@ -1245,6 +1253,76 @@ class PolymarketUSExecutionClient(LiveExecutionClient):
             now_ns=self._clock.timestamp_ns(),
         )
         self._intent_reconciled = True
+
+    def _seed_spend_from_durable_fills(self) -> None:
+        """S0 (plan rev 3, R3-1): book today's already-spent USD into the
+        daily ledger and the permit's session budget before anything can
+        arm.
+
+        Walks the SAME per-instrument ``FILL_INDEX_KEY_PREFIX`` index
+        :meth:`record_fill`/``iter_fill_records`` already maintain, over
+        every instrument this client's provider has loaded -- summing
+        ``DurableFillRecord.cumulative_cost`` for records whose ``ts_event``
+        falls in today's UTC calendar day, de-duplicated per
+        ``venue_order_id`` (the create and resolver paths overwrite the same
+        key, so one order is counted once).
+
+        **Fails CLOSED.** ``_read_fill_index`` returning ``None`` for ANY
+        ONE instrument -- a per-instrument corruption, not only a wholesale
+        walk exception -- or a fill index naming a record this store cannot
+        produce, RAISES. Left uncaught, this propagates to ``_connect``'s
+        own fault latch, which records the fault and requests a native
+        shutdown: the same direction ``_run_never_arm_walk``'s
+        ``_POSITION_FILL_WALK_UNREADABLE`` path takes, one layer up.
+
+        **Never reads or logs an operator-control value.** The only inputs
+        are durable fill records already on disk; the only output is an INFO
+        line naming the record count and the UTC day, never a dollar figure.
+
+        **Idempotent.** A second ``_connect()`` in the same process re-walks
+        the same records, but :meth:`DailySpendLedger.seed_spent` and
+        :func:`seed_permit_budget_from_prior_spend` are each keyed to apply
+        at most once, so re-running this method cannot double-book.
+        """
+        if self._ledger is None:
+            return
+        now_ns = self._clock.timestamp_ns()
+        today = utc_day_for_ns(now_ns)
+        seen: set[str] = set()
+        total = Decimal(0)
+        count = 0
+        for instrument in self._instrument_provider.list_all():
+            instrument_id = str(instrument.id)
+            index_key = f"{FILL_INDEX_KEY_PREFIX}{instrument_id}"
+            indexed = self._read_fill_index(index_key)
+            if indexed is None:
+                raise PolymarketUSError(
+                    f"the durable fill index at {index_key!r} could not be read; "
+                    "the boot-time spend seed refuses to arm on an incomplete walk"
+                )
+            for venue_order_id in indexed:
+                if venue_order_id in seen:
+                    continue
+                seen.add(venue_order_id)
+                raw = self._store_get(f"{FILL_KEY_PREFIX}{venue_order_id}")
+                if raw is None:
+                    raise PolymarketUSError(
+                        f"the fill index for {instrument_id} names venue order "
+                        f"{venue_order_id!r} but no record exists for it"
+                    )
+                record = DurableFillRecord.from_bytes(raw)
+                if utc_day_for_ns(record.ts_event) != today:
+                    continue
+                total += record.cumulative_cost
+                count += 1
+        if count == 0:
+            return
+        self._ledger.seed_spent(day=today, spent_usd=total, now_ns=now_ns)
+        if self._permit is not None:
+            seed_permit_budget_from_prior_spend(permit=self._permit, spent_usd=total)
+        self._log.info(
+            f"seeded from {count} fill record(s) for {today.isoformat()}"
+        )
 
     def _resolver_poll_interval_secs(self) -> float:
         """Overridable seam: tests shrink this to iterate the loop fast."""
@@ -1765,6 +1843,21 @@ class PolymarketUSExecutionClient(LiveExecutionClient):
             cumulative_cost=cumulative_cost,
             cumulative_fee=submit_chain.ZERO,
             fee_reconciled=False,
+            # S3 item 3 (plan 2026-09-14): `ts_event` is the RESOLVER's own
+            # wall-clock discovery time (`now_ns`, this method's own GET
+            # timestamp), never a venue-reported execution time -- the
+            # Order-only GET this path resolves from carries no execution
+            # legs and no fill timestamp at all. This differs from the
+            # CREATE path's `KIND_ACCEPT_FILL` branch, which stamps the
+            # venue's own execution time. Consequence, stated rather than
+            # papered over: the S0 boot-seed
+            # (`_seed_spend_from_durable_fills`) buckets every durable fill
+            # by `ts_event`, so a resolver-path fill DISCOVERED after UTC
+            # midnight is booked into the discovery day's seed, never the
+            # (unknown, possibly earlier) day the fill actually happened on
+            # the venue. Conservative -- the discovery day's ledger and
+            # permit budget see this spend even if the fill itself belongs
+            # to the prior day, never the reverse.
             ts_event=now_ns,
             venue_fee_raw=None,
             trade_id=_synthetic_get_fill_trade_id(context.venue_order_id).value,

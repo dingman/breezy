@@ -93,10 +93,18 @@ def _row(
     n: int,
     *,
     station: str = "MIA",
-    climate_day: str = "2026-09-11",
+    climate_day: str | None = None,
     ask: str = "0.50",
     held: bool = True,
 ) -> ScoredTrial:
+    """One row, one DISTINCT station-day by default (operator ruling
+    2026-09-14 / plan S4a R3-3): `build_family_tally_v2` now combines every
+    row sharing `(station, climate_day)` into one draw, so `n` independent
+    rows in a single-station fixture need `n` distinct days -- derived from
+    `n` (the row index) unless a caller passes `climate_day=` explicitly to
+    deliberately build a same-day (multi-rung) fixture."""
+    if climate_day is None:
+        climate_day = f"2026-09-{11 + n:02d}"
     ask_d = Decimal(ask)
     fee = _fee(ask_d)
     fill_px = ask_d

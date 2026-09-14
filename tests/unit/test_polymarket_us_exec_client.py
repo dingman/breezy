@@ -122,9 +122,14 @@ from breezy.adapters.polymarket_us.operator_controls import (
     MAX_DAILY_BUDGET_USD_ENV_VAR,
     MAX_POSITION_COST_USD_ENV_VAR,
     DailySpendLedger,
+    utc_day_for_ns,
 )
 from breezy.adapters.polymarket_us.parsing import FEE_COEFFICIENT_KEY, parse_binary_option
-from breezy.adapters.polymarket_us.safety import issue_live_trading_permit
+from breezy.adapters.polymarket_us.safety import (
+    LiveTradingPermissionError,
+    issue_live_trading_permit,
+    live_trading_budget_remaining,
+)
 from breezy.adapters.polymarket_us.symbology import POLYMARKET_US_VENUE
 from breezy.adapters.polymarket_us.transport import VenueResponse
 from breezy.runtime.sqlite_store import SqliteStateStore
@@ -240,6 +245,8 @@ class _Rig:
         read: _PrivateReadStub,
         account_states: list[AccountState],
         order_events: list[Any],
+        clock: LiveClock,
+        store_path: Path,
     ) -> None:
         self.client = client
         self.cache = cache
@@ -248,6 +255,8 @@ class _Rig:
         self.read = read
         self.account_states = account_states
         self.order_events = order_events
+        self.clock = clock
+        self.store_path = store_path
 
     def submit_command(self) -> SubmitOrder:
         factory = OrderFactory(
@@ -277,6 +286,9 @@ def _build_rig(
     instrument_loaded: bool = True,
     store_opener: Any = None,
     instrument_wait_timeout_s: Any = 1.0,
+    spend_ledger: Any = None,
+    live_trading_permit: Any = None,
+    store_path: Path | None = None,
 ) -> _Rig:
     loop = asyncio.get_running_loop()
     clock = LiveClock()
@@ -310,7 +322,8 @@ def _build_rig(
     msgbus.register(endpoint="Portfolio.update_account", handler=_on_account_state)
     msgbus.register(endpoint="ExecEngine.process", handler=order_events.append)
 
-    opener = store_opener or (lambda: SqliteStateStore(tmp_path / "exec_state.db"))
+    resolved_store_path = store_path or (tmp_path / "exec_state.db")
+    opener = store_opener or (lambda: SqliteStateStore(resolved_store_path))
     client = PolymarketUSExecutionClient(
         loop=loop,
         client_id=CLIENT_ID,
@@ -324,6 +337,8 @@ def _build_rig(
         account_number=ACCOUNT_NUMBER,
         instrument_wait_timeout_s=instrument_wait_timeout_s,
         account_registration_timeout_s=1.0,
+        spend_ledger=spend_ledger,
+        live_trading_permit=live_trading_permit,
     )
     return _Rig(
         client=client,
@@ -333,6 +348,8 @@ def _build_rig(
         read=read,
         account_states=account_states,
         order_events=order_events,
+        clock=clock,
+        store_path=resolved_store_path,
     )
 
 
@@ -2806,3 +2823,380 @@ def test_a_resolver_context_written_before_this_change_still_decodes() -> None:
     round_tripped = AmbiguousResolverContext.from_bytes(new_bytes)
     assert round_tripped.create_detail is None
     assert round_tripped.fill_parse_error is None
+
+
+# ---------------------------------------------------------------------------
+# S0 (plan rev 3, R3-1) -- boot-seed the ledger and permit budget from
+# today's durable fills, between `_reconcile_submit_intent` and
+# `_refresh_startup_position_evidence`.
+# ---------------------------------------------------------------------------
+
+
+def _issued_permit(clock: LiveClock) -> Any:
+    return issue_live_trading_permit(clock=clock)
+
+
+def _record_at(rig: _Rig, *, ts_event: int, **kwargs: Any) -> DurableFillRecord:
+    """A durable fill record with an EXPLICIT ``ts_event``, since ``_record``
+    defaults to the fixed ``TS_INIT`` constant, never the wall clock -- the
+    UTC-day seed needs a record whose day is deterministically "today" or
+    "not today" relative to the test's own ``now_ns``."""
+    return dataclasses.replace(_record(rig, **kwargs), ts_event=ts_event)
+
+
+@pytest.mark.asyncio
+async def test_a_relaunch_mid_day_does_not_re_grant_the_spent_budget(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A mid-day process restart must not forget what today already spent."""
+    enable_operator_gate(monkeypatch)
+    store_path = tmp_path / "exec_state.db"
+
+    boot1 = _build_rig(tmp_path, store_path=store_path, spend_ledger=DailySpendLedger())
+    await boot1.client._connect()
+    now_ns = boot1.clock.timestamp_ns()
+    boot1.client.record_fill(
+        _record_at(boot1, ts_event=now_ns, order="V-SEED-1", qty=Decimal(3), cost=Decimal("3.00")),
+    )
+    await boot1.client._disconnect()
+
+    ledger2 = DailySpendLedger()
+    boot2 = _build_rig(tmp_path, store_path=store_path, spend_ledger=ledger2)
+    await boot2.client._connect()
+    reauthorize_ns = boot2.clock.timestamp_ns()
+
+    assert ledger2.spent_today_usd(now_ns=reauthorize_ns) == Decimal("3.00")
+    with (
+        operator_control_env(MAX_DAILY_BUDGET_USD_ENV_VAR, "3.00"),
+        operator_control_env(MAX_POSITION_COST_USD_ENV_VAR, "3.00"),
+        pytest.raises(LiveTradingPermissionError, match="daily budget"),
+    ):
+        ledger2.authorize_order_cost(
+            price_usd=Decimal("0.01"), quantity=Decimal(1), now_ns=reauthorize_ns,
+        )
+    await boot2.client._disconnect()
+
+
+@pytest.mark.asyncio
+async def test_the_seed_sums_only_todays_utc_fills(tmp_path: Path) -> None:
+    store_path = tmp_path / "exec_state.db"
+    boot1 = _build_rig(tmp_path, store_path=store_path, spend_ledger=DailySpendLedger())
+    await boot1.client._connect()
+    now_ns = boot1.clock.timestamp_ns()
+    yesterday_ns = now_ns - 2 * 24 * 60 * 60 * 1_000_000_000
+    boot1.client.record_fill(
+        _record_at(boot1, ts_event=now_ns, order="V-TODAY", qty=Decimal(1), cost=Decimal("2.00")),
+    )
+    boot1.client.record_fill(
+        _record_at(
+            boot1, ts_event=yesterday_ns, order="V-YESTERDAY", qty=Decimal(1), cost=Decimal("9.00"),
+        ),
+    )
+    await boot1.client._disconnect()
+
+    ledger2 = DailySpendLedger()
+    boot2 = _build_rig(tmp_path, store_path=store_path, spend_ledger=ledger2)
+    await boot2.client._connect()
+
+    assert ledger2.spent_today_usd(now_ns=now_ns) == Decimal("2.00")
+    await boot2.client._disconnect()
+
+
+@pytest.mark.asyncio
+async def test_a_corrupt_fill_index_for_one_instrument_fails_the_seed_closed_and_never_arms(
+    tmp_path: Path,
+) -> None:
+    """A SECOND instrument's corrupt index -- not a wholesale walk failure --
+    must still refuse to arm the whole client (R3-1 security note)."""
+    second_instrument = build_second_instrument()
+    store_path = tmp_path / "exec_state.db"
+
+    with SqliteStateStore(store_path) as store:
+        store.set(f"{FILL_INDEX_KEY_PREFIX}{second_instrument.id}", b"{not json at all")
+
+    def _opener() -> SqliteStateStore:
+        return SqliteStateStore(store_path)
+
+    loop = asyncio.get_running_loop()
+    clock = LiveClock()
+    msgbus = MessageBus(trader_id=TRADER_ID, clock=clock)
+    cache = Cache(database=None, config=CacheConfig(database=None, flush_on_start=False))
+    instrument = build_instrument()
+    cache.add_instrument(instrument)
+    cache.add_instrument(second_instrument)
+    provider = InstrumentProvider()
+    provider.add(instrument)
+    provider.add(second_instrument)
+    read = _PrivateReadStub(
+        {
+            ACCOUNT_BALANCES_PATH: _balances_payload(),
+            PORTFOLIO_POSITIONS_PATH: {"positions": {}, "eof": True},
+        },
+    )
+    msgbus.register(endpoint="Portfolio.update_account", handler=lambda state: None)
+    msgbus.register(endpoint="ExecEngine.process", handler=lambda event: None)
+    client = PolymarketUSExecutionClient(
+        loop=loop,
+        client_id=CLIENT_ID,
+        venue=POLYMARKET_US_VENUE,
+        instrument_provider=provider,
+        msgbus=msgbus,
+        cache=cache,
+        clock=clock,
+        private_read=read,
+        state_store_opener=_opener,
+        account_number=ACCOUNT_NUMBER,
+        instrument_wait_timeout_s=1.0,
+        account_registration_timeout_s=1.0,
+        spend_ledger=DailySpendLedger(),
+    )
+
+    client.start()
+    client.connect()
+    tasks = list(client._tasks)
+    done, pending = await asyncio.wait(tasks, timeout=5.0)
+    assert pending == set()
+    assert done == set(tasks)
+
+    assert client.is_connected is False
+    fault = fatal_exec_fault()
+    assert fault is not None
+    assert "index" in fault.reason
+
+
+@pytest.mark.asyncio
+async def test_the_seed_never_reads_an_operator_control_value(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Neither operator-reserved-control reader is ever called by the seed --
+    live, not just statically: both are patched to raise, and a normal
+    two-boot relaunch (which DOES seed a nonzero figure) must still connect
+    cleanly with the raise never firing."""
+    import breezy.adapters.polymarket_us.operator_controls as operator_controls_module
+
+    def _boom() -> Decimal:
+        raise AssertionError("the boot-time seed must never read an operator control value")
+
+    monkeypatch.setattr(
+        operator_controls_module, "operator_max_daily_budget_usd", _boom,
+    )
+    monkeypatch.setattr(
+        operator_controls_module, "operator_max_position_cost_usd", _boom,
+    )
+
+    store_path = tmp_path / "exec_state.db"
+    boot1 = _build_rig(tmp_path, store_path=store_path, spend_ledger=DailySpendLedger())
+    await boot1.client._connect()
+    now_ns = boot1.clock.timestamp_ns()
+    boot1.client.record_fill(
+        _record_at(boot1, ts_event=now_ns, order="V-REDACT", qty=Decimal(1), cost=Decimal("7.00")),
+    )
+    await boot1.client._disconnect()
+
+    ledger2 = DailySpendLedger()
+    boot2 = _build_rig(tmp_path, store_path=store_path, spend_ledger=ledger2)
+    await boot2.client._connect()  # would raise via `_boom` if the seed read a control
+    await boot2.client._disconnect()
+
+    assert ledger2.spent_today_usd(now_ns=now_ns) == Decimal("7.00")
+
+
+def test_the_seed_log_line_names_only_the_count_and_the_day() -> None:
+    """Static proof the INFO line carries no money-shaped literal: a live
+    log capture is unreliable here (`self._log` is Nautilus's Rust-backed
+    logger, not interceptable through `caplog`/`capsys`/`capfd`), so this
+    parses the method's own source instead -- the same AST-based technique
+    `test_operator_control_assignment_scan.py` already uses for its refusal
+    messages."""
+    import textwrap
+
+    source = inspect.getsource(PolymarketUSExecutionClient._seed_spend_from_durable_fills)
+    tree = ast.parse(textwrap.dedent(source))
+    log_calls = [
+        call
+        for call in ast.walk(tree)
+        if isinstance(call, ast.Call)
+        and isinstance(call.func, ast.Attribute)
+        and call.func.attr == "info"
+    ]
+    assert log_calls, "expected at least one `self._log.info(...)` call"
+    for call in log_calls:
+        for arg in call.args:
+            formatted = ast.unparse(arg)
+            assert "cumulative_cost" not in formatted
+            assert "total" not in formatted
+            assert "spent" not in formatted.lower()
+
+
+@pytest.mark.asyncio
+async def test_the_permit_session_ceiling_is_seeded_from_the_same_walk(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    enable_operator_gate(monkeypatch, session_notional="12.00", order_count="10")
+    store_path = tmp_path / "exec_state.db"
+
+    boot1 = _build_rig(tmp_path, store_path=store_path, spend_ledger=DailySpendLedger())
+    await boot1.client._connect()
+    now_ns = boot1.clock.timestamp_ns()
+    boot1.client.record_fill(
+        _record_at(
+            boot1, ts_event=now_ns, order="V-PERMIT-SEED", qty=Decimal(1), cost=Decimal("4.00"),
+        ),
+    )
+    await boot1.client._disconnect()
+
+    permit = _issued_permit(LiveClock())
+    boot2 = _build_rig(
+        tmp_path,
+        store_path=store_path,
+        spend_ledger=DailySpendLedger(),
+        live_trading_permit=permit,
+    )
+    await boot2.client._connect()
+
+    assert live_trading_budget_remaining(permit) == (Decimal("8.00"), 10)
+    await boot2.client._disconnect()
+
+
+@pytest.mark.asyncio
+async def test_a_second_connect_in_the_same_process_is_idempotent(tmp_path: Path) -> None:
+    ledger = DailySpendLedger()
+    rig = _build_rig(tmp_path, spend_ledger=ledger)
+    await rig.client._connect()
+    now_ns = rig.clock.timestamp_ns()
+    rig.client.record_fill(
+        _record_at(
+            rig, ts_event=now_ns, order="V-IDEMPOTENT", qty=Decimal(1), cost=Decimal("3.00"),
+        ),
+    )
+
+    await rig.client._connect()
+    assert ledger.spent_today_usd(now_ns=now_ns) == Decimal("3.00")
+
+    await rig.client._connect()
+    assert ledger.spent_today_usd(now_ns=now_ns) == Decimal("3.00")
+
+    await rig.client._disconnect()
+
+
+@pytest.mark.asyncio
+async def test_the_seed_runs_after_intent_reconciliation_and_before_position_evidence(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    rig = _build_rig(tmp_path, spend_ledger=DailySpendLedger())
+    trace: list[str] = []
+
+    original_reconcile = rig.client._reconcile_submit_intent
+    original_seed = rig.client._seed_spend_from_durable_fills
+    original_evidence = rig.client._refresh_startup_position_evidence
+
+    def _spy_reconcile() -> Any:
+        trace.append("_reconcile_submit_intent")
+        return original_reconcile()
+
+    def _spy_seed() -> Any:
+        trace.append("_seed_spend_from_durable_fills")
+        return original_seed()
+
+    async def _spy_evidence() -> Any:
+        trace.append("_refresh_startup_position_evidence")
+        return await original_evidence()
+
+    monkeypatch.setattr(rig.client, "_reconcile_submit_intent", _spy_reconcile)
+    monkeypatch.setattr(rig.client, "_seed_spend_from_durable_fills", _spy_seed)
+    monkeypatch.setattr(rig.client, "_refresh_startup_position_evidence", _spy_evidence)
+
+    await rig.client._connect()
+
+    assert trace == [
+        "_reconcile_submit_intent",
+        "_seed_spend_from_durable_fills",
+        "_refresh_startup_position_evidence",
+    ], trace
+    await rig.client._disconnect()
+
+
+# ---------------------------------------------------------------------------
+# S3 item 3 (plan 2026-09-14): a resolver-path (`_resolve_accept_fill`) fill
+# is stamped with the RESOLVER's own discovery time, never a venue execution
+# time -- so a fill discovered after UTC midnight seeds the DISCOVERY day.
+# ---------------------------------------------------------------------------
+
+
+class _FakeResolverAcceptFillReport:
+    """Duck-typed stand-in for `_resolve_accept_fill`'s `report` argument.
+
+    `filled_qty`/`quantity` are REAL `Quantity` instances (unlike the
+    lighter duck-type in `test_current_rung_hold_ambiguous_resolver.py`):
+    this test's intent is genuinely OPEN, so `_resolve_accept_fill` runs all
+    the way through to `generate_order_filled`, which requires a real
+    `Quantity` for `last_qty`.
+    """
+
+    avg_px = Decimal("0.37")
+    filled_qty = Quantity(1, 0)
+    quantity = Quantity(1, 0)
+
+
+@pytest.mark.asyncio
+async def test_a_resolver_fill_discovered_after_midnight_seeds_the_discovery_day(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    write_canonical_verified: None,  # noqa: F811
+) -> None:
+    """The intent is ARMED (created) at 23:50 UTC on day D -- standing in
+    for a fill that happened on the venue before midnight -- but the
+    resolver's own GET only discovers and resolves it at 00:10 UTC on day
+    D+1. The durable record's `ts_event` must be the DISCOVERY time (D+1),
+    never the creation time (D): `_resolve_accept_fill` has no venue
+    execution timestamp to fall back on at all."""
+    sender = _FakeOrderSender()
+    rig = _build_accept_fill_rig(tmp_path, monkeypatch=monkeypatch, sender=sender)
+    order_id = "ord-s3-midnight"
+    sender.response = VenueResponse(status=200, headers={}, body=_ambiguous_with_id_body(order_id))
+
+    day_d_ns = 1_767_657_000_000_000_000  # 2026-01-05T23:50:00Z
+    day_d_plus_1_ns = 1_767_658_200_000_000_000  # 2026-01-06T00:10:00Z -- +20 min
+
+    with _accept_fill_caps():
+        await rig.client._connect()
+        await rig.client._submit_order(rig.limit_buy())
+
+        assert rig.client._latch is not None
+        current = rig.client._latch.current_open()
+        assert current is not None, "the with-id AMBIGUOUS outcome must leave OPEN"
+
+        instrument = rig.instrument
+        context = AmbiguousResolverContext(
+            intent_id=current.intent_id,
+            venue_order_id=order_id,
+            instrument_id=str(instrument.id),
+            client_order_id="O-does-not-matter",
+            strategy_id=str(STRATEGY_ID.value),
+            notional_usd=Decimal("0.40"),
+            booking_id=1,
+            created_ns=day_d_ns,
+        )
+        rig.client._resolved_by_get_ts_ns[current.intent_id] = day_d_plus_1_ns
+        # Simulate a restart re-entry (`_ambiguous_bookings` is process-local
+        # only and empty after a restart, mirroring
+        # `test_a_resolver_accept_fill_with_no_same_process_booking_still_
+        # records_the_venue_id_map`): this sidesteps `DailySpendLedger.
+        # true_up_booking`'s own same-UTC-day guard, which is orthogonal to
+        # what this test pins (the durable record's `ts_event`).
+        rig.client._ambiguous_bookings.pop(current.intent_id, None)
+
+        rig.client._resolve_accept_fill(
+            context, _FakeResolverAcceptFillReport(), instrument, day_d_plus_1_ns,
+        )
+
+        await rig.client._disconnect()
+
+    records = _reopened_fill_record(rig.store_path, order_id)
+    assert records is not None
+    assert records.ts_event == day_d_plus_1_ns
+    assert utc_day_for_ns(records.ts_event) == utc_day_for_ns(day_d_plus_1_ns)
+    assert utc_day_for_ns(records.ts_event) != utc_day_for_ns(day_d_ns), (
+        "a resolver-path fill discovered after midnight must seed the "
+        "DISCOVERY day, never the (unknown) day the fill actually happened"
+    )

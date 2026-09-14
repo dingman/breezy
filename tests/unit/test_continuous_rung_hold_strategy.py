@@ -51,6 +51,7 @@ from tests.unit.test_current_rung_hold_strategy import (
     ICAO,
     INTERIOR_ID,
     NS_PER_MIN,
+    OPEN_UPPER_ID,
     STATION,
     WINDOW_OPEN_NS,
     _instrument,
@@ -69,6 +70,11 @@ def store_path(tmp_path: Path) -> Path:
 @pytest.fixture
 def interior_instrument() -> BinaryOption:
     return _instrument(INTERIOR_ID, lower_f=86, upper_f=87)
+
+
+@pytest.fixture
+def open_upper_instrument() -> BinaryOption:
+    return _instrument(OPEN_UPPER_ID, lower_f=88, upper_f=None)
 
 
 @contextmanager
@@ -157,7 +163,8 @@ _PERMISSIVE_EVIDENCE: dict[str, object] = {
 
 
 def _pad(
-    side: OrderSide, levels: tuple[tuple[str, int], ...],
+    side: OrderSide,
+    levels: tuple[tuple[str, int], ...],
 ) -> tuple[list[BookOrder], list[int]]:
     """Ten-level Depth10 side, padded with the size-0 Arrow filler (matches
     `parse_order_book_depth10`'s own padding at the instrument's precision)."""
@@ -193,20 +200,27 @@ def _depth(
 
 
 def test_refuse_does_not_write_trial(
-    store_path: Path, interior_instrument: BinaryOption,
+    store_path: Path,
+    interior_instrument: BinaryOption,
 ) -> None:
     strategy = _register_and_start(store_path=store_path, instruments=(interior_instrument,))
     strategy.on_data(_observation(temp_c_tenths=300, observed_at_ns=WINDOW_OPEN_NS - 1))
     # ask=0.80: executable but p_hold_lower 0.6982 does not clear BE.
     strategy.on_quote_tick(_quote(INTERIOR_ID, ask="0.80", ts_event=WINDOW_OPEN_NS))
     assert strategy._latch is not None
-    assert strategy._latch.is_consumed(STATION, CLIMATE_DAY.isoformat()) is False
+    assert (
+        strategy._latch.is_consumed(
+            STATION, CLIMATE_DAY.isoformat(), key_instrument_id=str(INTERIOR_ID)
+        )
+        is False
+    )
     assert strategy.refusals.count("edge_below_break_even") == 1
     assert any(rec.reason == "edge_below_break_even" for rec in strategy.offer_tape.records())
 
 
 def test_illegal_cell_counted_once_visible_on_stop(
-    store_path: Path, interior_instrument: BinaryOption,
+    store_path: Path,
+    interior_instrument: BinaryOption,
 ) -> None:
     strategy = _register_and_start(store_path=store_path, instruments=(interior_instrument,))
     # 87F METAR → m_code = 1 on interior [86, 87] → illegal_cell.
@@ -217,15 +231,57 @@ def test_illegal_cell_counted_once_visible_on_stop(
     )
     assert strategy.refusals.count("illegal_cell") == 1
     assert strategy._latch is not None
-    assert strategy._latch.is_consumed(STATION, CLIMATE_DAY.isoformat()) is False
+    assert (
+        strategy._latch.is_consumed(
+            STATION, CLIMATE_DAY.isoformat(), key_instrument_id=str(INTERIOR_ID)
+        )
+        is False
+    )
     message = strategy._illegal_cell_snapshot_message()
     assert message == "continuous_rung_hold illegal_cell once-count: 1"
     strategy.stop()
     assert "illegal_cell once-count: 1" in strategy._illegal_cell_snapshot_message()
 
 
+def test_two_current_rungs_at_one_station_day_both_reach_a_decision(
+    store_path: Path,
+    interior_instrument: BinaryOption,
+    open_upper_instrument: BinaryOption,
+) -> None:
+    """RED (plan S1, operator ruling 2026-09-14): "I never wanted a limit
+    of 1 contract per station." A trial already consumed for ONE instrument
+    on a station-day must never block a DIFFERENT instrument's tick on the
+    SAME station-day from reaching its own decision point.
+    """
+    strategy = _register_and_start(
+        store_path=store_path, instruments=(interior_instrument, open_upper_instrument),
+    )
+    assert strategy._latch is not None
+    strategy._latch.consume(
+        STATION,
+        CLIMATE_DAY.isoformat(),
+        latched_at_ns=WINDOW_OPEN_NS,
+        instrument_id=str(INTERIOR_ID),
+        ask=Decimal("0.40"),
+        reason="taken",
+        key_instrument_id=str(INTERIOR_ID),
+    )
+    # INTERIOR_ID's own instrument-day is consumed -- its tick is a silent
+    # no-op (no diagnostic, `is_consumed` short-circuits before any is
+    # recorded).
+    strategy.on_quote_tick(_quote(INTERIOR_ID, ask="0.40", ts_event=WINDOW_OPEN_NS))
+    assert strategy.diagnostics.count("in_window_no_running_max_yet") == 0
+    # OPEN_UPPER_ID, a DIFFERENT rung on the SAME station-day, still reaches
+    # its own decision point -- this diagnostic only fires once `_hunt_tick`
+    # has passed the `is_consumed` guard for OPEN_UPPER_ID's OWN
+    # instrument-day key.
+    strategy.on_quote_tick(_quote(OPEN_UPPER_ID, ask="0.40", ts_event=WINDOW_OPEN_NS))
+    assert strategy.diagnostics.count("in_window_no_running_max_yet") == 1
+
+
 def test_inflight_commits_before_arm(
-    store_path: Path, interior_instrument: BinaryOption,
+    store_path: Path,
+    interior_instrument: BinaryOption,
 ) -> None:
     strategy = _register_and_start(store_path=store_path, instruments=(interior_instrument,))
     order: list[str] = []
@@ -237,12 +293,22 @@ def test_inflight_commits_before_arm(
         order.append("inflight")
         orig_set(*args, **kwargs)
         assert strategy._latch is not None
-        assert strategy._latch.is_inflight(STATION, CLIMATE_DAY.isoformat()) is True
+        assert (
+            strategy._latch.is_inflight(
+                STATION, CLIMATE_DAY.isoformat(), key_instrument_id=str(INTERIOR_ID)
+            )
+            is True
+        )
 
     def spy_maybe(*args: object, **kwargs: object) -> None:
         order.append("maybe_submit")
         assert strategy._latch is not None
-        assert strategy._latch.is_inflight(STATION, CLIMATE_DAY.isoformat()) is True
+        assert (
+            strategy._latch.is_inflight(
+                STATION, CLIMATE_DAY.isoformat(), key_instrument_id=str(INTERIOR_ID)
+            )
+            is True
+        )
         return orig_maybe(*args, **kwargs)
 
     strategy._latch.set_inflight = spy_set  # type: ignore[method-assign]
@@ -250,16 +316,24 @@ def test_inflight_commits_before_arm(
     strategy.on_data(_observation(temp_c_tenths=300, observed_at_ns=WINDOW_OPEN_NS - 1))
     strategy.on_quote_tick(_quote(INTERIOR_ID, ask="0.40", ts_event=WINDOW_OPEN_NS))
     assert order == ["inflight", "maybe_submit"]
-    assert strategy._latch.is_consumed(STATION, CLIMATE_DAY.isoformat()) is False
+    assert (
+        strategy._latch.is_consumed(
+            STATION, CLIMATE_DAY.isoformat(), key_instrument_id=str(INTERIOR_ID)
+        )
+        is False
+    )
 
 
 def test_on_data_skips_stale_or_future_last_tick(
-    store_path: Path, interior_instrument: BinaryOption,
+    store_path: Path,
+    interior_instrument: BinaryOption,
 ) -> None:
     strategy = _register_and_start(store_path=store_path, instruments=(interior_instrument,))
     obs = _observation(temp_c_tenths=300, observed_at_ns=WINDOW_OPEN_NS - 1)
     future = _quote(
-        INTERIOR_ID, ask="0.40", ts_event=obs.received_at_ns + NS_PER_MIN,
+        INTERIOR_ID,
+        ask="0.40",
+        ts_event=obs.received_at_ns + NS_PER_MIN,
     )
     strategy.cache.add_quote_tick(future)
     strategy.on_data(obs)
@@ -292,11 +366,14 @@ def test_on_data_skips_stale_or_future_last_tick(
 
 
 def test_timer_calls_empty(
-    store_path: Path, interior_instrument: BinaryOption,
+    store_path: Path,
+    interior_instrument: BinaryOption,
 ) -> None:
     clock = _SpyClock()
     strategy = _register_and_start(
-        store_path=store_path, instruments=(interior_instrument,), clock=clock,
+        store_path=store_path,
+        instruments=(interior_instrument,),
+        clock=clock,
     )
     strategy.on_data(_observation(temp_c_tenths=300, observed_at_ns=WINDOW_OPEN_NS - 1))
     strategy.on_quote_tick(_quote(INTERIOR_ID, ask="0.40", ts_event=WINDOW_OPEN_NS))
@@ -305,7 +382,8 @@ def test_timer_calls_empty(
 
 
 def test_constructing_with_a_non_none_permit_raises_phase0_error(
-    store_path: Path, interior_instrument: BinaryOption,
+    store_path: Path,
+    interior_instrument: BinaryOption,
 ) -> None:
     """Phase 0 seal: `ContinuousRungHoldStrategy.__init__` refuses a
     non-None `order_submission_permit`, naming Phase 0 in the error."""
@@ -319,7 +397,8 @@ def test_constructing_with_a_non_none_permit_raises_phase0_error(
 
 
 def test_a_take_decision_with_permit_none_never_calls_submit_order(
-    store_path: Path, interior_instrument: BinaryOption,
+    store_path: Path,
+    interior_instrument: BinaryOption,
 ) -> None:
     """With `order_submission_permit=None`, a Take-equivalent decision (ask
     clears break-even) must leave `submit_order` uncalled -- asserted
@@ -336,11 +415,15 @@ def test_a_take_decision_with_permit_none_never_calls_submit_order(
 
 
 def test_offer_tape_records_eligible_nonfills_and_is_bounded(
-    store_path: Path, interior_instrument: BinaryOption, tmp_path: Path,
+    store_path: Path,
+    interior_instrument: BinaryOption,
+    tmp_path: Path,
 ) -> None:
     tape = OfferTape(tmp_path / "offer.jsonl", maxlen=3)
     strategy = _register_and_start(
-        store_path=store_path, instruments=(interior_instrument,), offer_tape=tape,
+        store_path=store_path,
+        instruments=(interior_instrument,),
+        offer_tape=tape,
     )
     strategy.on_data(_observation(temp_c_tenths=300, observed_at_ns=WINDOW_OPEN_NS - 1))
     for i in range(10):
@@ -357,12 +440,19 @@ def test_offer_tape_records_eligible_nonfills_and_is_bounded(
     lines = (tmp_path / "offer.jsonl").read_text(encoding="utf-8").strip().splitlines()
     assert len(lines) == 10
     assert strategy._latch is not None
-    assert strategy._latch.is_consumed(STATION, CLIMATE_DAY.isoformat()) is False
+    assert (
+        strategy._latch.is_consumed(
+            STATION, CLIMATE_DAY.isoformat(), key_instrument_id=str(INTERIOR_ID)
+        )
+        is False
+    )
     assert Decimal("0.80") == Decimal(tape.records()[-1].ask)
 
 
 def test_an_unwritable_offer_tape_jsonl_path_never_raises_from_hunt_tick(
-    store_path: Path, interior_instrument: BinaryOption, tmp_path: Path,
+    store_path: Path,
+    interior_instrument: BinaryOption,
+    tmp_path: Path,
 ) -> None:
     """A disk error on `OfferTape.append`'s optional JSONL write must never
     propagate out of `on_quote_tick`/`on_data` -- the in-memory deque still
@@ -372,7 +462,9 @@ def test_an_unwritable_offer_tape_jsonl_path_never_raises_from_hunt_tick(
     try:
         tape = OfferTape(unwritable_dir / "offer.jsonl")
         strategy = _register_and_start(
-            store_path=store_path, instruments=(interior_instrument,), offer_tape=tape,
+            store_path=store_path,
+            instruments=(interior_instrument,),
+            offer_tape=tape,
         )
         strategy.on_data(_observation(temp_c_tenths=300, observed_at_ns=WINDOW_OPEN_NS - 1))
         strategy.on_quote_tick(_quote(INTERIOR_ID, ask="0.80", ts_event=WINDOW_OPEN_NS))
@@ -388,7 +480,8 @@ def test_an_unwritable_offer_tape_jsonl_path_never_raises_from_hunt_tick(
 
 
 def test_on_start_subscribes_order_book_depth_for_each_resolved_instrument(
-    store_path: Path, interior_instrument: BinaryOption,
+    store_path: Path,
+    interior_instrument: BinaryOption,
 ) -> None:
     strategy = _register(store_path=store_path, instruments=(interior_instrument,))
     subscribed: list[object] = []
@@ -400,7 +493,8 @@ def test_on_start_subscribes_order_book_depth_for_each_resolved_instrument(
 
 
 def test_on_stop_unsubscribes_order_book_depth(
-    store_path: Path, interior_instrument: BinaryOption,
+    store_path: Path,
+    interior_instrument: BinaryOption,
 ) -> None:
     strategy = _register_and_start(store_path=store_path, instruments=(interior_instrument,))
     unsubscribed: list[object] = []
@@ -412,7 +506,8 @@ def test_on_stop_unsubscribes_order_book_depth(
 
 
 def test_a_one_sided_depth10_ask_drives_the_same_decision_as_the_equivalent_quote_tick(
-    store_path: Path, interior_instrument: BinaryOption,
+    store_path: Path,
+    interior_instrument: BinaryOption,
 ) -> None:
     """A recorded one-sided window (bids all size-0 pad, asks populated) still
     reaches the SAME hunt path a two-sided QuoteTick would, via
@@ -435,7 +530,8 @@ def test_a_one_sided_depth10_ask_drives_the_same_decision_as_the_equivalent_quot
 
 
 def test_a_two_sided_frame_delivered_as_both_quote_and_depth_evaluates_once(
-    store_path: Path, interior_instrument: BinaryOption,
+    store_path: Path,
+    interior_instrument: BinaryOption,
 ) -> None:
     """The SAME WS frame yields a QuoteTick and a Depth10 with identical
     (instrument_id, ts_event, ask, size) -- whichever arrives second must be
@@ -446,7 +542,10 @@ def test_a_two_sided_frame_delivered_as_both_quote_and_depth_evaluates_once(
     strategy.on_data(_observation(temp_c_tenths=300, observed_at_ns=WINDOW_OPEN_NS - 1))
     quote = _quote(INTERIOR_ID, ask="0.80", ts_event=WINDOW_OPEN_NS)
     depth = _depth(
-        INTERIOR_ID, bids=(("0.01", 10),), asks=(("0.80", 10),), ts_event=WINDOW_OPEN_NS,
+        INTERIOR_ID,
+        bids=(("0.01", 10),),
+        asks=(("0.80", 10),),
+        ts_event=WINDOW_OPEN_NS,
     )
 
     strategy.on_quote_tick(quote)
@@ -473,7 +572,8 @@ def _order_denied(strategy: ContinuousRungHoldStrategy, *, reason: str) -> Any:
 
 
 def test_on_order_denied_with_the_wait_reason_clears_inflight(
-    store_path: Path, interior_instrument: BinaryOption,
+    store_path: Path,
+    interior_instrument: BinaryOption,
 ) -> None:
     """SAFETY C1 (plan rev 6.1): a WAIT-class deny (the pre-arm re-check
     inside ``_submit_order``) frees the station-day to re-hunt on a later
@@ -482,28 +582,48 @@ def test_on_order_denied_with_the_wait_reason_clears_inflight(
 
     strategy = _register_and_start(store_path=store_path, instruments=(interior_instrument,))
     assert strategy._latch is not None
-    strategy._latch.set_inflight(STATION, CLIMATE_DAY.isoformat())
-    assert strategy._latch.is_inflight(STATION, CLIMATE_DAY.isoformat()) is True
+    strategy._latch.set_inflight(
+        STATION, CLIMATE_DAY.isoformat(), key_instrument_id=str(INTERIOR_ID)
+    )
+    assert (
+        strategy._latch.is_inflight(
+            STATION, CLIMATE_DAY.isoformat(), key_instrument_id=str(INTERIOR_ID)
+        )
+        is True
+    )
 
     strategy.on_order_denied(
         _order_denied(strategy, reason=submit_chain.OPEN_INTENT_WAIT_REASON),
     )
 
-    assert strategy._latch.is_inflight(STATION, CLIMATE_DAY.isoformat()) is False
+    assert (
+        strategy._latch.is_inflight(
+            STATION, CLIMATE_DAY.isoformat(), key_instrument_id=str(INTERIOR_ID)
+        )
+        is False
+    )
 
 
 def test_on_order_denied_with_any_other_reason_leaves_inflight_set(
-    store_path: Path, interior_instrument: BinaryOption,
+    store_path: Path,
+    interior_instrument: BinaryOption,
 ) -> None:
     """A standing refusal (not the WAIT sentinel) is NOT cleared here -- a
     narrower match would risk silently waving off a real refusal."""
     strategy = _register_and_start(store_path=store_path, instruments=(interior_instrument,))
     assert strategy._latch is not None
-    strategy._latch.set_inflight(STATION, CLIMATE_DAY.isoformat())
+    strategy._latch.set_inflight(
+        STATION, CLIMATE_DAY.isoformat(), key_instrument_id=str(INTERIOR_ID)
+    )
 
     strategy.on_order_denied(_order_denied(strategy, reason="some other denial reason"))
 
-    assert strategy._latch.is_inflight(STATION, CLIMATE_DAY.isoformat()) is True
+    assert (
+        strategy._latch.is_inflight(
+            STATION, CLIMATE_DAY.isoformat(), key_instrument_id=str(INTERIOR_ID)
+        )
+        is True
+    )
 
 
 def _arm_and_release_stale_intent(store_path: Path) -> None:
@@ -515,7 +635,8 @@ def _arm_and_release_stale_intent(store_path: Path) -> None:
 
 
 def test_hunt_tick_waits_while_the_account_wide_intent_is_open(
-    store_path: Path, interior_instrument: BinaryOption,
+    store_path: Path,
+    interior_instrument: BinaryOption,
 ) -> None:
     """Resolution B (plan rev 6.1): a stale/crash-left OPEN singleton is seen
     by `_hunt_tick` BEFORE `set_inflight`/`_maybe_submit` -- no task hop, no
@@ -536,14 +657,25 @@ def test_hunt_tick_waits_while_the_account_wide_intent_is_open(
 
     assert calls == []
     assert strategy._latch is not None
-    assert strategy._latch.is_inflight(STATION, CLIMATE_DAY.isoformat()) is False
-    assert strategy._latch.is_consumed(STATION, CLIMATE_DAY.isoformat()) is False
+    assert (
+        strategy._latch.is_inflight(
+            STATION, CLIMATE_DAY.isoformat(), key_instrument_id=str(INTERIOR_ID)
+        )
+        is False
+    )
+    assert (
+        strategy._latch.is_consumed(
+            STATION, CLIMATE_DAY.isoformat(), key_instrument_id=str(INTERIOR_ID)
+        )
+        is False
+    )
     assert strategy.diagnostics.count("open_intent_wait") == 1
     assert len(strategy.offer_tape) == 0
 
 
 def test_repeated_ticks_while_open_never_loop_and_the_alert_is_throttled(
-    store_path: Path, interior_instrument: BinaryOption,
+    store_path: Path,
+    interior_instrument: BinaryOption,
 ) -> None:
     """No hunt -> WAIT-deny -> clear -> hunt loop: with the Resolution B
     pre-filter in place, repeated ticks while the singleton stays OPEN never
@@ -561,7 +693,10 @@ def test_repeated_ticks_while_open_never_loop_and_the_alert_is_throttled(
     strategy._maybe_submit = spy_maybe  # type: ignore[method-assign]
     sink = _RecordingSink()
     strategy.diagnostics_alerter = RefusalAlerter(
-        strategy.diagnostics, site=str(strategy.id), sink=sink, **_WAIT_VOCABULARY,
+        strategy.diagnostics,
+        site=str(strategy.id),
+        sink=sink,
+        **_WAIT_VOCABULARY,
     )
     strategy.on_data(_observation(temp_c_tenths=300, observed_at_ns=WINDOW_OPEN_NS - 1))
 
@@ -574,7 +709,12 @@ def test_repeated_ticks_while_open_never_loop_and_the_alert_is_throttled(
     assert strategy.diagnostics.count("open_intent_wait") == 2
     assert len(sink.payloads) == 1
     assert strategy._latch is not None
-    assert strategy._latch.is_inflight(STATION, CLIMATE_DAY.isoformat()) is False
+    assert (
+        strategy._latch.is_inflight(
+            STATION, CLIMATE_DAY.isoformat(), key_instrument_id=str(INTERIOR_ID)
+        )
+        is False
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -683,7 +823,8 @@ def _register_armed_and_start(
 
 
 def test_an_armed_strategy_consults_the_rearm_gate_after_the_first_attempt(
-    store_path: Path, interior_instrument: BinaryOption,
+    store_path: Path,
+    interior_instrument: BinaryOption,
 ) -> None:
     """A1, site :579: once armed and already attempted this station-day up
     to the cap, `_hunt_tick` must consult `_rearm_permitted` and REFUSE a
@@ -697,7 +838,10 @@ def test_an_armed_strategy_consults_the_rearm_gate_after_the_first_attempt(
     assert strategy._latch is not None
     for _ in range(3):  # _MAX_STATION_DAY_ATTEMPTS
         strategy._latch.record_attempt(
-            STATION, CLIMATE_DAY.isoformat(), ts_ns=WINDOW_OPEN_NS - NS_PER_MIN,
+            STATION,
+            CLIMATE_DAY.isoformat(),
+            ts_ns=WINDOW_OPEN_NS - NS_PER_MIN,
+            key_instrument_id=str(INTERIOR_ID),
         )
     submitted: list[object] = []
     strategy.submit_order = submitted.append  # type: ignore[method-assign]
@@ -707,12 +851,23 @@ def test_an_armed_strategy_consults_the_rearm_gate_after_the_first_attempt(
 
     assert submitted == []
     assert strategy.diagnostics.count("rearm_wait") == 1
-    assert strategy._latch.is_inflight(STATION, CLIMATE_DAY.isoformat()) is False
-    assert strategy._latch.attempt_state(STATION, CLIMATE_DAY.isoformat())[0] == 3
+    assert (
+        strategy._latch.is_inflight(
+            STATION, CLIMATE_DAY.isoformat(), key_instrument_id=str(INTERIOR_ID)
+        )
+        is False
+    )
+    assert (
+        strategy._latch.attempt_state(
+            STATION, CLIMATE_DAY.isoformat(), key_instrument_id=str(INTERIOR_ID)
+        )[0]
+        == 3
+    )
 
 
 def test_an_armed_strategy_records_an_attempt_and_holds_in_flight(
-    store_path: Path, interior_instrument: BinaryOption,
+    store_path: Path,
+    interior_instrument: BinaryOption,
 ) -> None:
     """A1, site :731: the FIRST armed attempt on a station-day must
     durably record it (`record_attempt`) and leave IN_FLIGHT set -- the
@@ -731,14 +886,22 @@ def test_an_armed_strategy_records_an_attempt_and_holds_in_flight(
     strategy.on_quote_tick(_quote(INTERIOR_ID, ask="0.40", ts_event=WINDOW_OPEN_NS))
 
     assert len(submitted) == 1
-    attempts, last_attempt_ns = strategy._latch.attempt_state(STATION, CLIMATE_DAY.isoformat())
+    attempts, last_attempt_ns = strategy._latch.attempt_state(
+        STATION, CLIMATE_DAY.isoformat(), key_instrument_id=str(INTERIOR_ID)
+    )
     assert attempts == 1
     assert last_attempt_ns == WINDOW_OPEN_NS
-    assert strategy._latch.is_inflight(STATION, CLIMATE_DAY.isoformat()) is True
+    assert (
+        strategy._latch.is_inflight(
+            STATION, CLIMATE_DAY.isoformat(), key_instrument_id=str(INTERIOR_ID)
+        )
+        is True
+    )
 
 
 def test_an_unarmed_strategy_clears_in_flight_after_maybe_submit(
-    store_path: Path, interior_instrument: BinaryOption,
+    store_path: Path,
+    interior_instrument: BinaryOption,
 ) -> None:
     """A1, site :734: the UNARMED (Phase 0) branch is SHADOW-ONLY and must
     clear IN_FLIGHT immediately after `_maybe_submit` returns -- the
@@ -752,11 +915,17 @@ def test_an_unarmed_strategy_clears_in_flight_after_maybe_submit(
     strategy.on_data(_observation(temp_c_tenths=300, observed_at_ns=WINDOW_OPEN_NS - 1))
     strategy.on_quote_tick(_quote(INTERIOR_ID, ask="0.40", ts_event=WINDOW_OPEN_NS))
 
-    assert strategy._latch.is_inflight(STATION, CLIMATE_DAY.isoformat()) is False
+    assert (
+        strategy._latch.is_inflight(
+            STATION, CLIMATE_DAY.isoformat(), key_instrument_id=str(INTERIOR_ID)
+        )
+        is False
+    )
 
 
 def test_an_unarmed_strategy_never_records_an_attempt_across_many_eligible_depth_frames(
-    store_path: Path, interior_instrument: BinaryOption,
+    store_path: Path,
+    interior_instrument: BinaryOption,
 ) -> None:
     """python-reviewer M5 (blocking): `_hunt_tick`'s re-arm-gate guard --
     the `_submission_armed()` predicate consulted immediately before the
@@ -795,8 +964,17 @@ def test_an_unarmed_strategy_never_records_an_attempt_across_many_eligible_depth
     assert len(strategy.offer_tape) == 5
     assert all(record.reason == "taken" for record in strategy.offer_tape.records())
     assert submitted == []  # unarmed `_maybe_submit` never calls `submit_order`
-    assert strategy._latch.attempt_state(STATION, CLIMATE_DAY.isoformat()) == (0, None)
-    assert strategy._latch.is_inflight(STATION, CLIMATE_DAY.isoformat()) is False
+    assert strategy._latch.attempt_state(
+        STATION, CLIMATE_DAY.isoformat(), key_instrument_id=str(INTERIOR_ID)
+    ) == (0, None)
+    assert (
+        strategy._latch.is_inflight(
+            STATION, CLIMATE_DAY.isoformat(), key_instrument_id=str(INTERIOR_ID)
+        )
+        is False
+    )
+
+
 # ---------------------------------------------------------------------------
 # HF-4 (post-take re-arm reachability): C1 -- release a stale IN_FLIGHT
 # marker once the account-wide submit intent has closed, so attempts 2/3
@@ -856,12 +1034,18 @@ def _register_phase1_and_start(
 
 def _arm_one_attempt(strategy: ContinuousRungHoldStrategy, *, ts_ns: int) -> None:
     assert strategy._latch is not None
-    strategy._latch.set_inflight(STATION, CLIMATE_DAY.isoformat())
-    strategy._latch.record_attempt(STATION, CLIMATE_DAY.isoformat(), ts_ns=ts_ns)
+    strategy._latch.set_inflight(
+        STATION, CLIMATE_DAY.isoformat(), key_instrument_id=str(INTERIOR_ID)
+    )
+    strategy._latch.record_attempt(
+        STATION, CLIMATE_DAY.isoformat(), ts_ns=ts_ns, key_instrument_id=str(INTERIOR_ID)
+    )
 
 
 def _order_filled_for_position(
-    strategy: ContinuousRungHoldStrategy, *, venue_order_id: str,
+    strategy: ContinuousRungHoldStrategy,
+    *,
+    venue_order_id: str,
 ) -> OrderFilled:
     """A minimal `OrderFilled` for seeding a REAL reconciled Nautilus
     position via `cache.add_position` + `portfolio.initialize_positions()`
@@ -896,7 +1080,8 @@ def _order_filled_for_position(
 
 
 def test_a_closed_intent_and_an_elapsed_delay_floor_release_a_stale_inflight_marker(
-    store_path: Path, interior_instrument: BinaryOption,
+    store_path: Path,
+    interior_instrument: BinaryOption,
 ) -> None:
     """AC-1: a closed intent + an elapsed 120s delay floor releases the
     stale IN_FLIGHT marker, and the SAME tick reaches `evaluate_eligible_
@@ -916,14 +1101,23 @@ def test_a_closed_intent_and_an_elapsed_delay_floor_release_a_stale_inflight_mar
     )
 
     assert strategy.diagnostics.count("inflight_released") == 1
-    assert strategy._latch.is_inflight(STATION, CLIMATE_DAY.isoformat()) is True
-    assert strategy._latch.attempt_state(STATION, CLIMATE_DAY.isoformat()) == (
-        2, WINDOW_OPEN_NS + 120 * _S,
+    assert (
+        strategy._latch.is_inflight(
+            STATION, CLIMATE_DAY.isoformat(), key_instrument_id=str(INTERIOR_ID)
+        )
+        is True
+    )
+    assert strategy._latch.attempt_state(
+        STATION, CLIMATE_DAY.isoformat(), key_instrument_id=str(INTERIOR_ID)
+    ) == (
+        2,
+        WINDOW_OPEN_NS + 120 * _S,
     )
 
 
 def test_a_second_attempt_arms_after_a_resolver_terminal_zero_refreshes_evidence(
-    store_path: Path, interior_instrument: BinaryOption,
+    store_path: Path,
+    interior_instrument: BinaryOption,
 ) -> None:
     """AC-1, integration-shaped: a first re-arm-eligible tick against STALE
     evidence releases IN_FLIGHT but is denied (no attempt 2 yet); a resolver
@@ -941,7 +1135,9 @@ def test_a_second_attempt_arms_after_a_resolver_terminal_zero_refreshes_evidence
     # Now stale, absent-slug -- the boot walk above already ran (and
     # passed) against the fresh permissive evidence.
     evidence_state["value"] = {
-        **_PERMISSIVE_EVIDENCE, "positions": [], "ts_ns": WINDOW_OPEN_NS - 10_000 * _S,
+        **_PERMISSIVE_EVIDENCE,
+        "positions": [],
+        "ts_ns": WINDOW_OPEN_NS - 10_000 * _S,
     }
     _arm_one_attempt(strategy, ts_ns=WINDOW_OPEN_NS)
     strategy.on_data(_observation(temp_c_tenths=300, observed_at_ns=WINDOW_OPEN_NS - 1))
@@ -951,25 +1147,43 @@ def test_a_second_attempt_arms_after_a_resolver_terminal_zero_refreshes_evidence
     )
     assert strategy._latch is not None
     # Released, but denied -- stale evidence -- so attempt 2 did NOT arm.
-    assert strategy._latch.is_inflight(STATION, CLIMATE_DAY.isoformat()) is False
-    assert strategy._latch.attempt_state(STATION, CLIMATE_DAY.isoformat()) == (1, WINDOW_OPEN_NS)
+    assert (
+        strategy._latch.is_inflight(
+            STATION, CLIMATE_DAY.isoformat(), key_instrument_id=str(INTERIOR_ID)
+        )
+        is False
+    )
+    assert strategy._latch.attempt_state(
+        STATION, CLIMATE_DAY.isoformat(), key_instrument_id=str(INTERIOR_ID)
+    ) == (1, WINDOW_OPEN_NS)
 
     # The resolver's own rewrite: fresh, absent-slug evidence.
     evidence_state["value"] = {
-        **_PERMISSIVE_EVIDENCE, "positions": [], "ts_ns": WINDOW_OPEN_NS,
+        **_PERMISSIVE_EVIDENCE,
+        "positions": [],
+        "ts_ns": WINDOW_OPEN_NS,
     }
     strategy.on_quote_tick(
         _quote(INTERIOR_ID, ask="0.40", ts_event=WINDOW_OPEN_NS + 121 * _S),
     )
 
-    assert strategy._latch.is_inflight(STATION, CLIMATE_DAY.isoformat()) is True
-    assert strategy._latch.attempt_state(STATION, CLIMATE_DAY.isoformat()) == (
-        2, WINDOW_OPEN_NS + 121 * _S,
+    assert (
+        strategy._latch.is_inflight(
+            STATION, CLIMATE_DAY.isoformat(), key_instrument_id=str(INTERIOR_ID)
+        )
+        is True
+    )
+    assert strategy._latch.attempt_state(
+        STATION, CLIMATE_DAY.isoformat(), key_instrument_id=str(INTERIOR_ID)
+    ) == (
+        2,
+        WINDOW_OPEN_NS + 121 * _S,
     )
 
 
 def test_a_third_attempt_arms_and_a_fourth_never_does(
-    store_path: Path, interior_instrument: BinaryOption,
+    store_path: Path,
+    interior_instrument: BinaryOption,
 ) -> None:
     """AC-2, AC-3: with two attempts already burned, a closed intent past
     the floor releases and arms attempt 3; the NEXT such release finds
@@ -980,31 +1194,54 @@ def test_a_third_attempt_arms_and_a_fourth_never_does(
         position_evidence_reader=lambda: _PERMISSIVE_EVIDENCE,
     )
     assert strategy._latch is not None
-    strategy._latch.record_attempt(STATION, CLIMATE_DAY.isoformat(), ts_ns=WINDOW_OPEN_NS)
-    strategy._latch.record_attempt(STATION, CLIMATE_DAY.isoformat(), ts_ns=WINDOW_OPEN_NS)
-    strategy._latch.set_inflight(STATION, CLIMATE_DAY.isoformat())
+    strategy._latch.record_attempt(
+        STATION, CLIMATE_DAY.isoformat(), ts_ns=WINDOW_OPEN_NS, key_instrument_id=str(INTERIOR_ID)
+    )
+    strategy._latch.record_attempt(
+        STATION, CLIMATE_DAY.isoformat(), ts_ns=WINDOW_OPEN_NS, key_instrument_id=str(INTERIOR_ID)
+    )
+    strategy._latch.set_inflight(
+        STATION, CLIMATE_DAY.isoformat(), key_instrument_id=str(INTERIOR_ID)
+    )
     strategy.on_data(_observation(temp_c_tenths=300, observed_at_ns=WINDOW_OPEN_NS - 1))
 
     strategy.on_quote_tick(
         _quote(INTERIOR_ID, ask="0.40", ts_event=WINDOW_OPEN_NS + 120 * _S),
     )
-    assert strategy._latch.attempt_state(STATION, CLIMATE_DAY.isoformat()) == (
-        3, WINDOW_OPEN_NS + 120 * _S,
+    assert strategy._latch.attempt_state(
+        STATION, CLIMATE_DAY.isoformat(), key_instrument_id=str(INTERIOR_ID)
+    ) == (
+        3,
+        WINDOW_OPEN_NS + 120 * _S,
     )
-    assert strategy._latch.is_inflight(STATION, CLIMATE_DAY.isoformat()) is True
+    assert (
+        strategy._latch.is_inflight(
+            STATION, CLIMATE_DAY.isoformat(), key_instrument_id=str(INTERIOR_ID)
+        )
+        is True
+    )
 
     strategy.on_quote_tick(
         _quote(INTERIOR_ID, ask="0.40", ts_event=WINDOW_OPEN_NS + 240 * _S),
     )
     # Attempt 4 never arms: released, then denied by the attempt cap.
-    assert strategy._latch.is_inflight(STATION, CLIMATE_DAY.isoformat()) is False
-    assert strategy._latch.attempt_state(STATION, CLIMATE_DAY.isoformat()) == (
-        3, WINDOW_OPEN_NS + 120 * _S,
+    assert (
+        strategy._latch.is_inflight(
+            STATION, CLIMATE_DAY.isoformat(), key_instrument_id=str(INTERIOR_ID)
+        )
+        is False
+    )
+    assert strategy._latch.attempt_state(
+        STATION, CLIMATE_DAY.isoformat(), key_instrument_id=str(INTERIOR_ID)
+    ) == (
+        3,
+        WINDOW_OPEN_NS + 120 * _S,
     )
 
 
 def test_a_stale_inflight_marker_is_never_released_while_the_intent_is_open(
-    store_path: Path, interior_instrument: BinaryOption,
+    store_path: Path,
+    interior_instrument: BinaryOption,
 ) -> None:
     """AC-4: a crash-left OPEN singleton (`_arm_and_release_stale_intent`,
     defined above) blocks the release regardless of how far past the delay
@@ -1025,12 +1262,20 @@ def test_a_stale_inflight_marker_is_never_released_while_the_intent_is_open(
     )
 
     assert strategy.diagnostics.count("inflight_released") == 0
-    assert strategy._latch.is_inflight(STATION, CLIMATE_DAY.isoformat()) is True
-    assert strategy._latch.attempt_state(STATION, CLIMATE_DAY.isoformat()) == (1, WINDOW_OPEN_NS)
+    assert (
+        strategy._latch.is_inflight(
+            STATION, CLIMATE_DAY.isoformat(), key_instrument_id=str(INTERIOR_ID)
+        )
+        is True
+    )
+    assert strategy._latch.attempt_state(
+        STATION, CLIMATE_DAY.isoformat(), key_instrument_id=str(INTERIOR_ID)
+    ) == (1, WINDOW_OPEN_NS)
 
 
 def test_a_corrupt_intent_singleton_leaves_the_inflight_marker_set(
-    store_path: Path, interior_instrument: BinaryOption,
+    store_path: Path,
+    interior_instrument: BinaryOption,
 ) -> None:
     """AC-5: `is_latched()` treats a corrupt singleton as `True` (fail
     closed) -- the release must never fire against one."""
@@ -1054,12 +1299,20 @@ def test_a_corrupt_intent_singleton_leaves_the_inflight_marker_set(
         _quote(INTERIOR_ID, ask="0.40", ts_event=WINDOW_OPEN_NS + 1_000 * _S),
     )
 
-    assert strategy._latch.is_inflight(STATION, CLIMATE_DAY.isoformat()) is True
-    assert strategy._latch.attempt_state(STATION, CLIMATE_DAY.isoformat()) == (1, WINDOW_OPEN_NS)
+    assert (
+        strategy._latch.is_inflight(
+            STATION, CLIMATE_DAY.isoformat(), key_instrument_id=str(INTERIOR_ID)
+        )
+        is True
+    )
+    assert strategy._latch.attempt_state(
+        STATION, CLIMATE_DAY.isoformat(), key_instrument_id=str(INTERIOR_ID)
+    ) == (1, WINDOW_OPEN_NS)
 
 
 def test_a_release_inside_the_delay_floor_never_happens(
-    store_path: Path, interior_instrument: BinaryOption,
+    store_path: Path,
+    interior_instrument: BinaryOption,
 ) -> None:
     """AC-6: the same-burst race guard -- a tick inside the 120s floor
     never releases, even with the intent closed."""
@@ -1075,12 +1328,20 @@ def test_a_release_inside_the_delay_floor_never_happens(
 
     assert strategy.diagnostics.count("inflight_released") == 0
     assert strategy._latch is not None
-    assert strategy._latch.is_inflight(STATION, CLIMATE_DAY.isoformat()) is True
-    assert strategy._latch.attempt_state(STATION, CLIMATE_DAY.isoformat()) == (1, WINDOW_OPEN_NS)
+    assert (
+        strategy._latch.is_inflight(
+            STATION, CLIMATE_DAY.isoformat(), key_instrument_id=str(INTERIOR_ID)
+        )
+        is True
+    )
+    assert strategy._latch.attempt_state(
+        STATION, CLIMATE_DAY.isoformat(), key_instrument_id=str(INTERIOR_ID)
+    ) == (1, WINDOW_OPEN_NS)
 
 
 def test_a_released_marker_still_cannot_arm_on_stale_absent_slug_evidence(
-    store_path: Path, interior_instrument: BinaryOption,
+    store_path: Path,
+    interior_instrument: BinaryOption,
 ) -> None:
     """AC-8: the release never bypasses `_rearm_permitted` -- evidence far
     outside EITHER the pre-HF-4 600s ceiling or HF-4's own 180s re-arm
@@ -1094,7 +1355,9 @@ def test_a_released_marker_still_cannot_arm_on_stale_absent_slug_evidence(
     # Now stale, absent-slug -- the boot walk above already ran (and
     # passed) against the fresh permissive evidence.
     evidence_state["value"] = {
-        **_PERMISSIVE_EVIDENCE, "positions": [], "ts_ns": WINDOW_OPEN_NS - 10_000 * _S,
+        **_PERMISSIVE_EVIDENCE,
+        "positions": [],
+        "ts_ns": WINDOW_OPEN_NS - 10_000 * _S,
     }
     _arm_one_attempt(strategy, ts_ns=WINDOW_OPEN_NS)
     strategy.on_data(_observation(temp_c_tenths=300, observed_at_ns=WINDOW_OPEN_NS - 1))
@@ -1104,13 +1367,21 @@ def test_a_released_marker_still_cannot_arm_on_stale_absent_slug_evidence(
     )
 
     assert strategy._latch is not None
-    assert strategy._latch.is_inflight(STATION, CLIMATE_DAY.isoformat()) is False
-    assert strategy._latch.attempt_state(STATION, CLIMATE_DAY.isoformat()) == (1, WINDOW_OPEN_NS)
+    assert (
+        strategy._latch.is_inflight(
+            STATION, CLIMATE_DAY.isoformat(), key_instrument_id=str(INTERIOR_ID)
+        )
+        is False
+    )
+    assert strategy._latch.attempt_state(
+        STATION, CLIMATE_DAY.isoformat(), key_instrument_id=str(INTERIOR_ID)
+    ) == (1, WINDOW_OPEN_NS)
     assert len(strategy.offer_tape) == 0
 
 
 def test_a_released_marker_still_cannot_arm_when_nautilus_reports_a_long(
-    store_path: Path, interior_instrument: BinaryOption,
+    store_path: Path,
+    interior_instrument: BinaryOption,
 ) -> None:
     """AC-8, R9: the release never bypasses the Nautilus cross-check --
     fresh absent-slug evidence still denies when the reconciled portfolio
@@ -1133,13 +1404,21 @@ def test_a_released_marker_still_cannot_arm_when_nautilus_reports_a_long(
     )
 
     assert strategy._latch is not None
-    assert strategy._latch.is_inflight(STATION, CLIMATE_DAY.isoformat()) is False
-    assert strategy._latch.attempt_state(STATION, CLIMATE_DAY.isoformat()) == (1, WINDOW_OPEN_NS)
+    assert (
+        strategy._latch.is_inflight(
+            STATION, CLIMATE_DAY.isoformat(), key_instrument_id=str(INTERIOR_ID)
+        )
+        is False
+    )
+    assert strategy._latch.attempt_state(
+        STATION, CLIMATE_DAY.isoformat(), key_instrument_id=str(INTERIOR_ID)
+    ) == (1, WINDOW_OPEN_NS)
     assert len(strategy.offer_tape) == 0
 
 
 def test_the_release_and_the_rearm_decision_each_record_exactly_one_decision_line(
-    store_path: Path, interior_instrument: BinaryOption,
+    store_path: Path,
+    interior_instrument: BinaryOption,
 ) -> None:
     """AC-17 (B3): the release and a successful re-arm each emit exactly
     ONE `rearm:`-prefixed decision line, recorded on `last_rearm_decision`
@@ -1165,7 +1444,8 @@ def test_the_release_and_the_rearm_decision_each_record_exactly_one_decision_lin
 
 
 def test_a_consumed_station_day_never_reaches_the_inflight_release(
-    store_path: Path, interior_instrument: BinaryOption,
+    store_path: Path,
+    interior_instrument: BinaryOption,
 ) -> None:
     """AC-7 (N3, mutation-regression authored with C1): `is_consumed` short-
     circuits `_hunt_tick` BEFORE the release path is ever consulted -- a
@@ -1179,9 +1459,12 @@ def test_a_consumed_station_day_never_reaches_the_inflight_release(
     )
     assert strategy._latch is not None
     strategy._latch.consume(
-        STATION, CLIMATE_DAY.isoformat(),
-        latched_at_ns=WINDOW_OPEN_NS, instrument_id=str(INTERIOR_ID),
-        ask=Decimal("0.40"), reason="taken",
+        STATION,
+        CLIMATE_DAY.isoformat(),
+        latched_at_ns=WINDOW_OPEN_NS,
+        instrument_id=str(INTERIOR_ID),
+        ask=Decimal("0.40"),
+        reason="taken",
     )
     # A residual IN_FLIGHT marker that should never be consulted.
     _arm_one_attempt(strategy, ts_ns=WINDOW_OPEN_NS)
@@ -1192,13 +1475,21 @@ def test_a_consumed_station_day_never_reaches_the_inflight_release(
     )
 
     assert strategy.diagnostics.count("inflight_released") == 0
-    assert strategy._latch.is_inflight(STATION, CLIMATE_DAY.isoformat()) is True
-    assert strategy._latch.attempt_state(STATION, CLIMATE_DAY.isoformat()) == (1, WINDOW_OPEN_NS)
+    assert (
+        strategy._latch.is_inflight(
+            STATION, CLIMATE_DAY.isoformat(), key_instrument_id=str(INTERIOR_ID)
+        )
+        is True
+    )
+    assert strategy._latch.attempt_state(
+        STATION, CLIMATE_DAY.isoformat(), key_instrument_id=str(INTERIOR_ID)
+    ) == (1, WINDOW_OPEN_NS)
     assert len(strategy.offer_tape) == 0
 
 
 def test_a_standing_pre_arm_refusal_burns_three_attempts_and_then_stops_forever(
-    store_path: Path, interior_instrument: BinaryOption,
+    store_path: Path,
+    interior_instrument: BinaryOption,
 ) -> None:
     """N2, AC-3: a standing pre-`arm()` refusal (the real submit-intent
     flock is never armed by these tests -- `submit_order` is stubbed) burns
@@ -1216,19 +1507,35 @@ def test_a_standing_pre_arm_refusal_burns_three_attempts_and_then_stops_forever(
         strategy.on_quote_tick(
             _quote(INTERIOR_ID, ask="0.40", ts_event=WINDOW_OPEN_NS + i * 120 * _S),
         )
-        assert strategy._latch.attempt_state(STATION, CLIMATE_DAY.isoformat()) == (
-            i + 1, WINDOW_OPEN_NS + i * 120 * _S,
+        assert strategy._latch.attempt_state(
+            STATION, CLIMATE_DAY.isoformat(), key_instrument_id=str(INTERIOR_ID)
+        ) == (
+            i + 1,
+            WINDOW_OPEN_NS + i * 120 * _S,
         )
-        assert strategy._latch.is_inflight(STATION, CLIMATE_DAY.isoformat()) is True
+        assert (
+            strategy._latch.is_inflight(
+                STATION, CLIMATE_DAY.isoformat(), key_instrument_id=str(INTERIOR_ID)
+            )
+            is True
+        )
 
     # A fourth re-arm-eligible tick: released, then denied forever by the
     # attempt cap.
     strategy.on_quote_tick(
         _quote(INTERIOR_ID, ask="0.40", ts_event=WINDOW_OPEN_NS + 3 * 120 * _S),
     )
-    assert strategy._latch.is_inflight(STATION, CLIMATE_DAY.isoformat()) is False
-    assert strategy._latch.attempt_state(STATION, CLIMATE_DAY.isoformat()) == (
-        3, WINDOW_OPEN_NS + 2 * 120 * _S,
+    assert (
+        strategy._latch.is_inflight(
+            STATION, CLIMATE_DAY.isoformat(), key_instrument_id=str(INTERIOR_ID)
+        )
+        is False
+    )
+    assert strategy._latch.attempt_state(
+        STATION, CLIMATE_DAY.isoformat(), key_instrument_id=str(INTERIOR_ID)
+    ) == (
+        3,
+        WINDOW_OPEN_NS + 2 * 120 * _S,
     )
     assert len(strategy.offer_tape) == 3
 
@@ -1236,8 +1543,16 @@ def test_a_standing_pre_arm_refusal_burns_three_attempts_and_then_stops_forever(
     strategy.on_quote_tick(
         _quote(INTERIOR_ID, ask="0.40", ts_event=WINDOW_OPEN_NS + 10 * 120 * _S),
     )
-    assert strategy._latch.is_inflight(STATION, CLIMATE_DAY.isoformat()) is False
-    assert strategy._latch.attempt_state(STATION, CLIMATE_DAY.isoformat()) == (
-        3, WINDOW_OPEN_NS + 2 * 120 * _S,
+    assert (
+        strategy._latch.is_inflight(
+            STATION, CLIMATE_DAY.isoformat(), key_instrument_id=str(INTERIOR_ID)
+        )
+        is False
+    )
+    assert strategy._latch.attempt_state(
+        STATION, CLIMATE_DAY.isoformat(), key_instrument_id=str(INTERIOR_ID)
+    ) == (
+        3,
+        WINDOW_OPEN_NS + 2 * 120 * _S,
     )
     assert len(strategy.offer_tape) == 3

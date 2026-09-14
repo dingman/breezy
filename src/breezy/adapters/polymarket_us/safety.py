@@ -346,6 +346,12 @@ class _Budget:
 #: Remaining budget per issued permit, keyed by ``permit_id``.
 _PERMIT_BUDGETS: Final[dict[bytes, _Budget]] = {}
 
+#: S0 (plan rev 3, R3-1): permit ids already seeded from a durable-fill walk
+#: at boot. A second `_connect()` in the same process is a no-op keyed on
+#: this set -- the same idempotency shape `_RESTORED_BUDGET_DELTAS` gives
+#: `restore_live_trading_budget`, one call per `venue_order_id`.
+_SEEDED_PERMIT_BUDGETS: Final[set[bytes]] = set()
+
 
 def _prune_expired_nonces(now_ns: int) -> None:
     """Drop every nonce that can no longer be consumed.
@@ -759,6 +765,57 @@ def live_trading_budget_remaining(permit: LiveTradingPermit) -> tuple[Decimal, i
     if budget is None:
         raise LiveTradingPermissionError("permit budget is unknown to this process")
     return budget.remaining_notional_usd, budget.remaining_order_count
+
+
+def seed_permit_budget_from_prior_spend(
+    *, permit: LiveTradingPermit, spent_usd: Decimal
+) -> bool:
+    """S0 (plan rev 3, R3-1): reduce a freshly-issued permit's remaining
+    session notional by USD already spent today, from the SAME durable-fill
+    walk that seeds :meth:`DailySpendLedger.seed_spent` -- never from an
+    operator-reserved control and never touching the order-count budget,
+    which counts orders this permit itself authorises, not prior-process
+    spend.
+
+    Idempotent per ``permit.permit_id``: a second call for the same permit is
+    a no-op, so a second ``_connect()`` in one process cannot double-count.
+    Clamped at zero, never negative, the same conservative direction
+    :func:`restore_live_trading_budget` clamps at the permit's issued
+    ceiling.
+
+    Returns:
+        ``True`` iff this call actually applied the seed; ``False`` on an
+        idempotent no-op.
+
+    Raises:
+        LiveTradingPermissionError: if ``permit`` was not issued by
+            :func:`issue_live_trading_permit`, its budget is unknown to this
+            process, or ``spent_usd`` is not a non-negative finite
+            ``Decimal``.
+    """
+    if not _verify_authenticity(_payload_of(permit), permit.authenticity):
+        raise LiveTradingPermissionError(
+            "live-trading permit was not issued by issue_live_trading_permit"
+        )
+    if type(spent_usd) is not Decimal:
+        raise LiveTradingPermissionError(
+            f"spent_usd must be exactly Decimal, not {type(spent_usd).__name__}"
+        )
+    if not spent_usd.is_finite() or spent_usd < Decimal(0):
+        raise LiveTradingPermissionError(
+            "spent_usd must be a non-negative finite decimal amount"
+        )
+    with _REGISTRY_LOCK:
+        if permit.permit_id in _SEEDED_PERMIT_BUDGETS:
+            return False
+        budget = _PERMIT_BUDGETS.get(permit.permit_id)
+        if budget is None:
+            raise LiveTradingPermissionError("permit budget is unknown to this process")
+        budget.remaining_notional_usd = max(
+            Decimal(0), budget.remaining_notional_usd - spent_usd
+        )
+        _SEEDED_PERMIT_BUDGETS.add(permit.permit_id)
+    return True
 
 
 #: D1 (plan rev 6.1): the notional/count delta actually APPLIED by

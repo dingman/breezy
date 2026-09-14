@@ -28,6 +28,7 @@ from breezy.persistence.gs_boundary_artefact import (
     load_boundary_artefact,
 )
 from breezy.runtime.sqlite_store import SqliteStateStore
+from breezy.settlement.current_rung_hold_v2 import score
 from breezy.settlement.trial_scorer import ScoredTrial
 from breezy.strategy.current_rung_hold.trial_day_latch import TrialDayRecord
 
@@ -171,7 +172,18 @@ def _row(
 
 
 def _rows(n: int, **kwargs: Any) -> tuple[ScoredTrial, ...]:
-    return tuple(_row(i, **kwargs) for i in range(n))
+    """`n` rows, one per DISTINCT station-day by default (operator ruling
+    2026-09-14 / plan S4a R3-3): `build_family_tally_v2` now combines every
+    row sharing `(station, climate_day)` into one station-day draw, so a
+    caller that wants `n` genuinely independent draws (the overwhelming
+    majority of this file's fixtures, pre-dating S4a) must not collide them
+    all onto the SAME day the way the old single-climate_day default did.
+    A caller that explicitly passes `climate_day=` (deliberately testing a
+    same-day collision) is left byte-identical to before this re-pin.
+    """
+    if "climate_day" in kwargs:
+        return tuple(_row(i, **kwargs) for i in range(n))
+    return tuple(_row(i, climate_day=f"2026-09-{11 + i:02d}", **kwargs) for i in range(n))
 
 
 # --- obligation (a): held/pnl-sign assertion --------------------------------
@@ -487,8 +499,16 @@ def test_no_stratum_label_starts_with_venue(
     tmp_path: Path, tally_mod: ModuleType, real_artefact: BoundaryArtefact
 ) -> None:
     manifest = _manifest(tmp_path)
+    # Distinct climate_day per row (operator ruling 2026-09-14 / plan S4a
+    # R3-3): build_family_tally_v2 now combines same-station-day rows into
+    # one draw, so 6 independent draws need 6 distinct station-days.
     rows = tuple(
-        _row(i, station=("LAX" if i % 2 == 0 else "MIA"), ask=("0.10" if i % 2 else "0.50"))
+        _row(
+            i,
+            station=("LAX" if i % 2 == 0 else "MIA"),
+            ask=("0.10" if i % 2 else "0.50"),
+            climate_day=f"2026-09-{11 + i:02d}",
+        )
         for i in range(6)
     )
     tally = tally_mod.build_family_tally_v2(rows, manifest=manifest, artefact=real_artefact)
@@ -1610,3 +1630,299 @@ def test_draft_manifest_never_prints_kill(tmp_path: Path, tally_mod: ModuleType)
     assert "KILL" not in report
     assert "SURVIVE" not in report
     assert "CONTINUE" not in report
+
+
+# ---------------------------------------------------------------------------
+# S4a (plan MULTI_POSITION_PER_STATION_2026-09-14, R3-2/R3-3): the
+# station-day combined draw, wired into build_family_tally_v2.
+# ---------------------------------------------------------------------------
+def test_a_single_fill_station_day_is_byte_identical_to_today(
+    tmp_path: Path, tally_mod: ModuleType
+) -> None:
+    """Regression floor (R3-2 merge gate): one fill per station-day (the
+    real invariant post-S1) drives `n` combined draws == `n` fills, exactly
+    as `pooled_rows` did before this slice."""
+    manifest = _manifest(tmp_path)
+    artefact = _synthetic_artefact(i_max=1000.0, n_max=100, look_step=5)
+    rows = _rows(5)  # 5 distinct station-days (see _rows' docstring)
+
+    tally = tally_mod.build_family_tally_v2(rows, manifest=manifest, artefact=artefact)
+
+    assert len(tally.looks) == 1
+    assert tally.looks[0].state.n == 5
+    expected_information = sum(
+        float(r.entry_ask + r.fee) * (1.0 - float(r.entry_ask + r.fee)) for r in rows
+    )
+    assert tally.looks[0].state.information == pytest.approx(expected_information)
+
+
+def test_two_rung_fills_on_one_station_day_are_one_draw(
+    tmp_path: Path, tally_mod: ModuleType
+) -> None:
+    """Two DIFFERENT rungs (distinct instrument_id) filled on the SAME
+    station-day count as ONE draw at the look, never two."""
+    manifest = _manifest(tmp_path)
+    artefact = _synthetic_artefact(i_max=1000.0, n_max=100, look_step=1)
+    row_a = _row(0, ask="0.30", held=True, climate_day="2026-09-11")
+    row_b = _row(1, ask="0.20", held=False, climate_day="2026-09-11")
+
+    tally = tally_mod.build_family_tally_v2(
+        (row_a, row_b), manifest=manifest, artefact=artefact
+    )
+
+    assert tally.n_scored == 2
+    assert len(tally.looks) == 1
+    assert tally.looks[0].state.n == 1
+
+
+def test_a_station_day_whose_break_evens_sum_above_one_is_refused_as_malformed_input_before_scoring(
+    tmp_path: Path, tally_mod: ModuleType
+) -> None:
+    manifest = _manifest(tmp_path)
+    artefact = _synthetic_artefact(i_max=1000.0, n_max=100, look_step=1)
+    row_a = _row(0, ask="0.60", held=True, climate_day="2026-09-11")
+    row_b = _row(1, ask="0.55", held=False, climate_day="2026-09-11")
+
+    with pytest.raises(tally_mod.ScoredTrialDataIntegrityError, match="malformed_input"):
+        tally_mod.build_family_tally_v2((row_a, row_b), manifest=manifest, artefact=artefact)
+
+
+def test_looks_are_ordered_by_the_earliest_fill_of_each_station_day(
+    tally_mod: ModuleType,
+) -> None:
+    """`_combined_draws_for_looks` groups by first-seen `(station,
+    climate_day)` in the ALREADY fill-ordered sequence, so the combined
+    draw for a station-day whose FIRST constituent filled earliest sorts
+    first, regardless of row order in the input list."""
+    row_lax_second_rung = _row(0, station="LAX", climate_day="2026-09-11", ask="0.10")
+    row_mia_first_rung = _row(1, station="MIA", climate_day="2026-09-12", ask="0.20")
+    row_lax_first_rung = _row(2, station="LAX", climate_day="2026-09-11", ask="0.15")
+    # Pre-ordered as `_ordered_for_looks` would deliver it: MIA's single
+    # fill is EARLIEST overall, then LAX's two rungs.
+    ordered = (row_mia_first_rung, row_lax_first_rung, row_lax_second_rung)
+
+    draws = tally_mod._combined_draws_for_looks(ordered)
+
+    assert len(draws) == 2
+    assert draws[0].n_constituents == 1  # MIA's single-rung draw, first
+    assert draws[1].n_constituents == 2  # LAX's two-rung combined draw, second
+
+
+def test_total_pnl_still_sums_constituent_rows(
+    tmp_path: Path, tally_mod: ModuleType
+) -> None:
+    manifest = _manifest(tmp_path)
+    artefact = _synthetic_artefact(i_max=1000.0, n_max=100, look_step=1)
+    row_a = _row(0, ask="0.30", held=True, climate_day="2026-09-11")
+    row_b = _row(1, ask="0.20", held=False, climate_day="2026-09-11")
+
+    tally = tally_mod.build_family_tally_v2(
+        (row_a, row_b), manifest=manifest, artefact=artefact
+    )
+
+    assert tally.total_pnl == row_a.pnl + row_b.pnl
+
+
+# ---------------------------------------------------------------------------
+# S4a math-review addendum (2026-09-14): the combine_station_day/
+# score_combined path (HEAD) must be identical to a reference built from the
+# byte-frozen `score()` over pooled `StratumRow`s at one fill per
+# station-day -- S, I, n, verdict, and the rendered markdown, all identical.
+# ---------------------------------------------------------------------------
+def _reference_tally_via_uncombined_score(
+    rows: tuple[ScoredTrial, ...],
+    *,
+    manifest: FamilyManifest,
+    artefact: BoundaryArtefact,
+    tally_mod: ModuleType,
+) -> Any:
+    """Pre-S4a reference: `score()` over pooled `StratumRow`s, never
+    `combine_station_day`/`score_combined` -- reimplements
+    `build_family_tally_v2`'s look loop against the byte-frozen `score()`
+    path so it can be compared to the real S4a path independently."""
+    non_excluded = tuple(r for r in rows if r.excluded_reason is None)
+    ordered = tally_mod._ordered_for_looks(non_excluded, store_dir=None)
+    pooled_rows = tuple(tally_mod._stratum_row(t) for t in ordered)
+    pooled = tally_mod.build_stratum_v2("pooled", pooled_rows) if pooled_rows else None
+    station_strata = tally_mod._station_strata(non_excluded)
+    ask_band_strata = tally_mod._ask_band_strata(non_excluded)
+    any_cell_dead = any(s.cell_dead for s in (*station_strata, *ask_band_strata))
+    total_pnl = sum((row.pnl for row in non_excluded), start=Decimal(0))
+
+    n = len(pooled_rows)
+    look_step = artefact.spending.look_step
+    n_max = artefact.spending.n_max
+
+    looks: list[Any] = []
+    t_history: list[float] = []
+    verdict = "CONTINUE"
+    bca_line: str | None = None
+    scheduled_ns = range(look_step, min(n, n_max) + 1, look_step)
+    for look_n in scheduled_ns:
+        state = score(pooled_rows[:look_n])
+        t = tally_mod.information_fraction(state.information, i_max=artefact.i_max)
+        t_history.append(t)
+        reached_i_max = state.information >= artefact.i_max
+        reached_n_max = look_n >= n_max
+        is_terminal = reached_i_max or reached_n_max
+        if is_terminal:
+            reason = tally_mod.TruncationReason.I_MAX
+            b_eff, b_fut = artefact.boundary_for(tuple(t_history), is_terminal=True)
+            verdict = tally_mod.terminal_look(
+                state,
+                reason=reason,
+                b_eff=b_eff,
+                b_fut=b_fut,
+                total_pnl=total_pnl,
+                cell_dead=any_cell_dead,
+                structural_fired=False,
+            )
+            looks.append(
+                tally_mod.LookRecord(
+                    look_n=look_n,
+                    t=t,
+                    state=state,
+                    b_eff=b_eff,
+                    b_fut=b_fut,
+                    verdict=verdict,
+                    terminal=True,
+                    reason=reason,
+                )
+            )
+            bca_line = tally_mod._roi_bound_line_v2(rows)
+            break
+        b_eff, b_fut = artefact.boundary_for(tuple(t_history), is_terminal=False)
+        verdict = tally_mod.look_verdict(
+            state,
+            b_eff=b_eff,
+            b_fut=b_fut,
+            total_pnl=total_pnl,
+            cell_dead=any_cell_dead,
+            structural_fired=False,
+        )
+        looks.append(
+            tally_mod.LookRecord(
+                look_n=look_n,
+                t=t,
+                state=state,
+                b_eff=b_eff,
+                b_fut=b_fut,
+                verdict=verdict,
+                terminal=False,
+                reason=None,
+            )
+        )
+        if verdict != "CONTINUE":
+            bca_line = tally_mod._roi_bound_line_v2(rows)
+            break
+
+    return tally_mod.FamilyTallyV2(
+        family_id=manifest.family_id,
+        manifest_sha256=manifest.manifest_sha256,
+        boundary_inputs_sha256=artefact.inputs_sha256,
+        status=manifest.status,
+        n_scored=len(rows),
+        n_excluded=len(rows) - len(non_excluded),
+        pooled=pooled,
+        station_strata=station_strata,
+        ask_band_strata=ask_band_strata,
+        looks=tuple(looks),
+        verdict=verdict,
+        total_pnl=total_pnl,
+        bca_line=bca_line,
+        structural_dead=None,
+        store_empty_no_sidecar=False,
+    )
+
+
+def _assert_tally_matches_reference(
+    tally: Any, reference: Any, *, tally_mod: ModuleType, tmp_path: Path
+) -> None:
+    assert len(tally.looks) == len(reference.looks)
+    for head_look, ref_look in zip(tally.looks, reference.looks, strict=True):
+        assert head_look.state.s == ref_look.state.s
+        assert head_look.state.information == ref_look.state.information
+        assert head_look.state.n == ref_look.state.n
+        assert head_look.verdict == ref_look.verdict
+    assert tally.verdict == reference.verdict
+
+    source_paths = (tmp_path / "scored.parquet",)
+    head_text = tally_mod.render_markdown_v2(
+        tally, source_paths=source_paths, as_of="2026-09-14T00:00:00Z"
+    )
+    ref_text = tally_mod.render_markdown_v2(
+        reference, source_paths=source_paths, as_of="2026-09-14T00:00:00Z"
+    )
+    assert head_text == ref_text
+
+
+def test_the_multi_station_tally_matches_the_uncombined_score_reference(
+    tmp_path: Path, tally_mod: ModuleType
+) -> None:
+    """A REALISTIC multi-station fixture (3 stations, 8 station-days, one
+    fill per station-day, mixed held/not-held, qty=1): the tally built at
+    HEAD (combine_station_day/score_combined) must equal the reference
+    built from the byte-frozen `score()` path, in S/I/n/verdict and the
+    rendered markdown."""
+    manifest = _manifest(tmp_path)
+    artefact = _synthetic_artefact(i_max=1000.0, n_max=100, look_step=1)
+    rows = (
+        _row(0, station="MIA", climate_day="2026-09-11", ask="0.10", held=True),
+        _row(1, station="MIA", climate_day="2026-09-12", ask="0.20", held=False),
+        _row(2, station="MIA", climate_day="2026-09-13", ask="0.35", held=True),
+        _row(3, station="LAX", climate_day="2026-09-11", ask="0.15", held=False),
+        _row(4, station="LAX", climate_day="2026-09-12", ask="0.45", held=True),
+        _row(5, station="LAX", climate_day="2026-09-13", ask="0.60", held=False),
+        _row(6, station="SFO", climate_day="2026-09-11", ask="0.25", held=True),
+        _row(7, station="SFO", climate_day="2026-09-12", ask="0.50", held=False),
+    )
+
+    tally = tally_mod.build_family_tally_v2(rows, manifest=manifest, artefact=artefact)
+    reference = _reference_tally_via_uncombined_score(
+        rows, manifest=manifest, artefact=artefact, tally_mod=tally_mod
+    )
+
+    assert len(tally.looks) == 8
+    _assert_tally_matches_reference(tally, reference, tally_mod=tally_mod, tmp_path=tmp_path)
+
+
+def test_the_v2_family_tally_is_unchanged_by_the_combined_draw(
+    tmp_path: Path, tally_mod: ModuleType
+) -> None:
+    """Using the REGISTERED v2 manifest (`deploy/families/pm_us_crh_v2.json`
+    semantics: at most one fill per station-day by its latch), the
+    combined-draw path yields S/I/n/verdict/text identical to the
+    score()-only reference -- pinning that S4a leaves the REGISTERED v2
+    family's stopping statistic unaffected by construction."""
+    manifest = load_family_manifest(
+        _REPO_ROOT / "deploy" / "families" / "pm_us_crh_v2.json", allow_draft=True
+    )
+    artefact = _synthetic_artefact(i_max=1000.0, n_max=100, look_step=1)
+    rows = (
+        _row(0, station="MIA", climate_day="2026-09-11", ask="0.10", held=True),
+        _row(1, station="LAX", climate_day="2026-09-11", ask="0.30", held=False),
+        _row(2, station="MDW", climate_day="2026-09-12", ask="0.55", held=True),
+        _row(3, station="SFO", climate_day="2026-09-13", ask="0.40", held=False),
+    )
+
+    tally = tally_mod.build_family_tally_v2(rows, manifest=manifest, artefact=artefact)
+    reference = _reference_tally_via_uncombined_score(
+        rows, manifest=manifest, artefact=artefact, tally_mod=tally_mod
+    )
+
+    assert len(tally.looks) == 4
+    _assert_tally_matches_reference(tally, reference, tally_mod=tally_mod, tmp_path=tmp_path)
+
+
+def test_the_v1_tally_is_untouched() -> None:
+    """S4a touches only v2 (`current_rung_hold_v2.py`/`family_tally_v2.py`)
+    -- v1's `live_family_tally.py` is byte-unmodified. Pinned against a
+    hardcoded sha256 of the file's current bytes (computed once at S4a
+    HEAD, cac3f63), not a `git show` of a commit that a future history
+    squash could make unresolvable. v1 tally byte-frozen; PREREG v1 closed;
+    update only with a ruling."""
+    import hashlib
+
+    path = _SCRIPTS_ANALYSIS_DIR / "live_family_tally.py"
+    current = hashlib.sha256(path.read_bytes()).hexdigest()
+    assert current == "801f3106e3a32f6032942b85feaf23b30cb2a0159705d471ab956f9cb86610e0"

@@ -310,9 +310,7 @@ class TestConsumeIfAbsent:
         with pytest.raises(SubmitIntentLockNotHeld):
             trial_latch.consume_if_absent(STATION, CLIMATE_DAY, record)
 
-    def test_a_foreign_thread_calling_consume_if_absent_is_refused(
-        self, store_path: Path
-    ) -> None:
+    def test_a_foreign_thread_calling_consume_if_absent_is_refused(self, store_path: Path) -> None:
         """The thread-affinity assert is load-bearing: a second thread
         racing this same call is NOT made safe by the process-wide flock
         alone."""
@@ -367,7 +365,8 @@ class TestSurvivesRestart:
         reopened.close()
 
     def test_a_restart_mid_day_cannot_re_arm_an_already_consumed_station_day(
-        self, store_path: Path,
+        self,
+        store_path: Path,
     ) -> None:
         """(C2) The MULTI-station aggregate bound (Rev 2 REVISE-4 / §7 R5).
 
@@ -421,7 +420,9 @@ class TestSurvivesRestart:
             )
             assert (
                 restarted_trial_latch.consume_if_absent(
-                    second_station, CLIMATE_DAY, re_arm_record,
+                    second_station,
+                    CLIMATE_DAY,
+                    re_arm_record,
                 )
                 is False
             )
@@ -555,22 +556,52 @@ class TestKeyPrefix:
 
 
 class TestInFlightPrimitive:
-    def test_inflight_get_set_clear_is_keyed_station_day(self, store_path: Path) -> None:
+    def test_inflight_get_set_clear_is_keyed_instrument_day(self, store_path: Path) -> None:
+        """Re-pinned (operator ruling 2026-09-14 / plan S1): "I never wanted
+        a limit of 1 contract per station" -- v3's IN_FLIGHT primitive is
+        keyed by ``(station, climate_day, instrument_id)``, not station-day
+        alone. Was ``test_inflight_get_set_clear_is_keyed_station_day``."""
         with open_submit_intent_latch(SqliteStateStore(store_path), store_path) as intent_latch:
             latch = open_trial_day_latch(
-                intent_latch, key_prefix=CONTINUOUS_TRIAL_KEY_PREFIX,
+                intent_latch,
+                key_prefix=CONTINUOUS_TRIAL_KEY_PREFIX,
             )
-            assert latch.is_inflight(STATION, CLIMATE_DAY) is False
-            latch.set_inflight(STATION, CLIMATE_DAY)
-            assert latch.is_inflight(STATION, CLIMATE_DAY) is True
-            assert latch.is_inflight(STATION, OTHER_CLIMATE_DAY) is False
-            assert latch.is_consumed(STATION, CLIMATE_DAY) is False
-            latch.clear_inflight(STATION, CLIMATE_DAY)
-            assert latch.is_inflight(STATION, CLIMATE_DAY) is False
+            assert latch.is_inflight(STATION, CLIMATE_DAY, key_instrument_id=INSTRUMENT_ID) is False
+            latch.set_inflight(STATION, CLIMATE_DAY, key_instrument_id=INSTRUMENT_ID)
+            assert latch.is_inflight(STATION, CLIMATE_DAY, key_instrument_id=INSTRUMENT_ID) is True
+            assert (
+                latch.is_inflight(STATION, OTHER_CLIMATE_DAY, key_instrument_id=INSTRUMENT_ID)
+                is False
+            )
+            assert latch.is_consumed(STATION, CLIMATE_DAY, key_instrument_id=INSTRUMENT_ID) is False
+            latch.clear_inflight(STATION, CLIMATE_DAY, key_instrument_id=INSTRUMENT_ID)
+            assert latch.is_inflight(STATION, CLIMATE_DAY, key_instrument_id=INSTRUMENT_ID) is False
         keys = _committed_keys(store_path)
-        inflight_key = f"continuous_rung_hold/inflight/{STATION}/{CLIMATE_DAY}"
+        inflight_key = f"continuous_rung_hold/inflight/{STATION}/{CLIMATE_DAY}/{INSTRUMENT_ID}"
         assert inflight_key in keys
-        assert f"continuous_rung_hold/trial/{STATION}/{CLIMATE_DAY}" not in keys
+        assert f"continuous_rung_hold/trial/{STATION}/{CLIMATE_DAY}/{INSTRUMENT_ID}" not in keys
+
+    def test_the_inflight_key_is_per_instrument_day(self, store_path: Path) -> None:
+        """RED (plan S1): two DIFFERENT instruments on the SAME station-day
+        each get their own independent IN_FLIGHT marker -- setting one must
+        never affect the other."""
+        other_instrument = "POLY-LAX-TMAX-94-96.US"
+        with open_submit_intent_latch(SqliteStateStore(store_path), store_path) as intent_latch:
+            latch = open_trial_day_latch(
+                intent_latch,
+                key_prefix=CONTINUOUS_TRIAL_KEY_PREFIX,
+            )
+            latch.set_inflight(STATION, CLIMATE_DAY, key_instrument_id=INSTRUMENT_ID)
+            assert latch.is_inflight(STATION, CLIMATE_DAY, key_instrument_id=INSTRUMENT_ID) is True
+            assert (
+                latch.is_inflight(STATION, CLIMATE_DAY, key_instrument_id=other_instrument) is False
+            )
+            latch.set_inflight(STATION, CLIMATE_DAY, key_instrument_id=other_instrument)
+            latch.clear_inflight(STATION, CLIMATE_DAY, key_instrument_id=INSTRUMENT_ID)
+            assert latch.is_inflight(STATION, CLIMATE_DAY, key_instrument_id=INSTRUMENT_ID) is False
+            assert (
+                latch.is_inflight(STATION, CLIMATE_DAY, key_instrument_id=other_instrument) is True
+            )
 
     def test_v2_default_prefix_never_writes_cont_inflight(self, store_path: Path) -> None:
         with open_submit_intent_latch(SqliteStateStore(store_path), store_path) as intent_latch:
@@ -604,12 +635,15 @@ class TestIsIntentOpen:
             intent = intent_latch.arm("a" * 64, now_ns=1)
             assert latch.is_intent_open() is True
             intent_latch.retire(
-                intent.intent_id, RetirementReason.DEFINITIVE_REJECT, now_ns=2,
+                intent.intent_id,
+                RetirementReason.DEFINITIVE_REJECT,
+                now_ns=2,
             )
             assert latch.is_intent_open() is False
 
     def test_a_stale_crash_left_open_singleton_is_visible_to_a_fresh_process(
-        self, store_path: Path,
+        self,
+        store_path: Path,
     ) -> None:
         """A latch armed and left OPEN (the flock released without a
         retire -- exactly a crash) is still OPEN to the NEXT process that
@@ -622,7 +656,8 @@ class TestIsIntentOpen:
             assert latch.is_intent_open() is True
 
     def test_a_trial_day_latch_built_without_an_intent_latch_refuses_to_answer(
-        self, store_path: Path,
+        self,
+        store_path: Path,
     ) -> None:
         """A ``TrialDayLatch`` constructed directly (existing test doubles,
         never through ``open_trial_day_latch``) has no ``intent_latch`` to
@@ -638,7 +673,8 @@ class TestDuplicateFillAndFamilyHalt:
     """Slice 4 item B1 (plan rev 6.1)."""
 
     def test_a_duplicate_fill_writes_a_bucket_and_sets_the_family_halt(
-        self, store_path: Path,
+        self,
+        store_path: Path,
     ) -> None:
         with open_submit_intent_latch(SqliteStateStore(store_path), store_path) as intent_latch:
             latch = open_trial_day_latch(intent_latch, key_prefix=CONTINUOUS_TRIAL_KEY_PREFIX)
@@ -658,18 +694,29 @@ class TestDuplicateFillAndFamilyHalt:
         assert FAMILY_HALT_KEY in keys
 
     def test_recording_the_same_duplicate_id_twice_writes_neither_bucket_twice(
-        self, store_path: Path,
+        self,
+        store_path: Path,
     ) -> None:
         with open_submit_intent_latch(SqliteStateStore(store_path), store_path) as intent_latch:
             latch = open_trial_day_latch(intent_latch, key_prefix=CONTINUOUS_TRIAL_KEY_PREFIX)
             latch.record_duplicate_fill(
-                STATION, CLIMATE_DAY, venue_order_id="ord-dup-1",
-                qty=Decimal(1), fill_px=Decimal("0.40"), fee=Decimal("0.01"), ts_ns=NOW_NS,
+                STATION,
+                CLIMATE_DAY,
+                venue_order_id="ord-dup-1",
+                qty=Decimal(1),
+                fill_px=Decimal("0.40"),
+                fee=Decimal("0.01"),
+                ts_ns=NOW_NS,
             )
             # Second call, different numbers -- must not overwrite the first.
             latch.record_duplicate_fill(
-                STATION, CLIMATE_DAY, venue_order_id="ord-dup-1",
-                qty=Decimal(9), fill_px=Decimal("0.99"), fee=Decimal("0.99"), ts_ns=NOW_NS + 1,
+                STATION,
+                CLIMATE_DAY,
+                venue_order_id="ord-dup-1",
+                qty=Decimal(9),
+                fill_px=Decimal("0.99"),
+                fee=Decimal("0.99"),
+                ts_ns=NOW_NS + 1,
             )
         conn_keys = _committed_keys(store_path)
         dup_keys = [k for k in conn_keys if k.startswith("continuous_rung_hold/duplicate_fill/")]
@@ -728,20 +775,28 @@ class TestStartupEvidence:
         [
             None,
             {
-                "v": 1, "position_read_refused": True,
-                "eof_complete": True, "fill_walk_complete": True,
+                "v": 1,
+                "position_read_refused": True,
+                "eof_complete": True,
+                "fill_walk_complete": True,
             },
             {
-                "v": 1, "position_read_refused": False,
-                "eof_complete": False, "fill_walk_complete": True,
+                "v": 1,
+                "position_read_refused": False,
+                "eof_complete": False,
+                "fill_walk_complete": True,
             },
             {
-                "v": 1, "position_read_refused": False,
-                "eof_complete": True, "fill_walk_complete": False,
+                "v": 1,
+                "position_read_refused": False,
+                "eof_complete": True,
+                "fill_walk_complete": False,
             },
             {
-                "v": 2, "position_read_refused": False,
-                "eof_complete": True, "fill_walk_complete": True,
+                "v": 2,
+                "position_read_refused": False,
+                "eof_complete": True,
+                "fill_walk_complete": True,
             },
         ],
     )
@@ -749,12 +804,17 @@ class TestStartupEvidence:
         assert startup_evidence_permits_arm(evidence) is False  # type: ignore[arg-type]
 
     def test_permits_arm_is_true_for_a_complete_record(self) -> None:
-        assert startup_evidence_permits_arm(
-            {
-                "v": 1, "position_read_refused": False,
-                "eof_complete": True, "fill_walk_complete": True,
-            },
-        ) is True
+        assert (
+            startup_evidence_permits_arm(
+                {
+                    "v": 1,
+                    "position_read_refused": False,
+                    "eof_complete": True,
+                    "fill_walk_complete": True,
+                },
+            )
+            is True
+        )
 
     def test_position_for_an_absent_slug_is_unknown_not_flat(self) -> None:
         """Slice 4 review item 5: the client seam now emits every slug from
@@ -813,7 +873,9 @@ class TestStartupEvidenceAbsentIsFlat:
         ],
     )
     def test_lists_slug_present_absent_and_garbage_row_ignored(
-        self, positions: list[object], expected: bool,
+        self,
+        positions: list[object],
+        expected: bool,
     ) -> None:  # H13
         evidence: dict[str, object] = {"positions": positions}
         assert startup_evidence_lists_slug(evidence, "mine") is expected
@@ -824,60 +886,114 @@ class TestStartupEvidenceAbsentIsFlat:
 
     def test_confirms_absent_flat_true_when_absent_and_complete(self) -> None:  # H1
         evidence = self._complete_evidence()
-        assert startup_evidence_confirms_absent_flat(
-            evidence, "mine", now_ns=NOW_NS, max_age_ns=self._MAX_AGE_NS,
-        ) is True
+        assert (
+            startup_evidence_confirms_absent_flat(
+                evidence,
+                "mine",
+                now_ns=NOW_NS,
+                max_age_ns=self._MAX_AGE_NS,
+            )
+            is True
+        )
 
     def test_confirms_absent_flat_false_when_not_eof_complete(self) -> None:  # H2
         evidence = self._complete_evidence(eof_complete=False)
-        assert startup_evidence_confirms_absent_flat(
-            evidence, "mine", now_ns=NOW_NS, max_age_ns=self._MAX_AGE_NS,
-        ) is False
+        assert (
+            startup_evidence_confirms_absent_flat(
+                evidence,
+                "mine",
+                now_ns=NOW_NS,
+                max_age_ns=self._MAX_AGE_NS,
+            )
+            is False
+        )
 
     def test_confirms_absent_flat_false_when_position_read_refused(self) -> None:  # H3
         evidence = self._complete_evidence(position_read_refused=True)
-        assert startup_evidence_confirms_absent_flat(
-            evidence, "mine", now_ns=NOW_NS, max_age_ns=self._MAX_AGE_NS,
-        ) is False
+        assert (
+            startup_evidence_confirms_absent_flat(
+                evidence,
+                "mine",
+                now_ns=NOW_NS,
+                max_age_ns=self._MAX_AGE_NS,
+            )
+            is False
+        )
 
     def test_confirms_absent_flat_false_when_schema_version_is_not_one(self) -> None:  # H4
         evidence = self._complete_evidence(v=2)
-        assert startup_evidence_confirms_absent_flat(
-            evidence, "mine", now_ns=NOW_NS, max_age_ns=self._MAX_AGE_NS,
-        ) is False
+        assert (
+            startup_evidence_confirms_absent_flat(
+                evidence,
+                "mine",
+                now_ns=NOW_NS,
+                max_age_ns=self._MAX_AGE_NS,
+            )
+            is False
+        )
 
     def test_confirms_absent_flat_false_when_fill_walk_incomplete(self) -> None:  # H5
         evidence = self._complete_evidence(fill_walk_complete=False)
-        assert startup_evidence_confirms_absent_flat(
-            evidence, "mine", now_ns=NOW_NS, max_age_ns=self._MAX_AGE_NS,
-        ) is False
+        assert (
+            startup_evidence_confirms_absent_flat(
+                evidence,
+                "mine",
+                now_ns=NOW_NS,
+                max_age_ns=self._MAX_AGE_NS,
+            )
+            is False
+        )
 
     # -- H9-H12: absent-branch exhaustiveness (HB4/E13) --
 
     def test_confirms_absent_flat_false_when_positions_key_is_missing(self) -> None:  # H9
         evidence = self._complete_evidence()
         del evidence["positions"]
-        assert startup_evidence_confirms_absent_flat(
-            evidence, "mine", now_ns=NOW_NS, max_age_ns=self._MAX_AGE_NS,
-        ) is False
+        assert (
+            startup_evidence_confirms_absent_flat(
+                evidence,
+                "mine",
+                now_ns=NOW_NS,
+                max_age_ns=self._MAX_AGE_NS,
+            )
+            is False
+        )
 
     def test_confirms_absent_flat_false_when_positions_is_not_a_list(self) -> None:  # H10
         evidence = self._complete_evidence(positions="garbage")
-        assert startup_evidence_confirms_absent_flat(
-            evidence, "mine", now_ns=NOW_NS, max_age_ns=self._MAX_AGE_NS,
-        ) is False
+        assert (
+            startup_evidence_confirms_absent_flat(
+                evidence,
+                "mine",
+                now_ns=NOW_NS,
+                max_age_ns=self._MAX_AGE_NS,
+            )
+            is False
+        )
 
     def test_confirms_absent_flat_false_on_any_non_mapping_row(self) -> None:  # H11
         evidence = self._complete_evidence(positions=["garbage"])
-        assert startup_evidence_confirms_absent_flat(
-            evidence, "mine", now_ns=NOW_NS, max_age_ns=self._MAX_AGE_NS,
-        ) is False
+        assert (
+            startup_evidence_confirms_absent_flat(
+                evidence,
+                "mine",
+                now_ns=NOW_NS,
+                max_age_ns=self._MAX_AGE_NS,
+            )
+            is False
+        )
 
     def test_confirms_absent_flat_false_when_slug_is_listed(self) -> None:  # H12
         evidence = self._complete_evidence(positions=[{"slug": "mine", "net_position": "0"}])
-        assert startup_evidence_confirms_absent_flat(
-            evidence, "mine", now_ns=NOW_NS, max_age_ns=self._MAX_AGE_NS,
-        ) is False
+        assert (
+            startup_evidence_confirms_absent_flat(
+                evidence,
+                "mine",
+                now_ns=NOW_NS,
+                max_age_ns=self._MAX_AGE_NS,
+            )
+            is False
+        )
 
     # -- H14 (HB3): round-trips the REAL producer object, not a hand-built dict --
 
@@ -886,40 +1002,73 @@ class TestStartupEvidenceAbsentIsFlat:
 
         evidence = json.loads(
             StartupPositionEvidence(
-                ts_ns=NOW_NS, eof_complete=True, position_read_refused=False,
-                fill_walk_complete=True, positions=(),
+                ts_ns=NOW_NS,
+                eof_complete=True,
+                position_read_refused=False,
+                fill_walk_complete=True,
+                positions=(),
             ).to_bytes(),
         )
-        assert startup_evidence_confirms_absent_flat(
-            evidence, "never-traded-slug", now_ns=NOW_NS, max_age_ns=self._MAX_AGE_NS,
-        ) is True
+        assert (
+            startup_evidence_confirms_absent_flat(
+                evidence,
+                "never-traded-slug",
+                now_ns=NOW_NS,
+                max_age_ns=self._MAX_AGE_NS,
+            )
+            is True
+        )
 
     # -- H6-H8 (C2, R2-B1/L-2): freshness clause, wall-clock units --
 
     def test_confirms_absent_flat_false_when_evidence_is_stale(self) -> None:  # H6
         evidence = self._complete_evidence(ts_ns=NOW_NS)
-        assert startup_evidence_confirms_absent_flat(
-            evidence, "mine", now_ns=NOW_NS + self._MAX_AGE_NS + 1, max_age_ns=self._MAX_AGE_NS,
-        ) is False
+        assert (
+            startup_evidence_confirms_absent_flat(
+                evidence,
+                "mine",
+                now_ns=NOW_NS + self._MAX_AGE_NS + 1,
+                max_age_ns=self._MAX_AGE_NS,
+            )
+            is False
+        )
 
     def test_confirms_absent_flat_false_when_ts_ns_is_in_the_future(self) -> None:  # H7
         evidence = self._complete_evidence(ts_ns=NOW_NS + 1)
-        assert startup_evidence_confirms_absent_flat(
-            evidence, "mine", now_ns=NOW_NS, max_age_ns=self._MAX_AGE_NS,
-        ) is False
+        assert (
+            startup_evidence_confirms_absent_flat(
+                evidence,
+                "mine",
+                now_ns=NOW_NS,
+                max_age_ns=self._MAX_AGE_NS,
+            )
+            is False
+        )
 
     @pytest.mark.parametrize("bad_ts", [None, True, "1700000000000000000"])
     def test_confirms_absent_flat_false_when_ts_ns_is_malformed(
-        self, bad_ts: object,
+        self,
+        bad_ts: object,
     ) -> None:  # H8
         evidence = self._complete_evidence(ts_ns=bad_ts)
-        assert startup_evidence_confirms_absent_flat(
-            evidence, "mine", now_ns=NOW_NS, max_age_ns=self._MAX_AGE_NS,
-        ) is False
+        assert (
+            startup_evidence_confirms_absent_flat(
+                evidence,
+                "mine",
+                now_ns=NOW_NS,
+                max_age_ns=self._MAX_AGE_NS,
+            )
+            is False
+        )
 
 
 def _fill_record(
-    *, venue_order_id: str, instrument_id: str, qty: str, cost: str, ts_event: int = NOW_NS,
+    *,
+    venue_order_id: str,
+    instrument_id: str,
+    qty: str,
+    cost: str,
+    ts_event: int = NOW_NS,
 ) -> DurableFillRecord:
     return DurableFillRecord(
         venue_order_id=venue_order_id,
@@ -955,7 +1104,10 @@ class TestIterFillRecords:
         store = SqliteStateStore(store_path)
         with open_submit_intent_latch(store, store_path) as intent_latch:
             record = _fill_record(
-                venue_order_id="ord-1", instrument_id=INSTRUMENT_ID, qty="1", cost="0.40",
+                venue_order_id="ord-1",
+                instrument_id=INSTRUMENT_ID,
+                qty="1",
+                cost="0.40",
             )
             _write_fill(store, record)
             latch = open_trial_day_latch(intent_latch)
@@ -1017,3 +1169,161 @@ class TestAttemptCounter:
             latch = open_trial_day_latch(intent_latch, key_prefix=CONTINUOUS_TRIAL_KEY_PREFIX)
             with pytest.raises(TrialDayRecordCorrupt):
                 latch.attempt_state(STATION, CLIMATE_DAY)
+
+    def test_the_attempt_counter_is_per_instrument_day(self, store_path: Path) -> None:
+        """RED (plan S1): two DIFFERENT instruments on the SAME station-day
+        each get their own independent re-arm attempt counter."""
+        other_instrument = "POLY-LAX-TMAX-94-96.US"
+        with open_submit_intent_latch(SqliteStateStore(store_path), store_path) as intent_latch:
+            latch = open_trial_day_latch(intent_latch, key_prefix=CONTINUOUS_TRIAL_KEY_PREFIX)
+            assert (
+                latch.record_attempt(
+                    STATION,
+                    CLIMATE_DAY,
+                    ts_ns=NOW_NS,
+                    key_instrument_id=INSTRUMENT_ID,
+                )
+                == 1
+            )
+            assert (
+                latch.record_attempt(
+                    STATION,
+                    CLIMATE_DAY,
+                    ts_ns=NOW_NS + 1,
+                    key_instrument_id=INSTRUMENT_ID,
+                )
+                == 2
+            )
+            # A second instrument's counter starts fresh, unaffected by the first.
+            assert latch.attempt_state(
+                STATION,
+                CLIMATE_DAY,
+                key_instrument_id=other_instrument,
+            ) == (0, None)
+            assert (
+                latch.record_attempt(
+                    STATION,
+                    CLIMATE_DAY,
+                    ts_ns=NOW_NS + 2,
+                    key_instrument_id=other_instrument,
+                )
+                == 1
+            )
+            assert latch.attempt_state(
+                STATION,
+                CLIMATE_DAY,
+                key_instrument_id=INSTRUMENT_ID,
+            ) == (2, NOW_NS + 1)
+            assert latch.attempt_state(
+                STATION,
+                CLIMATE_DAY,
+                key_instrument_id=other_instrument,
+            ) == (1, NOW_NS + 2)
+
+
+class TestInstrumentDayReadCompatShim:
+    """RED (plan S1, operator ruling 2026-09-14): "I never wanted a limit
+    of 1 contract per station." A durable row from before this slice lives
+    under the OLD station-day key with no instrument suffix; the shim below
+    is the only bridge a restart needs.
+    """
+
+    def test_a_legacy_station_day_row_blocks_only_its_own_instrument(
+        self,
+        store_path: Path,
+    ) -> None:
+        other_instrument = "POLY-LAX-TMAX-94-96.US"
+        with open_submit_intent_latch(SqliteStateStore(store_path), store_path) as intent_latch:
+            latch = open_trial_day_latch(intent_latch, key_prefix=CONTINUOUS_TRIAL_KEY_PREFIX)
+            latch.consume(
+                STATION,
+                CLIMATE_DAY,
+                latched_at_ns=NOW_NS,
+                instrument_id=INSTRUMENT_ID,
+                ask=Decimal("0.37"),
+                reason="taken",
+            )
+            # The legacy row's OWN instrument is blocked...
+            assert (
+                latch.is_consumed(
+                    STATION,
+                    CLIMATE_DAY,
+                    key_instrument_id=INSTRUMENT_ID,
+                )
+                is True
+            )
+            # ...but a DIFFERENT instrument on the SAME station-day is not.
+            assert (
+                latch.is_consumed(
+                    STATION,
+                    CLIMATE_DAY,
+                    key_instrument_id=other_instrument,
+                )
+                is False
+            )
+            # The different instrument may still be consumed under its own key.
+            latch.consume(
+                STATION,
+                CLIMATE_DAY,
+                latched_at_ns=NOW_NS + 1,
+                instrument_id=other_instrument,
+                ask=Decimal("0.22"),
+                reason="taken",
+                key_instrument_id=other_instrument,
+            )
+            assert (
+                latch.is_consumed(
+                    STATION,
+                    CLIMATE_DAY,
+                    key_instrument_id=other_instrument,
+                )
+                is True
+            )
+
+
+class TestV2LatchKeysAreByteIdentical:
+    """RED (plan S1): v2's PREREG is closed and never re-keyed -- every v2
+    call shape (no ``key_instrument_id``) must write and read the SAME
+    byte-identical station-day key as before this slice.
+    """
+
+    def test_v2_latch_keys_are_byte_identical(self, store_path: Path) -> None:
+        with open_submit_intent_latch(SqliteStateStore(store_path), store_path) as intent_latch:
+            latch = open_trial_day_latch(intent_latch)
+            latch.consume(
+                STATION,
+                CLIMATE_DAY,
+                latched_at_ns=NOW_NS,
+                instrument_id=INSTRUMENT_ID,
+                ask=Decimal("0.37"),
+                reason="taken",
+            )
+            assert latch.is_consumed(STATION, CLIMATE_DAY) is True
+        keys = _committed_keys(store_path)
+        assert f"current_rung_hold/trial/{STATION}/{CLIMATE_DAY}" in keys
+        assert not any(k.count("/") > 3 for k in keys if k.startswith("current_rung_hold/trial/"))
+
+
+class TestKeyInstrumentIdRejectsSlash:
+    """S1 follow-up (operator ruling 2026-09-14): a ``key_instrument_id``
+    containing ``/`` would corrupt the ``station/climate_day/instrument_id``
+    key boundary -- refused loudly at every keyed accessor, never silently
+    building a malformed key."""
+
+    def test_an_instrument_id_containing_a_slash_is_refused_at_the_key_boundary(
+        self, store_path: Path,
+    ) -> None:
+        with open_submit_intent_latch(SqliteStateStore(store_path), store_path) as intent_latch:
+            latch = open_trial_day_latch(intent_latch)
+            with pytest.raises(TrialDayLatchError):
+                latch.is_consumed(STATION, CLIMATE_DAY, key_instrument_id="POLY/LAX")
+            with pytest.raises(TrialDayLatchError):
+                latch.consume(
+                    STATION,
+                    CLIMATE_DAY,
+                    latched_at_ns=NOW_NS,
+                    instrument_id=INSTRUMENT_ID,
+                    ask=Decimal("0.37"),
+                    reason="taken",
+                    key_instrument_id="POLY/LAX",
+                )

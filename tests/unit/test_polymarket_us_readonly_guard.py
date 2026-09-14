@@ -2146,6 +2146,14 @@ def test_c10_submit_intent_and_operator_controls_reference_pins() -> None:
     (``current_rung_hold/clear_family_halt_cli.py``), not ``runtime``, since
     the layers contract forbids ``runtime`` importing ``strategy`` and this
     tool needs ``TrialDayLatch``.
+
+    WIDENED again (multi-position plan S0, 2026-09-14): the exec client's
+    ``_seed_spend_from_durable_fills`` (the boot-time ledger seed) imports
+    ``utc_day_for_ns`` -- a pure UTC-day helper -- from ``operator_controls``
+    to bucket today's durable fill records. It imports no money accessor
+    (``operator_max_position_cost_usd``/``operator_max_daily_budget_usd``)
+    and reads no operator value; it is a date-bucketing read, not a control
+    read.
     """
     assert _modules_importing("submit_intent") == {
         "src/breezy/runtime/node_config.py",
@@ -2176,6 +2184,11 @@ def test_c10_submit_intent_and_operator_controls_reference_pins() -> None:
         # session notional and session order count when no explicit
         # session override is set. Reads only; never assigns a control.
         "src/breezy/adapters/polymarket_us/safety.py",
+        # WIDENED (multi-position plan S0, 2026-09-14): the exec client
+        # imports ONLY `utc_day_for_ns`, a pure UTC-day helper, to bucket
+        # today's durable fill records for the boot-time ledger seed; it
+        # imports no money accessor and reads no operator value.
+        "src/breezy/adapters/polymarket_us/exec/client.py",
     }
 
 

@@ -528,28 +528,41 @@ def _entry_contexts_from_latch(
     filled_ids = _filled_instrument_ids(engine)
     if not filled_ids:
         return {}
+    # Plan S1 (operator ruling 2026-09-14): the v3 latch keys TRIAL by
+    # instrument-day, not station-day alone -- read per filled instrument,
+    # through `record_with_legacy_fallback` so a v2-default-prefix record
+    # (never instrument-keyed) is still found unchanged (byte-identical for
+    # v2). Multiple filled instruments on the same station-day are now
+    # legitimate (no longer a one-contract-per-station ceiling) and each
+    # gets its own corroborated entry context.
     with _latch_context(latch_store_path, key_prefix=latch_key_prefix) as latch:
-        record = latch.record(station, climate_day)
-    valid = record is not None and record.reason == "taken"
-    unexplained = sorted({
+        records = {
+            instrument_id: latch.record_with_legacy_fallback(
+                station, climate_day, key_instrument_id=instrument_id,
+            )
+            for instrument_id in filled_ids
+        }
+    unexplained = sorted(
         instrument_id
-        for instrument_id in filled_ids
-        if not valid or record.instrument_id != instrument_id
-    })
+        for instrument_id, record in records.items()
+        if record is None or record.reason != "taken" or record.instrument_id != instrument_id
+    )
     if unexplained:
         raise EntryAskFromLatchMissingError(
             f"{station}/{climate_day}: filled order(s) on instrument(s) "
             f"{unexplained!r} have no corroborating reason='taken' trial-day "
-            f"latch record (record={record!r}).",
+            f"latch record (records={records!r}).",
         )
-    ti = next(
-        ti for ti in tape_instruments if str(ti.instrument.id) == record.instrument_id
-    )
-    return {
-        record.instrument_id: _entry_context_for(
+    entry_contexts: dict[str, ReplayEntryContext] = {}
+    for instrument_id, record in records.items():
+        assert record is not None  # narrowed by the unexplained check above
+        ti = next(
+            ti for ti in tape_instruments if str(ti.instrument.id) == instrument_id
+        )
+        entry_contexts[instrument_id] = _entry_context_for(
             ti, scheduled_release_at_ns=scheduled_release_at_ns, entry_ask=record.ask,
-        ),
-    }
+        )
+    return entry_contexts
 
 
 SettlementByKey = dict[tuple[str, str], "NwsClimateDay"]

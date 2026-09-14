@@ -1372,3 +1372,17 @@ Plans, evidence, memories and briefs refer to the reserved controls as "the per-
 
 ### How to apply
 `grep -c "BREEZY_MAX" docs/plans/<new>.md` must print 0. Related: L-37 (declared drift per surface), the operator-control contract in PROGRESS.md.
+
+## L-40 — A station carries as many positions as it has current rungs; the trial unit is the station-day, with the exact mutual-exclusivity variance (2026-09-14)
+
+### What happened
+The construction bound of "one trial per station-day" was removed by operator ruling 2026-09-14 (plan `docs/plans/MULTI_POSITION_PER_STATION_2026-09-14.md`, Rev 3). A station can legitimately hold a position on every rung that is currently "current" at once (`tick_eval.py`'s `instrument_rung_is_current`), so a station-day can carry k≥1 mutually exclusive rung fills. The first proposed statistic (Rev 1/2 §2, a qty-weighted "borrowed Bernoulli" combined draw) was struck by the prediction-market reviewer (R3-3): it did not correctly encode that sibling rungs are mutually exclusive (`Cov(held_i, held_j) = -BE_i·BE_j` under H0), only their marginal probabilities.
+
+### Why this is binding
+The registered sequential statistic must have `Var_H0(S) = 1` exactly, or the LD-OBF group-sequential boundary controls the wrong error rate. Getting the per-station-day variance formula wrong is not a cosmetic bug — it silently changes the family's actual Type-I error while the boundary artefact keeps reporting `alpha=0.025`.
+
+### The rule
+When a trial unit can bundle more than one correlated sub-observation (here: sibling rungs on one station-day), derive `Var_H0` from the TRUE joint distribution of the bundle, never from a per-item variance sum that assumes independence. For k mutually exclusive Bernoulli-style sub-draws with marginal probabilities `BE_i`, `X_sd = Σ qty_i·(held_i − BE_i)` and `Var_H0(X_sd) = Σ qty_i²·BE_i(1−BE_i) − 2·Σ_{i<j} qty_i·qty_j·BE_i·BE_j`. At qty≡1 this algebraically collapses to `S·(1−S)` where `S = Σ BE_i` — the SAME single-Bernoulli variance ceiling (`≤ 1/4` at `S=0.5`) a pre-existing `I_max = n_max/4` pin already assumes, so a multi-rung station-day never raises the information ceiling by itself. Mixing `qty > 1` across sibling rungs is a different story: it can raise a station-day's variance well past the single-Bernoulli ceiling and de-calibrates a boundary artefact sized for qty=1 (measured: an H0 Monte-Carlo at qty∈{1,2,3} crossed the artefact's efficacy boundary at ~5.9%, versus the ≤3.5% (alpha+slack) target; the SAME methodology at qty≡1 measured ~1.1–1.3%, within tolerance).
+
+### How to apply
+Before trusting a "trial unit" whose members can co-occur, write down the mutual-exclusivity structure explicitly and derive `Var_H0` from it (never assume independence by default). Before reusing a boundary artefact for a widened statistic, re-validate with a seeded H0 Monte-Carlo checking (a) `Var(S_terminal) ≈ 1` and (b) the realised one-sided crossing rate ≤ alpha + a Monte-Carlo slack — using the artefact's own solved boundary values (`reference_table` interpolation or `boundary_for`), never a re-solve. A failing crossing-rate check blocks only the SCOPE that produced it (here: qty>1 / Increment B), not an already-validated narrower scope (here: qty≡1 / Increment A). Evidence: `docs/evidence/RULING_multi_position_per_station_2026-09-14.md`, `tests/unit/test_multi_position_validation_2026_09_14.py`.
