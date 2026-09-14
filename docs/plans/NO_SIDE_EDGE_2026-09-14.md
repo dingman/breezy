@@ -312,3 +312,17 @@ S2b settlement (R3-5 ii, iii) → S3 decision (N2-11) → S4 latch: sibling excl
 R3-7) → S6b Monte-Carlo with the real selection rule + exogeneity stress + amendment (R3-8) → S5 exec: pin change
 in one commit with ruling + sign-off, `ONE - x` guard widening, context-keyed booking test, preview capture as exit
 criterion (R3-2, R3-3, R3-4, N2-9) → S7 parity.
+
+### Status notes (2026-09-14, first-increment build)
+- Separator probe (empirical, Nautilus 1.231.0): `^` passes Symbol/InstrumentId round-trip, catalog `quote_ticks` read-back
+  and msgbus matching; `:` also passes but is already a namespace separator in durable keys (gaps.py, nws_actor.py,
+  product_index.py); `|` `+` `=` `!` fail the catalog read like `~`. Hazard: the catalog sanitiser maps `^`, `-`, `_`
+  to the same `_`, so `<slug>^no` collides with any real slug `<slug>-no`/`<slug>_no` — S2 carries a provider-level
+  alias-uniqueness guard. Recommended `^`.
+- NO-side preview capture (N2-9 exit criterion): script drafted and proven egress-free in dry run (strace: zero
+  connect calls); parked as `docs/evidence/venue/polymarket_us/capture_no_side_preview.py.draft` because any new
+  venue-writing script under `scripts/` fails the read-only cage census (`test_polymarket_us_readonly_guard.py` C4/C5,
+  `CAGE_EXEMPTIONS` length pin) until a reviewed `B4_EXEMPT_PATHS` addition lands with S5. It reuses the write-signer
+  transport outside `exec/`; SDK envelope `{"request": …}`; only `/v1/order/preview` and the book GET are reachable.
+- Drafts awaiting numbers/sign-off: `docs/evidence/PREREG_v3_AMENDMENT_NO_SIDE_2026-09-14.md` (S6b placeholders),
+  `docs/evidence/RULING_x3_no_outcome_token_2026-09-14.md` (security sign-off block empty).
