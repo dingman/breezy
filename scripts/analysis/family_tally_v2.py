@@ -394,8 +394,23 @@ def _assert_live_provenance(store_dir: Path) -> None:
 
 
 def _stratum_row(trial: ScoredTrial) -> StratumRow:
+    """`side` is read via `getattr` -- `ScoredTrial`'s 17-column schema
+    carries no `side` field today (same documented, out-of-scope schema
+    gap as the dormant `qty` guard above; plan NO_SIDE_EDGE_2026-09-14
+    S6a, R3-5 item i), so every real caller today gets the default `"yes"`
+    and this function is byte-identical to before. A record that DOES
+    carry `side="no"` (a future NO-leg adapter, S5) has its `held` field
+    inverted here: the tally's NWS-truth `held` is always
+    `1{HIGH in r}`-shaped for YES and `1{HIGH not in r}`-shaped for NO.
+    """
+    side = getattr(trial, "side", "yes")
+    held = trial.held if side == "yes" else not trial.held
     return StratumRow(
-        entry_ask=trial.entry_ask, fee=trial.fee, held=trial.held, station=trial.station
+        entry_ask=trial.entry_ask,
+        fee=trial.fee,
+        held=held,
+        station=trial.station,
+        side=side,
     )
 
 

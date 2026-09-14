@@ -95,6 +95,14 @@ class StratumRow:
     mutual-exclusivity variance (R3-3) is qty-weighted by construction,
     letting Increment B (S4b) wire real qty through additively, with no
     change to this dataclass or `combine_station_day`'s formula.
+
+    `side` (plan NO_SIDE_EDGE_2026-09-14, SS3/S6a, R3-5 item i): `"yes"` or
+    `"no"`, defaulting to `"yes"` so every existing caller and fixture is
+    byte-unchanged. `entry_ask`/`fee` are always the LEG'S OWN ask/fee
+    (`BE_i = ask_i + fee_i` prices whichever side was actually bought);
+    `held` is always the caller-supplied per-side truth (`1{HIGH in r_i}`
+    for YES, `1{HIGH not in r_i}` for NO) -- this module performs no
+    further inversion of its own.
     """
 
     entry_ask: Decimal
@@ -102,6 +110,7 @@ class StratumRow:
     held: bool
     station: str
     qty: Decimal = Decimal(1)
+    side: Literal["yes", "no"] = "yes"
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
@@ -148,19 +157,26 @@ class StationDayAdmissionRefusal(ValueError):
 @dataclass(frozen=True, slots=True, kw_only=True)
 class CombinedDraw:
     """One station-day's combined draw under the exact mutual-exclusivity
-    statistic (R3-3, plan S4a / operator ruling 2026-09-14).
+    statistic (R3-3, plan S4a / operator ruling 2026-09-14), generalised to
+    mixed YES/NO sides (plan NO_SIDE_EDGE_2026-09-14 SS3, S6a).
 
     For taken rungs `i=1..k` on one station-day (mutually exclusive by
-    `RungBounds`/`_rung_index` construction, so `Cov(held_i, held_j) =
-    -BE_i*BE_j` under H0):
+    `RungBounds`/`_rung_index` construction), with `s_i = +1` for a YES leg
+    and `s_i = -1` for a NO leg, and `q_i` always `P(HIGH in r_i)` under H0
+    (`q_i = BE_i` for YES, `q_i = 1 - BE_i` for NO):
 
         x        = Sum_i qty_i * (held_i - BE_i)
-        variance = Sum_i qty_i^2 * BE_i*(1 - BE_i)
-                   - 2 * Sum_{i<j} qty_i*qty_j*BE_i*BE_j
+        variance = Sum_i qty_i^2 * q_i*(1 - q_i)
+                   - 2 * Sum_{i<j} qty_i*qty_j*s_i*s_j*q_i*q_j
 
-    Built only by :func:`combine_station_day`. At k=1, qty=1 this reduces
-    to `held - BE` and `BE*(1 - BE)` -- byte-identical to one `StratumRow`'s
-    own contribution inside :func:`score`.
+    `x` keeps its original `BE_i` (not `q_i`) form -- `held_i - BE_i =
+    s_i*(Y_{r_i} - q_{r_i})` is the same centred score either way. On an
+    all-YES day `q_i == BE_i` and every `s_i*s_j == +1`, so this is
+    byte-identical to the original R3-3 formula.
+
+    Built only by :func:`combine_station_day`. At k=1, qty=1, side="yes"
+    this reduces to `held - BE` and `BE*(1 - BE)` -- byte-identical to one
+    `StratumRow`'s own contribution inside :func:`score`.
     """
 
     x: float
@@ -168,11 +184,17 @@ class CombinedDraw:
     n_constituents: int
 
 
+def _cell_probability(be: float, side: Literal["yes", "no"]) -> float:
+    """`q_i = P(HIGH in r_i)` under H0: `BE_i` for YES, `1 - BE_i` for NO."""
+    return be if side == "yes" else 1.0 - be
+
+
 def combine_station_day(rows: Sequence[StratumRow] | tuple[StratumRow, ...]) -> CombinedDraw:
     """Build one station-day's :class:`CombinedDraw` from its constituent
-    (mutually exclusive) rung fills (R3-3, plan S4a).
+    (mutually exclusive) rung fills, mixed-side aware (R3-3, S4a; plan
+    NO_SIDE_EDGE_2026-09-14 SS3, S6a).
 
-    Raises :class:`StationDayAdmissionRefusal` if `Sum_i BE_i > 1` for this
+    Raises :class:`StationDayAdmissionRefusal` if `Sum_i q_i > 1` for this
     station-day -- the admission gate fires here, at draw construction,
     before any `I`/`S` arithmetic ever sees the row. Raises `ValueError` for
     an empty ``rows`` -- a combined draw over nothing is undefined, matching
@@ -183,20 +205,22 @@ def combine_station_day(rows: Sequence[StratumRow] | tuple[StratumRow, ...]) -> 
         raise ValueError("combine_station_day() is undefined for an empty station-day")
     bes = [float(break_even_row(row.entry_ask, row.fee)) for row in rows]
     qtys = [float(row.qty) for row in rows]
-    if sum(bes) > 1.0:
+    signs = [1.0 if row.side == "yes" else -1.0 for row in rows]
+    qs = [_cell_probability(be, row.side) for be, row in zip(bes, rows, strict=True)]
+    if sum(qs) > 1.0:
         raise StationDayAdmissionRefusal(
-            f"station {rows[0].station!r}: constituent break-evens sum to "
-            f"{sum(bes)!r} > 1 -- refusing the whole station-day as "
-            "malformed_input before scoring (R3-3 admission gate)"
+            f"station {rows[0].station!r}: constituent cell probabilities sum to "
+            f"{sum(qs)!r} > 1 -- refusing the whole station-day as "
+            "malformed_input before scoring (R3-3/R3-7 admission gate)"
         )
     x = sum(
         qty * ((1.0 if row.held else 0.0) - be)
         for row, be, qty in zip(rows, bes, qtys, strict=True)
     )
-    variance = sum(qty * qty * be * (1.0 - be) for be, qty in zip(bes, qtys, strict=True))
+    variance = sum(qty * qty * q * (1.0 - q) for q, qty in zip(qs, qtys, strict=True))
     for i in range(len(rows)):
         for j in range(i + 1, len(rows)):
-            variance -= 2.0 * qtys[i] * qtys[j] * bes[i] * bes[j]
+            variance -= 2.0 * qtys[i] * qtys[j] * signs[i] * signs[j] * qs[i] * qs[j]
     return CombinedDraw(x=x, variance=variance, n_constituents=len(rows))
 
 
