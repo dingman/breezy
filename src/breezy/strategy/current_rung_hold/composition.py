@@ -26,7 +26,11 @@ from nautilus_trader.model.identifiers import InstrumentId
 from nautilus_trader.persistence.catalog.parquet import ParquetDataCatalog
 
 from breezy.adapters.polymarket_us.errors import VenuePayloadError
-from breezy.adapters.polymarket_us.symbology import instrument_id_to_slug, parse_weather_slug
+from breezy.adapters.polymarket_us.symbology import (
+    instrument_id_to_slug,
+    leg_of,
+    parse_weather_slug,
+)
 from breezy.domain.weather_bucket_facts import (
     Measure,
     WeatherFactsUnavailableError,
@@ -320,6 +324,15 @@ def resolve_station_instrument_ids(
             continue
         instrument_id = getattr(instrument, "id", None)
         if not isinstance(instrument_id, InstrumentId):
+            continue
+        # NO-1/S2 review finding: `_facts_from_instrument` reads bucket facts
+        # off `info`, which the NO leg shares byte-for-byte with its YES
+        # sibling, so an unfiltered pass would admit BOTH legs into one
+        # station's `instrument_ids` and double every rung. `leg_of` is
+        # purely id-derived (never reads `info`), so a legacy instrument with
+        # no composite suffix is still correctly admitted as YES. S3 lifts
+        # this gate deliberately, once the decision layer is NO-aware.
+        if leg_of(instrument_id) != "yes":
             continue
         # dict-as-ordered-set: de-duplicates on id while keeping the FIRST
         # recorded definition's position -- a plain `list` would re-append
