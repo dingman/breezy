@@ -270,6 +270,7 @@ class DailySpendLedger:
         "_last_ns",
         "_lock",
         "_released_ids",
+        "_seeded",
         "_spent_usd",
         "_trued_up_ids",
     )
@@ -286,6 +287,40 @@ class DailySpendLedger:
         self._bookings: dict[int, SpendBooking] = {}
         self._released_ids: set[int] = set()
         self._trued_up_ids: set[int] = set()
+        #: S0 (plan rev 3, R3-1): set by the FIRST successful `seed_spent`
+        #: call this process ever makes. A second `_connect()` in the same
+        #: process must not double-book, so every call after the first is a
+        #: no-op regardless of the figure it carries.
+        self._seeded = False
+
+    def seed_spent(self, *, day: date, spent_usd: Decimal, now_ns: int) -> None:
+        """Book prior spend into the ledger exactly once per process (S0).
+
+        Called at most meaningfully once: every call after the first
+        successful one is a no-op, so a second `_connect()` in the same
+        process cannot double-count what a real order already booked in
+        between. Never LOWERS an in-memory total that is already higher --
+        a booking made between the durable walk and this call must survive
+        it. ``spent_usd`` must be a durable-fill sum, never a value read
+        from an operator-reserved control.
+        """
+        if type(spent_usd) is not Decimal:
+            raise LiveTradingPermissionError(
+                f"spent_usd must be exactly Decimal, not {type(spent_usd).__name__}"
+            )
+        if not spent_usd.is_finite() or spent_usd < Decimal(0):
+            raise LiveTradingPermissionError(
+                "spent_usd must be a non-negative finite decimal amount"
+            )
+        with self._lock:
+            if self._seeded:
+                return
+            if self._day != day:
+                self._day = day
+                self._spent_usd = Decimal(0)
+            self._spent_usd = max(self._spent_usd, spent_usd)
+            self._seeded = True
+            self._last_ns = max(self._last_ns, now_ns)
 
     def spent_today_usd(self, *, now_ns: int) -> Decimal:
         """USD spent on the UTC day containing ``now_ns``. Never mutates.

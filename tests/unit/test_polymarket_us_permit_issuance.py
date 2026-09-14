@@ -81,6 +81,7 @@ from breezy.adapters.polymarket_us.safety import (
     assert_live_order_submission_permitted,
     issue_live_trading_permit,
     live_trading_budget_remaining,
+    seed_permit_budget_from_prior_spend,
 )
 from breezy.adapters.polymarket_us.secure import RedactedSecureString
 from tests.unit.operator_control_env import operator_control_env, operator_control_unset
@@ -137,8 +138,10 @@ def _isolate_the_permit_registries() -> Iterator[None]:
 
     nonces = dict(safety._UNSPENT_NONCES)
     budgets = dict(safety._PERMIT_BUDGETS)
+    seeded = set(safety._SEEDED_PERMIT_BUDGETS)
     safety._UNSPENT_NONCES.clear()
     safety._PERMIT_BUDGETS.clear()
+    safety._SEEDED_PERMIT_BUDGETS.clear()
     try:
         yield
     finally:
@@ -146,6 +149,8 @@ def _isolate_the_permit_registries() -> Iterator[None]:
         safety._UNSPENT_NONCES.update(nonces)
         safety._PERMIT_BUDGETS.clear()
         safety._PERMIT_BUDGETS.update(budgets)
+        safety._SEEDED_PERMIT_BUDGETS.clear()
+        safety._SEEDED_PERMIT_BUDGETS.update(seeded)
 
 
 def clock_at(now_ns: int = NOW_NS) -> TestClock:
@@ -1864,3 +1869,35 @@ def test_a_logged_permit_never_publishes_operator_id_or_a_ceiling_value(
     for value in sensitive_values:
         assert value not in text, f"{value!r} leaked into a log record"
         assert value not in rendered, f"{value!r} leaked into repr(permit)"
+
+
+# ---------------------------------------------------------------------------
+# S0 (plan rev 3, R3-1) -- seed_permit_budget_from_prior_spend
+# ---------------------------------------------------------------------------
+
+
+def test_the_permit_session_ceiling_is_reduced_by_a_boot_time_seed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    permit = issued(monkeypatch, ceiling="5.00", session_notional="12.00", order_count="10")
+    applied = seed_permit_budget_from_prior_spend(permit=permit, spent_usd=Decimal("4.00"))
+    assert applied is True
+    assert live_trading_budget_remaining(permit) == (Decimal("8.00"), 10)
+
+
+def test_the_permit_seed_is_idempotent_per_permit(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    permit = issued(monkeypatch, ceiling="5.00", session_notional="12.00", order_count="10")
+    seed_permit_budget_from_prior_spend(permit=permit, spent_usd=Decimal("4.00"))
+    applied_again = seed_permit_budget_from_prior_spend(permit=permit, spent_usd=Decimal("4.00"))
+    assert applied_again is False
+    assert live_trading_budget_remaining(permit) == (Decimal("8.00"), 10)
+
+
+def test_the_permit_seed_clamps_at_zero_never_negative(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    permit = issued(monkeypatch, ceiling="5.00", session_notional="3.00", order_count="10")
+    seed_permit_budget_from_prior_spend(permit=permit, spent_usd=Decimal("30.00"))
+    assert live_trading_budget_remaining(permit) == (Decimal("0.00"), 10)

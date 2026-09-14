@@ -673,6 +673,10 @@ def test_the_mechanism_has_no_production_call_site_yet() -> None:
     ``safety.issue_live_trading_permit`` reads the same two accessors to
     derive the three session ceilings when those env vars are absent. It
     never writes them.
+    Fifth, declared 2026-09-14 (S0, plan rev 3 R3-1): ``exec/client.py``
+    imports ``utc_day_for_ns`` to compute the UTC calendar day for its
+    boot-time durable-fill spend seed. It reads no control value -- see
+    ``test_the_seed_never_reads_an_operator_control_value``.
     """
     from pathlib import Path
 
@@ -687,7 +691,50 @@ def test_the_mechanism_has_no_production_call_site_yet() -> None:
     )
     assert importers == [
         "scripts/operator/print_operator_controls.py",
+        "src/breezy/adapters/polymarket_us/exec/client.py",
         "src/breezy/adapters/polymarket_us/factories.py",
         "src/breezy/adapters/polymarket_us/safety.py",
         "src/breezy/runtime/order_enablement.py",
     ]
+
+
+# ---------------------------------------------------------------------------
+# S0 (plan rev 3, R3-1) -- seed_spent: booking prior spend at boot
+# ---------------------------------------------------------------------------
+
+
+def test_seed_spent_books_the_figure_into_a_fresh_days_accumulator() -> None:
+    """A never-yet-authorized ledger accepts a boot-time seed for today."""
+    ledger = DailySpendLedger()
+    today = utc_day_for_ns(MIDDAY)
+    ledger.seed_spent(day=today, spent_usd=Decimal("3.00"), now_ns=MIDDAY)
+    assert ledger.spent_today_usd(now_ns=MIDDAY) == Decimal("3.00")
+
+
+def test_seed_spent_is_a_no_op_the_second_time_in_one_process() -> None:
+    """A second `_connect()` in the same process must not double-book."""
+    ledger = DailySpendLedger()
+    today = utc_day_for_ns(MIDDAY)
+    ledger.seed_spent(day=today, spent_usd=Decimal("3.00"), now_ns=MIDDAY)
+    ledger.seed_spent(day=today, spent_usd=Decimal("3.00"), now_ns=MIDDAY)
+    assert ledger.spent_today_usd(now_ns=MIDDAY) == Decimal("3.00")
+
+
+def test_seed_spent_never_lowers_an_already_higher_in_memory_total() -> None:
+    """A real order authorized between the walk and the seed call must never
+    be clobbered back down by a smaller durable figure."""
+    ledger = DailySpendLedger()
+    today = utc_day_for_ns(MIDDAY)
+    with _budget(daily="100.00", position="100.00"):
+        ledger.authorize_order_cost(price_usd=Decimal("5.00"), quantity=Decimal(1), now_ns=MIDDAY)
+    ledger.seed_spent(day=today, spent_usd=Decimal("3.00"), now_ns=MIDDAY)
+    assert ledger.spent_today_usd(now_ns=MIDDAY) == Decimal("5.00")
+
+
+def test_seed_spent_refuses_a_negative_or_non_decimal_figure() -> None:
+    ledger = DailySpendLedger()
+    today = utc_day_for_ns(MIDDAY)
+    with pytest.raises(LiveTradingPermissionError):
+        ledger.seed_spent(day=today, spent_usd=Decimal("-1.00"), now_ns=MIDDAY)
+    with pytest.raises(LiveTradingPermissionError):
+        ledger.seed_spent(day=today, spent_usd=3.0, now_ns=MIDDAY)  # type: ignore[arg-type]
