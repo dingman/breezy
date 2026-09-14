@@ -155,7 +155,9 @@ async def test_load_all_async_produces_binary_options_from_a_captured_payload() 
     provider, _, _ = build_provider(market_slugs=(OPEN_SLUG, CLOSED_SLUG))
     await provider.load_all_async()
 
-    assert provider.count == 1
+    # S2: one active market with a captured second (`marketSides`) side
+    # loads BOTH legs -- YES and its NO leg.
+    assert provider.count == 2
     assert provider.market_slugs == (OPEN_SLUG, CLOSED_SLUG)
     assert provider.active_market_slugs == (OPEN_SLUG,)
     assert CLOSED_SLUG in provider.resolved_market_reasons
@@ -216,7 +218,8 @@ async def test_load_ids_async_fetches_only_the_requested_ids() -> None:
     await provider.load_ids_async([InstrumentId(Symbol(OPEN_SLUG), POLYMARKET_US_VENUE)])
 
     assert len(transport.calls) == 1
-    assert provider.count == 1
+    # S2: OPEN_SLUG loads both legs.
+    assert provider.count == 2
 
 
 @pytest.mark.asyncio
@@ -225,7 +228,8 @@ async def test_initialize_honours_load_all_from_the_native_config() -> None:
         market_slugs=(OPEN_SLUG,), config=InstrumentProviderConfig(load_all=True)
     )
     await provider.initialize()
-    assert provider.count == 1
+    # S2: OPEN_SLUG loads both legs.
+    assert provider.count == 2
     assert len(transport.calls) == 1
 
 

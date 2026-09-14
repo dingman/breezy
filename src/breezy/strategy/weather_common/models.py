@@ -72,6 +72,13 @@ class MarketQuote:
     #: the live ask, so sizing/pricing off level 0 alone can silently walk
     #: through price on a thin book (see that module's docstring).
     ask_ladder: tuple[tuple[float, float], ...] | None = None
+    #: OPTIONAL per-level bid-side depth ladder, best price first, in RAW
+    #: venue price units -- additive, same shape and defaulting rationale as
+    #: ``ask_ladder`` (S2, plan `NO_SIDE_EDGE_2026-09-14.md`). The NO-side
+    #: executable floor reads this: ``NO_ask = 1 - YES_bid``, and the size
+    #: available at that price is the YES bid size, so a NO decision needs
+    #: the bid ladder, never top-of-book alone.
+    bid_ladder: tuple[tuple[float, float], ...] | None = None
 
     def __post_init__(self) -> None:
         if self.mid is None and self.bid is not None and self.ask is not None:
