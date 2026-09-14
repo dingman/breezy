@@ -745,6 +745,10 @@ def test_n2_the_shipped_tree_has_exactly_the_expected_execution_egress_modules()
         ("src/breezy/adapters/polymarket_us/exec/client.py", "E3"),
         ("src/breezy/adapters/polymarket_us/exec/client.py", "E3"),
         ("src/breezy/adapters/polymarket_us/exec/endpoints.py", "E0"),
+        # NO-SIDE S5 (E4-4): I/O-free durable-key constants + pure helpers.
+        # ONE new row: it defines no class in `_EGRESS_CLASS_BASES` (E2) and
+        # no order-lifecycle function (E3).
+        ("src/breezy/adapters/polymarket_us/exec/no_side_keys.py", "E0"),
         # EXEC SPINE R-6d: `refusals.py` classifies a venue refusal as
         # TRANSIENT or DURABLE. Like `endpoints.py` and `reports.py` it is
         # pure and performs no I/O -- and like them it is an egress surface
@@ -1558,6 +1562,10 @@ def test_x3_the_live_scan_actually_reaches_the_exec_package() -> None:
         "src/breezy/adapters/polymarket_us/exec/__init__.py",
         "src/breezy/adapters/polymarket_us/exec/client.py",
         "src/breezy/adapters/polymarket_us/exec/endpoints.py",
+        # NO-SIDE S5 (E4-4): I/O-free durable-key constants + pure helpers.
+        # WIDENED, not relaxed: brought INSIDE both scans like every other
+        # module under `exec/`, per this test's own reasoning.
+        "src/breezy/adapters/polymarket_us/exec/no_side_keys.py",
         # EXEC SPINE R-6d: the transient/durable refusal classifier. Pure,
         # stdlib-only, and under `exec/` because that is where the venue's
         # error payloads are parsed -- WIDENED, not relaxed: the comparison
@@ -2287,6 +2295,10 @@ def test_e0_inert_the_live_scan_actually_reaches_the_exec_package() -> None:
         "src/breezy/adapters/polymarket_us/exec/__init__.py",
         "src/breezy/adapters/polymarket_us/exec/client.py",
         "src/breezy/adapters/polymarket_us/exec/endpoints.py",
+        # NO-SIDE S5 (E4-4): I/O-free durable-key constants + pure helpers.
+        # WIDENED, not relaxed: brought INSIDE both scans like every other
+        # module under `exec/`, per this test's own reasoning.
+        "src/breezy/adapters/polymarket_us/exec/no_side_keys.py",
         # EXEC SPINE R-6d: the transient/durable refusal classifier. Pure,
         # stdlib-only, and under `exec/` because that is where the venue's
         # error payloads are parsed -- WIDENED, not relaxed: the comparison
@@ -3063,6 +3075,39 @@ def test_x1_the_live_scan_actually_reaches_a_test_that_imports_the_exec_package(
     # still `==`; the module carries no `SOCKET_RESTORING_MARKERS` and
     # constructs no client -- it drives `ContinuousRungHoldStrategy`
     # through the SAME registered-strategy-direct-handler-call harness.
+    #
+    # Old -> new (NO-SIDE S5, Track B commit 1, E4-4): added
+    # `tests/unit/test_no_side_keys.py`, which imports the new I/O-free
+    # `exec.no_side_keys` module (two `Final` string constants plus a pure
+    # `is_no_side_pending` helper) -- WIDENED, not relaxed (L-6/L-12): the
+    # comparison is still `==`; the module carries no
+    # `SOCKET_RESTORING_MARKERS` and constructs no client.
+    #
+    # Old -> new (NO-SIDE S5, Track B commit 2, E4-3): added
+    # `tests/unit/test_mark_no_side_position_captured_cli.py`, which
+    # imports the same `exec.no_side_keys` constants to seed/assert the
+    # durable keys the new CLI reads and writes. WIDENED, not relaxed: the
+    # module carries no `SOCKET_RESTORING_MARKERS` and constructs no client.
+    #
+    # Old -> new (NO-SIDE S5, Track B commit 3, E3-8): added
+    # `tests/unit/test_no_side_boot_reconcile_2026_09_14.py`, which imports
+    # `DurableFillRecord` from `exec.client` (the same plain-data-record
+    # shape as its siblings, above) and `NO_SIDE_FIRST_LIVE_ORDER_KEY` from
+    # `exec.no_side_keys` to prove the boot-reconcile write. WIDENED, not
+    # relaxed: the module carries no `SOCKET_RESTORING_MARKERS` and
+    # constructs no client -- it drives `PolymarketUSExecutionClient`
+    # through the SAME `_build_rig`/`_connect`/`_disconnect` harness every
+    # sibling exec-client suite uses.
+    #
+    # Old -> new (NO-SIDE S5, Track B commit 5, E3-2/E3-5/E2-3/E2-4):
+    # added `tests/unit/test_no_side_first_order_pending_2026_09_14.py`,
+    # which imports `BUDGET_EXHAUSTED_KEY_PREFIX` from `exec.client` (the
+    # SAME plain-string-constant shape as its sibling `test_continuous_
+    # rung_hold_strategy.py`'s own `_mark_budget_exhausted` precedent) and
+    # `exec.no_side_keys`'s two constants. WIDENED, not relaxed: the module
+    # carries no `SOCKET_RESTORING_MARKERS` and constructs no client -- it
+    # drives `ContinuousRungHoldStrategy` through the SAME
+    # registered-strategy-direct-handler-call harness.
     assert exec_importing_test_modules() == {
         "tests/contract/test_exec_client_reconciliation_contract.py",
         "tests/contract/test_exec_client_wiring_contract.py",
@@ -3084,6 +3129,10 @@ def test_x1_the_live_scan_actually_reaches_a_test_that_imports_the_exec_package(
         "tests/unit/test_polymarket_us_exec_reports.py",
         "tests/unit/test_fill_time_count.py",
         "tests/unit/test_live_family_tally_fill_source_cli.py",
+        "tests/unit/test_mark_no_side_position_captured_cli.py",
+        "tests/unit/test_no_side_boot_reconcile_2026_09_14.py",
+        "tests/unit/test_no_side_first_order_pending_2026_09_14.py",
+        "tests/unit/test_no_side_keys.py",
         "tests/unit/test_polymarket_us_exec_snapshot_drift.py",
         "tests/unit/test_polymarket_us_factories.py",
         "tests/unit/test_polymarket_us_startup_evidence.py",

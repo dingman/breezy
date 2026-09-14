@@ -37,6 +37,7 @@ from breezy.strategy.current_rung_hold.trial_day_latch import (
     DEFAULT_TRIAL_KEY_PREFIX,
     FAMILY_HALT_KEY,
     LATCH_GATE_REFUSAL_REASONS,
+    NO_SIDE_FIRST_ORDER_PENDING_REASON,
     SIBLING_LEG_TRADED_REASON,
     STARTUP_EVIDENCE_KEY,
     STATION_DAY_ADMISSION_REASON,
@@ -1376,15 +1377,25 @@ class TestKeyInstrumentIdRejectsSlash:
 
 
 def test_latch_gate_refusal_reasons_is_the_closed_set() -> None:
-    """Pin (plan NO_SIDE_EDGE_2026-09-14 S4, N2-10/R3-7): these two reasons
+    """Pin (plan NO_SIDE_EDGE_2026-09-14 S4, N2-10/R3-7): these reasons
     are DISTINCT from ``decision.REFUSAL_REASONS`` (hard invariant --
-    ``decision.py`` stays untouched) because both gates run before a quote
-    ever reaches ``evaluate_decision`` and have no analogue there."""
+    ``decision.py`` stays untouched) because these gates run before a quote
+    ever reaches ``evaluate_decision`` and have no analogue there.
+
+    WIDENED (NO-SIDE S5, E3-6/E4-6), never relaxed (L-12):
+    ``NO_SIDE_FIRST_ORDER_PENDING_REASON`` -- the bounded first-order
+    containment window's refusal reason (PREREG amendment §8).
+    """
     assert LATCH_GATE_REFUSAL_REASONS == frozenset(
-        {SIBLING_LEG_TRADED_REASON, STATION_DAY_ADMISSION_REASON}
+        {
+            SIBLING_LEG_TRADED_REASON,
+            STATION_DAY_ADMISSION_REASON,
+            NO_SIDE_FIRST_ORDER_PENDING_REASON,
+        }
     )
     assert SIBLING_LEG_TRADED_REASON == "sibling_leg_traded"
     assert STATION_DAY_ADMISSION_REASON == "station_day_admission"
+    assert NO_SIDE_FIRST_ORDER_PENDING_REASON == "no_side_first_order_pending"
 
 
 def test_refusal_rejects_a_reason_outside_the_closed_set() -> None:

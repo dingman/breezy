@@ -261,6 +261,14 @@ breezy-quote-tape-ingest = "breezy.runtime.quote_tape_ingest_cli:main"
 # Never a flag on breezy-trade, never on a timer, never at startup. See
 # `breezy.runtime.clear_submit_intent_cli`.
 breezy-clear-submit-intent = "breezy.runtime.clear_submit_intent_cli:main"
+# An EIGHTH process: mirrors `breezy-clear-submit-intent`'s structure and
+# safety exactly -- the operator tool that terminates the NO-side bounded
+# first-order containment window (PREREG amendment §8 item 4) by writing
+# `NO_SIDE_POSITION_SHAPE_CAPTURED_KEY`, the ONLY sanctioned write site for
+# that key (E3-7's structural scan). Never a flag on breezy-trade, never on
+# a timer, never at startup. See
+# `breezy.runtime.mark_no_side_position_captured_cli`.
+breezy-mark-no-side-position-captured = "breezy.runtime.mark_no_side_position_captured_cli:main"
 # Mirrors `breezy-clear-submit-intent`'s structure and safety exactly: the
 # operator clear tool for the `pm_us_crh_cont` family-wide halt
 # (`continuous_rung_hold/halt`, see `TrialDayLatch.record_duplicate_fill` /

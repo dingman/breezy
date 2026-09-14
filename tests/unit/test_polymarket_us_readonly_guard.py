@@ -2161,10 +2161,26 @@ def test_c10_submit_intent_and_operator_controls_reference_pins() -> None:
     key its own ``TrialDayLatch.is_day_budget_exhausted`` read consults.
     Same reasoning as the exec client's import above: no money accessor, no
     operator value read.
+
+    WIDENED again (NO-SIDE S5, Track B commit 2, E4-3):
+    ``runtime.mark_no_side_position_captured_cli`` imports
+    ``open_submit_intent_latch``/``SubmitIntentLockHeld``/
+    ``SubmitIntentLockNotHeld`` for ONE thing -- the same exclusive flock
+    ``clear_submit_intent_cli.py`` and ``clear_family_halt_cli.py`` already
+    take, so the node holding the lock refuses this tool too. It opens no
+    second latch and no second store.
     """
     assert _modules_importing("submit_intent") == {
         "src/breezy/runtime/node_config.py",
         "src/breezy/runtime/clear_submit_intent_cli.py",
+        # WIDENED (NO-SIDE S5, Track B commit 2, E4-3): a THIRD operator
+        # clear-tool mirror, terminating the NO-side bounded first-order
+        # containment window (`NO_SIDE_POSITION_SHAPE_CAPTURED_KEY`,
+        # PREREG amendment §8 item 4). Takes the SAME
+        # `open_submit_intent_latch` flock as `clear_submit_intent_cli.py`
+        # and `clear_family_halt_cli.py` -- consistent with both mirrors,
+        # never a second latch or a second store.
+        "src/breezy/runtime/mark_no_side_position_captured_cli.py",
         "src/breezy/strategy/current_rung_hold/trial_day_latch.py",
         "src/breezy/strategy/current_rung_hold/composition.py",
         "src/breezy/strategy/current_rung_hold/clear_family_halt_cli.py",
