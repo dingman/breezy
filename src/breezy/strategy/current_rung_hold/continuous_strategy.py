@@ -553,9 +553,26 @@ class ContinuousRungHoldStrategy(Strategy):
             # for NO-arming purposes (the position-shape ruling has not
             # fired yet) -- either way YES keeps arming exactly as before.
             no_iid = str(sibling_instrument_id(InstrumentId.from_str(iid)))
-            no_has_fill = self._latch.is_consumed(
-                station, climate_day_key, key_instrument_id=no_iid,
-            ) or bool(self._latch.iter_fill_records(frozenset({no_iid})))
+            try:
+                no_has_fill = self._latch.is_consumed(
+                    station, climate_day_key, key_instrument_id=no_iid,
+                ) or bool(self._latch.iter_fill_records(frozenset({no_iid})))
+            except (TrialDayRecordCorrupt, ExecutionReportMappingError) as exc:
+                # Fail closed exactly like the entry-level walk (:527) and
+                # the sibling cross-check below (:603) -- an unreadable
+                # NO-leg fill index must halt the walk, never raise out of
+                # it (safety review finding, 2026-09-14).
+                self.log.error(
+                    f"continuous_rung_hold: durable fill walk unreadable ({exc}); halting",
+                )
+                self.position_events.record(_POSITION_FILL_WALK_UNREADABLE)
+                self._report_alerter(
+                    self.position_alerter, "continuous_rung_hold position report failed",
+                )
+                self._record_startup_evidence_summary(
+                    evidence, now_ns=now_ns, decisions=decisions,
+                )
+                return False
             decisions[no_iid] = "UNKNOWN" if no_has_fill else "flat"
             if self._latch.is_consumed(station, climate_day_key, key_instrument_id=iid):
                 continue
@@ -600,7 +617,7 @@ class ContinuousRungHoldStrategy(Strategy):
                 # never crosses days. Shape-agnostic: a venue that nets the
                 # NO leg as non-long on the YES slug never reaches this
                 # block at all (`slug_ok` was already `True`).
-                no_iid_for_slug = str(sibling_instrument_id(InstrumentId.from_str(iid)))
+                no_iid_for_slug = no_iid
                 try:
                     no_fill_records = self._latch.iter_fill_records(
                         frozenset({no_iid_for_slug}),

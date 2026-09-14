@@ -33,6 +33,7 @@ from breezy.adapters.polymarket_us.exec.client import (
 from breezy.adapters.polymarket_us.symbology import sibling_instrument_id
 from breezy.runtime.sqlite_store import SqliteStateStore
 from breezy.runtime.submit_intent import open_submit_intent_latch
+from breezy.strategy.current_rung_hold.trial_day_latch import TrialDayRecordCorrupt
 from tests.unit.test_continuous_rung_hold_strategy import (
     _PERMISSIVE_EVIDENCE,
     _register_and_start,
@@ -161,3 +162,40 @@ def test_a_no_fill_with_a_flat_venue_slug_never_enters_the_accounting_branch(
     assert strategy.position_events.count("unreconciled_long_no_fill") == 0
     assert strategy.last_startup_evidence_summary is not None
     assert "accounted-by-no-leg" not in strategy.last_startup_evidence_summary
+
+
+def test_a_corrupt_no_leg_fill_index_halts_the_walk_cleanly(tmp_path: Path) -> None:
+    """(e) Safety review finding (2026-09-14): the observability-only
+    ``no_has_fill`` probe (``:558``, mirrored at ``:605``) must fail closed
+    exactly like every other durable-fill read in this walk -- a corrupt NO-
+    leg fill index must halt the walk (``fill_walk_unreadable``), never
+    raise ``TrialDayRecordCorrupt`` out of ``_run_never_arm_walk``.
+
+    ``_candidate_instrument_ids()`` already unions in every sibling, so the
+    entry-level walk (``:527``) reads the SAME NO-leg index the ``:558``
+    probe does -- a genuinely corrupt store row is caught there first and
+    never reaches ``:558`` at all. This isolates the previously-unguarded
+    call directly: the real per-instrument-set behaviour is preserved (the
+    ``:527`` superset call still runs for real against a clean store) and
+    only the single-instrument NO-leg lookup ``:558`` makes is stubbed to
+    raise, exactly the shape of corruption the guard exists to survive.
+    """
+    store_path = tmp_path / "state.db"
+    strategy = _register_and_start(
+        store_path=store_path,
+        instruments=(_interior_instrument(),),
+        position_evidence_reader=lambda: _PERMISSIVE_EVIDENCE,
+    )
+    assert strategy._latch is not None
+    real_iter_fill_records = strategy._latch.iter_fill_records
+    no_iid = str(_NO_INTERIOR_ID)
+
+    def _iter_fill_records_raising_for_no_leg(instrument_ids: object) -> object:
+        if frozenset(instrument_ids) == frozenset({no_iid}):
+            raise TrialDayRecordCorrupt()
+        return real_iter_fill_records(instrument_ids)
+
+    strategy._latch.iter_fill_records = _iter_fill_records_raising_for_no_leg  # type: ignore[method-assign]
+
+    assert strategy._run_never_arm_walk() is False
+    assert strategy.position_events.count("fill_walk_unreadable") == 1
