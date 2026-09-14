@@ -92,6 +92,7 @@ from score_live_trials import (
 )
 from structural_dead_stop import StructuralDeadVerdict, structural_dead
 
+from breezy.domain.instrument_leg import base_symbol_of, leg_of_symbol, symbol_of_instrument_id
 from breezy.persistence.family_manifest import FamilyManifest, load_family_manifest
 from breezy.persistence.gs_boundary_artefact import BoundaryArtefact, load_boundary_artefact
 from breezy.persistence.scored_trial_store import SCORED_TRIAL_SCHEMA, read_scored_trials
@@ -394,28 +395,37 @@ def _assert_live_provenance(store_dir: Path) -> None:
 
 
 def _stratum_row(trial: ScoredTrial) -> StratumRow:
-    """`side`/`rung` are read via `getattr` -- `ScoredTrial`'s 17-column
-    schema carries neither field today (same documented, out-of-scope
-    schema gap as the dormant `qty` guard above; plan
-    NO_SIDE_EDGE_2026-09-14 S6a, R3-5 item i, and the fix-first review of
-    87278dd item 2), so every real caller today gets `side="yes"` and
-    `rung=None` and this function is byte-identical to before. A record
-    that DOES carry `side="no"` (a future NO-leg adapter, S5) has its
-    `held` field inverted here: the tally's NWS-truth `held` is always
-    `1{HIGH in r}`-shaped for YES and `1{HIGH not in r}`-shaped for NO.
-    `rung` is the market's own base venue slug (`market_slug`, NOT
-    `instrument_id` -- a YES/NO pair shares one rung slug but has two
-    distinct instrument ids); a future adapter attaches it the same way.
+    """`side`/`rung` are DERIVED from `trial.instrument_id` (S5 Track D
+    fix-first review, plan NO_SIDE_EDGE_2026-09-14 S6a, R3-5 item i) --
+    never read via `getattr` on a dormant attribute `ScoredTrial`'s
+    17-column schema does not carry (that was the CRITICAL bug: every real
+    trial silently reported `side="yes"`/`rung=None`, folding a genuine NO
+    trial in as YES). `instrument_id` is a plain `str` (in production
+    `str(InstrumentId)`, `"<symbol>.<VENUE>"`; legacy fixtures use a bare
+    symbol) -- `symbol_of_instrument_id` strips the optional `.VENUE`
+    suffix, `leg_of_symbol`/`base_symbol_of` read the `^no` composite
+    suffix, matching `breezy.adapters.polymarket_us.symbology.leg_of`/
+    `base_slug_of` byte-for-byte (contract test:
+    `test_instrument_leg_layer_agreement_contract.py`).
+
+    `held` is passed through UNCHANGED: `score_trial`
+    (`breezy.settlement.trial_scorer`) already inverts it for a NO leg
+    (`held = 1{HIGH ∉ r}`), so this function must never invert it a second
+    time -- the inversion is applied EXACTLY ONCE, end to end.
+
+    `rung` is the market's own base venue slug, recovered off EITHER leg's
+    instrument id -- a YES/NO pair shares one rung slug but has two
+    distinct instrument ids.
     """
-    side = getattr(trial, "side", "yes")
-    held = trial.held if side == "yes" else not trial.held
+    symbol = symbol_of_instrument_id(trial.instrument_id)
+    side = leg_of_symbol(symbol)
     return StratumRow(
         entry_ask=trial.entry_ask,
         fee=trial.fee,
-        held=held,
+        held=trial.held,
         station=trial.station,
         side=side,
-        rung=getattr(trial, "market_slug", None),
+        rung=base_symbol_of(symbol),
     )
 
 
