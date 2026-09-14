@@ -14,6 +14,7 @@ import importlib.util
 import math
 import random
 import sys
+from dataclasses import replace
 from decimal import Decimal
 from pathlib import Path
 from types import ModuleType
@@ -326,10 +327,13 @@ def test_mixed_day_h0_simulation_has_zero_mean_and_unit_variance() -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_stratum_row_wiring_defaults_to_yes_for_a_record_with_no_side_attribute() -> None:
+def test_stratum_row_wiring_defaults_to_yes_for_a_legacy_bare_instrument_id() -> None:
+    """S5 Track D fix-first review: `side`/`rung` are now DERIVED from
+    `trial.instrument_id`, never read via `getattr` on a dormant attribute.
+    A legacy bare instrument id (no `^no` suffix) derives `side="yes"`,
+    byte-identical to before."""
     tally_mod = _load_family_tally_v2()
     trial = _scored_trial(ask="0.20", held=True)
-    assert not hasattr(trial, "side")
 
     row = tally_mod._stratum_row(trial)
 
@@ -340,9 +344,10 @@ def test_stratum_row_wiring_defaults_to_yes_for_a_record_with_no_side_attribute(
     assert row.station == trial.station
 
 
-def test_stratum_row_wiring_is_byte_identical_for_an_all_yes_fixture() -> None:
-    """Pin: before/after this change, an all-YES `ScoredTrial` (no `side`
-    attribute) produces the SAME `StratumRow` fields through `_stratum_row`."""
+def test_stratum_row_wiring_rung_is_always_derived_from_instrument_id() -> None:
+    """Pin: `rung` is now `base_symbol_of(trial.instrument_id)`, never a
+    dormant `getattr(trial, "market_slug", None)` placeholder -- for the
+    `_scored_trial` fixture's legacy bare id that is the id itself."""
     tally_mod = _load_family_tally_v2()
     trial = _scored_trial(ask="0.35", held=False, station="SFO")
 
@@ -354,41 +359,33 @@ def test_stratum_row_wiring_is_byte_identical_for_an_all_yes_fixture() -> None:
         held=False,
         station="SFO",
         side="yes",
+        rung="instrument-0",
     )
 
 
-class _NoLegScoredTrial:
-    """A minimal stand-in carrying a `side` attribute `ScoredTrial` itself
-    does not have (the 17-column schema is out of scope for this slice;
-    S5 is where a real NO-leg record lands on `ScoredTrial`). Exercises
-    `_stratum_row`'s `getattr(trial, "side", "yes")` branch structurally."""
-
-    def __init__(self, *, entry_ask: Decimal, fee: Decimal, held: bool, station: str) -> None:
-        self.entry_ask = entry_ask
-        self.fee = fee
-        self.held = held
-        self.station = station
-        self.side = "no"
-
-
-def test_stratum_row_wiring_carries_a_no_side_and_inverts_held() -> None:
-    """A NO row on a rung the HIGH landed IN (`trial.held=True`, i.e. Y=1)
-    must score held=False; off it (`trial.held=False`), held=True."""
+def test_stratum_row_wiring_derives_no_side_and_never_re_inverts_held() -> (
+    None
+):
+    """`trial.held` is ALREADY the scorer's correctly-inverted per-side
+    truth (`score_trial`, S5 Track D) -- `_stratum_row` must apply the
+    inversion EXACTLY ONCE end to end, i.e. never invert it again here."""
     tally_mod = _load_family_tally_v2()
-    on_rung = _NoLegScoredTrial(
-        entry_ask=Decimal("0.20"), fee=Decimal("0.01"), held=True, station="MIA"
+    no_leg_held_false = replace(
+        _scored_trial(ask="0.20", held=False, station="MIA"),
+        instrument_id="instrument-0^no",
     )
-    off_rung = _NoLegScoredTrial(
-        entry_ask=Decimal("0.20"), fee=Decimal("0.01"), held=False, station="MIA"
+    no_leg_held_true = replace(
+        _scored_trial(ask="0.20", held=True, station="MIA"),
+        instrument_id="instrument-0^no",
     )
 
-    on_row = tally_mod._stratum_row(on_rung)
-    off_row = tally_mod._stratum_row(off_rung)
+    off_row = tally_mod._stratum_row(no_leg_held_false)
+    on_row = tally_mod._stratum_row(no_leg_held_true)
 
-    assert on_row.side == "no"
-    assert on_row.held is False
     assert off_row.side == "no"
-    assert off_row.held is True
+    assert off_row.held is False
+    assert on_row.side == "no"
+    assert on_row.held is True
 
 
 # ---------------------------------------------------------------------------
@@ -483,33 +480,20 @@ def test_all_yes_fixtures_without_rung_keys_are_unedited_and_still_pass() -> Non
     ) == CombinedDraw(x=1.1, variance=0.09000000000000002, n_constituents=3)
 
 
-def test_stratum_row_wiring_carries_a_rung_from_market_slug() -> None:
-    """`_stratum_row` reads `rung` from `getattr(trial, "market_slug",
-    None)` -- a dormant field on today's 17-column `ScoredTrial` (no
-    schema change), same pattern as the existing `qty`/`side` gaps."""
+def test_stratum_row_wiring_carries_a_rung_derived_from_a_no_leg_instrument_id() -> None:
+    """`rung` is `base_symbol_of(trial.instrument_id)` -- the market's own
+    base venue slug, recovered off EITHER leg's instrument id (S5 Track D
+    fix-first review; no dormant `market_slug` field, no schema change)."""
     tally_mod = _load_family_tally_v2()
-
-    class _WithSlug:
-        def __init__(self) -> None:
-            self.entry_ask = Decimal("0.20")
-            self.fee = Decimal("0.01")
-            self.held = True
-            self.station = "MIA"
-            self.side = "no"
-            self.market_slug = "kxhighmia-26sep14"
-
-    row = tally_mod._stratum_row(_WithSlug())
-    assert row.rung == "kxhighmia-26sep14"
-
-
-def test_stratum_row_wiring_rung_defaults_to_none_for_a_record_with_no_market_slug() -> None:
-    tally_mod = _load_family_tally_v2()
-    trial = _scored_trial(ask="0.20", held=True)
-    assert not hasattr(trial, "market_slug")
+    trial = replace(
+        _scored_trial(ask="0.20", held=True, station="MIA"),
+        instrument_id="kxhighmia-26sep14^no",
+    )
 
     row = tally_mod._stratum_row(trial)
 
-    assert row.rung is None
+    assert row.side == "no"
+    assert row.rung == "kxhighmia-26sep14"
 
 
 # --- [MEDIUM] item 3: score() / build_stratum_v2 are side-blind ------------
