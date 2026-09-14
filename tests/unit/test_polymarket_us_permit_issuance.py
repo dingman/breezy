@@ -78,6 +78,7 @@ from breezy.adapters.polymarket_us.safety import (
     LiveOrderSubmissionAuthorization,
     LiveTradingPermissionError,
     LiveTradingPermit,
+    SessionNotionalExhausted,
     assert_live_order_submission_permitted,
     issue_live_trading_permit,
     live_trading_budget_remaining,
@@ -1354,7 +1355,7 @@ def test_the_notional_budget_is_spent_down_across_authorizations(
 
     assert live_trading_budget_remaining(permit) == (Decimal("2.00"), 8)
 
-    with pytest.raises(LiveTradingPermissionError, match="remaining notional budget"):
+    with pytest.raises(SessionNotionalExhausted, match="remaining notional budget") as excinfo:
         assert_live_order_submission_permitted(
             credentials=credentials(),
             permit=permit,
@@ -1363,6 +1364,7 @@ def test_the_notional_budget_is_spent_down_across_authorizations(
             request_fingerprint=FINGERPRINT,
             now_ns=NOW_NS,
         )
+    assert isinstance(excinfo.value, LiveTradingPermissionError)
 
 
 def test_the_order_count_budget_is_spent_down_and_then_refuses(
@@ -1382,7 +1384,7 @@ def test_the_order_count_budget_is_spent_down_and_then_refuses(
 
     assert live_trading_budget_remaining(permit) == (Decimal("998.00"), 0)
 
-    with pytest.raises(LiveTradingPermissionError, match="order-count budget"):
+    with pytest.raises(LiveTradingPermissionError, match="order-count budget") as excinfo:
         assert_live_order_submission_permitted(
             credentials=credentials(),
             permit=permit,
@@ -1391,6 +1393,12 @@ def test_the_order_count_budget_is_spent_down_and_then_refuses(
             request_fingerprint=FINGERPRINT,
             now_ns=NOW_NS,
         )
+    # D3 (Rev 2 dispositions): the session ORDER-COUNT ceiling is a distinct,
+    # non-dollar limit under the 09-14 per-order ruling -- it must stay a
+    # plain LiveTradingPermissionError, never the dollar-ceiling subclass,
+    # so the exec client's typed except arm does not mark the day for it.
+    assert type(excinfo.value) is LiveTradingPermissionError
+    assert not isinstance(excinfo.value, SessionNotionalExhausted)
 
 
 def test_a_refused_authorization_does_not_spend_budget(

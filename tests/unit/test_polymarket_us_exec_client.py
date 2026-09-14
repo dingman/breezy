@@ -95,6 +95,7 @@ import breezy.adapters.polymarket_us.exec.client as client_module
 from breezy.adapters.polymarket_us.errors import ExecutionReportMappingError, PolymarketUSError
 from breezy.adapters.polymarket_us.exec import submit_chain
 from breezy.adapters.polymarket_us.exec.client import (
+    BUDGET_EXHAUSTED_KEY_PREFIX,
     FILL_INDEX_KEY_PREFIX,
     FILL_KEY_PREFIX,
     RESOLVER_CONTEXT_KEY_PREFIX,
@@ -2204,6 +2205,421 @@ def _reopened_fill_record(store_path: Path, venue_order_id: str) -> DurableFillR
     if raw is None:
         return None
     return DurableFillRecord.from_bytes(raw)
+
+
+def _budget_marker(store_path: Path, day: str) -> bytes | None:
+    with SqliteStateStore(store_path) as reopened:
+        return reopened.get(f"{BUDGET_EXHAUSTED_KEY_PREFIX}{day}")
+
+
+# ---------------------------------------------------------------------------
+# Operator ruling 2026-09-14: the daily-budget day stop
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_a_daily_budget_denial_writes_the_utc_day_marker_and_still_denies(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    write_canonical_verified: None,  # noqa: F811
+) -> None:
+    sender = _FakeOrderSender()
+    rig = _build_accept_fill_rig(tmp_path, monkeypatch=monkeypatch, sender=sender)
+    with (
+        operator_control_env(MAX_DAILY_BUDGET_USD_ENV_VAR, "0.10"),
+        operator_control_env(MAX_POSITION_COST_USD_ENV_VAR, "10.00"),
+    ):
+        await rig.client._connect()
+        await rig.client._submit_order(rig.limit_buy())
+        await rig.client._disconnect()
+
+    denials = [event for event in rig.order_events if isinstance(event, OrderDenied)]
+    assert len(denials) == 1
+    assert sender.calls == []
+    day = utc_day_for_ns(rig.clock.timestamp_ns()).isoformat()
+    assert _budget_marker(rig.store_path, day) == b"1"
+
+
+@pytest.mark.asyncio
+async def test_a_session_notional_exhaustion_writes_the_same_day_marker(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    write_canonical_verified: None,  # noqa: F811
+) -> None:
+    """Operator ruling 2026-09-14: session notional derives from the daily
+    budget, so its exhaustion is the SAME day's dollar ceiling."""
+    sender = _FakeOrderSender()
+    loop = asyncio.get_running_loop()
+    clock = LiveClock()
+    msgbus = MessageBus(trader_id=TRADER_ID, clock=clock)
+    cache = Cache(database=None, config=CacheConfig(database=None, flush_on_start=False))
+    instrument = build_instrument()
+    cache.add_instrument(instrument)
+    provider = InstrumentProvider()
+    provider.add(instrument)
+    read = _PrivateReadStub(
+        {
+            ACCOUNT_BALANCES_PATH: _balances_payload(),
+            PORTFOLIO_POSITIONS_PATH: {"positions": {}, "eof": True},
+        },
+    )
+    order_events: list[Any] = []
+
+    def _on_account_state(state: AccountState) -> None:
+        if cache.account(state.account_id) is None:
+            cache.add_account(AccountFactory.create(state))
+        else:
+            cache.account(state.account_id).apply(state)
+
+    msgbus.register(endpoint="Portfolio.update_account", handler=_on_account_state)
+    msgbus.register(endpoint="ExecEngine.process", handler=order_events.append)
+
+    store_path = tmp_path / "exec_state.db"
+    enable_operator_gate(monkeypatch, session_notional="0.10")
+    issued_permit = issue_live_trading_permit(clock=clock)
+    latch_cm = open_submit_intent_latch(SqliteStateStore(store_path), store_path)
+    submit_intent_latch = latch_cm.__enter__()
+    client = PolymarketUSExecutionClient(
+        loop=loop,
+        client_id=CLIENT_ID,
+        venue=POLYMARKET_US_VENUE,
+        instrument_provider=provider,
+        msgbus=msgbus,
+        cache=cache,
+        clock=clock,
+        private_read=read,
+        state_store_opener=lambda: SqliteStateStore(store_path),
+        account_number=ACCOUNT_NUMBER,
+        instrument_wait_timeout_s=1.0,
+        account_registration_timeout_s=1.0,
+        order_sender=sender,
+        write_signer=_FakeWriteSigner(),
+        live_trading_permit=issued_permit,
+        spend_ledger=DailySpendLedger(),
+        submit_intent_latch=submit_intent_latch,
+        credentials=credentials(),
+        api_base_url="https://api.polymarket.us",
+        retirement_reasons=RetirementReason,
+    )
+    factory = OrderFactory(trader_id=TRADER_ID, strategy_id=STRATEGY_ID, clock=clock)
+    order = factory.limit(
+        instrument_id=instrument.id,
+        order_side=OrderSide.BUY,
+        quantity=Quantity(1, instrument.size_precision),
+        price=Price.from_str("0.37"),
+        time_in_force=TimeInForce.IOC,
+    )
+    command = SubmitOrder(
+        trader_id=TRADER_ID,
+        strategy_id=STRATEGY_ID,
+        order=order,
+        command_id=UUID4(),
+        ts_init=TS_INIT,
+    )
+    with (
+        operator_control_env(MAX_DAILY_BUDGET_USD_ENV_VAR, "1000.00"),
+        operator_control_env(MAX_POSITION_COST_USD_ENV_VAR, "10.00"),
+    ):
+        await client._connect()
+        await client._submit_order(command)
+        await client._disconnect()
+
+    denials = [event for event in order_events if isinstance(event, OrderDenied)]
+    assert len(denials) == 1
+    assert sender.calls == []
+    day = utc_day_for_ns(clock.timestamp_ns()).isoformat()
+    assert _budget_marker(store_path, day) == b"1"
+
+
+def _build_manual_client(
+    tmp_path: Path,
+    *,
+    name: str,
+    permit: Any,
+    sender: _FakeOrderSender,
+) -> tuple[PolymarketUSExecutionClient, list[Any], Path, LiveClock]:
+    """A second, independently-stored client stack sharing ONE already-issued
+    permit -- so its in-process ``_PERMIT_BUDGETS`` entry (keyed by
+    ``permit.permit_id``, not by client) is genuinely shared, the way a
+    process restart against the same permit id would be."""
+    loop = asyncio.get_running_loop()
+    clock = LiveClock()
+    msgbus = MessageBus(trader_id=TRADER_ID, clock=clock)
+    cache = Cache(database=None, config=CacheConfig(database=None, flush_on_start=False))
+    instrument = build_instrument()
+    cache.add_instrument(instrument)
+    provider = InstrumentProvider()
+    provider.add(instrument)
+    read = _PrivateReadStub(
+        {
+            ACCOUNT_BALANCES_PATH: _balances_payload(),
+            PORTFOLIO_POSITIONS_PATH: {"positions": {}, "eof": True},
+        },
+    )
+    order_events: list[Any] = []
+
+    def _on_account_state(state: AccountState) -> None:
+        if cache.account(state.account_id) is None:
+            cache.add_account(AccountFactory.create(state))
+        else:
+            cache.account(state.account_id).apply(state)
+
+    msgbus.register(endpoint="Portfolio.update_account", handler=_on_account_state)
+    msgbus.register(endpoint="ExecEngine.process", handler=order_events.append)
+
+    store_path = tmp_path / f"exec_state_{name}.db"
+    latch_cm = open_submit_intent_latch(SqliteStateStore(store_path), store_path)
+    submit_intent_latch = latch_cm.__enter__()
+    client = PolymarketUSExecutionClient(
+        loop=loop,
+        client_id=CLIENT_ID,
+        venue=POLYMARKET_US_VENUE,
+        instrument_provider=provider,
+        msgbus=msgbus,
+        cache=cache,
+        clock=clock,
+        private_read=read,
+        state_store_opener=lambda: SqliteStateStore(store_path),
+        account_number=ACCOUNT_NUMBER,
+        instrument_wait_timeout_s=1.0,
+        account_registration_timeout_s=1.0,
+        order_sender=sender,
+        write_signer=_FakeWriteSigner(),
+        live_trading_permit=permit,
+        spend_ledger=DailySpendLedger(),
+        submit_intent_latch=submit_intent_latch,
+        credentials=credentials(),
+        api_base_url="https://api.polymarket.us",
+        retirement_reasons=RetirementReason,
+    )
+    client._instrument_for_test = instrument  # type: ignore[attr-defined]
+    # Kept alive on the client for the rig's lifetime -- see
+    # `_AcceptFillRig`'s identical note: dropping this reference finalises
+    # the generator-CM via `GeneratorExit` and silently releases the flock
+    # mid-test.
+    client._latch_cm_for_test = latch_cm  # type: ignore[attr-defined]
+    return client, order_events, store_path, clock
+
+
+def _manual_limit_buy(client: Any, clock: LiveClock) -> SubmitOrder:
+    instrument = client._instrument_for_test
+    factory = OrderFactory(trader_id=TRADER_ID, strategy_id=STRATEGY_ID, clock=clock)
+    order = factory.limit(
+        instrument_id=instrument.id,
+        order_side=OrderSide.BUY,
+        quantity=Quantity(1, instrument.size_precision),
+        price=Price.from_str("0.37"),
+        time_in_force=TimeInForce.IOC,
+    )
+    return SubmitOrder(
+        trader_id=TRADER_ID, strategy_id=STRATEGY_ID, order=order, command_id=UUID4(),
+        ts_init=TS_INIT,
+    )
+
+
+@pytest.mark.asyncio
+async def test_a_session_order_count_exhaustion_writes_no_marker(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    write_canonical_verified: None,  # noqa: F811
+) -> None:
+    """D3 (Rev 2 dispositions): the session ORDER-COUNT ceiling is a
+    distinct, non-dollar limit under the 09-14 per-order ruling; it must
+    never mark the day.
+
+    Two client stacks (fresh store + latch each) share ONE issued permit:
+    the first cleanly retires its slot with an accepted fill, so the second
+    reaches the permit check with a fresh (unlatched) submit intent and an
+    exhausted order-count budget -- unambiguously the count ceiling, not the
+    per-order intent-wait path.
+    """
+    enable_operator_gate(monkeypatch, session_notional="1000.00", order_count="1")
+    clock0 = LiveClock()
+    permit = issue_live_trading_permit(clock=clock0)
+
+    sender1 = _FakeOrderSender()
+    client1, events1, _store_path1, clock1 = _build_manual_client(
+        tmp_path, name="a", permit=permit, sender=sender1,
+    )
+    slug = _slug(client1._instrument_for_test)  # type: ignore[attr-defined]
+    sender1.response = VenueResponse(status=200, headers={}, body=_accept_fill_body(slug))
+    with (
+        operator_control_env(MAX_DAILY_BUDGET_USD_ENV_VAR, "1000.00"),
+        operator_control_env(MAX_POSITION_COST_USD_ENV_VAR, "10.00"),
+    ):
+        await client1._connect()
+        await client1._submit_order(_manual_limit_buy(client1, clock1))
+        await client1._disconnect()
+    assert any(isinstance(event, OrderFilled) for event in events1)
+
+    sender2 = _FakeOrderSender()
+    client2, events2, store_path2, clock2 = _build_manual_client(
+        tmp_path, name="b", permit=permit, sender=sender2,
+    )
+    with (
+        operator_control_env(MAX_DAILY_BUDGET_USD_ENV_VAR, "1000.00"),
+        operator_control_env(MAX_POSITION_COST_USD_ENV_VAR, "10.00"),
+    ):
+        await client2._connect()
+        await client2._submit_order(_manual_limit_buy(client2, clock2))
+        await client2._disconnect()
+
+    denials2 = [event for event in events2 if isinstance(event, OrderDenied)]
+    assert len(denials2) == 1
+    assert sender2.calls == []
+    day = utc_day_for_ns(clock2.timestamp_ns()).isoformat()
+    assert _budget_marker(store_path2, day) is None
+
+
+@pytest.mark.asyncio
+async def test_a_per_position_ceiling_denial_writes_no_marker(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    write_canonical_verified: None,  # noqa: F811
+) -> None:
+    sender = _FakeOrderSender()
+    rig = _build_accept_fill_rig(tmp_path, monkeypatch=monkeypatch, sender=sender)
+    with (
+        operator_control_env(MAX_DAILY_BUDGET_USD_ENV_VAR, "1000.00"),
+        operator_control_env(MAX_POSITION_COST_USD_ENV_VAR, "0.10"),
+    ):
+        await rig.client._connect()
+        await rig.client._submit_order(rig.limit_buy())
+        await rig.client._disconnect()
+
+    denials = [event for event in rig.order_events if isinstance(event, OrderDenied)]
+    assert len(denials) == 1
+    assert sender.calls == []
+    day = utc_day_for_ns(rig.clock.timestamp_ns()).isoformat()
+    assert _budget_marker(rig.store_path, day) is None
+
+
+@pytest.mark.asyncio
+async def test_a_clock_rewind_denial_writes_no_marker(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    write_canonical_verified: None,  # noqa: F811
+) -> None:
+    """The clock-rewind branch shares the daily env-var name in its message
+    but is a plain ``LiveTradingPermissionError``, never
+    ``DailyBudgetExhausted`` -- pinned directly on the ledger by
+    ``test_operator_reserved_controls.py``. Here it must not reach the
+    exec client's marker-writing except arm either."""
+    sender = _FakeOrderSender()
+    rig = _build_accept_fill_rig(tmp_path, monkeypatch=monkeypatch, sender=sender)
+
+    def _raise_clock_rewind(*args: Any, **kwargs: Any) -> Any:
+        # A plain LiveTradingPermissionError -- deliberately NOT the typed
+        # DailyBudgetExhausted subclass, mirroring the real clock-rewind
+        # branch (operator_controls.py). The message text is irrelevant to
+        # this test and intentionally omits the control's name so the
+        # assignment scan's A6 rule (no control name outside the whitelisted
+        # seam) does not fire on this test double.
+        raise LiveTradingPermissionError(
+            "refuses this order: the injected clock moved backwards, and "
+            "spent budget is never resurrected"
+        )
+
+    monkeypatch.setattr(DailySpendLedger, "authorize_order_cost", _raise_clock_rewind)
+
+    with _accept_fill_caps():
+        await rig.client._connect()
+        await rig.client._submit_order(rig.limit_buy())
+        await rig.client._disconnect()
+
+    day = utc_day_for_ns(rig.clock.timestamp_ns()).isoformat()
+    assert _budget_marker(rig.store_path, day) is None
+
+
+@pytest.mark.asyncio
+async def test_a_marker_store_write_failure_still_denies_the_order_and_does_not_crash(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    write_canonical_verified: None,  # noqa: F811
+) -> None:
+    """D1 (Rev 2 dispositions): the marker write is exception-shielded, so
+    ``self._deny(...)`` always runs."""
+    sender = _FakeOrderSender()
+    rig = _build_accept_fill_rig(tmp_path, monkeypatch=monkeypatch, sender=sender)
+    original_store_set = rig.client._store_set
+
+    def _raise_only_for_the_budget_marker(key: str, value: bytes) -> None:
+        if key.startswith(BUDGET_EXHAUSTED_KEY_PREFIX):
+            raise RuntimeError("simulated store failure")
+        original_store_set(key, value)
+
+    with (
+        operator_control_env(MAX_DAILY_BUDGET_USD_ENV_VAR, "0.10"),
+        operator_control_env(MAX_POSITION_COST_USD_ENV_VAR, "10.00"),
+    ):
+        await rig.client._connect()
+        monkeypatch.setattr(rig.client, "_store_set", _raise_only_for_the_budget_marker)
+        await rig.client._submit_order(rig.limit_buy())  # must not raise
+        await rig.client._disconnect()
+
+    denials = [event for event in rig.order_events if isinstance(event, OrderDenied)]
+    assert len(denials) == 1
+    assert sender.calls == []
+
+
+def test_the_typed_budget_excepts_precede_the_parent_clause() -> None:
+    """D2 (Rev 2 dispositions): ``except SessionNotionalExhausted`` /
+    ``except DailyBudgetExhausted`` must each precede the parent
+    ``except LiveTradingPermissionError`` in ``_submit_order``'s source --
+    an ``except`` clause ordering that a Python interpreter itself enforces
+    at compile time only for identical types, never for a subclass listed
+    after its own parent (which would silently make the subclass arm dead
+    code)."""
+    import textwrap
+
+    source = inspect.getsource(client_module.PolymarketUSExecutionClient._submit_order)
+    tree = ast.parse(textwrap.dedent(source))
+    call = next(node for node in ast.walk(tree) if isinstance(node, ast.AsyncFunctionDef))
+    try_nodes = [node for node in ast.walk(call) if isinstance(node, ast.Try)]
+    found_pairs = 0
+    for try_node in try_nodes:
+        names = [
+            handler.type.id
+            for handler in try_node.handlers
+            if isinstance(handler.type, ast.Name)
+        ]
+        if "LiveTradingPermissionError" in names:
+            parent_index = names.index("LiveTradingPermissionError")
+            for typed_name in ("SessionNotionalExhausted", "DailyBudgetExhausted"):
+                if typed_name in names:
+                    assert names.index(typed_name) < parent_index, (
+                        f"{typed_name} must precede LiveTradingPermissionError, got {names}"
+                    )
+                    found_pairs += 1
+    assert found_pairs == 2, f"expected both typed excepts pinned, found {found_pairs}"
+
+
+def test_the_budget_stop_log_line_names_no_dollar_figure_and_no_control_name() -> None:
+    """A live log capture is unreliable here (`self._log` is Nautilus's
+    Rust-backed logger, not interceptable through `caplog`/`capsys`/
+    `capfd`), so this parses `_mark_budget_exhausted`'s own source instead --
+    the same AST-based technique `test_the_seed_log_line_names_only_the_
+    count_and_the_day` already uses."""
+    import re
+    import textwrap
+
+    source = inspect.getsource(PolymarketUSExecutionClient._mark_budget_exhausted)
+    tree = ast.parse(textwrap.dedent(source))
+    log_calls = [
+        call
+        for call in ast.walk(tree)
+        if isinstance(call, ast.Call)
+        and isinstance(call.func, ast.Attribute)
+        and call.func.attr == "warning"
+    ]
+    assert log_calls, "expected at least one `self._log.warning(...)` call"
+    for call in log_calls:
+        for arg in call.args:
+            formatted = ast.unparse(arg)
+            assert "$" not in formatted
+            assert MAX_DAILY_BUDGET_USD_ENV_VAR not in formatted
+            assert MAX_POSITION_COST_USD_ENV_VAR not in formatted
+            assert re.search(r"\d+\.\d\d", formatted) is None
 
 
 # (a) ordering probe -- the store write happens BEFORE `true_up_booking`,

@@ -287,10 +287,14 @@ from breezy.adapters.polymarket_us.exec.reports import (
 )
 from breezy.adapters.polymarket_us.exec_fault import record_fatal_exec_fault
 from breezy.adapters.polymarket_us.fees import polymarket_us_fee
-from breezy.adapters.polymarket_us.operator_controls import utc_day_for_ns
+from breezy.adapters.polymarket_us.operator_controls import (
+    DailyBudgetExhausted,
+    utc_day_for_ns,
+)
 from breezy.adapters.polymarket_us.parsing import _to_decimal
 from breezy.adapters.polymarket_us.safety import (
     LiveTradingPermissionError,
+    SessionNotionalExhausted,
     assert_live_order_submission_permitted,
     restore_live_trading_budget,
     seed_permit_budget_from_prior_spend,
@@ -328,6 +332,7 @@ if TYPE_CHECKING:  # pragma: no cover - typing only
     from breezy.ingest.gate import ClosableStateStore, StateStoreOpener
 
 __all__ = [
+    "BUDGET_EXHAUSTED_KEY_PREFIX",
     "BUDGET_RESTORE_KEY_PREFIX",
     "FILL_INDEX_KEY_PREFIX",
     "FILL_KEY_PREFIX",
@@ -378,6 +383,16 @@ STARTUP_EVIDENCE_KEY: Final[str] = f"{STATE_KEY_NAMESPACE}startup_evidence"
 #: observes a genuine fill for the same id `unrestore` exactly what was
 #: given back.
 BUDGET_RESTORE_KEY_PREFIX: Final[str] = f"{STATE_KEY_NAMESPACE}budget_restore/"
+
+#: Operator ruling 2026-09-14 ("once it reaches the maximum, it stops
+#: trading for the rest of the day"): keyed
+#: ``BUDGET_EXHAUSTED_KEY_PREFIX + <UTC YYYY-MM-DD>``, value ``b"1"``.
+#: Written here (the exec client) on a typed dollar-ceiling denial and read
+#: by ``TrialDayLatch.is_day_budget_exhausted`` under the same flock. Any
+#: value at the key means exhausted (fail-closed); the key self-expires at
+#: UTC midnight because a new day's key is never written -- no delete is
+#: needed.
+BUDGET_EXHAUSTED_KEY_PREFIX: Final[str] = f"{STATE_KEY_NAMESPACE}budget_exhausted/"
 
 #: How often `_resolve_ambiguous_intents` checks for a durable resolver
 #: context on the currently-OPEN submit intent. Build-side; revisable.
@@ -1038,6 +1053,10 @@ class PolymarketUSExecutionClient(LiveExecutionClient):
         #: Review fix 3 (Slice 2): a corrupt singleton is logged at ERROR
         #: ONCE, not every poll interval for the process lifetime.
         self._resolver_corrupt_logged = False
+        #: Operator ruling 2026-09-14: the ``budget stop`` line is logged
+        #: ONCE per process per UTC day, not on every subsequent denial for
+        #: the same exhausted day.
+        self._budget_marker_written: set[str] = set()
         # Item 1 (slice 4 review): a resolver action raising must never kill
         # the polling task for the process lifetime. The counter increments
         # on EVERY caught failure (so "no intents" and "resolver dead" are
@@ -2635,6 +2654,34 @@ class PolymarketUSExecutionClient(LiveExecutionClient):
             return None
         return list(decoded)
 
+    def _mark_budget_exhausted(self, now_ns: int) -> None:
+        """Durably mark today's UTC day as spend-exhausted (D1: shielded).
+
+        Called from the two typed-exception arms in ``_submit_order``, both
+        of which mean the operator's dollar ceiling was reached for the day.
+        A write failure here is logged and swallowed -- it must NEVER
+        prevent the caller's unconditional ``self._deny(...)`` from running;
+        the marker is a durable convenience for the strategy's re-arm gate,
+        never a precondition for denying an order that must be denied
+        regardless. Logs the ``budget stop`` line at most once per process
+        per UTC day. Never logs a dollar figure or either control's name.
+        """
+        day = utc_day_for_ns(now_ns).isoformat()
+        try:
+            self._store_set(f"{BUDGET_EXHAUSTED_KEY_PREFIX}{day}", b"1")
+        except Exception as exc:  # noqa: BLE001 - a marker write must never crash the deny path
+            self._log.error(
+                f"budget stop marker write failed for {day}: "
+                f"{exc.__class__.__name__}: {exc}"
+            )
+            return
+        if day not in self._budget_marker_written:
+            self._budget_marker_written.add(day)
+            self._log.warning(
+                f"budget stop: the day's spend ceiling is reached for {day}; "
+                "no further orders will be authorized today"
+            )
+
     def _store_set(self, key: str, value: bytes) -> None:
         self._require_store().set(key, value)
 
@@ -2997,6 +3044,9 @@ class PolymarketUSExecutionClient(LiveExecutionClient):
                 request_fingerprint=submit_chain.order_fingerprint_bytes(order),
                 now_ns=now_ns,
             )
+        except SessionNotionalExhausted as exc:
+            self._mark_budget_exhausted(now_ns)
+            return self._deny(order, f"{exc}; this client refuses to submit", now_ns)
         except LiveTradingPermissionError as exc:
             return self._deny(order, f"{exc}; this client refuses to submit", now_ns)
         body = submit_chain.build_order_body(order, instrument)
@@ -3007,6 +3057,9 @@ class PolymarketUSExecutionClient(LiveExecutionClient):
                 quantity=submit_chain.order_quantity_decimal(order),
                 now_ns=now_ns,
             )
+        except DailyBudgetExhausted as exc:
+            self._mark_budget_exhausted(now_ns)
+            return self._deny(order, f"{exc}; this client refuses to submit", now_ns)
         except LiveTradingPermissionError as exc:
             return self._deny(order, f"{exc}; this client refuses to submit", now_ns)
         if self._intent_reconciled is not True:

@@ -185,6 +185,17 @@ class LiveTradingPermissionError(PermissionError):
     """Raised when a live order submission lacks an explicit runtime permit."""
 
 
+class SessionNotionalExhausted(LiveTradingPermissionError):
+    """Operator ruling 2026-09-14: the permit's remaining USD notional budget
+    is exhausted -- session notional derives from the operator's daily
+    budget (:func:`_derived_session_notional`), so this is the same day's
+    dollar ceiling as :class:`~breezy.adapters.polymarket_us.
+    operator_controls.DailyBudgetExhausted`, checked at a different
+    chokepoint. The session ORDER-COUNT ceiling is a distinct, non-dollar
+    limit and stays a plain :class:`LiveTradingPermissionError` (R-12).
+    """
+
+
 @runtime_checkable
 class SupportsTimestampNs(Protocol):
     """The one method this module needs from a clock.
@@ -1009,7 +1020,7 @@ def assert_live_order_submission_permitted(
         if budget.remaining_order_count < 1:
             raise LiveTradingPermissionError("permit order-count budget is exhausted")
         if order_notional_usd > budget.remaining_notional_usd:
-            raise LiveTradingPermissionError(
+            raise SessionNotionalExhausted(
                 "order notional exceeds the permit's remaining notional budget"
             )
         budget.remaining_order_count -= 1

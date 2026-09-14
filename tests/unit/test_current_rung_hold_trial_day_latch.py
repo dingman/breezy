@@ -19,6 +19,7 @@ import pytest
 
 from breezy.adapters.polymarket_us.errors import ExecutionReportMappingError
 from breezy.adapters.polymarket_us.exec.client import (
+    BUDGET_EXHAUSTED_KEY_PREFIX,
     FILL_INDEX_KEY_PREFIX,
     FILL_KEY_PREFIX,
     DurableFillRecord,
@@ -726,6 +727,39 @@ class TestDuplicateFillAndFamilyHalt:
         with open_submit_intent_latch(SqliteStateStore(store_path), store_path) as intent_latch:
             latch = open_trial_day_latch(intent_latch, key_prefix=CONTINUOUS_TRIAL_KEY_PREFIX)
             assert latch.is_family_halted() is False
+
+
+class TestDayBudgetExhausted:
+    """Operator ruling 2026-09-14: the day-budget marker the exec client
+    writes at ``BUDGET_EXHAUSTED_KEY_PREFIX + <UTC day>``."""
+
+    def test_is_day_budget_exhausted_is_false_for_a_different_utc_day(
+        self, store_path: Path
+    ) -> None:
+        with open_submit_intent_latch(SqliteStateStore(store_path), store_path) as intent_latch:
+            latch = open_trial_day_latch(intent_latch, key_prefix=CONTINUOUS_TRIAL_KEY_PREFIX)
+            store, _ = intent_latch.shared_state_binding()
+            store.set(f"{BUDGET_EXHAUSTED_KEY_PREFIX}2026-09-14", b"1")
+            assert latch.is_day_budget_exhausted("2026-09-14") is True
+            assert latch.is_day_budget_exhausted("2026-09-15") is False
+
+    def test_is_day_budget_exhausted_raises_without_the_flock(
+        self, store_path: Path
+    ) -> None:
+        with open_submit_intent_latch(SqliteStateStore(store_path), store_path) as intent_latch:
+            latch = open_trial_day_latch(intent_latch, key_prefix=CONTINUOUS_TRIAL_KEY_PREFIX)
+        with pytest.raises(SubmitIntentLockNotHeld):
+            latch.is_day_budget_exhausted("2026-09-14")
+
+    def test_any_value_at_the_budget_key_reads_as_exhausted(self, store_path: Path) -> None:
+        """Fail-closed: the store has no delete, so ANY value -- not only
+        ``b"1"`` -- must read as exhausted, mirroring ``is_family_halted``'s
+        own presence check (except this key is never "cleared")."""
+        with open_submit_intent_latch(SqliteStateStore(store_path), store_path) as intent_latch:
+            latch = open_trial_day_latch(intent_latch, key_prefix=CONTINUOUS_TRIAL_KEY_PREFIX)
+            store, _ = intent_latch.shared_state_binding()
+            store.set(f"{BUDGET_EXHAUSTED_KEY_PREFIX}2026-09-14", b"anything-nonempty")
+            assert latch.is_day_budget_exhausted("2026-09-14") is True
 
 
 def test_startup_evidence_key_matches_the_exec_clients_own_constant() -> None:
