@@ -39,7 +39,7 @@ from __future__ import annotations
 from collections.abc import Sequence
 from dataclasses import dataclass
 from decimal import Decimal
-from typing import Final
+from typing import Final, Literal
 
 __all__ = [
     "EXCLUSION_FRACTION_CEILING",
@@ -48,6 +48,7 @@ __all__ = [
     "TradeReturnSample",
     "assert_settlement_close_permitted",
     "compute_trade_returns",
+    "settlement_price_for_leg",
 ]
 
 #: The exclusion-fraction ceiling this module's docstring (above) demands of
@@ -198,3 +199,43 @@ def assert_settlement_close_permitted(
             "(external_order_claims produced no id); closing an "
             "unattributable position risks booking a foreign fill"
         )
+
+
+def settlement_price_for_leg(*, leg: Literal["yes", "no"], settlement_price: Decimal) -> Decimal:
+    """The leg-correct settlement value, given the venue's raw ``settlementPx``.
+
+    Plan `NO_SIDE_EDGE_2026-09-14.md` Sec 1 (settlement) / R3-5(ii): the venue
+    publishes exactly one settlement price per market slug, denominated in
+    the YES outcome. A NO leg settles at the complement, `1 - settlementPrice`,
+    never at the raw venue number and never keyed on an outcome STRING (which
+    an NO leg's `BinaryOption.outcome` copies verbatim from the venue and is
+    therefore not a safe dispatch key -- see `symbology.leg_of`, which reads
+    the composite `InstrumentId` instead).
+
+    This function takes a plain `leg` marker rather than an `InstrumentId` or
+    a Nautilus object on purpose: `breezy.settlement` sits BELOW
+    `breezy.adapters` in the documented layer contract
+    (`pyproject.toml [tool.importlinter]`), so it must not import
+    `breezy.adapters.polymarket_us.symbology.leg_of` itself. Every caller in a
+    layer that CAN see both (`breezy.adapters.polymarket_us.tape_records`
+    today; the future `SettlementExitActor` in `breezy.strategy`/`breezy.
+    runtime`) calls `leg_of(instrument_id)` itself and passes the plain
+    string down.
+
+    Where this is wired: `assert_settlement_close_permitted`'s future caller
+    -- the `SettlementExitActor` described in this module's docstring -- must
+    call this function to price the synthetic `OrderStatusReport`'s `avg_px`
+    the instant AFTER `assert_settlement_close_permitted` returns (permits
+    the close) and BEFORE building that report: pass
+    `leg=leg_of(instrument_id)` (from the position's own `instrument_id`) and
+    `settlement_price=Decimal(venue_settlement_snapshot.settlement_px)` (the
+    verbatim venue string, parsed once, here). Never build the report from
+    the raw `settlement_px` directly for a NO-leg position.
+
+    Never divides, never rounds -- Decimal in, Decimal out.
+    """
+    if leg == "no":
+        return Decimal(1) - settlement_price
+    if leg == "yes":
+        return settlement_price
+    raise ValueError(f"unknown settlement leg {leg!r}; expected 'yes' or 'no'")

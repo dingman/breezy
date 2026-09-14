@@ -28,6 +28,7 @@ frame, so a future reader can re-derive the judgement rather than inherit ours.
 from __future__ import annotations
 
 import json
+from decimal import Decimal
 from pathlib import Path
 from typing import Any
 
@@ -38,6 +39,7 @@ from nautilus_trader.model.objects import Price
 from breezy.adapters.polymarket_us.parsing import (
     TERMINAL_SETTLEMENT_METHOD,
     parse_binary_option,
+    parse_binary_option_pair,
     parse_instrument_close,
     parse_mark_price,
     parse_rfc3339_nanos,
@@ -72,6 +74,18 @@ def instrument() -> BinaryOption:
     return parse_binary_option(
         load_raw("market_open_510636_by_slug.json"), venue=POLYMARKET_US_VENUE, ts_init=TS_INIT
     )
+
+
+@pytest.fixture
+def pair_payload(open_book: dict[str, Any]) -> dict[str, Any]:
+    """Same market (510636 / `tc-temp-nychigh-2026-08-25-lt79f`), synthesised
+    from two real captures: ``market_open_510636_by_slug.json`` has the
+    ``marketSides`` :func:`parse_binary_option_pair` needs (no
+    ``marketData``); ``book_open_510636.json`` has the settlement ``stats``
+    :func:`parse_settlement_snapshot` needs (no ``market``). Neither single
+    capture carries both -- merged here rather than inventing a payload."""
+    market_only = load_raw("market_open_510636_by_slug.json")
+    return {"market": market_only["market"], "marketData": open_book["marketData"]}
 
 
 class TestTheVenueSaysWhichRegimeItIsIn:
@@ -288,3 +302,75 @@ class TestVenueTransactTimeIsRetained:
         restored = VenueSettlementSnapshot.from_dict(snapshot.to_dict())
 
         assert restored.venue_transact_time_ns == snapshot.venue_transact_time_ns
+
+
+class TestNoLegSettlementSign:
+    """S2b (R3-5(ii)/(iii)): ``settlement_px`` is always the venue's raw,
+    YES-denominated number, verbatim, regardless of which leg's
+    ``instrument_id`` the snapshot happens to describe. The NO leg's true
+    settlement value -- ``1 - settlementPrice`` -- is read through the new
+    leg-aware accessor, never by touching ``settlement_px`` itself."""
+
+    def test_a_yes_snapshots_raw_field_is_byte_identical_to_before_this_change(
+        self, closed_book: dict[str, Any], instrument: BinaryOption
+    ) -> None:
+        """Pin: the YES path -- `settlement_px`, `to_dict()`, the schema --
+        is untouched by S2b."""
+        snapshot = parse_settlement_snapshot(closed_book, instrument=instrument, ts_init=TS_INIT)
+        assert snapshot is not None
+
+        assert snapshot.settlement_px == "1.0000"
+        assert snapshot.to_dict() == {
+            "instrument_id": instrument.id.value,
+            "state": "MARKET_STATE_EXPIRED",
+            "method": TERMINAL_SETTLEMENT_METHOD,
+            "settlement_px": "1.0000",
+            "is_terminal": True,
+            "venue_transact_time_ns": snapshot.venue_transact_time_ns,
+            "ts_event": snapshot.ts_event,
+            "ts_init": snapshot.ts_init,
+        }
+        assert snapshot.settlement_price_for_own_leg == Decimal("1.0000")
+
+    def test_a_no_legs_snapshot_reads_the_complement_without_mutating_the_raw_field(
+        self, pair_payload: dict[str, Any]
+    ) -> None:
+        yes, no = parse_binary_option_pair(
+            pair_payload, venue=POLYMARKET_US_VENUE, ts_init=TS_INIT
+        )
+        assert no is not None
+
+        yes_snapshot = parse_settlement_snapshot(pair_payload, instrument=yes, ts_init=TS_INIT)
+        no_snapshot = parse_settlement_snapshot(pair_payload, instrument=no, ts_init=TS_INIT)
+        assert yes_snapshot is not None
+        assert no_snapshot is not None
+
+        # The raw field is recorded verbatim off the payload regardless of
+        # which leg's instrument this snapshot was built against -- untouched
+        # by the leg-aware accessor below.
+        assert no_snapshot.settlement_px == yes_snapshot.settlement_px == "0.4900"
+
+        assert yes_snapshot.settlement_price_for_own_leg == Decimal("0.4900")
+        assert no_snapshot.settlement_price_for_own_leg == Decimal("0.5100")
+        assert (
+            yes_snapshot.settlement_price_for_own_leg + no_snapshot.settlement_price_for_own_leg
+            == Decimal(1)
+        )
+
+    def test_the_no_legs_serialised_bytes_are_unaffected_by_the_accessor(
+        self, pair_payload: dict[str, Any]
+    ) -> None:
+        """The accessor is derived, never persisted -- the tape schema and
+        `to_dict()` output for a NO-leg snapshot carry the same raw field a
+        YES snapshot would, not the inverted value."""
+        _yes, no = parse_binary_option_pair(
+            pair_payload, venue=POLYMARKET_US_VENUE, ts_init=TS_INIT
+        )
+        assert no is not None
+
+        no_snapshot = parse_settlement_snapshot(pair_payload, instrument=no, ts_init=TS_INIT)
+        assert no_snapshot is not None
+
+        restored = VenueSettlementSnapshot.from_dict(no_snapshot.to_dict())
+        assert restored.settlement_px == "0.4900"
+        assert restored.settlement_price_for_own_leg == Decimal("0.5100")

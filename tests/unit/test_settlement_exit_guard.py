@@ -28,6 +28,7 @@ from breezy.settlement.exit_guard import (
     TradeReturnInput,
     assert_settlement_close_permitted,
     compute_trade_returns,
+    settlement_price_for_leg,
 )
 
 # ---------------------------------------------------------------------------
@@ -259,3 +260,86 @@ def test_refusals_are_checked_before_attribution_and_both_named_in_the_message()
             instrument_id="BINARY-2.WEATHER",
             attributed_order_id=None,
         )
+
+
+# ---------------------------------------------------------------------------
+# S2b (R3-5(ii)) -- the NO leg settles at the complement, keyed on leg,
+# never on the raw venue number and never on an outcome string.
+# ---------------------------------------------------------------------------
+
+
+def test_a_yes_leg_settles_at_the_raw_venue_price_unchanged() -> None:
+    """Pin: the YES path is byte-identical to before this function existed --
+    the raw venue number, untouched."""
+    assert settlement_price_for_leg(leg="yes", settlement_price=Decimal("0.7300")) == Decimal(
+        "0.7300"
+    )
+
+
+def test_a_no_leg_settles_at_the_complement() -> None:
+    assert settlement_price_for_leg(leg="no", settlement_price=Decimal("0.7300")) == Decimal(
+        "0.2700"
+    )
+
+
+@pytest.mark.parametrize(
+    ("settlement_price", "expected_yes", "expected_no"),
+    [
+        (Decimal(0), Decimal(0), Decimal(1)),
+        (Decimal("0.5"), Decimal("0.5"), Decimal("0.5")),
+        (Decimal(1), Decimal(1), Decimal(0)),
+    ],
+)
+def test_a_yes_no_pair_always_sums_to_exactly_one(
+    settlement_price: Decimal, expected_yes: Decimal, expected_no: Decimal
+) -> None:
+    yes = settlement_price_for_leg(leg="yes", settlement_price=settlement_price)
+    no = settlement_price_for_leg(leg="no", settlement_price=settlement_price)
+
+    assert yes == expected_yes
+    assert no == expected_no
+    assert yes + no == Decimal(1)
+
+
+def test_an_unknown_leg_marker_is_refused() -> None:
+    with pytest.raises(ValueError, match="unknown settlement leg"):
+        settlement_price_for_leg(leg="maybe", settlement_price=Decimal("0.5"))  # type: ignore[arg-type]
+
+
+def test_a_no_position_that_won_yields_positive_and_a_lost_no_yields_negative_premium() -> None:
+    """`compute_trade_returns` doesn't know about legs -- it only sees a
+    priced entry and a realized PnL. This test proves the leg-correct
+    settlement price feeds it a realistic won/lost NO trade: a NO bought at
+    0.30 that settles at 1 (HIGH landed outside the rung, so NO won) returns
+    positive; the same NO settling at 0 (HIGH landed inside the rung, NO
+    lost) returns exactly -1 (loses the whole premium)."""
+    open_price = Decimal("0.30")
+    qty = Decimal(10)
+
+    won_settlement = settlement_price_for_leg(leg="no", settlement_price=Decimal(0))
+    won_pnl = (won_settlement - open_price) * qty
+    won_sample = compute_trade_returns(
+        [
+            TradeReturnInput(
+                trade_id="no-won",
+                realized_pnl=won_pnl,
+                avg_px_open=open_price,
+                qty=qty,
+            )
+        ]
+    )
+    assert won_sample.included[0][1] > 0
+
+    lost_settlement = settlement_price_for_leg(leg="no", settlement_price=Decimal(1))
+    lost_pnl = (lost_settlement - open_price) * qty
+    lost_sample = compute_trade_returns(
+        [
+            TradeReturnInput(
+                trade_id="no-lost",
+                realized_pnl=lost_pnl,
+                avg_px_open=open_price,
+                qty=qty,
+            )
+        ]
+    )
+    assert lost_sample.included[0][1] == Decimal(-1)
