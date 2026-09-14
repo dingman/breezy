@@ -3175,6 +3175,15 @@ def test_x1_the_live_scan_actually_reaches_a_test_that_imports_the_exec_package(
     # `SOCKET_RESTORING_MARKERS` -- its sender is the shipped `_FakeSender`
     # double (imported from `test_polymarket_us_submit_order_chain.py`,
     # never a parallel fake), same shape as every sibling exec suite.
+    #
+    # Old -> new (this row, NO-side S5 §1(a)): `test_polymarket_us_readonly_
+    # guard.py` now imports `exec.submit_chain` (locally, inside `test_the_
+    # capture_script_body_keys_equal_the_live_order_body_keys`) to pin the
+    # NO-side preview capture script's restated `ORDER_BODY_KEYS` equal to
+    # the live constant. WIDENED, not relaxed (L-6/L-12): the comparison is
+    # still `==`; the module carries no `SOCKET_RESTORING_MARKERS` and
+    # constructs no client -- `submit_chain.ORDER_BODY_KEYS` is a plain
+    # frozenset, read directly.
     assert exec_importing_test_modules() == {
         "tests/contract/test_exec_client_reconciliation_contract.py",
         "tests/contract/test_exec_client_wiring_contract.py",
@@ -3200,6 +3209,7 @@ def test_x1_the_live_scan_actually_reaches_a_test_that_imports_the_exec_package(
         "tests/unit/test_polymarket_us_factories.py",
         "tests/unit/test_no_side_fill_attribution_2026_09_14.py",
         "tests/unit/test_no_side_submit_chain_2026_09_14.py",
+        "tests/unit/test_polymarket_us_readonly_guard.py",
         "tests/unit/test_polymarket_us_startup_evidence.py",
         "tests/unit/test_polymarket_us_submit_order_chain.py",
         "tests/unit/test_polymarket_us_write_sequence.py",
