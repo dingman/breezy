@@ -96,14 +96,17 @@ from breezy.persistence.family_manifest import FamilyManifest, load_family_manif
 from breezy.persistence.gs_boundary_artefact import BoundaryArtefact, load_boundary_artefact
 from breezy.persistence.scored_trial_store import SCORED_TRIAL_SCHEMA, read_scored_trials
 from breezy.settlement.current_rung_hold_v2 import (
+    CombinedDraw,
     ScoreState,
+    StationDayAdmissionRefusal,
     StratumRow,
     StratumV2,
     TruncationReason,
     build_stratum_v2,
+    combine_station_day,
     information_fraction,
     look_verdict,
-    score,
+    score_combined,
     terminal_look,
 )
 from breezy.settlement.family_barrier import (
@@ -445,6 +448,39 @@ def _ordered_for_looks(
     )
 
 
+def _combined_draws_for_looks(
+    ordered: Sequence[ScoredTrial],
+) -> tuple[CombinedDraw, ...]:
+    """S4a (plan MULTI_POSITION_PER_STATION_2026-09-14, R3-2/R3-3): one
+    combined draw per `(station, climate_day)`, ordered by the EARLIEST
+    constituent fill.
+
+    `ordered` is already fill-ordered by :func:`_ordered_for_looks`, so
+    grouping by first-seen `(station, climate_day)` preserves that order --
+    no separate fill-time lookup is needed here. A station-day whose
+    constituent break-evens sum above 1 is refused as `malformed_input`
+    (`StationDayAdmissionRefusal`, raised at draw construction, never
+    post-hoc) rather than silently admitted.
+    """
+    groups: dict[tuple[str, str], list[StratumRow]] = {}
+    order: list[tuple[str, str]] = []
+    for trial in ordered:
+        key = (trial.station, trial.climate_day)
+        if key not in groups:
+            groups[key] = []
+            order.append(key)
+        groups[key].append(_stratum_row(trial))
+    draws: list[CombinedDraw] = []
+    for key in order:
+        try:
+            draws.append(combine_station_day(groups[key]))
+        except StationDayAdmissionRefusal as exc:
+            raise ScoredTrialDataIntegrityError(
+                f"refusing to tally station-day {key!r}: {exc} (malformed_input)"
+            ) from exc
+    return tuple(draws)
+
+
 def _station_strata(rows: Sequence[ScoredTrial]) -> tuple[StratumV2, ...]:
     by_station: dict[str, list[ScoredTrial]] = defaultdict(list)
     for row in rows:
@@ -580,6 +616,13 @@ def build_family_tally_v2(
     ordered = _ordered_for_looks(non_excluded, store_dir=store_dir)
     pooled_rows = tuple(_stratum_row(t) for t in ordered)
     pooled = build_stratum_v2("pooled", pooled_rows) if pooled_rows else None
+    # S4a (R3-2/R3-3): the registered statistic scores one COMBINED draw per
+    # station-day, never per raw fill -- `pooled`/`station_strata`/
+    # `ask_band_strata` above stay per-fill (Wilson cell_dead diagnostics are
+    # unaffected by the trial-unit change). At qty=1 with one fill per
+    # station-day this is a 1:1 relabelling of `pooled_rows` (the byte-
+    # identity regression floor), never a behaviour change.
+    combined_draws = _combined_draws_for_looks(ordered)
     station_strata = _station_strata(non_excluded)
     ask_band_strata = _ask_band_strata(non_excluded)
     any_cell_dead = any(s.cell_dead for s in (*station_strata, *ask_band_strata))
@@ -602,7 +645,7 @@ def build_family_tally_v2(
     )
     structural_fired = structural is not None and structural.structural_dead
 
-    n = len(pooled_rows)
+    n = len(combined_draws)
     look_step = artefact.spending.look_step
     n_max = artefact.spending.n_max
 
@@ -620,7 +663,7 @@ def build_family_tally_v2(
     else:
         scheduled_ns = range(look_step, min(n, n_max) + 1, look_step)
     for look_n in scheduled_ns:
-        state = score(pooled_rows[:look_n])
+        state = score_combined(combined_draws[:look_n])
         t = information_fraction(state.information, i_max=artefact.i_max)
         t_history.append(t)
 
@@ -697,12 +740,12 @@ def build_family_tally_v2(
         not (structural_fired and registered)
         and truncation is not None
         and not already_terminal
-        and pooled_rows
+        and combined_draws
     ):
         # An off-grid explicit truncation (n does not land on a look_step
         # boundary): treated as a look too, never a skipped None (rev b
         # SS4).
-        state = score(pooled_rows)
+        state = score_combined(combined_draws)
         t = information_fraction(state.information, i_max=artefact.i_max)
         t_history.append(t)
         b_eff, b_fut = artefact.boundary_for(tuple(t_history), is_terminal=True)

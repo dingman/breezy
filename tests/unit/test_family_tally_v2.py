@@ -171,7 +171,18 @@ def _row(
 
 
 def _rows(n: int, **kwargs: Any) -> tuple[ScoredTrial, ...]:
-    return tuple(_row(i, **kwargs) for i in range(n))
+    """`n` rows, one per DISTINCT station-day by default (operator ruling
+    2026-09-14 / plan S4a R3-3): `build_family_tally_v2` now combines every
+    row sharing `(station, climate_day)` into one station-day draw, so a
+    caller that wants `n` genuinely independent draws (the overwhelming
+    majority of this file's fixtures, pre-dating S4a) must not collide them
+    all onto the SAME day the way the old single-climate_day default did.
+    A caller that explicitly passes `climate_day=` (deliberately testing a
+    same-day collision) is left byte-identical to before this re-pin.
+    """
+    if "climate_day" in kwargs:
+        return tuple(_row(i, **kwargs) for i in range(n))
+    return tuple(_row(i, climate_day=f"2026-09-{11 + i:02d}", **kwargs) for i in range(n))
 
 
 # --- obligation (a): held/pnl-sign assertion --------------------------------
@@ -487,8 +498,16 @@ def test_no_stratum_label_starts_with_venue(
     tmp_path: Path, tally_mod: ModuleType, real_artefact: BoundaryArtefact
 ) -> None:
     manifest = _manifest(tmp_path)
+    # Distinct climate_day per row (operator ruling 2026-09-14 / plan S4a
+    # R3-3): build_family_tally_v2 now combines same-station-day rows into
+    # one draw, so 6 independent draws need 6 distinct station-days.
     rows = tuple(
-        _row(i, station=("LAX" if i % 2 == 0 else "MIA"), ask=("0.10" if i % 2 else "0.50"))
+        _row(
+            i,
+            station=("LAX" if i % 2 == 0 else "MIA"),
+            ask=("0.10" if i % 2 else "0.50"),
+            climate_day=f"2026-09-{11 + i:02d}",
+        )
         for i in range(6)
     )
     tally = tally_mod.build_family_tally_v2(rows, manifest=manifest, artefact=real_artefact)
@@ -1610,3 +1629,113 @@ def test_draft_manifest_never_prints_kill(tmp_path: Path, tally_mod: ModuleType)
     assert "KILL" not in report
     assert "SURVIVE" not in report
     assert "CONTINUE" not in report
+
+
+# ---------------------------------------------------------------------------
+# S4a (plan MULTI_POSITION_PER_STATION_2026-09-14, R3-2/R3-3): the
+# station-day combined draw, wired into build_family_tally_v2.
+# ---------------------------------------------------------------------------
+def test_a_single_fill_station_day_is_byte_identical_to_today(
+    tmp_path: Path, tally_mod: ModuleType
+) -> None:
+    """Regression floor (R3-2 merge gate): one fill per station-day (the
+    real invariant post-S1) drives `n` combined draws == `n` fills, exactly
+    as `pooled_rows` did before this slice."""
+    manifest = _manifest(tmp_path)
+    artefact = _synthetic_artefact(i_max=1000.0, n_max=100, look_step=5)
+    rows = _rows(5)  # 5 distinct station-days (see _rows' docstring)
+
+    tally = tally_mod.build_family_tally_v2(rows, manifest=manifest, artefact=artefact)
+
+    assert len(tally.looks) == 1
+    assert tally.looks[0].state.n == 5
+    expected_information = sum(
+        float(r.entry_ask + r.fee) * (1.0 - float(r.entry_ask + r.fee)) for r in rows
+    )
+    assert tally.looks[0].state.information == pytest.approx(expected_information)
+
+
+def test_two_rung_fills_on_one_station_day_are_one_draw(
+    tmp_path: Path, tally_mod: ModuleType
+) -> None:
+    """Two DIFFERENT rungs (distinct instrument_id) filled on the SAME
+    station-day count as ONE draw at the look, never two."""
+    manifest = _manifest(tmp_path)
+    artefact = _synthetic_artefact(i_max=1000.0, n_max=100, look_step=1)
+    row_a = _row(0, ask="0.30", held=True, climate_day="2026-09-11")
+    row_b = _row(1, ask="0.20", held=False, climate_day="2026-09-11")
+
+    tally = tally_mod.build_family_tally_v2(
+        (row_a, row_b), manifest=manifest, artefact=artefact
+    )
+
+    assert tally.n_scored == 2
+    assert len(tally.looks) == 1
+    assert tally.looks[0].state.n == 1
+
+
+def test_a_station_day_whose_break_evens_sum_above_one_is_refused_as_malformed_input_before_scoring(
+    tmp_path: Path, tally_mod: ModuleType
+) -> None:
+    manifest = _manifest(tmp_path)
+    artefact = _synthetic_artefact(i_max=1000.0, n_max=100, look_step=1)
+    row_a = _row(0, ask="0.60", held=True, climate_day="2026-09-11")
+    row_b = _row(1, ask="0.55", held=False, climate_day="2026-09-11")
+
+    with pytest.raises(tally_mod.ScoredTrialDataIntegrityError, match="malformed_input"):
+        tally_mod.build_family_tally_v2((row_a, row_b), manifest=manifest, artefact=artefact)
+
+
+def test_looks_are_ordered_by_the_earliest_fill_of_each_station_day(
+    tally_mod: ModuleType,
+) -> None:
+    """`_combined_draws_for_looks` groups by first-seen `(station,
+    climate_day)` in the ALREADY fill-ordered sequence, so the combined
+    draw for a station-day whose FIRST constituent filled earliest sorts
+    first, regardless of row order in the input list."""
+    row_lax_second_rung = _row(0, station="LAX", climate_day="2026-09-11", ask="0.10")
+    row_mia_first_rung = _row(1, station="MIA", climate_day="2026-09-12", ask="0.20")
+    row_lax_first_rung = _row(2, station="LAX", climate_day="2026-09-11", ask="0.15")
+    # Pre-ordered as `_ordered_for_looks` would deliver it: MIA's single
+    # fill is EARLIEST overall, then LAX's two rungs.
+    ordered = (row_mia_first_rung, row_lax_first_rung, row_lax_second_rung)
+
+    draws = tally_mod._combined_draws_for_looks(ordered)
+
+    assert len(draws) == 2
+    assert draws[0].n_constituents == 1  # MIA's single-rung draw, first
+    assert draws[1].n_constituents == 2  # LAX's two-rung combined draw, second
+
+
+def test_total_pnl_still_sums_constituent_rows(
+    tmp_path: Path, tally_mod: ModuleType
+) -> None:
+    manifest = _manifest(tmp_path)
+    artefact = _synthetic_artefact(i_max=1000.0, n_max=100, look_step=1)
+    row_a = _row(0, ask="0.30", held=True, climate_day="2026-09-11")
+    row_b = _row(1, ask="0.20", held=False, climate_day="2026-09-11")
+
+    tally = tally_mod.build_family_tally_v2(
+        (row_a, row_b), manifest=manifest, artefact=artefact
+    )
+
+    assert tally.total_pnl == row_a.pnl + row_b.pnl
+
+
+def test_the_v1_tally_is_untouched() -> None:
+    """S4a touches only v2 (`current_rung_hold_v2.py`/`family_tally_v2.py`)
+    -- v1's `live_family_tally.py` is byte-unmodified, checked against the
+    HEAD this slice's worktree branched from (cac3f63)."""
+    import hashlib
+    import subprocess
+
+    path = _SCRIPTS_ANALYSIS_DIR / "live_family_tally.py"
+    current = hashlib.sha256(path.read_bytes()).hexdigest()
+    frozen_bytes = subprocess.run(
+        ["git", "show", "cac3f63:scripts/analysis/live_family_tally.py"],
+        cwd=_REPO_ROOT,
+        capture_output=True,
+        check=True,
+    ).stdout
+    frozen = hashlib.sha256(frozen_bytes).hexdigest()
+    assert current == frozen

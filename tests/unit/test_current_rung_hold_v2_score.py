@@ -12,11 +12,15 @@ from decimal import Decimal
 import pytest
 
 from breezy.settlement.current_rung_hold_v2 import (
+    CombinedDraw,
     ScoreState,
+    StationDayAdmissionRefusal,
     StratumRow,
     break_even_row,
+    combine_station_day,
     information_fraction,
     score,
+    score_combined,
 )
 
 FEE_THETA = Decimal("0.06")
@@ -127,3 +131,115 @@ def test_score_state_is_a_frozen_dataclass_with_s_information_n() -> None:
     assert (state.s, state.information, state.n) == (1.0, 2.0, 3)
     with pytest.raises(Exception):  # noqa: B017 -- frozen dataclass raises FrozenInstanceError
         state.s = 5.0  # type: ignore[misc]
+
+
+# ---------------------------------------------------------------------------
+# S4a (plan MULTI_POSITION_PER_STATION_2026-09-14, R3-2/R3-3): the
+# station-day combined draw under the exact mutual-exclusivity variance.
+# ---------------------------------------------------------------------------
+def test_a_single_fill_station_day_is_byte_identical_to_today() -> None:
+    """Regression floor (R3-2 merge gate): k=1, qty=1 -- `combine_station_day`
+    plus `score_combined` over one draw per station-day must match `score()`
+    over the raw rows exactly."""
+    rows = (
+        _row("0.10", held=True),
+        _row("0.50", held=False),
+        _row("0.90", held=True),
+    )
+    direct = score(rows)
+    combined = tuple(combine_station_day((row,)) for row in rows)
+    via_combined = score_combined(combined)
+
+    assert via_combined.n == direct.n
+    assert math.isclose(via_combined.information, direct.information, abs_tol=1e-12)
+    assert math.isclose(via_combined.s, direct.s, abs_tol=1e-12)
+
+
+def test_two_rung_fills_on_one_station_day_are_one_draw() -> None:
+    """Numerically pinned example (R3-3): BE 0.30 and 0.20, held (1, 0) ->
+    X=0.5, Var = 0.21 + 0.16 - 2*0.06 = 0.25."""
+    row_a = StratumRow(entry_ask=Decimal("0.30"), fee=Decimal(0), held=True, station="MIA")
+    row_b = StratumRow(entry_ask=Decimal("0.20"), fee=Decimal(0), held=False, station="MIA")
+
+    draw = combine_station_day((row_a, row_b))
+
+    assert draw.n_constituents == 2
+    assert math.isclose(draw.x, 0.5, abs_tol=1e-12)
+    assert math.isclose(draw.variance, 0.25, abs_tol=1e-12)
+
+    state = score_combined((draw,))
+    assert state.n == 1
+
+
+def test_the_combined_draw_variance_uses_the_mutual_exclusivity_covariance() -> None:
+    """Three mutually exclusive rungs: Var = Sum BE_i(1-BE_i) - 2*Sum_{i<j} BE_i*BE_j."""
+    bes = (Decimal("0.10"), Decimal("0.20"), Decimal("0.15"))
+    held = (True, False, False)
+    rows = tuple(
+        StratumRow(entry_ask=be, fee=Decimal(0), held=h, station="MIA")
+        for be, h in zip(bes, held, strict=True)
+    )
+
+    draw = combine_station_day(rows)
+
+    bes_f = [float(b) for b in bes]
+    expected_variance = sum(b * (1 - b) for b in bes_f)
+    for i in range(3):
+        for j in range(i + 1, 3):
+            expected_variance -= 2 * bes_f[i] * bes_f[j]
+    expected_x = sum(
+        (1.0 if h else 0.0) - b for h, b in zip(held, bes_f, strict=True)
+    )
+
+    assert math.isclose(draw.variance, expected_variance, abs_tol=1e-12)
+    assert math.isclose(draw.x, expected_x, abs_tol=1e-12)
+
+
+def test_the_draw_is_a_function_of_a_qty_parameter_fixed_at_one() -> None:
+    """R3-2: qty is a wired PARAMETER (default 1), never a literal average --
+    proven by varying it, even though Increment A never passes qty != 1 in
+    a real caller."""
+    row_a = StratumRow(entry_ask=Decimal("0.30"), fee=Decimal(0), held=True, station="MIA")
+    row_b = StratumRow(entry_ask=Decimal("0.20"), fee=Decimal(0), held=False, station="MIA")
+    baseline = combine_station_day((row_a, row_b))
+
+    row_a_qty2 = StratumRow(
+        entry_ask=Decimal("0.30"), fee=Decimal(0), held=True, station="MIA", qty=Decimal(2),
+    )
+    weighted = combine_station_day((row_a_qty2, row_b))
+
+    be_a, be_b = 0.30, 0.20
+    expected_x = 2 * (1.0 - be_a) + 1 * (0.0 - be_b)
+    expected_variance = (
+        (2**2) * be_a * (1 - be_a) + (1**2) * be_b * (1 - be_b) - 2 * 2 * 1 * be_a * be_b
+    )
+
+    assert math.isclose(weighted.x, expected_x, abs_tol=1e-12)
+    assert math.isclose(weighted.variance, expected_variance, abs_tol=1e-12)
+    assert weighted.x != baseline.x
+    assert weighted.variance != baseline.variance
+
+
+def test_a_station_day_whose_bes_sum_above_one_is_refused_as_malformed_input() -> None:
+    row_a = StratumRow(entry_ask=Decimal("0.60"), fee=Decimal(0), held=True, station="MIA")
+    row_b = StratumRow(entry_ask=Decimal("0.55"), fee=Decimal(0), held=False, station="MIA")
+
+    with pytest.raises(StationDayAdmissionRefusal):
+        combine_station_day((row_a, row_b))
+
+
+def test_combine_station_day_raises_value_error_on_empty_rows() -> None:
+    with pytest.raises(ValueError):
+        combine_station_day(())
+
+
+def test_score_combined_raises_value_error_when_information_is_zero() -> None:
+    with pytest.raises(ValueError):
+        score_combined(())
+
+
+def test_combined_draw_is_a_frozen_dataclass() -> None:
+    draw = CombinedDraw(x=1.0, variance=2.0, n_constituents=1)
+    assert (draw.x, draw.variance, draw.n_constituents) == (1.0, 2.0, 1)
+    with pytest.raises(Exception):  # noqa: B017 -- frozen dataclass raises FrozenInstanceError
+        draw.x = 5.0  # type: ignore[misc]
