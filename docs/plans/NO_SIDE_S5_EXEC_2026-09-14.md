@@ -290,3 +290,12 @@ first live NO order under the E2-1 protocol.
 ### Track A resumes after a confirmation review of E5-1..E5-3
 Order: §2 (done, 36c6d99) → `leg_prices.py` + tests → §3 revised (wire inversion in `build_order_body`) → §4 revised
 (fill/status inversion + side-by-leg + declared values) → §1(a) census commit.
+
+### Rev 5a (architecture confirmation)
+- **E5-2 amended:** the venue side/intent VALUES table lives in `leg_prices.py` ONLY (the "or the existing reports-drift
+  declaration point" alternative is struck — that point is `reports.py`, under `exec/`, where the literals are banned).
+- **Verified facts:** the import-linter layers contract (`pyproject.toml [tool.importlinter]`) layers TOP-LEVEL packages
+  (`adapters` is one layer), so `exec/` importing `adapters/polymarket_us/leg_prices.py` is same-layer and legal; the X3 scan
+  root is `EXEC_PACKAGE_PATH_PREFIX = "src/breezy/adapters/polymarket_us/exec/"` (guard test :236), so `leg_prices.py` is
+  outside it; `intent_fingerprint` (`submit_chain.py:226-238`) hashes `order.price` — the Nautilus (NO-instrument) price, the
+  same on the create and GET paths, never the wire price. `_assert_market_matches` compares slug only.
