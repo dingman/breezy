@@ -1343,6 +1343,8 @@ Every venue-shape guard on a money surface MUST (1) emit the full names-only key
 ### How to apply
 Fixes: commits 8d56a26, ba2c5ee. Guards emit names-only key trees, allowlists are declared-and-logged per surface, resolver has backoff+age ceiling. Before accepting "shape drift handled", require: (a) the refusal names every field it saw, (b) the create path surfaces it visibly, (c) a test pins the new field as accepted post-fix. Related: L-17 (optional fields), L-22 (unforgeable primitives), L-36 (AMBIGUOUS semantics).
 
+**Addendum 2026-09-14 (third AMBIGUOUS, MIA CFJ485874TMM).** The surfaced error is only useful if it is READ. The coordinator theorised a classifier root cause ("no top-level order id") from a truncated key-tree line; the `fill_parse_error=` tail of the same AMBIGUOUS detail line (node log `breezy-trade-20260913T165011Z.log:533`) and the durable resolver context's `fillParseError` already named the five refused execution keys. Rule sharpened: before proposing any create-path classification change, quote the `fill_parse_error=` tail of the AMBIGUOUS detail line and the `exec/polymarket_us/resolver/<intent>` record's `fillParseError`; the `state=`/`cum=` detail tokens read top-level only and are never the diagnosis. Fix: `_EXECUTION_DRIFT_ALLOWED_KEYS` (commit 7a65e18, closes R-6); evidence `docs/evidence/venue/polymarket_us/CREATE_ORDER_EXECUTION_DRIFT_2026-09-13_MIA.md`. Last updated 2026-09-14.
+
 ## L-38 — A stop rule whose counter cannot increment is a missing stop, not a running clock (2026-09-12)
 
 ### What happened
@@ -1356,3 +1358,17 @@ Before citing any stop rule as active, read its counter artefact AND show that t
 
 ### How to apply
 At every readiness readout: (1) the counter's last value and the date it last changed; (2) the mechanism that would make it change tomorrow; (3) whether every registered family's tally actually receives the counter (the wrapper's argument gate, not the module's ability). If any of the three is unknown, the stop is MISSING. Related: L-5, L-8, L-20, L-32, L-35. Evidence: `docs/evidence/READINESS_AUDIT_2026-09-12.md`, `docs/plans/COVERAGE_KILL_CLOCK_2026-09-12.md`.
+
+## L-39 — Prose that names an operator-reserved control by its env-var name fails the census (2026-09-14)
+
+### What happened
+An untracked plan document (`docs/plans/MULTI_POSITION_PER_STATION_2026-09-14.md`) spelled out the two operator-control environment-variable names in its sizing formulas. The full gate on the live tree then failed `tests/unit/test_operator_control_assignment_scan.py::test_only_the_definition_module_names_an_operator_reserved_control` — the census walks every repo file, untracked included, and permits those names only in `operator.env*` and the definition module. The merged code was clean; the failure was the coordinator's own document.
+
+### Why this is binding
+The census is a security floor (no file but the definition module may even NAME a reserved control, so nothing can quietly assign, read, or leak it). A gate that fails on prose is doing its job; the fix is never to widen the census.
+
+### The rule
+Plans, evidence, memories and briefs refer to the reserved controls as "the per-position cap" and "the daily budget" — never by the environment-variable name. Before running the gate on a tree that carries a new untracked doc, grep that doc for the control names.
+
+### How to apply
+`grep -c "BREEZY_MAX" docs/plans/<new>.md` must print 0. Related: L-37 (declared drift per surface), the operator-control contract in PROGRESS.md.
