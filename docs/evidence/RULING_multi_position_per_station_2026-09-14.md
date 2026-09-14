@@ -51,7 +51,10 @@ must be re-run at the real qty distribution and pass; re-solve only then.
 **Operator ruling 2026-09-14 (budget question 1, CLOSED):** "per position is
 intended for per order spend, it is not the per station cap." The per-position
 cap bounds ONE ORDER; a station may carry several such orders across its rungs.
-Increment B S2 sizes each order against it. **Open operator-only question:** (2) the
+Increment B S2 sizes each order against it. **Operator ruling 2026-09-14 (budget question 2, CLOSED):** "the daily budget
+is the intended ceiling for the maximum spend in a single day. It's literally
+intended that once it reaches the maximum, it stops trading for the rest of the
+day." `DailySpendLedger` (seeded at connect by S0) is that stop. Formerly: (2) the
 daily budget is reachable in one afternoon across multiple stations × N
 rungs — confirm it is still the intended daily ceiling.
 **Hard invariants:** Nautilus immutable (extension-only); `allow_short`
