@@ -38,11 +38,13 @@ import score_live_trials as slt_module
 from score_live_trials import (
     _EXCLUDED_FILLS_ARTEFACT_NAME,
     _UNRESOLVED_TAKES_ARTEFACT_NAME,
+    RESIDUAL_EXCLUSION_REASONS,
     FillExclusion,
     FillSourceUnreadableError,
     NodeStorePreflightRefused,
     StorePositiveControlFailedError,
     UnresolvedTake,
+    _admit_fill,
     _append_excluded_fills,
     _append_unresolved_takes,
     _with_scheduled_release_at_ns,
@@ -54,6 +56,10 @@ from score_live_trials import (
 )
 
 from breezy.adapters.polymarket_us.exec.client import FILL_KEY_PREFIX, DurableFillRecord
+from breezy.adapters.polymarket_us.exec.no_side_keys import (
+    NO_SIDE_FIRST_LIVE_ORDER_KEY,
+    NO_SIDE_POSITION_SHAPE_CAPTURED_KEY,
+)
 from breezy.domain.nws_climate_day import CLIMATE_DAY_SCHEMA_VERSION, NwsClimateDay
 from breezy.domain.weather_bucket_facts import (
     CLIMATE_DAY_KEY,
@@ -280,7 +286,9 @@ def test_one_fill_and_one_taken_latch_yields_one_filled_trial(tmp_path: Path) ->
     )
     store.close()
 
-    trials, exclusions, fee_map = read_filled_trials_state_db(store_path, **_reader_kwargs())
+    trials, exclusions, fee_map, _no_side_map  = read_filled_trials_state_db(
+        store_path, **_reader_kwargs()
+    )
 
     assert exclusions == ()
     assert len(trials) == 1
@@ -316,12 +324,111 @@ def test_a_latch_carrying_the_new_venue_order_id_field_still_reads_identically(
     )
     store.close()
 
-    trials, exclusions, fee_map = read_filled_trials_state_db(store_path, **_reader_kwargs())
+    trials, exclusions, fee_map, _no_side_map  = read_filled_trials_state_db(
+        store_path, **_reader_kwargs()
+    )
 
     assert exclusions == ()
     assert len(trials) == 1
     assert trials[0].trial_id == latch_key
     assert fee_map[latch_key] == (True, "v1", False)
+
+
+# ---------------------------------------------------------------------------
+# NO-SIDE S5 (E2-1(iii)/E3-3): the bounded first-order residual protocol.
+# ---------------------------------------------------------------------------
+
+
+def test_the_trial_matching_the_pending_first_order_key_is_marked_residual(
+    tmp_path: Path,
+) -> None:
+    """While `NO_SIDE_FIRST_LIVE_ORDER_KEY` is present and
+    `NO_SIDE_POSITION_SHAPE_CAPTURED_KEY` is absent, the trial whose fill
+    instrument matches the key's `instrumentId` payload is threaded into
+    `no_side_residual_by_trial_id`, and excluded from n via `_admit_fill`."""
+    store_path = tmp_path / "state.sqlite"
+    store = SqliteStateStore(store_path)
+    latch_key = _seed_latch(store, ask=Decimal("0.40"))
+    _seed_fill(
+        store, venue_order_id="v1", cumulative_cost=Decimal("0.42"), cumulative_fee=Decimal("0.01")
+    )
+    store.set(
+        NO_SIDE_FIRST_LIVE_ORDER_KEY,
+        json.dumps({"instrumentId": _INSTRUMENT_ID, "venueOrderId": "v1", "tsNs": _BASE_NS}).encode(
+            "utf-8"
+        ),
+    )
+    store.close()
+
+    trials, exclusions, fee_map, no_side_map = read_filled_trials_state_db(
+        store_path, **_reader_kwargs()
+    )
+
+    assert exclusions == ()
+    assert len(trials) == 1
+    trial = trials[0]
+    assert trial.trial_id == latch_key
+    assert no_side_map == {latch_key: True}
+
+    exclusion = _admit_fill(
+        trial,
+        fee_reconciled=fee_map[latch_key][0],
+        venue_order_id=fee_map[latch_key][1],
+        no_side_residual=no_side_map.get(trial.trial_id, False),
+    )
+    assert exclusion is not None
+    assert exclusion.reason == "no_side_first_order_residual"
+    assert exclusion.reason in RESIDUAL_EXCLUSION_REASONS
+
+
+def test_a_trial_before_the_captured_key_is_marked_residual_and_after_is_not(
+    tmp_path: Path,
+) -> None:
+    """Termination (amendment §8 item 4): with the captured key present
+    too, the containment window is closed and the mapping is empty."""
+    store_path = tmp_path / "state.sqlite"
+    store = SqliteStateStore(store_path)
+    _seed_latch(store, ask=Decimal("0.40"))
+    _seed_fill(
+        store, venue_order_id="v1", cumulative_cost=Decimal("0.42"), cumulative_fee=Decimal("0.01")
+    )
+    store.set(
+        NO_SIDE_FIRST_LIVE_ORDER_KEY,
+        json.dumps({"instrumentId": _INSTRUMENT_ID}).encode("utf-8"),
+    )
+    store.set(NO_SIDE_POSITION_SHAPE_CAPTURED_KEY, b'{"rulingPath":"x"}')
+    store.close()
+
+    _trials, _exclusions, _fee_map, no_side_map = read_filled_trials_state_db(
+        store_path, **_reader_kwargs()
+    )
+
+    assert no_side_map == {}
+
+
+def test_a_trial_on_a_different_instrument_than_the_pending_key_is_not_marked(
+    tmp_path: Path,
+) -> None:
+    """Only the ONE trial matching the pending key's `instrumentId` is
+    marked -- a different instrument's trial (e.g. the sibling YES leg or
+    an unrelated station) is admissible."""
+    store_path = tmp_path / "state.sqlite"
+    store = SqliteStateStore(store_path)
+    _seed_latch(store, ask=Decimal("0.40"))
+    _seed_fill(
+        store, venue_order_id="v1", cumulative_cost=Decimal("0.42"), cumulative_fee=Decimal("0.01")
+    )
+    store.set(
+        NO_SIDE_FIRST_LIVE_ORDER_KEY,
+        json.dumps({"instrumentId": "some-other-instrument"}).encode("utf-8"),
+    )
+    store.close()
+
+    _trials, _exclusions, _fee_map, no_side_map = read_filled_trials_state_db(
+        store_path, **_reader_kwargs()
+    )
+
+    assert no_side_map == {}
 
 
 def test_no_taken_latch_is_excluded_with_blank_identity_fields(tmp_path: Path) -> None:
@@ -333,7 +440,9 @@ def test_no_taken_latch_is_excluded_with_blank_identity_fields(tmp_path: Path) -
     _seed_fill(store, venue_order_id="v1")
     store.close()
 
-    trials, exclusions, fee_map = read_filled_trials_state_db(store_path, **_reader_kwargs())
+    trials, exclusions, fee_map, _no_side_map  = read_filled_trials_state_db(
+        store_path, **_reader_kwargs()
+    )
 
     assert trials == ()
     assert fee_map == {}
@@ -354,7 +463,9 @@ def test_two_fill_records_on_one_latch_excludes_both_as_duplicate(tmp_path: Path
     _seed_fill(store, venue_order_id="v2")
     store.close()
 
-    trials, exclusions, fee_map = read_filled_trials_state_db(store_path, **_reader_kwargs())
+    trials, exclusions, fee_map, _no_side_map  = read_filled_trials_state_db(
+        store_path, **_reader_kwargs()
+    )
 
     assert trials == ()
     assert fee_map == {}
@@ -386,7 +497,7 @@ def test_v3_second_genuine_fill_is_duplicate_fill_not_duplicate_fill_for_latch(
     _seed_fill(store, venue_order_id="v2", cumulative_cost=Decimal("0.44"))
     store.close()
 
-    trials, exclusions, fee_map = read_filled_trials_state_db(
+    trials, exclusions, fee_map, _no_side_map = read_filled_trials_state_db(
         store_path, **_reader_kwargs(family_prefix=_V3_FAMILY_PREFIX),
     )
 
@@ -416,7 +527,7 @@ def test_v3_with_no_venue_order_id_on_the_latch_falls_back_to_v2_behaviour(
     _seed_fill(store, venue_order_id="v2")
     store.close()
 
-    trials, exclusions, _fee_map = read_filled_trials_state_db(
+    trials, exclusions, _fee_map, _no_side_map = read_filled_trials_state_db(
         store_path, **_reader_kwargs(family_prefix=_V3_FAMILY_PREFIX),
     )
 
@@ -443,7 +554,7 @@ def test_get_filled_duplicate_counts_once_in_residual(tmp_path: Path) -> None:
     )
     store.close()
 
-    trials, exclusions, _fee_map = read_filled_trials_state_db(
+    trials, exclusions, _fee_map, _no_side_map = read_filled_trials_state_db(
         store_path, **_reader_kwargs(family_prefix=_V3_FAMILY_PREFIX),
     )
 
@@ -502,7 +613,9 @@ def test_an_instrument_matching_more_than_one_taken_latch_is_ambiguous(tmp_path:
     _seed_fill(store, venue_order_id="v1")
     store.close()
 
-    trials, exclusions, fee_map = read_filled_trials_state_db(store_path, **_reader_kwargs())
+    trials, exclusions, fee_map, _no_side_map  = read_filled_trials_state_db(
+        store_path, **_reader_kwargs()
+    )
 
     assert trials == ()
     assert fee_map == {}
@@ -523,7 +636,9 @@ def test_a_paper_replay_latch_key_never_matches(tmp_path: Path) -> None:
     _seed_fill(store, venue_order_id="v1")
     store.close()
 
-    trials, _exclusions, _fee_map = read_filled_trials_state_db(store_path, **_reader_kwargs())
+    trials, _exclusions, _fee_map, _no_side_map  = read_filled_trials_state_db(
+        store_path, **_reader_kwargs()
+    )
 
     assert len(trials) == 1  # only the real latch joins; the paper key is inert
 
@@ -534,7 +649,9 @@ def test_an_open_writer_connection_does_not_block_the_read(tmp_path: Path) -> No
     _seed_latch(store)
     _seed_fill(store, venue_order_id="v1")
 
-    trials, exclusions, _fee_map = read_filled_trials_state_db(store_path, **_reader_kwargs())
+    trials, exclusions, _fee_map, _no_side_map  = read_filled_trials_state_db(
+        store_path, **_reader_kwargs()
+    )
 
     assert exclusions == ()
     assert len(trials) == 1
@@ -628,7 +745,7 @@ def test_a_latch_for_another_census_station_passes_the_positive_control(tmp_path
     _seed_latch(store, station="MDW", climate_day=_DAY_ISO, instrument_id="mdw-instr")
     store.close()
 
-    trials, exclusions, _fee_map = read_filled_trials_state_db(
+    trials, exclusions, _fee_map, _no_side_map = read_filled_trials_state_db(
         store_path, **_reader_kwargs(stations=("LAX", "MDW", "MIA", "SFO"))
     )
 
@@ -678,7 +795,7 @@ def test_a_fill_for_another_citys_taken_latch_is_skipped_not_excluded(tmp_path: 
     _seed_fill(store, venue_order_id="mdw-v1", instrument_id="mdw-instr")
     store.close()
 
-    lax_trials, lax_exclusions, lax_fee_map = read_filled_trials_state_db(
+    lax_trials, lax_exclusions, lax_fee_map, _no_side_map = read_filled_trials_state_db(
         store_path,
         **_reader_kwargs(city="LAX", cli_location="LAX", stations=("LAX", "MDW")),
     )
@@ -687,7 +804,7 @@ def test_a_fill_for_another_citys_taken_latch_is_skipped_not_excluded(tmp_path: 
     assert lax_trials[0].instrument_id == "lax-instr"
     assert lax_fee_map == {_latch_key("LAX", _DAY_ISO): (True, "lax-v1", False)}
 
-    mdw_trials, mdw_exclusions, mdw_fee_map = read_filled_trials_state_db(
+    mdw_trials, mdw_exclusions, mdw_fee_map, _no_side_map = read_filled_trials_state_db(
         store_path,
         **_reader_kwargs(city="MDW", cli_location="MDW", stations=("LAX", "MDW")),
     )
@@ -712,11 +829,11 @@ def test_no_taken_latch_anywhere_is_identical_across_every_citys_invocation(
     _seed_fill(store, venue_order_id="orphan-v1", instrument_id="no-such-instrument")
     store.close()
 
-    lax_trials, lax_exclusions, _lax_fee_map = read_filled_trials_state_db(
+    lax_trials, lax_exclusions, _lax_fee_map, _no_side_map = read_filled_trials_state_db(
         store_path,
         **_reader_kwargs(city="LAX", cli_location="LAX", stations=("LAX", "MDW")),
     )
-    mdw_trials, mdw_exclusions, _mdw_fee_map = read_filled_trials_state_db(
+    mdw_trials, mdw_exclusions, _mdw_fee_map, _no_side_map = read_filled_trials_state_db(
         store_path,
         **_reader_kwargs(city="MDW", cli_location="MDW", stations=("LAX", "MDW")),
     )
@@ -1504,7 +1621,7 @@ def test_v3_zero_keys_is_n0_not_store_failure(tmp_path: Path) -> None:
     store = SqliteStateStore(store_path)
     store.set("unrelated/key", b"x")
     store.close()
-    trials, exclusions, fees = read_filled_trials_state_db(
+    trials, exclusions, fees, _no_side_map = read_filled_trials_state_db(
         store_path,
         **_reader_kwargs(family_prefix="continuous_rung_hold/trial/"),
     )

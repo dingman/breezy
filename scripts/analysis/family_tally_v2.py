@@ -1139,7 +1139,7 @@ def v3_residual_from_fill_source(
     total = Decimal(0)
     for station in manifest.stations:
         try:
-            _trials, exclusions, _fee_map = read_filled_trials_state_db(
+            _trials, exclusions, _fee_map, _no_side_map = read_filled_trials_state_db(
                 fill_source,
                 family_prefix=manifest.trial_id_prefix,
                 city=station,
