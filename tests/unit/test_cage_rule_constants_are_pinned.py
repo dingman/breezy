@@ -862,10 +862,14 @@ CAGE_RULE_PINS: tuple[RulePin, ...] = (
     RulePin(
         module="firewall",
         attr="BANNED_EXEC_DIRECTION_TOKENS",
-        expected=frozenset({"_SHORT", "OUTCOME_SIDE_NO"}),
-        widened=frozenset({"_SHORT", "OUTCOME_SIDE_NO", "_LAY"}),
-        narrowed=frozenset({"_SHORT"}),
-        why="X3 (NS-2): direction vocabulary prohibited under exec/",
+        expected=frozenset({"_SHORT", "BUY_SHORT", "SELL_"}),
+        widened=frozenset({"_SHORT", "BUY_SHORT", "SELL_", "_LAY"}),
+        narrowed=frozenset({"_SHORT", "BUY_SHORT"}),
+        why="X3 (R3-3, NO-side S5): direction vocabulary prohibited under "
+        "exec/, narrowed per docs/evidence/RULING_x3_no_outcome_token_"
+        "2026-09-14.md -- OUTCOME_SIDE_NO is required by the live NO order "
+        "body and no longer banned; BUY_SHORT (SDK-snapshot-only) and SELL_ "
+        "(naked short) are banned instead",
     ),
 )
 

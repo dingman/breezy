@@ -248,8 +248,13 @@ BANNED_NATIVE_NAMES = frozenset({"SandboxExecutionClient", "BettingAccount"})
 BANNED_ACCOUNT_TYPE_MEMBER = "BETTING"
 BANNED_NATIVE_MODULE_SUBSTRING = "accounting.accounts.betting"
 
-#: X3 -- direction vocabulary prohibited anywhere under ``exec/``.
-BANNED_EXEC_DIRECTION_TOKENS = frozenset({"_SHORT", "OUTCOME_SIDE_NO"})
+#: X3 -- direction vocabulary prohibited anywhere under ``exec/``. Narrowed
+#: under ``docs/evidence/RULING_x3_no_outcome_token_2026-09-14.md``: the live
+#: order body requires ``outcomeSide=OUTCOME_SIDE_NO`` for the NO leg, so that
+#: token is admitted; ``BUY_SHORT`` (SDK-snapshot-only, never exercised live)
+#: and ``SELL_`` (naked-short vocabulary, ``allow_short=False``) are banned
+#: instead.
+BANNED_EXEC_DIRECTION_TOKENS = frozenset({"_SHORT", "BUY_SHORT", "SELL_"})
 
 
 # ==========================================================================
@@ -1258,8 +1263,29 @@ def scan_banned_native_constructs(
     ]
 
 
-def _is_one(node: ast.expr) -> bool:
-    """True for ``1``, ``1.0``, and one-argument constructors of either."""
+def _name_bound_to_one(name: str, tree: ast.Module) -> bool:
+    """True if ``name`` is assigned a one-valued literal at MODULE level.
+
+    Module level only (``ast.iter_child_nodes``, not ``ast.walk``): a local
+    ``ONE = 1`` shadowing an unrelated module constant must not resolve
+    through the module binding, and this scan never needs it to.
+    """
+    for stmt in ast.iter_child_nodes(tree):
+        if (
+            isinstance(stmt, ast.Assign)
+            and len(stmt.targets) == 1
+            and isinstance(stmt.targets[0], ast.Name)
+            and stmt.targets[0].id == name
+            and _is_one(stmt.value, tree)
+        ):
+            return True
+    return False
+
+
+def _is_one(node: ast.expr, tree: ast.Module | None = None) -> bool:
+    """True for ``1``, ``1.0``, one-argument constructors of either, or (R3-4
+    widening) an ``ast.Name`` bound at module level in ``tree`` to one of
+    those forms -- never a bare name allowlist."""
     if isinstance(node, ast.Constant) and isinstance(node.value, int | float):
         return bool(node.value == 1)
     if (
@@ -1272,6 +1298,8 @@ def _is_one(node: ast.expr) -> bool:
             return value.strip() in {"1", "1.0"}
         if isinstance(value, int | float):
             return bool(value == 1)
+    if isinstance(node, ast.Name) and tree is not None:
+        return _name_bound_to_one(node.id, tree)
     return False
 
 
@@ -1297,7 +1325,12 @@ def find_exec_direction_violations(path: str, source: str) -> list[Violation]:
                 Violation(path, 0, "X3", f"carries the banned direction token {token!r}")
             )
     for node in ast.walk(tree):
-        if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Sub) and _is_one(node.left):
+        is_complement_sub = (
+            isinstance(node, ast.BinOp)
+            and isinstance(node.op, ast.Sub)
+            and _is_one(node.left, tree)
+        )
+        if is_complement_sub:
             found.append(
                 Violation(
                     path,
@@ -1570,10 +1603,15 @@ def test_x3_the_live_scan_actually_reaches_the_exec_package() -> None:
 
 @pytest.mark.parametrize("token", sorted(BANNED_EXEC_DIRECTION_TOKENS))
 def test_x3_detects_each_banned_token_in_planted_exec_source(token: str) -> None:
+    """At least one violation names the planted token. Not an exact count of
+    one: ``BUY_SHORT`` literally contains ``_SHORT`` as a substring, so
+    planting it also (correctly) trips the ``_SHORT`` ban -- a superset
+    detection, never a missed one."""
     source = f'"""Docstring."""\n\nINTENT = "ORDER_INTENT_SELL{token}"\n'
     violations = find_exec_direction_violations(f"{EXEC_PACKAGE_PATH_PREFIX}reports.py", source)
-    assert [v.rule for v in violations] == ["X3"]
-    assert token in violations[0].detail
+    assert violations, f"expected at least one X3 violation for {token!r}"
+    assert all(v.rule == "X3" for v in violations)
+    assert any(token in v.detail for v in violations)
 
 
 def test_x3_detects_a_banned_token_split_across_an_implicit_concatenation() -> None:
@@ -1584,12 +1622,12 @@ def test_x3_detects_a_banned_token_split_across_an_implicit_concatenation() -> N
     ``ast.Constant``, so the AST pass does see it. Conversely the AST pass
     cannot see an identifier or a comment, which the raw-text pass can.
 
-    Residual, stated rather than claimed away: an EXPLICIT ``"OUTCOME_SIDE_"
-    + "NO"`` is folded by neither, and is not detected. The ban is a
-    prohibition on the vocabulary, not a proof of semantic absence.
+    Residual, stated rather than claimed away: an EXPLICIT ``"SELL" + "_"``
+    is folded by neither, and is not detected. The ban is a prohibition on
+    the vocabulary, not a proof of semantic absence.
     """
-    source = 'SIDE = "OUTCOME_SIDE_" "NO"\n'
-    assert "OUTCOME_SIDE_NO" not in source
+    source = 'SIDE = "SEL" "L_"\n'
+    assert "SELL_" not in source
     violations = find_exec_direction_violations(f"{EXEC_PACKAGE_PATH_PREFIX}reports.py", source)
     assert [v.rule for v in violations] == ["X3"]
 
@@ -1619,6 +1657,63 @@ def test_x3_does_not_fire_outside_the_exec_package() -> None:
     """``risk.py``'s correct-in-context comment is why this scope exists."""
     source = "OUTCOME_SIDE_NO = 'no'\n\n\ndef no_price(price):\n    return 1 - price\n"
     assert find_exec_direction_violations("src/breezy/strategy/risk.py", source) == []
+
+
+# ==========================================================================
+# R3-3/R3-4 -- X3 narrowed to admit OUTCOME_SIDE_NO, ONE-guard widened
+# ==========================================================================
+
+
+def test_the_exec_direction_scan_refuses_a_planted_BUY_SHORT() -> None:
+    """``BUY_SHORT`` stays banned: an SDK-snapshot-only artifact never
+    exercised by the live venue schema (ruling docs/evidence/
+    RULING_x3_no_outcome_token_2026-09-14.md section 2). ``BUY_SHORT``
+    literally contains ``_SHORT``, so both bans fire -- a superset
+    detection, not a bug."""
+    source = '"""Docstring."""\n\nINTENT = "BUY_SHORT"\n'
+    violations = find_exec_direction_violations(f"{EXEC_PACKAGE_PATH_PREFIX}reports.py", source)
+    assert violations
+    assert all(v.rule == "X3" for v in violations)
+    assert any("BUY_SHORT" in v.detail for v in violations)
+
+
+def test_the_exec_direction_scan_refuses_a_planted_SELL_underscore() -> None:
+    """``SELL_`` stays banned: a naked short exceeds ``allow_short=False``."""
+    source = '"""Docstring."""\n\nINTENT = "SELL_LONG"\n'
+    violations = find_exec_direction_violations(f"{EXEC_PACKAGE_PATH_PREFIX}reports.py", source)
+    assert [v.rule for v in violations] == ["X3"]
+    assert "SELL_" in violations[0].detail
+
+
+def test_the_exec_direction_scan_admits_OUTCOME_SIDE_NO_in_the_order_body() -> None:
+    """The narrowed set no longer bans ``OUTCOME_SIDE_NO``: the live NO order
+    body must be able to carry it under ``exec/``."""
+    source = '"""Docstring."""\n\nOUTCOME_SIDE = "OUTCOME_SIDE_NO"\n'
+    assert find_exec_direction_violations(f"{EXEC_PACKAGE_PATH_PREFIX}reports.py", source) == []
+
+
+def test_the_exec_direction_scan_refuses_a_planted_ONE_minus_price() -> None:
+    """R3-4 widening: a module-level ``ONE`` name resolved through the SAME
+    tree still trips the complement-arithmetic guard, never a bare name
+    allowlist."""
+    source = (
+        "from decimal import Decimal\n\n"
+        "ONE = Decimal(1)\n\n\n"
+        "def no_price(price):\n"
+        "    return ONE - price\n"
+    )
+    violations = find_exec_direction_violations(f"{EXEC_PACKAGE_PATH_PREFIX}reports.py", source)
+    assert [v.rule for v in violations] == ["X3"]
+    assert "complement" in violations[0].detail
+
+
+def test_the_literal_one_minus_form_still_trips_after_the_widening() -> None:
+    """Non-regression: the pre-existing literal-``1`` detection path (not the
+    new Name-resolution path) still fires after the widening."""
+    source = "def no_price(price):\n    return 1 - price\n"
+    violations = find_exec_direction_violations(f"{EXEC_PACKAGE_PATH_PREFIX}reports.py", source)
+    assert [v.rule for v in violations] == ["X3"]
+    assert "complement" in violations[0].detail
 
 
 # ==========================================================================
@@ -3063,6 +3158,13 @@ def test_x1_the_live_scan_actually_reaches_a_test_that_imports_the_exec_package(
     # still `==`; the module carries no `SOCKET_RESTORING_MARKERS` and
     # constructs no client -- it drives `ContinuousRungHoldStrategy`
     # through the SAME registered-strategy-direct-handler-call harness.
+    # Old -> new (this row, NO-side S5, section 2 E2-5 safety pin): added
+    # `tests/unit/test_no_side_submit_chain_2026_09_14.py`, which imports
+    # `submit_chain` directly to prove `_outcome_token`/`build_order_body`
+    # refuse a NO-leg order before section 3's leg-keyed mapping lands.
+    # WIDENED, not relaxed (L-6/L-12): the comparison is still `==`; the
+    # module carries no `SOCKET_RESTORING_MARKERS` and constructs no client
+    # -- `submit_chain` is the pure-helpers module, no socket either.
     assert exec_importing_test_modules() == {
         "tests/contract/test_exec_client_reconciliation_contract.py",
         "tests/contract/test_exec_client_wiring_contract.py",
@@ -3086,6 +3188,7 @@ def test_x1_the_live_scan_actually_reaches_a_test_that_imports_the_exec_package(
         "tests/unit/test_live_family_tally_fill_source_cli.py",
         "tests/unit/test_polymarket_us_exec_snapshot_drift.py",
         "tests/unit/test_polymarket_us_factories.py",
+        "tests/unit/test_no_side_submit_chain_2026_09_14.py",
         "tests/unit/test_polymarket_us_startup_evidence.py",
         "tests/unit/test_polymarket_us_submit_order_chain.py",
         "tests/unit/test_polymarket_us_write_sequence.py",

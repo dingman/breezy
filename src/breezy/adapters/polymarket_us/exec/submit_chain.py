@@ -2,8 +2,12 @@
 
 No I/O, no awaits, no network client. ``_submit_order`` is the one chokepoint;
 this module classifies order shape, encodes the venue body, and classifies the
-create-order response. X3 bans the NO-outcome constant under ``exec/``: a
-NO instrument is unmappable rather than encoded.
+create-order response. X3 (see the firewall guard's banned-token set) admits
+the outcome-side-NO constant per the ruling at
+``docs/evidence/RULING_x3_no_outcome_token_2026-09-14.md``, while still
+banning the naked-short vocabulary it replaced; ``_outcome_token`` maps a
+NO order via ``leg_of(instrument.id)``, never by reading the free-text
+outcome string.
 """
 
 from __future__ import annotations
