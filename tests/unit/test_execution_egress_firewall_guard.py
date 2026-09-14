@@ -3088,6 +3088,16 @@ def test_x1_the_live_scan_actually_reaches_a_test_that_imports_the_exec_package(
     # imports the same `exec.no_side_keys` constants to seed/assert the
     # durable keys the new CLI reads and writes. WIDENED, not relaxed: the
     # module carries no `SOCKET_RESTORING_MARKERS` and constructs no client.
+    #
+    # Old -> new (NO-SIDE S5, Track B commit 3, E3-8): added
+    # `tests/unit/test_no_side_boot_reconcile_2026_09_14.py`, which imports
+    # `DurableFillRecord` from `exec.client` (the same plain-data-record
+    # shape as its siblings, above) and `NO_SIDE_FIRST_LIVE_ORDER_KEY` from
+    # `exec.no_side_keys` to prove the boot-reconcile write. WIDENED, not
+    # relaxed: the module carries no `SOCKET_RESTORING_MARKERS` and
+    # constructs no client -- it drives `PolymarketUSExecutionClient`
+    # through the SAME `_build_rig`/`_connect`/`_disconnect` harness every
+    # sibling exec-client suite uses.
     assert exec_importing_test_modules() == {
         "tests/contract/test_exec_client_reconciliation_contract.py",
         "tests/contract/test_exec_client_wiring_contract.py",
@@ -3110,6 +3120,7 @@ def test_x1_the_live_scan_actually_reaches_a_test_that_imports_the_exec_package(
         "tests/unit/test_fill_time_count.py",
         "tests/unit/test_live_family_tally_fill_source_cli.py",
         "tests/unit/test_mark_no_side_position_captured_cli.py",
+        "tests/unit/test_no_side_boot_reconcile_2026_09_14.py",
         "tests/unit/test_no_side_keys.py",
         "tests/unit/test_polymarket_us_exec_snapshot_drift.py",
         "tests/unit/test_polymarket_us_factories.py",

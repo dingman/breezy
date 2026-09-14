@@ -271,6 +271,7 @@ from breezy.adapters.polymarket_us.exec.endpoints import (
     ACCOUNT_BALANCES_PATH,
     PORTFOLIO_POSITIONS_PATH,
 )
+from breezy.adapters.polymarket_us.exec.no_side_keys import NO_SIDE_FIRST_LIVE_ORDER_KEY
 from breezy.adapters.polymarket_us.exec.refusals import (
     ClassifiedRefusal,
     PrivateReadRefused,
@@ -300,7 +301,11 @@ from breezy.adapters.polymarket_us.safety import (
     seed_permit_budget_from_prior_spend,
     unrestore_live_trading_budget,
 )
-from breezy.adapters.polymarket_us.symbology import instrument_id_to_slug, slug_to_instrument_id
+from breezy.adapters.polymarket_us.symbology import (
+    instrument_id_to_slug,
+    leg_of,
+    slug_to_instrument_id,
+)
 from breezy.ingest.gate import assert_state_store_durable
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
@@ -1231,6 +1236,14 @@ class PolymarketUSExecutionClient(LiveExecutionClient):
             # read below -- a mid-day relaunch must not re-grant budget a
             # prior process in this same calendar day already spent.
             self._seed_spend_from_durable_fills()
+            # NO-SIDE S5 (E3-8/E4-1/E4-5): the equivalent boot-time trigger
+            # for the bounded first-order containment window -- runs
+            # immediately AFTER the spend seed (same walk target: today's
+            # durable fill records), via `self._store_set`, no flock, no
+            # `await` in between (same unlocked-write pattern as
+            # `_reconcile_submit_intent`/`record_fill`), so it lands before
+            # the resolver's NEXT periodic pass, not before its first.
+            self._reconcile_no_side_first_order_key()
             # C1 (plan rev 6.1): the strategy's never-arm gate needs FRESH
             # startup evidence, taken AFTER reconciliation -- last, not
             # first, so a position opened or closed by whatever reconcile
@@ -1342,6 +1355,55 @@ class PolymarketUSExecutionClient(LiveExecutionClient):
         self._log.info(
             f"seeded from {count} fill record(s) for {today.isoformat()}"
         )
+
+    def _reconcile_no_side_first_order_key(self) -> None:
+        """NO-SIDE S5 (E3-8/E4-1/E4-5): the equivalent, fail-closed boot
+        trigger for the bounded first-order containment window (PREREG
+        amendment §8 item 1b). If any NO-leg :class:`DurableFillRecord`
+        exists (a crash between a Track A create-path submission and its
+        own key write) while :data:`NO_SIDE_FIRST_LIVE_ORDER_KEY` is still
+        absent, this writes it here -- before the resolver's next periodic
+        pass -- so the containment window is entered even on that crash
+        path. Idempotent: a second boot with the key already present is a
+        no-op, and the key is never overwritten once set.
+
+        Walks the SAME per-instrument ``FILL_INDEX_KEY_PREFIX`` index
+        :meth:`_seed_spend_from_durable_fills` already walks, filtered to
+        NO-leg instruments (:func:`leg_of`) -- never a full-store scan.
+        Never raises: an unreadable fill index for one instrument is
+        already fatal to the SEED above (which runs first and would have
+        raised), so by the time control reaches here every index this
+        client's provider names is known-readable.
+        """
+        if self._store_get(NO_SIDE_FIRST_LIVE_ORDER_KEY) is not None:
+            return
+        for instrument in self._instrument_provider.list_all():
+            if leg_of(instrument.id) != "no":
+                continue
+            instrument_id = str(instrument.id)
+            index_key = f"{FILL_INDEX_KEY_PREFIX}{instrument_id}"
+            indexed = self._read_fill_index(index_key)
+            if not indexed:
+                continue
+            venue_order_id = indexed[0]
+            raw = self._store_get(f"{FILL_KEY_PREFIX}{venue_order_id}")
+            if raw is None:
+                continue
+            record = DurableFillRecord.from_bytes(raw)
+            payload = {
+                "instrumentId": record.instrument_id,
+                "venueOrderId": record.venue_order_id,
+                "tsNs": record.ts_event,
+            }
+            self._store_set(
+                NO_SIDE_FIRST_LIVE_ORDER_KEY,
+                json.dumps(payload, sort_keys=True).encode("utf-8"),
+            )
+            self._log.info(
+                "no_side_first_order_key: written at boot reconcile "
+                f"for instrument {instrument_id}"
+            )
+            return
 
     def _resolver_poll_interval_secs(self) -> float:
         """Overridable seam: tests shrink this to iterate the loop fast."""
