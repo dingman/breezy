@@ -29,6 +29,8 @@ from nautilus_trader.model.objects import Money, Price, Quantity
 
 from breezy.adapters.polymarket_us.errors import ExecutionReportMappingError, VenueTransportError
 from breezy.adapters.polymarket_us.exec.reports import _key_tree, parse_fill_report
+from breezy.adapters.polymarket_us.parsing import LEG_KEY, LEG_NO
+from breezy.adapters.polymarket_us.symbology import leg_of
 from breezy.adapters.polymarket_us.transport import VenueResponse
 
 logger = logging.getLogger(__name__)
@@ -108,8 +110,8 @@ _LATCH_ARM_REFUSAL_TYPES: Final[frozenset[str]] = frozenset(
         "SubmitIntentLockNotHeld",
     }
 )
-_YES_OUTCOME: Final[str] = "yes"
 _OUTCOME_SIDE_YES: Final[str] = "OUTCOME_SIDE_YES"
+_OUTCOME_SIDE_NO: Final[str] = "OUTCOME_SIDE_NO"
 _ORDER_ACTION_BUY: Final[str] = "ORDER_ACTION_BUY"
 _ORDER_TYPE_LIMIT: Final[str] = "ORDER_TYPE_LIMIT"
 _TIF_IOC: Final[str] = "TIME_IN_FORCE_IMMEDIATE_OR_CANCEL"
@@ -246,16 +248,25 @@ def order_fingerprint_bytes(order: object) -> bytes:
 
 
 def _outcome_token(instrument: object) -> str | None:
-    outcome = getattr(instrument, "outcome", None)
-    if not isinstance(outcome, str) or not outcome.strip():
-        info = getattr(instrument, "info", None)
-        if isinstance(info, Mapping):
-            outcome = info.get("outcome")
-    if not isinstance(outcome, str):
+    """Map ``instrument`` to its order-body ``outcomeSide`` value.
+
+    Keyed on :func:`leg_of` (the composite ``InstrumentId``), NEVER on the
+    free-text ``outcome`` string -- the parse the parent plan forbids
+    (``parsing.py:1211-1221``). ``info[LEG_KEY]`` is a cross-check that must
+    agree; disagreement is a refusal (``ValueError``), never a fallback.
+    Returns ``None`` only when the instrument carries no resolvable id.
+    """
+    instrument_id = getattr(instrument, "id", None)
+    if instrument_id is None:
         return None
-    if outcome.strip().casefold() == _YES_OUTCOME:
-        return _OUTCOME_SIDE_YES
-    return None
+    id_leg = leg_of(instrument_id)
+    info = getattr(instrument, "info", None)
+    info_leg = info.get(LEG_KEY) if isinstance(info, Mapping) else None
+    if info_leg is not None and info_leg != id_leg:
+        raise ValueError(
+            f"instrument id leg {id_leg!r} contradicts info[{LEG_KEY!r}]={info_leg!r}; refusing"
+        )
+    return _OUTCOME_SIDE_NO if id_leg == LEG_NO else _OUTCOME_SIDE_YES
 
 
 def unmappable_order_reason(order: object, instrument: object) -> str | None:
@@ -293,8 +304,12 @@ def unmappable_order_reason(order: object, instrument: object) -> str | None:
     has_trigger = getattr(order, "has_trigger_price", False)
     if has_trigger is True or (callable(has_trigger) and has_trigger()):
         return "trigger_price is not mappable; refusing"
-    if _outcome_token(instrument) is None:
-        return "no YES outcome leg is derivable from the instrument; refusing"
+    try:
+        outcome_side = _outcome_token(instrument)
+    except ValueError as exc:
+        return str(exc)
+    if outcome_side is None:
+        return "no order-body outcome side is derivable from the instrument; refusing"
     return None
 
 
@@ -307,7 +322,7 @@ def build_order_body(order: object, instrument: object) -> dict[str, Any]:
     slug = str(getattr(instrument, "raw_symbol", "") or "")
     outcome_side = _outcome_token(instrument)
     if outcome_side is None:
-        raise ValueError("no YES outcome leg is derivable from the instrument; refusing")
+        raise ValueError("no order-body outcome side is derivable from the instrument; refusing")
     return {
         "marketSlug": slug,
         "type": _ORDER_TYPE_LIMIT,
