@@ -1560,7 +1560,15 @@ class TestRefuseIfSiblingLegTraded:
         assert record is not None
         assert record.instrument_id == NO_INSTRUMENT_ID
         keys = _committed_keys(store_path)
-        assert f"current_rung_hold/trial/{STATION}/{CLIMATE_DAY}/{NO_INSTRUMENT_ID}" in keys
+        # Safety review finding 1 (2026-09-14, commit f2d33f4): `_key` now
+        # normalises every `key_instrument_id` to the DOTTED canonical form
+        # (`_dotted_key_id`) so a record written under the bare symbol and
+        # one written under the dotted `str(InstrumentId)` resolve to the
+        # SAME durable key -- the committed key is dotted, not bare.
+        assert (
+            f"current_rung_hold/trial/{STATION}/{CLIMATE_DAY}/{NO_INSTRUMENT_ID}.POLYMARKET_US"
+            in keys
+        )
 
     def test_mid_day_relaunch_a_fresh_process_still_sees_a_yes_trial_from_the_sibling(
         self, store_path: Path,

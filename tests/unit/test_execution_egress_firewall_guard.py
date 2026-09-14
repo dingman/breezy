@@ -3050,12 +3050,26 @@ def test_x1_the_live_scan_actually_reaches_a_test_that_imports_the_exec_package(
     # client -- it drives `ContinuousRungHoldBacktestStrategy` through the
     # SAME registered-strategy-direct-handler-call harness every sibling
     # continuous-strategy suite uses, never a socket.
+    #
+    # Old -> new (this row, safety review finding 1/2 fix, S3b NO-side
+    # shadow wiring): added `tests/unit/test_continuous_rung_hold_no_side_
+    # shadow_2026_09_14.py`, which imports `DurableFillRecord`/`FILL_KEY_
+    # PREFIX`/`FILL_INDEX_KEY_PREFIX` from `exec.client` (the SAME plain-
+    # data-record + plain-string-constant shape as its sibling `test_
+    # continuous_rung_hold_fill_wiring.py`, above) to seed a durable venue
+    # fill directly, proving the strategy's `TrialDayLatch.iter_fill_
+    # records`-based admission enumeration finds a fill absent from
+    # `self._facts`. WIDENED, not relaxed (L-6/L-12): the comparison is
+    # still `==`; the module carries no `SOCKET_RESTORING_MARKERS` and
+    # constructs no client -- it drives `ContinuousRungHoldStrategy`
+    # through the SAME registered-strategy-direct-handler-call harness.
     assert exec_importing_test_modules() == {
         "tests/contract/test_exec_client_reconciliation_contract.py",
         "tests/contract/test_exec_client_wiring_contract.py",
         "tests/contract/test_live_fill_scoring_chain_contract.py",
         "tests/unit/test_continuous_rung_hold_backtest_only.py",
         "tests/unit/test_continuous_rung_hold_fill_wiring.py",
+        "tests/unit/test_continuous_rung_hold_no_side_shadow_2026_09_14.py",
         "tests/unit/test_continuous_rung_hold_strategy.py",
         "tests/unit/test_current_rung_hold_ambiguous_resolver.py",
         "tests/unit/test_current_rung_hold_order_submission_wiring.py",
