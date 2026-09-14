@@ -65,7 +65,7 @@ import datetime as dt
 import sys
 from collections import defaultdict
 from collections.abc import Iterable, Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Final, Literal
 
@@ -339,6 +339,17 @@ class ArchiveCell:
     m: int | None
     n: int
     hold_count: int
+    #: Cached at construction (`__post_init__`) from ONE `wilson_interval`
+    #: call, or `None` below `N_MIN` -- `p_hold_lower`/`p_hold_upper` are
+    #: destructured from this single raw float pair, never two independent
+    #: calls, so `upper >= lower` is structural (N2-4/R3-9).
+    _interval: tuple[float, float] | None = field(
+        default=None, init=False, repr=False, compare=False
+    )
+
+    def __post_init__(self) -> None:
+        interval = None if self.n < N_MIN else wilson_interval(self.hold_count, self.n)
+        object.__setattr__(self, "_interval", interval)
 
     @property
     def hold_rate(self) -> float:
@@ -351,22 +362,18 @@ class ArchiveCell:
         `None`, never `0.0`: an under-powered cell is UNDEFINED, not the worst
         possible cell in the table (SS1: "empty cell = n/a, never 0").
         """
-        if self.n < N_MIN:
-            return None
-        return wilson_interval(self.hold_count, self.n)[0]
+        return None if self._interval is None else self._interval[0]
 
     @property
     def p_hold_upper(self) -> float | None:
         """Wilson 95% UPPER bound on hold, or `None` below `N_MIN`.
 
-        Same `wilson_interval` call (same raw float pair) as `p_hold_lower`,
-        so the two bounds never disagree at a boundary cell -- the NO-side
-        edge estimand `p_miss_lower := 1 - P_HOLD_UPPER[key]` (NO_SIDE_EDGE
-        plan §2, N2-4/R3-9) depends on that consistency.
+        Destructured from the SAME cached `_interval` as `p_hold_lower`, so
+        the two bounds never disagree at a boundary cell -- the NO-side edge
+        estimand `p_miss_lower := 1 - P_HOLD_UPPER[key]` (NO_SIDE_EDGE plan
+        §2, N2-4/R3-9) depends on that consistency.
         """
-        if self.n < N_MIN:
-            return None
-        return wilson_interval(self.hold_count, self.n)[1]
+        return None if self._interval is None else self._interval[1]
 
 
 def aggregate_hold_cases(cases: Iterable[HoldCase]) -> dict[ArchiveCellKey, ArchiveCell]:

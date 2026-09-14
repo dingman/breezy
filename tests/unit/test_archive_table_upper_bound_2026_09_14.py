@@ -128,6 +128,90 @@ def test_corpus_sha256_is_unchanged(archive_table: ModuleType) -> None:
     assert archive_table.CORPUS_SHA256 == _PINNED_CORPUS_SHA256
 
 
+def test_wilson_interval_is_called_exactly_once_per_cell_via_archive_cell(
+    generator: ModuleType, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Structural pin: `ArchiveCell` calls `wilson_interval` ONCE per cell.
+
+    Reading both `p_hold_lower` and `p_hold_upper` (repeatedly) must not
+    trigger a second call -- the two bounds are destructured from ONE raw
+    Wilson float pair, cached at construction, so `upper >= lower` is
+    structural rather than an accident of the function being pure
+    (N2-4/R3-9, review follow-up item 1).
+    """
+    import mb_current_rung_edge_study as study
+    from mb_current_rung_edge_study import ArchiveCell
+
+    calls: list[tuple[int, int]] = []
+    original = study.wilson_interval
+
+    def _spy(successes: int, total: int, **kwargs: object) -> tuple[float, float]:
+        calls.append((successes, total))
+        return original(successes, total, **kwargs)
+
+    monkeypatch.setattr(study, "wilson_interval", _spy)
+
+    cell = ArchiveCell(
+        city="MDW", season="SON", hour=12, width="interior_2F", m=0, n=455, hold_count=291
+    )
+    _ = cell.p_hold_lower
+    _ = cell.p_hold_upper
+    _ = cell.p_hold_lower  # a repeat read must not call again
+    _ = cell.p_hold_upper  # a repeat read must not call again
+
+    assert calls == [(291, 455)], f"expected exactly one wilson_interval call, got {calls}"
+
+
+def test_wilson_interval_is_called_exactly_once_per_cell_via_aggregate_hold_cases(
+    generator: ModuleType, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Same structural pin, exercised through the real cell-construction path.
+
+    `aggregate_hold_cases` is what `build_archive_table` (and hence
+    `build_frozen_table`) calls to build each `ArchiveCell` from raw
+    `HoldCase`s -- a small synthetic corpus (one cell, n=455 by repeating a
+    single case) must produce exactly one `wilson_interval` call for that
+    cell, not two.
+    """
+    import datetime as dt
+
+    import mb_current_rung_edge_study as study
+
+    calls: list[tuple[int, int]] = []
+    original = study.wilson_interval
+
+    def _spy(successes: int, total: int, **kwargs: object) -> tuple[float, float]:
+        calls.append((successes, total))
+        return original(successes, total, **kwargs)
+
+    monkeypatch.setattr(study, "wilson_interval", _spy)
+
+    n, hold_count = 455, 291
+    cases = [
+        study.HoldCase(
+            city="MDW",
+            climate_day=dt.date(2024, 1, 1),
+            season="SON",
+            hour=12,
+            running_f=70,
+            settled_f=70,
+            width="interior_2F",
+            m=0,
+            held=index < hold_count,
+        )
+        for index in range(n)
+    ]
+    archive = study.aggregate_hold_cases(cases)
+    (cell,) = archive.values()
+    assert cell.n == n
+    assert cell.hold_count == hold_count
+
+    _ = cell.p_hold_lower
+    _ = cell.p_hold_upper
+
+    assert calls == [(hold_count, n)], f"expected exactly one wilson_interval call, got {calls}"
+
+
 def test_p_hold_upper_is_derived_from_the_same_raw_wilson_float_as_the_lower_bound(
     generator: ModuleType,
 ) -> None:

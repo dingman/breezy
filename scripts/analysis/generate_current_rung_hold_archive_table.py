@@ -299,6 +299,8 @@ def generate(
 def main(argv: Sequence[str] | None = None) -> int:
     parsed_argv = list(argv) if argv is not None else list(sys.argv[1:])
     args = _parse_args(parsed_argv)
+    # `_upper_table` is already rendered into `source` by `generate`; only
+    # `lower_table` is needed here for the printed cell/defined counts.
     source, (lower_table, _upper_table), sha = generate(argv=parsed_argv)
     output_path = Path(args.output).expanduser()
     output_path.parent.mkdir(parents=True, exist_ok=True)
