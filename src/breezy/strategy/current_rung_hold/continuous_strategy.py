@@ -33,6 +33,7 @@ from breezy.adapters.polymarket_us.errors import (
 )
 from breezy.adapters.polymarket_us.exec import submit_chain
 from breezy.adapters.polymarket_us.exec.client import DurableFillRecord
+from breezy.adapters.polymarket_us.operator_controls import utc_day_for_ns
 from breezy.adapters.polymarket_us.parsing import assert_fee_schedule_known
 from breezy.adapters.polymarket_us.symbology import instrument_id_to_slug, parse_weather_slug
 from breezy.domain.station_observation import StationObservation
@@ -101,6 +102,9 @@ _DIAG_FAMILY_HALT: Final[str] = "family_halt_duplicate_fill"
 _DIAG_REARM_WAIT: Final[str] = "rearm_wait"
 #: HF-4 Decision 1 (1B): a stale IN_FLIGHT marker was released this tick.
 _DIAG_INFLIGHT_RELEASED: Final[str] = "inflight_released"
+#: Operator ruling 2026-09-14: today's UTC-day dollar ceiling is exhausted --
+#: a WAIT, checked before IN_FLIGHT/the attempt counter, never a refusal.
+_DIAG_DAY_BUDGET_EXHAUSTED: Final[str] = "day_budget_exhausted"
 #: Slice 4 items A1/A2 (plan rev 6.1): log-only position/fill events, never
 #: a refusal and never a WAIT diagnostic -- reported through
 #: `self.position_events`/`self.position_alerter`.
@@ -299,6 +303,10 @@ class ContinuousRungHoldStrategy(Strategy):
         #: AM-3 (Rev 2.1): dedupe set for `_record_rearm_denial_once`,
         #: bounded -- see that method's own comment.
         self._rearm_decision_dedupe: set[tuple[tuple[str, str], str]] = set()
+        #: Operator ruling 2026-09-14: dedupes the ``budget_stop`` WARN/alert
+        #: to once per ``(station, utc_day)``, mirroring the rearm-denial
+        #: dedupe above.
+        self._budget_stop_notice: set[tuple[str, str]] = set()
         self._illegal_cell_station_days: set[tuple[str, str]] = set()
         self._eligible_snap_counts: dict[tuple[str, str], int] = {}
         self._fee_halt = False
@@ -731,6 +739,27 @@ class ContinuousRungHoldStrategy(Strategy):
         climate_day = facts.climate_day
         climate_day_key = climate_day.isoformat()
         station_day = (station, climate_day_key)
+
+        utc_day = utc_day_for_ns(snapshot.ts_event).isoformat()
+        if self._latch.is_day_budget_exhausted(utc_day):
+            # Operator ruling 2026-09-14: checked BEFORE is_consumed/
+            # attempt_state/is_inflight, so a budget-stopped day never
+            # touches IN_FLIGHT or the attempt counter -- this is a WAIT for
+            # the rest of the UTC day, not a refusal.
+            self.diagnostics.record(_DIAG_DAY_BUDGET_EXHAUSTED)
+            notice_key = (station, utc_day)
+            if notice_key not in self._budget_stop_notice:
+                self._budget_stop_notice.add(notice_key)
+                notice = (
+                    f"budget_stop: {station}/{utc_day} not arming for the rest "
+                    "of the UTC day (the day's spend ceiling is reached)"
+                )
+                self.log.warning(notice)
+                self._report_alerter(
+                    self.diagnostics_alerter,
+                    "continuous_rung_hold diagnostics report failed",
+                )
+            return
 
         assert self._latch is not None
         if self._latch.is_consumed(station, climate_day_key, key_instrument_id=iid):

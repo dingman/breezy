@@ -31,6 +31,7 @@ import pytest
 from breezy.adapters.polymarket_us.operator_controls import (
     MAX_DAILY_BUDGET_USD_ENV_VAR,
     MAX_POSITION_COST_USD_ENV_VAR,
+    DailyBudgetExhausted,
     DailySpendLedger,
     operator_max_daily_budget_usd,
     operator_max_position_cost_usd,
@@ -252,6 +253,54 @@ def test_the_accumulated_total_is_what_refuses_the_next_order() -> None:
             )
         assert ledger.spent_today_usd(now_ns=_ns(2026, 9, 2, 3)) == Decimal("95.00")
     assert MAX_DAILY_BUDGET_USD_ENV_VAR in str(excinfo.value)
+
+
+def test_daily_budget_exhaustion_raises_the_typed_subclass() -> None:
+    """Operator ruling 2026-09-14: the exec client marks a UTC day
+    spend-exhausted by exception TYPE, not by re-parsing this (unchanged)
+    message -- so the daily-budget branch specifically must raise
+    ``DailyBudgetExhausted``, a ``LiveTradingPermissionError`` subclass.
+    """
+    ledger = DailySpendLedger()
+    with (
+        _budget(daily="100.00", position="200.00"),
+        pytest.raises(DailyBudgetExhausted) as excinfo,
+    ):
+        ledger.authorize_order_cost(
+            price_usd=Decimal("0.50"), quantity=Decimal(300), now_ns=MIDDAY
+        )
+    assert isinstance(excinfo.value, LiveTradingPermissionError)
+    assert MAX_DAILY_BUDGET_USD_ENV_VAR in str(excinfo.value)
+
+
+def test_a_cost_above_the_position_cap_raises_plain_not_the_daily_subclass() -> None:
+    """The per-position ceiling is a distinct control; its refusal must
+    never be mistaken for a day-budget exhaustion by the exec client's
+    ``except DailyBudgetExhausted`` arm.
+    """
+    ledger = DailySpendLedger()
+    with (
+        _budget(daily="1000.00", position="25.00"),
+        pytest.raises(LiveTradingPermissionError) as excinfo,
+    ):
+        ledger.authorize_order_cost(price_usd=Decimal("0.26"), quantity=Decimal(100), now_ns=MIDDAY)
+    assert type(excinfo.value) is LiveTradingPermissionError
+    assert not isinstance(excinfo.value, DailyBudgetExhausted)
+
+
+def test_a_backwards_clock_denial_raises_plain_not_the_daily_subclass() -> None:
+    """The clock-rewind branch shares the daily env-var name in its message
+    but is NOT a budget exhaustion and must not mark the day.
+    """
+    ledger = DailySpendLedger()
+    with _budget(daily="100.00", position="50.00"):
+        ledger.authorize_order_cost(price_usd=Decimal("0.10"), quantity=Decimal(1), now_ns=MIDDAY)
+        with pytest.raises(LiveTradingPermissionError) as excinfo:
+            ledger.authorize_order_cost(
+                price_usd=Decimal("0.10"), quantity=Decimal(1), now_ns=MIDDAY - _NS
+            )
+    assert type(excinfo.value) is LiveTradingPermissionError
+    assert not isinstance(excinfo.value, DailyBudgetExhausted)
 
 
 def test_spending_exactly_the_daily_budget_is_admitted() -> None:
@@ -677,6 +726,12 @@ def test_the_mechanism_has_no_production_call_site_yet() -> None:
     imports ``utc_day_for_ns`` to compute the UTC calendar day for its
     boot-time durable-fill spend seed. It reads no control value -- see
     ``test_the_seed_never_reads_an_operator_control_value``.
+    Sixth, declared 2026-09-14 (operator ruling of that date, daily-budget
+    day stop): ``strategy.current_rung_hold.continuous_strategy`` imports
+    ``utc_day_for_ns`` to compute the UTC day for the strategy's own
+    ``TrialDayLatch.is_day_budget_exhausted`` read -- it reads no control
+    value either, only the day boundary the exec client's marker key already
+    uses.
     """
     from pathlib import Path
 
@@ -695,6 +750,7 @@ def test_the_mechanism_has_no_production_call_site_yet() -> None:
         "src/breezy/adapters/polymarket_us/factories.py",
         "src/breezy/adapters/polymarket_us/safety.py",
         "src/breezy/runtime/order_enablement.py",
+        "src/breezy/strategy/current_rung_hold/continuous_strategy.py",
     ]
 
 

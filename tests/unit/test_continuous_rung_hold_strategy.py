@@ -29,6 +29,8 @@ from nautilus_trader.model.position import Position
 from nautilus_trader.portfolio import Portfolio
 from nautilus_trader.test_kit.stubs.component import TestComponentStubs
 
+from breezy.adapters.polymarket_us.exec.client import BUDGET_EXHAUSTED_KEY_PREFIX
+from breezy.adapters.polymarket_us.operator_controls import utc_day_for_ns
 from breezy.adapters.polymarket_us.parsing import DEPTH10_LEVELS
 from breezy.domain.station_observation import StationObservation
 from breezy.runtime.sqlite_store import SqliteStateStore
@@ -1556,3 +1558,150 @@ def test_a_standing_pre_arm_refusal_burns_three_attempts_and_then_stops_forever(
         WINDOW_OPEN_NS + 2 * 120 * _S,
     )
     assert len(strategy.offer_tape) == 3
+
+
+# ---------------------------------------------------------------------------
+# Operator ruling 2026-09-14: the daily-budget day stop
+# ---------------------------------------------------------------------------
+
+
+def _mark_budget_exhausted(strategy: ContinuousRungHoldStrategy, utc_day: str) -> None:
+    assert strategy._latch is not None
+    strategy._latch._store.set(  # type: ignore[attr-defined]
+        f"{BUDGET_EXHAUSTED_KEY_PREFIX}{utc_day}", b"1",
+    )
+
+
+def test_a_marked_day_refuses_to_arm_and_leaves_inflight_and_the_attempt_counter_untouched(
+    store_path: Path,
+    interior_instrument: BinaryOption,
+) -> None:
+    """The load-bearing test: a day-budget marker for the tick's UTC day
+    stops `_hunt_tick` BEFORE `is_consumed`/`attempt_state`/`is_inflight` are
+    ever read -- IN_FLIGHT and the attempt counter stay exactly where they
+    started, and no armed submission is attempted."""
+    strategy = _register_armed_and_start(
+        store_path=store_path,
+        instruments=(interior_instrument,),
+        position_evidence_reader=lambda: _PERMISSIVE_EVIDENCE,
+    )
+    assert strategy._latch is not None
+    utc_day = utc_day_for_ns(WINDOW_OPEN_NS).isoformat()
+    _mark_budget_exhausted(strategy, utc_day)
+    submitted: list[object] = []
+    strategy.submit_order = submitted.append  # type: ignore[method-assign]
+
+    strategy.on_data(_observation(temp_c_tenths=300, observed_at_ns=WINDOW_OPEN_NS - 1))
+    strategy.on_quote_tick(_quote(INTERIOR_ID, ask="0.40", ts_event=WINDOW_OPEN_NS))
+
+    assert submitted == []
+    assert strategy.diagnostics.count("day_budget_exhausted") == 1
+    assert (
+        strategy._latch.is_inflight(
+            STATION, CLIMATE_DAY.isoformat(), key_instrument_id=str(INTERIOR_ID)
+        )
+        is False
+    )
+    assert strategy._latch.attempt_state(
+        STATION, CLIMATE_DAY.isoformat(), key_instrument_id=str(INTERIOR_ID)
+    ) == (0, None)
+    assert (
+        strategy._latch.is_consumed(
+            STATION, CLIMATE_DAY.isoformat(), key_instrument_id=str(INTERIOR_ID)
+        )
+        is False
+    )
+
+
+def test_the_budget_stop_line_is_logged_once_per_station_per_day_across_many_ticks(
+    store_path: Path,
+    interior_instrument: BinaryOption,
+) -> None:
+    strategy = _register_and_start(store_path=store_path, instruments=(interior_instrument,))
+    assert strategy._latch is not None
+    utc_day = utc_day_for_ns(WINDOW_OPEN_NS).isoformat()
+    _mark_budget_exhausted(strategy, utc_day)
+
+    strategy.on_data(_observation(temp_c_tenths=300, observed_at_ns=WINDOW_OPEN_NS - 1))
+    for offset in range(5):
+        strategy.on_quote_tick(
+            _quote(INTERIOR_ID, ask="0.40", ts_event=WINDOW_OPEN_NS + offset * NS_PER_MIN),
+        )
+
+    assert strategy.diagnostics.count("day_budget_exhausted") == 5
+    assert strategy._budget_stop_notice == {(STATION, utc_day)}
+
+
+def test_the_next_utc_day_arms_again_with_no_clear_step(
+    store_path: Path,
+    interior_instrument: BinaryOption,
+) -> None:
+    """The marker self-expires at UTC midnight: a tick on the NEXT UTC day
+    never even consults the prior day's marker key -- no operator clear
+    step exists or is needed."""
+    strategy = _register_and_start(store_path=store_path, instruments=(interior_instrument,))
+    assert strategy._latch is not None
+    utc_day = utc_day_for_ns(WINDOW_OPEN_NS).isoformat()
+    _mark_budget_exhausted(strategy, utc_day)
+
+    strategy.on_data(_observation(temp_c_tenths=300, observed_at_ns=WINDOW_OPEN_NS - 1))
+    strategy.on_quote_tick(_quote(INTERIOR_ID, ask="0.40", ts_event=WINDOW_OPEN_NS))
+    assert strategy.diagnostics.count("day_budget_exhausted") == 1
+
+    _NS_PER_DAY = 86_400 * 1_000_000_000
+    next_day_ts = WINDOW_OPEN_NS + _NS_PER_DAY
+    next_utc_day = utc_day_for_ns(next_day_ts).isoformat()
+    assert next_utc_day != utc_day
+    strategy.on_quote_tick(_quote(INTERIOR_ID, ask="0.40", ts_event=next_day_ts))
+
+    # Still exactly one -- the next-day tick never re-triggers the diagnostic
+    # for the (unmarked) new UTC day.
+    assert strategy.diagnostics.count("day_budget_exhausted") == 1
+
+
+def test_the_first_budget_denied_orders_inflight_record_is_orphaned_and_inert(
+    store_path: Path,
+    interior_instrument: BinaryOption,
+) -> None:
+    """D4 (Rev 2 dispositions): `on_order_denied` clears IN_FLIGHT only on
+    the open-intent-wait reason -- a budget denial leaves the instrument-
+    day's IN_FLIGHT marker set. That marker is INERT: once the day is
+    marked exhausted, the day-budget read gates every later tick before
+    `is_inflight` is ever consulted again, so the orphaned marker can never
+    cause a stale-inflight release loop."""
+    strategy = _register_armed_and_start(
+        store_path=store_path,
+        instruments=(interior_instrument,),
+        position_evidence_reader=lambda: _PERMISSIVE_EVIDENCE,
+    )
+    assert strategy._latch is not None
+    # Simulate the orphaned state a real budget denial would leave: armed,
+    # IN_FLIGHT set, no attempt recorded release -- then the day is marked.
+    strategy._latch.set_inflight(
+        STATION, CLIMATE_DAY.isoformat(), key_instrument_id=str(INTERIOR_ID),
+    )
+    strategy._latch.record_attempt(
+        STATION, CLIMATE_DAY.isoformat(), ts_ns=WINDOW_OPEN_NS - NS_PER_MIN,
+        key_instrument_id=str(INTERIOR_ID),
+    )
+    utc_day = utc_day_for_ns(WINDOW_OPEN_NS).isoformat()
+    _mark_budget_exhausted(strategy, utc_day)
+    submitted: list[object] = []
+    strategy.submit_order = submitted.append  # type: ignore[method-assign]
+
+    strategy.on_data(_observation(temp_c_tenths=300, observed_at_ns=WINDOW_OPEN_NS - 1))
+    strategy.on_quote_tick(_quote(INTERIOR_ID, ask="0.40", ts_event=WINDOW_OPEN_NS))
+
+    assert submitted == []
+    assert strategy.diagnostics.count("day_budget_exhausted") == 1
+    # The orphaned marker from before the mark is untouched -- never
+    # released, never re-armed, never consulted this tick.
+    assert (
+        strategy._latch.is_inflight(
+            STATION, CLIMATE_DAY.isoformat(), key_instrument_id=str(INTERIOR_ID)
+        )
+        is True
+    )
+    assert strategy._latch.attempt_state(
+        STATION, CLIMATE_DAY.isoformat(), key_instrument_id=str(INTERIOR_ID)
+    )[0] == 1

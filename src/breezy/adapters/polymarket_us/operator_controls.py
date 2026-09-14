@@ -116,6 +116,16 @@ from breezy.adapters.polymarket_us.safety import (
     _read_operator_money,
 )
 
+
+#: Operator ruling 2026-09-14: raised ONLY by the daily-budget branch of
+#: :meth:`DailySpendLedger.authorize_order_cost`, so the exec client can
+#: durably mark the UTC day as spend-exhausted by exception TYPE rather than
+#: by re-parsing the (unchanged) refusal message. The per-position ceiling
+#: and the clock-rewind branch stay plain ``LiveTradingPermissionError`` --
+#: neither means the day's dollar ceiling was reached.
+class DailyBudgetExhausted(LiveTradingPermissionError):
+    """The daily USD budget was reached; today's remaining orders are denied."""
+
 #: The operator's rolling calendar-day (UTC) ceiling on USD notional spent.
 #: Operator-reserved: this repo never assigns it a value.
 MAX_DAILY_BUDGET_USD_ENV_VAR: Final = "BREEZY_MAX_DAILY_BUDGET_USD"
@@ -405,7 +415,7 @@ class DailySpendLedger:
                 self._day = day
                 self._spent_usd = Decimal(0)
             if self._spent_usd + cost > daily_budget:
-                raise LiveTradingPermissionError(
+                raise DailyBudgetExhausted(
                     f"{MAX_DAILY_BUDGET_USD_ENV_VAR} refuses this order: it would carry "
                     f"today's USD notional past the operator's daily budget"
                 )

@@ -1881,6 +1881,10 @@ EXEC_ORDER_COROUTINE_PERMITTED_CALLEES = frozenset(
         # already-open local store; no path, no payload, no socket; no
         # `await`. Mirrors `self._note_ambiguous_open`'s exemption above.
         "self.record_venue_order_id",
+        # Day-stop plan D1 (2026-09-14): inert synchronous callee -- writes
+        # one day-keyed marker to the already-open local state store; no
+        # await, no network.
+        "self._mark_budget_exhausted",
     }
 )
 
@@ -2859,6 +2863,10 @@ def test_the_order_coroutine_callee_allowlist_reaches_no_venue() -> None:
             # A1: writes one key to the already-open local store; no path,
             # no payload, no socket; no `await`.
             "self.record_venue_order_id",
+            # Day-stop plan D1 (2026-09-14): inert synchronous callee --
+            # writes one day-keyed marker to the already-open local state
+            # store; no await, no network.
+            "self._mark_budget_exhausted",
         }
     )
     for callee in EXEC_ORDER_COROUTINE_PERMITTED_CALLEES:

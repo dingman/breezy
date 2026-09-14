@@ -59,6 +59,7 @@ from decimal import Decimal, InvalidOperation
 from typing import Final
 
 from breezy.adapters.polymarket_us.exec.client import (
+    BUDGET_EXHAUSTED_KEY_PREFIX,
     FILL_INDEX_KEY_PREFIX,
     FILL_KEY_PREFIX,
     DurableFillRecord,
@@ -638,6 +639,20 @@ class TrialDayLatch:
         self._require_held()
         raw = self._store.get(FAMILY_HALT_KEY)
         return raw is not None and raw != _HALT_CLEARED_MARKER
+
+    def is_day_budget_exhausted(self, utc_day: str) -> bool:
+        """``True`` once the exec client has marked ``utc_day`` (a
+        ``YYYY-MM-DD`` UTC calendar day) as spend-exhausted (operator ruling
+        2026-09-14).
+
+        Any value at the key means exhausted -- fail-closed, mirroring
+        :meth:`is_family_halted`'s own shape. No ``try``/``except``: a store
+        error here propagates and halts the tick, exactly like
+        :meth:`is_family_halted`.
+        """
+        self._require_held()
+        raw = self._store.get(f"{BUDGET_EXHAUSTED_KEY_PREFIX}{utc_day}")
+        return raw is not None
 
     def clear_family_halt(
         self,

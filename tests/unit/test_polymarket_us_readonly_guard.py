@@ -2154,6 +2154,13 @@ def test_c10_submit_intent_and_operator_controls_reference_pins() -> None:
     (``operator_max_position_cost_usd``/``operator_max_daily_budget_usd``)
     and reads no operator value; it is a date-bucketing read, not a control
     read.
+
+    WIDENED again (operator ruling 2026-09-14, daily-budget day stop):
+    ``strategy.current_rung_hold.continuous_strategy`` imports the same
+    ``utc_day_for_ns`` -- a pure UTC-day helper -- to compute the UTC day
+    key its own ``TrialDayLatch.is_day_budget_exhausted`` read consults.
+    Same reasoning as the exec client's import above: no money accessor, no
+    operator value read.
     """
     assert _modules_importing("submit_intent") == {
         "src/breezy/runtime/node_config.py",
@@ -2189,6 +2196,11 @@ def test_c10_submit_intent_and_operator_controls_reference_pins() -> None:
         # today's durable fill records for the boot-time ledger seed; it
         # imports no money accessor and reads no operator value.
         "src/breezy/adapters/polymarket_us/exec/client.py",
+        # WIDENED (operator ruling 2026-09-14, daily-budget day stop): the
+        # continuous-rung-hold strategy imports the same `utc_day_for_ns`
+        # to key its own day-budget-exhausted read; no money accessor, no
+        # operator value.
+        "src/breezy/strategy/current_rung_hold/continuous_strategy.py",
     }
 
 
