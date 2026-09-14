@@ -113,10 +113,16 @@ __all__ = [
 _NS_PER_MINUTE: Final[int] = 60_000_000_000
 _CLASS_NAME: Final[str] = "ContinuousRungHoldStrategy"
 #: S3b (plan NO_SIDE_EDGE_2026-09-14 S4/S5): the NO leg's Take is evaluated
-#: and gated every tick but NEVER reaches `submit_order` in this slice --
-#: S5 is the ONLY slice permitted to flip this to `False`, and only after
-#: its exit criteria (new RulePin, ruling, NO-side preview capture) land.
-NO_SIDE_SHADOW_ONLY: Final[bool] = True
+#: and gated every tick. FLIPPED to `False` by this commit (S5 Track C,
+#: the tail commit of `NO_SIDE_S5_EXEC_2026-09-14.md` §5) -- exit criteria
+#: (a)-(d) are MET (preview+book capture, the X3 ruling sign-off at
+#: 8c954ef, the S6b citation, and the first-order-protocol keys/CLI/RED
+#: tests landing before this flip; PREREG amendment §8). Criterion (e),
+#: the position-shape ruling, stays OPEN by design and is contained by
+#: the bounded first-order protocol (`NO_SIDE_FIRST_ORDER_PENDING_REASON`)
+#: until the first NO fill's venue position payload is captured and
+#: ruled on.
+NO_SIDE_SHADOW_ONLY: Final[bool] = False
 #: Closed-set reasons for a `no_refuse:` shadow-gate log line (S3b, S4).
 #: Deliberately disjoint from `decision.REFUSAL_REASONS` -- these are the
 #: LATCH-layer gates run only after the NO leg's own `Take` already cleared
