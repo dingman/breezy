@@ -456,7 +456,8 @@ async def test_all_markets_are_added_on_a_fully_successful_cycle() -> None:
 
     await provider.load_all_async()
 
-    assert provider.count == 3
+    # S2: each captured market's second `marketSides` entry loads a NO leg too.
+    assert provider.count == 6
     assert set(provider.active_market_slugs) == set(slugs)
     for slug in slugs:
         assert provider.find(InstrumentId(Symbol(slug), POLYMARKET_US_VENUE)) is not None

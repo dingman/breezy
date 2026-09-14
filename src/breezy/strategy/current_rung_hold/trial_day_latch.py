@@ -58,11 +58,18 @@ from dataclasses import dataclass
 from decimal import Decimal, InvalidOperation
 from typing import Final
 
+from nautilus_trader.model.identifiers import InstrumentId, Symbol
+
 from breezy.adapters.polymarket_us.exec.client import (
     BUDGET_EXHAUSTED_KEY_PREFIX,
     FILL_INDEX_KEY_PREFIX,
     FILL_KEY_PREFIX,
     DurableFillRecord,
+)
+from breezy.adapters.polymarket_us.symbology import (
+    POLYMARKET_US_VENUE,
+    leg_of,
+    sibling_instrument_id,
 )
 from breezy.runtime.submit_intent import (
     StateStore,
@@ -79,8 +86,12 @@ __all__ = [
     "DUPLICATE_FILL_KEY_PREFIX",
     "FAMILY_HALT_KEY",
     "HALT_CLEARED_KEY_PREFIX",
+    "LATCH_GATE_REFUSAL_REASONS",
+    "SIBLING_LEG_TRADED_REASON",
     "STARTUP_EVIDENCE_KEY",
+    "STATION_DAY_ADMISSION_REASON",
     "TAKEN_FROM_FILL_WALK_REASON",
+    "Refusal",
     "TrialDayAlreadyConsumed",
     "TrialDayInvalidReason",
     "TrialDayLatch",
@@ -88,10 +99,12 @@ __all__ = [
     "TrialDayRecord",
     "TrialDayRecordCorrupt",
     "open_trial_day_latch",
+    "refuse_if_sibling_leg_traded",
     "startup_evidence_confirms_absent_flat",
     "startup_evidence_lists_slug",
     "startup_evidence_permits_arm",
     "startup_evidence_position_for",
+    "station_day_admission",
 ]
 
 #: Default trial-key prefix -- byte-identical to the v2 live family.
@@ -127,6 +140,75 @@ _REASONS: Final[frozenset[str]] = frozenset(
     REFUSAL_REASONS | {"taken", TAKEN_FROM_FILL_WALK_REASON}
 )
 _SCHEMA_VERSION: Final[int] = 1
+
+#: A ``TrialDayRecord.reason`` counting as "this leg actually traded" for
+#: the two S4 gates below (plan NO_SIDE_EDGE_2026-09-14, N2-10/R3-7) --
+#: ``"taken"`` and the never-arm fill walk's own reason. A record whose
+#: reason is any OTHER member of ``_REASONS`` was merely EVALUATED and
+#: refused, never filled, and must not count.
+_FILLED_REASONS: Final[frozenset[str]] = frozenset({"taken", TAKEN_FROM_FILL_WALK_REASON})
+
+#: N2-10: a same-rung YES/NO fill on the SAME instrument-day (the sibling
+#: leg, `breezy.adapters.polymarket_us.symbology.sibling_instrument_id`,
+#: already has a filled TRIAL record). Distinct from
+#: `decision.REFUSAL_REASONS` -- `decision.py` is immutable per this
+#: slice's hard invariants, and this gate runs before a quote ever reaches
+#: `evaluate_decision`.
+SIBLING_LEG_TRADED_REASON: Final[str] = "sibling_leg_traded"
+
+#: R3-7: the arm-time Sigma-q admission gate -- summing `q_i` (`BE_i` for a
+#: YES leg, `1 - BE_i` for a NO leg) over the station-day's existing filled
+#: TRIAL records plus the candidate exceeds 1. Same name as
+#: `breezy.settlement.current_rung_hold_v2.StationDayAdmissionRefusal`'s
+#: TALLY-time defence-in-depth check (R3-7: "the tally gate stays as
+#: defence in depth and must never fire on a day the arm-time gate
+#: admitted") -- deliberately the SAME reason string for the SAME
+#: violation, at an earlier point in time.
+STATION_DAY_ADMISSION_REASON: Final[str] = "station_day_admission"
+
+#: The closed set of reasons the two functions below (`Refusal`) may use.
+#: Fixed and finite by construction, mirroring `decision.REFUSAL_REASONS`
+#: and `risk.COUNTED_REFUSAL_REASONS` -- but a SEPARATE set, since
+#: `decision.py` must stay untouched (hard invariant) and neither gate has
+#: an analogue there.
+LATCH_GATE_REFUSAL_REASONS: Final[frozenset[str]] = frozenset(
+    {SIBLING_LEG_TRADED_REASON, STATION_DAY_ADMISSION_REASON}
+)
+
+
+@dataclass(frozen=True, slots=True)
+class Refusal:
+    """A refusal from one of the S4 latch-level gates below. ``reason`` is
+    always a member of :data:`LATCH_GATE_REFUSAL_REASONS` -- never a
+    ``decision.Refuse`` (that type validates against
+    ``decision.REFUSAL_REASONS``, which these two reasons are not in)."""
+
+    reason: str
+
+    def __post_init__(self) -> None:
+        if self.reason not in LATCH_GATE_REFUSAL_REASONS:
+            raise ValueError(
+                f"reason must be one of {sorted(LATCH_GATE_REFUSAL_REASONS)!r}, "
+                f"was {self.reason!r}"
+            )
+
+
+def _leg_instrument_id(raw: str) -> InstrumentId:
+    """Rebuild the Nautilus ``InstrumentId`` this latch's own
+    ``key_instrument_id``/``TrialDayRecord.instrument_id`` string names --
+    NEVER ``InstrumentId.from_str`` (that parser requires a ``.`` venue
+    delimiter this latch's plain-slug and composite-``^no`` strings do not
+    carry; both ``symbology.slug_to_instrument_id`` and
+    ``no_leg_instrument_id`` build the SAME shape by wrapping ``Symbol`` +
+    ``POLYMARKET_US_VENUE`` directly, never through ``from_str``)."""
+    return InstrumentId(Symbol(raw), POLYMARKET_US_VENUE)
+
+
+def _cell_probability(be: Decimal, side: str) -> Decimal:
+    """``q_i = P(HIGH in r_i)`` under H0 (plan NO_SIDE_EDGE_2026-09-14 SS3):
+    ``BE_i`` for a YES leg, ``1 - BE_i`` for a NO leg. Decimal throughout
+    (money/probability sums stay Decimal, never float)."""
+    return be if side == "yes" else Decimal(1) - be
 
 #: Slice 4 item B1 (plan rev 6.1): v3-only, family-wide keys -- literal
 #: strings, NOT derived from a `TrialDayLatch`'s own `_key_prefix` (v2 never
@@ -263,6 +345,13 @@ class TrialDayRecord:
     #: missing the key decodes as ``None`` -- mirrors
     #: ``DurableFillRecord.venue_fee_raw`` (client.py) exactly.
     venue_order_id: str | None = None
+    #: Plan NO_SIDE_EDGE_2026-09-14 S4 (R3-7): the venue fee paid on this
+    #: leg's own ask, when known -- ``BE = ask + fee``. TRAILING and
+    #: OPTIONAL, same compat pattern as ``venue_order_id`` immediately
+    #: above: no ``_SCHEMA_VERSION`` bump, read via ``payload.get`` so a
+    #: pre-slice-4 record missing the key decodes as ``None`` ("q unknown"
+    #: -- :func:`station_day_admission` refuses rather than guessing).
+    fee: Decimal | None = None
 
     def to_bytes(self) -> bytes:
         payload = {
@@ -272,6 +361,7 @@ class TrialDayRecord:
             "ask": str(self.ask),
             "reason": self.reason,
             "venueOrderId": self.venue_order_id,
+            "fee": str(self.fee) if self.fee is not None else None,
         }
         return json.dumps(payload, sort_keys=True).encode("utf-8")
 
@@ -309,12 +399,25 @@ class TrialDayRecord:
         venue_order_id_raw = payload.get("venueOrderId")
         if venue_order_id_raw is not None and not isinstance(venue_order_id_raw, str):
             raise TrialDayRecordCorrupt()
+        # Optional-on-read, same pattern as venueOrderId immediately above.
+        fee_raw = payload.get("fee")
+        if fee_raw is not None and not isinstance(fee_raw, str):
+            raise TrialDayRecordCorrupt()
+        fee: Decimal | None
+        if fee_raw is None:
+            fee = None
+        else:
+            try:
+                fee = Decimal(fee_raw)
+            except InvalidOperation:
+                raise TrialDayRecordCorrupt() from None
         return cls(
             latched_at_ns=latched_at_ns,
             instrument_id=instrument_id,
             ask=ask,
             reason=reason,
             venue_order_id=venue_order_id_raw,
+            fee=fee,
         )
 
 
@@ -460,6 +563,7 @@ class TrialDayLatch:
         ask: Decimal,
         reason: str,
         key_instrument_id: str | None = None,
+        fee: Decimal | None = None,
     ) -> None:
         """Durably record this station-day's single trial.
 
@@ -472,6 +576,10 @@ class TrialDayLatch:
         ``key_instrument_id`` (plan S1) keys the durable write by instrument
         as well as station-day. v2's only call shape never passes it and
         stays byte-identical.
+
+        ``fee`` (plan NO_SIDE_EDGE_2026-09-14 S4, R3-7) is OPTIONAL and
+        TRAILING, mirroring ``TrialDayRecord.fee`` -- v2's call shape never
+        passes it and stays byte-identical.
         """
         self._require_held()
         if reason not in _REASONS:
@@ -483,6 +591,7 @@ class TrialDayLatch:
             instrument_id=instrument_id,
             ask=ask,
             reason=reason,
+            fee=fee,
         )
         self._store.set(
             self._trial_key(station, climate_day, key_instrument_id=key_instrument_id),
@@ -975,3 +1084,102 @@ def open_trial_day_latch(
     """
     store, lock = intent_latch.shared_state_binding()
     return TrialDayLatch(store, lock, key_prefix=key_prefix, intent_latch=intent_latch)
+
+
+def refuse_if_sibling_leg_traded(
+    store: StateStore,
+    prefix: str,
+    station: str,
+    climate_day: str,
+    instrument_id: str,
+) -> Refusal | None:
+    """N2-10: refuse iff the OTHER leg (YES<->NO) of the same market slug
+    already has a filled TRIAL record for this station-day.
+
+    Pure read over ``store`` -- no flock required, no ``TrialDayLatch``
+    instance required (the latch's own flock-holding accessors are for
+    callers that also need to WRITE; this gate only ever reads). A fresh
+    process re-running this same read after a mid-day relaunch sees the
+    SAME durable record (N2-10's relaunch-ordering requirement): nothing
+    here is cached in memory.
+
+    ``instrument_id`` is this candidate leg's id (either a plain slug, for
+    a YES candidate, or a composite ``<slug>^no`` id, for a NO candidate --
+    both are valid ``key_instrument_id`` strings; the composite form
+    survives ``_key``'s slash guard exactly like any other string, since
+    the guard only bans ``/``).
+    """
+    sibling = str(sibling_instrument_id(_leg_instrument_id(instrument_id)).symbol)
+    key = _key(station, climate_day, key_prefix=prefix, key_instrument_id=sibling)
+    raw = store.get(key)
+    if raw is None:
+        return None
+    record = TrialDayRecord.from_bytes(raw)
+    if record.reason not in _FILLED_REASONS:
+        # The sibling was evaluated and refused, never filled -- not a
+        # trade, so this leg is not excluded.
+        return None
+    return Refusal(SIBLING_LEG_TRADED_REASON)
+
+
+def station_day_admission(
+    store: StateStore,
+    prefix: str,
+    station: str,
+    climate_day: str,
+    candidate_side: str,
+    candidate_be: Decimal,
+    *,
+    existing_instrument_ids: Iterable[str] = (),
+) -> Refusal | None:
+    """R3-7: the arm-time Sigma-q admission gate.
+
+    Sums ``q_i`` (``BE_i`` for a YES leg, ``1 - BE_i`` for a NO leg) over
+    the station-day's existing FILLED TRIAL records named by
+    ``existing_instrument_ids`` plus the candidate's own ``q``, and refuses
+    if the total exceeds 1. This runs BEFORE any submit, as defence against
+    R3-7's finding that :func:`breezy.settlement.current_rung_hold_v2.combine_station_day`
+    only enforces the same gate at TALLY time, after fills have already
+    spent capital.
+
+    ``existing_instrument_ids`` is explicit (not discovered by scanning the
+    store) because :class:`~breezy.runtime.submit_intent.StateStore` is a
+    minimal get/set protocol with no key enumeration -- the same reason
+    :meth:`TrialDayLatch.iter_fill_records` takes an explicit
+    ``instrument_ids`` argument rather than scanning. An empty tuple (the
+    default) is a lone-candidate day: admitted iff the candidate's own
+    ``q`` alone is at most 1.
+
+    A record with no ``fee`` (a pre-slice-4 legacy write, or corruption)
+    makes that record's ``q`` UNKNOWN. This gate never guesses in that
+    case -- it refuses the whole candidate rather than silently treating
+    an unknown ``q`` as zero, which could admit a station-day that would
+    actually breach Sigma-q > 1.
+
+    A record whose ``reason`` is not in the filled set (merely evaluated
+    and refused) is skipped, not counted -- it never spent capital and
+    contributes no ``q`` to the sum.
+
+    Mathematically, an all-YES day can never breach this gate under the
+    edge rule (``Sum(BE_i) < Sum(p_lower_i) <= 1``, R3-7) -- this
+    function's arithmetic simply cannot fire there once every leg's ``fee``
+    is recorded; the "never refuse a YES-only day" requirement is a
+    consequence of that identity, not a special case coded here.
+    """
+    total_q = _cell_probability(candidate_be, candidate_side)
+    for instrument_id in existing_instrument_ids:
+        key = _key(station, climate_day, key_prefix=prefix, key_instrument_id=instrument_id)
+        raw = store.get(key)
+        if raw is None:
+            continue
+        record = TrialDayRecord.from_bytes(raw)
+        if record.reason not in _FILLED_REASONS:
+            continue
+        if record.fee is None:
+            return Refusal(STATION_DAY_ADMISSION_REASON)
+        side = leg_of(_leg_instrument_id(record.instrument_id))
+        be = record.ask + record.fee
+        total_q += _cell_probability(be, side)
+    if total_q > Decimal(1):
+        return Refusal(STATION_DAY_ADMISSION_REASON)
+    return None
