@@ -161,21 +161,24 @@ def test_the_frozen_table_reproduces_the_audited_mdw_son_h12_m0_cell(
 def test_every_value_is_decimal_or_none_and_keys_are_well_formed(
     archive_table: ModuleType,
 ) -> None:
-    table = archive_table.P_HOLD_LOWER
-    assert len(table) > 0
-    for key, value in table.items():
-        station, season, hour, width_code, m_code = key
-        assert isinstance(station, str) and station in _STATIONS
-        assert isinstance(season, str) and season in _SEASONS
-        assert isinstance(hour, int) and 0 <= hour <= 23
-        assert isinstance(width_code, int) and width_code in _WIDTH_CODES
-        assert isinstance(m_code, int) and m_code in {0, 1}
-        assert value is None or isinstance(value, Decimal)
-        if isinstance(value, Decimal):
-            assert Decimal(0) <= value <= Decimal(1)
+    for table_name in ("P_HOLD_LOWER", "P_HOLD_UPPER"):
+        table = getattr(archive_table, table_name)
+        assert len(table) > 0
+        for key, value in table.items():
+            station, season, hour, width_code, m_code = key
+            assert isinstance(station, str) and station in _STATIONS
+            assert isinstance(season, str) and season in _SEASONS
+            assert isinstance(hour, int) and 0 <= hour <= 23
+            assert isinstance(width_code, int) and width_code in _WIDTH_CODES
+            assert isinstance(m_code, int) and m_code in {0, 1}
+            assert value is None or isinstance(value, Decimal)
+            if isinstance(value, Decimal):
+                assert Decimal(0) <= value <= Decimal(1)
 
 
 def test_the_module_is_immutable(archive_table: ModuleType) -> None:
     with pytest.raises(TypeError):
         archive_table.P_HOLD_LOWER[("MDW", "SON", 12, 0, 0)] = Decimal("0.1")
+    with pytest.raises(TypeError):
+        archive_table.P_HOLD_UPPER[("MDW", "SON", 12, 0, 0)] = Decimal("0.1")
 
