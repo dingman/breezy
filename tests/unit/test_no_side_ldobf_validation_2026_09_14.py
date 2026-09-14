@@ -101,6 +101,7 @@ from decimal import Decimal
 
 import pytest
 
+from breezy.settlement import current_rung_hold_v2
 from breezy.settlement.current_rung_hold_v2 import (
     StratumRow,
     combine_station_day,
@@ -156,6 +157,10 @@ class _Leg:
     fee: float
     held: bool
     q: float  # cell probability P(HIGH in r_i), always
+    rung: str = ""  # base-slug rung key (S6a fix-first review, 87278dd item 2);
+    # one distinct key per rung, shared by the YES and NO legs of that rung --
+    # never left as the StratumRow default `None`, or `combine_station_day`
+    # refuses any mixed-side day via `_MixedDayMissingRungKeyRefusal`.
 
 
 def _draw_rung_budget(rng: random.Random, k: int, *, budget: float) -> list[float]:
@@ -222,13 +227,16 @@ def _legs_for_station_day_null_exact(
         successes_no = rng.binomialvariate(n_cal, cal_target_no)
         _, p_upper = _wilson_interval(successes_no, n_cal)
 
+        rung = f"MIA-rung-{i}"
         if p_lower > be_yes:
             candidates.append(
-                _Leg(side="yes", entry_ask=ask_yes, fee=fee_yes, held=held_yes, q=be_yes)
+                _Leg(side="yes", entry_ask=ask_yes, fee=fee_yes, held=held_yes, q=be_yes, rung=rung)
             )
         elif (1.0 - p_upper) > be_no:
             candidates.append(
-                _Leg(side="no", entry_ask=ask_no, fee=fee_no, held=held_no, q=1.0 - be_no)
+                _Leg(
+                    side="no", entry_ask=ask_no, fee=fee_no, held=held_no, q=1.0 - be_no, rung=rung
+                )
             )
 
     return _admit(candidates)
@@ -300,19 +308,41 @@ def _legs_for_station_day_noisy_ask(
         successes_no = rng.binomialvariate(n_cal, 1.0 - p)
         _, p_upper_complement = _wilson_interval(successes_no, n_cal)
 
+        rung = f"MIA-rung-{i}"
         if p_lower > be_yes:
             candidates.append(
-                _Leg(side="yes", entry_ask=ask_yes, fee=be_yes - ask_yes, held=held_yes, q=be_yes)
+                _Leg(
+                    side="yes",
+                    entry_ask=ask_yes,
+                    fee=be_yes - ask_yes,
+                    held=held_yes,
+                    q=be_yes,
+                    rung=rung,
+                )
             )
         elif (1.0 - p_upper_complement) > be_no:
             candidates.append(
-                _Leg(side="no", entry_ask=ask_no, fee=be_no - ask_no, held=held_no, q=1.0 - be_no)
+                _Leg(
+                    side="no",
+                    entry_ask=ask_no,
+                    fee=be_no - ask_no,
+                    held=held_no,
+                    q=1.0 - be_no,
+                    rung=rung,
+                )
             )
 
     return _admit(candidates)
 
 
 def _legs_to_rows(legs: list[_Leg], *, station: str) -> tuple[StratumRow, ...]:
+    """Every simulated row carries its own rung key (fix-first review of
+    87278dd, item 2) -- never `None` -- so `combine_station_day` can fold/
+    exclude by rung instead of refusing the whole mixed-side day via
+    `_MixedDayMissingRungKeyRefusal`. One distinct key per rung; the YES
+    and NO legs of the SAME rung share it (never both admitted at once
+    here -- the real selection rule's `elif` already forbids that -- but
+    the shared key is still what a same-rung fold/refusal keys on)."""
     return tuple(
         StratumRow(
             entry_ask=Decimal(str(round(leg.entry_ask, 9))),
@@ -320,6 +350,7 @@ def _legs_to_rows(legs: list[_Leg], *, station: str) -> tuple[StratumRow, ...]:
             held=leg.held,
             station=station,
             side=leg.side,  # type: ignore[arg-type]
+            rung=leg.rung,
         )
         for leg in legs
     )
@@ -547,6 +578,45 @@ def test_same_rung_yes_and_no_are_never_both_admitted() -> None:
         # over `pis` appends at most one candidate per rung index); this
         # test pins that the admission gate does not somehow duplicate one.
         assert len(legs) <= 4
+
+
+def test_simulated_rows_never_trip_the_rung_key_refusal() -> None:
+    """RED test for the S6a fix-first review (87278dd item 2): every row
+    this module builds carries a `rung` key, so a mixed-side day is never
+    refused by `_MixedDayMissingRungKeyRefusal` -- a `StationDayAdmissionRefusal`
+    subclass this module must never trip on its OWN simulated rows (it may
+    still legitimately trip the base `StationDayAdmissionRefusal` via the
+    Sigma-q gate, or `_SameRungOppositeSidesRefusal` if a same-rung hedge
+    were ever admitted, which `test_same_rung_yes_and_no_are_never_both_admitted`
+    separately forbids). 5000 station-days, k in {1,2,3,4}, both leg
+    builders (null-exact and the noisy-ask sensitivity construction), mixed
+    YES+NO admitted whenever the real selection rule fires either side."""
+    rng = random.Random(2026091402)
+    checked_mixed_day = False
+    for k in (1, 2, 3, 4):
+        for _ in range(1250):
+            legs = _legs_for_station_day_null_exact(rng, k=k, n_cal=90)
+            if not legs:
+                continue
+            rows = _legs_to_rows(legs, station="MIA")
+            assert all(row.rung is not None for row in rows), (
+                "every simulated row must carry a non-None rung key"
+            )
+            try:
+                combine_station_day(rows)
+            except current_rung_hold_v2._MixedDayMissingRungKeyRefusal:
+                raise AssertionError(
+                    "combine_station_day() refused a simulated station-day for "
+                    "a missing rung key -- every simulated row must carry one"
+                )
+            if any(row.side == "no" for row in rows) and any(
+                row.side == "yes" for row in rows
+            ):
+                checked_mixed_day = True
+    assert checked_mixed_day, (
+        "5000 station-days produced no mixed YES+NO day to exercise the "
+        "rung-key-refusal guard against -- widen the sample"
+    )
 
 
 def test_admission_gate_refuses_a_take_that_would_breach_distinct_q_sum() -> None:
