@@ -188,7 +188,25 @@ The following remain **byte-identical** to PREREG v3 and are **NOT re-solved or 
 
 ---
 
-## 8. Cross-References to PREREG v3
+## 8. Prospective Amendment: First-NO-Order Residual Protocol (S5 scope)
+
+**Status: Registered for S5 deployment (E2-1/E2-2)**
+
+The residual classification for NO-side create-path trials deviates from PREREG v3 to implement a bounded first-order protocol. The following rules apply prospectively from the S5 deploy commit:
+
+1. **Residual Trigger:** The FIRST live NO create-path order is marked residual (fee-unreconciled, excluded from n and every look). A durable key `exec/polymarket_us/no_side/first_live_order` is written atomically at submission, persisting the instrument ID, venue order ID (when known), and timestamp.
+
+2. **Containment:** While this key exists and `exec/polymarket_us/no_side/position_shape_captured` does not exist, no further NO takes are armed account-wide (refusal reason: `no_side_first_order_pending`). At most one residual NO trial can exist at a time.
+
+3. **Exclusion Mechanism:** The scorer (`score_live_trials._admit_fill`/`FillExclusion`) reads the durable key at tally-construction time to exclude the trial from n and every look. Exclusion is determined by the real read path (durable keys), never by `TrialDayRecord.reason` alone or operator memory.
+
+4. **Termination:** Residual status ends when a CLI writes `exec/polymarket_us/no_side/position_shape_captured` after the venue position payload is captured and a ruling fixes the per-leg position mapping. Trials whose fill precedes this key are residual; trials at or after it are admissible.
+
+**Cross-reference:** S5 plan §2 disposition E2-1 and E2-2 (docs/plans/NO_SIDE_S5_EXEC_2026-09-14.md).
+
+---
+
+## 9. Cross-References to PREREG v3
 
 | Topic | PREREG v3 Section | Amendment impact |
 |-------|-------------------|------------------|
@@ -196,14 +214,14 @@ The following remain **byte-identical** to PREREG v3 and are **NOT re-solved or 
 | Selection population | §2 | Unchanged (trigger still every Depth10 ask update) |
 | Decision rule | §3 | Unchanged (take rule still compares edge vs cost + fee) |
 | AMBIGUOUS resolution | §4, §4a | Unchanged (resolver GET still applies to YES fills) |
-| Residual classification | §5 | Unchanged (bucket logic per fill, not per leg) |
+| Residual classification | §5 | Changed (first-NO-order protocol, §8.1, prospective S5) |
 | Safety pins | §6 | Unchanged (permit race, startup gate, never-arm) |
 | Operator controls | §7 | Unchanged (two caps, no new variable) |
 | Frozen from v2 | §10 | All items frozen; amendment does NOT change them |
 
 ---
 
-## 9. Acceptance Criteria (RED→GREEN before merge)
+## 10. Acceptance Criteria (RED→GREEN before merge)
 
 1. **S1 calibration:** `P_HOLD_UPPER` generated from same raw Wilson float as `P_HOLD_LOWER`; `UPPER[k] ≥ LOWER[k]` for all keys; `P_HOLD_LOWER` byte-identical to prior version.
 2. **S6a statistic:** Mixed-side `combine_station_day` (§3 Var formula) applied to an all-YES station-day yields result byte-identical to current v3 `score()`.

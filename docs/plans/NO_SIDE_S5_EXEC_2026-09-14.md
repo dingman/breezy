@@ -159,3 +159,50 @@ Whether the daily budget and the per-order cap stay as-is once NO roughly double
 §1(a) preview + book + fee capture; §1(b) X3 sign-off; §1(c) amendment cites S6b AND registers the first-NO-order residual
 trigger (E2-2); §1(d) the first-order protocol keys and CLI exist with RED tests BEFORE the flag flips; §1(e) position-shape
 ruling is a post-first-fill gate that re-enables NO arming.
+
+---
+
+## Rev 3 dispositions (2026-09-14, after round 2 — all three REVISE)
+
+- **E3-1 (CRITICAL, architect).** After a NO fill the venue position lands on the YES id (`_map_position`/`_find_instrument`,
+  `client.py:2354-2446`), and `_run_never_arm_walk` (`continuous_strategy.py:477-530`) sees a LONG on a YES id with no YES fill
+  record — its fail-closed case — and halts YES on that station. E2-1's "UNKNOWN on the NO id" answered the wrong failure.
+  **Disposition:** the walk, on finding LONG-on-YES-id with no YES fill, consults the sibling NO id's fill index
+  (`iter_fill_records([sibling_instrument_id(yes_id)])`); a NO fill for that slug accounts for the LONG (sibling exclusion
+  forbids YES+NO on one instrument-day, so the attribution is unambiguous) — log `never_arm: accounted_by_no_leg` and continue
+  arming YES. No fill on either leg → halt as today. RED: (a) NO fill + slug LONG → YES arms; (b) LONG with no fill either leg
+  → halt; (c) YES fill + LONG → unchanged. NO arming itself stays gated by E2-1 until the position-shape ruling.
+- **E3-2 (HIGH, architect).** Gate placement for `no_side_first_order_pending`: checked in `_evaluate_no_side_shadow`
+  IMMEDIATELY after `is_intent_open` and BEFORE `set_inflight`/`record_attempt`/decision-ask recording, mirroring the
+  `is_intent_open` pre-filter precedent (`trial_day_latch.py:514-533`); plus a synchronous re-check inside `_submit_order`'s
+  no-await prefix (SAFETY C1, `client.py:3011-3024`) as defence in depth. RED: a second concurrent NO take never calls
+  `set_inflight`.
+- **E3-3 (HIGH, market-math).** `_admit_fill` (`score_live_trials.py:379`) is pure; the read happens in
+  `read_filled_trials_state_db` (opens the live exec DB read-only under `node_store_path_check`), which reads both keys and threads
+  `no_side_residual_by_trial_id` into `_admit_fill` as a new keyword exactly like `fee_reconciled_by_trial_id`.
+  `FillExclusionReason` gains `no_side_first_order_residual`, added to `RESIDUAL_EXCLUSION_REASONS` (:307-328) — additive
+  widening. RED through `read_filled_trials_state_db` on a temp state DB, asserting n and the look index exclude the trial.
+- **E3-4 (market-math).** `test_a_no_order_prices_itself_at_the_no_ask_not_the_yes_ask` binds to
+  `tick_eval.evaluate_both_sides` → `_maybe_submit`: the submitted order's price equals the NO decision's price (`1 − YES_bid`).
+- **E3-5 (HIGH, market-math).** During the pending window the hunt stays observable: `_evaluate_no_side_shadow` keeps
+  evaluating and logs `no_take_shadow: … pending=1` for takes that would have submitted; only submission is refused. RED test.
+- **E3-6 (safety 1/3/6).** Reason `no_side_first_order_pending` joins `LATCH_GATE_REFUSAL_REASONS` (trial_day_latch.py, the
+  closed set where the other NO gates live), additive with its pin test; NOT `decision.REFUSAL_REASONS`. Key constants
+  `NO_SIDE_FIRST_LIVE_ORDER_KEY = "exec/polymarket_us/no_side/first_live_order"` and
+  `NO_SIDE_POSITION_SHAPE_CAPTURED_KEY = "exec/polymarket_us/no_side/position_shape_captured"` live in a new I/O-free module
+  `exec/no_side_keys.py` (importable by client, strategy via the existing injection pattern, and the CLI; lint-imports must stay
+  green). No key-prefix census exists in the repo (safety verified) — the constants are pinned by E3-7's structural test.
+  The CLI mirrors `clear_submit_intent_cli.py` (implementer locates its module and console-script entry in pyproject):
+  `breezy-mark-no-side-position-captured`, writing only the captured key with the ruling path and sha as payload, with its own
+  test file and census entry if the CLI census requires one.
+- **E3-7 (safety 2).** Structural test: an AST scan over `src/` and `scripts/` asserting `NO_SIDE_POSITION_SHAPE_CAPTURED_KEY`
+  appears as a `.set(`/write target ONLY in the CLI module (mirroring B4's write-egress scan shape); the node can read it, never
+  write it.
+- **E3-8 (safety 4).** Boot reconcile rule: in `_connect` after `_seed_spend_from_durable_fills`, any NO-leg
+  `DurableFillRecord` found with `NO_SIDE_FIRST_LIVE_ORDER_KEY` absent → write the key (fail closed toward "pending") before the
+  resolver runs. RED test on a temp store.
+- **Closed:** E2-5 implementable (`_outcome_token` returns None for a NO id today); E2-7 exact; `_consume_trial_from_fill_record`
+  keys the NO instrument-day only; the crash-race is serialised by the C1 synchronous prefix plus E3-8.
+
+### Exit criteria after Rev 3 (unchanged list; E3-1/E3-2/E3-8 are in-slice RED items)
+§1(a)–(e) as after Rev 2; the amendment §8 (first-NO-order residual protocol) is written.
