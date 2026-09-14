@@ -4,9 +4,10 @@ scope adjustment (2026-09-14): implements E3-2 (pending gate placement),
 E3-5 (pending shadow log), the `LATCH_GATE_REFUSAL_REASONS` addition
 (E4-6), E2-3 (day-budget WAIT submit-suppression) and E2-4 (partial-fill
 exclusion is leg-agnostic). E3-1 (the never-arm cross-check for a NO fill)
-is explicitly HELD pending new venue evidence that a NO fill may land as a
-SHORT/negative on the YES slug rather than a LONG -- see the xfail test at
-the bottom of this file, which documents both candidate shapes.
+was HELD pending venue evidence of the position shape; Rev 3/Rev 4 (E4-8)
+adjudicated it (a NO fill lands the venue position on the YES id as a
+LONG) and the real implementation is tested in
+``test_continuous_rung_hold_never_arm_no_leg_2026_09_14.py``.
 """
 
 from __future__ import annotations
@@ -263,42 +264,3 @@ def test_a_partial_no_fill_is_excluded_not_tallied_as_qty_one() -> None:
     exclusion = _admit_fill(trial)
     assert exclusion is not None
     assert exclusion.reason == "partial_fill"
-
-
-# ---------------------------------------------------------------------------
-# E3-1 HELD (coordinator scope adjustment, 2026-09-14): new venue evidence
-# (a NO buy preview echoes `intent: ORDER_INTENT_BUY_SHORT`,
-# `side: ORDER_SIDE_SELL` on the SAME market slug) means a real NO fill's
-# venue position on that slug may be reported as a SHORT/negative rather
-# than the LONG the never-arm walk's fail-closed case assumes. The
-# cross-check is NOT implemented pending a position-shape ruling; this
-# test documents both candidate shapes and is expected to fail either way
-# until the ruling lands and the real implementation replaces it.
-# ---------------------------------------------------------------------------
-
-
-@pytest.mark.xfail(
-    strict=False,
-    reason=(
-        "pending venue position-shape ruling: after a NO fill, the venue "
-        "position on the YES slug may be LONG (E3-1's original assumption) "
-        "or SHORT/negative (new preview evidence, "
-        "intent=ORDER_INTENT_BUY_SHORT/side=ORDER_SIDE_SELL) -- the "
-        "never-arm cross-check is held until the shape is captured"
-    ),
-)
-def test_never_arm_cross_check_for_a_no_fill_shape_is_undetermined() -> None:
-    """Documents the two candidate shapes without asserting either:
-    (a) LONG on the YES id (E3-1's original assumption: sibling NO fill
-        accounts for it, arming continues); (b) non-LONG (SHORT/negative)
-        on the YES id after a NO fill (the new venue evidence's shape,
-        which `_run_never_arm_walk`'s CURRENT `net_position <= 0` check
-        would treat as already-flat, not as evidence needing a NO-leg
-        cross-check at all). Both cannot be simultaneously implemented
-        without the ruling; this test intentionally never passes yet.
-    """
-    raise AssertionError(
-        "no implementation exists -- awaiting the position-shape ruling "
-        "(candidate shapes: LONG-on-YES-id vs SHORT/negative-on-YES-id "
-        "after a NO fill)"
-    )

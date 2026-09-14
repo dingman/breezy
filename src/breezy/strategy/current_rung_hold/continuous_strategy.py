@@ -583,6 +583,34 @@ class ContinuousRungHoldStrategy(Strategy):
                 ) and self.portfolio.net_position(InstrumentId.from_str(iid)) <= 0
                 decisions[iid] = "absent-flat" if slug_ok else "UNKNOWN"
             if not slug_ok:
+                # E3-1 (S5 plan Rev 3/Rev 4 E4-8): a venue LONG on the YES id
+                # with no YES fill on record may still be fully accounted
+                # for by a fill on the sibling NO id for the SAME
+                # instrument-day -- sibling exclusion forbids a YES and a NO
+                # fill on one instrument-day, so a NO fill here is
+                # unambiguous evidence that the position is the NO leg's,
+                # not an unreconciled YES long. `sibling_instrument_id`
+                # varies only the leg suffix on the same dated slug, so this
+                # never crosses days. Shape-agnostic: a venue that nets the
+                # NO leg as non-long on the YES slug never reaches this
+                # block at all (`slug_ok` was already `True`).
+                no_iid_for_slug = str(sibling_instrument_id(InstrumentId.from_str(iid)))
+                try:
+                    no_fill_records = self._latch.iter_fill_records(
+                        frozenset({no_iid_for_slug}),
+                    )
+                except (TrialDayRecordCorrupt, ExecutionReportMappingError):
+                    # Fail closed: an unreadable NO-leg fill index is never
+                    # treated as accounting evidence -- falls through to the
+                    # halt below, exactly like an absent one.
+                    no_fill_records = ()
+                if no_fill_records:
+                    self.log.info(
+                        f"never_arm: accounted_by_no_leg instrument={iid} "
+                        f"no_instrument={no_iid_for_slug}",
+                    )
+                    decisions[iid] = "accounted-by-no-leg"
+                    continue
                 self.log.error(
                     f"continuous_rung_hold: venue position for {iid} is a "
                     "LONG or UNKNOWN (no durable fill on record); halting",

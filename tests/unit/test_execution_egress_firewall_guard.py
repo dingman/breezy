@@ -3230,12 +3230,19 @@ def test_x1_the_live_scan_actually_reaches_a_test_that_imports_the_exec_package(
     # still `==`; the module carries no `SOCKET_RESTORING_MARKERS` and
     # constructs no client -- `submit_chain.ORDER_BODY_KEYS` is a plain
     # frozenset, read directly.
+    # Old -> new (E3-1/E4-4, NO_SIDE_S5_EXEC_2026-09-14.md): `test_continuous_
+    # rung_hold_never_arm_no_leg_2026_09_14.py` imports `exec.client`'s
+    # `DurableFillRecord`/`FILL_INDEX_KEY_PREFIX`/`FILL_KEY_PREFIX` to write a
+    # durable NO-leg fill fixture via the real writer's key shape (L-42),
+    # exactly like its `test_continuous_rung_hold_fill_wiring.py` sibling
+    # above -- additive, no relaxation.
     assert exec_importing_test_modules() == {
         "tests/contract/test_exec_client_reconciliation_contract.py",
         "tests/contract/test_exec_client_wiring_contract.py",
         "tests/contract/test_live_fill_scoring_chain_contract.py",
         "tests/unit/test_continuous_rung_hold_backtest_only.py",
         "tests/unit/test_continuous_rung_hold_fill_wiring.py",
+        "tests/unit/test_continuous_rung_hold_never_arm_no_leg_2026_09_14.py",
         "tests/unit/test_continuous_rung_hold_no_side_shadow_2026_09_14.py",
         "tests/unit/test_continuous_rung_hold_strategy.py",
         "tests/unit/test_current_rung_hold_ambiguous_resolver.py",
