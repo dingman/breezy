@@ -321,3 +321,32 @@ residual, pending gate + shadow log), plus the S6b rung-key integration fix (num
 `NO_SIDE_SHADOW_ONLY` remains True. The flip commit (§5 tail: arm, consume with fee, `_maybe_submit` on the NO instrument,
 never-arm walk deciding the NO leg, fill-walk join for NO ids, the E3-1 cross-check under the ruled position shape) is the
 LAST step and is not part of the 2026-09-15 01:23Z live merge.
+
+---
+
+## Rev 6 (2026-09-14 ~18:5xZ) — Track C review outcomes; Track D added
+
+- **E6-1 (CRITICAL, safety).** Track C (breezy-no9, 4159b46 + flip d96cf33) could not write `NO_SIDE_FIRST_LIVE_ORDER_KEY`
+  inside `_submit_order` without widening `EXEC_ORDER_COROUTINE_PERMITTED_CALLEES` and correctly stopped; but with only the
+  boot reconcile writing the key, a second station could submit a second live NO order before a restart. **Ruled placement:
+  Option B, strategy-side** — the key is written in `_evaluate_no_side_shadow` immediately before `set_inflight`/`_maybe_submit`,
+  under the latch flock already held, with zero `await` between the pending read and the write; the strategy never clears it
+  ("pending with no order" fails closed); the payload helper lives in `exec/no_side_keys.py` so both writers agree; the E3-7
+  scanner allow-list gains that one strategy site. The allowlist widening (Option A) is the same class as the
+  `_mark_budget_exhausted` widening and would have been additive, but B needs no exec change and is sufficient because arming is
+  the single choke point. **The flip d96cf33 is HOLD until this lands.**
+- **E6-2 (CRITICAL, market-math) — Track D.** `settlement/trial_scorer.score_trial` (:186-208) settles every trial with the
+  YES payoff (`held = bucket.contains(tmax)`), and `family_tally_v2._stratum_row` reads `getattr(trial, "side"/"market_slug")`
+  which `ScoredTrial` never carries — a real NO trial would be scored inverted and folded into the tally as YES with no
+  refusal. Fix (breezy-no10): derive leg and rung from `trial.instrument_id` with pure rules moved to the bottom layer
+  (`domain/instrument_leg.py`; symbology delegates), invert `held` for NO in the scorer exactly once end to end, no schema
+  change, contract test through the store. **The flip is HOLD until this lands too.**
+- **E6-3 (HIGH, market-math, accepted with statement).** A never-traded NO leg is "flat" on absence of a fill record, not on
+  venue position evidence (none can exist for a NO id). Accepted because `consume()` commits durably before `arm()`, so a
+  submitted NO's record can vanish only by store corruption, which independently fails closed (`TrialDayRecordCorrupt`).
+- **E6-4 (LOW, closed).** 4159b46's `no_refuse: no_side_first_order_pending` log and reason-set widening contradicted the
+  existing pin that pending is a silent WAIT; d96cf33 reverted it correctly.
+
+### Merge plan
+Track C (with E6-1 fix) and Track D merge into the base together → joint review of the NO fill → scorer → tally path → base
+gate → only then the flip commit is admissible. The 2026-09-15 01:23Z live merge carries the base WITHOUT C/D.
