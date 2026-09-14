@@ -204,6 +204,41 @@ def _leg_instrument_id(raw: str) -> InstrumentId:
     return InstrumentId(Symbol(raw), POLYMARKET_US_VENUE)
 
 
+def _bare_symbol(raw: str) -> str:
+    """The bare symbol portion of ``raw``, stripping a trailing
+    ``.<VENUE>`` if present.
+
+    Safety review finding 1 (2026-09-14, commit f2d33f4): real TRIAL
+    writers (``continuous_strategy.py``'s ``iid = str(instrument_id)``,
+    every ``key_instrument_id``/``TrialDayRecord.instrument_id`` in that
+    module) key by the DOTTED ``str(InstrumentId)`` form
+    (``"<symbol>.<venue>"``); ``_leg_instrument_id`` above needs the BARE
+    symbol only. A market slug never contains ``.`` (``assert_valid_slug``),
+    so splitting on the first ``.`` is unambiguous and idempotent on an
+    already-bare input.
+    """
+    if "." in raw:
+        return raw.split(".", 1)[0]
+    return raw
+
+
+def _dotted_key_id(raw: str) -> str:
+    """Normalise ``raw`` (either the BARE symbol S4's own tests were
+    originally written against, or the DOTTED ``str(InstrumentId)`` every
+    real caller in ``continuous_strategy.py`` actually writes) to the
+    dotted form every durable ``TrialDayRecord`` key/value is keyed and
+    stamped under in production.
+
+    Idempotent: a ``raw`` that already contains the reserved venue
+    delimiter ``.`` is returned unchanged, so a caller migrated to the
+    dotted convention (the only convention this module's OWN production
+    callers ever write) never double-normalises.
+    """
+    if "." in raw:
+        return raw
+    return str(_leg_instrument_id(raw))
+
+
 def _cell_probability(be: Decimal, side: str) -> Decimal:
     """``q_i = P(HIGH in r_i)`` under H0 (plan NO_SIDE_EDGE_2026-09-14 SS3):
     ``BE_i`` for a YES leg, ``1 - BE_i`` for a NO leg. Decimal throughout
@@ -312,17 +347,28 @@ def _key(
     (v2's only call shape, and this function's default) reproduces the
     ORIGINAL station-day key byte-for-byte; v2's PREREG is closed and never
     passes this parameter, so v2 is behaviourally untouched.
+
+    ``key_instrument_id``, when given, is normalised via
+    :func:`_dotted_key_id` BEFORE building the key (safety review finding
+    1, 2026-09-14): every real TRIAL writer (``continuous_strategy.py``'s
+    ``iid = str(instrument_id)``) passes the DOTTED ``str(InstrumentId)``
+    form, while some existing callers (and ``refuse_if_sibling_leg_traded``/
+    ``station_day_admission``'s own sibling computation) pass the BARE
+    symbol -- normalising HERE, in this one shared TRIAL-key builder, is
+    what makes a record written under either form found by a lookup under
+    either form: both durably resolve to ONE canonical key.
     """
     base = f"{key_prefix}{station}/{climate_day}"
     if key_instrument_id is None:
         return base
-    if "/" in key_instrument_id:
+    normalized = _dotted_key_id(key_instrument_id)
+    if "/" in normalized:
         raise TrialDayLatchError(
             f"key_instrument_id must not contain '/': {key_instrument_id!r} -- a "
             "slash would corrupt the station/climate_day/instrument_id key "
             "boundary this function builds"
         )
-    return f"{base}/{key_instrument_id}"
+    return f"{base}/{normalized}"
 
 
 @dataclass(frozen=True, slots=True)
@@ -1103,13 +1149,20 @@ def refuse_if_sibling_leg_traded(
     SAME durable record (N2-10's relaunch-ordering requirement): nothing
     here is cached in memory.
 
-    ``instrument_id`` is this candidate leg's id (either a plain slug, for
-    a YES candidate, or a composite ``<slug>^no`` id, for a NO candidate --
-    both are valid ``key_instrument_id`` strings; the composite form
-    survives ``_key``'s slash guard exactly like any other string, since
-    the guard only bans ``/``).
+    ``instrument_id`` is this candidate leg's id -- either the BARE symbol
+    (a plain slug, for a YES candidate, or a composite ``<slug>^no`` id,
+    for a NO candidate) or the DOTTED ``str(InstrumentId)`` every real
+    caller in ``continuous_strategy.py`` actually writes (safety review
+    finding 1, 2026-09-14): ``instrument_id`` is de-dotted via
+    :func:`_bare_symbol` before the sibling computation (which needs the
+    bare form); ``_key`` below re-normalises the computed sibling back to
+    the dotted canonical form, so the lookup matches the SAME key the
+    sibling's own TRIAL record was durably written under regardless of
+    which form ITS writer used. The composite form survives ``_key``'s
+    slash guard exactly like any other string, since the guard only bans
+    ``/``.
     """
-    sibling = str(sibling_instrument_id(_leg_instrument_id(instrument_id)).symbol)
+    sibling = str(sibling_instrument_id(_leg_instrument_id(_bare_symbol(instrument_id))).symbol)
     key = _key(station, climate_day, key_prefix=prefix, key_instrument_id=sibling)
     raw = store.get(key)
     if raw is None:
@@ -1165,6 +1218,13 @@ def station_day_admission(
     function's arithmetic simply cannot fire there once every leg's ``fee``
     is recorded; the "never refuse a YES-only day" requirement is a
     consequence of that identity, not a special case coded here.
+
+    ``existing_instrument_ids`` accepts EITHER the bare symbol or the
+    dotted ``str(InstrumentId)`` real callers write (safety review finding
+    1, 2026-09-14) -- ``_key`` below normalises either to the dotted
+    canonical form before the lookup, and the stored
+    ``record.instrument_id`` is normalised via :func:`_bare_symbol` before
+    ``leg_of``/``_leg_instrument_id`` (which require the bare form).
     """
     total_q = _cell_probability(candidate_be, candidate_side)
     for instrument_id in existing_instrument_ids:
@@ -1177,7 +1237,7 @@ def station_day_admission(
             continue
         if record.fee is None:
             return Refusal(STATION_DAY_ADMISSION_REASON)
-        side = leg_of(_leg_instrument_id(record.instrument_id))
+        side = leg_of(_leg_instrument_id(_bare_symbol(record.instrument_id)))
         be = record.ask + record.fee
         total_q += _cell_probability(be, side)
     if total_q > Decimal(1):

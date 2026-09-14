@@ -1082,29 +1082,28 @@ class ContinuousRungHoldStrategy(Strategy):
         the two private fields here is the narrowest bridge that avoids
         touching `trial_day_latch.py`.
 
-        NOTE on instrument-id FORMAT: `refuse_if_sibling_leg_traded`/
-        `station_day_admission` reconstruct an `InstrumentId` internally
-        via `_leg_instrument_id` (`Symbol(raw)` directly, never
-        `InstrumentId.from_str`), so their `instrument_id`/
-        `existing_instrument_ids` arguments are the BARE symbol string
-        (e.g. ``"lax-86-87^no"``), matching S4's own test fixtures
-        (`NO_INSTRUMENT_ID = str(no_leg_instrument_id(...).symbol)`) --
-        NOT `str(InstrumentId)` (which is dotted with the venue and would
-        raise inside `assert_valid_slug`, or silently mismatch a written
-        key). This differs from every OTHER `key_instrument_id` in this
-        module (`iid = str(snapshot.instrument_id)`, dotted) -- a
-        pre-existing S4/wiring convention gap this slice does not resolve
-        (out of scope: neither side may change without touching
-        `trial_day_latch.py` or every existing dotted-keyed YES test).
-        `is_consumed`/the day-budget/notice keys below are NOT parsed by
-        anything, so they keep this module's own dotted convention.
+        Safety review finding 1 (2026-09-14, commit f2d33f4): both gate
+        functions, and the shared `_key` builder underneath them, now
+        accept EITHER the bare symbol or the DOTTED `str(InstrumentId)`
+        form and normalise to one canonical (dotted) key -- so this method
+        passes the SAME dotted `iid`/`no_iid` convention every OTHER
+        `key_instrument_id` in this module already uses (`iid =
+        str(snapshot.instrument_id)`), rather than a bare form that would
+        have matched nothing a real fill ever writes.
+
+        Safety review finding 2: `existing_instrument_ids` (for `station_
+        day_admission`) is the union of every rung resolved in `self._facts`
+        for this station-day (today's ladder) AND every instrument with a
+        durable venue fill on record (`TrialDayLatch.iter_fill_records`,
+        the SAME primitive `_run_never_arm_walk` already uses) that joins
+        to this station-day -- a rung filled earlier and since dropped from
+        `self._facts` (a mid-day relaunch) still contributes its `q`.
         """
         if not isinstance(no_decision, Take):
             return
         assert self._latch is not None
         no_instrument_id = sibling_instrument_id(yes_instrument_id)
         no_iid = str(no_instrument_id)
-        no_symbol = str(no_instrument_id.symbol)
         notice_key = (station_day[0], station_day[1], no_iid)
 
         def _refuse_once(reason: str) -> None:
@@ -1121,19 +1120,37 @@ class ContinuousRungHoldStrategy(Strategy):
         prefix = self._latch._key_prefix
 
         sibling_refusal = refuse_if_sibling_leg_traded(
-            store, prefix, station, climate_day_key, no_symbol,
+            store, prefix, station, climate_day_key, no_iid,
         )
         if sibling_refusal is not None:
             _refuse_once(sibling_refusal.reason)
             return
 
         existing_ids: list[str] = []
+        seen_ids: set[str] = set()
+
+        def _add_leg(instrument_id_obj: InstrumentId) -> None:
+            leg_iid = str(instrument_id_obj)
+            if leg_iid in seen_ids:
+                return
+            seen_ids.add(leg_iid)
+            existing_ids.append(leg_iid)
+
         for iid, facts in self._facts.items():
             if (facts.settlement_station, facts.climate_day.isoformat()) != station_day:
                 continue
             yes_iid_obj = InstrumentId.from_str(iid)
-            existing_ids.append(str(yes_iid_obj.symbol))
-            existing_ids.append(str(sibling_instrument_id(yes_iid_obj).symbol))
+            _add_leg(yes_iid_obj)
+            _add_leg(sibling_instrument_id(yes_iid_obj))
+        for fill_record in self._latch.iter_fill_records(self._candidate_instrument_ids()):
+            joined = self._join_fill_to_station_day(
+                InstrumentId.from_str(fill_record.instrument_id),
+            )
+            if joined != station_day:
+                continue
+            fill_iid_obj = InstrumentId.from_str(fill_record.instrument_id)
+            _add_leg(fill_iid_obj)
+            _add_leg(sibling_instrument_id(fill_iid_obj))
         admission_refusal = station_day_admission(
             store,
             prefix,

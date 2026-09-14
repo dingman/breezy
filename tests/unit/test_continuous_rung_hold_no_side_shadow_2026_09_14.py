@@ -20,19 +20,39 @@ cases).
 
 from __future__ import annotations
 
+import json
 from decimal import Decimal
 from pathlib import Path
 
 import pytest
+from nautilus_trader.model.identifiers import InstrumentId, Symbol, Venue
 from nautilus_trader.model.instruments import BinaryOption
 
+from breezy.adapters.polymarket_us.exec.client import (
+    FILL_INDEX_KEY_PREFIX,
+    FILL_KEY_PREFIX,
+    DurableFillRecord,
+)
 from breezy.adapters.polymarket_us.symbology import sibling_instrument_id
+from breezy.runtime.sqlite_store import SqliteStateStore
+from breezy.runtime.submit_intent import open_submit_intent_latch
 from breezy.strategy.current_rung_hold.continuous_strategy import NO_SIDE_SHADOW_ONLY
 from breezy.strategy.current_rung_hold.decision import Take
-from tests.unit.test_continuous_rung_hold_strategy import _register_and_start
+from breezy.strategy.current_rung_hold.trial_day_latch import (
+    CONTINUOUS_TRIAL_KEY_PREFIX,
+    open_trial_day_latch,
+    refuse_if_sibling_leg_traded,
+    station_day_admission,
+)
+from tests.unit.test_continuous_rung_hold_fill_wiring import _fill
+from tests.unit.test_continuous_rung_hold_strategy import (
+    _PERMISSIVE_EVIDENCE,
+    _register_and_start,
+)
 from tests.unit.test_current_rung_hold_strategy import (
     CLIMATE_DAY,
     INTERIOR_ID,
+    NS_PER_MIN,
     OPEN_UPPER_ID,
     STATION,
     WINDOW_OPEN_NS,
@@ -127,26 +147,57 @@ def test_sibling_yes_filled_refuses_the_no_take_with_sibling_leg_traded(
     store_path: Path,
     interior_instrument: BinaryOption,
 ) -> None:
-    """(c) A filled YES TRIAL on the sibling forbids the NO leg (S4)."""
-    strategy = _register_and_start(store_path=store_path, instruments=(interior_instrument,))
+    """(c) Safety review finding 1 (2026-09-14, commit f2d33f4): a filled
+    YES TRIAL written through the REAL fill path (`on_order_filled` ->
+    `consume_if_absent`, keyed by the DOTTED `str(InstrumentId)` --
+    `continuous_strategy.py`'s only writer) must still forbid the sibling
+    NO leg. RED on f2d33f4: the gates read the BARE symbol, which never
+    matches a dotted-keyed record, so `refuse_if_sibling_leg_traded`
+    silently returned `None` and the NO take was wrongly admitted.
+
+    Calls the gated method directly (not `on_quote_tick`): once
+    INTERIOR_ID's OWN trial is filled, `_hunt_tick`'s PRE-EXISTING (YES-
+    only, unrelated to this slice) `is_consumed(iid)` guard short-circuits
+    the ENTIRE tick for that instrument -- including the NO-side
+    evaluation this slice adds further down -- before any tick for that
+    instrument can reach it again. That guard is not this test's target;
+    the REAL fill write (via `on_order_filled`) and the gate function
+    (`refuse_if_sibling_leg_traded`, reached through
+    `_evaluate_no_side_shadow`) are.
+    """
+    strategy = _register_and_start(
+        store_path=store_path,
+        instruments=(interior_instrument,),
+        position_evidence_reader=lambda: _PERMISSIVE_EVIDENCE,
+    )
+    strategy.on_order_filled(
+        _fill(strategy, instrument_id=INTERIOR_ID, venue_order_id="ord-sibling"),
+    )
     assert strategy._latch is not None
-    strategy._latch.consume(
-        STATION,
-        CLIMATE_DAY.isoformat(),
-        latched_at_ns=WINDOW_OPEN_NS,
-        instrument_id=str(INTERIOR_ID.symbol),
-        ask=Decimal("0.40"),
-        reason="taken",
-        key_instrument_id=str(INTERIOR_ID.symbol),
-        fee=Decimal("0.02"),
+    record = strategy._latch.record(
+        STATION, CLIMATE_DAY.isoformat(), key_instrument_id=str(INTERIOR_ID),
     )
-    submitted: list[object] = []
-    strategy.submit_order = submitted.append  # type: ignore[method-assign]
-    strategy.on_data(_observation(temp_c_tenths=300, observed_at_ns=WINDOW_OPEN_NS - 1))
-    strategy.on_quote_tick(
-        _quote(INTERIOR_ID, ask="0.90", bid=_NO_ASK_CLEARS_BID, ts_event=WINDOW_OPEN_NS)
+    assert record is not None
+    assert record.reason == "taken"
+
+    no_take = Take(
+        quantity=1,
+        limit_price=Decimal("0.15"),
+        p_hold_lower=Decimal("0.2211"),
+        break_even=Decimal("0.16"),
+        rung=(86, 87),
+        side="no",
+        p_bound=Decimal("0.2211"),
     )
-    assert submitted == []
+    strategy._evaluate_no_side_shadow(
+        station=STATION,
+        climate_day_key=CLIMATE_DAY.isoformat(),
+        station_day=(STATION, CLIMATE_DAY.isoformat()),
+        yes_instrument_id=INTERIOR_ID,
+        no_decision=no_take,
+        now_ns=WINDOW_OPEN_NS + NS_PER_MIN,
+        bid_size=Decimal(2),
+    )
     assert strategy.last_no_take_shadow is None
     assert strategy.last_no_refuse == "no_refuse: reason=sibling_leg_traded"
 
@@ -156,24 +207,32 @@ def test_admission_breach_refuses_station_day_admission(
     interior_instrument: BinaryOption,
     open_upper_instrument: BinaryOption,
 ) -> None:
-    """(d) A filled YES TRIAL on a DIFFERENT rung whose q already saturates
-    Sigma-q refuses the NO candidate with `station_day_admission` (R3-7)."""
+    """(d) Safety review finding 1: `station_day_admission` must COUNT a
+    real-path fill on a DIFFERENT rung, not silently skip it. The real
+    writer (`_consume_or_flag_duplicate`) never sets `fee`, so a found
+    record with `fee=None` correctly refuses (R3-7: an unknown `q` is
+    never guessed as zero) -- RED on f2d33f4: the bare-keyed lookup never
+    found this dotted-keyed record at all, so the loop skipped it
+    entirely and the NO candidate was wrongly ADMITTED instead of refused.
+    """
     strategy = _register_and_start(
-        store_path=store_path, instruments=(interior_instrument, open_upper_instrument),
+        store_path=store_path,
+        instruments=(interior_instrument, open_upper_instrument),
+        position_evidence_reader=lambda: _PERMISSIVE_EVIDENCE,
+    )
+    strategy.on_order_filled(
+        _fill(
+            strategy, instrument_id=OPEN_UPPER_ID, venue_order_id="ord-other-rung",
+            last_px="0.85",
+        ),
     )
     assert strategy._latch is not None
-    # A filled YES trial on OPEN_UPPER_ID with BE=0.90 alone nearly
-    # saturates Sigma-q; the NO candidate's own q (>=0.2211) pushes it over 1.
-    strategy._latch.consume(
-        STATION,
-        CLIMATE_DAY.isoformat(),
-        latched_at_ns=WINDOW_OPEN_NS,
-        instrument_id=str(OPEN_UPPER_ID.symbol),
-        ask=Decimal("0.85"),
-        reason="taken",
-        key_instrument_id=str(OPEN_UPPER_ID.symbol),
-        fee=Decimal("0.05"),
+    record = strategy._latch.record(
+        STATION, CLIMATE_DAY.isoformat(), key_instrument_id=str(OPEN_UPPER_ID),
     )
+    assert record is not None
+    assert record.fee is None
+
     submitted: list[object] = []
     strategy.submit_order = submitted.append  # type: ignore[method-assign]
     strategy.on_data(_observation(temp_c_tenths=300, observed_at_ns=WINDOW_OPEN_NS - 1))
@@ -183,6 +242,206 @@ def test_admission_breach_refuses_station_day_admission(
     assert submitted == []
     assert strategy.last_no_take_shadow is None
     assert strategy.last_no_refuse == "no_refuse: reason=station_day_admission"
+
+
+def test_a_fill_absent_from_todays_facts_still_contributes_to_admission(
+    store_path: Path,
+    interior_instrument: BinaryOption,
+) -> None:
+    """[HIGH] finding 2: a rung filled EARLIER and since dropped from
+    `self._facts` (a mid-day relaunch resolved a narrower ladder) must
+    still be found -- via `TrialDayLatch.iter_fill_records` over
+    `_candidate_instrument_ids()` (which still spans `self._config.
+    instrument_ids`/`self.cache.instrument_ids()`, NOT just `self._facts`)
+    -- and contribute its `q` to the admission sum.
+
+    Mirrors `test_slug_fallback_joins_a_fill_for_an_instrument_missing_
+    from_facts` (`test_continuous_rung_hold_fill_wiring.py`): a REAL,
+    parseable weather slug instrument (`_join_fill_to_station_day`'s slug
+    fallback requires this -- the plain test fixture ids like
+    `OPEN_UPPER_ID` do not parse) stays configured and cached (so it is a
+    genuine `_candidate_instrument_ids()` member and its fill genuinely
+    joins), but its `self._facts` entry is removed post-boot to model the
+    "ladder rebuild dropped this rung" gap.
+    """
+    dropped_instrument = _instrument(
+        InstrumentId(Symbol("tc-temp-laxhigh-2026-09-04-gte88f"), Venue("POLYMARKET_US")),
+        lower_f=88,
+        upper_f=None,
+    )
+    dropped_iid = dropped_instrument.id
+    # A durable VENUE fill (exec-client-owned; `DurableFillRecord`, a
+    # different index than the strategy's own `TrialDayRecord`) for the
+    # dropped rung exists BEFORE boot -- mirrors
+    # `test_never_arm_walk_consumes_a_durable_fill_with_no_trial`. This is
+    # what `_run_never_arm_walk` (called from `on_start`, unconditionally)
+    # durably converts into a `TrialDayRecord` via `iter_fill_records` over
+    # `_candidate_instrument_ids()` -- BEFORE `self._facts` is ever pruned.
+    store = SqliteStateStore(store_path)
+    with open_submit_intent_latch(store, store_path):
+        fill_record = DurableFillRecord(
+            venue_order_id="ord-dropped-rung",
+            client_order_id="C-ord-dropped-rung",
+            instrument_id=str(dropped_iid),
+            order_side="BUY",
+            cumulative_qty=Decimal(1),
+            cumulative_cost=Decimal("0.85"),
+            cumulative_fee=Decimal(0),
+            fee_reconciled=True,
+            ts_event=WINDOW_OPEN_NS,
+        )
+        store.set(
+            f"{FILL_INDEX_KEY_PREFIX}{dropped_iid}",
+            json.dumps(["ord-dropped-rung"]).encode("utf-8"),
+        )
+        store.set(f"{FILL_KEY_PREFIX}ord-dropped-rung", fill_record.to_bytes())
+    store.close()
+
+    strategy = _register_and_start(
+        store_path=store_path,
+        instruments=(interior_instrument, dropped_instrument),
+        position_evidence_reader=lambda: _PERMISSIVE_EVIDENCE,
+    )
+    assert strategy._latch is not None
+    # Phase 0 never arms (`_submission_armed()` is False), so `on_start`
+    # skips the never-arm walk automatically -- call it directly, exactly
+    # as `test_never_arm_walk_consumes_a_durable_fill_with_no_trial` does.
+    assert strategy._run_never_arm_walk() is True
+    record = strategy._latch.record(
+        STATION, CLIMATE_DAY.isoformat(), key_instrument_id=str(dropped_iid),
+    )
+    assert record is not None
+    assert record.fee is None
+    # Model "this rung's ladder entry was dropped on a mid-day relaunch" --
+    # removed from `self._facts` ONLY; it stays in `self._config.
+    # instrument_ids`/`self.cache.instrument_ids()`, so
+    # `_candidate_instrument_ids()` still names it.
+    del strategy._facts[str(dropped_iid)]
+    assert str(dropped_iid) not in strategy._facts
+    assert str(dropped_iid) in strategy._candidate_instrument_ids()
+
+    submitted: list[object] = []
+    strategy.submit_order = submitted.append  # type: ignore[method-assign]
+    strategy.on_data(_observation(temp_c_tenths=300, observed_at_ns=WINDOW_OPEN_NS - 1))
+    strategy.on_quote_tick(
+        _quote(INTERIOR_ID, ask="0.90", bid=_NO_ASK_CLEARS_BID, ts_event=WINDOW_OPEN_NS)
+    )
+    assert submitted == []
+    assert strategy.last_no_take_shadow is None
+    assert strategy.last_no_refuse == "no_refuse: reason=station_day_admission"
+
+
+def test_a_record_written_dotted_is_found_when_queried_bare_and_vice_versa(
+    store_path: Path,
+) -> None:
+    """Latch-level pin (item 3): `_key`'s normalisation makes a single
+    canonical durable key regardless of which form (bare symbol or dotted
+    `str(InstrumentId)`) either the writer or the reader used."""
+    store = SqliteStateStore(store_path)
+    bare = "poly-lax-tmax-92-94"
+    dotted = f"{bare}.POLYMARKET_US"
+    with open_submit_intent_latch(store, store_path) as intent_latch:
+        latch = open_trial_day_latch(intent_latch, key_prefix=CONTINUOUS_TRIAL_KEY_PREFIX)
+        latch.consume(
+            STATION,
+            CLIMATE_DAY.isoformat(),
+            latched_at_ns=WINDOW_OPEN_NS,
+            instrument_id=dotted,
+            ask=Decimal("0.40"),
+            reason="taken",
+            key_instrument_id=dotted,
+            fee=Decimal("0.02"),
+        )
+        # Written DOTTED, found via a BARE-form query.
+        found_via_bare = latch.record(
+            STATION, CLIMATE_DAY.isoformat(), key_instrument_id=bare,
+        )
+    assert found_via_bare is not None
+    assert found_via_bare.instrument_id == dotted
+
+    other_bare = "poly-lax-tmax-70-71"
+    other_dotted = f"{other_bare}.POLYMARKET_US"
+    with open_submit_intent_latch(store, store_path) as intent_latch:
+        latch = open_trial_day_latch(intent_latch, key_prefix=CONTINUOUS_TRIAL_KEY_PREFIX)
+        latch.consume(
+            STATION,
+            CLIMATE_DAY.isoformat(),
+            latched_at_ns=WINDOW_OPEN_NS,
+            instrument_id=other_bare,
+            ask=Decimal("0.40"),
+            reason="taken",
+            key_instrument_id=other_bare,
+            fee=Decimal("0.02"),
+        )
+        # Written BARE, found via a DOTTED-form query.
+        found_via_dotted = latch.record(
+            STATION, CLIMATE_DAY.isoformat(), key_instrument_id=other_dotted,
+        )
+    assert found_via_dotted is not None
+    assert found_via_dotted.instrument_id == other_bare
+
+
+def test_refuse_if_sibling_leg_traded_matches_a_dotted_written_record_via_bare_input(
+    store_path: Path,
+) -> None:
+    """Latch-level pin for `refuse_if_sibling_leg_traded` itself, isolated
+    from the strategy: a YES sibling written DOTTED (the real convention)
+    is found when the NO candidate is queried with the BARE symbol (S4's
+    original tested contract)."""
+    store = SqliteStateStore(store_path)
+    yes_bare = "poly-lax-tmax-86-87"
+    yes_dotted = f"{yes_bare}.POLYMARKET_US"
+    no_bare = "poly-lax-tmax-86-87^no"
+    with open_submit_intent_latch(store, store_path) as intent_latch:
+        latch = open_trial_day_latch(intent_latch, key_prefix=CONTINUOUS_TRIAL_KEY_PREFIX)
+        latch.consume(
+            STATION,
+            CLIMATE_DAY.isoformat(),
+            latched_at_ns=WINDOW_OPEN_NS,
+            instrument_id=yes_dotted,
+            ask=Decimal("0.40"),
+            reason="taken",
+            key_instrument_id=yes_dotted,
+        )
+        got = refuse_if_sibling_leg_traded(
+            store, CONTINUOUS_TRIAL_KEY_PREFIX, STATION, CLIMATE_DAY.isoformat(), no_bare,
+        )
+    assert got is not None
+    assert got.reason == "sibling_leg_traded"
+
+
+def test_station_day_admission_counts_a_dotted_written_record_via_bare_input(
+    store_path: Path,
+) -> None:
+    """Latch-level pin for `station_day_admission` itself: an existing
+    trial written DOTTED is counted when its id is passed BARE."""
+    store = SqliteStateStore(store_path)
+    other_bare = "poly-lax-tmax-70-71"
+    other_dotted = f"{other_bare}.POLYMARKET_US"
+    with open_submit_intent_latch(store, store_path) as intent_latch:
+        latch = open_trial_day_latch(intent_latch, key_prefix=CONTINUOUS_TRIAL_KEY_PREFIX)
+        latch.consume(
+            STATION,
+            CLIMATE_DAY.isoformat(),
+            latched_at_ns=WINDOW_OPEN_NS,
+            instrument_id=other_dotted,
+            ask=Decimal("0.50"),
+            reason="taken",
+            key_instrument_id=other_dotted,
+            fee=Decimal("0.01"),
+        )
+        got = station_day_admission(
+            store,
+            CONTINUOUS_TRIAL_KEY_PREFIX,
+            STATION,
+            CLIMATE_DAY.isoformat(),
+            "yes",
+            Decimal("0.55"),
+            existing_instrument_ids=(other_bare,),
+        )
+    # 0.51 + 0.55 == 1.06 > 1
+    assert got is not None
+    assert got.reason == "station_day_admission"
 
 
 def test_open_intent_refuses_before_the_sibling_check(
