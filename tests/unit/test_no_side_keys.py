@@ -52,6 +52,12 @@ _SCAN_ROOTS = ("src", "scripts")
 _CLI_MODULE_PATH = "src/breezy/runtime/mark_no_side_position_captured_cli.py"
 _CLIENT_MODULE_PATH = "src/breezy/adapters/polymarket_us/exec/client.py"
 _FIRST_ORDER_ALLOWED_FUNCTIONS = frozenset({"_submit_order", "_reconcile_no_side_first_order_key"})
+#: S5 Track C (adjudicated 2026-09-14, strategy-side placement): the
+#: strategy is a THIRD legitimate writer of the first-order key, at arm
+#: time (`_evaluate_no_side_shadow`), additive to the two client sites
+#: above -- never a relaxation, every other module/function stays refused.
+_STRATEGY_MODULE_PATH = "src/breezy/strategy/current_rung_hold/continuous_strategy.py"
+_STRATEGY_ALLOWED_FUNCTIONS = frozenset({"_evaluate_no_side_shadow"})
 
 _KEY_VALUES: Mapping[str, str] = {
     "captured": NO_SIDE_POSITION_SHAPE_CAPTURED_KEY,
@@ -227,9 +233,11 @@ def find_no_side_key_write_targets(path: str, source: str) -> tuple[KeyWriteFind
 
 
 def _is_allowed_first_order_write(path: str, finding: KeyWriteFinding) -> bool:
-    return path == _CLIENT_MODULE_PATH and finding.enclosing_function in (
-        _FIRST_ORDER_ALLOWED_FUNCTIONS
-    )
+    if path == _CLIENT_MODULE_PATH:
+        return finding.enclosing_function in _FIRST_ORDER_ALLOWED_FUNCTIONS
+    if path == _STRATEGY_MODULE_PATH:
+        return finding.enclosing_function in _STRATEGY_ALLOWED_FUNCTIONS
+    return False
 
 
 # ---------------------------------------------------------------------------
@@ -439,6 +447,25 @@ def test_is_allowed_first_order_write_refuses_a_third_client_function() -> None:
 def test_is_allowed_first_order_write_refuses_the_right_function_name_in_the_wrong_module() -> None:
     finding = KeyWriteFinding(1, "first_order", True, "_submit_order")
     assert _is_allowed_first_order_write("scripts/evil.py", finding) is False
+
+
+def test_is_allowed_first_order_write_accepts_the_strategy_arm_time_write() -> None:
+    """S5 Track C: the strategy-side write, additive to the two client
+    sites -- never a widening of the client's own allowlist."""
+    finding = KeyWriteFinding(1, "first_order", True, "_evaluate_no_side_shadow")
+    assert _is_allowed_first_order_write(_STRATEGY_MODULE_PATH, finding) is True
+
+
+def test_is_allowed_first_order_write_refuses_the_strategy_function_name_in_the_client_module() -> (
+    None
+):
+    finding = KeyWriteFinding(1, "first_order", True, "_evaluate_no_side_shadow")
+    assert _is_allowed_first_order_write(_CLIENT_MODULE_PATH, finding) is False
+
+
+def test_is_allowed_first_order_write_refuses_a_different_function_in_the_strategy_module() -> None:
+    finding = KeyWriteFinding(1, "first_order", True, "_run_never_arm_walk")
+    assert _is_allowed_first_order_write(_STRATEGY_MODULE_PATH, finding) is False
 
 
 def test_the_scan_detects_a_planted_first_order_alias_write_in_a_disallowed_function() -> None:

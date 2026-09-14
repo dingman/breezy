@@ -21,11 +21,13 @@ the captured one.
 
 from __future__ import annotations
 
+import json
 from typing import Protocol
 
 __all__ = [
     "NO_SIDE_FIRST_LIVE_ORDER_KEY",
     "NO_SIDE_POSITION_SHAPE_CAPTURED_KEY",
+    "first_live_order_payload",
     "is_no_side_pending",
 ]
 
@@ -43,6 +45,27 @@ NO_SIDE_POSITION_SHAPE_CAPTURED_KEY = "exec/polymarket_us/no_side/position_shape
 
 class _ReadableStore(Protocol):
     def get(self, key: str) -> bytes | None: ...
+
+
+def first_live_order_payload(
+    instrument_id: str, ts_ns: int, *, venue_order_id: str | None = None,
+) -> bytes:
+    """The single, shared payload shape for :data:`NO_SIDE_FIRST_LIVE_ORDER_KEY`.
+
+    Every writer (the strategy's arm-time write and the exec client's
+    boot-reconcile write, E3-8) MUST render the identical JSON shape --
+    keys ``instrumentId``/``venueOrderId``/``tsNs``, ``sort_keys=True`` --
+    so no reader ever has to know which site wrote a given record.
+    ``venue_order_id`` is ``None`` at arm time (the venue has not answered
+    yet) and a real id once the boot-reconcile path recovers it from an
+    already-durable :class:`DurableFillRecord`.
+    """
+    payload = {
+        "instrumentId": instrument_id,
+        "venueOrderId": venue_order_id,
+        "tsNs": ts_ns,
+    }
+    return json.dumps(payload, sort_keys=True).encode("utf-8")
 
 
 def is_no_side_pending(store: _ReadableStore) -> bool:

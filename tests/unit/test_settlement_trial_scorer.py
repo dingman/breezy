@@ -260,3 +260,53 @@ def test_venue_fallback_never_fires_without_a_recorded_venue_reading() -> None:
     result = score_trial(trial, None, now_ns=_BASE_NS + _SEVEN_DAYS_NS + 1)
     assert isinstance(result, ScoreRefusal)
     assert result.reason == "no_record"
+
+
+# ---------------------------------------------------------------------------
+# NO-leg scoring is inverted (S5 Track D fix-first review, plan
+# NO_SIDE_EDGE_2026-09-14 R3-5(i)). Leg is derived from `instrument_id`'s
+# `^no` composite suffix -- no `FilledTrial`/`ScoredTrial` schema change.
+# ---------------------------------------------------------------------------
+
+
+def test_a_no_leg_final_print_inside_the_rung_scores_not_held() -> (
+    None
+):
+    trial = _trial(instrument_id="LAX-2026-08-31-gte78lt80f^no")
+    result = score_trial(trial, _record(tmax_f=79), now_ns=_BASE_NS)
+    assert isinstance(result, ScoredTrial)
+    assert result.held is False
+    assert result.pnl == Decimal(0) - Decimal("0.42") - Decimal("0.01")
+
+
+def test_a_no_leg_final_print_outside_the_rung_scores_held() -> (
+    None
+):
+    trial = _trial(instrument_id="LAX-2026-08-31-gte78lt80f^no")
+    result = score_trial(trial, _record(tmax_f=85), now_ns=_BASE_NS)
+    assert isinstance(result, ScoredTrial)
+    assert result.held is True
+    assert result.pnl == Decimal(1) - Decimal("0.42") - Decimal("0.01")
+
+
+def test_a_dotted_no_leg_instrument_id_string_still_inverts() -> None:
+    """`instrument_id` in production is `str(InstrumentId)` --
+    ``"<symbol>.<VENUE>"`` -- not a bare symbol; the leg derivation must
+    strip that suffix before checking for the `^no` composite."""
+    trial = _trial(instrument_id="LAX-2026-08-31-gte78lt80f^no.POLYMARKET_US")
+    result = score_trial(trial, _record(tmax_f=79), now_ns=_BASE_NS)
+    assert isinstance(result, ScoredTrial)
+    assert result.held is False
+    assert result.pnl == Decimal(0) - Decimal("0.42") - Decimal("0.01")
+
+
+def test_a_yes_leg_instrument_id_is_byte_identical_to_before_the_no_side_change() -> None:
+    """Pin (fixed before this change): the two existing YES-leg fixtures
+    above, re-asserted verbatim so a later edit here cannot silently drop
+    the YES path's untouched behaviour."""
+    inside = score_trial(_trial(), _record(tmax_f=79), now_ns=_BASE_NS)
+    outside = score_trial(_trial(), _record(tmax_f=85), now_ns=_BASE_NS)
+    assert isinstance(inside, ScoredTrial) and inside.held is True
+    assert inside.pnl == Decimal(1) - Decimal("0.42") - Decimal("0.01")
+    assert isinstance(outside, ScoredTrial) and outside.held is False
+    assert outside.pnl == Decimal(0) - Decimal("0.42") - Decimal("0.01")

@@ -100,6 +100,18 @@ from typing import Literal
 from nautilus_trader.model.identifiers import InstrumentId, Symbol, Venue
 
 from breezy.adapters.polymarket_us.errors import BoundsSemanticsError, VenuePayloadError
+from breezy.domain.instrument_leg import (
+    INSTRUMENT_SEPARATOR as _DOMAIN_INSTRUMENT_SEPARATOR,
+)
+from breezy.domain.instrument_leg import (
+    NO_LEG_SUFFIX as _DOMAIN_NO_LEG_SUFFIX,
+)
+from breezy.domain.instrument_leg import (
+    base_symbol_of as _base_symbol_of,
+)
+from breezy.domain.instrument_leg import (
+    leg_of_symbol as _leg_of_symbol,
+)
 
 __all__ = [
     "INSTRUMENT_SEPARATOR",
@@ -129,10 +141,17 @@ __all__ = [
 #: Reserved for the NO-leg composite symbol ``<slug><SEP>no``. A base slug
 #: containing it is refused. See the module docstring (S2, plan R3-1) for why
 #: this is ``^`` and not the originally-reserved ``~``.
-INSTRUMENT_SEPARATOR: str = "^"
+#:
+#: Re-exported from `breezy.domain.instrument_leg` (S5 Track D fix-first
+#: review) so `breezy.settlement.trial_scorer` -- which sits BELOW `adapters`
+#: in the layer contract and must never import it -- can derive the same
+#: leg/rung rules from the bottom `domain` layer instead. This module keeps
+#: its own name and value (byte-identical) so every existing caller here is
+#: unedited.
+INSTRUMENT_SEPARATOR: str = _DOMAIN_INSTRUMENT_SEPARATOR
 
 #: The NO-leg composite symbol suffix, appended after :data:`INSTRUMENT_SEPARATOR`.
-_NO_LEG_SUFFIX: str = "no"
+_NO_LEG_SUFFIX: str = _DOMAIN_NO_LEG_SUFFIX
 
 #: The single venue identity for this adapter.
 POLYMARKET_US_VENUE: Venue = Venue("POLYMARKET_US")
@@ -268,10 +287,12 @@ def no_leg_instrument_id(slug: str, venue: Venue = POLYMARKET_US_VENUE) -> Instr
 
 
 def leg_of(instrument_id: InstrumentId) -> Literal["yes", "no"]:
-    """``"no"`` for a composite NO-leg id built by :func:`no_leg_instrument_id`, else ``"yes"``."""
-    symbol = str(instrument_id.symbol.value)
-    suffix = f"{INSTRUMENT_SEPARATOR}{_NO_LEG_SUFFIX}"
-    return "no" if symbol.endswith(suffix) else "yes"
+    """``"no"`` for a composite NO-leg id built by :func:`no_leg_instrument_id`, else ``"yes"``.
+
+    Delegates to `breezy.domain.instrument_leg.leg_of_symbol` (S5 Track D
+    fix-first review) -- byte-identical rule, restated in the bottom layer.
+    """
+    return _leg_of_symbol(str(instrument_id.symbol.value))
 
 
 def base_slug_of(instrument_id: InstrumentId, venue: Venue = POLYMARKET_US_VENUE) -> str:
@@ -280,10 +301,11 @@ def base_slug_of(instrument_id: InstrumentId, venue: Venue = POLYMARKET_US_VENUE
     Unlike :func:`instrument_id_to_slug`, this accepts a NO-leg id -- it is
     the ONLY sanctioned way to read a slug off a NO id; every existing caller
     of :func:`instrument_id_to_slug` keeps refusing one instead.
+
+    Delegates to `breezy.domain.instrument_leg.base_symbol_of` for the string
+    rule (S5 Track D fix-first review); the slug/venue validation stays here.
     """
-    symbol = str(instrument_id.symbol.value)
-    suffix = f"{INSTRUMENT_SEPARATOR}{_NO_LEG_SUFFIX}"
-    slug = symbol.removesuffix(suffix)
+    slug = _base_symbol_of(str(instrument_id.symbol.value))
     assert_valid_slug(slug)
     if instrument_id.venue != venue:
         raise VenuePayloadError(

@@ -37,6 +37,7 @@ from dataclasses import dataclass
 from decimal import Decimal
 from typing import Literal
 
+from breezy.domain.instrument_leg import leg_of_symbol, symbol_of_instrument_id
 from breezy.domain.nws_climate_day import NwsClimateDay
 from breezy.domain.weather_bucket_facts import WeatherBucketFacts
 from breezy.settlement.settlement_truth import final_tmax_f
@@ -183,7 +184,13 @@ def score_trial(
         return basis_result
     settlement_basis, excluded_reason, settlement_tmax_f, revision_seq, raw_sha256 = basis_result
 
-    held = trial.bucket.contains(settlement_tmax_f)
+    # Leg derived from `instrument_id`'s `^no` composite suffix (S5 Track D
+    # fix-first review, plan NO_SIDE_EDGE_2026-09-14 R3-5(i)) -- no schema
+    # change on `FilledTrial`/`ScoredTrial`. `contains` is always
+    # `HIGH in r_i`; a NO leg holds exactly when HIGH is OUTSIDE the rung.
+    leg = leg_of_symbol(symbol_of_instrument_id(trial.instrument_id))
+    contains = trial.bucket.contains(settlement_tmax_f)
+    held = contains if leg == "yes" else not contains
     pnl = (Decimal(1) if held else Decimal(0)) - trial.fill_px - trial.fee
     slippage = trial.fill_px - trial.entry_ask
 
