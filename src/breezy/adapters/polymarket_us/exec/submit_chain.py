@@ -29,6 +29,7 @@ from nautilus_trader.model.objects import Money, Price, Quantity
 
 from breezy.adapters.polymarket_us.errors import ExecutionReportMappingError, VenueTransportError
 from breezy.adapters.polymarket_us.exec.reports import _key_tree, parse_fill_report
+from breezy.adapters.polymarket_us.leg_prices import wire_price_for_leg
 from breezy.adapters.polymarket_us.parsing import LEG_KEY, LEG_NO
 from breezy.adapters.polymarket_us.symbology import leg_of
 from breezy.adapters.polymarket_us.transport import VenueResponse
@@ -323,10 +324,16 @@ def build_order_body(order: object, instrument: object) -> dict[str, Any]:
     outcome_side = _outcome_token(instrument)
     if outcome_side is None:
         raise ValueError("no order-body outcome side is derivable from the instrument; refusing")
+    # Rev 5 (E5-1): the venue's `price.value` always represents the YES/long
+    # side's price -- identity on the YES leg, `1 - price` on the NO leg.
+    # The complement lives in `leg_prices` (outside `exec/`, where X3 bans
+    # the arithmetic); `intent_fingerprint` still hashes `order.price`, the
+    # Nautilus (instrument) price, never this wire value.
+    wire_price = wire_price_for_leg(leg_of(getattr(instrument, "id")), price)  # noqa: B009
     return {
         "marketSlug": slug,
         "type": _ORDER_TYPE_LIMIT,
-        "price": {"value": f"{price:.2f}", "currency": "USD"},
+        "price": {"value": f"{wire_price:.2f}", "currency": "USD"},
         "quantity": 1,
         "tif": _TIF_IOC,
         "outcomeSide": outcome_side,

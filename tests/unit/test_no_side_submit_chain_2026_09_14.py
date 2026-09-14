@@ -133,6 +133,44 @@ def test_the_order_body_key_set_is_identical_on_both_legs(
     assert no_body["outcomeSide"] == "OUTCOME_SIDE_NO"
 
 
+def test_a_no_order_at_nautilus_price_0_97_sends_3_cents_on_the_wire(
+    legs: tuple[BinaryOption, BinaryOption],
+) -> None:
+    """Rev 5 (E5-1): the venue's `price.value` always represents the YES
+    (long) side's price; a NO buy at 0.97 must send `1 - 0.97 = 0.03`."""
+    _yes, no = legs
+    order = _limit_buy(no, price="0.97")
+    body = submit_chain.build_order_body(order, no)
+    assert body["price"] == {"value": "0.03", "currency": "USD"}
+
+
+def test_a_yes_order_wire_price_is_byte_identical_to_before_rev_5(
+    legs: tuple[BinaryOption, BinaryOption],
+) -> None:
+    yes, _no = legs
+    order = _limit_buy(yes, price="0.37")
+    body = submit_chain.build_order_body(order, yes)
+    assert body["price"] == {"value": "0.37", "currency": "USD"}
+
+
+def test_intent_fingerprint_hashes_the_nautilus_price_not_the_wire_price(
+    legs: tuple[BinaryOption, BinaryOption],
+) -> None:
+    """`intent_fingerprint` must not change when the wire translation is
+    applied -- it hashes `order.price` (the Nautilus/instrument price),
+    identically on the create and GET paths, regardless of leg."""
+    _yes, no = legs
+    order_no = _limit_buy(no, price="0.97")
+    order_yes_same_nautilus_price = _limit_buy(no, price="0.97")
+    assert submit_chain.intent_fingerprint(order_no) == submit_chain.intent_fingerprint(
+        order_yes_same_nautilus_price
+    )
+    # Sanity: the wire price sent for this order is NOT 0.97 (it is 0.03),
+    # yet the fingerprint tracks the Nautilus price unchanged.
+    body = submit_chain.build_order_body(order_no, no)
+    assert body["price"]["value"] == "0.03"
+
+
 def test_a_sell_on_the_no_leg_is_still_unmappable(
     legs: tuple[BinaryOption, BinaryOption],
 ) -> None:
