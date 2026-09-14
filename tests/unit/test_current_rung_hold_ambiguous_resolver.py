@@ -105,6 +105,7 @@ def _order_get_body(
         "id": order_id,
         "marketSlug": slug,
         "side": "ORDER_SIDE_BUY",
+        "intent": "ORDER_INTENT_BUY_LONG",
         "type": "ORDER_TYPE_LIMIT",
         "price": {"value": "0.40", "currency": "USD"},
         "quantity": 1,

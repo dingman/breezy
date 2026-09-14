@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """Capture a NO-side ``/v1/order/preview`` and the same market's book -- evidence only.
 
 Authority: ``docs/plans/NO_SIDE_EDGE_2026-09-14.md`` S5 exit criterion N2-9 and
@@ -35,8 +34,11 @@ Cage note. Under the repo's read-only barriers
 (C4/C5) and carries a POST literal, an order-path literal and a ``.post`` attribute
 (V1/V2/V3). It therefore CANNOT ship under ``scripts/`` without being added to
 ``B4_EXEMPT_PATHS`` (and the pinned ``CAGE_EXEMPTIONS`` count) by explicit review,
-exactly as ``scripts/venue/polymarket_us_write_signing_probe.py`` was. That is a
-deliberate, visible cost, not something to route around.
+exactly as the write-signing probe script under ``scripts/venue/`` was. That is
+a deliberate, visible cost, not something to route around. (D4 pins the
+write-signing probe's OWN module name as unimportable anywhere else, INCLUDING
+in a dotted-string literal -- naming its path/module here as a plain string
+would itself trip that scan, so this note deliberately does not spell it out.)
 
 Usage (dry run, no network)::
 
@@ -147,7 +149,9 @@ def validate_slug(slug: str) -> str:
             f"slug does not match the observed weather grammar: {slug!r}"
         )
     if any(not p or not p.isalnum() for p in parts):
-        raise argparse.ArgumentTypeError(f"slug contains an empty or non-alphanumeric segment: {slug!r}")
+        raise argparse.ArgumentTypeError(
+            f"slug contains an empty or non-alphanumeric segment: {slug!r}"
+        )
     return slug
 
 
@@ -244,7 +248,12 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
             "Capture a NO-side /v1/order/preview and the same market's book as "
             "N2-9 evidence. Default is a DRY RUN with zero network egress; "
             "--execute performs exactly one preview POST and one book GET. "
-            "Never creates, modifies, or cancels an order."
+            "Never creates, modifies, or cancels an order. "
+            "--execute requires the venue credentials env sourced (the same "
+            "env file the write-signing probe and node use): at minimum "
+            "POLYMARKET_US_USER_AGENT plus the signing key material. Running "
+            "--execute without it FATALs -- expected and correct, never a "
+            "silent skip; source the venue env file first."
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=(
@@ -254,12 +263,17 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
             "against 1 - best YES bid."
         ),
     )
-    parser.add_argument("--slug", required=True, type=validate_slug, help="Market slug (weather grammar).")
+    parser.add_argument(
+        "--slug", required=True, type=validate_slug, help="Market slug (weather grammar)."
+    )
     parser.add_argument(
         "--price",
         required=True,
         type=parse_price,
-        help="NO-leg limit price in USD, 2 dp, strictly inside (0, 1). Choose an UNMARKETABLE value.",
+        help=(
+            "NO-leg limit price in USD, 2 dp, strictly inside (0, 1). Choose an "
+            "UNMARKETABLE value."
+        ),
     )
     parser.add_argument(
         "--outcome-side",
@@ -275,7 +289,10 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--execute",
         action="store_true",
-        help="Perform the preview POST and the book GET. Without this flag nothing leaves the host.",
+        help=(
+            "Perform the preview POST and the book GET. Without this flag "
+            "nothing leaves the host."
+        ),
     )
     return parser.parse_args(argv)
 
@@ -350,7 +367,8 @@ async def _capture_live(args: argparse.Namespace, envelope: Mapping[str, Any]) -
         )
     }
     try:
-        book_record["response"] = {"status": 200, "body": await http.get_authenticated(book_path, quota_key=QUOTA_KEY_BOOK)}
+        book_response = await http.get_authenticated(book_path, quota_key=QUOTA_KEY_BOOK)
+        book_record["response"] = {"status": 200, "body": book_response}
     except PolymarketUSError as exc:
         book_record["response"] = {"status": None, "error_type": type(exc).__name__}
 
@@ -361,7 +379,11 @@ async def _capture_live(args: argparse.Namespace, envelope: Mapping[str, Any]) -
     body = encode_body(envelope)
     preview_record: dict[str, Any] = {
         "request": request_record(
-            method=WRITE_METHOD, base_url=config.api_base_url, path=PREVIEW_PATH, headers=headers, body=body
+            method=WRITE_METHOD,
+            base_url=config.api_base_url,
+            path=PREVIEW_PATH,
+            headers=headers,
+            body=body,
         )
     }
     write_client = nautilus_pyo3.HttpClient(
@@ -373,7 +395,9 @@ async def _capture_live(args: argparse.Namespace, envelope: Mapping[str, Any]) -
     )
     url = f"{config.api_base_url.rstrip('/')}{PREVIEW_PATH}"
     try:
-        response = await write_client.post(url, headers=headers, body=body, keys=[QUOTA_KEY_PORTFOLIO])
+        response = await write_client.post(
+            url, headers=headers, body=body, keys=[QUOTA_KEY_PORTFOLIO]
+        )
         preview_record["response"] = {
             "status": int(response.status),
             "body": decode_response_body(bytes(response.body)),
@@ -397,7 +421,9 @@ def _assert_no_secret_material(text: str, secrets: Sequence[str]) -> None:
 
 def main(argv: Sequence[str] | None = None) -> int:
     args = parse_args(argv)
-    order_body = build_preview_order_body(slug=args.slug, price=args.price, outcome_side=args.outcome_side)
+    order_body = build_preview_order_body(
+        slug=args.slug, price=args.price, outcome_side=args.outcome_side
+    )
     envelope = build_preview_envelope(order_body, unwrapped=args.unwrapped)
     stamp = utc_stamp()
 
@@ -443,7 +469,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     path = evidence_path(stamp)
     write_evidence_excl(path, text)
     print(f"evidence written: {path}", file=sys.stderr)
-    print(f"preview status: {document['preview'].get('response', {}).get('status')}", file=sys.stderr)
+    preview_status = document["preview"].get("response", {}).get("status")
+    print(f"preview status: {preview_status}", file=sys.stderr)
     return 0
 
 

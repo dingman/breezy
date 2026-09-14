@@ -653,20 +653,28 @@ CAGE_RULE_PINS: tuple[RulePin, ...] = (
             {
                 "scripts/venue/polymarket_us_write_signing_probe.py",
                 "src/breezy/adapters/polymarket_us/write_transport.py",
+                "scripts/analysis/capture_no_side_preview.py",
             }
         ),
         widened=frozenset(
             {
                 "scripts/venue/polymarket_us_write_signing_probe.py",
                 "src/breezy/adapters/polymarket_us/write_transport.py",
+                "scripts/analysis/capture_no_side_preview.py",
                 "scripts/venue/a_second_write_script.py",
             }
         ),
-        narrowed=frozenset({"scripts/venue/polymarket_us_write_signing_probe.py"}),
-        why="R-6.5P's B4 allowlist plus R-6.5b's shipped write transport. The "
-        "widened neighbour is the real hazard -- a third exemption would "
-        "silently admit another write-capable module with no paired review; "
-        "the narrowed neighbour re-arms the scan against the write transport.",
+        narrowed=frozenset(
+            {
+                "scripts/venue/polymarket_us_write_signing_probe.py",
+                "src/breezy/adapters/polymarket_us/write_transport.py",
+            }
+        ),
+        why="R-6.5P's B4 allowlist, R-6.5b's shipped write transport, and "
+        "NO-side S5 §1(a)'s preview capture script. The widened neighbour "
+        "is the real hazard -- a fourth exemption would silently admit "
+        "another write-capable module with no paired review; the narrowed "
+        "neighbour drops the newest entry, re-arming the scan against it.",
     ),
     RulePin(
         module="readonly",
@@ -862,10 +870,14 @@ CAGE_RULE_PINS: tuple[RulePin, ...] = (
     RulePin(
         module="firewall",
         attr="BANNED_EXEC_DIRECTION_TOKENS",
-        expected=frozenset({"_SHORT", "OUTCOME_SIDE_NO"}),
-        widened=frozenset({"_SHORT", "OUTCOME_SIDE_NO", "_LAY"}),
-        narrowed=frozenset({"_SHORT"}),
-        why="X3 (NS-2): direction vocabulary prohibited under exec/",
+        expected=frozenset({"_SHORT", "BUY_SHORT", "SELL_"}),
+        widened=frozenset({"_SHORT", "BUY_SHORT", "SELL_", "_LAY"}),
+        narrowed=frozenset({"_SHORT", "BUY_SHORT"}),
+        why="X3 (R3-3, NO-side S5): direction vocabulary prohibited under "
+        "exec/, narrowed per docs/evidence/RULING_x3_no_outcome_token_"
+        "2026-09-14.md -- OUTCOME_SIDE_NO is required by the live NO order "
+        "body and no longer banned; BUY_SHORT (SDK-snapshot-only) and SELL_ "
+        "(naked short) are banned instead",
     ),
 )
 
@@ -1001,16 +1013,20 @@ def test_every_cage_exemption_is_an_exact_path_not_a_prefix() -> None:
         assert not entry.endswith("/")
 
 
-def test_the_cage_grants_exactly_three_exemptions() -> None:
-    """An equality, not ``<=``: a FOURTH exemption must be argued for.
+def test_the_cage_grants_exactly_four_exemptions() -> None:
+    """An equality, not ``<=``: a FIFTH exemption must be argued for.
 
     NS-2 created the first (``SDK_IMPORT_ORACLE``, ``== 1``). R-6.5P adds the
     second (the write-signing probe's ``B4_EXEMPT_PATHS`` entry) -- the plan
     family's first genuine B4 narrowing. R-6.5b adds the third (the shipped
-    write transport). The name states the truth at ``== 3``; the old name
-    would now be a lie about shipped code.
+    write transport). NO-side S5 §1(a) (E2-7) adds the fourth: the NO-side
+    preview capture script (``scripts/analysis/capture_no_side_preview.py``),
+    venue-touching by C4/C5 but placed outside ``scripts/venue/`` on purpose,
+    so it needs this exemption rather than a venue-smoke-surface allowance.
+    The name states the truth at ``== 4``; the old name would now be a lie
+    about shipped code.
     """
-    assert len(CAGE_EXEMPTIONS) == 3
+    assert len(CAGE_EXEMPTIONS) == 4
 
 
 # ==========================================================================

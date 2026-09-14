@@ -267,6 +267,13 @@ B4_EXEMPT_PATHS: frozenset[str] = frozenset(
     {
         "scripts/venue/polymarket_us_write_signing_probe.py",
         "src/breezy/adapters/polymarket_us/write_transport.py",
+        # NO-side S5 exit criterion §1(a): the NO-side preview capture
+        # script carries a POST literal, an order-path literal and a
+        # `.post` attribute (V1/V2/V3) -- venue-touching by C4/C5. Placed
+        # under `scripts/analysis/`, not `scripts/venue/`, deliberately: it
+        # must stay OUT of the venue-smoke surface `VENUE_TOUCHING_SCRIPT_
+        # PREFIXES` covers, so this exemption is what carries it instead.
+        "scripts/analysis/capture_no_side_preview.py",
     }
 )
 
@@ -1005,6 +1012,56 @@ def test_b4_exemption_non_vacuity_a_second_script_with_the_same_literals_still_t
 def test_scan_write_egress_is_clean_with_the_exemption_applied() -> None:
     """The exemption in place: the live scan (with the probe on disk) is 0."""
     assert scan_write_egress() == []
+
+
+# ==========================================================================
+# NO-side S5 exit criterion §1(a) -- the preview capture script's exemption
+# ==========================================================================
+
+_NO_PREVIEW_SCRIPT_PATH = "scripts/analysis/capture_no_side_preview.py"
+assert _NO_PREVIEW_SCRIPT_PATH in B4_EXEMPT_PATHS
+
+
+def test_the_no_preview_script_is_exempt_and_nothing_else_is() -> None:
+    """The capture script trips B4 raw (non-vacuity), the exemption is an
+    EXACT path (a copycat script under a different path still trips), and
+    the LIVE scan -- every exemption applied -- is clean."""
+    path = REPO_ROOT / _NO_PREVIEW_SCRIPT_PATH
+    source = path.read_text(encoding="utf-8")
+    raw_violations = find_write_egress_violations(_NO_PREVIEW_SCRIPT_PATH, source)
+    assert raw_violations != [], "the script must trip B4 raw, or the exemption exempts nothing"
+    assert {v.rule for v in raw_violations} & {"V1", "V2", "V3"}
+    copycat_violations = find_write_egress_violations(
+        "scripts/analysis/a_copycat_no_preview_script.py", source
+    )
+    assert copycat_violations != []
+    assert scan_write_egress() == []
+
+
+def test_the_capture_script_body_keys_equal_the_live_order_body_keys() -> None:
+    """The script restates ``ORDER_BODY_KEYS`` rather than importing it
+    (nothing under ``exec/`` may be imported by this script); pinned equal
+    here so grammar drift between the two fires in one place."""
+    import sys
+
+    from breezy.adapters.polymarket_us.exec import submit_chain
+
+    sys.path.insert(0, (REPO_ROOT / "scripts" / "analysis").as_posix())
+    import capture_no_side_preview
+
+    assert capture_no_side_preview.ORDER_BODY_KEYS == submit_chain.ORDER_BODY_KEYS
+
+
+def test_the_capture_script_is_the_only_new_venue_write_path() -> None:
+    """§1(a)'s exit criterion: exactly ONE new write-capable module joins
+    the cage relative to R-6.5b, and it is this script."""
+    pre_existing = frozenset(
+        {
+            "scripts/venue/polymarket_us_write_signing_probe.py",
+            "src/breezy/adapters/polymarket_us/write_transport.py",
+        }
+    )
+    assert B4_EXEMPT_PATHS - pre_existing == {_NO_PREVIEW_SCRIPT_PATH}
 
 
 # ==========================================================================

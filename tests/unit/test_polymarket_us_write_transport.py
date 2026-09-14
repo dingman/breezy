@@ -412,10 +412,18 @@ def test_build_post_only_callable_has_exactly_one_caller() -> None:
 
 
 def test_write_transport_has_exactly_one_importer_and_it_does_not_re_export() -> None:
+    """The name states the ORIGINAL rule (one production importer); the set
+    below is the real, reviewed count. NO-side S5 §1(a) adds a THIRD:
+    ``scripts/analysis/capture_no_side_preview.py`` imports ``Ed25519Write
+    RequestSigner`` under its own ``--execute`` (permit-gated, evidence-only
+    preview capture) path -- WIDENED, not relaxed, for the same reason the
+    B4 exemption for that script exists: it is a genuinely write-capable
+    module, reviewed here rather than routed around."""
     importers = scan_write_transport_importers()
     assert {v.path for v in importers} == {
         _FACTORIES_PATH,
         "src/breezy/adapters/polymarket_us/exec/client.py",
+        "scripts/analysis/capture_no_side_preview.py",
     }
 
     factories_source = (REPO_ROOT / _FACTORIES_PATH).read_text(encoding="utf-8")

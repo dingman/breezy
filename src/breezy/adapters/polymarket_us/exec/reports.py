@@ -150,6 +150,11 @@ from nautilus_trader.model.instruments import Instrument
 from nautilus_trader.model.objects import AccountBalance, Money, Price, Quantity
 
 from breezy.adapters.polymarket_us.errors import ExecutionReportMappingError
+from breezy.adapters.polymarket_us.leg_prices import (
+    Leg,
+    assert_echo_matches_leg,
+    instrument_price_for_leg,
+)
 from breezy.adapters.polymarket_us.parsing import (
     QUOTE_CURRENCY_CODE,
     _assert_price_representable,
@@ -164,7 +169,7 @@ from breezy.adapters.polymarket_us.parsing import (
 from breezy.adapters.polymarket_us.parsing import (
     _require as _require_field,
 )
-from breezy.adapters.polymarket_us.symbology import POLYMARKET_US_VENUE
+from breezy.adapters.polymarket_us.symbology import POLYMARKET_US_VENUE, leg_of
 
 logger = logging.getLogger(__name__)
 
@@ -718,6 +723,48 @@ def _price_decimal_field(
     )
 
 
+def _leg_price_field(
+    payload: Mapping[str, Any], key: str, *, instrument: Instrument, leg: Leg, context: str
+) -> Price:
+    """Rev 5 (E5-1): :func:`_price_field`, then translate a NO-leg wire
+    value (always YES-denominated) back to the NO instrument's own price.
+    Identity on the YES leg."""
+    price = _price_field(payload, key, instrument=instrument, context=context)
+    if leg != "no":
+        return price
+    return instrument.make_price(instrument_price_for_leg(leg, price.as_decimal()))
+
+
+def _leg_price_decimal_field(
+    payload: Mapping[str, Any], key: str, *, instrument: Instrument, leg: Leg, context: str
+) -> Decimal:
+    """The ``Decimal``-returning sibling of :func:`_leg_price_field`."""
+    value = _price_decimal_field(payload, key, instrument=instrument, context=context)
+    if leg != "no":
+        return value
+    return instrument_price_for_leg(leg, value)
+
+
+def _order_side_for_leg(
+    order: Mapping[str, Any], *, leg: Leg, context: str
+) -> OrderSide:
+    """Rev 5 (E5-2): a NO-leg order is executed by the venue as a sale of
+    the YES side (see ``leg_prices.VENUE_SIDE_FOR_LEG``/``VENUE_INTENT_
+    FOR_LEG`` for the exact declared values); Breezy never shorts
+    (``allow_short=False``), so the NATIVE report's ``order_side`` is
+    derived from the order's OWN leg -- always BUY -- never forwarded from
+    the venue's ``side`` text. The venue's echo is cross-checked (never
+    trusted as the source of truth) and any disagreement in EITHER
+    direction is refused."""
+    side_raw = _require(order, "side", context=context)
+    intent_raw = _require(order, "intent", context=context)
+    try:
+        assert_echo_matches_leg(leg, side_raw, intent_raw)
+    except ValueError as exc:
+        raise ExecutionReportMappingError(str(exc)) from exc
+    return OrderSide.BUY
+
+
 def _assert_market_matches(slug: object, *, instrument: Instrument, context: str) -> None:
     """Refuse a payload whose market is not the instrument it is mapped onto.
 
@@ -1026,6 +1073,8 @@ def parse_order_status_report(
     _assert_market_matches(
         order.get("marketSlug"), instrument=instrument, context=context
     )
+    leg = leg_of(instrument.id)
+    order_side = _order_side_for_leg(order, leg=leg, context=context)
 
     ts_accepted = parse_rfc3339_nanos(
         _require(order, "createTime", context=context),
@@ -1049,7 +1098,7 @@ def parse_order_status_report(
         account_id=account_id,
         instrument_id=instrument.id,
         venue_order_id=VenueOrderId(_require_text(order, "id", context=context)),
-        order_side=_lookup(_ORDER_SIDES, order, "side", context=context),
+        order_side=order_side,
         order_type=_lookup(_ORDER_TYPES, order, "type", context=context),
         time_in_force=_lookup(_TIME_IN_FORCE, order, "tif", context=context),
         order_status=_lookup(ORDER_STATE_TO_ORDER_STATUS, order, "state", context=context),
@@ -1061,8 +1110,9 @@ def parse_order_status_report(
         ts_init=ts_init,
         # A LIMIT price is absent on a MARKET order; both native fields are
         # optional, and an absent optional is left absent, never zeroed.
+        # Rev 5 (E5-1): translated via `leg`, identity on the YES leg.
         price=(
-            _price_field(order, "price", instrument=instrument, context=context)
+            _leg_price_field(order, "price", instrument=instrument, leg=leg, context=context)
             if order.get("price") is not None
             else None
         ),
@@ -1070,7 +1120,9 @@ def parse_order_status_report(
         # feeds it to ``instrument.make_price()`` and books the result as a
         # fill price. It therefore runs the identical guard ``price`` does.
         avg_px=(
-            _price_decimal_field(order, "avgPx", instrument=instrument, context=context)
+            _leg_price_decimal_field(
+                order, "avgPx", instrument=instrument, leg=leg, context=context
+            )
             if order.get("avgPx") is not None
             else None
         ),
@@ -1172,6 +1224,8 @@ def parse_fill_report(
     _assert_market_matches(
         order.get("marketSlug"), instrument=instrument, context=order_context
     )
+    leg = leg_of(instrument.id)
+    order_side = _order_side_for_leg(order, leg=leg, context=order_context)
 
     _assert_taker_fill(execution, context=context)
 
@@ -1201,11 +1255,13 @@ def parse_fill_report(
         instrument_id=instrument.id,
         venue_order_id=VenueOrderId(_require_text(order, "id", context=order_context)),
         trade_id=TradeId(_require_text(execution, "tradeId", context=context)),
-        order_side=_lookup(_ORDER_SIDES, order, "side", context=order_context),
+        order_side=order_side,
         last_qty=_quantity_field(
             execution, "lastShares", instrument=instrument, context=context
         ),
-        last_px=_price_field(execution, "lastPx", instrument=instrument, context=context),
+        last_px=_leg_price_field(
+            execution, "lastPx", instrument=instrument, leg=leg, context=context
+        ),
         commission=_usd_commission(
             commission_dec,
             field=f"{context}.commissionNotionalCollected",
