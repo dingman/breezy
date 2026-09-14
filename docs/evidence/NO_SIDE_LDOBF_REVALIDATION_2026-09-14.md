@@ -18,6 +18,33 @@ revision replaces the main-grid construction with the REGISTERED null
 inflation conclusion. **Increment A (k=1, qty=1) was never implicated by
 either revision** -- both agree it calibrates correctly.
 
+**Second revision note (post-merge, commit `c564602`'s successor):**
+merging `backlog/no-side-base-2026-09-14` (S6a fix-first review, `4d26f5c`
+-- `StratumRow.rung`, `_MixedDayMissingRungKeyRefusal`, same-rung
+fold/refusal, plus S2-S4) surfaced that every simulated row here left
+`rung=None`; `combine_station_day` now refuses (via
+`_MixedDayMissingRungKeyRefusal`) any station-day carrying a NO row
+alongside a rung-less row, so every mixed-side smoke run failed RED
+(`ValueError`/refusal, 13 tests, 0.75s). Fixed by giving every simulated
+leg a `rung` key equal to `f"MIA-rung-{i}"` (`i` = the rung index within
+that station-day) -- one distinct key per rung, shared by the YES and NO
+legs of that rung, exactly as the fix-first review requires; the real
+selection rule's own `elif` already forbids admitting both sides of one
+rung, so the shared key is never exercised by an actual same-rung
+same-day admission, only by the fold/refusal machinery's rung-key
+presence check. A new RED-first structural test,
+`test_simulated_rows_never_trip_the_rung_key_refusal`, pins that
+`combine_station_day` never raises `_MixedDayMissingRungKeyRefusal` on
+this module's own simulated rows across 5000 station-days spanning
+`k in {1,2,3,4}`, and that the sample actually exercises a mixed
+YES+NO station-day (not vacuously true). **The full-size grid was re-run
+after the fix, seeds unchanged, and every number below is byte-identical
+to the pre-merge run** (confirmed by diffing the two full result sets,
+excluding wall-clock timings) -- expected, since folding/rung-refusal is a
+no-op on rows that were never same-rung-hedged to begin with; the fix
+only removes a spurious refusal, it does not change any admitted row's
+economics.
+
 ## H0 assumption (R3-8, stated verbatim)
 
 Conditional on the cell probability `q_i`, the realised `held_i` is
@@ -223,15 +250,25 @@ re-run as part of this slice's gate) -- pinned value
 - Default (gate) test run: smoke size (`n_reps=120` main grid,
   `n_reps=400` var-s-terminal smoke, `n_reps=400` per-look-var smoke) --
   `~30-35s` wall for the whole module, under the ~60s target.
-- Full-size run (this artefact's corrected numbers): 8 main-grid
-  crossing-rate configs + 4 per-look-Var(S) configs + 2 staleness-stress
-  configs, `n_reps=20000` each, `n_max=160`, executed once via a
-  standalone script -- total wall time **2242.99s (~37m 23s)**. Per-config
-  times: main grid 55-302s (k=4 configs take longest -- more simulated
-  station-days needed per admitted trade as the admission gate tightens
-  with more concurrent rungs); per-look Var(S) 57-270s (no early stopping,
-  so every replication runs the full `n_max`); staleness stress 66-86s.
-  ~3.1-3.2M simulated station-days evaluated per crossing-rate config.
+- Full-size run (this artefact's corrected numbers, pre-merge): 8
+  main-grid crossing-rate configs + 4 per-look-Var(S) configs + 2
+  staleness-stress configs, `n_reps=20000` each, `n_max=160`, executed
+  once via a standalone script -- total wall time **2242.99s (~37m 23s)**.
+  Per-config times: main grid 55-302s (k=4 configs take longest -- more
+  simulated station-days needed per admitted trade as the admission gate
+  tightens with more concurrent rungs); per-look Var(S) 57-270s (no early
+  stopping, so every replication runs the full `n_max`); staleness stress
+  66-86s. ~3.1-3.2M simulated station-days evaluated per crossing-rate
+  config.
+- Re-run in full after the `rung`-key fix (post-merge, same seeds, same
+  script): total wall time **2749.66s (~45m 50s)**, somewhat slower than
+  the pre-merge run on the same (otherwise idle) machine -- attributed to
+  the extra `_fold_same_rung_rows` bookkeeping now on the hot path inside
+  `combine_station_day`, not to any behavioural change. Every reported
+  number (crossing rates at every look, per-look Var(S), staleness-stress
+  rates) is byte-identical to the pre-merge run, confirmed by a direct
+  diff of the two full JSON result sets excluding wall-clock timings --
+  see "Second revision note" above.
 - Same `random.Random.binomialvariate` calibration-sampling optimisation
   as the prior revision (O(1) exact Binomial draw vs. an O(n_cal)
   Python-level Bernoulli loop).
