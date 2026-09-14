@@ -84,10 +84,12 @@ def test_flag_true_keeps_shadow_behaviour_byte_identical(
     store_path: Path,
     interior_instrument: BinaryOption,
     no_interior_instrument: BinaryOption,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """The default (still ``True``) flag never arms/consumes/submits the NO
-    leg -- exactly the S3b behaviour, unedited by this commit."""
-    assert cs.NO_SIDE_SHADOW_ONLY is True
+    """With the flag forced ``True`` (S5 flip: the default is now
+    ``False`` -- this proves the S3b shadow-only code path is still fully
+    reachable and byte-identical, never removed by the flip)."""
+    monkeypatch.setattr(cs, "NO_SIDE_SHADOW_ONLY", True)
     strategy = _register_and_start(
         store_path=store_path,
         instruments=(interior_instrument, no_interior_instrument),

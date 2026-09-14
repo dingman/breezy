@@ -82,10 +82,18 @@ def open_upper_instrument() -> BinaryOption:
 _NO_INTERIOR_ID = sibling_instrument_id(INTERIOR_ID)
 
 
-def test_no_side_shadow_only_constant_is_true() -> None:
-    """RED (item 3): pins the constant; the never-submit test below stays
-    valid across S5 by asserting this value explicitly."""
-    assert NO_SIDE_SHADOW_ONLY is True
+def test_no_side_shadow_only_constant_is_false() -> None:
+    """S5 flip (commit 2, plan ``NO_SIDE_S5_EXEC_2026-09-14.md`` §5): the
+    bounded pin moves ``True`` -> ``False``, deliberately -- the ONE change
+    of this slice's tail commit, not a relaxation. Exit criteria (a)-(d)
+    (plan Rev 4 "Exit criteria after Rev 3"/Status footer) are all MET:
+    (a) preview+book capture, (b) X3 sign-off (8c954ef), (c) S6b citation,
+    (d) the first-order-protocol keys/CLI/RED tests exist BEFORE this flip.
+    Criterion (e) (the position-shape ruling) stays OPEN by design -- it
+    needs the first NO fill this flip enables, and the bounded first-order
+    protocol (E2-1, ``NO_SIDE_FIRST_ORDER_PENDING_REASON``) contains
+    exposure to exactly one NO premium until it lands."""
+    assert NO_SIDE_SHADOW_ONLY is False
 
 
 def test_yes_take_sequence_is_byte_identical_to_before_this_slice(
@@ -104,11 +112,12 @@ def test_yes_take_sequence_is_byte_identical_to_before_this_slice(
     assert any(rec.reason == "taken" for rec in strategy.offer_tape.records())
     assert strategy.last_no_take_shadow is None
     assert strategy.last_no_refuse is None
-    # Item 3: `submitted == []` above already proves `submit_order` was
-    # never called at all this tick (YES or NO); `NO_SIDE_SHADOW_ONLY`
-    # being `True` is WHY -- pinned explicitly so this test stays a valid
-    # never-submit proof after S5 flips only the constant.
-    assert NO_SIDE_SHADOW_ONLY is True
+    # Item 3 (S5 flip): `submitted == []` above holds regardless of
+    # `NO_SIDE_SHADOW_ONLY` -- the default bid ("0.01") makes NO_ask=0.99,
+    # which never clears the NO break-even, so no NO `Take` is ever built
+    # for `_evaluate_no_side_shadow` to arm even with the flag now `False`.
+    # This is the "no NO log" default case named in the docstring, not a
+    # consequence of the (now-flipped) shadow-only pin.
 
 
 def test_a_clearing_no_frame_logs_exactly_one_shadow_line_and_submits_nothing(
