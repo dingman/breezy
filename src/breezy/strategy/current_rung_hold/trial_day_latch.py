@@ -233,6 +233,12 @@ def _key(
     base = f"{key_prefix}{station}/{climate_day}"
     if key_instrument_id is None:
         return base
+    if "/" in key_instrument_id:
+        raise TrialDayLatchError(
+            f"key_instrument_id must not contain '/': {key_instrument_id!r} -- a "
+            "slash would corrupt the station/climate_day/instrument_id key "
+            "boundary this function builds"
+        )
     return f"{base}/{key_instrument_id}"
 
 
@@ -312,8 +318,11 @@ class TrialDayRecord:
 
 
 class TrialDayLatch:
-    """At-most-one-trial-per-station-day latch sharing R-7's submit-intent
-    store and flock.
+    """At-most-one-trial-per-station-day latch by default (v2, no
+    ``key_instrument_id``); at-most-one-trial-per-INSTRUMENT-day when
+    ``key_instrument_id`` is supplied (v3, plan S1 -- "I never wanted a
+    limit of 1 contract per station"), sharing R-7's submit-intent store
+    and flock.
 
     Constructed only by :func:`open_trial_day_latch`, which binds this
     instance to the SAME ``StateStore`` and the SAME

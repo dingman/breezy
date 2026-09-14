@@ -1302,3 +1302,28 @@ class TestV2LatchKeysAreByteIdentical:
         keys = _committed_keys(store_path)
         assert f"current_rung_hold/trial/{STATION}/{CLIMATE_DAY}" in keys
         assert not any(k.count("/") > 3 for k in keys if k.startswith("current_rung_hold/trial/"))
+
+
+class TestKeyInstrumentIdRejectsSlash:
+    """S1 follow-up (operator ruling 2026-09-14): a ``key_instrument_id``
+    containing ``/`` would corrupt the ``station/climate_day/instrument_id``
+    key boundary -- refused loudly at every keyed accessor, never silently
+    building a malformed key."""
+
+    def test_an_instrument_id_containing_a_slash_is_refused_at_the_key_boundary(
+        self, store_path: Path,
+    ) -> None:
+        with open_submit_intent_latch(SqliteStateStore(store_path), store_path) as intent_latch:
+            latch = open_trial_day_latch(intent_latch)
+            with pytest.raises(TrialDayLatchError):
+                latch.is_consumed(STATION, CLIMATE_DAY, key_instrument_id="POLY/LAX")
+            with pytest.raises(TrialDayLatchError):
+                latch.consume(
+                    STATION,
+                    CLIMATE_DAY,
+                    latched_at_ns=NOW_NS,
+                    instrument_id=INSTRUMENT_ID,
+                    ask=Decimal("0.37"),
+                    reason="taken",
+                    key_instrument_id="POLY/LAX",
+                )

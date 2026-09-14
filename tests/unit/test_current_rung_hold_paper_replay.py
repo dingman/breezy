@@ -720,6 +720,103 @@ def test_entry_ask_comes_from_the_trial_day_latch_not_the_tapes_first_quote(
     assert trial.fill_px == Decimal("0.06")
 
 
+INSTRUMENT_ID_2 = InstrumentId(Symbol("lax-87-88"), Venue("POLYMARKET_US"))
+
+
+def _instrument2() -> BinaryOption:
+    increment = Price.from_str("0.01")
+    size_increment = Quantity.from_str("1")
+    return BinaryOption(
+        instrument_id=INSTRUMENT_ID_2,
+        raw_symbol=INSTRUMENT_ID_2.symbol,
+        outcome="Yes",
+        description="LAX daily high",
+        asset_class=AssetClass.ALTERNATIVE,
+        currency=USD,
+        price_precision=increment.precision,
+        price_increment=increment,
+        size_precision=size_increment.precision,
+        size_increment=size_increment,
+        activation_ns=0,
+        expiration_ns=200 * 3_600_000_000_000,
+        max_quantity=None,
+        min_quantity=Quantity.from_int(1),
+        maker_fee=THETA,
+        taker_fee=THETA,
+        ts_event=0,
+        ts_init=0,
+        info=_facts_info(lower_f=87, upper_f=88),
+    )
+
+
+def test_two_filled_rungs_on_one_station_day_yield_two_entry_contexts(
+    driver: ModuleType, tmp_path: Path,
+) -> None:
+    """S1 follow-up (operator ruling 2026-09-14 / plan S1): two DIFFERENT
+    rungs filled on the same station-day each get their own latch-
+    corroborated entry context -- the v3 latch keys TRIAL by instrument-day,
+    not station-day alone ("I never wanted a limit of 1 contract per
+    station")."""
+    instrument_a = _instrument()
+    instrument_b = _instrument2()
+    facts_a = read_weather_bucket_facts(instrument_a.info)
+    facts_b = read_weather_bucket_facts(instrument_b.info)
+    tape_a = driver.TapeInstrument(
+        instrument=instrument_a, facts=facts_a, depths=[], quotes=[], closes=[],
+    )
+    tape_b = driver.TapeInstrument(
+        instrument=instrument_b, facts=facts_b, depths=[], quotes=[], closes=[],
+    )
+
+    class _FakeOrder:
+        def __init__(self, instrument_id: str) -> None:
+            self.status = driver.OrderStatus.FILLED
+            self.client_order_id = "O-1"
+            self.instrument_id = instrument_id
+
+    class _FakeCache:
+        def orders(self) -> list[_FakeOrder]:
+            return [_FakeOrder(str(instrument_a.id)), _FakeOrder(str(instrument_b.id))]
+
+    class _FakeEngine:
+        def __init__(self) -> None:
+            self.cache = _FakeCache()
+
+    latch_store_path = tmp_path / "state.db"
+    with driver._latch_context(latch_store_path) as latch:
+        latch.consume(
+            STATION,
+            CLIMATE_DAY.isoformat(),
+            latched_at_ns=WINDOW_OPEN_NS,
+            instrument_id=str(instrument_a.id),
+            ask=Decimal("0.10"),
+            reason="taken",
+            key_instrument_id=str(instrument_a.id),
+        )
+        latch.consume(
+            STATION,
+            CLIMATE_DAY.isoformat(),
+            latched_at_ns=WINDOW_OPEN_NS,
+            instrument_id=str(instrument_b.id),
+            ask=Decimal("0.20"),
+            reason="taken",
+            key_instrument_id=str(instrument_b.id),
+        )
+
+    contexts = driver._entry_contexts_from_latch(
+        [tape_a, tape_b],
+        _FakeEngine(),
+        station=STATION,
+        climate_day=CLIMATE_DAY.isoformat(),
+        latch_store_path=latch_store_path,
+        scheduled_release_at_ns=WINDOW_OPEN_NS + 7 * 24 * 3_600_000_000_000,
+    )
+
+    assert set(contexts) == {str(instrument_a.id), str(instrument_b.id)}
+    assert contexts[str(instrument_a.id)].entry_ask == Decimal("0.10")
+    assert contexts[str(instrument_b.id)].entry_ask == Decimal("0.20")
+
+
 def test_a_fill_with_no_corroborating_latch_record_is_refused(
     driver: ModuleType, tmp_path: Path,
 ) -> None:
