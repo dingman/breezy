@@ -1,6 +1,6 @@
 # Ruling: Barrier X3 narrowing for NO-outcome token (DRAFT, 2026-09-14)
 
-**Status: DRAFT** (pending security reviewer sign-off)
+**Status: SIGNED** (security review 2026-09-14, Track A commits 36c6d99 → 8a0a7f2, cage exemption ffb8291; scope amended by S5 Rev 5: the ban applies to outbound request text under exec/, inbound classification uses the leg predicate and the values table in adapters/polymarket_us/leg_prices.py)
 
 **Related:** CLAUDE.md Immutable Foundation (extension-only); plan `NO_SIDE_EDGE_2026-09-14.md` rev 3, slices S5, N2-6, R3-3, R3-4; PREREG v3 §6 SAFETY pins.
 
@@ -230,11 +230,11 @@ POST /v1/orders/preview
 | **Pin edit:** | Single commit, update `expected` and `narrowed`, same label |
 | **Exit criterion:** | NO-side preview captured and confirmed before first live NO order |
 | **Hard invariants retained:** | Nautilus (extension-only), `allow_short=False`, NO-SEND firewall, both operator caps, settlement test, safety pins, boundary artefact |
-| **Reviewer:** | (pending security reviewer sign-off) |
-| **Date:** | (TBD) |
-| **Commit SHA:** | (TBD, sign-off not complete) |
+| **Reviewer:** | security-reviewer (independent adversarial review agent), verified by re-running the guard bundle under the no-egress gate: 547 passed |
+| **Date:** | 2026-09-14 (~17:50Z) |
+| **Commit SHA:** | 36c6d99 (X3 pin), 4be8155, d13d3e6, 52a9def, 8a0a7f2 (leg-aware mapping/booking), ffb8291 (cage exemption) on backlog/no-side-s5a-exec-2026-09-14 |
 | **Attestation:** | This ruling has been reviewed and approved by the security reviewer. The pin change is traced to the NO-side requirement in PREREG v3 amendment. All safety controls remain in place. |
 
 ---
 
-**Generated: 2026-09-14 | Status: DRAFT (awaiting security sign-off) | Related plan: NO_SIDE_EDGE_2026-09-14.md rev 3 | Sign-off: PENDING**
+**Generated: 2026-09-14 | Status: SIGNED 2026-09-14 | Related plans: NO_SIDE_EDGE_2026-09-14.md Rev 3, NO_SIDE_S5_EXEC_2026-09-14.md Rev 5b | Sign-off: SIGNED**
