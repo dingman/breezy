@@ -8,9 +8,24 @@ symbology splits on ``-`` and indexes ``[0]``/``[1]``
 ``tc-temp-nychigh-2026-08-25-lt79f`` has six hyphen-separated segments, so that
 scheme would silently mis-key every weather market. Nothing here imports it.
 
-**The reserved separator is** ``~``. It is reserved so a later phase can encode
-a composite symbol without ambiguity, which means a slug that already contains
-it must be refused now rather than round-trip incorrectly later.
+**The reserved separator is** ``^``. Chosen empirically (S2, plan R3-1) over the
+originally-reserved ``~``: a Nautilus Rust-session Parquet read
+(``quote_ticks``/``order_book_deltas``/``query``, hence backtest replay) raises
+``RuntimeError: SQL error: ParserError`` on a ``~``-composite id because
+``parquet.py:_sanitize_sql_identifier`` does not escape it; ``^`` and ``:`` both
+survive that sanitiser, and ``^`` was picked to avoid colliding with ``:``'s
+existing use as a namespace separator in Breezy's own durable keys. It is
+reserved so a NO-leg composite symbol (``no_leg_instrument_id``) can be encoded
+without ambiguity, which means a slug that already contains it must be refused
+now rather than round-trip incorrectly later.
+
+**The catalog's SQL sanitiser aliases ``.``, ``-``, `` ``, ``^`` and ``:`` all
+to ``_`` (then lowercases)** -- so a base slug spelled with ``-``/``_``
+interchangeably, or a NO-leg id, can collide on the SAME sanitised alias as a
+DIFFERENT instrument even though their raw ids differ. :func:`catalog_sql_alias`
+mirrors that exact mapping and :func:`assert_catalog_aliases_are_unique` is the
+guard: run it over every instrument id (both legs) built for one discovery
+cycle before any is cached.
 
 **A dotted slug is refused.** ``InstrumentId.from_str`` splits on the LAST
 ``"."``, so a slug containing a dot produces an id that does not round-trip.
@@ -77,8 +92,10 @@ about settlement; it only refuses to let an uncorroborated comparator through.
 from __future__ import annotations
 
 import re
+from collections.abc import Iterable
 from dataclasses import dataclass
 from datetime import date
+from typing import Literal
 
 from nautilus_trader.model.identifiers import InstrumentId, Symbol, Venue
 
@@ -95,16 +112,27 @@ __all__ = [
     "ProseBounds",
     "WeatherSlug",
     "assert_bounds_cross_checked",
+    "assert_catalog_aliases_are_unique",
     "assert_valid_slug",
+    "base_slug_of",
+    "catalog_sql_alias",
     "instrument_id_to_slug",
+    "leg_of",
+    "no_leg_instrument_id",
     "parse_prose_bounds",
     "parse_weather_slug",
+    "sibling_instrument_id",
     "slug_closed_interval",
     "slug_to_instrument_id",
 ]
 
-#: Reserved for a future composite symbol. A slug containing it is refused.
-INSTRUMENT_SEPARATOR: str = "~"
+#: Reserved for the NO-leg composite symbol ``<slug><SEP>no``. A base slug
+#: containing it is refused. See the module docstring (S2, plan R3-1) for why
+#: this is ``^`` and not the originally-reserved ``~``.
+INSTRUMENT_SEPARATOR: str = "^"
+
+#: The NO-leg composite symbol suffix, appended after :data:`INSTRUMENT_SEPARATOR`.
+_NO_LEG_SUFFIX: str = "no"
 
 #: The single venue identity for this adapter.
 POLYMARKET_US_VENUE: Venue = Venue("POLYMARKET_US")
@@ -114,9 +142,10 @@ POLYMARKET_US_VENUE: Venue = Venue("POLYMARKET_US")
 REGISTRY_VENUE_KEY: str = "polymarket_us"
 
 #: Permitted slug characters. Deliberately narrow: it excludes ``.`` (breaks
-#: ``InstrumentId`` round-tripping), ``~`` (reserved), whitespace, ``/`` and
-#: ``?`` (either of which would change the meaning of a URL path segment the
-#: slug is interpolated into).
+#: ``InstrumentId`` round-tripping), ``^`` (reserved, see
+#: ``INSTRUMENT_SEPARATOR``), whitespace, ``/`` and ``?`` (either of which
+#: would change the meaning of a URL path segment the slug is interpolated
+#: into).
 _SLUG_RE: re.Pattern[str] = re.compile(r"^[a-z0-9][a-z0-9_-]*$")
 
 _MAX_SLUG_LENGTH: int = 128
@@ -224,6 +253,91 @@ def instrument_id_to_slug(instrument_id: InstrumentId, venue: Venue = POLYMARKET
     slug: str = str(instrument_id.symbol.value)
     assert_valid_slug(slug)
     return slug
+
+
+def no_leg_instrument_id(slug: str, venue: Venue = POLYMARKET_US_VENUE) -> InstrumentId:
+    """Build the composite ``InstrumentId`` for the NO leg of ``slug``.
+
+    ``slug`` is validated first (it must be a plain base slug, never already
+    a composite id). The result is NOT a valid input to
+    :func:`instrument_id_to_slug`/:func:`slug_to_instrument_id` -- those stay
+    an untouched bijection over base slugs only (N2-1).
+    """
+    assert_valid_slug(slug)
+    return InstrumentId(Symbol(f"{slug}{INSTRUMENT_SEPARATOR}{_NO_LEG_SUFFIX}"), venue)
+
+
+def leg_of(instrument_id: InstrumentId) -> Literal["yes", "no"]:
+    """``"no"`` for a composite NO-leg id built by :func:`no_leg_instrument_id`, else ``"yes"``."""
+    symbol = str(instrument_id.symbol.value)
+    suffix = f"{INSTRUMENT_SEPARATOR}{_NO_LEG_SUFFIX}"
+    return "no" if symbol.endswith(suffix) else "yes"
+
+
+def base_slug_of(instrument_id: InstrumentId, venue: Venue = POLYMARKET_US_VENUE) -> str:
+    """Recover the underlying venue slug from either leg's ``InstrumentId``.
+
+    Unlike :func:`instrument_id_to_slug`, this accepts a NO-leg id -- it is
+    the ONLY sanctioned way to read a slug off a NO id; every existing caller
+    of :func:`instrument_id_to_slug` keeps refusing one instead.
+    """
+    symbol = str(instrument_id.symbol.value)
+    suffix = f"{INSTRUMENT_SEPARATOR}{_NO_LEG_SUFFIX}"
+    slug = symbol.removesuffix(suffix)
+    assert_valid_slug(slug)
+    if instrument_id.venue != venue:
+        raise VenuePayloadError(
+            f"InstrumentId {instrument_id} belongs to venue {instrument_id.venue}, "
+            f"not {venue}; refusing to read it as a Polymarket.us slug"
+        )
+    return slug
+
+
+def sibling_instrument_id(
+    instrument_id: InstrumentId, venue: Venue = POLYMARKET_US_VENUE
+) -> InstrumentId:
+    """The other leg (YES<->NO) of the same market slug. An involution."""
+    slug = base_slug_of(instrument_id, venue)
+    if leg_of(instrument_id) == "no":
+        return slug_to_instrument_id(slug, venue)
+    return no_leg_instrument_id(slug, venue)
+
+
+def catalog_sql_alias(instrument_id: InstrumentId) -> str:
+    """Mirror Nautilus's ``parquet.py:_sanitize_sql_identifier`` exactly.
+
+    That function aliases ``.``, ``-``, `` ``, ``^`` and ``:`` all to ``_``
+    then lowercases, when building the SQL table/view identifier a
+    ``ParquetDataCatalog`` query runs against. Two DIFFERENT instrument ids
+    (e.g. a NO-leg composite id and an unrelated base slug spelled with an
+    underscore instead of a hyphen) can therefore alias to the SAME table,
+    silently dropping one side's rows from an unfiltered catalog query. This
+    helper computes that alias so :func:`assert_catalog_aliases_are_unique`
+    can catch a collision before any data is ever written under it.
+    """
+    identifier = str(instrument_id)
+    for char in (".", "-", " ", "^", ":"):
+        identifier = identifier.replace(char, "_")
+    return identifier.lower()
+
+
+def assert_catalog_aliases_are_unique(instrument_ids: Iterable[InstrumentId]) -> None:
+    """Raise :class:`VenuePayloadError` if any two distinct ids share a catalog alias.
+
+    Run over every instrument id (both legs) built for one discovery cycle,
+    before any of them is added to the provider's cache.
+    """
+    seen: dict[str, InstrumentId] = {}
+    for instrument_id in instrument_ids:
+        alias = catalog_sql_alias(instrument_id)
+        prior = seen.get(alias)
+        if prior is not None and prior != instrument_id:
+            raise VenuePayloadError(
+                f"InstrumentId {instrument_id} and {prior} both sanitise to the "
+                f"same catalog SQL alias {alias!r}; refusing to admit both, as an "
+                "unfiltered catalog query would silently drop one side's rows"
+            )
+        seen[alias] = instrument_id
 
 
 def _parse_bounds(raw_bounds: str) -> tuple[tuple[str, int], ...] | None:

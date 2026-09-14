@@ -148,6 +148,7 @@ from breezy.adapters.polymarket_us.symbology import (
     REGISTRY_VENUE_KEY,
     assert_bounds_cross_checked,
     assert_valid_slug,
+    no_leg_instrument_id,
     parse_weather_slug,
     slug_to_instrument_id,
 )
@@ -1339,6 +1340,10 @@ def parse_binary_option(
         # Recorded verbatim, per market. PolymarketUSFeeModel reads it from here.
         FEE_COEFFICIENT_KEY: None if fee_coefficient is None else str(fee_coefficient),
         FEE_SCHEDULE_STATUS_KEY: fee_schedule_status,
+        # Additive S2 marker (plan `NO_SIDE_EDGE_2026-09-14.md` S2): every
+        # existing caller reads `info` by key, never by exact-equality, so
+        # this never breaks a caller that ignores it.
+        LEG_KEY: LEG_YES,
     }
     active_sites = default_registry() if sites is None else sites
     info.update(_weather_info(market, slug, sites=active_sites, venue_key=venue_key))
@@ -1365,6 +1370,84 @@ def parse_binary_option(
         description=_description(market),
         info=info,
     )
+
+
+#: `info["leg"]` marker values (S2, plan `NO_SIDE_EDGE_2026-09-14.md`). Additive.
+LEG_KEY: str = "leg"
+LEG_YES: str = "yes"
+LEG_NO: str = "no"
+
+
+def parse_binary_option_pair(
+    payload: Mapping[str, Any],
+    *,
+    venue: Venue = POLYMARKET_US_VENUE,
+    ts_init: int,
+    sites: SiteRegistry | None = None,
+    venue_key: str = REGISTRY_VENUE_KEY,
+) -> tuple[BinaryOption, BinaryOption | None]:
+    """Build the YES leg (:func:`parse_binary_option`, unchanged) plus its NO leg.
+
+    The NO leg is the second (non-``long``) entry of ``marketSides``, never a
+    hardcoded ``"No"`` outcome string. It shares ``raw_symbol=Symbol(slug)``
+    with the YES leg (the venue slug identifies the MARKET, not the leg) and
+    gets the composite id from :func:`~breezy.adapters.polymarket_us.
+    symbology.no_leg_instrument_id`. ``info`` is copied from the YES leg
+    (including :data:`FEE_COEFFICIENT_KEY`) with ``info["leg"]`` overwritten
+    to ``"no"``. A market with no second side returns ``(yes, None)``.
+    """
+    yes = parse_binary_option(
+        payload, venue=venue, ts_init=ts_init, sites=sites, venue_key=venue_key
+    )
+
+    market = _require_mapping(payload, "market", context="market payload")
+    slug = _require(market, "slug", error=InstrumentDefinitionError)
+    assert_valid_slug(slug)
+    sides, _yes_outcome = _market_sides(market, slug)
+    no_sides = [side for side in sides if side.get("long") is not True]
+    if not no_sides:
+        return yes, None
+    if len(no_sides) != 1:
+        raise InstrumentDefinitionError(
+            f"Expected exactly one non-long market side for {slug!r}, found {len(no_sides)}"
+        )
+    no_outcome = _require(no_sides[0], "description", error=InstrumentDefinitionError)
+    if not isinstance(no_outcome, str) or not no_outcome.strip():
+        raise InstrumentDefinitionError(
+            f"Non-long market side for {slug!r} carries no usable outcome description"
+        )
+
+    no_info: dict[str, Any] = dict(yes.info)
+    no_info[LEG_KEY] = LEG_NO
+
+    # F1 fee guard (`test_polymarket_us_fee_guard.py`): `.maker_fee`/`.taker_fee`
+    # are UNGUARDED reads of a Nautilus-native field that holds a placeholder
+    # `Decimal(0)` when the fee schedule is UNKNOWN, so the NO leg's fee is
+    # re-derived from the payload -- exactly what `parse_binary_option` itself
+    # does -- rather than read back off the already-built YES instrument.
+    fee_coefficient, _fee_schedule_status = _parse_fee_coefficient(market)
+
+    no_leg = BinaryOption(
+        instrument_id=no_leg_instrument_id(slug, venue),
+        raw_symbol=Symbol(slug),
+        asset_class=AssetClass.ALTERNATIVE,
+        currency=USD,
+        price_precision=yes.price_precision,
+        size_precision=yes.size_precision,
+        price_increment=yes.price_increment,
+        size_increment=yes.size_increment,
+        activation_ns=yes.activation_ns,
+        expiration_ns=yes.expiration_ns,
+        ts_event=yes.ts_event,
+        ts_init=ts_init,
+        min_quantity=yes.min_quantity,
+        maker_fee=fee_coefficient,
+        taker_fee=fee_coefficient,
+        outcome=no_outcome,
+        description=yes.description,
+        info=no_info,
+    )
+    return yes, no_leg
 
 
 def _description(market: Mapping[str, Any]) -> str | None:

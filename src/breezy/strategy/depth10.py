@@ -45,6 +45,7 @@ def market_quote_from_depth(
     depth: OrderBookDepth10,
     *,
     include_ask_ladder: bool = False,
+    include_bid_ladder: bool = False,
 ) -> MarketQuote | None:
     """Build a ``MarketQuote`` from a Depth10 snapshot, pad-safe.
 
@@ -52,6 +53,9 @@ def market_quote_from_depth(
     book is not a quote. ``mid`` stays ``None`` unless both sides are
     populated -- ``MarketQuote.__post_init__`` will not average a real ask
     against a synthetic zero bid.
+
+    ``include_bid_ladder`` is additive (S2, plan `NO_SIDE_EDGE_2026-09-14.md`):
+    every existing caller defaults it ``False`` and is unaffected.
     """
     bid = best_order(depth.bids)
     ask = best_order(depth.asks)
@@ -63,6 +67,12 @@ def market_quote_from_depth(
             (float(level.price), float(level.size)) for level in depth.asks if level.size > 0
         )
         ask_ladder = populated or None
+    bid_ladder: tuple[tuple[float, float], ...] | None = None
+    if include_bid_ladder:
+        populated_bids = tuple(
+            (float(level.price), float(level.size)) for level in depth.bids if level.size > 0
+        )
+        bid_ladder = populated_bids or None
     return MarketQuote(
         instrument_id=str(depth.instrument_id),
         bid=float(bid.price) if bid is not None else None,
@@ -71,4 +81,5 @@ def market_quote_from_depth(
         ask_size=float(ask.size) if ask is not None else None,
         ts_event=datetime.fromtimestamp(depth.ts_event / 1_000_000_000, tz=UTC),
         ask_ladder=ask_ladder,
+        bid_ladder=bid_ladder,
     )

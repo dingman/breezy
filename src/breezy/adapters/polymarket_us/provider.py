@@ -45,11 +45,12 @@ from nautilus_trader.model.identifiers import InstrumentId, Venue
 from breezy.adapters.polymarket_us.config import PolymarketUSMarketDiscoveryConfig
 from breezy.adapters.polymarket_us.errors import EmptyClimateListingError, VenuePayloadError
 from breezy.adapters.polymarket_us.http import PolymarketUSHttpClient, SupportsVenueLog
-from breezy.adapters.polymarket_us.parsing import parse_binary_option
+from breezy.adapters.polymarket_us.parsing import parse_binary_option_pair
 from breezy.adapters.polymarket_us.symbology import (
     POLYMARKET_US_VENUE,
     REGISTRY_VENUE_KEY,
     assert_bounds_cross_checked,
+    assert_catalog_aliases_are_unique,
     assert_valid_slug,
     instrument_id_to_slug,
     parse_weather_slug,
@@ -342,7 +343,7 @@ class PolymarketUSInstrumentProvider(InstrumentProvider):
         # (`.venv/.../nautilus_trader/common/providers.py:152-192`, never
         # cleared) strictly WORSE by adding every parseable market before an
         # abort instead of only the ones that preceded today's first raise.
-        pending_adds: list[tuple[str, Any]] = []
+        pending_adds: list[tuple[str, Any, Any | None]] = []
         failures: list[_StageThreeFailure] = []
         for market in discovered:
             if market.resolved_reason is not None:
@@ -351,7 +352,7 @@ class PolymarketUSInstrumentProvider(InstrumentProvider):
             try:
                 self._assert_bounds(market.payload, market.slug)
                 payload = {"market": market.payload}
-                instrument = parse_binary_option(
+                instrument, no_instrument = parse_binary_option_pair(
                     payload,
                     venue=self._venue,
                     ts_init=self._clock.timestamp_ns(),
@@ -372,7 +373,7 @@ class PolymarketUSInstrumentProvider(InstrumentProvider):
                 # still aborts immediately, exactly as it does today.
                 failures.append(_StageThreeFailure.from_exception(market.slug, exc))
                 continue
-            pending_adds.append((market.slug, instrument))
+            pending_adds.append((market.slug, instrument, no_instrument))
 
         if failures:
             # CF-14a C1: the tally is logged HERE, by the provider, before the
@@ -382,7 +383,7 @@ class PolymarketUSInstrumentProvider(InstrumentProvider):
             # exact case it exists for.
             parsed_pending = [
                 (slug, parsed.climate_date if (parsed := parse_weather_slug(slug)) else None)
-                for slug, _instrument in pending_adds
+                for slug, _instrument, _no_instrument in pending_adds
             ]
             self._discovery_log.error(
                 _cohort_failure_tally(
@@ -397,9 +398,30 @@ class PolymarketUSInstrumentProvider(InstrumentProvider):
             # assertion needs touching.
             raise failures[0].exception
 
+        # R3-1/coordinator hazard: the catalog's SQL sanitiser can alias two
+        # DIFFERENT instrument ids (a NO-leg composite id vs. an unrelated
+        # base slug spelled with `-`/`_` interchangeably) to the same table,
+        # silently dropping one side. Checked over every id (both legs) about
+        # to be added, before any of them is added.
+        assert_catalog_aliases_are_unique(
+            instrument_id
+            for _slug, instrument, no_instrument in pending_adds
+            for instrument_id in (
+                (instrument.id, no_instrument.id) if no_instrument is not None else (instrument.id,)
+            )
+        )
+
         active_slugs: list[str] = []
-        for slug, instrument in pending_adds:
+        for slug, instrument, no_instrument in pending_adds:
             self.add(instrument)
+            if no_instrument is not None:
+                self.add(no_instrument)
+            # R3-6 both-legs assertion: this lives HERE (immediately after the
+            # add loop), never in `_reconcile_discovered_subscriptions`, which
+            # is a slug-keyed subscription planner that never sees a NO id.
+            assert self.find(instrument.id) is not None
+            if no_instrument is not None:
+                assert self.find(no_instrument.id) is not None
             active_slugs.append(slug)
 
         self._market_slugs = slugs
@@ -447,7 +469,7 @@ class PolymarketUSInstrumentProvider(InstrumentProvider):
                 MARKET_BY_SLUG_PATH.format(slug=slug),
                 quota_key=QUOTA_KEY_INSTRUMENTS,
             )
-            instrument = parse_binary_option(
+            instrument, no_instrument = parse_binary_option_pair(
                 payload,
                 venue=self._venue,
                 ts_init=self._clock.timestamp_ns(),
@@ -459,7 +481,18 @@ class PolymarketUSInstrumentProvider(InstrumentProvider):
                     f"Requested market slug {slug!r} but the venue returned "
                     f"{instrument.id.symbol.value!r}"
                 )
+            # See `load_all_async` for why this check runs before either leg
+            # is added (R3-1/coordinator catalog-alias hazard).
+            assert_catalog_aliases_are_unique(
+                (instrument.id, no_instrument.id) if no_instrument is not None else (instrument.id,)
+            )
             self.add(instrument)
+            if no_instrument is not None:
+                self.add(no_instrument)
+            # R3-6 both-legs assertion (see `load_all_async`).
+            assert self.find(instrument.id) is not None
+            if no_instrument is not None:
+                assert self.find(no_instrument.id) is not None
 
     async def _discover_markets(self) -> tuple[DiscoveredMarket, ...]:
         discovered: list[DiscoveredMarket] = []
