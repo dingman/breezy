@@ -159,6 +159,18 @@ _ONE: Final[Decimal] = Decimal(1)
 #: shape -- either side `None` marks an open (unbounded) tail rung.
 RungBounds = tuple[int | None, int | None]
 
+#: The only two legal `side` values on `DecisionInputs`/`Take` (S3 fix-first
+#: review finding 1). `Literal["yes", "no"]` is a static hint only -- it does
+#: not stop `side="Yes"`/`None`/a typo reaching either dataclass at runtime,
+#: so both validate against this set in `__post_init__`, raising BEFORE any
+#: gate in `evaluate_decision` runs.
+_VALID_SIDES: Final[frozenset[str]] = frozenset({"yes", "no"})
+
+
+def _assert_valid_side(side: object) -> None:
+    if side not in _VALID_SIDES:
+        raise ValueError(f"side must be one of {sorted(_VALID_SIDES)!r}, was {side!r}")
+
 
 @dataclass(frozen=True, slots=True, kw_only=True)
 class DecisionInputs:
@@ -203,6 +215,9 @@ class DecisionInputs:
     bid: Decimal | None = None
     bid_size: Decimal | None = None
 
+    def __post_init__(self) -> None:
+        _assert_valid_side(self.side)
+
 
 @dataclass(frozen=True, slots=True)
 class Refuse:
@@ -238,6 +253,9 @@ class Take:
     rung: RungBounds
     side: Literal["yes", "no"] = "yes"
     p_bound: Decimal | None = None
+
+    def __post_init__(self) -> None:
+        _assert_valid_side(self.side)
 
 
 Decision = Refuse | Take
@@ -315,30 +333,73 @@ def evaluate_decision(inputs: DecisionInputs) -> Decision:
 
     key = (inputs.station, inputs.season, inputs.hour_lst, inputs.width_code, inputs.m_code)
 
-    if inputs.side == "no":
+    # Exhaustive dispatch on the two validated `side` values (S3 fix-first
+    # review finding 1) -- `DecisionInputs.__post_init__` already refused any
+    # other value at construction, so this `else` is defence in depth, never
+    # reachable in practice.
+    if inputs.side == "yes":
+        p_hold_lower = P_HOLD_LOWER.get(key)
+        return _finalize_take(
+            inputs,
+            price=inputs.ask,
+            size=inputs.size,
+            p_bound=p_hold_lower,
+            rung=rung,
+            side="yes",
+        )
+    elif inputs.side == "no":
         return _evaluate_no_side(inputs, key=key, rung=rung)
+    else:  # pragma: no cover - unreachable, `__post_init__` already validated `side`.
+        raise ValueError(f"unreachable: side={inputs.side!r}")
 
+
+def _finalize_take(
+    inputs: DecisionInputs,
+    *,
+    price: Decimal,
+    size: Decimal | int,
+    p_bound: Decimal | None,
+    rung: RungBounds,
+    side: Literal["yes", "no"],
+) -> Decision:
+    """Shared executable+lookup+break-even test for BOTH sides.
+
+    ``price``/``size`` are already side-resolved by the caller (YES:
+    ``ask``/``size``; NO: ``1 - bid``/``bid_size``) and ``p_bound`` is
+    already the side's own estimand (``P_HOLD_LOWER`` for YES,
+    ``1 - P_HOLD_UPPER`` for NO) -- this function only runs the shared rule
+    order (executable, then defined, then break-even), never any inversion.
+    """
     executable = (
-        inputs.config.executable_ask_lower < inputs.ask < inputs.config.executable_ask_upper
-        and inputs.size >= inputs.config.minimum_displayed_size
+        inputs.config.executable_ask_lower < price < inputs.config.executable_ask_upper
+        and size >= inputs.config.minimum_displayed_size
     )
     if not executable:
         return Refuse("not_executable")
 
-    p_hold_lower = P_HOLD_LOWER.get(key)
-    if p_hold_lower is None:
+    if p_bound is None:
         return Refuse("p_hold_undefined")
 
-    break_even = inputs.ask + _fee(inputs.ask, inputs.fee_coefficient)
-    if not (p_hold_lower > break_even):
+    break_even = price + _fee(price, inputs.fee_coefficient)
+    if not (p_bound > break_even):
         return Refuse("edge_below_break_even")
 
+    if side == "yes":
+        return Take(
+            quantity=inputs.config.order_quantity,
+            limit_price=price,
+            p_hold_lower=p_bound,
+            break_even=break_even,
+            rung=rung,
+        )
     return Take(
         quantity=inputs.config.order_quantity,
-        limit_price=inputs.ask,
-        p_hold_lower=p_hold_lower,
+        limit_price=price,
+        p_hold_lower=p_bound,
         break_even=break_even,
         rung=rung,
+        side="no",
+        p_bound=p_bound,
     )
 
 
@@ -357,28 +418,13 @@ def _evaluate_no_side(
         return Refuse("not_executable")
 
     no_ask = _ONE - inputs.bid
-    executable = (
-        inputs.config.executable_ask_lower < no_ask < inputs.config.executable_ask_upper
-        and inputs.bid_size >= inputs.config.minimum_displayed_size
-    )
-    if not executable:
-        return Refuse("not_executable")
-
     p_hold_upper = P_HOLD_UPPER.get(key)
-    if p_hold_upper is None:
-        return Refuse("p_hold_undefined")
-    p_miss_lower = _ONE - p_hold_upper
-
-    break_even = no_ask + _fee(no_ask, inputs.fee_coefficient)
-    if not (p_miss_lower > break_even):
-        return Refuse("edge_below_break_even")
-
-    return Take(
-        quantity=inputs.config.order_quantity,
-        limit_price=no_ask,
-        p_hold_lower=p_miss_lower,
-        break_even=break_even,
+    p_miss_lower = None if p_hold_upper is None else _ONE - p_hold_upper
+    return _finalize_take(
+        inputs,
+        price=no_ask,
+        size=inputs.bid_size,
+        p_bound=p_miss_lower,
         rung=rung,
         side="no",
-        p_bound=p_miss_lower,
     )

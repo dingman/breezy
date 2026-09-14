@@ -18,6 +18,8 @@ import dataclasses
 import datetime as dt
 from decimal import Decimal
 
+import pytest
+
 from breezy.strategy.current_rung_hold.config import CurrentRungHoldConfig
 from breezy.strategy.current_rung_hold.decision import (
     DecisionInputs,
@@ -218,3 +220,31 @@ def test_no_ask_inversion_is_exact_decimal_arithmetic_at_every_cent_tick() -> No
         if isinstance(decision, Take):
             assert decision.limit_price == Decimal(1) - bid
             assert decision.limit_price.as_tuple().exponent >= -2
+
+
+# ---------------------------------------------------------------------------
+# Fix-first review finding 1: `side` is validated at construction, and the
+# branch in `evaluate_decision` is exhaustive. An invalid `side` must raise
+# BEFORE any gate runs -- never fall through to the YES path.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("bad_side", ["Yes", None, "typo", "", "NO", "yes "])
+def test_decision_inputs_rejects_an_invalid_side_before_any_gate_runs(
+    bad_side: object,
+) -> None:
+    with pytest.raises(ValueError, match="side"):
+        _take_case_inputs(side=bad_side)
+
+
+@pytest.mark.parametrize("bad_side", ["Yes", None, "typo", "", "NO", "yes "])
+def test_take_rejects_an_invalid_side(bad_side: object) -> None:
+    with pytest.raises(ValueError, match="side"):
+        Take(
+            quantity=1,
+            limit_price=Decimal("0.40"),
+            p_hold_lower=Decimal("0.6585"),
+            break_even=Decimal("0.41"),
+            rung=(70, 71),
+            side=bad_side,  # type: ignore[arg-type]
+        )

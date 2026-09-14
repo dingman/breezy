@@ -12,6 +12,7 @@ the frozen take test (``decision.py``) -- never reimplemented here.
 from __future__ import annotations
 
 from collections.abc import Sequence
+from dataclasses import dataclass
 from datetime import date
 from decimal import Decimal
 
@@ -31,6 +32,7 @@ __all__ = [
     "WIDTH_INTERIOR",
     "WIDTH_OPEN_LOWER",
     "WIDTH_OPEN_UPPER",
+    "BothSides",
     "build_eligible_inputs",
     "build_eligible_inputs_no_side",
     "evaluate_both_sides",
@@ -145,8 +147,8 @@ def build_eligible_inputs_no_side(
     now_ns: int,
     ladder: Sequence[RungBounds],
     fee_coefficient: Decimal | None,
-    bid: Decimal,
-    bid_size: Decimal,
+    bid: Decimal | None,
+    bid_size: Decimal | None,
     running_max: RunningMax,
     staleness_ns: int | None,
     config: CurrentRungHoldConfig,
@@ -159,7 +161,10 @@ def build_eligible_inputs_no_side(
     ``ask``/``size`` are unused for ``side="no"`` (``evaluate_decision``
     never reads them on that branch) and are filled with harmless
     placeholders so :class:`DecisionInputs` stays a single, side-generic
-    type rather than growing an optional-``ask`` special case.
+    type rather than growing an optional-``ask`` special case. ``bid``/
+    ``bid_size`` are ``None``-able so a frame with no bid still builds
+    (``DecisionInputs`` then refuses ``not_executable`` on the NO side,
+    exactly the missing-bid gate ``_evaluate_no_side`` already runs).
     """
     if fee_coefficient is None:
         return Refuse("fee_schedule_mismatch")
@@ -192,8 +197,8 @@ def evaluate_eligible_snapshot_no_side(
     now_ns: int,
     ladder: Sequence[RungBounds],
     fee_coefficient: Decimal | None,
-    bid: Decimal,
-    bid_size: Decimal,
+    bid: Decimal | None,
+    bid_size: Decimal | None,
     running_max: RunningMax,
     staleness_ns: int | None,
     config: CurrentRungHoldConfig,
@@ -222,6 +227,14 @@ def evaluate_eligible_snapshot_no_side(
     return evaluate_decision(built)
 
 
+@dataclass(frozen=True, slots=True)
+class BothSides:
+    """The two independent per-side ``Decision``s from one Depth10 frame."""
+
+    yes: Decision
+    no: Decision
+
+
 def evaluate_both_sides(
     *,
     station: str,
@@ -231,27 +244,39 @@ def evaluate_both_sides(
     fee_coefficient: Decimal | None,
     ask: Decimal,
     ask_size: int,
-    bid: Decimal,
-    bid_size: Decimal,
+    bid: Decimal | None,
+    bid_size: Decimal | None,
     running_max: RunningMax,
     staleness_ns: int | None,
     config: CurrentRungHoldConfig,
     hour_lst: int,
     width_code: int,
     m_code: int,
-) -> tuple[Decision, Decision]:
+) -> BothSides:
     """Evaluate the YES ask side and the NO bid side of ONE Depth10 frame.
 
-    Returns ``(yes_decision, no_decision)``, each an independent call
+    Returns a :class:`BothSides` of ``(yes, no)``, each an independent call
     through the existing per-side evaluate path -- at most one ``Take`` per
     side (S3, plan §4 item 3). Both sides share the SAME ``ladder``,
     ``running_max``, ``width_code``/``m_code`` (current rung only, unchanged
     -- ``instrument_rung_is_current`` gates a whole instrument, not a side).
 
+    A CROSSED or LOCKED book (``bid >= ask``) refuses BOTH sides
+    ``not_executable``, not ``observation_ambiguous`` -- ``observation_ambiguous``
+    is ``RunningMax.spans`` naming a genuinely ambiguous OBSERVATION (the
+    running extreme spans two rungs); a crossed book is a bad QUOTE, the
+    same class of fault the existing ask-band/size checks already report as
+    ``not_executable``. Checked before either side's own gates run, so a
+    crossed frame never reaches a table lookup on either leg.
+
     Attaching the NO instrument id (``symbology.sibling_instrument_id``) to
-    ``no_decision`` and dispatching it is STRATEGY-layer wiring, owned by a
-    different slice -- out of this pure module's scope.
+    ``no`` and dispatching it is STRATEGY-layer wiring, owned by a different
+    slice -- out of this pure module's scope.
     """
+    if bid is not None and bid >= ask:
+        crossed = Refuse("not_executable")
+        return BothSides(yes=crossed, no=crossed)
+
     yes_decision = evaluate_eligible_snapshot(
         station=station,
         climate_day=climate_day,
@@ -282,4 +307,4 @@ def evaluate_both_sides(
         width_code=width_code,
         m_code=m_code,
     )
-    return yes_decision, no_decision
+    return BothSides(yes=yes_decision, no=no_decision)
