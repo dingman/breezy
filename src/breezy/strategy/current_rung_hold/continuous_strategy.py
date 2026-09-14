@@ -33,6 +33,7 @@ from breezy.adapters.polymarket_us.errors import (
 )
 from breezy.adapters.polymarket_us.exec import submit_chain
 from breezy.adapters.polymarket_us.exec.client import DurableFillRecord
+from breezy.adapters.polymarket_us.exec.no_side_keys import is_no_side_pending
 from breezy.adapters.polymarket_us.operator_controls import utc_day_for_ns
 from breezy.adapters.polymarket_us.parsing import assert_fee_schedule_known
 from breezy.adapters.polymarket_us.symbology import (
@@ -1118,6 +1119,17 @@ class ContinuousRungHoldStrategy(Strategy):
 
         store = self._latch._store
         prefix = self._latch._key_prefix
+        # NO-SIDE S5 (E3-2/E3-5): the bounded first-order containment
+        # window, checked IMMEDIATELY after `is_intent_open` and BEFORE any
+        # side effect below (mirroring `is_intent_open`'s own pre-filter
+        # precedent). This does NOT refuse the evaluation itself -- the
+        # hunt stays observable while pending (E3-5): every gate below
+        # still runs, and only the terminal shadow log's `pending=` field
+        # reflects the containment state. Submission (this method's
+        # `NO_SIDE_SHADOW_ONLY` scope has none yet) is the thing the
+        # closed-set reason `no_side_first_order_pending`
+        # (`LATCH_GATE_REFUSAL_REASONS`) will gate once §5 flips the flag.
+        pending = is_no_side_pending(store)
 
         sibling_refusal = refuse_if_sibling_leg_traded(
             store, prefix, station, climate_day_key, no_iid,
@@ -1179,7 +1191,8 @@ class ContinuousRungHoldStrategy(Strategy):
         self._record_no_take_shadow(
             f"no_take_shadow: station={station} instrument={no_iid} "
             f"no_ask={no_decision.limit_price} p_miss_lower={no_decision.p_bound} "
-            f"be={no_decision.break_even} bid_size={bid_size}"
+            f"be={no_decision.break_even} bid_size={bid_size} "
+            f"pending={1 if pending else 0}"
         )
 
     def _record_no_take_shadow(self, summary: str) -> None:
