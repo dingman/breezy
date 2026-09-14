@@ -350,3 +350,15 @@ LAST step and is not part of the 2026-09-15 01:23Z live merge.
 ### Merge plan
 Track C (with E6-1 fix) and Track D merge into the base together → joint review of the NO fill → scorer → tally path → base
 gate → only then the flip commit is admissible. The 2026-09-15 01:23Z live merge carries the base WITHOUT C/D.
+
+### Rev 6a — joint C+D review (abacc6c): HOLD on E3-1; E3-1 is shape-agnostic and lands now
+The end-to-end trace of one NO take (arm → C1 prefix → wire → echo cross-check → fill record → consume → scorer → tally →
+second-take WAIT) passed every control a YES order passes, with no new callee under the order coroutine. The single hold: the
+never-arm walk still halts the WHOLE strategy on the next boot if the venue reports a LONG on the YES id after a NO fill
+(`_POSITION_UNRECONCILED_LONG` → `on_start` stop). E3-1 was held pending the position-shape ruling, but the cross-check is
+shape-agnostic — a venue that nets the NO as non-long never enters the halt block, and a venue that reports LONG is accounted
+by the sibling NO fill (sibling exclusion makes the attribution unambiguous) — so it strictly reduces halts and lands on the
+joint branch before the flip. The E2-1 protocol still governs NO arming; the position-shape ruling still decides `_map_position`.
+Track D (bdf51a0) reviewed APPROVE: inversion applied once, five replaced tests were mechanism-only, YES rows now carry a rung
+key which cannot fold in real data (one trial per instrument-day). Joint gate re-runs after E3-1 (the first run overlapped an
+edit in the same worktree and is discarded, L-43 / one-tree-many-agents).
