@@ -29,7 +29,7 @@ Everything else is build-side.
 - **G-01 prelim→final revision POWERED FAIL** on MDW/NYC/SFO; interior-bucket strategies dead. `docs/evidence/observation_lock_falsification_2026-08-31.md`.
 - **Lock strategies DEAD (L-9); forecast family KILLED; K1 DEAD at ask ≥2c; candidate #2 THIN, NOT A GO.** Do not design a new family.
 - **Price history is forward-only; a forecast archive is a CALIBRATION set.** Venue surface = 5 cities × daily HIGH; no NO-side instrument (BL-6).
-- **NO FAMILY HAS A PROVEN EDGE; ONE IS UNDER LIVE MEASUREMENT** (`pm_us_crh_cont`, PREREG v3 BINDING, d0 2026-09-12; `pm_us_crh_v2` still REGISTERED). Demonstrated edge NONE; admissible n = 0 after 8 live days; 2 orders, 1 fill (09-11 SFO @0.22, resolver path → residual by v3 §5).
+- **NO FAMILY HAS A PROVEN EDGE; ONE IS UNDER LIVE MEASUREMENT** (`pm_us_crh_cont`, PREREG v3 BINDING, d0 2026-09-12; `pm_us_crh_v2` still REGISTERED). Demonstrated edge NONE; admissible n = 0 after 10 live days; 3 orders, 2 fills (09-11 SFO @0.22, 09-13 MIA @0.70; both resolver path → residual by v3 §5). Multi-position ruling 09-14 (R-10) lifts the one-per-station bound; MP-A merged b5a7c04.
 - **Readiness audit 2026-09-12** (`docs/evidence/READINESS_AUDIT_2026-09-12.md`): the KILL-clock counter read 0/15 for 09-05..09-11 BY MECHANISM (any-overlap rule + feed-wide gap fan-out; L-38), not by outage; the create-path accept-fill branch has never fired live; v3 has never been fill-replayed; alerts reach nobody.
 
 ---
@@ -46,11 +46,11 @@ order; B = build, O = operator, S = strategy-lead ruling.
 
 | ID | Own | Sev | Item | Plan | Size |
 |---|---|---|---|---|---|
-| SP-0 | B | DONE 09-12 | v3 launch state is build-side (flags are not operator controls, ruling 09-10). Decision 2026-09-12: the 16:50Z launch goes LIVE per the 09-10 operator direction and the 15:36Z freeze instruction; bound = 4 stations × 1 position × per-position cap, latch durable, ledger in-memory per process. Shadow stays a one-day reversible option (drop-in procedure, P1 §8 D-1) if SP-4's replay finds a hunt defect. | `SCOPE_STOP_AND_OPS_SERIALIZE_2026-09-12.md` §8 D-1 | — |
-| SP-1 | B | **CRIT** | **No v3 tally exists** (timer runs `pm_us_crh_v2` only, `breezy-pm-crh-v2-tally.service:46`; wrapper gates structural-dead args on v2, `family-tally-v2-run.sh:73,85`) — wire a nightly `pm_us_crh_cont` producer (I5, needs R-4). Stop-doing + serialize: disable k1/offer-gate/mb timers and the 6-hourly ingest timer; `breezy-studies.slice` + flock; nothing heavy inside [17:00Z, 01:00Z) (LST union, `std_utc_offset_hours`, never DST — reviewer-corrected; margin `[16:45Z, 01:15Z)`); ingest exit code truthful (`quote_tape_ingest_cli.py:803-805` hardcodes `converted`); orphan node accepted under L-26; parking rules | `SCOPE_STOP_AND_OPS_SERIALIZE_2026-09-12.md` | M |
-| SP-2 | B | CRIT | Create-path fill hardening: silent `filled_cost is None` (`submit_chain.py:664-666`); no-leg-selected skips the shape guard (H2); names-only execution key tree emitted and persisted on AMBIGUOUS; `_EXECUTION_DRIFT_ALLOWED_KEYS` gated on captured evidence (none exists today) | `EXEC_CREATE_PATH_HARDENING_2026-09-12.md` | M |
-| SP-3 | B | HIGH | Native reconciliation fed from the durable store: venue-id map on submit/resolver; `generate_order_status_reports`/`generate_fill_reports` (`exec/client.py:1946,1961` return `[]`) gated on open positions; persist `tradeId`/`orderQty`; §5 idempotence with mutation evidence; stale docstrings | `RECONCILIATION_NATIVE_REPORTS_2026-09-12.md` | M |
-| SP-4 | B | HIGH | v3 backtest-only subclass via one `_submission_armed()` seam (a permit-less subclass would replay the SHADOW path); driver `--strategy`; depth-basis CLEAN gate (L-35); one capped SFO 2026-09-01 replay | `V3_BACKTEST_REPLAY_SUBCLASS_2026-09-12.md` | M |
+| ING-1 | B | **CRIT** | **KILL clock blocked by ingest, not by the gap rule** (audit 09-13): the 15-min ingest writes a partial depth slice for the live instance (09-12: 09:00–11:15Z) and every later write is refused as a non-disjoint interval (exit 3 every run; instances 233aa3ad/213d84f7/edb87425 stranded), so in-window Depth10 stays < 30 min and coverage reads 0 with zero gap overlaps. Fix the collision (replace-or-extend the partial file), then re-run coverage; no R-3 tolerance rescues this | `READINESS_AUDIT_2026-09-13.md` | S |
+| MP-B | B/O | HIGH | Increment B: depth-capped, cent-safe, log-redacted sizing from the per-position cap (S2) + qty through scorer/store (S4b). **BLOCKED on R-11**: at mixed qty∈{1,2,3} the pre-solved LD-OBF boundary over-crosses (0.059 vs α 0.025; strict xfail `test_multi_position_validation_2026_09_14.py`) — re-validate at the real qty distribution, re-solve only then. Operator: confirm the per-position value as the intended per-order spend and the daily budget as the intended one-afternoon ceiling | plan §3 Increment B | M |
+| SP-1 | B | **CRIT** (I5) | **No v3 tally exists** (timer runs `pm_us_crh_v2` only, `breezy-pm-crh-v2-tally.service:46`; wrapper gates structural-dead args on v2, `family-tally-v2-run.sh:73,85`) — wire a nightly `pm_us_crh_cont` producer (I5, needs R-4). I1-I4 landed 09-13 as serialize-not-disable: k1/offer-gate/mb timers are still enabled under `breezy-studies.slice` while PROGRESS calls their hypotheses dead — disable them | `SCOPE_STOP_AND_OPS_SERIALIZE_2026-09-12.md` | S |
+| SP-3 | B | A/C DONE 09-13; B1/B2 open | Venue-id map live (proven on CFJ485874TMM); `generate_order_status_reports`/`generate_fill_reports` still return `[]` pending R-1/R-2; `_has_durable_fill_record` still a stub | `RECONCILIATION_NATIVE_REPORTS_2026-09-12.md` | S |
+| SP-4 | B | subclass DONE 09-13; replay **NOT RUN** | v3 backtest subclass, `--strategy continuous_rung_hold`, depth-basis gate landed; the one capped SFO 2026-09-01 replay has no artefact — run it (command in plan :80-91) in a quiet window, record filled trials or BLOCKED reason | `V3_BACKTEST_REPLAY_SUBCLASS_2026-09-12.md` | S |
 | SP-5 | B/S | CRIT | Coverage / KILL clock: read-only diagnostic (blips vs outages vs never-resolved rows from dead recorders); dry-run of tonight's afternoon under the shard-local recorder; ruling package on §9 tolerance; truncation as a named reason | `COVERAGE_KILL_CLOCK_2026-09-12.md` | S+ruling |
 | SP-6 | B/O | HIGH | Alert delivery: delivery receipt, shared sink, gap/disk/ingest routed to it, `breezy-alert-test`, `OnFailure=` template, word-boundary redaction test. OPERATOR supplies the destination (one line in `~/.config/breezy/alerts.env`); until then B4 stays open | `ALERT_DELIVERY_2026-09-12.md` | M |
 | SP-7 | B | LOW | Free hygiene: permit-log leak scan (1.98%/run flake; `test_app_trade_main_permit_logging.py:115`), five doc truth insertions, three docstrings, `PositionReportingLag` disposition; no bulk reformat | `HYGIENE_FREE_FIXES_2026-09-12.md` | S |
@@ -71,14 +71,17 @@ diagnostic is inert until the v3 tally receives the count (R-4).
 | R-3 | §9 coverage tolerance: (i) keep any-overlap, (ii) duration X≈60 s, (iii) span-with-max-gap, (iv) never-resolved rows from dead processes; does a safety-stop calibration trigger v1 §7 re-registration? | SP-5 rule change | P5 §8 |
 | R-4 | v3 §9 is "unchanged from v2" with no carve-out, so the v3 tally MUST receive a v3-scoped count (own `--family-manifest pm_us_crh_cont.json`, d0 09-12, never v2's JSON); today no unit runs the v3 tally at all | SP-1 I5 | P1 §8, R-F |
 | R-5 | Is PREREG v1's 60/150 tally still evidence (may `breezy-live-tally` stop)? | SP-1 I1 | P1 §8 |
-| R-6 | Evidence sufficiency for declaring `_EXECUTION_DRIFT_ALLOWED_KEYS` (repo precedent: one observed key tree) | SP-2 I4 | P2 §8 |
+| R-6 | `_EXECUTION_DRIFT_ALLOWED_KEYS` declared from the 09-13 MIA capture (five keys) | closed 09-14 | `CREATE_ORDER_EXECUTION_DRIFT_2026-09-13_MIA.md` |
+| R-10 | Multi-position ruling: one open position per instrument-day; trial unit = station-day combined draw, exact variance `Σqty²BE(1−BE) − 2Σqty_iqty_jBE_iBE_j`, admission `ΣBE ≤ 1`; PREREG v3 §13:210, §16:276, §12 test 6 amended | closed 09-14 | `RULING_multi_position_per_station_2026-09-14.md` |
+| R-11 | LD-OBF boundary validity at qty>1: H0 crossing 0.059 at mixed qty vs α 0.025 (qty≡1: 0.012). Re-validate at the real Increment-B qty distribution; re-solve the artefact only if it still fails | MP-B | validation slice |
 | R-7 | `PositionReportingLag`: keep and wire on the create path later (recommended), never on the resolver path (`ts_event` is poll cadence) | SP-7 H-8 | P7 §8 |
 | R-8 | ABSENT slug on a FRESH eof-complete page = FLAT for candidate instruments at BOTH `_run_never_arm_walk` and `_rearm_permitted`; supersedes Slice-4 review item 5 (its PASS state was unreachable). Residuals R9/R14. | closed 09-12 | HF-1 |
 | R-9a | Re-arm evidence freshness, build-side constants: `_REARM_EVIDENCE_MAX_AGE_NS`=180s (site 2 only) and `_EVIDENCE_REFRESH_AFTER_NS`=60s (resolver supply); floor 120s < ceiling ⇒ a healthy loop always clears. | closed 09-13 | HF-4 |
 
-**KILL clock (truth as of 09-12):** counter 0/15 for 09-05..09-11 by mechanism; shard-local
-accounting (d3f6c47) live in the recorder since 09-12 09:00Z; first real reading is the 09-13
-14:15Z artefact. Zero-fill / retired-AMBIGUOUS takes are not trials; resolver fills are residual.
+**KILL clock (truth as of 09-13 14:15Z):** counter 0/15 for 09-05..09-13. Shard-local gap
+accounting works (09-12 in-window overlaps = 0 on all four stations); the day is uncovered because
+ingest stranded its Depth10 (ING-1). Zero-fill / retired-AMBIGUOUS takes are not trials; resolver
+fills are residual. **Live n (09-14):** 3 orders, 2 fills (09-11 SFO, 09-13 MIA @0.70), admissible 0.
 
 **Parked (re-open trigger: a v3 verdict, or fills at rate).** Kalshi sibling (`wip/kalshi-s4-registry`,
 `kalshi_crh_v1.json` DRAFT, S11 operator-only); LADDER_EV stage 2 (stage-1 modules stay);
@@ -92,7 +95,7 @@ ruff 24 incl. `persistence/family_manifest.py:42`), CF-13, CF-14b, PF-1, BL-10, 
 
 ## Pointers
 
-Audit `docs/evidence/READINESS_AUDIT_2026-09-12.md` · durable rules `docs/core/LESSONS.md`
-(L-1..L-38, all binding) · evidence `docs/evidence/` · runbook `docs/plans/R8_OPERATOR_RUNBOOK.md`
+Audits `docs/evidence/READINESS_AUDIT_2026-09-13.md` (delta), `READINESS_AUDIT_2026-09-12.md` · durable rules `docs/core/LESSONS.md`
+(L-1..L-40, all binding) · evidence `docs/evidence/` · runbook `docs/plans/R8_OPERATOR_RUNBOOK.md`
 · programme narrative `docs/core/PROGRAMME_PATH.md` · strategy authoring
 `docs/specs/STRATEGY_QUICKSTART.md` · pre-shrink history `docs/core/archive/`
