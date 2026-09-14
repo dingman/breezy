@@ -206,3 +206,40 @@ ruling is a post-first-fill gate that re-enables NO arming.
 
 ### Exit criteria after Rev 3 (unchanged list; E3-1/E3-2/E3-8 are in-slice RED items)
 §1(a)–(e) as after Rev 2; the amendment §8 (first-NO-order residual protocol) is written.
+
+---
+
+## Rev 4 (2026-09-14) — CONVERGED. Round 3: architect CONVERGE; market-math and safety REVISE on documentation precision only.
+
+- **E4-1 (market-math).** Amendment §8 gains the boot-reconcile write (E3-8) as a second, equivalent trigger for the pending
+  state. Done in the same commit as this revision.
+- **E4-2 (market-math, LOW).** §5 body text "TrialDayRecord.reason gets a distinct value the tally excludes" is SUPERSEDED by
+  E2-1(iii)/E3-3: residual is derived from the durable keys via `read_filled_trials_state_db` → `_admit_fill`; the record's
+  `reason` is not the mechanism.
+- **E4-3 (safety, CLI flock).** The new CLI takes the SAME `open_submit_intent_latch` flock as `clear_submit_intent_cli.py`
+  (`src/breezy/runtime/clear_submit_intent_cli.py`, entry `breezy-clear-submit-intent`, pyproject.toml:263) and
+  `clear_family_halt_cli.py` — consistent with both mirrors and harmless; it joins the C10 importer census with a widened clause
+  citing this plan (precedent `test_polymarket_us_readonly_guard.py:2141-2170`), plus its own console-script line and test file
+  `tests/unit/test_mark_no_side_position_captured_cli.py`.
+- **E4-4 (safety, exec module census).** `exec/no_side_keys.py` is I/O-free; the implementer runs the full guard bundle
+  (`test_execution_egress_firewall_guard.py`, `test_cage_rule_constants_are_pinned.py`, `test_polymarket_us_readonly_guard.py`)
+  at RED and adds whatever marker/census entry the X1/E0 scans require, additively with a citation — never a rule change.
+- **E4-5 (safety + architect, `_connect` ordering).** Corrected wording: `_connect` already awaits one immediate resolver pass
+  (`client.py:1192-1224`) before `_reconcile_submit_intent` (:1227) and `_seed_spend_from_durable_fills` (:1233). The E3-8 write
+  goes immediately after `_seed_spend_from_durable_fills` via `self._store_set` (no flock; same unlocked pattern as
+  `_reconcile_submit_intent`/`record_fill`; no `await` in between, so no race with the periodic resolver task), i.e. before the
+  resolver's NEXT pass, not before its first.
+- **E4-6 (safety).** The `LATCH_GATE_REFUSAL_REASONS` pin is `test_latch_gate_refusal_reasons_is_the_closed_set` in
+  `tests/unit/test_current_rung_hold_trial_day_latch.py`; the new reason is added to both the set and that test additively.
+- **E4-7 (architect, INFO).** `pyproject.toml:75-91` declares `strategy` above `adapters`, so the strategy may import
+  `exec/no_side_keys.py` directly; injection is optional.
+- **E4-8 (closed by architect).** E3-1's sibling lookup cannot cross days (`sibling_instrument_id` varies only the leg suffix on
+  the same dated slug); it slots into the `if not slug_ok:` block (`continuous_strategy.py:565`) before `return False`. E3-2's
+  placement after `is_intent_open` (:1115-1117) precedes every side effect; the C1 prefix hosts a synchronous store read.
+
+### Build order (two parallel tracks, one worktree each; merge blocked on §1(a)–(e))
+Track A (exec): §2 X3 commit (+E2-5 test, pre-flight scan at commit time) → §3 submit chain → §4 attribution tests → §1(a)
+census commit moving the capture script under `scripts/analysis/` (+E2-7 rename).
+Track B (state/scorer/strategy): `exec/no_side_keys.py` → E3-7 structural test → CLI (+census, E4-3) → E3-8 boot reconcile →
+E3-3 scorer exclusion → `LATCH_GATE_REFUSAL_REASONS` (+E4-6) → E3-2 gate placement + E3-5 pending shadow log → E3-1 never-arm
+cross-check → §5 flip behind the still-True flag (the flip itself is the LAST commit, after (a)–(e)).

@@ -196,6 +196,8 @@ The residual classification for NO-side create-path trials deviates from PREREG 
 
 1. **Residual Trigger:** The FIRST live NO create-path order is marked residual (fee-unreconciled, excluded from n and every look). A durable key `exec/polymarket_us/no_side/first_live_order` is written atomically at submission, persisting the instrument ID, venue order ID (when known), and timestamp.
 
+1b. **Equivalent trigger at boot (fail-closed):** if, at exec-client connect, any NO-leg durable fill record exists while `exec/polymarket_us/no_side/first_live_order` is absent (e.g. a crash between submission and the key write), the node writes the key during boot reconciliation before the resolver's next pass. Entering the pending state by either trigger is equivalent.
+
 2. **Containment:** While this key exists and `exec/polymarket_us/no_side/position_shape_captured` does not exist, no further NO takes are armed account-wide (refusal reason: `no_side_first_order_pending`). At most one residual NO trial can exist at a time.
 
 3. **Exclusion Mechanism:** The scorer (`score_live_trials._admit_fill`/`FillExclusion`) reads the durable key at tally-construction time to exclude the trial from n and every look. Exclusion is determined by the real read path (durable keys), never by `TrialDayRecord.reason` alone or operator memory.
