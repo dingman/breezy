@@ -57,6 +57,7 @@ from tests.unit.test_current_rung_hold_strategy import (
     CLIMATE_DAY,
     INTERIOR_ID,
     NS_PER_MIN,
+    OPEN_UPPER_ID,
     STATION,
     WINDOW_OPEN_NS,
     _instrument,
@@ -73,6 +74,11 @@ def store_path(tmp_path: Path) -> Path:
 @pytest.fixture
 def interior_instrument() -> BinaryOption:
     return _instrument(INTERIOR_ID, lower_f=86, upper_f=87)
+
+
+@pytest.fixture
+def open_upper_instrument() -> BinaryOption:
+    return _instrument(OPEN_UPPER_ID, lower_f=88, upper_f=None)
 
 
 def _fill(
@@ -118,7 +124,8 @@ def _fill(
 
 
 def test_a_genuine_fill_consumes_the_trial_via_the_facts_join(
-    store_path: Path, interior_instrument: BinaryOption,
+    store_path: Path,
+    interior_instrument: BinaryOption,
 ) -> None:
     strategy = _register_and_start(
         store_path=store_path,
@@ -129,7 +136,9 @@ def test_a_genuine_fill_consumes_the_trial_via_the_facts_join(
         _fill(strategy, instrument_id=INTERIOR_ID, venue_order_id="ord-1"),
     )
     assert strategy._latch is not None
-    record = strategy._latch.record(STATION, CLIMATE_DAY.isoformat())
+    record = strategy._latch.record(
+        STATION, CLIMATE_DAY.isoformat(), key_instrument_id=str(INTERIOR_ID)
+    )
     assert record is not None
     assert record.reason == "taken"
     assert record.venue_order_id == "ord-1"
@@ -137,7 +146,8 @@ def test_a_genuine_fill_consumes_the_trial_via_the_facts_join(
 
 
 def test_a_replayed_fill_with_the_same_venue_order_id_is_idempotent(
-    store_path: Path, interior_instrument: BinaryOption,
+    store_path: Path,
+    interior_instrument: BinaryOption,
 ) -> None:
     """(C-a) Also characterises `continuous_strategy.py`'s replay
     idempotence at `_consume_or_flag_duplicate`'s own equality check
@@ -156,14 +166,17 @@ def test_a_replayed_fill_with_the_same_venue_order_id_is_idempotent(
     strategy.on_order_filled(event)  # replay: same venue_order_id
     assert strategy._latch is not None
     assert strategy._latch.is_family_halted() is False
-    record = strategy._latch.record(STATION, CLIMATE_DAY.isoformat())
+    record = strategy._latch.record(
+        STATION, CLIMATE_DAY.isoformat(), key_instrument_id=str(INTERIOR_ID)
+    )
     assert record is not None and record.venue_order_id == "ord-1"
     assert strategy._latch._store.get(f"{DUPLICATE_FILL_KEY_PREFIX}ord-1") is None
     assert strategy._latch._store.get(FAMILY_HALT_KEY) is None
 
 
 def test_a_second_genuine_fill_with_a_different_id_halts_the_family(
-    store_path: Path, interior_instrument: BinaryOption,
+    store_path: Path,
+    interior_instrument: BinaryOption,
 ) -> None:
     strategy = _register_and_start(
         store_path=store_path,
@@ -187,7 +200,8 @@ def test_a_second_genuine_fill_with_a_different_id_halts_the_family(
 
 
 def test_the_engines_synthetic_expiration_leg_fill_never_trips_the_duplicate_halt(
-    store_path: Path, interior_instrument: BinaryOption,
+    store_path: Path,
+    interior_instrument: BinaryOption,
 ) -> None:
     """A genuine fill consumes the TRIAL; the `BacktestEngine`'s own
     end-of-tape settlement-close fill (`check_instrument_expiration`,
@@ -215,12 +229,15 @@ def test_the_engines_synthetic_expiration_leg_fill_never_trips_the_duplicate_hal
     assert strategy._latch is not None
     assert strategy._latch.is_family_halted() is False
     assert strategy.diagnostics.count("family_halt_duplicate_fill") == 0
-    record = strategy._latch.record(STATION, CLIMATE_DAY.isoformat())
+    record = strategy._latch.record(
+        STATION, CLIMATE_DAY.isoformat(), key_instrument_id=str(INTERIOR_ID)
+    )
     assert record is not None and record.venue_order_id == "ord-1"
 
 
 def test_a_second_genuine_fill_with_a_different_id_STILL_halts_after_the_expiration_leg_fix(
-    store_path: Path, interior_instrument: BinaryOption,
+    store_path: Path,
+    interior_instrument: BinaryOption,
 ) -> None:
     """Regression guard for the fix above (§5 bucket 1, never weakened): a
     SECOND fill that does NOT carry the expiration-leg prefix is still a
@@ -241,8 +258,104 @@ def test_a_second_genuine_fill_with_a_different_id_STILL_halts_after_the_expirat
     assert strategy.diagnostics.count("family_halt_duplicate_fill") == 1
 
 
+def test_a_second_fill_on_the_same_instrument_day_is_still_a_duplicate(
+    store_path: Path,
+    interior_instrument: BinaryOption,
+) -> None:
+    """RED (plan S1, operator ruling 2026-09-14): re-keying TRIAL by
+    instrument-day must NOT weaken the duplicate-fill family halt for the
+    SAME instrument -- a second genuine fill on the SAME instrument-day is
+    still exactly one contract too many and still trips the halt."""
+    strategy = _register_and_start(
+        store_path=store_path,
+        instruments=(interior_instrument,),
+        position_evidence_reader=lambda: _PERMISSIVE_EVIDENCE,
+    )
+    strategy.on_order_filled(
+        _fill(strategy, instrument_id=INTERIOR_ID, venue_order_id="ord-1"),
+    )
+    strategy.on_order_filled(
+        _fill(strategy, instrument_id=INTERIOR_ID, venue_order_id="ord-2"),
+    )
+    assert strategy._latch is not None
+    assert strategy._latch.is_family_halted() is True
+    assert strategy.diagnostics.count("family_halt_duplicate_fill") == 1
+
+
+def test_a_fill_on_a_different_rung_of_the_same_station_day_is_not_a_duplicate(
+    store_path: Path,
+    interior_instrument: BinaryOption,
+    open_upper_instrument: BinaryOption,
+) -> None:
+    """RED (plan S1, operator ruling 2026-09-14): "I never wanted a limit
+    of 1 contract per station." A genuine fill on a DIFFERENT rung of the
+    SAME station-day is a SECOND, independent trial -- never a duplicate,
+    never a family halt."""
+    strategy = _register_and_start(
+        store_path=store_path,
+        instruments=(interior_instrument, open_upper_instrument),
+        position_evidence_reader=lambda: _PERMISSIVE_EVIDENCE,
+    )
+    strategy.on_order_filled(
+        _fill(strategy, instrument_id=INTERIOR_ID, venue_order_id="ord-1"),
+    )
+    strategy.on_order_filled(
+        _fill(strategy, instrument_id=OPEN_UPPER_ID, venue_order_id="ord-2"),
+    )
+    assert strategy._latch is not None
+    assert strategy._latch.is_family_halted() is False
+    assert strategy.diagnostics.count("family_halt_duplicate_fill") == 0
+    interior_record = strategy._latch.record(
+        STATION, CLIMATE_DAY.isoformat(), key_instrument_id=str(INTERIOR_ID),
+    )
+    upper_record = strategy._latch.record(
+        STATION, CLIMATE_DAY.isoformat(), key_instrument_id=str(OPEN_UPPER_ID),
+    )
+    assert interior_record is not None and interior_record.venue_order_id == "ord-1"
+    assert upper_record is not None and upper_record.venue_order_id == "ord-2"
+
+
+def test_a_fill_clears_the_inflight_marker_for_that_instrument_day(
+    store_path: Path,
+    interior_instrument: BinaryOption,
+) -> None:
+    """RED (plan S1): live evidence 09-13 --
+    `continuous_rung_hold/inflight/MIA/2026-09-13` stayed `open` after the
+    fill. A genuine fill must clear IN_FLIGHT for its own instrument-day,
+    ONLY after the durable trial write has already committed."""
+    strategy = _register_and_start(
+        store_path=store_path,
+        instruments=(interior_instrument,),
+        position_evidence_reader=lambda: _PERMISSIVE_EVIDENCE,
+    )
+    assert strategy._latch is not None
+    strategy._latch.set_inflight(
+        STATION, CLIMATE_DAY.isoformat(), key_instrument_id=str(INTERIOR_ID),
+    )
+    assert (
+        strategy._latch.is_inflight(
+            STATION, CLIMATE_DAY.isoformat(), key_instrument_id=str(INTERIOR_ID),
+        )
+        is True
+    )
+    strategy.on_order_filled(
+        _fill(strategy, instrument_id=INTERIOR_ID, venue_order_id="ord-1"),
+    )
+    record = strategy._latch.record(
+        STATION, CLIMATE_DAY.isoformat(), key_instrument_id=str(INTERIOR_ID),
+    )
+    assert record is not None and record.venue_order_id == "ord-1"  # write committed
+    assert (
+        strategy._latch.is_inflight(
+            STATION, CLIMATE_DAY.isoformat(), key_instrument_id=str(INTERIOR_ID),
+        )
+        is False
+    )
+
+
 def test_a_corrupt_existing_trial_record_fails_closed_never_raises(
-    store_path: Path, interior_instrument: BinaryOption,
+    store_path: Path,
+    interior_instrument: BinaryOption,
 ) -> None:
     """Three-seam Slice 4 review item 1 [CRITICAL]: a corrupt latch record
     reached via `consume_if_absent`/`record` inside `on_order_filled` must
@@ -276,7 +389,8 @@ def test_a_corrupt_existing_trial_record_fails_closed_never_raises(
 
 
 def test_a_legacy_record_with_no_venue_order_id_never_halts_the_family(
-    store_path: Path, interior_instrument: BinaryOption,
+    store_path: Path,
+    interior_instrument: BinaryOption,
 ) -> None:
     """Three-seam Slice 4 review item 2 [HIGH]: a pre-Slice-4 record decodes
     `venue_order_id` as `None` -- that is not evidence of a duplicate."""
@@ -310,12 +424,21 @@ def test_a_legacy_record_with_no_venue_order_id_never_halts_the_family(
     assert strategy._latch is not None
     assert strategy._latch.is_family_halted() is False
     # The legacy record is untouched -- no overwrite, no duplicate bucket.
-    record = strategy._latch.record(STATION, CLIMATE_DAY.isoformat())
+    # `record_with_legacy_fallback` (the shim), not the literal `record`
+    # lookup: this fill never wrote a NEW instrument-day key (the legacy
+    # row already matched INTERIOR_ID, so `_consume_or_flag_duplicate`
+    # warns and returns without writing anything).
+    record = strategy._latch.record_with_legacy_fallback(
+        STATION,
+        CLIMATE_DAY.isoformat(),
+        key_instrument_id=str(INTERIOR_ID),
+    )
     assert record == legacy
 
 
 def test_decision_ask_not_fill_price_is_recorded_on_fill(
-    store_path: Path, interior_instrument: BinaryOption,
+    store_path: Path,
+    interior_instrument: BinaryOption,
 ) -> None:
     """Three-seam Slice 4 review item 3 [HIGH]: the durable TRIAL records
     the ask `_hunt_tick` actually decided against, not the fill price --
@@ -333,13 +456,17 @@ def test_decision_ask_not_fill_price_is_recorded_on_fill(
 
     strategy.on_order_filled(
         _fill(
-            strategy, instrument_id=INTERIOR_ID, venue_order_id="ord-1",
+            strategy,
+            instrument_id=INTERIOR_ID,
+            venue_order_id="ord-1",
             last_px="0.35",  # a DIFFERENT, worse fill price than the decision ask
         ),
     )
 
     assert strategy._latch is not None
-    record = strategy._latch.record(STATION, CLIMATE_DAY.isoformat())
+    record = strategy._latch.record(
+        STATION, CLIMATE_DAY.isoformat(), key_instrument_id=str(INTERIOR_ID)
+    )
     assert record is not None
     assert record.ask == Decimal("0.40")  # the DECISION ask, not the fill price
     # Popped on read -- never grows unbounded.
@@ -347,7 +474,8 @@ def test_decision_ask_not_fill_price_is_recorded_on_fill(
 
 
 def test_fill_walk_consumed_trial_uses_the_walk_reason(
-    store_path: Path, interior_instrument: BinaryOption,
+    store_path: Path,
+    interior_instrument: BinaryOption,
 ) -> None:
     """Three-seam Slice 4 review item 3: a fill-walk-consumed trial has no
     decision ask -- it is written with the DISTINCT
@@ -383,13 +511,16 @@ def test_fill_walk_consumed_trial_uses_the_walk_reason(
     assert strategy._run_never_arm_walk() is True
 
     assert strategy._latch is not None
-    record = strategy._latch.record(STATION, CLIMATE_DAY.isoformat())
+    record = strategy._latch.record(
+        STATION, CLIMATE_DAY.isoformat(), key_instrument_id=str(INTERIOR_ID)
+    )
     assert record is not None
     assert record.reason == TAKEN_FROM_FILL_WALK_REASON
 
 
 def test_an_unjoinable_fill_halts_that_instrument_and_never_raises(
-    store_path: Path, interior_instrument: BinaryOption,
+    store_path: Path,
+    interior_instrument: BinaryOption,
 ) -> None:
     strategy = _register_and_start(
         store_path=store_path,
@@ -403,11 +534,17 @@ def test_an_unjoinable_fill_halts_that_instrument_and_never_raises(
     assert str(foreign_id) in strategy._unjoinable_fill_instruments
     assert strategy.position_events.count("unjoinable_fill_halt") == 1
     assert strategy._latch is not None
-    assert strategy._latch.is_consumed(STATION, CLIMATE_DAY.isoformat()) is False
+    assert (
+        strategy._latch.is_consumed(
+            STATION, CLIMATE_DAY.isoformat(), key_instrument_id=str(INTERIOR_ID)
+        )
+        is False
+    )
 
 
 def test_a_nyc_fill_is_unjoinable_via_the_slug_fallback(
-    store_path: Path, interior_instrument: BinaryOption,
+    store_path: Path,
+    interior_instrument: BinaryOption,
 ) -> None:
     """NYC is never one of the four supported stations -- the slug fallback
     must refuse to join it, same as `on_start`'s primary join would."""
@@ -417,7 +554,8 @@ def test_a_nyc_fill_is_unjoinable_via_the_slug_fallback(
         position_evidence_reader=lambda: _PERMISSIVE_EVIDENCE,
     )
     nyc_id = InstrumentId(
-        Symbol("tc-temp-nychigh-2026-09-04-gte86lt87f"), Venue("POLYMARKET_US"),
+        Symbol("tc-temp-nychigh-2026-09-04-gte86lt87f"),
+        Venue("POLYMARKET_US"),
     )
     strategy.on_order_filled(
         _fill(strategy, instrument_id=nyc_id, venue_order_id="ord-nyc"),
@@ -426,14 +564,16 @@ def test_a_nyc_fill_is_unjoinable_via_the_slug_fallback(
 
 
 def test_slug_fallback_joins_a_fill_for_an_instrument_missing_from_facts(
-    store_path: Path, interior_instrument: BinaryOption,
+    store_path: Path,
+    interior_instrument: BinaryOption,
 ) -> None:
     """An instrument that resolved into the cache/config AFTER `on_start`
     ran (simulated: present in config, then popped from `_facts`) still
     joins via the slug -- `station in config.stations` decides scope."""
     slug_instrument = _instrument(
         InstrumentId(Symbol("tc-temp-laxhigh-2026-09-04-gte86lt87f"), Venue("POLYMARKET_US")),
-        lower_f=86, upper_f=87,
+        lower_f=86,
+        upper_f=87,
     )
     strategy = _register(
         store_path=store_path,
@@ -449,7 +589,11 @@ def test_slug_fallback_joins_a_fill_for_an_instrument_missing_from_facts(
         _fill(strategy, instrument_id=slug_instrument.id, venue_order_id="ord-slug"),
     )
     assert strategy._latch is not None
-    record = strategy._latch.record(STATION, "2026-09-04")
+    record = strategy._latch.record(
+        STATION,
+        "2026-09-04",
+        key_instrument_id=str(slug_instrument.id),
+    )
     assert record is not None
     assert record.venue_order_id == "ord-slug"
 
@@ -462,7 +606,8 @@ def test_slug_fallback_joins_a_fill_for_an_instrument_missing_from_facts(
 
 
 def test_never_arm_walk_halts_when_evidence_is_absent(
-    store_path: Path, interior_instrument: BinaryOption,
+    store_path: Path,
+    interior_instrument: BinaryOption,
 ) -> None:
     strategy = _register_and_start(
         store_path=store_path,
@@ -482,7 +627,9 @@ def test_never_arm_walk_halts_when_evidence_is_absent(
     ],
 )
 def test_never_arm_walk_halts_on_every_incomplete_evidence_mode(
-    store_path: Path, interior_instrument: BinaryOption, evidence: dict[str, object],
+    store_path: Path,
+    interior_instrument: BinaryOption,
+    evidence: dict[str, object],
 ) -> None:
     strategy = _register_and_start(
         store_path=store_path,
@@ -494,7 +641,8 @@ def test_never_arm_walk_halts_on_every_incomplete_evidence_mode(
 
 
 def test_never_arm_walk_halts_when_the_family_is_already_halted(
-    store_path: Path, interior_instrument: BinaryOption,
+    store_path: Path,
+    interior_instrument: BinaryOption,
 ) -> None:
     strategy = _register_and_start(
         store_path=store_path,
@@ -503,15 +651,21 @@ def test_never_arm_walk_halts_when_the_family_is_already_halted(
     )
     assert strategy._latch is not None
     strategy._latch.record_duplicate_fill(
-        STATION, CLIMATE_DAY.isoformat(), venue_order_id="ord-x",
-        qty=Decimal(1), fill_px=Decimal("0.4"), fee=Decimal(0), ts_ns=WINDOW_OPEN_NS,
+        STATION,
+        CLIMATE_DAY.isoformat(),
+        venue_order_id="ord-x",
+        qty=Decimal(1),
+        fill_px=Decimal("0.4"),
+        fee=Decimal(0),
+        ts_ns=WINDOW_OPEN_NS,
     )
     assert strategy._run_never_arm_walk() is False
     assert strategy.position_events.count("family_halt_at_start") == 1
 
 
 def test_never_arm_walk_consumes_a_durable_fill_with_no_trial(
-    store_path: Path, interior_instrument: BinaryOption,
+    store_path: Path,
+    interior_instrument: BinaryOption,
 ) -> None:
     store = SqliteStateStore(store_path)
     with open_submit_intent_latch(store, store_path):
@@ -540,14 +694,113 @@ def test_never_arm_walk_consumes_a_durable_fill_with_no_trial(
     )
     assert strategy._run_never_arm_walk() is True
     assert strategy._latch is not None
-    record = strategy._latch.record(STATION, CLIMATE_DAY.isoformat())
+    record = strategy._latch.record(
+        STATION, CLIMATE_DAY.isoformat(), key_instrument_id=str(INTERIOR_ID)
+    )
     assert record is not None
     assert record.venue_order_id == "ord-durable"
     assert record.ask == Decimal("0.40")
 
 
+def test_the_fill_walk_consumes_per_instrument_day(
+    store_path: Path,
+    interior_instrument: BinaryOption,
+    open_upper_instrument: BinaryOption,
+) -> None:
+    """RED (plan S1): the never-arm fill-record join site
+    (`_consume_trial_from_fill_record`) writes the durable TRIAL under the
+    fill's OWN instrument-day key -- a sibling instrument with no fill on
+    the SAME station-day is completely unaffected."""
+    store = SqliteStateStore(store_path)
+    with open_submit_intent_latch(store, store_path):
+        fill_record = DurableFillRecord(
+            venue_order_id="ord-durable",
+            client_order_id="C-ord-durable",
+            instrument_id=str(INTERIOR_ID),
+            order_side="BUY",
+            cumulative_qty=Decimal(1),
+            cumulative_cost=Decimal("0.40"),
+            cumulative_fee=Decimal(0),
+            fee_reconciled=True,
+            ts_event=WINDOW_OPEN_NS,
+        )
+        store.set(
+            f"{FILL_INDEX_KEY_PREFIX}{INTERIOR_ID}",
+            json.dumps(["ord-durable"]).encode("utf-8"),
+        )
+        store.set(f"{FILL_KEY_PREFIX}ord-durable", fill_record.to_bytes())
+    store.close()
+
+    evidence = {**_PERMISSIVE_EVIDENCE, "ts_ns": WINDOW_OPEN_NS}
+    strategy = _register_and_start(
+        store_path=store_path,
+        instruments=(interior_instrument, open_upper_instrument),
+        position_evidence_reader=lambda: evidence,
+    )
+    assert strategy._run_never_arm_walk() is True
+    assert strategy._latch is not None
+    interior_record = strategy._latch.record(
+        STATION, CLIMATE_DAY.isoformat(), key_instrument_id=str(INTERIOR_ID),
+    )
+    assert interior_record is not None and interior_record.venue_order_id == "ord-durable"
+    assert (
+        strategy._latch.is_consumed(
+            STATION, CLIMATE_DAY.isoformat(), key_instrument_id=str(OPEN_UPPER_ID),
+        )
+        is False
+    )
+
+
+def test_the_boot_walk_skips_only_the_filled_rung_not_the_whole_station_day(
+    store_path: Path,
+    interior_instrument: BinaryOption,
+    open_upper_instrument: BinaryOption,
+) -> None:
+    """RED (plan S1, operator ruling 2026-09-14): a durable fill on ONE
+    instrument, consumed by the fill walk, must skip only THAT instrument's
+    boot-walk decision -- a sibling instrument on the SAME station-day with
+    no fill still gets its OWN independent decision, never silently skipped
+    as if the whole station-day were already done."""
+    store = SqliteStateStore(store_path)
+    with open_submit_intent_latch(store, store_path):
+        fill_record = DurableFillRecord(
+            venue_order_id="ord-durable",
+            client_order_id="C-ord-durable",
+            instrument_id=str(INTERIOR_ID),
+            order_side="BUY",
+            cumulative_qty=Decimal(1),
+            cumulative_cost=Decimal("0.40"),
+            cumulative_fee=Decimal(0),
+            fee_reconciled=True,
+            ts_event=WINDOW_OPEN_NS,
+        )
+        store.set(
+            f"{FILL_INDEX_KEY_PREFIX}{INTERIOR_ID}",
+            json.dumps(["ord-durable"]).encode("utf-8"),
+        )
+        store.set(f"{FILL_KEY_PREFIX}ord-durable", fill_record.to_bytes())
+    store.close()
+
+    evidence = {**_PERMISSIVE_EVIDENCE, "ts_ns": WINDOW_OPEN_NS}
+    strategy = _register_and_start(
+        store_path=store_path,
+        instruments=(interior_instrument, open_upper_instrument),
+        position_evidence_reader=lambda: evidence,
+    )
+    assert strategy._run_never_arm_walk() is True
+    assert strategy.last_startup_evidence_summary is not None
+    # INTERIOR_ID's fill-walk consumption skips it from the decisions loop
+    # entirely (no key in `decisions`); OPEN_UPPER_ID -- absent from the
+    # page, fresh, Nautilus-reconciled-flat -- is independently decided
+    # "absent-flat", proving the SIBLING instrument was evaluated on its
+    # own, never silently skipped alongside INTERIOR_ID.
+    assert f"'{OPEN_UPPER_ID}': 'absent-flat'" in strategy.last_startup_evidence_summary
+    assert f"'{INTERIOR_ID}':" not in strategy.last_startup_evidence_summary
+
+
 def test_never_arm_walk_halts_on_a_venue_long_with_no_durable_fill(
-    store_path: Path, interior_instrument: BinaryOption,
+    store_path: Path,
+    interior_instrument: BinaryOption,
 ) -> None:
     evidence = {
         **_PERMISSIVE_EVIDENCE,
@@ -565,7 +818,8 @@ def test_never_arm_walk_halts_on_a_venue_long_with_no_durable_fill(
 
 
 def test_never_arm_walk_arms_when_an_eof_complete_page_omits_the_slug(
-    store_path: Path, interior_instrument: BinaryOption,
+    store_path: Path,
+    interior_instrument: BinaryOption,
 ) -> None:
     """R-8 (2026-09-12): SUPERSEDES three-seam Slice 4 review item 5. The
     producer (`PolymarketUSExecutionClient._write_startup_position_evidence`)
@@ -584,7 +838,8 @@ def test_never_arm_walk_arms_when_an_eof_complete_page_omits_the_slug(
 
 
 def test_never_arm_walk_halts_when_net_position_is_null(
-    store_path: Path, interior_instrument: BinaryOption,
+    store_path: Path,
+    interior_instrument: BinaryOption,
 ) -> None:
     """Three-seam Slice 4 review item 5: `"net_position": null` is the
     client's own "this row was unreadable" signal -- UNKNOWN, never flat."""
@@ -602,7 +857,8 @@ def test_never_arm_walk_halts_when_net_position_is_null(
 
 
 def test_rearm_permitted_when_an_eof_complete_page_omits_the_slug(
-    store_path: Path, interior_instrument: BinaryOption,
+    store_path: Path,
+    interior_instrument: BinaryOption,
 ) -> None:
     """R-8 (2026-09-12): the re-arm gate applies the SAME rule as the
     never-arm walk (site 1), through the same helper and the same
@@ -616,14 +872,19 @@ def test_rearm_permitted_when_an_eof_complete_page_omits_the_slug(
         position_evidence_reader=lambda: evidence,
     )
     permitted = strategy._rearm_permitted(
-        STATION, CLIMATE_DAY.isoformat(), str(INTERIOR_ID),
-        attempts=1, last_attempt_ns=0, now_ns=10 * 365 * 24 * 3600 * 1_000_000_000,
+        STATION,
+        CLIMATE_DAY.isoformat(),
+        str(INTERIOR_ID),
+        attempts=1,
+        last_attempt_ns=0,
+        now_ns=10 * 365 * 24 * 3600 * 1_000_000_000,
     )
     assert permitted is True
 
 
 def test_rearm_denied_when_an_omitting_page_is_stale(
-    store_path: Path, interior_instrument: BinaryOption,
+    store_path: Path,
+    interior_instrument: BinaryOption,
 ) -> None:
     """R2-B1/AC-6 (C2, HB7-2): the same freshness bound as the never-arm
     walk, applied to the re-arm gate."""
@@ -638,14 +899,19 @@ def test_rearm_denied_when_an_omitting_page_is_stale(
         position_evidence_reader=lambda: evidence,
     )
     permitted = strategy._rearm_permitted(
-        STATION, CLIMATE_DAY.isoformat(), str(INTERIOR_ID),
-        attempts=1, last_attempt_ns=0, now_ns=10 * 365 * 24 * 3600 * 1_000_000_000,
+        STATION,
+        CLIMATE_DAY.isoformat(),
+        str(INTERIOR_ID),
+        attempts=1,
+        last_attempt_ns=0,
+        now_ns=10 * 365 * 24 * 3600 * 1_000_000_000,
     )
     assert permitted is False
 
 
 def test_rearm_denied_when_a_lagging_ts_event_would_have_extended_the_ceiling(
-    store_path: Path, interior_instrument: BinaryOption,
+    store_path: Path,
+    interior_instrument: BinaryOption,
 ) -> None:
     """R2-B1/R3-B1 (HB7-4): the freshness clause must read the WALL clock
     (`self.clock.timestamp_ns()`) INSIDE `_rearm_permitted`, never the
@@ -673,14 +939,19 @@ def test_rearm_denied_when_a_lagging_ts_event_would_have_extended_the_ceiling(
     )
     lagging_event_time_now_ns = wall - 600 * 1_000_000_000
     permitted = strategy._rearm_permitted(
-        STATION, CLIMATE_DAY.isoformat(), str(INTERIOR_ID),
-        attempts=1, last_attempt_ns=0, now_ns=lagging_event_time_now_ns,
+        STATION,
+        CLIMATE_DAY.isoformat(),
+        str(INTERIOR_ID),
+        attempts=1,
+        last_attempt_ns=0,
+        now_ns=lagging_event_time_now_ns,
     )
     assert permitted is False
 
 
 def test_rearm_denied_when_the_reconciled_portfolio_is_long(
-    store_path: Path, interior_instrument: BinaryOption,
+    store_path: Path,
+    interior_instrument: BinaryOption,
 ) -> None:
     """Option B (HB7-3): the same Nautilus cross-check as the never-arm
     walk (T3), applied to the re-arm gate."""
@@ -696,14 +967,19 @@ def test_rearm_denied_when_the_reconciled_portfolio_is_long(
     strategy.portfolio.initialize_positions()
 
     permitted = strategy._rearm_permitted(
-        STATION, CLIMATE_DAY.isoformat(), str(INTERIOR_ID),
-        attempts=1, last_attempt_ns=0, now_ns=10 * 365 * 24 * 3600 * 1_000_000_000,
+        STATION,
+        CLIMATE_DAY.isoformat(),
+        str(INTERIOR_ID),
+        attempts=1,
+        last_attempt_ns=0,
+        now_ns=10 * 365 * 24 * 3600 * 1_000_000_000,
     )
     assert permitted is False
 
 
 def test_on_start_with_a_permit_arms_and_subscribes_when_the_page_omits_the_slug(
-    store_path: Path, interior_instrument: BinaryOption,
+    store_path: Path,
+    interior_instrument: BinaryOption,
 ) -> None:
     """N5: drives the incident's actual entry path end to end -- `on_start`
     with a real (non-None) `order_submission_permit`, `phase0_permit_guard=
@@ -730,7 +1006,8 @@ def test_on_start_with_a_permit_arms_and_subscribes_when_the_page_omits_the_slug
 
 
 def test_never_arm_walk_halts_when_an_omitting_page_is_stale(
-    store_path: Path, interior_instrument: BinaryOption,
+    store_path: Path,
+    interior_instrument: BinaryOption,
 ) -> None:
     """R2-B1/AC-6 (C2): an eof-complete page omitting the candidate slug,
     but written more than the freshness ceiling ago, must NOT be read as
@@ -750,7 +1027,8 @@ def test_never_arm_walk_halts_when_an_omitting_page_is_stale(
 
 
 def test_never_arm_walk_halts_when_the_reconciled_portfolio_is_long(
-    store_path: Path, interior_instrument: BinaryOption,
+    store_path: Path,
+    interior_instrument: BinaryOption,
 ) -> None:
     """Option B (T3, N-T3): a candidate slug ABSENT from a fresh, complete
     page must still halt if Nautilus's OWN reconciled portfolio shows a
@@ -775,7 +1053,8 @@ def test_never_arm_walk_halts_when_the_reconciled_portfolio_is_long(
 
 
 def test_a_present_zero_row_arms_even_when_the_reconciled_portfolio_is_long(
-    store_path: Path, interior_instrument: BinaryOption,
+    store_path: Path,
+    interior_instrument: BinaryOption,
 ) -> None:
     """CHARACTERISATION (P1c, HB1 pin, L-33): Option B is scoped to the
     ABSENCE branch only -- a PRESENT row at "0" arms exactly as it does
@@ -802,7 +1081,8 @@ def test_a_present_zero_row_arms_even_when_the_reconciled_portfolio_is_long(
 
 
 def test_never_arm_walk_unreadable_fill_index_halts(
-    store_path: Path, interior_instrument: BinaryOption,
+    store_path: Path,
+    interior_instrument: BinaryOption,
 ) -> None:
     store = SqliteStateStore(store_path)
     with open_submit_intent_latch(store, store_path):
@@ -825,7 +1105,8 @@ def test_never_arm_walk_unreadable_fill_index_halts(
 
 
 def test_rearm_denied_once_attempts_reach_the_cap(
-    store_path: Path, interior_instrument: BinaryOption,
+    store_path: Path,
+    interior_instrument: BinaryOption,
 ) -> None:
     strategy = _register_and_start(
         store_path=store_path,
@@ -833,14 +1114,19 @@ def test_rearm_denied_once_attempts_reach_the_cap(
         position_evidence_reader=lambda: _PERMISSIVE_EVIDENCE,
     )
     permitted = strategy._rearm_permitted(
-        STATION, CLIMATE_DAY.isoformat(), str(INTERIOR_ID),
-        attempts=3, last_attempt_ns=0, now_ns=10 * 365 * 24 * 3600 * 1_000_000_000,
+        STATION,
+        CLIMATE_DAY.isoformat(),
+        str(INTERIOR_ID),
+        attempts=3,
+        last_attempt_ns=0,
+        now_ns=10 * 365 * 24 * 3600 * 1_000_000_000,
     )
     assert permitted is False
 
 
 def test_rearm_denied_before_the_delay_floor_elapses(
-    store_path: Path, interior_instrument: BinaryOption,
+    store_path: Path,
+    interior_instrument: BinaryOption,
 ) -> None:
     strategy = _register_and_start(
         store_path=store_path,
@@ -848,14 +1134,19 @@ def test_rearm_denied_before_the_delay_floor_elapses(
         position_evidence_reader=lambda: _PERMISSIVE_EVIDENCE,
     )
     permitted = strategy._rearm_permitted(
-        STATION, CLIMATE_DAY.isoformat(), str(INTERIOR_ID),
-        attempts=1, last_attempt_ns=WINDOW_OPEN_NS, now_ns=WINDOW_OPEN_NS + 1,
+        STATION,
+        CLIMATE_DAY.isoformat(),
+        str(INTERIOR_ID),
+        attempts=1,
+        last_attempt_ns=WINDOW_OPEN_NS,
+        now_ns=WINDOW_OPEN_NS + 1,
     )
     assert permitted is False
 
 
 def test_rearm_denied_without_fresh_no_refusal_evidence(
-    store_path: Path, interior_instrument: BinaryOption,
+    store_path: Path,
+    interior_instrument: BinaryOption,
 ) -> None:
     strategy = _register_and_start(
         store_path=store_path,
@@ -863,14 +1154,19 @@ def test_rearm_denied_without_fresh_no_refusal_evidence(
         position_evidence_reader=lambda: None,
     )
     permitted = strategy._rearm_permitted(
-        STATION, CLIMATE_DAY.isoformat(), str(INTERIOR_ID),
-        attempts=1, last_attempt_ns=0, now_ns=10 * 365 * 24 * 3600 * 1_000_000_000,
+        STATION,
+        CLIMATE_DAY.isoformat(),
+        str(INTERIOR_ID),
+        attempts=1,
+        last_attempt_ns=0,
+        now_ns=10 * 365 * 24 * 3600 * 1_000_000_000,
     )
     assert permitted is False
 
 
 def test_rearm_denied_on_a_fresh_long(
-    store_path: Path, interior_instrument: BinaryOption,
+    store_path: Path,
+    interior_instrument: BinaryOption,
 ) -> None:
     evidence = {
         **_PERMISSIVE_EVIDENCE,
@@ -882,14 +1178,19 @@ def test_rearm_denied_on_a_fresh_long(
         position_evidence_reader=lambda: evidence,
     )
     permitted = strategy._rearm_permitted(
-        STATION, CLIMATE_DAY.isoformat(), str(INTERIOR_ID),
-        attempts=1, last_attempt_ns=0, now_ns=10 * 365 * 24 * 3600 * 1_000_000_000,
+        STATION,
+        CLIMATE_DAY.isoformat(),
+        str(INTERIOR_ID),
+        attempts=1,
+        last_attempt_ns=0,
+        now_ns=10 * 365 * 24 * 3600 * 1_000_000_000,
     )
     assert permitted is False
 
 
 def test_rearm_permitted_once_every_gate_clears(
-    store_path: Path, interior_instrument: BinaryOption,
+    store_path: Path,
+    interior_instrument: BinaryOption,
 ) -> None:
     strategy = _register_and_start(
         store_path=store_path,
@@ -897,8 +1198,12 @@ def test_rearm_permitted_once_every_gate_clears(
         position_evidence_reader=lambda: _PERMISSIVE_EVIDENCE,
     )
     permitted = strategy._rearm_permitted(
-        STATION, CLIMATE_DAY.isoformat(), str(INTERIOR_ID),
-        attempts=1, last_attempt_ns=0, now_ns=10 * 365 * 24 * 3600 * 1_000_000_000,
+        STATION,
+        CLIMATE_DAY.isoformat(),
+        str(INTERIOR_ID),
+        attempts=1,
+        last_attempt_ns=0,
+        now_ns=10 * 365 * 24 * 3600 * 1_000_000_000,
     )
     assert permitted is True
 
@@ -911,7 +1216,8 @@ def test_rearm_permitted_once_every_gate_clears(
 
 
 def test_rearm_denied_on_a_present_zero_row_when_the_reconciled_portfolio_is_long(
-    store_path: Path, interior_instrument: BinaryOption,
+    store_path: Path,
+    interior_instrument: BinaryOption,
 ) -> None:
     """B5 (security HIGH, HF-4 rev2), AC-10: the present-row branch at site
     2 is no longer trusted alone once HF-4 makes attempts 2-3 reachable --
@@ -938,21 +1244,28 @@ def test_rearm_denied_on_a_present_zero_row_when_the_reconciled_portfolio_is_lon
     strategy.portfolio.initialize_positions()
 
     permitted = strategy._rearm_permitted(
-        STATION, CLIMATE_DAY.isoformat(), str(INTERIOR_ID),
-        attempts=1, last_attempt_ns=0, now_ns=10 * 365 * 24 * 3600 * 1_000_000_000,
+        STATION,
+        CLIMATE_DAY.isoformat(),
+        str(INTERIOR_ID),
+        attempts=1,
+        last_attempt_ns=0,
+        now_ns=10 * 365 * 24 * 3600 * 1_000_000_000,
     )
     assert permitted is False
 
 
 def test_a_three_hundred_second_absent_page_denies_rearm_but_still_arms_the_boot_walk(
-    store_path: Path, interior_instrument: BinaryOption,
+    store_path: Path,
+    interior_instrument: BinaryOption,
 ) -> None:
     """B4(ii)/AC-11 (R-9a): one test proving both halves of the split
     ceiling in one shot -- an absent-slug page aged 300s is fresh under
     the boot walk's UNCHANGED 600s ceiling (site 1) but stale under the
     re-arm gate's own NEW 180s ceiling (site 2)."""
     evidence = {
-        **_PERMISSIVE_EVIDENCE, "positions": [], "ts_ns": WINDOW_OPEN_NS - 300 * 1_000_000_000,
+        **_PERMISSIVE_EVIDENCE,
+        "positions": [],
+        "ts_ns": WINDOW_OPEN_NS - 300 * 1_000_000_000,
     }
     strategy = _register_and_start(
         store_path=store_path,
@@ -963,14 +1276,19 @@ def test_a_three_hundred_second_absent_page_denies_rearm_but_still_arms_the_boot
     assert strategy._run_never_arm_walk() is True
 
     permitted = strategy._rearm_permitted(
-        STATION, CLIMATE_DAY.isoformat(), str(INTERIOR_ID),
-        attempts=1, last_attempt_ns=0, now_ns=10 * 365 * 24 * 3600 * 1_000_000_000,
+        STATION,
+        CLIMATE_DAY.isoformat(),
+        str(INTERIOR_ID),
+        attempts=1,
+        last_attempt_ns=0,
+        now_ns=10 * 365 * 24 * 3600 * 1_000_000_000,
     )
     assert permitted is False
 
 
 def test_a_genuine_fill_freezes_the_attempt_counter(
-    store_path: Path, interior_instrument: BinaryOption,
+    store_path: Path,
+    interior_instrument: BinaryOption,
 ) -> None:
     strategy = _register_and_start(
         store_path=store_path,
@@ -978,16 +1296,30 @@ def test_a_genuine_fill_freezes_the_attempt_counter(
         position_evidence_reader=lambda: _PERMISSIVE_EVIDENCE,
     )
     assert strategy._latch is not None
-    strategy._latch.record_attempt(STATION, CLIMATE_DAY.isoformat(), ts_ns=WINDOW_OPEN_NS)
+    strategy._latch.record_attempt(
+        STATION, CLIMATE_DAY.isoformat(), ts_ns=WINDOW_OPEN_NS, key_instrument_id=str(INTERIOR_ID)
+    )
     strategy.on_order_filled(
         _fill(strategy, instrument_id=INTERIOR_ID, venue_order_id="ord-fill"),
     )
-    assert strategy._latch.is_consumed(STATION, CLIMATE_DAY.isoformat()) is True
+    assert (
+        strategy._latch.is_consumed(
+            STATION, CLIMATE_DAY.isoformat(), key_instrument_id=str(INTERIOR_ID)
+        )
+        is True
+    )
     # `_hunt_tick` returns before the attempt gate is ever consulted again.
-    before = strategy._latch.attempt_state(STATION, CLIMATE_DAY.isoformat())
+    before = strategy._latch.attempt_state(
+        STATION, CLIMATE_DAY.isoformat(), key_instrument_id=str(INTERIOR_ID)
+    )
     strategy.on_data(_observation(temp_c_tenths=300, observed_at_ns=WINDOW_OPEN_NS - 1))
     strategy.on_quote_tick(_quote(INTERIOR_ID, ask="0.40", ts_event=WINDOW_OPEN_NS + NS_PER_MIN))
-    assert strategy._latch.attempt_state(STATION, CLIMATE_DAY.isoformat()) == before
+    assert (
+        strategy._latch.attempt_state(
+            STATION, CLIMATE_DAY.isoformat(), key_instrument_id=str(INTERIOR_ID)
+        )
+        == before
+    )
 
 
 def test_startup_evidence_summary_names_completeness_age_and_each_decision() -> None:
@@ -1025,60 +1357,75 @@ def test_startup_evidence_summary_names_completeness_age_and_each_decision() -> 
 
 
 def _s2_family_halt(
-    store_path: Path, interior_instrument: BinaryOption,
+    store_path: Path,
+    interior_instrument: BinaryOption,
 ) -> ContinuousRungHoldStrategy:
     strategy = _register_and_start(
-        store_path=store_path, instruments=(interior_instrument,),
+        store_path=store_path,
+        instruments=(interior_instrument,),
         position_evidence_reader=lambda: _PERMISSIVE_EVIDENCE,
     )
     assert strategy._latch is not None
     strategy._latch.record_duplicate_fill(
-        STATION, CLIMATE_DAY.isoformat(), venue_order_id="ord-s2-halt",
-        qty=Decimal(1), fill_px=Decimal("0.4"), fee=Decimal(0), ts_ns=WINDOW_OPEN_NS,
+        STATION,
+        CLIMATE_DAY.isoformat(),
+        venue_order_id="ord-s2-halt",
+        qty=Decimal(1),
+        fill_px=Decimal("0.4"),
+        fee=Decimal(0),
+        ts_ns=WINDOW_OPEN_NS,
     )
     return strategy
 
 
 def _s2_evidence_missing(
-    store_path: Path, interior_instrument: BinaryOption,
+    store_path: Path,
+    interior_instrument: BinaryOption,
 ) -> ContinuousRungHoldStrategy:
     return _register_and_start(
-        store_path=store_path, instruments=(interior_instrument,),
+        store_path=store_path,
+        instruments=(interior_instrument,),
         position_evidence_reader=lambda: None,
     )
 
 
 def _s2_fill_walk_unreadable(
-    store_path: Path, interior_instrument: BinaryOption,
+    store_path: Path,
+    interior_instrument: BinaryOption,
 ) -> ContinuousRungHoldStrategy:
     store = SqliteStateStore(store_path)
     with open_submit_intent_latch(store, store_path):
         store.set(f"{FILL_INDEX_KEY_PREFIX}{INTERIOR_ID}", b"not json")
     store.close()
     return _register_and_start(
-        store_path=store_path, instruments=(interior_instrument,),
+        store_path=store_path,
+        instruments=(interior_instrument,),
         position_evidence_reader=lambda: _PERMISSIVE_EVIDENCE,
     )
 
 
 def _s2_per_slug_halt(
-    store_path: Path, interior_instrument: BinaryOption,
+    store_path: Path,
+    interior_instrument: BinaryOption,
 ) -> ContinuousRungHoldStrategy:
     evidence = {
         **_PERMISSIVE_EVIDENCE,
         "positions": [{"slug": str(INTERIOR_ID.symbol.value), "net_position": "1"}],
     }
     return _register_and_start(
-        store_path=store_path, instruments=(interior_instrument,),
+        store_path=store_path,
+        instruments=(interior_instrument,),
         position_evidence_reader=lambda: evidence,
     )
 
 
 def _s2_success(
-    store_path: Path, interior_instrument: BinaryOption,
+    store_path: Path,
+    interior_instrument: BinaryOption,
 ) -> ContinuousRungHoldStrategy:
     return _register_and_start(
-        store_path=store_path, instruments=(interior_instrument,),
+        store_path=store_path,
+        instruments=(interior_instrument,),
         position_evidence_reader=lambda: _PERMISSIVE_EVIDENCE,
     )
 
@@ -1147,7 +1494,8 @@ def test_family_halt_key_literal(store_path: Path) -> None:
 
 
 def test_phase0_permit_guard_true_still_raises_on_a_real_permit(
-    store_path: Path, interior_instrument: BinaryOption,
+    store_path: Path,
+    interior_instrument: BinaryOption,
 ) -> None:
     """RED (unchanged behaviour): the default keeps Phase 0's seal."""
     from breezy.strategy.current_rung_hold.config import CurrentRungHoldConfig
@@ -1166,7 +1514,8 @@ def test_phase0_permit_guard_true_still_raises_on_a_real_permit(
 
 
 def test_phase0_permit_guard_false_accepts_a_real_permit_and_submits_once(
-    store_path: Path, interior_instrument: BinaryOption,
+    store_path: Path,
+    interior_instrument: BinaryOption,
 ) -> None:
     """RED->GREEN: with the guard lifted, a Take-equivalent decision reaches
     `submit_order` exactly once."""
@@ -1202,7 +1551,9 @@ def _cont_latch_context_for(store_path: Path) -> Iterator[TrialDayLatch]:
 
 
 def _register_bare(
-    strategy: ContinuousRungHoldStrategy, *, instruments: tuple[BinaryOption, ...],
+    strategy: ContinuousRungHoldStrategy,
+    *,
+    instruments: tuple[BinaryOption, ...],
 ) -> None:
     from nautilus_trader.common.component import TestClock
     from nautilus_trader.model.identifiers import TraderId

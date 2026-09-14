@@ -1570,10 +1570,16 @@ def test_the_continuous_arm_uses_the_continuous_latch_key_prefix(
         latch_key_prefix=driver.CONTINUOUS_TRIAL_KEY_PREFIX,
     )
     assert len(result.trials) == 1
+    # Re-pinned (operator ruling 2026-09-14 / plan S1): the v3 latch now
+    # keys TRIAL by instrument-day, not station-day alone.
     with driver._latch_context(
         latch_store_path, key_prefix=driver.CONTINUOUS_TRIAL_KEY_PREFIX,
     ) as latch:
-        record = latch.record(STATION, CLIMATE_DAY.isoformat())
+        record = latch.record(
+            STATION,
+            CLIMATE_DAY.isoformat(),
+            key_instrument_id=str(tape_instrument.instrument.id),
+        )
     assert record is not None
     assert record.reason == "taken"
 

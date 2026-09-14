@@ -216,8 +216,24 @@ def _inflight_prefix(trial_prefix: str) -> str:
     return trial_prefix[: -len(_TRIAL_SUFFIX)] + _INFLIGHT_SUFFIX
 
 
-def _key(station: str, climate_day: str, *, key_prefix: str = DEFAULT_TRIAL_KEY_PREFIX) -> str:
-    return f"{key_prefix}{station}/{climate_day}"
+def _key(
+    station: str,
+    climate_day: str,
+    *,
+    key_prefix: str = DEFAULT_TRIAL_KEY_PREFIX,
+    key_instrument_id: str | None = None,
+) -> str:
+    """Operator ruling 2026-09-14 / plan S1: v3's TRIAL/IN_FLIGHT/attempt
+    keys are per ``(station, climate_day, instrument_id)`` -- "I never
+    wanted a limit of 1 contract per station." ``key_instrument_id=None``
+    (v2's only call shape, and this function's default) reproduces the
+    ORIGINAL station-day key byte-for-byte; v2's PREREG is closed and never
+    passes this parameter, so v2 is behaviourally untouched.
+    """
+    base = f"{key_prefix}{station}/{climate_day}"
+    if key_instrument_id is None:
+        return base
+    return f"{base}/{key_instrument_id}"
 
 
 @dataclass(frozen=True, slots=True)
@@ -358,24 +374,71 @@ class TrialDayLatch:
         return self._intent_latch.is_latched()
 
 
-    def _trial_key(self, station: str, climate_day: str) -> str:
-        return _key(station, climate_day, key_prefix=self._key_prefix)
+    def _trial_key(
+        self, station: str, climate_day: str, *, key_instrument_id: str | None = None,
+    ) -> str:
+        return _key(
+            station, climate_day, key_prefix=self._key_prefix, key_instrument_id=key_instrument_id,
+        )
 
-    def _inflight_key(self, station: str, climate_day: str) -> str:
-        return f"{self._inflight_prefix}{station}/{climate_day}"
+    def _inflight_key(
+        self, station: str, climate_day: str, *, key_instrument_id: str | None = None,
+    ) -> str:
+        base = f"{self._inflight_prefix}{station}/{climate_day}"
+        if key_instrument_id is None:
+            return base
+        return f"{base}/{key_instrument_id}"
 
-    def record(self, station: str, climate_day: str) -> TrialDayRecord | None:
-        """Return the durable record for this station-day, or ``None``."""
+    def record(
+        self, station: str, climate_day: str, *, key_instrument_id: str | None = None,
+    ) -> TrialDayRecord | None:
+        """Return the durable record for this station-day (or, when
+        ``key_instrument_id`` is given, this instrument-day -- plan S1), or
+        ``None``.
+        """
         self._require_held()
-        raw = self._store.get(self._trial_key(station, climate_day))
+        raw = self._store.get(
+            self._trial_key(station, climate_day, key_instrument_id=key_instrument_id),
+        )
         if raw is None:
             return None
         return TrialDayRecord.from_bytes(raw)
 
-    def is_consumed(self, station: str, climate_day: str) -> bool:
-        """``True`` once this station-day's single trial has been recorded."""
+    def record_with_legacy_fallback(
+        self, station: str, climate_day: str, *, key_instrument_id: str | None,
+    ) -> TrialDayRecord | None:
+        """Read-compat shim (operator ruling 2026-09-14 / plan S1): the
+        instrument-day record if one exists, else a LEGACY station-day row
+        IFF its own ``instrument_id`` field equals ``key_instrument_id`` --
+        durable rows written before this slice live under the old key and
+        the store has no delete. A legacy row for a DIFFERENT instrument is
+        never returned (fail-closed direction: match only a real match,
+        never a stranger). ``key_instrument_id=None`` is the plain v2 read,
+        with no legacy fallback of its own (there is nothing to fall back
+        from -- it IS the legacy key).
+        """
         self._require_held()
-        return self.record(station, climate_day) is not None
+        found = self.record(station, climate_day, key_instrument_id=key_instrument_id)
+        if found is not None or key_instrument_id is None:
+            return found
+        legacy = self.record(station, climate_day)
+        if legacy is not None and legacy.instrument_id == key_instrument_id:
+            return legacy
+        return None
+
+    def is_consumed(
+        self, station: str, climate_day: str, *, key_instrument_id: str | None = None,
+    ) -> bool:
+        """``True`` once this station-day's (or, keyed, this instrument-
+        day's -- plan S1) single trial has been recorded. See
+        :meth:`record_with_legacy_fallback` for the read-compat shim.
+        """
+        return (
+            self.record_with_legacy_fallback(
+                station, climate_day, key_instrument_id=key_instrument_id,
+            )
+            is not None
+        )
 
     def consume(
         self,
@@ -386,6 +449,7 @@ class TrialDayLatch:
         instrument_id: str,
         ask: Decimal,
         reason: str,
+        key_instrument_id: str | None = None,
     ) -> None:
         """Durably record this station-day's single trial.
 
@@ -394,11 +458,15 @@ class TrialDayLatch:
         module docstring). Per the ordering rule, this MUST be called, and
         MUST return, before ``SubmitIntentLatch.arm()`` for any order this
         trial leads to.
+
+        ``key_instrument_id`` (plan S1) keys the durable write by instrument
+        as well as station-day. v2's only call shape never passes it and
+        stays byte-identical.
         """
         self._require_held()
         if reason not in _REASONS:
             raise TrialDayInvalidReason(reason)
-        if self.is_consumed(station, climate_day):
+        if self.is_consumed(station, climate_day, key_instrument_id=key_instrument_id):
             raise TrialDayAlreadyConsumed(station, climate_day)
         record = TrialDayRecord(
             latched_at_ns=latched_at_ns,
@@ -406,13 +474,18 @@ class TrialDayLatch:
             ask=ask,
             reason=reason,
         )
-        self._store.set(self._trial_key(station, climate_day), record.to_bytes())
+        self._store.set(
+            self._trial_key(station, climate_day, key_instrument_id=key_instrument_id),
+            record.to_bytes(),
+        )
 
     def consume_if_absent(
         self,
         station: str,
         climate_day: str,
         record: TrialDayRecord,
+        *,
+        key_instrument_id: str | None = None,
     ) -> bool:
         """Slice 4 item A: durably record TRIAL for a fill, idempotently.
 
@@ -445,26 +518,45 @@ class TrialDayLatch:
         )
         if record.reason not in _REASONS:
             raise TrialDayInvalidReason(record.reason)
-        if self.is_consumed(station, climate_day):
+        if self.is_consumed(station, climate_day, key_instrument_id=key_instrument_id):
             return False
-        self._store.set(self._trial_key(station, climate_day), record.to_bytes())
+        self._store.set(
+            self._trial_key(station, climate_day, key_instrument_id=key_instrument_id),
+            record.to_bytes(),
+        )
         return True
 
-    def is_inflight(self, station: str, climate_day: str) -> bool:
-        """``True`` while this station-day has a durable IN_FLIGHT marker."""
+    def is_inflight(
+        self, station: str, climate_day: str, *, key_instrument_id: str | None = None,
+    ) -> bool:
+        """``True`` while this station-day (or, keyed, instrument-day --
+        plan S1) has a durable IN_FLIGHT marker."""
         self._require_held()
-        raw = self._store.get(self._inflight_key(station, climate_day))
+        raw = self._store.get(
+            self._inflight_key(station, climate_day, key_instrument_id=key_instrument_id),
+        )
         return raw == _INFLIGHT_OPEN
 
-    def set_inflight(self, station: str, climate_day: str) -> None:
-        """COMMIT the IN_FLIGHT marker for this station-day. Must precede ``arm()``."""
+    def set_inflight(
+        self, station: str, climate_day: str, *, key_instrument_id: str | None = None,
+    ) -> None:
+        """COMMIT the IN_FLIGHT marker for this station-day (or instrument-
+        day -- plan S1). Must precede ``arm()``."""
         self._require_held()
-        self._store.set(self._inflight_key(station, climate_day), _INFLIGHT_OPEN)
+        self._store.set(
+            self._inflight_key(station, climate_day, key_instrument_id=key_instrument_id),
+            _INFLIGHT_OPEN,
+        )
 
-    def clear_inflight(self, station: str, climate_day: str) -> None:
+    def clear_inflight(
+        self, station: str, climate_day: str, *, key_instrument_id: str | None = None,
+    ) -> None:
         """Clear the IN_FLIGHT marker (StateStore has no delete -- write cleared)."""
         self._require_held()
-        self._store.set(self._inflight_key(station, climate_day), _INFLIGHT_CLEARED)
+        self._store.set(
+            self._inflight_key(station, climate_day, key_instrument_id=key_instrument_id),
+            _INFLIGHT_CLEARED,
+        )
 
     # -- Slice 4 item B1 (plan rev 6.1): duplicate-fill residual + family halt --
 
@@ -637,19 +729,29 @@ class TrialDayLatch:
 
     # -- Slice 4 item E1 (plan rev 6.1, Resolution F): re-arm attempt counter --
 
-    def _attempt_key(self, station: str, climate_day: str) -> str:
-        return f"{ATTEMPT_COUNTER_KEY_PREFIX}{station}/{climate_day}"
+    def _attempt_key(
+        self, station: str, climate_day: str, *, key_instrument_id: str | None = None,
+    ) -> str:
+        base = f"{ATTEMPT_COUNTER_KEY_PREFIX}{station}/{climate_day}"
+        if key_instrument_id is None:
+            return base
+        return f"{base}/{key_instrument_id}"
 
-    def attempt_state(self, station: str, climate_day: str) -> tuple[int, int | None]:
-        """``(attempt_count, last_attempt_ts_ns)`` for this station-day's
-        re-arm counter -- ``(0, None)`` before the first attempt.
+    def attempt_state(
+        self, station: str, climate_day: str, *, key_instrument_id: str | None = None,
+    ) -> tuple[int, int | None]:
+        """``(attempt_count, last_attempt_ts_ns)`` for this station-day's (or
+        instrument-day's -- plan S1) re-arm counter -- ``(0, None)`` before
+        the first attempt.
 
         A genuine fill freezes this counter by construction: once
         ``is_consumed`` is ``True`` for this station-day, `_hunt_tick`
         returns before this is ever consulted again.
         """
         self._require_held()
-        raw = self._store.get(self._attempt_key(station, climate_day))
+        raw = self._store.get(
+            self._attempt_key(station, climate_day, key_instrument_id=key_instrument_id),
+        )
         if raw is None:
             return 0, None
         try:
@@ -666,18 +768,26 @@ class TrialDayLatch:
             raise TrialDayRecordCorrupt()
         return count, last_ns
 
-    def record_attempt(self, station: str, climate_day: str, *, ts_ns: int) -> int:
-        """Durably increment this station-day's re-arm attempt counter.
+    def record_attempt(
+        self,
+        station: str,
+        climate_day: str,
+        *,
+        ts_ns: int,
+        key_instrument_id: str | None = None,
+    ) -> int:
+        """Durably increment this station-day's (or instrument-day's -- plan
+        S1) re-arm attempt counter.
 
         Returns the new count. Called once per genuine arm attempt (at
         `set_inflight` time), never on a re-arm-gate REFUSAL.
         """
         self._require_held()
-        count, _ = self.attempt_state(station, climate_day)
+        count, _ = self.attempt_state(station, climate_day, key_instrument_id=key_instrument_id)
         new_count = count + 1
         payload = {"v": 1, "count": new_count, "lastAttemptNs": ts_ns}
         self._store.set(
-            self._attempt_key(station, climate_day),
+            self._attempt_key(station, climate_day, key_instrument_id=key_instrument_id),
             json.dumps(payload, sort_keys=True).encode("utf-8"),
         )
         return new_count

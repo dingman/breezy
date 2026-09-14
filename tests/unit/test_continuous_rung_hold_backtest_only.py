@@ -391,7 +391,9 @@ def test_a_fill_freezes_the_station_day_against_further_submission(
 
     strategy.on_order_filled(_order_filled_for_position(strategy, venue_order_id="V-1"))
     assert strategy._latch is not None
-    assert strategy._latch.is_consumed(STATION, CLIMATE_DAY.isoformat()) is True
+    assert strategy._latch.is_consumed(
+        STATION, CLIMATE_DAY.isoformat(), key_instrument_id=str(INTERIOR_ID),
+    ) is True
 
     for i in range(1, 16):
         strategy.on_order_book_depth(
@@ -425,23 +427,31 @@ def test_a_wait_class_deny_lets_a_later_frame_produce_a_SECOND_attempt(
     strategy.on_data(_observation(temp_c_tenths=300, observed_at_ns=WINDOW_OPEN_NS - 1))
     strategy.on_quote_tick(_quote(INTERIOR_ID, ask="0.40", ts_event=WINDOW_OPEN_NS))
     assert strategy._latch is not None
-    assert strategy._latch.attempt_state(STATION, CLIMATE_DAY.isoformat()) == (
+    assert strategy._latch.attempt_state(
+        STATION, CLIMATE_DAY.isoformat(), key_instrument_id=str(INTERIOR_ID),
+    ) == (
         1,
         WINDOW_OPEN_NS,
     )
     assert len(submitted) == 1
-    assert strategy._latch.is_inflight(STATION, CLIMATE_DAY.isoformat()) is True
+    assert strategy._latch.is_inflight(
+        STATION, CLIMATE_DAY.isoformat(), key_instrument_id=str(INTERIOR_ID),
+    ) is True
 
     # The clear itself is pinned by the shipped `:459` test; this is the
     # precondition for the next step, not the assertion under test here.
     strategy.on_order_denied(
         _order_denied(strategy, reason=submit_chain.OPEN_INTENT_WAIT_REASON),
     )
-    assert strategy._latch.is_inflight(STATION, CLIMATE_DAY.isoformat()) is False
+    assert strategy._latch.is_inflight(
+        STATION, CLIMATE_DAY.isoformat(), key_instrument_id=str(INTERIOR_ID),
+    ) is False
 
     second_ts = WINDOW_OPEN_NS + _REARM_MIN_DELAY_NS + 1
     strategy.on_quote_tick(_quote(INTERIOR_ID, ask="0.40", ts_event=second_ts))
-    assert strategy._latch.attempt_state(STATION, CLIMATE_DAY.isoformat()) == (
+    assert strategy._latch.attempt_state(
+        STATION, CLIMATE_DAY.isoformat(), key_instrument_id=str(INTERIOR_ID),
+    ) == (
         2,
         second_ts,
     )

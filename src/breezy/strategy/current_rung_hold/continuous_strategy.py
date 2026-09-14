@@ -463,7 +463,7 @@ class ContinuousRungHoldStrategy(Strategy):
         for iid, facts in self._facts.items():
             station = facts.settlement_station
             climate_day_key = facts.climate_day.isoformat()
-            if self._latch.is_consumed(station, climate_day_key):
+            if self._latch.is_consumed(station, climate_day_key, key_instrument_id=iid):
                 continue
             slug = InstrumentId.from_str(iid).symbol.value
             # R-8 (2026-09-12, docs/core/PROGRESS.md): a slug LISTED on the
@@ -558,7 +558,8 @@ class ContinuousRungHoldStrategy(Strategy):
         if joined is None:
             return
         station, climate_day_key = joined
-        if self._latch.is_consumed(station, climate_day_key):
+        instrument_id = fill_record.instrument_id
+        if self._latch.is_consumed(station, climate_day_key, key_instrument_id=instrument_id):
             return
         avg_px = (
             fill_record.cumulative_cost / fill_record.cumulative_qty
@@ -578,6 +579,7 @@ class ContinuousRungHoldStrategy(Strategy):
                 reason=TAKEN_FROM_FILL_WALK_REASON,
                 venue_order_id=fill_record.venue_order_id,
             ),
+            key_instrument_id=instrument_id,
         )
 
     def _join_fill_to_station_day(
@@ -731,7 +733,7 @@ class ContinuousRungHoldStrategy(Strategy):
         station_day = (station, climate_day_key)
 
         assert self._latch is not None
-        if self._latch.is_consumed(station, climate_day_key):
+        if self._latch.is_consumed(station, climate_day_key, key_instrument_id=iid):
             return
         # AM-4 (HF-4 rev2.1): hoisted once per tick, BEFORE the IN_FLIGHT
         # check below, so the stale-IN_FLIGHT release and the re-arm gate a
@@ -740,10 +742,13 @@ class ContinuousRungHoldStrategy(Strategy):
         # on every tick too, since the release check runs unconditionally --
         # accepted cost (Decision 1, HF-4.rev2.md): Phase 0 already self-
         # clears IN_FLIGHT at the end of this method regardless.
-        attempt_state = self._latch.attempt_state(station, climate_day_key)
-        if self._latch.is_inflight(station, climate_day_key) and not self._release_stale_inflight(
+        attempt_state = self._latch.attempt_state(station, climate_day_key, key_instrument_id=iid)
+        if self._latch.is_inflight(
+            station, climate_day_key, key_instrument_id=iid,
+        ) and not self._release_stale_inflight(
             station,
             climate_day_key,
+            iid,
             attempts=attempt_state[0],
             last_attempt_ns=attempt_state[1],
             now_ns=snapshot.ts_event,
@@ -907,9 +912,11 @@ class ContinuousRungHoldStrategy(Strategy):
         # fill price -- otherwise the scorer's L-25 `fill_below_ask` guard
         # is inert by construction.
         self._decision_ask_by_station_day[(station, climate_day_key)] = ask
-        self._latch.set_inflight(station, climate_day_key)
+        self._latch.set_inflight(station, climate_day_key, key_instrument_id=iid)
         if self._submission_armed():
-            self._latch.record_attempt(station, climate_day_key, ts_ns=snapshot.ts_event)
+            self._latch.record_attempt(
+                station, climate_day_key, ts_ns=snapshot.ts_event, key_instrument_id=iid,
+            )
             if attempt_state[0] > 0:
                 # B3 (Decision 3, HF-4 rev2): a genuine RE-arm (attempts
                 # already > 0 before this one), never the first attempt --
@@ -920,7 +927,7 @@ class ContinuousRungHoldStrategy(Strategy):
                 )
         self._maybe_submit(iid, decision)
         if not self._submission_armed():
-            self._latch.clear_inflight(station, climate_day_key)
+            self._latch.clear_inflight(station, climate_day_key, key_instrument_id=iid)
 
     def _rearm_permitted(
         self,
@@ -1016,12 +1023,17 @@ class ContinuousRungHoldStrategy(Strategy):
         if facts is None:
             return
         assert self._latch is not None
-        self._latch.clear_inflight(facts.settlement_station, facts.climate_day.isoformat())
+        self._latch.clear_inflight(
+            facts.settlement_station,
+            facts.climate_day.isoformat(),
+            key_instrument_id=str(event.instrument_id),
+        )
 
     def _release_stale_inflight(
         self,
         station: str,
         climate_day: str,
+        instrument_id: str,
         *,
         attempts: int,
         last_attempt_ns: int | None,
@@ -1070,7 +1082,7 @@ class ContinuousRungHoldStrategy(Strategy):
                 "the same-burst delay floor has not elapsed"
             )
             return False
-        self._latch.clear_inflight(station, climate_day)
+        self._latch.clear_inflight(station, climate_day, key_instrument_id=instrument_id)
         self.diagnostics.record(_DIAG_INFLIGHT_RELEASED)
         self._report_alerter(
             self.diagnostics_alerter,
@@ -1200,20 +1212,33 @@ class ContinuousRungHoldStrategy(Strategy):
         writes `TAKEN_FROM_FILL_WALK_REASON` instead of calling this).
         """
         assert self._latch is not None
+        instrument_id = str(event.instrument_id)
         venue_order_id = str(event.venue_order_id)
         decision_ask = self._decision_ask_by_station_day.pop((station, climate_day_key), None)
         ask = decision_ask if decision_ask is not None else event.last_px.as_decimal()
         record = TrialDayRecord(
             latched_at_ns=event.ts_event,
-            instrument_id=str(event.instrument_id),
+            instrument_id=instrument_id,
             ask=ask,
             reason="taken",
             venue_order_id=venue_order_id,
         )
-        wrote = self._latch.consume_if_absent(station, climate_day_key, record)
+        wrote = self._latch.consume_if_absent(
+            station, climate_day_key, record, key_instrument_id=instrument_id,
+        )
         if wrote:
+            # Live evidence (09-13): `continuous_rung_hold/inflight/MIA/
+            # 2026-09-13` stayed `open` after the fill. IN_FLIGHT is
+            # cleared only AFTER the durable trial write above has already
+            # COMMIT-ted (`consume_if_absent` -> `StateStore.set`), never
+            # before it -- a crash between the two leaves IN_FLIGHT set on
+            # an already-consumed instrument-day, which is safe (fail
+            # closed: `is_consumed` short-circuits `_hunt_tick` regardless).
+            self._latch.clear_inflight(station, climate_day_key, key_instrument_id=instrument_id)
             return
-        existing = self._latch.record(station, climate_day_key)
+        existing = self._latch.record_with_legacy_fallback(
+            station, climate_day_key, key_instrument_id=instrument_id,
+        )
         if existing is None:
             return
         if existing.venue_order_id is None:
