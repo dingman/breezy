@@ -311,3 +311,13 @@ Order: §2 (done, 36c6d99) → `leg_prices.py` + tests → §3 revised (wire inv
   `BUY_SHORT ⊃ _SHORT` substring, not weakenings); the per-order cap reads the Nautilus order before `build_order_body`
   (`client.py:3043` vs `:3055`); no firewall allowlist widening (the call is inside the already-allowlisted
   `build_order_body`); the two evidence files are redacted.
+
+### Status 2026-09-14 18:2xZ
+Base branch at 993c93d holds Track A (X3 lifted and SIGNED, `leg_prices.py`, wire/fill translation, capture script under
+`scripts/analysis/`) and Track B (durable keys + node-cannot-write pin with alias resolution, CLI, boot reconcile, scorer
+residual, pending gate + shadow log), plus the S6b rung-key integration fix (numbers byte-identical). Exit criteria: (a) preview
++ book captured — MET (fee check moves to first fill); (b) X3 signed — MET (8c954ef); (c) S6b cited with caveats — MET;
+(d) first-order protocol keys/CLI/tests — MET; (e) position-shape ruling — OPEN by design (needs the first NO fill).
+`NO_SIDE_SHADOW_ONLY` remains True. The flip commit (§5 tail: arm, consume with fee, `_maybe_submit` on the NO instrument,
+never-arm walk deciding the NO leg, fill-walk join for NO ids, the E3-1 cross-check under the ruled position shape) is the
+LAST step and is not part of the 2026-09-15 01:23Z live merge.
