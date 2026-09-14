@@ -560,6 +560,11 @@ CAGE_RULE_PINS: tuple[RulePin, ...] = (
                 # A1: writes one key to the already-open local store; no
                 # path, no payload, no socket; no `await`.
                 "self.record_venue_order_id",
+                # Widened 2026-09-14 (daily-budget day stop, plan D1):
+                # `self._mark_budget_exhausted` -- one inert synchronous
+                # local-store write in the ledger/permit dollar-ceiling
+                # except arms; no await, no network.
+                "self._mark_budget_exhausted",
             }
         ),
         widened=frozenset(
@@ -612,13 +617,18 @@ CAGE_RULE_PINS: tuple[RulePin, ...] = (
                 "fill_record_bytes.decode",
                 "self.create_task",
                 "self.record_venue_order_id",
+                "self._mark_budget_exhausted",
             }
         ),
         narrowed=frozenset({"self._log.error"}),
         why="E0-NOSEND's allowlist: what an order coroutine may CALL. The "
         "widened neighbour adds `self.create_task`, which is the NATIVE "
         "mechanism `live/execution_client.py:246-256` drives the lifecycle "
-        "with -- one line, no `await`, and the order is on the wire",
+        "with -- one line, no `await`, and the order is on the wire. "
+        "Widened 2026-09-14 (daily-budget day stop, plan D1): "
+        "`self._mark_budget_exhausted` -- one inert synchronous "
+        "local-store write in the ledger/permit dollar-ceiling except "
+        "arms; no await, no network.",
     ),
     RulePin(
         module="firewall",
