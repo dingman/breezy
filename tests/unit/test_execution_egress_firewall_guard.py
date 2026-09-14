@@ -3165,6 +3165,16 @@ def test_x1_the_live_scan_actually_reaches_a_test_that_imports_the_exec_package(
     # WIDENED, not relaxed (L-6/L-12): the comparison is still `==`; the
     # module carries no `SOCKET_RESTORING_MARKERS` and constructs no client
     # -- `submit_chain` is the pure-helpers module, no socket either.
+    #
+    # Old -> new (this row, NO-side S5, section 4): added `tests/unit/
+    # test_no_side_fill_attribution_2026_09_14.py`, which drives a real
+    # `PolymarketUSExecutionClient` through `_note_ambiguous_open`/
+    # `_resolve_accept_fill`/`_submit_order`/`_seed_spend_from_durable_fills`
+    # to prove NO-leg fill/GET attribution and spend seeding. WIDENED, not
+    # relaxed (L-6/L-12): the comparison is still `==`; it carries no
+    # `SOCKET_RESTORING_MARKERS` -- its sender is the shipped `_FakeSender`
+    # double (imported from `test_polymarket_us_submit_order_chain.py`,
+    # never a parallel fake), same shape as every sibling exec suite.
     assert exec_importing_test_modules() == {
         "tests/contract/test_exec_client_reconciliation_contract.py",
         "tests/contract/test_exec_client_wiring_contract.py",
@@ -3188,6 +3198,7 @@ def test_x1_the_live_scan_actually_reaches_a_test_that_imports_the_exec_package(
         "tests/unit/test_live_family_tally_fill_source_cli.py",
         "tests/unit/test_polymarket_us_exec_snapshot_drift.py",
         "tests/unit/test_polymarket_us_factories.py",
+        "tests/unit/test_no_side_fill_attribution_2026_09_14.py",
         "tests/unit/test_no_side_submit_chain_2026_09_14.py",
         "tests/unit/test_polymarket_us_startup_evidence.py",
         "tests/unit/test_polymarket_us_submit_order_chain.py",

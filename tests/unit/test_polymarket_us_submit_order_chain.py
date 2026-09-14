@@ -1954,7 +1954,7 @@ def test_fill_generation_records_an_error_when_the_filled_cost_cannot_be_derived
         last_px="0.41",
         commission="0.03",
     )
-    monkeypatch.setattr(submit_chain, "_filled_cost_from_execution", lambda _e: None)
+    monkeypatch.setattr(submit_chain, "_filled_cost_from_execution", lambda _e, **_kw: None)
     errors: list[str] = []
 
     result = fill_generation(
@@ -1986,7 +1986,7 @@ def test_a_body_whose_filled_cost_is_underivable_stays_ambiguous_with_a_fill_par
         last_px="0.41",
         commission="0.03",
     )
-    monkeypatch.setattr(submit_chain, "_filled_cost_from_execution", lambda _e: None)
+    monkeypatch.setattr(submit_chain, "_filled_cost_from_execution", lambda _e, **_kw: None)
 
     outcome = _classify_i1a([leg])
 
@@ -2069,7 +2069,7 @@ def test_a_leg_that_maps_cleanly_always_yields_a_derivable_filled_cost(
     # RED (if this coupling ever breaks live): a leg that maps cleanly, yet
     # whose cost this module's OWN, independent decimal parsing cannot
     # derive.
-    filled_cost = submit_chain._filled_cost_from_execution(execution)
+    filled_cost = submit_chain._filled_cost_from_execution(execution, leg="yes")
     assert filled_cost is None
 
 

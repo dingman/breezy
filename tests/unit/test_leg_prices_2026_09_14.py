@@ -114,9 +114,44 @@ def test_an_unknown_leg_refuses_the_echo_check() -> None:
 # E5-6 structural pin
 # ---------------------------------------------------------------------------
 
-_PERMITTED_IMPORTED_NAMES = frozenset({"wire_price_for_leg", "instrument_price_for_leg"})
+#: WIDENED (not relaxed) to include `assert_echo_matches_leg`: E5-2's venue
+#: side/intent cross-check lives in the SAME two mapper functions
+#: (`parse_fill_report`/`parse_order_status_report`) that translate the
+#: price -- the original E5-6 wording named only the price functions, but
+#: the echo check is the other half of the same commit's safety net and
+#: belongs to the same "outside exec/, imported narrowly" shape.
+_PERMITTED_IMPORTED_NAMES = frozenset(
+    {
+        "wire_price_for_leg",
+        "instrument_price_for_leg",
+        "assert_echo_matches_leg",
+        # `Leg`: the type alias, imported for signatures only -- carries no
+        # arithmetic and is never called.
+        "Leg",
+    }
+)
+#: WIDENED (not relaxed), commit `feat(exec): book NO-leg fills as BUY at
+#: the instrument price` -- `_cumulative_qty_and_cost`/`_filled_cost_from_
+#: execution` are the CREATE path's OWN I1a total computation, reading
+#: `avgPx`/`lastPx` directly off the raw execution/order body, entirely
+#: independent of `parse_fill_report`'s mapped `FillReport.last_px`. Both
+#: read a WIRE (YES-denominated) value and must translate it via the same
+#: `leg`, or the NO leg's booked notional silently keeps the wire price.
 _PERMITTED_CALLERS = frozenset(
-    {"build_order_body", "parse_fill_report", "parse_order_status_report"}
+    {
+        "build_order_body",
+        "parse_fill_report",
+        "parse_order_status_report",
+        "_cumulative_qty_and_cost",
+        "_filled_cost_from_execution",
+        # Thin leg-aware wrappers around `_price_field`/`_price_decimal_field`
+        # and the side/intent cross-check, called ONLY by the three mapper
+        # functions above -- named separately here so the AST scan sees the
+        # textual call site, not a second, drifting definition.
+        "_leg_price_field",
+        "_leg_price_decimal_field",
+        "_order_side_for_leg",
+    }
 )
 
 #: Pre-existing, unrelated complement arithmetic: `PolymarketUSFeeModel`'s

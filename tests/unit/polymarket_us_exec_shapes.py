@@ -93,6 +93,11 @@ def build_order(slug: str) -> dict[str, Any]:
         "id": "ord-7f3a",
         "marketSlug": slug,
         "side": "ORDER_SIDE_BUY",
+        # Rev 5 (E5-2): the venue always echoes `intent` on an Order; the YES
+        # leg's own values (`assert_echo_matches_leg`), matching the default
+        # `side` above. Every pre-existing caller of this fixture drives a
+        # YES-leg instrument, so this is additive, not a behaviour change.
+        "intent": "ORDER_INTENT_BUY_LONG",
         "type": "ORDER_TYPE_LIMIT",
         "price": {"value": "0.53", "currency": "USD"},
         "quantity": 10,

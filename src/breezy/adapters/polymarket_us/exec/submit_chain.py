@@ -29,7 +29,11 @@ from nautilus_trader.model.objects import Money, Price, Quantity
 
 from breezy.adapters.polymarket_us.errors import ExecutionReportMappingError, VenueTransportError
 from breezy.adapters.polymarket_us.exec.reports import _key_tree, parse_fill_report
-from breezy.adapters.polymarket_us.leg_prices import wire_price_for_leg
+from breezy.adapters.polymarket_us.leg_prices import (
+    Leg,
+    instrument_price_for_leg,
+    wire_price_for_leg,
+)
 from breezy.adapters.polymarket_us.parsing import LEG_KEY, LEG_NO
 from breezy.adapters.polymarket_us.symbology import leg_of
 from breezy.adapters.polymarket_us.transport import VenueResponse
@@ -459,14 +463,20 @@ def _durable_execution(payload: Mapping[str, Any]) -> Mapping[str, Any] | None:
     return None
 
 
-def _filled_cost_from_execution(execution: Mapping[str, Any]) -> Decimal | None:
+def _filled_cost_from_execution(execution: Mapping[str, Any], *, leg: Leg) -> Decimal | None:
+    """Rev 5 (E5-1): every raw ``avgPx``/``lastPx`` this reads is a WIRE
+    value (YES-denominated); translated via ``leg`` before it prices any
+    cost, identity on the YES leg. This is the create path's OWN I1a total,
+    read independently of :func:`~breezy.adapters.polymarket_us.exec.
+    reports.parse_fill_report` -- both must stay leg-aware or the NO leg's
+    booked cost silently keeps the wire (complement) price."""
     order = execution.get("order")
     if isinstance(order, Mapping):
         avg = _amount_decimal(order.get("avgPx"))
         cum = order.get("cumQuantity")
         if avg is not None and cum is not None:
             try:
-                return avg * Decimal(str(cum))
+                return instrument_price_for_leg(leg, avg) * Decimal(str(cum))
             except (InvalidOperation, ValueError, TypeError):
                 pass
     last_px = _amount_decimal(execution.get("lastPx"))
@@ -474,7 +484,7 @@ def _filled_cost_from_execution(execution: Mapping[str, Any]) -> Decimal | None:
     if last_px is None or last_shares is None:
         return None
     try:
-        return last_px * Decimal(str(last_shares))
+        return instrument_price_for_leg(leg, last_px) * Decimal(str(last_shares))
     except (InvalidOperation, ValueError, TypeError):
         return None
 
@@ -537,7 +547,7 @@ def _sum_fill_commission(executions: tuple[Mapping[str, Any], ...]) -> Decimal |
 
 
 def _cumulative_qty_and_cost(
-    execution: Mapping[str, Any],
+    execution: Mapping[str, Any], *, leg: Leg
 ) -> tuple[Decimal | None, Decimal | None]:
     """Qty and cost sourced TOGETHER, from the order snapshot on ``execution``,
     or together from this one execution's leg -- never mixed (I1a).
@@ -548,6 +558,10 @@ def _cumulative_qty_and_cost(
     would pair a whole-order quantity with a one-leg cost or the reverse --
     exactly the defect I1a forbids. This atomically checks both preconditions
     before choosing the order-level source.
+
+    Rev 5 (E5-1): the price half of either source is a WIRE value
+    (YES-denominated); translated via ``leg`` (identity on the YES leg)
+    before pricing the cost -- see :func:`_filled_cost_from_execution`.
     """
     order = execution.get("order")
     if isinstance(order, Mapping):
@@ -559,7 +573,7 @@ def _cumulative_qty_and_cost(
             except (InvalidOperation, ValueError):
                 cum = None
             if cum is not None:
-                return cum, avg * cum
+                return cum, instrument_price_for_leg(leg, avg) * cum
     last_px = _amount_decimal(execution.get("lastPx"))
     last_shares = execution.get("lastShares")
     if last_px is not None and last_shares is not None:
@@ -567,7 +581,7 @@ def _cumulative_qty_and_cost(
             qty = Decimal(str(last_shares))
         except (InvalidOperation, ValueError):
             return None, None
-        return qty, last_px * qty
+        return qty, instrument_price_for_leg(leg, last_px) * qty
     return None, None
 
 
@@ -819,7 +833,9 @@ def fill_generation(
         if errors is not None:
             errors.append(_capped_diagnostic(str(exc)))
         return None
-    filled_cost = _filled_cost_from_execution(execution)
+    filled_cost = _filled_cost_from_execution(
+        execution, leg=leg_of(cast(Instrument, instrument).id)
+    )
     if filled_cost is None:
         if errors is not None:
             errors.append(_capped_diagnostic(_underivable_cost_message(execution)))
@@ -1016,7 +1032,9 @@ def classify_create_order_outcome(
                 errors=fill_parse_errors,
             )
             if fill is not None:
-                cumulative_qty, cumulative_cost = _cumulative_qty_and_cost(execution)
+                cumulative_qty, cumulative_cost = _cumulative_qty_and_cost(
+                    execution, leg=leg_of(cast(Instrument, instrument).id)
+                )
                 cumulative_fee, fee_reconciled = _cumulative_fee_and_reconciliation(
                     payload, execution, cumulative_qty=cumulative_qty
                 )
