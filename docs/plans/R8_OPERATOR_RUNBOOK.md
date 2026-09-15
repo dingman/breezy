@@ -209,7 +209,7 @@ state store — the shared `SqliteStateStore` under the runtime state dir, holdi
 `current_rung_hold/trial/{station}/{climate_day}`.
 
 Wrong observations: more than one order per station-day → stop the node, the latch is not doing its
-job. Any SELL, any modify, any second contract → stop the node immediately. A refusal naming a
+job. Any SELL, any modify, any second contract → stop the node immediately. The intra-day position monitor (plan INTRADAY_POSITION_MONITOR_2026-09-15) is shadow-only — it evaluates and records HOLD/REDUCE/EXIT verdicts but never submits, so an observed SELL remains a defect to stop the node on, and the monitor's own health appears as `monitor_errors` / `monitor_marks_dropped` counters in the alert stream. A refusal naming a
 missing operator control → the two caps in `operator.env` did not reach the process.
 
 ## 8. Crash and recovery
