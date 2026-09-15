@@ -18,8 +18,10 @@ import datetime as dt
 import fcntl
 import logging
 import os
+import signal
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 import pytest
@@ -52,6 +54,7 @@ from breezy.runtime.trade_supervisor import (
     main,
     node_log_path,
     probe_open_intent,
+    process_is_alive,
     resolve_lock_holder_pid,
     spawn_node,
     supervisor_lock_path,
@@ -1406,6 +1409,96 @@ class TestTerminateAfterToctouRecheck:
 
         sig = inspect.signature(terminate_after_toctou_recheck)
         assert sig.parameters["terminate_fn"].default is terminate
+
+    def test_stop_prior_refuses_a_zombie_pid_with_the_nonexistent_reason(self):
+        pid = os.fork()
+        if pid == 0:
+            os._exit(0)
+        try:
+            _wait_for_zombie(pid)
+            sent: list[int] = []
+            with pytest.raises(StopPriorRaceRefused, match="pid no longer exists"):
+                terminate_after_toctou_recheck(
+                    pid,
+                    intent_lock_path_=Path("/does/not/matter"),
+                    resolve_holder=lambda _p: pid,
+                    terminate_fn=sent.append,
+                    is_alive=process_is_alive,
+                )
+            assert sent == []
+        finally:
+            os.waitpid(pid, 0)
+
+
+# ---------------------------------------------------------------------------
+# process_is_alive -- a zombie must never read as alive (os.kill(pid, 0)
+# alone succeeds against a zombie; the real fix inspects /proc/<pid>/stat).
+# ---------------------------------------------------------------------------
+
+
+def _read_proc_stat_state(pid: int) -> str | None:
+    """Test-only, independent parse of ``/proc/<pid>/stat``'s state field --
+    deliberately duplicated rather than reusing the production helper, so
+    the positive control below never depends on the code under test."""
+    try:
+        raw = Path(f"/proc/{pid}/stat").read_text()
+    except OSError:
+        return None
+    after_comm = raw.rsplit(")", 1)[-1]
+    fields = after_comm.split()
+    return fields[0] if fields else None
+
+
+def _wait_for_zombie(pid: int, *, timeout: float = 1.0) -> None:
+    """Poll briefly for ``pid`` to become a zombie. Raises (never a bare
+    ``assert``) if the deadline passes first, so a child that never exits
+    surfaces as a broken test environment rather than a silent pass."""
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if _read_proc_stat_state(pid) == "Z":
+            return
+        time.sleep(0.01)
+    raise RuntimeError(f"child pid {pid} never reached zombie state within {timeout}s")
+
+
+class TestProcessIsAlive:
+    def test_a_zombie_child_is_not_alive(self):
+        pid = os.fork()
+        if pid == 0:
+            os._exit(0)
+        try:
+            # Positive control FIRST: confirm, independently of the code
+            # under test, that this pid really is a zombie.
+            _wait_for_zombie(pid)
+            assert _read_proc_stat_state(pid) == "Z"
+            assert process_is_alive(pid) is False
+        finally:
+            os.waitpid(pid, 0)
+
+    def test_a_running_child_is_still_alive(self):
+        pid = os.fork()
+        if pid == 0:
+            time.sleep(5)
+            os._exit(0)
+        try:
+            assert process_is_alive(pid) is True
+        finally:
+            os.kill(pid, signal.SIGKILL)
+            os.waitpid(pid, 0)
+
+    def test_an_adopted_zombie_pid_is_not_alive(self):
+        # No Popen object anywhere in scope -- wired the same way
+        # `default_ports` wires the real `process_is_alive` in, then called
+        # through the `SupervisorPorts` port rather than the bare function.
+        pid = os.fork()
+        if pid == 0:
+            os._exit(0)
+        try:
+            _wait_for_zombie(pid)
+            ports = _make_ports(process_alive=process_is_alive)
+            assert ports.process_alive(pid) is False
+        finally:
+            os.waitpid(pid, 0)
 
 
 # ---------------------------------------------------------------------------
