@@ -130,6 +130,7 @@ from breezy.strategy.current_rung_hold.trial_day_latch import (
     TAKEN_FROM_FILL_WALK_REASON,
     TrialDayRecord,
     TrialDayRecordCorrupt,
+    trial_id_for,
 )
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -695,7 +696,12 @@ def read_filled_trials_state_db(
         if not isinstance(key, str) or not key.startswith(family_prefix):
             continue
         parts = key[len(family_prefix) :].split("/")
-        if len(parts) == 2 and parts[0] in station_census:
+        # v3 (plan S1, operator ruling 2026-09-14): an instrument-keyed
+        # latch key is 3-part (`station/climate_day/instrument_id`, built by
+        # `trial_day_latch._key`) -- the station segment is still `parts[0]`
+        # either way, so the census check widens to `(2, 3)` rather than
+        # gaining a second branch.
+        if len(parts) in (2, 3) and parts[0] in station_census:
             has_census_latch = True
             break
     if not has_census_latch:
@@ -722,9 +728,18 @@ def read_filled_trials_state_db(
         if not isinstance(key, str) or not key.startswith(family_prefix):
             continue
         parts = key[len(family_prefix) :].split("/")
-        if len(parts) != 2:
+        # v3 (plan S1, operator ruling 2026-09-14 -- "I never wanted a limit
+        # of 1 contract per station"): `trial_day_latch._key` also writes a
+        # 3-part `station/climate_day/instrument_id` shape. `key_instrument_id`
+        # is `None` for the legacy 2-part shape (v2's only shape, unchanged
+        # below) and the raw third segment for the 3-part shape.
+        if len(parts) == 2:
+            station, climate_day = parts
+            key_instrument_id: str | None = None
+        elif len(parts) == 3:
+            station, climate_day, key_instrument_id = parts
+        else:
             continue
-        station, climate_day = parts
         if climate_day < since_climate_day:
             continue
         try:
@@ -742,8 +757,28 @@ def read_filled_trials_state_db(
         # (below), never dropped here as if it were a refusal.
         if record.reason not in (_TAKEN_REASON, TAKEN_FROM_FILL_WALK_REASON):
             continue
+        if key_instrument_id is None:
+            trial_id = key
+        else:
+            # The key's own instrument-id segment must agree with the
+            # decoded record's `instrument_id` field -- compared through
+            # `trial_id_for` (the latch's own public normalization wrapper,
+            # never re-derived here) rather than a raw string compare, so a
+            # dotted-vs-bare spelling difference is never mistaken for a
+            # genuine disagreement. A real disagreement is store corruption
+            # (F3's existing convention): fail the whole run closed, never a
+            # silent join on the wrong identity.
+            from_key = trial_id_for(family_prefix, station, climate_day, key_instrument_id)
+            from_record = trial_id_for(family_prefix, station, climate_day, record.instrument_id)
+            if from_key != from_record:
+                raise FillSourceUnreadableError(
+                    f"a record under the {family_prefix!r} key prefix has an "
+                    "instrument-id key segment that disagrees with its own "
+                    "record's instrument_id"
+                )
+            trial_id = from_record
         latches_by_instrument.setdefault(record.instrument_id, []).append(
-            (key, climate_day, record.ask, station, record.venue_order_id, record.reason)
+            (trial_id, climate_day, record.ask, station, record.venue_order_id, record.reason)
         )
 
     fills_by_instrument: dict[str, list[DurableFillRecord]] = {}

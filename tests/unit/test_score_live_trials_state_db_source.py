@@ -79,6 +79,7 @@ from breezy.runtime.submit_intent import CURRENT_INTENT_KEY, SubmitIntent, Submi
 from breezy.strategy.current_rung_hold.trial_day_latch import (
     TAKEN_FROM_FILL_WALK_REASON,
     TrialDayRecord,
+    trial_id_for,
 )
 
 _BASE_NS = int(dt.datetime(2026, 9, 5, 6, 31, tzinfo=dt.UTC).timestamp() * 1_000_000_000)
@@ -125,8 +126,19 @@ def _seed_latch(
     latched_at_ns: int = _BASE_NS,
     venue_order_id: str | None = None,
     family_prefix: str = _FAMILY_PREFIX,
+    key_instrument_id: str | None = None,
 ) -> str:
-    key = _latch_key(station, climate_day, family_prefix=family_prefix)
+    """``key_instrument_id`` (v3, instrument-keyed latch shape,
+    `trial_day_latch._key`): builds the 3-part
+    ``{family_prefix}{station}/{climate_day}/{instrument_id}`` key via the
+    real public ``trial_id_for`` wrapper -- never a hand-rolled string --
+    so a fixture that disagrees with production's own normalization is
+    impossible. ``None`` (default) reproduces the legacy 2-part v2 key,
+    byte-identical to every pre-existing call site."""
+    if key_instrument_id is None:
+        key = _latch_key(station, climate_day, family_prefix=family_prefix)
+    else:
+        key = trial_id_for(family_prefix, station, climate_day, key_instrument_id)
     record = TrialDayRecord(
         latched_at_ns=latched_at_ns,
         instrument_id=instrument_id,
@@ -1637,3 +1649,167 @@ def test_v2_zero_keys_is_still_store_failure(tmp_path: Path) -> None:
     store.close()
     with pytest.raises(StorePositiveControlFailedError):
         read_filled_trials_state_db(store_path, **_reader_kwargs())
+
+
+# ---------------------------------------------------------------------------
+# 3-part instrument-keyed v3 latch key parsing (`trial_day_latch._key`'s
+# ``key_instrument_id``-widened shape, operator ruling 2026-09-14 / plan S1):
+# `read_filled_trials_state_db` must read this shape, not silently skip it
+# via the legacy `len(parts) != 2` guard (join-logic defect, never the
+# decision rule or the statistic).
+# ---------------------------------------------------------------------------
+
+
+_OTHER_V3_INSTRUMENT_ID = "LAX-2026-09-05-gte82lt83f"
+_NO_INSTRUMENT_ID = f"{_INSTRUMENT_ID}^no"
+
+
+def test_v3_instrument_keyed_latch_yields_one_trial_with_the_canonical_trial_id(
+    tmp_path: Path,
+) -> None:
+    """A 3-part ``{prefix}{station}/{climate_day}/{instrument_id}`` v3 latch
+    key is read (never skipped), and the yielded ``trial_id`` is exactly
+    ``trial_id_for(...)`` -- the same contract `position_monitor.py`'s
+    summary join relies on."""
+    store_path = tmp_path / "state.sqlite"
+    store = SqliteStateStore(store_path)
+    latch_key = _seed_latch(
+        store,
+        ask=Decimal("0.40"),
+        instrument_id=_INSTRUMENT_ID,
+        key_instrument_id=_INSTRUMENT_ID,
+        family_prefix=_V3_FAMILY_PREFIX,
+    )
+    _seed_fill(
+        store, venue_order_id="v1", cumulative_cost=Decimal("0.42"), cumulative_fee=Decimal("0.01")
+    )
+    store.close()
+
+    trials, exclusions, fee_map, _no_side_map = read_filled_trials_state_db(
+        store_path, **_reader_kwargs(family_prefix=_V3_FAMILY_PREFIX),
+    )
+
+    assert exclusions == ()
+    assert len(trials) == 1
+    trial = trials[0]
+    assert trial.instrument_id == _INSTRUMENT_ID
+    assert trial.trial_id == trial_id_for(_V3_FAMILY_PREFIX, _STATION, _DAY_ISO, _INSTRUMENT_ID)
+    assert trial.trial_id == latch_key
+    assert fee_map[trial.trial_id] == (True, "v1", False)
+
+
+def test_mixed_v2_and_v3_latches_in_one_store_are_both_read_without_cross_contamination(
+    tmp_path: Path,
+) -> None:
+    """A store carrying BOTH a legacy 2-part latch and an instrument-keyed
+    3-part latch (the real shape of today's live store, mid-migration)
+    yields both trials, each joined to its own fill only."""
+    store_path = tmp_path / "state.sqlite"
+    store = SqliteStateStore(store_path)
+    v2_key = _seed_latch(
+        store,
+        instrument_id=_INSTRUMENT_ID,
+        ask=Decimal("0.40"),
+        family_prefix=_V3_FAMILY_PREFIX,
+    )
+    _seed_fill(
+        store, venue_order_id="v1", instrument_id=_INSTRUMENT_ID,
+        cumulative_cost=Decimal("0.42"), cumulative_fee=Decimal("0.01"),
+    )
+    v3_key = _seed_latch(
+        store,
+        instrument_id=_OTHER_V3_INSTRUMENT_ID,
+        key_instrument_id=_OTHER_V3_INSTRUMENT_ID,
+        ask=Decimal("0.24"),
+        family_prefix=_V3_FAMILY_PREFIX,
+    )
+    _seed_fill(
+        store, venue_order_id="v2", instrument_id=_OTHER_V3_INSTRUMENT_ID,
+        cumulative_cost=Decimal("0.25"), cumulative_fee=Decimal("0.01"),
+    )
+    store.close()
+
+    trials, exclusions, fee_map, _no_side_map = read_filled_trials_state_db(
+        store_path, **_reader_kwargs(family_prefix=_V3_FAMILY_PREFIX),
+    )
+
+    assert exclusions == ()
+    assert len(trials) == 2
+    by_instrument = {t.instrument_id: t for t in trials}
+    assert by_instrument[_INSTRUMENT_ID].trial_id == v2_key
+    assert by_instrument[_OTHER_V3_INSTRUMENT_ID].trial_id == v3_key
+    assert by_instrument[_INSTRUMENT_ID].fill_px == Decimal("0.42")
+    assert by_instrument[_OTHER_V3_INSTRUMENT_ID].fill_px == Decimal("0.25")
+    assert fee_map[v2_key] == (True, "v1", False)
+    assert fee_map[v3_key] == (True, "v2", False)
+
+
+def test_a_v3_latchs_key_segment_disagreeing_with_its_record_instrument_id_is_unreadable(
+    tmp_path: Path,
+) -> None:
+    """A 3-part key whose own instrument-id segment does not agree with the
+    decoded record's `instrument_id` field is store corruption -- fail
+    closed (F3's existing convention), never a silent join on the wrong
+    identity."""
+    store_path = tmp_path / "state.sqlite"
+    store = SqliteStateStore(store_path)
+    _seed_latch(
+        store,
+        instrument_id=_INSTRUMENT_ID,
+        key_instrument_id=_OTHER_V3_INSTRUMENT_ID,
+        family_prefix=_V3_FAMILY_PREFIX,
+    )
+    store.close()
+
+    with pytest.raises(FillSourceUnreadableError):
+        read_filled_trials_state_db(store_path, **_reader_kwargs(family_prefix=_V3_FAMILY_PREFIX))
+
+
+def test_v3_no_leg_instrument_keyed_latch_matching_the_pending_key_is_marked_residual(
+    tmp_path: Path,
+) -> None:
+    """A NO-leg (``^no``-suffixed) instrument-keyed v3 latch is read exactly
+    like any other v3 latch, and the EXISTING first-order containment
+    window (`no_side_residual_by_trial_id`, matched by `instrument_id`,
+    never by key shape) still marks it residual once the 3-part key is no
+    longer silently skipped -- no new exclusion reason is required."""
+    store_path = tmp_path / "state.sqlite"
+    store = SqliteStateStore(store_path)
+    latch_key = _seed_latch(
+        store,
+        instrument_id=_NO_INSTRUMENT_ID,
+        key_instrument_id=_NO_INSTRUMENT_ID,
+        ask=Decimal("0.09"),
+        family_prefix=_V3_FAMILY_PREFIX,
+    )
+    _seed_fill(
+        store, venue_order_id="v1", instrument_id=_NO_INSTRUMENT_ID,
+        cumulative_cost=Decimal("0.09"), cumulative_fee=Decimal("0.01"),
+    )
+    store.set(
+        NO_SIDE_FIRST_LIVE_ORDER_KEY,
+        json.dumps(
+            {"instrumentId": _NO_INSTRUMENT_ID, "venueOrderId": "v1", "tsNs": _BASE_NS}
+        ).encode("utf-8"),
+    )
+    store.close()
+
+    trials, exclusions, fee_map, no_side_map = read_filled_trials_state_db(
+        store_path, **_reader_kwargs(family_prefix=_V3_FAMILY_PREFIX),
+    )
+
+    assert exclusions == ()
+    assert len(trials) == 1
+    trial = trials[0]
+    assert trial.trial_id == latch_key
+    assert no_side_map == {latch_key: True}
+
+    exclusion = _admit_fill(
+        trial,
+        fee_reconciled=fee_map[latch_key][0],
+        venue_order_id=fee_map[latch_key][1],
+        no_side_residual=no_side_map.get(trial.trial_id, False),
+    )
+    assert exclusion is not None
+    assert exclusion.reason == "no_side_first_order_residual"
+    assert exclusion.reason in RESIDUAL_EXCLUSION_REASONS
