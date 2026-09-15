@@ -162,7 +162,16 @@ def _decimal_range_summary(values: Sequence[Decimal]) -> DecimalRangeSummary:
 
 @dataclass(frozen=True, slots=True, kw_only=True)
 class AvoidedLossSummary:
-    """Sum of `recoverable_value_at_signal - settled_pnl` over losing EXIT rows.
+    """Sum of `recoverable_value_at_signal - settled_pnl_total` over losing EXIT rows.
+
+    UNITS (HIGH review fix): `recoverable_value_at_signal`
+    (`monitor_evidence.py`'s `mark_vwap * held_qty - exit_fee_at_mark`) is a
+    TOTAL-POSITION dollar mark, but `settled_pnl` (`ScoredTrial.pnl` /
+    `trial_scorer.py:194`, and the hypothetical corpus's
+    `monitor_hypothetical_core.py:476-480`) is PER-CONTRACT
+    (`1{held} - fill_px - fee`, no quantity term). `total` below is computed
+    entirely in TOTAL-POSITION dollars by scaling `settled_pnl` by
+    `held_qty` first -- see `_avoided_loss`.
 
     Only rows with a `recoverable_value_at_signal` (a true depth-walked
     mark, never a post-hoc bid -- L-18) are included; a missing mark is
@@ -253,6 +262,9 @@ class MonitorReport:
     exit_timing_histogram: Mapping[int, int]
     mae_summary: DecimalRangeSummary
     mfe_summary: DecimalRangeSummary
+    #: `settled_pnl` (scaled to TOTAL-POSITION dollars) minus the
+    #: signal-instant mark-implied PnL, also TOTAL-POSITION dollars -- see
+    #: `_realized_vs_mark_delta`'s docstring for the unit derivation.
     realized_vs_mark_delta: DecimalRangeSummary
     n_gated: NGatedMetrics
     calibration: CalibrationStatus
@@ -418,6 +430,7 @@ def _dead_precision(joined: Sequence[_Joined]) -> WilsonEstimate:
 
 
 def _avoided_loss(joined: Sequence[_Joined]) -> AvoidedLossSummary:
+    """See `AvoidedLossSummary`'s docstring for the TOTAL-POSITION-dollar unit fix."""
     total = Decimal(0)
     included = 0
     excluded = 0
@@ -427,7 +440,10 @@ def _avoided_loss(joined: Sequence[_Joined]) -> AvoidedLossSummary:
         if row.summary.recoverable_value_at_signal is None:
             excluded += 1
             continue
-        total += row.summary.recoverable_value_at_signal - row.settled_pnl
+        # `settled_pnl` is PER-CONTRACT; scale by `held_qty` (Decimal) so
+        # both operands are TOTAL-POSITION dollars before subtracting.
+        settled_pnl_total = row.settled_pnl * row.summary.held_qty
+        total += row.summary.recoverable_value_at_signal - settled_pnl_total
         included += 1
     return AvoidedLossSummary(total=total, n_included=included, n_excluded_missing_mark=excluded)
 
@@ -450,19 +466,35 @@ def _exit_timing_histogram(summaries: Sequence[PositionMonitorSummary]) -> dict[
 
 
 def _mark_implied_pnl(row: _Joined) -> Decimal | None:
-    """PnL implied by exiting the full held quantity at the signal-instant mark."""
+    """PnL implied by exiting the full held quantity at the signal-instant mark.
+
+    UNITS: TOTAL-POSITION dollars throughout -- `recoverable_value_at_signal`
+    is already `mark_vwap * held_qty - exit_fee_at_mark`
+    (`monitor_evidence.py`) and `fill_px * held_qty` here is the total cost
+    basis, so no further scaling is needed on this side of the comparison
+    (contrast `row.settled_pnl`, which is PER-CONTRACT -- see
+    `_realized_vs_mark_delta`).
+    """
     if row.summary.recoverable_value_at_signal is None:
         return None
     return row.summary.recoverable_value_at_signal - (row.summary.fill_px * row.summary.held_qty)
 
 
 def _realized_vs_mark_delta(joined: Sequence[_Joined]) -> DecimalRangeSummary:
+    """`settled_pnl` (scaled to TOTAL-POSITION dollars) minus `_mark_implied_pnl`.
+
+    UNITS (HIGH review fix): `_mark_implied_pnl` is TOTAL-POSITION dollars
+    (see its docstring), but `row.settled_pnl` (`ScoredTrial.pnl`) is
+    PER-CONTRACT. Scale by `held_qty` (Decimal) before subtracting so both
+    operands share a unit -- identical fix and rationale as `_avoided_loss`.
+    """
     deltas = []
     for row in joined:
         implied = _mark_implied_pnl(row)
         if implied is None:
             continue
-        deltas.append(row.settled_pnl - implied)
+        settled_pnl_total = row.settled_pnl * row.summary.held_qty
+        deltas.append(settled_pnl_total - implied)
     return _decimal_range_summary(tuple(deltas))
 
 

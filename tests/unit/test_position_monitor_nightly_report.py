@@ -409,6 +409,102 @@ class TestAvoidedLoss:
         assert report.avoided_loss.n_included == 1
         assert report.avoided_loss.n_excluded_missing_mark == 1
 
+    def test_avoided_loss_scales_settled_pnl_by_held_qty_to_match_total_dollar_units(
+        self, report_mod: ModuleType
+    ) -> None:
+        """HIGH review fix: `recoverable_value_at_signal` is a TOTAL-POSITION
+        dollar mark (`mark_vwap * held_qty - exit_fee`, `monitor_evidence.py`)
+        but `settled_pnl` (`ScoredTrial.pnl`) is PER-CONTRACT
+        (`1{held} - fill_px - fee`). At `held_qty=2` mixing the two units
+        without scaling silently corrupts the statistic.
+        """
+        summaries = (
+            _summary(
+                trial_id="A",
+                held_qty=Decimal(2),
+                fill_px=Decimal("0.40"),
+                verdict_at_signal="EXIT_RECOMMENDED",
+                recoverable_value_at_signal=Decimal("0.50"),
+            ),
+        )
+        scored = (_trial(trial_id="A", held=False, pnl=Decimal("-0.41")),)
+
+        report = report_mod.build_monitor_report(summaries, scored)
+
+        # Hand-computed in TOTAL-POSITION dollars: 0.50 - (-0.41 * 2) == 1.32.
+        assert report.avoided_loss.total == Decimal("1.32")
+        assert report.avoided_loss.n_included == 1
+
+    def test_avoided_loss_at_held_qty_one_is_unchanged_by_the_unit_fix(
+        self, report_mod: ModuleType
+    ) -> None:
+        """Regression: at `held_qty=1` scaling by 1 is a no-op, so the
+        pre-existing per-contract-looking figure must stay identical.
+        """
+        summaries = (
+            _summary(
+                trial_id="A",
+                held_qty=Decimal(1),
+                verdict_at_signal="EXIT_RECOMMENDED",
+                recoverable_value_at_signal=Decimal("0.30"),
+            ),
+        )
+        scored = (_trial(trial_id="A", held=False, pnl=Decimal("-0.50")),)
+
+        report = report_mod.build_monitor_report(summaries, scored)
+
+        assert report.avoided_loss.total == Decimal("0.80")
+
+
+class TestRealizedVsMarkDelta:
+    """HIGH review fix: `_mark_implied_pnl` is TOTAL-POSITION dollars
+    (`recoverable_value_at_signal - fill_px * held_qty`) but `settled_pnl`
+    is PER-CONTRACT -- see `TestAvoidedLoss`'s unit-fix tests for the same
+    mismatch on the sibling statistic.
+    """
+
+    def test_delta_scales_settled_pnl_by_held_qty_to_match_the_marks_total_dollar_units(
+        self, report_mod: ModuleType
+    ) -> None:
+        summaries = (
+            _summary(
+                trial_id="A",
+                held_qty=Decimal(2),
+                fill_px=Decimal("0.40"),
+                recoverable_value_at_signal=Decimal("0.50"),
+            ),
+        )
+        scored = (_trial(trial_id="A", held=False, pnl=Decimal("-0.41")),)
+
+        report = report_mod.build_monitor_report(summaries, scored)
+
+        # implied = recoverable_value_at_signal - (fill_px * held_qty)
+        #         = 0.50 - (0.40 * 2) = -0.30
+        # delta   = (settled_pnl * held_qty) - implied
+        #         = (-0.41 * 2) - (-0.30) = -0.52
+        assert report.realized_vs_mark_delta.n == 1
+        assert report.realized_vs_mark_delta.min == Decimal("-0.52")
+        assert report.realized_vs_mark_delta.median == Decimal("-0.52")
+        assert report.realized_vs_mark_delta.max == Decimal("-0.52")
+
+    def test_delta_at_held_qty_one_is_unchanged_by_the_unit_fix(
+        self, report_mod: ModuleType
+    ) -> None:
+        summaries = (
+            _summary(
+                trial_id="A",
+                held_qty=Decimal(1),
+                fill_px=Decimal("0.40"),
+                recoverable_value_at_signal=Decimal("0.55"),
+            ),
+        )
+        scored = (_trial(trial_id="A", held=False, pnl=Decimal("-0.10")),)
+
+        report = report_mod.build_monitor_report(summaries, scored)
+
+        # implied = 0.55 - (0.40 * 1) = 0.15; delta = (-0.10 * 1) - 0.15 = -0.25
+        assert report.realized_vs_mark_delta.min == Decimal("-0.25")
+
 
 class TestOneSidedBookRate:
     def test_rate_is_missing_frames_over_total_frames_summed_across_positions(
