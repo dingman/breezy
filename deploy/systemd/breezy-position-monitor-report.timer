@@ -1,0 +1,31 @@
+[Unit]
+Description=15:00 UTC trigger for the Breezy INC-6 position-monitor nightly report
+Documentation=file:///home/jon/breezy/deploy/systemd/README.md
+Documentation=file:///home/jon/breezy/scripts/analysis/position_monitor_nightly_report.py
+
+[Timer]
+Unit=breezy-position-monitor-report.service
+
+# 15:00 UTC -- free on the existing schedule (occupied: 01:35, 02:05, 09:00,
+# 13:30, 14:15, 14:30, 17:15, 22:30, 22:45, 00/06/12/18:15), and strictly
+# AFTER breezy-score-live-trials (14:15 UTC), the run that populates the
+# scored-trials store this report joins against. This report never reads
+# either PREREG tally's output (breezy-live-tally 14:30 UTC,
+# breezy-pm-crh-v2-tally 17:15 UTC), so it does not need to follow both --
+# only the scorer. Outside the protected LST-union window [16:45Z, 01:15Z)
+# (no-start rule [16:35Z, 01:15Z)) -- see deploy/systemd/README.md
+# "Protected window and serialization". UTC is stated explicitly (this
+# host's clock is UTC) so the schedule cannot move if the host timezone is
+# ever changed. No two Breezy timers ever fire in the same hour:minute tick
+# (tests/unit/test_deploy_timer_hours.py).
+OnCalendar=*-*-* 15:00:00 UTC
+
+# A run missed because the host was down fires as soon as the timer is next
+# active, instead of being silently skipped until the following day --
+# mirrors breezy-score-live-trials.timer.
+Persistent=true
+
+AccuracySec=1min
+
+[Install]
+WantedBy=timers.target
