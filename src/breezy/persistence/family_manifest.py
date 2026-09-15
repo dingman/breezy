@@ -52,8 +52,8 @@ __all__ = [
     "FamilyManifest",
     "FamilyManifestError",
     "FamilyManifestValidationError",
-    "UnregisteredFamilyManifestError",
     "UnpinnedBoundaryArtefactError",
+    "UnregisteredFamilyManifestError",
     "load_family_manifest",
 ]
 

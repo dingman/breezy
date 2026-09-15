@@ -55,7 +55,6 @@ from run_weather_strategy_backtests import (
 )
 from weather_strategy_backtest_lib import settlement_prices_for_scenario
 
-from breezy.adapters.polymarket_us.symbology import leg_of
 from breezy.persistence.scored_trial_store import write_scored_trials
 from breezy.registry.sites import default_registry
 from breezy.runtime.backtest_feed import as_backtest_data
@@ -93,8 +92,8 @@ from breezy.strategy.current_rung_hold.config import CurrentRungHoldConfig
 from breezy.strategy.current_rung_hold.continuous_backtest_only import (
     ContinuousRungHoldBacktestStrategy,
 )
-from breezy.strategy.current_rung_hold.monitor_evidence import Leg
 from breezy.strategy.current_rung_hold.monitor_store import MarkBuffer
+from breezy.strategy.current_rung_hold.monitor_wiring import build_monitor_callables
 from breezy.strategy.current_rung_hold.position_monitor import PositionMonitor
 from breezy.strategy.current_rung_hold.strategy import _local_hour
 from breezy.strategy.current_rung_hold.trial_day_latch import (
@@ -740,21 +739,19 @@ def install_position_monitor(
     :class:`PositionMonitor` to `strategy` inside the v3 paper-replay
     harness, run under a real engine ``TestClock``.
 
-    Mirrors ``composition.py::_build_position_monitor_for`` -- the ONLY
-    other site that wires a `PositionMonitor` -- with the SAME shape of
-    read-only closures over the strategy's own cache/latch/facts/
-    accumulators (never a direct reference to its mutating surface, M7 D3
-    pin: never `_hunt_tick`/`_maybe_submit`, never
-    `_decision_ask_by_station_day`). This is not a call to that function:
-    `composition.py` is outside this increment's touch-list, and this
-    harness needs a directory layout the live composition root does not
-    use (`out_dir/monitor` plus a SIBLING `out_dir/monitor_summaries`,
-    never nested the way the live root nests `monitor/summaries`) and a
-    `MarkBuffer` carrying a JSONL sidecar (a replay run is disposable, so a
-    best-effort on-disk trail of every mark is worth the write cost the
-    live node's bare `MarkBuffer()` deliberately avoids) -- reproducing the
-    closure SHAPE here is preferred over importing the private builder and
-    monkey-patching mismatched paths onto its result.
+    F1 DRY extraction: the eight read-only closures over the strategy's own
+    cache/latch/facts/accumulators (never a direct reference to its mutating
+    surface, M7 D3 pin: never `_hunt_tick`/`_maybe_submit`, never
+    `_decision_ask_by_station_day`) now come from
+    :func:`build_monitor_callables` (``monitor_wiring.py``) -- the SAME
+    factory ``composition.py::_build_position_monitor_for`` and the contract
+    test's ``_wire_monitor`` also call. This function still owns the
+    directory layout the live composition root does not use (`out_dir/
+    monitor` plus a SIBLING `out_dir/monitor_summaries`, never nested the
+    way the live root nests `monitor/summaries`) and a `MarkBuffer` carrying
+    a JSONL sidecar (a replay run is disposable, so a best-effort on-disk
+    trail of every mark is worth the write cost the live node's bare
+    `MarkBuffer()` deliberately avoids).
 
     `clock_ns` is taken as a caller-supplied callable, never derived
     internally from `strategy.clock.timestamp_ns` at call time: a
@@ -784,54 +781,18 @@ def install_position_monitor(
             ),
         )
 
-    def _positions_open(iid: str) -> Sequence[object]:
-        return strategy.cache.positions_open(  # type: ignore[no-any-return]
-            instrument_id=InstrumentId.from_str(iid),
-        )
-
-    def _latch_record(
-        station: str, climate_day: str, *, key_instrument_id: str | None = None,
-    ) -> object | None:
-        if strategy._latch is None:
-            return None
-        return strategy._latch.record_with_legacy_fallback(
-            station, climate_day, key_instrument_id=key_instrument_id,
-        )
-
-    def _rung_geometry(iid: str) -> object | None:
-        return strategy._facts.get(iid)
-
-    def _fee_coefficient_for(iid: str) -> Decimal:
-        instrument = strategy.cache.instrument(InstrumentId.from_str(iid))
-        fee = strategy._guarded_fee_coefficient(instrument)
-        if fee is None:
-            raise ValueError(f"unknown fee schedule for {iid}")
-        return fee
-
-    def _leg_for(iid: str) -> Leg:
-        return "NO" if leg_of(InstrumentId.from_str(iid)) == "no" else "YES"
-
-    def _station_for(iid: str) -> str:
-        return strategy._facts[iid].settlement_station
-
-    def _climate_day_for(iid: str) -> str:
-        return strategy._facts[iid].climate_day.isoformat()
-
-    def _hour_lst_for(station: str, now_ns: int) -> int:
-        offset = strategy._std_utc_offset_hours_by_station[station]
-        return _local_hour(now_ns, offset)
-
+    callables = build_monitor_callables(strategy)
     monitor = PositionMonitor(
         clock_ns=clock_ns,
-        positions_open=_positions_open,
+        positions_open=callables.positions_open,
         accumulators=strategy._accumulators,
-        latch_record=_latch_record,  # type: ignore[arg-type]
-        rung_geometry=_rung_geometry,  # type: ignore[arg-type]
-        fee_coefficient_for=_fee_coefficient_for,
-        leg_for=_leg_for,
-        station_for=_station_for,
-        climate_day_for=_climate_day_for,
-        hour_lst_for=_hour_lst_for,
+        latch_record=callables.latch_record,
+        rung_geometry=callables.rung_geometry,
+        fee_coefficient_for=callables.fee_coefficient_for,
+        leg_for=callables.leg_for,
+        station_for=callables.station_for,
+        climate_day_for=callables.climate_day_for,
+        hour_lst_for=callables.hour_lst_for,
         stale_observation_bound_ns=strategy._config.stale_observation_minutes * _NS_PER_MINUTE,
         trial_id_prefix=CONTINUOUS_TRIAL_KEY_PREFIX,
         buffer=MarkBuffer(sidecar_path=out_dir / _MONITOR_SIDECAR_FILENAME),
@@ -870,6 +831,17 @@ def run_one_precision_arm(
     (`strategy_cls is ContinuousRungHoldBacktestStrategy`); passing it
     alongside `CurrentRungHoldBacktestStrategy` is a silent no-op, since the
     v2 strategy carries no `_position_monitor` hook at all.
+
+    Review finding F2: `main` calls this function once per entry in
+    `PRECISION_ARMS`, all sharing the ONE `monitor_out_dir` an operator
+    passes on the CLI. Neither `PositionMarkRecord` nor
+    `PositionMonitorSummary` carries a precision-arm discriminator, so two
+    arms writing to the identical `monitor_out_dir/monitor` catalog and
+    `monitor_out_dir/monitor_summaries` directory can collide --
+    `read_monitor_summaries`' dedup by `(trial_id, max monitor_seq)` would
+    then silently keep only one arm's row. `install_position_monitor` is
+    therefore called against `monitor_out_dir / precision_mode`, giving
+    each arm its own `<mode>/monitor` + `<mode>/monitor_summaries` pair.
     """
     inputs = PaperReplayInputs(lag_minutes=lag_minutes, precision_mode=precision_mode)
     # `StationObservation.station` must carry the IEM ASOS/ICAO id
@@ -975,9 +947,10 @@ def run_one_precision_arm(
         )
         evidence.bind(strategy)
         if monitor_out_dir is not None:
+            # F2: keyed per arm -- see this function's own docstring.
             install_position_monitor(
                 strategy,
-                out_dir=monitor_out_dir,
+                out_dir=monitor_out_dir / precision_mode,
                 clock_ns=lambda: strategy.clock.timestamp_ns(),
             )
     else:
@@ -1124,8 +1097,10 @@ def main(argv: Sequence[str] | None = None) -> int:
         default=None,
         type=Path,
         help=(
-            "INC-7: install a shadow PositionMonitor under this directory "
-            "(monitor/ + monitor_summaries/). Meaningful only with "
+            "INC-7: install a shadow PositionMonitor under this directory, "
+            "one <precision_mode>/monitor + <precision_mode>/monitor_summaries "
+            "pair per PRECISION_ARMS entry (F2: never a shared pair, which "
+            "could hide one arm's row). Meaningful only with "
             "--strategy continuous_rung_hold; default None never installs "
             "one, so every existing replay artefact stays byte-identical."
         ),

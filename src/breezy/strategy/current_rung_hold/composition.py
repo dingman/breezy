@@ -19,7 +19,6 @@ import logging
 import time
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from contextlib import AbstractContextManager, contextmanager
-from decimal import Decimal
 from pathlib import Path
 from typing import Final, NamedTuple
 
@@ -47,11 +46,11 @@ from breezy.strategy.current_rung_hold.continuous_strategy import (
     ContinuousRungHoldStrategy,
     Phase0PermitForbiddenError,
 )
-from breezy.strategy.current_rung_hold.monitor_evidence import Leg
 from breezy.strategy.current_rung_hold.monitor_store import MarkBuffer
+from breezy.strategy.current_rung_hold.monitor_wiring import build_monitor_callables
 from breezy.strategy.current_rung_hold.offer_tape import OfferTape
 from breezy.strategy.current_rung_hold.position_monitor import PositionMonitor
-from breezy.strategy.current_rung_hold.strategy import CurrentRungHoldStrategy, _local_hour
+from breezy.strategy.current_rung_hold.strategy import CurrentRungHoldStrategy
 from breezy.strategy.current_rung_hold.trial_day_latch import (
     CONTINUOUS_TRIAL_KEY_PREFIX,
     DEFAULT_TRIAL_KEY_PREFIX,
@@ -527,9 +526,16 @@ def build_continuous_rung_hold_strategies(
 def _build_position_monitor_for(
     strategy: ContinuousRungHoldStrategy, *, monitor_root: Path,
 ) -> PositionMonitor:
-    """Wire a :class:`PositionMonitor` to ``strategy`` via read-only
-    closures -- never a direct constructor reference to the strategy's own
-    mutating surface (M7 D3 pin, plan §2).
+    """Wire a :class:`PositionMonitor` to ``strategy``.
+
+    F1 DRY extraction: the eight read-only closures come from
+    :func:`build_monitor_callables` (``monitor_wiring.py``) -- the SAME
+    factory ``install_position_monitor`` (paper-replay) and the contract
+    test's ``_wire_monitor`` also call, so the wiring can never drift
+    between the three sites again. This function still owns everything
+    site-specific -- the alert-sink ``report``, the live ``MarkBuffer()``,
+    and the live monitor/summaries paths -- never a direct constructor
+    reference to the strategy's own mutating surface (M7 D3 pin, plan §2).
     """
     sink = resolve_alert_sink()
 
@@ -541,54 +547,18 @@ def _build_position_monitor_for(
             ),
         )
 
-    def _positions_open(iid: str) -> Sequence[object]:
-        return strategy.cache.positions_open(  # type: ignore[no-any-return]
-            instrument_id=InstrumentId.from_str(iid),
-        )
-
-    def _latch_record(
-        station: str, climate_day: str, *, key_instrument_id: str | None = None,
-    ) -> object | None:
-        if strategy._latch is None:
-            return None
-        return strategy._latch.record_with_legacy_fallback(
-            station, climate_day, key_instrument_id=key_instrument_id,
-        )
-
-    def _rung_geometry(iid: str) -> object | None:
-        return strategy._facts.get(iid)
-
-    def _fee_coefficient_for(iid: str) -> Decimal:
-        instrument = strategy.cache.instrument(InstrumentId.from_str(iid))
-        fee = strategy._guarded_fee_coefficient(instrument)
-        if fee is None:
-            raise ValueError(f"unknown fee schedule for {iid}")
-        return fee
-
-    def _leg_for(iid: str) -> Leg:
-        return "NO" if leg_of(InstrumentId.from_str(iid)) == "no" else "YES"
-
-    def _station_for(iid: str) -> str:
-        return strategy._facts[iid].settlement_station
-
-    def _climate_day_for(iid: str) -> str:
-        return strategy._facts[iid].climate_day.isoformat()
-
-    def _hour_lst_for(station: str, now_ns: int) -> int:
-        offset = strategy._std_utc_offset_hours_by_station[station]
-        return _local_hour(now_ns, offset)
-
+    callables = build_monitor_callables(strategy)
     return PositionMonitor(
         clock_ns=strategy.clock.timestamp_ns,
-        positions_open=_positions_open,
+        positions_open=callables.positions_open,
         accumulators=strategy._accumulators,
-        latch_record=_latch_record,  # type: ignore[arg-type]
-        rung_geometry=_rung_geometry,  # type: ignore[arg-type]
-        fee_coefficient_for=_fee_coefficient_for,
-        leg_for=_leg_for,
-        station_for=_station_for,
-        climate_day_for=_climate_day_for,
-        hour_lst_for=_hour_lst_for,
+        latch_record=callables.latch_record,
+        rung_geometry=callables.rung_geometry,
+        fee_coefficient_for=callables.fee_coefficient_for,
+        leg_for=callables.leg_for,
+        station_for=callables.station_for,
+        climate_day_for=callables.climate_day_for,
+        hour_lst_for=callables.hour_lst_for,
         stale_observation_bound_ns=strategy._config.stale_observation_minutes
         * _NS_PER_MINUTE,
         trial_id_prefix=CONTINUOUS_TRIAL_KEY_PREFIX,

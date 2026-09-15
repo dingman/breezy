@@ -30,7 +30,6 @@ read.
 
 from __future__ import annotations
 
-from decimal import Decimal
 from pathlib import Path
 
 import pytest
@@ -43,6 +42,7 @@ from breezy.strategy.current_rung_hold.monitor_store import (
     MarkBuffer,
     read_monitor_summaries,
 )
+from breezy.strategy.current_rung_hold.monitor_wiring import build_monitor_callables
 from breezy.strategy.current_rung_hold.position_monitor import PositionMonitor
 from breezy.strategy.current_rung_hold.trial_day_latch import (
     CONTINUOUS_TRIAL_KEY_PREFIX,
@@ -61,55 +61,24 @@ _MINUTE_NS = 60_000_000_000
 
 
 def _wire_monitor(strategy, *, tmp_path: Path) -> PositionMonitor:
-    from nautilus_trader.model.identifiers import InstrumentId
-
-    from breezy.adapters.polymarket_us.symbology import leg_of
-    from breezy.strategy.current_rung_hold.strategy import _local_hour
-
-    def _positions_open(iid: str):
-        return strategy.cache.positions_open(instrument_id=InstrumentId.from_str(iid))
-
-    def _latch_record(station: str, climate_day: str, *, key_instrument_id: str | None = None):
-        if strategy._latch is None:
-            return None
-        return strategy._latch.record_with_legacy_fallback(
-            station, climate_day, key_instrument_id=key_instrument_id,
-        )
-
-    def _rung_geometry(iid: str):
-        return strategy._facts.get(iid)
-
-    def _fee_coefficient_for(iid: str) -> Decimal:
-        instrument = strategy.cache.instrument(InstrumentId.from_str(iid))
-        fee = strategy._guarded_fee_coefficient(instrument)
-        if fee is None:
-            raise ValueError(f"unknown fee schedule for {iid}")
-        return fee
-
-    def _leg_for(iid: str) -> str:
-        return "NO" if leg_of(InstrumentId.from_str(iid)) == "no" else "YES"
-
-    def _station_for(iid: str) -> str:
-        return strategy._facts[iid].settlement_station
-
-    def _climate_day_for(iid: str) -> str:
-        return strategy._facts[iid].climate_day.isoformat()
-
-    def _hour_lst_for(station: str, now_ns: int) -> int:
-        offset = strategy._std_utc_offset_hours_by_station[station]
-        return _local_hour(now_ns, offset)
-
+    # F1 DRY extraction: the eight read-only closures come from
+    # `build_monitor_callables` (`monitor_wiring.py`) -- the SAME factory
+    # `composition.py::_build_position_monitor_for` and the paper-replay
+    # driver's `install_position_monitor` also call. This helper still owns
+    # everything test-specific: a no-op `report`, a bare `MarkBuffer()`, and
+    # a `tmp_path`-scoped catalog/summaries pair.
+    callables = build_monitor_callables(strategy)
     return PositionMonitor(
         clock_ns=strategy.clock.timestamp_ns,
-        positions_open=_positions_open,  # type: ignore[arg-type]
+        positions_open=callables.positions_open,
         accumulators=strategy._accumulators,
-        latch_record=_latch_record,  # type: ignore[arg-type]
-        rung_geometry=_rung_geometry,  # type: ignore[arg-type]
-        fee_coefficient_for=_fee_coefficient_for,
-        leg_for=_leg_for,  # type: ignore[arg-type]
-        station_for=_station_for,
-        climate_day_for=_climate_day_for,
-        hour_lst_for=_hour_lst_for,
+        latch_record=callables.latch_record,
+        rung_geometry=callables.rung_geometry,
+        fee_coefficient_for=callables.fee_coefficient_for,
+        leg_for=callables.leg_for,
+        station_for=callables.station_for,
+        climate_day_for=callables.climate_day_for,
+        hour_lst_for=callables.hour_lst_for,
         stale_observation_bound_ns=strategy._config.stale_observation_minutes * _MINUTE_NS,
         trial_id_prefix=CONTINUOUS_TRIAL_KEY_PREFIX,
         buffer=MarkBuffer(),

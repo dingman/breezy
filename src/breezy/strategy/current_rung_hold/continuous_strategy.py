@@ -170,6 +170,13 @@ _POSITION_FILL_JOIN_ERROR: Final[str] = "fill_join_error"
 #: counted, reported, never raised into `_hunt_tick`/`_maybe_submit`/latch
 #: state.
 _POSITION_MONITOR_ERROR: Final[str] = "monitor_error"
+#: Review finding F3: `on_position_opened`'s `self.cache.position(event.
+#: position_id)` lookup returns `None` -- counted, never silently skipped.
+#: A later Depth10 frame still registers the position lazily via
+#: `PositionMonitor._ensure_registered`'s own `positions_open` read
+#: (`position_monitor.py`), so this is observability only, never a lost
+#: registration.
+_POSITION_OPENED_EVENT_UNRESOLVED: Final[str] = "position_opened_event_unresolved"
 #: Review item 2: a legacy (pre-Slice-4) record with no `venue_order_id`
 #: cannot prove a SECOND fill is genuinely a duplicate vs. its own replay --
 #: logged, never halted.
@@ -806,10 +813,20 @@ class ContinuousRungHoldStrategy(Strategy):
             return
         monitor = self._position_monitor
         position = self.cache.position(event.position_id)
-        if position is not None:
-            self._forward_to_monitor(
-                lambda: monitor.on_position_opened(position, self.clock.timestamp_ns()),
+        if position is None:
+            # F3: counted, never silently dropped. `_ensure_registered`
+            # (`position_monitor.py`) still registers this position lazily
+            # off its own `positions_open` read the next time a Depth10
+            # frame arrives, so nothing is permanently lost -- only this
+            # event's own hand-off.
+            self.position_events.record(_POSITION_OPENED_EVENT_UNRESOLVED)
+            self._report_alerter(
+                self.position_alerter, "continuous_rung_hold position report failed",
             )
+            return
+        self._forward_to_monitor(
+            lambda: monitor.on_position_opened(position, self.clock.timestamp_ns()),
+        )
 
     def _forward_to_monitor(self, action: Callable[[], None]) -> None:
         """D8 (plan §2/§7): "monitor exceptions caught at the handler

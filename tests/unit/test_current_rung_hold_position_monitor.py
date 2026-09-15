@@ -19,6 +19,7 @@ from decimal import Decimal
 from pathlib import Path
 
 import pytest
+from nautilus_trader.model.enums import OmsType
 from nautilus_trader.model.identifiers import InstrumentId
 from nautilus_trader.model.instruments import BinaryOption
 from nautilus_trader.model.position import Position
@@ -587,3 +588,44 @@ def test_a_raising_position_monitor_never_reaches_the_hunt_path(
     assert strategy.position_events.count("monitor_error") >= 1
     # The hunt path itself ran: a decision was recorded on the offer tape.
     assert len(strategy.offer_tape.records()) >= 1
+
+
+def test_an_unresolved_position_opened_event_is_counted_and_the_position_still_registers_lazily(
+    store_path: Path, interior_instrument: BinaryOption, tmp_path: Path,
+) -> None:
+    """Review finding F3: `on_position_opened`'s `self.cache.position(event.
+    position_id)` lookup can return `None` (the cache has not yet reflected
+    the position this event names) -- previously a silent skip. This proves
+    (1) that branch is now counted, never silently dropped, and (2) the
+    position is not lost: `PositionMonitor._ensure_registered`'s own
+    `positions_open` read still registers it the next time a Depth10 frame
+    for the same instrument arrives, once the cache DOES know about it.
+    """
+    from tests.unit.test_continuous_rung_hold_strategy import _depth
+
+    strategy = _register_and_start(store_path=store_path, instruments=(interior_instrument,))
+    strategy._position_monitor = _wire_monitor(strategy, tmp_path=tmp_path)
+    monitor = strategy._position_monitor
+
+    fill = _fill(strategy, instrument_id=INTERIOR_ID, venue_order_id="ord-f3-1")
+    position = Position(interior_instrument, fill)
+    unresolved_event = TestEventStubs.position_opened(position)
+
+    # (1) The cache does NOT yet know this position -- `cache.position(...)`
+    # returns `None`, so the handler must count, not silently return.
+    strategy.on_position_opened(unresolved_event)
+    assert strategy.position_events.count("position_opened_event_unresolved") == 1
+    assert _IID not in monitor._positions  # nothing registered yet
+
+    # (2) The cache now reflects the position (a later reconciliation read,
+    # e.g. the strategy's own fill/position bookkeeping catching up) -- the
+    # NEXT Depth10 frame must still register it, lazily, via
+    # `_ensure_registered`'s own `positions_open` read.
+    strategy.cache.add_position(position, OmsType.NETTING)
+    depth = _depth(
+        INTERIOR_ID, bids=(("0.01", 10),), asks=(("0.40", 10),), ts_event=WINDOW_OPEN_NS,
+    )
+    strategy.on_order_book_depth(depth)
+
+    assert _IID in monitor._positions
+    assert strategy.position_events.count("position_opened_event_unresolved") == 1  # unchanged

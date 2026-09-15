@@ -68,6 +68,7 @@ from breezy.strategy.current_rung_hold.config import (
     CurrentRungHoldConfig,
 )
 from breezy.strategy.current_rung_hold.continuous_strategy import ContinuousRungHoldStrategy
+from breezy.strategy.current_rung_hold.monitor_store import read_monitor_summaries
 from breezy.strategy.current_rung_hold.trial_day_latch import (
     TrialDayLatch,
     open_trial_day_latch,
@@ -1948,3 +1949,48 @@ def test_the_guard_runs_before_convert_live_capture_writes_the_work_catalog(
     with pytest.raises(driver.ReplayLatchStoreIsLiveError):
         driver.main(_minimal_argv(tmp_path, strategy=None))
     assert not work_catalog.exists()  # _convert_live_capture's own mkdir never ran
+
+
+def test_two_precision_arms_write_monitor_output_to_distinct_per_arm_directories(
+    driver: ModuleType, tmp_path: Path,
+) -> None:
+    """Review finding F2: `main` installs a shadow `PositionMonitor` for
+    EVERY `PRECISION_ARMS` entry against the SAME `--monitor-out-dir` --
+    unkeyed by arm, both arms' `PositionMarkRecord`/`PositionMonitorSummary`
+    rows would land in one shared catalog and one shared summaries
+    directory, where `read_monitor_summaries`' dedup by `(trial_id, max
+    monitor_seq)` could hide one arm's row (neither record type carries a
+    precision-arm discriminator). `run_one_precision_arm` now keys the
+    monitor output per arm -- `monitor_out_dir / precision_mode` -- so both
+    arms' summaries survive, each in its own subdirectory.
+    """
+    monitor_out_dir = tmp_path / "monitor_out"
+    settlement_by_key = {(STATION, CLIMATE_DAY.isoformat()): _final_climate_day(tmax_f=87)}
+
+    for index, precision_mode in enumerate(driver.PRECISION_ARMS):
+        tape_instrument = _tape_instrument_no_close(driver, ask="0.40", size=10)
+        result = driver.run_one_precision_arm(
+            tape_instruments=[tape_instrument],
+            observation_rows=_OBSERVATION_ROWS,
+            station=STATION,
+            lag_minutes=1,
+            precision_mode=precision_mode,
+            latch_store_path=tmp_path / f"state_{index}.db",
+            settlement_by_key=settlement_by_key,
+            strategy_cls=driver.ContinuousRungHoldBacktestStrategy,
+            latch_key_prefix=driver.CONTINUOUS_TRIAL_KEY_PREFIX,
+            monitor_out_dir=monitor_out_dir,
+        )
+        assert len(result.trials) == 1
+
+    for precision_mode in driver.PRECISION_ARMS:
+        summaries = read_monitor_summaries(monitor_out_dir / precision_mode / "monitor_summaries")
+        assert len(summaries) == 1, (
+            f"{precision_mode}: expected exactly one summary row in its own "
+            f"per-arm directory, got {len(summaries)}"
+        )
+
+    # Never a shared pair at the root -- each arm's output is fully
+    # contained under its own <precision_mode> subdirectory.
+    assert not (monitor_out_dir / "monitor_summaries").exists()
+    assert not (monitor_out_dir / "monitor").exists()
