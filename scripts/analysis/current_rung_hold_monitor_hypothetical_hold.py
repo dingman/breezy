@@ -76,6 +76,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from h4_preliminary_economic_read import Rung, parse_ladder
 from ma_prelock_winner_ask_study import (
+    ASOS_FETCH_END,
+    ASOS_FETCH_START,
     DEFAULT_QUOTE_TAPE_CATALOG,
     DEFAULT_SETTLEMENT_CATALOG,
     discover_station_days,
@@ -146,11 +148,24 @@ __all__ = [
 def _load_observations_for_station(
     *, cache_dir: Path, spec: SiteSpec, start: dt.date, end: dt.date,
 ) -> tuple[ObservationRow, ...]:
-    """Every archive observation for one station across ``[start, end]``,
-    parsed ONCE per station (never per day) -- the CLI slices this per
-    climate day before pushing into a fresh accumulator (module docstring).
+    """Every archive observation for one station whose climate day falls in
+    ``[start, end]``, parsed ONCE per station (never per day) -- the CLI
+    slices this per climate day before pushing into a fresh accumulator
+    (module docstring).
+
+    The ASOS cache is keyed by the FIXED ``ASOS_FETCH_START``/``ASOS_FETCH_END``
+    window -- the SAME window ``mb_current_rung_edge_study.py`` uses and the
+    nightly ``asos_recent_refresh.py --since`` refresh populates -- never by
+    this run's own ``--start``/``--end``. Keying by the run's own window (the
+    prior bug) produces a cache key the nightly refresh never wrote, so every
+    corpus run other than one over the exact refresh window missed. Rows
+    outside the requested ``[start, end]`` are dropped here so the
+    accumulator this feeds never sees more than the requested day range (no
+    look-ahead).
     """
-    raw_path = cache_path_for_url(cache_dir, asos_url(spec.iem_asos_id, start, end), ".txt")
+    raw_path = cache_path_for_url(
+        cache_dir, asos_url(spec.iem_asos_id, ASOS_FETCH_START, ASOS_FETCH_END), ".txt",
+    )
     if not raw_path.exists():
         raise SystemExit(f"ASOS cache miss for {spec.city}; expected: {raw_path}")
     rows = parse_asos_rows(raw_path.read_text(encoding="utf-8", errors="replace"))
@@ -170,6 +185,12 @@ def _load_observations_for_station(
             is_metar=record.is_metar,
         )
         for record in parsed
+        if start
+        <= climate_day_for_instant(
+            dt.datetime.fromtimestamp(record.observed_at_ns / 1_000_000_000, tz=dt.UTC),
+            spec.std_utc_offset_hours,
+        )
+        <= end
     )
 
 

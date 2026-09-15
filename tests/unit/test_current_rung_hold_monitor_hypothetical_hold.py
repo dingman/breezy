@@ -22,7 +22,7 @@ import json
 import sys
 from decimal import Decimal
 from pathlib import Path
-from types import ModuleType
+from types import ModuleType, SimpleNamespace
 from typing import Any
 
 import pytest
@@ -656,3 +656,75 @@ def test_build_corpus_report_to_dict_is_json_serializable(hh: ModuleType) -> Non
 
 def test_archive_hours_constant_matches_the_window(hh: ModuleType) -> None:
     assert hh.ARCHIVE_HOURS == (12, 13, 14, 15, 16)
+
+
+# ---------------------------------------------------------------------------
+# ASOS cache keying (the DEFECT fix): the loader must key its cache read by
+# the FIXED ASOS_FETCH_START/ASOS_FETCH_END study window -- the same window
+# `mb_current_rung_edge_study.py` uses and `asos_recent_refresh.py --since`
+# populates -- never by this run's own --start/--end.
+# ---------------------------------------------------------------------------
+
+_ASOS_METAR_86F = "KSFO 011853Z 00000KT 10SM CLR 25/18 A3002 RMK AO2 T03000200"
+_ASOS_METAR_82F = "KSFO 251853Z 00000KT 10SM CLR 25/18 A3002 RMK AO2 T02780200"
+
+
+def _fake_site_spec(iem_asos_id: str = "KSFO") -> Any:
+    """Duck-typed stand-in for `settlement_alignment_study.SiteSpec` --
+    `_load_observations_for_station` only ever reads `.city`,
+    `.std_utc_offset_hours` and `.iem_asos_id` off its `spec` argument."""
+    return SimpleNamespace(
+        city=_STATION, std_utc_offset_hours=_STD_UTC_OFFSET_HOURS, iem_asos_id=iem_asos_id,
+    )
+
+
+def test_loader_keys_the_asos_cache_by_the_study_window_and_filters_to_the_requested_day(
+    hh: ModuleType, tmp_path: Path,
+) -> None:
+    spec = _fake_site_spec()
+    run_start = dt.date(2026, 9, 1)
+    run_end = dt.date(2026, 9, 1)
+
+    study_url = hh.asos_url(spec.iem_asos_id, hh.ASOS_FETCH_START, hh.ASOS_FETCH_END)
+    study_path = hh.cache_path_for_url(tmp_path, study_url, ".txt")
+    study_path.write_text(
+        "station,valid,metar\n"
+        f"{spec.iem_asos_id},2026-09-01 13:00,{_ASOS_METAR_86F}\n"
+        # Outside the requested [run_start, run_end] day -- must be dropped,
+        # never fed into the caller's accumulator (no look-ahead / no stale
+        # spillover).
+        f"{spec.iem_asos_id},2026-08-25 13:00,{_ASOS_METAR_82F}\n",
+        encoding="utf-8",
+    )
+
+    observations = hh._load_observations_for_station(
+        cache_dir=tmp_path, spec=spec, start=run_start, end=run_end,
+    )
+
+    assert len(observations) == 1
+    assert observations[0].temp_c_tenths == 300
+
+
+def test_loader_miss_message_names_the_study_window_path_even_when_the_old_run_window_key_exists(
+    hh: ModuleType, tmp_path: Path,
+) -> None:
+    spec = _fake_site_spec()
+    run_start = dt.date(2026, 9, 1)
+    run_end = dt.date(2026, 9, 1)
+
+    # The PRIOR (buggy) run-window key is present -- it must never be
+    # consulted, and its presence must not mask a study-window cache miss.
+    run_url = hh.asos_url(spec.iem_asos_id, run_start, run_end)
+    run_path = hh.cache_path_for_url(tmp_path, run_url, ".txt")
+    run_path.write_text("station,valid,metar\n", encoding="utf-8")
+
+    study_url = hh.asos_url(spec.iem_asos_id, hh.ASOS_FETCH_START, hh.ASOS_FETCH_END)
+    study_path = hh.cache_path_for_url(tmp_path, study_url, ".txt")
+    assert study_path != run_path
+
+    with pytest.raises(SystemExit) as excinfo:
+        hh._load_observations_for_station(
+            cache_dir=tmp_path, spec=spec, start=run_start, end=run_end,
+        )
+
+    assert str(study_path) in str(excinfo.value)
