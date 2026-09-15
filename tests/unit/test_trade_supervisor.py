@@ -61,6 +61,8 @@ from breezy.runtime.trade_supervisor import (
 )
 from breezy.runtime.trade_supervisor_core import (
     MAX_RELAUNCH_ATTEMPTS,
+    MIDDAY_MAX_RELAUNCH_ATTEMPTS,
+    MIDDAY_MIN_RELAUNCH_GAP,
     MIN_RELAUNCH_GAP,
     RELAUNCH_CUTOFF_UTC,
     SUPERVISOR_ARGV_TOKEN,
@@ -75,14 +77,17 @@ from breezy.runtime.trade_supervisor_core import (
     assert_no_live_node_before_intent_probe,
     classify_exit1_cause,
     decide_launch_action,
+    decide_midday_relaunch,
     decide_relaunch,
     decide_stop_prior_action,
     disambiguate_exit_config_error,
     initial_scheduler_state,
     mark_phase_fired,
+    midday_watch_window_end,
     next_due,
     parse_permit_expiry_ns,
     readiness_observed,
+    record_midday_cause_seen,
     record_permit_issued_seen,
     record_readiness_observed,
     record_relaunch_attempt,
@@ -192,6 +197,20 @@ def test_strategy_subscribed_marker_is_a_substring_of_the_real_emitter():
 
     source = (REPO_ROOT / "src/breezy/strategy/current_rung_hold/strategy.py").read_text()
     assert STRATEGY_SUBSCRIBED_MARKER in source
+
+
+def test_fatal_market_data_fault_marker_is_a_substring_of_the_real_emitter():
+    from breezy.runtime.trade_supervisor_core import FATAL_MARKET_DATA_FAULT_MARKER
+
+    source = (REPO_ROOT / "src/breezy/runtime/trade_cli.py").read_text()
+    assert FATAL_MARKET_DATA_FAULT_MARKER in source
+
+
+def test_fatal_exec_client_fault_marker_is_a_substring_of_the_real_emitter():
+    from breezy.runtime.trade_supervisor_core import FATAL_EXEC_CLIENT_FAULT_MARKER
+
+    source = (REPO_ROOT / "src/breezy/runtime/trade_cli.py").read_text()
+    assert FATAL_EXEC_CLIENT_FAULT_MARKER in source
 
 
 def test_module_source_never_consults_tradingnode_running_string():
@@ -412,6 +431,24 @@ class TestClassifyExit1Cause:
         log = "order submission permit not issued: X\ntrading node failed: Y\n"
         assert classify_exit1_cause(log) is RelaunchCause.DETERMINISTIC
 
+    def test_classify_exit1_cause_market_data_fault_is_transient(self):
+        log = "breezy-trade: FATAL market-data fault in Foo: bar. The trading process shut down.\n"
+        assert classify_exit1_cause(log) is RelaunchCause.TRANSIENT
+
+    def test_classify_exit1_cause_exec_client_fault_is_transient(self):
+        log = (
+            "breezy-trade: FATAL execution-client fault in Foo: bar. "
+            "The trading process shut down.\n"
+        )
+        assert classify_exit1_cause(log) is RelaunchCause.TRANSIENT
+
+    def test_classify_exit1_cause_still_prefers_deterministic_marker(self):
+        log = (
+            "order submission permit not issued: X\n"
+            "breezy-trade: FATAL market-data fault in Foo: bar. The trading process shut down.\n"
+        )
+        assert classify_exit1_cause(log) is RelaunchCause.DETERMINISTIC
+
 
 class TestDisambiguateExitConfigError:
     def test_lock_held_is_duplicate_node(self):
@@ -523,6 +560,132 @@ class TestDecideRelaunch:
             cause=RelaunchCause.TRANSIENT,
         )
         assert decision.should_relaunch is True
+
+
+# ---------------------------------------------------------------------------
+# [2026-09-15] Mid-day relaunch budget -- decide_midday_relaunch's sibling
+# suite: same shape as TestDecideRelaunch minus every readiness case (no
+# readiness gate at all -- a ready node crashing mid-day is exactly the
+# scenario this budget exists for, plan §2 item 2 / §3).
+# ---------------------------------------------------------------------------
+
+_MIDDAY_WINDOW_END = midday_watch_window_end(_BASE_DAY.date())
+
+
+class TestDecideMiddayRelaunch:
+    def test_midday_eligible_transient_within_budget_and_window(self):
+        decision = decide_midday_relaunch(
+            now=_BASE_DAY.replace(hour=20, minute=0),
+            window_end=_MIDDAY_WINDOW_END,
+            attempts_so_far=0,
+            last_attempt_at=None,
+            cause=RelaunchCause.TRANSIENT,
+        )
+        assert decision.should_relaunch is True
+
+    def test_midday_never_relaunches_a_deterministic_failure(self):
+        decision = decide_midday_relaunch(
+            now=_BASE_DAY.replace(hour=20, minute=0),
+            window_end=_MIDDAY_WINDOW_END,
+            attempts_so_far=0,
+            last_attempt_at=None,
+            cause=RelaunchCause.DETERMINISTIC,
+        )
+        assert decision.should_relaunch is False
+
+    def test_midday_never_relaunches_an_unknown_cause(self):
+        decision = decide_midday_relaunch(
+            now=_BASE_DAY.replace(hour=20, minute=0),
+            window_end=_MIDDAY_WINDOW_END,
+            attempts_so_far=0,
+            last_attempt_at=None,
+            cause=RelaunchCause.UNKNOWN,
+        )
+        assert decision.should_relaunch is False
+
+    def test_midday_attempt_budget_is_at_most_three(self):
+        decision = decide_midday_relaunch(
+            now=_BASE_DAY.replace(hour=20, minute=0),
+            window_end=_MIDDAY_WINDOW_END,
+            attempts_so_far=MIDDAY_MAX_RELAUNCH_ATTEMPTS,
+            last_attempt_at=_BASE_DAY.replace(hour=19, minute=50),
+            cause=RelaunchCause.TRANSIENT,
+        )
+        assert decision.should_relaunch is False
+
+    def test_midday_minimum_five_minute_gap_is_enforced(self):
+        too_soon = decide_midday_relaunch(
+            now=_BASE_DAY.replace(hour=20, minute=3),
+            window_end=_MIDDAY_WINDOW_END,
+            attempts_so_far=1,
+            last_attempt_at=_BASE_DAY.replace(hour=20, minute=0),
+            cause=RelaunchCause.TRANSIENT,
+        )
+        assert too_soon.should_relaunch is False
+
+        exactly_the_gap = decide_midday_relaunch(
+            now=_BASE_DAY.replace(hour=20, minute=0) + MIDDAY_MIN_RELAUNCH_GAP,
+            window_end=_MIDDAY_WINDOW_END,
+            attempts_so_far=1,
+            last_attempt_at=_BASE_DAY.replace(hour=20, minute=0),
+            cause=RelaunchCause.TRANSIENT,
+        )
+        assert exactly_the_gap.should_relaunch is True
+
+    def test_midday_never_relaunches_at_or_after_window_close(self):
+        at_close = decide_midday_relaunch(
+            now=_MIDDAY_WINDOW_END,
+            window_end=_MIDDAY_WINDOW_END,
+            attempts_so_far=0,
+            last_attempt_at=None,
+            cause=RelaunchCause.TRANSIENT,
+        )
+        assert at_close.should_relaunch is False
+
+        after_close = decide_midday_relaunch(
+            now=_MIDDAY_WINDOW_END + dt.timedelta(minutes=1),
+            window_end=_MIDDAY_WINDOW_END,
+            attempts_so_far=0,
+            last_attempt_at=None,
+            cause=RelaunchCause.TRANSIENT,
+        )
+        assert after_close.should_relaunch is False
+
+    def test_midday_readiness_already_observed_is_not_a_decline_reason(self):
+        # decide_midday_relaunch has no readiness parameter at all, unlike
+        # decide_relaunch -- assert the signature never grew one, then that
+        # an otherwise-eligible decision is never declined by readiness.
+        import inspect
+
+        assert "readiness_was_observed" not in inspect.signature(decide_midday_relaunch).parameters
+        decision = decide_midday_relaunch(
+            now=_BASE_DAY.replace(hour=20, minute=0),
+            window_end=_MIDDAY_WINDOW_END,
+            attempts_so_far=0,
+            last_attempt_at=None,
+            cause=RelaunchCause.TRANSIENT,
+        )
+        assert decision.should_relaunch is True
+
+    def test_a_fatal_marker_seen_two_polls_before_death_still_classifies_transient(self):
+        # Replays the exact 09-05/09-06 drain shape (§3, §7): the poll
+        # that first sees the fatal marker is not reliably the SAME poll
+        # that first sees the process dead -- the death-detection poll's
+        # OWN delta may no longer contain the marker text.
+        state = initial_scheduler_state(_BASE_DAY.date())
+        earlier_delta = (
+            "breezy-trade: FATAL market-data fault in Foo: bar. "
+            "The trading process shut down.\n"
+        )
+        state = record_midday_cause_seen(
+            state, _BASE_DAY.replace(hour=20, minute=0), classify_exit1_cause(earlier_delta)
+        )
+        later_delta_without_marker = "some unrelated later tail\n"
+        live_cause = classify_exit1_cause(later_delta_without_marker)
+        resolved_cause = (
+            state.midday_cause_seen if state.midday_cause_seen is not None else live_cause
+        )
+        assert resolved_cause is RelaunchCause.TRANSIENT
 
 
 # ---------------------------------------------------------------------------
@@ -948,15 +1111,20 @@ class TestNextDue:
         assert phase is Phase.NONE
         assert fire_at == _utc(16, 40)
 
-    def test_restart_at_2350_nothing_until_tomorrow_1640(self):
+    def test_restart_at_2350_is_midday_watch_not_nothing(self):
+        # [2026-09-15] Renamed/updated from "...nothing_until_tomorrow_1640":
+        # a ready, self-checked node going silent for the rest of the day
+        # was exactly the mid-day relaunch plan's root-cause gap (§2 item 1)
+        # -- 23:50 with readiness observed now correctly lands in
+        # MIDDAY_WATCH's window, never a bare Phase.NONE.
         state = initial_scheduler_state(_DAY)
         state = mark_phase_fired(state, Phase.STOP_PRIOR, _utc(16, 40))
         state = mark_phase_fired(state, Phase.LAUNCH, _utc(16, 50))
         state = record_readiness_observed(state, _utc(16, 52))
         state = mark_phase_fired(state, Phase.SELF_CHECK, _utc(17, 5))
         phase, fire_at = next_due(_utc(23, 50), state)
-        assert phase is Phase.NONE
-        assert fire_at == _utc(16, 40, day=_DAY + dt.timedelta(days=1))
+        assert phase is Phase.MIDDAY_WATCH
+        assert fire_at == _utc(17, 10)
 
     def test_self_check_due_in_its_window(self):
         state = mark_phase_fired(initial_scheduler_state(_DAY), Phase.LAUNCH, _utc(16, 50))
@@ -969,6 +1137,34 @@ class TestNextDue:
         state = mark_phase_fired(initial_scheduler_state(_DAY), Phase.SELF_CHECK, _utc(17, 5))
         phase, _ = next_due(_utc(17, 6), state)
         assert phase is not Phase.SELF_CHECK
+
+    def test_self_check_still_wins_at_1705_with_readiness_observed(self):
+        state = mark_phase_fired(initial_scheduler_state(_DAY), Phase.LAUNCH, _utc(16, 50))
+        state = record_readiness_observed(state, _utc(16, 52))
+        phase, _ = next_due(_utc(17, 5), state)
+        assert phase is Phase.SELF_CHECK
+
+    def test_midday_watch_due_after_1710_before_window_close(self):
+        state = mark_phase_fired(initial_scheduler_state(_DAY), Phase.LAUNCH, _utc(16, 50))
+        state = record_readiness_observed(state, _utc(16, 52))
+        state = mark_phase_fired(state, Phase.SELF_CHECK, _utc(17, 5))
+        phase, fire_at = next_due(_utc(18, 0), state)
+        assert phase is Phase.MIDDAY_WATCH
+        assert fire_at == _utc(17, 10)
+
+    def test_midday_watch_not_due_before_readiness(self):
+        state = mark_phase_fired(initial_scheduler_state(_DAY), Phase.LAUNCH, _utc(16, 50))
+        state = mark_phase_fired(state, Phase.SELF_CHECK, _utc(17, 5))
+        phase, _ = next_due(_utc(18, 0), state)
+        assert phase is not Phase.MIDDAY_WATCH
+
+    def test_midday_watch_not_due_after_window_close(self):
+        next_day = _DAY + dt.timedelta(days=1)
+        state = mark_phase_fired(initial_scheduler_state(_DAY), Phase.LAUNCH, _utc(16, 50))
+        state = record_readiness_observed(state, _utc(16, 52))
+        state = mark_phase_fired(state, Phase.SELF_CHECK, _utc(17, 5))
+        phase, _ = next_due(_utc(1, 0, day=next_day), state)
+        assert phase is not Phase.MIDDAY_WATCH
 
     def test_day_rollover_resets_all_done_flags(self):
         yesterday = _DAY - dt.timedelta(days=1)
@@ -993,6 +1189,44 @@ class TestNextDue:
         assert state.last_relaunch_attempt_at == _utc(16, 51)
         state = record_relaunch_attempt(state, _utc(16, 55))
         assert state.relaunch_attempts == 2
+
+    def test_state_survives_midnight_rollover_before_stop_prior_utc(self):
+        # [2026-09-15] The 00:00-16:40Z dead zone belongs to the trading
+        # day that opened at yesterday's 16:40Z STOP_PRIOR, not the new
+        # UTC calendar date -- a poll at 00:30Z the next calendar day must
+        # not reset today's already-latched bookkeeping.
+        next_day = _DAY + dt.timedelta(days=1)
+        state = mark_phase_fired(initial_scheduler_state(_DAY), Phase.SELF_CHECK, _utc(17, 5))
+        state = record_relaunch_attempt(state, _utc(16, 51))
+        assert state.relaunch_attempts == 1
+
+        state = record_readiness_observed(state, _utc(0, 30, day=next_day))
+        assert state.day == _DAY
+        assert state.self_check_done is True
+        assert state.relaunch_attempts == 1
+        assert state.readiness_observed is True
+
+    def test_state_still_rolls_over_at_stop_prior_utc(self):
+        next_day = _DAY + dt.timedelta(days=1)
+        state = mark_phase_fired(initial_scheduler_state(_DAY), Phase.SELF_CHECK, _utc(17, 5))
+        state = mark_phase_fired(state, Phase.STOP_PRIOR, _utc(16, 40, day=next_day))
+        assert state.day == next_day
+        assert state.self_check_done is False
+        assert state.stop_prior_done is True
+
+    def test_next_scheduled_event_after_utc_midnight_names_todays_stop_prior(self):
+        # readiness_observed deliberately left False -- keeps this case out
+        # of MIDDAY_WATCH's gate so it isolates _next_scheduled_event's own
+        # effective.day != today guard (a MIDDAY_WATCH-eligible variant of
+        # this same midnight crossing is covered separately).
+        next_day = _DAY + dt.timedelta(days=1)
+        state = mark_phase_fired(initial_scheduler_state(_DAY), Phase.STOP_PRIOR, _utc(16, 40))
+        state = mark_phase_fired(state, Phase.LAUNCH, _utc(16, 50))
+        state = mark_phase_fired(state, Phase.SELF_CHECK, _utc(17, 5))
+        phase, fire_at = next_due(_utc(0, 30, day=next_day), state)
+        assert phase is Phase.NONE
+        # today's (next_day's) own still-upcoming STOP_PRIOR -- never D+2.
+        assert fire_at == _utc(16, 40, day=next_day)
 
 
 def test_parse_permit_expiry_ns_extracts_the_real_marker_shape():

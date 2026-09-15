@@ -71,6 +71,7 @@ from breezy.runtime.trade_supervisor_core import (
     Phase,
     SelfCheckResult,
     StopPriorAction,
+    _trading_day,
     assert_no_live_node_before_intent_probe,
     classify_exit1_cause,
     continuous_family_check,
@@ -1187,7 +1188,7 @@ def _run_forever(
     set ``max_iterations``.
     """
     active_ports = ports if ports is not None else default_ports()
-    state = initial_scheduler_state(clock().date())
+    state = initial_scheduler_state(_trading_day(clock()))
     tracked_pid: int | None = None
     node_log: Path | None = None
     iterations = 0
