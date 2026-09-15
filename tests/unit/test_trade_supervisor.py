@@ -1714,6 +1714,48 @@ class TestPhaseHandlersDirect:
         result = _do_stop_prior(ports=ports, store_path=store_path, tracked_pid=None)
         assert result is None
 
+    def test_stop_prior_after_midday_exhaustion_with_dead_pid_is_a_noop_not_adoption_refused(
+        self, tmp_path
+    ):
+        # Seeded exactly as a next-day boot after a mid-day-exhausted node
+        # would arrive: `_do_midday_watch` kept the dead pid as
+        # `tracked_pid` (intended), but the process is gone, nothing holds
+        # the intent flock, and pgrep finds nothing either -- this must be
+        # a true NOOP, never a spurious REFUSE_ALERT page.
+        store_path = tmp_path / "state" / "store.sqlite3"
+        sink = _RecordingAlertSink()
+        terminated: list[int] = []
+        ports = _make_ports(
+            alert_sink=sink,
+            process_alive=lambda _pid: False,
+            resolve_intent_lock_holder=lambda _p: None,
+            find_node_pid=lambda: None,
+            terminate_after_recheck=lambda pid, **_kw: terminated.append(pid),
+        )
+        result = _do_stop_prior(ports=ports, store_path=store_path, tracked_pid=1001)
+        assert result is None
+        assert sink.payloads == []
+        assert terminated == []
+
+    def test_stop_prior_uses_a_live_tracked_pid_directly(self, tmp_path):
+        # Regression guard: a LIVE tracked pid is still trusted and used
+        # directly, never overridden by `find_node_pid` -- `find_node_pid`
+        # is left unreachable here (raises if called) to pin that.
+        def _boom():
+            raise AssertionError("find_node_pid must not be called for a live tracked pid")
+
+        store_path = tmp_path / "state" / "store.sqlite3"
+        terminated: list[int] = []
+        ports = _make_ports(
+            process_alive=lambda _pid: True,
+            resolve_intent_lock_holder=lambda _p: 1001,
+            find_node_pid=_boom,
+            terminate_after_recheck=lambda pid, **_kw: terminated.append(pid),
+        )
+        result = _do_stop_prior(ports=ports, store_path=store_path, tracked_pid=1001)
+        assert result is None
+        assert terminated == [1001]
+
     def test_do_launch_refuses_when_lock_held(self, tmp_path):
         store_path = tmp_path / "state" / "store.sqlite3"
         sink = _RecordingAlertSink()
@@ -2919,6 +2961,47 @@ class TestDoMiddayWatch:
             **_midday_watch_common_kwargs(tmp_path),
         )
         assert len(sink.payloads) == 1
+
+    def test_do_midday_watch_stops_probing_the_flock_once_relaunched_child_is_ready(
+        self, tmp_path
+    ):
+        from breezy.runtime.trade_supervisor_core import record_midday_relaunch_attempt
+
+        node_log = tmp_path / "node.log"
+        node_log.write_text(_STRATEGY_SUBSCRIBED_LINE + _PERMIT_ISSUED_LINE)
+        holder_calls: list[Path] = []
+        ports = _make_ports(
+            process_alive=lambda _pid: True,
+            resolve_intent_lock_holder=lambda p: (holder_calls.append(p), 2002)[1],
+            read_log_new=lambda p: p.read_text(),
+        )
+        state = record_readiness_observed(initial_scheduler_state(_DAY), _utc(17, 10))
+        relaunch_at = _utc(20, 0)
+        state = record_midday_relaunch_attempt(state, relaunch_at)
+
+        # Poll where readiness becomes satisfied -- the probe fires once here.
+        tracked_pid, _, state = _do_midday_watch(
+            ports=ports,
+            state=state,
+            now=relaunch_at + dt.timedelta(seconds=30),
+            tracked_pid=2002,
+            node_log=node_log,
+            **_midday_watch_common_kwargs(tmp_path),
+        )
+        assert tracked_pid == 2002
+        assert len(holder_calls) == 1
+
+        # Every later alive poll must NOT re-probe the flock.
+        for i in range(1, 5):
+            _, _, state = _do_midday_watch(
+                ports=ports,
+                state=state,
+                now=relaunch_at + dt.timedelta(seconds=30 + i * 60),
+                tracked_pid=2002,
+                node_log=node_log,
+                **_midday_watch_common_kwargs(tmp_path),
+            )
+        assert len(holder_calls) == 1
 
     def test_relaunched_child_markers_are_read_from_the_new_log(self, tmp_path):
         (tmp_path / "logs").mkdir(parents=True, exist_ok=True)

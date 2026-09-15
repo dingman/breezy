@@ -94,6 +94,7 @@ from breezy.runtime.trade_supervisor_core import (
     record_midday_alert_sent,
     record_midday_cause_seen,
     record_midday_not_ready_alert_sent,
+    record_midday_readiness_recheck_done,
     record_midday_relaunch_attempt,
     record_permit_issued_seen,
     record_readiness_observed,
@@ -770,9 +771,20 @@ def default_ports(*, alert_sink: AlertSink | None = None) -> SupervisorPorts:
 def _do_stop_prior(
     *, ports: SupervisorPorts, store_path: Path, tracked_pid: int | None
 ) -> int | None:
-    """[B2/E5/L3] Returns the PID still outstanding (None if none)."""
+    """[B2/E5/L3] Returns the PID still outstanding (None if none).
+
+    [2026-09-15 F2] ``tracked_pid`` is trusted only when it is actually
+    alive. Mid-day exhaustion (``_do_midday_watch``) intentionally keeps a
+    dead pid as ``tracked_pid`` for operator diagnosis (kept, not changed
+    here); passing that dead pid straight into
+    :func:`decide_stop_prior_action` next boot -- with no lock holder --
+    manufactures a REFUSE_ALERT for a non-event. A dead/absent
+    ``tracked_pid`` falls back to :func:`SupervisorPorts.find_node_pid`,
+    same as when nothing was tracked at all.
+    """
     lock_path = intent_lock_path(store_path)
-    discovered = tracked_pid if tracked_pid is not None else ports.find_node_pid()
+    tracked_pid_alive = tracked_pid is not None and ports.process_alive(tracked_pid)
+    discovered = tracked_pid if tracked_pid_alive else ports.find_node_pid()
     holder = ports.resolve_intent_lock_holder(lock_path)
     action = decide_stop_prior_action(discovered_node_pid=discovered, lock_holder_pid=holder)
 
@@ -1037,14 +1049,16 @@ def _do_midday_watch(
 
     if ports.process_alive(tracked_pid):
         relaunched_at = state.last_midday_relaunch_attempt_at
-        if relaunched_at is not None and not state.midday_not_ready_alert_sent:
+        if relaunched_at is not None and not state.midday_readiness_recheck_done:
             holder = ports.resolve_intent_lock_holder(intent_lock_path(store_path))
             ready = readiness_observed(
                 holds_intent_lock=(holder == tracked_pid),
                 permit_issued=state.permit_issued_seen_expires_at_ns is not None,
                 strategy_subscribed=state.strategy_subscribed_seen,
             )
-            if not ready and (now - relaunched_at) > MIDDAY_READINESS_RECHECK_TIMEOUT:
+            if ready:
+                return tracked_pid, node_log, record_midday_readiness_recheck_done(state, now)
+            if (now - relaunched_at) > MIDDAY_READINESS_RECHECK_TIMEOUT:
                 log_decision(
                     "midday_relaunched_child_not_ready", phase="midday_watch", pid=tracked_pid
                 )
@@ -1054,7 +1068,8 @@ def _do_midday_watch(
                     severity="WARN",
                     detail=AlertDetail.MIDDAY_RELAUNCHED_CHILD_NOT_READY,
                 )
-                return tracked_pid, node_log, record_midday_not_ready_alert_sent(state, now)
+                state = record_midday_not_ready_alert_sent(state, now)
+                return tracked_pid, node_log, record_midday_readiness_recheck_done(state, now)
         return tracked_pid, node_log, state
 
     cause = state.midday_cause_seen if state.midday_cause_seen is not None else live_cause

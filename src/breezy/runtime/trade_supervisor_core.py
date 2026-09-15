@@ -589,6 +589,15 @@ class DaySchedulerState:
     #: bookkeeping..."). Reset by :func:`record_child_adopted` for a new
     #: child, same as ``midday_cause_seen``.
     midday_not_ready_alert_sent: bool = False
+    #: [2026-09-15 F1] Gates the post-relaunch readiness recheck (and its
+    #: ``resolve_intent_lock_holder`` flock probe) to running only until a
+    #: verdict is reached for the current mid-day-relaunched child --
+    #: either readiness was observed (success) or
+    #: ``midday_not_ready_alert_sent`` fired (timeout). Without this,
+    #: nothing latches the SUCCESS path and the probe runs on every poll
+    #: for the rest of the day. Reset by :func:`record_child_adopted` for
+    #: a new child, same as ``midday_not_ready_alert_sent``.
+    midday_readiness_recheck_done: bool = False
 
 
 def initial_scheduler_state(day: dt.date) -> DaySchedulerState:
@@ -713,7 +722,10 @@ def record_child_adopted(state: DaySchedulerState, now_utc: dt.datetime) -> DayS
     is evidence about THAT child, never inherited from its predecessor --
     and ``midday_not_ready_alert_sent``, so a LATER mid-day relaunch (a
     fresh child) gets its own bounded readiness re-check rather than
-    inheriting a prior child's already-fired alert latch."""
+    inheriting a prior child's already-fired alert latch. [2026-09-15 F1]
+    Also clears ``midday_readiness_recheck_done`` -- the new child gets
+    its own recheck window rather than inheriting a prior child's
+    already-latched verdict."""
     effective = _for_day(state, _trading_day(now_utc))
     return replace(
         effective,
@@ -721,6 +733,7 @@ def record_child_adopted(state: DaySchedulerState, now_utc: dt.datetime) -> DayS
         permit_issued_seen_expires_at_ns=None,
         midday_cause_seen=None,
         midday_not_ready_alert_sent=False,
+        midday_readiness_recheck_done=False,
     )
 
 
@@ -823,6 +836,21 @@ def record_midday_not_ready_alert_sent(
     if effective.midday_not_ready_alert_sent:
         return effective
     return replace(effective, midday_not_ready_alert_sent=True)
+
+
+def record_midday_readiness_recheck_done(
+    state: DaySchedulerState, now_utc: dt.datetime
+) -> DaySchedulerState:
+    """[2026-09-15 F1] Latch that the post-relaunch readiness recheck (and
+    its flock probe) has reached a verdict -- either readiness was
+    observed, or the not-ready alert fired -- for the current mid-day-
+    relaunched child. Gates the recheck to running only until a verdict
+    exists; cleared by :func:`record_child_adopted` for the NEXT
+    relaunched child. Idempotent."""
+    effective = _for_day(state, _trading_day(now_utc))
+    if effective.midday_readiness_recheck_done:
+        return effective
+    return replace(effective, midday_readiness_recheck_done=True)
 
 
 def decide_midday_relaunch(
