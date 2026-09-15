@@ -140,20 +140,36 @@ MonitorHistory.EMPTY = MonitorHistory(
 )
 
 
+def _dead_confirm_key(evidence: MonitorEvidence) -> int:
+    """The instant a DEAD-confirming reading is keyed on.
+
+    2026-09-15 correction (INC-3 author's open question): keying on
+    ``evidence.ts_ns`` (the EVALUATION timestamp) let two depth-only
+    evaluations of the SAME station observation, minutes apart, "confirm"
+    DEAD on a single observation. The correct key is the OBSERVATION's own
+    ``observed_at_ns`` -- distinct observation instants only. Falls back to
+    ``ts_ns`` when ``observed_at_ns`` is ``None`` (evidence built before this
+    field existed, or a caller that never threads it through), which
+    reproduces the exact prior behaviour for those callers.
+    """
+    return evidence.ts_ns if evidence.observed_at_ns is None else evidence.observed_at_ns
+
+
 def _update_dead_confirmation(
-    observed: tuple[int, ...], ts_ns: int, *, qualifies: bool
+    observed: tuple[int, ...], observed_key: int, *, qualifies: bool
 ) -> tuple[tuple[int, ...], bool]:
     """Fold one reading into the DEAD confirmation window.
 
     A non-qualifying reading resets the window to empty. A qualifying
-    reading at a ``ts_ns`` already present is a same-instant re-push and
-    never counts twice (module docstring rule 2). Confirmed once the window
-    holds >= ``_DEAD_CONFIRMATIONS`` distinct instants spanning >=
-    ``_DEAD_MIN_CONFIRM_SPAN_NS``.
+    reading at an ``observed_key`` (see :func:`_dead_confirm_key`) already
+    present is a same-instant re-push and never counts twice (module
+    docstring rule 2). Confirmed once the window holds
+    >= ``_DEAD_CONFIRMATIONS`` distinct instants spanning
+    >= ``_DEAD_MIN_CONFIRM_SPAN_NS``.
     """
     if not qualifies:
         return (), False
-    new_observed = observed if ts_ns in observed else (*observed, ts_ns)
+    new_observed = observed if observed_key in observed else (*observed, observed_key)
     confirmed = (
         len(new_observed) >= _DEAD_CONFIRMATIONS
         and (max(new_observed) - min(new_observed)) >= _DEAD_MIN_CONFIRM_SPAN_NS
@@ -272,7 +288,7 @@ def evaluate_monitor(
         evidence.rung_high is not None and evidence.running_max_lower > evidence.rung_high
     )
     dead_confirm_ns, dead_confirmed = _update_dead_confirmation(
-        history.dead_confirm_observed_ns, evidence.ts_ns, qualifies=dead_qualifies,
+        history.dead_confirm_observed_ns, _dead_confirm_key(evidence), qualifies=dead_qualifies,
     )
 
     if dead_confirmed:

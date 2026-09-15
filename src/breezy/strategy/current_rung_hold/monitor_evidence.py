@@ -91,6 +91,17 @@ class MonitorEvidence:
     cell_key: _CellKey
     p_hold_at_entry: Decimal | None
     p_hold_at_t: Decimal | None
+    #: The OBSERVATION's own valid/observed instant (the accumulator's last
+    #: observation time), never the evaluation's own ``ts_ns``. ``None`` when
+    #: this evaluation carries no observation (a depth-only tick). Distinct
+    #: from ``ts_ns`` deliberately (2026-09-15 correction): two evaluations
+    #: minutes apart driven by depth frames only, with no new observation in
+    #: between, must never be mistaken for two independent confirming
+    #: readings -- see ``monitor_decision.evaluate_monitor``'s DEAD gate.
+    #: Defaults to ``None`` so existing callers/tests that predate this field
+    #: are unaffected; ``monitor_decision`` falls back to ``ts_ns`` when this
+    #: is ``None``, which reproduces the exact prior behaviour.
+    observed_at_ns: int | None = None
     fill_px: Decimal
     held_qty: int
     mark_vwap: Decimal | None
@@ -140,6 +151,7 @@ class MonitorEvidence:
             "recoverable_value": _decimal_or_none(self.recoverable_value),
             "hour_lst": self.hour_lst,
             "entry_context": self.entry_context,
+            "observed_at_ns": self.observed_at_ns,
         }
 
 
@@ -263,6 +275,7 @@ def build_monitor_evidence(
     depth: OrderBookDepth10 | None,
     fee_coefficient: Decimal,
     p_hold_at_entry: Decimal | None,
+    observed_at_ns: int | None = None,
 ) -> MonitorEvidence:
     """Build one :class:`MonitorEvidence` snapshot from already-computed
     plain values -- ``running_max_lower``/``upper``, ``rung_low``/``high``,
@@ -329,4 +342,5 @@ def build_monitor_evidence(
         recoverable_value=recoverable_value,
         hour_lst=hour_lst,
         entry_context=entry_context,
+        observed_at_ns=observed_at_ns,
     )
