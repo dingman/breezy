@@ -4,6 +4,15 @@ Every eligible snapshot (Take and retry-Refuse) is recorded. The in-memory
 buffer is a ``deque(maxlen=...)`` so a long-running shadow cannot grow
 without bound. Optional JSONL is a named production consumer; tests inject
 a throwaway path, never the live exec-state DB.
+
+GAP fix (2026-09-15, offer-tape postmortem observability): a 09-15 SFO take
+could not be reconstructed after the fact -- the row carried no
+``p_bound``/``break_even``/running-max interval/staleness/side/fee
+coefficient, so nobody could tell WHY that snapshot cleared. The fields
+added below are purely additive (old keys, old positions, unchanged;
+``OfferTape``/``ContinuousRungHoldStrategy`` behaviour is byte-identical --
+L-34/D3): this module never decides which snapshot becomes a trial, never
+touches the latch, and never changes an admission/refusal outcome.
 """
 
 from __future__ import annotations
@@ -13,6 +22,7 @@ import logging
 from collections import deque
 from collections.abc import Mapping
 from dataclasses import dataclass
+from decimal import Decimal
 from pathlib import Path
 from typing import Final
 
@@ -25,7 +35,16 @@ DEFAULT_OFFER_TAPE_MAXLEN: Final[int] = 8192
 
 @dataclass(frozen=True, slots=True)
 class OfferTapeRecord:
-    """One eligible snapshot. Money fields are Decimal strings."""
+    """One eligible snapshot. Money fields are Decimal strings.
+
+    The GAP-fix fields below are the exception to that "Decimal strings"
+    convention: they are typed ``Decimal | None`` in-memory (never a bare
+    ``float``) and converted to strings only at :meth:`to_dict` time,
+    alongside the two Fahrenheit running-max bounds (also carried as
+    ``Decimal`` here purely so every numeric postmortem field shares one
+    quantize-free serialization path -- they are whole-degree integers, not
+    money).
+    """
 
     station: str
     climate_day: str
@@ -43,6 +62,36 @@ class OfferTapeRecord:
     prior_eligible_snaps: int
     illegal_cell: bool
     source: str
+    #: "YES" or "NO" -- which leg this snapshot evaluated.
+    side: str = "YES"
+    #: The side's own edge estimand (`P_HOLD_LOWER` for YES, `1 -
+    #: P_HOLD_UPPER` for NO) -- `None` when the decision never reached the
+    #: table lookup (e.g. `not_executable`, `observation_unavailable`).
+    p_bound: Decimal | None = None
+    #: `price + fee(price)` -- `None` under the same conditions as `p_bound`.
+    break_even: Decimal | None = None
+    #: The running-max Fahrenheit interval `[lower, upper]` this snapshot was
+    #: evaluated against.
+    running_max_lower: Decimal | None = None
+    running_max_upper: Decimal | None = None
+    #: `True` iff the running max had collapsed to an exact METAR reading.
+    running_max_exact: bool = False
+    #: Age (ns) of the running-max observation at evaluation time.
+    staleness_ns: int | None = None
+    #: The fee coefficient the decision was evaluated under.
+    fee_coefficient: Decimal | None = None
+    #: Valid time (ns) of the observation that SET the running max.
+    observed_at_ns: int | None = None
+    #: The NO-side latch-gate outcome (`sibling_leg_traded`,
+    #: `station_day_admission`, a day-budget/consumed reason, or
+    #: `"admitted"`) -- `None` for YES (no such gate runs at this layer) and
+    #: for a NO snapshot that never reached the gate chain (economic refuse).
+    admission_reason: str | None = None
+    #: The FINAL outcome this row represents -- "take" (would-arm/armed),
+    #: "refuse", or "wait". Never "wait" in practice: a WAIT tick never
+    #: reaches `OfferTape.append` at all (unbounded-log guard), so this
+    #: field is always "take" or "refuse" for every row that exists.
+    decision: str = "refuse"
 
     def to_dict(self) -> dict[str, object]:
         """Field-by-field serialization -- never ``dataclasses.asdict``.
@@ -72,6 +121,23 @@ class OfferTapeRecord:
             "prior_eligible_snaps": self.prior_eligible_snaps,
             "illegal_cell": self.illegal_cell,
             "source": self.source,
+            "side": self.side,
+            "p_bound": None if self.p_bound is None else str(self.p_bound),
+            "break_even": None if self.break_even is None else str(self.break_even),
+            "running_max_lower": (
+                None if self.running_max_lower is None else str(self.running_max_lower)
+            ),
+            "running_max_upper": (
+                None if self.running_max_upper is None else str(self.running_max_upper)
+            ),
+            "running_max_exact": self.running_max_exact,
+            "staleness_ns": self.staleness_ns,
+            "fee_coefficient": (
+                None if self.fee_coefficient is None else str(self.fee_coefficient)
+            ),
+            "observed_at_ns": self.observed_at_ns,
+            "admission_reason": self.admission_reason,
+            "decision": self.decision,
         }
 
 

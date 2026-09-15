@@ -228,7 +228,11 @@ def test_edge_below_break_even_is_refused_when_p_hold_lower_does_not_clear_it() 
     # Same cell (`p_hold_lower == 0.6585`), a higher ask pushes break-even
     # above it: fee(0.80) = 0.06*0.80*0.20 = 0.0096 -> $0.01, BE = 0.81.
     decision = evaluate_decision(_take_case_inputs(ask=Decimal("0.80")))
-    assert decision == Refuse("edge_below_break_even")
+    # GAP fix 2026-09-15: `Refuse` now carries the numeric p_bound/break_even
+    # that produced this refusal (offer-tape postmortem observability).
+    assert decision == Refuse(
+        "edge_below_break_even", p_bound=Decimal("0.6585"), break_even=Decimal("0.81")
+    )
 
 
 def test_first_executable_ask_is_the_only_candidate_even_if_a_later_ask_is_cheaper() -> None:
@@ -329,7 +333,11 @@ def test_refusal_precedence_order(
     overrides: dict[str, object], expected_reason: str
 ) -> None:
     decision = evaluate_decision(_take_case_inputs(**overrides))
-    assert decision == Refuse(expected_reason)
+    # Compares `.reason` only (not full equality): the `edge_below_break_even`
+    # case now carries non-None `p_bound`/`break_even` (GAP fix 2026-09-15),
+    # which is irrelevant to this test's actual subject, refusal PRECEDENCE.
+    assert isinstance(decision, Refuse)
+    assert decision.reason == expected_reason
 
 
 def test_a_refuse_reason_outside_the_closed_set_is_rejected() -> None:

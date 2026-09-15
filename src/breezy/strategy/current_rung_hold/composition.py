@@ -84,6 +84,11 @@ _CONTINUOUS_COMPONENT_ID_PREFIX: Final[str] = "ContinuousRungHoldStrategy"
 _MONITOR_CATALOG_DIRNAME: Final[str] = "monitor"
 _MONITOR_SUMMARIES_DIRNAME: Final[str] = "summaries"
 _NS_PER_MINUTE: Final[int] = 60_000_000_000
+#: GAP fix 2026-09-15 (offer-tape postmortem observability): sibling of the
+#: quote-tape catalog root, mirroring `_MONITOR_CATALOG_DIRNAME` above --
+#: NEVER nested under the catalog. No env var (L-39): a build-side default,
+#: never an operator control.
+_DECISIONS_DIRNAME: Final[str] = "decisions"
 
 #: Review finding 1: a WAIT-state diagnostic is not a refusal -- passed to
 #: `RefusalAlerter`'s injectable vocabulary so its event name/detail never
@@ -441,6 +446,21 @@ def build_current_rung_hold_strategies(
     return tuple(strategies)
 
 
+def _default_offer_tape_path(catalog_root: Path, today_by_station: Mapping[str, dt.date]) -> Path:
+    """GAP fix 2026-09-15: the live default JSONL sidecar for the shared
+    `OfferTape` -- a sibling of the quote-tape catalog root (never nested
+    under it, mirroring `monitor_root` above), one file per day. Naturally
+    rotates: `today_by_station` changes at the next daily boot
+    (`breezy-trade-supervisor`), so a fresh process always gets a fresh
+    file. `min(...)` over `today_by_station.values()` is deterministic
+    (stations share the same UTC calendar day in every real deployment) and
+    never raises on an empty mapping in practice -- `build_continuous_rung_
+    hold_strategies` already requires at least one resolved station above.
+    """
+    day = min(today_by_station.values())
+    return catalog_root.parent / _DECISIONS_DIRNAME / f"offer_tape_{day.isoformat()}.jsonl"
+
+
 def build_continuous_rung_hold_strategies(
     *,
     catalog_root: Path,
@@ -482,8 +502,17 @@ def build_continuous_rung_hold_strategies(
 
     # ONE OfferTape instance (its bounded deque, DEFAULT_OFFER_TAPE_MAXLEN=8192
     # slots) is shared by every per-station strategy below -- not one tape per
-    # station.
-    tape = OfferTape(offer_tape_path)
+    # station. GAP fix 2026-09-15: an explicit `offer_tape_path` still wins
+    # unconditionally (tests/the backtest harness keep working unedited);
+    # `None` (the live default -- `app/trade.py` never passes this kwarg
+    # today) now resolves to a real sidecar instead of in-memory-only, which
+    # is exactly the gap a 2026-09-15 postmortem hit (no JSONL to read back).
+    resolved_offer_tape_path = (
+        offer_tape_path
+        if offer_tape_path is not None
+        else _default_offer_tape_path(catalog_root, today_by_station)
+    )
+    tape = OfferTape(resolved_offer_tape_path)
     #: Sibling of the quote-tape catalog root (NEVER nested under it) --
     #: `catalog_root` here is `resolve_station_instrument_ids`'s own quote
     #: -tape root, so `monitor_root` is a directory beside it, one level up.

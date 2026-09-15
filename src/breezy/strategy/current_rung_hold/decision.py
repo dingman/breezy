@@ -221,9 +221,20 @@ class DecisionInputs:
 
 @dataclass(frozen=True, slots=True)
 class Refuse:
-    """A refused decision. ``reason`` is always a member of :data:`REFUSAL_REASONS`."""
+    """A refused decision. ``reason`` is always a member of :data:`REFUSAL_REASONS`.
+
+    ``p_bound``/``break_even`` are additive (GAP fix 2026-09-15, offer-tape
+    postmortem observability): unset (``None``) for every reason except
+    ``edge_below_break_even``, where :func:`_finalize_take` now populates
+    the SAME two numbers it already computed to make that refusal --
+    exposed here purely so a caller (the offer tape) can log WHY the edge
+    failed, never changing this class's truthiness or `evaluate_decision`'s
+    branching (L-34/D3: observability only).
+    """
 
     reason: str
+    p_bound: Decimal | None = None
+    break_even: Decimal | None = None
 
     def __post_init__(self) -> None:
         if self.reason not in REFUSAL_REASONS:
@@ -382,7 +393,7 @@ def _finalize_take(
 
     break_even = price + _fee(price, inputs.fee_coefficient)
     if not (p_bound > break_even):
-        return Refuse("edge_below_break_even")
+        return Refuse("edge_below_break_even", p_bound=p_bound, break_even=break_even)
 
     if side == "yes":
         return Take(
