@@ -2,8 +2,12 @@
 
 No I/O, no awaits, no network client. ``_submit_order`` is the one chokepoint;
 this module classifies order shape, encodes the venue body, and classifies the
-create-order response. X3 bans the NO-outcome constant under ``exec/``: a
-NO instrument is unmappable rather than encoded.
+create-order response. X3 (see the firewall guard's banned-token set) admits
+the outcome-side-NO constant per the ruling at
+``docs/evidence/RULING_x3_no_outcome_token_2026-09-14.md``, while still
+banning the naked-short vocabulary it replaced; ``_outcome_token`` maps a
+NO order via ``leg_of(instrument.id)``, never by reading the free-text
+outcome string.
 """
 
 from __future__ import annotations
@@ -25,6 +29,13 @@ from nautilus_trader.model.objects import Money, Price, Quantity
 
 from breezy.adapters.polymarket_us.errors import ExecutionReportMappingError, VenueTransportError
 from breezy.adapters.polymarket_us.exec.reports import _key_tree, parse_fill_report
+from breezy.adapters.polymarket_us.leg_prices import (
+    Leg,
+    instrument_price_for_leg,
+    wire_price_for_leg,
+)
+from breezy.adapters.polymarket_us.parsing import LEG_KEY, LEG_NO
+from breezy.adapters.polymarket_us.symbology import leg_of
 from breezy.adapters.polymarket_us.transport import VenueResponse
 
 logger = logging.getLogger(__name__)
@@ -104,8 +115,8 @@ _LATCH_ARM_REFUSAL_TYPES: Final[frozenset[str]] = frozenset(
         "SubmitIntentLockNotHeld",
     }
 )
-_YES_OUTCOME: Final[str] = "yes"
 _OUTCOME_SIDE_YES: Final[str] = "OUTCOME_SIDE_YES"
+_OUTCOME_SIDE_NO: Final[str] = "OUTCOME_SIDE_NO"
 _ORDER_ACTION_BUY: Final[str] = "ORDER_ACTION_BUY"
 _ORDER_TYPE_LIMIT: Final[str] = "ORDER_TYPE_LIMIT"
 _TIF_IOC: Final[str] = "TIME_IN_FORCE_IMMEDIATE_OR_CANCEL"
@@ -242,16 +253,25 @@ def order_fingerprint_bytes(order: object) -> bytes:
 
 
 def _outcome_token(instrument: object) -> str | None:
-    outcome = getattr(instrument, "outcome", None)
-    if not isinstance(outcome, str) or not outcome.strip():
-        info = getattr(instrument, "info", None)
-        if isinstance(info, Mapping):
-            outcome = info.get("outcome")
-    if not isinstance(outcome, str):
+    """Map ``instrument`` to its order-body ``outcomeSide`` value.
+
+    Keyed on :func:`leg_of` (the composite ``InstrumentId``), NEVER on the
+    free-text ``outcome`` string -- the parse the parent plan forbids
+    (``parsing.py:1211-1221``). ``info[LEG_KEY]`` is a cross-check that must
+    agree; disagreement is a refusal (``ValueError``), never a fallback.
+    Returns ``None`` only when the instrument carries no resolvable id.
+    """
+    instrument_id = getattr(instrument, "id", None)
+    if instrument_id is None:
         return None
-    if outcome.strip().casefold() == _YES_OUTCOME:
-        return _OUTCOME_SIDE_YES
-    return None
+    id_leg = leg_of(instrument_id)
+    info = getattr(instrument, "info", None)
+    info_leg = info.get(LEG_KEY) if isinstance(info, Mapping) else None
+    if info_leg is not None and info_leg != id_leg:
+        raise ValueError(
+            f"instrument id leg {id_leg!r} contradicts info[{LEG_KEY!r}]={info_leg!r}; refusing"
+        )
+    return _OUTCOME_SIDE_NO if id_leg == LEG_NO else _OUTCOME_SIDE_YES
 
 
 def unmappable_order_reason(order: object, instrument: object) -> str | None:
@@ -289,8 +309,12 @@ def unmappable_order_reason(order: object, instrument: object) -> str | None:
     has_trigger = getattr(order, "has_trigger_price", False)
     if has_trigger is True or (callable(has_trigger) and has_trigger()):
         return "trigger_price is not mappable; refusing"
-    if _outcome_token(instrument) is None:
-        return "no YES outcome leg is derivable from the instrument; refusing"
+    try:
+        outcome_side = _outcome_token(instrument)
+    except ValueError as exc:
+        return str(exc)
+    if outcome_side is None:
+        return "no order-body outcome side is derivable from the instrument; refusing"
     return None
 
 
@@ -303,11 +327,17 @@ def build_order_body(order: object, instrument: object) -> dict[str, Any]:
     slug = str(getattr(instrument, "raw_symbol", "") or "")
     outcome_side = _outcome_token(instrument)
     if outcome_side is None:
-        raise ValueError("no YES outcome leg is derivable from the instrument; refusing")
+        raise ValueError("no order-body outcome side is derivable from the instrument; refusing")
+    # Rev 5 (E5-1): the venue's `price.value` always represents the YES/long
+    # side's price -- identity on the YES leg, `1 - price` on the NO leg.
+    # The complement lives in `leg_prices` (outside `exec/`, where X3 bans
+    # the arithmetic); `intent_fingerprint` still hashes `order.price`, the
+    # Nautilus (instrument) price, never this wire value.
+    wire_price = wire_price_for_leg(leg_of(getattr(instrument, "id")), price)  # noqa: B009
     return {
         "marketSlug": slug,
         "type": _ORDER_TYPE_LIMIT,
-        "price": {"value": f"{price:.2f}", "currency": "USD"},
+        "price": {"value": f"{wire_price:.2f}", "currency": "USD"},
         "quantity": 1,
         "tif": _TIF_IOC,
         "outcomeSide": outcome_side,
@@ -433,14 +463,20 @@ def _durable_execution(payload: Mapping[str, Any]) -> Mapping[str, Any] | None:
     return None
 
 
-def _filled_cost_from_execution(execution: Mapping[str, Any]) -> Decimal | None:
+def _filled_cost_from_execution(execution: Mapping[str, Any], *, leg: Leg) -> Decimal | None:
+    """Rev 5 (E5-1): every raw ``avgPx``/``lastPx`` this reads is a WIRE
+    value (YES-denominated); translated via ``leg`` before it prices any
+    cost, identity on the YES leg. This is the create path's OWN I1a total,
+    read independently of :func:`~breezy.adapters.polymarket_us.exec.
+    reports.parse_fill_report` -- both must stay leg-aware or the NO leg's
+    booked cost silently keeps the wire (complement) price."""
     order = execution.get("order")
     if isinstance(order, Mapping):
         avg = _amount_decimal(order.get("avgPx"))
         cum = order.get("cumQuantity")
         if avg is not None and cum is not None:
             try:
-                return avg * Decimal(str(cum))
+                return instrument_price_for_leg(leg, avg) * Decimal(str(cum))
             except (InvalidOperation, ValueError, TypeError):
                 pass
     last_px = _amount_decimal(execution.get("lastPx"))
@@ -448,7 +484,7 @@ def _filled_cost_from_execution(execution: Mapping[str, Any]) -> Decimal | None:
     if last_px is None or last_shares is None:
         return None
     try:
-        return last_px * Decimal(str(last_shares))
+        return instrument_price_for_leg(leg, last_px) * Decimal(str(last_shares))
     except (InvalidOperation, ValueError, TypeError):
         return None
 
@@ -511,7 +547,7 @@ def _sum_fill_commission(executions: tuple[Mapping[str, Any], ...]) -> Decimal |
 
 
 def _cumulative_qty_and_cost(
-    execution: Mapping[str, Any],
+    execution: Mapping[str, Any], *, leg: Leg
 ) -> tuple[Decimal | None, Decimal | None]:
     """Qty and cost sourced TOGETHER, from the order snapshot on ``execution``,
     or together from this one execution's leg -- never mixed (I1a).
@@ -522,6 +558,10 @@ def _cumulative_qty_and_cost(
     would pair a whole-order quantity with a one-leg cost or the reverse --
     exactly the defect I1a forbids. This atomically checks both preconditions
     before choosing the order-level source.
+
+    Rev 5 (E5-1): the price half of either source is a WIRE value
+    (YES-denominated); translated via ``leg`` (identity on the YES leg)
+    before pricing the cost -- see :func:`_filled_cost_from_execution`.
     """
     order = execution.get("order")
     if isinstance(order, Mapping):
@@ -533,7 +573,7 @@ def _cumulative_qty_and_cost(
             except (InvalidOperation, ValueError):
                 cum = None
             if cum is not None:
-                return cum, avg * cum
+                return cum, instrument_price_for_leg(leg, avg) * cum
     last_px = _amount_decimal(execution.get("lastPx"))
     last_shares = execution.get("lastShares")
     if last_px is not None and last_shares is not None:
@@ -541,7 +581,7 @@ def _cumulative_qty_and_cost(
             qty = Decimal(str(last_shares))
         except (InvalidOperation, ValueError):
             return None, None
-        return qty, last_px * qty
+        return qty, instrument_price_for_leg(leg, last_px) * qty
     return None, None
 
 
@@ -793,7 +833,9 @@ def fill_generation(
         if errors is not None:
             errors.append(_capped_diagnostic(str(exc)))
         return None
-    filled_cost = _filled_cost_from_execution(execution)
+    filled_cost = _filled_cost_from_execution(
+        execution, leg=leg_of(cast(Instrument, instrument).id)
+    )
     if filled_cost is None:
         if errors is not None:
             errors.append(_capped_diagnostic(_underivable_cost_message(execution)))
@@ -990,7 +1032,9 @@ def classify_create_order_outcome(
                 errors=fill_parse_errors,
             )
             if fill is not None:
-                cumulative_qty, cumulative_cost = _cumulative_qty_and_cost(execution)
+                cumulative_qty, cumulative_cost = _cumulative_qty_and_cost(
+                    execution, leg=leg_of(cast(Instrument, instrument).id)
+                )
                 cumulative_fee, fee_reconciled = _cumulative_fee_and_reconciliation(
                     payload, execution, cumulative_qty=cumulative_qty
                 )

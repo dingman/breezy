@@ -87,6 +87,7 @@ __all__ = [
     "FAMILY_HALT_KEY",
     "HALT_CLEARED_KEY_PREFIX",
     "LATCH_GATE_REFUSAL_REASONS",
+    "NO_SIDE_FIRST_ORDER_PENDING_REASON",
     "SIBLING_LEG_TRADED_REASON",
     "STARTUP_EVIDENCE_KEY",
     "STATION_DAY_ADMISSION_REASON",
@@ -166,13 +167,26 @@ SIBLING_LEG_TRADED_REASON: Final[str] = "sibling_leg_traded"
 #: violation, at an earlier point in time.
 STATION_DAY_ADMISSION_REASON: Final[str] = "station_day_admission"
 
+#: NO-SIDE S5 (E3-6/E4-6): the bounded first-order containment window
+#: (PREREG amendment §8) -- while `NO_SIDE_FIRST_LIVE_ORDER_KEY` exists and
+#: `NO_SIDE_POSITION_SHAPE_CAPTURED_KEY` does not, the strategy refuses to
+#: ARM any further NO take account-wide. Distinct from
+#: `decision.REFUSAL_REASONS` for the same reason as the two reasons above.
+NO_SIDE_FIRST_ORDER_PENDING_REASON: Final[str] = "no_side_first_order_pending"
+
 #: The closed set of reasons the two functions below (`Refusal`) may use.
 #: Fixed and finite by construction, mirroring `decision.REFUSAL_REASONS`
 #: and `risk.COUNTED_REFUSAL_REASONS` -- but a SEPARATE set, since
 #: `decision.py` must stay untouched (hard invariant) and neither gate has
 #: an analogue there.
+#:
+#: WIDENED (NO-SIDE S5, E3-6/E4-6), never relaxed (L-12): adds
+#: `NO_SIDE_FIRST_ORDER_PENDING_REASON`, which is not raised via `Refusal`
+#: (no gate function below constructs one for it yet) -- it lives here
+#: because it is the closed set every OTHER NO-side latch-level gate reason
+#: also lives in, per the plan's own instruction.
 LATCH_GATE_REFUSAL_REASONS: Final[frozenset[str]] = frozenset(
-    {SIBLING_LEG_TRADED_REASON, STATION_DAY_ADMISSION_REASON}
+    {SIBLING_LEG_TRADED_REASON, STATION_DAY_ADMISSION_REASON, NO_SIDE_FIRST_ORDER_PENDING_REASON}
 )
 
 

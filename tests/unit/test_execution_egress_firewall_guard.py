@@ -248,8 +248,13 @@ BANNED_NATIVE_NAMES = frozenset({"SandboxExecutionClient", "BettingAccount"})
 BANNED_ACCOUNT_TYPE_MEMBER = "BETTING"
 BANNED_NATIVE_MODULE_SUBSTRING = "accounting.accounts.betting"
 
-#: X3 -- direction vocabulary prohibited anywhere under ``exec/``.
-BANNED_EXEC_DIRECTION_TOKENS = frozenset({"_SHORT", "OUTCOME_SIDE_NO"})
+#: X3 -- direction vocabulary prohibited anywhere under ``exec/``. Narrowed
+#: under ``docs/evidence/RULING_x3_no_outcome_token_2026-09-14.md``: the live
+#: order body requires ``outcomeSide=OUTCOME_SIDE_NO`` for the NO leg, so that
+#: token is admitted; ``BUY_SHORT`` (SDK-snapshot-only, never exercised live)
+#: and ``SELL_`` (naked-short vocabulary, ``allow_short=False``) are banned
+#: instead.
+BANNED_EXEC_DIRECTION_TOKENS = frozenset({"_SHORT", "BUY_SHORT", "SELL_"})
 
 
 # ==========================================================================
@@ -745,6 +750,10 @@ def test_n2_the_shipped_tree_has_exactly_the_expected_execution_egress_modules()
         ("src/breezy/adapters/polymarket_us/exec/client.py", "E3"),
         ("src/breezy/adapters/polymarket_us/exec/client.py", "E3"),
         ("src/breezy/adapters/polymarket_us/exec/endpoints.py", "E0"),
+        # NO-SIDE S5 (E4-4): I/O-free durable-key constants + pure helpers.
+        # ONE new row: it defines no class in `_EGRESS_CLASS_BASES` (E2) and
+        # no order-lifecycle function (E3).
+        ("src/breezy/adapters/polymarket_us/exec/no_side_keys.py", "E0"),
         # EXEC SPINE R-6d: `refusals.py` classifies a venue refusal as
         # TRANSIENT or DURABLE. Like `endpoints.py` and `reports.py` it is
         # pure and performs no I/O -- and like them it is an egress surface
@@ -1258,8 +1267,29 @@ def scan_banned_native_constructs(
     ]
 
 
-def _is_one(node: ast.expr) -> bool:
-    """True for ``1``, ``1.0``, and one-argument constructors of either."""
+def _name_bound_to_one(name: str, tree: ast.Module) -> bool:
+    """True if ``name`` is assigned a one-valued literal at MODULE level.
+
+    Module level only (``ast.iter_child_nodes``, not ``ast.walk``): a local
+    ``ONE = 1`` shadowing an unrelated module constant must not resolve
+    through the module binding, and this scan never needs it to.
+    """
+    for stmt in ast.iter_child_nodes(tree):
+        if (
+            isinstance(stmt, ast.Assign)
+            and len(stmt.targets) == 1
+            and isinstance(stmt.targets[0], ast.Name)
+            and stmt.targets[0].id == name
+            and _is_one(stmt.value, tree)
+        ):
+            return True
+    return False
+
+
+def _is_one(node: ast.expr, tree: ast.Module | None = None) -> bool:
+    """True for ``1``, ``1.0``, one-argument constructors of either, or (R3-4
+    widening) an ``ast.Name`` bound at module level in ``tree`` to one of
+    those forms -- never a bare name allowlist."""
     if isinstance(node, ast.Constant) and isinstance(node.value, int | float):
         return bool(node.value == 1)
     if (
@@ -1272,6 +1302,8 @@ def _is_one(node: ast.expr) -> bool:
             return value.strip() in {"1", "1.0"}
         if isinstance(value, int | float):
             return bool(value == 1)
+    if isinstance(node, ast.Name) and tree is not None:
+        return _name_bound_to_one(node.id, tree)
     return False
 
 
@@ -1297,7 +1329,12 @@ def find_exec_direction_violations(path: str, source: str) -> list[Violation]:
                 Violation(path, 0, "X3", f"carries the banned direction token {token!r}")
             )
     for node in ast.walk(tree):
-        if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Sub) and _is_one(node.left):
+        is_complement_sub = (
+            isinstance(node, ast.BinOp)
+            and isinstance(node.op, ast.Sub)
+            and _is_one(node.left, tree)
+        )
+        if is_complement_sub:
             found.append(
                 Violation(
                     path,
@@ -1558,6 +1595,10 @@ def test_x3_the_live_scan_actually_reaches_the_exec_package() -> None:
         "src/breezy/adapters/polymarket_us/exec/__init__.py",
         "src/breezy/adapters/polymarket_us/exec/client.py",
         "src/breezy/adapters/polymarket_us/exec/endpoints.py",
+        # NO-SIDE S5 (E4-4): I/O-free durable-key constants + pure helpers.
+        # WIDENED, not relaxed: brought INSIDE both scans like every other
+        # module under `exec/`, per this test's own reasoning.
+        "src/breezy/adapters/polymarket_us/exec/no_side_keys.py",
         # EXEC SPINE R-6d: the transient/durable refusal classifier. Pure,
         # stdlib-only, and under `exec/` because that is where the venue's
         # error payloads are parsed -- WIDENED, not relaxed: the comparison
@@ -1570,10 +1611,15 @@ def test_x3_the_live_scan_actually_reaches_the_exec_package() -> None:
 
 @pytest.mark.parametrize("token", sorted(BANNED_EXEC_DIRECTION_TOKENS))
 def test_x3_detects_each_banned_token_in_planted_exec_source(token: str) -> None:
+    """At least one violation names the planted token. Not an exact count of
+    one: ``BUY_SHORT`` literally contains ``_SHORT`` as a substring, so
+    planting it also (correctly) trips the ``_SHORT`` ban -- a superset
+    detection, never a missed one."""
     source = f'"""Docstring."""\n\nINTENT = "ORDER_INTENT_SELL{token}"\n'
     violations = find_exec_direction_violations(f"{EXEC_PACKAGE_PATH_PREFIX}reports.py", source)
-    assert [v.rule for v in violations] == ["X3"]
-    assert token in violations[0].detail
+    assert violations, f"expected at least one X3 violation for {token!r}"
+    assert all(v.rule == "X3" for v in violations)
+    assert any(token in v.detail for v in violations)
 
 
 def test_x3_detects_a_banned_token_split_across_an_implicit_concatenation() -> None:
@@ -1584,12 +1630,12 @@ def test_x3_detects_a_banned_token_split_across_an_implicit_concatenation() -> N
     ``ast.Constant``, so the AST pass does see it. Conversely the AST pass
     cannot see an identifier or a comment, which the raw-text pass can.
 
-    Residual, stated rather than claimed away: an EXPLICIT ``"OUTCOME_SIDE_"
-    + "NO"`` is folded by neither, and is not detected. The ban is a
-    prohibition on the vocabulary, not a proof of semantic absence.
+    Residual, stated rather than claimed away: an EXPLICIT ``"SELL" + "_"``
+    is folded by neither, and is not detected. The ban is a prohibition on
+    the vocabulary, not a proof of semantic absence.
     """
-    source = 'SIDE = "OUTCOME_SIDE_" "NO"\n'
-    assert "OUTCOME_SIDE_NO" not in source
+    source = 'SIDE = "SEL" "L_"\n'
+    assert "SELL_" not in source
     violations = find_exec_direction_violations(f"{EXEC_PACKAGE_PATH_PREFIX}reports.py", source)
     assert [v.rule for v in violations] == ["X3"]
 
@@ -1619,6 +1665,63 @@ def test_x3_does_not_fire_outside_the_exec_package() -> None:
     """``risk.py``'s correct-in-context comment is why this scope exists."""
     source = "OUTCOME_SIDE_NO = 'no'\n\n\ndef no_price(price):\n    return 1 - price\n"
     assert find_exec_direction_violations("src/breezy/strategy/risk.py", source) == []
+
+
+# ==========================================================================
+# R3-3/R3-4 -- X3 narrowed to admit OUTCOME_SIDE_NO, ONE-guard widened
+# ==========================================================================
+
+
+def test_the_exec_direction_scan_refuses_a_planted_BUY_SHORT() -> None:
+    """``BUY_SHORT`` stays banned: an SDK-snapshot-only artifact never
+    exercised by the live venue schema (ruling docs/evidence/
+    RULING_x3_no_outcome_token_2026-09-14.md section 2). ``BUY_SHORT``
+    literally contains ``_SHORT``, so both bans fire -- a superset
+    detection, not a bug."""
+    source = '"""Docstring."""\n\nINTENT = "BUY_SHORT"\n'
+    violations = find_exec_direction_violations(f"{EXEC_PACKAGE_PATH_PREFIX}reports.py", source)
+    assert violations
+    assert all(v.rule == "X3" for v in violations)
+    assert any("BUY_SHORT" in v.detail for v in violations)
+
+
+def test_the_exec_direction_scan_refuses_a_planted_SELL_underscore() -> None:
+    """``SELL_`` stays banned: a naked short exceeds ``allow_short=False``."""
+    source = '"""Docstring."""\n\nINTENT = "SELL_LONG"\n'
+    violations = find_exec_direction_violations(f"{EXEC_PACKAGE_PATH_PREFIX}reports.py", source)
+    assert [v.rule for v in violations] == ["X3"]
+    assert "SELL_" in violations[0].detail
+
+
+def test_the_exec_direction_scan_admits_OUTCOME_SIDE_NO_in_the_order_body() -> None:
+    """The narrowed set no longer bans ``OUTCOME_SIDE_NO``: the live NO order
+    body must be able to carry it under ``exec/``."""
+    source = '"""Docstring."""\n\nOUTCOME_SIDE = "OUTCOME_SIDE_NO"\n'
+    assert find_exec_direction_violations(f"{EXEC_PACKAGE_PATH_PREFIX}reports.py", source) == []
+
+
+def test_the_exec_direction_scan_refuses_a_planted_ONE_minus_price() -> None:
+    """R3-4 widening: a module-level ``ONE`` name resolved through the SAME
+    tree still trips the complement-arithmetic guard, never a bare name
+    allowlist."""
+    source = (
+        "from decimal import Decimal\n\n"
+        "ONE = Decimal(1)\n\n\n"
+        "def no_price(price):\n"
+        "    return ONE - price\n"
+    )
+    violations = find_exec_direction_violations(f"{EXEC_PACKAGE_PATH_PREFIX}reports.py", source)
+    assert [v.rule for v in violations] == ["X3"]
+    assert "complement" in violations[0].detail
+
+
+def test_the_literal_one_minus_form_still_trips_after_the_widening() -> None:
+    """Non-regression: the pre-existing literal-``1`` detection path (not the
+    new Name-resolution path) still fires after the widening."""
+    source = "def no_price(price):\n    return 1 - price\n"
+    violations = find_exec_direction_violations(f"{EXEC_PACKAGE_PATH_PREFIX}reports.py", source)
+    assert [v.rule for v in violations] == ["X3"]
+    assert "complement" in violations[0].detail
 
 
 # ==========================================================================
@@ -2287,6 +2390,10 @@ def test_e0_inert_the_live_scan_actually_reaches_the_exec_package() -> None:
         "src/breezy/adapters/polymarket_us/exec/__init__.py",
         "src/breezy/adapters/polymarket_us/exec/client.py",
         "src/breezy/adapters/polymarket_us/exec/endpoints.py",
+        # NO-SIDE S5 (E4-4): I/O-free durable-key constants + pure helpers.
+        # WIDENED, not relaxed: brought INSIDE both scans like every other
+        # module under `exec/`, per this test's own reasoning.
+        "src/breezy/adapters/polymarket_us/exec/no_side_keys.py",
         # EXEC SPINE R-6d: the transient/durable refusal classifier. Pure,
         # stdlib-only, and under `exec/` because that is where the venue's
         # error payloads are parsed -- WIDENED, not relaxed: the comparison
@@ -3063,12 +3170,79 @@ def test_x1_the_live_scan_actually_reaches_a_test_that_imports_the_exec_package(
     # still `==`; the module carries no `SOCKET_RESTORING_MARKERS` and
     # constructs no client -- it drives `ContinuousRungHoldStrategy`
     # through the SAME registered-strategy-direct-handler-call harness.
+    #
+    # Old -> new (NO-SIDE S5, Track B commit 1, E4-4): added
+    # `tests/unit/test_no_side_keys.py`, which imports the new I/O-free
+    # `exec.no_side_keys` module (two `Final` string constants plus a pure
+    # `is_no_side_pending` helper) -- WIDENED, not relaxed (L-6/L-12): the
+    # comparison is still `==`; the module carries no
+    # `SOCKET_RESTORING_MARKERS` and constructs no client.
+    #
+    # Old -> new (NO-SIDE S5, Track B commit 2, E4-3): added
+    # `tests/unit/test_mark_no_side_position_captured_cli.py`, which
+    # imports the same `exec.no_side_keys` constants to seed/assert the
+    # durable keys the new CLI reads and writes. WIDENED, not relaxed: the
+    # module carries no `SOCKET_RESTORING_MARKERS` and constructs no client.
+    #
+    # Old -> new (NO-SIDE S5, Track B commit 3, E3-8): added
+    # `tests/unit/test_no_side_boot_reconcile_2026_09_14.py`, which imports
+    # `DurableFillRecord` from `exec.client` (the same plain-data-record
+    # shape as its siblings, above) and `NO_SIDE_FIRST_LIVE_ORDER_KEY` from
+    # `exec.no_side_keys` to prove the boot-reconcile write. WIDENED, not
+    # relaxed: the module carries no `SOCKET_RESTORING_MARKERS` and
+    # constructs no client -- it drives `PolymarketUSExecutionClient`
+    # through the SAME `_build_rig`/`_connect`/`_disconnect` harness every
+    # sibling exec-client suite uses.
+    #
+    # Old -> new (NO-SIDE S5, Track B commit 5, E3-2/E3-5/E2-3/E2-4):
+    # added `tests/unit/test_no_side_first_order_pending_2026_09_14.py`,
+    # which imports `BUDGET_EXHAUSTED_KEY_PREFIX` from `exec.client` (the
+    # SAME plain-string-constant shape as its sibling `test_continuous_
+    # rung_hold_strategy.py`'s own `_mark_budget_exhausted` precedent) and
+    # `exec.no_side_keys`'s two constants. WIDENED, not relaxed: the module
+    # carries no `SOCKET_RESTORING_MARKERS` and constructs no client -- it
+    # drives `ContinuousRungHoldStrategy` through the SAME
+    # registered-strategy-direct-handler-call harness.
+    #
+    # Old -> new (this row, NO-side S5, section 2 E2-5 safety pin): added
+    # `tests/unit/test_no_side_submit_chain_2026_09_14.py`, which imports
+    # `submit_chain` directly to prove `_outcome_token`/`build_order_body`
+    # refuse a NO-leg order before section 3's leg-keyed mapping lands.
+    # WIDENED, not relaxed (L-6/L-12): the comparison is still `==`; the
+    # module carries no `SOCKET_RESTORING_MARKERS` and constructs no client
+    # -- `submit_chain` is the pure-helpers module, no socket either.
+    #
+    # Old -> new (this row, NO-side S5, section 4): added `tests/unit/
+    # test_no_side_fill_attribution_2026_09_14.py`, which drives a real
+    # `PolymarketUSExecutionClient` through `_note_ambiguous_open`/
+    # `_resolve_accept_fill`/`_submit_order`/`_seed_spend_from_durable_fills`
+    # to prove NO-leg fill/GET attribution and spend seeding. WIDENED, not
+    # relaxed (L-6/L-12): the comparison is still `==`; it carries no
+    # `SOCKET_RESTORING_MARKERS` -- its sender is the shipped `_FakeSender`
+    # double (imported from `test_polymarket_us_submit_order_chain.py`,
+    # never a parallel fake), same shape as every sibling exec suite.
+    #
+    # Old -> new (this row, NO-side S5 §1(a)): `test_polymarket_us_readonly_
+    # guard.py` now imports `exec.submit_chain` (locally, inside `test_the_
+    # capture_script_body_keys_equal_the_live_order_body_keys`) to pin the
+    # NO-side preview capture script's restated `ORDER_BODY_KEYS` equal to
+    # the live constant. WIDENED, not relaxed (L-6/L-12): the comparison is
+    # still `==`; the module carries no `SOCKET_RESTORING_MARKERS` and
+    # constructs no client -- `submit_chain.ORDER_BODY_KEYS` is a plain
+    # frozenset, read directly.
+    # Old -> new (E3-1/E4-4, NO_SIDE_S5_EXEC_2026-09-14.md): `test_continuous_
+    # rung_hold_never_arm_no_leg_2026_09_14.py` imports `exec.client`'s
+    # `DurableFillRecord`/`FILL_INDEX_KEY_PREFIX`/`FILL_KEY_PREFIX` to write a
+    # durable NO-leg fill fixture via the real writer's key shape (L-42),
+    # exactly like its `test_continuous_rung_hold_fill_wiring.py` sibling
+    # above -- additive, no relaxation.
     assert exec_importing_test_modules() == {
         "tests/contract/test_exec_client_reconciliation_contract.py",
         "tests/contract/test_exec_client_wiring_contract.py",
         "tests/contract/test_live_fill_scoring_chain_contract.py",
         "tests/unit/test_continuous_rung_hold_backtest_only.py",
         "tests/unit/test_continuous_rung_hold_fill_wiring.py",
+        "tests/unit/test_continuous_rung_hold_never_arm_no_leg_2026_09_14.py",
         "tests/unit/test_continuous_rung_hold_no_side_shadow_2026_09_14.py",
         "tests/unit/test_continuous_rung_hold_strategy.py",
         "tests/unit/test_current_rung_hold_ambiguous_resolver.py",
@@ -3084,8 +3258,16 @@ def test_x1_the_live_scan_actually_reaches_a_test_that_imports_the_exec_package(
         "tests/unit/test_polymarket_us_exec_reports.py",
         "tests/unit/test_fill_time_count.py",
         "tests/unit/test_live_family_tally_fill_source_cli.py",
+        "tests/unit/test_mark_no_side_position_captured_cli.py",
+        "tests/unit/test_no_side_boot_reconcile_2026_09_14.py",
+        "tests/unit/test_no_side_first_order_pending_2026_09_14.py",
+        "tests/unit/test_no_side_keys.py",
+        "tests/unit/test_no_side_s5c_flip_2026_09_14.py",
         "tests/unit/test_polymarket_us_exec_snapshot_drift.py",
         "tests/unit/test_polymarket_us_factories.py",
+        "tests/unit/test_no_side_fill_attribution_2026_09_14.py",
+        "tests/unit/test_no_side_submit_chain_2026_09_14.py",
+        "tests/unit/test_polymarket_us_readonly_guard.py",
         "tests/unit/test_polymarket_us_startup_evidence.py",
         "tests/unit/test_polymarket_us_submit_order_chain.py",
         "tests/unit/test_polymarket_us_write_sequence.py",

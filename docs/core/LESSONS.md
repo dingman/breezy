@@ -1414,3 +1414,17 @@ Any test of a function that READS durable state must create that state through t
 
 ### How to apply
 When briefing a slice that adds a store reader: require the RED test to write via the real path and name that path. When reviewing: grep the new tests for direct `store.set`/`consume(` calls with literal keys. Related: L-37 (declared drift), L-40.
+
+## L-43 — Two slices that are each green can be jointly broken; gate the integration branch after EVERY merge (2026-09-14)
+
+### What happened
+S6a's review fix (4d26f5c) added a refusal for a mixed-side station-day whose rows lack rung keys. S6b's Monte-Carlo (c564602, branched before that fix) built rows without rung keys. Each branch was green in its own worktree and each was reviewed. After both were merged into the NO-side base branch, the S6b test file failed 13 of 15 cases in under a second with `combine_station_day() is undefined for an empty station-day`, and the "corrected" Monte-Carlo numbers already cited by the PREREG amendment had been produced against the pre-fix statistic. The coordinator had run the base gate after the S1–S4 and S3/S3b merges but skipped it after the S6b merge.
+
+### Why this is binding
+Parallel worktrees hide interface drift between slices; a review of one slice cannot see a later fix to another. Numbers cited by a registration document must come from the integrated code.
+
+### The rule
+Run the full no-egress gate on the integration branch immediately after every slice merge, before merging the next slice, and never cite an evidence artefact whose test does not pass on the integration branch at the cited commit.
+
+### How to apply
+After `git merge` on the base branch: gate → only then merge the next branch. When a merged evidence artefact's test fails on the base, the artefact is withdrawn until re-run on the base commit. Related: L-41, [[one-tree-many-agents-fakes-test-failures]].

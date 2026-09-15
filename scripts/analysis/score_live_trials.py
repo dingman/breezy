@@ -100,6 +100,10 @@ from typing import Any, Final, Literal
 
 from breezy.adapters.polymarket_us.errors import ExecutionReportMappingError
 from breezy.adapters.polymarket_us.exec.client import FILL_KEY_PREFIX, DurableFillRecord
+from breezy.adapters.polymarket_us.exec.no_side_keys import (
+    NO_SIDE_FIRST_LIVE_ORDER_KEY,
+    NO_SIDE_POSITION_SHAPE_CAPTURED_KEY,
+)
 from breezy.domain.nws_climate_day import NwsClimateDay
 from breezy.domain.weather_bucket_facts import (
     Measure,
@@ -313,6 +317,11 @@ FillExclusionReason = Literal[
     "no_taken_latch",
     "ambiguous_latch",
     "duplicate_fill",
+    # NO-SIDE S5 (E2-1(iii)/E3-3, PREREG amendment §8): the first live NO
+    # create-path trial, marked residual by the durable first-order key
+    # while the bounded containment window (`is_no_side_pending`) is open.
+    # Widened, never relaxed (L-12): no member removed or re-spelled.
+    "no_side_first_order_residual",
 ]
 
 #: Slice 4 item B2 (plan rev 6.1): the mutually exclusive residual set --
@@ -324,7 +333,14 @@ FillExclusionReason = Literal[
 #: -- so a fill can never land in more than one of these three buckets by
 #: construction (PREREG mutual-exclusivity requirement).
 RESIDUAL_EXCLUSION_REASONS: Final[frozenset[FillExclusionReason]] = frozenset(
-    {"duplicate_fill", "partial_fill", "multi_fill", "fee_unverified"}
+    {
+        "duplicate_fill",
+        "partial_fill",
+        "multi_fill",
+        "fee_unverified",
+        # NO-SIDE S5 (E3-3): additive, never relaxed (L-12).
+        "no_side_first_order_residual",
+    }
 )
 
 
@@ -383,6 +399,7 @@ def _admit_fill(
     venue_order_id: str = "",
     tick: Decimal = _TICK,
     skip_ask_guard: bool = False,
+    no_side_residual: bool = False,
 ) -> FillExclusion | None:
     """Ruling Q1 admission gate, widened by I2 (BLOCK-3/L-25). Assumes
     `trial.qty > 0` (call `_validate_qty` first). Returns `None` when the
@@ -438,6 +455,27 @@ def _admit_fill(
             qty=str(trial.qty),
             reason="fee_unverified",
             detail="the venue's cumulative fee could not be reconciled to its fill-type legs",
+            venue_order_id=venue_order_id,
+            filled_at_ns=trial.filled_at_ns,
+            fill_px=str(trial.fill_px),
+            fee=str(trial.fee),
+        )
+    if no_side_residual:
+        # NO-SIDE S5 (E2-1(iii)/E3-3): checked LAST -- an otherwise fully
+        # admissible fill (qty==1, ask-respecting, fee-reconciled) is
+        # excluded only because it is the FIRST live NO create-path trial,
+        # marked by the durable first-order key while the bounded
+        # containment window is open (PREREG amendment §8).
+        return FillExclusion(
+            trial_id=trial.trial_id,
+            station=trial.station,
+            climate_day=trial.climate_day,
+            qty=str(trial.qty),
+            reason="no_side_first_order_residual",
+            detail=(
+                "the first live NO create-path trial is residual while "
+                "the bounded first-order containment window is open"
+            ),
             venue_order_id=venue_order_id,
             filled_at_ns=trial.filled_at_ns,
             fill_px=str(trial.fill_px),
@@ -544,7 +582,10 @@ def read_filled_trials_state_db(
     since_climate_day: str,
     stations: Sequence[str],
 ) -> tuple[
-    tuple[FilledTrial, ...], tuple[FillExclusion, ...], Mapping[str, tuple[bool, str, bool]],
+    tuple[FilledTrial, ...],
+    tuple[FillExclusion, ...],
+    Mapping[str, tuple[bool, str, bool]],
+    Mapping[str, bool],
 ]:
     """Read real fills from the live exec `SqliteStateStore`, joined to each
     trial's `current_rung_hold/trial/{station}/{climate_day}` latch by
@@ -599,15 +640,25 @@ def read_filled_trials_state_db(
     closed. The message names only the key prefix and the violated rule,
     never the key's content or the raw bytes.
 
-    Returns `(trials, exclusions, fee_reconciled_by_trial_id)`; the third
-    member maps `trial_id -> (fee_reconciled, venue_order_id, skip_ask_guard)`
-    (three-seam Slice 4 review item 3: `skip_ask_guard` is `True` only for a
-    `TAKEN_FROM_FILL_WALK_REASON` latch) so the caller can pass all three
-    into `_admit_fill`. `FilledTrial.scheduled_release_at_ns`
+    Returns `(trials, exclusions, fee_reconciled_by_trial_id,
+    no_side_residual_by_trial_id)`; the third member maps `trial_id ->
+    (fee_reconciled, venue_order_id, skip_ask_guard)` (three-seam Slice 4
+    review item 3: `skip_ask_guard` is `True` only for a
+    `TAKEN_FROM_FILL_WALK_REASON` latch) so the caller can pass both new
+    keyword arguments into `_admit_fill`. `FilledTrial.scheduled_release_at_ns`
     is a placeholder `0` here -- this reader takes no `venue` (the signature
     above is frozen, Stage-0), so the caller resolves the real settlement
     instant via `_with_scheduled_release_at_ns`, the one place `venue` and
     `city` are both already in hand.
+
+    NO-SIDE S5 (E2-1(iii)/E3-3): `no_side_residual_by_trial_id` maps
+    `trial_id -> True` for the ONE trial whose fill instrument matches the
+    `NO_SIDE_FIRST_LIVE_ORDER_KEY` payload's `instrumentId`, read from the
+    SAME `rows` this function already fetched (never a second store read),
+    while `NO_SIDE_POSITION_SHAPE_CAPTURED_KEY` is absent (the bounded
+    containment window, `is_no_side_pending`). Every other trial is absent
+    from the mapping (falsy default at the call site, exactly like
+    `fee_reconciled_by_trial_id.get(...)`).
     """
     conn = _open_readonly(path)
     if conn is None:
@@ -618,6 +669,25 @@ def read_filled_trials_state_db(
         raise FillSourceUnreadableError("the fill source could not be read") from exc
     finally:
         conn.close()
+
+    # NO-SIDE S5 (E2-1(iii)/E3-3): both durable keys, read from the SAME
+    # `rows` fetch above -- never a second store read. `pending_instrument_id`
+    # is `None` unless the containment window is genuinely open (first-order
+    # present, captured absent).
+    no_side_first_order_raw: bytes | None = None
+    no_side_captured_present = False
+    for key, value in rows:
+        if key == NO_SIDE_FIRST_LIVE_ORDER_KEY:
+            no_side_first_order_raw = value
+        elif key == NO_SIDE_POSITION_SHAPE_CAPTURED_KEY:
+            no_side_captured_present = True
+    pending_instrument_id: str | None = None
+    if no_side_first_order_raw is not None and not no_side_captured_present:
+        try:
+            pending_payload = json.loads(no_side_first_order_raw)
+            pending_instrument_id = pending_payload.get("instrumentId")
+        except (TypeError, ValueError):
+            pending_instrument_id = None
 
     station_census = set(stations)
     has_census_latch = False
@@ -632,7 +702,7 @@ def read_filled_trials_state_db(
         # v3 Phase 0: a store with zero prefix keys is n=0, not a store failure.
         # v2 branch is unchanged (positive control still refuses).
         if family_prefix.startswith("continuous_rung_hold/"):
-            return (), (), {}
+            return (), (), {}, {}
         raise StorePositiveControlFailedError("store_positive_control_failed")
 
     # instrument_id -> every TAKEN latch across ALL cities sharing this
@@ -842,7 +912,18 @@ def read_filled_trials_state_db(
             skip_ask_guard=skip_ask_guard,
         )
 
-    return tuple(trials), tuple(exclusions), fee_reconciled_by_trial_id
+    no_side_residual_by_trial_id: dict[str, bool] = {}
+    if pending_instrument_id is not None:
+        for trial in trials:
+            if trial.instrument_id == pending_instrument_id:
+                no_side_residual_by_trial_id[trial.trial_id] = True
+
+    return (
+        tuple(trials),
+        tuple(exclusions),
+        fee_reconciled_by_trial_id,
+        no_side_residual_by_trial_id,
+    )
 
 
 def _admit_one_fill(
@@ -1171,6 +1252,7 @@ def score_live_trials(
     """
     reader_exclusions: tuple[FillExclusion, ...] = ()
     fee_reconciled_by_trial_id: Mapping[str, tuple[bool, str, bool]] = {}
+    no_side_residual_by_trial_id: Mapping[str, bool] = {}
     unresolved_takes: tuple[UnresolvedTake, ...] = ()
 
     if fills_path is not None:
@@ -1207,7 +1289,12 @@ def score_live_trials(
             # through as MATCH. Never the actual token (value-free, A5).
             raise NodeStorePreflightRefused("node_store_preflight_unknown_result")
         cli_location = default_registry().settlement_site(venue, city).cli_location
-        raw_trials, reader_exclusions, fee_reconciled_by_trial_id = read_filled_trials_state_db(
+        (
+            raw_trials,
+            reader_exclusions,
+            fee_reconciled_by_trial_id,
+            no_side_residual_by_trial_id,
+        ) = read_filled_trials_state_db(
             fill_source_path,
             family_prefix=family_prefix,
             city=city,
@@ -1257,11 +1344,13 @@ def score_live_trials(
         fee_reconciled, venue_order_id, skip_ask_guard = fee_reconciled_by_trial_id.get(
             trial.trial_id, (True, "", False),
         )
+        no_side_residual = no_side_residual_by_trial_id.get(trial.trial_id, False)
         exclusion = _admit_fill(
             trial,
             fee_reconciled=fee_reconciled,
             venue_order_id=venue_order_id,
             skip_ask_guard=skip_ask_guard,
+            no_side_residual=no_side_residual,
         )
         if exclusion is not None:
             excluded_fills.append(exclusion)

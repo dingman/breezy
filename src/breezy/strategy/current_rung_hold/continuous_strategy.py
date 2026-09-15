@@ -33,10 +33,16 @@ from breezy.adapters.polymarket_us.errors import (
 )
 from breezy.adapters.polymarket_us.exec import submit_chain
 from breezy.adapters.polymarket_us.exec.client import DurableFillRecord
+from breezy.adapters.polymarket_us.exec.no_side_keys import (
+    NO_SIDE_FIRST_LIVE_ORDER_KEY,
+    first_live_order_payload,
+    is_no_side_pending,
+)
 from breezy.adapters.polymarket_us.operator_controls import utc_day_for_ns
 from breezy.adapters.polymarket_us.parsing import assert_fee_schedule_known
 from breezy.adapters.polymarket_us.symbology import (
-    instrument_id_to_slug,
+    base_slug_of,
+    leg_of,
     parse_weather_slug,
     sibling_instrument_id,
 )
@@ -107,10 +113,16 @@ __all__ = [
 _NS_PER_MINUTE: Final[int] = 60_000_000_000
 _CLASS_NAME: Final[str] = "ContinuousRungHoldStrategy"
 #: S3b (plan NO_SIDE_EDGE_2026-09-14 S4/S5): the NO leg's Take is evaluated
-#: and gated every tick but NEVER reaches `submit_order` in this slice --
-#: S5 is the ONLY slice permitted to flip this to `False`, and only after
-#: its exit criteria (new RulePin, ruling, NO-side preview capture) land.
-NO_SIDE_SHADOW_ONLY: Final[bool] = True
+#: and gated every tick. FLIPPED to `False` by this commit (S5 Track C,
+#: the tail commit of `NO_SIDE_S5_EXEC_2026-09-14.md` §5) -- exit criteria
+#: (a)-(d) are MET (preview+book capture, the X3 ruling sign-off at
+#: 8c954ef, the S6b citation, and the first-order-protocol keys/CLI/RED
+#: tests landing before this flip; PREREG amendment §8). Criterion (e),
+#: the position-shape ruling, stays OPEN by design and is contained by
+#: the bounded first-order protocol (`NO_SIDE_FIRST_ORDER_PENDING_REASON`)
+#: until the first NO fill's venue position payload is captured and
+#: ruled on.
+NO_SIDE_SHADOW_ONLY: Final[bool] = False
 #: Closed-set reasons for a `no_refuse:` shadow-gate log line (S3b, S4).
 #: Deliberately disjoint from `decision.REFUSAL_REASONS` -- these are the
 #: LATCH-layer gates run only after the NO leg's own `Take` already cleared
@@ -531,6 +543,37 @@ class ContinuousRungHoldStrategy(Strategy):
         for iid, facts in self._facts.items():
             station = facts.settlement_station
             climate_day_key = facts.climate_day.isoformat()
+            # NO-SIDE S5 (§5 plan, "the never-arm walk decides both legs"):
+            # the NO sibling's decision is recorded for observability ONLY --
+            # it never gates the YES `slug_ok`/`return False` logic below,
+            # because no venue position evidence for a NO id can ever exist
+            # (E2-1(i)/(ii), `_map_position` is YES-only). A NO leg with no
+            # durable fill record on this instrument-day is "flat" without
+            # any position read; a NO leg with ANY fill record is "UNKNOWN"
+            # for NO-arming purposes (the position-shape ruling has not
+            # fired yet) -- either way YES keeps arming exactly as before.
+            no_iid = str(sibling_instrument_id(InstrumentId.from_str(iid)))
+            try:
+                no_has_fill = self._latch.is_consumed(
+                    station, climate_day_key, key_instrument_id=no_iid,
+                ) or bool(self._latch.iter_fill_records(frozenset({no_iid})))
+            except (TrialDayRecordCorrupt, ExecutionReportMappingError) as exc:
+                # Fail closed exactly like the entry-level walk (:527) and
+                # the sibling cross-check below (:603) -- an unreadable
+                # NO-leg fill index must halt the walk, never raise out of
+                # it (safety review finding, 2026-09-14).
+                self.log.error(
+                    f"continuous_rung_hold: durable fill walk unreadable ({exc}); halting",
+                )
+                self.position_events.record(_POSITION_FILL_WALK_UNREADABLE)
+                self._report_alerter(
+                    self.position_alerter, "continuous_rung_hold position report failed",
+                )
+                self._record_startup_evidence_summary(
+                    evidence, now_ns=now_ns, decisions=decisions,
+                )
+                return False
+            decisions[no_iid] = "UNKNOWN" if no_has_fill else "flat"
             if self._latch.is_consumed(station, climate_day_key, key_instrument_id=iid):
                 continue
             slug = InstrumentId.from_str(iid).symbol.value
@@ -563,6 +606,34 @@ class ContinuousRungHoldStrategy(Strategy):
                 ) and self.portfolio.net_position(InstrumentId.from_str(iid)) <= 0
                 decisions[iid] = "absent-flat" if slug_ok else "UNKNOWN"
             if not slug_ok:
+                # E3-1 (S5 plan Rev 3/Rev 4 E4-8): a venue LONG on the YES id
+                # with no YES fill on record may still be fully accounted
+                # for by a fill on the sibling NO id for the SAME
+                # instrument-day -- sibling exclusion forbids a YES and a NO
+                # fill on one instrument-day, so a NO fill here is
+                # unambiguous evidence that the position is the NO leg's,
+                # not an unreconciled YES long. `sibling_instrument_id`
+                # varies only the leg suffix on the same dated slug, so this
+                # never crosses days. Shape-agnostic: a venue that nets the
+                # NO leg as non-long on the YES slug never reaches this
+                # block at all (`slug_ok` was already `True`).
+                no_iid_for_slug = no_iid
+                try:
+                    no_fill_records = self._latch.iter_fill_records(
+                        frozenset({no_iid_for_slug}),
+                    )
+                except (TrialDayRecordCorrupt, ExecutionReportMappingError):
+                    # Fail closed: an unreadable NO-leg fill index is never
+                    # treated as accounting evidence -- falls through to the
+                    # halt below, exactly like an absent one.
+                    no_fill_records = ()
+                if no_fill_records:
+                    self.log.info(
+                        f"never_arm: accounted_by_no_leg instrument={iid} "
+                        f"no_instrument={no_iid_for_slug}",
+                    )
+                    decisions[iid] = "accounted-by-no-leg"
+                    continue
                 self.log.error(
                     f"continuous_rung_hold: venue position for {iid} is a "
                     "LONG or UNKNOWN (no durable fill on record); halting",
@@ -616,6 +687,16 @@ class ContinuousRungHoldStrategy(Strategy):
         """
         ids = set(self._facts) | {str(i) for i in self._config.instrument_ids}
         ids |= {str(i) for i in self.cache.instrument_ids()}
+        # NO-SIDE S5: both legs are candidates -- a NO fill/never-arm lookup
+        # must find its instrument-day here too (E2-6: the arming loop is
+        # not NO-aware yet, but the join/walk lookups must be).
+        siblings: set[str] = set()
+        for candidate_id in ids:
+            try:
+                siblings.add(str(sibling_instrument_id(InstrumentId.from_str(candidate_id))))
+            except VenuePayloadError:
+                continue
+        ids |= siblings
         return frozenset(ids)
 
     def _consume_trial_from_fill_record(self, fill_record: DurableFillRecord) -> None:
@@ -669,10 +750,19 @@ class ContinuousRungHoldStrategy(Strategy):
         facts = self._facts.get(iid)
         if facts is not None:
             return facts.settlement_station, facts.climate_day.isoformat()
+        # NO-SIDE S5 (§5 plan): a NO-leg fill has no entry of its own in
+        # `self._facts` (which is populated from YES instruments only) --
+        # its YES sibling's facts join it to the same station-day.
+        if leg_of(instrument_id) == "no":
+            yes_facts = self._facts.get(str(sibling_instrument_id(instrument_id)))
+            if yes_facts is not None:
+                return yes_facts.settlement_station, yes_facts.climate_day.isoformat()
         if iid not in self._candidate_instrument_ids():
             return None
         try:
-            slug = instrument_id_to_slug(instrument_id)
+            # `base_slug_of` (unlike `instrument_id_to_slug`) accepts either
+            # leg's id, recovering the same underlying venue slug.
+            slug = base_slug_of(instrument_id)
         except VenuePayloadError:
             return None
         parsed = parse_weather_slug(slug)
@@ -1118,6 +1208,17 @@ class ContinuousRungHoldStrategy(Strategy):
 
         store = self._latch._store
         prefix = self._latch._key_prefix
+        # NO-SIDE S5 (E3-2/E3-5): the bounded first-order containment
+        # window, checked IMMEDIATELY after `is_intent_open` and BEFORE any
+        # side effect below (mirroring `is_intent_open`'s own pre-filter
+        # precedent). This does NOT refuse the evaluation itself -- the
+        # hunt stays observable while pending (E3-5): every gate below
+        # still runs, and only the terminal shadow log's `pending=` field
+        # reflects the containment state. Submission (this method's
+        # `NO_SIDE_SHADOW_ONLY` scope has none yet) is the thing the
+        # closed-set reason `no_side_first_order_pending`
+        # (`LATCH_GATE_REFUSAL_REASONS`) will gate once §5 flips the flag.
+        pending = is_no_side_pending(store)
 
         sibling_refusal = refuse_if_sibling_leg_traded(
             store, prefix, station, climate_day_key, no_iid,
@@ -1173,14 +1274,63 @@ class ContinuousRungHoldStrategy(Strategy):
             return
 
         minute_bucket = now_ns // _NS_PER_MINUTE
-        if self._no_shadow_notice.get(notice_key) == minute_bucket:
+        # E3-5: the hunt stays observable while pending -- log every minute,
+        # even for a take that would have submitted, BEFORE the flag/pending
+        # branch below decides whether it actually arms.
+        if self._no_shadow_notice.get(notice_key) != minute_bucket:
+            self._no_shadow_notice[notice_key] = minute_bucket
+            self._record_no_take_shadow(
+                f"no_take_shadow: station={station} instrument={no_iid} "
+                f"no_ask={no_decision.limit_price} p_miss_lower={no_decision.p_bound} "
+                f"be={no_decision.break_even} bid_size={bid_size} "
+                f"pending={1 if pending else 0}"
+            )
+
+        if NO_SIDE_SHADOW_ONLY:
+            # S3b (frozen behaviour): never arm, consume, or submit.
             return
-        self._no_shadow_notice[notice_key] = minute_bucket
-        self._record_no_take_shadow(
-            f"no_take_shadow: station={station} instrument={no_iid} "
-            f"no_ask={no_decision.limit_price} p_miss_lower={no_decision.p_bound} "
-            f"be={no_decision.break_even} bid_size={bid_size}"
+
+        # NO-SIDE S5 tail (§5 plan): the flag is False -- arm the NO take
+        # exactly like the YES arm block (:1020-1041), keyed on `no_iid`,
+        # UNLESS the bounded first-order protocol (E2-1/E3-2) is pending.
+        # E3-2/E3-5 (pinned by test_no_side_first_order_pending_2026_09_14.py):
+        # this is a silent WAIT, never a `no_refuse:` -- `NO_SIDE_FIRST_
+        # ORDER_PENDING_REASON` lives in `LATCH_GATE_REFUSAL_REASONS` for
+        # the client-side denial path, not for a `Refusal`/`_refuse_once`
+        # this method would raise.
+        if pending:
+            return
+        # SAFETY (adjudicated placement, strategy-side, mirrors client.py's
+        # SAFETY C1 comment at `_submit_order`): this write and the arm
+        # block below run with NO `await` between the `pending` read above
+        # and here -- `Strategy.on_quote_tick`/`on_data` are plain
+        # synchronous methods, so two stations' ticks handled back-to-back
+        # in one process cannot interleave: whichever call reaches this
+        # line first WRITES the key and COMMITs (`SqliteStateStore.set`
+        # commits before returning) before it ever yields control, so the
+        # second call's OWN `pending = is_no_side_pending(store)` read,
+        # taken at the top of its own invocation of this method, observes
+        # `True` and returns above -- never reaching this line. The key is
+        # NEVER cleared by this method: if `_maybe_submit` below goes on to
+        # refuse (permit exhausted, budget cap, latch already armed by a
+        # true concurrent submit_order path), the key stays SET -- "pending
+        # with no order" fails closed exactly like `client.py`'s own C1
+        # WAIT (no money moved, but no further NO arm is granted either).
+        store.set(
+            NO_SIDE_FIRST_LIVE_ORDER_KEY,
+            first_live_order_payload(no_iid, now_ns),
         )
+        self._decision_ask_by_station_day[(station, climate_day_key)] = no_decision.limit_price
+        self._latch.set_inflight(station, climate_day_key, key_instrument_id=no_iid)
+        self._latch.record_attempt(
+            station, climate_day_key, ts_ns=now_ns, key_instrument_id=no_iid,
+        )
+        self._record_rearm_decision(
+            f"rearm: {station}/{climate_day_key} NO armed instrument={no_iid}"
+        )
+        self._maybe_submit(no_iid, no_decision)
+        if not self._submission_armed():
+            self._latch.clear_inflight(station, climate_day_key, key_instrument_id=no_iid)
 
     def _record_no_take_shadow(self, summary: str) -> None:
         """Mirrors `_record_rearm_decision` -- stores the ONE summary line
