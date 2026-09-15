@@ -1813,3 +1813,119 @@ def test_v3_no_leg_instrument_keyed_latch_matching_the_pending_key_is_marked_res
     assert exclusion is not None
     assert exclusion.reason == "no_side_first_order_residual"
     assert exclusion.reason in RESIDUAL_EXCLUSION_REASONS
+
+
+# ---------------------------------------------------------------------------
+# `find_unresolved_takes` 3-part instrument-keyed v3 latch key parsing
+# (mirrors the `read_filled_trials_state_db` fix above, 2498752): a v3
+# TAKEN-but-unfilled latch must not be invisible to this visibility-only
+# census just because its key is 3-part.
+# ---------------------------------------------------------------------------
+
+
+def test_v3_instrument_keyed_taken_latch_with_no_fill_is_unresolved_with_the_canonical_trial_id(
+    tmp_path: Path,
+) -> None:
+    """A 3-part ``{prefix}{station}/{climate_day}/{instrument_id}`` v3 TAKEN
+    latch with no matching fill is reported unresolved, and `.trial` is
+    exactly `trial_id_for(...)` -- the same canonical form
+    `read_filled_trials_state_db` now yields, never the raw store key."""
+    store_path = tmp_path / "state.sqlite"
+    store = SqliteStateStore(store_path)
+    latch_key = _seed_latch(
+        store,
+        ask=Decimal("0.40"),
+        instrument_id=_INSTRUMENT_ID,
+        key_instrument_id=_INSTRUMENT_ID,
+        family_prefix=_V3_FAMILY_PREFIX,
+    )
+    _seed_open_intent(store)
+    store.close()
+
+    unresolved = find_unresolved_takes(
+        store_path, family_prefix=_V3_FAMILY_PREFIX, city=_CITY, since_climate_day=_DAY_ISO
+    )
+
+    assert len(unresolved) == 1
+    take = unresolved[0]
+    assert take.trial == trial_id_for(_V3_FAMILY_PREFIX, _STATION, _DAY_ISO, _INSTRUMENT_ID)
+    assert take.trial == latch_key
+    assert take.station == _CITY
+    assert take.climate_day == _DAY_ISO
+    assert take.ask == "0.40"
+    assert take.intent_state == "OPEN"
+
+
+def test_v3_instrument_keyed_taken_latch_with_a_matching_fill_is_never_unresolved(
+    tmp_path: Path,
+) -> None:
+    store_path = tmp_path / "state.sqlite"
+    store = SqliteStateStore(store_path)
+    _seed_latch(
+        store,
+        instrument_id=_INSTRUMENT_ID,
+        key_instrument_id=_INSTRUMENT_ID,
+        family_prefix=_V3_FAMILY_PREFIX,
+    )
+    _seed_fill(store, venue_order_id="v1", instrument_id=_INSTRUMENT_ID)
+    store.close()
+
+    unresolved = find_unresolved_takes(
+        store_path, family_prefix=_V3_FAMILY_PREFIX, city=_CITY, since_climate_day=_DAY_ISO
+    )
+
+    assert unresolved == ()
+
+
+def test_mixed_v2_and_v3_unresolved_takes_in_one_store_are_both_reported(
+    tmp_path: Path,
+) -> None:
+    """A store carrying BOTH a legacy 2-part TAKEN-but-unfilled latch and an
+    instrument-keyed 3-part one (the real mid-migration shape) reports
+    BOTH, each with its own canonical `.trial`."""
+    store_path = tmp_path / "state.sqlite"
+    store = SqliteStateStore(store_path)
+    v2_key = _seed_latch(
+        store,
+        instrument_id=_INSTRUMENT_ID,
+        ask=Decimal("0.40"),
+        family_prefix=_V3_FAMILY_PREFIX,
+    )
+    v3_key = _seed_latch(
+        store,
+        instrument_id=_OTHER_V3_INSTRUMENT_ID,
+        key_instrument_id=_OTHER_V3_INSTRUMENT_ID,
+        ask=Decimal("0.24"),
+        family_prefix=_V3_FAMILY_PREFIX,
+    )
+    store.close()
+
+    unresolved = find_unresolved_takes(
+        store_path, family_prefix=_V3_FAMILY_PREFIX, city=_CITY, since_climate_day=_DAY_ISO
+    )
+
+    by_trial = {take.trial: take for take in unresolved}
+    assert set(by_trial) == {v2_key, v3_key}
+
+
+def test_a_v3_unresolved_latchs_key_segment_disagreeing_with_its_record_instrument_id_is_unreadable(
+    tmp_path: Path,
+) -> None:
+    """Mirrors `read_filled_trials_state_db`'s own F3 refusal: a 3-part
+    key's instrument-id segment must agree with the decoded record's
+    `instrument_id`, or the whole run fails closed -- never a silent join
+    on the wrong identity."""
+    store_path = tmp_path / "state.sqlite"
+    store = SqliteStateStore(store_path)
+    _seed_latch(
+        store,
+        instrument_id=_INSTRUMENT_ID,
+        key_instrument_id=_OTHER_V3_INSTRUMENT_ID,
+        family_prefix=_V3_FAMILY_PREFIX,
+    )
+    store.close()
+
+    with pytest.raises(FillSourceUnreadableError):
+        find_unresolved_takes(
+            store_path, family_prefix=_V3_FAMILY_PREFIX, city=_CITY, since_climate_day=_DAY_ISO
+        )
