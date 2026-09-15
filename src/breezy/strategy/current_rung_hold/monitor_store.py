@@ -185,6 +185,18 @@ class MarkBuffer:
         Records stay buffered (bounded by the deque, never unboundedly) on
         any writer failure, so a transient catalog fault never loses data
         beyond what the deque itself would already have dropped.
+
+        `OSError` is caught alongside the catalog module's own exception
+        taxonomy because `open_monitor_catalog` -> `open_station_catalog`
+        does an eager `root.mkdir(parents=True, exist_ok=True)`
+        (`persistence/catalog.py:411`) BEFORE the writer lock is taken --
+        unlike everything inside `write_records`'s own lock-acquisition
+        path, that `mkdir` has no chance to translate a raw filesystem
+        failure (permission denied, disk full, a non-directory in the way)
+        into `WriterLockError`. Without this, such a failure would escape
+        this buffer's own guard entirely and rely solely on
+        `PositionMonitor._guarded` for containment (safety-review finding
+        M1, 2026-09-15).
         """
         if not self._buf:
             return 0
@@ -193,7 +205,7 @@ class MarkBuffer:
         try:
             catalog = open_monitor_catalog(catalog_root, climate_day)
             outcome = write_records(catalog, pending)
-        except (WriterLockError, CatalogWriteError, ValueError):
+        except (WriterLockError, CatalogWriteError, ValueError, OSError):
             self._flush_errors += 1
             logger.exception(
                 "MarkBuffer: flush failed for climate_day=%s; %d record(s) remain buffered",

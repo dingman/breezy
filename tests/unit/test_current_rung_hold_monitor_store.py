@@ -188,6 +188,47 @@ class TestMarkBufferFlush:
 
         assert buf.flush(tmp_path, "2026-09-01") == 0
 
+    def test_an_oserror_from_open_monitor_catalog_is_swallowed_and_counted(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """M1 (safety review, 2026-09-15): `open_monitor_catalog` ->
+        `open_station_catalog` does an eager `mkdir` BEFORE the writer lock
+        (`persistence/catalog.py:411`), so a raw `OSError`/`PermissionError`
+        from that `mkdir` must never escape `flush` -- it is not translated
+        into `WriterLockError`/`CatalogWriteError` the way a lock-acquisition
+        failure inside `write_records` would be."""
+        buf = MarkBuffer()
+        buf.append(_mark_record())
+
+        def boom(root: Path, climate_day: str) -> object:
+            raise PermissionError("simulated unwritable catalog root")
+
+        monkeypatch.setattr(monitor_store, "open_monitor_catalog", boom)
+
+        written = buf.flush(tmp_path, "2026-09-01")
+
+        assert written == 0
+        assert len(buf) == 1
+        assert buf.flush_errors == 1
+
+    def test_a_real_unwritable_root_is_swallowed_and_counted(self, tmp_path: Path) -> None:
+        """Same failure, but a REAL disk condition rather than a monkeypatch:
+        `catalog_root` is a plain FILE, so `root.mkdir(parents=True,
+        exist_ok=True)` inside `open_station_catalog` raises `NotADirectoryError`
+        (an `OSError` subclass) because a path component is not a directory --
+        this holds even when the test runs as root, unlike a permission-bit
+        based simulation."""
+        blocked_root = tmp_path / "not_a_directory"
+        blocked_root.write_text("this is a file, not a catalog root")
+        buf = MarkBuffer()
+        buf.append(_mark_record())
+
+        written = buf.flush(blocked_root, "2026-09-01")
+
+        assert written == 0
+        assert len(buf) == 1
+        assert buf.flush_errors == 1
+
 
 class TestOpenMonitorCatalogPartitioning:
     def test_two_climate_days_get_two_distinct_catalog_roots(self, tmp_path: Path) -> None:
