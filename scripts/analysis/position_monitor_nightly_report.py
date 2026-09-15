@@ -240,9 +240,12 @@ class MonitorReport:
     total_positions: int
     settled_count: int
     unsettled_count: int
+    settled_from_scored_trials: int
+    settled_from_summary: int
     by_leg: Mapping[str, int]
     by_entry_context: Mapping[str, int]
     contingency_table: tuple[VerdictContingencyRow, ...]
+    contingency_table_by_entry_context: Mapping[str, tuple[VerdictContingencyRow, ...]]
     premature_exit_rate: WilsonEstimate
     dead_precision: WilsonEstimate
     avoided_loss: AvoidedLossSummary
@@ -259,9 +262,15 @@ class MonitorReport:
             "total_positions": self.total_positions,
             "settled_count": self.settled_count,
             "unsettled_count": self.unsettled_count,
+            "settled_from_scored_trials": self.settled_from_scored_trials,
+            "settled_from_summary": self.settled_from_summary,
             "by_leg": dict(self.by_leg),
             "by_entry_context": dict(self.by_entry_context),
             "contingency_table": [row.to_dict() for row in self.contingency_table],
+            "contingency_table_by_entry_context": {
+                context: [row.to_dict() for row in rows]
+                for context, rows in self.contingency_table_by_entry_context.items()
+            },
             "premature_exit_rate": self.premature_exit_rate.to_dict(),
             "dead_precision": self.dead_precision.to_dict(),
             "avoided_loss": self.avoided_loss.to_dict(),
@@ -277,9 +286,16 @@ class MonitorReport:
         }
 
 
+#: `_Joined.settlement_source` values -- which store answered the settlement question.
+_SOURCE_SCORED_TRIAL: Final[str] = "scored_trial"
+_SOURCE_SUMMARY: Final[str] = "summary"
+
+
 @dataclass(frozen=True, slots=True, kw_only=True)
 class _Joined:
-    """One monitor summary joined to the `ScoredTrial` settlement truth for its `trial_id`."""
+    """One monitor summary, settled either by a joined `ScoredTrial` or by its
+    own `settled_held`/`settled_pnl` (see `_join`'s docstring for the order).
+    """
 
     summary: PositionMonitorSummary
     settled_pnl: Decimal
@@ -287,6 +303,7 @@ class _Joined:
     climate_day: str
     trial_id: str
     verdict_at_signal: str | None
+    settlement_source: str
 
 
 def _count_by(
@@ -302,25 +319,66 @@ def _count_by(
 def _join(
     summaries: Sequence[PositionMonitorSummary], scored_trials: Sequence[ScoredTrial]
 ) -> tuple[tuple[_Joined, ...], int]:
+    """Settle each summary, preferring the joined `ScoredTrial` over the summary's own fields.
+
+    Resolution order: (1) a `ScoredTrial` joined on `trial_id` -- authoritative
+    for live trials, scored from the live settlement pipeline; (2) else the
+    summary's own `settled_held`/`settled_pnl` when BOTH are not `None` -- this
+    is the INC-8 hypothetical-hold corpus's path, whose rows are joined
+    offline to NWS FINAL truth and by construction never have a `ScoredTrial`;
+    (3) else the summary stays unsettled. A summary is never promoted to
+    settled from a partial pair (one field present, the other `None`).
+    """
     scored_by_id = {trial.trial_id: trial for trial in scored_trials}
     joined: list[_Joined] = []
     unsettled = 0
     for summary in summaries:
         trial = scored_by_id.get(summary.trial_id)
-        if trial is None:
-            unsettled += 1
-            continue
-        joined.append(
-            _Joined(
-                summary=summary,
-                settled_pnl=trial.pnl,
-                settled_held=trial.held,
-                climate_day=summary.climate_day,
-                trial_id=summary.trial_id,
-                verdict_at_signal=summary.verdict_at_signal,
+        if trial is not None:
+            joined.append(
+                _Joined(
+                    summary=summary,
+                    settled_pnl=trial.pnl,
+                    settled_held=trial.held,
+                    climate_day=summary.climate_day,
+                    trial_id=summary.trial_id,
+                    verdict_at_signal=summary.verdict_at_signal,
+                    settlement_source=_SOURCE_SCORED_TRIAL,
+                )
             )
-        )
+            continue
+        if summary.settled_held is not None and summary.settled_pnl is not None:
+            joined.append(
+                _Joined(
+                    summary=summary,
+                    settled_pnl=summary.settled_pnl,
+                    settled_held=summary.settled_held,
+                    climate_day=summary.climate_day,
+                    trial_id=summary.trial_id,
+                    verdict_at_signal=summary.verdict_at_signal,
+                    settlement_source=_SOURCE_SUMMARY,
+                )
+            )
+            continue
+        unsettled += 1
     return tuple(joined), unsettled
+
+
+def _contingency_by_entry_context(
+    joined: Sequence[_Joined],
+) -> dict[str, tuple[VerdictContingencyRow, ...]]:
+    """Contingency table per `entry_context` (live / reconciled / hypothetical).
+
+    Only over settled rows, mirroring `_contingency_table`; a context with no
+    settled rows is omitted rather than reported as an all-zero table.
+    """
+    contexts = sorted({row.summary.entry_context for row in joined})
+    return {
+        context: _contingency_table(
+            tuple(row for row in joined if row.summary.entry_context == context)
+        )
+        for context in contexts
+    }
 
 
 def _contingency_table(joined: Sequence[_Joined]) -> tuple[VerdictContingencyRow, ...]:
@@ -485,19 +543,31 @@ def build_monitor_report(
     """Build the nightly report purely from already-read `summaries`/`scored_trials`.
 
     Never queries a catalog or store itself (D3/L-34: monitoring stays
-    read-only w.r.t. trial selection); an unjoined summary (no row in
-    `scored_trials` for its `trial_id`) is counted as unsettled, never
-    dropped and never treated as settled.
+    read-only w.r.t. trial selection). Settlement per summary resolves in
+    order: a joined `ScoredTrial` (authoritative for live trials), else the
+    summary's own `settled_held`/`settled_pnl` when both are present (the
+    INC-8 hypothetical-hold corpus, which never has a `ScoredTrial` by
+    construction), else unsettled -- see `_join`. A summary settled neither
+    way is counted as unsettled, never dropped and never treated as settled.
     """
     joined, unsettled = _join(summaries, scored_trials)
+    settled_from_scored_trials = sum(
+        1 for row in joined if row.settlement_source == _SOURCE_SCORED_TRIAL
+    )
+    settled_from_summary = len(joined) - settled_from_scored_trials
 
     return MonitorReport(
         total_positions=len(summaries),
         settled_count=len(joined),
         unsettled_count=unsettled,
+        settled_from_scored_trials=settled_from_scored_trials,
+        settled_from_summary=settled_from_summary,
         by_leg=MappingProxyType(_count_by(summaries, lambda s: s.leg)),
         by_entry_context=MappingProxyType(_count_by(summaries, lambda s: s.entry_context)),
         contingency_table=_contingency_table(joined),
+        contingency_table_by_entry_context=MappingProxyType(
+            _contingency_by_entry_context(joined)
+        ),
         premature_exit_rate=_premature_exit_rate(joined),
         dead_precision=_dead_precision(joined),
         avoided_loss=_avoided_loss(joined),
@@ -519,6 +589,10 @@ def _render_markdown(report: MonitorReport) -> str:
         (
             f"positions: {report.total_positions} "
             f"(settled {report.settled_count}, unsettled {report.unsettled_count})"
+        ),
+        (
+            f"settled by source: scored_trials={report.settled_from_scored_trials} "
+            f"summary={report.settled_from_summary}"
         ),
         (
             f"premature-exit rate: point={report.premature_exit_rate.point} "

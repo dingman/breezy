@@ -136,6 +136,158 @@ class TestJoin:
         assert dict(report.by_entry_context) == {"live": 2, "reconciled": 1}
 
 
+class TestSettlementResolution:
+    """The hypothetical-hold corpus carries its own `settled_*` fields and by
+    construction never has a matching `ScoredTrial` (GAP fix): a summary must
+    settle from its own `settled_held`/`settled_pnl` when no `ScoredTrial`
+    joins, never fall through to unsettled just because it is not a live trial.
+    """
+
+    def test_summary_with_no_scored_trial_settles_from_its_own_settled_fields(
+        self, report_mod: ModuleType
+    ) -> None:
+        summaries = (
+            _summary(
+                trial_id="hypo:SFO:2026-09-01:0",
+                entry_context="hypothetical",
+                settled_held=True,
+                settled_pnl=Decimal("0.45"),
+            ),
+        )
+
+        report = report_mod.build_monitor_report(summaries, ())
+
+        assert report.settled_count == 1
+        assert report.unsettled_count == 0
+        assert report.settled_from_scored_trials == 0
+        assert report.settled_from_summary == 1
+
+    def test_summary_missing_either_settled_field_stays_unsettled(
+        self, report_mod: ModuleType
+    ) -> None:
+        summaries = (
+            _summary(
+                trial_id="hypo:SFO:2026-09-01:0",
+                entry_context="hypothetical",
+                settled_held=True,
+                settled_pnl=None,
+            ),
+            _summary(
+                trial_id="hypo:SFO:2026-09-01:1",
+                entry_context="hypothetical",
+                settled_held=None,
+                settled_pnl=Decimal("0.10"),
+            ),
+        )
+
+        report = report_mod.build_monitor_report(summaries, ())
+
+        assert report.settled_count == 0
+        assert report.unsettled_count == 2
+        assert report.settled_from_scored_trials == 0
+        assert report.settled_from_summary == 0
+
+    def test_joined_scored_trial_is_authoritative_over_the_summarys_own_settled_fields(
+        self, report_mod: ModuleType
+    ) -> None:
+        # The summary claims HELD True / pnl +0.99; the joined ScoredTrial
+        # (live, authoritative) disagrees: HELD False / pnl -0.50. The
+        # ScoredTrial must win.
+        summaries = (
+            _summary(
+                trial_id="A",
+                entry_context="live",
+                verdict_at_signal="EXIT_RECOMMENDED",
+                settled_held=True,
+                settled_pnl=Decimal("0.99"),
+            ),
+        )
+        scored = (_trial(trial_id="A", held=False, pnl=Decimal("-0.50")),)
+
+        report = report_mod.build_monitor_report(summaries, scored)
+
+        assert report.settled_from_scored_trials == 1
+        assert report.settled_from_summary == 0
+        by_verdict = {row.verdict: row for row in report.contingency_table}
+        assert by_verdict["EXIT_RECOMMENDED"].settled_held_true == 0
+        assert by_verdict["EXIT_RECOMMENDED"].settled_held_false == 1
+        assert report.dead_precision.k == 1
+        assert report.dead_precision.n == 1
+
+    def test_mixed_corpus_counts_each_source_separately(
+        self, report_mod: ModuleType
+    ) -> None:
+        summaries = (
+            _summary(trial_id="A", entry_context="live"),
+            _summary(
+                trial_id="hypo:SFO:2026-09-01:0",
+                entry_context="hypothetical",
+                settled_held=False,
+                settled_pnl=Decimal("-0.10"),
+            ),
+            _summary(trial_id="unresolved", entry_context="live"),
+        )
+        scored = (_trial(trial_id="A", held=True, pnl=Decimal("0.20")),)
+
+        report = report_mod.build_monitor_report(summaries, scored)
+
+        assert report.total_positions == 3
+        assert report.settled_count == 2
+        assert report.unsettled_count == 1
+        assert report.settled_from_scored_trials == 1
+        assert report.settled_from_summary == 1
+
+
+class TestContingencyByEntryContext:
+    def test_contingency_table_is_broken_out_per_entry_context(
+        self, report_mod: ModuleType
+    ) -> None:
+        summaries = (
+            _summary(trial_id="A", entry_context="live", verdict_at_signal="HOLD"),
+            _summary(
+                trial_id="hypo:SFO:2026-09-01:0",
+                entry_context="hypothetical",
+                verdict_at_signal="EXIT_RECOMMENDED",
+                settled_held=False,
+                settled_pnl=Decimal("-0.10"),
+            ),
+            _summary(
+                trial_id="B", entry_context="reconciled", verdict_at_signal="HOLD"
+            ),
+        )
+        scored = (
+            _trial(trial_id="A", held=True),
+            _trial(trial_id="B", held=True),
+        )
+
+        report = report_mod.build_monitor_report(summaries, scored)
+
+        assert set(report.contingency_table_by_entry_context) == {
+            "live",
+            "hypothetical",
+            "reconciled",
+        }
+        live_rows = {
+            row.verdict: row for row in report.contingency_table_by_entry_context["live"]
+        }
+        assert live_rows["HOLD"].settled_held_true == 1
+        assert live_rows["HOLD"].settled_held_false == 0
+
+        hypothetical_rows = {
+            row.verdict: row
+            for row in report.contingency_table_by_entry_context["hypothetical"]
+        }
+        assert hypothetical_rows["EXIT_RECOMMENDED"].settled_held_true == 0
+        assert hypothetical_rows["EXIT_RECOMMENDED"].settled_held_false == 1
+
+    def test_omits_contexts_with_no_settled_rows(self, report_mod: ModuleType) -> None:
+        summaries = (_summary(trial_id="A", entry_context="live"),)
+
+        report = report_mod.build_monitor_report(summaries, ())
+
+        assert report.contingency_table_by_entry_context == {}
+
+
 class TestContingencyTable:
     def test_verdict_by_settled_held_counts_and_none_verdict_normalizes_to_hold(
         self, report_mod: ModuleType
@@ -413,6 +565,34 @@ class TestDecimalPurity:
         assert isinstance(payload["avoided_loss"]["total"], str)
         assert isinstance(payload["mae_summary"]["min"], str)
         assert isinstance(payload["mfe_summary"]["max"], str)
+
+    def test_to_dict_serializes_settlement_source_counts_and_contingency_by_context(
+        self, report_mod: ModuleType
+    ) -> None:
+        summaries = (
+            _summary(trial_id="A", entry_context="live", verdict_at_signal="HOLD"),
+            _summary(
+                trial_id="hypo:SFO:2026-09-01:0",
+                entry_context="hypothetical",
+                verdict_at_signal="EXIT_RECOMMENDED",
+                settled_held=False,
+                settled_pnl=Decimal("-0.10"),
+            ),
+        )
+        scored = (_trial(trial_id="A", held=True),)
+
+        report = report_mod.build_monitor_report(summaries, scored)
+        payload = report.to_dict()
+
+        assert payload["settled_from_scored_trials"] == 1
+        assert payload["settled_from_summary"] == 1
+        assert set(payload["contingency_table_by_entry_context"]) == {
+            "live",
+            "hypothetical",
+        }
+        assert payload["contingency_table_by_entry_context"]["hypothetical"][0][
+            "verdict"
+        ]
 
 
 class TestIsolation:
