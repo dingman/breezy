@@ -9,16 +9,19 @@ pattern `test_current_rung_hold_backtest_only.py` uses for the v2 subclass.
 from __future__ import annotations
 
 import ast
+import importlib.util
 import itertools
+import sys
 import time
 from decimal import Decimal
 from pathlib import Path
+from types import ModuleType
 from typing import Any
 
 import pytest
 from nautilus_trader.common.component import TestClock
 from nautilus_trader.model.currencies import USD
-from nautilus_trader.model.data import OrderBookDepth10
+from nautilus_trader.model.data import CustomData, OrderBookDepth10
 from nautilus_trader.model.events import OrderFilled
 from nautilus_trader.model.identifiers import TraderId
 from nautilus_trader.model.instruments import BinaryOption
@@ -43,6 +46,11 @@ from breezy.strategy.current_rung_hold.continuous_backtest_only import (
 from breezy.strategy.current_rung_hold.continuous_strategy import (
     _MAX_STATION_DAY_ATTEMPTS,
     _REARM_MIN_DELAY_NS,
+)
+from breezy.strategy.current_rung_hold.monitor_records import PositionMarkRecord
+from breezy.strategy.current_rung_hold.monitor_store import (
+    open_monitor_catalog,
+    read_monitor_summaries,
 )
 from breezy.strategy.current_rung_hold.offer_tape import OfferTape
 from tests.unit.test_continuous_rung_hold_strategy import (
@@ -76,6 +84,28 @@ _TARGET_FILE = (
 _EXPECTED_IMPORTER = "scripts/analysis/current_rung_hold_paper_replay.py"
 _DRIVER_FILE = _REPO_ROOT / "scripts/analysis/current_rung_hold_paper_replay.py"
 _BASELINE_DYNAMIC_IMPORT_CALL_SITES = 0
+_SCRIPTS_ANALYSIS_DIR = _REPO_ROOT / "scripts" / "analysis"
+
+
+def _load_paper_replay_driver() -> ModuleType:
+    """INC-7: dynamically loads the driver module, mirroring
+    `test_current_rung_hold_paper_replay.py::_load_driver` exactly --
+    `scripts/` is unimportable as a package from `src/breezy`."""
+    if str(_SCRIPTS_ANALYSIS_DIR) not in sys.path:
+        sys.path.insert(0, str(_SCRIPTS_ANALYSIS_DIR))
+    path = _SCRIPTS_ANALYSIS_DIR / "current_rung_hold_paper_replay.py"
+    spec = importlib.util.spec_from_file_location("current_rung_hold_paper_replay", path)
+    assert spec is not None
+    assert spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+@pytest.fixture(scope="module")
+def paper_replay_driver() -> ModuleType:
+    return _load_paper_replay_driver()
 
 
 @pytest.fixture
@@ -653,3 +683,231 @@ def test_the_dynamic_import_call_site_count_is_unchanged() -> None:
         _dynamic_import_call_site_count(_DRIVER_FILE)
         == _BASELINE_DYNAMIC_IMPORT_CALL_SITES
     )
+
+
+# ---------------------------------------------------------------------------
+# INC-7: `install_position_monitor` runs the shadow monitor inside the v3
+# paper-replay harness, under a REAL BacktestEngine `TestClock` (plan §6
+# INC-7, Rev 2.1 addendum M3).
+# ---------------------------------------------------------------------------
+
+#: 32.0C -> 89.6F, round-half-up to 90F -- strictly above the fixture rung's
+#: `upper_f=87`, so two readings at this value confirm DEAD (>= 5 min apart).
+_DEAD_TEMP_C_TENTHS = 320
+_DEAD_CONFIRM_SPAN_MIN = 6  # >= monitor_decision._DEAD_MIN_CONFIRM_SPAN_NS (5 min)
+
+
+def _query_mark_rows(catalog: Any) -> list[PositionMarkRecord]:
+    """Unwraps `CustomData`, mirroring `quote_tape_gaps.py::_query_gap_rows`
+    -- a `ParquetDataCatalog.query(data_cls=...)` call for a hand-written
+    `Data` subclass returns `CustomData` wrappers, not the bare record."""
+    rows: list[PositionMarkRecord] = []
+    for item in catalog.query(data_cls=PositionMarkRecord):
+        if isinstance(item, PositionMarkRecord):
+            rows.append(item)
+        elif isinstance(item, CustomData) and isinstance(item.data, PositionMarkRecord):
+            rows.append(item.data)
+        else:  # pragma: no cover - defensive against Nautilus API drift
+            raise TypeError(
+                "expected PositionMarkRecord rows from Nautilus catalog query, "
+                f"got {type(item).__name__}"
+            )
+    return rows
+
+
+def _run_fill_then_monitor(
+    *,
+    store_path: Path,
+    interior_instrument: BinaryOption,
+    driver: ModuleType | None,
+    out_dir: Path | None,
+    extra_weather_observations: tuple[Any, ...] = (),
+) -> tuple[ContinuousRungHoldBacktestStrategy, tuple[Any, ...], int]:
+    """The exact fill geometry from
+    `test_a_fill_is_delivered_before_the_next_depth_frame_is_handled`
+    (pre-window depth, an in-window quote that triggers the fill, then a
+    post-window depth), optionally with `out_dir`'s `PositionMonitor`
+    installed via `driver.install_position_monitor` and extra post-fill
+    weather rows appended. Returns the stopped strategy, the filled trials,
+    and `final_ts` -- the latest `ts_event`/`observed_at_ns` fed to the
+    engine across every market and weather record, i.e. the true upper
+    bound no mark may look ahead of.
+    """
+    interior_instrument.info["fee_coefficient"] = "0.06"
+    depth_pre_ts = WINDOW_OPEN_NS - 1_000
+    quote_ts = WINDOW_OPEN_NS
+    depth_post_ts = WINDOW_OPEN_NS + 1
+    depth_pre = _depth(
+        INTERIOR_ID, bids=(("0.01", 10),), asks=(("0.40", 10),), ts_event=depth_pre_ts,
+    )
+    quote = _quote(INTERIOR_ID, ask="0.40", ts_event=quote_ts)
+    depth_post = _depth(
+        INTERIOR_ID, bids=(("0.01", 10),), asks=(("0.40", 10),), ts_event=depth_post_ts,
+    )
+    observation = _observation(
+        temp_c_tenths=300, observed_at_ns=WINDOW_OPEN_NS - 5 * NS_PER_MIN,
+    )
+    weather = (observation, *extra_weather_observations)
+    final_ts = max(
+        depth_pre_ts,
+        quote_ts,
+        depth_post_ts,
+        *(row.observed_at_ns for row in weather),
+        *(row.received_at_ns for row in weather),
+    )
+    config = build_paper_replay_config(
+        instruments=[interior_instrument],
+        market_data=[depth_pre, quote, depth_post],
+        weather_data=as_backtest_data(list(weather)),
+        starting_balances=(Money(10_000, USD),),
+        capture_window_ns=(depth_pre_ts, depth_post_ts),
+        instruments_without_close=frozenset({interior_instrument.id}),
+    )
+    strategy = ContinuousRungHoldBacktestStrategy(
+        CurrentRungHoldConfig(instrument_ids=(interior_instrument.id,)),
+        trial_day_latch_factory=_cont_latch_factory(store_path),
+        position_evidence_reader=lambda: _PERMISSIVE_EVIDENCE,
+    )
+    if out_dir is not None:
+        assert driver is not None
+        driver.install_position_monitor(
+            strategy, out_dir=out_dir, clock_ns=lambda: strategy.clock.timestamp_ns(),
+        )
+    with backtest(
+        config, strategies=(strategy,), allow_idle_strategies=True, allow_open_positions=True,
+    ) as engine:
+        ctx = ReplayEntryContext(
+            station=STATION,
+            climate_day=CLIMATE_DAY.isoformat(),
+            bucket=None,
+            entry_ask=Decimal("0.40"),
+            scheduled_release_at_ns=WINDOW_OPEN_NS + 7 * 24 * 3_600_000_000_000,
+        )
+        trials = filled_trials_from_engine(engine, {str(interior_instrument.id): ctx})
+    assert len(trials) == 1
+    return strategy, trials, final_ts
+
+
+def test_a_fill_with_the_monitor_installed_emits_a_queryable_mark_and_summary(
+    store_path: Path, interior_instrument: BinaryOption, tmp_path: Path,
+    paper_replay_driver: ModuleType,
+) -> None:
+    out_dir = tmp_path / "monitor_out"
+    _strategy, _trials, final_ts = _run_fill_then_monitor(
+        store_path=store_path,
+        interior_instrument=interior_instrument,
+        driver=paper_replay_driver,
+        out_dir=out_dir,
+    )
+
+    catalog = open_monitor_catalog(out_dir / "monitor", CLIMATE_DAY.isoformat())
+    marks = _query_mark_rows(catalog)
+    assert len(marks) >= 1
+
+    summaries = read_monitor_summaries(out_dir / "monitor_summaries")
+    assert len(summaries) >= 1
+
+    ts_inits = [mark.ts_init for mark in marks]
+    assert ts_inits == sorted(ts_inits), f"ts_init not non-decreasing: {ts_inits!r}"
+    assert all(mark.ts_event <= final_ts for mark in marks), (
+        f"a mark's ts_event exceeds final_ts={final_ts}: "
+        f"{[mark.ts_event for mark in marks]!r}"
+    )
+
+
+def test_the_monitor_installed_or_not_yields_identical_fills_and_latch_state(
+    tmp_path: Path, paper_replay_driver: ModuleType,
+) -> None:
+    """D3 (plan §2): installing the shadow monitor must never change what
+    the strategy actually does -- same fill, same latch state, whether or
+    not `out_dir` is passed."""
+    with_monitor_instrument = _instrument(INTERIOR_ID, lower_f=86, upper_f=87)
+    without_monitor_instrument = _instrument(INTERIOR_ID, lower_f=86, upper_f=87)
+    with_store = tmp_path / "with_monitor" / "state.db"
+    without_store = tmp_path / "without_monitor" / "state.db"
+
+    _with_strategy, with_trials, _ = _run_fill_then_monitor(
+        store_path=with_store,
+        interior_instrument=with_monitor_instrument,
+        driver=paper_replay_driver,
+        out_dir=tmp_path / "monitor_out",
+    )
+    _without_strategy, without_trials, _ = _run_fill_then_monitor(
+        store_path=without_store,
+        interior_instrument=without_monitor_instrument,
+        driver=None,
+        out_dir=None,
+    )
+
+    assert len(with_trials) == len(without_trials) == 1
+    assert with_trials[0].entry_ask == without_trials[0].entry_ask
+    assert with_trials[0].fill_px == without_trials[0].fill_px
+
+    with _cont_latch_factory(with_store)() as with_latch:
+        with_state = with_latch.attempt_state(
+            STATION, CLIMATE_DAY.isoformat(), key_instrument_id=str(INTERIOR_ID),
+        )
+        with_consumed = with_latch.is_consumed(
+            STATION, CLIMATE_DAY.isoformat(), key_instrument_id=str(INTERIOR_ID),
+        )
+    with _cont_latch_factory(without_store)() as without_latch:
+        without_state = without_latch.attempt_state(
+            STATION, CLIMATE_DAY.isoformat(), key_instrument_id=str(INTERIOR_ID),
+        )
+        without_consumed = without_latch.is_consumed(
+            STATION, CLIMATE_DAY.isoformat(), key_instrument_id=str(INTERIOR_ID),
+        )
+    assert with_state == without_state
+    assert with_consumed == without_consumed is True
+
+
+def test_a_dead_scenario_in_replay_yields_an_exit_or_missing_stop_mark(
+    store_path: Path, interior_instrument: BinaryOption, tmp_path: Path,
+    paper_replay_driver: ModuleType,
+) -> None:
+    """Two post-fill observations pushing the running max past `rung_high`
+    (87), spaced >= the 5-minute DEAD confirmation guard, must confirm
+    `DEAD_BY_OBSERVATION` and emit a verdict of `EXIT_RECOMMENDED` or
+    `MISSING_STOP` -- never silently absorbed as `HOLD` (L-38)."""
+    out_dir = tmp_path / "monitor_out"
+    first_dead = _observation(
+        temp_c_tenths=_DEAD_TEMP_C_TENTHS, observed_at_ns=WINDOW_OPEN_NS + 2 * NS_PER_MIN,
+    )
+    second_dead = _observation(
+        temp_c_tenths=_DEAD_TEMP_C_TENTHS,
+        observed_at_ns=WINDOW_OPEN_NS + (2 + _DEAD_CONFIRM_SPAN_MIN) * NS_PER_MIN,
+    )
+    _strategy, _trials, _final_ts = _run_fill_then_monitor(
+        store_path=store_path,
+        interior_instrument=interior_instrument,
+        driver=paper_replay_driver,
+        out_dir=out_dir,
+        extra_weather_observations=(first_dead, second_dead),
+    )
+
+    catalog = open_monitor_catalog(out_dir / "monitor", CLIMATE_DAY.isoformat())
+    marks = _query_mark_rows(catalog)
+    dead_marks = [mark for mark in marks if mark.thesis_state == "DEAD_BY_OBSERVATION"]
+    assert dead_marks, f"no DEAD_BY_OBSERVATION mark among {[m.thesis_state for m in marks]!r}"
+    assert all(mark.verdict in ("EXIT_RECOMMENDED", "MISSING_STOP") for mark in dead_marks)
+
+
+def test_a_stable_scenario_in_replay_yields_only_hold_marks(
+    store_path: Path, interior_instrument: BinaryOption, tmp_path: Path,
+    paper_replay_driver: ModuleType,
+) -> None:
+    """No post-fill temperature ever leaves the rung -- every emitted mark
+    must stay `ALIVE`/`HOLD`, never a THREATENED/DEAD reason code."""
+    out_dir = tmp_path / "monitor_out"
+    _strategy, _trials, _final_ts = _run_fill_then_monitor(
+        store_path=store_path,
+        interior_instrument=interior_instrument,
+        driver=paper_replay_driver,
+        out_dir=out_dir,
+    )
+
+    catalog = open_monitor_catalog(out_dir / "monitor", CLIMATE_DAY.isoformat())
+    marks = _query_mark_rows(catalog)
+    assert len(marks) >= 1
+    assert all(mark.thesis_state == "ALIVE" for mark in marks)
+    assert all(mark.verdict == "HOLD" for mark in marks)
