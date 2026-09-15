@@ -27,6 +27,15 @@ their family is actually registered: a manifest committed as scaffolding
 64 zeros, and `load_family_manifest` refuses both unless the caller
 explicitly opts in with `allow_draft=True` -- a caller who forgets the flag
 gets a loud refusal, never a silently-accepted stub feeding a real tally.
+
+`exit_rule` (optional, added for the intra-day position monitor, INC-1) is
+an OPTIONAL widening of the exact-set key barrier: a manifest may declare
+it, but declaring it does not itself grant exit capability -- that
+requires the separate `persistence/exit_gate.py` allowlist to also name
+the family (see that module's docstring for why the split is unforgeable).
+A present `exit_rule` must be a non-empty string; an absent one loads as
+`None`. Every other key in `_REQUIRED_KEYS` stays mandatory and the
+exact-set refusal for a genuinely unknown key is unchanged (L-12).
 """
 
 from __future__ import annotations
@@ -71,6 +80,7 @@ _STRING_FIELDS: Final[tuple[str, ...]] = (
     "boundary_inputs_sha256",
     "status",
 )
+_OPTIONAL_KEYS: Final[frozenset[str]] = frozenset({"exit_rule"})
 _STATUSES: Final[frozenset[str]] = frozenset({"DRAFT_NOT_REGISTERED", "REGISTERED"})
 _SHA256_RE: Final[re.Pattern[str]] = re.compile(r"^[0-9a-f]{64}$")
 _UNPINNED_SHA256: Final[str] = "0" * 64
@@ -110,12 +120,14 @@ class FamilyManifest:
     stations: tuple[str, ...]
     status: ManifestStatus
     manifest_sha256: str
+    exit_rule: str | None = None
 
 
 def load_family_manifest(path: Path, *, allow_draft: bool = False) -> FamilyManifest:
     """Load and strictly validate one family manifest JSON file.
 
-    Every field in `FamilyManifest` is required; any key not in that set is
+    Every key in `_REQUIRED_KEYS` is required; `exit_rule` is the sole
+    optional key (`_OPTIONAL_KEYS`); any key outside that combined set is
     refused. `status="DRAFT_NOT_REGISTERED"` and an unpinned (all-zero)
     `boundary_inputs_sha256` are each refused unless `allow_draft=True`.
     """
@@ -134,7 +146,7 @@ def load_family_manifest(path: Path, *, allow_draft: bool = False) -> FamilyMani
         raise FamilyManifestValidationError(
             f"{path}: missing required key(s): {sorted(missing)}"
         )
-    unknown = keys - _REQUIRED_KEYS
+    unknown = keys - _REQUIRED_KEYS - _OPTIONAL_KEYS
     if unknown:
         raise FamilyManifestValidationError(f"{path}: unknown key(s): {sorted(unknown)}")
 
@@ -181,6 +193,12 @@ def load_family_manifest(path: Path, *, allow_draft: bool = False) -> FamilyMani
             f"{path}: stations must be a non-empty list of strings"
         )
 
+    exit_rule = payload.get("exit_rule")
+    if exit_rule is not None and (not isinstance(exit_rule, str) or not exit_rule):
+        raise FamilyManifestValidationError(
+            f"{path}: exit_rule must be a non-empty string when present"
+        )
+
     return FamilyManifest(
         family_id=payload["family_id"],
         venue=payload["venue"],
@@ -191,4 +209,5 @@ def load_family_manifest(path: Path, *, allow_draft: bool = False) -> FamilyMani
         stations=tuple(stations_raw),
         status=status,
         manifest_sha256=manifest_sha256,
+        exit_rule=exit_rule,
     )
