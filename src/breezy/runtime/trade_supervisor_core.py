@@ -47,6 +47,16 @@ SELF_CHECK_WINDOW_END_UTC: Final[dt.time] = dt.time(17, 10)
 MAX_RELAUNCH_ATTEMPTS: Final[int] = 2
 MIN_RELAUNCH_GAP: Final[dt.timedelta] = dt.timedelta(minutes=3)
 
+#: [2026-09-15] Mid-day relaunch budget -- independent of the boot-time
+#: MAX_RELAUNCH_ATTEMPTS/MIN_RELAUNCH_GAP above, and with no readiness gate
+#: at all (plan §3 "Relaunch bookkeeping..."/§4 step 5).
+MIDDAY_MAX_RELAUNCH_ATTEMPTS: Final[int] = 3
+MIDDAY_MIN_RELAUNCH_GAP: Final[dt.timedelta] = dt.timedelta(minutes=5)
+#: Bounded post-relaunch readiness re-check, anchored at
+#: ``last_midday_relaunch_attempt_at`` -- observability only (§3), never a
+#: forced extra relaunch attempt.
+MIDDAY_READINESS_RECHECK_TIMEOUT: Final[dt.timedelta] = dt.timedelta(minutes=2)
+
 #: The console entry's required first positional argv token -- distinct from
 #: the node's own argv so ``pgrep -f`` can anchor on either without
 #: substring-matching the other [R8].
@@ -71,6 +81,14 @@ PERMIT_ISSUED_MARKER: Final[str] = "live-trading permit issued issued_at_ns="
 PERMIT_NOT_ISSUED_MARKER: Final[str] = "order submission permit not issued"
 TRADING_NODE_FAILED_MARKER: Final[str] = "trading node failed"
 STRATEGY_SUBSCRIBED_MARKER: Final[str] = "CurrentRungHoldStrategy subscribed"
+
+#: [2026-09-15 mid-day relaunch] A fatal-fault shutdown exits the process
+#: cleanly (``EXIT_RUNTIME_ERROR`` via a normal ``return``, not an
+#: uncaught exception) so it never reaches ``TRADING_NODE_FAILED_MARKER``'s
+#: own emitter. Substrings of the two ``print()`` calls in
+#: ``runtime/trade_cli.py`` -- pinned the same way, against the real source.
+FATAL_MARKET_DATA_FAULT_MARKER: Final[str] = "FATAL market-data fault"
+FATAL_EXEC_CLIENT_FAULT_MARKER: Final[str] = "FATAL execution-client fault"
 
 #: [2026-09-12] Pinned the same way, against
 #: ``strategy/current_rung_hold/continuous_strategy.py``'s own class name --
@@ -130,6 +148,13 @@ class AlertDetail(str, Enum):
     )
     SELF_CHECK_FAIL_CONTINUOUS_FAMILY_HALTED = "self_check_fail_continuous_family_halted"
     PHASE_EXCEPTION_CONTAINED = "phase_exception_contained"
+    #: [2026-09-15] Mid-day watch (§3/§4 step 5-6) -- fires exactly once
+    #: (gated by ``DaySchedulerState.midday_alert_sent``) once the mid-day
+    #: relaunch budget is exhausted, and once (observability only, never
+    #: consuming an extra attempt) when a mid-day-relaunched child fails
+    #: the bounded post-relaunch readiness re-check.
+    MIDDAY_RELAUNCH_EXHAUSTED = "midday_relaunch_exhausted"
+    MIDDAY_RELAUNCHED_CHILD_NOT_READY = "midday_relaunched_child_not_ready"
 
 
 class StopPriorAction(str, Enum):
@@ -352,10 +377,15 @@ def readiness_observed(
 def classify_exit1_cause(log_text: str) -> RelaunchCause:
     """[E4] The two exit-1 causes are distinguished by log TEXT, not exit
     code. The deterministic marker is checked first: a build that logs both
-    (should never happen) must never be treated as transient."""
+    (should never happen) must never be treated as transient. [2026-09-15]
+    Purely additive: either fatal-fault marker (a clean shutdown, not an
+    uncaught exception) also classifies TRANSIENT, checked last so neither
+    existing branch's precedence changes."""
     if PERMIT_NOT_ISSUED_MARKER in log_text:
         return RelaunchCause.DETERMINISTIC
     if TRADING_NODE_FAILED_MARKER in log_text:
+        return RelaunchCause.TRANSIENT
+    if FATAL_MARKET_DATA_FAULT_MARKER in log_text or FATAL_EXEC_CLIENT_FAULT_MARKER in log_text:
         return RelaunchCause.TRANSIENT
     return RelaunchCause.UNKNOWN
 
@@ -493,6 +523,10 @@ class Phase(str, Enum):
     LAUNCH = "launch"
     RELAUNCH_CHECK = "relaunch_check"
     SELF_CHECK = "self_check"
+    #: [2026-09-15] Mid-day watch: catches a dead-feed/exec-client shutdown
+    #: any time after SELF_CHECK's own window closes, so the node is never
+    #: left unsupervised for the rest of the trading day.
+    MIDDAY_WATCH = "midday_watch"
 
 
 @dataclass(frozen=True, slots=True)
@@ -536,6 +570,34 @@ class DaySchedulerState:
     #: stored expiry is still enforced at self-check. First-seen-wins
     #: applies per child.
     permit_issued_seen_expires_at_ns: int | None = None
+    #: [2026-09-15] Mid-day relaunch budget bookkeeping -- independent of
+    #: ``relaunch_attempts``/``last_relaunch_attempt_at`` above (see
+    #: :data:`MIDDAY_MAX_RELAUNCH_ATTEMPTS`/:data:`MIDDAY_MIN_RELAUNCH_GAP`).
+    midday_relaunch_attempts: int = 0
+    last_midday_relaunch_attempt_at: dt.datetime | None = None
+    #: Sticky latch for the first non-``UNKNOWN`` mid-day
+    #: :func:`classify_exit1_cause` result -- same drain-race guard as
+    #: ``strategy_subscribed_seen``/``permit_issued_seen_expires_at_ns``
+    #: (plan §3). Reset by :func:`record_child_adopted` for a new child.
+    midday_cause_seen: RelaunchCause | None = None
+    #: Gates ``AlertDetail.MIDDAY_RELAUNCH_EXHAUSTED`` to exactly once per
+    #: trading day.
+    midday_alert_sent: bool = False
+    #: [2026-09-15] Gates ``AlertDetail.MIDDAY_RELAUNCHED_CHILD_NOT_READY``
+    #: to exactly once per mid-day-relaunched child -- observability only,
+    #: never a forced extra relaunch attempt (plan §3 "Relaunch
+    #: bookkeeping..."). Reset by :func:`record_child_adopted` for a new
+    #: child, same as ``midday_cause_seen``.
+    midday_not_ready_alert_sent: bool = False
+    #: [2026-09-15 F1] Gates the post-relaunch readiness recheck (and its
+    #: ``resolve_intent_lock_holder`` flock probe) to running only until a
+    #: verdict is reached for the current mid-day-relaunched child --
+    #: either readiness was observed (success) or
+    #: ``midday_not_ready_alert_sent`` fired (timeout). Without this,
+    #: nothing latches the SUCCESS path and the probe runs on every poll
+    #: for the rest of the day. Reset by :func:`record_child_adopted` for
+    #: a new child, same as ``midday_not_ready_alert_sent``.
+    midday_readiness_recheck_done: bool = False
 
 
 def initial_scheduler_state(day: dt.date) -> DaySchedulerState:
@@ -549,8 +611,27 @@ def _for_day(state: DaySchedulerState, day: dt.date) -> DaySchedulerState:
     return state if state.day == day else initial_scheduler_state(day)
 
 
+def _trading_day(now_utc: dt.datetime) -> dt.date:
+    """[2026-09-15] The trading day a UTC instant belongs to -- the daily
+    cycle opens at :data:`STOP_PRIOR_UTC` (16:40Z), so the 00:00-16:40Z
+    dead zone still belongs to the trading day that opened YESTERDAY's
+    16:40Z, not the new UTC calendar date. Every ``_for_day`` rollover
+    anchor in this module (and :func:`initial_scheduler_state`'s own seed
+    at the I/O shell's boot) uses this, never a bare ``now_utc.date()``."""
+    if now_utc.time() >= STOP_PRIOR_UTC:
+        return now_utc.date()
+    return now_utc.date() - dt.timedelta(days=1)
+
+
 def _at(day: dt.date, time_: dt.time) -> dt.datetime:
     return dt.datetime.combine(day, time_, tzinfo=dt.UTC)
+
+
+def midday_watch_window_end(trading_day: dt.date) -> dt.datetime:
+    """[2026-09-15] MIDDAY_WATCH's window closes at 01:00Z on the calendar
+    day AFTER ``trading_day`` -- crosses UTC midnight, so callers must
+    compare a full ``datetime``, never a bare ``.time()``."""
+    return _at(trading_day + dt.timedelta(days=1), dt.time(1, 0))
 
 
 def next_due(now_utc: dt.datetime, state: DaySchedulerState) -> tuple[Phase, dt.datetime]:
@@ -565,7 +646,7 @@ def next_due(now_utc: dt.datetime, state: DaySchedulerState) -> tuple[Phase, dt.
     phase, or tomorrow's STOP_PRIOR once every phase for today is done).
     """
     today = now_utc.date()
-    effective = _for_day(state, today)
+    effective = _for_day(state, _trading_day(now_utc))
     t = now_utc.time()
 
     if not effective.stop_prior_done and STOP_PRIOR_UTC <= t < LAUNCH_UTC:
@@ -584,13 +665,27 @@ def next_due(now_utc: dt.datetime, state: DaySchedulerState) -> tuple[Phase, dt.
     if not effective.self_check_done and SELF_CHECK_UTC <= t < SELF_CHECK_WINDOW_END_UTC:
         return Phase.SELF_CHECK, _at(today, SELF_CHECK_UTC)
 
+    watch_open_at = _at(effective.day, SELF_CHECK_WINDOW_END_UTC)
+    watch_close_at = midday_watch_window_end(effective.day)
+    if (
+        effective.launch_done
+        and effective.readiness_observed
+        and watch_open_at <= now_utc < watch_close_at
+    ):
+        return Phase.MIDDAY_WATCH, watch_open_at
+
     return Phase.NONE, _next_scheduled_event(today, effective, t)
 
 
 def _next_scheduled_event(today: dt.date, effective: DaySchedulerState, t: dt.time) -> dt.datetime:
     """Informational only (never consulted for a DUE-NOW decision, which is
     entirely governed by the branches above): the next phase time a caller
-    might want to log or sleep towards."""
+    might want to log or sleep towards. [2026-09-15] ``effective`` may
+    belong to a still-open trading day even after the UTC calendar date
+    has rolled -- checked first so this never overshoots to ``today + 2``
+    days when every phase for the still-open trading day is done."""
+    if effective.day != today:
+        return _at(today, STOP_PRIOR_UTC)
     if not effective.stop_prior_done and t < STOP_PRIOR_UTC:
         return _at(today, STOP_PRIOR_UTC)
     if not effective.launch_done and t < LAUNCH_UTC:
@@ -606,7 +701,7 @@ def mark_phase_fired(
     """Record that ``phase`` fired for today. ``RELAUNCH_CHECK`` and
     ``NONE`` never set a "done" flag -- the relaunch window stays open
     until readiness is observed or the window itself closes."""
-    effective = _for_day(state, now_utc.date())
+    effective = _for_day(state, _trading_day(now_utc))
     if phase is Phase.STOP_PRIOR:
         return replace(effective, stop_prior_done=True)
     if phase is Phase.LAUNCH:
@@ -621,12 +716,24 @@ def record_child_adopted(state: DaySchedulerState, now_utc: dt.datetime) -> DayS
     bookkeeping. Called when the I/O shell ADOPTS an already-live node
     (``tracked_pid`` swapped to a different process) so that node's own
     log is the only remaining evidence. :func:`record_relaunch_attempt`
-    reuses this primitive when a new child is launched."""
-    effective = _for_day(state, now_utc.date())
+    and :func:`record_midday_relaunch_attempt` both reuse this primitive
+    when a new child is launched. [2026-09-15] Also clears
+    ``midday_cause_seen`` -- a mid-day-relaunched child's own exit-1 cause
+    is evidence about THAT child, never inherited from its predecessor --
+    and ``midday_not_ready_alert_sent``, so a LATER mid-day relaunch (a
+    fresh child) gets its own bounded readiness re-check rather than
+    inheriting a prior child's already-fired alert latch. [2026-09-15 F1]
+    Also clears ``midday_readiness_recheck_done`` -- the new child gets
+    its own recheck window rather than inheriting a prior child's
+    already-latched verdict."""
+    effective = _for_day(state, _trading_day(now_utc))
     return replace(
         effective,
         strategy_subscribed_seen=False,
         permit_issued_seen_expires_at_ns=None,
+        midday_cause_seen=None,
+        midday_not_ready_alert_sent=False,
+        midday_readiness_recheck_done=False,
     )
 
 
@@ -644,7 +751,7 @@ def record_relaunch_attempt(state: DaySchedulerState, now_utc: dt.datetime) -> D
 
 
 def record_readiness_observed(state: DaySchedulerState, now_utc: dt.datetime) -> DaySchedulerState:
-    effective = _for_day(state, now_utc.date())
+    effective = _for_day(state, _trading_day(now_utc))
     return replace(effective, readiness_observed=True)
 
 
@@ -657,7 +764,7 @@ def record_strategy_subscribed_seen(
     reader whose delta no longer contains that text. Idempotent: a caller
     that has already latched today's marker gets the same state back
     unchanged."""
-    effective = _for_day(state, now_utc.date())
+    effective = _for_day(state, _trading_day(now_utc))
     if effective.strategy_subscribed_seen:
         return effective
     return replace(effective, strategy_subscribed_seen=True)
@@ -672,7 +779,101 @@ def record_permit_issued_seen(
     the same shared, offset-draining reader whose delta no longer contains
     that text. Idempotent: a caller that has already latched today's expiry
     gets the same state back unchanged (the first-seen expiry wins)."""
-    effective = _for_day(state, now_utc.date())
+    effective = _for_day(state, _trading_day(now_utc))
     if effective.permit_issued_seen_expires_at_ns is not None:
         return effective
     return replace(effective, permit_issued_seen_expires_at_ns=expires_at_ns)
+
+
+def record_midday_cause_seen(
+    state: DaySchedulerState, now_utc: dt.datetime, cause: RelaunchCause
+) -> DaySchedulerState:
+    """[2026-09-15] Latch the first :func:`classify_exit1_cause` result a
+    MIDDAY_WATCH poll observes for the current child -- same drain-race
+    guard, and same first-seen-wins idempotency, as
+    :func:`record_permit_issued_seen` (plan §3): the fatal-fault marker's
+    line may print well before the process is actually observed dead, and
+    a later poll's log delta may no longer contain it."""
+    effective = _for_day(state, _trading_day(now_utc))
+    if effective.midday_cause_seen is not None:
+        return effective
+    return replace(effective, midday_cause_seen=cause)
+
+
+def record_midday_relaunch_attempt(
+    state: DaySchedulerState, now_utc: dt.datetime
+) -> DaySchedulerState:
+    """[2026-09-15] Mid-day sibling of :func:`record_relaunch_attempt`:
+    clears the per-child evidence latches (via :func:`record_child_adopted`,
+    which now also clears ``midday_cause_seen``) for the new child, then
+    bumps the INDEPENDENT mid-day attempt/last-attempt bookkeeping --
+    ``relaunch_attempts`` (the boot-time budget) is left untouched."""
+    effective = record_child_adopted(state, now_utc)
+    return replace(
+        effective,
+        midday_relaunch_attempts=effective.midday_relaunch_attempts + 1,
+        last_midday_relaunch_attempt_at=now_utc,
+    )
+
+
+def record_midday_alert_sent(state: DaySchedulerState, now_utc: dt.datetime) -> DaySchedulerState:
+    """[2026-09-15] Latch that ``AlertDetail.MIDDAY_RELAUNCH_EXHAUSTED`` has
+    already fired today -- gates it to exactly once. Idempotent."""
+    effective = _for_day(state, _trading_day(now_utc))
+    if effective.midday_alert_sent:
+        return effective
+    return replace(effective, midday_alert_sent=True)
+
+
+def record_midday_not_ready_alert_sent(
+    state: DaySchedulerState, now_utc: dt.datetime
+) -> DaySchedulerState:
+    """[2026-09-15] Latch that ``AlertDetail.MIDDAY_RELAUNCHED_CHILD_NOT_READY``
+    has already fired for the current mid-day-relaunched child -- gates it
+    to exactly once per relaunch (cleared by :func:`record_child_adopted`
+    for the NEXT relaunched child). Idempotent."""
+    effective = _for_day(state, _trading_day(now_utc))
+    if effective.midday_not_ready_alert_sent:
+        return effective
+    return replace(effective, midday_not_ready_alert_sent=True)
+
+
+def record_midday_readiness_recheck_done(
+    state: DaySchedulerState, now_utc: dt.datetime
+) -> DaySchedulerState:
+    """[2026-09-15 F1] Latch that the post-relaunch readiness recheck (and
+    its flock probe) has reached a verdict -- either readiness was
+    observed, or the not-ready alert fired -- for the current mid-day-
+    relaunched child. Gates the recheck to running only until a verdict
+    exists; cleared by :func:`record_child_adopted` for the NEXT
+    relaunched child. Idempotent."""
+    effective = _for_day(state, _trading_day(now_utc))
+    if effective.midday_readiness_recheck_done:
+        return effective
+    return replace(effective, midday_readiness_recheck_done=True)
+
+
+def decide_midday_relaunch(
+    *,
+    now: dt.datetime,
+    window_end: dt.datetime,
+    attempts_so_far: int,
+    last_attempt_at: dt.datetime | None,
+    cause: RelaunchCause,
+) -> RelaunchDecision:
+    """[2026-09-15] Mid-day sibling of :func:`decide_relaunch` [E4] -- <=3
+    attempts, >=5 min apart, never at/after ``window_end`` (a full
+    ``datetime``, since the mid-day watch window crosses UTC midnight).
+
+    Deliberately has NO readiness gate: unlike the boot-time budget, a
+    node that achieved readiness and then died mid-day is exactly the
+    scenario this budget exists for (plan §2 item 2, §3)."""
+    if now >= window_end:
+        return RelaunchDecision(False, "at or past the mid-day watch window close")
+    if cause is not RelaunchCause.TRANSIENT:
+        return RelaunchDecision(False, "exit cause is not transient")
+    if attempts_so_far >= MIDDAY_MAX_RELAUNCH_ATTEMPTS:
+        return RelaunchDecision(False, "attempt budget exhausted")
+    if last_attempt_at is not None and (now - last_attempt_at) < MIDDAY_MIN_RELAUNCH_GAP:
+        return RelaunchDecision(False, "minimum inter-attempt gap not elapsed")
+    return RelaunchDecision(True, "transient failure, within budget and window")

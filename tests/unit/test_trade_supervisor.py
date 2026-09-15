@@ -18,8 +18,10 @@ import datetime as dt
 import fcntl
 import logging
 import os
+import signal
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 import pytest
@@ -36,6 +38,7 @@ from breezy.runtime.trade_supervisor import (
     StopPriorRaceRefused,
     SupervisorPorts,
     _do_launch,
+    _do_midday_watch,
     _do_relaunch_check,
     _do_self_check,
     _do_stop_prior,
@@ -52,6 +55,7 @@ from breezy.runtime.trade_supervisor import (
     main,
     node_log_path,
     probe_open_intent,
+    process_is_alive,
     resolve_lock_holder_pid,
     spawn_node,
     supervisor_lock_path,
@@ -61,6 +65,9 @@ from breezy.runtime.trade_supervisor import (
 )
 from breezy.runtime.trade_supervisor_core import (
     MAX_RELAUNCH_ATTEMPTS,
+    MIDDAY_MAX_RELAUNCH_ATTEMPTS,
+    MIDDAY_MIN_RELAUNCH_GAP,
+    MIDDAY_READINESS_RECHECK_TIMEOUT,
     MIN_RELAUNCH_GAP,
     RELAUNCH_CUTOFF_UTC,
     SUPERVISOR_ARGV_TOKEN,
@@ -75,14 +82,17 @@ from breezy.runtime.trade_supervisor_core import (
     assert_no_live_node_before_intent_probe,
     classify_exit1_cause,
     decide_launch_action,
+    decide_midday_relaunch,
     decide_relaunch,
     decide_stop_prior_action,
     disambiguate_exit_config_error,
     initial_scheduler_state,
     mark_phase_fired,
+    midday_watch_window_end,
     next_due,
     parse_permit_expiry_ns,
     readiness_observed,
+    record_midday_cause_seen,
     record_permit_issued_seen,
     record_readiness_observed,
     record_relaunch_attempt,
@@ -192,6 +202,20 @@ def test_strategy_subscribed_marker_is_a_substring_of_the_real_emitter():
 
     source = (REPO_ROOT / "src/breezy/strategy/current_rung_hold/strategy.py").read_text()
     assert STRATEGY_SUBSCRIBED_MARKER in source
+
+
+def test_fatal_market_data_fault_marker_is_a_substring_of_the_real_emitter():
+    from breezy.runtime.trade_supervisor_core import FATAL_MARKET_DATA_FAULT_MARKER
+
+    source = (REPO_ROOT / "src/breezy/runtime/trade_cli.py").read_text()
+    assert FATAL_MARKET_DATA_FAULT_MARKER in source
+
+
+def test_fatal_exec_client_fault_marker_is_a_substring_of_the_real_emitter():
+    from breezy.runtime.trade_supervisor_core import FATAL_EXEC_CLIENT_FAULT_MARKER
+
+    source = (REPO_ROOT / "src/breezy/runtime/trade_cli.py").read_text()
+    assert FATAL_EXEC_CLIENT_FAULT_MARKER in source
 
 
 def test_module_source_never_consults_tradingnode_running_string():
@@ -412,6 +436,24 @@ class TestClassifyExit1Cause:
         log = "order submission permit not issued: X\ntrading node failed: Y\n"
         assert classify_exit1_cause(log) is RelaunchCause.DETERMINISTIC
 
+    def test_classify_exit1_cause_market_data_fault_is_transient(self):
+        log = "breezy-trade: FATAL market-data fault in Foo: bar. The trading process shut down.\n"
+        assert classify_exit1_cause(log) is RelaunchCause.TRANSIENT
+
+    def test_classify_exit1_cause_exec_client_fault_is_transient(self):
+        log = (
+            "breezy-trade: FATAL execution-client fault in Foo: bar. "
+            "The trading process shut down.\n"
+        )
+        assert classify_exit1_cause(log) is RelaunchCause.TRANSIENT
+
+    def test_classify_exit1_cause_still_prefers_deterministic_marker(self):
+        log = (
+            "order submission permit not issued: X\n"
+            "breezy-trade: FATAL market-data fault in Foo: bar. The trading process shut down.\n"
+        )
+        assert classify_exit1_cause(log) is RelaunchCause.DETERMINISTIC
+
 
 class TestDisambiguateExitConfigError:
     def test_lock_held_is_duplicate_node(self):
@@ -523,6 +565,132 @@ class TestDecideRelaunch:
             cause=RelaunchCause.TRANSIENT,
         )
         assert decision.should_relaunch is True
+
+
+# ---------------------------------------------------------------------------
+# [2026-09-15] Mid-day relaunch budget -- decide_midday_relaunch's sibling
+# suite: same shape as TestDecideRelaunch minus every readiness case (no
+# readiness gate at all -- a ready node crashing mid-day is exactly the
+# scenario this budget exists for, plan §2 item 2 / §3).
+# ---------------------------------------------------------------------------
+
+_MIDDAY_WINDOW_END = midday_watch_window_end(_BASE_DAY.date())
+
+
+class TestDecideMiddayRelaunch:
+    def test_midday_eligible_transient_within_budget_and_window(self):
+        decision = decide_midday_relaunch(
+            now=_BASE_DAY.replace(hour=20, minute=0),
+            window_end=_MIDDAY_WINDOW_END,
+            attempts_so_far=0,
+            last_attempt_at=None,
+            cause=RelaunchCause.TRANSIENT,
+        )
+        assert decision.should_relaunch is True
+
+    def test_midday_never_relaunches_a_deterministic_failure(self):
+        decision = decide_midday_relaunch(
+            now=_BASE_DAY.replace(hour=20, minute=0),
+            window_end=_MIDDAY_WINDOW_END,
+            attempts_so_far=0,
+            last_attempt_at=None,
+            cause=RelaunchCause.DETERMINISTIC,
+        )
+        assert decision.should_relaunch is False
+
+    def test_midday_never_relaunches_an_unknown_cause(self):
+        decision = decide_midday_relaunch(
+            now=_BASE_DAY.replace(hour=20, minute=0),
+            window_end=_MIDDAY_WINDOW_END,
+            attempts_so_far=0,
+            last_attempt_at=None,
+            cause=RelaunchCause.UNKNOWN,
+        )
+        assert decision.should_relaunch is False
+
+    def test_midday_attempt_budget_is_at_most_three(self):
+        decision = decide_midday_relaunch(
+            now=_BASE_DAY.replace(hour=20, minute=0),
+            window_end=_MIDDAY_WINDOW_END,
+            attempts_so_far=MIDDAY_MAX_RELAUNCH_ATTEMPTS,
+            last_attempt_at=_BASE_DAY.replace(hour=19, minute=50),
+            cause=RelaunchCause.TRANSIENT,
+        )
+        assert decision.should_relaunch is False
+
+    def test_midday_minimum_five_minute_gap_is_enforced(self):
+        too_soon = decide_midday_relaunch(
+            now=_BASE_DAY.replace(hour=20, minute=3),
+            window_end=_MIDDAY_WINDOW_END,
+            attempts_so_far=1,
+            last_attempt_at=_BASE_DAY.replace(hour=20, minute=0),
+            cause=RelaunchCause.TRANSIENT,
+        )
+        assert too_soon.should_relaunch is False
+
+        exactly_the_gap = decide_midday_relaunch(
+            now=_BASE_DAY.replace(hour=20, minute=0) + MIDDAY_MIN_RELAUNCH_GAP,
+            window_end=_MIDDAY_WINDOW_END,
+            attempts_so_far=1,
+            last_attempt_at=_BASE_DAY.replace(hour=20, minute=0),
+            cause=RelaunchCause.TRANSIENT,
+        )
+        assert exactly_the_gap.should_relaunch is True
+
+    def test_midday_never_relaunches_at_or_after_window_close(self):
+        at_close = decide_midday_relaunch(
+            now=_MIDDAY_WINDOW_END,
+            window_end=_MIDDAY_WINDOW_END,
+            attempts_so_far=0,
+            last_attempt_at=None,
+            cause=RelaunchCause.TRANSIENT,
+        )
+        assert at_close.should_relaunch is False
+
+        after_close = decide_midday_relaunch(
+            now=_MIDDAY_WINDOW_END + dt.timedelta(minutes=1),
+            window_end=_MIDDAY_WINDOW_END,
+            attempts_so_far=0,
+            last_attempt_at=None,
+            cause=RelaunchCause.TRANSIENT,
+        )
+        assert after_close.should_relaunch is False
+
+    def test_midday_readiness_already_observed_is_not_a_decline_reason(self):
+        # decide_midday_relaunch has no readiness parameter at all, unlike
+        # decide_relaunch -- assert the signature never grew one, then that
+        # an otherwise-eligible decision is never declined by readiness.
+        import inspect
+
+        assert "readiness_was_observed" not in inspect.signature(decide_midday_relaunch).parameters
+        decision = decide_midday_relaunch(
+            now=_BASE_DAY.replace(hour=20, minute=0),
+            window_end=_MIDDAY_WINDOW_END,
+            attempts_so_far=0,
+            last_attempt_at=None,
+            cause=RelaunchCause.TRANSIENT,
+        )
+        assert decision.should_relaunch is True
+
+    def test_a_fatal_marker_seen_two_polls_before_death_still_classifies_transient(self):
+        # Replays the exact 09-05/09-06 drain shape (§3, §7): the poll
+        # that first sees the fatal marker is not reliably the SAME poll
+        # that first sees the process dead -- the death-detection poll's
+        # OWN delta may no longer contain the marker text.
+        state = initial_scheduler_state(_BASE_DAY.date())
+        earlier_delta = (
+            "breezy-trade: FATAL market-data fault in Foo: bar. "
+            "The trading process shut down.\n"
+        )
+        state = record_midday_cause_seen(
+            state, _BASE_DAY.replace(hour=20, minute=0), classify_exit1_cause(earlier_delta)
+        )
+        later_delta_without_marker = "some unrelated later tail\n"
+        live_cause = classify_exit1_cause(later_delta_without_marker)
+        resolved_cause = (
+            state.midday_cause_seen if state.midday_cause_seen is not None else live_cause
+        )
+        assert resolved_cause is RelaunchCause.TRANSIENT
 
 
 # ---------------------------------------------------------------------------
@@ -948,15 +1116,20 @@ class TestNextDue:
         assert phase is Phase.NONE
         assert fire_at == _utc(16, 40)
 
-    def test_restart_at_2350_nothing_until_tomorrow_1640(self):
+    def test_restart_at_2350_is_midday_watch_not_nothing(self):
+        # [2026-09-15] Renamed/updated from "...nothing_until_tomorrow_1640":
+        # a ready, self-checked node going silent for the rest of the day
+        # was exactly the mid-day relaunch plan's root-cause gap (§2 item 1)
+        # -- 23:50 with readiness observed now correctly lands in
+        # MIDDAY_WATCH's window, never a bare Phase.NONE.
         state = initial_scheduler_state(_DAY)
         state = mark_phase_fired(state, Phase.STOP_PRIOR, _utc(16, 40))
         state = mark_phase_fired(state, Phase.LAUNCH, _utc(16, 50))
         state = record_readiness_observed(state, _utc(16, 52))
         state = mark_phase_fired(state, Phase.SELF_CHECK, _utc(17, 5))
         phase, fire_at = next_due(_utc(23, 50), state)
-        assert phase is Phase.NONE
-        assert fire_at == _utc(16, 40, day=_DAY + dt.timedelta(days=1))
+        assert phase is Phase.MIDDAY_WATCH
+        assert fire_at == _utc(17, 10)
 
     def test_self_check_due_in_its_window(self):
         state = mark_phase_fired(initial_scheduler_state(_DAY), Phase.LAUNCH, _utc(16, 50))
@@ -969,6 +1142,34 @@ class TestNextDue:
         state = mark_phase_fired(initial_scheduler_state(_DAY), Phase.SELF_CHECK, _utc(17, 5))
         phase, _ = next_due(_utc(17, 6), state)
         assert phase is not Phase.SELF_CHECK
+
+    def test_self_check_still_wins_at_1705_with_readiness_observed(self):
+        state = mark_phase_fired(initial_scheduler_state(_DAY), Phase.LAUNCH, _utc(16, 50))
+        state = record_readiness_observed(state, _utc(16, 52))
+        phase, _ = next_due(_utc(17, 5), state)
+        assert phase is Phase.SELF_CHECK
+
+    def test_midday_watch_due_after_1710_before_window_close(self):
+        state = mark_phase_fired(initial_scheduler_state(_DAY), Phase.LAUNCH, _utc(16, 50))
+        state = record_readiness_observed(state, _utc(16, 52))
+        state = mark_phase_fired(state, Phase.SELF_CHECK, _utc(17, 5))
+        phase, fire_at = next_due(_utc(18, 0), state)
+        assert phase is Phase.MIDDAY_WATCH
+        assert fire_at == _utc(17, 10)
+
+    def test_midday_watch_not_due_before_readiness(self):
+        state = mark_phase_fired(initial_scheduler_state(_DAY), Phase.LAUNCH, _utc(16, 50))
+        state = mark_phase_fired(state, Phase.SELF_CHECK, _utc(17, 5))
+        phase, _ = next_due(_utc(18, 0), state)
+        assert phase is not Phase.MIDDAY_WATCH
+
+    def test_midday_watch_not_due_after_window_close(self):
+        next_day = _DAY + dt.timedelta(days=1)
+        state = mark_phase_fired(initial_scheduler_state(_DAY), Phase.LAUNCH, _utc(16, 50))
+        state = record_readiness_observed(state, _utc(16, 52))
+        state = mark_phase_fired(state, Phase.SELF_CHECK, _utc(17, 5))
+        phase, _ = next_due(_utc(1, 0, day=next_day), state)
+        assert phase is not Phase.MIDDAY_WATCH
 
     def test_day_rollover_resets_all_done_flags(self):
         yesterday = _DAY - dt.timedelta(days=1)
@@ -993,6 +1194,44 @@ class TestNextDue:
         assert state.last_relaunch_attempt_at == _utc(16, 51)
         state = record_relaunch_attempt(state, _utc(16, 55))
         assert state.relaunch_attempts == 2
+
+    def test_state_survives_midnight_rollover_before_stop_prior_utc(self):
+        # [2026-09-15] The 00:00-16:40Z dead zone belongs to the trading
+        # day that opened at yesterday's 16:40Z STOP_PRIOR, not the new
+        # UTC calendar date -- a poll at 00:30Z the next calendar day must
+        # not reset today's already-latched bookkeeping.
+        next_day = _DAY + dt.timedelta(days=1)
+        state = mark_phase_fired(initial_scheduler_state(_DAY), Phase.SELF_CHECK, _utc(17, 5))
+        state = record_relaunch_attempt(state, _utc(16, 51))
+        assert state.relaunch_attempts == 1
+
+        state = record_readiness_observed(state, _utc(0, 30, day=next_day))
+        assert state.day == _DAY
+        assert state.self_check_done is True
+        assert state.relaunch_attempts == 1
+        assert state.readiness_observed is True
+
+    def test_state_still_rolls_over_at_stop_prior_utc(self):
+        next_day = _DAY + dt.timedelta(days=1)
+        state = mark_phase_fired(initial_scheduler_state(_DAY), Phase.SELF_CHECK, _utc(17, 5))
+        state = mark_phase_fired(state, Phase.STOP_PRIOR, _utc(16, 40, day=next_day))
+        assert state.day == next_day
+        assert state.self_check_done is False
+        assert state.stop_prior_done is True
+
+    def test_next_scheduled_event_after_utc_midnight_names_todays_stop_prior(self):
+        # readiness_observed deliberately left False -- keeps this case out
+        # of MIDDAY_WATCH's gate so it isolates _next_scheduled_event's own
+        # effective.day != today guard (a MIDDAY_WATCH-eligible variant of
+        # this same midnight crossing is covered separately).
+        next_day = _DAY + dt.timedelta(days=1)
+        state = mark_phase_fired(initial_scheduler_state(_DAY), Phase.STOP_PRIOR, _utc(16, 40))
+        state = mark_phase_fired(state, Phase.LAUNCH, _utc(16, 50))
+        state = mark_phase_fired(state, Phase.SELF_CHECK, _utc(17, 5))
+        phase, fire_at = next_due(_utc(0, 30, day=next_day), state)
+        assert phase is Phase.NONE
+        # today's (next_day's) own still-upcoming STOP_PRIOR -- never D+2.
+        assert fire_at == _utc(16, 40, day=next_day)
 
 
 def test_parse_permit_expiry_ns_extracts_the_real_marker_shape():
@@ -1172,6 +1411,96 @@ class TestTerminateAfterToctouRecheck:
 
         sig = inspect.signature(terminate_after_toctou_recheck)
         assert sig.parameters["terminate_fn"].default is terminate
+
+    def test_stop_prior_refuses_a_zombie_pid_with_the_nonexistent_reason(self):
+        pid = os.fork()
+        if pid == 0:
+            os._exit(0)
+        try:
+            _wait_for_zombie(pid)
+            sent: list[int] = []
+            with pytest.raises(StopPriorRaceRefused, match="pid no longer exists"):
+                terminate_after_toctou_recheck(
+                    pid,
+                    intent_lock_path_=Path("/does/not/matter"),
+                    resolve_holder=lambda _p: pid,
+                    terminate_fn=sent.append,
+                    is_alive=process_is_alive,
+                )
+            assert sent == []
+        finally:
+            os.waitpid(pid, 0)
+
+
+# ---------------------------------------------------------------------------
+# process_is_alive -- a zombie must never read as alive (os.kill(pid, 0)
+# alone succeeds against a zombie; the real fix inspects /proc/<pid>/stat).
+# ---------------------------------------------------------------------------
+
+
+def _read_proc_stat_state(pid: int) -> str | None:
+    """Test-only, independent parse of ``/proc/<pid>/stat``'s state field --
+    deliberately duplicated rather than reusing the production helper, so
+    the positive control below never depends on the code under test."""
+    try:
+        raw = Path(f"/proc/{pid}/stat").read_text()
+    except OSError:
+        return None
+    after_comm = raw.rsplit(")", 1)[-1]
+    fields = after_comm.split()
+    return fields[0] if fields else None
+
+
+def _wait_for_zombie(pid: int, *, timeout: float = 1.0) -> None:
+    """Poll briefly for ``pid`` to become a zombie. Raises (never a bare
+    ``assert``) if the deadline passes first, so a child that never exits
+    surfaces as a broken test environment rather than a silent pass."""
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if _read_proc_stat_state(pid) == "Z":
+            return
+        time.sleep(0.01)
+    raise RuntimeError(f"child pid {pid} never reached zombie state within {timeout}s")
+
+
+class TestProcessIsAlive:
+    def test_a_zombie_child_is_not_alive(self):
+        pid = os.fork()
+        if pid == 0:
+            os._exit(0)
+        try:
+            # Positive control FIRST: confirm, independently of the code
+            # under test, that this pid really is a zombie.
+            _wait_for_zombie(pid)
+            assert _read_proc_stat_state(pid) == "Z"
+            assert process_is_alive(pid) is False
+        finally:
+            os.waitpid(pid, 0)
+
+    def test_a_running_child_is_still_alive(self):
+        pid = os.fork()
+        if pid == 0:
+            time.sleep(5)
+            os._exit(0)
+        try:
+            assert process_is_alive(pid) is True
+        finally:
+            os.kill(pid, signal.SIGKILL)
+            os.waitpid(pid, 0)
+
+    def test_an_adopted_zombie_pid_is_not_alive(self):
+        # No Popen object anywhere in scope -- wired the same way
+        # `default_ports` wires the real `process_is_alive` in, then called
+        # through the `SupervisorPorts` port rather than the bare function.
+        pid = os.fork()
+        if pid == 0:
+            os._exit(0)
+        try:
+            _wait_for_zombie(pid)
+            ports = _make_ports(process_alive=process_is_alive)
+            assert ports.process_alive(pid) is False
+        finally:
+            os.waitpid(pid, 0)
 
 
 # ---------------------------------------------------------------------------
@@ -1384,6 +1713,48 @@ class TestPhaseHandlersDirect:
         ports = _make_ports()
         result = _do_stop_prior(ports=ports, store_path=store_path, tracked_pid=None)
         assert result is None
+
+    def test_stop_prior_after_midday_exhaustion_with_dead_pid_is_a_noop_not_adoption_refused(
+        self, tmp_path
+    ):
+        # Seeded exactly as a next-day boot after a mid-day-exhausted node
+        # would arrive: `_do_midday_watch` kept the dead pid as
+        # `tracked_pid` (intended), but the process is gone, nothing holds
+        # the intent flock, and pgrep finds nothing either -- this must be
+        # a true NOOP, never a spurious REFUSE_ALERT page.
+        store_path = tmp_path / "state" / "store.sqlite3"
+        sink = _RecordingAlertSink()
+        terminated: list[int] = []
+        ports = _make_ports(
+            alert_sink=sink,
+            process_alive=lambda _pid: False,
+            resolve_intent_lock_holder=lambda _p: None,
+            find_node_pid=lambda: None,
+            terminate_after_recheck=lambda pid, **_kw: terminated.append(pid),
+        )
+        result = _do_stop_prior(ports=ports, store_path=store_path, tracked_pid=1001)
+        assert result is None
+        assert sink.payloads == []
+        assert terminated == []
+
+    def test_stop_prior_uses_a_live_tracked_pid_directly(self, tmp_path):
+        # Regression guard: a LIVE tracked pid is still trusted and used
+        # directly, never overridden by `find_node_pid` -- `find_node_pid`
+        # is left unreachable here (raises if called) to pin that.
+        def _boom():
+            raise AssertionError("find_node_pid must not be called for a live tracked pid")
+
+        store_path = tmp_path / "state" / "store.sqlite3"
+        terminated: list[int] = []
+        ports = _make_ports(
+            process_alive=lambda _pid: True,
+            resolve_intent_lock_holder=lambda _p: 1001,
+            find_node_pid=_boom,
+            terminate_after_recheck=lambda pid, **_kw: terminated.append(pid),
+        )
+        result = _do_stop_prior(ports=ports, store_path=store_path, tracked_pid=1001)
+        assert result is None
+        assert terminated == [1001]
 
     def test_do_launch_refuses_when_lock_held(self, tmp_path):
         store_path = tmp_path / "state" / "store.sqlite3"
@@ -2414,3 +2785,424 @@ class TestSupervisorLoggingConfiguration:
         assert exit_code == EXIT_OK
         assert supervisor_log_path(override_log_dir).exists()
         assert not decoy_home_log_dir.exists()
+
+
+# ===========================================================================
+# [2026-09-15] Mid-day watch (plan §3/§4 step 6): `_do_midday_watch` mirrors
+# `_do_relaunch_check` with an INDEPENDENT budget/window, a never-null
+# `tracked_pid` decline contract (opposite of boot's), and NO per-poll
+# flock probe outside the bounded post-relaunch readiness re-check.
+# ===========================================================================
+
+
+def _midday_watch_common_kwargs(tmp_path) -> dict:
+    return {
+        "store_path": tmp_path / "state" / "store.sqlite3",
+        "repo_root": tmp_path,
+        "node_bin": tmp_path / "node_bin",
+        "log_dir": tmp_path / "logs",
+    }
+
+
+class TestDoMiddayWatch:
+    def test_do_midday_watch_relaunches_a_dead_transient_child(self, tmp_path):
+        node_log = tmp_path / "node.log"
+        node_log.write_text(_TRADING_NODE_FAILED_LINE)
+        spawner = FakeSpawner()
+        ports = _make_ports(
+            process_alive=lambda _pid: False,
+            spawn=spawner,
+            read_log_new=lambda p: p.read_text(),
+        )
+        state = record_readiness_observed(initial_scheduler_state(_DAY), _utc(17, 10))
+
+        new_pid, new_log, state = _do_midday_watch(
+            ports=ports,
+            state=state,
+            now=_utc(20, 0),
+            tracked_pid=1001,
+            node_log=node_log,
+            **_midday_watch_common_kwargs(tmp_path),
+        )
+
+        assert len(spawner.calls) == 1
+        assert new_pid != 1001
+        assert new_log != node_log
+        assert state.midday_relaunch_attempts == 1
+        assert state.last_midday_relaunch_attempt_at == _utc(20, 0)
+
+    def test_do_midday_watch_declines_and_alerts_on_exhaustion_exactly_once(self, tmp_path):
+        from breezy.runtime.trade_supervisor_core import record_midday_relaunch_attempt
+
+        node_log = tmp_path / "node.log"
+        node_log.write_text(_TRADING_NODE_FAILED_LINE)
+        sink = _RecordingAlertSink()
+        ports = _make_ports(
+            process_alive=lambda _pid: False,
+            alert_sink=sink,
+            read_log_new=lambda p: p.read_text(),
+        )
+        state = record_readiness_observed(initial_scheduler_state(_DAY), _utc(17, 10))
+        for i in range(MIDDAY_MAX_RELAUNCH_ATTEMPTS):
+            state = record_midday_relaunch_attempt(state, _utc(19, 40 + i * 6))
+        assert state.midday_relaunch_attempts == MIDDAY_MAX_RELAUNCH_ATTEMPTS
+
+        tracked_pid, _, state = _do_midday_watch(
+            ports=ports,
+            state=state,
+            now=_utc(20, 0),
+            tracked_pid=1001,
+            node_log=node_log,
+            **_midday_watch_common_kwargs(tmp_path),
+        )
+
+        assert state.midday_alert_sent is True
+        assert [p.detail for p in sink.payloads] == [AlertDetail.MIDDAY_RELAUNCH_EXHAUSTED.value]
+
+        # A second poll (same day) must short-circuit before ANY log read
+        # or re-decision -- never re-alert.
+        tracked_pid_2, _, _state_2 = _do_midday_watch(
+            ports=ports,
+            state=state,
+            now=_utc(20, 1),
+            tracked_pid=tracked_pid,
+            node_log=node_log,
+            **_midday_watch_common_kwargs(tmp_path),
+        )
+        assert len(sink.payloads) == 1
+        assert tracked_pid_2 == tracked_pid
+
+    def test_do_midday_watch_keeps_tracked_pid_after_exhaustion(self, tmp_path):
+        from breezy.runtime.trade_supervisor_core import record_midday_relaunch_attempt
+
+        node_log = tmp_path / "node.log"
+        node_log.write_text(_TRADING_NODE_FAILED_LINE)
+        ports = _make_ports(process_alive=lambda _pid: False)
+        state = record_readiness_observed(initial_scheduler_state(_DAY), _utc(17, 10))
+        for i in range(MIDDAY_MAX_RELAUNCH_ATTEMPTS):
+            state = record_midday_relaunch_attempt(state, _utc(19, 40 + i * 6))
+
+        tracked_pid, _, _state = _do_midday_watch(
+            ports=ports,
+            state=state,
+            now=_utc(20, 0),
+            tracked_pid=1001,
+            node_log=node_log,
+            **_midday_watch_common_kwargs(tmp_path),
+        )
+
+        # Never None on decline -- opposite of `_do_relaunch_check`'s own
+        # boot-time contract -- so the dead PID stays visible in every
+        # subsequent `log_decision` line for operator diagnosis.
+        assert tracked_pid == 1001
+
+    def test_do_midday_watch_noop_while_child_alive(self, tmp_path):
+        node_log = tmp_path / "node.log"
+        node_log.write_text("")
+        holder_calls: list[Path] = []
+        ports = _make_ports(
+            process_alive=lambda _pid: True,
+            resolve_intent_lock_holder=lambda p: (holder_calls.append(p), None)[1],
+        )
+        state = record_readiness_observed(initial_scheduler_state(_DAY), _utc(17, 10))
+
+        result = _do_midday_watch(
+            ports=ports,
+            state=state,
+            now=_utc(18, 0),
+            tracked_pid=1001,
+            node_log=node_log,
+            **_midday_watch_common_kwargs(tmp_path),
+        )
+
+        assert result == (1001, node_log, state)
+        # The steady-state "still alive" poll never needs the flock probe --
+        # only the bounded post-relaunch readiness re-check does.
+        assert holder_calls == []
+
+    def test_do_midday_watch_alerts_when_relaunched_child_never_readies(self, tmp_path):
+        from breezy.runtime.trade_supervisor_core import record_midday_relaunch_attempt
+
+        node_log = tmp_path / "node.log"
+        node_log.write_text("")
+        sink = _RecordingAlertSink()
+        ports = _make_ports(
+            process_alive=lambda _pid: True,
+            resolve_intent_lock_holder=lambda _p: None,  # never took the flock
+            alert_sink=sink,
+        )
+        state = record_readiness_observed(initial_scheduler_state(_DAY), _utc(17, 10))
+        relaunch_at = _utc(20, 0)
+        state = record_midday_relaunch_attempt(state, relaunch_at)
+
+        past_timeout = relaunch_at + MIDDAY_READINESS_RECHECK_TIMEOUT + dt.timedelta(seconds=1)
+        tracked_pid, _, state = _do_midday_watch(
+            ports=ports,
+            state=state,
+            now=past_timeout,
+            tracked_pid=2002,
+            node_log=node_log,
+            **_midday_watch_common_kwargs(tmp_path),
+        )
+
+        assert tracked_pid == 2002
+        assert state.midday_not_ready_alert_sent is True
+        assert [p.detail for p in sink.payloads] == [
+            AlertDetail.MIDDAY_RELAUNCHED_CHILD_NOT_READY.value
+        ]
+
+        # A later poll must not re-alert -- observability only, once.
+        _, _, _state_2 = _do_midday_watch(
+            ports=ports,
+            state=state,
+            now=past_timeout + dt.timedelta(seconds=60),
+            tracked_pid=2002,
+            node_log=node_log,
+            **_midday_watch_common_kwargs(tmp_path),
+        )
+        assert len(sink.payloads) == 1
+
+    def test_do_midday_watch_stops_probing_the_flock_once_relaunched_child_is_ready(
+        self, tmp_path
+    ):
+        from breezy.runtime.trade_supervisor_core import record_midday_relaunch_attempt
+
+        node_log = tmp_path / "node.log"
+        node_log.write_text(_STRATEGY_SUBSCRIBED_LINE + _PERMIT_ISSUED_LINE)
+        holder_calls: list[Path] = []
+        ports = _make_ports(
+            process_alive=lambda _pid: True,
+            resolve_intent_lock_holder=lambda p: (holder_calls.append(p), 2002)[1],
+            read_log_new=lambda p: p.read_text(),
+        )
+        state = record_readiness_observed(initial_scheduler_state(_DAY), _utc(17, 10))
+        relaunch_at = _utc(20, 0)
+        state = record_midday_relaunch_attempt(state, relaunch_at)
+
+        # Poll where readiness becomes satisfied -- the probe fires once here.
+        tracked_pid, _, state = _do_midday_watch(
+            ports=ports,
+            state=state,
+            now=relaunch_at + dt.timedelta(seconds=30),
+            tracked_pid=2002,
+            node_log=node_log,
+            **_midday_watch_common_kwargs(tmp_path),
+        )
+        assert tracked_pid == 2002
+        assert len(holder_calls) == 1
+
+        # Every later alive poll must NOT re-probe the flock.
+        for i in range(1, 5):
+            _, _, state = _do_midday_watch(
+                ports=ports,
+                state=state,
+                now=relaunch_at + dt.timedelta(seconds=30 + i * 60),
+                tracked_pid=2002,
+                node_log=node_log,
+                **_midday_watch_common_kwargs(tmp_path),
+            )
+        assert len(holder_calls) == 1
+
+    def test_relaunched_child_markers_are_read_from_the_new_log(self, tmp_path):
+        (tmp_path / "logs").mkdir(parents=True, exist_ok=True)
+        old_log = tmp_path / "child1.log"
+        old_log.write_text(_TRADING_NODE_FAILED_LINE)
+        reader = IncrementalLogReader()
+        session: dict = {"alive": set()}
+        ports = _make_ports(
+            process_alive=lambda pid: pid in session["alive"],
+            read_log_new=reader.read_new,
+            spawn=FakeSpawner(),
+        )
+        state = record_readiness_observed(initial_scheduler_state(_DAY), _utc(17, 10))
+
+        new_pid, new_log, state = _do_midday_watch(
+            ports=ports,
+            state=state,
+            now=_utc(20, 0),
+            tracked_pid=1001,
+            node_log=old_log,
+            **_midday_watch_common_kwargs(tmp_path),
+        )
+        assert new_log != old_log
+        assert state.strategy_subscribed_seen is False
+
+        new_log.write_text("CurrentRungHoldStrategy subscribed instrument=X\n")
+        session["alive"].add(new_pid)
+
+        _, _, state = _do_midday_watch(
+            ports=ports,
+            state=state,
+            now=_utc(20, 1),
+            tracked_pid=new_pid,
+            node_log=new_log,
+            **_midday_watch_common_kwargs(tmp_path),
+        )
+        # `node_log_path` is second-granular, so the new child's own
+        # `IncrementalLogReader` offset naturally starts at 0 for the new
+        # path -- this marker is read from CHILD 2's log, never a stale
+        # offset into child 1's.
+        assert state.strategy_subscribed_seen is True
+
+    def test_a_fatal_marker_drained_before_death_still_relaunches(self, tmp_path):
+        node_log = tmp_path / "node.log"
+        node_log.write_text(_TRADING_NODE_FAILED_LINE)
+        reader = IncrementalLogReader()
+        spawner = FakeSpawner()
+        session: dict = {"alive": True}
+        ports = _make_ports(
+            process_alive=lambda _pid: session["alive"],
+            read_log_new=reader.read_new,
+            spawn=spawner,
+        )
+        state = record_readiness_observed(initial_scheduler_state(_DAY), _utc(17, 10))
+
+        # Poll N: the fatal marker is present in THIS poll's delta, but the
+        # process is still alive -- the death-detecting poll may be a
+        # later one whose own delta no longer holds the marker text.
+        tracked_pid, node_log, state = _do_midday_watch(
+            ports=ports,
+            state=state,
+            now=_utc(20, 0),
+            tracked_pid=1001,
+            node_log=node_log,
+            **_midday_watch_common_kwargs(tmp_path),
+        )
+        assert state.midday_cause_seen is RelaunchCause.TRANSIENT
+        assert len(spawner.calls) == 0
+
+        # Push the marker text out of the reader's 256-byte carry with
+        # later, unrelated noise -- the exact 09-05/09-06 drain shape
+        # (§3/§7): >256 bytes evicts the short marker line from the next
+        # delta in a single append.
+        noise = "order book tick " + ("x" * 300) + "\n"
+        with node_log.open("a") as fh:
+            fh.write(noise)
+        _, node_log, state = _do_midday_watch(
+            ports=ports,
+            state=state,
+            now=_utc(20, 0, 30),
+            tracked_pid=tracked_pid,
+            node_log=node_log,
+            **_midday_watch_common_kwargs(tmp_path),
+        )
+
+        # Poll N+1: process now dead, and this poll's OWN delta no longer
+        # holds the marker text -- already drained by the poll above.
+        session["alive"] = False
+        leftover = reader.read_new(node_log)
+        assert "trading node failed" not in leftover  # sanity: genuinely drained
+
+        new_pid, _new_log, state = _do_midday_watch(
+            ports=ports,
+            state=state,
+            now=_utc(20, 1),
+            tracked_pid=tracked_pid,
+            node_log=node_log,
+            **_midday_watch_common_kwargs(tmp_path),
+        )
+
+        assert len(spawner.calls) == 1
+        assert new_pid != tracked_pid
+
+
+# ===========================================================================
+# [2026-09-15] Plan §4 step 7: `_run_forever`'s dispatch must route
+# `Phase.MIDDAY_WATCH` into `_do_midday_watch`, never fall through the bare
+# `else` into `_do_self_check`.
+# ===========================================================================
+
+
+class TestRunForeverDispatchesMiddayWatch:
+    def test_run_forever_dispatches_midday_watch_phase(self, tmp_path):
+        clock = FakeClock(_utc(16, 49, 30))
+        spawn_calls: list[int] = []
+        session: dict = {"tracked_pid": None}
+        dead_pids: set[int] = set()
+        kill_time = _utc(19, 57)
+        killed_once = {"done": False}
+
+        def fake_sleep(seconds: float) -> None:
+            clock.advance(seconds)
+
+        def fake_spawn(**_kwargs) -> FakePopen:
+            pid = 9000 + len(spawn_calls) + 1
+            spawn_calls.append(pid)
+            session["tracked_pid"] = pid
+            return FakePopen(pid)
+
+        def read_log_new(_path: Path) -> str:
+            if not killed_once["done"] and clock.current >= kill_time:
+                killed_once["done"] = True
+                dead_pids.add(session["tracked_pid"])
+                return _TRADING_NODE_FAILED_LINE
+            return _READY_LOG_LINES
+
+        ports = _make_ports(
+            spawn=fake_spawn,
+            resolve_intent_lock_holder=lambda _p: session["tracked_pid"],
+            process_alive=lambda pid: pid not in dead_pids,
+            read_log_new=read_log_new,
+        )
+
+        _run_forever(
+            store_path=tmp_path / "state" / "store.sqlite3",
+            repo_root=tmp_path,
+            node_bin=tmp_path / "node_bin",
+            log_dir=tmp_path / "logs",
+            clock=clock,
+            sleep=fake_sleep,
+            ports=ports,
+            max_iterations=300,
+        )
+
+        # LAUNCH's own spawn, plus MIDDAY_WATCH's relaunch of the
+        # dead-at-19:57Z child.
+        assert len(spawn_calls) == 2
+
+    def test_run_forever_never_routes_midday_watch_into_self_check(self, tmp_path, caplog):
+        clock = FakeClock(_utc(16, 49, 30))
+        session: dict = {"tracked_pid": None}
+        spawn_calls: list[int] = []
+        holder_count_calls = {"n": 0}
+
+        def fake_sleep(seconds: float) -> None:
+            clock.advance(seconds)
+
+        def fake_spawn(**_kwargs) -> FakePopen:
+            pid = 9500 + len(spawn_calls) + 1
+            spawn_calls.append(pid)
+            session["tracked_pid"] = pid
+            return FakePopen(pid)
+
+        def count_holders(_p: Path) -> int:
+            holder_count_calls["n"] += 1
+            return 1
+
+        ports = _make_ports(
+            spawn=fake_spawn,
+            resolve_intent_lock_holder=lambda _p: session["tracked_pid"],
+            count_intent_lock_holders=count_holders,
+            process_alive=lambda _pid: True,
+            read_log_new=lambda _p: _READY_LOG_LINES,
+        )
+
+        with caplog.at_level("INFO"):
+            _run_forever(
+                store_path=tmp_path / "state" / "store.sqlite3",
+                repo_root=tmp_path,
+                node_bin=tmp_path / "node_bin",
+                log_dir=tmp_path / "logs",
+                clock=clock,
+                sleep=fake_sleep,
+                ports=ports,
+                max_iterations=250,  # well past 17:10Z, deep into MIDDAY_WATCH
+            )
+
+        self_check_lines = [r for r in caplog.records if "self_check" in r.getMessage()]
+        # Exactly the one real 17:05Z SELF_CHECK line -- MIDDAY_WATCH never
+        # produces another, because it never routes into `_do_self_check`.
+        assert len(self_check_lines) == 1
+        # `count_intent_lock_holders` is read ONLY by `_do_self_check` --
+        # exactly one call proves MIDDAY_WATCH never dispatched there.
+        assert holder_count_calls["n"] == 1
