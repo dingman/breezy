@@ -1428,3 +1428,17 @@ Run the full no-egress gate on the integration branch immediately after every sl
 
 ### How to apply
 After `git merge` on the base branch: gate → only then merge the next branch. When a merged evidence artefact's test fails on the base, the artefact is withdrawn until re-run on the base commit. Related: L-41, [[one-tree-many-agents-fakes-test-failures]].
+
+## L-44 — Logic written for one leg silently mislabels the other; test each leg's terminal state (2026-09-15)
+
+### What happened
+The shadow position monitor's thesis classifier (`strategy/current_rung_hold/monitor_decision.py`, merged ad31dd8) was YES-shaped: DEAD when `running_max_lower > rung_high`, LOCKED when the running-max interval sat inside the rung after the peak hour. The plan named the NO-leg MARK inversion (walk the asks, `1 − vwap`) and four blind reviewers approved, but nobody inverted the STATE machine. Run over the day's live board, the MIA NO [92,93] position (running max 93 inside the rung since 17:55Z, preliminary CLI 93, economically dead) reported `LOCKED_BY_OBSERVATION / HOLD`, and DEAD was structurally unreachable for any NO leg. Found only by executing the code against real positions of both legs; fixed in 88914eb.
+
+### Why this is binding
+A leg-conditional classifier that is right for YES and inverted for NO produces confident, wrong evidence for exactly the positions the NO-side amendment made live, and every fixture that only ever builds YES positions (L-24) stays green.
+
+### The rule
+Any leg-conditional logic — marks, thesis states, verdicts, PnL sign, fee basis, admission — carries (a) a two-column table of both legs' semantics in the module docstring, (b) one test per leg proving that leg's LOSING terminal state is reachable and the other leg's terminal state is not, and (c) a review line "which leg did you check this against?" answered with a NO-leg case.
+
+### How to apply
+When briefing or reviewing anything that reads `leg`/`side`: grep the tests for a NO-leg fixture; if none exists the slice is RED. Before citing a monitor or scorer verdict for a NO position, confirm the verdict path is leg-aware. Related: L-24, L-42, NO-side amendment §8.
