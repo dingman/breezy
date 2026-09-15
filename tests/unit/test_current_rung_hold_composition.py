@@ -598,6 +598,38 @@ def test_continuous_builder_honors_an_explicit_offer_tape_path(tmp_path: Path) -
     assert v3[0].offer_tape._path == explicit_path  # type: ignore[attr-defined]
 
 
+def test_build_continuous_rung_hold_strategies_survives_an_unwritable_offer_tape_sidecar(
+    tmp_path: Path,
+) -> None:
+    """H1 review finding (commit 309dab6): a blocked sidecar directory must
+    never raise out of strategy construction at the live 16:50Z boot --
+    ``OfferTape.__init__`` is best-effort (see
+    ``tests/unit/test_current_rung_hold_offer_tape.py``)."""
+    _write(
+        tmp_path,
+        [
+            _binary(
+                "tc-temp-sfohigh-2026-09-04-gte70lt71f",
+                info=_known(station="SFO", day=_DAY),
+            ),
+        ],
+    )
+    blocker = tmp_path / "blocker_file"
+    blocker.write_text("not a directory")
+    offer_tape_path = blocker / "offer_tape.jsonl"
+
+    v3 = build_continuous_rung_hold_strategies(
+        catalog_root=tmp_path,
+        today_by_station=_TODAY,
+        trial_day_latch_factory=_unused_latch_factory,
+        order_submission_permit=None,
+        offer_tape_path=offer_tape_path,
+    )
+
+    assert len(v3) == 1
+    assert v3[0].offer_tape.sidecar_errors == 1
+
+
 def test_continuous_builder_refuses_a_non_none_permit(tmp_path: Path) -> None:
     """Phase 0 seal: `build_continuous_rung_hold_strategies` refuses a
     non-None `order_submission_permit`, naming Phase 0 in the error."""

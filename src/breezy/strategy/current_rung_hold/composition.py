@@ -500,7 +500,7 @@ def build_continuous_rung_hold_strategies(
     if all(len(ids) == 0 for ids in resolved.values()):
         raise NoTradableInstrumentsError(_zero_instruments_message(resolved, today_by_station))
 
-    # ONE OfferTape instance (its bounded deque, DEFAULT_OFFER_TAPE_MAXLEN=8192
+    # ONE OfferTape instance (its bounded deque, DEFAULT_OFFER_TAPE_MAXLEN=16384
     # slots) is shared by every per-station strategy below -- not one tape per
     # station. GAP fix 2026-09-15: an explicit `offer_tape_path` still wins
     # unconditionally (tests/the backtest harness keep working unedited);

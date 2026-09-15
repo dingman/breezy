@@ -25,7 +25,13 @@ import json
 from decimal import Decimal
 from pathlib import Path
 
-from breezy.strategy.current_rung_hold.offer_tape import OfferTape, OfferTapeRecord
+import pytest
+
+from breezy.strategy.current_rung_hold.offer_tape import (
+    DEFAULT_OFFER_TAPE_MAXLEN,
+    OfferTape,
+    OfferTapeRecord,
+)
 
 _RECORD = OfferTapeRecord(
     station="KJFK",
@@ -208,12 +214,74 @@ def test_a_pre_gap_fix_record_still_defaults_the_new_keys() -> None:
     assert as_dict["decision"] == "refuse"
 
 
-def test_an_old_jsonl_line_missing_the_new_keys_still_parses() -> None:
-    """GAP fix 2026-09-15 RED: a JSONL line written by the PRE-fix code (only
-    the 16 old keys, no side/p_bound/etc.) is still valid, parseable JSON --
-    nothing in this module requires every historical line to carry the new
-    keys."""
-    old_line = json.dumps({key: None for key in _OLD_SHAPE_KEYS} | {"size": 1}, sort_keys=True)
+def test_an_old_jsonl_line_missing_the_new_keys_still_round_trips_through_from_dict() -> None:
+    """L1 review finding (commit 309dab6): a JSONL line written by the
+    PRE-fix code (only the 16 old keys, no side/p_bound/etc.) is not merely
+    parseable JSON (that assertion was vacuous) -- it round-trips through
+    the reader ``OfferTapeRecord`` lacked until now: ``from_dict`` defaults
+    every GAP-fix key exactly like a record built directly (mirrors
+    ``test_a_pre_gap_fix_record_still_defaults_the_new_keys`` above)."""
+    old_line = json.dumps(
+        {key: getattr(_RECORD, key) for key in _OLD_SHAPE_KEYS}, sort_keys=True,
+    )
     parsed = json.loads(old_line)
     assert _OLD_SHAPE_KEYS <= set(parsed)
     assert "side" not in parsed
+
+    record = OfferTapeRecord.from_dict(parsed)
+
+    as_dict = record.to_dict()
+    for key in _OLD_SHAPE_KEYS:
+        assert as_dict[key] == getattr(_RECORD, key)
+    assert as_dict["side"] == "YES"
+    assert as_dict["p_bound"] is None
+    assert as_dict["break_even"] is None
+    assert as_dict["running_max_lower"] is None
+    assert as_dict["running_max_upper"] is None
+    assert as_dict["running_max_exact"] is False
+    assert as_dict["staleness_ns"] is None
+    assert as_dict["fee_coefficient"] is None
+    assert as_dict["observed_at_ns"] is None
+    assert as_dict["admission_reason"] is None
+    assert as_dict["decision"] == "refuse"
+
+
+def test_a_full_record_round_trips_exactly_through_from_dict_and_to_dict() -> None:
+    """L1 review finding (commit 309dab6): a NEW-shape line (all 27 keys)
+    round-trips byte-for-byte through ``from_dict`` -> ``to_dict``."""
+    round_tripped = OfferTapeRecord.from_dict(_EXPECTED_DICT)
+    assert round_tripped.to_dict() == _EXPECTED_DICT
+
+
+def test_from_dict_refuses_a_payload_missing_a_legacy_key() -> None:
+    """L1 review finding (commit 309dab6): ``from_dict`` is strict on the 16
+    legacy keys -- unlike the GAP-fix keys, these have never been optional."""
+    incomplete = {key: getattr(_RECORD, key) for key in _OLD_SHAPE_KEYS if key != "station"}
+    with pytest.raises(ValueError, match="station"):
+        OfferTapeRecord.from_dict(incomplete)
+
+
+def test_default_offer_tape_maxlen_is_pinned_at_16384() -> None:
+    """M2 review finding (commit 309dab6): YES+NO rows now share one tape,
+    doubling the per-tick row count -- the default is doubled in step so
+    YES retention depth is unchanged."""
+    assert DEFAULT_OFFER_TAPE_MAXLEN == 16384
+
+
+def test_a_file_where_the_sidecar_directory_should_be_still_constructs(
+    tmp_path: Path,
+) -> None:
+    """H1 review finding (commit 309dab6): ``OfferTape.__init__`` must never
+    raise from a blocked sidecar directory (composition.py now resolves a
+    default sidecar path unconditionally) -- construction is best-effort,
+    falling back to in-memory only."""
+    blocker = tmp_path / "blocker"
+    blocker.write_text("not a directory")
+    path = blocker / "sub" / "offer.jsonl"
+
+    tape = OfferTape(path)
+
+    assert tape.sidecar_errors == 1
+    tape.append(_RECORD)
+    assert len(tape) == 1
+    assert not path.exists()

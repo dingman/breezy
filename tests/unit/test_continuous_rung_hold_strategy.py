@@ -653,6 +653,11 @@ def test_a_one_sided_depth10_ask_drives_the_same_decision_as_the_equivalent_quot
     record = next(rec for rec in strategy.offer_tape.records() if rec.side == "YES")
     assert record.reason == "taken"
     assert record.source == "depth"
+    # M1 review finding (commit 309dab6): the NO row's `ask` is `None` for a
+    # no-bid frame -- there is no `1 - bid` price to report -- never the
+    # empty-string sentinel the pre-fix code wrote.
+    no_record = next(rec for rec in strategy.offer_tape.records() if rec.side == "NO")
+    assert no_record.ask is None
 
 
 def test_a_two_sided_frame_delivered_as_both_quote_and_depth_evaluates_once(

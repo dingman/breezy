@@ -24,13 +24,43 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from decimal import Decimal
 from pathlib import Path
-from typing import Final
+from typing import Final, cast
 
 __all__ = ["DEFAULT_OFFER_TAPE_MAXLEN", "OfferTape", "OfferTapeRecord"]
 
 logger = logging.getLogger(__name__)
 
-DEFAULT_OFFER_TAPE_MAXLEN: Final[int] = 8192
+#: M2 review finding (commit 309dab6): the NO-side wiring (S3b) doubled the
+#: rows-per-eligible-tick from one (YES only) to two (YES + NO), so the old
+#: 8192 halved effective YES retention. Doubled to keep the same YES-row
+#: history depth a long-running shadow had before the NO leg started
+#: sharing this tape.
+DEFAULT_OFFER_TAPE_MAXLEN: Final[int] = 16384
+
+#: L1 review finding (commit 309dab6): the 16 keys every pre-GAP-fix JSONL
+#: line carries -- :meth:`OfferTapeRecord.from_dict` requires all of them
+#: and defaults the 11 GAP-fix keys added below, so an old line still reads
+#: back cleanly.
+_LEGACY_KEYS: Final[frozenset[str]] = frozenset(
+    {
+        "station",
+        "climate_day",
+        "instrument_id",
+        "ask",
+        "size",
+        "reason",
+        "ts_event",
+        "hour_lst",
+        "width_code",
+        "m_code",
+        "trigger",
+        "quote_age_ns",
+        "minutes_since_window_open",
+        "prior_eligible_snaps",
+        "illegal_cell",
+        "source",
+    }
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -49,7 +79,12 @@ class OfferTapeRecord:
     station: str
     climate_day: str
     instrument_id: str
-    ask: str
+    #: M1 review finding (commit 309dab6): `None` for a NO-side row whose
+    #: Depth10 frame carried no bid at all -- there is no `1 - bid` ask to
+    #: report, so this is "undefined", not the (unrelated) empty-string
+    #: sentinel the pre-fix code wrote. Every other row (YES, and a NO row
+    #: with a real bid) still carries a Decimal string exactly as before.
+    ask: str | None
     size: int
     reason: str
     ts_event: int
@@ -140,6 +175,61 @@ class OfferTapeRecord:
             "decision": self.decision,
         }
 
+    @classmethod
+    def from_dict(cls, payload: Mapping[str, object]) -> OfferTapeRecord:
+        """The reader half of :meth:`to_dict` (L1 review finding, commit
+        309dab6) -- deliberately narrow: this is the seed of a future
+        offer-tape reader, not a general JSON-to-dataclass mapper.
+
+        Strict on the 16 legacy keys (:data:`_LEGACY_KEYS`) -- a payload
+        missing any of them raises, since those keys have never been
+        optional. The 11 GAP-fix keys default exactly as a directly
+        constructed record would (``side="YES"``, ``decision="refuse"``,
+        the rest ``None``/``False``), so an old (pre-GAP-fix) JSONL line
+        round-trips cleanly. The Decimal-valued GAP-fix fields are
+        re-hydrated from their ``to_dict`` string form; ``None`` stays
+        ``None``.
+        """
+        missing = _LEGACY_KEYS - set(payload)
+        if missing:
+            raise ValueError(
+                f"OfferTapeRecord.from_dict: payload missing legacy keys {sorted(missing)}"
+            )
+
+        def _decimal(key: str) -> Decimal | None:
+            value = payload.get(key)
+            return None if value is None else Decimal(str(value))
+
+        return cls(
+            station=cast(str, payload["station"]),
+            climate_day=cast(str, payload["climate_day"]),
+            instrument_id=cast(str, payload["instrument_id"]),
+            ask=cast("str | None", payload["ask"]),
+            size=cast(int, payload["size"]),
+            reason=cast(str, payload["reason"]),
+            ts_event=cast(int, payload["ts_event"]),
+            hour_lst=cast(int, payload["hour_lst"]),
+            width_code=cast(int, payload["width_code"]),
+            m_code=cast(int, payload["m_code"]),
+            trigger=cast(str, payload["trigger"]),
+            quote_age_ns=cast("int | None", payload["quote_age_ns"]),
+            minutes_since_window_open=cast(int, payload["minutes_since_window_open"]),
+            prior_eligible_snaps=cast(int, payload["prior_eligible_snaps"]),
+            illegal_cell=cast(bool, payload["illegal_cell"]),
+            source=cast(str, payload["source"]),
+            side=cast(str, payload.get("side", "YES")),
+            p_bound=_decimal("p_bound"),
+            break_even=_decimal("break_even"),
+            running_max_lower=_decimal("running_max_lower"),
+            running_max_upper=_decimal("running_max_upper"),
+            running_max_exact=cast(bool, payload.get("running_max_exact", False)),
+            staleness_ns=cast("int | None", payload.get("staleness_ns")),
+            fee_coefficient=_decimal("fee_coefficient"),
+            observed_at_ns=cast("int | None", payload.get("observed_at_ns")),
+            admission_reason=cast("str | None", payload.get("admission_reason")),
+            decision=cast(str, payload.get("decision", "refuse")),
+        )
+
 
 class OfferTape:
     """Bounded eligible-snapshot tape. Memory is O(1) in message count."""
@@ -153,14 +243,37 @@ class OfferTape:
         if maxlen < 1:
             raise ValueError("offer tape maxlen must be >= 1")
         self._buf: deque[OfferTapeRecord] = deque(maxlen=maxlen)
-        self._path = path
         self._maxlen = maxlen
+        self._sidecar_errors = 0
+        #: H1 review finding (commit 309dab6): sidecar setup is best-effort.
+        #: `composition.py` now resolves a default sidecar path
+        #: unconditionally, so an unwritable/read-only/full
+        #: `catalog_root.parent` must never raise out of strategy
+        #: construction at the live boot -- it falls back to in-memory only
+        #: (`self._path` stays `None`), exactly like a later `append` disk
+        #: error already does.
+        self._path: Path | None = None
         if path is not None:
-            path.parent.mkdir(parents=True, exist_ok=True)
+            try:
+                path.parent.mkdir(parents=True, exist_ok=True)
+            except OSError:
+                self._sidecar_errors += 1
+                logger.exception(
+                    "OfferTape: failed to create sidecar directory for %s; "
+                    "falling back to in-memory only",
+                    path,
+                )
+            else:
+                self._path = path
 
     @property
     def maxlen(self) -> int:
         return self._maxlen
+
+    @property
+    def sidecar_errors(self) -> int:
+        """Count of sidecar setup/append failures (H1 review finding)."""
+        return self._sidecar_errors
 
     def __len__(self) -> int:
         return len(self._buf)
@@ -186,6 +299,7 @@ class OfferTape:
                 handle.write(line)
                 handle.write("\n")
         except OSError:
+            self._sidecar_errors += 1
             logger.exception("OfferTape: failed to append to %s", self._path)
 
     def as_dicts(self) -> tuple[Mapping[str, object], ...]:

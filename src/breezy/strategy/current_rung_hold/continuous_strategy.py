@@ -1353,11 +1353,15 @@ class ContinuousRungHoldStrategy(Strategy):
             method or anything it calls, so it cannot change which branch
             fires (L-34/D3).
             """
+            ask_str: str | None
             if isinstance(no_decision, Take):
                 ask_str = str(no_decision.limit_price)
                 reason = "taken"
             else:
-                ask_str = "" if bid is None else str(_ONE - bid)
+                # M1 review finding (commit 309dab6): `None`, not `""` -- a
+                # NO row with no bid has no `1 - bid` ask to report at all,
+                # matching `OfferTapeRecord.ask`'s `str | None` contract.
+                ask_str = None if bid is None else str(_ONE - bid)
                 reason = no_decision.reason
             row_p_bound = no_decision.p_bound
             row_break_even = no_decision.break_even
