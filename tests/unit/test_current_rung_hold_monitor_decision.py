@@ -352,6 +352,173 @@ _reading = st.fixed_dictionaries(
 )
 
 
+# --------------------------------------------------------------------------
+# NO leg -- the thesis classifier's semantics invert (2026-09-15 fix)
+# --------------------------------------------------------------------------
+
+
+def _no_evidence(**overrides: object) -> MonitorEvidence:
+    overrides.setdefault("leg", "NO")
+    return _evidence(**overrides)
+
+
+def test_no_leg_single_win_lock_reading_is_a_candidate_not_locked() -> None:
+    evidence = _no_evidence(ts_ns=0, running_max_lower=90, rung_high=87)
+
+    decision, history = _evaluate(evidence, MonitorHistory.EMPTY)
+
+    assert decision.state is not ThesisState.LOCKED_BY_OBSERVATION
+    assert decision.reason_codes == ("dead_candidate",)
+    assert history.dead_confirm_observed_ns == (0,)
+
+
+def test_no_leg_two_confirmed_win_lock_readings_are_locked_and_hold() -> None:
+    first = _no_evidence(ts_ns=0, running_max_lower=90, rung_high=87)
+    _, history = _evaluate(first, MonitorHistory.EMPTY)
+
+    second = _no_evidence(ts_ns=5 * _MINUTE_NS, running_max_lower=90, rung_high=87)
+    decision, _ = _evaluate(second, history)
+
+    assert decision.state is ThesisState.LOCKED_BY_OBSERVATION
+    assert decision.verdict is Verdict.HOLD
+    assert decision.reason_codes == ("no_leg_win_locked",)
+
+
+def test_no_leg_single_inside_rung_after_peak_reading_is_a_candidate_not_dead() -> None:
+    evidence = _no_evidence(
+        running_max_lower=85, running_max_upper=86, rung_low=84, rung_high=87, hour_lst=18,
+    )
+
+    decision, history = _evaluate(evidence, MonitorHistory.EMPTY)
+
+    assert decision.state is not ThesisState.DEAD_BY_OBSERVATION
+    assert decision.reason_codes == ("dead_candidate",)
+    assert history.locked_confirm_observed_ns == (0,)
+
+
+def test_no_leg_inside_rung_after_peak_confirmed_is_dead_and_exit_recommended() -> None:
+    first = _no_evidence(
+        ts_ns=0, running_max_lower=85, running_max_upper=86,
+        rung_low=84, rung_high=87, hour_lst=18,
+    )
+    _, history = _evaluate(first, MonitorHistory.EMPTY)
+
+    second = _no_evidence(
+        ts_ns=5 * _MINUTE_NS, running_max_lower=85, running_max_upper=86,
+        rung_low=84, rung_high=87, hour_lst=18,
+    )
+    decision, _ = _evaluate(second, history)
+
+    assert decision.state is ThesisState.DEAD_BY_OBSERVATION
+    assert decision.verdict is Verdict.EXIT_RECOMMENDED
+    assert decision.reason_codes == ("no_leg_inside_rung_after_peak",)
+
+
+def test_no_leg_inside_rung_after_peak_confirmed_with_stale_book_is_missing_stop() -> None:
+    first = _no_evidence(
+        ts_ns=0, running_max_lower=85, running_max_upper=86,
+        rung_low=84, rung_high=87, hour_lst=18, book_staleness_ns=0,
+    )
+    _, history = _evaluate(first, MonitorHistory.EMPTY)
+
+    second = _no_evidence(
+        ts_ns=5 * _MINUTE_NS, running_max_lower=85, running_max_upper=86,
+        rung_low=84, rung_high=87, hour_lst=18, book_staleness_ns=181 * 1_000_000_000,
+    )
+    decision, _ = _evaluate(second, history)
+
+    assert decision.state is ThesisState.DEAD_BY_OBSERVATION
+    assert decision.verdict is Verdict.MISSING_STOP
+
+
+def test_no_leg_inside_rung_before_peak_flips_to_threatened_after_confirmations() -> None:
+    history = MonitorHistory.EMPTY
+    decision = None
+    for ts_ns in (0, 4 * _MINUTE_NS, 10 * _MINUTE_NS):
+        evidence = _no_evidence(
+            ts_ns=ts_ns, running_max_lower=85, running_max_upper=86,
+            rung_low=84, rung_high=87, hour_lst=14,
+        )
+        decision, history = _evaluate(evidence, history)
+
+    assert decision is not None
+    assert decision.state is ThesisState.THREATENED
+    assert decision.verdict is Verdict.REDUCE_RECOMMENDED
+    assert decision.reason_codes == ()
+
+
+def test_no_leg_inside_rung_before_peak_building_candidate_reason_is_no_inside_rung() -> None:
+    evidence = _no_evidence(
+        ts_ns=0, running_max_lower=85, running_max_upper=86,
+        rung_low=84, rung_high=87, hour_lst=14,
+    )
+
+    decision, _ = _evaluate(evidence, MonitorHistory.EMPTY)
+
+    assert decision.state is ThesisState.ALIVE
+    assert decision.reason_codes == ("no_inside_rung",)
+
+
+def test_no_leg_inside_rung_before_peak_never_confirms_to_dead() -> None:
+    history = MonitorHistory.EMPTY
+    for minute in range(12):
+        evidence = _no_evidence(
+            ts_ns=minute * _MINUTE_NS, running_max_lower=85, running_max_upper=86,
+            rung_low=84, rung_high=87, hour_lst=14,
+        )
+        decision, history = _evaluate(evidence, history)
+        assert decision.state is not ThesisState.DEAD_BY_OBSERVATION
+        assert decision.state is not ThesisState.LOCKED_BY_OBSERVATION
+
+
+def test_no_leg_below_the_rung_is_alive() -> None:
+    evidence = _no_evidence(
+        running_max_lower=80, running_max_upper=81, rung_low=84, rung_high=87,
+    )
+
+    decision, _ = _evaluate(evidence, MonitorHistory.EMPTY)
+
+    assert decision.state is ThesisState.ALIVE
+    assert decision.verdict is Verdict.HOLD
+
+
+def test_no_leg_history_does_not_disturb_yes_leg_regression() -> None:
+    """Sanity: the YES fixture default still exercises the unchanged path."""
+    evidence = _evidence(running_max_lower=90, rung_high=87)
+
+    decision, _ = _evaluate(evidence, MonitorHistory.EMPTY)
+
+    assert decision.reason_codes == ("dead_candidate",)
+
+
+_no_position = st.sampled_from(["above", "inside", "below"])
+
+
+@given(st.lists(_no_position, min_size=1, max_size=12))
+@settings(max_examples=100)
+def test_no_leg_never_reports_locked_while_the_interval_is_inside_the_rung(
+    positions: list[str],
+) -> None:
+    history = MonitorHistory.EMPTY
+    ts_ns = 0
+    for position in positions:
+        ts_ns += 6 * _MINUTE_NS
+        if position == "above":
+            running_max_lower, running_max_upper = 90, 91
+        elif position == "inside":
+            running_max_lower, running_max_upper = 85, 86
+        else:
+            running_max_lower, running_max_upper = 80, 81
+        evidence = _no_evidence(
+            ts_ns=ts_ns, running_max_lower=running_max_lower,
+            running_max_upper=running_max_upper, rung_low=84, rung_high=87, hour_lst=14,
+        )
+        decision, history = _evaluate(evidence, history)
+
+        if decision.state is ThesisState.LOCKED_BY_OBSERVATION:
+            assert running_max_lower > 87
+
+
 @given(st.lists(_reading, min_size=1, max_size=12))
 @settings(max_examples=100)
 def test_unknown_and_unconfirmed_dead_never_yield_exit_recommended(

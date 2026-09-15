@@ -42,6 +42,54 @@ Rule order (plan §3, Rev 2.1 addendum P6):
    table's coverage, or an under-powered cell) means membership-only logic:
    no candidate run advances either way, the prior ALIVE/THREATENED
    classification is simply repeated, tagged reason ``p_hold_undefined``.
+
+Leg semantics (2026-09-15 correction, plan Rev 2.1 addendum P6 follow-up --
+the classifier above was YES-shaped; rules 1-5 describe the YES leg only and
+stay UNCHANGED for it). A NO leg pays iff the settled high lands OUTSIDE the
+rung, so the two mechanistic geometric facts rules 2-4 key on INVERT their
+meaning and are evaluated by a separate ``_evaluate_no`` path:
+
+* ``running_max_lower > rung_high`` (rule 2's structural DEAD condition for
+  YES -- the running max has already cleared the rung) is the NO leg's
+  WIN-LOCKED state instead: once true it cannot lose. Still gated behind the
+  SAME >= 2-distinct-observation, >= ``_DEAD_MIN_CONFIRM_SPAN_NS`` confirmation
+  rule as YES's DEAD (a single reading can be noise even for a locked win) --
+  confirmed -> ``LOCKED_BY_OBSERVATION``/``HOLD``, reason
+  ``no_leg_win_locked``; unconfirmed -> reason ``dead_candidate`` (shared with
+  YES's own unconfirmed-DEAD candidate tag; both describe "a structural
+  terminal condition is building but not yet confirmed").
+* The running-max interval sitting fully inside ``[rung_low, rung_high]``
+  with the peak passed (rule 4's ``_is_locked`` predicate, mechanistic and
+  UNCONFIRMED for YES) is the NO leg's LOSING terminal state instead --
+  the high is captured inside the rung after the day's peak, so the NO leg
+  is economically dead. Unlike YES's LOCKED, this NO-leg DEAD condition
+  *is* confirmation-gated (same 2-observation/span rule, tracked in its own
+  ``MonitorHistory.locked_confirm_observed_ns`` buffer so it never shares
+  state with the win-lock bumper above) because declaring a leg dead is a
+  stronger claim than declaring it informationally locked. Confirmed ->
+  ``DEAD_BY_OBSERVATION`` -> the same executable-exit test as YES's rule 3
+  (``mark_source == "depth_walk"``, ``depth_sufficient``,
+  ``book_staleness_ns <= _BOOK_STALE_NS``; the NO leg's own walk already
+  prices off ``depth.asks`` per ``monitor_evidence.walk_exit_vwap``) ->
+  ``EXIT_RECOMMENDED``/``MISSING_STOP``, reason
+  ``no_leg_inside_rung_after_peak``; unconfirmed -> ``dead_candidate``.
+* Before the peak hour, the SAME "fully inside the rung" geometry is merely
+  THREATENED-shaped for NO -- the high may still climb out and save the
+  leg -- so it drives the SAME 3-confirmation/``_THREATENED_MIN_SPAN_NS``
+  symmetric hysteresis machinery as YES's rule 5 (shared via
+  ``_evaluate_hysteresis``), just keyed on this geometric boolean instead of
+  a ``p_hold`` drop: building candidate -> reason ``no_inside_rung``;
+  building recovery (leaving the rung again) -> reason ``no_leg_recovering``.
+  The NO leg never consults ``p_hold_at_entry``/``p_hold_at_t`` at all --
+  its thesis is purely a function of the running-max interval's geometric
+  relationship to the rung and the clock, never the probability table.
+* Otherwise (interval below the rung, or rung geometry undefined) -> plain
+  ``ALIVE``/``HOLD``, same as YES's "nothing is happening" fallback.
+
+Invariant: a NO leg never reports ``LOCKED_BY_OBSERVATION`` while the
+interval sits inside the rung (LOCKED requires the interval to be entirely
+above it) -- see
+``test_no_leg_never_reports_locked_while_the_interval_is_inside_the_rung``.
 """
 
 from __future__ import annotations
@@ -119,11 +167,21 @@ class MonitorHistory:
     candidate_state: str | None
     candidate_count: int
     candidate_first_ts_ns: int | None
-    #: Distinct ``ts_ns`` values at which the DEAD structural condition
-    #: (``running_max_lower > rung_high``) has held, consecutively, with no
+    #: Distinct ``ts_ns`` values at which the ``running_max_lower >
+    #: rung_high`` structural condition has held, consecutively, with no
     #: intervening non-qualifying reading. Reset to ``()`` the instant a
-    #: reading fails to qualify.
+    #: reading fails to qualify. YES: confirms DEAD. NO: confirms the
+    #: win-locked state (module docstring's leg semantics section).
     dead_confirm_observed_ns: tuple[int, ...]
+    #: Same shape as ``dead_confirm_observed_ns`` but for the SEPARATE
+    #: "interval fully inside the rung past the peak hour" (``_is_locked``)
+    #: structural condition -- kept in its own buffer so it never shares
+    #: confirmation progress with ``dead_confirm_observed_ns`` (the two
+    #: conditions are mutually exclusive per reading, but a position can
+    #: oscillate between candidacies across readings). Only the NO leg
+    #: confirmation-gates this condition; YES treats it as mechanistic
+    #: (``_is_locked`` checked directly, no confirmation window).
+    locked_confirm_observed_ns: tuple[int, ...]
     last_emitted_ts_ns: int | None
 
     EMPTY: ClassVar[MonitorHistory]
@@ -136,6 +194,7 @@ MonitorHistory.EMPTY = MonitorHistory(
     candidate_count=0,
     candidate_first_ts_ns=None,
     dead_confirm_observed_ns=(),
+    locked_confirm_observed_ns=(),
     last_emitted_ts_ns=None,
 )
 
@@ -197,21 +256,34 @@ def _dead_verdict(evidence: MonitorEvidence) -> Verdict:
     return Verdict.EXIT_RECOMMENDED if fillable else Verdict.MISSING_STOP
 
 
-def _evaluate_threatened_alive(
-    evidence: MonitorEvidence, history: MonitorHistory
+def _fully_inside_rung(evidence: MonitorEvidence) -> bool:
+    """Geometric-only twin of :func:`_is_locked`, without the hour gate."""
+    if evidence.rung_low is None or evidence.rung_high is None:
+        return False
+    return (
+        evidence.running_max_lower >= evidence.rung_low
+        and evidence.running_max_upper <= evidence.rung_high
+    )
+
+
+def _evaluate_hysteresis(
+    is_candidate: bool,
+    history: MonitorHistory,
+    ts_ns: int,
+    *,
+    toward_threatened_reason: str,
+    toward_alive_reason: str,
 ) -> tuple[ThesisState, Verdict, tuple[str, ...], int, MonitorHistory]:
+    """Shared ALIVE<->THREATENED symmetric hysteresis (module docstring
+    rule 5): ``_THREATENED_CONFIRMATIONS`` CONSECUTIVE ``is_candidate``
+    readings spanning >= ``_THREATENED_MIN_SPAN_NS`` flip the state; a
+    single reading in the "wrong" direction resets any in-progress run.
+    Driven by an arbitrary boolean signal -- the YES leg's ``p_hold`` drop,
+    or the NO leg's "fully inside the rung before the peak hour" geometry
+    (module docstring's leg semantics section) -- so both legs share one
+    confirmation implementation.
+    """
     currently_threatened = history.last_state is ThesisState.THREATENED
-
-    if evidence.p_hold_at_entry is None or evidence.p_hold_at_t is None:
-        state = ThesisState.THREATENED if currently_threatened else ThesisState.ALIVE
-        verdict = Verdict.REDUCE_RECOMMENDED if currently_threatened else Verdict.HOLD
-        new_history = dataclasses.replace(
-            history, candidate_state=None, candidate_count=0, candidate_first_ts_ns=None,
-        )
-        return state, verdict, ("p_hold_undefined",), 0, new_history
-
-    drop = evidence.p_hold_at_entry - evidence.p_hold_at_t
-    is_candidate = drop >= _P_HOLD_DROP_MARGIN
     relevant = (not currently_threatened and is_candidate) or (
         currently_threatened and not is_candidate
     )
@@ -230,9 +302,9 @@ def _evaluate_threatened_alive(
         first_ts = history.candidate_first_ts_ns
     else:
         count = 1
-        first_ts = evidence.ts_ns
+        first_ts = ts_ns
 
-    span_ns = evidence.ts_ns - first_ts
+    span_ns = ts_ns - first_ts
     flips = count >= _THREATENED_CONFIRMATIONS and span_ns >= _THREATENED_MIN_SPAN_NS
 
     if flips:
@@ -246,44 +318,60 @@ def _evaluate_threatened_alive(
 
     state = ThesisState.THREATENED if currently_threatened else ThesisState.ALIVE
     verdict = Verdict.REDUCE_RECOMMENDED if currently_threatened else Verdict.HOLD
-    reason = "p_hold_recovery_candidate" if label == _TOWARD_ALIVE else "p_hold_drop_candidate"
+    reason = toward_alive_reason if label == _TOWARD_ALIVE else toward_threatened_reason
     new_history = dataclasses.replace(
         history, candidate_state=label, candidate_count=count, candidate_first_ts_ns=first_ts,
     )
     return state, verdict, (reason,), count, new_history
 
 
-def evaluate_monitor(
-    evidence: MonitorEvidence,
-    history: MonitorHistory,
-    *,
-    stale_observation_bound_ns: int,
-) -> tuple[MonitorDecision, MonitorHistory]:
-    """Classify one evaluation. ``stale_observation_bound_ns`` is the SAME
-    bound ``evaluate_decision`` uses
-    (``config.stale_observation_minutes * 60_000_000_000``) -- taken as a
-    parameter here rather than re-declared, so the two paths never disagree
-    on what "stale" means.
-    """
-    if evidence.staleness_ns is None or evidence.staleness_ns > stale_observation_bound_ns:
-        new_history = dataclasses.replace(
-            history,
-            last_state=ThesisState.UNKNOWN,
-            last_verdict=Verdict.UNKNOWN,
-            candidate_state=None,
-            candidate_count=0,
-            candidate_first_ts_ns=None,
-            dead_confirm_observed_ns=(),
-        )
-        decision = MonitorDecision(
-            state=ThesisState.UNKNOWN,
-            verdict=Verdict.UNKNOWN,
-            reason_codes=("stale_observation",),
-            confirmations=0,
-            ts_ns=evidence.ts_ns,
-        )
-        return decision, new_history
+def _evaluate_threatened_alive(
+    evidence: MonitorEvidence, history: MonitorHistory
+) -> tuple[ThesisState, Verdict, tuple[str, ...], int, MonitorHistory]:
+    """YES leg only (module docstring rule 5) -- UNCHANGED behaviour."""
+    currently_threatened = history.last_state is ThesisState.THREATENED
 
+    if evidence.p_hold_at_entry is None or evidence.p_hold_at_t is None:
+        state = ThesisState.THREATENED if currently_threatened else ThesisState.ALIVE
+        verdict = Verdict.REDUCE_RECOMMENDED if currently_threatened else Verdict.HOLD
+        new_history = dataclasses.replace(
+            history, candidate_state=None, candidate_count=0, candidate_first_ts_ns=None,
+        )
+        return state, verdict, ("p_hold_undefined",), 0, new_history
+
+    drop = evidence.p_hold_at_entry - evidence.p_hold_at_t
+    is_candidate = drop >= _P_HOLD_DROP_MARGIN
+    return _evaluate_hysteresis(
+        is_candidate,
+        history,
+        evidence.ts_ns,
+        toward_threatened_reason="p_hold_drop_candidate",
+        toward_alive_reason="p_hold_recovery_candidate",
+    )
+
+
+def _evaluate_no_leg_threat(
+    evidence: MonitorEvidence, history: MonitorHistory
+) -> tuple[ThesisState, Verdict, tuple[str, ...], int, MonitorHistory]:
+    """NO leg's THREATENED-shaped case (module docstring's leg semantics
+    section): the running-max interval sits fully inside the rung before
+    the peak hour -- the high may still climb out and save the leg, so this
+    is geometric-only and never consults ``p_hold``.
+    """
+    is_candidate = _fully_inside_rung(evidence) and evidence.hour_lst < _LOCKED_HOUR_LST
+    return _evaluate_hysteresis(
+        is_candidate,
+        history,
+        evidence.ts_ns,
+        toward_threatened_reason="no_inside_rung",
+        toward_alive_reason="no_leg_recovering",
+    )
+
+
+def _evaluate_yes(
+    evidence: MonitorEvidence, history: MonitorHistory,
+) -> tuple[MonitorDecision, MonitorHistory]:
+    """YES leg (module docstring rules 2-5) -- UNCHANGED behaviour."""
     dead_qualifies = (
         evidence.rung_high is not None and evidence.running_max_lower > evidence.rung_high
     )
@@ -360,6 +448,160 @@ def evaluate_monitor(
         ts_ns=evidence.ts_ns,
     )
     return decision, new_history
+
+
+def _evaluate_no(
+    evidence: MonitorEvidence, history: MonitorHistory,
+) -> tuple[MonitorDecision, MonitorHistory]:
+    """NO leg (module docstring's leg semantics section): the two
+    mechanistic geometric facts YES uses for DEAD/LOCKED swap outcomes, and
+    the pre-peak "inside the rung" geometry becomes THREATENED instead of
+    running through YES's p_hold-driven hysteresis.
+    """
+    win_lock_qualifies = (
+        evidence.rung_high is not None and evidence.running_max_lower > evidence.rung_high
+    )
+    win_lock_ns, win_lock_confirmed = _update_dead_confirmation(
+        history.dead_confirm_observed_ns,
+        _dead_confirm_key(evidence),
+        qualifies=win_lock_qualifies,
+    )
+
+    if win_lock_confirmed:
+        new_history = dataclasses.replace(
+            history,
+            last_state=ThesisState.LOCKED_BY_OBSERVATION,
+            last_verdict=Verdict.HOLD,
+            candidate_state=None,
+            candidate_count=0,
+            candidate_first_ts_ns=None,
+            dead_confirm_observed_ns=win_lock_ns,
+            locked_confirm_observed_ns=(),
+        )
+        decision = MonitorDecision(
+            state=ThesisState.LOCKED_BY_OBSERVATION,
+            verdict=Verdict.HOLD,
+            reason_codes=("no_leg_win_locked",),
+            confirmations=len(win_lock_ns),
+            ts_ns=evidence.ts_ns,
+        )
+        return decision, new_history
+
+    if win_lock_qualifies:
+        prev_state = history.last_state if history.last_state is not None else ThesisState.ALIVE
+        prev_verdict = history.last_verdict if history.last_verdict is not None else Verdict.HOLD
+        new_history = dataclasses.replace(
+            history, dead_confirm_observed_ns=win_lock_ns, locked_confirm_observed_ns=(),
+        )
+        decision = MonitorDecision(
+            state=prev_state,
+            verdict=prev_verdict,
+            reason_codes=("dead_candidate",),
+            confirmations=len(win_lock_ns),
+            ts_ns=evidence.ts_ns,
+        )
+        return decision, new_history
+
+    dead_lock_qualifies = _is_locked(evidence)
+    dead_lock_ns, dead_lock_confirmed = _update_dead_confirmation(
+        history.locked_confirm_observed_ns,
+        _dead_confirm_key(evidence),
+        qualifies=dead_lock_qualifies,
+    )
+
+    if dead_lock_confirmed:
+        verdict = _dead_verdict(evidence)
+        new_history = dataclasses.replace(
+            history,
+            last_state=ThesisState.DEAD_BY_OBSERVATION,
+            last_verdict=verdict,
+            candidate_state=None,
+            candidate_count=0,
+            candidate_first_ts_ns=None,
+            dead_confirm_observed_ns=(),
+            locked_confirm_observed_ns=dead_lock_ns,
+        )
+        decision = MonitorDecision(
+            state=ThesisState.DEAD_BY_OBSERVATION,
+            verdict=verdict,
+            reason_codes=("no_leg_inside_rung_after_peak",),
+            confirmations=len(dead_lock_ns),
+            ts_ns=evidence.ts_ns,
+        )
+        return decision, new_history
+
+    if dead_lock_qualifies:
+        prev_state = history.last_state if history.last_state is not None else ThesisState.ALIVE
+        prev_verdict = history.last_verdict if history.last_verdict is not None else Verdict.HOLD
+        new_history = dataclasses.replace(
+            history, dead_confirm_observed_ns=(), locked_confirm_observed_ns=dead_lock_ns,
+        )
+        decision = MonitorDecision(
+            state=prev_state,
+            verdict=prev_verdict,
+            reason_codes=("dead_candidate",),
+            confirmations=len(dead_lock_ns),
+            ts_ns=evidence.ts_ns,
+        )
+        return decision, new_history
+
+    state, verdict, reason_codes, confirmations, ta_history = _evaluate_no_leg_threat(
+        evidence, history,
+    )
+    new_history = dataclasses.replace(
+        ta_history,
+        last_state=state,
+        last_verdict=verdict,
+        dead_confirm_observed_ns=(),
+        locked_confirm_observed_ns=(),
+    )
+    decision = MonitorDecision(
+        state=state,
+        verdict=verdict,
+        reason_codes=reason_codes,
+        confirmations=confirmations,
+        ts_ns=evidence.ts_ns,
+    )
+    return decision, new_history
+
+
+def evaluate_monitor(
+    evidence: MonitorEvidence,
+    history: MonitorHistory,
+    *,
+    stale_observation_bound_ns: int,
+) -> tuple[MonitorDecision, MonitorHistory]:
+    """Classify one evaluation. ``stale_observation_bound_ns`` is the SAME
+    bound ``evaluate_decision`` uses
+    (``config.stale_observation_minutes * 60_000_000_000``) -- taken as a
+    parameter here rather than re-declared, so the two paths never disagree
+    on what "stale" means. Dispatches on ``evidence.leg`` -- see the module
+    docstring's leg semantics section for why NO cannot share YES's DEAD/
+    LOCKED/THREATENED mapping.
+    """
+    if evidence.staleness_ns is None or evidence.staleness_ns > stale_observation_bound_ns:
+        new_history = dataclasses.replace(
+            history,
+            last_state=ThesisState.UNKNOWN,
+            last_verdict=Verdict.UNKNOWN,
+            candidate_state=None,
+            candidate_count=0,
+            candidate_first_ts_ns=None,
+            dead_confirm_observed_ns=(),
+            locked_confirm_observed_ns=(),
+        )
+        decision = MonitorDecision(
+            state=ThesisState.UNKNOWN,
+            verdict=Verdict.UNKNOWN,
+            reason_codes=("stale_observation",),
+            confirmations=0,
+            ts_ns=evidence.ts_ns,
+        )
+        return decision, new_history
+
+    if evidence.leg == "NO":
+        return _evaluate_no(evidence, history)
+    return _evaluate_yes(evidence, history)
 
 
 def should_emit(decision: MonitorDecision, history: MonitorHistory, now_ns: int) -> bool:
