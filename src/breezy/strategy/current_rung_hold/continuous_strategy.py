@@ -22,7 +22,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Final, Literal
 
 from nautilus_trader.model.enums import OrderSide, TimeInForce
-from nautilus_trader.model.events import OrderDenied, OrderFilled
+from nautilus_trader.model.events import OrderDenied, OrderFilled, PositionOpened
 from nautilus_trader.model.identifiers import InstrumentId
 from nautilus_trader.trading.strategy import Strategy
 
@@ -60,6 +60,7 @@ from breezy.runtime.paper_replay import EXPIRATION_LEG_PREFIX
 from breezy.strategy.current_rung_hold.config import CurrentRungHoldConfig
 from breezy.strategy.current_rung_hold.decision import Decision, Refuse, Take
 from breezy.strategy.current_rung_hold.offer_tape import OfferTape, OfferTapeRecord
+from breezy.strategy.current_rung_hold.position_monitor import PositionMonitor
 from breezy.strategy.current_rung_hold.strategy import (
     _DIAG_NO_RUNNING_MAX_YET,
     _DIAG_NOT_EXECUTABLE,
@@ -164,6 +165,18 @@ _POSITION_FAMILY_HALT_AT_START: Final[str] = "family_halt_at_start"
 #: Three-seam Slice 4 review item 1: a corrupt/unreadable latch read or
 #: write inside `on_order_filled` -- fail closed, process-local, never raise.
 _POSITION_FILL_JOIN_ERROR: Final[str] = "fill_join_error"
+#: INC-5 (intra-day position monitor, D8): a `PositionMonitor` forwarding
+#: call failed -- caught at THIS handler boundary (`_forward_to_monitor`),
+#: counted, reported, never raised into `_hunt_tick`/`_maybe_submit`/latch
+#: state.
+_POSITION_MONITOR_ERROR: Final[str] = "monitor_error"
+#: Review finding F3: `on_position_opened`'s `self.cache.position(event.
+#: position_id)` lookup returns `None` -- counted, never silently skipped.
+#: A later Depth10 frame still registers the position lazily via
+#: `PositionMonitor._ensure_registered`'s own `positions_open` read
+#: (`position_monitor.py`), so this is observability only, never a lost
+#: registration.
+_POSITION_OPENED_EVENT_UNRESOLVED: Final[str] = "position_opened_event_unresolved"
 #: Review item 2: a legacy (pre-Slice-4) record with no `venue_order_id`
 #: cannot prove a SECOND fill is genuinely a duplicate vs. its own replay --
 #: logged, never halted.
@@ -307,6 +320,7 @@ class ContinuousRungHoldStrategy(Strategy):
         offer_tape_path: Path | None = None,
         position_evidence_reader: Callable[[], dict[str, object] | None] | None = None,
         phase0_permit_guard: bool = True,
+        position_monitor: PositionMonitor | None = None,
     ) -> None:
         """``phase0_permit_guard=True`` (default) keeps Phase 0's seal: a
         non-None ``order_submission_permit`` raises
@@ -397,6 +411,13 @@ class ContinuousRungHoldStrategy(Strategy):
         #: instrument id), for the life of the process, mirroring
         #: `_illegal_cell_station_days`.
         self._no_refuse_notice: set[tuple[str, str, str]] = set()
+        #: INC-5 (intra-day position monitor, SHADOW-ONLY): `None` (default)
+        #: means every monitor hook below is a no-op -- byte-identical
+        #: behaviour to before this field existed. A composition root wires
+        #: a real `PositionMonitor` in after construction (`composition.py`);
+        #: this strategy never constructs one itself and never reaches into
+        #: its mutating surface (there is none -- M7 D3 pin).
+        self._position_monitor: PositionMonitor | None = position_monitor
 
     def _submission_armed(self) -> bool:
         """Whether this strategy holds a real order-submission capability.
@@ -778,10 +799,52 @@ class ContinuousRungHoldStrategy(Strategy):
         self.log.info(self._illegal_cell_snapshot_message())
         for iid in self._facts:
             self.unsubscribe_order_book_depth(InstrumentId.from_str(iid))
+        if self._position_monitor is not None:
+            monitor = self._position_monitor
+            self._forward_to_monitor(lambda: monitor.on_stop(self.clock.timestamp_ns()))
         exit_stack, self._exit_stack = self._exit_stack, None
         self._latch = None
         if exit_stack is not None:
             exit_stack.close()
+
+    def on_position_opened(self, event: PositionOpened) -> None:
+        super().on_position_opened(event)
+        if self._position_monitor is None:
+            return
+        monitor = self._position_monitor
+        position = self.cache.position(event.position_id)
+        if position is None:
+            # F3: counted, never silently dropped. `_ensure_registered`
+            # (`position_monitor.py`) still registers this position lazily
+            # off its own `positions_open` read the next time a Depth10
+            # frame arrives, so nothing is permanently lost -- only this
+            # event's own hand-off.
+            self.position_events.record(_POSITION_OPENED_EVENT_UNRESOLVED)
+            self._report_alerter(
+                self.position_alerter, "continuous_rung_hold position report failed",
+            )
+            return
+        self._forward_to_monitor(
+            lambda: monitor.on_position_opened(position, self.clock.timestamp_ns()),
+        )
+
+    def _forward_to_monitor(self, action: Callable[[], None]) -> None:
+        """D8 (plan §2/§7): "monitor exceptions caught at the handler
+        boundary" -- a SECOND, strategy-level containment layer on top of
+        `PositionMonitor`'s own internal guard, so even a monitor object
+        that fails in some way its own guard cannot catch (a broken stub,
+        a raise from a mocked method) never reaches -- or blocks --
+        `_hunt_tick`/`_maybe_submit`/latch state. Counted the same way
+        every other position-observability event is (`position_events`),
+        never as a refusal or a diagnostic WAIT.
+        """
+        try:
+            action()
+        except Exception:  # noqa: BLE001 - a monitor must never affect the strategy's own path
+            self.position_events.record(_POSITION_MONITOR_ERROR)
+            self._report_alerter(
+                self.position_alerter, "continuous_rung_hold position report failed",
+            )
 
     def _diagnostics_snapshot_message(self) -> str:
         counts = dict(sorted(self.diagnostics.counts.items()))
@@ -808,6 +871,10 @@ class ContinuousRungHoldStrategy(Strategy):
             data.is_metar,
             data.received_at_ns,
         )
+        if self._position_monitor is not None:
+            monitor = self._position_monitor
+            received_at_ns = data.received_at_ns
+            self._forward_to_monitor(lambda: monitor.on_observation(station, received_at_ns))
         stale_bound_ns = self._config.stale_observation_minutes * _NS_PER_MINUTE
         for iid, facts in self._facts.items():
             if facts.settlement_station != station:
@@ -846,6 +913,9 @@ class ContinuousRungHoldStrategy(Strategy):
             bid_size=bid.size.as_decimal() if bid is not None else None,
         )
         self._hunt_tick(snapshot, trigger="depth", quote_age_ns=None)
+        if self._position_monitor is not None:
+            monitor = self._position_monitor
+            self._forward_to_monitor(lambda: monitor.on_depth(depth, depth.ts_event))
 
     def _hunt_tick(
         self,

@@ -106,6 +106,7 @@ __all__ = [
     "startup_evidence_permits_arm",
     "startup_evidence_position_for",
     "station_day_admission",
+    "trial_id_for",
 ]
 
 #: Default trial-key prefix -- byte-identical to the v2 live family.
@@ -383,6 +384,24 @@ def _key(
             "boundary this function builds"
         )
     return f"{base}/{normalized}"
+
+
+def trial_id_for(
+    key_prefix: str, station: str, climate_day: str, instrument_id: str,
+) -> str:
+    """The canonical ``trial_id`` string for one (station, climate_day,
+    instrument_id) trial under ``key_prefix`` -- a public, read-only wrapper
+    around this module's own private :func:`_key`, so a second caller
+    (``position_monitor.py``, INC-5/A1) can derive the SAME string
+    ``score_live_trials.py`` reads back verbatim from the durable store's
+    own key, WITHOUT re-deriving the key-building rule inline and risking
+    silent drift between the two.
+
+    No behaviour change: ``_key(station, climate_day, key_prefix=key_prefix,
+    key_instrument_id=instrument_id)`` is exactly what a v3 (instrument-
+    keyed) ``TrialDayRecord`` is written and read under today.
+    """
+    return _key(station, climate_day, key_prefix=key_prefix, key_instrument_id=instrument_id)
 
 
 @dataclass(frozen=True, slots=True)

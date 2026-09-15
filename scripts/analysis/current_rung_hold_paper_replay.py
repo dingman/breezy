@@ -65,6 +65,7 @@ from breezy.runtime.exec_state_db_path import (
     node_store_path_check,
     resolve_store_path,
 )
+from breezy.runtime.health import AlertPayload, emit_alert, resolve_alert_sink
 from breezy.runtime.paper_replay import (
     EXPIRATION_LEG_PREFIX,
     PAPER_TRIAL_ID_PREFIX,
@@ -91,6 +92,9 @@ from breezy.strategy.current_rung_hold.config import CurrentRungHoldConfig
 from breezy.strategy.current_rung_hold.continuous_backtest_only import (
     ContinuousRungHoldBacktestStrategy,
 )
+from breezy.strategy.current_rung_hold.monitor_store import MarkBuffer
+from breezy.strategy.current_rung_hold.monitor_wiring import build_monitor_callables
+from breezy.strategy.current_rung_hold.position_monitor import PositionMonitor
 from breezy.strategy.current_rung_hold.strategy import _local_hour
 from breezy.strategy.current_rung_hold.trial_day_latch import (
     CONTINUOUS_TRIAL_KEY_PREFIX,
@@ -126,6 +130,17 @@ _WINDOW_END_HOUR_LST: Final[int] = 17  # exclusive
 
 STARTING_BALANCE_USD: Final[int] = 10_000
 SEVEN_DAYS_NS: Final[int] = 7 * 24 * 60 * 60 * 1_000_000_000
+_NS_PER_MINUTE: Final[int] = 60_000_000_000
+
+#: INC-7 (plan §6, Rev 2.1 addendum M3): a SIBLING pair under `--monitor-
+#: out-dir`, deliberately NOT nested the way the live composition root
+#: nests `monitor/summaries` (`composition.py`'s `_MONITOR_SUMMARIES_
+#: DIRNAME`) -- a disposable replay run's catalog and its summary rollups
+#: are independently disposable here, so there is no reason to couple their
+#: paths.
+_MONITOR_CATALOG_DIRNAME: Final[str] = "monitor"
+_MONITOR_SUMMARIES_DIRNAME: Final[str] = "monitor_summaries"
+_MONITOR_SIDECAR_FILENAME: Final[str] = "position_monitor_marks.jsonl"
 
 #: Default paper-replay store -- deliberately NOT the live scored_trials
 #: dir (L-22: two independent barriers, see `paper_replay.py`'s docstring).
@@ -714,6 +729,81 @@ class _FlatStartupEvidence:
         }
 
 
+def install_position_monitor(
+    strategy: ContinuousRungHoldBacktestStrategy,
+    *,
+    out_dir: Path,
+    clock_ns: Callable[[], int],
+) -> PositionMonitor:
+    """INC-7 (plan §6, Rev 2.1 addendum M3): attach a shadow
+    :class:`PositionMonitor` to `strategy` inside the v3 paper-replay
+    harness, run under a real engine ``TestClock``.
+
+    F1 DRY extraction: the eight read-only closures over the strategy's own
+    cache/latch/facts/accumulators (never a direct reference to its mutating
+    surface, M7 D3 pin: never `_hunt_tick`/`_maybe_submit`, never
+    `_decision_ask_by_station_day`) now come from
+    :func:`build_monitor_callables` (``monitor_wiring.py``) -- the SAME
+    factory ``composition.py::_build_position_monitor_for`` and the contract
+    test's ``_wire_monitor`` also call. This function still owns the
+    directory layout the live composition root does not use (`out_dir/
+    monitor` plus a SIBLING `out_dir/monitor_summaries`, never nested the
+    way the live root nests `monitor/summaries`) and a `MarkBuffer` carrying
+    a JSONL sidecar (a replay run is disposable, so a best-effort on-disk
+    trail of every mark is worth the write cost the live node's bare
+    `MarkBuffer()` deliberately avoids).
+
+    `clock_ns` is taken as a caller-supplied callable, never derived
+    internally from `strategy.clock.timestamp_ns` at call time: a
+    backtest-only strategy's `.clock` attribute is a placeholder `Clock()`
+    until `Strategy.register()` swaps in the engine's real `TestClock`
+    (`nautilus_trader.trading.strategy.Strategy.__init__`/`register_base`),
+    and this function always runs BEFORE that registration (the same
+    ordering `composition.py` uses). Binding a bare method reference at
+    THIS call site would capture the placeholder forever; the caller must
+    pass a callable that reads `strategy.clock` fresh on every invocation
+    (e.g. ``lambda: strategy.clock.timestamp_ns()``), which stays correct
+    across the registration swap.
+
+    Default OFF (module docstring; plan spec): a caller that never invokes
+    this leaves `strategy._position_monitor` at its inherited `None`, so
+    every existing replay artefact stays byte-identical.
+    """
+    monitor_root = out_dir / _MONITOR_CATALOG_DIRNAME
+    summaries_dir = out_dir / _MONITOR_SUMMARIES_DIRNAME
+    sink = resolve_alert_sink()
+
+    def _report(event: str, detail: Mapping[str, object]) -> None:
+        emit_alert(
+            sink,
+            AlertPayload(
+                severity="WARN", event=event, site=str(strategy.id), detail=str(dict(detail)),
+            ),
+        )
+
+    callables = build_monitor_callables(strategy)
+    monitor = PositionMonitor(
+        clock_ns=clock_ns,
+        positions_open=callables.positions_open,
+        accumulators=strategy._accumulators,
+        latch_record=callables.latch_record,
+        rung_geometry=callables.rung_geometry,
+        fee_coefficient_for=callables.fee_coefficient_for,
+        leg_for=callables.leg_for,
+        station_for=callables.station_for,
+        climate_day_for=callables.climate_day_for,
+        hour_lst_for=callables.hour_lst_for,
+        stale_observation_bound_ns=strategy._config.stale_observation_minutes * _NS_PER_MINUTE,
+        trial_id_prefix=CONTINUOUS_TRIAL_KEY_PREFIX,
+        buffer=MarkBuffer(sidecar_path=out_dir / _MONITOR_SIDECAR_FILENAME),
+        catalog_root=monitor_root,
+        summaries_dir=summaries_dir,
+        report=_report,
+    )
+    strategy._position_monitor = monitor
+    return monitor
+
+
 def run_one_precision_arm(
     *,
     tape_instruments: Sequence[TapeInstrument],
@@ -727,12 +817,31 @@ def run_one_precision_arm(
         CurrentRungHoldBacktestStrategy | ContinuousRungHoldBacktestStrategy
     ] = CurrentRungHoldBacktestStrategy,
     latch_key_prefix: str = DEFAULT_TRIAL_KEY_PREFIX,
+    monitor_out_dir: Path | None = None,
 ) -> PrecisionArmResult:
     """Run one (lag, precision) arm of the replay; return its `FilledTrial`s
     AND the strategy's own refusal counts (`PrecisionArmResult`).
 
     `tape_instruments` supplies BOTH `QuoteTick` and `OrderBookDepth10` --
     `build_paper_replay_config` refuses a quote-only instrument (RED test 2).
+
+    `monitor_out_dir` (INC-7): `None` (default) never installs a
+    `PositionMonitor` -- byte-identical to before this parameter existed.
+    Non-`None` is meaningful only for the continuous arm
+    (`strategy_cls is ContinuousRungHoldBacktestStrategy`); passing it
+    alongside `CurrentRungHoldBacktestStrategy` is a silent no-op, since the
+    v2 strategy carries no `_position_monitor` hook at all.
+
+    Review finding F2: `main` calls this function once per entry in
+    `PRECISION_ARMS`, all sharing the ONE `monitor_out_dir` an operator
+    passes on the CLI. Neither `PositionMarkRecord` nor
+    `PositionMonitorSummary` carries a precision-arm discriminator, so two
+    arms writing to the identical `monitor_out_dir/monitor` catalog and
+    `monitor_out_dir/monitor_summaries` directory can collide --
+    `read_monitor_summaries`' dedup by `(trial_id, max monitor_seq)` would
+    then silently keep only one arm's row. `install_position_monitor` is
+    therefore called against `monitor_out_dir / precision_mode`, giving
+    each arm its own `<mode>/monitor` + `<mode>/monitor_summaries` pair.
     """
     inputs = PaperReplayInputs(lag_minutes=lag_minutes, precision_mode=precision_mode)
     # `StationObservation.station` must carry the IEM ASOS/ICAO id
@@ -837,6 +946,13 @@ def run_one_precision_arm(
             position_evidence_reader=evidence,
         )
         evidence.bind(strategy)
+        if monitor_out_dir is not None:
+            # F2: keyed per arm -- see this function's own docstring.
+            install_position_monitor(
+                strategy,
+                out_dir=monitor_out_dir / precision_mode,
+                clock_ns=lambda: strategy.clock.timestamp_ns(),
+            )
     else:
         strategy = strategy_cls(
             cfg,
@@ -976,6 +1092,19 @@ def main(argv: Sequence[str] | None = None) -> int:
             "ContinuousRungHoldBacktestStrategy (SP-4)."
         ),
     )
+    parser.add_argument(
+        "--monitor-out-dir",
+        default=None,
+        type=Path,
+        help=(
+            "INC-7: install a shadow PositionMonitor under this directory, "
+            "one <precision_mode>/monitor + <precision_mode>/monitor_summaries "
+            "pair per PRECISION_ARMS entry (F2: never a shared pair, which "
+            "could hide one arm's row). Meaningful only with "
+            "--strategy continuous_rung_hold; default None never installs "
+            "one, so every existing replay artefact stays byte-identical."
+        ),
+    )
     args = parser.parse_args(argv)
 
     # Explicit `if`, never `getattr`/dynamic-import duck-typing (L-12/AM-5;
@@ -1068,6 +1197,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             settlement_by_key=settlement,
             strategy_cls=strategy_cls,
             latch_key_prefix=latch_key_prefix,
+            monitor_out_dir=args.monitor_out_dir,
         )
         all_trials.extend(result.trials)
         # (a) reporting gap: the strategy's own refusal counts, sorted for a

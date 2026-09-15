@@ -188,3 +188,28 @@ def test_the_registered_cont_manifest_loads_without_allow_draft() -> None:
     assert cont.boundary_inputs_sha256 == artefact_payload["inputs_sha256"]
     assert cont.trial_id_prefix == "continuous_rung_hold/trial/"
     assert cont.stations == ("LAX", "MDW", "MIA", "SFO")
+
+
+def test_exit_rule_absent_defaults_to_none(tmp_path: Path) -> None:
+    manifest = load_family_manifest(_write(tmp_path, _VALID))
+    assert manifest.exit_rule is None
+
+
+def test_exit_rule_present_and_non_empty_is_accepted(tmp_path: Path) -> None:
+    payload = dict(_VALID, exit_rule="hold_to_settlement")
+    manifest = load_family_manifest(_write(tmp_path, payload))
+    assert manifest.exit_rule == "hold_to_settlement"
+
+
+def test_a_genuinely_unknown_key_is_still_refused_alongside_exit_rule(
+    tmp_path: Path,
+) -> None:
+    payload = dict(_VALID, exit_rule="hold_to_settlement", extra_field="surprise")
+    with pytest.raises(FamilyManifestValidationError):
+        load_family_manifest(_write(tmp_path, payload))
+
+
+def test_an_empty_string_exit_rule_is_refused(tmp_path: Path) -> None:
+    payload = dict(_VALID, exit_rule="")
+    with pytest.raises(FamilyManifestValidationError):
+        load_family_manifest(_write(tmp_path, payload))

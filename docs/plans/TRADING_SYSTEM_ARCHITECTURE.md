@@ -1586,6 +1586,8 @@ Neither kind flattens positions automatically. **Nothing in this architecture
 force-closes a position without a human.** That is a deliberate asymmetry: an
 automated flatten under a data fault is itself a trade made on faulty data.
 
+A shadow position monitor exists to continuously evaluate open positions on market observations and Depth10 updates, re-computing entry thesis state (ALIVE / THREATENED / DEAD / LOCKED / UNKNOWN) and recording verdicts (HOLD / REDUCE_RECOMMENDED / EXIT_RECOMMENDED / MISSING_STOP) to a dedicated monitor catalog and summary store for nightly reporting and comparative analysis. The monitor preserves this asymmetry: it evaluates but never submits; a real exit execution requires a family manifest that declares an exit rule via `persistence/exit_gate.py` (empty allow-list today) and a new pre-registration, since an exit rule is a class-(C) change to the registered trial.
+
 ### 10.4 Circuit-breaker numbers
 
 The drawdown threshold, the rejection-count threshold and the reset policy are

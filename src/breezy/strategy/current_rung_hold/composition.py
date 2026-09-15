@@ -37,7 +37,7 @@ from breezy.domain.weather_bucket_facts import (
     read_weather_bucket_facts,
 )
 from breezy.runtime.component_health_watch import COMPONENT_STATE_TOPIC
-from breezy.runtime.health import AlertState, resolve_alert_sink
+from breezy.runtime.health import AlertPayload, AlertState, emit_alert, resolve_alert_sink
 from breezy.runtime.order_enablement import OrderSubmissionPermit
 from breezy.runtime.settings import SettingsError
 from breezy.runtime.submit_intent import SubmitIntentLatch
@@ -46,9 +46,13 @@ from breezy.strategy.current_rung_hold.continuous_strategy import (
     ContinuousRungHoldStrategy,
     Phase0PermitForbiddenError,
 )
+from breezy.strategy.current_rung_hold.monitor_store import MarkBuffer
+from breezy.strategy.current_rung_hold.monitor_wiring import build_monitor_callables
 from breezy.strategy.current_rung_hold.offer_tape import OfferTape
+from breezy.strategy.current_rung_hold.position_monitor import PositionMonitor
 from breezy.strategy.current_rung_hold.strategy import CurrentRungHoldStrategy
 from breezy.strategy.current_rung_hold.trial_day_latch import (
+    CONTINUOUS_TRIAL_KEY_PREFIX,
     DEFAULT_TRIAL_KEY_PREFIX,
     TrialDayLatch,
     open_trial_day_latch,
@@ -72,6 +76,14 @@ logger = logging.getLogger(__name__)
 
 _COMPONENT_ID_PREFIX: Final[str] = "CurrentRungHoldStrategy"
 _CONTINUOUS_COMPONENT_ID_PREFIX: Final[str] = "ContinuousRungHoldStrategy"
+
+#: INC-5 (intra-day position monitor, plan §2 "no new env var"). Sibling of
+#: the quote-tape catalog root, NEVER nested under it (`monitor_store.py`'s
+#: own docstring; the trader writes no tape of its own, `node_config.py:
+#: 748-750`).
+_MONITOR_CATALOG_DIRNAME: Final[str] = "monitor"
+_MONITOR_SUMMARIES_DIRNAME: Final[str] = "summaries"
+_NS_PER_MINUTE: Final[int] = 60_000_000_000
 
 #: Review finding 1: a WAIT-state diagnostic is not a refusal -- passed to
 #: `RefusalAlerter`'s injectable vocabulary so its event name/detail never
@@ -437,6 +449,7 @@ def build_continuous_rung_hold_strategies(
     order_submission_permit: OrderSubmissionPermit | None = None,
     offer_tape_path: Path | None = None,
     phase0_permit_guard: bool = True,
+    enable_position_monitor: bool = True,
 ) -> tuple[ContinuousRungHoldStrategy, ...]:
     """One continuous-rung-hold strategy per supported station with instruments.
 
@@ -451,6 +464,12 @@ def build_continuous_rung_hold_strategies(
     when ``phase1_family_permits`` has genuinely routed the single sending
     family's permit to v3 -- see ``app/trade.py::run``, the only caller that
     ever passes ``False``.
+
+    ``enable_position_monitor`` (INC-5, D2/D3 SHADOW-ONLY -- never submits,
+    modifies, or cancels an order): ``True`` by default in live composition.
+    A build-side switch, never an operator control and never a new env var
+    (plan D1) -- tests that want the pre-INC-5 byte-identical strategy pass
+    ``False``.
     """
     if phase0_permit_guard and order_submission_permit is not None:
         raise Phase0PermitForbiddenError(
@@ -465,6 +484,10 @@ def build_continuous_rung_hold_strategies(
     # slots) is shared by every per-station strategy below -- not one tape per
     # station.
     tape = OfferTape(offer_tape_path)
+    #: Sibling of the quote-tape catalog root (NEVER nested under it) --
+    #: `catalog_root` here is `resolve_station_instrument_ids`'s own quote
+    #: -tape root, so `monitor_root` is a directory beside it, one level up.
+    monitor_root = catalog_root.parent / _MONITOR_CATALOG_DIRNAME
     strategies: list[ContinuousRungHoldStrategy] = []
     for station in SUPPORTED_STATIONS:
         instrument_ids = resolved[station]
@@ -481,16 +504,69 @@ def build_continuous_rung_hold_strategies(
             strategy_id=_CONTINUOUS_COMPONENT_ID_PREFIX,
             order_id_tag=station,
         )
-        strategies.append(
-            ContinuousRungHoldStrategy(
-                config,
-                trial_day_latch_factory=trial_day_latch_factory,
-                order_submission_permit=order_submission_permit,
-                offer_tape=tape,
-                phase0_permit_guard=phase0_permit_guard,
-            )
+        strategy = ContinuousRungHoldStrategy(
+            config,
+            trial_day_latch_factory=trial_day_latch_factory,
+            order_submission_permit=order_submission_permit,
+            offer_tape=tape,
+            phase0_permit_guard=phase0_permit_guard,
         )
+        if enable_position_monitor:
+            # Attribute assignment, not a constructor kwarg: the monitor's
+            # own callables close over `strategy` (its cache/latch/facts are
+            # only populated once `on_start` runs), so it can only be built
+            # AFTER construction -- see `_build_position_monitor_for`.
+            strategy._position_monitor = _build_position_monitor_for(
+                strategy, monitor_root=monitor_root,
+            )
+        strategies.append(strategy)
     return tuple(strategies)
+
+
+def _build_position_monitor_for(
+    strategy: ContinuousRungHoldStrategy, *, monitor_root: Path,
+) -> PositionMonitor:
+    """Wire a :class:`PositionMonitor` to ``strategy``.
+
+    F1 DRY extraction: the eight read-only closures come from
+    :func:`build_monitor_callables` (``monitor_wiring.py``) -- the SAME
+    factory ``install_position_monitor`` (paper-replay) and the contract
+    test's ``_wire_monitor`` also call, so the wiring can never drift
+    between the three sites again. This function still owns everything
+    site-specific -- the alert-sink ``report``, the live ``MarkBuffer()``,
+    and the live monitor/summaries paths -- never a direct constructor
+    reference to the strategy's own mutating surface (M7 D3 pin, plan §2).
+    """
+    sink = resolve_alert_sink()
+
+    def _report(event: str, detail: Mapping[str, object]) -> None:
+        emit_alert(
+            sink,
+            AlertPayload(
+                severity="WARN", event=event, site=str(strategy.id), detail=str(dict(detail)),
+            ),
+        )
+
+    callables = build_monitor_callables(strategy)
+    return PositionMonitor(
+        clock_ns=strategy.clock.timestamp_ns,
+        positions_open=callables.positions_open,
+        accumulators=strategy._accumulators,
+        latch_record=callables.latch_record,
+        rung_geometry=callables.rung_geometry,
+        fee_coefficient_for=callables.fee_coefficient_for,
+        leg_for=callables.leg_for,
+        station_for=callables.station_for,
+        climate_day_for=callables.climate_day_for,
+        hour_lst_for=callables.hour_lst_for,
+        stale_observation_bound_ns=strategy._config.stale_observation_minutes
+        * _NS_PER_MINUTE,
+        trial_id_prefix=CONTINUOUS_TRIAL_KEY_PREFIX,
+        buffer=MarkBuffer(),
+        catalog_root=monitor_root,
+        summaries_dir=monitor_root / _MONITOR_SUMMARIES_DIRNAME,
+        report=_report,
+    )
 
 
 def install_current_rung_hold_refusal_watch(
