@@ -38,6 +38,7 @@ from breezy.runtime.trade_supervisor import (
     StopPriorRaceRefused,
     SupervisorPorts,
     _do_launch,
+    _do_midday_watch,
     _do_relaunch_check,
     _do_self_check,
     _do_stop_prior,
@@ -66,6 +67,7 @@ from breezy.runtime.trade_supervisor_core import (
     MAX_RELAUNCH_ATTEMPTS,
     MIDDAY_MAX_RELAUNCH_ATTEMPTS,
     MIDDAY_MIN_RELAUNCH_GAP,
+    MIDDAY_READINESS_RECHECK_TIMEOUT,
     MIN_RELAUNCH_GAP,
     RELAUNCH_CUTOFF_UTC,
     SUPERVISOR_ARGV_TOKEN,
@@ -2741,3 +2743,383 @@ class TestSupervisorLoggingConfiguration:
         assert exit_code == EXIT_OK
         assert supervisor_log_path(override_log_dir).exists()
         assert not decoy_home_log_dir.exists()
+
+
+# ===========================================================================
+# [2026-09-15] Mid-day watch (plan §3/§4 step 6): `_do_midday_watch` mirrors
+# `_do_relaunch_check` with an INDEPENDENT budget/window, a never-null
+# `tracked_pid` decline contract (opposite of boot's), and NO per-poll
+# flock probe outside the bounded post-relaunch readiness re-check.
+# ===========================================================================
+
+
+def _midday_watch_common_kwargs(tmp_path) -> dict:
+    return {
+        "store_path": tmp_path / "state" / "store.sqlite3",
+        "repo_root": tmp_path,
+        "node_bin": tmp_path / "node_bin",
+        "log_dir": tmp_path / "logs",
+    }
+
+
+class TestDoMiddayWatch:
+    def test_do_midday_watch_relaunches_a_dead_transient_child(self, tmp_path):
+        node_log = tmp_path / "node.log"
+        node_log.write_text(_TRADING_NODE_FAILED_LINE)
+        spawner = FakeSpawner()
+        ports = _make_ports(
+            process_alive=lambda _pid: False,
+            spawn=spawner,
+            read_log_new=lambda p: p.read_text(),
+        )
+        state = record_readiness_observed(initial_scheduler_state(_DAY), _utc(17, 10))
+
+        new_pid, new_log, state = _do_midday_watch(
+            ports=ports,
+            state=state,
+            now=_utc(20, 0),
+            tracked_pid=1001,
+            node_log=node_log,
+            **_midday_watch_common_kwargs(tmp_path),
+        )
+
+        assert len(spawner.calls) == 1
+        assert new_pid != 1001
+        assert new_log != node_log
+        assert state.midday_relaunch_attempts == 1
+        assert state.last_midday_relaunch_attempt_at == _utc(20, 0)
+
+    def test_do_midday_watch_declines_and_alerts_on_exhaustion_exactly_once(self, tmp_path):
+        from breezy.runtime.trade_supervisor_core import record_midday_relaunch_attempt
+
+        node_log = tmp_path / "node.log"
+        node_log.write_text(_TRADING_NODE_FAILED_LINE)
+        sink = _RecordingAlertSink()
+        ports = _make_ports(
+            process_alive=lambda _pid: False,
+            alert_sink=sink,
+            read_log_new=lambda p: p.read_text(),
+        )
+        state = record_readiness_observed(initial_scheduler_state(_DAY), _utc(17, 10))
+        for i in range(MIDDAY_MAX_RELAUNCH_ATTEMPTS):
+            state = record_midday_relaunch_attempt(state, _utc(19, 40 + i * 6))
+        assert state.midday_relaunch_attempts == MIDDAY_MAX_RELAUNCH_ATTEMPTS
+
+        tracked_pid, _, state = _do_midday_watch(
+            ports=ports,
+            state=state,
+            now=_utc(20, 0),
+            tracked_pid=1001,
+            node_log=node_log,
+            **_midday_watch_common_kwargs(tmp_path),
+        )
+
+        assert state.midday_alert_sent is True
+        assert [p.detail for p in sink.payloads] == [AlertDetail.MIDDAY_RELAUNCH_EXHAUSTED.value]
+
+        # A second poll (same day) must short-circuit before ANY log read
+        # or re-decision -- never re-alert.
+        tracked_pid_2, _, _state_2 = _do_midday_watch(
+            ports=ports,
+            state=state,
+            now=_utc(20, 1),
+            tracked_pid=tracked_pid,
+            node_log=node_log,
+            **_midday_watch_common_kwargs(tmp_path),
+        )
+        assert len(sink.payloads) == 1
+        assert tracked_pid_2 == tracked_pid
+
+    def test_do_midday_watch_keeps_tracked_pid_after_exhaustion(self, tmp_path):
+        from breezy.runtime.trade_supervisor_core import record_midday_relaunch_attempt
+
+        node_log = tmp_path / "node.log"
+        node_log.write_text(_TRADING_NODE_FAILED_LINE)
+        ports = _make_ports(process_alive=lambda _pid: False)
+        state = record_readiness_observed(initial_scheduler_state(_DAY), _utc(17, 10))
+        for i in range(MIDDAY_MAX_RELAUNCH_ATTEMPTS):
+            state = record_midday_relaunch_attempt(state, _utc(19, 40 + i * 6))
+
+        tracked_pid, _, _state = _do_midday_watch(
+            ports=ports,
+            state=state,
+            now=_utc(20, 0),
+            tracked_pid=1001,
+            node_log=node_log,
+            **_midday_watch_common_kwargs(tmp_path),
+        )
+
+        # Never None on decline -- opposite of `_do_relaunch_check`'s own
+        # boot-time contract -- so the dead PID stays visible in every
+        # subsequent `log_decision` line for operator diagnosis.
+        assert tracked_pid == 1001
+
+    def test_do_midday_watch_noop_while_child_alive(self, tmp_path):
+        node_log = tmp_path / "node.log"
+        node_log.write_text("")
+        holder_calls: list[Path] = []
+        ports = _make_ports(
+            process_alive=lambda _pid: True,
+            resolve_intent_lock_holder=lambda p: (holder_calls.append(p), None)[1],
+        )
+        state = record_readiness_observed(initial_scheduler_state(_DAY), _utc(17, 10))
+
+        result = _do_midday_watch(
+            ports=ports,
+            state=state,
+            now=_utc(18, 0),
+            tracked_pid=1001,
+            node_log=node_log,
+            **_midday_watch_common_kwargs(tmp_path),
+        )
+
+        assert result == (1001, node_log, state)
+        # The steady-state "still alive" poll never needs the flock probe --
+        # only the bounded post-relaunch readiness re-check does.
+        assert holder_calls == []
+
+    def test_do_midday_watch_alerts_when_relaunched_child_never_readies(self, tmp_path):
+        from breezy.runtime.trade_supervisor_core import record_midday_relaunch_attempt
+
+        node_log = tmp_path / "node.log"
+        node_log.write_text("")
+        sink = _RecordingAlertSink()
+        ports = _make_ports(
+            process_alive=lambda _pid: True,
+            resolve_intent_lock_holder=lambda _p: None,  # never took the flock
+            alert_sink=sink,
+        )
+        state = record_readiness_observed(initial_scheduler_state(_DAY), _utc(17, 10))
+        relaunch_at = _utc(20, 0)
+        state = record_midday_relaunch_attempt(state, relaunch_at)
+
+        past_timeout = relaunch_at + MIDDAY_READINESS_RECHECK_TIMEOUT + dt.timedelta(seconds=1)
+        tracked_pid, _, state = _do_midday_watch(
+            ports=ports,
+            state=state,
+            now=past_timeout,
+            tracked_pid=2002,
+            node_log=node_log,
+            **_midday_watch_common_kwargs(tmp_path),
+        )
+
+        assert tracked_pid == 2002
+        assert state.midday_not_ready_alert_sent is True
+        assert [p.detail for p in sink.payloads] == [
+            AlertDetail.MIDDAY_RELAUNCHED_CHILD_NOT_READY.value
+        ]
+
+        # A later poll must not re-alert -- observability only, once.
+        _, _, _state_2 = _do_midday_watch(
+            ports=ports,
+            state=state,
+            now=past_timeout + dt.timedelta(seconds=60),
+            tracked_pid=2002,
+            node_log=node_log,
+            **_midday_watch_common_kwargs(tmp_path),
+        )
+        assert len(sink.payloads) == 1
+
+    def test_relaunched_child_markers_are_read_from_the_new_log(self, tmp_path):
+        (tmp_path / "logs").mkdir(parents=True, exist_ok=True)
+        old_log = tmp_path / "child1.log"
+        old_log.write_text(_TRADING_NODE_FAILED_LINE)
+        reader = IncrementalLogReader()
+        session: dict = {"alive": set()}
+        ports = _make_ports(
+            process_alive=lambda pid: pid in session["alive"],
+            read_log_new=reader.read_new,
+            spawn=FakeSpawner(),
+        )
+        state = record_readiness_observed(initial_scheduler_state(_DAY), _utc(17, 10))
+
+        new_pid, new_log, state = _do_midday_watch(
+            ports=ports,
+            state=state,
+            now=_utc(20, 0),
+            tracked_pid=1001,
+            node_log=old_log,
+            **_midday_watch_common_kwargs(tmp_path),
+        )
+        assert new_log != old_log
+        assert state.strategy_subscribed_seen is False
+
+        new_log.write_text("CurrentRungHoldStrategy subscribed instrument=X\n")
+        session["alive"].add(new_pid)
+
+        _, _, state = _do_midday_watch(
+            ports=ports,
+            state=state,
+            now=_utc(20, 1),
+            tracked_pid=new_pid,
+            node_log=new_log,
+            **_midday_watch_common_kwargs(tmp_path),
+        )
+        # `node_log_path` is second-granular, so the new child's own
+        # `IncrementalLogReader` offset naturally starts at 0 for the new
+        # path -- this marker is read from CHILD 2's log, never a stale
+        # offset into child 1's.
+        assert state.strategy_subscribed_seen is True
+
+    def test_a_fatal_marker_drained_before_death_still_relaunches(self, tmp_path):
+        node_log = tmp_path / "node.log"
+        node_log.write_text(_TRADING_NODE_FAILED_LINE)
+        reader = IncrementalLogReader()
+        spawner = FakeSpawner()
+        session: dict = {"alive": True}
+        ports = _make_ports(
+            process_alive=lambda _pid: session["alive"],
+            read_log_new=reader.read_new,
+            spawn=spawner,
+        )
+        state = record_readiness_observed(initial_scheduler_state(_DAY), _utc(17, 10))
+
+        # Poll N: the fatal marker is present in THIS poll's delta, but the
+        # process is still alive -- the death-detecting poll may be a
+        # later one whose own delta no longer holds the marker text.
+        tracked_pid, node_log, state = _do_midday_watch(
+            ports=ports,
+            state=state,
+            now=_utc(20, 0),
+            tracked_pid=1001,
+            node_log=node_log,
+            **_midday_watch_common_kwargs(tmp_path),
+        )
+        assert state.midday_cause_seen is RelaunchCause.TRANSIENT
+        assert len(spawner.calls) == 0
+
+        # Push the marker text out of the reader's 256-byte carry with
+        # later, unrelated noise -- the exact 09-05/09-06 drain shape
+        # (§3/§7): >256 bytes evicts the short marker line from the next
+        # delta in a single append.
+        noise = "order book tick " + ("x" * 300) + "\n"
+        with node_log.open("a") as fh:
+            fh.write(noise)
+        _, node_log, state = _do_midday_watch(
+            ports=ports,
+            state=state,
+            now=_utc(20, 0, 30),
+            tracked_pid=tracked_pid,
+            node_log=node_log,
+            **_midday_watch_common_kwargs(tmp_path),
+        )
+
+        # Poll N+1: process now dead, and this poll's OWN delta no longer
+        # holds the marker text -- already drained by the poll above.
+        session["alive"] = False
+        leftover = reader.read_new(node_log)
+        assert "trading node failed" not in leftover  # sanity: genuinely drained
+
+        new_pid, _new_log, state = _do_midday_watch(
+            ports=ports,
+            state=state,
+            now=_utc(20, 1),
+            tracked_pid=tracked_pid,
+            node_log=node_log,
+            **_midday_watch_common_kwargs(tmp_path),
+        )
+
+        assert len(spawner.calls) == 1
+        assert new_pid != tracked_pid
+
+
+# ===========================================================================
+# [2026-09-15] Plan §4 step 7: `_run_forever`'s dispatch must route
+# `Phase.MIDDAY_WATCH` into `_do_midday_watch`, never fall through the bare
+# `else` into `_do_self_check`.
+# ===========================================================================
+
+
+class TestRunForeverDispatchesMiddayWatch:
+    def test_run_forever_dispatches_midday_watch_phase(self, tmp_path):
+        clock = FakeClock(_utc(16, 49, 30))
+        spawn_calls: list[int] = []
+        session: dict = {"tracked_pid": None}
+        dead_pids: set[int] = set()
+        kill_time = _utc(19, 57)
+        killed_once = {"done": False}
+
+        def fake_sleep(seconds: float) -> None:
+            clock.advance(seconds)
+
+        def fake_spawn(**_kwargs) -> FakePopen:
+            pid = 9000 + len(spawn_calls) + 1
+            spawn_calls.append(pid)
+            session["tracked_pid"] = pid
+            return FakePopen(pid)
+
+        def read_log_new(_path: Path) -> str:
+            if not killed_once["done"] and clock.current >= kill_time:
+                killed_once["done"] = True
+                dead_pids.add(session["tracked_pid"])
+                return _TRADING_NODE_FAILED_LINE
+            return _READY_LOG_LINES
+
+        ports = _make_ports(
+            spawn=fake_spawn,
+            resolve_intent_lock_holder=lambda _p: session["tracked_pid"],
+            process_alive=lambda pid: pid not in dead_pids,
+            read_log_new=read_log_new,
+        )
+
+        _run_forever(
+            store_path=tmp_path / "state" / "store.sqlite3",
+            repo_root=tmp_path,
+            node_bin=tmp_path / "node_bin",
+            log_dir=tmp_path / "logs",
+            clock=clock,
+            sleep=fake_sleep,
+            ports=ports,
+            max_iterations=300,
+        )
+
+        # LAUNCH's own spawn, plus MIDDAY_WATCH's relaunch of the
+        # dead-at-19:57Z child.
+        assert len(spawn_calls) == 2
+
+    def test_run_forever_never_routes_midday_watch_into_self_check(self, tmp_path, caplog):
+        clock = FakeClock(_utc(16, 49, 30))
+        session: dict = {"tracked_pid": None}
+        spawn_calls: list[int] = []
+        holder_count_calls = {"n": 0}
+
+        def fake_sleep(seconds: float) -> None:
+            clock.advance(seconds)
+
+        def fake_spawn(**_kwargs) -> FakePopen:
+            pid = 9500 + len(spawn_calls) + 1
+            spawn_calls.append(pid)
+            session["tracked_pid"] = pid
+            return FakePopen(pid)
+
+        def count_holders(_p: Path) -> int:
+            holder_count_calls["n"] += 1
+            return 1
+
+        ports = _make_ports(
+            spawn=fake_spawn,
+            resolve_intent_lock_holder=lambda _p: session["tracked_pid"],
+            count_intent_lock_holders=count_holders,
+            process_alive=lambda _pid: True,
+            read_log_new=lambda _p: _READY_LOG_LINES,
+        )
+
+        with caplog.at_level("INFO"):
+            _run_forever(
+                store_path=tmp_path / "state" / "store.sqlite3",
+                repo_root=tmp_path,
+                node_bin=tmp_path / "node_bin",
+                log_dir=tmp_path / "logs",
+                clock=clock,
+                sleep=fake_sleep,
+                ports=ports,
+                max_iterations=250,  # well past 17:10Z, deep into MIDDAY_WATCH
+            )
+
+        self_check_lines = [r for r in caplog.records if "self_check" in r.getMessage()]
+        # Exactly the one real 17:05Z SELF_CHECK line -- MIDDAY_WATCH never
+        # produces another, because it never routes into `_do_self_check`.
+        assert len(self_check_lines) == 1
+        # `count_intent_lock_holders` is read ONLY by `_do_self_check` --
+        # exactly one call proves MIDDAY_WATCH never dispatched there.
+        assert holder_count_calls["n"] == 1

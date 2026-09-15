@@ -583,6 +583,12 @@ class DaySchedulerState:
     #: Gates ``AlertDetail.MIDDAY_RELAUNCH_EXHAUSTED`` to exactly once per
     #: trading day.
     midday_alert_sent: bool = False
+    #: [2026-09-15] Gates ``AlertDetail.MIDDAY_RELAUNCHED_CHILD_NOT_READY``
+    #: to exactly once per mid-day-relaunched child -- observability only,
+    #: never a forced extra relaunch attempt (plan §3 "Relaunch
+    #: bookkeeping..."). Reset by :func:`record_child_adopted` for a new
+    #: child, same as ``midday_cause_seen``.
+    midday_not_ready_alert_sent: bool = False
 
 
 def initial_scheduler_state(day: dt.date) -> DaySchedulerState:
@@ -704,13 +710,17 @@ def record_child_adopted(state: DaySchedulerState, now_utc: dt.datetime) -> DayS
     and :func:`record_midday_relaunch_attempt` both reuse this primitive
     when a new child is launched. [2026-09-15] Also clears
     ``midday_cause_seen`` -- a mid-day-relaunched child's own exit-1 cause
-    is evidence about THAT child, never inherited from its predecessor."""
+    is evidence about THAT child, never inherited from its predecessor --
+    and ``midday_not_ready_alert_sent``, so a LATER mid-day relaunch (a
+    fresh child) gets its own bounded readiness re-check rather than
+    inheriting a prior child's already-fired alert latch."""
     effective = _for_day(state, _trading_day(now_utc))
     return replace(
         effective,
         strategy_subscribed_seen=False,
         permit_issued_seen_expires_at_ns=None,
         midday_cause_seen=None,
+        midday_not_ready_alert_sent=False,
     )
 
 
@@ -800,6 +810,19 @@ def record_midday_alert_sent(state: DaySchedulerState, now_utc: dt.datetime) -> 
     if effective.midday_alert_sent:
         return effective
     return replace(effective, midday_alert_sent=True)
+
+
+def record_midday_not_ready_alert_sent(
+    state: DaySchedulerState, now_utc: dt.datetime
+) -> DaySchedulerState:
+    """[2026-09-15] Latch that ``AlertDetail.MIDDAY_RELAUNCHED_CHILD_NOT_READY``
+    has already fired for the current mid-day-relaunched child -- gates it
+    to exactly once per relaunch (cleared by :func:`record_child_adopted`
+    for the NEXT relaunched child). Idempotent."""
+    effective = _for_day(state, _trading_day(now_utc))
+    if effective.midday_not_ready_alert_sent:
+        return effective
+    return replace(effective, midday_not_ready_alert_sent=True)
 
 
 def decide_midday_relaunch(

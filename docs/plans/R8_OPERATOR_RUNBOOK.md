@@ -214,7 +214,7 @@ missing operator control → the two caps in `operator.env` did not reach the pr
 
 ## 8. Crash and recovery
 
-**Any restart inside the window makes that day's selector uptime-conditional** (the "first executable snapshot" the archive table was measured on may fall in the gap) and resets the per-process daily ledger and session budgets; the durable trial-day latch still bounds the day. Disclosed here so a crash day is never mistaken for a PREREG-comparable day without saying so.
+**Any restart inside the window makes that day's selector uptime-conditional** (the "first executable snapshot" the archive table was measured on may fall in the gap). The per-process daily ledger is NOT zeroed by a restart: `_seed_spend_from_durable_fills` (`exec/client.py:1292-1360`) re-seeds it from durable fills at every boot, including a relaunch, keyed by UTC calendar day -- summing only fills whose `ts_event` falls in the current UTC day and re-arming the permit budget from that sum, consistent with what the same running node would do on its own next order attempt. The durable trial-day latch still bounds the day regardless. Disclosed here so a crash day is never mistaken for a PREREG-comparable day without saying so.
 
 `retire()` writes the history key **before** the singleton, so a crash leaves the singleton **OPEN**
 and every subsequent submit is refused **account-wide** (`submit_intent.py:1-19`, `:365-421`). That is

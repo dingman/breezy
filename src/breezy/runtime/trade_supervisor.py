@@ -55,6 +55,7 @@ from breezy.runtime.trade_supervisor_core import (
     CONTINUOUS_STARTUP_EVIDENCE_KEY,
     LAUNCH_UTC,
     MAX_RELAUNCH_ATTEMPTS,
+    MIDDAY_READINESS_RECHECK_TIMEOUT,
     MIN_RELAUNCH_GAP,
     NODE_ARGV_ANCHOR,
     PERMIT_ISSUED_MARKER,
@@ -69,6 +70,7 @@ from breezy.runtime.trade_supervisor_core import (
     DaySchedulerState,
     LaunchAction,
     Phase,
+    RelaunchCause,
     SelfCheckResult,
     StopPriorAction,
     _trading_day,
@@ -77,16 +79,22 @@ from breezy.runtime.trade_supervisor_core import (
     continuous_family_check,
     continuous_family_is_halted,
     decide_launch_action,
+    decide_midday_relaunch,
     decide_relaunch,
     decide_stop_prior_action,
     initial_scheduler_state,
     launch_time_ns,
     mark_phase_fired,
+    midday_watch_window_end,
     next_due,
     parse_permit_expiry_ns,
     permit_expiry_valid,
     readiness_observed,
     record_child_adopted,
+    record_midday_alert_sent,
+    record_midday_cause_seen,
+    record_midday_not_ready_alert_sent,
+    record_midday_relaunch_attempt,
     record_permit_issued_seen,
     record_readiness_observed,
     record_relaunch_attempt,
@@ -970,6 +978,114 @@ def _do_relaunch_check(
     return proc.pid, new_log, record_relaunch_attempt(state, now)
 
 
+def _do_midday_watch(
+    *,
+    ports: SupervisorPorts,
+    state: DaySchedulerState,
+    now: dt.datetime,
+    tracked_pid: int | None,
+    node_log: Path | None,
+    store_path: Path,
+    repo_root: Path,
+    node_bin: Path,
+    log_dir: Path,
+) -> tuple[int | None, Path | None, DaySchedulerState]:
+    """[2026-09-15] Mid-day sibling of :func:`_do_relaunch_check`, run for
+    the rest of the trading day once SELF_CHECK's own window has closed
+    (plan §3/§4 step 6).
+
+    Short-circuits before ANY log read once ``state.midday_alert_sent`` is
+    latched -- the mid-day budget is exhausted and the operator has
+    already been alerted exactly once; redoing full decision work every
+    poll for the rest of the day would serve no purpose.
+
+    Keeps latching :data:`STRATEGY_SUBSCRIBED_MARKER`/the permit-issued
+    line and the first non-``UNKNOWN`` :func:`classify_exit1_cause` result
+    on EVERY poll, alive or dead -- the same drain-safe pattern
+    ``_do_relaunch_check`` already uses, guarding against a fatal-fault
+    marker the shared, offset-draining ``IncrementalLogReader`` has
+    already consumed past by the poll that first observes the process
+    dead.
+
+    The per-poll flock probe (:attr:`SupervisorPorts.resolve_intent_lock_holder`)
+    is called ONLY inside the bounded post-relaunch readiness re-check
+    below -- never on the steady-state "still alive" poll (plan §3
+    "Dropped per-poll flock probe"): that gate alone removes ~470
+    pointless ``/proc/locks`` reads/day in the common, no-incident case.
+
+    **Contract, explicit and opposite of boot's**: on any mid-day decline
+    -- mid-budget or exhausted -- this returns the SAME ``tracked_pid`` it
+    was given, never ``None`` (contrast :func:`_do_relaunch_check`'s own
+    ``return None, node_log, state`` on decline, correct for boot since
+    that window is genuinely over). Keeping the dead PID visible names it
+    in every subsequent :func:`log_decision` line for operator diagnosis.
+    """
+    if state.midday_alert_sent:
+        return tracked_pid, node_log, state
+    if tracked_pid is None or node_log is None:
+        return tracked_pid, node_log, state
+
+    log_text = ports.read_log_new(node_log)
+    if STRATEGY_SUBSCRIBED_MARKER in log_text:
+        state = record_strategy_subscribed_seen(state, now)
+    permit_expiry_ns = parse_permit_expiry_ns(log_text)
+    if permit_expiry_ns is not None:
+        state = record_permit_issued_seen(state, now, permit_expiry_ns)
+    live_cause = classify_exit1_cause(log_text)
+    if live_cause is not RelaunchCause.UNKNOWN:
+        state = record_midday_cause_seen(state, now, live_cause)
+
+    if ports.process_alive(tracked_pid):
+        relaunched_at = state.last_midday_relaunch_attempt_at
+        if relaunched_at is not None and not state.midday_not_ready_alert_sent:
+            holder = ports.resolve_intent_lock_holder(intent_lock_path(store_path))
+            ready = readiness_observed(
+                holds_intent_lock=(holder == tracked_pid),
+                permit_issued=state.permit_issued_seen_expires_at_ns is not None,
+                strategy_subscribed=state.strategy_subscribed_seen,
+            )
+            if not ready and (now - relaunched_at) > MIDDAY_READINESS_RECHECK_TIMEOUT:
+                log_decision(
+                    "midday_relaunched_child_not_ready", phase="midday_watch", pid=tracked_pid
+                )
+                alert(
+                    ports.alert_sink,
+                    event="TRADE_SUPERVISOR_MIDDAY_WATCH",
+                    severity="WARN",
+                    detail=AlertDetail.MIDDAY_RELAUNCHED_CHILD_NOT_READY,
+                )
+                return tracked_pid, node_log, record_midday_not_ready_alert_sent(state, now)
+        return tracked_pid, node_log, state
+
+    cause = state.midday_cause_seen if state.midday_cause_seen is not None else live_cause
+    decision = decide_midday_relaunch(
+        now=now,
+        window_end=midday_watch_window_end(state.day),
+        attempts_so_far=state.midday_relaunch_attempts,
+        last_attempt_at=state.last_midday_relaunch_attempt_at,
+        cause=cause,
+    )
+    if not decision.should_relaunch:
+        log_decision("midday_relaunch_declined", phase="midday_watch", reason=decision.reason)
+        if decision.reason == "attempt budget exhausted":
+            log_decision("midday_relaunch_exhausted", phase="midday_watch", pid=tracked_pid)
+            alert(
+                ports.alert_sink,
+                event="TRADE_SUPERVISOR_MIDDAY_WATCH",
+                severity="CRITICAL",
+                detail=AlertDetail.MIDDAY_RELAUNCH_EXHAUSTED,
+            )
+            state = record_midday_alert_sent(state, now)
+        return tracked_pid, node_log, state
+
+    log_decision(
+        "midday_relaunching", phase="midday_watch", attempt=state.midday_relaunch_attempts + 1
+    )
+    new_log = node_log_path(log_dir, now)
+    proc = ports.spawn(node_bin=node_bin, repo_root=repo_root, env=os.environ, log_path=new_log)
+    return proc.pid, new_log, record_midday_relaunch_attempt(state, now)
+
+
 #: Self-check results that are a PASS of some kind -- never alerted on.
 _SELF_CHECK_PASS_RESULTS: Final[frozenset[SelfCheckResult]] = frozenset(
     {SelfCheckResult.PASS, SelfCheckResult.PASS_ADOPTED_LOG_UNKNOWN}
@@ -1248,7 +1364,7 @@ def _run_forever(
                         node_bin=node_bin,
                         log_dir=log_dir,
                     )
-                else:
+                elif phase is Phase.SELF_CHECK:
                     tracked_pid, node_log, new_state = _do_self_check(
                         ports=active_ports,
                         now=now,
@@ -1261,6 +1377,24 @@ def _run_forever(
                     if new_state is not None:
                         state = new_state
                     state = mark_phase_fired(state, phase, now)
+                elif phase is Phase.MIDDAY_WATCH:
+                    tracked_pid, node_log, state = _do_midday_watch(
+                        ports=active_ports,
+                        state=state,
+                        now=now,
+                        tracked_pid=tracked_pid,
+                        node_log=node_log,
+                        store_path=store_path,
+                        repo_root=repo_root,
+                        node_bin=node_bin,
+                        log_dir=log_dir,
+                    )
+                else:
+                    # Defensive: a future third new `Phase` must never
+                    # silently fall through into `_do_self_check` (the
+                    # original bug this dispatch fixed) -- named and
+                    # dropped instead.
+                    log_decision("phase_unhandled", phase=phase.value)
             except Exception as exc:  # noqa: BLE001 -- deliberate: one failing
                 # phase must never end the supervisor (see the coordinator's
                 # loop-wiring requirement). Named by TYPE only below, never
