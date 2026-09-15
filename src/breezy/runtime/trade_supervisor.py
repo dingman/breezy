@@ -450,6 +450,21 @@ def terminate_after_toctou_recheck(
     terminate_fn(pid)
 
 
+def _proc_state_char(pid: int) -> str | None:
+    """The state field of ``/proc/<pid>/stat``, or ``None`` if unreadable.
+
+    ``comm`` (the second field) is parenthesized and may itself contain
+    spaces or parentheses, so the state field is found by splitting after
+    the LAST ``)`` on the line, never by positional field-splitting."""
+    try:
+        raw = Path(f"/proc/{pid}/stat").read_text()
+    except OSError:
+        return None
+    after_comm = raw.rsplit(")", 1)[-1]
+    fields = after_comm.split()
+    return fields[0] if fields else None
+
+
 def process_is_alive(pid: int) -> bool:
     try:
         os.kill(pid, 0)
@@ -457,7 +472,7 @@ def process_is_alive(pid: int) -> bool:
         return False
     except PermissionError:
         return True
-    return True
+    return _proc_state_char(pid) != "Z"
 
 
 # ---------------------------------------------------------------------------
