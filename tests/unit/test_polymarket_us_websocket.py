@@ -44,6 +44,7 @@ from breezy.adapters.polymarket_us.websocket import (
     DEFAULT_SUBSCRIPTION_CONFIRMATION_SECS,
     MAX_SUBSCRIPTIONS_PER_CONNECTION,
     SUBSCRIPTION_TYPE_MARKET_DATA,
+    SUBSCRIPTION_TYPE_TRADE,
     WS_PATH,
     PolymarketUSMarketsWebSocket,
     PolymarketUSMarketsWebSocketPool,
@@ -1564,3 +1565,175 @@ async def test_supervisor_reconnect_warning_names_the_connection_label(
 
     logged = "\n".join(recorder.messages)
     assert "shard-3" in logged, f"the WARN must name which connection closed: {logged!r}"
+
+
+# --------------------------------------------------------------------------
+# TRADE channel (executed prints): opt-in, OFF by default
+# --------------------------------------------------------------------------
+#
+# The venue's markets socket offers ``SUBSCRIPTION_TYPE_TRADE`` beside the
+# market-data channel (``docs/evidence/venue/polymarket_us/docs_snapshots/
+# api-reference_websocket_markets_2026-08-25.md:29-31,114-138``; SDK
+# ``websocket/markets.py:37-43``). Prints cannot be reconstructed from a quote
+# tape, and the stream is forward-only, so the quote-tape RECORDER subscribes
+# it. The live trade node keeps the knob off and its wire traffic unchanged.
+
+_TRADE_SLUGS = ["tc-temp-nychigh-2026-08-25-lt79f", "tc-temp-denhigh-2026-08-25-lt91f"]
+
+
+def test_trade_subscription_type_matches_the_sdk_snapshot() -> None:
+    """``sdk_snapshot/polymarket_us_0.1.2/websocket/markets.py:43``."""
+    assert SUBSCRIPTION_TYPE_TRADE == "SUBSCRIPTION_TYPE_TRADE"
+
+
+@pytest.mark.allow_socket
+@pytest.mark.asyncio
+async def test_trades_are_off_by_default_so_only_the_market_data_envelope_is_sent() -> None:
+    async with LoopbackWebSocketServer() as server:
+        signer, _ = _new_signer()
+        ws = _make_ws(ws_url=server.url, signer=signer)
+        try:
+            await ws.connect()
+            await ws.subscribe_market_data(_TRADE_SLUGS)
+            await _wait_until(lambda: len(server.messages) == 1)
+            # Give a second envelope every chance to arrive before asserting it did not.
+            await asyncio.sleep(0.1)
+        finally:
+            await ws.close()
+
+        assert [p["subscriptionType"] for p in _subscribe_payloads(server)] == [
+            SUBSCRIPTION_TYPE_MARKET_DATA
+        ]
+        assert ws.trade_subscriptions == {}
+
+
+@pytest.mark.allow_socket
+@pytest.mark.asyncio
+async def test_subscribe_trades_sends_a_trade_envelope_for_the_same_slugs_after_md() -> None:
+    """Market data FIRST, then trades, each under its own request id.
+
+    The order is load-bearing: if the venue's 10-per-connection cap turns out
+    to be shared across subscription types (UNRESOLVED -- never probed), the
+    later TRADE envelope is the one the venue rejects with explicit error
+    frames, and the irreplaceable market-data subscriptions stay intact.
+    """
+    async with LoopbackWebSocketServer() as server:
+        signer, _ = _new_signer()
+        ws = _make_ws(ws_url=server.url, signer=signer, subscribe_trades=True)
+        try:
+            await ws.connect()
+            await ws.subscribe_market_data(_TRADE_SLUGS)
+            await _wait_until(lambda: len(server.messages) == 2)
+        finally:
+            await ws.close()
+
+        market_data, trade = _subscribe_payloads(server)
+        assert market_data == {
+            "requestId": "req-1",
+            "subscriptionType": SUBSCRIPTION_TYPE_MARKET_DATA,
+            "marketSlugs": _TRADE_SLUGS,
+        }
+        assert trade == {
+            "requestId": "req-2",
+            "subscriptionType": SUBSCRIPTION_TYPE_TRADE,
+            "marketSlugs": _TRADE_SLUGS,
+        }
+        assert ws.subscriptions == dict.fromkeys(_TRADE_SLUGS, "req-1")
+        assert ws.trade_subscriptions == dict.fromkeys(_TRADE_SLUGS, "req-2")
+
+
+@pytest.mark.allow_socket
+@pytest.mark.asyncio
+async def test_trade_subscriptions_are_replayed_after_a_reconnect() -> None:
+    async with LoopbackWebSocketServer() as server:
+        signer, _ = _new_signer()
+        ws = _make_ws(ws_url=server.url, signer=signer, subscribe_trades=True)
+        try:
+            await ws.connect()
+            await ws.subscribe_market_data(_TRADE_SLUGS)
+            await _wait_until(lambda: len(server.messages) == 2)
+
+            server.drop_connections()
+            await _wait_until(lambda: len(server.handshakes) == 2)
+            await _wait_until(lambda: len(server.messages) == 4)
+        finally:
+            await ws.close()
+
+        first, second, replay_md, replay_trade = _subscribe_payloads(server)
+        assert replay_md == first
+        assert replay_trade == second
+        assert replay_trade["subscriptionType"] == SUBSCRIPTION_TYPE_TRADE
+        assert replay_trade["requestId"] == "req-2"
+
+
+@pytest.mark.allow_socket
+@pytest.mark.asyncio
+async def test_unsubscribing_market_data_releases_the_trade_subscription_too() -> None:
+    """One slug, one lifetime: the data client only ever tracks the market-data
+    request id, so releasing it must release the paired TRADE request as well
+    or the venue keeps streaming prints for a market nobody is recording."""
+    async with LoopbackWebSocketServer() as server:
+        signer, _ = _new_signer()
+        ws = _make_ws(ws_url=server.url, signer=signer, subscribe_trades=True)
+        try:
+            await ws.connect()
+            await ws.subscribe_market_data(_TRADE_SLUGS)
+            await _wait_until(lambda: len(server.messages) == 2)
+
+            await ws.unsubscribe("req-1")
+            await _wait_until(lambda: len(server.messages) == 4)
+        finally:
+            await ws.close()
+
+        unsubscribes = [json.loads(m) for m in server.messages[2:]]
+        assert unsubscribes == [
+            {"unsubscribe": {"requestId": "req-1"}},
+            {"unsubscribe": {"requestId": "req-2"}},
+        ]
+        assert ws.subscriptions == {}
+        assert ws.trade_subscriptions == {}
+
+
+@pytest.mark.allow_socket
+@pytest.mark.asyncio
+async def test_pool_threads_subscribe_trades_to_every_shard_keeping_the_shard_count() -> None:
+    """Sharding stays count-based on MARKET-DATA slugs (cap unchanged), and
+    every shard subscribes TRADE for exactly the slugs it holds."""
+    slugs = _weather_slugs(12)
+    ids = iter(f"req-{i}" for i in range(1, 100))
+    async with LoopbackWebSocketServer() as server:
+        pool = _make_pool(
+            ws_url=server.url,
+            signer=None,
+            cap=10,
+            request_id_factory=lambda: next(ids),
+            subscribe_trades=True,
+        )
+        try:
+            await pool.subscribe_market_data(slugs)
+            await _wait_until(lambda: len(server.messages) == 4)
+        finally:
+            await pool.close()
+
+        assert len(pool._shards) == 2
+        for shard in pool._shards:
+            assert shard._subscribe_trades is True
+            assert set(shard.trade_subscriptions) == set(shard.subscriptions)
+        assert set(pool.trade_subscriptions) == set(slugs)
+        payloads = _subscribe_payloads(server)
+        assert sorted(p["subscriptionType"] for p in payloads) == sorted(
+            [SUBSCRIPTION_TYPE_MARKET_DATA, SUBSCRIPTION_TYPE_TRADE] * 2
+        )
+
+
+def test_pool_leaves_trades_off_by_default() -> None:
+    pool = PolymarketUSMarketsWebSocketPool(
+        ws_url="wss://api.example.invalid",
+        signer=None,
+        handler=lambda _raw: None,
+        loop=asyncio.new_event_loop(),
+        heartbeat_secs=10,
+        idle_timeout_secs=60,
+        logger=Logger("test-polymarket-us-ws-pool"),
+    )
+    assert pool._shards[0]._subscribe_trades is False

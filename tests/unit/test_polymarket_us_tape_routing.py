@@ -332,16 +332,20 @@ class TestExpiredMarketFrame:
 
 
 class TestTradeFrame:
+    """Shape per ``docs_snapshots/api-reference_websocket_markets_2026-08-25.md:114-138``."""
+
     def frame(self) -> dict[str, Any]:
         return {
+            "requestId": "trade-sub-1",
+            "subscriptionType": "SUBSCRIPTION_TYPE_TRADE",
             "trade": {
                 "marketSlug": SLUG,
-                "px": {"value": "0.5300", "currency": "USD"},
-                "qty": "15.6100",
-                "transactTime": "2026-08-25T00:06:58.830425365Z",
-                "tradeId": "trd-0001",
-                "takerSide": "SIDE_BUY",
-            }
+                "price": {"value": "0.55", "currency": "USD"},
+                "quantity": {"value": "3", "currency": "USD"},
+                "tradeTime": "2026-08-25T00:06:58.830425365Z",
+                "maker": {"side": "ORDER_SIDE_SELL", "intent": "ORDER_INTENT_SELL_LONG"},
+                "taker": {"side": "ORDER_SIDE_BUY", "intent": "ORDER_INTENT_BUY_LONG"},
+            },
         }
 
     def test_an_executed_print_is_published_as_a_trade_tick(
@@ -351,19 +355,22 @@ class TestTradeFrame:
 
         trades = harness.of(TradeTick)
         assert len(trades) == 1
-        assert trades[0].price == Price.from_str("0.530")
-        assert trades[0].trade_id.value == "trd-0001"
+        assert trades[0].price == Price.from_str("0.55")
+        # Derived, never venue-issued: the documented frame carries no id.
+        assert len(trades[0].trade_id.value) == 32
+        assert int(trades[0].trade_id.value, 16) >= 0
 
     def test_an_unparseable_trade_is_dropped_and_counted_never_fabricated(
         self, harness: Harness
     ) -> None:
         frame = self.frame()
-        del frame["trade"]["px"]
+        del frame["trade"]["price"]
 
         harness.feed.deliver(frame)
 
         assert harness.of(TradeTick) == []
         assert harness.client.dropped_frames == 1
+        assert harness.client.trade_parse_failures == 1
 
 
 # ---------------------------------------------------------------------------

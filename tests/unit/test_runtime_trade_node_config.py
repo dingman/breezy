@@ -200,6 +200,17 @@ class TestTradeNodeConfig:
         wired = config.data_clients[POLYMARKET_US_CLIENT_NAME]
         assert wired.empty_discovery_retry_secs == 0.0
 
+    def test_the_trade_node_leaves_trade_capture_off(self) -> None:
+        """``subscribe_trades`` is the quote-tape RECORDER's knob. The live
+        node's wire traffic must stay byte-identical: one market-data
+        subscribe envelope per batch, no TRADE channel."""
+        config = build_trade_node_config(
+            make_trade_settings(), make_data_client_config(), make_exec_client_config()
+        )
+
+        wired = config.data_clients[POLYMARKET_US_CLIENT_NAME]
+        assert wired.subscribe_trades is False
+
     def test_the_trade_node_config_registers_exactly_one_exec_client(self) -> None:
         """EXEC SPINE W. R-4's client had ZERO construction sites before this;
         the key equals `POLYMARKET_US_CLIENT_NAME` because the derived

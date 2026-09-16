@@ -743,8 +743,9 @@ def build_backtest_engine(config: BreezyBacktestConfig) -> BacktestEngine:
         # The `False` default lets each iteration fill against the full book
         # independently -- one stale Depth10 snapshot refills infinitely.
         liquidity_consumption=True,
-        # The adapter publishes no TradeTick. `True` arms the bid/ask override
-        # path if one ever leaks in.
+        # The trade node publishes no TradeTick (`subscribe_trades` is off
+        # there); the recorder's trade tape is not consumed by this harness.
+        # `True` arms the bid/ask override path if one ever leaks in.
         trade_execution=False,
         bar_execution=False,
         bar_adaptive_high_low_ordering=False,

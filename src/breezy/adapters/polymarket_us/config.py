@@ -319,6 +319,19 @@ class PolymarketUSDataClientConfig(LiveDataClientConfig, frozen=True):
     #: staging wiring set it explicitly in code, which is reviewed.
     allow_foreign_origin: bool = False
 
+    #: Also subscribe the venue's ``SUBSCRIPTION_TYPE_TRADE`` channel (executed
+    #: prints) for every market-data slug, and publish each print as a native
+    #: ``TradeTick`` on the YES instrument. OFF by default: this is the
+    #: quote-tape RECORDER's knob, set in
+    #: ``breezy.runtime.node_config.build_quote_tape_node_config`` exactly
+    #: where that role already widens ``empty_discovery_retry_secs``. The
+    #: live trade node keeps the default and its wire traffic unchanged.
+    #: Prints are forward-only on this venue and cannot be rebuilt from a
+    #: quote tape, which is why the recorder carries them. Channel facts:
+    #: ``docs/evidence/venue/polymarket_us/docs_snapshots/
+    #: api-reference_websocket_markets_2026-08-25.md:29-31,114-138``.
+    subscribe_trades: bool = False
+
     def __post_init__(self) -> None:
         unset = [
             name
@@ -351,6 +364,10 @@ class PolymarketUSDataClientConfig(LiveDataClientConfig, frozen=True):
             value = getattr(self, name)
             if not isinstance(value, int) or isinstance(value, bool) or value <= 0:
                 raise SettingsError(f"{name} must be a positive integer, was {value!r}")
+        if not isinstance(self.subscribe_trades, bool):
+            raise SettingsError(
+                f"subscribe_trades must be a bool, was {type(self.subscribe_trades).__name__}"
+            )
         if (
             not isinstance(self.empty_discovery_retry_secs, int | float)
             or isinstance(self.empty_discovery_retry_secs, bool)

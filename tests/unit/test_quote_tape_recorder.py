@@ -42,8 +42,8 @@ from nautilus_trader.model.data import (
     QuoteTick,
     TradeTick,
 )
-from nautilus_trader.model.enums import AssetClass
-from nautilus_trader.model.identifiers import InstrumentId, Symbol
+from nautilus_trader.model.enums import AggressorSide, AssetClass
+from nautilus_trader.model.identifiers import InstrumentId, Symbol, TradeId
 from nautilus_trader.model.instruments import BinaryOption
 from nautilus_trader.model.objects import Price, Quantity
 from nautilus_trader.persistence.catalog.parquet import ParquetDataCatalog
@@ -581,3 +581,81 @@ class TestRecorderInstanceIdentityIsNative:
         second = build_quote_tape_node_config(make_tape_settings(tmp_path), base)
 
         assert first.instance_id != second.instance_id
+
+
+# ---------------------------------------------------------------------------
+# Executed prints: the recorder captures them, and they read back
+# ---------------------------------------------------------------------------
+
+
+class TestTradePrintsReachDiskAndReadBack:
+    def test_the_recorder_role_turns_trade_capture_on(self, tmp_path: Path) -> None:
+        """Set HERE, for the recorder role only -- the same seam that widens
+        ``empty_discovery_retry_secs`` (GL-12). The input config's default is
+        off, and it is the live trade node's value."""
+        base = make_data_client_config()
+        assert base.subscribe_trades is False
+
+        config = build_quote_tape_node_config(make_tape_settings(tmp_path), base)
+
+        wired = config.data_clients[POLYMARKET_US_CLIENT_NAME]
+        assert wired.subscribe_trades is True
+
+    def test_a_recorded_trade_tick_is_read_back_from_disk_by_a_separate_reader(
+        self, tmp_path: Path
+    ) -> None:
+        """``TradeTick`` is native, already in ``QUOTE_TAPE_INCLUDE_TYPES``, and
+        written by the SAME kernel writer as quotes -- this pins that the whole
+        path (writer -> feather -> ``convert_stream_to_data`` -> parquet ->
+        ``query``) round-trips price, size, aggressor, id and timestamps."""
+        instrument = make_instrument(SLUG)
+        config = build_quote_tape_node_config(
+            make_tape_settings(tmp_path), make_data_client_config()
+        )
+
+        cache = Cache(database=None, config=CacheConfig())
+        cache.add_instrument(instrument)
+        writer = writer_from_node_config(config, tmp_path, "instance-1", cache)
+        writer.write(instrument)
+        writer.write(
+            TradeTick(
+                instrument_id=instrument.id,
+                price=Price.from_str("0.550"),
+                size=Quantity.from_str("3"),
+                aggressor_side=AggressorSide.SELLER,
+                trade_id=TradeId("0123456789abcdef0123456789abcdef"),
+                ts_event=1_000_000_000,
+                ts_init=1_000_000_500,
+            )
+        )
+        writer.write(
+            TradeTick(
+                instrument_id=instrument.id,
+                price=Price.from_str("0.560"),
+                size=Quantity.from_str("1"),
+                aggressor_side=AggressorSide.NO_AGGRESSOR,
+                trade_id=TradeId("fedcba9876543210fedcba9876543210"),
+                ts_event=2_000_000_000,
+                ts_init=2_000_000_500,
+            )
+        )
+        writer.close()
+
+        reader = ParquetDataCatalog(tmp_path)
+        reader.convert_stream_to_data("instance-1", TradeTick, subdirectory="live")
+        reader.convert_stream_to_data("instance-1", BinaryOption, subdirectory="live")
+
+        trades = reader.query(data_cls=TradeTick)
+        assert [str(t.price) for t in trades] == ["0.550", "0.560"]
+        assert [str(t.size) for t in trades] == ["3", "1"]
+        assert [t.aggressor_side for t in trades] == [
+            AggressorSide.SELLER,
+            AggressorSide.NO_AGGRESSOR,
+        ]
+        assert [t.trade_id.value for t in trades] == [
+            "0123456789abcdef0123456789abcdef",
+            "fedcba9876543210fedcba9876543210",
+        ]
+        assert [t.ts_event for t in trades] == [1_000_000_000, 2_000_000_000]
+        assert [t.ts_init for t in trades] == [1_000_000_500, 2_000_000_500]
+        assert {t.instrument_id for t in trades} == {instrument.id}

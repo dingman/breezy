@@ -109,6 +109,7 @@ without calling it.
 from __future__ import annotations
 
 import calendar
+import hashlib
 import re
 from collections.abc import Mapping, Sequence
 from datetime import datetime
@@ -175,6 +176,8 @@ __all__ = [
     "QUOTE_CURRENCY_CODE",
     "TERMINAL_SETTLEMENT_METHOD",
     "TRADE_CONTAINER_KEY",
+    "TRADE_KNOWN_KEYS",
+    "TRADE_QUANTITY_UNIT",
     "assert_fee_schedule_known",
     "depth_levels_dropped",
     "parse_binary_option",
@@ -205,6 +208,27 @@ DEPTH10_LEVELS: int = 10
 #: fabricated print. Confirmation is a live-probe question for
 #: ``polymarket-us-discovery``.
 TRADE_CONTAINER_KEY: str = "trade"
+
+#: Every key the venue documents on the ``trade`` payload
+#: (``docs_snapshots/api-reference_websocket_markets_2026-08-25.md:114-138``;
+#: SDK ``_TradePayload``, ``websocket/types.py:164-170``). The data client
+#: records -- bounded, never fatally -- any key outside this set.
+#:
+#: ``quantity`` is documented as ``Amount{value, currency: "USD"}`` -- the
+#: venue's CASH-quantity shape elsewhere (orders overview :106,130,185;
+#: create-order :77,308; preview :106-107,122-123) -- while contract counts are
+#: bare numbers. Its UNIT is therefore :data:`TRADE_QUANTITY_UNIT`.
+TRADE_KNOWN_KEYS: frozenset[str] = frozenset(
+    {"marketSlug", "price", "quantity", "tradeTime", "maker", "taker"}
+)
+
+#: Unit of a print's ``quantity`` -- and so of ``TradeTick.size`` -- on this
+#: venue: ``"UNRESOLVED"`` until the first live print is cross-checked against
+#: the REST fill quantity for the same trade (contracts vs dollars). Any
+#: consumer of ``TradeTick.size`` (the resting-bid study first) MUST check this
+#: constant before treating a size as a contract count. The data client keeps
+#: the raw ``quantity`` object verbatim as bounded evidence for that check.
+TRADE_QUANTITY_UNIT: str = "UNRESOLVED"
 
 #: Venue ``state`` values that mean the contract has reached a terminal
 #: settlement, so ``settlementPx`` is the final value rather than a daily mark.
@@ -243,15 +267,31 @@ OBSERVED_SETTLEMENT_METHODS: frozenset[str] = frozenset(
     }
 )
 
-#: Venue taker-side spellings mapped onto Nautilus's aggressor side. UNRESOLVED:
-#: no trade frame has been captured, so an unrecognised token maps to
-#: ``NO_AGGRESSOR`` rather than to a guessed direction.
+#: Venue ``taker.side`` spellings mapped onto Nautilus's aggressor side, read
+#: on the YES leg (the only instrument Breezy publishes).
+#:
+#: ``ORDER_SIDE_BUY`` / ``ORDER_SIDE_SELL`` are the spellings the venue itself
+#: emitted in ``docs/evidence/venue/polymarket_us/AMBIGUOUS_ORDER_2026-09-05_SFO/
+#: activities_p0.json`` and the documented trade example uses
+#: (``docs_snapshots/api-reference_websocket_markets_2026-08-25.md:126-133``).
+#: A NO buy is echoed by the venue as ``SELL`` / ``BUY_SHORT`` on the SAME slug
+#: (memory 2026-09-14), so it lands as ``SELLER`` here and the ``intent`` is
+#: deliberately not consulted. Anything else -- including the venue's own
+#: ``ORDER_SIDE_UNDEFINED`` -- is ``NO_AGGRESSOR``, never a guessed direction.
+#: The un-prefixed forms are kept for the account-activity readers that share
+#: this table.
 _TAKER_SIDES: dict[str, AggressorSide] = {
+    "ORDER_SIDE_BUY": AggressorSide.BUYER,
+    "ORDER_SIDE_SELL": AggressorSide.SELLER,
     "SIDE_BUY": AggressorSide.BUYER,
     "SIDE_SELL": AggressorSide.SELLER,
     "BUY": AggressorSide.BUYER,
     "SELL": AggressorSide.SELLER,
 }
+
+#: Hex digits kept from the SHA-256 that derives a print's ``TradeId`` (the
+#: venue sends none). 32 <= the native 36-character ``TradeId`` bound.
+_TRADE_ID_HEX_CHARS: int = 32
 
 #: The only settlement currency Polymarket.us (a fiat DCM) is documented to use.
 #: A payload naming anything else is refused rather than coerced.
@@ -877,19 +917,41 @@ def depth_levels_dropped(payload: Mapping[str, Any]) -> int:
 def parse_trade_tick(
     payload: Mapping[str, Any], *, instrument: BinaryOption, ts_init: int
 ) -> TradeTick:
-    """Build a ``TradeTick`` from an executed-print frame.
+    """Build a ``TradeTick`` from a ``SUBSCRIPTION_TYPE_TRADE`` frame.
 
     Executed prints are the only ground truth for what actually traded rather
     than what was merely quoted (REQ-DATA-04), and they cannot be reconstructed
     later from a quote tape.
 
-    **UNRESOLVED venue fact.** No trade frame has been captured; the field names
-    here are the singular forms already used by the book payload
-    (``px``/``qty``/``transactTime``/``marketSlug``) plus ``tradeId`` and
-    ``takerSide``. Every one is REQUIRED except ``takerSide``, so a frame that
-    does not match raises :class:`VenuePayloadError` and is dropped and counted
-    by the caller. A wrong guess therefore degrades to "no trades recorded",
-    which the drop counter makes visible -- never to a fabricated print.
+    Shape per the venue's documentation
+    (``docs_snapshots/api-reference_websocket_markets_2026-08-25.md:114-138``)
+    and the SDK ``_TradePayload`` (``websocket/types.py:164-170``)::
+
+        {"trade": {"marketSlug", "price": Amount, "quantity": Amount,
+                   "tradeTime": RFC3339, "maker": {side, intent},
+                   "taker": {side, intent}}}
+
+    ``marketSlug``, ``price``, ``quantity`` and ``tradeTime`` are REQUIRED; a
+    frame missing any of them raises :class:`VenuePayloadError` and is dropped
+    and counted by the caller -- never defaulted. ``taker`` is optional and
+    only ever narrows to ``NO_AGGRESSOR`` (see :data:`_TAKER_SIDES`). Unknown
+    keys are ignored here and recorded, bounded, by the data client.
+
+    **The print is published on the YES instrument only.** A NO-leg print is a
+    print on the same market; its direction is carried by ``aggressor_side``
+    and nothing is synthesised for a NO instrument.
+
+    **The trade id is derived, not venue-issued.** The documented frame has no
+    id, so ``sha256(slug | tradeTime | price | quantity | taker.side)`` over
+    VENUE-ONLY fields supplies one. The receipt instant is deliberately
+    excluded: a frame the venue replays after a reconnect then collides with
+    the original and the data client dedupes it (bounded). The accepted cost
+    is that two genuine prints identical in all five fields collapse to one;
+    ``tradeTime`` is documented with nanosecond precision, which bounds that
+    risk. It cannot be reconciled with the venue and must never be presented
+    as if it could.
+
+    **``size`` is unit-unresolved** -- see :data:`TRADE_QUANTITY_UNIT`.
     """
     trade = _require_mapping(payload, TRADE_CONTAINER_KEY, context="trade payload")
     expected_slug = instrument.id.symbol.value
@@ -899,38 +961,69 @@ def parse_trade_tick(
             f"Trade frame is for slug {observed_slug!r} but was parsed against "
             f"instrument {expected_slug!r}"
         )
-    price = _parse_amount(_require(trade, "px", error=VenuePayloadError), field="trade.px")
+    price = _parse_amount(
+        _require(trade, "price", error=VenuePayloadError), field="trade.price"
+    )
     if price < _PRICE_MIN or price > _PRICE_MAX:
         raise VenuePayloadError(
             f"Trade price {price} is outside the binary-option range "
             f"[{_PRICE_MIN}, {_PRICE_MAX}]"
         )
-    size = _to_decimal(
-        _require(trade, "qty", error=VenuePayloadError), field="trade.qty", error=VenuePayloadError
+    size = _parse_trade_quantity(
+        _require(trade, "quantity", error=VenuePayloadError), field="trade.quantity"
     )
     if size <= 0:
-        raise VenuePayloadError(f"Trade size {size} is not a positive size")
-    ts_event = parse_rfc3339_nanos(
-        _require(trade, "transactTime", error=VenuePayloadError), field="transactTime"
-    )
-    raw_trade_id = _require(trade, "tradeId", error=VenuePayloadError)
-    if not isinstance(raw_trade_id, str) or not raw_trade_id.strip():
-        raise VenuePayloadError("Field 'tradeId' must be a non-empty string")
+        raise VenuePayloadError("Trade size is not a positive size; value withheld")
+    raw_trade_time = _require(trade, "tradeTime", error=VenuePayloadError)
+    ts_event = parse_rfc3339_nanos(raw_trade_time, field="tradeTime")
 
-    raw_side = trade.get("takerSide")
-    aggressor = _TAKER_SIDES.get(raw_side, AggressorSide.NO_AGGRESSOR) if isinstance(
-        raw_side, str
-    ) else AggressorSide.NO_AGGRESSOR
+    taker = trade.get("taker")
+    raw_side = taker.get("side") if isinstance(taker, Mapping) else None
+    aggressor = (
+        _TAKER_SIDES.get(raw_side, AggressorSide.NO_AGGRESSOR)
+        if isinstance(raw_side, str)
+        else AggressorSide.NO_AGGRESSOR
+    )
+
+    derived_id = hashlib.sha256(
+        "|".join(
+            (
+                expected_slug,
+                str(raw_trade_time),
+                format(price, "f"),
+                format(size, "f"),
+                raw_side if isinstance(raw_side, str) else "",
+            )
+        ).encode("utf-8")
+    ).hexdigest()[:_TRADE_ID_HEX_CHARS]
 
     return TradeTick(
         instrument_id=instrument.id,
-        price=_build_price(price, precision=instrument.price_precision, field="trade.px"),
-        size=_build_quantity(size, precision=instrument.size_precision, field="trade.qty"),
+        price=_build_price(price, precision=instrument.price_precision, field="trade.price"),
+        size=_build_quantity(
+            size, precision=instrument.size_precision, field="trade.quantity"
+        ),
         aggressor_side=aggressor,
-        trade_id=TradeId(raw_trade_id.strip()),
+        trade_id=TradeId(derived_id),
         ts_event=ts_event,
         ts_init=ts_init,
     )
+
+
+def _parse_trade_quantity(value: object, *, field: str) -> Decimal:
+    """Read a print's ``quantity`` as a decimal, unit UNRESOLVED.
+
+    The snapshot types ``quantity`` as ``Amount{value, currency}`` -- the
+    venue's cash-quantity shape elsewhere -- while the book payload's ``qty``
+    is a bare decimal. Both shapes are accepted; the value is carried into
+    ``TradeTick.size`` WITHOUT asserting whether it is contracts or dollars
+    (:data:`TRADE_QUANTITY_UNIT`). The currency label is not consulted here
+    because refusing on it would settle the unit question by assumption.
+    """
+    raw: object = value
+    if isinstance(value, Mapping):
+        raw = _require(value, "value", error=VenuePayloadError, context=f"Field {field!r}")
+    return _to_decimal(raw, field=field, error=VenuePayloadError)
 
 
 def venue_market_state(payload: Mapping[str, Any]) -> str | None:
