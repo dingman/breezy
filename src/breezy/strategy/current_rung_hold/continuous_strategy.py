@@ -307,6 +307,31 @@ def _startup_evidence_summary(
     )
 
 
+def _per_contract_reconciled_fee(record: DurableFillRecord) -> Decimal | None:
+    """The per-contract fee a `DurableFillRecord` supports, when known.
+
+    ONE shared derivation for both `TrialDayRecord.fee` call sites (companion
+    ruling to option B, domain review of a9fd0fb): `ContinuousRungHoldStrategy
+    ._recorded_fee_for` (create-path fill, `_consume_or_flag_duplicate`) and
+    `_consume_trial_from_fill_record` (the boot never-arm walk's fill-record
+    join). The boot walk re-adopts open positions through this join on every
+    16:50Z reboot, so a fee derivation that only ran on the create path would
+    re-impose the unknown-fee refusal on any later rung of that station-day
+    after every restart -- this function makes both sites agree byte-for-byte.
+
+    `None` unless `record` is `fee_reconciled` and carries a positive
+    `cumulative_qty` -- an unreconciled or zero-qty record leaves `q`
+    UNKNOWN, and `station_day_admission` must keep refusing rather than
+    guess (never relaxed by this helper). Deliberately NEVER
+    `event.commission`: the resolver path emits a synthetic `Money(0)`
+    there, indistinguishable from a genuine zero fee (PREREG v3
+    fee-unreconciled-residual ruling).
+    """
+    if not record.fee_reconciled or record.cumulative_qty <= 0:
+        return None
+    return record.cumulative_fee / record.cumulative_qty
+
+
 class Phase0PermitForbiddenError(RuntimeError):
     """A non-None `order_submission_permit` was given in Phase 0.
 
@@ -763,6 +788,13 @@ class ContinuousRungHoldStrategy(Strategy):
                 # reason, so the scorer's L-25 guard skips it BY REASON.
                 reason=TAKEN_FROM_FILL_WALK_REASON,
                 venue_order_id=fill_record.venue_order_id,
+                # Companion to the create-path fix (option B, domain review
+                # of a9fd0fb): this record is ALREADY in hand, so the SAME
+                # derivation `_recorded_fee_for` uses is applied directly --
+                # without this, every 16:50Z reboot's re-adoption of an open
+                # position through this walk would re-impose the
+                # unknown-fee refusal on any later rung of the station-day.
+                fee=_per_contract_reconciled_fee(fill_record),
             ),
             key_instrument_id=instrument_id,
         )
@@ -1971,19 +2003,17 @@ class ContinuousRungHoldStrategy(Strategy):
         synthetic `Money(0)` there, indistinguishable from a genuine zero
         fee (PREREG v3 fee-unreconciled-residual ruling).
 
-        `None` unless a record for this EXACT `venue_order_id` exists, is
-        `fee_reconciled`, and carries a positive `cumulative_qty` -- an
-        absent, unreconciled, or zero-qty record leaves `q` UNKNOWN, and
-        `station_day_admission` must keep refusing rather than guess (never
-        relaxed by this helper).
+        `None` unless a record for this EXACT `venue_order_id` exists and
+        `_per_contract_reconciled_fee` (the module-level helper this method
+        shares with `_consume_trial_from_fill_record`) derives a fee from
+        it -- an absent record leaves `q` UNKNOWN, and `station_day_admission`
+        must keep refusing rather than guess (never relaxed by this helper).
         """
         assert self._latch is not None
         for candidate in self._latch.iter_fill_records((str(instrument_id),)):
             if candidate.venue_order_id != venue_order_id:
                 continue
-            if not candidate.fee_reconciled or candidate.cumulative_qty <= 0:
-                return None
-            return candidate.cumulative_fee / candidate.cumulative_qty
+            return _per_contract_reconciled_fee(candidate)
         return None
 
     def _consume_or_flag_duplicate(

@@ -2090,3 +2090,108 @@ def test_recorded_fee_for_divides_cumulative_fee_by_cumulative_qty(
         position_evidence_reader=lambda: _PERMISSIVE_EVIDENCE,
     )
     assert strategy._recorded_fee_for(INTERIOR_ID, "ord-two") == Decimal("0.01")
+
+
+# ---------------------------------------------------------------------------
+# Companion to the create-path fix (option B, domain review of a9fd0fb):
+# the boot never-arm walk's `_consume_trial_from_fill_record` (the fill-
+# record join `_run_never_arm_walk` runs on EVERY 16:50Z reboot, re-
+# adopting any already-open position) now derives the SAME per-contract
+# fee `_recorded_fee_for` does, through the shared module-level helper
+# `_per_contract_reconciled_fee` -- fixing what would otherwise be a
+# refusal reimposed on every restart for any later rung of a station-day
+# whose earlier fill was adopted this way.
+# ---------------------------------------------------------------------------
+
+
+def test_a_reconciled_boot_walk_adopted_fill_carries_the_fee_and_admits_the_second_rung(
+    store_path: Path,
+    interior_instrument: BinaryOption,
+    open_upper_instrument: BinaryOption,
+) -> None:
+    """(1) A durable, `fee_reconciled=True` fill record already on disk
+    BEFORE `start()` (simulating a reboot re-adopting an open position) is
+    consumed by the boot walk with a real per-contract fee on the written
+    `TrialDayRecord` -- so a genuinely different second YES rung on the
+    SAME station-day is ADMITTED after boot, mirroring
+    `test_a_reconciled_durable_fill_record_supplies_the_fee_and_admits_the_second_rung`
+    for the create path."""
+    from breezy.strategy.current_rung_hold.trial_day_latch import TAKEN_FROM_FILL_WALK_REASON
+
+    _write_durable_fill_record(
+        store_path,
+        instrument_id=OPEN_UPPER_ID,
+        venue_order_id="ord-boot-adopted",
+        cumulative_qty=Decimal(1),
+        cumulative_fee=Decimal("0.01"),
+        fee_reconciled=True,
+        cumulative_cost=Decimal("0.11"),
+    )
+    strategy = _register_armed_and_start(
+        store_path=store_path,
+        instruments=(interior_instrument, open_upper_instrument),
+        position_evidence_reader=lambda: _TWO_RUNG_EVIDENCE,
+    )
+    assert strategy._latch is not None
+    walked_record = strategy._latch.record(
+        STATION, CLIMATE_DAY.isoformat(), key_instrument_id=str(OPEN_UPPER_ID),
+    )
+    assert walked_record is not None
+    assert walked_record.reason == TAKEN_FROM_FILL_WALK_REASON
+    assert walked_record.fee == Decimal("0.01")
+
+    submitted: list[object] = []
+    strategy.submit_order = submitted.append  # type: ignore[method-assign]
+    strategy.on_data(_observation(temp_c_tenths=300, observed_at_ns=WINDOW_OPEN_NS - 1))
+    strategy.on_quote_tick(_quote(INTERIOR_ID, ask="0.24", ts_event=WINDOW_OPEN_NS))
+
+    assert len(submitted) == 1
+    assert strategy.refusals.count("station_day_admission") == 0
+    yes_records = [rec for rec in strategy.offer_tape.records() if rec.side == "YES"]
+    assert len(yes_records) == 1
+    assert yes_records[0].decision == "take"
+    assert yes_records[0].admission_reason == "admitted"
+
+
+def test_an_unreconciled_boot_walk_adopted_fill_still_refuses_the_second_rung(
+    store_path: Path,
+    interior_instrument: BinaryOption,
+    open_upper_instrument: BinaryOption,
+) -> None:
+    """(2) A resolver-shaped (`fee_reconciled=False`) durable record
+    adopted at boot must NOT supply a fee -- `q` stays UNKNOWN and a later
+    rung of the same station-day is refused exactly as before this fix,
+    mirroring `test_an_unreconciled_durable_fill_record_still_refuses_the_second_rung`
+    for the create path."""
+    _write_durable_fill_record(
+        store_path,
+        instrument_id=OPEN_UPPER_ID,
+        venue_order_id="ord-boot-adopted",
+        cumulative_qty=Decimal(1),
+        cumulative_fee=Decimal("0.01"),
+        fee_reconciled=False,
+        cumulative_cost=Decimal("0.11"),
+    )
+    strategy = _register_armed_and_start(
+        store_path=store_path,
+        instruments=(interior_instrument, open_upper_instrument),
+        position_evidence_reader=lambda: _TWO_RUNG_EVIDENCE,
+    )
+    assert strategy._latch is not None
+    walked_record = strategy._latch.record(
+        STATION, CLIMATE_DAY.isoformat(), key_instrument_id=str(OPEN_UPPER_ID),
+    )
+    assert walked_record is not None
+    assert walked_record.fee is None
+
+    submitted: list[object] = []
+    strategy.submit_order = submitted.append  # type: ignore[method-assign]
+    strategy.on_data(_observation(temp_c_tenths=300, observed_at_ns=WINDOW_OPEN_NS - 1))
+    strategy.on_quote_tick(_quote(INTERIOR_ID, ask="0.24", ts_event=WINDOW_OPEN_NS))
+
+    assert submitted == []
+    assert strategy.refusals.count("station_day_admission") == 1
+    yes_records = [rec for rec in strategy.offer_tape.records() if rec.side == "YES"]
+    assert len(yes_records) == 1
+    assert yes_records[0].decision == "refuse"
+    assert yes_records[0].admission_reason == "station_day_admission"
