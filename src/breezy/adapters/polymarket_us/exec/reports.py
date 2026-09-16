@@ -175,12 +175,15 @@ from breezy.adapters.polymarket_us.symbology import POLYMARKET_US_VENUE, leg_of
 logger = logging.getLogger(__name__)
 
 __all__ = [
+    "OPEN_ORDER_UNKNOWN_KEYS_MAX",
     "ORDER_STATE_TO_ORDER_STATUS",
     "MappedPosition",
+    "OpenOrderRecord",
     "build_execution_mass_status",
     "derive_position_cost_basis",
     "parse_account_balances",
     "parse_fill_report",
+    "parse_open_orders",
     "parse_order_status_report",
     "parse_position_status_report",
 ]
@@ -1576,3 +1579,174 @@ def build_execution_mass_status(
     mass_status.add_fill_reports(list(fill_reports))
     mass_status.add_position_reports(list(position_reports))
     return mass_status
+
+
+# ---------------------------------------------------------------------------
+# Open orders -> OpenOrderRecord (RESTING_BID_HUNT Rev 2 section 4.3)
+# ---------------------------------------------------------------------------
+
+#: Upper bound on the unknown-key names one :class:`OpenOrderRecord` carries.
+#: The record is a diagnostic, not a schema: a venue that adds fifty fields
+#: must not turn one enumeration row into fifty log tokens.
+OPEN_ORDER_UNKNOWN_KEYS_MAX: Final[int] = 16
+
+#: ``GetOpenOrdersResponse`` (``types/orders.py:171-174``): one declared key.
+#: ``eof`` is NOT declared for this response; it is tolerated as a known name
+#: only so that, should the venue paginate this surface later, a non-terminal
+#: page is REFUSED (below) instead of being recorded as an unknown key.
+_OPEN_ORDERS_RESPONSE_KEYS: Final[frozenset[str]] = frozenset({"orders", "eof"})
+
+#: The keys :func:`parse_open_orders` READS off an ``Order``. Everything else
+#: the snapshot declares (``_ORDER_KEYS``) or has been seen live
+#: (``_ORDER_DRIFT_ALLOWED_KEYS``) is accepted silently; anything beyond BOTH
+#: is recorded as unknown -- bounded, never fatal.
+_OPEN_ORDER_REQUIRED_KEYS: Final[tuple[str, ...]] = (
+    "id",
+    "marketSlug",
+    "state",
+    "side",
+    "quantity",
+    "cumQuantity",
+    "tif",
+    "createTime",
+)
+
+
+class OpenOrderRecord(NamedTuple):
+    """One open order as the venue enumerates it -- instrument-FREE.
+
+    NOT a parallel report class: the native ``OrderStatusReport`` needs an
+    ``Instrument`` and an account, and the boot never-arm gate must be able
+    to enumerate an order on a market this node never configured (a foreign
+    slug is exactly the open order it cannot account for). So this is the
+    minimal venue-shape record the gate and the durable evidence need, and
+    ``parse_order_status_report`` remains the ONLY route to a native report.
+
+    Direction vocabulary is deliberately absent: ``side`` is the venue's
+    ``OrderSide`` member; ``intent``/outcome fields are declared but unread,
+    exactly as in every other mapper in this module.
+    """
+
+    venue_order_id: str
+    market_slug: str
+    state: str
+    side: str
+    quantity: Decimal
+    cum_quantity: Decimal
+    price: Decimal | None
+    tif: str
+    create_time: str
+    #: Sanitised names (``_safe_key_name``) of keys neither the snapshot nor
+    #: the live drift allowlist declares -- on the order row AND the response
+    #: envelope -- sorted, capped at :data:`OPEN_ORDER_UNKNOWN_KEYS_MAX`.
+    unknown_keys: tuple[str, ...]
+
+
+def _unknown_key_names(payload: Mapping[str, Any], *, known: frozenset[str]) -> list[str]:
+    return [_safe_key_name(key) for key in payload if key not in known]
+
+
+def _open_order_record(
+    payload: object, *, context: str, envelope_unknown: list[str]
+) -> OpenOrderRecord:
+    if not isinstance(payload, Mapping):
+        raise ExecutionReportMappingError(
+            f"{context} must be a JSON object, got {type(payload).__name__}"
+        )
+    for key in _OPEN_ORDER_REQUIRED_KEYS:
+        if key not in payload or payload[key] is None:
+            raise ExecutionReportMappingError(f"{context} is missing required field {key!r}")
+
+    venue_order_id = _require_text(payload, "id", context=context)
+    market_slug = _require_text(payload, "marketSlug", context=context)
+    create_time = _require_text(payload, "createTime", context=context)
+    # Membership only -- the native enums are not needed for an enumeration,
+    # but an undeclared member is still refused rather than carried.
+    state = _require_text(payload, "state", context=context)
+    if state not in ORDER_STATE_TO_ORDER_STATUS:
+        raise ExecutionReportMappingError(f"{context}.state {state!r} is not a declared OrderState")
+    side = _require_text(payload, "side", context=context)
+    if side not in _ORDER_SIDES:
+        raise ExecutionReportMappingError(f"{context}.side {side!r} is not a declared OrderSide")
+    tif = _require_text(payload, "tif", context=context)
+    if tif not in _TIME_IN_FORCE:
+        raise ExecutionReportMappingError(f"{context}.tif {tif!r} is not a declared TimeInForce")
+
+    quantity = _to_decimal(
+        payload["quantity"], field=f"{context}.quantity", error=ExecutionReportMappingError
+    )
+    cum_quantity = _to_decimal(
+        payload["cumQuantity"], field=f"{context}.cumQuantity", error=ExecutionReportMappingError
+    )
+    if quantity <= 0:
+        raise ExecutionReportMappingError(f"{context}.quantity must be positive, got {quantity}")
+    if cum_quantity < 0 or cum_quantity > quantity:
+        raise ExecutionReportMappingError(
+            f"{context}.cumQuantity {cum_quantity} is outside [0, quantity={quantity}]"
+        )
+
+    price: Decimal | None = None
+    if payload.get("price") is not None:
+        price = _amount_field(payload, "price", context=context)
+        if not (Decimal(0) < price < Decimal(1)):
+            raise ExecutionReportMappingError(
+                f"{context}.price {price} is outside the open interval (0, 1)"
+            )
+
+    unknown = sorted(
+        set(envelope_unknown)
+        | set(_unknown_key_names(payload, known=_ORDER_KEYS | _ORDER_DRIFT_ALLOWED_KEYS))
+    )
+    return OpenOrderRecord(
+        venue_order_id=venue_order_id,
+        market_slug=market_slug,
+        state=state,
+        side=side,
+        quantity=quantity,
+        cum_quantity=cum_quantity,
+        price=price,
+        tif=tif,
+        create_time=create_time,
+        unknown_keys=tuple(unknown[:OPEN_ORDER_UNKNOWN_KEYS_MAX]),
+    )
+
+
+def parse_open_orders(payload: object) -> tuple[OpenOrderRecord, ...]:
+    """Map a ``GetOpenOrdersResponse`` to :class:`OpenOrderRecord` rows.
+
+    Drift-TOLERANT on purpose, and the only mapper here that is: the boot
+    never-arm gate consumes this to decide whether ANY order is open, so an
+    order whose shape moved must still be enumerable (its unknown keys are
+    recorded, bounded). Strict everywhere that matters for the decision: a
+    missing ``orders`` list, a non-list, a non-object row, an undeclared
+    enum member, a negative/inconsistent quantity, a non-USD or out-of-range
+    price, or a missing required field REFUSES THE WHOLE READ -- the caller
+    records the read as refused and never arms, rather than acting on a
+    partial book. An ``eof`` key that is present and not ``True`` is refused
+    for the same reason ``_declared_positions`` refuses it: page 1 is not
+    the book.
+    """
+    if not isinstance(payload, Mapping):
+        raise ExecutionReportMappingError(
+            f"open orders response must be a JSON object, got {type(payload).__name__}"
+        )
+    orders = payload.get("orders")
+    if orders is None:
+        raise ExecutionReportMappingError(
+            "the venue open-orders response declares no 'orders' key; an absent "
+            "list is not an empty list"
+        )
+    if not isinstance(orders, list):
+        raise ExecutionReportMappingError(
+            f"the venue open-orders response carries a {type(orders).__name__} under "
+            "'orders' where a list was declared"
+        )
+    if "eof" in payload and payload["eof"] is not True:
+        raise ExecutionReportMappingError(
+            "the venue open-orders response is marked eof!=true; page 1 is not the book"
+        )
+    envelope_unknown = _unknown_key_names(payload, known=_OPEN_ORDERS_RESPONSE_KEYS)
+    return tuple(
+        _open_order_record(row, context=f"open order [{index}]", envelope_unknown=envelope_unknown)
+        for index, row in enumerate(orders)
+    )

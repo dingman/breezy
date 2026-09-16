@@ -64,6 +64,7 @@ from breezy.adapters.polymarket_us.exec.client import (
     BUDGET_EXHAUSTED_KEY_PREFIX,
     FILL_INDEX_KEY_PREFIX,
     FILL_KEY_PREFIX,
+    STARTUP_OPEN_ORDERS_PRESENT_REASON,
     DurableFillRecord,
 )
 from breezy.adapters.polymarket_us.symbology import (
@@ -91,6 +92,7 @@ __all__ = [
     "NO_SIDE_FIRST_ORDER_PENDING_REASON",
     "SIBLING_LEG_TRADED_REASON",
     "STARTUP_EVIDENCE_KEY",
+    "STARTUP_OPEN_ORDERS_PRESENT_REASON",
     "STATION_DAY_ADMISSION_REASON",
     "TAKEN_FROM_FILL_WALK_REASON",
     "Refusal",
@@ -106,6 +108,7 @@ __all__ = [
     "startup_evidence_lists_slug",
     "startup_evidence_permits_arm",
     "startup_evidence_position_for",
+    "startup_evidence_refusal_reason",
     "station_day_admission",
     "trial_id_for",
 ]
@@ -1188,20 +1191,47 @@ class TrialDayLatch:
         return new_count
 
 
-def startup_evidence_permits_arm(evidence: dict[str, object] | None) -> bool:
-    """``True`` only when ``evidence`` proves a complete, non-refused
-    startup positions read (Slice 4 item A2, plan rev 6.1). Any missing or
-    wrong-typed field is a refusal to arm -- fail closed, not a partial read.
+def startup_evidence_refusal_reason(evidence: dict[str, object] | None) -> str | None:
+    """Why ``evidence`` does NOT permit arming, or ``None`` when it does.
+
+    Slice 4 item A2 (plan rev 6.1) for the positions read, extended by
+    RESTING_BID_HUNT Rev 2 section 4.3 for the open-order enumeration: the
+    exec client's read must have SUCCEEDED (``open_orders_read_refused`` is
+    exactly ``False``) AND returned an EMPTY list. A record predating those
+    two keys, a refused read, a malformed list, or ANY open order -- on a
+    configured market or a foreign one -- is a refusal. Fail closed: an
+    enumeration error is never an assumed-empty book. Reasons are stable
+    tokens; :data:`STARTUP_OPEN_ORDERS_PRESENT_REASON` is the one the exec
+    client also logs at ERROR when it writes such a record.
     """
     if evidence is None:
-        return False
+        return "evidence_absent"
     if evidence.get("v") != 1:
-        return False
+        return "schema_version"
     if evidence.get("position_read_refused") is not False:
-        return False
+        return "position_read_refused"
     if evidence.get("eof_complete") is not True:
-        return False
-    return evidence.get("fill_walk_complete") is True
+        return "not_eof_complete"
+    if evidence.get("fill_walk_complete") is not True:
+        return "fill_walk_incomplete"
+    if evidence.get("open_orders_read_refused") is not False:
+        return "open_orders_read_refused"
+    open_orders = evidence.get("open_orders")
+    if not isinstance(open_orders, list):
+        return "open_orders_malformed"
+    if open_orders:
+        return STARTUP_OPEN_ORDERS_PRESENT_REASON
+    return None
+
+
+def startup_evidence_permits_arm(evidence: dict[str, object] | None) -> bool:
+    """``True`` only when ``evidence`` proves a complete, non-refused startup
+    positions read AND a successful, EMPTY open-order enumeration -- exactly
+    :func:`startup_evidence_refusal_reason` returning ``None``. Any missing
+    or wrong-typed field is a refusal to arm -- fail closed, not a partial
+    read.
+    """
+    return startup_evidence_refusal_reason(evidence) is None
 
 
 def startup_evidence_position_for(

@@ -338,6 +338,11 @@ def _maker_commission(instrument: Instrument, quantity: Quantity, price: Price) 
     return Money(_round_bankers(exact, instrument.quote_currency), instrument.quote_currency)
 
 
+# Venue field-path citation for the two MakerFeeScheduleMismatchError messages
+# below: Order.makerCommissionsBasisPoints, "Maker commission rate in basis
+# points" (docs/evidence/venue/polymarket_us/docs_snapshots/
+# api-reference_orders_create-order_2026-08-25.md:339-341). Evidence citation
+# only -- never embed that docs/evidence path in a runtime string.
 def _assert_maker_fee_schedule_matches(instrument: Instrument) -> None:
     """Refuse if the venue's own reported maker bps disagrees with the pin.
 
@@ -360,18 +365,15 @@ def _assert_maker_fee_schedule_matches(instrument: Instrument) -> None:
         raise MakerFeeScheduleMismatchError(
             f"Refusing to price a Polymarket.us maker fill for {instrument.id}: "
             f"{MAKER_FEE_BPS_INFO_KEY!r} = {raw_bps!r} is not a valid basis-points "
-            "number (venue field path Order.makerCommissionsBasisPoints, "
-            "docs/evidence/venue/polymarket_us/docs_snapshots/"
-            "api-reference_orders_create-order_2026-08-25.md:339-341)"
+            "number (see the venue field-path citation in this module's "
+            "comments)"
         ) from None
     if reported != MAKER_FEE_COEFFICIENT:
         raise MakerFeeScheduleMismatchError(
             f"Refusing to price a Polymarket.us maker fill for {instrument.id}: "
             f"reported {MAKER_FEE_BPS_INFO_KEY!r}={raw_bps!r} ({reported}) disagrees "
             f"with the pinned maker coefficient {MAKER_FEE_COEFFICIENT} (-125 bps) "
-            "(venue field path Order.makerCommissionsBasisPoints, "
-            "docs/evidence/venue/polymarket_us/docs_snapshots/"
-            "api-reference_orders_create-order_2026-08-25.md:339-341)"
+            "(see the venue field-path citation in this module's comments)"
         )
 
 

@@ -107,6 +107,7 @@ from breezy.adapters.polymarket_us.exec.client import (
 )
 from breezy.adapters.polymarket_us.exec.endpoints import (
     ACCOUNT_BALANCES_PATH,
+    OPEN_ORDERS_PATH,
     PORTFOLIO_POSITIONS_PATH,
 )
 from breezy.adapters.polymarket_us.exec.refusals import (
@@ -355,6 +356,10 @@ def _build_rig(
         {
             ACCOUNT_BALANCES_PATH: _balances_payload(),
             PORTFOLIO_POSITIONS_PATH: {"positions": dict(positions or {}), "eof": True},
+            # §4.3 (RESTING_BID_HUNT Rev 2): the boot's open-order enumeration
+            # -- EMPTY by default, the "nothing rests" book every existing
+            # `_connect` test assumes.
+            OPEN_ORDERS_PATH: {"orders": []},
         },
     )
 
@@ -2444,6 +2449,7 @@ def _build_accept_fill_rig(
         {
             ACCOUNT_BALANCES_PATH: _balances_payload(),
             PORTFOLIO_POSITIONS_PATH: {"positions": {}, "eof": True},
+            OPEN_ORDERS_PATH: {"orders": []},
         },
     )
     order_events: list[Any] = []
@@ -2579,6 +2585,7 @@ async def test_a_session_notional_exhaustion_writes_the_same_day_marker(
         {
             ACCOUNT_BALANCES_PATH: _balances_payload(),
             PORTFOLIO_POSITIONS_PATH: {"positions": {}, "eof": True},
+            OPEN_ORDERS_PATH: {"orders": []},
         },
     )
     order_events: list[Any] = []
@@ -2672,6 +2679,7 @@ def _build_manual_client(
         {
             ACCOUNT_BALANCES_PATH: _balances_payload(),
             PORTFOLIO_POSITIONS_PATH: {"positions": {}, "eof": True},
+            OPEN_ORDERS_PATH: {"orders": []},
         },
     )
     order_events: list[Any] = []
@@ -4322,6 +4330,7 @@ async def test_a_corrupt_fill_index_for_one_instrument_fails_the_seed_closed_and
         {
             ACCOUNT_BALANCES_PATH: _balances_payload(),
             PORTFOLIO_POSITIONS_PATH: {"positions": {}, "eof": True},
+            OPEN_ORDERS_PATH: {"orders": []},
         },
     )
     msgbus.register(endpoint="Portfolio.update_account", handler=lambda state: None)
@@ -4659,3 +4668,136 @@ async def test_a_resolver_accept_fill_books_the_contexts_real_order_side(
     # every fill event here comes from `_resolve_accept_fill` above.
     assert len(fills) == 1
     assert fills[0].order_side == OrderSide.SELL
+
+
+# ===========================================================================
+# RESTING_BID_HUNT Rev 2 §4.3 -- `_read_open_orders` on the private read seam
+# ===========================================================================
+
+
+def _open_orders_payload(*slugs: str) -> dict[str, Any]:
+    return {
+        "orders": [
+            {
+                "id": f"RESTING{i:04d}",
+                "marketSlug": slug,
+                "side": "ORDER_SIDE_BUY",
+                "type": "ORDER_TYPE_LIMIT",
+                "price": {"value": "0.01", "currency": "USD"},
+                "quantity": 1,
+                "cumQuantity": 0,
+                "leavesQuantity": 1,
+                "tif": "TIME_IN_FORCE_GOOD_TILL_CANCEL",
+                "state": "ORDER_STATE_NEW",
+                "createTime": TS_EVENT_TEXT,
+            }
+            for i, slug in enumerate(slugs)
+        ]
+    }
+
+
+@pytest.mark.asyncio
+async def test_read_open_orders_issues_one_bare_path_get_and_maps_the_rows(
+    tmp_path: Path,
+) -> None:
+    """One GET on the declared path -- no query string, so the proven
+    path-only signing contract (`PrivateRead.__call__(path)`) is untouched."""
+    rig = _build_rig(tmp_path)
+    rig.read._payloads[OPEN_ORDERS_PATH] = _open_orders_payload("slug-a", "slug-b")  # type: ignore[attr-defined]
+
+    records = await rig.client._read_open_orders()
+
+    assert rig.read.paths == [OPEN_ORDERS_PATH]
+    assert [r.venue_order_id for r in records] == ["RESTING0000", "RESTING0001"]
+    assert [r.market_slug for r in records] == ["slug-a", "slug-b"]
+
+
+@pytest.mark.asyncio
+async def test_read_open_orders_filters_by_slug_client_side(tmp_path: Path) -> None:
+    """`slugs` narrows the RESULT, never the request: the venue's `slugs[]`
+    query is not sent (bare path only), so an unfiltered enumeration is what
+    the boot gate sees and a caller's filter cannot hide a foreign order."""
+    rig = _build_rig(tmp_path)
+    rig.read._payloads[OPEN_ORDERS_PATH] = _open_orders_payload("slug-a", "slug-b")  # type: ignore[attr-defined]
+
+    records = await rig.client._read_open_orders(slugs=("slug-b",))
+
+    assert rig.read.paths == [OPEN_ORDERS_PATH]
+    assert [r.market_slug for r in records] == ["slug-b"]
+
+
+@pytest.mark.asyncio
+async def test_read_open_orders_propagates_a_read_refusal(tmp_path: Path) -> None:
+    rig = _build_rig(tmp_path)
+    rig.read.raises[OPEN_ORDERS_PATH] = PrivateReadRefused(
+        status=503, path=OPEN_ORDERS_PATH, body=b'{"code": 14}',
+    )
+    with pytest.raises(PrivateReadRefused):
+        await rig.client._read_open_orders()
+
+
+@pytest.mark.asyncio
+async def test_read_open_orders_refuses_a_malformed_body(tmp_path: Path) -> None:
+    rig = _build_rig(tmp_path)
+    rig.read._payloads[OPEN_ORDERS_PATH] = {"orders": [{"id": "x"}]}  # type: ignore[attr-defined]
+    with pytest.raises(ExecutionReportMappingError):
+        await rig.client._read_open_orders()
+
+
+@pytest.mark.asyncio
+async def test_generate_order_status_reports_still_returns_empty_when_an_order_rests(
+    tmp_path: Path,
+) -> None:
+    """DECIDED: stays ``[]``. The venue ``Order`` carries no client-order-id
+    field (reports.py module docstring item 2; skill row 2026-09-05), so no
+    open order is Breezy-ATTRIBUTABLE from the read alone; attribution
+    arrives with the §4.4 store. Until then a report with
+    ``client_order_id=None`` would make native reconciliation adopt the
+    order as EXTERNAL -- the opposite of fail-closed."""
+    rig = _build_rig(tmp_path)
+    rig.read._payloads[OPEN_ORDERS_PATH] = _open_orders_payload("slug-a")  # type: ignore[attr-defined]
+    await rig.client._connect()
+    reports = await rig.client.generate_order_status_reports(
+        GenerateOrderStatusReports(
+            instrument_id=None,
+            start=None,
+            end=None,
+            open_only=True,
+            command_id=UUID4(),
+            ts_init=TS_INIT,
+        ),
+    )
+    await rig.client._disconnect()
+    assert reports == []
+
+
+@pytest.mark.asyncio
+async def test_a_terminal_zero_rewrite_carries_the_last_open_order_read_forward(
+    tmp_path: Path,
+) -> None:
+    """`_resolve_terminal_zero` is synchronous and cannot GET; its evidence
+    rewrite must reuse the LAST enumeration rather than fabricate an empty
+    one. Before any read the carried state is REFUSED (fail closed)."""
+    rig = _build_rig(tmp_path)
+    assert rig.client._open_orders_read_refused is True
+    assert rig.client._open_orders == ()
+    rig.read._payloads[OPEN_ORDERS_PATH] = _open_orders_payload("slug-a")  # type: ignore[attr-defined]
+    await rig.client._connect()
+    assert rig.client._open_orders_read_refused is False
+    rig.client._write_startup_position_evidence(
+        now_ns=rig.clock.timestamp_ns(),
+        eof_complete=True,
+        position_read_refused=False,
+        raw_positions={},
+    )
+    evidence = rig.client.read_startup_position_evidence()
+    await rig.client._disconnect()
+    assert evidence is not None
+    assert [o.venue_order_id for o in evidence.open_orders] == ["RESTING0000"]
+
+
+def test_open_order_ids_are_redacted_to_a_prefix_in_the_error_line() -> None:
+    from breezy.adapters.polymarket_us.exec.client import _redact_order_id
+
+    assert _redact_order_id("CEBPX0EVTTMX") == "CEBP…"
+    assert _redact_order_id("AB") == "AB…"

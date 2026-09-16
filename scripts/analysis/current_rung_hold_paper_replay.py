@@ -726,6 +726,12 @@ class _FlatStartupEvidence:
             "eof_complete": True,
             "fill_walk_complete": True,
             "positions": [{"slug": slug, "net_position": "0"} for slug in sorted(slugs)],
+            # RESTING_BID_HUNT Rev 2 §4.3: the never-arm gate also requires a
+            # successful, EMPTY open-order enumeration. A replay has no venue
+            # and therefore no open order BY CONSTRUCTION -- this is the one
+            # place stating "read, empty" without a read is truthful.
+            "open_orders_read_refused": False,
+            "open_orders": [],
         }
 
 

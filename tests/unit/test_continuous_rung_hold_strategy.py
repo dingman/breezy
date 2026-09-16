@@ -35,12 +35,14 @@ from breezy.adapters.polymarket_us.parsing import DEPTH10_LEVELS
 from breezy.domain.station_observation import StationObservation
 from breezy.runtime.sqlite_store import SqliteStateStore
 from breezy.runtime.submit_intent import CURRENT_INTENT_KEY, open_submit_intent_latch
+from breezy.strategy.current_rung_hold import continuous_strategy as continuous_strategy_module
 from breezy.strategy.current_rung_hold.config import CurrentRungHoldConfig
 from breezy.strategy.current_rung_hold.continuous_strategy import (
     ContinuousRungHoldStrategy,
     Phase0PermitForbiddenError,
 )
 from breezy.strategy.current_rung_hold.offer_tape import OfferTape
+from breezy.strategy.current_rung_hold.shadow_rest_store import ShadowRestSummary
 from breezy.strategy.current_rung_hold.trial_day_latch import (
     CONTINUOUS_TRIAL_KEY_PREFIX,
     TrialDayLatch,
@@ -98,6 +100,7 @@ def _register(
     clock: TestClock | None = None,
     offer_tape: OfferTape | None = None,
     position_evidence_reader: Any | None = None,
+    shadow_rest_summary_dir: Path | None = None,
 ) -> ContinuousRungHoldStrategy:
     cfg = CurrentRungHoldConfig(
         instrument_ids=tuple(instrument.id for instrument in instruments),
@@ -107,6 +110,7 @@ def _register(
         trial_day_latch_factory=_cont_latch_factory(store_path),
         offer_tape=offer_tape,
         position_evidence_reader=position_evidence_reader,
+        shadow_rest_summary_dir=shadow_rest_summary_dir,
     )
     used_clock = TestClock() if clock is None else clock
     used_clock.set_time(WINDOW_OPEN_NS)
@@ -132,6 +136,7 @@ def _register_and_start(
     clock: TestClock | None = None,
     offer_tape: OfferTape | None = None,
     position_evidence_reader: Any | None = None,
+    shadow_rest_summary_dir: Path | None = None,
 ) -> ContinuousRungHoldStrategy:
     strategy = _register(
         store_path=store_path,
@@ -139,6 +144,7 @@ def _register_and_start(
         clock=clock,
         offer_tape=offer_tape,
         position_evidence_reader=position_evidence_reader,
+        shadow_rest_summary_dir=shadow_rest_summary_dir,
     )
     strategy.start()
     return strategy
@@ -161,6 +167,12 @@ _PERMISSIVE_EVIDENCE: dict[str, object] = {
     "position_read_refused": False,
     "fill_walk_complete": True,
     "positions": [{"slug": str(INTERIOR_ID.symbol.value), "net_position": "0"}],
+    # RESTING_BID_HUNT Rev 2 §4.3: the never-arm gate now also requires a
+    # SUCCESSFUL open-order enumeration that came back EMPTY. Additive --
+    # every prior key and value is unchanged; a fixture without these two
+    # keys would (correctly) halt every boot walk, fail closed.
+    "open_orders_read_refused": False,
+    "open_orders": [],
 }
 
 
@@ -634,6 +646,65 @@ def test_on_stop_unsubscribes_order_book_depth(
     strategy.stop()
 
     assert unsubscribed == [interior_instrument.id]
+
+
+def test_on_stop_completes_and_clears_the_latch_when_the_summary_write_raises(
+    store_path: Path,
+    interior_instrument: BinaryOption,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Domain review of 87446c2, finding 3: `_flush_shadow_rest_summaries`
+    used to catch only `OSError`, and `close_all_windows`'s own loop ran
+    unguarded -- a store whose write raised e.g. `ValueError` would have
+    propagated out of `on_stop`, skipping `exit_stack.close()` and leaving
+    `self._latch` set. Contained now: `on_stop` always completes."""
+    strategy = _register_and_start(
+        store_path=store_path,
+        instruments=(interior_instrument,),
+        shadow_rest_summary_dir=tmp_path / "shadow_rest",
+    )
+    strategy._shadow_rest_summaries["SFO|2026-09-16|YES"] = ShadowRestSummary(
+        station="SFO", climate_day="2026-09-16", leg="YES", ticks_evaluated=1,
+    )
+
+    def _raise(*_args: object, **_kwargs: object) -> None:
+        raise ValueError("store exploded")
+
+    monkeypatch.setattr(continuous_strategy_module, "write_shadow_rest_summaries", _raise)
+
+    strategy.stop()
+
+    assert strategy._latch is None
+    assert strategy._exit_stack is None
+
+
+def test_a_second_flush_never_rewrites_the_already_flushed_summaries(
+    store_path: Path,
+    interior_instrument: BinaryOption,
+    tmp_path: Path,
+) -> None:
+    """Domain review of 87446c2, finding 4: a successful flush must clear
+    `_shadow_rest_summaries`, so a second `on_stop`/flush call writes
+    nothing rather than re-writing a stale run."""
+    summary_dir = tmp_path / "shadow_rest"
+    strategy = _register_and_start(
+        store_path=store_path,
+        instruments=(interior_instrument,),
+        shadow_rest_summary_dir=summary_dir,
+    )
+    strategy._shadow_rest_summaries["SFO|2026-09-16|YES"] = ShadowRestSummary(
+        station="SFO", climate_day="2026-09-16", leg="YES", ticks_evaluated=1,
+    )
+
+    strategy._flush_shadow_rest_summaries()
+    written = sorted(summary_dir.glob("*.parquet"))
+    assert len(written) == 1
+    assert strategy._shadow_rest_summaries == {}
+
+    strategy._flush_shadow_rest_summaries()
+    still_written = sorted(summary_dir.glob("*.parquet"))
+    assert still_written == written
 
 
 def test_a_one_sided_depth10_ask_drives_the_same_decision_as_the_equivalent_quote_tick(

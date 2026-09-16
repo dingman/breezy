@@ -1821,6 +1821,17 @@ EXEC_PERMITTED_COROUTINE_NAMES = frozenset(
         # run last inside `_connect`. Never reaches `_order_sender.post_order`
         # -- one GET plus a local store write.
         "_refresh_startup_position_evidence",
+        # RESTING_BID_HUNT Rev 2 §4.3 (2026-09-16): the open-order READ-BACK
+        # on the injected `PrivateRead` seam -- one bare-path GET on
+        # `endpoints.OPEN_ORDERS_PATH`, decoded by `reports.parse_open_orders`,
+        # nothing else. Old(21) -> new(22), WIDENED not relaxed: it is a
+        # read coroutine feeding the never-arm gate's fail-closed
+        # open-order evidence; it constructs no order, names no write verb
+        # and cannot reach `_order_sender.post_order` (B4 V1-V5 and the
+        # order-coroutine callee pins are unchanged). Non-vacuity: the
+        # `_send_signed_request` widened neighbour in
+        # `test_cage_rule_constants_are_pinned.py` is still refused.
+        "_read_open_orders",
         # The injected read protocol's own call signature.
         "__call__",
     }
@@ -2081,6 +2092,15 @@ EXEC_RESOLVER_PERMITTED_CALLEES = frozenset(
         "self._cache.instrument",
         "InstrumentId.from_str",
         "self._private_read",
+        # RESTING_BID_HUNT Rev 2 §4.3: R-9a's age-gated evidence refresh now
+        # also re-enumerates open orders (a rest appearing after boot must
+        # reach the re-arm gate). `_read_open_orders` is the client's own
+        # read coroutine (`EXEC_PERMITTED_COROUTINE_NAMES`); `_note_open_
+        # orders_outcome` is a synchronous attribute-and-log recorder with
+        # no callee of its own beyond `self._log.*`. Neither can reach
+        # `self._order_sender.post_order`, which stays absent from this set.
+        "self._read_open_orders",
+        "self._note_open_orders_outcome",
         "submit_chain.order_by_id_path",
         "order_payload.get",
         "isinstance",

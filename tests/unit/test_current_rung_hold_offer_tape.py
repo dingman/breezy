@@ -105,6 +105,14 @@ _EXPECTED_DICT: dict[str, object] = {
     "exit_reason_code": None,
     "exit_limit_price": None,
     "expected_settlement_value": None,
+    # RESTING_BID_HUNT Rev 2 §5/§6 (shadow stage): additive, `None`/`False`
+    # for every row before the shadow decider is wired in -- see this
+    # module's own docstring.
+    "shadow_rest_state": None,
+    "shadow_rest_price": None,
+    "shadow_rest_margin": None,
+    "shadow_rest_reason": None,
+    "shadow_fill_event": False,
 }
 
 _OLD_SHAPE_KEYS = frozenset(

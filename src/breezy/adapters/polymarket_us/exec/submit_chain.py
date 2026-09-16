@@ -28,6 +28,9 @@ from nautilus_trader.model.instruments import BinaryOption, Instrument
 from nautilus_trader.model.objects import Money, Price, Quantity
 
 from breezy.adapters.polymarket_us.errors import ExecutionReportMappingError, VenueTransportError
+from breezy.adapters.polymarket_us.exec.endpoints import (
+    order_by_id_path as endpoints_order_by_id_path,
+)
 from breezy.adapters.polymarket_us.exec.reports import _key_tree, parse_fill_report
 from breezy.adapters.polymarket_us.leg_prices import (
     Leg,
@@ -132,8 +135,6 @@ _ORDER_TYPE_LIMIT: Final[str] = "ORDER_TYPE_LIMIT"
 _TIF_IOC: Final[str] = "TIME_IN_FORCE_IMMEDIATE_OR_CANCEL"
 _MANUAL_AUTOMATIC: Final[str] = "MANUAL_ORDER_INDICATOR_AUTOMATIC"
 _MAX_BLOCK_TIME: Final[str] = "5"
-_PRIVATE_API_VERSION: Final[str] = "v1"
-_ORDER_RESOURCE: Final[str] = "order"
 
 
 @dataclass(frozen=True, slots=True)
@@ -534,8 +535,13 @@ def encode_order_body(body: Mapping[str, Any]) -> bytes:
 
 
 def order_by_id_path(order_id: str) -> str:
-    """Templated by-id path so V2 does not see the order resource as one literal."""
-    return f"/{_PRIVATE_API_VERSION}/{_ORDER_RESOURCE}/{order_id}"
+    """The resolver's by-id path -- ONE builder, delegated to the declared read
+    set (``endpoints.order_by_id_path``, RESTING_BID_HUNT Rev 2 section 4.3).
+    Before that increment this spliced the resource out of fragments so V2
+    did not see the literal; the literal is now V2-allowlisted in
+    ``endpoints.py`` alone, and this name is kept only so the resolver's
+    pinned callee (``EXEC_RESOLVER_PERMITTED_CALLEES``) is unchanged."""
+    return endpoints_order_by_id_path(order_id)
 
 
 def _parse_json_object(body: bytes) -> dict[str, Any] | None:

@@ -1075,6 +1075,11 @@ class TestStartupEvidence:
                     "position_read_refused": False,
                     "eof_complete": True,
                     "fill_walk_complete": True,
+                    # RESTING_BID_HUNT Rev 2 §4.3: a COMPLETE record now also
+                    # carries a successful, EMPTY open-order enumeration.
+                    # Widened additively; every prior key is unchanged.
+                    "open_orders_read_refused": False,
+                    "open_orders": [],
                 },
             )
             is True
@@ -1117,6 +1122,9 @@ class TestStartupEvidenceAbsentIsFlat:
             "eof_complete": True,
             "fill_walk_complete": True,
             "positions": [],
+            # RESTING_BID_HUNT Rev 2 §4.3: complete = open orders read, empty.
+            "open_orders_read_refused": False,
+            "open_orders": [],
         }
         base.update(overrides)
         return base
@@ -1271,6 +1279,10 @@ class TestStartupEvidenceAbsentIsFlat:
                 position_read_refused=False,
                 fill_walk_complete=True,
                 positions=(),
+                # §4.3: the producer's default is REFUSED (fail closed); a
+                # complete boot record states the successful empty read.
+                open_orders_read_refused=False,
+                open_orders=(),
             ).to_bytes(),
         )
         assert (
@@ -2090,3 +2102,96 @@ def test_yes_only_rungs_summing_at_or_below_one_are_never_refused(
             existing_instrument_ids=existing,
         )
     assert got is None
+
+
+class TestStartupEvidenceOpenOrders:
+    """RESTING_BID_HUNT Rev 2 §4.3: the never-arm gate fails closed on the
+    open-order enumeration -- absent, refused, malformed or NON-EMPTY all
+    refuse. ``startup_evidence_permits_arm`` is the single predicate both
+    the boot walk (``continuous_strategy.py:582``) and the re-arm gate
+    (``:1765``) consult, so the refusal lands on both without either
+    caller changing."""
+
+    @staticmethod
+    def _complete(**overrides: object) -> dict[str, object]:
+        base: dict[str, object] = {
+            "v": 1,
+            "ts_ns": NOW_NS,
+            "position_read_refused": False,
+            "eof_complete": True,
+            "fill_walk_complete": True,
+            "positions": [],
+            "open_orders_read_refused": False,
+            "open_orders": [],
+        }
+        base.update(overrides)
+        return base
+
+    def test_a_complete_record_with_an_empty_open_order_set_arms(self) -> None:
+        assert startup_evidence_permits_arm(self._complete()) is True
+
+    def test_a_record_predating_the_open_order_fields_refuses(self) -> None:
+        """Fail closed: a v1 record written by an older client carries no
+        open-order evidence, which is UNKNOWN, never 'none open'."""
+        evidence = self._complete()
+        del evidence["open_orders_read_refused"]
+        del evidence["open_orders"]
+        assert startup_evidence_permits_arm(evidence) is False
+
+    @pytest.mark.parametrize(
+        "overrides",
+        [
+            {"open_orders_read_refused": True},
+            {"open_orders_read_refused": None},
+            {"open_orders_read_refused": "false"},
+            {"open_orders": None},
+            {"open_orders": {}},
+            {"open_orders": "[]"},
+            {"open_orders": [{"venue_order_id": "RESTING0001A", "market_slug": "x"}]},
+        ],
+    )
+    def test_refused_malformed_or_non_empty_open_orders_refuse(
+        self, overrides: dict[str, object],
+    ) -> None:
+        assert startup_evidence_permits_arm(self._complete(**overrides)) is False
+
+    def test_refusal_reason_names_the_open_order_presence(self) -> None:
+        from breezy.strategy.current_rung_hold.trial_day_latch import (
+            STARTUP_OPEN_ORDERS_PRESENT_REASON,
+            startup_evidence_refusal_reason,
+        )
+
+        present = self._complete(open_orders=[{"venue_order_id": "R1", "market_slug": "x"}])
+        assert startup_evidence_refusal_reason(present) == STARTUP_OPEN_ORDERS_PRESENT_REASON
+        assert STARTUP_OPEN_ORDERS_PRESENT_REASON == "startup_open_orders_present"
+        assert startup_evidence_refusal_reason(self._complete()) is None
+        assert (
+            startup_evidence_refusal_reason(self._complete(open_orders_read_refused=True))
+            == "open_orders_read_refused"
+        )
+        assert startup_evidence_refusal_reason(None) == "evidence_absent"
+
+    def test_permits_arm_is_exactly_reason_is_none(self) -> None:
+        from breezy.strategy.current_rung_hold.trial_day_latch import (
+            startup_evidence_refusal_reason,
+        )
+
+        for evidence in (
+            None,
+            self._complete(),
+            self._complete(open_orders_read_refused=True),
+            self._complete(position_read_refused=True),
+            self._complete(v=2),
+        ):
+            assert startup_evidence_permits_arm(evidence) is (
+                startup_evidence_refusal_reason(evidence) is None
+            )
+
+    def test_confirms_absent_flat_also_refuses_on_an_open_order(self) -> None:
+        present = self._complete(open_orders=[{"venue_order_id": "R1", "market_slug": "x"}])
+        assert (
+            startup_evidence_confirms_absent_flat(
+                present, "never-listed", now_ns=NOW_NS, max_age_ns=10**12,
+            )
+            is False
+        )
