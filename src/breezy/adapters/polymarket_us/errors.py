@@ -23,6 +23,7 @@ __all__ = [
     "FeeScheduleUnknownError",
     "GatewayForbiddenError",
     "InstrumentDefinitionError",
+    "MakerFeeScheduleMismatchError",
     "MakerRebateUnmodelledError",
     "MethodNotPermittedError",
     "PolymarketUSError",
@@ -318,6 +319,28 @@ class MakerRebateUnmodelledError(PolymarketUSError):
 
     Resolve by observing a real maker fill and recording the venue's actual
     maker treatment, not by relaxing this refusal.
+    """
+
+
+class MakerFeeScheduleMismatchError(PolymarketUSError):
+    """The venue's reported maker commission disagrees with the pinned rebate.
+
+    ``PolymarketUSFeeModel`` prices an opted-in maker fill at a single pinned
+    coefficient, ``fees.MAKER_FEE_COEFFICIENT`` (``-0.0125``), transcribed
+    from the venue's documented fee schedule
+    (``docs/evidence/venue/polymarket_us/docs_snapshots/fees_2026-08-25.md:
+    12-26``, "Maker Rebate | -0.0125") -- DOCUMENTED-NOT-WIRE-OBSERVED, since
+    no captured payload or fill has independently confirmed it.
+
+    The venue's OWN wire schema separately carries a per-order maker
+    commission field: ``Order.makerCommissionsBasisPoints``
+    (``docs/evidence/venue/polymarket_us/docs_snapshots/
+    api-reference_orders_create-order_2026-08-25.md:339-341``, "Maker
+    commission rate in basis points"). If that figure is ever surfaced onto
+    ``instrument.info`` under ``fees.MAKER_FEE_BPS_INFO_KEY`` and disagrees
+    with the pinned coefficient, pricing at the stale pin would be silently
+    wrong. Raised instead of silently mispricing; resolve by re-verifying the
+    venue's maker schedule and updating the pin, not by relaxing this guard.
     """
 
 

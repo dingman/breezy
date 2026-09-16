@@ -39,10 +39,16 @@ from nautilus_trader.test_kit.stubs.execution import TestExecStubs
 
 from breezy.adapters.polymarket_us.errors import (
     FeeScheduleUnknownError,
+    MakerFeeScheduleMismatchError,
     MakerRebateUnmodelledError,
     PolymarketUSError,
 )
-from breezy.adapters.polymarket_us.fees import PolymarketUSFeeModel
+from breezy.adapters.polymarket_us.fees import (
+    MAKER_FEE_BPS_INFO_KEY,
+    MAKER_FEE_COEFFICIENT,
+    PolymarketUSFeeModel,
+    expected_fee_for,
+)
 from breezy.adapters.polymarket_us.parsing import (
     FEE_COEFFICIENT_KEY,
     FEE_SCHEDULE_STATUS_KEY,
@@ -935,3 +941,253 @@ def test_one_contract_taker_fee_is_bounded_by_two_cents_at_the_p_half_maximum(
 
     assert charged == Money(expected, instrument.quote_currency)
     assert charged.as_decimal() <= Decimal("0.02")
+
+
+# ---------------------------------------------------------------------------
+# Maker branch (RESTING_BID_HUNT Arm B prerequisite, L-44 style)
+#
+# `allow_maker` is a config flag on the model, default `False`. Every test
+# above this marker constructs `PolymarketUSFeeModel()` with no arguments and
+# must keep passing UNCHANGED -- this section adds to that surface, it never
+# edits it.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("side", [LiquiditySide.MAKER, LiquiditySide.TAKER])
+def test_taker_path_is_byte_identical_regardless_of_the_allow_maker_flag(
+    side: LiquiditySide,
+) -> None:
+    """Non-vacuity for the "taker unchanged" requirement.
+
+    A TAKER fill must return the exact figure pinned by
+    `test_fee_model_pins_theta_times_contracts_times_price_times_one_minus_price`
+    whether or not `allow_maker` is set -- the flag governs the MAKER branch
+    only. Parametrized over `side` so a future change that accidentally makes
+    `allow_maker` leak into the taker path is caught here even for a MAKER
+    order evaluated with `allow_maker=False` (today's default path).
+    """
+    instrument = build(load_open_market())
+    order = order_with_liquidity(instrument, LiquiditySide.TAKER)
+    args = (Quantity.from_int(100), Price.from_str("0.50"), instrument)
+
+    default_model = PolymarketUSFeeModel()
+    explicit_off = PolymarketUSFeeModel(allow_maker=False)
+
+    assert default_model.get_commission(order, *args) == Money(
+        Decimal("1.50"), instrument.quote_currency
+    )
+    assert explicit_off.get_commission(order, *args) == Money(
+        Decimal("1.50"), instrument.quote_currency
+    )
+
+
+@pytest.mark.parametrize(
+    ("price", "expected"),
+    [
+        # theta_maker * 100 * p * (1-p), banker's-rounded -- hand-verified
+        # against the venue's own worked figure at p=0.50 (-$0.31,
+        # fees_2026-08-25.md:26 "Maker Rebate | -0.0125 | -$0.31").
+        ("0.05", "-0.06"),
+        ("0.10", "-0.11"),
+        ("0.44", "-0.31"),
+        ("0.50", "-0.31"),
+        ("0.95", "-0.06"),
+    ],
+)
+def test_maker_fill_prices_at_the_pinned_rebate_when_allow_maker_is_true(
+    price: str, expected: str
+) -> None:
+    """The maker branch is negative (income), never the taker-shaped positive."""
+    instrument = build(load_open_market())
+    model = PolymarketUSFeeModel(allow_maker=True)
+    order = order_with_liquidity(instrument, LiquiditySide.MAKER)
+
+    commission = model.get_commission(
+        order, Quantity.from_int(100), Price.from_str(price), instrument
+    )
+
+    assert commission == Money(Decimal(expected), instrument.quote_currency)
+    assert commission.as_decimal() < Decimal(0)
+
+
+def test_post_only_still_refuses_when_allow_maker_is_explicitly_false() -> None:
+    """Unchanged refusal, with the flag named explicitly rather than defaulted."""
+    instrument = build(load_open_market())
+    model = PolymarketUSFeeModel(allow_maker=False)
+    order = post_only_order(instrument, LiquiditySide.MAKER)
+
+    with pytest.raises(MakerRebateUnmodelledError, match="post-only"):
+        model.get_commission(order, Quantity.from_int(100), Price.from_str("0.50"), instrument)
+
+
+def test_post_only_prices_at_the_rebate_and_does_not_refuse_when_allow_maker_is_true() -> None:
+    """The refusal moves behind the opt-in: a post-only fill is now priceable."""
+    instrument = build(load_open_market())
+    model = PolymarketUSFeeModel(allow_maker=True)
+    order = post_only_order(instrument, LiquiditySide.MAKER)
+    assert order.is_post_only
+
+    commission = model.get_commission(
+        order, Quantity.from_int(100), Price.from_str("0.50"), instrument
+    )
+
+    assert commission == Money(Decimal("-0.31"), instrument.quote_currency)
+
+
+def test_incidental_maker_fill_does_not_warn_when_allow_maker_is_true() -> None:
+    """The sign-inversion `UserWarning` is specific to the unmodelled path."""
+    import warnings
+
+    instrument = build(load_open_market())
+    model = PolymarketUSFeeModel(allow_maker=True)
+    order = order_with_liquidity(instrument, LiquiditySide.MAKER)
+    assert not order.is_post_only
+
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        commission = model.get_commission(
+            order, Quantity.from_int(100), Price.from_str("0.50"), instrument
+        )
+
+    assert commission == Money(Decimal("-0.31"), instrument.quote_currency)
+
+
+def test_maker_fee_coefficient_is_pinned_to_the_documented_rebate() -> None:
+    """Evidence pin: fees_2026-08-25.md:12-26, "Maker Rebate | -0.0125"."""
+    assert MAKER_FEE_COEFFICIENT == Decimal("-0.0125")
+
+
+# ---------------------------------------------------------------------------
+# Maker fee-schedule mismatch guard
+# ---------------------------------------------------------------------------
+
+
+def test_maker_fee_schedule_guard_refuses_a_disagreeing_reported_bps() -> None:
+    """-100 bps (-0.01) disagrees with the pinned -125 bps (-0.0125)."""
+    instrument = build(load_open_market())
+    info = dict(instrument.info)
+    info[MAKER_FEE_BPS_INFO_KEY] = "-100"
+    tampered = rebuild_with_info(instrument, info)
+
+    model = PolymarketUSFeeModel(allow_maker=True)
+    order = order_with_liquidity(instrument, LiquiditySide.MAKER)
+
+    with pytest.raises(MakerFeeScheduleMismatchError, match="makerCommissionsBasisPoints"):
+        model.get_commission(order, Quantity.from_int(100), Price.from_str("0.50"), tampered)
+
+
+def test_maker_fee_schedule_guard_accepts_an_agreeing_reported_bps() -> None:
+    """-125 bps == -0.0125: the pin and the (hypothetical) wire figure agree."""
+    instrument = build(load_open_market())
+    info = dict(instrument.info)
+    info[MAKER_FEE_BPS_INFO_KEY] = "-125"
+    agreeing = rebuild_with_info(instrument, info)
+
+    model = PolymarketUSFeeModel(allow_maker=True)
+    order = order_with_liquidity(instrument, LiquiditySide.MAKER)
+
+    commission = model.get_commission(
+        order, Quantity.from_int(100), Price.from_str("0.50"), agreeing
+    )
+
+    assert commission == Money(Decimal("-0.31"), instrument.quote_currency)
+
+
+def test_maker_fee_schedule_guard_is_dormant_when_the_key_is_absent() -> None:
+    """No captured payload writes this key today; absence must not refuse."""
+    instrument = build(load_open_market())
+    assert MAKER_FEE_BPS_INFO_KEY not in instrument.info
+
+    model = PolymarketUSFeeModel(allow_maker=True)
+    order = order_with_liquidity(instrument, LiquiditySide.MAKER)
+
+    commission = model.get_commission(
+        order, Quantity.from_int(100), Price.from_str("0.50"), instrument
+    )
+
+    assert commission == Money(Decimal("-0.31"), instrument.quote_currency)
+
+
+def test_maker_fee_schedule_guard_is_a_noop_when_allow_maker_is_false() -> None:
+    """The guard is scoped to the opt-in branch: it must not touch old behaviour.
+
+    A disagreeing reported bps present on an instrument must not change the
+    `allow_maker=False` outcome at all -- the model does not read this key on
+    that path, so the incidental-maker warning-and-taker-priced behaviour
+    stays exactly as it was before this guard existed.
+    """
+    instrument = build(load_open_market())
+    info = dict(instrument.info)
+    info[MAKER_FEE_BPS_INFO_KEY] = "-100"
+    tampered = rebuild_with_info(instrument, info)
+
+    model = PolymarketUSFeeModel()
+    order = order_with_liquidity(instrument, LiquiditySide.MAKER)
+
+    with pytest.warns(UserWarning, match="REBATE"):
+        commission = model.get_commission(
+            order, Quantity.from_int(100), Price.from_str("0.50"), tampered
+        )
+
+    assert commission == Money(Decimal("1.50"), instrument.quote_currency)
+
+
+def test_maker_fee_schedule_guard_refuses_an_unparseable_reported_bps() -> None:
+    instrument = build(load_open_market())
+    info = dict(instrument.info)
+    info[MAKER_FEE_BPS_INFO_KEY] = "not-a-number"
+    tampered = rebuild_with_info(instrument, info)
+
+    model = PolymarketUSFeeModel(allow_maker=True)
+    order = order_with_liquidity(instrument, LiquiditySide.MAKER)
+
+    with pytest.raises(MakerFeeScheduleMismatchError):
+        model.get_commission(order, Quantity.from_int(100), Price.from_str("0.50"), tampered)
+
+
+# ---------------------------------------------------------------------------
+# expected_fee_for -- pure break-even helper (RESTING_BID_HUNT BE_maker)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("price", "expected"),
+    [
+        ("0.05", "-0.00059375"),
+        ("0.10", "-0.001125"),
+        ("0.44", "-0.00308"),
+        ("0.50", "-0.003125"),
+        ("0.95", "-0.00059375"),
+    ],
+)
+def test_expected_fee_for_maker_matches_the_pinned_rebate_formula(
+    price: str, expected: str
+) -> None:
+    """Pure, per-contract, unrounded: `theta_maker * qty * p * (1 - p)`."""
+    p = Decimal(price)
+    fee = expected_fee_for(p, Decimal(1), LiquiditySide.MAKER)
+
+    assert fee == MAKER_FEE_COEFFICIENT * p * (Decimal(1) - p)
+    assert fee < Decimal(0)
+
+
+def test_expected_fee_for_taker_is_positive_and_uses_the_documented_theta() -> None:
+    """No `Instrument` is available to this pure helper, so it uses the
+    venue's documented 0.06 rather than any per-market coefficient -- see
+    the function's own docstring for why that is a strategy-side estimate,
+    never a substitute for `polymarket_us_fee`.
+    """
+    fee = expected_fee_for(Decimal("0.50"), Decimal(100), LiquiditySide.TAKER)
+
+    assert fee == Decimal("0.06") * Decimal(100) * Decimal("0.50") * Decimal("0.50")
+    assert fee > Decimal(0)
+
+
+def test_expected_fee_for_refuses_a_price_outside_the_binary_range() -> None:
+    with pytest.raises(ValueError, match="0, 1"):
+        expected_fee_for(Decimal("1.01"), Decimal(1), LiquiditySide.MAKER)
+
+
+def test_expected_fee_for_refuses_a_sideless_liquidity_side() -> None:
+    with pytest.raises(ValueError, match="liquidity"):
+        expected_fee_for(Decimal("0.50"), Decimal(1), LiquiditySide.NO_LIQUIDITY_SIDE)
