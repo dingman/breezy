@@ -36,11 +36,12 @@ from nautilus_trader.model.data import (
 )
 from nautilus_trader.model.enums import AggressorSide, InstrumentCloseType, OrderSide
 from nautilus_trader.model.instruments import BinaryOption
-from nautilus_trader.model.objects import Price
+from nautilus_trader.model.objects import Price, Quantity
 
 from breezy.adapters.polymarket_us.errors import VenuePayloadError
 from breezy.adapters.polymarket_us.parsing import (
     DEPTH10_LEVELS,
+    TRADE_QUANTITY_UNIT,
     parse_binary_option,
     parse_instrument_close,
     parse_instrument_status,
@@ -306,70 +307,177 @@ class TestDepth:
 
 
 class TestTradeTick:
-    def frame(self) -> dict[str, Any]:
+    """``SUBSCRIPTION_TYPE_TRADE`` frames, shaped per the venue's OWN documentation.
+
+    Field names: ``docs/evidence/venue/polymarket_us/docs_snapshots/
+    api-reference_websocket_markets_2026-08-25.md:114-138`` (Trade Response)
+    and the SDK ``_TradePayload`` TypedDict
+    (``sdk_snapshot/polymarket_us_0.1.2/websocket/types.py:160-185``):
+    ``marketSlug, price{value,currency}, quantity{value,currency}, tradeTime,
+    maker{side,intent}, taker{side,intent}``. Side spellings
+    ``ORDER_SIDE_BUY`` / ``ORDER_SIDE_SELL`` / ``ORDER_SIDE_UNDEFINED`` are the
+    ones the venue actually emitted in
+    ``docs/evidence/venue/polymarket_us/AMBIGUOUS_ORDER_2026-09-05_SFO/activities_p0.json``.
+
+    Values are adjusted to the fixture instrument's own tick (0.01) and size
+    increment (0.01): both are per-market facts, never constants.
+    """
+
+    SLUG = "tc-temp-nychigh-2026-08-25-lt79f"
+    TRADE_TIME = "2026-08-25T00:06:58.830425365Z"
+
+    def frame(self, **trade_overrides: Any) -> dict[str, Any]:
+        trade: dict[str, Any] = {
+            "marketSlug": self.SLUG,
+            "price": {"value": "0.55", "currency": "USD"},
+            "quantity": {"value": "0.50", "currency": "USD"},
+            "tradeTime": self.TRADE_TIME,
+            "maker": {"side": "ORDER_SIDE_BUY", "intent": "ORDER_INTENT_BUY_LONG"},
+            "taker": {"side": "ORDER_SIDE_SELL", "intent": "ORDER_INTENT_SELL_LONG"},
+        }
+        trade.update(trade_overrides)
         return {
-            "trade": {
-                "marketSlug": "tc-temp-nychigh-2026-08-25-lt79f",
-                "px": {"value": "0.5300", "currency": "USD"},
-                "qty": "15.6100",
-                "transactTime": "2026-08-25T00:06:58.830425365Z",
-                "tradeId": "trd-0001",
-                "takerSide": "SIDE_BUY",
-            }
+            "requestId": "trade-sub-1",
+            "subscriptionType": "SUBSCRIPTION_TYPE_TRADE",
+            "trade": trade,
         }
 
-    def test_an_executed_print_becomes_a_trade_tick(
+    def test_a_documented_trade_frame_becomes_a_trade_tick(
         self, open_instrument: BinaryOption
     ) -> None:
         tick = parse_trade_tick(self.frame(), instrument=open_instrument, ts_init=TS_INIT)
 
         assert isinstance(tick, TradeTick)
         assert tick.instrument_id == open_instrument.id
-        assert tick.price == Price.from_str("0.530")
-        assert str(tick.size) == "15.6100"[: len(str(tick.size))] or tick.size.as_decimal() > 0
-        assert tick.ts_event == parse_rfc3339_nanos(
-            "2026-08-25T00:06:58.830425365Z", field="transactTime"
-        )
+        assert tick.price == Price.from_str("0.55")
+        assert tick.size == Quantity.from_str("0.50")
+        assert tick.ts_event == parse_rfc3339_nanos(self.TRADE_TIME, field="tradeTime")
         assert tick.ts_init == TS_INIT
 
-    def test_the_venue_trade_id_is_preserved_verbatim(
-        self, open_instrument: BinaryOption
+    @pytest.mark.parametrize(
+        ("taker_side", "expected"),
+        [
+            ("ORDER_SIDE_BUY", AggressorSide.BUYER),
+            ("ORDER_SIDE_SELL", AggressorSide.SELLER),
+            ("ORDER_SIDE_UNDEFINED", AggressorSide.NO_AGGRESSOR),
+            ("SOMETHING_NEW", AggressorSide.NO_AGGRESSOR),
+        ],
+    )
+    def test_the_aggressor_is_the_taker_side_read_on_the_yes_leg(
+        self, open_instrument: BinaryOption, taker_side: str, expected: AggressorSide
     ) -> None:
-        """Not synthesised. A synthetic id cannot be reconciled with the venue."""
-        tick = parse_trade_tick(self.frame(), instrument=open_instrument, ts_init=TS_INIT)
-
-        assert tick.trade_id.value == "trd-0001"
-
-    def test_the_taker_side_is_carried_through(self, open_instrument: BinaryOption) -> None:
-        tick = parse_trade_tick(self.frame(), instrument=open_instrument, ts_init=TS_INIT)
-
-        assert tick.aggressor_side == AggressorSide.BUYER
-
-    def test_an_unknown_taker_side_records_no_aggressor_rather_than_guessing(
-        self, open_instrument: BinaryOption
-    ) -> None:
-        """The venue's taker-side spelling is UNRESOLVED.
-
-        Guessing BUYER for an unrecognised token would invent direction on
-        every print. `NO_AGGRESSOR` is the honest encoding of "the venue told
-        us something we do not understand".
-        """
-        frame = self.frame()
-        frame["trade"]["takerSide"] = "SOMETHING_NEW"
+        """Mapping, documented against the snapshot: ``taker.side`` is the side
+        of the order that INITIATED the print, on the market (the YES leg, the
+        only instrument Breezy publishes). ``ORDER_SIDE_BUY`` -> ``BUYER``,
+        ``ORDER_SIDE_SELL`` -> ``SELLER``. The venue echoes a NO buy as
+        ``SELL`` / ``BUY_SHORT`` on the SAME slug (memory 2026-09-14), so a
+        NO-leg aggressor lands as ``SELLER`` on the YES instrument and the
+        ``intent`` is deliberately NOT consulted. Anything else, including the
+        venue's own ``ORDER_SIDE_UNDEFINED``, is ``NO_AGGRESSOR`` -- never a
+        guessed direction."""
+        frame = self.frame(taker={"side": taker_side, "intent": "ORDER_INTENT_BUY_LONG"})
 
         tick = parse_trade_tick(frame, instrument=open_instrument, ts_init=TS_INIT)
 
-        assert tick.aggressor_side == AggressorSide.NO_AGGRESSOR
+        assert tick.aggressor_side == expected
+
+    def test_a_no_leg_print_lands_on_the_yes_instrument_as_a_seller(
+        self, open_instrument: BinaryOption
+    ) -> None:
+        frame = self.frame(
+            maker={"side": "ORDER_SIDE_BUY", "intent": "ORDER_INTENT_BUY_LONG"},
+            taker={"side": "ORDER_SIDE_SELL", "intent": "ORDER_INTENT_BUY_SHORT"},
+        )
+
+        tick = parse_trade_tick(frame, instrument=open_instrument, ts_init=TS_INIT)
+
+        assert tick.instrument_id == open_instrument.id
+        assert tick.aggressor_side == AggressorSide.SELLER
+
+    def test_a_missing_or_malformed_taker_block_records_no_aggressor(
+        self, open_instrument: BinaryOption
+    ) -> None:
+        absent = self.frame()
+        del absent["trade"]["taker"]
+        malformed = self.frame(taker="ORDER_SIDE_BUY")
+
+        for frame in (absent, malformed):
+            tick = parse_trade_tick(frame, instrument=open_instrument, ts_init=TS_INIT)
+            assert tick.aggressor_side == AggressorSide.NO_AGGRESSOR
+
+    def test_the_trade_id_is_derived_from_venue_fields_only_so_a_replay_collides(
+        self, open_instrument: BinaryOption
+    ) -> None:
+        """The documented frame carries NO trade id (snapshot :114-138), so one
+        is derived from VENUE-ONLY fields: ``slug | tradeTime | price |
+        quantity | taker.side``. The receipt instant is deliberately excluded,
+        so the same frame replayed by the venue after a reconnect yields the
+        SAME id and the client can dedupe it (bounded). It is NOT a venue
+        identifier and cannot be reconciled with the venue."""
+        a = parse_trade_tick(self.frame(), instrument=open_instrument, ts_init=TS_INIT)
+        replayed = parse_trade_tick(
+            self.frame(), instrument=open_instrument, ts_init=TS_INIT + 5_000_000_000
+        )
+        different = parse_trade_tick(
+            self.frame(price={"value": "0.56", "currency": "USD"}),
+            instrument=open_instrument,
+            ts_init=TS_INIT,
+        )
+
+        assert a.trade_id == replayed.trade_id
+        assert a.trade_id != different.trade_id
+        assert 1 <= len(a.trade_id.value) <= 36
+
+    def test_the_print_size_unit_is_declared_unresolved(self) -> None:
+        """``trade.quantity`` is wrapped as ``Amount{value, currency: "USD"}``,
+        the venue's CASH-quantity shape elsewhere (orders overview, create-order,
+        preview), while contract counts are bare numbers. Whether a print's
+        ``quantity`` is contracts or dollars is therefore UNRESOLVED until the
+        first live print is cross-checked against the REST fill quantity for
+        the same trade; consumers of ``TradeTick.size`` must check this flag."""
+        assert TRADE_QUANTITY_UNIT == "UNRESOLVED"
+
+    def test_a_bare_decimal_quantity_is_accepted_alongside_the_documented_amount_object(
+        self, open_instrument: BinaryOption
+    ) -> None:
+        """The snapshot types ``quantity`` as an ``Amount`` (a contract count
+        wearing a currency label); a bare decimal string is the other shape the
+        book payload uses for ``qty``. Either reads as the size; the currency
+        label on a contract count is not consulted."""
+        documented = parse_trade_tick(self.frame(), instrument=open_instrument, ts_init=TS_INIT)
+        bare = parse_trade_tick(
+            self.frame(quantity="0.50"), instrument=open_instrument, ts_init=TS_INIT
+        )
+
+        assert documented.size == bare.size == Quantity.from_str("0.50")
 
     def test_a_trade_for_another_slug_is_refused(
         self, open_instrument: BinaryOption
     ) -> None:
-        frame = self.frame()
-        frame["trade"]["marketSlug"] = "tc-temp-mdwhigh-2026-08-25-lt91f"
+        frame = self.frame(marketSlug="tc-temp-mdwhigh-2026-08-25-lt91f")
         with pytest.raises(VenuePayloadError):
             parse_trade_tick(frame, instrument=open_instrument, ts_init=TS_INIT)
 
-    @pytest.mark.parametrize("field", ["px", "qty", "transactTime", "tradeId"])
+    def test_a_price_outside_the_binary_range_is_refused(
+        self, open_instrument: BinaryOption
+    ) -> None:
+        frame = self.frame(price={"value": "1.01", "currency": "USD"})
+        with pytest.raises(VenuePayloadError, match="range"):
+            parse_trade_tick(frame, instrument=open_instrument, ts_init=TS_INIT)
+
+    def test_a_non_usd_price_is_refused_rather_than_coerced(
+        self, open_instrument: BinaryOption
+    ) -> None:
+        frame = self.frame(price={"value": "0.55", "currency": "USDC"})
+        with pytest.raises(VenuePayloadError, match="USD"):
+            parse_trade_tick(frame, instrument=open_instrument, ts_init=TS_INIT)
+
+    def test_a_non_positive_quantity_is_refused(self, open_instrument: BinaryOption) -> None:
+        frame = self.frame(quantity={"value": "0", "currency": "USD"})
+        with pytest.raises(VenuePayloadError):
+            parse_trade_tick(frame, instrument=open_instrument, ts_init=TS_INIT)
+
+    @pytest.mark.parametrize("field", ["marketSlug", "price", "quantity", "tradeTime"])
     def test_no_required_trade_field_is_ever_defaulted(
         self, open_instrument: BinaryOption, field: str
     ) -> None:
@@ -377,6 +485,17 @@ class TestTradeTick:
         del frame["trade"][field]
         with pytest.raises(VenuePayloadError, match=field):
             parse_trade_tick(frame, instrument=open_instrument, ts_init=TS_INIT)
+
+    def test_additive_drift_in_the_trade_payload_does_not_refuse_the_print(
+        self, open_instrument: BinaryOption
+    ) -> None:
+        """Unknown keys are the CLIENT's business to record (bounded); the
+        parser must not turn a schema addition into a silent loss of prints."""
+        frame = self.frame(venueSeq=17, feeCoefficient="0.06")
+
+        tick = parse_trade_tick(frame, instrument=open_instrument, ts_init=TS_INIT)
+
+        assert tick.price == Price.from_str("0.55")
 
 
 # ---------------------------------------------------------------------------

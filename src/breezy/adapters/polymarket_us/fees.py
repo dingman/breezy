@@ -42,6 +42,7 @@ from nautilus_trader.model.orders import Order
 
 from breezy.adapters.polymarket_us.errors import (
     FeeScheduleUnknownError,
+    MakerFeeScheduleMismatchError,
     MakerRebateUnmodelledError,
 )
 from breezy.adapters.polymarket_us.parsing import (
@@ -49,10 +50,49 @@ from breezy.adapters.polymarket_us.parsing import (
     assert_fee_schedule_known,
 )
 
-__all__ = ["PolymarketUSFeeModel", "polymarket_us_fee"]
+__all__ = [
+    "MAKER_FEE_BPS_INFO_KEY",
+    "MAKER_FEE_COEFFICIENT",
+    "PolymarketUSFeeModel",
+    "expected_fee_for",
+    "polymarket_us_fee",
+]
 
 _ZERO = Decimal(0)
 _ONE = Decimal(1)
+_BPS_PER_UNIT = Decimal(10_000)
+
+#: Maker rebate coefficient, per the venue's DOCUMENTED fee schedule --
+#: DOCUMENTED-NOT-WIRE-OBSERVED: no captured payload or fill has confirmed
+#: this figure independently. Transcribed from
+#: ``docs/evidence/venue/polymarket_us/docs_snapshots/fees_2026-08-25.md:
+#: 12-26`` ("Maker Rebate | -0.0125 | -$0.31"), which also gives the worked
+#: check this module's tests pin: at ``C=100``, ``p=0.50`` the venue pays
+#: ``-0.0125 * 100 * 0.25 = -$0.3125`` -> banker's-rounds to ``-$0.31``.
+#: Pinned as its OWN coefficient, never derived from `theta`
+#: (`FEE_COEFFICIENT_KEY`) -- the two are unrelated numbers on the venue's
+#: own schedule (taker vs. maker), and reading one from the other would be a
+#: fabrication, not an inference.
+MAKER_FEE_COEFFICIENT: Decimal = Decimal("-0.0125")
+
+#: The DOCUMENTED taker theta (fees_2026-08-25.md:22, "Taker Fee | 0.06 |
+#: $1.50"), used ONLY by :func:`expected_fee_for`, which has no `Instrument`
+#: and therefore no per-market coefficient to read. Every per-fill fee this
+#: module actually charges comes from :func:`polymarket_us_fee`, which reads
+#: `theta` from `instrument.info[FEE_COEFFICIENT_KEY]` and never from this
+#: constant.
+_DOCUMENTED_TAKER_FEE_COEFFICIENT = Decimal("0.06")
+
+#: ``instrument.info`` key this module cross-checks :data:`MAKER_FEE_COEFFICIENT`
+#: against, named for the venue's OWN wire field:
+#: ``Order.makerCommissionsBasisPoints`` (``docs/evidence/venue/polymarket_us/
+#: docs_snapshots/api-reference_orders_create-order_2026-08-25.md:339-341``,
+#: "Maker commission rate in basis points"). Nothing in `parsing.py` writes
+#: this key onto `instrument.info` today -- the mismatch guard below is a
+#: dormant no-op until it does -- but it is wired now so that a future write
+#: of a schedule that has drifted from -0.0125 fails closed rather than
+#: silently mispricing every maker fill.
+MAKER_FEE_BPS_INFO_KEY: str = "makerCommissionsBasisPoints"
 
 #: Emitted once per call site when a maker fill is priced at the taker
 #: coefficient. Deliberately carries no instrument identifier, so Python's
@@ -112,6 +152,23 @@ class PolymarketUSFeeModel(FeeModel):  # type: ignore[misc]
     * any other **maker** fill is priced, but emits a loud ``UserWarning``, so
       a number built on it cannot be mistaken for a clean one.
 
+    This is the behaviour when ``allow_maker=False``, the default and the
+    behaviour of every existing call site -- it is unchanged by everything
+    below.
+
+    Opting in: ``allow_maker=True``
+    --------------------------------
+    Passing ``allow_maker=True`` to the constructor switches BOTH maker cases
+    above to price at :data:`MAKER_FEE_COEFFICIENT` (``-0.0125``, a REBATE)
+    instead: a post-only fill is no longer refused, and an incidental maker
+    fill is no longer priced at ``+theta`` with a warning. Nothing about the
+    TAKER path changes under either setting. Before pricing at the pin, the
+    model also cross-checks it against :data:`MAKER_FEE_BPS_INFO_KEY` on
+    ``instrument.info``, if present, and refuses with
+    :class:`~breezy.adapters.polymarket_us.errors.MakerFeeScheduleMismatchError`
+    on disagreement -- see that key's own docstring for why this is a
+    currently-dormant guard rather than a live check.
+
     Because one coefficient is written to both flat fields,
     ``MakerTakerFeeModel``'s own ``LiquiditySide`` branch is DEAD on these
     instruments -- it returns the same figure either way. Do not read that
@@ -153,6 +210,21 @@ class PolymarketUSFeeModel(FeeModel):  # type: ignore[misc]
     default fee model off every backtest venue.
     """
 
+    def __init__(self, *, allow_maker: bool = False) -> None:
+        """
+        Parameters
+        ----------
+        allow_maker : bool, default False
+            ``False`` (the default, and every EXISTING call site) keeps the
+            maker branch exactly as documented above: a post-only order
+            raises :class:`~breezy.adapters.polymarket_us.errors.MakerRebateUnmodelledError`
+            and an incidental maker fill is priced at ``+theta`` with a loud
+            ``UserWarning``. ``True`` opts BOTH cases into pricing at the
+            pinned :data:`MAKER_FEE_COEFFICIENT` rebate instead -- see
+            "Opting in" above.
+        """
+        self._allow_maker = allow_maker
+
     def get_commission(
         self,
         order: Order,
@@ -170,6 +242,9 @@ class PolymarketUSFeeModel(FeeModel):  # type: ignore[misc]
             )
 
         if side == LiquiditySide.MAKER:
+            if self._allow_maker:
+                _assert_maker_fee_schedule_matches(instrument)
+                return _maker_commission(instrument, fill_qty, fill_px)
             self._refuse_or_warn_on_maker(order, instrument)
 
         return polymarket_us_fee(instrument, fill_qty, fill_px)
@@ -237,6 +312,107 @@ def polymarket_us_fee(instrument: Instrument, quantity: Quantity, price: Price) 
 
     exact = theta * quantity.as_decimal() * fill_price * (_ONE - fill_price)
     return Money(_round_bankers(exact, instrument.quote_currency), instrument.quote_currency)
+
+
+def _maker_commission(instrument: Instrument, quantity: Quantity, price: Price) -> Money:
+    """Return ``MAKER_FEE_COEFFICIENT * C * p * (1 - p)`` -- a REBATE (negative ``Money``).
+
+    Only reached from :meth:`PolymarketUSFeeModel.get_commission` when
+    ``allow_maker=True``. Deliberately independent of the market's own
+    (taker) ``theta``: the venue publishes maker and taker as two SEPARATE,
+    unrelated coefficients (see the class docstring), so this never reads
+    ``FEE_COEFFICIENT_KEY`` and never calls ``assert_fee_schedule_known`` --
+    the per-market TAKER schedule being unknown says nothing about the
+    venue-wide, pinned maker rebate. Same ``[0, 1]`` price guard and the same
+    banker's-rounding convention as :func:`polymarket_us_fee`, so the two
+    paths stay numerically consistent apart from which coefficient they use.
+    """
+    fill_price = price.as_decimal()
+    if fill_price < _ZERO or fill_price > _ONE:
+        raise ValueError(
+            f"Fill price {fill_price} is outside the binary-option range [0, 1]; "
+            f"refusing to compute a Polymarket.us fee for {instrument.id}"
+        )
+
+    exact = MAKER_FEE_COEFFICIENT * quantity.as_decimal() * fill_price * (_ONE - fill_price)
+    return Money(_round_bankers(exact, instrument.quote_currency), instrument.quote_currency)
+
+
+def _assert_maker_fee_schedule_matches(instrument: Instrument) -> None:
+    """Refuse if the venue's own reported maker bps disagrees with the pin.
+
+    See :data:`MAKER_FEE_BPS_INFO_KEY` and
+    :class:`~breezy.adapters.polymarket_us.errors.MakerFeeScheduleMismatchError`
+    for the field-path lineage. A dormant no-op today: nothing writes this
+    key onto ``instrument.info``, so every currently-captured instrument
+    returns immediately. Wired ahead of that write so a schedule that has
+    drifted from ``-0.0125`` is refused rather than silently mispriced.
+    """
+    info = getattr(instrument, "info", None)
+    if not isinstance(info, Mapping):
+        return
+    raw_bps = info.get(MAKER_FEE_BPS_INFO_KEY)
+    if raw_bps is None:
+        return
+    try:
+        reported = Decimal(str(raw_bps)) / _BPS_PER_UNIT
+    except (InvalidOperation, ValueError):
+        raise MakerFeeScheduleMismatchError(
+            f"Refusing to price a Polymarket.us maker fill for {instrument.id}: "
+            f"{MAKER_FEE_BPS_INFO_KEY!r} = {raw_bps!r} is not a valid basis-points "
+            "number (venue field path Order.makerCommissionsBasisPoints, "
+            "docs/evidence/venue/polymarket_us/docs_snapshots/"
+            "api-reference_orders_create-order_2026-08-25.md:339-341)"
+        ) from None
+    if reported != MAKER_FEE_COEFFICIENT:
+        raise MakerFeeScheduleMismatchError(
+            f"Refusing to price a Polymarket.us maker fill for {instrument.id}: "
+            f"reported {MAKER_FEE_BPS_INFO_KEY!r}={raw_bps!r} ({reported}) disagrees "
+            f"with the pinned maker coefficient {MAKER_FEE_COEFFICIENT} (-125 bps) "
+            "(venue field path Order.makerCommissionsBasisPoints, "
+            "docs/evidence/venue/polymarket_us/docs_snapshots/"
+            "api-reference_orders_create-order_2026-08-25.md:339-341)"
+        )
+
+
+def expected_fee_for(price: Decimal, qty: Decimal, liquidity_side: LiquiditySide) -> Decimal:
+    """Pure, unrounded break-even helper: ``theta * qty * p * (1 - p)``, signed.
+
+    No ``Instrument``, no rounding, no ``Money`` -- this is a strategy-side
+    ESTIMATE for a pre-trade break-even check (the resting-bid plan's
+    ``BE_maker = p - |rebate|``), never a substitute for
+    :func:`polymarket_us_fee` / :meth:`PolymarketUSFeeModel.get_commission`,
+    which remain the authoritative, per-fill, rounded numbers.
+
+    ``liquidity_side=MAKER`` returns a NEGATIVE value (income) at the pinned
+    :data:`MAKER_FEE_COEFFICIENT`. ``liquidity_side=TAKER`` returns a
+    POSITIVE value at the venue's documented ``theta=0.06`` -- the actual
+    per-market coefficient is unavailable here because there is no
+    ``Instrument`` to read it from; use :func:`polymarket_us_fee` when one is
+    available.
+
+    Raises
+    ------
+    ValueError
+        If ``price`` is outside ``[0, 1]`` or ``liquidity_side`` is neither
+        MAKER nor TAKER.
+    """
+    if price < _ZERO or price > _ONE:
+        raise ValueError(
+            f"Price {price} is outside the binary-option range [0, 1]; refusing "
+            "to estimate a Polymarket.us fee"
+        )
+    if liquidity_side == LiquiditySide.MAKER:
+        theta = MAKER_FEE_COEFFICIENT
+    elif liquidity_side == LiquiditySide.TAKER:
+        theta = _DOCUMENTED_TAKER_FEE_COEFFICIENT
+    else:
+        raise ValueError(
+            "Refusing to estimate a Polymarket.us fee with no maker/taker "
+            f"liquidity side (was {liquidity_side!r}); a sideless fill is an "
+            "upstream bug, never a free trade"
+        )
+    return theta * qty * price * (_ONE - price)
 
 
 def _fee_coefficient(instrument: Instrument) -> Decimal:

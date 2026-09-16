@@ -860,3 +860,15 @@ def test_the_data_client_factory_itself_defines_no_execution_surface() -> None:
     assert "LiveExecClientFactory" not in source
     assert "LiveExecutionClientFactory" not in source
     assert "submit_order" not in source
+
+
+def test_create_threads_subscribe_trades_from_the_config_into_the_pool(
+    wired: dict[str, Any],
+) -> None:
+    """Off by default (the trade node); on when the recorder's config says so."""
+    off = build_client(make_config())._feed
+    on = build_client(make_config(subscribe_trades=True))._feed
+    assert isinstance(off, PolymarketUSMarketsWebSocketPool)
+    assert isinstance(on, PolymarketUSMarketsWebSocketPool)
+    assert off._shards[0]._subscribe_trades is False
+    assert on._shards[0]._subscribe_trades is True

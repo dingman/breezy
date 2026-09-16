@@ -893,6 +893,24 @@ def test_f2_accepts_a_qualified_reference_to_the_venue_fee_model() -> None:
     assert find_default_fee_model_venues("src/breezy/runtime/backtest.py", source) == []
 
 
+def test_f2_accepts_the_venue_fee_model_constructed_with_the_maker_opt_in() -> None:
+    """The `allow_maker` constructor kwarg must not create an F2 bypass.
+
+    Rule F2 (`_mentions_required_fee_model`) matches on the `PolymarketUSFeeModel`
+    `Name`/`Attribute` node appearing anywhere inside the `fee_model=` value
+    expression -- a constructor keyword argument does not remove that node,
+    so this call site is exempt exactly as the bare-constructor call is.
+    """
+    source = (
+        "from breezy.adapters.polymarket_us import PolymarketUSFeeModel\n"
+        "\n"
+        "def build(engine):\n"
+        "    engine.add_venue(venue=V, fee_model=PolymarketUSFeeModel(allow_maker=True))\n"
+    )
+
+    assert find_default_fee_model_venues("src/breezy/runtime/backtest.py", source) == []
+
+
 def test_f2_accepts_the_importable_config_spelling_used_by_backtest_node() -> None:
     """`ImportableFeeModelConfig` names the class as a STRING path."""
     source = (

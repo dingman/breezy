@@ -287,3 +287,13 @@ def test_config_module_never_imports_os() -> None:
         elif isinstance(node, ast.ImportFrom) and node.level == 0 and node.module:
             imported.add(node.module.split(".")[0])
     assert "os" not in imported
+
+
+def test_subscribe_trades_defaults_off_and_is_a_plain_bool() -> None:
+    """The TRADE channel is opt-in per ROLE (the recorder turns it on in
+    ``build_quote_tape_node_config``); the field itself defaults off so every
+    other consumer of this config is unchanged."""
+    assert make_config().subscribe_trades is False
+    assert make_config(subscribe_trades=True).subscribe_trades is True
+    with pytest.raises(SettingsError, match="subscribe_trades"):
+        make_config(subscribe_trades="yes")

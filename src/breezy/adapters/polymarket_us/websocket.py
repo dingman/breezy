@@ -127,6 +127,7 @@ __all__ = [
     "DEFAULT_SUBSCRIPTION_CONFIRMATION_SECS",
     "MAX_SUBSCRIPTIONS_PER_CONNECTION",
     "SUBSCRIPTION_TYPE_MARKET_DATA",
+    "SUBSCRIPTION_TYPE_TRADE",
     "WS_PATH",
     "PolymarketUSMarketsWebSocket",
     "PolymarketUSMarketsWebSocketPool",
@@ -142,6 +143,13 @@ WS_PATH: Final[str] = "/v1/ws/markets"
 
 #: ``sdk_snapshot/polymarket_us_0.1.2/websocket/markets.py:25``.
 SUBSCRIPTION_TYPE_MARKET_DATA: Final[str] = "SUBSCRIPTION_TYPE_MARKET_DATA"
+
+#: ``sdk_snapshot/polymarket_us_0.1.2/websocket/markets.py:43``; documented at
+#: ``docs_snapshots/api-reference_websocket_markets_2026-08-25.md:29-31,114-138``.
+#: Executed prints: ``{trade: {marketSlug, price, quantity, tradeTime, maker,
+#: taker}}``. Opt-in per connection (``subscribe_trades``); when on, every
+#: market-data batch is followed by a TRADE envelope for the same slugs.
+SUBSCRIPTION_TYPE_TRADE: Final[str] = "SUBSCRIPTION_TYPE_TRADE"
 
 _MS_PER_SECOND: Final[int] = 1_000
 
@@ -338,10 +346,12 @@ class PolymarketUSMarketsWebSocket:
         "_silent_subscriptions",
         "_stable_reset_secs",
         "_stable_since",
+        "_subscribe_trades",
         "_subscription_errors",
         "_subscriptions",
         "_supervisor",
         "_tasks",
+        "_trade_subscriptions",
         "_ws_url",
     )
 
@@ -364,6 +374,7 @@ class PolymarketUSMarketsWebSocket:
         connection_label: str = "single",
         confirmation_window_secs: float | None = None,
         stable_reset_secs: float = 60.0,
+        subscribe_trades: bool = False,
     ) -> None:
         if heartbeat_secs <= 0:
             raise ValueError("heartbeat_secs must be positive")
@@ -400,6 +411,12 @@ class PolymarketUSMarketsWebSocket:
         self._client: WebSocketClient | None = None
         #: slug -> requestId. One subscribe call covers many slugs under one id.
         self._subscriptions: dict[str, str] = {}
+        self._subscribe_trades: bool = subscribe_trades
+        #: slug -> requestId of the paired ``SUBSCRIPTION_TYPE_TRADE`` request.
+        #: Empty unless ``subscribe_trades``. Never keyed into
+        #: ``_subscriptions``: the data client and the pool track a slug by
+        #: its MARKET-DATA request id, and this map follows that id's life.
+        self._trade_subscriptions: dict[str, str] = {}
         self._supervisor: asyncio.Task[None] | None = None
         self._confirmation_task: asyncio.Task[None] | None = None
         self._tasks: set[asyncio.Task[Any] | asyncio.Future[Any]] = set()
@@ -500,6 +517,11 @@ class PolymarketUSMarketsWebSocket:
         return dict(self._subscriptions)
 
     @property
+    def trade_subscriptions(self) -> Mapping[str, str]:
+        """slug -> request id of the paired TRADE subscription; empty unless enabled."""
+        return dict(self._trade_subscriptions)
+
+    @property
     def subscription_errors(self) -> tuple[WebSocketErrorFrame, ...]:
         """Every venue ``{"error": ...}`` frame received on this connection.
 
@@ -590,13 +612,56 @@ class PolymarketUSMarketsWebSocket:
         for slug in pending:
             self._subscriptions[slug] = request_id
         self._arm_confirmation(pending)
+        if self._subscribe_trades:
+            await self._subscribe_trades_for(pending)
+
+    async def _subscribe_trades_for(self, slugs: Sequence[str]) -> None:
+        """Send the paired TRADE envelope for a batch just subscribed to market data.
+
+        AFTER market data, never before, and as ONE envelope per batch. Both
+        are deliberate. Whether a TRADE subscription counts against the
+        venue's measured 10-per-connection cap is UNRESOLVED (never probed);
+        if it does, this later envelope is the one the venue rejects, and it
+        rejects a BATCHED envelope with explicit error frames
+        (:attr:`subscription_errors`) rather than the silent truncation the
+        one-per-envelope pattern produces. Either way the irreplaceable
+        market-data subscriptions on this connection are already accepted.
+
+        No liveness confirmation is armed for the TRADE request: a quiet
+        weather market legitimately prints nothing for hours, so absence of
+        prints is not evidence of a dropped subscription. The slug's
+        market-data frames already confirm the connection carries it.
+        """
+        request_id = self._request_id_factory()
+        await self._send(
+            build_subscribe_envelope(
+                request_id=request_id,
+                subscription_type=SUBSCRIPTION_TYPE_TRADE,
+                market_slugs=slugs,
+            )
+        )
+        for slug in slugs:
+            self._trade_subscriptions[slug] = request_id
 
     async def unsubscribe(self, request_id: str) -> None:
-        """Cancel one subscription request and forget every slug it covered."""
+        """Cancel one subscription request and forget every slug it covered.
+
+        A market-data request id also releases the paired TRADE request(s)
+        for the same slugs: the caller tracks one id per slug, and leaving
+        the venue streaming prints for a market nobody records is a leak.
+        """
         await self._send(build_unsubscribe_envelope(request_id=request_id))
-        for slug in [s for s, rid in self._subscriptions.items() if rid == request_id]:
+        released = [s for s, rid in self._subscriptions.items() if rid == request_id]
+        for slug in released:
             del self._subscriptions[slug]
             self._pending_confirmation.pop(slug, None)
+        trade_ids = dict.fromkeys(
+            rid for s, rid in self._trade_subscriptions.items() if s in released
+        )
+        for trade_request_id in trade_ids:
+            await self._send(build_unsubscribe_envelope(request_id=trade_request_id))
+        for slug in released:
+            self._trade_subscriptions.pop(slug, None)
 
     async def _replay_subscriptions(self) -> None:
         """Re-send every live subscription: exactly one envelope per request id."""
@@ -615,6 +680,17 @@ class PolymarketUSMarketsWebSocket:
             # frames observed on the old connection do not prove this one
             # accepted the replay.
             self._arm_confirmation(slugs)
+        trade_groups: dict[str, list[str]] = {}
+        for slug, request_id in self._trade_subscriptions.items():
+            trade_groups.setdefault(request_id, []).append(slug)
+        for request_id, slugs in trade_groups.items():
+            await self._send(
+                build_subscribe_envelope(
+                    request_id=request_id,
+                    subscription_type=SUBSCRIPTION_TYPE_TRADE,
+                    market_slugs=slugs,
+                )
+            )
 
     def _arm_confirmation(self, slugs: Sequence[str]) -> None:
         if self._confirmation_window_secs is None:
@@ -1110,6 +1186,7 @@ class PolymarketUSMarketsWebSocketPool:
         "_signer",
         "_slug_to_shard",
         "_subscribe_lock",
+        "_subscribe_trades",
         "_ws_url",
     )
 
@@ -1131,6 +1208,7 @@ class PolymarketUSMarketsWebSocketPool:
         request_id_factory: Callable[[], str] | None = None,
         cap: int = MAX_SUBSCRIPTIONS_PER_CONNECTION,
         confirmation_window_secs: float | None = DEFAULT_SUBSCRIPTION_CONFIRMATION_SECS,
+        subscribe_trades: bool = False,
     ) -> None:
         if cap <= 0:
             raise ValueError("cap must be positive")
@@ -1154,6 +1232,13 @@ class PolymarketUSMarketsWebSocketPool:
         )
         self._cap: int = cap
         self._confirmation_window_secs: float | None = confirmation_window_secs
+        #: Threaded to every shard. Sharding stays count-based on MARKET-DATA
+        #: slugs: `cap` is not halved for the paired TRADE request, because a
+        #: second unknown -- whether the venue caps CONNECTIONS per key -- is
+        #: the more expensive one to be wrong about (it would strand market
+        #: data on shards that never connect), whereas a shared subscription
+        #: cap only costs prints, loudly (see `_subscribe_trades_for`).
+        self._subscribe_trades: bool = subscribe_trades
 
         #: Built eagerly (never connected) so configuration -- URL, signer --
         #: is inspectable before `connect()`, exactly like a bare
@@ -1208,6 +1293,14 @@ class PolymarketUSMarketsWebSocketPool:
         merged: dict[str, str] = {}
         for shard in self._shards:
             merged.update(shard.subscriptions)
+        return merged
+
+    @property
+    def trade_subscriptions(self) -> Mapping[str, str]:
+        """Union of every shard's paired TRADE subscriptions (slug -> request id)."""
+        merged: dict[str, str] = {}
+        for shard in self._shards:
+            merged.update(shard.trade_subscriptions)
         return merged
 
     @property
@@ -1390,6 +1483,7 @@ class PolymarketUSMarketsWebSocketPool:
             request_id_factory=self._request_id_factory,
             connection_label=f"shard-{index}",
             confirmation_window_secs=self._confirmation_window_secs,
+            subscribe_trades=self._subscribe_trades,
         )
 
     async def _shard_with_room(self) -> PolymarketUSMarketsWebSocket:

@@ -75,7 +75,7 @@ from nautilus_trader.data.messages import (
     UnsubscribeQuoteTicks,
 )
 from nautilus_trader.live.data_client import LiveMarketDataClient
-from nautilus_trader.model.data import CustomData, DataType, QuoteTick
+from nautilus_trader.model.data import CustomData, DataType, QuoteTick, TradeTick
 from nautilus_trader.model.identifiers import ClientId, InstrumentId, Venue
 from nautilus_trader.model.instruments import BinaryOption, Instrument
 
@@ -90,6 +90,7 @@ from breezy.adapters.polymarket_us.parsing import (
     EXPIRED_MARKET_STATES,
     TERMINAL_SETTLEMENT_METHOD,
     TRADE_CONTAINER_KEY,
+    TRADE_KNOWN_KEYS,
     depth_levels_dropped,
     parse_instrument_close,
     parse_instrument_status,
@@ -122,6 +123,10 @@ __all__ = [
     "MISSING_ROUTING_KEY_WARN_EVERY",
     "ONE_SIDED_BOOK_SUMMARY_EVERY",
     "POLYMARKET_US_VENUE",
+    "TRADE_DEDUP_WINDOW",
+    "TRADE_QUANTITY_EVIDENCE_CAPACITY",
+    "TRADE_TAKER_TALLY_CAPACITY",
+    "TRADE_UNKNOWN_KEY_CAPACITY",
     "FrameDiagnostic",
     "MarketsFeed",
     "MarketsFeedFactory",
@@ -130,6 +135,7 @@ __all__ = [
     "ReloadDelay",
     "SilentSubscription",
     "SubscriptionChangePlan",
+    "TradeQuantityEvidence",
     "build_data_client",
     "derive_client_id",
     "derive_reload_delay_secs",
@@ -196,6 +202,30 @@ DEFAULT_FEED_WATCH_INTERVAL_SECS: Final[float] = 5.0
 #: here leaked ~1 GB/h on the live node (2026-09-05); the only reader wants
 #: recent frame shapes, never the full-run history.
 FRAME_DIAGNOSTICS_CAPACITY: Final[int] = 64
+
+#: Distinct unknown ``trade`` payload keys remembered (first-seen order). Past
+#: this, frames carrying further new keys are still COUNTED (the counter is
+#: unbounded-by-design, it is one int) but no new key names are stored. A
+#: bound, not a list: the recorder runs for months near its cgroup ceiling.
+TRADE_UNKNOWN_KEY_CAPACITY: Final[int] = 32
+
+#: Distinct ``taker.side / taker.intent`` pairs tallied. ``TradeTick`` has no
+#: field for the venue's ``intent`` -- the NO-leg discriminator -- so this
+#: bounded tally is the only evidence about the NO-leg print population the
+#: process keeps. Pairs past the bound fall into one overflow bucket.
+TRADE_TAKER_TALLY_CAPACITY: Final[int] = 16
+
+#: Derived trade ids remembered PER INSTRUMENT to suppress a print the venue
+#: replays after a reconnect (the id is built from venue-only fields, so a
+#: replay collides). A ``deque(maxlen=...)`` per instrument, never a set that
+#: grows with the tape.
+TRADE_DEDUP_WINDOW: Final[int] = 256
+
+#: Raw ``quantity`` / ``price`` objects of the most recent published prints,
+#: kept VERBATIM so the first live print can be cross-checked against the REST
+#: fill quantity for the same trade and ``parsing.TRADE_QUANTITY_UNIT``
+#: resolved. Bounded ring; the first entry is also logged so journald holds it.
+TRADE_QUANTITY_EVIDENCE_CAPACITY: Final[int] = 64
 
 #: Topic ``Component.shutdown_system`` publishes on
 #: (``common/component.pyx:2182``). Duplicated here for ONE purpose -- a
@@ -367,6 +397,20 @@ class FrameDiagnostic:
     value_types: Mapping[str, str]
     safe_values: Mapping[str, str]
     slug_bearing_keys: tuple[str, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class TradeQuantityEvidence:
+    """Verbatim (``repr``) ``quantity`` and ``price`` of one published print.
+
+    Evidence for resolving ``parsing.TRADE_QUANTITY_UNIT``; strings, bounded
+    in length, never the live objects.
+    """
+
+    market_slug: str
+    trade_time: str
+    quantity: str
+    price: str
 
 
 @dataclass(frozen=True, slots=True)
@@ -650,6 +694,13 @@ def _market_slug_from_payload(payload: Mapping[str, Any]) -> Any:
     return None
 
 
+def _tally_token(value: object, *, limit: int = 48) -> str:
+    """A venue enum token for a bounded tally key: short string verbatim, else its type."""
+    if isinstance(value, str):
+        return value[:limit]
+    return type(value).__name__
+
+
 def frame_class_counts(diagnostics: Sequence[FrameDiagnostic]) -> dict[str, int]:
     counts: dict[str, int] = {}
     for diagnostic in diagnostics:
@@ -749,6 +800,17 @@ class PolymarketUSDataClient(LiveMarketDataClient):
         self._shard_gap_seq: dict[str, int] = {}
         self._shard_gap_slugs: dict[str, tuple[str, ...]] = {}
         self._trades_published: int = 0
+        self._trade_parse_failures: int = 0
+        # Bounded drift record for the TRADE payload -- mirrors the depth
+        # path's "record, never refuse" posture. See the two capacities.
+        self._trade_unknown_keys: dict[str, None] = {}
+        self._trade_frames_with_unknown_keys: int = 0
+        self._trade_taker_tally: dict[str, int] = {}
+        self._trade_recent_ids: dict[str, deque[str]] = {}
+        self._trade_replay_duplicates: int = 0
+        self._trade_quantity_evidence: deque[TradeQuantityEvidence] = deque(
+            maxlen=TRADE_QUANTITY_EVIDENCE_CAPACITY
+        )
         self._depth_levels_truncated: int = 0
         self._clock_offset_samples: int = 0
         self._quote_parse_failures: int = 0
@@ -887,6 +949,36 @@ class PolymarketUSDataClient(LiveMarketDataClient):
     def trades_published(self) -> int:
         """Executed prints handed to the data engine."""
         return self._trades_published
+
+    @property
+    def trade_parse_failures(self) -> int:
+        """TRADE frames that did not parse (also counted in :attr:`dropped_frames`)."""
+        return self._trade_parse_failures
+
+    @property
+    def trade_unknown_keys(self) -> tuple[str, ...]:
+        """Unknown ``trade`` payload keys seen, first-seen order, bounded."""
+        return tuple(self._trade_unknown_keys)
+
+    @property
+    def trade_frames_with_unknown_keys(self) -> int:
+        """TRADE frames that carried at least one key outside ``TRADE_KNOWN_KEYS``."""
+        return self._trade_frames_with_unknown_keys
+
+    @property
+    def trade_taker_tally(self) -> Mapping[str, int]:
+        """Bounded tally of ``taker.side/taker.intent`` pairs on published prints."""
+        return dict(self._trade_taker_tally)
+
+    @property
+    def trade_replay_duplicates(self) -> int:
+        """Prints suppressed because their derived id was seen within the dedup window."""
+        return self._trade_replay_duplicates
+
+    @property
+    def trade_quantity_evidence(self) -> tuple[TradeQuantityEvidence, ...]:
+        """Verbatim raw ``quantity``/``price`` of the most recent published prints."""
+        return tuple(self._trade_quantity_evidence)
 
     @property
     def depth_levels_truncated(self) -> int:
@@ -1557,14 +1649,95 @@ class PolymarketUSDataClient(LiveMarketDataClient):
         """
         if not isinstance(instrument, BinaryOption):
             return 0
+        trade_payload = payload.get(TRADE_CONTAINER_KEY)
+        if isinstance(trade_payload, Mapping):
+            self._note_trade_drift(trade_payload)
         trade = self._try_parse(
             payload, instrument, ts_init, parse_trade_tick, "trade", required=False
         )
         if trade is None:
+            self._trade_parse_failures += 1
             return 0
+        if self._is_replayed_print(trade):
+            # Handled, not dropped: the frame was well-formed and already on
+            # the tape. Returning 1 keeps it out of `dropped_frames`.
+            self._trade_replay_duplicates += 1
+            return 1
         self._handle_data(trade)
         self._trades_published += 1
+        if isinstance(trade_payload, Mapping):
+            self._tally_taker(trade_payload)
+            self._keep_quantity_evidence(trade_payload)
         return 1
+
+    def _is_replayed_print(self, trade: TradeTick) -> bool:
+        """True if this derived id was published within the per-instrument window.
+
+        Keyed by instrument, so the dict is bounded by the number of markets
+        this process has ever subscribed (a few dozen; the recorder restarts
+        daily), and each window is a fixed-length deque.
+        """
+        recent = self._trade_recent_ids.setdefault(
+            trade.instrument_id.value, deque(maxlen=TRADE_DEDUP_WINDOW)
+        )
+        trade_id = trade.trade_id.value
+        if trade_id in recent:
+            return True
+        recent.append(trade_id)
+        return False
+
+    def _keep_quantity_evidence(self, trade_payload: Mapping[str, Any]) -> None:
+        evidence = TradeQuantityEvidence(
+            market_slug=_tally_token(trade_payload.get("marketSlug"), limit=96),
+            trade_time=_tally_token(trade_payload.get("tradeTime"), limit=48),
+            quantity=repr(trade_payload.get("quantity"))[:128],
+            price=repr(trade_payload.get("price"))[:128],
+        )
+        if not self._trade_quantity_evidence:
+            self._log.info(
+                "Polymarket.us first print kept as quantity-unit evidence "
+                f"(TRADE_QUANTITY_UNIT is UNRESOLVED): {evidence!r}"
+            )
+        self._trade_quantity_evidence.append(evidence)
+
+    #: Tally key for ``taker.side/intent`` pairs past ``TRADE_TAKER_TALLY_CAPACITY``.
+    TRADE_TAKER_TALLY_OVERFLOW_KEY: Final[str] = "<other>"
+
+    def _note_trade_drift(self, trade_payload: Mapping[str, Any]) -> None:
+        """Record additive schema drift on the ``trade`` payload. Never refuse.
+
+        Once per new key at WARNING, names bounded by
+        :data:`TRADE_UNKNOWN_KEY_CAPACITY`; the per-frame counter is not
+        bounded because it is a single integer.
+        """
+        unknown = [str(key) for key in trade_payload if key not in TRADE_KNOWN_KEYS]
+        if not unknown:
+            return
+        self._trade_frames_with_unknown_keys += 1
+        for key in unknown:
+            if key in self._trade_unknown_keys:
+                continue
+            if len(self._trade_unknown_keys) >= TRADE_UNKNOWN_KEY_CAPACITY:
+                return
+            self._trade_unknown_keys[key] = None
+            self._log.warning(
+                f"Polymarket.us trade payload carried an undocumented key {key[:64]!r}; "
+                "recorded (bounded), print still published. Schema drift, not a fault."
+            )
+
+    def _tally_taker(self, trade_payload: Mapping[str, Any]) -> None:
+        taker = trade_payload.get("taker")
+        if isinstance(taker, Mapping):
+            side, intent = taker.get("side"), taker.get("intent")
+        else:
+            side = intent = None
+        key = f"{_tally_token(side)}/{_tally_token(intent)}"
+        if key not in self._trade_taker_tally:
+            if len(self._trade_taker_tally) >= TRADE_TAKER_TALLY_CAPACITY:
+                key = self.TRADE_TAKER_TALLY_OVERFLOW_KEY
+            else:
+                self._log.info(f"Polymarket.us first print with taker side/intent {key!r}")
+        self._trade_taker_tally[key] = self._trade_taker_tally.get(key, 0) + 1
 
     def _try_parse(
         self,

@@ -520,6 +520,11 @@ def build_quote_tape_node_config(
         # :data:`QUOTE_TAPE_EMPTY_DISCOVERY_RETRY_SECS` for why; the live
         # trade node keeps the field default (0, fail-fast immediately).
         empty_discovery_retry_secs=QUOTE_TAPE_EMPTY_DISCOVERY_RETRY_SECS,
+        # Quote-tape ONLY: capture the venue's executed prints as native
+        # `TradeTick`s (already in `QUOTE_TAPE_INCLUDE_TYPES`, so the writer
+        # persists them with no further wiring). Prints are forward-only on
+        # this venue; the live trade node keeps the field default (off).
+        subscribe_trades=True,
     )
 
     # `msgspec.Struct` config classes are untyped to mypy (compiled Nautilus

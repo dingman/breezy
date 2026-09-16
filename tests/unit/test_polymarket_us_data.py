@@ -1084,3 +1084,227 @@ async def test_connect_schedules_the_reload_task_without_any_configured_interval
         assert task is not None and not task.done()
     finally:
         await harness.client._disconnect()
+
+
+# ---------------------------------------------------------------------------
+# TRADE frames -> native TradeTick, through the DataEngine
+# ---------------------------------------------------------------------------
+#
+# Shape per ``docs/evidence/venue/polymarket_us/docs_snapshots/
+# api-reference_websocket_markets_2026-08-25.md:114-138``. The test instrument
+# has a 0.001 tick and a size increment of 1, so the values are adjusted to it.
+
+
+def documented_trade_frame(slug: str = SLUG, **trade_overrides: Any) -> dict[str, Any]:
+    trade: dict[str, Any] = {
+        "marketSlug": slug,
+        "price": {"value": "0.55", "currency": "USD"},
+        "quantity": {"value": "3", "currency": "USD"},
+        "tradeTime": "2026-08-25T00:06:58.830425365Z",
+        "maker": {"side": "ORDER_SIDE_BUY", "intent": "ORDER_INTENT_BUY_LONG"},
+        "taker": {"side": "ORDER_SIDE_SELL", "intent": "ORDER_INTENT_SELL_LONG"},
+    }
+    trade.update(trade_overrides)
+    return {
+        "requestId": "trade-sub-1",
+        "subscriptionType": "SUBSCRIPTION_TYPE_TRADE",
+        "trade": trade,
+    }
+
+
+def _capture_trades(harness: Harness) -> list[Any]:
+    trades: list[Any] = []
+    harness.client._msgbus.subscribe(topic="data.trades.*", handler=trades.append)
+    return trades
+
+
+@pytest.mark.asyncio
+async def test_a_documented_trade_frame_reaches_the_data_engine_as_a_trade_tick() -> None:
+    from nautilus_trader.model.data import TradeTick
+    from nautilus_trader.model.enums import AggressorSide
+
+    harness = build_harness()
+    trades = _capture_trades(harness)
+    await harness.client._connect()
+
+    harness.feed.deliver(documented_trade_frame())
+
+    assert len(trades) == 1
+    tick = trades[0]
+    assert isinstance(tick, TradeTick)
+    assert tick.instrument_id == InstrumentId(Symbol(SLUG), POLYMARKET_US_VENUE)
+    assert tick.price == Price.from_str("0.550")
+    assert tick.size == Quantity.from_str("3")
+    assert tick.aggressor_side == AggressorSide.SELLER
+    from breezy.adapters.polymarket_us.parsing import parse_rfc3339_nanos
+
+    assert tick.ts_event == parse_rfc3339_nanos(
+        "2026-08-25T00:06:58.830425365Z", field="tradeTime"
+    )
+    assert harness.client.trades_published == 1
+    assert harness.client.dropped_frames == 0
+    # Published on the YES instrument only; nothing is synthesised for a NO leg.
+    assert harness.published == []
+    # The engine cached it exactly as it caches quotes.
+    assert harness.client._cache.trade_tick(tick.instrument_id) is not None
+    await harness.client._disconnect()
+
+
+@pytest.mark.asyncio
+async def test_a_malformed_trade_frame_is_counted_and_dropped_never_published() -> None:
+    harness = build_harness()
+    trades = _capture_trades(harness)
+    await harness.client._connect()
+
+    frame = documented_trade_frame()
+    del frame["trade"]["price"]
+    harness.feed.deliver(frame)
+    harness.feed.deliver(documented_trade_frame(quantity={"value": "-1", "currency": "USD"}))
+
+    assert trades == []
+    assert harness.client.trades_published == 0
+    assert harness.client.trade_parse_failures == 2
+    assert harness.client.dropped_frames == 2
+    assert harness.feed.is_connected is True
+    await harness.client._disconnect()
+
+
+@pytest.mark.asyncio
+async def test_unknown_trade_keys_are_recorded_bounded_and_the_print_still_publishes() -> None:
+    """Drift discipline, mirroring the depth path: additive schema drift is
+    recorded (once per key, bounded) and never fatal."""
+    from breezy.adapters.polymarket_us.data import TRADE_UNKNOWN_KEY_CAPACITY
+
+    harness = build_harness()
+    trades = _capture_trades(harness)
+    await harness.client._connect()
+
+    harness.feed.deliver(documented_trade_frame(venueSeq=1, feeCoefficient="0.06"))
+    for i in range(TRADE_UNKNOWN_KEY_CAPACITY + 50):
+        # Distinct tradeTime per frame: identical venue fields would (rightly)
+        # be suppressed as a replay, which is not what this test measures.
+        harness.feed.deliver(
+            documented_trade_frame(
+                tradeTime=f"2026-08-25T00:00:01.{i:09d}Z", **{f"drift{i}": i}
+            )
+        )
+
+    assert len(trades) == TRADE_UNKNOWN_KEY_CAPACITY + 51
+    recorded = harness.client.trade_unknown_keys
+    assert {"venueSeq", "feeCoefficient"} <= set(recorded)
+    assert len(recorded) == TRADE_UNKNOWN_KEY_CAPACITY
+    assert harness.client.trade_frames_with_unknown_keys == TRADE_UNKNOWN_KEY_CAPACITY + 51
+    await harness.client._disconnect()
+
+
+@pytest.mark.asyncio
+async def test_taker_side_and_intent_pairs_are_tallied_in_a_bounded_table() -> None:
+    """``TradeTick`` has no field for the venue's ``intent`` (the NO-leg
+    discriminator), so the client keeps a BOUNDED tally of observed
+    ``taker.side / taker.intent`` pairs -- the only evidence about the NO-leg
+    print population the tape can carry without a raw sidecar."""
+    from breezy.adapters.polymarket_us.data import TRADE_TAKER_TALLY_CAPACITY
+
+    harness = build_harness()
+    await harness.client._connect()
+
+    harness.feed.deliver(documented_trade_frame())
+    harness.feed.deliver(documented_trade_frame(tradeTime="2026-08-25T00:07:00Z"))
+    no_leg = {"side": "ORDER_SIDE_SELL", "intent": "ORDER_INTENT_BUY_SHORT"}
+    # Own tradeTime: `intent` is not part of the derived id, so an otherwise
+    # identical frame would be suppressed as a replay.
+    harness.feed.deliver(documented_trade_frame(tradeTime="2026-08-25T00:08:00Z", taker=no_leg))
+    for i in range(TRADE_TAKER_TALLY_CAPACITY + 20):
+        harness.feed.deliver(
+            documented_trade_frame(
+                tradeTime=f"2026-08-25T00:00:01.{i:09d}Z",
+                taker={"side": f"SIDE_{i}", "intent": f"INTENT_{i}"},
+            )
+        )
+
+    tally = harness.client.trade_taker_tally
+    assert tally["ORDER_SIDE_SELL/ORDER_INTENT_SELL_LONG"] == 2
+    assert tally["ORDER_SIDE_SELL/ORDER_INTENT_BUY_SHORT"] == 1
+    assert len(tally) <= TRADE_TAKER_TALLY_CAPACITY + 1  # + the overflow bucket
+    assert tally[harness.client.TRADE_TAKER_TALLY_OVERFLOW_KEY] > 0
+    await harness.client._disconnect()
+
+
+@pytest.mark.asyncio
+async def test_a_trade_frame_for_an_unknown_slug_is_dropped_without_raising() -> None:
+    harness = build_harness()
+    trades = _capture_trades(harness)
+    await harness.client._connect()
+
+    harness.feed.deliver(documented_trade_frame(slug="tc-temp-mdwhigh-2026-08-25-lt91f"))
+
+    assert trades == []
+    assert harness.client.trades_published == 0
+    await harness.client._disconnect()
+
+
+@pytest.mark.asyncio
+async def test_a_replayed_print_is_published_once_and_counted_as_a_replay_duplicate() -> None:
+    """After a reconnect the venue may re-send a print. Its derived id is built
+    from venue-only fields, so the replay collides and the client suppresses
+    it (bounded per-instrument window) instead of double-counting volume."""
+    harness = build_harness()
+    trades = _capture_trades(harness)
+    await harness.client._connect()
+
+    harness.feed.deliver(documented_trade_frame())
+    harness.feed.deliver(documented_trade_frame())
+    harness.feed.deliver(documented_trade_frame(price={"value": "0.56", "currency": "USD"}))
+
+    assert len(trades) == 2
+    assert harness.client.trades_published == 2
+    assert harness.client.trade_replay_duplicates == 1
+    assert harness.client.dropped_frames == 0
+    await harness.client._disconnect()
+
+
+@pytest.mark.asyncio
+async def test_the_replay_dedup_window_is_bounded_per_instrument() -> None:
+    from breezy.adapters.polymarket_us.data import TRADE_DEDUP_WINDOW
+
+    harness = build_harness()
+    trades = _capture_trades(harness)
+    await harness.client._connect()
+
+    first = documented_trade_frame(tradeTime="2026-08-25T00:00:00.000000000Z")
+    harness.feed.deliver(first)
+    for i in range(TRADE_DEDUP_WINDOW):
+        harness.feed.deliver(
+            documented_trade_frame(tradeTime=f"2026-08-25T00:00:01.{i:09d}Z")
+        )
+    harness.feed.deliver(first)  # evicted from the window: published again
+
+    assert len(trades) == TRADE_DEDUP_WINDOW + 2
+    assert harness.client.trade_replay_duplicates == 0
+    await harness.client._disconnect()
+
+
+@pytest.mark.asyncio
+async def test_the_raw_quantity_object_is_kept_verbatim_as_bounded_evidence() -> None:
+    """The print-size UNIT is unresolved (contracts vs dollars). The raw
+    ``quantity`` object and ``price`` are kept verbatim, bounded, so the first
+    live print can be cross-checked against the REST fill for the same trade."""
+    from breezy.adapters.polymarket_us.data import TRADE_QUANTITY_EVIDENCE_CAPACITY
+
+    harness = build_harness()
+    await harness.client._connect()
+
+    harness.feed.deliver(documented_trade_frame())
+    for i in range(TRADE_QUANTITY_EVIDENCE_CAPACITY + 5):
+        harness.feed.deliver(
+            documented_trade_frame(tradeTime=f"2026-08-25T00:00:01.{i:09d}Z", quantity=str(i + 1))
+        )
+
+    evidence = harness.client.trade_quantity_evidence
+    assert len(evidence) == TRADE_QUANTITY_EVIDENCE_CAPACITY
+    last = evidence[-1]
+    assert last.market_slug == SLUG
+    assert last.trade_time == f"2026-08-25T00:00:01.{TRADE_QUANTITY_EVIDENCE_CAPACITY + 4:09d}Z"
+    assert last.quantity == repr(str(TRADE_QUANTITY_EVIDENCE_CAPACITY + 5))
+    assert last.price == repr({"value": "0.55", "currency": "USD"})
+    await harness.client._disconnect()

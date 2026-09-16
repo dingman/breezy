@@ -616,6 +616,10 @@ class PolymarketUSLiveDataClientFactory(LiveDataClientFactory):
                 heartbeat_secs=config.ws_heartbeat_secs,
                 idle_timeout_secs=config.ws_idle_timeout_secs,
                 logger=ws_logger,
+                # The recorder's knob (`build_quote_tape_node_config`); the
+                # trade node's config leaves it False and its wire traffic
+                # unchanged.
+                subscribe_trades=config.subscribe_trades,
             )
 
         return build_data_client(
