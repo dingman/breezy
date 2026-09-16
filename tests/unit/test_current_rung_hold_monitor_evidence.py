@@ -9,13 +9,16 @@ Covers: one-sided book, insufficient depth, the NO-leg mark inversion
 
 from __future__ import annotations
 
-from decimal import Decimal
+from decimal import ROUND_HALF_EVEN, Decimal
 
+import pytest
 from nautilus_trader.model.data import BookOrder, OrderBookDepth10
 from nautilus_trader.model.enums import OrderSide
 from nautilus_trader.model.identifiers import InstrumentId
 from nautilus_trader.model.objects import Price, Quantity
 
+from breezy.strategy.current_rung_hold import decision as decision_module
+from breezy.strategy.current_rung_hold import monitor_evidence as monitor_evidence_module
 from breezy.strategy.current_rung_hold.archive_table import P_HOLD_LOWER, P_HOLD_UPPER
 from breezy.strategy.current_rung_hold.monitor_evidence import (
     build_monitor_evidence,
@@ -219,6 +222,46 @@ def test_exit_fee_is_computed_off_the_exit_price_not_the_fill_price() -> None:
 
 def test_exit_fee_scales_linearly_with_quantity() -> None:
     assert exit_fee(Decimal("0.40"), 3, _FEE_COEFFICIENT) == Decimal("0.03")
+
+
+# --------------------------------------------------------------------------
+# INC-E2 (POSITION_EXIT_EXECUTION_2026-09-16.md §3, review item 4): the exit
+# fee and the entry fee must share ONE coefficient source, never drift into
+# two implementations of `theta * p * (1 - p)`.
+# --------------------------------------------------------------------------
+
+
+def test_exit_fee_and_the_entry_fee_share_the_same_function_object() -> None:
+    """D5 (module docstring, `monitor_evidence.py:16-18`): `exit_fee` calls
+    `decision._fee` directly, imported as `_entry_fee` -- not a second
+    implementation that merely happens to agree today. Identity, not
+    equality: a drifted copy could still equal `decision._fee` on every
+    price this test tries and diverge on one it does not."""
+    assert monitor_evidence_module._entry_fee is decision_module._fee
+
+
+@pytest.mark.parametrize(
+    ("price", "expected_per_contract"),
+    [
+        (Decimal("0.01"), Decimal("0.00")),
+        (Decimal("0.09"), Decimal("0.00")),
+        (Decimal("0.44"), Decimal("0.01")),
+        (Decimal("0.50"), Decimal("0.02")),
+        (Decimal("0.99"), Decimal("0.00")),
+    ],
+)
+def test_exit_fee_matches_the_theta_p_one_minus_p_formula_at_every_price(
+    price: Decimal, expected_per_contract: Decimal,
+) -> None:
+    """``0.06 * p * (1 - p)``, banker's-rounded to the cent (the SAME
+    rounding `decision._fee` applies) -- pinned independently of the
+    production formula, so a coefficient or rounding-mode drift is caught
+    even though :func:`test_exit_fee_and_the_entry_fee_share_the_same_
+    function_object` already pins the identity."""
+    exact = _FEE_COEFFICIENT * price * (Decimal(1) - price)
+    pinned = exact.quantize(Decimal("0.01"), rounding=ROUND_HALF_EVEN)
+    assert pinned == expected_per_contract
+    assert exit_fee(price, 1, _FEE_COEFFICIENT) == expected_per_contract
 
 
 # --------------------------------------------------------------------------

@@ -17,6 +17,7 @@ from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from decimal import Decimal
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 import pytest
 from nautilus_trader.model.enums import OmsType
@@ -55,6 +56,9 @@ from tests.unit.test_current_rung_hold_strategy import (
     _observation,
 )
 
+if TYPE_CHECKING:  # pragma: no cover - typing only
+    from breezy.persistence.family_manifest import FamilyManifest
+
 _MINUTE_NS = 60_000_000_000
 _STALE_BOUND_NS = 50 * _MINUTE_NS
 _IID = str(INTERIOR_ID)
@@ -70,6 +74,11 @@ class _FakePosition:
     instrument_id: str
     avg_px_open: float
     quantity: int
+    #: INC-E3: additive -- `PositionMonitor._register` reads `position.id`
+    #: (a real Nautilus `Position` always has one) to populate
+    #: `_MonitoredPosition.position_id` for the exit decider/`submit_exit`.
+    #: Every existing call site omits this and gets the default, unchanged.
+    id: str = "P-FAKE-1"
 
 
 @dataclass
@@ -437,6 +446,12 @@ def _wire_monitor(
     *,
     tmp_path: Path,
     report: Callable[[str, Mapping[str, object]], None] | None = None,
+    exit_decider: Callable[..., object] | None = None,
+    exit_manifest: object | None = None,
+    exit_family_id: str | None = None,
+    exit_client_order_id_factory: Callable[[], str] | None = None,
+    submit_exit: Callable[..., None] | None = None,
+    record_exit_offer: Callable[..., None] | None = None,
 ) -> PositionMonitor:
     from breezy.adapters.polymarket_us.symbology import leg_of
     from breezy.strategy.current_rung_hold.strategy import _local_hour
@@ -491,6 +506,12 @@ def _wire_monitor(
         catalog_root=tmp_path / "monitor",
         summaries_dir=tmp_path / "monitor" / "summaries",
         report=report if report is not None else (lambda event, detail: None),
+        exit_decider=exit_decider,  # type: ignore[arg-type]
+        exit_manifest=exit_manifest,  # type: ignore[arg-type]
+        exit_family_id=exit_family_id,
+        exit_client_order_id_factory=exit_client_order_id_factory,
+        submit_exit=submit_exit,
+        record_exit_offer=record_exit_offer,
     )
 
 
@@ -629,3 +650,182 @@ def test_an_unresolved_position_opened_event_is_counted_and_the_position_still_r
 
     assert _IID in monitor._positions
     assert strategy.position_events.count("position_opened_event_unresolved") == 1  # unchanged
+
+
+# ---------------------------------------------------------------------------
+# INC-E3 (plan §3, PREREG v4 §3b/§12): exit-decider wiring.
+#
+# These tests drive the REAL `PositionMonitor` pipeline (real
+# `RunningExtremeAccumulator`, real `evaluate_monitor`/`build_monitor_
+# evidence`) exactly like `test_attached_monitor_...` above, through the
+# LIGHTWEIGHT `_register_and_start` harness (no `BacktestEngine`, no real
+# order submission) -- `submit_exit`/`record_exit_offer` are injected SPY
+# callables here, never the strategy's own `submit_exit` (that method's
+# OWN order-construction behaviour is covered by
+# `test_current_rung_hold_exit_wiring.py`'s full-backtest-harness tests).
+# ---------------------------------------------------------------------------
+
+_DEAD_TEMP_C_TENTHS = 320  # 32.0C -> 90F, strictly above rung_high=87
+_DEAD_CONFIRM_SPAN_MIN = 6  # >= monitor_decision._DEAD_MIN_CONFIRM_SPAN_NS (5 min)
+
+
+def _manifest_for_exit_test(*, exit_rule: str | None) -> FamilyManifest:
+    from breezy.persistence.family_manifest import FamilyManifest
+
+    return FamilyManifest(
+        family_id="pm_us_crh_exit_v4",
+        venue="polymarket_us",
+        trial_id_prefix="current_rung_hold_exit_v4/trial/",
+        d0_climate_day="2099-01-01",
+        boundary_artefact_path=Path("deploy/families/gs_boundary_pm_us_crh_v2.json"),
+        boundary_inputs_sha256="a" * 64,
+        stations=("SFO",),
+        status="REGISTERED" if exit_rule is not None else "DRAFT_NOT_REGISTERED",
+        manifest_sha256="b" * 64,
+        exit_rule=exit_rule,
+    )
+
+
+def _drive_to_dead(
+    strategy, interior_instrument: BinaryOption, *, monitor: PositionMonitor,
+) -> None:
+    """Entry fill + position-opened + two DEAD-confirming observations/
+    depth frames -- the SAME geometry
+    `test_a_dead_scenario_in_replay_yields_an_exit_or_missing_stop_mark`
+    (backtest_only test file) drives, reused here at the lightweight
+    (non-engine) `_register_and_start` layer."""
+    from tests.unit.test_continuous_rung_hold_strategy import _depth
+
+    interior_instrument.info["fee_coefficient"] = "0.06"
+    strategy.on_data(_observation(temp_c_tenths=300, observed_at_ns=WINDOW_OPEN_NS - 1))
+    fill = _fill(strategy, instrument_id=INTERIOR_ID, venue_order_id="ord-e3-1")
+    strategy.on_order_filled(fill)
+    position = Position(interior_instrument, fill)
+    strategy.cache.add_position(position, OmsType.NETTING)
+    strategy.on_position_opened(TestEventStubs.position_opened(position))
+
+    def _fresh_depth(now_ns: int) -> None:
+        # Re-pushed at each evaluation instant so `book_staleness_ns` (measured
+        # from `monitored.last_book_ts_ns`) stays inside the 180s bound --
+        # unlike the full-engine backtest harness, this lightweight harness
+        # has no continuous market-data stream keeping the book fresh for free.
+        strategy.on_order_book_depth(
+            _depth(
+                INTERIOR_ID, bids=(("0.30", 10),), asks=(("0.90", 10),), ts_event=now_ns,
+            ),
+        )
+
+    _fresh_depth(WINDOW_OPEN_NS)
+
+    first_ts_ns = WINDOW_OPEN_NS + 2 * _MINUTE_NS
+    first_dead = _observation(temp_c_tenths=_DEAD_TEMP_C_TENTHS, observed_at_ns=first_ts_ns)
+    strategy.on_data(first_dead)
+    _fresh_depth(first_ts_ns)
+    monitor.on_observation(STATION, first_ts_ns)
+
+    second_ts_ns = WINDOW_OPEN_NS + (2 + _DEAD_CONFIRM_SPAN_MIN) * _MINUTE_NS
+    second_dead = _observation(temp_c_tenths=_DEAD_TEMP_C_TENTHS, observed_at_ns=second_ts_ns)
+    strategy.on_data(second_dead)
+    _fresh_depth(second_ts_ns)
+    monitor.on_observation(STATION, second_ts_ns)
+
+
+def test_a_shadow_monitor_never_calls_submit_exit_or_record_exit_offer_even_on_dead(
+    store_path: Path, interior_instrument: BinaryOption, tmp_path: Path,
+) -> None:
+    """Module docstring (INC-E3): `exit_decider=None` (the default) is
+    byte-identical shadow behaviour -- neither `submit_exit` nor
+    `record_exit_offer` is EVER called, even on a confirmed DEAD scenario
+    with `EXIT_RECOMMENDED`."""
+    submit_calls: list[object] = []
+    offer_calls: list[object] = []
+    strategy = _register_and_start(store_path=store_path, instruments=(interior_instrument,))
+    monitor = _wire_monitor(
+        strategy,
+        tmp_path=tmp_path,
+        submit_exit=submit_calls.append,
+        record_exit_offer=offer_calls.append,
+    )
+    strategy._position_monitor = monitor
+
+    _drive_to_dead(strategy, interior_instrument, monitor=monitor)
+
+    assert submit_calls == []
+    assert offer_calls == []
+
+
+def test_a_gate_refused_family_evaluates_but_submits_nothing(
+    store_path: Path, interior_instrument: BinaryOption, tmp_path: Path,
+) -> None:
+    """A decider IS installed, but the manifest is `pm_us_crh_cont`-shaped
+    (no `exit_rule`) -- `decide_exit`'s own family gate refuses every
+    evaluation, so `record_exit_offer` sees only refusals and
+    `submit_exit` is NEVER called."""
+    from breezy.strategy.current_rung_hold.exit_decider import ExitProposal, decide_exit
+
+    submit_calls: list[object] = []
+    offer_calls: list[object] = []
+    strategy = _register_and_start(store_path=store_path, instruments=(interior_instrument,))
+    monitor = _wire_monitor(
+        strategy,
+        tmp_path=tmp_path,
+        exit_decider=decide_exit,
+        exit_manifest=_manifest_for_exit_test(exit_rule=None),
+        exit_family_id="pm_us_crh_cont",
+        exit_client_order_id_factory=lambda: "exit-coid-shadow",
+        submit_exit=submit_calls.append,
+        record_exit_offer=offer_calls.append,
+    )
+    strategy._position_monitor = monitor
+
+    _drive_to_dead(strategy, interior_instrument, monitor=monitor)
+
+    assert submit_calls == []
+    assert offer_calls, "at least one refusal row must still be persisted"
+    assert not any(isinstance(call, ExitProposal) for call in offer_calls)
+
+
+def test_an_armed_family_fires_and_calls_submit_exit_with_a_proposal(
+    store_path: Path, interior_instrument: BinaryOption, tmp_path: Path,
+) -> None:
+    """The mirror case: a manifest that DOES declare `exit_rule` for the
+    registered family fires R_DEAD once DEAD confirms with an executable
+    book, and the decision is persisted (`record_exit_offer`) BEFORE
+    `submit_exit` is called."""
+    from breezy.strategy.current_rung_hold.exit_decider import ExitProposal, decide_exit
+
+    call_order: list[str] = []
+    submitted: list[ExitProposal] = []
+
+    def _submit_exit(proposal: ExitProposal) -> None:
+        call_order.append("submit_exit")
+        submitted.append(proposal)
+
+    def _record_exit_offer(record: object) -> None:
+        call_order.append("record_exit_offer")
+
+    strategy = _register_and_start(store_path=store_path, instruments=(interior_instrument,))
+    monitor = _wire_monitor(
+        strategy,
+        tmp_path=tmp_path,
+        exit_decider=decide_exit,
+        exit_manifest=_manifest_for_exit_test(
+            exit_rule="crh_exit_v4:R_THREAT_PRIMARY+R_DEAD_BACKSTOP",
+        ),
+        exit_family_id="pm_us_crh_exit_v4",
+        exit_client_order_id_factory=lambda: "exit-coid-fired",
+        submit_exit=_submit_exit,
+        record_exit_offer=_record_exit_offer,
+    )
+    strategy._position_monitor = monitor
+
+    _drive_to_dead(strategy, interior_instrument, monitor=monitor)
+
+    assert len(submitted) == 1
+    assert submitted[0].authorization.rule.value == "R_DEAD"
+    assert submitted[0].authorization.client_order_id == "exit-coid-fired"
+    assert "record_exit_offer" in call_order
+    assert "submit_exit" in call_order
+    assert call_order.index("record_exit_offer") < call_order.index("submit_exit"), (
+        "the decision must be persisted BEFORE submit_exit is called (hard invariant)"
+    )

@@ -14,6 +14,8 @@ import pytest
 
 from breezy.adapters.polymarket_us.leg_prices import (
     assert_echo_matches_leg,
+    assert_exit_echo_matches_leg,
+    exit_wire_price_for_leg,
     instrument_price_for_leg,
     wire_price_for_leg,
 )
@@ -111,6 +113,83 @@ def test_an_unknown_leg_refuses_the_echo_check() -> None:
 
 
 # ---------------------------------------------------------------------------
+# INC-E1/E2 (POSITION_EXIT_EXECUTION_2026-09-16.md, Appendix A rows 1-2):
+# the CLOSING-order (exit) echo table, disjoint from the BUY table above.
+# ---------------------------------------------------------------------------
+
+
+def test_a_yes_close_echo_matches() -> None:
+    assert_exit_echo_matches_leg("yes", "ORDER_SIDE_SELL", "ORDER_INTENT_SELL_LONG")
+
+
+def test_a_no_close_echo_matches() -> None:
+    """PINNED-BY-CAPTURE 2026-09-16T03:19:32Z
+    (``CLOSE_PREVIEW_no_20260916T031932Z.json``): a NO close is the exact
+    mirror of a NO buy -- side ``ORDER_SIDE_BUY``, not ``SELL``, even though
+    the request carried ``action: ORDER_ACTION_SELL``."""
+    assert_exit_echo_matches_leg("no", "ORDER_SIDE_BUY", "ORDER_INTENT_SELL_SHORT")
+
+
+def test_a_no_close_echoed_as_a_yes_close_intent_is_refused() -> None:
+    """The NO-close SIDE (``ORDER_SIDE_BUY``) alone is not enough to pass --
+    paired with YES's close intent (``ORDER_INTENT_SELL_LONG``) it must
+    still refuse."""
+    with pytest.raises(ValueError, match="refusing"):
+        assert_exit_echo_matches_leg("no", "ORDER_SIDE_BUY", "ORDER_INTENT_SELL_LONG")
+
+
+def test_a_yes_close_echoed_as_a_no_close_intent_is_refused() -> None:
+    with pytest.raises(ValueError, match="refusing"):
+        assert_exit_echo_matches_leg("yes", "ORDER_SIDE_SELL", "ORDER_INTENT_SELL_SHORT")
+
+
+def test_an_unknown_leg_refuses_the_exit_echo_check() -> None:
+    with pytest.raises(ValueError):
+        assert_exit_echo_matches_leg("maybe", "ORDER_SIDE_SELL", "ORDER_INTENT_SELL_LONG")
+
+
+def test_a_buy_echo_presented_to_the_exit_check_is_refused() -> None:
+    """Refused in BOTH directions (E5-2, carried over): the entry table's
+    exact pair is not a valid exit echo for either leg."""
+    with pytest.raises(ValueError, match="refusing"):
+        assert_exit_echo_matches_leg("yes", "ORDER_SIDE_BUY", "ORDER_INTENT_BUY_LONG")
+    with pytest.raises(ValueError, match="refusing"):
+        assert_exit_echo_matches_leg("no", "ORDER_SIDE_SELL", "ORDER_INTENT_BUY_SHORT")
+
+
+def test_an_exit_echo_presented_to_the_buy_check_is_refused() -> None:
+    """The other direction: the exit table's exact pair is not a valid BUY
+    echo for either leg."""
+    with pytest.raises(ValueError, match="refusing"):
+        assert_echo_matches_leg("yes", "ORDER_SIDE_SELL", "ORDER_INTENT_SELL_LONG")
+    with pytest.raises(ValueError, match="refusing"):
+        assert_echo_matches_leg("no", "ORDER_SIDE_BUY", "ORDER_INTENT_SELL_SHORT")
+
+
+def test_the_no_close_echo_and_the_yes_buy_echo_share_a_side_but_are_not_interchangeable() -> None:
+    """PINNED-BY-CAPTURE: the corrected NO-close pair (``ORDER_SIDE_BUY``,
+    ``ORDER_INTENT_SELL_SHORT``) and the YES-buy pair (``ORDER_SIDE_BUY``,
+    ``ORDER_INTENT_BUY_LONG``) now share a SIDE and differ only by intent --
+    both checks must key on the full (side, intent) PAIR, never side alone,
+    or one leg's close would silently pass as the other leg's open."""
+    with pytest.raises(ValueError, match="refusing"):
+        assert_echo_matches_leg("yes", "ORDER_SIDE_BUY", "ORDER_INTENT_SELL_SHORT")
+    with pytest.raises(ValueError, match="refusing"):
+        assert_exit_echo_matches_leg("no", "ORDER_SIDE_BUY", "ORDER_INTENT_BUY_LONG")
+
+
+def test_exit_wire_price_for_leg_is_identity_on_yes_and_complement_on_no() -> None:
+    """`exit_wire_price_for_leg` reuses `wire_price_for_leg`'s exact
+    arithmetic -- a NO close at X is sent as `1 - X`, the IDENTICAL
+    complement a NO BUY uses (Appendix A row 3): no new formula for a close."""
+    assert exit_wire_price_for_leg("yes", Decimal("0.63")) == Decimal("0.63")
+    assert exit_wire_price_for_leg("no", Decimal("0.63")) == Decimal("0.37")
+    assert exit_wire_price_for_leg("no", Decimal("0.63")) == wire_price_for_leg(
+        "no", Decimal("0.63"),
+    )
+
+
+# ---------------------------------------------------------------------------
 # E5-6 structural pin
 # ---------------------------------------------------------------------------
 
@@ -128,6 +207,19 @@ _PERMITTED_IMPORTED_NAMES = frozenset(
         # `Leg`: the type alias, imported for signatures only -- carries no
         # arithmetic and is never called.
         "Leg",
+        # WIDENED (not relaxed), INC-E2b (`POSITION_EXIT_EXECUTION_2026-09-16.md`
+        # §3): `exec/submit_chain.py`'s `build_exit_order_body` imports the
+        # exit-call-site alias of `wire_price_for_leg` (leg_prices module
+        # docstring) to translate the closing order's wire price -- same
+        # complement, named for its call site.
+        "exit_wire_price_for_leg",
+        # WIDENED (not relaxed), INC-E2 response-side leg check
+        # (`POSITION_EXIT_EXECUTION_2026-09-16.md` §3): `exec/reports.py`'s
+        # `_order_side_for_leg` imports the closing-order sibling of
+        # `assert_echo_matches_leg` (same module, same "outside exec/,
+        # imported narrowly" shape) so a closing response is cross-checked
+        # against the disjoint exit echo table instead of the entry-only one.
+        "assert_exit_echo_matches_leg",
     }
 )
 #: WIDENED (not relaxed), commit `feat(exec): book NO-leg fills as BUY at
@@ -140,6 +232,10 @@ _PERMITTED_IMPORTED_NAMES = frozenset(
 _PERMITTED_CALLERS = frozenset(
     {
         "build_order_body",
+        # WIDENED (not relaxed), INC-E2b: the closing-order counterpart of
+        # `build_order_body`, calling `exit_wire_price_for_leg` for the exact
+        # same reason -- one wire-price translation, one call site.
+        "build_exit_order_body",
         "parse_fill_report",
         "parse_order_status_report",
         "_cumulative_qty_and_cost",

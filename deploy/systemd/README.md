@@ -701,6 +701,68 @@ this unit too.
 
 ---
 
+## `breezy-exit-window-study` — nightly exit-window study (2026-09-16, PREPARED, NOT ACTIVATED)
+
+`breezy-exit-window-study.service` + `.timer` run the nightly offline "exit
+window" study (`docs/plans/POSITION_EXIT_EXECUTION_2026-09-16.md`) via
+`deploy/systemd/exit-window-study-run.sh`, in the same wrapper-owns-the-work
+style as `position-monitor-report-run.sh`. Each run invokes
+`scripts/analysis/current_rung_hold_exit_window_study.py` for the
+`pm_us_crh_v2` family's four stations (`LAX`, `MDW`, `MIA`, `SFO`) since that
+family's own `d0_climate_day` (both hardcoded in the wrapper with a citation
+comment, the same convention `family-tally-v2-run.sh` uses for its own
+`V2_D0_LITERAL` — never a second, independently-derived parse of
+`deploy/families/pm_us_crh_v2.json` at run time), with `--obs-source fetch`
+(network fetch allowed only on a cache miss) and the CLI's own default
+depth-source (auto-select per position), writing one dated JSON + Markdown
+report under `~/.local/share/breezy/derived/exit_window_study/<run-stamp>/`
+(`<run-stamp>` is `<date>_nightly`).
+
+**Read-only exec-state-store copy, never the live path.** The study script
+reads real fills from the live exec `SqliteStateStore`
+(`POLYMARKET_US_EXEC_STATE_DB`), but the wrapper never hands the CLI that
+live path directly: it first opens the live store `mode=ro` (URI, no flock)
+and makes a full snapshot into a private `mktemp` directory via the stdlib
+`sqlite3.Connection.backup()` API — safe against a concurrently writing
+WAL-mode node, and never a plain `cp` of a possibly-mid-write file — then
+passes ONLY that copy's path as `--state-db`. The temp directory is removed
+on exit via a `trap`, success or failure. `POLYMARKET_US_EXEC_STATE_DB` is
+set with the same byte-identical `Environment=` literal as
+`breezy-score-live-trials.service` / `breezy-live-tally.service` /
+`breezy-pm-crh-v2-tally.service` (a single non-secret filesystem path, never
+a venue credential, so no `EnvironmentFile=` is needed).
+
+Scheduled at **15:20 UTC** — free on the existing schedule, strictly after
+`breezy-position-monitor-report` (15:00 UTC), and outside the protected
+LST-union window (see "Protected window and serialization" below); pinned
+by `tests/unit/test_deploy_timer_hours.py`.
+
+**Deliberate opt-in to the studies discipline.** Like
+`breezy-position-monitor-report`, this unit opts INTO `breezy-studies.slice`
+and the shared host-wide `breezy-studies.lock` (same skip-not-kill
+convention: contention exits 0, lock-infrastructure failure exits 75) even
+though its own cap (`MemoryHigh=1G`/`MemoryMax=2G`) is well under the three
+heavy studies' `MemoryHigh=12G`/`MemoryMax=16G` floor — it reads from the
+same quote-tape-catalog-derived directory tree those studies write near, so
+it stays under the shared discipline rather than being asserted
+independently exempt.
+
+Validation performed (no unit activated):
+
+```
+$ bash -n deploy/systemd/exit-window-study-run.sh
+OK
+```
+
+To activate: symlink both unit files into `~/.config/systemd/user/` (§2's
+pattern), `daemon-reload`, then
+`systemctl --user enable --now breezy-exit-window-study.timer` — never
+`start` the service directly; see the TRAP section above for the post-edit
+`daemon-reload` discipline that applies to any future edit of this unit
+too.
+
+---
+
 ## `breezy-pm-crh-v2-tally` — PREREG v2 family tally, PM-only (2026-09-04, PREPARED, NOT ACTIVATED)
 
 One concrete unit pair runs `scripts/analysis/family_tally_v2.py` (the CLI

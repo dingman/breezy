@@ -126,7 +126,29 @@ class OfferTapeRecord:
     #: "refuse", or "wait". Never "wait" in practice: a WAIT tick never
     #: reaches `OfferTape.append` at all (unbounded-log guard), so this
     #: field is always "take" or "refuse" for every row that exists.
+    #: INC-E3 (plan §3, PREREG v4 §3b/§12) adds "exit_fired"/"exit_refused"
+    #: for the intra-day position monitor's own exit-decision rows -- a
+    #: DIFFERENT source ("position_monitor", never "quote_tick"/"depth"),
+    #: additive and never read by the entry-hunt's own consumers.
     decision: str = "refuse"
+    #: INC-E3: the registered exit rule (``"R_THREAT"``/``"R_DEAD"``) an
+    #: exit decision was evaluated under. `None` for every entry-hunt row
+    #: (every row before this increment, and every row this increment adds
+    #: for a decision that never even reached rule selection).
+    exit_rule: str | None = None
+    #: INC-E3: `"fired"` or `"refused"` -- `None` for every entry-hunt row.
+    exit_decision: str | None = None
+    #: INC-E3: the exit decider's own distinct refusal reason code (see
+    #: `exit_decider.py`), or `"fired"` on a proposal. `None` for every
+    #: entry-hunt row.
+    exit_reason_code: str | None = None
+    #: INC-E3: the authorised 1-contract limit price, when fired. `None`
+    #: otherwise (including every entry-hunt row).
+    exit_limit_price: Decimal | None = None
+    #: INC-E3: the archive's own hold expectation the fired exit cleared
+    #: (`ExitAuthorization.expected_settlement_value`). `None` otherwise
+    #: (including every entry-hunt row).
+    expected_settlement_value: Decimal | None = None
 
     def to_dict(self) -> dict[str, object]:
         """Field-by-field serialization -- never ``dataclasses.asdict``.
@@ -173,6 +195,17 @@ class OfferTapeRecord:
             "observed_at_ns": self.observed_at_ns,
             "admission_reason": self.admission_reason,
             "decision": self.decision,
+            "exit_rule": self.exit_rule,
+            "exit_decision": self.exit_decision,
+            "exit_reason_code": self.exit_reason_code,
+            "exit_limit_price": (
+                None if self.exit_limit_price is None else str(self.exit_limit_price)
+            ),
+            "expected_settlement_value": (
+                None
+                if self.expected_settlement_value is None
+                else str(self.expected_settlement_value)
+            ),
         }
 
     @classmethod
@@ -228,6 +261,11 @@ class OfferTapeRecord:
             observed_at_ns=cast("int | None", payload.get("observed_at_ns")),
             admission_reason=cast("str | None", payload.get("admission_reason")),
             decision=cast(str, payload.get("decision", "refuse")),
+            exit_rule=cast("str | None", payload.get("exit_rule")),
+            exit_decision=cast("str | None", payload.get("exit_decision")),
+            exit_reason_code=cast("str | None", payload.get("exit_reason_code")),
+            exit_limit_price=_decimal("exit_limit_price"),
+            expected_settlement_value=_decimal("expected_settlement_value"),
         )
 
 

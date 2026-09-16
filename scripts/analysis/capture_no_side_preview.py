@@ -49,6 +49,21 @@ Usage (live capture, under the operator permit context ONLY)::
 
     BREEZY_VENUE_LIVE=1 uv run python scripts/analysis/capture_no_side_preview.py \\
         --slug tc-temp-mdwhigh-2026-09-14-gte76lt77f --price 0.05 --execute
+
+CLOSE mode (``--close``). ``docs/plans/POSITION_EXIT_EXECUTION_2026-09-16.md``
+Section 4 step 1: capture a CLOSING order preview against a held position
+instead of a NO-side opening buy. Same 10-key schema, ``action=
+ORDER_ACTION_SELL`` and ``outcomeSide`` per ``--outcome``; the wire price is
+the shipped ``leg_prices.wire_price_for_leg`` complement of ``--price`` (the
+INSTRUMENT price), never re-derived here. Still only ever POSTs the preview
+path -- ``assert_preview_path_only`` refuses anything else::
+
+    uv run python scripts/analysis/capture_no_side_preview.py \\
+        --close --slug tc-temp-mdwhigh-2026-09-15-gte80lt81f --outcome yes --price 0.01
+
+    BREEZY_VENUE_LIVE=1 uv run python scripts/analysis/capture_no_side_preview.py \\
+        --close --slug tc-temp-mdwhigh-2026-09-15-gte80lt81f --outcome yes \\
+        --price 0.01 --execute
 """
 
 from __future__ import annotations
@@ -61,7 +76,7 @@ import sys
 from collections.abc import Mapping, Sequence
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
-from typing import Any, Final
+from typing import Any, Final, cast
 
 # ---------------------------------------------------------------------------
 # Constants -- the captured schema, restated (see module docstring)
@@ -87,6 +102,9 @@ ORDER_BODY_KEYS: Final[frozenset[str]] = frozenset(
 OUTCOME_SIDE_NO: Final[str] = "OUTCOME_SIDE_NO"
 OUTCOME_SIDE_YES: Final[str] = "OUTCOME_SIDE_YES"
 ORDER_ACTION_BUY: Final[str] = "ORDER_ACTION_BUY"
+#: CLOSE mode only (a SELL of a held leg). Never used by the NO-side opening
+#: buy path above, which stays ORDER_ACTION_BUY.
+ORDER_ACTION_SELL: Final[str] = "ORDER_ACTION_SELL"
 ORDER_TYPE_LIMIT: Final[str] = "ORDER_TYPE_LIMIT"
 TIF_IOC: Final[str] = "TIME_IN_FORCE_IMMEDIATE_OR_CANCEL"
 MANUAL_AUTOMATIC: Final[str] = "MANUAL_ORDER_INDICATOR_AUTOMATIC"
@@ -101,7 +119,13 @@ READ_METHOD: Final[str] = "GET"
 
 EVIDENCE_DIRECTORY: Final[Path] = Path("docs/evidence/venue/polymarket_us")
 EVIDENCE_PREFIX: Final[str] = "NO_SIDE_PREVIEW_"
+#: CLOSE mode's evidence prefix (POSITION_EXIT_EXECUTION_2026-09-16.md S4.1).
+CLOSE_EVIDENCE_PREFIX: Final[str] = "CLOSE_PREVIEW_"
 EVIDENCE_FILE_MODE: Final[int] = 0o600
+
+#: CLOSE mode's ``--outcome`` -> ``outcomeSide`` table. A plain dict, not a
+#: branch, so a third outcome cannot silently fall through to a wrong side.
+CLOSE_OUTCOME_SIDE: Final[dict[str, str]] = {"yes": OUTCOME_SIDE_YES, "no": OUTCOME_SIDE_NO}
 
 #: Header NAMES whose values are never printed or written. Same set the
 #: adapter's ``redaction.py`` blanks; restated so the dry run needs no imports.
@@ -141,6 +165,17 @@ def parse_price(raw: str) -> Decimal:
     return price.quantize(PRICE_TICK)
 
 
+def parse_quantity(raw: str) -> int:
+    """A positive integer contract count (``--close`` only)."""
+    try:
+        quantity = int(raw)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(f"quantity is not an integer: {raw!r}") from exc
+    if quantity < 1:
+        raise argparse.ArgumentTypeError("quantity must be a positive integer")
+    return quantity
+
+
 def validate_slug(slug: str) -> str:
     """Weather slug grammar as observed on the tape: ``tc-temp-<sta>high-YYYY-MM-DD-<bucket>``."""
     parts = slug.split("-")
@@ -172,6 +207,75 @@ def build_preview_order_body(*, slug: str, price: Decimal, outcome_side: str) ->
     if set(body) != ORDER_BODY_KEYS:
         raise ValueError("preview body key set drifted from the captured schema")
     return body
+
+
+def _wire_price_for_close(outcome: str, price: Decimal) -> Decimal:
+    """The wire ``price.value`` for a CLOSING order, via the SHIPPED
+    complement helper -- never re-derived here.
+
+    ``leg_prices.wire_price_for_leg`` already carries the ``1 - x`` flip for
+    the live NO buy (``exec/submit_chain.build_order_body``); importing it
+    keeps exactly one place in the repo doing that arithmetic. Local import:
+    this is the only function in the module that needs the adapter package,
+    and the dry run for the opening-buy modes above must stay import-free.
+    """
+    if outcome not in CLOSE_OUTCOME_SIDE:
+        raise ValueError(f"unknown outcome {outcome!r}; expected 'yes' or 'no'")
+    src_dir = REPO_ROOT / "src"
+    if str(src_dir) not in sys.path:
+        sys.path.insert(0, str(src_dir))
+    from breezy.adapters.polymarket_us.leg_prices import Leg, wire_price_for_leg
+
+    return wire_price_for_leg(cast(Leg, outcome), price)
+
+
+def build_close_order_body(
+    *, slug: str, price: Decimal, outcome: str, quantity: int
+) -> dict[str, Any]:
+    """The CLOSING create-order body: ``action=ORDER_ACTION_SELL``,
+    ``outcomeSide`` per ``outcome``, same 10-key schema as the opening buy.
+
+    ``price`` is the INSTRUMENT price (Nautilus convention, strictly inside
+    (0, 1)); see :func:`_wire_price_for_close` for the wire conversion.
+    """
+    if outcome not in CLOSE_OUTCOME_SIDE:
+        raise ValueError(f"unknown outcome {outcome!r}; expected 'yes' or 'no'")
+    wire_price = _wire_price_for_close(outcome, price)
+    body = {
+        "marketSlug": slug,
+        "type": ORDER_TYPE_LIMIT,
+        "price": {"value": f"{wire_price:.2f}", "currency": CURRENCY},
+        "quantity": quantity,
+        "tif": TIF_IOC,
+        "outcomeSide": CLOSE_OUTCOME_SIDE[outcome],
+        "action": ORDER_ACTION_SELL,
+        "manualOrderIndicator": MANUAL_AUTOMATIC,
+        "synchronousExecution": True,
+        "maxBlockTime": MAX_BLOCK_TIME,
+    }
+    if set(body) != ORDER_BODY_KEYS:
+        raise ValueError("close order body key set drifted from the captured schema")
+    return body
+
+
+def assert_preview_path_only(path: str) -> None:
+    """Refuse absolutely: every write this script issues must be exactly
+    ``PREVIEW_PATH``. Never creates, modifies, or cancels an order."""
+    if path != PREVIEW_PATH:
+        raise ValueError(f"refusing to send to {path!r}; only {PREVIEW_PATH!r} is permitted")
+
+
+def extract_order_echo(preview_record: Mapping[str, Any]) -> dict[str, Any]:
+    """Pull the venue's echoed ``order`` fields out of a preview response.
+
+    Returns an empty mapping (never raises) when the body did not parse to
+    the expected ``{"order": {...}}`` shape -- an unparsed or error response
+    is still a valid, recordable outcome for this capture.
+    """
+    response = preview_record.get("response")
+    body = response.get("body") if isinstance(response, dict) else None
+    order = body.get("order") if isinstance(body, dict) else None
+    return order if isinstance(order, dict) else {}
 
 
 def build_preview_envelope(order_body: Mapping[str, Any], *, unwrapped: bool) -> dict[str, Any]:
@@ -223,6 +327,10 @@ def utc_stamp(now: dt.datetime | None = None) -> str:
 
 def evidence_path(stamp: str) -> Path:
     return REPO_ROOT / EVIDENCE_DIRECTORY / f"{EVIDENCE_PREFIX}{stamp}.json"
+
+
+def close_evidence_path(outcome: str, stamp: str) -> Path:
+    return REPO_ROOT / EVIDENCE_DIRECTORY / f"{CLOSE_EVIDENCE_PREFIX}{outcome}_{stamp}.json"
 
 
 def write_evidence_excl(path: Path, text: str) -> None:
@@ -287,14 +395,40 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         help='Send the bare order body instead of the SDK {"request": ...} envelope.',
     )
     parser.add_argument(
+        "--close",
+        action="store_true",
+        help=(
+            "Capture a CLOSING order preview (action=ORDER_ACTION_SELL) against a "
+            "held position instead of a NO-side opening buy. Requires --outcome; "
+            "--outcome-side is ignored in this mode."
+        ),
+    )
+    parser.add_argument(
+        "--outcome",
+        default=None,
+        choices=("yes", "no"),
+        help="Held leg to close (--close only): 'yes' or 'no'.",
+    )
+    parser.add_argument(
+        "--quantity",
+        default=1,
+        type=parse_quantity,
+        help="Contracts to close (--close only); default 1.",
+    )
+    parser.add_argument(
         "--execute",
         action="store_true",
         help=(
-            "Perform the preview POST and the book GET. Without this flag "
-            "nothing leaves the host."
+            "Perform the preview POST (and, outside --close, the book GET). "
+            "Without this flag nothing leaves the host."
         ),
     )
-    return parser.parse_args(argv)
+    args = parser.parse_args(argv)
+    if args.close and args.outcome is None:
+        parser.error("--close requires --outcome {yes,no}")
+    if not args.close and args.outcome is not None:
+        parser.error("--outcome is only valid with --close")
+    return args
 
 
 # ---------------------------------------------------------------------------
@@ -409,6 +543,69 @@ async def _capture_live(args: argparse.Namespace, envelope: Mapping[str, Any]) -
     return {"preview": preview_record, "book": book_record, "_secrets": secrets}
 
 
+async def _capture_close_live(
+    args: argparse.Namespace, envelope: Mapping[str, Any]
+) -> dict[str, Any]:
+    """One preview POST for a CLOSING order. No book GET, no other write verb.
+
+    Adapter imports live here on purpose -- the dry run needs none of them.
+    """
+    scripts_venue = REPO_ROOT / "scripts" / "venue"
+    for entry in (REPO_ROOT / "src", scripts_venue):
+        if str(entry) not in sys.path:
+            sys.path.insert(0, str(entry))
+
+    from nautilus_trader.common.component import LiveClock
+    from nautilus_trader.core import nautilus_pyo3
+    from polymarket_us_auth_smoke import CredentialGuard, build_safe_excepthook, prepare
+
+    from breezy.adapters.polymarket_us.transport import QUOTA_KEY_PORTFOLIO, build_default_quota
+    from breezy.adapters.polymarket_us.write_transport import Ed25519WriteRequestSigner
+
+    guard = CredentialGuard()
+    sys.excepthook = build_safe_excepthook(guard)
+    prepared = prepare(os.environ, guard=guard)  # core dumps off -> enable gate -> creds
+    config = prepared.config
+    credentials = prepared.credentials
+    clock = LiveClock()
+
+    assert_preview_path_only(PREVIEW_PATH)
+    write_signer = Ed25519WriteRequestSigner(credentials, clock=clock)
+    signed = dict(write_signer.sign_headers(WRITE_METHOD, PREVIEW_PATH))
+    headers = {**signed, "Content-Type": "application/json", "User-Agent": str(config.user_agent)}
+    body = encode_body(envelope)
+    preview_record: dict[str, Any] = {
+        "request": request_record(
+            method=WRITE_METHOD,
+            base_url=config.api_base_url,
+            path=PREVIEW_PATH,
+            headers=headers,
+            body=body,
+        )
+    }
+    write_client = nautilus_pyo3.HttpClient(
+        default_headers={"User-Agent": str(config.user_agent)},
+        header_keys=[],
+        keyed_quotas=[],
+        default_quota=build_default_quota(config.global_requests_per_second),
+        timeout_secs=int(config.http_timeout_secs),
+    )
+    url = f"{config.api_base_url.rstrip('/')}{PREVIEW_PATH}"
+    try:
+        response = await write_client.post(
+            url, headers=headers, body=body, keys=[QUOTA_KEY_PORTFOLIO]
+        )
+        preview_record["response"] = {
+            "status": int(response.status),
+            "body": decode_response_body(bytes(response.body)),
+        }
+    except (nautilus_pyo3.HttpError, nautilus_pyo3.HttpTimeoutError) as exc:
+        preview_record["response"] = {"status": None, "error_type": type(exc).__name__}
+
+    secrets = [credentials.key_id.get_value(), credentials.secret_key.get_value()]
+    return {"preview": preview_record, "_secrets": secrets}
+
+
 def _assert_no_secret_material(text: str, secrets: Sequence[str]) -> None:
     """Fail closed: refuse to emit an artefact carrying any 4-char window of a secret."""
     for secret in secrets:
@@ -421,13 +618,18 @@ def _assert_no_secret_material(text: str, secrets: Sequence[str]) -> None:
 
 def main(argv: Sequence[str] | None = None) -> int:
     args = parse_args(argv)
-    order_body = build_preview_order_body(
-        slug=args.slug, price=args.price, outcome_side=args.outcome_side
-    )
+    if args.close:
+        order_body = build_close_order_body(
+            slug=args.slug, price=args.price, outcome=args.outcome, quantity=args.quantity
+        )
+    else:
+        order_body = build_preview_order_body(
+            slug=args.slug, price=args.price, outcome_side=args.outcome_side
+        )
     envelope = build_preview_envelope(order_body, unwrapped=args.unwrapped)
     stamp = utc_stamp()
 
-    dry = {
+    dry: dict[str, Any] = {
         "mode": "DRY_RUN" if not args.execute else "EXECUTE",
         "captured_at": stamp,
         "slug": args.slug,
@@ -443,10 +645,18 @@ def main(argv: Sequence[str] | None = None) -> int:
             },
             body=encode_body(envelope),
         ),
-        "book_request": {"method": READ_METHOD, "path": BOOK_PATH_TEMPLATE.format(slug=args.slug)},
         "writes_possible": ["POST " + PREVIEW_PATH],
         "creates_orders": False,
     }
+    if args.close:
+        dry["close"] = True
+        dry["outcome"] = args.outcome
+        dry["quantity"] = args.quantity
+    else:
+        dry["book_request"] = {
+            "method": READ_METHOD,
+            "path": BOOK_PATH_TEMPLATE.format(slug=args.slug),
+        }
     print(json.dumps(dry, indent=2, sort_keys=True))
     if not args.execute:
         print("dry run: no network call was made; pass --execute to capture.", file=sys.stderr)
@@ -454,19 +664,43 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     import asyncio
 
-    captured = asyncio.run(_capture_live(args, envelope))
-    secrets = captured.pop("_secrets")
-    document = {
-        "schema": "breezy.no_side_preview_capture.v1",
-        "captured_at": stamp,
-        "slug": args.slug,
-        "outcome_side": args.outcome_side,
-        "envelope": "unwrapped" if args.unwrapped else "sdk_request_wrapper",
-        **captured,
-    }
+    if args.close:
+        captured = asyncio.run(_capture_close_live(args, envelope))
+        secrets = captured.pop("_secrets")
+        order = extract_order_echo(captured["preview"])
+        document: dict[str, Any] = {
+            "schema": "breezy.close_preview_capture.v1",
+            "captured_at": stamp,
+            "slug": args.slug,
+            "outcome": args.outcome,
+            "quantity": args.quantity,
+            "envelope": "unwrapped" if args.unwrapped else "sdk_request_wrapper",
+            "echo": {
+                "intent": order.get("intent"),
+                "side": order.get("side"),
+                "outcomeSide": order_body["outcomeSide"],
+                "price": order.get("price"),
+                "state": order.get("state"),
+                "id": order.get("id"),
+            },
+            **captured,
+        }
+        path = close_evidence_path(args.outcome, stamp)
+    else:
+        captured = asyncio.run(_capture_live(args, envelope))
+        secrets = captured.pop("_secrets")
+        document = {
+            "schema": "breezy.no_side_preview_capture.v1",
+            "captured_at": stamp,
+            "slug": args.slug,
+            "outcome_side": args.outcome_side,
+            "envelope": "unwrapped" if args.unwrapped else "sdk_request_wrapper",
+            **captured,
+        }
+        path = evidence_path(stamp)
+
     text = json.dumps(document, indent=2, sort_keys=True) + "\n"
     _assert_no_secret_material(text, secrets)
-    path = evidence_path(stamp)
     write_evidence_excl(path, text)
     print(f"evidence written: {path}", file=sys.stderr)
     preview_status = document["preview"].get("response", {}).get("status")

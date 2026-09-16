@@ -24,16 +24,24 @@ diff, a review, a commit -- not a data edit (L-22: unforgeable exclusion).
 being set AND the family's id being named in this frozenset; either one
 alone is refused.
 
-Today the frozenset is EMPTY: no family may exit. Every currently
-registered and draft family (`pm_us_crh_v2`, `pm_us_crh_cont`,
-`kalshi_crh_v1`) holds to settlement, per PREREG v3 and plan
-`INTRADAY_POSITION_MONITOR_2026-09-15.md` §5 (the execution seam that would
-ever let a family act on this gate is itself BLOCKED, increment INC-9,
-pending the `unmappable_order_reason` widening and REDUCE_ONLY_BYPASS/R6A
-remediation landing together). The intra-day position monitor
-(`strategy/current_rung_hold/position_monitor.py`) is SHADOW-ONLY: it may
-consult this gate for reporting/decision-labelling purposes but must never
-construct, submit, modify, or cancel an order on the strength of it.
+The frozenset gains its first (and, as of this commit, only) member,
+`pm_us_crh_exit_v4`, per PREREG v4 (`docs/plans/
+POSITION_EXIT_EXECUTION_2026-09-16.md` §2, INC-E1): a change to the ACTION
+is a new family, never an amendment of `pm_us_crh_cont` (L-34). Every other
+currently registered or draft family (`pm_us_crh_v2`, `pm_us_crh_cont`,
+`kalshi_crh_v1`) still holds to settlement -- membership here alone grants
+nothing (see below): `pm_us_crh_exit_v4`'s own manifest
+(`deploy/families/pm_us_crh_exit_v4.json`) ships `status:
+DRAFT_NOT_REGISTERED` with NO `exit_rule` key at INC-E1, so
+`family_declares_exit_rule` still gates False for it until the manifest is
+amended to declare `exit_rule` at REGISTRATION (§2, INC-E4 enable). The
+execution seam that would ever let a family act on a True gate is itself
+BLOCKED through INC-E3 (`POSITION_EXIT_EXECUTION_2026-09-16.md` §3: "Nothing
+in E1-E3 can reach the venue: the gate stays closed until E4"). The intra-day
+position monitor (`strategy/current_rung_hold/position_monitor.py`) is
+SHADOW-ONLY: it may consult this gate for reporting/decision-labelling
+purposes but must never construct, submit, modify, or cancel an order on the
+strength of it.
 """
 
 from __future__ import annotations
@@ -44,7 +52,7 @@ from breezy.persistence.family_manifest import FamilyManifest
 
 __all__ = ["family_declares_exit_rule"]
 
-_EXIT_RULE_REGISTERED_FAMILIES: Final[frozenset[str]] = frozenset()
+_EXIT_RULE_REGISTERED_FAMILIES: Final[frozenset[str]] = frozenset({"pm_us_crh_exit_v4"})
 
 
 def family_declares_exit_rule(manifest: FamilyManifest) -> bool:

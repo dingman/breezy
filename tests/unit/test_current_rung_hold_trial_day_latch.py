@@ -737,6 +737,181 @@ class TestDuplicateFillAndFamilyHalt:
             assert latch.is_family_halted() is False
 
 
+class TestExitProvenanceAndAmbiguousHalt:
+    """INC-E3 (plan §3, PREREG v4 §5b/§10): ``record_exit`` and
+    ``record_ambiguous_exit``."""
+
+    def test_record_exit_attaches_provenance_to_an_existing_trial(
+        self, store_path: Path,
+    ) -> None:
+        with open_submit_intent_latch(SqliteStateStore(store_path), store_path) as intent_latch:
+            latch = open_trial_day_latch(intent_latch, key_prefix=CONTINUOUS_TRIAL_KEY_PREFIX)
+            latch.consume(
+                STATION,
+                CLIMATE_DAY,
+                latched_at_ns=NOW_NS,
+                instrument_id=INSTRUMENT_ID,
+                ask=Decimal("0.40"),
+                reason="taken",
+                key_instrument_id=INSTRUMENT_ID,
+            )
+            latch.record_exit(
+                STATION,
+                CLIMATE_DAY,
+                key_instrument_id=INSTRUMENT_ID,
+                exit_reason="R_DEAD",
+                exit_px=Decimal("0.05"),
+                exit_fee=Decimal("0.00"),
+                exit_at_ns=NOW_NS + 1,
+            )
+            record = latch.record(STATION, CLIMATE_DAY, key_instrument_id=INSTRUMENT_ID)
+        assert record is not None
+        # Entry fields carried forward byte-identical.
+        assert record.ask == Decimal("0.40")
+        assert record.reason == "taken"
+        # New exit provenance.
+        assert record.exit_reason == "R_DEAD"
+        assert record.exit_px == Decimal("0.05")
+        assert record.exit_fee == Decimal("0.00")
+        assert record.exit_at_ns == NOW_NS + 1
+
+    def test_record_exit_round_trips_through_to_bytes_and_from_bytes(
+        self, store_path: Path,
+    ) -> None:
+        with open_submit_intent_latch(SqliteStateStore(store_path), store_path) as intent_latch:
+            latch = open_trial_day_latch(intent_latch, key_prefix=CONTINUOUS_TRIAL_KEY_PREFIX)
+            latch.consume(
+                STATION,
+                CLIMATE_DAY,
+                latched_at_ns=NOW_NS,
+                instrument_id=INSTRUMENT_ID,
+                ask=Decimal("0.40"),
+                reason="taken",
+                key_instrument_id=INSTRUMENT_ID,
+            )
+            latch.record_exit(
+                STATION,
+                CLIMATE_DAY,
+                key_instrument_id=INSTRUMENT_ID,
+                exit_reason="R_THREAT",
+                exit_px=Decimal("0.55"),
+                exit_fee=Decimal("0.01"),
+                exit_at_ns=NOW_NS + 2,
+            )
+        # Fresh reopen over the SAME store file -- a genuine restart, not an
+        # in-process re-read.
+        with open_submit_intent_latch(SqliteStateStore(store_path), store_path) as intent_latch:
+            latch = open_trial_day_latch(intent_latch, key_prefix=CONTINUOUS_TRIAL_KEY_PREFIX)
+            record = latch.record(STATION, CLIMATE_DAY, key_instrument_id=INSTRUMENT_ID)
+        assert record is not None
+        assert record.exit_reason == "R_THREAT"
+        assert record.exit_px == Decimal("0.55")
+        assert record.exit_fee == Decimal("0.01")
+        assert record.exit_at_ns == NOW_NS + 2
+
+    def test_record_exit_refuses_a_station_day_with_no_existing_trial(
+        self, store_path: Path,
+    ) -> None:
+        with open_submit_intent_latch(SqliteStateStore(store_path), store_path) as intent_latch:
+            latch = open_trial_day_latch(intent_latch, key_prefix=CONTINUOUS_TRIAL_KEY_PREFIX)
+            with pytest.raises(TrialDayLatchError):
+                latch.record_exit(
+                    STATION,
+                    CLIMATE_DAY,
+                    key_instrument_id=INSTRUMENT_ID,
+                    exit_reason="R_DEAD",
+                    exit_px=Decimal("0.05"),
+                    exit_fee=Decimal("0.00"),
+                    exit_at_ns=NOW_NS,
+                )
+
+    def test_record_exit_refuses_an_exit_reason_outside_the_closed_set(
+        self, store_path: Path,
+    ) -> None:
+        with open_submit_intent_latch(SqliteStateStore(store_path), store_path) as intent_latch:
+            latch = open_trial_day_latch(intent_latch, key_prefix=CONTINUOUS_TRIAL_KEY_PREFIX)
+            latch.consume(
+                STATION,
+                CLIMATE_DAY,
+                latched_at_ns=NOW_NS,
+                instrument_id=INSTRUMENT_ID,
+                ask=Decimal("0.40"),
+                reason="taken",
+                key_instrument_id=INSTRUMENT_ID,
+            )
+            with pytest.raises(TrialDayInvalidReason):
+                latch.record_exit(
+                    STATION,
+                    CLIMATE_DAY,
+                    key_instrument_id=INSTRUMENT_ID,
+                    exit_reason="not_a_real_rule",
+                    exit_px=Decimal("0.05"),
+                    exit_fee=Decimal("0.00"),
+                    exit_at_ns=NOW_NS,
+                )
+
+    def test_record_ambiguous_exit_sets_the_same_family_halt_as_duplicate_fill(
+        self, store_path: Path,
+    ) -> None:
+        with open_submit_intent_latch(SqliteStateStore(store_path), store_path) as intent_latch:
+            latch = open_trial_day_latch(intent_latch, key_prefix=CONTINUOUS_TRIAL_KEY_PREFIX)
+            assert latch.is_family_halted() is False
+            latch.record_ambiguous_exit(
+                position_id="P-1", reason="order_rejected:test", ts_ns=NOW_NS,
+            )
+            assert latch.is_family_halted() is True
+        keys = _committed_keys(store_path)
+        assert FAMILY_HALT_KEY in keys
+
+    def test_record_ambiguous_exit_is_idempotent_once_already_halted(
+        self, store_path: Path,
+    ) -> None:
+        with open_submit_intent_latch(SqliteStateStore(store_path), store_path) as intent_latch:
+            latch = open_trial_day_latch(intent_latch, key_prefix=CONTINUOUS_TRIAL_KEY_PREFIX)
+            latch.record_duplicate_fill(
+                STATION,
+                CLIMATE_DAY,
+                venue_order_id="ord-dup-x",
+                qty=Decimal(1),
+                fill_px=Decimal("0.40"),
+                fee=Decimal("0.01"),
+                ts_ns=NOW_NS,
+            )
+            # A SECOND, different cause must never overwrite the FIRST halt
+            # payload (mirrors `record_duplicate_fill`'s own idempotency).
+            latch.record_ambiguous_exit(
+                position_id="P-1", reason="order_rejected:test", ts_ns=NOW_NS + 1,
+            )
+            assert latch.is_family_halted() is True
+        with sqlite3.connect(store_path) as conn:
+            row = conn.execute(
+                "SELECT value FROM state WHERE key = ?", (FAMILY_HALT_KEY,),
+            ).fetchone()
+        assert row is not None
+        assert b"duplicate_fill" in row[0]
+        assert b"ambiguous_exit" not in row[0]
+
+    def test_the_ambiguous_exit_halt_survives_a_process_restart(
+        self, store_path: Path,
+    ) -> None:
+        """The exact scenario `midday-relaunch` makes routine (memory:
+        `trade-node-dies-with-the-session`): the halt written by ONE process
+        must be observed as-is by a FRESH `TrialDayLatch`/`SqliteStateStore`
+        opened over the SAME on-disk store file, never re-derived from
+        in-memory state."""
+        with open_submit_intent_latch(SqliteStateStore(store_path), store_path) as intent_latch:
+            latch = open_trial_day_latch(intent_latch, key_prefix=CONTINUOUS_TRIAL_KEY_PREFIX)
+            latch.record_ambiguous_exit(
+                position_id="P-restart", reason="order_denied:test", ts_ns=NOW_NS,
+            )
+
+        # Simulates a process restart: a BRAND NEW SqliteStateStore instance
+        # and a brand new intent latch, over the same file on disk.
+        with open_submit_intent_latch(SqliteStateStore(store_path), store_path) as intent_latch:
+            restarted = open_trial_day_latch(intent_latch, key_prefix=CONTINUOUS_TRIAL_KEY_PREFIX)
+            assert restarted.is_family_halted() is True
+
+
 class TestDayBudgetExhausted:
     """Operator ruling 2026-09-14: the day-budget marker the exec client
     writes at ``BUDGET_EXHAUSTED_KEY_PREFIX + <UTC day>``."""

@@ -54,7 +54,7 @@ from __future__ import annotations
 import json
 import threading
 from collections.abc import Iterable
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from decimal import Decimal, InvalidOperation
 from typing import Final
 
@@ -142,6 +142,15 @@ _REASONS: Final[frozenset[str]] = frozenset(
     REFUSAL_REASONS | {"taken", TAKEN_FROM_FILL_WALK_REASON}
 )
 _SCHEMA_VERSION: Final[int] = 1
+
+#: The closed set of ``TrialDayRecord.exit_reason`` values (INC-E3, PREREG
+#: v4 §3b) -- the two registered exit rules, mirroring
+#: ``exit_authorization.ExitRule``'s own two members. Declared locally
+#: (never imported from ``exit_authorization.py``) for the same layering
+#: reason that module gives for declaring its own ``Leg`` locally: this
+#: module never imports the ``strategy``-layer exit types, only ever
+#: receives their ``.value`` strings from the caller.
+_EXIT_REASONS: Final[frozenset[str]] = frozenset({"R_THREAT", "R_DEAD"})
 
 #: A ``TrialDayRecord.reason`` counting as "this leg actually traded" for
 #: the two S4 gates below (plan NO_SIDE_EDGE_2026-09-14, N2-10/R3-7) --
@@ -431,6 +440,22 @@ class TrialDayRecord:
     #: pre-slice-4 record missing the key decodes as ``None`` ("q unknown"
     #: -- :func:`station_day_admission` refuses rather than guessing).
     fee: Decimal | None = None
+    #: INC-E3 (plan §3, PREREG v4 §5b/§10): the registered rule
+    #: (``"R_THREAT"``/``"R_DEAD"``) an exit fill on THIS trial was decided
+    #: under, when this station-day's position was exited mid-day. TRAILING
+    #: and OPTIONAL, same compat pattern as ``fee`` immediately above --
+    #: written only by :meth:`TrialDayLatch.record_exit`, ``None`` for every
+    #: trial never exited (which is every v2/v3 trial, and every v4 trial
+    #: that settles by holding).
+    exit_reason: str | None = None
+    #: The exit fill's own price, in the held leg's own price domain
+    #: (mirrors ``ask``'s convention) -- ``None`` unless ``exit_reason`` is set.
+    exit_px: Decimal | None = None
+    #: The exit fill's own per-contract fee -- ``None`` unless ``exit_reason``
+    #: is set.
+    exit_fee: Decimal | None = None
+    #: The exit fill's ``ts_event`` (ns) -- ``None`` unless ``exit_reason`` is set.
+    exit_at_ns: int | None = None
 
     def to_bytes(self) -> bytes:
         payload = {
@@ -441,6 +466,10 @@ class TrialDayRecord:
             "reason": self.reason,
             "venueOrderId": self.venue_order_id,
             "fee": str(self.fee) if self.fee is not None else None,
+            "exitReason": self.exit_reason,
+            "exitPx": str(self.exit_px) if self.exit_px is not None else None,
+            "exitFee": str(self.exit_fee) if self.exit_fee is not None else None,
+            "exitAtNs": self.exit_at_ns,
         }
         return json.dumps(payload, sort_keys=True).encode("utf-8")
 
@@ -490,6 +519,37 @@ class TrialDayRecord:
                 fee = Decimal(fee_raw)
             except InvalidOperation:
                 raise TrialDayRecordCorrupt() from None
+        # INC-E3: optional-on-read, same pattern as `fee`/`venueOrderId` above.
+        exit_reason_raw = payload.get("exitReason")
+        if exit_reason_raw is not None and not isinstance(exit_reason_raw, str):
+            raise TrialDayRecordCorrupt()
+        exit_px_raw = payload.get("exitPx")
+        if exit_px_raw is not None and not isinstance(exit_px_raw, str):
+            raise TrialDayRecordCorrupt()
+        exit_px: Decimal | None
+        if exit_px_raw is None:
+            exit_px = None
+        else:
+            try:
+                exit_px = Decimal(exit_px_raw)
+            except InvalidOperation:
+                raise TrialDayRecordCorrupt() from None
+        exit_fee_raw = payload.get("exitFee")
+        if exit_fee_raw is not None and not isinstance(exit_fee_raw, str):
+            raise TrialDayRecordCorrupt()
+        exit_fee: Decimal | None
+        if exit_fee_raw is None:
+            exit_fee = None
+        else:
+            try:
+                exit_fee = Decimal(exit_fee_raw)
+            except InvalidOperation:
+                raise TrialDayRecordCorrupt() from None
+        exit_at_ns_raw = payload.get("exitAtNs")
+        if exit_at_ns_raw is not None and (
+            isinstance(exit_at_ns_raw, bool) or not isinstance(exit_at_ns_raw, int)
+        ):
+            raise TrialDayRecordCorrupt()
         return cls(
             latched_at_ns=latched_at_ns,
             instrument_id=instrument_id,
@@ -497,6 +557,10 @@ class TrialDayRecord:
             reason=reason,
             venue_order_id=venue_order_id_raw,
             fee=fee,
+            exit_reason=exit_reason_raw,
+            exit_px=exit_px,
+            exit_fee=exit_fee,
+            exit_at_ns=exit_at_ns_raw,
         )
 
 
@@ -812,6 +876,92 @@ class TrialDayLatch:
             self._store.set(
                 FAMILY_HALT_KEY, json.dumps(halt_payload, sort_keys=True).encode("utf-8"),
             )
+
+    # -- INC-E3 (plan §3, PREREG v4 §3b/§5b): exit provenance + kill rule --
+
+    def record_exit(
+        self,
+        station: str,
+        climate_day: str,
+        *,
+        key_instrument_id: str,
+        exit_reason: str,
+        exit_px: Decimal,
+        exit_fee: Decimal,
+        exit_at_ns: int,
+    ) -> None:
+        """Durably attach exit provenance to an already-consumed trial.
+
+        Unlike :meth:`consume`/:meth:`consume_if_absent` (which write a
+        FRESH record), this OVERWRITES the existing ``TrialDayRecord`` for
+        ``(station, climate_day, key_instrument_id)`` via
+        ``dataclasses.replace`` -- the station-day's entry fields
+        (``ask``/``reason``/``venue_order_id``/``fee``) are carried forward
+        byte-identical; only the four ``exit_*`` fields change. Raises
+        :class:`TrialDayLatchError` if no record exists yet for this
+        station-day (an exit fill can only ever follow a genuine entry
+        fill -- attaching exit provenance to a station-day with no trial at
+        all is a caller defect, not a benign no-op) and
+        :class:`TrialDayInvalidReason` if ``exit_reason`` is outside the
+        closed :data:`_EXIT_REASONS` set.
+        """
+        self._require_held()
+        if exit_reason not in _EXIT_REASONS:
+            raise TrialDayInvalidReason(exit_reason)
+        existing = self.record_with_legacy_fallback(
+            station, climate_day, key_instrument_id=key_instrument_id,
+        )
+        if existing is None:
+            raise TrialDayLatchError(
+                f"record_exit: no trial-day record for {station}/{climate_day}/"
+                f"{key_instrument_id!r} -- an exit fill must join an already-"
+                "consumed trial"
+            )
+        updated = replace(
+            existing,
+            exit_reason=exit_reason,
+            exit_px=exit_px,
+            exit_fee=exit_fee,
+            exit_at_ns=exit_at_ns,
+        )
+        self._store.set(
+            self._trial_key(station, climate_day, key_instrument_id=key_instrument_id),
+            updated.to_bytes(),
+        )
+
+    def record_ambiguous_exit(
+        self,
+        *,
+        position_id: str,
+        reason: str,
+        ts_ns: int,
+    ) -> None:
+        """Durably set the FAMILY-wide halt for an AMBIGUOUS or rejected
+        exit order (plan §5.4, PREREG v4 §5b).
+
+        Writes the EXACT SAME durable state :meth:`record_duplicate_fill`
+        writes and :meth:`is_family_halted` reads -- no new mechanism, so
+        this is already enforced at every existing chokepoint
+        (``composition.py``'s ``family_halt_submit_veto``,
+        ``continuous_strategy.py``'s ``_hunt_tick``/``on_order_filled``) and
+        cleared only by :meth:`clear_family_halt` via the operator CLI.
+        Idempotent: if the family is already halted (by this or any other
+        cause), the existing halt payload is left untouched -- first cause
+        wins, mirroring :meth:`record_duplicate_fill`'s own idempotency.
+        """
+        self._require_held()
+        if self.is_family_halted():
+            return
+        halt_payload = {
+            "v": 1,
+            "reason": "ambiguous_exit",
+            "tsNs": ts_ns,
+            "positionId": position_id,
+            "detail": reason,
+        }
+        self._store.set(
+            FAMILY_HALT_KEY, json.dumps(halt_payload, sort_keys=True).encode("utf-8"),
+        )
 
     def is_family_halted(self) -> bool:
         """``True`` once :meth:`record_duplicate_fill` has ever fired for

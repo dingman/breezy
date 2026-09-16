@@ -10,14 +10,26 @@ addendum A1/A3), composing ``monitor_evidence.py``/``monitor_decision.py``/
 M7 D3 pin (never violate): holds NO reference to ``TrialDayLatch``'s
 mutating surface (only the read-only ``record`` accessor, as a plain
 callable); NEVER calls ``_hunt_tick``/``_maybe_submit``, reads, or pops
-``_decision_ask_by_station_day``; never constructs, submits, modifies, or
-cancels an order (D2/D3 -- SHADOW-ONLY). Accumulator access is limited to
+``_decision_ask_by_station_day``. Accumulator access is limited to
 ``value_at``/``staleness_ns`` -- never ``push``/``coverage``/
 ``earliest_observed_ns``.
 
 D8: every public method is wrapped so an internal failure is caught,
 counted (``monitor_errors``), and reported -- never raised into the
 strategy's own handler, never able to affect hunting/latch state.
+
+INC-E3 (``docs/plans/POSITION_EXIT_EXECUTION_2026-09-16.md`` §3, PREREG v4
+§3b/§5b): this object stays SHADOW-ONLY by DEFAULT -- ``exit_decider`` and
+``submit_exit`` both default to ``None``, in which case every evaluation
+behaves byte-identically to before this increment (D3's "never constructs,
+submits, modifies, or cancels an order" holds exactly as before). A caller
+that installs BOTH a decider and a ``submit_exit`` callable opts THIS ONE
+instance into evaluating (never constructing or submitting itself: that
+stays the injected ``submit_exit``'s job, owned by the strategy layer)
+whether the current evaluation authorises a 1-contract closing order --
+still never touching ``TrialDayLatch``'s mutating surface directly, and
+still never able to affect entry-side hunting/latch state (the exit path
+and the entry path share no state through this object).
 """
 
 from __future__ import annotations
@@ -34,6 +46,7 @@ from typing import TYPE_CHECKING
 from nautilus_trader.model.identifiers import InstrumentId
 
 from breezy.domain.season import season_for
+from breezy.strategy.current_rung_hold.exit_decider import ExitProposal, ExitRefusal
 from breezy.strategy.current_rung_hold.monitor_decision import (
     MonitorDecision,
     MonitorHistory,
@@ -52,6 +65,7 @@ from breezy.strategy.current_rung_hold.monitor_records import (
     PositionMonitorSummary,
 )
 from breezy.strategy.current_rung_hold.monitor_store import MarkBuffer, write_monitor_summaries
+from breezy.strategy.current_rung_hold.offer_tape import OfferTapeRecord
 from breezy.strategy.current_rung_hold.tick_eval import width_and_m
 from breezy.strategy.current_rung_hold.trial_day_latch import trial_id_for
 
@@ -60,8 +74,16 @@ if TYPE_CHECKING:  # pragma: no cover - typing only
     from nautilus_trader.model.position import Position
 
     from breezy.domain.weather_bucket_facts import WeatherBucketFacts
+    from breezy.persistence.family_manifest import FamilyManifest
     from breezy.strategy.current_rung_hold.trial_day_latch import TrialDayRecord
     from breezy.strategy.weather_common.running_extreme import RunningExtremeAccumulator
+
+#: The exit decider's full keyword signature (``exit_decider.decide_exit``)
+#: -- typed loosely here (``...``) rather than spelled out, mirroring this
+#: module's own existing callables (``latch_record: Callable[..., ...]``):
+#: the caller passes ``decide_exit`` itself or a test double with the same
+#: keyword surface.
+ExitDecider = Callable[..., "ExitProposal | ExitRefusal"]
 
 __all__ = ["PositionMonitor"]
 
@@ -88,6 +110,9 @@ class _MonitoredPosition:
     fill_px: Decimal
     p_hold_at_entry: Decimal | None
     opened_at_ns: int
+    #: INC-E3: the Nautilus ``PositionId`` string, needed by the exit
+    #: decider (``position_id``) and the strategy's own ``submit_exit``.
+    position_id: str = ""
     history: MonitorHistory = field(default_factory=lambda: MonitorHistory.EMPTY)
     last_depth: OrderBookDepth10 | None = None
     last_book_ts_ns: int | None = None
@@ -102,6 +127,70 @@ class _MonitoredPosition:
     verdict_at_signal: str | None = None
     recoverable_value_at_signal: Decimal | None = None
     monitor_seq: int = 0
+    #: INC-E3: the MOST RECENT exit decision for this position, tracked so
+    #: (a) the rate limit (``exit_decider._required_span_ns``) can be
+    #: enforced across evaluations and (b) the position-day summary can
+    #: report the latest decision even when it was refused.
+    last_exit_decided_at_ns: int | None = None
+    last_exit_rule: str | None = None
+    last_exit_decision: str | None = None
+    last_exit_reason_code: str | None = None
+    last_exit_limit_price: Decimal | None = None
+    last_exit_expected_settlement_value: Decimal | None = None
+
+
+def _exit_offer_tape_record(
+    monitored: _MonitoredPosition,
+    evidence: MonitorEvidence,
+    outcome: ExitProposal | ExitRefusal,
+    now_ns: int,
+) -> OfferTapeRecord:
+    """One offer-tape row per exit decision (INC-E3, plan §3 acceptance
+    item 8: "every exit decision -- fired or refused -- is persisted").
+
+    Reuses ``OfferTapeRecord`` (never a second row type) with ``trigger=
+    "exit"``/``source="position_monitor"`` as the discriminator from an
+    entry-hunt row: every entry-only field this row has no value for
+    (``size``, ``quote_age_ns``, ``minutes_since_window_open``,
+    ``prior_eligible_snaps``, ``illegal_cell``) takes its own type's
+    zero/empty default rather than a fabricated number.
+    """
+    fired = isinstance(outcome, ExitProposal)
+    if isinstance(outcome, ExitProposal):
+        rule_value: str | None = outcome.authorization.rule.value
+        limit_price = outcome.authorization.limit_price
+        expected_settlement_value = outcome.authorization.expected_settlement_value
+        reason_code = "fired"
+    else:
+        rule_value = outcome.rule.value if outcome.rule is not None else None
+        limit_price = None
+        expected_settlement_value = None
+        reason_code = outcome.reason
+    return OfferTapeRecord(
+        station=monitored.station,
+        climate_day=monitored.climate_day,
+        instrument_id=evidence.instrument_id,
+        ask=None,
+        size=0,
+        reason=("exit_fired" if fired else f"exit_refused:{reason_code}"),
+        ts_event=now_ns,
+        hour_lst=evidence.hour_lst,
+        width_code=evidence.cell_key[3],
+        m_code=evidence.cell_key[4],
+        trigger="exit",
+        quote_age_ns=None,
+        minutes_since_window_open=0,
+        prior_eligible_snaps=0,
+        illegal_cell=False,
+        source="position_monitor",
+        side=monitored.leg,
+        decision=("exit_fired" if fired else "exit_refused"),
+        exit_rule=rule_value,
+        exit_decision=("fired" if fired else "refused"),
+        exit_reason_code=reason_code,
+        exit_limit_price=limit_price,
+        expected_settlement_value=expected_settlement_value,
+    )
 
 
 class PositionMonitor:
@@ -130,6 +219,12 @@ class PositionMonitor:
         catalog_root: Path,
         summaries_dir: Path,
         report: Callable[[str, Mapping[str, object]], None],
+        exit_decider: ExitDecider | None = None,
+        exit_manifest: FamilyManifest | None = None,
+        exit_family_id: str | None = None,
+        exit_client_order_id_factory: Callable[[], str] | None = None,
+        submit_exit: Callable[[ExitProposal], None] | None = None,
+        record_exit_offer: Callable[[OfferTapeRecord], None] | None = None,
     ) -> None:
         self._clock_ns = clock_ns
         self._positions_open = positions_open
@@ -147,6 +242,16 @@ class PositionMonitor:
         self._catalog_root = catalog_root
         self._summaries_dir = summaries_dir
         self._report = report
+        #: INC-E3 (module docstring): every one of these five defaults to
+        #: `None` -- SHADOW-ONLY, byte-identical to before this increment,
+        #: unless a caller installs both `exit_decider` and `submit_exit`
+        #: (module docstring).
+        self._exit_decider = exit_decider
+        self._exit_manifest = exit_manifest
+        self._exit_family_id = exit_family_id
+        self._exit_client_order_id_factory = exit_client_order_id_factory
+        self._submit_exit = submit_exit
+        self._record_exit_offer = record_exit_offer
 
         self._positions: dict[str, _MonitoredPosition] = {}
         #: A3: negative `TrialDayRecord` lookups cached per (instrument_id,
@@ -155,6 +260,9 @@ class PositionMonitor:
         self._monitor_errors = 0
         self._evaluations = 0
         self._emitted = 0
+        #: INC-E3: exit orders fired this process, per (station, climate_day)
+        #: -- the per-station-day cap `exit_decider.decide_exit` enforces.
+        self._station_day_exit_counts: dict[tuple[str, str], int] = {}
 
     @property
     def counters(self) -> Mapping[str, int]:
@@ -278,6 +386,7 @@ class PositionMonitor:
             fill_px=fill_px,
             p_hold_at_entry=p_hold_at_entry,
             opened_at_ns=now_ns,
+            position_id=str(position.id),
         )
         self._positions[iid] = monitored
         return monitored
@@ -392,6 +501,72 @@ class PositionMonitor:
         if should_emit(decision, pre_history, now_ns):
             self._emit(monitored, iid, evidence, decision, now_ns)
 
+        self._maybe_decide_exit(monitored, evidence, decision, now_ns)
+
+    def _maybe_decide_exit(
+        self,
+        monitored: _MonitoredPosition,
+        evidence: MonitorEvidence,
+        decision: MonitorDecision,
+        now_ns: int,
+    ) -> None:
+        """INC-E3 (module docstring): a no-op unless BOTH ``exit_decider``
+        and the family/factory context were installed. Neither rule can
+        ever fire outside ``THREATENED``/``DEAD_BY_OBSERVATION`` (module
+        docstring's decider does that gating itself), so this method skips
+        the call entirely for every other state -- never floods the offer
+        tape/summary with a decision for an ``ALIVE``/``HOLD`` position.
+        """
+        if self._exit_decider is None:
+            return
+        if decision.state not in (ThesisState.THREATENED, ThesisState.DEAD_BY_OBSERVATION):
+            return
+        assert self._exit_manifest is not None
+        assert self._exit_family_id is not None
+        assert self._exit_client_order_id_factory is not None
+
+        station_day_key = (monitored.station, monitored.climate_day)
+        outcome = self._exit_decider(
+            decision,
+            evidence,
+            manifest=self._exit_manifest,
+            family_id=self._exit_family_id,
+            position_id=monitored.position_id,
+            client_order_id_factory=self._exit_client_order_id_factory,
+            last_exit_decided_at_ns_for_position=monitored.last_exit_decided_at_ns,
+            station_day_exit_count=self._station_day_exit_counts.get(station_day_key, 0),
+            fee_coefficient=self._fee_coefficient_for(evidence.instrument_id),
+            now_ns=now_ns,
+        )
+        fired = isinstance(outcome, ExitProposal)
+        monitored.last_exit_decision = "fired" if fired else "refused"
+        if isinstance(outcome, ExitProposal):
+            monitored.last_exit_rule = outcome.authorization.rule.value
+            monitored.last_exit_reason_code = "fired"
+            monitored.last_exit_limit_price = outcome.authorization.limit_price
+            monitored.last_exit_expected_settlement_value = (
+                outcome.authorization.expected_settlement_value
+            )
+        else:
+            monitored.last_exit_rule = outcome.rule.value if outcome.rule is not None else None
+            monitored.last_exit_reason_code = outcome.reason
+            monitored.last_exit_limit_price = None
+            monitored.last_exit_expected_settlement_value = None
+
+        # Persisted BEFORE any submit (hard invariant, plan §3 INC-E3):
+        # every exit decision -- fired or refused -- reaches the offer tape
+        # first.
+        if self._record_exit_offer is not None:
+            self._record_exit_offer(_exit_offer_tape_record(monitored, evidence, outcome, now_ns))
+
+        if isinstance(outcome, ExitProposal):
+            monitored.last_exit_decided_at_ns = now_ns
+            self._station_day_exit_counts[station_day_key] = (
+                self._station_day_exit_counts.get(station_day_key, 0) + 1
+            )
+            if self._submit_exit is not None:
+                self._submit_exit(outcome)
+
     def _emit(
         self,
         monitored: _MonitoredPosition,
@@ -452,4 +627,9 @@ class PositionMonitor:
             mark_missing_frames=monitored.mark_missing_frames,
             settled_pnl=None,
             settled_held=None,
+            exit_rule=monitored.last_exit_rule,
+            exit_decision=monitored.last_exit_decision,
+            exit_reason_code=monitored.last_exit_reason_code,
+            exit_limit_price=monitored.last_exit_limit_price,
+            expected_settlement_value=monitored.last_exit_expected_settlement_value,
         )

@@ -153,6 +153,7 @@ from breezy.adapters.polymarket_us.errors import ExecutionReportMappingError
 from breezy.adapters.polymarket_us.leg_prices import (
     Leg,
     assert_echo_matches_leg,
+    assert_exit_echo_matches_leg,
     instrument_price_for_leg,
 )
 from breezy.adapters.polymarket_us.parsing import (
@@ -746,23 +747,37 @@ def _leg_price_decimal_field(
 
 
 def _order_side_for_leg(
-    order: Mapping[str, Any], *, leg: Leg, context: str
+    order: Mapping[str, Any], *, leg: Leg, context: str, closing: bool = False
 ) -> OrderSide:
     """Rev 5 (E5-2): a NO-leg order is executed by the venue as a sale of
     the YES side (see ``leg_prices.VENUE_SIDE_FOR_LEG``/``VENUE_INTENT_
     FOR_LEG`` for the exact declared values); Breezy never shorts
-    (``allow_short=False``), so the NATIVE report's ``order_side`` is
+    (``allow_short=False``), so an OPENING report's ``order_side`` is
     derived from the order's OWN leg -- always BUY -- never forwarded from
     the venue's ``side`` text. The venue's echo is cross-checked (never
     trusted as the source of truth) and any disagreement in EITHER
-    direction is refused."""
+    direction is refused.
+
+    INC-E2 (``POSITION_EXIT_EXECUTION_2026-09-16.md`` §3, response-side leg
+    check): ``closing=True`` selects the DISJOINT closing-order echo table
+    (:func:`leg_prices.assert_exit_echo_matches_leg`) instead, and the
+    derived side is ``SELL`` -- every closing order Breezy sends reduces a
+    long, never opens one. A closing report echoed against the OPENING
+    table (or vice versa) is refused exactly like a wrong-leg echo: the two
+    tables never accept each other's ``(side, intent)`` pair, so an entry
+    response carrying a close echo -- or a close response carrying an entry
+    echo -- raises here rather than being silently mis-attributed.
+    """
     side_raw = _require(order, "side", context=context)
     intent_raw = _require(order, "intent", context=context)
     try:
-        assert_echo_matches_leg(leg, side_raw, intent_raw)
+        if closing:
+            assert_exit_echo_matches_leg(leg, side_raw, intent_raw)
+        else:
+            assert_echo_matches_leg(leg, side_raw, intent_raw)
     except ValueError as exc:
         raise ExecutionReportMappingError(str(exc)) from exc
-    return OrderSide.BUY
+    return OrderSide.SELL if closing else OrderSide.BUY
 
 
 def _assert_market_matches(slug: object, *, instrument: Instrument, context: str) -> None:
@@ -1177,6 +1192,7 @@ def parse_fill_report(
     account_id: AccountId,
     report_id: UUID4,
     ts_init: int,
+    closing: bool = False,
 ) -> FillReport:
     """Map an ``Execution`` (``types/orders.py:95-108``) to the native report.
 
@@ -1196,6 +1212,12 @@ def parse_fill_report(
     because this message is DURABLE: SP-2's I3 persists it into the resolver
     context store, and ``_require`` permits ``type`` to be any JSON value, so
     an unbounded or nested one must never be echoed whole (SEC-H1).
+
+    ``closing`` (INC-E2, default ``False`` -- byte-unchanged for every
+    existing entry-path caller): forwarded to :func:`_order_side_for_leg`
+    so a closing order's response is checked against the disjoint exit echo
+    table and reports ``order_side=OrderSide.SELL``, instead of the
+    entry-only BUY table always refusing it.
     """
     context = "fill report"
     execution = _known_keys_with_full_tree(
@@ -1225,7 +1247,7 @@ def parse_fill_report(
         order.get("marketSlug"), instrument=instrument, context=order_context
     )
     leg = leg_of(instrument.id)
-    order_side = _order_side_for_leg(order, leg=leg, context=order_context)
+    order_side = _order_side_for_leg(order, leg=leg, context=order_context, closing=closing)
 
     _assert_taker_fill(execution, context=context)
 

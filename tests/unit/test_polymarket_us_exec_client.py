@@ -125,7 +125,11 @@ from breezy.adapters.polymarket_us.operator_controls import (
     DailySpendLedger,
     utc_day_for_ns,
 )
-from breezy.adapters.polymarket_us.parsing import FEE_COEFFICIENT_KEY, parse_binary_option
+from breezy.adapters.polymarket_us.parsing import (
+    FEE_COEFFICIENT_KEY,
+    parse_binary_option,
+    parse_binary_option_pair,
+)
 from breezy.adapters.polymarket_us.safety import (
     LiveTradingPermissionError,
     issue_live_trading_permit,
@@ -133,6 +137,13 @@ from breezy.adapters.polymarket_us.safety import (
 )
 from breezy.adapters.polymarket_us.symbology import POLYMARKET_US_VENUE
 from breezy.adapters.polymarket_us.transport import VenueResponse
+from breezy.persistence.exit_tags import (
+    EXIT_CLIENT_ORDER_ID_TAG_PREFIX,
+    EXIT_FAMILY_TAG_PREFIX,
+    EXIT_POSITION_TAG_PREFIX,
+    EXIT_RULE_TAG_PREFIX,
+)
+from breezy.persistence.family_manifest import FamilyManifest
 from breezy.runtime.sqlite_store import SqliteStateStore
 from breezy.runtime.submit_intent import (
     RetirementReason,
@@ -141,6 +152,7 @@ from breezy.runtime.submit_intent import (
 )
 from tests.unit.operator_control_env import operator_control_env
 from tests.unit.polymarket_us_exec_shapes import (
+    RAW,
     TS_EVENT_TEXT,
     build_execution,
     build_instrument,
@@ -170,6 +182,42 @@ TRADER_ID: Final[TraderId] = TraderId("BREEZY-R4-001")
 STRATEGY_ID: Final[StrategyId] = StrategyId("WEATHER-001")
 CLIENT_ID: Final[ClientId] = ClientId("POLYMARKET_US")
 ACCOUNT_NUMBER: Final[str] = "001"
+
+_ZERO_SHA256: Final[str] = "0" * 64
+
+
+def _family_manifest(*, family_id: str, exit_rule: str | None) -> FamilyManifest:
+    """INC-E2c: a manifest built directly (never `load_family_manifest`,
+    which reads a real file) -- only `family_id`/`exit_rule` vary across the
+    tests below; every other field is a well-formed placeholder."""
+    return FamilyManifest(
+        family_id=family_id,
+        venue="polymarket_us",
+        trial_id_prefix="current_rung_hold/trial/",
+        d0_climate_day="2026-09-01",
+        boundary_artefact_path=Path("deploy/families/placeholder.json"),
+        boundary_inputs_sha256=_ZERO_SHA256,
+        stations=("KSFO",),
+        status="REGISTERED",
+        manifest_sha256=_ZERO_SHA256,
+        exit_rule=exit_rule,
+    )
+
+
+#: The LIVE configuration (module docstring of `persistence/exit_gate.py`):
+#: `pm_us_crh_cont` is not `_EXIT_RULE_REGISTERED_FAMILIES`-registered AND
+#: declares no `exit_rule` -- the gate is closed either way.
+LIVE_UNARMED_MANIFEST: Final[FamilyManifest] = _family_manifest(
+    family_id="pm_us_crh_cont", exit_rule=None,
+)
+
+#: The TEST-ONLY armed configuration: the one family
+#: `persistence/exit_gate.py._EXIT_RULE_REGISTERED_FAMILIES` names, with a
+#: manifest that also declares `exit_rule` -- `family_declares_exit_rule`
+#: gates `True`.
+ARMED_EXIT_MANIFEST: Final[FamilyManifest] = _family_manifest(
+    family_id="pm_us_crh_exit_v4", exit_rule="R_THREAT",
+)
 
 #: A ``GetAccountBalancesResponse`` with a spendable USD balance. The literals
 #: are bare JSON numbers because the venue types the private money fields as
@@ -2096,12 +2144,78 @@ class _AcceptFillRig:
             ts_init=TS_INIT,
         )
 
+    def limit_sell(self, *, price: str = "0.37") -> SubmitOrder:
+        """An UNTAGGED SELL-side order -- a naked short, never an exit
+        (INC-E2c: an exit order carries the ``exit_rule=`` tag,
+        :meth:`limit_exit_sell`). `submit_chain.unmappable_order_reason`
+        refuses every non-BUY, untagged order, byte-unchanged. Callers that
+        need this to reach `_submit_order`'s ACCEPT_FILL branch must
+        monkeypatch that ONE gate off for the duration of the test, to
+        isolate the (in-scope) fill-accounting fix from the (out-of-scope,
+        unmodified) mappability gate."""
+        factory = OrderFactory(trader_id=TRADER_ID, strategy_id=STRATEGY_ID, clock=self.clock)
+        order = factory.limit(
+            instrument_id=self.instrument.id,
+            order_side=OrderSide.SELL,
+            quantity=Quantity(1, self.instrument.size_precision),
+            price=Price.from_str(price),
+            time_in_force=TimeInForce.IOC,
+        )
+        return SubmitOrder(
+            trader_id=TRADER_ID,
+            strategy_id=STRATEGY_ID,
+            order=order,
+            command_id=UUID4(),
+            ts_init=TS_INIT,
+        )
+
+    def limit_exit_sell(
+        self,
+        *,
+        price: str = "0.37",
+        rule: str = "R_THREAT",
+        family_id: str = "pm_us_crh_exit_v4",
+        position_id: str = "pos-exit-1",
+        client_order_id_value: str = "O-EXIT-1",
+        instrument: Any | None = None,
+    ) -> SubmitOrder:
+        """INC-E2c: a properly exit-tagged SELL, the exact shape
+        `exit_wiring.submit_exit` constructs (four ``exit_*=`` tags, plus
+        ``client_order_id`` pinned to the SAME value the tag carries).
+        ``instrument`` defaults to the rig's own (YES-leg) instrument; a
+        caller proving the NO leg passes the NO-leg instrument explicitly
+        (and must register it on the rig's cache itself first)."""
+        target_instrument = self.instrument if instrument is None else instrument
+        factory = OrderFactory(trader_id=TRADER_ID, strategy_id=STRATEGY_ID, clock=self.clock)
+        order = factory.limit(
+            instrument_id=target_instrument.id,
+            order_side=OrderSide.SELL,
+            quantity=Quantity(1, target_instrument.size_precision),
+            price=Price.from_str(price),
+            time_in_force=TimeInForce.IOC,
+            tags=[
+                f"{EXIT_RULE_TAG_PREFIX}{rule}",
+                f"{EXIT_POSITION_TAG_PREFIX}{position_id}",
+                f"{EXIT_FAMILY_TAG_PREFIX}{family_id}",
+                f"{EXIT_CLIENT_ORDER_ID_TAG_PREFIX}{client_order_id_value}",
+            ],
+            client_order_id=ClientOrderId(client_order_id_value),
+        )
+        return SubmitOrder(
+            trader_id=TRADER_ID,
+            strategy_id=STRATEGY_ID,
+            order=order,
+            command_id=UUID4(),
+            ts_init=TS_INIT,
+        )
+
 
 def _build_accept_fill_rig(
     tmp_path: Path,
     *,
     monkeypatch: pytest.MonkeyPatch,
     sender: _FakeOrderSender | None = None,
+    exit_manifest: FamilyManifest | None = None,
 ) -> _AcceptFillRig:
     """The R-7 full stack: a real client, a real `SqliteStateStore`, a real
     submit-intent latch, and a fake `post_order` -- the same shape
@@ -2173,6 +2287,7 @@ def _build_accept_fill_rig(
         credentials=credentials(),
         api_base_url="https://api.polymarket.us",
         retirement_reasons=RetirementReason,
+        exit_manifest=exit_manifest,
     )
     return _AcceptFillRig(
         client=client,
@@ -2699,6 +2814,529 @@ async def test_the_durable_record_decodes_with_the_venue_fee_and_the_reconciled_
     assert record.cumulative_cost == Decimal("0.37")
     assert record.cumulative_fee == Decimal("0.03")
     assert record.fee_reconciled is True
+
+
+# ---------------------------------------------------------------------------
+# INC-E2 (POSITION_EXIT_EXECUTION_2026-09-16.md §3): fill accounting takes
+# the order's REAL side, and an exit-side order never touches the daily
+# budget. No exit order can reach `_submit_order` yet --
+# `submit_chain.unmappable_order_reason` refuses every non-BUY order,
+# byte-unchanged (INC-E2b/E3 build the exit seam that reaches this
+# mappable) -- so every test below monkeypatches that ONE gate off, for
+# this test only, to isolate the fill-accounting/budget fix under test.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_a_sell_side_accept_fill_books_sell_not_buy_and_never_debits_the_budget(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    write_canonical_verified: None,  # noqa: F811
+) -> None:
+    """RED (pre-INC-E2): the durable record and the native `OrderFilled`
+    both hardcoded BUY (`LONG_ONLY_SIDE` / `OrderSide.BUY`) regardless of
+    the order's real side, and `authorize_order_cost` ran unconditionally.
+    GREEN: a SELL-side fill books SELL both places, nets to a negative
+    signed quantity via the existing `_RECORD_SIGNS` table, and the daily
+    ledger is untouched -- `authorize_order_cost` is never even called."""
+    monkeypatch.setattr(submit_chain, "unmappable_order_reason", lambda order, instrument: None)
+    ledger = DailySpendLedger()
+    authorize_calls: list[Any] = []
+    original_authorize = DailySpendLedger.authorize_order_cost
+
+    def _spy_authorize(self_: DailySpendLedger, **kwargs: Any) -> Any:
+        authorize_calls.append(kwargs)
+        return original_authorize(self_, **kwargs)
+
+    monkeypatch.setattr(DailySpendLedger, "authorize_order_cost", _spy_authorize)
+
+    sender = _FakeOrderSender()
+    rig = _build_accept_fill_rig(tmp_path, monkeypatch=monkeypatch, sender=sender)
+    rig.client._ledger = ledger
+    slug = _slug(rig.instrument)
+    order_id = "ord-e2-sell"
+    sender.response = VenueResponse(
+        status=200, headers={}, body=_accept_fill_body(slug, order_id=order_id),
+    )
+
+    with _accept_fill_caps():
+        await rig.client._connect()
+        await rig.client._submit_order(rig.limit_sell())
+        now_ns = rig.clock.timestamp_ns()
+        await rig.client._disconnect()
+
+    assert authorize_calls == [], "a SELL-side order must never call authorize_order_cost"
+    assert ledger.spent_today_usd(now_ns=now_ns) == Decimal(0), (
+        "an exit fill must never debit the daily (gross entry spend) counter"
+    )
+
+    record = _reopened_fill_record(rig.store_path, order_id)
+    assert record is not None
+    assert record.order_side == "SELL"
+    assert client_module._RECORD_SIGNS[record.order_side] * record.cumulative_qty == Decimal(-1)
+
+    fills = [event for event in rig.order_events if isinstance(event, OrderFilled)]
+    assert len(fills) == 1
+    assert fills[0].order_side == OrderSide.SELL
+
+
+@pytest.mark.asyncio
+async def test_a_buy_side_accept_fill_still_books_buy_and_still_debits_the_budget(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    write_canonical_verified: None,  # noqa: F811
+) -> None:
+    """The BUY path must stay byte-identical after INC-E2: this is the same
+    assertion shape as the SELL test above, mirrored for a BUY, so a future
+    change to the shared code path is caught on both sides at once."""
+    ledger = DailySpendLedger()
+    sender = _FakeOrderSender()
+    rig = _build_accept_fill_rig(tmp_path, monkeypatch=monkeypatch, sender=sender)
+    rig.client._ledger = ledger
+    slug = _slug(rig.instrument)
+    order_id = "ord-e2-buy"
+    sender.response = VenueResponse(
+        status=200, headers={}, body=_accept_fill_body(slug, order_id=order_id, last_px="0.37"),
+    )
+
+    with _accept_fill_caps():
+        await rig.client._connect()
+        await rig.client._submit_order(rig.limit_buy())
+        now_ns = rig.clock.timestamp_ns()
+        await rig.client._disconnect()
+
+    assert ledger.spent_today_usd(now_ns=now_ns) == Decimal("0.37")
+
+    record = _reopened_fill_record(rig.store_path, order_id)
+    assert record is not None
+    assert record.order_side == "BUY"
+    assert client_module._RECORD_SIGNS[record.order_side] * record.cumulative_qty == Decimal(1)
+
+    fills = [event for event in rig.order_events if isinstance(event, OrderFilled)]
+    assert len(fills) == 1
+    assert fills[0].order_side == OrderSide.BUY
+
+
+# ---------------------------------------------------------------------------
+# INC-E2c: wiring the exec client to the exit seam
+# (`docs/plans/POSITION_EXIT_EXECUTION_2026-09-16.md` §3 INC-E2, live-tree
+# path). `limit_exit_sell` builds the exact tag shape
+# `exit_wiring.submit_exit` constructs; these tests drive `_submit_order`
+# end to end, never calling `submit_chain` directly (that seam is pinned by
+# `test_polymarket_us_exit_submit_chain_2026_09_16.py`).
+# ---------------------------------------------------------------------------
+
+
+def _no_leg_instrument() -> BinaryOption:
+    """The NO-leg sibling of `polymarket_us_exec_shapes.build_instrument`,
+    from the SAME captured market file, via the pair parser."""
+    payload = json.loads(
+        (RAW / "market_open_510636_by_slug.json").read_text(encoding="utf-8")
+    )
+    _yes, no = parse_binary_option_pair(payload, ts_init=TS_INIT)
+    assert no is not None
+    return no
+
+
+@pytest.mark.asyncio
+async def test_an_authorised_yes_exit_maps_and_sends_through_the_same_seam_as_a_buy(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    write_canonical_verified: None,  # noqa: F811
+) -> None:
+    sender = _FakeOrderSender()
+    rig = _build_accept_fill_rig(
+        tmp_path, monkeypatch=monkeypatch, sender=sender, exit_manifest=ARMED_EXIT_MANIFEST,
+    )
+    with _accept_fill_caps():
+        await rig.client._connect()
+        await rig.client._submit_order(rig.limit_exit_sell(price="0.55"))
+        await rig.client._disconnect()
+
+    assert len(sender.calls) == 1, "an authorised exit must reach the ONE sanctioned egress call"
+    sent_body = json.loads(sender.calls[0]["body"])
+    assert sent_body["action"] == "ORDER_ACTION_SELL"
+    assert sent_body["outcomeSide"] == "OUTCOME_SIDE_YES"
+    assert sent_body["price"] == {"value": "0.55", "currency": "USD"}
+    assert sent_body["quantity"] == 1
+
+    denials = [event for event in rig.order_events if isinstance(event, OrderDenied)]
+    assert denials == []
+
+
+@pytest.mark.asyncio
+async def test_an_authorised_no_exit_maps_with_the_complemented_price(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    write_canonical_verified: None,  # noqa: F811
+) -> None:
+    """NO at instrument price 0.09 -> wire price 0.91 (matches
+    `test_polymarket_us_exit_submit_chain_2026_09_16.py`'s pin at the
+    `submit_chain` layer -- this proves the SAME translation survives the
+    exec-client wiring)."""
+    sender = _FakeOrderSender()
+    rig = _build_accept_fill_rig(
+        tmp_path, monkeypatch=monkeypatch, sender=sender, exit_manifest=ARMED_EXIT_MANIFEST,
+    )
+    no_instrument = _no_leg_instrument()
+    rig.client._cache.add_instrument(no_instrument)
+
+    with _accept_fill_caps():
+        await rig.client._connect()
+        await rig.client._submit_order(
+            rig.limit_exit_sell(price="0.09", instrument=no_instrument)
+        )
+        await rig.client._disconnect()
+
+    assert len(sender.calls) == 1
+    sent_body = json.loads(sender.calls[0]["body"])
+    assert sent_body["action"] == "ORDER_ACTION_SELL"
+    assert sent_body["outcomeSide"] == "OUTCOME_SIDE_NO"
+    assert sent_body["price"] == {"value": "0.91", "currency": "USD"}
+
+    denials = [event for event in rig.order_events if isinstance(event, OrderDenied)]
+    assert denials == []
+
+
+@pytest.mark.asyncio
+async def test_an_untagged_sell_is_still_refused_as_a_naked_short_byte_identical(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    write_canonical_verified: None,  # noqa: F811
+) -> None:
+    """No exit tags -> the plain (BUY-only) path, unchanged: the exact same
+    reason `test_no_side_submit_chain_2026_09_14.py` pins at the
+    `submit_chain` layer, now proven at the exec-client boundary too."""
+    sender = _FakeOrderSender()
+    rig = _build_accept_fill_rig(
+        tmp_path, monkeypatch=monkeypatch, sender=sender, exit_manifest=ARMED_EXIT_MANIFEST,
+    )
+    command = rig.limit_sell()
+    expected_reason = submit_chain.unmappable_order_reason(command.order, rig.instrument)
+    assert expected_reason == "only a BUY is mappable (a SELL is a naked short); refusing"
+
+    with _accept_fill_caps():
+        await rig.client._connect()
+        await rig.client._submit_order(command)
+        await rig.client._disconnect()
+
+    assert sender.calls == []
+    denials = [event for event in rig.order_events if isinstance(event, OrderDenied)]
+    assert len(denials) == 1
+    assert denials[0].reason == expected_reason
+
+
+@pytest.mark.asyncio
+async def test_a_tagged_exit_is_denied_when_the_live_manifest_declares_no_exit_rule(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    write_canonical_verified: None,  # noqa: F811
+) -> None:
+    """The LIVE configuration (`persistence/exit_gate.py` module docstring):
+    `pm_us_crh_cont` declares no `exit_rule`, so the gate stays closed and
+    `_submit_order` never reaches `self._order_sender.post_order` at all --
+    the seam ships unarmed."""
+    sender = _FakeOrderSender()
+    rig = _build_accept_fill_rig(
+        tmp_path, monkeypatch=monkeypatch, sender=sender, exit_manifest=LIVE_UNARMED_MANIFEST,
+    )
+    command = rig.limit_exit_sell(family_id="pm_us_crh_cont")
+
+    with _accept_fill_caps():
+        await rig.client._connect()
+        await rig.client._submit_order(command)
+        await rig.client._disconnect()
+
+    assert sender.calls == [], "the LIVE (unarmed) manifest must never let an exit reach transport"
+    denials = [event for event in rig.order_events if isinstance(event, OrderDenied)]
+    assert len(denials) == 1
+    assert denials[0].reason == "family does not declare a registered exit rule; refusing"
+
+
+def _exit_shaped_body_with_echo(
+    slug: str, *, order_id: str, side: str, intent: str, last_px: str = "0.37"
+) -> bytes:
+    """The SAME accept-fill shape `_accept_fill_body` builds, with the
+    nested order's `side`/`intent` overridden -- so the venue's ECHO can be
+    driven independently of the order Breezy actually sent. `last_px`
+    (INC-E2, additive default -- every existing caller stays at "0.37")
+    drives the wire price independently too, so a NO-leg close's pinned
+    0.99 wire (0.01 instrument price) can be built the same way."""
+    order = build_order(slug)
+    order["id"] = order_id
+    order["quantity"] = 1
+    order["cumQuantity"] = 1
+    order["leavesQuantity"] = 0
+    order["state"] = "ORDER_STATE_FILLED"
+    order["price"] = {"value": last_px, "currency": "USD"}
+    order["avgPx"] = {"value": last_px, "currency": "USD"}
+    order["side"] = side
+    order["intent"] = intent
+    execution = build_execution(order)
+    execution["lastShares"] = "1"
+    execution["lastPx"] = {"value": last_px, "currency": "USD"}
+    execution["commissionNotionalCollected"] = {"value": "0.03", "currency": "USD"}
+    return json.dumps({"id": order_id, "executions": [execution]}).encode("utf-8")
+
+
+@pytest.mark.asyncio
+async def test_an_exit_fill_with_a_mismatched_venue_echo_never_accepts(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    write_canonical_verified: None,  # noqa: F811
+) -> None:
+    """`reports.py._order_side_for_leg` is byte-unchanged (plan's pinned
+    test #1) and still unconditionally applies the BUY-table echo
+    (`VENUE_SIDE_FOR_LEG`/`VENUE_INTENT_FOR_LEG`) to every fill it parses,
+    entry or exit. A venue echo that matches NEITHER table -- here, the
+    NO-leg CLOSE pair (`ORDER_SIDE_SELL`, `ORDER_INTENT_SELL_SHORT`) echoed
+    for a YES-leg exit -- fails the mapper's cross-check and the outcome
+    stays `KIND_AMBIGUOUS`: never an `OrderFilled`, and the AMBIGUOUS
+    refusal is latched. (Making a CORRECTLY-echoed exit fill classify as
+    `KIND_ACCEPT_FILL` needs `reports.py` to become exit-aware -- out of
+    this increment's file list; see the return's open question.)"""
+    slug = _slug(build_instrument())
+    order_id = "ord-exit-echo-1"
+    sender = _FakeOrderSender()
+    sender.response = VenueResponse(
+        status=200,
+        headers={},
+        body=_exit_shaped_body_with_echo(
+            slug, order_id=order_id, side="ORDER_SIDE_SELL", intent="ORDER_INTENT_SELL_SHORT",
+        ),
+    )
+    rig = _build_accept_fill_rig(
+        tmp_path, monkeypatch=monkeypatch, sender=sender, exit_manifest=ARMED_EXIT_MANIFEST,
+    )
+
+    with _accept_fill_caps():
+        await rig.client._connect()
+        await rig.client._submit_order(rig.limit_exit_sell(price="0.37"))
+        await rig.client._disconnect()
+
+    assert len(sender.calls) == 1, "the well-formed, authorised exit still reaches the venue"
+    fills = [event for event in rig.order_events if isinstance(event, OrderFilled)]
+    assert fills == [], "a mismatched exit echo must never accept a fill"
+    assert submit_chain.AMBIGUOUS_REASON in rig.client.trading_refusals
+
+
+# ---------------------------------------------------------------------------
+# INC-E2 gap close: `reports.py`/`classify_create_order_outcome` are now
+# exit-aware (`closing=is_exit_order`, threaded from `_submit_order`'s own
+# tag-derived flag). A CORRECTLY-echoed exit fill now accepts instead of
+# staying the AMBIGUOUS residual the docstring above describes.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_an_authorised_yes_exit_with_the_pinned_echo_now_accepts(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    write_canonical_verified: None,  # noqa: F811
+) -> None:
+    slug = _slug(build_instrument())
+    order_id = "ord-exit-yes-accept-1"
+    sender = _FakeOrderSender()
+    sender.response = VenueResponse(
+        status=200,
+        headers={},
+        body=_exit_shaped_body_with_echo(
+            slug, order_id=order_id, side="ORDER_SIDE_SELL", intent="ORDER_INTENT_SELL_LONG",
+        ),
+    )
+    rig = _build_accept_fill_rig(
+        tmp_path, monkeypatch=monkeypatch, sender=sender, exit_manifest=ARMED_EXIT_MANIFEST,
+    )
+
+    with _accept_fill_caps():
+        await rig.client._connect()
+        await rig.client._submit_order(rig.limit_exit_sell(price="0.37"))
+        await rig.client._disconnect()
+
+    assert len(sender.calls) == 1
+    fills = [event for event in rig.order_events if isinstance(event, OrderFilled)]
+    assert len(fills) == 1, "a correctly-echoed YES close must accept the fill"
+    assert fills[0].order_side == OrderSide.SELL
+    assert submit_chain.AMBIGUOUS_REASON not in rig.client.trading_refusals
+
+    record = _reopened_fill_record(rig.store_path, order_id)
+    assert record is not None
+    assert record.order_side == "SELL"
+    assert client_module._RECORD_SIGNS[record.order_side] * record.cumulative_qty == Decimal(-1)
+
+
+@pytest.mark.asyncio
+async def test_an_authorised_no_exit_with_the_pinned_mirrored_echo_now_accepts(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    write_canonical_verified: None,  # noqa: F811
+) -> None:
+    """NO close: request instrument price 0.01 -> wire 0.99 (the SAME
+    complement `test_an_authorised_no_exit_maps_with_the_complemented_price`
+    proves on the request side); the response echoes the pinned
+    ``(ORDER_SIDE_BUY, ORDER_INTENT_SELL_SHORT)`` mirror pair at that same
+    wire price, and now accepts at the decoded instrument price 0.01."""
+    no_instrument = _no_leg_instrument()
+    slug = str(no_instrument.raw_symbol)
+    order_id = "ord-exit-no-accept-1"
+    sender = _FakeOrderSender()
+    sender.response = VenueResponse(
+        status=200,
+        headers={},
+        body=_exit_shaped_body_with_echo(
+            slug,
+            order_id=order_id,
+            side="ORDER_SIDE_BUY",
+            intent="ORDER_INTENT_SELL_SHORT",
+            last_px="0.99",
+        ),
+    )
+    rig = _build_accept_fill_rig(
+        tmp_path, monkeypatch=monkeypatch, sender=sender, exit_manifest=ARMED_EXIT_MANIFEST,
+    )
+    rig.client._cache.add_instrument(no_instrument)
+
+    with _accept_fill_caps():
+        await rig.client._connect()
+        await rig.client._submit_order(
+            rig.limit_exit_sell(price="0.01", instrument=no_instrument)
+        )
+        await rig.client._disconnect()
+
+    assert len(sender.calls) == 1
+    sent_body = json.loads(sender.calls[0]["body"])
+    assert sent_body["price"] == {"value": "0.99", "currency": "USD"}
+
+    fills = [event for event in rig.order_events if isinstance(event, OrderFilled)]
+    assert len(fills) == 1, "a correctly-echoed NO close must accept the fill"
+    assert fills[0].order_side == OrderSide.SELL
+    assert fills[0].last_px == Price.from_str("0.01")
+    assert submit_chain.AMBIGUOUS_REASON not in rig.client.trading_refusals
+
+    record = _reopened_fill_record(rig.store_path, order_id)
+    assert record is not None
+    assert record.order_side == "SELL"
+    assert client_module._RECORD_SIGNS[record.order_side] * record.cumulative_qty == Decimal(-1)
+
+
+@pytest.mark.asyncio
+async def test_a_no_exit_echoed_with_the_wrong_side_stays_ambiguous(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    write_canonical_verified: None,  # noqa: F811
+) -> None:
+    """The NO-close echo's ``side`` is ``BUY``; a ``SELL`` on the same
+    ``SELL_SHORT`` intent matches neither table and must never accept."""
+    no_instrument = _no_leg_instrument()
+    slug = str(no_instrument.raw_symbol)
+    order_id = "ord-exit-no-wrong-side-1"
+    sender = _FakeOrderSender()
+    sender.response = VenueResponse(
+        status=200,
+        headers={},
+        body=_exit_shaped_body_with_echo(
+            slug,
+            order_id=order_id,
+            side="ORDER_SIDE_SELL",
+            intent="ORDER_INTENT_SELL_SHORT",
+            last_px="0.99",
+        ),
+    )
+    rig = _build_accept_fill_rig(
+        tmp_path, monkeypatch=monkeypatch, sender=sender, exit_manifest=ARMED_EXIT_MANIFEST,
+    )
+    rig.client._cache.add_instrument(no_instrument)
+
+    with _accept_fill_caps():
+        await rig.client._connect()
+        await rig.client._submit_order(
+            rig.limit_exit_sell(price="0.01", instrument=no_instrument)
+        )
+        await rig.client._disconnect()
+
+    assert len(sender.calls) == 1
+    fills = [event for event in rig.order_events if isinstance(event, OrderFilled)]
+    assert fills == [], "a wrong-side NO-close echo must never accept a fill"
+    assert submit_chain.AMBIGUOUS_REASON in rig.client.trading_refusals
+
+
+class _YieldingOrderSender(_FakeOrderSender):
+    """Like `_FakeOrderSender`, but yields to the event loop once before
+    resolving -- so a SECOND `_submit_order` task, created before this one
+    finishes, gets a chance to run its own prefix (through the SAME-tick
+    `arm()`/`is_latched()` re-check SAFETY C1 describes) while THIS one is
+    suspended, rather than running the two to completion back to back."""
+
+    async def post_order(
+        self, base_url: str, *, headers: Mapping[str, str], body: bytes,
+    ) -> VenueResponse:
+        # Inlined rather than `await super().post_order(...)`: B9
+        # (`test_polymarket_us_readonly_guard.py`) pins `post_order` to
+        # EXACTLY one repo-wide call site
+        # (`exec/client.py::_submit_order`) by scanning for the CALL, not
+        # the definition -- a second named call site here, even to this
+        # fake's own base class, would widen that pin.
+        await asyncio.sleep(0)
+        self.calls.append({"base_url": base_url, "headers": dict(headers), "body": body})
+        return self.response
+
+
+@pytest.mark.asyncio
+async def test_an_open_entry_intent_refuses_a_concurrent_exit(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    write_canonical_verified: None,  # noqa: F811
+) -> None:
+    """SAFETY C1's account-wide `SubmitIntentLatch` singleton is NOT
+    re-checked per side (`exit_wiring.submit_exit`'s own docstring): a
+    concurrently-submitted exit, created before the entry's own `arm()` ->
+    `post_order` round trip resolves, observes `is_latched() is True` and
+    is denied as a WAIT -- exactly like a second entry would be -- rather
+    than reaching the venue itself."""
+    sender = _YieldingOrderSender()
+    rig = _build_accept_fill_rig(
+        tmp_path, monkeypatch=monkeypatch, sender=sender, exit_manifest=ARMED_EXIT_MANIFEST,
+    )
+
+    with _accept_fill_caps():
+        await rig.client._connect()
+        entry_task = asyncio.create_task(rig.client._submit_order(rig.limit_buy()))
+        exit_task = asyncio.create_task(rig.client._submit_order(rig.limit_exit_sell()))
+        await asyncio.gather(entry_task, exit_task)
+        await rig.client._disconnect()
+
+    assert len(sender.calls) == 1, "only the entry reaches transport; the exit is a WAIT, not sent"
+    denials = [event for event in rig.order_events if isinstance(event, OrderDenied)]
+    assert len(denials) == 1
+    assert denials[0].client_order_id == rig.limit_exit_sell().order.client_order_id
+    assert denials[0].reason == submit_chain.OPEN_INTENT_WAIT_REASON
+
+
+@pytest.mark.asyncio
+async def test_an_open_exit_intent_refuses_a_concurrent_entry(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    write_canonical_verified: None,  # noqa: F811
+) -> None:
+    """The reverse of the test above: a concurrently-submitted entry,
+    created before the exit's own round trip resolves, is refused as a
+    WAIT instead of reaching the venue."""
+    sender = _YieldingOrderSender()
+    rig = _build_accept_fill_rig(
+        tmp_path, monkeypatch=monkeypatch, sender=sender, exit_manifest=ARMED_EXIT_MANIFEST,
+    )
+
+    with _accept_fill_caps():
+        await rig.client._connect()
+        exit_task = asyncio.create_task(rig.client._submit_order(rig.limit_exit_sell()))
+        entry_task = asyncio.create_task(rig.client._submit_order(rig.limit_buy()))
+        await asyncio.gather(exit_task, entry_task)
+        await rig.client._disconnect()
+
+    assert len(sender.calls) == 1, "only the exit reaches transport; the entry is a WAIT, not sent"
+    denials = [event for event in rig.order_events if isinstance(event, OrderDenied)]
+    assert len(denials) == 1
+    assert denials[0].reason == submit_chain.OPEN_INTENT_WAIT_REASON
 
 
 # (b2) B0-c: the create-path record carries the venue's own tradeId and the
@@ -3241,6 +3879,43 @@ def test_a_resolver_context_written_before_this_change_still_decodes() -> None:
     assert round_tripped.fill_parse_error is None
 
 
+def test_a_resolver_context_written_before_order_side_still_decodes_as_buy() -> None:
+    """INC-E2: same AR-N6 shape as the test above, for the new `order_side`
+    field. An old blob (no `orderSide` key -- every order this client had
+    ever built was a BUY) decodes to `LONG_ONLY_SIDE`; a new row round-trips
+    whatever real side it was given, including `SELL`."""
+    old_blob = json.dumps(
+        {
+            "intentId": "intent-old-side",
+            "venueOrderId": "venue-old-side",
+            "instrumentId": "instrument-old-side",
+            "clientOrderId": "client-old-side",
+            "strategyId": "strategy-old-side",
+            "notionalUsd": "1.00",
+            "bookingId": 9,
+            "createdNs": TS_INIT,
+        },
+        sort_keys=True,
+    ).encode("utf-8")
+
+    old_context = AmbiguousResolverContext.from_bytes(old_blob)
+    assert old_context.order_side == client_module.LONG_ONLY_SIDE
+
+    sell_context = AmbiguousResolverContext(
+        intent_id="intent-new-sell",
+        venue_order_id="venue-new-sell",
+        instrument_id="instrument-new-sell",
+        client_order_id="client-new-sell",
+        strategy_id="strategy-new-sell",
+        notional_usd=Decimal("1.00"),
+        booking_id=10,
+        created_ns=TS_INIT,
+        order_side="SELL",
+    )
+    round_tripped = AmbiguousResolverContext.from_bytes(sell_context.to_bytes())
+    assert round_tripped.order_side == "SELL"
+
+
 # ---------------------------------------------------------------------------
 # S0 (plan rev 3, R3-1) -- boot-seed the ledger and permit budget from
 # today's durable fills, between `_reconcile_submit_intent` and
@@ -3616,3 +4291,71 @@ async def test_a_resolver_fill_discovered_after_midnight_seeds_the_discovery_day
         "a resolver-path fill discovered after midnight must seed the "
         "DISCOVERY day, never the (unknown) day the fill actually happened"
     )
+
+
+# ---------------------------------------------------------------------------
+# INC-E2: the resolver path (`_resolve_accept_fill`) takes the durable
+# context's own `order_side`, never the entry-only `LONG_ONLY_SIDE` /
+# `OrderSide.BUY` hardcodes.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_a_resolver_accept_fill_books_the_contexts_real_order_side(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    write_canonical_verified: None,  # noqa: F811
+) -> None:
+    """RED (pre-INC-E2): the resolver always recorded `LONG_ONLY_SIDE` /
+    `OrderSide.BUY`, regardless of what a durable `AmbiguousResolverContext`
+    named. GREEN: a context carrying `order_side="SELL"` books SELL in both
+    the durable record and the native `OrderFilled`."""
+    sender = _FakeOrderSender()
+    rig = _build_accept_fill_rig(tmp_path, monkeypatch=monkeypatch, sender=sender)
+    order_id = "ord-e2-resolver-sell"
+    sender.response = VenueResponse(status=200, headers={}, body=_ambiguous_with_id_body(order_id))
+
+    with _accept_fill_caps():
+        await rig.client._connect()
+        # Only the latch needs to be armed and OPEN; the initiating order's
+        # own side is irrelevant to this test -- `_resolve_accept_fill`
+        # reads the durable context's `order_side`, built manually below,
+        # never the order that armed the intent.
+        await rig.client._submit_order(rig.limit_buy())
+
+        assert rig.client._latch is not None
+        current = rig.client._latch.current_open()
+        assert current is not None, "the with-id AMBIGUOUS outcome must leave OPEN"
+
+        instrument = rig.instrument
+        now_ns = rig.clock.timestamp_ns()
+        context = AmbiguousResolverContext(
+            intent_id=current.intent_id,
+            venue_order_id=order_id,
+            instrument_id=str(instrument.id),
+            client_order_id="O-does-not-matter",
+            strategy_id=str(STRATEGY_ID.value),
+            notional_usd=Decimal("0.40"),
+            booking_id=1,
+            created_ns=now_ns,
+            order_side="SELL",
+        )
+        rig.client._resolved_by_get_ts_ns[current.intent_id] = now_ns
+        rig.client._ambiguous_bookings.pop(current.intent_id, None)
+
+        rig.client._resolve_accept_fill(
+            context, _FakeResolverAcceptFillReport(), instrument, now_ns,
+        )
+
+        await rig.client._disconnect()
+
+    record = _reopened_fill_record(rig.store_path, order_id)
+    assert record is not None
+    assert record.order_side == "SELL"
+
+    fills = [event for event in rig.order_events if isinstance(event, OrderFilled)]
+    # The initiating `rig.limit_buy()` submit classified with-id AMBIGUOUS
+    # (`_ambiguous_with_id_body`), which never emits an `OrderFilled` --
+    # every fill event here comes from `_resolve_accept_fill` above.
+    assert len(fills) == 1
+    assert fills[0].order_side == OrderSide.SELL

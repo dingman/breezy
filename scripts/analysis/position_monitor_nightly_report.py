@@ -30,6 +30,30 @@ change" warns against), so `_profit_factor`/`_max_drawdown` below are
 authored as small pure functions over the ordered dollar-PnL sequence
 instead -- a genuine, narrow GAP in the native surface for this input
 shape, not a declined native capability.
+
+INC-E5 (`docs/plans/POSITION_EXIT_EXECUTION_2026-09-16.md` Sec 1/3, plan
+row "How the measurement reads"): three further DESCRIPTIVE series, keyed
+per registered exit rule (`R_THREAT`/`R_DEAD`) plus a `SETTLED` hold
+-control -- realized pnl, avoided loss and a per-rule premature-exit rate.
+Same D2/D6 isolation as every other series in this module: NEVER an
+LD-OBF/tally input, and `RuleSeries.armed`/`.family` state plainly, from
+`persistence/exit_gate.family_declares_exit_rule` (the code-registered
+gate, never a manifest field alone), whether the underlying rule has ever
+been allowed to submit a real order -- `False` for every family today,
+since PREREG v4 (`pm_us_crh_exit_v4`) has not yet registered `exit_rule`
+(plan Sec 2, INC-E1..E4: "Nothing in E1-E3 can reach the venue"). UNITS:
+these three series are PER-CONTRACT throughout (mirrors `ScoredTrial.pnl`),
+never the TOTAL-POSITION-dollar convention `AvoidedLossSummary`/
+`_realized_vs_mark_delta` use above -- deliberate, because every
+`ExitAuthorization` closes exactly 1 contract (plan Sec 1), so a
+per-contract figure is the one this seam's data model supports without
+inventing a partial-fill allocation this increment never measures. A
+`ScoredTrial` (`settlement/trial_scorer.py`) carries no exit provenance of
+its own (`trial_day_latch.TrialDayRecord.exit_reason`/`exit_px`/`exit_fee`
+live on the trial-day record, not the scorer's output) -- this increment
+therefore joins on `PositionMonitorSummary`'s OWN `exit_rule`/
+`exit_decision`/`exit_limit_price` fields (INC-E3) instead, and reads the
+entry fee from the joined `ScoredTrial.fee` when one exists.
 """
 
 from __future__ import annotations
@@ -50,8 +74,14 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from archive_correction_probe import wilson_interval
 
+from breezy.persistence.exit_gate import family_declares_exit_rule
+from breezy.persistence.family_manifest import FamilyManifest, load_family_manifest
 from breezy.persistence.scored_trial_store import read_scored_trials
 from breezy.settlement.trial_scorer import ScoredTrial
+from breezy.strategy.current_rung_hold.config import CurrentRungHoldConfig
+from breezy.strategy.current_rung_hold.monitor_evidence import (
+    exit_fee as _per_contract_exit_fee,
+)
 from breezy.strategy.current_rung_hold.monitor_records import (
     PositionMonitorSummary,
 )
@@ -62,6 +92,7 @@ from breezy.strategy.current_rung_hold.monitor_store import (
 __all__ = [
     "DEFAULT_N_MIN",
     "MonitorReport",
+    "RuleSeries",
     "build_monitor_report",
     "main",
 ]
@@ -74,6 +105,23 @@ DEFAULT_N_MIN: Final[int] = 90
 #: Rev 2.1 addendum A4, PROVISIONAL: below this many usable INC-8
 #: station-days, every hysteresis/LOCKED constant stays UNCALIBRATED.
 CALIBRATION_FLOOR_STATION_DAYS: Final[int] = 30
+
+#: INC-E5: the two registered exit rules (PREREG v4 Sec 1) `PositionMonitorSummary
+#: .exit_rule` can name, plus the synthetic `SETTLED` hold-control group for
+#: every joined row a decider never fired an exit for.
+_EXIT_RULES: Final[tuple[str, ...]] = ("R_THREAT", "R_DEAD")
+_SETTLED_GROUP: Final[str] = "SETTLED"
+#: The one family this report has ever covered to date; used only as the
+#: `RuleSeries.family` label when no explicit `FamilyManifest` is supplied
+#: (`main`'s `--family-manifest` is optional). Never influences `armed`,
+#: which is `False` whenever no manifest is supplied, regardless of this
+#: label.
+_DEFAULT_MONITORED_FAMILY_ID: Final[str] = "pm_us_crh_cont"
+#: Same per-contract fee coefficient `decision.py`/`monitor_evidence.py`
+#: already require (`CurrentRungHoldConfig.required_fee_coefficient`) --
+#: read from that ONE source rather than re-declaring `Decimal("0.06")`
+#: here, so this report can never silently drift from the live schedule.
+_FEE_COEFFICIENT: Final[Decimal] = CurrentRungHoldConfig().required_fee_coefficient
 
 _VERDICT_ORDER: Final[tuple[str, ...]] = (
     "HOLD",
@@ -191,6 +239,39 @@ class AvoidedLossSummary:
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
+class RuleSeries:
+    """INC-E5: one §1 DESCRIPTIVE series for one exit rule (or `SETTLED`).
+
+    NEVER an LD-OBF/tally input (module docstring). `armed`/`family` say
+    plainly whether this rule has ever been allowed to submit a real order
+    (`persistence/exit_gate.family_declares_exit_rule`) -- until it has,
+    every number here is shadow/counterfactual. See the module docstring's
+    INC-E5 paragraph for the per-contract unit convention.
+    """
+
+    rule: str
+    armed: bool
+    family: str
+    n: int
+    n_excluded_missing_price_or_fee: int
+    realized_pnl_total: Decimal
+    avoided_loss_total: Decimal
+    premature_exit_rate: WilsonEstimate
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "rule": self.rule,
+            "armed": self.armed,
+            "family": self.family,
+            "n": self.n,
+            "n_excluded_missing_price_or_fee": self.n_excluded_missing_price_or_fee,
+            "realized_pnl_total": str(self.realized_pnl_total),
+            "avoided_loss_total": str(self.avoided_loss_total),
+            "premature_exit_rate": self.premature_exit_rate.to_dict(),
+        }
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
 class OneSidedBookRate:
     rate: float | None
     mark_missing_frames: int
@@ -268,6 +349,9 @@ class MonitorReport:
     realized_vs_mark_delta: DecimalRangeSummary
     n_gated: NGatedMetrics
     calibration: CalibrationStatus
+    #: INC-E5: keyed by `"R_THREAT"`, `"R_DEAD"`, `"SETTLED"` -- see
+    #: `RuleSeries` and the module docstring's INC-E5 paragraph.
+    exit_rule_series: Mapping[str, RuleSeries]
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -295,6 +379,9 @@ class MonitorReport:
             "realized_vs_mark_delta": self.realized_vs_mark_delta.to_dict(),
             "n_gated": self.n_gated.to_dict(),
             "calibration": self.calibration.to_dict(),
+            "exit_rule_series": {
+                rule: series.to_dict() for rule, series in self.exit_rule_series.items()
+            },
         }
 
 
@@ -316,6 +403,12 @@ class _Joined:
     trial_id: str
     verdict_at_signal: str | None
     settlement_source: str
+    #: INC-E5: the joined `ScoredTrial.fee` (entry leg, per-contract) when
+    #: `settlement_source == _SOURCE_SCORED_TRIAL`. `None` for the INC-8
+    #: hypothetical corpus (`_SOURCE_SUMMARY`), which never carries a
+    #: separate entry-fee figure -- excluded from `RuleSeries` pricing
+    #: rather than guessed (see `_realized_pnl_per_contract`).
+    entry_fee: Decimal | None
 
 
 def _count_by(
@@ -356,6 +449,7 @@ def _join(
                     trial_id=summary.trial_id,
                     verdict_at_signal=summary.verdict_at_signal,
                     settlement_source=_SOURCE_SCORED_TRIAL,
+                    entry_fee=trial.fee,
                 )
             )
             continue
@@ -369,6 +463,7 @@ def _join(
                     trial_id=summary.trial_id,
                     verdict_at_signal=summary.verdict_at_signal,
                     settlement_source=_SOURCE_SUMMARY,
+                    entry_fee=None,
                 )
             )
             continue
@@ -446,6 +541,90 @@ def _avoided_loss(joined: Sequence[_Joined]) -> AvoidedLossSummary:
         total += row.summary.recoverable_value_at_signal - settled_pnl_total
         included += 1
     return AvoidedLossSummary(total=total, n_included=included, n_excluded_missing_mark=excluded)
+
+
+def _rule_group(summary: PositionMonitorSummary) -> str:
+    """Which INC-E5 group `summary` belongs to.
+
+    A row belongs to its own most-recent FIRED exit rule only when that
+    rule is one of the two PREREG v4 registers (`_EXIT_RULES`); every other
+    row -- including every row before INC-E3 (backward compat: `exit_rule`
+    defaults to `None`) and every REFUSED decision -- falls to the
+    `SETTLED` hold-control group, since it was, in fact, held to
+    settlement.
+    """
+    if summary.exit_decision == "fired" and summary.exit_rule in _EXIT_RULES:
+        return summary.exit_rule
+    return _SETTLED_GROUP
+
+
+def _realized_pnl_per_contract(row: _Joined, group: str) -> Decimal | None:
+    """The realized-pnl side of INC-E5's comparison, per contract.
+
+    `SETTLED` (never exited): realized IS the settlement outcome --
+    `row.settled_pnl` unchanged (so `avoided_loss` is trivially 0 for every
+    `SETTLED` row, by construction, never a special case below).
+
+    A FIRED exit: `exit_limit_price` (the authorised, shadow/counterfactual
+    close -- pre-arming, no real fill exists) minus the exit's own
+    per-contract fee, minus the entry `fill_px` and its own per-contract
+    fee. `None` (excluded, never guessed) when either the authorised price
+    or the joined entry fee is unavailable.
+    """
+    if group == _SETTLED_GROUP:
+        return row.settled_pnl
+    exit_price = row.summary.exit_limit_price
+    if exit_price is None or row.entry_fee is None:
+        return None
+    fee_on_exit = _per_contract_exit_fee(exit_price, 1, _FEE_COEFFICIENT)
+    return exit_price - fee_on_exit - row.summary.fill_px - row.entry_fee
+
+
+def _exit_rule_series(
+    joined: Sequence[_Joined], *, family_manifest: FamilyManifest | None
+) -> dict[str, RuleSeries]:
+    """Build the three INC-E5 `RuleSeries` (`R_THREAT`, `R_DEAD`, `SETTLED`).
+
+    `armed` is `False` unconditionally when no manifest is supplied, and
+    otherwise exactly `family_declares_exit_rule(family_manifest)` for the
+    two real exit-rule groups -- `SETTLED` is never "armed" (it names the
+    absence of an exit, not a rule that could fire).
+    """
+    family = (
+        family_manifest.family_id if family_manifest is not None else _DEFAULT_MONITORED_FAMILY_ID
+    )
+    gate_open = family_manifest is not None and family_declares_exit_rule(family_manifest)
+
+    series: dict[str, RuleSeries] = {}
+    for group in (*_EXIT_RULES, _SETTLED_GROUP):
+        is_exit_group = group != _SETTLED_GROUP
+        rows = [row for row in joined if _rule_group(row.summary) == group]
+
+        realized_total = Decimal(0)
+        avoided_total = Decimal(0)
+        n_excluded = 0
+        for row in rows:
+            realized = _realized_pnl_per_contract(row, group)
+            if realized is None:
+                n_excluded += 1
+                continue
+            realized_total += realized
+            avoided_total += realized - row.settled_pnl
+
+        premature_k = sum(1 for row in rows if row.settled_held) if is_exit_group else 0
+        premature_n = len(rows) if is_exit_group else 0
+
+        series[group] = RuleSeries(
+            rule=group,
+            armed=gate_open and is_exit_group,
+            family=family,
+            n=len(rows),
+            n_excluded_missing_price_or_fee=n_excluded,
+            realized_pnl_total=realized_total,
+            avoided_loss_total=avoided_total,
+            premature_exit_rate=_wilson_estimate(premature_k, premature_n),
+        )
+    return series
 
 
 def _one_sided_book(summaries: Sequence[PositionMonitorSummary]) -> OneSidedBookRate:
@@ -571,6 +750,7 @@ def build_monitor_report(
     *,
     n_min: int = DEFAULT_N_MIN,
     usable_station_days: int | None = None,
+    family_manifest: FamilyManifest | None = None,
 ) -> MonitorReport:
     """Build the nightly report purely from already-read `summaries`/`scored_trials`.
 
@@ -610,6 +790,9 @@ def build_monitor_report(
         realized_vs_mark_delta=_realized_vs_mark_delta(joined),
         n_gated=_n_gated_metrics(joined, n_min=n_min),
         calibration=_calibration_status(usable_station_days),
+        exit_rule_series=MappingProxyType(
+            _exit_rule_series(joined, family_manifest=family_manifest)
+        ),
     )
 
 
@@ -645,6 +828,16 @@ def _render_markdown(report: MonitorReport) -> str:
         f"calibration: {calibration_word} -- {report.calibration.reason}",
         "",
     ]
+    for group in (*_EXIT_RULES, _SETTLED_GROUP):
+        rule_series = report.exit_rule_series[group]
+        lines.append(
+            f"{group}: ARMED: {rule_series.armed} family: {rule_series.family} "
+            f"n={rule_series.n} realized_pnl_total={rule_series.realized_pnl_total} "
+            f"avoided_loss_total={rule_series.avoided_loss_total} "
+            f"premature_exit_rate point={rule_series.premature_exit_rate.point} "
+            f"n={rule_series.premature_exit_rate.n}"
+        )
+    lines.append("")
     return "\n".join(lines)
 
 
@@ -667,6 +860,14 @@ def main(argv: Sequence[str] | None = None) -> int:
         "--corpus-summary", type=Path, default=None,
         help='optional INC-8 corpus summary JSON: {"usable_station_days": int}',
     )
+    parser.add_argument(
+        "--family-manifest", type=Path, default=None,
+        help=(
+            "optional deploy/families/<family>.json path, so the INC-E5 "
+            "RuleSeries lines can report a real armed/family label instead "
+            "of the default"
+        ),
+    )
     args = parser.parse_args(argv)
 
     summaries = read_monitor_summaries(args.summaries_dir)
@@ -677,11 +878,19 @@ def main(argv: Sequence[str] | None = None) -> int:
         payload = json.loads(args.corpus_summary.read_text())
         usable_station_days = int(payload["usable_station_days"])
 
+    family_manifest: FamilyManifest | None = None
+    if args.family_manifest is not None:
+        # `allow_draft=True`: a DRAFT_NOT_REGISTERED manifest (e.g. today's
+        # `pm_us_crh_exit_v4.json`) must still load so its `armed=False`
+        # state can be reported, never refused just for being unregistered.
+        family_manifest = load_family_manifest(args.family_manifest, allow_draft=True)
+
     report = build_monitor_report(
         summaries,
         scored_trials,
         n_min=args.n_min,
         usable_station_days=usable_station_days,
+        family_manifest=family_manifest,
     )
 
     args.out.parent.mkdir(parents=True, exist_ok=True)

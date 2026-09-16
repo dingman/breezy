@@ -975,6 +975,78 @@ def test_classify_create_order_outcome_books_a_sub_cent_fill() -> None:
     assert outcome.cumulative_fee == Decimal("0.004")
 
 
+# ---------------------------------------------------------------------------
+# INC-E2 response-side leg check: `classify_create_order_outcome(...,
+# closing=True)` wiring. Per-leg pins live at the `parse_fill_report` level
+# (`test_polymarket_us_exec_reports.py`); these prove the SAME `closing` flag
+# reaches this classifier and flips the residual AMBIGUOUS into ACCEPT_FILL
+# for a correctly-echoed close, without touching the `closing=False` default
+# every test above this line already exercises.
+# ---------------------------------------------------------------------------
+
+
+def _closing_accept_body(
+    slug: str, *, side: str, intent: str, last_px: str, order_id: str = "ord-close-1"
+) -> bytes:
+    order = build_order(slug)
+    order["id"] = order_id
+    order["quantity"] = 1
+    order["cumQuantity"] = 1
+    order["leavesQuantity"] = 0
+    order["state"] = "ORDER_STATE_FILLED"
+    order["side"] = side
+    order["intent"] = intent
+    order["price"] = {"value": last_px, "currency": "USD"}
+    order["avgPx"] = {"value": last_px, "currency": "USD"}
+    execution = build_execution(order)
+    execution["lastShares"] = "1"
+    execution["lastPx"] = {"value": last_px, "currency": "USD"}
+    execution["commissionNotionalCollected"] = {"value": "0.03", "currency": "USD"}
+    return json.dumps({"id": order_id, "executions": [execution]}).encode("utf-8")
+
+
+def test_classify_create_order_outcome_accepts_a_correctly_echoed_yes_close() -> None:
+    slug = str(build_instrument().raw_symbol)
+    response = VenueResponse(
+        status=200,
+        headers={},
+        body=_closing_accept_body(
+            slug, side="ORDER_SIDE_SELL", intent="ORDER_INTENT_SELL_LONG", last_px="0.55",
+        ),
+    )
+    outcome = classify_create_order_outcome(
+        response,
+        instrument=build_instrument(),
+        account_id=ACCOUNT_ID,
+        ts_init=TS_INIT,
+        closing=True,
+    )
+    assert outcome.kind == KIND_ACCEPT_FILL
+    assert outcome.fill is not None
+
+
+def test_classify_create_order_outcome_stays_ambiguous_on_an_entry_close_echo() -> None:
+    """``closing`` defaults to ``False``: a plain create-order call whose
+    response happens to carry the YES-close pair is still checked against
+    the BUY-only table and stays the AMBIGUOUS residual."""
+    slug = str(build_instrument().raw_symbol)
+    response = VenueResponse(
+        status=200,
+        headers={},
+        body=_closing_accept_body(
+            slug, side="ORDER_SIDE_SELL", intent="ORDER_INTENT_SELL_LONG", last_px="0.55",
+        ),
+    )
+    outcome = classify_create_order_outcome(
+        response,
+        instrument=build_instrument(),
+        account_id=ACCOUNT_ID,
+        ts_init=TS_INIT,
+    )
+    assert outcome.kind == KIND_AMBIGUOUS
+    assert outcome.fill_parse_error is not None
+
+
 @pytest.mark.asyncio
 async def test_a_sub_cent_venue_fee_is_booked_as_bankers_zero_with_raw_audit(
     tmp_path: Path,

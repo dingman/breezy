@@ -19,7 +19,7 @@ import re
 from collections.abc import Mapping
 from dataclasses import dataclass
 from decimal import ROUND_HALF_EVEN, Decimal, InvalidOperation
-from typing import Any, Final, cast
+from typing import Any, Final, Protocol, cast
 
 from nautilus_trader.core.uuid import UUID4
 from nautilus_trader.model.enums import OrderSide, OrderType, TimeInForce
@@ -31,12 +31,15 @@ from breezy.adapters.polymarket_us.errors import ExecutionReportMappingError, Ve
 from breezy.adapters.polymarket_us.exec.reports import _key_tree, parse_fill_report
 from breezy.adapters.polymarket_us.leg_prices import (
     Leg,
+    exit_wire_price_for_leg,
     instrument_price_for_leg,
     wire_price_for_leg,
 )
 from breezy.adapters.polymarket_us.parsing import LEG_KEY, LEG_NO
 from breezy.adapters.polymarket_us.symbology import leg_of
 from breezy.adapters.polymarket_us.transport import VenueResponse
+from breezy.persistence.exit_gate import family_declares_exit_rule
+from breezy.persistence.family_manifest import FamilyManifest
 
 logger = logging.getLogger(__name__)
 
@@ -118,6 +121,13 @@ _LATCH_ARM_REFUSAL_TYPES: Final[frozenset[str]] = frozenset(
 _OUTCOME_SIDE_YES: Final[str] = "OUTCOME_SIDE_YES"
 _OUTCOME_SIDE_NO: Final[str] = "OUTCOME_SIDE_NO"
 _ORDER_ACTION_BUY: Final[str] = "ORDER_ACTION_BUY"
+#: The closing (sell) counterpart of `_ORDER_ACTION_BUY`, defined the exact
+#: same way -- a `Final` module constant, never assembled from parts. The
+#: X3 banned-token set (see the firewall guard's `BANNED_EXEC_DIRECTION_TOKENS`)
+#: bans the naked-short vocabulary this value is NOT: it carries none of
+#: those banned substrings (verified by
+#: `tests/unit/test_execution_egress_firewall_guard.py`'s X3 scan).
+_ORDER_ACTION_SELL: Final[str] = "ORDER_ACTION_SELL"
 _ORDER_TYPE_LIMIT: Final[str] = "ORDER_TYPE_LIMIT"
 _TIF_IOC: Final[str] = "TIME_IN_FORCE_IMMEDIATE_OR_CANCEL"
 _MANUAL_AUTOMATIC: Final[str] = "MANUAL_ORDER_INDICATOR_AUTOMATIC"
@@ -342,6 +352,175 @@ def build_order_body(order: object, instrument: object) -> dict[str, Any]:
         "tif": _TIF_IOC,
         "outcomeSide": outcome_side,
         "action": _ORDER_ACTION_BUY,
+        "manualOrderIndicator": _MANUAL_AUTOMATIC,
+        "synchronousExecution": True,
+        "maxBlockTime": _MAX_BLOCK_TIME,
+    }
+
+
+class ExitAuthorizationLike(Protocol):
+    """Structural shape this module needs from a strategy-authored exit
+    authorisation (`breezy.strategy.current_rung_hold.exit_authorization.
+    ExitAuthorization`).
+
+    Adapters never import `strategy/` (the importlinter layer contract
+    places `strategy` above `adapters`; see that module's own docstring), so
+    this file cannot name the dataclass directly. Declaring only the
+    attributes actually consumed below -- never the whole dataclass shape --
+    keeps this protocol minimal and lets the real object satisfy it with no
+    inheritance and no adapter-side import, proven in
+    `tests/unit/test_polymarket_us_exit_submit_chain_2026_09_16.py`.
+    `quantity` is typed `int` to match the real dataclass's own field type
+    exactly (mirrors `FamilyIdentity` in `settlement/family_barrier.py`,
+    the same structural-typing idiom for a cross-layer boundary). Every
+    member is a read-only `@property`, not a plain attribute: the real
+    dataclass is `frozen=True`, so mypy treats its fields as read-only, and a
+    plain (implicitly settable) protocol attribute would refuse to match a
+    read-only one.
+    """
+
+    @property
+    def family_id(self) -> str: ...
+    @property
+    def position_id(self) -> str: ...
+    @property
+    def client_order_id(self) -> str: ...
+    @property
+    def leg(self) -> Leg: ...
+    @property
+    def quantity(self) -> int: ...
+    @property
+    def limit_price(self) -> Decimal: ...
+
+
+def _unmappable_exit_shape_reason(
+    order: object, instrument: object, authorization: ExitAuthorizationLike
+) -> str | None:
+    """Every BUY-path shape rule (`unmappable_order_reason`), re-applied to
+    a closing SELL, plus the authorisation/order attribution cross-checks.
+
+    Shared by `unmappable_exit_order_reason` (which adds the manifest exit
+    gate) and `build_exit_order_body` (which receives no manifest), so
+    neither duplicates the other's shape logic.
+    """
+    if instrument is None or not isinstance(instrument, BinaryOption):
+        return "instrument is not a BinaryOption; refusing"
+    slug = str(getattr(instrument, "raw_symbol", "") or "")
+    if not slug.strip():
+        return "instrument has no resolvable market slug; refusing"
+    if getattr(order, "order_type", None) is not OrderType.LIMIT:
+        return "only a LIMIT order is mappable; refusing"
+    if getattr(order, "time_in_force", None) is not TimeInForce.IOC:
+        return "only an IOC order is mappable; refusing"
+    if getattr(order, "side", None) is not OrderSide.SELL:
+        return "only a SELL is mappable for a closing exit (a BUY does not close a long); refusing"
+    try:
+        quantity = order_quantity_decimal(order)
+        price = order_price_decimal(order)
+    except (TypeError, ValueError, InvalidOperation):
+        return "order price or quantity is unreadable; refusing"
+    if quantity != ONE:
+        return "only a 1-contract order is mappable; refusing"
+    if price <= OPEN_PRICE_EXCLUSIVE_LOW or price >= OPEN_PRICE_EXCLUSIVE_HIGH:
+        return "price must be strictly inside (0.00, 1.00); refusing"
+    if getattr(order, "is_post_only", False):
+        return "post-only is not mappable; refusing"
+    if getattr(order, "is_reduce_only", False):
+        return "reduce-only is not mappable; refusing"
+    display_qty = getattr(order, "display_qty", None)
+    if display_qty is not None:
+        return "display_qty is not mappable; refusing"
+    expire_time = getattr(order, "expire_time", None)
+    if expire_time is not None:
+        return "expire_time is not mappable; refusing"
+    has_trigger = getattr(order, "has_trigger_price", False)
+    if has_trigger is True or (callable(has_trigger) and has_trigger()):
+        return "trigger_price is not mappable; refusing"
+    try:
+        outcome_side = _outcome_token(instrument)
+    except ValueError as exc:
+        return str(exc)
+    if outcome_side is None:
+        return "no order-body outcome side is derivable from the instrument; refusing"
+    instrument_leg = leg_of(getattr(instrument, "id"))  # noqa: B009
+    if authorization.leg != instrument_leg:
+        return "authorization leg does not match the instrument leg; refusing"
+    order_client_order_id = str(getattr(order, "client_order_id", ""))
+    if authorization.client_order_id != order_client_order_id:
+        return "authorization client_order_id does not match the order; refusing"
+    if not authorization.position_id:
+        return "authorization carries no position_id; refusing"
+    order_position_id = getattr(order, "position_id", None)
+    if order_position_id is not None and authorization.position_id != str(order_position_id):
+        return "authorization position_id does not match the order; refusing"
+    if Decimal(authorization.quantity) != quantity:
+        return "authorization quantity does not match the order; refusing"
+    if authorization.limit_price != price:
+        return "authorization limit_price does not match the order; refusing"
+    return None
+
+
+def unmappable_exit_order_reason(
+    order: object,
+    instrument: object,
+    authorization: ExitAuthorizationLike | None,
+    manifest: FamilyManifest,
+) -> str | None:
+    """Return a denial reason when the closing order cannot be mapped, else
+    `None`. Reachable only with a real `authorization` -- a missing one is a
+    caller defect, not a refusal, and raises `TypeError` (mirrors the same
+    posture the plan requires of `build_exit_order_body`).
+    """
+    if authorization is None:
+        raise TypeError(
+            "authorization is required to evaluate a closing exit order; "
+            "this seam is unreachable without one"
+        )
+    reason = _unmappable_exit_shape_reason(order, instrument, authorization)
+    if reason is not None:
+        return reason
+    if not family_declares_exit_rule(manifest):
+        return "family does not declare a registered exit rule; refusing"
+    if manifest.family_id != authorization.family_id:
+        return "manifest family_id does not match the authorization; refusing"
+    return None
+
+
+def build_exit_order_body(
+    order: object, instrument: object, authorization: ExitAuthorizationLike | None
+) -> dict[str, Any]:
+    """The same 10-key body as `build_order_body`, action flipped to the
+    closing side. Re-applies every shape and attribution check that does
+    not need a manifest (`_unmappable_exit_shape_reason`), so it can never
+    emit a body for an order `unmappable_exit_order_reason` would refuse on
+    shape grounds -- the manifest exit-gate check is the caller's job.
+    """
+    if authorization is None:
+        raise TypeError(
+            "authorization is required to build a closing exit order body; "
+            "this seam is unreachable without one"
+        )
+    reason = _unmappable_exit_shape_reason(order, instrument, authorization)
+    if reason is not None:
+        raise ValueError(reason)
+    price = order_price_decimal(order)
+    slug = str(getattr(instrument, "raw_symbol", "") or "")
+    outcome_side = _outcome_token(instrument)
+    if outcome_side is None:
+        raise ValueError("no order-body outcome side is derivable from the instrument; refusing")
+    # `exit_wire_price_for_leg` is the documented exit-call-site alias of
+    # `wire_price_for_leg` (leg_prices, outside exec/): the venue always
+    # prices the YES/long side, on the close as on the open. `outcomeSide`
+    # is unchanged by closing -- only `action` flips.
+    wire_price = exit_wire_price_for_leg(leg_of(getattr(instrument, "id")), price)  # noqa: B009
+    return {
+        "marketSlug": slug,
+        "type": _ORDER_TYPE_LIMIT,
+        "price": {"value": f"{wire_price:.2f}", "currency": "USD"},
+        "quantity": 1,
+        "tif": _TIF_IOC,
+        "outcomeSide": outcome_side,
+        "action": _ORDER_ACTION_SELL,
         "manualOrderIndicator": _MANUAL_AUTOMATIC,
         "synchronousExecution": True,
         "maxBlockTime": _MAX_BLOCK_TIME,
@@ -803,6 +982,7 @@ def fill_generation(
     ts_init: int,
     payload: Mapping[str, Any] | None = None,
     errors: list[str] | None = None,
+    closing: bool = False,
 ) -> FillGeneration | None:
     """Map ``execution`` to native fill-generation arguments, or ``None``.
 
@@ -820,6 +1000,11 @@ def fill_generation(
     receives is capped with an explicit, placement-ruled marker
     (:func:`_capped_diagnostic`), so ``fill_parse_error`` is bounded for
     both the log line and the durable store (SP-2 I3).
+
+    ``closing`` (INC-E2, default ``False``): forwarded verbatim to
+    :func:`reports.parse_fill_report`, which is the ONE place the
+    entry-vs-exit echo table is selected. This function makes no
+    leg/echo decision of its own.
     """
     try:
         report = parse_fill_report(
@@ -828,6 +1013,7 @@ def fill_generation(
             account_id=cast(AccountId, account_id),
             report_id=UUID4(),
             ts_init=ts_init,
+            closing=closing,
         )
     except (ExecutionReportMappingError, TypeError, ValueError) as exc:
         if errors is not None:
@@ -976,8 +1162,19 @@ def classify_create_order_outcome(
     instrument: object,
     account_id: object,
     ts_init: int,
+    closing: bool = False,
 ) -> CreateOrderOutcome:
-    """Classify one create-order HTTP outcome. AMBIGUOUS is the residual."""
+    """Classify one create-order HTTP outcome. AMBIGUOUS is the residual.
+
+    ``closing`` (INC-E2, default ``False`` -- byte-unchanged for every
+    existing entry-path caller/test): forwarded to :func:`fill_generation`
+    so a CORRECTLY-echoed closing-order response classifies
+    ``KIND_ACCEPT_FILL`` instead of falling through to the AMBIGUOUS
+    residual below. An echo that matches neither table -- a BUY-table echo
+    on a close, or a close-table echo on an entry -- still fails
+    ``reports.parse_fill_report`` and lands here as before, with its own
+    distinct exception message carried on ``fill_parse_error``.
+    """
     if response is None:
         return CreateOrderOutcome(
             kind=KIND_AMBIGUOUS,
@@ -1030,6 +1227,7 @@ def classify_create_order_outcome(
                 ts_init=ts_init,
                 payload=payload,
                 errors=fill_parse_errors,
+                closing=closing,
             )
             if fill is not None:
                 cumulative_qty, cumulative_cost = _cumulative_qty_and_cost(

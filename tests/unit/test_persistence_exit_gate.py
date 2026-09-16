@@ -1,11 +1,14 @@
-"""RED-first suite for `persistence/exit_gate.py` (INC-1).
+"""RED-first suite for `persistence/exit_gate.py` (INC-1, extended INC-E1).
 
-Today NO family may exit (hold-to-settlement is the registered action,
-PREREG v3): the registered-families frozenset is empty, and every family
-manifest currently committed to the repo -- including drafts -- must gate
-False. A manifest's own `exit_rule` field can never flip the gate alone;
-only membership in the module's own frozenset, set here in code (never by
-editing a JSON file), can.
+`_EXIT_RULE_REGISTERED_FAMILIES` now names exactly one family,
+`pm_us_crh_exit_v4` (PREREG v4, `docs/plans/
+POSITION_EXIT_EXECUTION_2026-09-16.md` §2). Membership alone still grants
+nothing: every family manifest currently committed to the repo -- including
+`pm_us_crh_exit_v4`'s own DRAFT manifest, which ships with no `exit_rule`
+key at INC-E1 -- must gate False until its manifest actually declares
+`exit_rule`, and `pm_us_crh_cont` (the live hold-to-settlement family) must
+gate False even if its manifest were hypothetically edited to declare one,
+because it is not, and must never become, a member of the frozenset.
 """
 
 from __future__ import annotations
@@ -19,6 +22,7 @@ from breezy.persistence.exit_gate import (
     family_declares_exit_rule,
 )
 from breezy.persistence.family_manifest import FamilyManifest, load_family_manifest
+from breezy.strategy.current_rung_hold.trial_day_latch import CONTINUOUS_TRIAL_KEY_PREFIX
 
 _REPO_ROOT = Path(__file__).resolve().parents[2]
 _FAMILIES_DIR = _REPO_ROOT / "deploy" / "families"
@@ -32,6 +36,7 @@ _COMMITTED_MANIFEST_NAMES: tuple[str, ...] = (
     "pm_us_crh_v2.json",
     "pm_us_crh_cont.json",
     "kalshi_crh_v1.json",
+    "pm_us_crh_exit_v4.json",
 )
 
 
@@ -60,17 +65,78 @@ def _load_any(path: Path) -> FamilyManifest:
         return load_family_manifest(path, allow_draft=True)
 
 
-def test_the_registered_families_frozenset_is_final_and_empty() -> None:
+def test_the_registered_families_frozenset_names_exactly_pm_us_crh_exit_v4() -> None:
     assert isinstance(_EXIT_RULE_REGISTERED_FAMILIES, frozenset)
-    assert _EXIT_RULE_REGISTERED_FAMILIES == frozenset()
+    assert _EXIT_RULE_REGISTERED_FAMILIES == frozenset({"pm_us_crh_exit_v4"})
 
 
 def test_every_committed_family_manifest_gates_false_and_carries_no_exit_rule() -> None:
+    """True for every committed manifest today, `pm_us_crh_exit_v4`'s DRAFT
+    manifest included: code-registration alone never suffices (module
+    docstring) -- the manifest must ALSO declare `exit_rule`, which none do
+    yet."""
     paths = _committed_manifest_paths()
     for path in paths:
         manifest = _load_any(path)
         assert manifest.exit_rule is None, f"{path}: unexpected exit_rule {manifest.exit_rule!r}"
         assert family_declares_exit_rule(manifest) is False, f"{path}: gate must be False today"
+
+
+def test_pm_us_crh_exit_v4_gates_true_only_once_its_manifest_declares_exit_rule() -> None:
+    """The registered family gates False while its manifest omits
+    `exit_rule` (today's committed state) and True once a manifest for that
+    SAME family_id declares one -- the second, independent half of the gate
+    (module docstring)."""
+    without_exit_rule = FamilyManifest(
+        family_id="pm_us_crh_exit_v4",
+        venue="polymarket_us",
+        trial_id_prefix="current_rung_hold_exit_v4/trial/",
+        d0_climate_day="2099-01-01",
+        boundary_artefact_path=Path("deploy/families/gs_boundary_pm_us_crh_v2.json"),
+        boundary_inputs_sha256="a" * 64,
+        stations=("SFO",),
+        status="DRAFT_NOT_REGISTERED",
+        manifest_sha256="b" * 64,
+        exit_rule=None,
+    )
+    assert family_declares_exit_rule(without_exit_rule) is False
+
+    with_exit_rule = FamilyManifest(
+        family_id="pm_us_crh_exit_v4",
+        venue="polymarket_us",
+        trial_id_prefix="current_rung_hold_exit_v4/trial/",
+        d0_climate_day="2099-01-01",
+        boundary_artefact_path=Path("deploy/families/gs_boundary_pm_us_crh_v2.json"),
+        boundary_inputs_sha256="a" * 64,
+        stations=("SFO",),
+        status="REGISTERED",
+        manifest_sha256="c" * 64,
+        exit_rule="crh_exit_v4:R_THREAT_PRIMARY+R_DEAD_BACKSTOP",
+    )
+    assert family_declares_exit_rule(with_exit_rule) is True
+
+
+def test_pm_us_crh_cont_can_never_gate_true_even_if_its_manifest_declared_exit_rule() -> None:
+    """`pm_us_crh_cont` is not, and must never become, a member of
+    `_EXIT_RULE_REGISTERED_FAMILIES` -- a change to the ACTION is a new
+    family (PREREG v4, L-34), never an amendment of the live hold-to-
+    settlement family. Simulates the hypothetical bad edit (a manifest JSON
+    declaring `exit_rule` for `pm_us_crh_cont`) to prove code registration,
+    not the manifest, is the deciding half."""
+    hypothetically_amended = FamilyManifest(
+        family_id="pm_us_crh_cont",
+        venue="polymarket_us",
+        trial_id_prefix="continuous_rung_hold/trial/",
+        d0_climate_day="2026-09-12",
+        boundary_artefact_path=Path("deploy/families/gs_boundary_pm_us_crh_v2.json"),
+        boundary_inputs_sha256="a" * 64,
+        stations=("LAX", "MDW", "MIA", "SFO"),
+        status="REGISTERED",
+        manifest_sha256="d" * 64,
+        exit_rule="crh_exit_v4:R_THREAT_PRIMARY+R_DEAD_BACKSTOP",
+    )
+    assert family_declares_exit_rule(hypothetically_amended) is False
+    assert "pm_us_crh_cont" not in _EXIT_RULE_REGISTERED_FAMILIES
 
 
 def test_a_manifest_with_exit_rule_not_in_the_frozenset_gates_false(tmp_path: Path) -> None:
@@ -133,3 +199,18 @@ def test_a_manifest_both_registered_and_declaring_exit_rule_gates_true(
         exit_rule="hold_to_settlement",
     )
     assert exit_gate_module.family_declares_exit_rule(manifest) is True
+
+
+def test_live_composition_still_resolves_pm_us_crh_cont_not_the_draft_exit_family() -> None:
+    """`composition.py`'s live trial-key wiring (`CONTINUOUS_TRIAL_KEY_PREFIX`)
+    still mints trial ids under `pm_us_crh_cont`'s own registered
+    `trial_id_prefix` -- adding `pm_us_crh_exit_v4` to the gate's frozenset
+    (INC-E1) selects no live family and rewires nothing; that requires its
+    own manifest to flip to REGISTERED with a real `exit_rule` (INC-E4)."""
+    cont = load_family_manifest(_FAMILIES_DIR / "pm_us_crh_cont.json")
+    assert CONTINUOUS_TRIAL_KEY_PREFIX == cont.trial_id_prefix
+
+    draft_v4 = load_family_manifest(
+        _FAMILIES_DIR / "pm_us_crh_exit_v4.json", allow_draft=True
+    )
+    assert draft_v4.trial_id_prefix != CONTINUOUS_TRIAL_KEY_PREFIX
