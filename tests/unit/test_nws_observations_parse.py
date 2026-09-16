@@ -234,6 +234,109 @@ def test_the_recorded_fixture_parses_with_only_the_documented_drop_reasons() -> 
 
 
 # ---------------------------------------------------------------------------
+# 2026-09-16 GAP fix: raw-observation sidecar wiring (defect B).
+# ---------------------------------------------------------------------------
+
+
+class _RecordingSidecar:
+    """A test double standing in for `ObservationSidecar` -- records every
+    row handed to it, without touching disk."""
+
+    def __init__(self) -> None:
+        self.rows: list[Any] = []
+
+    def append(self, row: Any) -> None:
+        self.rows.append(row)
+
+
+def test_a_metar_row_writes_exactly_one_sidecar_row_with_exact_precision() -> None:
+    raw = "KMDW 040153Z 09008KT 10SM CLR 22/13 A3020 RMK AO2 SLP224 T02170128"
+    sidecar = _RecordingSidecar()
+
+    nws_observation_rows_to_station_observations(
+        station="KMDW",
+        payload=_payload(_row(value=21.7, raw_message=raw)),
+        source_channel=NWS_OBSERVATION_SOURCE_CHANNEL,
+        assumed_publication_lag_ns=_LAG_NS,
+        received_at_ns=_RECEIVED_AT_NS,
+        sidecar=sidecar,
+        source_url_path="/stations/KMDW/observations",
+    )
+
+    (row,) = sidecar.rows
+    assert row.station == "KMDW"
+    assert row.observed_at == "2026-09-04T02:20:00+00:00"
+    assert row.temp_c_raw == 21.7
+    assert row.raw_message == raw
+    assert row.is_metar is True
+    assert row.precision_c_tenths == 5
+    assert row.temp_c_tenths == 217
+    assert row.source_url_path == "/stations/KMDW/observations"
+    assert row.fetched_at_ns == _RECEIVED_AT_NS
+
+
+def test_a_whole_degree_row_writes_exactly_one_sidecar_row_with_interval_precision() -> None:
+    sidecar = _RecordingSidecar()
+
+    nws_observation_rows_to_station_observations(
+        station="KMDW",
+        payload=_payload(_row(value=22.0, raw_message="")),
+        source_channel=NWS_OBSERVATION_SOURCE_CHANNEL,
+        assumed_publication_lag_ns=_LAG_NS,
+        received_at_ns=_RECEIVED_AT_NS,
+        sidecar=sidecar,
+        source_url_path="/stations/KMDW/observations",
+    )
+
+    (row,) = sidecar.rows
+    assert row.temp_c_raw == 22.0
+    assert row.raw_message == ""
+    assert row.is_metar is False
+    assert row.precision_c_tenths == 10
+    assert row.temp_c_tenths == 220
+
+
+@pytest.mark.parametrize(
+    "row_kwargs",
+    [
+        {"value": 21.7, "raw_message": ""},  # unparseable_row
+        {"value": None},  # null_temperature_row
+        {"value": 72, "unit_code": "wmoUnit:degF"},  # unexpected_unit_code
+    ],
+)
+def test_a_dropped_row_writes_no_sidecar_row(row_kwargs: dict[str, Any]) -> None:
+    sidecar = _RecordingSidecar()
+
+    observations, drops = nws_observation_rows_to_station_observations(
+        station="KMDW",
+        payload=_payload(_row(**row_kwargs)),
+        source_channel=NWS_OBSERVATION_SOURCE_CHANNEL,
+        assumed_publication_lag_ns=_LAG_NS,
+        received_at_ns=_RECEIVED_AT_NS,
+        sidecar=sidecar,
+        source_url_path="/stations/KMDW/observations",
+    )
+
+    assert observations == ()
+    assert sum(drops.values()) == 1
+    assert sidecar.rows == []
+
+
+def test_sidecar_defaults_to_none_and_the_call_stays_byte_identical() -> None:
+    """No `sidecar=` kwarg at all -- the pre-fix call shape -- behaves exactly
+    like before this fix."""
+    observations, drops = nws_observation_rows_to_station_observations(
+        station="KMDW",
+        payload=_payload(_row(value=22.0)),
+        source_channel=NWS_OBSERVATION_SOURCE_CHANNEL,
+        assumed_publication_lag_ns=_LAG_NS,
+        received_at_ns=_RECEIVED_AT_NS,
+    )
+    assert len(observations) == 1
+    assert drops == Counter()
+
+
+# ---------------------------------------------------------------------------
 # largest_gap_ns -- pure, ingest-local, no strategy import
 # ---------------------------------------------------------------------------
 

@@ -61,6 +61,7 @@ import threading
 from collections import Counter
 from datetime import timedelta
 from typing import Any, Final
+from urllib.parse import urlsplit
 
 from nautilus_trader.common.actor import Actor
 
@@ -86,6 +87,7 @@ from breezy.ingest.nws_observations import (
     nws_observation_rows_to_station_observations,
     station_observation_data_type,
 )
+from breezy.ingest.observation_sidecar import ObservationSidecar
 
 logger = logging.getLogger(__name__)
 
@@ -113,6 +115,7 @@ class NwsObservationActor(Actor):
         *,
         std_utc_offset_hours: float,
         transport_factory: TransportFactory = build_observation_transport,
+        sidecar: ObservationSidecar | None = None,
     ) -> None:
         super().__init__(config)
         self._config = config
@@ -121,6 +124,11 @@ class NwsObservationActor(Actor):
         self._staleness_bound_ns = int(config.staleness_bound_seconds) * _NS_PER_SECOND
         self._transport_factory = transport_factory
         self._transport: ObservationFetcher | None = None
+        #: 2026-09-16 GAP fix: best-effort raw-payload diagnosability
+        #: sidecar. `None` (the default) is byte-identical to before this
+        #: fix -- see `nws_observations.nws_observation_rows_to_station_
+        #: observations`'s own docstring.
+        self._sidecar = sidecar
 
         self._loop: asyncio.AbstractEventLoop | None = None
         self._timer_armed = False
@@ -333,6 +341,9 @@ class NwsObservationActor(Actor):
             source_channel=self._config.source_channel,
             assumed_publication_lag_ns=int(self._config.assumed_publication_lag_ns),
             received_at_ns=result.retrieved_at_ns,
+            sidecar=self._sidecar,
+            # Path only -- no query string, no credentials (module docstring).
+            source_url_path=urlsplit(result.url).path,
         )
         self.counters.update(drops)
         return sorted(observations, key=lambda record: record.observed_at_ns)

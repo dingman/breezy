@@ -53,6 +53,7 @@ from breezy.ingest.nws_observations import (
     nws_observation_rows_to_station_observations,
     station_observation_data_type,
 )
+from breezy.ingest.observation_sidecar import ObservationSidecar
 
 FIXTURE_FILE = (
     Path(__file__).resolve().parents[1] / "fixtures" / "nws" / "kmdw_observations_2026-09-04.json"
@@ -169,6 +170,7 @@ def build(
     texts: Sequence[str] | Callable[[int], str] = (FIXTURE_TEXT,),
     raises: BaseException | None = None,
     now_ns: int = FETCH_INSTANT_NS,
+    sidecar: ObservationSidecar | None = None,
     **config_overrides: Any,
 ) -> Harness:
     clock = TestClock()
@@ -191,6 +193,7 @@ def build(
         NwsObservationActorConfig(**kwargs),
         std_utc_offset_hours=MDW_STD_OFFSET_HOURS,
         transport_factory=factory,
+        sidecar=sidecar,
     )
     msgbus = TestComponentStubs.msgbus()
     actor.register_base(
