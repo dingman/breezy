@@ -1,0 +1,105 @@
+{
+  "captured_at": "20260916T031932Z",
+  "echo": {
+    "id": "",
+    "intent": "ORDER_INTENT_SELL_SHORT",
+    "outcomeSide": "OUTCOME_SIDE_NO",
+    "price": {
+      "currency": "USD",
+      "value": "0.99"
+    },
+    "side": "ORDER_SIDE_BUY",
+    "state": "ORDER_STATE_PENDING_NEW"
+  },
+  "envelope": "sdk_request_wrapper",
+  "outcome": "no",
+  "preview": {
+    "request": {
+      "body": {
+        "request": {
+          "action": "ORDER_ACTION_SELL",
+          "manualOrderIndicator": "MANUAL_ORDER_INDICATOR_AUTOMATIC",
+          "marketSlug": "tc-temp-miahigh-2026-09-15-gte92lt93f",
+          "maxBlockTime": "5",
+          "outcomeSide": "OUTCOME_SIDE_NO",
+          "price": {
+            "currency": "USD",
+            "value": "0.99"
+          },
+          "quantity": 1,
+          "synchronousExecution": true,
+          "tif": "TIME_IN_FORCE_IMMEDIATE_OR_CANCEL",
+          "type": "ORDER_TYPE_LIMIT"
+        }
+      },
+      "headers": {
+        "Content-Type": "application/json",
+        "User-Agent": "breezy/1.0 (+mailto:weather-breezy@jonathan.vc)",
+        "X-PM-Access-Key": "<redacted>",
+        "X-PM-Signature": "<redacted>",
+        "X-PM-Timestamp": "<redacted>"
+      },
+      "method": "POST",
+      "path": "/v1/order/preview",
+      "url": "https://api.polymarket.us/v1/order/preview"
+    },
+    "response": {
+      "body": {
+        "order": {
+          "action": "ORDER_ACTION_SELL",
+          "avgPx": {
+            "currency": "USD",
+            "value": "0.0000"
+          },
+          "cashOrderQty": {
+            "currency": "USD",
+            "value": "0.0000"
+          },
+          "commissionNotionalTotalCollected": {
+            "currency": "USD",
+            "value": "0.0000"
+          },
+          "commissionsBasisPoints": "0",
+          "createTime": "2026-09-16T03:19:32.627719670Z",
+          "cumQuantity": 0,
+          "goodTillTime": null,
+          "id": "",
+          "insertTime": null,
+          "intent": "ORDER_INTENT_SELL_SHORT",
+          "lastTransactTime": null,
+          "leavesQuantity": 1,
+          "makerCommissionsBasisPoints": "0",
+          "manualOrderIndicator": "MANUAL_ORDER_INDICATOR_AUTOMATIC",
+          "marketMetadata": {
+            "eventId": "112518",
+            "eventSlug": "temp-miahigh-2026-09-15",
+            "icon": "https://polymarket-upload.s3.us-east-2.amazonaws.com/us%20weather%20highest%20miami-71d4d602b3.png",
+            "outcome": "No",
+            "slug": "tc-temp-miahigh-2026-09-15-gte92lt93f",
+            "subject": {
+              "id": 0,
+              "name": "92 to 93",
+              "subjectType": ""
+            },
+            "title": "Highest temperature in Miami on September 15?"
+          },
+          "marketSlug": "tc-temp-miahigh-2026-09-15-gte92lt93f",
+          "outcomeSide": "OUTCOME_SIDE_NO",
+          "price": {
+            "currency": "USD",
+            "value": "0.99"
+          },
+          "quantity": 1,
+          "side": "ORDER_SIDE_BUY",
+          "state": "ORDER_STATE_PENDING_NEW",
+          "tif": "TIME_IN_FORCE_IMMEDIATE_OR_CANCEL",
+          "type": "ORDER_TYPE_LIMIT"
+        }
+      },
+      "status": 200
+    }
+  },
+  "quantity": 1,
+  "schema": "breezy.close_preview_capture.v1",
+  "slug": "tc-temp-miahigh-2026-09-15-gte92lt93f"
+}

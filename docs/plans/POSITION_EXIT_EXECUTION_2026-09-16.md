@@ -430,3 +430,13 @@ Top unknowns the §4 protocol must retire, in order: (1) how a held NO position 
 | tc-temp-sfohigh-2026-09-15-gte71lt72f | Yes | 1 | 1 | 1 / 0 | 0.4500 | 0.4500 | 0.0100 | 0 | False |
 
 Findings that bind INC-E2/E3: (1) the venue nets a held NO as a **short of YES** (`netPosition −1`, `qtySold 1`), while Breezy/Nautilus holds it as a LONG on the `^no` leg instrument — the net-long guard reasons per Breezy instrument and stays correct, but any reconciliation of venue `netPosition` against Breezy positions must apply the leg sign (`marketMetadata.outcome`) before comparing; (2) `avgPx`/`cost` are **fee-inclusive** and denominated in the HELD leg (YES 0.12 = 0.11 + 0.01 fee; NO 0.09); (3) `cashValue` is the venue's mark (0.01 on all four = the settled-as-lost expectation); (4) the close of a NO must therefore be the order that brings `netPosition −1 → 0` — expected `SELL_SHORT` per the docs; the §4 step 1 preview capture decides.
+
+### Appendix A.2 — §4 step 1 RETIRED (2026-09-16 03:19Z, closing-order preview capture; no order created)
+`scripts/analysis/capture_no_side_preview.py --close` → `docs/evidence/venue/polymarket_us/CLOSE_PREVIEW_yes_20260916T031931Z.json`, `CLOSE_PREVIEW_no_20260916T031932Z.json` (HTTP 200, state PENDING_NEW, id "").
+
+| Request (10-key body, no `intent`) | Echo `side` | Echo `intent` | Echo `outcomeSide` | Echo `price.value` |
+|---|---|---|---|---|
+| YES + `ORDER_ACTION_SELL` @ 0.01 | `ORDER_SIDE_SELL` | `ORDER_INTENT_SELL_LONG` | YES | 0.01 |
+| NO + `ORDER_ACTION_SELL` @ instrument 0.01 (wire 0.99) | **`ORDER_SIDE_BUY`** | `ORDER_INTENT_SELL_SHORT` | NO | 0.99 |
+
+Binding correction to INC-E2: the exit echo table is (YES close → `SELL`/`SELL_LONG`), (NO close → **`BUY`**/`SELL_SHORT`) — the exact mirror of the entry table (NO buy echoes `SELL`/`BUY_SHORT`). The NO-close echo shares `side=BUY` with a YES-buy echo and differs only by `intent`, so `assert_exit_echo_matches_leg` must check the (side, intent) PAIR. The `SELL_LONG`/`SELL_SHORT` tokens live only in `leg_prices.py` (outside `exec/`), per `RULING_x3_sell_long_sell_short_2026-09-16.md`.
