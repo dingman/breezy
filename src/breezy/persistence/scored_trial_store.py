@@ -37,6 +37,7 @@ import datetime as dt
 import os
 import tempfile
 from collections.abc import Sequence
+from dataclasses import dataclass
 from decimal import Decimal
 from pathlib import Path
 from typing import Any
@@ -46,7 +47,13 @@ import pyarrow.parquet as pq
 
 from breezy.settlement.trial_scorer import BucketSource, ScoredTrial, SettlementBasis
 
-__all__ = ["SCORED_TRIAL_SCHEMA", "read_scored_trials", "write_scored_trials"]
+__all__ = [
+    "SCORED_TRIAL_SCHEMA",
+    "PooledScoredTrials",
+    "read_scored_trials",
+    "read_scored_trials_pooled",
+    "write_scored_trials",
+]
 
 #: Pinned column-for-column (review item 8 plus the `settlement_basis` /
 #: `excluded_reason` / `slippage` columns items 1, 2 and 6 require).
@@ -125,6 +132,64 @@ def read_scored_trials(directory: Path) -> tuple[ScoredTrial, ...]:
             if current is None or trial.score_seq > current.score_seq:
                 latest[trial.trial_id] = trial
     return tuple(latest.values())
+
+
+#: L-38 (`cbd5fec`): `score-live-trials-run.sh` now writes each REGISTERED
+#: family's rows to its OWN `<store>/<family_id>/` subdirectory rather than
+#: a shared top-level directory, because `family_tally_v2.py`'s
+#: contamination barrier (`FamilyStoreContaminationError`) forbids a shared
+#: store. `read_scored_trials` itself stays non-recursive and single-
+#: directory (its existing per-family and legacy callers are unchanged); a
+#: caller that wants the union across every family -- the live/pooled
+#: diagnostic tally and the two nightly studies that join on `trial_id`
+#: (`live_family_tally.py`, `position_monitor_nightly_report.py`,
+#: `current_rung_hold_exit_window_study.py`) -- calls this instead.
+_LEGACY_SOURCE_LABEL: str = "(top-level)"
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
+class PooledScoredTrials:
+    """The union of every per-family scored-trial store under a base
+    directory, plus any legacy top-level parquet files written directly
+    under it (the pre-L-38 layout, kept working for a store that has not
+    been migrated). `family_counts` is `(source_label, row_count)` in
+    discovery order -- `"(top-level)"` for the legacy rows (only present
+    when at least one legacy row exists), then one entry per non-empty
+    subdirectory named for its `family_id` (L-38's own convention: the
+    subdirectory name IS the family id). Rows are never deduped across
+    sources: `family_tally_v2.py`'s own contamination barrier already keeps
+    each per-family store disjoint from every other by `trial_id` manifest
+    prefix, and legacy top-level rows predate any per-family store existing
+    at all.
+    """
+
+    rows: tuple[ScoredTrial, ...]
+    family_counts: tuple[tuple[str, int], ...]
+
+
+def read_scored_trials_pooled(base_dir: Path) -> PooledScoredTrials:
+    """Read `base_dir`'s own legacy top-level parquet files (if any) UNION
+    every immediate subdirectory's parquet files (if any), each read via
+    `read_scored_trials` unmodified.
+
+    An absent or fully empty `base_dir` returns no rows and no breakdown
+    entries -- the same "never an error" contract `read_scored_trials`
+    itself carries: a fresh deployment with no score runs yet, or one that
+    has not scored today's family yet, is a normal state, not a defect.
+    """
+    legacy_rows = read_scored_trials(base_dir)
+    rows: list[ScoredTrial] = list(legacy_rows)
+    counts: list[tuple[str, int]] = []
+    if legacy_rows:
+        counts.append((_LEGACY_SOURCE_LABEL, len(legacy_rows)))
+    if base_dir.exists():
+        for child in sorted(p for p in base_dir.iterdir() if p.is_dir()):
+            family_rows = read_scored_trials(child)
+            if not family_rows:
+                continue
+            rows.extend(family_rows)
+            counts.append((child.name, len(family_rows)))
+    return PooledScoredTrials(rows=tuple(rows), family_counts=tuple(counts))
 
 
 def _stamp(now_ns: int) -> str:

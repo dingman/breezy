@@ -111,7 +111,7 @@ from breezy.domain.instrument_leg import base_symbol_of, leg_of_symbol, symbol_o
 from breezy.domain.season import season_for
 from breezy.domain.weather_bucket_facts import WeatherBucketFacts, read_weather_bucket_facts
 from breezy.ingest.iem_observations import iem_asos_rows_to_station_observations
-from breezy.persistence.scored_trial_store import read_scored_trials
+from breezy.persistence.scored_trial_store import read_scored_trials_pooled
 from breezy.registry.sites import default_registry
 from breezy.settlement.trial_scorer import FilledTrial, ScoredTrial
 from breezy.strategy.current_rung_hold.config import CurrentRungHoldConfig
@@ -413,8 +413,12 @@ def run_exit_window_study(
     stale_observation_bound_ns = config.stale_observation_minutes * 60_000_000_000
     registry = default_registry()
     specs_by_city = {spec.city: spec for spec in load_sites() if spec.city in stations}
+    #: L-38 (`cbd5fec`): each REGISTERED family's rows now live under their
+    #: own `<scored_trials_dir>/<family_id>/` subdirectory -- pooled here
+    #: across every family plus any legacy top-level rows (see
+    #: `read_scored_trials_pooled`'s docstring).
     scored_by_trial_id = {
-        trial.trial_id: trial for trial in read_scored_trials(scored_trials_dir)
+        trial.trial_id: trial for trial in read_scored_trials_pooled(scored_trials_dir).rows
     }
     #: Built once, shared across every city (module docstring's fallback note).
     quote_tape_bucket_by_instrument = _quote_tape_bucket_by_instrument(catalog_root)

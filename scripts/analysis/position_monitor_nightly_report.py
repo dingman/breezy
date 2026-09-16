@@ -76,7 +76,7 @@ from archive_correction_probe import wilson_interval
 
 from breezy.persistence.exit_gate import family_declares_exit_rule
 from breezy.persistence.family_manifest import FamilyManifest, load_family_manifest
-from breezy.persistence.scored_trial_store import read_scored_trials
+from breezy.persistence.scored_trial_store import read_scored_trials_pooled
 from breezy.settlement.trial_scorer import ScoredTrial
 from breezy.strategy.current_rung_hold.config import CurrentRungHoldConfig
 from breezy.strategy.current_rung_hold.monitor_evidence import (
@@ -871,7 +871,11 @@ def main(argv: Sequence[str] | None = None) -> int:
     args = parser.parse_args(argv)
 
     summaries = read_monitor_summaries(args.summaries_dir)
-    scored_trials = read_scored_trials(args.scored_trials_dir)
+    #: L-38 (`cbd5fec`): each REGISTERED family's rows now live under their
+    #: own `<args.scored_trials_dir>/<family_id>/` subdirectory -- pooled
+    #: here across every family plus any legacy top-level rows (see
+    #: `read_scored_trials_pooled`'s docstring).
+    scored_trials = read_scored_trials_pooled(args.scored_trials_dir).rows
 
     usable_station_days: int | None = None
     if args.corpus_summary is not None:

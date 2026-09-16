@@ -15,6 +15,24 @@
 # var is unset, or the node-env pre-flight refuses (MISMATCH/
 # DISCOVERY_FAILED). Reported to `systemctl --user status
 # breezy-live-tally.service`.
+#
+# L-38 (`cbd5fec`, defect fix 2026-09-16): `score-live-trials-run.sh` now
+# writes each REGISTERED family's rows to its OWN `$STORE_DIR/<family_id>/`
+# subdirectory (family_tally_v2.py's contamination barrier forbids a shared
+# top-level store) -- but `live_family_tally.py` (this wrapper's own
+# analysis script) is v1-BINDING and PREREG-v1-frozen
+# (`tests/unit/test_family_tally_v2.py::test_the_v1_tally_is_untouched`
+# pins its bytes; "update only with a ruling"), and its reader is
+# non-recursive, so pointing it straight at `$STORE_DIR` now silently reads
+# zero rows whenever every family has migrated to its own subdirectory. This
+# wrapper fixes that WITHOUT touching the frozen script: when `$STORE_DIR`
+# has at least one subdirectory, it pools every subdirectory's (plus any
+# legacy top-level) `scored_trials_*.parquet` files into a throwaway
+# symlink directory and passes THAT to the unmodified CLI, then appends an
+# additive "by family: ..." breakdown line to the report the CLI already
+# wrote. When `$STORE_DIR` has no subdirectories (the pre-L-38 legacy
+# layout), `$STORE_DIR` is passed straight through, unchanged from before
+# this fix.
 set -uo pipefail
 
 REPO=/home/jon/breezy
@@ -89,14 +107,59 @@ if [ "$CHECK_TOKEN" = "NO_NODE" ]; then
   say "WARN: node-env pre-flight found no anchored breezy-trade process"
 fi
 
+# L-38: pool every per-family subdirectory (plus any legacy top-level
+# files) into a throwaway symlink directory, ONLY when $STORE_DIR actually
+# has subdirectories -- see the module docstring above. A store with no
+# subdirectories at all (legacy layout, or a fresh deployment) passes
+# straight through unchanged, exactly as before this fix.
+STORE_ARG="$STORE_DIR"
+FAMILY_BREAKDOWN=""
+POOL_DIR=""
+if [ -d "$STORE_DIR" ] && find "$STORE_DIR" -mindepth 1 -maxdepth 1 -type d -print -quit 2>/dev/null | grep -q .; then
+  POOL_DIR=$(mktemp -d)
+  trap 'rm -rf "$POOL_DIR"' EXIT
+
+  pool_source() {
+    # $1: directory to scan (non-recursive); $2: breakdown label.
+    local src="$1" label="$2" n=0 f
+    while IFS= read -r -d '' f; do
+      if ! ln -s "$f" "$POOL_DIR/$(basename "$f")" 2>>"$LOG"; then
+        say "LIVE TALLY FAILED -- duplicate scored-trial filename pooling $label: $(basename "$f")"
+        exit 1
+      fi
+      n=$((n + 1))
+    done < <(find "$src" -maxdepth 1 -type f -name 'scored_trials_*.parquet' -print0 2>/dev/null)
+    if [ "$n" -gt 0 ]; then
+      if [ -n "$FAMILY_BREAKDOWN" ]; then
+        FAMILY_BREAKDOWN="$FAMILY_BREAKDOWN, $label=$n"
+      else
+        FAMILY_BREAKDOWN="$label=$n"
+      fi
+    fi
+  }
+
+  pool_source "$STORE_DIR" "(top-level)"
+  while IFS= read -r -d '' fam_dir; do
+    pool_source "$fam_dir" "$(basename "$fam_dir")"
+  done < <(find "$STORE_DIR" -mindepth 1 -maxdepth 1 -type d -print0)
+
+  STORE_ARG="$POOL_DIR"
+fi
+
+REPORT="$OUT/live_family_tally_$STAMP.md"
 if "$PY" "$REPO/scripts/analysis/live_family_tally.py" \
-     "$STORE_DIR" \
-     --output "$OUT/live_family_tally_$STAMP.md" \
+     "$STORE_ARG" \
+     --output "$REPORT" \
      --as-of "$STAMP" \
      --fill-source "$STATE_DB" \
      --fill-since-climate-day "$D0" \
      --covered-listed-station-days "$COUNT" >/dev/null 2>>"$LOG"; then
   say "live tally ok"
+  # Additive only -- never touches the v1-frozen script's own report body,
+  # just appends a breakdown line this wrapper computed independently.
+  if [ -n "$FAMILY_BREAKDOWN" ] && [ -f "$REPORT" ]; then
+    sed -i "/^row count:/a by family: $FAMILY_BREAKDOWN" "$REPORT"
+  fi
 else
   say "LIVE TALLY RUN FAILED (see stderr above in $LOG)"
   STATUS=1
