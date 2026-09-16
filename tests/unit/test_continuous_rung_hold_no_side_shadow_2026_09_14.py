@@ -320,7 +320,16 @@ def test_a_fill_absent_from_todays_facts_still_contributes_to_admission(
         STATION, CLIMATE_DAY.isoformat(), key_instrument_id=str(dropped_iid),
     )
     assert record is not None
-    assert record.fee is None
+    # 2026-09-16 fee-at-consume ruling (d934ae5/1133578): the boot fill-walk
+    # now carries the venue-reconciled per-contract fee
+    # (`cumulative_fee / cumulative_qty` when `fee_reconciled`), so this
+    # fixture's reconciled zero-fee fill decodes as `Decimal("0")`, not
+    # `None`. The property under test is unaffected: this leg's `q`
+    # (`be = ask + fee = 0.85`, "yes" side) plus the NO candidate's own
+    # `q = 1 - 0.16 = 0.84` still sums to `1.69 > 1`, so the dropped rung's
+    # fill still drives the real Sigma-q refusal below -- it is no longer
+    # incidentally refused via the "unknown fee" branch instead.
+    assert record.fee == Decimal(0)
     # Model "this rung's ladder entry was dropped on a mid-day relaunch" --
     # removed from `self._facts` ONLY; it stays in `self._config.
     # instrument_ids`/`self.cache.instrument_ids()`, so
