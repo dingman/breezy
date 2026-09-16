@@ -174,19 +174,57 @@ def test_confirmed_dead_with_one_sided_depth_is_missing_stop() -> None:
 
 
 # --------------------------------------------------------------------------
-# LOCKED_BY_OBSERVATION -- mechanistic
+# LOCKED_BY_OBSERVATION -- PLATEAU confirmed (2026-09-16 correction: was
+# mechanistic/immediate, which is exactly the shape of the MIA defect for
+# the sibling NO-leg plateau path below).
 # --------------------------------------------------------------------------
 
 
-def test_locked_when_the_interval_sits_fully_inside_the_rung_after_18_lst() -> None:
+def test_single_locked_reading_is_a_candidate_not_locked() -> None:
     evidence = _evidence(
-        running_max_lower=85, running_max_upper=86, rung_low=84, rung_high=87, hour_lst=18,
+        ts_ns=0, running_max_lower=85, running_max_upper=86,
+        rung_low=84, rung_high=87, hour_lst=18, observed_at_ns=0,
     )
 
-    decision, _ = _evaluate(evidence, MonitorHistory.EMPTY)
+    decision, history = _evaluate(evidence, MonitorHistory.EMPTY)
 
+    assert decision.state is not ThesisState.LOCKED_BY_OBSERVATION
+    assert decision.reason_codes == ("lock_candidate",)
+    assert history.locked_confirm_progress.qualifying_count == 1
+
+
+def test_locked_confirms_via_the_plateau_rule_once_the_span_elapses() -> None:
+    """The running max is FROZEN (same `observed_at_ns` on every reading) --
+    the RISING confirmation gate would never satisfy this; the PLATEAU rule
+    confirms off elapsed evaluation-time span instead.
+    """
+    history = MonitorHistory.EMPTY
+    decision = None
+    for ts_ns in (0, 5 * _MINUTE_NS):
+        evidence = _evidence(
+            ts_ns=ts_ns, running_max_lower=85, running_max_upper=86,
+            rung_low=84, rung_high=87, hour_lst=18, observed_at_ns=0,
+        )
+        decision, history = _evaluate(evidence, history)
+
+    assert decision is not None
     assert decision.state is ThesisState.LOCKED_BY_OBSERVATION
     assert decision.verdict is Verdict.HOLD
+
+
+def test_locked_never_confirms_without_a_single_genuine_observation() -> None:
+    """`observed_at_ns` unset on every reading -- no genuine observation ever
+    backed this geometry, so the plateau rule must never confirm purely off
+    the evaluation clock."""
+    history = MonitorHistory.EMPTY
+    for ts_ns in (0, 5 * _MINUTE_NS, 10 * _MINUTE_NS):
+        evidence = _evidence(
+            ts_ns=ts_ns, running_max_lower=85, running_max_upper=86,
+            rung_low=84, rung_high=87, hour_lst=18,
+        )
+        decision, history = _evaluate(evidence, history)
+
+    assert decision.state is not ThesisState.LOCKED_BY_OBSERVATION
 
 
 def test_not_locked_before_the_locked_hour_even_if_interval_is_inside() -> None:
@@ -386,26 +424,31 @@ def test_no_leg_two_confirmed_win_lock_readings_are_locked_and_hold() -> None:
 
 def test_no_leg_single_inside_rung_after_peak_reading_is_a_candidate_not_dead() -> None:
     evidence = _no_evidence(
-        running_max_lower=85, running_max_upper=86, rung_low=84, rung_high=87, hour_lst=18,
+        ts_ns=0, running_max_lower=85, running_max_upper=86,
+        rung_low=84, rung_high=87, hour_lst=18, observed_at_ns=0,
     )
 
     decision, history = _evaluate(evidence, MonitorHistory.EMPTY)
 
     assert decision.state is not ThesisState.DEAD_BY_OBSERVATION
     assert decision.reason_codes == ("dead_candidate",)
-    assert history.locked_confirm_observed_ns == (0,)
+    assert history.locked_confirm_progress.qualifying_count == 1
 
 
 def test_no_leg_inside_rung_after_peak_confirmed_is_dead_and_exit_recommended() -> None:
+    """The running max is FROZEN (same `observed_at_ns` on both readings,
+    the 2026-09-16 MIA defect shape) -- the PLATEAU rule confirms off the
+    elapsed EVALUATION-time span, never off distinct `observed_at_ns`
+    instants (which never arrive for a plateau)."""
     first = _no_evidence(
         ts_ns=0, running_max_lower=85, running_max_upper=86,
-        rung_low=84, rung_high=87, hour_lst=18,
+        rung_low=84, rung_high=87, hour_lst=18, observed_at_ns=0,
     )
     _, history = _evaluate(first, MonitorHistory.EMPTY)
 
     second = _no_evidence(
         ts_ns=5 * _MINUTE_NS, running_max_lower=85, running_max_upper=86,
-        rung_low=84, rung_high=87, hour_lst=18,
+        rung_low=84, rung_high=87, hour_lst=18, observed_at_ns=0,
     )
     decision, _ = _evaluate(second, history)
 
@@ -417,18 +460,125 @@ def test_no_leg_inside_rung_after_peak_confirmed_is_dead_and_exit_recommended() 
 def test_no_leg_inside_rung_after_peak_confirmed_with_stale_book_is_missing_stop() -> None:
     first = _no_evidence(
         ts_ns=0, running_max_lower=85, running_max_upper=86,
-        rung_low=84, rung_high=87, hour_lst=18, book_staleness_ns=0,
+        rung_low=84, rung_high=87, hour_lst=18, book_staleness_ns=0, observed_at_ns=0,
     )
     _, history = _evaluate(first, MonitorHistory.EMPTY)
 
     second = _no_evidence(
         ts_ns=5 * _MINUTE_NS, running_max_lower=85, running_max_upper=86,
         rung_low=84, rung_high=87, hour_lst=18, book_staleness_ns=181 * 1_000_000_000,
+        observed_at_ns=0,
     )
     decision, _ = _evaluate(second, history)
 
     assert decision.state is ThesisState.DEAD_BY_OBSERVATION
     assert decision.verdict is Verdict.MISSING_STOP
+
+
+def test_no_leg_inside_rung_after_peak_never_confirms_without_a_genuine_observation() -> None:
+    """`observed_at_ns` unset on every reading -- pure evaluation-clock ticks
+    with no station observation ever backing the geometry must never confirm
+    DEAD."""
+    history = MonitorHistory.EMPTY
+    for ts_ns in (0, 5 * _MINUTE_NS, 10 * _MINUTE_NS):
+        evidence = _no_evidence(
+            ts_ns=ts_ns, running_max_lower=85, running_max_upper=86,
+            rung_low=84, rung_high=87, hour_lst=18,
+        )
+        decision, history = _evaluate(evidence, history)
+
+    assert decision.state is not ThesisState.DEAD_BY_OBSERVATION
+
+
+def test_mia_shaped_no_leg_plateau_confirms_after_the_locked_hour_via_elapsed_span() -> None:
+    """Reproduces the 2026-09-16 replay defect: a NO position sits inside its
+    rung from BEFORE the locked hour (THREATENED-shaped, module docstring's
+    NO-leg pre-peak bullet), the running max FREEZES (a single
+    `observed_at_ns` for the whole sequence -- it never sets a new extreme
+    again), and evaluations continue every 5 minutes. Before the fix, DEAD
+    confirmation was keyed on distinct `observed_at_ns` instants, which
+    never arrive for a frozen max -- the position stuck at `dead_candidate
+    conf=1` forever (MIA NO [92,93], frozen since 2026-09-15 17:55Z). The
+    PLATEAU rule must confirm once the elapsed EVALUATION-time span since
+    the locked hour began clears `_DEAD_MIN_CONFIRM_SPAN_NS` (5 min).
+    """
+    frozen_observed_at_ns = 0
+    history = MonitorHistory.EMPTY
+
+    # Before the locked hour: THREATENED-shaped candidacy building (module
+    # docstring's NO-leg pre-peak bullet), never DEAD/LOCKED.
+    for ts_ns in (0, 4 * _MINUTE_NS, 10 * _MINUTE_NS):
+        evidence = _no_evidence(
+            ts_ns=ts_ns, running_max_lower=85, running_max_upper=86,
+            rung_low=84, rung_high=87, hour_lst=14, observed_at_ns=frozen_observed_at_ns,
+        )
+        decision, history = _evaluate(evidence, history)
+    assert decision.state is ThesisState.THREATENED
+
+    # The locked hour arrives (hour_lst 18): the SAME frozen max is now
+    # ALSO geometrically "inside the rung after the peak" -- a dead
+    # candidate builds.
+    locked_hour_start_ts_ns = 60 * _MINUTE_NS
+    first_locked = _no_evidence(
+        ts_ns=locked_hour_start_ts_ns, running_max_lower=85, running_max_upper=86,
+        rung_low=84, rung_high=87, hour_lst=18, observed_at_ns=frozen_observed_at_ns,
+    )
+    decision, history = _evaluate(first_locked, history)
+    assert decision.state is not ThesisState.DEAD_BY_OBSERVATION
+    assert decision.reason_codes == ("dead_candidate",)
+
+    # A fresh, sufficient book: EXIT_RECOMMENDED once confirmed.
+    confirming = _no_evidence(
+        ts_ns=locked_hour_start_ts_ns + 5 * _MINUTE_NS, running_max_lower=85,
+        running_max_upper=86, rung_low=84, rung_high=87, hour_lst=18,
+        observed_at_ns=frozen_observed_at_ns,
+    )
+    decision, history = _evaluate(confirming, history)
+    assert decision.state is ThesisState.DEAD_BY_OBSERVATION
+    assert decision.verdict is Verdict.EXIT_RECOMMENDED
+    assert decision.reason_codes == ("no_leg_inside_rung_after_peak",)
+
+
+def test_mia_shaped_plateau_resets_on_a_stale_observation_and_never_confirms_until_fresh() -> None:
+    """A stale reading in the MIDDLE of the plateau run must reset
+    confirmation entirely (``evaluate_monitor``'s stale branch clears every
+    confirmation buffer) -- DEAD is never reached until a fresh run
+    re-accumulates the full span from scratch."""
+    frozen_observed_at_ns = 0
+    history = MonitorHistory.EMPTY
+
+    first = _no_evidence(
+        ts_ns=0, running_max_lower=85, running_max_upper=86,
+        rung_low=84, rung_high=87, hour_lst=18, observed_at_ns=frozen_observed_at_ns,
+    )
+    decision, history = _evaluate(first, history)
+    assert decision.reason_codes == ("dead_candidate",)
+
+    stale = _no_evidence(
+        ts_ns=3 * _MINUTE_NS, running_max_lower=85, running_max_upper=86,
+        rung_low=84, rung_high=87, hour_lst=18, observed_at_ns=frozen_observed_at_ns,
+        staleness_ns=_STALE_BOUND_NS + 1,
+    )
+    decision, history = _evaluate(stale, history)
+    assert decision.state is ThesisState.UNKNOWN
+    assert history.locked_confirm_progress.qualifying_count == 0
+
+    # Immediately after the stale reading, span has NOT re-accumulated yet.
+    resumed = _no_evidence(
+        ts_ns=4 * _MINUTE_NS, running_max_lower=85, running_max_upper=86,
+        rung_low=84, rung_high=87, hour_lst=18, observed_at_ns=frozen_observed_at_ns,
+    )
+    decision, history = _evaluate(resumed, history)
+    assert decision.state is not ThesisState.DEAD_BY_OBSERVATION
+    assert decision.reason_codes == ("dead_candidate",)
+
+    fresh_confirming = _no_evidence(
+        ts_ns=4 * _MINUTE_NS + 5 * _MINUTE_NS, running_max_lower=85, running_max_upper=86,
+        rung_low=84, rung_high=87, hour_lst=18, observed_at_ns=frozen_observed_at_ns,
+    )
+    decision, history = _evaluate(fresh_confirming, history)
+    assert decision.state is ThesisState.DEAD_BY_OBSERVATION
+    assert decision.reason_codes == ("no_leg_inside_rung_after_peak",)
 
 
 def test_no_leg_inside_rung_before_peak_flips_to_threatened_after_confirmations() -> None:
