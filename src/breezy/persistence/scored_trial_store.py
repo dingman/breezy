@@ -44,7 +44,7 @@ from typing import Any
 import pyarrow as pa
 import pyarrow.parquet as pq
 
-from breezy.settlement.trial_scorer import ScoredTrial, SettlementBasis
+from breezy.settlement.trial_scorer import BucketSource, ScoredTrial, SettlementBasis
 
 __all__ = ["SCORED_TRIAL_SCHEMA", "read_scored_trials", "write_scored_trials"]
 
@@ -69,6 +69,13 @@ SCORED_TRIAL_SCHEMA: pa.Schema = pa.schema(
         pa.field("entry_ask", pa.string(), nullable=False),
         pa.field("fill_px", pa.string(), nullable=False),
         pa.field("fee", pa.string(), nullable=False),
+        #: Additive (2026-09-16, defect fix): absent on any file written
+        #: before this column existed -- `read_table(path, schema=...)`
+        #: fills a genuinely missing column with `None` for every row of an
+        #: older file (measured), and `_scored_trial_from_row` maps that
+        #: `None` back to `ScoredTrial.bucket_source`'s own "catalog"
+        #: default, so an old row's meaning is unchanged.
+        pa.field("bucket_source", pa.string(), nullable=True),
     ]
 )
 
@@ -145,11 +152,17 @@ def _row_from_scored_trial(trial: ScoredTrial) -> dict[str, Any]:
         "entry_ask": str(trial.entry_ask),
         "fill_px": str(trial.fill_px),
         "fee": str(trial.fee),
+        "bucket_source": trial.bucket_source,
     }
 
 
 def _scored_trial_from_row(row: dict[str, Any]) -> ScoredTrial:
     settlement_basis: SettlementBasis = row["settlement_basis"]
+    #: `.get` (not `row["bucket_source"]`): a pre-existing file written
+    #: before this column existed decodes with the column present but
+    #: `None` for every row (module docstring); a stored `None` maps to
+    #: `ScoredTrial.bucket_source`'s own "catalog" default either way.
+    bucket_source: BucketSource = row.get("bucket_source") or "catalog"
     return ScoredTrial(
         trial_id=row["trial_id"],
         station=row["station"],
@@ -168,4 +181,5 @@ def _scored_trial_from_row(row: dict[str, Any]) -> ScoredTrial:
         entry_ask=Decimal(row["entry_ask"]),
         fill_px=Decimal(row["fill_px"]),
         fee=Decimal(row["fee"]),
+        bucket_source=bucket_source,
     )

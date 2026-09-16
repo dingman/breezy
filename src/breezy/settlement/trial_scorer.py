@@ -43,6 +43,7 @@ from breezy.domain.weather_bucket_facts import WeatherBucketFacts
 from breezy.settlement.settlement_truth import final_tmax_f
 
 __all__ = [
+    "BucketSource",
     "FilledTrial",
     "ScoreRefusal",
     "ScoredTrial",
@@ -55,6 +56,16 @@ __all__ = [
 _SEVEN_DAYS_NS: int = 7 * 24 * 60 * 60 * 1_000_000_000
 
 SettlementBasis = Literal["nws_final", "venue_last_fair_price_fallback"]
+
+#: Provenance of a scored row's rung facts -- "catalog" (the persisted
+#: instrument definition, the historical and still-preferred source) or
+#: "slug" (derived from the instrument id's own slug grammar when the
+#: catalog held no definition, `scripts/analysis/score_live_trials.py
+#: ._bucket_facts_from_instrument_id`). Defaults to "catalog" so every
+#: existing `ScoredTrial` construction -- including a pre-existing stored
+#: row read back with no persisted value for this column -- keeps its
+#: historical meaning unchanged.
+BucketSource = Literal["catalog", "slug"]
 
 RefusalReason = Literal[
     "no_record",
@@ -137,6 +148,7 @@ class ScoredTrial:
     entry_ask: Decimal
     fill_px: Decimal
     fee: Decimal
+    bucket_source: BucketSource = "catalog"
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)

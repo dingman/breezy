@@ -19,12 +19,19 @@ PY=${BREEZY_FAMILY_TALLY_V2_PYTHON:-$REPO/.venv/bin/python}
 # systemd always sees $REPO/deploy/families, exactly the manifests actually
 # shipped there).
 FAMILIES_DIR="${BREEZY_FAMILY_TALLY_V2_FAMILIES_DIR:-$REPO/deploy/families}"
-# Same store the v1 live tally reads (BREEZY_SCORED_TRIALS_DIR override
-# shared with live-tally-run.sh) and the same reports-dir convention
-# (BREEZY_LIVE_TALLY_OUTPUT_DIR override shared with live-tally-run.sh),
-# so both tallies land artefacts in the same place under
-# ~/.local/share/breezy/derived/.
-STORE_DIR=${BREEZY_SCORED_TRIALS_DIR:-$HOME/.local/share/breezy/derived/scored_trials}
+# Same base store dir the v1 live tally reads (BREEZY_SCORED_TRIALS_DIR
+# override shared with live-tally-run.sh) and the same reports-dir
+# convention (BREEZY_LIVE_TALLY_OUTPUT_DIR override shared with
+# live-tally-run.sh), so both tallies land artefacts in the same place
+# under ~/.local/share/breezy/derived/.
+#
+# L-38: score-live-trials-run.sh now writes each REGISTERED family's rows
+# to its OWN "$STORE_DIR_BASE/<family_id>" subdirectory (never a shared
+# top-level directory -- this CLI's own filter_rows_to_manifest_prefix
+# refuses a store contaminated by another family's rows,
+# FamilyStoreContaminationError). This wrapper reads exactly the one
+# subdirectory matching $FAMILY below.
+STORE_DIR_BASE=${BREEZY_SCORED_TRIALS_DIR:-$HOME/.local/share/breezy/derived/scored_trials}
 OUT=${BREEZY_LIVE_TALLY_OUTPUT_DIR:-$HOME/.local/share/breezy/derived}
 LOG=$OUT/family_tally_v2.log
 
@@ -66,6 +73,10 @@ if [ -z "$FAMILY" ] || ! is_valid_family_id "$FAMILY"; then
   echo "family-tally-v2-run.sh: unknown or missing family id '$FAMILY' -- valid ids: $(echo "$VALID_IDS" | tr '\n' ' ' | sed 's/ *$//')" >&2
   exit 2
 fi
+
+# L-38: this family's own scored-trial subdirectory -- see STORE_DIR_BASE's
+# docstring above.
+STORE_DIR="$STORE_DIR_BASE/$FAMILY"
 
 mkdir -p "$OUT"
 
