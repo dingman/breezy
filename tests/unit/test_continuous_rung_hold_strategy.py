@@ -470,7 +470,14 @@ def test_a_take_appends_an_offer_tape_row_with_decision_inputs_populated(
     """GAP fix 2026-09-15 RED: a genuine Take (same fixture as
     ``test_inflight_commits_before_arm``) must leave one offer-tape row
     behind carrying every postmortem-reconstruction field -- exactly what
-    the 2026-09-15 SFO take's own row was missing."""
+    the 2026-09-15 SFO take's own row was missing.
+
+    ADM-1 fix (2026-09-15): ``admission_reason`` is now populated for every
+    YES Take row (never bare ``None`` -- that was the ADM-1 defect's own
+    observability symptom: a station-day admission check that never ran
+    left every YES row's ``admission_reason`` unconditionally ``None``,
+    admitted or not). A lone candidate on an otherwise-empty station-day
+    always admits (R3-7), so this row reads ``"admitted"``."""
     strategy = _register_and_start(store_path=store_path, instruments=(interior_instrument,))
     strategy.on_data(_observation(temp_c_tenths=300, observed_at_ns=WINDOW_OPEN_NS - 1))
     strategy.on_quote_tick(_quote(INTERIOR_ID, ask="0.40", ts_event=WINDOW_OPEN_NS))
@@ -490,7 +497,7 @@ def test_a_take_appends_an_offer_tape_row_with_decision_inputs_populated(
     assert record.staleness_ns is not None
     assert record.fee_coefficient == Decimal("0.06")
     assert record.observed_at_ns is not None
-    assert record.admission_reason is None
+    assert record.admission_reason == "admitted"
 
 
 def test_a_break_even_refusal_appends_the_numeric_p_bound_and_be_that_produced_it(

@@ -84,6 +84,7 @@ from breezy.strategy.current_rung_hold.trial_day_latch import (
     SIBLING_LEG_TRADED_REASON,
     STATION_DAY_ADMISSION_REASON,
     TAKEN_FROM_FILL_WALK_REASON,
+    Refusal,
     TrialDayLatch,
     TrialDayLatchError,
     TrialDayRecord,
@@ -1153,6 +1154,72 @@ class ContinuousRungHoldStrategy(Strategy):
             running_max=running_max,
         )
 
+        # ADM-1 fix (2026-09-15, docs/core/PROGRESS.md row ADM-1): the YES
+        # arm path never ran the two S4 latch-level gates the NO shadow
+        # path immediately above already runs -- R-10 registers this gate
+        # for BOTH legs (plan MULTI_POSITION_PER_STATION_2026-09-14.md
+        # SS13/SS16: "the tally gate stays as defence in depth and must
+        # never fire on a day the arm-time gate admitted"). Evaluated ONLY
+        # for a Take -- a Refuse never reaches `_maybe_submit`/IN_FLIGHT
+        # below, so it needs no admission check and `yes_admission_refusal`
+        # stays `None` for it (never surfaced on the offer-tape row either,
+        # mirroring `_evaluate_no_side_shadow`'s own `not isinstance(...,
+        # Take)` early branch). Mirrors the NO path's own gate ORDER
+        # (sibling first, then Sigma-q) and its own `existing_instrument_
+        # ids` construction verbatim (today's ladder plus any durable fill
+        # joined to this station-day, each leg deduped with its sibling) --
+        # see `_evaluate_no_side_shadow`'s matching block below for the
+        # shared rationale (TrialDayLatch has no public accessor for its
+        # store/key-prefix; these two gate functions are pure over exactly
+        # those by design).
+        yes_admission_refusal: Refusal | None = None
+        if isinstance(decision, Take):
+            store = self._latch._store
+            prefix = self._latch._key_prefix
+            yes_admission_refusal = refuse_if_sibling_leg_traded(
+                store, prefix, station, climate_day_key, iid,
+            )
+            if yes_admission_refusal is None:
+                existing_ids: list[str] = []
+                seen_ids: set[str] = set()
+
+                def _add_leg(instrument_id_obj: InstrumentId) -> None:
+                    leg_iid = str(instrument_id_obj)
+                    if leg_iid in seen_ids:
+                        return
+                    seen_ids.add(leg_iid)
+                    existing_ids.append(leg_iid)
+
+                for other_iid, other_facts in self._facts.items():
+                    if (
+                        other_facts.settlement_station,
+                        other_facts.climate_day.isoformat(),
+                    ) != station_day:
+                        continue
+                    other_iid_obj = InstrumentId.from_str(other_iid)
+                    _add_leg(other_iid_obj)
+                    _add_leg(sibling_instrument_id(other_iid_obj))
+                for fill_record in self._latch.iter_fill_records(
+                    self._candidate_instrument_ids(),
+                ):
+                    joined = self._join_fill_to_station_day(
+                        InstrumentId.from_str(fill_record.instrument_id),
+                    )
+                    if joined != station_day:
+                        continue
+                    fill_iid_obj = InstrumentId.from_str(fill_record.instrument_id)
+                    _add_leg(fill_iid_obj)
+                    _add_leg(sibling_instrument_id(fill_iid_obj))
+                yes_admission_refusal = station_day_admission(
+                    store,
+                    prefix,
+                    station,
+                    climate_day_key,
+                    "yes",
+                    decision.break_even,
+                    existing_instrument_ids=tuple(existing_ids),
+                )
+
         reason = decision.reason if isinstance(decision, Refuse) else "taken"
         prior = self._eligible_snap_counts.get(station_day, 0)
         illegal = isinstance(decision, Refuse) and decision.reason == "illegal_cell"
@@ -1162,14 +1229,21 @@ class ContinuousRungHoldStrategy(Strategy):
         # never reached the table lookup, except `edge_below_break_even`,
         # which `Refuse` itself now carries). Pure observability: neither
         # branch below changes `decision` or anything it drives.
+        offer_admission_reason: str | None
         if isinstance(decision, Take):
             offer_p_bound: Decimal | None = decision.p_hold_lower
             offer_break_even: Decimal | None = decision.break_even
-            offer_decision_label = "take"
+            if yes_admission_refusal is None:
+                offer_decision_label = "take"
+                offer_admission_reason = "admitted"
+            else:
+                offer_decision_label = "refuse"
+                offer_admission_reason = yes_admission_refusal.reason
         else:
             offer_p_bound = decision.p_bound
             offer_break_even = decision.break_even
             offer_decision_label = "refuse"
+            offer_admission_reason = None
         self.offer_tape.append(
             OfferTapeRecord(
                 station=station,
@@ -1197,7 +1271,7 @@ class ContinuousRungHoldStrategy(Strategy):
                 staleness_ns=staleness_ns,
                 fee_coefficient=fee_coefficient,
                 observed_at_ns=running_max.source_observed_at_ns,
-                admission_reason=None,
+                admission_reason=offer_admission_reason,
                 decision=offer_decision_label,
             )
         )
@@ -1222,6 +1296,21 @@ class ContinuousRungHoldStrategy(Strategy):
                     )
                 return
             self.refusals.record(decision.reason)
+            self._report_alerter(
+                self.refusal_alerter,
+                "continuous_rung_hold refusal report failed",
+            )
+            return
+
+        # ADM-1 fix: `decision` is a genuine Take here (mypy narrows it via
+        # the exhaustive `Refuse` return above), but the arm-time latch
+        # gates computed earlier may still have refused it -- counted and
+        # alerted exactly like every other refusal above, and returned
+        # BEFORE the `take:` log line below (never log a take for a rung
+        # that never armed) and BEFORE `_decision_ask_by_station_day`/
+        # `set_inflight`/`_maybe_submit` (no submit, no IN_FLIGHT).
+        if yes_admission_refusal is not None:
+            self.refusals.record(yes_admission_refusal.reason)
             self._report_alerter(
                 self.refusal_alerter,
                 "continuous_rung_hold refusal report failed",
