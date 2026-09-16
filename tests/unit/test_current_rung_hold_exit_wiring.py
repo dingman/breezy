@@ -477,3 +477,118 @@ def test_record_exit_and_record_ambiguous_exit_are_reachable_from_the_public_lat
         position_id="P-smoke", reason="smoke", ts_ns=WINDOW_OPEN_NS,
     )
     assert strategy._latch.is_family_halted() is True
+
+
+# ---------------------------------------------------------------------------
+# Review finding B: the second layer of the AMBIGUOUS-exit cover.
+# ---------------------------------------------------------------------------
+
+
+def _cached_exit_order(
+    strategy: ContinuousRungHoldStrategy, *, client_order_id: str, position_id: str,
+) -> LimitOrder:
+    order = strategy.order_factory.limit(
+        instrument_id=INTERIOR_ID,
+        order_side=OrderSide.SELL,
+        quantity=Quantity.from_int(1),
+        price=Price.from_str("0.30"),
+        time_in_force=TimeInForce.IOC,
+        reduce_only=False,
+        tags=[
+            f"{_EXIT_RULE_TAG_PREFIX}R_THREAT",
+            f"{_EXIT_POSITION_TAG_PREFIX}{position_id}",
+        ],
+        client_order_id=ClientOrderId(client_order_id),
+    )
+    strategy.cache.add_order(order, position_id=None)
+    return order
+
+
+def test_a_fresh_process_with_no_open_intent_is_a_no_op(
+    store_path: Path, interior_instrument: BinaryOption,
+) -> None:
+    strategy = _register_and_start(store_path=store_path, instruments=(interior_instrument,))
+    assert strategy._latch is not None
+    _cached_exit_order(strategy, client_order_id="O-EXIT-noop", position_id="P-noop")
+
+    strategy.check_ambiguous_exit_intent(
+        client_order_id="O-EXIT-noop", position_id="P-noop", now_ns=WINDOW_OPEN_NS,
+    )
+
+    assert strategy._latch.is_family_halted() is False
+
+
+def test_an_open_intent_younger_than_the_deadline_never_halts(
+    store_path: Path, interior_instrument: BinaryOption,
+) -> None:
+    """RED (pre-fix): `check_ambiguous_exit_intent` did not exist at all.
+    GREEN: an intent still well within a healthy round trip is left alone."""
+    from breezy.adapters.polymarket_us.exec import submit_chain
+
+    strategy = _register_and_start(store_path=store_path, instruments=(interior_instrument,))
+    assert strategy._latch is not None
+    order = _cached_exit_order(strategy, client_order_id="O-EXIT-young", position_id="P-young")
+    strategy._latch._intent_latch.arm(  # type: ignore[union-attr]
+        submit_chain.intent_fingerprint(order), now_ns=WINDOW_OPEN_NS,
+    )
+
+    strategy.check_ambiguous_exit_intent(
+        client_order_id="O-EXIT-young",
+        position_id="P-young",
+        now_ns=WINDOW_OPEN_NS + 1_000_000_000,  # +1s -- well under the 30s deadline
+    )
+
+    assert strategy._latch.is_family_halted() is False
+
+
+def test_an_open_intent_past_the_deadline_with_a_matching_fingerprint_halts_the_family(
+    store_path: Path, interior_instrument: BinaryOption,
+) -> None:
+    """GREEN: the SAME exit order's own intent, still OPEN well past the
+    AMBIGUOUS-send deadline, durably halts the family -- the second-layer
+    cover the exec client's silent-refuse path cannot itself provide."""
+    from breezy.adapters.polymarket_us.exec import submit_chain
+
+    strategy = _register_and_start(store_path=store_path, instruments=(interior_instrument,))
+    assert strategy._latch is not None
+    order = _cached_exit_order(strategy, client_order_id="O-EXIT-stale", position_id="P-stale")
+    strategy._latch._intent_latch.arm(  # type: ignore[union-attr]
+        submit_chain.intent_fingerprint(order), now_ns=WINDOW_OPEN_NS,
+    )
+
+    strategy.check_ambiguous_exit_intent(
+        client_order_id="O-EXIT-stale",
+        position_id="P-stale",
+        now_ns=WINDOW_OPEN_NS + 31_000_000_000,  # +31s -- past the 30s deadline
+    )
+
+    assert strategy._latch.is_family_halted() is True
+
+
+def test_a_stale_open_intent_for_a_DIFFERENT_order_never_halts(
+    store_path: Path, interior_instrument: BinaryOption,
+) -> None:
+    """A stale OPEN intent belonging to a DIFFERENT order (a concurrent
+    entry, or a prior exit for a different position) must never be
+    attributed to THIS position's exit -- the fingerprint match is the
+    unforgeable link, never the client_order_id/position_id arguments
+    alone."""
+    from breezy.adapters.polymarket_us.exec import submit_chain
+
+    strategy = _register_and_start(store_path=store_path, instruments=(interior_instrument,))
+    assert strategy._latch is not None
+    other_order = _cached_exit_order(
+        strategy, client_order_id="O-EXIT-other", position_id="P-other",
+    )
+    strategy._latch._intent_latch.arm(  # type: ignore[union-attr]
+        submit_chain.intent_fingerprint(other_order), now_ns=WINDOW_OPEN_NS,
+    )
+    _cached_exit_order(strategy, client_order_id="O-EXIT-mine", position_id="P-mine")
+
+    strategy.check_ambiguous_exit_intent(
+        client_order_id="O-EXIT-mine",
+        position_id="P-mine",
+        now_ns=WINDOW_OPEN_NS + 31_000_000_000,
+    )
+
+    assert strategy._latch.is_family_halted() is False

@@ -3053,6 +3053,103 @@ async def test_a_tagged_exit_is_denied_when_the_live_manifest_declares_no_exit_r
     assert denials[0].reason == "family does not declare a registered exit rule; refusing"
 
 
+@pytest.mark.asyncio
+async def test_a_tagged_exit_with_a_vanished_instrument_denies_before_fabricating_a_leg(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    write_canonical_verified: None,  # noqa: F811
+) -> None:
+    """Item C (POSITION_EXIT_EXECUTION_2026-09-16.md review, LOW): an
+    exit-tagged order for an instrument absent from the cache must deny
+    immediately, never construct an `_AdapterExitAuthorization` with a
+    fabricated `exit_leg="yes"` placeholder. The instrument below is never
+    registered on `rig.client._cache`, standing in for the (already-logged
+    elsewhere) "instrument vanished from cache" race."""
+    sender = _FakeOrderSender()
+    rig = _build_accept_fill_rig(
+        tmp_path, monkeypatch=monkeypatch, sender=sender, exit_manifest=ARMED_EXIT_MANIFEST,
+    )
+    vanished_instrument = _no_leg_instrument()  # deliberately NOT added to rig.client._cache
+    command = rig.limit_exit_sell(instrument=vanished_instrument)
+
+    with _accept_fill_caps():
+        await rig.client._connect()
+        await rig.client._submit_order(command)
+        await rig.client._disconnect()
+
+    assert sender.calls == [], "a vanished instrument must never reach transport"
+    denials = [event for event in rig.order_events if isinstance(event, OrderDenied)]
+    assert len(denials) == 1
+    assert denials[0].reason == "instrument is not a BinaryOption; refusing"
+
+
+@pytest.mark.asyncio
+async def test_an_ambiguous_exit_send_leaves_the_durable_intent_open_across_a_restart(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    write_canonical_verified: None,  # noqa: F811
+) -> None:
+    """Review finding B (POSITION_EXIT_EXECUTION_2026-09-16.md, first layer
+    of the AMBIGUOUS-exit cover): an exit order whose create-order response
+    classifies `KIND_AMBIGUOUS` (with-id, L-36 shape) leaves the
+    account-wide `SubmitIntentLatch` OPEN on disk -- `_submit_order`'s own
+    `arm()` -> POST -> classify prefix is IDENTICAL for an entry and an
+    exit, so this needs no new production code, only proof. A brand-new
+    client instance over the SAME store (standing in for a process restart)
+    still sees the OPEN singleton and refuses BOTH the next entry AND the
+    next exit with the SAME open-intent reason, until an operator retires
+    it -- this is the durable cover the exec client's silent, in-memory
+    `_refuse` on a POST exception/AMBIGUOUS classification cannot itself
+    provide via an order event."""
+    order_id = "ord-exit-ambiguous-1"
+    sender = _FakeOrderSender()
+    sender.response = VenueResponse(status=200, headers={}, body=_ambiguous_with_id_body(order_id))
+    rig = _build_accept_fill_rig(
+        tmp_path, monkeypatch=monkeypatch, sender=sender, exit_manifest=ARMED_EXIT_MANIFEST,
+    )
+
+    with _accept_fill_caps():
+        await rig.client._connect()
+        await rig.client._submit_order(rig.limit_exit_sell())
+
+        assert rig.client._latch is not None
+        assert rig.client._latch.is_latched() is True, (
+            "an AMBIGUOUS exit send must leave the account-wide intent OPEN"
+        )
+        denials_first = [event for event in rig.order_events if isinstance(event, OrderDenied)]
+        assert denials_first == [], (
+            "AMBIGUOUS raises no order event at all -- this is exactly the "
+            "gap the durable latch, not an OrderDenied/OrderRejected, covers"
+        )
+
+        await rig.client._disconnect()
+    # Release the flock this rig's `open_submit_intent_latch` call holds --
+    # standing in for the process exiting -- so a SECOND client can open the
+    # SAME store, exactly like a restarted process would.
+    rig._latch_cm.__exit__(None, None, None)
+
+    second_sender = _FakeOrderSender()
+    restarted_rig = _build_accept_fill_rig(
+        tmp_path, monkeypatch=monkeypatch, sender=second_sender, exit_manifest=ARMED_EXIT_MANIFEST,
+    )
+
+    with _accept_fill_caps():
+        await restarted_rig.client._connect()
+        await restarted_rig.client._submit_order(restarted_rig.limit_buy())
+        await restarted_rig.client._submit_order(restarted_rig.limit_exit_sell())
+        await restarted_rig.client._disconnect()
+
+    assert second_sender.calls == [], (
+        "a restarted client over the SAME store must never let ANY order -- "
+        "entry or exit -- reach transport while the intent is still OPEN"
+    )
+    restart_denials = [
+        event for event in restarted_rig.order_events if isinstance(event, OrderDenied)
+    ]
+    assert len(restart_denials) == 2
+    assert all(denial.reason == submit_chain.OPEN_INTENT_WAIT_REASON for denial in restart_denials)
+
+
 def _exit_shaped_body_with_echo(
     slug: str, *, order_id: str, side: str, intent: str, last_px: str = "0.37"
 ) -> bytes:

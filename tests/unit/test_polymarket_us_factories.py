@@ -92,6 +92,7 @@ from breezy.adapters.polymarket_us.websocket import (
     PolymarketUSMarketsWebSocketPool,
 )
 from breezy.adapters.polymarket_us.write_transport import PolymarketUSWriteTransport
+from breezy.persistence.family_manifest import FamilyManifest
 from breezy.runtime.settings import SettingsError
 
 CLIENT_NAME = "POLYMARKET_US"
@@ -521,6 +522,40 @@ def test_exec_create_forwards_the_timeouts(tmp_path: Path, wired: dict[str, Any]
 
     assert client._instrument_wait_timeout_s == 12.0
     assert client._account_registration_timeout_s == 34.0
+
+
+def test_exec_create_forwards_the_exit_manifest(tmp_path: Path, wired: dict[str, Any]) -> None:
+    """Review finding A(2) (POSITION_EXIT_EXECUTION_2026-09-16.md §5.1): the
+    config's own ``exit_manifest`` field must reach the constructed client,
+    exactly like ``submit_veto``. RED (pre-fix): ``PolymarketUSExecClientConfig``
+    carried no ``exit_manifest`` field at all -- ``make_exec_config`` would
+    raise ``TypeError`` on the unknown kwarg. GREEN: the client's own
+    ``_exit_manifest`` is the SAME object the config carried, never ``None``
+    when one was supplied."""
+    manifest = FamilyManifest(
+        family_id="pm_us_crh_cont",
+        venue="polymarket_us",
+        trial_id_prefix="continuous_rung_hold/trial/",
+        d0_climate_day="2026-09-01",
+        boundary_artefact_path=Path("deploy/families/placeholder.json"),
+        boundary_inputs_sha256="0" * 64,
+        stations=("SFO",),
+        status="REGISTERED",
+        manifest_sha256="0" * 64,
+        exit_rule=None,
+    )
+    client = build_exec_client(make_exec_config(tmp_path, exit_manifest=manifest))
+
+    assert client._exit_manifest is manifest
+
+
+def test_exec_create_defaults_the_exit_manifest_to_none(
+    tmp_path: Path, wired: dict[str, Any]
+) -> None:
+    """Byte-identical for every composition root that predates this field."""
+    client = build_exec_client(make_exec_config(tmp_path))
+
+    assert client._exit_manifest is None
 
 
 def test_exec_create_rejects_a_config_of_the_wrong_type(wired: dict[str, Any]) -> None:

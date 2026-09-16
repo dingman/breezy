@@ -1074,6 +1074,7 @@ def parse_order_status_report(
     account_id: AccountId,
     report_id: UUID4,
     ts_init: int,
+    closing: bool = False,
 ) -> OrderStatusReport:
     """Map an ``Order`` (``types/orders.py:70-92``) to the native report.
 
@@ -1082,6 +1083,18 @@ def parse_order_status_report(
     and promoting an undefined timestamp to "the last order status change"
     would put an invented event time into reconciliation. Using the one field
     whose meaning is unambiguous states less, and states nothing false.
+
+    ``closing`` (INC-E2d, mirrors :func:`parse_fill_report`'s own parameter
+    exactly, default ``False`` -- byte-unchanged for every existing entry-path
+    caller): forwarded to :func:`_order_side_for_leg` so a closing (exit)
+    order's GET-resolved status report is checked against the disjoint exit
+    echo table and reports ``order_side=OrderSide.SELL``, instead of the
+    entry-only BUY table always refusing it. Without this, the with-id
+    AMBIGUOUS resolver (``exec/client.py``'s ``_resolve_ambiguous_intents``)
+    has no way to ever resolve an exit order's GET response: it always
+    applied the entry echo table, so a genuinely-filled exit stayed
+    ``mapping_error``/AMBIGUOUS forever, leaving the account-wide
+    ``SubmitIntentLatch`` OPEN indefinitely.
     """
     context = "order status report"
     order = _known_order(payload, context=context)
@@ -1089,7 +1102,7 @@ def parse_order_status_report(
         order.get("marketSlug"), instrument=instrument, context=context
     )
     leg = leg_of(instrument.id)
-    order_side = _order_side_for_leg(order, leg=leg, context=context)
+    order_side = _order_side_for_leg(order, leg=leg, context=context, closing=closing)
 
     ts_accepted = parse_rfc3339_nanos(
         _require(order, "createTime", context=context),

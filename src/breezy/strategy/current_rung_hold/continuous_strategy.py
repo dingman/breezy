@@ -2061,6 +2061,20 @@ class ContinuousRungHoldStrategy(Strategy):
         """
         exit_wiring.submit_exit(self, proposal)
 
+    def check_ambiguous_exit_intent(
+        self, *, client_order_id: str, position_id: str, now_ns: int,
+    ) -> None:
+        """Injected into `PositionMonitor` as its `check_ambiguous_exit`
+        callable (review finding B). Thin delegator (extraction:
+        `exit_wiring.py`, brief's "keep continuous_strategy.py growth
+        small") -- kept as a bound method so `PositionMonitor` can be handed
+        a plain callable without the composition root reaching into
+        `exit_wiring` itself.
+        """
+        exit_wiring.check_exit_intent_for_ambiguous_send(
+            self, client_order_id=client_order_id, position_id=position_id, now_ns=now_ns,
+        )
+
     def _recorded_fee_for(
         self, instrument_id: InstrumentId, venue_order_id: str,
     ) -> Decimal | None:

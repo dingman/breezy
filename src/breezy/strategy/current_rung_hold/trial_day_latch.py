@@ -73,6 +73,7 @@ from breezy.adapters.polymarket_us.symbology import (
 )
 from breezy.runtime.submit_intent import (
     StateStore,
+    SubmitIntent,
     SubmitIntentLatch,
     SubmitIntentLockNotHeld,
     _HeldSubmitIntentLock,
@@ -629,6 +630,27 @@ class TrialDayLatch:
             )
         return self._intent_latch.is_latched()
 
+    def current_open_submit_intent(self) -> SubmitIntent | None:
+        """Review finding B (``POSITION_EXIT_EXECUTION_2026-09-16.md``):
+        the currently OPEN account-wide submit intent, or ``None`` -- the
+        read-only surface ``exit_wiring.check_exit_intent_for_ambiguous_
+        send`` needs to tell whether ITS OWN prior exit order is the one
+        still stuck open, and for how long.
+
+        A read-only pass-through over the SAME store and flock ``is_intent_
+        open()`` already shares -- delegates to
+        ``SubmitIntentLatch.current_open()`` on the ``intent_latch`` bound
+        at construction. Never polls the venue: this is a local read of the
+        durable singleton this process (or a sibling that shares the same
+        store) already wrote.
+        """
+        self._require_held()
+        if self._intent_latch is None:
+            raise TrialDayLatchError(
+                "current_open_submit_intent() requires a TrialDayLatch bound "
+                "to an intent_latch at construction; see open_trial_day_latch"
+            )
+        return self._intent_latch.current_open()
 
     def _trial_key(
         self, station: str, climate_day: str, *, key_instrument_id: str | None = None,

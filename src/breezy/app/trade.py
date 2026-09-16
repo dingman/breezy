@@ -27,6 +27,11 @@ from nautilus_trader.trading.strategy import Strategy
 
 from breezy.adapters.polymarket_us.factories import exec_config_from_env
 from breezy.domain.climate_day import climate_day_for_instant
+from breezy.persistence.family_manifest import (
+    FamilyManifest,
+    FamilyManifestError,
+    load_family_manifest,
+)
 from breezy.registry.sites import default_registry
 from breezy.runtime import trade_cli
 from breezy.runtime.health import AlertPayload, emit_alert, resolve_alert_sink
@@ -55,6 +60,18 @@ from breezy.strategy.current_rung_hold.trial_day_latch import (
 )
 
 _VENUE = "polymarket_us"
+
+#: Review finding A(1)/A(2) (``POSITION_EXIT_EXECUTION_2026-09-16.md`` §5.1):
+#: the LIVE ``continuous_rung_hold`` family's own manifest, resolved
+#: relative to the process CWD -- `trade_supervisor.py`'s
+#: `_launch`/`_relaunch` always set `cwd=str(repo_root)` before spawning this
+#: process, the same relative-path convention `deploy/families/*.json`
+#: already uses everywhere else (test fixtures, `scripts/analysis/*`'s own
+#: `--family-manifest` CLI args). This is the ONLY family
+#: `build_continuous_rung_hold_strategies` composes today (trial_id_prefix
+#: ``continuous_rung_hold/trial/`` matches exactly), so it is the one and
+#: only manifest ever loaded here -- never a second, competing lookup.
+_LIVE_CONTINUOUS_FAMILY_MANIFEST_PATH: Final[Path] = Path("deploy/families/pm_us_crh_cont.json")
 
 #: ``AlertPayload.event``/``site``/``severity`` for a refused live-trading
 #: permit in ``main()`` -- the ONLY refusal here that continues the run in
@@ -194,6 +211,7 @@ def run(
             )
             strategies: list[Strategy] = []
             submit_veto: Callable[[], str | None] | None = None
+            exit_manifest: FamilyManifest | None = None
             if settings.current_rung_hold:
                 factory = make_trial_day_latch_factory(latch)
                 strategies.extend(
@@ -223,6 +241,14 @@ def run(
                     latch, key_prefix=CONTINUOUS_TRIAL_KEY_PREFIX,
                 )
                 submit_veto = family_halt_submit_veto(family_halt_latch)
+                # Review finding A(1)/A(2): the LIVE family's own manifest,
+                # threaded into BOTH the position monitor (which evaluates
+                # an exit and refuses with `family_not_exit_registered`
+                # -- the manifest declares no `exit_rule`) and the exec
+                # client (which denies with the same manifest-gate reason if
+                # anything ever reached it). One load, one object, passed to
+                # both -- never two independent reads of the same file.
+                exit_manifest = load_family_manifest(_LIVE_CONTINUOUS_FAMILY_MANIFEST_PATH)
                 strategies.extend(
                     build_continuous_rung_hold_strategies(
                         catalog_root=catalog_root,
@@ -236,6 +262,7 @@ def run(
                         # permit), so lifting the guard is exactly and only
                         # conditioned on that permit being present.
                         phase0_permit_guard=v3_permit is None,
+                        exit_manifest=exit_manifest,
                     )
                 )
             composed = tuple(strategies)
@@ -250,12 +277,18 @@ def run(
                 settings=settings,
                 exec_client_config=exec_client_config,
                 submit_veto=submit_veto,
+                exit_manifest=exit_manifest,
             )
     except (
         SettingsError,
         OSError,
         SubmitIntentLockHeld,
         SubmitIntentLockError,
+        # A missing/malformed `deploy/families/pm_us_crh_cont.json` is a
+        # deployment defect, not a crash: the process should refuse to start
+        # cleanly (exit 2) rather than take down a live-trading node on a
+        # file it should never be missing.
+        FamilyManifestError,
         # Defense in depth, not the intended path: `phase0_permit_guard=
         # (v3_permit is None)` above makes this unreachable when
         # `phase1_family_permits`'s own invariant holds (a non-None

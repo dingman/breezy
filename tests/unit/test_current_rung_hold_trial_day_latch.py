@@ -678,6 +678,53 @@ class TestIsIntentOpen:
                 bare.is_intent_open()
 
 
+class TestCurrentOpenSubmitIntent:
+    """Review finding B (POSITION_EXIT_EXECUTION_2026-09-16.md): the
+    read-only pass-through ``exit_wiring.check_exit_intent_for_ambiguous_
+    send`` needs to see whether ITS OWN exit is the account-wide singleton
+    still stuck OPEN."""
+
+    def test_none_on_a_fresh_never_armed_latch(self, store_path: Path) -> None:
+        with open_submit_intent_latch(SqliteStateStore(store_path), store_path) as intent_latch:
+            latch = open_trial_day_latch(intent_latch)
+            assert latch.current_open_submit_intent() is None
+
+    def test_returns_the_armed_intent_with_its_fingerprint_and_created_ns(
+        self, store_path: Path,
+    ) -> None:
+        with open_submit_intent_latch(SqliteStateStore(store_path), store_path) as intent_latch:
+            latch = open_trial_day_latch(intent_latch)
+            armed = intent_latch.arm("a" * 64, now_ns=123)
+            current = latch.current_open_submit_intent()
+            assert current is not None
+            assert current.intent_id == armed.intent_id
+            assert current.fingerprint == "a" * 64
+            assert current.created_ns == 123
+
+    def test_none_again_once_retired(self, store_path: Path) -> None:
+        from breezy.runtime.submit_intent import RetirementReason
+
+        with open_submit_intent_latch(SqliteStateStore(store_path), store_path) as intent_latch:
+            latch = open_trial_day_latch(intent_latch)
+            intent = intent_latch.arm("a" * 64, now_ns=1)
+            assert latch.current_open_submit_intent() is not None
+            intent_latch.retire(
+                intent.intent_id,
+                RetirementReason.DEFINITIVE_REJECT,
+                now_ns=2,
+            )
+            assert latch.current_open_submit_intent() is None
+
+    def test_a_trial_day_latch_built_without_an_intent_latch_refuses_to_answer(
+        self, store_path: Path,
+    ) -> None:
+        with open_submit_intent_latch(SqliteStateStore(store_path), store_path) as intent_latch:
+            store, lock = intent_latch.shared_state_binding()
+            bare = TrialDayLatch(store, lock)
+            with pytest.raises(TrialDayLatchError):
+                bare.current_open_submit_intent()
+
+
 class TestDuplicateFillAndFamilyHalt:
     """Slice 4 item B1 (plan rev 6.1)."""
 

@@ -33,6 +33,7 @@ from typing import Any
 import pytest
 from nautilus_trader.common.component import LiveClock
 from nautilus_trader.common.factories import OrderFactory
+from nautilus_trader.model.enums import OrderSide
 from nautilus_trader.model.events import OrderDenied
 from nautilus_trader.model.identifiers import ClientOrderId, VenueOrderId
 
@@ -1776,3 +1777,169 @@ async def test_a_failed_refresh_read_leaves_the_prior_evidence_intact_and_the_re
         assert "self._log.info(" in immediate, (
             f"{method.__name__}: the retire INFO line must immediately follow _retire()"
         )
+
+
+# ---------------------------------------------------------------------------
+# Coordinator item D (POSITION_EXIT_EXECUTION_2026-09-16.md, security review):
+# `_resolve_ambiguous_intents` must derive `closing` from the durable
+# context's own `order_side`, mirroring INC-E2's `parse_fill_report(closing=)`
+# wiring -- otherwise a GET-resolved EXIT order always applies the entry echo
+# table, always classifies `mapping_error`, and leaves the account-wide
+# `SubmitIntentLatch` OPEN forever.
+# ---------------------------------------------------------------------------
+
+
+def _closing_order_get_body(
+    order_id: str, *, slug: str, side: str, intent: str, cum_quantity: float, avg_px: str,
+) -> dict[str, Any]:
+    """``_order_get_body``'s shape with the (side, intent) echo pair driven
+    independently, so a closing-order GET response can be built for either
+    the pinned YES or NO close echo."""
+    return {
+        "order": {
+            "id": order_id,
+            "marketSlug": slug,
+            "side": side,
+            "intent": intent,
+            "type": "ORDER_TYPE_LIMIT",
+            "price": {"value": avg_px, "currency": "USD"},
+            "quantity": 1,
+            "cumQuantity": cum_quantity,
+            "leavesQuantity": 1 - cum_quantity,
+            "tif": "TIME_IN_FORCE_IMMEDIATE_OR_CANCEL",
+            "state": "ORDER_STATE_FILLED",
+            "createTime": TS_EVENT_TEXT,
+            "avgPx": {"value": avg_px, "currency": "USD"},
+        }
+    }
+
+
+async def _arm_one_ambiguous_exit_intent(
+    tmp_path: Path,
+) -> tuple[PolymarketUSExecutionClient, str, str, Any, list[Any]]:
+    """Like :func:`_arm_one_ambiguous_intent`, but the durable resolver
+    context is overwritten to ``order_side="SELL"`` immediately after
+    arming -- standing in for a real exit order's own AMBIGUOUS create (item
+    A wires the exit-manifest gate that would let a real one reach here;
+    this test isolates the resolver's GET-side behaviour from that gate)."""
+    client, order_id, slug, latch_cm, order_events = await _arm_one_ambiguous_intent(tmp_path)
+    assert client._latch is not None
+    current = client._latch.current_open()
+    assert current is not None
+    key = f"{RESOLVER_CONTEXT_KEY_PREFIX}{current.intent_id}"
+    raw = client._store_get(key)
+    assert raw is not None
+    context = AmbiguousResolverContext.from_bytes(raw)
+    client._store_set(key, replace(context, order_side="SELL").to_bytes())
+    return client, order_id, slug, latch_cm, order_events
+
+
+@pytest.mark.asyncio
+async def test_a_stored_exit_context_with_the_pinned_close_echo_resolves_via_the_get_resolver(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    write_canonical_verified: None,  # noqa: F811
+) -> None:
+    """RED (pre-fix): `parse_order_status_report` carried no `closing`
+    parameter, so this GET body -- the pinned YES-close echo (SELL/
+    SELL_LONG) -- always refused as a wrong-side entry echo and stayed
+    `mapping_error`/AMBIGUOUS forever. GREEN: the resolver derives
+    `closing=True` from the stored context's own `order_side == "SELL"`,
+    the report maps, and the exit resolves through the SAME
+    `_resolve_accept_fill` an entry fill does."""
+    enable_operator_gate(monkeypatch, order_count="2")
+    with operator_control_env(MAX_DAILY_BUDGET_USD_ENV_VAR, "1000.00"), operator_control_env(
+        MAX_POSITION_COST_USD_ENV_VAR, "10.00",
+    ):
+        client, order_id, slug, _latch_cm, order_events = await _arm_one_ambiguous_exit_intent(
+            tmp_path,
+        )
+        client._private_read._payloads[  # type: ignore[attr-defined]
+            f"/v1/order/{order_id}"
+        ] = _closing_order_get_body(
+            order_id,
+            slug=slug,
+            side="ORDER_SIDE_SELL",
+            intent="ORDER_INTENT_SELL_LONG",
+            cum_quantity=1,
+            avg_px="0.55",
+        )
+        # eof-complete, a LONG still present (a closing SELL reduces it, but
+        # `_resolve_accept_fill`'s own positions check only asks whether one
+        # is present, never how many contracts remain).
+        client._private_read._payloads["/v1/portfolio/positions"] = {  # type: ignore[attr-defined]
+            "positions": {slug: {"netPosition": "1"}},
+            "eof": True,
+        }
+        instrument = build_instrument()
+
+        await _run_resolver_passes(client, count=1)
+
+        for kind in client._resolver_last_failure_kind.values():
+            assert kind != "mapping_error", (
+                "the exit GET response must map, never stay mapping_error"
+            )
+        assert client._resolver_consecutive_failures == 0
+
+        assert client._latch is not None
+        current = client._latch.current()
+        assert current is not None
+        assert current.state is SubmitIntentState.RETIRED
+        assert current.retirement_reason is not None
+        assert current.retirement_reason.value == "STATUS_REPORT_ACCEPT_FILL_TERMINAL"
+
+        records = client.fill_records_for(instrument.id)
+        assert len(records) == 1
+        assert records[0].order_side == "SELL"
+        assert records[0].cumulative_cost == Decimal("0.55")
+
+        filled = _order_filled_events(order_events)
+        assert len(filled) == 1
+        assert filled[0].order_side == OrderSide.SELL
+        assert filled[0].last_px.as_decimal() == Decimal("0.55")
+        await client._disconnect()
+
+
+@pytest.mark.asyncio
+async def test_the_same_get_body_under_an_entry_context_stays_mapping_error(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    write_canonical_verified: None,  # noqa: F811
+) -> None:
+    """The disjoint-table regression guard: the IDENTICAL close-echoed GET
+    body, resolved under a plain entry context (`order_side` left at its
+    `LONG_ONLY_SIDE` default, exactly what a pre-existing durable blob
+    decodes to), must still classify `mapping_error` -- `closing` is derived
+    from the context, never from the response body."""
+    enable_operator_gate(monkeypatch, order_count="2")
+    with operator_control_env(MAX_DAILY_BUDGET_USD_ENV_VAR, "1000.00"), operator_control_env(
+        MAX_POSITION_COST_USD_ENV_VAR, "10.00",
+    ):
+        client, order_id, slug, _latch_cm, _order_events = await _arm_one_ambiguous_intent(
+            tmp_path,
+        )
+        client._private_read._payloads[  # type: ignore[attr-defined]
+            f"/v1/order/{order_id}"
+        ] = _closing_order_get_body(
+            order_id,
+            slug=slug,
+            side="ORDER_SIDE_SELL",
+            intent="ORDER_INTENT_SELL_LONG",
+            cum_quantity=1,
+            avg_px="0.55",
+        )
+        client._private_read._payloads["/v1/portfolio/positions"] = {  # type: ignore[attr-defined]
+            "positions": {slug: {"netPosition": "1"}},
+            "eof": True,
+        }
+
+        await _run_resolver_passes(client, count=1)
+
+        assert client._resolver_consecutive_failures >= 1
+        assert client._latch is not None
+        current = client._latch.current()
+        assert current is not None
+        assert current.state is SubmitIntentState.OPEN, (
+            "an entry context must never resolve against a close echo"
+        )
+        await client._disconnect()

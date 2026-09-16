@@ -137,6 +137,11 @@ class _MonitoredPosition:
     last_exit_reason_code: str | None = None
     last_exit_limit_price: Decimal | None = None
     last_exit_expected_settlement_value: Decimal | None = None
+    #: Review finding B: the client_order_id of the MOST RECENT fired
+    #: exit for this position, so the NEXT evaluation can check (via
+    #: ``check_ambiguous_exit``) whether that prior exit's own durable
+    #: intent is still stuck OPEN past the AMBIGUOUS-send deadline.
+    last_exit_client_order_id: str | None = None
 
 
 def _exit_offer_tape_record(
@@ -225,6 +230,7 @@ class PositionMonitor:
         exit_client_order_id_factory: Callable[[], str] | None = None,
         submit_exit: Callable[[ExitProposal], None] | None = None,
         record_exit_offer: Callable[[OfferTapeRecord], None] | None = None,
+        check_ambiguous_exit: Callable[..., None] | None = None,
     ) -> None:
         self._clock_ns = clock_ns
         self._positions_open = positions_open
@@ -252,6 +258,9 @@ class PositionMonitor:
         self._exit_client_order_id_factory = exit_client_order_id_factory
         self._submit_exit = submit_exit
         self._record_exit_offer = record_exit_offer
+        #: Review finding B: the SAME shadow-only default posture --
+        #: `None` unless a caller opts in alongside the five above.
+        self._check_ambiguous_exit = check_ambiguous_exit
 
         self._positions: dict[str, _MonitoredPosition] = {}
         #: A3: negative `TrialDayRecord` lookups cached per (instrument_id,
@@ -519,6 +528,16 @@ class PositionMonitor:
         """
         if self._exit_decider is None:
             return
+        # Review finding B: checked on EVERY evaluation once a prior exit
+        # has fired for this position -- never gated on THIS tick's state --
+        # so a stuck AMBIGUOUS send is caught even if the position's thesis
+        # has since drifted back toward ALIVE/HOLD.
+        if self._check_ambiguous_exit is not None and monitored.last_exit_client_order_id:
+            self._check_ambiguous_exit(
+                client_order_id=monitored.last_exit_client_order_id,
+                position_id=monitored.position_id,
+                now_ns=now_ns,
+            )
         if decision.state not in (ThesisState.THREATENED, ThesisState.DEAD_BY_OBSERVATION):
             return
         assert self._exit_manifest is not None
@@ -561,6 +580,7 @@ class PositionMonitor:
 
         if isinstance(outcome, ExitProposal):
             monitored.last_exit_decided_at_ns = now_ns
+            monitored.last_exit_client_order_id = outcome.authorization.client_order_id
             self._station_day_exit_counts[station_day_key] = (
                 self._station_day_exit_counts.get(station_day_key, 0) + 1
             )

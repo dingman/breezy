@@ -25,6 +25,7 @@ from nautilus_trader.model.enums import TimeInForce
 from nautilus_trader.model.identifiers import ClientOrderId, InstrumentId, PositionId
 from nautilus_trader.model.orders import Order
 
+from breezy.adapters.polymarket_us.exec import submit_chain
 from breezy.persistence.exit_tags import (
     EXIT_CLIENT_ORDER_ID_TAG_PREFIX,
     EXIT_FAMILY_TAG_PREFIX,
@@ -46,6 +47,7 @@ __all__ = [
     "EXIT_FAMILY_TAG_PREFIX",
     "EXIT_POSITION_TAG_PREFIX",
     "EXIT_RULE_TAG_PREFIX",
+    "check_exit_intent_for_ambiguous_send",
     "exit_position_id_from_tags",
     "exit_rule_from_tags",
     "halt_family_for_ambiguous_exit",
@@ -81,6 +83,19 @@ _DIAG_FAMILY_HALT_AMBIGUOUS_EXIT: Final[str] = "family_halt_ambiguous_exit"
 _POSITION_EXIT_FILLED: Final[str] = "exit_filled"
 _POSITION_EXIT_ORDER_REJECTED: Final[str] = "exit_order_rejected"
 _POSITION_EXIT_FILL_JOIN_ERROR: Final[str] = "exit_fill_join_error"
+
+#: Review finding B (POSITION_EXIT_EXECUTION_2026-09-16.md, PREREG v4 §5.4/
+#: §5b): how long an exit order's own durable ``SubmitIntent`` may sit OPEN
+#: before this strategy treats it as an AMBIGUOUS send that will never
+#: surface as an ``OrderDenied``/``OrderRejected`` event. The exec client's
+#: own IOC ``maxBlockTime`` wire value is 5 seconds
+#: (``adapters/polymarket_us/exec/submit_chain.py``'s ``_MAX_BLOCK_TIME``) --
+#: an intent still OPEN long after that was never going to resolve as a
+#: clean accept/deny on the venue's own clock. Set well above it (never
+#: re-derived from the private wire literal) so a merely-slow-but-healthy
+#: POST round trip is never mistaken for AMBIGUOUS.
+_AMBIGUOUS_EXIT_STALE_NS: Final[int] = 30_000_000_000  # 30s
+_AMBIGUOUS_EXIT_INTENT_STALE: Final[str] = "submit_intent_open_past_deadline"
 
 
 def order_is_exit(order: Order) -> bool:
@@ -119,6 +134,62 @@ def halt_family_for_ambiguous_exit(
     strategy.position_events.record(_POSITION_EXIT_ORDER_REJECTED)
     strategy._report_alerter(
         strategy.diagnostics_alerter, "continuous_rung_hold diagnostics report failed",
+    )
+
+
+def check_exit_intent_for_ambiguous_send(
+    strategy: ContinuousRungHoldStrategy,
+    *,
+    client_order_id: str,
+    position_id: str,
+    now_ns: int,
+) -> None:
+    """Review finding B: the SECOND layer of the AMBIGUOUS-exit cover.
+
+    A POST exception or a ``KIND_AMBIGUOUS`` classification inside the exec
+    client's ``_submit_order`` calls ``self._refuse(...)`` (in-memory only)
+    and raises NO order event at all -- ``on_order_denied``/
+    ``on_order_rejected`` are therefore never reached for this failure mode,
+    so the durable family-wide halt those two handlers set can never fire
+    for it either. The FIRST layer already covers this without any code
+    here: the account-wide ``SubmitIntentLatch`` is armed (left OPEN on
+    disk) BEFORE the POST, so every subsequent order -- entry or exit --
+    is refused with ``submit_chain.OPEN_INTENT_WAIT_REASON`` until an
+    operator retires it via the durable-intent CLI.
+
+    THIS function is the second layer: called by ``submit_exit`` on ITS next
+    invocation for the SAME position (never a venue poll, never a timer --
+    the read happens only when the strategy is already about to act again),
+    it durably sets the FAMILY halt too, once it can prove -- via the
+    latch's own read-only API -- that the PRIOR exit's own intent is still
+    the one OPEN, and has been open longer than a healthy round trip would
+    ever leave it.
+
+    A no-op unless ALL of: a latch is bound, an intent is currently OPEN, it
+    has been open at least :data:`_AMBIGUOUS_EXIT_STALE_NS`, the cached
+    order for ``client_order_id`` still exists, AND its own intent
+    fingerprint (the SAME recipe ``_submit_order``'s own ``arm()`` call
+    used) matches the OPEN intent's. Idempotent, like
+    :func:`halt_family_for_ambiguous_exit` itself: a family already halted
+    is left untouched.
+    """
+    if strategy._latch is None:
+        return
+    current = strategy._latch.current_open_submit_intent()
+    if current is None:
+        return
+    if now_ns - current.created_ns < _AMBIGUOUS_EXIT_STALE_NS:
+        return
+    order = strategy.cache.order(ClientOrderId(client_order_id))
+    if order is None:
+        return
+    if submit_chain.intent_fingerprint(order) != current.fingerprint:
+        return
+    halt_family_for_ambiguous_exit(
+        strategy,
+        position_id=position_id,
+        reason=_AMBIGUOUS_EXIT_INTENT_STALE,
+        ts_ns=now_ns,
     )
 
 

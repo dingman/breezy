@@ -3274,6 +3274,17 @@ def test_x1_the_live_scan_actually_reaches_a_test_that_imports_the_exec_package(
     # relaxed: the comparison is still `==`; the module carries no
     # `SOCKET_RESTORING_MARKERS` and constructs no client -- `submit_chain` is
     # the pure-helpers module, no socket either.
+    #
+    # Old -> new (review finding B, POSITION_EXIT_EXECUTION_2026-09-16.md
+    # §5.4): `test_current_rung_hold_exit_wiring.py` now imports
+    # `exec.submit_chain` (locally, inside its new AMBIGUOUS-exit-cover
+    # tests) to recompute `submit_chain.intent_fingerprint(order)` -- the SAME
+    # pure, deterministic hash `_submit_order`'s own `arm()` call uses -- so a
+    # test can arm a `SubmitIntentLatch` fixture with the exact fingerprint a
+    # cached exit order would produce. WIDENED, not relaxed (L-6/L-12): the
+    # comparison is still `==`; the module carries no `SOCKET_RESTORING_
+    # MARKERS` and constructs no client -- `submit_chain` is the pure-helpers
+    # module, no socket either.
     assert exec_importing_test_modules() == {
         "tests/contract/test_exec_client_reconciliation_contract.py",
         "tests/contract/test_exec_client_wiring_contract.py",
@@ -3284,6 +3295,7 @@ def test_x1_the_live_scan_actually_reaches_a_test_that_imports_the_exec_package(
         "tests/unit/test_continuous_rung_hold_no_side_shadow_2026_09_14.py",
         "tests/unit/test_continuous_rung_hold_strategy.py",
         "tests/unit/test_current_rung_hold_ambiguous_resolver.py",
+        "tests/unit/test_current_rung_hold_exit_wiring.py",
         "tests/unit/test_current_rung_hold_order_submission_wiring.py",
         "tests/unit/test_current_rung_hold_pre_arm_race.py",
         "tests/unit/test_current_rung_hold_trial_day_latch.py",

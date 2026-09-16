@@ -786,6 +786,107 @@ def test_an_entry_response_carrying_a_close_echo_is_refused(
 
 
 # ---------------------------------------------------------------------------
+# Coordinator item D (POSITION_EXIT_EXECUTION_2026-09-16.md, security review):
+# `parse_order_status_report` gains the SAME `closing` parameter
+# `parse_fill_report` already has -- the with-id AMBIGUOUS resolver's GET
+# path (`exec/client.py::_resolve_ambiguous_intents`) maps an ``Order``, not
+# an ``Execution``, so without this the resolver has no way to ever resolve
+# a genuinely-filled exit order: it always applied the entry-only BUY/
+# BUY_LONG echo table and stayed `mapping_error`/AMBIGUOUS forever.
+# ---------------------------------------------------------------------------
+
+
+def _closing_order_payload(
+    order: dict[str, Any], *, side: str, intent: str,
+) -> dict[str, Any]:
+    return {**order, "side": side, "intent": intent}
+
+
+def test_order_status_report_a_yes_close_with_the_pinned_echo_reports_a_sell(
+    order: dict[str, Any], instrument: BinaryOption
+) -> None:
+    """PINNED-BY-CAPTURE, mirrors ``test_a_yes_close_with_the_pinned_echo_
+    reports_a_sell`` for the ORDER (not execution) mapper: a YES close
+    echoes exactly ``(ORDER_SIDE_SELL, ORDER_INTENT_SELL_LONG)`` and maps to
+    ``OrderSide.SELL`` only when ``closing=True``."""
+    payload = _closing_order_payload(
+        order, side="ORDER_SIDE_SELL", intent="ORDER_INTENT_SELL_LONG",
+    )
+
+    report = parse_order_status_report(
+        payload,
+        instrument=instrument,
+        account_id=ACCOUNT_ID,
+        report_id=REPORT_ID,
+        ts_init=TS_INIT,
+        closing=True,
+    )
+
+    assert report.order_side == OrderSide.SELL
+
+
+def test_order_status_report_a_no_close_with_the_pinned_mirrored_echo_reports_a_sell(
+    no_leg_instrument: BinaryOption,
+) -> None:
+    """PINNED-BY-CAPTURE: a NO close echoes ``(ORDER_SIDE_BUY,
+    ORDER_INTENT_SELL_SHORT)`` and still maps to ``OrderSide.SELL`` under
+    ``closing=True``."""
+    no_order = build_order(str(no_leg_instrument.raw_symbol))
+    payload = _closing_order_payload(
+        no_order, side="ORDER_SIDE_BUY", intent="ORDER_INTENT_SELL_SHORT",
+    )
+
+    report = parse_order_status_report(
+        payload,
+        instrument=no_leg_instrument,
+        account_id=ACCOUNT_ID,
+        report_id=REPORT_ID,
+        ts_init=TS_INIT,
+        closing=True,
+    )
+
+    assert report.order_side == OrderSide.SELL
+
+
+def test_order_status_report_defaults_closing_to_false_and_refuses_a_close_echo(
+    order: dict[str, Any], instrument: BinaryOption
+) -> None:
+    """``closing`` defaults to ``False`` -- byte-unchanged for every
+    existing entry-path caller: a status report carrying the YES-close pair
+    is checked against the BUY-only table and refused, never silently
+    accepted as an open."""
+    payload = _closing_order_payload(
+        order, side="ORDER_SIDE_SELL", intent="ORDER_INTENT_SELL_LONG",
+    )
+
+    with pytest.raises(ExecutionReportMappingError):
+        parse_order_status_report(
+            payload,
+            instrument=instrument,
+            account_id=ACCOUNT_ID,
+            report_id=REPORT_ID,
+            ts_init=TS_INIT,
+        )
+
+
+def test_order_status_report_a_close_echoed_with_the_wrong_side_is_refused_under_closing(
+    order: dict[str, Any], instrument: BinaryOption
+) -> None:
+    """The two tables never accept each other's pair: an ENTRY-shaped echo
+    (BUY/BUY_LONG) under ``closing=True`` is refused, not silently accepted
+    as a close."""
+    with pytest.raises(ExecutionReportMappingError, match="closing order"):
+        parse_order_status_report(
+            order,
+            instrument=instrument,
+            account_id=ACCOUNT_ID,
+            report_id=REPORT_ID,
+            ts_init=TS_INIT,
+            closing=True,
+        )
+
+
+# ---------------------------------------------------------------------------
 # ExecutionMassStatus -- native assembly
 # ---------------------------------------------------------------------------
 

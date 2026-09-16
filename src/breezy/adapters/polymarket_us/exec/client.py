@@ -1754,6 +1754,15 @@ class PolymarketUSExecutionClient(LiveExecutionClient):
                     account_id=self._issued_account_id,
                     report_id=UUID4(),
                     ts_init=self._clock.timestamp_ns(),
+                    # INC-E2d: `context.order_side` is the order's REAL side
+                    # captured at `_note_ambiguous_open` time (INC-E2a) --
+                    # "SELL" only for an exit, since every entry this client
+                    # ever submits is a plain BUY (`allow_short=False`). A
+                    # `context.order_side` of `LONG_ONLY_SIDE` ("BUY", the
+                    # field's own default for an old blob predating this
+                    # field) resolves `closing=False`, so a pre-existing
+                    # durable context decodes with byte-identical behaviour.
+                    closing=context.order_side == "SELL",
                 )
             except Exception as exc:  # noqa: BLE001 - malformed stays AMBIGUOUS
                 self._resolver_consecutive_failures += 1
@@ -3212,10 +3221,18 @@ class PolymarketUSExecutionClient(LiveExecutionClient):
                 f"exit order exit={exit_rule_tag} position_id={exit_position_id} "
                 f"client_order_id={order.client_order_id.value}"
             )
-            if instrument is not None:
-                exit_leg: Leg = leg_of(instrument.id)
-            else:
-                exit_leg = "yes"
+            # Item C (POSITION_EXIT_EXECUTION_2026-09-16.md review): deny
+            # immediately when the instrument has vanished from the cache --
+            # never fabricate a "yes"-leg placeholder to keep
+            # `_AdapterExitAuthorization` constructible. The SAME reason
+            # `unmappable_exit_order_reason`/`_unmappable_exit_shape_reason`
+            # would eventually return for a `None` instrument, stated here
+            # instead of manufactured evidence flowing into the shape check.
+            if instrument is None:
+                return self._deny(
+                    order, "instrument is not a BinaryOption; refusing", now_ns,
+                )
+            exit_leg: Leg = leg_of(instrument.id)
             try:
                 exit_limit_price = submit_chain.order_price_decimal(order)
             except (TypeError, ValueError, InvalidOperation):

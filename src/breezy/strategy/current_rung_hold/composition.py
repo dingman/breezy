@@ -20,7 +20,7 @@ import time
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from contextlib import AbstractContextManager, contextmanager
 from pathlib import Path
-from typing import Final, NamedTuple
+from typing import TYPE_CHECKING, Final, NamedTuple
 
 from nautilus_trader.model.identifiers import InstrumentId
 from nautilus_trader.persistence.catalog.parquet import ParquetDataCatalog
@@ -46,6 +46,7 @@ from breezy.strategy.current_rung_hold.continuous_strategy import (
     ContinuousRungHoldStrategy,
     Phase0PermitForbiddenError,
 )
+from breezy.strategy.current_rung_hold.exit_decider import decide_exit
 from breezy.strategy.current_rung_hold.monitor_store import MarkBuffer
 from breezy.strategy.current_rung_hold.monitor_wiring import build_monitor_callables
 from breezy.strategy.current_rung_hold.offer_tape import OfferTape
@@ -58,6 +59,9 @@ from breezy.strategy.current_rung_hold.trial_day_latch import (
     open_trial_day_latch,
 )
 from breezy.strategy.weather_common.refusals import RefusalAlerter
+
+if TYPE_CHECKING:  # pragma: no cover - typing only
+    from breezy.persistence.family_manifest import FamilyManifest
 
 __all__ = [
     "NoTradableInstrumentsError",
@@ -470,6 +474,7 @@ def build_continuous_rung_hold_strategies(
     offer_tape_path: Path | None = None,
     phase0_permit_guard: bool = True,
     enable_position_monitor: bool = True,
+    exit_manifest: FamilyManifest | None = None,
 ) -> tuple[ContinuousRungHoldStrategy, ...]:
     """One continuous-rung-hold strategy per supported station with instruments.
 
@@ -487,6 +492,24 @@ def build_continuous_rung_hold_strategies(
 
     ``enable_position_monitor`` (INC-5, D2/D3 SHADOW-ONLY -- never submits,
     modifies, or cancels an order): ``True`` by default in live composition.
+
+    ``exit_manifest`` (INC-E4, ``docs/plans/POSITION_EXIT_EXECUTION_2026-09-16
+    .md`` §5.1, review finding A): ``None`` by default -- byte-identical to
+    every increment before this one, since ``_build_position_monitor_for``
+    then leaves every ``PositionMonitor`` exit kwarg at its own ``None``
+    default (``_maybe_decide_exit`` stays a permanent no-op, exactly D3's
+    pin). A caller (the composition ROOT, ``app/trade.py``, never this
+    function itself -- it loads no file and opens no manifest) that passes
+    the family's REAL, already-loaded :class:`FamilyManifest` opts every
+    monitor-enabled station strategy into EVALUATING an exit on every
+    ``THREATENED``/``DEAD_BY_OBSERVATION`` tick. This does not by itself let
+    an order reach the venue: :func:`breezy.strategy.current_rung_hold.
+    exit_decider.decide_exit` refuses with ``family_not_exit_registered``
+    whenever :func:`breezy.persistence.exit_gate.family_declares_exit_rule`
+    is ``False`` for the manifest handed in -- which is exactly the LIVE
+    family's (``pm_us_crh_cont``) own manifest today (no ``exit_rule``
+    declared), so passing it here produces persisted refusals and zero
+    orders, never a live exit.
     A build-side switch, never an operator control and never a new env var
     (plan D1) -- tests that want the pre-INC-5 byte-identical strategy pass
     ``False``.
@@ -546,14 +569,17 @@ def build_continuous_rung_hold_strategies(
             # only populated once `on_start` runs), so it can only be built
             # AFTER construction -- see `_build_position_monitor_for`.
             strategy._position_monitor = _build_position_monitor_for(
-                strategy, monitor_root=monitor_root,
+                strategy, monitor_root=monitor_root, exit_manifest=exit_manifest,
             )
         strategies.append(strategy)
     return tuple(strategies)
 
 
 def _build_position_monitor_for(
-    strategy: ContinuousRungHoldStrategy, *, monitor_root: Path,
+    strategy: ContinuousRungHoldStrategy,
+    *,
+    monitor_root: Path,
+    exit_manifest: FamilyManifest | None = None,
 ) -> PositionMonitor:
     """Wire a :class:`PositionMonitor` to ``strategy``.
 
@@ -565,6 +591,23 @@ def _build_position_monitor_for(
     site-specific -- the alert-sink ``report``, the live ``MarkBuffer()``,
     and the live monitor/summaries paths -- never a direct constructor
     reference to the strategy's own mutating surface (M7 D3 pin, plan §2).
+
+    Review finding A (``POSITION_EXIT_EXECUTION_2026-09-16.md``): the five
+    exit kwargs below are wired ONLY when ``exit_manifest`` is not ``None``
+    -- ``exit_manifest is None`` (the caller's own default) leaves every one
+    of them at ``PositionMonitor``'s own ``None`` default, so
+    ``_maybe_decide_exit`` stays byte-identical to every increment before
+    this one (module docstring's D3 pin). ``exit_family_id`` is read off the
+    manifest itself (never a second, independently-suppliable id that could
+    drift from it). ``exit_client_order_id_factory`` closes over ``strategy``
+    lazily -- `order_factory` is `None` until Nautilus registers the
+    strategy (`trading/strategy.pyx:173,298`), which runs AFTER this
+    function returns, so the closure must defer the read to call time,
+    exactly the laziness `build_monitor_callables`'s own docstring already
+    requires of every closure here. ``submit_exit``/``record_exit_offer``
+    reuse the strategy's OWN thin delegator (`continuous_strategy.py::
+    submit_exit`) and its own `OfferTape.append` -- never a second exit-order
+    construction path and never a second offer-tape sink.
     """
     sink = resolve_alert_sink()
 
@@ -575,6 +618,9 @@ def _build_position_monitor_for(
                 severity="WARN", event=event, site=str(strategy.id), detail=str(dict(detail)),
             ),
         )
+
+    def _exit_client_order_id_factory() -> str:
+        return str(strategy.order_factory.generate_client_order_id().value)
 
     callables = build_monitor_callables(strategy)
     return PositionMonitor(
@@ -595,6 +641,17 @@ def _build_position_monitor_for(
         catalog_root=monitor_root,
         summaries_dir=monitor_root / _MONITOR_SUMMARIES_DIRNAME,
         report=_report,
+        exit_decider=decide_exit if exit_manifest is not None else None,
+        exit_manifest=exit_manifest,
+        exit_family_id=None if exit_manifest is None else exit_manifest.family_id,
+        exit_client_order_id_factory=(
+            _exit_client_order_id_factory if exit_manifest is not None else None
+        ),
+        submit_exit=strategy.submit_exit if exit_manifest is not None else None,
+        record_exit_offer=strategy.offer_tape.append if exit_manifest is not None else None,
+        check_ambiguous_exit=(
+            strategy.check_ambiguous_exit_intent if exit_manifest is not None else None
+        ),
     )
 
 
