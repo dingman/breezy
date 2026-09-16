@@ -358,12 +358,39 @@ resolver (`exec/client.py` `_resolve_ambiguous_intents`), never a re-send. Any A
    fill carries a Breezy `client_order_id` we minted (`submit_order(..., position_id=...)` ties them;
    `continuous_strategy.py:874-875` delivers the `Position`). An unattributable position is never
    exited — it is alerted.
-4. **Kill on AMBIGUOUS or rejected exit — the durable family halt.** `record_ambiguous_exit` writes the
-   same state `TrialDayLatch.is_family_halted` (`:816`) reads, cleared only by `clear_family_halt`
-   (`:845`) via `clear_family_halt_cli.py`; enforced at `composition.py:190-221`
-   `family_halt_submit_veto` (synchronous, pre-spend, zero money moved) and
-   `continuous_strategy.py:561,975`. Durable, so it **survives the process death** `midday-relaunch`
-   makes routine (RED test, INC-E3).
+4. **Kill on AMBIGUOUS or rejected exit — a TWO-layer durable cover, corrected in review (finding B,
+   2026-09-16).** `on_order_denied`/`on_order_rejected` only ever fire for a venue-side deny/reject —
+   they are never reached when the create-order POST itself raises, or when the response classifies
+   `KIND_AMBIGUOUS`: `exec/client.py::_submit_order` calls `self._refuse(...)` (in-memory only) and
+   returns with **no order event at all** on that path, so `on_order_denied`/`on_order_rejected` (and
+   therefore the family-halt call they make) are unreachable for it.
+   - **Layer 1 (immediate, no extra code): the account-wide `SubmitIntentLatch` itself.**
+     `_submit_order`'s own `arm()` call happens BEFORE the POST, for an entry and an exit alike — an
+     AMBIGUOUS send therefore leaves the intent OPEN on disk immediately. Every subsequent order of
+     EITHER kind (entry or exit, this process or a restarted one over the same store) is refused with
+     `submit_chain.OPEN_INTENT_WAIT_REASON` until an operator retires the intent via the durable-intent
+     CLI with venue evidence. This is the SAME cover an AMBIGUOUS entry already had; nothing new was
+     needed to extend it to an exit.
+   - **Layer 2 (durable family halt, on the strategy's own next tick): `exit_wiring.
+     check_exit_intent_for_ambiguous_send`.** Injected into `PositionMonitor` as `check_ambiguous_exit`
+     and called at the top of every evaluation once a prior exit has fired for that position. It reads
+     the account-wide intent through `TrialDayLatch.current_open_submit_intent()` (a read-only
+     pass-through to the SAME `SubmitIntentLatch.current_open()` layer 1 already relies on — never a
+     venue poll) and, once it can prove — by intent fingerprint, the SAME recipe `_submit_order`'s own
+     `arm()` call used — that THIS exit's own intent is still the one OPEN, and has been open longer
+     than a healthy round trip would ever leave it (30s, well above the venue's own 5s `maxBlockTime`),
+     it calls `record_ambiguous_exit` so the FAMILY-wide halt (`TrialDayLatch.is_family_halted`, `:816`)
+     is ALSO set durably — the same state a venue-side deny/reject sets, cleared only by
+     `clear_family_halt` (`:845`) via `clear_family_halt_cli.py`, and enforced at the SAME two
+     chokepoints (`composition.py:190-221` `family_halt_submit_veto` and `continuous_strategy.py:561,975`).
+   - Both layers are durable and **survive the process death** `midday-relaunch` makes routine (RED
+     test, INC-E3): layer 1 needs no restart-specific code (the singleton is read fresh from the shared
+     store); layer 2 re-evaluates from durable state on the strategy's very next tick after restart,
+     never from in-memory bookkeeping.
+   - A with-id AMBIGUOUS exit resolves through the SAME GET-based resolver an entry does
+     (`exec/client.py::_resolve_ambiguous_intents`) — see finding D below; this does not change the
+     two-layer cover above, since a resolver retirement is a NORMAL closure of the OPEN intent, not
+     itself the AMBIGUOUS-cover mechanism.
 5. **Response-side leg check.** `leg_prices.assert_exit_echo_matches_leg` (INC-E2) refuses any echo that
    is not the exact documented pair for the leg, in both directions — the venue represents a NO buy as
    `side SELL`/`intent BUY_SHORT`, so an echo-blind exit path could attribute a report to the wrong leg.

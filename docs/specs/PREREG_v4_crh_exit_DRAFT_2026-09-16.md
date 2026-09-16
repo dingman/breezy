@@ -61,9 +61,43 @@ The bounded GET resolver, its durable pre-write and its fail-closed rules (GET f
 
 Three mutually exclusive first-match-wins buckets (`duplicate_fill`, `q≠1`, `fee_unreconciled`), `total_pnl = scored_pnl − residual` in contract-units, the `total_pnl ≤ −60` halt, the re-arm floor and the attempt counter are carried over verbatim. **v4 addition:** a GET-resolved **exit** leg is `fee_unreconciled` residual and never grows `n` — the same treatment v3 gives a resolver-recovered entry fill; a trial with an admissible entry and a resolver-recovered exit is scored residual, never dropped.
 
-## 5b. Exit Kill Rule — **NEW**
+## 5b. Exit Kill Rule — **NEW, TWO layers (corrected in review, finding B, 2026-09-16)**
 
-An exit order whose outcome is **AMBIGUOUS or rejected** sets the durable family halt: the same state `TrialDayLatch.is_family_halted` (`strategy/current_rung_hold/trial_day_latch.py:816`) reads, cleared **only** by `clear_family_halt` (`:845`) via the operator CLI `clear_family_halt_cli.py`. Written by a new `record_ambiguous_exit` alongside `record_duplicate_fill` (`:761`) — same state, no new mechanism — so it is already enforced at the three existing chokepoints: `composition.py:190-221` `family_halt_submit_veto` (synchronous, pre-spend, zero money moved) and `continuous_strategy.py:561,975`. Durable, so it survives the mid-session process death and relaunch that is routine on this host. **No automatic clearing of any kind.**
+An exit order whose outcome is **AMBIGUOUS or rejected** is covered by two distinct, durable layers —
+corrected from the original single-mechanism statement above, which described only the venue-side
+reject/deny path and missed that a POST exception or a `KIND_AMBIGUOUS` classification raises **no
+order event at all** (`on_order_denied`/`on_order_rejected` are Strategy-hook overrides on an event
+that, for this failure mode, is never delivered).
+
+**Layer 1 — immediate, account-wide, no exit-specific code.** The existing `SubmitIntentLatch`
+(`runtime/submit_intent.py:37,313`) is `arm()`-ed BEFORE the create-order POST, identically for an
+entry and an exit. An AMBIGUOUS send therefore leaves the account-wide intent OPEN on disk the instant
+it happens; every subsequent order of EITHER kind — entry or exit, this process or one restarted over
+the same store — is refused (`submit_chain.OPEN_INTENT_WAIT_REASON`) until an operator retires the
+intent with venue evidence via the durable-intent CLI. This is the SAME cover an AMBIGUOUS entry
+already had.
+
+**Layer 2 — durable family halt, checked on the strategy's own next tick.** `exit_wiring.
+check_exit_intent_for_ambiguous_send`, injected into the position monitor and invoked at the top of
+every evaluation once a prior exit has fired for that position, reads the account-wide intent
+read-only (`TrialDayLatch.current_open_submit_intent()`, a pass-through to `SubmitIntentLatch.
+current_open()` — never a venue poll). Once it can prove, by intent fingerprint, that THIS exit's own
+intent is still the one OPEN and has sat open longer than a healthy round trip ever would (30s, above
+the venue's own 5s `maxBlockTime`), it calls `record_ambiguous_exit` — the same durable state
+`TrialDayLatch.is_family_halted` (`strategy/current_rung_hold/trial_day_latch.py:816`) reads, cleared
+**only** by `clear_family_halt` (`:845`) via the operator CLI `clear_family_halt_cli.py`, and enforced
+at the same chokepoints: `composition.py:190-221` `family_halt_submit_veto` (synchronous, pre-spend,
+zero money moved) and `continuous_strategy.py:561,975`. A genuine venue-side reject/deny still sets the
+SAME state directly, via `on_order_denied`/`on_order_rejected`, with no dependence on layer 2's tick
+cadence.
+
+Both layers are durable and survive the mid-session process death and relaunch that is routine on this
+host: layer 1 needs no restart-specific code (the singleton is read fresh from the shared store on
+every process); layer 2 re-evaluates from durable state on the strategy's very next tick after
+restart, never from in-memory bookkeeping. A with-id AMBIGUOUS exit resolves through the SAME
+GET-based resolver an entry does (`exec/client.py::_resolve_ambiguous_intents`); resolving it is a
+NORMAL closure of the OPEN intent and does not bypass either layer above. **No automatic clearing of
+the family halt, of any kind.**
 
 ## 6. Safety Pins — **UNCHANGED FROM v3** (§6:106-128), plus four exit safeguards on existing seams
 
