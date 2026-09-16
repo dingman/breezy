@@ -333,6 +333,10 @@ CAGE_RULE_PINS: tuple[RulePin, ...] = (
                 # C1 (plan rev 6.1): the startup/re-arm position-evidence
                 # refresh, run last inside `_connect`. Old(20) -> new(21).
                 "_refresh_startup_position_evidence",
+                # RESTING_BID_HUNT Rev 2 §4.3: the open-order read-back on
+                # the `PrivateRead` seam. Old(21) -> new(22); the widened
+                # neighbour below (`_send_signed_request`) is still refused.
+                "_read_open_orders",
                 "__call__",
             }
         ),

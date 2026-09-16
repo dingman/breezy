@@ -231,7 +231,7 @@ from __future__ import annotations
 import asyncio
 import json
 import threading
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass
 from decimal import Decimal, InvalidOperation
 from typing import TYPE_CHECKING, Any, Final, Protocol, Self
@@ -269,6 +269,7 @@ from breezy.adapters.polymarket_us.errors import (
 from breezy.adapters.polymarket_us.exec import submit_chain
 from breezy.adapters.polymarket_us.exec.endpoints import (
     ACCOUNT_BALANCES_PATH,
+    OPEN_ORDERS_PATH,
     PORTFOLIO_POSITIONS_PATH,
 )
 from breezy.adapters.polymarket_us.exec.no_side_keys import (
@@ -283,9 +284,11 @@ from breezy.adapters.polymarket_us.exec.refusals import (
     refusals_after_successful_reconcile,
 )
 from breezy.adapters.polymarket_us.exec.reports import (
+    OpenOrderRecord,
     build_execution_mass_status,
     derive_position_cost_basis,
     parse_account_balances,
+    parse_open_orders,
     parse_order_status_report,
     parse_position_status_report,
 )
@@ -356,11 +359,13 @@ __all__ = [
     "FILL_KEY_PREFIX",
     "RESOLVER_CONTEXT_KEY_PREFIX",
     "STARTUP_EVIDENCE_KEY",
+    "STARTUP_OPEN_ORDERS_PRESENT_REASON",
     "VENUE_ORDER_ID_KEY_PREFIX",
     "AmbiguousResolverContext",
     "DurableFillRecord",
     "PolymarketUSExecutionClient",
     "PrivateRead",
+    "StartupOpenOrderSnapshot",
     "StartupPositionEvidence",
     "StartupPositionSnapshot",
 ]
@@ -394,6 +399,21 @@ RESOLVER_CONTEXT_KEY_PREFIX: Final[str] = f"{STATE_KEY_NAMESPACE}resolver/"
 #: (`read_startup_position_evidence`). Overwritten on EVERY write -- there is
 #: exactly one row, the most recent evidence, never a history.
 STARTUP_EVIDENCE_KEY: Final[str] = f"{STATE_KEY_NAMESPACE}startup_evidence"
+
+#: RESTING_BID_HUNT Rev 2 section 4.3: the never-arm refusal token the
+#: strategy-side predicate (``trial_day_latch.startup_evidence_refusal_
+#: reason``) returns, and this client logs at ERROR, when the boot's
+#: open-order enumeration came back NON-EMPTY. Defined here (the producer,
+#: lowest layer) so both sides spell one string.
+STARTUP_OPEN_ORDERS_PRESENT_REASON: Final[str] = "startup_open_orders_present"
+
+#: How many leading characters of a venue order id an ERROR line may carry.
+_ORDER_ID_REDACT_PREFIX: Final[int] = 4
+
+
+def _redact_order_id(venue_order_id: str) -> str:
+    """A venue order id reduced to a short prefix for a log line."""
+    return f"{venue_order_id[:_ORDER_ID_REDACT_PREFIX]}\u2026"
 
 #: D1/D2 (plan rev 6.1): durable, per-venue-order-id marker that a permit
 #: slot was restored for it -- written by the CALLER (this client), never by
@@ -869,6 +889,17 @@ class StartupPositionSnapshot:
 
 
 @dataclass(frozen=True, slots=True)
+class StartupOpenOrderSnapshot:
+    """One enumerated open order, as the never-arm gate needs it: enough to
+    name the order in a refusal (id, market, state) and nothing that would
+    put a price or size into a durable row the gate never reads."""
+
+    venue_order_id: str
+    market_slug: str
+    state: str
+
+
+@dataclass(frozen=True, slots=True)
 class StartupPositionEvidence:
     """C1 (plan rev 6.1): durable startup/re-arm evidence for the strategy's
     never-arm gate, read via
@@ -888,6 +919,13 @@ class StartupPositionEvidence:
     position_read_refused: bool
     fill_walk_complete: bool
     positions: tuple[StartupPositionSnapshot, ...]
+    #: RESTING_BID_HUNT Rev 2 section 4.3: the open-order enumeration. The
+    #: gate arms only if the read SUCCEEDED (``open_orders_read_refused`` is
+    #: ``False``) AND ``open_orders`` is EMPTY. A record written before these
+    #: fields existed decodes as REFUSED (see ``from_bytes``): unrecorded is
+    #: UNKNOWN, never "none open".
+    open_orders_read_refused: bool = True
+    open_orders: tuple[StartupOpenOrderSnapshot, ...] = ()
 
     def to_bytes(self) -> bytes:
         return json.dumps(
@@ -899,6 +937,15 @@ class StartupPositionEvidence:
                 "fill_walk_complete": self.fill_walk_complete,
                 "positions": [
                     {"slug": p.slug, "net_position": p.net_position} for p in self.positions
+                ],
+                "open_orders_read_refused": self.open_orders_read_refused,
+                "open_orders": [
+                    {
+                        "venue_order_id": o.venue_order_id,
+                        "market_slug": o.market_slug,
+                        "state": o.state,
+                    }
+                    for o in self.open_orders
                 ],
             },
             sort_keys=True,
@@ -935,6 +982,30 @@ class StartupPositionEvidence:
                 )
                 for entry in raw_positions
             )
+            # Pre-section-4.3 records carry neither key: decode as REFUSED
+            # rather than raise -- the boot rewrites this row at the end of
+            # `_connect`, and nothing reading the old bytes may mistake
+            # "unrecorded" for "none open".
+            if "open_orders_read_refused" in payload and "open_orders" in payload:
+                open_orders_read_refused = _require_bool(
+                    payload["open_orders_read_refused"], field="open_orders_read_refused"
+                )
+                raw_open_orders = payload["open_orders"]
+                if not isinstance(raw_open_orders, list):
+                    raise ExecutionReportMappingError(
+                        "startup position evidence 'open_orders' is not a list"
+                    )
+                open_orders = tuple(
+                    StartupOpenOrderSnapshot(
+                        venue_order_id=str(entry["venue_order_id"]),
+                        market_slug=str(entry["market_slug"]),
+                        state=str(entry["state"]),
+                    )
+                    for entry in raw_open_orders
+                )
+            else:
+                open_orders_read_refused = True
+                open_orders = ()
             return cls(
                 ts_ns=int(payload["ts_ns"]),
                 eof_complete=_require_bool(payload["eof_complete"], field="eof_complete"),
@@ -945,6 +1016,8 @@ class StartupPositionEvidence:
                     payload["fill_walk_complete"], field="fill_walk_complete"
                 ),
                 positions=snapshots,
+                open_orders_read_refused=open_orders_read_refused,
+                open_orders=open_orders,
             )
         except (KeyError, TypeError, ValueError) as exc:
             raise ExecutionReportMappingError(
@@ -1191,6 +1264,12 @@ class PolymarketUSExecutionClient(LiveExecutionClient):
         #: first write makes the very first resolver pass refresh
         #: unconditionally (age is always >= the threshold against `0`).
         self._last_evidence_write_ns: int = 0
+        # RESTING_BID_HUNT Rev 2 section 4.3: the LAST open-order enumeration,
+        # carried into every `_write_startup_position_evidence` row --
+        # including the synchronous `_resolve_terminal_zero` rewrite, which
+        # cannot GET. REFUSED until the first read succeeds: fail closed.
+        self._open_orders_read_refused: bool = True
+        self._open_orders: tuple[OpenOrderRecord, ...] = ()
 
     # -- observable state ---------------------------------------------------
 
@@ -1628,6 +1707,17 @@ class PolymarketUSExecutionClient(LiveExecutionClient):
                 try:
                     refresh_payload = await self._private_read(PORTFOLIO_POSITIONS_PATH)
                     refresh_positions = self._declared_positions(refresh_payload)
+                    # Section 4.3: the open-order evidence is refreshed on the
+                    # SAME age gate, so a rest appearing after boot reaches
+                    # the re-arm gate. Its outcome (success OR failure) is
+                    # recorded below; only the positions GET keeps this
+                    # branch's "prior record kept" semantics.
+                    try:
+                        refresh_open_orders = await self._read_open_orders()
+                    except Exception as open_exc:  # noqa: BLE001 - recorded as refused
+                        self._note_open_orders_outcome(error=open_exc)
+                    else:
+                        self._note_open_orders_outcome(records=refresh_open_orders)
                 except Exception as exc:  # noqa: BLE001 - inert; never `_refuse`
                     self._log.warning(
                         "resolver: startup-evidence refresh GET failed "
@@ -2422,10 +2512,18 @@ class PolymarketUSExecutionClient(LiveExecutionClient):
         :class:`~nautilus_trader.execution.reports.FillReport`'s
         ``commission`` is a required ``Money`` (``execution/reports.py:667-684``),
         and the intended source, once R-1 rules, is the ONE durable fill
-        record this session's B0 already writes to disk and the store --
-        never a fresh read of the venue's open-order surface, which R-3's
-        endpoint table does not declare. This docstring makes no promise
-        that B1 will be implemented.
+        record this session's B0 already writes to disk and the store.
+
+        RESTING_BID_HUNT Rev 2 section 4.3 DECIDED to keep this empty even
+        though the open-order read (:meth:`_read_open_orders`) now exists:
+        the venue ``Order`` carries no client-order-id field (``reports.py``
+        module docstring item 2), so no enumerated order is
+        Breezy-ATTRIBUTABLE from the read alone, and a report carrying
+        ``client_order_id=None`` would make native reconciliation adopt the
+        order as ``EXTERNAL`` -- the opposite of the fail-closed stance the
+        never-arm gate takes on the same enumeration. Attribution arrives
+        with the section 4.4 durable resting-intent store (venue id -> intent);
+        this generator is wired then, together with fill reports.
         """
         return []
 
@@ -2985,6 +3083,15 @@ class PolymarketUSExecutionClient(LiveExecutionClient):
             position_read_refused=position_read_refused,
             fill_walk_complete=self._fill_walk_complete(),
             positions=tuple(snapshots),
+            open_orders_read_refused=self._open_orders_read_refused,
+            open_orders=tuple(
+                StartupOpenOrderSnapshot(
+                    venue_order_id=o.venue_order_id,
+                    market_slug=o.market_slug,
+                    state=o.state,
+                )
+                for o in self._open_orders
+            ),
         )
         self._store_set(STARTUP_EVIDENCE_KEY, evidence.to_bytes())
         # R-9a (HF-4 rev2): the single writer of the watermark the resolver's
@@ -3000,6 +3107,15 @@ class PolymarketUSExecutionClient(LiveExecutionClient):
         `on_start` gate is the one place that acts on it.
         """
         now_ns = self._clock.timestamp_ns()
+        # Section 4.3: enumerate open orders FIRST, independently of the
+        # positions read -- each failure is recorded on its own flag, so the
+        # gate's log names which read refused.
+        try:
+            open_orders = await self._read_open_orders()
+        except Exception as exc:  # noqa: BLE001 - recorded as refused, never propagated
+            self._note_open_orders_outcome(error=exc)
+        else:
+            self._note_open_orders_outcome(records=open_orders)
         try:
             payload = await self._private_read(PORTFOLIO_POSITIONS_PATH)
             declared = self._declared_positions(payload)
@@ -3015,6 +3131,65 @@ class PolymarketUSExecutionClient(LiveExecutionClient):
         self._write_startup_position_evidence(
             now_ns=now_ns, eof_complete=True, position_read_refused=False, raw_positions=declared,
         )
+
+    async def _read_open_orders(
+        self, slugs: Iterable[str] | None = None
+    ) -> tuple[OpenOrderRecord, ...]:
+        """RESTING_BID_HUNT Rev 2 section 4.3: enumerate the account's open
+        orders -- ONE bare-path GET on ``OPEN_ORDERS_PATH`` through the
+        injected ``PrivateRead`` seam, mapped by ``parse_open_orders``.
+
+        Raises on any failure (``PrivateReadRefused``, a transport fault,
+        ``ExecutionReportMappingError`` on a malformed body): the caller
+        decides what a refused read means, and for the never-arm gate it
+        means REFUSED, never empty. ``slugs`` narrows the RESULT client-side;
+        the venue's ``slugs[]`` query is never sent, so the request is the
+        same proven path-only signed GET every time and a caller's filter
+        cannot hide a foreign order from the unfiltered enumeration.
+        """
+        payload = await self._private_read(OPEN_ORDERS_PATH)
+        records = parse_open_orders(payload)
+        if slugs is None:
+            return records
+        wanted = frozenset(slugs)
+        return tuple(r for r in records if r.market_slug in wanted)
+
+    def _note_open_orders_outcome(
+        self,
+        *,
+        records: tuple[OpenOrderRecord, ...] | None = None,
+        error: BaseException | None = None,
+    ) -> None:
+        """Record the latest open-order enumeration on this client (the
+        state every subsequent evidence row carries) and log it: WARNING for
+        a refused read, ERROR -- ids redacted to a prefix -- when any order
+        is open (``STARTUP_OPEN_ORDERS_PRESENT_REASON``), one bounded
+        WARNING when a row carried undeclared keys.
+        """
+        if error is not None or records is None:
+            self._open_orders_read_refused = True
+            self._open_orders = ()
+            self._log.warning(
+                "startup evidence: open-orders read failed "
+                f"({type(error).__name__ if error is not None else 'no result'}); "
+                "recording open_orders_read_refused=True"
+            )
+            return
+        self._open_orders_read_refused = False
+        self._open_orders = records
+        drifted = [r for r in records if r.unknown_keys]
+        if drifted:
+            self._log.warning(
+                f"startup evidence: {len(drifted)} open order row(s) carry undeclared "
+                f"key(s); first row: {', '.join(drifted[0].unknown_keys)}"
+            )
+        if records:
+            ids = ", ".join(_redact_order_id(r.venue_order_id) for r in records)
+            self._log.error(
+                f"{STARTUP_OPEN_ORDERS_PRESENT_REASON}: {len(records)} open order(s) on "
+                f"the account ({ids}); the never-arm gate refuses until every one is "
+                "enumerated and adopted or cancelled"
+            )
 
     def _mark_budget_restored(self, venue_order_id: str) -> None:
         """D2: durable evidence that a permit slot was restored for

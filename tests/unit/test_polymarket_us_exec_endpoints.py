@@ -475,3 +475,44 @@ def test_the_money_docstring_records_the_r4_commission_obligation() -> None:
     assert docstring is not None
     assert "calculate_commission" in docstring
     assert "PolymarketUSFeeModel" in docstring
+
+
+# ---------------------------------------------------------------------------
+# RESTING_BID_HUNT Rev 2 §4.3 -- the open-order read-back paths
+# ---------------------------------------------------------------------------
+
+
+def test_open_orders_path_is_declared_in_the_private_read_set() -> None:
+    from breezy.adapters.polymarket_us.exec.endpoints import OPEN_ORDERS_PATH
+
+    assert OPEN_ORDERS_PATH == "/v1/orders/open"
+    assert OPEN_ORDERS_PATH in PRIVATE_READ_PATHS
+    assert len(PRIVATE_READ_PATHS) == len(set(PRIVATE_READ_PATHS))
+
+
+def test_order_by_id_path_builds_the_singular_order_resource() -> None:
+    from breezy.adapters.polymarket_us.exec.endpoints import order_by_id_path
+
+    assert order_by_id_path("CEBPX0EVTTMX") == "/v1/order/CEBPX0EVTTMX"
+
+
+@pytest.mark.parametrize(
+    "order_id",
+    ["", " ", "abc/cancel", "abc?x=1", "abc#frag", "a b", "../orders", "abc\n"],
+)
+def test_order_by_id_path_refuses_an_id_that_could_alter_the_signed_path(order_id: str) -> None:
+    """The id is interpolated into the path the signer signs; a separator or
+    whitespace in it would sign one path and request another."""
+    from breezy.adapters.polymarket_us.exec.endpoints import order_by_id_path
+
+    with pytest.raises(ValueError, match="order id"):
+        order_by_id_path(order_id)
+
+
+def test_submit_chain_order_by_id_path_is_the_endpoints_builder() -> None:
+    """One builder, not two: the resolver's ``submit_chain.order_by_id_path``
+    must produce byte-identical paths to the declared read-set builder."""
+    from breezy.adapters.polymarket_us.exec import submit_chain
+    from breezy.adapters.polymarket_us.exec.endpoints import order_by_id_path
+
+    assert submit_chain.order_by_id_path("V-1") == order_by_id_path("V-1")

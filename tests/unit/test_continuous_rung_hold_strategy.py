@@ -161,6 +161,12 @@ _PERMISSIVE_EVIDENCE: dict[str, object] = {
     "position_read_refused": False,
     "fill_walk_complete": True,
     "positions": [{"slug": str(INTERIOR_ID.symbol.value), "net_position": "0"}],
+    # RESTING_BID_HUNT Rev 2 §4.3: the never-arm gate now also requires a
+    # SUCCESSFUL open-order enumeration that came back EMPTY. Additive --
+    # every prior key and value is unchanged; a fixture without these two
+    # keys would (correctly) halt every boot walk, fail closed.
+    "open_orders_read_refused": False,
+    "open_orders": [],
 }
 
 

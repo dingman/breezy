@@ -1620,6 +1620,12 @@ def test_a_reader_that_drops_a_facts_slug_fails_the_run_loudly(
             "eof_complete": True,
             "fill_walk_complete": True,
             "positions": [],
+            # RESTING_BID_HUNT Rev 2 §4.3: additive -- the gate now checks
+            # the open-order enumeration BEFORE the per-slug walk; this
+            # test's subject is the per-slug walk, so the enumeration is
+            # stated clean and the dropped-slug halt is still what fires.
+            "open_orders_read_refused": False,
+            "open_orders": [],
         },
     )
     stopped: list[bool] = []

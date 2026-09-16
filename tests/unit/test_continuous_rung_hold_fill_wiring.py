@@ -1661,6 +1661,11 @@ _TWO_RUNG_EVIDENCE: dict[str, object] = {
         {"slug": str(INTERIOR_ID.symbol.value), "net_position": "0"},
         {"slug": str(OPEN_UPPER_ID.symbol.value), "net_position": "0"},
     ],
+    # RESTING_BID_HUNT Rev 2 §4.3: the never-arm gate also requires a
+    # successful, EMPTY open-order enumeration. Additive; mirrors
+    # `_PERMISSIVE_EVIDENCE`.
+    "open_orders_read_refused": False,
+    "open_orders": [],
 }
 
 

@@ -103,6 +103,7 @@ from tests.unit.polymarket_us_exec_shapes import (
     RAW,
     REPORT_ID,
     TS_EVENT_NANOS,
+    TS_EVENT_TEXT,
     TS_INIT,
     build_execution,
     build_instrument,
@@ -1586,3 +1587,152 @@ def test_a_scalar_team_value_is_not_rendered_opaque() -> None:
     tree = _key_tree({"team": "not-a-map"})
     assert "<opaque>" not in tree
     assert ascii("team") in tree
+
+
+# ---------------------------------------------------------------------------
+# RESTING_BID_HUNT Rev 2 §4.3 -- open-orders read-back parse
+# (``GetOpenOrdersResponse`` = ``{orders: [Order]}``, ``types/orders.py:171-174``)
+# ---------------------------------------------------------------------------
+
+
+def _resting_order(**overrides: Any) -> dict[str, Any]:
+    order = build_order("tc-temp-sfohigh-2026-09-16-gte70lt71f")
+    order.update(
+        {
+            "id": "RESTING0001A",
+            "state": "ORDER_STATE_NEW",
+            "tif": "TIME_IN_FORCE_GOOD_TILL_CANCEL",
+            "cumQuantity": 0,
+            "leavesQuantity": 10,
+        }
+    )
+    order.pop("avgPx")
+    order.update(overrides)
+    return order
+
+
+def test_parse_open_orders_empty_list_is_an_empty_tuple() -> None:
+    from breezy.adapters.polymarket_us.exec.reports import parse_open_orders
+
+    assert parse_open_orders({"orders": []}) == ()
+
+
+def test_parse_open_orders_maps_one_resting_order() -> None:
+    from breezy.adapters.polymarket_us.exec.reports import OpenOrderRecord, parse_open_orders
+
+    (record,) = parse_open_orders({"orders": [_resting_order()]})
+
+    assert isinstance(record, OpenOrderRecord)
+    assert record.venue_order_id == "RESTING0001A"
+    assert record.market_slug == "tc-temp-sfohigh-2026-09-16-gte70lt71f"
+    assert record.state == "ORDER_STATE_NEW"
+    assert record.side == "ORDER_SIDE_BUY"
+    assert record.quantity == Decimal(10)
+    assert record.cum_quantity == Decimal(0)
+    assert record.price == Decimal("0.53")
+    assert record.tif == "TIME_IN_FORCE_GOOD_TILL_CANCEL"
+    assert record.create_time == TS_EVENT_TEXT
+    assert record.unknown_keys == ()
+
+
+def test_parse_open_orders_records_a_drift_key_bounded_and_never_refuses_on_it() -> None:
+    """Drift-TOLERANT by design: the boot gate must still be able to ENUMERATE
+    an order whose shape moved, so a new key is recorded, never fatal."""
+    from breezy.adapters.polymarket_us.exec.reports import parse_open_orders
+
+    (record,) = parse_open_orders(
+        {"orders": [_resting_order(brandNewVenueField=1, anotherOne={"x": 1})]},
+    )
+
+    assert record.venue_order_id == "RESTING0001A"
+    assert record.unknown_keys == ("'anotherOne'", "'brandNewVenueField'")
+
+
+def test_parse_open_orders_bounds_the_unknown_key_record() -> None:
+    from breezy.adapters.polymarket_us.exec.reports import (
+        OPEN_ORDER_UNKNOWN_KEYS_MAX,
+        parse_open_orders,
+    )
+
+    drift = {f"k{i:03d}": i for i in range(OPEN_ORDER_UNKNOWN_KEYS_MAX + 5)}
+    (record,) = parse_open_orders({"orders": [_resting_order(**drift)]})
+
+    assert len(record.unknown_keys) == OPEN_ORDER_UNKNOWN_KEYS_MAX
+
+
+def test_parse_open_orders_records_unknown_response_level_keys_too() -> None:
+    from breezy.adapters.polymarket_us.exec.reports import parse_open_orders
+
+    (record,) = parse_open_orders({"orders": [_resting_order()], "extraEnvelope": 1})
+
+    assert "'extraEnvelope'" in record.unknown_keys
+
+
+@pytest.mark.parametrize(
+    ("payload", "match"),
+    [
+        ({}, "no 'orders' key"),
+        ({"orders": None}, "no 'orders' key"),
+        ({"orders": {"a": 1}}, "list"),
+        ({"orders": [1]}, "JSON object"),
+        ([], "JSON object"),
+        ({"orders": [], "eof": False}, "eof"),
+    ],
+)
+def test_parse_open_orders_refuses_a_malformed_envelope(payload: Any, match: str) -> None:
+    from breezy.adapters.polymarket_us.exec.reports import parse_open_orders
+
+    with pytest.raises(ExecutionReportMappingError, match=match):
+        parse_open_orders(payload)
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        {"id": ""},
+        {"id": 12},
+        {"marketSlug": None},
+        {"state": "ORDER_STATE_NOT_A_STATE"},
+        {"side": "ORDER_SIDE_SIDEWAYS"},
+        {"tif": "TIME_IN_FORCE_FOREVER"},
+        {"quantity": "ten"},
+        {"quantity": -1},
+        {"cumQuantity": 11},
+        {"price": {"value": "1.5", "currency": "USD"}},
+        {"price": {"value": "0.5", "currency": "EUR"}},
+        {"createTime": 7},
+    ],
+)
+def test_parse_open_orders_refuses_a_malformed_order(overrides: dict[str, Any]) -> None:
+    """A malformed row refuses the WHOLE read: the caller records the read
+    as refused and never arms, rather than enumerating a partial book."""
+    from breezy.adapters.polymarket_us.exec.reports import parse_open_orders
+
+    with pytest.raises(ExecutionReportMappingError):
+        parse_open_orders({"orders": [_resting_order(**overrides)]})
+
+
+def test_parse_open_orders_a_missing_required_field_refuses() -> None:
+    from breezy.adapters.polymarket_us.exec.reports import parse_open_orders
+
+    order = _resting_order()
+    del order["state"]
+    with pytest.raises(ExecutionReportMappingError, match="state"):
+        parse_open_orders({"orders": [order]})
+
+
+def test_parse_open_orders_a_market_order_may_carry_no_price() -> None:
+    from breezy.adapters.polymarket_us.exec.reports import parse_open_orders
+
+    order = _resting_order(type="ORDER_TYPE_MARKET")
+    del order["price"]
+    (record,) = parse_open_orders({"orders": [order]})
+    assert record.price is None
+
+
+def test_parse_open_orders_never_reads_intent_or_outcome_side() -> None:
+    """The record is side-only; direction vocabulary stays out of this mapper."""
+    from breezy.adapters.polymarket_us.exec.reports import OpenOrderRecord
+
+    assert "intent" not in OpenOrderRecord._fields
+    assert not any("outcome" in f for f in OpenOrderRecord._fields)

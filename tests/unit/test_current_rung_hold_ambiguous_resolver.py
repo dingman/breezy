@@ -45,7 +45,7 @@ from breezy.adapters.polymarket_us.exec.client import (
     StartupPositionSnapshot,
     _synthetic_get_fill_trade_id,
 )
-from breezy.adapters.polymarket_us.exec.endpoints import PORTFOLIO_POSITIONS_PATH
+from breezy.adapters.polymarket_us.exec.endpoints import OPEN_ORDERS_PATH, PORTFOLIO_POSITIONS_PATH
 from breezy.adapters.polymarket_us.operator_controls import (
     MAX_DAILY_BUDGET_USD_ENV_VAR,
     MAX_POSITION_COST_USD_ENV_VAR,
@@ -1647,6 +1647,69 @@ async def test_a_pass_with_no_open_intent_refreshes_stale_startup_evidence(
         assert after is not None
         assert after.ts_ns > before.ts_ns
         assert any(row.slug == "a-different-market" for row in after.positions)
+        await client._disconnect()
+
+
+@pytest.mark.asyncio
+async def test_the_refresh_re_enumerates_open_orders_so_a_post_boot_rest_reaches_the_gate(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    write_canonical_verified: None,  # noqa: F811
+) -> None:
+    """RESTING_BID_HUNT Rev 2 §4.3: R-9a's age-gated refresh carries the
+    open-order evidence forward FRESH -- an order that rests AFTER boot is
+    seen by the re-arm gate on the very next refreshed pass, and the written
+    record refuses (`startup_open_orders_present`)."""
+    enable_operator_gate(monkeypatch, order_count="2")
+    with operator_control_env(MAX_DAILY_BUDGET_USD_ENV_VAR, "1000.00"), operator_control_env(
+        MAX_POSITION_COST_USD_ENV_VAR, "10.00",
+    ):
+        client, _order_id, _slug, _latch_cm, _order_events = await _arm_one_ambiguous_intent(
+            tmp_path,
+        )
+        assert client._latch is not None
+        current = client._latch.current()
+        assert current is not None
+        client._store_set(
+            CURRENT_INTENT_KEY,
+            _retired_intent(current, retired_ns=client._clock.timestamp_ns()).to_bytes(),
+        )
+        before = client.read_startup_position_evidence()
+        assert before is not None
+        assert before.open_orders == ()
+        client._last_evidence_write_ns = 0  # back-date -- force the refresh
+        client._private_read._payloads[OPEN_ORDERS_PATH] = {  # type: ignore[attr-defined]
+            "orders": [
+                {
+                    "id": "RESTING0001A",
+                    "marketSlug": "a-different-market",
+                    "side": "ORDER_SIDE_BUY",
+                    "type": "ORDER_TYPE_LIMIT",
+                    "price": {"value": "0.01", "currency": "USD"},
+                    "quantity": 1,
+                    "cumQuantity": 0,
+                    "leavesQuantity": 1,
+                    "tif": "TIME_IN_FORCE_GOOD_TILL_CANCEL",
+                    "state": "ORDER_STATE_NEW",
+                    "createTime": "2026-09-16T17:00:00.000000000Z",
+                }
+            ]
+        }
+
+        await _run_exactly_one_pass(client)
+
+        after = client.read_startup_position_evidence()
+        assert after is not None
+        assert after.ts_ns > before.ts_ns
+        assert after.open_orders_read_refused is False
+        assert [o.venue_order_id for o in after.open_orders] == ["RESTING0001A"]
+        from breezy.strategy.current_rung_hold.trial_day_latch import (
+            STARTUP_OPEN_ORDERS_PRESENT_REASON,
+            startup_evidence_refusal_reason,
+        )
+
+        decoded = json.loads(after.to_bytes())
+        assert startup_evidence_refusal_reason(decoded) == STARTUP_OPEN_ORDERS_PRESENT_REASON
         await client._disconnect()
 
 

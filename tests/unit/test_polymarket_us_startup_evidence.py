@@ -12,6 +12,7 @@ here must be exactly right, because nothing downstream double-checks it.
 from __future__ import annotations
 
 import asyncio
+import json
 from pathlib import Path
 from typing import Any
 
@@ -31,6 +32,7 @@ from breezy.adapters.polymarket_us.exec.client import (
 )
 from breezy.adapters.polymarket_us.exec.endpoints import (
     ACCOUNT_BALANCES_PATH,
+    OPEN_ORDERS_PATH,
     PORTFOLIO_POSITIONS_PATH,
 )
 from breezy.adapters.polymarket_us.symbology import POLYMARKET_US_VENUE
@@ -221,6 +223,7 @@ def _build_client_with_cache(tmp_path: Path, cache: Cache) -> PolymarketUSExecut
         {
             ACCOUNT_BALANCES_PATH: _balances_payload(),
             PORTFOLIO_POSITIONS_PATH: {"positions": {}, "eof": True},
+            OPEN_ORDERS_PATH: {"orders": []},
         },
     )
 
@@ -305,3 +308,138 @@ def test_startup_position_evidence_round_trips_through_bytes() -> None:
 
 def test_startup_evidence_key_is_namespaced_under_this_venue_only() -> None:
     assert STARTUP_EVIDENCE_KEY == "exec/polymarket_us/startup_evidence"
+
+
+# ---------------------------------------------------------------------------
+# RESTING_BID_HUNT Rev 2 §4.3 -- open-order evidence in the durable record
+# ---------------------------------------------------------------------------
+
+
+def _one_resting_order(slug: str = "tc-temp-sfohigh-2026-09-16-gte70lt71f") -> dict[str, Any]:
+    return {
+        "orders": [
+            {
+                "id": "RESTING0001A",
+                "marketSlug": slug,
+                "side": "ORDER_SIDE_BUY",
+                "type": "ORDER_TYPE_LIMIT",
+                "price": {"value": "0.01", "currency": "USD"},
+                "quantity": 1,
+                "cumQuantity": 0,
+                "leavesQuantity": 1,
+                "tif": "TIME_IN_FORCE_GOOD_TILL_CANCEL",
+                "state": "ORDER_STATE_NEW",
+                "createTime": "2026-09-16T16:50:00.000000000Z",
+            }
+        ]
+    }
+
+
+@pytest.mark.asyncio
+async def test_connect_records_an_empty_open_order_set_as_read_not_refused(
+    tmp_path: Path,
+) -> None:
+    rig = _build_rig(tmp_path)
+    await rig.client._connect()
+    evidence = rig.client.read_startup_position_evidence()
+    await rig.client._disconnect()
+
+    assert evidence is not None
+    assert OPEN_ORDERS_PATH in rig.read.paths
+    assert evidence.open_orders_read_refused is False
+    assert evidence.open_orders == ()
+
+
+@pytest.mark.asyncio
+async def test_a_5xx_open_orders_read_at_connect_is_recorded_as_refused(tmp_path: Path) -> None:
+    """Fail closed: an enumeration error is a refusal, never an assumed-empty book."""
+    rig = _build_rig(tmp_path)
+    rig.read.raises[OPEN_ORDERS_PATH] = RuntimeError("venue read failed")
+    await rig.client._connect()
+    evidence = rig.client.read_startup_position_evidence()
+    await rig.client._disconnect()
+
+    assert evidence is not None
+    assert evidence.open_orders_read_refused is True
+    assert evidence.open_orders == ()
+    # The positions read is independent and still succeeded.
+    assert evidence.position_read_refused is False
+
+
+@pytest.mark.asyncio
+async def test_a_malformed_open_orders_body_at_connect_is_recorded_as_refused(
+    tmp_path: Path,
+) -> None:
+    rig = _build_rig(tmp_path)
+    rig.read._payloads[OPEN_ORDERS_PATH] = {"orders": [{"id": "x"}]}  # type: ignore[attr-defined]
+    await rig.client._connect()
+    evidence = rig.client.read_startup_position_evidence()
+    await rig.client._disconnect()
+
+    assert evidence is not None
+    assert evidence.open_orders_read_refused is True
+
+
+@pytest.mark.asyncio
+async def test_one_resting_order_at_connect_is_enumerated_into_the_evidence(
+    tmp_path: Path,
+) -> None:
+    rig = _build_rig(tmp_path)
+    rig.read._payloads[OPEN_ORDERS_PATH] = _one_resting_order()  # type: ignore[attr-defined]
+    await rig.client._connect()
+    evidence = rig.client.read_startup_position_evidence()
+    await rig.client._disconnect()
+
+    assert evidence is not None
+    assert evidence.open_orders_read_refused is False
+    assert [o.venue_order_id for o in evidence.open_orders] == ["RESTING0001A"]
+    assert evidence.open_orders[0].market_slug == "tc-temp-sfohigh-2026-09-16-gte70lt71f"
+    assert evidence.open_orders[0].state == "ORDER_STATE_NEW"
+    # The strategy-side predicate reads the SAME bytes and refuses.
+    from breezy.strategy.current_rung_hold.trial_day_latch import (
+        STARTUP_OPEN_ORDERS_PRESENT_REASON,
+        startup_evidence_refusal_reason,
+    )
+
+    decoded = json.loads(evidence.to_bytes())
+    assert startup_evidence_refusal_reason(decoded) == STARTUP_OPEN_ORDERS_PRESENT_REASON
+
+
+def test_startup_position_evidence_round_trips_open_orders_through_bytes() -> None:
+    from breezy.adapters.polymarket_us.exec.client import StartupOpenOrderSnapshot
+
+    evidence = StartupPositionEvidence(
+        ts_ns=123,
+        eof_complete=True,
+        position_read_refused=False,
+        fill_walk_complete=True,
+        positions=(),
+        open_orders_read_refused=False,
+        open_orders=(
+            StartupOpenOrderSnapshot(
+                venue_order_id="RESTING0001A",
+                market_slug="a-slug",
+                state="ORDER_STATE_NEW",
+            ),
+        ),
+    )
+    assert StartupPositionEvidence.from_bytes(evidence.to_bytes()) == evidence
+
+
+def test_a_pre_open_order_record_decodes_as_open_orders_refused() -> None:
+    """A durable record written before §4.3 carries no open-order fields;
+    it decodes (never raises -- the boot rewrites it) as REFUSED, so nothing
+    reading the old bytes can mistake 'unrecorded' for 'none open'."""
+    legacy = json.dumps(
+        {
+            "v": 1,
+            "ts_ns": 5,
+            "eof_complete": True,
+            "position_read_refused": False,
+            "fill_walk_complete": True,
+            "positions": [],
+        }
+    ).encode("utf-8")
+    decoded = StartupPositionEvidence.from_bytes(legacy)
+    assert decoded.open_orders_read_refused is True
+    assert decoded.open_orders == ()
