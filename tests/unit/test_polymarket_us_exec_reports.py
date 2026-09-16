@@ -50,6 +50,7 @@ from __future__ import annotations
 
 import base64
 import decimal
+import json
 import logging
 from decimal import Decimal, InvalidOperation
 from typing import Any
@@ -94,10 +95,12 @@ from breezy.adapters.polymarket_us.exec.reports import (
     parse_order_status_report,
     parse_position_status_report,
 )
+from breezy.adapters.polymarket_us.parsing import parse_binary_option_pair
 from breezy.adapters.polymarket_us.symbology import POLYMARKET_US_VENUE
 from tests.unit.polymarket_us_exec_shapes import (
     ACCOUNT_ID,
     CLIENT_ID,
+    RAW,
     REPORT_ID,
     TS_EVENT_NANOS,
     TS_INIT,
@@ -653,6 +656,233 @@ def test_zero_quantity_fill_is_refused(
             account_id=ACCOUNT_ID,
             report_id=REPORT_ID,
             ts_init=TS_INIT,
+        )
+
+
+# ---------------------------------------------------------------------------
+# INC-E2 (POSITION_EXIT_EXECUTION_2026-09-16.md sec 3): response-side leg
+# check, exit-aware. `parse_fill_report(..., closing=True)` selects the
+# disjoint closing-order echo table (`leg_prices.assert_exit_echo_matches_
+# leg`) instead of the entry-only BUY table, so a correctly-echoed exit fill
+# maps instead of classifying AMBIGUOUS structurally. `closing` defaults to
+# `False`, so every fixture/test above this line stays byte-unchanged.
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def no_leg_instrument() -> BinaryOption:
+    """The NO-leg sibling of ``instrument``, from the SAME captured market."""
+    payload = json.loads(
+        (RAW / "market_open_510636_by_slug.json").read_text(encoding="utf-8")
+    )
+    _yes, no = parse_binary_option_pair(payload, ts_init=TS_INIT)
+    assert no is not None
+    return no
+
+
+def _closing_execution(
+    order: dict[str, Any], *, side: str, intent: str, last_px: str
+) -> dict[str, Any]:
+    """``execution``'s shape, with the nested order's echo AND the fill price
+    driven independently, so a closing-order response can be built for
+    either leg without depending on the entry fixture's YES-BUY defaults."""
+    closing_order = {**order, "side": side, "intent": intent}
+    execution = build_execution(closing_order)
+    execution["lastPx"] = {"value": last_px, "currency": "USD"}
+    return execution
+
+
+def test_a_yes_close_with_the_pinned_echo_reports_a_sell(
+    order: dict[str, Any], instrument: BinaryOption
+) -> None:
+    """PINNED-BY-CAPTURE (``leg_prices.py`` module docstring): a YES close
+    echoes exactly ``(ORDER_SIDE_SELL, ORDER_INTENT_SELL_LONG)`` and now maps
+    to ``KIND``-eligible ``OrderSide.SELL`` instead of refusing."""
+    execution = _closing_execution(
+        order, side="ORDER_SIDE_SELL", intent="ORDER_INTENT_SELL_LONG", last_px="0.55"
+    )
+
+    report = parse_fill_report(
+        execution,
+        instrument=instrument,
+        account_id=ACCOUNT_ID,
+        report_id=REPORT_ID,
+        ts_init=TS_INIT,
+        closing=True,
+    )
+
+    assert report.order_side == OrderSide.SELL
+    assert report.last_px == Price.from_str("0.55")
+
+
+def test_a_no_close_with_the_pinned_mirrored_echo_reports_a_sell_at_the_complement(
+    no_leg_instrument: BinaryOption,
+) -> None:
+    """PINNED-BY-CAPTURE: a NO close echoes ``(ORDER_SIDE_BUY,
+    ORDER_INTENT_SELL_SHORT)`` -- the exact mirror of a NO BUY's own echo --
+    at wire price 0.99 (instrument price 0.01, the SAME leg-complement
+    translation ``_leg_price_field`` already applies identically on open and
+    close)."""
+    no_order = build_order(str(no_leg_instrument.raw_symbol))
+    execution = _closing_execution(
+        no_order, side="ORDER_SIDE_BUY", intent="ORDER_INTENT_SELL_SHORT", last_px="0.99"
+    )
+
+    report = parse_fill_report(
+        execution,
+        instrument=no_leg_instrument,
+        account_id=ACCOUNT_ID,
+        report_id=REPORT_ID,
+        ts_init=TS_INIT,
+        closing=True,
+    )
+
+    assert report.order_side == OrderSide.SELL
+    assert report.last_px == Price.from_str("0.01")
+
+
+def test_a_no_close_echoed_with_the_wrong_side_is_refused(
+    no_leg_instrument: BinaryOption,
+) -> None:
+    """The NO-close echo's ``side`` is ``BUY`` (the mirror of a NO buy); a
+    ``SELL`` on the same ``SELL_SHORT`` intent matches NEITHER table and is
+    refused -- the two closing/opening tables never accept each other's
+    partial overlap."""
+    no_order = build_order(str(no_leg_instrument.raw_symbol))
+    execution = _closing_execution(
+        no_order, side="ORDER_SIDE_SELL", intent="ORDER_INTENT_SELL_SHORT", last_px="0.99"
+    )
+
+    with pytest.raises(ExecutionReportMappingError, match="closing order"):
+        parse_fill_report(
+            execution,
+            instrument=no_leg_instrument,
+            account_id=ACCOUNT_ID,
+            report_id=REPORT_ID,
+            ts_init=TS_INIT,
+            closing=True,
+        )
+
+
+def test_an_entry_response_carrying_a_close_echo_is_refused(
+    order: dict[str, Any], instrument: BinaryOption
+) -> None:
+    """``closing`` defaults to ``False``: an entry order whose response
+    happens to carry the YES-close pair is checked against the BUY-only
+    table and refused there -- never silently accepted as if it were an
+    open."""
+    execution = _closing_execution(
+        order, side="ORDER_SIDE_SELL", intent="ORDER_INTENT_SELL_LONG", last_px="0.55"
+    )
+
+    with pytest.raises(ExecutionReportMappingError, match="leg the venue did not declare"):
+        parse_fill_report(
+            execution,
+            instrument=instrument,
+            account_id=ACCOUNT_ID,
+            report_id=REPORT_ID,
+            ts_init=TS_INIT,
+        )
+
+
+# ---------------------------------------------------------------------------
+# Coordinator item D (POSITION_EXIT_EXECUTION_2026-09-16.md, security review):
+# `parse_order_status_report` gains the SAME `closing` parameter
+# `parse_fill_report` already has -- the with-id AMBIGUOUS resolver's GET
+# path (`exec/client.py::_resolve_ambiguous_intents`) maps an ``Order``, not
+# an ``Execution``, so without this the resolver has no way to ever resolve
+# a genuinely-filled exit order: it always applied the entry-only BUY/
+# BUY_LONG echo table and stayed `mapping_error`/AMBIGUOUS forever.
+# ---------------------------------------------------------------------------
+
+
+def _closing_order_payload(
+    order: dict[str, Any], *, side: str, intent: str,
+) -> dict[str, Any]:
+    return {**order, "side": side, "intent": intent}
+
+
+def test_order_status_report_a_yes_close_with_the_pinned_echo_reports_a_sell(
+    order: dict[str, Any], instrument: BinaryOption
+) -> None:
+    """PINNED-BY-CAPTURE, mirrors ``test_a_yes_close_with_the_pinned_echo_
+    reports_a_sell`` for the ORDER (not execution) mapper: a YES close
+    echoes exactly ``(ORDER_SIDE_SELL, ORDER_INTENT_SELL_LONG)`` and maps to
+    ``OrderSide.SELL`` only when ``closing=True``."""
+    payload = _closing_order_payload(
+        order, side="ORDER_SIDE_SELL", intent="ORDER_INTENT_SELL_LONG",
+    )
+
+    report = parse_order_status_report(
+        payload,
+        instrument=instrument,
+        account_id=ACCOUNT_ID,
+        report_id=REPORT_ID,
+        ts_init=TS_INIT,
+        closing=True,
+    )
+
+    assert report.order_side == OrderSide.SELL
+
+
+def test_order_status_report_a_no_close_with_the_pinned_mirrored_echo_reports_a_sell(
+    no_leg_instrument: BinaryOption,
+) -> None:
+    """PINNED-BY-CAPTURE: a NO close echoes ``(ORDER_SIDE_BUY,
+    ORDER_INTENT_SELL_SHORT)`` and still maps to ``OrderSide.SELL`` under
+    ``closing=True``."""
+    no_order = build_order(str(no_leg_instrument.raw_symbol))
+    payload = _closing_order_payload(
+        no_order, side="ORDER_SIDE_BUY", intent="ORDER_INTENT_SELL_SHORT",
+    )
+
+    report = parse_order_status_report(
+        payload,
+        instrument=no_leg_instrument,
+        account_id=ACCOUNT_ID,
+        report_id=REPORT_ID,
+        ts_init=TS_INIT,
+        closing=True,
+    )
+
+    assert report.order_side == OrderSide.SELL
+
+
+def test_order_status_report_defaults_closing_to_false_and_refuses_a_close_echo(
+    order: dict[str, Any], instrument: BinaryOption
+) -> None:
+    """``closing`` defaults to ``False`` -- byte-unchanged for every
+    existing entry-path caller: a status report carrying the YES-close pair
+    is checked against the BUY-only table and refused, never silently
+    accepted as an open."""
+    payload = _closing_order_payload(
+        order, side="ORDER_SIDE_SELL", intent="ORDER_INTENT_SELL_LONG",
+    )
+
+    with pytest.raises(ExecutionReportMappingError):
+        parse_order_status_report(
+            payload,
+            instrument=instrument,
+            account_id=ACCOUNT_ID,
+            report_id=REPORT_ID,
+            ts_init=TS_INIT,
+        )
+
+
+def test_order_status_report_a_close_echoed_with_the_wrong_side_is_refused_under_closing(
+    order: dict[str, Any], instrument: BinaryOption
+) -> None:
+    """The two tables never accept each other's pair: an ENTRY-shaped echo
+    (BUY/BUY_LONG) under ``closing=True`` is refused, not silently accepted
+    as a close."""
+    with pytest.raises(ExecutionReportMappingError, match="closing order"):
+        parse_order_status_report(
+            order,
+            instrument=instrument,
+            account_id=ACCOUNT_ID,
+            report_id=REPORT_ID,
+            ts_init=TS_INIT,
+            closing=True,
         )
 
 

@@ -94,6 +94,7 @@ from breezy.adapters.polymarket_us.feed_fault import (
     clear_fatal_feed_fault,
     fatal_feed_fault,
 )
+from breezy.persistence.family_manifest import FamilyManifest
 from breezy.runtime.account_presence_halt import install_account_presence_halt
 from breezy.runtime.backtest_order_guard import install_live_order_guard
 from breezy.runtime.component_health_watch import (
@@ -454,6 +455,7 @@ def run(
     settings: BreezyTradeSettings | None = None,
     exec_client_config: PolymarketUSExecClientConfig | None = None,
     submit_veto: Callable[[], str | None] | None = None,
+    exit_manifest: FamilyManifest | None = None,
 ) -> int:
     """Load settings, build the node config, run the node, return an exit code.
 
@@ -495,6 +497,7 @@ def run(
                 submit_intent_latch=submit_intent_latch,
                 live_trading_permit=live_trading_permit,
                 submit_veto=submit_veto,
+                exit_manifest=exit_manifest,
             )
         except _CONFIG_ERRORS as exc:
             _report(out, "configuration error", exc, expected=True)

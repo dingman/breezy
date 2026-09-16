@@ -24,6 +24,7 @@ from types import ModuleType
 
 import pytest
 
+from breezy.persistence.family_manifest import FamilyManifest
 from breezy.settlement.trial_scorer import ScoredTrial
 from breezy.strategy.current_rung_hold.monitor_records import PositionMonitorSummary
 
@@ -634,6 +635,234 @@ class TestCalibration:
         report = report_mod.build_monitor_report((), (), usable_station_days=30)
 
         assert report.calibration.constants_calibrated is True
+
+
+class TestExitRuleSeries:
+    """INC-E5 (`docs/plans/POSITION_EXIT_EXECUTION_2026-09-16.md` Sec 1/3):
+    realized pnl, avoided loss and premature-exit rate, keyed per exit
+    rule, plus the `SETTLED` hold-control -- DESCRIPTIVE only (never an
+    LD-OBF/tally input). Every number below is hand-computed: the fee
+    coefficient is `CurrentRungHoldConfig().required_fee_coefficient`
+    (`Decimal("0.06")`), and `0.06 * price * (1 - price)` is quantized to
+    the cent with banker's rounding (`decision.py`'s `_fee`, reused via
+    `monitor_evidence.exit_fee`) -- see each row's own comment.
+    """
+
+    def _fired_summary(self, **overrides: object) -> PositionMonitorSummary:
+        base: dict[str, object] = {
+            "exit_decision": "fired",
+            "exit_reason_code": "fired",
+            "fill_px": Decimal("0.50"),
+        }
+        base.update(overrides)
+        return _summary(**base)
+
+    def test_two_r_threat_one_r_dead_two_settled_series_match_hand_computed_arithmetic(
+        self, report_mod: ModuleType
+    ) -> None:
+        summaries = (
+            # R_THREAT #1: PREMATURE -- settlement says the entry thesis
+            # would have held (settled_held=True). exit_fee =
+            # 0.06*0.60*0.40 = 0.0144 -> 0.01 (banker's rounding).
+            # realized = 0.60 - 0.01 - 0.50 - 0.02 = 0.07.
+            # avoided  = 0.07 - 0.48 (would-have-held) = -0.41.
+            self._fired_summary(
+                trial_id="RT1", exit_rule="R_THREAT", exit_limit_price=Decimal("0.60")
+            ),
+            # R_THREAT #2: AVOIDED LOSS -- settlement says the thesis died
+            # (settled_held=False). exit_fee = 0.06*0.30*0.70 = 0.0126 ->
+            # 0.01. realized = 0.30 - 0.01 - 0.50 - 0.02 = -0.23.
+            # avoided = -0.23 - (-0.52) = 0.29.
+            self._fired_summary(
+                trial_id="RT2", exit_rule="R_THREAT", exit_limit_price=Decimal("0.30")
+            ),
+            # R_DEAD: exit_fee = 0.06*0.10*0.90 = 0.0054 -> 0.01.
+            # realized = 0.10 - 0.01 - 0.50 - 0.02 = -0.43.
+            # avoided = -0.43 - (-0.52) = 0.09.
+            self._fired_summary(
+                trial_id="RD1", exit_rule="R_DEAD", exit_limit_price=Decimal("0.10")
+            ),
+            # SETTLED (never exited -- backward-compat default exit_rule=None).
+            _summary(trial_id="S1"),
+            _summary(trial_id="S2"),
+        )
+        scored = (
+            _trial(
+                trial_id="RT1", held=True, pnl=Decimal("0.48"),
+                fill_px=Decimal("0.50"), fee=Decimal("0.02"),
+            ),
+            _trial(
+                trial_id="RT2", held=False, pnl=Decimal("-0.52"),
+                fill_px=Decimal("0.50"), fee=Decimal("0.02"),
+            ),
+            _trial(
+                trial_id="RD1", held=False, pnl=Decimal("-0.52"),
+                fill_px=Decimal("0.50"), fee=Decimal("0.02"),
+            ),
+            _trial(trial_id="S1", held=True, pnl=Decimal("0.44")),
+            _trial(trial_id="S2", held=False, pnl=Decimal("-0.56")),
+        )
+
+        report = report_mod.build_monitor_report(summaries, scored)
+        series = report.exit_rule_series
+
+        r_threat = series["R_THREAT"]
+        assert r_threat.n == 2
+        assert r_threat.n_excluded_missing_price_or_fee == 0
+        assert r_threat.realized_pnl_total == Decimal("-0.16")
+        assert r_threat.avoided_loss_total == Decimal("-0.12")
+        assert r_threat.premature_exit_rate.k == 1
+        assert r_threat.premature_exit_rate.n == 2
+
+        r_dead = series["R_DEAD"]
+        assert r_dead.n == 1
+        assert r_dead.n_excluded_missing_price_or_fee == 0
+        assert r_dead.realized_pnl_total == Decimal("-0.43")
+        assert r_dead.avoided_loss_total == Decimal("0.09")
+        assert r_dead.premature_exit_rate.k == 0
+        assert r_dead.premature_exit_rate.n == 1
+
+        settled = series["SETTLED"]
+        assert settled.n == 2
+        assert settled.realized_pnl_total == Decimal("-0.12")
+        assert settled.avoided_loss_total == Decimal(0)
+        assert settled.premature_exit_rate.n == 0
+        assert settled.premature_exit_rate.point is None
+
+    def test_old_summary_rows_without_exit_fields_still_render_as_settled(
+        self, report_mod: ModuleType
+    ) -> None:
+        """Backward compat: a pre-INC-E3 summary defaults `exit_rule` to
+        `None` -- it must still render, joined into `SETTLED`, never raise
+        and never silently vanish from every group's count."""
+        summaries = (_summary(trial_id="OLD1"),)
+        scored = (_trial(trial_id="OLD1", held=True, pnl=Decimal("0.20")),)
+
+        report = report_mod.build_monitor_report(summaries, scored)
+
+        assert report.exit_rule_series["SETTLED"].n == 1
+        assert report.exit_rule_series["R_THREAT"].n == 0
+        assert report.exit_rule_series["R_DEAD"].n == 0
+
+    def test_default_manifest_reports_armed_false_for_pm_us_crh_cont(
+        self, report_mod: ModuleType
+    ) -> None:
+        report = report_mod.build_monitor_report((), ())
+
+        for rule in ("R_THREAT", "R_DEAD", "SETTLED"):
+            rule_series = report.exit_rule_series[rule]
+            assert rule_series.armed is False
+            assert rule_series.family == "pm_us_crh_cont"
+
+    def test_markdown_renders_the_armed_line_false_for_pm_us_crh_cont(
+        self, report_mod: ModuleType
+    ) -> None:
+        report = report_mod.build_monitor_report((), ())
+        markdown = report_mod._render_markdown(report)
+
+        assert "R_THREAT: ARMED: False family: pm_us_crh_cont" in markdown
+        assert "R_DEAD: ARMED: False family: pm_us_crh_cont" in markdown
+        assert "SETTLED: ARMED: False family: pm_us_crh_cont" in markdown
+
+    def test_a_code_registered_manifest_declaring_exit_rule_arms_the_exit_rules_only(
+        self, report_mod: ModuleType
+    ) -> None:
+        manifest = FamilyManifest(
+            family_id="pm_us_crh_exit_v4",
+            venue="polymarket_us",
+            trial_id_prefix="current_rung_hold_exit_v4/trial/",
+            d0_climate_day="2099-01-01",
+            boundary_artefact_path=Path("deploy/families/gs_boundary_pm_us_crh_v2.json"),
+            boundary_inputs_sha256="a" * 64,
+            stations=("SFO",),
+            status="REGISTERED",
+            manifest_sha256="c" * 64,
+            exit_rule="crh_exit_v4:R_THREAT_PRIMARY+R_DEAD_BACKSTOP",
+        )
+
+        report = report_mod.build_monitor_report((), (), family_manifest=manifest)
+
+        assert report.exit_rule_series["R_THREAT"].armed is True
+        assert report.exit_rule_series["R_DEAD"].armed is True
+        assert report.exit_rule_series["R_THREAT"].family == "pm_us_crh_exit_v4"
+        # SETTLED never "arms" -- it names the absence of an exit, not a rule.
+        assert report.exit_rule_series["SETTLED"].armed is False
+
+    def test_a_manifest_that_never_declares_exit_rule_stays_unarmed(
+        self, report_mod: ModuleType
+    ) -> None:
+        manifest = FamilyManifest(
+            family_id="pm_us_crh_cont",
+            venue="polymarket_us",
+            trial_id_prefix="continuous_rung_hold/trial/",
+            d0_climate_day="2026-09-12",
+            boundary_artefact_path=Path("deploy/families/gs_boundary_pm_us_crh_v2.json"),
+            boundary_inputs_sha256="a" * 64,
+            stations=("LAX", "MDW", "MIA", "SFO"),
+            status="REGISTERED",
+            manifest_sha256="d" * 64,
+            exit_rule=None,
+        )
+
+        report = report_mod.build_monitor_report((), (), family_manifest=manifest)
+
+        assert report.exit_rule_series["R_THREAT"].armed is False
+        assert report.exit_rule_series["R_DEAD"].armed is False
+
+    def test_to_dict_serializes_exit_rule_series_with_decimal_as_str(
+        self, report_mod: ModuleType
+    ) -> None:
+        summaries = (
+            self._fired_summary(
+                trial_id="RT1", exit_rule="R_THREAT", exit_limit_price=Decimal("0.60")
+            ),
+        )
+        scored = (
+            _trial(
+                trial_id="RT1", held=True, pnl=Decimal("0.48"),
+                fill_px=Decimal("0.50"), fee=Decimal("0.02"),
+            ),
+        )
+
+        report = report_mod.build_monitor_report(summaries, scored)
+        payload = report.to_dict()
+
+        r_threat_payload = payload["exit_rule_series"]["R_THREAT"]
+        assert isinstance(r_threat_payload["realized_pnl_total"], str)
+        assert isinstance(r_threat_payload["avoided_loss_total"], str)
+        assert r_threat_payload["armed"] is False
+        assert r_threat_payload["family"] == "pm_us_crh_cont"
+
+    def test_missing_entry_fee_join_excludes_the_row_from_pricing_but_counts_it(
+        self, report_mod: ModuleType
+    ) -> None:
+        """A fired exit whose settlement resolved from the summary's own
+        `settled_*` fields (INC-8 hypothetical corpus, no `ScoredTrial`,
+        never a discrete entry fee) is excluded from `realized_pnl_total`/
+        `avoided_loss_total` -- counted, never guessed -- but still counts
+        toward `n` and the premature-exit rate, which need only
+        `settled_held`.
+        """
+        summaries = (
+            self._fired_summary(
+                trial_id="hypo:SFO:2026-09-01:0",
+                entry_context="hypothetical",
+                exit_rule="R_THREAT",
+                exit_limit_price=Decimal("0.60"),
+                settled_held=True,
+                settled_pnl=Decimal("0.48"),
+            ),
+        )
+
+        report = report_mod.build_monitor_report(summaries, ())
+        r_threat = report.exit_rule_series["R_THREAT"]
+
+        assert r_threat.n == 1
+        assert r_threat.n_excluded_missing_price_or_fee == 1
+        assert r_threat.realized_pnl_total == Decimal(0)
+        assert r_threat.avoided_loss_total == Decimal(0)
+        assert r_threat.premature_exit_rate.k == 1
+        assert r_threat.premature_exit_rate.n == 1
 
 
 class TestDecimalPurity:

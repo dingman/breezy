@@ -50,6 +50,7 @@ def _run_wrapper(
     set_state_db: bool = True,
     write_counter_json: bool = True,
     state_db: Path | None = None,
+    families_dir: Path | None = None,
 ) -> subprocess.CompletedProcess[str]:
     # I3 (LIVE_FILL_SCORING_CHAIN_2026-09-05.md, BLOCK-2): the wrapper now
     # asserts the 14:15 score-live-trials-run.sh success marker before
@@ -61,6 +62,13 @@ def _run_wrapper(
     env = dict(os.environ)
     env["BREEZY_SCORED_TRIALS_DIR"] = str(tmp_path / "scored_trials")
     env["BREEZY_LIVE_TALLY_OUTPUT_DIR"] = str(out_dir)
+    # Default to THIS checkout's own deploy/families (never the deployed
+    # tree's) so the wrapper enumerates exactly what `_valid_family_ids()`
+    # sees -- the wrapper's own default (unset) still resolves to
+    # $REPO/deploy/families for the real, deployed systemd unit.
+    env["BREEZY_FAMILY_TALLY_V2_FAMILIES_DIR"] = str(
+        families_dir if families_dir is not None else _FAMILIES_DIR
+    )
     if stub_python is not None:
         env["BREEZY_FAMILY_TALLY_V2_PYTHON"] = str(stub_python)
     if set_state_db:
@@ -170,6 +178,40 @@ def test_wrapper_never_lists_a_boundary_artefact_json_as_a_valid_family_id(
     result = _run_wrapper(["gs_boundary_pm_us_crh_v2"], tmp_path)
     assert result.returncode == 2
     assert "gs_boundary_pm_us_crh_v2" not in _valid_family_ids()
+
+
+def test_wrapper_families_dir_override_replaces_the_enumerated_manifest_set(
+    tmp_path: Path,
+) -> None:
+    """`BREEZY_FAMILY_TALLY_V2_FAMILIES_DIR` swaps which directory the
+    wrapper enumerates for `--family` validation -- it is what lets this
+    module's own tests validate against THIS checkout's `deploy/families`
+    (which may hold manifests, such as a DRAFT_NOT_REGISTERED one, not yet
+    present on the deployed tree the wrapper defaults to) instead of
+    silently reading the deployed tree's set. An id that is valid only in
+    the override directory is accepted; the deployed-default set's ids are
+    no longer recognised once the override is in effect."""
+    only_family_dir = tmp_path / "only_family"
+    only_family_dir.mkdir()
+    (only_family_dir / "solo_family.json").write_text(
+        json.dumps({"family_id": "solo_family"})
+    )
+
+    stub = tmp_path / "stub_python.sh"
+    stub.write_text("#!/usr/bin/env bash\nexit 0\n")
+    stub.chmod(0o755)
+    accepted = _run_wrapper(
+        ["solo_family"], tmp_path, stub_python=stub, families_dir=only_family_dir
+    )
+    assert accepted.returncode == 0, accepted.stderr
+
+    rejected = _run_wrapper(
+        ["pm_us_crh_v2"], tmp_path, stub_python=stub, families_dir=only_family_dir
+    )
+    assert rejected.returncode == 2
+    valid_ids_named = rejected.stderr.split("valid ids:", 1)[1]
+    assert "pm_us_crh_v2" not in valid_ids_named
+    assert "solo_family" in valid_ids_named
 
 
 def test_wrapper_exits_nonzero_and_never_invokes_the_tally_when_marker_absent(

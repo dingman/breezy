@@ -293,6 +293,7 @@ from breezy.adapters.polymarket_us.exec_fault import record_fatal_exec_fault
 from breezy.adapters.polymarket_us.fees import polymarket_us_fee
 from breezy.adapters.polymarket_us.operator_controls import (
     DailyBudgetExhausted,
+    SpendBooking,
     utc_day_for_ns,
 )
 from breezy.adapters.polymarket_us.parsing import _to_decimal
@@ -310,6 +311,12 @@ from breezy.adapters.polymarket_us.symbology import (
     slug_to_instrument_id,
 )
 from breezy.ingest.gate import assert_state_store_durable
+from breezy.persistence.exit_tags import (
+    EXIT_CLIENT_ORDER_ID_TAG_PREFIX,
+    EXIT_FAMILY_TAG_PREFIX,
+    EXIT_POSITION_TAG_PREFIX,
+    EXIT_RULE_TAG_PREFIX,
+)
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
     from nautilus_trader.cache.cache import Cache
@@ -337,7 +344,9 @@ if TYPE_CHECKING:  # pragma: no cover - typing only
     from nautilus_trader.model.instruments import Instrument
     from nautilus_trader.model.objects import Price, Quantity
 
+    from breezy.adapters.polymarket_us.leg_prices import Leg
     from breezy.ingest.gate import ClosableStateStore, StateStoreOpener
+    from breezy.persistence.family_manifest import FamilyManifest
 
 __all__ = [
     "BUDGET_EXHAUSTED_KEY_PREFIX",
@@ -436,6 +445,12 @@ _RECORD_SIGNS: Final[Mapping[str, Decimal]] = {
     "SELL": Decimal(-1),
 }
 
+#: INC-E2: the process-local booking-id sentinel recorded on a resolver
+#: context for an exit-side order, which never books against the ledger at
+#: all (`:347` budget, §5.8). `_BOOKING_IDS` (`operator_controls.py:157`) is
+#: `itertools.count(1)`, so `-1` can never collide with a real booking id.
+_NO_BOOKING_ID: Final[int] = -1
+
 _DEFAULT_INSTRUMENT_WAIT_SECONDS: Final[float] = 30.0
 _DEFAULT_ACCOUNT_REGISTRATION_SECONDS: Final[float] = 30.0
 
@@ -466,6 +481,56 @@ _VENUE_ID_MAP_WRITE_FAILED: Final[str] = (
     "the venue order id -> client order id map write raised; this client "
     "refuses further submits until an operator investigates"
 )
+
+#: INC-E2c: an exit-tagged order reached this coroutine with no
+#: ``exit_manifest`` injected -- fails exactly like ``PERMIT_ABSENT_REASON``
+#: (a missing collaborator denies, it never crashes the coroutine by calling
+#: ``submit_chain.unmappable_exit_order_reason`` with ``manifest=None``).
+_EXIT_MANIFEST_ABSENT_REASON: Final[str] = (
+    "no exit family manifest is injected; this client refuses to submit an exit"
+)
+
+#: The four ``Order.tags`` prefixes an exit order carries (module docstring
+#: of ``persistence/exit_tags.py``), and their lengths precomputed at import
+#: time. ``_submit_order`` is E0-NOSEND-scanned (every ``ast.Call`` in its
+#: body must be on ``EXEC_ORDER_COROUTINE_PERMITTED_CALLEES`` --
+#: ``test_execution_egress_firewall_guard.py``), so tag matching there uses
+#: slicing and ``==`` (neither is a call) against these precomputed lengths
+#: rather than ``str.startswith(...)`` -- a call the cage would need a new
+#: entry for, for a pure string comparison that does not need one.
+_EXIT_RULE_TAG_PREFIX_LEN: Final[int] = len(EXIT_RULE_TAG_PREFIX)
+_EXIT_POSITION_TAG_PREFIX_LEN: Final[int] = len(EXIT_POSITION_TAG_PREFIX)
+_EXIT_FAMILY_TAG_PREFIX_LEN: Final[int] = len(EXIT_FAMILY_TAG_PREFIX)
+_EXIT_CLIENT_ORDER_ID_TAG_PREFIX_LEN: Final[int] = len(EXIT_CLIENT_ORDER_ID_TAG_PREFIX)
+
+
+@dataclass(frozen=True, slots=True)
+class _AdapterExitAuthorization:
+    """Adapter-side view satisfying ``submit_chain.ExitAuthorizationLike``
+    structurally, reconstructed from the order's own tags and fields --
+    never imported from ``strategy/`` (the importlinter layer contract:
+    ``adapters`` sits below ``strategy``, module docstring of
+    ``exec/submit_chain.py``'s ``ExitAuthorizationLike``).
+
+    ``leg`` and ``limit_price`` are derived from the SAME order/instrument
+    ``submit_chain``'s own cross-checks compare them against
+    (``leg_of(instrument.id)``, ``order_price_decimal(order)``), so those
+    two checks are necessarily tautological for THIS caller -- there is no
+    second, independent source of truth at the exec-client boundary; only
+    ``family_id`` (read from the ``exit_family_id=`` tag, independent of the
+    order's own fields) exercises a genuine cross-check, against
+    ``manifest.family_id``. ``quantity`` is pinned to the domain invariant
+    (every exit is exactly 1 contract, ``ExitAuthorization.__post_init__``)
+    rather than converted from the order via a new ``int(...)`` call, which
+    the E0-NOSEND cage would need a new entry for.
+    """
+
+    family_id: str
+    position_id: str
+    client_order_id: str
+    leg: Leg
+    quantity: int
+    limit_price: Decimal
 
 
 class PrivateRead(Protocol):
@@ -709,6 +774,15 @@ class AmbiguousResolverContext:
     # or raise the cap in a follow-up, never remove it.
     create_detail: str | None = None
     fill_parse_error: str | None = None
+    #: INC-E2 (POSITION_EXIT_EXECUTION_2026-09-16 fill accounting): the
+    #: order's REAL Nautilus side name (``"BUY"``/``"SELL"``), so a resolver
+    #: GET-fill books the same side the create-time order actually carried
+    #: instead of the entry-only ``LONG_ONLY_SIDE`` hardcode. Trailing-
+    #: optional, same AR-N6 shape as the two fields above: an OLD blob
+    #: (written before this change, when every order this client ever built
+    #: was a BUY) has no key at all and decodes to ``LONG_ONLY_SIDE`` --
+    #: exactly what it always was.
+    order_side: str = LONG_ONLY_SIDE
 
     def to_bytes(self) -> bytes:
         return json.dumps(
@@ -723,6 +797,7 @@ class AmbiguousResolverContext:
                 "createdNs": self.created_ns,
                 "createDetail": self.create_detail,
                 "fillParseError": self.fill_parse_error,
+                "orderSide": self.order_side,
             },
             sort_keys=True,
         ).encode("utf-8")
@@ -747,6 +822,11 @@ class AmbiguousResolverContext:
         create_detail = None if raw_create_detail is None else str(raw_create_detail)
         raw_fill_parse_error = payload.get("fillParseError")
         fill_parse_error = None if raw_fill_parse_error is None else str(raw_fill_parse_error)
+        # INC-E2: same trailing-optional shape -- an old blob has no
+        # `orderSide` key at all (every order it could ever have named was a
+        # BUY), so absence decodes to `LONG_ONLY_SIDE`, never `None`.
+        raw_order_side = payload.get("orderSide")
+        order_side = LONG_ONLY_SIDE if raw_order_side is None else str(raw_order_side)
         try:
             return cls(
                 intent_id=str(payload["intentId"]),
@@ -763,6 +843,7 @@ class AmbiguousResolverContext:
                 created_ns=int(payload["createdNs"]),
                 create_detail=create_detail,
                 fill_parse_error=fill_parse_error,
+                order_side=order_side,
             )
         except (KeyError, TypeError, ValueError, InvalidOperation) as exc:
             raise ExecutionReportMappingError(
@@ -960,6 +1041,7 @@ class PolymarketUSExecutionClient(LiveExecutionClient):
         api_base_url: str = "",
         retirement_reasons: Any = None,
         submit_veto: Callable[[], str | None] | None = None,
+        exit_manifest: FamilyManifest | None = None,
     ) -> None:
         """Build the client. Every input is checked here, not at first use.
 
@@ -1046,6 +1128,13 @@ class PolymarketUSExecutionClient(LiveExecutionClient):
         # adapters-layer module never imports the type of. `None` -> no veto,
         # matching every composition root that predates this parameter.
         self._submit_veto = submit_veto
+        # INC-E2c: the registered exit family's manifest, injected exactly
+        # like `submit_veto`/`submit_intent_latch` above -- `None` (the
+        # default, matching every composition root that predates this
+        # parameter) denies every exit-tagged order with
+        # `_EXIT_MANIFEST_ABSENT_REASON` rather than dereferencing `None`
+        # inside `submit_chain.unmappable_exit_order_reason`.
+        self._exit_manifest = exit_manifest
         self._intent_reconciled: bool = False
         # Resolution A/E (plan rev 6.1): the live `SpendBooking` for a
         # with-id AMBIGUOUS intent, held ONLY for same-process true-up.
@@ -1665,6 +1754,15 @@ class PolymarketUSExecutionClient(LiveExecutionClient):
                     account_id=self._issued_account_id,
                     report_id=UUID4(),
                     ts_init=self._clock.timestamp_ns(),
+                    # INC-E2d: `context.order_side` is the order's REAL side
+                    # captured at `_note_ambiguous_open` time (INC-E2a) --
+                    # "SELL" only for an exit, since every entry this client
+                    # ever submits is a plain BUY (`allow_short=False`). A
+                    # `context.order_side` of `LONG_ONLY_SIDE` ("BUY", the
+                    # field's own default for an old blob predating this
+                    # field) resolves `closing=False`, so a pre-existing
+                    # durable context decodes with byte-identical behaviour.
+                    closing=context.order_side == "SELL",
                 )
             except Exception as exc:  # noqa: BLE001 - malformed stays AMBIGUOUS
                 self._resolver_consecutive_failures += 1
@@ -1921,7 +2019,12 @@ class PolymarketUSExecutionClient(LiveExecutionClient):
             venue_order_id=context.venue_order_id,
             client_order_id=context.client_order_id,
             instrument_id=context.instrument_id,
-            order_side=LONG_ONLY_SIDE,
+            # INC-E2: the order's REAL side (`context.order_side`), never the
+            # entry-only `LONG_ONLY_SIDE` hardcode -- an old context (written
+            # before this change) still decodes `order_side` as
+            # `LONG_ONLY_SIDE`, so this is byte-identical for every fill this
+            # resolver has ever recorded to date.
+            order_side=context.order_side,
             cumulative_qty=cumulative_qty,
             cumulative_cost=cumulative_cost,
             cumulative_fee=submit_chain.ZERO,
@@ -2004,7 +2107,11 @@ class PolymarketUSExecutionClient(LiveExecutionClient):
             venue_order_id=submit_chain.venue_order_id(context.venue_order_id),
             venue_position_id=None,
             trade_id=_synthetic_get_fill_trade_id(context.venue_order_id),
-            order_side=OrderSide.BUY,
+            # INC-E2: the order's REAL side, reconstructed from the durable
+            # context's own record (`OrderSide[...]` is a by-name lookup,
+            # e.g. `OrderSide["BUY"] is OrderSide.BUY`) -- never the
+            # hardcoded `OrderSide.BUY`.
+            order_side=OrderSide[context.order_side],
             order_type=OrderType.LIMIT,
             last_qty=report.filled_qty,
             last_px=instrument.make_price(avg_px),
@@ -3022,7 +3129,7 @@ class PolymarketUSExecutionClient(LiveExecutionClient):
         venue_order_id: str,
         order: Any,
         notional_usd: Decimal,
-        booking: Any,
+        booking: SpendBooking | None,
         now_ns: int,
         create_detail: str | None = None,
         fill_parse_error: str | None = None,
@@ -3038,6 +3145,12 @@ class PolymarketUSExecutionClient(LiveExecutionClient):
         reads from the caller's already-classified ``outcome`` -- both
         already capped and names-only by the time they reach here. This
         method does NOT truncate them again (S-L1).
+
+        INC-E2: ``booking`` is ``None`` for an exit-side order (§5.8, gross
+        entry spend only -- no debit was ever booked to true up or release),
+        so ``booking_id`` records the sentinel ``-1`` (``_BOOKING_IDS`` is
+        1-indexed, `operator_controls.py:157`, so it never collides with a
+        real booking) rather than dereferencing a ``None``.
         """
         context = AmbiguousResolverContext(
             intent_id=intent_id,
@@ -3046,10 +3159,11 @@ class PolymarketUSExecutionClient(LiveExecutionClient):
             client_order_id=str(order.client_order_id.value),
             strategy_id=str(order.strategy_id.value),
             notional_usd=notional_usd,
-            booking_id=booking.booking_id,
+            booking_id=_NO_BOOKING_ID if booking is None else booking.booking_id,
             created_ns=now_ns,
             create_detail=create_detail,
             fill_parse_error=fill_parse_error,
+            order_side=order.side.name,
         )
         self._store_set(f"{RESOLVER_CONTEXT_KEY_PREFIX}{intent_id}", context.to_bytes())
         self._ambiguous_bookings[intent_id] = booking
@@ -3069,7 +3183,75 @@ class PolymarketUSExecutionClient(LiveExecutionClient):
         if write_transport.WRITE_CANONICAL_STRING_VERIFIED is not True:
             return self._deny(order, submit_chain.CANONICAL_UNVERIFIED_REASON, now_ns)
         instrument = self._cache.instrument(order.instrument_id)
-        unmappable = submit_chain.unmappable_order_reason(order, instrument)
+        # INC-E2c: reconstruct the exit-order view from the order's OWN
+        # tags -- never imported from `strategy/exit_wiring.py` (the
+        # importlinter layer contract). Slicing + `==` only (see
+        # `_EXIT_RULE_TAG_PREFIX_LEN`'s comment): every `ast.Call` inside
+        # this coroutine must be on `EXEC_ORDER_COROUTINE_PERMITTED_CALLEES`
+        # (`test_execution_egress_firewall_guard.py`), so a `str.startswith`
+        # call here would need a cage entry a pure comparison does not.
+        order_tags = order.tags or []
+        exit_rule_tag: str | None = None
+        exit_position_id = ""
+        exit_family_id = ""
+        exit_client_order_id = ""
+        for order_tag in order_tags:
+            if order_tag[:_EXIT_RULE_TAG_PREFIX_LEN] == EXIT_RULE_TAG_PREFIX:
+                exit_rule_tag = order_tag[_EXIT_RULE_TAG_PREFIX_LEN:]
+            elif order_tag[:_EXIT_POSITION_TAG_PREFIX_LEN] == EXIT_POSITION_TAG_PREFIX:
+                exit_position_id = order_tag[_EXIT_POSITION_TAG_PREFIX_LEN:]
+            elif order_tag[:_EXIT_FAMILY_TAG_PREFIX_LEN] == EXIT_FAMILY_TAG_PREFIX:
+                exit_family_id = order_tag[_EXIT_FAMILY_TAG_PREFIX_LEN:]
+            elif (
+                order_tag[:_EXIT_CLIENT_ORDER_ID_TAG_PREFIX_LEN]
+                == EXIT_CLIENT_ORDER_ID_TAG_PREFIX
+            ):
+                exit_client_order_id = order_tag[_EXIT_CLIENT_ORDER_ID_TAG_PREFIX_LEN:]
+        # An exit-tagged order the plan's `Order.closing_side` always makes a
+        # SELL (`submit_exit`, `exit_wiring.py`); an order with the tag but
+        # the wrong side is treated as a plain (untagged) order below rather
+        # than risking an `exit_view` used uninitialised.
+        is_exit_order = exit_rule_tag is not None and order.side == OrderSide.SELL
+        exit_view: _AdapterExitAuthorization | None = None
+        if is_exit_order:
+            # Every log line for an exit carries `exit=` and the rule
+            # (brief requirement), unconditionally -- before any deny/allow
+            # decision below.
+            self._log.warning(
+                f"exit order exit={exit_rule_tag} position_id={exit_position_id} "
+                f"client_order_id={order.client_order_id.value}"
+            )
+            # Item C (POSITION_EXIT_EXECUTION_2026-09-16.md review): deny
+            # immediately when the instrument has vanished from the cache --
+            # never fabricate a "yes"-leg placeholder to keep
+            # `_AdapterExitAuthorization` constructible. The SAME reason
+            # `unmappable_exit_order_reason`/`_unmappable_exit_shape_reason`
+            # would eventually return for a `None` instrument, stated here
+            # instead of manufactured evidence flowing into the shape check.
+            if instrument is None:
+                return self._deny(
+                    order, "instrument is not a BinaryOption; refusing", now_ns,
+                )
+            exit_leg: Leg = leg_of(instrument.id)
+            try:
+                exit_limit_price = submit_chain.order_price_decimal(order)
+            except (TypeError, ValueError, InvalidOperation):
+                exit_limit_price = submit_chain.ZERO
+            exit_view = _AdapterExitAuthorization(
+                family_id=exit_family_id,
+                position_id=exit_position_id,
+                client_order_id=exit_client_order_id,
+                leg=exit_leg,
+                quantity=1,
+                limit_price=exit_limit_price,
+            )
+            if self._exit_manifest is None:
+                return self._deny(order, _EXIT_MANIFEST_ABSENT_REASON, now_ns)
+            unmappable = submit_chain.unmappable_exit_order_reason(
+                order, instrument, exit_view, self._exit_manifest
+            )
+        else:
+            unmappable = submit_chain.unmappable_order_reason(order, instrument)
         if unmappable is not None:
             return self._deny(order, unmappable, now_ns)
         if submit_chain.permit_is_missing(self._permit):
@@ -3113,26 +3295,47 @@ class PolymarketUSExecutionClient(LiveExecutionClient):
             return self._deny(order, f"{exc}; this client refuses to submit", now_ns)
         except LiveTradingPermissionError as exc:
             return self._deny(order, f"{exc}; this client refuses to submit", now_ns)
-        body = submit_chain.build_order_body(order, instrument)
+        if is_exit_order:
+            assert exit_view is not None  # narrowed by `is_exit_order` above
+            body = submit_chain.build_exit_order_body(order, instrument, exit_view)
+        else:
+            body = submit_chain.build_order_body(order, instrument)
         encoded = submit_chain.encode_order_body(body)
-        try:
-            booking = self._ledger.authorize_order_cost(
-                price_usd=submit_chain.order_price_decimal(order),
-                quantity=submit_chain.order_quantity_decimal(order),
-                now_ns=now_ns,
-            )
-        except DailyBudgetExhausted as exc:
-            self._mark_budget_exhausted(now_ns)
-            return self._deny(order, f"{exc}; this client refuses to submit", now_ns)
-        except LiveTradingPermissionError as exc:
-            return self._deny(order, f"{exc}; this client refuses to submit", now_ns)
+        # INC-E2 budget (review MEDIUM 9): the daily budget is GROSS entry
+        # spend (§5.8) -- an exit-side order never calls
+        # `authorize_order_cost` and never debits the daily counter, so its
+        # `booking` stays `None` through every downstream release/true-up
+        # site below (each already guarded), and its proceeds never
+        # replenish entry headroom. INC-E2c: an exit order now reaches this
+        # coroutine (gated by `submit_chain.unmappable_exit_order_reason`
+        # above, which the untagged/naked-short path never reaches), so
+        # `is_exit_side` is `True` for exactly the orders `is_exit_order`
+        # marked above -- the two conditions are equivalent by construction
+        # (`unmappable_exit_order_reason`'s own shape check refuses any
+        # exit-tagged order whose side is not SELL).
+        is_exit_side = order.side == OrderSide.SELL
+        booking: SpendBooking | None = None
+        if not is_exit_side:
+            try:
+                booking = self._ledger.authorize_order_cost(
+                    price_usd=submit_chain.order_price_decimal(order),
+                    quantity=submit_chain.order_quantity_decimal(order),
+                    now_ns=now_ns,
+                )
+            except DailyBudgetExhausted as exc:
+                self._mark_budget_exhausted(now_ns)
+                return self._deny(order, f"{exc}; this client refuses to submit", now_ns)
+            except LiveTradingPermissionError as exc:
+                return self._deny(order, f"{exc}; this client refuses to submit", now_ns)
         if self._intent_reconciled is not True:
-            self._ledger.release_booking(booking, now_ns=now_ns)
+            if booking is not None:
+                self._ledger.release_booking(booking, now_ns=now_ns)
             return self._deny(order, submit_chain.RECONCILE_NOT_RUN_REASON, now_ns)
         try:
             intent = self._latch.arm(submit_chain.intent_fingerprint(order), now_ns=now_ns)
         except Exception as exc:  # noqa: BLE001 - store/latch failures must deny, not crash the loop
-            self._ledger.release_booking(booking, now_ns=now_ns)
+            if booking is not None:
+                self._ledger.release_booking(booking, now_ns=now_ns)
             if submit_chain.is_latch_arm_refusal(exc):
                 return self._deny(order, submit_chain.LATCH_ARM_REFUSED_REASON, now_ns)
             return self._deny(order, submit_chain.STORE_RAISED_REASON, now_ns)
@@ -3166,6 +3369,12 @@ class PolymarketUSExecutionClient(LiveExecutionClient):
             instrument=instrument,
             account_id=self._issued_account_id,
             ts_init=now_ns,
+            # INC-E2 response-side leg check: `is_exit_order` is the SAME
+            # tag-derived flag computed above (never re-derived here), so
+            # the response is checked against the closing-order echo table
+            # for exactly the orders the request side already tagged and
+            # mapped as a close.
+            closing=is_exit_order,
         )
         classified_line = (
             f"create-order classified kind={outcome.kind} {outcome.detail} "
@@ -3229,7 +3438,13 @@ class PolymarketUSExecutionClient(LiveExecutionClient):
                     venue_order_id=fill.venue_order_id.value,
                     client_order_id=order.client_order_id.value,
                     instrument_id=order.instrument_id.value,
-                    order_side=LONG_ONLY_SIDE,
+                    # INC-E2: the order's REAL side, never the entry-only
+                    # `LONG_ONLY_SIDE` hardcode. `order.side` is always
+                    # `OrderSide.BUY` today (`unmappable_order_reason`
+                    # refuses every other side, byte-unchanged), so
+                    # `.name` == `LONG_ONLY_SIDE` == "BUY" for every fill
+                    # this branch has ever recorded.
+                    order_side=order.side.name,
                     cumulative_qty=outcome.cumulative_qty,
                     cumulative_cost=outcome.cumulative_cost,
                     cumulative_fee=outcome.cumulative_fee,
@@ -3258,9 +3473,10 @@ class PolymarketUSExecutionClient(LiveExecutionClient):
                 )
                 self._refuse(_FILL_WRITE_FAILED)
             else:
-                self._ledger.true_up_booking(
-                    booking, filled_cost_usd=outcome.filled_cost_usd, now_ns=now_ns
-                )
+                if booking is not None:
+                    self._ledger.true_up_booking(
+                        booking, filled_cost_usd=outcome.filled_cost_usd, now_ns=now_ns
+                    )
                 self._retire(intent.intent_id, retire_name, now_ns)
                 if outcome.fee_reconciled is False:
                     # The fill is real; only the fee is untrusted -- the
@@ -3279,7 +3495,9 @@ class PolymarketUSExecutionClient(LiveExecutionClient):
                 venue_order_id=fill.venue_order_id,
                 venue_position_id=None,
                 trade_id=fill.trade_id,
-                order_side=OrderSide.BUY,
+                # INC-E2: the order's REAL side, never the hardcoded
+                # `OrderSide.BUY`.
+                order_side=order.side,
                 order_type=OrderType.LIMIT,
                 last_qty=fill.last_qty,
                 last_px=fill.last_px,
@@ -3294,9 +3512,10 @@ class PolymarketUSExecutionClient(LiveExecutionClient):
             and retire_name is not None
             and outcome.venue_order_id is not None
         ):
-            self._ledger.true_up_booking(
-                booking, filled_cost_usd=submit_chain.ZERO, now_ns=now_ns
-            )
+            if booking is not None:
+                self._ledger.true_up_booking(
+                    booking, filled_cost_usd=submit_chain.ZERO, now_ns=now_ns
+                )
             self._retire(intent.intent_id, retire_name, now_ns)
             self._generate_submitted(order, now_ns)
             self.generate_order_canceled(
@@ -3308,7 +3527,8 @@ class PolymarketUSExecutionClient(LiveExecutionClient):
             )
             return
         if outcome.kind == submit_chain.KIND_REJECT and retire_name is not None:
-            self._ledger.release_booking(booking, now_ns=now_ns)
+            if booking is not None:
+                self._ledger.release_booking(booking, now_ns=now_ns)
             self._retire(intent.intent_id, retire_name, now_ns)
             self.generate_order_rejected(
                 strategy_id=order.strategy_id,

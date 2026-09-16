@@ -95,6 +95,14 @@ _EXPECTED_DICT: dict[str, object] = {
     "observed_at_ns": 1_787_617_188_000_000_000,
     "admission_reason": None,
     "decision": "refuse",
+    # INC-E3 (plan §3, PREREG v4 §3b/§12): additive, `None` for every
+    # entry-hunt row (this fixture's own row is one) -- see this module's
+    # own docstring.
+    "exit_rule": None,
+    "exit_decision": None,
+    "exit_reason_code": None,
+    "exit_limit_price": None,
+    "expected_settlement_value": None,
 }
 
 _OLD_SHAPE_KEYS = frozenset(

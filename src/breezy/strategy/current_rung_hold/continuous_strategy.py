@@ -22,7 +22,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Final, Literal
 
 from nautilus_trader.model.enums import OrderSide, TimeInForce
-from nautilus_trader.model.events import OrderDenied, OrderFilled, PositionOpened
+from nautilus_trader.model.events import OrderDenied, OrderFilled, OrderRejected, PositionOpened
 from nautilus_trader.model.identifiers import InstrumentId
 from nautilus_trader.trading.strategy import Strategy
 
@@ -57,8 +57,10 @@ from breezy.registry.sites import default_registry
 from breezy.runtime.backtest_feed import NWS_BACKTEST_CLIENT_ID
 from breezy.runtime.order_enablement import OrderSubmissionPermit
 from breezy.runtime.paper_replay import EXPIRATION_LEG_PREFIX
+from breezy.strategy.current_rung_hold import exit_wiring
 from breezy.strategy.current_rung_hold.config import CurrentRungHoldConfig
 from breezy.strategy.current_rung_hold.decision import Decision, Refuse, Take
+from breezy.strategy.current_rung_hold.exit_decider import ExitProposal
 from breezy.strategy.current_rung_hold.offer_tape import OfferTape, OfferTapeRecord
 from breezy.strategy.current_rung_hold.position_monitor import PositionMonitor
 from breezy.strategy.current_rung_hold.strategy import (
@@ -188,6 +190,13 @@ _POSITION_MONITOR_ERROR: Final[str] = "monitor_error"
 #: (`position_monitor.py`), so this is observability only, never a lost
 #: registration.
 _POSITION_OPENED_EVENT_UNRESOLVED: Final[str] = "position_opened_event_unresolved"
+#: INC-E3 (plan §3, PREREG v4 §5b): the exit-side diagnostics/position-event
+#: counter names (`family_halt_ambiguous_exit`, `exit_filled`,
+#: `exit_order_rejected`, `exit_fill_join_error`) now live as private
+#: constants in `exit_wiring.py` (extraction: brief's "keep
+#: continuous_strategy.py growth small") alongside the functions that
+#: record them -- kept here only as this comment so a future reader
+#: searching this file for the string still finds where it moved to.
 #: Review item 2: a legacy (pre-Slice-4) record with no `venue_order_id`
 #: cannot prove a SECOND fill is genuinely a duplicate vs. its own replay --
 #: logged, never halted.
@@ -1800,8 +1809,21 @@ class ContinuousRungHoldStrategy(Strategy):
         ``order_submission_permit is None``), so IN_FLIGHT is left set for
         anything but the exact WAIT sentinel -- a narrower reason match
         would risk silently clearing a real refusal too.
+
+        INC-E3 (plan §3, PREREG v4 §5b): a denied EXIT order (identified by
+        its own tags, never by reason string -- an exit never uses the
+        entry-only WAIT sentinel) is an AMBIGUOUS/rejected exit -- the
+        family-wide kill fires instead of any entry-shaped IN_FLIGHT logic.
         """
         super().on_order_denied(event)
+        order = self.cache.order(event.client_order_id)
+        if order is not None and exit_wiring.order_is_exit(order):
+            self._halt_family_for_ambiguous_exit(
+                position_id=exit_wiring.exit_position_id_from_tags(order),
+                reason=f"order_denied:{event.reason}",
+                ts_ns=event.ts_event,
+            )
+            return
         if event.reason != submit_chain.OPEN_INTENT_WAIT_REASON:
             return
         facts = self._facts.get(str(event.instrument_id))
@@ -1812,6 +1834,36 @@ class ContinuousRungHoldStrategy(Strategy):
             facts.settlement_station,
             facts.climate_day.isoformat(),
             key_instrument_id=str(event.instrument_id),
+        )
+
+    def on_order_rejected(self, event: OrderRejected) -> None:
+        """INC-E3 (plan §3, PREREG v4 §5b): a venue-rejected EXIT order sets
+        the family-wide AMBIGUOUS/rejected-exit kill. Entry orders never
+        reach here today (Phase 0/1's own guards refuse before submission,
+        never after venue acceptance) -- this override exists FOR the exit
+        path, but is written generically (tag-gated) rather than asserting
+        the order must be an exit, so a future entry-side rejection is
+        merely ignored rather than mis-attributed.
+        """
+        super().on_order_rejected(event)
+        order = self.cache.order(event.client_order_id)
+        if order is not None and exit_wiring.order_is_exit(order):
+            self._halt_family_for_ambiguous_exit(
+                position_id=exit_wiring.exit_position_id_from_tags(order),
+                reason=f"order_rejected:{event.reason}",
+                ts_ns=event.ts_event,
+            )
+
+    def _halt_family_for_ambiguous_exit(
+        self, *, position_id: str, reason: str, ts_ns: int,
+    ) -> None:
+        """Thin delegator (extraction: `exit_wiring.py`, brief's "keep
+        continuous_strategy.py growth small") -- kept as a bound method
+        because `on_order_denied`/`on_order_rejected` are Strategy-hook
+        overrides that must stay on this class.
+        """
+        exit_wiring.halt_family_for_ambiguous_exit(
+            self, position_id=position_id, reason=reason, ts_ns=ts_ns,
         )
 
     def _release_stale_inflight(
@@ -1951,6 +2003,14 @@ class ContinuousRungHoldStrategy(Strategy):
                 f"leg {event.client_order_id}",
             )
             return
+        if event.order_side is OrderSide.SELL:
+            # INC-E3 (plan §3): Breezy never submits any OTHER SELL --
+            # every entry is a plain BUY (`_maybe_submit`) -- so a SELL
+            # fill is unambiguously an EXIT fill, routed to its own,
+            # entirely separate join/provenance path (never the entry
+            # `consume_if_absent`/duplicate-fill machinery below).
+            self._on_exit_order_filled(event)
+            return
         if event.last_qty.as_decimal() <= 0:
             return
         assert self._latch is not None
@@ -1982,6 +2042,38 @@ class ContinuousRungHoldStrategy(Strategy):
             self._report_alerter(
                 self.position_alerter, "continuous_rung_hold position report failed",
             )
+
+    def _on_exit_order_filled(self, event: OrderFilled) -> None:
+        """Thin delegator (extraction: `exit_wiring.py`, brief's "keep
+        continuous_strategy.py growth small") -- kept as a bound method
+        because `on_order_filled` (a Strategy-hook override that must stay
+        on this class) calls it by that name.
+        """
+        exit_wiring.on_exit_order_filled(self, event)
+
+    def submit_exit(self, proposal: ExitProposal) -> None:
+        """Injected into `PositionMonitor` as its `submit_exit` callable
+        (INC-E3, plan §3). Thin delegator (extraction: `exit_wiring.py`,
+        brief's "keep continuous_strategy.py growth small") -- kept as a
+        bound method so `PositionMonitor` can be handed a plain
+        `Callable[[ExitProposal], None]` (`strategy.submit_exit`) without
+        the composition root reaching into `exit_wiring` itself.
+        """
+        exit_wiring.submit_exit(self, proposal)
+
+    def check_ambiguous_exit_intent(
+        self, *, client_order_id: str, position_id: str, now_ns: int,
+    ) -> None:
+        """Injected into `PositionMonitor` as its `check_ambiguous_exit`
+        callable (review finding B). Thin delegator (extraction:
+        `exit_wiring.py`, brief's "keep continuous_strategy.py growth
+        small") -- kept as a bound method so `PositionMonitor` can be handed
+        a plain callable without the composition root reaching into
+        `exit_wiring` itself.
+        """
+        exit_wiring.check_exit_intent_for_ambiguous_send(
+            self, client_order_id=client_order_id, position_id=position_id, now_ns=now_ns,
+        )
 
     def _recorded_fee_for(
         self, instrument_id: InstrumentId, venue_order_id: str,

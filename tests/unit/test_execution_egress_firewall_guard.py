@@ -1988,6 +1988,24 @@ EXEC_ORDER_COROUTINE_PERMITTED_CALLEES = frozenset(
         # one day-keyed marker to the already-open local state store; no
         # await, no network.
         "self._mark_budget_exhausted",
+        # Widened 2026-09-16 (INC-E2c, POSITION_EXIT_EXECUTION_2026-09-16.md
+        # §3): the exit seam's own pure mapper/gate pair -- the exact SAME
+        # shape as `submit_chain.unmappable_order_reason`/`build_order_body`
+        # above, refusal-or-body-dict only, no I/O.
+        "submit_chain.unmappable_exit_order_reason",
+        "submit_chain.build_exit_order_body",
+        # Widened 2026-09-16 (INC-E2c): the instrument's leg -- the SAME
+        # pure lookup `build_order_body`/`unmappable_exit_order_reason`
+        # already call internally, needed here too because the adapter
+        # reconstructs `ExitAuthorizationLike.leg` from the order's tags and
+        # the instrument, never imported from `strategy/` (the importlinter
+        # layer contract).
+        "leg_of",
+        # Widened 2026-09-16 (INC-E2c): the adapter-side
+        # `ExitAuthorizationLike` view, constructed from the order's own
+        # tags -- the SAME intra-module/inert shape as `DurableFillRecord`
+        # above; no I/O.
+        "_AdapterExitAuthorization",
     }
 )
 
@@ -2974,6 +2992,15 @@ def test_the_order_coroutine_callee_allowlist_reaches_no_venue() -> None:
             # writes one day-keyed marker to the already-open local state
             # store; no await, no network.
             "self._mark_budget_exhausted",
+            # Widened 2026-09-16 (INC-E2c): the exit seam's own pure
+            # mapper/gate pair -- see the definition site's comment above.
+            "submit_chain.unmappable_exit_order_reason",
+            "submit_chain.build_exit_order_body",
+            # Widened 2026-09-16 (INC-E2c): the instrument's leg, and the
+            # adapter-side exit-authorization view -- see the definition
+            # site's comment above.
+            "leg_of",
+            "_AdapterExitAuthorization",
         }
     )
     for callee in EXEC_ORDER_COROUTINE_PERMITTED_CALLEES:
@@ -3236,6 +3263,28 @@ def test_x1_the_live_scan_actually_reaches_a_test_that_imports_the_exec_package(
     # durable NO-leg fill fixture via the real writer's key shape (L-42),
     # exactly like its `test_continuous_rung_hold_fill_wiring.py` sibling
     # above -- additive, no relaxation.
+    #
+    # Old -> new (INC-E2b, POSITION_EXIT_EXECUTION_2026-09-16.md §3): added
+    # `tests/unit/test_polymarket_us_exit_submit_chain_2026_09_16.py`, which
+    # imports `submit_chain` directly to prove the new closing-order mapping
+    # (`unmappable_exit_order_reason`/`build_exit_order_body`) and its sibling
+    # pin against `test_no_side_submit_chain_2026_09_14.py`'s naked-short
+    # refusal (L-15: this equality fires on any new test importing `exec/`,
+    # independently of what the increment does to `src/`). WIDENED, not
+    # relaxed: the comparison is still `==`; the module carries no
+    # `SOCKET_RESTORING_MARKERS` and constructs no client -- `submit_chain` is
+    # the pure-helpers module, no socket either.
+    #
+    # Old -> new (review finding B, POSITION_EXIT_EXECUTION_2026-09-16.md
+    # §5.4): `test_current_rung_hold_exit_wiring.py` now imports
+    # `exec.submit_chain` (locally, inside its new AMBIGUOUS-exit-cover
+    # tests) to recompute `submit_chain.intent_fingerprint(order)` -- the SAME
+    # pure, deterministic hash `_submit_order`'s own `arm()` call uses -- so a
+    # test can arm a `SubmitIntentLatch` fixture with the exact fingerprint a
+    # cached exit order would produce. WIDENED, not relaxed (L-6/L-12): the
+    # comparison is still `==`; the module carries no `SOCKET_RESTORING_
+    # MARKERS` and constructs no client -- `submit_chain` is the pure-helpers
+    # module, no socket either.
     assert exec_importing_test_modules() == {
         "tests/contract/test_exec_client_reconciliation_contract.py",
         "tests/contract/test_exec_client_wiring_contract.py",
@@ -3246,6 +3295,7 @@ def test_x1_the_live_scan_actually_reaches_a_test_that_imports_the_exec_package(
         "tests/unit/test_continuous_rung_hold_no_side_shadow_2026_09_14.py",
         "tests/unit/test_continuous_rung_hold_strategy.py",
         "tests/unit/test_current_rung_hold_ambiguous_resolver.py",
+        "tests/unit/test_current_rung_hold_exit_wiring.py",
         "tests/unit/test_current_rung_hold_order_submission_wiring.py",
         "tests/unit/test_current_rung_hold_pre_arm_race.py",
         "tests/unit/test_current_rung_hold_trial_day_latch.py",
@@ -3267,6 +3317,7 @@ def test_x1_the_live_scan_actually_reaches_a_test_that_imports_the_exec_package(
         "tests/unit/test_polymarket_us_factories.py",
         "tests/unit/test_no_side_fill_attribution_2026_09_14.py",
         "tests/unit/test_no_side_submit_chain_2026_09_14.py",
+        "tests/unit/test_polymarket_us_exit_submit_chain_2026_09_16.py",
         "tests/unit/test_polymarket_us_readonly_guard.py",
         "tests/unit/test_polymarket_us_startup_evidence.py",
         "tests/unit/test_polymarket_us_submit_order_chain.py",

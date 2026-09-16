@@ -89,6 +89,7 @@ from breezy.adapters.polymarket_us.tape_records import (
     VenueSettlementSnapshot,
 )
 from breezy.persistence.catalog import CatalogPathError
+from breezy.persistence.family_manifest import FamilyManifest
 from breezy.runtime.settings import (
     BreezyRuntimeSettings,
     BreezyTradeSettings,
@@ -655,6 +656,7 @@ def build_trade_node_config(
     submit_intent_latch: object | None = None,
     live_trading_permit: object | None = None,
     submit_veto: Callable[[], str | None] | None = None,
+    exit_manifest: FamilyManifest | None = None,
 ) -> TradingNodeConfig:
     """Return the `TradingNodeConfig` for the **trading** process (EXEC SPINE W).
 
@@ -819,6 +821,17 @@ def build_trade_node_config(
         raise NodeConfigError(
             f"submit_veto must be a callable (or None); got {type(submit_veto).__name__!r}"
         )
+    # Review finding A(2) (POSITION_EXIT_EXECUTION_2026-09-16.md §5.1):
+    # `PolymarketUSExecClientConfig.exit_manifest` is typed as the real
+    # `FamilyManifest` (unlike `submit_intent_latch`, `persistence` sits
+    # BELOW `runtime` in the layer contract, so no `object` widening is
+    # needed here either) -- `isinstance` is still the strongest available
+    # refusal at config-build time.
+    if exit_manifest is not None and not isinstance(exit_manifest, FamilyManifest):
+        raise NodeConfigError(
+            "exit_manifest must be a real breezy.persistence.family_manifest."
+            f"FamilyManifest (or None); got {type(exit_manifest).__name__!r}"
+        )
 
     exec_client_config = msgspec_replace(
         exec_client_config,
@@ -827,6 +840,7 @@ def build_trade_node_config(
         live_trading_permit=live_trading_permit,
         retirement_reasons=RetirementReason,
         submit_veto=submit_veto,
+        exit_manifest=exit_manifest,
     )
 
     # `msgspec.Struct` config classes are untyped to mypy (compiled Nautilus

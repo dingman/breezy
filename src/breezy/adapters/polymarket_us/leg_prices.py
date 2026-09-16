@@ -96,6 +96,36 @@ def instrument_price_for_leg(leg: Leg, wire_price: Decimal) -> Decimal:
     raise ValueError(f"unknown leg {leg!r}; expected 'yes' or 'no'")
 
 
+#: The venue's CLOSING-order values (INC-E1 X3 ruling,
+#: ``docs/evidence/RULING_x3_sell_long_sell_short_2026-09-16.md``): a YES
+#: close is a SELL of the long leg; a NO close is the exact MIRROR of a NO
+#: BUY (side ``ORDER_SIDE_BUY``, not ``SELL``), even though the request
+#: itself carries ``action: ORDER_ACTION_SELL``. Both intents carry the
+#: X3-banned ``SELL_`` substring, which is why this classifier lives here,
+#: outside ``exec/``, exactly like :data:`VENUE_SIDE_FOR_LEG` above.
+#:
+#: PINNED-BY-CAPTURE 2026-09-16T03:19:31Z/T03:19:32Z
+#: (``docs/evidence/venue/polymarket_us/CLOSE_PREVIEW_yes_20260916T031931Z.json``,
+#: ``..._no_20260916T031932Z.json``): live ``/v1/order/preview`` responses,
+#: superseding the Appendix A PINNED-PENDING-CAPTURE documentation guess for
+#: the NO leg -- the capture wins per the INC-E2 rule. YES close: request
+#: ``outcomeSide YES + ORDER_ACTION_SELL @0.01`` echoes exactly
+#: ``(ORDER_SIDE_SELL, ORDER_INTENT_SELL_LONG)`` -- matches the prior
+#: documentation guess. NO close: request ``outcomeSide NO + ORDER_ACTION_
+#: SELL`` at instrument price 0.01 (wire 0.99) echoes ``(ORDER_SIDE_BUY,
+#: ORDER_INTENT_SELL_SHORT)`` -- NOT ``ORDER_SIDE_SELL`` as previously
+#: documented. If a future capture disagrees again, THAT capture wins and
+#: this table is corrected again, never widened to accept both.
+EXIT_VENUE_SIDE_FOR_LEG: Final[dict[Leg, str]] = {
+    "yes": "ORDER_SIDE_SELL",
+    "no": "ORDER_SIDE_BUY",
+}
+EXIT_VENUE_INTENT_FOR_LEG: Final[dict[Leg, str]] = {
+    "yes": "ORDER_INTENT_SELL_LONG",
+    "no": "ORDER_INTENT_SELL_SHORT",
+}
+
+
 def assert_echo_matches_leg(leg: Leg, side: object, intent: object) -> None:
     """Refuse if the venue's ``side``/``intent`` echo disagrees with ``leg``.
 
@@ -118,11 +148,59 @@ def assert_echo_matches_leg(leg: Leg, side: object, intent: object) -> None:
         )
 
 
+def exit_wire_price_for_leg(leg: Leg, instrument_price: Decimal) -> Decimal:
+    """The value Breezy must send on the wire to CLOSE at ``instrument_price``.
+
+    The venue always prices the long (YES) side regardless of BUY/SELL
+    intent (Appendix A row 3 of ``POSITION_EXIT_EXECUTION_2026-09-16.md``):
+    closing a NO holding at X is sent as ``1 - X``, the IDENTICAL complement
+    a NO BUY uses. This is therefore a documented alias of
+    :func:`wire_price_for_leg`, not a second implementation -- a closing
+    order's call site never has to re-derive whether "the wire price" means
+    an open or a close.
+    """
+    return wire_price_for_leg(leg, instrument_price)
+
+
+def assert_exit_echo_matches_leg(leg: Leg, side: object, intent: object) -> None:
+    """Refuse if the venue's CLOSING-order echo disagrees with ``leg``.
+
+    Sibling of :func:`assert_echo_matches_leg` for a closing order, over the
+    disjoint :data:`EXIT_VENUE_SIDE_FOR_LEG`/:data:`EXIT_VENUE_INTENT_FOR_LEG`
+    table (PINNED-BY-CAPTURE, module docstring above): a YES close must echo
+    exactly ``(ORDER_SIDE_SELL, ORDER_INTENT_SELL_LONG)``; a NO close must
+    echo exactly ``(ORDER_SIDE_BUY, ORDER_INTENT_SELL_SHORT)`` -- the exact
+    mirror of a NO buy's own echo. Because the NO-close side (``BUY``) is
+    the SAME value the YES-buy table uses, this check keys on the full
+    (side, intent) PAIR, never side alone: a NO close accidentally
+    presented as a YES buy differs by intent (``SELL_SHORT`` vs
+    ``BUY_LONG``) and is refused. Refused in BOTH directions (E5-2's rule,
+    carried over): a BUY-table echo presented here refuses, and an
+    exit-table echo presented to :func:`assert_echo_matches_leg` refuses
+    there -- the two tables never accept each other's pair.
+    """
+    if leg not in EXIT_VENUE_SIDE_FOR_LEG:
+        raise ValueError(f"unknown leg {leg!r}; expected 'yes' or 'no'")
+    expected_side = EXIT_VENUE_SIDE_FOR_LEG[leg]
+    expected_intent = EXIT_VENUE_INTENT_FOR_LEG[leg]
+    if side != expected_side or intent != expected_intent:
+        raise ValueError(
+            f"leg {leg!r} exit expects venue echo (side={expected_side!r}, "
+            f"intent={expected_intent!r}) but observed (side={side!r}, "
+            f"intent={intent!r}); refusing to attribute this report to a "
+            "closing order the venue did not declare"
+        )
+
+
 __all__ = [
+    "EXIT_VENUE_INTENT_FOR_LEG",
+    "EXIT_VENUE_SIDE_FOR_LEG",
     "VENUE_INTENT_FOR_LEG",
     "VENUE_SIDE_FOR_LEG",
     "Leg",
     "assert_echo_matches_leg",
+    "assert_exit_echo_matches_leg",
+    "exit_wire_price_for_leg",
     "instrument_price_for_leg",
     "wire_price_for_leg",
 ]

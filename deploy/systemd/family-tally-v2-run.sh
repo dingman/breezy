@@ -14,7 +14,11 @@ set -uo pipefail
 
 REPO=/home/jon/breezy
 PY=${BREEZY_FAMILY_TALLY_V2_PYTHON:-$REPO/.venv/bin/python}
-FAMILIES_DIR="$REPO/deploy/families"
+# Overridable so tests can enumerate a worktree's own deploy/families
+# instead of the deployed tree's (the deployed default never changes:
+# systemd always sees $REPO/deploy/families, exactly the manifests actually
+# shipped there).
+FAMILIES_DIR="${BREEZY_FAMILY_TALLY_V2_FAMILIES_DIR:-$REPO/deploy/families}"
 # Same store the v1 live tally reads (BREEZY_SCORED_TRIALS_DIR override
 # shared with live-tally-run.sh) and the same reports-dir convention
 # (BREEZY_LIVE_TALLY_OUTPUT_DIR override shared with live-tally-run.sh),

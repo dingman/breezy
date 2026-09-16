@@ -307,6 +307,23 @@ Every arrow into the decision is a *veto*. None of them is a vote. The design ha
 no path where a strong signal on one axis compensates for a failed gate on
 another.
 
+### 2.1 Exit-seam flow (PREREG v4)
+
+The registered exit path (`pm_us_crh_exit_v4`, plan POSITION_EXIT_EXECUTION_2026-09-16 INC-E3/E4)
+closes held positions mid-day under a registered rule. Flow: `PositionMonitor` (injects decider)
+→ `exit_decider.decide_exit()` (pure, accepts/refuses per rule) → `ExitAuthorization` (frozen
+value object) → `ExitAuthorizationLike` Protocol (layering boundary) → `exec/submit_chain`
+(unmappable vs exit order body) → exec client → `_RECORD_SIGNS` (SELL side) → `leg_prices`
+exit echo table → venue → fill → native event + durable record. Echo check: YES close =
+`SELL`/`SELL_LONG`; NO close = `BUY`/`SELL_SHORT` (plan Appendix A.2). **Unarmed by construction:**
+`exit_gate.py` frozenset (code gate), `manifest.exit_rule` (manifest gate), decider reason codes,
+live net-long guard (`_refuse_naked_short`, account-wide), `SubmitIntentLatch` (singleton exit/entry),
+family halt on AMBIGUOUS/rejected exit (durable, survives restart, clear only via CLI). **Layering:**
+adapters never import strategy; `ExitAuthorizationLike` is a Protocol defined in `exec/submit_chain.py` that the
+strategy's `ExitAuthorization` satisfies structurally; the order-tag prefixes live in `persistence/exit_tags.py` (the
+lowest layer both sides import); the venue echo tokens (`ORDER_INTENT_SELL_LONG`, `ORDER_INTENT_SELL_SHORT`) live only
+in `leg_prices.py`, outside `exec/`, per `RULING_x3_sell_long_sell_short_2026-09-16.md`.
+
 ---
 
 ## 3. The probability boundary (C3)

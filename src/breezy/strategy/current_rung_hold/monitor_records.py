@@ -287,6 +287,24 @@ class PositionMonitorSummary:
     settled_pnl: Decimal | None
     settled_held: bool | None
     monitor_intervened: bool = False
+    #: INC-E3 (plan §3, PREREG v4 §3b/§12): the registered exit rule
+    #: (``"R_THREAT"``/``"R_DEAD"``) the MOST RECENT exit decision for this
+    #: position-day was evaluated under. ``None`` for every position no
+    #: decider ever evaluated (every row before this increment, and every
+    #: shadow-monitored position after it).
+    exit_rule: str | None = None
+    #: ``"fired"`` or ``"refused"`` for the most recent exit decision.
+    #: ``None`` when no decider was ever consulted.
+    exit_decision: str | None = None
+    #: The exit decider's own distinct reason code for the most recent
+    #: decision (see ``exit_decider.py``), or ``"fired"`` on a proposal.
+    exit_reason_code: str | None = None
+    #: The authorised 1-contract limit price of the most recent FIRED exit
+    #: decision. ``None`` otherwise.
+    exit_limit_price: Decimal | None = None
+    #: The archive's own hold expectation the most recent FIRED exit
+    #: cleared. ``None`` otherwise.
+    expected_settlement_value: Decimal | None = None
 
     def __post_init__(self) -> None:
         require_text(self.trial_id, "trial_id")
@@ -321,6 +339,11 @@ class PositionMonitorSummary:
                 "(plan Sec 2/4): no `on_position_closed` logic exists that could "
                 "ever set it otherwise, so a `True` value here is a defect, not data"
             )
+        require_optional_text(self.exit_rule, "exit_rule")
+        require_optional_text(self.exit_decision, "exit_decision")
+        require_optional_text(self.exit_reason_code, "exit_reason_code")
+        _require_optional_decimal(self.exit_limit_price, "exit_limit_price")
+        _require_optional_decimal(self.expected_settlement_value, "expected_settlement_value")
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -346,6 +369,11 @@ class PositionMonitorSummary:
             "monitor_intervened": self.monitor_intervened,
             "settled_pnl": _decimal_to_str(self.settled_pnl),
             "settled_held": self.settled_held,
+            "exit_rule": self.exit_rule,
+            "exit_decision": self.exit_decision,
+            "exit_reason_code": self.exit_reason_code,
+            "exit_limit_price": _decimal_to_str(self.exit_limit_price),
+            "expected_settlement_value": _decimal_to_str(self.expected_settlement_value),
         }
 
     @classmethod
@@ -391,5 +419,22 @@ class PositionMonitorSummary:
             settled_pnl=_str_to_decimal(values["settled_pnl"], "settled_pnl"),
             settled_held=(
                 bool(values["settled_held"]) if values["settled_held"] is not None else None
+            ),
+            exit_rule=(
+                str(values["exit_rule"]) if values.get("exit_rule") is not None else None
+            ),
+            exit_decision=(
+                str(values["exit_decision"]) if values.get("exit_decision") is not None else None
+            ),
+            exit_reason_code=(
+                str(values["exit_reason_code"])
+                if values.get("exit_reason_code") is not None
+                else None
+            ),
+            exit_limit_price=_str_to_decimal(
+                values.get("exit_limit_price"), "exit_limit_price"
+            ),
+            expected_settlement_value=_str_to_decimal(
+                values.get("expected_settlement_value"), "expected_settlement_value"
             ),
         )

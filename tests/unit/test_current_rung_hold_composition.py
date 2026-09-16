@@ -35,6 +35,7 @@ from breezy.domain.weather_bucket_facts import (
     WEATHER_FACTS_STATUS_KNOWN,
     WEATHER_FACTS_STATUS_UNKNOWN,
 )
+from breezy.persistence.family_manifest import FamilyManifest
 from breezy.runtime.order_enablement import OrderSubmissionPermit
 from breezy.runtime.settings import SettingsError
 from breezy.runtime.sqlite_store import SqliteStateStore
@@ -51,6 +52,7 @@ from breezy.strategy.current_rung_hold.composition import (
 )
 from breezy.strategy.current_rung_hold.config import SUPPORTED_STATIONS
 from breezy.strategy.current_rung_hold.continuous_strategy import ContinuousRungHoldStrategy
+from breezy.strategy.current_rung_hold.exit_decider import decide_exit
 from breezy.strategy.current_rung_hold.strategy import CurrentRungHoldStrategy
 from breezy.strategy.current_rung_hold.trial_day_latch import (
     CONTINUOUS_TRIAL_KEY_PREFIX,
@@ -542,6 +544,92 @@ def test_continuous_builder_uses_distinct_strategy_id(tmp_path: Path) -> None:
     assert str(v2[0].id) == "CurrentRungHoldStrategy-SFO"
     assert str(v3[0].id) == "ContinuousRungHoldStrategy-SFO"
     assert v3[0]._order_submission_permit is None
+
+
+def _placeholder_manifest(*, family_id: str, exit_rule: str | None) -> FamilyManifest:
+    """A manifest built directly (never ``load_family_manifest``, which
+    reads a real file): only ``family_id``/``exit_rule`` vary here; every
+    other field is a well-formed placeholder, mirroring
+    ``test_polymarket_us_exec_client.py``'s own ``_family_manifest``."""
+    zero_sha = "0" * 64
+    return FamilyManifest(
+        family_id=family_id,
+        venue="polymarket_us",
+        trial_id_prefix=CONTINUOUS_TRIAL_KEY_PREFIX,
+        d0_climate_day="2026-09-01",
+        boundary_artefact_path=Path("deploy/families/placeholder.json"),
+        boundary_inputs_sha256=zero_sha,
+        stations=("SFO",),
+        status="REGISTERED",
+        manifest_sha256=zero_sha,
+        exit_rule=exit_rule,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Review finding A (POSITION_EXIT_EXECUTION_2026-09-16.md): composition must
+# actually WIRE `_build_position_monitor_for`'s exit kwargs into
+# `PositionMonitor`, or `_maybe_decide_exit` is a permanent no-op regardless
+# of what the strategy layer or the exec client can do.
+# ---------------------------------------------------------------------------
+
+
+def test_position_monitor_stays_fully_shadow_when_no_exit_manifest_is_supplied(
+    tmp_path: Path,
+) -> None:
+    """RED (pre-fix): `_build_position_monitor_for` never passed any of the
+    five exit kwargs, so this held by accident. GREEN: it holds by an
+    explicit default -- `exit_manifest=None` (the caller's own default, and
+    every existing composition-root call site today) leaves every exit
+    kwarg at its own `None`, byte-identical to before this increment."""
+    _write(
+        tmp_path,
+        [_binary("tc-temp-sfohigh-2026-09-04-gte70lt71f", info=_known(station="SFO", day=_DAY))],
+    )
+    v3 = build_continuous_rung_hold_strategies(
+        catalog_root=tmp_path,
+        today_by_station=_TODAY,
+        trial_day_latch_factory=_unused_latch_factory,
+    )
+    monitor = v3[0]._position_monitor
+    assert monitor is not None
+    assert monitor._exit_decider is None
+    assert monitor._exit_manifest is None
+    assert monitor._exit_family_id is None
+    assert monitor._exit_client_order_id_factory is None
+    assert monitor._submit_exit is None
+    assert monitor._record_exit_offer is None
+
+
+def test_position_monitor_wires_the_exit_decider_when_a_manifest_is_supplied(
+    tmp_path: Path,
+) -> None:
+    """RED (pre-fix): `TypeError` -- `build_continuous_rung_hold_strategies`
+    had no `exit_manifest` parameter at all. GREEN: passing the LIVE
+    family's own (unarmed) manifest wires every exit kwarg through to the
+    constructed `PositionMonitor` -- `exit_family_id` derived from the
+    manifest, `submit_exit`/`record_exit_offer` bound to the strategy's own
+    methods, never a second construction path."""
+    _write(
+        tmp_path,
+        [_binary("tc-temp-sfohigh-2026-09-04-gte70lt71f", info=_known(station="SFO", day=_DAY))],
+    )
+    manifest = _placeholder_manifest(family_id="pm_us_crh_cont", exit_rule=None)
+    v3 = build_continuous_rung_hold_strategies(
+        catalog_root=tmp_path,
+        today_by_station=_TODAY,
+        trial_day_latch_factory=_unused_latch_factory,
+        exit_manifest=manifest,
+    )
+    strategy = v3[0]
+    monitor = strategy._position_monitor
+    assert monitor is not None
+    assert monitor._exit_decider is decide_exit
+    assert monitor._exit_manifest is manifest
+    assert monitor._exit_family_id == "pm_us_crh_cont"
+    assert callable(monitor._exit_client_order_id_factory)
+    assert monitor._submit_exit == strategy.submit_exit
+    assert monitor._record_exit_offer == strategy.offer_tape.append
 
 
 def test_continuous_builder_defaults_the_offer_tape_to_a_sibling_decisions_dir(

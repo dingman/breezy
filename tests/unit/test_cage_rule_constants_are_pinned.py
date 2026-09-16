@@ -565,6 +565,26 @@ CAGE_RULE_PINS: tuple[RulePin, ...] = (
                 # local-store write in the ledger/permit dollar-ceiling
                 # except arms; no await, no network.
                 "self._mark_budget_exhausted",
+                # Widened 2026-09-16 (INC-E2c, POSITION_EXIT_EXECUTION_2026-
+                # 09-16.md §3): the exit seam's own pure mapper/gate pair --
+                # the exact SAME shape as `submit_chain.unmappable_order_
+                # reason`/`build_order_body` above, refusal-or-body-dict
+                # only, no I/O.
+                "submit_chain.unmappable_exit_order_reason",
+                "submit_chain.build_exit_order_body",
+                # Widened 2026-09-16 (INC-E2c): the instrument's leg -- the
+                # SAME pure lookup `build_order_body`/`unmappable_exit_
+                # order_reason` already call internally, needed here too
+                # because the adapter reconstructs `ExitAuthorizationLike.
+                # leg` from the order's tags and the instrument, never
+                # imported from `strategy/` (the importlinter layer
+                # contract).
+                "leg_of",
+                # Widened 2026-09-16 (INC-E2c): the adapter-side
+                # `ExitAuthorizationLike` view, constructed from the order's
+                # own tags -- the SAME intra-module/inert shape as
+                # `DurableFillRecord` above; no I/O.
+                "_AdapterExitAuthorization",
             }
         ),
         widened=frozenset(

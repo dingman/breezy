@@ -1,0 +1,69 @@
+[Unit]
+# Nightly driver for the offline "exit window" study
+# (docs/plans/POSITION_EXIT_EXECUTION_2026-09-16.md), triggered by
+# breezy-exit-window-study.timer. Sibling of
+# breezy-position-monitor-report.service: same oneshot/no-Install shape,
+# same wrapper-script driver style
+# (deploy/systemd/exit-window-study-run.sh) -- the timer owns cadence, the
+# script owns the work.
+#
+# This unit reads a READ-ONLY sqlite3 backup copy of the exec state store
+# (never the live path -- see the wrapper's own comment) plus each filled
+# position's captured Depth10 catalog frames and NWS ASOS observations, and
+# writes one dated JSON + Markdown report under
+# ~/.local/share/breezy/derived/exit_window_study/<run-stamp>/. It is
+# READ-ONLY / offline analysis only: it never constructs, submits,
+# modifies, or cancels an order and never touches the TrialDayLatch.
+Description=Breezy nightly exit-window study (offline, read-only)
+Documentation=file:///home/jon/breezy/deploy/systemd/README.md
+Documentation=file:///home/jon/breezy/scripts/analysis/current_rung_hold_exit_window_study.py
+Documentation=file:///home/jon/breezy/docs/plans/POSITION_EXIT_EXECUTION_2026-09-16.md
+
+[Service]
+Type=oneshot
+WorkingDirectory=/home/jon/breezy
+
+# Own cgroup memory ceiling: this unit reads a read-only sqlite3 copy plus
+# per-station Depth10 catalog frames and an ASOS fetch-on-miss -- heavier
+# than breezy-position-monitor-report's pure parquet join
+# (MemoryHigh=512M/MemoryMax=1G) but still far under the three heavy
+# nightly studies' own MemoryHigh=12G/MemoryMax=16G floor
+# (tests/unit/test_analysis_units_memory_capped.py). A runaway run's OOM
+# lands on the study, never the node.
+MemoryHigh=1G
+MemoryMax=2G
+
+# Same deliberate opt-in as breezy-position-monitor-report.service (see
+# that unit's own comment): this unit reads from the same quote-tape-
+# catalog-derived directory tree the heavy studies write near, so it stays
+# under the shared discipline (breezy-studies.slice + the host-wide
+# breezy-studies.lock, see exit-window-study-run.sh's own lock preamble)
+# rather than being asserted independently exempt.
+Slice=breezy-studies.slice
+UMask=0077
+
+# No EnvironmentFile: this is a single non-secret filesystem path literal,
+# byte-identical to the same line in breezy-score-live-trials.service /
+# breezy-live-tally.service / breezy-pm-crh-v2-tally.service (I3
+# BLOCK-1.1/BLOCK-1.3) -- never a venue credential. The wrapper opens this
+# path READ-ONLY to make its own private backup copy; it never writes to
+# it and never passes it directly to the study CLI.
+Environment=POLYMARKET_US_EXEC_STATE_DB=/home/jon/.local/share/breezy/state/exec_polymarket_us.sqlite
+
+ExecStart=/home/jon/breezy/deploy/systemd/exit-window-study-run.sh
+
+# Reads a network ASOS fetch-on-miss (--obs-source fetch) plus a Depth10
+# catalog scan per station -- generous, mirroring breezy-k1-daily.service's
+# own budget for a comparable per-station analysis pass.
+TimeoutStartSec=1800
+
+# No Restart=. A missed run is not an incident on its own -- tomorrow's run
+# subsumes today's. The timer's Persistent=true is what recovers a run
+# missed across a reboot.
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=breezy-exit-window-study
+
+# NOTE: no [Install] section. This unit is started BY the timer, never
+# enabled directly. `systemctl --user enable
+# breezy-exit-window-study.timer` is the only thing to enable.

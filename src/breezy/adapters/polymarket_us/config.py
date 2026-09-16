@@ -50,6 +50,7 @@ from breezy.adapters.polymarket_us.credentials import (
 )
 from breezy.adapters.polymarket_us.signing import SigningVariant
 from breezy.ingest.gate import StateStoreOpener
+from breezy.persistence.family_manifest import FamilyManifest
 from breezy.registry.sites import SiteRegistry, default_registry
 from breezy.runtime.settings import SettingsError
 
@@ -562,6 +563,18 @@ class PolymarketUSExecClientConfig(LiveExecClientConfig, frozen=True):
         this parameter is unaffected. The composition root wires the actual
         closure (e.g. ``lambda: "family_halt" if latch.is_family_halted()
         else None``); this config only carries it through.
+    exit_manifest : FamilyManifest | None
+        Review finding A (``POSITION_EXIT_EXECUTION_2026-09-16.md`` §5.1):
+        the registered exit family's manifest, injected the SAME way
+        ``submit_veto``/``submit_intent_latch`` are. Typed as the real
+        :class:`~breezy.persistence.family_manifest.FamilyManifest` (never
+        ``object``): unlike ``runtime``, which sits ABOVE ``adapters`` in the
+        import-linter layer contract, ``persistence`` sits BELOW it, so this
+        module may import the real type directly. ``None`` by default --
+        every composition root that predates this parameter is unaffected,
+        and ``PolymarketUSExecutionClient`` denies every exit-tagged order
+        with ``_EXIT_MANIFEST_ABSENT_REASON`` exactly as it did before this
+        field existed.
     """
 
     venue: PolymarketUSDataClientConfig | None = None
@@ -574,6 +587,7 @@ class PolymarketUSExecClientConfig(LiveExecClientConfig, frozen=True):
     live_trading_permit: object | None = None
     retirement_reasons: object | None = None
     submit_veto: Callable[[], str | None] | None = None
+    exit_manifest: FamilyManifest | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.venue, PolymarketUSDataClientConfig):

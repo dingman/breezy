@@ -92,6 +92,17 @@ MONITOR_SUMMARY_SCHEMA: pa.Schema = pa.schema(
         pa.field("monitor_intervened", pa.bool_(), nullable=False),
         pa.field("settled_pnl", pa.string(), nullable=True),
         pa.field("settled_held", pa.bool_(), nullable=True),
+        # INC-E3 (plan §3, PREREG v4 §3b/§12): additive, nullable -- an
+        # existing summary file written before this increment has none of
+        # these columns; `pq.read_table(path, schema=MONITOR_SUMMARY_SCHEMA)`
+        # back-fills every missing column with `None` for such a file (see
+        # `test_current_rung_hold_monitor_store.py`'s read-compat test), so
+        # `read_monitor_summaries` needs no other change.
+        pa.field("exit_rule", pa.string(), nullable=True),
+        pa.field("exit_decision", pa.string(), nullable=True),
+        pa.field("exit_reason_code", pa.string(), nullable=True),
+        pa.field("exit_limit_price", pa.string(), nullable=True),
+        pa.field("expected_settlement_value", pa.string(), nullable=True),
     ]
 )
 
