@@ -124,18 +124,113 @@ def test_zero_net_position_is_flat(
 def test_a_negative_net_position_is_reported_not_refused(
     position: dict[str, Any], instrument: BinaryOption, slug: str
 ) -> None:
-    """Breezy never opens one, but refusing to REPORT one hides real risk."""
-    report = parse_position_status_report(
+    """Breezy never opens a SHORT, but refusing to REPORT one hides real risk.
+
+    RULING (``docs/evidence/RULING_no_side_position_shape_2026-09-16.md``): a
+    negative ``netPosition`` with no ``marketMetadata.outcome`` to contradict
+    it is a NO holding, not a SHORT on the YES instrument -- it is reported
+    as a LONG (on the NO leg; ``leg`` is what the client resolves the actual
+    NO instrument from) of the absolute quantity, never as
+    ``PositionSide.SHORT``.
+    """
+    mapped = parse_position_status_report(
         {**position, "netPosition": "-4"},
         market_slug=slug,
         instrument=instrument,
         account_id=ACCOUNT_ID,
         report_id=REPORT_ID,
         ts_init=TS_INIT,
-    ).report
+    )
 
-    assert report.quantity == Quantity.from_str("4.00")
-    assert report.signed_decimal_qty == Decimal("-4.00")
+    assert mapped.leg == "no"
+    assert mapped.report.position_side == PositionSide.LONG
+    assert mapped.report.quantity == Quantity.from_str("4.00")
+    assert mapped.report.signed_decimal_qty == Decimal("4.00")
+
+
+def test_an_explicit_no_outcome_maps_the_no_leg(
+    position: dict[str, Any], instrument: BinaryOption, slug: str
+) -> None:
+    """The primary signal is ``marketMetadata.outcome``, not just the sign."""
+    mapped = parse_position_status_report(
+        {
+            **position,
+            "netPosition": "-1",
+            "marketMetadata": {"slug": slug, "outcome": "No"},
+        },
+        market_slug=slug,
+        instrument=instrument,
+        account_id=ACCOUNT_ID,
+        report_id=REPORT_ID,
+        ts_init=TS_INIT,
+    )
+
+    assert mapped.leg == "no"
+    assert mapped.report.position_side == PositionSide.LONG
+    assert mapped.report.quantity == Quantity.from_str("1.00")
+
+
+def test_an_explicit_yes_outcome_maps_the_yes_leg(
+    position: dict[str, Any], instrument: BinaryOption, slug: str
+) -> None:
+    mapped = parse_position_status_report(
+        {**position, "marketMetadata": {"slug": slug, "outcome": "Yes"}},
+        market_slug=slug,
+        instrument=instrument,
+        account_id=ACCOUNT_ID,
+        report_id=REPORT_ID,
+        ts_init=TS_INIT,
+    )
+
+    assert mapped.leg == "yes"
+    assert mapped.report.position_side == PositionSide.LONG
+
+
+@pytest.mark.parametrize(
+    ("outcome", "net"),
+    [
+        ("No", "4"),
+        ("Yes", "-4"),
+    ],
+    ids=["no-outcome-positive-net", "yes-outcome-negative-net"],
+)
+def test_a_contradictory_outcome_and_sign_is_refused(
+    position: dict[str, Any],
+    instrument: BinaryOption,
+    slug: str,
+    outcome: str,
+    net: str,
+) -> None:
+    """Two venue-supplied signals that disagree are a contradiction, not a
+    preference -- neither ``outcome`` nor the sign of ``netPosition`` is
+    picked over the other."""
+    with pytest.raises(ExecutionReportMappingError, match="contradiction"):
+        parse_position_status_report(
+            {
+                **position,
+                "netPosition": net,
+                "marketMetadata": {"slug": slug, "outcome": outcome},
+            },
+            market_slug=slug,
+            instrument=instrument,
+            account_id=ACCOUNT_ID,
+            report_id=REPORT_ID,
+            ts_init=TS_INIT,
+        )
+
+
+def test_an_unrecognized_outcome_value_is_refused(
+    position: dict[str, Any], instrument: BinaryOption, slug: str
+) -> None:
+    with pytest.raises(ExecutionReportMappingError, match="outcome"):
+        parse_position_status_report(
+            {**position, "marketMetadata": {"slug": slug, "outcome": "Maybe"}},
+            market_slug=slug,
+            instrument=instrument,
+            account_id=ACCOUNT_ID,
+            report_id=REPORT_ID,
+            ts_init=TS_INIT,
+        )
 
 
 def test_position_average_open_price_is_not_invented(

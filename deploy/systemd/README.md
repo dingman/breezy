@@ -813,6 +813,80 @@ pattern), `daemon-reload`, then
 not run here; see the TRAP section above for the post-edit `daemon-reload`
 discipline that applies to any future edit of this unit too.
 
+## `breezy-pm-crh-cont-tally` — PREREG v3 family tally, pm_us_crh_cont (2026-09-16, PREPARED, NOT ACTIVATED)
+
+**L-38 closure.** `pm_us_crh_cont` (`deploy/families/pm_us_crh_cont.json`,
+trial prefix `continuous_rung_hold/trial/`, `status: REGISTERED`) has been
+the LIVE family since 2026-09-13, but until this item had NO scheduled
+tally at all -- "a stop that cannot fire is MISSING". This unit pair,
+**`breezy-pm-crh-cont-tally`** at **17:25 UTC**, closes that gap by running
+the SAME `family-tally-v2-run.sh` wrapper against family id
+`pm_us_crh_cont` instead of `pm_us_crh_v2` -- byte-identical
+`Type=oneshot`/`MemoryHigh=1G`/`MemoryMax=2G`/`WorkingDirectory=`/no-`
+[Install]` shape to `breezy-pm-crh-v2-tally.service`, scheduled 10 minutes
+after the v2 tally's own 17:15Z tick (never the same minute --
+`tests/unit/test_deploy_timer_hours.py::test_1725_utc_is_owned_by_exactly_one_timer`)
+and still outside the protected window `P` (light-job exemption, same as
+its v2 sibling).
+
+**What this item does NOT do.** The wrapper's `PM_FAMILY`-scoped branch
+(`family-tally-v2-run.sh:73`, literal `"pm_us_crh_v2"` only) still gates
+the structural-dead-stop's `--covered-listed-station-days` /
+`--fill-source` / `--fill-since-climate-day` arguments to `pm_us_crh_v2`
+alone -- `pm_us_crh_cont` runs the plain, unqualified path (identical to
+`kalshi_crh_v1`'s), with `covered_listed_station_days=None` and
+`filled_takes=None`, so the structural-dead stop is never evaluated for
+it. Wiring a v3-scoped count (its own `--family-manifest
+pm_us_crh_cont.json`, d0 `2026-09-12`) is **R-4** (`docs/core/PROGRESS.md`
+SP-1 I5) and is explicitly out of scope here. What this item DOES restore
+is the LD-OBF sequential Wald boundary look (every 10 filled trials) and
+the per-stratum Wilson `cell_dead` diagnostics -- both of which were
+simply never running for this family before, since nothing invoked the
+CLI against it on any schedule.
+
+**Verified before landing (read-only, against a scratch copy of the real
+derived store -- never the live `~/.local/share/breezy/derived/` tree):**
+the manifest's `status` is `REGISTERED` (not `DRAFT_NOT_REGISTERED`), so
+the CLI's own draft gate (`family_tally_v2.py:1042`, SHADOW/DIAGNOSTIC-only
+output for a non-`REGISTERED` manifest) does not apply -- full
+`SURVIVE`/`KILL`/`CONTINUE` verdict vocabulary is issued. The tally's
+source parquet is the SAME store the v2 tally and the 14:15Z scorer read
+(`BREEZY_SCORED_TRIALS_DIR`, default
+`~/.local/share/breezy/derived/scored_trials`) -- no separate store exists
+for v3. As of 2026-09-16 (before that day's 14:15Z scorer run) the live
+store carries **zero** `*.parquet` score-run files at all (any family), so
+`pm_us_crh_cont`'s rendered `row count: 0 (excluded: 0)` and verdict
+`CONTINUE -- fewer than one completed look so far (n < look_step)` --
+consistent with "Resolver fills are residual by PREREG"
+(`docs/core/LESSONS.md`): every v3 fill so far (the 2026-09-13 MIA take,
+the 2026-09-15 NO-side trial) has landed as fee-unreconciled *residual*
+dollars via the resolver path, never as a create-path row this store's
+scorer has admitted, so 0 (not 3) is the correct count today regardless of
+whether the 14:15Z scorer has already run.
+
+Validation performed (no unit activated, no real state touched):
+
+```
+$ bash -n deploy/systemd/family-tally-v2-run.sh
+OK
+$ BREEZY_SCORED_TRIALS_DIR=<scratch copy> BREEZY_LIVE_TALLY_OUTPUT_DIR=<scratch dir> \
+  BREEZY_FAMILY_TALLY_V2_FAMILIES_DIR=deploy/families \
+  bash deploy/systemd/family-tally-v2-run.sh pm_us_crh_cont
+family tally v2 (pm_us_crh_cont) ok   # exit 0; row count: 0 (excluded: 0); verdict CONTINUE
+```
+
+To activate: symlink the pair into `~/.config/systemd/user/` (§2's
+pattern), `daemon-reload`, then
+
+```
+systemctl --user daemon-reload
+systemctl --user enable --now breezy-pm-crh-cont-tally.timer
+```
+
+-- deliberately not run here; see the TRAP section above for the post-edit
+`daemon-reload` discipline that applies to any future edit of this unit
+too.
+
 ## Orphan node after a supervisor restart is EXPECTED
 
 SP-1/I4 (2026-09-12), doc-only. A `systemctl --user restart
@@ -935,6 +1009,12 @@ zero-diff file:
 R-5 (the `breezy-live-tally` narrowing ruling) should sweep these five
 comments in the same pass.
 
-**No v3 tally exists.** `pm_us_crh_cont` (the live v3 strategy) has no
-nightly tally unit of its own -- L-38 stands. Building one is I5, blocked on
-R-4; this item does not touch it.
+**v3 tally now scheduled (L-38 closed 2026-09-16).** `pm_us_crh_cont` (the
+live v3 strategy) now has its own nightly tally unit,
+`breezy-pm-crh-cont-tally.{service,timer}` at 17:25Z (see that section
+above) -- a stop that cannot fire is no longer MISSING for this family. The
+structural-dead-stop's v3-scoped count wiring (its own
+`--covered-listed-station-days`/`--fill-source`/`--fill-since-climate-day`
+args, currently `pm_us_crh_v2`-only in the wrapper) remains I5, blocked on
+R-4; this item schedules the LD-OBF sequential look and per-stratum
+`cell_dead` diagnostics only, not the structural-dead stop itself.

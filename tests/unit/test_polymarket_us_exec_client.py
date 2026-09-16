@@ -695,8 +695,12 @@ def test_refuse_producer_count_stays_pinned_at_twenty_seven() -> None:
     fail-closed guard around its own `record_fill` call. Widened AGAIN
     old(30) -> new(33) by A1 (SP-3): three new fail-closed venue-id
     map-write refusals (`_submit_order`'s new site plus one each in
-    `_resolve_accept_fill` and `_resolve_terminal_zero`). Never relaxed,
-    only widened (L-12).
+    `_resolve_accept_fill` and `_resolve_terminal_zero`). Widened AGAIN
+    old(33) -> new(34) by the position-shape ruling
+    (`docs/evidence/RULING_no_side_position_shape_2026-09-16.md`):
+    `_map_position` gained one new fail-closed refusal for a NO-leg
+    holding whose NO instrument is not loaded. Never relaxed, only
+    widened (L-12).
 
     The authoritative, triaged inventory is
     `tests/unit/test_exec_refusal_health_surface.py::REFUSAL_PRODUCERS`,
@@ -714,7 +718,7 @@ def test_refuse_producer_count_stays_pinned_at_twenty_seven() -> None:
         and isinstance(node.func.value, ast.Name)
         and node.func.value.id == "self"
     )
-    assert count == 33
+    assert count == 34
 
 
 @pytest.mark.asyncio
@@ -1258,6 +1262,205 @@ async def test_a_position_under_an_unusable_slug_is_refused_by_name(
     assert mass_status.position_reports == {}
     assert any(
         "unusable slug" in reason and bad_slug in reason for reason in rig.client.trading_refusals
+    ), rig.client.trading_refusals
+    await rig.client._disconnect()
+
+
+# ---------------------------------------------------------------------------
+# NO-leg position mapping -- position-shape ruling
+# (`docs/evidence/RULING_no_side_position_shape_2026-09-16.md`,
+# `docs/plans/POSITION_EXIT_EXECUTION_2026-09-16.md` Appendix A.1). A NO
+# holding is a LONG on the NO-leg instrument, never a SHORT on the YES one.
+# ---------------------------------------------------------------------------
+
+
+def _no_side_position(slug: str, *, qty: str = "1", cost: str = "0.09") -> dict[str, Any]:
+    """A ``UserPosition`` shaped like the measured NO holding (Appendix A.1):
+    ``outcome='No'``, negative ``netPosition``, ``qtyBought=0``/``qtySold=1``
+    -- the venue represents a NO buy as a sell of the YES side."""
+    return {
+        **build_position(slug),
+        "netPosition": f"-{qty}",
+        "qtyBought": "0",
+        "qtySold": qty,
+        "cost": {"value": cost, "currency": "USD"},
+        "qtyAvailable": f"-{qty}",
+        "marketMetadata": {"slug": slug, "outcome": "No"},
+    }
+
+
+@pytest.mark.asyncio
+async def test_a_yes_holding_with_an_explicit_outcome_is_long_on_the_yes_instrument(
+    tmp_path: Path,
+) -> None:
+    """L-44: an explicit ``outcome='Yes'`` maps the same way an absent one
+    already did -- LONG 1 on the YES instrument, priced from Breezy's own
+    durable fill record (0.12, per the measured YES holding)."""
+    rig = _build_rig(tmp_path)
+    await rig.client._connect()
+    slug = _slug(rig.instrument)
+    rig.client.record_fill(_record(rig, qty=Decimal(1), cost=Decimal("0.12")))
+    yes_position = {
+        **build_position(slug),
+        "netPosition": "1",
+        "qtyBought": "1",
+        "qtySold": "0",
+        "marketMetadata": {"slug": slug, "outcome": "Yes"},
+    }
+    rig.read._payloads[PORTFOLIO_POSITIONS_PATH] = {
+        "positions": {slug: yes_position},
+        "eof": True,
+    }
+
+    mass_status = await rig.client.generate_mass_status()
+
+    reports = mass_status.position_reports[rig.instrument.id]
+    assert len(reports) == 1
+    assert reports[0].position_side == PositionSide.LONG
+    assert reports[0].quantity == Quantity(1, rig.instrument.size_precision)
+    assert reports[0].avg_px_open == Decimal("0.12")
+    assert rig.client.trading_refusals == ()
+    await rig.client._disconnect()
+
+
+@pytest.mark.asyncio
+async def test_a_no_holding_is_long_on_the_no_leg_instrument_in_a_mixed_payload(
+    tmp_path: Path,
+) -> None:
+    """L-44: the NO holding measured 2026-09-16 -- ``outcome='No'``,
+    ``netPosition='-1'``, ``qtyBought=0``, ``qtySold=1`` -- maps to LONG 1 on
+    the ``^no`` instrument, priced 0.09 from Breezy's own durable fill
+    record (never complemented: the venue's ``avgPx``/``cost`` are already
+    NO-denominated). ``qtySold=1`` is accepted, not refused as an unknown or
+    contradictory shape.
+
+    Mixed with an ordinary YES holding in a SECOND, unrelated market in the
+    SAME boot payload (Appendix A.1's "mixed YES+NO payload" case), and
+    asserts the NO leg is never attributed to its own market's YES
+    instrument -- the sibling-leg false positive this ruling exists to
+    close.
+    """
+    rig = _build_rig(tmp_path)
+    no_instrument = _no_leg_instrument()
+    second_instrument = build_second_instrument()
+    rig.client._instrument_provider.add(no_instrument)
+    rig.cache.add_instrument(no_instrument)
+    rig.client._instrument_provider.add(second_instrument)
+    rig.cache.add_instrument(second_instrument)
+    await rig.client._connect()
+
+    no_slug = _slug(rig.instrument)
+    second_slug = _slug(second_instrument)
+    no_record = DurableFillRecord(
+        venue_order_id="V-NO-1",
+        client_order_id="O-19700101-000000-001-001-1",
+        instrument_id=str(no_instrument.id),
+        order_side="BUY",
+        cumulative_qty=Decimal(1),
+        cumulative_cost=Decimal("0.09"),
+        cumulative_fee=Decimal("0.00"),
+        fee_reconciled=True,
+        ts_event=TS_INIT,
+    )
+    rig.client.record_fill(no_record)
+    second_record = DurableFillRecord(
+        venue_order_id="V-SECOND-1",
+        client_order_id="O-19700101-000000-001-001-1",
+        instrument_id=str(second_instrument.id),
+        order_side="BUY",
+        cumulative_qty=Decimal(1),
+        cumulative_cost=Decimal("0.60"),
+        cumulative_fee=Decimal("0.00"),
+        fee_reconciled=True,
+        ts_event=TS_INIT,
+    )
+    rig.client.record_fill(second_record)
+    second_position = {
+        **build_position(second_slug),
+        "netPosition": "1",
+        "qtyBought": "1",
+        "qtySold": "0",
+    }
+    rig.read._payloads[PORTFOLIO_POSITIONS_PATH] = {
+        "positions": {
+            no_slug: _no_side_position(no_slug),
+            second_slug: second_position,
+        },
+        "eof": True,
+    }
+
+    mass_status = await rig.client.generate_mass_status()
+
+    assert rig.instrument.id not in mass_status.position_reports, (
+        "a NO holding must never be attributed to its market's YES instrument"
+    )
+    no_reports = mass_status.position_reports[no_instrument.id]
+    assert len(no_reports) == 1
+    assert no_reports[0].position_side == PositionSide.LONG
+    assert no_reports[0].quantity == Quantity(1, no_instrument.size_precision)
+    assert no_reports[0].avg_px_open == Decimal("0.09")
+
+    yes_reports = mass_status.position_reports[second_instrument.id]
+    assert len(yes_reports) == 1
+    assert yes_reports[0].position_side == PositionSide.LONG
+
+    assert rig.client.trading_refusals == ()
+    await rig.client._disconnect()
+
+
+@pytest.mark.asyncio
+async def test_a_no_holding_with_no_no_leg_instrument_loaded_is_refused(
+    tmp_path: Path,
+) -> None:
+    """The YES instrument alone is not enough to map a NO holding: without
+    the NO-leg instrument loaded the exposure is real but unattributable,
+    so it is refused rather than silently dropped or mis-mapped onto YES."""
+    rig = _build_rig(tmp_path)
+    await rig.client._connect()
+    slug = _slug(rig.instrument)
+    rig.read._payloads[PORTFOLIO_POSITIONS_PATH] = {
+        "positions": {slug: _no_side_position(slug)},
+        "eof": True,
+    }
+
+    mass_status = await rig.client.generate_mass_status()
+
+    assert mass_status is not None
+    assert mass_status.position_reports == {}
+    assert any(
+        "NO-leg instrument" in reason and "no NO-leg instrument is loaded" in reason
+        for reason in rig.client.trading_refusals
+    ), rig.client.trading_refusals
+    await rig.client._disconnect()
+
+
+@pytest.mark.asyncio
+async def test_a_contradictory_outcome_and_sign_is_refused_end_to_end(
+    tmp_path: Path,
+) -> None:
+    """``outcome='No'`` with a positive ``netPosition`` is a venue
+    contradiction, refused all the way through ``_map_position`` -- never
+    guessed toward either leg."""
+    rig = _build_rig(tmp_path)
+    await rig.client._connect()
+    slug = _slug(rig.instrument)
+    contradictory = {
+        **build_position(slug),
+        "netPosition": "1",
+        "marketMetadata": {"slug": slug, "outcome": "No"},
+    }
+    rig.read._payloads[PORTFOLIO_POSITIONS_PATH] = {
+        "positions": {slug: contradictory},
+        "eof": True,
+    }
+
+    mass_status = await rig.client.generate_mass_status()
+
+    assert mass_status is not None
+    assert mass_status.position_reports == {}
+    assert any(
+        "could not be mapped" in reason and "contradiction" in reason
+        for reason in rig.client.trading_refusals
     ), rig.client.trading_refusals
     await rig.client._disconnect()
 

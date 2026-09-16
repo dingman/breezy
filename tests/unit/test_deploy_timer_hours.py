@@ -161,3 +161,15 @@ def test_1715_utc_is_owned_by_exactly_one_timer() -> None:
         if ("17", "15") in _clock_ticks(timer_path)
     ]
     assert owners == ["breezy-pm-crh-v2-tally.timer"]
+
+
+def test_1725_utc_is_owned_by_exactly_one_timer() -> None:
+    # L-38: 17:25 UTC is the pm_us_crh_cont v3-tally tick -- after the v2
+    # tally's own 17:15 tick (never the same minute) and still after 16:50
+    # launch / 17:10 window end. Unique as an hour:minute tick.
+    owners = [
+        timer_path.name
+        for timer_path in _all_timer_files()
+        if ("17", "25") in _clock_ticks(timer_path)
+    ]
+    assert owners == ["breezy-pm-crh-cont-tally.timer"]

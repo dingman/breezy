@@ -308,6 +308,7 @@ from breezy.adapters.polymarket_us.safety import (
 from breezy.adapters.polymarket_us.symbology import (
     instrument_id_to_slug,
     leg_of,
+    no_leg_instrument_id,
     slug_to_instrument_id,
 )
 from breezy.ingest.gate import assert_state_store_durable
@@ -2550,6 +2551,25 @@ class PolymarketUSExecutionClient(LiveExecutionClient):
             self._refuse(f"the position in market {slug!r} could not be mapped: {exc}")
             return None
 
+        # `mapped.leg` names which outcome the exposure belongs to; `reports.py`
+        # is I/O-free (module docstring) and never resolves the real NO-leg
+        # instrument, so this is the one place that does -- reusing
+        # `_find_instrument`'s existing provider-then-cache lookup, applied to
+        # the NO-leg id (`no_leg_instrument_id`, the same bijection
+        # `parsing.parse_binary_option_pair` already builds every NO-leg
+        # instrument through), never a new one.
+        resolved_instrument_id = mapped.report.instrument_id
+        if mapped.leg == "no":
+            no_instrument = self._find_instrument(slug, leg="no")
+            if no_instrument is None:
+                self._refuse(
+                    f"the venue reports a NO-leg position in market {slug!r}, for "
+                    "which no NO-leg instrument is loaded; it cannot be mapped, "
+                    "priced or netted"
+                )
+                return None
+            resolved_instrument_id = no_instrument.id
+
         # R-6.5a: this is "an instrument's reconciliation succeeded" -- the
         # payload for `slug` was read AND mapped without error. Chosen as the
         # narrowest point that covers every outcome below it (expired, FLAT,
@@ -2590,11 +2610,11 @@ class PolymarketUSExecutionClient(LiveExecutionClient):
             )
             return None
 
-        avg_px_open = self._entry_price(report.instrument_id, report.quantity, payload)
+        avg_px_open = self._entry_price(resolved_instrument_id, report.quantity, payload)
 
         return PositionStatusReport(
             account_id=report.account_id,
-            instrument_id=report.instrument_id,
+            instrument_id=resolved_instrument_id,
             position_side=report.position_side,
             quantity=report.quantity,
             report_id=report.id,
@@ -2604,10 +2624,19 @@ class PolymarketUSExecutionClient(LiveExecutionClient):
             avg_px_open=avg_px_open,
         )
 
-    def _find_instrument(self, slug: str) -> Instrument | None:
-        """Resolve a market slug to a loaded instrument, provider first."""
+    def _find_instrument(self, slug: str, *, leg: Leg = "yes") -> Instrument | None:
+        """Resolve a market slug to a loaded instrument, provider first.
+
+        ``leg`` selects which of the market's two instruments to resolve:
+        the YES id (:func:`slug_to_instrument_id`, the default -- unchanged
+        from before ``leg`` existed) or the NO id (:func:`no_leg_instrument_id`)
+        -- the same bijections :mod:`parsing` already uses to build both legs
+        at discovery time. Never a new one.
+        """
         try:
-            instrument_id = slug_to_instrument_id(slug)
+            instrument_id = (
+                no_leg_instrument_id(slug) if leg == "no" else slug_to_instrument_id(slug)
+            )
         except VenuePayloadError as exc:
             self._refuse(f"the venue reports a position under an unusable slug: {exc}")
             return None

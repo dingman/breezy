@@ -257,6 +257,12 @@ def test_wrapper_reports_failure_from_the_stub_analysis_script(tmp_path: Path) -
     "service_name,timer_name,family_id",
     [
         ("breezy-pm-crh-v2-tally.service", "breezy-pm-crh-v2-tally.timer", "pm_us_crh_v2"),
+        # L-38: pm_us_crh_cont is the LIVE family since 2026-09-13 and had no
+        # scheduled tally at all -- a stop that cannot fire is MISSING. This
+        # pair mirrors the pm_us_crh_v2 pair exactly (same wrapper, same
+        # slice/memory/WorkingDirectory shape), scheduled at a distinct tick
+        # (17:25Z, see test_pm_crh_cont_timer_fires_at_1725_utc).
+        ("breezy-pm-crh-cont-tally.service", "breezy-pm-crh-cont-tally.timer", "pm_us_crh_cont"),
     ],
 )
 def test_concrete_unit_pair_exists_and_wires_to_wrapper(
@@ -295,6 +301,27 @@ def test_pm_crh_v2_tally_tick_is_after_node_launch() -> None:
         re.MULTILINE,
     )
     assert match is not None, "breezy-pm-crh-v2-tally.timer has no parseable OnCalendar="
+    tick = _dt.time(int(match.group(1)), int(match.group(2)), int(match.group(3)))
+    assert tick >= LAUNCH_WINDOW_END_UTC
+
+
+def test_pm_crh_cont_timer_fires_at_1725_utc() -> None:
+    """L-38: distinct from pm_us_crh_v2's 17:15Z tick so the two tallies
+    never collide (tests/unit/test_deploy_timer_hours.py owns the general
+    no-two-timers-share-a-tick collision scan)."""
+    timer_text = (_SYSTEMD_DIR / "breezy-pm-crh-cont-tally.timer").read_text()
+    assert "OnCalendar=*-*-* 17:25:00 UTC" in timer_text
+
+
+def test_pm_crh_cont_tally_tick_is_after_node_launch() -> None:
+    """Mirrors test_pm_crh_v2_tally_tick_is_after_node_launch for the new pair."""
+    timer_text = (_SYSTEMD_DIR / "breezy-pm-crh-cont-tally.timer").read_text()
+    match = re.search(
+        r"^OnCalendar=\S+\s+(\d{2}):(\d{2}):(\d{2})\s+UTC\s*$",
+        timer_text,
+        re.MULTILINE,
+    )
+    assert match is not None, "breezy-pm-crh-cont-tally.timer has no parseable OnCalendar="
     tick = _dt.time(int(match.group(1)), int(match.group(2)), int(match.group(3)))
     assert tick >= LAUNCH_WINDOW_END_UTC
 
