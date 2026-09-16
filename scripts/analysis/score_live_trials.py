@@ -104,6 +104,12 @@ from breezy.adapters.polymarket_us.exec.no_side_keys import (
     NO_SIDE_FIRST_LIVE_ORDER_KEY,
     NO_SIDE_POSITION_SHAPE_CAPTURED_KEY,
 )
+from breezy.adapters.polymarket_us.symbology import (
+    REGISTRY_VENUE_KEY,
+    parse_weather_slug,
+    slug_closed_interval,
+)
+from breezy.domain.instrument_leg import base_symbol_of, symbol_of_instrument_id
 from breezy.domain.nws_climate_day import NwsClimateDay
 from breezy.domain.weather_bucket_facts import (
     Measure,
@@ -114,13 +120,14 @@ from breezy.persistence.catalog import open_station_catalog, read_climate_day_in
 from breezy.persistence.family_manifest import FamilyManifestError, load_family_manifest
 from breezy.persistence.scored_trial_store import read_scored_trials, write_scored_trials
 from breezy.registry.settlement_clock import settlement_deadline_ns
-from breezy.registry.sites import default_registry
+from breezy.registry.sites import SiteNotFoundError, default_registry
 from breezy.runtime.exec_state_db_path import (
     ExecStateDbNotConfiguredError,
     node_store_path_check,
     resolve_store_path,
 )
 from breezy.settlement.trial_scorer import (
+    BucketSource,
     FilledTrial,
     ScoredTrial,
     ScoreRefusal,
@@ -1249,6 +1256,52 @@ def _read_bucket_facts_by_instrument_id(
     return facts
 
 
+def _bucket_facts_from_instrument_id(instrument_id: str) -> WeatherBucketFacts | None:
+    """Derive `WeatherBucketFacts` straight from `instrument_id`'s own slug
+    grammar, for when no persisted instrument definition exists (measured
+    2026-09-16: the per-station NWS catalog holds ZERO instrument
+    definitions in this environment -- ING-1 ingest strand).
+
+    Reuses the SAME parser `breezy.adapters.polymarket_us.parsing
+    ._weather_info` reads at ingestion time --
+    `symbology.parse_weather_slug` for the city/measure/climate-day/bounds,
+    then `symbology.slug_closed_interval` for the closed-interval reading --
+    never a new regex. `slug_closed_interval`'s three-family mapping is the
+    exact rule `docs/evidence/venue/polymarket_us
+    /THRESHOLD_SEMANTICS_2026-08-25.md` section 4.2 pins as settlement-grade
+    (`gte{A}lt{B}f` -> `[A, B]` inclusive, the same rule
+    `settlement_truth_dataset.bucket_facts` already applies standalone with
+    no venue payload) -- this driver never has the venue's own
+    description/title to cross-check against (`assert_bounds_cross_checked`
+    needs a live market payload this scorer does not hold), so it uses that
+    corroborated cross-check reading directly rather than re-deriving a new
+    one.
+
+    `None` for anything the parser does not recognise (an unobserved bound
+    family, a slug outside the weather grammar, or a city with no
+    registered settlement site) -- the caller's `instrument_unavailable`
+    refusal, unchanged.
+    """
+    slug = base_symbol_of(symbol_of_instrument_id(instrument_id))
+    parsed = parse_weather_slug(slug)
+    if parsed is None:
+        return None
+    interval = slug_closed_interval(parsed.bounds)
+    if interval is None:
+        return None
+    try:
+        site = default_registry().site_for_venue_city_token(REGISTRY_VENUE_KEY, parsed.city)
+    except SiteNotFoundError:
+        return None
+    return WeatherBucketFacts(
+        settlement_station=site.cli_location,
+        climate_day=dt.date.fromisoformat(parsed.climate_date),
+        measure=Measure(parsed.measure),
+        lower_f=interval[0],
+        upper_f=interval[1],
+    )
+
+
 def _latest_stored_row(derived_dir: Path, trial_id: str) -> ScoredTrial | None:
     """The highest-`score_seq` stored row for `trial_id`, or `None` if none
     has ever been scored."""
@@ -1408,6 +1461,11 @@ def score_live_trials(
     pairs: list[tuple[FilledTrial, NwsClimateDay | None]] = []
     extra_refusals: list[ScoreRefusal] = list(jsonl_refusals)
     excluded_fills: list[FillExclusion] = list(reader_exclusions)
+    #: Set only for a trial resolved via `_bucket_facts_from_instrument_id`
+    #: (the catalog default is the `ScoredTrial.bucket_source` field's own
+    #: default, applied by the re-stamping step below) -- read back there so
+    #: the tally can see, per row, which source supplied the rung.
+    bucket_source_by_trial_id: dict[str, BucketSource] = {}
     for trial in filled_trials:
         malformed_qty = _validate_qty(trial)
         if malformed_qty is not None:
@@ -1429,15 +1487,27 @@ def score_live_trials(
             continue
         if _already_fallback_scored(derived_dir, trial.trial_id):
             continue
-        if trial.bucket is None and trial.instrument_id not in bucket_by_instrument:
-            extra_refusals.append(
-                ScoreRefusal(
-                    trial_id=trial.trial_id,
-                    reason="instrument_unavailable",
-                    detail=f"no persisted instrument definition for {trial.instrument_id!r}",
+        resolved_bucket: WeatherBucketFacts | None = trial.bucket
+        if resolved_bucket is None:
+            resolved_bucket = bucket_by_instrument.get(trial.instrument_id)
+            if resolved_bucket is None:
+                # Catalog absence: fall back to deriving the rung straight
+                # from the instrument id's own slug grammar (measured
+                # 2026-09-16, ING-1) before refusing. Only THIS trial's
+                # provenance is marked "slug" -- a sibling trial that
+                # resolved from the catalog stays "catalog".
+                resolved_bucket = _bucket_facts_from_instrument_id(trial.instrument_id)
+                if resolved_bucket is not None:
+                    bucket_source_by_trial_id[trial.trial_id] = "slug"
+            if resolved_bucket is None:
+                extra_refusals.append(
+                    ScoreRefusal(
+                        trial_id=trial.trial_id,
+                        reason="instrument_unavailable",
+                        detail=f"no persisted instrument definition for {trial.instrument_id!r}",
+                    )
                 )
-            )
-            continue
+                continue
         resolved_trial = trial
         if trial.bucket is None:
             resolved_trial = FilledTrial(
@@ -1445,7 +1515,7 @@ def score_live_trials(
                 station=trial.station,
                 climate_day=trial.climate_day,
                 instrument_id=trial.instrument_id,
-                bucket=bucket_by_instrument[trial.instrument_id],
+                bucket=resolved_bucket,
                 fill_px=trial.fill_px,
                 fee=trial.fee,
                 qty=trial.qty,
@@ -1496,6 +1566,7 @@ def score_live_trials(
             entry_ask=row.entry_ask,
             fill_px=row.fill_px,
             fee=row.fee,
+            bucket_source=bucket_source_by_trial_id.get(row.trial_id, "catalog"),
         )
         for row in scored
     )

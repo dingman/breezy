@@ -56,6 +56,59 @@ def test_a_written_run_round_trips_every_decimal_exactly(tmp_path: Path) -> None
     assert isinstance(rows[0].pnl, Decimal)
 
 
+def test_bucket_source_defaults_to_catalog_and_round_trips_slug(tmp_path: Path) -> None:
+    default_trial = _scored()
+    assert default_trial.bucket_source == "catalog"
+    slug_trial = _scored(trial_id="slug-trial", bucket_source="slug")
+    write_scored_trials(tmp_path, [default_trial, slug_trial], now_ns=_BASE_NS)
+    rows = {row.trial_id: row for row in read_scored_trials(tmp_path)}
+    assert rows[default_trial.trial_id].bucket_source == "catalog"
+    assert rows["slug-trial"].bucket_source == "slug"
+
+
+def test_a_pre_existing_file_missing_the_bucket_source_column_reads_back_as_catalog(
+    tmp_path: Path,
+) -> None:
+    """A file written before this column existed has no `bucket_source`
+    column at all -- `read_table(path, schema=SCORED_TRIAL_SCHEMA)` fills
+    every row's missing column with `None` (measured), which
+    `_scored_trial_from_row` must map back to the historical "catalog"
+    meaning, never leave as `None`."""
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    legacy_schema = pa.schema(
+        [field for field in SCORED_TRIAL_SCHEMA if field.name != "bucket_source"]
+    )
+    trial = _scored()
+    row = {
+        "trial_id": trial.trial_id,
+        "station": trial.station,
+        "climate_day": trial.climate_day,
+        "instrument_id": trial.instrument_id,
+        "settlement_tmax_f": trial.settlement_tmax_f,
+        "held": trial.held,
+        "pnl": str(trial.pnl),
+        "revision_seq": trial.revision_seq,
+        "raw_sha256": trial.raw_sha256,
+        "scored_at_ns": trial.scored_at_ns,
+        "score_seq": trial.score_seq,
+        "settlement_basis": trial.settlement_basis,
+        "excluded_reason": trial.excluded_reason,
+        "slippage": str(trial.slippage),
+        "entry_ask": str(trial.entry_ask),
+        "fill_px": str(trial.fill_px),
+        "fee": str(trial.fee),
+    }
+    table = pa.Table.from_pylist([row], schema=legacy_schema)
+    legacy_path = tmp_path / "scored_trials_legacy.parquet"
+    pq.write_table(table, legacy_path)
+
+    rows = read_scored_trials(tmp_path)
+    assert len(rows) == 1
+    assert rows[0].bucket_source == "catalog"
+
+
 def test_a_second_run_appends_a_file_and_never_rewrites_the_first(tmp_path: Path) -> None:
     first = write_scored_trials(tmp_path, [_scored()], now_ns=_BASE_NS)
     second = write_scored_trials(
@@ -75,6 +128,13 @@ def test_reading_an_empty_directory_returns_no_rows_not_an_error(tmp_path: Path)
 
 
 def test_the_schema_is_pinned_column_for_column() -> None:
+    """Additive widening (2026-09-16, slug-fallback defect fix):
+    `bucket_source` appended at the END -- an ADDITIVE, nullable column,
+    never inserted mid-schema -- so a pre-existing file written before this
+    column existed still reads back correctly (`_scored_trial_from_row`'s
+    own `.get(...) or "catalog"` default; see
+    `scripts/analysis/score_live_trials.py._bucket_facts_from_instrument_id`
+    for why the column exists)."""
     names = SCORED_TRIAL_SCHEMA.names
     assert names == [
         "trial_id",
@@ -94,6 +154,7 @@ def test_the_schema_is_pinned_column_for_column() -> None:
         "entry_ask",
         "fill_px",
         "fee",
+        "bucket_source",
     ]
 
 
