@@ -1,0 +1,66 @@
+[Unit]
+# Daily driver for the PREREG v3 (continuous-rung-hold) family tally,
+# family pm_us_crh_cont (scripts/analysis/family_tally_v2.py via
+# deploy/systemd/family-tally-v2-run.sh), triggered by
+# breezy-pm-crh-cont-tally.timer. Sibling of breezy-pm-crh-v2-tally.service:
+# byte-identical oneshot/no-Install shape, same wrapper-script driver style
+# -- the timer owns cadence, the script owns the work. The family id
+# (pm_us_crh_cont) is the wrapper's ONLY argument; it is never inferred, so
+# this unit and breezy-pm-crh-v2-tally.service share one wrapper safely.
+# Scheduled at 17:25 UTC (after 16:50 launch / 17:10 window end, and after
+# the v2 tally's own 17:15Z tick so the two never collide -- L-38).
+#
+# L-38: pm_us_crh_cont has been the LIVE family since 2026-09-13
+# (deploy/families/pm_us_crh_cont.json, trial prefix
+# continuous_rung_hold/trial/) but had NO scheduled tally at all -- a stop
+# that cannot fire is MISSING. This unit closes that gap; it does not
+# change the wrapper's own PM_FAMILY-scoped structural-dead-stop argument
+# wiring (family-tally-v2-run.sh:73), which stays pm_us_crh_v2-only (R-4,
+# SP-1 I5, tracked separately) -- the LD-OBF sequential Wald boundary and
+# per-stratum cell_dead diagnostics run regardless.
+#
+# No network: the PREREG v2/v3 store is a local parquet directory
+# (`~/.local/share/breezy/derived/scored_trials`, same store
+# breezy-live-tally.service and breezy-pm-crh-v2-tally.service read), plus
+# the local family manifest (`deploy/families/pm_us_crh_cont.json`).
+Description=Breezy PREREG v3 family tally -- pm_us_crh_cont (daily)
+Documentation=file:///home/jon/breezy/deploy/systemd/README.md
+Documentation=file:///home/jon/breezy/scripts/analysis/family_tally_v2.py
+Documentation=file:///home/jon/breezy/docs/plans/FAMILY_TALLY_V2_BLUEPRINT_2026-09-04.md
+
+[Service]
+Type=oneshot
+WorkingDirectory=/home/jon/breezy
+
+# Own cgroup memory ceiling -- byte-identical to breezy-pm-crh-v2-tally
+# .service's own ceiling and rationale (2026-09-11 breezy-k1-daily.service
+# incident follow-up): this unit's own footprint is a local parquet/sqlite
+# read, not a tape scan, so MemoryHigh=1G/MemoryMax=2G is deliberately far
+# below the host.
+MemoryHigh=1G
+MemoryMax=2G
+UMask=0077
+
+# No EnvironmentFile, deliberately: this unit holds no venue credential --
+# it reads a local parquet directory and writes a local Markdown report.
+# Unlike breezy-pm-crh-v2-tally.service, pm_us_crh_cont does not trip the
+# wrapper's PM_FAMILY-scoped branch (family-tally-v2-run.sh:73, literal
+# "pm_us_crh_v2" only), so no POLYMARKET_US_EXEC_STATE_DB Environment= line
+# is needed here.
+
+ExecStart=/home/jon/breezy/deploy/systemd/family-tally-v2-run.sh pm_us_crh_cont
+
+# Same budget as breezy-pm-crh-v2-tally.service: a local parquet scan plus
+# a bootstrap (BCa), well under breezy-mb-daily's network-bound budget.
+TimeoutStartSec=600
+
+# No Restart=. A missed daily run is not an incident -- tomorrow's run
+# subsumes today's over the still-growing store. The timer's
+# Persistent=true is what recovers a run missed across a reboot.
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=breezy-pm-crh-cont-tally
+
+# NOTE: no [Install] section. This unit is started BY the timer, never
+# enabled directly. `systemctl --user enable breezy-pm-crh-cont-tally.timer`
+# is the only thing to enable.

@@ -17,7 +17,7 @@ layer that turns that transition into exactly one alert through the existing
 ``AlertSink`` seam.
 
 **DEGRADED is a health INDICATOR, not a kill switch, and R-6c does not wire
-it to process exit.** The triage table below is why: seven of the thirty-three
+it to process exit.** The triage table below is why: seven of the thirty-four
 refusal producers are ROUTINE -- they are true of a correctly-built Breezy
 running against a healthy venue on an account the operator has ALSO traded by
 hand. Stopping the process on any of them would turn an ordinary foreign
@@ -57,7 +57,11 @@ generate_mass_status#2              EXCEPTIONAL   mass-status assembly rejected 
 generate_position_status_reports#1  EXCEPTIONAL   the venue position read failed
 _map_position#1                     ROUTINE       a position in a market Breezy never loaded
 _map_position#2                     EXCEPTIONAL   mapping a loadable position raised
-_map_position#3                     ROUTINE       a NON-LONG venue position; Breezy is long-only
+_map_position#3                     ROUTINE       a NO-leg holding whose NO instrument Breezy
+                                                   never loaded (position-shape ruling 2026-09-16)
+_map_position#4                     EXCEPTIONAL   a non-long `position_side` reached the LONG-only
+                                                   gate; the leg mapper's LONG-or-FLAT invariant
+                                                   (ruling 2026-09-16) broke upstream of this check
 _find_instrument#1                  ROUTINE       a slug our symbology rejects; a foreign market
 _entry_price#1                      ROUTINE       priced from the VENUE basis, not a Breezy fill
 _entry_price#2                      EXCEPTIONAL   neither a fill record nor a basis can price it
@@ -89,15 +93,29 @@ _resolve_terminal_zero#1            EXCEPTIONAL   fail-closed: the venue-id map 
                                                    GET-confirmed terminal zero; the retire proceeds
 ==================================  ============  ================================================
 
-Seven ROUTINE, twenty-six EXCEPTIONAL (A1 added three fail-closed venue-id
+Seven ROUTINE, twenty-seven EXCEPTIONAL (position-shape ruling 2026-09-16,
+old total 33 -> new total 34). `_map_position` gained a fourth
+`self._refuse(...)` site, inserted between the old `#2` and `#3`, so the old
+`#3` -- the non-long-position refusal -- shifts to `#4`. The new `#3` is a
+ROUTINE producer (a NO-leg holding Breezy has not loaded the NO instrument
+for, the same shape as the existing `#1`). `#4` is RECLASSIFIED from ROUTINE
+to EXCEPTIONAL: before this ruling a negative `netPosition` mapped to
+`PositionSide.SHORT` and reaching it was the ordinary shape of an operator's
+hand-opened short; after it, `parse_position_status_report` never reports a
+non-long side at all, so `#4` firing now means the leg mapper's
+LONG-or-FLAT invariant broke upstream -- EXCEPTIONAL by this table's own
+axis. Net effect on the totals: ROUTINE stays at seven (one added, one
+reclassified away); EXCEPTIONAL rises from twenty-six to twenty-seven. A1
+earlier added three fail-closed venue-id
 map-write refusals: old 30 -> new 33 -- ``_submit_order#2`` (NEW; the
 pre-existing rows shift: old ``#2``/``#3``/``#4`` -> new ``#3``/``#4``/``#5``),
 ``_resolve_accept_fill#2`` and ``_resolve_terminal_zero#1``. slice 3 earlier
 added ``_resolve_accept_fill#1``: old 29 -> new 30; I1b earlier added
-``_submit_order#3``/``#4``: old 27 -> new 29). Every one of the seven is
+``_submit_order#3``/``#4``: old 27 -> new 29). Every ROUTINE producer is
 reachable on an account in perfectly good order, which is the whole argument
-for INDICATOR over kill switch -- and one of them, ``_map_position#3``, is
-the non-long position refusal Revision 0's hand count missed entirely.
+for INDICATOR over kill switch -- the non-long-position refusal (now
+``_map_position#4``) is the one Revision 0's original hand count missed
+entirely, back when it was still ROUTINE.
 
 NO ORDER PATH, NO EGRESS
 -------------------------
@@ -163,7 +181,12 @@ REFUSAL_PRODUCERS: Final[frozenset[str]] = frozenset(
         "generate_position_status_reports#1",
         "_map_position#1",
         "_map_position#2",
+        # Position-shape ruling (2026-09-16): a fourth `_map_position`
+        # `self._refuse(...)` site, inserted BETWEEN the old `#2` and `#3` --
+        # the old `#3` (the non-long-position refusal) shifts to `#4`. Old
+        # 33 -> new 34.
         "_map_position#3",
+        "_map_position#4",
         "_find_instrument#1",
         "_entry_price#1",
         "_entry_price#2",
@@ -280,7 +303,7 @@ def test_the_refusal_producer_set_is_exactly_pinned() -> None:
         "added": sorted(scanned - REFUSAL_PRODUCERS),
         "removed": sorted(REFUSAL_PRODUCERS - scanned),
     }
-    assert len(scanned) == 33  # A1: old 30 -> new 33 (slice 3: old 29 -> new 30)
+    assert len(scanned) == 34  # position-shape ruling: old 33 -> new 34 (A1: old 30 -> new 33)
 
 
 def test_planting_a_twenty_sixth_refusal_breaks_the_pin() -> None:
@@ -295,7 +318,7 @@ def test_planting_a_twenty_sixth_refusal_breaks_the_pin() -> None:
     assert planted != source, "the plant site moved; update this test's anchor"
     scanned = _refusal_producers(planted)
     assert scanned != set(REFUSAL_PRODUCERS)
-    assert len(scanned) == 34  # A1: old 33 -> new 34 (planting one more breaks the pin)
+    assert len(scanned) == 35  # position-shape ruling: old 34 -> new 35 (planting breaks the pin)
 
 
 def test_removing_a_refusal_breaks_the_pin() -> None:
@@ -317,7 +340,7 @@ def test_removing_a_refusal_breaks_the_pin() -> None:
     assert removed != source, "the removal site moved; update this test's anchor"
     scanned = _refusal_producers(removed)
     assert scanned != set(REFUSAL_PRODUCERS)
-    assert "_map_position#3" not in scanned
+    assert "_map_position#4" not in scanned
 
 
 def test_every_pinned_refusal_producer_is_triaged_here() -> None:
@@ -328,10 +351,14 @@ def test_every_pinned_refusal_producer_is_triaged_here() -> None:
         "stale_rows": sorted(set(triaged) - REFUSAL_PRODUCERS),
     }
     counts = Counter(triaged.values())
+    # Position-shape ruling (2026-09-16): new `_map_position#3` is ROUTINE
+    # (+1 ROUTINE) and old `_map_position#3` -> `#4` is RECLASSIFIED
+    # ROUTINE -> EXCEPTIONAL (-1 ROUTINE, +1 EXCEPTIONAL): old
+    # {"EXCEPTIONAL": 26, "ROUTINE": 7} -> new {"EXCEPTIONAL": 27, "ROUTINE": 7}.
     # A1 (AM-3): old {"EXCEPTIONAL": 23, "ROUTINE": 7} -> new {"EXCEPTIONAL": 26, "ROUTINE": 7}
     # (slice 3: old {"EXCEPTIONAL": 22, "ROUTINE": 7} -> new {"EXCEPTIONAL": 23, "ROUTINE": 7};
     # I1b: old {"EXCEPTIONAL": 20, "ROUTINE": 7} -> new {"EXCEPTIONAL": 22, "ROUTINE": 7})
-    assert counts == {"EXCEPTIONAL": 26, "ROUTINE": 7}, counts
+    assert counts == {"EXCEPTIONAL": 27, "ROUTINE": 7}, counts
 
 
 # ---------------------------------------------------------------------------

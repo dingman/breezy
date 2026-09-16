@@ -1336,10 +1336,68 @@ class MappedPosition(NamedTuple):
 
     Breezy still defines no parallel REPORT type: ``report`` is the native
     ``PositionStatusReport``, unwrapped and unmodified.
+
+    ``leg`` is the OUTCOME the exposure belongs to -- ``"yes"`` or ``"no"`` --
+    determined by :func:`_position_leg`. This module performs no I/O
+    (module docstring) and therefore never resolves an actual NO-leg
+    ``Instrument``: ``report.instrument_id`` is left on the YES id it was
+    given (unchanged from before this field existed), and a caller that
+    needs the NO-leg exposure attached to the real NO instrument -- R-4's
+    :meth:`~breezy.adapters.polymarket_us.exec.client.
+    PolymarketUSExecutionClient._map_position` -- reads ``leg`` and performs
+    that resolution itself, the same way it already resolves the YES
+    instrument from the slug.
     """
 
     report: PositionStatusReport
     expired: bool
+    leg: Leg
+
+
+def _position_leg(*, net: Decimal, metadata: Mapping[str, Any] | None, context: str) -> Leg:
+    """Which leg -- YES or NO -- a position's exposure belongs to.
+
+    Ruling: ``docs/evidence/RULING_no_side_position_shape_2026-09-16.md``. A
+    venue position whose ``marketMetadata.outcome`` is ``"No"`` is a holding
+    of the NO leg -- Breezy is long-only, and a NO holding is a LONG on the
+    NO-leg instrument, never a SHORT on the YES one. An absent ``outcome``
+    (or an absent ``marketMetadata`` block entirely -- it is optional, see
+    the module docstring) falls back to the sign of ``netPosition``:
+    negative is a NO holding, non-negative is a YES holding -- this is the
+    pre-existing, still-correct reading for every payload this module has
+    ever been tested against, none of which carried ``outcome``.
+
+    A present ``outcome`` that CONTRADICTS the sign -- ``"No"`` with a
+    non-negative ``netPosition``, or ``"Yes"`` with a negative one -- is
+    refused rather than guessed: two venue-supplied signals that disagree
+    are a contradiction, not a preference, and neither is picked over the
+    other. An ``outcome`` outside ``{"Yes", "No"}`` is refused the same way
+    -- this module refuses outside its declared shapes rather than
+    extrapolating (module docstring).
+    """
+    outcome = metadata.get("outcome") if metadata is not None else None
+    if outcome is not None and outcome not in ("Yes", "No"):
+        raise ExecutionReportMappingError(
+            f"{context}.marketMetadata carries outcome {outcome!r}, neither "
+            "'Yes' nor 'No'; refusing to guess which leg the exposure belongs to"
+        )
+    if outcome == "No":
+        if net > 0:
+            raise ExecutionReportMappingError(
+                f"{context} declares marketMetadata.outcome='No' but a positive "
+                f"netPosition ({net}); a NO holding cannot carry a positive "
+                "netPosition and the contradiction is refused rather than guessed"
+            )
+        return "no"
+    if outcome == "Yes":
+        if net < 0:
+            raise ExecutionReportMappingError(
+                f"{context} declares marketMetadata.outcome='Yes' but a negative "
+                f"netPosition ({net}); a YES holding cannot carry a negative "
+                "netPosition and the contradiction is refused rather than guessed"
+            )
+        return "yes"
+    return "no" if net < 0 else "yes"
 
 
 def parse_position_status_report(
@@ -1408,12 +1466,12 @@ def parse_position_status_report(
         field=f"{context}.netPosition",
         error=ExecutionReportMappingError,
     )
-    if net > 0:
-        side = PositionSide.LONG
-    elif net < 0:
-        side = PositionSide.SHORT
-    else:
-        side = PositionSide.FLAT
+    leg = _position_leg(net=net, metadata=metadata, context=context)
+    # A NO holding's exposure is LONG on the NO leg, never SHORT on the YES
+    # one -- `leg` above already carries that distinction, so the only
+    # `position_side` this function ever reports again is LONG (net != 0) or
+    # FLAT (net == 0). See `_position_leg` and the ruling it cites.
+    side = PositionSide.FLAT if net == 0 else PositionSide.LONG
 
     return MappedPosition(
         report=PositionStatusReport(
@@ -1435,6 +1493,7 @@ def parse_position_status_report(
             ts_init=ts_init,
         ),
         expired=expired,
+        leg=leg,
     )
 
 
