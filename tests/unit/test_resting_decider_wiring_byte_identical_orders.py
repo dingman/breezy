@@ -113,12 +113,17 @@ def test_a_bogus_shadow_decider_output_never_changes_what_reaches_maybe_submit(
 def test_a_raising_shadow_decider_still_never_reaches_maybe_submit_differently(
     tmp_path: Path,
 ) -> None:
-    """An even stronger form: if the decider call itself raised, Phase 0's
-    own `_hunt_tick` has no try/except around the decider call today by
-    design (a decider bug should be loud, never silently swallowed into a
-    live strategy the way `_forward_to_monitor` swallows a monitor bug) --
-    pinned here so a future change that wraps it in a blanket try/except
-    is a deliberate decision, not an accident."""
+    """Domain review of 87446c2, finding 1 (CORRECTED): the decider is
+    compute-and-persist ONLY (`resting_decider.py`'s own module docstring)
+    and must NEVER raise into the live hunt tick -- the opposite of what
+    this test used to pin. `_evaluate_shadow_rest` contains the exception
+    (mirrors `_forward_to_monitor`'s discipline): the tick completes, the
+    SAME `_maybe_submit` arguments as the real (non-raising) decider
+    reach it, and the tape row records `shadow_rest_reason=
+    "decider_error"` rather than losing the tick."""
+    real_strategy = _build_strategy(tmp_path / "real")
+    real_calls = _run_and_capture_submit_args(real_strategy)
+
     strategy = _build_strategy(tmp_path / "raising")
 
     def _raise(**_kwargs: object) -> ShadowRestTickResult:
@@ -126,10 +131,15 @@ def test_a_raising_shadow_decider_still_never_reaches_maybe_submit_differently(
 
     strategy._shadow_rest_decider.evaluate_tick = _raise  # type: ignore[method-assign]
 
-    strategy.on_data(_observation(temp_c_tenths=300, observed_at_ns=WINDOW_OPEN_NS - 1))
-    try:
-        strategy.on_quote_tick(_quote(INTERIOR_ID, ask="0.40", ts_event=WINDOW_OPEN_NS))
-    except RuntimeError as exc:
-        assert "shadow decider exploded" in str(exc)
-    else:
-        raise AssertionError("expected the decider's exception to propagate, not be swallowed")
+    raising_calls = _run_and_capture_submit_args(strategy)
+
+    assert len(real_calls) == 1
+    assert len(raising_calls) == 1
+    (real_iid, real_decision), = real_calls
+    (raising_iid, raising_decision), = raising_calls
+    assert real_iid == raising_iid
+    assert real_decision == raising_decision
+
+    tape_rows = strategy.offer_tape.records()
+    assert tape_rows, "expected the decider error to still produce a tape row"
+    assert tape_rows[-1].shadow_rest_reason == "decider_error"

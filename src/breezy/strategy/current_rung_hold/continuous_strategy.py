@@ -64,6 +64,7 @@ from breezy.strategy.current_rung_hold.exit_decider import ExitProposal
 from breezy.strategy.current_rung_hold.offer_tape import OfferTape, OfferTapeRecord
 from breezy.strategy.current_rung_hold.position_monitor import PositionMonitor
 from breezy.strategy.current_rung_hold.resting_decider import (
+    MAX_CLIMATE_DAYS_PER_STATION_LEG,
     ShadowRestingDecider,
     ShadowRestTickResult,
 )
@@ -134,6 +135,19 @@ _NS_PER_SECOND: Final[int] = 1_000_000_000
 #: recomputed here purely for logging (never for a decision).
 _ONE: Final[Decimal] = Decimal(1)
 _CLASS_NAME: Final[str] = "ContinuousRungHoldStrategy"
+#: Domain review of 87446c2, finding 1: `_evaluate_shadow_rest`'s
+#: containment fallback when the shadow decider raises -- a synthetic
+#: no-op tick, never persisted as a real REST/CANCEL, so the offer tape's
+#: `shadow_rest_*` fields still record SOMETHING (`"decider_error"`)
+#: rather than silently going stale mid-run.
+_SHADOW_REST_DECIDER_ERROR_RESULT: Final[ShadowRestTickResult] = ShadowRestTickResult(
+    state="NONE",
+    price=None,
+    margin=None,
+    price_secondary=None,
+    reason="decider_error",
+    fill_event=False,
+)
 #: S3b (plan NO_SIDE_EDGE_2026-09-14 S4/S5): the NO leg's Take is evaluated
 #: and gated every tick. FLIPPED to `False` by this commit (S5 Track C,
 #: the tail commit of `NO_SIDE_S5_EXEC_2026-09-14.md` §5) -- exit criteria
@@ -487,6 +501,12 @@ class ContinuousRungHoldStrategy(Strategy):
         self._shadow_rest_decider = ShadowRestingDecider()
         self._shadow_rest_summaries: dict[str, ShadowRestSummary] = {}
         self._shadow_rest_summary_dir = shadow_rest_summary_dir
+        #: Domain review of 87446c2, finding 2: counted evictions from the
+        #: hard cap `_evict_stale_shadow_rest_summaries` enforces on
+        #: `_shadow_rest_summaries` -- observable, never silent, so a
+        #: genuine leak (evictions climbing every day) is distinguishable
+        #: from ordinary multi-day overlap.
+        self._shadow_rest_summary_evictions = 0
 
     def _record_shadow_rest_tick(
         self,
@@ -512,30 +532,128 @@ class ContinuousRungHoldStrategy(Strategy):
         if result.fill_event:
             summary.fill_eligible_events += 1
 
+    def _evaluate_shadow_rest(
+        self,
+        *,
+        station: str,
+        climate_day_key: str,
+        leg: Literal["YES", "NO"],
+        best_ask: Decimal | None,
+        p_bound: Decimal | None,
+        staleness_ns: int | None,
+        cell_legal: bool,
+        sibling_leg_filled: bool,
+        fee_schedule_mismatch: bool = False,
+    ) -> ShadowRestTickResult:
+        """Compute-and-persist one tick's shadow resting-bid outcome,
+        CONTAINED (domain review of 87446c2, finding 1).
+
+        Mirrors `_forward_to_monitor`'s containment discipline: the shadow
+        decider is compute-and-persist ONLY (`resting_decider.py`'s own
+        module docstring) and must never raise into the live hunt tick. A
+        decider exception is caught here, logged, and reported as the
+        synthetic `_SHADOW_REST_DECIDER_ERROR_RESULT` (`"decider_error"`),
+        so a bug in observability code can never kill `_hunt_tick`.
+        """
+        try:
+            result = self._shadow_rest_decider.evaluate_tick(
+                station=station,
+                climate_day=climate_day_key,
+                leg=leg,
+                best_ask=best_ask,
+                p_bound=p_bound,
+                staleness_ns=staleness_ns,
+                stale_bound_ns=self._config.stale_observation_minutes * _NS_PER_MINUTE,
+                cell_legal=cell_legal,
+                sibling_leg_filled=sibling_leg_filled,
+                fee_schedule_mismatch=fee_schedule_mismatch,
+            )
+        except Exception as exc:  # the shadow decider must never affect the live hunt tick
+            message = "continuous_rung_hold: shadow-rest decider failed"
+            self.log.exception(message, exc)  # noqa: TRY401
+            result = _SHADOW_REST_DECIDER_ERROR_RESULT
+        self._record_shadow_rest_tick(
+            station=station, climate_day_key=climate_day_key, leg=leg, result=result,
+        )
+        self._drain_shadow_rest_evictions()
+        return result
+
+    def _drain_shadow_rest_evictions(self) -> None:
+        """Fold every eviction the decider self-enforced this tick
+        (`ShadowRestingDecider.evaluate_tick`'s own hard cap, domain review
+        finding 2) into `_shadow_rest_summaries` -- the evicted key's
+        CANCEL is recorded exactly as a real window-close would be, even
+        though the decider already bounded itself independent of this
+        call. Then re-checks the summary dict's own independent cap.
+        """
+        for (station, climate_day, leg), result in self._shadow_rest_decider.drain_evictions():
+            self._record_shadow_rest_tick(
+                station=station, climate_day_key=climate_day, leg=leg, result=result,
+            )
+        self._evict_stale_shadow_rest_summaries()
+
+    def _evict_stale_shadow_rest_summaries(self) -> None:
+        """Hard cap on `_shadow_rest_summaries` itself (domain review of
+        87446c2, finding 2), INDEPENDENT of the decider's own `_states`
+        bound: `_shadow_rest_summaries` grows one entry per ticked
+        `(station, climate_day, leg)` regardless of whether that key ever
+        rested, so a long run touching many climate_days for one
+        `(station, leg)` must never grow it past `MAX_CLIMATE_DAYS_PER_
+        STATION_LEG` either. Evictions are counted
+        (`_shadow_rest_summary_evictions`) and logged, never silent.
+        """
+        by_station_leg: dict[tuple[str, str], list[str]] = {}
+        for summary_key in self._shadow_rest_summaries:
+            station, climate_day, leg = summary_key.split("|")
+            by_station_leg.setdefault((station, leg), []).append(climate_day)
+        for (station, leg), days in by_station_leg.items():
+            if len(days) <= MAX_CLIMATE_DAYS_PER_STATION_LEG:
+                continue
+            for stale_day in sorted(days)[:-MAX_CLIMATE_DAYS_PER_STATION_LEG]:
+                stale_key = f"{station}|{stale_day}|{leg}"
+                if self._shadow_rest_summaries.pop(stale_key, None) is None:
+                    continue
+                self._shadow_rest_summary_evictions += 1
+                self.log.warning(
+                    "continuous_rung_hold: evicted stale shadow-rest summary "
+                    f"{stale_key!r} (evictions so far: "
+                    f"{self._shadow_rest_summary_evictions})",
+                )
+
     def _flush_shadow_rest_summaries(self) -> None:
         """`on_stop`: close every still-RESTING key (CANCEL `window_close`,
         recorded on the summary, never on the offer tape -- no tick exists
         for a window-close transition to ride on), then flush the run's
         tally to the optional parquet sidecar. Best-effort, mirroring every
         other optional sidecar in this package (`OfferTape`, `MarkBuffer`):
-        a write failure here must never raise out of `on_stop`.
+        a failure here must never raise out of `on_stop` (finding 3, domain
+        review of 87446c2 -- the whole body is contained, not just the
+        write call, so `exit_stack.close()`/clearing `self._latch` always
+        run regardless of what fails here). A successful write clears
+        `_shadow_rest_summaries` (finding 4) so a second `on_stop` call --
+        the shape every other `on_stop` idempotence test in this package
+        already pins -- writes nothing rather than re-writing a stale run.
         """
-        for (station, climate_day, leg), result in self._shadow_rest_decider.close_all_windows():
-            summary_key = f"{station}|{climate_day}|{leg}"
-            summary = self._shadow_rest_summaries.get(summary_key)
-            if summary is not None:
-                summary.still_resting_at_stop = True
-                summary.record_reason(result.reason)
-        if self._shadow_rest_summary_dir is None or not self._shadow_rest_summaries:
-            return
         try:
+            for (station, climate_day, leg), result in (
+                self._shadow_rest_decider.close_all_windows()
+            ):
+                summary_key = f"{station}|{climate_day}|{leg}"
+                summary = self._shadow_rest_summaries.get(summary_key)
+                if summary is not None:
+                    summary.still_resting_at_stop = True
+                    summary.record_reason(result.reason)
+            if self._shadow_rest_summary_dir is None or not self._shadow_rest_summaries:
+                return
             write_shadow_rest_summaries(
                 self._shadow_rest_summary_dir,
                 tuple(self._shadow_rest_summaries.values()),
                 now_ns=self.clock.timestamp_ns(),
             )
-        except OSError:
-            self.log.exception("continuous_rung_hold: shadow-rest summary flush failed")
+            self._shadow_rest_summaries.clear()
+        except Exception as exc:  # on_stop's cleanup must always complete
+            message = "continuous_rung_hold: shadow-rest summary flush failed"
+            self.log.exception(message, exc)  # noqa: TRY401
 
     def _submission_armed(self) -> bool:
         """Whether this strategy holds a real order-submission capability.
@@ -1364,22 +1482,19 @@ class ContinuousRungHoldStrategy(Strategy):
             yes_admission_refusal is not None
             and yes_admission_refusal.reason == SIBLING_LEG_TRADED_REASON
         )
-        shadow_yes_result = self._shadow_rest_decider.evaluate_tick(
+        shadow_yes_fee_schedule_mismatch = (
+            isinstance(decision, Refuse) and decision.reason == "fee_schedule_mismatch"
+        )
+        shadow_yes_result = self._evaluate_shadow_rest(
             station=station,
-            climate_day=climate_day_key,
+            climate_day_key=climate_day_key,
             leg="YES",
             best_ask=ask,
             p_bound=offer_p_bound,
             staleness_ns=staleness_ns,
-            stale_bound_ns=self._config.stale_observation_minutes * _NS_PER_MINUTE,
             cell_legal=not illegal,
             sibling_leg_filled=shadow_yes_sibling_filled,
-        )
-        self._record_shadow_rest_tick(
-            station=station,
-            climate_day_key=climate_day_key,
-            leg="YES",
-            result=shadow_yes_result,
+            fee_schedule_mismatch=shadow_yes_fee_schedule_mismatch,
         )
         self.offer_tape.append(
             OfferTapeRecord(
@@ -1606,22 +1721,19 @@ class ContinuousRungHoldStrategy(Strategy):
             shadow_no_cell_legal = not (
                 isinstance(no_decision, Refuse) and no_decision.reason == "illegal_cell"
             )
-            shadow_no_result = self._shadow_rest_decider.evaluate_tick(
+            shadow_no_fee_schedule_mismatch = (
+                isinstance(no_decision, Refuse) and no_decision.reason == "fee_schedule_mismatch"
+            )
+            shadow_no_result = self._evaluate_shadow_rest(
                 station=station,
-                climate_day=climate_day_key,
+                climate_day_key=climate_day_key,
                 leg="NO",
                 best_ask=no_best_ask,
                 p_bound=row_p_bound,
                 staleness_ns=staleness_ns,
-                stale_bound_ns=self._config.stale_observation_minutes * _NS_PER_MINUTE,
                 cell_legal=shadow_no_cell_legal,
                 sibling_leg_filled=shadow_no_sibling_filled,
-            )
-            self._record_shadow_rest_tick(
-                station=station,
-                climate_day_key=climate_day_key,
-                leg="NO",
-                result=shadow_no_result,
+                fee_schedule_mismatch=shadow_no_fee_schedule_mismatch,
             )
             self.offer_tape.append(
                 OfferTapeRecord(

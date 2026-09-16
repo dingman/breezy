@@ -19,10 +19,11 @@ import pytest
 from breezy.strategy.current_rung_hold import resting_decider as resting_decider_module
 from breezy.strategy.current_rung_hold.resting_decider import (
     MARGIN_PRIMARY,
+    MAX_CLIMATE_DAYS_PER_STATION_LEG,
     ShadowRestingDecider,
     compute_p_star,
-    edge_maker,
-    fee_maker,
+    edge_rest_conservative,
+    fee_rest_conservative,
 )
 
 _STATION = "SFO"
@@ -85,21 +86,71 @@ def test_a_second_module_referencing_the_banned_names_still_trips_the_scan() -> 
 
 
 # ---------------------------------------------------------------------------
-# edge_maker / fee_maker / compute_p_star
+# edge_rest_conservative / fee_rest_conservative / compute_p_star
+#
+# Domain review of 87446c2, finding 5: priced at the TAKER coefficient
+# (PREREG v5 §3b / plan Rev 2 §1.2), never the maker rebate, until a
+# wire-observed maker fill retires the pin.
 # ---------------------------------------------------------------------------
 
 
-def test_fee_maker_is_a_rebate_negative_for_any_interior_price() -> None:
-    assert fee_maker(Decimal("0.50")) < 0
-    assert fee_maker(Decimal("0.80")) < 0
+def test_fee_rest_conservative_is_a_cost_positive_for_any_interior_price() -> None:
+    assert fee_rest_conservative(Decimal("0.50")) > 0
+    assert fee_rest_conservative(Decimal("0.80")) > 0
 
 
-def test_edge_maker_is_larger_than_the_taker_break_even_gap_at_the_same_price() -> None:
+def test_edge_rest_conservative_is_smaller_than_the_raw_price_gap() -> None:
     p_bound = Decimal("0.70")
     price = Decimal("0.60")
-    edge = edge_maker(p_bound, price)
-    # A rebate means cost < price, so edge > p_bound - price.
-    assert edge > p_bound - price
+    edge = edge_rest_conservative(p_bound, price)
+    # A cost means the priced fee > 0, so edge < p_bound - price.
+    assert edge < p_bound - price
+
+
+def test_compute_p_star_prices_the_documented_taker_tick_exactly() -> None:
+    """Finding 5: computed and asserted against a hand-derived number
+    (theta=0.06, the documented taker coefficient), not merely cross-
+    checked against the module's own formula."""
+    p_bound = Decimal("0.90")
+    best_ask = Decimal("0.80")
+    margin = Decimal("0.02")
+    price, reason = compute_p_star(p_bound, best_ask, margin)
+    assert reason is None
+    # ceiling_effective = min(0.95, 0.80 - 0.01) = 0.79; at p=0.79 the
+    # taker-priced edge (0.90 - 0.79 - 0.06*0.79*0.21 = 0.100046) already
+    # clears the 0.02 margin, so 0.79 is the highest admissible tick.
+    assert price == Decimal("0.79")
+
+
+def test_taker_priced_p_star_is_strictly_below_the_rebate_priced_p_star() -> None:
+    """Finding 5: a case where the conservative (taker) pricing and the
+    rebate pricing this module used to use land on DIFFERENT ticks --
+    proof the rename+repricing is load-bearing, not cosmetic."""
+    p_bound = Decimal("0.81")
+    best_ask = Decimal("0.80")
+    margin = Decimal("0.02")
+
+    taker_price, taker_reason = compute_p_star(p_bound, best_ask, margin)
+    assert taker_reason is None
+    assert taker_price == Decimal("0.77")
+
+    def _rebate_edge(p_bound: Decimal, price: Decimal) -> Decimal:
+        rebate_fee = Decimal("-0.0125") * price * (Decimal(1) - price)
+        return p_bound - (price + rebate_fee)
+
+    # Hand-rolled rebate-priced search, independent of this module's own
+    # (now taker-only) `edge_rest_conservative` -- a real cross-check, not
+    # a tautology against the code under test.
+    rebate_price = None
+    candidate = Decimal("0.79")
+    while candidate >= Decimal("0.05"):
+        if _rebate_edge(p_bound, candidate) >= margin:
+            rebate_price = candidate
+            break
+        candidate -= Decimal("0.01")
+    assert rebate_price == Decimal("0.79")
+    assert taker_price is not None
+    assert taker_price < rebate_price
 
 
 def test_compute_p_star_returns_the_highest_tick_price_meeting_the_margin() -> None:
@@ -211,6 +262,7 @@ def test_reprice_fires_when_p_bound_changes_the_computed_p_star() -> None:
     ("kwargs", "expected_reason"),
     [
         ({"family_halted": True}, "halt"),
+        ({"fee_schedule_mismatch": True}, "fee_schedule_mismatch"),
         ({"sibling_leg_filled": True}, "sibling_leg_filled"),
         ({"cell_legal": False}, "rung_dead"),
         ({"in_window": False}, "window_close"),
@@ -457,6 +509,78 @@ def test_a_station_and_no_station_do_not_share_state() -> None:
     )
     assert decider.is_resting("SFO", _DAY, "YES")
     assert not decider.is_resting("MIA", _DAY, "YES")
+
+
+# ---------------------------------------------------------------------------
+# Hard cap on `_states` (domain review of 87446c2, finding 2): a missed
+# window-close signal must never let `_states` grow past
+# `MAX_CLIMATE_DAYS_PER_STATION_LEG` climate_days per (station, leg).
+# ---------------------------------------------------------------------------
+
+
+def _rest(decider: ShadowRestingDecider, climate_day: str) -> None:
+    decider.evaluate_tick(
+        station=_STATION,
+        climate_day=climate_day,
+        leg="YES",
+        best_ask=Decimal("0.90"),
+        p_bound=Decimal("0.90"),
+        staleness_ns=0,
+        stale_bound_ns=_STALE_BOUND_NS,
+    )
+
+
+def test_ten_consecutive_climate_days_never_grow_states_past_the_cap() -> None:
+    decider = _decider()
+    days = [f"2026-09-{d:02d}" for d in range(1, 11)]
+    for day in days:
+        _rest(decider, day)
+
+    assert len(decider) <= MAX_CLIMATE_DAYS_PER_STATION_LEG
+    # The oldest days were evicted; only the newest survive as RESTING.
+    for stale_day in days[:-MAX_CLIMATE_DAYS_PER_STATION_LEG]:
+        assert not decider.is_resting(_STATION, stale_day, "YES")
+    for fresh_day in days[-MAX_CLIMATE_DAYS_PER_STATION_LEG:]:
+        assert decider.is_resting(_STATION, fresh_day, "YES")
+
+
+def test_evicted_climate_days_appear_in_the_drained_eviction_buffer() -> None:
+    decider = _decider()
+    days = [f"2026-09-{d:02d}" for d in range(1, 11)]
+    for day in days:
+        _rest(decider, day)
+
+    evicted = decider.drain_evictions()
+    evicted_days = {climate_day for (_station, climate_day, _leg), _result in evicted}
+    assert evicted_days == set(days[:-MAX_CLIMATE_DAYS_PER_STATION_LEG])
+    assert all(result.reason == "window_close" for _key, result in evicted)
+    # Drained once -- a second drain is empty until the next eviction.
+    assert decider.drain_evictions() == ()
+
+
+def test_yes_and_no_legs_are_capped_independently() -> None:
+    decider = _decider()
+    for d in range(1, 11):
+        day = f"2026-09-{d:02d}"
+        decider.evaluate_tick(
+            station=_STATION,
+            climate_day=day,
+            leg="YES",
+            best_ask=Decimal("0.90"),
+            p_bound=Decimal("0.90"),
+            staleness_ns=0,
+            stale_bound_ns=_STALE_BOUND_NS,
+        )
+        decider.evaluate_tick(
+            station=_STATION,
+            climate_day=day,
+            leg="NO",
+            best_ask=Decimal("0.80"),
+            p_bound=Decimal("0.80"),
+            staleness_ns=0,
+            stale_bound_ns=_STALE_BOUND_NS,
+        )
+    assert len(decider) <= 2 * MAX_CLIMATE_DAYS_PER_STATION_LEG
 
 
 def test_yes_and_no_legs_of_the_same_station_day_do_not_share_state() -> None:
