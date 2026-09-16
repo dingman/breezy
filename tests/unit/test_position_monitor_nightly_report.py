@@ -977,3 +977,38 @@ class TestCli:
         assert payload["total_positions"] == 1
         assert sorted(p.name for p in summaries_dir.glob("*")) == summaries_before
         assert sorted(p.name for p in scored_dir.glob("*")) == scored_before
+
+    def test_scored_trials_under_a_per_family_subdirectory_are_still_joined(
+        self, tmp_path: Path, report_mod: ModuleType
+    ) -> None:
+        """Defect fix (2026-09-16): `score-live-trials-run.sh` now writes
+        each REGISTERED family's rows to its OWN `<store>/<family_id>/`
+        subdirectory (L-38, `cbd5fec`) rather than directly under
+        `--scored-trials-dir` -- the join must still find the row."""
+        from breezy.persistence.scored_trial_store import write_scored_trials
+        from breezy.strategy.current_rung_hold.monitor_store import write_monitor_summaries
+
+        summaries_dir = tmp_path / "summaries"
+        scored_dir = tmp_path / "scored"
+        out_path = tmp_path / "out" / "report.json"
+
+        write_monitor_summaries(summaries_dir, [_summary(trial_id="A")], now_ns=1_000_000_000)
+        write_scored_trials(
+            scored_dir / "pm_us_crh_v2", [_trial(trial_id="A", held=True)], now_ns=1_000_000_000
+        )
+
+        exit_code = report_mod.main(
+            [
+                "--summaries-dir",
+                str(summaries_dir),
+                "--scored-trials-dir",
+                str(scored_dir),
+                "--out",
+                str(out_path),
+            ]
+        )
+
+        assert exit_code == 0
+        payload = json.loads(out_path.read_text())
+        assert payload["total_positions"] == 1
+        assert payload["settled_from_scored_trials"] == 1

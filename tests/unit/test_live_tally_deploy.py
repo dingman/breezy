@@ -263,3 +263,131 @@ def test_unset_state_db_env_var_is_nonzero(tmp_path: Path) -> None:
     result = _run_wrapper(tmp_path, stub_python=stub, set_state_db=False)
     assert result.returncode != 0
     assert not _tally_calls(argv_log)
+
+
+# --- L-38 defect fix (2026-09-16): per-family scored-trial subdirectories ---
+#
+# `live_family_tally.py` itself is v1-BINDING/PREREG-v1-frozen
+# (`tests/unit/test_family_tally_v2.py::test_the_v1_tally_is_untouched`), so
+# the fix lives entirely in this wrapper: it pools every subdirectory's (plus
+# any legacy top-level) `scored_trials_*.parquet` files into a throwaway
+# symlink directory and passes THAT positional arg to the unmodified CLI,
+# then appends a "by family: ..." breakdown line to the report the CLI
+# already wrote. The stub below simulates the real script's own behavior
+# just enough to prove this: it counts matching filenames in the positional
+# arg it actually received (mirroring `read_scored_trials`'s own non-
+# recursive glob) and writes that count as a "row count:" line to
+# `--output`.
+
+
+def _touch_scored_trial_file(directory: Path, name: str) -> None:
+    directory.mkdir(parents=True, exist_ok=True)
+    (directory / name).write_bytes(b"")
+
+
+def _make_report_stub(tmp_path: Path, *, tally_exit: int = 0) -> tuple[Path, Path]:
+    argv_log = tmp_path / "argv_log.txt"
+    script = f"""#!/usr/bin/env bash
+ARGV_LOG={shlex.quote(str(argv_log))}
+case "$*" in
+  *"-m breezy.runtime.exec_state_db_path --check"*)
+    echo "CHECK $*" >> "$ARGV_LOG"
+    echo "MATCH"
+    exit 0
+    ;;
+  *"live_family_tally.py"*)
+    echo "TALLY $*" >> "$ARGV_LOG"
+    store_arg="$2"
+    out_arg=""
+    prev=""
+    for a in "$@"; do
+      if [ "$prev" = "--output" ]; then out_arg="$a"; fi
+      prev="$a"
+    done
+    count=$(find -L "$store_arg" -maxdepth 1 -type f \\
+      -name 'scored_trials_*.parquet' 2>/dev/null | wc -l)
+    if [ -n "$out_arg" ]; then
+      mkdir -p "$(dirname "$out_arg")"
+      printf '# Live family tally\\n\\nrow count: %s (excluded: 0)\\n' "$count" > "$out_arg"
+    fi
+    exit {tally_exit}
+    ;;
+  *)
+    echo "UNKNOWN $*" >> "$ARGV_LOG"
+    exit 0
+    ;;
+esac
+"""
+    stub = tmp_path / "stub_report_python.sh"
+    stub.write_text(script)
+    stub.chmod(0o755)
+    return stub, argv_log
+
+
+def _report_path(tmp_path: Path) -> Path:
+    return _out_dir(tmp_path) / f"live_family_tally_{_stamp()}.md"
+
+
+def test_two_family_subdirectories_pool_to_the_union_with_a_breakdown_line(
+    tmp_path: Path,
+) -> None:
+    _write_marker(tmp_path)
+    _write_counter_json(tmp_path)
+    store_dir = tmp_path / "scored_trials"
+    _touch_scored_trial_file(store_dir / "pm_us_crh_v2", "scored_trials_a.parquet")
+    _touch_scored_trial_file(store_dir / "pm_us_crh_v2", "scored_trials_b.parquet")
+    _touch_scored_trial_file(store_dir / "pm_us_crh_v2", "scored_trials_c.parquet")
+    _touch_scored_trial_file(store_dir / "kalshi_crh_v1", "scored_trials_d.parquet")
+    stub, argv_log = _make_report_stub(tmp_path)
+
+    result = _run_wrapper(tmp_path, stub_python=stub)
+
+    assert result.returncode == 0, result.stderr
+    assert len(_tally_calls(argv_log)) == 1
+    report = _report_path(tmp_path).read_text()
+    assert "row count: 4" in report
+    assert "by family: " in report
+    assert "pm_us_crh_v2=3" in report
+    assert "kalshi_crh_v1=1" in report
+
+
+def test_legacy_top_level_only_layout_passes_store_dir_through_unchanged(
+    tmp_path: Path,
+) -> None:
+    _write_marker(tmp_path)
+    _write_counter_json(tmp_path)
+    store_dir = tmp_path / "scored_trials"
+    _touch_scored_trial_file(store_dir, "scored_trials_legacy.parquet")
+    stub, argv_log = _make_report_stub(tmp_path)
+
+    result = _run_wrapper(tmp_path, stub_python=stub)
+
+    assert result.returncode == 0, result.stderr
+    calls = _tally_calls(argv_log)
+    assert len(calls) == 1
+    parts = calls[0].split()
+    # No subdirectories exist -- the positional store-dir arg is passed
+    # through UNCHANGED (byte-identical to the pre-fix wrapper), never
+    # substituted with a pool directory.
+    assert parts[2] == str(store_dir)
+    report = _report_path(tmp_path).read_text()
+    assert "row count: 1" in report
+
+
+def test_an_empty_store_dir_is_still_underpowered_not_broken(tmp_path: Path) -> None:
+    _write_marker(tmp_path)
+    _write_counter_json(tmp_path)
+    store_dir = tmp_path / "scored_trials"
+    store_dir.mkdir(parents=True, exist_ok=True)
+    stub, argv_log = _make_report_stub(tmp_path)
+
+    result = _run_wrapper(tmp_path, stub_python=stub)
+
+    assert result.returncode == 0, result.stderr
+    calls = _tally_calls(argv_log)
+    assert len(calls) == 1
+    parts = calls[0].split()
+    assert parts[2] == str(store_dir)
+    report = _report_path(tmp_path).read_text()
+    assert "row count: 0" in report
+    assert "by family:" not in report

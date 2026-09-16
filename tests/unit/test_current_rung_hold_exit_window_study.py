@@ -20,6 +20,7 @@ import sys
 from decimal import Decimal
 from pathlib import Path
 
+import pytest
 from nautilus_trader.model.data import BookOrder, OrderBookDepth10
 from nautilus_trader.model.enums import OrderSide
 from nautilus_trader.model.identifiers import InstrumentId
@@ -34,6 +35,7 @@ _SCRIPTS_ANALYSIS_DIR = _REPO_ROOT / "scripts" / "analysis"
 if str(_SCRIPTS_ANALYSIS_DIR) not in sys.path:
     sys.path.insert(0, str(_SCRIPTS_ANALYSIS_DIR))
 
+import current_rung_hold_exit_window_study as study_mod
 import exit_window_core as ewc
 import exit_window_report as ewr
 
@@ -420,3 +422,41 @@ def test_markdown_row_for_a_leg_correct_no_loser_shows_negative_hold_pnl() -> No
     markdown = ewr.render_markdown((row,), ewr.build_summary((row,)))
     assert str(row.hold_pnl) in markdown
     assert f"sum_hold_pnl={row.hold_pnl}" in markdown
+
+
+def test_run_exit_window_study_reads_scored_trials_via_the_pooled_reader(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Defect fix (2026-09-16): `read_scored_trials` alone only sees a
+    scored-trial store's LEGACY top-level parquet files -- since L-38
+    (`cbd5fec`), each REGISTERED family's rows live under their own
+    `<scored_trials_dir>/<family_id>/` subdirectory. `stations=()` reaches
+    the `scored_by_trial_id` build (the line under test) without ever
+    opening `state_db` or a real quote-tape catalog (the `for city in
+    stations` loop -- the only code that touches either -- never runs), so
+    this stays a cheap wiring check rather than a full end-to-end run.
+    """
+    calls: list[Path] = []
+    original = study_mod.read_scored_trials_pooled
+
+    def _spy(base_dir: Path) -> object:
+        calls.append(base_dir)
+        return original(base_dir)
+
+    monkeypatch.setattr(study_mod, "read_scored_trials_pooled", _spy)  # type: ignore[attr-defined]
+
+    scored_dir = tmp_path / "scored"
+    empty_catalog = tmp_path / "catalog"
+    empty_catalog.mkdir()
+
+    rows, missing = study_mod.run_exit_window_study(
+        state_db=tmp_path / "state.sqlite",
+        stations=(),
+        since_climate_day="2026-01-01",
+        catalog_root=empty_catalog,
+        scored_trials_dir=scored_dir,
+    )
+
+    assert calls == [scored_dir]
+    assert rows == ()
+    assert missing == ()
