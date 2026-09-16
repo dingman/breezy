@@ -440,3 +440,18 @@ Findings that bind INC-E2/E3: (1) the venue nets a held NO as a **short of YES**
 | NO + `ORDER_ACTION_SELL` @ instrument 0.01 (wire 0.99) | **`ORDER_SIDE_BUY`** | `ORDER_INTENT_SELL_SHORT` | NO | 0.99 |
 
 Binding correction to INC-E2: the exit echo table is (YES close → `SELL`/`SELL_LONG`), (NO close → **`BUY`**/`SELL_SHORT`) — the exact mirror of the entry table (NO buy echoes `SELL`/`BUY_SHORT`). The NO-close echo shares `side=BUY` with a YES-buy echo and differs only by `intent`, so `assert_exit_echo_matches_leg` must check the (side, intent) PAIR. The `SELL_LONG`/`SELL_SHORT` tokens live only in `leg_prices.py` (outside `exec/`), per `RULING_x3_sell_long_sell_short_2026-09-16.md`.
+
+### Appendix A.3 — §4 step 0 RESULT (exit-window study, run `20260916_initial`, 2026-09-16 ~04:30Z; UNCALIBRATED, N=5)
+Source: `~/.local/share/breezy/derived/exit_window_study/20260916_initial/exit_window_study.md` (staged Depth10 for 4/5 rows because the parquet catalog is stranded before the fills, ING-1; IEM obs fetched into the fixed-window cache). SFO 2026-09-11 excluded (v2 family); LAX has no fills.
+
+| position | leg | fill | first THREATENED | first DEAD | last executable exit | hold pnl | R-DEAD | R-THREAT | R-BEST (oracle) |
+|---|---|---|---|---|---|---|---|---|---|
+| MDW [80,81] 09-15 | YES | 0.11 | — | 19:40Z | 18:07Z | −0.12 | unfillable | no signal | exit @0.11 → −0.02 |
+| MDW [82,83] 09-15 | YES | 0.24 | — | 20:10Z | none after fill (catalog) | −0.25 | unfillable | no signal | no signal |
+| MIA 09-13 | YES | 0.70 | — | — | 15:35Z | +0.30 | no signal | no signal | exit @0.99 → +0.29 |
+| MIA [92,93] 09-15 | NO | 0.09 | 18:22Z | 23:05Z | 19:36Z | **+0.91 per the study's inference** | unfillable | exit @0.02 → −0.07 | exit @0.06 → −0.03 |
+| SFO [71,72] 09-15 | YES | 0.44 | — | 20:20Z | 20:12Z | −0.45 | unfillable | no signal | exit @0.02 → −0.43 |
+
+Counters: THREATENED before the exit side emptied 1/5; DEAD before the exit side emptied **0/5**; median minutes from last executable exit to DEAD +93; Σ hold +0.39, Σ R-DEAD +0.39 (never fires), Σ R-THREAT **−0.59**, Σ R-BEST −0.44.
+
+Reading against the §4 step 0 arming gates: **R-DEAD fails** (0 of 5 fillable); **R-THREAT fails** (fires 1 of 5, and that firing is a premature exit if the MIA NO leg is a settlement winner). **OPEN CONTRADICTION to resolve before any conclusion is final:** the study's `infer_preliminary_settlement` treats a daily high of 93 on rung `gte92lt93` as OUTSIDE (NO wins, +0.91), while the shadow monitor classified the same position as "inside the rung after the peak" (NO dead) and this morning's market book (YES bid 0.99, no ask) prices YES as the winner. One of these boundary conventions is wrong; a read-only verification across scorer/monitor/study/venue rule text is in progress. Until it lands, the MIA row's pnl sign is unknown and the monitor's boundary treatment is suspect (L-44-class defect, at the rung top).
