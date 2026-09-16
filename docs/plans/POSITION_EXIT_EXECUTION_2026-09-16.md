@@ -418,3 +418,15 @@ spend (§5.8), so neither cap needs a new value, no new operator-reserved contro
 | Live exec client has no close-position coroutine; `_close_position` sits in the widened (rejected) cage pin | code-enforced | tests/unit/test_cage_rule_constants_are_pinned.py:810-848 |
 
 Top unknowns the §4 protocol must retire, in order: (1) how a held NO position is signed and priced on `/v1/portfolio/positions` (the positions endpoint has NEVER returned a non-empty body here — capture it while the four 09-15 positions are still open, before 12:00Z settlement); (2) whether `outcomeSide`+`action=ORDER_ACTION_SELL` is accepted on the intent-less 10-key body and what it echoes (preview both YES+SELL and NO+SELL); (3) proceeds/fee sign on a closing fill and whether a priced IOC SELL or `/close-position` is the venue's expected close.
+
+### Appendix A.1 — §4 step 0b RETIRED (2026-09-16 ~03:40Z, value capture of the four open positions)
+`scripts/venue/polymarket_us_positions_value_capture.py` → `PRIVATE_v1_portfolio_positions_open_positions_20260916.positions.json` (gitignored PRIVATE_ artefact; HTTP 200, 4 positions, redacted keys `eventId`, `id`).
+
+| slug | outcome | netPosition | qtyAvailable | qtyBought / qtySold | avgPx | cost | cashValue | realized | expired |
+|---|---|---|---|---|---|---|---|---|---|
+| tc-temp-mdwhigh-2026-09-15-gte80lt81f | Yes | 1 | 1 | 1 / 0 | 0.1200 | 0.1200 | 0.0100 | 0 | False |
+| tc-temp-mdwhigh-2026-09-15-gte82lt83f | Yes | 1 | 1 | 1 / 0 | 0.2500 | 0.2500 | 0.0100 | 0 | False |
+| tc-temp-miahigh-2026-09-15-gte92lt93f | No | **−1** | **−1** | **0 / 1** | 0.0900 | 0.0900 | 0.0100 | 0 | False |
+| tc-temp-sfohigh-2026-09-15-gte71lt72f | Yes | 1 | 1 | 1 / 0 | 0.4500 | 0.4500 | 0.0100 | 0 | False |
+
+Findings that bind INC-E2/E3: (1) the venue nets a held NO as a **short of YES** (`netPosition −1`, `qtySold 1`), while Breezy/Nautilus holds it as a LONG on the `^no` leg instrument — the net-long guard reasons per Breezy instrument and stays correct, but any reconciliation of venue `netPosition` against Breezy positions must apply the leg sign (`marketMetadata.outcome`) before comparing; (2) `avgPx`/`cost` are **fee-inclusive** and denominated in the HELD leg (YES 0.12 = 0.11 + 0.01 fee; NO 0.09); (3) `cashValue` is the venue's mark (0.01 on all four = the settled-as-lost expectation); (4) the close of a NO must therefore be the order that brings `netPosition −1 → 0` — expected `SELL_SHORT` per the docs; the §4 step 1 preview capture decides.
