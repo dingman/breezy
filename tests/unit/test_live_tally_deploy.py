@@ -353,7 +353,7 @@ def test_two_family_subdirectories_pool_to_the_union_with_a_breakdown_line(
     assert "row count: 3" in report
     assert "by family: " in report
     assert "pm_us_crh_v2=3" in report
-    assert "kalshi_crh_v1=1 (skipped)" in report
+    assert "kalshi_crh_v1=1 files (skipped; rows in family_tally_v2_kalshi_crh_v1)" in report
 
 
 def test_legacy_top_level_only_layout_passes_store_dir_through_unchanged(
@@ -404,7 +404,11 @@ def test_an_empty_store_dir_is_still_underpowered_not_broken(tmp_path: Path) -> 
 # outside `current_rung_hold/trial/`. The wrapper now pools only the family
 # subdirectories whose manifest `trial_id_prefix` is accepted by the v1
 # tally, skips the rest (logged), and lists both pooled AND skipped
-# families -- with row counts -- on the additive "by family:" line.
+# families -- with pooled families showing row counts and skipped families
+# showing file counts (explicitly labeled "files", never conflated with
+# rows -- the frozen v1 reader dedupes by trial_id, a skipped family's
+# per-file row count is never computed) -- on the additive "by family:"
+# line.
 #
 # `BREEZY_LIVE_TALLY_FAMILIES_DIR` (mirroring family-tally-v2-run.sh's own
 # `BREEZY_FAMILY_TALLY_V2_FAMILIES_DIR` override) points the wrapper at a
@@ -468,7 +472,7 @@ def test_a_v3_prefixed_family_is_skipped_not_pooled_and_the_v1_family_still_repo
     report = _report_path(tmp_path).read_text()
     assert "row count: 0" in report
     assert "by family: " in report
-    assert "pm_us_crh_cont=3 (skipped)" in report
+    assert "pm_us_crh_cont=3 files (skipped; rows in family_tally_v2_pm_us_crh_cont)" in report
     log = (tmp_path / "derived" / "live_tally.log").read_text()
     assert "SKIP pm_us_crh_cont: prefix not v1-live; see family_tally_v2_pm_us_crh_cont" in log
 
@@ -494,4 +498,4 @@ def test_a_v1_prefixed_family_pools_normally_alongside_a_skipped_sibling(
     report = _report_path(tmp_path).read_text()
     assert "row count: 2" in report
     assert "pm_us_crh_v2=2" in report
-    assert "pm_us_crh_cont=1 (skipped)" in report
+    assert "pm_us_crh_cont=1 files (skipped; rows in family_tally_v2_pm_us_crh_cont)" in report

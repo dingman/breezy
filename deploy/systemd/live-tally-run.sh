@@ -41,9 +41,10 @@
 # `assert_live_only` refuses outright, failing the WHOLE run. Only a
 # subdirectory whose manifest `trial_id_prefix` is accepted by the v1 tally
 # (`current_rung_hold/trial/`) is now pooled; every other family
-# subdirectory is skipped (and logged, and still listed with its row count
-# on the additive "by family:" line) rather than fatally refused or
-# silently dropped.
+# subdirectory is skipped (and logged, and still listed with its FILE
+# count -- explicitly labeled "files", never rows, since a skipped
+# family's own row count is never computed here -- on the additive
+# "by family:" line) rather than fatally refused or silently dropped.
 set -uo pipefail
 
 REPO=/home/jon/breezy
@@ -190,14 +191,23 @@ print(_LIVE_TRIAL_ID_PREFIX)
     # Never pooled -- the frozen v1 tally's assert_live_only would refuse
     # the WHOLE run on the first row whose trial_id carries a non-v1
     # prefix, so a mismatched family is counted and logged here instead.
+    #
+    # Defect fix (measured 2026-09-16, live_tally.log): this count is a
+    # PARQUET FILE count (one `find`, non-recursive), never a row count --
+    # a real tally's `row count:` line dedupes by trial_id via
+    # `read_scored_trials`, so a skipped family with N files can report a
+    # different row count in its own `family_tally_v2_<family>` output.
+    # Labeling this "N (skipped)" reads as N rows and is misleading; label
+    # it "N files (skipped; ...)" and point at the family's own row-count
+    # report instead of silently implying this number is rows.
     local src="$1" fam="$2" n
     n=$(find "$src" -maxdepth 1 -type f -name 'scored_trials_*.parquet' 2>/dev/null | wc -l)
     if [ "$n" -gt 0 ]; then
       say "SKIP $fam: prefix not v1-live; see family_tally_v2_$fam"
       if [ -n "$SKIP_BREAKDOWN" ]; then
-        SKIP_BREAKDOWN="$SKIP_BREAKDOWN, $fam=$n (skipped)"
+        SKIP_BREAKDOWN="$SKIP_BREAKDOWN, $fam=$n files (skipped; rows in family_tally_v2_$fam)"
       else
-        SKIP_BREAKDOWN="$fam=$n (skipped)"
+        SKIP_BREAKDOWN="$fam=$n files (skipped; rows in family_tally_v2_$fam)"
       fi
     fi
   }
