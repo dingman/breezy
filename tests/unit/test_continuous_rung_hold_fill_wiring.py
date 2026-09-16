@@ -1857,3 +1857,236 @@ def test_a_second_yes_rung_is_refused_when_a_prior_leg_has_no_recorded_fee(
         )
         is False
     )
+
+
+# ---------------------------------------------------------------------------
+# RULING (option B, domain review of a9fd0fb): `_consume_or_flag_duplicate`
+# now looks up the fill's own `DurableFillRecord` via
+# `TrialDayLatch.iter_fill_records` (the SAME read-only accessor the
+# never-arm walk already uses) and supplies a real per-contract fee when
+# that record is fee-reconciled -- fixing the de-facto one-position-per-
+# station bug the docstring on
+# `test_a_second_yes_rung_is_refused_when_a_prior_leg_has_no_recorded_fee`
+# above describes.
+# ---------------------------------------------------------------------------
+
+
+def _write_durable_fill_record(
+    store_path: Path,
+    *,
+    instrument_id: InstrumentId,
+    venue_order_id: str,
+    cumulative_qty: Decimal,
+    cumulative_fee: Decimal,
+    fee_reconciled: bool,
+    cumulative_cost: Decimal,
+) -> None:
+    """Writes one durable fill record through the SAME store keys the real
+    exec client (`client.py::record_fill`) writes -- mirrors
+    `test_fill_walk_consumed_trial_uses_the_walk_reason`'s own setup, so a
+    strategy started AFTER this call reads it back exactly as it would in
+    production (used by the never-arm-walk-level tests). BEFORE-start only
+    -- opens (and releases) its own transient flock, so it must never be
+    called once a strategy sharing ``store_path`` already holds the SAME
+    flock open (see ``_write_durable_fill_record_into`` for that case)."""
+    store = SqliteStateStore(store_path)
+    with open_submit_intent_latch(store, store_path):
+        _write_durable_fill_record_into(
+            store,
+            instrument_id=instrument_id,
+            venue_order_id=venue_order_id,
+            cumulative_qty=cumulative_qty,
+            cumulative_fee=cumulative_fee,
+            fee_reconciled=fee_reconciled,
+            cumulative_cost=cumulative_cost,
+        )
+    store.close()
+
+
+def _write_durable_fill_record_into(
+    store: SqliteStateStore,
+    *,
+    instrument_id: InstrumentId,
+    venue_order_id: str,
+    cumulative_qty: Decimal,
+    cumulative_fee: Decimal,
+    fee_reconciled: bool,
+    cumulative_cost: Decimal,
+) -> None:
+    """Writes one durable fill record into an ALREADY-OPEN store -- for a
+    strategy that is already started and holds ``store_path``'s flock, so a
+    fresh ``open_submit_intent_latch`` on the same path would deadlock
+    against the strategy's own held lock. Writes via the strategy's own
+    ``strategy._latch._store`` (the exact object the real exec client would
+    share through the SAME ``intent_latch`` binding in production), never a
+    second connection."""
+    fill_record = DurableFillRecord(
+        venue_order_id=venue_order_id,
+        client_order_id=f"C-{venue_order_id}",
+        instrument_id=str(instrument_id),
+        order_side="BUY",
+        cumulative_qty=cumulative_qty,
+        cumulative_cost=cumulative_cost,
+        cumulative_fee=cumulative_fee,
+        fee_reconciled=fee_reconciled,
+        ts_event=WINDOW_OPEN_NS,
+    )
+    store.set(
+        f"{FILL_INDEX_KEY_PREFIX}{instrument_id}",
+        json.dumps([venue_order_id]).encode("utf-8"),
+    )
+    store.set(f"{FILL_KEY_PREFIX}{venue_order_id}", fill_record.to_bytes())
+
+
+def test_a_reconciled_durable_fill_record_supplies_the_fee_and_admits_the_second_rung(
+    store_path: Path,
+    interior_instrument: BinaryOption,
+    open_upper_instrument: BinaryOption,
+) -> None:
+    """(1) A create-path fill whose durable record is `fee_reconciled=True`
+    now carries a real per-contract fee on the `TrialDayRecord` -- MDW
+    09-15 shape, asks 0.11 then 0.24 -- so `station_day_admission`'s Sigma-q
+    is no longer UNKNOWN and a genuinely different second YES rung on the
+    same station-day is ADMITTED and submits, unlike the refusal proven by
+    `test_a_second_yes_rung_is_refused_when_a_prior_leg_has_no_recorded_fee`.
+
+    The durable record is written AFTER ``start()`` (via the strategy's own
+    open ``_latch._store``) -- writing it before, like the never-arm-walk
+    tests do, would let the boot walk itself consume this trial first
+    (`TAKEN_FROM_FILL_WALK_REASON`), which never exercises
+    `_consume_or_flag_duplicate`'s new lookup at all."""
+    strategy = _register_armed_and_start(
+        store_path=store_path,
+        instruments=(interior_instrument, open_upper_instrument),
+        position_evidence_reader=lambda: _TWO_RUNG_EVIDENCE,
+    )
+    assert strategy._latch is not None
+    _write_durable_fill_record_into(
+        strategy._latch._store,
+        instrument_id=OPEN_UPPER_ID,
+        venue_order_id="ord-other-rung",
+        cumulative_qty=Decimal(1),
+        cumulative_fee=Decimal("0.01"),
+        fee_reconciled=True,
+        cumulative_cost=Decimal("0.11"),
+    )
+    submitted: list[object] = []
+    strategy.submit_order = submitted.append  # type: ignore[method-assign]
+    strategy.on_order_filled(
+        _fill(
+            strategy, instrument_id=OPEN_UPPER_ID, venue_order_id="ord-other-rung",
+            last_px="0.11",
+        ),
+    )
+    other_record = strategy._latch.record(
+        STATION, CLIMATE_DAY.isoformat(), key_instrument_id=str(OPEN_UPPER_ID),
+    )
+    assert other_record is not None
+    assert other_record.reason == "taken"
+    assert other_record.fee == Decimal("0.01")
+
+    strategy.on_data(_observation(temp_c_tenths=300, observed_at_ns=WINDOW_OPEN_NS - 1))
+    strategy.on_quote_tick(_quote(INTERIOR_ID, ask="0.24", ts_event=WINDOW_OPEN_NS))
+
+    assert len(submitted) == 1
+    assert strategy.refusals.count("station_day_admission") == 0
+    yes_records = [rec for rec in strategy.offer_tape.records() if rec.side == "YES"]
+    assert len(yes_records) == 1
+    assert yes_records[0].decision == "take"
+    assert yes_records[0].admission_reason == "admitted"
+    assert (
+        strategy._latch.is_inflight(
+            STATION, CLIMATE_DAY.isoformat(), key_instrument_id=str(INTERIOR_ID),
+        )
+        is True
+    )
+
+
+def test_an_unreconciled_durable_fill_record_still_refuses_the_second_rung(
+    store_path: Path,
+    interior_instrument: BinaryOption,
+    open_upper_instrument: BinaryOption,
+) -> None:
+    """(2) A resolver-shaped durable record (`fee_reconciled=False`, PREREG
+    v3's fee-unreconciled-residual ruling) must NOT supply a fee -- `q`
+    stays UNKNOWN and `station_day_admission` refuses exactly as it did
+    before this fix. Unchanged behaviour for the resolver shape. Written
+    AFTER ``start()``, same reason as the reconciled test above."""
+    strategy = _register_armed_and_start(
+        store_path=store_path,
+        instruments=(interior_instrument, open_upper_instrument),
+        position_evidence_reader=lambda: _TWO_RUNG_EVIDENCE,
+    )
+    assert strategy._latch is not None
+    _write_durable_fill_record_into(
+        strategy._latch._store,
+        instrument_id=OPEN_UPPER_ID,
+        venue_order_id="ord-other-rung",
+        cumulative_qty=Decimal(1),
+        cumulative_fee=Decimal("0.01"),
+        fee_reconciled=False,
+        cumulative_cost=Decimal("0.11"),
+    )
+    submitted: list[object] = []
+    strategy.submit_order = submitted.append  # type: ignore[method-assign]
+    strategy.on_order_filled(
+        _fill(
+            strategy, instrument_id=OPEN_UPPER_ID, venue_order_id="ord-other-rung",
+            last_px="0.11",
+        ),
+    )
+    other_record = strategy._latch.record(
+        STATION, CLIMATE_DAY.isoformat(), key_instrument_id=str(OPEN_UPPER_ID),
+    )
+    assert other_record is not None
+    assert other_record.reason == "taken"
+    assert other_record.fee is None
+
+    strategy.on_data(_observation(temp_c_tenths=300, observed_at_ns=WINDOW_OPEN_NS - 1))
+    strategy.on_quote_tick(_quote(INTERIOR_ID, ask="0.24", ts_event=WINDOW_OPEN_NS))
+
+    assert submitted == []
+    assert strategy.refusals.count("station_day_admission") == 1
+    yes_records = [rec for rec in strategy.offer_tape.records() if rec.side == "YES"]
+    assert len(yes_records) == 1
+    assert yes_records[0].decision == "refuse"
+    assert yes_records[0].admission_reason == "station_day_admission"
+
+
+def test_recorded_fee_for_is_none_when_no_durable_record_exists(
+    store_path: Path,
+    interior_instrument: BinaryOption,
+) -> None:
+    """(3) No durable fill record at all (e.g. the record was never
+    written, or names a different venue order) -- `_recorded_fee_for` must
+    return `None`, never guess."""
+    strategy = _register_and_start(
+        store_path=store_path,
+        instruments=(interior_instrument,),
+        position_evidence_reader=lambda: _PERMISSIVE_EVIDENCE,
+    )
+    assert strategy._recorded_fee_for(INTERIOR_ID, "ord-never-written") is None
+
+
+def test_recorded_fee_for_divides_cumulative_fee_by_cumulative_qty(
+    store_path: Path,
+    interior_instrument: BinaryOption,
+) -> None:
+    """(4) A qty-2 reconciled record's `cumulative_fee` is divided by its
+    `cumulative_qty` to yield the PER-CONTRACT fee `TrialDayRecord.fee`
+    expects (`BE = ask + fee`, one leg's own ask)."""
+    _write_durable_fill_record(
+        store_path,
+        instrument_id=INTERIOR_ID,
+        venue_order_id="ord-two",
+        cumulative_qty=Decimal(2),
+        cumulative_fee=Decimal("0.02"),
+        fee_reconciled=True,
+        cumulative_cost=Decimal("0.22"),
+    )
+    strategy = _register_and_start(
+        store_path=store_path,
+        instruments=(interior_instrument,),
+        position_evidence_reader=lambda: _PERMISSIVE_EVIDENCE,
+    )
+    assert strategy._recorded_fee_for(INTERIOR_ID, "ord-two") == Decimal("0.01")

@@ -1951,6 +1951,41 @@ class ContinuousRungHoldStrategy(Strategy):
                 self.position_alerter, "continuous_rung_hold position report failed",
             )
 
+    def _recorded_fee_for(
+        self, instrument_id: InstrumentId, venue_order_id: str,
+    ) -> Decimal | None:
+        """The per-contract venue fee this fill's own durable
+        `DurableFillRecord` supports, when known.
+
+        RULING (option B, domain review of a9fd0fb): a genuine create-path
+        fill left `TrialDayRecord.fee` permanently `None`, which made
+        `station_day_admission` refuse EVERY second YES rung on a
+        station-day (unknown `q` -- R3-7 never guesses) -- de facto one
+        position per station, contradicting R-10. This reads through
+        `TrialDayLatch.iter_fill_records`, the SAME read-only, store-based
+        accessor the never-arm walk (`_run_never_arm_walk`) already uses to
+        find fill records -- never a second store, never the adapters exec
+        module imported here.
+
+        Deliberately NEVER `event.commission`: the resolver path emits a
+        synthetic `Money(0)` there, indistinguishable from a genuine zero
+        fee (PREREG v3 fee-unreconciled-residual ruling).
+
+        `None` unless a record for this EXACT `venue_order_id` exists, is
+        `fee_reconciled`, and carries a positive `cumulative_qty` -- an
+        absent, unreconciled, or zero-qty record leaves `q` UNKNOWN, and
+        `station_day_admission` must keep refusing rather than guess (never
+        relaxed by this helper).
+        """
+        assert self._latch is not None
+        for candidate in self._latch.iter_fill_records((str(instrument_id),)):
+            if candidate.venue_order_id != venue_order_id:
+                continue
+            if not candidate.fee_reconciled or candidate.cumulative_qty <= 0:
+                return None
+            return candidate.cumulative_fee / candidate.cumulative_qty
+        return None
+
     def _consume_or_flag_duplicate(
         self, station: str, climate_day_key: str, *, event: OrderFilled,
     ) -> None:
@@ -1969,12 +2004,14 @@ class ContinuousRungHoldStrategy(Strategy):
         venue_order_id = str(event.venue_order_id)
         decision_ask = self._decision_ask_by_station_day.pop((station, climate_day_key), None)
         ask = decision_ask if decision_ask is not None else event.last_px.as_decimal()
+        fee = self._recorded_fee_for(event.instrument_id, venue_order_id)
         record = TrialDayRecord(
             latched_at_ns=event.ts_event,
             instrument_id=instrument_id,
             ask=ask,
             reason="taken",
             venue_order_id=venue_order_id,
+            fee=fee,
         )
         wrote = self._latch.consume_if_absent(
             station, climate_day_key, record, key_instrument_id=instrument_id,
