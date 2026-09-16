@@ -612,6 +612,125 @@ esac
     assert tally_argv[tally_argv.index("--fill-since-climate-day") + 1] == "2026-09-05"
 
 
+def test_wrapper_passes_covered_listed_and_fill_source_for_cont_family_with_its_own_d0(
+    tmp_path: Path,
+) -> None:
+    """SD-1/L-38: pm_us_crh_cont is REGISTERED + venue=polymarket_us but is
+    NOT the literal pm_us_crh_v2 -- before the fix it got neither input and
+    tallied with filled_takes=None forever (its structural-dead stop never
+    evaluable). It must now get all three flags too, WITHOUT going through
+    the v2-only structural-pin-guard/CHECK_TOKEN path (no case for
+    `exec_state_db_path`/`structural_pin_guard` in this stub -- if the
+    wrapper called either for a non-pm_us_crh_v2 family this test's stub
+    would fall through to the default capture branch and corrupt the
+    tally's own argv capture). `--fill-since-climate-day` must be the
+    family's OWN `d0_climate_day` (2026-09-12), never the v2 literal
+    (2026-09-05) baked into the shared counter JSON's `fetch_start`.
+    """
+    capture = tmp_path / "argv_capture.txt"
+    stub = tmp_path / "stub_python.sh"
+    stub.write_text(f'#!/usr/bin/env bash\nprintf "%s\\n" "$@" > "{capture}"\nexit 0\n')
+    stub.chmod(0o755)
+    _write_counter_json(tmp_path, count=17, fetch_start="2026-09-05")
+    result = _run_wrapper(
+        ["pm_us_crh_cont"],
+        tmp_path,
+        stub_python=stub,
+        set_state_db=True,
+        write_counter_json=False,
+    )
+    assert result.returncode == 0, result.stderr
+    argv_lines = capture.read_text().splitlines()
+    assert "--covered-listed-station-days" in argv_lines
+    assert argv_lines[argv_lines.index("--covered-listed-station-days") + 1] == "17"
+    assert "--fill-source" in argv_lines
+    assert argv_lines[argv_lines.index("--fill-source") + 1] == str(
+        tmp_path / "state" / "exec_polymarket_us.sqlite"
+    )
+    assert "--fill-since-climate-day" in argv_lines
+    assert argv_lines[argv_lines.index("--fill-since-climate-day") + 1] == "2026-09-12"
+
+
+def test_wrapper_never_supplies_structural_dead_stop_inputs_for_a_draft_family(
+    tmp_path: Path,
+) -> None:
+    """A DRAFT_NOT_REGISTERED manifest (pm_us_crh_exit_v4) is a valid
+    `--family` id (B6: its own `family_id` matches the filename) but must
+    never receive the structural-dead-stop inputs -- generalising to
+    "REGISTERED, venue=polymarket_us" must not silently widen to every
+    manifest on disk."""
+    capture = tmp_path / "argv_capture.txt"
+    stub = tmp_path / "stub_python.sh"
+    stub.write_text(f'#!/usr/bin/env bash\nprintf "%s\\n" "$@" > "{capture}"\nexit 0\n')
+    stub.chmod(0o755)
+    result = _run_wrapper(
+        ["pm_us_crh_exit_v4"],
+        tmp_path,
+        stub_python=stub,
+        set_state_db=True,
+    )
+    assert result.returncode == 0, result.stderr
+    argv_lines = capture.read_text().splitlines()
+    assert "--covered-listed-station-days" not in argv_lines
+    assert "--fill-source" not in argv_lines
+    assert "--fill-since-climate-day" not in argv_lines
+
+
+def test_wrapper_never_supplies_structural_dead_stop_inputs_for_a_non_polymarket_us_family(
+    tmp_path: Path,
+) -> None:
+    """kalshi_crh_v1 is currently DRAFT_NOT_REGISTERED (parked, see
+    test_kalshi_crh_unit_pair_is_parked_off_main) but even a hypothetically
+    REGISTERED non-polymarket_us manifest must never get these inputs --
+    the venue check is a second, independent gate, not a byproduct of the
+    status check alone."""
+    capture = tmp_path / "argv_capture.txt"
+    stub = tmp_path / "stub_python.sh"
+    stub.write_text(f'#!/usr/bin/env bash\nprintf "%s\\n" "$@" > "{capture}"\nexit 0\n')
+    stub.chmod(0o755)
+    result = _run_wrapper(
+        ["kalshi_crh_v1"],
+        tmp_path,
+        stub_python=stub,
+        set_state_db=True,
+    )
+    assert result.returncode == 0, result.stderr
+    argv_lines = capture.read_text().splitlines()
+    assert "--covered-listed-station-days" not in argv_lines
+    assert "--fill-source" not in argv_lines
+    assert "--fill-since-climate-day" not in argv_lines
+
+
+def test_wrapper_logs_which_structural_dead_stop_inputs_were_supplied_per_family(
+    tmp_path: Path,
+) -> None:
+    """SD-1/L-38: the wrapper must log, per family, which structural-dead
+    stop inputs it supplied (or that it skipped them and why) -- so a
+    `journalctl`/`family_tally_v2.log` read tells a reader which families
+    are actually evaluable without re-deriving it from the argv."""
+    stub = tmp_path / "stub_python.sh"
+    stub.write_text('#!/usr/bin/env bash\nexit 0\n')
+    stub.chmod(0o755)
+    out_dir = tmp_path / "derived"
+    _write_counter_json(tmp_path, count=17, fetch_start="2026-09-05")
+
+    cont_result = _run_wrapper(
+        ["pm_us_crh_cont"], tmp_path, stub_python=stub, write_counter_json=False
+    )
+    assert cont_result.returncode == 0, cont_result.stderr
+    cont_log = (out_dir / "family_tally_v2.log").read_text()
+    assert "pm_us_crh_cont" in cont_log
+    assert "covered-listed-station-days=17" in cont_log
+    assert "fill-since-climate-day=2026-09-12" in cont_log
+
+    draft_result = _run_wrapper(["pm_us_crh_exit_v4"], tmp_path, stub_python=stub)
+    assert draft_result.returncode == 0, draft_result.stderr
+    draft_log = (out_dir / "family_tally_v2.log").read_text()
+    assert "pm_us_crh_exit_v4" in draft_log
+    assert "SKIPPED" in draft_log
+    assert "DRAFT_NOT_REGISTERED" in draft_log
+
+
 def test_kalshi_crh_unit_pair_is_parked_off_main(tmp_path: Path) -> None:
     # breezy-kalshi-crh-tally.{service,timer} moved to wip/kalshi-s4-registry
     # per the 2026-09-04 operator priority (PM-only until PM is working).

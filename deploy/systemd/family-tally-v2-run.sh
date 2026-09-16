@@ -49,6 +49,18 @@ manifest_family_id() {
     | sed -E 's/.*:[[:space:]]*"([^"]*)"/\1/'
 }
 
+# SD-1/L-38 (2026-09-16): generic single-key string-field reader, same
+# grep/sed idiom as manifest_family_id() above and byte-identical to
+# score-live-trials-run.sh's own manifest_field() -- never a second JSON
+# parser. Used below to read `status`/`venue`/`d0_climate_day` off THIS
+# family's own manifest, so the structural-dead-stop inputs generalise to
+# ANY REGISTERED, venue=polymarket_us family instead of the literal
+# pm_us_crh_v2 alone.
+manifest_field() {
+  grep -o "\"$2\"[[:space:]]*:[[:space:]]*\"[^\"]*\"" "$1" | head -n1 \
+    | sed -E 's/.*:[[:space:]]*"([^"]*)"/\1/'
+}
+
 valid_family_ids() {
   local manifest stem field
   for manifest in "$FAMILIES_DIR"/*.json; do
@@ -96,8 +108,14 @@ if [ ! -f "$OUT/score_live_trials_ok_$STAMP" ]; then
   exit 1
 fi
 
-EXTRA_ARGS=()
 if [ "$FAMILY" = "$PM_FAMILY" ]; then
+  # The structural-PIN launch-window gate (`structural_pin_guard`) is,
+  # deliberately, a pm_us_crh_v2-only artefact of that family's own launch
+  # (its own docstring: "Pure structural-pin gate for the PREREG v2
+  # family-tally wrapper"; `evaluate_pin_gate` returns NOT_APPLICABLE, never
+  # READY, for any other family_id) -- tracked separately (R-4, SP-1 I5) and
+  # OUT OF SCOPE for the SD-1/L-38 generalisation below. Never extended to
+  # another family.
   CHECK_TOKEN="refused"
   # Capture stdout even on non-zero (MISMATCH/DISCOVERY_FAILED print a token
   # then exit 3). Unset-env --check prints nothing and stays 'refused'.
@@ -118,7 +136,41 @@ if [ "$FAMILY" = "$PM_FAMILY" ]; then
     say "$MSG"
     exit 1
   fi
+fi
 
+# SD-1/L-38 (2026-09-16, PROGRESS): the structural-dead stop's two inputs --
+# covered-listed station-days and the FILL-TIME filled-Takes count -- used
+# to reach `family_tally_v2.py` ONLY when `$FAMILY` was literally
+# pm_us_crh_v2, so the LIVE `pm_us_crh_cont` family tallied with
+# filled_takes=None forever and its own structural-dead stop
+# (structural_dead_stop.py's `StructuralDeadVerdict.evaluable`) could never
+# fire. Generalised: ANY family whose OWN manifest declares
+# status=REGISTERED and venue=polymarket_us gets both inputs -- never a
+# second hardcoded family literal.
+#
+# covered-listed-station-days is FAMILY-AGNOSTIC PER STATION (a property of
+# which afternoon windows were actually captured, not of who is trading
+# them) and comes from the ONE shared counter JSON
+# score-live-trials-run.sh already writes once per day, pinned to
+# pm_us_crh_v2's own d0_climate_day -- so the freshness check below is
+# always against $V2_D0_LITERAL, for every family, never this family's own
+# D0 (a drift here means the SHARED counter drifted, not this one family).
+#
+# fill-source/fill-since-climate-day ARE per-family: filled_takes and the
+# v3 residual are read under THIS family's own `trial_id_prefix`
+# (`count_filled_takes`/`v3_residual_from_fill_source`, both already keyed
+# by `manifest.trial_id_prefix` -- e.g. v3's `continuous_rung_hold/trial/`
+# vs v2's `current_rung_hold/trial/` -- so no prefix argument needs adding
+# here), scoped `--fill-since-climate-day` to THIS family's own
+# `d0_climate_day` (read straight off its manifest, never
+# $V2_D0_LITERAL) so a family registered after v2 never inherits v2's D0.
+EXTRA_ARGS=()
+FAMILY_MANIFEST_PATH="$FAMILIES_DIR/$FAMILY.json"
+FAMILY_STATUS=$(manifest_field "$FAMILY_MANIFEST_PATH" status)
+FAMILY_VENUE=$(manifest_field "$FAMILY_MANIFEST_PATH" venue)
+FAMILY_D0=$(manifest_field "$FAMILY_MANIFEST_PATH" d0_climate_day)
+
+if [ "$FAMILY_STATUS" = "REGISTERED" ] && [ "$FAMILY_VENUE" = "polymarket_us" ]; then
   CJSON="$OUT/covered_listed_station_days_$STAMP.json"
   if [ ! -f "$CJSON" ]; then
     say "FAMILY TALLY V2 ($FAMILY) SKIPPED -- no covered-listed station-days JSON for $STAMP"
@@ -141,15 +193,20 @@ if [ "$FAMILY" = "$PM_FAMILY" ]; then
   fi
 
   COUNT=$(sed -nE 's/^  "count": ([0-9]+),?$/\1/p' "$CJSON")
-  D0=$(sed -nE 's/^  "fetch_start": "([0-9]{4}-[0-9]{2}-[0-9]{2})",?$/\1/p' "$CJSON")
+  CJSON_FETCH_START=$(sed -nE 's/^  "fetch_start": "([0-9]{4}-[0-9]{2}-[0-9]{2})",?$/\1/p' "$CJSON")
 
-  if [ -z "$COUNT" ] || [ -z "$D0" ]; then
+  if [ -z "$COUNT" ] || [ -z "$CJSON_FETCH_START" ]; then
     say "FAMILY TALLY V2 ($FAMILY) SKIPPED -- could not extract count/fetch_start from $CJSON"
     exit 1
   fi
 
-  if [ "$D0" != "$V2_D0_LITERAL" ]; then
+  if [ "$CJSON_FETCH_START" != "$V2_D0_LITERAL" ]; then
     say "FAMILY TALLY V2 ($FAMILY) SKIPPED -- counter fetch_start drifted from the registered d0"
+    exit 1
+  fi
+
+  if [ -z "$FAMILY_D0" ]; then
+    say "FAMILY TALLY V2 ($FAMILY) SKIPPED -- manifest has no d0_climate_day"
     exit 1
   fi
 
@@ -158,8 +215,11 @@ if [ "$FAMILY" = "$PM_FAMILY" ]; then
   EXTRA_ARGS=(
     --covered-listed-station-days "$COUNT"
     --fill-source "$STATE_DB"
-    --fill-since-climate-day "$D0"
+    --fill-since-climate-day "$FAMILY_D0"
   )
+  say "family tally v2 ($FAMILY) supplied covered-listed-station-days=$COUNT fill-source=$STATE_DB fill-since-climate-day=$FAMILY_D0"
+else
+  say "family tally v2 ($FAMILY) structural-dead-stop inputs SKIPPED -- status=$FAMILY_STATUS venue=$FAMILY_VENUE (not a REGISTERED polymarket_us family)"
 fi
 
 if "$PY" "$REPO/scripts/analysis/family_tally_v2.py" \
