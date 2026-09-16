@@ -22,6 +22,7 @@ and value is unchanged, only new keys were appended).
 from __future__ import annotations
 
 import json
+import logging
 from decimal import Decimal
 from pathlib import Path
 
@@ -29,6 +30,7 @@ import pytest
 
 from breezy.strategy.current_rung_hold.offer_tape import (
     DEFAULT_OFFER_TAPE_MAXLEN,
+    DEFAULT_OFFER_TAPE_SIDECAR_MAX_BYTES,
     OfferTape,
     OfferTapeRecord,
 )
@@ -293,3 +295,99 @@ def test_a_file_where_the_sidecar_directory_should_be_still_constructs(
     tape.append(_RECORD)
     assert len(tape) == 1
     assert not path.exists()
+
+
+# ---------------------------------------------------------------------------
+# 2026-09-16 GAP fix: per-climate-day sidecar byte cap (defect A).
+# ---------------------------------------------------------------------------
+
+
+def _line_bytes(record: OfferTapeRecord) -> int:
+    return len(json.dumps(record.to_dict(), sort_keys=True).encode("utf-8")) + 1
+
+
+def test_default_sidecar_max_bytes_is_pinned_at_64_mib() -> None:
+    assert DEFAULT_OFFER_TAPE_SIDECAR_MAX_BYTES == 64 * 1024 * 1024
+
+
+def test_below_the_cap_every_row_is_written_unchanged(tmp_path: Path) -> None:
+    path = tmp_path / "offer.jsonl"
+    tape = OfferTape(path, sidecar_max_bytes=DEFAULT_OFFER_TAPE_SIDECAR_MAX_BYTES)
+
+    for _ in range(5):
+        tape.append(_RECORD)
+
+    lines = path.read_text(encoding="utf-8").splitlines()
+    assert len(lines) == 5
+    assert tape.sidecar_capped == 0
+    assert len(tape) == 5
+
+
+def test_at_the_cap_further_rows_stop_appending_to_disk_but_not_to_the_deque(
+    tmp_path: Path,
+) -> None:
+    """Cap reached: no further bytes land on disk, the counter increments
+    once per refused row, and the in-memory deque is unaffected."""
+    path = tmp_path / "offer.jsonl"
+    one_line = _line_bytes(_RECORD)
+    # Room for exactly 3 lines before the 4th would push over the cap.
+    cap = one_line * 3
+    tape = OfferTape(path, sidecar_max_bytes=cap)
+
+    for _ in range(3):
+        tape.append(_RECORD)
+    size_at_cap = path.stat().st_size
+    assert size_at_cap == cap
+
+    for _ in range(4):
+        tape.append(_RECORD)
+
+    assert path.stat().st_size == size_at_cap  # not one more byte landed
+    assert tape.sidecar_capped == 4
+    assert len(tape) == 7  # the deque kept working throughout
+    assert tape.sidecar_errors == 0  # a cap refusal is not a disk error
+
+    lines = path.read_text(encoding="utf-8").splitlines()
+    assert len(lines) == 3
+    for line in lines:
+        assert OfferTapeRecord.from_dict(json.loads(line)) == _RECORD
+
+
+def test_the_cap_warning_is_logged_exactly_once(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    path = tmp_path / "offer.jsonl"
+    one_line = _line_bytes(_RECORD)
+    tape = OfferTape(path, sidecar_max_bytes=one_line)
+
+    caplog.set_level(logging.WARNING, logger="breezy.strategy.current_rung_hold.offer_tape")
+    tape.append(_RECORD)  # exactly fills the cap
+    for _ in range(3):
+        tape.append(_RECORD)  # every one of these is refused
+
+    warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
+    assert len(warnings) == 1
+    assert tape.sidecar_capped == 3
+
+
+def test_a_process_restart_resumes_the_cap_from_the_real_on_disk_size(
+    tmp_path: Path,
+) -> None:
+    """A second `OfferTape` opened on a path that already has rows on disk
+    (a mid-day process restart) must count those bytes toward its cap, not
+    re-zero the budget and allow a second full `sidecar_max_bytes` past the
+    true on-disk size."""
+    path = tmp_path / "offer.jsonl"
+    one_line = _line_bytes(_RECORD)
+    cap = one_line * 3
+
+    first = OfferTape(path, sidecar_max_bytes=cap)
+    for _ in range(3):
+        first.append(_RECORD)
+    assert path.stat().st_size == cap
+
+    second = OfferTape(path, sidecar_max_bytes=cap)
+    second.append(_RECORD)
+
+    assert path.stat().st_size == cap  # the restarted tape refused too
+    assert second.sidecar_capped == 1

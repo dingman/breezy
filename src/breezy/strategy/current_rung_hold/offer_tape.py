@@ -26,7 +26,12 @@ from decimal import Decimal
 from pathlib import Path
 from typing import Final, cast
 
-__all__ = ["DEFAULT_OFFER_TAPE_MAXLEN", "OfferTape", "OfferTapeRecord"]
+__all__ = [
+    "DEFAULT_OFFER_TAPE_MAXLEN",
+    "DEFAULT_OFFER_TAPE_SIDECAR_MAX_BYTES",
+    "OfferTape",
+    "OfferTapeRecord",
+]
 
 logger = logging.getLogger(__name__)
 
@@ -36,6 +41,16 @@ logger = logging.getLogger(__name__)
 #: history depth a long-running shadow had before the NO leg started
 #: sharing this tape.
 DEFAULT_OFFER_TAPE_MAXLEN: Final[int] = 16384
+
+#: PROVISIONAL (2026-09-16 GAP fix, first live-day offer-tape postmortem):
+#: the first live day wrote 7.9 MB / 9612 rows in ONE hour for ONE station
+#: (one row per eligible snapshot per leg, by design -- the in-memory
+#: deque is already bounded by :data:`DEFAULT_OFFER_TAPE_MAXLEN`, but the
+#: JSONL sidecar was an unbounded plain append). 64 MiB is a round, generous
+#: multiple of that measured rate (~8x the single busiest hour observed so
+#: far) -- revisit once more live days are measured. Applies PER sidecar
+#: file (one per climate day), never across files.
+DEFAULT_OFFER_TAPE_SIDECAR_MAX_BYTES: Final[int] = 64 * 1024 * 1024
 
 #: L1 review finding (commit 309dab6): the 16 keys every pre-GAP-fix JSONL
 #: line carries -- :meth:`OfferTapeRecord.from_dict` requires all of them
@@ -277,12 +292,22 @@ class OfferTape:
         path: Path | None = None,
         *,
         maxlen: int = DEFAULT_OFFER_TAPE_MAXLEN,
+        sidecar_max_bytes: int = DEFAULT_OFFER_TAPE_SIDECAR_MAX_BYTES,
     ) -> None:
         if maxlen < 1:
             raise ValueError("offer tape maxlen must be >= 1")
+        if sidecar_max_bytes < 1:
+            raise ValueError("offer tape sidecar_max_bytes must be >= 1")
         self._buf: deque[OfferTapeRecord] = deque(maxlen=maxlen)
         self._maxlen = maxlen
+        self._sidecar_max_bytes = sidecar_max_bytes
         self._sidecar_errors = 0
+        #: 2026-09-16 GAP fix: rows refused by the byte cap, never the
+        #: in-memory deque (which keeps working). One counter increment per
+        #: refused row; see `append`'s "logs ONE WARN" behaviour below --
+        #: this counter is unbounded so it never itself needs a cap.
+        self._sidecar_capped = 0
+        self._sidecar_cap_logged = False
         #: H1 review finding (commit 309dab6): sidecar setup is best-effort.
         #: `composition.py` now resolves a default sidecar path
         #: unconditionally, so an unwritable/read-only/full
@@ -291,6 +316,13 @@ class OfferTape:
         #: (`self._path` stays `None`), exactly like a later `append` disk
         #: error already does.
         self._path: Path | None = None
+        #: 2026-09-16 GAP fix: bytes already on disk at THIS path, so a
+        #: process restart mid-day (the file already has rows) resumes the
+        #: cap from the real on-disk size rather than re-zeroing it and
+        #: allowing another full `sidecar_max_bytes` past the true limit.
+        #: Best-effort, like everything else here: a `stat()` failure (the
+        #: file does not exist yet) is the common case, not an error.
+        self._bytes_written = 0
         if path is not None:
             try:
                 path.parent.mkdir(parents=True, exist_ok=True)
@@ -303,6 +335,10 @@ class OfferTape:
                 )
             else:
                 self._path = path
+                try:
+                    self._bytes_written = path.stat().st_size
+                except OSError:
+                    self._bytes_written = 0
 
     @property
     def maxlen(self) -> int:
@@ -312,6 +348,14 @@ class OfferTape:
     def sidecar_errors(self) -> int:
         """Count of sidecar setup/append failures (H1 review finding)."""
         return self._sidecar_errors
+
+    @property
+    def sidecar_capped(self) -> int:
+        """Count of rows refused by the byte cap (2026-09-16 GAP fix).
+
+        Disk-only: the in-memory deque never refuses a row on this account.
+        """
+        return self._sidecar_capped
 
     def __len__(self) -> int:
         return len(self._buf)
@@ -323,15 +367,29 @@ class OfferTape:
         """Record into the bounded in-memory deque, then best-effort JSONL.
 
         The in-memory record above always happens first and unconditionally:
-        a disk error on the optional JSONL sidecar must never propagate out
-        of a live strategy's `on_quote_tick`/`on_data` (this is called
-        directly from `ContinuousRungHoldStrategy._hunt_tick`), so it is
-        caught and logged here rather than left to the caller.
+        a disk error on the optional JSONL sidecar -- OR the sidecar hitting
+        its byte cap (2026-09-16 GAP fix) -- must never propagate out of a
+        live strategy's `on_quote_tick`/`on_data` (this is called directly
+        from `ContinuousRungHoldStrategy._hunt_tick`), and must never starve
+        the in-memory tape either. Below the cap this method is
+        byte-identical to before the fix.
         """
         self._buf.append(record)
         if self._path is None:
             return
         line = json.dumps(record.to_dict(), sort_keys=True)
+        encoded = line.encode("utf-8") + b"\n"
+        if self._bytes_written + len(encoded) > self._sidecar_max_bytes:
+            self._sidecar_capped += 1
+            if not self._sidecar_cap_logged:
+                self._sidecar_cap_logged = True
+                logger.warning(
+                    "OfferTape: sidecar %s reached its %d-byte cap; further rows are "
+                    "dropped from disk only (the in-memory deque is unaffected)",
+                    self._path,
+                    self._sidecar_max_bytes,
+                )
+            return
         try:
             with self._path.open("a", encoding="utf-8") as handle:
                 handle.write(line)
@@ -339,6 +397,8 @@ class OfferTape:
         except OSError:
             self._sidecar_errors += 1
             logger.exception("OfferTape: failed to append to %s", self._path)
+            return
+        self._bytes_written += len(encoded)
 
     def as_dicts(self) -> tuple[Mapping[str, object], ...]:
         return tuple(record.to_dict() for record in self._buf)

@@ -10,8 +10,10 @@ Nautilus test kit's bus/portfolio/cache, timers fired organically through
 
 from __future__ import annotations
 
+import json
 import logging
 import threading
+from pathlib import Path
 from typing import Any
 
 import pytest
@@ -24,6 +26,7 @@ from breezy.ingest.nws_observation_actor import (
     NwsObservationActorConfig,
 )
 from breezy.ingest.nws_observations import NWS_OBSERVATION_SOURCE_CHANNEL
+from breezy.ingest.observation_sidecar import ObservationSidecar
 from tests.unit.nws_observation_harness import (
     FETCH_INSTANT_NS,
     INTERVAL_S,
@@ -224,3 +227,69 @@ async def test_stop_cancels_the_poll_timer() -> None:
     harness.actor.stop()
 
     assert harness.clock.timer_names == []
+
+
+# ---------------------------------------------------------------------------
+# 2026-09-16 GAP fix: raw-observation sidecar wiring (defect B).
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_a_poll_writes_the_fetch_url_path_and_receipt_stamp_onto_every_sidecar_row(
+    tmp_path: Path,
+) -> None:
+    sidecar_path = tmp_path / "observations.jsonl"
+    sidecar = ObservationSidecar(sidecar_path)
+    harness = build(sidecar=sidecar)
+
+    harness.actor.start()
+    await harness.drain()
+
+    assert sidecar_path.exists()
+    lines = sidecar_path.read_text(encoding="utf-8").splitlines()
+    assert len(lines) > 0
+    for line in lines:
+        row = json.loads(line)
+        assert row["station"] == "KMDW"
+        assert row["source_url_path"] == "/stations/KMDW/observations"
+        assert row["fetched_at_ns"] == FETCH_INSTANT_NS
+    # At least one published record's own decoded reading appears among the
+    # sidecar rows -- the sidecar sees the same decode the strategy topic does.
+    published_tenths = {record.temp_c_tenths for record in harness.published}
+    sidecar_tenths = {json.loads(line)["temp_c_tenths"] for line in lines}
+    assert published_tenths
+    assert published_tenths <= sidecar_tenths
+
+
+@pytest.mark.asyncio
+async def test_a_poll_never_raises_when_the_sidecar_directory_is_unwritable(
+    tmp_path: Path,
+) -> None:
+    """Failure containment: an `ObservationSidecar` that cannot write to
+    disk must never surface out of the actor's poll -- observations still
+    parse and publish, the sidecar just counts an error."""
+    blocker = tmp_path / "blocker"
+    blocker.write_text("not a directory")
+    unwritable_path = blocker / "sub" / "observations.jsonl"
+    sidecar = ObservationSidecar(unwritable_path)
+    assert sidecar.errors == 1  # construction itself already degraded
+
+    harness = build(sidecar=sidecar)
+
+    harness.actor.start()
+    await harness.drain()  # must not raise
+
+    assert harness.actor.rebuild_trusted is True
+    assert len(harness.published) > 0
+    assert not unwritable_path.exists()
+
+
+@pytest.mark.asyncio
+async def test_a_poll_with_no_sidecar_configured_is_byte_identical_to_before_the_fix() -> None:
+    harness = build()  # sidecar defaults to None
+
+    harness.actor.start()
+    await harness.drain()
+
+    assert harness.actor.rebuild_trusted is True
+    assert len(harness.published) > 0

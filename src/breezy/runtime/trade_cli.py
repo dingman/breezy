@@ -505,7 +505,14 @@ def run(
 
         actors: Sequence[Actor] = ()
         if settings.live_observations:
-            actors = build_live_observation_actors(check_proxy_env=proxy_env_check_enabled(env))
+            # 2026-09-16 GAP fix: `catalog_root` is the config seam for the
+            # raw-observation sidecar default path -- `None` whenever no
+            # rung-hold family is on (`settings`'s own only other reader of
+            # this field), which disables the sidecar rather than raising.
+            actors = build_live_observation_actors(
+                check_proxy_env=proxy_env_check_enabled(env),
+                catalog_root=settings.catalog_root,
+            )
         return _run_node(
             config,
             node_factory,

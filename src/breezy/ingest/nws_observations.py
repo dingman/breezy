@@ -33,10 +33,11 @@ from collections import Counter
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from itertools import pairwise
-from typing import Any, Final
+from typing import Any, Final, Protocol, cast
 
 from breezy.domain.station_observation import StationObservation
 from breezy.ingest.iem_observations import parse_metar_t_group, station_observation_data_type
+from breezy.ingest.observation_sidecar import ObservationSidecarRow
 
 __all__ = [
     "EXPECTED_TEMPERATURE_UNIT_CODE",
@@ -44,10 +45,21 @@ __all__ = [
     "METAR_PRECISION_C_TENTHS",
     "NWS_OBSERVATION_SOURCE_CHANNEL",
     "NwsObservationPayloadError",
+    "ObservationSidecarWriter",
     "largest_gap_ns",
     "nws_observation_rows_to_station_observations",
     "station_observation_data_type",
 ]
+
+
+class ObservationSidecarWriter(Protocol):
+    """The minimal shape this module needs from a sidecar (structural, like
+    `breezy.ingest.gaps.ObservedRecord`) -- satisfied by
+    `breezy.ingest.observation_sidecar.ObservationSidecar` WITHOUT this
+    module needing to import that concrete class, and equally satisfied by
+    any test double with an `append(row) -> None` method."""
+
+    def append(self, row: ObservationSidecarRow) -> None: ...
 
 #: The `StationObservation.source_channel` for rows from the NWS API.
 NWS_OBSERVATION_SOURCE_CHANNEL: Final[str] = "nws_api_observations"
@@ -123,6 +135,8 @@ def nws_observation_rows_to_station_observations(
     source_channel: str,
     assumed_publication_lag_ns: int,
     received_at_ns: int,
+    sidecar: ObservationSidecarWriter | None = None,
+    source_url_path: str = "",
 ) -> tuple[tuple[StationObservation, ...], Counter[str]]:
     """Convert one observations payload to `StationObservation` records.
 
@@ -133,6 +147,15 @@ def nws_observation_rows_to_station_observations(
     `received_at_ns` is the transport's receipt stamp for the whole response
     (`FetchResult.retrieved_at_ns`), applied to every row in this call.
     `assumed_publication_lag_ns` is provenance only (amendment A6).
+
+    2026-09-16 GAP fix (observation-sidecar diagnosability): `sidecar`, when
+    not `None`, receives one best-effort `ObservationSidecarRow` per
+    successfully DECODED reading (never a drop) -- the raw payload this
+    module itself decodes, so a later ambiguous/dropped running-max cannot
+    be root-caused. `sidecar=None` (the default) is byte-identical to
+    before this fix: zero sidecar calls, zero behaviour change. A sidecar
+    write is best-effort by construction (`ObservationSidecar.append` never
+    raises) and never influences which readings are accepted or dropped.
     """
     observations: list[StationObservation] = []
     drops: Counter[str] = Counter()
@@ -149,10 +172,25 @@ def nws_observation_rows_to_station_observations(
         if observed_at_ns is None:
             drops["observation_parse_error"] += 1
             continue
-        reading = _decode_reading(properties.get("rawMessage"), temperature.get("value"))
+        raw_message = properties.get("rawMessage")
+        reading = _decode_reading(raw_message, temperature.get("value"))
         if isinstance(reading, str):
             drops[reading] += 1
             continue
+        if sidecar is not None:
+            sidecar.append(
+                ObservationSidecarRow(
+                    station=station,
+                    observed_at=cast(str, properties.get("timestamp")),
+                    temp_c_raw=cast("float | int | None", temperature.get("value")),
+                    raw_message=raw_message if isinstance(raw_message, str) else "",
+                    is_metar=reading.is_metar,
+                    precision_c_tenths=reading.precision_c_tenths,
+                    temp_c_tenths=reading.temp_c_tenths,
+                    source_url_path=source_url_path,
+                    fetched_at_ns=received_at_ns,
+                )
+            )
         try:
             record = StationObservation(
                 station=station,
