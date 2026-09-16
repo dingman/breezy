@@ -33,6 +33,17 @@
 # wrote. When `$STORE_DIR` has no subdirectories (the pre-L-38 legacy
 # layout), `$STORE_DIR` is passed straight through, unchanged from before
 # this fix.
+#
+# Defect fix (measured 2026-09-16, live_tally.log): pooling EVERY
+# subdirectory unconditionally means a non-v1 family (e.g. pm_us_crh_cont's
+# v3 `continuous_rung_hold/trial/` trial_id prefix -- or kalshi_crh_v1's
+# `kalshi:current_rung_hold/trial/`) lands rows the frozen
+# `assert_live_only` refuses outright, failing the WHOLE run. Only a
+# subdirectory whose manifest `trial_id_prefix` is accepted by the v1 tally
+# (`current_rung_hold/trial/`) is now pooled; every other family
+# subdirectory is skipped (and logged, and still listed with its row count
+# on the additive "by family:" line) rather than fatally refused or
+# silently dropped.
 set -uo pipefail
 
 REPO=/home/jon/breezy
@@ -40,6 +51,12 @@ PY="${BREEZY_LIVE_TALLY_PYTHON:-$REPO/.venv/bin/python}"
 # BLOCK-1: byte-identical to score-live-trials-run.sh's own assignment --
 # one manifest literal, two wrappers, one test.
 FAMILY_MANIFEST="$REPO/deploy/families/pm_us_crh_v2.json"
+# Overridable so tests can enumerate a throwaway manifest directory instead
+# of the deployed tree's -- mirrors family-tally-v2-run.sh's own
+# BREEZY_FAMILY_TALLY_V2_FAMILIES_DIR. The deployed default never changes:
+# systemd always sees $REPO/deploy/families, exactly the manifests shipped
+# there.
+FAMILIES_DIR="${BREEZY_LIVE_TALLY_FAMILIES_DIR:-$REPO/deploy/families}"
 STORE_DIR=${BREEZY_SCORED_TRIALS_DIR:-$HOME/.local/share/breezy/derived/scored_trials}
 OUT=${BREEZY_LIVE_TALLY_OUTPUT_DIR:-$HOME/.local/share/breezy/derived}
 LOG=$OUT/live_tally.log
@@ -53,6 +70,15 @@ V1_D0_LITERAL="2026-09-05"  # PREREG v1 §6:130
 mkdir -p "$OUT"
 
 say() { echo "$(date -u +%Y-%m-%dT%H:%M:%SZ) $*" >> "$LOG"; }
+
+manifest_trial_id_prefix() {
+  # Same grep/sed extraction shape as family-tally-v2-run.sh's own
+  # manifest_family_id -- never $PY, so this never depends on the stubbed
+  # analysis-script invocation. Prints nothing if the key or the file is
+  # absent.
+  grep -o '"trial_id_prefix"[[:space:]]*:[[:space:]]*"[^"]*"' "$1" 2>/dev/null | head -n1 \
+    | sed -E 's/.*:[[:space:]]*"([^"]*)"/\1/'
+}
 
 STAMP=$(date -u +%Y-%m-%d)
 STATUS=0
@@ -114,10 +140,31 @@ fi
 # straight through unchanged, exactly as before this fix.
 STORE_ARG="$STORE_DIR"
 FAMILY_BREAKDOWN=""
+SKIP_BREAKDOWN=""
 POOL_DIR=""
 if [ -d "$STORE_DIR" ] && find "$STORE_DIR" -mindepth 1 -maxdepth 1 -type d -print -quit 2>/dev/null | grep -q .; then
   POOL_DIR=$(mktemp -d)
   trap 'rm -rf "$POOL_DIR"' EXIT
+
+  # Accepted prefix: the frozen module's own `_LIVE_TRIAL_ID_PREFIX` when
+  # importable, else the v1 family manifest's own `trial_id_prefix`
+  # (pm_us_crh_v2.json IS the v1 family, by construction -- byte-identical
+  # to the constant in production). The import path is what a real `$PY`
+  # exercises; every test here stubs `$PY` to a fake that knows nothing of
+  # this call, so tests always exercise the manifest fallback.
+  ACCEPTED_PREFIX=$("$PY" -c "
+import sys
+sys.path.insert(0, '$REPO')
+from scripts.analysis.live_family_tally import _LIVE_TRIAL_ID_PREFIX
+print(_LIVE_TRIAL_ID_PREFIX)
+" 2>>"$LOG")
+  if [ -z "$ACCEPTED_PREFIX" ]; then
+    ACCEPTED_PREFIX=$(manifest_trial_id_prefix "$FAMILIES_DIR/pm_us_crh_v2.json")
+  fi
+  if [ -z "$ACCEPTED_PREFIX" ]; then
+    say "LIVE TALLY FAILED -- could not determine the v1-accepted trial_id_prefix"
+    exit 1
+  fi
 
   pool_source() {
     # $1: directory to scan (non-recursive); $2: breakdown label.
@@ -138,12 +185,46 @@ if [ -d "$STORE_DIR" ] && find "$STORE_DIR" -mindepth 1 -maxdepth 1 -type d -pri
     fi
   }
 
+  skip_source() {
+    # $1: directory to scan (non-recursive, count only); $2: family id.
+    # Never pooled -- the frozen v1 tally's assert_live_only would refuse
+    # the WHOLE run on the first row whose trial_id carries a non-v1
+    # prefix, so a mismatched family is counted and logged here instead.
+    local src="$1" fam="$2" n
+    n=$(find "$src" -maxdepth 1 -type f -name 'scored_trials_*.parquet' 2>/dev/null | wc -l)
+    if [ "$n" -gt 0 ]; then
+      say "SKIP $fam: prefix not v1-live; see family_tally_v2_$fam"
+      if [ -n "$SKIP_BREAKDOWN" ]; then
+        SKIP_BREAKDOWN="$SKIP_BREAKDOWN, $fam=$n (skipped)"
+      else
+        SKIP_BREAKDOWN="$fam=$n (skipped)"
+      fi
+    fi
+  }
+
   pool_source "$STORE_DIR" "(top-level)"
   while IFS= read -r -d '' fam_dir; do
-    pool_source "$fam_dir" "$(basename "$fam_dir")"
+    fam_id=$(basename "$fam_dir")
+    fam_prefix=$(manifest_trial_id_prefix "$FAMILIES_DIR/$fam_id.json")
+    case "$fam_prefix" in
+      "$ACCEPTED_PREFIX"*)
+        pool_source "$fam_dir" "$fam_id"
+        ;;
+      *)
+        skip_source "$fam_dir" "$fam_id"
+        ;;
+    esac
   done < <(find "$STORE_DIR" -mindepth 1 -maxdepth 1 -type d -print0)
 
   STORE_ARG="$POOL_DIR"
+
+  if [ -n "$SKIP_BREAKDOWN" ]; then
+    if [ -n "$FAMILY_BREAKDOWN" ]; then
+      FAMILY_BREAKDOWN="$FAMILY_BREAKDOWN, $SKIP_BREAKDOWN"
+    else
+      FAMILY_BREAKDOWN="$SKIP_BREAKDOWN"
+    fi
+  fi
 fi
 
 REPORT="$OUT/live_family_tally_$STAMP.md"

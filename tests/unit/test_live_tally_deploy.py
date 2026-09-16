@@ -331,6 +331,11 @@ def _report_path(tmp_path: Path) -> Path:
 def test_two_family_subdirectories_pool_to_the_union_with_a_breakdown_line(
     tmp_path: Path,
 ) -> None:
+    """`kalshi_crh_v1`'s manifest prefix (`kalshi:current_rung_hold/trial/`)
+    is NOT accepted by the v1 tally (`current_rung_hold/trial/`) -- this is
+    the same defect shape as pm_us_crh_cont's v3 prefix, just against the
+    real deploy/families/ manifests (no `BREEZY_LIVE_TALLY_FAMILIES_DIR`
+    override here), so it is pooled-skip, not pooled-union, post-fix."""
     _write_marker(tmp_path)
     _write_counter_json(tmp_path)
     store_dir = tmp_path / "scored_trials"
@@ -345,10 +350,10 @@ def test_two_family_subdirectories_pool_to_the_union_with_a_breakdown_line(
     assert result.returncode == 0, result.stderr
     assert len(_tally_calls(argv_log)) == 1
     report = _report_path(tmp_path).read_text()
-    assert "row count: 4" in report
+    assert "row count: 3" in report
     assert "by family: " in report
     assert "pm_us_crh_v2=3" in report
-    assert "kalshi_crh_v1=1" in report
+    assert "kalshi_crh_v1=1 (skipped)" in report
 
 
 def test_legacy_top_level_only_layout_passes_store_dir_through_unchanged(
@@ -391,3 +396,102 @@ def test_an_empty_store_dir_is_still_underpowered_not_broken(tmp_path: Path) -> 
     report = _report_path(tmp_path).read_text()
     assert "row count: 0" in report
     assert "by family:" not in report
+
+
+# --- Defect fix (measured 2026-09-16, live_tally.log): a v3-prefixed family
+# (e.g. pm_us_crh_cont, `continuous_rung_hold/trial/`) must never reach the
+# frozen v1 `assert_live_only` -- it refuses the WHOLE run on any trial_id
+# outside `current_rung_hold/trial/`. The wrapper now pools only the family
+# subdirectories whose manifest `trial_id_prefix` is accepted by the v1
+# tally, skips the rest (logged), and lists both pooled AND skipped
+# families -- with row counts -- on the additive "by family:" line.
+#
+# `BREEZY_LIVE_TALLY_FAMILIES_DIR` (mirroring family-tally-v2-run.sh's own
+# `BREEZY_FAMILY_TALLY_V2_FAMILIES_DIR` override) points the wrapper at a
+# throwaway manifest directory built per-test, so none of this depends on
+# the real deploy/families/ contents.
+
+
+def _write_family_manifest(families_dir: Path, family_id: str, trial_id_prefix: str) -> None:
+    families_dir.mkdir(parents=True, exist_ok=True)
+    (families_dir / f"{family_id}.json").write_text(
+        json.dumps(
+            {"family_id": family_id, "trial_id_prefix": trial_id_prefix},
+            indent=2,
+            sort_keys=True,
+        )
+    )
+
+
+def _run_wrapper_with_families(
+    tmp_path: Path, *, stub_python: Path, families_dir: Path
+) -> subprocess.CompletedProcess:
+    env = dict(os.environ)
+    home = tmp_path / "home"
+    home.mkdir(parents=True, exist_ok=True)
+    env["HOME"] = str(home)
+    env["BREEZY_SCORED_TRIALS_DIR"] = str(tmp_path / "scored_trials")
+    env["BREEZY_LIVE_TALLY_OUTPUT_DIR"] = str(tmp_path / "derived")
+    env["POLYMARKET_US_EXEC_STATE_DB"] = str(tmp_path / "state" / "exec_polymarket_us.sqlite")
+    env["BREEZY_LIVE_TALLY_PYTHON"] = str(stub_python)
+    env["BREEZY_LIVE_TALLY_FAMILIES_DIR"] = str(families_dir)
+    return subprocess.run(
+        ["bash", str(_WRAPPER)],
+        cwd=_REPO_ROOT,
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=30,
+        check=False,
+    )
+
+
+def test_a_v3_prefixed_family_is_skipped_not_pooled_and_the_v1_family_still_reports(
+    tmp_path: Path,
+) -> None:
+    _write_marker(tmp_path)
+    _write_counter_json(tmp_path)
+    store_dir = tmp_path / "scored_trials"
+    _touch_scored_trial_file(store_dir / "pm_us_crh_cont", "scored_trials_a.parquet")
+    _touch_scored_trial_file(store_dir / "pm_us_crh_cont", "scored_trials_b.parquet")
+    _touch_scored_trial_file(store_dir / "pm_us_crh_cont", "scored_trials_c.parquet")
+    (store_dir / "pm_us_crh_v2").mkdir(parents=True, exist_ok=True)
+    families_dir = tmp_path / "families"
+    _write_family_manifest(families_dir, "pm_us_crh_v2", "current_rung_hold/trial/")
+    _write_family_manifest(families_dir, "pm_us_crh_cont", "continuous_rung_hold/trial/")
+    stub, argv_log = _make_report_stub(tmp_path)
+
+    result = _run_wrapper_with_families(tmp_path, stub_python=stub, families_dir=families_dir)
+
+    assert result.returncode == 0, result.stderr
+    assert len(_tally_calls(argv_log)) == 1
+    report = _report_path(tmp_path).read_text()
+    assert "row count: 0" in report
+    assert "by family: " in report
+    assert "pm_us_crh_cont=3 (skipped)" in report
+    log = (tmp_path / "derived" / "live_tally.log").read_text()
+    assert "SKIP pm_us_crh_cont: prefix not v1-live; see family_tally_v2_pm_us_crh_cont" in log
+
+
+def test_a_v1_prefixed_family_pools_normally_alongside_a_skipped_sibling(
+    tmp_path: Path,
+) -> None:
+    _write_marker(tmp_path)
+    _write_counter_json(tmp_path)
+    store_dir = tmp_path / "scored_trials"
+    _touch_scored_trial_file(store_dir / "pm_us_crh_v2", "scored_trials_a.parquet")
+    _touch_scored_trial_file(store_dir / "pm_us_crh_v2", "scored_trials_b.parquet")
+    _touch_scored_trial_file(store_dir / "pm_us_crh_cont", "scored_trials_c.parquet")
+    families_dir = tmp_path / "families"
+    _write_family_manifest(families_dir, "pm_us_crh_v2", "current_rung_hold/trial/")
+    _write_family_manifest(families_dir, "pm_us_crh_cont", "continuous_rung_hold/trial/")
+    stub, argv_log = _make_report_stub(tmp_path)
+
+    result = _run_wrapper_with_families(tmp_path, stub_python=stub, families_dir=families_dir)
+
+    assert result.returncode == 0, result.stderr
+    assert len(_tally_calls(argv_log)) == 1
+    report = _report_path(tmp_path).read_text()
+    assert "row count: 2" in report
+    assert "pm_us_crh_v2=2" in report
+    assert "pm_us_crh_cont=1 (skipped)" in report
