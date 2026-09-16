@@ -3285,6 +3285,17 @@ def test_x1_the_live_scan_actually_reaches_a_test_that_imports_the_exec_package(
     # comparison is still `==`; the module carries no `SOCKET_RESTORING_
     # MARKERS` and constructs no client -- `submit_chain` is the pure-helpers
     # module, no socket either.
+    #
+    # Old -> new (L-38, 2026-09-16, scheduled-scorer family-prefix fix):
+    # `test_score_live_trials_l38_family_prefix.py` imports `DurableFillRecord`
+    # /`FILL_KEY_PREFIX` from `exec.client` and `NO_SIDE_FIRST_LIVE_ORDER_KEY`
+    # from `exec.no_side_keys` -- same idiom as its
+    # `test_score_live_trials_state_db_source.py` sibling above: seeds a
+    # fixture `SqliteStateStore` via the shipped encoders, never a
+    # hand-written JSON blob. WIDENED, not relaxed (L-12): the comparison is
+    # still `==`; the module carries no `SOCKET_RESTORING_MARKERS` and
+    # constructs no client -- both are plain data records/constants, built
+    # and used directly from literal fields.
     assert exec_importing_test_modules() == {
         "tests/contract/test_exec_client_reconciliation_contract.py",
         "tests/contract/test_exec_client_wiring_contract.py",
@@ -3322,6 +3333,7 @@ def test_x1_the_live_scan_actually_reaches_a_test_that_imports_the_exec_package(
         "tests/unit/test_polymarket_us_startup_evidence.py",
         "tests/unit/test_polymarket_us_submit_order_chain.py",
         "tests/unit/test_polymarket_us_write_sequence.py",
+        "tests/unit/test_score_live_trials_l38_family_prefix.py",
         "tests/unit/test_score_live_trials_state_db_source.py",
     }
 

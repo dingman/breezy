@@ -159,6 +159,18 @@ esac
     assert "--family" in argv_lines
     assert argv_lines[argv_lines.index("--family") + 1] == family_id
     assert "--store-dir" in argv_lines
+    # L-38: this family's own scored-trial subdirectory
+    # ($BREEZY_SCORED_TRIALS_DIR/<family_id>), never the shared top-level
+    # directory -- family_tally_v2.py's filter_rows_to_manifest_prefix
+    # refuses a store contaminated by another family's rows
+    # (FamilyStoreContaminationError), so score-live-trials-run.sh writes
+    # each REGISTERED family's rows to its own subdirectory and this
+    # wrapper must read exactly that one back.
+    store_dir_arg = argv_lines[argv_lines.index("--store-dir") + 1]
+    assert store_dir_arg.endswith(f"/{family_id}"), (
+        f"--store-dir {store_dir_arg!r} does not end with this family's own "
+        f"subdirectory /{family_id}"
+    )
     assert "--output" in argv_lines
     output_arg = argv_lines[argv_lines.index("--output") + 1]
     assert family_id in output_arg

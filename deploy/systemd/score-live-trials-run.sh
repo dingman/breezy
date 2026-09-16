@@ -3,27 +3,54 @@
 # 7). ONE run of the 14:15 UTC live-fill scorer: the node-env pre-flight,
 # then the covered-listed-station-days counter (run ONCE, here, per section
 # 7's build-time disposition -- NOT by live-tally-run.sh), then one
-# `score_live_trials.py` invocation per manifest station. The dated success
-# marker `score_live_trials_ok_$STAMP` is the ONE thing both 14:30 and 17:15
-# tally wrappers assert before running (BLOCK-2): this script is its SOLE
-# writer, and only after the counter AND every city's scorer invocation
+# `score_live_trials.py` invocation per (manifest station, REGISTERED
+# family manifest) pair. The dated success marker
+# `score_live_trials_ok_$STAMP` is the ONE thing both 14:30 and 17:15 tally
+# wrappers assert before running (BLOCK-2): this script is its SOLE writer,
+# and only after the counter AND every city/family scorer invocation
 # exited 0.
+#
+# L-38 (2026-09-16): before this fix, only `pm_us_crh_v2.json` was ever
+# scored, so every fill under a DIFFERENT family's trial-id prefix (e.g. the
+# live `pm_us_crh_cont` family, `continuous_rung_hold/trial/`) came back
+# `no_taken_latch` -- the family's own genuine taken latch was real, just
+# never looked up under the right prefix. The fix: enumerate every
+# REGISTERED, `venue == polymarket_us` family manifest under
+# `deploy/families/*.json` (never a second hardcoded literal) and run the
+# scorer once per (city, manifest) pair, each family's rows landing in its
+# OWN `$STORE_DIR/<family_id>` subdirectory -- `family_tally_v2.py`'s
+# `filter_rows_to_manifest_prefix` REFUSES a store that mixes another
+# family's rows into a store declared single-family
+# (`FamilyStoreContaminationError`), so a shared top-level directory would
+# make one family's tally poison the other's. A manifest that is
+# `DRAFT_NOT_REGISTERED` (or a non-`polymarket_us` venue, e.g.
+# `kalshi_crh_v1.json`) is skipped with a logged reason, never invoked.
 #
 # Exit status: 0 only when the marker was written; 1 if the state-DB env
 # var is unset, the node-env pre-flight refuses (MISMATCH/DISCOVERY_FAILED),
 # the counter fails, its JSON is malformed/unreadable, its fetch_start
-# drifts from the registered v1 D0, or any city's scorer invocation fails --
-# remaining cities are still attempted so the journal shows every failure.
+# drifts from the registered v1 D0, or any city/family scorer invocation
+# fails -- remaining (city, family) pairs are still attempted so the
+# journal shows every failure.
 # Reported to `systemctl --user status breezy-score-live-trials.service`.
 set -uo pipefail
 
 REPO=/home/jon/breezy
 PY="${BREEZY_SCORE_LIVE_TRIALS_PYTHON:-$REPO/.venv/bin/python}"
 # BLOCK-1: byte-identical to live-tally-run.sh's own assignment -- one
-# manifest literal, two wrappers, one test. Reaches three consumers: this
-# loop's cities, every scorer invocation's --family-manifest, and the
-# counter's --family-manifest.
+# manifest literal, two wrappers, one test. Reaches two consumers now (L-38
+# widened the scorer loop below off a separate, generically-enumerated
+# list): the covered-listed-station-days counter's --family-manifest, and
+# (unchanged since before L-38) the structural-dead-stop pin stays
+# v2-scoped only, tracked separately (R-4, SP-1 I5) -- never every scorer
+# invocation any more, that is FAMILY_MANIFESTS below.
 FAMILY_MANIFEST="$REPO/deploy/families/pm_us_crh_v2.json"
+# L-38: every REGISTERED, venue=polymarket_us family manifest under
+# deploy/families -- one scorer invocation per (city, manifest) pair below.
+# Overridable so tests can point at a worktree's own deploy/families
+# instead of the deployed tree's (mirrors family-tally-v2-run.sh's own
+# BREEZY_FAMILY_TALLY_V2_FAMILIES_DIR override).
+FAMILIES_DIR="${BREEZY_SCORE_LIVE_TRIALS_FAMILIES_DIR:-$REPO/deploy/families}"
 STORE_DIR=${BREEZY_SCORED_TRIALS_DIR:-$HOME/.local/share/breezy/derived/scored_trials}
 OUT=${BREEZY_LIVE_TALLY_OUTPUT_DIR:-$HOME/.local/share/breezy/derived}
 LOG=$OUT/score_live_trials.log
@@ -37,6 +64,35 @@ V1_D0_LITERAL="2026-09-05"  # PREREG v1 §6:130
 mkdir -p "$OUT"
 
 say() { echo "$(date -u +%Y-%m-%dT%H:%M:%SZ) $*" >> "$LOG"; }
+
+# L-38: enumerate every REGISTERED, venue=polymarket_us family manifest --
+# same grep/sed extraction idiom family-tally-v2-run.sh already uses for
+# `family_id` (never a second JSON parser for a shell script). Populates
+# the "$manifest_path:$family_id" array the city loop below iterates.
+manifest_field() {
+  grep -o "\"$2\"[[:space:]]*:[[:space:]]*\"[^\"]*\"" "$1" | head -n1 \
+    | sed -E 's/.*:[[:space:]]*"([^"]*)"/\1/'
+}
+
+FAMILY_MANIFESTS=()
+for manifest in "$FAMILIES_DIR"/*.json; do
+  [ -e "$manifest" ] || continue
+  status=$(manifest_field "$manifest" status)
+  venue=$(manifest_field "$manifest" venue)
+  family_id=$(manifest_field "$manifest" family_id)
+  if [ -z "$family_id" ]; then
+    continue  # not a family manifest (e.g. a boundary-artefact JSON)
+  fi
+  if [ "$venue" != "polymarket_us" ]; then
+    say "SKIP $manifest -- venue=$venue (this wrapper scores polymarket_us only)"
+    continue
+  fi
+  if [ "$status" != "REGISTERED" ]; then
+    say "SKIP $manifest -- status=$status (not REGISTERED)"
+    continue
+  fi
+  FAMILY_MANIFESTS+=("$manifest:$family_id")
+done
 
 STAMP=$(date -u +%Y-%m-%d)
 STATUS=0
@@ -109,16 +165,32 @@ if [ -z "$STATIONS" ]; then
   exit 1
 fi
 
+if [ "${#FAMILY_MANIFESTS[@]}" -eq 0 ]; then
+  say "SCORE LIVE TRIALS SKIPPED -- no REGISTERED polymarket_us family manifest found in $FAMILIES_DIR"
+  exit 1
+fi
+
+# L-38: one scorer invocation per (city, REGISTERED family manifest) pair,
+# each family's rows written to its OWN $STORE_DIR/<family_id> subdirectory
+# -- never a shared top-level directory (family_tally_v2.py's
+# filter_rows_to_manifest_prefix refuses a store contaminated by another
+# family's rows). A per-city failure marks STATUS=1 but every remaining
+# (city, family) pair is still attempted, matching the pre-L-38 per-city
+# failure behaviour.
 for CITY in $STATIONS; do
-  if "$PY" "$REPO/scripts/analysis/score_live_trials.py" \
-       --city "$CITY" \
-       --family-manifest "$FAMILY_MANIFEST" \
-       --derived-dir "$STORE_DIR" >>"$LOG" 2>&1; then
-    say "scorer ok for city $CITY"
-  else
-    say "SCORER FAILED for city $CITY"
-    STATUS=1
-  fi
+  for ENTRY in "${FAMILY_MANIFESTS[@]}"; do
+    MANIFEST_PATH="${ENTRY%%:*}"
+    FAMILY_ID="${ENTRY##*:}"
+    if "$PY" "$REPO/scripts/analysis/score_live_trials.py" \
+         --city "$CITY" \
+         --family-manifest "$MANIFEST_PATH" \
+         --derived-dir "$STORE_DIR/$FAMILY_ID" >>"$LOG" 2>&1; then
+      say "scorer ok for city $CITY family $FAMILY_ID"
+    else
+      say "SCORER FAILED for city $CITY family $FAMILY_ID"
+      STATUS=1
+    fi
+  done
 done
 
 if [ "$STATUS" -eq 0 ]; then
