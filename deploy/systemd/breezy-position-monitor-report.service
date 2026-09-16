@@ -1,0 +1,67 @@
+[Unit]
+# INC-6 driver for the position-monitor nightly report
+# (docs/plans/INTRADAY_POSITION_MONITOR_2026-09-15.md Sec 4/6), triggered by
+# breezy-position-monitor-report.timer. Sibling of
+# breezy-score-live-trials.service: same oneshot/no-Install shape, same
+# wrapper-script driver style
+# (deploy/systemd/position-monitor-report-run.sh) -- the timer owns cadence,
+# the script owns the work.
+#
+# This unit joins the intra-day position monitor's own summary store
+# (SHADOW-ONLY -- never submits, modifies, or cancels an order) against the
+# 14:15 UTC live-fill scorer's store and writes one dated JSON + Markdown
+# report. It holds no venue credential and opens no socket.
+Description=Breezy INC-6 position-monitor nightly report (daily)
+Documentation=file:///home/jon/breezy/deploy/systemd/README.md
+Documentation=file:///home/jon/breezy/scripts/analysis/position_monitor_nightly_report.py
+Documentation=file:///home/jon/breezy/docs/plans/INTRADAY_POSITION_MONITOR_2026-09-15.md
+
+[Service]
+Type=oneshot
+WorkingDirectory=/home/jon/breezy
+
+# Own cgroup memory ceiling, modest: this unit reads two already-persisted
+# parquet stores (monitor summaries + scored trials) via pyarrow, the same
+# class of local-disk-only, non-tape-scan read as
+# breezy-score-live-trials.service (MemoryHigh=1G/MemoryMax=2G, see that
+# unit's own comment) -- never a raw tape scan like the heavy nightly
+# studies (breezy-k1-daily/-mb-daily/-offer-gate-daily,
+# MemoryHigh=12G/MemoryMax=16G). No incident has measured this exact
+# script's footprint yet, so the ceiling is set at half the score-live-
+# trials sibling's, not zero: a runaway run's OOM lands on the report,
+# never the node.
+MemoryHigh=512M
+MemoryMax=1G
+
+# Shares the studies' aggregate ceiling and host-wide flock (see
+# position-monitor-report-run.sh's own lock preamble and the slice file's
+# comment) -- a deliberate, explicit opt-in rather than claiming the
+# README's "light-job exemption" (score-live-trials/live-tally/pm-crh-v2-
+# tally, all <=1GB/<=60s): this unit reads from the SAME quote-tape-catalog-
+# derived directory tree the heavy studies write near, so it stays under
+# the shared discipline rather than being asserted independently exempt.
+Slice=breezy-studies.slice
+UMask=0077
+
+# No EnvironmentFile: this process holds NO venue credential and opens no
+# socket. It reads two parquet stores from disk, both of which resolve to
+# absolute defaults when the wrapper's own overrides are unset (mirrors
+# breezy-k1-daily.service's own "No EnvironmentFile" stance).
+ExecStart=/home/jon/breezy/deploy/systemd/position-monitor-report-run.sh
+
+# The report is a bounded parquet join over one day's accumulation --
+# generous but far under breezy-score-live-trials's own 1200 s budget
+# (that unit also runs a station-day scan the report does not).
+TimeoutStartSec=600
+
+# No Restart=. A missed run is not an incident on its own -- the summary and
+# scored-trials stores keep accumulating and tomorrow's run subsumes
+# today's. The timer's Persistent=true is what recovers a run missed across
+# a reboot.
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=breezy-position-monitor-report
+
+# NOTE: no [Install] section. This unit is started BY the timer, never
+# enabled directly. `systemctl --user enable
+# breezy-position-monitor-report.timer` is the only thing to enable.

@@ -1748,6 +1748,45 @@ class TestStationDayAdmission:
             )
         assert got == Refusal(STATION_DAY_ADMISSION_REASON)
 
+    def test_the_2026_09_15_mdw_yes_pair_admits_at_the_arm_time_gate(
+        self, store_path: Path,
+    ) -> None:
+        """ADM-1 regression pin (docs/core/PROGRESS.md row ADM-1): MDW took
+        YES [80,81] @0.11 then YES [82,83] @0.24 with NO arm-time admission
+        check at all (the defect). Their break-evens (q for a YES leg is
+        `BE` itself, `_cell_probability`) sum to 0.3581 + 0.5944 = 0.9525 <=
+        1 -- the arm-time gate this fix wires onto the YES path must ADMIT
+        this exact historical pair, not merely some synthetic one, once a
+        FILLED prior leg's `fee` is genuinely known (the strategy-level
+        regression, `test_two_yes_rungs_on_one_station_day_both_arm_before_
+        either_fills`, covers the currently-reachable no-prior-fill shape;
+        this pins the arithmetic itself against the real incident numbers).
+        """
+        first_leg = "POLY-MDW-TMAX-80-81"
+        store = SqliteStateStore(store_path)
+        with open_submit_intent_latch(store, store_path) as intent_latch:
+            latch = open_trial_day_latch(intent_latch)
+            latch.consume(
+                STATION,
+                CLIMATE_DAY,
+                latched_at_ns=NOW_NS,
+                instrument_id=first_leg,
+                ask=Decimal("0.11"),
+                reason="taken",
+                fee=Decimal("0.3581") - Decimal("0.11"),
+                key_instrument_id=first_leg,
+            )
+            got = station_day_admission(
+                store,
+                DEFAULT_TRIAL_KEY_PREFIX,
+                STATION,
+                CLIMATE_DAY,
+                "yes",
+                Decimal("0.5944"),
+                existing_instrument_ids=(first_leg,),
+            )
+        assert got is None
+
     def test_a_merely_refused_existing_record_does_not_count_toward_the_sum(
         self, store_path: Path,
     ) -> None:

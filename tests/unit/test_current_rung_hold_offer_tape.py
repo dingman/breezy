@@ -10,14 +10,28 @@ This module pins that the JSONL sidecar's output is BYTE-IDENTICAL to what
 ``json.dumps(dataclasses.asdict(record), sort_keys=True)`` produced before
 the refactor: every field name, present, with the exact same value, in the
 same (sorted) key order.
+
+GAP fix (2026-09-15): ``OfferTapeRecord`` grew nine postmortem-observability
+fields (``side``/``p_bound``/``break_even``/running-max interval/staleness/
+fee coefficient/``observed_at_ns``/``admission_reason``/``decision``) --
+the fixture and expected dict below now cover the FULL current shape
+(sanctioned schema growth, not a weakening of this pin: every original key
+and value is unchanged, only new keys were appended).
 """
 
 from __future__ import annotations
 
 import json
+from decimal import Decimal
 from pathlib import Path
 
-from breezy.strategy.current_rung_hold.offer_tape import OfferTape, OfferTapeRecord
+import pytest
+
+from breezy.strategy.current_rung_hold.offer_tape import (
+    DEFAULT_OFFER_TAPE_MAXLEN,
+    OfferTape,
+    OfferTapeRecord,
+)
 
 _RECORD = OfferTapeRecord(
     station="KJFK",
@@ -36,12 +50,23 @@ _RECORD = OfferTapeRecord(
     prior_eligible_snaps=3,
     illegal_cell=False,
     source="depth",
+    side="YES",
+    p_bound=Decimal("0.6982"),
+    break_even=Decimal("0.81"),
+    running_max_lower=Decimal(87),
+    running_max_upper=Decimal(87),
+    running_max_exact=True,
+    staleness_ns=1_000_000_000,
+    fee_coefficient=Decimal("0.06"),
+    observed_at_ns=1_787_617_188_000_000_000,
+    admission_reason=None,
+    decision="refuse",
 )
 
 #: The exact shape ``json.dumps(dataclasses.asdict(_RECORD), sort_keys=True)``
-#: produced before the refactor -- every field name and value, independently
-#: hand-derived from ``OfferTapeRecord``'s own field list, never copy-pasted
-#: from the implementation under test.
+#: would produce -- every field name and value, independently hand-derived
+#: from ``OfferTapeRecord``'s own field list, never copy-pasted from the
+#: implementation under test.
 _EXPECTED_DICT: dict[str, object] = {
     "station": "KJFK",
     "climate_day": "2026-08-25",
@@ -59,7 +84,39 @@ _EXPECTED_DICT: dict[str, object] = {
     "prior_eligible_snaps": 3,
     "illegal_cell": False,
     "source": "depth",
+    "side": "YES",
+    "p_bound": "0.6982",
+    "break_even": "0.81",
+    "running_max_lower": "87",
+    "running_max_upper": "87",
+    "running_max_exact": True,
+    "staleness_ns": 1_000_000_000,
+    "fee_coefficient": "0.06",
+    "observed_at_ns": 1_787_617_188_000_000_000,
+    "admission_reason": None,
+    "decision": "refuse",
 }
+
+_OLD_SHAPE_KEYS = frozenset(
+    {
+        "station",
+        "climate_day",
+        "instrument_id",
+        "ask",
+        "size",
+        "reason",
+        "ts_event",
+        "hour_lst",
+        "width_code",
+        "m_code",
+        "trigger",
+        "quote_age_ns",
+        "minutes_since_window_open",
+        "prior_eligible_snaps",
+        "illegal_cell",
+        "source",
+    }
+)
 
 
 def test_to_dict_matches_the_pre_refactor_asdict_shape_exactly() -> None:
@@ -117,3 +174,114 @@ def test_offer_tape_record_no_longer_calls_asdict() -> None:
         )
     ]
     assert asdict_calls == [], "offer_tape.py must never call dataclasses.asdict again"
+
+
+def test_a_pre_gap_fix_record_still_defaults_the_new_keys() -> None:
+    """GAP fix 2026-09-15 RED: a record built with ONLY the pre-fix (old
+    15-field) shape -- exactly how ``continuous_strategy.py`` constructed
+    every ``OfferTapeRecord`` before this fix -- must still construct and
+    serialize, defaulting every new key rather than raising."""
+    old_shape_record = OfferTapeRecord(
+        station="KJFK",
+        climate_day="2026-08-25",
+        instrument_id="tc-temp-nyc-2026-08-25.POLYMARKET_US",
+        ask="0.80",
+        size=1,
+        reason="edge_below_break_even",
+        ts_event=1_787_617_188_120_237_895,
+        hour_lst=14,
+        width_code=2,
+        m_code=1,
+        trigger="on_quote_tick",
+        quote_age_ns=5_000_000_000,
+        minutes_since_window_open=12,
+        prior_eligible_snaps=3,
+        illegal_cell=False,
+        source="depth",
+    )
+    as_dict = old_shape_record.to_dict()
+    assert _OLD_SHAPE_KEYS <= set(as_dict)
+    assert as_dict["side"] == "YES"
+    assert as_dict["p_bound"] is None
+    assert as_dict["break_even"] is None
+    assert as_dict["running_max_lower"] is None
+    assert as_dict["running_max_upper"] is None
+    assert as_dict["running_max_exact"] is False
+    assert as_dict["staleness_ns"] is None
+    assert as_dict["fee_coefficient"] is None
+    assert as_dict["observed_at_ns"] is None
+    assert as_dict["admission_reason"] is None
+    assert as_dict["decision"] == "refuse"
+
+
+def test_an_old_jsonl_line_missing_the_new_keys_still_round_trips_through_from_dict() -> None:
+    """L1 review finding (commit 309dab6): a JSONL line written by the
+    PRE-fix code (only the 16 old keys, no side/p_bound/etc.) is not merely
+    parseable JSON (that assertion was vacuous) -- it round-trips through
+    the reader ``OfferTapeRecord`` lacked until now: ``from_dict`` defaults
+    every GAP-fix key exactly like a record built directly (mirrors
+    ``test_a_pre_gap_fix_record_still_defaults_the_new_keys`` above)."""
+    old_line = json.dumps(
+        {key: getattr(_RECORD, key) for key in _OLD_SHAPE_KEYS}, sort_keys=True,
+    )
+    parsed = json.loads(old_line)
+    assert _OLD_SHAPE_KEYS <= set(parsed)
+    assert "side" not in parsed
+
+    record = OfferTapeRecord.from_dict(parsed)
+
+    as_dict = record.to_dict()
+    for key in _OLD_SHAPE_KEYS:
+        assert as_dict[key] == getattr(_RECORD, key)
+    assert as_dict["side"] == "YES"
+    assert as_dict["p_bound"] is None
+    assert as_dict["break_even"] is None
+    assert as_dict["running_max_lower"] is None
+    assert as_dict["running_max_upper"] is None
+    assert as_dict["running_max_exact"] is False
+    assert as_dict["staleness_ns"] is None
+    assert as_dict["fee_coefficient"] is None
+    assert as_dict["observed_at_ns"] is None
+    assert as_dict["admission_reason"] is None
+    assert as_dict["decision"] == "refuse"
+
+
+def test_a_full_record_round_trips_exactly_through_from_dict_and_to_dict() -> None:
+    """L1 review finding (commit 309dab6): a NEW-shape line (all 27 keys)
+    round-trips byte-for-byte through ``from_dict`` -> ``to_dict``."""
+    round_tripped = OfferTapeRecord.from_dict(_EXPECTED_DICT)
+    assert round_tripped.to_dict() == _EXPECTED_DICT
+
+
+def test_from_dict_refuses_a_payload_missing_a_legacy_key() -> None:
+    """L1 review finding (commit 309dab6): ``from_dict`` is strict on the 16
+    legacy keys -- unlike the GAP-fix keys, these have never been optional."""
+    incomplete = {key: getattr(_RECORD, key) for key in _OLD_SHAPE_KEYS if key != "station"}
+    with pytest.raises(ValueError, match="station"):
+        OfferTapeRecord.from_dict(incomplete)
+
+
+def test_default_offer_tape_maxlen_is_pinned_at_16384() -> None:
+    """M2 review finding (commit 309dab6): YES+NO rows now share one tape,
+    doubling the per-tick row count -- the default is doubled in step so
+    YES retention depth is unchanged."""
+    assert DEFAULT_OFFER_TAPE_MAXLEN == 16384
+
+
+def test_a_file_where_the_sidecar_directory_should_be_still_constructs(
+    tmp_path: Path,
+) -> None:
+    """H1 review finding (commit 309dab6): ``OfferTape.__init__`` must never
+    raise from a blocked sidecar directory (composition.py now resolves a
+    default sidecar path unconditionally) -- construction is best-effort,
+    falling back to in-memory only."""
+    blocker = tmp_path / "blocker"
+    blocker.write_text("not a directory")
+    path = blocker / "sub" / "offer.jsonl"
+
+    tape = OfferTape(path)
+
+    assert tape.sidecar_errors == 1
+    tape.append(_RECORD)
+    assert len(tape) == 1
+    assert not path.exists()

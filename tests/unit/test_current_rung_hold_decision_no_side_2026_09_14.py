@@ -149,7 +149,11 @@ def test_a_clean_no_take_inverts_the_bid_and_reads_p_hold_upper() -> None:
 def test_no_edge_below_break_even_is_refused() -> None:
     # bid=0.10 -> NO_ask=0.90, break_even~0.91, far above p_miss_lower=0.2570.
     decision = evaluate_decision(_no_case_inputs(bid=Decimal("0.10")))
-    assert decision == Refuse("edge_below_break_even")
+    # GAP fix 2026-09-15: `Refuse` now carries the numeric p_bound/break_even
+    # that produced this refusal (offer-tape postmortem observability).
+    assert decision == Refuse(
+        "edge_below_break_even", p_bound=_P_MISS_LOWER, break_even=Decimal("0.91")
+    )
 
 
 def test_no_missing_bid_is_not_executable() -> None:

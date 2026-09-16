@@ -130,6 +130,7 @@ from breezy.strategy.current_rung_hold.trial_day_latch import (
     TAKEN_FROM_FILL_WALK_REASON,
     TrialDayRecord,
     TrialDayRecordCorrupt,
+    trial_id_for,
 )
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -695,7 +696,12 @@ def read_filled_trials_state_db(
         if not isinstance(key, str) or not key.startswith(family_prefix):
             continue
         parts = key[len(family_prefix) :].split("/")
-        if len(parts) == 2 and parts[0] in station_census:
+        # v3 (plan S1, operator ruling 2026-09-14): an instrument-keyed
+        # latch key is 3-part (`station/climate_day/instrument_id`, built by
+        # `trial_day_latch._key`) -- the station segment is still `parts[0]`
+        # either way, so the census check widens to `(2, 3)` rather than
+        # gaining a second branch.
+        if len(parts) in (2, 3) and parts[0] in station_census:
             has_census_latch = True
             break
     if not has_census_latch:
@@ -722,9 +728,18 @@ def read_filled_trials_state_db(
         if not isinstance(key, str) or not key.startswith(family_prefix):
             continue
         parts = key[len(family_prefix) :].split("/")
-        if len(parts) != 2:
+        # v3 (plan S1, operator ruling 2026-09-14 -- "I never wanted a limit
+        # of 1 contract per station"): `trial_day_latch._key` also writes a
+        # 3-part `station/climate_day/instrument_id` shape. `key_instrument_id`
+        # is `None` for the legacy 2-part shape (v2's only shape, unchanged
+        # below) and the raw third segment for the 3-part shape.
+        if len(parts) == 2:
+            station, climate_day = parts
+            key_instrument_id: str | None = None
+        elif len(parts) == 3:
+            station, climate_day, key_instrument_id = parts
+        else:
             continue
-        station, climate_day = parts
         if climate_day < since_climate_day:
             continue
         try:
@@ -742,8 +757,28 @@ def read_filled_trials_state_db(
         # (below), never dropped here as if it were a refusal.
         if record.reason not in (_TAKEN_REASON, TAKEN_FROM_FILL_WALK_REASON):
             continue
+        if key_instrument_id is None:
+            trial_id = key
+        else:
+            # The key's own instrument-id segment must agree with the
+            # decoded record's `instrument_id` field -- compared through
+            # `trial_id_for` (the latch's own public normalization wrapper,
+            # never re-derived here) rather than a raw string compare, so a
+            # dotted-vs-bare spelling difference is never mistaken for a
+            # genuine disagreement. A real disagreement is store corruption
+            # (F3's existing convention): fail the whole run closed, never a
+            # silent join on the wrong identity.
+            from_key = trial_id_for(family_prefix, station, climate_day, key_instrument_id)
+            from_record = trial_id_for(family_prefix, station, climate_day, record.instrument_id)
+            if from_key != from_record:
+                raise FillSourceUnreadableError(
+                    f"a record under the {family_prefix!r} key prefix has an "
+                    "instrument-id key segment that disagrees with its own "
+                    "record's instrument_id"
+                )
+            trial_id = from_record
         latches_by_instrument.setdefault(record.instrument_id, []).append(
-            (key, climate_day, record.ask, station, record.venue_order_id, record.reason)
+            (trial_id, climate_day, record.ask, station, record.venue_order_id, record.reason)
         )
 
     fills_by_instrument: dict[str, list[DurableFillRecord]] = {}
@@ -1020,9 +1055,14 @@ def find_unresolved_takes(
     city: str,
     since_climate_day: str,
 ) -> tuple[UnresolvedTake, ...]:
-    """Every `{family_prefix}{city}/{climate_day}` latch with
-    `reason="taken"` (on or after `since_climate_day`) that has no matching
-    `DurableFillRecord` anywhere in the store (I4 defect fix).
+    """Every `{family_prefix}{city}/{climate_day}` (v2) or
+    `{family_prefix}{city}/{climate_day}/{instrument_id}` (v3,
+    instrument-keyed, `trial_day_latch._key`) latch with `reason="taken"`
+    (on or after `since_climate_day`) that has no matching
+    `DurableFillRecord` anywhere in the store (I4 defect fix). `.trial` is
+    the raw key for a v2 (2-part) latch, or the canonical
+    `trial_id_for(...)` string for a v3 (3-part) latch -- exactly
+    `read_filled_trials_state_db`'s own `trial_id` convention.
 
     Restricted to THIS run's own `city` (mirrors `read_filled_trials_state_db`'s
     cross-city convention, F1): a shared store's other cities' own taken
@@ -1036,11 +1076,14 @@ def find_unresolved_takes(
 
     Fail-closed on the SAME latch/fill corruption as
     `read_filled_trials_state_db` (F3): an undecodable `TrialDayRecord` or
-    `DurableFillRecord` is store corruption, never a silent skip. The
-    account-wide submit-intent singleton is the one exception -- it is
-    read-only diagnostic context for the sidecar row only, so a missing or
-    undecodable intent record degrades to `intent_state="absent"` rather
-    than failing this visibility-only reader closed.
+    `DurableFillRecord` is store corruption, never a silent skip -- including
+    a v3 latch key's instrument-id segment disagreeing with its own
+    record's `instrument_id` (compared via `trial_id_for`, mirroring
+    `read_filled_trials_state_db` exactly). The account-wide submit-intent
+    singleton is the one exception -- it is read-only diagnostic context
+    for the sidecar row only, so a missing or undecodable intent record
+    degrades to `intent_state="absent"` rather than failing this
+    visibility-only reader closed.
     """
     conn = _open_readonly(path)
     if conn is None:
@@ -1057,9 +1100,18 @@ def find_unresolved_takes(
         if not isinstance(key, str) or not key.startswith(family_prefix):
             continue
         parts = key[len(family_prefix) :].split("/")
-        if len(parts) != 2:
+        # v3 (plan S1, operator ruling 2026-09-14): an instrument-keyed
+        # latch key is 3-part (`station/climate_day/instrument_id`, built by
+        # `trial_day_latch._key`) -- mirrors `read_filled_trials_state_db`'s
+        # own `(2, 3)` widening exactly, so a v3 TAKEN-but-unfilled latch is
+        # no longer invisible to this visibility-only census.
+        if len(parts) == 2:
+            station, climate_day = parts
+            key_instrument_id: str | None = None
+        elif len(parts) == 3:
+            station, climate_day, key_instrument_id = parts
+        else:
             continue
-        station, climate_day = parts
         if station != city or climate_day < since_climate_day:
             continue
         try:
@@ -1070,7 +1122,27 @@ def find_unresolved_takes(
             ) from exc
         if record.reason != _TAKEN_REASON:
             continue
-        taken_latches.append((key, climate_day, record.instrument_id, record.ask))
+        if key_instrument_id is None:
+            trial_id = key
+        else:
+            # Mirrors `read_filled_trials_state_db`'s own mismatch refusal
+            # (F3): the key's instrument-id segment must agree with the
+            # decoded record's `instrument_id`, compared through
+            # `trial_id_for` (never a raw string compare) so a
+            # dotted-vs-bare spelling difference is never mistaken for a
+            # genuine disagreement. A real disagreement is store
+            # corruption: fail the whole run closed, never a silent join
+            # on the wrong identity.
+            from_key = trial_id_for(family_prefix, station, climate_day, key_instrument_id)
+            from_record = trial_id_for(family_prefix, station, climate_day, record.instrument_id)
+            if from_key != from_record:
+                raise FillSourceUnreadableError(
+                    f"a record under the {family_prefix!r} key prefix has an "
+                    "instrument-id key segment that disagrees with its own "
+                    "record's instrument_id"
+                )
+            trial_id = from_record
+        taken_latches.append((trial_id, climate_day, record.instrument_id, record.ask))
 
     if not taken_latches:
         return ()

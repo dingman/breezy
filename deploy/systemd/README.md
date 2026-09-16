@@ -635,6 +635,72 @@ too.
 
 ---
 
+## `breezy-position-monitor-report` — INC-6 nightly report (2026-09-15)
+
+`breezy-position-monitor-report.service` + `.timer` run the nightly report
+increment of `docs/plans/INTRADAY_POSITION_MONITOR_2026-09-15.md` (Sec 4
+"Nightly report" / Sec 6 INC-6) via
+`deploy/systemd/position-monitor-report-run.sh`, in the same
+wrapper-owns-the-work style as `score-live-trials-run.sh` /
+`family-tally-v2-run.sh`. Each run invokes
+`scripts/analysis/position_monitor_nightly_report.py`, which joins the
+intra-day position monitor's own summary store (SHADOW-ONLY -- never
+submits, modifies, or cancels an order) against the 14:15 UTC live-fill
+scorer's store on `trial_id`, and writes one dated JSON + Markdown report
+under `~/.local/share/breezy/derived/`
+(`position_monitor_report_<date>.{json,md}`). When an INC-8 corpus summary
+(`~/.local/share/breezy/derived/hypothetical_hold_corpus/
+hypothetical_hold_corpus_report_*.json`) exists, the wrapper passes the
+NEWEST one as `--corpus-summary` so the report's calibration flag reflects
+the corpus accumulation rather than the live monitor's own count alone; no
+unit writes into that directory yet, so its absence is normal.
+
+The monitor's own summaries directory is never a second, hand-maintained
+path: the wrapper derives it the SAME way
+`composition.py::build_continuous_rung_hold_strategies` derives it for the
+live node -- `monitor_root = catalog_root.parent / "monitor"`,
+`summaries_dir = monitor_root / "summaries"` -- from the same quote-tape
+catalog root literal (`BREEZY_POLYMARKET_US_QUOTE_TAPE_CATALOG`) as
+`score-live-trials-run.sh`. It reads the same scored-trials store
+(`BREEZY_SCORED_TRIALS_DIR`) and writes into the same reports directory
+convention (`BREEZY_LIVE_TALLY_OUTPUT_DIR`) as both siblings.
+
+Scheduled at **15:00 UTC** -- free on the existing schedule, strictly after
+`breezy-score-live-trials` (14:15 UTC, the run that populates the
+scored-trials store this report joins against), and outside the protected
+LST-union window -- pinned by `tests/unit/test_deploy_timer_hours.py`. The
+unit carries no `Environment=`/`EnvironmentFile=`: it holds no venue
+credential and opens no socket, mirroring `breezy-k1-daily.service`'s own
+stance.
+
+**Deliberate deviation from the "light-job exemption."** Unlike
+`breezy-score-live-trials`/`breezy-live-tally`/`breezy-pm-crh-v2-tally`
+(all <=1GB/<=60s, exempted from the studies flock/slice above), this unit
+opts INTO `breezy-studies.slice` and the shared host-wide
+`breezy-studies.lock` (same skip-not-kill convention as
+`k1-daily-run.sh`/`mb-daily-run.sh`/`offer-gate-daily-run.sh`: contention
+exits 0, lock-infrastructure failure exits 75) even though it is itself
+light (`MemoryHigh=512M`/`MemoryMax=1G`, well under the 12G/16G heavy-study
+floor) -- it reads from the same quote-tape-catalog-derived directory tree
+the heavy studies write near, so it stays under the shared discipline
+rather than being asserted independently exempt.
+
+Validation performed (no unit activated):
+
+```
+$ bash -n deploy/systemd/position-monitor-report-run.sh
+OK
+```
+
+To activate: symlink both unit files into `~/.config/systemd/user/` (§2's
+pattern), `daemon-reload`, then
+`systemctl --user enable --now breezy-position-monitor-report.timer` --
+never `start` the service directly; see the TRAP section above for the
+post-edit `daemon-reload` discipline that applies to any future edit of
+this unit too.
+
+---
+
 ## `breezy-pm-crh-v2-tally` — PREREG v2 family tally, PM-only (2026-09-04, PREPARED, NOT ACTIVATED)
 
 One concrete unit pair runs `scripts/analysis/family_tally_v2.py` (the CLI

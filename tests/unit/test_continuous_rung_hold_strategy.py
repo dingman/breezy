@@ -363,8 +363,11 @@ def test_on_data_skips_stale_or_future_last_tick(
         assumed_publication_lag_ns=1,
     )
     strategy.on_data(later)
-    assert len(strategy.offer_tape) == 1
-    assert strategy.offer_tape.records()[0].trigger == "on_data"
+    # GAP fix 2026-09-15: `fresh` has no bid, so `_evaluate_no_side_shadow`
+    # ALSO appends its own (side="NO") `not_executable` row -- 2 total.
+    assert len(strategy.offer_tape) == 2
+    yes_record = next(rec for rec in strategy.offer_tape.records() if rec.side == "YES")
+    assert yes_record.trigger == "on_data"
 
 
 def test_timer_calls_empty(
@@ -436,11 +439,20 @@ def test_offer_tape_records_eligible_nonfills_and_is_bounded(
                 ts_event=WINDOW_OPEN_NS + i * NS_PER_MIN,
             ),
         )
+    # GAP fix 2026-09-15: every tick ALSO gets its own (side="NO")
+    # `not_executable` row (no bid on this fixture) -- 2 rows/tick, so the
+    # bounded deque (still exactly `maxlen`) now mixes YES/NO reasons, and
+    # twice as many lines land in the JSONL sidecar.
     assert len(tape) == 3
     assert tape.maxlen == 3
-    assert all(rec.reason == "edge_below_break_even" for rec in tape.records())
+    assert all(
+        rec.reason in ("edge_below_break_even", "not_executable") for rec in tape.records()
+    )
+    assert any(
+        rec.side == "YES" and rec.reason == "edge_below_break_even" for rec in tape.records()
+    )
     lines = (tmp_path / "offer.jsonl").read_text(encoding="utf-8").strip().splitlines()
-    assert len(lines) == 10
+    assert len(lines) == 20
     assert strategy._latch is not None
     assert (
         strategy._latch.is_consumed(
@@ -449,6 +461,121 @@ def test_offer_tape_records_eligible_nonfills_and_is_bounded(
         is False
     )
     assert Decimal("0.80") == Decimal(tape.records()[-1].ask)
+
+
+def test_a_take_appends_an_offer_tape_row_with_decision_inputs_populated(
+    store_path: Path,
+    interior_instrument: BinaryOption,
+) -> None:
+    """GAP fix 2026-09-15 RED: a genuine Take (same fixture as
+    ``test_inflight_commits_before_arm``) must leave one offer-tape row
+    behind carrying every postmortem-reconstruction field -- exactly what
+    the 2026-09-15 SFO take's own row was missing.
+
+    ADM-1 fix (2026-09-15): ``admission_reason`` is now populated for every
+    YES Take row (never bare ``None`` -- that was the ADM-1 defect's own
+    observability symptom: a station-day admission check that never ran
+    left every YES row's ``admission_reason`` unconditionally ``None``,
+    admitted or not). A lone candidate on an otherwise-empty station-day
+    always admits (R3-7), so this row reads ``"admitted"``."""
+    strategy = _register_and_start(store_path=store_path, instruments=(interior_instrument,))
+    strategy.on_data(_observation(temp_c_tenths=300, observed_at_ns=WINDOW_OPEN_NS - 1))
+    strategy.on_quote_tick(_quote(INTERIOR_ID, ask="0.40", ts_event=WINDOW_OPEN_NS))
+    # `_evaluate_no_side_shadow` ALSO appends its own (side="NO") row for
+    # this tick (no bid on this frame -> NO refuses `not_executable`) --
+    # filter to the YES row this test is about.
+    records = [rec for rec in strategy.offer_tape.records() if rec.side == "YES"]
+    assert len(records) == 1
+    record = records[0]
+    assert record.decision == "take"
+    assert record.side == "YES"
+    assert record.p_bound == Decimal("0.6982")
+    assert record.break_even == Decimal("0.41")
+    assert record.running_max_lower == Decimal(86)
+    assert record.running_max_upper == Decimal(86)
+    assert record.running_max_exact is True
+    assert record.staleness_ns is not None
+    assert record.fee_coefficient == Decimal("0.06")
+    assert record.observed_at_ns is not None
+    assert record.admission_reason == "admitted"
+
+
+def test_a_break_even_refusal_appends_the_numeric_p_bound_and_be_that_produced_it(
+    store_path: Path,
+    interior_instrument: BinaryOption,
+) -> None:
+    """GAP fix 2026-09-15 RED: `edge_below_break_even` (same fixture as
+    ``test_refuse_does_not_write_trial``) must leave the ACTUAL numbers that
+    produced the refusal on the row, not just the reason string."""
+    strategy = _register_and_start(store_path=store_path, instruments=(interior_instrument,))
+    strategy.on_data(_observation(temp_c_tenths=300, observed_at_ns=WINDOW_OPEN_NS - 1))
+    strategy.on_quote_tick(_quote(INTERIOR_ID, ask="0.80", ts_event=WINDOW_OPEN_NS))
+    # Filter to the YES row -- `_evaluate_no_side_shadow` also appends its
+    # own (side="NO") row for this tick.
+    record = next(rec for rec in strategy.offer_tape.records() if rec.side == "YES")
+    assert record.decision == "refuse"
+    assert record.reason == "edge_below_break_even"
+    assert record.p_bound == Decimal("0.6982")
+    assert record.break_even == Decimal("0.81")
+    assert not (record.p_bound > record.break_even)
+
+
+def test_a_no_side_evaluation_appends_an_offer_tape_row_with_side_no(
+    store_path: Path,
+    interior_instrument: BinaryOption,
+) -> None:
+    """GAP fix 2026-09-15 RED: the NO shadow path (same admitted fixture as
+    ``test_a_clearing_no_frame_logs_exactly_one_shadow_line_and_submits_
+    nothing``) must ALSO leave an offer-tape row, distinct from the YES
+    row for the same tick, carrying `side="NO"` and its own admission
+    outcome."""
+    strategy = _register_and_start(store_path=store_path, instruments=(interior_instrument,))
+    strategy.on_data(_observation(temp_c_tenths=300, observed_at_ns=WINDOW_OPEN_NS - 1))
+    strategy.on_quote_tick(
+        _quote(INTERIOR_ID, ask="0.90", bid="0.85", ts_event=WINDOW_OPEN_NS)
+    )
+    no_records = [rec for rec in strategy.offer_tape.records() if rec.side == "NO"]
+    assert len(no_records) == 1
+    no_record = no_records[0]
+    assert no_record.decision == "take"
+    assert no_record.admission_reason == "admitted"
+    assert no_record.p_bound is not None
+    assert no_record.break_even is not None
+
+
+def test_a_wait_tick_before_any_observation_appends_no_offer_tape_row(
+    store_path: Path,
+    interior_instrument: BinaryOption,
+) -> None:
+    """GAP fix 2026-09-15 RED: a tick that bails out before an evaluable
+    frame exists (no running max yet -- `_DIAG_NO_RUNNING_MAX_YET`) must
+    never append -- the offer tape would grow unbounded if every WAIT tick
+    logged a row."""
+    strategy = _register_and_start(store_path=store_path, instruments=(interior_instrument,))
+    strategy.on_quote_tick(_quote(INTERIOR_ID, ask="0.40", ts_event=WINDOW_OPEN_NS))
+    assert strategy.offer_tape.records() == ()
+
+
+def test_a_take_logs_one_info_line_mirroring_no_take_shadow(
+    store_path: Path,
+    interior_instrument: BinaryOption,
+) -> None:
+    """GAP fix 2026-09-15 RED (brief item 4): a YES take logs a `take:` INFO
+    line, once per finalized take -- never once per tick."""
+    strategy = _register_and_start(store_path=store_path, instruments=(interior_instrument,))
+    strategy.on_data(_observation(temp_c_tenths=300, observed_at_ns=WINDOW_OPEN_NS - 1))
+    logged: list[str] = []
+    strategy._emit_take_log = logged.append  # type: ignore[method-assign]
+    strategy.on_quote_tick(_quote(INTERIOR_ID, ask="0.40", ts_event=WINDOW_OPEN_NS))
+    strategy.on_quote_tick(_quote(INTERIOR_ID, ask="0.40", ts_event=WINDOW_OPEN_NS + NS_PER_MIN))
+    assert len(logged) == 1
+    assert logged[0].startswith("take: ")
+    assert str(INTERIOR_ID) in logged[0]
+    assert "p_bound=" in logged[0]
+    assert "be=" in logged[0]
+    assert "R=[" in logged[0]
+    assert "staleness_s=" in logged[0]
+    assert "cell=(" in logged[0]
 
 
 def test_an_unwritable_offer_tape_jsonl_path_never_raises_from_hunt_tick(
@@ -470,7 +597,9 @@ def test_an_unwritable_offer_tape_jsonl_path_never_raises_from_hunt_tick(
         )
         strategy.on_data(_observation(temp_c_tenths=300, observed_at_ns=WINDOW_OPEN_NS - 1))
         strategy.on_quote_tick(_quote(INTERIOR_ID, ask="0.80", ts_event=WINDOW_OPEN_NS))
-        assert len(tape) == 1
+        # GAP fix 2026-09-15: this tick ALSO gets its own (side="NO")
+        # `not_executable` row (no bid on this fixture) -- 2 total.
+        assert len(tape) == 2
         assert not (unwritable_dir / "offer.jsonl").exists()
     finally:
         unwritable_dir.chmod(0o700)
@@ -524,11 +653,18 @@ def test_a_one_sided_depth10_ask_drives_the_same_decision_as_the_equivalent_quot
     # inside `_hunt_tick` itself (see `test_a_take_decision_with_permit_none_
     # never_calls_submit_order`), so the durable proof of "same decision
     # path as a QuoteTick" is the offer-tape record, not a post-hoc
-    # `is_inflight` read.
-    assert len(strategy.offer_tape) == 1
-    record = strategy.offer_tape.records()[0]
+    # `is_inflight` read. GAP fix 2026-09-15: this one-sided depth frame has
+    # no real bid, so `_evaluate_no_side_shadow` ALSO appends its own
+    # (side="NO") `not_executable` row for the same tick -- 2 total.
+    assert len(strategy.offer_tape) == 2
+    record = next(rec for rec in strategy.offer_tape.records() if rec.side == "YES")
     assert record.reason == "taken"
     assert record.source == "depth"
+    # M1 review finding (commit 309dab6): the NO row's `ask` is `None` for a
+    # no-bid frame -- there is no `1 - bid` price to report -- never the
+    # empty-string sentinel the pre-fix code wrote.
+    no_record = next(rec for rec in strategy.offer_tape.records() if rec.side == "NO")
+    assert no_record.ask is None
 
 
 def test_a_two_sided_frame_delivered_as_both_quote_and_depth_evaluates_once(
@@ -553,8 +689,12 @@ def test_a_two_sided_frame_delivered_as_both_quote_and_depth_evaluates_once(
     strategy.on_quote_tick(quote)
     strategy.on_order_book_depth(depth)
 
-    assert len(strategy.offer_tape) == 1
-    assert strategy.offer_tape.records()[0].reason == "edge_below_break_even"
+    # GAP fix 2026-09-15: `_evaluate_no_side_shadow` ALSO appends its own
+    # (side="NO") row for this (deduped, evaluated-once) tick -- 2 total,
+    # never 4 (the de-dupe this test actually pins still holds).
+    assert len(strategy.offer_tape) == 2
+    yes_record = next(rec for rec in strategy.offer_tape.records() if rec.side == "YES")
+    assert yes_record.reason == "edge_below_break_even"
 
 
 def _order_denied(strategy: ContinuousRungHoldStrategy, *, reason: str) -> Any:
@@ -963,8 +1103,15 @@ def test_an_unarmed_strategy_never_records_an_attempt_across_many_eligible_depth
         )
         strategy.on_order_book_depth(depth)
 
-    assert len(strategy.offer_tape) == 5
-    assert all(record.reason == "taken" for record in strategy.offer_tape.records())
+    # GAP fix 2026-09-15: no bid on any of these 5 frames, so
+    # `_evaluate_no_side_shadow` ALSO appends its own (side="NO")
+    # `not_executable` row per frame -- 10 total, 5 YES + 5 NO.
+    yes_records = [rec for rec in strategy.offer_tape.records() if rec.side == "YES"]
+    no_records = [rec for rec in strategy.offer_tape.records() if rec.side == "NO"]
+    assert len(strategy.offer_tape) == 10
+    assert len(yes_records) == 5
+    assert all(record.reason == "taken" for record in yes_records)
+    assert all(record.reason == "not_executable" for record in no_records)
     assert submitted == []  # unarmed `_maybe_submit` never calls `submit_order`
     assert strategy._latch.attempt_state(
         STATION, CLIMATE_DAY.isoformat(), key_instrument_id=str(INTERIOR_ID)
@@ -1539,7 +1686,11 @@ def test_a_standing_pre_arm_refusal_burns_three_attempts_and_then_stops_forever(
         3,
         WINDOW_OPEN_NS + 2 * 120 * _S,
     )
-    assert len(strategy.offer_tape) == 3
+    # GAP fix 2026-09-15: each of the 3 loop ticks has no bid, so
+    # `_evaluate_no_side_shadow` ALSO appends its own (side="NO")
+    # `not_executable` row per tick -- 6 total (3 YES + 3 NO); the 4th/5th
+    # denied-forever ticks never reach the offer-tape append point at all.
+    assert len(strategy.offer_tape) == 6
 
     # And a fifth, far later: still denied, still no fourth arm.
     strategy.on_quote_tick(
@@ -1557,7 +1708,11 @@ def test_a_standing_pre_arm_refusal_burns_three_attempts_and_then_stops_forever(
         3,
         WINDOW_OPEN_NS + 2 * 120 * _S,
     )
-    assert len(strategy.offer_tape) == 3
+    # GAP fix 2026-09-15: each of the 3 loop ticks has no bid, so
+    # `_evaluate_no_side_shadow` ALSO appends its own (side="NO")
+    # `not_executable` row per tick -- 6 total (3 YES + 3 NO); the 4th/5th
+    # denied-forever ticks never reach the offer-tape append point at all.
+    assert len(strategy.offer_tape) == 6
 
 
 # ---------------------------------------------------------------------------

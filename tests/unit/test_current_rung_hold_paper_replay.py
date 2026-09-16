@@ -409,8 +409,18 @@ def test_a_one_sided_depth_only_replay_delivers_on_order_book_depth_to_continuou
 
     assert len(delivered) == 1
     assert delivered[0].instrument_id == instrument.id
-    assert len(strategy.offer_tape) == 1
-    assert strategy.offer_tape.records()[0].source == "depth"
+    # GAP fix 2026-09-15 (commit 309dab6): a finalized evaluation now appends
+    # one YES-side and one NO-side `OfferTapeRecord` -- 2 total, not 1. The
+    # NO row carries its own composite `<slug>^no` instrument id (per
+    # `trial_day_latch`'s NO-leg convention), so only the YES row is checked
+    # against `instrument.id`.
+    assert len(strategy.offer_tape) == 2
+    records = strategy.offer_tape.records()
+    yes_record = next(record for record in records if record.side == "YES")
+    no_record = next(record for record in records if record.side == "NO")
+    assert yes_record.instrument_id == str(instrument.id)
+    assert yes_record.source == "depth"
+    assert no_record.side == "NO"
 
 
 # ---------------------------------------------------------------------------

@@ -96,7 +96,10 @@ def test_a_normal_book_proves_be_yes_plus_be_no_exceeds_one() -> None:
     # two sides' break-evens cannot both be admissible on the same rung.
     result = _both_sides()
     assert isinstance(result.yes, Take)
-    assert result.no == Refuse("edge_below_break_even")
+    # GAP fix 2026-09-15: `Refuse` now carries the numeric p_bound/break_even
+    # that produced this refusal; `.reason` is this test's actual subject.
+    assert isinstance(result.no, Refuse)
+    assert result.no.reason == "edge_below_break_even"
     assert result.yes.break_even + Decimal("0.91") > Decimal(1)
 
 

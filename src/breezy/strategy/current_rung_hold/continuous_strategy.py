@@ -84,6 +84,7 @@ from breezy.strategy.current_rung_hold.trial_day_latch import (
     SIBLING_LEG_TRADED_REASON,
     STATION_DAY_ADMISSION_REASON,
     TAKEN_FROM_FILL_WALK_REASON,
+    Refusal,
     TrialDayLatch,
     TrialDayLatchError,
     TrialDayRecord,
@@ -97,7 +98,10 @@ from breezy.strategy.current_rung_hold.trial_day_latch import (
 )
 from breezy.strategy.depth10 import best_order
 from breezy.strategy.weather_common.refusals import RefusalAlerter, RefusalCounter
-from breezy.strategy.weather_common.running_extreme import RunningExtremeAccumulator
+from breezy.strategy.weather_common.running_extreme import (
+    RunningExtremeAccumulator,
+    RunningMax,
+)
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
     from nautilus_trader.core.data import Data
@@ -112,6 +116,13 @@ __all__ = [
 ]
 
 _NS_PER_MINUTE: Final[int] = 60_000_000_000
+#: GAP fix 2026-09-15: for the `take:` log line's `staleness_s=` field only.
+_NS_PER_SECOND: Final[int] = 1_000_000_000
+#: GAP fix 2026-09-15: `NO_ask = 1 - bid`, for the NO-side offer-tape row's
+#: `ask` field ONLY when `no_decision` is a `Refuse` that never reached a
+#: `Take.limit_price` -- mirrors `decision.py`'s own inversion exactly,
+#: recomputed here purely for logging (never for a decision).
+_ONE: Final[Decimal] = Decimal(1)
 _CLASS_NAME: Final[str] = "ContinuousRungHoldStrategy"
 #: S3b (plan NO_SIDE_EDGE_2026-09-14 S4/S5): the NO leg's Take is evaluated
 #: and gated every tick. FLIPPED to `False` by this commit (S5 Track C,
@@ -296,6 +307,31 @@ def _startup_evidence_summary(
     )
 
 
+def _per_contract_reconciled_fee(record: DurableFillRecord) -> Decimal | None:
+    """The per-contract fee a `DurableFillRecord` supports, when known.
+
+    ONE shared derivation for both `TrialDayRecord.fee` call sites (companion
+    ruling to option B, domain review of a9fd0fb): `ContinuousRungHoldStrategy
+    ._recorded_fee_for` (create-path fill, `_consume_or_flag_duplicate`) and
+    `_consume_trial_from_fill_record` (the boot never-arm walk's fill-record
+    join). The boot walk re-adopts open positions through this join on every
+    16:50Z reboot, so a fee derivation that only ran on the create path would
+    re-impose the unknown-fee refusal on any later rung of that station-day
+    after every restart -- this function makes both sites agree byte-for-byte.
+
+    `None` unless `record` is `fee_reconciled` and carries a positive
+    `cumulative_qty` -- an unreconciled or zero-qty record leaves `q`
+    UNKNOWN, and `station_day_admission` must keep refusing rather than
+    guess (never relaxed by this helper). Deliberately NEVER
+    `event.commission`: the resolver path emits a synthetic `Money(0)`
+    there, indistinguishable from a genuine zero fee (PREREG v3
+    fee-unreconciled-residual ruling).
+    """
+    if not record.fee_reconciled or record.cumulative_qty <= 0:
+        return None
+    return record.cumulative_fee / record.cumulative_qty
+
+
 class Phase0PermitForbiddenError(RuntimeError):
     """A non-None `order_submission_permit` was given in Phase 0.
 
@@ -411,6 +447,10 @@ class ContinuousRungHoldStrategy(Strategy):
         #: instrument id), for the life of the process, mirroring
         #: `_illegal_cell_station_days`.
         self._no_refuse_notice: set[tuple[str, str, str]] = set()
+        #: GAP fix 2026-09-15 (brief item 4): dedupe for the `take:` INFO
+        #: line -- once per (station, climate_day, YES instrument id), for
+        #: the life of the process, mirroring `_no_refuse_notice` above.
+        self._take_log_notice: set[tuple[str, str, str]] = set()
         #: INC-5 (intra-day position monitor, SHADOW-ONLY): `None` (default)
         #: means every monitor hook below is a no-op -- byte-identical
         #: behaviour to before this field existed. A composition root wires
@@ -748,6 +788,13 @@ class ContinuousRungHoldStrategy(Strategy):
                 # reason, so the scorer's L-25 guard skips it BY REASON.
                 reason=TAKEN_FROM_FILL_WALK_REASON,
                 venue_order_id=fill_record.venue_order_id,
+                # Companion to the create-path fix (option B, domain review
+                # of a9fd0fb): this record is ALREADY in hand, so the SAME
+                # derivation `_recorded_fee_for` uses is applied directly --
+                # without this, every 16:50Z reboot's re-adoption of an open
+                # position through this walk would re-impose the
+                # unknown-fee refusal on any later rung of the station-day.
+                fee=_per_contract_reconciled_fee(fill_record),
             ),
             key_instrument_id=instrument_id,
         )
@@ -1092,6 +1139,12 @@ class ContinuousRungHoldStrategy(Strategy):
         width_code, m_code = width_and_m(facts, running_max)
         instrument = self.cache.instrument(snapshot.instrument_id)
         fee_coefficient = self._guarded_fee_coefficient(instrument)
+        # GAP fix 2026-09-15 (offer-tape postmortem observability): named
+        # once so the offer-tape row below and the NO-side shadow evaluation
+        # log the SAME staleness the decision was actually evaluated
+        # against, rather than two independent (if numerically identical)
+        # calls -- pure extraction, no behaviour change.
+        staleness_ns = accumulator.staleness_ns(now_ns)
         # S3b (plan NO_SIDE_EDGE_2026-09-14 S3/S4): both sides are evaluated
         # from the SAME frame every tick. `decision` (YES) continues through
         # the existing arm/submit path below, byte-identical to before this
@@ -1109,7 +1162,7 @@ class ContinuousRungHoldStrategy(Strategy):
             bid=snapshot.bid,
             bid_size=snapshot.bid_size,
             running_max=running_max,
-            staleness_ns=accumulator.staleness_ns(now_ns),
+            staleness_ns=staleness_ns,
             config=self._config,
             hour_lst=hour_lst,
             width_code=width_code,
@@ -1124,11 +1177,105 @@ class ContinuousRungHoldStrategy(Strategy):
             no_decision=both_sides.no,
             now_ns=now_ns,
             bid_size=snapshot.bid_size,
+            bid=snapshot.bid,
+            hour_lst=hour_lst,
+            width_code=width_code,
+            m_code=m_code,
+            fee_coefficient=fee_coefficient,
+            staleness_ns=staleness_ns,
+            running_max=running_max,
         )
+
+        # ADM-1 fix (2026-09-15, docs/core/PROGRESS.md row ADM-1): the YES
+        # arm path never ran the two S4 latch-level gates the NO shadow
+        # path immediately above already runs -- R-10 registers this gate
+        # for BOTH legs (plan MULTI_POSITION_PER_STATION_2026-09-14.md
+        # SS13/SS16: "the tally gate stays as defence in depth and must
+        # never fire on a day the arm-time gate admitted"). Evaluated ONLY
+        # for a Take -- a Refuse never reaches `_maybe_submit`/IN_FLIGHT
+        # below, so it needs no admission check and `yes_admission_refusal`
+        # stays `None` for it (never surfaced on the offer-tape row either,
+        # mirroring `_evaluate_no_side_shadow`'s own `not isinstance(...,
+        # Take)` early branch). Mirrors the NO path's own gate ORDER
+        # (sibling first, then Sigma-q) and its own `existing_instrument_
+        # ids` construction verbatim (today's ladder plus any durable fill
+        # joined to this station-day, each leg deduped with its sibling) --
+        # see `_evaluate_no_side_shadow`'s matching block below for the
+        # shared rationale (TrialDayLatch has no public accessor for its
+        # store/key-prefix; these two gate functions are pure over exactly
+        # those by design).
+        yes_admission_refusal: Refusal | None = None
+        if isinstance(decision, Take):
+            store = self._latch._store
+            prefix = self._latch._key_prefix
+            yes_admission_refusal = refuse_if_sibling_leg_traded(
+                store, prefix, station, climate_day_key, iid,
+            )
+            if yes_admission_refusal is None:
+                existing_ids: list[str] = []
+                seen_ids: set[str] = set()
+
+                def _add_leg(instrument_id_obj: InstrumentId) -> None:
+                    leg_iid = str(instrument_id_obj)
+                    if leg_iid in seen_ids:
+                        return
+                    seen_ids.add(leg_iid)
+                    existing_ids.append(leg_iid)
+
+                for other_iid, other_facts in self._facts.items():
+                    if (
+                        other_facts.settlement_station,
+                        other_facts.climate_day.isoformat(),
+                    ) != station_day:
+                        continue
+                    other_iid_obj = InstrumentId.from_str(other_iid)
+                    _add_leg(other_iid_obj)
+                    _add_leg(sibling_instrument_id(other_iid_obj))
+                for fill_record in self._latch.iter_fill_records(
+                    self._candidate_instrument_ids(),
+                ):
+                    joined = self._join_fill_to_station_day(
+                        InstrumentId.from_str(fill_record.instrument_id),
+                    )
+                    if joined != station_day:
+                        continue
+                    fill_iid_obj = InstrumentId.from_str(fill_record.instrument_id)
+                    _add_leg(fill_iid_obj)
+                    _add_leg(sibling_instrument_id(fill_iid_obj))
+                yes_admission_refusal = station_day_admission(
+                    store,
+                    prefix,
+                    station,
+                    climate_day_key,
+                    "yes",
+                    decision.break_even,
+                    existing_instrument_ids=tuple(existing_ids),
+                )
 
         reason = decision.reason if isinstance(decision, Refuse) else "taken"
         prior = self._eligible_snap_counts.get(station_day, 0)
         illegal = isinstance(decision, Refuse) and decision.reason == "illegal_cell"
+        # GAP fix 2026-09-15: the decision-input fields a postmortem needs
+        # (p_bound/break_even/running-max interval/staleness/fee
+        # coefficient) -- read off `decision` (Take) or left `None` (Refuse
+        # never reached the table lookup, except `edge_below_break_even`,
+        # which `Refuse` itself now carries). Pure observability: neither
+        # branch below changes `decision` or anything it drives.
+        offer_admission_reason: str | None
+        if isinstance(decision, Take):
+            offer_p_bound: Decimal | None = decision.p_hold_lower
+            offer_break_even: Decimal | None = decision.break_even
+            if yes_admission_refusal is None:
+                offer_decision_label = "take"
+                offer_admission_reason = "admitted"
+            else:
+                offer_decision_label = "refuse"
+                offer_admission_reason = yes_admission_refusal.reason
+        else:
+            offer_p_bound = decision.p_bound
+            offer_break_even = decision.break_even
+            offer_decision_label = "refuse"
+            offer_admission_reason = None
         self.offer_tape.append(
             OfferTapeRecord(
                 station=station,
@@ -1147,6 +1294,17 @@ class ContinuousRungHoldStrategy(Strategy):
                 prior_eligible_snaps=prior,
                 illegal_cell=illegal,
                 source=snapshot.source,
+                side="YES",
+                p_bound=offer_p_bound,
+                break_even=offer_break_even,
+                running_max_lower=Decimal(running_max.lower_f),
+                running_max_upper=Decimal(running_max.upper_f),
+                running_max_exact=running_max.exact_f is not None,
+                staleness_ns=staleness_ns,
+                fee_coefficient=fee_coefficient,
+                observed_at_ns=running_max.source_observed_at_ns,
+                admission_reason=offer_admission_reason,
+                decision=offer_decision_label,
             )
         )
         self._eligible_snap_counts[station_day] = prior + 1
@@ -1175,6 +1333,38 @@ class ContinuousRungHoldStrategy(Strategy):
                 "continuous_rung_hold refusal report failed",
             )
             return
+
+        # ADM-1 fix: `decision` is a genuine Take here (mypy narrows it via
+        # the exhaustive `Refuse` return above), but the arm-time latch
+        # gates computed earlier may still have refused it -- counted and
+        # alerted exactly like every other refusal above, and returned
+        # BEFORE the `take:` log line below (never log a take for a rung
+        # that never armed) and BEFORE `_decision_ask_by_station_day`/
+        # `set_inflight`/`_maybe_submit` (no submit, no IN_FLIGHT).
+        if yes_admission_refusal is not None:
+            self.refusals.record(yes_admission_refusal.reason)
+            self._report_alerter(
+                self.refusal_alerter,
+                "continuous_rung_hold refusal report failed",
+            )
+            return
+
+        # GAP fix 2026-09-15 (brief item 4): one INFO line per FINALIZED
+        # take, mirroring `no_take_shadow:`'s fields -- gated by
+        # `_take_log_notice` so a re-arm cycle for the same instrument-day
+        # never logs twice, never once per tick (`decision` is a `Take`
+        # here; mypy narrows it via the exhaustive `Refuse` return above).
+        take_log_key = (station, climate_day_key, iid)
+        if take_log_key not in self._take_log_notice:
+            self._take_log_notice.add(take_log_key)
+            staleness_s = None if staleness_ns is None else staleness_ns / _NS_PER_SECOND
+            self._emit_take_log(
+                f"take: station={station} instrument={iid} ask={decision.limit_price} "
+                f"p_bound={decision.p_hold_lower} be={decision.break_even} "
+                f"R=[{running_max.lower_f},{running_max.upper_f}] "
+                f"staleness_s={staleness_s} "
+                f"cell=({hour_lst},{width_code},{m_code})"
+            )
 
         # Review item 3 (three-seam Slice 4 review): the DECISION-time ask,
         # captured here so `on_order_filled` records the durable TRIAL
@@ -1209,9 +1399,25 @@ class ContinuousRungHoldStrategy(Strategy):
         no_decision: Decision,
         now_ns: int,
         bid_size: Decimal | None,
+        bid: Decimal | None = None,
+        hour_lst: int = 0,
+        width_code: int = 0,
+        m_code: int = 0,
+        fee_coefficient: Decimal | None = None,
+        staleness_ns: int | None = None,
+        running_max: RunningMax | None = None,
     ) -> None:
         """S3b (plan NO_SIDE_EDGE_2026-09-14 S3/S4): the NO leg's Take,
         gated but NEVER armed, consumed, or submitted (`NO_SIDE_SHADOW_ONLY`).
+
+        GAP fix 2026-09-15 (offer-tape postmortem observability): the eight
+        keyword-only parameters from ``bid`` onward are ADDITIVE, each
+        defaulted so the two direct unit-test call sites
+        (``tests/unit/test_continuous_rung_hold_no_side_shadow_2026_09_14.py``)
+        keep working unedited -- they carry no decision-affecting weight,
+        only the offer-tape row's own postmortem fields (mirroring the YES
+        side's row in ``_hunt_tick``). Pure observability (L-34/D3): nothing
+        below changes because of them.
 
         Runs the S4 gates in the fixed order the plan names, refusing at
         the FIRST that fires (closed-set reason, `NO_SIDE_SHADOW_REFUSAL_
@@ -1259,11 +1465,70 @@ class ContinuousRungHoldStrategy(Strategy):
         to this station-day -- a rung filled earlier and since dropped from
         `self._facts` (a mid-day relaunch) still contributes its `q`.
         """
-        if not isinstance(no_decision, Take):
-            return
-        assert self._latch is not None
         no_instrument_id = sibling_instrument_id(yes_instrument_id)
         no_iid = str(no_instrument_id)
+
+        def _append_no_offer_tape(*, decision_label: str, admission_reason: str | None) -> None:
+            """GAP fix 2026-09-15: ONE offer-tape row per branch this method
+            can return from -- pure side effect, never read back by this
+            method or anything it calls, so it cannot change which branch
+            fires (L-34/D3).
+            """
+            ask_str: str | None
+            if isinstance(no_decision, Take):
+                ask_str = str(no_decision.limit_price)
+                reason = "taken"
+            else:
+                # M1 review finding (commit 309dab6): `None`, not `""` -- a
+                # NO row with no bid has no `1 - bid` ask to report at all,
+                # matching `OfferTapeRecord.ask`'s `str | None` contract.
+                ask_str = None if bid is None else str(_ONE - bid)
+                reason = no_decision.reason
+            row_p_bound = no_decision.p_bound
+            row_break_even = no_decision.break_even
+            row_size = 0 if bid_size is None else int(bid_size)
+            self.offer_tape.append(
+                OfferTapeRecord(
+                    station=station,
+                    climate_day=climate_day_key,
+                    instrument_id=no_iid,
+                    ask=ask_str,
+                    size=row_size,
+                    reason=reason,
+                    ts_event=now_ns,
+                    hour_lst=hour_lst,
+                    width_code=width_code,
+                    m_code=m_code,
+                    trigger="no_side_shadow",
+                    quote_age_ns=None,
+                    minutes_since_window_open=max(0, hour_lst - _WINDOW_START_HOUR_LST) * 60,
+                    prior_eligible_snaps=0,
+                    illegal_cell=False,
+                    source="no_side_shadow",
+                    side="NO",
+                    p_bound=row_p_bound,
+                    break_even=row_break_even,
+                    running_max_lower=(
+                        None if running_max is None else Decimal(running_max.lower_f)
+                    ),
+                    running_max_upper=(
+                        None if running_max is None else Decimal(running_max.upper_f)
+                    ),
+                    running_max_exact=running_max is not None and running_max.exact_f is not None,
+                    staleness_ns=staleness_ns,
+                    fee_coefficient=fee_coefficient,
+                    observed_at_ns=(
+                        None if running_max is None else running_max.source_observed_at_ns
+                    ),
+                    admission_reason=admission_reason,
+                    decision=decision_label,
+                )
+            )
+
+        if not isinstance(no_decision, Take):
+            _append_no_offer_tape(decision_label="refuse", admission_reason=None)
+            return
+        assert self._latch is not None
         notice_key = (station_day[0], station_day[1], no_iid)
 
         def _refuse_once(reason: str) -> None:
@@ -1274,6 +1539,7 @@ class ContinuousRungHoldStrategy(Strategy):
 
         if self._latch.is_intent_open():
             _refuse_once(_NO_REFUSE_INTENT_OPEN)
+            _append_no_offer_tape(decision_label="refuse", admission_reason=_NO_REFUSE_INTENT_OPEN)
             return
 
         store = self._latch._store
@@ -1295,6 +1561,7 @@ class ContinuousRungHoldStrategy(Strategy):
         )
         if sibling_refusal is not None:
             _refuse_once(sibling_refusal.reason)
+            _append_no_offer_tape(decision_label="refuse", admission_reason=sibling_refusal.reason)
             return
 
         existing_ids: list[str] = []
@@ -1333,15 +1600,31 @@ class ContinuousRungHoldStrategy(Strategy):
         )
         if admission_refusal is not None:
             _refuse_once(admission_refusal.reason)
+            _append_no_offer_tape(
+                decision_label="refuse", admission_reason=admission_refusal.reason,
+            )
             return
 
         utc_day = utc_day_for_ns(now_ns).isoformat()
         if self._latch.is_day_budget_exhausted(utc_day):
             _refuse_once(_NO_REFUSE_DAY_BUDGET_EXHAUSTED)
+            _append_no_offer_tape(
+                decision_label="refuse", admission_reason=_NO_REFUSE_DAY_BUDGET_EXHAUSTED,
+            )
             return
         if self._latch.is_consumed(station, climate_day_key, key_instrument_id=no_iid):
             _refuse_once(_NO_REFUSE_TRIAL_DAY_CONSUMED)
+            _append_no_offer_tape(
+                decision_label="refuse", admission_reason=_NO_REFUSE_TRIAL_DAY_CONSUMED,
+            )
             return
+
+        # GAP fix 2026-09-15: every gate above has cleared -- this snapshot
+        # is a genuinely ADMITTED NO candidate (would arm, or already has,
+        # depending on `pending`/`NO_SIDE_SHADOW_ONLY` below). ONE row per
+        # finalized evaluation, never per WAIT tick -- this line runs
+        # exactly once per `_evaluate_no_side_shadow` call that reaches it.
+        _append_no_offer_tape(decision_label="take", admission_reason="admitted")
 
         minute_bucket = now_ns // _NS_PER_MINUTE
         # E3-5: the hunt stays observable while pending -- log every minute,
@@ -1422,6 +1705,13 @@ class ContinuousRungHoldStrategy(Strategy):
         self._emit_no_refuse(summary)
 
     def _emit_no_refuse(self, summary: str) -> None:
+        self.log.info(summary)
+
+    def _emit_take_log(self, summary: str) -> None:
+        """GAP fix 2026-09-15 (brief item 4): overridable seam for the
+        `take:` INFO line, mirroring `_emit_no_take_shadow` above. Stable
+        grep token `take:`.
+        """
         self.log.info(summary)
 
     def _rearm_permitted(
@@ -1693,6 +1983,39 @@ class ContinuousRungHoldStrategy(Strategy):
                 self.position_alerter, "continuous_rung_hold position report failed",
             )
 
+    def _recorded_fee_for(
+        self, instrument_id: InstrumentId, venue_order_id: str,
+    ) -> Decimal | None:
+        """The per-contract venue fee this fill's own durable
+        `DurableFillRecord` supports, when known.
+
+        RULING (option B, domain review of a9fd0fb): a genuine create-path
+        fill left `TrialDayRecord.fee` permanently `None`, which made
+        `station_day_admission` refuse EVERY second YES rung on a
+        station-day (unknown `q` -- R3-7 never guesses) -- de facto one
+        position per station, contradicting R-10. This reads through
+        `TrialDayLatch.iter_fill_records`, the SAME read-only, store-based
+        accessor the never-arm walk (`_run_never_arm_walk`) already uses to
+        find fill records -- never a second store, never the adapters exec
+        module imported here.
+
+        Deliberately NEVER `event.commission`: the resolver path emits a
+        synthetic `Money(0)` there, indistinguishable from a genuine zero
+        fee (PREREG v3 fee-unreconciled-residual ruling).
+
+        `None` unless a record for this EXACT `venue_order_id` exists and
+        `_per_contract_reconciled_fee` (the module-level helper this method
+        shares with `_consume_trial_from_fill_record`) derives a fee from
+        it -- an absent record leaves `q` UNKNOWN, and `station_day_admission`
+        must keep refusing rather than guess (never relaxed by this helper).
+        """
+        assert self._latch is not None
+        for candidate in self._latch.iter_fill_records((str(instrument_id),)):
+            if candidate.venue_order_id != venue_order_id:
+                continue
+            return _per_contract_reconciled_fee(candidate)
+        return None
+
     def _consume_or_flag_duplicate(
         self, station: str, climate_day_key: str, *, event: OrderFilled,
     ) -> None:
@@ -1711,12 +2034,14 @@ class ContinuousRungHoldStrategy(Strategy):
         venue_order_id = str(event.venue_order_id)
         decision_ask = self._decision_ask_by_station_day.pop((station, climate_day_key), None)
         ask = decision_ask if decision_ask is not None else event.last_px.as_decimal()
+        fee = self._recorded_fee_for(event.instrument_id, venue_order_id)
         record = TrialDayRecord(
             latched_at_ns=event.ts_event,
             instrument_id=instrument_id,
             ask=ask,
             reason="taken",
             venue_order_id=venue_order_id,
+            fee=fee,
         )
         wrote = self._latch.consume_if_absent(
             station, climate_day_key, record, key_instrument_id=instrument_id,
