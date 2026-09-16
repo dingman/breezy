@@ -105,9 +105,9 @@ Recorded per rule and reported nightly by `scripts/analysis/position_monitor_nig
 - **Either rule fails** if Σ counterfactual pnl < Σ pnl(hold), or if the R-BEST oracle is ≤ hold — the latter means no exit policy could have helped on this tape and **no rule arms**.
 - A gate passed on N ≈ 4–6 licenses **arming for measurement**, never a claim of edge.
 
-**Step 0b — value-capturing positions read.** `scripts/venue/polymarket_us_positions_value_capture.py` against still-open positions before settlement. Retires: how a held NO position is signed and denominated on `/v1/portfolio/positions` (`netPosition`, `qtyBought`/`qtySold`, `avgPx`, `costPerShare`, `positionId`) — every positions response on this host has been `{"positions":{}}`, so these VALUES have never been observed. Until retired, "quantity ≤ attributed net long" is arithmetic over an unverified NO-leg sign.
+**Step 0b — RETIRED 2026-09-16 ~03:40Z** (plan Appendix A.1): the held NO is `netPosition −1 / qtySold 1 / qtyAvailable −1`, `avgPx 0.0900` NO-denominated and fee-inclusive; YES holdings `netPosition 1`, `avgPx` = fill + fee; `cashValue 0.01` on all four. The venue nets a NO as a short of YES; Breezy holds it as a LONG on the `^no` instrument, so the net-long guard reasons per Breezy instrument and any venue reconciliation applies the leg sign first. Original text: **value-capturing positions read.** `scripts/venue/polymarket_us_positions_value_capture.py` against still-open positions before settlement. Retires: how a held NO position is signed and denominated on `/v1/portfolio/positions` (`netPosition`, `qtyBought`/`qtySold`, `avgPx`, `costPerShare`, `positionId`) — every positions response on this host has been `{"positions":{}}`, so these VALUES have never been observed. Until retired, "quantity ≤ attributed net long" is arithmetic over an unverified NO-leg sign.
 
-**Step 1 — preview capture.** Closing-order preview for a held YES and a held NO; retires the `action`/`outcomeSide` pair, the `price.value` convention, the echoed `side`/`intent` (pinning §6.3's table), and that the venue reads the order as REDUCING rather than opening the opposite side. If reducing cannot be distinguished from opening, this step is NOT retired and step 3 stays blocked.
+**Step 1 — RETIRED 2026-09-16 03:19Z** (plan Appendix A.2; no order created, state PENDING_NEW, id ""): YES + `ORDER_ACTION_SELL` → echo `ORDER_SIDE_SELL` / `ORDER_INTENT_SELL_LONG`; NO + `ORDER_ACTION_SELL` at wire 0.99 → echo **`ORDER_SIDE_BUY`** / `ORDER_INTENT_SELL_SHORT`. §6.3's exit echo table is pinned to these pairs (checked as a (side, intent) PAIR). Whether the venue books the fill as REDUCING is retired only by step 3's positive control (the preview cannot show it). Original text: **preview capture.** Closing-order preview for a held YES and a held NO; retires the `action`/`outcomeSide` pair, the `price.value` convention, the echoed `side`/`intent` (pinning §6.3's table), and that the venue reads the order as REDUCING rather than opening the opposite side. If reducing cannot be distinguished from opening, this step is NOT retired and step 3 stays blocked.
 
 **Step 2 — declare the mapping** from the capture in a ruling doc; encode it with a test pinning the captured bytes.
 
@@ -131,7 +131,7 @@ Recorded per rule and reported nightly by `scripts/analysis/position_monitor_nig
 
 - Whether a fillable exit window exists at all — the 09-15 tape shows the exit side emptied before DEAD confirmed, and the no-trade diagnosis ruled no counterparty. §11 step 0 decides it.
 - Venue closing-order semantics: request shape, echo, proceeds/fee sign, and whether a priced IOC SELL is read as reducing. UNKNOWN until §11 steps 1–3.
-- NO-holding sign and denomination on the positions endpoint (§11 step 0b).
+- ~~NO-holding sign and denomination on the positions endpoint (§11 step 0b).~~ RETIRED 2026-09-16 (plan Appendix A.1).
 - Every PROVISIONAL constant in §3b (1-day corpus), and whether R-THREAT's benefit has a positive sign at any attainable `n` this season.
 
 ## 14. Reference — **UNCHANGED FROM v3** (§14:222-233), plus
