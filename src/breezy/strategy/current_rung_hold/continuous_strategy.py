@@ -63,6 +63,14 @@ from breezy.strategy.current_rung_hold.decision import Decision, Refuse, Take
 from breezy.strategy.current_rung_hold.exit_decider import ExitProposal
 from breezy.strategy.current_rung_hold.offer_tape import OfferTape, OfferTapeRecord
 from breezy.strategy.current_rung_hold.position_monitor import PositionMonitor
+from breezy.strategy.current_rung_hold.resting_decider import (
+    ShadowRestingDecider,
+    ShadowRestTickResult,
+)
+from breezy.strategy.current_rung_hold.shadow_rest_store import (
+    ShadowRestSummary,
+    write_shadow_rest_summaries,
+)
 from breezy.strategy.current_rung_hold.strategy import (
     _DIAG_NO_RUNNING_MAX_YET,
     _DIAG_NOT_EXECUTABLE,
@@ -366,6 +374,7 @@ class ContinuousRungHoldStrategy(Strategy):
         position_evidence_reader: Callable[[], dict[str, object] | None] | None = None,
         phase0_permit_guard: bool = True,
         position_monitor: PositionMonitor | None = None,
+        shadow_rest_summary_dir: Path | None = None,
     ) -> None:
         """``phase0_permit_guard=True`` (default) keeps Phase 0's seal: a
         non-None ``order_submission_permit`` raises
@@ -467,6 +476,66 @@ class ContinuousRungHoldStrategy(Strategy):
         #: this strategy never constructs one itself and never reaches into
         #: its mutating surface (there is none -- M7 D3 pin).
         self._position_monitor: PositionMonitor | None = position_monitor
+        #: RESTING_BID_HUNT Rev 2 §6 (shadow stage): a PURE counterfactual
+        #: decider -- constructs no order, never touches `self._latch`, and
+        #: is consulted AFTER every take/refuse decision below already
+        #: fired, so it can never block or alter one (L-34/D3: computed +
+        #: persisted, nothing else). `_shadow_rest_summaries` is the
+        #: per-`(station, climate_day, leg)` tally flushed at `on_stop`;
+        #: `_shadow_rest_summary_dir` is `None` (the shadow default) unless
+        #: a composition root opts into the parquet sidecar.
+        self._shadow_rest_decider = ShadowRestingDecider()
+        self._shadow_rest_summaries: dict[str, ShadowRestSummary] = {}
+        self._shadow_rest_summary_dir = shadow_rest_summary_dir
+
+    def _record_shadow_rest_tick(
+        self,
+        *,
+        station: str,
+        climate_day_key: str,
+        leg: Literal["YES", "NO"],
+        result: ShadowRestTickResult,
+    ) -> None:
+        """Tally one tick's shadow-decider outcome (observability only).
+
+        Never raises into the caller's hot path -- a summary dict miss is
+        the only failure mode here, and `setdefault` makes that impossible;
+        this is a plain accumulator, no I/O, no exception surface.
+        """
+        summary_key = f"{station}|{climate_day_key}|{leg}"
+        summary = self._shadow_rest_summaries.setdefault(
+            summary_key,
+            ShadowRestSummary(station=station, climate_day=climate_day_key, leg=leg),
+        )
+        summary.ticks_evaluated += 1
+        summary.record_reason(result.reason)
+        if result.fill_event:
+            summary.fill_eligible_events += 1
+
+    def _flush_shadow_rest_summaries(self) -> None:
+        """`on_stop`: close every still-RESTING key (CANCEL `window_close`,
+        recorded on the summary, never on the offer tape -- no tick exists
+        for a window-close transition to ride on), then flush the run's
+        tally to the optional parquet sidecar. Best-effort, mirroring every
+        other optional sidecar in this package (`OfferTape`, `MarkBuffer`):
+        a write failure here must never raise out of `on_stop`.
+        """
+        for (station, climate_day, leg), result in self._shadow_rest_decider.close_all_windows():
+            summary_key = f"{station}|{climate_day}|{leg}"
+            summary = self._shadow_rest_summaries.get(summary_key)
+            if summary is not None:
+                summary.still_resting_at_stop = True
+                summary.record_reason(result.reason)
+        if self._shadow_rest_summary_dir is None or not self._shadow_rest_summaries:
+            return
+        try:
+            write_shadow_rest_summaries(
+                self._shadow_rest_summary_dir,
+                tuple(self._shadow_rest_summaries.values()),
+                now_ns=self.clock.timestamp_ns(),
+            )
+        except OSError:
+            self.log.exception("continuous_rung_hold: shadow-rest summary flush failed")
 
     def _submission_armed(self) -> bool:
         """Whether this strategy holds a real order-submission capability.
@@ -858,6 +927,7 @@ class ContinuousRungHoldStrategy(Strategy):
         if self._position_monitor is not None:
             monitor = self._position_monitor
             self._forward_to_monitor(lambda: monitor.on_stop(self.clock.timestamp_ns()))
+        self._flush_shadow_rest_summaries()
         exit_stack, self._exit_stack = self._exit_stack, None
         self._latch = None
         if exit_stack is not None:
@@ -1285,6 +1355,32 @@ class ContinuousRungHoldStrategy(Strategy):
             offer_break_even = decision.break_even
             offer_decision_label = "refuse"
             offer_admission_reason = None
+        # RESTING_BID_HUNT Rev 2 §6 (shadow stage): computed AFTER `decision`
+        # and `yes_admission_refusal` are both final, so the shadow decider
+        # observes exactly the same sibling-fill/illegal-cell facts the YES
+        # arm path itself just used -- and, being read-only over locals
+        # already computed above, can never influence them (L-34/D3).
+        shadow_yes_sibling_filled = (
+            yes_admission_refusal is not None
+            and yes_admission_refusal.reason == SIBLING_LEG_TRADED_REASON
+        )
+        shadow_yes_result = self._shadow_rest_decider.evaluate_tick(
+            station=station,
+            climate_day=climate_day_key,
+            leg="YES",
+            best_ask=ask,
+            p_bound=offer_p_bound,
+            staleness_ns=staleness_ns,
+            stale_bound_ns=self._config.stale_observation_minutes * _NS_PER_MINUTE,
+            cell_legal=not illegal,
+            sibling_leg_filled=shadow_yes_sibling_filled,
+        )
+        self._record_shadow_rest_tick(
+            station=station,
+            climate_day_key=climate_day_key,
+            leg="YES",
+            result=shadow_yes_result,
+        )
         self.offer_tape.append(
             OfferTapeRecord(
                 station=station,
@@ -1314,6 +1410,11 @@ class ContinuousRungHoldStrategy(Strategy):
                 observed_at_ns=running_max.source_observed_at_ns,
                 admission_reason=offer_admission_reason,
                 decision=offer_decision_label,
+                shadow_rest_state=shadow_yes_result.state,
+                shadow_rest_price=shadow_yes_result.price,
+                shadow_rest_margin=shadow_yes_result.margin,
+                shadow_rest_reason=shadow_yes_result.reason,
+                shadow_fill_event=shadow_yes_result.fill_event,
             )
         )
         self._eligible_snap_counts[station_day] = prior + 1
@@ -1496,6 +1597,32 @@ class ContinuousRungHoldStrategy(Strategy):
             row_p_bound = no_decision.p_bound
             row_break_even = no_decision.break_even
             row_size = 0 if bid_size is None else int(bid_size)
+            # RESTING_BID_HUNT Rev 2 §6 (shadow stage): the NO leg's ask is
+            # the caller's own `1 - bid` complement -- the SAME pure
+            # `compute_p_star` the YES leg uses, fed the complement price,
+            # never a leg-conditional branch inside the decider itself.
+            no_best_ask = None if bid is None else _ONE - bid
+            shadow_no_sibling_filled = admission_reason == SIBLING_LEG_TRADED_REASON
+            shadow_no_cell_legal = not (
+                isinstance(no_decision, Refuse) and no_decision.reason == "illegal_cell"
+            )
+            shadow_no_result = self._shadow_rest_decider.evaluate_tick(
+                station=station,
+                climate_day=climate_day_key,
+                leg="NO",
+                best_ask=no_best_ask,
+                p_bound=row_p_bound,
+                staleness_ns=staleness_ns,
+                stale_bound_ns=self._config.stale_observation_minutes * _NS_PER_MINUTE,
+                cell_legal=shadow_no_cell_legal,
+                sibling_leg_filled=shadow_no_sibling_filled,
+            )
+            self._record_shadow_rest_tick(
+                station=station,
+                climate_day_key=climate_day_key,
+                leg="NO",
+                result=shadow_no_result,
+            )
             self.offer_tape.append(
                 OfferTapeRecord(
                     station=station,
@@ -1526,6 +1653,11 @@ class ContinuousRungHoldStrategy(Strategy):
                     running_max_exact=running_max is not None and running_max.exact_f is not None,
                     staleness_ns=staleness_ns,
                     fee_coefficient=fee_coefficient,
+                    shadow_rest_state=shadow_no_result.state,
+                    shadow_rest_price=shadow_no_result.price,
+                    shadow_rest_margin=shadow_no_result.margin,
+                    shadow_rest_reason=shadow_no_result.reason,
+                    shadow_fill_event=shadow_no_result.fill_event,
                     observed_at_ns=(
                         None if running_max is None else running_max.source_observed_at_ns
                     ),

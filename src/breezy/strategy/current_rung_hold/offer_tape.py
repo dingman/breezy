@@ -164,6 +164,21 @@ class OfferTapeRecord:
     #: (`ExitAuthorization.expected_settlement_value`). `None` otherwise
     #: (including every entry-hunt row).
     expected_settlement_value: Decimal | None = None
+    #: RESTING_BID_HUNT Rev 2 §5/§6 (shadow stage): the SHADOW resting-bid
+    #: decider's per-tick outcome (`resting_decider.ShadowRestTickResult`,
+    #: additive, observability-only -- never read by the entry-hunt or
+    #: exit-decider consumers above). `shadow_rest_state` is `"NONE"` or
+    #: `"RESTING"`; `shadow_rest_price`/`shadow_rest_margin` are the primary-
+    #: margin `p*` and margin that produced it; `shadow_rest_reason` carries
+    #: a CANCEL/WAIT reason code or the `"rest"`/`"reprice"` transition
+    #: marker (see that class's own docstring); `shadow_fill_event` is the
+    #: crossing-event proxy (§2.1), `False` on every row until the decider
+    #: is wired in. `None`/`False` for every row before this increment.
+    shadow_rest_state: str | None = None
+    shadow_rest_price: Decimal | None = None
+    shadow_rest_margin: Decimal | None = None
+    shadow_rest_reason: str | None = None
+    shadow_fill_event: bool = False
 
     def to_dict(self) -> dict[str, object]:
         """Field-by-field serialization -- never ``dataclasses.asdict``.
@@ -221,6 +236,15 @@ class OfferTapeRecord:
                 if self.expected_settlement_value is None
                 else str(self.expected_settlement_value)
             ),
+            "shadow_rest_state": self.shadow_rest_state,
+            "shadow_rest_price": (
+                None if self.shadow_rest_price is None else str(self.shadow_rest_price)
+            ),
+            "shadow_rest_margin": (
+                None if self.shadow_rest_margin is None else str(self.shadow_rest_margin)
+            ),
+            "shadow_rest_reason": self.shadow_rest_reason,
+            "shadow_fill_event": self.shadow_fill_event,
         }
 
     @classmethod
@@ -281,6 +305,11 @@ class OfferTapeRecord:
             exit_reason_code=cast("str | None", payload.get("exit_reason_code")),
             exit_limit_price=_decimal("exit_limit_price"),
             expected_settlement_value=_decimal("expected_settlement_value"),
+            shadow_rest_state=cast("str | None", payload.get("shadow_rest_state")),
+            shadow_rest_price=_decimal("shadow_rest_price"),
+            shadow_rest_margin=_decimal("shadow_rest_margin"),
+            shadow_rest_reason=cast("str | None", payload.get("shadow_rest_reason")),
+            shadow_fill_event=cast(bool, payload.get("shadow_fill_event", False)),
         )
 
 
