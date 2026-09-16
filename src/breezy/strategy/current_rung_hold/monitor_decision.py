@@ -28,9 +28,18 @@ Rule order (plan §3, Rev 2.1 addendum P6):
    ``depth_sufficient``, ``book_staleness_ns <= _BOOK_STALE_NS``) ->
    ``EXIT_RECOMMENDED``; otherwise ``MISSING_STOP`` (L-38: an exit whose leg
    cannot fill is a MISSING stop, never silently absorbed as HOLD).
-4. ``LOCKED_BY_OBSERVATION`` (mechanistic, informational): the running-max
-   interval sits fully inside ``[rung_low, rung_high]`` AND
-   ``hour_lst >= _LOCKED_HOUR_LST`` -> verdict ``HOLD``.
+4. ``LOCKED_BY_OBSERVATION`` (PLATEAU confirmation mode, 2026-09-16
+   correction -- see the "Confirmation modes" note below; previously
+   mechanistic/immediate, which is what let a same-instant repush "confirm"
+   on the very first qualifying reading): the running-max interval sits
+   fully inside ``[rung_low, rung_high]`` AND ``hour_lst >= _LOCKED_HOUR_LST``
+   is the QUALIFYING condition; CONFIRMED once the run has spanned
+   >= ``_DEAD_MIN_CONFIRM_SPAN_NS`` of EVALUATION time (``ts_ns``) since the
+   first qualifying reading AND >= 1 reading in the run carried a genuine
+   observation (``observed_at_ns is not None``) -> verdict ``HOLD``. Until
+   confirmed, the reported state/verdict stay whatever they were before this
+   reading, reason ``lock_candidate`` (mirrors rule 2's ``dead_candidate``
+   shape).
 5. Otherwise, THESIS is decided from the same-cell ``p_hold_at_t`` re-lookup
    against ``p_hold_at_entry``: a drop >= ``_P_HOLD_DROP_MARGIN`` is a
    THREATENED candidate; ``_THREATENED_CONFIRMATIONS`` CONSECUTIVE candidates
@@ -43,36 +52,60 @@ Rule order (plan §3, Rev 2.1 addendum P6):
    no candidate run advances either way, the prior ALIVE/THREATENED
    classification is simply repeated, tagged reason ``p_hold_undefined``.
 
+Confirmation modes (2026-09-16 correction, L-44): two distinct confirmation
+shapes exist for structural (non-``p_hold``) conditions, and the two must
+never be conflated. RISING (``_update_dead_confirmation``, keyed on distinct
+``observed_at_ns`` instants via :func:`_dead_confirm_key`) is correct when
+the qualifying fact is a value CLIMBING past a threshold -- each fresh
+confirming instant necessarily carries a NEW ``observed_at_ns`` because the
+running max just changed to produce it. PLATEAU
+(``_update_plateau_confirmation``, keyed on elapsed EVALUATION-time span
+(``ts_ns``) since the first qualifying reading, gated on >= 1 reading in the
+run carrying a genuine observation) is correct when the qualifying fact is a
+value HOLDING STILL -- the running max has STOPPED moving, so no new
+distinct ``observed_at_ns`` ever arrives and the RISING gate is structurally
+unsatisfiable (this was exactly the 2026-09-16 defect: a NO position stuck
+inside its rung past the peak hour reported ``dead_candidate conf=1``
+forever, because ``_update_dead_confirmation``'s >= 2-distinct-instant gate
+can never be satisfied by a frozen instant). Rule 2 (YES DEAD) and the NO
+win-lock bullet below are RISING; rule 4 (LOCKED, both legs) and the NO
+inside-rung-after-peak DEAD bullet below are PLATEAU. A stale reading resets
+BOTH modes' progress identically (``evaluate_monitor``'s stale branch clears
+every confirmation buffer before either mode is ever consulted).
+
 Leg semantics (2026-09-15 correction, plan Rev 2.1 addendum P6 follow-up --
 the classifier above was YES-shaped; rules 1-5 describe the YES leg only and
 stay UNCHANGED for it). A NO leg pays iff the settled high lands OUTSIDE the
-rung, so the two mechanistic geometric facts rules 2-4 key on INVERT their
-meaning and are evaluated by a separate ``_evaluate_no`` path:
+rung, so the two geometric facts rules 2-4 key on INVERT their meaning and
+are evaluated by a separate ``_evaluate_no`` path:
 
 * ``running_max_lower > rung_high`` (rule 2's structural DEAD condition for
   YES -- the running max has already cleared the rung) is the NO leg's
   WIN-LOCKED state instead: once true it cannot lose. Still gated behind the
-  SAME >= 2-distinct-observation, >= ``_DEAD_MIN_CONFIRM_SPAN_NS`` confirmation
-  rule as YES's DEAD (a single reading can be noise even for a locked win) --
+  SAME RISING >= 2-distinct-observation, >= ``_DEAD_MIN_CONFIRM_SPAN_NS``
+  confirmation rule as YES's DEAD (a single reading can be noise even for a
+  locked win, and the max clearing the rung is itself a RISING event) --
   confirmed -> ``LOCKED_BY_OBSERVATION``/``HOLD``, reason
   ``no_leg_win_locked``; unconfirmed -> reason ``dead_candidate`` (shared with
   YES's own unconfirmed-DEAD candidate tag; both describe "a structural
   terminal condition is building but not yet confirmed").
 * The running-max interval sitting fully inside ``[rung_low, rung_high]``
-  with the peak passed (rule 4's ``_is_locked`` predicate, mechanistic and
-  UNCONFIRMED for YES) is the NO leg's LOSING terminal state instead --
-  the high is captured inside the rung after the day's peak, so the NO leg
-  is economically dead. Unlike YES's LOCKED, this NO-leg DEAD condition
-  *is* confirmation-gated (same 2-observation/span rule, tracked in its own
-  ``MonitorHistory.locked_confirm_observed_ns`` buffer so it never shares
-  state with the win-lock bumper above) because declaring a leg dead is a
-  stronger claim than declaring it informationally locked. Confirmed ->
-  ``DEAD_BY_OBSERVATION`` -> the same executable-exit test as YES's rule 3
-  (``mark_source == "depth_walk"``, ``depth_sufficient``,
-  ``book_staleness_ns <= _BOOK_STALE_NS``; the NO leg's own walk already
-  prices off ``depth.asks`` per ``monitor_evidence.walk_exit_vwap``) ->
-  ``EXIT_RECOMMENDED``/``MISSING_STOP``, reason
-  ``no_leg_inside_rung_after_peak``; unconfirmed -> ``dead_candidate``.
+  with the peak passed (rule 4's ``_is_locked`` predicate, PLATEAU-confirmed
+  for BOTH legs) is the NO leg's LOSING terminal state instead -- the high is
+  captured inside the rung after the day's peak, so the NO leg is
+  economically dead. This NO-leg DEAD condition is confirmation-gated by the
+  PLATEAU mode (:func:`_update_plateau_confirmation`, tracked in
+  ``MonitorHistory.locked_confirm_progress`` -- shared with YES's own rule-4
+  LOCKED plateau progress, safe because a position's leg never changes
+  mid-flight, so only one of ``_evaluate_yes``/``_evaluate_no`` ever touches
+  it for a given history) because declaring a leg dead is a stronger claim
+  than declaring it informationally locked. Confirmed -> ``DEAD_BY_OBSERVATION``
+  -> the same executable-exit test as YES's rule 3 (``mark_source ==
+  "depth_walk"``, ``depth_sufficient``, ``book_staleness_ns <=
+  _BOOK_STALE_NS``; the NO leg's own walk already prices off ``depth.asks``
+  per ``monitor_evidence.walk_exit_vwap``) -> ``EXIT_RECOMMENDED``/
+  ``MISSING_STOP``, reason ``no_leg_inside_rung_after_peak``; unconfirmed ->
+  ``dead_candidate``.
 * Before the peak hour, the SAME "fully inside the rung" geometry is merely
   THREATENED-shaped for NO -- the high may still climb out and save the
   leg -- so it drives the SAME 3-confirmation/``_THREATENED_MIN_SPAN_NS``
@@ -145,6 +178,60 @@ class Verdict(str, Enum):
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
+class _PlateauProgress:
+    """PLATEAU-mode confirmation progress (module docstring's "Confirmation
+    modes" note) for one in-progress structural candidacy.
+
+    Unlike the RISING mode's ``tuple[int, ...]`` of distinct
+    ``observed_at_ns`` instants, a plateau's qualifying evidence is that a
+    value has STOPPED changing -- so ``observed_at_ns`` freezes at whatever
+    instant last set it and never contributes a second distinct value.
+    Progress is instead an elapsed EVALUATION-time span (``ts_ns``) since the
+    first qualifying reading, gated on ``has_observation`` so a run that
+    never carried a single genuine observation (``observed_at_ns`` always
+    ``None``) can never confirm purely off evaluation-clock ticks.
+    """
+
+    first_ts_ns: int | None
+    qualifying_count: int
+    has_observation: bool
+
+    EMPTY: ClassVar[_PlateauProgress]
+
+
+_PlateauProgress.EMPTY = _PlateauProgress(
+    first_ts_ns=None, qualifying_count=0, has_observation=False,
+)
+
+
+def _update_plateau_confirmation(
+    progress: _PlateauProgress, ts_ns: int, observed_at_ns: int | None, *, qualifies: bool,
+) -> tuple[_PlateauProgress, bool]:
+    """Fold one reading into a PLATEAU confirmation window.
+
+    A non-qualifying reading resets progress to :attr:`_PlateauProgress.EMPTY`
+    (same reset semantics as :func:`_update_dead_confirmation`). A stale
+    reading resets it too, for free -- ``evaluate_monitor``'s stale branch
+    already clears every confirmation buffer before either mode is
+    consulted. Confirmed once the run has spanned
+    >= ``_DEAD_MIN_CONFIRM_SPAN_NS`` of evaluation time since the first
+    qualifying reading AND at least one reading in the run carried a genuine
+    observation.
+    """
+    if not qualifies:
+        return _PlateauProgress.EMPTY, False
+    first_ts_ns = progress.first_ts_ns if progress.first_ts_ns is not None else ts_ns
+    has_observation = progress.has_observation or observed_at_ns is not None
+    new_progress = _PlateauProgress(
+        first_ts_ns=first_ts_ns,
+        qualifying_count=progress.qualifying_count + 1,
+        has_observation=has_observation,
+    )
+    confirmed = has_observation and (ts_ns - first_ts_ns) >= _DEAD_MIN_CONFIRM_SPAN_NS
+    return new_progress, confirmed
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
 class MonitorDecision:
     state: ThesisState
     verdict: Verdict
@@ -173,15 +260,17 @@ class MonitorHistory:
     #: reading fails to qualify. YES: confirms DEAD. NO: confirms the
     #: win-locked state (module docstring's leg semantics section).
     dead_confirm_observed_ns: tuple[int, ...]
-    #: Same shape as ``dead_confirm_observed_ns`` but for the SEPARATE
-    #: "interval fully inside the rung past the peak hour" (``_is_locked``)
-    #: structural condition -- kept in its own buffer so it never shares
-    #: confirmation progress with ``dead_confirm_observed_ns`` (the two
-    #: conditions are mutually exclusive per reading, but a position can
-    #: oscillate between candidacies across readings). Only the NO leg
-    #: confirmation-gates this condition; YES treats it as mechanistic
-    #: (``_is_locked`` checked directly, no confirmation window).
-    locked_confirm_observed_ns: tuple[int, ...]
+    #: PLATEAU confirmation progress (module docstring's "Confirmation
+    #: modes" note) for the SEPARATE "interval fully inside the rung past
+    #: the peak hour" (``_is_locked``) structural condition -- kept apart
+    #: from ``dead_confirm_observed_ns`` (the RISING-mode buffer) so the two
+    #: never share progress (the two conditions are mutually exclusive per
+    #: reading, but a position can oscillate between candidacies across
+    #: readings). Shared between YES's rule-4 LOCKED and the NO leg's
+    #: inside-rung-after-peak DEAD -- safe because a position's leg never
+    #: changes mid-flight, so only one of ``_evaluate_yes``/``_evaluate_no``
+    #: ever advances it for a given history.
+    locked_confirm_progress: _PlateauProgress
     last_emitted_ts_ns: int | None
 
     EMPTY: ClassVar[MonitorHistory]
@@ -194,7 +283,7 @@ MonitorHistory.EMPTY = MonitorHistory(
     candidate_count=0,
     candidate_first_ts_ns=None,
     dead_confirm_observed_ns=(),
-    locked_confirm_observed_ns=(),
+    locked_confirm_progress=_PlateauProgress.EMPTY,
     last_emitted_ts_ns=None,
 )
 
@@ -371,7 +460,10 @@ def _evaluate_no_leg_threat(
 def _evaluate_yes(
     evidence: MonitorEvidence, history: MonitorHistory,
 ) -> tuple[MonitorDecision, MonitorHistory]:
-    """YES leg (module docstring rules 2-5) -- UNCHANGED behaviour."""
+    """YES leg (module docstring rules 2-5). Rule 2 (DEAD) stays RISING-mode,
+    UNCHANGED. Rule 4 (LOCKED) is now PLATEAU-mode (2026-09-16 correction --
+    previously mechanistic/immediate).
+    """
     dead_qualifies = (
         evidence.rung_high is not None and evidence.running_max_lower > evidence.rung_high
     )
@@ -389,6 +481,7 @@ def _evaluate_yes(
             candidate_count=0,
             candidate_first_ts_ns=None,
             dead_confirm_observed_ns=dead_confirm_ns,
+            locked_confirm_progress=_PlateauProgress.EMPTY,
         )
         decision = MonitorDecision(
             state=ThesisState.DEAD_BY_OBSERVATION,
@@ -402,7 +495,11 @@ def _evaluate_yes(
     if dead_qualifies:
         prev_state = history.last_state if history.last_state is not None else ThesisState.ALIVE
         prev_verdict = history.last_verdict if history.last_verdict is not None else Verdict.HOLD
-        new_history = dataclasses.replace(history, dead_confirm_observed_ns=dead_confirm_ns)
+        new_history = dataclasses.replace(
+            history,
+            dead_confirm_observed_ns=dead_confirm_ns,
+            locked_confirm_progress=_PlateauProgress.EMPTY,
+        )
         decision = MonitorDecision(
             state=prev_state,
             verdict=prev_verdict,
@@ -412,7 +509,13 @@ def _evaluate_yes(
         )
         return decision, new_history
 
-    if _is_locked(evidence):
+    lock_qualifies = _is_locked(evidence)
+    lock_progress, lock_confirmed = _update_plateau_confirmation(
+        history.locked_confirm_progress, evidence.ts_ns, evidence.observed_at_ns,
+        qualifies=lock_qualifies,
+    )
+
+    if lock_confirmed:
         new_history = dataclasses.replace(
             history,
             last_state=ThesisState.LOCKED_BY_OBSERVATION,
@@ -421,12 +524,30 @@ def _evaluate_yes(
             candidate_count=0,
             candidate_first_ts_ns=None,
             dead_confirm_observed_ns=dead_confirm_ns,
+            locked_confirm_progress=lock_progress,
         )
         decision = MonitorDecision(
             state=ThesisState.LOCKED_BY_OBSERVATION,
             verdict=Verdict.HOLD,
             reason_codes=("locked",),
-            confirmations=0,
+            confirmations=lock_progress.qualifying_count,
+            ts_ns=evidence.ts_ns,
+        )
+        return decision, new_history
+
+    if lock_qualifies:
+        prev_state = history.last_state if history.last_state is not None else ThesisState.ALIVE
+        prev_verdict = history.last_verdict if history.last_verdict is not None else Verdict.HOLD
+        new_history = dataclasses.replace(
+            history,
+            dead_confirm_observed_ns=dead_confirm_ns,
+            locked_confirm_progress=lock_progress,
+        )
+        decision = MonitorDecision(
+            state=prev_state,
+            verdict=prev_verdict,
+            reason_codes=("lock_candidate",),
+            confirmations=lock_progress.qualifying_count,
             ts_ns=evidence.ts_ns,
         )
         return decision, new_history
@@ -439,6 +560,7 @@ def _evaluate_yes(
         last_state=state,
         last_verdict=verdict,
         dead_confirm_observed_ns=dead_confirm_ns,
+        locked_confirm_progress=_PlateauProgress.EMPTY,
     )
     decision = MonitorDecision(
         state=state,
@@ -453,10 +575,11 @@ def _evaluate_yes(
 def _evaluate_no(
     evidence: MonitorEvidence, history: MonitorHistory,
 ) -> tuple[MonitorDecision, MonitorHistory]:
-    """NO leg (module docstring's leg semantics section): the two
-    mechanistic geometric facts YES uses for DEAD/LOCKED swap outcomes, and
-    the pre-peak "inside the rung" geometry becomes THREATENED instead of
-    running through YES's p_hold-driven hysteresis.
+    """NO leg (module docstring's leg semantics section): the two geometric
+    facts YES uses for DEAD/LOCKED swap outcomes (win-lock stays RISING-mode,
+    inside-rung-after-peak is PLATEAU-mode -- 2026-09-16 correction), and the
+    pre-peak "inside the rung" geometry becomes THREATENED instead of running
+    through YES's p_hold-driven hysteresis.
     """
     win_lock_qualifies = (
         evidence.rung_high is not None and evidence.running_max_lower > evidence.rung_high
@@ -476,7 +599,7 @@ def _evaluate_no(
             candidate_count=0,
             candidate_first_ts_ns=None,
             dead_confirm_observed_ns=win_lock_ns,
-            locked_confirm_observed_ns=(),
+            locked_confirm_progress=_PlateauProgress.EMPTY,
         )
         decision = MonitorDecision(
             state=ThesisState.LOCKED_BY_OBSERVATION,
@@ -491,7 +614,9 @@ def _evaluate_no(
         prev_state = history.last_state if history.last_state is not None else ThesisState.ALIVE
         prev_verdict = history.last_verdict if history.last_verdict is not None else Verdict.HOLD
         new_history = dataclasses.replace(
-            history, dead_confirm_observed_ns=win_lock_ns, locked_confirm_observed_ns=(),
+            history,
+            dead_confirm_observed_ns=win_lock_ns,
+            locked_confirm_progress=_PlateauProgress.EMPTY,
         )
         decision = MonitorDecision(
             state=prev_state,
@@ -503,9 +628,8 @@ def _evaluate_no(
         return decision, new_history
 
     dead_lock_qualifies = _is_locked(evidence)
-    dead_lock_ns, dead_lock_confirmed = _update_dead_confirmation(
-        history.locked_confirm_observed_ns,
-        _dead_confirm_key(evidence),
+    dead_lock_progress, dead_lock_confirmed = _update_plateau_confirmation(
+        history.locked_confirm_progress, evidence.ts_ns, evidence.observed_at_ns,
         qualifies=dead_lock_qualifies,
     )
 
@@ -519,13 +643,13 @@ def _evaluate_no(
             candidate_count=0,
             candidate_first_ts_ns=None,
             dead_confirm_observed_ns=(),
-            locked_confirm_observed_ns=dead_lock_ns,
+            locked_confirm_progress=dead_lock_progress,
         )
         decision = MonitorDecision(
             state=ThesisState.DEAD_BY_OBSERVATION,
             verdict=verdict,
             reason_codes=("no_leg_inside_rung_after_peak",),
-            confirmations=len(dead_lock_ns),
+            confirmations=dead_lock_progress.qualifying_count,
             ts_ns=evidence.ts_ns,
         )
         return decision, new_history
@@ -534,13 +658,13 @@ def _evaluate_no(
         prev_state = history.last_state if history.last_state is not None else ThesisState.ALIVE
         prev_verdict = history.last_verdict if history.last_verdict is not None else Verdict.HOLD
         new_history = dataclasses.replace(
-            history, dead_confirm_observed_ns=(), locked_confirm_observed_ns=dead_lock_ns,
+            history, dead_confirm_observed_ns=(), locked_confirm_progress=dead_lock_progress,
         )
         decision = MonitorDecision(
             state=prev_state,
             verdict=prev_verdict,
             reason_codes=("dead_candidate",),
-            confirmations=len(dead_lock_ns),
+            confirmations=dead_lock_progress.qualifying_count,
             ts_ns=evidence.ts_ns,
         )
         return decision, new_history
@@ -553,7 +677,7 @@ def _evaluate_no(
         last_state=state,
         last_verdict=verdict,
         dead_confirm_observed_ns=(),
-        locked_confirm_observed_ns=(),
+        locked_confirm_progress=_PlateauProgress.EMPTY,
     )
     decision = MonitorDecision(
         state=state,
@@ -588,7 +712,7 @@ def evaluate_monitor(
             candidate_count=0,
             candidate_first_ts_ns=None,
             dead_confirm_observed_ns=(),
-            locked_confirm_observed_ns=(),
+            locked_confirm_progress=_PlateauProgress.EMPTY,
         )
         decision = MonitorDecision(
             state=ThesisState.UNKNOWN,
