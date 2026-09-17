@@ -319,7 +319,7 @@ def test_markdown_summary_renders_the_registered_gates() -> None:
         qualifying_station_days=30, stranded_station_days=2, fills_by_margin_share={
             (Decimal("0.02"), Decimal("1.0")): 160,
         }, pi_hat_i_by_margin_share={(Decimal("0.02"), Decimal("1.0")): (0.10, 0.20)},
-        pnl_sum_maker_by_margin_share={(Decimal("0.02"), Decimal("1.0")): Decimal("12.34")},
+        pnl_sum_taker_by_margin_share={(Decimal("0.02"), Decimal("1.0")): Decimal("12.34")},
         pnl_sum_ioc=Decimal("3.21"), gates=(
             rbr.GateResult(
                 gate_id="G-R1", description="honest N", status="PASS", detail="160 fills",
@@ -336,3 +336,114 @@ def test_markdown_summary_renders_the_registered_gates() -> None:
     assert "G-R6" in markdown
     assert "NOT_COMPUTABLE" in markdown
     assert "30" in markdown
+
+
+# ---------------------------------------------------------------------------
+# 9. Domain-review finding 4 (MEDIUM): gates/report make s=1.0 explicit.
+# ---------------------------------------------------------------------------
+
+
+def test_markdown_header_states_gates_are_evaluated_at_unscaled_queue_share() -> None:
+    summary = rbr.StudySummary(qualifying_station_days=1, stranded_station_days=0)
+    markdown = rbr.render_markdown(summary)
+    assert "s=1.0" in markdown
+    assert "expected fill count" in markdown.lower() or "expected fill" in markdown.lower()
+
+
+# ---------------------------------------------------------------------------
+# 10. Domain-review finding 1 (CRITICAL): a filled leg retires -- one
+#     crossing-event fill only, even across a later re-crossing.
+# ---------------------------------------------------------------------------
+
+
+def test_a_filled_leg_retires_and_a_later_re_crossing_never_refires() -> None:
+    p_bound = Decimal("0.70")
+    p_star = rbc.compute_p_star(p_bound, _MARGIN)
+    assert p_star is not None
+    above = p_star + Decimal("0.05")
+    at_or_below = p_star
+
+    events = [
+        _event(ts_ns=_ns_at(13, 0), ask=above, p_bound=p_bound),
+        _event(ts_ns=_ns_at(13, 2), ask=at_or_below, p_bound=p_bound),  # first fill
+        _event(ts_ns=_ns_at(13, 4), ask=above, p_bound=p_bound),  # uncross
+        _event(ts_ns=_ns_at(13, 6), ask=at_or_below, p_bound=p_bound),  # re-cross: no refire
+    ]
+
+    result = rbc.simulate_leg(events, margin=_MARGIN)
+
+    assert len(result.fill_events) == 1
+    assert result.fill_events[0].ts_ns == _ns_at(13, 2)
+
+
+# ---------------------------------------------------------------------------
+# 11. Domain-review finding 2 (CRITICAL): taker-priced primary path, maker
+#     rebate survives only as a documented, separate sensitivity.
+# ---------------------------------------------------------------------------
+
+
+def test_compute_p_star_is_taker_priced_primary_and_at_or_below_rebate_sensitivity() -> None:
+    p_bound = Decimal("0.90")
+    margin = Decimal("0.02")
+
+    taker_price = rbc.compute_p_star(p_bound, margin)
+    rebate_price = rbc.compute_p_star_rebate_sensitivity(p_bound, margin)
+
+    assert taker_price is not None
+    assert rebate_price is not None
+    assert taker_price <= rebate_price
+    edge_under_taker_fee = p_bound - (taker_price + rbc.fee_taker(taker_price))
+    assert edge_under_taker_fee >= margin
+
+
+def test_fill_pnl_is_taker_priced_primary_and_rebate_sensitivity_is_separate() -> None:
+    fill = rbc.FillEligibleEvent(
+        ts_ns=_ns_at(13, 0), price=Decimal("0.60"), rest_start_ts_ns=_ns_at(13, 0),
+        p_bound_at_fill=Decimal("0.70"),
+    )
+
+    taker_pnl = rbc.fill_pnl(fill, leg_won=True)
+    rebate_pnl = rbc.fill_pnl_rebate_sensitivity(fill, leg_won=True)
+
+    assert taker_pnl is not None
+    assert rebate_pnl is not None
+    assert taker_pnl == Decimal(1) - fill.price - rbc.fee_taker(fill.price)
+    assert rebate_pnl == Decimal(1) - fill.price - rbc.fee_maker(fill.price)
+    assert taker_pnl < rebate_pnl  # a genuine cost vs. an optimistic, unobserved rebate
+
+
+# ---------------------------------------------------------------------------
+# 12. Domain-review finding 3 (HIGH): sibling-leg exclusivity -- one trial
+#     per station-day, across rungs, at a fixed margin.
+# ---------------------------------------------------------------------------
+
+
+def test_sibling_leg_exclusivity_keeps_only_the_earliest_fill_across_rungs() -> None:
+    p_bound = Decimal("0.70")
+    p_star = rbc.compute_p_star(p_bound, _MARGIN)
+    assert p_star is not None
+    above = p_star + Decimal("0.05")
+    at_or_below = p_star
+
+    rung_a_events = [
+        _event(ts_ns=_ns_at(13, 0), ask=above, p_bound=p_bound),
+        _event(ts_ns=_ns_at(13, 2), ask=at_or_below, p_bound=p_bound),  # earlier fill
+    ]
+    rung_b_events = [
+        _event(ts_ns=_ns_at(13, 0), ask=above, p_bound=p_bound),
+        _event(ts_ns=_ns_at(13, 5), ask=at_or_below, p_bound=p_bound),  # later fill
+    ]
+
+    sims = {
+        ("rung-a", "YES"): rbc.simulate_leg(rung_a_events, margin=_MARGIN),
+        ("rung-b", "YES"): rbc.simulate_leg(rung_b_events, margin=_MARGIN),
+    }
+    assert len(sims[("rung-a", "YES")].fill_events) == 1
+    assert len(sims[("rung-b", "YES")].fill_events) == 1
+
+    adjusted = rbc.apply_sibling_exclusivity(sims)
+
+    assert len(adjusted[("rung-a", "YES")].fill_events) == 1
+    assert adjusted[("rung-a", "YES")].fill_events[0].ts_ns == _ns_at(13, 2)
+    assert adjusted[("rung-b", "YES")].fill_events == ()
+    assert adjusted[("rung-b", "YES")].cancels_by_reason.get("sibling_filled") == 1
