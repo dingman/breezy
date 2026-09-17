@@ -206,6 +206,29 @@ arm:
    the L-7/L-9 pick-offs, made concrete. Then realised pnl at settlement per fill; `π̂_I` split per §1.4; compare to the IOC
    baseline over the identical day set.
 
+**Arm A result (run `20260916_armA_fixed`, 2026-09-17 ~05:40Z; supersedes `20260916_armA_initial`, whose 561 fills came from
+one simulated order re-firing on every re-crossing and a rebate-priced p*).** Driver `scripts/analysis/current_rung_hold_resting_bid_study.py`
+(+ `resting_bid_core.py`, `resting_bid_report.py`; commits d9b47c4, 8a3d34f; domain-reviewed). Staged Depth10 feather,
+09-01..09-16, LAX/MDW/MIA/SFO, taker-priced p* and pnl per PREREG v5 §3b, one fill per leg, sibling-leg latch, gates at s=1.0:
+
+| item | value |
+|---|---|
+| qualifying / stranded (ING-1, <80 % window coverage) station-days | 27 / 33 |
+| distinct climate days | 11 |
+| fills, m=0.02 / m=0.05 | 19 / 20 |
+| Σpnl resting (taker) m=0.02 / m=0.05 | −2.55 / −0.57 |
+| Σpnl IOC baseline, same day set | −2.09 |
+| mean pnl per fill (m=0.02) / climate-day bootstrap lower | −0.134 / −0.334 |
+| π̂_I 95 % CI | [0.000, 0.168] |
+| rebate sensitivity (DOCUMENTED-NOT-WIRE-OBSERVED) mean pnl/fill | −0.124 |
+| gates | G-R1 FAIL (19 fills, 11 days), G-R2 FAIL, G-R3 NOT_COMPUTABLE, G-R4 FAIL, G-R5 FAIL, G-R6 PASS |
+
+Reading: **underpowered and negative.** On 19 depth-proxy fills the resting rule loses more than the IOC rule it would
+replace, and both lose. G-R1 is the binding failure, so this is not a verdict on the concept; it is a verdict that the
+existing tape cannot arm it. The proxy is biased-adverse by construction (§2.1 item 2), so the pnl figure is a lower bound
+only in the informed-seller direction. Nothing in §4 that writes to the venue proceeds until a rerun with TRADE prints (§2.2)
+and ≥12 climate days passes G-R1..G-R5. Rerun cadence: with the nightly study cadence once §2.2's print-based proxy exists.
+
 ### §2.2 TRADE-print capture, and the re-run that closes the proxy gap
 
 The recorder has a TRADE parser and publish path but **has never subscribed the channel** (Appendix A). **A separate capture
