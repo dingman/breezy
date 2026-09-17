@@ -525,6 +525,23 @@ def build_quote_tape_node_config(
         # persists them with no further wiring). Prints are forward-only on
         # this venue; the live trade node keeps the field default (off).
         subscribe_trades=True,
+        # Quote-tape ONLY, cleared by the 2026-09-17 09:29-09:30Z
+        # connection-per-key probe
+        # (`docs/evidence/venue/polymarket_us/probes/
+        # WS_CONCURRENT_CONNECTIONS_20260917T093016Z.probe.json`): 12
+        # concurrent authenticated `/v1/ws/markets` connections succeeded on
+        # this key in one run (recorder's 3 existing shards + 9 probe
+        # connections), zero refusals or evictions; the ceiling was not
+        # located, only that 12 is reachable. Enabling this halves the
+        # recorder's shard size (`cap // 2` instead of `cap`), which is what
+        # lets every subscribed slug's TRADE request actually fit -- at the
+        # cost of doubling the recorder's own live connection count (3 -> 6
+        # shards for 30 slugs). 6 recorder shards + the live trade node's own
+        # 3 = 9, still under the measured 12, so it is safe to turn on HERE.
+        # The live trade node keeps the field's off default: it never sets
+        # `subscribe_trades`, so halving would be a no-op for it, and this
+        # keeps its shard count byte-identical regardless.
+        trade_shard_halving=True,
     )
 
     # `msgspec.Struct` config classes are untyped to mypy (compiled Nautilus

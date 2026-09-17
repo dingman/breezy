@@ -620,6 +620,10 @@ class PolymarketUSLiveDataClientFactory(LiveDataClientFactory):
                 # trade node's config leaves it False and its wire traffic
                 # unchanged.
                 subscribe_trades=config.subscribe_trades,
+                # OFF everywhere today, including the recorder: doubling the
+                # live connection count per key is gated on an unresolved
+                # connection-per-key probe (`websocket.py` pool docstring).
+                trade_shard_halving=config.trade_shard_halving,
             )
 
         return build_data_client(

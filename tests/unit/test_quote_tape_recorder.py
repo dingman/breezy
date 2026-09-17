@@ -601,6 +601,27 @@ class TestTradePrintsReachDiskAndReadBack:
         wired = config.data_clients[POLYMARKET_US_CLIENT_NAME]
         assert wired.subscribe_trades is True
 
+    def test_the_recorder_role_also_turns_on_trade_shard_halving(self, tmp_path: Path) -> None:
+        """Set HERE too, for the recorder role only, cleared by the
+        2026-09-17 09:29-09:30Z connection-per-key probe
+        (``docs/evidence/venue/polymarket_us/probes/
+        WS_CONCURRENT_CONNECTIONS_20260917T093016Z.probe.json``): 12
+        concurrent authenticated markets-websocket connections on this key
+        (recorder 3 + probe 9), zero refusals or evictions. The recorder's 6
+        halved shards plus the live trade node's own 3 (9 total) stay under
+        that measured 12, so halving is safe to turn on for the recorder
+        while the trade node keeps the field's off default -- same shape as
+        ``subscribe_trades`` above, and gated the same way this comment
+        documents the probe rather than assuming a ceiling: the probe never
+        located where refusals begin, only that 12 succeeded in one run."""
+        base = make_data_client_config()
+        assert base.trade_shard_halving is False
+
+        config = build_quote_tape_node_config(make_tape_settings(tmp_path), base)
+
+        wired = config.data_clients[POLYMARKET_US_CLIENT_NAME]
+        assert wired.trade_shard_halving is True
+
     def test_a_recorded_trade_tick_is_read_back_from_disk_by_a_separate_reader(
         self, tmp_path: Path
     ) -> None:
