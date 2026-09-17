@@ -526,9 +526,9 @@ def build_quote_tape_node_config(
         # this venue; the live trade node keeps the field default (off).
         subscribe_trades=True,
         # Quote-tape ONLY, cleared by the 2026-09-17 09:29-09:30Z
-        # connection-per-key probe
-        # (`docs/evidence/venue/polymarket_us/probes/
-        # WS_CONCURRENT_CONNECTIONS_20260917T093016Z.probe.json`): 12
+        # connection-per-key probe (venue evidence: WS concurrent-connections
+        # probe run WS_CONCURRENT_CONNECTIONS_20260917T093016Z, recorded under
+        # the venue probes evidence directory): 12
         # concurrent authenticated `/v1/ws/markets` connections succeeded on
         # this key in one run (recorder's 3 existing shards + 9 probe
         # connections), zero refusals or evictions; the ceiling was not
