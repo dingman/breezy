@@ -3316,6 +3316,21 @@ def test_x1_the_live_scan_actually_reaches_a_test_that_imports_the_exec_package(
     # still `==`; the module carries no `SOCKET_RESTORING_MARKERS` and
     # constructs no client -- both are plain data records/constants, built
     # and used directly from literal fields.
+    #
+    # Old -> new (this row, 2026-09-16 review of bfcf53d, startup-evidence
+    # parser-agreement pin): added `tests/unit/test_startup_evidence_parsers_
+    # agree_2026_09_16.py`, which imports `StartupOpenOrderSnapshot`/
+    # `StartupPositionEvidence` from `exec.client` to round-trip every
+    # field-combination through the real `to_bytes`/`from_bytes` encoding and
+    # assert it agrees with `trial_day_latch`'s independent JSON-dict parser.
+    # WIDENED, not relaxed (L-6/L-12): the comparison is still `==`; the
+    # module carries no `SOCKET_RESTORING_MARKERS` and constructs no client --
+    # both imports are plain frozen dataclasses, read and built directly from
+    # literal fields, never a socket. (Note: `test_continuous_rung_hold_open_
+    # orders_gate_2026_09_16.py`, added by the same commit, imports only
+    # `breezy.strategy.current_rung_hold.trial_day_latch` and sibling test
+    # modules -- no `exec.*` import -- so X1's rule cannot fire on it and it
+    # is correctly absent from this set.)
     assert exec_importing_test_modules() == {
         "tests/contract/test_exec_client_reconciliation_contract.py",
         "tests/contract/test_exec_client_wiring_contract.py",
@@ -3355,6 +3370,10 @@ def test_x1_the_live_scan_actually_reaches_a_test_that_imports_the_exec_package(
         "tests/unit/test_polymarket_us_write_sequence.py",
         "tests/unit/test_score_live_trials_l38_family_prefix.py",
         "tests/unit/test_score_live_trials_state_db_source.py",
+        # StartupOpenOrderSnapshot/StartupPositionEvidence (exec.client) --
+        # plain frozen dataclasses, no client, no socket; see the comment
+        # block above this assert for the full justification.
+        "tests/unit/test_startup_evidence_parsers_agree_2026_09_16.py",
     }
 
 
