@@ -297,3 +297,13 @@ def test_subscribe_trades_defaults_off_and_is_a_plain_bool() -> None:
     assert make_config(subscribe_trades=True).subscribe_trades is True
     with pytest.raises(SettingsError, match="subscribe_trades"):
         make_config(subscribe_trades="yes")
+
+
+def test_trade_shard_halving_defaults_off_and_is_a_plain_bool() -> None:
+    """OFF by default: shards stay sized at ``cap`` (the proven-concurrent
+    connection count), never doubling the live connection count per key
+    until the connection-per-key probe (OQ, open) clears it."""
+    assert make_config().trade_shard_halving is False
+    assert make_config(trade_shard_halving=True).trade_shard_halving is True
+    with pytest.raises(SettingsError, match="trade_shard_halving"):
+        make_config(trade_shard_halving="yes")

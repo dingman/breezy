@@ -323,6 +323,7 @@ class PolymarketUSMarketsWebSocket:
 
     __slots__ = (
         "_backoff_factor",
+        "_cap",
         "_client",
         "_closing",
         "_confirmation_task",
@@ -375,6 +376,7 @@ class PolymarketUSMarketsWebSocket:
         confirmation_window_secs: float | None = None,
         stable_reset_secs: float = 60.0,
         subscribe_trades: bool = False,
+        cap: int = MAX_SUBSCRIPTIONS_PER_CONNECTION,
     ) -> None:
         if heartbeat_secs <= 0:
             raise ValueError("heartbeat_secs must be positive")
@@ -388,6 +390,8 @@ class PolymarketUSMarketsWebSocket:
             raise ValueError("confirmation_window_secs must be positive")
         if stable_reset_secs <= 0:
             raise ValueError("stable_reset_secs must be positive")
+        if cap <= 0:
+            raise ValueError("cap must be positive")
 
         self._ws_url: str = ws_url.rstrip("/")
         self._signer: Ed25519RequestSigner | None = signer
@@ -407,6 +411,12 @@ class PolymarketUSMarketsWebSocket:
         self._connection_label: str = connection_label
         self._confirmation_window_secs: float | None = confirmation_window_secs
         self._stable_reset_secs: float = stable_reset_secs
+        #: The venue's per-connection subscription cap, SHARED between
+        #: MARKET_DATA and TRADE requests (measured 2026-09-17 09:00Z boot:
+        #: see `_subscribe_trades_for`). Threaded from the pool so a shard
+        #: built under a non-default `cap` enforces the SAME limit its pool
+        #: sizes shards against, rather than the module default.
+        self._cap: int = cap
 
         self._client: WebSocketClient | None = None
         #: slug -> requestId. One subscribe call covers many slugs under one id.
@@ -618,30 +628,66 @@ class PolymarketUSMarketsWebSocket:
     async def _subscribe_trades_for(self, slugs: Sequence[str]) -> None:
         """Send the paired TRADE envelope for a batch just subscribed to market data.
 
-        AFTER market data, never before, and as ONE envelope per batch. Both
-        are deliberate. Whether a TRADE subscription counts against the
-        venue's measured 10-per-connection cap is UNRESOLVED (never probed);
-        if it does, this later envelope is the one the venue rejects, and it
-        rejects a BATCHED envelope with explicit error frames
-        (:attr:`subscription_errors`) rather than the silent truncation the
-        one-per-envelope pattern produces. Either way the irreplaceable
-        market-data subscriptions on this connection are already accepted.
+        AFTER market data, never before, and as ONE envelope per batch that
+        still fits. Both are deliberate.
+
+        RESOLVED 2026-09-17 (recorder boot, first boot with
+        ``subscribe_trades=True``): the venue's measured 10-per-connection cap
+        IS shared between MARKET_DATA and TRADE requests. 30 slugs sharded
+        3-per-connection at the FULL cap produced 40 ``"max subscriptions per
+        connection reached"`` rejections and, worse, 10 of 30 slugs had NO
+        depth, NO quotes and NO prints at all: each slug's TRADE request was
+        sent right after its own MARKET_DATA request and consumed a slot the
+        6th..10th slugs' MARKET_DATA needed, so market data was lost, not just
+        prints. This method now accounts for that shared cap explicitly: it
+        only sends TRADE for as many of ``slugs`` as still fit under ``_cap``
+        given what THIS connection already carries (``_subscriptions`` +
+        ``_trade_subscriptions``, both already updated for this batch's
+        market-data slugs by the caller), and WARNS once, naming every slug it
+        could not fit, rather than letting the venue silently drop them. The
+        market-data subscriptions on this connection are always safe: they
+        were already accepted before this method is ever called, and this
+        method can only shed TRADE room, never MARKET_DATA.
 
         No liveness confirmation is armed for the TRADE request: a quiet
         weather market legitimately prints nothing for hours, so absence of
         prints is not evidence of a dropped subscription. The slug's
         market-data frames already confirm the connection carries it.
         """
+        room = self._cap - (len(self._subscriptions) + len(self._trade_subscriptions))
+        if room <= 0:
+            self._log.warning(self._trade_skip_warning(slugs))
+            return
+        tradeable = list(slugs[:room])
+        skipped = list(slugs[room:])
+        if skipped:
+            self._log.warning(self._trade_skip_warning(skipped))
         request_id = self._request_id_factory()
         await self._send(
             build_subscribe_envelope(
                 request_id=request_id,
                 subscription_type=SUBSCRIPTION_TYPE_TRADE,
-                market_slugs=slugs,
+                market_slugs=tradeable,
             )
         )
-        for slug in slugs:
+        for slug in tradeable:
             self._trade_subscriptions[slug] = request_id
+
+    def _trade_skip_warning(self, slugs: Sequence[str]) -> str:
+        """One WARN naming every slug whose TRADE request will not be sent.
+
+        Never a rejection risked on the wire: these slugs are skipped
+        LOCALLY, before the venue ever sees the request, because the shared
+        cap has no room left after this connection's MARKET_DATA
+        subscriptions -- which always win the room (module docstring, "Note
+        on the per-connection subscription cap").
+        """
+        return (
+            f"Polymarket.us markets websocket ({self._connection_label}): skipping TRADE "
+            f"subscription for {len(slugs)} slug(s) -- no room left under the shared "
+            f"{self._cap}-subscription-per-connection cap after MARKET_DATA. Prints will "
+            f"NOT be captured for: {sorted(slugs)}"
+        )
 
     async def unsubscribe(self, request_id: str) -> None:
         """Cancel one subscription request and forget every slug it covered.
@@ -664,7 +710,23 @@ class PolymarketUSMarketsWebSocket:
             self._trade_subscriptions.pop(slug, None)
 
     async def _replay_subscriptions(self) -> None:
-        """Re-send every live subscription: exactly one envelope per request id."""
+        """Re-send every live subscription: exactly one envelope per request id.
+
+        ALL MARKET_DATA groups replay before any TRADE group -- same
+        MARKET_DATA-first invariant as a fresh subscribe
+        (:meth:`_subscribe_trades_for`) -- and each TRADE group replays only
+        while the running slot count (MARKET_DATA already replayed this pass,
+        plus TRADE already replayed this pass) stays under ``_cap``; a group
+        that would push it over is skipped with the same WARN a fresh
+        subscribe would emit. This closes the 2026-09-17 09:00Z boot's
+        shard-1 failure: a bare re-subscribe on reconnect resent every prior
+        TRADE group unconditionally and reproduced the exact over-cap
+        rejection (20 rejections -- double the first pass's 10) that a fresh
+        subscribe no longer allows. ``_trade_subscriptions`` should already
+        fit within ``_cap`` by construction once a slug is first
+        trade-subscribed, so this re-check is defense in depth, not the
+        primary guard.
+        """
         groups: dict[str, list[str]] = {}
         for slug, request_id in self._subscriptions.items():
             groups.setdefault(request_id, []).append(slug)
@@ -680,17 +742,28 @@ class PolymarketUSMarketsWebSocket:
             # frames observed on the old connection do not prove this one
             # accepted the replay.
             self._arm_confirmation(slugs)
+
         trade_groups: dict[str, list[str]] = {}
         for slug, request_id in self._trade_subscriptions.items():
             trade_groups.setdefault(request_id, []).append(slug)
+        used = len(self._subscriptions)
         for request_id, slugs in trade_groups.items():
+            room = self._cap - used
+            if room <= 0:
+                self._log.warning(self._trade_skip_warning(slugs))
+                continue
+            tradeable = slugs[:room]
+            skipped = slugs[room:]
+            if skipped:
+                self._log.warning(self._trade_skip_warning(skipped))
             await self._send(
                 build_subscribe_envelope(
                     request_id=request_id,
                     subscription_type=SUBSCRIPTION_TYPE_TRADE,
-                    market_slugs=slugs,
+                    market_slugs=tradeable,
                 )
             )
+            used += len(tradeable)
 
     def _arm_confirmation(self, slugs: Sequence[str]) -> None:
         if self._confirmation_window_secs is None:
@@ -1139,9 +1212,37 @@ class PolymarketUSMarketsWebSocketPool:
     This pool is a :class:`~breezy.adapters.polymarket_us.data.MarketsFeed`
     that owns one or more :class:`PolymarketUSMarketsWebSocket` connections
     ("shards"), each capped at ``cap`` subscriptions, and opens exactly
-    ``ceil(N / cap)`` of them for ``N`` distinct subscribed slugs. A slug is
-    assigned to exactly one shard for its lifetime; :meth:`subscribe_market_data`
-    fills the newest shard before opening another.
+    ``ceil(N / slugs_per_shard)`` of them for ``N`` distinct subscribed slugs
+    (``slugs_per_shard`` is ``cap`` by default, or ``cap // 2`` when both
+    ``subscribe_trades`` and ``trade_shard_halving`` are on -- see
+    ``trade_shard_halving``'s own docstring below). A slug is assigned to
+    exactly one shard for its lifetime; :meth:`subscribe_market_data` fills
+    the newest shard before opening another.
+
+    ``trade_shard_halving`` -- OFF by default (2026-09-17 ruling)
+    ---------------------------------------------------------------
+    The venue's per-connection cap is SHARED between MARKET_DATA and TRADE
+    requests (measured 2026-09-17 09:00Z: see :meth:`PolymarketUSMarketsWebSocket
+    ._subscribe_trades_for`). Shrinking ``slugs_per_shard`` to ``cap // 2``
+    guarantees every slug's paired TRADE subscription has room -- but it also
+    DOUBLES the live connection count per key (30 slugs: 3 shards at ``cap``
+    vs. 6 at ``cap // 2``), and whether this venue caps CONCURRENT
+    CONNECTIONS per key at all is an OPEN QUESTION never probed live. The
+    live trade node shares this key and connects its own shard(s) AFTER the
+    recorder's from 16:50Z; if that cap exists, doubling the recorder's
+    connection count is what would strand it -- stranding ORDERS, a strictly
+    worse failure than the recorder losing prints. So the default keeps
+    ``slugs_per_shard == cap`` (the PROVEN-CONCURRENT count for this venue
+    and key) even with ``subscribe_trades`` on: TRADE then fills only
+    whatever room MARKET_DATA left on each shard, which is ZERO once a shard
+    is full (:meth:`PolymarketUSMarketsWebSocket._subscribe_trades_for` warns
+    once per shard rather than losing MARKET_DATA or silently dropping
+    prints). Concretely, with the default off: 30 slugs at ``cap=10``
+    capture zero prints, by design, until either ``trade_shard_halving`` is
+    turned on or ``cap`` is raised -- both gated on the connection-per-key
+    probe. Recorder wiring: ``breezy.runtime.node_config
+    .build_quote_tape_node_config`` sets ``subscribe_trades=True`` and
+    leaves ``trade_shard_halving`` at its default.
 
     Reconnection is per shard BY CONSTRUCTION: each shard is a fully
     independent ``PolymarketUSMarketsWebSocket`` with its own supervisor task
@@ -1185,8 +1286,10 @@ class PolymarketUSMarketsWebSocketPool:
         "_shards",
         "_signer",
         "_slug_to_shard",
+        "_slugs_per_shard",
         "_subscribe_lock",
         "_subscribe_trades",
+        "_trade_shard_halving",
         "_ws_url",
     )
 
@@ -1209,9 +1312,17 @@ class PolymarketUSMarketsWebSocketPool:
         cap: int = MAX_SUBSCRIPTIONS_PER_CONNECTION,
         confirmation_window_secs: float | None = DEFAULT_SUBSCRIPTION_CONFIRMATION_SECS,
         subscribe_trades: bool = False,
+        trade_shard_halving: bool = False,
     ) -> None:
         if cap <= 0:
             raise ValueError("cap must be positive")
+        if subscribe_trades and trade_shard_halving and cap // 2 < 1:
+            raise ValueError(
+                "cap must be at least 2 when subscribe_trades and "
+                "trade_shard_halving are both enabled -- every slug needs one "
+                "MARKET_DATA slot and one TRADE slot under the shared "
+                "per-connection cap"
+            )
 
         self._ws_url: str = ws_url
         self._signer: Ed25519RequestSigner | None = signer
@@ -1232,13 +1343,41 @@ class PolymarketUSMarketsWebSocketPool:
         )
         self._cap: int = cap
         self._confirmation_window_secs: float | None = confirmation_window_secs
-        #: Threaded to every shard. Sharding stays count-based on MARKET-DATA
-        #: slugs: `cap` is not halved for the paired TRADE request, because a
-        #: second unknown -- whether the venue caps CONNECTIONS per key -- is
-        #: the more expensive one to be wrong about (it would strand market
-        #: data on shards that never connect), whereas a shared subscription
-        #: cap only costs prints, loudly (see `_subscribe_trades_for`).
+        #: MEASURED 2026-09-17 09:00Z (first recorder boot with
+        #: `subscribe_trades=True`), superseding the prediction this comment
+        #: used to make: the venue's per-connection cap IS shared between
+        #: MARKET_DATA and TRADE requests, not independent. Sharding count-
+        #: based on MARKET-DATA slugs alone at the FULL `cap` let each slug's
+        #: TRADE request consume a slot the NEXT slugs' MARKET_DATA needed --
+        #: 30 slugs on 3 shards produced 40 rejections (10/10/20 by shard) and
+        #: left 10 of 30 slugs with NO depth, NO quotes and NO prints at all.
+        #: That is real, unrecoverable market-data loss, not "only costs
+        #: prints, loudly" as this comment previously claimed. Threaded to
+        #: every shard: `_slugs_per_shard` below halves shard capacity when
+        #: this is True, so a shard's MARKET_DATA + TRADE subscriptions never
+        #: approach the shared cap in the first place, and
+        #: `_subscribe_trades_for`/`_replay_subscriptions` on each shard still
+        #: enforce it directly as defense in depth.
         self._subscribe_trades: bool = subscribe_trades
+        #: OFF by default (see the class docstring's `trade_shard_halving`
+        #: section for the connection-per-key risk this defers). Only when
+        #: this AND `subscribe_trades` are both True does `_slugs_per_shard`
+        #: halve; otherwise it stays at `cap` regardless of `subscribe_trades`,
+        #: which is exactly the pre-2026-09-17 shard COUNT (proven concurrent)
+        #: -- what changed is that TRADE now safely fills only leftover room
+        #: instead of silently starving MARKET_DATA.
+        self._trade_shard_halving: bool = trade_shard_halving
+        #: How many slugs may live on one shard. Halved only when BOTH
+        #: `subscribe_trades` and `trade_shard_halving` are on -- each slug
+        #: then costs TWO subscriptions (MARKET_DATA + TRADE) against the ONE
+        #: shared cap, so `cap` slugs' worth of MARKET_DATA can never fill a
+        #: shard before its TRADE requests do. Unchanged (`cap`) otherwise:
+        #: this preserves the pre-2026-09-17 shard count for both the live
+        #: trade node (`subscribe_trades` off) and the recorder's current
+        #: default (`subscribe_trades` on, `trade_shard_halving` off).
+        self._slugs_per_shard: int = (
+            cap // 2 if (subscribe_trades and trade_shard_halving) else cap
+        )
 
         #: Built eagerly (never connected) so configuration -- URL, signer --
         #: is inspectable before `connect()`, exactly like a bare
@@ -1249,6 +1388,13 @@ class PolymarketUSMarketsWebSocketPool:
         #: Serializes `subscribe_market_data` end to end -- see that method's
         #: docstring for the race this closes.
         self._subscribe_lock: asyncio.Lock = asyncio.Lock()
+
+        self._log.info(
+            "Polymarket.us markets websocket pool: subscriptions per slug="
+            f"{2 if self._subscribe_trades else 1} slugs per shard="
+            f"{self._slugs_per_shard} shards={len(self._shards)} "
+            f"trade_shard_halving={self._trade_shard_halving}"
+        )
 
     # -- state --------------------------------------------------------------
 
@@ -1407,11 +1553,18 @@ class PolymarketUSMarketsWebSocketPool:
     # -- subscriptions ------------------------------------------------------
 
     async def subscribe_market_data(self, market_slugs: Sequence[str]) -> None:
-        """Subscribe every not-yet-subscribed slug, sharded at the venue cap.
+        """Subscribe every not-yet-subscribed slug, sharded at ``_slugs_per_shard``.
 
-        Fills the most recently opened shard to ``cap`` before opening
-        another, so ``N`` distinct slugs open exactly ``ceil(N / cap)`` shards
-        regardless of whether they arrive in one call or many.
+        Fills the most recently opened shard to ``_slugs_per_shard`` before
+        opening another, so ``N`` distinct slugs open exactly
+        ``ceil(N / _slugs_per_shard)`` shards regardless of whether they
+        arrive in one call or many. ``_slugs_per_shard`` is ``cap`` unless
+        BOTH ``subscribe_trades`` and ``trade_shard_halving`` are on, in which
+        case it is ``cap // 2`` so a slug's MARKET_DATA and paired TRADE
+        subscription together never approach the shared per-connection cap
+        (see the class docstring's ``trade_shard_halving`` section for why
+        that halving -- which doubles the live connection count per key -- is
+        opt-in rather than automatic).
 
         The entire read-room -> commit-batch sequence runs under
         ``_subscribe_lock``. Without it, ``_shard_with_room`` reads
@@ -1441,7 +1594,7 @@ class PolymarketUSMarketsWebSocketPool:
             index = 0
             while index < len(pending):
                 shard = await self._shard_with_room()
-                room = self._cap - len(shard.subscriptions)
+                room = self._slugs_per_shard - len(shard.subscriptions)
                 batch = pending[index : index + room]
                 await shard.subscribe_market_data(batch)
                 for slug in batch:
@@ -1484,11 +1637,12 @@ class PolymarketUSMarketsWebSocketPool:
             connection_label=f"shard-{index}",
             confirmation_window_secs=self._confirmation_window_secs,
             subscribe_trades=self._subscribe_trades,
+            cap=self._cap,
         )
 
     async def _shard_with_room(self) -> PolymarketUSMarketsWebSocket:
         last = self._shards[-1]
-        if len(last.subscriptions) < self._cap:
+        if len(last.subscriptions) < self._slugs_per_shard:
             if not last.is_connected:
                 await last.connect()
             return last

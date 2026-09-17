@@ -1696,9 +1696,56 @@ async def test_unsubscribing_market_data_releases_the_trade_subscription_too() -
 
 @pytest.mark.allow_socket
 @pytest.mark.asyncio
-async def test_pool_threads_subscribe_trades_to_every_shard_keeping_the_shard_count() -> None:
-    """Sharding stays count-based on MARKET-DATA slugs (cap unchanged), and
-    every shard subscribes TRADE for exactly the slugs it holds."""
+async def test_pool_keeps_shard_count_at_cap_by_default_and_warns_when_a_shard_is_full() -> None:
+    """RULING 2026-09-17 (post-boot-defect): `trade_shard_halving` defaults
+    OFF, so sharding stays at the FULL `cap` -- the PROVEN-CONCURRENT
+    connection count for this venue and key -- even with `subscribe_trades`
+    on. TRADE then fills only whatever room MARKET_DATA left on each shard:
+    12 slugs at cap=10 -> 2 shards (10, 2), same shard COUNT as before the
+    09-17 defect. Shard 0 is fully packed with MARKET_DATA alone (room=0),
+    so it gets ZERO TRADE subscriptions and one WARN naming its 10 slugs;
+    shard 1 has room for both of its 2 slugs' TRADE requests."""
+    slugs = _weather_slugs(12)
+    ids = iter(f"req-{i}" for i in range(1, 100))
+    recorder = _RecordingPoolLogger()
+    async with LoopbackWebSocketServer() as server:
+        pool = _make_pool(
+            ws_url=server.url,
+            signer=None,
+            cap=10,
+            request_id_factory=lambda: next(ids),
+            subscribe_trades=True,
+            logger=recorder,
+        )
+        try:
+            await pool.subscribe_market_data(slugs)
+            await _wait_until(lambda: len(server.messages) == 3)
+            await asyncio.sleep(0.1)
+        finally:
+            await pool.close()
+
+        assert len(pool._shards) == 2
+        sizes = sorted(len(shard.subscriptions) for shard in pool._shards)
+        assert sizes == [2, 10]
+        full_shard, spare_shard = pool._shards[0], pool._shards[1]
+        assert full_shard.trade_subscriptions == {}
+        assert set(spare_shard.trade_subscriptions) == set(spare_shard.subscriptions)
+        assert set(pool.trade_subscriptions) == set(slugs[10:])
+
+        warnings = [m for m in recorder.messages if "skipping TRADE" in m]
+        assert len(warnings) == 1
+        for slug in slugs[:10]:
+            assert slug in warnings[0]
+
+
+@pytest.mark.allow_socket
+@pytest.mark.asyncio
+async def test_pool_threads_subscribe_trades_and_halving_to_every_shard() -> None:
+    """`trade_shard_halving=True` is the opt-in that pairs every slug's
+    MARKET_DATA with TRADE, at the cost of doubling the live connection
+    count per key (gated on the connection-per-key probe): 12 slugs at
+    cap=10 -> 5 slugs/shard -> 3 shards (5, 5, 2), every shard's TRADE
+    subscriptions matching its MARKET_DATA exactly."""
     slugs = _weather_slugs(12)
     ids = iter(f"req-{i}" for i in range(1, 100))
     async with LoopbackWebSocketServer() as server:
@@ -1708,21 +1755,25 @@ async def test_pool_threads_subscribe_trades_to_every_shard_keeping_the_shard_co
             cap=10,
             request_id_factory=lambda: next(ids),
             subscribe_trades=True,
+            trade_shard_halving=True,
         )
         try:
             await pool.subscribe_market_data(slugs)
-            await _wait_until(lambda: len(server.messages) == 4)
+            await _wait_until(lambda: len(server.messages) == 6)
         finally:
             await pool.close()
 
-        assert len(pool._shards) == 2
+        assert len(pool._shards) == 3
+        sizes = sorted(len(shard.subscriptions) for shard in pool._shards)
+        assert sizes == [2, 5, 5]
         for shard in pool._shards:
             assert shard._subscribe_trades is True
             assert set(shard.trade_subscriptions) == set(shard.subscriptions)
+            assert len(shard.subscriptions) + len(shard.trade_subscriptions) <= 10
         assert set(pool.trade_subscriptions) == set(slugs)
         payloads = _subscribe_payloads(server)
         assert sorted(p["subscriptionType"] for p in payloads) == sorted(
-            [SUBSCRIPTION_TYPE_MARKET_DATA, SUBSCRIPTION_TYPE_TRADE] * 2
+            [SUBSCRIPTION_TYPE_MARKET_DATA, SUBSCRIPTION_TYPE_TRADE] * 3
         )
 
 
@@ -1737,3 +1788,305 @@ def test_pool_leaves_trades_off_by_default() -> None:
         logger=Logger("test-polymarket-us-ws-pool"),
     )
     assert pool._shards[0]._subscribe_trades is False
+
+
+# --------------------------------------------------------------------------
+# shared subscription cap -- 2026-09-17 09:00Z recorder boot defect.
+#
+# The venue's MAX_SUBSCRIPTIONS_PER_CONNECTION cap turned out to be SHARED
+# between MARKET_DATA and TRADE requests, not independent as the sharder
+# comment predicted. Measured: 30 slugs on 3 shards produced 40
+# "max subscriptions per connection reached" rejections (10/10/20 by shard),
+# and 10 of 30 slugs had NO depth, NO quotes and NO prints -- market data
+# lost, not just prints, because each slug's TRADE request consumed a slot
+# the 6th..10th slugs' MARKET_DATA needed. These tests pin the fix: MARKET_
+# DATA always sent first and never displaced, TRADE only sent while slots
+# remain, and shards sized at cap // 2 slugs when trades are enabled.
+# --------------------------------------------------------------------------
+
+
+@pytest.mark.allow_socket
+@pytest.mark.asyncio
+async def test_trade_requests_never_displace_market_data_when_the_cap_is_full() -> None:
+    """RED: 10 slugs already consume the entire shared cap=10 via MARKET_DATA
+    alone, so zero TRADE envelopes may be sent -- not a partial batch, not a
+    rejected-by-the-venue batch, ZERO -- and the connection must WARN once,
+    naming every slug whose prints will not be captured."""
+    slugs = _weather_slugs(MAX_SUBSCRIPTIONS_PER_CONNECTION)
+    recorder = _RecordingPoolLogger()
+    async with LoopbackWebSocketServer() as server:
+        signer, _ = _new_signer()
+        ws = _make_ws(ws_url=server.url, signer=signer, subscribe_trades=True, logger=recorder)
+        try:
+            await ws.connect()
+            await ws.subscribe_market_data(slugs)
+            await _wait_until(lambda: len(server.messages) == 1)
+            # Give a TRADE envelope every chance to arrive before asserting it did not.
+            await asyncio.sleep(0.1)
+        finally:
+            await ws.close()
+
+        payloads = _subscribe_payloads(server)
+        assert [p["subscriptionType"] for p in payloads] == [SUBSCRIPTION_TYPE_MARKET_DATA]
+        assert len(payloads[0]["marketSlugs"]) == MAX_SUBSCRIPTIONS_PER_CONNECTION
+        assert ws.trade_subscriptions == {}
+
+        warnings = [m for m in recorder.messages if "skipping TRADE" in m]
+        assert len(warnings) == 1, f"expected exactly one WARN, got: {recorder.messages!r}"
+        for slug in slugs:
+            assert slug in warnings[0]
+
+
+@pytest.mark.allow_socket
+@pytest.mark.asyncio
+async def test_trade_requests_are_sent_after_market_data_when_room_remains() -> None:
+    """RED: 4 slugs leave room under the shared cap=10, so MARKET_DATA is sent
+    for all 4, THEN one TRADE envelope for the same 4 -- no rejection possible
+    and no WARN, because the accounting never lets the shard get near the cap."""
+    slugs = _weather_slugs(4)
+    recorder = _RecordingPoolLogger()
+    async with LoopbackWebSocketServer() as server:
+        signer, _ = _new_signer()
+        ws = _make_ws(ws_url=server.url, signer=signer, subscribe_trades=True, logger=recorder)
+        try:
+            await ws.connect()
+            await ws.subscribe_market_data(slugs)
+            await _wait_until(lambda: len(server.messages) == 2)
+        finally:
+            await ws.close()
+
+        payloads = _subscribe_payloads(server)
+        assert [p["subscriptionType"] for p in payloads] == [
+            SUBSCRIPTION_TYPE_MARKET_DATA,
+            SUBSCRIPTION_TYPE_TRADE,
+        ]
+        assert payloads[0]["marketSlugs"] == slugs
+        assert payloads[1]["marketSlugs"] == slugs
+        assert ws.trade_subscriptions == dict.fromkeys(slugs, payloads[1]["requestId"])
+        assert not any("skipping TRADE" in m for m in recorder.messages)
+
+
+@pytest.mark.allow_socket
+@pytest.mark.asyncio
+async def test_trade_requests_partially_fit_send_only_what_the_cap_allows() -> None:
+    """RED: a bare connection handed more slugs than its cap can pair (cap=6,
+    4 slugs -> MARKET_DATA uses 4 of 6 slots, leaving room for only 2 TRADE
+    subscriptions). The 2 that fit are sent as ONE envelope; the other 2 are
+    named in ONE WARN, never silently dropped."""
+    slugs = _weather_slugs(4)
+    recorder = _RecordingPoolLogger()
+    async with LoopbackWebSocketServer() as server:
+        signer, _ = _new_signer()
+        ws = _make_ws(
+            ws_url=server.url, signer=signer, subscribe_trades=True, cap=6, logger=recorder
+        )
+        try:
+            await ws.connect()
+            await ws.subscribe_market_data(slugs)
+            await _wait_until(lambda: len(server.messages) == 2)
+        finally:
+            await ws.close()
+
+        payloads = _subscribe_payloads(server)
+        assert payloads[0]["subscriptionType"] == SUBSCRIPTION_TYPE_MARKET_DATA
+        assert payloads[0]["marketSlugs"] == slugs
+        assert payloads[1]["subscriptionType"] == SUBSCRIPTION_TYPE_TRADE
+        assert payloads[1]["marketSlugs"] == slugs[:2]
+        assert set(ws.trade_subscriptions) == set(slugs[:2])
+
+        warnings = [m for m in recorder.messages if "skipping TRADE" in m]
+        assert len(warnings) == 1
+        assert slugs[2] in warnings[0]
+        assert slugs[3] in warnings[0]
+        assert slugs[0] not in warnings[0]
+
+
+@pytest.mark.allow_socket
+@pytest.mark.asyncio
+async def test_subscribing_30_slugs_with_trade_shard_halving_enabled_opens_6_shards_of_5() -> None:
+    """`trade_shard_halving=True`: sharding halves at cap // 2 slugs per
+    shard, so every slug gets BOTH subscriptions and the shared cap is never
+    approached: 30 slugs at cap=10 -> 5 slugs/shard -> 6 shards, none
+    rejected. This is the opt-in path, gated on the connection-per-key
+    probe -- it doubles the live connection count per key vs. the default."""
+    slugs = _weather_slugs(30)
+    async with LoopbackWebSocketServer() as server:
+        signer, _ = _new_signer()
+        pool = _make_pool(
+            ws_url=server.url, signer=signer, subscribe_trades=True, trade_shard_halving=True
+        )
+        try:
+            await pool.connect()
+            await pool.subscribe_market_data(slugs)
+            await _wait_until(lambda: len(server.handshakes) == 6)
+            await _wait_until(lambda: len(server.messages) == 12)
+            await asyncio.sleep(0.1)
+        finally:
+            await pool.close()
+
+        assert pool.shard_count == 6
+        for shard in pool._shards:
+            assert len(shard.subscriptions) == 5
+            assert set(shard.trade_subscriptions) == set(shard.subscriptions)
+        assert set(pool.subscriptions) == set(slugs)
+        assert set(pool.trade_subscriptions) == set(slugs)
+        assert pool.subscription_errors == ()
+
+
+@pytest.mark.allow_socket
+@pytest.mark.asyncio
+async def test_subscribing_30_slugs_with_trades_enabled_by_default_captures_zero_prints() -> None:
+    """RULING 2026-09-17: with `trade_shard_halving` at its default (False),
+    30 slugs at cap=10 open the PROVEN-CONCURRENT 3 shards (not 6), each
+    fully packed with MARKET_DATA alone (room=0 for TRADE on every shard).
+    This is the accepted, documented cost of keeping the connection count
+    per key unchanged until the connection-per-key probe clears raising it:
+    zero prints, but no MARKET_DATA lost and no venue rejection possible --
+    one WARN per shard names exactly the slugs without prints."""
+    slugs = _weather_slugs(30)
+    recorder = _RecordingPoolLogger()
+    async with LoopbackWebSocketServer() as server:
+        signer, _ = _new_signer()
+        pool = _make_pool(ws_url=server.url, signer=signer, subscribe_trades=True, logger=recorder)
+        try:
+            await pool.connect()
+            await pool.subscribe_market_data(slugs)
+            await _wait_until(lambda: len(server.handshakes) == 3)
+            await _wait_until(lambda: len(server.messages) == 3)
+            await asyncio.sleep(0.1)
+        finally:
+            await pool.close()
+
+        assert pool.shard_count == 3
+        for shard in pool._shards:
+            assert len(shard.subscriptions) == 10
+            assert shard.trade_subscriptions == {}
+        assert set(pool.subscriptions) == set(slugs)
+        assert pool.trade_subscriptions == {}
+        assert pool.subscription_errors == ()
+
+        warnings = [m for m in recorder.messages if "skipping TRADE" in m]
+        assert len(warnings) == 3
+        warned_slugs = {slug for warning in warnings for slug in slugs if slug in warning}
+        assert warned_slugs == set(slugs)
+
+
+@pytest.mark.allow_socket
+@pytest.mark.asyncio
+async def test_reconnect_replay_keeps_market_data_first_and_cap_aware_for_trades() -> None:
+    """RED: shard-1 in the 2026-09-17 09:00Z boot re-subscribed after a drop and
+    REPEATED the same over-cap failure (20 rejections, double the first pass's
+    10). Replay must reapply the identical MARKET_DATA-first, cap-aware
+    accounting a fresh subscribe uses -- never blindly resend every TRADE
+    group regardless of room."""
+    slugs = _weather_slugs(4)
+    recorder = _RecordingPoolLogger()
+    async with LoopbackWebSocketServer() as server:
+        signer, _ = _new_signer()
+        ws = _make_ws(
+            ws_url=server.url, signer=signer, subscribe_trades=True, cap=6, logger=recorder
+        )
+        try:
+            await ws.connect()
+            await ws.subscribe_market_data(slugs)
+            await _wait_until(lambda: len(server.messages) == 2)
+
+            server.drop_connections()
+            await _wait_until(lambda: len(server.handshakes) == 2)
+            await _wait_until(lambda: len(server.messages) == 4)
+        finally:
+            await ws.close()
+
+        payloads = _subscribe_payloads(server)
+        first_md, first_trade, replay_md, replay_trade = payloads
+        assert first_md["subscriptionType"] == SUBSCRIPTION_TYPE_MARKET_DATA
+        assert first_md["marketSlugs"] == slugs
+        assert first_trade["subscriptionType"] == SUBSCRIPTION_TYPE_TRADE
+        assert first_trade["marketSlugs"] == slugs[:2]
+
+        assert replay_md["subscriptionType"] == SUBSCRIPTION_TYPE_MARKET_DATA
+        assert replay_md["marketSlugs"] == slugs
+        assert replay_trade["subscriptionType"] == SUBSCRIPTION_TYPE_TRADE
+        assert replay_trade["marketSlugs"] == slugs[:2]
+
+        # Never a THIRD replayed TRADE group over the cap, and never doubled
+        # rejections from blindly resending every prior TRADE group.
+        assert len(server.messages) == 4
+
+
+def test_pool_logs_boot_time_sizing_with_trades_enabled_and_halving_off_by_default() -> None:
+    """item 4 -- one INFO line naming the per-slug subscription count, the
+    per-shard slug capacity, the shard count and the halving flag. Default
+    `trade_shard_halving=False` keeps `slugs per shard` at the full `cap`
+    even though `subscribe_trades` is on."""
+    recorder = _RecordingPoolLogger()
+    PolymarketUSMarketsWebSocketPool(
+        ws_url="ws://127.0.0.1:1",
+        signer=None,
+        handler=lambda _raw: None,
+        loop=asyncio.new_event_loop(),
+        heartbeat_secs=10,
+        idle_timeout_secs=60,
+        logger=recorder,
+        cap=10,
+        subscribe_trades=True,
+    )
+
+    assert any(
+        "subscriptions per slug=2" in m
+        and "slugs per shard=10" in m
+        and "shards=1" in m
+        and "trade_shard_halving=False" in m
+        for m in recorder.messages
+    ), f"missing boot-time sizing line: {recorder.messages!r}"
+
+
+def test_pool_logs_boot_time_sizing_with_trade_shard_halving_enabled() -> None:
+    """`trade_shard_halving=True` halves `slugs per shard` to `cap // 2` and
+    the boot line says so explicitly."""
+    recorder = _RecordingPoolLogger()
+    PolymarketUSMarketsWebSocketPool(
+        ws_url="ws://127.0.0.1:1",
+        signer=None,
+        handler=lambda _raw: None,
+        loop=asyncio.new_event_loop(),
+        heartbeat_secs=10,
+        idle_timeout_secs=60,
+        logger=recorder,
+        cap=10,
+        subscribe_trades=True,
+        trade_shard_halving=True,
+    )
+
+    assert any(
+        "subscriptions per slug=2" in m
+        and "slugs per shard=5" in m
+        and "shards=1" in m
+        and "trade_shard_halving=True" in m
+        for m in recorder.messages
+    ), f"missing boot-time sizing line: {recorder.messages!r}"
+
+
+def test_pool_logs_boot_time_sizing_with_trades_disabled() -> None:
+    """The trade node's default config (subscribe_trades=False) must log the
+    unhalved, byte-identical sizing -- 1 subscription per slug, cap slugs
+    per shard, halving flag False."""
+    recorder = _RecordingPoolLogger()
+    PolymarketUSMarketsWebSocketPool(
+        ws_url="ws://127.0.0.1:1",
+        signer=None,
+        handler=lambda _raw: None,
+        loop=asyncio.new_event_loop(),
+        heartbeat_secs=10,
+        idle_timeout_secs=60,
+        logger=recorder,
+        cap=10,
+    )
+
+    assert any(
+        "subscriptions per slug=1" in m
+        and "slugs per shard=10" in m
+        and "shards=1" in m
+        and "trade_shard_halving=False" in m
+        for m in recorder.messages
+    ), f"missing boot-time sizing line: {recorder.messages!r}"

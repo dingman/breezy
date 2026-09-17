@@ -1442,3 +1442,32 @@ Any leg-conditional logic — marks, thesis states, verdicts, PnL sign, fee basi
 
 ### How to apply
 When briefing or reviewing anything that reads `leg`/`side`: grep the tests for a NO-leg fixture; if none exists the slice is RED. Before citing a monitor or scorer verdict for a NO position, confirm the verdict path is leg-aware. Related: L-24, L-42, NO-side amendment §8.
+
+## L-45 — A venue limit is per RESOURCE UNIT, not per slug; verify a new subscription type by coverage count on its first boot (2026-09-17)
+
+### What happened
+The recorder's first boot with TRADE-print capture (09-17 09:00Z) kept sharding at 10 SLUGS per websocket connection while
+sending two subscription requests per slug. The venue's cap of 10 is per SUBSCRIPTION and is shared across types, so the
+6th–10th slugs on every shard had their MARKET_DATA request rejected: 40 rejections, and 10 of 30 slugs (all SFO, four MIA,
+one NYC) recorded no depth, no quotes and no prints for the day. The sharder comment had predicted a shared cap would
+"only cost prints, loudly" — a prediction (L-18) that was wrong in the expensive direction. The rejections were logged at
+ERROR, yet nothing in the boot check counted covered instruments, so the loss was found by hand at 09:13Z.
+
+### Why this is binding
+Every capture gap here is a permanent hole in the only corpus the studies and the KILL clock read (ING-1 already strands
+~55 % of station-days). A new subscription type is the one change that multiplies slot usage without changing slug count.
+
+### The rule
+1. Size every sharded resource on the venue's counted unit (subscriptions, connections, requests), never on slugs; when a
+   second type is added, the divisor changes.
+2. Order requests so the trading-critical type (MARKET_DATA) is fully placed before any optional type takes a slot, and
+   name the slugs the optional type skipped in one WARN.
+3. The first boot after any subscription change is verified by COVERAGE COUNT — instrument directories written per type
+   against the subscribed list — not by the absence of errors or the presence of the new data.
+4. Any unmeasured sibling limit (connections per key) that a fix leans on stays an open question with a probe, and the
+   behaviour that depends on it ships opt-in.
+
+### How to apply
+Websocket pool: `slugs_per_shard = cap // subscriptions_per_slug`; MARKET_DATA-first replay on reconnect; boot INFO
+`subscriptions per slug / slugs per shard / shards`. Boot check: `comm -23 <subscribed> <ls order_book_depths>` must be
+empty. Applies equally to Kalshi when it arrives.

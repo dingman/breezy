@@ -872,3 +872,16 @@ def test_create_threads_subscribe_trades_from_the_config_into_the_pool(
     assert isinstance(on, PolymarketUSMarketsWebSocketPool)
     assert off._shards[0]._subscribe_trades is False
     assert on._shards[0]._subscribe_trades is True
+
+
+def test_create_threads_trade_shard_halving_from_the_config_into_the_pool(
+    wired: dict[str, Any],
+) -> None:
+    """Off by default (including the recorder today, gated on the
+    connection-per-key probe); on only when explicitly requested."""
+    off = build_client(make_config(subscribe_trades=True))._feed
+    on = build_client(make_config(subscribe_trades=True, trade_shard_halving=True))._feed
+    assert isinstance(off, PolymarketUSMarketsWebSocketPool)
+    assert isinstance(on, PolymarketUSMarketsWebSocketPool)
+    assert off._slugs_per_shard == off._cap
+    assert on._slugs_per_shard == on._cap // 2

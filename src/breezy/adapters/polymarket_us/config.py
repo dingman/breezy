@@ -332,6 +332,26 @@ class PolymarketUSDataClientConfig(LiveDataClientConfig, frozen=True):
     #: api-reference_websocket_markets_2026-08-25.md:29-31,114-138``.
     subscribe_trades: bool = False
 
+    #: Shard market-data connections at ``cap // 2`` slugs instead of ``cap``
+    #: when :attr:`subscribe_trades` is on, so every slug's paired TRADE
+    #: subscription always has room under the venue's SHARED per-connection
+    #: cap (measured 2026-09-17 09:00Z: MARKET_DATA and TRADE draw from the
+    #: same 10-subscription pool). OFF by default: with it off, shards stay
+    #: sized at ``cap`` -- the PROVEN-CONCURRENT connection count for this
+    #: venue and key -- and TRADE fills only whatever room MARKET_DATA left,
+    #: which is ZERO once a shard is full (30 slugs at ``cap=10`` -> 3 full
+    #: shards -> no prints captured, only a WARN per shard). Turning this on
+    #: doubles the live connection count per key (6 shards instead of 3 for
+    #: 30 slugs); whether the venue caps CONCURRENT CONNECTIONS per key at
+    #: all is an OPEN QUESTION never probed live, and the trade node's own
+    #: shard(s) share this key and connect AFTER the recorder's from
+    #: 16:50Z -- a connection-cap violation there strands ORDERS, a strictly
+    #: worse failure than lost prints. Enabling this is gated on that probe;
+    #: ``breezy.runtime.node_config.build_quote_tape_node_config`` leaves it
+    #: at the default for now, so the recorder currently captures zero prints
+    #: and only pins the shard-count-stays-safe behaviour.
+    trade_shard_halving: bool = False
+
     def __post_init__(self) -> None:
         unset = [
             name
@@ -367,6 +387,11 @@ class PolymarketUSDataClientConfig(LiveDataClientConfig, frozen=True):
         if not isinstance(self.subscribe_trades, bool):
             raise SettingsError(
                 f"subscribe_trades must be a bool, was {type(self.subscribe_trades).__name__}"
+            )
+        if not isinstance(self.trade_shard_halving, bool):
+            raise SettingsError(
+                "trade_shard_halving must be a bool, was "
+                f"{type(self.trade_shard_halving).__name__}"
             )
         if (
             not isinstance(self.empty_discovery_retry_secs, int | float)
