@@ -24,14 +24,23 @@ calls the IDENTICAL formula at a DIFFERENT, LOCAL, PROVISIONAL coefficient
 no maker fee schedule has ever been read from the venue (plan Sec 0.5 --
 ``Order`` carries a SEPARATE ``makerCommissionsBasisPoints`` that has never
 been captured). A negative coefficient makes :func:`fee_maker` a REBATE
-(``fee_maker(p) <= 0`` for every ``p`` in ``(0, 1)``), which is why every
-maker PnL formula below reads ``payoff - price - fee_maker(price)`` (SUBTRACT
-a negative number to ADD the rebate) rather than the taker convention's
-``payoff - price - fee_taker(price)`` (still a subtraction, but there
-``fee_taker`` is a genuine cost). A separate maker branch of ``fees.py`` is
-being added concurrently by another agent -- this module does NOT import it
-(brief instruction); when that lands, this local constant is the thing to
-replace, not the formula shape.
+(``fee_maker(p) <= 0`` for every ``p`` in ``(0, 1)``).
+
+**PRIMARY path is TAKER-priced, end to end** (domain-review finding 2): with
+no wire-observed maker fee schedule, :func:`compute_p_star` and
+:func:`fill_pnl` price every resting fill as if it crossed at
+:data:`TAKER_FEE_COEFFICIENT` -- the same break-even fee the live IOC rule
+uses -- and every gate in the driver's ``_evaluate_gates`` is evaluated
+against that taker-priced PnL. The maker rebate survives ONLY as an
+explicitly labelled, DOCUMENTED-NOT-WIRE-OBSERVED optimistic sensitivity:
+:func:`compute_p_star_rebate_sensitivity` and
+:func:`fill_pnl_rebate_sensitivity` compute the SAME shapes at
+:data:`MAKER_FEE_COEFFICIENT` instead, for reporting only -- neither feeds
+:func:`simulate_leg`, a row's primary PnL, or a gate's PASS/FAIL. A separate
+maker branch of ``fees.py`` is being added concurrently by another agent --
+this module does NOT import it (brief instruction); when a maker fee is
+ever wire-observed, this local constant is the thing to replace, not the
+taker/rebate split.
 
 Rung/closed-bounds parsing reuses ``h4_preliminary_economic_read.parse_rung``
 /``.Rung``/``.parse_ladder`` (the offline instrument-id grammar parser every
@@ -48,7 +57,7 @@ evidence.py`` already do.
 from __future__ import annotations
 
 import sys
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import date
 from decimal import Decimal
@@ -96,13 +105,16 @@ __all__ = [
     "IocTake",
     "LegEvent",
     "RestingSimResult",
+    "apply_sibling_exclusivity",
     "bucket_facts",
     "build_leg_events",
     "classify_fill",
     "compute_p_star",
+    "compute_p_star_rebate_sensitivity",
     "fee_maker",
     "fee_taker",
     "fill_pnl",
+    "fill_pnl_rebate_sensitivity",
     "ioc_pnl",
     "is_qualifying_station_day",
     "leg_ask_price",
@@ -196,30 +208,52 @@ def fee_maker(price: Decimal) -> Decimal:
 # ---------------------------------------------------------------------------
 
 
-def compute_p_star(p_bound: Decimal | None, margin: Decimal) -> Decimal | None:
-    """The highest venue-tick price with ``edge_maker(p) >= margin``.
-
-    Searches the tick grid strictly inside the executable band
-    ``(0.05, 0.95)`` (plan Sec 1.2's clamp), from the top down -- ``edge_maker
-    (p) = p_bound - (p + fee_maker(p))`` is monotone NON-INCREASING in ``p``
-    for the PROVISIONAL ``MAKER_FEE_COEFFICIENT`` magnitude (a rebate whose
-    own contribution shrinks slower than ``p`` grows), so the first
-    tick-aligned price (descending) that satisfies the margin is the highest
-    one. Returns ``None`` when ``p_bound`` is ``None`` (undefined cell) or no
-    tick in the band satisfies ``margin`` -- never a guessed price.
-
-    Deliberately does NOT compare against the current best ask -- see
-    :func:`simulate_leg`'s docstring for the "does this rest, or is this the
-    IOC case" decision, made by the caller from THIS value.
-    """
-    if p_bound is None:
-        return None
+def _search_p_star(
+    p_bound: Decimal, margin: Decimal, fee_fn: Callable[[Decimal], Decimal],
+) -> Decimal | None:
+    """The highest venue-tick price with ``p_bound - (p + fee_fn(p)) >=
+    margin``, searching the tick grid strictly inside the executable band
+    ``(0.05, 0.95)`` (plan Sec 1.2's clamp) from the top down. ``None`` when
+    no tick in the band satisfies ``margin`` -- never a guessed price."""
     for cents in range(_BAND_HIGH_CENTS - _TICK_CENTS, _BAND_LOW_CENTS, -_TICK_CENTS):
         price = Decimal(cents) / 100
-        edge = p_bound - (price + fee_maker(price))
+        edge = p_bound - (price + fee_fn(price))
         if edge >= margin:
             return price
     return None
+
+
+def compute_p_star(p_bound: Decimal | None, margin: Decimal) -> Decimal | None:
+    """PRIMARY, TAKER-priced resting price (domain-review finding 2): the
+    highest venue-tick price with ``edge_taker(p) = p_bound - (p +
+    fee_taker(p)) >= margin``. ``price + fee_taker(price)`` is strictly
+    increasing on ``(0.05, 0.95)`` for :data:`TAKER_FEE_COEFFICIENT` (its
+    derivative, ``1 + theta * (1 - 2p)``, stays positive across the whole
+    band), so ``edge_taker`` is strictly decreasing in ``p`` and the first
+    tick-aligned price (descending) that satisfies the margin is the highest
+    one. Returns ``None`` when ``p_bound`` is ``None`` (undefined cell) or no
+    tick in the band satisfies ``margin``.
+
+    Deliberately does NOT compare against the current best ask -- see
+    :func:`simulate_leg`'s docstring for the "does this rest, or is this the
+    IOC case" decision, made by the caller from THIS value. See
+    :func:`compute_p_star_rebate_sensitivity` for the DOCUMENTED-NOT-
+    WIRE-OBSERVED optimistic alternative (reporting only, never primary).
+    """
+    if p_bound is None:
+        return None
+    return _search_p_star(p_bound, margin, fee_taker)
+
+
+def compute_p_star_rebate_sensitivity(p_bound: Decimal | None, margin: Decimal) -> Decimal | None:
+    """DOCUMENTED-NOT-WIRE-OBSERVED optimistic sensitivity (finding 2): the
+    SAME search as :func:`compute_p_star`, priced at the PROVISIONAL maker
+    rebate (:data:`MAKER_FEE_COEFFICIENT`) instead of the taker fee. Reported
+    alongside the primary taker-priced value only -- never feeds
+    :func:`simulate_leg` or a gate's PASS/FAIL."""
+    if p_bound is None:
+        return None
+    return _search_p_star(p_bound, margin, fee_maker)
 
 
 # ---------------------------------------------------------------------------
@@ -458,6 +492,11 @@ class _State:
     cancels: dict[str, int] = field(default_factory=_cancels_dict)
     fills: list[FillEligibleEvent] = field(default_factory=list)
     ioc_take: IocTake | None = None
+    #: PREREG v5 Sec 3b (domain-review finding 1): quantity=1, so once this
+    #: leg fills ONCE there is "no resting order live for this leg" for the
+    #: rest of the station-day -- no further REST/RE-PRICE/CANCEL decision
+    #: and no further fill ever fires for it again.
+    filled: bool = False
 
 
 def _record_cancel_complete(state: _State) -> None:
@@ -514,7 +553,11 @@ def simulate_leg(
     pending-cancel STILL resting until effective -- see above), the
     ask-vs-price relationship flipping from above to at-or-below is exactly
     ONE :class:`FillEligibleEvent`; it does not re-fire while the ask stays
-    at-or-below, only on the NEXT above-to-at-or-below flip.
+    at-or-below, only on the NEXT above-to-at-or-below flip. Once this leg
+    has produced ONE fill it RETIRES (domain-review finding 1, PREREG v5
+    Sec 3b quantity=1): no further REST/RE-PRICE/CANCEL decision and no
+    further fill, even across a later uncross/re-cross, for the rest of this
+    replay.
     """
     state = _State()
 
@@ -533,6 +576,9 @@ def simulate_leg(
                 state.ioc_take = IocTake(
                     ts_ns=event.ts_ns, price=event.ask, p_bound=event.p_bound,
                 )
+
+        if state.filled:
+            continue
 
         if state.pending_cancel_reason is None:
             nominal = compute_p_star(event.p_bound, margin) if not event.stale else None
@@ -578,12 +624,57 @@ def simulate_leg(
                         p_bound_at_fill=event.p_bound,
                     ),
                 )
+                state.filled = True
             state.side_above = not now_at_or_below
 
     return RestingSimResult(
         rests=state.rests, reprices=state.reprices, cancels_by_reason=dict(state.cancels),
         fill_events=tuple(state.fills), ioc_take=state.ioc_take,
     )
+
+
+def apply_sibling_exclusivity(
+    sims: Mapping[tuple[str, str], RestingSimResult],
+) -> dict[tuple[str, str], RestingSimResult]:
+    """One-trial-per-station-day latch across every (rung, leg) simulated for
+    the SAME station-day and margin (domain-review finding 3, PREREG v3/v5
+    trial-day latch): once ANY leg fills, every OTHER leg's own fill is
+    CANCELLED with reason ``"sibling_filled"`` at the winning fill's instant
+    -- it never counts toward the study.
+
+    Each ``sims[key].fill_events`` here is already at most one element
+    (``simulate_leg``'s post-fill retirement, finding 1), so "the other
+    leg's fill" is unambiguous: this is a pure combinator over ALREADY
+    independently-simulated legs, not a re-simulation, and does not itself
+    decide who rests where -- callers pass one ``sims`` mapping per margin
+    (cancel trigger 8 is margin-scoped, since the resting price/fill
+    eligibility is too). Ties (two legs' single fill at the identical
+    ``ts_ns``) resolve by ``sims``' own iteration/insertion order --
+    deterministic, never both. ``ioc_take`` is left untouched on every leg
+    (the IOC baseline is tracked independently of the resting exclusivity,
+    module docstring).
+    """
+    fills = [
+        (key, result.fill_events[0]) for key, result in sims.items() if result.fill_events
+    ]
+    if len(fills) <= 1:
+        return dict(sims)
+
+    order = {key: index for index, key in enumerate(sims)}
+    winner_key, _winner_fill = min(fills, key=lambda item: (item[1].ts_ns, order[item[0]]))
+
+    adjusted: dict[tuple[str, str], RestingSimResult] = {}
+    for key, result in sims.items():
+        if key == winner_key or not result.fill_events:
+            adjusted[key] = result
+            continue
+        cancels = dict(result.cancels_by_reason)
+        cancels["sibling_filled"] = cancels.get("sibling_filled", 0) + 1
+        adjusted[key] = RestingSimResult(
+            rests=result.rests, reprices=result.reprices, cancels_by_reason=cancels,
+            fill_events=(), ioc_take=result.ioc_take,
+        )
+    return adjusted
 
 
 # ---------------------------------------------------------------------------
@@ -616,9 +707,24 @@ def classify_fill(
 
 
 def fill_pnl(fill: FillEligibleEvent, *, leg_won: bool | None) -> Decimal | None:
-    """``payoff - price - fee_maker(price)`` (a rebate SUBTRACTS a negative
-    number, i.e. adds its magnitude -- module docstring). ``None`` when the
-    settlement outcome is unknown."""
+    """PRIMARY, TAKER-priced fill PnL (domain-review finding 2):
+    ``payoff - price - fee_taker(price)``. No maker fee schedule has ever
+    been wire-observed (module docstring), so every resting fill is priced
+    as if it crossed at the taker fee until one is. ``None`` when the
+    settlement outcome is unknown. See :func:`fill_pnl_rebate_sensitivity`
+    for the DOCUMENTED-NOT-WIRE-OBSERVED optimistic alternative."""
+    if leg_won is None:
+        return None
+    payoff = _ONE if leg_won else _ZERO
+    return payoff - fill.price - fee_taker(fill.price)
+
+
+def fill_pnl_rebate_sensitivity(fill: FillEligibleEvent, *, leg_won: bool | None) -> Decimal | None:
+    """DOCUMENTED-NOT-WIRE-OBSERVED optimistic sensitivity (finding 2): the
+    SAME fill's PnL under the PROVISIONAL maker rebate instead of the taker
+    fee -- ``payoff - price - fee_maker(price)`` (a rebate SUBTRACTS a
+    negative number, i.e. adds its magnitude -- module docstring). Reported
+    alongside :func:`fill_pnl` only -- never feeds a gate's PASS/FAIL."""
     if leg_won is None:
         return None
     payoff = _ONE if leg_won else _ZERO

@@ -78,11 +78,14 @@ from resting_bid_core import (
     POLL_LAG_NS,
     WINDOW_END_HOUR_LST,
     WINDOW_START_HOUR_LST,
+    LegEvent,
+    RestingSimResult,
+    apply_sibling_exclusivity,
     bucket_facts,
     build_leg_events,
     classify_fill,
-    fee_taker,
     fill_pnl,
+    fill_pnl_rebate_sensitivity,
     ioc_pnl,
     is_qualifying_station_day,
     simulate_leg,
@@ -124,15 +127,20 @@ _ALPHA: Final[float] = 0.05
 @dataclass(frozen=True, slots=True, kw_only=True)
 class _FillFact:
     """One raw fill-eligible event's outcome, already settlement-resolved --
-    the unit both the gate math and the row aggregation consume."""
+    the unit both the gate math and the row aggregation consume.
+
+    ``pnl_taker`` is the PRIMARY, taker-priced pnl (domain-review finding 2);
+    ``pnl_rebate_sensitivity`` is the DOCUMENTED-NOT-WIRE-OBSERVED optimistic
+    maker-rebate alternative, reported only -- never gated on.
+    """
 
     station: str
     climate_day: str
     margin: Decimal
     price: Decimal
     classification: Literal["I", "L"]
-    pnl_maker: Decimal | None
-    pnl_taker_fee_sensitivity: Decimal | None
+    pnl_taker: Decimal | None
+    pnl_rebate_sensitivity: Decimal | None
     band: str
 
 
@@ -309,7 +317,7 @@ def _bootstrap_lower_bound(
 
 
 def _evaluate_gates(
-    fills: Sequence[_FillFact], *, ioc_pnl_sum: Decimal, maker_pnl_sum: Decimal,
+    fills: Sequence[_FillFact], *, ioc_pnl_sum: Decimal, taker_pnl_sum: Decimal,
     qualifying_station_days: int, stranded_station_days: int,
 ) -> tuple[GateResult, ...]:
     headline = [f for f in fills if f.margin == _HEADLINE_MARGIN]
@@ -334,8 +342,8 @@ def _evaluate_gates(
 
     pnl_by_day: dict[str, list[Decimal]] = {}
     for f in headline:
-        if f.pnl_maker is not None:
-            pnl_by_day.setdefault(f.climate_day, []).append(f.pnl_maker)
+        if f.pnl_taker is not None:
+            pnl_by_day.setdefault(f.climate_day, []).append(f.pnl_taker)
     all_pnl = [p for values in pnl_by_day.values() for p in values]
     mean_pnl = float(sum(all_pnl)) / len(all_pnl) if all_pnl else None
     lower_bound = _bootstrap_lower_bound(pnl_by_day, resamples=_BOOTSTRAP_RESAMPLES, alpha=_ALPHA)
@@ -365,10 +373,10 @@ def _evaluate_gates(
         lower, upper = wilson_interval(informed, total)
         half_width = (upper - lower) / 2
         informed_pnl = [
-            f.pnl_maker for f in headline if f.classification == "I" and f.pnl_maker is not None
+            f.pnl_taker for f in headline if f.classification == "I" and f.pnl_taker is not None
         ]
         liquidity_pnl = [
-            f.pnl_maker for f in headline if f.classification == "L" and f.pnl_maker is not None
+            f.pnl_taker for f in headline if f.classification == "L" and f.pnl_taker is not None
         ]
         stressed_ok = None
         if informed_pnl and liquidity_pnl:
@@ -391,23 +399,32 @@ def _evaluate_gates(
 
     g_r4 = GateResult(
         gate_id="G-R4", description="dominance",
-        status="PASS" if maker_pnl_sum > ioc_pnl_sum else "FAIL",
-        detail=f"maker_sigma_pnl={maker_pnl_sum} ioc_sigma_pnl={ioc_pnl_sum}",
+        status="PASS" if taker_pnl_sum > ioc_pnl_sum else "FAIL",
+        detail=f"resting_taker_priced_sigma_pnl={taker_pnl_sum} ioc_sigma_pnl={ioc_pnl_sum}",
     )
 
-    taker_fee_pnl = [
-        f.pnl_taker_fee_sensitivity for f in headline
-        if f.pnl_taker_fee_sensitivity is not None
+    # G-R5 robustness = taker primary (finding 2 inverts the old "under
+    # fee_taker" stress leg, which is now identical to G-R2 since taker IS
+    # the primary price); sensitivity = the rebate figure, reported alongside
+    # for documentation only -- neither leg gates on the rebate.
+    taker_fill_pnl = [f.pnl_taker for f in headline if f.pnl_taker is not None]
+    taker_mean = float(sum(taker_fill_pnl)) / len(taker_fill_pnl) if taker_fill_pnl else None
+    rebate_fill_pnl = [
+        f.pnl_rebate_sensitivity for f in headline if f.pnl_rebate_sensitivity is not None
     ]
-    taker_fee_mean = float(sum(taker_fee_pnl)) / len(taker_fee_pnl) if taker_fee_pnl else None
+    rebate_mean = (
+        float(sum(rebate_fill_pnl)) / len(rebate_fill_pnl) if rebate_fill_pnl else None
+    )
     g_r5 = GateResult(
         gate_id="G-R5", description="robustness",
-        status="NOT_COMPUTABLE" if taker_fee_mean is None else (
-            "PASS" if taker_fee_mean > 0 else "FAIL"
+        status="NOT_COMPUTABLE" if taker_mean is None else (
+            "PASS" if taker_mean > 0 else "FAIL"
         ),
         detail=(
-            f"mean_pnl_per_fill_under_fee=fee_taker={taker_fee_mean}; queue-share s does not "
-            "change Ê[pnl|fill] under this proxy (s scales expected fill COUNT only), so the "
+            f"mean_pnl_per_fill_taker_primary={taker_mean}; "
+            "mean_pnl_per_fill_rebate_sensitivity(DOCUMENTED-NOT-WIRE-OBSERVED)="
+            f"{rebate_mean}; queue-share s does not change E[pnl|fill] under this proxy "
+            "(s scales expected fill COUNT only, gates evaluated at s=1.0), so the "
             "s-robustness leg is vacuous by construction here; the >=1-frame persistence "
             "convention is NOT implemented in this run (NOT_COMPUTABLE for that half)"
         ),
@@ -442,7 +459,7 @@ def run_resting_bid_study(
     rows: list[RungLegRow] = []
     all_fills: list[_FillFact] = []
     ioc_pnl_sum = Decimal(0)
-    maker_pnl_sum = Decimal(0)
+    taker_pnl_sum = Decimal(0)
     qualifying = 0
     stranded = 0
 
@@ -507,6 +524,11 @@ def run_resting_bid_study(
             )
             season = season_for(climate_day)
 
+            # Phase 1: settlement + events for every (rung, leg) -- margin-
+            # independent, unchanged from before. Buffered by key so Phase 2
+            # can apply sibling-leg exclusivity ACROSS legs/rungs, never in
+            # per-leg isolation (domain-review finding 3).
+            per_leg: dict[tuple[str, str], tuple[bool | None, tuple[LegEvent, ...]]] = {}
             for rung in rungs:
                 facts = bucket_facts(
                     lower_f=rung.lower_f, upper_f=rung.upper_f, station=city,
@@ -527,66 +549,84 @@ def run_resting_bid_study(
                         depth_frames=depth_by_instrument.get(rung.instrument_id, ()),
                         observation_visible_ts_ns=observation_visible_ts_ns,
                     )
-                    ioc_taken_pnl = None
-                    for margin in margins:
-                        sim = simulate_leg(events, margin=margin)
-                        row_pnl_sum = Decimal(0)
-                        informed_count = 0
-                        liquidity_count = 0
-                        bands: dict[str, int] = {}
-                        for fill in sim.fill_events:
-                            classification = classify_fill(fill, events)
-                            pnl = fill_pnl(fill, leg_won=leg_won)
-                            pnl_sensitivity = (
-                                None if leg_won is None
-                                else (Decimal(1) if leg_won else Decimal(0))
-                                - (fill.price + fee_taker(fill.price))
-                            )
-                            band = time_to_fill_band(fill)
-                            bands[band] = bands.get(band, 0) + 1
-                            if classification == "I":
-                                informed_count += 1
-                            else:
-                                liquidity_count += 1
-                            if pnl is not None:
-                                row_pnl_sum += pnl
-                            all_fills.append(
-                                _FillFact(
-                                    station=city, climate_day=climate_day.isoformat(),
-                                    margin=margin, price=fill.price,
-                                    classification=classification, pnl_maker=pnl,
-                                    pnl_taker_fee_sensitivity=pnl_sensitivity, band=band,
-                                ),
-                            )
+                    per_leg[(rung.instrument_id, leg)] = (leg_won, events)
 
-                        if sim.ioc_take is not None and ioc_taken_pnl is None:
-                            ioc_taken_pnl = ioc_pnl(sim.ioc_take, leg_won=leg_won)
+            # Phase 2: per margin, simulate every (rung, leg) independently,
+            # THEN apply the one-trial-per-station-day latch across all of
+            # them for that margin (``ioc_take`` is margin-invariant and
+            # tracked separately of the resting exclusivity -- module
+            # docstring -- so it is added to ``ioc_pnl_sum`` at most once per
+            # leg regardless of how many margins visit it).
+            ioc_pnl_taken_for: set[tuple[str, str]] = set()
+            for margin in margins:
+                sims: dict[tuple[str, str], RestingSimResult] = {
+                    key: simulate_leg(events, margin=margin)
+                    for key, (_leg_won, events) in per_leg.items()
+                }
+                sims = apply_sibling_exclusivity(sims)
 
-                        for share in queue_shares:
-                            rows.append(
-                                RungLegRow(
-                                    station=city, climate_day=climate_day.isoformat(),
-                                    instrument_id=rung.instrument_id, leg=leg,
-                                    margin=margin, queue_share=share, rests=sim.rests,
-                                    reprices=sim.reprices,
-                                    cancels_by_reason=dict(sim.cancels_by_reason),
-                                    fill_events=len(sim.fill_events),
-                                    fills_expected=Decimal(len(sim.fill_events)) * share,
-                                    informed_count=informed_count,
-                                    liquidity_count=liquidity_count,
-                                    pnl_maker_sum=row_pnl_sum * share,
-                                    ioc_armed=sim.ioc_take is not None,
-                                    ioc_pnl=ioc_taken_pnl,
-                                    time_to_fill_bands=bands,
-                                ),
-                            )
-                            if margin == _HEADLINE_MARGIN and share == _HEADLINE_SHARE:
-                                maker_pnl_sum += row_pnl_sum * share
-                    if ioc_taken_pnl is not None:
+                for key, sim in sims.items():
+                    instrument_id, leg = key
+                    leg_won, events = per_leg[key]
+                    row_pnl_sum = Decimal(0)
+                    informed_count = 0
+                    liquidity_count = 0
+                    bands: dict[str, int] = {}
+                    for fill in sim.fill_events:
+                        classification = classify_fill(fill, events)
+                        pnl = fill_pnl(fill, leg_won=leg_won)
+                        pnl_rebate_sensitivity = fill_pnl_rebate_sensitivity(
+                            fill, leg_won=leg_won,
+                        )
+                        band = time_to_fill_band(fill)
+                        bands[band] = bands.get(band, 0) + 1
+                        if classification == "I":
+                            informed_count += 1
+                        else:
+                            liquidity_count += 1
+                        if pnl is not None:
+                            row_pnl_sum += pnl
+                        all_fills.append(
+                            _FillFact(
+                                station=city, climate_day=climate_day.isoformat(),
+                                margin=margin, price=fill.price,
+                                classification=classification, pnl_taker=pnl,
+                                pnl_rebate_sensitivity=pnl_rebate_sensitivity, band=band,
+                            ),
+                        )
+
+                    ioc_taken_pnl = (
+                        ioc_pnl(sim.ioc_take, leg_won=leg_won)
+                        if sim.ioc_take is not None else None
+                    )
+
+                    for share in queue_shares:
+                        rows.append(
+                            RungLegRow(
+                                station=city, climate_day=climate_day.isoformat(),
+                                instrument_id=instrument_id, leg=leg,
+                                margin=margin, queue_share=share, rests=sim.rests,
+                                reprices=sim.reprices,
+                                cancels_by_reason=dict(sim.cancels_by_reason),
+                                fill_events=len(sim.fill_events),
+                                fills_expected=Decimal(len(sim.fill_events)) * share,
+                                informed_count=informed_count,
+                                liquidity_count=liquidity_count,
+                                pnl_taker_sum=row_pnl_sum * share,
+                                ioc_armed=sim.ioc_take is not None,
+                                ioc_pnl=ioc_taken_pnl,
+                                time_to_fill_bands=bands,
+                            ),
+                        )
+                        if margin == _HEADLINE_MARGIN and share == _HEADLINE_SHARE:
+                            taker_pnl_sum += row_pnl_sum * share
+
+                    if ioc_taken_pnl is not None and key not in ioc_pnl_taken_for:
                         ioc_pnl_sum += ioc_taken_pnl
+                        ioc_pnl_taken_for.add(key)
 
     gates = _evaluate_gates(
-        all_fills, ioc_pnl_sum=ioc_pnl_sum, maker_pnl_sum=maker_pnl_sum,
+        all_fills, ioc_pnl_sum=ioc_pnl_sum, taker_pnl_sum=taker_pnl_sum,
         qualifying_station_days=qualifying, stranded_station_days=stranded,
     )
     return tuple(rows), gates, qualifying, stranded, tuple(missing)
