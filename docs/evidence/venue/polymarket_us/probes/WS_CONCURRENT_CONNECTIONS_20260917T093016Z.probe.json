@@ -1,0 +1,187 @@
+{
+  "question": "concurrent authenticated /v1/ws/markets connections per API key",
+  "started_utc": "2026-09-17T09:29:08.826+00:00",
+  "recorder_shards_assumed": 3,
+  "pre_check_recorder_dirty": [],
+  "safety_stop": null,
+  "post_wait_recorder_dirty": [],
+  "closed_utc": "2026-09-17T09:30:16.595+00:00",
+  "seconds_connected_total": 67.8,
+  "max_probe_connections_handshake_ok": 9,
+  "max_probe_connections_receiving_frames_no_drop": 9,
+  "max_concurrent_on_key_reached": 12,
+  "post_close_recorder_dirty": [],
+  "connections": [
+    {
+      "n": 1,
+      "handshake_ok": true,
+      "handshake_ms": 326.8,
+      "connect_error": null,
+      "first_frame_after_subscribe_ms": 215.2,
+      "frames_within_20s": 2,
+      "frames_total": 6,
+      "frame_key_sets": [
+        [
+          "marketData",
+          "requestId",
+          "subscriptionType"
+        ]
+      ],
+      "venue_error_texts": [],
+      "drops": [],
+      "fatally_degraded_at_end": false
+    },
+    {
+      "n": 2,
+      "handshake_ok": true,
+      "handshake_ms": 129.2,
+      "connect_error": null,
+      "first_frame_after_subscribe_ms": 50.1,
+      "frames_within_20s": 10,
+      "frames_total": 14,
+      "frame_key_sets": [
+        [
+          "marketData",
+          "requestId",
+          "subscriptionType"
+        ]
+      ],
+      "venue_error_texts": [],
+      "drops": [],
+      "fatally_degraded_at_end": false
+    },
+    {
+      "n": 3,
+      "handshake_ok": true,
+      "handshake_ms": 140.9,
+      "connect_error": null,
+      "first_frame_after_subscribe_ms": 56.1,
+      "frames_within_20s": 2,
+      "frames_total": 8,
+      "frame_key_sets": [
+        [
+          "marketData",
+          "requestId",
+          "subscriptionType"
+        ]
+      ],
+      "venue_error_texts": [],
+      "drops": [],
+      "fatally_degraded_at_end": false
+    },
+    {
+      "n": 4,
+      "handshake_ok": true,
+      "handshake_ms": 152.5,
+      "connect_error": null,
+      "first_frame_after_subscribe_ms": 173.8,
+      "frames_within_20s": 4,
+      "frames_total": 12,
+      "frame_key_sets": [
+        [
+          "marketData",
+          "requestId",
+          "subscriptionType"
+        ]
+      ],
+      "venue_error_texts": [],
+      "drops": [],
+      "fatally_degraded_at_end": false
+    },
+    {
+      "n": 5,
+      "handshake_ok": true,
+      "handshake_ms": 129.3,
+      "connect_error": null,
+      "first_frame_after_subscribe_ms": 50.0,
+      "frames_within_20s": 4,
+      "frames_total": 29,
+      "frame_key_sets": [
+        [
+          "marketData",
+          "requestId",
+          "subscriptionType"
+        ]
+      ],
+      "venue_error_texts": [],
+      "drops": [],
+      "fatally_degraded_at_end": false
+    },
+    {
+      "n": 6,
+      "handshake_ok": true,
+      "handshake_ms": 125.4,
+      "connect_error": null,
+      "first_frame_after_subscribe_ms": 56.1,
+      "frames_within_20s": 8,
+      "frames_total": 24,
+      "frame_key_sets": [
+        [
+          "marketData",
+          "requestId",
+          "subscriptionType"
+        ]
+      ],
+      "venue_error_texts": [],
+      "drops": [],
+      "fatally_degraded_at_end": false
+    },
+    {
+      "n": 7,
+      "handshake_ok": true,
+      "handshake_ms": 140.4,
+      "connect_error": null,
+      "first_frame_after_subscribe_ms": 58.4,
+      "frames_within_20s": 1,
+      "frames_total": 1,
+      "frame_key_sets": [
+        [
+          "marketData",
+          "requestId",
+          "subscriptionType"
+        ]
+      ],
+      "venue_error_texts": [],
+      "drops": [],
+      "fatally_degraded_at_end": false
+    },
+    {
+      "n": 8,
+      "handshake_ok": true,
+      "handshake_ms": 321.5,
+      "connect_error": null,
+      "first_frame_after_subscribe_ms": 209.5,
+      "frames_within_20s": 6,
+      "frames_total": 6,
+      "frame_key_sets": [
+        [
+          "marketData",
+          "requestId",
+          "subscriptionType"
+        ]
+      ],
+      "venue_error_texts": [],
+      "drops": [],
+      "fatally_degraded_at_end": false
+    },
+    {
+      "n": 9,
+      "handshake_ok": true,
+      "handshake_ms": 122.5,
+      "connect_error": null,
+      "first_frame_after_subscribe_ms": 46.5,
+      "frames_within_20s": 5,
+      "frames_total": 5,
+      "frame_key_sets": [
+        [
+          "marketData",
+          "requestId",
+          "subscriptionType"
+        ]
+      ],
+      "venue_error_texts": [],
+      "drops": [],
+      "fatally_degraded_at_end": false
+    }
+  ]
+}
