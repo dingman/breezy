@@ -27,7 +27,7 @@ Everything else is build-side.
 
 - **G-02 ROI feasibility NO-GO** on the downstream programme (not the first fill). `docs/evidence/roi_feasibility_2026-08-26.md`.
 - **G-01 prelim→final revision POWERED FAIL** on MDW/NYC/SFO; interior-bucket strategies dead. `docs/evidence/observation_lock_falsification_2026-08-31.md`.
-- **Lock strategies DEAD (L-9); forecast family KILLED; K1 DEAD at ask ≥2c; candidate #2 THIN, NOT A GO.** Do not design a new family.
+- **Lock strategies DEAD (L-9); K1 DEAD at ask ≥2c.** Forecast-family KILL **SUPERSEDED 09-18 by ruling** `docs/evidence/RULING_forecast_edge_family_2026-09-18.md`: `pm_us_crh_fc_v1` Stage 0 per `docs/plans/FORECAST_EDGE_FAMILY_Rev5_2026-09-18.md` (§0.3 binding); arming displaces `pm_us_crh_cont`.
 - **Price history is forward-only; a forecast archive is a CALIBRATION set.** Venue surface = 5 cities × daily HIGH. BL-6 (no NO-side instrument) is SUPERSEDED by the 09-14 operator ruling: NO-side hunting is a requirement (NO-1).
 - **NO FAMILY HAS A PROVEN EDGE; ONE IS UNDER LIVE MEASUREMENT** (`pm_us_crh_cont`, PREREG v3 BINDING, d0 2026-09-12; `pm_us_crh_v2` still REGISTERED). Demonstrated edge NONE; admissible n = 0 after 10 live days; 3 orders, 2 fills (09-11 SFO @0.22, 09-13 MIA @0.70; both resolver path → residual by v3 §5). Multi-position ruling 09-14 (R-10) lifts the one-per-station bound; MP-A merged b5a7c04.
 - **Readiness audit 2026-09-12** (`docs/evidence/READINESS_AUDIT_2026-09-12.md`): the KILL-clock counter read 0/15 for 09-05..09-11 BY MECHANISM (any-overlap rule + feed-wide gap fan-out; L-38), not by outage; the create-path accept-fill branch has never fired live; v3 has never been fill-replayed; alerts reach nobody.
@@ -47,7 +47,7 @@ order; B = build, O = operator, S = strategy-lead ruling.
 | ID | Own | Sev | Item | Plan | Size |
 |---|---|---|---|---|---|
 | ING-1 | B | **CRIT** | **KILL clock blocked by ingest** (audit 09-13): the 15-min ingest writes a partial live-instance depth slice and refuses every later write as non-disjoint (exit 3), so in-window Depth10 stays < 30 min and coverage reads 0. Fix the collision (replace-or-extend), re-run coverage; also blocks monitor marks and the hypothetical-hold corpus | `READINESS_AUDIT_2026-09-13.md` | S |
-| ADM-1 | B | HIGH | Σq admission + sibling-leg gates enforced on the YES arm path 09-16 (a9fd0fb), recorded per-contract fee at consume. RESIDUAL: counts FILLED legs only (concurrent-arm race). `docs/evidence/LOSING_DAY_DIAGNOSIS_2026-09-15.md` | diagnosis §4 | S |
+| ADM-1 | B | LOW | Σq admission counts FILLED legs only (concurrent-arm race) | diagnosis §4 | S |
 | EXIT-1 | B/O | CRIT | **Exit seam BUILT, UNARMED** (c96c7f4; ruling 09-16). Decider→native IOC LIMIT SELL→exec exit seam; `pm_us_crh_exit_v4` DRAFT, no `exit_rule` → live family never sells. Study N=5: R-DEAD 0/5 fillable, R-THREAT 1/5 → gates FAIL. Before arming: PREREG v4 registration, 1-lot positive control, nightly study (15:20Z). `POSITION_EXIT_EXECUTION_2026-09-16.md` | plan §4 | L |
 | REST-1 | B | HIGH | **Resting-bid hunting** (ruling 09-16): `RESTING_BID_HUNT_2026-09-16.md` Rev 2, PREREG v5 DRAFT. Merged 09-17 (d1a01c2): maker-fee branch (opt-in), TRADE-print capture (recorder from 09-17 09:00Z; unit UNRESOLVED), shadow decider (taker-priced, contained, tape fields), open-orders read-back (boot/re-arm fail closed on any resting order), Arm A study. Arm A `20260916_armA_fixed`: 19 fills/11 days, resting −2.55 vs IOC −2.09, G-R1/2/4/5 FAIL → underpowered negative; no venue write until a print-based rerun with ≥12 days passes | plan §2.1 | L |
 | WIN-1 | B | **HIGH** | Hunt opens after the winning rung reprices (MIA 0.50→0.90 done 61 min pre-open): calibrate hours 10–11 LST, screen vs pre-window asks, PREREG-amend; `docs/evidence/STRATEGY_OPPORTUNITY_AUDIT_2026-09-18.md` | plan §6 | M |
@@ -100,6 +100,6 @@ ruff 24 incl. `persistence/family_manifest.py:42`), CF-13, CF-14b, PF-1, BL-10, 
 ## Pointers
 
 Audits `docs/evidence/READINESS_AUDIT_2026-09-13.md` (delta), `READINESS_AUDIT_2026-09-12.md` · durable rules `docs/core/LESSONS.md`
-(L-1..L-40, all binding) · evidence `docs/evidence/` · runbook `docs/plans/R8_OPERATOR_RUNBOOK.md`
+(binding) · evidence `docs/evidence/` · runbook `docs/plans/R8_OPERATOR_RUNBOOK.md`
 · programme narrative `docs/core/PROGRAMME_PATH.md` · strategy authoring
 `docs/specs/STRATEGY_QUICKSTART.md` · pre-shrink history `docs/core/archive/`
