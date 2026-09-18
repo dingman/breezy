@@ -8,9 +8,12 @@ carries either marker.
 from __future__ import annotations
 
 import ast
+import importlib.util
 import inspect
+import sys
 from collections.abc import Callable
 from pathlib import Path
+from types import ModuleType
 from typing import Any
 from urllib.parse import parse_qs, urlsplit
 
@@ -19,14 +22,6 @@ import pytest
 import respx
 
 from breezy.ingest.http import FetchResult, HttpTransport, OversizeBodyError, RedirectError
-from breezy.ingest.iem_mos_probe_transport import (
-    IEM_BASE_URL,
-    IEM_MIN_INTERVAL_NS,
-    IemMosProbeTransport,
-    IemPacer,
-    exchange_from_alarm,
-    exchange_from_result,
-)
 from breezy.ingest.probe_transport import (
     SETTLEMENT_HOSTS,
     RequestBudget,
@@ -36,7 +31,27 @@ from breezy.ingest.probe_transport import (
 
 UA = "breezy-mos-probe-test (contact: ops@example.invalid)"
 FROZEN_NS = 1_758_153_600_000_000_000  # 2026-09-18T00:00:00Z
-_MODULE_PATH = Path(__file__).resolve().parents[2] / "src/breezy/ingest/iem_mos_probe_transport.py"
+_MODULE_PATH = Path(__file__).resolve().parents[2] / "scripts/venue/iem_mos_probe_transport.py"
+
+
+def _load_script(path: Path) -> ModuleType:
+    """Import a ``scripts/`` module by path, as the probe-containment suite does."""
+    spec = importlib.util.spec_from_file_location(f"breezy_probe_{path.stem}", path)
+    if spec is None or spec.loader is None:  # pragma: no cover - import plumbing
+        raise ImportError(f"cannot load {path}")
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+_transport_mod = _load_script(_MODULE_PATH)
+IEM_BASE_URL = _transport_mod.IEM_BASE_URL
+IEM_MIN_INTERVAL_NS = _transport_mod.IEM_MIN_INTERVAL_NS
+IemMosProbeTransport = _transport_mod.IemMosProbeTransport
+IemPacer = _transport_mod.IemPacer
+exchange_from_alarm = _transport_mod.exchange_from_alarm
+exchange_from_result = _transport_mod.exchange_from_result
 
 
 def _clock() -> int:

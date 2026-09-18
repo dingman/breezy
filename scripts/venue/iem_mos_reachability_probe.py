@@ -26,7 +26,18 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from breezy.ingest.http import OversizeBodyError, RedirectError, TransportError
-from breezy.ingest.iem_mos_probe_transport import (
+from breezy.ingest.probe_transport import (
+    ProbeEvidenceWriter,
+    ProbeExchange,
+    RequestBudget,
+    RequestBudgetExceededError,
+)
+
+_SCRIPT_DIRECTORY = Path(__file__).resolve().parent
+if str(_SCRIPT_DIRECTORY) not in sys.path:  # pragma: no cover - bootstrap
+    sys.path.insert(0, str(_SCRIPT_DIRECTORY))
+
+from iem_mos_probe_transport import (
     IEM_ALLOWED_HOSTS,
     IEM_HOST,
     IEM_MOS_PROBE_MAX_BODY_BYTES,
@@ -36,12 +47,6 @@ from breezy.ingest.iem_mos_probe_transport import (
     exchange_from_alarm,
     exchange_from_result,
     utc_stamp,
-)
-from breezy.ingest.probe_transport import (
-    ProbeEvidenceWriter,
-    ProbeExchange,
-    RequestBudget,
-    RequestBudgetExceededError,
 )
 
 ALLOWED_HOSTS: frozenset[str] = IEM_ALLOWED_HOSTS
@@ -610,7 +615,7 @@ def render_report(
         "",
         f"Host: `{IEM_HOST}` (settlement host NOT touched)",
         (
-            "Transport: `breezy.ingest.iem_mos_probe_transport.IemMosProbeTransport`, "
+            "Transport: `iem_mos_probe_transport.IemMosProbeTransport`, "
             f"max_body_bytes={IEM_MOS_PROBE_MAX_BODY_BYTES}"
         ),
         f"Request budget: {budget.limit} hard; spent {budget.spent}.",

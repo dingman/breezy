@@ -428,7 +428,7 @@ def test_probes_do_bind_to_the_hardened_transport(rel: str) -> None:
 def test_probe_d_binds_iem_mos_probe_transport() -> None:
     source = (REPO_ROOT / PROBE_D_REL).read_text(encoding="utf-8")
     modules = {module for module, _ in _imported_roots(ast.parse(source, filename=PROBE_D_REL))}
-    assert "breezy.ingest.iem_mos_probe_transport" in modules
+    assert "iem_mos_probe_transport" in modules
 
 
 def test_the_foreign_import_detector_is_not_vacuous() -> None:

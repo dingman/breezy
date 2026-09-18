@@ -22,7 +22,6 @@ import httpx
 import pytest
 
 from breezy.ingest.http import FetchResult, HttpTransport, OversizeBodyError, RedirectError
-from breezy.ingest.iem_mos_probe_transport import IemMosProbeTransport, IemPacer
 from breezy.ingest.probe_transport import (
     MANIFEST_FILENAME,
     ProbeEvidenceWriter,
@@ -32,6 +31,7 @@ from breezy.ingest.probe_transport import (
 
 REPO_ROOT: Final[Path] = Path(__file__).resolve().parents[2]
 PROBE_PATH: Final[Path] = REPO_ROOT / "scripts/venue/iem_mos_reachability_probe.py"
+TRANSPORT_PATH: Final[Path] = REPO_ROOT / "scripts/venue/iem_mos_probe_transport.py"
 PROBE_UA: Final[str] = "breezy-mos-probe-ua-token-TESTONLY"
 FROZEN_DT: Final[dt.datetime] = dt.datetime(2026, 9, 18, tzinfo=dt.UTC)
 FROZEN_NS: Final[int] = int(FROZEN_DT.timestamp() * 1_000_000_000)
@@ -65,6 +65,10 @@ def _load_script(path: Path) -> ModuleType:
     spec.loader.exec_module(module)
     return module
 
+
+_transport_mod = _load_script(TRANSPORT_PATH)
+IemMosProbeTransport = _transport_mod.IemMosProbeTransport
+IemPacer = _transport_mod.IemPacer
 
 probe = _load_script(PROBE_PATH)
 

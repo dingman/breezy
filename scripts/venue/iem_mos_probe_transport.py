@@ -48,9 +48,7 @@ __all__ = [
     "utc_stamp",
 ]
 
-# Assembled so the contiguous IEM origin is not a src/ literal (archive
-# separation contract: src never names the IEM host as one string).
-IEM_HOST: Final[str] = ".".join(("mesonet", "agron", "iastate", "edu"))  # noqa: FLY002
+IEM_HOST: Final[str] = "mesonet.agron.iastate.edu"
 IEM_BASE_URL: Final[str] = f"https://{IEM_HOST}"
 IEM_ALLOWED_HOSTS: Final[frozenset[str]] = frozenset({IEM_HOST})
 IEM_MIN_INTERVAL_NS: Final[int] = 1_000_000_000
