@@ -70,12 +70,20 @@ SRC_ROOT: Final[Path] = REPO_ROOT / "src" / "breezy"
 PROBE_A_PATH: Final[Path] = REPO_ROOT / "scripts/venue/open_meteo_previous_runs_probe.py"
 PROBE_B_PATH: Final[Path] = REPO_ROOT / "scripts/venue/iem_afos_forecast_pil_probe.py"
 PROBE_C_PATH: Final[Path] = REPO_ROOT / "scripts/venue/open_meteo_coverage_bisect_probe.py"
+PROBE_D_PATH: Final[Path] = REPO_ROOT / "scripts/venue/iem_mos_reachability_probe.py"
 PROBE_E_PATH: Final[Path] = REPO_ROOT / "scripts/venue/nbm_nomads_discovery_probe.py"
-PROBE_PATHS: Final[tuple[Path, ...]] = (PROBE_A_PATH, PROBE_B_PATH, PROBE_C_PATH, PROBE_E_PATH)
+PROBE_PATHS: Final[tuple[Path, ...]] = (
+    PROBE_A_PATH,
+    PROBE_B_PATH,
+    PROBE_C_PATH,
+    PROBE_D_PATH,
+    PROBE_E_PATH,
+)
 
 PROBE_A_REL: Final[str] = "scripts/venue/open_meteo_previous_runs_probe.py"
 PROBE_B_REL: Final[str] = "scripts/venue/iem_afos_forecast_pil_probe.py"
 PROBE_C_REL: Final[str] = "scripts/venue/open_meteo_coverage_bisect_probe.py"
+PROBE_D_REL: Final[str] = "scripts/venue/iem_mos_reachability_probe.py"
 PROBE_E_REL: Final[str] = "scripts/venue/nbm_nomads_discovery_probe.py"
 
 LIVE_TEST_PATHS: Final[tuple[Path, ...]] = (
@@ -104,6 +112,7 @@ def _load_script(path: Path) -> ModuleType:
 probe_a = _load_script(PROBE_A_PATH)
 probe_b = _load_script(PROBE_B_PATH)
 probe_c = _load_script(PROBE_C_PATH)
+probe_d = _load_script(PROBE_D_PATH)
 probe_e = _load_script(PROBE_E_PATH)
 
 
@@ -263,7 +272,7 @@ async def test_the_client_the_probe_builds_does_not_follow_redirects() -> None:
 # ==========================================================================
 
 
-@pytest.mark.parametrize("rel", [PROBE_A_REL, PROBE_B_REL, PROBE_C_REL, PROBE_E_REL])
+@pytest.mark.parametrize("rel", [PROBE_A_REL, PROBE_B_REL, PROBE_C_REL, PROBE_D_REL, PROBE_E_REL])
 def test_both_probes_classify_as_venue_touching(rel: str) -> None:
     source = (REPO_ROOT / rel).read_text(encoding="utf-8")
     assert is_venue_touching(rel, ast.parse(source, filename=rel)) is True
@@ -287,7 +296,7 @@ def test_the_classifier_still_exempts_the_operator_webhook_module() -> None:
 # ==========================================================================
 
 
-@pytest.mark.parametrize("rel", [PROBE_A_REL, PROBE_B_REL, PROBE_C_REL, PROBE_E_REL])
+@pytest.mark.parametrize("rel", [PROBE_A_REL, PROBE_B_REL, PROBE_C_REL, PROBE_D_REL, PROBE_E_REL])
 def test_probe_modules_contain_no_write_egress_violation(rel: str) -> None:
     source = (REPO_ROOT / rel).read_text(encoding="utf-8")
     assert find_write_egress_violations(rel, source) == []
@@ -408,18 +417,24 @@ def find_foreign_http_client_imports(path: str, source: str) -> list[str]:
     return found
 
 
-@pytest.mark.parametrize("rel", [PROBE_A_REL, PROBE_B_REL, PROBE_C_REL, PROBE_E_REL])
+@pytest.mark.parametrize("rel", [PROBE_A_REL, PROBE_B_REL, PROBE_C_REL, PROBE_D_REL, PROBE_E_REL])
 def test_probes_import_no_http_client_other_than_breezy_ingest_http(rel: str) -> None:
     source = (REPO_ROOT / rel).read_text(encoding="utf-8")
     assert find_foreign_http_client_imports(rel, source) == []
 
 
-@pytest.mark.parametrize("rel", [PROBE_A_REL, PROBE_B_REL, PROBE_C_REL, PROBE_E_REL])
+@pytest.mark.parametrize("rel", [PROBE_A_REL, PROBE_B_REL, PROBE_C_REL, PROBE_D_REL, PROBE_E_REL])
 def test_probes_do_bind_to_the_hardened_transport(rel: str) -> None:
     """The negative above is worthless without this positive."""
     source = (REPO_ROOT / rel).read_text(encoding="utf-8")
     modules = {module for module, _ in _imported_roots(ast.parse(source, filename=rel))}
     assert "breezy.ingest.probe_transport" in modules
+
+
+def test_probe_d_binds_iem_mos_probe_transport() -> None:
+    source = (REPO_ROOT / PROBE_D_REL).read_text(encoding="utf-8")
+    modules = {module for module, _ in _imported_roots(ast.parse(source, filename=PROBE_D_REL))}
+    assert "iem_mos_probe_transport" in modules
 
 
 def test_the_foreign_import_detector_is_not_vacuous() -> None:
@@ -452,7 +467,7 @@ def _breezy_import_closure(rel: str) -> set[str]:
     return seen
 
 
-@pytest.mark.parametrize("rel", [PROBE_A_REL, PROBE_B_REL, PROBE_C_REL, PROBE_E_REL])
+@pytest.mark.parametrize("rel", [PROBE_A_REL, PROBE_B_REL, PROBE_C_REL, PROBE_D_REL, PROBE_E_REL])
 def test_exactly_one_module_in_the_probe_import_closure_speaks_httpx(rel: str) -> None:
     """The probe cannot inherit a second, softer transport through a dependency.
 
@@ -964,7 +979,7 @@ def test_probe_c_phase_ceilings_fit_inside_its_hard_budget() -> None:
     assert probe_c.REQUEST_BUDGET == 16, "16 is the ceiling that was authorised for Probe C"
 
 
-@pytest.mark.parametrize("module", [probe_a, probe_b, probe_c, probe_e])
+@pytest.mark.parametrize("module", [probe_a, probe_b, probe_c, probe_d, probe_e])
 def test_no_probe_widens_the_shipped_default_allowlist(module: ModuleType) -> None:
     """A per-probe host is permitted; the shipped default must not move."""
     from breezy.ingest.shared_state import DEFAULT_ALLOWED_HOSTS
@@ -987,8 +1002,8 @@ def test_no_probe_widens_the_shipped_default_allowlist(module: ModuleType) -> No
 
 @pytest.mark.parametrize(
     "module",
-    [probe_a, probe_b, probe_c, probe_e],
-    ids=["open_meteo", "iem_afos", "coverage_bisect", "nbm_nomads"],
+    [probe_a, probe_b, probe_c, probe_d, probe_e],
+    ids=["open_meteo", "iem_afos", "coverage_bisect", "iem_mos", "nbm_nomads"],
 )
 def test_neither_probe_names_the_settlement_host(module: ModuleType) -> None:
     source = Path(module.__file__ or "").read_text(encoding="utf-8")
