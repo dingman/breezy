@@ -619,6 +619,7 @@ class PolymarketUSMarketsWebSocket:
                 market_slugs=pending,
             )
         )
+        self._log.info(self._subscribe_sent_info("MARKET_DATA", request_id, pending))
         for slug in pending:
             self._subscriptions[slug] = request_id
         self._arm_confirmation(pending)
@@ -670,8 +671,25 @@ class PolymarketUSMarketsWebSocket:
                 market_slugs=tradeable,
             )
         )
+        self._log.info(self._subscribe_sent_info("TRADE", request_id, tradeable))
         for slug in tradeable:
             self._trade_subscriptions[slug] = request_id
+
+    def _subscribe_sent_info(
+        self, kind: str, request_id: str, slugs: Sequence[str]
+    ) -> str:
+        """One INFO after a successful MARKET_DATA or TRADE subscribe send.
+
+        Public slugs only -- never the envelope JSON, signatures, or headers.
+        ``kind`` is ``MARKET_DATA`` or ``TRADE``. The connection label is the
+        same ``shard-N`` (or ``single``) used on closed-and-reconnecting lines.
+        """
+        joined = ",".join(slugs)
+        return (
+            f"Polymarket.us markets websocket ({self._connection_label}) "
+            f"sent {kind} subscribe: request_id={request_id} "
+            f"slugs={len(slugs)} [{joined}]"
+        )
 
     def _trade_skip_warning(self, slugs: Sequence[str]) -> str:
         """One WARN naming every slug whose TRADE request will not be sent.
@@ -1649,4 +1667,9 @@ class PolymarketUSMarketsWebSocketPool:
         shard = self._build_shard(len(self._shards))
         await shard.connect()
         self._shards.append(shard)
+        self._log.info(
+            "Polymarket.us markets websocket pool: "
+            f"opened {shard.connection_label}; shards={len(self._shards)} "
+            f"slugs per shard={self._slugs_per_shard}"
+        )
         return shard

@@ -2090,3 +2090,144 @@ def test_pool_logs_boot_time_sizing_with_trades_disabled() -> None:
         and "trade_shard_halving=False" in m
         for m in recorder.messages
     ), f"missing boot-time sizing line: {recorder.messages!r}"
+
+
+# --------------------------------------------------------------------------
+# L-45 observability: live shard-open count + per-shard MARKET_DATA/TRADE
+# subscribe sends. Construction logs shards=1 before discovery; envelope
+# sends logged nothing, so MARKET_DATA-before-TRADE was uncountable from
+# the journal. Logging only -- no behaviour, flags, or config change.
+# --------------------------------------------------------------------------
+
+_NEW_OBSERVABILITY_LOG_MARKERS = (
+    "opened shard-",
+    "sent MARKET_DATA subscribe",
+    "sent TRADE subscribe",
+)
+_FORBIDDEN_IN_OBSERVABILITY_LOGS = (
+    "signature",
+    "Authorization",
+    "apiKey",
+    "secret",
+    '{"',
+)
+
+
+@pytest.mark.allow_socket
+@pytest.mark.asyncio
+async def test_opening_a_second_shard_logs_opened_shard_and_new_total() -> None:
+    """Opening shard-1 must INFO the new live total, not the construction 1."""
+    slugs = _weather_slugs(3)
+    recorder = _RecordingPoolLogger()
+    async with LoopbackWebSocketServer() as server:
+        pool = _make_pool(ws_url=server.url, signer=None, cap=2, logger=recorder)
+        try:
+            await pool.subscribe_market_data(slugs)
+            await _wait_until(lambda: pool.shard_count == 2)
+        finally:
+            await pool.close()
+
+    opened = [m for m in recorder.messages if "opened shard-1" in m]
+    assert opened, f"missing opened-shard INFO: {recorder.messages!r}"
+    assert "opened shard-1; shards=2" in opened[0]
+    assert "slugs per shard=2" in opened[0]
+
+
+@pytest.mark.allow_socket
+@pytest.mark.asyncio
+async def test_subscribe_logs_market_data_then_trade_with_request_ids() -> None:
+    """A successful send logs MARKET_DATA then TRADE, with ids and slug count."""
+    recorder = _RecordingPoolLogger()
+    async with LoopbackWebSocketServer() as server:
+        signer, _ = _new_signer()
+        ws = _make_ws(
+            ws_url=server.url,
+            signer=signer,
+            subscribe_trades=True,
+            logger=recorder,
+            connection_label="shard-0",
+        )
+        try:
+            await ws.connect()
+            await ws.subscribe_market_data(_TRADE_SLUGS)
+            await _wait_until(lambda: len(server.messages) == 2)
+        finally:
+            await ws.close()
+
+    md = [i for i, m in enumerate(recorder.messages) if "sent MARKET_DATA subscribe" in m]
+    trade = [i for i, m in enumerate(recorder.messages) if "sent TRADE subscribe" in m]
+    assert md, f"missing MARKET_DATA subscribe INFO: {recorder.messages!r}"
+    assert trade, f"missing TRADE subscribe INFO: {recorder.messages!r}"
+    assert md[0] < trade[0], f"MARKET_DATA must log before TRADE: {recorder.messages!r}"
+    md_line = recorder.messages[md[0]]
+    trade_line = recorder.messages[trade[0]]
+    assert "request_id=req-1" in md_line
+    assert "slugs=2" in md_line
+    assert "request_id=req-2" in trade_line
+    assert "slugs=2" in trade_line
+    for slug in _TRADE_SLUGS:
+        assert slug in md_line
+        assert slug in trade_line
+
+
+@pytest.mark.allow_socket
+@pytest.mark.asyncio
+async def test_subscribe_without_trades_logs_market_data_and_not_trade() -> None:
+    recorder = _RecordingPoolLogger()
+    async with LoopbackWebSocketServer() as server:
+        signer, _ = _new_signer()
+        ws = _make_ws(
+            ws_url=server.url,
+            signer=signer,
+            logger=recorder,
+            connection_label="shard-0",
+        )
+        try:
+            await ws.connect()
+            await ws.subscribe_market_data(_TRADE_SLUGS)
+            await _wait_until(lambda: len(server.messages) == 1)
+            await asyncio.sleep(0.1)
+        finally:
+            await ws.close()
+
+    assert any("sent MARKET_DATA subscribe" in m for m in recorder.messages), (
+        f"missing MARKET_DATA subscribe INFO: {recorder.messages!r}"
+    )
+    assert not any("sent TRADE subscribe" in m for m in recorder.messages), (
+        f"unexpected TRADE subscribe INFO: {recorder.messages!r}"
+    )
+
+
+@pytest.mark.allow_socket
+@pytest.mark.asyncio
+async def test_shard_open_and_subscribe_logs_omit_secrets_and_envelope_json() -> None:
+    """These paths log public slugs only -- never envelope JSON or credentials."""
+    slugs = _weather_slugs(3)
+    recorder = _RecordingPoolLogger()
+    async with LoopbackWebSocketServer() as server:
+        pool = _make_pool(
+            ws_url=server.url,
+            signer=None,
+            cap=2,
+            logger=recorder,
+            subscribe_trades=True,
+        )
+        try:
+            await pool.subscribe_market_data(slugs)
+            await _wait_until(lambda: pool.shard_count == 2)
+        finally:
+            await pool.close()
+
+    produced = [
+        m
+        for m in recorder.messages
+        if any(marker in m for marker in _NEW_OBSERVABILITY_LOG_MARKERS)
+    ]
+    assert produced, f"new observability lines missing: {recorder.messages!r}"
+    leaked = [
+        (token, line)
+        for line in produced
+        for token in _FORBIDDEN_IN_OBSERVABILITY_LOGS
+        if token in line
+    ]
+    assert leaked == [], f"forbidden token in observability log: {leaked!r}"
