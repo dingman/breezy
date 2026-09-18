@@ -51,6 +51,7 @@ from breezy.adapters.polymarket_us.parsing import (
 )
 
 __all__ = [
+    "DOCUMENTED_TAKER_FEE_COEFFICIENT",
     "MAKER_FEE_BPS_INFO_KEY",
     "MAKER_FEE_COEFFICIENT",
     "PolymarketUSFeeModel",
@@ -75,13 +76,14 @@ _BPS_PER_UNIT = Decimal(10_000)
 #: fabrication, not an inference.
 MAKER_FEE_COEFFICIENT: Decimal = Decimal("-0.0125")
 
-#: The DOCUMENTED taker theta (fees_2026-08-25.md:22, "Taker Fee | 0.06 |
+#: The DOCUMENTED taker theta (fees_2026-08-25.md:27, "Taker Fee | 0.06 |
 #: $1.50"), used ONLY by :func:`expected_fee_for`, which has no `Instrument`
 #: and therefore no per-market coefficient to read. Every per-fill fee this
 #: module actually charges comes from :func:`polymarket_us_fee`, which reads
 #: `theta` from `instrument.info[FEE_COEFFICIENT_KEY]` and never from this
-#: constant.
-_DOCUMENTED_TAKER_FEE_COEFFICIENT = Decimal("0.06")
+#: constant. Public because the schedule-pin capture test is the only legal
+#: cross-package reader -- nothing in `src/` may import it.
+DOCUMENTED_TAKER_FEE_COEFFICIENT = Decimal("0.06")
 
 #: ``instrument.info`` key this module cross-checks :data:`MAKER_FEE_COEFFICIENT`
 #: against, named for the venue's OWN wire field:
@@ -407,7 +409,7 @@ def expected_fee_for(price: Decimal, qty: Decimal, liquidity_side: LiquiditySide
     if liquidity_side == LiquiditySide.MAKER:
         theta = MAKER_FEE_COEFFICIENT
     elif liquidity_side == LiquiditySide.TAKER:
-        theta = _DOCUMENTED_TAKER_FEE_COEFFICIENT
+        theta = DOCUMENTED_TAKER_FEE_COEFFICIENT
     else:
         raise ValueError(
             "Refusing to estimate a Polymarket.us fee with no maker/taker "
