@@ -363,17 +363,26 @@ class ProbeTransport(HttpTransport):
         path: str,
         *,
         query: Mapping[str, str] | None = None,
+        if_none_match: str | None = None,
+        if_modified_since: str | None = None,
+        allow_not_modified: bool = False,
     ) -> FetchResult:
         """Dispatch one budgeted GET and let every inherited alarm propagate.
 
         The same budget and the same controls; used where a caller wants the
         typed exception rather than a recorded finding.
+
+        ``if_none_match``, ``if_modified_since`` and ``allow_not_modified`` are
+        optional keyword-only parameters forwarded to the inherited
+        ``_fetch``. Defaults (``None`` / ``None`` / ``False``) reproduce the
+        previous hardcoded behaviour. The budget still charges inside
+        :meth:`_fetch` whether or not a validator is supplied.
         """
         return await self._fetch(
             self._probe_url(path, query),
-            if_none_match=None,
-            if_modified_since=None,
-            allow_not_modified=False,
+            if_none_match=if_none_match,
+            if_modified_since=if_modified_since,
+            allow_not_modified=allow_not_modified,
         )
 
     # -- internals ----------------------------------------------------------
