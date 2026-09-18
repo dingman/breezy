@@ -133,6 +133,8 @@ forbidden_modules = [
     "breezy.domain.archived_climate_day",
     "breezy.domain.archived_raw_product",
     "breezy.persistence.archive_catalog",
+    "breezy.persistence.archive_cache",
+    "breezy.persistence.archive_request",
     "breezy.ingest.archive_records",
 ]
 allow_indirect_imports = false
