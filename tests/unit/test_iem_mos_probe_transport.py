@@ -66,11 +66,11 @@ def _pacer(
     *,
     clock: Callable[[], int] = _clock,
     sleeper: Callable[[float], Any] | None = None,
-) -> IemPacer:
+) -> Any:
     return IemPacer(clock=clock, sleeper=sleeper or _noop_sleep)
 
 
-def _transport(**overrides: object) -> IemMosProbeTransport:
+def _transport(**overrides: object) -> Any:
     kwargs: dict[str, object] = {
         "budget": RequestBudget(limit=8),
         "pacer": _pacer(),
@@ -79,7 +79,7 @@ def _transport(**overrides: object) -> IemMosProbeTransport:
         "check_proxy_env": False,
     }
     kwargs.update(overrides)
-    return IemMosProbeTransport(**kwargs)  # type: ignore[arg-type]
+    return IemMosProbeTransport(**kwargs)
 
 
 def _result(

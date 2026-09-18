@@ -277,7 +277,7 @@ async def _run_execute(
     fetch_impl: Callable[..., Any],
     *,
     budget_limit: int | None = None,
-) -> tuple[Any, ProbeEvidenceWriter, IemMosProbeTransport]:
+) -> tuple[Any, ProbeEvidenceWriter, Any]:
     plan = probe.build_request_plan(clock=_clock)
     budget = RequestBudget(limit=budget_limit if budget_limit is not None else probe.REQUEST_BUDGET)
     transport = IemMosProbeTransport(

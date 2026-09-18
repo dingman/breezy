@@ -72,7 +72,13 @@ PROBE_B_PATH: Final[Path] = REPO_ROOT / "scripts/venue/iem_afos_forecast_pil_pro
 PROBE_C_PATH: Final[Path] = REPO_ROOT / "scripts/venue/open_meteo_coverage_bisect_probe.py"
 PROBE_D_PATH: Final[Path] = REPO_ROOT / "scripts/venue/iem_mos_reachability_probe.py"
 PROBE_E_PATH: Final[Path] = REPO_ROOT / "scripts/venue/nbm_nomads_discovery_probe.py"
-PROBE_PATHS: Final[tuple[Path, ...]] = (PROBE_A_PATH, PROBE_B_PATH, PROBE_C_PATH, PROBE_D_PATH, PROBE_E_PATH)
+PROBE_PATHS: Final[tuple[Path, ...]] = (
+    PROBE_A_PATH,
+    PROBE_B_PATH,
+    PROBE_C_PATH,
+    PROBE_D_PATH,
+    PROBE_E_PATH,
+)
 
 PROBE_A_REL: Final[str] = "scripts/venue/open_meteo_previous_runs_probe.py"
 PROBE_B_REL: Final[str] = "scripts/venue/iem_afos_forecast_pil_probe.py"
