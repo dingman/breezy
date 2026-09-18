@@ -16,7 +16,7 @@ import json
 import os
 import re
 from collections.abc import Callable
-from dataclasses import asdict, dataclass
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Final, Protocol
 
@@ -129,7 +129,19 @@ class CoverageEntry:
     manifest_version: int
 
     def to_dict(self) -> dict[str, Any]:
-        return asdict(self)
+        return {
+            "cache_key": self.cache_key,
+            "station": self.station,
+            "product": self.product,
+            "window_start": self.window_start,
+            "window_end": self.window_end,
+            "rows": self.rows,
+            "bytes": self.bytes,
+            "sha256": self.sha256,
+            "fetched_at_ns": self.fetched_at_ns,
+            "model": self.model,
+            "manifest_version": self.manifest_version,
+        }
 
     @classmethod
     def from_dict(cls, values: dict[str, Any]) -> CoverageEntry:
