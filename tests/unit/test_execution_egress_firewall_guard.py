@@ -772,6 +772,13 @@ def test_n2_the_shipped_tree_has_exactly_the_expected_execution_egress_modules()
     ]
 
 
+def test_iem_mos_probe_transport_is_not_an_execution_egress_module() -> None:
+    relative = "src/breezy/ingest/iem_mos_probe_transport.py"
+    assert (REPO_ROOT / relative).is_file()
+    found_paths = {violation.path for violation in find_execution_egress_modules()}
+    assert relative not in found_paths
+
+
 def test_n2_scan_covers_both_src_and_scripts() -> None:
     scanned = {path for path, _ in iter_python_sources(EGRESS_SCAN_ROOTS)}
     assert any(p.startswith("src/") for p in scanned)
