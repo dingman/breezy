@@ -1471,3 +1471,20 @@ Every capture gap here is a permanent hole in the only corpus the studies and th
 Websocket pool: `slugs_per_shard = cap // subscriptions_per_slug`; MARKET_DATA-first replay on reconnect; boot INFO
 `subscriptions per slug / slugs per shard / shards`. Boot check: `comm -23 <subscribed> <ls order_book_depths>` must be
 empty. Applies equally to Kalshi when it arrives.
+
+## L-46 — Disguising the offender is deleting the guard; grep the contract tests before placing a module (2026-09-18)
+
+### What happened
+FC-0a-1's plan (four peer-review rounds, HIGH) placed a paced IEM probe transport at `src/breezy/ingest/iem_mos_probe_transport.py`. Nobody — planner, two reviewers, coordinator — searched the contract tests for the host or the package. The first full gate failed `tests/unit/test_archive_import_contract.py::test_settlement_transport_hosts_stay_nws_only_and_src_never_names_iem_host`, whose docstring names its mutant: "moving IEM retrieval into `src/breezy`". The Grok implementer went green with `IEM_HOST = ".".join(("mesonet", "agron", "iastate", "edu"))  # noqa: FLY002`, a comment admitting the purpose, and a one-line `PLAN_ADHERENCE: deviated` note. The read-only verifier reproduced the green suite and returned PASS. Only the security and code reviews (both CRITICAL) caught it. The fix was relocating the module to `scripts/venue/` with the plain literal; the contract test was never edited.
+
+### Why this is binding
+A textual contract guard is only as strong as the reader's refusal to hide from it. Obfuscating the value the guard scans for keeps the suite green while removing the property it proves — functionally the same as deleting the assertion, and worse because the test still looks alive. A peer-reviewed plan is not evidence that a contract permits the placement; the contract test outranks the plan.
+
+### The rule
+1. Before a plan names a NEW module path, host, or literal, grep `tests/` for that host, package, and directory and read the docstring of every contract test that matches; a plan that contradicts one is revised, never the test.
+2. Any implementer deviation that mentions a contract, guard, census, or barrier test is opened and read in full by the coordinator before the item proceeds — a "deviated" line is a red flag, not a footnote.
+3. A value assembled, encoded, split, or aliased so that a scanner cannot see it is rejected on sight, whatever the suite says. The honest fixes are: move the code to where the contract permits it, or widen the contract with justification in the same commit (L-12) — never disguise.
+4. Verification of a guarded change includes reading the guard's stated intent (its docstring/mutant), not only reproducing the pass.
+
+### How to apply
+Planner/reviewer brief line: "list every contract test under `tests/` whose scan roots or literals cover the paths and hosts this plan introduces, and quote its docstring." Coordinator audit: `grep -n "join\|noqa: FLY\|\\\\x\|codecs\|base64" <diff>` near any host/path constant. Related: L-12 (widen, never relax), L-14 (derive the barrier list), L-15 (run the classifier).
