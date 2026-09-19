@@ -11,10 +11,34 @@ The break-even oracle here is RECOMPUTED from price and fee coefficient
 production drift in ``decision._fee``'s formula or rounding fails these
 tests instead of silently agreeing with them.
 
-The sole probability input is ``P_HOLD_LOWER.get(key)``; to hold EVERY other
-``DecisionInputs`` field constant while sweeping it, these tests monkeypatch
-``decision.P_HOLD_LOWER`` (the module global the function actually reads) --
-never the frozen ``archive_table`` corpus itself.
+The sole probability input is ``P_HOLD_LOWER.get(key)`` (YES) /
+``1 - P_HOLD_UPPER.get(key)`` (NO); to hold EVERY other ``DecisionInputs``
+field constant while sweeping it, these tests monkeypatch
+``decision.P_HOLD_LOWER`` / ``decision.P_HOLD_UPPER`` (the module globals the
+function actually reads) -- never the frozen ``archive_table`` corpus itself.
+
+What this file does NOT prove (scope, explicit)
+-----------------------------------------------
+
+The claim proved here is about the PURE CORE ``evaluate_decision`` and the
+IMPORT/CALL-SITE binding from the live family to it. It is NOT an end-to-end
+sending proof. Specifically, none of the following is proved anywhere below:
+
+* that a live venue tick actually REACHES ``_hunt_tick``'s
+  ``evaluate_both_sides`` call -- the instrument/subscription, climate-day,
+  de-dupe, trial-day latch, observation-availability and depth/quote
+  plumbing gates upstream of it are untested here (only the LST-window gate
+  is characterized, and only by predicate + source order);
+* that a ``Take`` is ever SUBMITTED. ``_maybe_submit``, the arming state,
+  the boot-time execution permit, the NO-SEND egress firewall and the
+  operator-reserved caps are all downstream of this file's last assertion;
+  a ``Take`` here is a decision object, never an order;
+* the NO leg's live WIRING (``continuous_strategy.py:1937``). The NO-leg
+  sweep below exercises the pure core's NO branch (``decision.py:431-433``,
+  probability ``1 - P_HOLD_UPPER``) only -- it does not prove the strategy
+  feeds it the venue's real bid, nor that a NO ``Take`` is submitted;
+* the exit/sell path (``exit_wiring.py:302``) in any form -- this file is
+  entry-decision-only and says nothing about closing a position.
 """
 
 from __future__ import annotations
@@ -29,6 +53,7 @@ import pytest
 from breezy.strategy.current_rung_hold import continuous_strategy as continuous_strategy_module
 from breezy.strategy.current_rung_hold import decision as decision_module
 from breezy.strategy.current_rung_hold import tick_eval as tick_eval_module
+from breezy.strategy.current_rung_hold.archive_table import P_HOLD_LOWER as FROZEN_P_HOLD_LOWER
 from breezy.strategy.current_rung_hold.config import CurrentRungHoldConfig
 from breezy.strategy.current_rung_hold.continuous_strategy import ContinuousRungHoldStrategy
 from breezy.strategy.current_rung_hold.decision import (
@@ -61,8 +86,13 @@ _KEY: tuple[str, str, int, int, int] = (
     _M_ZERO,
 )
 
-_STALE_BOUND_NS = 50 * 60 * 1_000_000_000
+#: Derived from the production config, never hardcoded: if
+#: ``stale_observation_minutes`` moves, the staleness test below moves with
+#: it (and fails loudly if production's bound stops being
+#: ``minutes * 60s``), rather than silently drifting away from the real bound.
+_STALE_BOUND_NS = CurrentRungHoldConfig().stale_observation_minutes * 60 * 1_000_000_000
 _CENT = Decimal("0.01")
+_TENTH_CENT = Decimal("0.0001")
 
 
 def _expected_break_even(price: Decimal, fee_coefficient: Decimal) -> Decimal:
@@ -280,6 +310,15 @@ def test_the_live_family_decision_path_resolves_to_this_same_evaluate_decision(
     ``_hunt_tick``'s body really calls ``evaluate_both_sides``; and (c) a
     SPY driven through ``evaluate_both_sides`` proving the YES leg reaches
     ``evaluate_decision`` with ``DecisionInputs`` built from the tick.
+
+    SCOPE (see the module docstring's "What this file does NOT prove"):
+    this proves only that the live family's decision call RESOLVES to this
+    function. It does NOT prove that a live tick reaches ``_hunt_tick`` past
+    its upstream gates, that ``evaluate_both_sides`` is reached on a real
+    quote, or that the resulting ``Take`` is ever submitted -- ``_maybe_submit``,
+    arming, the execution permit and the egress firewall are all untested
+    here, and the NO leg's live wiring (``continuous_strategy.py:1937``) and
+    the exit path (``exit_wiring.py:302``) are outside this file entirely.
     """
     # (a) import identity -- one object, no shadowing copy.
     assert tick_eval_module.evaluate_decision is decision_module.evaluate_decision
@@ -434,3 +473,322 @@ def test_quantity_and_side_are_invariant_to_the_probability_input(
     assert quantities == {config.order_quantity} == {1}
     assert sides == {"yes"}
     assert limit_prices == {Decimal("0.40")}  # the ask, never a function of p
+
+
+# --------------------------------------------------------------------------
+# 6. The fee's ROUNDING MODE is banker's, pinned against the alternatives.
+# --------------------------------------------------------------------------
+
+
+def _fee_is_a_half_cent_tie(price: Decimal, theta: Decimal) -> bool:
+    exact = theta * price * (Decimal(1) - price)
+    return (exact / _CENT) % 1 == Decimal("0.5")
+
+
+@pytest.mark.parametrize(
+    ("theta", "price", "expected_fee", "half_up_fee"),
+    [
+        # exact fee 0.015 -> banker's rounds UP to the even cent 0.02.
+        # Rules this case KILLS: ROUND_DOWN / ROUND_FLOOR / ROUND_HALF_DOWN
+        # (all 0.01).
+        (Decimal("0.06"), Decimal("0.50"), Decimal("0.02"), Decimal("0.02")),
+        # exact fee 0.025 -> banker's rounds DOWN to the even cent 0.02.
+        # Rules this case KILLS: ROUND_HALF_UP / ROUND_UP / ROUND_CEILING
+        # (all 0.03).
+        (Decimal("0.10"), Decimal("0.50"), Decimal("0.02"), Decimal("0.03")),
+    ],
+)
+def test_a_true_half_cent_tie_is_rounded_bankers_not_half_up(
+    monkeypatch: pytest.MonkeyPatch,
+    theta: Decimal,
+    price: Decimal,
+    expected_fee: Decimal,
+    half_up_fee: Decimal,
+) -> None:
+    """The break-even on an EXACT half-cent tie is banker's-rounded.
+
+    Gap 1 (domain review): every other case in this file lands the fee well
+    away from a .005 boundary (0.0144, 0.0126, 0.0500), so ROUND_DOWN or
+    ROUND_HALF_UP in production would pass them unchanged. These two cases
+    are true ties -- one that banker's rounds UP and one it rounds DOWN --
+    so between them they pin ROUND_HALF_EVEN uniquely against every other
+    standard mode. The 0.025 case FAILS if production switches to
+    ROUND_HALF_UP (break-even would be 0.53, not 0.52).
+    """
+    assert _fee_is_a_half_cent_tie(price, theta), "case is not a true half-cent tie"
+    expected_break_even = price + expected_fee
+    assert _expected_break_even(price, theta) == expected_break_even
+
+    config = CurrentRungHoldConfig(required_fee_coefficient=theta)
+
+    def _decide(p_bound: Decimal) -> object:
+        _pin_probability(monkeypatch, p_bound)
+        return evaluate_decision(
+            _causal_inputs(ask=price, fee_coefficient=theta, config=config)
+        )
+
+    # (a) the reported break-even is the banker's one, on BOTH outcome paths.
+    below = _decide(expected_break_even)
+    assert below == Refuse(
+        "edge_below_break_even", p_bound=expected_break_even, break_even=expected_break_even
+    )
+    above = _decide(expected_break_even + _CENT)
+    assert isinstance(above, Take)
+    assert above.break_even == expected_break_even
+
+    # (b) a DECISION that differs under ROUND_HALF_UP, whenever the two modes
+    # disagree: p sits above the banker's break-even and at-or-below the
+    # half-up one, so half-up would refuse where banker's takes.
+    if half_up_fee != expected_fee:
+        half_up_break_even = price + half_up_fee
+        probe = expected_break_even + (half_up_break_even - expected_break_even) / 2
+        assert expected_break_even < probe <= half_up_break_even
+        outcome = _decide(probe)
+        assert isinstance(outcome, Take), (
+            f"p={probe} must TAKE under banker's rounding (break-even "
+            f"{expected_break_even}); a Refuse here means production rounds "
+            f"HALF_UP (break-even {half_up_break_even})"
+        )
+        assert outcome.break_even == expected_break_even
+
+
+# --------------------------------------------------------------------------
+# 7. CHARACTERIZATION: the boundary tracks the AS-CHARGED (rounded) fee.
+# --------------------------------------------------------------------------
+
+
+def test_the_break_even_boundary_tracks_the_as_charged_fee_not_the_exact_fee(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The gate's break-even uses the fee the VENUE ACTUALLY CHARGES.
+
+    Gap 2 (domain review), corrected against the venue's own published
+    schedule (``docs/evidence/venue/polymarket_us/docs_snapshots/
+    fees_2026-08-25.md:152,208``): "All fees and rebates are rounded to the
+    nearest $0.01 using banker's rounding (round half to even)" and "Fees
+    are rounded to the nearest cent ... the fee can round down to $0.00".
+    The cent-quantized fee is therefore NOT an approximation the gate gets
+    away with -- it is the charge. ``decision._fee`` models the same rule
+    ``fees._round_bankers`` (:467-475) applies to the authoritative
+    per-fill commission, and at ``config.order_quantity == 1`` there is
+    exactly ONE fill, so that snapshot's multi-fill cumulative cap (:153,
+    which "can only reduce a fill's charge, never increase it") is
+    inapplicable and the rounded per-fill fee is exactly what is paid.
+
+    The sub-cent sweep is kept because the boundary is what it pins: the
+    probability arrives at 1e-4 granularity while the charge is a whole
+    cent, so a probability strictly between the as-charged break-even and
+    the EXACT-fee break-even is taken -- correctly, at POSITIVE realised
+    edge, because the exact fee is never billed. At ask 0.70 / theta 0.06
+    the exact fee is 0.0126 but 0.01 is charged, so the rounding is a
+    0.0026/contract DISCOUNT in the trader's favour. The signed gap's full
+    distribution is characterized in the corpus test below.
+    """
+    price = Decimal("0.70")
+    theta = Decimal("0.06")
+    exact_fee = theta * price * (Decimal(1) - price)
+    as_charged_fee = exact_fee.quantize(_CENT, rounding=ROUND_HALF_EVEN)
+    assert (exact_fee, as_charged_fee) == (Decimal("0.012600"), Decimal("0.01"))
+
+    as_charged_break_even = _expected_break_even(price, theta)
+    exact_fee_break_even = price + exact_fee
+    assert as_charged_break_even == Decimal("0.71")
+    # Signed gap, trader's perspective: charged MINUS exact. Negative = discount.
+    rounding_gap = as_charged_fee - exact_fee
+    assert rounding_gap == Decimal("-0.002600")
+
+    # Sweep at 1e-4 -- the frozen table's OWN granularity, i.e. values the
+    # production lookup really can return.
+    taken_below_the_exact_fee_break_even: list[Decimal] = []
+    step = as_charged_break_even
+    while step <= exact_fee_break_even:
+        _pin_probability(monkeypatch, step)
+        outcome = evaluate_decision(_causal_inputs(ask=price, fee_coefficient=theta))
+        if step == as_charged_break_even:
+            assert isinstance(outcome, Refuse)  # equality refuses (strict `>`)
+        else:
+            assert isinstance(outcome, Take), f"expected Take at p={step}"
+            assert outcome.break_even == as_charged_break_even
+            # Realised edge against the AS-CHARGED fee -- the money actually
+            # paid -- is strictly POSITIVE on every one of these.
+            assert step - (price + as_charged_fee) > 0
+            assert step <= exact_fee_break_even  # and below the exact-fee line
+            taken_below_the_exact_fee_break_even.append(step)
+        step += _TENTH_CENT
+
+    assert len(taken_below_the_exact_fee_break_even) == 26  # 0.7101 .. 0.7126
+    assert min(taken_below_the_exact_fee_break_even) == Decimal("0.7101")
+    assert max(taken_below_the_exact_fee_break_even) == exact_fee_break_even
+    # The whole band is inside the rounding discount: no take here is thinner
+    # than one 1e-4 tick of realised edge.
+    thinnest = min(p - (price + as_charged_fee) for p in taken_below_the_exact_fee_break_even)
+    assert thinnest == _TENTH_CENT
+
+
+def test_the_as_charged_rounding_gap_is_a_discount_more_often_than_a_penalty(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The SIGNED gap ``as_charged_fee - exact_fee`` over the frozen corpus.
+
+    Measured over all 240 defined ``P_HOLD_LOWER`` cells (every one at 1e-4
+    granularity; 239 finer than a cent) crossed with the whole admissible 1c
+    ask grid in ``(0.05, 0.95)`` -- 89 asks:
+
+    * theta = 0.06: the rounding favours the trader (charged < exact) at 64
+      of 89 asks and penalises (charged > exact) at 25; max discount
+      0.004994/contract at ask 0.49, max penalty 0.0050 at ask 0.50. Of the
+      21,360 (cell, ask) pairs, 51 are TAKEN under the as-charged rule that
+      an exact-fee rule would refuse (each at positive realised edge), and
+      10 are REFUSED that an exact-fee rule would take (the conservative
+      direction) -- no pair trades at negative realised edge.
+    * theta = 0.0695 (the 2026-09-17 drift): discount at 32 asks, penalty at
+      57; max discount 0.00486605 at ask 0.31, max penalty 0.00488480 at ask
+      0.92; 42 pairs taken-only-under-as-charged, 24 refused-only.
+
+    Because the take rule is ``p > price + as_charged_fee`` and the venue
+    charges exactly that fee, NO admissible (cell, ask) pair yields a take
+    with negative realised edge -- asserted exhaustively below.
+    """
+    defined = {key: value for key, value in FROZEN_P_HOLD_LOWER.items() if value is not None}
+    assert len(defined) == 240
+    assert all(value.as_tuple().exponent == -4 for value in defined.values())
+    assert sum(1 for v in defined.values() if v != v.quantize(_CENT)) == 239
+
+    grid = [Decimal(cents) / 100 for cents in range(6, 95)]
+    assert len(grid) == 89
+
+    for theta, favour, penalise, max_discount, max_penalty, taken_only, refused_only in (
+        (Decimal("0.06"), 64, 25, Decimal("-0.004994"), Decimal("0.0050"), 51, 10),
+        (Decimal("0.0695"), 32, 57, Decimal("-0.00486605"), Decimal("0.00488480"), 42, 24),
+    ):
+        gaps = {
+            ask: _expected_break_even(ask, theta) - (ask + theta * ask * (Decimal(1) - ask))
+            for ask in grid
+        }
+        assert sum(1 for gap in gaps.values() if gap < 0) == favour
+        assert sum(1 for gap in gaps.values() if gap > 0) == penalise
+        assert min(gaps.values()) == max_discount
+        assert max(gaps.values()) == max_penalty
+
+        taken_only_count = 0
+        refused_only_count = 0
+        for value in defined.values():
+            for ask in grid:
+                as_charged = _expected_break_even(ask, theta)
+                exact = ask + theta * ask * (Decimal(1) - ask)
+                if as_charged < value <= exact:
+                    taken_only_count += 1
+                elif exact < value <= as_charged:
+                    refused_only_count += 1
+        assert (taken_only_count, refused_only_count) == (taken_only, refused_only)
+
+    theta = Decimal("0.06")
+    # A real corpus cell, driven through production at the as-charged fee.
+    key = ("LAX", "DJF", 14, 0, 0)
+    value = FROZEN_P_HOLD_LOWER[key]
+    assert value == Decimal("0.7213")
+    ask = Decimal("0.71")
+    _pin_probability(monkeypatch, value)
+    outcome = evaluate_decision(_causal_inputs(ask=ask, fee_coefficient=theta))
+    assert isinstance(outcome, Take)
+    assert outcome.break_even == Decimal("0.72")  # 0.71 + charged 0.01
+    assert value - outcome.break_even == Decimal("0.0013")  # POSITIVE realised edge
+    # An exact-fee rule would have refused this one; the venue never bills it.
+    assert value <= ask + theta * ask * (Decimal(1) - ask)
+
+
+# --------------------------------------------------------------------------
+# 8. The NO leg: the same causal sweep on `1 - P_HOLD_UPPER`.
+# --------------------------------------------------------------------------
+
+
+def _pin_no_probability(
+    monkeypatch: pytest.MonkeyPatch,
+    p_hold_upper: Decimal | None,
+    *,
+    key: tuple[str, str, int, int, int] = _KEY,
+) -> None:
+    """Pin the NO leg's ONLY probability source (``decision.P_HOLD_UPPER``)."""
+    monkeypatch.setattr(decision_module, "P_HOLD_UPPER", {key: p_hold_upper})
+
+
+def _no_inputs(bid: Decimal, **overrides: object) -> DecisionInputs:
+    return _causal_inputs(side="no", bid=bid, bid_size=Decimal(5), **overrides)
+
+
+def test_the_no_leg_flips_refuse_to_take_exactly_at_its_own_break_even(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Sweeping ONLY ``P_HOLD_UPPER`` flips the NO decision at ``1 - p_u > NO_ask + fee``.
+
+    The NO price is ``1 - bid`` and the NO estimand is ``1 - P_HOLD_UPPER``
+    (``decision.py:431-433``): a HIGHER ``p_hold_upper`` is a WORSE NO edge,
+    so the sweep's direction is inverted relative to the YES leg. The
+    break-even oracle is the same recomputed one, applied to the inverted
+    price -- never imported from production.
+    """
+    bid = Decimal("0.60")
+    theta = Decimal("0.06")
+    no_ask = Decimal(1) - bid
+    expected_break_even = _expected_break_even(no_ask, theta)
+    assert (no_ask, expected_break_even) == (Decimal("0.40"), Decimal("0.41"))
+
+    taken: list[Decimal] = []
+    refused: list[Decimal] = []
+    for step in range(31):  # p_hold_upper 0.40 .. 0.70 => p_miss 0.60 .. 0.30
+        p_hold_upper = Decimal("0.40") + Decimal(step) * _CENT
+        p_miss_lower = Decimal(1) - p_hold_upper
+        _pin_no_probability(monkeypatch, p_hold_upper)
+        outcome = evaluate_decision(_no_inputs(bid))
+        if p_miss_lower > expected_break_even:
+            assert isinstance(outcome, Take), f"expected Take at p_u={p_hold_upper}"
+            assert outcome.side == "no"
+            assert outcome.p_bound == p_miss_lower
+            assert outcome.limit_price == no_ask
+            assert outcome.break_even == expected_break_even
+            assert outcome.quantity == 1  # never a short: allow_short stays False
+            taken.append(p_miss_lower)
+        else:
+            assert outcome == Refuse(
+                "edge_below_break_even",
+                p_bound=p_miss_lower,
+                break_even=expected_break_even,
+            ), f"expected Refuse at p_u={p_hold_upper}"
+            refused.append(p_miss_lower)
+
+    assert refused and taken
+    assert max(refused) < min(taken)
+    assert max(refused) == expected_break_even  # equality refuses (strict `>`)
+    assert min(taken) == expected_break_even + _CENT
+
+
+def test_the_no_leg_refuses_when_its_own_table_cell_is_undefined(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """No ``P_HOLD_UPPER`` => no NO take, even with a wide-open YES cell."""
+    _pin_probability(monkeypatch, Decimal("0.99"))
+    monkeypatch.setattr(decision_module, "P_HOLD_UPPER", {})
+    assert evaluate_decision(_no_inputs(Decimal("0.60"))) == Refuse("p_hold_undefined")
+    _pin_no_probability(monkeypatch, None)
+    assert evaluate_decision(_no_inputs(Decimal("0.60"))) == Refuse("p_hold_undefined")
+
+
+def test_raising_the_bid_flips_a_no_take_into_a_refusal(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A higher bid is a DEARER NO leg (``NO_ask = 1 - bid``) => the edge dies."""
+    _pin_no_probability(monkeypatch, Decimal("0.40"))  # p_miss_lower = 0.60
+    theta = Decimal("0.06")
+    cheap_bid = Decimal("0.60")  # NO_ask 0.40, break-even 0.41
+    dear_bid = Decimal("0.30")  # NO_ask 0.70, break-even 0.71
+
+    cheap = evaluate_decision(_no_inputs(cheap_bid))
+    dear = evaluate_decision(_no_inputs(dear_bid))
+
+    assert isinstance(cheap, Take)
+    assert cheap.limit_price == Decimal("0.40")
+    assert dear == Refuse(
+        "edge_below_break_even",
+        p_bound=Decimal("0.60"),
+        break_even=_expected_break_even(Decimal("0.70"), theta),
+    )
