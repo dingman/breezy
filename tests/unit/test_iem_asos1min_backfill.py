@@ -534,7 +534,8 @@ def test_the_url_names_the_cadence_the_product_claims(cli: ModuleType) -> None:
 
     assert parts.scheme == "https"
     assert parts.path == cli.IEM_ASOS1MIN_PATH
-    assert query["station"] == ["KMIA"]
+    # The IEM identifier, not the ICAO call sign the plan speaks (VERIFIED).
+    assert query["station"] == ["MIA"]
     assert query["sample"] == ["1min"]
     assert query["tz"] == ["UTC"]
     assert "tmpf" in query["vars"]
@@ -625,3 +626,60 @@ def test_main_refuses_a_volatile_cache_root_before_creating_anything(
     assert cli.main(["--dry-run", "--cache-root", str(target)]) == 2
     assert "durable" in capsys.readouterr().err.lower()
     assert not target.exists()
+
+
+# --------------------------------------------------------------------------
+# VERIFIED grammar (live, 2026-09-19). The fixture beside these tests is the
+# byte-for-byte body of the request that succeeded, so a future silent change
+# to the query shape -- or to the station identifier the service accepts --
+# fails here instead of at the next operator backfill.
+# --------------------------------------------------------------------------
+
+VERIFIED_FIXTURE: Final[Path] = (
+    REPO_ROOT / "tests/fixtures/iem/asos1min_MIA_2021-06-15T12Z_10min.csv"
+)
+#: The exact query the live service answered 200 for. `station` is the 3-letter
+#: IEM/FAA identifier: the 4-letter ICAO form is rejected 422 "Unknown station
+#: provided: KMIA".
+VERIFIED_QUERY: Final[dict[str, list[str]]] = {
+    "station": ["MIA"],
+    "vars": ["tmpf", "dwpf"],
+    "sample": ["1min"],
+    "sts": ["2021-06-15T12:00Z"],
+    "ets": ["2021-06-15T12:10Z"],
+    "tz": ["UTC"],
+    "format": ["comma"],
+    "what": ["download"],
+}
+
+
+def test_the_url_reproduces_the_verified_live_request_exactly(cli: ModuleType) -> None:
+    url = _transport(cli)._asos1min_url("KMIA", "1min", "2021-06-15T12:00Z", "2021-06-15T12:10Z")
+    parts = urlsplit(url)
+
+    assert parts.scheme == "https"
+    assert parts.netloc == "mesonet.agron.iastate.edu"
+    assert parts.path == "/cgi-bin/request/asos1min.py"
+    assert parse_qs(parts.query) == VERIFIED_QUERY
+
+
+def test_the_url_carries_the_iem_station_id_not_the_icao_call_sign(cli: ModuleType) -> None:
+    """The 422 that stalled the first backfill was exactly this substitution."""
+    for icao in cli.STATIONS:
+        url = _transport(cli)._asos1min_url(icao, "1min", "2021-06-15T12:00Z", "2021-06-15T12:10Z")
+        station = parse_qs(urlsplit(url).query)["station"]
+        assert station == [cli.IEM_1MIN_STATION_IDS[icao]]
+        assert station != [icao]
+        assert len(station[0]) == 3
+
+
+def test_every_backfill_station_has_a_verified_iem_1min_identifier(cli: ModuleType) -> None:
+    assert tuple(cli.IEM_1MIN_STATION_IDS) == cli.STATIONS
+
+
+def test_the_verified_response_body_validates_as_real_coverage(cli: ModuleType) -> None:
+    body = VERIFIED_FIXTURE.read_bytes()
+    header = body.split(b"\n", 1)[0]
+
+    assert header == b"station,station_name,valid(UTC),tmpf,dwpf"
+    assert cli.validate_payload(body, station="KMIA", cadence="1min") == 10

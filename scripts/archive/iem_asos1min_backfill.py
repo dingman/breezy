@@ -40,10 +40,31 @@ zero-row "covered" entry; and because the cache writes the payload atomically
 and only then the manifest, a crash anywhere in between leaves a manifest that
 claims nothing it does not have -- the next run re-fetches that station-year.
 
-URL GRAMMAR. The `asos1min.py` query grammar below is UNVERIFIED against the
-live service: no request has been issued from this module. The first real run
-is the verification, which is why `--dry-run` exists and why a real run needs
-both `BREEZY_LIVE=1` and `--apply`.
+URL GRAMMAR -- VERIFIED LIVE 2026-09-19. The query shape below was exercised
+against the live service over a ten-minute window and answered `HTTP 200` with
+CSV. The exact request that worked, verbatim:
+
+    https://mesonet.agron.iastate.edu/cgi-bin/request/asos1min.py
+        ?station=MIA&vars=tmpf&vars=dwpf&sample=1min
+        &sts=2021-06-15T12%3A00Z&ets=2021-06-15T12%3A10Z
+        &tz=UTC&format=comma&what=download
+
+    -> HTTP 200, Content-Type: application/octet-stream, 502 bytes, 10 data
+       rows, header `station,station_name,valid(UTC),tmpf,dwpf`.
+
+That body is checked in byte-for-byte as
+`tests/fixtures/iem/asos1min_MIA_2021-06-15T12Z_10min.csv` and the URL shape is
+pinned against it by `tests/unit/test_iem_asos1min_backfill.py`, so a silent
+grammar drift fails a test rather than an operator backfill.
+
+STATION IDENTIFIER. The one thing the first live run got wrong: `asos1min.py`
+keys on the THREE-letter IEM/FAA identifier, not the four-letter ICAO call
+sign. `station=KMIA` is answered `HTTP 422` with the body `Unknown station
+provided: KMIA` -- parameter validation, not coverage. Breezy speaks ICAO
+everywhere else (cache keys, plan, registry), so the translation happens once,
+at the URL boundary, through the closed :data:`IEM_1MIN_STATION_IDS` map. It is
+a map rather than a `K`-strip so an unlisted station is refused rather than
+mangled into a plausible-looking request.
 
 Usage
 -----
@@ -108,6 +129,7 @@ __all__ = [
     "DEFAULT_CADENCE",
     "DURABLE_ROOT_TAIL",
     "FIRST_YEAR",
+    "IEM_1MIN_STATION_IDS",
     "IEM_ASOS1MIN_PATH",
     "STATIONS",
     "Asos1MinTransport",
@@ -136,6 +158,19 @@ __all__ = [
 #: refused, never sanitised into a request.
 STATIONS: Final[tuple[str, ...]] = ("KLAX", "KMDW", "KMIA", "KSFO")
 FIRST_YEAR: Final[int] = 2021
+
+#: ICAO call sign -> the identifier `asos1min.py` actually accepts (VERIFIED
+#: live 2026-09-19; see the module docstring). Closed and explicit: a station
+#: absent here has no verified 1-minute identifier and is refused, never
+#: derived by stripping a leading `K`.
+IEM_1MIN_STATION_IDS: Final[MappingProxyType[str, str]] = MappingProxyType(
+    {
+        "KLAX": "LAX",
+        "KMDW": "MDW",
+        "KMIA": "MIA",
+        "KSFO": "SFO",
+    }
+)
 
 #: L-13. One product per cadence, so a cache key, a payload file and a manifest
 #: entry can only ever hold ONE cadence. `asos-1min` is the product string the
@@ -478,7 +513,13 @@ class Asos1MinTransport(PacedIemTransport):
         for name, value in (("sts", sts), ("ets", ets)):
             if _STS_ETS_PATTERN.match(value) is None:
                 raise ValueError(f"`{name}` must be YYYY-MM-DDTHH:MMZ; {value!r} is refused.")
-        pairs: list[tuple[str, str]] = [("station", station)]
+        iem_station = IEM_1MIN_STATION_IDS.get(station)
+        if iem_station is None:  # pragma: no cover - unreachable via STATIONS above
+            raise ValueError(
+                f"no VERIFIED IEM 1-minute identifier for {station!r}; refused rather "
+                "than derived. asos1min.py answers 422 for an ICAO call sign."
+            )
+        pairs: list[tuple[str, str]] = [("station", iem_station)]
         pairs.extend(("vars", variable) for variable in ASOS1MIN_VARS)
         pairs.extend(
             [
