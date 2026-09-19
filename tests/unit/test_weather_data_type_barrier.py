@@ -82,6 +82,7 @@ from nautilus_trader.model.data import DataType
 
 from breezy.domain.nws_climate_day import NwsClimateDay
 from breezy.ingest.iem_observations import station_observation_data_type
+from breezy.ingest.nbm_forecast_data_type import nbm_forecast_point_data_type
 from breezy.ingest.nws_actor import nws_climate_day_data_type, nws_raw_product_data_type
 from tests.unit.test_polymarket_us_readonly_guard import iter_python_sources
 
@@ -104,7 +105,15 @@ _RECORD_NAMES = frozenset(
 
 #: The shared factories, and the ONE module each is allowed to live in.
 _FACTORY_NAMES = frozenset(
-    {"nws_climate_day_data_type", "nws_raw_product_data_type", "station_observation_data_type"},
+    {
+        "nws_climate_day_data_type",
+        "nws_raw_product_data_type",
+        "station_observation_data_type",
+        # WP-12 Seam B: `ForecastPoint` has been a RECORD here since its class
+        # landed (see `_RECORD_NAMES`); its shared factory joins now that the
+        # ingest seam builds one. WIDENED, never narrowed.
+        "nbm_forecast_point_data_type",
+    },
 )
 
 #: Per-module count of legitimate shared-factory `DataType` constructions
@@ -114,6 +123,9 @@ _FACTORY_NAMES = frozenset(
 _FACTORY_MODULES: dict[str, int] = {
     "src/breezy/ingest/nws_actor.py": 2,
     "src/breezy/ingest/iem_observations.py": 1,
+    # WP-12 Seam B. Its own module rather than a fourth construction site
+    # inside `nws_actor.py`, for the reason the IEM factory gives above.
+    "src/breezy/ingest/nbm_forecast_data_type.py": 1,
 }
 
 
@@ -230,6 +242,9 @@ def test_the_shared_factories_return_one_object_not_merely_an_equal_one() -> Non
     assert nws_climate_day_data_type() is not nws_raw_product_data_type()
     assert station_observation_data_type() is not nws_climate_day_data_type()
     assert station_observation_data_type() is not nws_raw_product_data_type()
+    assert nbm_forecast_point_data_type() is nbm_forecast_point_data_type()
+    assert nbm_forecast_point_data_type() is not station_observation_data_type()
+    assert nbm_forecast_point_data_type() is not nws_climate_day_data_type()
 
 
 def test_the_shared_factories_carry_no_metadata() -> None:
@@ -245,6 +260,8 @@ def test_the_shared_factories_carry_no_metadata() -> None:
     assert nws_raw_product_data_type().topic == "NwsRawProduct*"
     assert station_observation_data_type().metadata == {}
     assert station_observation_data_type().topic == "StationObservation*"
+    assert nbm_forecast_point_data_type().metadata == {}
+    assert nbm_forecast_point_data_type().topic == "ForecastPoint*"
 
 
 # ---------------------------------------------------------------------------
@@ -332,6 +349,7 @@ def test_the_rule_detects_an_inline_construction(label: str, source: str) -> Non
         ("a foreign record class", "DataType(QuoteTick)\n"),
         ("a call to the shared factory", "nws_climate_day_data_type()\n"),
         ("a call to the IEM shared factory", "station_observation_data_type()\n"),
+        ("a call to the forecast shared factory", "nbm_forecast_point_data_type()\n"),
         ("an unrelated callee", "SomethingElse(NwsClimateDay)\n"),
         ("a bare reference", "records = [NwsClimateDay]\n"),
     ],

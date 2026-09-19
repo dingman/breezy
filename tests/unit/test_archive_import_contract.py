@@ -71,13 +71,82 @@ def test_archive_forbidden_contract_is_explicitly_indirect_strict() -> None:
     assert "breezy.ingest.archive_records" in pyproject
 
 
-def test_settlement_transport_hosts_stay_nws_only_and_src_never_names_iem_host() -> None:
-    """Separation mutant: moving IEM retrieval into `src/breezy`."""
-    assert DEFAULT_ALLOWED_HOSTS == frozenset({"api.weather.gov"})
+SETTLEMENT_HOST: Final[str] = "api.weather.gov"
+IEM_HOST: Final[str] = "mesonet.agron.iastate.edu"
 
-    offenders: list[Path] = []
-    for path in SRC_ROOT.rglob("*.py"):
-        if "mesonet.agron.iastate.edu" in path.read_text(encoding="utf-8"):
-            offenders.append(path.relative_to(REPO_ROOT))
+#: WP-12c. The ONE module in `src/` allowed to name the IEM host: the forecast
+#: FALLBACK transport, which carries its own named, paced, distinct
+#: `allowed_hosts` and is never the live primary (NBM direct is).
+#: An exact set, not a prefix -- a second module naming the host fails here.
+IEM_HOST_ALLOWED_MODULES: Final[frozenset[str]] = frozenset(
+    {"src/breezy/ingest/iem_mos_fallback_transport.py"}
+)
 
-    assert offenders == []
+
+def is_settlement_module(rel_path: str, source: str) -> bool:
+    """A settlement module: it lives in `settlement/` or it names the NWS origin."""
+    return rel_path.startswith("src/breezy/settlement/") or SETTLEMENT_HOST in source
+
+
+def find_iem_host_in_settlement_modules(
+    entries: list[tuple[str, str]],
+) -> list[str]:
+    """Report every SETTLEMENT module that names the IEM host.
+
+    This is the rule WP-12c re-scoped, and it is still a real constraint:
+    the mutant the original assertion protected against -- *"moving IEM
+    retrieval into `src/breezy`"* in its own words -- was about the
+    SETTLEMENT transports, whose hosts stay NWS-only. Banning the string
+    repo-wide also banned the legitimate, contained forecast fallback.
+    """
+    return [
+        f"{rel_path}: settlement module names the IEM host"
+        for rel_path, source in entries
+        if is_settlement_module(rel_path, source) and IEM_HOST in source
+    ]
+
+
+def _src_entries() -> list[tuple[str, str]]:
+    return [
+        (path.relative_to(REPO_ROOT).as_posix(), path.read_text(encoding="utf-8"))
+        for path in sorted(SRC_ROOT.rglob("*.py"))
+    ]
+
+
+def test_settlement_transport_hosts_stay_nws_only() -> None:
+    """Separation mutant: moving IEM retrieval into a SETTLEMENT module.
+
+    Settlement transports stay NWS-only. The forecast fallback is a named,
+    paced, distinct `allowed_hosts` in `ingest/iem_mos_fallback_transport.py`
+    (WP-12c) and is NOT a settlement surface.
+    """
+    assert DEFAULT_ALLOWED_HOSTS == frozenset({SETTLEMENT_HOST})
+
+    assert find_iem_host_in_settlement_modules(_src_entries()) == []
+
+
+def test_the_settlement_host_rule_still_bites() -> None:
+    """Mutation proof: a settlement module naming the IEM host FAILS.
+
+    Both shapes of settlement module are mutated -- one classified by its
+    package, one by the NWS origin it names -- so the re-scoping cannot be
+    satisfied by a module simply moving out of `settlement/`.
+    """
+    by_package = ("src/breezy/settlement/mutant.py", f'HOST = "{IEM_HOST}"\n')
+    by_origin = (
+        "src/breezy/ingest/mutant_transport.py",
+        f'HOSTS = {{"{SETTLEMENT_HOST}", "{IEM_HOST}"}}\n',
+    )
+
+    assert len(find_iem_host_in_settlement_modules([by_package])) == 1
+    assert len(find_iem_host_in_settlement_modules([by_origin])) == 1
+    assert find_iem_host_in_settlement_modules([("src/breezy/ingest/ok.py", "X = 1\n")]) == []
+
+
+def test_only_the_named_fallback_module_may_name_the_iem_host() -> None:
+    """The re-scoping is not a blanket permit: the allowance is one exact path."""
+    namers = {
+        rel_path for rel_path, source in _src_entries() if IEM_HOST in source
+    }
+
+    assert namers == IEM_HOST_ALLOWED_MODULES
