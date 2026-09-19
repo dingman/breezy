@@ -561,6 +561,69 @@ class TestDoSelfCheckPassesAfterALegitimateClear:
         assert sink.payloads == []
 
 
+# ---------------------------------------------------------------------------
+# WP-0a: the live family logs ``ContinuousRungHoldStrategy subscribed``;
+# the hardcoded ``CurrentRungHoldStrategy subscribed`` marker currently
+# false-fails the 17:05Z self-check as FAIL_NODE_NOT_READY.
+# ---------------------------------------------------------------------------
+
+_CONTINUOUS_READY_LOG_LINE = (
+    "live-trading permit issued issued_at_ns=1 expires_at_ns=4102444800000000000 ttl_s=1\n"
+    "ContinuousRungHoldStrategy subscribed X\n"
+)
+
+
+def _clean_continuous_store_state(*, day: dt.date) -> ContinuousFamilyStoreState:
+    launch_ns = launch_time_ns(day)
+    return ContinuousFamilyStoreState(
+        startup_evidence={
+            "ts_ns": launch_ns + 1,
+            "eof_complete": True,
+            "position_read_refused": False,
+        },
+        family_halted=False,
+    )
+
+
+class TestWp0aSubscribeMarkerAcceptsBothPrefixes:
+    """Both rung-hold class-name prefixes must make 17:05Z self-check PASS.
+
+    WP-11b later parameterises the marker by ``composition_kind``; this
+    package only accepts the two prefixes.
+    """
+
+    def _run_self_check(self, tmp_path, *, log_text: str) -> _RecordingAlertSink:
+        store_path = tmp_path / "state" / "store.sqlite3"
+        sink = _RecordingAlertSink()
+        ports = _make_ports(
+            read_log_new=lambda _p: log_text,
+            alert_sink=sink,
+            continuous_family_active=lambda: True,
+            read_continuous_family_store_state=lambda _p: _clean_continuous_store_state(
+                day=dt.date(2026, 9, 12)
+            ),
+        )
+        _do_self_check(
+            ports=ports,
+            now=dt.datetime(2026, 9, 12, 17, 5, tzinfo=dt.UTC),
+            store_path=store_path,
+            log_dir=tmp_path / "logs",
+            tracked_pid=42,
+            node_log=tmp_path / "n.log",
+        )
+        return sink
+
+    def test_continuous_family_log_line_self_check_passes(self, tmp_path):
+        """Live-family subscribe line must PASS; today it is FAIL_NODE_NOT_READY."""
+        sink = self._run_self_check(tmp_path, log_text=_CONTINUOUS_READY_LOG_LINE)
+        assert sink.payloads == []
+
+    def test_current_rung_hold_log_line_self_check_still_passes(self, tmp_path):
+        """The original CurrentRungHoldStrategy prefix must keep PASSing."""
+        sink = self._run_self_check(tmp_path, log_text=_READY_LOG_LINE)
+        assert sink.payloads == []
+
+
 class TestRuntimeLiteralsPinnedAgainstTheStrategyLayer:
     """[2026-09-12] Tests may import both layers even though production code
     must not (runtime never imports strategy -- the layers contract). This
