@@ -130,6 +130,17 @@ def _stat_or_none(path: Path) -> tuple[int, float] | None:
 
 
 @pytest.fixture(autouse=True)
+def _clear_retained_spawned_children():
+    """WP-0a: ``_SPAWNED_CHILDREN`` is process-global; pytest-randomly
+    otherwise lets a FakePopen from one test shadow a later pid probe."""
+    from breezy.runtime import trade_supervisor as ts
+
+    ts._SPAWNED_CHILDREN.clear()
+    yield
+    ts._SPAWNED_CHILDREN.clear()
+
+
+@pytest.fixture(autouse=True)
 def _isolate_home_and_reset_supervisor_logger(monkeypatch, tmp_path):
     """Autouse for EVERY test in this module: ``Path.home()`` never
     resolves to the operator's real home for the duration of any test
@@ -202,6 +213,20 @@ def test_strategy_subscribed_marker_is_a_substring_of_the_real_emitter():
 
     source = (REPO_ROOT / "src/breezy/strategy/current_rung_hold/strategy.py").read_text()
     assert STRATEGY_SUBSCRIBED_MARKER in source
+
+
+def test_continuous_strategy_subscribed_marker_matches_the_real_emitter():
+    """Live-family emitter is ``f"{_CLASS_NAME} subscribed ...``; pin both
+    the class-name constant and the format string so a rename cannot
+    silently revive FAIL_NODE_NOT_READY."""
+    from breezy.runtime.trade_supervisor_core import CONTINUOUS_STRATEGY_SUBSCRIBED_MARKER
+
+    source = (
+        REPO_ROOT / "src/breezy/strategy/current_rung_hold/continuous_strategy.py"
+    ).read_text()
+    assert '_CLASS_NAME: Final[str] = "ContinuousRungHoldStrategy"' in source
+    assert 'f"{_CLASS_NAME} subscribed' in source
+    assert CONTINUOUS_STRATEGY_SUBSCRIBED_MARKER == "ContinuousRungHoldStrategy subscribed"
 
 
 def test_fatal_market_data_fault_marker_is_a_substring_of_the_real_emitter():
@@ -1522,6 +1547,10 @@ class FakeClock:
 class FakePopen:
     def __init__(self, pid: int) -> None:
         self.pid = pid
+
+    def poll(self) -> int | None:
+        """Harness stand-in for ``subprocess.Popen.poll`` -- still running."""
+        return None
 
 
 class FakeSpawner:
@@ -3206,3 +3235,185 @@ class TestRunForeverDispatchesMiddayWatch:
         # `count_intent_lock_holders` is read ONLY by `_do_self_check` --
         # exactly one call proves MIDDAY_WATCH never dispatched there.
         assert holder_count_calls["n"] == 1
+
+
+# ===========================================================================
+# WP-0a: live-family subscribe marker + retained Popen so zombies are reaped.
+# ===========================================================================
+
+_CONTINUOUS_READY_LOG_LINES = (
+    "live-trading permit issued issued_at_ns=1 expires_at_ns=4102444800000000000 ttl_s=1\n"
+    "ContinuousRungHoldStrategy subscribed X\n"
+)
+
+
+class TestWp0aLiveFamilyMiddayWatchAndReap:
+    def test_midday_watch_is_reachable_for_a_live_family_child(self, tmp_path):
+        """A continuous-family subscribe line must latch readiness so
+        ``next_due`` enters MIDDAY_WATCH after 17:10Z. Today the wrong
+        marker leaves ``readiness_observed`` false and gates the watch off."""
+        node_log = tmp_path / "node.log"
+        node_log.write_text(_CONTINUOUS_READY_LOG_LINES)
+        tracked_pid = 4242
+        ports = _make_ports(
+            process_alive=lambda _pid: True,
+            resolve_intent_lock_holder=lambda _p: tracked_pid,
+            read_log_new=lambda p: p.read_text(),
+        )
+        state = mark_phase_fired(initial_scheduler_state(_DAY), Phase.LAUNCH, _utc(16, 50))
+        _, _, state = _do_relaunch_check(
+            ports=ports,
+            state=state,
+            now=_utc(16, 55),
+            tracked_pid=tracked_pid,
+            node_log=node_log,
+            store_path=tmp_path / "state" / "store.sqlite3",
+            repo_root=tmp_path,
+            node_bin=tmp_path / "node_bin",
+            log_dir=tmp_path / "logs",
+        )
+        assert state.strategy_subscribed_seen is True
+        assert state.readiness_observed is True
+        state = mark_phase_fired(state, Phase.SELF_CHECK, _utc(17, 5))
+        phase, fire_at = next_due(_utc(18, 0), state)
+        assert phase is Phase.MIDDAY_WATCH
+        assert fire_at == _utc(17, 10)
+
+    def test_a_zombie_child_is_reaped_and_relaunched_not_stuck_fail_node_not_ready(
+        self, tmp_path, caplog
+    ):
+        """``_do_launch`` must keep the Popen so a state-Z child is reaped
+        via ``poll``/``waitpid``, and MIDDAY_WATCH then takes the relaunch
+        path."""
+        proc = subprocess.Popen(
+            [sys.executable, "-c", "import os; os._exit(0)"],
+            start_new_session=True,
+        )
+        try:
+            _wait_for_zombie(proc.pid)
+            assert _read_proc_stat_state(proc.pid) == "Z"
+
+            ports = _make_ports(
+                spawn=lambda **_kw: proc,
+                intent_lock_free=lambda _p: True,
+                process_alive=process_is_alive,
+            )
+            pid, _log, state, done = _do_launch(
+                ports=ports,
+                state=initial_scheduler_state(_DAY),
+                now=_utc(16, 50),
+                store_path=tmp_path / "state" / "store.sqlite3",
+                repo_root=tmp_path,
+                node_bin=tmp_path / "node_bin",
+                log_dir=tmp_path / "logs",
+            )
+            assert (pid, done) == (proc.pid, True)
+            assert process_is_alive(pid) is False
+            # Reaped: the pid is gone, not left sitting in state Z.
+            assert _read_proc_stat_state(pid) is None
+
+            node_log = tmp_path / "node.log"
+            node_log.write_text("trading node failed\n")
+            relaunch_spawner = FakeSpawner()
+            watch_ports = _make_ports(
+                process_alive=process_is_alive,
+                spawn=relaunch_spawner,
+                read_log_new=lambda p: p.read_text(),
+            )
+            state = record_readiness_observed(state, _utc(16, 55))
+            new_pid, _new_log, state = _do_midday_watch(
+                ports=watch_ports,
+                state=state,
+                now=_utc(20, 0),
+                tracked_pid=pid,
+                node_log=node_log,
+                **_midday_watch_common_kwargs(tmp_path),
+            )
+            assert len(relaunch_spawner.calls) == 1
+            assert new_pid != pid
+            assert state.midday_relaunch_attempts == 1
+        finally:
+            try:
+                os.waitpid(proc.pid, os.WNOHANG)
+            except ChildProcessError:
+                pass
+
+    def test_a_retained_zombie_is_reaped_when_another_pid_is_probed(self):
+        """Sweep the whole retain table: a dead child we are not currently
+        asking about must still be waitpid'd, otherwise it sits
+        ``<defunct>`` until the supervisor exits."""
+        from breezy.runtime.trade_supervisor import _retain_spawned_child
+
+        proc = subprocess.Popen(
+            [sys.executable, "-c", "import os; os._exit(0)"],
+            start_new_session=True,
+        )
+        try:
+            _wait_for_zombie(proc.pid)
+            assert _read_proc_stat_state(proc.pid) == "Z"
+            _retain_spawned_child(proc)
+            other_pid = proc.pid + 1
+            assert process_is_alive(other_pid) is False
+            assert _read_proc_stat_state(proc.pid) is None
+        finally:
+            try:
+                os.waitpid(proc.pid, os.WNOHANG)
+            except ChildProcessError:
+                pass
+
+    def test_run_forever_live_family_self_check_passes_and_midday_relaunches(
+        self, tmp_path, caplog
+    ):
+        """End-to-end: continuous-family log → 17:05Z PASS (not
+        FAIL_NODE_NOT_READY) and a dead child after 17:10Z is relaunched
+        by MIDDAY_WATCH."""
+        clock = FakeClock(_utc(16, 49, 30))
+        spawn_calls: list[int] = []
+        session: dict = {"tracked_pid": None}
+        dead_pids: set[int] = set()
+        kill_time = _utc(19, 57)
+        killed_once = {"done": False}
+
+        def fake_sleep(seconds: float) -> None:
+            clock.advance(seconds)
+
+        def fake_spawn(**_kwargs) -> FakePopen:
+            pid = 9000 + len(spawn_calls) + 1
+            spawn_calls.append(pid)
+            session["tracked_pid"] = pid
+            return FakePopen(pid)
+
+        def read_log_new(_path: Path) -> str:
+            if not killed_once["done"] and clock.current >= kill_time:
+                killed_once["done"] = True
+                dead_pids.add(session["tracked_pid"])
+                return "trading node failed\n"
+            return _CONTINUOUS_READY_LOG_LINES
+
+        ports = _make_ports(
+            spawn=fake_spawn,
+            resolve_intent_lock_holder=lambda _p: session["tracked_pid"],
+            count_intent_lock_holders=lambda _p: 1,
+            process_alive=lambda pid: pid not in dead_pids,
+            read_log_new=read_log_new,
+        )
+
+        with caplog.at_level("INFO"):
+            _run_forever(
+                store_path=tmp_path / "state" / "store.sqlite3",
+                repo_root=tmp_path,
+                node_bin=tmp_path / "node_bin",
+                log_dir=tmp_path / "logs",
+                clock=clock,
+                sleep=fake_sleep,
+                ports=ports,
+                max_iterations=300,
+            )
+
+        self_check_lines = [
+            r.getMessage() for r in caplog.records if "self_check" in r.getMessage()
+        ]
+        assert len(self_check_lines) == 1
+        assert "FAIL_NODE_NOT_READY" not in self_check_lines[0]
+        assert "PASS" in self_check_lines[0]
+        assert len(spawn_calls) == 2

@@ -81,6 +81,23 @@ PERMIT_ISSUED_MARKER: Final[str] = "live-trading permit issued issued_at_ns="
 PERMIT_NOT_ISSUED_MARKER: Final[str] = "order submission permit not issued"
 TRADING_NODE_FAILED_MARKER: Final[str] = "trading node failed"
 STRATEGY_SUBSCRIBED_MARKER: Final[str] = "CurrentRungHoldStrategy subscribed"
+#: WP-0a stopgap: the live family logs ``ContinuousRungHoldStrategy
+#: subscribed``. Two accepted prefixes, not a registry. WP-11b parameterises
+#: this by ``composition_kind`` — do not generalise here.
+CONTINUOUS_STRATEGY_SUBSCRIBED_MARKER: Final[str] = "ContinuousRungHoldStrategy subscribed"
+STRATEGY_SUBSCRIBED_MARKERS: Final[tuple[str, ...]] = (
+    STRATEGY_SUBSCRIBED_MARKER,
+    CONTINUOUS_STRATEGY_SUBSCRIBED_MARKER,
+)
+
+
+def strategy_subscribed_in(log_text: str) -> bool:
+    """True iff ``log_text`` contains any accepted rung-hold subscribe prefix.
+
+    WP-0a stopgap. WP-11b parameterises by ``composition_kind``.
+    """
+    return any(marker in log_text for marker in STRATEGY_SUBSCRIBED_MARKERS)
+
 
 #: [2026-09-15 mid-day relaunch] A fatal-fault shutdown exits the process
 #: cleanly (``EXIT_RUNTIME_ERROR`` via a normal ``return``, not an
@@ -759,11 +776,11 @@ def record_strategy_subscribed_seen(
     state: DaySchedulerState, now_utc: dt.datetime
 ) -> DaySchedulerState:
     """[fix 2026-09-05] Latch ``strategy_subscribed_seen`` -- called by the
-    I/O shell the moment ANY log read observes ``STRATEGY_SUBSCRIBED_MARKER``,
-    so the fact survives a LATER read of the same shared, offset-draining
-    reader whose delta no longer contains that text. Idempotent: a caller
-    that has already latched today's marker gets the same state back
-    unchanged."""
+    I/O shell the moment ANY log read observes an accepted rung-hold
+    subscribe prefix (see :func:`strategy_subscribed_in`), so the fact
+    survives a LATER read of the same shared, offset-draining reader whose
+    delta no longer contains that text. Idempotent: a caller that has
+    already latched today's marker gets the same state back unchanged."""
     effective = _for_day(state, _trading_day(now_utc))
     if effective.strategy_subscribed_seen:
         return effective

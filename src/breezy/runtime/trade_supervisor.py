@@ -63,7 +63,6 @@ from breezy.runtime.trade_supervisor_core import (
     SELF_CHECK_ALERT_DETAIL,
     SELF_CHECK_UTC,
     STOP_PRIOR_UTC,
-    STRATEGY_SUBSCRIBED_MARKER,
     SUPERVISOR_ARGV_TOKEN,
     AlertDetail,
     ContinuousFamilyCheck,
@@ -101,6 +100,7 @@ from breezy.runtime.trade_supervisor_core import (
     record_relaunch_attempt,
     record_strategy_subscribed_seen,
     self_check,
+    strategy_subscribed_in,
 )
 
 logger = logging.getLogger(__name__)
@@ -475,7 +475,32 @@ def _proc_state_char(pid: int) -> str | None:
     return fields[0] if fields else None
 
 
+# WP-0a: spawn sites used to keep only ``proc.pid`` and drop the Popen, so
+# ``waitpid`` never ran and a dead child sat ``<defunct>``. Retain the
+# Popen here (supervisor is single-threaded) and poll it from
+# :func:`process_is_alive`. Adopted pids have no Popen and are not retained.
+_SPAWNED_CHILDREN: dict[int, subprocess.Popen[bytes]] = {}
+
+
+def _retain_spawned_child(proc: subprocess.Popen[bytes]) -> None:
+    """Keep the Popen so ``poll``/``waitpid`` can reap it."""
+    _SPAWNED_CHILDREN[proc.pid] = proc
+
+
+def _reap_spawned_children() -> None:
+    """``Popen.poll()`` every retained child.
+
+    A dead pid we are not currently asking about must still be waitpid'd,
+    otherwise it sits ``<defunct>`` until the supervisor exits (e.g. after
+    SIGTERM at STOP_PRIOR, when ``tracked_pid`` is dropped).
+    """
+    for pid, proc in list(_SPAWNED_CHILDREN.items()):
+        if proc.poll() is not None:
+            _SPAWNED_CHILDREN.pop(pid, None)
+
+
 def process_is_alive(pid: int) -> bool:
+    _reap_spawned_children()
     try:
         os.kill(pid, 0)
     except ProcessLookupError:
@@ -820,6 +845,7 @@ def _do_stop_prior(
         if ports.intent_lock_free(lock_path):
             break
         ports.sigterm_poll_sleep(_SIGTERM_POLL_INTERVAL_S)
+    _reap_spawned_children()
     return None
 
 
@@ -929,6 +955,7 @@ def _do_launch(
         log_decision("launch_spawn_failed", error_type=type(exc).__name__)
         return None, None, record_relaunch_attempt(state, now), False
 
+    _retain_spawned_child(proc)
     log_decision("launched", pid=proc.pid)
     return proc.pid, log_path, state, True
 
@@ -955,7 +982,7 @@ def _do_relaunch_check(
     # read sees it -- this poll may be the last one whose delta still holds
     # it before later polls (waiting on a permit that never comes) drain the
     # shared reader's offset past it.
-    if STRATEGY_SUBSCRIBED_MARKER in log_text:
+    if strategy_subscribed_in(log_text):
         state = record_strategy_subscribed_seen(state, now)
     permit_expiry_ns = parse_permit_expiry_ns(log_text)
     if permit_expiry_ns is not None:
@@ -987,6 +1014,7 @@ def _do_relaunch_check(
     log_decision("relaunching", attempt=state.relaunch_attempts + 1)
     new_log = node_log_path(log_dir, now)
     proc = ports.spawn(node_bin=node_bin, repo_root=repo_root, env=os.environ, log_path=new_log)
+    _retain_spawned_child(proc)
     return proc.pid, new_log, record_relaunch_attempt(state, now)
 
 
@@ -1011,7 +1039,8 @@ def _do_midday_watch(
     already been alerted exactly once; redoing full decision work every
     poll for the rest of the day would serve no purpose.
 
-    Keeps latching :data:`STRATEGY_SUBSCRIBED_MARKER`/the permit-issued
+    Keeps latching any accepted rung-hold subscribe prefix (see
+    :func:`strategy_subscribed_in`)/the permit-issued
     line and the first non-``UNKNOWN`` :func:`classify_exit1_cause` result
     on EVERY poll, alive or dead -- the same drain-safe pattern
     ``_do_relaunch_check`` already uses, guarding against a fatal-fault
@@ -1038,7 +1067,7 @@ def _do_midday_watch(
         return tracked_pid, node_log, state
 
     log_text = ports.read_log_new(node_log)
-    if STRATEGY_SUBSCRIBED_MARKER in log_text:
+    if strategy_subscribed_in(log_text):
         state = record_strategy_subscribed_seen(state, now)
     permit_expiry_ns = parse_permit_expiry_ns(log_text)
     if permit_expiry_ns is not None:
@@ -1098,6 +1127,7 @@ def _do_midday_watch(
     )
     new_log = node_log_path(log_dir, now)
     proc = ports.spawn(node_bin=node_bin, repo_root=repo_root, env=os.environ, log_path=new_log)
+    _retain_spawned_child(proc)
     return proc.pid, new_log, record_midday_relaunch_attempt(state, now)
 
 
@@ -1153,7 +1183,7 @@ def _do_self_check(
     log_text = ports.read_log_new(node_log) if node_log is not None else ""
     child_alive = tracked_pid is not None and ports.process_alive(tracked_pid)
 
-    strategy_subscribed_live = STRATEGY_SUBSCRIBED_MARKER in log_text
+    strategy_subscribed_live = strategy_subscribed_in(log_text)
     permit_issued_live = PERMIT_ISSUED_MARKER in log_text
     live_permit_expiry_ns = parse_permit_expiry_ns(log_text)
     now_ns = int(now.timestamp() * 1e9)
