@@ -71,6 +71,8 @@ from breezy.ingest.http import (
 )
 
 __all__ = [
+    "BODY_EXCERPT_LINES",
+    "BODY_EXCERPT_THRESHOLD_BYTES",
     "MANIFEST_COLUMNS",
     "MANIFEST_FILENAME",
     "PROBE_PAYLOAD_SUFFIX",
@@ -89,6 +91,20 @@ __all__ = [
 PROBE_PAYLOAD_SUFFIX: str = ".probe.json"
 
 MANIFEST_FILENAME: str = "request_manifest.tsv"
+
+#: Bodies at or above this size are stored as a bounded excerpt instead of in
+#: full. 1 MiB comfortably holds every ordinary probe capture whole
+#: (directory listings, JSON error bodies, small text products) while
+#: catching payloads at the scale of the NBM collective bulletin (~30 MB,
+#: docs/evidence/nbm_nomads_discovery_probe_20260919T134718Z/) well before
+#: they would bloat the evidence directory -- this is the threshold used to
+#: hand-trim that artefact, kept so old and new captures read alike.
+BODY_EXCERPT_THRESHOLD_BYTES: int = 1024 * 1024
+
+#: Leading lines kept in an excerpt. 400 is enough to retain several complete
+#: station blocks of an NBM-shaped bulletin -- the content the hand-trim's
+#: findings actually rested on -- while keeping the artefact small.
+BODY_EXCERPT_LINES: int = 400
 
 MANIFEST_COLUMNS: tuple[str, ...] = (
     "ordinal",
@@ -532,8 +548,42 @@ class ProbeEvidenceWriter:
         return len(self._rows)
 
     def record(self, name: str, exchange: ProbeExchange) -> None:
-        """Append one manifest row and, when a body arrived, one payload file."""
+        """Append one manifest row and, when a body arrived, one payload file.
+
+        A body at or above :data:`BODY_EXCERPT_THRESHOLD_BYTES` is stored as
+        a bounded excerpt plus a ``body_trimmed`` marker instead of in full
+        (see that constant's docstring for why, and
+        ``docs/evidence/nbm_nomads_discovery_probe_20260919T134718Z/`` for the
+        hand-trimmed precedent this mirrors). The ``sha256`` recorded is
+        always ``exchange.sha256`` -- computed upstream, over the raw bytes
+        actually received, before this writer ever sees them
+        (``breezy.ingest.http`` line ~823) -- so trimming the stored body can
+        never desync the artefact's provenance hash from what was fetched.
+        """
         if exchange.text is not None:
+            body: str = exchange.text
+            body_trimmed: dict[str, object] | None = None
+            if exchange.body_bytes >= BODY_EXCERPT_THRESHOLD_BYTES:
+                lines = exchange.text.splitlines()
+                excerpt_lines = lines[:BODY_EXCERPT_LINES]
+                body = "\n".join(excerpt_lines)
+                body_trimmed = {
+                    "reason": (
+                        "Full body withheld from git: "
+                        f"{exchange.body_bytes} bytes is at or above the "
+                        f"{BODY_EXCERPT_THRESHOLD_BYTES}-byte bound this writer keeps "
+                        "in full. The sha256 above is the FULL body's hash, not the "
+                        "excerpt's."
+                    ),
+                    "original_bytes": exchange.body_bytes,
+                    "original_lines": len(lines),
+                    "excerpt_lines": len(excerpt_lines),
+                    "sha256_of_full_body": exchange.sha256,
+                    "recoverable_by": (
+                        f"Re-GET {exchange.url} and verify sha256 matches "
+                        "sha256_of_full_body."
+                    ),
+                }
             payload = {
                 "label": exchange.label,
                 "url": exchange.url,
@@ -544,8 +594,10 @@ class ProbeEvidenceWriter:
                 "bytes": exchange.body_bytes,
                 "outcome": exchange.outcome,
                 "finding": exchange.finding,
-                "body": exchange.text,
+                "body": body,
             }
+            if body_trimmed is not None:
+                payload["body_trimmed"] = body_trimmed
             target = self._directory / f"{name}{PROBE_PAYLOAD_SUFFIX}"
             target.write_text(json.dumps(payload, indent=2, sort_keys=True), encoding="utf-8")
         self._rows.append(

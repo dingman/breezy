@@ -33,6 +33,7 @@ network would fail rather than spend a request.
 from __future__ import annotations
 
 import ast
+import hashlib
 import importlib.util
 import json
 import subprocess
@@ -48,6 +49,7 @@ import respx
 
 from breezy.ingest.http import HttpTransport, RedirectError
 from breezy.ingest.probe_transport import (
+    BODY_EXCERPT_THRESHOLD_BYTES,
     MANIFEST_COLUMNS,
     PROBE_PAYLOAD_SUFFIX,
     SETTLEMENT_HOSTS,
@@ -1772,3 +1774,143 @@ def test_the_corroborating_capture_is_found_from_the_run_itself() -> None:
     assert probe_a.corroborating_historical_capture((recent, historical)) == "q3_archive_depth_2022"
     assert probe_a.corroborating_historical_capture((recent,)) is None
     assert probe_a.corroborating_historical_capture(()) is None
+
+
+# ==========================================================================
+# Bounded body capture (fix: over-threshold bodies must never be stored in
+# full -- docs/evidence/nbm_nomads_discovery_probe_20260919T134718Z/ is the
+# hand-trimmed precedent this section holds the writer to).
+# ==========================================================================
+
+
+def _oversize_exchange(*, body_bytes: int, sha256_of_full_body: str, line_count: int) -> ProbeExchange:
+    """A synthetic exchange whose ``text`` is exactly ``body_bytes`` long.
+
+    ``sha256_of_full_body`` is supplied by the caller -- exactly as the real
+    transport supplies :attr:`ProbeExchange.sha256`, computed over the raw
+    bytes it actually received (``http.py`` line 823) -- never derived here
+    from ``text``, so a test that asserts on it is asserting on an
+    independently-known value, not re-deriving what the code under test also
+    derives.
+    """
+    line = "STATION BLOCK CONTENT " * 3
+    lines = [line] * line_count
+    text = "\n".join(lines)
+    text = text + ("x" * max(0, body_bytes - len(text.encode("utf-8"))))
+    return ProbeExchange(
+        1,
+        "2026-09-19T13:00:00+00:00",
+        "p2_collective_nbstx",
+        "https://nomads.ncep.noaa.gov/pub/data/nccf/com/blend/prod/blend.20260919/12/text/blend_nbstx.t12z",
+        200,
+        len(text.encode("utf-8")),
+        "text/plain",
+        "ok",
+        sha256_of_full_body,
+        text,
+        None,
+    )
+
+
+def test_an_over_threshold_body_is_not_stored_whole(tmp_path: Path) -> None:
+    """RED: today's writer stores the entire ~30 MB body -- this must stop."""
+    threshold = BODY_EXCERPT_THRESHOLD_BYTES
+    oversized = threshold + (10 * 1024 * 1024)
+    exchange = _oversize_exchange(
+        body_bytes=oversized,
+        sha256_of_full_body="f" * 64,
+        line_count=500,
+    )
+    writer = ProbeEvidenceWriter(tmp_path)
+
+    writer.record("p2_collective_nbstx", exchange)
+
+    payload = json.loads((tmp_path / "p2_collective_nbstx.probe.json").read_text(encoding="utf-8"))
+    stored_body_bytes = len(payload["body"].encode("utf-8"))
+    assert stored_body_bytes < oversized, (
+        "an over-threshold body must be stored as a bounded excerpt, not in full "
+        f"(stored {stored_body_bytes} bytes of a {oversized}-byte body)"
+    )
+    assert "body_trimmed" in payload
+    body_trimmed = payload["body_trimmed"]
+    assert body_trimmed["original_bytes"] == oversized
+    assert body_trimmed["reason"]
+    assert body_trimmed["recoverable_by"]
+    assert body_trimmed["excerpt_lines"] <= 400
+
+
+def test_the_recorded_sha256_is_always_the_full_body_hash_never_the_excerpts(
+    tmp_path: Path,
+) -> None:
+    """RED: the sha256 recorded for a trimmed body must be the FULL-body hash
+    supplied by the transport -- never a hash of the excerpt this writer
+    keeps. Constructing the excerpt's own hash and asserting it differs from
+    the recorded value is what would catch a regression where the writer
+    silently re-hashes only what it kept.
+    """
+    threshold = BODY_EXCERPT_THRESHOLD_BYTES
+    oversized = threshold + (5 * 1024 * 1024)
+    full_body_sha256 = "a" * 64
+    exchange = _oversize_exchange(
+        body_bytes=oversized,
+        sha256_of_full_body=full_body_sha256,
+        line_count=500,
+    )
+    writer = ProbeEvidenceWriter(tmp_path)
+
+    writer.record("p2_collective_nbstx", exchange)
+
+    payload = json.loads((tmp_path / "p2_collective_nbstx.probe.json").read_text(encoding="utf-8"))
+    excerpt_sha256 = hashlib.sha256(payload["body"].encode("utf-8")).hexdigest()
+
+    assert payload["sha256"] == full_body_sha256
+    assert payload["body_trimmed"]["sha256_of_full_body"] == full_body_sha256
+    assert payload["body_trimmed"]["sha256_of_full_body"] != excerpt_sha256, (
+        "the recorded sha256 must be the FULL body's hash, not the excerpt's -- "
+        "an artefact that hashed only what it kept would claim verifiability it "
+        "does not have"
+    )
+
+
+def test_a_below_threshold_body_is_still_stored_in_full(tmp_path: Path) -> None:
+    """Small captures must not regress: no excerpt, no body_trimmed marker."""
+    threshold = BODY_EXCERPT_THRESHOLD_BYTES
+    small_text = "a directory listing\n" * 10
+    exchange = ProbeExchange(
+        1,
+        "2026-09-19T13:00:00+00:00",
+        "p6_robots",
+        "https://nomads.ncep.noaa.gov/robots.txt",
+        200,
+        len(small_text.encode("utf-8")),
+        "text/plain",
+        "ok",
+        "b" * 64,
+        small_text,
+        None,
+    )
+    assert exchange.body_bytes < threshold
+    writer = ProbeEvidenceWriter(tmp_path)
+
+    writer.record("p6_robots", exchange)
+
+    payload = json.loads((tmp_path / "p6_robots.probe.json").read_text(encoding="utf-8"))
+    assert payload["body"] == small_text
+    assert "body_trimmed" not in payload
+
+
+def test_a_body_exactly_at_the_threshold_is_trimmed(tmp_path: Path) -> None:
+    """Boundary case: AT the threshold trims (matches the hand-trim's ~1 MB cut)."""
+    threshold = BODY_EXCERPT_THRESHOLD_BYTES
+    exchange = _oversize_exchange(
+        body_bytes=threshold,
+        sha256_of_full_body="c" * 64,
+        line_count=500,
+    )
+    assert exchange.body_bytes == threshold
+    writer = ProbeEvidenceWriter(tmp_path)
+
+    writer.record("p_boundary", exchange)
+
+    payload = json.loads((tmp_path / "p_boundary.probe.json").read_text(encoding="utf-8"))
+    assert "body_trimmed" in payload
