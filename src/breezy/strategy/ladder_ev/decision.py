@@ -5,19 +5,21 @@ from __future__ import annotations
 from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import date
+from typing import Final, Literal
 
 from breezy.strategy.current_rung_hold.decision import is_legal_cell
 from breezy.strategy.ladder_ev.config import LadderEvConfig
 from breezy.strategy.weather_common.running_extreme import RunningMax
 
-__all__ = ["ExclusionInputs", "exclusion_filter"]
+__all__ = ["ExclusionInputs", "exclusion_filter", "forecast_side_is_legal"]
 
 RungBounds = tuple[int | None, int | None]
 
-_ENTRY_WINDOW_START_HOUR = 12
-_ENTRY_WINDOW_END_HOUR = 17
 _CHEAP_OPEN_ASK = 0.05
 _POST_PEAK_P_MAX = 0.05
+_FORECAST_LIVE_RELATIONS: Final[frozenset[str]] = frozenset(
+    {"contains", "above", "above1", "above2", "above3+"}
+)
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
@@ -41,6 +43,11 @@ class ExclusionInputs:
     at_listing: bool
     interior_prelim_final_trade: bool
     p_computed_without_mt: bool
+    side: Literal["yes", "no"] = "yes"
+
+    def __post_init__(self) -> None:
+        if self.side not in ("yes", "no"):
+            raise ValueError(f"side must be 'yes' or 'no', was {self.side!r}")
 
 
 def _peak_hour(station: str, cfg: LadderEvConfig) -> int | None:
@@ -101,7 +108,7 @@ def exclusion_filter(inputs: ExclusionInputs, cfg: LadderEvConfig) -> tuple[bool
     if inputs.width_code == 2:
         return False, "open_lower"
     # Universe gates
-    if not (_ENTRY_WINDOW_START_HOUR <= inputs.hour_lst < _ENTRY_WINDOW_END_HOUR):
+    if not (cfg.window_start_hour_lst <= inputs.hour_lst < cfg.window_end_hour_lst):
         return False, "outside_entry_window"
     if cfg.dplus1_require_running_max and inputs.climate_day > inputs.now_climate_day:
         return False, "dplus1_entry"
@@ -109,3 +116,30 @@ def exclusion_filter(inputs: ExclusionInputs, cfg: LadderEvConfig) -> tuple[bool
     if not (cfg.executable_ask_lower < inputs.ask < cfg.executable_ask_upper):
         return False, "not_executable"
     return True, "ok"
+
+
+def forecast_side_is_legal(
+    *,
+    side: str,
+    r_relation: str,
+    width_code: int,
+    m_code: int,
+) -> bool:
+    """Family call-site replacement for X8 (plan §7.4).
+
+    YES: interior or open-upper physical shape (``width_code`` in {0, 1}) and
+    ``r_relation`` in {contains, above*}. ``m_code`` may be negative on a
+    forecast-implied interior — ``is_legal_cell`` is a helper, not the gate.
+    NO: ``r_relation`` in {contains, above*}; ``below`` is ``rung_physically_dead``
+    on both legs (L-9 / L-44).
+    """
+    if r_relation not in _FORECAST_LIVE_RELATIONS:
+        return False
+    if side == "no":
+        return True
+    if side != "yes":
+        raise ValueError(f"side must be 'yes' or 'no', was {side!r}")
+    # m_code is accepted for call-site symmetry with X8; forecast interiors
+    # may carry m_code < 0, so physical shape is width, not is_legal_cell.
+    _ = m_code
+    return width_code in (0, 1)

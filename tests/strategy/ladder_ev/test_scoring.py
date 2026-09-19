@@ -106,6 +106,38 @@ def test_ranking_prefers_absolute_ev_net_over_roi_and_applies_city_day_cap() -> 
     assert "MDW-D-lt70" not in ids
 
 
+def test_no_side_ev_uses_one_minus_p_upper_with_intent_long_yes_true() -> None:
+    """E2: a NO buy is a LONG of the NO leg, never a short-YES (L-44)."""
+    import inspect
+
+    from breezy.strategy.ladder_ev import scoring as scoring_mod
+    from breezy.strategy.ladder_ev.scoring import ev_net_no
+
+    source = inspect.getsource(scoring_mod)
+    assert 'intent_long_yes=(side == "yes")' not in source
+    assert "intent_long_yes=(side==\"yes\")" not in source
+    assert "intent_long_yes=(side == 'yes')" not in source
+
+    cost = depth_aware_trade_cost_prob(
+        ask_levels=_THREE_LEVEL_LADDER,
+        quantity=1.0,
+        price_scale=1.0,
+        fee_coefficient=0.06,
+        slippage_floor_prob=0.01,
+    )
+    p_upper = 0.80
+    net = ev_net_no(p_upper, cost)
+    assert net is not None
+    assert net == pytest.approx((1.0 - p_upper) - unified_cost(cost), abs=1e-12)
+    # Anti-conservative 1-p_lower and short-YES (intent_long_yes=False, no bid)
+    # must not be the path this function took.
+    yes_shaped = ev_net(p_upper, cost)
+    assert yes_shaped is not None
+    assert net != pytest.approx(yes_shaped, abs=1e-12)
+    no_row = _row(side="no", p_lower=0.10)
+    assert no_row.side == "no"
+
+
 def test_kelly_stake_fraction_returns_kappa_times_f_star() -> None:
     disabled = LadderEvConfig()
     assert kelly_stake_fraction(0.60, 0.40, disabled) == pytest.approx(1.0)

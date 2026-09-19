@@ -2,21 +2,32 @@
 
 Operator-reserved dollar caps (maximum daily budget; maximum per position)
 are deliberately absent. ``allow_short`` stays False; ``mode='full'`` is
-refused at construction (no forecast ingest exists).
+refused at construction. ``mode='forecast'`` is a third legal branch;
+its corpus pin is supplied by the family manifest, never a src constant.
 """
 
 from __future__ import annotations
 
+import re
+from typing import Final
+
 from nautilus_trader.trading.config import StrategyConfig
 
-from breezy.strategy.ladder_ev.density_table import CORPUS_SHA256
+from breezy.strategy.ladder_ev.density_table import (
+    CORPUS_SHA256,
+    ForecastCorpusPinMismatchError,
+)
 
 __all__ = [
     "AllowShortNotPermittedError",
+    "ForecastCorpusPinMismatchError",
     "LadderEvConfig",
     "ModeFullNotPermittedError",
     "RawCorpusPinMismatchError",
 ]
+
+_SHA256_RE: Final[re.Pattern[str]] = re.compile(r"^[0-9a-f]{64}$")
+_UNPINNED_SHA256: Final[str] = "0" * 64
 
 _PEAK_HOUR_LST_DEFAULT: tuple[tuple[str, int], ...] = (
     ("LAX", 15),
@@ -28,11 +39,11 @@ _PEAK_HOUR_LST_DEFAULT: tuple[tuple[str, int], ...] = (
 
 
 class AllowShortNotPermittedError(ValueError):
-    """Raised when ``allow_short`` is constructed ``True``. LONG_YES only."""
+    """Raised when ``allow_short`` is constructed ``True``. SHORT_YES is forbidden."""
 
 
 class ModeFullNotPermittedError(ValueError):
-    """Raised when ``mode`` is constructed ``'full'``. DEGRADED-only family."""
+    """Raised when ``mode`` is constructed ``'full'``. ``degraded`` or ``forecast`` only."""
 
 
 class RawCorpusPinMismatchError(ValueError):
@@ -107,7 +118,7 @@ class LadderEvConfig(StrategyConfig, frozen=True):
     exit_sell_enabled : bool
         False; exits are audit-only in v2.
     mode : str
-        ``degraded`` only; ``full`` refused at construction.
+        ``degraded`` or ``forecast``; ``full`` refused at construction.
     raw_corpus_pin : str
         Pin of the RAW archive corpus bytes CRH's selector was built from
         (``generate_current_rung_hold_archive_table.py:115-125``). NOT a hash
@@ -115,6 +126,18 @@ class LadderEvConfig(StrategyConfig, frozen=True):
         (``ON_DISK_BUILD_RAN=False``).
     se_z : float
         FULL-only z; unused in DEGRADED.
+    window_start_hour_lst, window_end_hour_lst : int
+        Inclusive/exclusive LST entry window (E1). Defaults 12/17.
+    forecast_staleness_bound_ns : int
+        Max age of a visible forecast versus ``now_ns``. ``0`` means no
+        staleness cut (visibility-only). Must be >= 0.
+    publication_lag_ns : int
+        Ingest vintage offset (``available_at_ns = cycle + lag``). ``0``
+        means no added lag. Must be >= 0.
+    forecast_corpus_pin : str
+        Manifest-pinned ``density_artefact_sha256``. Empty in DEGRADED;
+        required 64 lowercase hex (not all-zero) in ``mode='forecast'``.
+        The sha lives on the family manifest, not as a source constant.
 
     Not present: the two operator-reserved dollar controls.
     """
@@ -154,18 +177,25 @@ class LadderEvConfig(StrategyConfig, frozen=True):
     mode: str = "degraded"
     raw_corpus_pin: str = CORPUS_SHA256
     se_z: float = 1.96
+    window_start_hour_lst: int = 12
+    window_end_hour_lst: int = 17
+    forecast_staleness_bound_ns: int = 0
+    publication_lag_ns: int = 0
+    forecast_corpus_pin: str = ""
 
     def __post_init__(self) -> None:
         if self.allow_short:
             raise AllowShortNotPermittedError(
-                "allow_short must stay False; this package is LONG_YES only"
+                "allow_short must stay False; SHORT_YES is forbidden"
             )
         if self.mode == "full":
             raise ModeFullNotPermittedError(
-                "mode='full' is refused; LADDER_EV registers DEGRADED-only"
+                "mode='full' is refused; legal modes are 'degraded' and 'forecast'"
             )
-        if self.mode != "degraded":
-            raise ValueError(f"mode must be 'degraded', was {self.mode!r}")
+        if self.mode not in ("degraded", "forecast"):
+            raise ValueError(
+                f"mode must be 'degraded' or 'forecast', was {self.mode!r}"
+            )
         if self.n_min_cell < 1:
             raise ValueError(f"n_min_cell must be >= 1, was {self.n_min_cell!r}")
         if self.margin_m24 < self.margin_m0:
@@ -177,8 +207,30 @@ class LadderEvConfig(StrategyConfig, frozen=True):
                 "executable_ask_lower must be < executable_ask_upper, "
                 f"was {self.executable_ask_lower!r} >= {self.executable_ask_upper!r}"
             )
+        if self.window_start_hour_lst >= self.window_end_hour_lst:
+            raise ValueError(
+                "window_start_hour_lst must be < window_end_hour_lst, "
+                f"was {self.window_start_hour_lst!r} >= {self.window_end_hour_lst!r}"
+            )
+        if self.forecast_staleness_bound_ns < 0:
+            raise ValueError(
+                "forecast_staleness_bound_ns must be >= 0, "
+                f"was {self.forecast_staleness_bound_ns!r}"
+            )
+        if self.publication_lag_ns < 0:
+            raise ValueError(
+                f"publication_lag_ns must be >= 0, was {self.publication_lag_ns!r}"
+            )
         if self.raw_corpus_pin != CORPUS_SHA256:
             raise RawCorpusPinMismatchError(
                 "raw_corpus_pin must equal density_table.CORPUS_SHA256 "
                 f"({CORPUS_SHA256!r}), was {self.raw_corpus_pin!r}"
             )
+        if self.mode == "forecast":
+            pin = self.forecast_corpus_pin
+            if not _SHA256_RE.match(pin) or pin == _UNPINNED_SHA256:
+                raise ForecastCorpusPinMismatchError(
+                    "forecast_corpus_pin must equal the manifest-pinned "
+                    "density_artefact_sha256 (64 lowercase hex, not all-zero); "
+                    f"was {pin!r}"
+                )

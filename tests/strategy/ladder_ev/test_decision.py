@@ -242,3 +242,38 @@ def test_not_executable_fires_after_x_rules() -> None:
     eligible, reason = exclusion_filter(_passing(ask=0.96), _CFG)
     assert eligible is False
     assert reason == "not_executable"
+
+
+def test_exclusion_inputs_carry_side_defaulting_to_yes() -> None:
+    inputs = _passing()
+    assert inputs.side == "yes"
+    no_inputs = _passing(side="no")
+    assert no_inputs.side == "no"
+
+
+def test_entry_window_reads_from_config_not_module_constants() -> None:
+    widened = LadderEvConfig(window_start_hour_lst=10, window_end_hour_lst=17)
+    eligible, reason = exclusion_filter(_passing(hour_lst=11), widened)
+    assert eligible is True
+    assert reason == "ok"
+    eligible, reason = exclusion_filter(_passing(hour_lst=11), _CFG)
+    assert eligible is False
+    assert reason == "outside_entry_window"
+
+
+def test_forecast_side_legality_replaces_x8_and_admits_negative_m_code() -> None:
+    from breezy.strategy.ladder_ev.decision import forecast_side_is_legal
+
+    # Forecast-implied interior above R(t) has m_code < 0 and dies at X8.
+    assert forecast_side_is_legal(
+        side="yes", r_relation="above", width_code=0, m_code=-1
+    )
+    assert forecast_side_is_legal(
+        side="no", r_relation="contains", width_code=0, m_code=-1
+    )
+    assert not forecast_side_is_legal(
+        side="yes", r_relation="below", width_code=0, m_code=0
+    )
+    assert not forecast_side_is_legal(
+        side="no", r_relation="below", width_code=0, m_code=0
+    )

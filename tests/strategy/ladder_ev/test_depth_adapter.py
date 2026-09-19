@@ -64,6 +64,47 @@ def test_never_returns_a_size_zero_level() -> None:
     assert levels == [(0.40, 3.0), (0.41, 7.0)]
 
 
+def _depth_sides(
+    *,
+    bids: tuple[tuple[str, int], ...],
+    asks: tuple[tuple[str, int], ...],
+) -> OrderBookDepth10:
+    bid_orders, bid_counts = _pad(OrderSide.BUY, bids)
+    ask_orders, ask_counts = _pad(OrderSide.SELL, asks)
+    return OrderBookDepth10(
+        instrument_id=_INSTRUMENT_ID,
+        bids=bid_orders,
+        asks=ask_orders,
+        bid_counts=bid_counts,
+        ask_counts=ask_counts,
+        flags=0,
+        sequence=0,
+        ts_event=0,
+        ts_init=0,
+    )
+
+
+def test_no_bid_side_is_fail_closed_never_assumed() -> None:
+    from breezy.strategy.ladder_ev.depth_adapter import bid_levels_from_book
+
+    book = OrderBook(_INSTRUMENT_ID, BookType.L2_MBP)
+    book.add(BookOrder(OrderSide.SELL, Price.from_str("0.50"), Quantity.from_int(4), 1), 1)
+    with pytest.raises(NoExecutableDepthError, match="no_bid_side"):
+        bid_levels_from_book(book)
+    padded = _depth_sides(bids=(), asks=(("0.50", 4),))
+    with pytest.raises(NoExecutableDepthError, match="no_bid_side"):
+        bid_levels_from_book(padded)
+
+
+def test_bid_levels_invert_yes_bids_to_no_asks_then_sort_ascending() -> None:
+    from breezy.strategy.ladder_ev.depth_adapter import bid_levels_from_book
+
+    # YES bids 0.60 (size 5) and 0.40 (size 2). Best NO ask is 1-0.60 = 0.40.
+    depth = _depth_sides(bids=(("0.60", 5), ("0.40", 2)), asks=(("0.70", 1),))
+    levels = bid_levels_from_book(depth)
+    assert levels == [(0.40, 5.0), (0.60, 2.0)]
+
+
 def test_order_book_levels_are_ascending_real_asks() -> None:
     book = OrderBook(_INSTRUMENT_ID, BookType.L2_MBP)
     book.add(BookOrder(OrderSide.SELL, Price.from_str("0.52"), Quantity.from_int(2), 1), 1)
