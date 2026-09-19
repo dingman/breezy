@@ -54,6 +54,7 @@ from pathlib import Path
 from typing import Any
 
 import pyarrow as pa
+from nautilus_trader.model.data import CustomData
 from nautilus_trader.persistence.catalog.parquet import ParquetDataCatalog
 from nautilus_trader.persistence.funcs import class_to_filename
 
@@ -121,20 +122,59 @@ def _object_key(obj: Any) -> tuple[str | None, int]:
     return (instrument_id.value if instrument_id is not None else None, obj.ts_init)
 
 
+def _catalog_row(item: Any) -> Any:
+    return item.data if isinstance(item, CustomData) else item
+
+
 def _drop_already_landed(
     write_target: ParquetDataCatalog, data_cls: type, objects: list[Any]
 ) -> list[Any]:
     """Filter out every object whose ``(instrument_id, ts_init)`` is already landed."""
-    identifiers = sorted(
-        {key[0] for obj in objects if (key := _object_key(obj))[0] is not None}
-    )
+    identifiers = sorted({key[0] for obj in objects if (key := _object_key(obj))[0] is not None})
     existing = (
         write_target.query(data_cls=data_cls, identifiers=identifiers)
         if identifiers
         else write_target.query(data_cls=data_cls)
     )
-    known = {_object_key(landed) for landed in existing}
+    known = {_object_key(_catalog_row(landed)) for landed in existing}
     return [obj for obj in objects if _object_key(obj) not in known]
+
+
+def _drop_already_landed_unfiltered(
+    write_target: ParquetDataCatalog, data_cls: type, objects: list[Any]
+) -> list[Any]:
+    """Drop landed rows using an unfiltered, time-bounded query.
+
+    Identifier-filtered ``query`` silently omits FLAT ``convert_stream_to_data``
+    files (``parquet.py:2249``; ``TestTheMixedCatalogLayoutIsPinned``). The
+    ING-1 partial slice is exactly that layout, so EXTEND must see it.
+    """
+    if not objects:
+        return []
+    lo = min(obj.ts_init for obj in objects)
+    hi = max(obj.ts_init for obj in objects)
+    existing = write_target.query(data_cls=data_cls, start=lo, end=hi)
+    known = {_object_key(_catalog_row(landed)) for landed in existing}
+    return [obj for obj in objects if _object_key(obj) not in known]
+
+
+def write_fresh_capture_rows(
+    write_target: ParquetDataCatalog,
+    data_cls: type,
+    objects: list[Any],
+) -> int:
+    """Write capture-timed rows that are not already in the catalog.
+
+    EXTEND for ING-1: new parquet records only, never a rewrite or a
+    ``delete_data_range``. ``skip_disjoint_check=True`` is earned by the
+    de-dupe, same contract as :func:`salvage_truncated_instance` and
+    ``convert_instrument_definitions``.
+    """
+    fresh = _drop_already_landed_unfiltered(write_target, data_cls, objects)
+    if not fresh:
+        return 0
+    write_target.write_data(fresh, skip_disjoint_check=True)
+    return len(fresh)
 
 
 def salvage_truncated_instance(

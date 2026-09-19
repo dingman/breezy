@@ -31,10 +31,13 @@ from __future__ import annotations
 import io
 import os
 import time
+from collections.abc import Callable
 from pathlib import Path
+from typing import Any
 
 import pytest
-from nautilus_trader.model.data import QuoteTick
+from nautilus_trader.model.data import BookOrder, OrderBookDepth10, QuoteTick, TradeTick
+from nautilus_trader.model.enums import OrderSide
 from nautilus_trader.model.objects import Price, Quantity
 from nautilus_trader.persistence.catalog.parquet import ParquetDataCatalog
 from nautilus_trader.test_kit.providers import TestInstrumentProvider
@@ -46,6 +49,11 @@ from breezy.runtime.quote_tape_ingest_cli import (
     run_ingest,
 )
 from breezy.runtime.quote_tape_preflight_cli import CATALOG_ENV_VAR
+from tests.unit.test_quote_tape_ingest_cli import (
+    _quote_tick,
+    _trade_tick,
+    _write_typed_ipc_stream,
+)
 
 _INSTANCE = "instance-1"
 
@@ -191,3 +199,162 @@ def test_a_republished_overlapping_interval_reproduces_the_non_disjoint_refusal(
             "non-disjoint QuoteTick interval -- the native guard I3 depends "
             "on may have changed"
         )
+
+
+def _age_past_live_grace(path: Path) -> None:
+    stamp = time.time() - (DEFAULT_LIVE_GRACE_MINUTES + 5) * 60
+    os.utime(path, (stamp, stamp))
+
+
+def _depth10_at(index: int) -> OrderBookDepth10:
+    """Minimal Depth10 frame; ten levels per side, one real bid/ask plus pad."""
+    ts_ns = 1_000_000_000 + index
+    instrument = TestInstrumentProvider.default_fx_ccy("EUR/USD")
+    bid = BookOrder(OrderSide.BUY, Price.from_str("1.00000"), Quantity.from_int(1), 0)
+    ask = BookOrder(OrderSide.SELL, Price.from_str("1.00010"), Quantity.from_int(1), 0)
+    pad_bid = BookOrder(OrderSide.BUY, Price.from_str("0.00000"), Quantity.from_int(0), 0)
+    pad_ask = BookOrder(OrderSide.SELL, Price.from_str("0.00000"), Quantity.from_int(0), 0)
+    bids = [bid, *[pad_bid] * 9]
+    asks = [ask, *[pad_ask] * 9]
+    counts = [1, *[0] * 9]
+    return OrderBookDepth10(
+        instrument_id=instrument.id,
+        bids=bids,
+        asks=asks,
+        bid_counts=counts,
+        ask_counts=counts,
+        flags=0,
+        sequence=0,
+        ts_event=ts_ns,
+        ts_init=ts_ns,
+    )
+
+
+def _seed_partial_then_grow(
+    catalog_root: Path,
+    *,
+    feather_name: str,
+    data_cls: type,
+    factory: Callable[[int], Any],
+    partial_count: int,
+    full_count: int,
+) -> Path:
+    """Lay down the ING-1 shape: native convert of a short stream, then the
+    same feather grows to a later-end overlapping interval, unmarked.
+
+    Matches the 15-minute ingest writing a partial live-instance slice and
+    then retrying the grown range. The first write is the native converter
+    (flat layout, interval from min/max ts_init); the type marker is left
+    absent so the next ``run_ingest`` actually retries — the production
+    collision never earns the marker because the second write raises.
+    """
+    instance_dir = catalog_root / "live" / _INSTANCE
+    path = instance_dir / feather_name
+    _write_typed_ipc_stream(path, [factory(i) for i in range(partial_count)], data_cls, close=True)
+    _age_past_live_grace(path)
+    ParquetDataCatalog(str(catalog_root)).convert_stream_to_data(
+        _INSTANCE, data_cls, subdirectory="live"
+    )
+    _write_typed_ipc_stream(path, [factory(i) for i in range(full_count)], data_cls, close=True)
+    _age_past_live_grace(path)
+    return path
+
+
+def test_a_partial_quote_slice_then_overlapping_write_does_not_strand_the_range(
+    tmp_path: Path,
+) -> None:
+    """ING-1: a later overlapping convert must land the tail, not exit 3."""
+    _seed_partial_then_grow(
+        tmp_path,
+        feather_name="quote_tick_0.feather",
+        data_cls=QuoteTick,
+        factory=_quote_tick,
+        partial_count=5,
+        full_count=20,
+    )
+
+    results = run_ingest(tmp_path, data_types=(QuoteTick,), service_active_probe=_never_active)
+
+    catalog = ParquetDataCatalog(str(tmp_path))
+    landed = catalog.query(data_cls=QuoteTick)
+    assert results[0].outcome != "failed"
+    assert {tick.ts_init for tick in landed} == {1_000_000_000 + i for i in range(20)}
+    assert len(landed) == 20
+
+
+def test_a_partial_depth10_slice_then_overlapping_write_does_not_strand_the_range(
+    tmp_path: Path,
+) -> None:
+    """ING-1 production type: OrderBookDepth10 must extend, not strand."""
+    _seed_partial_then_grow(
+        tmp_path,
+        feather_name="order_book_depths_0.feather",
+        data_cls=OrderBookDepth10,
+        factory=_depth10_at,
+        partial_count=5,
+        full_count=20,
+    )
+
+    results = run_ingest(
+        tmp_path, data_types=(OrderBookDepth10,), service_active_probe=_never_active
+    )
+
+    catalog = ParquetDataCatalog(str(tmp_path))
+    landed = catalog.query(data_cls=OrderBookDepth10)
+    assert results[0].outcome != "failed"
+    assert {row.ts_init for row in landed} == {1_000_000_000 + i for i in range(20)}
+    assert len(landed) == 20
+
+
+def test_extending_an_overlapping_slice_does_not_duplicate_already_landed_rows(
+    tmp_path: Path,
+) -> None:
+    """De-dupe is what earns skip_disjoint_check; the partial rows stay once."""
+    _seed_partial_then_grow(
+        tmp_path,
+        feather_name="quote_tick_0.feather",
+        data_cls=QuoteTick,
+        factory=_quote_tick,
+        partial_count=5,
+        full_count=12,
+    )
+
+    run_ingest(tmp_path, data_types=(QuoteTick,), service_active_probe=_never_active)
+    run_ingest(tmp_path, data_types=(QuoteTick,), service_active_probe=_never_active)
+
+    catalog = ParquetDataCatalog(str(tmp_path))
+    landed = catalog.query(data_cls=QuoteTick)
+    stamps = [tick.ts_init for tick in landed]
+    assert sorted(stamps) == [1_000_000_000 + i for i in range(12)]
+    assert len(stamps) == len(set(stamps))
+
+
+def test_a_partial_slice_on_the_per_file_path_does_not_strand_the_range(
+    tmp_path: Path,
+) -> None:
+    """ING-1 via `_convert_one_tick_type_per_file`: an open sibling forces
+    the per-file path; a later overlapping write of the closed file must
+    still land the tail.
+    """
+    _seed_partial_then_grow(
+        tmp_path,
+        feather_name="quote_tick_0.feather",
+        data_cls=QuoteTick,
+        factory=_quote_tick,
+        partial_count=5,
+        full_count=20,
+    )
+    open_path = tmp_path / "live" / _INSTANCE / "trade_tick_0.feather"
+    _write_typed_ipc_stream(open_path, [_trade_tick(i) for i in range(3)], TradeTick, close=False)
+
+    results = run_ingest(
+        tmp_path,
+        data_types=(QuoteTick, TradeTick),
+        service_active_probe=_never_active,
+    )
+
+    catalog = ParquetDataCatalog(str(tmp_path))
+    landed = catalog.query(data_cls=QuoteTick)
+    assert "failed" not in results[0].type_results[0].outcome
+    assert {tick.ts_init for tick in landed} == {1_000_000_000 + i for i in range(20)}
+    assert len(landed) == 20

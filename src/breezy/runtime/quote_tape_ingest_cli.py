@@ -230,6 +230,7 @@ from breezy.runtime.quote_tape_preflight_cli import CATALOG_ENV_VAR
 from breezy.runtime.quote_tape_salvage import (
     _file_belongs_to_data_cls,
     salvage_truncated_instance,
+    write_fresh_capture_rows,
 )
 
 logger = logging.getLogger(__name__)
@@ -558,22 +559,79 @@ def default_convert(
     """The one native call this module exists to schedule and guard.
 
     Instrument definitions take the row-wise path instead; every other type
-    is one ``convert_stream_to_data``, unchanged. ``target`` defaults to
-    ``None``, which is byte-for-byte the pre-existing behaviour (every
-    existing caller, including :func:`ingest_instance`, omits it); passing it
-    writes the converted rows into a SEPARATE catalog instead of ``catalog``
-    itself -- the shape ``_convert_live_capture`` needs to convert a
-    read-only capture into a disposable work catalog without duplicating this
-    function's dispatch logic.
+    is one ``convert_stream_to_data``, unchanged, except the ING-1
+    non-disjoint fallback (:func:`_extend_overlapping_stream`). ``target``
+    defaults to ``None``, which is byte-for-byte the pre-existing behaviour
+    (every existing caller, including :func:`ingest_instance`, omits it);
+    passing it writes the converted rows into a SEPARATE catalog instead of
+    ``catalog`` itself -- the shape ``_convert_live_capture`` needs to convert
+    a read-only capture into a disposable work catalog without duplicating
+    this function's dispatch logic.
     """
     if _is_instrument_definition(data_cls):
         return convert_instrument_definitions(
             catalog, instance_id, data_cls, subdirectory, target=target
         )
-    catalog.convert_stream_to_data(
-        instance_id, data_cls, other_catalog=target, subdirectory=subdirectory
-    )
+    try:
+        catalog.convert_stream_to_data(
+            instance_id, data_cls, other_catalog=target, subdirectory=subdirectory
+        )
+    except ValueError as exc:
+        if not _is_non_disjoint_refusal(exc):
+            raise
+        return _extend_overlapping_stream(
+            catalog, instance_id, data_cls, subdirectory, target=target
+        )
     return CONVERTED
+
+
+def _is_non_disjoint_refusal(exc: BaseException) -> bool:
+    """True when Nautilus refused a write as a non-disjoint interval."""
+    return "non-disjoint" in str(exc)
+
+
+def _extend_overlapping_stream(
+    catalog: ParquetDataCatalog,
+    instance_id: str,
+    data_cls: type,
+    subdirectory: str,
+    *,
+    target: ParquetDataCatalog | None = None,
+) -> str:
+    """ING-1 EXTEND: land only rows the partial slice did not already write.
+
+    Reached when ``convert_stream_to_data`` raises the native non-disjoint
+    refusal. Walks the same feather files the native converter would, one
+    file at a time -- a whole-stream deserialise of a multi-gigabyte live
+    instance would not fit the ingest unit's memory ceiling. Does not
+    delete, does not rewrite an existing filename, and does not restamp
+    ``ts_init``. Empty stream re-raises so a monkeypatched native failure
+    with nothing to extend stays ``failed``.
+    """
+    write_target = catalog if target is None else target
+    streamed_any = False
+    written = 0
+    for feather_file in catalog._list_feather_data_files(
+        kind=subdirectory,
+        instance_id=instance_id,
+        data_cls=data_cls,
+    ):
+        table = catalog._read_feather_file(feather_file.path)
+        if table is None or len(table) == 0:
+            continue
+        objects = list(catalog._handle_table_nautilus(table=table, data_cls=data_cls))
+        if not objects:
+            continue
+        streamed_any = True
+        written += write_fresh_capture_rows(write_target, data_cls, objects)
+    if written:
+        return CONVERTED
+    if streamed_any:
+        return CONVERTED_NOTHING_NEW
+    raise ValueError(
+        f"conversion of {data_cls.__name__} failed: would create non-disjoint "
+        "intervals and the stream had no rows to extend"
+    )
 
 
 def default_service_active_probe(unit: str = DEFAULT_SERVICE_UNIT) -> bool:
@@ -989,14 +1047,32 @@ def _convert_one_tick_type_per_file(
             counts["converted"] = counts.get("converted", 0) + 1
             any_new_conversion = True
         except ValueError as exc:
-            logger.error(
-                "instance %s: conversion of %s file %s failed: %s",
-                instance_id,
-                data_cls.__name__,
-                path,
-                exc,
-            )
-            counts["failed"] = counts.get("failed", 0) + 1
+            if not _is_non_disjoint_refusal(exc):
+                logger.error(
+                    "instance %s: conversion of %s file %s failed: %s",
+                    instance_id,
+                    data_cls.__name__,
+                    path,
+                    exc,
+                )
+                counts["failed"] = counts.get("failed", 0) + 1
+                continue
+            objects = list(catalog._handle_table_nautilus(table=table, data_cls=data_cls))
+            written = write_fresh_capture_rows(catalog, data_cls, objects)
+            if written or objects:
+                _mark_file_converted(instance_dir, path)
+                key = "converted" if written else "converted-nothing-new"
+                counts[key] = counts.get(key, 0) + 1
+                any_new_conversion = any_new_conversion or bool(written)
+            else:
+                logger.error(
+                    "instance %s: conversion of %s file %s failed: %s",
+                    instance_id,
+                    data_cls.__name__,
+                    path,
+                    exc,
+                )
+                counts["failed"] = counts.get("failed", 0) + 1
 
     any_open_seen = bool(cls_open)
     if cls_open:
