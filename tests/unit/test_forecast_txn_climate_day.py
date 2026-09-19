@@ -405,8 +405,15 @@ def test_dst_transition_day_assignment_is_identical_to_a_non_dst_day(
         assert mapped == climate
 
 
-def test_v5_split_cycle_runtime_does_not_change_day_assignment(mapper: ModuleType) -> None:
-    pair = [row for row in FROZEN_FIXTURES if row.phenomenon.startswith("v5_split_")]
+@pytest.mark.parametrize("provenance", ["synthetic", "observed"])
+def test_v5_split_cycle_runtime_does_not_change_day_assignment(
+    mapper: ModuleType, provenance: str
+) -> None:
+    pair = [
+        row
+        for row in FROZEN_FIXTURES
+        if row.phenomenon.startswith("v5_split_") and row.provenance == provenance
+    ]
     assert len(pair) == 2
     days = {_call_row(mapper, row) for row in pair}
     runtimes = {row.runtime_ns for row in pair}
@@ -498,6 +505,10 @@ def test_fixture_table_digest_is_frozen() -> None:
 
 
 def test_a_consumer_refuses_a_none_digest_table(mapper: ModuleType) -> None:
+    """A consumer must still refuse ``None`` (Phase A's un-frozen state) even
+    though ``FROZEN_TABLE_SHA256`` itself is frozen as of Phase B -- this
+    guards a caller that has not yet re-imported the frozen constant, or a
+    future un-freeze, not this module's current value."""
     del mapper
 
     def consume(digest: str | None) -> str:
@@ -506,7 +517,18 @@ def test_a_consumer_refuses_a_none_digest_table(mapper: ModuleType) -> None:
         return digest
 
     with pytest.raises(ValueError, match="None digest"):
-        consume(FROZEN_TABLE_SHA256)
+        consume(None)
+
+
+def test_the_frozen_digest_itself_is_accepted_by_a_none_refusing_consumer() -> None:
+    assert FROZEN_TABLE_SHA256 is not None
+
+    def consume(digest: str | None) -> str:
+        if digest is None:
+            raise ValueError("refusing a None digest table")
+        return digest
+
+    assert consume(FROZEN_TABLE_SHA256) == FROZEN_TABLE_SHA256
 
 
 @pytest.mark.xfail(

@@ -1,9 +1,18 @@
-"""Frozen forecast-side climate-day fixture table (FC-0a-4 Phase A).
+"""Frozen forecast-side climate-day fixture table (FC-0a-4 Phase A + Phase B).
 
-Data only: synthetic rows that pin (icao, runtime, ftime) -> climate_day
-phenomena the parent plan names (MIA bleed, SFO/LAX UTC-cut miss, DST,
-v5-split invariance, 18Z night-MIN refusal). Phase B appends observed
-rows and freezes FROZEN_TABLE_SHA256; until then the digest is None.
+Data only: rows that pin (icao, runtime, ftime) -> climate_day phenomena
+the parent plan names (MIA bleed, SFO/LAX UTC-cut miss, DST, v5-split
+invariance, 18Z night-MIN refusal). Phase A's rows (provenance="synthetic")
+use narrative 2026 dates chosen before any archive check. Phase B appends
+one "observed" row per phenomenon below, each grounded in a REAL NWS CLI
+FINAL record verified present in the on-disk settlement-alignment cache
+(``settlement_alignment_cache.DEFAULT_SETTLEMENT_ALIGNMENT_CACHE_DIR``) -- see
+``docs/evidence/forecast_txn_climate_day_cli_alignment_2026-09-19.md`` for
+the verification run. "observed" never means a real forecast (TXN) value
+was checked -- the fixture table carries no forecast value field at all,
+by design (see ``ForecastDayFixture``) -- it means the row's
+``expected_climate_day`` is a calendar date NWS actually published a CLI
+report for at that station, not an invented future date.
 
 No network. No nautilus_trader. No zoneinfo. Offsets in a row are the
 frozen expected values for that row; the mapper never reads this table.
@@ -67,7 +76,12 @@ FORECAST_VENUE: Final[str] = _VENUE
 
 FROZEN_AT: Final[datetime] = datetime(2026, 9, 18, tzinfo=UTC)
 
-FROZEN_TABLE_SHA256: str | None = None
+#: Frozen at FC-0a-4 Phase B completion, over all 18 rows (9 synthetic +
+#: 9 observed). Recompute via `table_digest(FROZEN_FIXTURES)`; any row
+#: edit must recompute and update this value in the same change.
+FROZEN_TABLE_SHA256: str | None = (
+    "170eead77c0bbe4b1b876f215813932d14c919ac109296820765bce88aca97ee"
+)
 
 # Canonical TXN max-period cycle: runtime 12Z(D), ftime 06Z(D+1).
 # Climate day under P2 is D at every forecast offset; UTC naive of ftime is D+1.
@@ -81,6 +95,16 @@ _JUL16_UTC = date(2026, 7, 16)
 _V5_FTIME = _utc_ns(2024, 12, 3, 6)
 _V5_CLIMATE = date(2024, 12, 2)
 _V5_UTC = date(2024, 12, 3)
+
+# Phase B "observed" anchor: 2024-12-02/03 verified present as real MIA/MDW/
+# SFO/LAX CLI FINAL records (docs/evidence/forecast_txn_climate_day_cli_
+# alignment_2026-09-19.md). Reused across the bleed/v5-split observed rows
+# below so the digest-freezing table cites one measurement, not several.
+_OBS_BLEED_RUNTIME = _utc_ns(2024, 12, 2, 12)
+_OBS_BLEED_FTIME = _utc_ns(2024, 12, 3, 6)
+_OBS_BLEED_CLIMATE = date(2024, 12, 2)
+_OBS_BLEED_UTC = date(2024, 12, 3)
+_OBS_V5_FTIME = _OBS_BLEED_FTIME
 
 FROZEN_FIXTURES: Final[tuple[ForecastDayFixture, ...]] = (
     ForecastDayFixture(
@@ -189,6 +213,120 @@ FROZEN_FIXTURES: Final[tuple[ForecastDayFixture, ...]] = (
         expected_utc_naive_day=date(2026, 7, 15),
         phenomenon="night_min_18z",
         provenance="synthetic",
+        expected_refusal=True,
+    ),
+    # ------------------------------------------------------------------
+    # Phase B: "observed" rows. Each expected_climate_day below is a real
+    # NWS CLI FINAL date, verified present for that station in the on-disk
+    # settlement-alignment cache (2021-01-01..2025-12-31 coverage) -- see
+    # docs/evidence/forecast_txn_climate_day_cli_alignment_2026-09-19.md.
+    # ------------------------------------------------------------------
+    ForecastDayFixture(
+        icao="KMIA",
+        runtime_ns=_OBS_BLEED_RUNTIME,
+        ftime_ns=_OBS_BLEED_FTIME,
+        std_utc_offset_hours=-5.0,
+        model="NBM_NBS",
+        expected_climate_day=_OBS_BLEED_CLIMATE,
+        expected_utc_naive_day=_OBS_BLEED_UTC,
+        phenomenon="mia_period_end_bleed",
+        provenance="observed",
+        expected_refusal=False,
+    ),
+    ForecastDayFixture(
+        icao="KMDW",
+        runtime_ns=_OBS_BLEED_RUNTIME,
+        ftime_ns=_OBS_BLEED_FTIME,
+        std_utc_offset_hours=-6.0,
+        model="NBM_NBS",
+        expected_climate_day=_OBS_BLEED_CLIMATE,
+        expected_utc_naive_day=_OBS_BLEED_UTC,
+        phenomenon="mdw_period_end_bleed",
+        provenance="observed",
+        expected_refusal=False,
+    ),
+    ForecastDayFixture(
+        icao="KSFO",
+        runtime_ns=_OBS_BLEED_RUNTIME,
+        ftime_ns=_OBS_BLEED_FTIME,
+        std_utc_offset_hours=-8.0,
+        model="NBM_NBS",
+        expected_climate_day=_OBS_BLEED_CLIMATE,
+        expected_utc_naive_day=_OBS_BLEED_UTC,
+        phenomenon="sfo_utc_cut_miss",
+        provenance="observed",
+        expected_refusal=False,
+    ),
+    ForecastDayFixture(
+        icao="KLAX",
+        runtime_ns=_OBS_BLEED_RUNTIME,
+        ftime_ns=_OBS_BLEED_FTIME,
+        std_utc_offset_hours=-8.0,
+        model="NBM_NBS",
+        expected_climate_day=_OBS_BLEED_CLIMATE,
+        expected_utc_naive_day=_OBS_BLEED_UTC,
+        phenomenon="lax_utc_cut_miss",
+        provenance="observed",
+        expected_refusal=False,
+    ),
+    ForecastDayFixture(
+        icao="KMIA",
+        runtime_ns=_utc_ns(2022, 3, 13, 12),
+        ftime_ns=_utc_ns(2022, 3, 14, 6),
+        std_utc_offset_hours=-5.0,
+        model="NBM_NBS",
+        expected_climate_day=date(2022, 3, 13),
+        expected_utc_naive_day=date(2022, 3, 14),
+        phenomenon="dst_spring_forward",
+        provenance="observed",
+        expected_refusal=False,
+    ),
+    ForecastDayFixture(
+        icao="KMIA",
+        runtime_ns=_utc_ns(2022, 11, 6, 12),
+        ftime_ns=_utc_ns(2022, 11, 7, 6),
+        std_utc_offset_hours=-5.0,
+        model="NBM_NBS",
+        expected_climate_day=date(2022, 11, 6),
+        expected_utc_naive_day=date(2022, 11, 7),
+        phenomenon="dst_fall_back",
+        provenance="observed",
+        expected_refusal=False,
+    ),
+    ForecastDayFixture(
+        icao="KMIA",
+        runtime_ns=_OBS_BLEED_RUNTIME,
+        ftime_ns=_OBS_V5_FTIME,
+        std_utc_offset_hours=-5.0,
+        model="NBM_NBS",
+        expected_climate_day=_OBS_BLEED_CLIMATE,
+        expected_utc_naive_day=_OBS_BLEED_UTC,
+        phenomenon="v5_split_pre",
+        provenance="observed",
+        expected_refusal=False,
+    ),
+    ForecastDayFixture(
+        icao="KMIA",
+        runtime_ns=_utc_ns(2024, 12, 3, 0),
+        ftime_ns=_OBS_V5_FTIME,
+        std_utc_offset_hours=-5.0,
+        model="NBM_NBS",
+        expected_climate_day=_OBS_BLEED_CLIMATE,
+        expected_utc_naive_day=_OBS_BLEED_UTC,
+        phenomenon="v5_split_post",
+        provenance="observed",
+        expected_refusal=False,
+    ),
+    ForecastDayFixture(
+        icao="KMIA",
+        runtime_ns=_OBS_BLEED_RUNTIME,
+        ftime_ns=_utc_ns(2024, 12, 2, 18),
+        std_utc_offset_hours=-5.0,
+        model="NBM_NBS",
+        expected_climate_day=_OBS_BLEED_CLIMATE,
+        expected_utc_naive_day=_OBS_BLEED_CLIMATE,
+        phenomenon="night_min_18z",
+        provenance="observed",
         expected_refusal=True,
     ),
 )
