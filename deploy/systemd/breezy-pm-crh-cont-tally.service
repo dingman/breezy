@@ -42,11 +42,30 @@ MemoryMax=2G
 UMask=0077
 
 # No EnvironmentFile, deliberately: this unit holds no venue credential --
-# it reads a local parquet directory and writes a local Markdown report.
-# Unlike breezy-pm-crh-v2-tally.service, pm_us_crh_cont does not trip the
-# wrapper's PM_FAMILY-scoped branch (family-tally-v2-run.sh:73, literal
-# "pm_us_crh_v2" only), so no POLYMARKET_US_EXEC_STATE_DB Environment= line
-# is needed here.
+# it reads a local parquet directory, a local sqlite exec-state DB, and
+# writes a local Markdown report. The one line below is a non-secret
+# filesystem path literal, byte-identical to the same line in
+# breezy-pm-crh-v2-tally.service, breezy-score-live-trials.service, and
+# breezy-live-tally.service (I3 BLOCK-1.1).
+#
+# WP-0b (2026-09-19): a prior version of this comment claimed
+# pm_us_crh_cont "does not trip" the wrapper's
+# POLYMARKET_US_EXEC_STATE_DB requirement because it never trips the
+# wrapper's PM_FAMILY-scoped structural-pin-guard branch (still true,
+# family-tally-v2-run.sh:73, literal "pm_us_crh_v2" only). That claim was
+# WRONG about the DIFFERENT, SD-1/L-38-generalised branch a few lines
+# further down the wrapper (~line 213): ANY family whose OWN manifest
+# declares status=REGISTERED and venue=polymarket_us --
+# pm_us_crh_cont included (deploy/families/pm_us_crh_cont.json) -- reaches
+# `STATE_DB="${POLYMARKET_US_EXEC_STATE_DB:?POLYMARKET_US_EXEC_STATE_DB is
+# required}"` and refuses to run without this line. Without it, this
+# unit's nightly SURVIVE/KILL/CONTINUE tally could never produce a
+# verdict for the LIVE family -- a stop that cannot fire is MISSING, not
+# merely failing. See tests/unit/test_family_tally_v2_deploy.py::
+# test_every_tally_unit_carries_every_env_var_its_family_requires, which
+# derives the requirement from the wrapper itself so this cannot silently
+# drift stale again.
+Environment=POLYMARKET_US_EXEC_STATE_DB=/home/jon/.local/share/breezy/state/exec_polymarket_us.sqlite
 
 ExecStart=/home/jon/breezy/deploy/systemd/family-tally-v2-run.sh pm_us_crh_cont
 
