@@ -11,13 +11,25 @@ from breezy.strategy.current_rung_hold.decision import is_legal_cell
 from breezy.strategy.ladder_ev.config import LadderEvConfig
 from breezy.strategy.weather_common.running_extreme import RunningMax
 
-__all__ = ["ExclusionInputs", "exclusion_filter", "forecast_side_is_legal"]
+__all__ = [
+    "ExclusionInputs",
+    "ForecastRungRelation",
+    "exclusion_filter",
+    "forecast_side_is_legal",
+]
 
 RungBounds = tuple[int | None, int | None]
 
 _CHEAP_OPEN_ASK = 0.05
 _POST_PEAK_P_MAX = 0.05
-_FORECAST_LIVE_RELATIONS: Final[frozenset[str]] = frozenset(
+
+# Scan-time rung/forecast relation (includes the coarse class ``above``).
+# Distinct from ``FORECAST_OUTCOME_ALPHABET`` (settled-outcome labels), which
+# has no bare ``above`` — ``above1``/``above2``/``above3+`` are the outcomes.
+ForecastRungRelation = Literal[
+    "below", "contains", "above", "above1", "above2", "above3+"
+]
+_FORECAST_RUNG_RELATIONS: Final[frozenset[ForecastRungRelation]] = frozenset(
     {"contains", "above", "above1", "above2", "above3+"}
 )
 
@@ -120,8 +132,8 @@ def exclusion_filter(inputs: ExclusionInputs, cfg: LadderEvConfig) -> tuple[bool
 
 def forecast_side_is_legal(
     *,
-    side: str,
-    r_relation: str,
+    side: Literal["yes", "no"],
+    r_relation: ForecastRungRelation,
     width_code: int,
     m_code: int,
 ) -> bool:
@@ -133,7 +145,7 @@ def forecast_side_is_legal(
     NO: ``r_relation`` in {contains, above*}; ``below`` is ``rung_physically_dead``
     on both legs (L-9 / L-44).
     """
-    if r_relation not in _FORECAST_LIVE_RELATIONS:
+    if r_relation not in _FORECAST_RUNG_RELATIONS:
         return False
     if side == "no":
         return True

@@ -74,6 +74,29 @@ def test_on_disk_build_flag_is_explicit() -> None:
     assert ON_DISK_BUILD_RAN is False
 
 
+def test_density_cell_bounds_are_non_optional() -> None:
+    """Degraded 6-rung cells keep a structurally non-null Wilson interval."""
+    from typing import get_type_hints
+
+    from breezy.strategy.ladder_ev.density_table import DensityCell
+
+    hints = get_type_hints(DensityCell)
+    assert hints["p_lower"] is float
+    assert hints["p_upper"] is float
+
+
+def test_forecast_density_cell_bounds_are_nullable() -> None:
+    from typing import get_args, get_type_hints
+
+    from breezy.strategy.ladder_ev.density_table import ForecastDensityCell
+
+    hints = get_type_hints(ForecastDensityCell)
+    assert type(None) in get_args(hints["p_lower"])
+    assert type(None) in get_args(hints["p_upper"])
+    assert float in get_args(hints["p_lower"])
+    assert float in get_args(hints["p_upper"])
+
+
 def test_forecast_density_key_uses_the_closed_outcome_alphabet() -> None:
     from breezy.strategy.ladder_ev.density_table import (
         FORECAST_OUTCOME_ALPHABET,

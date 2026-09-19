@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import replace
 from datetime import date
+from typing import get_args
 
 from breezy.strategy.ladder_ev.config import LadderEvConfig
 from breezy.strategy.ladder_ev.decision import ExclusionInputs, exclusion_filter
@@ -262,7 +263,17 @@ def test_entry_window_reads_from_config_not_module_constants() -> None:
 
 
 def test_forecast_side_legality_replaces_x8_and_admits_negative_m_code() -> None:
-    from breezy.strategy.ladder_ev.decision import forecast_side_is_legal
+    from breezy.strategy.ladder_ev.decision import (
+        ForecastRungRelation,
+        forecast_side_is_legal,
+    )
+    from breezy.strategy.ladder_ev.density_table import FORECAST_OUTCOME_ALPHABET
+
+    # Two vocabularies: scan-time rung relation vs settled-outcome alphabet.
+    # Bare "above" is a relation, never an outcome label.
+    assert "above" in get_args(ForecastRungRelation)
+    assert "above" not in FORECAST_OUTCOME_ALPHABET
+    assert set(FORECAST_OUTCOME_ALPHABET) <= set(get_args(ForecastRungRelation))
 
     # Forecast-implied interior above R(t) has m_code < 0 and dies at X8.
     assert forecast_side_is_legal(

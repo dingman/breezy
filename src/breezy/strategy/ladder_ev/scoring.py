@@ -1,4 +1,11 @@
-"""Unified cost, EV, margin, ranking, Kelly (spec §4–§7)."""
+"""Unified cost, EV, margin, ranking, Kelly (spec §4–§7).
+
+``ev_net_no``'s ``cost`` MUST be a :class:`DepthAwareTradeCost` built from
+the inverted YES-book BID ladder (:func:`bid_levels_from_book`), never from
+YES asks. The fee term is symmetric and would hide a YES-ask pairing;
+``top_of_book_price`` would not. WP-14 wires that pairing; this module does
+not.
+"""
 
 from __future__ import annotations
 
@@ -67,6 +74,9 @@ def ev_net_no(p_upper: float, cost: DepthAwareTradeCost) -> float | None:
     that flag from ``side`` — False is a short-YES edge and returns None
     without ``bid_p`` (``risk.py:732-751``). Venue NO is SELL / BUY_SHORT
     of YES; this path still buys the NO instrument long.
+
+    ``cost`` must come from the bid side (see module docstring). WP-10 does
+    not enforce that pairing.
     """
     return edge_after_costs(
         model_p=1.0 - p_upper,

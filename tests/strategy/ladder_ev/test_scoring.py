@@ -108,15 +108,8 @@ def test_ranking_prefers_absolute_ev_net_over_roi_and_applies_city_day_cap() -> 
 
 def test_no_side_ev_uses_one_minus_p_upper_with_intent_long_yes_true() -> None:
     """E2: a NO buy is a LONG of the NO leg, never a short-YES (L-44)."""
-    import inspect
-
-    from breezy.strategy.ladder_ev import scoring as scoring_mod
     from breezy.strategy.ladder_ev.scoring import ev_net_no
-
-    source = inspect.getsource(scoring_mod)
-    assert 'intent_long_yes=(side == "yes")' not in source
-    assert "intent_long_yes=(side==\"yes\")" not in source
-    assert "intent_long_yes=(side == 'yes')" not in source
+    from breezy.strategy.weather_common.risk import edge_after_costs
 
     cost = depth_aware_trade_cost_prob(
         ask_levels=_THREE_LEVEL_LADDER,
@@ -128,12 +121,24 @@ def test_no_side_ev_uses_one_minus_p_upper_with_intent_long_yes_true() -> None:
     p_upper = 0.80
     net = ev_net_no(p_upper, cost)
     assert net is not None
+    # Identity: NO long = YES-long EV of the complementary probability.
+    assert net == pytest.approx(ev_net(1.0 - p_upper, cost), abs=1e-12)
     assert net == pytest.approx((1.0 - p_upper) - unified_cost(cost), abs=1e-12)
-    # Anti-conservative 1-p_lower and short-YES (intent_long_yes=False, no bid)
-    # must not be the path this function took.
+    # Wrong tail: feeding p_upper as if it were p_lower (1-p_lower anti-conservative).
     yes_shaped = ev_net(p_upper, cost)
     assert yes_shaped is not None
     assert net != pytest.approx(yes_shaped, abs=1e-12)
+    # Short-YES (intent_long_yes=False) without bid_p is None — that is not this path.
+    assert (
+        edge_after_costs(
+            model_p=1.0 - p_upper,
+            bid_p=None,
+            ask_p=cost.top_of_book_price,
+            intent_long_yes=False,
+            cost=cost.total_prob,
+        )
+        is None
+    )
     no_row = _row(side="no", p_lower=0.10)
     assert no_row.side == "no"
 

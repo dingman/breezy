@@ -30,7 +30,7 @@ from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 from math import sqrt
 from pathlib import Path
-from typing import Final
+from typing import Final, Protocol
 
 __all__ = [
     "CORPUS_SHA256",
@@ -42,6 +42,7 @@ __all__ = [
     "DensityRecord",
     "DensityTable",
     "ForecastCorpusPinMismatchError",
+    "ForecastDensityCell",
     "ForecastDensityKey",
     "ForecastDensityRecord",
     "ForecastDensityTable",
@@ -108,22 +109,44 @@ class ForecastDensityRecord:
 
 @dataclass(frozen=True, slots=True)
 class DensityCell:
-    """``p_hat``, Wilson-95% bounds, and cell count for one outcome of a key.
+    """6-rung DEGRADED cell. Wilson bounds are structurally non-null.
 
-    ``p_lower`` / ``p_upper`` are ``None`` below ``n_min_cell`` in forecast mode
-    (never the degenerate Wilson-at-n=0 zero). YES uses ``p_lower``; NO uses
-    ``1 - p_upper``.
+    ``_wilson_lower`` / ``_wilson_upper`` are total (0.0 / 1.0 at n=0), and
+    ``build_density_table`` always calls both, so ``p_lower`` and ``p_upper``
+    are plain ``float``. Forecast-mode nulling-below-``n_min_cell`` lives on
+    :class:`ForecastDensityCell`, not here.
+    """
+
+    p_hat: float
+    p_lower: float
+    n_cell: int
+    k_r: int
+    p_upper: float
+
+
+@dataclass(frozen=True, slots=True)
+class ForecastDensityCell:
+    """Forecast-mode cell. Bounds are ``None`` below ``n_min_cell``.
+
+    YES uses ``p_lower``; NO uses ``1 - p_upper``. Never the degenerate
+    Wilson-at-n=0 zero.
     """
 
     p_hat: float
     p_lower: float | None
     n_cell: int
     k_r: int
-    p_upper: float | None = None
+    p_upper: float | None
+
+
+class _PartitionCell(Protocol):
+    """Anything ``partition_check`` can sum — both cell types satisfy this."""
+
+    p_hat: float
 
 
 DensityTable = dict[DensityKey, dict[str, DensityCell]]
-ForecastDensityTable = dict[ForecastDensityKey, dict[str, DensityCell]]
+ForecastDensityTable = dict[ForecastDensityKey, dict[str, ForecastDensityCell]]
 
 
 def _wilson_lower(successes: int, total: int, *, z: float = _Z_95) -> float:
@@ -199,7 +222,7 @@ def build_forecast_density_table(
         n_cell = sum(per_outcome.values())
         powered = n_cell >= n_min_cell
         table[key] = {
-            outcome: DensityCell(
+            outcome: ForecastDensityCell(
                 p_hat=(per_outcome[outcome] / n_cell) if n_cell else 0.0,
                 p_lower=_wilson_lower(per_outcome[outcome], n_cell) if powered else None,
                 n_cell=n_cell,
@@ -255,7 +278,7 @@ def load_forecast_density_table(
     return build_forecast_density_table(records, n_min_cell=n_min_cell)
 
 
-def partition_check[K](table: Mapping[K, Mapping[str, DensityCell]]) -> None:
+def partition_check[K](table: Mapping[K, Mapping[str, _PartitionCell]]) -> None:
     """Assert ``Σ_r p_hat = 1`` per key within ``1e-9``."""
     for key, cells in table.items():
         total = sum(cell.p_hat for cell in cells.values())

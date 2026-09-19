@@ -11,6 +11,7 @@ from breezy.strategy.ladder_ev.config import (
 )
 from breezy.strategy.ladder_ev.decision import (
     ExclusionInputs,
+    ForecastRungRelation,
     exclusion_filter,
     forecast_side_is_legal,
 )
@@ -21,6 +22,7 @@ from breezy.strategy.ladder_ev.density_table import (
     RUNG_IDS,
     DensityCell,
     DensityRecord,
+    ForecastDensityCell,
     ForecastDensityRecord,
     build_density_table,
     build_forecast_density_table,
@@ -50,7 +52,9 @@ __all__ = [
     "DensityRecord",
     "ExclusionInputs",
     "ForecastCorpusPinMismatchError",
+    "ForecastDensityCell",
     "ForecastDensityRecord",
+    "ForecastRungRelation",
     "ForecastState",
     "ForecastTxnSnapshot",
     "LadderEvConfig",
