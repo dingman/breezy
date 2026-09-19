@@ -1,0 +1,17 @@
+{
+  "body_bytes": 5067326,
+  "content_type": "text/plain; charset=UTF-8",
+  "csv_header_line": "runtime,ftime,model,tmp,dpt,wdr,wsp,p06,p12,q06,q12,t06_1,t06_2,t12_1,t12_2,cig,vis,sky,gst,t03,pzr,psn,ppl,pra,s06,slv,i06,lcb,swh,station,dur,mht,twd,tws,hid,sol,txn,xnd,tsd,dsd,ssd,gsd,ifc,ifv,wsd",
+  "distinct_runtime_days": 365,
+  "finding": null,
+  "first_runtime": "2022-01-01 01:00:00",
+  "label": "nbs_kmia_2022",
+  "last_runtime": "2022-12-31 19:00:00",
+  "outcome": "ok",
+  "row_count": 33534,
+  "sample_row_1": "2022-01-01 01:00:00,2022-01-01 06:00:00,NBS,73,68,120,4,,,,,2.0,,,,-88,100,12,10,0,0,0,0,100,,91,,12,2.0,KMIA,,8,13,6,,0,,,1,1,10,1,0,0,1",
+  "sample_row_2": "2022-01-01 01:00:00,2022-01-01 09:00:00,NBS,72,68,130,3,,,,,,,,,-88,100,12,9,1,0,0,0,100,,90,,23,2.0,KMIA,,7,14,3,,0,,,1,1,16,2,0,2,1",
+  "sha256": "4e8aa89814c5541dadba1641e1b25902fe88d27a80fe80869a00a6686487526a",
+  "status": 200,
+  "url": "https://mesonet.agron.iastate.edu/cgi-bin/request/mos.py?station=KMIA&model=NBS&format=csv&sts=2022-01-01T00%3A00Z&ets=2022-12-31T23%3A59Z"
+}

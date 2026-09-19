@@ -1,0 +1,17 @@
+{
+  "body_bytes": 3186760,
+  "content_type": "text/plain; charset=UTF-8",
+  "csv_header_line": "runtime,ftime,model,n_x,tmp,dpt,cld,wdr,wsp,p06,p12,q06,q12,t06_1,t06_2,t12_1,t12_2,snw,cig,vis,obv,poz,pos,typ,station,t06,t12",
+  "distinct_runtime_days": 365,
+  "finding": null,
+  "first_runtime": "2021-01-01 00:00:00",
+  "label": "gfs_kmdw_2021",
+  "last_runtime": "2021-12-31 18:00:00",
+  "outcome": "ok",
+  "row_count": 30639,
+  "sample_row_1": "2021-01-01 00:00:00,2021-01-01 06:00:00,GFS,,26,19,FW,100,4,,,,,0.0,,,,,8,7,N ,2.0,81.0,S ,KMDW,,",
+  "sample_row_2": "2021-01-01 00:00:00,2021-01-01 09:00:00,GFS,,26,20,FW,80,5,,,,,,,,,,8,7,N ,3.0,74.0,S ,KMDW,,",
+  "sha256": "a7a269a86218f6aa0f92f3f26f972386c47b66d227d54a132331c6835b46b47c",
+  "status": 200,
+  "url": "https://mesonet.agron.iastate.edu/cgi-bin/request/mos.py?station=KMDW&model=GFS&format=csv&sts=2021-01-01T00%3A00Z&ets=2021-12-31T23%3A59Z"
+}

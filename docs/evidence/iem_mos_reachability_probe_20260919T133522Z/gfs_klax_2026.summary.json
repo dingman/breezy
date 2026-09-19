@@ -1,0 +1,17 @@
+{
+  "body_bytes": 2222625,
+  "content_type": "text/plain; charset=UTF-8",
+  "csv_header_line": "runtime,ftime,model,n_x,tmp,dpt,cld,wdr,wsp,p06,p12,q06,q12,t06_1,t06_2,t12_1,t12_2,cig,vis,obv,poz,pos,typ,station,t06,t12",
+  "distinct_runtime_days": 262,
+  "finding": null,
+  "first_runtime": "2026-01-01 00:00:00",
+  "label": "gfs_klax_2026",
+  "last_runtime": "2026-09-19 06:00:00",
+  "outcome": "ok",
+  "row_count": 21966,
+  "sample_row_1": "2026-01-01 00:00:00,2026-01-01 06:00:00,GFS,,58,56,OV,50,10,,,,,0.0,,,,5,6,N ,0.0,0.0,R ,KLAX,,",
+  "sample_row_2": "2026-01-01 00:00:00,2026-01-01 09:00:00,GFS,,57,55,OV,90,8,,,,,,,,,4,5,BR,1.0,0.0,R ,KLAX,,",
+  "sha256": "adb716aa29378a5517db2dd0060887ab109751ffe07ce07943766a79433c8c9b",
+  "status": 200,
+  "url": "https://mesonet.agron.iastate.edu/cgi-bin/request/mos.py?station=KLAX&model=GFS&format=csv&sts=2026-01-01T00%3A00Z&ets=2026-09-19T13%3A35Z"
+}
