@@ -45,8 +45,7 @@ from breezy.strategy.current_rung_hold.composition import (
     build_continuous_rung_hold_strategies,
     build_current_rung_hold_strategies,
     family_halt_submit_veto,
-    phase0_family_permits,
-    phase1_family_permits,
+    phase1_sending_permit,
     resolve_station_instrument_ids,
     strategy_component_id,
 )
@@ -559,6 +558,9 @@ def _placeholder_manifest(*, family_id: str, exit_rule: str | None) -> FamilyMan
         d0_climate_day="2026-09-01",
         boundary_artefact_path=Path("deploy/families/placeholder.json"),
         boundary_inputs_sha256=zero_sha,
+        composition_kind="continuous_rung_hold",
+        density_artefact_path=Path("deploy/families/artefacts/not_applicable_density.json"),
+        density_artefact_sha256="247f636350685b38966251703c47d10531913367fbcca175b086a2c298421a65",
         stations=("SFO",),
         status="REGISTERED",
         manifest_sha256=zero_sha,
@@ -743,56 +745,52 @@ def test_continuous_builder_refuses_a_non_none_permit(tmp_path: Path) -> None:
         )
 
 
-def test_no_flag_combination_mints_two_sending_families() -> None:
+def test_no_sending_family_id_ever_yields_a_permit_without_one() -> None:
+    """WP-11b: cardinality-1 is now STRUCTURAL -- ``phase1_sending_permit``
+    returns a single ``OrderSubmissionPermit | None``, so there is no shape
+    in which it could mint two. A blank ``sending_family_id`` is refused
+    outright (a caller bug, never reachable from ``app/trade.py::run``,
+    which only calls this once a sending family is confirmed set)."""
     fake_permit = object()
-    for current in (False, True):
-        for cont in (False, True):
-            for permit in (None, fake_permit):
-                v2, v3 = phase0_family_permits(
-                    current_rung_hold=current,
-                    continuous_rung_hold=cont,
+    for phase0_shadow in (False, True):
+        for permit in (None, fake_permit):
+            with pytest.raises(SettingsError):
+                phase1_sending_permit(
+                    sending_family_id="",
                     permit=permit,  # type: ignore[arg-type]
+                    phase0_shadow=phase0_shadow,
                 )
-                assert v3 is None
-                if current and permit is not None:
-                    assert v2 is permit
-                else:
-                    assert v2 is None
-                assert not (v2 is not None and v3 is not None)
 
 
 # ---------------------------------------------------------------------------
-# F3/F4 (plan rev 6.1, Phase 1): phase1_family_permits gives the single
-# sending family's permit to whichever family is on -- v3 (continuous_rung_
-# hold) MAY hold it here, unlike phase0_family_permits (kept, unchanged,
-# above). Both families on together is refused (SettingsError) unless the
-# Phase 0 shadow flag is threaded in, matching phase0_family_permits exactly.
+# F3/F4 (plan rev 6.1, Phase 1; folded forward by WP-11b): phase1_sending_
+# permit routes the ONE sending family's permit -- ``phase0_shadow=True``
+# folds forward the retired ``phase0_family_permits``'s behaviour (composed,
+# but the permit is deliberately withheld).
 # ---------------------------------------------------------------------------
 
 
 @dataclass(frozen=True, slots=True)
 class _PermitRoutingSettings:
     """The narrow ``SettingsLike`` surface ``OrderSubmissionPermit.issue``
-    needs, with ``current_rung_hold``/``continuous_rung_hold`` varied per
-    combo under test."""
+    needs, with ``sending_family_id`` varied per combo under test."""
 
-    current_rung_hold: bool
-    continuous_rung_hold: bool
+    sending_family_id: str | None
     orders_enabled_requested: bool = True
     live_observations: bool = True
 
 
 def _mint_real_permit(
-    monkeypatch: pytest.MonkeyPatch, *, current: bool, continuous: bool
+    monkeypatch: pytest.MonkeyPatch, *, sending_family_id: str | None
 ) -> OrderSubmissionPermit:
-    """Mint a genuine, sealed ``OrderSubmissionPermit`` for the given family
-    combo -- F4 requires a real permit object, not a fake, so
-    ``phase1_family_permits`` is exercised against the same construction
+    """Mint a genuine, sealed ``OrderSubmissionPermit`` for the given
+    sending family -- F4 requires a real permit object, not a fake, so
+    ``phase1_sending_permit`` is exercised against the same construction
     path production uses."""
     enable_operator_gate(monkeypatch)
     clock = clock_at()
     live_permit = issue_live_trading_permit(clock=clock)
-    settings = _PermitRoutingSettings(current_rung_hold=current, continuous_rung_hold=continuous)
+    settings = _PermitRoutingSettings(sending_family_id=sending_family_id)
     with (
         operator_control_env(MAX_DAILY_BUDGET_USD_ENV_VAR, "1000.00"),
         operator_control_env(MAX_POSITION_COST_USD_ENV_VAR, "10.00"),
@@ -803,58 +801,22 @@ def _mint_real_permit(
 
 
 @pytest.mark.parametrize("shadow", (False, True))
-@pytest.mark.parametrize("continuous", (False, True))
-@pytest.mark.parametrize("current", (False, True))
-def test_phase1_family_permits_all_combos_with_a_real_permit(
-    current: bool,
-    continuous: bool,
+def test_phase1_sending_permit_routes_the_real_permit_or_withholds_it_under_shadow(
     shadow: bool,
     monkeypatch: pytest.MonkeyPatch,
     write_canonical_verified: None,  # noqa: F811
 ) -> None:
-    if not (current or continuous):
-        # No family on: no permit is ever minted in production for this
-        # combo (issue() itself refuses it); the routing function alone must
-        # still resolve to no holder for a None permit.
-        v2, v3 = phase1_family_permits(
-            current_rung_hold=current,
-            continuous_rung_hold=continuous,
-            permit=None,
-            phase0_shadow=shadow,
-        )
-        assert v2 is None
-        assert v3 is None
-        return
+    permit = _mint_real_permit(monkeypatch, sending_family_id="pm_us_crh_cont")
 
-    permit = _mint_real_permit(monkeypatch, current=current, continuous=continuous)
-
-    if current and continuous and not shadow:
-        with pytest.raises(SettingsError):
-            phase1_family_permits(
-                current_rung_hold=current,
-                continuous_rung_hold=continuous,
-                permit=permit,
-                phase0_shadow=shadow,
-            )
-        return
-
-    v2, v3 = phase1_family_permits(
-        current_rung_hold=current,
-        continuous_rung_hold=continuous,
+    routed = phase1_sending_permit(
+        sending_family_id="pm_us_crh_cont",
         permit=permit,
         phase0_shadow=shadow,
     )
-    holders = [p for p in (v2, v3) if p is not None]
-    assert len(holders) <= 1, "at most one family may hold the permit"
     if shadow:
-        assert v3 is None
-        assert v2 is (permit if current else None)
-    elif continuous:
-        assert v3 is permit
-        assert v2 is None
+        assert routed is None
     else:
-        assert v2 is permit
-        assert v3 is None
+        assert routed is permit
 
 
 def test_continuous_only_phase1_builds_strategies_holding_the_real_permit(
@@ -862,14 +824,12 @@ def test_continuous_only_phase1_builds_strategies_holding_the_real_permit(
     monkeypatch: pytest.MonkeyPatch,
     write_canonical_verified: None,  # noqa: F811
 ) -> None:
-    """End-to-end F3 wiring: continuous-only, no shadow -- the single
-    sending family's permit is routed to v3, `build_continuous_rung_hold_
-    strategies` is called with `phase0_permit_guard=(v3 is None)` exactly as
-    `app/trade.py::run` does, and every constructed station strategy holds
-    the SAME real permit object. v2 is never composed for this combo (there
-    is no `current_rung_hold` flag on, so `app/trade.py::run` never calls
-    `build_current_rung_hold_strategies` at all -- asserted here by never
-    calling it)."""
+    """End-to-end F3 wiring (folded forward by WP-11b): no-shadow -- the
+    single sending family's permit is routed through ``phase1_sending_
+    permit``, ``build_continuous_rung_hold_strategies`` is called with
+    ``phase0_permit_guard=(routed is None)`` exactly as ``app/trade.py::run``
+    does, and every constructed station strategy holds the SAME real permit
+    object."""
     _write(
         tmp_path,
         [
@@ -877,23 +837,21 @@ def test_continuous_only_phase1_builds_strategies_holding_the_real_permit(
             _binary("tc-temp-laxhigh-2026-09-04-gte70lt71f", info=_known(station="LAX", day=_DAY)),
         ],
     )
-    permit = _mint_real_permit(monkeypatch, current=False, continuous=True)
+    permit = _mint_real_permit(monkeypatch, sending_family_id="pm_us_crh_cont")
 
-    v2, v3 = phase1_family_permits(
-        current_rung_hold=False,
-        continuous_rung_hold=True,
+    routed = phase1_sending_permit(
+        sending_family_id="pm_us_crh_cont",
         permit=permit,
         phase0_shadow=False,
     )
-    assert v2 is None
-    assert v3 is permit
+    assert routed is permit
 
     strategies = build_continuous_rung_hold_strategies(
         catalog_root=tmp_path,
         today_by_station=_TODAY,
         trial_day_latch_factory=_unused_latch_factory,
-        order_submission_permit=v3,
-        phase0_permit_guard=v3 is None,
+        order_submission_permit=routed,
+        phase0_permit_guard=routed is None,
     )
     assert len(strategies) == 2
     for strategy in strategies:

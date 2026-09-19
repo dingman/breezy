@@ -67,6 +67,11 @@ def _registered_manifest_fixture(tmp_path: Path, *, d0: str, stations: list[str]
         "d0_climate_day": d0,
         "boundary_artefact_path": "deploy/families/gs_boundary_test_fixture.json",
         "boundary_inputs_sha256": "1" * 64,
+        "composition_kind": "current_rung_hold",
+        "density_artefact_path": "deploy/families/artefacts/not_applicable_density.json",
+        "density_artefact_sha256": (
+            "247f636350685b38966251703c47d10531913367fbcca175b086a2c298421a65"
+        ),
         "stations": stations,
         "status": "REGISTERED",
     }
@@ -83,6 +88,9 @@ def _draft_manifest_fixture(tmp_path: Path) -> Path:
         "d0_climate_day": "2026-09-05",
         "boundary_artefact_path": "deploy/families/gs_boundary_test_fixture.json",
         "boundary_inputs_sha256": "0" * 64,
+        "composition_kind": "current_rung_hold",
+        "density_artefact_path": "deploy/families/artefacts/not_applicable_density.json",
+        "density_artefact_sha256": "0" * 64,
         "stations": ["LAX"],
         "status": "DRAFT_NOT_REGISTERED",
     }

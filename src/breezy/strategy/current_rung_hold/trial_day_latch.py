@@ -276,6 +276,17 @@ def _cell_probability(be: Decimal, side: str) -> Decimal:
 #: Slice 4 item B1 (plan rev 6.1): v3-only, family-wide keys -- literal
 #: strings, NOT derived from a `TrialDayLatch`'s own `_key_prefix` (v2 never
 #: writes either of these; there is exactly one continuous-rung-hold family).
+#:
+#: WP-11b (active-family registry, cardinality-1, 2026-09-19): this key is
+#: scoped by COMPOSITION KIND (every ``continuous_rung_hold`` family opens
+#: its latch with `CONTINUOUS_TRIAL_KEY_PREFIX`, a fixed constant), never by
+#: the manifest's own `family_id` -- under cardinality-1 at most one family
+#: is ever the continuous-kind sender, so "halted" stays GLOBAL-equivalent
+#: to "this node's only sender is halted" (F6) no matter which literal
+#: family id currently occupies that slot. `trade_supervisor_core.
+#: continuous_family_halt_key(sending_family_id)` duplicates this literal
+#: (runtime must not import strategy) and is pinned against it byte-for-byte
+#: in `tests/unit/test_trade_supervisor_cont_self_check.py`.
 DUPLICATE_FILL_KEY_PREFIX: Final[str] = "continuous_rung_hold/duplicate_fill/"
 FAMILY_HALT_KEY: Final[str] = "continuous_rung_hold/halt"
 #: Audit trail for `breezy-clear-family-halt` (build-side clear only -- there

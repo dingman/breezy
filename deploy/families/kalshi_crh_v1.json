@@ -5,6 +5,9 @@
   "d0_climate_day": "2099-01-01",
   "boundary_artefact_path": "deploy/families/gs_boundary_kalshi_crh_v1.json",
   "boundary_inputs_sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+  "composition_kind": "current_rung_hold",
+  "density_artefact_path": "deploy/families/artefacts/not_applicable_density.json",
+  "density_artefact_sha256": "0000000000000000000000000000000000000000000000000000000000000000",
   "stations": [
     "LAX",
     "MDW",

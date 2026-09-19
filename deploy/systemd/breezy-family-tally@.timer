@@ -1,0 +1,38 @@
+[Unit]
+Description=Daily trigger for the Breezy family tally (PREREG v2/v3) -- %i
+Documentation=file:///home/jon/breezy/deploy/systemd/README.md
+Documentation=file:///home/jon/breezy/scripts/analysis/family_tally_v2.py
+
+[Timer]
+Unit=breezy-family-tally@%i.service
+
+# 17:20 UTC -- after supervisor LAUNCH_UTC (16:50) and SELF_CHECK_WINDOW_END
+# (17:10). WP-11b replaces the two former per-family ticks (17:15
+# pm_us_crh_v2, 17:25 pm_us_crh_cont) with ONE shared tick on the shared
+# template: cardinality-1 means at most one family is ever the LIVE sender,
+# so at most one instance of this template runs against a REGISTERED
+# polymarket_us family with real exec-state at any given boot; any other
+# REGISTERED family enabled here for learning-ledger purposes only is a
+# low-volume local parquet/sqlite job, not a resource-contention risk at
+# the same minute (MemoryHigh=1G/MemoryMax=2G per instance, well under the
+# host).
+# Unique as an hour:minute tick (ingest already owns :15 at 00/06/12/18,
+# score-live-trials owns 14:15, live-tally owns 14:30).
+# Occupied elsewhere: 09:00 rotate, 13:30 mb-daily, 14:15 score-live-trials,
+# 14:30 live-tally, 22:30 k1-daily, 22:45 offer-gate-daily.
+# Persistent=true boot catch-up before 16:50 exits 1 with no report --
+# accepted (the structural pin is not READY before launch).
+# No two Breezy timers ever fire in the same hour:minute tick
+# (tests/unit/test_deploy_timer_hours.py). UTC is stated explicitly (this
+# host's clock is UTC) so the schedule cannot move if the host timezone is
+# ever changed.
+OnCalendar=*-*-* 17:20:00 UTC
+
+# A run missed because the host was down fires as soon as the timer is
+# next active, instead of being silently skipped until the following day.
+Persistent=true
+
+AccuracySec=1min
+
+[Install]
+WantedBy=timers.target

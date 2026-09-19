@@ -1661,6 +1661,47 @@ class TestRunForeverWiredLoop:
         assert spawner.calls == []
         assert clock.current < _utc(16, 40)
 
+    def test_idle_tick_reaps_a_retained_zombie_before_the_60s_sleep(self, tmp_path):
+        """WP-0a residual (module docstring of ``_run_forever``'s
+        ``Phase.NONE`` branch): a child SIGTERM'd at STOP_PRIOR could
+        previously sit ``<defunct>`` until the NEXT DAY's RELAUNCH_CHECK,
+        because nothing called ``_reap_spawned_children()`` during an idle
+        ``Phase.NONE`` tick. This test reuses the real WP-0a
+        zombie-producing fixture (``_wait_for_zombie`` /
+        ``_retain_spawned_child`` / ``_read_proc_stat_state``, the same
+        ones ``test_a_retained_zombie_is_reaped_when_another_pid_is_probed``
+        uses) rather than a fake, so it proves the ACTUAL OS-level zombie
+        is gone, not just that some mock was called.
+
+        03:00Z is the same idle window ``test_no_fire_before_1640_after_a_
+        0300_start`` uses -- ``next_due`` returns ``Phase.NONE`` on every
+        tick until 16:40Z, so every one of the bounded iterations below
+        takes the idle branch."""
+        from breezy.runtime.trade_supervisor import _retain_spawned_child
+
+        proc = subprocess.Popen(
+            [sys.executable, "-c", "import os; os._exit(0)"],
+            start_new_session=True,
+        )
+        try:
+            _wait_for_zombie(proc.pid)
+            assert _read_proc_stat_state(proc.pid) == "Z"
+            _retain_spawned_child(proc)
+
+            clock = FakeClock(_utc(3, 0, 0))
+            ports = _make_ports()
+            # Two idle iterations is enough: the reap call precedes the
+            # bounded sleep on every Phase.NONE tick, including the first.
+            self._run(clock=clock, ports=ports, max_iterations=2, tmp_path=tmp_path)
+
+            assert _read_proc_stat_state(proc.pid) is None
+            assert clock.current < _utc(16, 40)
+        finally:
+            try:
+                os.waitpid(proc.pid, os.WNOHANG)
+            except ChildProcessError:
+                pass
+
     def test_adoption_at_1640_after_a_0300_start(self, tmp_path):
         clock = FakeClock(_utc(3, 0, 0))
         terminate_calls: list[int] = []

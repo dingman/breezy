@@ -681,7 +681,11 @@ _A20_SCOPE: Final[frozenset[str]] = frozenset(
 _A20_MOVED_MARKER: Final[str] = "MOVED 2026-09-12"
 _A20_RESIDUAL: Final[frozenset[str]] = frozenset(
     {
-        "breezy-pm-crh-v2-tally.timer",
+        # WP-11b (active-family registry, cardinality-1) retired
+        # breezy-pm-crh-v2-tally.timer/.service in favour of the shared
+        # breezy-family-tally@.timer/.service template, which carries the
+        # SAME "occupied elsewhere" residual-tick comment.
+        "breezy-family-tally@.timer",
         "breezy-live-tally.timer",
         "breezy-mb-daily.timer",
         "breezy-score-live-trials.timer",

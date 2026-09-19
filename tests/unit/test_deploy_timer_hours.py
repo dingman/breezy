@@ -151,25 +151,28 @@ def test_a_periodic_timer_is_exempt_only_when_it_shares_a_unit_with_a_sibling(
     assert _is_periodic(orphan_periodic, all_timers) is False
 
 
-def test_1715_utc_is_owned_by_exactly_one_timer() -> None:
-    # GL-6: 17:15 UTC is the pm_us_crh_v2 v2-tally tick (after 16:50 launch
-    # / 17:10 window end). Unique as an hour:minute tick; ingest already
-    # owns :15 at 00/06/12/18.
+def test_1715_and_1725_utc_are_unowned_after_the_wp11b_template_merge() -> None:
+    # WP-11b (active-family registry, cardinality-1): the former
+    # pm_us_crh_v2 (17:15) / pm_us_crh_cont (17:25) per-family tally ticks
+    # are retired along with their per-family unit files, replaced by ONE
+    # shared template tick (17:20, see the next test). Neither old tick may
+    # be silently re-claimed by a future timer.
+    for hour, minute in (("17", "15"), ("17", "25")):
+        owners = [
+            timer_path.name
+            for timer_path in _all_timer_files()
+            if (hour, minute) in _clock_ticks(timer_path)
+        ]
+        assert owners == [], f"{hour}:{minute} UTC unexpectedly owned by {owners}"
+
+
+def test_1720_utc_is_owned_by_exactly_one_timer() -> None:
+    # WP-11b: 17:20 UTC is the ONE shared breezy-family-tally@.timer tick --
+    # after 16:50 launch / 17:10 window end, and strictly between the two
+    # retired per-family ticks it replaces. Unique as an hour:minute tick.
     owners = [
         timer_path.name
         for timer_path in _all_timer_files()
-        if ("17", "15") in _clock_ticks(timer_path)
+        if ("17", "20") in _clock_ticks(timer_path)
     ]
-    assert owners == ["breezy-pm-crh-v2-tally.timer"]
-
-
-def test_1725_utc_is_owned_by_exactly_one_timer() -> None:
-    # L-38: 17:25 UTC is the pm_us_crh_cont v3-tally tick -- after the v2
-    # tally's own 17:15 tick (never the same minute) and still after 16:50
-    # launch / 17:10 window end. Unique as an hour:minute tick.
-    owners = [
-        timer_path.name
-        for timer_path in _all_timer_files()
-        if ("17", "25") in _clock_ticks(timer_path)
-    ]
-    assert owners == ["breezy-pm-crh-cont-tally.timer"]
+    assert owners == ["breezy-family-tally@.timer"]

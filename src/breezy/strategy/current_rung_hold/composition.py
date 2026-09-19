@@ -70,8 +70,7 @@ __all__ = [
     "family_halt_submit_veto",
     "install_current_rung_hold_refusal_watch",
     "make_trial_day_latch_factory",
-    "phase0_family_permits",
-    "phase1_family_permits",
+    "phase1_sending_permit",
     "resolve_station_instrument_ids",
     "strategy_component_id",
 ]
@@ -227,58 +226,43 @@ def family_halt_submit_veto(trial_day_latch: TrialDayLatch) -> Callable[[], str 
     return _veto
 
 
-def phase0_family_permits(
+def phase1_sending_permit(
     *,
-    current_rung_hold: bool,
-    continuous_rung_hold: bool,
-    permit: OrderSubmissionPermit | None,
-) -> tuple[OrderSubmissionPermit | None, OrderSubmissionPermit | None]:
-    """Phase 0 permit assignment: v2 may hold the permit; v3 is always None.
-
-    ``continuous_rung_hold`` selects composition, never the permit. No flag
-    combination returns two non-None permits.
-    """
-    v2_permit = permit if current_rung_hold else None
-    # Phase 0: v3 never holds a permit.
-    v3_permit: OrderSubmissionPermit | None = None
-    return v2_permit, v3_permit
-
-
-def phase1_family_permits(
-    *,
-    current_rung_hold: bool,
-    continuous_rung_hold: bool,
+    sending_family_id: str,
     permit: OrderSubmissionPermit | None,
     phase0_shadow: bool = False,
-) -> tuple[OrderSubmissionPermit | None, OrderSubmissionPermit | None]:
-    """Phase 1 permit assignment: exactly one sending family per run.
+) -> OrderSubmissionPermit | None:
+    """WP-11b (active-family registry, cardinality-1): route the single
+    sending family's permit.
 
-    Unlike :func:`phase0_family_permits` (kept, unchanged, for the Phase 0
-    shadow composition), v3 (``continuous_rung_hold``) MAY hold the permit
-    here -- whichever single family is on receives it. Both families on
-    together is refused (``SettingsError``) UNLESS ``phase0_shadow`` is
-    True, mirroring ``runtime.settings.load_trade_settings``'s own
-    load-time exclusivity check as defense in depth -- a caller that
-    bypasses settings validation (a test, a future call site) still cannot
-    mint two sending families through this function. Under
-    ``phase0_shadow``, behaviour matches ``phase0_family_permits`` exactly:
-    v2 may hold the permit, v3 never does. Neither family on returns
-    ``(None, None)``.
+    Replaces the retired two-family ``phase1_family_permits`` (a
+    ``tuple[Permit, Permit]`` of exactly one non-``None`` slot) and the
+    retired ``phase0_family_permits`` (kept for the Phase 0 shadow
+    composition, folded in here). Cardinality-1 is now STRUCTURAL: this
+    function's return type is a single ``OrderSubmissionPermit | None``, so
+    it is not merely refused to express two sending permits -- there is no
+    shape in which it COULD.
+
+    ``sending_family_id`` must be non-empty (``app/trade.py::run`` only
+    calls this once ``settings.sending_family_id is not None``; a caller
+    that reaches here with a blank string is a bug in that caller, not a
+    legitimate "no family" case -- that case never calls this function at
+    all). ``phase0_shadow=True`` folds forward the retired
+    ``phase0_family_permits``'s Phase 0 behaviour (composed, but the
+    permit is deliberately withheld) -- the sending family still boots, but
+    ``permit`` is never handed to it, matching the old "v3 never holds the
+    Phase 0 permit" contract generalised to whichever single family is
+    named. It can never, even under this hatch, cause a SECOND sending id
+    to receive a permit -- there is only ever the one ``sending_family_id``
+    argument.
     """
-    if current_rung_hold and continuous_rung_hold and not phase0_shadow:
+    if not sending_family_id:
         raise SettingsError(
-            "phase1_family_permits: current_rung_hold and continuous_rung_hold "
-            "together requires phase0_shadow=True; Phase 1 sends orders from "
-            "exactly one family"
+            "phase1_sending_permit: sending_family_id must be non-empty"
         )
     if phase0_shadow:
-        v2_permit = permit if current_rung_hold else None
-        return v2_permit, None
-    if continuous_rung_hold:
-        return None, permit
-    if current_rung_hold:
-        return permit, None
-    return None, None
+        return None
+    return permit
 
 
 def _facts_from_instrument(instrument: object) -> tuple[str, dt.date, Measure] | None:
@@ -486,9 +470,9 @@ def build_continuous_rung_hold_strategies(
     HERE, before any instrument resolution or strategy construction, rather
     than only inside the first station's constructor. ``False`` is the
     Phase 1, continuous-only (no-shadow) opt-in a composition root passes
-    when ``phase1_family_permits`` has genuinely routed the single sending
-    family's permit to v3 -- see ``app/trade.py::run``, the only caller that
-    ever passes ``False``.
+    when ``phase1_sending_permit`` has genuinely routed the single sending
+    family's permit to this composition kind -- see ``app/trade.py::run``,
+    the only caller that ever passes ``False``.
 
     ``enable_position_monitor`` (INC-5, D2/D3 SHADOW-ONLY -- never submits,
     modifies, or cancels an order): ``True`` by default in live composition.

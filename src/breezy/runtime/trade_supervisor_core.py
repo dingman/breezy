@@ -80,22 +80,35 @@ SUPERVISOR_ARGV_ANCHOR: Final[str] = f"{SUPERVISOR_ARGV_TOKEN}$"
 PERMIT_ISSUED_MARKER: Final[str] = "live-trading permit issued issued_at_ns="
 PERMIT_NOT_ISSUED_MARKER: Final[str] = "order submission permit not issued"
 TRADING_NODE_FAILED_MARKER: Final[str] = "trading node failed"
-STRATEGY_SUBSCRIBED_MARKER: Final[str] = "CurrentRungHoldStrategy subscribed"
-#: WP-0a stopgap: the live family logs ``ContinuousRungHoldStrategy
-#: subscribed``. Two accepted prefixes, not a registry. WP-11b parameterises
-#: this by ``composition_kind`` — do not generalise here.
-CONTINUOUS_STRATEGY_SUBSCRIBED_MARKER: Final[str] = "ContinuousRungHoldStrategy subscribed"
-STRATEGY_SUBSCRIBED_MARKERS: Final[tuple[str, ...]] = (
-    STRATEGY_SUBSCRIBED_MARKER,
-    CONTINUOUS_STRATEGY_SUBSCRIBED_MARKER,
+
+#: WP-11b (active-family registry, cardinality-1): the WP-0a two-prefix
+#: stopgap is replaced by a ``composition_kind`` -> subscribe-marker
+#: mapping, pinned against each strategy class's own name the same way the
+#: two retired markers were. ``forecast_ladder`` is wired here so the map
+#: is complete even though WP-14 has not landed and that composition kind
+#: refuses to boot -- the marker exists so the mapping (and this module's
+#: own exact-set expectations) never need a second edit once it does.
+COMPOSITION_KIND_SUBSCRIBED_MARKERS: Final[dict[str, str]] = {
+    "current_rung_hold": "CurrentRungHoldStrategy subscribed",
+    "continuous_rung_hold": "ContinuousRungHoldStrategy subscribed",
+    "forecast_ladder": "ForecastLadderStrategy subscribed",
+}
+#: Back-compat names for the two markers that existed before WP-11b --
+#: several call sites/tests reference these directly.
+STRATEGY_SUBSCRIBED_MARKER: Final[str] = COMPOSITION_KIND_SUBSCRIBED_MARKERS[
+    "current_rung_hold"
+]
+CONTINUOUS_STRATEGY_SUBSCRIBED_MARKER: Final[str] = COMPOSITION_KIND_SUBSCRIBED_MARKERS[
+    "continuous_rung_hold"
+]
+STRATEGY_SUBSCRIBED_MARKERS: Final[tuple[str, ...]] = tuple(
+    COMPOSITION_KIND_SUBSCRIBED_MARKERS.values()
 )
 
 
 def strategy_subscribed_in(log_text: str) -> bool:
-    """True iff ``log_text`` contains any accepted rung-hold subscribe prefix.
-
-    WP-0a stopgap. WP-11b parameterises by ``composition_kind``.
-    """
+    """True iff ``log_text`` contains any accepted composition-kind subscribe
+    marker (:data:`COMPOSITION_KIND_SUBSCRIBED_MARKERS`)."""
     return any(marker in log_text for marker in STRATEGY_SUBSCRIBED_MARKERS)
 
 
@@ -124,6 +137,43 @@ PHASE0_PERMIT_FORBIDDEN_MARKER: Final[str] = "Phase0PermitForbiddenError"
 #: markers above.
 CONTINUOUS_STARTUP_EVIDENCE_KEY: Final[str] = "exec/polymarket_us/startup_evidence"
 CONTINUOUS_FAMILY_HALT_KEY: Final[str] = "continuous_rung_hold/halt"
+
+
+def continuous_family_startup_evidence_key(sending_family_id: str) -> str:
+    """WP-11b: the startup-evidence key expressed as a function of
+    ``sending_family_id``, for API symmetry with
+    :func:`continuous_family_halt_key`.
+
+    Returns :data:`CONTINUOUS_STARTUP_EVIDENCE_KEY` regardless of the
+    argument: the underlying key is exec-client-wide (there is exactly one
+    execution-client connection regardless of which family is sending), not
+    literally scoped by family id, so no rename of the on-disk key is
+    needed or safe -- see F6 (per-family state is global-equivalent under
+    cardinality-1).
+    """
+    del sending_family_id  # exec-client-wide; family-agnostic by design
+    return CONTINUOUS_STARTUP_EVIDENCE_KEY
+
+
+def continuous_family_halt_key(sending_family_id: str) -> str:
+    """WP-11b: the family-halt key expressed as a function of
+    ``sending_family_id``.
+
+    Returns :data:`CONTINUOUS_FAMILY_HALT_KEY` regardless of the argument.
+    The underlying key is written by ``TrialDayLatch`` instances opened
+    with ``CONTINUOUS_TRIAL_KEY_PREFIX`` -- a fixed, ``composition_kind``
+    -scoped prefix, not the manifest's own ``family_id`` -- so under
+    cardinality-1 (WP-11b) at most one family is EVER the continuous-kind
+    sender, and "halted" is GLOBAL-equivalent to "this node's only sender
+    is halted" (F6) no matter which literal family id currently occupies
+    that slot. A future increment that lifts cardinality-1 would need to
+    widen this function's body, not just its call sites -- the parameter
+    is threaded through now so that is a one-function change.
+    """
+    del sending_family_id  # composition-kind-scoped, not family-id-scoped
+    return CONTINUOUS_FAMILY_HALT_KEY
+
+
 #: [2026-09-12 cross-seam fix] The store has no delete, so
 #: ``breezy-clear-family-halt`` (``trial_day_latch.TrialDayLatch.clear_family_halt``)
 #: overwrites ``CONTINUOUS_FAMILY_HALT_KEY`` with this exact sentinel rather

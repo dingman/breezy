@@ -24,8 +24,8 @@ from breezy.runtime.trade_supervisor import (
     ContinuousFamilyStoreState,
     SupervisorPorts,
     _do_self_check,
-    continuous_rung_hold_env_active,
     read_continuous_family_store_state,
+    sending_family_active,
 )
 from breezy.runtime.trade_supervisor_core import (
     CONTINUOUS_FAMILY_HALT_CLEARED_MARKER,
@@ -282,18 +282,29 @@ _READY_LOG_LINE = (
 )
 
 
-class TestContinuousRungHoldEnvActive:
-    def test_true_only_for_exactly_the_string_1(self, monkeypatch):
-        monkeypatch.setenv("BREEZY_CONTINUOUS_RUNG_HOLD", "1")
-        assert continuous_rung_hold_env_active() is True
+class TestSendingFamilyActive:
+    """WP-11b: family-agnostic arming predicate, replacing the retired
+    ``continuous_rung_hold_env_active`` (which read the now-retired
+    ``BREEZY_CONTINUOUS_RUNG_HOLD`` boolean and so left this self-check
+    block permanently unarmed for any OTHER sending family)."""
+
+    def test_true_for_any_non_blank_value(self, monkeypatch):
+        monkeypatch.setenv("BREEZY_SENDING_FAMILY_ID", "pm_us_crh_cont")
+        assert sending_family_active() is True
+
+    def test_true_for_a_fixture_forecast_family_id(self, monkeypatch):
+        """The literal F1 requirement: arming ``pm_us_crh_fc_v1`` must not
+        leave this predicate False."""
+        monkeypatch.setenv("BREEZY_SENDING_FAMILY_ID", "pm_us_crh_fc_v1")
+        assert sending_family_active() is True
 
     def test_false_when_absent(self, monkeypatch):
-        monkeypatch.delenv("BREEZY_CONTINUOUS_RUNG_HOLD", raising=False)
-        assert continuous_rung_hold_env_active() is False
+        monkeypatch.delenv("BREEZY_SENDING_FAMILY_ID", raising=False)
+        assert sending_family_active() is False
 
-    def test_false_for_any_other_value(self, monkeypatch):
-        monkeypatch.setenv("BREEZY_CONTINUOUS_RUNG_HOLD", "true")
-        assert continuous_rung_hold_env_active() is False
+    def test_false_for_a_blank_value(self, monkeypatch):
+        monkeypatch.setenv("BREEZY_SENDING_FAMILY_ID", "   ")
+        assert sending_family_active() is False
 
 
 class TestReadContinuousFamilyStoreState:
@@ -301,7 +312,7 @@ class TestReadContinuousFamilyStoreState:
         store_path = tmp_path / "state" / "store.sqlite3"
         with SqliteStateStore(store_path):
             pass  # just create the file/table, write nothing
-        state = read_continuous_family_store_state(store_path)
+        state = read_continuous_family_store_state(store_path, "pm_us_crh_cont")
         assert state == ContinuousFamilyStoreState(startup_evidence=None, family_halted=False)
 
     def test_reads_the_evidence_and_halt_keys_the_client_writes(self, tmp_path):
@@ -313,7 +324,7 @@ class TestReadContinuousFamilyStoreState:
                 json.dumps(evidence).encode("utf-8"),
             )
             store.set(CONTINUOUS_FAMILY_HALT_KEY, b'{"v":1}')
-        state = read_continuous_family_store_state(store_path)
+        state = read_continuous_family_store_state(store_path, "pm_us_crh_cont")
         assert state.startup_evidence == evidence
         assert state.family_halted is True
 
@@ -321,7 +332,7 @@ class TestReadContinuousFamilyStoreState:
         store_path = tmp_path / "state" / "store.sqlite3"
         with SqliteStateStore(store_path) as store:
             store.set(CONTINUOUS_STARTUP_EVIDENCE_KEY, b"not json")
-        state = read_continuous_family_store_state(store_path)
+        state = read_continuous_family_store_state(store_path, "pm_us_crh_cont")
         assert state.startup_evidence is None
 
     def test_read_is_safe_via_a_second_independent_connection_while_a_writer_handle_is_open(
@@ -335,7 +346,7 @@ class TestReadContinuousFamilyStoreState:
             writer.set(CONTINUOUS_FAMILY_HALT_KEY, b'{"v":1}')
             # writer handle still open here -- the read below must not block
             # or raise against it (WAL serves concurrent readers).
-            state = read_continuous_family_store_state(store_path)
+            state = read_continuous_family_store_state(store_path, "pm_us_crh_cont")
         assert state.family_halted is True
 
 
@@ -370,7 +381,7 @@ class TestDoSelfCheckContinuousWiring:
             read_log_new=lambda _p: _READY_LOG_LINE,
             alert_sink=sink,
             continuous_family_active=lambda: True,
-            read_continuous_family_store_state=lambda _p: store_state,
+            read_continuous_family_store_state=lambda _p, _f: store_state,
         )
         _do_self_check(
             ports=ports,
@@ -399,7 +410,7 @@ class TestDoSelfCheckContinuousWiring:
             read_log_new=lambda _p: log_with_error,
             alert_sink=sink,
             continuous_family_active=lambda: True,
-            read_continuous_family_store_state=lambda _p: store_state,
+            read_continuous_family_store_state=lambda _p, _f: store_state,
         )
         _do_self_check(
             ports=ports,
@@ -431,7 +442,7 @@ class TestDoSelfCheckContinuousWiring:
             read_log_new=lambda _p: _READY_LOG_LINE,
             alert_sink=sink,
             continuous_family_active=lambda: True,
-            read_continuous_family_store_state=lambda _p: store_state,
+            read_continuous_family_store_state=lambda _p, _f: store_state,
         )
         _do_self_check(
             ports=ports,
@@ -463,7 +474,7 @@ class TestDoSelfCheckContinuousWiring:
             read_log_new=lambda _p: _READY_LOG_LINE,
             alert_sink=sink,
             continuous_family_active=lambda: True,
-            read_continuous_family_store_state=lambda _p: store_state,
+            read_continuous_family_store_state=lambda _p, _f: store_state,
         )
         _do_self_check(
             ports=ports,
@@ -512,14 +523,14 @@ class TestReadContinuousFamilyStoreStateHonoursTheClearedSentinel:
         store_path = tmp_path / "state" / "store.sqlite3"
         with SqliteStateStore(store_path) as store:
             store.set(CONTINUOUS_FAMILY_HALT_KEY, CONTINUOUS_FAMILY_HALT_CLEARED_MARKER)
-        state = read_continuous_family_store_state(store_path)
+        state = read_continuous_family_store_state(store_path, "pm_us_crh_cont")
         assert state.family_halted is False
 
     def test_a_genuine_halt_payload_reads_as_halted(self, tmp_path):
         store_path = tmp_path / "state" / "store.sqlite3"
         with SqliteStateStore(store_path) as store:
             store.set(CONTINUOUS_FAMILY_HALT_KEY, b'{"v":1,"reason":"duplicate_fill"}')
-        state = read_continuous_family_store_state(store_path)
+        state = read_continuous_family_store_state(store_path, "pm_us_crh_cont")
         assert state.family_halted is True
 
 
@@ -599,7 +610,7 @@ class TestWp0aSubscribeMarkerAcceptsBothPrefixes:
             read_log_new=lambda _p: log_text,
             alert_sink=sink,
             continuous_family_active=lambda: True,
-            read_continuous_family_store_state=lambda _p: _clean_continuous_store_state(
+            read_continuous_family_store_state=lambda _p, _f: _clean_continuous_store_state(
                 day=dt.date(2026, 9, 12)
             ),
         )

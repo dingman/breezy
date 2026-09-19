@@ -73,12 +73,15 @@ _ISSUE = OrderSubmissionPermit.issue
 
 @dataclass(frozen=True, slots=True)
 class _FakeSettings:
-    """The narrow ``SettingsLike`` surface ``issue`` needs -- nothing else."""
+    """The narrow ``SettingsLike`` surface ``issue`` needs -- nothing else.
+
+    WP-11b: a single ``sending_family_id`` slot replaces the retired
+    ``current_rung_hold``/``continuous_rung_hold`` boolean pair.
+    """
 
     orders_enabled_requested: bool = True
-    current_rung_hold: bool = True
+    sending_family_id: str | None = "pm_us_crh_v2"
     live_observations: bool = True
-    continuous_rung_hold: bool = False
 
 
 @contextmanager
@@ -192,14 +195,14 @@ def test_issue_accepts_continuous_without_current(
     monkeypatch: pytest.MonkeyPatch,
     write_canonical_verified: None,  # noqa: F811
 ) -> None:
-    """Phase 1: continuous_rung_hold alone (plus live_observations) is now
-    enough -- issue() no longer requires current_rung_hold specifically."""
+    """WP-11b: any single non-blank sending_family_id is enough -- issue()
+    is agnostic to which family asked."""
     enable_operator_gate(monkeypatch)
     clock = clock_at()
     live_permit = issue_live_trading_permit(clock=clock)
     with _caps():
         permit = _ISSUE(
-            settings=_FakeSettings(current_rung_hold=False, continuous_rung_hold=True),
+            settings=_FakeSettings(sending_family_id="pm_us_crh_cont"),
             live_trading_permit=live_permit,
             clock=clock,
         )
@@ -210,13 +213,13 @@ def test_neither_family_on_refuses(
     monkeypatch: pytest.MonkeyPatch,
     write_canonical_verified: None,  # noqa: F811
 ) -> None:
-    """Neither current_rung_hold nor continuous_rung_hold on is still refused."""
+    """No sending_family_id set is still refused."""
     enable_operator_gate(monkeypatch)
     clock = clock_at()
     live_permit = issue_live_trading_permit(clock=clock)
     with _caps(), pytest.raises(RungHoldNotReadyError):
         _ISSUE(
-            settings=_FakeSettings(current_rung_hold=False, continuous_rung_hold=False),
+            settings=_FakeSettings(sending_family_id=None),
             live_trading_permit=live_permit,
             clock=clock,
         )
@@ -308,7 +311,7 @@ def test_operator_caps_and_rung_hold_messages_name_no_value(
 
         with _caps(), pytest.raises(RungHoldNotReadyError) as exc_rung:
             _ISSUE(
-                settings=_FakeSettings(current_rung_hold=False),
+                settings=_FakeSettings(sending_family_id=None),
                 live_trading_permit=live_permit,
                 clock=clock,
             )

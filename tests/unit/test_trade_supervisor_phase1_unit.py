@@ -1,10 +1,12 @@
-"""G1/G2 (plan rev 6.1) + review item 2, POST-CUT (2026-09-12, d0): the
-installed `deploy/systemd/breezy-trade-supervisor.service` (symlinked into
-~/.config/systemd/user) now carries the Phase 1 `continuous_rung_hold`
-launch profile. The former `.phase1` sibling was applied verbatim at the cut
-(three `Environment=` line changes) and deleted; these pins hold the
-post-cut state so nobody re-enables the frozen v2 family or the shadow
-flag by accident. This module never runs `daemon-reload` or touches any
+"""G1/G2 (plan rev 6.1) + review item 2, POST-CUT (2026-09-12, d0), migrated
+by WP-11b (active-family registry, cardinality-1, 2026-09-19): the installed
+`deploy/systemd/breezy-trade-supervisor.service` (symlinked into
+~/.config/systemd/user) now carries ONE `BREEZY_SENDING_FAMILY_ID` value
+naming the live family, replacing the retired
+`BREEZY_CURRENT_RUNG_HOLD`/`BREEZY_CONTINUOUS_RUNG_HOLD` boolean pair. These
+pins hold the post-WP-11b state so nobody reintroduces either retired
+boolean by accident, and so a promotion (changing ONLY this value) is
+visible in a diff. This module never runs `daemon-reload` or touches any
 service.
 """
 
@@ -16,13 +18,16 @@ from pathlib import Path
 
 import pytest
 
+from breezy.runtime.settings import SENDING_FAMILY_ID_VAR
+
 _DEPLOY_DIR = Path(__file__).resolve().parents[2] / "deploy" / "systemd"
 _INSTALLED_UNIT = _DEPLOY_DIR / "breezy-trade-supervisor.service"
 
 _SYSTEMD_ANALYZE = shutil.which("systemd-analyze")
 
-_EXPECTED_REMOVED = "Environment=BREEZY_CURRENT_RUNG_HOLD=1"
-_EXPECTED_REPLACEMENT_ADDED = "Environment=BREEZY_CONTINUOUS_RUNG_HOLD=1"
+_EXPECTED_REMOVED_CURRENT = "Environment=BREEZY_CURRENT_RUNG_HOLD=1"
+_EXPECTED_REMOVED_CONTINUOUS = "Environment=BREEZY_CONTINUOUS_RUNG_HOLD=1"
+_EXPECTED_REPLACEMENT_ADDED = "Environment=BREEZY_SENDING_FAMILY_ID=pm_us_crh_cont"
 _EXPECTED_SHADOW_PIN_ADDED = "Environment=BREEZY_CRH_CONT_PHASE0_SHADOW=0"
 _OPERATOR_ENV_LINE = "EnvironmentFile=-%h/breezy/operator.env"
 
@@ -31,11 +36,23 @@ def test_installed_unit_exists() -> None:
     assert _INSTALLED_UNIT.is_file()
 
 
-def test_installed_unit_runs_the_continuous_family_not_v2() -> None:
+def test_installed_unit_runs_the_registered_sending_family_by_id() -> None:
     lines = _INSTALLED_UNIT.read_text().splitlines()
     assert _EXPECTED_REPLACEMENT_ADDED in lines
-    assert _EXPECTED_REMOVED not in lines
+    assert _EXPECTED_REMOVED_CURRENT not in lines
+    assert _EXPECTED_REMOVED_CONTINUOUS not in lines
     assert lines.count(_EXPECTED_REPLACEMENT_ADDED) == 1
+
+    # Gap closed (independent review, MEDIUM, 2026-09-19): the assertions
+    # above pin the env-var NAME as a bare literal, so a future rename of
+    # `breezy.runtime.settings.SENDING_FAMILY_ID_VAR` with no matching edit
+    # to this systemd unit would drift silently -- this test would keep
+    # passing against the OLD name. Derive the prefix from the constant
+    # itself so a rename on either side (settings.py or the unit file)
+    # without the other shows up here.
+    derived_prefix = f"Environment={SENDING_FAMILY_ID_VAR}="
+    matched = [line for line in lines if line.startswith(derived_prefix)]
+    assert matched == [_EXPECTED_REPLACEMENT_ADDED]
 
 
 def test_installed_unit_pins_the_phase0_shadow_flag_off_after_operator_env() -> None:

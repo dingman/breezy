@@ -40,11 +40,13 @@ equality rather than an assumption. Cross-checking an explicitly configured
 from __future__ import annotations
 
 import os
+import re
 import shutil
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
 
+from breezy.persistence.family_manifest import FamilyManifestError, load_family_manifest
 from breezy.registry.sites import RegistryError, default_registry, load_registry
 
 _TRADER_ID_VAR = "BREEZY_TRADER_ID"
@@ -96,44 +98,55 @@ TRADE_TRADER_ID_VAR = "BREEZY_TRADE_TRADER_ID"
 #: idiom. The ingest node and the tape recorder never read it.
 LIVE_OBSERVATIONS_VAR = "BREEZY_LIVE_OBSERVATIONS"
 
-#: Shadow-mode ``current_rung_hold`` enablement for the TRADING role. OFF
-#: unless set to exactly ``"1"``. Requires :data:`LIVE_OBSERVATIONS_VAR` --
-#: the strategy prices against ``StationObservation``, so enabling it without
-#: the publisher would latch ``observation_unavailable`` on every station-day
-#: and burn the one trial. The tape recorder never reads this variable.
-CURRENT_RUNG_HOLD_VAR = "BREEZY_CURRENT_RUNG_HOLD"
+#: WP-11b (active-family registry, cardinality-1): the ONE identifier
+#: naming which ``deploy/families/<id>.json`` manifest is the sending
+#: family for this boot. Replaces the retired
+#: ``BREEZY_CURRENT_RUNG_HOLD``/``BREEZY_CONTINUOUS_RUNG_HOLD`` boolean
+#: pair -- cardinality-1 is now STRUCTURAL (one string slot), not an
+#: N-boolean mutex that happens to be checked. Unset means no sending
+#: family (shadow / tape-recorder / ingest-role boots). Requires
+#: :data:`LIVE_OBSERVATIONS_VAR` -- every composition kind prices against
+#: live data, so enabling a sending family without the publisher would
+#: latch ``observation_unavailable`` on every station-day and burn the
+#: trial. The tape recorder never reads this variable.
+SENDING_FAMILY_ID_VAR = "BREEZY_SENDING_FAMILY_ID"
 
-#: Phase 0 shadow ``continuous_rung_hold`` family. OFF unless set to exactly
-#: ``"1"``. Composed beside v2; never receives the order-submission permit
-#: (Phase 0: permit is ``None`` by construction).
-CONTINUOUS_RUNG_HOLD_VAR = "BREEZY_CONTINUOUS_RUNG_HOLD"
+#: Family-id shape: the same charset `deploy/families/*.json` basenames
+#: already use everywhere (lowercase/digits/underscore/colon, for the
+#: ``kalshi:`` venue-prefixed ids). A comma or embedded whitespace can never
+#: be a single id, so it is the natural, cheap way a caller could otherwise
+#: try to smuggle two ids through the one string slot -- refused by
+#: :func:`_parse_sending_family_id` before it ever reaches a file lookup.
+_FAMILY_ID_RE_SOURCE = r"^[a-z0-9_:]+$"
 
-#: Phase 1: :data:`CURRENT_RUNG_HOLD_VAR` and :data:`CONTINUOUS_RUNG_HOLD_VAR`
-#: set together is refused at load time (``SettingsError``, exit 2) -- Phase 1
-#: sends orders from exactly one family -- UNLESS this build-side escape
-#: hatch is set to exactly ``"1"``, which restores the Phase 0 shadow
-#: composition (both families built; only v2 may ever hold the permit; see
-#: ``strategy.current_rung_hold.composition.phase0_family_permits``). This is
+#: Phase 0 shadow build-side escape hatch. OFF unless set to exactly
+#: ``"1"``. Under WP-11b's single ``sending_family_id`` slot this folds the
+#: retired ``phase0_family_permits``'s behaviour (composed, but the
+#: order-submission permit is deliberately withheld) into
+#: ``strategy.current_rung_hold.composition.phase1_sending_permit``: with
+#: this on, the ONE sending family is still composed and still boots, but
+#: never receives a real permit (permit stays ``None`` by construction) --
+#: it can never, even under this hatch, name a SECOND sending id. This is
 #: a BUILD-SIDE flag, never an operator-reserved control, so its name may
 #: appear in tracked files; it does not gate order submission by itself.
 CRH_CONT_PHASE0_SHADOW_VAR = "BREEZY_CRH_CONT_PHASE0_SHADOW"
 
-#: Trade-role catalog root used as the pre-build discovery source when
-#: :data:`CURRENT_RUNG_HOLD_VAR` is on. Distinct from
-#: :data:`QUOTE_TAPE_CATALOG_VAR`, which remains the recorder's single-reader
-#: contract. Required, absolute, no ``..`` segment, only when the flag is on.
+#: Trade-role catalog root used as the pre-build discovery source when a
+#: sending family is on. Distinct from :data:`QUOTE_TAPE_CATALOG_VAR`, which
+#: remains the recorder's single-reader contract. Required, absolute, no
+#: ``..`` segment, only when a sending family is set.
 TRADE_CATALOG_ROOT_VAR = "BREEZY_TRADE_CATALOG_ROOT"
 
 #: CRH enablement step 8 (converged review item 7): a build-side REQUEST
 #: for the order path to be reachable, not an enablement by itself. OFF
-#: unless set to exactly ``"1"`` -- same idiom as :data:`LIVE_OBSERVATIONS_VAR`
-#: and :data:`CURRENT_RUNG_HOLD_VAR`. Requires both of those to already be on:
-#: the strategy has no order path to gate without ``current_rung_hold``, and
-#: no fresh price to gate it against without ``live_observations``. This
-#: field is a REQUEST that ``runtime.order_enablement.issue_order_submission_
-#: permit`` reads and validates alongside five other preconditions -- it is
-#: never, on its own, sufficient to submit an order. It is a build-side flag,
-#: not an operator-reserved control, so its name may appear in tracked files.
+#: unless set to exactly ``"1"`` -- same idiom as :data:`LIVE_OBSERVATIONS_VAR`.
+#: Requires both of those to already be on: the strategy has no order path
+#: to gate without a sending family, and no fresh price to gate it against
+#: without ``live_observations``. This field is a REQUEST that
+#: ``runtime.order_enablement.issue_order_submission_permit`` reads and
+#: validates alongside five other preconditions -- it is never, on its own,
+#: sufficient to submit an order. It is a build-side flag, not an
+#: operator-reserved control, so its name may appear in tracked files.
 ORDERS_ENABLED_VAR = "BREEZY_ORDERS_ENABLED"
 
 _DEFAULT_TRADER_ID = "BREEZY-001"
@@ -166,6 +179,15 @@ _DEFAULT_QUOTE_TAPE_DISK_CHECK_INTERVAL_SECONDS = 30
 #: aliases NOT present on Nautilus's `LogLevel` and must be rejected here.
 _SUPPORTED_LOG_LEVELS = frozenset({"OFF", "TRACE", "DEBUG", "INFO", "WARNING", "ERROR"})
 _STATE_DB_RELATIVE_PATH = Path("state") / "breezy-state.sqlite3"
+
+#: WP-11b: where every family manifest lives, relative to the process CWD.
+#: `trade_supervisor.py`'s `_launch`/`_relaunch` always set
+#: `cwd=str(repo_root)` before spawning the trading process, the same
+#: relative-path convention `deploy/families/*.json` already uses
+#: everywhere else (test fixtures, `scripts/analysis/*`'s own
+#: `--family-manifest` CLI args, `app/trade.py`'s own manifest load).
+_FAMILIES_DIR = Path("deploy/families")
+_FAMILY_ID_RE = re.compile(_FAMILY_ID_RE_SOURCE)
 
 
 class SettingsError(ValueError):
@@ -316,12 +338,61 @@ def _parse_live_observations(env: Mapping[str, str]) -> bool:
     return env.get(LIVE_OBSERVATIONS_VAR) == "1"
 
 
-def _parse_current_rung_hold(env: Mapping[str, str]) -> bool:
-    return env.get(CURRENT_RUNG_HOLD_VAR) == "1"
+def _parse_sending_family_id(env: Mapping[str, str]) -> str | None:
+    """Parse :data:`SENDING_FAMILY_ID_VAR`; ``None`` when unset (no sending
+    family -- a legitimate shadow/tape-recorder/ingest-role boot).
+
+    Cardinality-1 is enforced HERE, structurally, before the value is ever
+    used to look up a manifest: a comma or embedded whitespace can never be
+    a single family id, so it is refused as an attempt to name two ids
+    through the one string slot rather than silently truncated or
+    first-token-accepted.
+    """
+    raw = env.get(SENDING_FAMILY_ID_VAR)
+    if raw is None:
+        return None
+    if not raw.strip():
+        raise SettingsError(
+            f"{SENDING_FAMILY_ID_VAR} must not be blank; unset it entirely for no "
+            "sending family"
+        )
+    if "\x00" in raw:
+        raise SettingsError(f"{SENDING_FAMILY_ID_VAR} must not contain a NUL byte")
+    if "," in raw or any(ch.isspace() for ch in raw):
+        raise SettingsError(
+            f"{SENDING_FAMILY_ID_VAR} must name exactly ONE family id (cardinality-1); "
+            f"was {raw!r}, which looks like more than one id"
+        )
+    if not _FAMILY_ID_RE.match(raw):
+        raise SettingsError(
+            f"{SENDING_FAMILY_ID_VAR} must match {_FAMILY_ID_RE_SOURCE!r}, was {raw!r}"
+        )
+    return raw
 
 
-def _parse_continuous_rung_hold(env: Mapping[str, str]) -> bool:
-    return env.get(CONTINUOUS_RUNG_HOLD_VAR) == "1"
+def _validate_sending_family_manifest(sending_family_id: str) -> None:
+    """Fail-closed manifest validation at settings-LOAD time (WP-11b):
+    unknown id, missing file, or ``DRAFT_NOT_REGISTERED`` all refuse here
+    (``SettingsError``, exit 2) rather than surfacing later as a confusing
+    crash deep inside composition. Never passes ``allow_draft=True`` --
+    a production boot always requires a REGISTERED manifest; DRAFT loads
+    are a test/tooling-only affordance reached through
+    ``persistence.family_manifest.load_family_manifest`` directly, never
+    through this settings loader.
+    """
+    manifest_path = _FAMILIES_DIR / f"{sending_family_id}.json"
+    try:
+        load_family_manifest(manifest_path)
+    except FamilyManifestError as exc:
+        raise SettingsError(
+            f"{SENDING_FAMILY_ID_VAR}={sending_family_id!r}: manifest at "
+            f"{manifest_path} failed to load ({type(exc).__name__}): {exc}"
+        ) from exc
+    except OSError as exc:
+        raise SettingsError(
+            f"{SENDING_FAMILY_ID_VAR}={sending_family_id!r}: manifest at "
+            f"{manifest_path} could not be read: {exc}"
+        ) from exc
 
 
 def _parse_crh_cont_phase0_shadow(env: Mapping[str, str]) -> bool:
@@ -755,23 +826,18 @@ class BreezyTradeSettings:
     #: BL-24 Seam B: whether the NWS observation Actors are registered on
     #: this node. Default OFF; see :data:`LIVE_OBSERVATIONS_VAR`.
     live_observations: bool = False
-    #: Shadow-mode ``current_rung_hold``. Default OFF; see
-    #: :data:`CURRENT_RUNG_HOLD_VAR`. ``orders_enabled`` is not a field here
-    #: and cannot be reached from this object.
-    current_rung_hold: bool = False
-    #: Phase 0 shadow continuous-rung-hold family. Default OFF; see
-    #: :data:`CONTINUOUS_RUNG_HOLD_VAR`. Phase 1: may hold the
-    #: order-submission permit on its own (see
-    #: :data:`CRH_CONT_PHASE0_SHADOW_VAR` for the exception that keeps both
-    #: families composed together, in which case only ``current_rung_hold``
-    #: may ever hold the permit).
-    continuous_rung_hold: bool = False
+    #: WP-11b: the ONE family (by id) authorized to send orders on this
+    #: boot, or ``None`` for no sending family. Structural cardinality-1 --
+    #: a single ``str | None`` slot replaces the retired
+    #: ``current_rung_hold``/``continuous_rung_hold`` boolean pair; there is
+    #: no representation in this type for "two families on". See
+    #: :data:`SENDING_FAMILY_ID_VAR`.
+    sending_family_id: str | None = None
     #: Build-side Phase 0 shadow escape hatch; see
-    #: :data:`CRH_CONT_PHASE0_SHADOW_VAR`. Default OFF -- Phase 1 sends
-    #: orders from exactly one family.
+    #: :data:`CRH_CONT_PHASE0_SHADOW_VAR`. Default OFF.
     phase0_shadow: bool = False
-    #: Pre-build discovery catalog, set when either rung-hold family is on.
-    #: See :data:`TRADE_CATALOG_ROOT_VAR`.
+    #: Pre-build discovery catalog, set when a sending family is on. See
+    #: :data:`TRADE_CATALOG_ROOT_VAR`.
     catalog_root: Path | None = None
     #: CRH enablement step 8: a REQUEST that the order path be reachable.
     #: Default OFF; see :data:`ORDERS_ENABLED_VAR`. This is NOT an
@@ -780,10 +846,8 @@ class BreezyTradeSettings:
     #: ``runtime.order_enablement.issue_order_submission_permit`` reads off
     #: this already-loaded settings object (never re-parsing the env) before
     #: minting the sealed, unforgeable ``OrderSubmissionPermit`` that the
-    #: strategy actually gates on. Requires ``live_observations`` True and,
-    #: as of Phase 1, EITHER ``current_rung_hold`` OR ``continuous_rung_hold``
-    #: True (previously ``current_rung_hold`` specifically); refused
-    #: otherwise at load time.
+    #: strategy actually gates on. Requires ``live_observations`` True and a
+    #: ``sending_family_id`` set; refused otherwise at load time.
     orders_enabled_requested: bool = False
 
 
@@ -808,51 +872,43 @@ def load_trade_settings(env: Mapping[str, str] | None = None) -> BreezyTradeSett
         raise SettingsError(f"{TRADE_TRADER_ID_VAR} is required and must not be blank")
 
     live_observations = _parse_live_observations(active_env)
-    current_rung_hold = _parse_current_rung_hold(active_env)
-    continuous_rung_hold = _parse_continuous_rung_hold(active_env)
+    sending_family_id = _parse_sending_family_id(active_env)
     phase0_shadow = _parse_crh_cont_phase0_shadow(active_env)
-    rung_hold_family = current_rung_hold or continuous_rung_hold
-    if rung_hold_family and not live_observations:
-        which = CURRENT_RUNG_HOLD_VAR if current_rung_hold else CONTINUOUS_RUNG_HOLD_VAR
+    has_sending_family = sending_family_id is not None
+    if has_sending_family and not live_observations:
         raise SettingsError(
-            f"{which}=1 requires {LIVE_OBSERVATIONS_VAR}=1: "
-            "the strategy prices against StationObservation, so enabling it "
-            "without the publisher would latch observation_unavailable on "
-            "every station-day and burn the one trial"
+            f"{SENDING_FAMILY_ID_VAR}={sending_family_id!r} requires "
+            f"{LIVE_OBSERVATIONS_VAR}=1: every composition kind prices "
+            "against live data, so enabling a sending family without the "
+            "publisher would latch observation_unavailable on every "
+            "station-day and burn the trial"
         )
-    if current_rung_hold and continuous_rung_hold and not phase0_shadow:
-        # Phase 1 sends orders from exactly one family. Both flags together
-        # is refused at load time unless the build-side shadow escape hatch
-        # is set, which restores the Phase 0 composition (both families
-        # built; only current_rung_hold may ever hold the permit -- see
-        # composition.py::phase0_family_permits).
-        raise SettingsError(
-            f"{CURRENT_RUNG_HOLD_VAR}=1 and {CONTINUOUS_RUNG_HOLD_VAR}=1 "
-            f"together requires {CRH_CONT_PHASE0_SHADOW_VAR}=1 (Phase 0 "
-            "shadow); Phase 1 sends orders from exactly one family"
-        )
+    if sending_family_id is not None:
+        # WP-11b: fail-closed manifest validation at settings-LOAD time --
+        # unknown id, missing file, or DRAFT_NOT_REGISTERED all refuse here
+        # (mirrors UnregisteredFamilyManifestError / UnpinnedBoundaryArtefactError).
+        _validate_sending_family_manifest(sending_family_id)
     orders_enabled_requested = _parse_orders_enabled(active_env)
-    if orders_enabled_requested and not (rung_hold_family and live_observations):
-        # Phase 1: EITHER family alone, plus live_observations, is enough to
-        # match OrderSubmissionPermit.issue()'s own gate (order_enablement.py:
-        # "current_rung_hold or continuous_rung_hold, and live_observations,
-        # must be enabled"). Neither family on is still refused here at
-        # settings-load time (SettingsError, exit 2) rather than falling
-        # through to issue()'s FATAL OrderSubmissionRefused (exit 1).
+    if orders_enabled_requested and not (has_sending_family and live_observations):
+        # A sending family plus live_observations is enough to match
+        # OrderSubmissionPermit.issue()'s own gate (order_enablement.py: "a
+        # sending family and live_observations must be enabled"). No
+        # sending family is still refused here at settings-load time
+        # (SettingsError, exit 2) rather than falling through to issue()'s
+        # FATAL OrderSubmissionRefused (exit 1).
         raise SettingsError(
             f"{ORDERS_ENABLED_VAR}=1 requires {LIVE_OBSERVATIONS_VAR}=1 and "
-            f"one of {CURRENT_RUNG_HOLD_VAR}=1 or {CONTINUOUS_RUNG_HOLD_VAR}=1: "
-            "a request for the order path to be reachable is meaningless "
-            "without a rung-hold family and its price source both enabled"
+            f"{SENDING_FAMILY_ID_VAR} to be set: a request for the order "
+            "path to be reachable is meaningless without a sending family "
+            "and its price source both enabled"
         )
-    catalog_root = _parse_trade_catalog_root(active_env) if rung_hold_family else None
+    catalog_root = _parse_trade_catalog_root(active_env) if has_sending_family else None
 
     return BreezyTradeSettings(
         trader_id=raw.strip(),
         log_level=_parse_log_level(active_env),
         live_observations=live_observations,
-        current_rung_hold=current_rung_hold,
-        continuous_rung_hold=continuous_rung_hold,
+        sending_family_id=sending_family_id,
         phase0_shadow=phase0_shadow,
         catalog_root=catalog_root,
         orders_enabled_requested=orders_enabled_requested,

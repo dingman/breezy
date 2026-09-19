@@ -19,11 +19,10 @@ from breezy.adapters.polymarket_us.operator_controls import (
 )
 from breezy.registry.sites import default_registry
 from breezy.runtime.settings import (
-    CONTINUOUS_RUNG_HOLD_VAR,
     CRH_CONT_PHASE0_SHADOW_VAR,
-    CURRENT_RUNG_HOLD_VAR,
     LIVE_OBSERVATIONS_VAR,
     ORDERS_ENABLED_VAR,
+    SENDING_FAMILY_ID_VAR,
     TRADE_CATALOG_ROOT_VAR,
     TRADE_TRADER_ID_VAR,
     BreezyRuntimeSettings,
@@ -724,72 +723,85 @@ def test_the_default_probe_walks_up_to_the_nearest_existing_ancestor(
 
 
 # ---------------------------------------------------------------------------
-# Trading-role current_rung_hold flag (exact ``== "1"`` idiom)
+# WP-11b (active-family registry, cardinality-1, 2026-09-19): ONE
+# ``sending_family_id`` slot replaces the retired
+# ``current_rung_hold``/``continuous_rung_hold`` boolean pair.
 # ---------------------------------------------------------------------------
 
 _TRADE_ONLY_ENV = {TRADE_TRADER_ID_VAR: "BREEZYTRADE-001"}
+_CATALOG_ROOT_ENV = {TRADE_CATALOG_ROOT_VAR: "/tmp/breezy-trade-catalog"}
 
 
-def test_current_rung_hold_flag_is_exact_one() -> None:
-    """RED 10: absent / ``"0"`` / ``"true"`` / ``"1"`` → False, False, False, True."""
-    absent = load_trade_settings(_TRADE_ONLY_ENV).current_rung_hold
-    zero = load_trade_settings({**_TRADE_ONLY_ENV, CURRENT_RUNG_HOLD_VAR: "0"}).current_rung_hold
-    true = load_trade_settings(
-        {**_TRADE_ONLY_ENV, CURRENT_RUNG_HOLD_VAR: "true"}
-    ).current_rung_hold
-    one = load_trade_settings(
+def test_sending_family_id_absent_is_none() -> None:
+    assert load_trade_settings(_TRADE_ONLY_ENV).sending_family_id is None
+
+
+def test_sending_family_id_set_to_a_registered_family_boots() -> None:
+    settings = load_trade_settings(
         {
             **_TRADE_ONLY_ENV,
-            CURRENT_RUNG_HOLD_VAR: "1",
+            **_CATALOG_ROOT_ENV,
+            SENDING_FAMILY_ID_VAR: "pm_us_crh_v2",
             LIVE_OBSERVATIONS_VAR: "1",
-            TRADE_CATALOG_ROOT_VAR: "/tmp/breezy-trade-catalog",
         }
-    ).current_rung_hold
-    assert (absent, zero, true, one) == (False, False, False, True)
+    )
+    assert settings.sending_family_id == "pm_us_crh_v2"
 
 
-def test_current_rung_hold_without_live_observations_is_a_settings_error() -> None:
+def test_sending_family_id_without_live_observations_is_a_settings_error() -> None:
     with pytest.raises(SettingsError) as excinfo:
-        load_trade_settings({**_TRADE_ONLY_ENV, CURRENT_RUNG_HOLD_VAR: "1"})
+        load_trade_settings(
+            {**_TRADE_ONLY_ENV, **_CATALOG_ROOT_ENV, SENDING_FAMILY_ID_VAR: "pm_us_crh_v2"}
+        )
     message = str(excinfo.value)
-    assert CURRENT_RUNG_HOLD_VAR in message
+    assert SENDING_FAMILY_ID_VAR in message
     assert LIVE_OBSERVATIONS_VAR in message
 
 
-def test_continuous_rung_hold_flag_is_exact_one() -> None:
-    absent = load_trade_settings(_TRADE_ONLY_ENV).continuous_rung_hold
-    one = load_trade_settings(
-        {
-            **_TRADE_ONLY_ENV,
-            CONTINUOUS_RUNG_HOLD_VAR: "1",
-            LIVE_OBSERVATIONS_VAR: "1",
-            TRADE_CATALOG_ROOT_VAR: "/tmp/breezy-trade-catalog",
-        }
-    ).continuous_rung_hold
-    assert (absent, one) == (False, True)
-
-
-def test_continuous_rung_hold_without_live_observations_is_a_settings_error() -> None:
+def test_sending_family_id_blank_is_a_settings_error() -> None:
     with pytest.raises(SettingsError) as excinfo:
-        load_trade_settings({**_TRADE_ONLY_ENV, CONTINUOUS_RUNG_HOLD_VAR: "1"})
-    message = str(excinfo.value)
-    assert CONTINUOUS_RUNG_HOLD_VAR in message
-    assert LIVE_OBSERVATIONS_VAR in message
+        load_trade_settings({**_TRADE_ONLY_ENV, SENDING_FAMILY_ID_VAR: "   "})
+    assert SENDING_FAMILY_ID_VAR in str(excinfo.value)
+
+
+def test_sending_family_id_with_two_comma_separated_ids_is_a_settings_error() -> None:
+    """Cardinality-1 is structural, enforced before any file lookup: a
+    comma can never be part of a single family id."""
+    with pytest.raises(SettingsError) as excinfo:
+        load_trade_settings(
+            {**_TRADE_ONLY_ENV, SENDING_FAMILY_ID_VAR: "pm_us_crh_cont,pm_us_crh_v2"}
+        )
+    assert SENDING_FAMILY_ID_VAR in str(excinfo.value)
+
+
+def test_sending_family_id_with_embedded_whitespace_is_a_settings_error() -> None:
+    with pytest.raises(SettingsError) as excinfo:
+        load_trade_settings({**_TRADE_ONLY_ENV, SENDING_FAMILY_ID_VAR: "pm us crh cont"})
+    assert SENDING_FAMILY_ID_VAR in str(excinfo.value)
+
+
+def test_unknown_sending_family_id_is_refused_at_settings_load_time() -> None:
+    with pytest.raises(SettingsError) as excinfo:
+        load_trade_settings(
+            {**_TRADE_ONLY_ENV, **_CATALOG_ROOT_ENV, SENDING_FAMILY_ID_VAR: "no_such_family"}
+        )
+    assert "no_such_family" in str(excinfo.value)
+
+
+def test_draft_sending_family_id_is_refused_at_settings_load_time() -> None:
+    """``kalshi_crh_v1`` is a committed DRAFT_NOT_REGISTERED manifest --
+    settings-load never passes ``allow_draft=True``."""
+    with pytest.raises(SettingsError) as excinfo:
+        load_trade_settings(
+            {**_TRADE_ONLY_ENV, **_CATALOG_ROOT_ENV, SENDING_FAMILY_ID_VAR: "kalshi_crh_v1"}
+        )
+    assert "kalshi_crh_v1" in str(excinfo.value)
 
 
 # ---------------------------------------------------------------------------
-# Phase 1 -- exactly one sending family; BREEZY_CRH_CONT_PHASE0_SHADOW is the
-# build-side escape hatch that restores the Phase 0 composition (both
-# families built together; only current_rung_hold may ever hold the permit).
+# Phase 0 shadow build-side escape hatch -- independent of sending_family_id
+# under WP-11b (there is only ever one id to shadow).
 # ---------------------------------------------------------------------------
-
-_BOTH_FAMILIES_ENV = {
-    **_TRADE_ONLY_ENV,
-    CURRENT_RUNG_HOLD_VAR: "1",
-    CONTINUOUS_RUNG_HOLD_VAR: "1",
-    LIVE_OBSERVATIONS_VAR: "1",
-    TRADE_CATALOG_ROOT_VAR: "/tmp/breezy-trade-catalog",
-}
 
 
 def test_phase0_shadow_flag_is_exact_one() -> None:
@@ -806,21 +818,17 @@ def test_phase0_shadow_flag_is_exact_one() -> None:
     assert (absent, zero, true_word, one) == (False, False, False, True)
 
 
-def test_current_and_continuous_together_without_shadow_is_a_settings_error() -> None:
-    """Phase 1 sends orders from exactly one family: both flags together is
-    refused at load time (exit 2) unless the shadow escape hatch is set."""
-    with pytest.raises(SettingsError) as excinfo:
-        load_trade_settings(_BOTH_FAMILIES_ENV)
-    message = str(excinfo.value)
-    assert CURRENT_RUNG_HOLD_VAR in message
-    assert CONTINUOUS_RUNG_HOLD_VAR in message
-    assert CRH_CONT_PHASE0_SHADOW_VAR in message
-
-
-def test_current_and_continuous_together_with_shadow_flag_is_accepted() -> None:
-    settings = load_trade_settings({**_BOTH_FAMILIES_ENV, CRH_CONT_PHASE0_SHADOW_VAR: "1"})
-    assert settings.current_rung_hold is True
-    assert settings.continuous_rung_hold is True
+def test_sending_family_id_plus_shadow_flag_both_carry_through() -> None:
+    settings = load_trade_settings(
+        {
+            **_TRADE_ONLY_ENV,
+            **_CATALOG_ROOT_ENV,
+            SENDING_FAMILY_ID_VAR: "pm_us_crh_cont",
+            LIVE_OBSERVATIONS_VAR: "1",
+            CRH_CONT_PHASE0_SHADOW_VAR: "1",
+        }
+    )
+    assert settings.sending_family_id == "pm_us_crh_cont"
     assert settings.phase0_shadow is True
 
 
@@ -828,30 +836,30 @@ def test_current_and_continuous_together_with_shadow_flag_is_accepted() -> None:
 # A1 -- BREEZY_ORDERS_ENABLED (single parse; converged review item 7)
 # ---------------------------------------------------------------------------
 
-_BOTH_SIBLINGS_ENV = {
+_WITH_SENDING_FAMILY_ENV = {
     **_TRADE_ONLY_ENV,
-    CURRENT_RUNG_HOLD_VAR: "1",
+    **_CATALOG_ROOT_ENV,
+    SENDING_FAMILY_ID_VAR: "pm_us_crh_v2",
     LIVE_OBSERVATIONS_VAR: "1",
-    TRADE_CATALOG_ROOT_VAR: "/tmp/breezy-trade-catalog",
 }
 
 
 def test_orders_enabled_requested_is_exact_one() -> None:
-    """Same ``== "1"`` idiom as the two siblings: absent / ``" 1"`` /
-    ``"true"`` / ``"yes"`` -> False; ``"1"`` (with both siblings set) -> True.
+    """Same ``== "1"`` idiom as the sibling flags: absent / ``" 1"`` /
+    ``"true"`` / ``"yes"`` -> False; ``"1"`` (with siblings set) -> True.
     """
-    absent = load_trade_settings(_BOTH_SIBLINGS_ENV).orders_enabled_requested
+    absent = load_trade_settings(_WITH_SENDING_FAMILY_ENV).orders_enabled_requested
     padded = load_trade_settings(
-        {**_BOTH_SIBLINGS_ENV, ORDERS_ENABLED_VAR: " 1"}
+        {**_WITH_SENDING_FAMILY_ENV, ORDERS_ENABLED_VAR: " 1"}
     ).orders_enabled_requested
     true_word = load_trade_settings(
-        {**_BOTH_SIBLINGS_ENV, ORDERS_ENABLED_VAR: "true"}
+        {**_WITH_SENDING_FAMILY_ENV, ORDERS_ENABLED_VAR: "true"}
     ).orders_enabled_requested
     yes_word = load_trade_settings(
-        {**_BOTH_SIBLINGS_ENV, ORDERS_ENABLED_VAR: "yes"}
+        {**_WITH_SENDING_FAMILY_ENV, ORDERS_ENABLED_VAR: "yes"}
     ).orders_enabled_requested
     one = load_trade_settings(
-        {**_BOTH_SIBLINGS_ENV, ORDERS_ENABLED_VAR: "1"}
+        {**_WITH_SENDING_FAMILY_ENV, ORDERS_ENABLED_VAR: "1"}
     ).orders_enabled_requested
 
     assert (absent, padded, true_word, yes_word, one) == (False, False, False, False, True)
@@ -861,17 +869,18 @@ def test_orders_enabled_requested_defaults_false_and_is_shadow_by_default() -> N
     assert load_trade_settings(_TRADE_ONLY_ENV).orders_enabled_requested is False
 
 
-def test_orders_enabled_without_current_rung_hold_is_a_settings_error() -> None:
+def test_orders_enabled_without_sending_family_id_is_a_settings_error() -> None:
     with pytest.raises(SettingsError) as excinfo:
-        load_trade_settings({**_TRADE_ONLY_ENV, ORDERS_ENABLED_VAR: "1"})
+        load_trade_settings(
+            {**_TRADE_ONLY_ENV, LIVE_OBSERVATIONS_VAR: "1", ORDERS_ENABLED_VAR: "1"}
+        )
     message = str(excinfo.value)
     assert ORDERS_ENABLED_VAR in message
-    assert CURRENT_RUNG_HOLD_VAR in message
-    assert LIVE_OBSERVATIONS_VAR in message
+    assert SENDING_FAMILY_ID_VAR in message
 
 
 def test_orders_enabled_without_live_observations_is_a_settings_error() -> None:
-    """``current_rung_hold`` alone cannot be True without ``live_observations``
+    """A sending family alone cannot be True without ``live_observations``
     (the prior cross-flag refusal), so this combination is refused by that
     earlier check before the new one is ever reached -- still refused,
     which is the property under test.
@@ -880,86 +889,68 @@ def test_orders_enabled_without_live_observations_is_a_settings_error() -> None:
         load_trade_settings(
             {
                 **_TRADE_ONLY_ENV,
+                **_CATALOG_ROOT_ENV,
                 ORDERS_ENABLED_VAR: "1",
-                CURRENT_RUNG_HOLD_VAR: "1",
-                TRADE_CATALOG_ROOT_VAR: "/tmp/breezy-trade-catalog",
+                SENDING_FAMILY_ID_VAR: "pm_us_crh_v2",
             }
         )
     message = str(excinfo.value)
-    assert CURRENT_RUNG_HOLD_VAR in message
+    assert SENDING_FAMILY_ID_VAR in message
     assert LIVE_OBSERVATIONS_VAR in message
 
 
-def test_orders_enabled_with_both_siblings_set_is_accepted() -> None:
-    settings = load_trade_settings({**_BOTH_SIBLINGS_ENV, ORDERS_ENABLED_VAR: "1"})
+def test_orders_enabled_with_sending_family_and_live_observations_is_accepted() -> None:
+    settings = load_trade_settings({**_WITH_SENDING_FAMILY_ENV, ORDERS_ENABLED_VAR: "1"})
 
     assert settings.orders_enabled_requested is True
-    assert settings.current_rung_hold is True
+    assert settings.sending_family_id == "pm_us_crh_v2"
     assert settings.live_observations is True
 
 
-# ---------------------------------------------------------------------------
-# Phase 1: BREEZY_ORDERS_ENABLED=1 accepts EITHER family alone (plus
-# live_observations) -- order_enablement.issue() was widened to match
-# (settings.current_rung_hold OR settings.continuous_rung_hold), so
-# continuous_rung_hold-only is no longer refused here at settings-load time.
-# Both families together still requires the Phase 0 shadow escape hatch
-# (tested above); that combination is accepted here for BREEZY_ORDERS_ENABLED
-# purposes exactly when the shadow flag is set.
-# ---------------------------------------------------------------------------
-
-_CONT_SIBLINGS_ENV = {
-    **_TRADE_ONLY_ENV,
-    CONTINUOUS_RUNG_HOLD_VAR: "1",
-    LIVE_OBSERVATIONS_VAR: "1",
-    TRADE_CATALOG_ROOT_VAR: "/tmp/breezy-trade-catalog",
-}
-
-
-def test_orders_enabled_with_continuous_rung_hold_only_is_accepted() -> None:
-    settings = load_trade_settings({**_CONT_SIBLINGS_ENV, ORDERS_ENABLED_VAR: "1"})
+def test_orders_enabled_with_the_continuous_family_alone_is_also_accepted() -> None:
+    """Any single sending family satisfies the precondition -- settings
+    stays agnostic to which ``composition_kind`` the family resolves to."""
+    settings = load_trade_settings(
+        {
+            **_TRADE_ONLY_ENV,
+            **_CATALOG_ROOT_ENV,
+            SENDING_FAMILY_ID_VAR: "pm_us_crh_cont",
+            LIVE_OBSERVATIONS_VAR: "1",
+            ORDERS_ENABLED_VAR: "1",
+        }
+    )
     assert settings.orders_enabled_requested is True
-    assert settings.current_rung_hold is False
-    assert settings.continuous_rung_hold is True
+    assert settings.sending_family_id == "pm_us_crh_cont"
 
 
 @pytest.mark.parametrize(
-    ("current", "continuous", "shadow", "expect_ok"),
+    ("family_id", "expect_ok"),
     [
-        (False, False, False, False),
-        (True, False, False, True),
-        (False, True, False, True),
-        (True, True, False, False),
-        (True, True, True, True),
+        (None, False),
+        ("pm_us_crh_v2", True),
+        ("pm_us_crh_cont", True),
     ],
 )
 def test_orders_enabled_family_precondition_matches_the_issue_gate(
-    current: bool, continuous: bool, shadow: bool, expect_ok: bool
+    family_id: str | None, expect_ok: bool
 ) -> None:
-    """Phase 1: the settings-load-time family precondition for
-    ``BREEZY_ORDERS_ENABLED=1`` accepts exactly the (current, continuous,
-    shadow) combinations ``phase1_family_permits``/``OrderSubmissionPermit.
-    issue()`` themselves would accept -- EITHER family alone, or both
-    together only under the shadow escape hatch. Neither family on is
-    always refused."""
+    """The settings-load-time family precondition for
+    ``BREEZY_ORDERS_ENABLED=1`` accepts exactly the case
+    ``OrderSubmissionPermit.issue()`` itself would accept -- a
+    ``sending_family_id`` set. No family set is always refused."""
     env: dict[str, str] = {
         **_TRADE_ONLY_ENV,
+        **_CATALOG_ROOT_ENV,
         LIVE_OBSERVATIONS_VAR: "1",
         ORDERS_ENABLED_VAR: "1",
-        TRADE_CATALOG_ROOT_VAR: "/tmp/breezy-trade-catalog",
     }
-    if current:
-        env[CURRENT_RUNG_HOLD_VAR] = "1"
-    if continuous:
-        env[CONTINUOUS_RUNG_HOLD_VAR] = "1"
-    if shadow:
-        env[CRH_CONT_PHASE0_SHADOW_VAR] = "1"
+    if family_id is not None:
+        env[SENDING_FAMILY_ID_VAR] = family_id
 
     if expect_ok:
         settings = load_trade_settings(env)
         assert settings.orders_enabled_requested is True
-        assert settings.current_rung_hold is current
-        assert settings.continuous_rung_hold is continuous
+        assert settings.sending_family_id == family_id
     else:
         with pytest.raises(SettingsError):
             load_trade_settings(env)
@@ -993,6 +984,10 @@ def test_loader_succeeds_on_the_exact_deployed_env_shape(
     that `main()`'s permit-audit lines ran before Nautilus's logging
     subsystem (and its stdlib bridge, `runtime.logging_bridge`) existed, so
     they were silently discarded regardless of this loader's outcome.
+
+    WP-11b (2026-09-19): the deployed env's ``BREEZY_CURRENT_RUNG_HOLD=1``
+    is migrated to ``BREEZY_SENDING_FAMILY_ID=pm_us_crh_v2`` (a REGISTERED
+    manifest, so settings-load-time manifest validation succeeds).
     """
     key_file = tmp_path / "polymarket_us_secret.key"
     key_file.write_text("fake-secret-key-material\n")
@@ -1005,7 +1000,7 @@ def test_loader_succeeds_on_the_exact_deployed_env_shape(
         "BREEZY_LOG_LEVEL": "INFO",
         "BREEZY_TRADING_ENABLED": "1",
         "BREEZY_ORDERS_ENABLED": "1",
-        "BREEZY_CURRENT_RUNG_HOLD": "1",
+        "BREEZY_SENDING_FAMILY_ID": "pm_us_crh_v2",
         "BREEZY_LIVE_OBSERVATIONS": "1",
         "BREEZY_TRADE_CATALOG_ROOT": str(catalog_root),
         "BREEZY_TRADING_OPERATOR_ID": "operator@example.com",
@@ -1031,7 +1026,6 @@ def test_loader_succeeds_on_the_exact_deployed_env_shape(
 
     assert settings is not None
     assert settings.orders_enabled_requested is True
-    assert settings.current_rung_hold is True
+    assert settings.sending_family_id == "pm_us_crh_v2"
     assert settings.live_observations is True
     assert settings.trader_id == "BREEZY-L001"
-
