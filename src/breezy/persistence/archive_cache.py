@@ -25,6 +25,8 @@ from breezy.persistence.archive_layout import BACKED_UP_ARCHIVE_DATASET_DIR
 
 __all__ = [
     "IEM_ASOS_1MIN_SOURCE",
+    "IEM_MOS_MODEL_PRODUCTS",
+    "IEM_MOS_SOURCE",
     "MANIFEST_VERSION",
     "ArchiveCache",
     "ArchiveCacheConcurrentWriterError",
@@ -41,11 +43,20 @@ __all__ = [
     "count_rows",
     "fsync_directory",
     "iem_asos_1min_request",
+    "iem_mos_request",
 ]
 
 MANIFEST_VERSION: Final[int] = 1
 IEM_ASOS_1MIN_SOURCE: Final[str] = "iem-asos-1min"
 _IEM_ASOS_1MIN_PRODUCT: Final[str] = "asos-1min"
+#: MOS forecast archive. A DIFFERENT source directory, a different manifest and
+#: a different product from the 1-minute observation archive, so a forecast
+#: payload can never occupy an observation's cache slot.
+IEM_MOS_SOURCE: Final[str] = "iem-mos"
+#: L-13. Model identity is explicit in BOTH the product and the ``model`` field,
+#: so NBS and GFS can never share a cache key, a payload file or a manifest
+#: entry even if one of the two fields were ever ignored by a reader.
+IEM_MOS_MODEL_PRODUCTS: Final[dict[str, str]] = {"NBS": "mos-nbs", "GFS": "mos-gfs"}
 _MANIFEST_NAME: Final[str] = "coverage.json"
 _LOCK_NAME: Final[str] = "coverage.json.lock"
 _SOURCE_PATTERN: Final[re.Pattern[str]] = re.compile(r"\A[a-z0-9-]+\Z")
@@ -194,6 +205,34 @@ def iem_asos_1min_request(station: str, year: int) -> ArchiveRequest:
         window_start=int(start.timestamp()) * 1_000_000_000,
         window_end=int(end.timestamp()) * 1_000_000_000,
         model=None,
+    )
+
+
+def iem_mos_request(station: str, year: int, model: str) -> ArchiveRequest:
+    """One station-year of one MOS model.
+
+    The window is ``[Jan 1 00:00Z, Dec 31 23:59Z]`` of the requested year --
+    the bounds the live service was VERIFIED against, and the bounds the URL
+    carries. MOS runtimes fall on the hour, so consecutive years are disjoint
+    and nothing falls in the one-minute gap at the boundary.
+    """
+    if isinstance(year, bool) or not isinstance(year, int):
+        raise TypeError("year must be an int")
+    product = IEM_MOS_MODEL_PRODUCTS.get(model)
+    if product is None:
+        raise ValueError(
+            f"unknown MOS model {model!r}; the closed set is "
+            f"{sorted(IEM_MOS_MODEL_PRODUCTS)} -- refused rather than sanitised"
+        )
+    start = dt.datetime(year, 1, 1, tzinfo=dt.UTC)
+    end = dt.datetime(year, 12, 31, 23, 59, tzinfo=dt.UTC)
+    return ArchiveRequest(
+        source=IEM_MOS_SOURCE,
+        station=station,
+        product=product,
+        window_start=int(start.timestamp()) * 1_000_000_000,
+        window_end=int(end.timestamp()) * 1_000_000_000,
+        model=model,
     )
 
 
