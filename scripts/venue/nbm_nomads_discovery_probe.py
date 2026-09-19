@@ -1,8 +1,20 @@
 #!/usr/bin/env python
 """FC-0a-3 -- one-shot NOMADS/NBM discovery probe (Seam A only).
 
-EVIDENCE ONLY -- NEVER INGEST. Candidate URL shapes are UNVERIFIED constants.
-Pinned ANSWERED/ABSENT values belong in a follow-up commit citing evidence.
+EVIDENCE ONLY -- NEVER INGEST. Most candidate URL shapes are still UNVERIFIED
+constants; each says so in its own rationale. Pinned ANSWERED/ABSENT values
+belong in a follow-up commit citing evidence.
+
+VERIFIED 2026-09-19 (docs/evidence/nbm_nomads_discovery_probe_20260919T133813Z/
+p5_lag_20260919_12.probe.json, a live directory listing): the NBS bulletin is
+COLLECTIVE -- ``.../text/blend_nbstx.t{hh}z`` -- with every station as a block
+inside that one file. The same run REFUTED every per-station URL guess this
+module previously carried (ICAO suffix, ICAO prefix, both under the wrong
+bulletin letters ``nbsta`` and ``nbstx``): none of those filenames appeared in
+the directory listing that NOMADS actually served, and the live probe got
+403/404 on each. Do not re-derive a per-station bulletin URL for this
+endpoint -- see the comment above ``_NBS_COLLECTIVE_BULLETIN`` below for the
+full refutation record before spending budget re-checking it.
 
 Containment: ProbeTransport, allowed_hosts={nomads.ncep.noaa.gov}, hard
 REQUEST_BUDGET=18, GET only, no host/URL flag or env override. Header-bearing
@@ -36,7 +48,13 @@ from breezy.ingest.probe_transport import (
 HOST: str = "nomads.ncep.noaa.gov"
 BASE_URL: str = f"https://{HOST}"
 ALLOWED_HOSTS: frozenset[str] = frozenset({HOST})
-MAX_BODY_BYTES: int = 4 * 1024 * 1024
+#: The verified collective NBS bulletin (see module docstring) ran 20-28 MB
+#: across the four cycles sampled live on 2026-09-19 (directory listing
+#: sizes: 20M/06Z, 27M/00Z-ish siblings, 28M/12Z). 4 MiB -- sized for a
+#: per-station file that turned out not to exist -- truncates every real
+#: response via OversizeBodyError. 48 MiB gives ~70% headroom over the
+#: largest sampled cycle without materially weakening the cap as a control.
+MAX_BODY_BYTES: int = 48 * 1024 * 1024
 REQUEST_BUDGET: int = 18
 P1_INDEX_DESCENT_BUDGET: int = 3
 P2_BULLETIN_SHAPES_BUDGET: int = 4
@@ -73,8 +91,17 @@ STATIONS: tuple[str, ...] = ("KLAX", "KMDW", "KMIA", "KSFO")
 
 _NS = 1_000_000_000
 _BLEND = "/pub/data/nccf/com/blend/prod"
+#: VERIFIED 2026-09-19 (docs/evidence/nbm_nomads_discovery_probe_20260919T134336Z/
+#: p2_collective_nbstx.probe.json): the live collective bulletin's per-station
+#: header carries a version token between NBM and NBS --
+#: "KMIA    NBM V5.0 NBS GUIDANCE    9/19/2026  1200 UTC" -- that the
+#: original UNVERIFIED regex omitted (it required "NBM\s+NBS\s+GUIDANCE"
+#: literally), which parsed zero station blocks out of a real, correctly
+#: fetched 200 body. `V\d+\.\d+` generalises only the version-number field,
+#: which is the one part of this header expected to change across NBM
+#: releases; the surrounding literal tokens are exactly what was observed.
 _STATION_HEADER_RE = re.compile(
-    r"^[ ]?(?P<icao>K[A-Z]{3})\s+NBM\s+NBS\s+GUIDANCE\b", re.MULTILINE
+    r"^[ ]?(?P<icao>K[A-Z]{3})\s+NBM\s+V\d+\.\d+\s+NBS\s+GUIDANCE\b", re.MULTILINE
 )
 _TXN_ROW_RE = re.compile(r"^[ ]*TXN\b(?P<fields>.*)$", re.MULTILINE)
 _ROW_RE = re.compile(r"^[ ]*(?P<id>[A-Z][A-Z0-9]{1,3})\s+\S", re.MULTILINE)
@@ -94,44 +121,55 @@ def _shape(name: str, kind: str, path: str, why: str, phase: str) -> CandidateSh
     return CandidateShape(name, kind, path, f"UNVERIFIED: {why}", phase)
 
 
-#: UNVERIFIED. Every path/filename/cycle/retention claim is a hypothesis.
+def _verified_shape(name: str, kind: str, path: str, why: str, phase: str) -> CandidateShape:
+    return CandidateShape(name, kind, path, f"VERIFIED 2026-09-19: {why}", phase)
+
+
+#: UNVERIFIED unless the candidate below says VERIFIED. Every path/filename/
+#: cycle/retention claim not marked VERIFIED remains a hypothesis.
 _C1 = f"{_BLEND}/blend.{{yyyymmdd}}"
 _TEXT = f"{_C1}/{{hh}}/text"
-CANDIDATE_SHAPES: tuple[CandidateShape, ...] = tuple(
-    _shape(*row)
-    for row in (
-        ("blend_prod_index", "index", f"{_BLEND}/", "C1 blend prod root.", "p1_index"),
-        ("blend_dated_index", "index", f"{_C1}/", "C1 dated cycle directory.", "p1_index"),
-        ("blend_cycle_text_index", "index", f"{_TEXT}/", "C1 text/ of one cycle.", "p1_index"),
-        (
-            "collective_nbsta",
-            "collective_bulletin",
-            f"{_TEXT}/blend_nbsta.t{{hh}}z",
-            "C2 collective NBS bulletin.",
-            "p2_bulletin",
-        ),
-        (
-            "per_station_nbsta_suffix",
-            "per_station_bulletin",
-            f"{_TEXT}/blend_nbsta.t{{hh}}z.{{icao}}",
-            "C3 ICAO suffix.",
-            "p2_bulletin",
-        ),
-        (
-            "per_station_nbsta_prefix",
-            "per_station_bulletin",
-            f"{_TEXT}/{{icao}}.nbsta.t{{hh}}z",
-            "C3 ICAO prefix.",
-            "p2_bulletin",
-        ),
-        (
-            "per_station_nbstx",
-            "per_station_bulletin",
-            f"{_TEXT}/blend_nbstx.t{{hh}}z.{{icao}}",
-            "C3 NBS TX variant.",
-            "p2_bulletin",
-        ),
-    )
+
+#: VERIFIED 2026-09-19 by a live directory listing of `.../blend.20260919/12/
+#: text/` (docs/evidence/nbm_nomads_discovery_probe_20260919T133813Z/
+#: p5_lag_20260919_12.probe.json). That listing contains exactly five
+#: bulletins and none carries a per-station suffix or prefix:
+#:     blend_nbetx.t12z  blend_nbhtx.t12z  blend_nbptx.t12z
+#:     blend_nbstx.t12z   <- NBS text: the collective bulletin this probe needs
+#:     blend_nbxtx.t12z
+#: It is COLLECTIVE: every station (KLAX/KMDW/KMIA/KSFO and every other NBM
+#: station) is a block inside this one ~20-28 MB file, never one file per
+#: station.
+#:
+#: REFUTED the same run by that same listing (the guessed filenames below
+#: simply never appeared in it) plus a live 403/404 on each direct probe:
+#:   - "{_TEXT}/blend_nbsta.t{{hh}}z"           wrong letter (nbsta, not
+#:     nbstx) -- HTTP 404 as `p2_collective_nbsta`.
+#:   - "{_TEXT}/blend_nbsta.t{{hh}}z.{{icao}}"  ICAO suffix, nbsta -- HTTP 403.
+#:   - "{_TEXT}/{{icao}}.nbsta.t{{hh}}z"        ICAO prefix, nbsta -- HTTP 404.
+#:   - "{_TEXT}/blend_nbstx.t{{hh}}z.{{icao}}"  ICAO suffix, nbstx -- HTTP 403.
+#: Do not re-derive a per-station bulletin URL for this endpoint: none of
+#: those four candidates ever appeared in the directory listing NOMADS
+#: actually served, and re-probing them only re-spends budget confirming a
+#: fact already in evidence.
+_NBS_COLLECTIVE_BULLETIN = f"{_TEXT}/blend_nbstx.t{{hh}}z"
+
+CANDIDATE_SHAPES: tuple[CandidateShape, ...] = (
+    _shape("blend_prod_index", "index", f"{_BLEND}/", "C1 blend prod root.", "p1_index"),
+    _shape("blend_dated_index", "index", f"{_C1}/", "C1 dated cycle directory.", "p1_index"),
+    _shape(
+        "blend_cycle_text_index", "index", f"{_TEXT}/", "C1 text/ of one cycle.", "p1_index"
+    ),
+    _verified_shape(
+        "collective_nbstx",
+        "collective_bulletin",
+        _NBS_COLLECTIVE_BULLETIN,
+        "C2 collective NBS bulletin; confirmed live via the directory listing "
+        "at blend.20260919/12/text/ and is the only NBS bulletin this endpoint "
+        "serves (see the comment above this constant for the refutation record "
+        "of every per-station guess).",
+        "p2_bulletin",
+    ),
 )
 
 
@@ -371,11 +409,21 @@ def build_discovery_plan(
         steps.append(
             _step(
                 f"p5_lag_{yyyymmdd}_{hour}",
-                f"{_BLEND}/blend.{yyyymmdd}/{hour}/text/",
+                # VERIFIED 2026-09-19: the bare `.../text/` directory index is
+                # dynamically rendered and carries no Last-Modified header (the
+                # first live re-run against the corrected bulletin URL left q8
+                # UNANSWERED for exactly this reason). Only the bulletin FILE
+                # itself -- the same verified collective shape as p2 -- has a
+                # Last-Modified to compare against the cycle's nominal runtime.
+                _NBS_COLLECTIVE_BULLETIN.format(yyyymmdd=yyyymmdd, hh=hour),
                 "p5_lag",
                 ("q8_retrospective_lag_samples", "q4_cycles_per_day_with_txn"),
-                f"UNVERIFIED: cycle-hour {hour}Z index (nominal {nominal}).",
-                "index",
+                (
+                    f"VERIFIED 2026-09-19 shape, UNVERIFIED lag: {hour}Z collective "
+                    f"NBS bulletin (nominal {nominal}); its Last-Modified vs the "
+                    "nominal runtime is the retrospective-lag datum for q8."
+                ),
+                "collective_bulletin",
             )
         )
     steps.append(

@@ -43,8 +43,11 @@ PROBE_UA: Final[str] = "breezy-probe (contact: ops@example.invalid)"
 _NOMADS_HOST: Final[str] = "nomads.ncep.noaa.gov"
 
 #: A served NBS station block that has rows but NO TXN group. T8's datum.
+#: Header carries "V5.0" per the real grammar captured live 2026-09-19 (see
+#: `_REAL_KMIA_BLOCK_EXCERPT` below) -- earlier fixtures omitted it and so
+#: never matched the real bulletin either.
 _NO_TXN_BULLETIN: Final[str] = (
-    " KMIA   NBM  NBS GUIDANCE  9/17/2026  1200 UTC\n"
+    " KMIA   NBM V5.0 NBS GUIDANCE  9/17/2026  1200 UTC\n"
     "\n"
     " UTC  18 21 00 03 06 09 12\n"
     " TMP  86 84 82 80 78 77 76\n"
@@ -53,6 +56,19 @@ _NO_TXN_BULLETIN: Final[str] = (
 
 #: Bytes that are within any reasonable body cap and are not a bulletin.
 _GARBLED_BODY: Final[str] = "<<<\x00not a bulletin>>>\n???? #####\n" * 8
+
+#: VERBATIM excerpt of the KMIA block from the live collective bulletin
+#: (docs/evidence/nbm_nomads_discovery_probe_20260919T134336Z/
+#: p2_collective_nbstx.probe.json). Proves the real header grammar is
+#: "<ICAO>    NBM V5.0 NBS GUIDANCE    <date>  <time> UTC" -- with a version
+#: token between NBM and NBS that the original UNVERIFIED regex omitted.
+_REAL_KMIA_BLOCK_EXCERPT: Final[str] = (
+    "KMIA    NBM V5.0 NBS GUIDANCE    9/19/2026  1200 UTC\n"
+    " DT /SEP  19/SEP  20                /SEP  21                /SEP  22      \n"
+    " UTC  18 21 00 03 06 09 12 15 18 21 00 03 06 09 12 15 18 21 00 03 06 09 12 \n"
+    " FHR  06 09 12 15 18 21 24 27 30 33 36 39 42 45 48 51 54 57 60 63 66 69 72 \n"
+    " TXN        89          77          89          76          89          77\n"
+)
 
 
 def _load_script(path: Path) -> ModuleType:
@@ -107,12 +123,47 @@ def test_the_probe_transport_can_only_reach_nomads() -> None:
     assert probe.BASE_URL == f"https://{_NOMADS_HOST}"
     assert probe.ALLOWED_HOSTS == frozenset({_NOMADS_HOST})
     for shape in probe.CANDIDATE_SHAPES:
-        assert "UNVERIFIED" in shape.rationale
+        # A candidate is either an honestly-labelled guess (UNVERIFIED) or a
+        # dated, evidence-backed fact (VERIFIED <date>) -- never unlabelled.
+        assert shape.rationale.startswith("UNVERIFIED") or shape.rationale.startswith(
+            "VERIFIED 2026-09-19"
+        )
         assert shape.path_template.startswith("/")
         assert "://" not in shape.path_template
         assert "nomads" not in shape.path_template
     transport = _transport()
     assert transport._base_url == probe.BASE_URL
+
+
+# ==========================================================================
+# T1b -- the NBS bulletin candidate is the verified collective shape
+# ==========================================================================
+
+
+def test_the_nbs_bulletin_candidate_is_the_verified_collective_shape_with_no_per_station_suffix() -> (
+    None
+):
+    """FC-0a-3 evidence, 2026-09-19 (`p5_lag_20260919_12.probe.json`): the live
+    directory listing of `.../blend.20260919/12/text/` contains exactly five
+    bulletins -- `blend_nbstx.t12z` (the NBS text bulletin, collective, no
+    ICAO) among them -- and NO per-station-suffixed or -prefixed filename.
+    Every per-station guess this module once carried was refuted the same
+    run (403/404), so the only registered bulletin candidate must be the
+    verified collective shape, never a per-station one.
+    """
+    bulletin_shapes = [
+        shape for shape in probe.CANDIDATE_SHAPES if shape.kind == "collective_bulletin"
+    ]
+    assert len(bulletin_shapes) == 1, "exactly one collective bulletin candidate is registered"
+    shape = bulletin_shapes[0]
+    assert "{icao}" not in shape.path_template, "the bulletin is collective, not per-station"
+    assert shape.path_template.endswith("blend_nbstx.t{hh}z")
+    assert shape.rationale.startswith("VERIFIED 2026-09-19")
+    assert "UNVERIFIED" not in shape.rationale
+
+    # No refuted per-station bulletin candidate remains registered for active
+    # probing -- the 2026-09-19 directory listing evidence refutes all of them.
+    assert not any(shape.kind == "per_station_bulletin" for shape in probe.CANDIDATE_SHAPES)
 
 
 # ==========================================================================
@@ -204,6 +255,33 @@ def test_the_probe_does_not_widen_the_shipped_default_allowlist() -> None:
         if isinstance(node, ast.ImportFrom) and node.module
         for module in (node.module,)
     }
+
+
+# ==========================================================================
+# T4b -- q8's retrospective-lag steps target the bulletin file, not the index
+# ==========================================================================
+
+
+def test_the_retrospective_lag_steps_target_the_bulletin_file_not_the_bare_index() -> None:
+    """FC-0a-3 evidence, 2026-09-19: the live directory-index page for a
+    cycle carries no Last-Modified header (it is dynamically rendered), so
+    the original UNVERIFIED p5_lag steps -- which fetched only the bare
+    `.../text/` index -- could never answer q8. The actual bulletin FILE
+    does carry Last-Modified (confirmed by the same run's conditional GET).
+    Each p5_lag step must therefore fetch the collective bulletin for its
+    cycle hour, matching the verified shape from T1b.
+    """
+    plan = probe.build_discovery_plan()
+    lag_steps = [step for step in plan if step.phase == "p5_lag"]
+    assert len(lag_steps) == 4
+    for step in lag_steps:
+        assert step.path.endswith("z"), f"{step.label}: expected a bulletin file path"
+        assert not step.path.endswith("/text/"), (
+            f"{step.label}: fetching the bare index cannot answer q8 -- it carries "
+            "no Last-Modified header"
+        )
+        assert "blend_nbstx.t" in step.path
+        assert "q8_retrospective_lag_samples" in step.questions
 
 
 # ==========================================================================
@@ -338,6 +416,29 @@ def test_a_2xx_without_a_txn_group_is_recorded_absent_with_its_counts() -> None:
     assert verdict.txn_groups == 0
     assert verdict.row_count >= 1
     assert verdict.field_count == 0
+
+
+# ==========================================================================
+# T8b -- the real "NBM V5.0 NBS GUIDANCE" header is recognized
+# ==========================================================================
+
+
+def test_the_real_nbm_v5_header_grammar_is_recognized_and_yields_an_answered_verdict() -> None:
+    """FC-0a-3 evidence, 2026-09-19: the live collective bulletin's per-station
+    header carries a version token -- "NBM V5.0 NBS GUIDANCE", not "NBM NBS
+    GUIDANCE" -- that the original UNVERIFIED station-header regex omitted,
+    which is why the first live re-run against the corrected URL still parsed
+    zero station blocks (q1/q6 ABSENT despite a 200 with a real body).
+    """
+    blocks = probe.parse_station_blocks(_REAL_KMIA_BLOCK_EXCERPT)
+    assert len(blocks) == 1
+    assert blocks[0].startswith("KMIA")
+
+    verdict = probe.evaluate_shape_verdict(status_code=200, body=_REAL_KMIA_BLOCK_EXCERPT)
+    assert verdict.state == "ANSWERED"
+    assert verdict.station_blocks == 1
+    assert verdict.txn_groups == 1
+    assert verdict.field_count > 0
 
 
 # ==========================================================================
