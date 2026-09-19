@@ -57,7 +57,6 @@ if str(_SCRIPTS_ANALYSIS_DIR) not in sys.path:
 
 from forecast_climate_day_map import (  # noqa: E402
     TXN_MAX_PERIOD_END_UTC_HOUR,
-    TXN_MAX_PERIOD_HOURS,
     climate_day_for_txn,
 )
 from pmr_climatology_study import CliRecord  # noqa: E402
@@ -80,6 +79,18 @@ __all__ = [
 
 _NS: Final[int] = 10**9
 _SECONDS_PER_HOUR: Final[int] = 3600
+
+#: UNVERIFIED (docs/evidence/FC_0a_TXN_OCCUPANCY_2026-09-19.md, "What is
+#: settled vs what is not"). The 2026-09-19 occupancy census fixed WHEN
+#: `txn` publishes (TXN_MAX_PERIOD_END_UTC_HOUR, imported above), never
+#: HOW LONG the underlying aggregation window is. Carried forward,
+#: unchanged, only for this module's window-coverage corollary check
+#: below (an informational forecast-accuracy signal, never a day-labeling
+#: input -- ``forecast_climate_day_map.climate_day_for_txn`` no longer
+#: uses a period length at all, by design). Do not read this as confirmed
+#: for the corrected 00Z end hour; it is exactly as unverified as it was
+#: for the superseded 06Z end hour.
+_WINDOW_COVERAGE_PERIOD_HOURS_UNVERIFIED: Final[int] = 18
 
 DEFAULT_OUTPUT: Final[Path] = (
     Path(__file__).resolve().parents[2]
@@ -125,12 +136,21 @@ class WindowBounds:
 def window_bounds(std_utc_offset_hours: float) -> WindowBounds:
     """Compute the TXN daily-max window's local-standard hour bounds.
 
-    Pure arithmetic on the frozen constants in ``forecast_climate_day_map``;
-    no clock, no ``zoneinfo``. ``std_utc_offset_hours`` must be an integer
-    number of hours for the result to line up with a whole local hour --
-    true of every site in ``sites.toml`` today.
+    Pure arithmetic on ``TXN_MAX_PERIOD_END_UTC_HOUR`` (measured; imported
+    from ``forecast_climate_day_map``) and
+    ``_WINDOW_COVERAGE_PERIOD_HOURS_UNVERIFIED`` (NOT measured -- see that
+    constant's docstring); no clock, no ``zoneinfo``. ``std_utc_offset_hours``
+    must be an integer number of hours for the result to line up with a
+    whole local hour -- true of every site in ``sites.toml`` today.
     """
-    start = int((TXN_MAX_PERIOD_END_UTC_HOUR - TXN_MAX_PERIOD_HOURS + std_utc_offset_hours) % 24)
+    start = int(
+        (
+            TXN_MAX_PERIOD_END_UTC_HOUR
+            - _WINDOW_COVERAGE_PERIOD_HOURS_UNVERIFIED
+            + std_utc_offset_hours
+        )
+        % 24
+    )
     end = int((TXN_MAX_PERIOD_END_UTC_HOUR + std_utc_offset_hours) % 24)
     return WindowBounds(start_local_hour=start, end_local_hour=end, wraps=end <= start)
 
@@ -151,25 +171,29 @@ def climate_day_for_real_final(
 ) -> dt.date:
     """Map the canonical daily-max TXN row targeting a real archived ``climate_day``.
 
-    Builds ``runtime = 12Z(climate_day)`` and ``ftime = 06Z(climate_day + 1
-    day)`` -- the frozen constants' own period -- and delegates to
-    ``climate_day_for_txn``. The runtime choice does not affect the result
-    (the mapper is runtime-invariant given a fixed ``ftime``; see
-    ``test_off_grid_runtime_is_accepted_not_refused``), so any valid runtime
-    at or before ``ftime`` would do; 12Z(D) is used because it is the
-    period's own documented start.
+    Builds ``runtime = 12Z(climate_day)`` and ``ftime = 00Z(climate_day + 1
+    day)`` -- the MEASURED daily-MAX end hour (Phase B2; see
+    ``TXN_MAX_PERIOD_END_UTC_HOUR``) -- and delegates to
+    ``climate_day_for_txn`` with ``kind="max"``. The runtime choice does not
+    affect the result (the mapper is runtime-invariant given a fixed
+    ``ftime``; see ``test_off_grid_runtime_is_accepted_not_refused``), so
+    any valid runtime at or before ``ftime`` would do; 12Z(D) is used
+    because it is a documented cycle start.
     """
     runtime = dt.datetime(
         climate_day.year, climate_day.month, climate_day.day, 12, tzinfo=dt.UTC
     )
     ftime_day = climate_day + dt.timedelta(days=1)
-    ftime = dt.datetime(ftime_day.year, ftime_day.month, ftime_day.day, 6, tzinfo=dt.UTC)
+    ftime = dt.datetime(
+        ftime_day.year, ftime_day.month, ftime_day.day, TXN_MAX_PERIOD_END_UTC_HOUR, tzinfo=dt.UTC
+    )
     return climate_day_for_txn(
         icao=icao,
         runtime_ns=int(runtime.timestamp()) * _NS,
         ftime_ns=int(ftime.timestamp()) * _NS,
         std_utc_offset_hours=std_utc_offset_hours,
         model=model,
+        kind="max",
     )
 
 
@@ -263,7 +287,7 @@ def build_report(results: Sequence[StationAlignmentResult]) -> str:
         "`scripts/analysis/forecast_txn_climate_day_cli_alignment.py`.",
         "",
         f"TXN_MAX_PERIOD_END_UTC_HOUR={TXN_MAX_PERIOD_END_UTC_HOUR} "
-        f"TXN_MAX_PERIOD_HOURS={TXN_MAX_PERIOD_HOURS}",
+        f"window_coverage_period_hours_unverified={_WINDOW_COVERAGE_PERIOD_HOURS_UNVERIFIED}",
         "",
         "| station | offset | n_days | day-label mismatches | window-miss rate | n misses / n with time |",
         "|---|---|---|---|---|---|",

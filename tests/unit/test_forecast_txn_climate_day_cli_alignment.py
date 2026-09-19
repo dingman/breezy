@@ -74,47 +74,51 @@ def _cli_record(
 # ---------------------------------------------------------------------------
 
 
-def test_window_bounds_mia_wraps_past_local_midnight(align_module: ModuleType) -> None:
+def test_window_bounds_mia_stays_within_the_same_local_day(align_module: ModuleType) -> None:
+    # Phase B2: TXN_MAX_PERIOD_END_UTC_HOUR moved 6 -> 0 (measured); bounds
+    # shift accordingly. MIA no longer wraps past local midnight.
     bounds = align_module.window_bounds(-5.0)
-    assert bounds.start_local_hour == 7
-    assert bounds.end_local_hour == 1
-    assert bounds.wraps is True
-
-
-def test_window_bounds_mdw_ends_exactly_at_local_midnight(align_module: ModuleType) -> None:
-    bounds = align_module.window_bounds(-6.0)
-    assert bounds.start_local_hour == 6
-    assert bounds.end_local_hour == 0
-    assert bounds.wraps is True
-
-
-def test_window_bounds_sfo_lax_stay_within_the_same_local_day(align_module: ModuleType) -> None:
-    bounds = align_module.window_bounds(-8.0)
-    assert bounds.start_local_hour == 4
-    assert bounds.end_local_hour == 22
+    assert bounds.start_local_hour == 1
+    assert bounds.end_local_hour == 19
     assert bounds.wraps is False
+
+
+def test_window_bounds_mdw_starts_exactly_at_local_midnight(align_module: ModuleType) -> None:
+    bounds = align_module.window_bounds(-6.0)
+    assert bounds.start_local_hour == 0
+    assert bounds.end_local_hour == 18
+    assert bounds.wraps is False
+
+
+def test_window_bounds_sfo_lax_wraps_past_local_midnight(align_module: ModuleType) -> None:
+    # Phase B2: SFO/LAX now wraps (previously did not, under the 06Z end hour).
+    bounds = align_module.window_bounds(-8.0)
+    assert bounds.start_local_hour == 22
+    assert bounds.end_local_hour == 16
+    assert bounds.wraps is True
 
 
 def test_is_hour_in_window_wrapping_window_accepts_late_and_early_hours(
     align_module: ModuleType,
 ) -> None:
-    bounds = align_module.window_bounds(-5.0)  # MIA: start=7, end=1, wraps
-    assert align_module.is_hour_in_window(7, bounds) is True
+    bounds = align_module.window_bounds(-8.0)  # SFO/LAX: start=22, end=16, wraps
+    assert align_module.is_hour_in_window(22, bounds) is True
     assert align_module.is_hour_in_window(23, bounds) is True
     assert align_module.is_hour_in_window(0, bounds) is True
-    assert align_module.is_hour_in_window(6, bounds) is False
-    assert align_module.is_hour_in_window(2, bounds) is False
+    assert align_module.is_hour_in_window(15, bounds) is True
+    assert align_module.is_hour_in_window(16, bounds) is False
+    assert align_module.is_hour_in_window(21, bounds) is False
 
 
 def test_is_hour_in_window_non_wrapping_window_rejects_late_night(
     align_module: ModuleType,
 ) -> None:
-    bounds = align_module.window_bounds(-8.0)  # SFO/LAX: start=4, end=22, no wrap
-    assert align_module.is_hour_in_window(4, bounds) is True
-    assert align_module.is_hour_in_window(21, bounds) is True
-    assert align_module.is_hour_in_window(22, bounds) is False
-    assert align_module.is_hour_in_window(23, bounds) is False
-    assert align_module.is_hour_in_window(3, bounds) is False
+    bounds = align_module.window_bounds(-5.0)  # MIA: start=1, end=19, no wrap
+    assert align_module.is_hour_in_window(1, bounds) is True
+    assert align_module.is_hour_in_window(18, bounds) is True
+    assert align_module.is_hour_in_window(19, bounds) is False
+    assert align_module.is_hour_in_window(0, bounds) is False
+    assert align_module.is_hour_in_window(20, bounds) is False
 
 
 # ---------------------------------------------------------------------------
@@ -163,13 +167,14 @@ def test_align_station_confirms_the_day_label_over_synthetic_real_dated_rows(
 def test_align_station_flags_a_max_time_outside_the_window_as_a_window_miss(
     align_module: ModuleType, pmr: ModuleType
 ) -> None:
+    # Phase B2 bounds for MDW (-6.0): start=0, end=18 -- hour 20 is outside.
     day = dt.date(2021, 1, 22)
-    finals = {day: _cli_record(pmr, city="MDW", climate_day=day, max_hour=0, max_minute=13)}
+    finals = {day: _cli_record(pmr, city="MDW", climate_day=day, max_hour=20, max_minute=13)}
     result = align_module.align_station(
         icao="KMDW", city="MDW", std_utc_offset_hours=-6.0, finals_by_day=finals
     )
     assert result.day_label_confirmed is True  # window miss != day-label mismatch
-    assert result.window_misses == ((day, 0),)
+    assert result.window_misses == ((day, 20),)
     assert result.window_miss_rate == pytest.approx(1.0)
 
 

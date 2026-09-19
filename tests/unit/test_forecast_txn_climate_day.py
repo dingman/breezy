@@ -34,7 +34,6 @@ _FIXTURES_PATH = (
 
 _FORBIDDEN_IDENTIFIERS: Final[frozenset[str]] = frozenset({"side", "leg", "yes", "no"})
 _NS: Final[int] = 10**9
-_PERIOD_HOURS: Final[int] = 18
 
 
 def _load_module(name: str) -> ModuleType:
@@ -79,17 +78,19 @@ def _call(
     ftime_ns: int | None = None,
     std_utc_offset_hours: float | None = -5.0,
     model: str = "NBM_NBS",
+    kind: str = "max",
 ) -> dt.date:
     if runtime_ns is None:
         runtime_ns = _utc_ns(2026, 7, 15, 12)
     if ftime_ns is None:
-        ftime_ns = _utc_ns(2026, 7, 16, 6)
+        ftime_ns = _utc_ns(2026, 7, 16, 0)
     return mapper.climate_day_for_txn(  # type: ignore[no-any-return]
         icao=icao,
         runtime_ns=runtime_ns,
         ftime_ns=ftime_ns,
         std_utc_offset_hours=std_utc_offset_hours,
         model=model,
+        kind=kind,
     )
 
 
@@ -100,6 +101,7 @@ def _call_row(mapper: ModuleType, row: ForecastDayFixture, **overrides: object) 
         "ftime_ns": row.ftime_ns,
         "std_utc_offset_hours": row.std_utc_offset_hours,
         "model": row.model,
+        "kind": row.kind,
     }
     kwargs.update(overrides)
     return mapper.climate_day_for_txn(**kwargs)  # type: ignore[no-any-return]
@@ -142,10 +144,11 @@ def _imported_roots(path: Path) -> set[str]:
 def test_climate_day_for_txn_delegates_every_conversion_to_local_standard_date(
     mapper: ModuleType,
 ) -> None:
-    ftime_ns = _utc_ns(2026, 7, 16, 6)
+    # P2 (Phase B2): no period-length subtraction -- climate_day_for_txn
+    # delegates ftime_ns itself, directly, to local_standard_date.
+    ftime_ns = _utc_ns(2026, 7, 16, 0)
     runtime_ns = _utc_ns(2026, 7, 15, 12)
     offset = _offset_for("KMIA")
-    expected_valid_start = ftime_ns - _PERIOD_HOURS * 3600 * _NS
     with patch.object(gaps, "local_standard_date", wraps=gaps.local_standard_date) as spy:
         result = _call(
             mapper,
@@ -154,8 +157,8 @@ def test_climate_day_for_txn_delegates_every_conversion_to_local_standard_date(
             ftime_ns=ftime_ns,
             std_utc_offset_hours=offset,
         )
-    spy.assert_called_once_with(expected_valid_start, offset)
-    assert result == gaps.local_standard_date(expected_valid_start, offset)
+    spy.assert_called_once_with(ftime_ns, offset)
+    assert result == gaps.local_standard_date(ftime_ns, offset)
 
 
 @pytest.mark.parametrize(
@@ -183,10 +186,15 @@ def test_frozen_fixtures_map_to_expected_climate_day(
     ],
     ids=["-5.0", "-6.0", "-8.0", "-8.0"],
 )
-def test_06z_ftime_maps_to_the_valid_start_local_day(
+def test_a_real_00z_row_is_accepted_as_the_max_period(
     mapper: ModuleType, icao: str, std_utc_offset_hours: float
 ) -> None:
-    ftime_ns = _utc_ns(2026, 7, 16, 6)
+    """RED-evidence case 1 (FC-0a-4 Phase B2): a real ftime=00Z row, the
+    MEASURED daily-MAX end hour, must be ACCEPTED and correctly mapped --
+    not refused, as the pre-correction TXN_MAX_PERIOD_END_UTC_HOUR=6 did
+    for every real row (0/14,720 occupancy at 06Z; see
+    docs/evidence/FC_0a_TXN_OCCUPANCY_2026-09-19.md)."""
+    ftime_ns = _utc_ns(2026, 7, 16, 0)
     runtime_ns = _utc_ns(2026, 7, 15, 12)
     mapped = _call(
         mapper,
@@ -194,10 +202,71 @@ def test_06z_ftime_maps_to_the_valid_start_local_day(
         runtime_ns=runtime_ns,
         ftime_ns=ftime_ns,
         std_utc_offset_hours=std_utc_offset_hours,
+        kind="max",
     )
-    valid_start_ns = ftime_ns - mapper.TXN_MAX_PERIOD_HOURS * 3600 * _NS
-    assert mapped == gaps.local_standard_date(valid_start_ns, std_utc_offset_hours)
+    assert mapped == gaps.local_standard_date(ftime_ns, std_utc_offset_hours)
     assert mapped == dt.date(2026, 7, 15)
+
+
+@pytest.mark.parametrize(
+    ("icao", "std_utc_offset_hours"),
+    [
+        ("KMIA", -5.0),
+        ("KMDW", -6.0),
+        ("KSFO", -8.0),
+        ("KLAX", -8.0),
+    ],
+    ids=["-5.0", "-6.0", "-8.0", "-8.0"],
+)
+def test_a_real_12z_row_is_accepted_as_the_min_period(
+    mapper: ModuleType, icao: str, std_utc_offset_hours: float
+) -> None:
+    """RED-evidence case 2 (FC-0a-4 Phase B2): a real ftime=12Z row, the
+    MEASURED daily-MIN end hour, must be ACCEPTED when requested with
+    ``kind="min"`` -- also refused by the pre-correction constant (0/14,720
+    occupancy at the frozen 06Z)."""
+    ftime_ns = _utc_ns(2026, 7, 15, 12)
+    runtime_ns = _utc_ns(2026, 7, 15, 0)
+    mapped = _call(
+        mapper,
+        icao=icao,
+        runtime_ns=runtime_ns,
+        ftime_ns=ftime_ns,
+        std_utc_offset_hours=std_utc_offset_hours,
+        kind="min",
+    )
+    assert mapped == gaps.local_standard_date(ftime_ns, std_utc_offset_hours)
+    assert mapped == dt.date(2026, 7, 15)
+
+
+@pytest.mark.parametrize("kind", ["max", "min"])
+def test_a_06z_row_still_refuses_for_either_kind(mapper: ModuleType, kind: str) -> None:
+    """RED-evidence case 3: 06Z has 0% measured occupancy (0/14,720 real
+    rows); it must remain refused after the correction, for BOTH kinds --
+    it is not a slow-to-arrive period, it is anomalous."""
+    ftime_ns = _utc_ns(2026, 7, 16, 6)
+    runtime_ns = _utc_ns(2026, 7, 15, 12)
+    with pytest.raises(mapper.ForecastValidPeriodError, match=f"not the daily-{kind} TXN period"):
+        _call(mapper, runtime_ns=runtime_ns, ftime_ns=ftime_ns, kind=kind)
+
+
+def test_a_min_row_cannot_be_consumed_as_a_max(mapper: ModuleType) -> None:
+    """RED-evidence case 4: a real 12Z (MIN) row requested with
+    ``kind="max"`` must refuse -- a MIN silently accepted as a MAX would be
+    invisible and catastrophic for a HIGH-market trader."""
+    ftime_ns = _utc_ns(2026, 7, 15, 12)
+    runtime_ns = _utc_ns(2026, 7, 15, 0)
+    with pytest.raises(mapper.ForecastValidPeriodError, match="not the daily-max TXN period"):
+        _call(mapper, runtime_ns=runtime_ns, ftime_ns=ftime_ns, kind="max")
+
+
+def test_a_max_row_cannot_be_consumed_as_a_min(mapper: ModuleType) -> None:
+    """Mirror of the above: a real 00Z (MAX) row requested with
+    ``kind="min"`` must also refuse."""
+    ftime_ns = _utc_ns(2026, 7, 16, 0)
+    runtime_ns = _utc_ns(2026, 7, 15, 12)
+    with pytest.raises(mapper.ForecastValidPeriodError, match="not the daily-min TXN period"):
+        _call(mapper, runtime_ns=runtime_ns, ftime_ns=ftime_ns, kind="min")
 
 
 def test_an_18z_ftime_refuses_as_not_the_daily_max_period(mapper: ModuleType) -> None:
@@ -207,32 +276,29 @@ def test_an_18z_ftime_refuses_as_not_the_daily_max_period(mapper: ModuleType) ->
 
 
 def test_refusal_names_the_max_period_constant(mapper: ModuleType) -> None:
-    assert mapper.TXN_MAX_PERIOD_END_UTC_HOUR == 6
+    assert mapper.TXN_MAX_PERIOD_END_UTC_HOUR == 0
+    assert mapper.TXN_MIN_PERIOD_END_UTC_HOUR == 12
     ftime_ns = _utc_ns(2026, 7, 15, 18)
     with pytest.raises(mapper.ForecastValidPeriodError, match="not the daily-max TXN period"):
         _call(mapper, ftime_ns=ftime_ns)
     hour = (ftime_ns // _NS) % 86400 // 3600
     assert hour != mapper.TXN_MAX_PERIOD_END_UTC_HOUR
+    assert hour != mapper.TXN_MIN_PERIOD_END_UTC_HOUR
 
 
-def test_ftime_own_local_date_disagrees_with_the_pin_at_kmia_and_kmdw(
-    mapper: ModuleType,
-) -> None:
-    ftime_ns = _utc_ns(2026, 7, 16, 6)
-    runtime_ns = _utc_ns(2026, 7, 15, 12)
-    for icao in ("KMIA", "KMDW"):
-        offset = _offset_for(icao)
-        pin = _call(
-            mapper,
-            icao=icao,
-            runtime_ns=runtime_ns,
-            ftime_ns=ftime_ns,
-            std_utc_offset_hours=offset,
-        )
-        ftime_local = gaps.local_standard_date(ftime_ns, offset)
-        assert pin != ftime_local
-        assert pin == dt.date(2026, 7, 15)
-        assert ftime_local == dt.date(2026, 7, 16)
+# NOTE: the Phase-A `test_ftime_own_local_date_disagrees_with_the_pin_at_
+# kmia_and_kmdw` and `test_period_end_crossing_local_midnight_does_not_
+# change_the_result` tests are intentionally REMOVED, not weakened: their
+# premise (the mapped day disagrees with -- or crosses local midnight
+# relative to -- ftime's own LOCAL date) was an artefact of the superseded
+# 06Z/18h-subtraction design. Under the corrected P2 formula the mapped day
+# IS `gaps.local_standard_date(ftime_ns, offset)` -- literally ftime's own
+# local date -- so that comparison is now tautological, not a
+# discriminator. The discriminator that actually matters (the mapped day
+# disagrees with ftime's own UTC-*naive* calendar day, which is what a
+# careless implementer would compute) is preserved by
+# `test_mia_bleed_disagrees_with_a_utc_day_cut` and
+# `test_pacific_utc_cut_misses_the_true_local_max` below, unchanged.
 
 
 def test_adjacent_cycles_12z_d_and_12z_d_plus_1_map_to_distinct_consecutive_days(
@@ -242,13 +308,13 @@ def test_adjacent_cycles_12z_d_and_12z_d_plus_1_map_to_distinct_consecutive_days
     day_d = _call(
         mapper,
         runtime_ns=_utc_ns(2026, 7, 15, 12),
-        ftime_ns=_utc_ns(2026, 7, 16, 6),
+        ftime_ns=_utc_ns(2026, 7, 16, 0),
         std_utc_offset_hours=offset,
     )
     day_d1 = _call(
         mapper,
         runtime_ns=_utc_ns(2026, 7, 16, 12),
-        ftime_ns=_utc_ns(2026, 7, 17, 6),
+        ftime_ns=_utc_ns(2026, 7, 17, 0),
         std_utc_offset_hours=offset,
     )
     assert day_d == dt.date(2026, 7, 15)
@@ -269,14 +335,13 @@ def test_one_nanosecond_either_side_of_local_midnight(
         assert local_day == dt.date(2026, 7, 14)
     else:
         assert local_day == dt.date(2026, 7, 15)
-    ftime_ns = _utc_ns(2026, 7, 16, 6)
+    ftime_ns = _utc_ns(2026, 7, 16, 0)
     mapped = _call(mapper, ftime_ns=ftime_ns, std_utc_offset_hours=std_utc_offset_hours)
-    valid_start_ns = ftime_ns - mapper.TXN_MAX_PERIOD_HOURS * 3600 * _NS
-    assert mapped == gaps.local_standard_date(valid_start_ns, std_utc_offset_hours)
+    assert mapped == gaps.local_standard_date(ftime_ns, std_utc_offset_hours)
 
 
 def test_mapping_is_identical_for_model_nbm_nbs_and_gfs_mos(mapper: ModuleType) -> None:
-    ftime_ns = _utc_ns(2026, 7, 16, 6)
+    ftime_ns = _utc_ns(2026, 7, 16, 0)
     runtime_ns = _utc_ns(2026, 7, 15, 12)
     offset = _offset_for("KMIA")
     nbm = _call(
@@ -304,23 +369,21 @@ def test_missing_or_none_offset_refuses_instead_of_defaulting_to_utc(
     assert offset_param.default is inspect.Parameter.empty
     with pytest.raises(mapper.ForecastValidPeriodError):
         _call(mapper, std_utc_offset_hours=None)
-    utc_default = gaps.local_standard_date(
-        _utc_ns(2026, 7, 16, 6) - _PERIOD_HOURS * 3600 * _NS, 0.0
-    )
+    utc_default = gaps.local_standard_date(_utc_ns(2026, 7, 16, 0), 0.0)
     with pytest.raises(mapper.ForecastValidPeriodError):
         result = _call(mapper, std_utc_offset_hours=None)
         assert result != utc_default
 
 
 def test_runtime_after_the_period_end_refuses(mapper: ModuleType) -> None:
-    ftime_ns = _utc_ns(2026, 7, 16, 6)
+    ftime_ns = _utc_ns(2026, 7, 16, 0)
     runtime_ns = ftime_ns + 1
     with pytest.raises(mapper.ForecastValidPeriodError):
         _call(mapper, runtime_ns=runtime_ns, ftime_ns=ftime_ns)
 
 
 def test_non_integer_ns_refuses(mapper: ModuleType) -> None:
-    ftime_ns = _utc_ns(2026, 7, 16, 6)
+    ftime_ns = _utc_ns(2026, 7, 16, 0)
     runtime_ns = _utc_ns(2026, 7, 15, 12)
     with pytest.raises(mapper.ForecastValidPeriodError):
         mapper.climate_day_for_txn(
@@ -329,6 +392,7 @@ def test_non_integer_ns_refuses(mapper: ModuleType) -> None:
             ftime_ns=ftime_ns,
             std_utc_offset_hours=-5.0,
             model="NBM_NBS",
+            kind="max",
         )
     with pytest.raises(mapper.ForecastValidPeriodError):
         mapper.climate_day_for_txn(
@@ -337,26 +401,8 @@ def test_non_integer_ns_refuses(mapper: ModuleType) -> None:
             ftime_ns=float(ftime_ns),
             std_utc_offset_hours=-5.0,
             model="NBM_NBS",
+            kind="max",
         )
-
-
-def test_period_end_crossing_local_midnight_does_not_change_the_result(
-    mapper: ModuleType,
-) -> None:
-    """KMIA/KMDW period end is on local D+1; P2 still assigns D."""
-    ftime_ns = _utc_ns(2026, 7, 16, 6)
-    runtime_ns = _utc_ns(2026, 7, 15, 12)
-    for icao in ("KMIA", "KMDW"):
-        offset = _offset_for(icao)
-        pin = _call(
-            mapper,
-            icao=icao,
-            runtime_ns=runtime_ns,
-            ftime_ns=ftime_ns,
-            std_utc_offset_hours=offset,
-        )
-        assert gaps.local_standard_date(ftime_ns, offset) == dt.date(2026, 7, 16)
-        assert pin == dt.date(2026, 7, 15)
 
 
 def test_mia_bleed_disagrees_with_a_utc_day_cut(mapper: ModuleType) -> None:
@@ -392,7 +438,7 @@ def test_dst_transition_day_assignment_is_identical_to_a_non_dst_day(
     )
     for climate in probes:
         ftime = dt.datetime(
-            climate.year, climate.month, climate.day, 6, tzinfo=dt.UTC
+            climate.year, climate.month, climate.day, 0, tzinfo=dt.UTC
         ) + dt.timedelta(days=1)
         runtime = dt.datetime(climate.year, climate.month, climate.day, 12, tzinfo=dt.UTC)
         mapped = _call(
@@ -426,7 +472,7 @@ def test_off_grid_runtime_is_accepted_not_refused(mapper: ModuleType) -> None:
     mapped = _call(
         mapper,
         runtime_ns=_utc_ns(2026, 7, 15, 15),
-        ftime_ns=_utc_ns(2026, 7, 16, 6),
+        ftime_ns=_utc_ns(2026, 7, 16, 0),
         std_utc_offset_hours=_offset_for("KMIA"),
     )
     assert mapped == dt.date(2026, 7, 15)
@@ -460,6 +506,7 @@ def test_mapping_signature_has_no_side_or_leg_parameter(mapper: ModuleType) -> N
         "ftime_ns",
         "std_utc_offset_hours",
         "model",
+        "kind",
     ]
     for parameter in signature.parameters.values():
         assert parameter.kind is inspect.Parameter.KEYWORD_ONLY

@@ -76,6 +76,7 @@ def _call(mapper: ModuleType, row: ForecastDayFixture) -> dt.date:
         ftime_ns=row.ftime_ns,
         std_utc_offset_hours=row.std_utc_offset_hours,
         model=row.model,
+        kind=row.kind,
     )
 
 
