@@ -1,10 +1,18 @@
-"""Unified cost, EV, margin, ranking, Kelly (spec §4–§7)."""
+"""Unified cost, EV, margin, ranking, Kelly (spec §4–§7).
+
+``ev_net_no``'s ``cost`` MUST be a :class:`DepthAwareTradeCost` built from
+the inverted YES-book BID ladder (:func:`bid_levels_from_book`), never from
+YES asks. The fee term is symmetric and would hide a YES-ask pairing;
+``top_of_book_price`` would not. WP-14 wires that pairing; this module does
+not.
+"""
 
 from __future__ import annotations
 
 from collections.abc import Sequence
 from dataclasses import dataclass, replace
 from datetime import date
+from typing import Literal
 
 from breezy.strategy.ladder_ev.config import LadderEvConfig
 from breezy.strategy.weather_common.costs import DepthAwareTradeCost
@@ -13,6 +21,7 @@ from breezy.strategy.weather_common.risk import edge_after_costs
 __all__ = [
     "OpportunityRow",
     "ev_net",
+    "ev_net_no",
     "kelly_stake_fraction",
     "margin",
     "rank_rows",
@@ -35,6 +44,11 @@ class OpportunityRow:
     p_lower: float
     score: float | None = None
     rank: int | None = None
+    side: Literal["yes", "no"] = "yes"
+
+    def __post_init__(self) -> None:
+        if self.side not in ("yes", "no"):
+            raise ValueError(f"side must be 'yes' or 'no', was {self.side!r}")
 
 
 def unified_cost(cost: DepthAwareTradeCost) -> float:
@@ -46,6 +60,26 @@ def ev_net(p_lower: float, cost: DepthAwareTradeCost) -> float | None:
     """``P^L − C`` via the shipped :func:`edge_after_costs` call contract."""
     return edge_after_costs(
         model_p=p_lower,
+        bid_p=None,
+        ask_p=cost.top_of_book_price,
+        intent_long_yes=True,
+        cost=cost.total_prob,
+    )
+
+
+def ev_net_no(p_upper: float, cost: DepthAwareTradeCost) -> float | None:
+    """NO-leg EV: long the NO instrument (E2).
+
+    ``intent_long_yes=True`` names the leg being bought. Do not derive
+    that flag from ``side`` — False is a short-YES edge and returns None
+    without ``bid_p`` (``risk.py:732-751``). Venue NO is SELL / BUY_SHORT
+    of YES; this path still buys the NO instrument long.
+
+    ``cost`` must come from the bid side (see module docstring). WP-10 does
+    not enforce that pairing.
+    """
+    return edge_after_costs(
+        model_p=1.0 - p_upper,
         bid_p=None,
         ask_p=cost.top_of_book_price,
         intent_long_yes=True,
