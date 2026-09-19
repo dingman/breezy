@@ -217,20 +217,23 @@ _USER_BALANCE_KEYS: Final[frozenset[str]] = frozenset(
     }
 )
 
-#: Six fields observed live on ``GET /v1/account/balances`` on 2026-09-04 that
-#: the pinned SDK snapshot (``polymarket_us_0.1.2``, frozen at package release)
-#: does not declare -- see
-#: ``docs/evidence/venue/polymarket_us/BALANCES_SHAPE_DRIFT_2026-09-04.md``.
+#: Six fields observed live on ``GET /v1/account/balances`` on 2026-09-04, plus
+#: a seventh (``bonusHold``) observed live on 2026-09-19, that the pinned SDK
+#: snapshot (``polymarket_us_0.1.2``, frozen at package release) does not
+#: declare -- see
+#: ``docs/evidence/venue/polymarket_us/BALANCES_SHAPE_DRIFT_2026-09-04.md`` and
+#: ``docs/evidence/venue/polymarket_us/BALANCES_SHAPE_DRIFT_2026-09-19.md``.
 #: Declared here, repo-side, as DECLARED-BUT-UNREAD: accepted so the
 #: reconciliation does not refuse an otherwise-healthy connect over a name it
 #: has never needed, but not merged into :data:`_USER_BALANCE_KEYS` itself --
 #: that set must stay exactly what the snapshot declares, or the drift check
-#: above goes vacuous. None of these six is read for money by
-#: :func:`_parse_account_balance`; a field the venue adds beyond THESE six is
+#: above goes vacuous. None of these seven is read for money by
+#: :func:`_parse_account_balance`; a field the venue adds beyond THESE seven is
 #: still an unknown key and is still refused.
 _USER_BALANCE_DRIFT_ALLOWED_KEYS: Final[frozenset[str]] = frozenset(
     {
         "availableToWithdraw",
+        "bonusHold",
         "bonusReservation",
         "depositReservation",
         "displayedAvailableSoon",
@@ -915,11 +918,14 @@ def parse_account_balances(payload: Mapping[str, Any]) -> tuple[AccountBalance, 
 
     Each row's key allowlist is ``_USER_BALANCE_KEYS`` widened by
     ``_USER_BALANCE_DRIFT_ALLOWED_KEYS`` -- six fields observed live on
-    2026-09-04 that the pinned SDK snapshot does not declare (see
-    ``docs/evidence/venue/polymarket_us/BALANCES_SHAPE_DRIFT_2026-09-04.md``).
+    2026-09-04 plus a seventh (``bonusHold``) observed live on 2026-09-19
+    that the pinned SDK snapshot does not declare (see
+    ``docs/evidence/venue/polymarket_us/BALANCES_SHAPE_DRIFT_2026-09-04.md``
+    and
+    ``docs/evidence/venue/polymarket_us/BALANCES_SHAPE_DRIFT_2026-09-19.md``).
     They are accepted DECLARED-BUT-UNREAD, never merged into the snapshot-
     matched set itself, so the strict refusal below stays strict for any
-    field beyond those six.
+    field beyond those seven.
 
     ``currentBalance`` and ``buyingPower`` are QUANTIZED to ``USD.precision``
     with ``ROUND_DOWN`` rather than refused when they carry sub-cent
