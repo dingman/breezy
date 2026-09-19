@@ -389,9 +389,10 @@ def test_unknown_balance_key_is_refused() -> None:
         parse_account_balances(payload)
 
 
-def test_drifted_balance_six_unread_fields_are_accepted_money_unchanged() -> None:
-    """BALANCES_SHAPE_DRIFT_2026-09-04: the six new fields are accepted, and
-    the money fields reconciliation actually reads are unaffected by them.
+def test_drifted_balance_seven_unread_fields_are_accepted_money_unchanged() -> None:
+    """BALANCES_SHAPE_DRIFT_2026-09-04 (six fields) + BALANCES_SHAPE_DRIFT_2026-09-19
+    (``bonusHold``, the seventh): all seven are accepted, and the money fields
+    reconciliation actually reads are unaffected by them.
     """
     pre_drift = {
         "balances": [
@@ -405,6 +406,7 @@ def test_drifted_balance_six_unread_fields_are_accepted_money_unchanged() -> Non
                 "currentBalance": Decimal("12.34"),
                 "buyingPower": Decimal("10.00"),
                 "availableToWithdraw": Decimal("10.00"),
+                "bonusHold": Decimal(0),
                 "bonusReservation": Decimal(0),
                 "depositReservation": Decimal(0),
                 "displayedAvailableSoon": Decimal(0),
@@ -417,9 +419,9 @@ def test_drifted_balance_six_unread_fields_are_accepted_money_unchanged() -> Non
     assert parse_account_balances(drifted) == parse_account_balances(pre_drift)
 
 
-def test_a_seventh_unknown_field_still_refuses_even_alongside_the_six() -> None:
-    """The six-name widening is exact -- a genuinely new, unpinned field is
-    still refused, even when it arrives alongside the six already allowed.
+def test_an_eighth_unknown_field_still_refuses_even_alongside_the_seven() -> None:
+    """The seven-name widening is exact -- a genuinely new, unpinned field is
+    still refused, even when it arrives alongside the seven already allowed.
     """
     payload = {
         "balances": [
@@ -428,6 +430,7 @@ def test_a_seventh_unknown_field_still_refuses_even_alongside_the_six() -> None:
                 "currentBalance": Decimal("1.00"),
                 "buyingPower": Decimal("1.00"),
                 "availableToWithdraw": Decimal("1.00"),
+                "bonusHold": Decimal(0),
                 "someFutureField": Decimal("0.01"),
             }
         ]
