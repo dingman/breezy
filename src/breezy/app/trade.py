@@ -50,7 +50,7 @@ from breezy.strategy.current_rung_hold.composition import (
     family_halt_submit_veto,
     install_current_rung_hold_refusal_watch,
     make_trial_day_latch_factory,
-    phase1_family_permits,
+    phase1_sending_permit,
 )
 from breezy.strategy.current_rung_hold.config import SUPPORTED_STATIONS
 from breezy.strategy.current_rung_hold.continuous_strategy import Phase0PermitForbiddenError
@@ -61,17 +61,17 @@ from breezy.strategy.current_rung_hold.trial_day_latch import (
 
 _VENUE = "polymarket_us"
 
-#: Review finding A(1)/A(2) (``POSITION_EXIT_EXECUTION_2026-09-16.md`` §5.1):
-#: the LIVE ``continuous_rung_hold`` family's own manifest, resolved
-#: relative to the process CWD -- `trade_supervisor.py`'s
-#: `_launch`/`_relaunch` always set `cwd=str(repo_root)` before spawning this
-#: process, the same relative-path convention `deploy/families/*.json`
+#: WP-11b (active-family registry, cardinality-1): where every family
+#: manifest lives, relative to the process CWD -- `trade_supervisor.py`'s
+#: `_launch`/`_relaunch` always set `cwd=str(repo_root)` before spawning
+#: this process, the same relative-path convention `deploy/families/*.json`
 #: already uses everywhere else (test fixtures, `scripts/analysis/*`'s own
-#: `--family-manifest` CLI args). This is the ONLY family
-#: `build_continuous_rung_hold_strategies` composes today (trial_id_prefix
-#: ``continuous_rung_hold/trial/`` matches exactly), so it is the one and
-#: only manifest ever loaded here -- never a second, competing lookup.
-_LIVE_CONTINUOUS_FAMILY_MANIFEST_PATH: Final[Path] = Path("deploy/families/pm_us_crh_cont.json")
+#: `--family-manifest` CLI args, `runtime.settings`'s own load-time
+#: validation). Replaces the retired single-family manifest-path module
+#: constant this file used to carry -- promoting a revision is now
+#: `settings.sending_family_id` + this registry directory, never a source
+#: edit (test_promoted_revision_requires_no_src_edit).
+_FAMILIES_DIR: Final[Path] = Path("deploy/families")
 
 #: ``AlertPayload.event``/``site``/``severity`` for a refused live-trading
 #: permit in ``main()`` -- the ONLY refusal here that continues the run in
@@ -164,7 +164,16 @@ def run(
     live_trading_permit: object | None = None,
     order_submission_permit: OrderSubmissionPermit | None = None,
 ) -> int:
-    """Load settings, compose strategies when the flag is on, run the node."""
+    """Load settings; resolve the ONE sending family (if any) against
+    ``deploy/families/``; dispatch composition by its ``composition_kind``;
+    run the node.
+
+    WP-11b (active-family registry, cardinality-1): there is no module
+    constant naming a family here -- ``settings.sending_family_id`` +
+    ``deploy/families/{id}.json`` is the only path from boot to a
+    composed strategy, so promoting a revision is a manifest + env act,
+    never a source edit.
+    """
     out = sys.stderr if stderr is None else stderr
     try:
         settings = load_trade_settings(env)
@@ -172,7 +181,7 @@ def run(
         _report(out, "configuration error", exc, expected=True)
         return EXIT_CONFIG_ERROR
 
-    if not settings.current_rung_hold and not settings.continuous_rung_hold:
+    if settings.sending_family_id is None:
         return trade_cli.run(
             env=env,
             node_factory=node_factory,
@@ -193,36 +202,37 @@ def run(
         _report(
             out,
             "configuration error",
-            SettingsError("a rung-hold family is on but catalog_root is unset"),
+            SettingsError("a sending family is on but catalog_root is unset"),
             expected=True,
         )
         return EXIT_CONFIG_ERROR
 
     today_by_station = _today_by_station()
     try:
+        manifest = load_family_manifest(_FAMILIES_DIR / f"{settings.sending_family_id}.json")
         with ExitStack() as stack:
             store = stack.enter_context(SqliteStateStore(store_path))
             latch = stack.enter_context(open_submit_intent_latch(store, store_path))
-            v2_permit, v3_permit = phase1_family_permits(
-                current_rung_hold=settings.current_rung_hold,
-                continuous_rung_hold=settings.continuous_rung_hold,
+            sending_permit = phase1_sending_permit(
+                sending_family_id=settings.sending_family_id,
                 permit=order_submission_permit,
                 phase0_shadow=settings.phase0_shadow,
             )
             strategies: list[Strategy] = []
             submit_veto: Callable[[], str | None] | None = None
             exit_manifest: FamilyManifest | None = None
-            if settings.current_rung_hold:
+
+            if manifest.composition_kind == "current_rung_hold":
                 factory = make_trial_day_latch_factory(latch)
                 strategies.extend(
                     build_current_rung_hold_strategies(
                         catalog_root=catalog_root,
                         today_by_station=today_by_station,
                         trial_day_latch_factory=factory,
-                        order_submission_permit=v2_permit,
+                        order_submission_permit=sending_permit,
                     )
                 )
-            if settings.continuous_rung_hold:
+            elif manifest.composition_kind == "continuous_rung_hold":
                 cont_factory = make_trial_day_latch_factory(
                     latch, key_prefix=CONTINUOUS_TRIAL_KEY_PREFIX,
                 )
@@ -241,30 +251,47 @@ def run(
                     latch, key_prefix=CONTINUOUS_TRIAL_KEY_PREFIX,
                 )
                 submit_veto = family_halt_submit_veto(family_halt_latch)
-                # Review finding A(1)/A(2): the LIVE family's own manifest,
-                # threaded into BOTH the position monitor (which evaluates
-                # an exit and refuses with `family_not_exit_registered`
-                # -- the manifest declares no `exit_rule`) and the exec
-                # client (which denies with the same manifest-gate reason if
-                # anything ever reached it). One load, one object, passed to
-                # both -- never two independent reads of the same file.
-                exit_manifest = load_family_manifest(_LIVE_CONTINUOUS_FAMILY_MANIFEST_PATH)
+                # Review finding A(1)/A(2): the sending family's own
+                # manifest (loaded once, above), threaded into BOTH the
+                # position monitor (which evaluates an exit and refuses
+                # with `family_not_exit_registered` when the manifest
+                # declares no `exit_rule`) and the exec client (which
+                # denies with the same manifest-gate reason if anything
+                # ever reached it). One load, one object, passed to both --
+                # never two independent reads of the same file.
+                exit_manifest = manifest
                 strategies.extend(
                     build_continuous_rung_hold_strategies(
                         catalog_root=catalog_root,
                         today_by_station=today_by_station,
                         trial_day_latch_factory=cont_factory,
-                        order_submission_permit=v3_permit,
-                        # phase1_family_permits routes a non-None v3_permit
-                        # ONLY for the continuous-only, no-shadow case (a
-                        # settings-level guarantee -- see its docstring and
-                        # test_phase1_family_permits_all_combos_with_a_real_
-                        # permit), so lifting the guard is exactly and only
+                        order_submission_permit=sending_permit,
+                        # phase1_sending_permit routes a non-None permit
+                        # ONLY when phase0_shadow is False (a
+                        # function-level guarantee -- see its docstring),
+                        # so lifting the guard is exactly and only
                         # conditioned on that permit being present.
-                        phase0_permit_guard=v3_permit is None,
+                        phase0_permit_guard=sending_permit is None,
                         exit_manifest=exit_manifest,
                     )
                 )
+            elif manifest.composition_kind == "forecast_ladder":
+                # WP-14 has not landed: the strategy this composition_kind
+                # names does not exist yet. Refuse to boot rather than
+                # silently compose nothing -- an operator who points
+                # sending_family_id at a forecast_ladder manifest today
+                # gets a clean, logged configuration error, not a
+                # zero-strategy node quietly doing nothing.
+                raise SettingsError(
+                    f"composition_kind=forecast_ladder ({settings.sending_family_id}) "
+                    "cannot boot yet: ForecastLadderStrategy is not implemented"
+                )
+            else:
+                raise SettingsError(
+                    f"{settings.sending_family_id}: unknown composition_kind "
+                    f"{manifest.composition_kind!r}"
+                )
+
             composed = tuple(strategies)
             return trade_cli.run(
                 env=env,
@@ -284,19 +311,20 @@ def run(
         OSError,
         SubmitIntentLockHeld,
         SubmitIntentLockError,
-        # A missing/malformed `deploy/families/pm_us_crh_cont.json` is a
-        # deployment defect, not a crash: the process should refuse to start
-        # cleanly (exit 2) rather than take down a live-trading node on a
-        # file it should never be missing.
+        # A missing/malformed `deploy/families/<id>.json` is a deployment
+        # defect, not a crash: the process should refuse to start cleanly
+        # (exit 2) rather than take down a live-trading node on a file it
+        # should never be missing. (``runtime.settings.load_trade_settings``
+        # already validates this at settings-load time, above; this is
+        # defense in depth for the second, real-use load.)
         FamilyManifestError,
         # Defense in depth, not the intended path: `phase0_permit_guard=
-        # (v3_permit is None)` above makes this unreachable when
-        # `phase1_family_permits`'s own invariant holds (a non-None
-        # `v3_permit` implies continuous-only, no-shadow). Kept as a
+        # (sending_permit is None)` above makes this unreachable when
+        # `phase1_sending_permit`'s own invariant holds. Kept as a
         # fail-closed net for a future mis-wiring -- e.g. a call site that
         # passes a real permit through `build_continuous_rung_hold_strategies`
         # without also flipping `phase0_permit_guard`, or a change to
-        # `phase1_family_permits` that stops guaranteeing that pairing --
+        # `phase1_sending_permit` that stops guaranteeing that pairing --
         # so such a bug degrades to a clean, logged configuration error
         # rather than an unhandled crash in a live-trading process.
         Phase0PermitForbiddenError,

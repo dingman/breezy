@@ -30,7 +30,11 @@ _CANDIDATE_UNITS = [
     "breezy-k1-daily.service",
     "breezy-mb-daily.service",
     "breezy-offer-gate-daily.service",
-    "breezy-pm-crh-v2-tally.service",
+    # WP-11b (active-family registry, cardinality-1): the retired
+    # breezy-pm-crh-v2-tally.service/breezy-pm-crh-cont-tally.service pair
+    # is replaced by ONE shared instantiated template, checked here so its
+    # own cgroup ceiling never goes uncovered.
+    "breezy-family-tally@.service",
     "breezy-live-tally.service",
     "breezy-score-live-trials.service",
     "breezy-quote-tape-ingest.service",

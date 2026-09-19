@@ -99,6 +99,9 @@ _MANIFEST_PAYLOAD: dict[str, Any] = {
     "d0_climate_day": _DAY_ISO,
     "boundary_artefact_path": "deploy/families/gs_boundary_pm_us_crh_v2.json",
     "boundary_inputs_sha256": "a" * 64,
+    "composition_kind": "current_rung_hold",
+    "density_artefact_path": "deploy/families/artefacts/not_applicable_density.json",
+    "density_artefact_sha256": "247f636350685b38966251703c47d10531913367fbcca175b086a2c298421a65",
     "stations": [_STATION],
     "status": "REGISTERED",
 }

@@ -51,6 +51,7 @@ def _run_wrapper(
     write_counter_json: bool = True,
     state_db: Path | None = None,
     families_dir: Path | None = None,
+    unset_extra: frozenset[str] = frozenset(),
 ) -> subprocess.CompletedProcess[str]:
     # I3 (LIVE_FILL_SCORING_CHAIN_2026-09-05.md, BLOCK-2): the wrapper now
     # asserts the 14:15 score-live-trials-run.sh success marker before
@@ -79,6 +80,12 @@ def _run_wrapper(
         )
     else:
         env.pop("POLYMARKET_US_EXEC_STATE_DB", None)
+    # Generic hook (WP-0b/WP-11b's env-var discovery test): remove ANY
+    # named var, not just POLYMARKET_US_EXEC_STATE_DB, so a future wrapper
+    # requirement is discoverable by the same mechanism without a new
+    # dedicated `set_*` parameter per variable.
+    for var in unset_extra:
+        env.pop(var, None)
     if create_marker:
         out_dir.mkdir(parents=True, exist_ok=True)
         stamp = _dt.datetime.now(_dt.UTC).strftime("%Y-%m-%d")
@@ -265,23 +272,19 @@ def test_wrapper_reports_failure_from_the_stub_analysis_script(tmp_path: Path) -
     assert result.returncode == 1
 
 
-@pytest.mark.parametrize(
-    "service_name,timer_name,family_id",
-    [
-        ("breezy-pm-crh-v2-tally.service", "breezy-pm-crh-v2-tally.timer", "pm_us_crh_v2"),
-        # L-38: pm_us_crh_cont is the LIVE family since 2026-09-13 and had no
-        # scheduled tally at all -- a stop that cannot fire is MISSING. This
-        # pair mirrors the pm_us_crh_v2 pair exactly (same wrapper, same
-        # slice/memory/WorkingDirectory shape), scheduled at a distinct tick
-        # (17:25Z, see test_pm_crh_cont_timer_fires_at_1725_utc).
-        ("breezy-pm-crh-cont-tally.service", "breezy-pm-crh-cont-tally.timer", "pm_us_crh_cont"),
-    ],
-)
-def test_concrete_unit_pair_exists_and_wires_to_wrapper(
-    service_name: str, timer_name: str, family_id: str
-) -> None:
-    service_path = _SYSTEMD_DIR / service_name
-    timer_path = _SYSTEMD_DIR / timer_name
+#: WP-11b (active-family registry, cardinality-1): the former per-family
+#: unit COPIES (breezy-pm-crh-v2-tally.{service,timer},
+#: breezy-pm-crh-cont-tally.{service,timer}) are retired in favour of ONE
+#: instantiated systemd template. `%i` (the systemd instance name) IS the
+#: family id -- test_family_tally_template_passes_family_id_as_percent_i is
+#: the WP-11b RED test naming this requirement directly.
+_TEMPLATE_SERVICE = "breezy-family-tally@.service"
+_TEMPLATE_TIMER = "breezy-family-tally@.timer"
+
+
+def test_template_unit_pair_exists_and_wires_to_wrapper_via_percent_i() -> None:
+    service_path = _SYSTEMD_DIR / _TEMPLATE_SERVICE
+    timer_path = _SYSTEMD_DIR / _TEMPLATE_TIMER
     assert service_path.exists()
     assert timer_path.exists()
 
@@ -289,53 +292,115 @@ def test_concrete_unit_pair_exists_and_wires_to_wrapper(
     exec_start_lines = [line for line in service_text.splitlines() if line.startswith("ExecStart=")]
     assert len(exec_start_lines) == 1
     assert "family-tally-v2-run.sh" in exec_start_lines[0]
-    assert exec_start_lines[0].strip().endswith(family_id)
+    assert exec_start_lines[0].strip().endswith("%i")
 
     timer_text = timer_path.read_text()
-    assert f"Unit={service_name}" in timer_text
+    assert "Unit=breezy-family-tally@%i.service" in timer_text
 
 
-def test_pm_crh_v2_timer_fires_at_1715_utc() -> None:
-    timer_text = (_SYSTEMD_DIR / "breezy-pm-crh-v2-tally.timer").read_text()
-    assert "OnCalendar=*-*-* 17:15:00 UTC" in timer_text
+def test_family_tally_template_passes_family_id_as_percent_i() -> None:
+    """WP-11b RED test (9): no per-family ``ExecStart=`` literal survives --
+    the template's ONLY argument to the wrapper is the systemd specifier
+    ``%i``, so promoting a new family (e.g. a future ``fc_v1``/``fc_v2``
+    forecast revision) is ``systemctl --user enable --now
+    breezy-family-tally@<family_id>.timer``, never a new unit file."""
+    service_text = (_SYSTEMD_DIR / _TEMPLATE_SERVICE).read_text()
+    exec_start_lines = [
+        line for line in service_text.splitlines() if line.startswith("ExecStart=")
+    ]
+    assert len(exec_start_lines) == 1
+    exec_start = exec_start_lines[0]
+    assert exec_start.strip().endswith("family-tally-v2-run.sh %i")
+    # No literal family id anywhere on the ExecStart= line -- %i is the ONLY
+    # argument token after the wrapper path.
+    for literal_family_id in _valid_family_ids():
+        assert literal_family_id not in exec_start
+
+    # Neither retired per-family unit file exists any more -- the template
+    # is the only unit driving this wrapper.
+    assert not (_SYSTEMD_DIR / "breezy-pm-crh-v2-tally.service").exists()
+    assert not (_SYSTEMD_DIR / "breezy-pm-crh-cont-tally.service").exists()
 
 
-def test_pm_crh_v2_tally_tick_is_after_node_launch() -> None:
+def test_template_timer_fires_at_1720_utc() -> None:
+    timer_text = (_SYSTEMD_DIR / _TEMPLATE_TIMER).read_text()
+    assert "OnCalendar=*-*-* 17:20:00 UTC" in timer_text
+
+
+def test_template_tally_tick_is_after_node_launch() -> None:
     """A1: parse OnCalendar= and require the tick at/after launch-window end.
 
     Compares the parsed ``dt.time`` to ``LAUNCH_WINDOW_END_UTC`` (not a
-    restated 16:50 literal). RED while the timer still fires at 15:30.
+    restated 16:50 literal).
     """
-    timer_text = (_SYSTEMD_DIR / "breezy-pm-crh-v2-tally.timer").read_text()
+    timer_text = (_SYSTEMD_DIR / _TEMPLATE_TIMER).read_text()
     match = re.search(
         r"^OnCalendar=\S+\s+(\d{2}):(\d{2}):(\d{2})\s+UTC\s*$",
         timer_text,
         re.MULTILINE,
     )
-    assert match is not None, "breezy-pm-crh-v2-tally.timer has no parseable OnCalendar="
+    assert match is not None, f"{_TEMPLATE_TIMER} has no parseable OnCalendar="
     tick = _dt.time(int(match.group(1)), int(match.group(2)), int(match.group(3)))
     assert tick >= LAUNCH_WINDOW_END_UTC
 
 
-def test_pm_crh_cont_timer_fires_at_1725_utc() -> None:
-    """L-38: distinct from pm_us_crh_v2's 17:15Z tick so the two tallies
-    never collide (tests/unit/test_deploy_timer_hours.py owns the general
-    no-two-timers-share-a-tick collision scan)."""
-    timer_text = (_SYSTEMD_DIR / "breezy-pm-crh-cont-tally.timer").read_text()
-    assert "OnCalendar=*-*-* 17:25:00 UTC" in timer_text
-
-
-def test_pm_crh_cont_tally_tick_is_after_node_launch() -> None:
-    """Mirrors test_pm_crh_v2_tally_tick_is_after_node_launch for the new pair."""
-    timer_text = (_SYSTEMD_DIR / "breezy-pm-crh-cont-tally.timer").read_text()
-    match = re.search(
-        r"^OnCalendar=\S+\s+(\d{2}):(\d{2}):(\d{2})\s+UTC\s*$",
-        timer_text,
-        re.MULTILINE,
+#: WP-0b built a discovery-based regression test
+#: (test_every_tally_unit_carries_every_env_var_its_family_requires) that
+#: derives the wrapper's required env vars from its own ``${VAR:?...}``
+#: syntax and skips any unit file that names no CONCRETE family (an
+#: uninstantiated ``@.service`` template has no ``@<instance>`` suffix, so
+#: it names none). WP-11b's whole tally surface IS such a template, so that
+#: skip would leave POLYMARKET_US_EXEC_STATE_DB unguarded on the one unit
+#: that matters -- the exact env line WP-0b exists to keep from being
+#: missed. This test closes that blind spot directly: it does not skip the
+#: bare template, it asserts the template declares every var the wrapper
+#: could ever require for ANY family it might be instantiated with.
+def test_bare_template_declares_every_env_var_any_instantiated_family_could_require(
+    tmp_path: Path,
+) -> None:
+    required_vars: set[str] = set()
+    wrapper_text = _WRAPPER.read_text()
+    for match in re.finditer(r"\$\{(\w+):\?[^}]*\}", wrapper_text):
+        required_vars.add(match.group(1))
+    assert "POLYMARKET_US_EXEC_STATE_DB" in required_vars, (
+        "the wrapper's own ${VAR:?...} syntax no longer names "
+        "POLYMARKET_US_EXEC_STATE_DB -- update this test's expectation, "
+        "do not just widen the template"
     )
-    assert match is not None, "breezy-pm-crh-cont-tally.timer has no parseable OnCalendar="
-    tick = _dt.time(int(match.group(1)), int(match.group(2)), int(match.group(3)))
-    assert tick >= LAUNCH_WINDOW_END_UTC
+
+    # Which families actually TRIGGER each required var, determined by
+    # running the real wrapper against each real manifest with the var
+    # unset -- never a hardcoded Python mirror of the wrapper's own bash
+    # conditional (REGISTERED + venue == polymarket_us).
+    triggering_vars: set[str] = set()
+    for family_id in sorted(_valid_family_ids()):
+        for var in sorted(required_vars):
+            result = _run_wrapper(
+                [family_id],
+                tmp_path / family_id / var,
+                unset_extra=frozenset({var}),
+            )
+            # A failure that names the missing var (bash's `:?` message) --
+            # not merely a nonzero exit, which the DRAFT/non-polymarket_us
+            # families also produce for unrelated reasons -- is what proves
+            # THIS family actually reaches the requirement.
+            if var in result.stderr:
+                triggering_vars.add(var)
+
+    template_text = (_SYSTEMD_DIR / _TEMPLATE_SERVICE).read_text()
+    template_env_vars = {
+        line[len("Environment=") :].split("=", 1)[0]
+        for line in template_text.splitlines()
+        if line.startswith("Environment=")
+    }
+    missing = triggering_vars - template_env_vars
+    assert not missing, (
+        f"{_TEMPLATE_SERVICE} is missing Environment= for {sorted(missing)}, "
+        "required by at least one family this template can be instantiated "
+        "with -- the exact WP-0b incident (a var present on one per-family "
+        "unit copy and missing on the other) recurring on the shared "
+        "template"
+    )
 
 
 def _write_counter_json(

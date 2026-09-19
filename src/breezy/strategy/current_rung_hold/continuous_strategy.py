@@ -369,7 +369,7 @@ class Phase0PermitForbiddenError(RuntimeError):
     Phase 0 mints every `ContinuousRungHoldStrategy` (and its composition
     root, `build_continuous_rung_hold_strategies`) with `permit=None`; v3
     never holds the sealed order-submission capability while Phase 0 is in
-    force (see `composition.py::phase0_family_permits`).
+    force (see `composition.py::phase1_sending_permit`).
     """
 
 

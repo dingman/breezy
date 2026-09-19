@@ -486,7 +486,9 @@ def test_environment_lines_byte_identical_and_equal_pinned_literal() -> None:
     names = (
         "breezy-score-live-trials.service",
         "breezy-live-tally.service",
-        "breezy-pm-crh-v2-tally.service",
+        # WP-11b: the retired per-family tally units are replaced by ONE
+        # shared instantiated template, which carries the SAME pinned line.
+        "breezy-family-tally@.service",
     )
     env_lines: list[str] = []
     for name in names:
@@ -509,7 +511,7 @@ def test_neither_i3_unit_carries_an_environment_file_directive() -> None:
     for name in (
         "breezy-score-live-trials.service",
         "breezy-live-tally.service",
-        "breezy-pm-crh-v2-tally.service",
+        "breezy-family-tally@.service",
     ):
         assert "EnvironmentFile=" not in (_SYSTEMD_DIR / name).read_text(), name
 

@@ -279,9 +279,8 @@ class _FakeSettings:
     """The narrow ``SettingsLike`` surface ``OrderSubmissionPermit.issue`` needs."""
 
     orders_enabled_requested = True
-    current_rung_hold = True
+    sending_family_id = "pm_us_crh_v2"
     live_observations = True
-    continuous_rung_hold = False
 
 
 def _durable_accept_body(*, commission: str = "0.03", last_px: str = "0.37") -> bytes:

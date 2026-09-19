@@ -49,15 +49,28 @@ from pathlib import Path
 from typing import Final, Literal
 
 __all__ = [
+    "CompositionKind",
     "FamilyManifest",
     "FamilyManifestError",
     "FamilyManifestValidationError",
     "UnpinnedBoundaryArtefactError",
+    "UnpinnedDensityArtefactError",
     "UnregisteredFamilyManifestError",
     "load_family_manifest",
 ]
 
 ManifestStatus = Literal["DRAFT_NOT_REGISTERED", "REGISTERED"]
+
+#: WP-11b (active-family registry, cardinality-1): which strategy builder a
+#: manifest dispatches to. ``forecast_ladder`` is wired here so the exact-set
+#: is complete, but its strategy does not exist yet -- a boot attempt refuses
+#: (``app/trade.py``) until WP-14 lands. Never a bool alongside another bool:
+#: this is the ONE slot that names the composition, matching the manifest's
+#: own cardinality-1 ``family_id``.
+CompositionKind = Literal["current_rung_hold", "continuous_rung_hold", "forecast_ladder"]
+_COMPOSITION_KINDS: Final[frozenset[str]] = frozenset(
+    {"current_rung_hold", "continuous_rung_hold", "forecast_ladder"}
+)
 
 _REQUIRED_KEYS: Final[frozenset[str]] = frozenset(
     {
@@ -69,6 +82,9 @@ _REQUIRED_KEYS: Final[frozenset[str]] = frozenset(
         "boundary_inputs_sha256",
         "stations",
         "status",
+        "composition_kind",
+        "density_artefact_path",
+        "density_artefact_sha256",
     }
 )
 _STRING_FIELDS: Final[tuple[str, ...]] = (
@@ -79,6 +95,9 @@ _STRING_FIELDS: Final[tuple[str, ...]] = (
     "boundary_artefact_path",
     "boundary_inputs_sha256",
     "status",
+    "composition_kind",
+    "density_artefact_path",
+    "density_artefact_sha256",
 )
 _OPTIONAL_KEYS: Final[frozenset[str]] = frozenset({"exit_rule"})
 _STATUSES: Final[frozenset[str]] = frozenset({"DRAFT_NOT_REGISTERED", "REGISTERED"})
@@ -102,6 +121,15 @@ class UnpinnedBoundaryArtefactError(FamilyManifestError):
     """`boundary_inputs_sha256` is the all-zero placeholder and `allow_draft` is `False`."""
 
 
+class UnpinnedDensityArtefactError(FamilyManifestError):
+    """`density_artefact_sha256` is the all-zero placeholder and `allow_draft` is `False`.
+
+    Same pin shape as :class:`UnpinnedBoundaryArtefactError` (WP-11b F2 /
+    WP-13 L-12): a family's density table travels as a sha-pinned on-disk
+    DATA artefact named by the manifest, never a `src/` constant.
+    """
+
+
 @dataclass(frozen=True, slots=True, kw_only=True)
 class FamilyManifest:
     """One family's declared provenance boundary, plus its own content hash.
@@ -120,6 +148,19 @@ class FamilyManifest:
     stations: tuple[str, ...]
     status: ManifestStatus
     manifest_sha256: str
+    #: WP-11b: which strategy builder this family dispatches to. Required
+    #: (no default) -- every manifest, including every pre-existing one,
+    #: was updated in the WP-11b commit to declare it.
+    composition_kind: CompositionKind
+    #: WP-11b F2 / WP-13 L-12: on-disk DATA artefact for the family's
+    #: density/hold-probability table, sha-pinned the same way as
+    #: ``boundary_artefact_path`` / ``boundary_inputs_sha256`` above.
+    #: ``current_rung_hold`` / ``continuous_rung_hold`` families pin the
+    #: committed sentinel (``deploy/families/artefacts/
+    #: not_applicable_density.json``); ``forecast_ladder`` families pin the
+    #: real table minted at WP-13.
+    density_artefact_path: Path
+    density_artefact_sha256: str
     exit_rule: str | None = None
 
 
@@ -183,6 +224,24 @@ def load_family_manifest(path: Path, *, allow_draft: bool = False) -> FamilyMani
             "pass allow_draft=True to load anyway"
         )
 
+    composition_kind = payload["composition_kind"]
+    if composition_kind not in _COMPOSITION_KINDS:
+        raise FamilyManifestValidationError(
+            f"{path}: composition_kind {composition_kind!r} not one of "
+            f"{sorted(_COMPOSITION_KINDS)}"
+        )
+
+    density_sha = payload["density_artefact_sha256"]
+    if not _SHA256_RE.match(density_sha):
+        raise FamilyManifestValidationError(
+            f"{path}: density_artefact_sha256 must be 64 lowercase hex characters"
+        )
+    if density_sha == _UNPINNED_SHA256 and not allow_draft:
+        raise UnpinnedDensityArtefactError(
+            f"{path}: density_artefact_sha256 is the unpinned all-zero placeholder; "
+            "pass allow_draft=True to load anyway"
+        )
+
     stations_raw = payload["stations"]
     if (
         not isinstance(stations_raw, list)
@@ -209,5 +268,8 @@ def load_family_manifest(path: Path, *, allow_draft: bool = False) -> FamilyMani
         stations=tuple(stations_raw),
         status=status,
         manifest_sha256=manifest_sha256,
+        composition_kind=composition_kind,
+        density_artefact_path=Path(payload["density_artefact_path"]),
+        density_artefact_sha256=density_sha,
         exit_rule=exit_rule,
     )

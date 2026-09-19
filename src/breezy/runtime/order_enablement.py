@@ -131,17 +131,16 @@ class SettingsLike(Protocol):
     sufficient in a test, and this module never re-parses anything the
     settings loader already owns.
 
-    Phase 1: EITHER ``current_rung_hold`` OR ``continuous_rung_hold`` alone
-    satisfies the rung-hold precondition below -- exactly one sending family
-    is enforced at settings-load time (``runtime.settings.load_trade_settings``)
-    and in permit routing (``strategy.current_rung_hold.composition.
-    phase1_family_permits``), not here. ``issue()`` itself stays agnostic to
-    which family asked.
+    WP-11b: a single ``sending_family_id`` slot satisfies the rung-hold
+    precondition below whenever it is not ``None`` -- cardinality-1 (exactly
+    one sending family) is enforced at settings-load time
+    (``runtime.settings.load_trade_settings``) and in permit routing
+    (``strategy.current_rung_hold.composition.phase1_sending_permit``), not
+    here. ``issue()`` itself stays agnostic to which family asked.
     """
 
     orders_enabled_requested: bool
-    current_rung_hold: bool
-    continuous_rung_hold: bool
+    sending_family_id: str | None
     live_observations: bool
 
 
@@ -221,13 +220,10 @@ class OrderSubmissionPermit:
                 "both operator-reserved caps must be present and positive"
             ) from exc
 
-        rung_hold_family = (
-            settings.current_rung_hold is True or settings.continuous_rung_hold is True
-        )
+        rung_hold_family = settings.sending_family_id is not None
         if not rung_hold_family or settings.live_observations is not True:
             raise RungHoldNotReadyError(
-                "live_observations and one of current_rung_hold or "
-                "continuous_rung_hold must be enabled"
+                "live_observations must be enabled and sending_family_id must be set"
             )
 
         # The construction call names the class directly, not ``cls``: the

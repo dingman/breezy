@@ -37,8 +37,8 @@ from breezy.domain.weather_bucket_facts import (
 )
 from breezy.registry.sites import default_registry
 from breezy.runtime.settings import (
-    CURRENT_RUNG_HOLD_VAR,
     LIVE_OBSERVATIONS_VAR,
+    SENDING_FAMILY_ID_VAR,
     TRADE_CATALOG_ROOT_VAR,
     TRADE_TRADER_ID_VAR,
 )
@@ -257,17 +257,17 @@ def test_flag_absent_registers_zero_strategies_and_config_stays_empty(
     assert node.config.strategies == []
 
 
-def test_current_rung_hold_without_live_observations_exits_two(
+def test_sending_family_id_without_live_observations_exits_two(
     tmp_path: Path,
 ) -> None:
     err = io.StringIO()
-    env = _trade_env(tmp_path, **{CURRENT_RUNG_HOLD_VAR: "1"})
+    env = _trade_env(tmp_path, **{SENDING_FAMILY_ID_VAR: "pm_us_crh_v2"})
 
     code = run(env=env, node_factory=RecordingNode, stderr=err)
 
     assert code == EXIT_CONFIG_ERROR
     message = err.getvalue()
-    assert CURRENT_RUNG_HOLD_VAR in message
+    assert SENDING_FAMILY_ID_VAR in message
     assert LIVE_OBSERVATIONS_VAR in message
     assert RecordingNode.instances == []
 
@@ -279,7 +279,7 @@ def test_both_flags_on_empty_catalog_refuses_to_start(tmp_path: Path) -> None:
     env = _trade_env(
         tmp_path,
         **{
-            CURRENT_RUNG_HOLD_VAR: "1",
+            SENDING_FAMILY_ID_VAR: "pm_us_crh_v2",
             LIVE_OBSERVATIONS_VAR: "1",
             TRADE_CATALOG_ROOT_VAR: str(catalog_root),
         },
@@ -305,7 +305,7 @@ def test_both_flags_on_populated_catalog_registers_one_strategy_per_station_befo
     env = _trade_env(
         tmp_path,
         **{
-            CURRENT_RUNG_HOLD_VAR: "1",
+            SENDING_FAMILY_ID_VAR: "pm_us_crh_v2",
             LIVE_OBSERVATIONS_VAR: "1",
             TRADE_CATALOG_ROOT_VAR: str(catalog_root),
         },
@@ -342,7 +342,7 @@ def test_trial_day_latch_is_the_shared_binding_opened_once(tmp_path: Path) -> No
     env = _trade_env(
         tmp_path,
         **{
-            CURRENT_RUNG_HOLD_VAR: "1",
+            SENDING_FAMILY_ID_VAR: "pm_us_crh_v2",
             LIVE_OBSERVATIONS_VAR: "1",
             TRADE_CATALOG_ROOT_VAR: str(catalog_root),
         },
@@ -396,7 +396,7 @@ def test_orders_enabled_cannot_be_set_from_env(tmp_path: Path) -> None:
         env = _trade_env(
             tmp_path,
             **{
-                CURRENT_RUNG_HOLD_VAR: "1",
+                SENDING_FAMILY_ID_VAR: "pm_us_crh_v2",
                 LIVE_OBSERVATIONS_VAR: "1",
                 TRADE_CATALOG_ROOT_VAR: str(catalog_root),
                 **extra,
@@ -420,7 +420,7 @@ def test_exit_stack_releases_the_flock_on_success_and_on_exception(
     env = _trade_env(
         tmp_path,
         **{
-            CURRENT_RUNG_HOLD_VAR: "1",
+            SENDING_FAMILY_ID_VAR: "pm_us_crh_v2",
             LIVE_OBSERVATIONS_VAR: "1",
             TRADE_CATALOG_ROOT_VAR: str(catalog_root),
         },
@@ -446,7 +446,7 @@ def test_two_stations_never_share_a_component_id(tmp_path: Path) -> None:
     env = _trade_env(
         tmp_path,
         **{
-            CURRENT_RUNG_HOLD_VAR: "1",
+            SENDING_FAMILY_ID_VAR: "pm_us_crh_v2",
             LIVE_OBSERVATIONS_VAR: "1",
             TRADE_CATALOG_ROOT_VAR: str(catalog_root),
         },
@@ -459,7 +459,7 @@ def test_two_stations_never_share_a_component_id(tmp_path: Path) -> None:
     assert len(tags) == len(set(tags))
 
 
-def test_tape_recorder_settings_never_read_the_current_rung_hold_flag(
+def test_tape_recorder_settings_never_read_the_sending_family_id_var(
     tmp_path: Path,
 ) -> None:
     from breezy.runtime.settings import load_quote_tape_settings
@@ -467,9 +467,9 @@ def test_tape_recorder_settings_never_read_the_current_rung_hold_flag(
     settings = load_quote_tape_settings(
         {
             "BREEZY_POLYMARKET_US_QUOTE_TAPE_CATALOG": str(tmp_path / "tape"),
-            CURRENT_RUNG_HOLD_VAR: "1",
+            SENDING_FAMILY_ID_VAR: "pm_us_crh_v2",
         },
         total_bytes_probe=lambda _path: 500 * 1024**3,
     )
-    assert not hasattr(settings, "current_rung_hold")
-    assert "current_rung_hold" not in getattr(settings, "__dataclass_fields__", {})
+    assert not hasattr(settings, "sending_family_id")
+    assert "sending_family_id" not in getattr(settings, "__dataclass_fields__", {})

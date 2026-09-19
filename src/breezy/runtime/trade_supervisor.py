@@ -42,7 +42,7 @@ from typing import Final, TextIO
 
 from breezy.runtime.exec_state_db_path import ExecStateDbNotConfiguredError, resolve_store_path
 from breezy.runtime.health import AlertPayload, AlertSink, emit_alert, resolve_alert_sink
-from breezy.runtime.settings import CONTINUOUS_RUNG_HOLD_VAR
+from breezy.runtime.settings import SENDING_FAMILY_ID_VAR
 from breezy.runtime.sqlite_store import SqliteStateStore
 from breezy.runtime.submit_intent import (
     CURRENT_INTENT_KEY,
@@ -51,8 +51,6 @@ from breezy.runtime.submit_intent import (
     SubmitIntentState,
 )
 from breezy.runtime.trade_supervisor_core import (
-    CONTINUOUS_FAMILY_HALT_KEY,
-    CONTINUOUS_STARTUP_EVIDENCE_KEY,
     LAUNCH_UTC,
     MAX_RELAUNCH_ATTEMPTS,
     MIDDAY_READINESS_RECHECK_TIMEOUT,
@@ -76,7 +74,9 @@ from breezy.runtime.trade_supervisor_core import (
     assert_no_live_node_before_intent_probe,
     classify_exit1_cause,
     continuous_family_check,
+    continuous_family_halt_key,
     continuous_family_is_halted,
+    continuous_family_startup_evidence_key,
     decide_launch_action,
     decide_midday_relaunch,
     decide_relaunch,
@@ -338,9 +338,12 @@ def probe_open_intent(store_path: Path, *, node_pid: int | None) -> bool:
 
 
 # ---------------------------------------------------------------------------
-# [2026-09-12] Continuous-family self-check reads -- BREEZY_CONTINUOUS_RUNG_HOLD
-# only. Deliberately NOT routed through probe_open_intent/
-# assert_no_live_node_before_intent_probe: that guard is a business
+# [2026-09-12] Continuous-family self-check reads -- WP-11b (2026-09-19)
+# migrated the arming source off the retired continuous-rung-hold boolean
+# flag to a family-agnostic predicate over :data:`SENDING_FAMILY_ID_VAR`
+# (see `sending_family_active` below). Deliberately NOT routed through
+# probe_open_intent/assert_no_live_node_before_intent_probe: that guard is
+# a business
 # invariant scoped to the pre-launch OPEN-intent probe specifically (its own
 # docstring: "[E5 scope] The probe is pre-launch ONLY"), not a technical
 # limitation of SqliteStateStore -- the self-check runs at 17:05 UTC, WHILE
@@ -376,27 +379,55 @@ def _decode_startup_evidence(raw: bytes | None) -> Mapping[str, object] | None:
     return decoded
 
 
-def read_continuous_family_store_state(store_path: Path) -> ContinuousFamilyStoreState:
+def read_continuous_family_store_state(
+    store_path: Path, sending_family_id: str
+) -> ContinuousFamilyStoreState:
     """Read-only via a fresh, independent ``SqliteStateStore`` connection --
     see the module note above for why this is safe while the node is live.
+
+    WP-11b: takes the sending family id -- see
+    :func:`trade_supervisor_core.continuous_family_startup_evidence_key` /
+    :func:`trade_supervisor_core.continuous_family_halt_key` for why the
+    keys those functions return do not vary with it today (F6,
+    global-equivalent under cardinality-1).
 
     [2026-09-12 cross-seam fix] ``family_halted`` is NOT mere key presence:
     the store has no delete, so a legitimate ``breezy-clear-family-halt``
     run leaves the cleared sentinel in place rather than an absent key --
     see :func:`continuous_family_is_halted`.
     """
+    startup_evidence_key = continuous_family_startup_evidence_key(sending_family_id)
+    family_halt_key = continuous_family_halt_key(sending_family_id)
     with SqliteStateStore(store_path) as store:
-        evidence = _decode_startup_evidence(store.get(CONTINUOUS_STARTUP_EVIDENCE_KEY))
-        family_halted = continuous_family_is_halted(store.get(CONTINUOUS_FAMILY_HALT_KEY))
+        evidence = _decode_startup_evidence(store.get(startup_evidence_key))
+        family_halted = continuous_family_is_halted(store.get(family_halt_key))
     return ContinuousFamilyStoreState(startup_evidence=evidence, family_halted=family_halted)
 
 
-def continuous_rung_hold_env_active() -> bool:
-    """``True`` iff ``BREEZY_CONTINUOUS_RUNG_HOLD`` is set to exactly
-    ``"1"`` -- the ONLY environment value this module ever reads for the
-    continuous-family self-check. Never the operator-reserved caps, and
-    never logged by value (only the derived booleans below are)."""
-    return os.environ.get(CONTINUOUS_RUNG_HOLD_VAR) == "1"
+def sending_family_active() -> bool:
+    """``True`` iff :data:`SENDING_FAMILY_ID_VAR` is set to a non-blank
+    value -- the ONLY environment value this module ever reads for the
+    continuous-family self-check block's arming decision. Family-agnostic
+    (WP-11b F1): replaces the retired ``continuous_rung_hold_env_active``,
+    which read the now-retired continuous-rung-hold boolean flag and so
+    left the self-check block permanently unarmed for any OTHER sending
+    family (e.g. a promoted ``pm_us_crh_fc_v1``). Never the
+    operator-reserved caps, and never logged by value."""
+    raw = os.environ.get(SENDING_FAMILY_ID_VAR)
+    return raw is not None and raw.strip() != ""
+
+
+def resolve_sending_family_id() -> str | None:
+    """The raw :data:`SENDING_FAMILY_ID_VAR` value, or ``None`` if unset/blank.
+
+    Separate from :func:`sending_family_active` (a bool) because
+    :func:`_do_self_check` needs the actual id to pass to
+    :func:`read_continuous_family_store_state`, not merely whether one is
+    set."""
+    raw = os.environ.get(SENDING_FAMILY_ID_VAR)
+    if raw is None or not raw.strip():
+        return None
+    return raw
 
 
 # ---------------------------------------------------------------------------
@@ -763,8 +794,16 @@ class SupervisorPorts:
     #: never sets these: a constant ``False`` means the continuous-family
     #: self-check block is never entered (see ``_do_self_check``).
     continuous_family_active: Callable[[], bool] = field(default=lambda: False)
-    read_continuous_family_store_state: Callable[[Path], ContinuousFamilyStoreState] = field(
-        default=lambda _p: ContinuousFamilyStoreState(startup_evidence=None, family_halted=False)
+    #: WP-11b: the actual sending-family id, resolved separately from the
+    #: bool above so ``_do_self_check`` can pass it to
+    #: ``read_continuous_family_store_state`` below.
+    resolve_sending_family_id: Callable[[], str | None] = field(default=lambda: None)
+    read_continuous_family_store_state: Callable[
+        [Path, str], ContinuousFamilyStoreState
+    ] = field(
+        default=lambda _p, _f: ContinuousFamilyStoreState(
+            startup_evidence=None, family_halted=False
+        )
     )
 
 
@@ -782,7 +821,8 @@ def default_ports(*, alert_sink: AlertSink | None = None) -> SupervisorPorts:
         read_log_new=log_reader.read_new,
         alert_sink=alert_sink if alert_sink is not None else resolve_alert_sink(),
         find_adopted_log=find_adopted_node_log,
-        continuous_family_active=continuous_rung_hold_env_active,
+        continuous_family_active=sending_family_active,
+        resolve_sending_family_id=resolve_sending_family_id,
         read_continuous_family_store_state=read_continuous_family_store_state,
     )
 
@@ -1206,7 +1246,8 @@ def _do_self_check(
 
     continuous_check: ContinuousFamilyCheck | None = None
     if ports.continuous_family_active():
-        store_state = ports.read_continuous_family_store_state(store_path)
+        sending_family_id = ports.resolve_sending_family_id() or ""
+        store_state = ports.read_continuous_family_store_state(store_path, sending_family_id)
         launch_day = state.day if state is not None else now.date()
         continuous_check = continuous_family_check(
             log_text=log_text,
@@ -1376,6 +1417,19 @@ def _run_forever(
             phase, _fire_at = next_due(now, state)
 
             if phase is Phase.NONE:
+                # WP-0a review residual: a child SIGTERM'd at STOP_PRIOR is
+                # reaped there via a bounded poll loop, but if it happens to
+                # outlive that ~10 s window (e.g. slow shutdown), NOTHING
+                # else called `_reap_spawned_children()` until the phase
+                # machinery next made a port call -- which, since Phase.NONE
+                # is exactly the "nothing due" idle state, could be hours
+                # away (the next day's RELAUNCH_CHECK at worst). A
+                # `<defunct>` process sitting that long in a long-lived
+                # systemd unit's process table has caused a production
+                # incident in this repo before (WP-0a's own motivation).
+                # Reaping here bounds the window to one poll interval
+                # (`_SCHEDULE_POLL_INTERVAL_S`, currently 60 s) instead.
+                _reap_spawned_children()
                 sleep(_SCHEDULE_POLL_INTERVAL_S)
                 continue
 

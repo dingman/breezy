@@ -12,9 +12,15 @@ from breezy.persistence.family_manifest import (
     FamilyManifest,
     FamilyManifestValidationError,
     UnpinnedBoundaryArtefactError,
+    UnpinnedDensityArtefactError,
     UnregisteredFamilyManifestError,
     load_family_manifest,
 )
+
+#: WP-11b L-12 widen: real (non-zero) sha of the committed sentinel density
+#: artefact -- `deploy/families/artefacts/not_applicable_density.json` --
+#: shared by every non-forecast family manifest.
+_SENTINEL_DENSITY_SHA = "247f636350685b38966251703c47d10531913367fbcca175b086a2c298421a65"
 
 _VALID: dict[str, Any] = {
     "family_id": "pm_us_crh_v2",
@@ -23,6 +29,9 @@ _VALID: dict[str, Any] = {
     "d0_climate_day": "2026-09-10",
     "boundary_artefact_path": "deploy/families/gs_boundary_pm_us_crh_v2.json",
     "boundary_inputs_sha256": "a" * 64,
+    "composition_kind": "current_rung_hold",
+    "density_artefact_path": "deploy/families/artefacts/not_applicable_density.json",
+    "density_artefact_sha256": _SENTINEL_DENSITY_SHA,
     "stations": ["LAX", "MDW", "MIA", "SFO"],
     "status": "REGISTERED",
 }
