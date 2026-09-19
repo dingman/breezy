@@ -29,6 +29,7 @@ guards.
 from __future__ import annotations
 
 import io
+import logging
 import os
 import time
 from collections.abc import Callable
@@ -49,6 +50,7 @@ from breezy.runtime.quote_tape_ingest_cli import (
     run_ingest,
 )
 from breezy.runtime.quote_tape_preflight_cli import CATALOG_ENV_VAR
+from breezy.runtime.quote_tape_salvage import write_fresh_capture_rows
 from tests.unit.test_quote_tape_ingest_cli import (
     _quote_tick,
     _trade_tick,
@@ -358,3 +360,40 @@ def test_a_partial_slice_on_the_per_file_path_does_not_strand_the_range(
     assert "failed" not in results[0].type_results[0].outcome
     assert {tick.ts_init for tick in landed} == {1_000_000_000 + i for i in range(20)}
     assert len(landed) == 20
+
+
+def test_write_fresh_capture_rows_logs_the_dropped_count_on_a_dedupe_collision(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A de-dupe collision silently DROPS rows -- as bad as a duplicate would
+    be for the replay corpus, and otherwise invisible beyond the coarse
+    written-count int. Mirrors ``_salvage_one_file``'s precedent: log the
+    exact drop count as a WARNING."""
+    catalog = ParquetDataCatalog(str(tmp_path))
+    already_landed = [_quote_tick_at(1_000_000_000 + i) for i in range(5)]
+    catalog.write_data(already_landed, start=1_000_000_000, end=1_000_000_004)
+
+    overlapping = [_quote_tick_at(1_000_000_000 + i) for i in range(8)]
+    with caplog.at_level(logging.WARNING, logger="breezy.runtime.quote_tape_salvage"):
+        written = write_fresh_capture_rows(catalog, QuoteTick, overlapping)
+
+    assert written == 3
+    warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
+    assert len(warnings) == 1
+    assert "5 of 8" in warnings[0].getMessage()
+    assert "quote_tick" in warnings[0].getMessage()
+
+
+def test_write_fresh_capture_rows_does_not_warn_when_nothing_is_dropped(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Positive control (L-24): no collision, no warning."""
+    catalog = ParquetDataCatalog(str(tmp_path))
+    fresh_rows = [_quote_tick_at(1_000_000_000 + i) for i in range(4)]
+
+    with caplog.at_level(logging.WARNING, logger="breezy.runtime.quote_tape_salvage"):
+        written = write_fresh_capture_rows(catalog, QuoteTick, fresh_rows)
+
+    assert written == 4
+    warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
+    assert warnings == []

@@ -586,7 +586,18 @@ def default_convert(
 
 
 def _is_non_disjoint_refusal(exc: BaseException) -> bool:
-    """True when Nautilus refused a write as a non-disjoint interval."""
+    """True when Nautilus refused a write as a non-disjoint interval.
+
+    Coupled to nautilus's literal message text because that is the ONLY
+    signal available: nautilus raises a bare ``ValueError`` here, with no
+    dedicated exception type to catch instead. This degrades safely if a
+    future nautilus bump rewords the message -- the EXTEND fallback simply
+    stops firing and the write is reported as an ordinary "failed" outcome
+    (the pre-EXTEND behaviour); it never misroutes an unrelated
+    ``ValueError`` into EXTEND, since this is only consulted after a
+    ``ValueError`` has already been caught and every other branch requires
+    an affirmative substring match.
+    """
     return "non-disjoint" in str(exc)
 
 

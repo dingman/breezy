@@ -171,6 +171,15 @@ def write_fresh_capture_rows(
     ``convert_instrument_definitions``.
     """
     fresh = _drop_already_landed_unfiltered(write_target, data_cls, objects)
+    dropped = len(objects) - len(fresh)
+    if dropped:
+        logger.warning(
+            "%d of %d capture-timed %s row(s) already landed (same "
+            "instrument_id, ts_init); dropped to avoid a duplicate",
+            dropped,
+            len(objects),
+            class_to_filename(data_cls),
+        )
     if not fresh:
         return 0
     write_target.write_data(fresh, skip_disjoint_check=True)
