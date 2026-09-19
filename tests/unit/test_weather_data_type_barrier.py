@@ -92,7 +92,15 @@ if TYPE_CHECKING:  # pragma: no cover - typing only
 WEATHER_SCAN_ROOTS = ("src", "scripts")
 
 #: The record classes that have exactly one legitimate `DataType` each.
-_RECORD_NAMES = frozenset({"NwsClimateDay", "NwsRawProduct", "StationObservation"})
+#: WIDENED for `ForecastPoint` (WP-12 Seam A) the moment the record class
+#: landed, ahead of its shared factory: the rule is "no module builds one
+#: inline", and it must be in force BEFORE the first construction site
+#: exists, not after. The factory and its identity/topic assertions join
+#: `_FACTORY_NAMES`/`_FACTORY_MODULES` in the ingest seam that adds them.
+#: Never narrowed.
+_RECORD_NAMES = frozenset(
+    {"NwsClimateDay", "NwsRawProduct", "StationObservation", "ForecastPoint"},
+)
 
 #: The shared factories, and the ONE module each is allowed to live in.
 _FACTORY_NAMES = frozenset(
@@ -302,6 +310,7 @@ def test_the_exemption_is_bound_to_the_factory_module_not_the_function_name() ->
         ("with metadata", 'DataType(NwsClimateDay, {"p": 1, "q": 2})\n'),
         ("raw product", "DataType(NwsRawProduct)\n"),
         ("station observation", "DataType(StationObservation)\n"),
+        ("forecast point", "DataType(ForecastPoint)\n"),
         ("dotted callee", "data.DataType(NwsClimateDay)\n"),
         ("dotted record", "nws.NwsRawProduct\nDataType(nws.NwsRawProduct)\n"),
         ("keyword form", "DataType(type=NwsClimateDay)\n"),
