@@ -15,6 +15,7 @@ import ast
 import hashlib
 import io
 import json
+import subprocess
 from pathlib import Path
 
 import pytest
@@ -145,10 +146,26 @@ def test_boot_loads_manifest_from_registry_dir_not_module_constant() -> None:
 
 
 # ---------------------------------------------------------------------------
-# (5) test_promoted_revision_requires_no_src_edit -- a fixture
-# pm_us_crh_fc_v2.json with composition_kind=forecast_ladder boots as
-# sender with ZERO src/ diff vs v1 (manifest + density artefact + env only).
-# THIS TEST IS THE POINT OF THE WHOLE WP.
+# (5) test_promoted_revision_requires_no_src_edit -- promoting a REAL,
+# booting family (continuous_rung_hold) to a successor changes ONLY a
+# manifest file + a density artefact + the ``BREEZY_SENDING_FAMILY_ID`` env
+# value, and each boot's composition is built from ITS OWN manifest data
+# (never a value captured once and reused). THIS TEST IS THE POINT OF THE
+# WHOLE WP.
+#
+# Superseded design note: an earlier version of this test used two
+# ``forecast_ladder`` fixtures and asserted (a) ``_APP_TRADE_SOURCE ==
+# src_before`` -- comparing the same in-memory string to itself, since
+# nothing in the test process ever writes to ``src/`` under ANY
+# implementation, including a hardcoded one -- and (b)
+# ``EXIT_CONFIG_ERROR`` for both. ``forecast_ladder`` boots never reach
+# composition at all (``app/trade.py`` refuses it unconditionally --
+# ``ForecastLadderStrategy`` does not exist yet, WP-14), so that test
+# proved only that two manifest files hit the SAME hard-coded refusal
+# branch. It would have passed identically had ``run()`` ignored the
+# manifest's ``family_id``, ``stations`` and ``trial_id_prefix`` entirely.
+# The replacement below boots for real and reads a value straight off the
+# constructed runtime object.
 # ---------------------------------------------------------------------------
 
 
@@ -182,22 +199,102 @@ def _write_forecast_ladder_manifest(
     (families_dir / f"{family_id}.json").write_text(json.dumps(payload))
 
 
+def _write_continuous_promotion_manifest(
+    families_dir: Path,
+    *,
+    family_id: str,
+    trial_suffix: str,
+    stations: tuple[str, ...],
+) -> None:
+    """A REGISTERED ``continuous_rung_hold`` fixture manifest -- unlike
+    ``_write_forecast_ladder_manifest``'s, this composition_kind actually
+    boots, so it can prove data-driven promotion rather than a shared
+    refusal path."""
+    artefacts_dir = families_dir / "artefacts"
+    artefacts_dir.mkdir(parents=True, exist_ok=True)
+    density_path = artefacts_dir / f"{family_id}_density.json"
+    density_path.write_text(json.dumps({"schema": "fixture", "revision": trial_suffix}))
+    density_sha = hashlib.sha256(density_path.read_bytes()).hexdigest()
+
+    boundary_path = families_dir / "gs_boundary_fixture.json"
+    if not boundary_path.exists():
+        boundary_path.write_text(json.dumps({"boundary": "fixture"}))
+    boundary_sha = hashlib.sha256(boundary_path.read_bytes()).hexdigest()
+
+    payload = {
+        "family_id": family_id,
+        "venue": "polymarket_us",
+        "trial_id_prefix": f"continuous_rung_hold/trial/{trial_suffix}/",
+        "d0_climate_day": "2026-09-19",
+        "boundary_artefact_path": str(boundary_path),
+        "boundary_inputs_sha256": boundary_sha,
+        "composition_kind": "continuous_rung_hold",
+        "density_artefact_path": str(density_path),
+        "density_artefact_sha256": density_sha,
+        "stations": list(stations),
+        "status": "REGISTERED",
+    }
+    (families_dir / f"{family_id}.json").write_text(json.dumps(payload))
+
+
+def _hash_tracked_src_files() -> str:
+    """Sha256 over every git-tracked file under ``src/`` -- path AND
+    content -- so an added, removed, OR modified file all flip the digest.
+    Reads bytes straight off disk (never ``git show``), so even an
+    unstaged write shows up. Uses the repo's own git index (``git
+    ls-files``) for the file list, never a glob, so a rename is caught
+    too. This is the thing an implementation that actually edited
+    ``src/`` during a "promotion" would break; a hardcoded-family
+    implementation and a genuinely data-driven one both leave it alone,
+    which is exactly the property this test needs and the retired
+    ``_APP_TRADE_SOURCE == src_before`` self-comparison could never
+    check.
+    """
+    listing = subprocess.run(
+        ["git", "ls-files", "src"],
+        cwd=_REPO_ROOT,
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    digest = hashlib.sha256()
+    for rel_path in sorted(listing.stdout.splitlines()):
+        digest.update(rel_path.encode("utf-8"))
+        digest.update((_REPO_ROOT / rel_path).read_bytes())
+    return digest.hexdigest()
+
+
 def test_promoted_revision_requires_no_src_edit(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     _operator_order_ceiling: None,  # noqa: F811
     _clean_nodes: None,  # noqa: F811
 ) -> None:
-    """Promoting ``pm_us_crh_fc_v1`` -> ``pm_us_crh_fc_v2`` changes ONLY a
-    manifest file + a density artefact + the ``BREEZY_SENDING_FAMILY_ID``
-    env value. ``ForecastLadderStrategy`` does not exist yet (WP-14), so
-    BOTH fixture ids reach the identical, data-driven composition-dispatch
-    refusal (``EXIT_CONFIG_ERROR``) through the exact SAME unmodified
-    ``src/`` code path -- proving the promotion act is purely data.
+    """Promoting ``pm_us_crh_promo_a`` -> ``pm_us_crh_promo_b`` (both
+    ``continuous_rung_hold``, both REGISTERED, differing only in their own
+    manifest data) changes ONLY a manifest file + a density artefact + the
+    ``BREEZY_SENDING_FAMILY_ID`` env value -- and BOTH boot for real.
+
+    Today, of a manifest's data-bearing fields, only ``family_id`` reaches
+    a live runtime object: it flows through ``exit_manifest.family_id`` in
+    ``app/trade.py::run`` into every constructed strategy's
+    ``PositionMonitor.exit_family_id``
+    (``composition.py::_build_position_monitor_for``). ``stations`` and
+    ``trial_id_prefix`` are declared and validated on the manifest but not
+    yet consumed by composition -- station iteration comes from the
+    module-level ``SUPPORTED_STATIONS`` constant, not ``manifest.stations``
+    -- so this test asserts exactly the one property that is actually true
+    on disk today: each boot's monitor carries ITS OWN manifest's
+    ``family_id``, never a value captured once (e.g. at import time or on
+    the first boot) and silently reused on the second.
     """
     families_dir = tmp_path / "deploy" / "families"
-    _write_forecast_ladder_manifest(families_dir, family_id="pm_us_crh_fc_v1", trial_suffix="v1")
-    _write_forecast_ladder_manifest(families_dir, family_id="pm_us_crh_fc_v2", trial_suffix="v2")
+    _write_continuous_promotion_manifest(
+        families_dir, family_id="pm_us_crh_promo_a", trial_suffix="a", stations=("SFO",)
+    )
+    _write_continuous_promotion_manifest(
+        families_dir, family_id="pm_us_crh_promo_b", trial_suffix="b", stations=("LAX",)
+    )
 
     monkeypatch.chdir(tmp_path)
 
@@ -205,9 +302,9 @@ def test_promoted_revision_requires_no_src_edit(
     catalog_root.mkdir()
     _write_today_catalog(catalog_root)
 
-    src_before = _APP_TRADE_SOURCE
-    results: dict[str, int] = {}
-    for family_id in ("pm_us_crh_fc_v1", "pm_us_crh_fc_v2"):
+    src_hash_before = _hash_tracked_src_files()
+    exit_family_ids: dict[str, set[str | None]] = {}
+    for family_id in ("pm_us_crh_promo_a", "pm_us_crh_promo_b"):
         env = _trade_env(
             tmp_path,
             **{
@@ -216,13 +313,60 @@ def test_promoted_revision_requires_no_src_edit(
                 TRADE_CATALOG_ROOT_VAR: str(catalog_root),
             },
         )
-        results[family_id] = run(env=env, node_factory=RecordingNode, stderr=io.StringIO())
+        code = run(env=env, node_factory=RecordingNode, stderr=io.StringIO())
+        assert code == EXIT_OK, f"{family_id} failed to boot"
+        node = RecordingNode.instances[-1]
+        strategies = [
+            s for s in node.trader.strategies if isinstance(s, ContinuousRungHoldStrategy)
+        ]
+        assert strategies, f"{family_id}: no ContinuousRungHoldStrategy was registered"
+        exit_family_ids[family_id] = {
+            strategy._position_monitor._exit_family_id for strategy in strategies
+        }
+        RecordingNode.instances.clear()
 
-    # ZERO src/ diff between the two calls: the module's own source text
-    # (read once, at import time, before either call) is unchanged.
-    assert _APP_TRADE_SOURCE == src_before
-    assert results["pm_us_crh_fc_v1"] == EXIT_CONFIG_ERROR
-    assert results["pm_us_crh_fc_v2"] == EXIT_CONFIG_ERROR
+    # ZERO src/ diff across the promotion -- a REAL check, capable of
+    # failing: hashed before the first boot, again after the second.
+    assert _hash_tracked_src_files() == src_hash_before
+
+    # Each boot's composition reflects ITS OWN manifest, not a value
+    # captured once and reused across both: the two boots disagree with
+    # each other, and each agrees only with its own sending_family_id.
+    assert exit_family_ids["pm_us_crh_promo_a"] == {"pm_us_crh_promo_a"}
+    assert exit_family_ids["pm_us_crh_promo_b"] == {"pm_us_crh_promo_b"}
+    assert exit_family_ids["pm_us_crh_promo_a"] != exit_family_ids["pm_us_crh_promo_b"]
+
+
+def test_forecast_ladder_composition_kind_deliberately_refuses_to_boot(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    _operator_order_ceiling: None,  # noqa: F811
+    _clean_nodes: None,  # noqa: F811
+) -> None:
+    """Kept as its OWN test, separate from the promotion proof above:
+    ``composition_kind=forecast_ladder`` is a deliberate, data-driven
+    refusal (``ForecastLadderStrategy`` does not exist yet -- WP-14), never
+    a silent zero-strategy boot."""
+    families_dir = tmp_path / "deploy" / "families"
+    _write_forecast_ladder_manifest(families_dir, family_id="pm_us_crh_fc_v1", trial_suffix="v1")
+
+    monkeypatch.chdir(tmp_path)
+
+    catalog_root = tmp_path / "catalog"
+    catalog_root.mkdir()
+    _write_today_catalog(catalog_root)
+
+    env = _trade_env(
+        tmp_path,
+        **{
+            SENDING_FAMILY_ID_VAR: "pm_us_crh_fc_v1",
+            LIVE_OBSERVATIONS_VAR: "1",
+            TRADE_CATALOG_ROOT_VAR: str(catalog_root),
+        },
+    )
+    code = run(env=env, node_factory=RecordingNode, stderr=io.StringIO())
+
+    assert code == EXIT_CONFIG_ERROR
     assert RecordingNode.instances == []
 
 

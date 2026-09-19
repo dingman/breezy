@@ -18,6 +18,8 @@ from pathlib import Path
 
 import pytest
 
+from breezy.runtime.settings import SENDING_FAMILY_ID_VAR
+
 _DEPLOY_DIR = Path(__file__).resolve().parents[2] / "deploy" / "systemd"
 _INSTALLED_UNIT = _DEPLOY_DIR / "breezy-trade-supervisor.service"
 
@@ -40,6 +42,17 @@ def test_installed_unit_runs_the_registered_sending_family_by_id() -> None:
     assert _EXPECTED_REMOVED_CURRENT not in lines
     assert _EXPECTED_REMOVED_CONTINUOUS not in lines
     assert lines.count(_EXPECTED_REPLACEMENT_ADDED) == 1
+
+    # Gap closed (independent review, MEDIUM, 2026-09-19): the assertions
+    # above pin the env-var NAME as a bare literal, so a future rename of
+    # `breezy.runtime.settings.SENDING_FAMILY_ID_VAR` with no matching edit
+    # to this systemd unit would drift silently -- this test would keep
+    # passing against the OLD name. Derive the prefix from the constant
+    # itself so a rename on either side (settings.py or the unit file)
+    # without the other shows up here.
+    derived_prefix = f"Environment={SENDING_FAMILY_ID_VAR}="
+    matched = [line for line in lines if line.startswith(derived_prefix)]
+    assert matched == [_EXPECTED_REPLACEMENT_ADDED]
 
 
 def test_installed_unit_pins_the_phase0_shadow_flag_off_after_operator_env() -> None:
