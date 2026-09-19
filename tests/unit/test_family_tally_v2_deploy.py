@@ -344,62 +344,228 @@ def test_template_tally_tick_is_after_node_launch() -> None:
     assert tick >= LAUNCH_WINDOW_END_UTC
 
 
-#: WP-0b built a discovery-based regression test
-#: (test_every_tally_unit_carries_every_env_var_its_family_requires) that
-#: derives the wrapper's required env vars from its own ``${VAR:?...}``
-#: syntax and skips any unit file that names no CONCRETE family (an
-#: uninstantiated ``@.service`` template has no ``@<instance>`` suffix, so
-#: it names none). WP-11b's whole tally surface IS such a template, so that
-#: skip would leave POLYMARKET_US_EXEC_STATE_DB unguarded on the one unit
-#: that matters -- the exact env line WP-0b exists to keep from being
-#: missed. This test closes that blind spot directly: it does not skip the
-#: bare template, it asserts the template declares every var the wrapper
-#: could ever require for ANY family it might be instantiated with.
-def test_bare_template_declares_every_env_var_any_instantiated_family_could_require(
+# --- WP-0b regression, folded together with WP-11b's template collapse ---
+#
+# WP-0b (commit 49e095c) built a discovery-based regression test,
+# `test_every_tally_unit_carries_every_env_var_its_family_requires`, that
+# derives BOTH sides from the real artefacts instead of hardcoding them:
+#
+#   * the REQUIRED variable set comes from parsing the wrapper's own
+#     `${VAR:?message}` syntax -- never a Python-side restatement of which
+#     variables it needs, which could drift the moment the wrapper's own
+#     requirements change;
+#   * WHICH families actually trigger that requirement is determined by
+#     actually RUNNING the wrapper against each family's REAL manifest with
+#     the variable unset and checking for the wrapper's own message --
+#     never a Python mirror of the wrapper's
+#     `status == REGISTERED and venue == polymarket_us` bash conditional;
+#   * the units under test are DISCOVERED by scanning every
+#     deploy/systemd/*.service file's ExecStart= for an invocation of
+#     family-tally-v2-run.sh, never named one at a time.
+#
+# WP-0b's original `_discover_tally_units()` skipped any unit file that
+# names no CONCRETE family -- an uninstantiated `@.service` template has no
+# `@<instance>` suffix, so it named none. WP-11b's whole tally surface IS
+# such a template (`breezy-family-tally@.service` replaces the per-family
+# unit files WP-0b's discovery used to iterate), so that skip would leave
+# POLYMARKET_US_EXEC_STATE_DB unguarded on the one unit that matters -- the
+# exact env line WP-0b exists to keep from being missed.
+#
+# Fixed here by making the bare template a FIRST-CLASS discovery result
+# rather than a skipped one: `_discover_tally_units()` now pairs a bare
+# template with the set of every REGISTERED family in `deploy/families/`
+# the wrapper could require a variable for (a template is instantiable with
+# ANY of them), and the assertion loop below checks the template declares
+# every variable required by ANY of those families. A concrete
+# `@<instance>` unit, should one reappear, is still resolved to its own one
+# family and checked individually.
+#
+# WP-11b's separate `test_bare_template_declares_every_env_var_...` test
+# (added directly against the template, without going through
+# `_discover_tally_units()`) is now REDUNDANT with this strengthened
+# discovery test -- both derive the same required-var set from the
+# wrapper's `${VAR:?...}` syntax and the same triggering-family set by
+# running the real wrapper, and both assert the template declares the
+# union. Folded into this one test rather than kept side by side.
+
+
+def _required_env_var_messages() -> dict[str, str]:
+    """Every strictly-required ``${VAR:?message}`` parameter expansion in
+    the wrapper's own source, keyed by variable name. This is the wrapper's
+    OWN definition of "required" -- never a hardcoded name list that could
+    drift out of sync with it."""
+    text = _WRAPPER.read_text()
+    return dict(re.findall(r"\$\{([A-Z_][A-Z0-9_]*):\?([^}]*)\}", text))
+
+
+def _discover_tally_units() -> list[tuple[Path, list[str]]]:
+    """Every ``deploy/systemd/*.service`` unit whose ``ExecStart=`` invokes
+    ``family-tally-v2-run.sh``, paired with the family id(s) it must
+    satisfy the wrapper's env-var contract for. Units are found by
+    scanning ExecStart=, never a hardcoded unit-name list:
+
+    * a CONCRETE unit -- ``ExecStart=...wrapper %i`` on an
+      ``@<instance>`` filename, or a literal family-id argument -- is
+      paired with that ONE family id, resolved from the unit's own
+      filename/argument;
+    * a BARE, uninstantiated template (``ExecStart=...wrapper %i``, no
+      ``@<instance>`` suffix -- WP-11b's ``breezy-family-tally@.service``)
+      is instantiable with ANY REGISTERED family, so it is paired with
+      EVERY valid family id and must satisfy the union of what any of them
+      could require. It is a first-class discovery result, never skipped:
+      skipping it would leave the one unit that matters unguarded.
+    """
+    pairs: list[tuple[Path, list[str]]] = []
+    for unit in sorted(_SYSTEMD_DIR.glob("*.service")):
+        text = unit.read_text()
+        exec_start_lines = [
+            line for line in text.splitlines() if line.startswith("ExecStart=")
+        ]
+        if not exec_start_lines:
+            continue
+        exec_start = exec_start_lines[0]
+        if "family-tally-v2-run.sh" not in exec_start:
+            continue
+        trailing = exec_start.strip().split()[-1]
+        if trailing == "%i":
+            # unit.stem for "breezy-family-tally@pm_us_crh_v2.service" is
+            # "breezy-family-tally@pm_us_crh_v2" (family after the "@");
+            # for the BARE template "breezy-family-tally@.service" it is
+            # "breezy-family-tally@" -- "@" present, but nothing after it.
+            family_id = unit.stem.split("@", 1)[1] if "@" in unit.stem else ""
+            if family_id:
+                pairs.append((unit, [family_id]))
+                continue
+            # Bare template: instantiable with any REGISTERED family --
+            # check it against the union of them, never skip it.
+            family_ids = sorted(_valid_family_ids())
+            assert family_ids, (
+                f"{unit.name} is a bare template with no ExecStart= "
+                "instance suffix, but no valid family manifest exists to "
+                "check its env contract against"
+            )
+            pairs.append((unit, family_ids))
+        else:
+            pairs.append((unit, [trailing]))
+    return pairs
+
+
+def _family_requires_env_var(
+    family_id: str, var_name: str, message: str, tmp_path: Path
+) -> bool:
+    """Run the REAL wrapper against family_id's REAL manifest with
+    var_name unset, and report whether the wrapper's own bash parameter
+    expansion fails with its own message -- the wrapper's runtime
+    behaviour is the source of truth for "required", never a Python
+    restatement of its internal branching."""
+    probe_dir = tmp_path / f"probe_{family_id}_{var_name}"
+    out_dir = probe_dir / "derived"
+    out_dir.mkdir(parents=True)
+    stamp = _dt.datetime.now(_dt.UTC).strftime("%Y-%m-%d")
+    (out_dir / f"score_live_trials_ok_{stamp}").touch()
+    _write_counter_json(probe_dir)
+
+    stub = probe_dir / "stub_python.sh"
+    stub.write_text(
+        """#!/usr/bin/env bash
+case "$*" in
+  *"-m breezy.runtime.exec_state_db_path --check"*)
+    echo "MATCH"
+    exit 0
+    ;;
+  *"-m breezy.runtime.structural_pin_guard"*)
+    exit 0
+    ;;
+  *)
+    exit 0
+    ;;
+esac
+"""
+    )
+    stub.chmod(0o755)
+
+    env = dict(os.environ)
+    env["BREEZY_SCORED_TRIALS_DIR"] = str(probe_dir / "scored_trials")
+    env["BREEZY_LIVE_TALLY_OUTPUT_DIR"] = str(out_dir)
+    env["BREEZY_FAMILY_TALLY_V2_FAMILIES_DIR"] = str(_FAMILIES_DIR)
+    env["BREEZY_FAMILY_TALLY_V2_PYTHON"] = str(stub)
+    env.pop(var_name, None)
+
+    result = subprocess.run(
+        ["bash", str(_WRAPPER), family_id],
+        cwd=_REPO_ROOT,
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=30,
+        check=False,
+    )
+    log_path = out_dir / "family_tally_v2.log"
+    blob = f"{result.stdout}{result.stderr}"
+    blob += log_path.read_text() if log_path.exists() else ""
+    return result.returncode != 0 and message in blob
+
+
+def test_every_tally_unit_carries_every_env_var_its_family_requires(
     tmp_path: Path,
 ) -> None:
-    required_vars: set[str] = set()
-    wrapper_text = _WRAPPER.read_text()
-    for match in re.finditer(r"\$\{(\w+):\?[^}]*\}", wrapper_text):
-        required_vars.add(match.group(1))
-    assert "POLYMARKET_US_EXEC_STATE_DB" in required_vars, (
+    """WP-0b regression, strengthened for WP-11b's template collapse:
+    catches a tally unit -- concrete OR the bare, instantiable-with-any-
+    family template -- that invokes the wrapper for a family the wrapper
+    requires a variable for, without declaring it. Discovery never skips
+    the bare template; it is checked against the union of every family it
+    could be instantiated with."""
+    required_messages = _required_env_var_messages()
+    assert required_messages, (
+        "expected at least one ${VAR:?message} required parameter in "
+        f"{_WRAPPER} -- wrapper syntax changed, this test's derivation is stale"
+    )
+    assert "POLYMARKET_US_EXEC_STATE_DB" in required_messages, (
         "the wrapper's own ${VAR:?...} syntax no longer names "
         "POLYMARKET_US_EXEC_STATE_DB -- update this test's expectation, "
         "do not just widen the template"
     )
 
-    # Which families actually TRIGGER each required var, determined by
-    # running the real wrapper against each real manifest with the var
-    # unset -- never a hardcoded Python mirror of the wrapper's own bash
-    # conditional (REGISTERED + venue == polymarket_us).
-    triggering_vars: set[str] = set()
-    for family_id in sorted(_valid_family_ids()):
-        for var in sorted(required_vars):
-            result = _run_wrapper(
-                [family_id],
-                tmp_path / family_id / var,
-                unset_extra=frozenset({var}),
-            )
-            # A failure that names the missing var (bash's `:?` message) --
-            # not merely a nonzero exit, which the DRAFT/non-polymarket_us
-            # families also produce for unrelated reasons -- is what proves
-            # THIS family actually reaches the requirement.
-            if var in result.stderr:
-                triggering_vars.add(var)
+    units = _discover_tally_units()
+    assert units, "expected at least one systemd unit invoking family-tally-v2-run.sh"
 
-    template_text = (_SYSTEMD_DIR / _TEMPLATE_SERVICE).read_text()
-    template_env_vars = {
-        line[len("Environment=") :].split("=", 1)[0]
-        for line in template_text.splitlines()
-        if line.startswith("Environment=")
-    }
-    missing = triggering_vars - template_env_vars
-    assert not missing, (
-        f"{_TEMPLATE_SERVICE} is missing Environment= for {sorted(missing)}, "
-        "required by at least one family this template can be instantiated "
-        "with -- the exact WP-0b incident (a var present on one per-family "
-        "unit copy and missing on the other) recurring on the shared "
-        "template"
+    requires_cache: dict[tuple[str, str], bool] = {}
+
+    def _requires(family_id: str, var_name: str, message: str) -> bool:
+        key = (family_id, var_name)
+        if key not in requires_cache:
+            requires_cache[key] = _family_requires_env_var(
+                family_id, var_name, message, tmp_path
+            )
+        return requires_cache[key]
+
+    checked_a_required_case = False
+    for unit_path, family_ids in units:
+        unit_text = unit_path.read_text()
+        for family_id in family_ids:
+            manifest_path = _FAMILIES_DIR / f"{family_id}.json"
+            assert manifest_path.exists(), (
+                f"{unit_path.name} invokes the wrapper for unknown family {family_id!r}"
+            )
+
+            for var_name, message in required_messages.items():
+                if not _requires(family_id, var_name, message):
+                    continue
+                checked_a_required_case = True
+                has_line = re.search(
+                    rf"^Environment={re.escape(var_name)}=", unit_text, re.MULTILINE
+                )
+                assert has_line, (
+                    f"{unit_path.name} invokes family-tally-v2-run.sh for family "
+                    f"{family_id!r}, which the wrapper's own logic requires "
+                    f"{var_name} for, but the unit declares no "
+                    f"Environment={var_name}= line"
+                )
+
+    assert checked_a_required_case, (
+        "no discovered unit's family actually required any of the wrapper's "
+        "required variables -- this test would pass vacuously; the "
+        "fixture/manifest set changed under it"
     )
 
 
