@@ -9,8 +9,8 @@ complete 24h days only, dense stations only (NYC excluded, L-13).
 Corpus sha256 (manifest over every ASOS/CLI cache file this run read):
     3b410fb9c0c9208c5afb5cd8de05789077aca93c71fd540ddae0607ad6f04d48
 Study git sha (scripts/analysis/mb_current_rung_edge_study.py):
-    dd77357fc68a352d1b86cb695202bb2ce49273a1
-Generated at (UTC): 2026-09-14T14:50:25+00:00
+    d499cee7ca53ec504bad031c685786ed17dac658
+Generated at (UTC): 2026-09-20T21:27:31+00:00
 
 Key: `(station, season, hour_lst, width_code, m_code)`.
 `width_code`: 0 = interior_2F, 1 = open_upper, 2 = open_lower.
@@ -35,7 +35,7 @@ from typing import Final
 __all__ = ["CORPUS_SHA256", "P_HOLD_LOWER", "P_HOLD_UPPER", "STUDY_GIT_SHA"]
 
 CORPUS_SHA256: Final[str] = "3b410fb9c0c9208c5afb5cd8de05789077aca93c71fd540ddae0607ad6f04d48"
-STUDY_GIT_SHA: Final[str] = "dd77357fc68a352d1b86cb695202bb2ce49273a1"
+STUDY_GIT_SHA: Final[str] = "d499cee7ca53ec504bad031c685786ed17dac658"
 
 P_HOLD_LOWER: Final[Mapping[tuple[str, str, int, int, int], Decimal | None]] = (
     MappingProxyType(

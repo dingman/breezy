@@ -30,9 +30,9 @@ import itertools
 import math
 import random
 import statistics
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
-from typing import Final
+from typing import Final, Protocol
 
 from forecast_conditional_corpus import (
     BOOTSTRAP_ALPHA,
@@ -217,11 +217,62 @@ class ClusterCI:
         }
 
 
-def _clusters(trials: Sequence[Trial], cluster: str) -> list[list[Trial]]:
-    grouped: dict[object, list[Trial]] = {}
+class SupportsClusterKey(Protocol):
+    """Anything that can name its own cluster -- a :class:`Trial`, or a row of
+    another study that wants THIS blocking and THIS bootstrap rather than a
+    second copy of them."""
+
+    def cluster_key(self, cluster: str) -> object: ...
+
+
+def _clusters[ClusterT: SupportsClusterKey](
+    trials: Sequence[ClusterT], cluster: str
+) -> list[list[ClusterT]]:
+    grouped: dict[object, list[ClusterT]] = {}
     for trial in trials:
         grouped.setdefault(trial.cluster_key(cluster), []).append(trial)
     return [grouped[key] for key in sorted(grouped, key=repr)]
+
+
+def bootstrap_cluster_draws[ClusterT: SupportsClusterKey](
+    items: Sequence[ClusterT],
+    *,
+    statistic: Callable[[Sequence[ClusterT]], float],
+    cluster: str,
+    iterations: int = BOOTSTRAP_ITERATIONS,
+    seed: int = BOOTSTRAP_SEED,
+) -> list[float]:
+    """Cluster block bootstrap draws of ``statistic``, ascending.
+
+    THE one resampling loop in this repo: whole clusters are drawn with
+    replacement, all of their members together, and ``statistic`` is evaluated
+    on each resample. Every study that needs a cluster-robust interval calls
+    this rather than writing a second loop whose seeding, draw count and tail
+    convention could drift from the one the published intervals came from.
+    """
+    blocks = _clusters(items, cluster)
+    if not blocks:
+        raise ValueError("bootstrap of an empty trial set is undefined")
+    rng = random.Random(seed)
+    draws: list[float] = []
+    for _ in range(iterations):
+        drawn: list[ClusterT] = []
+        for _ in range(len(blocks)):
+            drawn.extend(blocks[rng.randrange(len(blocks))])
+        draws.append(statistic(drawn))
+    draws.sort()
+    return draws
+
+
+def percentile_interval(
+    draws: Sequence[float], *, alpha: float = BOOTSTRAP_ALPHA
+) -> tuple[float, float]:
+    """The two-sided percentile interval of ASCENDING ``draws``."""
+    if not draws:
+        raise ValueError("an interval over zero draws is undefined")
+    low = draws[max(0, math.floor((alpha / 2.0) * len(draws)))]
+    high = draws[min(len(draws) - 1, math.ceil((1.0 - alpha / 2.0) * len(draws)) - 1)]
+    return low, high
 
 
 def assert_nondegenerate_clustering(trials: Sequence[Trial], *, cluster: str) -> None:
@@ -273,16 +324,14 @@ def bootstrap_brier_difference_ci(
     blocks = _clusters(trials, cluster)
     if not blocks:
         raise ValueError("bootstrap of an empty trial set is undefined")
-    rng = random.Random(seed)
-    diffs: list[float] = []
-    for _ in range(iterations):
-        drawn: list[Trial] = []
-        for _ in range(len(blocks)):
-            drawn.extend(blocks[rng.randrange(len(blocks))])
-        diffs.append(brier(drawn, MODEL_FORECAST) - brier(drawn, against))
-    diffs.sort()
-    lo = diffs[max(0, math.floor((BOOTSTRAP_ALPHA / 2.0) * len(diffs)))]
-    hi = diffs[min(len(diffs) - 1, math.ceil((1.0 - BOOTSTRAP_ALPHA / 2.0) * len(diffs)) - 1)]
+    diffs = bootstrap_cluster_draws(
+        trials,
+        statistic=lambda drawn: brier(drawn, MODEL_FORECAST) - brier(drawn, against),
+        cluster=cluster,
+        iterations=iterations,
+        seed=seed,
+    )
+    lo, hi = percentile_interval(diffs)
     return ClusterCI(
         against=against,
         cluster=cluster,

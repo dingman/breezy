@@ -105,6 +105,19 @@ STUDY_THETA_BY_VENUE: frozenset[tuple[str, str, str, Decimal]] = frozenset(
             "TAKER_FEE_COEFFICIENT",
             Decimal("0.06"),
         ),
+        # HUNT-2. The ONLY study site carrying the post-drift coefficient the
+        # venue has actually charged since 2026-09-17. It is deliberately
+        # visible here and deliberately NOT 0.06: an ask-relative edge measured
+        # against the superseded coefficient would understate the hurdle by
+        # ~16% and could manufacture an hour that looks tradeable. This entry
+        # registers a STUDY site; it neither is nor touches
+        # `DOCUMENTED_TAKER_FEE_COEFFICIENT`, which stays pinned at 0.06.
+        (
+            "polymarket_us",
+            "hourly_ask_relative_edge",
+            "TAKER_FEE_COEFFICIENT",
+            Decimal("0.0695"),
+        ),
         ("kalshi", "k1_kalshi_prior", "KALSHI_TAKER_THETA", Decimal("0.07")),
     }
 )
