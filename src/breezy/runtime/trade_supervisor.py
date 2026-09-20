@@ -41,7 +41,13 @@ from pathlib import Path
 from typing import Final, TextIO
 
 from breezy.runtime.exec_state_db_path import ExecStateDbNotConfiguredError, resolve_store_path
-from breezy.runtime.health import AlertPayload, AlertSink, emit_alert, resolve_alert_sink
+from breezy.runtime.health import (
+    AlertPayload,
+    AlertSink,
+    emit_alert,
+    log_alert_egress_status,
+    resolve_alert_sink,
+)
 from breezy.runtime.settings import SENDING_FAMILY_ID_VAR
 from breezy.runtime.sqlite_store import SqliteStateStore
 from breezy.runtime.submit_intent import (
@@ -807,6 +813,18 @@ class SupervisorPorts:
     )
 
 
+def _boot_alert_sink() -> AlertSink:
+    """[WP-B0] Resolve the real sink, announcing whether it can reach anyone.
+
+    The supervisor is the FIRST thing that starts each trading day, so this
+    is the earliest point at which "no operator is reachable" can be made
+    visible. Loud, never fatal: an unconfigured webhook still yields a
+    working ``LoggingAlertSink`` and the supervisor still starts.
+    """
+    log_alert_egress_status(component="trade_supervisor")
+    return resolve_alert_sink()
+
+
 def default_ports(*, alert_sink: AlertSink | None = None) -> SupervisorPorts:
     log_reader = IncrementalLogReader()
     return SupervisorPorts(
@@ -819,7 +837,7 @@ def default_ports(*, alert_sink: AlertSink | None = None) -> SupervisorPorts:
         probe_open_intent_state=probe_open_intent,
         spawn=spawn_node,
         read_log_new=log_reader.read_new,
-        alert_sink=alert_sink if alert_sink is not None else resolve_alert_sink(),
+        alert_sink=alert_sink if alert_sink is not None else _boot_alert_sink(),
         find_adopted_log=find_adopted_node_log,
         continuous_family_active=sending_family_active,
         resolve_sending_family_id=resolve_sending_family_id,

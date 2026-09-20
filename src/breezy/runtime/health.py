@@ -60,6 +60,7 @@ from urllib.parse import urlsplit
 import httpx
 
 __all__ = [
+    "ALERT_EGRESS_UNCONFIGURED_EVENT",
     "ALERT_WEBHOOK_URL_ENV_VAR",
     "ALLOWED_ALERT_PAYLOAD_KEYS",
     "DEFAULT_RENOTIFY_AFTER_NS",
@@ -77,7 +78,9 @@ __all__ = [
     "LoggingAlertSink",
     "SiteHealth",
     "WebhookAlertSink",
+    "alert_egress_configured",
     "emit_alert",
+    "log_alert_egress_status",
     "resolve_alert_sink",
     "write_snapshot_atomic",
 ]
@@ -112,6 +115,12 @@ MAX_ALERT_DETAIL_CHARS: Final[int] = 200
 #: variable is set. Unset (the default) is not a placeholder empty string
 #: baked into source -- it is the literal absence of any endpoint.
 ALERT_WEBHOOK_URL_ENV_VAR: Final[str] = "BREEZY_ALERT_WEBHOOK_URL"
+
+#: [WP-B0] Event name on the one-line boot WARNING emitted by
+#: :func:`log_alert_egress_status` when no webhook is configured. Greppable
+#: in the node/supervisor log and in `journalctl`, so "did anyone ever have
+#: a delivery channel?" is answerable from the log alone.
+ALERT_EGRESS_UNCONFIGURED_EVENT: Final[str] = "BREEZY_ALERT_EGRESS_UNCONFIGURED"
 
 #: Mode of the health snapshot FILE: owner read/write only. Gap and gate
 #: contents disclose exactly when and how collection is degraded.
@@ -509,6 +518,61 @@ def resolve_alert_sink(env: Mapping[str, str] | None = None) -> AlertSink:
     if not url:
         return LoggingAlertSink()
     return WebhookAlertSink(url)
+
+
+def alert_egress_configured(env: Mapping[str, str] | None = None) -> bool:
+    """True iff this process can deliver an alert OFF this machine.
+
+    [WP-B0] Deliberately the EXACT condition :func:`resolve_alert_sink`
+    branches on -- a non-empty ``BREEZY_ALERT_WEBHOOK_URL`` -- so there can
+    never be two competing definitions of "configured" that drift apart.
+    URL *validity* is not re-checked here on purpose: a set-but-malformed
+    URL makes :func:`resolve_alert_sink` raise loudly at construction,
+    which is a different (and already noisy) failure from the SILENT
+    degradation to `LoggingAlertSink` that this predicate exists to make
+    queryable by a later health check.
+    """
+    active_env: Mapping[str, str] = os.environ if env is None else env
+    return bool(active_env.get(ALERT_WEBHOOK_URL_ENV_VAR))
+
+
+def log_alert_egress_status(
+    env: Mapping[str, str] | None = None, *, component: str
+) -> bool:
+    """Make alert reachability VISIBLE at boot. Returns the predicate.
+
+    [WP-B0] Before this existed, an unset webhook degraded in total
+    silence: every alert went to a log file nobody reads, and the system
+    paid for it twice -- a fee-schedule halt that ran three days unnoticed
+    and a live-trading permit lapse that ran eleven hours unnoticed. Both
+    were emitted; neither was delivered.
+
+    **Loud, never fatal.** An unconfigured channel logs one WARNING line
+    and returns ``False``; it never raises and never blocks startup.
+    Refusing to start the bot over telemetry would trade a real trading
+    capability for an observability one, which is the wrong trade.
+
+    **Never logs the URL.** An operator webhook URL is a bearer
+    credential -- possession of it IS authorisation to post -- so the
+    configured branch names only the environment variable, never its value
+    and never the endpoint's host.
+    """
+    if alert_egress_configured(env):
+        logger.info(
+            "breezy alert egress configured component=%s source=%s",
+            component,
+            ALERT_WEBHOOK_URL_ENV_VAR,
+        )
+        return True
+    logger.warning(
+        "%s component=%s: NO alert egress is configured -- every alert this "
+        "process emits will reach the log ONLY and no operator. Set %s to an "
+        "https endpoint and verify it with `breezy-check-alerts`.",
+        ALERT_EGRESS_UNCONFIGURED_EVENT,
+        component,
+        ALERT_WEBHOOK_URL_ENV_VAR,
+    )
+    return False
 
 
 def emit_alert(sink: AlertSink, payload: AlertPayload) -> None:

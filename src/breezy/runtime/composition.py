@@ -42,7 +42,11 @@ from breezy.ingest.shared_state import SharedIngestState
 from breezy.persistence.catalog import FilesystemProbe, probe_filesystem
 from breezy.registry.sites import SiteRegistry, default_registry, load_registry
 from breezy.runtime.bootstrap_witness import enforce_bootstrap_witness
-from breezy.runtime.health import AlertSink, resolve_alert_sink
+from breezy.runtime.health import (
+    AlertSink,
+    log_alert_egress_status,
+    resolve_alert_sink,
+)
 from breezy.runtime.node_config import actor_component_id, build_node_config
 from breezy.runtime.settings import BreezyRuntimeSettings
 from breezy.runtime.sqlite_store import SqliteStateStore
@@ -349,6 +353,12 @@ def ingest_runtime(
         # that owns a transport is expected to expose `close()`, and one
         # that owns nothing (`LoggingAlertSink`) does not -- hence the
         # duck-typed check rather than a widened Protocol.
+        # [WP-B0] Announce, once per node boot, whether alerts can reach an
+        # operator at all. Guarded on the DEFAULT factory: a caller that
+        # injects its own sink has already decided the delivery question,
+        # and the environment variable says nothing about that sink.
+        if alert_sink_factory is resolve_alert_sink:
+            log_alert_egress_status(component="ingest_runtime")
         alert_sink = alert_sink_factory()
         stack.callback(_close_alert_sink, alert_sink)
 

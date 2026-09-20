@@ -293,6 +293,13 @@ breezy-clear-family-halt = "breezy.strategy.current_rung_hold.clear_family_halt_
 # `pgrep -f` can find it without substring-matching the node's own argv.
 # See `breezy.runtime.trade_supervisor`.
 breezy-trade-supervisor = "breezy.runtime.trade_supervisor:main"
+# [WP-B0] The operator's alert-channel one-shot, deliberately its own
+# process and not a flag on the node or the supervisor: it must run on a
+# host with no venue configuration, holds no credential, touches no state
+# store, and sends exactly ONE alert before exiting. See
+# `breezy.runtime.check_alerts_cli` for the exit contract (2 = NO EGRESS
+# CONFIGURED, 3 = configured but NOT DELIVERED).
+breezy-check-alerts = "breezy.runtime.check_alerts_cli:main"
 
 [build-system]
 requires = ["uv_build>=0.12.5,<0.13.0"]
