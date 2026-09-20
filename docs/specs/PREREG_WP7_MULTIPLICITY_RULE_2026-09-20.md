@@ -45,12 +45,22 @@ unlogged variants — is what this rule refuses.
    run artefact, including variants that fail early, error, or return
    INSUFFICIENT-DATA. A variant that was run and not reported is a rule breach
    and invalidates the registration.
-5. **(v) FIREWALL.** Variant search runs **only** on the 2021–2025 fit/holdout
-   corpus. The confirmatory statistic (PREREG v6 `S_k`, pre-Stage-4) runs
-   **only** on 2026 shadow and live data collected **after** the winning variant
-   is frozen. A confirmatory peek at 2021–2025 after the freeze discards the
-   confirmatory statistic; recovery is to freeze a new variant and restart the
-   confirmatory series on post-freeze data.
+5. **(v) FIREWALL — restated on measured data availability (amendment A6).**
+   The search corpus is **every venue price day existing at the freeze commit**;
+   the confirmatory corpus is **only data collected strictly AFTER that commit**.
+   A confirmatory peek at pre-freeze data discards the confirmatory statistic;
+   recovery is to freeze a new variant and restart the series on post-freeze
+   data.
+
+   **Why this differs from the first draft.** The first draft said "search on
+   2021–2025, confirm on 2026", inheriting the plan's language about the *fit*
+   corpus. That is unexecutable for an *economic* screen: measured
+   2026-09-20, the venue quote tape spans **2026-08-30 to 2026-09-20 only
+   (~22 days, 32,072 files)**. There are **no venue prices for 2021–2025**, so
+   no price-bearing screen can run there, and a search-then-confirm split
+   inside 2026 would otherwise be the same data twice. Freeze-date separation
+   is the only real firewall available, and it is a genuine one: post-freeze
+   days have not been seen by any variant.
 
 ## 2. The enumerated variant space — K_variants = 12
 
@@ -131,6 +141,26 @@ used unmodified for WP-7**: a flat subtraction inflates the hurdle by roughly
 | `no_bid_side` (B2) | counted as a **no-take**, never a dropped day, so it depresses take counts honestly instead of inflating the positive rate by discarding hard days; the rate is reported |
 | `sigma` | **frozen as fitted in 0b (amendment A4)**; any re-fit against price is a new registration, not a knob |
 | bootstrap cluster | **date is the single PRIMARY and decisional cluster**; the station-clustered interval is reported as sensitivity only and is explicitly non-decisional |
+
+## 2.3 Measured search-corpus size, and the expected verdict (amendment A6)
+
+Recorded before the run, because it very likely determines the outcome:
+
+- Venue quote tape: **2026-08-30 .. 2026-09-20**, ~22 calendar days.
+- Prior independent inventory of forecast x settlement-truth x venue-price
+  triple overlap: **n = 73 station-days total** across the 4 NBS stations
+  (NYC has no local forecast rows and is out of scope here).
+- The §3 bar requires `n >= 20` station-days **per window-pooled cell**. Each
+  variant restricts to a window, so a variant's n is the subset of those ~73
+  station-days carrying a would-take inside its window — materially fewer
+  than 73, and plausibly under 20 for the narrow `A3` (10–11 LST) window.
+
+**Therefore INSUFFICIENT-DATA is the most likely outcome for several cells, and
+possibly for the whole set.** Under §4 that is an instruction to extend the
+corpus, never a PASS and never a KILL. A variant that clears the bar at n just
+above 20 on a 22-day tape should be treated as a candidate for confirmation,
+not as a result. This is written down now so that a thin PASS cannot later be
+narrated as a strong one.
 
 ## 3. The per-cell measurement gate (not a hypothesis test)
 
