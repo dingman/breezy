@@ -91,3 +91,143 @@ Nautilus IMMUTABLE (native extension points only; `Actor`, `set_timer`,
 contract test weakened. Operator caps never valued in code. No real-money
 exposure to validate any hypothesis. No `dataclasses.asdict`/`astuple`. Every
 hypothesis WP carries a pre-registered abandonment criterion.
+
+---
+
+# AMENDMENT A — security review (2026-09-20)
+
+Adversarial safety-control review returned **SAFE WITH NAMED CHANGES** and four
+HIGH defects. Two were introduced by me in the original draft. All are verified
+against source and are binding on the build.
+
+## A-1 [HIGH] — STRIKE B3 option (b). It is a second mint.
+
+The draft offered, as a way to close the 02:50Z→16:40Z impotent window, "a
+second intraday process under the existing one-process-per-day flock." **A
+second process is a second boot, therefore a second `issue_live_trading_permit`
+call, therefore a second 10 h permit.** Two sequential permits cover ~20 h/day:
+the TTL survives *literally* while the property it exists to enforce — bounded
+unattended spend authority — is voided. B1's "no second mint site" tripwire does
+not reach B3 as written.
+
+**Resolution: option (b) is STRUCK.** B3 is re-scoped to choose between
+(a) accept the window and alert on it, or (a′) move the LAUNCH time later so the
+10 h window covers the decision windows that matter. If any future proposal
+reintroduces a second daily process, it must carry an acceptance test bounding
+**cumulative daily permit coverage ≤ `PERMIT_TTL_NS` + spawn grace**, and B1's
+tripwire is extended to cover it.
+
+## A-2 [HIGH] — B1 must be THREE-valued. `UNKNOWN` is not `valid`.
+
+The draft's detector compares a latched expiry to now. If the latch is `None` —
+adopted node whose log was not found, `read_new` returning `""` on `OSError`,
+or rotation resetting the offset — a naive `expiry is not None and expiry <= now`
+reads as **not lapsed**, i.e. fails OPEN.
+
+**This exact fail-open already exists in the codebase** and is the precedent not
+to copy (`trade_supervisor_core.py:538-544`):
+
+```python
+if not log_available:
+    return SelfCheckResult.PASS_ADOPTED_LOG_UNKNOWN   # returns PASS
+...
+if not (permit_issued and permit_expiry_valid):       # never reached
+```
+
+A missing log returns PASS and the permit check is never evaluated.
+
+**Resolution:** `permit_capability_valid` returns three states —
+`VALID` / `LAPSED` / `UNKNOWN`. `UNKNOWN` with an adopted child past the
+readiness grace emits CRITICAL `TRADE_SUPERVISOR_PERMIT_UNVERIFIABLE`. Absence
+is failure, never silence.
+
+## A-3 [HIGH] — A0's RED test must be greenable WITHOUT touching the pin.
+
+The draft specified "a RED-first test pinning the OBSERVED SET … failing against
+the current single-value pin." **A red test whose cheapest green is editing
+`DOCUMENTED_TAKER_FEE_COEFFICIENT` is a pressure valve aimed directly at the
+edit the pin doc forbids.** Under time pressure that is the change that gets
+made.
+
+**Resolution:** A0's test asserts two things, both green without any `src/`
+change — (a) the observed θ set as a separate *evidence record*, and (b) that
+`DOCUMENTED_TAKER_FEE_COEFFICIENT == Decimal("0.06")` **still holds**. The
+drift is recorded as evidence; the pin is asserted unchanged. No test in A0 may
+be satisfiable by editing `fees.py:86`.
+
+## A-4 [HIGH] — B1's CALL SITE, not just its test, must clear the latch.
+
+The draft required a test that the alert fires with `midday_alert_sent` latched,
+but never constrained where the detector is *called*. `trade_supervisor.py:1104`
+returns on that latch **before any log read**, so a detector hung inside
+`_do_midday_watch` is muted for the rest of the day once one mid-day relaunch
+budget is exhausted.
+
+**Resolution:** the detector is called from the poll loop **ahead of every
+early-return latch**, including `_do_midday_watch`. The risk-3 test is retained
+in addition, not instead.
+
+## A-5 [MEDIUM] — B2 must not become the sole enforcement.
+
+B2 narrows the strategy gate, which moves enforcement EARLIER. A later reader
+may judge the `safety.py:986` chokepoint redundant.
+
+**Resolution:** B2's acceptance adds a **chokepoint-independence test** — with
+the strategy gate stubbed to PASS, `assert_live_order_submission_permitted`
+still raises on expiry. `safety.py:986` is documented as AUTHORITATIVE; B2 is
+advisory and defence-in-depth only.
+
+## A-6 [MEDIUM] — B2 must not leak into backtest permit isolation.
+
+`ContinuousRungHoldBacktestStrategy` overrides `_has_order_submission_permit()`
+with a private flag and **no permit object** (PERMIT ISOLATION,
+`continuous_strategy.py:672`). B2 must not push it toward a synthetic
+`expires_at_ns`, which would manufacture a permit shape in backtest.
+**Resolution:** assert the override stays permit-object-free.
+
+## A-7 [MEDIUM] — C1 must be MARKET_DATA-only and must not churn YES.
+
+The venue's subscription cap is **shared across MARKET_DATA + TRADE**
+(`websocket.py:415`, `:637`; measured 09-17, TRADE stole slots MARKET_DATA
+needed), and `:425` pairs `slug → requestId` for `SUBSCRIPTION_TYPE_TRADE` off
+the same authenticated socket. A NO-leg subscription routed through the existing
+path could auto-pair TRADE. The 60 s idle timeout on a thin NO book plus the
+replay path (`:733`, all MARKET_DATA before TRADE) is a resubscribe-churn risk
+that can starve YES slots.
+
+**Resolution:** C1 acceptance requires NO-leg subscribed **MARKET_DATA-only**
+with an asserted-ABSENT TRADE pairing; per-connection reconnect backoff; and a
+test that a NO-book flap cannot trigger the YES connection's replay. C1
+registers no exec-client factory, so NO-SEND is not implicated.
+
+## A-8 [MEDIUM] — θ typing divergence must be closed before any v4.
+
+Verified: `ladder_ev/config.py:154` types `required_fee_coefficient` as
+**`float`** while `current_rung_hold/config.py:226` types it `Decimal`, and
+`decision.py:331` compares with exact `!=` — that line is what currently halts
+the bot. **Resolution:** any v4 θ is `Decimal`, exact equality. **A tolerance
+band (`|θ − θ*| < ε`) is the softest possible pin edit and is forbidden.**
+
+## A-9 — The invariant A1(iii) must satisfy to be a NEW FAMILY and not a pin edit
+
+All of the following must hold:
+
+1. `DOCUMENTED_TAKER_FEE_COEFFICIENT` stays `Decimal("0.06")` — the drift is
+   recorded as evidence only.
+2. New `trial_id_prefix`, new `d0_climate_day`, **n reset to 0**, LD-OBF α spent
+   from zero.
+3. The residual sidecar is family-keyed, so v4 inherits **no** v3 residuals.
+4. `assert_family_only` refuses v3 rows into v4 **and** v4 rows into v3.
+5. **v4's n accrues only from station-days strictly AFTER registration** — the
+   A0 evidence window is disjoint from v4's sample.
+
+The L-34 rationale is affirmative, not bureaucratic: raising θ moves
+break-even, so a *different* snapshot becomes executable — **the estimand
+changes**, therefore class C, therefore a genuinely new family. Landing v4 with
+the same tally, or with the A0 window inside n, is the disguised move.
+
+## A-10 — The brake
+
+`FEE_SCHEDULE_MISMATCH_REFUSALS` is currently **the only thing halting the
+bot.** A1(iii) removes it. Therefore the v4 family must land `family_halted` by
+default, armed only by a separate, evidenced decision.
