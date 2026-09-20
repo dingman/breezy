@@ -49,15 +49,10 @@ order; B = build, O = operator, S = strategy-lead ruling.
 | REG-1 | B | HIGH | `manifest.stations` / `trial_id_prefix` are validated but NOT consumed by composition (station iteration reads module-level `SUPPORTED_STATIONS`), so a promoted revision changing stations silently does nothing. Blocks promotion varying the station set | WP-11b merge `fbc5eea` | M |
 | ADM-1 | B | LOW | Σq admission counts FILLED legs only (concurrent-arm race) | diagnosis §4 | S |
 | EXIT-1 | B/O | CRIT | **Exit seam BUILT, UNARMED** (c96c7f4; ruling 09-16). Decider→native IOC LIMIT SELL→exec exit seam; `pm_us_crh_exit_v4` DRAFT, no `exit_rule` → live family never sells. Study N=5: R-DEAD 0/5 fillable, R-THREAT 1/5 → gates FAIL. Before arming: PREREG v4 registration, 1-lot positive control, nightly study (15:20Z). `POSITION_EXIT_EXECUTION_2026-09-16.md` | plan §4 | L |
-| REST-1 | B | HIGH | **Resting-bid hunting** (ruling 09-16): `RESTING_BID_HUNT_2026-09-16.md` Rev 2, PREREG v5 DRAFT. Merged 09-17 (d1a01c2): maker-fee branch (opt-in), TRADE-print capture (recorder from 09-17 09:00Z; unit UNRESOLVED), shadow decider (taker-priced, contained, tape fields), open-orders read-back (boot/re-arm fail closed on any resting order), Arm A study. Arm A `20260916_armA_fixed`: 19 fills/11 days, resting −2.55 vs IOC −2.09, G-R1/2/4/5 FAIL → underpowered negative; no venue write until a print-based rerun with ≥12 days passes | plan §2.1 | L |
-| WIN-1 | B | **HIGH** | Hunt opens after the winning rung reprices (MIA 0.50→0.90 done 61 min pre-open): calibrate hours 10–11 LST, screen vs pre-window asks, PREREG-amend; `docs/evidence/STRATEGY_OPPORTUNITY_AUDIT_2026-09-18.md` | plan §6 | M |
-| FC-0b | B | **HIGH** | **Critical path.** 0b fit corpus COMPLETE on disk (4 stations x 2021-2025): NBS forecasts 671,163 rows `archive/iem-mos`, ASOS 1-min R(t) 9,003,142 rows `archive/iem-asos-1min`, both resumable + digest-verified. Next: WP-6 fit/holdout scripts (2021-2024 fit, 2025 holdout, leak-refusing), then WP-7 pre-declared variant set + cheap screen (needs prediction-market sign-off BEFORE first run), WP-8 power table | WB WP-6/7/8 | M |
-| FC-1-RERUN | B | HIGH | FC-0a-4 Phase B: per-station CLI-truth alignment script, fixture extraction, digest freeze (`FROZEN_TABLE_SHA256` is None until then), evidence doc — BLOCKED on the FC-0a-1 artefact; Phase A merged 9b9da70 | Rev 5 §3.3–3.5 | S |
 | MP-B | B/O | HIGH | Increment B: depth-capped, cent-safe, log-redacted sizing from the per-position cap (S2) + qty through scorer/store (S4b). **BLOCKED on R-11**: at mixed qty∈{1,2,3} the pre-solved LD-OBF boundary over-crosses (0.059 vs α 0.025; strict xfail `test_multi_position_validation_2026_09_14.py`) — re-validate at the real qty distribution, re-solve only then. Operator rulings 09-14 (per-order cap; daily budget = single-day stop) recorded in memory + day-stop plan | plan §3 Increment B | M |
 | SP-3 | B | A/C DONE 09-13; B1/B2 open | Venue-id map live (proven on CFJ485874TMM); `generate_order_status_reports`/`generate_fill_reports` still return `[]` pending R-1/R-2; `_has_durable_fill_record` still a stub | `RECONCILIATION_NATIVE_REPORTS_2026-09-12.md` | S |
 | SP-4 | B | subclass DONE 09-13; replay **NOT RUN** | v3 backtest subclass, `--strategy continuous_rung_hold`, depth-basis gate landed; the one capped SFO 2026-09-01 replay has no artefact — run it (command in plan :80-91) in a quiet window, record filled trials or BLOCKED reason | `V3_BACKTEST_REPLAY_SUBCLASS_2026-09-12.md` | S |
 | SP-5 | B/S | CRIT | Coverage / KILL clock: read-only diagnostic (blips vs outages vs never-resolved rows from dead recorders); dry-run of tonight's afternoon under the shard-local recorder; ruling package on §9 tolerance; truncation as a named reason | `COVERAGE_KILL_CLOCK_2026-09-12.md` | S+ruling |
-| SP-6 | B/O | HIGH | Alert delivery: delivery receipt, shared sink, gap/disk/ingest routed to it, `breezy-alert-test`, `OnFailure=` template, word-boundary redaction test. OPERATOR supplies the destination (one line in `~/.config/breezy/alerts.env`); until then B4 stays open | `ALERT_DELIVERY_2026-09-12.md` | M |
 | SP-7 | B | LOW | Free hygiene: permit-log leak scan (1.98%/run flake; `test_app_trade_main_permit_logging.py:115`), five doc truth insertions, three docstrings, `PositionReportingLag` disposition; no bulk reformat | `HYGIENE_FREE_FIXES_2026-09-12.md` | S |
 
 **Execution order (from the 2026-09-12 peer reviews, Rev 1 dispositions land as Rev 2 in each plan):**
@@ -84,6 +79,13 @@ diagnostic is inert until the v3 tally receives the count (R-4).
 accounting works (09-12 in-window overlaps = 0 on all four stations); the day is uncovered because
 ingest stranded its Depth10 (ING-1). Zero-fill / retired-AMBIGUOUS takes are not trials; resolver
 fills are residual. **Live n (09-14):** 3 orders, 2 fills (09-11 SFO, 09-13 MIA @0.70), admissible 0.
+
+**Closed 2026-09-20:** forecast-edge hunt TERMINAL on PM.us daily-high rungs
+(`docs/evidence/RULING_forecast_edge_programme_closes_2026-09-20.md`, `b48834d`) --
+market resolution 1.98x the forecast's; recalibration cannot help. `pm_us_crh_rest_v5`
+folded CLOSED_NOT_REGISTERED (dominated by the IOC baseline it must beat). Alert
+delivery closed by WP-B0 (`f97c26f`). Next phase + its two review amendments:
+`docs/plans/POST_FORECAST_PHASE_2026-09-20.md`.
 
 **Parked (re-open trigger: a v3 verdict, or fills at rate).** Kalshi sibling (`wip/kalshi-s4-registry`,
 `kalshi_crh_v1.json` DRAFT, S11 operator-only); LADDER_EV stage 2 (stage-1 modules stay);
