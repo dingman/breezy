@@ -48,6 +48,7 @@ order; B = build, O = operator, S = strategy-lead ruling.
 |---|---|---|---|---|---|
 | REG-1 | B | HIGH | `manifest.stations` / `trial_id_prefix` are validated but NOT consumed by composition (station iteration reads module-level `SUPPORTED_STATIONS`), so a promoted revision changing stations silently does nothing. Blocks promotion varying the station set | WP-11b merge `fbc5eea` | M |
 | ADM-1 | B | LOW | Σq admission counts FILLED legs only (concurrent-arm race) | diagnosis §4 | S |
+| HUNT-1 | B/S | **CRIT** | **Continuous hunting is REQUIRED and NOT met.** The `[12:00,17:00)` LST gate is a consequence of `P_HOLD_LOWER` covering `hour_lst` ∈ {12..16} only — removing it yields `None`, not hunting. Supersedes WIN-1 (wrongly deleted 09-20) | `CONTINUOUS_HUNTING_GAP_2026-09-20.md` | L |
 | EXIT-1 | B/O | CRIT | **Exit seam BUILT, UNARMED** (c96c7f4; ruling 09-16). Decider→native IOC LIMIT SELL→exec exit seam; `pm_us_crh_exit_v4` DRAFT, no `exit_rule` → live family never sells. Study N=5: R-DEAD 0/5 fillable, R-THREAT 1/5 → gates FAIL. Before arming: PREREG v4 registration, 1-lot positive control, nightly study (15:20Z). `POSITION_EXIT_EXECUTION_2026-09-16.md` | plan §4 | L |
 | MP-B | B/O | HIGH | Increment B: depth-capped, cent-safe, log-redacted sizing from the per-position cap (S2) + qty through scorer/store (S4b). **BLOCKED on R-11**: at mixed qty∈{1,2,3} the pre-solved LD-OBF boundary over-crosses (0.059 vs α 0.025; strict xfail `test_multi_position_validation_2026_09_14.py`) — re-validate at the real qty distribution, re-solve only then. Operator rulings 09-14 (per-order cap; daily budget = single-day stop) recorded in memory + day-stop plan | plan §3 Increment B | M |
 | SP-3 | B | A/C DONE 09-13; B1/B2 open | Venue-id map live (proven on CFJ485874TMM); `generate_order_status_reports`/`generate_fill_reports` still return `[]` pending R-1/R-2; `_has_durable_fill_record` still a stub | `RECONCILIATION_NATIVE_REPORTS_2026-09-12.md` | S |
@@ -80,12 +81,7 @@ accounting works (09-12 in-window overlaps = 0 on all four stations); the day is
 ingest stranded its Depth10 (ING-1). Zero-fill / retired-AMBIGUOUS takes are not trials; resolver
 fills are residual. **Live n (09-14):** 3 orders, 2 fills (09-11 SFO, 09-13 MIA @0.70), admissible 0.
 
-**Closed 2026-09-20:** forecast-edge hunt TERMINAL on PM.us daily-high rungs
-(`docs/evidence/RULING_forecast_edge_programme_closes_2026-09-20.md`, `b48834d`) --
-market resolution 1.98x the forecast's; recalibration cannot help. `pm_us_crh_rest_v5`
-folded CLOSED_NOT_REGISTERED (dominated by the IOC baseline it must beat). Alert
-delivery closed by WP-B0 (`f97c26f`). Next phase + its two review amendments:
-`docs/plans/POST_FORECAST_PHASE_2026-09-20.md`.
+**Closed 2026-09-20:** forecast-edge hunt TERMINAL (`RULING_forecast_edge_programme_closes_2026-09-20.md`); `pm_us_crh_rest_v5` folded CLOSED_NOT_REGISTERED; alert delivery shipped (`f97c26f`). Next phase: `docs/plans/POST_FORECAST_PHASE_2026-09-20.md`.
 
 **Parked (re-open trigger: a v3 verdict, or fills at rate).** Kalshi sibling (`wip/kalshi-s4-registry`,
 `kalshi_crh_v1.json` DRAFT, S11 operator-only); LADDER_EV stage 2 (stage-1 modules stay);
