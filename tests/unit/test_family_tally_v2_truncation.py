@@ -74,6 +74,7 @@ def _manifest(tmp_path: Path, **overrides: Any) -> FamilyManifest:
         "venue": "polymarket_us",
         "trial_id_prefix": _PM_PREFIX,
         "d0_climate_day": _D0,
+        "taker_fee_coefficient": "0.06",
         "boundary_artefact_path": "deploy/families/gs_boundary_pm_us_crh_v2.json",
         "boundary_inputs_sha256": "a" * 64,
         "composition_kind": "current_rung_hold",

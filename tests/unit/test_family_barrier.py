@@ -21,6 +21,10 @@ class _FakeManifest:
     trial_id_prefix: str
     d0_climate_day: str
     stations: tuple[str, ...]
+    #: Additive: the family's last climate day, inclusive, or `None` for
+    #: "still open" -- the pre-existing, unbounded-above behaviour every
+    #: test in this module exercises.
+    terminal_climate_day: str | None = None
 
 
 _CENSUS = ("LAX", "MDW", "MIA", "SFO")

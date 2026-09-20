@@ -230,6 +230,13 @@ def run(
                         today_by_station=today_by_station,
                         trial_day_latch_factory=factory,
                         order_submission_permit=sending_permit,
+                        # The family's REGISTERED cost basis, read off the
+                        # manifest loaded above -- never an environment
+                        # variable and never a constant here. A different
+                        # theta is a different estimand, so it can only
+                        # arrive as a different, committed, sha-changed,
+                        # REGISTERED family.
+                        required_fee_coefficient=manifest.taker_fee_coefficient,
                     )
                 )
             elif manifest.composition_kind == "continuous_rung_hold":
@@ -273,6 +280,9 @@ def run(
                         # conditioned on that permit being present.
                         phase0_permit_guard=sending_permit is None,
                         exit_manifest=exit_manifest,
+                        # See the v2 branch above: the theta every station
+                        # prices against comes from THIS family's manifest.
+                        required_fee_coefficient=manifest.taker_fee_coefficient,
                     )
                 )
             elif manifest.composition_kind == "forecast_ladder":

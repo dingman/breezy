@@ -28,6 +28,26 @@ their family is actually registered: a manifest committed as scaffolding
 explicitly opts in with `allow_draft=True` -- a caller who forgets the flag
 gets a loud refusal, never a silently-accepted stub feeding a real tally.
 
+`taker_fee_coefficient` (REQUIRED) is the venue taker theta this family's
+break-even was computed against. It lives HERE rather than as a `src/`
+constant or an environment variable for the reason `d0_climate_day` does:
+the cost basis is part of the family's ESTIMAND, so a different theta is a
+different family, and a family is only real once its manifest is committed,
+content-hashed (`manifest_sha256`), and `REGISTERED`. Re-pricing a running
+family in place would silently change what its in-flight sequential test is
+measuring (L-34). The value travels as a STRING-DECIMAL and is parsed to
+`Decimal` through a deliberately narrow ``0.`` + 1-6 digits screen -- never
+`float`, and never `Decimal`'s own permissive grammar, which accepts
+`6.95E-2`, `NaN`, `Infinity`, and surrounding whitespace.
+
+`terminal_climate_day` (optional) closes a family's tally at the TOP.
+`d0_climate_day` alone is a lower bound, so a superseded family would go on
+admitting its successor's rows -- pooling trials priced at a different cost
+basis into an in-flight alpha-spending sequence. A family that has been
+superseded declares its last climate day here; `settlement/family_barrier.py`
+enforces it inclusively. Absent means unbounded above, exactly the
+pre-existing behaviour.
+
 `exit_rule` (optional, added for the intra-day position monitor, INC-1) is
 an OPTIONAL widening of the exact-set key barrier: a manifest may declare
 it, but declaring it does not itself grant exit capability -- that
@@ -45,6 +65,7 @@ import json
 import re
 from dataclasses import dataclass
 from datetime import date
+from decimal import Decimal
 from pathlib import Path
 from typing import Final, Literal
 
@@ -85,6 +106,7 @@ _REQUIRED_KEYS: Final[frozenset[str]] = frozenset(
         "composition_kind",
         "density_artefact_path",
         "density_artefact_sha256",
+        "taker_fee_coefficient",
     }
 )
 _STRING_FIELDS: Final[tuple[str, ...]] = (
@@ -98,8 +120,21 @@ _STRING_FIELDS: Final[tuple[str, ...]] = (
     "composition_kind",
     "density_artefact_path",
     "density_artefact_sha256",
+    "taker_fee_coefficient",
 )
-_OPTIONAL_KEYS: Final[frozenset[str]] = frozenset({"exit_rule"})
+_OPTIONAL_KEYS: Final[frozenset[str]] = frozenset({"exit_rule", "terminal_climate_day"})
+
+#: Deliberately NARROWER than ``Decimal``'s own grammar. ``Decimal`` accepts
+#: ``" 0.0695 "``, ``6.95E-2``, ``NaN``, ``Infinity``, ``+0.06`` and
+#: ``-0.06``; every one of those would either compare unequal to the venue's
+#: own wire coefficient in a way no reader could predict, or (NaN) make the
+#: exact ``!=`` gate in ``strategy.current_rung_hold.decision`` silently
+#: true forever. A taker coefficient is a small positive fraction written
+#: plainly, so that is the only spelling accepted: leading ``0.`` and one to
+#: six decimal digits. Anchored with ``\A``/``\Z`` rather than ``^``/``$``:
+#: ``$`` also matches immediately BEFORE a trailing newline, so ``"0.0695\n"``
+#: would otherwise slip through.
+_TAKER_FEE_COEFFICIENT_RE: Final[re.Pattern[str]] = re.compile(r"\A0\.\d{1,6}\Z")
 _STATUSES: Final[frozenset[str]] = frozenset({"DRAFT_NOT_REGISTERED", "REGISTERED"})
 _SHA256_RE: Final[re.Pattern[str]] = re.compile(r"^[0-9a-f]{64}$")
 _UNPINNED_SHA256: Final[str] = "0" * 64
@@ -161,15 +196,24 @@ class FamilyManifest:
     #: real table minted at WP-13.
     density_artefact_path: Path
     density_artefact_sha256: str
+    #: The venue taker coefficient this family's break-even was computed
+    #: against, REGISTERED on this artifact. Required, no default: a default
+    #: is exactly where a silent, unregistered cost basis would reappear.
+    #: See the module docstring.
+    taker_fee_coefficient: Decimal
     exit_rule: str | None = None
+    #: The family's LAST climate day, inclusive, or ``None`` for "still
+    #: open". Set when a family is superseded -- see the module docstring
+    #: and ``settlement/family_barrier.assert_family_only``.
+    terminal_climate_day: str | None = None
 
 
 def load_family_manifest(path: Path, *, allow_draft: bool = False) -> FamilyManifest:
     """Load and strictly validate one family manifest JSON file.
 
-    Every key in `_REQUIRED_KEYS` is required; `exit_rule` is the sole
-    optional key (`_OPTIONAL_KEYS`); any key outside that combined set is
-    refused. `status="DRAFT_NOT_REGISTERED"` and an unpinned (all-zero)
+    Every key in `_REQUIRED_KEYS` is required; `_OPTIONAL_KEYS`
+    (`exit_rule`, `terminal_climate_day`) may be present; any key outside
+    that combined set is refused. `status="DRAFT_NOT_REGISTERED"` and an unpinned (all-zero)
     `boundary_inputs_sha256` are each refused unless `allow_draft=True`.
     """
     raw = path.read_bytes()
@@ -252,6 +296,39 @@ def load_family_manifest(path: Path, *, allow_draft: bool = False) -> FamilyMani
             f"{path}: stations must be a non-empty list of strings"
         )
 
+    raw_theta = payload["taker_fee_coefficient"]
+    if not _TAKER_FEE_COEFFICIENT_RE.match(raw_theta):
+        raise FamilyManifestValidationError(
+            f"{path}: taker_fee_coefficient {raw_theta!r} must be a plain decimal "
+            f"fraction matching {_TAKER_FEE_COEFFICIENT_RE.pattern!r} (e.g. \"0.0695\")"
+        )
+    taker_fee_coefficient = Decimal(raw_theta)
+    if not (Decimal(0) < taker_fee_coefficient < Decimal(1)):
+        raise FamilyManifestValidationError(
+            f"{path}: taker_fee_coefficient {raw_theta!r} must be strictly between "
+            "0 and 1"
+        )
+
+    terminal_climate_day = payload.get("terminal_climate_day")
+    if terminal_climate_day is not None:
+        if not isinstance(terminal_climate_day, str):
+            raise FamilyManifestValidationError(
+                f"{path}: terminal_climate_day must be a string when present"
+            )
+        try:
+            date.fromisoformat(terminal_climate_day)
+        except ValueError as exc:
+            raise FamilyManifestValidationError(
+                f"{path}: terminal_climate_day {terminal_climate_day!r} is not a "
+                "real ISO-8601 date"
+            ) from exc
+        if terminal_climate_day < d0_climate_day:
+            raise FamilyManifestValidationError(
+                f"{path}: terminal_climate_day {terminal_climate_day!r} precedes "
+                f"d0_climate_day {d0_climate_day!r}, which would make the family's "
+                "scope empty"
+            )
+
     exit_rule = payload.get("exit_rule")
     if exit_rule is not None and (not isinstance(exit_rule, str) or not exit_rule):
         raise FamilyManifestValidationError(
@@ -271,5 +348,7 @@ def load_family_manifest(path: Path, *, allow_draft: bool = False) -> FamilyMani
         composition_kind=composition_kind,
         density_artefact_path=Path(payload["density_artefact_path"]),
         density_artefact_sha256=density_sha,
+        taker_fee_coefficient=taker_fee_coefficient,
         exit_rule=exit_rule,
+        terminal_climate_day=terminal_climate_day,
     )

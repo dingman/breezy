@@ -675,6 +675,7 @@ def _manifest_for_exit_test(*, exit_rule: str | None) -> FamilyManifest:
     return FamilyManifest(
         family_id="pm_us_crh_exit_v4",
         venue="polymarket_us",
+        taker_fee_coefficient=Decimal("0.06"),
         trial_id_prefix="current_rung_hold_exit_v4/trial/",
         d0_climate_day="2099-01-01",
         boundary_artefact_path=Path("deploy/families/gs_boundary_pm_us_crh_v2.json"),

@@ -13,6 +13,7 @@ because it is not, and must never become, a member of the frozenset.
 
 from __future__ import annotations
 
+from decimal import Decimal
 from pathlib import Path
 
 import pytest
@@ -37,6 +38,10 @@ _COMMITTED_MANIFEST_NAMES: tuple[str, ...] = (
     "pm_us_crh_cont.json",
     "kalshi_crh_v1.json",
     "pm_us_crh_exit_v4.json",
+    # WP-THETA: the family registered at the 2026-09-17 taker basis
+    # (0.0695). It declares no `exit_rule` either, so the gate stays closed
+    # for it exactly as for every sibling above.
+    "pm_us_crh_v4.json",
 )
 
 
@@ -90,6 +95,7 @@ def test_pm_us_crh_exit_v4_gates_true_only_once_its_manifest_declares_exit_rule(
     without_exit_rule = FamilyManifest(
         family_id="pm_us_crh_exit_v4",
         venue="polymarket_us",
+        taker_fee_coefficient=Decimal("0.06"),
         trial_id_prefix="current_rung_hold_exit_v4/trial/",
         d0_climate_day="2099-01-01",
         boundary_artefact_path=Path("deploy/families/gs_boundary_pm_us_crh_v2.json"),
@@ -107,6 +113,7 @@ def test_pm_us_crh_exit_v4_gates_true_only_once_its_manifest_declares_exit_rule(
     with_exit_rule = FamilyManifest(
         family_id="pm_us_crh_exit_v4",
         venue="polymarket_us",
+        taker_fee_coefficient=Decimal("0.06"),
         trial_id_prefix="current_rung_hold_exit_v4/trial/",
         d0_climate_day="2099-01-01",
         boundary_artefact_path=Path("deploy/families/gs_boundary_pm_us_crh_v2.json"),
@@ -132,6 +139,7 @@ def test_pm_us_crh_cont_can_never_gate_true_even_if_its_manifest_declared_exit_r
     hypothetically_amended = FamilyManifest(
         family_id="pm_us_crh_cont",
         venue="polymarket_us",
+        taker_fee_coefficient=Decimal("0.06"),
         trial_id_prefix="continuous_rung_hold/trial/",
         d0_climate_day="2026-09-12",
         boundary_artefact_path=Path("deploy/families/gs_boundary_pm_us_crh_v2.json"),
@@ -152,6 +160,7 @@ def test_a_manifest_with_exit_rule_not_in_the_frozenset_gates_false(tmp_path: Pa
     manifest = FamilyManifest(
         family_id="not_registered_family",
         venue="polymarket_us",
+        taker_fee_coefficient=Decimal("0.06"),
         trial_id_prefix="not_registered/trial/",
         d0_climate_day="2026-09-15",
         boundary_artefact_path=tmp_path / "boundary.json",
@@ -178,6 +187,7 @@ def test_a_manifest_in_a_monkeypatched_frozenset_but_exit_rule_none_gates_false(
     manifest = FamilyManifest(
         family_id="registered_family",
         venue="polymarket_us",
+        taker_fee_coefficient=Decimal("0.06"),
         trial_id_prefix="registered/trial/",
         d0_climate_day="2026-09-15",
         boundary_artefact_path=Path("deploy/families/does_not_matter.json"),
@@ -204,6 +214,7 @@ def test_a_manifest_both_registered_and_declaring_exit_rule_gates_true(
     manifest = FamilyManifest(
         family_id="registered_family",
         venue="polymarket_us",
+        taker_fee_coefficient=Decimal("0.06"),
         trial_id_prefix="registered/trial/",
         d0_climate_day="2026-09-15",
         boundary_artefact_path=Path("deploy/families/does_not_matter.json"),

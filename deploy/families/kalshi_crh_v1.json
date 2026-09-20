@@ -14,5 +14,6 @@
     "MIA",
     "SFO"
   ],
+  "taker_fee_coefficient": "0.06",
   "status": "DRAFT_NOT_REGISTERED"
 }

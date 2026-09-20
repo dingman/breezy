@@ -82,6 +82,7 @@ _MANIFEST_PAYLOAD: dict[str, Any] = {
     "venue": _VENUE,
     "trial_id_prefix": "current_rung_hold/trial/",
     "d0_climate_day": _DAY_ISO,
+    "taker_fee_coefficient": "0.06",
     "boundary_artefact_path": "deploy/families/gs_boundary_pm_us_crh_v2.json",
     "boundary_inputs_sha256": "a" * 64,
     "composition_kind": "current_rung_hold",

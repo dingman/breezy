@@ -121,6 +121,7 @@ def _manifest(*, family_id: str, exit_rule: str | None) -> FamilyManifest:
     return FamilyManifest(
         family_id=family_id,
         venue="polymarket_us",
+        taker_fee_coefficient=Decimal("0.06"),
         trial_id_prefix="crh_exit_v4",
         d0_climate_day="2026-09-16",
         boundary_artefact_path=Path("deploy/boundaries/pm_us_crh_exit_v4.json"),

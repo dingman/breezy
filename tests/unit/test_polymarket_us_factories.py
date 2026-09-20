@@ -535,6 +535,7 @@ def test_exec_create_forwards_the_exit_manifest(tmp_path: Path, wired: dict[str,
     manifest = FamilyManifest(
         family_id="pm_us_crh_cont",
         venue="polymarket_us",
+        taker_fee_coefficient=Decimal("0.06"),
         trial_id_prefix="continuous_rung_hold/trial/",
         d0_climate_day="2026-09-01",
         boundary_artefact_path=Path("deploy/families/placeholder.json"),

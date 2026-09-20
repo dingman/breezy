@@ -194,6 +194,7 @@ def _family_manifest(*, family_id: str, exit_rule: str | None) -> FamilyManifest
     return FamilyManifest(
         family_id=family_id,
         venue="polymarket_us",
+        taker_fee_coefficient=Decimal("0.06"),
         trial_id_prefix="current_rung_hold/trial/",
         d0_climate_day="2026-09-01",
         boundary_artefact_path=Path("deploy/families/placeholder.json"),

@@ -554,6 +554,7 @@ def _placeholder_manifest(*, family_id: str, exit_rule: str | None) -> FamilyMan
     return FamilyManifest(
         family_id=family_id,
         venue="polymarket_us",
+        taker_fee_coefficient=Decimal("0.06"),
         trial_id_prefix=CONTINUOUS_TRIAL_KEY_PREFIX,
         d0_climate_day="2026-09-01",
         boundary_artefact_path=Path("deploy/families/placeholder.json"),

@@ -19,6 +19,7 @@ import logging
 import time
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from contextlib import AbstractContextManager, contextmanager
+from decimal import Decimal
 from pathlib import Path
 from typing import TYPE_CHECKING, Final, NamedTuple
 
@@ -383,12 +384,50 @@ def _zero_instruments_message(
     )
 
 
+def _station_config(
+    *,
+    instrument_ids: tuple[InstrumentId, ...],
+    station: str,
+    strategy_id: str,
+    required_fee_coefficient: Decimal | None,
+) -> CurrentRungHoldConfig:
+    """One station's config, priced at the sending family's REGISTERED theta.
+
+    ``required_fee_coefficient`` is the family manifest's own
+    ``taker_fee_coefficient``, threaded down by the composition root
+    (``app/trade.py``) -- never read from the environment and never a
+    constant here. ``None`` means "no family opinion", and the config keeps
+    its own pinned ``Decimal("0.06")`` default, so every pre-existing caller
+    (tests, the backtest harness) is byte-identical to before.
+
+    Nautilus sets ``Strategy.id`` to ``f"{strategy_id}-{order_id_tag}"``
+    (``trading/strategy.pyx:148-149``). The prefix is the class name; the
+    tag is the station, so both uniqueness checks at ``trader.py:400,416``
+    pass.
+    """
+    if required_fee_coefficient is None:
+        return CurrentRungHoldConfig(
+            instrument_ids=instrument_ids,
+            stations=(station,),
+            strategy_id=strategy_id,
+            order_id_tag=station,
+        )
+    return CurrentRungHoldConfig(
+        instrument_ids=instrument_ids,
+        stations=(station,),
+        strategy_id=strategy_id,
+        order_id_tag=station,
+        required_fee_coefficient=required_fee_coefficient,
+    )
+
+
 def build_current_rung_hold_strategies(
     *,
     catalog_root: Path,
     today_by_station: Mapping[str, dt.date],
     trial_day_latch_factory: Callable[[], AbstractContextManager[TrialDayLatch]],
     order_submission_permit: OrderSubmissionPermit | None = None,
+    required_fee_coefficient: Decimal | None = None,
 ) -> tuple[CurrentRungHoldStrategy, ...]:
     """One strategy per supported station that resolved at least one instrument.
 
@@ -415,15 +454,11 @@ def build_current_rung_hold_strategies(
                 today_by_station[station].isoformat(),
             )
             continue
-        config = CurrentRungHoldConfig(
+        config = _station_config(
             instrument_ids=instrument_ids,
-            stations=(station,),
-            # Nautilus sets ``Strategy.id`` to ``f"{strategy_id}-{order_id_tag}"``
-            # (``trading/strategy.pyx:148-149``). The prefix is the class name;
-            # the tag is the station, so both uniqueness checks at
-            # ``trader.py:400,416`` pass.
+            station=station,
             strategy_id=_COMPONENT_ID_PREFIX,
-            order_id_tag=station,
+            required_fee_coefficient=required_fee_coefficient,
         )
         strategies.append(
             CurrentRungHoldStrategy(
@@ -460,6 +495,7 @@ def build_continuous_rung_hold_strategies(
     phase0_permit_guard: bool = True,
     enable_position_monitor: bool = True,
     exit_manifest: FamilyManifest | None = None,
+    required_fee_coefficient: Decimal | None = None,
 ) -> tuple[ContinuousRungHoldStrategy, ...]:
     """One continuous-rung-hold strategy per supported station with instruments.
 
@@ -535,11 +571,11 @@ def build_continuous_rung_hold_strategies(
                 today_by_station[station].isoformat(),
             )
             continue
-        config = CurrentRungHoldConfig(
+        config = _station_config(
             instrument_ids=instrument_ids,
-            stations=(station,),
+            station=station,
             strategy_id=_CONTINUOUS_COMPONENT_ID_PREFIX,
-            order_id_tag=station,
+            required_fee_coefficient=required_fee_coefficient,
         )
         strategy = ContinuousRungHoldStrategy(
             config,

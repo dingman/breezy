@@ -38,6 +38,11 @@ class FamilyIdentity(Protocol):
     trial_id_prefix: str
     d0_climate_day: str
     stations: tuple[str, ...]
+    #: The family's LAST climate day, inclusive, or ``None`` for "still
+    #: open". Structural, like every other attribute here --
+    #: ``FamilyManifest`` satisfies it without either module importing the
+    #: other.
+    terminal_climate_day: str | None
 
 
 class FamilyBarrierRefusal(Exception):
@@ -47,15 +52,25 @@ class FamilyBarrierRefusal(Exception):
 def assert_family_only(rows: Sequence[ScoredTrial], manifest: FamilyIdentity) -> None:
     """Refuse the whole tally if any row is out of `manifest`'s family scope.
 
-    Three independent checks, any of which refuses the ENTIRE batch -- never
+    Four independent checks, any of which refuses the ENTIRE batch -- never
     a silent per-row drop: the trial-id must start with the family's own
     prefix, `climate_day` must not precede the family's registered
-    `d0_climate_day`, and `station` must be in the family's registered
+    `d0_climate_day` nor follow its registered `terminal_climate_day` (when
+    it declares one), and `station` must be in the family's registered
     `stations` census (B2: a family manifest may deliberately exclude a
     station -- e.g. `pm_us_crh_v2.json` excludes NYC -- and a row from an
     excluded station must never be silently pooled into strata). Symmetric
     by construction: swapping which manifest is checked against which rows
     still refuses the mismatch.
+
+    The terminal bound closes an asymmetry that was fatal on its own: with
+    only a lower bound, a SUPERSEDED family went on admitting its
+    successor's rows. Where the successor exists because the cost basis
+    moved (a new `taker_fee_coefficient`), that silently pools trials priced
+    against a different estimand into the older family's in-flight
+    alpha-spending sequence. `None` means "still open" -- unbounded above,
+    exactly the pre-existing behaviour -- and the bound is INCLUSIVE, the
+    mirror image of `d0_climate_day`.
     """
     for row in rows:
         if not row.trial_id.startswith(manifest.trial_id_prefix):
@@ -66,6 +81,13 @@ def assert_family_only(rows: Sequence[ScoredTrial], manifest: FamilyIdentity) ->
             raise FamilyBarrierRefusal(
                 f"{row.trial_id!r}: climate_day {row.climate_day!r} precedes "
                 f"family D0 {manifest.d0_climate_day!r}"
+            )
+        terminal = manifest.terminal_climate_day
+        if terminal is not None and row.climate_day > terminal:
+            raise FamilyBarrierRefusal(
+                f"{row.trial_id!r}: climate_day {row.climate_day!r} follows the "
+                f"family's terminal climate day {terminal!r}; this family is closed "
+                "and the row belongs to its successor"
             )
         if row.station not in manifest.stations:
             raise FamilyBarrierRefusal(

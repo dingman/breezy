@@ -14,5 +14,7 @@
     "MIA",
     "SFO"
   ],
+  "taker_fee_coefficient": "0.06",
+  "terminal_climate_day": "2026-09-19",
   "status": "REGISTERED"
 }
