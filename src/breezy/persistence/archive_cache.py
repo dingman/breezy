@@ -359,6 +359,22 @@ class ArchiveCache:
     def missing(self, request: ArchiveRequest) -> bool:
         return request.cache_key() not in self._load_source(request.source)
 
+    def entries(self, source: str) -> tuple[CoverageEntry, ...]:
+        """Every manifested entry for ``source``, in a deterministic order.
+
+        Read-only and additive: :meth:`covered` returns cache KEYS, which name
+        an entry without describing what it claims. A reader that must resolve
+        a DATE RANGE (rather than a key it can already construct) needs the
+        window bounds, because an explicit-window entry's bounds cannot be
+        guessed from the request it would have to build.
+        """
+        return tuple(
+            sorted(
+                self._load_source(source).values(),
+                key=lambda e: (e.station, e.window_start, e.window_end, e.cache_key),
+            )
+        )
+
     def read(self, request: ArchiveRequest) -> bytes:
         entry = self._entry_for(request)
         if entry is None:

@@ -752,7 +752,11 @@ def read_rung_tape(
 
 
 def forecast_cycles_from_mos_payload(
-    body: bytes, *, icao: str, std_utc_offset_hours: float
+    body: bytes,
+    *,
+    icao: str,
+    std_utc_offset_hours: float,
+    runtime_days: frozenset[dt.date] | None = None,
 ) -> dict[dt.date, list[tuple[int, float]]]:
     """``climate_day -> [(runtime_ns, txn_f), ...]``, ALL cycles, sorted.
 
@@ -772,6 +776,8 @@ def forecast_cycles_from_mos_payload(
         if not raw:
             continue
         runtime = dt.datetime.strptime(row["runtime"], "%Y-%m-%d %H:%M:%S").replace(tzinfo=dt.UTC)
+        if runtime_days is not None and runtime.date() not in runtime_days:
+            continue
         ftime = dt.datetime.strptime(row["ftime"], "%Y-%m-%d %H:%M:%S").replace(tzinfo=dt.UTC)
         try:
             climate_day = climate_day_for_txn(
@@ -869,31 +875,63 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     # -- forecasts covering the PRICE window ------------------------------
     price_days = sorted({day for _city, day in by_station_day})
-    years = sorted({day.year for day in price_days})
     forecasts: dict[tuple[str, dt.date], list[tuple[int, float]]] = {}
-    from forecast_conditional_corpus import _archive_cache
-
-    from breezy.persistence.archive_request import iem_mos_request
+    from forecast_conditional_corpus import (
+        MosCoverageGapError,
+        _archive_cache,
+        read_mos_windows,
+        resolve_mos_coverage,
+    )
 
     cache = _archive_cache("iem-mos")
+    if price_days:
+        # RUNTIME days, not climate days: a climate day is priced by cycles
+        # issued on it or the day before, so the range is widened one day at
+        # each end. The archive answers this range from YEAR entries, explicit
+        # WINDOW entries, or both -- the resolver decides which entry owns each
+        # day, and a day owned by neither is NAMED rather than silently dropped.
+        runtime_start = price_days[0] - dt.timedelta(days=1)
+        runtime_end = price_days[-1] + dt.timedelta(days=1)
+    else:
+        runtime_start = runtime_end = None
     for city in POOL_CITIES:
         icao = CITY_TO_ICAO[city]
-        for year in years:
-            try:
-                body = cache.read(iem_mos_request(icao, year, "NBS"))
-            except Exception as exc:  # noqa: BLE001 -- this IS the measurement
-                notes.append(
-                    f"FORECAST ARCHIVE ABSENT for {icao} {year}: {type(exc).__name__}"
-                )
-                continue
+        if runtime_start is None or runtime_end is None:
+            continue
+        try:
+            coverage = resolve_mos_coverage(
+                cache,
+                station=icao,
+                start=runtime_start,
+                end=runtime_end + dt.timedelta(days=1),
+                model="NBS",
+            )
+        except MosCoverageGapError as gap:
+            # §4 requires this run to REPORT and exit 0, so the gap is recorded
+            # with its days named and the covered remainder is still measured.
+            # Nothing is silent: the shortfall is in the artefact.
+            notes.append(
+                f"FORECAST ARCHIVE GAP for {icao}: "
+                f"{len(gap.missing_days)} runtime day(s) covered by no entry "
+                f"({gap.missing_days[0].isoformat()}..{gap.missing_days[-1].isoformat()}); "
+                "the covered remainder is measured below."
+            )
+            coverage = gap.coverage
+        for body, owned_days in read_mos_windows(cache, coverage):
             cycles = forecast_cycles_from_mos_payload(
                 body,
                 icao=icao,
                 std_utc_offset_hours=sites[city].std_utc_offset_hours,
+                runtime_days=owned_days,
             )
+            # EXTEND, never replace: entries own disjoint runtime days, so a
+            # climate day straddling two of them keeps both entries' cycles and
+            # gains no duplicates.
             for day, entries in cycles.items():
-                forecasts[(city, day)] = entries
+                forecasts.setdefault((city, day), []).extend(entries)
             del body, cycles
+        for entries in forecasts.values():
+            entries.sort()
     census.station_days_with_forecast = sum(1 for key in by_station_day if key in forecasts)
     if census.station_days_with_forecast == 0 and census.station_days_with_truth:
         notes.append(

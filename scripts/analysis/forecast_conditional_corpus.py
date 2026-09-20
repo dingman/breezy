@@ -414,14 +414,174 @@ def _archive_cache(source: str):
     )
 
 
+# ---------------------------------------------------------------------------
+# WINDOW-AWARE MOS RESOLUTION -- a date range, never a calendar year
+# ---------------------------------------------------------------------------
+#
+# The MOS archive carries TWO shapes of entry: whole-station-YEAR entries
+# (``iem_mos_request``) and explicit-WINDOW entries (``iem_mos_window_request``,
+# the only shape an ONGOING period can be claimed as). A reader that builds a
+# year key can never name a window entry, so the 2026 backfill read as absent
+# and the WP-7 screen measured n = 0 against forecasts that were on disk.
+#
+# The resolution rule, stated once:
+#
+#   * A requested UTC day is answered by the NARROWEST manifested entry whose
+#     window contains that whole day; ties break on the cache key, so the
+#     choice is deterministic and never depends on manifest ordering. Narrowest
+#     wins because an explicit window is the more specific claim -- it is
+#     minted for exactly the period it names.
+#   * Each requested day is owned by EXACTLY ONE entry. A day inside both a
+#     year entry and a window entry therefore contributes its rows once; two
+#     owners would double-weight that station-day in a per-station-day trial.
+#   * A requested day owned by NO entry RAISES. Returning fewer rows silently
+#     is the failure this module just cost a cycle to diagnose: a corpus
+#     shortfall is indistinguishable from a real null once it reaches a gate.
+
+
+class MosCoverageGapError(RuntimeError):
+    """Raised when a requested day is claimed by no manifested MOS entry.
+
+    Carries the named missing days AND the partial coverage, so a caller whose
+    registration requires it to REPORT rather than abort (the WP-7 screen under
+    §4) can proceed with the gap named in its artefact instead of swallowing it.
+    """
+
+    def __init__(
+        self,
+        *,
+        station: str,
+        model: str,
+        missing_days: Sequence[dt.date],
+        coverage: MosCoverage,
+    ) -> None:
+        self.station = station
+        self.model = model
+        self.missing_days: tuple[dt.date, ...] = tuple(missing_days)
+        self.coverage = coverage
+        named = ", ".join(day.isoformat() for day in self.missing_days)
+        super().__init__(
+            f"{station} {model}: {len(self.missing_days)} requested day(s) are covered by "
+            f"neither a year entry nor a window entry in the MOS archive: {named}. "
+            "Refusing to return fewer rows than were asked for -- a silent shortfall "
+            "reads downstream as a real null."
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class MosCoverage:
+    """Which manifested archive entry answers each requested UTC day."""
+
+    station: str
+    model: str
+    request_by_day: Mapping[dt.date, object]
+
+    def requests(self) -> tuple[object, ...]:
+        """The distinct entries to read, ordered by their first owned day."""
+        seen: dict[object, dt.date] = {}
+        for day in sorted(self.request_by_day):
+            request = self.request_by_day[day]
+            seen.setdefault(request, day)
+        return tuple(sorted(seen, key=lambda r: (seen[r], repr(r))))
+
+    def days_for(self, request: object) -> frozenset[dt.date]:
+        """The days this entry OWNS -- never the days its window merely spans."""
+        return frozenset(day for day, owner in self.request_by_day.items() if owner == request)
+
+
+def _days_in(start: dt.date, end: dt.date) -> tuple[dt.date, ...]:
+    """``[start, end)`` as UTC calendar days. ``end`` is EXCLUSIVE."""
+    if end <= start:
+        raise ValueError(f"end {end} must be after start {start} (end is exclusive)")
+    return tuple(start + dt.timedelta(days=i) for i in range((end - start).days))
+
+
+def resolve_mos_coverage(cache, *, station: str, start: dt.date, end: dt.date, model: str):
+    """Map every UTC day in ``[start, end)`` onto the entry that answers it.
+
+    ``start``/``end`` are the days of the forecast RUNTIMES being asked for;
+    ``end`` is exclusive. Raises :class:`MosCoverageGapError` if any day is
+    claimed by no entry.
+    """
+    from breezy.persistence.archive_cache import (
+        IEM_MOS_MODEL_PRODUCTS,
+        IEM_MOS_SOURCE,
+        ArchiveRequest,
+    )
+
+    product = IEM_MOS_MODEL_PRODUCTS.get(model)
+    if product is None:
+        raise ValueError(
+            f"unknown MOS model {model!r}; the closed set is "
+            f"{sorted(IEM_MOS_MODEL_PRODUCTS)} -- refused rather than sanitised"
+        )
+
+    candidates = [
+        ArchiveRequest(
+            source=IEM_MOS_SOURCE,
+            station=entry.station,
+            product=entry.product,
+            window_start=entry.window_start,
+            window_end=entry.window_end,
+            model=entry.model,
+        )
+        for entry in cache.entries(IEM_MOS_SOURCE)
+        if entry.station == station and entry.product == product and entry.model == model
+    ]
+
+    request_by_day: dict[dt.date, object] = {}
+    missing: list[dt.date] = []
+    for day in _days_in(start, end):
+        day_start = int(dt.datetime(day.year, day.month, day.day, tzinfo=dt.UTC).timestamp()) * NS
+        day_end = day_start + (24 * 3600 - 60) * NS  # the 23:59Z inclusive-minute convention
+        owners = [
+            request
+            for request in candidates
+            if request.window_start <= day_start and day_end <= request.window_end
+        ]
+        if not owners:
+            missing.append(day)
+            continue
+        request_by_day[day] = min(
+            owners, key=lambda r: (r.window_end - r.window_start, r.cache_key())
+        )
+
+    coverage = MosCoverage(station=station, model=model, request_by_day=dict(request_by_day))
+    if missing:
+        raise MosCoverageGapError(
+            station=station, model=model, missing_days=missing, coverage=coverage
+        )
+    return coverage
+
+
+def read_mos_windows(cache, coverage: MosCoverage) -> Iterable[tuple[bytes, frozenset[dt.date]]]:
+    """Yield ``(payload, owned_days)`` per resolved entry, ONE payload at a time.
+
+    The caller filters rows to ``owned_days``; that -- not the read order -- is
+    what makes an overlapping year/window pair contribute each day once.
+    Payloads are yielded and dropped, never accumulated (MEMORY).
+    """
+    for request in coverage.requests():
+        yield cache.read(request), coverage.days_for(request)
+
+
 def forecasts_from_mos_payload(
-    body: bytes, *, icao: str, std_utc_offset_hours: float
+    body: bytes,
+    *,
+    icao: str,
+    std_utc_offset_hours: float,
+    runtime_days: frozenset[dt.date] | None = None,
 ) -> dict[dt.date, dict[int, float]]:
     """Reduce one MOS station-year to ``climate_day -> {lead_hours: txn_f}``.
 
     Only the daily-MAX ftime rows carry ``txn`` at the max hour; the frozen
     ``climate_day_for_txn`` map decides the day, and ``assert_forecast_vintage``
     decides whether the run was available in time.
+
+    ``runtime_days`` restricts the rows consumed to the UTC runtime days this
+    payload OWNS under :func:`resolve_mos_coverage`. ``None`` (the default)
+    consumes the whole payload, which is what a single non-overlapping entry
+    means; the filter is how two overlapping entries stay disjoint.
     """
     from forecast_climate_day_map import ForecastValidPeriodError
 
@@ -432,6 +592,8 @@ def forecasts_from_mos_payload(
         if not raw:
             continue
         runtime = dt.datetime.strptime(row["runtime"], "%Y-%m-%d %H:%M:%S").replace(tzinfo=dt.UTC)
+        if runtime_days is not None and runtime.date() not in runtime_days:
+            continue
         ftime = dt.datetime.strptime(row["ftime"], "%Y-%m-%d %H:%M:%S").replace(tzinfo=dt.UTC)
         runtime_ns = int(runtime.timestamp()) * NS
         ftime_ns = int(ftime.timestamp()) * NS
@@ -497,7 +659,7 @@ def build_corpus(*, start: dt.date, end: dt.date, progress=None) -> list[CorpusR
     )
     from settlement_alignment_study import load_sites
 
-    from breezy.persistence.archive_request import iem_asos_1min_request, iem_mos_request
+    from breezy.persistence.archive_request import iem_asos_1min_request
 
     cli_dir = require_settlement_alignment_cache_dir(DEFAULT_SETTLEMENT_ALIGNMENT_CACHE_DIR)
     sites = {spec.city: spec for spec in load_sites()}
@@ -511,14 +673,34 @@ def build_corpus(*, start: dt.date, end: dt.date, progress=None) -> list[CorpusR
         offset = spec.std_utc_offset_hours
         forecasts: dict[dt.date, dict[int, float]] = {}
         observations: dict[dt.date, tuple[float, dict[int, float]]] = {}
-        for year in years:
-            forecasts.update(
-                forecasts_from_mos_payload(
-                    mos_cache.read(iem_mos_request(icao, year, MOS_MODEL)),
-                    icao=icao,
-                    std_utc_offset_hours=offset,
-                )
+        # MOS is resolved over the whole requested RANGE, not year by year: the
+        # archive may answer a span with a year entry, a window entry, or both,
+        # and only the resolver knows which owns a given day. The range asked
+        # for here is the exact union of the calendar years this corpus spans,
+        # so a year-only archive resolves to precisely the entries the previous
+        # per-year loop read.
+        coverage = resolve_mos_coverage(
+            mos_cache,
+            station=icao,
+            start=dt.date(start.year, 1, 1),
+            end=dt.date(end.year + 1, 1, 1),
+            model=MOS_MODEL,
+        )
+        for body, owned_days in read_mos_windows(mos_cache, coverage):
+            part = forecasts_from_mos_payload(
+                body,
+                icao=icao,
+                std_utc_offset_hours=offset,
+                runtime_days=owned_days,
             )
+            # MERGED per climate day, not `dict.update`d: a climate day's cycles
+            # can straddle two entries at a window boundary (the D-1 runtime in
+            # one, the D runtime in the other), and replacing the day's lead map
+            # wholesale would DROP the leads the other entry owns.
+            for climate_day, leads in part.items():
+                forecasts.setdefault(climate_day, {}).update(leads)
+            del body, part
+        for year in years:
             observations.update(
                 observations_from_asos_payload(
                     asos_cache.read(iem_asos_1min_request(icao, year)),
