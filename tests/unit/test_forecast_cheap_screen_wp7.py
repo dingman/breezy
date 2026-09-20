@@ -51,9 +51,22 @@ def _variant(wp7: ModuleType, variant_id: str):
 
 
 def _instant(wp7: ModuleType, *, ts: int, hour: int, ask=None, ask_size=0.0, bid=None,
-             bid_size=0.0):
+             bid_size=0.0, local_date=DAY):
+    """One projected depth instant.
+
+    ``local_date`` is REQUIRED on ``RungInstant`` and defaults to the fixture
+    day here: a rung's depth tape spans D-1..D+1, so an instant carrying only
+    an hour cannot be placed in a decision window without admitting the
+    neighbouring days. Tests that exercise date-scoping pass it explicitly.
+    """
     return wp7.RungInstant(
-        ts_ns=ts, hour_lst=hour, ask=ask, ask_size=ask_size, bid=bid, bid_size=bid_size
+        ts_ns=ts,
+        hour_lst=hour,
+        local_date=local_date,
+        ask=ask,
+        ask_size=ask_size,
+        bid=bid,
+        bid_size=bid_size,
     )
 
 

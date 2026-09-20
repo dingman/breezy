@@ -66,6 +66,7 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Final
+from zoneinfo import ZoneInfo
 
 _SCRIPTS_ANALYSIS_DIR = Path(__file__).resolve().parent
 _REPO_ROOT = _SCRIPTS_ANALYSIS_DIR.parents[1]
@@ -77,21 +78,27 @@ from forecast_tape_screen import DEFAULT_FEE_COEFFICIENT, venue_fee
 
 __all__ = [
     "ALL_VARIANTS",
+    "DECISION_LOCAL_HOUR",
     "FWER_ALPHA",
     "K_VARIANTS",
     "MIN_MEDIAN_MARGIN",
     "MIN_POSITIVE_RATE",
     "MIN_TRIAL_STATION_DAYS",
+    "STATION_TIME_ZONES",
     "GateResult",
     "HourDiagnostic",
     "HourSelectionRefused",
     "PooledCell",
+    "PreWindowLookAheadError",
     "StationDayTrial",
     "Variant",
     "VariantResult",
+    "decision_instant_ns",
     "evaluate_gate",
     "holm_bonferroni",
+    "local_date_and_hour",
     "screen_station_day",
+    "station_time_zone",
 ]
 
 # ---------------------------------------------------------------------------
@@ -189,6 +196,8 @@ VERDICT_INSUFFICIENT_DATA: Final[str] = "INSUFFICIENT-DATA"
 #: §2.1. The selection unit is the four-station pool, ALWAYS. NYC carries no
 #: local NBS forecast rows and is out of scope; per-station tables are
 #: diagnosis only and are never a selection surface.
+_NS: Final[int] = 10**9
+
 POOL_CITIES: Final[tuple[str, ...]] = ("LAX", "MDW", "MIA", "SFO")
 CITY_TO_ICAO: Final[Mapping[str, str]] = {
     "LAX": "KLAX",
@@ -196,6 +205,56 @@ CITY_TO_ICAO: Final[Mapping[str, str]] = {
     "MIA": "KMIA",
     "SFO": "KSFO",
 }
+
+#: The station's own IANA zone, named EXPLICITLY rather than derived from a UTC
+#: offset. The registered decision windows (`WINDOWS`) are WALL-CLOCK trading
+#: windows -- "the 12:00-17:00 local afternoon" -- and all four stations are on
+#: daylight time through the 2026-08-30.. price tape, so a fixed standard offset
+#: labels every window an hour early. This is DELIBERATELY different from
+#: `breezy.domain.climate_day`, which pins the SETTLEMENT day to local STANDARD
+#: time year-round: that boundary must not follow DST, and this one must. The
+#: two agree on every instant a registered window can admit (09:00-17:00 local),
+#: so no trial changes its day because of the difference.
+STATION_TIME_ZONES: Final[Mapping[str, str]] = {
+    "LAX": "America/Los_Angeles",
+    "MDW": "America/Chicago",
+    "MIA": "America/New_York",
+    "SFO": "America/Los_Angeles",
+}
+
+#: §2.2. The earliest decision instant in the enumerated set: 09:00 LOCAL at the
+#: station, never 09:00 UTC (which is 01:00 at LAX -- it would admit a cycle no
+#: 09:00-local decision could have seen, or refuse one it could).
+DECISION_LOCAL_HOUR: Final[int] = 9
+
+
+def station_time_zone(city: str) -> ZoneInfo:
+    """The station's IANA zone. An unmapped station RAISES, never defaults."""
+    try:
+        return ZoneInfo(STATION_TIME_ZONES[city])
+    except KeyError as exc:
+        raise KeyError(
+            f"{city} has no explicit IANA zone in STATION_TIME_ZONES; refusing to "
+            "guess an offset for a decision window"
+        ) from exc
+
+
+def local_date_and_hour(ts_ns: int, zone: ZoneInfo) -> tuple[dt.date, int]:
+    """``(local calendar date, local hour)`` for an instant, DST-aware."""
+    local = dt.datetime.fromtimestamp(ts_ns / _NS, tz=dt.UTC).astimezone(zone)
+    return local.date(), local.hour
+
+
+def decision_instant_ns(*, city: str, climate_day: dt.date) -> int:
+    """09:00 LOCAL on the climate day, in epoch ns (§2.2)."""
+    moment = dt.datetime(
+        climate_day.year,
+        climate_day.month,
+        climate_day.day,
+        DECISION_LOCAL_HOUR,
+        tzinfo=station_time_zone(city),
+    )
+    return int(moment.timestamp()) * _NS
 
 
 # ---------------------------------------------------------------------------
@@ -419,9 +478,19 @@ def cluster_bootstrap_median_ci(
 
 @dataclass(frozen=True, slots=True)
 class RungInstant:
-    """One L0 snapshot of one rung: the only tape shape the screen consumes."""
+    """One L0 snapshot of one rung: the only tape shape the screen consumes.
+
+    ``local_date`` is REQUIRED and carries the instant's own local calendar
+    date. It is not a convenience: a rung's depth tape for climate day D spans
+    D-1 through D+1 (a 2026-09-15 LAX rung runs 2026-09-14 07:00 local to
+    2026-09-16 00:01), so an hour-of-day window filter admits the PRIOR day --
+    and since the take is the EARLIEST qualifying instant, the prior day then
+    supplies most of the takes. The date travels with the instant so that no
+    caller can screen on the hour alone.
+    """
 
     ts_ns: int
+    local_date: dt.date
     hour_lst: int
     ask: float | None
     ask_size: float
@@ -445,14 +514,57 @@ REASON_NO_MODEL_PROBABILITY: Final[str] = "NO_MODEL_PROBABILITY"
 REASON_NO_LIFTABLE_QUOTE: Final[str] = "NO_LIFTABLE_QUOTE"
 
 
-def _pre_window_ask(tape: RungTape, window_start_lst: int) -> float | None:
-    """The last liftable ask observed STRICTLY BEFORE the window opens."""
+class PreWindowLookAheadError(AssertionError):
+    """A C2 reference instant was observable at or after the take it screens.
+
+    The original screen took ``prior[-1]`` over the WHOLE multi-day tape, which
+    for a take on D-1 returned the 08:59 instant on D -- up to ~24 h LATER. The
+    condition ``ask(t) < ref`` then meant "this rung repriced upward over the
+    next day", an outcome leak wearing a screen's clothes. The arithmetic below
+    no longer does that; this guard is what stops it coming back silently.
+    """
+
+
+def _last_liftable_before_window(
+    tape: RungTape,
+    *,
+    window_start_lst: int,
+    climate_day: dt.date,
+    side: str,
+) -> RungInstant | None:
+    """The last liftable quote strictly before the window opens ON DAY ``D``.
+
+    "Before the window" is ``climate_day`` at an hour earlier than the window
+    start -- never merely an earlier hour-of-day on some other day, and never an
+    instant from D-1. ``side`` selects which half of the book must be liftable:
+    the YES leg lifts the ask, the NO leg lifts the BID (selling YES into it).
+    """
     prior = [
         i
         for i in tape.instants
-        if i.hour_lst < window_start_lst and i.ask is not None and i.ask_size >= LIFTABLE_QUANTITY
+        if i.local_date == climate_day
+        and i.hour_lst < window_start_lst
+        and (
+            (i.ask is not None and i.ask_size >= LIFTABLE_QUANTITY)
+            if side == SIDE_YES
+            else (i.bid is not None and i.bid_size >= LIFTABLE_QUANTITY)
+        )
     ]
-    return prior[-1].ask if prior else None
+    return max(prior, key=lambda i: i.ts_ns) if prior else None
+
+
+def _assert_reference_precedes(
+    reference: RungInstant, instant: RungInstant, *, rung_id: str, side: str
+) -> None:
+    """The C2 reference must be strictly OLDER than the instant it screens."""
+    if reference.ts_ns >= instant.ts_ns:
+        raise PreWindowLookAheadError(
+            f"{rung_id} {side}: pre-window reference at ts_ns={reference.ts_ns} "
+            f"({reference.local_date} {reference.hour_lst:02d}h local) is not before "
+            f"the screened instant at ts_ns={instant.ts_ns} "
+            f"({instant.local_date} {instant.hour_lst:02d}h local) -- it is observable "
+            "after it, which is an outcome leak, not a screen"
+        )
 
 
 def screen_station_day(
@@ -475,11 +587,28 @@ def screen_station_day(
     best margin the window ever offered.
     """
     hours = set(variant.hours())
-    pre_window = (
-        {r.rung_id: _pre_window_ask(r, variant.window_start_lst) for r in rungs}
-        if variant.ask_screen
-        else {}
-    )
+    # §2.2 -- the window is a span of the CLIMATE DAY, so each leg carries its
+    # OWN pre-window reference, taken on that same day: the YES leg screens
+    # against the pre-window ASK, the NO leg against the pre-window NO ask,
+    # which is ``1 - pre-window BID`` and NOT ``1 - pre-window ask`` (those
+    # differ by the whole spread, which on this tape screened the NO leg out
+    # almost everywhere).
+    yes_reference: dict[str, RungInstant | None] = {}
+    no_reference: dict[str, RungInstant | None] = {}
+    if variant.ask_screen:
+        for tape_ in rungs:
+            yes_reference[tape_.rung_id] = _last_liftable_before_window(
+                tape_,
+                window_start_lst=variant.window_start_lst,
+                climate_day=climate_day,
+                side=SIDE_YES,
+            )
+            no_reference[tape_.rung_id] = _last_liftable_before_window(
+                tape_,
+                window_start_lst=variant.window_start_lst,
+                climate_day=climate_day,
+                side=SIDE_NO,
+            )
 
     if p_yes_by_rung is None:
         return StationDayTrial(
@@ -497,7 +626,7 @@ def screen_station_day(
 
     # One merged, time-ordered pass over the window. Candidate tuples are
     # (margin, ask, rung_lower, ...) so the tie-break is the tuple order itself.
-    candidates: list[tuple[int, float, float, int, str, str]] = []
+    candidates: list[tuple[int, float, float, int, str, str, int]] = []
     saw_liftable = False
     saw_bid_side = False
     for tape in rungs:
@@ -505,24 +634,39 @@ def screen_station_day(
         if p_yes is None:
             continue
         lower_key = tape.lower_f if tape.lower_f is not None else -10**6
-        screen_ref = pre_window.get(tape.rung_id) if variant.ask_screen else None
+        yes_ref = yes_reference.get(tape.rung_id) if variant.ask_screen else None
+        no_ref = no_reference.get(tape.rung_id) if variant.ask_screen else None
         for inst in tape.instants:
-            if inst.hour_lst not in hours:
+            # DATE-SCOPED, not hour-of-day: the D-1 and D+1 legs of this rung's
+            # tape carry in-window HOURS and are not decisions on day D.
+            if inst.local_date != climate_day or inst.hour_lst not in hours:
                 continue
             if SIDE_YES in variant.sides and inst.ask is not None and inst.ask_size >= (
                 LIFTABLE_QUANTITY
             ):
                 saw_liftable = True
-                if not variant.ask_screen or (
-                    screen_ref is not None and inst.ask < screen_ref
-                ):
+                screened = not variant.ask_screen
+                if variant.ask_screen and yes_ref is not None:
+                    _assert_reference_precedes(
+                        yes_ref, inst, rung_id=tape.rung_id, side=SIDE_YES
+                    )
+                    screened = yes_ref.ask is not None and inst.ask < yes_ref.ask
+                if screened:
                     margin = p_yes - (
                         inst.ask + venue_fee(
                             ask_probability=inst.ask, fee_coefficient=fee_coefficient
                         )
                     )
                     candidates.append(
-                        (inst.ts_ns, -margin, inst.ask, lower_key, SIDE_YES, tape.rung_id)
+                        (
+                            inst.ts_ns,
+                            -margin,
+                            inst.ask,
+                            lower_key,
+                            SIDE_YES,
+                            tape.rung_id,
+                            inst.hour_lst,
+                        )
                     )
             # The NO leg is priced off the INVERTED YES bid ladder: lifting NO
             # at the venue means selling YES into the bid, so the NO ask is
@@ -535,16 +679,26 @@ def screen_station_day(
                 saw_bid_side = True
                 saw_liftable = True
                 no_ask = 1.0 - inst.bid
-                if not variant.ask_screen or (
-                    screen_ref is not None and no_ask < (1.0 - screen_ref)
-                ):
+                screened = not variant.ask_screen
+                if variant.ask_screen and no_ref is not None and no_ref.bid is not None:
+                    _assert_reference_precedes(no_ref, inst, rung_id=tape.rung_id, side=SIDE_NO)
+                    screened = no_ask < (1.0 - no_ref.bid)
+                if screened:
                     margin = (1.0 - p_yes) - (
                         no_ask + venue_fee(
                             ask_probability=no_ask, fee_coefficient=fee_coefficient
                         )
                     )
                     candidates.append(
-                        (inst.ts_ns, -margin, no_ask, lower_key, SIDE_NO, tape.rung_id)
+                        (
+                            inst.ts_ns,
+                            -margin,
+                            no_ask,
+                            lower_key,
+                            SIDE_NO,
+                            tape.rung_id,
+                            inst.hour_lst,
+                        )
                     )
 
     no_bid_side = (SIDE_NO in variant.sides) and not saw_bid_side
@@ -567,11 +721,9 @@ def screen_station_day(
     first_take = next((c for c in candidates if -c[1] > MIN_EDGE_FOR_TAKE), None)
     best = min(candidates, key=lambda c: (c[1], c[2], c[3]))
     chosen = first_take if first_take is not None else best
-    ts_ns, neg_margin, ask, _lower, side, rung_id = chosen
-    hour = next(
-        (i.hour_lst for t in rungs for i in t.instants if i.ts_ns == ts_ns),
-        None,
-    )
+    # The hour travels WITH the chosen candidate: looking it up by ``ts_ns``
+    # across every rung could attribute a diagnostic to a rung never chosen.
+    _ts_ns, neg_margin, ask, _lower, side, rung_id, hour = chosen
     return StationDayTrial(
         station=station,
         climate_day=climate_day,
@@ -685,7 +837,6 @@ _L0_COLUMNS: Final[tuple[str, ...]] = (
     "bid_price_0",
     "bid_size_0",
 )
-_NS: Final[int] = 10**9
 
 
 @dataclass(slots=True)
@@ -712,9 +863,31 @@ def read_rung_tape(
     std_utc_offset_hours: float,
     price_scalar: float,
     size_scalar: float,
+    city: str | None = None,
 ) -> tuple[list[RungInstant], int]:
-    """Stream ONE rung's depth files, projected to the five L0 columns."""
+    """Stream ONE rung's depth files, projected to the five L0 columns.
+
+    Local time is derived through the station's IANA zone, so a September
+    instant reads as PDT/CDT/EDT rather than an hour early. ``city`` defaults to
+    the one in the instrument directory's own venue slug -- the zone is a
+    property of the station, never of the caller. ``std_utc_offset_hours``
+    stays in the signature and is CROSS-CHECKED against the zone's standard
+    (January) offset: it no longer performs the conversion, and a registry that
+    disagrees with the zone is refused rather than silently preferred.
+    """
     import pyarrow.parquet as pq
+    from h4_preliminary_economic_read import parse_rung
+
+    station = city if city is not None else parse_rung(instrument_dir.name).city
+    zone = station_time_zone(station)
+    january_offset = dt.datetime(2026, 1, 15, 12, tzinfo=zone).utcoffset()
+    assert january_offset is not None
+    if january_offset.total_seconds() / 3600.0 != float(std_utc_offset_hours):
+        raise ValueError(
+            f"{station}: registry standard offset {std_utc_offset_hours} disagrees with "
+            f"{STATION_TIME_ZONES[station]} standard offset "
+            f"{january_offset.total_seconds() / 3600.0}; refusing to guess which is right"
+        )
 
     instants: list[RungInstant] = []
     rows = 0
@@ -731,13 +904,12 @@ def read_rung_tape(
             bid_raw = int.from_bytes(bid_p[i], "little", signed=True)
             ask = ask_raw / price_scalar
             bid = bid_raw / price_scalar
-            local = dt.datetime.fromtimestamp(
-                ts[i] / _NS, tz=dt.UTC
-            ) + dt.timedelta(hours=std_utc_offset_hours)
+            local_date, local_hour = local_date_and_hour(int(ts[i]), zone)
             instants.append(
                 RungInstant(
                     ts_ns=int(ts[i]),
-                    hour_lst=local.hour,
+                    local_date=local_date,
+                    hour_lst=local_hour,
                     # A ``Price(0)`` pad on an absent side must read as NO ASK,
                     # never as a free contract (h4's L-8 reading of Depth10).
                     ask=ask if ask_raw > 0 else None,
@@ -1061,13 +1233,10 @@ def _rung_probabilities(
     from forecast_conditional_model_study import _norm_cdf
 
     # §2.2: the latest cycle whose vintage <= the decision instant. The earliest
-    # decision instant in the enumerated set is 09:00 LST, so that is the bound
-    # applied here; no lead or cycle-age partition is taken.
-    decision_ns = int(
-        dt.datetime(
-            climate_day.year, climate_day.month, climate_day.day, 9, tzinfo=dt.UTC
-        ).timestamp()
-    ) * _NS
+    # decision instant in the enumerated set is 09:00 LOCAL at the station --
+    # `decision_instant_ns`, NOT 09:00 UTC, which is 01:00 at LAX -- and that is
+    # the bound applied here; no lead or cycle-age partition is taken.
+    decision_ns = decision_instant_ns(city=city, climate_day=climate_day)
     legal = [c for c in cycles if c[0] <= decision_ns]
     if not legal:
         return None
