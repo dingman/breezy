@@ -121,6 +121,7 @@ from settlement_alignment_study import (
 from breezy.normalize.climate_day import standard_time_zone
 
 __all__ = [
+    "ALL_QUOTED_HOURS",
     "ARCHIVE_HOURS",
     "ASK_BANDS",
     "DENSE_STATIONS",
@@ -166,6 +167,24 @@ __all__ = [
 
 #: LST hours the archive table and the tape join both condition on.
 ARCHIVE_HOURS: Final[tuple[int, ...]] = (12, 13, 14, 15, 16)
+
+#: Every LST hour the venue actually quotes -- the whole local-standard day.
+#: MEASURED, not assumed: streaming `ts_event` + `ask_price_0` over the entire
+#: archived Depth10 tape
+#: (`~/.local/share/breezy/catalog/quote_tape/polymarket_us`, 634 instruments)
+#: and binning by each station's standard-time offset, EVERY hour 00..23 LST
+#: carries depth instants and a live ask on all four dense stations; the
+#: thinnest hour (02 LST) still holds ~298k instants across 15+ distinct days
+#: (`docs/evidence/CONTINUOUS_HUNTING_GAP_2026-09-20.md`, WP report
+#: 2026-09-20). `ARCHIVE_HOURS` is therefore a SCOPE restriction inherited
+#: from SS1's afternoon tape join (Part B), never a correctness bound on Part
+#: A: Part A reads only the ASOS running-max series and the CLI final, both
+#: defined at all 24 hours of a complete climate day.
+#:
+#: Widening the hour set NEVER widens what may be traded: a cell below
+#: `N_MIN` stays `None` here exactly as it does at 12 LST, and the strategy
+#: must refuse an `None` cell rather than guess.
+ALL_QUOTED_HOURS: Final[tuple[int, ...]] = tuple(range(24))
 
 #: G-01 `SAMPLE_FLOOR_PER_SITE` -- the minimum cell size before a Wilson bound
 #: is reported at all. Below it: `n/a`, never `0`.

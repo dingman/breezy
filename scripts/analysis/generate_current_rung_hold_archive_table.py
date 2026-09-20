@@ -78,7 +78,56 @@ def _parse_args(argv: Sequence[str] | None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--archive-cache-dir", default=str(DEFAULT_ARCHIVE_CACHE_DIR))
     parser.add_argument("--output", default=str(DEFAULT_OUTPUT))
+    parser.add_argument(
+        "--hours",
+        default=None,
+        help=(
+            "LST hours to build cells at, as a comma list and/or inclusive "
+            "ranges (e.g. '0-23', '10,11,12-16'). Default: the shipped "
+            "afternoon window ARCHIVE_HOURS, so an argument-free run "
+            "reproduces the frozen artefact byte-for-byte."
+        ),
+    )
     return parser.parse_args(argv)
+
+
+def parse_hours(spec: str | None) -> tuple[int, ...]:
+    """`--hours` -> a sorted, de-duplicated tuple of LST hours.
+
+    `None` (the default) means `ARCHIVE_HOURS`: an argument-free regeneration
+    must keep reproducing the SHIPPED five-hour table byte-for-byte, so
+    widening is always an explicit, recorded choice -- and `argv` is echoed
+    into the generated module's "Regenerate via" line, so the hour set a table
+    was built at is provenance, never folklore.
+
+    Raises `SystemExit` on anything that is not a set of real hours in
+    `[0, 23]`: an hour the local-standard day does not have would key cells
+    the strategy can never look up.
+    """
+    if spec is None:
+        return ARCHIVE_HOURS
+    hours: set[int] = set()
+    for token in spec.split(","):
+        piece = token.strip()
+        if not piece:
+            raise SystemExit(f"--hours: empty hour token in {spec!r}")
+        bounds = piece.split("-")
+        if len(bounds) not in (1, 2):
+            raise SystemExit(f"--hours: malformed token {piece!r}")
+        try:
+            values = [int(bound) for bound in bounds]
+        except ValueError:
+            raise SystemExit(f"--hours: {piece!r} is not an integer hour") from None
+        low, high = (values[0], values[0]) if len(values) == 1 else (values[0], values[1])
+        if low > high:
+            raise SystemExit(f"--hours: descending range {piece!r}")
+        for hour in range(low, high + 1):
+            if not 0 <= hour <= 23:
+                raise SystemExit(f"--hours: {hour} is outside the local-standard day [0, 23]")
+            hours.add(hour)
+    if not hours:
+        raise SystemExit(f"--hours: {spec!r} selected no hours")
+    return tuple(sorted(hours))
 
 
 def _corpus_files(*, cache_dir: Path, cities: Sequence[str]) -> list[Path]:
@@ -146,7 +195,7 @@ def _quantize(value: float) -> Decimal:
 
 
 def build_frozen_table(
-    *, archive_cache_dir: Path
+    *, archive_cache_dir: Path, hours: Sequence[int] = ARCHIVE_HOURS
 ) -> tuple[
     dict[tuple[str, str, int, int, int], Decimal | None],
     dict[tuple[str, str, int, int, int], Decimal | None],
@@ -169,7 +218,7 @@ def build_frozen_table(
         days_by_city[city] = days
         finals_by_city[city] = finals
     archive: dict[ArchiveCellKey, ArchiveCell] = build_archive_table(
-        days_by_city, finals_by_city, hours=ARCHIVE_HOURS
+        days_by_city, finals_by_city, hours=tuple(hours)
     )
     lower_table: dict[tuple[str, str, int, int, int], Decimal | None] = {}
     upper_table: dict[tuple[str, str, int, int, int], Decimal | None] = {}
@@ -280,7 +329,10 @@ def generate(
     parsed_argv = list(argv) if argv is not None else list(sys.argv[1:])
     args = _parse_args(parsed_argv)
     archive_cache_dir = Path(args.archive_cache_dir).expanduser()
-    lower_table, upper_table = build_frozen_table(archive_cache_dir=archive_cache_dir)
+    hours = parse_hours(args.hours)
+    lower_table, upper_table = build_frozen_table(
+        archive_cache_dir=archive_cache_dir, hours=hours
+    )
     files = _corpus_files(cache_dir=archive_cache_dir, cities=DENSE_STATIONS)
     sha = corpus_sha256(files)
     sha_study = study_git_sha()
@@ -301,8 +353,15 @@ def main(argv: Sequence[str] | None = None) -> int:
     args = _parse_args(parsed_argv)
     # `_upper_table` is already rendered into `source` by `generate`; only
     # `lower_table` is needed here for the printed cell/defined counts.
-    source, (lower_table, _upper_table), sha = generate(argv=parsed_argv)
     output_path = Path(args.output).expanduser()
+    if parse_hours(args.hours) != ARCHIVE_HOURS and output_path == DEFAULT_OUTPUT:
+        raise SystemExit(
+            "refusing to overwrite the SHIPPED artefact "
+            f"{DEFAULT_OUTPUT} with a non-default --hours set; pass --output "
+            "to write the widened table somewhere else. Publishing a widened "
+            "table is a separate, PREREG-gated decision (L-34, class C)."
+        )
+    source, (lower_table, _upper_table), sha = generate(argv=parsed_argv)
     output_path.parent.mkdir(parents=True, exist_ok=True)
     output_path.write_text(source, encoding="utf-8")
     n_cells = len(lower_table)
