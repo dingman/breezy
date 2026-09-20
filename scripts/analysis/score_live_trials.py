@@ -96,7 +96,7 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
-from typing import Any, Final, Literal
+from typing import Any, Final
 
 from breezy.adapters.polymarket_us.errors import ExecutionReportMappingError
 from breezy.adapters.polymarket_us.exec.client import FILL_KEY_PREFIX, DurableFillRecord
@@ -118,6 +118,10 @@ from breezy.domain.weather_bucket_facts import (
 )
 from breezy.persistence.catalog import open_station_catalog, read_climate_day_including_corrections
 from breezy.persistence.family_manifest import FamilyManifestError, load_family_manifest
+from breezy.persistence.residual_fills import (
+    RESIDUAL_EXCLUSION_REASONS,
+    FillExclusionReason,
+)
 from breezy.persistence.scored_trial_store import read_scored_trials, write_scored_trials
 from breezy.registry.settlement_clock import settlement_deadline_ns
 from breezy.registry.sites import SiteNotFoundError, default_registry
@@ -313,44 +317,12 @@ _MALFORMED_ROW_ERRORS: tuple[type[Exception], ...] = (
 #: Widened again (plan rev 6.1, Slice 4 item B2): `"duplicate_fill"` -- the
 #: v3 continuous-rung-hold family's EXPLICIT signal (a genuine SECOND fill on
 #: an already-consumed station-day, `TrialDayLatch.record_duplicate_fill`),
-#: distinct from `"duplicate_fill_for_latch"` (v2's "N fills joined ONE
-#: latch, pick none" heuristic, unchanged). Widened, never relaxed (L-12): no
-#: member removed or re-spelled.
-FillExclusionReason = Literal[
-    "partial_fill",
-    "multi_fill",
-    "fill_below_ask",
-    "fee_unverified",
-    "duplicate_fill_for_latch",
-    "no_taken_latch",
-    "ambiguous_latch",
-    "duplicate_fill",
-    # NO-SIDE S5 (E2-1(iii)/E3-3, PREREG amendment §8): the first live NO
-    # create-path trial, marked residual by the durable first-order key
-    # while the bounded containment window (`is_no_side_pending`) is open.
-    # Widened, never relaxed (L-12): no member removed or re-spelled.
-    "no_side_first_order_residual",
-]
-
-#: Slice 4 item B2 (plan rev 6.1): the mutually exclusive residual set --
-#: every unscored fill in one of these three buckets contributes
-#: `qty * (fill_px + fee)` to `compute_residual`, first-match-wins,
-#: `"duplicate_fill"` checked before `"partial_fill"`/`"multi_fill"` (q != 1)
-#: before `"fee_unverified"`. `duplicate_fill` is excluded upstream, in
-#: `read_filled_trials_state_db`, before a fill ever reaches `_admit_fill`
-#: -- so a fill can never land in more than one of these three buckets by
-#: construction (PREREG mutual-exclusivity requirement).
-RESIDUAL_EXCLUSION_REASONS: Final[frozenset[FillExclusionReason]] = frozenset(
-    {
-        "duplicate_fill",
-        "partial_fill",
-        "multi_fill",
-        "fee_unverified",
-        # NO-SIDE S5 (E3-3): additive, never relaxed (L-12).
-        "no_side_first_order_residual",
-    }
-)
-
+#: WP-31: the PREREG v3 §5 residual vocabulary is EXTRACTED to
+#: `breezy.persistence.residual_fills` so `src/` consumers (which cannot
+#: import a script) share this module's definition rather than copying it.
+#: Re-exported here unchanged: every existing
+#: `from score_live_trials import RESIDUAL_EXCLUSION_REASONS` import site,
+#: and this module's own uses, are byte-identical.
 
 @dataclass(frozen=True, slots=True, kw_only=True)
 class FillExclusion:

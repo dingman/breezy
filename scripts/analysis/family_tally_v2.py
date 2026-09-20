@@ -69,12 +69,11 @@ from __future__ import annotations
 import argparse
 import json
 import logging
-import re
 import sys
 from collections import defaultdict
 from collections.abc import Sequence
 from dataclasses import dataclass
-from decimal import Decimal, InvalidOperation
+from decimal import Decimal
 from pathlib import Path
 from typing import Final, cast
 
@@ -92,9 +91,15 @@ from score_live_trials import (
 )
 from structural_dead_stop import StructuralDeadVerdict, structural_dead
 
-from breezy.domain.instrument_leg import base_symbol_of, leg_of_symbol, symbol_of_instrument_id
 from breezy.persistence.family_manifest import FamilyManifest, load_family_manifest
 from breezy.persistence.gs_boundary_artefact import BoundaryArtefact, load_boundary_artefact
+from breezy.persistence.realized_draws import stratum_row_from_scored_trial
+from breezy.persistence.residual_fills import (
+    EXCLUDED_FILLS_FILENAME,
+    ExcludedFill,
+    ExcludedFillsMalformed,
+)
+from breezy.persistence.residual_fills import read_excluded_fills as _read_excluded_fills
 from breezy.persistence.scored_trial_store import SCORED_TRIAL_SCHEMA, read_scored_trials
 from breezy.settlement.current_rung_hold_v2 import (
     CombinedDraw,
@@ -188,44 +193,13 @@ class ProvenanceRefusal(ScoredTrialDataIntegrityError):
     `"paper_replay"`)."""
 
 
-#: I3c (`docs/plans/LIVE_FILL_SCORING_CHAIN_2026-09-05.md` 3.0(c)): the
-#: driver-local `FillExclusion`'s 8-key artefact line, read back here.
-_EXCLUDED_FILLS_FILENAME: Final[str] = "excluded_fills.jsonl"
-_EXCLUDED_FILL_KEYS: Final[tuple[str, ...]] = (
-    "trial_id",
-    "station",
-    "climate_day",
-    "venue_order_id",
-    "qty",
-    "reason",
-    "filled_at_ns",
-    "scored_run_utc",
-)
-#: 3.0(g): `YYYY-MM-DDTHH:MM:SSZ`, UTC and lexically sortable.
-_SCORED_RUN_UTC_RE: Final[re.Pattern[str]] = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$")
-#: shape only (mirrors `_SCORED_RUN_UTC_RE`'s non-calendar-validating style).
-_CLIMATE_DAY_RE: Final[re.Pattern[str]] = re.compile(r"^\d{4}-\d{2}-\d{2}$")
-#: 3.0(c)/I2 BLOCK-3: the sole reason for which `trial_id`/`station`/
-#: `climate_day` may be blank -- a fill whose instrument never reached a
-#: taken latch has no trial identity yet.
-_NO_TAKEN_LATCH_REASON: Final[str] = "no_taken_latch"
-
-
-@dataclass(frozen=True, slots=True, kw_only=True)
-class ExcludedFill:
-    """One line of `<store_dir>/excluded_fills.jsonl` (I3c, 3.0(c)) --
-    driver-local, never a `ScoreRefusal` (that struct carries only
-    `trial_id, reason, detail` and is v1-BINDING inside the AST-pure
-    `settlement` package)."""
-
-    trial_id: str
-    station: str
-    climate_day: str
-    venue_order_id: str
-    qty: Decimal
-    reason: str
-    filled_at_ns: int
-    scored_run_utc: str
+#: WP-31: the `excluded_fills.jsonl` reader and its PREREG v3 §5 residual
+#: vocabulary are EXTRACTED to `breezy.persistence.residual_fills` so `src/`
+#: consumers (which cannot import a script) share ONE definition rather than
+#: copying it. Re-exported unchanged -- `ExcludedFill`, `read_excluded_fills`
+#: and every refusal message are byte-identical, and this module's public
+#: `__all__` surface is unchanged.
+_EXCLUDED_FILLS_FILENAME: Final[str] = EXCLUDED_FILLS_FILENAME
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
@@ -394,39 +368,11 @@ def _assert_live_provenance(store_dir: Path) -> None:
         )
 
 
-def _stratum_row(trial: ScoredTrial) -> StratumRow:
-    """`side`/`rung` are DERIVED from `trial.instrument_id` (S5 Track D
-    fix-first review, plan NO_SIDE_EDGE_2026-09-14 S6a, R3-5 item i) --
-    never read via `getattr` on a dormant attribute `ScoredTrial`'s
-    17-column schema does not carry (that was the CRITICAL bug: every real
-    trial silently reported `side="yes"`/`rung=None`, folding a genuine NO
-    trial in as YES). `instrument_id` is a plain `str` (in production
-    `str(InstrumentId)`, `"<symbol>.<VENUE>"`; legacy fixtures use a bare
-    symbol) -- `symbol_of_instrument_id` strips the optional `.VENUE`
-    suffix, `leg_of_symbol`/`base_symbol_of` read the `^no` composite
-    suffix, matching `breezy.adapters.polymarket_us.symbology.leg_of`/
-    `base_slug_of` byte-for-byte (contract test:
-    `test_instrument_leg_layer_agreement_contract.py`).
-
-    `held` is passed through UNCHANGED: `score_trial`
-    (`breezy.settlement.trial_scorer`) already inverts it for a NO leg
-    (`held = 1{HIGH ∉ r}`), so this function must never invert it a second
-    time -- the inversion is applied EXACTLY ONCE, end to end.
-
-    `rung` is the market's own base venue slug, recovered off EITHER leg's
-    instrument id -- a YES/NO pair shares one rung slug but has two
-    distinct instrument ids.
-    """
-    symbol = symbol_of_instrument_id(trial.instrument_id)
-    side = leg_of_symbol(symbol)
-    return StratumRow(
-        entry_ask=trial.entry_ask,
-        fee=trial.fee,
-        held=trial.held,
-        station=trial.station,
-        side=side,
-        rung=base_symbol_of(symbol),
-    )
+#: WP-31: ONE definition, extracted to `breezy.persistence.realized_draws`
+#: so the realized-outcome loader and this tally build the SAME `StratumRow`
+#: from a `ScoredTrial` -- side/rung derived from `instrument_id`, `held`
+#: passed through uninverted. Behaviour byte-unchanged.
+_stratum_row = stratum_row_from_scored_trial
 
 
 def _load_fill_order_index(store_dir: Path) -> dict[tuple[str, int], int]:
@@ -832,95 +778,16 @@ def _fmt_stratum_row(stratum: StratumV2) -> str:
 def read_excluded_fills(store_dir: Path) -> tuple[ExcludedFill, ...]:
     """Read `<store_dir>/excluded_fills.jsonl` (I3c, 3.0(c)).
 
-    An absent file returns no rows, never an error -- day one has none, not
-    a refusal. A malformed line (missing key, bad JSON, a `scored_run_utc`
-    not shaped `YYYY-MM-DDTHH:MM:SSZ`, a non-decimal `qty`, a blank
-    `venue_order_id`, a blank `trial_id`/`station`/`climate_day` for any
-    reason other than `no_taken_latch`, or a `climate_day` not shaped
-    `YYYY-MM-DD`) refuses the whole tally loudly.
+    Delegates to the ONE implementation
+    (`breezy.persistence.residual_fills.read_excluded_fills`, WP-31) and
+    re-raises its `ExcludedFillsMalformed` -- message verbatim -- as this
+    module's own `ScoredTrialDataIntegrityError`, so every caller's refusal
+    type and text are byte-unchanged by the extraction.
     """
-    path = store_dir / _EXCLUDED_FILLS_FILENAME
-    if not path.exists():
-        return ()
-    fills: list[ExcludedFill] = []
-    for lineno, line in enumerate(path.read_text(encoding="utf-8").splitlines(), start=1):
-        if not line.strip():
-            continue
-        fills.append(_excluded_fill_from_line(line, path=path, lineno=lineno))
-    return tuple(fills)
-
-
-def _excluded_fill_from_line(line: str, *, path: Path, lineno: int) -> ExcludedFill:
     try:
-        row = json.loads(line)
-    except json.JSONDecodeError as exc:
-        raise ScoredTrialDataIntegrityError(
-            f"refusing to tally: malformed {path}:{lineno} -- invalid JSON: {exc}"
-        ) from exc
-    missing = [key for key in _EXCLUDED_FILL_KEYS if key not in row]
-    if missing:
-        raise ScoredTrialDataIntegrityError(
-            f"refusing to tally: malformed {path}:{lineno} -- missing key(s) {missing!r}"
-        )
-    scored_run_utc = row["scored_run_utc"]
-    if not isinstance(scored_run_utc, str) or not _SCORED_RUN_UTC_RE.match(scored_run_utc):
-        raise ScoredTrialDataIntegrityError(
-            f"refusing to tally: malformed {path}:{lineno} -- scored_run_utc "
-            f"{scored_run_utc!r} is not YYYY-MM-DDTHH:MM:SSZ"
-        )
-    try:
-        qty = Decimal(str(row["qty"]))
-    except (InvalidOperation, TypeError) as exc:
-        raise ScoredTrialDataIntegrityError(
-            f"refusing to tally: malformed {path}:{lineno} -- non-decimal qty {row['qty']!r}"
-        ) from exc
-    try:
-        filled_at_ns = int(row["filled_at_ns"])
-    except (TypeError, ValueError) as exc:
-        raise ScoredTrialDataIntegrityError(
-            f"refusing to tally: malformed {path}:{lineno} -- non-integer filled_at_ns "
-            f"{row['filled_at_ns']!r}"
-        ) from exc
-    reason = row["reason"]
-    if not isinstance(reason, str) or not reason:
-        raise ScoredTrialDataIntegrityError(
-            f"refusing to tally: malformed {path}:{lineno} -- empty/non-string reason"
-        )
-    venue_order_id = row["venue_order_id"]
-    if not isinstance(venue_order_id, str) or not venue_order_id:
-        raise ScoredTrialDataIntegrityError(
-            f"refusing to tally: malformed {path}:{lineno} -- empty/non-string venue_order_id"
-        )
-    trial_id = row["trial_id"]
-    station = row["station"]
-    climate_day = row["climate_day"]
-    if reason != _NO_TAKEN_LATCH_REASON:
-        for field_name, value in (
-            ("trial_id", trial_id),
-            ("station", station),
-            ("climate_day", climate_day),
-        ):
-            if not isinstance(value, str) or not value:
-                raise ScoredTrialDataIntegrityError(
-                    f"refusing to tally: malformed {path}:{lineno} -- empty/non-string "
-                    f"{field_name} (reason {reason!r} requires it; only "
-                    f"{_NO_TAKEN_LATCH_REASON!r} may leave it blank)"
-                )
-    if climate_day and (not isinstance(climate_day, str) or not _CLIMATE_DAY_RE.match(climate_day)):
-        raise ScoredTrialDataIntegrityError(
-            f"refusing to tally: malformed {path}:{lineno} -- climate_day "
-            f"{climate_day!r} is not YYYY-MM-DD"
-        )
-    return ExcludedFill(
-        trial_id=trial_id,
-        station=station,
-        climate_day=climate_day,
-        venue_order_id=venue_order_id,
-        qty=qty,
-        reason=reason,
-        filled_at_ns=filled_at_ns,
-        scored_run_utc=scored_run_utc,
-    )
+        return _read_excluded_fills(store_dir)
+    except ExcludedFillsMalformed as exc:
+        raise ScoredTrialDataIntegrityError(str(exc)) from exc
 
 
 def _dedup_excluded_fills_by_venue_order_id(
