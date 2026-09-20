@@ -10,6 +10,7 @@ from breezy.persistence.archive_cache import (
     count_rows,
     iem_asos_1min_request,
     iem_mos_request,
+    iem_mos_window_request,
 )
 
 __all__ = [
@@ -20,4 +21,5 @@ __all__ = [
     "count_rows",
     "iem_asos_1min_request",
     "iem_mos_request",
+    "iem_mos_window_request",
 ]

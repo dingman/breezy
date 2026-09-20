@@ -424,3 +424,266 @@ def test_the_cli_refuses_a_real_run_without_the_live_unlock(
     )
 
     assert code == 2
+
+
+# --------------------------------------------------------------------------
+# 7. Explicit date-window mode (WP-7): one entry per (station, window).
+#
+# The year plan claims a whole calendar year, so it can never reach an
+# unfinished year. The window mode is the additive answer: the cache key
+# hashes the EXACT window, so re-running an identical window is a zero-request
+# no-op while extending the end is a different key that fetches fresh.
+# --------------------------------------------------------------------------
+
+WINDOW_START: Final[str] = "2026-08-25"
+WINDOW_END: Final[str] = "2026-09-21"  # EXCLUSIVE
+
+
+def _window_plan(cli: ModuleType, *, stations: tuple[str, ...] = ("KMIA",)) -> Any:
+    import datetime as dt
+
+    return cli.build_window_plan(
+        stations=stations,
+        start=dt.date.fromisoformat(WINDOW_START),
+        end=dt.date.fromisoformat(WINDOW_END),
+        model="NBS",
+    )
+
+
+def test_a_windowed_entry_is_a_window_claim_not_a_year_claim(cli: ModuleType) -> None:
+    import datetime as dt
+
+    from breezy.persistence.archive_request import iem_mos_window_request
+
+    windowed = iem_mos_window_request(
+        "KMIA", dt.date.fromisoformat(WINDOW_START), dt.date.fromisoformat(WINDOW_END), "NBS"
+    )
+    year = iem_mos_request("KMIA", 2026, "NBS")
+
+    assert windowed.cache_key() != year.cache_key()
+    assert windowed.source == year.source
+    assert windowed.product == year.product
+    assert windowed.window_start > year.window_start
+    assert windowed.window_end < year.window_end
+
+
+def test_an_identical_window_is_the_same_key_and_an_extended_one_is_not(
+    cli: ModuleType,
+) -> None:
+    """Resumability and correctness for an ONGOING period, with no refresh concept."""
+    import datetime as dt
+
+    from breezy.persistence.archive_request import iem_mos_window_request
+
+    start = dt.date.fromisoformat(WINDOW_START)
+    same_a = iem_mos_window_request("KMIA", start, dt.date.fromisoformat(WINDOW_END), "NBS")
+    same_b = iem_mos_window_request("KMIA", start, dt.date.fromisoformat(WINDOW_END), "NBS")
+    extended = iem_mos_window_request("KMIA", start, dt.date(2026, 9, 28), "NBS")
+
+    assert same_a.cache_key() == same_b.cache_key()
+    assert extended.cache_key() != same_a.cache_key()
+
+
+def test_a_windowed_url_carries_the_exact_window_the_manifest_records(
+    cli: ModuleType,
+) -> None:
+    item = _window_plan(cli)[0]
+    sts, ets = cli.window_bounds(item)
+
+    assert (sts, ets) == ("2026-08-25T00:00Z", "2026-09-20T23:59Z")
+    query = parse_qs(urlsplit(_transport(cli)._mos_url("KMIA", "NBS", sts, ets)).query)
+    assert query["sts"] == [sts] and query["ets"] == [ets]
+
+
+def test_a_whole_calendar_year_window_is_refused_as_a_year_claim(cli: ModuleType) -> None:
+    import datetime as dt
+
+    with pytest.raises(ValueError):
+        cli.build_window_plan(
+            stations=("KMIA",), start=dt.date(2021, 1, 1), end=dt.date(2022, 1, 1), model="NBS"
+        )
+
+
+def test_an_end_at_or_before_the_start_is_refused(cli: ModuleType) -> None:
+    import datetime as dt
+
+    with pytest.raises(ValueError):
+        cli.build_window_plan(
+            stations=("KMIA",), start=dt.date(2026, 9, 1), end=dt.date(2026, 9, 1), model="NBS"
+        )
+
+
+def test_the_window_plan_is_station_major_and_one_item_per_station(cli: ModuleType) -> None:
+    plan = _window_plan(cli, stations=("KMIA", "KSFO"))
+
+    assert [item.station for item in plan] == ["KMIA", "KSFO"]
+    assert all(item.model == "NBS" for item in plan)
+    assert plan[0].label == "KMIA 2026-08-25..2026-09-21 NBS"
+
+
+def test_a_zero_row_windowed_response_fails_and_is_never_cached(
+    cli: ModuleType, tmp_path: Path, three_letter_zero_rows: bytes
+) -> None:
+    """HTTP 200 is not coverage in window mode either (the negative control)."""
+    root = _durable_root(tmp_path)
+    plan = _window_plan(cli)
+
+    def fetch(request: Any) -> bytes:
+        cli.validate_payload(three_letter_zero_rows, station="KMIA", model="NBS")
+        return three_letter_zero_rows
+
+    report = cli.run_backfill(
+        cache=ArchiveCache(root=root, fetch=fetch, clock=_Clock()),
+        plan=plan,
+        progress=lambda _: None,
+    )
+
+    assert report.fetched == 0
+    assert [outcome.label for outcome in report.failed] == [
+        "KMIA 2026-08-25..2026-09-21 NBS"
+    ]
+    assert ArchiveCache(root=root, fetch=fetch, clock=_Clock()).missing(
+        cli.request_for(plan[0])
+    )
+
+
+def test_re_running_the_identical_window_spends_no_request(
+    cli: ModuleType, tmp_path: Path, nbs_day: bytes
+) -> None:
+    root = _durable_root(tmp_path)
+    calls: list[str] = []
+
+    def fetch(request: Any) -> bytes:
+        calls.append(request.cache_key())
+        return nbs_day
+
+    plan = _window_plan(cli)
+    first = cli.run_backfill(
+        cache=ArchiveCache(root=root, fetch=fetch, clock=_Clock()),
+        plan=plan,
+        progress=lambda _: None,
+    )
+    second = cli.run_backfill(
+        cache=ArchiveCache(root=root, fetch=fetch, clock=_Clock()),
+        plan=plan,
+        progress=lambda _: None,
+    )
+
+    assert first.fetched == 1
+    assert second.fetched == 0 and second.skipped == 1
+    assert len(calls) == 1
+
+
+def test_an_extended_window_is_a_fresh_fetch_beside_the_shorter_one(
+    cli: ModuleType, tmp_path: Path, nbs_day: bytes
+) -> None:
+    import datetime as dt
+
+    root = _durable_root(tmp_path)
+    calls: list[str] = []
+
+    def fetch(request: Any) -> bytes:
+        calls.append(request.cache_key())
+        return nbs_day
+
+    short = _window_plan(cli)
+    longer = cli.build_window_plan(
+        stations=("KMIA",),
+        start=dt.date.fromisoformat(WINDOW_START),
+        end=dt.date(2026, 9, 28),
+        model="NBS",
+    )
+    cli.run_backfill(
+        cache=ArchiveCache(root=root, fetch=fetch, clock=_Clock()),
+        plan=short,
+        progress=lambda _: None,
+    )
+    second = cli.run_backfill(
+        cache=ArchiveCache(root=root, fetch=fetch, clock=_Clock()),
+        plan=longer,
+        progress=lambda _: None,
+    )
+
+    assert second.fetched == 1
+    assert len(calls) == 2 and calls[0] != calls[1]
+
+
+def test_the_window_report_json_names_the_window_field(
+    cli: ModuleType, tmp_path: Path, nbs_day: bytes
+) -> None:
+    import json
+
+    report = cli.run_backfill(
+        cache=ArchiveCache(
+            root=_durable_root(tmp_path), fetch=lambda request: nbs_day, clock=_Clock()
+        ),
+        plan=_window_plan(cli),
+        progress=lambda _: None,
+    )
+    payload = json.loads(cli.report_to_json(report))
+
+    assert payload["outcomes"][0]["window"] == "2026-08-25..2026-09-21"
+    assert payload["outcomes"][0]["year"] is None
+    assert payload["outcomes"][0]["model"] == "NBS"
+
+
+def test_the_cli_refuses_a_date_window_mixed_with_the_year_plan(
+    cli: ModuleType, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("BREEZY_LIVE", "1")
+    monkeypatch.setenv("BREEZY_USER_AGENT", TEST_UA)
+    code = cli.main(
+        [
+            "--cache-root",
+            str(_durable_root(tmp_path)),
+            "--stations",
+            "KMIA",
+            "--through-year",
+            "2021",
+            "--start",
+            WINDOW_START,
+            "--end",
+            WINDOW_END,
+            "--dry-run",
+        ]
+    )
+
+    assert code == 2
+
+
+def test_the_cli_refuses_a_start_without_an_end(
+    cli: ModuleType, tmp_path: Path
+) -> None:
+    code = cli.main(
+        [
+            "--cache-root",
+            str(_durable_root(tmp_path)),
+            "--start",
+            WINDOW_START,
+            "--dry-run",
+        ]
+    )
+
+    assert code == 2
+
+
+def test_the_cli_dry_run_plans_one_request_per_station_in_window_mode(
+    cli: ModuleType, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    code = cli.main(
+        [
+            "--cache-root",
+            str(_durable_root(tmp_path)),
+            "--stations",
+            "KMIA",
+            "KSFO",
+            "--start",
+            WINDOW_START,
+            "--end",
+            WINDOW_END,
+            "--dry-run",
+        ]
+    )
+
+    assert code == 0
+    assert "2026-08-25..2026-09-21" in capsys.readouterr().err

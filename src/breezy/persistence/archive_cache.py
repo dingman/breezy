@@ -236,6 +236,70 @@ def iem_mos_request(station: str, year: int, model: str) -> ArchiveRequest:
     )
 
 
+def iem_mos_window_request(
+    station: str, start: dt.date, end: dt.date, model: str
+) -> ArchiveRequest:
+    """One station-WINDOW of one MOS model. ``end`` is EXCLUSIVE.
+
+    The whole-year factory above claims a calendar year, so it can never be
+    aimed at a year that has not finished. This factory is the additive answer
+    for an ONGOING period: the entry claims exactly the requested range and
+    nothing more.
+
+    The cache key hashes ``window_start``/``window_end``, so the window is part
+    of the identity. Consequences, and they are the point:
+
+    * re-running the IDENTICAL window resolves to the SAME key -- a hit, zero
+      requests, which is what makes the job resumable; and
+    * extending ``end`` by even one day is a DIFFERENT key, so it fetches the
+      longer range fresh rather than being masked by a shorter entry that has
+      no way to describe itself as incomplete.
+
+    There is therefore no "refreshable entry" concept and no partial-year
+    claim: a window entry is never a year claim, and a request that would span
+    exactly one calendar year is REFUSED rather than silently minted as one.
+
+    The recorded bounds are the bounds the URL carries: ``[start 00:00Z,
+    (end - 1 day) 23:59Z]``, the same inclusive-minute convention the
+    station-year window uses, so consecutive windows stay disjoint.
+    """
+    for name, value in (("start", start), ("end", end)):
+        if isinstance(value, dt.datetime) or not isinstance(value, dt.date):
+            raise TypeError(f"{name} must be a datetime.date (not a datetime), was {value!r}")
+    if end <= start:
+        raise ValueError(f"end {end} must be after start {start} (end is exclusive)")
+    if (
+        start.month == 1
+        and start.day == 1
+        and end.month == 1
+        and end.day == 1
+        and end.year == start.year + 1
+    ):
+        raise ValueError(
+            f"the window {start}..{end} spans exactly the calendar year {start.year}; "
+            "use the whole-year plan for that -- a window entry is never a year claim"
+        )
+    product = IEM_MOS_MODEL_PRODUCTS.get(model)
+    if product is None:
+        raise ValueError(
+            f"unknown MOS model {model!r}; the closed set is "
+            f"{sorted(IEM_MOS_MODEL_PRODUCTS)} -- refused rather than sanitised"
+        )
+    window_start = dt.datetime(start.year, start.month, start.day, tzinfo=dt.UTC)
+    last_day = end - dt.timedelta(days=1)
+    window_end = dt.datetime(
+        last_day.year, last_day.month, last_day.day, 23, 59, tzinfo=dt.UTC
+    )
+    return ArchiveRequest(
+        source=IEM_MOS_SOURCE,
+        station=station,
+        product=product,
+        window_start=int(window_start.timestamp()) * 1_000_000_000,
+        window_end=int(window_end.timestamp()) * 1_000_000_000,
+        model=model,
+    )
+
+
 def fsync_directory(path: Path) -> None:
     fd = os.open(path, os.O_RDONLY | os.O_DIRECTORY)
     try:

@@ -105,6 +105,7 @@ from breezy.persistence.archive_request import (
     IEM_MOS_MODEL_PRODUCTS,
     IEM_MOS_SOURCE,
     iem_mos_request,
+    iem_mos_window_request,
 )
 
 _VENUE_SCRIPTS = Path(__file__).resolve().parents[1] / "venue"
@@ -137,11 +138,13 @@ __all__ = [
     "ModelMismatchError",
     "ModelMixError",
     "StationMismatchError",
+    "StationWindow",
     "StationYear",
     "StationYearOutcome",
     "assert_durable_cache_root",
     "build_pacer",
     "build_plan",
+    "build_window_plan",
     "default_cache_root",
     "last_complete_year",
     "main",
@@ -236,25 +239,72 @@ class StationYear:
     model: str
 
     @property
+    def window_label(self) -> str | None:
+        """A year item makes a YEAR claim, never a window claim."""
+        return None
+
+    @property
     def label(self) -> str:
         return f"{self.station} {self.year} {self.model}"
 
 
 @dataclass(frozen=True, slots=True)
-class StationYearOutcome:
-    """What a station-year did. Statistics only -- never a payload."""
+class StationWindow:
+    """One unit of work: one station, one explicit date window, one model.
+
+    ``end`` is EXCLUSIVE. This item claims exactly its own range -- never a
+    calendar year -- and the window is part of the cache key, so an identical
+    re-run is a hit and an extended window is a different key (see
+    :func:`breezy.persistence.archive_cache.iem_mos_window_request`).
+    """
 
     station: str
-    year: int
+    start: dt.date
+    end: dt.date
+    model: str
+
+    @property
+    def year(self) -> int | None:
+        """A window item makes no year claim; the outcome records `None`."""
+        return None
+
+    @property
+    def window_label(self) -> str:
+        return f"{self.start.isoformat()}..{self.end.isoformat()}"
+
+    @property
+    def label(self) -> str:
+        return f"{self.station} {self.window_label} {self.model}"
+
+
+#: Either unit of work. Both carry `station`, `model`, `year`, `window_label`
+#: and `label`, so the run loop never branches on which one it has.
+WorkItem = StationYear | StationWindow
+
+
+@dataclass(frozen=True, slots=True)
+class StationYearOutcome:
+    """What one work item did. Statistics only -- never a payload.
+
+    `year` is `None` and `window` carries the range for a date-window item;
+    `window` is `None` and `year` carries the year for a station-year item.
+    Exactly one of the two is set, so an entry always says which claim it makes.
+    """
+
+    station: str
+    year: int | None
     model: str
     status: str
     rows: int
     bytes: int
     sha256: str
     detail: str
+    window: str | None = None
 
     @property
     def label(self) -> str:
+        if self.window is not None:
+            return f"{self.station} {self.window} {self.model}"
         return f"{self.station} {self.year} {self.model}"
 
 
@@ -334,8 +384,10 @@ def refuse_model_mix(models: Iterable[str]) -> str:
     return distinct[0]
 
 
-def request_for(item: StationYear) -> ArchiveRequest:
-    """Build the archive request for a station-year; the model is in the key."""
+def request_for(item: WorkItem) -> ArchiveRequest:
+    """Build the archive request for a work item; the model is in the key."""
+    if isinstance(item, StationWindow):
+        return iem_mos_window_request(item.station, item.start, item.end, item.model)
     return iem_mos_request(item.station, item.year, item.model)
 
 
@@ -361,7 +413,33 @@ def build_plan(
     )
 
 
-def window_bounds(item: StationYear) -> tuple[str, str]:
+def build_window_plan(
+    *,
+    stations: Sequence[str] = STATIONS,
+    start: dt.date,
+    end: dt.date,
+    model: str = DEFAULT_MODEL,
+) -> tuple[StationWindow, ...]:
+    """Station-major work plan over ONE explicit date window (``end`` exclusive).
+
+    Mutually exclusive with the whole-year plan and deliberately additive to
+    it: one item -- one request -- one cache entry per (station, window). The
+    window is validated here by minting the request, so an end at or before the
+    start, or a range that spans exactly one calendar year, is refused before a
+    single request is planned.
+    """
+    if model not in MODELS:
+        raise ValueError(f"unknown model {model!r}; the closed set is {sorted(MODELS)}")
+    unknown = [station for station in stations if station not in STATIONS]
+    if unknown:
+        raise ValueError(f"station(s) {unknown} are not in the closed set {list(STATIONS)}")
+    plan = tuple(StationWindow(station, start, end, model) for station in stations)
+    for item in plan:
+        request_for(item)  # refuses a bad window before any work is planned
+    return plan
+
+
+def window_bounds(item: WorkItem) -> tuple[str, str]:
     """The `sts`/`ets` the URL carries, derived from the cache request itself."""
     request = request_for(item)
     start = dt.datetime.fromtimestamp(request.window_start / _NANOSECONDS_PER_SECOND, tz=dt.UTC)
@@ -491,7 +569,7 @@ class IemMosBackfillTransport(IemMosProbeTransport):
 def run_backfill(
     *,
     cache: ArchiveCache,
-    plan: Sequence[StationYear],
+    plan: Sequence[WorkItem],
     progress: Callable[[str], None],
     dry_run: bool = False,
 ) -> BackfillReport:
@@ -517,6 +595,7 @@ def run_backfill(
             outcome = StationYearOutcome(
                 station=item.station,
                 year=item.year,
+                window=item.window_label,
                 model=item.model,
                 status=STATUS_SKIPPED,
                 rows=0,
@@ -534,6 +613,7 @@ def run_backfill(
                 StationYearOutcome(
                     station=item.station,
                     year=item.year,
+                    window=item.window_label,
                     model=item.model,
                     status=STATUS_WOULD_FETCH,
                     rows=0,
@@ -554,6 +634,7 @@ def run_backfill(
             outcome = StationYearOutcome(
                 station=item.station,
                 year=item.year,
+                window=item.window_label,
                 model=item.model,
                 status=STATUS_FAILED,
                 rows=0,
@@ -575,6 +656,7 @@ def run_backfill(
             StationYearOutcome(
                 station=item.station,
                 year=item.year,
+                window=item.window_label,
                 model=item.model,
                 status=STATUS_FETCHED,
                 rows=rows,
@@ -603,7 +685,7 @@ def render_summary(report: BackfillReport) -> str:
     lines = [
         f"{mode} model={report.model} product={IEM_MOS_MODEL_PRODUCTS[report.model]}",
         (
-            f"  station-years: {len(report.outcomes)} planned, "
+            f"  items: {len(report.outcomes)} planned, "
             f"{report.would_fetch} to fetch, {report.fetched} fetched, "
             f"{report.skipped} already covered, {len(report.failed)} failed"
         ),
@@ -621,12 +703,12 @@ def render_summary(report: BackfillReport) -> str:
             if outcome.status == STATUS_WOULD_FETCH
         )
     if report.failed:
-        lines.append("  FAILED station-years (NOT covered; re-run to retry):")
+        lines.append("  FAILED items (NOT covered; re-run to retry):")
         lines.extend(
             f"    {STATUS_FAILED} {outcome.label}: {outcome.detail}" for outcome in report.failed
         )
     else:
-        lines.append("  no failed station-years")
+        lines.append("  no failed items")
     return "\n".join(lines) + "\n"
 
 
@@ -647,6 +729,7 @@ def _outcome_to_json(outcome: StationYearOutcome) -> dict[str, Any]:
         "bytes": outcome.bytes,
         "sha256": outcome.sha256,
         "detail": outcome.detail,
+        "window": outcome.window,
     }
 
 
@@ -676,8 +759,13 @@ def _parse_args(argv: Sequence[str]) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__, add_help=True)
     parser.add_argument("--cache-root", default=None)
     parser.add_argument("--stations", nargs="+", default=list(STATIONS))
-    parser.add_argument("--first-year", type=int, default=FIRST_YEAR)
+    parser.add_argument("--first-year", type=int, default=None)
     parser.add_argument("--through-year", type=int, default=None)
+    # Date-window mode. Mutually exclusive with the whole-year plan above:
+    # `--end` is EXCLUSIVE and the pair produces ONE entry per (station,
+    # window), never a partial-year claim.
+    parser.add_argument("--start", default=None)
+    parser.add_argument("--end", default=None)
     parser.add_argument("--model", choices=sorted(MODELS), default=DEFAULT_MODEL)
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--apply", action="store_true")
@@ -709,7 +797,7 @@ class _WallClock:
 def _make_fetch(
     transport: IemMosBackfillTransport,
     runner: asyncio.Runner,
-    plan_by_key: dict[str, StationYear],
+    plan_by_key: dict[str, WorkItem],
 ) -> Callable[[ArchiveRequest], bytes]:
     def fetch(request: ArchiveRequest) -> bytes:
         item = plan_by_key[request.cache_key()]
@@ -737,27 +825,58 @@ def main(argv: Sequence[str] | None = None) -> int:
         return _refuse(str(exc))
 
     clock = time.time_ns
-    through_year = args.through_year if args.through_year is not None else last_complete_year(clock)
-    try:
-        plan = build_plan(
-            stations=tuple(args.stations),
-            first_year=args.first_year,
-            through_year=through_year,
-            model=args.model,
+    windowed = args.start is not None or args.end is not None
+    plan: tuple[WorkItem, ...]
+    if windowed:
+        if args.start is None or args.end is None:
+            return _refuse("--start and --end are a pair: supply both or neither")
+        if args.first_year is not None or args.through_year is not None:
+            return _refuse(
+                "--start/--end name an explicit date window and are mutually exclusive "
+                "with the whole-year plan (--first-year/--through-year). A window entry "
+                "is never a year claim, so the two modes are never mixed in one run."
+            )
+        try:
+            start_date = dt.date.fromisoformat(args.start)
+            end_date = dt.date.fromisoformat(args.end)
+        except ValueError as exc:
+            return _refuse(f"--start/--end must be YYYY-MM-DD: {exc}")
+        try:
+            plan = build_window_plan(
+                stations=tuple(args.stations),
+                start=start_date,
+                end=end_date,
+                model=args.model,
+            )
+        except (TypeError, ValueError) as exc:
+            return _refuse(str(exc))
+        scope = f"{', '.join(args.stations)} {start_date}..{end_date} (end exclusive)"
+    else:
+        first_year = args.first_year if args.first_year is not None else FIRST_YEAR
+        through_year = (
+            args.through_year if args.through_year is not None else last_complete_year(clock)
         )
-    except ValueError as exc:
-        return _refuse(str(exc))
+        try:
+            plan = build_plan(
+                stations=tuple(args.stations),
+                first_year=first_year,
+                through_year=through_year,
+                model=args.model,
+            )
+        except ValueError as exc:
+            return _refuse(str(exc))
+        scope = f"{', '.join(args.stations)} {first_year}..{through_year}"
 
     if not args.dry_run:
         if os.environ.get(LIVE_ENV_VAR) != "1":
             return _refuse(
                 f"{LIVE_ENV_VAR}=1 is required before this job may dispatch any request. "
-                f"Planned station-years: {len(plan)} (one request each). "
+                f"Planned items: {len(plan)} (one request each). "
                 "Run with --dry-run first."
             )
         if not args.apply:
             return _refuse(
-                f"--apply is required for a real run. Planned station-years: {len(plan)}."
+                f"--apply is required for a real run. Planned items: {len(plan)}."
             )
         if not os.environ.get(USER_AGENT_ENV_VAR):
             return _refuse(f"{USER_AGENT_ENV_VAR} must name a monitored contact.")
@@ -768,9 +887,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         return _refuse(str(exc))
 
     _stderr(
-        f"IEM MOS backfill: {len(plan)} station-years planned "
-        f"({', '.join(args.stations)} {args.first_year}..{through_year}, "
-        f"model={args.model}) into {root}"
+        f"IEM MOS backfill: {len(plan)} item(s) planned "
+        f"({scope}, model={args.model}) into {root}"
     )
 
     if args.dry_run:
