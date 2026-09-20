@@ -29,6 +29,7 @@ from pathlib import Path
 from typing import Any, ClassVar
 
 import pytest
+from nautilus_trader.common.component import TestClock
 from nautilus_trader.core.uuid import UUID4
 from nautilus_trader.model.enums import OrderSide, OrderType, TimeInForce, TradingState
 from nautilus_trader.model.events import OrderInitialized
@@ -184,6 +185,13 @@ class _FakeKernel:
         self.cache = self.cache_type()
         self.msgbus = _FakeMsgBus()
         self.risk_engine = _FakeRiskEngine()
+        # WP-B2 widens the slice the guards read by one attribute: the
+        # kernel's own clock, which `_run_node` hands the order guard so a
+        # lapsed `OrderSubmissionPermit` is refused at submit. A REAL
+        # Nautilus `TestClock`, not a stub -- `NautilusKernel.clock` returns
+        # a `Clock` (`system/kernel.py`), and the point of this fake is to
+        # stand in for that slice faithfully.
+        self.clock = TestClock()
 
 
 class _FakeAccountlessKernel(_FakeKernel):

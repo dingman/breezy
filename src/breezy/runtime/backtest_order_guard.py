@@ -85,12 +85,15 @@ if TYPE_CHECKING:  # pragma: no cover - typing only
     from nautilus_trader.model.orders.base import Order
     from nautilus_trader.portfolio import Portfolio
 
+    from breezy.runtime.order_enablement import ClockLike, OrderSubmissionPermit
+
 logger = logging.getLogger(__name__)
 
 __all__ = [
     "ORDER_EVENT_TOPIC",
     "BacktestOrderGuard",
     "NakedShortRefusedError",
+    "PermitExpiredRefusedError",
     "PostOnlyRefusedError",
     "install_live_order_guard",
     "install_order_guard",
@@ -127,6 +130,41 @@ class NakedShortRefusedError(ValueError):
     """
 
 
+class PermitExpiredRefusedError(ValueError):
+    """The ``OrderSubmissionPermit`` authorising this order has LAPSED (WP-B2).
+
+    ``OrderSubmissionPermit.issue`` (``runtime/order_enablement.py``) tests
+    ``clock.timestamp_ns() > live_trading_permit.expires_at_ns`` only at MINT.
+    Once the permit object is held by a strategy, nothing re-checked expiry at
+    submit: the strategy-side gates ask only ``self._order_submission_permit
+    is not None``. The live permit is minted once at boot with a 10 h TTL
+    (``safety.PERMIT_TTL_NS``) and then lapses for ~14 h of every day while
+    the node runs healthy, with that gate still reading "granted".
+
+    Refused HERE, at the kernel chokepoint, rather than in each strategy
+    (plan ``POST_FORECAST_PHASE_2026-09-20.md`` §B-5): a per-strategy gate
+    violates DRY and a new strategy simply forgets it, while this guard's one
+    ``events.order.*`` subscription already covers every strategy in the run,
+    including one added after it was installed -- the same seam the long-only
+    (``allow_short = False``) rule uses.
+
+    DEFENCE IN DEPTH, NOT A REPLACEMENT. ``adapters.polymarket_us.safety.
+    assert_live_order_submission_permitted`` remains the AUTHORITATIVE expiry
+    check; it screens a different object (the ``LiveTradingPermit``, with its
+    authenticity tag and its single-use nonce registry) at the venue-egress
+    chokepoint, and nothing here may be read as making it redundant --
+    ``test_runtime_order_guard_permit_expiry.py::
+    test_the_exec_chokepoint_still_refuses_an_expired_permit_with_this_guard_passing``
+    pins that with this rule stubbed to pass.
+
+    This refusal NEVER extends, renews or re-mints anything. The 10 h TTL is a
+    deliberate operator-facing bound (``docs/plans/R8_OPERATOR_RUNBOOK.md``:
+    the union of the four decision windows plus slack, one process per trading
+    day); the correct response to this refusal is a new process, never a
+    longer permit.
+    """
+
+
 class BacktestOrderGuard:
     """Refuses two unmodellable order intents at the moment they are submitted.
 
@@ -151,10 +189,46 @@ class BacktestOrderGuard:
     which sum currently sees it (RED-20).
     """
 
-    def __init__(self, portfolio: Portfolio, cache: CacheFacade) -> None:
+    def __init__(
+        self,
+        portfolio: Portfolio,
+        cache: CacheFacade,
+        *,
+        order_submission_permit: OrderSubmissionPermit | None = None,
+        clock: ClockLike | None = None,
+    ) -> None:
+        """``order_submission_permit``/``clock`` are the WP-B2 expiry rule's
+        two inputs, and both default to absent.
+
+        Absent means the rule is INERT -- never consulted, because there is no
+        permit to consult. That is the correct reading in the two modes that
+        have no permit object at all: a BACKTEST (``install_order_guard``
+        grows no permit parameter, and ``ContinuousRungHoldBacktestStrategy``
+        keeps its permit-object-free private-flag override), and a live
+        SHADOW-mode boot (``orders_enabled_requested`` False, so
+        ``app.trade.main`` mints nothing). Manufacturing a synthetic
+        ``expires_at_ns`` for either would be inventing authority where none
+        exists.
+
+        ``clock`` is INJECTED, never sampled from a wall clock here, for the
+        same reason ``safety._read_clock`` refuses one: a second time source
+        is a second policy. In production this is ``node.kernel.clock`` -- the
+        Nautilus clock of the very node whose message bus publishes the events
+        screened below.
+        """
         self._portfolio = portfolio
         self._cache = cache
         self._shim: dict[ClientOrderId, tuple[InstrumentId, Decimal]] = {}
+        self._order_submission_permit = order_submission_permit
+        self._clock = clock
+        #: Refusals by class name, this process. A CLOSED set of exactly three
+        #: keys -- the three refusal classes this module raises -- never a
+        #: string composed from a value, so it cannot become an unbounded dict
+        #: keyed by market noise (the constraint
+        #: ``strategy.weather_common.refusals`` states for its own counter,
+        #: which is unreachable from here: ``runtime`` sits BELOW ``strategy``
+        #: in the import-linter layer contract).
+        self.refusal_counts: dict[str, int] = {}
 
     def on_order_event(self, event: Event) -> None:
         """Screen ``OrderInitialized``; ignore every other order event.
@@ -198,10 +272,67 @@ class BacktestOrderGuard:
             # unforgeable: `OrderFactory` cannot set it (see
             # `test_the_order_factory_cannot_set_the_reconciliation_flag`).
             return
-        self._refuse_post_only(event)
-        self._refuse_naked_short(event)
+        try:
+            # Authority BEFORE order shape: an order with no live authority is
+            # refused for that, not for being post-only -- otherwise the
+            # operator reads a fee-model complaint when the real fact is a
+            # lapsed permit. `_refuse_naked_short`'s `_shim` record runs only
+            # after every rule has passed, so refusing earlier leaves no entry
+            # behind (RED-24's ordering constraint, unchanged).
+            self._refuse_expired_permit(event)
+            self._refuse_post_only(event)
+            self._refuse_naked_short(event)
+        except (
+            PermitExpiredRefusedError,
+            PostOnlyRefusedError,
+            NakedShortRefusedError,
+        ) as exc:
+            # COUNTED, then re-raised unchanged. A silent refusal is how the
+            # 2026-09-17 fee-schedule halt hid for three days; the count is
+            # what lets "zero orders today" be told apart from "every order
+            # refused today". Counting here, once, rather than in each rule
+            # keeps the three rules pure raisers.
+            name = type(exc).__name__
+            self.refusal_counts[name] = self.refusal_counts.get(name, 0) + 1
+            raise
 
     # -- rules -------------------------------------------------------------
+
+    def _refuse_expired_permit(self, event: OrderInitialized) -> None:
+        """Refuse when the permit authorising this run has LAPSED (WP-B2).
+
+        Strict ``>``, exactly the comparison ``OrderSubmissionPermit.issue``
+        uses at mint, so the guard and the mint agree on the boundary instead
+        of inventing a second one: ``now == expires_at_ns`` is permitted at
+        mint and is permitted here.
+
+        Reads ``expires_at_ns`` and nothing else. Authenticity was established
+        at mint, at the one construction site B11 pins; re-deriving it here
+        would be a second issuer policy. The message names the failed
+        precondition and the two timestamps only -- never ``operator_id``,
+        never a cap, never any other permit field (L-22 shape).
+        """
+        permit = self._order_submission_permit
+        clock = self._clock
+        if permit is None or clock is None:
+            return
+        now_ns = clock.timestamp_ns()
+        if now_ns <= permit.expires_at_ns:
+            return
+        raise PermitExpiredRefusedError(
+            f"{event.client_order_id} on {event.instrument_id} was submitted under an "
+            f"order-submission permit that expired at {permit.expires_at_ns} ns; the "
+            f"node clock reads {now_ns} ns (lapsed "
+            f"{now_ns - permit.expires_at_ns} ns ago). The permit's expiry was checked "
+            f"ONLY at mint before WP-B2, so a node running past its 10h TTL kept "
+            f"submitting with a strategy-side gate that still read 'granted'. The "
+            f"permit is never extended, renewed or re-minted in-process: the TTL is a "
+            f"deliberate operator-facing bound of one process per trading day "
+            f"(`docs/plans/R8_OPERATOR_RUNBOOK.md`), so the correct response is a new "
+            f"process, never a longer permit. This refusal is DEFENCE IN DEPTH only -- "
+            f"`adapters.polymarket_us.safety.assert_live_order_submission_permitted` "
+            f"remains the authoritative expiry check at venue egress."
+        )
 
     def _refuse_post_only(self, event: OrderInitialized) -> None:
         if not event.post_only:
@@ -409,6 +540,9 @@ def install_live_order_guard(
     cache: CacheFacade,
     msgbus: MessageBus,
     on_refusal: Callable[[ValueError], None],
+    *,
+    order_submission_permit: OrderSubmissionPermit | None = None,
+    clock: ClockLike | None = None,
 ) -> BacktestOrderGuard:
     """Subscribe a :class:`BacktestOrderGuard` to a LIVE node's message bus.
 
@@ -442,15 +576,31 @@ def install_live_order_guard(
     re-raises, so the refusal still aborts exactly as it did before -- only
     reporting is added.
 
+    ``order_submission_permit`` and ``clock`` are WP-B2's two inputs, passed
+    straight through to :class:`BacktestOrderGuard`. Keyword-only and
+    defaulted to absent so a shadow-mode boot -- which mints no permit at all
+    -- installs exactly the guard it installed before, with the expiry rule
+    inert rather than satisfied. See the constructor for why absence is never
+    a synthetic permit.
+
     Returns the guard so a caller (and a test) can hold it; the node holds
     only the bound handler.
     """
-    guard = BacktestOrderGuard(portfolio, cache)
+    guard = BacktestOrderGuard(
+        portfolio,
+        cache,
+        order_submission_permit=order_submission_permit,
+        clock=clock,
+    )
 
     def _report_then_reraise(event: Event) -> None:
         try:
             guard.on_order_event(event)
-        except (PostOnlyRefusedError, NakedShortRefusedError) as exc:
+        except (
+            PermitExpiredRefusedError,
+            PostOnlyRefusedError,
+            NakedShortRefusedError,
+        ) as exc:
             try:
                 on_refusal(exc)
             except Exception:  # a broken reporter must not replace the cause

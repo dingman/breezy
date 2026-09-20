@@ -113,6 +113,7 @@ from breezy.runtime.settings import (
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
     from breezy.adapters.polymarket_us.config import PolymarketUSExecClientConfig
+    from breezy.runtime.order_enablement import OrderSubmissionPermit
     from breezy.runtime.settings import BreezyTradeSettings
 
 logger = logging.getLogger(__name__)
@@ -328,6 +329,7 @@ def _run_node(
     actors: Sequence[Actor] = (),
     strategies: Sequence[Strategy] = (),
     after_build: Callable[[Node], None] | None = None,
+    order_submission_permit: OrderSubmissionPermit | None = None,
 ) -> int:
     """Build, run and ALWAYS dispose the node. Never raises.
 
@@ -382,6 +384,17 @@ def _run_node(
     -- which gives the execution client's ``_submit_order`` a real body and
     removes the standing refusal that currently masks the fail-open -- cannot
     drop it by accident.
+
+    WP-B2 hands that SAME guard the ``order_submission_permit`` the composed
+    strategies were given, plus ``node.kernel.clock``, so a lapsed permit is
+    refused at the kernel chokepoint instead of only at mint. The clock is
+    the node's own Nautilus clock -- the one whose message bus publishes the
+    order events being screened -- never a wall clock, and never a second
+    clock object of this module's own. In shadow mode the permit is ``None``
+    and the rule is inert, so the installed guard is byte-identical to the
+    pre-WP-B2 one. This is DEFENCE IN DEPTH: ``adapters.polymarket_us.safety.
+    assert_live_order_submission_permitted`` stays the authoritative expiry
+    check at venue egress.
     """
     node: Node | None = None
     try:
@@ -402,6 +415,8 @@ def _run_node(
             node.kernel.cache,
             node.kernel.msgbus,
             on_refusal=_order_guard_reporter(stderr),
+            order_submission_permit=order_submission_permit,
+            clock=node.kernel.clock,
         )
         install_component_degraded_alert(
             node.kernel.msgbus,
@@ -456,6 +471,7 @@ def run(
     exec_client_config: PolymarketUSExecClientConfig | None = None,
     submit_veto: Callable[[], str | None] | None = None,
     exit_manifest: FamilyManifest | None = None,
+    order_submission_permit: OrderSubmissionPermit | None = None,
 ) -> int:
     """Load settings, build the node config, run the node, return an exit code.
 
@@ -520,6 +536,7 @@ def run(
             actors=actors,
             strategies=strategies,
             after_build=after_build,
+            order_submission_permit=order_submission_permit,
         )
     finally:
         uninstall_logging_bridge()

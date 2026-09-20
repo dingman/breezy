@@ -16,6 +16,7 @@ from typing import Any, ClassVar
 from unittest.mock import patch
 
 import pytest
+from nautilus_trader.common.component import TestClock
 from nautilus_trader.model.currencies import USD
 from nautilus_trader.model.enums import AssetClass
 from nautilus_trader.model.identifiers import InstrumentId, Symbol, Venue
@@ -182,6 +183,9 @@ class _FakeKernel:
         self.cache = _FakeGuardCache()
         self.msgbus = _FakeMsgBus()
         self.risk_engine = _FakeRiskEngine()
+        # WP-B2: `_run_node` reads `node.kernel.clock` and hands it to the
+        # order guard (see the same addition in `test_trade_cli.py`).
+        self.clock = TestClock()
 
 
 class _RecordingTrader:

@@ -305,6 +305,13 @@ def run(
                 exec_client_config=exec_client_config,
                 submit_veto=submit_veto,
                 exit_manifest=exit_manifest,
+                # WP-B2: the kernel order guard re-checks THIS permit's
+                # expiry at every submit. `sending_permit`, not
+                # `order_submission_permit`, because it is the object the
+                # composed strategies were actually given -- Phase 0 hands
+                # them `None`, and the guard must agree with them rather than
+                # enforce a permit nobody holds.
+                order_submission_permit=sending_permit,
             )
     except (
         SettingsError,
