@@ -114,3 +114,80 @@ correlations are computed over the same prior-day takes and are equally void.
   lands.
 - No fix may be evaluated on whether it recovers a positive number. A
   correctly-measured negative is the successful outcome of a falsification run.
+
+---
+
+## 8. AMENDMENT (same day) — the corrected result is a NON-DETECTION, not an absence
+
+§7 ruled "requirement 3 remains UNMET. The corrected measurement is negative."
+The first sentence stands. **The second was overstated and is corrected here.**
+
+**Power.** Per-take settlement PnL at a 0.10 ticket has
+sd ≈ √(0.1 × 0.9) ≈ 0.30 payout units. Over 73 clustered station-days,
+SE of the mean ≈ 0.30/√73 ≈ **0.035**. The study can therefore only detect an
+edge of roughly **≥ 0.07 per take**. This is corroborated independently by the
+corrected table's own CI half-widths (~0.072).
+
+A true edge of **0.01–0.03 per take — the entire plausible range implied by the
+measured forecast skill — is invisible to this study.** The six near-zero cells
+are a correctly-measured non-detection. They are NOT evidence that no edge
+exists.
+
+**Consequence.** Requirement 3 is **UNMET and UNDETERMINED**. It has not been
+refuted. Anyone reading §4 must read this amendment with it. The original text
+is preserved above unchanged.
+
+## 9. Why the takes are all in the cheap tail — a selector defect
+
+The screen is `edge = p_model − ask − fee(ask)`, take if `edge > 0`
+(`forecast_tape_screen.py:252`, `MIN_EDGE_FOR_TAKE = 0.0`). With a fixed
+zero threshold and a noisy `p_model`, the take set is **the argmax of model
+ERROR, not the argmax of model SKILL**. In the far tail a 0.03 absolute
+overstatement of `p_model` flips a rung from no-take to take; near the mode it
+does not. A fixed-absolute-edge rule therefore migrates every take into the
+cheap tail *regardless of where the skill actually lives*.
+
+So the observed "0.10 ask winning ~10%" coincidence is **weak** evidence of
+efficiency: it is exactly what a zero-information selector on a fairly-priced
+tail also produces. It says the tail is fairly priced *conditional on the rungs
+this screen chose*. It says nothing about mid-priced rungs, **which the screen
+never sampled.** L-7 (the forecast is already in the price) remains UNTESTED at
+the prices where it would matter.
+
+## 10. The fee is not what kills this
+
+Fee = ROUND_HALF_EVEN(0.0695 · p · (1−p), 2):
+
+| ask | raw fee | billed |
+|---|---|---|
+| 0.07 | 0.004524 | **0.00** |
+| 0.10 | 0.006255 | **0.01** |
+| 0.13 | 0.007861 | **0.01** |
+| 0.30 | 0.014595 | 0.01 |
+| 0.50 | 0.017375 | 0.02 |
+
+Crossover at p(1−p) = 0.005/0.0695 → **p ≈ 0.0777**; below that the fee rounds
+to zero. At the traded prices the fee hurdle is **0–1 cent**. The binding
+hurdle is the ask-vs-fair gap, not the venue fee.
+
+## 11. Where the edge should be, if it exists
+
+On a mutually-exclusive rung ladder a forecast's information is a
+**redistribution of unit mass**. The model can move a mid rung by 0.1–0.3; it
+can move a far-tail rung by at most a few points, because model and market
+agree the mass there is small. The hurdle in absolute probability units is
+flat-to-rising in price (fee peaks at 0.0174 near 0.50). Therefore the
+edge/hurdle ratio is **maximised near the forecast mode and minimised in the
+tail** — and the registered screen samples exactly the region with the worst
+achievable ratio.
+
+Rough magnitudes from BSS +0.081 over persistence (assumption: per-rung
+reference Brier ≈ p(1−p) ≈ 0.09 on a ~10-rung ladder — **to be verified against
+the Stage 0b reference score**): ΔBS ≈ 0.0073, so RMS disagreement
+≈ √0.0073 ≈ 0.085 and mean |Δp| ≈ 0.05. That 0.085 is an UPPER bound, since the
+market very likely beats persistence. Tail: attainable |Δp| of a few points
+against a 0.01–0.04 hurdle → ratio ≈ 1, no margin. Mid-ladder: 0.10–0.15
+against a 0.01–0.03 hurdle → ratio 4–10×.
+
+The arithmetic says the hurdle is clearable **in principle, but only where the
+screen does not look.**
