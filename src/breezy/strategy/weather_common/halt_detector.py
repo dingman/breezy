@@ -84,6 +84,7 @@ __all__ = [
     "ALL_REFUSED_EVENT",
     "DEFAULT_HALT_WINDOW_NS",
     "MIN_EVALUATED_FOR_ALL_REFUSED",
+    "PRE_DECISION_WAIT_DIAGNOSTICS",
     "STRUCTURAL_HALT_REASONS",
     "ZERO_EVALUATION_EVENT",
     "DecisionWindowTally",
@@ -153,6 +154,33 @@ STRUCTURAL_HALT_REASONS: Final[frozenset[str]] = frozenset(
 )
 
 
+#: The closed set of WAIT-state diagnostic keys that prove a tick was
+#: OBSERVED in the decision window without ever reaching a decision.
+#:
+#: Named here as literals rather than imported from
+#: ``current_rung_hold.strategy`` because ``weather_common`` sits BELOW the
+#: family packages in the import graph (``lint-imports``); a test pins these
+#: against that module's own ``_DIAG_*`` constants, so a rename there cannot
+#: silently drift this set. This module still invents no counter of its own:
+#: every member is a key the strategy ALREADY records at a pre-decision
+#: ``return``, and nothing about what it counts changes here.
+#:
+#: Why the zero-evaluation arm needs them (MDW, 2026-09-20): a pre-decision
+#: WAIT is not a candidate evaluated. When every tick in a window fails
+#: executability -- an ordinary illiquid stretch on a thin venue -- the
+#: window closes with ZERO candidates, and reading that as a structural
+#: block pages the operator for a thin market. Ticks observed but undecided
+#: is a market; NO tick at all is discovery or subscription collapse, which
+#: is the condition this arm exists for.
+PRE_DECISION_WAIT_DIAGNOSTICS: Final[frozenset[str]] = frozenset(
+    {
+        "in_window_not_executable",
+        "in_window_no_running_max_yet",
+        "in_window_rung_not_current",
+    }
+)
+
+
 class HaltDetail(str, Enum):
     """Closed set of ``detail`` tokens this module emits that are NOT
     themselves a refusal reason.
@@ -185,6 +213,10 @@ class DecisionWindowTally:
 
     refusals: Mapping[str, int]
     takes: int
+    #: Ticks OBSERVED in this window that returned before any decision --
+    #: the sum of this window's :data:`PRE_DECISION_WAIT_DIAGNOSTICS`
+    #: deltas. Evidence the feed is alive even when ``evaluated`` is zero.
+    wait_ticks: int = 0
 
     @property
     def evaluated(self) -> int:
@@ -211,14 +243,22 @@ def all_refused_halt_reason(tally: DecisionWindowTally) -> str | None:
 
 
 def zero_evaluation_halt(tally: DecisionWindowTally) -> bool:
-    """A decision window in which nothing was ever evaluated.
+    """A decision window in which nothing was ever OBSERVED.
 
     Distinct from every refusal: no gate refused, because no candidate
     reached one. The caller decides WHEN this is meaningful by passing
     ``trading_expected`` to :meth:`HaltDetector.observe` -- overnight, zero
     candidates is simply correct.
+
+    Gated on the OBSERVED TICK count, not the candidate count (MDW
+    18:58Z, 2026-09-20 -- the first live day of this module, and a false
+    page). ``evaluated == 0`` alone is also what an ordinary illiquid
+    stretch looks like: every tick arrived, every tick was a pre-decision
+    wait, nothing reached a gate. Only a window in which NOTHING arrived at
+    all -- no candidate AND no wait tick -- is the discovery / subscription
+    collapse this condition names.
     """
-    return tally.evaluated == 0
+    return tally.evaluated == 0 and tally.wait_ticks == 0
 
 
 class HaltDetector:
@@ -254,6 +294,7 @@ class HaltDetector:
         self._window_ns = window_ns
         self._window_open_ns: int | None = None
         self._baseline_refusals: dict[str, int] = {}
+        self._baseline_diagnostics: dict[str, int] = {}
         self._baseline_takes = 0
 
     def observe(
@@ -263,6 +304,7 @@ class HaltDetector:
         takes: int,
         now_ns: int,
         trading_expected: bool,
+        diagnostic_counts: Mapping[str, int] | None = None,
     ) -> tuple[AlertPayload, ...]:
         """Record this tick's cumulative counters; close the window if due.
 
@@ -276,16 +318,27 @@ class HaltDetector:
         the LST decision window is open. While it is ``False`` the baseline
         simply slides and no window can close, so a quiet night can never
         page.
+
+        ``diagnostic_counts`` is the strategy's cumulative WAIT-state
+        diagnostics counter (``strategy.diagnostics.counts``); only the
+        :data:`PRE_DECISION_WAIT_DIAGNOSTICS` members are read, and only to
+        answer "was anything observed at all this window?". Omitting it is
+        the same fact as "no wait tick was observed".
         """
         counts = {reason: count for reason, count in refusal_counts.items() if count > 0}
+        diagnostics = {
+            key: count
+            for key, count in (diagnostic_counts or {}).items()
+            if key in PRE_DECISION_WAIT_DIAGNOSTICS and count > 0
+        }
         if not trading_expected or self._window_open_ns is None:
-            self._reset(counts, takes, now_ns)
+            self._reset(counts, diagnostics, takes, now_ns)
             return ()
         if now_ns - self._window_open_ns < self._window_ns:
             return ()
 
-        tally = self._tally(counts, takes)
-        self._reset(counts, takes, now_ns)
+        tally = self._tally(counts, diagnostics, takes)
+        self._reset(counts, diagnostics, takes, now_ns)
         payloads = self._state.evaluate(self._conditions(tally), now_ns=now_ns)
         for payload in payloads:
             emit_alert(self._sink, payload)
@@ -293,12 +346,24 @@ class HaltDetector:
 
     # -- internals ------------------------------------------------------
 
-    def _reset(self, counts: Mapping[str, int], takes: int, now_ns: int) -> None:
+    def _reset(
+        self,
+        counts: Mapping[str, int],
+        diagnostics: Mapping[str, int],
+        takes: int,
+        now_ns: int,
+    ) -> None:
         self._baseline_refusals = dict(counts)
+        self._baseline_diagnostics = dict(diagnostics)
         self._baseline_takes = takes
         self._window_open_ns = now_ns
 
-    def _tally(self, counts: Mapping[str, int], takes: int) -> DecisionWindowTally:
+    def _tally(
+        self,
+        counts: Mapping[str, int],
+        diagnostics: Mapping[str, int],
+        takes: int,
+    ) -> DecisionWindowTally:
         """This window's delta against the baseline.
 
         A counter that went BACKWARDS (a restart of whatever owns it) is
@@ -310,8 +375,14 @@ class HaltDetector:
             for reason, count in counts.items()
             if count - self._baseline_refusals.get(reason, 0) > 0
         }
+        wait_ticks = sum(
+            max(0, count - self._baseline_diagnostics.get(key, 0))
+            for key, count in diagnostics.items()
+        )
         return DecisionWindowTally(
-            refusals=refusals, takes=max(0, takes - self._baseline_takes)
+            refusals=refusals,
+            takes=max(0, takes - self._baseline_takes),
+            wait_ticks=wait_ticks,
         )
 
     def _conditions(self, tally: DecisionWindowTally) -> tuple[AlertCondition, ...]:

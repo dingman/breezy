@@ -2457,6 +2457,13 @@ class ContinuousRungHoldStrategy(Strategy):
 
         `trading_expected` is this station's LST decision window: while it is
         `False`, zero candidates is simply correct and no window can close.
+
+        `self.diagnostics.counts` supplies the detector's OBSERVED-TICK
+        gate (MDW 18:58Z, 2026-09-20): the WAIT-state keys already recorded
+        at the pre-decision returns below are what tell an illiquid stretch
+        (ticks arrived, none reached a decision) apart from a starved feed
+        (nothing arrived at all). Read only -- nothing here changes what the
+        strategy counts or when it counts it.
         """
         detector = self.halt_detector
         if detector is None:
@@ -2468,6 +2475,7 @@ class ContinuousRungHoldStrategy(Strategy):
                 takes=self.takes,
                 now_ns=self.clock.timestamp_ns(),
                 trading_expected=trading_expected,
+                diagnostic_counts=self.diagnostics.counts,
             ),
         )
 
