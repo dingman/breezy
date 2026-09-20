@@ -117,3 +117,94 @@ consistent with the rung family's measured under-confidence (mean signed
 deviation +0.0790, sigma too wide). A model whose disagreement with the price
 is uncorrelated with being right has nothing to monetise, regardless of the
 decision rule wrapped around it.
+
+---
+
+## RETRACTION of "CORRECTION 1" (2026-09-20, same day)
+
+**"CORRECTION 1 — B2 unevaluable is WRONG" is itself WRONG and is retracted.**
+The ORIGINAL claim — that B2 (NO-side) is unevaluable — was CORRECT.
+
+I counted directories matching `*^no*` under the tape root, confirmed they held
+parquet, and concluded NO-leg price tape existed. It does not. Those are
+Nautilus **instrument-definition** rows (`outcome='No'`, 5 rows, schema
+`raw_symbol/maker_fee/…`), not prices. Broken down by data type:
+
+| data type | `^no` dirs | total dirs |
+|---|---|---|
+| `binary_option` (instrument definitions) | **210** | 781 |
+| `order_book_depths` | **0** | 606 |
+| `quote_tick` | **0** | 569 |
+| `trade_tick` | **0** | 101 |
+| `mark_price_update` | **0** | 551 |
+
+**The NO leg has never been priced.** B2 is not "underpowered at 30
+station-days" — it is UNOBSERVED. The error was counting a match without
+checking what the matched thing IS; the parquet-present check gave false
+confidence because instrument definitions are also parquet.
+
+Consequence: any hypothesis whose only long-only expression is a NO-leg buy
+(`allow_short = False`) **cannot be evaluated from the existing archive at
+all**, no matter how the YES ask is re-analysed.
+
+## Follow-on ruling: "fade the market's overconfidence" — UNDERPOWERED-UNDETERMINED
+
+The reliability gap that motivated this hypothesis is arithmetically real and
+sign-stable, but it does not mean what it appears to.
+
+**Real as arithmetic.** Market reliability deviation on the ask is
+distinguishable from zero at every threshold ≥ 0.50, with station-day-clustered
+CIs — not merely in the thin tail bins:
+
+| region | n | clusters | dev (obs − p̄) | CI95 |
+|---|---|---|---|---|
+| ask ≥ 0.50 | 63 | 53 | −0.2665 | [−0.4076, −0.1064] |
+| ask ≥ 0.70 | 19 | 14 | **−0.6389** | [−0.8233, −0.3823] |
+| bin [0.9,1.0) | 12 | 9 | −0.7175 | [−0.9686, −0.4560] |
+
+Sign-stable: 4/4 stations negative at ask ≥ 0.70; 7 of 9 dates negative.
+
+**But the dominant driver is overround mislabelled as belief.** The high-ask
+events sit on broken ladders: mean `Σask` on ladders CARRYING a high ask is
+**2.3516** against 1.2913 corpus-wide. Eleven of nineteen sit at Σask 2.12–3.90
+(SFO 2026-09-01: **Σask = 3.90**, four rungs quoted 0.92–0.99 simultaneously).
+Six mutually exclusive rungs cannot each be ~97% likely. On those books the ask
+is **not a probability** — it is a near-cap quote against no seller (L0 ask
+sizes of 1, 7, 10, 11 contracts; YES half-spread on the high-ask subset
+averages **0.1307** vs 0.0235 corpus-wide). The market is not overconfident
+there; we were reading an illiquid quote as a belief.
+
+**And the NO leg is not the cheap side.** Synthetic NO (buying the other five
+rungs) costs a median **1.130** and up to 2.980 — on the junk ladders the NO
+claim costs ~3× its maximum payout. Only 8 of 19 cost < 1.00 pre-fee. Fees are
+not the constraint (θ·p·(1−p) is ~1¢ at these prices); the constraints are a
+13-point half-spread and an unpriced NO book.
+
+**PnL under the generous CLOB-complement assumption (`NO_ask = 1 − yes_bid`,
+itself unverifiable):**
+
+| rule | n | clusters | mean/contract | CI95 |
+|---|---|---|---|---|
+| every event, any ask | 293 | 64 | **−0.0110** | **[−0.0188, −0.0021]** |
+| ask ≥ 0.70, any ladder | 14 | 13 | +0.3250 | [+0.1118, +0.5456] |
+| ask ≥ 0.70, **Σask ≤ 1.20** | 8 | 8 | +0.3037 | **[−0.2200, +0.8250]** |
+
+Indiscriminate NO buying **loses with a CI excluding zero** — both legs are
+expensive, exactly as 29% overround implies. The significant-looking ask ≥ 0.70
+row is carried by junk-ladder events whose assumed NO price is meaningless.
+Strip them and the tradeable residue is **8 events / 8 clusters, CI straddling
+zero, +2.43 total driven by two trades**. The 2026-09-19 holdout contains
+**zero** qualifying events.
+
+**VERDICT: UNDERPOWERED-UNDETERMINED.** Not refuted, not supported. It cannot
+be ruled on from the archive, because the price of the only instrument that
+could express it has never been recorded.
+
+**Frozen confirmatory region (registered now, before any NO data exists):**
+`yes_ask ≥ 0.70` AND `Σask over the complete partition ≤ 1.20` AND both sides
+priced at L0, at the existing 09:00 LST instant. Statistic: mean realised
+NO-leg PnL per contract at the ACTUALLY QUOTED NO ask, fee θ·p·(1−p)
+banker's-rounded. Bar: station-day-clustered 95% CI strictly > 0. Data:
+post-freeze station-days only, from the first day NO-leg depth is captured.
+Power: ~0.5 qualifying events/station-day ⇒ ~60 station-days for n ≈ 30. One
+region, one statistic, no sweep.
