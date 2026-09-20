@@ -1008,9 +1008,42 @@ def test_two_lines_for_one_venue_order_id_count_once_with_the_latest_reason(
     )
 
 
-def test_an_exclusion_whose_trial_id_has_a_scored_row_is_dropped(
+def test_a_non_residual_exclusion_whose_trial_id_has_a_scored_row_is_dropped(
     tmp_path: Path, tally_mod: ModuleType
 ) -> None:
+    """The ORIGINAL I3c count rule, unchanged for every NON-residual reason:
+    a line re-scored on a later run is stale evidence, not a count."""
+    from breezy.persistence.scored_trial_store import read_scored_trials, write_scored_trials
+
+    store_dir = tmp_path / "store"
+    scored_row = _row(0, climate_day="2026-09-11")
+    write_scored_trials(store_dir, (scored_row,), now_ns=1)
+    (store_dir / "excluded_fills.jsonl").write_text(
+        _excluded_fill_line(
+            trial_id=scored_row.trial_id,
+            station=scored_row.station,
+            climate_day=scored_row.climate_day,
+            venue_order_id="vo-1",
+            reason="ambiguous_latch",
+        )
+        + "\n"
+    )
+    scored_ids = frozenset(t.trial_id for t in read_scored_trials(store_dir))
+    excluded = tally_mod.read_excluded_fills(store_dir)
+    rows = tally_mod.coverage_rows(excluded, scored_ids)
+    assert rows == ()
+    assert tally_mod.residual_scored_contradictions(excluded, scored_ids) == ()
+
+
+def test_a_residual_exclusion_whose_trial_id_has_a_scored_row_is_surfaced_not_dropped(
+    tmp_path: Path, tally_mod: ModuleType
+) -> None:
+    """Ruling `docs/evidence/RULING_v3_admissibility_divergence_2026-09-20.md`
+    R2: this case previously asserted `rows == ()` -- the silent skip that
+    discarded the one record revealing the tally over-admitting a residual
+    fill. A RESIDUAL reason (`RESIDUAL_EXCLUSION_REASONS`) whose trial_id has
+    a scored row is now counted in the coverage table AND named as a
+    reconciliation contradiction."""
     from breezy.persistence.scored_trial_store import read_scored_trials, write_scored_trials
 
     store_dir = tmp_path / "store"
@@ -1028,8 +1061,15 @@ def test_an_exclusion_whose_trial_id_has_a_scored_row_is_dropped(
     )
     scored_ids = frozenset(t.trial_id for t in read_scored_trials(store_dir))
     excluded = tally_mod.read_excluded_fills(store_dir)
+
     rows = tally_mod.coverage_rows(excluded, scored_ids)
-    assert rows == ()
+
+    assert [(r.reason, r.station, r.climate_day, r.count) for r in rows] == [
+        ("fee_unverified", scored_row.station, scored_row.climate_day, 1)
+    ]
+    assert tally_mod.residual_scored_contradictions(excluded, scored_ids) == (
+        scored_row.trial_id,
+    )
 
 
 def test_an_exclusion_whose_trial_id_is_not_scored_still_counts(
@@ -1366,7 +1406,14 @@ def test_coverage_section_footer_states_artefact_path_and_counts(
     assert str(store_dir / "excluded_fills.jsonl") in report
     assert "lines read: 2" in report
     assert "distinct venue_order_ids: 2" in report
-    assert "dropped as already-scored: 1" in report
+    # Ruling 2026-09-20 R2: the `fee_unverified` line on a scored trial_id is
+    # NOT "dropped as already-scored" any more -- it is a residual/scored
+    # contradiction, counted and named. Only NON-residual reasons still drop,
+    # and this store has none (the `fill_below_ask` line is unscored).
+    assert "non-residual entries dropped as already-scored: 0" in report
+    assert "residual/scored contradictions: 1" in report
+    assert "**residual/scored contradiction (1)**" in report
+    assert scored_row.trial_id in report
 
 
 # --- Slice 4 item B2 (plan rev 6.1): `residual` additive to the LOSS_STOP gate

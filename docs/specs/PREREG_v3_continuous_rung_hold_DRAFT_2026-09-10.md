@@ -101,6 +101,53 @@ Every unscored fill contributes to EXACTLY ONE bucket. Residual = sum of `qty ×
 - Re-arm gate: evidence-based (fresh eof-complete positions read showing no LONG on instrument).
 - Attempt counter: `_MAX_STATION_DAY_ATTEMPTS = 3`, frozen by `is_consumed` (no re-arm after a fill).
 
+### 5.1 Amendment A1 (2026-09-20) — FOURTH residual bucket `no_side_first_order_residual` (REGISTERED)
+
+**Status: REGISTERED 2026-09-20. Applies from climate_day 2026-09-15** (the first
+NO-side create-path fill; earlier station-days carry no such fill, so the
+amendment is not retroactive in effect). Authority: operator ruling
+`docs/evidence/RULING_v3_admissibility_divergence_2026-09-20.md` R3. **The
+registered §5 text above is unchanged and is preserved verbatim** — this
+subsection is additive, in the manner of the WP-7 amendments
+(`docs/specs/PREREG_WP7_MULTIPLICITY_RULE_2026-09-20.md` §6.1).
+
+**Why this exists.** The NO-side S5 work (E2-1(iii)/E3-3) added a fourth
+per-fill residual reason, `no_side_first_order_residual`, to
+`RESIDUAL_EXCLUSION_REASONS`, and `src/breezy/persistence/residual_fills.py`
+cited it as a "PREREG amendment §8". **That citation was false**: §8 of this
+document is "Boundary Artefact", and this document mentioned NO-side nowhere.
+A residual classifier on a REGISTERED sequential test was extended without
+amending the registration. This subsection registers it; the false citation is
+corrected in the code to point here.
+
+**4. `no_side_first_order_residual`** — the first live NO-side create-path
+trial, marked residual by the durable first-order key while the bounded
+containment window (`is_no_side_pending`) is open. Ordering: checked **LAST**,
+after `duplicate_fill`, `q≠1` and `fee_unreconciled`, under the same
+FIRST-MATCH-WINS rule as the registered three — so it can never re-label a fill
+that any registered bucket already claims, and every unscored fill still
+contributes to EXACTLY ONE bucket.
+
+**Conservative by construction.** The bucket only ever REMOVES fills from `n`;
+it can never admit one. Its dollars enter `residual`, an UNSIGNED magnitude
+SUBTRACTED from `scored_pnl`, so it can only move `total_pnl` toward KILL,
+never toward SURVIVE. It is therefore a widening of the residual set (L-12:
+widened, never relaxed) and it cannot manufacture a favourable verdict.
+
+**Admissibility is the sidecar, not the parquet column (ruling R1).** A
+`trial_id` recorded in `excluded_fills.jsonl` in ANY of these four buckets is
+NOT admissible, regardless of its scored-parquet `excluded_reason`. Both the
+registered tally (`scripts/analysis/family_tally_v2.py`) and the §5 loader
+(`breezy.persistence.realized_draws.load_realized_draws`) apply the ONE
+predicate. A `trial_id` carrying both a scored row and a residual entry is a
+reconciliation contradiction: it is reported, counted, and resolved in the
+SHRINK direction (excluded); readmitting one refuses the whole tally (R4).
+
+**Measured effect at registration.** On the live `pm_us_crh_cont` store the
+registered tally admitted 4 fills where §5 admits 3 — an `n` inflated 25%. No
+prior verdict flips at this sample (nowhere near a boundary), and the
+correction shrinks `n`.
+
 ---
 
 ## 6. Safety Pins (Phase 1)
@@ -247,6 +294,8 @@ Window `[12:00, 17:00)` LST, 30 min afternoon-covered threshold, ≥15 covered l
 - Dollar halt KILL if scored_pnl − residual ≤ −60 (not inside daily budget cap).
 - Re-arm evidence gate + attempt freeze by `is_consumed`.
 - Residual mutually exclusive per-fill classification.
+
+**Amendment A1 (2026-09-20):** §5.1 registers the FOURTH residual bucket `no_side_first_order_residual` (last in the first-match-wins ordering, applies from climate_day 2026-09-15, conservative -- only ever removes fills from `n`) and pins admissibility to the residual sidecar rather than the scored-parquet `excluded_reason` column alone. Ruling: `docs/evidence/RULING_v3_admissibility_divergence_2026-09-20.md`.
 
 ---
 

@@ -15,8 +15,15 @@ residual is THREE mutually exclusive per-fill buckets, first-match-wins --
 `duplicate_fill`, `q≠1` (spelled `partial_fill`/`multi_fill` here), and
 `fee_unreconciled` (spelled `fee_unverified`, and including resolver
 GET-FILLED rows which are `fee_reconciled=False` by construction). The
-PREREG amendment §8 `no_side_first_order_residual` bucket is additive
-(L-12: widened, never relaxed).
+FOURTH bucket, `no_side_first_order_residual`, is registered by **PREREG v3
+§5.1 amendment A1 (2026-09-20)** -- last in the first-match-wins ordering,
+applying from climate_day 2026-09-15, additive and conservative (L-12:
+widened, never relaxed; it only ever REMOVES fills from `n`).
+
+The earlier "PREREG amendment §8" citation carried here was FALSE -- §8 of
+that document is "Boundary Artefact" and the document mentioned NO-side
+nowhere. Corrected per ruling
+`docs/evidence/RULING_v3_admissibility_divergence_2026-09-20.md` R3.
 """
 
 from __future__ import annotations
@@ -50,28 +57,33 @@ FillExclusionReason = Literal[
     "no_taken_latch",
     "ambiguous_latch",
     "duplicate_fill",
-    # NO-SIDE S5 (E2-1(iii)/E3-3, PREREG amendment §8): the first live NO
-    # create-path trial, marked residual by the durable first-order key
-    # while the bounded containment window (`is_no_side_pending`) is open.
+    # NO-SIDE S5 (E2-1(iii)/E3-3, PREREG v3 §5.1 amendment A1 2026-09-20 --
+    # NOT §8, which is "Boundary Artefact"): the first live NO create-path
+    # trial, marked residual by the durable first-order key while the
+    # bounded containment window (`is_no_side_pending`) is open.
     # Widened, never relaxed (L-12): no member removed or re-spelled.
     "no_side_first_order_residual",
 ]
 
-#: Slice 4 item B2 (plan rev 6.1): the mutually exclusive residual set --
-#: every unscored fill in one of these three buckets contributes
+#: Slice 4 item B2 (plan rev 6.1) + PREREG v3 §5.1 amendment A1
+#: (2026-09-20, the registered fourth bucket): the mutually exclusive
+#: residual set -- every unscored fill in one of these buckets contributes
 #: `qty * (fill_px + fee)` to `compute_residual`, first-match-wins,
 #: `"duplicate_fill"` checked before `"partial_fill"`/`"multi_fill"` (q != 1)
 #: before `"fee_unverified"`. `duplicate_fill` is excluded upstream, in
 #: `read_filled_trials_state_db`, before a fill ever reaches `_admit_fill`
-#: -- so a fill can never land in more than one of these three buckets by
-#: construction (PREREG mutual-exclusivity requirement).
+#: -- so a fill can never land in more than one of these buckets by
+#: construction (PREREG mutual-exclusivity requirement);
+#: `"no_side_first_order_residual"` is checked LAST, after all three
+#: registered buckets, per amendment A1.
 RESIDUAL_EXCLUSION_REASONS: Final[frozenset[FillExclusionReason]] = frozenset(
     {
         "duplicate_fill",
         "partial_fill",
         "multi_fill",
         "fee_unverified",
-        # NO-SIDE S5 (E3-3): additive, never relaxed (L-12).
+        # NO-SIDE S5 (E3-3), registered by PREREG v3 §5.1 amendment A1
+        # (2026-09-20): additive, never relaxed (L-12).
         "no_side_first_order_residual",
     }
 )

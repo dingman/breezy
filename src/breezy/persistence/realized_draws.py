@@ -158,9 +158,12 @@ def is_admissible(trial: ScoredTrial, *, residual_trial_ids: frozenset[str]) -> 
     Three refusals, in order:
 
     1. `trial_id` carries a residual exclusion (`duplicate_fill` / `q≠1` /
-       `fee_unreconciled`, plus the §8 `no_side_first_order_residual`
-       amendment) -- the bucket set is `RESIDUAL_EXCLUSION_REASONS`, never
-       restated here.
+       `fee_unreconciled`, plus `no_side_first_order_residual`, registered
+       by PREREG v3 §5.1 amendment A1 2026-09-20 -- NOT §8, which is
+       "Boundary Artefact"; corrected per ruling
+       `docs/evidence/RULING_v3_admissibility_divergence_2026-09-20.md` R3)
+       -- the bucket set is `RESIDUAL_EXCLUSION_REASONS`, never restated
+       here.
     2. `excluded_reason is not None` -- the scoring-time
        venue-fallback-without-NWS concept, which the registered
        `family_tally_v2.build_family_tally_v2` already refuses. A loader

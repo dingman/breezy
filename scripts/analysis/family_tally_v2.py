@@ -93,13 +93,18 @@ from structural_dead_stop import StructuralDeadVerdict, structural_dead
 
 from breezy.persistence.family_manifest import FamilyManifest, load_family_manifest
 from breezy.persistence.gs_boundary_artefact import BoundaryArtefact, load_boundary_artefact
-from breezy.persistence.realized_draws import stratum_row_from_scored_trial
+from breezy.persistence.realized_draws import (
+    admissible_scored_trials,
+    stratum_row_from_scored_trial,
+)
 from breezy.persistence.residual_fills import (
     EXCLUDED_FILLS_FILENAME,
+    RESIDUAL_EXCLUSION_REASONS,
     ExcludedFill,
     ExcludedFillsMalformed,
 )
 from breezy.persistence.residual_fills import read_excluded_fills as _read_excluded_fills
+from breezy.persistence.residual_fills import residual_trial_ids as _residual_trial_ids
 from breezy.persistence.scored_trial_store import SCORED_TRIAL_SCHEMA, read_scored_trials
 from breezy.settlement.current_rung_hold_v2 import (
     CombinedDraw,
@@ -133,13 +138,17 @@ __all__ = [
     "FamilyTallyV2",
     "LookRecord",
     "ProvenanceRefusal",
+    "ResidualScoredContradictionError",
     "ScoredTrialDataIntegrityError",
+    "assert_residual_contradictions_excluded",
     "build_family_tally_v2",
     "coverage_rows",
     "filter_rows_to_manifest_prefix",
     "main",
     "read_excluded_fills",
     "render_markdown_v2",
+    "residual_scored_contradictions",
+    "residual_trial_ids",
 ]
 
 #: B1 (ruling Q4): the only value `family_tally_v2.py` ever admits for a
@@ -185,6 +194,22 @@ class ScoredTrialDataIntegrityError(Exception):
 
 class FamilyStoreContaminationError(ScoredTrialDataIntegrityError):
     """A store declared single-family contains rows outside the manifest prefix."""
+
+
+class ResidualScoredContradictionError(ScoredTrialDataIntegrityError):
+    """R2/R4 (ruling `docs/evidence/RULING_v3_admissibility_divergence_2026-09-20.md`):
+    a `trial_id` the scorer recorded in a PREREG v3 §5 residual bucket is
+    STILL in the tally's admitted set.
+
+    The contradiction itself (a residual sidecar entry whose `trial_id` also
+    has a scored parquet row) is resolved in the only direction §5 allows --
+    the row is dropped, `n` SHRINKS -- and is named, counted and reported
+    rather than refused, so a store carrying the known 2026-09-15 MIA `^no`
+    contradiction still renders. This refusal is the fail-closed guard on
+    that resolution: if residual strictness is ever reduced and such a
+    trial_id is readmitted, the whole tally refuses instead of silently
+    inflating `n` on a sequential test that is spending alpha.
+    """
 
 
 class ProvenanceRefusal(ScoredTrialDataIntegrityError):
@@ -259,6 +284,14 @@ class FamilyTallyV2:
     #: never refused (unlike a store WITH rows and no/mismatched sidecar,
     #: which still refuses via `_assert_live_provenance`).
     store_empty_no_sidecar: bool = False
+    #: R1 (ruling 2026-09-20): scored rows dropped because their `trial_id`
+    #: appears in `excluded_fills.jsonl` in a PREREG v3 §5 residual bucket
+    #: -- counted separately from the parquet `excluded_reason` drops, both
+    #: of which are inside `n_excluded`.
+    n_residual_excluded: int = 0
+    #: R2: the `trial_id`s that are BOTH a scored parquet row AND a residual
+    #: sidecar entry -- a reconciliation contradiction, never silent.
+    residual_scored_contradictions: tuple[str, ...] = ()
 
 
 def _assert_held_matches_pnl_sign(rows: Sequence[ScoredTrial]) -> None:
@@ -588,7 +621,25 @@ def build_family_tally_v2(
     # structural-typing reason.
     assert_family_only(rows, cast(FamilyIdentity, manifest))
 
-    non_excluded = tuple(row for row in rows if row.excluded_reason is None)
+    # R1 (ruling `docs/evidence/RULING_v3_admissibility_divergence_2026-09-20.md`):
+    # admissibility is NOT the parquet `excluded_reason` column alone. A
+    # `trial_id` the scorer recorded in a PREREG v3 §5 residual bucket in
+    # `excluded_fills.jsonl` is not admissible whatever that column says --
+    # otherwise a fill this family's OWN scorer classified residual still
+    # counts toward `n` on a sequential test that is spending alpha. The
+    # predicate is `breezy.persistence.realized_draws.admissible_scored_trials`
+    # (the WP-31 §5 loader's own, reused not re-written), so the tally's `n`
+    # and `load_realized_draws`'s admissible count cannot drift apart.
+    residual_ids = residual_trial_ids(store_dir) if store_dir is not None else frozenset()
+    non_excluded = admissible_scored_trials(tuple(rows), residual_trial_ids=residual_ids)
+    contradictions = tuple(
+        sorted({row.trial_id for row in rows if row.trial_id in residual_ids})
+    )
+    assert_residual_contradictions_excluded(
+        contradictions,
+        admitted_trial_ids=frozenset(row.trial_id for row in non_excluded),
+        store_declared_single_family=True,
+    )
     ordered = _ordered_for_looks(non_excluded, store_dir=store_dir)
     pooled_rows = tuple(_stratum_row(t) for t in ordered)
     pooled = build_stratum_v2("pooled", pooled_rows) if pooled_rows else None
@@ -604,6 +655,13 @@ def build_family_tally_v2(
     any_cell_dead = any(s.cell_dead for s in (*station_strata, *ask_band_strata))
 
     total_pnl = sum((row.pnl for row in non_excluded), start=Decimal(0))
+    # R1/R4: `_roi_bound_line_v2` applies `excluded_reason` itself (via
+    # `ROIInputRow`), but knows nothing of the residual sidecar -- so the
+    # residual rows are withheld here. Without this the BCa line would keep
+    # pricing a fill that §5 excludes from `n`, i.e. the same over-admission
+    # in the reported ROI bound. Byte-identical whenever there is no residual
+    # sidecar entry (every synthetic-row caller).
+    roi_rows = tuple(row for row in rows if row.trial_id not in residual_ids)
 
     if filled_takes is not None and filled_takes < len(rows):
         raise ValueError(
@@ -683,7 +741,7 @@ def build_family_tally_v2(
                     n_max_reached_below_i_max=n_max_reached_below_i_max,
                 )
             )
-            bca_line = _roi_bound_line_v2(rows)
+            bca_line = _roi_bound_line_v2(roi_rows)
             break
 
         b_eff, b_fut = artefact.boundary_for(tuple(t_history), is_terminal=False)
@@ -708,7 +766,7 @@ def build_family_tally_v2(
             )
         )
         if verdict != "CONTINUE":
-            bca_line = _roi_bound_line_v2(rows)
+            bca_line = _roi_bound_line_v2(roi_rows)
             break
 
     already_terminal = bool(looks) and looks[-1].terminal
@@ -746,7 +804,7 @@ def build_family_tally_v2(
                 reason=truncation,
             )
         )
-        bca_line = _roi_bound_line_v2(rows)
+        bca_line = _roi_bound_line_v2(roi_rows)
 
     return FamilyTallyV2(
         family_id=manifest.family_id,
@@ -755,6 +813,8 @@ def build_family_tally_v2(
         status=manifest.status,
         n_scored=len(rows),
         n_excluded=len(rows) - len(non_excluded),
+        n_residual_excluded=len(contradictions),
+        residual_scored_contradictions=contradictions,
         pooled=pooled,
         station_strata=station_strata,
         ask_band_strata=ask_band_strata,
@@ -805,18 +865,106 @@ def _dedup_excluded_fills_by_venue_order_id(
     return latest
 
 
+def residual_trial_ids(store_dir: Path) -> frozenset[str]:
+    """Every `trial_id` `excluded_fills.jsonl` puts in a PREREG v3 §5
+    residual bucket (R1, ruling 2026-09-20).
+
+    Delegates to the ONE definition
+    (`breezy.persistence.residual_fills.residual_trial_ids`, which reads via
+    `read_excluded_fills`) -- this tally must never carry a second residual
+    predicate, which is the drift §5 exists to prevent. A malformed sidecar
+    line is re-raised, message verbatim, as this module's own
+    `ScoredTrialDataIntegrityError`, exactly as `read_excluded_fills` does.
+    """
+    try:
+        return _residual_trial_ids(store_dir)
+    except ExcludedFillsMalformed as exc:
+        raise ScoredTrialDataIntegrityError(str(exc)) from exc
+
+
+def residual_scored_contradictions(
+    excluded: Sequence[ExcludedFill], scored_trial_ids: frozenset[str]
+) -> tuple[str, ...]:
+    """R2: the `trial_id`s that appear BOTH as a scored parquet row and as a
+    PREREG §5 residual entry in the sidecar -- the reconciliation
+    contradiction that `coverage_rows` used to discard as "already-scored".
+
+    Deduped per `venue_order_id` first (the I3c count rule), sorted, each
+    `trial_id` once.
+    """
+    latest = _dedup_excluded_fills_by_venue_order_id(excluded)
+    return tuple(
+        sorted(
+            {
+                fill.trial_id
+                for fill in latest.values()
+                if fill.trial_id
+                and fill.trial_id in scored_trial_ids
+                and fill.reason in RESIDUAL_EXCLUSION_REASONS
+            }
+        )
+    )
+
+
+def assert_residual_contradictions_excluded(
+    contradictions: Sequence[str],
+    *,
+    admitted_trial_ids: frozenset[str],
+    store_declared_single_family: bool = True,
+) -> None:
+    """R2/R4: log every residual/scored contradiction, and REFUSE if any of
+    them survived into the admitted set.
+
+    Mirrors `filter_rows_to_manifest_prefix`'s posture for non-manifest rows
+    -- counted and logged always, refused when the store is declared
+    single-family -- but the refusal fires only on an UNRESOLVED
+    contradiction. §5 resolves a residual/scored contradiction
+    deterministically in the shrink direction (the row is not admissible),
+    so a resolved one is reported, not fatal; an admitted one means residual
+    strictness was reduced, which R4 forbids outright.
+    """
+    if not contradictions:
+        return
+    logger.warning(
+        "family_tally_v2: %d residual/scored contradiction(s) -- trial_id(s) %s carry "
+        "BOTH a scored parquet row and a PREREG v3 §5 residual entry in %s; excluded "
+        "from n (fail closed, ruling 2026-09-20 R1/R4)",
+        len(contradictions),
+        list(contradictions),
+        EXCLUDED_FILLS_FILENAME,
+    )
+    still_admitted = tuple(t for t in contradictions if t in admitted_trial_ids)
+    if still_admitted and store_declared_single_family:
+        raise ResidualScoredContradictionError(
+            f"refusing to tally: {len(still_admitted)} residual/scored contradiction(s) "
+            f"left in the admitted set -- trial_id(s) {list(still_admitted)!r} are "
+            f"recorded in {EXCLUDED_FILLS_FILENAME} in a PREREG v3 §5 residual bucket "
+            "and must never count toward n (ruling 2026-09-20 R1/R4)"
+        )
+
+
 def coverage_rows(
     excluded: Sequence[ExcludedFill], scored_trial_ids: frozenset[str]
 ) -> tuple[CoverageRow, ...]:
     """I3c count rule (strategy-lead Q2: "append-only jsonl is evidence,
     not the count"): dedup to one entry per `venue_order_id`, drop any
-    entry whose `trial_id` already has a scored row (any `score_seq`), and
-    group/count the survivors by `(reason, station, climate_day)`, sorted.
+    NON-RESIDUAL entry whose `trial_id` already has a scored row (any
+    `score_seq`), and group/count the survivors by
+    `(reason, station, climate_day)`, sorted.
+
+    R2 (ruling 2026-09-20): a RESIDUAL entry (`RESIDUAL_EXCLUSION_REASONS`)
+    whose `trial_id` has a scored row is NEVER dropped here. That case is not
+    "the jsonl is stale evidence, the parquet is the count" -- it is a
+    contradiction between the two, and dropping it hid precisely the record
+    that revealed the tally over-admitting a residual fill. The original drop
+    survives unchanged for every non-residual reason (a `no_taken_latch` or
+    `ambiguous_latch` line later re-scored), which is the case it was written
+    for.
     """
     latest = _dedup_excluded_fills_by_venue_order_id(excluded)
     counts: dict[tuple[str, str, str], int] = defaultdict(int)
     for fill in latest.values():
-        if fill.trial_id in scored_trial_ids:
+        if fill.trial_id in scored_trial_ids and fill.reason not in RESIDUAL_EXCLUSION_REASONS:
             continue
         counts[(fill.reason, fill.station, fill.climate_day)] += 1
     return tuple(
@@ -841,7 +989,15 @@ def _coverage_section_lines(store_dir: Path | None) -> list[str]:
     excluded = read_excluded_fills(store_dir)
     scored_trial_ids = frozenset(t.trial_id for t in read_scored_trials(store_dir))
     latest = _dedup_excluded_fills_by_venue_order_id(excluded)
-    dropped = sum(1 for fill in latest.values() if fill.trial_id in scored_trial_ids)
+    # R2: "dropped as already-scored" now counts ONLY the non-residual case
+    # it was written for; a residual entry whose trial_id has a scored row is
+    # a contradiction, reported below, never a drop.
+    dropped = sum(
+        1
+        for fill in latest.values()
+        if fill.trial_id in scored_trial_ids and fill.reason not in RESIDUAL_EXCLUSION_REASONS
+    )
+    contradictions = residual_scored_contradictions(excluded, scored_trial_ids)
     rows = coverage_rows(excluded, scored_trial_ids)
     lines.append("| reason | station | climate_day | count |")
     lines.append("|---|---|---|---:|")
@@ -850,8 +1006,18 @@ def _coverage_section_lines(store_dir: Path | None) -> list[str]:
     lines.append("")
     lines.append(
         f"artefact: {artefact_path}; lines read: {len(excluded)}; "
-        f"distinct venue_order_ids: {len(latest)}; dropped as already-scored: {dropped}"
+        f"distinct venue_order_ids: {len(latest)}; non-residual entries dropped as "
+        f"already-scored: {dropped}; residual/scored contradictions: {len(contradictions)}"
     )
+    if contradictions:
+        lines.append("")
+        lines.append(
+            f"**residual/scored contradiction ({len(contradictions)})** -- trial_id(s) "
+            f"{list(contradictions)!r} carry BOTH a scored parquet row and a PREREG v3 §5 "
+            "residual entry in this artefact. §5 resolves this in the shrink direction: "
+            "they are NOT admissible and are excluded from n (ruling "
+            "docs/evidence/RULING_v3_admissibility_divergence_2026-09-20.md, R1/R4)."
+        )
     lines.append("")
     return lines
 
@@ -870,6 +1036,14 @@ def render_markdown_v2(tally: FamilyTallyV2, *, source_paths: Sequence[Path], as
     add(f"status: {tally.status}")
     add(f"as_of: {as_of}")
     add(f"row count: {tally.n_scored} (excluded: {tally.n_excluded})")
+    if tally.n_residual_excluded:
+        add(
+            f"residual-sidecar exclusions (PREREG v3 §5, amendment A1 2026-09-20): "
+            f"{tally.n_residual_excluded} -- scored row(s) "
+            f"{list(tally.residual_scored_contradictions)!r} recorded in "
+            f"{EXCLUDED_FILLS_FILENAME} in a residual bucket; NOT admissible, "
+            "excluded from n"
+        )
     if tally.store_empty_no_sidecar:
         add("store empty; provenance sidecar not yet written")
     add("source parquet: " + ", ".join(str(p) for p in source_paths))
