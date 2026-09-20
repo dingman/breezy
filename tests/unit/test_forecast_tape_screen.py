@@ -12,10 +12,13 @@ from __future__ import annotations
 import datetime as dt
 import importlib.util
 import sys
+from decimal import Decimal
 from pathlib import Path
 from types import ModuleType
 
 import pytest
+
+from breezy.strategy.current_rung_hold.decision import fee_on_ask
 
 _REPO_ROOT = Path(__file__).resolve().parents[2]
 _SCRIPTS_ANALYSIS_DIR = _REPO_ROOT / "scripts" / "analysis"
@@ -86,8 +89,15 @@ def test_zero_variants_is_refused(screen: ModuleType) -> None:
 
 
 def test_edge_is_net_of_the_declared_fee(screen: ModuleType) -> None:
-    edge = screen.net_edge(model_probability=0.60, ask_probability=0.50, fee=0.0695)
-    assert edge == pytest.approx(0.60 - 0.50 - 0.0695)
+    """CORRECTED (WP-7 amendment A2): the fee is `theta * p * (1 - p)`, not flat.
+
+    The predecessor asserted `0.60 - 0.50 - 0.0695`, i.e. a FLAT 6.95-point
+    subtraction. That was the defect, pinned by a test -- so the test had to
+    move with it. The take-rule quantity is asserted against the production
+    function, never against a second copy of the arithmetic.
+    """
+    edge = screen.net_edge(model_probability=0.60, ask_probability=0.50)
+    assert edge == pytest.approx(0.60 - 0.50 - float(_production_fee("0.50")))
 
 
 def test_a_take_needs_edge_strictly_above_the_threshold(screen: ModuleType) -> None:
@@ -95,7 +105,7 @@ def test_a_take_needs_edge_strictly_above_the_threshold(screen: ModuleType) -> N
     quotes = (_quote(screen, 0.55),)
     probs = {("KSFO", dt.date(2025, 7, 1), 70): 0.60}
     decision = screen.screen_tape(quotes=quotes, model_probability=probs, variants=(variant,))[0]
-    # 0.60 - 0.55 - 0.0695 = -0.0195 -> below 0.03 -> no take.
+    # 0.60 - 0.55 - fee(0.55) = 0.05 - 0.02 = 0.03 -> NOT strictly above 0.03.
     assert decision.take is False
     assert decision.reason == screen.REASON_EDGE_BELOW_THRESHOLD
 
@@ -121,7 +131,7 @@ def test_a_quote_with_no_model_probability_is_skipped_not_guessed(screen: Module
 
 def test_a_probability_outside_the_unit_interval_is_refused(screen: ModuleType) -> None:
     with pytest.raises(ValueError):
-        screen.net_edge(model_probability=1.5, ask_probability=0.5, fee=0.0)
+        screen.net_edge(model_probability=1.5, ask_probability=0.5)
 
 
 def test_a_short_side_is_never_produced(screen: ModuleType) -> None:
@@ -132,3 +142,71 @@ def test_a_short_side_is_never_produced(screen: ModuleType) -> None:
         variants=(screen.ScreenVariant(min_edge=0.03),),
     )[0]
     assert decision.side == screen.SIDE_BUY
+
+
+# ---------------------------------------------------------------------------
+# WP-7 amendment A2 -- the venue fee is NOT flat
+# ---------------------------------------------------------------------------
+#
+# `PREREG_WP7_MULTIPLICITY_RULE_2026-09-20.md` §2.2 pins the fee as
+#
+#     fee = theta * price * (1 - price),  theta = 0.0695
+#
+# Subtracting 0.0695 FLAT inflates the hurdle by roughly 5x and manufactures a
+# null result that reads as "the forecast thesis died on its economics". The
+# screen must therefore price the SAME quantity the live take rule prices --
+# `current_rung_hold.decision.fee_on_ask` (`_fee`, banker's-rounded to the
+# cent) -- not a restatement of the formula that can drift from it.
+
+
+def _production_fee(ask: str, coefficient: str = "0.0695") -> Decimal:
+    """The LIVE take rule's fee, imported, never restated."""
+    return fee_on_ask(Decimal(ask), Decimal(coefficient))
+
+
+def test_the_venue_fee_is_price_dependent_and_never_the_flat_coefficient(
+    screen: ModuleType,
+) -> None:
+    flat = 0.0695
+    for ask in ("0.05", "0.10", "0.30", "0.50", "0.70", "0.95"):
+        measured = screen.venue_fee(ask_probability=float(ask))
+        assert measured == pytest.approx(float(_production_fee(ask))), ask
+        assert measured < flat, f"fee at ask {ask} must be far below the flat coefficient"
+
+
+def test_the_venue_fee_is_the_production_take_rule_fee_byte_for_byte(
+    screen: ModuleType,
+) -> None:
+    """Mutation guard: a restated formula that skipped the cent rounding, or a
+    flat subtraction, both fail here."""
+    assert screen.venue_fee(ask_probability=0.30) == float(_production_fee("0.30"))
+    assert screen.venue_fee(ask_probability=0.50) == float(_production_fee("0.50"))
+    # The fee peaks at the midpoint and is symmetric about it.
+    assert screen.venue_fee(ask_probability=0.50) >= screen.venue_fee(ask_probability=0.30)
+    assert screen.venue_fee(ask_probability=0.30) == screen.venue_fee(ask_probability=0.70)
+
+
+def test_net_edge_subtracts_the_price_dependent_fee_not_a_flat_one(
+    screen: ModuleType,
+) -> None:
+    edge = screen.net_edge(model_probability=0.60, ask_probability=0.30)
+    assert edge == pytest.approx(0.60 - 0.30 - float(_production_fee("0.30")))
+    # MUTATION CHECK: the flat-fee predecessor returned 0.60 - 0.30 - 0.0695
+    # = 0.2305. The corrected hurdle is ~5x smaller, so the two are far apart.
+    assert edge > 0.60 - 0.30 - 0.0695
+
+
+def test_a_flat_fee_would_manufacture_a_false_null(screen: ModuleType) -> None:
+    """The defect's signature: a real take read as no-edge.
+
+    p_fc = 0.36 against an ask of 0.30 clears the registered `min_edge > 0`
+    take rule on the true fee and FAILS it on a flat 0.0695 subtraction.
+    """
+    edge = screen.net_edge(model_probability=0.36, ask_probability=0.30)
+    assert edge > 0.0
+    assert 0.36 - 0.30 - 0.0695 < 0.0
+
+
+def test_an_ask_outside_the_unit_interval_is_still_refused(screen: ModuleType) -> None:
+    with pytest.raises(ValueError):
+        screen.venue_fee(ask_probability=1.5)

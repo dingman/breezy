@@ -20,19 +20,33 @@ exactly one variant (:class:`VariantSweepRefused`). The refusal is structural,
 not a comment, so the containment cannot lapse silently. Lifting it is a WP-7
 change and must arrive with the pre-declaration.
 
-No network, no clock, no I/O, no ``nautilus_trader``, no strategy import. Every
-input is caller-supplied.
+No network, no clock and no I/O. It DOES import the live take rule's fee
+(``current_rung_hold.decision.fee_on_ask``) -- deliberately, see
+:func:`venue_fee`: a study that restates the fee formula is a study whose
+hurdle can drift from the one real money pays. That import pulls
+``nautilus_trader`` transitively through the strategy's config module; the
+earlier "no strategy import" promise was worth less than agreeing with the
+live rule byte for byte. Every other input is caller-supplied.
 """
 
 from __future__ import annotations
 
 import datetime as dt
+import sys
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
+from decimal import Decimal
+from pathlib import Path
 from typing import Final
 
+_REPO_SRC = str(Path(__file__).resolve().parents[2] / "src")
+if _REPO_SRC not in sys.path:
+    sys.path.insert(0, _REPO_SRC)
+
+from breezy.strategy.current_rung_hold.decision import fee_on_ask
+
 __all__ = [
-    "DEFAULT_FEE",
+    "DEFAULT_FEE_COEFFICIENT",
     "REASON_EDGE_BELOW_THRESHOLD",
     "REASON_NO_MODEL_PROBABILITY",
     "REASON_TAKE",
@@ -43,13 +57,19 @@ __all__ = [
     "VariantSweepRefused",
     "net_edge",
     "screen_tape",
+    "venue_fee",
 ]
 
 #: MEASURED 2026-09-17 (L-"venue fee theta drift"): the venue's effective fee
-#: drifted 0.06 -> 0.0695. Carried here as the DEFAULT only; every caller that
-#: means a specific run should pass the fee that run observed. This module
-#: never reads a pin, an environment variable or a config file.
-DEFAULT_FEE: Final[float] = 0.0695
+#: COEFFICIENT drifted 0.06 -> 0.0695. This is the coefficient in
+#: ``fee = coefficient * price * (1 - price)``, NOT a fee. The repo's
+#: ``config.py`` pin deliberately still reads 0.06 (the drift is recorded in
+#: ``docs/evidence/venue/polymarket_us/FEE_SCHEDULE_PIN_2026-09-18.md`` and is
+#: not absorbed); a SCREEN asks what a trade would really cost today, so it
+#: uses the measured wire value. Carried here as the DEFAULT only; every caller
+#: that means a specific run should pass the coefficient that run observed.
+#: This module never reads a pin, an environment variable or a config file.
+DEFAULT_FEE_COEFFICIENT: Final[float] = 0.0695
 
 #: The only side this module can emit. ``allow_short`` stays ``False`` repo-wide
 #: (CLAUDE.md), so a screen that could emit a short would be a defect even if no
@@ -133,21 +153,51 @@ def _require_unit_interval(name: str, value: float) -> float:
     return float(value)
 
 
-def net_edge(*, model_probability: float, ask_probability: float, fee: float) -> float:
+def venue_fee(
+    *, ask_probability: float, fee_coefficient: float = DEFAULT_FEE_COEFFICIENT
+) -> float:
+    """The venue's per-contract fee at ``ask_probability``, as the LIVE rule pays it.
+
+    ``fee = coefficient * p * (1 - p)``, banker's-rounded to the cent -- which
+    is 0.01 at an ask of 0.30 and 0.02 at 0.50, NOT the 0.0695 coefficient.
+    The arithmetic is not restated here: it is
+    :func:`breezy.strategy.current_rung_hold.decision.fee_on_ask`, the exact
+    function ``evaluate_decision`` uses to build ``break_even``. A study that
+    re-derives the formula is a study whose hurdle silently drifts from the one
+    real money pays, and a FLAT subtraction of the coefficient inflates the
+    hurdle by roughly 5x -- enough to manufacture a null that reads as a
+    structural absence of edge (WP-7 registration amendment A2).
+    """
+    ask = _require_unit_interval("ask_probability", ask_probability)
+    if isinstance(fee_coefficient, bool) or not isinstance(fee_coefficient, float | int):
+        raise TypeError("fee_coefficient must be a real number")
+    if fee_coefficient < 0.0:
+        raise ValueError("fee_coefficient must not be negative")
+    return float(fee_on_ask(Decimal(str(ask)), Decimal(str(fee_coefficient))))
+
+
+def net_edge(
+    *,
+    model_probability: float,
+    ask_probability: float,
+    fee_coefficient: float = DEFAULT_FEE_COEFFICIENT,
+) -> float:
     """Post-fee edge of buying one YES contract at ``ask_probability``.
 
-    ``model_probability`` is the model's P(event). Paying ``ask`` plus ``fee``
-    for a claim worth ``p`` leaves ``p - ask - fee``. Both probabilities are
-    validated: a probability outside ``[0, 1]`` is a caller defect, never
-    something to clamp silently into a plausible-looking edge.
+    ``model_probability`` is the model's P(event). Paying ``ask`` plus the
+    venue fee ON that ask for a claim worth ``p`` leaves
+    ``p - ask - venue_fee(ask)``. Both probabilities are validated: a
+    probability outside ``[0, 1]`` is a caller defect, never something to clamp
+    silently into a plausible-looking edge.
+
+    The parameter is the fee COEFFICIENT, not a fee. The predecessor took a
+    flat ``fee`` and subtracted it whole; that was amendment A2's defect and
+    the signature changed so a stale caller fails loudly rather than keeping
+    the wrong arithmetic through a defaulted argument.
     """
     p = _require_unit_interval("model_probability", model_probability)
     ask = _require_unit_interval("ask_probability", ask_probability)
-    if isinstance(fee, bool) or not isinstance(fee, float | int):
-        raise TypeError("fee must be a real number")
-    if fee < 0.0:
-        raise ValueError("fee must not be negative")
-    return p - ask - float(fee)
+    return p - ask - venue_fee(ask_probability=ask, fee_coefficient=fee_coefficient)
 
 
 def screen_tape(
@@ -155,7 +205,7 @@ def screen_tape(
     quotes: Sequence[TapeQuote],
     model_probability: Mapping[tuple[str, dt.date, int], float],
     variants: Sequence[ScreenVariant],
-    fee: float = DEFAULT_FEE,
+    fee_coefficient: float = DEFAULT_FEE_COEFFICIENT,
 ) -> tuple[ScreenDecision, ...]:
     """Screen every quote under EXACTLY ONE variant.
 
@@ -194,7 +244,11 @@ def screen_tape(
                 )
             )
             continue
-        edge = net_edge(model_probability=p, ask_probability=quote.ask_probability, fee=fee)
+        edge = net_edge(
+            model_probability=p,
+            ask_probability=quote.ask_probability,
+            fee_coefficient=fee_coefficient,
+        )
         take = edge > variant.min_edge
         decisions.append(
             ScreenDecision(

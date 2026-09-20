@@ -315,6 +315,14 @@ def _fee(ask: Decimal, fee_coefficient: Decimal) -> Decimal:
     return exact.quantize(_CENT, rounding=ROUND_HALF_EVEN)
 
 
+#: Public alias for the LIVE take rule's fee, same pattern as ``is_legal_cell``
+#: above. Offline studies that must price the identical quantity the live rule
+#: prices (WP-7's cheap screen) import THIS rather than restating
+#: ``theta * p * (1 - p)``: a second copy of the formula is how a study's hurdle
+#: and the live hurdle drift apart. No behaviour change -- it is ``_fee``.
+fee_on_ask = _fee
+
+
 def evaluate_decision(inputs: DecisionInputs) -> Decision:
     """Evaluate one snapshot against the frozen rule order (module docstring)."""
     if inputs.latch_consumed:

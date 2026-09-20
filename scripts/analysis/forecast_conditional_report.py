@@ -52,7 +52,7 @@ from forecast_conditional_scoring import (
     MODEL_KEYS,
     RELIABILITY_EPSILON,
 )
-from forecast_tape_screen import DEFAULT_FEE
+from forecast_tape_screen import DEFAULT_FEE_COEFFICIENT
 
 __all__ = ["corpus_definition", "render_artefact", "render_markdown"]
 
@@ -70,7 +70,7 @@ __all__ = ["corpus_definition", "render_artefact", "render_markdown"]
 #: one carrying 0.0695 -- would have forced exactly that edit. So this module
 #: declares nothing: it re-uses the screen's single fee input. Do not rename
 #: this to ``_VENUE_FEE``; doing so re-breaks the census.
-_VENUE_FEE = DEFAULT_FEE
+_VENUE_FEE = DEFAULT_FEE_COEFFICIENT
 
 _FAMILY_MEDIAN: Final[str] = "median"
 
