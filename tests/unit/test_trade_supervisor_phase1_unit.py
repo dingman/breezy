@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import shutil
 import subprocess
+import pathlib
 from pathlib import Path
 
 import pytest
@@ -27,7 +28,16 @@ _SYSTEMD_ANALYZE = shutil.which("systemd-analyze")
 
 _EXPECTED_REMOVED_CURRENT = "Environment=BREEZY_CURRENT_RUNG_HOLD=1"
 _EXPECTED_REMOVED_CONTINUOUS = "Environment=BREEZY_CONTINUOUS_RUNG_HOLD=1"
-_EXPECTED_REPLACEMENT_ADDED = "Environment=BREEZY_SENDING_FAMILY_ID=pm_us_crh_cont"
+#: The family the INSTALLED unit promotes. Updated on promotion (2026-09-20:
+#: pm_us_crh_cont -> pm_us_crh_v4, the class-C successor registered at the
+#: venue's drifted taker theta 0.0695). The id alone is a weak guard, so
+#: `test_the_installed_unit_names_a_REGISTERED_family` additionally resolves
+#: it against deploy/families/ -- a unit naming an unregistered or DRAFT
+#: family must fail here, not at 16:50Z launch.
+_EXPECTED_SENDING_FAMILY_ID = "pm_us_crh_v4"
+_EXPECTED_REPLACEMENT_ADDED = (
+    f"Environment=BREEZY_SENDING_FAMILY_ID={_EXPECTED_SENDING_FAMILY_ID}"
+)
 _EXPECTED_SHADOW_PIN_ADDED = "Environment=BREEZY_CRH_CONT_PHASE0_SHADOW=0"
 _OPERATOR_ENV_LINE = "EnvironmentFile=-%h/breezy/operator.env"
 
@@ -53,6 +63,32 @@ def test_installed_unit_runs_the_registered_sending_family_by_id() -> None:
     derived_prefix = f"Environment={SENDING_FAMILY_ID_VAR}="
     matched = [line for line in lines if line.startswith(derived_prefix)]
     assert matched == [_EXPECTED_REPLACEMENT_ADDED]
+
+
+def test_the_installed_unit_names_a_REGISTERED_family() -> None:
+    """The unit's family id must resolve to a REGISTERED manifest.
+
+    Pinning the id as a bare string only catches a change to the unit. It
+    cannot catch the failure that actually costs a trading day: promoting to
+    an id whose manifest is missing, malformed, or still DRAFT_NOT_REGISTERED.
+    That would boot-fail at the 16:50Z launch with the window already closing.
+    Resolve it here instead.
+    """
+    from breezy.persistence.family_manifest import load_family_manifest
+
+    lines = _INSTALLED_UNIT.read_text().splitlines()
+    prefix = f"Environment={SENDING_FAMILY_ID_VAR}="
+    (line,) = [ln for ln in lines if ln.startswith(prefix)]
+    family_id = line[len(prefix) :]
+
+    manifest_path = (
+        pathlib.Path(__file__).resolve().parents[2] / "deploy" / "families" / f"{family_id}.json"
+    )
+    assert manifest_path.is_file(), f"unit names {family_id!r} but {manifest_path} does not exist"
+
+    manifest = load_family_manifest(manifest_path)
+    assert manifest.family_id == family_id
+    assert manifest.status == "REGISTERED"
 
 
 def test_installed_unit_pins_the_phase0_shadow_flag_off_after_operator_env() -> None:

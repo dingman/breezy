@@ -112,7 +112,7 @@ Environment=BREEZY_ORDERS_ENABLED=1
 # revision changes ONLY this value (plus the new manifest + density
 # artefact); it is never a source edit
 # (test_promoted_revision_requires_no_src_edit).
-Environment=BREEZY_SENDING_FAMILY_ID=pm_us_crh_cont
+Environment=BREEZY_SENDING_FAMILY_ID=pm_us_crh_v4
 Environment=BREEZY_LIVE_OBSERVATIONS=1
 Environment=BREEZY_TRADING_OPERATOR_ID=%u
 Environment=BREEZY_CRH_CONT_PHASE0_SHADOW=0

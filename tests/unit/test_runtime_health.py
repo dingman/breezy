@@ -40,6 +40,7 @@ from breezy.runtime.health import (
     HealthSnapshot,
     LoggingAlertSink,
     SiteHealth,
+    TeeAlertSink,
     WebhookAlertSink,
     emit_alert,
     resolve_alert_sink,
@@ -377,7 +378,11 @@ def test_resolve_alert_sink_returns_logging_sink_when_env_var_empty_string() -> 
 def test_resolve_alert_sink_returns_webhook_sink_when_env_var_set() -> None:
     sink = resolve_alert_sink({ALERT_WEBHOOK_URL_ENV_VAR: _WEBHOOK_URL})
 
-    assert isinstance(sink, WebhookAlertSink)
+    # [WP-B0a] A webhook sink is still constructed -- it is now one branch of
+    # a tee whose other branch is the local log (see `TeeAlertSink`).
+    assert isinstance(sink, TeeAlertSink)
+    assert any(isinstance(branch, WebhookAlertSink) for branch in sink.sinks)
+    sink.close()
 
 
 def test_webhook_alert_sink_rejects_non_https_scheme() -> None:

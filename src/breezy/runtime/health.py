@@ -501,6 +501,81 @@ class WebhookAlertSink:
         self._client.close()
 
 
+class TeeAlertSink:
+    """Fan ONE `AlertPayload` out to several sinks, containing each branch
+    INDEPENDENTLY.
+
+    Why this exists (a measured 2026-09-20 regression). `resolve_alert_sink`
+    used to return EITHER `LoggingAlertSink` OR `WebhookAlertSink`. While
+    `BREEZY_ALERT_WEBHOOK_URL` was unset everywhere, every alert reached the
+    node log. The afternoon the webhook was configured, the same node went
+    from 10 `breezy alert` lines in its first ~51 minutes of uptime to
+    ZERO, while 11 alerts were delivered to the webhook. Enabling delivery
+    had silently destroyed local diagnosability -- and the node log is the
+    authoritative forensic record here (it alone carries the boot-time
+    permit line that proves order capability). A channel that costs the
+    record is not an upgrade; it is a trade.
+
+    **Composition, not modification.** Neither `LoggingAlertSink` nor
+    `WebhookAlertSink` knows this class exists; both are unchanged, and
+    either can still be used alone. This type adds fan-out and nothing
+    else -- no formatting, no filtering, no retry, no ordering guarantee
+    beyond "in the order given".
+
+    **Per-branch containment is the whole point.** Every branch is invoked
+    through `emit_alert` -- the same function, with the same deliberate
+    `BaseException` catch, that already guarantees a sink can never abort
+    the poll cycle it is reporting on. So a webhook that throws, times out
+    or hangs does NOT suppress the local log line, a local logger that
+    throws does NOT suppress delivery, and nothing propagates out of
+    `emit`. A tee that let one branch's failure become two would recreate
+    the very loss it was built to prevent. Calling `emit_alert` per branch
+    rather than re-implementing a `try/except` here is deliberate: there is
+    then exactly ONE definition of "contained" in this module.
+
+    **Never names the endpoint.** The webhook URL is a bearer credential.
+    This class logs only an exception TYPE (in `close`), never a message --
+    `httpx` and `ssl` embed the full URL in theirs.
+    """
+
+    __slots__ = ("_sinks",)
+
+    def __init__(self, *sinks: AlertSink) -> None:
+        if not sinks:
+            raise ValueError("TeeAlertSink requires at least one branch sink")
+        self._sinks: tuple[AlertSink, ...] = tuple(sinks)
+
+    @property
+    def sinks(self) -> tuple[AlertSink, ...]:
+        """The branches, in invocation order. Read-only by construction."""
+        return self._sinks
+
+    def emit(self, payload: AlertPayload) -> None:
+        """Hand the SAME payload object to every branch, each contained."""
+        for sink in self._sinks:
+            emit_alert(sink, payload)
+
+    def close(self) -> None:
+        """Close every branch that owns a transport, duck-typed exactly as
+        `composition._close_alert_sink` does.
+
+        Never raises, and never stops early: one branch failing to close
+        must not leak another branch's socket. Only the exception TYPE is
+        logged -- a transport error's message can carry the webhook URL.
+        """
+        for sink in self._sinks:
+            closer = getattr(sink, "close", None)
+            if not callable(closer):
+                continue
+            try:
+                closer()
+            except BaseException as exc:  # noqa: BLE001 - teardown must never unwind
+                # `logger.exception` is deliberately NOT used here: an
+                # `httpx`/`ssl` traceback embeds the full webhook URL,
+                # which is a bearer credential. Only the TYPE is logged.
+                logger.error("alert sink branch close() failed: %s", type(exc).__name__)
+
+
 def resolve_alert_sink(env: Mapping[str, str] | None = None) -> AlertSink:
     """Return the `AlertSink` this process should use.
 
@@ -510,14 +585,29 @@ def resolve_alert_sink(env: Mapping[str, str] | None = None) -> AlertSink:
 
     `WebhookAlertSink` -- and the `httpx.Client` (and TLS context) inside
     it -- is constructed ONLY when `BREEZY_ALERT_WEBHOOK_URL` is set to a
-    non-empty value. Unset (the default) returns `LoggingAlertSink()` and
-    builds no client, opens no socket, and touches no `ssl` module state.
+    non-empty value. Unset (the default) returns a bare `LoggingAlertSink()`
+    and builds no client, opens no socket, and touches no `ssl` module
+    state.
+
+    **Configured means BOTH, never either/or.** A configured webhook
+    returns a `TeeAlertSink` whose branches are the local log FIRST and the
+    webhook second -- delivery off the box must never cost the node log
+    line, which is the authoritative forensic record (see
+    `TeeAlertSink`'s docstring for the regression this ordering and
+    fan-out exist to prevent). The log branch runs first so the local
+    record is written before a webhook POST that may block up to its
+    timeout; per-branch containment means the ordering is an ordering, not
+    a dependency.
+
+    A malformed URL still raises `ValueError` out of this function, loudly
+    and at construction: `WebhookAlertSink` is built before the tee, so a
+    bad endpoint can never be silently demoted to log-only.
     """
     active_env: Mapping[str, str] = os.environ if env is None else env
     url = active_env.get(ALERT_WEBHOOK_URL_ENV_VAR)
     if not url:
         return LoggingAlertSink()
-    return WebhookAlertSink(url)
+    return TeeAlertSink(LoggingAlertSink(), WebhookAlertSink(url))
 
 
 def alert_egress_configured(env: Mapping[str, str] | None = None) -> bool:

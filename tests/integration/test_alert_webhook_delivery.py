@@ -40,6 +40,8 @@ from breezy.runtime.health import (
     ALERT_WEBHOOK_URL_ENV_VAR,
     ALLOWED_ALERT_PAYLOAD_KEYS,
     AlertPayload,
+    LoggingAlertSink,
+    TeeAlertSink,
     WebhookAlertSink,
     emit_alert,
 )
@@ -218,3 +220,56 @@ def test_check_alerts_one_shot_exits_non_zero_when_the_receiver_500s(
     assert code == EXIT_DELIVERY_FAILED
     assert code != EXIT_OK
     assert "not delivered" in (capsys.readouterr().err).lower()
+
+
+# --------------------------------------------------------------------------
+# WP-B0a -- delivery must not COST the local forensic record
+# --------------------------------------------------------------------------
+
+
+def test_a_critical_alert_reaches_the_local_log_AND_the_real_receiver(
+    tls_material: TlsMaterial,
+    critical_payload: AlertPayload,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Both branches, proven on two independent artefacts: the bytes the
+    receiver took off the wire, and the node-log line."""
+    with loopback_https_receiver(tls_material) as receiver:
+        tee = TeeAlertSink(LoggingAlertSink(), _sink_for(receiver.url, tls_material))
+        try:
+            with caplog.at_level(logging.INFO, logger="breezy.runtime.health"):
+                emit_alert(tee, critical_payload)
+        finally:
+            tee.close()
+
+        assert len(receiver.received) == 1, "the alert never left the process"
+        body = receiver.received[0].json_body()
+
+    assert body == critical_payload.to_dict()
+    assert set(body) == set(ALLOWED_ALERT_PAYLOAD_KEYS)
+    rendered = [record.getMessage() for record in caplog.records]
+    assert any(
+        message.startswith(f"breezy alert event={critical_payload.event}")
+        for message in rendered
+    ), "delivery to the webhook destroyed the local log line (the WP-B0a regression)"
+
+
+def test_an_unreachable_webhook_does_not_cost_the_local_log_line(
+    tls_material: TlsMaterial,
+    critical_payload: AlertPayload,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Real transport failure, real local log line -- no mock in the path."""
+    dead_url = "https://127.0.0.1:1/alerts"
+    tee = TeeAlertSink(LoggingAlertSink(), _sink_for(dead_url, tls_material, timeout_s=1.0))
+    try:
+        with caplog.at_level(logging.INFO, logger="breezy.runtime.health"):
+            emit_alert(tee, critical_payload)  # must not raise
+    finally:
+        tee.close()
+
+    rendered = [record.getMessage() for record in caplog.records]
+    assert any(
+        message.startswith(f"breezy alert event={critical_payload.event}")
+        for message in rendered
+    )

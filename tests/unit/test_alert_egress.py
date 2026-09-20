@@ -35,8 +35,10 @@ from breezy.runtime.health import (
     ALLOWED_ALERT_PAYLOAD_KEYS,
     AlertPayload,
     LoggingAlertSink,
+    TeeAlertSink,
     WebhookAlertSink,
     alert_egress_configured,
+    emit_alert,
     log_alert_egress_status,
     resolve_alert_sink,
 )
@@ -78,7 +80,11 @@ def test_empty_string_env_means_egress_not_configured() -> None:
 def test_set_env_means_webhook_sink_and_egress_configured() -> None:
     env = {ALERT_WEBHOOK_URL_ENV_VAR: _WEBHOOK_URL}
     sink = resolve_alert_sink(env)
-    assert isinstance(sink, WebhookAlertSink)
+    # [WP-B0a] Configured egress now TEES: the webhook AND the local log.
+    # It is still true that a webhook sink is constructed -- it is no longer
+    # true that the local log branch is discarded to make room for it.
+    assert isinstance(sink, TeeAlertSink)
+    assert any(isinstance(branch, WebhookAlertSink) for branch in sink.sinks)
     sink.close()
     assert alert_egress_configured(env) is True
 
@@ -251,3 +257,180 @@ def test_check_alerts_severity_choices_are_closed() -> None:
             env={ALERT_WEBHOOK_URL_ENV_VAR: _WEBHOOK_URL},
             sink_factory=lambda _env: sink,
         )
+
+
+# --------------------------------------------------------------------------
+# WP-B0a -- the tee: delivery must not COST local diagnosability
+#
+# Regression measured in production on 2026-09-20. `resolve_alert_sink`
+# returned EITHER `LoggingAlertSink` OR `WebhookAlertSink`, never both.
+# While the webhook was unset every alert landed in the node log; the
+# afternoon the webhook was configured the node log went from 10 `breezy
+# alert` lines in the first ~51 minutes of uptime to ZERO, while 11 alerts
+# were delivered to the webhook. The node log is the authoritative forensic
+# record (it alone carries the boot-time permit line that proves order
+# capability) and three incidents this week were diagnosed by reading it.
+# Enabling delivery must never disable the local record.
+# --------------------------------------------------------------------------
+
+
+def test_configured_webhook_tees_to_the_local_log_and_the_webhook() -> None:
+    """The regression itself: configured egress keeps the LOCAL record."""
+    sink = resolve_alert_sink({ALERT_WEBHOOK_URL_ENV_VAR: _WEBHOOK_URL})
+    try:
+        assert isinstance(sink, TeeAlertSink)
+        branch_types = [type(branch) for branch in sink.sinks]
+        assert LoggingAlertSink in branch_types, (
+            "configuring a webhook must not remove the local log branch -- "
+            "that is exactly the regression this tee exists to prevent"
+        )
+        assert WebhookAlertSink in branch_types
+    finally:
+        sink.close()
+
+
+def test_unset_webhook_is_exactly_todays_behaviour_bare_logging_sink(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Unconfigured stays byte-for-byte what it is today: log only."""
+    import socket as socket_module
+
+    from breezy.runtime import health as health_module
+
+    def _no_client(*args: object, **kwargs: object) -> object:
+        raise AssertionError("no webhook client may be constructed when unset")
+
+    def _no_socket(*args: object, **kwargs: object) -> object:
+        raise AssertionError("no socket may be opened when the webhook is unset")
+
+    monkeypatch.setattr(health_module, "_build_webhook_client", _no_client)
+    monkeypatch.setattr(socket_module, "socket", _no_socket)
+
+    sink = resolve_alert_sink({})
+
+    assert isinstance(sink, LoggingAlertSink)
+    assert not isinstance(sink, TeeAlertSink)
+
+
+def test_a_failing_webhook_branch_still_writes_the_local_log_line(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Failure isolation A -- the webhook must not cost the log line."""
+    tee = TeeAlertSink(
+        LoggingAlertSink(), _FailingSink(RuntimeError("POST timed out"))
+    )
+    payload = AlertPayload(
+        severity="CRITICAL",
+        event="BREEZY_PERMIT_LAPSED",
+        site="trade_node",
+        detail="permit_lapsed",
+    )
+
+    with caplog.at_level(logging.INFO, logger="breezy.runtime.health"):
+        emit_alert(tee, payload)  # must not raise
+
+    rendered = [record.getMessage() for record in caplog.records]
+    assert any(
+        message.startswith("breezy alert event=BREEZY_PERMIT_LAPSED") for message in rendered
+    ), "a failing webhook branch suppressed the local forensic log line"
+
+
+def test_a_failing_local_logger_branch_still_reaches_the_webhook() -> None:
+    """Failure isolation B -- the log must not cost the delivery."""
+    delivered = _RecordingSink()
+    tee = TeeAlertSink(_FailingSink(RuntimeError("logging blew up")), delivered)
+    payload = AlertPayload(
+        severity="CRITICAL", event="BREEZY_FEE_SCHEDULE_HALT", site="trade_node", detail="halt"
+    )
+
+    emit_alert(tee, payload)  # must not raise
+
+    assert delivered.payloads == [payload], (
+        "a failing local branch suppressed webhook delivery"
+    )
+
+
+def test_a_baseexception_in_one_branch_neither_propagates_nor_suppresses() -> None:
+    """`emit_alert` catches `BaseException` by design; the tee must too."""
+    delivered = _RecordingSink()
+    tee = TeeAlertSink(_FailingSink(KeyboardInterrupt()), delivered)
+    payload = AlertPayload(severity="WARN", event="E", site="global", detail="d")
+
+    emit_alert(tee, payload)
+
+    assert delivered.payloads == [payload]
+
+
+def test_the_tee_itself_never_propagates_even_when_every_branch_fails() -> None:
+    tee = TeeAlertSink(_FailingSink(RuntimeError("a")), _FailingSink(RuntimeError("b")))
+
+    emit_alert(tee, AlertPayload(severity="INFO", event="E", site="global", detail="d"))
+
+
+def test_both_branches_receive_an_identical_allowlisted_payload() -> None:
+    first, second = _RecordingSink(), _RecordingSink()
+    tee = TeeAlertSink(first, second)
+    payload = AlertPayload(
+        severity="CRITICAL", event="BREEZY_STRUCTURAL_HALT", site="pm_us/KSFO", detail="x"
+    )
+
+    emit_alert(tee, payload)
+
+    assert first.payloads[0] is second.payloads[0]
+    assert first.payloads[0].to_dict() == second.payloads[0].to_dict()
+    assert set(first.payloads[0].to_dict()) <= ALLOWED_ALERT_PAYLOAD_KEYS
+
+
+def test_a_failing_webhook_branch_never_names_the_endpoint_in_its_own_logging(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """The webhook URL is a bearer credential; the tee adds no disclosure."""
+    secretish = "hooks.example.test/T000/B111/zzSECRETzz"
+    tee = TeeAlertSink(
+        LoggingAlertSink(), _FailingSink(RuntimeError(f"POST https://{secretish} failed"))
+    )
+
+    with caplog.at_level(logging.INFO, logger="breezy.runtime.health"):
+        emit_alert(tee, AlertPayload(severity="WARN", event="E", site="global", detail="d"))
+
+    rendered = " ".join(record.getMessage() for record in caplog.records)
+    assert "zzSECRETzz" not in rendered
+    assert "hooks.example.test" not in rendered
+
+
+def test_close_releases_every_branch_and_contains_a_failing_branch() -> None:
+    class _ClosingSink:
+        def __init__(self, *, fails: bool = False) -> None:
+            self.closed = 0
+            self._fails = fails
+
+        def emit(self, payload: AlertPayload) -> None:  # pragma: no cover - unused
+            raise AssertionError
+
+        def close(self) -> None:
+            self.closed += 1
+            if self._fails:
+                raise RuntimeError("close blew up")
+
+    failing, healthy = _ClosingSink(fails=True), _ClosingSink()
+    tee = TeeAlertSink(failing, LoggingAlertSink(), healthy)
+
+    tee.close()  # must not raise, and must not stop at the failing branch
+
+    assert failing.closed == 1
+    assert healthy.closed == 1
+
+
+@pytest.mark.parametrize(
+    "env",
+    [{}, {ALERT_WEBHOOK_URL_ENV_VAR: ""}, {ALERT_WEBHOOK_URL_ENV_VAR: _WEBHOOK_URL}],
+)
+def test_predicate_and_resolver_branch_on_the_same_condition(env: Mapping[str, str]) -> None:
+    """The predicate and the behaviour must not be able to drift apart."""
+    sink = resolve_alert_sink(env)
+    try:
+        assert alert_egress_configured(env) is isinstance(sink, TeeAlertSink)
+    finally:
+        close = getattr(sink, "close", None)
+        if callable(close):
+            close()
