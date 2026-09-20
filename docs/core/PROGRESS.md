@@ -101,3 +101,30 @@ Audits `docs/evidence/READINESS_AUDIT_2026-09-13.md` (delta), `READINESS_AUDIT_2
 (binding) · evidence `docs/evidence/` · runbook `docs/plans/R8_OPERATOR_RUNBOOK.md`
 · programme narrative `docs/core/PROGRAMME_PATH.md` · strategy authoring
 `docs/specs/STRATEGY_QUICKSTART.md` · pre-shrink history `docs/core/archive/`
+
+## 2026-09-20 — WP-R1 calibration defect found in production (open)
+
+`ZERO_CANDIDATES_EVALUATED_HALT` fired for MDW at 18:58Z on the first day the
+detector ran live, while MDW demonstrably evaluated at 18:48Z and 19:03Z
+(`IN_WINDOW_NOT_EXECUTABLE_WAIT`, same station, same window).
+
+**Cause.** A pre-decision WAIT is not a "candidate evaluated". When every tick
+in an observation window fails executability — an ordinary illiquid stretch —
+the window closes with a candidate count of zero and the detector reads that as
+a structural block.
+
+**Why it matters.** This is exactly the false page WP-R1 was designed to avoid:
+"the cost of a false page is an operator who stops reading alerts." The
+all-refused arm is correctly guarded (homogeneous reason ∈
+`STRUCTURAL_HALT_REASONS`); the zero-evaluation arm is not.
+
+**Fix (not yet applied).** ZERO-EVALUATION must distinguish *no ticks observed*
+(genuine: no eligible instrument, discovery collapse, subscription starvation)
+from *ticks observed but none reached a decision* (ordinary market condition).
+Gate it on observed tick count, not candidate count. Add a RED test built from
+this exact MDW 18:58Z shape.
+
+**Not a trading blocker** — observability only; the node was hunting normally
+throughout. Verified same-window: WS subscriptions healthy (30 instruments
+across LAX/MDW/MIA/SFO/NYC), no cap message (the apparent one was a GET URL
+containing `limit` as a query parameter).
