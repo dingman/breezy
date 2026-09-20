@@ -231,3 +231,163 @@ the same tally, or with the A0 window inside n, is the disguised move.
 `FEE_SCHEDULE_MISMATCH_REFUSALS` is currently **the only thing halting the
 bot.** A1(iii) removes it. Therefore the v4 family must land `family_halted` by
 default, armed only by a separate, evidenced decision.
+
+---
+
+# AMENDMENT B — architecture review (2026-09-20)
+
+Verdict **BUILD WITH THE NAMED CHANGES**. This amendment reorders the plan. All
+findings verified against source.
+
+## B-0 [CRITICAL, and it reorders everything] — alerts reach nobody
+
+**Verified:** `BREEZY_ALERT_WEBHOOK_URL` is not set in any file under
+`~/.config/breezy`, and is absent from the live node's own environment
+(`/proc/94168/environ`). `resolve_alert_sink` (`health.py:495`) therefore
+returns `LoggingAlertSink()`. **Every alert this system has ever emitted has
+gone to a log file nobody reads.**
+
+That is why the fee halt ran **three days** unnoticed and the permit lapse ran
+**eleven hours** unnoticed. Both were emitted. Neither was delivered.
+
+The plan's stated goal — *"we would KNOW if it stopped"* — is **unreachable by
+any detector** until this is fixed. B1's acceptance test as drafted proves
+*emission*, not *notification*, which is precisely the gap that cost three days.
+
+**NEW WP-B0 — alert egress. Blocks B1, B2, B3, R1. Size S.**
+Acceptance: an **out-of-process artefact an operator actually sees** for a
+CRITICAL — not a log line, not a test double. One delivered channel is enough.
+`WebhookAlertSink` already exists and is https-validated; this is configuration
+and a delivery test, not new machinery.
+
+## B-1 [HIGH] — A1 cites the WRONG FAMILY's statistic
+
+A1's precondition justified retirement using Fact 1 — the Murphy result
+(`D = −0.01518`, 384 rung-events). **That is the forecast-ladder family.** A1
+rules on `pm_us_crh_v4`: a different family, different manifest, different
+prefix, different D0.
+
+**This is the identical error I committed a correction for earlier today**
+(citing the median family's BSS for the traded rung unit), reproduced inside the
+plan that was supposed to be more careful than I was.
+
+**Resolution:** A1's precondition is a post-θ edge estimate **for
+`pm_us_crh` itself**. The Fact-1 justification is struck from A1. Declaring
+(ii) the default before A0 remains defensible, but it must rest on CRH's own
+numbers.
+
+## B-2 [HIGH] — C's power figure is wrong by 4×, and C1 abandons itself on day one
+
+| | value |
+|---|---|
+| WP-7b registered rate | ~0.5 qualifying events/station-day |
+| **measured residue** | 8 events over 64 scored instants = **0.125**/station-day |
+| station-days for n ≈ 30 | **240** ≈ 48 trading days at 5 stations ≈ **10 weeks** |
+| C1's abandonment bar | `< 0.25`/station-day — **2× ABOVE the measured rate** |
+
+C1 as drafted trips its own abandonment criterion immediately if measured
+honestly, and the 2026-09-19 holdout contained zero qualifying events.
+
+**Resolution:** C is NOT a three-week commitment. It proceeds **only** as a
+zero-marginal-cost rider — i.e. only if C0 shows the WS cap counts
+`requestId`s, making C1 a slug-list change at size S. **Before committing any
+capture weeks, run the qualifying-rate count on post-freeze YES data alone**
+(computable today, no NO capture needed). A measured rate ≥ 0.25/station-day is
+what would justify C; the current measurement is half that.
+
+## B-3 [HIGH] — B is mis-ordered internally; B2 is the control, B1 is telemetry
+
+`OrderSubmissionPermit.issue` (`order_enablement.py:207`) checks
+`clock.timestamp_ns() > expires_at_ns` **only at mint**. Once the permit object
+is held by the strategy, expiry is never re-checked at submit. **B2 alone closes
+that hole, and B2 depends on nothing.** B1 is telemetry over it.
+
+Additionally **B3 must precede B1**: a 10 h TTL minted at 16:50Z lapsing at
+02:50Z is the *designed* posture, so B1-as-written would emit a nightly CRITICAL
+for a non-fault until B3 rules on the window.
+
+**Resolution:** dependency `B2 → B1` is INVERTED. B2 becomes independent,
+size S. B1 becomes a backstop, after B3.
+
+## B-4 [HIGH] — B1 would be dead code at the moment it matters
+
+**Verified:** `midday_watch_window_end` (`trade_supervisor_core.py:697-701`)
+returns **01:00Z**. The permit lapses at **02:50Z**. The supervisor's watch has
+already closed. A detector hung on that loop never runs when the lapse occurs.
+
+**Resolution:** B1's site must be the **node**, not the supervisor — a Nautilus
+`Actor` with `self.clock.set_timer_ns` in `on_start`, which is the native
+extension point and needs no log scraping at all. This also retires the
+`_PERMIT_ISSUED_RE` regex drain through `IncrementalLogReader`.
+
+## B-5 [HIGH] — B2 should be ONE kernel guard, not a per-strategy gate
+
+Per-strategy gates violate DRY and a new strategy simply forgets them. The
+kernel-level `install_order_guard` seam — the same one `allow_short = False`
+uses — already covers every strategy. **Nautilus-native answer:** one guard at
+the kernel chokepoint, plus the `Actor` heartbeat from B-4.
+
+## B-6 [HIGH] — A0's abandonment criterion is already tripped before A0 runs
+
+"≥2 distinct θ within a week" is already satisfied by 0.06 (09-16) vs 0.0695
+(09-17). As drafted A0 is decorative. **Resolution:** the criterion must
+distinguish a **one-time step change** from **non-stationarity after 09-17**.
+
+## B-7 [MEDIUM] — A0 sizing and an unsatisfiable requirement
+
+A0 is not S: "≥5 consecutive days" is a 5-day clock blocking all of A. And
+"record the maker field independently" is **unsatisfiable from the catalog** —
+`parsing.py:1460-1461,1537-1538` write θ onto *both* flat fields, so
+`maker_fee == taker_fee == 0.0695` by construction. **Resolution:** pull raw
+wire JSON, never `instrument.maker_fee`.
+
+## B-8 [MEDIUM] — A1 sizing; (i)/(ii) reinvents an existing halt
+
+`continuous_family_check` → `family_not_halted` →
+`FAIL_CONTINUOUS_FAMILY_HALTED` plus `CONTINUOUS_FAMILY_HALT_CLEARED_MARKER`
+already exist, so A1(i)/(ii) is a store write plus a doc — **size S**.
+Conversely **A1(iii) is L, not M**: `load_family_manifest` refuses placeholder
+`boundary_inputs_sha256` / `density_artefact_sha256`, so v4 needs newly minted
+sha-pinned artefacts, plus `FamilyManifest`'s ~40 call sites.
+
+## B-9 [MEDIUM] — C2's dependency and C1's acceptance are both wrong
+
+C2's frozen statistic uses fee `θ·p·(1−p)` — and θ is exactly what A0 measures.
+**C2 depends on A0 AND C1**, and must name which θ it scores at.
+C1's acceptance demanded an L0 **bid** on the NO book; the NO book is thin and
+its bid side is routinely empty, and the frozen region needs the NO **ask**.
+**Resolution:** acceptance is "≥1 `^no` `order_book_depths` dir with an L0
+ASK".
+
+## B-10 — Four MISSING work packages
+
+- **WP-R1 — "all orders refused / zero orders today" detector.** A 100%
+  `fee_schedule_mismatch` refusal rate IS a halt, and it was logged at WARN.
+  **This, not the permit, is what cost three days.** Blocks on B0. Size S.
+- **WP-D1 — discovery attrition** (60 → 48 → 42 active markets with ERRORs).
+  **Blocks A0**, whose "all listed weather slugs" denominator is otherwise
+  defined by a failing lister — an underpowered verdict describing its sample.
+- **WP-Q1 — quote-tape gap root cause** (#10/#11, shard-1/shard-3, 10
+  instruments each). **Blocks C1**: with a shared 10-sub/connection cap, adding
+  NO legs can degrade the YES tape, which is the only asset we have.
+- **WP-T1 — the 2026-09-17 offer-tape collapse, 53,624 → 6 rows**, parked
+  "open, out of scope" in `FEE_SCHEDULE_PIN_2026-09-18.md:86`. The offer tape is
+  the ONLY channel distinguishing absent-θ from drifted-θ; its silent collapse
+  is a first-class defect and plausibly shares a root cause with D1.
+
+## Revised order of work
+
+```
+WP-B0 (alert egress)            <- blocks everything; nothing is knowable without it
+  -> B3 (window posture)
+  -> B2 (kernel guard, independent, size S)
+  -> WP-R1 (zero-orders / all-refused detector)
+  -> WP-D1 (discovery attrition)  -> A0 -> A1
+  -> B1 (node-side Actor heartbeat, backstop)
+WP-T1 (offer-tape collapse)     <- parallel, and informs A0
+WP-Q1 (tape gaps) -> C0 -> C1   <- C only as an S rider, and only if the
+                                   post-freeze YES qualifying rate >= 0.25
+```
+
+**The single most important change in this amendment:** WP-B0 comes first.
+Every detector in this plan is worthless until an alert can reach a human.
