@@ -58,6 +58,7 @@ from breezy.strategy.current_rung_hold.trial_day_latch import (
     TrialDayLatch,
     open_trial_day_latch,
 )
+from breezy.strategy.weather_common.halt_detector import HaltDetector
 from breezy.strategy.weather_common.refusals import RefusalAlerter
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
@@ -691,6 +692,18 @@ def install_current_rung_hold_refusal_watch(
             )
             setattr(strategy, binding.alerter_attr, alerter)
             wired.append(alerter)
+
+    # WP-R1: the halt detector, wired here rather than in a fourth
+    # `_AlerterBinding`, because it is NOT a `RefusalAlerter` -- it consumes
+    # the SAME cumulative `strategy.refusals` counter plus the take count and
+    # answers a different question (is this family structurally unable to
+    # trade?) through the same `AlertState`/`emit_alert` path. One instance
+    # per strategy, NEVER added to `wired`: the `COMPONENT_STATE_TOPIC`
+    # secondary path cannot say whether trading is expected right now, and
+    # only the per-tick call site knows that.
+    for strategy in strategies:
+        strategy.halt_detector = HaltDetector(site=str(strategy.id), sink=sink)
+
     if not wired:
         return
 

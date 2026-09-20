@@ -108,6 +108,7 @@ from breezy.strategy.current_rung_hold.trial_day_latch import (
     station_day_admission,
 )
 from breezy.strategy.depth10 import best_order
+from breezy.strategy.weather_common.halt_detector import HaltDetector
 from breezy.strategy.weather_common.refusals import RefusalAlerter, RefusalCounter
 from breezy.strategy.weather_common.running_extreme import (
     RunningExtremeAccumulator,
@@ -428,6 +429,14 @@ class ContinuousRungHoldStrategy(Strategy):
         self.diagnostics_alerter: RefusalAlerter | None = None
         self.position_events = RefusalCounter()
         self.position_alerter: RefusalAlerter | None = None
+        #: WP-R1: takes FINALIZED this process (counted at the same point
+        #: the trial-day latch goes IN_FLIGHT), and the detector that reads
+        #: it alongside `self.refusals`. Installed by
+        #: `install_current_rung_hold_refusal_watch`; `None` in a test or a
+        #: harness that never wires composition, in which case
+        #: `_observe_halt` is a no-op.
+        self.takes = 0
+        self.halt_detector: HaltDetector | None = None
         #: AC-13/N2 (R-8, L-30): the rendered `_startup_evidence_summary(...)`
         #: from the MOST RECENT `_run_never_arm_walk` call, on every one of
         #: its five return paths. Asserted by presence, never via log
@@ -1300,7 +1309,15 @@ class ContinuousRungHoldStrategy(Strategy):
                 self.refusal_alerter,
                 "continuous_rung_hold refusal report failed",
             )
+            self._observe_halt(trading_expected=False)
             return
+
+        # WP-R1: the ONE per-tick halt observation, placed here because this
+        # is the single point every in-window candidate passes through --
+        # ahead of the decision rather than at each of the refusal sites
+        # below, since the detector reads CUMULATIVE counters and only needs
+        # to be called often enough to close its window.
+        self._observe_halt(trading_expected=True)
 
         ask = snapshot.ask
         size = snapshot.size
@@ -1596,6 +1613,10 @@ class ContinuousRungHoldStrategy(Strategy):
         # against the ask actually evaluated, never the (later, different)
         # fill price -- otherwise the scorer's L-25 `fill_below_ask` guard
         # is inert by construction.
+        # WP-R1: one FINALIZED take. Counted here, at the same point the
+        # latch goes IN_FLIGHT -- never at `Take` construction, which the
+        # arm-time admission gates above can still refuse.
+        self.takes += 1
         self._decision_ask_by_station_day[(station, climate_day_key)] = ask
         self._latch.set_inflight(station, climate_day_key, key_instrument_id=iid)
         if self._submission_armed():
@@ -2424,6 +2445,30 @@ class ContinuousRungHoldStrategy(Strategy):
         self._report_alerter(
             self.diagnostics_alerter,
             "continuous_rung_hold diagnostics report failed",
+        )
+
+    def _observe_halt(self, *, trading_expected: bool) -> None:
+        """WP-R1: hand this tick's cumulative counters to the halt detector.
+
+        Observability ONLY, and guarded by `_run_observability` exactly like
+        every alerter call above: this can never raise into the decision
+        path and can never let an order through -- the detector submits
+        nothing and holds no reference to any gate it reports on.
+
+        `trading_expected` is this station's LST decision window: while it is
+        `False`, zero candidates is simply correct and no window can close.
+        """
+        detector = self.halt_detector
+        if detector is None:
+            return
+        self._run_observability(
+            "continuous_rung_hold halt detector failed",
+            lambda: detector.observe(
+                refusal_counts=self.refusals.counts,
+                takes=self.takes,
+                now_ns=self.clock.timestamp_ns(),
+                trading_expected=trading_expected,
+            ),
         )
 
     def _report_alerter(
