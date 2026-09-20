@@ -146,10 +146,33 @@ used unmodified for WP-7**: a flat subtraction inflates the hurdle by roughly
 
 Recorded before the run, because it very likely determines the outcome:
 
+**CORRECTED 2026-09-20 after the first run (amendment A7). The figure below was
+wrong when first registered.**
+
+Measured by the screen's own census, 4-station pool:
+
+| leg | station-days |
+|---|---|
+| venue depth tape | 81 |
+| + NWS CLI settlement truth | 73 |
+| + NBS forecast | **0** |
+
+**The corpus is DISJOINT.** The IEM MOS NBS archive ends 2026-01-03; the venue
+depth tape begins 2026-08-30. No station-day carries forecast AND truth AND
+price.
+
+The first draft of this section asserted "triple overlap n = 73". That 73 is the
+tape x settlement-truth overlap **with the forecast leg absent entirely**. It
+came from an early session inventory that I propagated into a pre-registration
+without verifying — the error is recorded here rather than quietly replaced,
+because a pre-registration that silently revises its own sample-size claim is
+worth nothing. The screen's census is what caught it.
+
+Historical record of the original (wrong) text: "Prior independent inventory of
+forecast x settlement-truth x venue-price triple overlap: n = 73 station-days
+total across the 4 NBS stations."
+
 - Venue quote tape: **2026-08-30 .. 2026-09-20**, ~22 calendar days.
-- Prior independent inventory of forecast x settlement-truth x venue-price
-  triple overlap: **n = 73 station-days total** across the 4 NBS stations
-  (NYC has no local forecast rows and is out of scope here).
 - The §3 bar requires `n >= 20` station-days **per window-pooled cell**. Each
   variant restricts to a window, so a variant's n is the subset of those ~73
   station-days carrying a would-take inside its window — materially fewer
@@ -161,6 +184,20 @@ corpus, never a PASS and never a KILL. A variant that clears the bar at n just
 above 20 on a 22-day tape should be treated as a candidate for confirmation,
 not as a result. This is written down now so that a thin PASS cannot later be
 narrated as a strong one.
+
+## 2.4 Strategy-lead rulings on the five ambiguities the first run surfaced (A8)
+
+Ruled 2026-09-20, **before any cell has non-zero n**, so none of these can be
+chosen with a result in view. All five are ratifications of what the first run
+did; none changes a gate.
+
+| # | Ambiguity | RULING |
+|---|---|---|
+| 1 | Fee rounding: §2.2 quoted 0.0146 at ask 0.30 (unrounded) but names `decision._fee`, which banker's-rounds to the cent (0.01) | **Use the production `_fee`, banker's-rounded.** The registered quantity is "what the live take rule prices"; an unrounded study fee would differ from what a trade actually costs. The rounded fee is the more permissive of the two, which is recorded as working against our own null. |
+| 2 | The `n` denominator (**material**) | **n = complete-join station-days (take or no-take), with `no_bid_side` retained as a no-take.** Under the take-only reading, §3's "> 50% of trials with margin > 0" is vacuous by construction, since `min_edge > 0` makes every take positive. "% positive" therefore means: the fraction of eligible station-days on which the variant found a liftable take with positive post-fee margin. The take-only median is reported beside it so both readings stay visible. |
+| 3 | C2 direction unspecified | **`ask < last liftable pre-window ask`.** This is the only direction aimed at the stale-repricing mechanism named in §5.6. Rungs with no pre-window ask are ineligible under C2. |
+| 4 | Staleness bound governs an observation, but the screen consumes a forecast | **Quote staleness is 0 by construction** (evaluated at each depth row's own `ts_event`). **No forecast-age cap is added**: cycle age is a reported §4.8 diagnostic, never a gate. Adding a cap would be an unenumerated knob, which §1(i) forbids. |
+| 5 | 0b's `forecasts_from_mos_payload` raises on any cycle after 12:00Z, so it cannot express "latest cycle <= the decision instant" | **A dedicated reader that keeps the runtime and applies the vintage rule at the registered instant, reusing the frozen `climate_day_for_txn` map.** This is a reader, not a second corpus. |
 
 ## 3. The per-cell measurement gate (not a hypothesis test)
 
