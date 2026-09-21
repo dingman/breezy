@@ -3338,6 +3338,17 @@ def test_x1_the_live_scan_actually_reaches_a_test_that_imports_the_exec_package(
     # `breezy.strategy.current_rung_hold.trial_day_latch` and sibling test
     # modules -- no `exec.*` import -- so X1's rule cannot fire on it and it
     # is correctly absent from this set.)
+    #
+    # Old -> new (this row, AUD-04 2026-09-21, portfolio ROI report): added
+    # `tests/unit/test_portfolio_roi_report.py`, which imports
+    # `DurableFillRecord` from `exec.client` to build ledger-fill fixtures for
+    # the offline capital-deployed / cash-identity report -- the SAME
+    # plain-data-record idiom as its `test_fill_time_count.py` and
+    # `test_live_family_tally_fill_source_cli.py` siblings above, so fixtures
+    # are encoded by the shipped record, never a second hand-written blob.
+    # WIDENED, not relaxed (L-6/L-12): the comparison is still `==`; the module
+    # carries NO pytest mark at all -- none of `SOCKET_RESTORING_MARKERS`
+    # appears in it -- constructs no client and opens no socket.
     assert exec_importing_test_modules() == {
         "tests/contract/test_exec_client_reconciliation_contract.py",
         "tests/contract/test_exec_client_wiring_contract.py",
@@ -3375,6 +3386,7 @@ def test_x1_the_live_scan_actually_reaches_a_test_that_imports_the_exec_package(
         "tests/unit/test_polymarket_us_startup_evidence.py",
         "tests/unit/test_polymarket_us_submit_order_chain.py",
         "tests/unit/test_polymarket_us_write_sequence.py",
+        "tests/unit/test_portfolio_roi_report.py",
         "tests/unit/test_score_live_trials_l38_family_prefix.py",
         "tests/unit/test_score_live_trials_state_db_source.py",
         # Old -> new (this row, AUD-02b 2026-09-21): added

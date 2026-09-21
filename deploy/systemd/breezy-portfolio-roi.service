@@ -1,0 +1,66 @@
+[Unit]
+# AUD-04 (docs/plans/backlog/AUDIT_2026-09-21/AUD-04-portfolio-roi-measurement.md
+# section 6 D1, section 7 step 5). Unattended, read-only portfolio-level ROI
+# report: realised P&L after fees, capital deployed, the account-balance
+# series, an unexplained-capital-flow line and ROI against two registered
+# baselines -- joining the durable fill ledger and the scored-trial store
+# family-agnostically, across the whole live record. Never gates on, and
+# never requires, AUD-05's family tally to have succeeded (section 6 D2):
+# AUD-05 is open and this item must still produce a number while it is.
+Description=Breezy AUD-04 unattended portfolio ROI report (daily)
+Documentation=file:///home/jon/breezy/deploy/systemd/README.md
+Documentation=file:///home/jon/breezy/scripts/analysis/portfolio_roi_report.py
+Documentation=file:///home/jon/breezy/docs/plans/backlog/AUDIT_2026-09-21/AUD-04-portfolio-roi-measurement.md
+
+# AUD-15a: alert on failure (timeout, OOM-kill, or non-zero exit) -- see
+# deploy/systemd/breezy-study-failed@.service and its own module docstring.
+OnFailure=breezy-study-failed@%n.service
+
+[Service]
+Type=oneshot
+WorkingDirectory=/home/jon/breezy
+
+# Light-unit band, matching breezy-position-monitor-report.service's own
+# ceiling and breezy-asos-refresh.service's re-homed one: this unit reads
+# two already-persisted local stores (the exec-state SQLite ledger and the
+# scored-trial parquet store) plus a bounded scan of log lines for the
+# balance series -- never a raw quote-tape scan like the heavy nightly
+# studies (breezy-k1-daily.service, MemoryHigh=12G/MemoryMax=16G, the
+# 2026-09-11 K1 incident's 17.6 GB peak). Still cites that incident's date
+# and unit because every unit on this host now carries an explicit ceiling
+# for that reason, however small its own working set.
+MemoryHigh=512M
+MemoryMax=1G
+
+# Shared aggregate ceiling across the nightly studies -- this unit takes
+# the same shared flock the wrapper below opens, so it participates in the
+# same serialization even though it is a light unit, not a heavy study.
+Slice=breezy-studies.slice
+UMask=0077
+
+# AUD-15 amendment discipline (2026-09-22): the ONLY EnvironmentFile= this
+# unit loads -- the dedicated, single-key alerts.env file (mode 0600,
+# holding just BREEZY_ALERT_WEBHOOK_URL), never breezy-trade.env/
+# polymarket.env/operator.env (which carry a venue credential or an
+# operator-reserved value this unit must never hold). Without it, this
+# unit's D8/D9 alert emission always resolves a LOG-ONLY sink -- detection
+# without delivery. The `-` prefix keeps the unit startable if the file is
+# absent.
+EnvironmentFile=-%h/.config/breezy/alerts.env
+ExecStart=/home/jon/breezy/deploy/systemd/portfolio-roi-run.sh
+
+# A bounded ledger/parquet join and a log scan -- generous but far under
+# breezy-k1-daily's heavy-study budget.
+TimeoutStartSec=600
+
+# No Restart=. A missed run is not an incident on its own -- the ledger and
+# scored-trial stores keep accumulating and tomorrow's run subsumes
+# today's over the same growing record. The timer's Persistent=true is
+# what recovers a run missed across a reboot.
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=breezy-portfolio-roi
+
+# NOTE: no [Install] section. This unit is started BY the timer, never
+# enabled directly. `systemctl --user enable breezy-portfolio-roi.timer` is
+# the only thing to enable.

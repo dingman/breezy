@@ -910,6 +910,93 @@ this unit too.
 
 ---
 
+## `breezy-portfolio-roi` — AUD-04 unattended portfolio ROI report (2026-09-21/22, PREPARED, NOT ACTIVATED)
+
+`breezy-portfolio-roi.service` + `.timer` + `deploy/systemd/
+portfolio-roi-run.sh` ship the daily, unattended, read-only portfolio-level
+ROI report of
+`docs/plans/backlog/AUDIT_2026-09-21/AUD-04-portfolio-roi-measurement.md`
+(section 6 D1, section 7 step 5). Each run invokes
+`scripts/analysis/portfolio_roi_report.py`, which joins the durable
+exec-state fill ledger and the scored-trial store family-agnostically
+across the whole live record and writes a PRIVATE Markdown + versioned JSON
+sibling under `~/.local/share/breezy/derived/` — realised P&L after fees,
+capital deployed, the account-balance series, an unexplained-capital-flow
+line, and ROI against the two registered baselines (B0 cash, B1 fee-drag
+null). No dollar figure ever reaches the journal, the wrapper log, or an
+alert (section 6 D6).
+
+**Gated on the score-live-trials marker, never on the family tally
+(section 6 D2).** The wrapper requires the same
+`$OUT/score_live_trials_ok_<stamp>` success marker
+`family-tally-v2-run.sh` requires, and deliberately never requires AUD-05's
+family tally to have succeeded — AUD-05 is open and this item must still
+produce a number while it is failing.
+
+**ASSUMPTION, named because the plan leaves it open.** The plan's section 7
+steps 2–3 name `portfolio_roi_report.py`'s loader FUNCTION signatures and
+its output artefact paths, but no CLI/argparse contract for the script
+itself (unlike `family_tally_v2.py`'s `--family`/`--store-dir`/`--as-of`/
+`--output`, which the plan names explicitly). The wrapper therefore invokes
+the script with **no arguments** — `"$PY" "$REPO/scripts/analysis/
+portfolio_roi_report.py"`. If the script's implementer lands a required
+flag, this invocation line and its pin in
+`tests/unit/test_portfolio_roi_deploy.py` both need updating together.
+
+**Light unit, not a heavy study.** `MemoryHigh=512M`/`MemoryMax=1G` (the
+same band as `breezy-position-monitor-report.service` and the re-homed
+`breezy-asos-refresh.service`) — this unit reads two already-persisted
+local stores plus a bounded log-line scan for the balance series, never a
+raw quote-tape scan. It still cites the 2026-09-11 K1 incident, joins
+`breezy-studies.slice`, and takes the shared studies flock
+(`portfolio-roi-run.sh` mirrors `position-monitor-report-run.sh`'s own
+skip-not-kill convention: lock contention exits 0, lock-infrastructure
+failure exits 75), so it never contends with a heavy study or the live
+node.
+
+**Alert env file.** The unit's only `EnvironmentFile=` is
+`-%h/.config/breezy/alerts.env` (the AUD-15 amendment single-key file,
+never `breezy-trade.env`/`polymarket.env`/`operator.env`), needed because
+the D8 frozen-input ladder and the D9 unsettled-position check both deliver
+through the existing shipped sink (`breezy.runtime.health.resolve_alert_sink`
+/ `emit_alert`) — without it, both would always resolve a LOG-ONLY sink on
+this host. See "AUD-15 alert env file" above for the full migration story.
+
+**`OnFailure=`.** `OnFailure=breezy-study-failed@%n.service`, the same
+notifier every other study-adjacent unit with a sibling timer declares
+(`tests/unit/test_study_failure_alert.py` scans the tree, so this unit is
+covered by that test's own discovery rather than a name added by hand).
+
+Scheduled at **17:40 UTC** — strictly after `breezy-family-tally@.timer`'s
+17:20 UTC tick (section 6 D1), and free against every occupied
+`OnCalendar=` on this host, pinned by
+`tests/unit/test_deploy_timer_hours.py`. This report never reads either
+PREREG tally's output, so the ordering is for a lower-contention slot on
+the shared studies lock, not for correctness.
+
+Validation performed (no unit activated):
+
+```
+$ bash -n deploy/systemd/portfolio-roi-run.sh
+OK
+```
+
+To activate: symlink all three files (`breezy-portfolio-roi.service`,
+`breezy-portfolio-roi.timer`) into `~/.config/systemd/user/` (§2's
+pattern), `daemon-reload`, then
+`systemctl --user enable --now breezy-portfolio-roi.timer` — never `start`
+the service directly; see the TRAP section above for the post-edit
+`daemon-reload` discipline that applies to any future edit of this unit
+too.
+
+**Rollback:** `systemctl --user disable --now breezy-portfolio-roi.timer`
+and revert the commit. Nothing else consumes the report's output except
+through the D7 sanctioned reader (`read_portfolio_roi_report()`), which
+refuses an absent or unknown-schema input, so rollback is total and
+fail-closed.
+
+---
+
 ## `breezy-exit-window-study` — nightly exit-window study (2026-09-16, PREPARED, NOT ACTIVATED)
 
 `breezy-exit-window-study.service` + `.timer` run the nightly offline "exit

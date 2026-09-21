@@ -2264,6 +2264,10 @@ def test_c10_submit_intent_and_operator_controls_reference_pins() -> None:
     ``strategy.current_rung_hold.set_family_halt_cli``, the SET sibling of
     ``clear_family_halt_cli.py``. Same property, same flock, same store --
     see the row's own comment below.
+
+    WIDENED again (AUD-04, 2026-09-21): old -> new adds the offline portfolio
+    ROI report, an analysis script importing ONLY the pure cent quantiser.
+    Same property, no accessor, no operator value -- see the row's own comment.
     """
     assert _modules_importing("submit_intent") == {
         "src/breezy/runtime/node_config.py",
@@ -2321,6 +2325,17 @@ def test_c10_submit_intent_and_operator_controls_reference_pins() -> None:
         # to key its own day-budget-exhausted read; no money accessor, no
         # operator value.
         "src/breezy/strategy/current_rung_hold/continuous_strategy.py",
+        # WIDENED (AUD-04, 2026-09-21), not relaxed (L-6/L-12): the comparison
+        # is still `==`; old -> new added exactly this one path. The offline
+        # portfolio ROI report imports ONE pure symbol,
+        # `_round_cost_up_to_cent`, so `capital_deployed` quantises `cost+fee`
+        # with the SAME ROUND_UP-to-the-cent rule `order_cost_usd` and
+        # `DailySpendLedger.true_up_booking` share (§6 D4). It imports no money
+        # accessor (`operator_max_position_cost_usd`/`operator_max_daily_
+        # budget_usd`), reads no operator value, opens no ledger, and runs
+        # offline in a `Type=oneshot` -- the same pure-helper class as the
+        # `utc_day_for_ns` rows above.
+        "scripts/analysis/portfolio_roi_report.py",
     }
 
 

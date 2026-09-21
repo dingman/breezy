@@ -1,0 +1,2667 @@
+"""Portfolio-level ROI report (AUD-04).
+
+**Stage C1a scope only.** This module currently provides:
+
+- the four verified loaders (ledger fills, scored trials, residual trial
+  ids, admissible scored trials) named in
+  ``docs/plans/backlog/AUDIT_2026-09-21/AUD-04-portfolio-roi-measurement.md``
+  section 7 step 2;
+- fill bucketing (scored / residual / unreconciled) and per-leg,
+  fee-inclusive, never-netted realised P&L and capital-deployed helpers
+  (section 6 D3/D4's ledger-only pieces);
+- the balance-series line parser, anchored on the literal ``AccountState(``
+  token, fail-closed to ``None`` (UNKNOWN) on any non-match (section 7
+  step 2's balance-line parser).
+
+**Stage C1b adds:** the cash-identity reconciliation and its
+settlement-date-proxy / proxy-lag classification (D4 R2/R3), the
+settled-through cutoff and its minimum-sample statistic selection (D4
+R4/R5/R6), the pure core of the D9 permanently-unsettled left-anti-join
+detector (flagging and `days_past_horizon` only), and ROI vs the two
+registered baselines (D5).
+
+**Stage C2 adds (this stage):** the versioned JSON schema and its sanctioned
+reader (D7), including the `roi_status`/`UnsettledCapitalRoiError` gating;
+the PRIVATE Markdown report and its header assembly; the D6 no-currency
+journal line; the D8 frozen-input detector and the D9
+permanently-unsettled-position alert, both driven by the shared
+``breezy.runtime.alert_ladder`` state machine; the fill -> `trial_id` join
+via ``score_live_trials.read_filled_trials_state_db`` (one call per
+(REGISTERED ``polymarket_us`` family manifest, station) pair, the same loop
+``score-live-trials-run.sh`` already drives); and the CLI ``main``.
+
+**Known gap, deliberately deferred, not a contradiction with the plan text
+naming only four loaders:** the plan's four named loaders do not, on their
+own, give a `DurableFillRecord` (keyed by `venue_order_id`) a `trial_id` --
+`ScoredTrial` and `residual_fills.ExcludedFill.trial_id` both key by
+`trial_id`, but only `ExcludedFill` also carries `venue_order_id`; a
+*scored* (non-residual) ledger fill's `venue_order_id` -> `trial_id` join
+requires the same `TrialDayRecord` join
+`scripts/analysis/score_live_trials.read_filled_trials_state_db` already
+performs, which is I/O-heavy domain logic out of this stage's four named
+loaders. This module therefore takes that join as an input
+(:class:`AttributedFill`) rather than resolving it -- keeping the bucketing
+and arithmetic below pure and independently testable -- and leaves
+constructing that mapping to the (also out-of-scope-this-stage) CLI
+``main``, which can reuse ``read_filled_trials_state_db`` unmodified.
+"""
+
+from __future__ import annotations
+
+import json
+import logging
+import math
+import os
+import re
+import sqlite3
+import sys
+import tempfile
+import time
+from collections.abc import Iterable, Mapping, Sequence
+from dataclasses import dataclass, replace
+from datetime import UTC, date, datetime, timedelta
+from decimal import Decimal, InvalidOperation
+from enum import Enum
+from pathlib import Path
+from typing import Final, Literal
+
+from breezy.adapters.polymarket_us.errors import ExecutionReportMappingError
+from breezy.adapters.polymarket_us.exec.client import FILL_KEY_PREFIX, DurableFillRecord
+from breezy.adapters.polymarket_us.factories import EXEC_STATE_DB_ENV_VAR
+from breezy.adapters.polymarket_us.operator_controls import _round_cost_up_to_cent
+from breezy.domain.instrument_leg import leg_of_symbol, symbol_of_instrument_id
+from breezy.persistence.family_manifest import FamilyManifestError, load_family_manifest
+from breezy.persistence.realized_draws import admissible_scored_trials
+from breezy.persistence.residual_fills import residual_trial_ids
+from breezy.persistence.scored_trial_store import read_scored_trials, read_scored_trials_pooled
+from breezy.registry.sites import SiteNotFoundError, default_registry
+from breezy.runtime import alert_ladder
+from breezy.runtime.health import (
+    AlertPayload,
+    AlertSink,
+    emit_alert,
+    log_alert_egress_status,
+    resolve_alert_sink,
+)
+from breezy.settlement.trial_scorer import FilledTrial, ScoredTrial
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
+from score_live_trials import (
+    FillSourceUnreadableError,
+    StorePositiveControlFailedError,
+    _with_scheduled_release_at_ns,
+    read_filled_trials_state_db,
+)
+
+logger = logging.getLogger(__name__)
+
+__all__ = [
+    "BALANCE_UNKNOWN_LABEL",
+    "BASELINE_B0_CASH",
+    "FEE_RECONCILED_LABEL",
+    "FEE_UNRECONCILED_LABEL",
+    "FROZEN_INPUTS_CLEARED_EVENT",
+    "FROZEN_INPUTS_EVENT",
+    "MIN_LAG_SAMPLE_N",
+    "ORDER_SIDE_BUY",
+    "ORDER_SIDE_SELL",
+    "PERMANENTLY_UNSETTLED_EVENT",
+    "PORTFOLIO_ROI_SCHEMA_VERSION",
+    "PROCEEDS_DATE_PROXY_LABEL",
+    "ROI_STATUS_GATED_UNSETTLED_CAPITAL",
+    "ROI_STATUS_OK",
+    "SETTLEMENT_HORIZON_GRACE_DAYS",
+    "STALE_INPUT_THRESHOLD_DAYS",
+    "STRUCTURAL_FALLBACK_LAG_DAYS",
+    "UNEXPLAINED_CAPITAL_FLOW_LABEL",
+    "UNEXPLAINED_OK_LABEL",
+    "UNEXPLAINED_PROXY_LAG_LABEL",
+    "UNRECONCILED_EXIT_LABEL",
+    "AttributedFill",
+    "BalancePoint",
+    "CumulativeReconciliation",
+    "DailyUnexplained",
+    "DailyUnexplainedSummaryRow",
+    "FamilyManifestAttribution",
+    "FamilyStationResult",
+    "FillBucket",
+    "FreshnessAlertDecision",
+    "LedgerPartitionViolationError",
+    "LedgerReadResult",
+    "PermanentlyUnsettledTrial",
+    "PortfolioRoiReportData",
+    "PortfolioRoiReportMalformedFieldError",
+    "PortfolioRoiReportView",
+    "RoiAgainstBaselines",
+    "UnknownOrderSideError",
+    "UnknownPortfolioRoiSchemaError",
+    "UnsettledCapitalRoiError",
+    "admissible_scored_trials",
+    "apply_freshness_ladder",
+    "apply_settled_through",
+    "apply_unsettled_positions_ladder",
+    "assert_ledger_partition",
+    "attribute_fills_via_family_manifests",
+    "baseline_b1_fee_drag",
+    "bucket_for_fill",
+    "bucket_ledger_fills",
+    "build_attribution_from_results",
+    "capital_deployed_by_day",
+    "capital_deployed_for_fill",
+    "compute_settled_through",
+    "count_exit_fills",
+    "cumulative_reconciliation",
+    "daily_balance_series",
+    "days_since_newest_input",
+    "enumerate_family_station_pairs",
+    "exit_label_for_fill",
+    "fee_reconciliation_label",
+    "fill_side_label",
+    "is_input_fresh",
+    "journal_line",
+    "leg_of_fill",
+    "main",
+    "max_settlement_horizon_ns",
+    "parse_account_state_line",
+    "per_day_tolerance",
+    "permanently_unsettled_trials",
+    "power_caveat",
+    "proceeds_by_day",
+    "proceeds_date",
+    "read_ledger_fills",
+    "read_ledger_fills_with_counts",
+    "read_portfolio_roi_report",
+    "read_scored_trials",
+    "read_scored_trials_pooled",
+    "reconcile_daily",
+    "render_markdown_report",
+    "residual_trial_ids",
+    "residual_trial_ids_pooled",
+    "roi",
+    "roi_against_baselines",
+    "settled_through_statistic_label",
+    "settlement_lag_days",
+    "settlement_payout",
+    "total_capital_deployed",
+    "total_realised_pnl_admissible",
+    "total_realised_pnl_all_settled",
+    "write_portfolio_roi_json",
+]
+
+# --------------------------------------------------------------------------
+# I1 -- ledger fill loader
+# --------------------------------------------------------------------------
+
+
+def _open_ledger_readonly(path: Path) -> sqlite3.Connection | None:
+    """Open ``path`` read-only, or return ``None``.
+
+    Deliberately mirrors ``scripts/analysis/fill_time_count.py``'s own
+    ``_open_readonly`` (:84-98) byte-for-byte in policy -- the same
+    read-only ``mode=ro`` URI idiom, so this reader can never contend with
+    the live process's own writer. Not imported from that module because it
+    is that module's own private helper; this is the SAME policy restated,
+    not a second one invented.
+    """
+    if not path.is_file():
+        return None
+    try:
+        conn = sqlite3.connect(f"file:{path.as_posix()}?mode=ro", uri=True)
+        conn.execute("SELECT 1 FROM state LIMIT 1")
+        return conn
+    except sqlite3.Error:
+        return None
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
+class LedgerReadResult:
+    """F4: the raw fill-prefixed row count and the undecodable-row count,
+    alongside the decoded fills -- so the partition
+    ``n_scored + n_residual + n_unreconciled == n_fills`` (§8 AC #2) can be
+    checked against something other than a count DERIVED from the very
+    buckets it is meant to validate, and so a row that fails to decode is
+    counted rather than silently dropped."""
+
+    fills: tuple[DurableFillRecord, ...]
+    n_ledger_rows: int
+    n_undecodable_ledger_rows: int
+
+
+def read_ledger_fills_with_counts(source_path: Path) -> LedgerReadResult | None:
+    """Every durable fill record under ``FILL_KEY_PREFIX`` in the exec-state
+    store at ``source_path``, plus the raw and undecodable row counts.
+
+    Fail-closed: returns ``None`` -- never an empty result -- when
+    ``source_path`` is absent or unreadable as this schema, mirroring
+    ``fill_time_count.count_filled_takes`` (:119-121). A row that fails to
+    decode as a ``DurableFillRecord`` is COUNTED (``n_undecodable_ledger_rows``),
+    never silently skipped with no trace (F4 defect: the pre-fix
+    :func:`read_ledger_fills` swallowed such a row via a bare ``continue``).
+    """
+    conn = _open_ledger_readonly(source_path)
+    if conn is None:
+        return None
+    try:
+        rows = conn.execute("SELECT key, value FROM state").fetchall()
+    except sqlite3.Error:
+        return None
+    finally:
+        conn.close()
+
+    fills: list[DurableFillRecord] = []
+    n_ledger_rows = 0
+    n_undecodable = 0
+    for key, value in rows:
+        if not isinstance(key, str) or not key.startswith(FILL_KEY_PREFIX):
+            continue
+        n_ledger_rows += 1
+        try:
+            fills.append(DurableFillRecord.from_bytes(value))
+        except ExecutionReportMappingError:
+            n_undecodable += 1
+            continue
+    return LedgerReadResult(
+        fills=tuple(fills), n_ledger_rows=n_ledger_rows, n_undecodable_ledger_rows=n_undecodable
+    )
+
+
+def read_ledger_fills(source_path: Path) -> tuple[DurableFillRecord, ...] | None:
+    """Every durable fill record under ``FILL_KEY_PREFIX`` in the exec-state
+    store at ``source_path``.
+
+    Fail-closed: returns ``None`` -- never an empty tuple -- when
+    ``source_path`` is absent or unreadable as this schema, mirroring
+    ``fill_time_count.count_filled_takes`` (:119-121). A row that fails to
+    decode as a ``DurableFillRecord`` is skipped (as
+    ``count_filled_takes`` already does), never treated as absence of the
+    whole store. Thin wrapper over :func:`read_ledger_fills_with_counts`,
+    kept for every existing caller of this exact signature.
+    """
+    result = read_ledger_fills_with_counts(source_path)
+    if result is None:
+        return None
+    return result.fills
+
+
+class LedgerPartitionViolationError(Exception):
+    """F4/§8 AC #2: the partition ``n_scored + n_residual + n_unreconciled ==
+    n_fills`` (or the raw == decoded + undecodable ledger-row count) does not
+    hold. Raised, never bypassed -- ``_run`` treats this as fail-loud: a
+    non-zero exit and no report written for that run."""
+
+
+def assert_ledger_partition(
+    *,
+    ledger_result: LedgerReadResult,
+    buckets: Mapping[FillBucket, tuple[AttributedFill, ...]],
+) -> None:
+    """Assert both halves of §8 AC #2's partition, non-bypassably (F4):
+    every DECODED fill lands in exactly one bucket, and every RAW
+    fill-prefixed row is either decoded or counted undecodable -- never a
+    count silently derived from the buckets themselves."""
+    n_bucketed = sum(len(rows) for rows in buckets.values())
+    if n_bucketed != len(ledger_result.fills):
+        raise LedgerPartitionViolationError(
+            f"bucketed={n_bucketed} != decoded_fills={len(ledger_result.fills)}"
+        )
+    expected_raw = len(ledger_result.fills) + ledger_result.n_undecodable_ledger_rows
+    if ledger_result.n_ledger_rows != expected_raw:
+        raise LedgerPartitionViolationError(
+            f"raw_ledger_rows={ledger_result.n_ledger_rows} != "
+            f"decoded={len(ledger_result.fills)} + "
+            f"undecodable={ledger_result.n_undecodable_ledger_rows}"
+        )
+
+
+# --------------------------------------------------------------------------
+# Leg-aware, never-netted capital deployed (D3/D4)
+# --------------------------------------------------------------------------
+
+
+def leg_of_fill(fill: DurableFillRecord) -> Literal["yes", "no"]:
+    """``"no"`` for a fill on a composite ``^no`` instrument id, else
+    ``"yes"`` -- the same rule ``realized_draws.stratum_row_from_scored_trial``
+    applies, restated here over a ledger fill instead of a ``ScoredTrial``."""
+    return leg_of_symbol(symbol_of_instrument_id(fill.instrument_id))
+
+
+#: F5: `DurableFillRecord.order_side` on this ledger is already NORMALISED
+#: (its own docstring: "a SELL record NETS against the longs (an R-8/R-9
+#: partial exit)") -- BUY is an open (capital deployed), SELL is an exit.
+#: No other value is a recognised side.
+ORDER_SIDE_BUY: Final[str] = "BUY"
+ORDER_SIDE_SELL: Final[str] = "SELL"
+
+#: F5: a SELL exit whose cash-proceeds/fee-sign semantics this reader cannot
+#: independently verify from `DurableFillRecord` alone. The plan itself
+#: never names this label or a SELL-handling fallback -- it only states
+#: (Section 6, "Null hypothesis" verdict), quoted verbatim from
+#: `docs/plans/backlog/AUDIT_2026-09-21/AUD-04-portfolio-roi-measurement.md:114`:
+#: "the live family never sells (G-12)". `UNRECONCILED_EXIT` and this whole
+#: SELL branch are review-driven hardening, added because an exit seam
+#: (AUD-07) now exists even though the live family does not yet use it --
+#: see :func:`exit_label_for_fill`'s docstring for why exclusion, rather
+#: than a guess, is the conservative choice.
+UNRECONCILED_EXIT_LABEL: Final[str] = "UNRECONCILED_EXIT"
+
+
+class UnknownOrderSideError(Exception):
+    """F5: a ledger fill's ``order_side`` is neither ``BUY`` nor ``SELL`` --
+    fail loud rather than silently treating an unrecognised venue-side value
+    as an open (which would silently inflate capital deployed) or as an exit
+    (which would silently exclude real capital from the denominator)."""
+
+
+def fill_side_label(fill: DurableFillRecord) -> str:
+    """``"BUY"`` or ``"SELL"``; raises :class:`UnknownOrderSideError` on any
+    other recorded ``order_side`` (F5)."""
+    if fill.order_side in (ORDER_SIDE_BUY, ORDER_SIDE_SELL):
+        return fill.order_side
+    raise UnknownOrderSideError(
+        f"ledger fill venue_order_id={fill.venue_order_id!r} has an unrecognised "
+        f"order_side={fill.order_side!r}; refusing to guess whether it is an "
+        "open or an exit"
+    )
+
+
+def exit_label_for_fill(fill: DurableFillRecord) -> str:
+    """The label a SELL exit is reported under (F5). `DurableFillRecord`
+    carries no field distinguishing a genuine cash-proceeds figure from a
+    netting-only cost basis on its ``cumulative_cost``/``cumulative_fee``
+    (`client.py`'s own docstring only says a SELL record "nets against the
+    longs" for ENTRY-PRICE purposes, `_entry_price_from_records`, never that
+    its cost figure is a venue cash credit) -- so this reader cannot verify
+    the fee sign or the cash-proceeds semantics of an exit fill from the
+    record alone.
+
+    The plan itself never anticipates a SELL at all: it assumed the live
+    family never sells (see :data:`UNRECONCILED_EXIT_LABEL`'s docstring for
+    the exact plan citation) and named no fallback for one. Handling a SELL
+    exit is therefore review-driven hardening, not a plan-documented
+    behaviour, added because an exit seam (AUD-07) now exists in the code
+    even though the live family has not yet used it. Given that gap in
+    verifiable semantics, `UNRECONCILED_EXIT` is the conservative choice:
+    every SELL is excluded from capital deployed and never folded into
+    `proceeds` (D4's `proceeds(D)` stays scored-trial-derived only,
+    unchanged by this fill) -- rather than guessed into either total -- and
+    is instead counted visibly via the dimensionless `n_exit_fills`. Only
+    called on a fill already known to be a SELL via :func:`fill_side_label`.
+    """
+    return UNRECONCILED_EXIT_LABEL
+
+
+def capital_deployed_for_fill(fill: DurableFillRecord) -> Decimal:
+    """One fill's cash-out: cost + fee, rounded UP to the cent via the same
+    helper ``order_cost_usd`` and the ledger true-up already share
+    (``operator_controls._round_cost_up_to_cent``) -- so this figure is
+    quantised identically to D4's later tolerance derivation. Reads no
+    operator-reserved control and assigns no value to one; it is a pure
+    rounding function over already-recorded ledger amounts.
+
+    Callers -- :func:`total_capital_deployed` and
+    :func:`capital_deployed_by_day` -- filter to BUY fills only (F5); this
+    function itself is side-agnostic arithmetic, kept usable on its own by
+    :func:`TestLegAwareCapitalDeployed`-style direct-cost assertions.
+    """
+    return _round_cost_up_to_cent(fill.cumulative_cost + fill.cumulative_fee)
+
+
+def total_capital_deployed(fills: Iterable[DurableFillRecord]) -> Decimal:
+    """Σ of :func:`capital_deployed_for_fill` over every given BUY (open)
+    fill (F5) -- never a SELL exit, whose cash this reader cannot verify
+    (see :func:`exit_label_for_fill`).
+
+    Leg-aware by construction, never netted: a YES fill and its sibling
+    ``^no`` fill on the same station-day are two distinct
+    ``DurableFillRecord`` rows (two distinct ``instrument_id``s), and this
+    sums both -- there is no station-day accumulator here to net them
+    into (§6 D4, R1 two-leg test).
+    """
+    return sum(
+        (
+            capital_deployed_for_fill(fill)
+            for fill in fills
+            if fill_side_label(fill) == ORDER_SIDE_BUY
+        ),
+        start=Decimal(0),
+    )
+
+
+def count_exit_fills(fills: Iterable[DurableFillRecord]) -> int:
+    """F5: the dimensionless count of SELL exits, reported as
+    ``n_exit_fills`` -- visibility for the capital this report deliberately
+    excludes from both the denominator and ROI."""
+    return sum(1 for fill in fills if fill_side_label(fill) == ORDER_SIDE_SELL)
+
+
+# --------------------------------------------------------------------------
+# Fee reconciliation labelling -- never silently modelled
+# --------------------------------------------------------------------------
+
+FEE_RECONCILED_LABEL: Final[str] = "fee_reconciled"
+FEE_UNRECONCILED_LABEL: Final[str] = "fee_unreconciled"
+
+
+def fee_reconciliation_label(fill: DurableFillRecord) -> str:
+    """Name the fill's fee-reconciliation state; never silently treats an
+    unreconciled fee as reconciled, and never zeroes or otherwise models a
+    substitute fee value -- the recorded ``cumulative_fee`` is used as-is
+    either way, the label is metadata a later stage's totals can key on."""
+    return FEE_RECONCILED_LABEL if fill.fee_reconciled else FEE_UNRECONCILED_LABEL
+
+
+# --------------------------------------------------------------------------
+# Fill bucketing -- scored / residual / unreconciled (I3 partition)
+# --------------------------------------------------------------------------
+
+
+class FillBucket(str, Enum):
+    """Exactly one of these three, never more than one, for every ledger
+    fill (§8 AC #2's partition)."""
+
+    SCORED = "scored"
+    RESIDUAL = "residual"
+    UNRECONCILED = "unreconciled"
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
+class AttributedFill:
+    """One ledger fill, with the ``trial_id`` it has already been
+    attributed to by the caller's own ``TrialDayRecord`` join (module
+    docstring's "known gap"). ``trial_id is None`` means no attribution was
+    ever made -- the fill is `unreconciled` regardless of what
+    ``scored_trial_ids``/``residual_trial_ids`` contain."""
+
+    fill: DurableFillRecord
+    trial_id: str | None
+
+
+def bucket_for_fill(
+    attributed: AttributedFill,
+    *,
+    scored_trial_ids: frozenset[str],
+    residual_trial_ids: frozenset[str],
+) -> FillBucket:
+    """One fill's bucket. Checked in a fixed order (scored, then residual,
+    then unreconciled) -- a `trial_id` present in both sets would be a data
+    contradiction, not decided by this pure function."""
+    if attributed.trial_id is not None and attributed.trial_id in scored_trial_ids:
+        return FillBucket.SCORED
+    if attributed.trial_id is not None and attributed.trial_id in residual_trial_ids:
+        return FillBucket.RESIDUAL
+    return FillBucket.UNRECONCILED
+
+
+def bucket_ledger_fills(
+    fills: Sequence[AttributedFill],
+    *,
+    scored_trial_ids: frozenset[str],
+    residual_trial_ids: frozenset[str],
+) -> dict[FillBucket, tuple[AttributedFill, ...]]:
+    """Partition every fill into exactly one bucket.
+
+    The three buckets' combined length always equals ``len(fills)`` --
+    every fill lands somewhere, never dropped and never counted twice
+    (§8 AC #2).
+    """
+    buckets: dict[FillBucket, list[AttributedFill]] = {
+        FillBucket.SCORED: [],
+        FillBucket.RESIDUAL: [],
+        FillBucket.UNRECONCILED: [],
+    }
+    for attributed in fills:
+        bucket = bucket_for_fill(
+            attributed,
+            scored_trial_ids=scored_trial_ids,
+            residual_trial_ids=residual_trial_ids,
+        )
+        buckets[bucket].append(attributed)
+    return {bucket: tuple(rows) for bucket, rows in buckets.items()}
+
+
+def residual_trial_ids_pooled(base_dir: Path) -> frozenset[str]:
+    """Union of :func:`residual_trial_ids` over every per-family subdirectory
+    of ``base_dir``, mirroring ``read_scored_trials_pooled``'s own per-family
+    iteration (``scored_trial_store.py:186``) -- but WITHOUT that reader's
+    legacy top-level union.
+
+    Every production caller of ``residual_trial_ids``/``read_excluded_fills``
+    passes a per-family ``store_dir`` -- ``family_tally_v2.py``'s own CLI
+    declares ``--store-dir`` as "6c scored-trial parquet directory"
+    (`family_tally_v2.py:1216`) and always resolves to one family's own
+    subdirectory; ``build_family_tally_v2`` (`family_tally_v2.py:633`) never
+    receives the family-agnostic parent. There is no documented pre-L-38
+    top-level ``excluded_fills.jsonl`` layout to stay backward-compatible
+    with (unlike ``scored_trials_*.parquet``'s legacy top-level files,
+    `scored_trial_store.py:152-163`), so a parent-level ``excluded_fills.jsonl``
+    is deliberately never read here.
+    """
+    if not base_dir.exists():
+        return frozenset()
+    ids: set[str] = set()
+    for child in sorted(p for p in base_dir.iterdir() if p.is_dir()):
+        ids |= residual_trial_ids(child)
+    return frozenset(ids)
+
+
+def scored_trial_ids_of(scored_trials: Iterable[ScoredTrial]) -> frozenset[str]:
+    """The set of `trial_id`s carried by every given (already-loaded)
+    `ScoredTrial` row -- a plain projection, kept as a named function so a
+    caller never inlines ``{t.trial_id for t in ...}`` independently at each
+    call site."""
+    return frozenset(trial.trial_id for trial in scored_trials)
+
+
+# --------------------------------------------------------------------------
+# Realised P&L -- I3: portfolio P&L is never scoped by n's admissibility
+# --------------------------------------------------------------------------
+
+
+def total_realised_pnl_all_settled(scored_trials: Iterable[ScoredTrial]) -> Decimal:
+    """Σ ``pnl`` over EVERY given settled trial, including one whose
+    `trial_id` is ALSO a PREREG v3 §5 residual exclusion.
+
+    `n` (the admissible, sequential-test-eligible count -- see
+    :func:`admissible_scored_trials`) is a narrower set; the account does
+    not know or care about `n`'s admissibility filter (plan §6, "I3 is the
+    single most important correctness property of this item"). A residual
+    fill still moved real money and must never be dropped from portfolio
+    P&L just because it is excluded from `n`.
+    """
+    return sum((trial.pnl for trial in scored_trials), start=Decimal(0))
+
+
+def total_realised_pnl_admissible(
+    scored_trials: tuple[ScoredTrial, ...], *, residual_trial_ids: frozenset[str]
+) -> Decimal:
+    """Σ ``pnl`` over only the admissible subset (`n`'s own rows) -- the
+    narrower, statistically-scoped figure, distinct from
+    :func:`total_realised_pnl_all_settled`."""
+    admissible = admissible_scored_trials(scored_trials, residual_trial_ids=residual_trial_ids)
+    return total_realised_pnl_all_settled(admissible)
+
+
+# --------------------------------------------------------------------------
+# I4 -- balance-series line parser
+# --------------------------------------------------------------------------
+
+#: Strips terminal colour escapes the node log wraps every line in, so the
+#: timestamp/field regexes below never have to account for them.
+_ANSI_ESCAPE_RE: Final[re.Pattern[str]] = re.compile(r"\x1b\[[0-9;]*m")
+
+#: The ISO-8601 UTC instant at the start of every node log line.
+_ISO_TS_RE: Final[re.Pattern[str]] = re.compile(
+    r"(?P<ts>\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d+Z)"
+)
+
+#: Anchored on the literal ``AccountState(`` token (plan §7 step 2). Only
+#: ``account_id`` and the first (and, on this venue, only) balance's
+#: ``total`` figure are extracted -- the two fields needed to build a
+#: :class:`BalancePoint`. No fallback pattern: a line whose shape has
+#: drifted from this one is UNKNOWN, never partially parsed.
+_ACCOUNT_STATE_RE: Final[re.Pattern[str]] = re.compile(
+    r"AccountState\(account_id=(?P<account_id>[^,]+),.*?"
+    r"balances=\[AccountBalance\(total=(?P<total_usd>-?\d+\.\d+) USD"
+)
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
+class BalancePoint:
+    """One successfully parsed ``AccountState(`` line."""
+
+    ts_iso: str
+    account_id: str
+    total_usd: Decimal
+
+
+def parse_account_state_line(line: str) -> BalancePoint | None:
+    """Parse one node-log line into a :class:`BalancePoint`, or ``None``.
+
+    Fail-closed on ANY non-match: no ``AccountState(`` token, no parseable
+    timestamp, an unexpected field shape, or a non-decimal balance all
+    return ``None`` -- never a partial `BalancePoint`, and never a second,
+    looser fallback regex.
+    """
+    if "AccountState(" not in line:
+        return None
+    cleaned = _ANSI_ESCAPE_RE.sub("", line)
+    ts_match = _ISO_TS_RE.search(cleaned)
+    account_match = _ACCOUNT_STATE_RE.search(cleaned)
+    if ts_match is None or account_match is None:
+        return None
+    try:
+        total_usd = Decimal(account_match.group("total_usd"))
+    except InvalidOperation:
+        return None
+    return BalancePoint(
+        ts_iso=ts_match.group("ts"),
+        account_id=account_match.group("account_id"),
+        total_usd=total_usd,
+    )
+
+
+def daily_balance_series(
+    lines: Iterable[str], *, days: Sequence[str]
+) -> Mapping[str, BalancePoint | None]:
+    """One entry per day in ``days`` (an explicit, caller-supplied list of
+    UTC calendar-day strings), so a day this run received NO parseable
+    balance line -- node never booted, log rotated away -- still appears in
+    the result, mapped to ``None`` (UNKNOWN), rather than being silently
+    absent (which a caller could not distinguish from "never asked about").
+    Never interpolates: a missing day's value is ``None``, not the previous
+    or next day's balance.
+
+    When more than one line parses for the same day, the LAST one
+    encountered (in the order ``lines`` iterates) wins -- callers are
+    expected to pass lines in chronological order, matching how the node
+    log itself is written.
+    """
+    latest_by_day: dict[str, BalancePoint] = {}
+    for line in lines:
+        point = parse_account_state_line(line)
+        if point is None:
+            continue
+        day = point.ts_iso[:10]
+        latest_by_day[day] = point
+    return {day: latest_by_day.get(day) for day in days}
+
+
+#: G1: how far back `_latest_balance_before` will search the SAME log lines
+#: for a genuine prior balance before the report period's earliest
+#: known-balance day. Bounded, never unbounded -- a value found further
+#: back than this is treated the same as none found (falls back to an
+#: explicit `NO_PRIOR_BALANCE` row rather than an arbitrarily stale diff).
+OPENING_BALANCE_LOOKBACK_DAYS: Final[int] = 7
+
+
+def _latest_balance_before(
+    lines: Iterable[str], *, before_day: str, max_lookback_days: int
+) -> BalancePoint | None:
+    """The most recent :class:`BalancePoint` whose day is strictly before
+    ``before_day`` and within ``max_lookback_days`` of it (G1) -- lets
+    ``_run`` supply a genuine prior balance for the report period's
+    earliest known-balance day when the node log carries an
+    ``AccountState(`` line from before the reporting period itself (e.g.
+    the node was already running before the first fill). Bounded and
+    best-effort: ``None`` when no such line exists in range, in which case
+    the caller falls back to an explicit ``NO_PRIOR_BALANCE_LABEL`` row
+    rather than fabricating one. When more than one line parses for the
+    same day, the LAST one encountered wins -- mirrors
+    :func:`daily_balance_series`.
+    """
+    earliest_allowed_day = _shift_iso_day(before_day, -max_lookback_days)
+    latest_by_day: dict[str, BalancePoint] = {}
+    for line in lines:
+        point = parse_account_state_line(line)
+        if point is None:
+            continue
+        day = point.ts_iso[:10]
+        if earliest_allowed_day <= day < before_day:
+            latest_by_day[day] = point
+    if not latest_by_day:
+        return None
+    return latest_by_day[max(latest_by_day)]
+
+
+# --------------------------------------------------------------------------
+# C1b -- day-of helpers shared by the cash identity and the D9 detector
+# --------------------------------------------------------------------------
+
+_NS_PER_DAY: Final[int] = 24 * 60 * 60 * 1_000_000_000
+
+#: Restated from ``breezy.settlement.trial_scorer._SEVEN_DAYS_NS``
+#: (`trial_scorer.py:56`) rather than importing that module's private name --
+#: same structural fallback window, cited per §6 D9's "read verbatim from
+#: source" instruction.
+_SEVEN_DAYS_NS: Final[int] = 7 * 24 * 60 * 60 * 1_000_000_000
+
+
+def _utc_day_of_ns(ts_ns: int) -> str:
+    """The UTC calendar-day (ISO date string) containing ``ts_ns``.
+
+    Integer nanosecond division, never a float -- the same discipline
+    ``operator_controls.utc_day_for_ns`` uses for the analogous conversion.
+    """
+    return datetime.fromtimestamp(ts_ns // 1_000_000_000, tz=UTC).date().isoformat()
+
+
+def _utc_day_of_fill(fill: DurableFillRecord) -> str:
+    """The UTC calendar day a ledger fill OPENED on -- ``capital_deployed``'s
+    dating rule (§6 D4: 'capital_deployed(D) = Sum over fills whose open is
+    dated D')."""
+    return _utc_day_of_ns(fill.ts_event)
+
+
+def _shift_iso_day(day: str, delta_days: int) -> str:
+    return (date.fromisoformat(day) + timedelta(days=delta_days)).isoformat()
+
+
+# --------------------------------------------------------------------------
+# C1b -- the cash identity's two ledger-scoped terms (§6 D4)
+# --------------------------------------------------------------------------
+
+
+def capital_deployed_by_day(fills: Iterable[DurableFillRecord]) -> dict[str, Decimal]:
+    """Sum of :func:`capital_deployed_for_fill` grouped by each fill's OPEN
+    day (§6 D4: 'capital_deployed(D) = Sum over fills whose open is dated D,
+    of cost + fee (cash OUT)'). BUY fills only (F5) -- a SELL exit never
+    contributes to this term."""
+    totals: dict[str, Decimal] = {}
+    for fill in fills:
+        if fill_side_label(fill) != ORDER_SIDE_BUY:
+            continue
+        day = _utc_day_of_fill(fill)
+        totals[day] = totals.get(day, Decimal(0)) + capital_deployed_for_fill(fill)
+    return totals
+
+
+def _fills_opened_count_by_day(fills: Iterable[DurableFillRecord]) -> dict[str, int]:
+    """BUY (open) fills only (F5) -- matches :func:`capital_deployed_by_day`,
+    so the per-day tolerance (`n_fills_that_day x $0.01`) is derived from the
+    same population as the capital-deployed term it bounds."""
+    counts: dict[str, int] = {}
+    for fill in fills:
+        if fill_side_label(fill) != ORDER_SIDE_BUY:
+            continue
+        day = _utc_day_of_fill(fill)
+        counts[day] = counts.get(day, 0) + 1
+    return counts
+
+
+def settlement_payout(trial: ScoredTrial) -> Decimal:
+    """The cash settlement payout for one settled trial.
+
+    ``score_trial`` computes ``pnl = (1 if held else 0) - fill_px - fee``
+    (`trial_scorer.py:206`) for a qty-1 admitted trial, so the payout is
+    recoverable as ``pnl + fill_px + fee`` regardless of the win/lose
+    outcome -- §6 D4's worked example: 'realised_pnl(position) = payout -
+    cost - fee, booked once, on the settlement date.'
+    """
+    return trial.pnl + trial.fill_px + trial.fee
+
+
+#: §6 D4 R3: "proceeds(D) is dated by the UTC calendar day of scored_at_ns,
+#: and by nothing else."
+PROCEEDS_DATE_PROXY_LABEL: Final[str] = "scored_at_ns_utc_day"
+
+
+def proceeds_date(trial: ScoredTrial) -> str:
+    """The day ``proceeds(D)`` attributes ``trial`` to (§6 D4 R3 quote
+    above) -- the UTC day of ``scored_at_ns``, never ``climate_day``."""
+    return _utc_day_of_ns(trial.scored_at_ns)
+
+
+def settlement_lag_days(trial: ScoredTrial) -> int:
+    """``scored_at_ns``'s UTC day minus ``climate_day`` (§6 D4 R3: '...the
+    measured distribution of settlement_lag_days (scored_at_ns's UTC day
+    minus climate_day)')."""
+    scored_day = date.fromisoformat(proceeds_date(trial))
+    climate_day = date.fromisoformat(trial.climate_day)
+    return (scored_day - climate_day).days
+
+
+def proceeds_by_day(scored_trials: Iterable[ScoredTrial]) -> dict[str, Decimal]:
+    """Sum of :func:`settlement_payout` grouped by :func:`proceeds_date`
+    (§6 D4: 'proceeds(D) = Sum over positions whose settlement is dated D,
+    of payout (cash IN)')."""
+    totals: dict[str, Decimal] = {}
+    for trial in scored_trials:
+        day = proceeds_date(trial)
+        totals[day] = totals.get(day, Decimal(0)) + settlement_payout(trial)
+    return totals
+
+
+def _days_potentially_explained_by_proxy_lag(
+    scored_trials: Iterable[ScoredTrial],
+) -> dict[str, int]:
+    """Every day a proxy-lagged trial could plausibly explain a breach on --
+    both its ``climate_day`` (the credit-day proxy) and its
+    :func:`proceeds_date` -- mapped to the largest lag applicable that day.
+
+    Quotes §6 D4 R3: 'a same-day cash-out/cash-in mismatch caused by the
+    proxy shows up as a nonzero unexplained(D) on the credit day and an
+    equal-and-opposite unexplained(D') on the scoring day' and 'A day whose
+    entire breach is explained by rows with settlement_lag_days > 1 or
+    settlement_basis == "venue_last_fair_price_fallback" is reported as
+    UNEXPLAINED_PROXY_LAG.'
+    """
+    explained: dict[str, int] = {}
+    for trial in scored_trials:
+        lag = settlement_lag_days(trial)
+        is_proxy_lag = lag > 1 or trial.settlement_basis == "venue_last_fair_price_fallback"
+        if not is_proxy_lag:
+            continue
+        for day in (trial.climate_day, proceeds_date(trial)):
+            explained[day] = max(explained.get(day, 0), lag)
+    return explained
+
+
+# --------------------------------------------------------------------------
+# C1b -- the per-day tolerance (§6 D4). The balance-delta term itself is now
+# computed windowed, over known-balance-to-known-balance intervals, by
+# `_balance_windows` (F3, below `reconcile_daily`) rather than a flat
+# day-over-day `balance_deltas` helper -- a hole in the series must never be
+# coerced into a known-zero delta on the day right after it.
+# --------------------------------------------------------------------------
+
+
+def per_day_tolerance(fills_opened_that_day: int) -> Decimal:
+    """§6 D4: 'The tolerance is not an asserted constant: it is
+    TOLERANCE_day = n_fills_that_day x $0.01, because the only rounding this
+    pipeline performs is the venue-cent ROUND_UP quantisation ... so the
+    maximum accumulated round-up error on a day is exactly one cent per
+    fill.'
+    """
+    return Decimal("0.01") * fills_opened_that_day
+
+
+# --------------------------------------------------------------------------
+# C1b -- the per-day reconciliation row and the cash identity itself
+# --------------------------------------------------------------------------
+
+UNEXPLAINED_OK_LABEL: Final[str] = "OK"
+UNEXPLAINED_CAPITAL_FLOW_LABEL: Final[str] = "UNEXPLAINED_CAPITAL_FLOW"
+UNEXPLAINED_PROXY_LAG_LABEL: Final[str] = "UNEXPLAINED_PROXY_LAG"
+PROVISIONAL_IN_FLIGHT_LABEL: Final[str] = "PROVISIONAL_IN_FLIGHT"
+#: F3: a day whose own balance is unknown (a "hole") -- its delta cannot be
+#: computed, so it is never coerced into a known zero. Excluded from every
+#: cumulative sum, never breaches, counted only in the dimensionless
+#: `n_balance_unknown_days`.
+BALANCE_UNKNOWN_LABEL: Final[str] = "BALANCE_UNKNOWN"
+
+#: G1: the earliest known-balance day in the whole series has no PRIOR
+#: balance to diff against -- its delta is genuinely UNKNOWN, exactly like a
+#: hole day, but it is NOT a hole (its own balance IS known) so
+#: :data:`BALANCE_UNKNOWN_LABEL` would be the wrong label. Excluded from
+#: every cumulative sum, never breaches, counted only in the dimensionless
+#: `n_no_prior_balance_days` (mirrors `n_balance_unknown_days`).
+NO_PRIOR_BALANCE_LABEL: Final[str] = "NO_PRIOR_BALANCE"
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
+class DailyUnexplained:
+    """One reconciliation row (§6 D4):
+    ``unexplained(D) = Delta_balance(D) - proceeds(D) + capital_deployed(D)``.
+
+    ``provisional`` is ``False`` until :func:`apply_settled_through` (or
+    :func:`cumulative_reconciliation`) marks a day past ``SETTLED_THROUGH``
+    -- the per-day tolerance, breach detection and classification are
+    unchanged on both sides of that cutoff (§8 AC #12: 'this criterion
+    narrows nothing').
+
+    **F3 -- balance holes are never coerced to a known zero.** ``day`` is
+    always the row's own resolving calendar day (never a range string, so
+    every existing string/date comparison over ``.day`` -- e.g.
+    :func:`apply_settled_through` -- is unaffected). Two shapes:
+
+    - A day whose OWN balance is unknown (a hole): ``classification ==
+      BALANCE_UNKNOWN_LABEL``, ``delta_balance is None``,
+      ``unexplained is None``, never breaches, excluded from every
+      cumulative sum.
+    - A day that RESOLVES a balance delta spanning one or more hole days
+      (``window_start_day != day``, ``spans_hole is True``): the row is
+      never silently attributed to just that one day -- ``capital_deployed``
+      and ``proceeds`` are the SUM over the whole
+      ``window_start_day..day`` span (inclusive), compared against the one
+      known delta that actually spans it, and named as such via
+      ``spans_hole``/``window_start_day`` rather than absorbed into an
+      ordinary single-day row.
+    """
+
+    day: str
+    window_start_day: str
+    spans_hole: bool
+    capital_deployed: Decimal
+    proceeds: Decimal
+    delta_balance: Decimal | None
+    unexplained: Decimal | None
+    tolerance: Decimal
+    breaches_tolerance: bool
+    settlement_lag_days: int | None
+    proceeds_date_proxy: str | None
+    classification: str
+    provisional: bool = False
+
+
+def _days_between_inclusive(start_day: str, end_day: str) -> tuple[str, ...]:
+    """Every ISO calendar-day string from ``start_day`` to ``end_day``
+    inclusive."""
+    start = date.fromisoformat(start_day)
+    end = date.fromisoformat(end_day)
+    span = (end - start).days
+    return tuple((start + timedelta(days=i)).isoformat() for i in range(span + 1))
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
+class _BalanceWindow:
+    """One known-balance-to-known-balance interval (F3). ``spans_hole`` is
+    ``True`` exactly when ``window_start_day != end_day`` -- i.e. at least
+    one calendar day between the previous known balance and this one has no
+    known balance of its own."""
+
+    window_start_day: str
+    end_day: str
+    delta: Decimal
+    spans_hole: bool
+
+
+def _balance_windows(daily_balances: Mapping[str, Decimal | None]) -> tuple[_BalanceWindow, ...]:
+    known_days = sorted(day for day, balance in daily_balances.items() if balance is not None)
+    windows: list[_BalanceWindow] = []
+    previous_day: str | None = None
+    previous_balance: Decimal | None = None
+    for day in known_days:
+        balance = daily_balances[day]
+        assert balance is not None  # narrowed by the `known_days` filter above
+        if previous_day is not None:
+            assert previous_balance is not None
+            window_start_day = _shift_iso_day(previous_day, 1)
+            windows.append(
+                _BalanceWindow(
+                    window_start_day=window_start_day,
+                    end_day=day,
+                    delta=balance - previous_balance,
+                    spans_hole=window_start_day != day,
+                )
+            )
+        previous_day = day
+        previous_balance = balance
+    return tuple(windows)
+
+
+def reconcile_daily(
+    *,
+    fills: Sequence[DurableFillRecord],
+    scored_trials: Sequence[ScoredTrial],
+    daily_balances: Mapping[str, Decimal | None],
+) -> tuple[DailyUnexplained, ...]:
+    """The cash identity (§6 D4), windowed over known-balance-to-known-balance
+    intervals (F3) so a hole in the balance series is never coerced into a
+    known-zero delta.
+
+    Quotes the identity verbatim: 'unexplained(D) = Delta_balance(D) -
+    proceeds(D) + capital_deployed(D)'. Never nets a breach into ROI or into
+    another day's figure -- each row is independent; only a caller's
+    explicit cumulative sum (see :func:`cumulative_reconciliation`) combines
+    them, and :class:`BALANCE_UNKNOWN_LABEL` rows never enter that sum.
+    """
+    capital_by_day = capital_deployed_by_day(fills)
+    fills_opened_count = _fills_opened_count_by_day(fills)
+    proceeds_totals = proceeds_by_day(scored_trials)
+    proxy_lag_days = _days_potentially_explained_by_proxy_lag(scored_trials)
+
+    rows: list[DailyUnexplained] = []
+    resolved_days: set[str] = set()
+
+    windows = _balance_windows(daily_balances)
+    for window in windows:
+        span_days = _days_between_inclusive(window.window_start_day, window.end_day)
+        capital_deployed = sum(
+            (capital_by_day.get(day, Decimal(0)) for day in span_days), start=Decimal(0)
+        )
+        proceeds = sum(
+            (proceeds_totals.get(day, Decimal(0)) for day in span_days), start=Decimal(0)
+        )
+        n_fills_in_span = sum(fills_opened_count.get(day, 0) for day in span_days)
+        unexplained = window.delta - proceeds + capital_deployed
+        tolerance = per_day_tolerance(n_fills_in_span)
+        breaches = abs(unexplained) > tolerance
+        lag = max(
+            (proxy_lag_days[day] for day in span_days if day in proxy_lag_days), default=None
+        )
+        if not breaches:
+            classification = UNEXPLAINED_OK_LABEL
+        elif lag is not None:
+            classification = UNEXPLAINED_PROXY_LAG_LABEL
+        else:
+            classification = UNEXPLAINED_CAPITAL_FLOW_LABEL
+        proceeds_date_proxy = PROCEEDS_DATE_PROXY_LABEL if proceeds != Decimal(0) else None
+        rows.append(
+            DailyUnexplained(
+                day=window.end_day,
+                window_start_day=window.window_start_day,
+                spans_hole=window.spans_hole,
+                capital_deployed=capital_deployed,
+                proceeds=proceeds,
+                delta_balance=window.delta,
+                unexplained=unexplained,
+                tolerance=tolerance,
+                breaches_tolerance=breaches,
+                settlement_lag_days=lag,
+                proceeds_date_proxy=proceeds_date_proxy,
+                classification=classification,
+            )
+        )
+        resolved_days.update(span_days)
+
+    # G1: the earliest known-balance day in the series is never the END of
+    # any window above (a window needs a PREVIOUS known day to diff
+    # against) and its own balance IS known, so it is never picked up by
+    # the BALANCE_UNKNOWN sweep below either -- without this row it is
+    # silently dropped: its capital/proceeds are computed but land in no
+    # row at all. Emitted with a distinct label, its own day's
+    # capital/proceeds for transparency, and `unexplained=None` so it is
+    # excluded from every cumulative sum exactly like a `BALANCE_UNKNOWN`
+    # row (see `cumulative_reconciliation`'s `row.unexplained is not None`
+    # filter).
+    known_days = sorted(day for day, balance in daily_balances.items() if balance is not None)
+    if known_days:
+        earliest_known_day = known_days[0]
+        resolved_end_days = {window.end_day for window in windows}
+        if earliest_known_day not in resolved_end_days:
+            capital_deployed = capital_by_day.get(earliest_known_day, Decimal(0))
+            proceeds = proceeds_totals.get(earliest_known_day, Decimal(0))
+            rows.append(
+                DailyUnexplained(
+                    day=earliest_known_day,
+                    window_start_day=earliest_known_day,
+                    spans_hole=False,
+                    capital_deployed=capital_deployed,
+                    proceeds=proceeds,
+                    delta_balance=None,
+                    unexplained=None,
+                    tolerance=per_day_tolerance(fills_opened_count.get(earliest_known_day, 0)),
+                    breaches_tolerance=False,
+                    settlement_lag_days=proxy_lag_days.get(earliest_known_day),
+                    proceeds_date_proxy=(
+                        PROCEEDS_DATE_PROXY_LABEL if proceeds != Decimal(0) else None
+                    ),
+                    classification=NO_PRIOR_BALANCE_LABEL,
+                )
+            )
+
+    # F3: every day whose OWN balance is unknown -- whether or not it also
+    # falls inside a resolving window above -- is separately named
+    # BALANCE_UNKNOWN for visibility. Its capital/proceeds figures are shown
+    # for transparency but this row never enters a cumulative sum (its
+    # `unexplained` is `None`), so nothing is double-counted against the
+    # window row that already reconciled the span.
+    unknown_days = sorted(
+        (set(capital_by_day) | set(proceeds_totals) | set(daily_balances))
+        - {day for day, balance in daily_balances.items() if balance is not None}
+    )
+    for day in unknown_days:
+        capital_deployed = capital_by_day.get(day, Decimal(0))
+        proceeds = proceeds_totals.get(day, Decimal(0))
+        rows.append(
+            DailyUnexplained(
+                day=day,
+                window_start_day=day,
+                spans_hole=False,
+                capital_deployed=capital_deployed,
+                proceeds=proceeds,
+                delta_balance=None,
+                unexplained=None,
+                tolerance=per_day_tolerance(fills_opened_count.get(day, 0)),
+                breaches_tolerance=False,
+                settlement_lag_days=proxy_lag_days.get(day),
+                proceeds_date_proxy=(
+                    PROCEEDS_DATE_PROXY_LABEL if proceeds != Decimal(0) else None
+                ),
+                classification=BALANCE_UNKNOWN_LABEL,
+            )
+        )
+
+    return tuple(sorted(rows, key=lambda row: row.day))
+
+
+# --------------------------------------------------------------------------
+# C1b -- the settled-through cutoff and its minimum-sample statistic (§6 D4
+# R4/R5/R6)
+# --------------------------------------------------------------------------
+
+#: §6 D4 R5: "MIN_LAG_SAMPLE_N = 20. With lag_sample_n < MIN_LAG_SAMPLE_N,
+#: the cutoff uses max(observed settlement_lag_days); at or above it,
+#: p99(observed settlement_lag_days)."
+MIN_LAG_SAMPLE_N: Final[int] = 20
+
+#: §6 D4 R4: "the 7 floor is the structural fallback lag" -- restated from
+#: `trial_scorer._SEVEN_DAYS_NS` as a whole number of days.
+STRUCTURAL_FALLBACK_LAG_DAYS: Final[int] = 7
+
+
+def _interpolated_percentile(sorted_values: Sequence[int], percentile: float) -> float:
+    """Linear-interpolation percentile -- 'the common default, and the one
+    an implementer reaches for' (§6 D4 R5), deliberately used ONLY at or
+    above :data:`MIN_LAG_SAMPLE_N` by :func:`_observed_lag_statistic`."""
+    if len(sorted_values) == 1:
+        return float(sorted_values[0])
+    rank = (len(sorted_values) - 1) * (percentile / 100)
+    lower_index = math.floor(rank)
+    upper_index = math.ceil(rank)
+    if lower_index == upper_index:
+        return float(sorted_values[int(rank)])
+    lower_weight = sorted_values[lower_index] * (upper_index - rank)
+    upper_weight = sorted_values[upper_index] * (rank - lower_index)
+    return lower_weight + upper_weight
+
+
+def _observed_lag_statistic(lags: Sequence[int]) -> tuple[Literal["max", "p99"], int]:
+    """Select and evaluate the lag statistic per §6 D4 R5's minimum-sample
+    rule. An empty sample is treated as the ``max`` branch over zero
+    observations -- :func:`compute_settled_through` then applies the bare
+    structural floor, so this never narrows the cutoff (§6 D4 R5: 'the
+    small-n branch can only WIDEN the cutoff, never narrow it')."""
+    if not lags:
+        return "max", 0
+    sorted_lags = sorted(lags)
+    if len(sorted_lags) < MIN_LAG_SAMPLE_N:
+        return "max", max(sorted_lags)
+    return "p99", math.ceil(_interpolated_percentile(sorted_lags, 99))
+
+
+def compute_settled_through(
+    *, now_day: str, lags: Sequence[int]
+) -> tuple[str, Literal["max", "p99"], int]:
+    """``(settled_through_day, statistic_name, lag_sample_n)`` (§6 D4 R4):
+    'SETTLED_THROUGH = D_now - max(7, observed p99 settlement_lag_days)',
+    with the statistic chosen by :func:`_observed_lag_statistic`."""
+    statistic_name, observed_value = _observed_lag_statistic(lags)
+    cutoff_days = max(STRUCTURAL_FALLBACK_LAG_DAYS, observed_value)
+    settled_through_day = _shift_iso_day(now_day, -cutoff_days)
+    return settled_through_day, statistic_name, len(lags)
+
+
+def settled_through_statistic_label(*, statistic_name: str, lag_sample_n: int) -> str:
+    """The header FRAGMENT §8 AC #12 requires; header assembly itself is a
+    later stage. Quotes §6 D4 R5 verbatim:
+    'settled_through_statistic=<max|p99> lag_sample_n=<n>'."""
+    return f"settled_through_statistic={statistic_name} lag_sample_n={lag_sample_n}"
+
+
+def apply_settled_through(
+    rows: Sequence[DailyUnexplained], *, settled_through: str
+) -> tuple[DailyUnexplained, ...]:
+    """Mark every row whose day is AFTER ``settled_through`` as
+    ``provisional`` (§6 D4 R4: labelled 'PROVISIONAL_IN_FLIGHT' and
+    'excluded from the cumulative pass/fail determination'). Per-day
+    tolerance, breach detection and classification are untouched."""
+    return tuple(
+        row if row.day <= settled_through else replace(row, provisional=True) for row in rows
+    )
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
+class CumulativeReconciliation:
+    """The settled-vs-provisional split of one reconciliation run (§6 D4
+    R4/R5). ``settled_cumulative_passes`` gates only over
+    ``D <= settled_through``; the provisional tail's own sum is printed
+    beside it as an explicitly non-gating figure, never suppressed."""
+
+    settled_through: str
+    all_rows: tuple[DailyUnexplained, ...]
+    settled_rows: tuple[DailyUnexplained, ...]
+    provisional_rows: tuple[DailyUnexplained, ...]
+    settled_cumulative_unexplained: Decimal
+    provisional_cumulative_unexplained: Decimal
+    settled_cumulative_passes: bool
+    #: F3: count of `BALANCE_UNKNOWN_LABEL` rows -- excluded from both
+    #: cumulative sums above, dimensionless, never a gating figure.
+    n_balance_unknown_days: int
+    #: G1: count of `NO_PRIOR_BALANCE_LABEL` rows -- excluded from both
+    #: cumulative sums above, dimensionless, never a gating figure.
+    n_no_prior_balance_days: int
+
+
+def cumulative_reconciliation(
+    *, daily_rows: Sequence[DailyUnexplained], settled_through: str
+) -> CumulativeReconciliation:
+    """Split ``daily_rows`` at ``settled_through`` and evaluate the
+    cumulative pass/fail determination ONLY over the settled side (§8 AC
+    #12: 'The cumulative Sum_D unexplained pass/fail determination applies
+    ONLY to days D <= SETTLED_THROUGH').
+
+    F3: a `BALANCE_UNKNOWN_LABEL` row's `unexplained` is `None` (its delta is
+    genuinely unknown, never a known zero) and is EXCLUDED from both
+    cumulative sums -- counted instead in `n_balance_unknown_days`.
+    """
+    all_rows = apply_settled_through(daily_rows, settled_through=settled_through)
+    settled_rows = tuple(
+        row for row in all_rows if not row.provisional and row.unexplained is not None
+    )
+    provisional_rows = tuple(
+        row for row in all_rows if row.provisional and row.unexplained is not None
+    )
+    settled_cumulative = sum(
+        (row.unexplained for row in settled_rows if row.unexplained is not None),
+        start=Decimal(0),
+    )
+    provisional_cumulative = sum(
+        (row.unexplained for row in provisional_rows if row.unexplained is not None),
+        start=Decimal(0),
+    )
+    settled_tolerance = sum((row.tolerance for row in settled_rows), start=Decimal(0))
+    n_balance_unknown_days = sum(
+        1 for row in all_rows if row.classification == BALANCE_UNKNOWN_LABEL
+    )
+    n_no_prior_balance_days = sum(
+        1 for row in all_rows if row.classification == NO_PRIOR_BALANCE_LABEL
+    )
+    return CumulativeReconciliation(
+        settled_through=settled_through,
+        all_rows=all_rows,
+        settled_rows=settled_rows,
+        provisional_rows=provisional_rows,
+        settled_cumulative_unexplained=settled_cumulative,
+        provisional_cumulative_unexplained=provisional_cumulative,
+        settled_cumulative_passes=abs(settled_cumulative) <= settled_tolerance,
+        n_balance_unknown_days=n_balance_unknown_days,
+        n_no_prior_balance_days=n_no_prior_balance_days,
+    )
+
+
+# --------------------------------------------------------------------------
+# C1b -- D9's pure core: the permanently-unsettled left-anti-join detector
+# --------------------------------------------------------------------------
+
+#: §6 D9: "SETTLEMENT_HORIZON_GRACE_DAYS = 3" -- the scorer's own nightly
+#: cadence margin on top of the structural fallback bound.
+SETTLEMENT_HORIZON_GRACE_DAYS: Final[int] = 3
+_SETTLEMENT_HORIZON_GRACE_NS: Final[int] = SETTLEMENT_HORIZON_GRACE_DAYS * _NS_PER_DAY
+
+
+def max_settlement_horizon_ns(scheduled_release_at_ns: int) -> int:
+    """§6 D9: 'MAX_SETTLEMENT_HORIZON_NS = trial.scheduled_release_at_ns +
+    _SEVEN_DAYS_NS + SETTLEMENT_HORIZON_GRACE_NS'."""
+    return scheduled_release_at_ns + _SEVEN_DAYS_NS + _SETTLEMENT_HORIZON_GRACE_NS
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
+class PermanentlyUnsettledTrial:
+    """One `FilledTrial` past its settlement horizon with no matching
+    `ScoredTrial` (§6 D9's left-anti-join on `trial_id`)."""
+
+    trial_id: str
+    scheduled_release_at_ns: int
+    days_past_horizon: int
+
+
+def permanently_unsettled_trials(
+    filled_trials: Iterable[FilledTrial],
+    *,
+    scored_trial_ids: frozenset[str],
+    now_ns: int,
+) -> tuple[PermanentlyUnsettledTrial, ...]:
+    """§6 D9: 'the left-anti-join of FilledTrial on ScoredTrial by trial_id',
+    flagging every row past :func:`max_settlement_horizon_ns`.
+
+    Pure core only, this stage: the caller is responsible for the
+    `roi_status`/`UnsettledCapitalRoiError` gating (D7, out of this stage's
+    touch-set) and the `PORTFOLIO_ROI_POSITION_PERMANENTLY_UNSETTLED` alert
+    (D8's shared `alert_ladder`, a separate concurrent stage). A trial
+    inside its horizon is never flagged (§6 D9's negative half: 'the
+    detector cannot be satisfied by flagging every open position').
+    """
+    flagged: list[PermanentlyUnsettledTrial] = []
+    for trial in filled_trials:
+        if trial.trial_id in scored_trial_ids:
+            continue
+        horizon_ns = max_settlement_horizon_ns(trial.scheduled_release_at_ns)
+        if now_ns <= horizon_ns:
+            continue
+        days_past_horizon = (now_ns - horizon_ns) // _NS_PER_DAY
+        flagged.append(
+            PermanentlyUnsettledTrial(
+                trial_id=trial.trial_id,
+                scheduled_release_at_ns=trial.scheduled_release_at_ns,
+                days_past_horizon=int(days_past_horizon),
+            )
+        )
+    return tuple(flagged)
+
+
+# --------------------------------------------------------------------------
+# C1b -- ROI vs the two registered baselines (§6 D5)
+# --------------------------------------------------------------------------
+
+#: §6 D5: "B0 -- cash. 0.00 return on the same deployed capital over the
+#: same period."
+BASELINE_B0_CASH: Final[Decimal] = Decimal(0)
+
+
+def roi(*, total_realised_pnl: Decimal, total_capital_deployed: Decimal) -> Decimal:
+    """Realised P&L over capital deployed. ``0`` on zero deployed capital --
+    never a division error over an empty/quiet record."""
+    if total_capital_deployed == Decimal(0):
+        return Decimal(0)
+    return total_realised_pnl / total_capital_deployed
+
+
+def baseline_b1_fee_drag(fills: Iterable[DurableFillRecord]) -> Decimal:
+    """§6 D5: 'B1 -- fee-drag null. Under H0 "the quoted ask is fair",
+    E[pnl_i] = -fee_i, so ROI_B1 = -Sum fee_i / Sum cost_i.'"""
+    materialised = tuple(fills)
+    total_fee = sum((fill.cumulative_fee for fill in materialised), start=Decimal(0))
+    total_cost = sum((fill.cumulative_cost for fill in materialised), start=Decimal(0))
+    if total_cost == Decimal(0):
+        return Decimal(0)
+    return -total_fee / total_cost
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
+class RoiAgainstBaselines:
+    """§6 D5: 'both figures printed with equal prominence, so no reader
+    depends on which one was nominated' -- B0 the headline, B1 the
+    diagnostic (§12 registers the choice; not repeated here)."""
+
+    roi: Decimal
+    baseline_b0: Decimal
+    baseline_b1: Decimal
+    roi_minus_b0: Decimal
+    roi_minus_b1: Decimal
+
+
+def roi_against_baselines(
+    *,
+    total_realised_pnl: Decimal,
+    total_capital_deployed: Decimal,
+    fills: Iterable[DurableFillRecord],
+) -> RoiAgainstBaselines:
+    """Assemble :class:`RoiAgainstBaselines` (§6 D5); ROI vs the PREREG
+    sequential verdict or any market-index figure is explicitly NOT computed
+    here (§6 D5: 'Explicitly NOT a baseline')."""
+    computed_roi = roi(
+        total_realised_pnl=total_realised_pnl, total_capital_deployed=total_capital_deployed
+    )
+    baseline_b1 = baseline_b1_fee_drag(fills)
+    return RoiAgainstBaselines(
+        roi=computed_roi,
+        baseline_b0=BASELINE_B0_CASH,
+        baseline_b1=baseline_b1,
+        roi_minus_b0=computed_roi - BASELINE_B0_CASH,
+        roi_minus_b1=computed_roi - baseline_b1,
+    )
+
+
+# --------------------------------------------------------------------------
+# C2 -- D7: the versioned JSON schema and its sanctioned reader
+# --------------------------------------------------------------------------
+
+#: §6 D7: '"schema_version": 1" as a top-level integer ... additive-only
+#: within a major version; any removal or semantic change increments it.'
+PORTFOLIO_ROI_SCHEMA_VERSION: Final[int] = 1
+
+#: §6 D9: 'roi_status: "GATED_UNSETTLED_CAPITAL"'.
+ROI_STATUS_OK: Final[str] = "OK"
+ROI_STATUS_GATED_UNSETTLED_CAPITAL: Final[str] = "GATED_UNSETTLED_CAPITAL"
+
+
+class UnknownPortfolioRoiSchemaError(Exception):
+    """§6 D7: 'a `read_portfolio_roi_report()` helper ... raises
+    `UnknownPortfolioRoiSchemaError` on any version it does not know.'"""
+
+
+class UnsettledCapitalRoiError(Exception):
+    """§6 D9: 'the D7 sanctioned reader `read_portfolio_roi_report()` raises
+    `UnsettledCapitalRoiError` when a consumer reads `roi` / `roi_minus_b0` /
+    `roi_minus_b1` while gated.'"""
+
+
+class PortfolioRoiReportMalformedFieldError(Exception):
+    """F9: a field in the versioned JSON has the wrong type. Mirrors
+    ``alert_ladder.read_latch_state``'s strictness -- a wrong-typed field
+    raises a clear, field-named error rather than a bare `KeyError`/
+    `TypeError`/`decimal.InvalidOperation` surfacing from a raw dict access.
+    """
+
+
+def _atomic_write_bytes(path: Path, payload: bytes, *, mode: int = 0o600) -> None:
+    """F7: durable, atomic write (temp file + fsync + ``os.replace``),
+    mirroring the exact idiom ``alert_ladder.write_latch_state`` already
+    uses. A failure mid-write leaves no partial file at ``path`` and never
+    disturbs a pre-existing report there -- the temp file is removed on any
+    exception, and ``path`` itself is only ever touched by the final atomic
+    rename."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp_name = tempfile.mkstemp(dir=path.parent, prefix=".portfolio-roi-", suffix=".tmp")
+    tmp_path = Path(tmp_name)
+    try:
+        os.chmod(tmp_path, mode)
+        with os.fdopen(fd, "wb") as handle:
+            handle.write(payload)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(tmp_path, path)
+    except BaseException:
+        tmp_path.unlink(missing_ok=True)
+        raise
+
+
+def _require_int(raw: Mapping[str, object], field: str) -> int:
+    """F9: strict int extraction -- raises
+    :class:`PortfolioRoiReportMalformedFieldError` naming the field on any
+    non-int (bools are excluded: ``isinstance(True, int)`` is `True` in
+    Python, and a boolean here is always a data error)."""
+    value = raw.get(field)
+    if not isinstance(value, int) or isinstance(value, bool):
+        raise PortfolioRoiReportMalformedFieldError(
+            f"portfolio ROI report field {field!r} must be an int, got "
+            f"{type(value).__name__}"
+        )
+    return value
+
+
+def _require_str(raw: Mapping[str, object], field: str) -> str:
+    value = raw.get(field)
+    if not isinstance(value, str):
+        raise PortfolioRoiReportMalformedFieldError(
+            f"portfolio ROI report field {field!r} must be a str, got "
+            f"{type(value).__name__}"
+        )
+    return value
+
+
+def _require_bool(raw: Mapping[str, object], field: str) -> bool:
+    value = raw.get(field)
+    if not isinstance(value, bool):
+        raise PortfolioRoiReportMalformedFieldError(
+            f"portfolio ROI report field {field!r} must be a bool, got "
+            f"{type(value).__name__}"
+        )
+    return value
+
+
+def _require_daily_reconciliation_rows(
+    raw: Mapping[str, object],
+) -> tuple[DailyUnexplainedSummaryRow, ...]:
+    """G2: strict extraction of ``daily_reconciliation`` -- absent (an old
+    JSON sibling predating this field) reads as ``()``, the only tolerated
+    absence (D7's additive-only rule); present-but-malformed raises
+    :class:`PortfolioRoiReportMalformedFieldError`, mirroring every other
+    strict field reader here rather than a bare `KeyError`/`TypeError`."""
+    if "daily_reconciliation" not in raw:
+        return ()
+    rows = raw.get("daily_reconciliation")
+    if not isinstance(rows, list):
+        raise PortfolioRoiReportMalformedFieldError(
+            "portfolio ROI report field 'daily_reconciliation' must be a list, got "
+            f"{type(rows).__name__}"
+        )
+    parsed: list[DailyUnexplainedSummaryRow] = []
+    for index, row in enumerate(rows):
+        if not isinstance(row, dict):
+            raise PortfolioRoiReportMalformedFieldError(
+                f"portfolio ROI report field 'daily_reconciliation[{index}]' must be an "
+                f"object, got {type(row).__name__}"
+            )
+        parsed.append(
+            DailyUnexplainedSummaryRow(
+                day=_require_str(row, "day"),
+                classification=_require_str(row, "classification"),
+                magnitude_cents=_require_int(row, "magnitude_cents"),
+                provisional=_require_bool(row, "provisional"),
+            )
+        )
+    return tuple(parsed)
+
+
+def _require_decimal_str(raw: Mapping[str, object], field: str) -> Decimal:
+    value = raw.get(field)
+    if not isinstance(value, str):
+        raise PortfolioRoiReportMalformedFieldError(
+            f"portfolio ROI report field {field!r} must be a decimal-shaped "
+            f"str, got {type(value).__name__}"
+        )
+    try:
+        return Decimal(value)
+    except InvalidOperation as exc:
+        raise PortfolioRoiReportMalformedFieldError(
+            f"portfolio ROI report field {field!r} is not a valid decimal "
+            f"string: {value!r}"
+        ) from exc
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
+class DailyUnexplainedSummaryRow:
+    """One :class:`DailyUnexplained` row, reduced to the JSON/Markdown-safe
+    shape (F1): a dollar figure never appears in this row directly -- only
+    the pre-rounded ``magnitude_cents`` integer, since this row IS destined
+    for the currency-carrying PRIVATE artefact (§6 D6), never the journal."""
+
+    day: str
+    classification: str
+    magnitude_cents: int
+    provisional: bool
+
+
+def _summary_row_of(row: DailyUnexplained) -> DailyUnexplainedSummaryRow:
+    magnitude_cents = (
+        0 if row.unexplained is None else int((abs(row.unexplained) * 100).to_integral_value())
+    )
+    return DailyUnexplainedSummaryRow(
+        day=row.day,
+        classification=row.classification,
+        magnitude_cents=magnitude_cents,
+        provisional=row.provisional,
+    )
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
+class PortfolioRoiReportData:
+    """Every field the D7 JSON sibling carries (§11's evaluation-path
+    table), assembled by :func:`build_portfolio_roi_report_data`. All
+    Decimal fields are serialised as strings (never float) by
+    :func:`write_portfolio_roi_json`.
+    """
+
+    period_start: str
+    period_end: str
+    n_fills: int
+    n_scored: int
+    n_residual: int
+    n_unreconciled: int
+    power_caveat: str
+    realised_pnl_after_fees_total: Decimal
+    capital_deployed_total: Decimal
+    roi: Decimal
+    roi_minus_b0: Decimal
+    roi_minus_b1: Decimal
+    unexplained_flow_days: int
+    settled_through: str
+    settled_through_statistic: str
+    lag_sample_n: int
+    roi_status: str
+    unsettled_capital_positions: int
+    max_days_past_horizon: int
+    n_family_station_refusals: int = 0
+    # -- F1: the settled-window cash-identity verdict, now reaching the
+    # artefact (was computed by `cumulative_reconciliation` and dropped).
+    settled_cumulative_unexplained: Decimal = Decimal(0)
+    provisional_cumulative_unexplained: Decimal = Decimal(0)
+    settled_cumulative_passes: bool = True
+    daily_reconciliation: tuple[DailyUnexplainedSummaryRow, ...] = ()
+    # -- F2: `unexplained_flow_days` (kept, additive-only/D7) conflated
+    # UNEXPLAINED_CAPITAL_FLOW and UNEXPLAINED_PROXY_LAG days; split here.
+    n_unexplained_capital_flow_days: int = 0
+    n_unexplained_proxy_lag_days: int = 0
+    # -- F3: hole days, dimensionless, excluded from both cumulative sums.
+    n_balance_unknown_days: int = 0
+    # -- G1: opening days with no prior balance to diff against,
+    # dimensionless, excluded from both cumulative sums.
+    n_no_prior_balance_days: int = 0
+    # -- F4: the raw/decoded/undecodable ledger-row counts the partition
+    # assertion is checked against (never derived from the buckets alone).
+    n_ledger_rows: int = 0
+    n_undecodable_ledger_rows: int = 0
+    # -- F5: SELL exits, excluded from capital_deployed/ROI (see
+    # `exit_label_for_fill`), visible only as this dimensionless count.
+    n_exit_fills: int = 0
+
+
+def power_caveat(*, n_ledger_fills: int, n_scored: int, days: int) -> str:
+    """F6: the header line names ledger fills and SCORED (settled) fills as
+    two separate, correctly labelled numbers -- the pre-fix wording called
+    ``n_scored + n_residual + n_unreconciled`` (i.e. every ledger fill,
+    settled or not) "settled fills", which is false for a residual or
+    unreconciled row.
+    """
+    return (
+        f"n_ledger_fills={n_ledger_fills} n_scored_settled_fills={n_scored} over "
+        f"{days} days; NOT a statistically powered estimate of improvement "
+        "over B0 or B1 at this sample size."
+    )
+
+
+def build_portfolio_roi_report_data(
+    *,
+    period_start: str,
+    period_end: str,
+    fill_buckets: Mapping[FillBucket, tuple[AttributedFill, ...]],
+    total_realised_pnl: Decimal,
+    total_capital_deployed: Decimal,
+    baselines: RoiAgainstBaselines,
+    cumulative: CumulativeReconciliation,
+    settled_through_statistic: str,
+    lag_sample_n: int,
+    permanently_unsettled: tuple[PermanentlyUnsettledTrial, ...],
+    n_family_station_refusals: int = 0,
+    n_ledger_rows: int = 0,
+    n_undecodable_ledger_rows: int = 0,
+    n_exit_fills: int = 0,
+) -> PortfolioRoiReportData:
+    """Assemble the one :class:`PortfolioRoiReportData` this run produces.
+
+    §6 D9: 'a `roi_status: "GATED_UNSETTLED_CAPITAL"` ... whenever k > 0' --
+    gating is decided here, once, from ``len(permanently_unsettled)``.
+    """
+    n_fills = sum(len(rows) for rows in fill_buckets.values())
+    n_scored = len(fill_buckets.get(FillBucket.SCORED, ()))
+    unsettled_count = len(permanently_unsettled)
+    max_days_past_horizon = (
+        max((row.days_past_horizon for row in permanently_unsettled), default=0)
+    )
+    non_provisional_rows = tuple(row for row in cumulative.all_rows if not row.provisional)
+    unexplained_flow_days = sum(1 for row in non_provisional_rows if row.breaches_tolerance)
+    n_unexplained_capital_flow_days = sum(
+        1
+        for row in non_provisional_rows
+        if row.classification == UNEXPLAINED_CAPITAL_FLOW_LABEL
+    )
+    n_unexplained_proxy_lag_days = sum(
+        1 for row in non_provisional_rows if row.classification == UNEXPLAINED_PROXY_LAG_LABEL
+    )
+    return PortfolioRoiReportData(
+        period_start=period_start,
+        period_end=period_end,
+        n_fills=n_fills,
+        n_scored=n_scored,
+        n_residual=len(fill_buckets.get(FillBucket.RESIDUAL, ())),
+        n_unreconciled=len(fill_buckets.get(FillBucket.UNRECONCILED, ())),
+        power_caveat=power_caveat(
+            n_ledger_fills=n_fills, n_scored=n_scored, days=_days_between(period_start, period_end)
+        ),
+        realised_pnl_after_fees_total=total_realised_pnl,
+        capital_deployed_total=total_capital_deployed,
+        roi=baselines.roi,
+        roi_minus_b0=baselines.roi_minus_b0,
+        roi_minus_b1=baselines.roi_minus_b1,
+        unexplained_flow_days=unexplained_flow_days,
+        settled_through=cumulative.settled_through,
+        settled_through_statistic=settled_through_statistic,
+        lag_sample_n=lag_sample_n,
+        roi_status=(
+            ROI_STATUS_GATED_UNSETTLED_CAPITAL if unsettled_count > 0 else ROI_STATUS_OK
+        ),
+        unsettled_capital_positions=unsettled_count,
+        max_days_past_horizon=max_days_past_horizon,
+        n_family_station_refusals=n_family_station_refusals,
+        settled_cumulative_unexplained=cumulative.settled_cumulative_unexplained,
+        provisional_cumulative_unexplained=cumulative.provisional_cumulative_unexplained,
+        settled_cumulative_passes=cumulative.settled_cumulative_passes,
+        daily_reconciliation=tuple(_summary_row_of(row) for row in cumulative.all_rows),
+        n_unexplained_capital_flow_days=n_unexplained_capital_flow_days,
+        n_unexplained_proxy_lag_days=n_unexplained_proxy_lag_days,
+        n_balance_unknown_days=cumulative.n_balance_unknown_days,
+        n_no_prior_balance_days=cumulative.n_no_prior_balance_days,
+        n_ledger_rows=n_ledger_rows,
+        n_undecodable_ledger_rows=n_undecodable_ledger_rows,
+        n_exit_fills=n_exit_fills,
+    )
+
+
+def _days_between(start_day: str, end_day: str) -> int:
+    return (date.fromisoformat(end_day) - date.fromisoformat(start_day)).days + 1
+
+
+def _portfolio_roi_json_dict(data: PortfolioRoiReportData) -> dict[str, object]:
+    return {
+        "schema_version": PORTFOLIO_ROI_SCHEMA_VERSION,
+        "period_start": data.period_start,
+        "period_end": data.period_end,
+        "n_fills": data.n_fills,
+        "n_scored": data.n_scored,
+        "n_residual": data.n_residual,
+        "n_unreconciled": data.n_unreconciled,
+        "power_caveat": data.power_caveat,
+        "realised_pnl_after_fees_total": str(data.realised_pnl_after_fees_total),
+        "capital_deployed_total": str(data.capital_deployed_total),
+        "roi": str(data.roi),
+        "roi_minus_b0": str(data.roi_minus_b0),
+        "roi_minus_b1": str(data.roi_minus_b1),
+        "unexplained_flow_days": data.unexplained_flow_days,
+        "settled_through": data.settled_through,
+        "settled_through_statistic": data.settled_through_statistic,
+        "lag_sample_n": data.lag_sample_n,
+        "roi_status": data.roi_status,
+        "unsettled_capital_positions": data.unsettled_capital_positions,
+        "max_days_past_horizon": data.max_days_past_horizon,
+        "n_family_station_refusals": data.n_family_station_refusals,
+        "settled_cumulative_unexplained": str(data.settled_cumulative_unexplained),
+        "provisional_cumulative_unexplained": str(data.provisional_cumulative_unexplained),
+        "settled_cumulative_passes": data.settled_cumulative_passes,
+        "daily_reconciliation": [
+            {
+                "day": row.day,
+                "classification": row.classification,
+                "magnitude_cents": row.magnitude_cents,
+                "provisional": row.provisional,
+            }
+            for row in data.daily_reconciliation
+        ],
+        "n_unexplained_capital_flow_days": data.n_unexplained_capital_flow_days,
+        "n_unexplained_proxy_lag_days": data.n_unexplained_proxy_lag_days,
+        "n_balance_unknown_days": data.n_balance_unknown_days,
+        "n_no_prior_balance_days": data.n_no_prior_balance_days,
+        "n_ledger_rows": data.n_ledger_rows,
+        "n_undecodable_ledger_rows": data.n_undecodable_ledger_rows,
+        "n_exit_fills": data.n_exit_fills,
+    }
+
+
+def write_portfolio_roi_json(path: Path, data: PortfolioRoiReportData) -> None:
+    """Write the D7 versioned JSON sibling, mode 0600 (§6 D6: PRIVATE_
+    convention -- every currency-denominated figure lives only here and in
+    the sibling Markdown). F7: atomic (tempfile + fsync + `os.replace`),
+    mirroring ``alert_ladder.write_latch_state`` -- a failure mid-write
+    leaves no partial file and never touches a pre-existing report."""
+    _atomic_write_bytes(
+        path,
+        (json.dumps(_portfolio_roi_json_dict(data), sort_keys=True, indent=2) + "\n").encode(
+            "utf-8"
+        ),
+    )
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
+class PortfolioRoiReportView:
+    """The ONE sanctioned reader's return shape (§6 D7). Every non-ROI field
+    is always readable; ``roi``/``roi_minus_b0``/``roi_minus_b1`` raise
+    :class:`UnsettledCapitalRoiError` while ``roi_status ==
+    "GATED_UNSETTLED_CAPITAL"` (§6 D9)."""
+
+    schema_version: int
+    period_start: str
+    period_end: str
+    n_fills: int
+    n_scored: int
+    n_residual: int
+    n_unreconciled: int
+    power_caveat: str
+    realised_pnl_after_fees_total: Decimal
+    capital_deployed_total: Decimal
+    unexplained_flow_days: int
+    settled_through: str
+    settled_through_statistic: str
+    lag_sample_n: int
+    roi_status: str
+    unsettled_capital_positions: int
+    max_days_past_horizon: int
+    n_family_station_refusals: int
+    settled_cumulative_unexplained: Decimal
+    provisional_cumulative_unexplained: Decimal
+    settled_cumulative_passes: bool
+    n_unexplained_capital_flow_days: int
+    n_unexplained_proxy_lag_days: int
+    n_balance_unknown_days: int
+    n_no_prior_balance_days: int
+    n_ledger_rows: int
+    n_undecodable_ledger_rows: int
+    n_exit_fills: int
+    #: G2: the per-day table, typed/validated the same way as every other
+    #: field (never a raw list of dicts) -- absent on an old JSON sibling
+    #: (schema_version=1 predates this field) reads as `()`, the only
+    #: tolerated absence (D7's additive-only rule).
+    daily_reconciliation: tuple[DailyUnexplainedSummaryRow, ...]
+    _roi: Decimal
+    _roi_minus_b0: Decimal
+    _roi_minus_b1: Decimal
+
+    def _raise_if_gated(self) -> None:
+        if self.roi_status == ROI_STATUS_GATED_UNSETTLED_CAPITAL:
+            raise UnsettledCapitalRoiError(
+                "portfolio ROI is gated: "
+                f"{self.unsettled_capital_positions} position(s) past "
+                "MAX_SETTLEMENT_HORIZON_NS with no matching ScoredTrial "
+                "(see PERMANENTLY_UNSETTLED); consult capital_deployed_total "
+                "and n_fills instead of any ROI field"
+            )
+
+    @property
+    def roi(self) -> Decimal:
+        self._raise_if_gated()
+        return self._roi
+
+    @property
+    def roi_minus_b0(self) -> Decimal:
+        self._raise_if_gated()
+        return self._roi_minus_b0
+
+    @property
+    def roi_minus_b1(self) -> Decimal:
+        self._raise_if_gated()
+        return self._roi_minus_b1
+
+
+def read_portfolio_roi_report(path: Path) -> PortfolioRoiReportView:
+    """The ONE sanctioned reader (§6 D7). Raises
+    :class:`UnknownPortfolioRoiSchemaError` on any `schema_version` this
+    module does not know -- never a best-effort parse of an unknown shape.
+
+    F9: every field is type-checked (via `_require_int`/`_require_str`/
+    `_require_bool`/`_require_decimal_str`), mirroring
+    ``alert_ladder.read_latch_state``'s strictness -- a wrong-typed field
+    raises :class:`PortfolioRoiReportMalformedFieldError` naming the field,
+    never a bare `KeyError`/`TypeError` from a raw dict access. Fields added
+    after `schema_version=1` shipped stay optional-on-read with a default
+    (D7's additive-only rule) and are NOT type-checked when absent.
+    """
+    raw = json.loads(path.read_text())
+    version = raw.get("schema_version")
+    if version != PORTFOLIO_ROI_SCHEMA_VERSION:
+        raise UnknownPortfolioRoiSchemaError(
+            f"unknown portfolio ROI schema_version={version!r}; this reader "
+            f"only knows schema_version={PORTFOLIO_ROI_SCHEMA_VERSION!r}"
+        )
+    return PortfolioRoiReportView(
+        schema_version=version,
+        period_start=_require_str(raw, "period_start"),
+        period_end=_require_str(raw, "period_end"),
+        n_fills=_require_int(raw, "n_fills"),
+        n_scored=_require_int(raw, "n_scored"),
+        n_residual=_require_int(raw, "n_residual"),
+        n_unreconciled=_require_int(raw, "n_unreconciled"),
+        power_caveat=_require_str(raw, "power_caveat"),
+        realised_pnl_after_fees_total=_require_decimal_str(
+            raw, "realised_pnl_after_fees_total"
+        ),
+        capital_deployed_total=_require_decimal_str(raw, "capital_deployed_total"),
+        unexplained_flow_days=_require_int(raw, "unexplained_flow_days"),
+        settled_through=_require_str(raw, "settled_through"),
+        settled_through_statistic=_require_str(raw, "settled_through_statistic"),
+        lag_sample_n=_require_int(raw, "lag_sample_n"),
+        roi_status=_require_str(raw, "roi_status"),
+        unsettled_capital_positions=_require_int(raw, "unsettled_capital_positions"),
+        max_days_past_horizon=_require_int(raw, "max_days_past_horizon"),
+        # Additive fields (§6 D7: "additive-only within a major version"): a
+        # JSON sibling written before a field existed has no such key, and
+        # reads as its default rather than refusing the whole
+        # schema_version=1 document over one new, purely diagnostic field --
+        # only type-CHECKED when present.
+        n_family_station_refusals=(
+            _require_int(raw, "n_family_station_refusals")
+            if "n_family_station_refusals" in raw
+            else 0
+        ),
+        settled_cumulative_unexplained=(
+            _require_decimal_str(raw, "settled_cumulative_unexplained")
+            if "settled_cumulative_unexplained" in raw
+            else Decimal(0)
+        ),
+        provisional_cumulative_unexplained=(
+            _require_decimal_str(raw, "provisional_cumulative_unexplained")
+            if "provisional_cumulative_unexplained" in raw
+            else Decimal(0)
+        ),
+        settled_cumulative_passes=(
+            _require_bool(raw, "settled_cumulative_passes")
+            if "settled_cumulative_passes" in raw
+            else True
+        ),
+        n_unexplained_capital_flow_days=(
+            _require_int(raw, "n_unexplained_capital_flow_days")
+            if "n_unexplained_capital_flow_days" in raw
+            else 0
+        ),
+        n_unexplained_proxy_lag_days=(
+            _require_int(raw, "n_unexplained_proxy_lag_days")
+            if "n_unexplained_proxy_lag_days" in raw
+            else 0
+        ),
+        n_balance_unknown_days=(
+            _require_int(raw, "n_balance_unknown_days")
+            if "n_balance_unknown_days" in raw
+            else 0
+        ),
+        n_no_prior_balance_days=(
+            _require_int(raw, "n_no_prior_balance_days")
+            if "n_no_prior_balance_days" in raw
+            else 0
+        ),
+        daily_reconciliation=_require_daily_reconciliation_rows(raw),
+        n_ledger_rows=_require_int(raw, "n_ledger_rows") if "n_ledger_rows" in raw else 0,
+        n_undecodable_ledger_rows=(
+            _require_int(raw, "n_undecodable_ledger_rows")
+            if "n_undecodable_ledger_rows" in raw
+            else 0
+        ),
+        n_exit_fills=_require_int(raw, "n_exit_fills") if "n_exit_fills" in raw else 0,
+        _roi=_require_decimal_str(raw, "roi"),
+        _roi_minus_b0=_require_decimal_str(raw, "roi_minus_b0"),
+        _roi_minus_b1=_require_decimal_str(raw, "roi_minus_b1"),
+    )
+
+
+# --------------------------------------------------------------------------
+# C2 -- the PRIVATE Markdown report (§7 step 3)
+# --------------------------------------------------------------------------
+
+
+def _roi_or_gated(data: PortfolioRoiReportData, value: Decimal) -> str:
+    return str(value) if data.roi_status == ROI_STATUS_OK else "GATED -- see roi_status"
+
+
+def render_markdown_report(data: PortfolioRoiReportData) -> str:
+    """The PRIVATE Markdown sibling. Every currency figure lives ONLY here
+    and in the JSON sibling (§6 D6) -- never in the journal line or an
+    alert."""
+    lines = [
+        "# Portfolio ROI Report (AUD-04, PRIVATE -- do not share outside the operator)",
+        "",
+        f"Period: {data.period_start} .. {data.period_end}",
+        (
+            f"n={data.n_fills} settled fills over "
+            f"{_days_between(data.period_start, data.period_end)} days; NOT a "
+            "statistically powered estimate of improvement over B0 or B1 at "
+            "this sample size."
+        ),
+        f"{data.power_caveat}",
+        (
+            f"settled_through={data.settled_through} "
+            f"settled_through_statistic={data.settled_through_statistic} "
+            f"lag_sample_n={data.lag_sample_n}"
+        ),
+        (
+            "Balance series semantics: venue currentBalance (cash or "
+            "cash+positions -- UNVERIFIED); this report treats it as CASH."
+        ),
+        "",
+        "## Partition (§8 AC #2)",
+        f"- scored: {data.n_scored}",
+        f"- residual: {data.n_residual}",
+        f"- unreconciled: {data.n_unreconciled}",
+        f"- total: {data.n_fills}",
+        f"- n_ledger_rows (raw, F4): {data.n_ledger_rows}",
+        f"- n_undecodable_ledger_rows (F4): {data.n_undecodable_ledger_rows}",
+        (
+            f"- n_exit_fills ({UNRECONCILED_EXIT_LABEL}, F5, excluded from capital "
+            f"deployed and ROI): {data.n_exit_fills}"
+        ),
+        "",
+        "## Totals",
+        f"- realised P&L after fees (total): {data.realised_pnl_after_fees_total}",
+        f"- capital deployed (total, leg-summed, never netted): {data.capital_deployed_total}",
+        f"- ROI: {_roi_or_gated(data, data.roi)}",
+        f"- ROI - B0 (cash): {_roi_or_gated(data, data.roi_minus_b0)}",
+        f"- ROI - B1 (fee-drag null): {_roi_or_gated(data, data.roi_minus_b1)}",
+        f"- roi_status: {data.roi_status}",
+        "",
+        "## Integrity",
+        f"- unexplained_flow_days (settled window only): {data.unexplained_flow_days}",
+        f"- n_unexplained_capital_flow_days (F2): {data.n_unexplained_capital_flow_days}",
+        f"- n_unexplained_proxy_lag_days (F2): {data.n_unexplained_proxy_lag_days}",
+        (
+            f"- n_balance_unknown_days (F3, excluded from cumulative sums): "
+            f"{data.n_balance_unknown_days}"
+        ),
+        (
+            f"- n_no_prior_balance_days (G1, excluded from cumulative sums): "
+            f"{data.n_no_prior_balance_days}"
+        ),
+        f"- unsettled_capital_positions: {data.unsettled_capital_positions}",
+        f"- max_days_past_horizon: {data.max_days_past_horizon}",
+        f"- n_family_station_refusals: {data.n_family_station_refusals}",
+        "",
+        "## Settled-window cash-identity verdict (F1, §6 D4)",
+        f"- settled_cumulative_unexplained: {data.settled_cumulative_unexplained}",
+        (
+            f"- provisional_cumulative_unexplained (non-gating): "
+            f"{data.provisional_cumulative_unexplained}"
+        ),
+        f"- settled_cumulative_passes: {data.settled_cumulative_passes}",
+        "",
+        "### Per-day reconciliation",
+    ]
+    for row in data.daily_reconciliation:
+        provisional_suffix = " (PROVISIONAL_IN_FLIGHT)" if row.provisional else ""
+        lines.append(
+            f"{row.classification} day={row.day} magnitude_cents="
+            f"{row.magnitude_cents}{provisional_suffix}"
+        )
+    if data.roi_status == ROI_STATUS_GATED_UNSETTLED_CAPITAL:
+        lines.append(
+            "\n**GATED_UNSETTLED_CAPITAL:** at least one position has aged past its "
+            "settlement horizon with no matching ScoredTrial. ROI fields above are "
+            "gated for every downstream consumer via `read_portfolio_roi_report()`. "
+            "Its capital stays in capital_deployed_total (never dropped)."
+        )
+    return "\n".join(lines) + "\n"
+
+
+# --------------------------------------------------------------------------
+# C2 -- D6: the no-currency journal line
+# --------------------------------------------------------------------------
+
+
+def journal_line(data: PortfolioRoiReportData) -> str:
+    """§6 D6: 'the journal line ... carr[ies] only dimensionless ratios and
+    counts.' Every field below is an integer count, a boolean, a date, or an
+    enum label -- never a Decimal/currency figure.
+
+    F1: carries the settled-window cash-identity VERDICT
+    (`settled_reconciliation_passes`) as a boolean label, never a magnitude
+    -- the per-day `UNEXPLAINED_CAPITAL_FLOW day=<d> magnitude_cents=<...>`
+    lines and the cumulative Decimal figures stay PRIVATE-artefact-only
+    (Markdown/JSON), per D6.
+    """
+    return (
+        f"PORTFOLIO_ROI period={data.period_start}..{data.period_end} "
+        f"n_fills={data.n_fills} n_scored={data.n_scored} "
+        f"n_residual={data.n_residual} n_unreconciled={data.n_unreconciled} "
+        f"n_ledger_rows={data.n_ledger_rows} "
+        f"n_undecodable_ledger_rows={data.n_undecodable_ledger_rows} "
+        f"n_exit_fills={data.n_exit_fills} "
+        f"roi_status={data.roi_status} "
+        f"settled_reconciliation_passes={data.settled_cumulative_passes} "
+        f"unexplained_flow_days={data.unexplained_flow_days} "
+        f"n_unexplained_capital_flow_days={data.n_unexplained_capital_flow_days} "
+        f"n_unexplained_proxy_lag_days={data.n_unexplained_proxy_lag_days} "
+        f"n_balance_unknown_days={data.n_balance_unknown_days} "
+        f"n_no_prior_balance_days={data.n_no_prior_balance_days} "
+        f"unsettled_capital_positions={data.unsettled_capital_positions} "
+        f"settled_through_statistic={data.settled_through_statistic} "
+        f"lag_sample_n={data.lag_sample_n} "
+        f"n_family_station_refusals={data.n_family_station_refusals}"
+    )
+
+
+# --------------------------------------------------------------------------
+# C2 -- D8/D9: the shared alert-ladder wiring
+# --------------------------------------------------------------------------
+
+FROZEN_INPUTS_EVENT: Final[str] = "PORTFOLIO_ROI_INPUTS_FROZEN"
+FROZEN_INPUTS_CLEARED_EVENT: Final[str] = "PORTFOLIO_ROI_INPUTS_FROZEN_CLEARED"
+PERMANENTLY_UNSETTLED_EVENT: Final[str] = "PORTFOLIO_ROI_POSITION_PERMANENTLY_UNSETTLED"
+
+#: §6 D8: 'days_since_newest_input > 3'.
+STALE_INPUT_THRESHOLD_DAYS: Final[int] = 3
+
+INPUT_FRESHNESS_LATCH_FILENAME: Final[str] = ".input_freshness.json"
+UNSETTLED_POSITIONS_LATCH_FILENAME: Final[str] = ".unsettled_positions.json"
+
+
+def is_input_fresh(days_since_newest_input: int | None) -> bool:
+    """§6 D8's clear condition: 'days_since_newest_input <= 3 on any run
+    resets streak to 0.' `None` (no input has ever been observed) is
+    fail-closed as STALE, never as fresh."""
+    if days_since_newest_input is None:
+        return False
+    return days_since_newest_input <= STALE_INPUT_THRESHOLD_DAYS
+
+
+def days_since_newest_input(
+    *, newest_ledger_fill_ts: int | None, newest_scored_trial_ts: int | None, now_ns: int
+) -> int | None:
+    """The larger (more recent) of the two input timestamps, expressed as
+    whole days before `now_ns`; `None` when BOTH inputs have never produced
+    a timestamp (fail-closed, never zero -- an empty/never-started pipeline
+    reads identically to a genuinely frozen one, which is D8's own honest
+    limitation, stated in the artefact)."""
+    candidates = [ts for ts in (newest_ledger_fill_ts, newest_scored_trial_ts) if ts is not None]
+    if not candidates:
+        return None
+    newest_ts = max(candidates)
+    return max(0, (now_ns - newest_ts) // _NS_PER_DAY)
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
+class FreshnessAlertDecision:
+    """One ladder verdict, already carrying the event name and a
+    dimensionless `detail` string -- ready to hand to :class:`AlertPayload`
+    unchanged."""
+
+    should_alert: bool
+    severity: str | None
+    event: str | None
+    detail: str
+
+
+def _apply_ladder(
+    *,
+    is_fresh: bool,
+    latch: alert_ladder.LatchState,
+    now_ns: int,
+    stale_event: str,
+    cleared_event: str,
+    stale_detail: str,
+    cleared_detail: str,
+) -> tuple[alert_ladder.LatchState, FreshnessAlertDecision]:
+    """Shared plumbing behind :func:`apply_freshness_ladder` and
+    :func:`apply_unsettled_positions_ladder`: drives
+    ``breezy.runtime.alert_ladder``'s pure state machine (D8's OWNERSHIP
+    rule -- one implementation, two consumers, two latch files, two event
+    sets) and returns the next latch state plus this run's decision."""
+    previous_streak = latch.streak
+    streak = alert_ladder.next_streak(is_fresh=is_fresh, previous_streak=previous_streak)
+
+    if is_fresh:
+        new_latch = alert_ladder.LatchState(
+            schema_version=alert_ladder.LATCH_SCHEMA_VERSION,
+            streak=0,
+            last_alert_severity=None,
+            last_alert_period_key=None,
+        )
+        if previous_streak >= alert_ladder.WARN_STREAK_THRESHOLD:
+            return new_latch, FreshnessAlertDecision(
+                should_alert=True, severity="INFO", event=cleared_event, detail=cleared_detail
+            )
+        return new_latch, FreshnessAlertDecision(
+            should_alert=False, severity=None, event=None, detail=""
+        )
+
+    decision = alert_ladder.evaluate_streak(
+        streak=streak,
+        last_alert_severity=latch.last_alert_severity,
+        last_alert_period_key=latch.last_alert_period_key,
+        now_ns=now_ns,
+    )
+    new_latch = alert_ladder.LatchState(
+        schema_version=alert_ladder.LATCH_SCHEMA_VERSION,
+        streak=streak,
+        last_alert_severity=(
+            decision.severity if decision.should_alert else latch.last_alert_severity
+        ),
+        last_alert_period_key=(
+            decision.period_key if decision.should_alert else latch.last_alert_period_key
+        ),
+    )
+    if not decision.should_alert:
+        return new_latch, FreshnessAlertDecision(
+            should_alert=False, severity=None, event=None, detail=""
+        )
+    return new_latch, FreshnessAlertDecision(
+        should_alert=True, severity=decision.severity, event=stale_event, detail=stale_detail
+    )
+
+
+def apply_freshness_ladder(
+    *, days_since_newest_input: int | None, latch: alert_ladder.LatchState, now_ns: int
+) -> tuple[alert_ladder.LatchState, FreshnessAlertDecision]:
+    """D8's own re-alert ladder over ``.input_freshness.json``. `detail` is
+    dimensionless (`streak`, `days_since_newest_input`), never a currency
+    figure (§6 D6)."""
+    previous_streak = latch.streak
+    return _apply_ladder(
+        is_fresh=is_input_fresh(days_since_newest_input),
+        latch=latch,
+        now_ns=now_ns,
+        stale_event=FROZEN_INPUTS_EVENT,
+        cleared_event=FROZEN_INPUTS_CLEARED_EVENT,
+        stale_detail=(
+            f"streak={previous_streak + 1} days_since_newest_input={days_since_newest_input}"
+        ),
+        cleared_detail=f"streak_len={previous_streak}",
+    )
+
+
+def apply_unsettled_positions_ladder(
+    *,
+    unsettled_count: int,
+    max_days_past_horizon: int,
+    latch: alert_ladder.LatchState,
+    now_ns: int,
+) -> tuple[alert_ladder.LatchState, FreshnessAlertDecision]:
+    """D9's alert over its OWN latch, ``.unsettled_positions.json`` --
+    driven by the SAME shared `alert_ladder` state machine (D8's ownership
+    rule), never a second implementation. 'Fresh' here means
+    `unsettled_count == 0`."""
+    return _apply_ladder(
+        is_fresh=unsettled_count == 0,
+        latch=latch,
+        now_ns=now_ns,
+        stale_event=PERMANENTLY_UNSETTLED_EVENT,
+        cleared_event=PERMANENTLY_UNSETTLED_EVENT + "_CLEARED",
+        stale_detail=f"count={unsettled_count} max_days_past_horizon={max_days_past_horizon}",
+        cleared_detail="count=0",
+    )
+
+
+def _emit_ladder_decision(sink: AlertSink, site: str, decision: FreshnessAlertDecision) -> None:
+    if not decision.should_alert:
+        return
+    assert decision.severity is not None
+    assert decision.event is not None
+    emit_alert(
+        sink,
+        AlertPayload(
+            severity=decision.severity, event=decision.event, site=site, detail=decision.detail
+        ),
+    )
+
+
+# --------------------------------------------------------------------------
+# C2 -- the fill -> trial_id join (I/O shell only; the pure core stays
+# untouched above)
+# --------------------------------------------------------------------------
+
+
+def _default_exec_state_db_path() -> Path:
+    override = os.environ.get(EXEC_STATE_DB_ENV_VAR, "").strip()
+    if override:
+        return Path(override)
+    return Path.home() / ".local" / "share" / "breezy" / "state" / "exec_polymarket_us.sqlite"
+
+
+def _default_scored_trials_dir() -> Path:
+    override = os.environ.get("BREEZY_SCORED_TRIALS_DIR", "").strip()
+    if override:
+        return Path(override)
+    return Path.home() / ".local" / "share" / "breezy" / "derived" / "scored_trials"
+
+
+def _default_logs_dir() -> Path:
+    return Path.home() / ".local" / "share" / "breezy" / "logs"
+
+
+def _default_output_dir() -> Path:
+    override = os.environ.get("BREEZY_LIVE_TALLY_OUTPUT_DIR", "").strip()
+    if override:
+        return Path(override)
+    return Path.home() / ".local" / "share" / "breezy" / "derived"
+
+
+def _default_families_dir() -> Path:
+    override = os.environ.get("BREEZY_SCORE_LIVE_TRIALS_FAMILIES_DIR", "").strip()
+    if override:
+        return Path(override)
+    return Path(__file__).resolve().parents[2] / "deploy" / "families"
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
+class FamilyManifestAttribution:
+    """:func:`attribute_fills_via_family_manifests`'s return shape:
+    ``attributed_fills`` alongside ``n_family_station_refusals``."""
+
+    attributed_fills: tuple[AttributedFill, ...]
+    n_family_station_refusals: int
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
+class FamilyStationResult:
+    """F8: one successful ``read_filled_trials_state_db`` call for one
+    (REGISTERED ``polymarket_us`` family manifest, station) pair, as
+    returned by :func:`enumerate_family_station_pairs`. ``trials`` already
+    has :func:`_with_scheduled_release_at_ns` applied (defect 2's fix)."""
+
+    family_id: str
+    station: str
+    trials: tuple[FilledTrial, ...]
+    fee_reconciled_by_trial_id: Mapping[str, tuple[bool, str, bool]]
+
+
+def enumerate_family_station_pairs(
+    *, families_dir: Path, exec_state_db_path: Path
+) -> tuple[tuple[FamilyStationResult, ...], int]:
+    """F8: the ONE shared enumeration of every (registered ``polymarket_us``
+    family manifest, station) pair via
+    ``score_live_trials.read_filled_trials_state_db`` -- the SAME loop
+    ``deploy/systemd/score-live-trials-run.sh`` already drives (its ``CITY``
+    variable is the station code, confirmed at that script's per-city loop).
+
+    Pre-fix, this glob-manifest-load-per-station-read loop was duplicated
+    verbatim in :func:`attribute_fills_via_family_manifests` AND in `_run`'s
+    own D9 scan, with each copy counting its OWN refusals -- so a single
+    genuinely broken (family, station) pair was refused (and counted) TWICE
+    per run. This function is now the only place that glob/load/read loop
+    exists; both the attribution join (via
+    :func:`build_attribution_from_results`) and the D9 left-anti-join scan
+    consume the SAME single pass's results, so a refusal is counted once.
+
+    Best-effort per (family, station) pair: any read/registry error for one
+    pair is skipped (logged with the type name and family/station -- never
+    the exception's own message, which may carry a path/detail) so a single
+    bad manifest or an unlisted station never aborts the whole report --
+    the ledger itself is what this report is fail-closed on
+    (`read_ledger_fills_with_counts`), not this join.
+    """
+    results: list[FamilyStationResult] = []
+    n_refusals = 0
+    for manifest_path in sorted(families_dir.glob("*.json")):
+        try:
+            manifest = load_family_manifest(manifest_path, allow_draft=True)
+        except FamilyManifestError:
+            continue
+        if manifest.venue != "polymarket_us":
+            continue
+        for station in manifest.stations:
+            try:
+                site = default_registry().settlement_site(manifest.venue, station)
+                cli_location = site.cli_location
+                trials, _exclusions, fee_reconciled_by_trial_id, _no_side = (
+                    read_filled_trials_state_db(
+                        exec_state_db_path,
+                        family_prefix=manifest.trial_id_prefix,
+                        city=station,
+                        cli_location=cli_location,
+                        since_climate_day=manifest.d0_climate_day,
+                        stations=manifest.stations,
+                    )
+                )
+            except (
+                SiteNotFoundError,
+                FillSourceUnreadableError,
+                StorePositiveControlFailedError,
+            ) as exc:
+                n_refusals += 1
+                logger.warning(
+                    "portfolio_roi_report: family/station scan skipped family=%s station=%s: %s",
+                    manifest.family_id,
+                    station,
+                    type(exc).__name__,
+                )
+                continue
+            # defect 2 fix: `read_filled_trials_state_db` returns
+            # `FilledTrial`s whose `scheduled_release_at_ns` is a documented
+            # PLACEHOLDER 0; every real caller (`score_live_trials.py`'s own
+            # `score_live_trials` function) replaces it via
+            # `_with_scheduled_release_at_ns` before using the trial for
+            # anything horizon-related.
+            resolved_trials = tuple(
+                _with_scheduled_release_at_ns(trial, venue=manifest.venue, city=station)
+                for trial in trials
+            )
+            results.append(
+                FamilyStationResult(
+                    family_id=manifest.family_id,
+                    station=station,
+                    trials=resolved_trials,
+                    fee_reconciled_by_trial_id=fee_reconciled_by_trial_id,
+                )
+            )
+    return tuple(results), n_refusals
+
+
+def build_attribution_from_results(
+    fills: Sequence[DurableFillRecord], results: Sequence[FamilyStationResult]
+) -> tuple[AttributedFill, ...]:
+    """venue_order_id -> trial_id, from an already-enumerated
+    :func:`enumerate_family_station_pairs` result set (F8). Family-agnostic
+    (§6 D3): every result is folded in, never filtered to one prefix. A
+    `venue_order_id` two DIFFERENT (family, station) pairs attribute to two
+    different `trial_id`s is left unattributed (`trial_id=None`) rather than
+    guessed (§9: 'attribution column is AMBIGUOUS_FAMILY, never a guess' --
+    this stage represents that as `None`, which `bucket_for_fill` already
+    buckets UNRECONCILED).
+    """
+    trial_id_by_venue_order_id: dict[str, str] = {}
+    ambiguous_venue_order_ids: set[str] = set()
+    for result in results:
+        for trial_id, (
+            _fee_reconciled,
+            venue_order_id,
+            _skip_ask_guard,
+        ) in result.fee_reconciled_by_trial_id.items():
+            if not venue_order_id:
+                continue
+            existing = trial_id_by_venue_order_id.get(venue_order_id)
+            if existing is not None and existing != trial_id:
+                ambiguous_venue_order_ids.add(venue_order_id)
+                continue
+            trial_id_by_venue_order_id[venue_order_id] = trial_id
+
+    attributed: list[AttributedFill] = []
+    for fill in fills:
+        if fill.venue_order_id in ambiguous_venue_order_ids:
+            attributed.append(AttributedFill(fill=fill, trial_id=None))
+        else:
+            attributed.append(
+                AttributedFill(
+                    fill=fill, trial_id=trial_id_by_venue_order_id.get(fill.venue_order_id)
+                )
+            )
+    return tuple(attributed)
+
+
+def attribute_fills_via_family_manifests(
+    fills: Sequence[DurableFillRecord],
+    *,
+    exec_state_db_path: Path,
+    families_dir: Path,
+) -> FamilyManifestAttribution:
+    """Standalone convenience wrapper (kept for direct/test use): performs
+    its OWN single call to :func:`enumerate_family_station_pairs`. `_run`
+    does NOT call this function -- it calls the enumerator once itself and
+    shares the same result set with the D9 scan (F8), so a real run performs
+    exactly one enumeration pass, not two.
+    """
+    results, n_refusals = enumerate_family_station_pairs(
+        families_dir=families_dir, exec_state_db_path=exec_state_db_path
+    )
+    attributed = build_attribution_from_results(fills, results)
+    return FamilyManifestAttribution(
+        attributed_fills=attributed, n_family_station_refusals=n_refusals
+    )
+
+
+# --------------------------------------------------------------------------
+# C2 -- CLI (`main`, argv=None-friendly per the wrapper's no-args contract)
+# --------------------------------------------------------------------------
+
+
+def _run(
+    *,
+    exec_state_db_path: Path,
+    scored_trials_dir: Path,
+    logs_dir: Path,
+    output_dir: Path,
+    families_dir: Path,
+    now_ns: int,
+    sink: AlertSink,
+) -> int:
+    """The I/O shell's actual work, factored out of `main()` as an explicit
+    test seam (never a CLI flag -- mirrors `score_live_trials.main`'s own
+    `proc_root` keyword-only seam): every path `main()` would otherwise
+    resolve from an env-var-or-literal-default is passed in directly, so a
+    test can drive the exact same code `main()` runs against a `tmp_path`
+    layout without touching `~/.local/share` or any environment variable
+    `main()` reads. `main([])`'s own no-argument CLI contract (pinned by
+    `deploy/systemd/portfolio-roi-run.sh` and
+    `tests/unit/test_portfolio_roi_deploy.py`) is unchanged by this split.
+    """
+    ledger_result = read_ledger_fills_with_counts(exec_state_db_path)
+    if ledger_result is None:
+        print(
+            "portfolio_roi_report: ledger absent/unreadable at "
+            f"{exec_state_db_path} -- refusing to report a fabricated zero",
+            file=sys.stderr,
+        )
+        return 1
+    fills = ledger_result.fills
+
+    # defect 1 fix: `scored_trials_*.parquet` and `excluded_fills.jsonl`
+    # live per-family, under `<scored_trials_dir>/<family_id>/` (L-38,
+    # `scored_trial_store.py:144-163`) -- every production caller
+    # (`family_tally_v2.py`'s `--store-dir`, `live_family_tally.py`) reads
+    # ONE family's subdirectory at a time. `read_scored_trials_pooled`
+    # already unions every subdirectory (plus any legacy top-level rows,
+    # `scored_trial_store.py:170-192`); `residual_trial_ids_pooled` mirrors
+    # that iteration for the residual sidecar, without a legacy top-level
+    # union (see its own docstring for why). Calling the single-directory
+    # `read_scored_trials`/`residual_trial_ids` on the family-agnostic
+    # parent directory (as this module previously did) always returns
+    # nothing, because neither reader recurses.
+    scored_trials = read_scored_trials_pooled(scored_trials_dir).rows
+    residual_ids = residual_trial_ids_pooled(scored_trials_dir)
+    scored_ids = scored_trial_ids_of(scored_trials)
+
+    # F8: ONE shared enumeration of every (family, station) pair, consumed
+    # by BOTH the attribution join and the D9 scan below -- a refusal is
+    # counted once, not twice.
+    family_station_results, n_family_station_refusals = enumerate_family_station_pairs(
+        families_dir=families_dir, exec_state_db_path=exec_state_db_path
+    )
+    attributed_fills = build_attribution_from_results(fills, family_station_results)
+    buckets = bucket_ledger_fills(
+        attributed_fills, scored_trial_ids=scored_ids, residual_trial_ids=residual_ids
+    )
+
+    # F4/§8 AC #2: the partition is asserted against the RAW ledger-row
+    # counts, non-bypassably -- a violation is fail-loud: non-zero exit, a
+    # clear stderr line, and no report written for this run.
+    try:
+        assert_ledger_partition(ledger_result=ledger_result, buckets=buckets)
+    except LedgerPartitionViolationError as exc:
+        print(f"portfolio_roi_report: PARTITION VIOLATION: {exc}", file=sys.stderr)
+        return 1
+
+    if fills:
+        period_start = min(_utc_day_of_fill(f) for f in fills)
+    else:
+        period_start = _utc_day_of_ns(now_ns)
+    period_end = _utc_day_of_ns(now_ns)
+
+    # G3: a fill's `order_side` outside {BUY, SELL} fails loud (F5,
+    # `UnknownOrderSideError`) from any of `total_capital_deployed`,
+    # `reconcile_daily` (via `capital_deployed_by_day`) or
+    # `count_exit_fills` below. Handled exactly like the ledger-partition
+    # violation above: one clear stderr line naming the error type and the
+    # offending `venue_order_id` (never an amount), non-zero exit, and no
+    # report written for this run.
+    try:
+        total_pnl = total_realised_pnl_all_settled(scored_trials)
+        total_capital = total_capital_deployed(fills)
+        baselines = roi_against_baselines(
+            total_realised_pnl=total_pnl, total_capital_deployed=total_capital, fills=fills
+        )
+
+        lags = [settlement_lag_days(trial) for trial in scored_trials]
+        now_day = _utc_day_of_ns(now_ns)
+        settled_through, statistic_name, lag_sample_n = compute_settled_through(
+            now_day=now_day, lags=lags
+        )
+
+        period_days_count = _days_between(period_start, period_end)
+        days = [_shift_iso_day(period_start, delta) for delta in range(period_days_count)]
+        balance_lines: list[str] = []
+        if logs_dir.is_dir():
+            for log_path in sorted(logs_dir.glob("breezy-trade-*.log")):
+                try:
+                    balance_lines.extend(log_path.read_text(errors="replace").splitlines())
+                except OSError:
+                    continue
+        balance_series = daily_balance_series(balance_lines, days=days)
+        daily_balances = {
+            day: (point.total_usd if point is not None else None)
+            for day, point in balance_series.items()
+        }
+
+        # G1: the earliest known-balance day in `daily_balances` has no
+        # PRIOR balance within the report period to diff against. Look
+        # further back in the SAME log lines (bounded,
+        # `OPENING_BALANCE_LOOKBACK_DAYS`) for a genuine earlier
+        # `AccountState(` point -- e.g. the node was already running
+        # before the first fill -- so that day reconciles normally instead
+        # of falling back to an explicit `NO_PRIOR_BALANCE` row.
+        known_days_in_period = sorted(
+            day for day, balance in daily_balances.items() if balance is not None
+        )
+        if known_days_in_period:
+            lookback_point = _latest_balance_before(
+                balance_lines,
+                before_day=known_days_in_period[0],
+                max_lookback_days=OPENING_BALANCE_LOOKBACK_DAYS,
+            )
+            if lookback_point is not None:
+                daily_balances = {
+                    **daily_balances,
+                    lookback_point.ts_iso[:10]: lookback_point.total_usd,
+                }
+
+        daily_rows = reconcile_daily(
+            fills=fills, scored_trials=scored_trials, daily_balances=daily_balances
+        )
+        # G1: a successful look-back above adds a day BEFORE `period_start`
+        # into `daily_balances` purely as a window anchor -- it is never
+        # itself a day this report covers, so if it has no prior balance of
+        # its OWN (the bounded look-back has to stop somewhere), it must
+        # not surface as a `NO_PRIOR_BALANCE` row outside the report
+        # period. Every within-period day this row could have obscured is
+        # still fully covered: the window it anchors resolves normally
+        # (see the row for the period's own earliest known day), and no
+        # fill/trial is ever dated before `period_start` by construction
+        # (`period_start` is defined as the earliest fill's own day).
+        daily_rows = tuple(row for row in daily_rows if row.day >= period_start)
+        cumulative = cumulative_reconciliation(
+            daily_rows=daily_rows, settled_through=settled_through
+        )
+
+        # D9: the permanently-unsettled left-anti-join, over the SAME
+        # `family_station_results` the attribution join above already
+        # gathered (F8) -- no second `read_filled_trials_state_db` pass.
+        filled_trials: list[FilledTrial] = [
+            trial for result in family_station_results for trial in result.trials
+        ]
+        permanently_unsettled = permanently_unsettled_trials(
+            filled_trials, scored_trial_ids=scored_ids, now_ns=now_ns
+        )
+
+        # F5: SELL exits, visible only as a dimensionless count -- see
+        # `exit_label_for_fill`'s docstring for why this reader does not
+        # guess their cash-proceeds semantics.
+        n_exit_fills = count_exit_fills(fills)
+    except UnknownOrderSideError as exc:
+        print(f"portfolio_roi_report: {type(exc).__name__}: {exc}", file=sys.stderr)
+        return 1
+
+    report_data = build_portfolio_roi_report_data(
+        period_start=period_start,
+        period_end=period_end,
+        fill_buckets=buckets,
+        total_realised_pnl=total_pnl,
+        total_capital_deployed=total_capital,
+        baselines=baselines,
+        cumulative=cumulative,
+        settled_through_statistic=statistic_name,
+        lag_sample_n=lag_sample_n,
+        permanently_unsettled=permanently_unsettled,
+        n_family_station_refusals=n_family_station_refusals,
+        n_ledger_rows=ledger_result.n_ledger_rows,
+        n_undecodable_ledger_rows=ledger_result.n_undecodable_ledger_rows,
+        n_exit_fills=n_exit_fills,
+    )
+
+    # F7/F9: atomic writes -- the directory is created by
+    # `_atomic_write_bytes` itself, so no redundant explicit `mkdir` here.
+    stamp = now_day
+    json_path = output_dir / f"PRIVATE_portfolio_roi_{stamp}.json"
+    md_path = output_dir / f"PRIVATE_portfolio_roi_{stamp}.md"
+    write_portfolio_roi_json(json_path, report_data)
+    _atomic_write_bytes(md_path, render_markdown_report(report_data).encode("utf-8"))
+
+    print(journal_line(report_data))
+
+    # D8 -- frozen-input detector.
+    newest_ledger_fill_ts = max((f.ts_event for f in fills), default=None)
+    newest_scored_trial_ts = max((t.scored_at_ns for t in scored_trials), default=None)
+    freshness_days = days_since_newest_input(
+        newest_ledger_fill_ts=newest_ledger_fill_ts,
+        newest_scored_trial_ts=newest_scored_trial_ts,
+        now_ns=now_ns,
+    )
+    freshness_latch_path = output_dir / "portfolio_roi" / INPUT_FRESHNESS_LATCH_FILENAME
+    freshness_latch = alert_ladder.read_latch_state(freshness_latch_path)
+    new_freshness_latch, freshness_decision = apply_freshness_ladder(
+        days_since_newest_input=freshness_days, latch=freshness_latch, now_ns=now_ns
+    )
+    alert_ladder.write_latch_state(freshness_latch_path, new_freshness_latch)
+    _emit_ladder_decision(sink, "portfolio_roi_report", freshness_decision)
+
+    # D9 -- open-position staleness alert.
+    unsettled_latch_path = output_dir / "portfolio_roi" / UNSETTLED_POSITIONS_LATCH_FILENAME
+    unsettled_latch = alert_ladder.read_latch_state(unsettled_latch_path)
+    new_unsettled_latch, unsettled_decision = apply_unsettled_positions_ladder(
+        unsettled_count=len(permanently_unsettled),
+        max_days_past_horizon=report_data.max_days_past_horizon,
+        latch=unsettled_latch,
+        now_ns=now_ns,
+    )
+    alert_ladder.write_latch_state(unsettled_latch_path, new_unsettled_latch)
+    _emit_ladder_decision(sink, "portfolio_roi_report", unsettled_decision)
+
+    return 0
+
+
+def main(argv: Sequence[str] | None = None) -> int:
+    """Thin I/O shell over `_run()`. `argv` is accepted (and ignored, beyond
+    its emptiness) so this matches the deployed wrapper's contract of
+    invoking the script with NO ARGUMENTS -- every input/output path is
+    resolved from the same env-var-or-literal-default convention every
+    sibling study wrapper already uses (see the `_default_*` functions
+    above). Never assigns or reads an operator-reserved control.
+    """
+    del argv  # accepted for CLI-shape symmetry with sibling scripts; unused
+
+    log_alert_egress_status(os.environ, component="portfolio_roi_report")
+    return _run(
+        exec_state_db_path=_default_exec_state_db_path(),
+        scored_trials_dir=_default_scored_trials_dir(),
+        logs_dir=_default_logs_dir(),
+        output_dir=_default_output_dir(),
+        families_dir=_default_families_dir(),
+        now_ns=time.time_ns(),
+        sink=resolve_alert_sink(os.environ),
+    )
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

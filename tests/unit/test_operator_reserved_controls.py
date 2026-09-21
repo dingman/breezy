@@ -732,6 +732,16 @@ def test_the_mechanism_has_no_production_call_site_yet() -> None:
     ``TrialDayLatch.is_day_budget_exhausted`` read -- it reads no control
     value either, only the day boundary the exec client's marker key already
     uses.
+    Seventh, declared 2026-09-21 (AUD-04, portfolio ROI report): the OFFLINE,
+    read-only `scripts/analysis/portfolio_roi_report.py` imports ONE pure
+    symbol, `_round_cost_up_to_cent`, to quantise `cost + fee` per ledger fill
+    into capital-deployed, so the report cannot round differently from the live
+    cap arithmetic and the ledger true-up (AUD-04 §6 D4). It imports no money
+    accessor, reads no operator value, constructs no ledger, and runs in a
+    `Type=oneshot` outside the node -- the same pure-helper class as the exec
+    client's and the strategy's `utc_day_for_ns` rows above. This scan is a
+    SUBSTRING scan, so the module is also matched by that script's explanatory
+    docstring citations; those are documentation, not calls.
     """
     from pathlib import Path
 
@@ -745,6 +755,7 @@ def test_the_mechanism_has_no_production_call_site_yet() -> None:
         and path.name != "operator_controls.py"
     )
     assert importers == [
+        "scripts/analysis/portfolio_roi_report.py",
         "scripts/operator/print_operator_controls.py",
         "src/breezy/adapters/polymarket_us/exec/client.py",
         "src/breezy/adapters/polymarket_us/factories.py",
@@ -794,3 +805,77 @@ def test_seed_spent_refuses_a_negative_or_non_decimal_figure() -> None:
         ledger.seed_spent(day=today, spent_usd=Decimal("-1.00"), now_ns=MIDDAY)
     with pytest.raises(LiveTradingPermissionError):
         ledger.seed_spent(day=today, spent_usd=3.0, now_ns=MIDDAY)  # type: ignore[arg-type]
+
+
+# ---------------------------------------------------------------------------
+# AUD-04 -- close the blanket-admission gap in the "Seventh, declared
+# 2026-09-21" row above: admitting the FILE into the pin means the pin alone
+# no longer notices WHICH symbol it imports. Pin the import surface itself.
+# ---------------------------------------------------------------------------
+
+
+def test_portfolio_roi_report_imports_only_the_cent_rounding_helper() -> None:
+    """A future edit importing a cap ACCESSOR from this file must trip.
+
+    The "Seventh" row above admits the whole file to the substring/import
+    scans on the strength of ONE pure symbol, `_round_cost_up_to_cent`. That
+    admission is blanket at the file level: it says nothing about which name
+    is imported, so a later edit that also imports, say,
+    `operator_max_daily_budget_usd` from the SAME module would satisfy both
+    pins without tripping either. This test closes that gap directly: it
+    parses the script with `ast` and asserts the exact set of names imported
+    from `breezy.adapters.polymarket_us.operator_controls` is precisely
+    `{"_round_cost_up_to_cent"}` -- no more, no fewer -- and that the module is
+    never imported as a whole (no `import ...operator_controls` / aliasing
+    form) or accessed via attribute off such an alias.
+
+    Non-vacuity: the assertion is `==` against a non-empty set, so if the
+    script ever stops importing the helper altogether, this test fails loudly
+    instead of passing vacuously -- the correct response then is to REMOVE
+    the "Seventh" pin rows above and in the readonly-guard pin, not to weaken
+    this assertion.
+    """
+    import ast
+    from pathlib import Path
+
+    repo_root = Path(__file__).resolve().parents[2]
+    script_path = repo_root / "scripts" / "analysis" / "portfolio_roi_report.py"
+    source = script_path.read_text(encoding="utf-8")
+    tree = ast.parse(source, filename=str(script_path))
+
+    module_name = "breezy.adapters.polymarket_us.operator_controls"
+    imported_names: set[str] = set()
+    whole_module_aliases: set[str] = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.ImportFrom) and node.module == module_name:
+            for alias in node.names:
+                imported_names.add(alias.name)
+        elif isinstance(node, ast.Import):
+            for alias in node.names:
+                if alias.name == module_name:
+                    whole_module_aliases.add(alias.asname or alias.name)
+
+    assert not whole_module_aliases, (
+        "portfolio_roi_report.py must never `import "
+        f"{module_name}` as a whole module; found alias(es) {whole_module_aliases}"
+    )
+    for alias_name in whole_module_aliases:
+        for node in ast.walk(tree):
+            if (
+                isinstance(node, ast.Attribute)
+                and isinstance(node.value, ast.Name)
+                and node.value.id == alias_name
+            ):
+                raise AssertionError(
+                    "portfolio_roi_report.py must never access "
+                    f"`{alias_name}.{node.attr}` -- only the direct "
+                    "`_round_cost_up_to_cent` import is admitted"
+                )
+
+    assert imported_names, (
+        "portfolio_roi_report.py no longer imports anything from "
+        f"{module_name} -- REMOVE the 'Seventh' pin row above and the "
+        "matching AUD-04 row in test_polymarket_us_readonly_guard.py rather "
+        "than leaving this assertion vacuous"
+    )
+    assert imported_names == {"_round_cost_up_to_cent"}

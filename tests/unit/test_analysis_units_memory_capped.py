@@ -46,6 +46,11 @@ _CANDIDATE_UNITS = [
     # AUD-15 re-home (2026-09-22): a light unit, but it declares its own
     # MemoryHigh=512M/MemoryMax=1G and nothing else pinned them until now.
     "breezy-asos-refresh.service",
+    # AUD-04 (2026-09-21/22): the portfolio ROI report is another light
+    # unit in the same MemoryHigh=512M/MemoryMax=1G band as
+    # breezy-position-monitor-report.service and breezy-asos-refresh.service
+    # -- checked here so its own cgroup ceiling never goes uncovered.
+    "breezy-portfolio-roi.service",
 ]
 
 _EXISTING_UNITS = [
