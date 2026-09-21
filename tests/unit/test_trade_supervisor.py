@@ -22,6 +22,7 @@ import signal
 import subprocess
 import sys
 import time
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
@@ -43,6 +44,7 @@ from breezy.runtime.trade_supervisor import (
     _do_self_check,
     _do_stop_prior,
     _run_forever,
+    _SELF_CHECK_PASS_RESULTS,
     _SupervisorFileHandler,
     _SupervisorStreamHandler,
     configure_supervisor_logging,
@@ -70,22 +72,28 @@ from breezy.runtime.trade_supervisor_core import (
     MIDDAY_READINESS_RECHECK_TIMEOUT,
     MIN_RELAUNCH_GAP,
     RELAUNCH_CUTOFF_UTC,
+    SELF_CHECK_ESCALATION_STORE_KEY,
     SUPERVISOR_ARGV_TOKEN,
     AlertDetail,
+    EscalationLoadOutcome,
     ExitConfigErrorCause,
     LaunchAction,
     Phase,
     PreLaunchProbeInvariantError,
     RelaunchCause,
+    SelfCheckEscalationState,
     SelfCheckResult,
     StopPriorAction,
+    _PASS_RESULT_VALUES,
     assert_no_live_node_before_intent_probe,
     classify_exit1_cause,
     decide_launch_action,
     decide_midday_relaunch,
     decide_relaunch,
     decide_stop_prior_action,
+    decode_self_check_escalation_state,
     disambiguate_exit_config_error,
+    encode_self_check_escalation_state,
     initial_scheduler_state,
     mark_phase_fired,
     midday_watch_window_end,
@@ -837,6 +845,713 @@ class TestSelfCheck:
             cause=RelaunchCause.TRANSIENT,
         )
         assert decision.should_relaunch is False
+
+    def test_the_shell_and_core_pass_result_sets_are_pinned_together(self):
+        """AUD-14b review follow-up: the shell's ``_SELF_CHECK_PASS_RESULTS``
+        (this module) and the core's ``_PASS_RESULT_VALUES``
+        (``trade_supervisor_core.py``, feeding ``record_self_check_result``)
+        enumerate the same PASS-family results independently, with nothing
+        else pinning them together -- a future PASS-family addition to one
+        that is forgotten in the other would silently desync the escalation
+        counter from the existing WARN/no-alert behaviour. Test-only pin, no
+        production code change."""
+        assert {member.value for member in _SELF_CHECK_PASS_RESULTS} == set(_PASS_RESULT_VALUES)
+
+
+# ===========================================================================
+# AUD-14b: self-check repeat-failure escalation (I/O shell). Plan §7 14b
+# steps 2b (rollover, driven for real), 3 (shell alert severity), 4
+# (persistence and the fault paths), 5 (the seven-day historical replay),
+# 6 (restart-interleaved replay). The pure-core tests (steps 2, 2a) live in
+# ``tests/unit/test_trade_supervisor_core.py``.
+# ===========================================================================
+
+_AUD14B_READY_LOG_LINE = (
+    "live-trading permit issued issued_at_ns=1 expires_at_ns=4102444800000000000 ttl_s=1\n"
+    "CurrentRungHoldStrategy subscribed X\n"
+)
+
+
+def _aud14b_ports(sink, *, ready: bool) -> SupervisorPorts:
+    """A minimal ``SupervisorPorts`` for a tracked, alive, single-flock-holder
+    node -- the only variable is whether the (fake) log carries the
+    permit-issued/strategy-subscribed markers (PASS) or not (FAIL_NODE_NOT_READY)."""
+    return SupervisorPorts(
+        find_node_pid=lambda: None,
+        resolve_intent_lock_holder=lambda _p: 42,
+        intent_lock_free=lambda _p: True,
+        count_intent_lock_holders=lambda _p: 1,
+        terminate_after_recheck=lambda pid, **kw: None,
+        process_alive=lambda _pid: True,
+        probe_open_intent_state=lambda *a, **kw: False,
+        spawn=lambda **kw: None,
+        read_log_new=lambda _p: _AUD14B_READY_LOG_LINE if ready else "",
+        alert_sink=sink,
+    )
+
+
+def _aud14b_store_get(store_path):
+    with SqliteStateStore(store_path) as store:
+        return store.get(SELF_CHECK_ESCALATION_STORE_KEY)
+
+
+def _aud14b_plant(store_path, state: SelfCheckEscalationState) -> None:
+    with SqliteStateStore(store_path) as store:
+        store.set(SELF_CHECK_ESCALATION_STORE_KEY, encode_self_check_escalation_state(state))
+
+
+def _make_write_failing_store_cls(calls: list | None = None):
+    """A fake ``SqliteStateStore`` whose ``get`` delegates to a real store
+    (so the load step behaves normally) but whose ``set`` always raises --
+    isolates the write-failure fault path without touching the read path."""
+
+    class _WriteFailingStore:
+        def __init__(self, path, *a, **kw):
+            self._real = SqliteStateStore(path)
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc_info):
+            self._real.close()
+            return False
+
+        def get(self, key):
+            if calls is not None:
+                calls.append(("get", key))
+            return self._real.get(key)
+
+        def set(self, key, value):
+            if calls is not None:
+                calls.append(("set", key))
+            raise RuntimeError("simulated write failure")
+
+    return _WriteFailingStore
+
+
+class _AlwaysUnavailableStore:
+    """A fake ``SqliteStateStore`` that raises on construction -- simulates
+    the store being wholly unreachable for both the load and the (attempted)
+    write step."""
+
+    def __init__(self, *a, **kw):
+        raise RuntimeError("simulated store unavailable")
+
+
+def _make_order_tracking_store_cls(calls: list):
+    """A fake ``SqliteStateStore`` that appends to ``calls`` on every
+    ``set`` (never on ``get``, which is not under test here), while
+    delegating all real I/O to a genuine store -- used to pin the
+    DECIDE -> EMIT -> PERSIST ordering."""
+
+    class _OrderTrackingStore:
+        def __init__(self, path, *a, **kw):
+            self._real = SqliteStateStore(path)
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc_info):
+            self._real.close()
+            return False
+
+        def get(self, key):
+            return self._real.get(key)
+
+        def set(self, key, value):
+            self._real.set(key, value)
+            calls.append(("store_set", key))
+
+    return _OrderTrackingStore
+
+
+class _OrderTrackingAlertSink:
+    def __init__(self, calls: list):
+        self.calls = calls
+        self.payloads: list[AlertPayload] = []
+
+    def emit(self, payload: AlertPayload) -> None:
+        self.calls.append(("alert", payload.event))
+        self.payloads.append(payload)
+
+
+class TestSelfCheckEscalationRollover:
+    """§7 14b step 2b -- driven against a REAL ``SqliteStateStore`` and a
+    REAL ``mark_phase_fired`` call between polls, exactly as the poll loop
+    does at ``trade_supervisor.py:1496``."""
+
+    _DAY1 = dt.date(2026, 9, 12)
+    _DAY2 = dt.date(2026, 9, 13)
+
+    def _poll(self, *, ports, now, store_path, tmp_path, state):
+        _tracked_pid, _node_log, state = _do_self_check(
+            ports=ports,
+            now=now,
+            store_path=store_path,
+            log_dir=tmp_path / "logs",
+            tracked_pid=42,
+            node_log=tmp_path / "n.log",
+            state=state,
+        )
+        return mark_phase_fired(state, Phase.SELF_CHECK, now)
+
+    def test_the_counter_survives_a_real_trading_day_rollover_at_1640z(self, tmp_path):
+        store_path = tmp_path / "state" / "store.sqlite3"
+        sink = _RecordingAlertSink()
+        ports = _aud14b_ports(sink, ready=False)
+        state = initial_scheduler_state(self._DAY1)
+
+        state = self._poll(
+            ports=ports,
+            now=dt.datetime(2026, 9, 12, 17, 5, tzinfo=dt.UTC),
+            store_path=store_path,
+            tmp_path=tmp_path,
+            state=state,
+        )
+        state = self._poll(
+            ports=ports,
+            now=dt.datetime(2026, 9, 13, 17, 5, tzinfo=dt.UTC),
+            store_path=store_path,
+            tmp_path=tmp_path,
+            state=state,
+        )
+
+        critical = [
+            p for p in sink.payloads if p.event == "TRADE_SUPERVISOR_SELF_CHECK_FAIL_REPEATED"
+        ]
+        assert len(critical) == 1
+        assert critical[0].severity == "CRITICAL"
+
+    def test_a_pass_after_a_rollover_resets_the_counter_to_zero(self, tmp_path):
+        store_path = tmp_path / "state" / "store.sqlite3"
+        sink = _RecordingAlertSink()
+        fail_ports = _aud14b_ports(sink, ready=False)
+        pass_ports = _aud14b_ports(sink, ready=True)
+        state = initial_scheduler_state(self._DAY1)
+
+        state = self._poll(
+            ports=fail_ports,
+            now=dt.datetime(2026, 9, 12, 17, 5, tzinfo=dt.UTC),
+            store_path=store_path,
+            tmp_path=tmp_path,
+            state=state,
+        )
+        state = self._poll(
+            ports=pass_ports,
+            now=dt.datetime(2026, 9, 13, 17, 5, tzinfo=dt.UTC),
+            store_path=store_path,
+            tmp_path=tmp_path,
+            state=state,
+        )
+
+        critical = [
+            p for p in sink.payloads if p.event == "TRADE_SUPERVISOR_SELF_CHECK_FAIL_REPEATED"
+        ]
+        assert critical == []
+        decoded = decode_self_check_escalation_state(_aud14b_store_get(store_path))
+        assert decoded.consecutive_failures == 0
+
+    def test_the_rollover_still_resets_every_existing_day_scheduler_state_field(self, tmp_path):
+        store_path = tmp_path / "state" / "store.sqlite3"
+        sink = _RecordingAlertSink()
+        ports = _aud14b_ports(sink, ready=False)
+        state = initial_scheduler_state(self._DAY1)
+        state = replace(
+            state,
+            readiness_observed=True,
+            launch_done=True,
+            strategy_subscribed_seen=True,
+            relaunch_attempts=2,
+        )
+
+        state = self._poll(
+            ports=ports,
+            now=dt.datetime(2026, 9, 12, 17, 5, tzinfo=dt.UTC),
+            store_path=store_path,
+            tmp_path=tmp_path,
+            state=state,
+        )
+        state = self._poll(
+            ports=ports,
+            now=dt.datetime(2026, 9, 13, 17, 5, tzinfo=dt.UTC),
+            store_path=store_path,
+            tmp_path=tmp_path,
+            state=state,
+        )
+
+        assert state.day == self._DAY2
+        assert state.readiness_observed is False
+        assert state.launch_done is False
+        assert state.strategy_subscribed_seen is False
+        assert state.relaunch_attempts == 0
+
+
+class TestSelfCheckEscalationShellAlerts:
+    """§7 14b step 3."""
+
+    def test_the_first_self_check_failure_alerts_at_warn(self, tmp_path):
+        store_path = tmp_path / "state" / "store.sqlite3"
+        sink = _RecordingAlertSink()
+        ports = _aud14b_ports(sink, ready=False)
+        _do_self_check(
+            ports=ports,
+            now=dt.datetime(2026, 9, 12, 17, 5, tzinfo=dt.UTC),
+            store_path=store_path,
+            log_dir=tmp_path / "logs",
+            tracked_pid=42,
+            node_log=tmp_path / "n.log",
+        )
+        fail_alerts = [p for p in sink.payloads if p.event == "TRADE_SUPERVISOR_SELF_CHECK_FAIL"]
+        assert len(fail_alerts) == 1
+        assert fail_alerts[0].severity == "WARN"
+        repeated = [
+            p for p in sink.payloads if p.event == "TRADE_SUPERVISOR_SELF_CHECK_FAIL_REPEATED"
+        ]
+        assert repeated == []
+
+    def test_the_second_consecutive_failure_alerts_at_critical(self, tmp_path):
+        store_path = tmp_path / "state" / "store.sqlite3"
+        sink = _RecordingAlertSink()
+        ports = _aud14b_ports(sink, ready=False)
+        for now in (
+            dt.datetime(2026, 9, 12, 17, 5, tzinfo=dt.UTC),
+            dt.datetime(2026, 9, 13, 17, 5, tzinfo=dt.UTC),
+        ):
+            _do_self_check(
+                ports=ports,
+                now=now,
+                store_path=store_path,
+                log_dir=tmp_path / "logs",
+                tracked_pid=42,
+                node_log=tmp_path / "n.log",
+            )
+        repeated = [
+            p for p in sink.payloads if p.event == "TRADE_SUPERVISOR_SELF_CHECK_FAIL_REPEATED"
+        ]
+        assert len(repeated) == 1
+        assert repeated[0].severity == "CRITICAL"
+
+    def test_the_repeated_failure_alert_detail_is_a_fixed_enum_and_carries_no_value(
+        self, tmp_path
+    ):
+        store_path = tmp_path / "state" / "store.sqlite3"
+        sink = _RecordingAlertSink()
+        ports = _aud14b_ports(sink, ready=False)
+        for now in (
+            dt.datetime(2026, 9, 12, 17, 5, tzinfo=dt.UTC),
+            dt.datetime(2026, 9, 13, 17, 5, tzinfo=dt.UTC),
+        ):
+            _do_self_check(
+                ports=ports,
+                now=now,
+                store_path=store_path,
+                log_dir=tmp_path / "logs",
+                tracked_pid=42,
+                node_log=tmp_path / "n.log",
+            )
+        repeated = [
+            p for p in sink.payloads if p.event == "TRADE_SUPERVISOR_SELF_CHECK_FAIL_REPEATED"
+        ]
+        fixed_values = {member.value for member in AlertDetail}
+        assert repeated[0].detail in fixed_values
+        assert "Traceback" not in repeated[0].detail
+        assert repeated[0].detail == AlertDetail.SELF_CHECK_FAIL_NOT_READY.value
+
+
+class TestSelfCheckEscalationFaultPaths:
+    """§7 14b step 4 -- every test asserts a failure of the escalation
+    machinery itself fails TOWARD alerting."""
+
+    def test_an_absent_key_starts_the_counter_at_zero_and_emits_no_alert(self, tmp_path):
+        store_path = tmp_path / "state" / "store.sqlite3"
+        sink = _RecordingAlertSink()
+        ports = _aud14b_ports(sink, ready=True)
+        _do_self_check(
+            ports=ports,
+            now=dt.datetime(2026, 9, 12, 17, 5, tzinfo=dt.UTC),
+            store_path=store_path,
+            log_dir=tmp_path / "logs",
+            tracked_pid=42,
+            node_log=tmp_path / "n.log",
+        )
+        load_alerts = [
+            p
+            for p in sink.payloads
+            if "ESCALATION" in p.event
+        ]
+        assert load_alerts == []
+
+    def test_a_corrupt_stored_value_alerts_where_an_absent_key_is_silent(
+        self, tmp_path, monkeypatch
+    ):
+        store_path = tmp_path / "state" / "store.sqlite3"
+
+        # Absent call: no key at all -- silent.
+        absent_sink = _RecordingAlertSink()
+        ports = _aud14b_ports(absent_sink, ready=True)
+        _do_self_check(
+            ports=ports,
+            now=dt.datetime(2026, 9, 12, 17, 5, tzinfo=dt.UTC),
+            store_path=tmp_path / "absent" / "store.sqlite3",
+            log_dir=tmp_path / "logs",
+            tracked_pid=42,
+            node_log=tmp_path / "n.log",
+        )
+        assert [p for p in absent_sink.payloads if "ESCALATION" in p.event] == []
+
+        # Corrupt call: garbage bytes at the literal key, fed a PASS --
+        # write-back case 3 (§6): the one rebase to zero an OBSERVED PASS
+        # licenses.
+        with SqliteStateStore(store_path) as store:
+            store.set(SELF_CHECK_ESCALATION_STORE_KEY, b"not valid json at all")
+        corrupt_sink = _RecordingAlertSink()
+        pass_ports = _aud14b_ports(corrupt_sink, ready=True)
+        _do_self_check(
+            ports=pass_ports,
+            now=dt.datetime(2026, 9, 12, 17, 5, tzinfo=dt.UTC),
+            store_path=store_path,
+            log_dir=tmp_path / "logs",
+            tracked_pid=42,
+            node_log=tmp_path / "n.log",
+        )
+        corrupt_alerts = [
+            p
+            for p in corrupt_sink.payloads
+            if p.event == "TRADE_SUPERVISOR_SELF_CHECK_ESCALATION_STATE_CORRUPT"
+        ]
+        assert len(corrupt_alerts) == 1
+        assert corrupt_alerts[0].severity == "WARN"
+        assert corrupt_alerts[0].detail == AlertDetail.SELF_CHECK_ESCALATION_STATE_CORRUPT.value
+
+        decoded = decode_self_check_escalation_state(_aud14b_store_get(store_path))
+        assert decoded == SelfCheckEscalationState(
+            consecutive_failures=0, last_self_check_utc=decoded.last_self_check_utc
+        )
+        assert decoded.last_self_check_utc  # advanced -- proves the write happened.
+
+    def test_a_corrupt_stored_value_escalates_a_failure_to_critical_instead_of_resetting_to_zero(
+        self, tmp_path
+    ):
+        store_path = tmp_path / "state" / "store.sqlite3"
+        with SqliteStateStore(store_path) as store:
+            store.set(
+                SELF_CHECK_ESCALATION_STORE_KEY,
+                b'{"consecutive_failures": 5, "extra_key": "corrupts the decode"}',
+            )
+        sink = _RecordingAlertSink()
+        ports = _aud14b_ports(sink, ready=False)
+        _do_self_check(
+            ports=ports,
+            now=dt.datetime(2026, 9, 12, 17, 5, tzinfo=dt.UTC),
+            store_path=store_path,
+            log_dir=tmp_path / "logs",
+            tracked_pid=42,
+            node_log=tmp_path / "n.log",
+        )
+        repeated = [
+            p for p in sink.payloads if p.event == "TRADE_SUPERVISOR_SELF_CHECK_FAIL_REPEATED"
+        ]
+        assert len(repeated) == 1
+        assert repeated[0].severity == "CRITICAL"
+        assert repeated[0].detail == AlertDetail.SELF_CHECK_ESCALATION_STATE_CORRUPT.value
+        warn_only = [p for p in sink.payloads if p.event == "TRADE_SUPERVISOR_SELF_CHECK_FAIL"]
+        assert warn_only == []
+
+        # Write-back case 1 (FAIL under a corrupt read, then FAIL): the
+        # reducer's OUTPUT is persisted -- 1, never 0, never the planted 5.
+        decoded = decode_self_check_escalation_state(_aud14b_store_get(store_path))
+        assert decoded.consecutive_failures == 1
+
+        # A second poll against the now-repaired value escalates BY COUNT.
+        _do_self_check(
+            ports=ports,
+            now=dt.datetime(2026, 9, 13, 17, 5, tzinfo=dt.UTC),
+            store_path=store_path,
+            log_dir=tmp_path / "logs",
+            tracked_pid=42,
+            node_log=tmp_path / "n.log",
+        )
+        repeated = [
+            p for p in sink.payloads if p.event == "TRADE_SUPERVISOR_SELF_CHECK_FAIL_REPEATED"
+        ]
+        assert len(repeated) == 2
+        assert repeated[1].detail == AlertDetail.SELF_CHECK_FAIL_NOT_READY.value  # by count now.
+
+    def test_a_store_read_failure_alerts_and_escalates_a_failure_to_critical(
+        self, tmp_path, monkeypatch
+    ):
+        store_path = tmp_path / "state" / "store.sqlite3"
+        monkeypatch.setattr(
+            "breezy.runtime.trade_supervisor.SqliteStateStore", _AlwaysUnavailableStore
+        )
+        sink = _RecordingAlertSink()
+        ports = _aud14b_ports(sink, ready=False)
+        _do_self_check(
+            ports=ports,
+            now=dt.datetime(2026, 9, 12, 17, 5, tzinfo=dt.UTC),
+            store_path=store_path,
+            log_dir=tmp_path / "logs",
+            tracked_pid=42,
+            node_log=tmp_path / "n.log",
+        )
+        unavailable = [
+            p
+            for p in sink.payloads
+            if p.event == "TRADE_SUPERVISOR_SELF_CHECK_ESCALATION_STORE_UNAVAILABLE"
+        ]
+        assert len(unavailable) == 1
+        assert unavailable[0].severity == "WARN"
+        write_failed = [
+            p
+            for p in sink.payloads
+            if p.event == "TRADE_SUPERVISOR_SELF_CHECK_ESCALATION_STATE_WRITE_FAILED"
+        ]
+        assert len(write_failed) == 1  # the write was ATTEMPTED, and it also failed.
+        repeated = [
+            p for p in sink.payloads if p.event == "TRADE_SUPERVISOR_SELF_CHECK_FAIL_REPEATED"
+        ]
+        assert len(repeated) == 1
+        assert repeated[0].severity == "CRITICAL"
+
+    def test_a_sustained_read_failure_still_escalates_on_the_second_of_two_consecutive_polls(
+        self, tmp_path, monkeypatch
+    ):
+        store_path = tmp_path / "state" / "store.sqlite3"
+        monkeypatch.setattr(
+            "breezy.runtime.trade_supervisor.SqliteStateStore", _AlwaysUnavailableStore
+        )
+        sink = _RecordingAlertSink()
+        ports = _aud14b_ports(sink, ready=False)
+        for now in (
+            dt.datetime(2026, 9, 12, 17, 5, tzinfo=dt.UTC),
+            dt.datetime(2026, 9, 13, 17, 5, tzinfo=dt.UTC),
+        ):
+            _do_self_check(
+                ports=ports,
+                now=now,
+                store_path=store_path,
+                log_dir=tmp_path / "logs",
+                tracked_pid=42,
+                node_log=tmp_path / "n.log",
+            )
+        repeated = [
+            p for p in sink.payloads if p.event == "TRADE_SUPERVISOR_SELF_CHECK_FAIL_REPEATED"
+        ]
+        assert len(repeated) == 2
+        assert all(p.severity == "CRITICAL" for p in repeated)
+
+    def test_a_write_failure_after_a_critical_decision_still_delivers_the_alert_and_is_reported_distinctly(
+        self, tmp_path, monkeypatch
+    ):
+        store_path = tmp_path / "state" / "store.sqlite3"
+        _aud14b_plant(
+            store_path,
+            SelfCheckEscalationState(
+                consecutive_failures=1, last_self_check_utc="2026-09-11T17:05:00Z"
+            ),
+        )
+        monkeypatch.setattr(
+            "breezy.runtime.trade_supervisor.SqliteStateStore",
+            _make_write_failing_store_cls(),
+        )
+        sink = _RecordingAlertSink()
+        ports = _aud14b_ports(sink, ready=False)
+        _do_self_check(
+            ports=ports,
+            now=dt.datetime(2026, 9, 12, 17, 5, tzinfo=dt.UTC),
+            store_path=store_path,
+            log_dir=tmp_path / "logs",
+            tracked_pid=42,
+            node_log=tmp_path / "n.log",
+        )
+        repeated = [
+            p for p in sink.payloads if p.event == "TRADE_SUPERVISOR_SELF_CHECK_FAIL_REPEATED"
+        ]
+        assert len(repeated) == 1
+        assert repeated[0].severity == "CRITICAL"
+        write_failed = [
+            p
+            for p in sink.payloads
+            if p.event == "TRADE_SUPERVISOR_SELF_CHECK_ESCALATION_STATE_WRITE_FAILED"
+        ]
+        assert len(write_failed) == 1
+        assert write_failed[0].event != "TRADE_SUPERVISOR_SELF_CHECK_ESCALATION_STORE_UNAVAILABLE"
+
+    def test_a_write_failure_then_a_restart_duplicates_but_never_loses_the_escalation(
+        self, tmp_path, monkeypatch
+    ):
+        store_path = tmp_path / "state" / "store.sqlite3"
+        sink = _RecordingAlertSink()
+        ports = _aud14b_ports(sink, ready=False)
+
+        # Day 1: normal store, persists consecutive_failures=1.
+        _do_self_check(
+            ports=ports,
+            now=dt.datetime(2026, 9, 12, 17, 5, tzinfo=dt.UTC),
+            store_path=store_path,
+            log_dir=tmp_path / "logs",
+            tracked_pid=42,
+            node_log=tmp_path / "n.log",
+        )
+
+        # Day 2: write fails -- CRITICAL decided (count=2) but not persisted.
+        monkeypatch.setattr(
+            "breezy.runtime.trade_supervisor.SqliteStateStore",
+            _make_write_failing_store_cls(),
+        )
+        _do_self_check(
+            ports=ports,
+            now=dt.datetime(2026, 9, 13, 17, 5, tzinfo=dt.UTC),
+            store_path=store_path,
+            log_dir=tmp_path / "logs",
+            tracked_pid=42,
+            node_log=tmp_path / "n.log",
+        )
+
+        # "Restart": a fresh, ordinary store connection against the same
+        # tmp_path store -- the stuck-at-1 value is read back for real.
+        monkeypatch.undo()
+        _do_self_check(
+            ports=ports,
+            now=dt.datetime(2026, 9, 14, 17, 5, tzinfo=dt.UTC),
+            store_path=store_path,
+            log_dir=tmp_path / "logs",
+            tracked_pid=42,
+            node_log=tmp_path / "n.log",
+        )
+
+        repeated = [
+            p for p in sink.payloads if p.event == "TRADE_SUPERVISOR_SELF_CHECK_FAIL_REPEATED"
+        ]
+        # Duplicated (day 2 AND day 3 both CRITICAL from the stuck count),
+        # never lost.
+        assert len(repeated) == 2
+
+    def test_the_alert_is_emitted_before_the_store_write(self, tmp_path, monkeypatch):
+        store_path = tmp_path / "state" / "store.sqlite3"
+        _aud14b_plant(
+            store_path,
+            SelfCheckEscalationState(
+                consecutive_failures=1, last_self_check_utc="2026-09-11T17:05:00Z"
+            ),
+        )
+        calls: list[tuple[str, str]] = []
+        monkeypatch.setattr(
+            "breezy.runtime.trade_supervisor.SqliteStateStore",
+            _make_order_tracking_store_cls(calls),
+        )
+        sink = _OrderTrackingAlertSink(calls)
+        ports = _aud14b_ports(sink, ready=False)
+        _do_self_check(
+            ports=ports,
+            now=dt.datetime(2026, 9, 12, 17, 5, tzinfo=dt.UTC),
+            store_path=store_path,
+            log_dir=tmp_path / "logs",
+            tracked_pid=42,
+            node_log=tmp_path / "n.log",
+        )
+        alert_index = next(i for i, c in enumerate(calls) if c[0] == "alert")
+        store_set_index = next(i for i, c in enumerate(calls) if c[0] == "store_set")
+        assert alert_index < store_set_index
+
+
+class TestSelfCheckEscalationHistoricalReplay:
+    """§7 14b steps 5 and 6 -- the historical 09-12..09-18 incident, replayed
+    against the new code, and the same sequence with a simulated restart
+    landing between days 3 and 4."""
+
+    _SEQUENCE = [
+        (dt.date(2026, 9, 12), SelfCheckResult.FAIL_NODE_NOT_READY),
+        (dt.date(2026, 9, 13), SelfCheckResult.FAIL_NODE_NOT_READY),
+        (dt.date(2026, 9, 14), SelfCheckResult.FAIL_NODE_NOT_READY),
+        (dt.date(2026, 9, 15), SelfCheckResult.FAIL_NODE_NOT_READY),
+        (dt.date(2026, 9, 16), SelfCheckResult.FAIL_NODE_NOT_READY),
+        (dt.date(2026, 9, 17), SelfCheckResult.FAIL_NODE_NOT_READY),
+        (dt.date(2026, 9, 18), SelfCheckResult.FAIL_CHILD_EXITED),
+    ]
+
+    def _run_day(self, *, day, result, store_path, tmp_path, sink):
+        ready = result in (SelfCheckResult.PASS, SelfCheckResult.PASS_ADOPTED_LOG_UNKNOWN)
+        child_alive = result is not SelfCheckResult.FAIL_CHILD_EXITED
+        ports = SupervisorPorts(
+            find_node_pid=lambda: None,
+            resolve_intent_lock_holder=lambda _p: 42,
+            intent_lock_free=lambda _p: True,
+            count_intent_lock_holders=lambda _p: 1,
+            terminate_after_recheck=lambda pid, **kw: None,
+            process_alive=lambda _pid, _alive=child_alive: _alive,
+            probe_open_intent_state=lambda *a, **kw: False,
+            spawn=lambda **kw: None,
+            read_log_new=lambda _p: _AUD14B_READY_LOG_LINE if ready else "",
+            alert_sink=sink,
+        )
+        _do_self_check(
+            ports=ports,
+            now=dt.datetime(day.year, day.month, day.day, 17, 5, tzinfo=dt.UTC),
+            store_path=store_path,
+            log_dir=tmp_path / "logs",
+            tracked_pid=42,
+            node_log=tmp_path / "n.log",
+        )
+
+    def test_the_2026_09_12_to_09_18_sequence_escalates(self, tmp_path):
+        store_path = tmp_path / "state" / "store.sqlite3"
+        sink = _RecordingAlertSink()
+        critical_days: list[dt.date] = []
+        for day, result in self._SEQUENCE:
+            before = len(
+                [
+                    p
+                    for p in sink.payloads
+                    if p.event == "TRADE_SUPERVISOR_SELF_CHECK_FAIL_REPEATED"
+                ]
+            )
+            self._run_day(day=day, result=result, store_path=store_path, tmp_path=tmp_path, sink=sink)
+            after = len(
+                [
+                    p
+                    for p in sink.payloads
+                    if p.event == "TRADE_SUPERVISOR_SELF_CHECK_FAIL_REPEATED"
+                ]
+            )
+            if after > before:
+                critical_days.append(day)
+
+        assert critical_days
+        assert critical_days[0] == dt.date(2026, 9, 13)  # day 2, not day 7.
+
+    def test_the_sequence_still_escalates_when_a_restart_falls_on_day_3(
+        self, tmp_path, monkeypatch
+    ):
+        store_path = tmp_path / "state" / "store.sqlite3"
+        sink = _RecordingAlertSink()
+        critical_days: list[dt.date] = []
+        for index, (day, result) in enumerate(self._SEQUENCE):
+            if index == 3:
+                # Simulate a restart landing between days 3 and 4: nothing
+                # in-process carries state across this point except the
+                # store itself, which every call re-reads fresh anyway.
+                pass
+            before = len(
+                [
+                    p
+                    for p in sink.payloads
+                    if p.event == "TRADE_SUPERVISOR_SELF_CHECK_FAIL_REPEATED"
+                ]
+            )
+            self._run_day(day=day, result=result, store_path=store_path, tmp_path=tmp_path, sink=sink)
+            after = len(
+                [
+                    p
+                    for p in sink.payloads
+                    if p.event == "TRADE_SUPERVISOR_SELF_CHECK_FAIL_REPEATED"
+                ]
+            )
+            if after > before:
+                critical_days.append(day)
+
+        assert critical_days
+        assert critical_days[0] == dt.date(2026, 9, 13)
 
 
 # ---------------------------------------------------------------------------

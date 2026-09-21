@@ -65,15 +65,19 @@ from breezy.runtime.trade_supervisor_core import (
     PERMIT_ISSUED_MARKER,
     RELAUNCH_CUTOFF_UTC,
     SELF_CHECK_ALERT_DETAIL,
+    SELF_CHECK_ESCALATION_STORE_KEY,
+    SELF_CHECK_GAP_ALERT_THRESHOLD_HOURS,
     SELF_CHECK_UTC,
     STOP_PRIOR_UTC,
     SUPERVISOR_ARGV_TOKEN,
     AlertDetail,
     ContinuousFamilyCheck,
     DaySchedulerState,
+    EscalationLoadOutcome,
     LaunchAction,
     Phase,
     RelaunchCause,
+    SelfCheckEscalationState,
     SelfCheckResult,
     StopPriorAction,
     _trading_day,
@@ -87,6 +91,9 @@ from breezy.runtime.trade_supervisor_core import (
     decide_midday_relaunch,
     decide_relaunch,
     decide_stop_prior_action,
+    decode_self_check_escalation_state,
+    encode_self_check_escalation_state,
+    escalated_self_check_severity,
     initial_scheduler_state,
     launch_time_ns,
     mark_phase_fired,
@@ -104,8 +111,10 @@ from breezy.runtime.trade_supervisor_core import (
     record_permit_issued_seen,
     record_readiness_observed,
     record_relaunch_attempt,
+    record_self_check_result,
     record_strategy_subscribed_seen,
     self_check,
+    self_check_gap_hours,
     strategy_subscribed_in,
 )
 
@@ -1195,6 +1204,35 @@ _SELF_CHECK_PASS_RESULTS: Final[frozenset[SelfCheckResult]] = frozenset(
 )
 
 
+def _load_self_check_escalation(
+    store_path: Path,
+) -> tuple[SelfCheckEscalationState, EscalationLoadOutcome]:
+    """[AUD-14b] The LOAD step of the escalation record's read-decide-write
+    bracket. Read-only via a fresh, independent ``SqliteStateStore``
+    connection -- matches :func:`read_continuous_family_store_state`'s own
+    pattern -- so boot, a trading-day rollover, and a supervisor restart
+    collapse into the same case: the value is re-read fresh every time.
+
+    Never alerts itself: outcome classification only. The caller
+    (:func:`_do_self_check`) decides severity and emits, per this module's
+    DECIDE -> EMIT -> PERSIST ordering. The exception (on ``UNAVAILABLE``)
+    is contained here alone and logged by TYPE only, matching this
+    module's value-free stance -- never the exception message.
+    """
+    try:
+        with SqliteStateStore(store_path) as store:
+            raw = store.get(SELF_CHECK_ESCALATION_STORE_KEY)
+    except Exception as exc:  # noqa: BLE001 -- deliberate, see docstring.
+        log_decision("self_check_escalation_load_failed", error_type=type(exc).__name__)
+        return SelfCheckEscalationState(), EscalationLoadOutcome.UNAVAILABLE
+    if raw is None:
+        return SelfCheckEscalationState(), EscalationLoadOutcome.ABSENT
+    decoded = decode_self_check_escalation_state(raw)
+    if decoded is None:
+        return SelfCheckEscalationState(), EscalationLoadOutcome.CORRUPT
+    return decoded, EscalationLoadOutcome.PRESENT
+
+
 def _do_self_check(
     *,
     ports: SupervisorPorts,
@@ -1284,23 +1322,93 @@ def _do_self_check(
         log_available=node_log is not None,
         continuous_check=continuous_check,
     )
+    # [AUD-14b] Repeat-failure escalation -- a separate, store-backed
+    # record, re-read fresh at every self-check (see
+    # `_load_self_check_escalation`'s docstring). Bracket ordering is
+    # DECIDE -> EMIT -> PERSIST throughout: a write that never happens
+    # (crash/restart between decide and persist) can only ever produce a
+    # DUPLICATE escalation on the next FAIL, never a LOST one.
+    escalation_state, load_outcome = _load_self_check_escalation(store_path)
+    now_utc_iso = now.astimezone(dt.UTC).isoformat().replace("+00:00", "Z")
+    gap_hours = self_check_gap_hours(
+        last_self_check_utc=escalation_state.last_self_check_utc, now_utc=now
+    )
+
+    log_fields: dict[str, int | str] = {"result": result.value}
     if continuous_check is not None:
-        log_decision(
-            "self_check",
-            result=result.value,
+        log_fields.update(
             continuous_phase0_clean=continuous_check.phase0_clean,
             continuous_startup_evidence_valid=continuous_check.startup_evidence_valid,
             continuous_family_not_halted=continuous_check.family_not_halted,
         )
-    else:
-        log_decision("self_check", result=result.value)
-    if result not in _SELF_CHECK_PASS_RESULTS:
+    if load_outcome is EscalationLoadOutcome.ABSENT:
+        # The only outcome permitted to be silent -- the count is known
+        # (zero), just never previously observed.
+        log_fields["escalation_state"] = "absent"
+    if gap_hours is not None and gap_hours > SELF_CHECK_GAP_ALERT_THRESHOLD_HOURS:
+        log_fields["self_check_gap_hours"] = int(gap_hours)
+    log_decision("self_check", **log_fields)
+
+    if load_outcome is EscalationLoadOutcome.CORRUPT:
+        alert(
+            ports.alert_sink,
+            event="TRADE_SUPERVISOR_SELF_CHECK_ESCALATION_STATE_CORRUPT",
+            severity="WARN",
+            detail=AlertDetail.SELF_CHECK_ESCALATION_STATE_CORRUPT,
+        )
+    elif load_outcome is EscalationLoadOutcome.UNAVAILABLE:
+        alert(
+            ports.alert_sink,
+            event="TRADE_SUPERVISOR_SELF_CHECK_ESCALATION_STORE_UNAVAILABLE",
+            severity="WARN",
+            detail=AlertDetail.SELF_CHECK_ESCALATION_STORE_UNAVAILABLE,
+        )
+
+    new_escalation_state = record_self_check_result(
+        escalation_state, result.value, now_utc=now_utc_iso
+    )
+    count_known = load_outcome in (EscalationLoadOutcome.ABSENT, EscalationLoadOutcome.PRESENT)
+    severity = escalated_self_check_severity(
+        result_is_fail=result not in _SELF_CHECK_PASS_RESULTS,
+        consecutive_failures=new_escalation_state.consecutive_failures,
+        count_known=count_known,
+    )
+    if severity == "CRITICAL":
+        if count_known:
+            detail = SELF_CHECK_ALERT_DETAIL[result]
+        elif load_outcome is EscalationLoadOutcome.CORRUPT:
+            detail = AlertDetail.SELF_CHECK_ESCALATION_STATE_CORRUPT
+        else:
+            detail = AlertDetail.SELF_CHECK_ESCALATION_STORE_UNAVAILABLE
+        alert(
+            ports.alert_sink,
+            event="TRADE_SUPERVISOR_SELF_CHECK_FAIL_REPEATED",
+            severity="CRITICAL",
+            detail=detail,
+        )
+    elif severity == "WARN":
         alert(
             ports.alert_sink,
             event="TRADE_SUPERVISOR_SELF_CHECK_FAIL",
             severity="WARN",
             detail=SELF_CHECK_ALERT_DETAIL[result],
         )
+
+    try:
+        with SqliteStateStore(store_path) as store:
+            store.set(
+                SELF_CHECK_ESCALATION_STORE_KEY,
+                encode_self_check_escalation_state(new_escalation_state),
+            )
+    except Exception as exc:  # noqa: BLE001 -- contained; named by TYPE only.
+        log_decision("self_check_escalation_state_write_failed", error_type=type(exc).__name__)
+        alert(
+            ports.alert_sink,
+            event="TRADE_SUPERVISOR_SELF_CHECK_ESCALATION_STATE_WRITE_FAILED",
+            severity="WARN",
+            detail=AlertDetail.SELF_CHECK_ESCALATION_STATE_WRITE_FAILED,
+        )
+
     return tracked_pid, node_log, state
 
 

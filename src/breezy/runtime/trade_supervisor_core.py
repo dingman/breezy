@@ -19,6 +19,7 @@ file's source, not merely asserted here.)
 from __future__ import annotations
 
 import datetime as dt
+import json
 import re
 from collections.abc import Mapping
 from dataclasses import dataclass, replace
@@ -222,6 +223,12 @@ class AlertDetail(str, Enum):
     #: the bounded post-relaunch readiness re-check.
     MIDDAY_RELAUNCH_EXHAUSTED = "midday_relaunch_exhausted"
     MIDDAY_RELAUNCHED_CHILD_NOT_READY = "midday_relaunched_child_not_ready"
+    #: [AUD-14b] The self-check repeat-failure escalation machinery's own
+    #: fault paths -- see ``SelfCheckEscalationState``/``EscalationLoadOutcome``
+    #: below. Each fails TOWARD alerting, never toward silence.
+    SELF_CHECK_ESCALATION_STATE_CORRUPT = "self_check_escalation_state_corrupt"
+    SELF_CHECK_ESCALATION_STORE_UNAVAILABLE = "self_check_escalation_store_unavailable"
+    SELF_CHECK_ESCALATION_STATE_WRITE_FAILED = "self_check_escalation_state_write_failed"
 
 
 class StopPriorAction(str, Enum):
@@ -571,6 +578,166 @@ def permit_expiry_valid(log_text: str, *, now_ns: int) -> bool:
     """[B4] "permit-issued line present with expiry beyond now"."""
     expiry = parse_permit_expiry_ns(log_text)
     return expiry is not None and expiry > now_ns
+
+
+# ---------------------------------------------------------------------------
+# [AUD-14b] Self-check repeat-failure escalation.
+#
+# A SEPARATE, store-backed record -- deliberately NOT a ``DaySchedulerState``
+# field. See the plan's §6 for the full rationale: `_for_day` resets every
+# ``DaySchedulerState`` field on a trading-day rollover, and the 17:05Z
+# self-check straddles that rollover boundary on every consecutive pair, so
+# a day-keyed counter cannot survive it. This record carries no ``day``
+# field at all -- that absence IS the mechanism -- and its reducer never
+# calls ``_for_day``. Still fully pure/no-I/O, matching this module's
+# contract; the I/O shell (``trade_supervisor.py``) owns reading and
+# writing the persisted value fresh at every self-check.
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True, slots=True)
+class SelfCheckEscalationState:
+    """The self-check repeat-failure counter. No ``day`` field -- not being
+    day-keyed is the mechanism that lets it survive a trading-day rollover
+    (see the module note above)."""
+
+    consecutive_failures: int = 0
+    #: "" means never observed.
+    last_self_check_utc: str = ""
+
+
+#: The literal, store-backed record key -- colon-separated, matching
+#: ``bootstrap_witness.py``'s ``runtime:bootstrap_witness`` convention
+#: (never tilde-separated: composite ids use ``^``/``:``, a tilde breaks
+#: catalog queries).
+SELF_CHECK_ESCALATION_STORE_KEY: Final[str] = "runtime:supervisor:self_check_escalation"
+
+#: Every FAIL-family ``SelfCheckResult`` value that is actually a PASS of
+#: some kind, by value -- mirrors ``trade_supervisor._SELF_CHECK_PASS_RESULTS``
+#: without importing it (this module owns zero I/O and never imports the
+#: shell it is imported BY).
+_PASS_RESULT_VALUES: Final[frozenset[str]] = frozenset(
+    {SelfCheckResult.PASS.value, SelfCheckResult.PASS_ADOPTED_LOG_UNKNOWN.value}
+)
+
+
+def record_self_check_result(
+    state: SelfCheckEscalationState, result: str, *, now_utc: str
+) -> SelfCheckEscalationState:
+    """Pure reducer: increments ``consecutive_failures`` on a FAIL result,
+    resets it to ``0`` on a PASS (or ``PASS_ADOPTED_LOG_UNKNOWN``), and sets
+    ``last_self_check_utc=now_utc`` on EVERY result. Deliberately does not
+    match the ``record_*``/``_for_day`` family: no ``now`` (a ``dt.datetime``)
+    and no ``day`` parameter, because this field must not have a
+    day-rollover reset (see the module note above)."""
+    if result in _PASS_RESULT_VALUES:
+        return SelfCheckEscalationState(consecutive_failures=0, last_self_check_utc=now_utc)
+    return replace(
+        state, consecutive_failures=state.consecutive_failures + 1, last_self_check_utc=now_utc
+    )
+
+
+def escalated_self_check_severity(
+    *, result_is_fail: bool, consecutive_failures: int, count_known: bool
+) -> str | None:
+    """The fail-toward-alerting rule, as a pure function: ``None`` for a
+    PASS result; ``"CRITICAL"`` when the result is a FAIL and EITHER the
+    count is unknown (a corrupt or unavailable escalation record) OR the
+    count has reached 2; ``"WARN"`` otherwise (a known first failure)."""
+    if not result_is_fail:
+        return None
+    if not count_known or consecutive_failures >= 2:
+        return "CRITICAL"
+    return "WARN"
+
+
+#: The escalation record's declared JSON keys -- exactly these two, by
+#: name, one-to-one with ``SelfCheckEscalationState``'s fields. A decode
+#: succeeds only when the value is a JSON object with EXACTLY this key set
+#: and each value's own declared scalar type -- never a subset, never a
+#: superset, never coerced.
+_ESCALATION_STATE_KEYS: Final[frozenset[str]] = frozenset(
+    {"consecutive_failures", "last_self_check_utc"}
+)
+
+
+def encode_self_check_escalation_state(state: SelfCheckEscalationState) -> bytes:
+    """Total encode: the two fields, by name, one-to-one."""
+    return json.dumps(
+        {
+            "consecutive_failures": state.consecutive_failures,
+            "last_self_check_utc": state.last_self_check_utc,
+        }
+    ).encode("utf-8")
+
+
+def decode_self_check_escalation_state(raw: bytes) -> SelfCheckEscalationState | None:
+    """Total decode: ``None`` for anything that is not exactly the two
+    declared keys with the two declared scalar types -- not JSON, not an
+    object, a missing or extra key, or a wrong scalar type. Never coerced,
+    never partially accepted: the caller treats ``None`` as CORRUPT, never
+    as a default with a warning attached."""
+    try:
+        decoded = json.loads(raw.decode("utf-8"))
+    except (ValueError, UnicodeDecodeError):
+        return None
+    if not isinstance(decoded, dict):
+        return None
+    if set(decoded.keys()) != _ESCALATION_STATE_KEYS:
+        return None
+    consecutive_failures = decoded["consecutive_failures"]
+    last_self_check_utc = decoded["last_self_check_utc"]
+    if not isinstance(consecutive_failures, int) or isinstance(consecutive_failures, bool):
+        return None
+    if not isinstance(last_self_check_utc, str):
+        return None
+    return SelfCheckEscalationState(
+        consecutive_failures=consecutive_failures, last_self_check_utc=last_self_check_utc
+    )
+
+
+class EscalationLoadOutcome(str, Enum):
+    """The escalation record's load outcome -- distinguished so an ``ABSENT``
+    key (the only legitimate silent-zero case) is never conflated with a
+    ``CORRUPT`` or ``UNAVAILABLE`` fault, both of which must alert and both
+    of which leave the count UNKNOWN rather than zero."""
+
+    #: ``store.get`` returned ``None`` -- the legitimate first-boot /
+    #: first-deploy case. The ONLY outcome permitted to start at zero
+    #: silently; the count is KNOWN.
+    ABSENT = "absent"
+    #: A value was present and decoded cleanly. The count is KNOWN.
+    PRESENT = "present"
+    #: A value was present but did not decode into exactly the two declared
+    #: keys. A persistence FAULT, not an absence -- the count is UNKNOWN.
+    CORRUPT = "corrupt"
+    #: Opening the store or calling ``get``/``set`` raised. The count is
+    #: UNKNOWN.
+    UNAVAILABLE = "unavailable"
+
+
+#: [2026-09-15 originally B4/D-man's-switch, tightened AUD-14b] A gap of more
+#: than this many hours since the last recorded self-check is reported as a
+#: field on the self-check log line -- it does not alert by itself (the run
+#: reporting it is a run that happened), but it makes a missed day
+#: recoverable from the journal instead of invisible. ~26h (not 24h) gives a
+#: one-day trading cycle margin before a normal daily cadence would trip it.
+SELF_CHECK_GAP_ALERT_THRESHOLD_HOURS: Final[float] = 26.0
+
+
+def self_check_gap_hours(*, last_self_check_utc: str, now_utc: dt.datetime) -> float | None:
+    """Hours between ``last_self_check_utc`` (an ISO-8601 ``...Z`` string, or
+    ``""`` meaning never observed) and ``now_utc``. ``None`` when there is no
+    prior recorded self-check or the stored timestamp fails to parse --
+    pure, no I/O, no alerting; the caller (the I/O shell) decides whether
+    and how to log it."""
+    if not last_self_check_utc:
+        return None
+    try:
+        previous = dt.datetime.fromisoformat(last_self_check_utc.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    return (now_utc - previous).total_seconds() / 3600.0
 
 
 # ---------------------------------------------------------------------------
