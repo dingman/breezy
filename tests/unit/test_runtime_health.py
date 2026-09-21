@@ -328,6 +328,42 @@ def test_emit_alert_calls_a_healthy_sink_normally() -> None:
 
     emit_alert(sink, payload)
 
+
+_WEBHOOK_URL_SENTINEL = "https://ntfy.sh/aud15-amendment-sentinel-topic-token"
+
+
+def test_emit_alert_never_logs_the_sink_exceptions_message_or_traceback(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """AUD-15 amendment, Commit 1. `emit_alert`'s catch-all used to call
+    `logger.exception(...)`, which attaches the full traceback -- and an
+    `httpx`/`ssl` exception's own message routinely embeds the request URL,
+    which for a webhook sink IS a bearer credential (mirrors
+    `TeeAlertSink.close()`'s and `check_alerts_cli`'s withheld-message
+    discipline elsewhere in this module). This pins that emit_alert's log
+    record never carries the sentinel URL, in the message, its %-args, or
+    the captured exception text -- only the exception TYPE may appear.
+    """
+    caplog.set_level("DEBUG", logger="breezy.runtime.health")
+    sink = _FakeSink(raises=httpx.HTTPStatusError(
+        f"Client error for url '{_WEBHOOK_URL_SENTINEL}'",
+        request=httpx.Request("POST", _WEBHOOK_URL_SENTINEL),
+        response=httpx.Response(500, request=httpx.Request("POST", _WEBHOOK_URL_SENTINEL)),
+    ))
+    payload = AlertPayload(severity="CRITICAL", event="e", site="global", detail="d")
+
+    emit_alert(sink, payload)  # must not raise
+
+    for record in caplog.records:
+        assert _WEBHOOK_URL_SENTINEL not in record.getMessage()
+        assert _WEBHOOK_URL_SENTINEL not in (record.exc_text or "")
+        if record.exc_info is not None:
+            exc = record.exc_info[1]
+            assert exc is not None
+            assert _WEBHOOK_URL_SENTINEL not in str(exc)
+        for arg in record.args or ():
+            assert _WEBHOOK_URL_SENTINEL not in str(arg)
+
     assert sink.received == [payload]
 
 

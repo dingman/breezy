@@ -676,16 +676,26 @@ def emit_alert(sink: AlertSink, payload: AlertPayload) -> None:
     an alert sink must never be able to abort the poll cycle it is
     reporting on, for ANY reason, mirroring `nws_actor.py`'s own stance in
     `_on_poll_done` toward supervision errors. A failure here is logged at
-    ERROR (with the stack trace, via `logger.exception`) and swallowed.
+    ERROR and swallowed.
+
+    **Only the exception TYPE is logged, never its message or traceback**
+    (AUD-15 amendment, 2026-09-22) -- an `httpx`/`ssl` exception's own
+    message routinely embeds the failing request's full URL, and for
+    `WebhookAlertSink` that URL is a bearer credential. `logger.exception`
+    (which attaches `exc_info`, and therefore the message, via the
+    traceback) is deliberately NOT used here, mirroring
+    `TeeAlertSink.close()`'s and `check_alerts_cli`'s own withheld-message
+    discipline elsewhere in this module.
     """
     try:
         sink.emit(payload)
-    except BaseException:  # deliberate: see docstring -- this is the contract, not sloppiness.
-        logger.exception(
-            "alert sink failed to emit event=%s site=%s severity=%s",
+    except BaseException as exc:  # noqa: BLE001 - deliberate; see docstring.
+        logger.error(
+            "alert sink failed to emit event=%s site=%s severity=%s exception_type=%s",
             payload.event,
             payload.site,
             payload.severity,
+            type(exc).__name__,
         )
 
 
