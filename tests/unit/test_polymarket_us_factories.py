@@ -889,3 +889,19 @@ def test_create_threads_trade_shard_halving_from_the_config_into_the_pool(
     assert isinstance(on, PolymarketUSMarketsWebSocketPool)
     assert off._slugs_per_shard == off._cap
     assert on._slugs_per_shard == on._cap // 2
+
+
+def test_the_public_http_client_wrapper_returns_the_same_cached_instance(
+    wired: dict[str, Any],
+) -> None:
+    """AUD-02b P3(i): `shared_polymarket_us_http_client` (public) is a pure
+    delegation to `_shared_polymarket_us_http_client` (private, still
+    `@lru_cache`d) -- a build-side caller outside this module gets the
+    EXACT same cached object the two Nautilus factory callers get, never a
+    second instance, and this test's own `cache_clear()` fixture still
+    controls it (defect A stays intact)."""
+    config = make_config()
+    clock = LiveClock()
+    via_public = factories_module.shared_polymarket_us_http_client(config, clock)
+    via_private = factories_module._shared_polymarket_us_http_client(config, clock)
+    assert via_public is via_private

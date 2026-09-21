@@ -3377,6 +3377,14 @@ def test_x1_the_live_scan_actually_reaches_a_test_that_imports_the_exec_package(
         "tests/unit/test_polymarket_us_write_sequence.py",
         "tests/unit/test_score_live_trials_l38_family_prefix.py",
         "tests/unit/test_score_live_trials_state_db_source.py",
+        # Old -> new (this row, AUD-02b 2026-09-21): added
+        # `tests/unit/test_set_family_halt_cli.py`, which imports `exec.client`
+        # for `PolymarketUSExecutionClient.declared_positions` -- the node's
+        # OWN positions parser, reused rather than copied. WIDENED, not
+        # relaxed (L-6/L-12): the comparison is still `==`; the module carries
+        # NO marker at all, injects `positions_reader` in every test, and pins
+        # that no client instance is ever constructed.
+        "tests/unit/test_set_family_halt_cli.py",
         # StartupOpenOrderSnapshot/StartupPositionEvidence (exec.client) --
         # plain frozen dataclasses, no client, no socket; see the comment
         # block above this assert for the full justification.

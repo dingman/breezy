@@ -2259,6 +2259,11 @@ def test_c10_submit_intent_and_operator_controls_reference_pins() -> None:
     ``clear_submit_intent_cli.py`` and ``clear_family_halt_cli.py`` already
     take, so the node holding the lock refuses this tool too. It opens no
     second latch and no second store.
+
+    WIDENED again (AUD-02b, 2026-09-21): old -> new adds
+    ``strategy.current_rung_hold.set_family_halt_cli``, the SET sibling of
+    ``clear_family_halt_cli.py``. Same property, same flock, same store --
+    see the row's own comment below.
     """
     assert _modules_importing("submit_intent") == {
         "src/breezy/runtime/node_config.py",
@@ -2274,6 +2279,15 @@ def test_c10_submit_intent_and_operator_controls_reference_pins() -> None:
         "src/breezy/strategy/current_rung_hold/trial_day_latch.py",
         "src/breezy/strategy/current_rung_hold/composition.py",
         "src/breezy/strategy/current_rung_hold/clear_family_halt_cli.py",
+        # WIDENED (AUD-02b, 2026-09-21), not relaxed (L-6/L-12): the comparison
+        # is still `==`; old -> new added exactly this one path.
+        # `breezy-set-family-halt` is the SET sibling of `clear_family_halt_cli.py`
+        # two rows above and the FOURTH tool on this flock. It takes the SAME
+        # `open_submit_intent_latch`, opens no second latch and no second store,
+        # and writes the SAME `FAMILY_HALT_KEY` payload shape via
+        # `TrialDayLatch.record_policy_halt`. It lives in `strategy`, not
+        # `runtime`, for the layers-contract reason its sibling states.
+        "src/breezy/strategy/current_rung_hold/set_family_halt_cli.py",
         "scripts/analysis/current_rung_hold_paper_replay.py",
         "src/breezy/app/trade.py",
         "src/breezy/runtime/trade_supervisor.py",

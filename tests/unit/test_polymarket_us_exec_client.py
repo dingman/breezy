@@ -849,6 +849,47 @@ def test_declared_positions_accepts_a_genuinely_empty_map() -> None:
     )
 
 
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {},
+        {"positions": None},
+        {"positions": ["not", "a", "dict"]},
+        {"positions": {}, "eof": True},
+        {"positions": {}, "eof": False},
+        {"positions": {}},
+        {"positions": {"some-slug": {"netPosition": "1"}}, "eof": True},
+    ],
+    ids=[
+        "absent-key",
+        "explicit-none",
+        "non-dict-list",
+        "empty-eof-true",
+        "empty-eof-false",
+        "empty-no-eof",
+        "one-slug",
+    ],
+)
+def test_declared_positions_public_alias_agrees_with_the_private_staticmethod(
+    payload: dict[str, Any],
+) -> None:
+    """AUD-02b P3(i): `declared_positions` (public) is a pure delegation to
+    `_declared_positions` (private) -- same return, or the SAME exception
+    type, on every one of the existing foreign/empty/non-eof/terminal
+    payload shapes above. The six in-class call sites and the existing
+    private-name tests stay untouched; only a build-side caller outside this
+    class (`breezy.strategy.current_rung_hold.set_family_halt_cli`) is meant
+    to reach the public name."""
+    try:
+        private_result: Any = PolymarketUSExecutionClient._declared_positions(payload)
+    except ExecutionReportMappingError as private_exc:
+        with pytest.raises(ExecutionReportMappingError) as public_exc_info:
+            PolymarketUSExecutionClient.declared_positions(payload)
+        assert str(public_exc_info.value) == str(private_exc)
+        return
+    assert PolymarketUSExecutionClient.declared_positions(payload) == private_result
+
+
 # ---------------------------------------------------------------------------
 # R-4P-1 -- a non-terminal page is a REFUSAL, never a silently-accepted
 # partial book. `GetUserPositionsResponse` is cursor-paginated (`eof`,

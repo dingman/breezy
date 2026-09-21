@@ -1377,6 +1377,57 @@ async def test_a_family_halt_veto_denies_wait_class_and_spends_zero_permit_slots
         await client._disconnect()
 
 
+@pytest.mark.asyncio
+async def test_a_policy_halt_veto_denies_wait_class_and_spends_zero_permit_slots(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    write_canonical_verified: None,  # noqa: F811
+) -> None:
+    """AUD-02b (§7 step 0a test (1)): the SAME end-to-end proof as
+    ``test_a_family_halt_veto_denies_wait_class_and_spends_zero_permit_slots``
+    immediately above, but the halt is set via the NEW
+    ``TrialDayLatch.record_policy_halt`` (the write
+    ``breezy-set-family-halt`` uses) rather than
+    ``record_duplicate_fill`` -- proving the new writer's payload is read by
+    the SAME ``is_family_halted`` and denied by the SAME
+    ``family_halt_submit_veto`` chokepoint, with no new mechanism.
+    """
+    enable_operator_gate(monkeypatch, order_count="2")
+    with operator_control_env(MAX_DAILY_BUDGET_USD_ENV_VAR, "1000.00"), operator_control_env(
+        MAX_POSITION_COST_USD_ENV_VAR, "10.00",
+    ):
+        sender = _SlowSender()
+        client, order_events, permit, _latch_cm = await _build_race_client(
+            tmp_path, sender=sender,
+        )
+        assert client._latch is not None
+        trial_day_latch = open_trial_day_latch(
+            client._latch, key_prefix=CONTINUOUS_TRIAL_KEY_PREFIX,
+        )
+        client._submit_veto = family_halt_submit_veto(  # type: ignore[method-assign]
+            trial_day_latch,
+        )
+        trial_day_latch.record_policy_halt(
+            reason="AUD-02b: enforcing RULING_A1 disposition (ii)",
+            evidence_sha256="0" * 64,
+            ts_ns=1,
+        )
+        _, remaining_before = live_trading_budget_remaining(permit)
+        factory = OrderFactory(trader_id=TRADER_ID, strategy_id=STRATEGY_ID, clock=LiveClock())
+        command = _submit_command(client, factory, "a")
+
+        await client._submit_order(command)
+
+        denials = [e for e in order_events if isinstance(e, OrderDenied)]
+        assert len(denials) == 1
+        assert denials[0].reason == "family_halt"
+        _, remaining_after = live_trading_budget_remaining(permit)
+        assert remaining_after == remaining_before, "a WAIT deny must spend nothing"
+        assert client._latch.is_latched() is False, "a WAIT deny must never arm"
+        assert sender.calls == [], "the veto must deny before any venue contact"
+        await client._disconnect()
+
+
 # ---------------------------------------------------------------------------
 # Item 2 (2026-09-12, boot-ordering addendum): `_connect` must run ONE
 # synchronous resolver pass, with NO initial sleep, before it returns -- so a

@@ -285,6 +285,13 @@ breezy-mark-no-side-position-captured = "breezy.runtime.mark_no_side_position_ca
 # `runtime` may never import `strategy` (see the layers contract below).
 # `breezy.strategy.current_rung_hold.clear_family_halt_cli`.
 breezy-clear-family-halt = "breezy.strategy.current_rung_hold.clear_family_halt_cli:main"
+# AUD-02b: enforce the A1 ruling
+# (`docs/evidence/RULING_A1_pm_us_crh_v4_disposition_2026-09-21.md`) -- the
+# SET sibling of `breezy-clear-family-halt` immediately above. Writes exactly
+# the same `FAMILY_HALT_KEY` payload shape via the new
+# `TrialDayLatch.record_policy_halt`; no new state, no new veto, no new key.
+# See `breezy.strategy.current_rung_hold.set_family_halt_cli`.
+breezy-set-family-halt = "breezy.strategy.current_rung_hold.set_family_halt_cli:main"
 # A SEVENTH process: the detached daily launcher for `breezy-trade`
 # (TRADE_NODE_DAILY_RELAUNCH_2026-09-04.md). Values-free -- the seven
 # operator-reserved values travel only through its own forwarded `env=`,

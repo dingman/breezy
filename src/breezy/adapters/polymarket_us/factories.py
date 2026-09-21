@@ -513,6 +513,21 @@ def _shared_polymarket_us_http_client(
     )
 
 
+def shared_polymarket_us_http_client(
+    config: PolymarketUSDataClientConfig, clock: LiveClock
+) -> PolymarketUSHttpClient:
+    """Public delegation to :func:`_shared_polymarket_us_http_client` (AUD-02b
+    P3(i)): the ONE pyo3-backed HTTP client, exposed so a build-side caller
+    outside this module (``breezy.strategy.current_rung_hold.set_family_halt_cli``)
+    can reuse the EXACT production wiring rather than reaching through the
+    private name. Pure delegation -- the ``@lru_cache`` stays on the private
+    function, so both existing Nautilus factory callers and every
+    ``._shared_polymarket_us_http_client.cache_clear()`` test call site keep
+    calling exactly what they call today, byte-for-byte unchanged.
+    """
+    return _shared_polymarket_us_http_client(config, clock)
+
+
 @lru_cache(maxsize=1)
 def _shared_polymarket_us_instrument_provider(
     client: PolymarketUSHttpClient,

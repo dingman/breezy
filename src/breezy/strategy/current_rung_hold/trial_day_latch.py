@@ -999,10 +999,56 @@ class TrialDayLatch:
             FAMILY_HALT_KEY, json.dumps(halt_payload, sort_keys=True).encode("utf-8"),
         )
 
+    def record_policy_halt(
+        self,
+        *,
+        reason: str,
+        evidence_sha256: str,
+        ts_ns: int,
+    ) -> None:
+        """Durably set the FAMILY-wide halt for a deliberate, evidenced
+        POLICY decision (AUD-02b: enforce the A1 ruling,
+        ``docs/evidence/RULING_A1_pm_us_crh_v4_disposition_2026-09-21.md``).
+
+        Writes the EXACT SAME durable state :meth:`record_duplicate_fill` and
+        :meth:`record_ambiguous_exit` already write and :meth:`is_family_halted`
+        already reads -- no new mechanism, no new key, no new veto. Enforced at
+        every existing chokepoint (``composition.py``'s
+        ``family_halt_submit_veto``, ``exit_wiring.submit_exit``) with zero
+        additional wiring. Cleared only by :meth:`clear_family_halt` via the
+        operator CLI. Idempotent: if the family is already halted (by this or
+        any other cause), the existing halt payload is left untouched -- first
+        cause wins, mirroring :meth:`record_duplicate_fill`'s own idempotency.
+        """
+        self._require_held()
+        if self.is_family_halted():
+            return
+        halt_payload = {
+            "v": 1,
+            "reason": "policy_halt",
+            "tsNs": ts_ns,
+            "detail": reason,
+            "evidenceSha256": evidence_sha256,
+        }
+        self._store.set(
+            FAMILY_HALT_KEY, json.dumps(halt_payload, sort_keys=True).encode("utf-8"),
+        )
+
     def is_family_halted(self) -> bool:
-        """``True`` once :meth:`record_duplicate_fill` has ever fired for
-        THIS family and no ``breezy-clear-family-halt`` run has cleared it
-        since. Durable -- survives restart, unlike ``_trading_refusals``.
+        """``True`` once ANY of this latch's three ``FAMILY_HALT_KEY``
+        writers has fired for THIS family and no ``breezy-clear-family-halt``
+        run has cleared it since. Durable -- survives restart, unlike
+        ``_trading_refusals``. The three writers, added across separate
+        slices and unified here (AUD-02b, docstring-only note -- no code
+        change on this read path): :meth:`record_duplicate_fill` (an
+        automatic consequence of a second genuine fill on an
+        already-consumed instrument-day), :meth:`record_ambiguous_exit` (an
+        automatic consequence of an AMBIGUOUS or rejected exit order), and
+        :meth:`record_policy_halt` (a deliberate, evidenced operator
+        decision via ``breezy-set-family-halt`` -- AUD-02b: enforce the A1
+        ruling). All three write the SAME payload shape and are read
+        identically here; this method cannot and does not distinguish which
+        one fired.
 
         Checks against ``_HALT_CLEARED_MARKER`` rather than mere key
         presence: the store has no delete, so :meth:`clear_family_halt`

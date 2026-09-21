@@ -2621,6 +2621,18 @@ class PolymarketUSExecutionClient(LiveExecutionClient):
             )
         return positions
 
+    @staticmethod
+    def declared_positions(payload: Mapping[str, Any]) -> Mapping[str, Any]:
+        """Public delegation to :meth:`_declared_positions` (AUD-02b P3(i)):
+        the node's OWN positions-page parser, exposed so a build-side caller
+        outside this class (``breezy.strategy.current_rung_hold.set_family_halt_cli``)
+        reuses it rather than reaching through the private name. Pure
+        delegation, verbatim -- every in-class call site keeps calling
+        ``_declared_positions`` unchanged, and this stays a bare
+        ``@staticmethod``: no instance, no connection, no I/O.
+        """
+        return PolymarketUSExecutionClient._declared_positions(payload)
+
     def _map_position(self, slug: str, payload: Any) -> PositionStatusReport | None:
         """One venue position -> one report, or ``None`` plus a refusal.
 
